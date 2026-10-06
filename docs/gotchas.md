@@ -1,0 +1,916 @@
+# 開発で踏んだ落とし穴
+
+このプロジェクトで**実際に踏んで直した**バグと、その原因・対策をまとめたものです。
+「設計の意図」ではなく「間違えると何が壊れるか」を軸にした記録です。
+
+---
+
+## 目次
+
+1. [最も危険な 5 大カテゴリ](#1-最も危険な-5-大カテゴリ)
+2. [pull 演算子（`Op`）の罠](#2-pull-演算子op-の罠)
+3. [`Optimizer.exec` の罠](#3-optimizer-exec-の罠)
+4. [LSM / ストレージの罠](#4-lsm--ストレージの罠)
+5. [MVCC / トランザクションの罠](#5-mvcc--トランザクションの罠)
+6. [索引（index）の罠](#6-索引index-の罠)
+7. [SQL 意味論の罠](#7-sql-意味論の罠)
+8. [F# 10 の言語の罠](#8-f-10-の言語の罠)
+9. [テスト・ビルドの罠](#9-テスト・ビルドの罠)
+10. [デバッグ手法](#10-デバッグ手法)
+11. [設計上の注意点](#11-設計上の注意点)
+
+---
+
+## 1. 最も危険な 5 大カテゴリ
+
+| #   | 分類                        | 症状                                               | 原因                                                            |
+| --- | --------------------------- | -------------------------------------------------- | --------------------------------------------------------------- |
+| 1   | **スタックオーバーフロー**  | テストプロセスが `SIGABRT`（exit 134）で死ぬ       | `>>=` チェーンで組んだ末尾再帰                                  |
+| 2   | **pull 演算子の継続飛ばし** | 射影が最初の 1 行だけ / JOIN の 2 行目以降が消える | 継続に「次の行」ではなく「次のループ」を渡した                  |
+| 3   | **SeqNo の取り違え**        | tombstone が消える / reopen 後 0 行                | put と delete で同じ SeqNo、または reopen で SeqNo を再開しない |
+| 4   | **O(n) な操作の混入**       | 点検索 43 ms                                       | `rangeScan` を点検索に使った                                    |
+| 5   | **F# の型推論の壊れ**       | 謎の FS0001 / FS0072                               | 引数の型注釈・スコープ                                          |
+
+以下、それぞれを詳述します。
+
+---
+
+## 2. pull 演算子（`Op`）の罠
+
+`Executor.fs` の `Op` は Pitt–Patel 型 pull 演算子です。
+
+```fsharp
+type Op =
+    | Done
+    | Step    of SqlValue array * Op                                    // **遅延しない**
+    | Compute of (unit -> Result<(SqlValue array * Op) option, DbError>) // 遅延する
+```
+
+### 2.1 `Step` は遅延ではない（最重要）
+
+`Step(row, nextOp)` の **`nextOp` は「次の行の値を返す」のではなく「継続を表す値」**です。
+F# は評価が厳しいので `Step(f x, g y)` と書くと **`g y` が先に計算されます**。
+
+```fsharp
+// ❌ 無限再帰になる（Step は遅延ではない）
+let rec loop () = Op.Step(row, loop ())
+
+// ✅ 遅延が必要なら Compute
+let rec loop () = Op.Compute(fun () -> ...)
+```
+
+**`Step` は「有限の既知の連鎖」専用。** 無限系列は `Compute` で組む。
+
+有限の連鎖でも、**再帰を第 2 引数（または `let rest = ...`）に渡すとコンストラクト時に「深さ = 要素数」のスタック**を積みます。
+
+```fsharp
+// ❌ コンストラクト時に全行ぶんのスタックを積む（行数比例で Stack overflow）
+let rec go (i: int) : Op =
+    if i >= rows.Length then Done
+    else
+        let rest = go (i + 1)      // ← これが先に評価される
+        Step(rows.[i], rest)
+
+// ✅ Compute で「次を要求されてから 1 行だけ」作る
+let rec go (i: int) : Op =
+    if i >= rows.Length then Done
+    else Compute(fun () -> ret (Some(rows.[i], go (i + 1))))
+```
+
+実測（2026-10-08・Debug・Linux）: 同形の再帰は **約 131,000 段で Stack overflow（exit 134）**。
+10 万行の `COUNT(*)` スキャンは壁の **約 76%** を既に使っていた。
+1MB スレッドの環境（Windows 等）では壁は 1〜2 万段まで下がる。
+該当していたのは `Op.ofArray`（=`Scan.table` の全表スキャン / `byIndex` /`sortBy`）、
+GROUP BY の `chain`、`innerJoin`・`leftJoin` のマッチ腕で、2026-10-08 にすべて `Compute` ラップへ修正済み。
+
+### 2.2 継続を「別ループ」に飛ばすと結果が落ちる
+
+```fsharp
+// ❌ filter が効かない（偽の行がそのまま流れ落ちる）
+let rec go (src: Op) : Op =
+    Compute(fun () ->
+        next src
+        >>= function
+        | Some(row, nxt) -> ret (Some(row, go nxt))   // ← ここが `nxt`
+        | None -> ret None)
+```
+
+`go nxt` は「**まだ述語を通していない**残り」を表すので、正しくは `nxt` をそのまま渡す。
+`go nxt` にすると「述語を通した列」と「通していない列」が交互に出る。
+
+**同じ罠は `Op.map` / `innerJoin` / `leftJoin` にもあった。**
+
+```fsharp
+// ❌ 内側ループの 2 行目以降が消える（JOIN で 3 行あるはずが 2 行になる）
+| Ok true -> Op.Step(Array.append lrow rrow, go lnext)
+// ✅ 同じ左行の「次の右行」へ続ける
+| Ok true -> Op.Step(Array.append lrow rrow, inner rest lrow lnext)
+```
+
+**教訓: 「継続」は必ず「今の位置の残り」を表す。ループを作り直さない。**
+
+### 2.3 `Op.toArray` に `>>>` チェーンを使うとスタックオーバーフロー
+
+```fsharp
+// ❌ 10 万行で SIGABRT
+let rec go (cur: Op) (acc: SqlValue array list) =
+    next cur
+    >>= function
+    | None -> ret (List.rev acc |> List.toArray)
+    | Some(row, nxt) -> go nxt (row :: acc)
+```
+
+`>>=` が F# の末尾呼び出し最適化を**妨げる**ため、フレームが 1 行ずつ増える。
+`Array.take` で最後に `List.rev` する形は **O(n²)** でもある。
+
+```fsharp
+// ✅ 末尾位置の match + let rec。フレームが増えない。
+let rec go (cur: Op) : Result<SqlValue array array, DbError> =
+    match next cur with
+    | Error e -> Error e
+    | Ok None -> Ok(rows.ToArray())
+    | Ok(Some(row, nxt)) ->
+        rows.Add row
+        go nxt
+```
+
+**教訓: 「再帰 + `>>=`」組み合わせは使わない。`match` を書いて末尾位置を保つ。**
+
+### 2.4 `Op.distinct` は「直前の値」比較では書けない
+
+`2, 1, 2` という入力では「直前の `1` と今の `2`」は違うので、重複除去できない。
+
+```fsharp
+// ❌ 2 が 2 回目に出るので除去されない
+// ✅ 既出の値を全部覚える（Set<string> / HashSet）必要がある
+```
+
+---
+
+## 3. `Optimizer.exec` の罠
+
+### 3.1 下へ渡すのは「入力スキーマ」
+
+```fsharp
+let rec exec (ctx: ExecContext) (tree: Logical) (schema: Schema) : Result<Op, DbError> =
+    match tree with
+    | Limit(_, _, child) ->
+        let childSchema = outputOf ctx child schema     // ← child の**出力**スキーマ
+        exec ctx child childSchema                     // ← ❌ これを渡すと破綻
+```
+
+`outputOf ctx child schema` は「**child の出力**スキーマ」であって、「child を**実行**するときの**入力**スキーマ」ではない。
+
+これを間違えると、集約ノードが「集約後のヘッダ（`SUM(t.age)` など）」を**入力**として受け取る:
+
+- `SELECT SUM(age) FROM t` → `SUM` が `NULL` になる（引数の `t.age` を評価できない）
+- `GROUP BY age` → `id` でグループ化してしまう
+
+```fsharp
+// ✅ childSchema は「結果を読む側」だけが使う。下へは schema を渡す。
+| Limit(_, _, child) ->
+    let childSchema = outputOf ctx child schema
+    exec ctx child schema
+    |> Result.map (fun op ->
+        let limited = if limit > 0 then Op.take limit op else op
+        ...)
+```
+
+### 3.2 `Aggregate` は「包みを剥がして」探す
+
+`Project` の `child` は `Limit → Sort → Distinct → Aggregate` と包まれている。
+直接 `Aggregate` を match すると**見つからない**。
+
+```fsharp
+// ✅ 包みを全部剥がして探す
+let rec private groupByOf (tree: Logical) : Expr list =
+    match tree with
+    | Logical.Aggregate(groupBy, _, _) -> groupBy
+    | Logical.Having(_, _, _, child) -> groupByOf child
+    | Logical.Distinct child -> groupByOf child
+    | Logical.Sort(_, child) -> groupByOf child
+    | Logical.Limit(_, _, child) -> groupByOf child
+    | Logical.Filter(_, child) -> groupByOf child
+    | _ -> []
+```
+
+### 3.3 `Ops.sortBy` は「修飾つきを先に」試す
+
+集約後の出力では列名が `t.age` のまま残るので、修飾子を先に剥がすと「列 age が存在しません」になる。
+
+```fsharp
+// ✅ 修飾つき → 修飾なしの順で試す
+match Schema.resolve schema c with
+| Ok i -> Ok(i, dir)
+| Error _ ->
+    Schema.resolve schema bare |> Result.map (fun i -> (i, dir))
+```
+
+### 3.4 `Join` の右部分木を捨てると WHERE が消える
+
+`buildLogical` は WHERE を各スキャンの直下へ pushdown して右部分木に持たせる。
+なのに `exec` は `execScan ctx name method` を呼んで **`rTree` を捨てていた**:
+
+- 右テーブルだけを参照する `WHERE b.v = 100` が無効化され**全行**返る
+- 2 テーブルにまたがる WHERE は pushdown 先が無いのに誰も置かず、**黙って無視される**
+
+```fsharp
+// ❌ rTree（pushdown した Filter を含む）が未使用
+| Join(kind, name, method, on, lTree, rTree) ->
+    exec ctx lTree schema >>= fun lOp ->
+        execScan ctx name method >>= fun rOp -> ...
+// ✅ 右部分木をそのまま実行する
+| Join(kind, name, on, lTree, rTree) ->
+    exec ctx rTree rightSchema >>= fun rOp -> ...
+```
+
+あわせて **LEFT JOIN の右（null 供給側）には WHERE を pushdown してはいけない**。
+落とすと「NULL 拡張行を残すか」の判断が変わるので、JOIN の上での評価が必要。
+`WHERE b.v IS NULL`（未一致行だけ残す）だと、入力へ落とした瞬間に**全行**になる。
+
+- 修復: `buildLogical` は INNER のみ pushdown、LEFT は top へ回す。
+  どのテーブルにも属さない述語も top に置いた。
+- 回帰テスト: `DatabaseTests` の `Database: JOIN の WHERE は右テーブルと横断述語に効く` /
+  `Database: LEFT JOIN の WHERE は null 供給側に効く`
+
+---
+
+## 4. LSM / ストレージの罠
+
+### 4.1 点検索に `rangeScan` を使うと O(n)（10 万倍遅くなる）
+
+```fsharp
+// ❌ 点検索なのに「そのキー以降の全エントリ」を挽いている
+let fromMem =
+    Memtable.rangeScan engine.Mem key 0
+    |> Seq.map (...)
+    |> firstVisible visible key
+```
+
+10 万行で **1 回 43 ms**。
+`SELECT COUNT(*)` 全体（10 万行走査）が 0.2 秒なので、点検索のほうが**全走査より 200 倍遅い**という異常な状態だった。
+
+```fsharp
+// ✅ 点ルックアップ（O(log n)）を使う
+let fromMem =
+    match Memtable.getVisible engine.Mem key visible with
+    | None -> ret None
+    | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
+```
+
+**教訓: 点検索・prefix 検索に `rangeScan` を使わない。`getVisible` を使う。**
+
+### 4.2 `scanAt` の `startKey` は SSTable に効かない（**再オープン後だけ露見する**）
+
+```fsharp
+// ❌ 枝刈りだけして中身は全部 merge する
+let files =
+    Version.allFiles engine.Version
+    |> List.filter (fun f -> SstEntry.compareBytes f.Largest startKey >= 0)
+// ... そのままだと startKey より前のエントリも混ざる
+```
+
+`memtable` 側は `Memtable.rangeScan` が下限を適用するので、**同一プロセス内では動く**。
+**reopen すると memtable が空になり、SSTable だけになることで初めて壊れる。**
+
+```fsharp
+// ✅ merge 後に下限を適用する
+let sliced =
+    if Array.isEmpty startKey then merged
+    else merged |> Array.filter (fun e -> SstEntry.compareBytes e.Key startKey >= 0)
+```
+
+**教訓: 「ファイルを選ぶ枝刈り」と「中身の下限」は別物。両方をやる。**
+
+### 4.3 prefix 検索は「1 件目が答え」ではない
+
+```fsharp
+// ❌ scanAt の 1 件目が別の値であることがある
+RowStore.scanAt store ks prefix visible 0
+|> Result.map (fun rows -> if rows.Length = 0 then None else Some rows.[0])
+
+// ✅ 接頭辞一致を検査してから取る
+RowStore.scanAt store ks prefix visible 0
+|> Result.map (fun rows ->
+    rows
+    |> Array.tryFind (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix)
+    |> Option.bind snd)
+```
+
+`WHERE name = 'carol'` が `alice` の行を返すrowseのがこれ。
+
+### 4.4 `Manifest.logAndApply` が `NextFileNumber` を進めていないとデータを消す
+
+compaction の出力が入力と同じファイル番号になり、`deleteObsolete` が
+**自分で書いたファイルを消す**。`logAndApply` 内で `max(追加ファイルの番号) + 1` まで進めること。
+
+併せて `Compaction.compact` には `nextFileNumber` を**明示引数**で渡す
+（`version.NextFileNumber` は MANIFEST 反映後にしか更新されない）。
+
+### 4.5 `Version.filesForPointLookup` が `v.Files.[0]` だけ見ていた
+
+compaction で L1+ に降ろしたデータが一切見つからなくなった。
+
+```fsharp
+// ❌ L0 しか見ていない
+// ✅ 全レベルを走査し (level, fileNumber) の降順で並べる
+Array.mapi (fun level files -> ...)
+```
+
+### 4.6 `Sstable.FooterSize` の変更は `decodeFooter` と成套で
+
+`MaxSeqNo` を追加したときは `FooterSize` を `72 → 80` に。
+**放置するとファイル名の長さがずれて、.footer の読み取りが壊れる。**
+
+---
+
+## 5. MVCC / トランザクションの罠
+
+### 5.1 put と tombstone に同じ SeqNo を書くと tombstone が消える
+
+LSM の規則「同じキーでは SeqNo が大きい put が勝つ」により、
+**同じ SeqNo の put と delete が同居すると、tombstone が負ける。**
+
+```fsharp
+// ❌ 全部 0UL にしていた
+// ✅ 現在値から採番して単調増加させる
+let nextSeq = engine.NextSeqNo
+```
+
+### 5.2 reopen 時に SeqNo を再開しないと「全部未来」で見えない
+
+`RowStore.openStore` が keyspace を**開かず** `Engines = Map.empty` にしていたため、
+`Database.openWith` の `TransactionManager.create ()` が `LastCommitSeqNo = 0` になり、
+**ディスク上の行がすべて「未来」**と判定されて **0 行**になっていた。
+
+```fsharp
+// ✅ 既存 keyspace を全部開いて、SeqNo を再開する
+let openStore (root: string) : Result<RowStore, DbError> =
+    protect (fun () -> Directory.CreateDirectory(root) |> ignore)
+    |> Result.bind (fun () ->
+        let known =
+            Directory.GetDirectories(root)
+            |> Array.choose (fun dir ->
+                let name = Path.GetFileName dir
+                match Keyspace.tryFromDirName name with
+                | Some ks -> Some(ks, dir)
+                | None -> None)
+        // ... 全ての StorageEngine.openDatabase を engines に積む ...)
+    // ...
+
+// ✅ 開いた engine から SeqNo を復元する
+let lastSeqNo (store: RowStore) : uint64 =
+    store.Engines
+    |> Map.toList
+    |> List.fold
+        (fun acc (_, (e, _)) -> max acc (if e.NextSeqNo = 0UL then 0UL else e.NextSeqNo - 1UL))
+        0UL
+```
+
+### 5.3 GC の SeqNo 判定は「snapshot が小さいほどまだ読まれている」
+
+snapshot `S` の読み手は `SeqNo <= S` の版を見る。
+つまり **SeqNo が小さい版こそ、まだ読まれている**。
+
+```fsharp
+// ❌ データ損失になる誤った判定
+let obsolete = Version.allFiles version
+               |> List.filter (fun f -> f.MaxSeqNo < activeSnapshot)
+```
+
+正しい方針:
+
+- **版（エントリ）単位の GC**: 同キーのうち SeqNo 最大の版は**必ず残す**。
+  その次に新しい版のうち `SeqNo < activeSnapshot` のものだけ捨てる。
+- **ファイル単位の回収は SeqNo で判定しない**。LevelDB と同じ
+  「Version が参照していないファイル」だけ（MANIFEST 反映前に取り残されたものの掃除用）。
+
+### 5.4 `Transaction.Buffers` は「同一キーに put と delete を書くと打ち消し合う」
+
+```fsharp
+type Transaction =
+    {
+        Buffers: Map<string, Map<byte array, SqlValue array option>>
+        //                                       ^^^^ これが option
+    }
+```
+
+`Dml.updateByPrimaryKey` の「delete → put」は**この構造で壊れる**ので、
+「put だけ」（LSM は新しい SeqNo の put が旧 put を隠す）に変更。
+
+索引側は「値が変わるときだけ 古い索引キーへ tombstone → 新しい索引キーへ put」。
+
+### 5.5 `TransactionManager.create ()` を 2 回呼ぶと SeqNo が衝突する
+
+テストで `TransactionManager.create ()` を 2 回呼ぶと、
+両方とも SeqNo 1 から採番し、2 つ目の transaction の書き込みが**先に見えた上位の SeqNo に隠される**。
+
+```fsharp
+// ✅ beginTxn の戻り値を次の transaction に引き継ぐ
+let (mgr, txn) = TransactionManager.beginTxn mgr
+// ... uzzyな処理 ...
+let (mgr, txn2) = TransactionManager.beginTxn mgr
+```
+
+### 5.6 `Database.Execute` は新しい `Database` を返す
+
+ハンドルは**不変**。
+
+```fsharp
+// ❌ 書き込みが失われる
+db.Execute "INSERT ..." |> ignore
+
+// ✅ 戻り値を持ち替える
+let db2, _ = db.Execute "INSERT ..."
+```
+
+---
+
+## 6. 索引（index）の罠
+
+### 6.1 索引選択が緩いと「別の列の索引」を引く
+
+`chooseScanMethod` の判定が:
+
+```fsharp
+// ❌ 1 列の索引なら列名に関係なく当ててしまう
+let found =
+    idxes
+    |> List.tryFind (fun i ->
+        i.Columns |> List.forall (fun c -> Catalog.eqName c colName)
+        || i.Columns.Length = 1)
+```
+
+`CREATE INDEX ON t (name)` と `ON t (age)` の両方があれば、
+`WHERE name = 'bob'` が **age の索引**を引いて 0 行になっていた。
+
+```fsharp
+// ✅ 索引の列が検索列と完全に一致するものだけを使う
+let found =
+    idxes
+    |> List.tryFind (fun i ->
+        match i.Columns with
+        | [ c ] -> Catalog.eqName c colName
+        | _ -> false)
+```
+
+### 6.2 `Catalog.toSchema` は `Indexes = []` で埋まる
+
+索引を定義しても実行系の `TableSchema.Indexes` に載らないと、
+`Scan.byIndex` が「索引が無い」と言って検索に失敗する。
+
+```fsharp
+// ✅ contextOf で明示的に載せる
+let withIndexes =
+    { schema with
+        Indexes = Catalog.indexSchemasOf state.Catalog t.Name }
+```
+
+### 6.3 `CREATE INDEX` に backfill が無いと過去行が見つからない
+
+索引は**別の keyspace**（`i:<name>`）に持つので、
+`CREATE INDEX` 時に中身を写さないと、**その前に `INSERT` した行が検索に出てこない**。
+
+```fsharp
+// ✅ 既存行を index keyspace に書き込む
+Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
+|> Result.bind (fun rows ->
+    rows |> Array.fold (fun acc row ->
+        let key = RowKey.indexKey withIndex idx row
+        Ok(Transaction.put t (Keyspace.index idx.Name) key row)) (ret txn))
+```
+
+### 6.4 `Dml.getByIndex` は「完全な行」が契約
+
+`RowKey.indexPrefix` は `row.[schema.IndexOf name]` を使うので、
+**完全な行**を要求する。索引の値だけを持つ実行計画からは `IndexOutOfRangeException` になる。
+
+```fsharp
+// ✅ 値だけで引くなら専用の関数を使う
+Dml.scanByIndexPrefix store index visible values 0
+```
+
+---
+
+## 7. SQL 意味論の罠
+
+### 7.1 SQL の評価順は「集約 → 並び替え → 射影 → DISTINCT → LIMIT」
+
+`DISTINCT` を射影の前にすると `(id, g)` の組を重複排除してしまう。
+
+```fsharp
+// ✅ DISTINCT は射影の後
+let projected = Project(items, withSorted)
+let deduped = if stmt.Distinct then Distinct projected else projected
+applyLimit deduped stmt
+```
+
+### 7.2 `AggCall` の第 2 引数は「DISTINCT フラグ」
+
+`COUNT(*)` は**引数が `Star` かどうか**で `isStar` を判定する。
+
+```fsharp
+// ✅ COUNT(*) は Star で表す
+AggCall(AggFunc.Count, false, Star)
+// ✅ COUNT(DISTINCT a) は第 2 引数が true
+AggCall(AggFunc.Count, true, Name "a")
+```
+
+第 2 引数を `isStar` と誤解すると `COUNT(DISTINCT a)` が解析できない。
+
+### 7.3 `COUNT(*)` は NULL を数える。`COUNT(列)` は数えない
+
+`addAcc` の `isStar` 分岐を**先に**置かないと、`Some Null` が「NULL を無視」側に落ちて **0** になる。
+
+### 7.4 `InList` の未一致は FALSE であって UNKNOWN ではない
+
+SQL 標準の 3 値論理:
+
+```fsharp
+// ❌ 5 IN (1,2) が NULL になる
+| [] -> ret Null
+// ✅ 一致すれば TRUE / どれも一致しなければ FALSE /
+//    NULL 比較が 1 つでもあれば UNKNOWN
+| [] -> if sawUnknown then ret Null else ret (Bool negated)
+```
+
+### 7.5 `LIKE` のバックトラックは「進捗保証」が無いと無限ループ
+
+テストプロセスが **SIGABRT / exit 134** で落ちた。
+
+`%` で分割 → 区間を左から順に前方一致で探す、という**単純な走査**に書き換えた。
+`%` で `go (pi+1) ti pi ti` のように `ti` が進まず、`star+1` のリトライが永久に終わらない。
+
+**教訓: バックトラックする再帰には必ず「進捗が必ず進む」保証を書く。**
+
+---
+
+## 8. F# 10 の言語の罠
+
+### 8.1 主コンストラクタの中に副作用のある呼び出しを単独で書けない
+
+```fsharp
+// ❌ FS0010 "Unexpected identifier in member definition"
+type T(host: string, port: int) =
+    let client = new TcpClient()
+    client.Connect(host, port)   // ← ここ
+    member _.Port = port
+
+// ✅ コンストラクタ引数で接続を成立させる
+type T(host: string, port: int) =
+    let client = new TcpClient(host, port)
+    member _.Port = port
+```
+
+### 8.2 `Result` の共用体ケース名が衝突する
+
+```fsharp
+// ❌ Reply.Ok が Result.Ok を shadow して全部壊れる
+type Reply = | Ok of ... | Error of string
+// ✅ 名前を変える
+type Reply = | Rows of ... | Failure of string | Halt
+```
+
+### 8.3 `let private rec` の順序は逆
+
+```fsharp
+// ❌ FS0110
+let private rec f x = ...
+// ✅
+let rec private f x = ...
+```
+
+### 8.4 namespace 直下には値を置けない（FS0201）
+
+```fsharp
+// ❌ FS0201
+namespace RykDb.Core
+let myHelper x = ...     // ← 不可
+// ✅ module に入れる
+namespace RykDb.Core
+module MyModule =
+    let myHelper x = ...
+```
+
+### 8.5 型の member から同じファイルの後にある `let` を見られない
+
+```fsharp
+type Catalog =
+    { Tables: TableDefinition list }
+    // ← この member から下の updateTables が見えない
+    member this.Count = this.Tables.Length
+
+let updateTables t ... = ...   // ← member から参照不可
+```
+
+→ **検索・更新は module 関数**にする。
+
+### 8.6 `Result.all` は `seq` を要求する
+
+```fsharp
+// ❌ 推論が壊れる
+Result.all [ r1; r2 ]
+// ✅ Lattice.combine（自作の List 版）を使う
+Lattice.combine [ r1; r2 ]
+```
+
+同名 module は 1 アセンブリに 1 つだけなので、`Planner.fs` では `Results` に改名している。
+
+### 8.7 `SqlValue` は `:?>` できない（FS0016）
+
+proper subtype がないので型テストできません。
+
+```fsharp
+// ❌ FS0016
+match v with :? SqlValue.Int n -> ...
+// ✅ ヘルパー
+let asInt (v: SqlValue) = match v with | SqlValue.Int n -> n | _ -> 0L
+```
+
+### 8.8 `Binary` などの「引数 3 つ」のケースはタプル形
+
+```fsharp
+// ❌ FS0727
+| Binary(op, _, _) -> ...
+// ✅
+| Binary(op, a, b) -> ...
+```
+
+### 8.9 `Array.takeWhile` は「配列を全部見る」
+
+`Scan.byIndexPrefix` では「先頭から連続する接頭辞一致」を取りたいので `takeWhile` を使いますが、
+**ファイル側の下限が効いていないと 1 件も一致しません**（§4.2 を参照）。
+
+### 8.10 予約語
+
+`default` / `value` / `old` / `type` / `base` は変数名・引数名に使えない。
+
+```fsharp
+// ❌ base は予約語
+let f (base: Schema) = ...
+// ✅
+let f (tree: Logical) = ...
+```
+
+モジュール名に使えないのもある（`CompactionOptions.default` → `CompactionOptions.defaults`）。
+
+`key` / `base` / `begin` / `new` / `old` / `type` / `value` は**匿名レコードのフィールド名にも使えません**。
+
+```fsharp
+// ❌ 予約語と衝突
+let private entryKey ... = { Key = ... }
+
+// ✅ 動詞で始る名前にする
+let private hashKey (e: Entry) = ...
+let private writeByte (w: Writer) = ...
+```
+
+モジュール名と型名が同じ（`BlockCache` / `Wal` / `Memtable`）と
+`Module.field` が型と取り違えられます。型注釈付きのヘルパー経由で構築してください。
+
+### 8.11 ローカル関数名が外側の関数と被ると後者が優先される
+
+```fsharp
+// ❌ pickMax (2 引数) に解決されて壊れる
+let pickMaxFrom gs = pickMax (gs + 1) gs ge
+// ✅ 名前を変える
+let pickMaxFrom gs = pickMaxIdx (gs + 1) gs ge
+```
+
+### 8.12 `op_GreaterGreaterEquals` の連鎖で末尾再帰が壊れる
+
+`Result` のbind を `>>=` で重ねると F# の末尾呼び出し最適化が効かない。
+**「再帰 + `>>=`」の組み合わせは使わない**（§2.3 を参照）。
+
+### 8.13 `use` は主コンストラクタに書けない（FS0523）
+
+```fsharp
+// ❌ FS0523
+type T() =
+    use stream = ...
+// ✅ let で持って Dispose で破棄
+type T() =
+    let stream = ...
+    interface IDisposable with
+        member _.Dispose() = stream.Dispose()
+```
+
+### 8.14 `member _.Foo = _.Bar` の短縮ラムダは atomic 式のみ
+
+```fsharp
+// ❌ FS3584
+member _.Query sql = _.Send sql
+// ✅
+member this.Query sql = this.Send sql
+```
+
+### 8.15 F# 10 では型注釈付きの戻り値宣言は 1 行
+
+```fsharp
+// ❌ FS0058
+let rec go (rest: T list) (acc: Map<string, int>) :
+    Result<string list * Map<string, int>, DbError> =
+    ...
+// ✅ 引数リストを複数行にして、戻り値型も 1 行で
+let rec go
+    (rest: T list)
+    (acc: Map<string, int>)
+    : Result<string list * Map<string, int>, DbError> =
+    ...
+```
+
+---
+
+### 8.16 `[<TailCall>]` は末尾位置に置けたときだけ付ける（FS3569）
+
+`TreatWarningsAsErrors=true` なので、属性を付けた関数の自己再帰が 1 つでも
+末尾位置に来ないと **FS3569 がビルドエラーになる**（2026-10-08 に 61 error）。
+最小プローブで位置ごとに実測した結果は次のとおり。
+
+| 書き方                                             | 判定      |
+| -------------------------------------------------- | --------- |
+| `match f x with` の**枝**で `f (n-1)`              | ✅ 末尾   |
+| `match 別関数 x with` の枝で `f (n-1)`             | ✅ 末尾   |
+| `if ... then f (n-1) else ...`（本体レベル）       | ✅ 末尾   |
+| ネストした `let rec go` の本体                     | ✅ 末尾   |
+| ラムダの本体が**そのまま** `f (n-1)`               | ✅ 末尾   |
+| `match f x with`（自己再帰がスラフ値）             | ❌ FS3569 |
+| `f (n-1) \|> Result.map g` / `g (f (n-1))`（引数） | ❌ FS3569 |
+| `f (n-1) >>= fun ... ->`（レシーバ = 引数）        | ❌ FS3569 |
+| ラムダの本体が `if` で、枝に `f (n-1)`             | ❌ FS3569 |
+
+「評価結果を**消費してから**次をする」再帰（`>>=` / `Result.map` / スラフ値）は
+構造上どうしても末尾にならない。選択肢は 2 つ。
+
+```fsharp
+// ❌ FS3569（結果を消費してから整形する）
+exec ctx child schema |> Result.map (fun op -> Ops.sortBy schema op keys)
+
+// ✅ 属性を外して理由をコメントで残す
+// [<TailCall>] を付けない理由: 子の Result を消費するため末尾にならず FS3569 になる。
+// 深さは論理木の深さ（式は MaxExpressionDepth = 200）で頭打ちになる。
+exec ctx child schema |> Result.map (fun op -> Ops.sortBy schema op keys)
+
+// ✅ あるいは「積む側」と「回す側」に分けて本当に末尾再帰にする
+let rec readColumns n c acc =
+    match readColumn c with
+    | Error e -> Error e
+    | Ok(cd, c1) -> readColumns (n - 1UL) c1 (cd :: acc)   // 末尾
+```
+
+**要素数に比例する反復は必ず後者にする**（`match` に直せば末尾になる）。
+`>>=` で受けると候補の数・WHEN 節の数だけスタックが積まれる。
+該当は `IN` の候補リストと `CASE` の WHEN 節（`Eval.eval`）で、
+回帰テストは `ExecutorTests` の `末尾再帰: 巨大な IN 候補と WHEN 節を評価できる`。
+
+属性の無い関数（ローカル `let rec` 含む）まで含めた**反復検証**は
+`dotnet run --project tools/TailAudit`（既知分は `tools/TailAudit/TailAudit.baseline` と差分を取り、
+新規があれば exit 1。追認は内容確認のうえ `-- --update`）。
+
+---
+
+## 9. テスト・ビルドの罠
+
+### 9.1 `[<Fact>]` は関数でない let 束縛に付くと黙って無視される（FS0842）
+
+```fsharp
+// ❌ 実行されない（FS0842 が警告、しかしエラーに昇格しない）
+let ``説明`` = assertEqual 1 1
+// ✅ 関数形
+let ``説明`` () = assertEqual 1 1
+```
+
+「全部緑だが 0 件走っていない」壊れた状態になる。
+**リフレクションで `[<Fact>]` を数えるテスト自身**を置いた。
+
+### 9.2 `withDir` はディレクトリを作らない
+
+```fsharp
+// ❌ ディレクトリが無いので失敗する
+let withDir tag f = f ("/tmp/" + tag)
+// ✅ 明示的に作る
+let withDir tag f =
+    let dir = Path.Combine(Path.GetTempPath(), sprintf "rykdb-%s-%d" tag DateTime.Now.Ticks)
+    Directory.CreateDirectory dir |> ignore
+    try f dir finally Directory.Delete(dir, true)
+```
+
+### 9.3 `Assert.Equal<int64>(3L, list.Length)` は通らない
+
+`list.Length` は `int`。`Assert.Equal<int>(3, list.Length)` にしてください。
+
+### 9.4 `dotnet build` / `dotnet test` を並行で走らせない
+
+ビルドロック競合で謎の `Error` が出る。**逐次実行**すること。
+
+並行にすると incremental state が壊れ、
+`StorageEngine.fs(338): error FS0039 'isEmpty' is not defined`
+のような**幻影エラー**が出ます（ソース自体は正しい）。
+
+### 9.5 テストが SIGABRT すると件数が不定になる
+
+実行済み分だけ報告される。`--logger "console;verbosity=detailed"` で個別に切り分ける。
+
+### 9.6 乱数生成のテストは seed 固定だと退行する
+
+`let rnd () = Random(seed)` は全ケースが同じ値になり、バグを検出できないまま緑になる。
+
+モジュールスコープに `Random` を 1 つ置き、「テストデータ: 乱数生成器が実際に多様な値を返す」で明示的にアサートする。
+
+---
+
+## 10. デバッグ手法
+
+### 10.1 `/tmp/probe.fsx` で DLL を直接叩く
+
+```fsharp
+#r "src/RykDb.Core/bin/Debug/net10.0/RykDb.Core.dll"   // リポジトリルートからの相対パス
+open RykDb.Core
+
+let ok r = match r with | Ok v -> v | Error e -> failwithf "%s" (DbError.toDisplayString e)
+
+let dir = "/tmp/probe-db"
+if System.IO.Directory.Exists dir then System.IO.Directory.Delete(dir, true)
+
+let db0 = ok (Database.openWith dir)
+let db1, _ = ok (db0.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
+// ... 1 演算子ずつ確認 ...
+```
+
+**重要: DLL をコピーしないこと。** FSI は `/tmp/probe.dll` のようなパスをキャッシュする。
+**呼び出し側が同じ DLL を参照しているか**確認すること。
+
+### 10.2 データが本当にディスクに書かれたか確認
+
+keyspace ごとに base64 のディレクトリができる（`t:people` → `dDpwZW9wbGU=`）。
+
+```fsharp
+System.IO.Directory.GetFiles(dir, "*", System.IO.SearchOption.AllDirectories)
+|> Array.iter (fun f -> printfn "%s (%d B)" f (int (System.IO.FileInfo f).Length))
+```
+
+### 10.3 treap の検索が O(n) になっていないか
+
+`Memtable.getVisible` を使うようにすると **43 ms → 0.3 ms** になった。
+「点検索が遅い」BANはまず `rangeScan` を使っていないか確認する。
+
+### 10.4 fantomas で整形したら必ずリビルド
+
+```bash
+dotnet fantomas tests/RykDb.Tests/
+dotnet build -t:Rebuild   # FS0020（戻り値の無視）などは整形後に増える
+```
+
+---
+
+## 11. 設計上の注意点
+
+`architecture.md` §15.3 にあった「**コードから触ってはいけないこと**」の記録です。
+項目ごとの詳しい症状・原因は下の各節にあります。
+
+| #   | 注意点                                | 詳細         |
+| --- | ------------------------------------- | ------------ |
+| 1   | **`Op` の継続を飛ばさない**           | §2.2         |
+| 2   | **`exec` には「入力スキーマ」を渡す** | §3.1         |
+| 3   | **再帰を `>>=` で組まない**           | §2.3 / §8.12 |
+| 4   | **点検索に `rangeScan` を使わない**   | §4.1         |
+
+### 11.1 `Array.take` に「全部」を表す巨大数を渡さない
+
+FSharp.Core の `Array.take` は `Seq.take` 相当で、要素数が足りないと
+`The input sequence has an insufficient number of elements.`
+で落ちます（`Int32.MaxValue` を「全部」の意で渡さない）。
+
+### 11.2 ファイル番号を巻き戻さない
+
+`NextFileNumber` は MANIFEST に残りません（§4.4）。
+復旧時にディスク上の最大番号より小さい値に戻すと、
+**次の flush が既存の SSTable を上書きしてデータを失います。**
+復旧時は必ず `maxFileNumberOnDisk + 1` で上へ進めます。
+
+### 11.3 削除は主キー + 全索引に墓碑を書く
+
+keyspace を分けている代償として、削除は主キー側に加えて**全索引にも
+tombstone を書き込みます。** 索引側を忘れると、
+索引経由の検索で**削除済みの行が復活します**。
+
+### 11.4 MANIFEST を先に、ファイル削除を後にする
+
+compaction / version 適用では **MANIFEST への反映が先、入力ファイルの削除が後**です。
+逆順にすると「MANIFEST は新しいがファイルは古い」状態になり、
+**データ損失**になります（§4.4 参照）。
+
+### 11.5 SSTable の検証はレコードの構造比較を使ってはいけない
+
+並びは「キー昇順・同一キーは SeqNo 降順」（`SstEntry.compare`）です。
+レコードの構造比較（F# のレコード等価）はこの順序と一致しないため、
+検証に使うと正しく並んでいるファイルを「壊れている」と誤判定します。
+
+### 11.6 順序保持符号化の実装ミス（キー順が壊れる）
+
+- `int64` の順序写像に `~~~` は**使えません**。`-1` のビットパターンが全 1 なので反転すると
+  最小になり `-2` より小さく並びます。正しくは `mapInt64 v = (uint64) v + 0x8000000000000000UL`。
+- `DECIMAL` の raw ビット列（96bit + スケール）も順序保持になりません。
+  内部表現は `(符号, 10進指数, 桁列 29 桁右詰め)` で、**負数は指数も桁列も両方反転**します。
+- `Double.NaN` は .NET では符号ビットが立っています。正の quiet NaN に正規化しないと
+  キー順が壊れます（`SqlValue.normalizeFloat`）。

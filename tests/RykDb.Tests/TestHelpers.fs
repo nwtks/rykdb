@@ -1,0 +1,167 @@
+// ---------------------------------------------------------------------------
+// テスト共通の補助。各テストファイルから `open RykDb.TestHelpers` で使う。
+// ---------------------------------------------------------------------------
+
+module internal RykDb.TestHelpers
+
+open System
+open System.IO
+open System.Text
+open Xunit
+open RykDb.Core
+
+/// Entry option を None ならテストを落とす。
+let entry (e: Entry option) =
+    match e with
+    | Some v -> v
+    | None ->
+        Assert.Fail "エントリが見つかりません"
+        Unchecked.defaultof<Entry>
+
+/// Result が Ok でなければテストを落とす。Err なら DbError を表示する。
+let ok (r: Result<'T, DbError>) : 'T =
+    match r with
+    | Ok v -> v
+    | Error e ->
+        Assert.Fail(sprintf "Result が Error でした: %s" (DbError.toDisplayString e))
+        Unchecked.defaultof<'T>
+
+/// Result の Ok 値を取り出す。Err なら 0 を返す（数値比較の補助など）。
+let okOr defaultValue (r: Result<'T, DbError>) : 'T =
+    match r with
+    | Ok v -> v
+    | Error _ -> defaultValue
+
+/// 一意な一時ディレクトリを作る。
+let newDir (tag: string) =
+    let dir =
+        Path.Combine(Path.GetTempPath(), sprintf "rykdb-%s-%d" tag DateTime.Now.Ticks)
+
+    Directory.CreateDirectory dir |> ignore
+    dir
+
+/// 一時ディレクトリ内でテストを実行し、最後に削除する。
+let withDir (tag: string) (f: string -> unit) =
+    let dir = newDir tag
+
+    try
+        f dir
+    finally
+        if Directory.Exists dir then
+            try
+                Directory.Delete(dir, true)
+            with _ ->
+                ()
+
+/// INTEGER でなければテストを落とす。
+let asInt (v: SqlValue) =
+    match v with
+    | SqlValue.Int n -> n
+    | _ ->
+        Assert.Fail(sprintf "INTEGER ではありません: %A" v)
+        0L
+
+/// TEXT でなければテストを落とす。
+let asText (v: SqlValue) =
+    match v with
+    | SqlValue.Text s -> s
+    | _ ->
+        Assert.Fail(sprintf "TEXT ではありません: %A" v)
+        ""
+
+/// `Database.Execute` の戻り値を「新しいハンドル」に持ち替える。
+let exec (db: Database) (sql: string) =
+    let next, _ = ok (db.Execute sql)
+    next
+
+/// 実行して結果だけ返す。
+let query (db: Database) (sql: string) =
+    let _, r = ok (db.Query sql)
+    r
+
+/// `toSqlLiteral` で 1 行を文字列化する（クライアント比較用）。
+let rowText (r: StatementResult) =
+    r.Rows
+    |> Array.toList
+    |> List.map (fun row -> row |> Array.map SqlLiteral.toSqlLiteral |> String.concat ",")
+
+// ---------------------------------------------------------------------------
+// 決定的テストのため固定シードを使う。
+// ---------------------------------------------------------------------------
+
+/// Random はモジュールスコープに 1 つだけ置く（決定的・mutable 不使用）。
+let private rng = Random 20261004
+let private rnd () = rng
+
+let nextInt (lo: int) (hi: int) = rnd().Next(lo, hi)
+
+/// NUL・制御文字・多バイト文字を混ぜた文字列を作る（escape 経路と
+/// UTF-8 バイト順 = コードポイント順の検証）。
+let randomText () =
+    let r = rnd ()
+    let len = r.Next(0, 14)
+    let sb = StringBuilder()
+
+    for _ in 1..len do
+        match r.Next(0, 9) with
+        | 0 -> sb.Append(char 0) |> ignore
+        | 1 -> sb.Append(char 1) |> ignore
+        | 2 -> sb.Append(char 0xFF) |> ignore
+        | 3 -> sb.Append 'a' |> ignore
+        | 4 -> sb.Append 'z' |> ignore
+        | 5 -> sb.Append(char (r.Next(32, 127))) |> ignore
+        | 6 -> sb.Append(char (r.Next(0x80, 0x800))) |> ignore
+        | 7 -> sb.Append(char (r.Next(0x0800, 0xD800))) |> ignore
+        | _ -> sb.Append(char (r.Next(0xE000, 0xFFFD))) |> ignore
+
+    sb.ToString()
+
+let randomValue () =
+    let r = rnd ()
+
+    match r.Next(0, 10) with
+    | 0 -> SqlValue.Null
+    | 1 -> SqlValue.Bool(r.Next 2 = 0)
+    | 2 -> SqlValue.Int(int64 (r.Next(-5000, 5000)))
+    | 3 -> SqlValue.Real(float (r.Next(-5000, 5000)) / float (r.Next(1, 8)))
+    | 4 -> SqlValue.Decimal(decimal (r.Next(-5000, 5000)) / decimal (r.Next(1, 8)))
+    | 5 -> SqlValue.Text(randomText ())
+    | 6 -> SqlValue.Blob(Array.init (r.Next(0, 8)) (fun _ -> byte (r.Next(0, 256))))
+    // DateOnly.FromDayNumber は 0..DateOnly.MaxValue.DayNumber のみ受け付ける
+    | 7 -> SqlValue.Date(DateOnly.FromDayNumber(r.Next(0, 3_650_000)))
+    | 8 -> SqlValue.Timestamp(DateTimeOffset(DateTime(r.Next(0, 2_000_000_000), DateTimeKind.Utc)))
+    | _ -> SqlValue.Uuid(Guid(Array.init 16 (fun _ -> byte (r.Next(0, 256)))))
+
+/// テスト用の全順序。型順位 → 同一型内は SQL 比較。
+let compareForSort (a: SqlValue) (b: SqlValue) =
+    let ra = a |> SqlValue.dataType |> DataType.rank
+    let rb = b |> SqlValue.dataType |> DataType.rank
+
+    if ra <> rb then
+        compare ra rb
+    else
+        match SqlValue.compareValues a b with
+        | Ok c -> c
+        | Error _ -> 0
+
+/// バイト列の辞書順比較（前方が短いほうが小さい）。
+let compareKeyBytes (a: byte[]) (b: byte[]) =
+    let n = min a.Length b.Length
+
+    let rec firstDiff i =
+        if i >= n then
+            compare a.Length b.Length
+        else
+            let c = compare (int a.[i]) (int b.[i])
+            if c = 0 then firstDiff (i + 1) else c
+
+    firstDiff 0
+
+/// 比較結果を見える形にする。型の情報も含めることで描画の衝突を避ける。
+let render (vs: SqlValue[]) =
+    vs
+    |> Array.map (fun v -> (v |> SqlValue.dataType |> DataType.toSqlName) + ":" + SqlLiteral.toSqlLiteral v)
+
+// KeyBuilder の戻り値はそのままバイト列キー
+let keyOf (v: SqlValue) = KeyBuilder.ofValues [ v ]
+let keyOfTuple (vs: SqlValue[]) = KeyBuilder.ofValues vs

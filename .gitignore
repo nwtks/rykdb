@@ -42,7 +42,9 @@ ScaffoldingReadMe.txt
 # Others
 ~$*
 *~
+.fake
 CodeCoverage/
+coverage.*
 
 # MSBuild Binary and Structured Log
 *.binlog

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      FCS は NuGet ではなく SDK 同梱品を参照する。
+      $(MSBuildBinPath) は「ビルドに使っている sdk/<ver>/」を指すので、
+      インストール場所・SDK バージョンに依存せず、fsi/fsc と同じコンパイラで必ず一致する。
+    -->
+    <Reference Include="FSharp.Compiler.Service">
+      <HintPath>$(MSBuildBinPath)/FSharp/FSharp.Compiler.Service.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+</Project>

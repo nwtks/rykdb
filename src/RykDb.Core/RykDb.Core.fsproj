@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <AssemblyName>RykDb.Core</AssemblyName>
+    <RootNamespace>RykDb.Core</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Errors.fs" />
+    <Compile Include="Types.fs" />
+    <Compile Include="Serialization.fs" />
+    <Compile Include="Memtable.fs" />
+    <Compile Include="Wal.fs" />
+    <Compile Include="BloomFilter.fs" />
+    <Compile Include="Sstable.fs" />
+    <Compile Include="VersionSet.fs" />
+    <Compile Include="Manifest.fs" />
+    <Compile Include="Compaction.fs" />
+    <Compile Include="BlockCache.fs" />
+    <Compile Include="StorageEngine.fs" />
+    <Compile Include="Transactions.fs" />
+    <Compile Include="Ast.fs" />
+    <Compile Include="Lexer.fs" />
+    <Compile Include="Parser.fs" />
+    <Compile Include="RowStore.fs" />
+    <Compile Include="Catalog.fs" />
+    <Compile Include="Executor.fs" />
+    <Compile Include="Planner.fs" />
+    <Compile Include="Engine.fs" />
+    <Compile Include="Database.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="RykDb.Tests" />
+  </ItemGroup>
+
+</Project>

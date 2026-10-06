@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RykDb.Cli/RykDb.Cli.fsproj" />
+    <Project Path="src/RykDb.Core/RykDb.Core.fsproj" />
+    <Project Path="src/RykDb.Server/RykDb.Server.fsproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RykDb.Tests/RykDb.Tests.fsproj" />
+  </Folder>
+</Solution>
