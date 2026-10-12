@@ -12,6 +12,9 @@
 //      ローカル let rec には属性を付けられない（FS0010）ためコンパイラでは見られない。
 //      「再帰呼び出しが末尾位置か」を判定し、ラムダ内・入れ子関数の末尾は
 //      保守的に非末尾と数えて、ベースライン（tools/TailAudit/TailAudit.baseline）で既知分を吸収する。
+//      pipe の**関数側**は末尾を継承する（`x |> f a` = `f a x` → 右が関数側、
+//      `f a <| x` = `(f a) x` → 左が関数側）。値側（先に評価される側）は非末尾のまま。
+//      非末尾は「ラムダ内 / 直接」で内訳表示する（直接 = 監査部・引数 = 末尾化候補）。
 //   3) `dotnet test` — 深さが積もる事象を実測（`末尾再帰:` 系テスト・スタック深度）
 //
 // FCS は NuGet ではなく SDK 同梱品を参照する
@@ -65,6 +68,8 @@ type Hit =
         Col: int
         Tail: bool
         Bare: bool
+        /// ラムダ本体の中（Compute/pull 継続・CPS 継続）にある呼び出しか
+        InLambda: bool
     }
 
 type Group =
@@ -87,6 +92,9 @@ let mutable collectPhase = true
 let mutable curGroupLine = 0
 let mutable curGroupNames = ""
 let mutable curGroupAttr = false
+/// 入れ子ラムダの深さ（0 = ラムダの外）。
+/// walk のシグネチャを変えずに「ラムダ内か」を hit へ運ぶ。
+let mutable inLambdaDepth = 0
 
 let unionAll (sets: Set<string> list) = List.fold Set.union Set.empty sets
 
@@ -223,6 +231,7 @@ let hit (fn: string) (r: range) (tail: bool) (bare: bool) (targets: Set<string>)
                         Col = r.StartColumn
                         Tail = tail
                         Bare = bare
+                        InLambda = inLambdaDepth > 0
                     }
 
 // ---------------------------------------------------------------------------
@@ -251,15 +260,23 @@ let rec walk (targets: Set<string>) (shadow: Set<string>) (tail: bool) (e: SynEx
     | SynExpr.App(_, _, funcE, argE, _) ->
         let head, funcArgs = splitApp funcE
 
+        // `x |> f a` = `f a x` なら関数側は右（argE）、
+        // `f a <| x` = `(f a) x` なら関数側は左（funcArgs）。
+        // 演算子の**関数側だけ**は末尾を継承し、値側（先に評価される側）は非末尾のまま。
+        let headName = head |> Option.map (fun (n, _) -> n)
+        let pipeRight = headName |> Option.exists (fun n -> n.StartsWith "op_PipeRight")
+        let pipeLeft = headName |> Option.exists (fun n -> n.StartsWith "op_PipeLeft")
+
         match head with
         | Some(fn, r) -> hit fn r tail false targets shadow
         | None -> ()
 
         // head の後ろに付く引数と head 以外の関数位置はすべて非末尾
+        // （`f a |> g` の f、`a >>= k` の a など。値は先に評価されるため）。
         for a in funcArgs do
-            w shadow false a
+            w shadow (if pipeLeft then tail else false) a
 
-        w shadow false argE
+        w shadow (if pipeRight then tail else false) argE
     | SynExpr.IfThenElse(c, th, el, _, _, _, _) ->
         w shadow false c
         w shadow tail th
@@ -293,7 +310,12 @@ let rec walk (targets: Set<string>) (shadow: Set<string>) (tail: bool) (e: SynEx
             walk targets shadowB false (bindingExpr b)
 
         walk targets shadowBody tail lo.Body
-    | SynExpr.Lambda(_, _, pats, body, _, _, _) -> w (Set.union shadow (simplePatsIds pats)) false body
+    | SynExpr.Lambda(_, _, pats, body, _, _, _) ->
+        // ラムダ本体は「ラムダ内」を立てたうえで非末尾として走査する
+        // （FS3569 はラムダ末尾を許容するが、実行時にはフレームが積みうるため）。
+        inLambdaDepth <- inLambdaDepth + 1
+        w (Set.union shadow (simplePatsIds pats)) false body
+        inLambdaDepth <- inLambdaDepth - 1
     | SynExpr.TryWith(tryE, cases, _, _, _, _) ->
         // .NET の tail. 命令は保護区域内では出せない
         w shadow false tryE
@@ -595,7 +617,20 @@ let currentKeys = nonTail |> List.map keyOf |> List.distinct |> List.sort
 let printSite (h: Hit) =
     let kind = if h.Bare then "bare" else "call"
     let attr = if h.GroupAttr then " [TailCall attr!]" else ""
-    printfn "  %s:%d:%d  grp@%d(%s) -> %s [%s]%s" (rel h.File) h.Line h.Col h.GroupLine h.GroupNames h.Fn kind attr
+    let lam = if h.InLambda then " [lambda]" else ""
+
+    printfn
+        "  %s:%d:%d  grp@%d(%s) -> %s [%s]%s%s"
+        (rel h.File)
+        h.Line
+        h.Col
+        h.GroupLine
+        h.GroupNames
+        h.Fn
+        kind
+        attr
+        lam
+
     printfn "      %s" (srcText h.File h.Line)
 
 // --- CLI 引数（先頭はこのアセンブリのパスなので捨てる） ---
@@ -635,7 +670,20 @@ let unhandledCases =
 
 printfn "===== tail 監査: %s =====" rootN
 printfn "ファイル %d / rec グループ %d（相互再帰 %d・[<TailCall>] 付き %d）" files.Length groups.Count mutual.Length attrGroups.Length
-printfn "再帰呼び出し %d（末尾 %d / 非末尾 %d）" hits.Count tailOk nonTail.Length
+
+let inLambdaNonTail = nonTail |> List.filter (fun h -> h.InLambda) |> List.length
+
+printfn
+    "再帰呼び出し %d（末尾 %d / 非末尾 %d：うちラムダ内 %d・直接 %d）"
+    hits.Count
+    tailOk
+    nonTail.Length
+    inLambdaNonTail
+    (nonTail.Length - inLambdaNonTail)
+
+printfn "  区分: ラムダ内 = Compute/pull 継続・CPS 継続（深度は 1 行ごと / MaxExpressionDepth で頭打ち）"
+
+printfn "        直接 = 監査部・引数など「結果を消費してから」型（本来の末尾化候補）"
 
 for (caseName, n) in unhandledCases do
     printfn "walk 未対応ケース: %s（%d ファイル）※スライス境界など・再帰を含まない想定" caseName n

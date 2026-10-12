@@ -10,74 +10,9 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 // ---------------------------------------------------------------------------
-// テスト用のスキーマ
+// スキーマ・名前束縛（peopleSchema / ordersSchema・列定義ビルダーは RykDb.TestHelpers）
 // ---------------------------------------------------------------------------
 
-let private col (name: string) (dt: DataType) =
-    {
-        Name = name
-        DataType = dt
-        TypeArguments = []
-        Constraint =
-            {
-                NotNull = false
-                PrimaryKey = false
-                Unique = false
-                Default = None
-            }
-    }
-
-let private pkCol (name: string) (dt: DataType) =
-    { col name dt with
-        Constraint =
-            {
-                NotNull = true
-                PrimaryKey = true
-                Unique = false
-                Default = None
-            }
-    }
-
-/// テスト用のテーブルスキーマ。
-let private peopleSchema: TableSchema =
-    {
-        Name = "people"
-        Columns =
-            [
-                pkCol "id" DataType.Integer
-                col "name" DataType.Text
-                col "age" DataType.Integer
-            ]
-        PrimaryKey = [ 0 ]
-        Indexes =
-            [
-                {
-                    Name = "ix_people_age"
-                    Columns = [ "age" ]
-                    Unique = false
-                }
-            ]
-    }
-
-let private ordersSchema: TableSchema =
-    {
-        Name = "orders"
-        Columns =
-            [
-                pkCol "oid" DataType.Integer
-                col "person_id" DataType.Integer
-                col "amount" DataType.Integer
-            ]
-        PrimaryKey = [ 0 ]
-        Indexes =
-            [
-                {
-                    Name = "ix_orders_person"
-                    Columns = [ "person_id" ]
-                    Unique = false
-                }
-            ]
-    }
 
 /// テスト用の ExecContext（people と orders を登録済み）。
 let private ctxOf (store: RowStore) =
@@ -168,8 +103,7 @@ let ``Predicate: split した conjunct を AND で戻せる`` () =
 
 [<Fact>]
 let ``Analyzer: 等価条件があれば主キー検索にする`` () =
-    withDir "an1" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "an1" (fun store ->
         let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
 
         let pred = Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Literal(Literal.Int 1L))
@@ -183,8 +117,7 @@ let ``Analyzer: 等価条件があれば主キー検索にする`` () =
 
 [<Fact>]
 let ``Analyzer: 等価条件があっても索引が無ければ全走査`` () =
-    withDir "an2" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "an2" (fun store ->
         let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
 
         // name には索引が無い
@@ -197,8 +130,7 @@ let ``Analyzer: 等価条件があっても索引が無ければ全走査`` () =
 
 [<Fact>]
 let ``Analyzer: 索引があれば索引検索にする`` () =
-    withDir "an3" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "an3" (fun store ->
 
         let ix = Catalog.toIndexDefinition "people" peopleSchema.Indexes.[0]
         let catalog = ix |> Catalog.addIndex Catalog.empty
@@ -216,8 +148,7 @@ let ``Analyzer: 索引があれば索引検索にする`` () =
 
 [<Fact>]
 let ``Analyzer: 等価条件が無ければ全走査`` () =
-    withDir "an4" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "an4" (fun store ->
         let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
 
         let pred = Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))
@@ -246,8 +177,7 @@ let private selectOf (items: SelectItem list) (from: TableRef option) (joins: Jo
 
 [<Fact>]
 let ``Planner: 単純な SELECT は Scan + Project になる`` () =
-    withDir "pl1" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "pl1" (fun store ->
         let ctx = ctxOf store
 
         let stmt =
@@ -261,8 +191,7 @@ let ``Planner: 単純な SELECT は Scan + Project になる`` () =
 
 [<Fact>]
 let ``Planner: WHERE があれば Scan の直下に Filter が付く`` () =
-    withDir "pl2" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "pl2" (fun store ->
         let ctx = ctxOf store
 
         let stmt =
@@ -285,8 +214,7 @@ let ``Planner: WHERE があれば Scan の直下に Filter が付く`` () =
 
 [<Fact>]
 let ``Planner: JOIN があれば LJoin が作られる`` () =
-    withDir "pl3" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "pl3" (fun store ->
         let ctx = ctxOf store
 
         let stmt =
@@ -313,33 +241,23 @@ let ``Planner: JOIN があれば LJoin が作られる`` () =
 
 [<Fact>]
 let ``Planner: GROUP BY があれば LAggregate が作られる`` () =
-    withDir "pl4" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "pl4" (fun store ->
         let ctx = ctxOf store
 
-        let stmt =
-            {
-                Distinct = false
-                Items =
-                    [
-                        {
-                            Expression = pCol "age"
-                            Alias = None
-                        }
-                        {
-                            Expression = Expr.AggCall(AggFunc.Count, true, Expr.Literal(Literal.Null))
-                            Alias = None
-                        }
-                    ]
-                From = Some { Name = "people"; Alias = None }
-                Joins = []
-                Where = None
-                GroupBy = [ pCol "age" ]
-                Having = None
-                OrderBy = []
-                Limit = None
-                Offset = None
-            }
+        let items =
+            [
+                {
+                    Expression = pCol "age"
+                    Alias = None
+                }
+                {
+                    Expression = Expr.AggCall(AggFunc.Count, true, Expr.Literal(Literal.Null))
+                    Alias = None
+                }
+            ]
+
+        let plain = selectOf items (Some { Name = "people"; Alias = None }) [] None
+        let stmt = { plain with GroupBy = [ pCol "age" ] }
 
         let tree = ok (Optimizer.buildLogical ctx stmt)
 
@@ -351,8 +269,7 @@ let ``Planner: GROUP BY があれば LAggregate が作られる`` () =
 
 [<Fact>]
 let ``Planner: 集約がなければ LAggregate は作られない`` () =
-    withDir "pl5" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "pl5" (fun store ->
         let ctx = ctxOf store
 
         let stmt =
@@ -375,20 +292,14 @@ let ``Planner: 集約がなければ LAggregate は作られない`` () =
 
 [<Fact>]
 let ``Planner: LIMIT / OFFSET は LLimit になる`` () =
-    withDir "pl6" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "pl6" (fun store ->
         let ctx = ctxOf store
 
+        let plain =
+            selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
+
         let stmt =
-            {
-                Distinct = false
-                Items = [ { Expression = Expr.Star; Alias = None } ]
-                From = Some { Name = "people"; Alias = None }
-                Joins = []
-                Where = None
-                GroupBy = []
-                Having = None
-                OrderBy = []
+            { plain with
                 Limit = Some(Expr.Literal(Literal.Int 10L))
                 Offset = Some(Expr.Literal(Literal.Int 5L))
             }
@@ -405,8 +316,7 @@ let ``Planner: LIMIT / OFFSET は LLimit になる`` () =
 
 [<Fact>]
 let ``Planner: FROM が無ければ LValues になる`` () =
-    withDir "pl7" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "pl7" (fun store ->
         let ctx = ctxOf store
 
         let stmt = selectOf [ { Expression = Expr.Star; Alias = None } ] None [] None

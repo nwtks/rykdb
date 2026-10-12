@@ -90,9 +90,7 @@ let ``RowStore: 主キー無し・列無しのテーブルはエラー`` () =
             Constraints = []
         }
 
-    match TableSchema.ofCreateTable noCols with
-    | Error e -> Assert.Equal<ErrorKind>(ErrorKind.ConstraintViolation, e.Kind)
-    | Ok _ -> Assert.Fail("列無しのテーブルを許してはいけない")
+    expectErrorKind ErrorKind.ConstraintViolation "列無しのテーブルを許してはいけない" (TableSchema.ofCreateTable noCols)
 
     let noPk =
         {
@@ -110,9 +108,7 @@ let ``RowStore: 主キー無し・列無しのテーブルはエラー`` () =
             Constraints = []
         }
 
-    match TableSchema.ofCreateTable noPk with
-    | Error e -> Assert.Equal<ErrorKind>(ErrorKind.ConstraintViolation, e.Kind)
-    | Ok _ -> Assert.Fail("主キー無しのテーブルを許してはいけない")
+    expectErrorKind ErrorKind.ConstraintViolation "主キー無しのテーブルを許してはいけない" (TableSchema.ofCreateTable noPk)
 
 [<Fact>]
 let ``RowStore: keyspace はテーブルと索引で別になる`` () =
@@ -125,8 +121,7 @@ let ``RowStore: keyspace はテーブルと索引で別になる`` () =
 
 [<Fact>]
 let ``RowStore: 1 行挿入して主キーで引ける`` () =
-    withDir "rs1" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs1" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
         let txn = Dml.insert usersWithEmailIndex txn (rowOf 1 "a@example.com" 20) |> ok
@@ -142,8 +137,7 @@ let ``RowStore: 1 行挿入して主キーで引ける`` () =
 
 [<Fact>]
 let ``RowStore: 索引で引ける`` () =
-    withDir "rs2" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs2" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
         let txn = Dml.insert usersWithEmailIndex txn (rowOf 7 "bob@example.com" 30) |> ok
@@ -186,33 +180,29 @@ let ``RowStore: NOT NULL 制約違反は弾かれる`` () =
                 ]
         }
 
-    withDir "rs3" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs3" (fun _ ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
 
         // email が NULL
         let bad = [| SqlValue.Int 1L; SqlValue.Null; SqlValue.Int 20L |]
 
-        match Dml.insert schema txn bad with
-        | Error e -> Assert.Equal<ErrorKind>(ErrorKind.ConstraintViolation, e.Kind)
-        | Ok _ -> Assert.Fail("NOT NULL 制約違反を検出できなかった"))
+        expectErrorKind ErrorKind.ConstraintViolation "NOT NULL 制約違反を検出できなかった" (Dml.insert schema txn bad))
 
 [<Fact>]
 let ``RowStore: 列数が違う行は弾かれる`` () =
-    withDir "rs3b" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs3b" (fun _ ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
 
-        match Dml.insert usersWithEmailIndex txn [| SqlValue.Int 1L |] with
-        | Error e -> Assert.Equal<ErrorKind>(ErrorKind.ConstraintViolation, e.Kind)
-        | Ok _ -> Assert.Fail("列数不一致を検出できなかった"))
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "列数不一致を検出できなかった"
+            (Dml.insert usersWithEmailIndex txn [| SqlValue.Int 1L |]))
 
 [<Fact>]
 let ``RowStore: 削除は主キーと索引の両方に tombstone を書く`` () =
-    withDir "rs4" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs4" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
         let txn = Dml.insert usersWithEmailIndex txn (rowOf 1 "x@example.com" 1) |> ok
@@ -241,19 +231,18 @@ let ``RowStore: 削除は主キーと索引の両方に tombstone を書く`` ()
 
 [<Fact>]
 let ``RowStore: 存在しない行の削除は NotFound`` () =
-    withDir "rs4b" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs4b" (fun store ->
         let mgr = TransactionManager.create ()
         let _, delTxn = TransactionManager.beginTxn mgr
 
-        match Dml.deleteByPrimaryKey store usersWithEmailIndex None delTxn [| SqlValue.Int 999L |] with
-        | Error e -> Assert.Equal<ErrorKind>(ErrorKind.NotFound, e.Kind)
-        | Ok _ -> Assert.Fail("存在しない行の削除を許してはいけない"))
+        expectErrorKind
+            ErrorKind.NotFound
+            "存在しない行の削除を許してはいけない"
+            (Dml.deleteByPrimaryKey store usersWithEmailIndex None delTxn [| SqlValue.Int 999L |]))
 
 [<Fact>]
 let ``RowStore: update は削除+挿入を 1 transaction で行う`` () =
-    withDir "rs5" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs5" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
         let txn = Dml.insert usersWithEmailIndex txn (rowOf 1 "old@example.com" 1) |> ok
@@ -293,8 +282,7 @@ let ``RowStore: update は削除+挿入を 1 transaction で行う`` () =
 
 [<Fact>]
 let ``RowStore: 主キーで全行を走査できる`` () =
-    withDir "rs6" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs6" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
 
@@ -314,8 +302,7 @@ let ``RowStore: 主キーで全行を走査できる`` () =
 
 [<Fact>]
 let ``RowStore: 主キーで全行を走査できる（limit）`` () =
-    withDir "rs6b" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs6b" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
 
@@ -378,8 +365,7 @@ let ``RowStore: 複数テーブルは別 keyspace に載る`` () =
             }
         |> ok
 
-    withDir "rs8" (fun dir ->
-        let store = RowStore.openStore dir |> ok
+    withStore "rs8" (fun store ->
         let mgr = TransactionManager.create ()
         let _, t1 = TransactionManager.beginTxn mgr
         let t1 = Dml.insert usersWithEmailIndex t1 (rowOf 1 "a@x.com" 1) |> ok

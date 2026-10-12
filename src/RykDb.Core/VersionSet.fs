@@ -30,8 +30,53 @@ type internal FileMetaData =
 
     /// このファイルが [key] を持ち得るか（Bloom より粗い判定）。
     member x.MightContain(key: byte array) =
-        SstEntry.compareBytes x.Smallest key <= 0
-        && SstEntry.compareBytes key x.Largest <= 0
+        Bytes.compare x.Smallest key <= 0 && Bytes.compare key x.Largest <= 0
+
+module internal FileMetaData =
+    /// キー範囲も件数も未確定の空メタデータ。
+    /// デコード途中の「番号とレベルだけ分かった」状態や、
+    /// 「compaction はやりませんでした」の報告に使う（フィールドは上書きする）。
+    let zero =
+        {
+            FileNumber = 0L
+            Level = 0
+            Smallest = [||]
+            Largest = [||]
+            EntryCount = 0L
+            Size = 0L
+            MaxSeqNo = 0UL
+        }
+
+    /// ソート済みエントリ列から FileMetaData を作る。
+    /// Smallest / Largest / EntryCount / MaxSeqNo の算出規則はここで一元管理する
+    /// （flush と compaction で別々に書くと不変条件がズレる）。
+    /// <paramref name="size"/> はシリアライズ後のファイルサイズ（バイト）。
+    let ofChunk (fileNumber: int64) (level: int) (size: int64) (entries: SstEntry array) =
+        {
+            FileNumber = fileNumber
+            Level = level
+            Smallest = entries.[0].Key
+            Largest = entries.[entries.Length - 1].Key
+            EntryCount = int64 entries.Length
+            Size = size
+            MaxSeqNo = SstEntry.maxSeqNo entries
+        }
+
+    /// エントリ列を SSTable としてビルドし、ファイルに書き、メタデータを返す。
+    /// ビルド・書き出し・メタ算出が 1つの経路を通るので、「書いたバイト数」と Size が食い違うことが無い。
+    let writeSstable
+        (dir: string)
+        (fileNumber: int64)
+        (level: int)
+        (bloomFalsePositiveRate: float)
+        (entries: SstEntry array)
+        =
+        match Sstable.build entries bloomFalsePositiveRate with
+        | Error e -> Error e
+        | Ok bytes ->
+            match protect (fun () -> System.IO.File.WriteAllBytes(Sstable.path dir fileNumber, bytes) |> ignore) with
+            | Error e -> Error e
+            | Ok() -> ret (ofChunk fileNumber level (int64 bytes.Length) entries)
 
 /// コンパクションの候補。
 type internal CompactionPlan =
@@ -74,7 +119,7 @@ module internal Version =
 
         let merged =
             Array.append [| f |] levelFiles
-            |> Array.sortWith (fun a b -> SstEntry.compareBytes a.Smallest b.Smallest)
+            |> Array.sortWith (fun a b -> Bytes.compare a.Smallest b.Smallest)
 
         { v with
             Files = Array.mapi (fun i l -> if i = f.Level then merged else l) v.Files
@@ -161,6 +206,13 @@ module internal VersionEdit =
             DeletedFiles = [ f ]
         }
 
+    /// VersionEdit のファイル変更を適用する（削除してから追加）。
+    let apply (version: Version) (edit: VersionEdit) =
+        let afterDelete = Version.deleteFiles edit.DeletedFiles version
+
+        edit.AddedFiles
+        |> List.fold (fun current file -> Version.addFile file current) afterDelete
+
     // -----------------------------------------------------------------------
     // 直列化
     //   [tag:varint] : 1 = 追加, 2 = 削除
@@ -169,35 +221,28 @@ module internal VersionEdit =
     // -----------------------------------------------------------------------
 
     let private encodeFile (f: FileMetaData) =
-        Writer.empty
-        |> Writer.varint (uint64 f.FileNumber)
-        |> fun w -> Writer.varint (uint64 f.Level) w
-        |> fun w -> Writer.varint (uint64 f.EntryCount) w
-        |> fun w -> Writer.varint (uint64 f.Size) w
-        |> fun w -> Writer.varint f.MaxSeqNo w
-        |> fun w -> Writer.lengthPrefixed f.Smallest w
-        |> fun w -> Writer.lengthPrefixed f.Largest w
-        |> Writer.toArray
+        Writer.build
+            [
+                Writer.varint (uint64 f.FileNumber)
+                Writer.varint (uint64 f.Level)
+                Writer.varint (uint64 f.EntryCount)
+                Writer.varint (uint64 f.Size)
+                Writer.varint f.MaxSeqNo
+                Writer.lengthPrefixed f.Smallest
+                Writer.lengthPrefixed f.Largest
+            ]
 
     let private encodeDeleted (f: FileMetaData) =
-        Writer.empty
-        |> Writer.varint (uint64 f.FileNumber)
-        |> fun w -> Writer.varint (uint64 f.Level) w
-        |> Writer.toArray
+        Writer.build [ Writer.varint (uint64 f.FileNumber); Writer.varint (uint64 f.Level) ]
 
     let encode (edit: VersionEdit) =
-        let added =
-            edit.AddedFiles
-            |> List.fold (fun w f -> w |> Writer.varint 1UL |> fun w -> Writer.writeBytes (encodeFile f) w) Writer.empty
+        let steps =
+            (edit.AddedFiles
+             |> List.collect (fun f -> [ Writer.varint 1UL; Writer.writeBytes (encodeFile f) ]))
+            @ (edit.DeletedFiles
+               |> List.collect (fun f -> [ Writer.varint 2UL; Writer.writeBytes (encodeDeleted f) ]))
 
-        let deleted =
-            edit.DeletedFiles
-            |> List.fold
-                (fun w f -> w |> Writer.varint 2UL |> fun w -> Writer.writeBytes (encodeDeleted f) w)
-                Writer.empty
-
-        let body = Array.append (Writer.toArray added) (Writer.toArray deleted)
-        Writer.empty |> Writer.lengthPrefixed body |> Writer.toArray
+        Writer.build [ Writer.lengthPrefixed (Writer.build steps) ]
 
     let decode (data: byte array) =
         let readFileNumber c =
@@ -240,14 +285,9 @@ module internal VersionEdit =
 
                             return
                                 c,
-                                {
+                                { FileMetaData.zero with
                                     FileNumber = num
                                     Level = lvl
-                                    Smallest = [||]
-                                    Largest = [||]
-                                    EntryCount = 0L
-                                    Size = 0L
-                                    MaxSeqNo = 0UL
                                 }
                         }
                     else

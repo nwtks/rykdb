@@ -199,6 +199,32 @@ module internal Lexer =
 
         loop s
 
+    /// `delim` で囲まれた文字列リテラル / 引用識別子を読む。
+    /// `delim` を 2 つ続けると 1 文字として取り込む（SQL 標準のエスケープ）。
+    /// `'` の文字列と `"` の引用識別子は閉じ方もエスケープも同じなので 1 本に集約する。
+    let private collectDelimited
+        (input: string)
+        (n: int)
+        (delim: char)
+        (unclosedMsg: string)
+        (line: int)
+        (start: LexState)
+        =
+        let rec go (s: LexState) (sb: StringBuilder) =
+            if s.Index >= n then
+                Error(DbError.syntax unclosedMsg line)
+            elif input.[s.Index] = delim then
+                if s.Index + 1 < n && input.[s.Index + 1] = delim then
+                    sb.Append delim |> ignore
+                    go (advance input (advance input s)) sb
+                else
+                    Ok(sb.ToString(), advance input s)
+            else
+                sb.Append(input.[s.Index]) |> ignore
+                go (advance input s) sb
+
+        go (advance input start) (StringBuilder())
+
     /// 1 トークンを読む。読み後は次の位置を返す。
     let private scanToken (input: string) (s: LexState) (startPos: Position) =
         let n = input.Length
@@ -299,37 +325,11 @@ module internal Lexer =
                 | _ -> Error(DbError.syntax (sprintf "整数の解析に失敗しました: %s" text) startPos.Line)
 
         elif c = '\'' then
-            let rec collect (s: LexState) (sb: StringBuilder) =
-                if s.Index >= n then
-                    Error(DbError.syntax "文字列が閉じられていません" startPos.Line)
-                elif input.[s.Index] = '\'' then
-                    if s.Index + 1 < n && input.[s.Index + 1] = '\'' then
-                        sb.Append '\'' |> ignore
-                        collect (advance input (advance input s)) sb
-                    else
-                        Ok(sb.ToString(), advance input s)
-                else
-                    sb.Append(input.[s.Index]) |> ignore
-                    collect (advance input s) sb
-
-            collect (advance input s) (StringBuilder())
+            collectDelimited input n '\'' "文字列が閉じられていません" startPos.Line s
             |> Result.map (fun (v, s') -> StringLit v, s')
 
         elif c = '"' then
-            let rec collect (s: LexState) (sb: StringBuilder) =
-                if s.Index >= n then
-                    Error(DbError.syntax "引用識別子が閉じられていません" startPos.Line)
-                elif input.[s.Index] = '"' then
-                    if s.Index + 1 < n && input.[s.Index + 1] = '"' then
-                        sb.Append('"') |> ignore
-                        collect (advance input (advance input s)) sb
-                    else
-                        Ok(sb.ToString(), advance input s)
-                else
-                    sb.Append(input.[s.Index]) |> ignore
-                    collect (advance input s) sb
-
-            collect (advance input s) (StringBuilder())
+            collectDelimited input n '"' "引用識別子が閉じられていません" startPos.Line s
             |> Result.map (fun (v, s') -> QuotedIdent v, s')
 
         // 6) 記号・演算子

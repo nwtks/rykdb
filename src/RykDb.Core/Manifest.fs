@@ -86,12 +86,7 @@ module internal Manifest =
         protect scan
 
     let private applyAll (edits: VersionEdit list) (initial: RykDb.Core.Version) =
-        let step (v: RykDb.Core.Version) (e: VersionEdit) =
-            e.DeletedFiles
-            |> List.fold (fun v f -> Version.deleteFiles [ f ] v) v
-            |> fun v -> e.AddedFiles |> List.fold (fun v f -> Version.addFile f v) v
-
-        List.fold step initial edits
+        List.fold VersionEdit.apply initial edits
 
     /// データベースを開く（新規なら作成する）。
     /// 返り値は (Version, 有効な manifest 番号)。
@@ -116,8 +111,7 @@ module internal Manifest =
     let logAndApply (dir: string) (manifestNumber: int64) (version: RykDb.Core.Version) (edit: VersionEdit) =
         result {
             let! _ = append dir manifestNumber edit
-            let afterDelete = Version.deleteFiles edit.DeletedFiles version
-            let next = edit.AddedFiles |> List.fold (fun v f -> Version.addFile f v) afterDelete
+            let next = VersionEdit.apply version edit
             let seed = version.NextFileNumber
 
             let highestAdded =

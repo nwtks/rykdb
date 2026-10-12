@@ -1,22 +1,14 @@
 // ===========================================================================
 // Catalog — スキーマ（テーブル・索引）の管理と永続化。
 //
-// 専用 keyspace `__catalog__` に「1 キー = 1 定義」で構造化して保存する。
-//   キー `table:<name>` -> テーブル定義
-//   キー `index:<name>` -> 索引定義（属するテーブル名を含む）
+// 専用 keyspace __catalog__ に「1キー = 1定義」で構造化して保存する。
+//   キー table:<name> -> テーブル定義
+//   キー index:<name> -> 索引定義（属するテーブル名を含む）
 // 既存の LSM（WAL / Compaction）をそのまま流用できる。
-// SQL テキストではなく構造化で保存する理由は docs/architecture.md §7.3。
 // カタログ内の名前比較は常に OrdinalIgnoreCase（SQL の識別子は大文字小文字を区別しない）。
 // ===========================================================================
 
 namespace RykDb.Core
-
-open System
-open System.Text
-
-// ---------------------------------------------------------------------------
-// 定義
-// ---------------------------------------------------------------------------
 
 /// テーブルの定義（永続化の対象）。
 type internal TableDefinition =
@@ -43,18 +35,20 @@ type internal Catalog =
         Indexes: IndexDefinition list
     }
 
-    static member empty = { Tables = []; Indexes = [] }
-
 module internal Catalog =
+    let empty = { Tables = []; Indexes = [] }
+
     let private keyspace = "__catalog__"
 
     /// SQL の識別子は大文字小文字を区別しない（OrdinalIgnoreCase）。
     let eqName (a: string) (b: string) =
-        String.Equals(a, b, StringComparison.OrdinalIgnoreCase)
+        System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
 
-    let private tableKey (name: string) = Encoding.UTF8.GetBytes("table:" + name)
+    let private tableKey (name: string) =
+        System.Text.Encoding.UTF8.GetBytes("table:" + name)
 
-    let private indexKey (name: string) = Encoding.UTF8.GetBytes("index:" + name)
+    let private indexKey (name: string) =
+        System.Text.Encoding.UTF8.GetBytes("index:" + name)
 
     /// テーブルを探す。無ければ None。
     let findTable (c: Catalog) (name: string) =
@@ -68,22 +62,23 @@ module internal Catalog =
     let indexesOf (c: Catalog) (table: string) =
         c.Indexes |> List.filter (fun i -> eqName i.TableName table)
 
+    /// 同名（大文字小文字を無視）の要素を除いてから末尾へ足す、共通の upsert。
+    /// addTable / addIndex は名前の取り出し方だけが違う。
+    let private upsert (nameOf: 'a -> string) (item: 'a) (items: 'a list) =
+        items
+        |> List.filter (fun x -> not (eqName (nameOf x) (nameOf item)))
+        |> fun xs -> xs @ [ item ]
+
     /// テーブルを追加（同名があれば置き換える）。
     let addTable (c: Catalog) (t: TableDefinition) =
         { c with
-            Tables =
-                c.Tables
-                |> List.filter (fun x -> not (eqName x.Name t.Name))
-                |> fun ts -> ts @ [ t ]
+            Tables = upsert (fun (x: TableDefinition) -> x.Name) t c.Tables
         }
 
     /// 索引を追加（同名があれば置き換える）。
     let addIndex (c: Catalog) (i: IndexDefinition) =
         { c with
-            Indexes =
-                c.Indexes
-                |> List.filter (fun x -> not (eqName x.IndexName i.IndexName))
-                |> fun xs -> xs @ [ i ]
+            Indexes = upsert (fun (x: IndexDefinition) -> x.IndexName) i c.Indexes
         }
 
     /// テーブルを削除する（そのテーブルの索引も消える）。
@@ -99,7 +94,7 @@ module internal Catalog =
             Indexes = c.Indexes |> List.filter (fun i -> not (eqName i.IndexName name))
         }
 
-    /// `TableSchema` を永続化形にする。
+    /// TableSchema を永続化形にする。
     let toDefinition (schema: TableSchema) =
         {
             Name = schema.Name
@@ -107,7 +102,7 @@ module internal Catalog =
             PrimaryKeyColumns = List.ofArray schema.PrimaryKeyColumns
         }
 
-    /// 永続化形を `TableSchema` に戻す。
+    /// 永続化形を TableSchema に戻す。
     let toSchema (t: TableDefinition) =
         let rec findIndices (names: string list) (acc: int list) =
             match names with
@@ -126,7 +121,7 @@ module internal Catalog =
                 Indexes = []
             })
 
-    /// `IndexSchema` を永続化形にする。
+    /// IndexSchema を永続化形にする。
     let toIndexDefinition (table: string) (index: IndexSchema) =
         {
             IndexName = index.Name
@@ -135,11 +130,7 @@ module internal Catalog =
             Unique = index.Unique
         }
 
-    /// 永続化形を `IndexSchema` に戻す。
-    /// <remarks>
-    /// `Catalog.toSchema` は `Indexes = []` で埋まるので、
-    /// この変換を通さないと索引が実行系から見えない。
-    /// </remarks>
+    /// 永続化形を IndexSchema に戻す。
     let toIndexSchema (i: IndexDefinition) =
         {
             Name = i.IndexName
@@ -147,7 +138,7 @@ module internal Catalog =
             Unique = i.Unique
         }
 
-    /// カタログにある索引を実行用の `IndexSchema` へ落とす。
+    /// カタログにある索引を実行用の IndexSchema へ落とす。
     let indexSchemasOf (catalog: Catalog) (table: string) =
         indexesOf catalog table |> List.map toIndexSchema
 
@@ -160,8 +151,8 @@ module internal Catalog =
     //   索引    : [table:lenPrefixed][unique:1][colCount:varint]
     //            [name:lenPrefixed] × colCount
     //
-    // `flags`: bit0 = NOT NULL / bit1 = PRIMARY KEY / bit2 = UNIQUE
-    // `default` は長さ 0 が「DEFAULT なし」。
+    // flags: bit0 = NOT NULL / bit1 = PRIMARY KEY / bit2 = UNIQUE
+    // default は長さ 0 が「DEFAULT なし」。
     //
 
     let private encodeTable (t: TableDefinition) =
@@ -171,8 +162,7 @@ module internal Catalog =
             t.Columns
             |> List.fold
                 (fun w c ->
-                    let w = Writer.str c.Name w
-                    let w = Writer.writeByte (DataType.toTag c.DataType) w
+                    let w = Writer.str c.Name w |> Writer.writeByte (DataType.toTag c.DataType)
 
                     let flags =
                         (if c.Constraint.NotNull then 1uy else 0uy)
@@ -216,49 +206,27 @@ module internal Catalog =
                             },
                             c4)
 
-    [<TailCall>]
-    let rec private readColumns (n: uint64) (c: Cursor) (acc: ColumnDefinition list) =
-        if n = 0UL then
-            ret (List.rev acc, c)
-        else
-            match readColumn c with
-            | Error e -> Error e
-            | Ok(cd, c1) -> readColumns (n - 1UL) c1 (cd :: acc)
-
-    [<TailCall>]
-    let rec private readNames (n: uint64) (c: Cursor) (acc: string list) =
-        if n = 0UL then
-            ret (List.rev acc, c)
-        else
-            match Read.readStr c with
-            | Error e -> Error e
-            | Ok(name, c1) -> readNames (n - 1UL) c1 (name :: acc)
-
     let private decodeTable (name: string) (bytes: byte array) =
         let cur = Cursor.create bytes
 
-        match Read.readVarint cur with
-        | Error e -> Error e
-        | Ok(colCount, cur1) ->
-            match readColumns colCount cur1 [] with
-            | Error e -> Error e
-            | Ok(cols, cur2) ->
-                match Read.readVarint cur2 with
-                | Error e -> Error e
-                | Ok(pkCount, cur3) ->
-                    match readNames pkCount cur3 [] with
-                    | Error e -> Error e
-                    | Ok(pks, _) ->
-                        ret
-                            {
-                                Name = name
-                                Columns = cols
-                                PrimaryKeyColumns = pks
-                            }
+        Read.readVarint cur
+        >>= fun (colCount, cur1) ->
+            Read.readItems colCount readColumn cur1
+            >>= fun (cols, cur2) ->
+                Read.readVarint cur2
+                >>= fun (pkCount, cur3) ->
+                    Read.readItems pkCount Read.readStr cur3
+                    |> Result.map (fun (pks, _) ->
+                        {
+                            Name = name
+                            Columns = cols
+                            PrimaryKeyColumns = pks
+                        })
 
     let private encodeIndex (i: IndexDefinition) =
         let w2 =
-            Writer.str i.TableName Writer.empty
+            Writer.empty
+            |> Writer.str i.TableName
             |> Writer.bool i.Unique
             |> Writer.varint (uint64 i.Columns.Length)
 
@@ -267,54 +235,51 @@ module internal Catalog =
     let private decodeIndex (name: string) (bytes: byte array) =
         let cur = Cursor.create bytes
 
-        match Read.readStr cur with
-        | Error e -> Error e
-        | Ok(table, cur1) ->
-            match Read.readBool cur1 with
-            | Error e -> Error e
-            | Ok(unique, cur2) ->
-                match Read.readVarint cur2 with
-                | Error e -> Error e
-                | Ok(colCount, cur3) ->
-                    match readNames colCount cur3 [] with
-                    | Error e -> Error e
-                    | Ok(cols, _) ->
-                        ret
-                            {
-                                IndexName = name
-                                TableName = table
-                                Columns = cols
-                                Unique = unique
-                            }
+        Read.readStr cur
+        >>= fun (table, cur1) ->
+            Read.readBool cur1
+            >>= fun (unique, cur2) ->
+                Read.readVarint cur2
+                >>= fun (colCount, cur3) ->
+                    Read.readItems colCount Read.readStr cur3
+                    |> Result.map (fun (cols, _) ->
+                        {
+                            IndexName = name
+                            TableName = table
+                            Columns = cols
+                            Unique = unique
+                        })
 
     let private bytesEqual (a: byte array) (b: byte array) =
         a.Length = b.Length && Array.forall2 (=) a b
 
-    let private asciiSuffix (prefix: string) (bytes: byte array) =
-        let p = Encoding.UTF8.GetByteCount prefix
+    /// キーから「テーブルの定義か索引の定義か」と名前を読み出す。
+    /// isIndex = `index:` プレフィックスなら true。どちらでもなければ None。
+    let private keyKindOf (key: byte array) =
+        let tryPrefix (prefix: string) =
+            let p = System.Text.Encoding.UTF8.GetBytes prefix
 
-        if bytes.Length < p then
-            ""
-        else
-            Encoding.UTF8.GetString(bytes, p, bytes.Length - p)
+            if key.Length < p.Length then
+                None
+            elif Array.forall2 (=) key.[0 .. p.Length - 1] p then
+                Some(System.Text.Encoding.UTF8.GetString(key, p.Length, key.Length - p.Length))
+            else
+                None
 
-    let private startsWithAscii (prefix: string) (bytes: byte array) =
-        let p = Encoding.UTF8.GetBytes prefix
-
-        if bytes.Length < p.Length then
-            false
-        else
-            Array.forall2 (=) bytes.[0 .. p.Length - 1] p
+        match tryPrefix "table:" with
+        | Some name -> Some(false, name)
+        | None ->
+            match tryPrefix "index:" with
+            | Some name -> Some(true, name)
+            | None -> None
 
     let private toValue (bytes: byte array) = [| SqlValue.Blob bytes |]
 
     let private ofValue (v: SqlValue array) =
         match v with
         | [| SqlValue.Blob b |] -> Some b
-        | [| SqlValue.Text t |] -> Some(Encoding.UTF8.GetBytes t)
+        | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
         | _ -> None
-
-    // -- 永続化 --------------------------------------------------------------
 
     /// カタログを読み込む。キーが無ければ空を返す。
     let load (store: RowStore) =
@@ -331,50 +296,43 @@ module internal Catalog =
                     match ofValue v with
                     | None -> go tail acc
                     | Some bytes ->
-                        if startsWithAscii "table:" key then
-                            let name = asciiSuffix "table:" key
-                            decodeTable name bytes >>= fun t -> go tail (addTable acc t)
-                        elif startsWithAscii "index:" key then
-                            let name = asciiSuffix "index:" key
-                            decodeIndex name bytes >>= fun i -> go tail (addIndex acc i)
-                        else
-                            go tail acc
+                        match keyKindOf key with
+                        | Some(false, name) ->
+                            match decodeTable name bytes with
+                            | Error e -> Error e
+                            | Ok t -> go tail (addTable acc t)
+                        | Some(true, name) ->
+                            match decodeIndex name bytes with
+                            | Error e -> Error e
+                            | Ok i -> go tail (addIndex acc i)
+                        | None -> go tail acc
 
-        RowStore.scan store keyspace [||] 0
-        |> Result.bind (fun rows -> go rows Catalog.empty)
+        RowStore.scan store keyspace [||] 0 |> Result.bind (fun rows -> go rows empty)
 
     /// カタログを保存する（消えた定義は tombstone で落とす）。
     let save (store: RowStore) (catalog: Catalog) =
-        let rec numberTables (rest: TableDefinition list) (seq: uint64) (acc: (string * Entry array) list) =
+        let rec numberList (mk: 'a -> uint64 -> 'b) (rest: 'a list) (seq: uint64) (acc: 'b list) =
             match rest with
             | [] -> List.rev acc, seq
-            | t :: tail ->
-                let e = Entry.put (tableKey t.Name) seq (toValue (encodeTable t))
-                numberTables tail (seq + 1UL) ((keyspace, [| e |]) :: acc)
+            | x :: tail -> numberList mk tail (seq + 1UL) (mk x seq :: acc)
 
-        let rec numberIndexes (rest: IndexDefinition list) (seq: uint64) (acc: (string * Entry array) list) =
-            match rest with
-            | [] -> List.rev acc, seq
-            | i :: tail ->
-                let e = Entry.put (indexKey i.IndexName) seq (toValue (encodeIndex i))
-                numberIndexes tail (seq + 1UL) ((keyspace, [| e |]) :: acc)
+        let tableBatch (t: TableDefinition) (seq: uint64) =
+            keyspace, [| Entry.put (tableKey t.Name) seq (toValue (encodeTable t)) |]
+
+        let indexBatch (i: IndexDefinition) (seq: uint64) =
+            keyspace, [| Entry.put (indexKey i.IndexName) seq (toValue (encodeIndex i)) |]
 
         let isWanted (key: byte array) =
-            if startsWithAscii "table:" key then
-                catalog.Tables |> List.exists (fun t -> bytesEqual key (tableKey t.Name))
-            else
-                catalog.Indexes |> List.exists (fun i -> bytesEqual key (indexKey i.IndexName))
-
-        let rec numberDeletes (rest: byte array list) (seq: uint64) (acc: Entry list) =
-            match rest with
-            | [] -> acc |> List.rev |> List.toArray
-            | k :: tail -> numberDeletes tail (seq + 1UL) (Entry.delete k seq :: acc)
+            match keyKindOf key with
+            | Some(false, _) -> catalog.Tables |> List.exists (fun t -> bytesEqual key (tableKey t.Name))
+            | Some(true, _) -> catalog.Indexes |> List.exists (fun i -> bytesEqual key (indexKey i.IndexName))
+            | None -> false
 
         RowStore.engine store keyspace
         |> Result.map (fun e -> e.NextSeqNo)
         >>= fun seq0 ->
-            let tableBatches, seq1 = numberTables catalog.Tables seq0 []
-            let indexBatches, seq2 = numberIndexes catalog.Indexes seq1 []
+            let tableBatches, seq1 = numberList tableBatch catalog.Tables seq0 []
+            let indexBatches, seq2 = numberList indexBatch catalog.Indexes seq1 []
 
             RowStore.writeBatches store (tableBatches @ indexBatches)
             |> Result.bind (fun updated ->
@@ -392,5 +350,7 @@ module internal Catalog =
                     if List.isEmpty stale then
                         ret updated
                     else
-                        let deletes = numberDeletes stale seq2 []
-                        RowStore.writeBatches updated [ (keyspace, deletes) ]))
+                        let deletes, _ =
+                            numberList (fun (k: byte array) seq -> Entry.delete k seq) stale seq2 []
+
+                        RowStore.writeBatches updated [ (keyspace, Array.ofList deletes) ]))

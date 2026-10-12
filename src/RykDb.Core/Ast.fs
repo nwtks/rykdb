@@ -1,30 +1,7 @@
 namespace RykDb.Core
 
-/// AST を末尾再帰で走査するための内部補助。
-module internal Internal =
-    /// 明示的なスタック（末尾再帰で辿る list）へ、xs の要素を
-    /// 先頭から順に積み上げる補助。
-    /// xs @ stack や stack @ xs だと O(n^2) になるので
-    /// 反転しながら畳む。こちらも末尾再帰。
-    let pushAll (xs: 'a list) (stack: 'a list) =
-        let rec revInto acc =
-            function
-            | [] -> acc
-            | x :: rest -> revInto (x :: acc) rest
-
-        revInto stack xs
-
 /// SQL テキスト中の位置。エラー報告に使う。
-type internal Position =
-    {
-        Offset: int
-        Line: int
-        Column: int
-    }
-
-    static member Zero = { Offset = 0; Line = 1; Column = 1 }
-
-    override x.ToString() = sprintf "%d:%d" x.Line x.Column
+type internal Position = { Offset: int; Line: int; Column: int }
 
 /// リテラル。
 [<RequireQualifiedAccess>]
@@ -37,18 +14,7 @@ type internal Literal =
     | String of string
     | Blob of byte[]
 
-    /// リテラルの型。束縛時の型決定に使う。
-    member this.DataType =
-        match this with
-        | Null -> DataType.Null
-        | Bool _ -> DataType.Boolean
-        | Int _ -> DataType.Integer
-        | Real _ -> DataType.Real
-        | Decimal _ -> DataType.Decimal
-        | String _ -> DataType.Text
-        | Blob _ -> DataType.Blob
-
-    member this.ToSqlValue: SqlValue =
+    member this.ToSqlValue =
         match this with
         | Null -> SqlValue.Null
         | Bool b -> SqlValue.Bool b
@@ -112,13 +78,6 @@ module internal AggFunc =
         | "MAX" -> Some AggFunc.Max
         | _ -> None
 
-    /// 返り値型。COUNT は常に INTEGER。それ以外は入力の型に従う。
-    let resultType (f: AggFunc) =
-        match f with
-        | AggFunc.Count -> Some DataType.Integer
-        | AggFunc.Avg -> Some DataType.Real
-        | _ -> None
-
 [<RequireQualifiedAccess>]
 type internal UnaryOp =
     /// 算術否定
@@ -151,23 +110,6 @@ type internal BinaryOp =
     | And
     | Or
     | Like
-
-    /// NULL 伝播の扱いに必要な比較演算子かどうか。
-    member x.IsComparison =
-        match x with
-        | Eq
-        | Ne
-        | Lt
-        | Le
-        | Gt
-        | Ge -> true
-        | _ -> false
-
-    member x.IsLogical =
-        match x with
-        | And
-        | Or -> true
-        | _ -> false
 
     member x.Display =
         match x with
@@ -215,42 +157,6 @@ type internal Expr =
     /// `t.*`
     | QualifiedStar of string
 
-    /// 式中のすべての列参照を列挙する。束縛と空き列判定に使う。
-    /// <remarks>
-    /// 走査する式を「スタック」として持ち、列参照を蓄積器的 Reverse に積む。
-    /// `go a @ go b` とすると再帰呼び出しが末尾位置に来ないうえ O(n^2) になるので、
-    /// 末尾再帰の形に書き換えている。
-    /// </remarks>
-    member this.ColumnRefs =
-        let rec go (stack: Expr list) (acc: ColumnRef list) =
-            match stack with
-            | [] -> List.rev acc
-            | Literal _ :: rest -> go rest acc
-            | Name _ :: rest -> go rest acc
-            | Star :: rest -> go rest acc
-            | QualifiedStar _ :: rest -> go rest acc
-            | Column c :: rest -> go rest (c :: acc)
-            | Unary(_, x) :: rest -> go (x :: rest) acc
-            | Binary(_, a, b) :: rest -> go (b :: a :: rest) acc
-            | IsNull(x, _) :: rest -> go (x :: rest) acc
-            | Between(x, a, b, _) :: rest -> go (b :: a :: x :: rest) acc
-            | InList(x, xs, _) :: rest -> go (Internal.pushAll xs (x :: rest)) acc
-            | Like(x, p, _) :: rest -> go (p :: x :: rest) acc
-            | Case(branches, elseE) :: rest ->
-                let conds = branches |> List.collect (fun (w, t) -> [ w; t ])
-
-                let withElse =
-                    match elseE with
-                    | Some e -> e :: conds
-                    | None -> conds
-
-                go (Internal.pushAll withElse rest) acc
-            | FuncCall(_, args) :: rest -> go (Internal.pushAll args rest) acc
-            | AggCall(_, _, x) :: rest -> go (x :: rest) acc
-
-        go [ this ] []
-
-
 /// Expr.toDisplayString が使う出力項目。
 /// Sub の closer を先に与えておくことで、式の出力が終わってから
 /// 閉じ括弧などを出力する順序を、末尾再帰のまま表現できる。
@@ -262,53 +168,123 @@ type private PrintStep =
     | Sub of Expr * PrintStep list
 
 module internal Expr =
-    let literal l = Expr.Literal l
+    /// 直接の子式をリストで返す（走査順は左から右）。再帰は呼び出し側が行う。
+    let children (e: Expr) =
+        match e with
+        | Expr.Literal _
+        | Expr.Column _
+        | Expr.Name _
+        | Expr.Star
+        | Expr.QualifiedStar _ -> []
+        | Expr.Unary(_, x) -> [ x ]
+        | Expr.Binary(_, a, b) -> [ a; b ]
+        | Expr.IsNull(x, _) -> [ x ]
+        | Expr.Between(x, a, b, _) -> [ x; a; b ]
+        | Expr.InList(x, xs, _) -> x :: xs
+        | Expr.Like(x, p, _) -> [ x; p ]
+        | Expr.Case(branches, elseE) -> (branches |> List.collect (fun (w, t) -> [ w; t ])) @ (elseE |> Option.toList)
+        | Expr.FuncCall(_, args) -> args
+        | Expr.AggCall(_, _, x) -> [ x ]
 
-    let column q n = Expr.Column { Qualifier = q; Name = n }
+    /// 各子式に f を適用して式を再構成する（構造は維持）。
+    let mapChildren (f: Expr -> Expr) (e: Expr) =
+        match e with
+        | Expr.Literal _
+        | Expr.Column _
+        | Expr.Name _
+        | Expr.Star
+        | Expr.QualifiedStar _ -> e
+        | Expr.Unary(op, x) -> Expr.Unary(op, f x)
+        | Expr.Binary(op, a, b) -> Expr.Binary(op, f a, f b)
+        | Expr.IsNull(x, neg) -> Expr.IsNull(f x, neg)
+        | Expr.Between(x, a, b, neg) -> Expr.Between(f x, f a, f b, neg)
+        | Expr.InList(x, xs, neg) -> Expr.InList(f x, List.map f xs, neg)
+        | Expr.Like(x, p, neg) -> Expr.Like(f x, f p, neg)
+        | Expr.Case(branches, elseE) -> Expr.Case(List.map (fun (w, t) -> f w, f t) branches, Option.map f elseE)
+        | Expr.FuncCall(n, args) -> Expr.FuncCall(n, List.map f args)
+        | Expr.AggCall(f2, star, x) -> Expr.AggCall(f2, star, f x)
 
-    let name n = Expr.Name n
-    let unary op e = Expr.Unary(op, e)
-    let binary op a b = Expr.Binary(op, a, b)
+    /// 各子式にモナド関数 f（Result を返す）を適用して式を再構成する。
+    let mapChildrenM (f: Expr -> Result<Expr, DbError>) (e: Expr) =
+        match e with
+        | Expr.Literal _
+        | Expr.Column _
+        | Expr.Name _
+        | Expr.Star
+        | Expr.QualifiedStar _ -> ret e
+        | Expr.Unary(op, x) -> f x |> Result.map (fun i -> Expr.Unary(op, i))
+        | Expr.Binary(op, a, b) -> f a >>= fun a2 -> f b |> Result.map (fun b2 -> Expr.Binary(op, a2, b2))
+        | Expr.IsNull(x, neg) -> f x |> Result.map (fun i -> Expr.IsNull(i, neg))
+        | Expr.Between(a, b, c, neg) ->
+            f a
+            >>= fun a2 -> f b >>= fun b2 -> f c |> Result.map (fun c2 -> Expr.Between(a2, b2, c2, neg))
+        | Expr.InList(a, xs, neg) ->
+            f a
+            >>= fun a2 -> xs |> List.map f |> all |> Result.map (fun vs -> Expr.InList(a2, vs, neg))
+        | Expr.Like(a, b, neg) -> f a >>= fun a2 -> f b |> Result.map (fun b2 -> Expr.Like(a2, b2, neg))
+        | Expr.Case(branches, elseE) ->
+            branches
+            |> List.map (fun (w, t) -> f w >>= fun w2 -> f t |> Result.map (fun t2 -> w2, t2))
+            |> all
+            >>= fun branches2 ->
+                match elseE with
+                | None -> ret None
+                | Some e2 -> f e2 |> Result.map Some
+                |> Result.map (fun el -> Expr.Case(branches2, el))
+        | Expr.FuncCall(n, args) -> args |> List.map f |> all |> Result.map (fun as2 -> Expr.FuncCall(n, as2))
+        | Expr.AggCall(f2, star, arg) -> f arg |> Result.map (fun a -> Expr.AggCall(f2, star, a))
+
+    /// 明示的なスタック（末尾再帰で辿る list）へ、xs の要素を先頭から順に積み上げる補助。
+    /// xs @ stack や stack @ xs だと O(n^2) になるので反転しながら畳む。こちらも末尾再帰。
+    let private pushAll (xs: 'a list) (stack: 'a list) =
+        let rec revInto acc =
+            function
+            | [] -> acc
+            | x :: rest -> revInto (x :: acc) rest
+
+        revInto stack xs
+
+    /// 式木を明示スタックで pre-order にたどり、各ノードについて状態を畳み込む。
+    /// 末尾再帰。走査順は「根 → 子を左から右へ」。
+    let fold (f: 's -> Expr -> 's) (state: 's) (root: Expr) =
+        let rec go (stack: Expr list) (acc: 's) =
+            match stack with
+            | [] -> acc
+            | e :: rest ->
+                let acc2 = f acc e
+                go (pushAll (List.rev (children e)) rest) acc2
+
+        go [ root ] state
+
+    /// 式中のすべての列参照を列挙する。束縛と空き列判定に使う。
+    /// 末尾再帰の明示スタック走査（ColumnRefs の既存の挙動を維持）。
+    let columnRefs (e: Expr) =
+        fold
+            (fun acc e ->
+                match e with
+                | Expr.Column c -> c :: acc
+                | _ -> acc)
+            []
+            e
+        |> List.rev
 
     /// 式に集計呼び出しが含まれるか。GROUP BY の妥当性判定に使う。
-    /// <remarks>
-    /// `||` の短絡評価を使うと再帰呼び出しが末尾位置に来ないため、
-    /// 明示的なスタックで走査し「1 つでも見つかれば true」で打ち切る形にしている。
-    /// 短絡評価の ronda 打ち切りは失われるが、結果は論理 OR で同じなので正しさは保たれる。
-    /// </remarks>
+    /// 短絡評価の早期打ち切りは失われるが、結果は論理 OR で同じ。
     let isAggregate (e: Expr) =
-        let rec go (stack: Expr list) =
-            match stack with
-            | [] -> false
-            | Expr.AggCall _ :: _ -> true
-            | Expr.Literal _ :: rest -> go rest
-            | Expr.Column _ :: rest -> go rest
-            | Expr.Name _ :: rest -> go rest
-            | Expr.Star :: rest -> go rest
-            | Expr.QualifiedStar _ :: rest -> go rest
-            | Expr.Unary(_, x) :: rest -> go (x :: rest)
-            | Expr.Binary(_, a, b) :: rest -> go (b :: a :: rest)
-            | Expr.IsNull(x, _) :: rest -> go (x :: rest)
-            | Expr.Between(x, a, b, _) :: rest -> go (b :: a :: x :: rest)
-            | Expr.InList(x, xs, _) :: rest -> go (Internal.pushAll xs (x :: rest))
-            | Expr.Like(x, p, _) :: rest -> go (p :: x :: rest)
-            | Expr.Case(branches, elseE) :: rest ->
-                let conds = branches |> List.collect (fun (w, t) -> [ w; t ])
-
-                let withElse =
-                    match elseE with
-                    | Some e -> e :: conds
-                    | None -> conds
-
-                go (Internal.pushAll withElse rest)
-            | Expr.FuncCall(_, args) :: rest -> go (Internal.pushAll args rest)
-
-        go [ e ]
+        fold
+            (fun found e ->
+                found
+                || match e with
+                   | Expr.AggCall _ -> true
+                   | _ -> false)
+            false
+            e
 
     /// 式をテキストへ戻す（EXPLAIN やエラーメッセージ用）。
-    /// 「式」と「その式を出したあとに吐く文字列」を 1 本のスタックで表現し、
-    /// 末尾再帰で処理する。`go x` のあとに `put ")"` と書くと再帰呼び出しが
-    /// 末尾位置にならず、深い式（1 万段超）でスタックを食うため。
+    /// 「式」と「その式を出したあとに吐く文字列」を 1本のスタックで表現し、
+    /// 末尾再帰で処理する。
+    /// go x のあとに put ")" と書くと再帰呼び出しが末尾位置にならず、
+    /// 深い式（1万段超）でスタックを食うため。
     let toDisplayString (e: Expr) =
         let sb = System.Text.StringBuilder()
         let put (s: string) = sb.Append s |> ignore
@@ -365,8 +341,6 @@ module internal Expr =
                     put "("
                     let n = List.length xs
 
-                    // 最後の要素の直後で "))" を閉じる。
-                    // それ以外は ", " を付ける（i=0 の前にも "," を付けると "a IN (, 1)" になる）。
                     let items =
                         xs |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then "))" else ", ") ])
 
@@ -382,7 +356,6 @@ module internal Expr =
                 | Expr.Case(branches, elseE) ->
                     put "(CASE "
 
-                    // WHEN / THEN / ELSE / END を出さないと AST の中身が分からなくなる。
                     let branchSteps =
                         branches
                         |> List.collect (fun (w, t) -> [ text "WHEN "; sub w [ text " THEN " ]; sub t [ text " " ] ])
@@ -419,16 +392,7 @@ type internal JoinKind =
     | Inner
     | Left
 
-type internal TableRef =
-    {
-        Name: string
-        Alias: string option
-    }
-
-    member x.Display =
-        match x.Alias with
-        | Some a -> sprintf "%s AS %s" x.Name a
-        | None -> x.Name
+type internal TableRef = { Name: string; Alias: string option }
 
 type internal JoinClause =
     {
@@ -453,11 +417,6 @@ type internal SelectItem =
         Expression: Expr
         Alias: string option
     }
-
-    member x.Display =
-        match x.Alias with
-        | Some a -> sprintf "%s AS %s" (Expr.toDisplayString x.Expression) a
-        | None -> Expr.toDisplayString x.Expression
 
 type internal ColumnConstraint =
     {
@@ -547,17 +506,3 @@ type internal Statement =
     | Begin
     | Commit
     | Rollback
-
-    member x.Describe =
-        match x with
-        | Select _ -> "SELECT"
-        | Insert _ -> "INSERT"
-        | Update _ -> "UPDATE"
-        | Delete _ -> "DELETE"
-        | CreateTable _ -> "CREATE TABLE"
-        | DropTable _ -> "DROP TABLE"
-        | CreateIndex _ -> "CREATE INDEX"
-        | DropIndex _ -> "DROP INDEX"
-        | Begin -> "BEGIN"
-        | Commit -> "COMMIT"
-        | Rollback -> "ROLLBACK"

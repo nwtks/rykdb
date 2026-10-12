@@ -246,8 +246,7 @@ let ``Compaction: RowStore 経由で全 keyspace を compact できる`` () =
             }
         |> ok
 
-    withDir "c6" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "c6" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
         let txn = ok (Dml.insert schema txn [| SqlValue.Int 1L |])

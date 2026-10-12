@@ -10,23 +10,8 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-let private sstKey (i: int) =
-    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
-
-let private fmd (num: int64) (level: int) (lo: int) (hi: int) =
-    {
-        FileNumber = num
-        Level = level
-        Smallest = sstKey lo
-        Largest = sstKey hi
-        EntryCount = int64 (hi - lo + 1)
-        Size = int64 (hi - lo + 1) * 100L
-        MaxSeqNo = uint64 (hi + 1)
-    }
-
 /// MANIFEST 用の一時ディレクトリ（テスト名とは無関係に固有にする）。
-let private manifestDir () =
-    Path.Combine(Path.GetTempPath(), sprintf "rykdb-manifest-%d" DateTime.Now.Ticks)
+let private manifestDir () = newDir "manifest"
 
 [<Fact>]
 let ``Manifest: 新規作成と CURRENT の内容`` () =
@@ -126,6 +111,4 @@ let ``Manifest: CURRENT が不正なら CorruptionError`` () =
         ok (Manifest.ensureDirectory dir)
         File.WriteAllText(Path.Combine(dir, "CURRENT"), "not-a-manifest")
 
-        match Manifest.openOrCreate dir with
-        | Error e -> Assert.Equal<ErrorKind>(ErrorKind.CorruptionError, e.Kind)
-        | Ok _ -> Assert.Fail("壊れた CURRENT はエラーになるはず"))
+        expectErrorKind ErrorKind.CorruptionError "壊れた CURRENT はエラーになるはず" (Manifest.openOrCreate dir))

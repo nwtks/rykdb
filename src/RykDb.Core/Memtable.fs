@@ -43,9 +43,12 @@ module internal Entry =
 
         e.Key.Length + 8 + payload
 
-/// 永続 Treap — 挿入は根から再構築して新しい memtable を返す（破壊的変更なし）。
+    /// エントリ列に含まれる SeqNo の最大値（空なら 0）。
+    let maxSeqNo (entries: Entry seq) =
+        entries |> Seq.fold (fun acc e -> max acc e.SeqNo) 0UL
+
+/// 永続 Treap。挿入は根から再構築して新しい memtable を返す（破壊的変更なし）。
 /// 構造は「キー昇順・同一キーは SeqNo 降順」で探索・全順序走査できる平衡木。
-/// スキップリストを採用しなかった理由は docs/architecture.md §9.1。
 type internal TNode =
     {
         Entry: Entry
@@ -64,8 +67,8 @@ type internal Memtable =
         ApproxBytes: int
     }
 
-/// 範囲走査の作業リスト。探索中のノードと、
-/// 「このエントリを結果に積む」という操作を交互に並べる。
+/// 範囲走査の作業リスト。
+/// 探索中のノードと、「このエントリを結果に積む」という操作を交互に並べる。
 [<RequireQualifiedAccess>]
 type private Work =
     /// 探索するノード。None は「ここより先には対象がない」を意味する
@@ -80,34 +83,12 @@ module internal Memtable =
             ApproxBytes = 0
         }
 
+    /// キーの昇順、同一キーは SeqNo の降順（新しい版が先）。
+    /// バイト比較は `Bytes.compare` に一本化する（順序保持の要なので重複実装しない）。
     let private compareKeys (a: Entry) (b: Entry) =
-        let n = min a.Key.Length b.Key.Length
-
-        let rec go i =
-            if i >= n then compare a.Key.Length b.Key.Length
-            elif a.Key.[i] = b.Key.[i] then go (i + 1)
-            else compare (int a.Key.[i]) (int b.Key.[i])
-
-        match go 0 with
+        match Bytes.compare a.Key b.Key with
         | 0 -> compare b.SeqNo a.SeqNo
         | c -> c
-
-    let private compareByteArrays (a: byte array) (b: byte array) =
-        let n = min a.Length b.Length
-
-        let rec go i =
-            if i >= n then compare a.Length b.Length
-            elif a.[i] = b.[i] then go (i + 1)
-            else compare (int a.[i]) (int b.[i])
-
-        go 0
-
-    let private compareKeyOnly (key: byte array) (e: Entry) = compareByteArrays key e.Key
-
-    let private priority (e: Entry) =
-        let h = Hashing.hashBytes e.Key
-        let mixed = Hashing.mix (h ^^^ e.SeqNo * 0x9E3779B97F4A7C15UL)
-        Hashing.mix mixed
 
     let private split (root: TNode option) (target: Entry) =
         let rec go (stack: TNode list) (left: TNode option) (right: TNode option) =
@@ -119,8 +100,8 @@ module internal Memtable =
                 else
                     go rest left (Some { r with Left = right })
 
-        let rec down (stack: TNode list) (root: TNode option) =
-            match root with
+        let rec down (stack: TNode list) (node: TNode option) =
+            match node with
             | None -> go stack None None
             | Some r ->
                 if compareKeys r.Entry target < 0 then
@@ -129,6 +110,10 @@ module internal Memtable =
                     down (r :: stack) r.Left
 
         down [] root
+
+    let private priority (e: Entry) =
+        let h = Hashing.hashBytes e.Key
+        Hashing.mix (h ^^^ e.SeqNo * 0x9E3779B97F4A7C15UL) |> Hashing.mix
 
     let private insertNode (e: Entry) (root: TNode option) =
         let p = priority e
@@ -145,19 +130,17 @@ module internal Memtable =
 
                 rebuild rest rebuilt
 
-        let rec go (stack: (TNode * bool) list) (root: TNode option) =
-            match root with
+        let rec go (stack: (TNode * bool) list) (node: TNode option) =
+            match node with
             | None ->
-                let leaf =
-                    Some
-                        {
-                            Entry = e
-                            Priority = p
-                            Left = None
-                            Right = None
-                        }
-
-                rebuild stack leaf
+                Some
+                    {
+                        Entry = e
+                        Priority = p
+                        Left = None
+                        Right = None
+                    }
+                |> rebuild stack
             | Some r ->
                 if p > r.Priority then
                     let left, right = split (Some r) e
@@ -192,13 +175,15 @@ module internal Memtable =
     let apply (entries: Entry seq) (mem: Memtable) =
         Seq.fold (fun mem e -> insert e mem) mem entries
 
+    let private compareKeyOnly (key: byte array) (e: Entry) = Bytes.compare key e.Key
+
     /// キーの最新バージョン（SeqNo が最大のもの）を返す。
     /// 同一キーの版は SeqNo 降順に並ぶので、最初に拾ったものが最新。
     /// 点ルックアップ（MVCC の可視性つき）。
     /// <remarks>
     /// 点ルックアップ-matched キーだけを辿るので O(log n)。
-    /// `rangeScan` で済ませると「そのキー以降の全エントリ」を挽くため
-    /// O(n) になり、10 万行入れた memtable の点検索が 1 回 40 ms になる。
+    /// rangeScan で済ませると「そのキー以降の全エントリ」を挽くため O(n) になり、
+    /// 10 万行入れた memtable の点検索が 1 回 40 ms になる。
     /// </remarks>
     let getVisible (mem: Memtable) (key: byte array) (visible: uint64 option) =
         let rec go (work: TNode option list) (best: Entry option) =
@@ -235,7 +220,7 @@ module internal Memtable =
                 | Work.Emit e :: rest -> go rest (e :: acc) (count + 1)
                 | Work.Visit None :: rest -> go rest acc count
                 | Work.Visit(Some r) :: rest ->
-                    if compareByteArrays r.Entry.Key startKey < 0 then
+                    if Bytes.compare r.Entry.Key startKey < 0 then
                         go (Work.Visit r.Right :: rest) acc count
                     else
                         go (Work.Visit r.Left :: Work.Emit r.Entry :: Work.Visit r.Right :: rest) acc count
@@ -243,9 +228,7 @@ module internal Memtable =
         go [ Work.Visit mem.Root ] [] 0
 
     /// キー昇順（同一キーは SeqNo 降順）で全エントリを返す。
-    let toArray (mem: Memtable) =
-        // startKey を空にすると全件が対象になる（空キーより大きいので除外されない）
-        scanFrom mem [||] 0 |> List.toArray
+    let toArray (mem: Memtable) = scanFrom mem [||] 0 |> List.toArray
 
     /// startKey 以降のキーをキー昇順で返す。
     /// 木を使うので開始位置への到達は O(log n)。

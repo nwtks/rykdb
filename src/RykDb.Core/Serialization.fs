@@ -47,13 +47,18 @@ module internal Writer =
     let int64LE (v: int64) (w: Writer) =
         add w (Array.init 8 (fun i -> byte (v >>> 8 * i &&& 0xFFL)))
 
+    /// リトルエンディアン 4 バイト（符号なし）。
+    /// WAL のフレームヘッダや SSTable の Footer など固定長フィールド用。
+    let uint32LE (v: uint32) (w: Writer) =
+        add w (Array.init 4 (fun i -> byte (v >>> 8 * i &&& 0xFFu)))
+
     /// ビッグエンディアン 8 バイト（符号なし）。順序保持符号化で使う。
     let uint64BE (v: uint64) (w: Writer) =
         add w (Array.init 8 (fun i -> byte (v >>> 8 * (7 - i) &&& 0xFFUL)))
 
     /// 長さ付きバイト列（varint 長 + 実体）。
     let lengthPrefixed (bs: byte array) (w: Writer) =
-        w |> varint (uint64 bs.Length) |> fun w -> writeBytes bs w
+        w |> varint (uint64 bs.Length) |> writeBytes bs
 
     /// UTF-8 文字列を長さ付きで追加する。
     let str (s: string) (w: Writer) =
@@ -62,6 +67,12 @@ module internal Writer =
     /// 全チャンクを 1 本のバイト列に平坦化する。
     let toArray (w: Writer) =
         w.Chunks |> List.rev |> List.toArray |> Array.concat
+
+    /// 書き出し手順を左から順に適用して 1 本のバイト列にする。
+    /// `Writer.empty |> f1 |> f2 |> Writer.toArray` の繰り返しをまとめたもの。
+    /// 要素は `Writer.varint x` のような部分適用で書ける。
+    let build (steps: (Writer -> Writer) list) =
+        steps |> List.fold (fun w f -> f w) empty |> toArray
 
 /// 読み取り: Cursor
 /// 読み取り位置を値が持つ。更新は新しい Cursor を返すので mutable は要らない。
@@ -127,14 +138,26 @@ module internal Read =
             let v = bs |> Array.mapi (fun i b -> int64 b <<< 8 * i) |> Array.sum
             v, c)
 
-    /// ビッグエンディアン 8 バイトを読む（順序保持された整数の復元）。
+    /// リトルエンディアン 4バイト（符号なし）を読む。
+    let readUInt32LE (c: Cursor) =
+        readBytes 4 c
+        |> Result.map (fun (bs, c) ->
+            let v =
+                (uint32 bs.[0])
+                ||| (uint32 bs.[1] <<< 8)
+                ||| (uint32 bs.[2] <<< 16)
+                ||| (uint32 bs.[3] <<< 24)
+
+            v, c)
+
+    /// ビッグエンディアン 8バイトを読む（順序保持された整数の復元）。
     let readInt64BE (c: Cursor) =
         readBytes 8 c
         |> Result.map (fun (bs, c) ->
             let v = bs |> Array.fold (fun acc b -> acc <<< 8 ||| int64 b) 0L
             v, c)
 
-    /// ビッグエンディアン 8 バイト（符号なし）。順序保持された整数の復元。
+    /// ビッグエンディアン 8バイト（符号なし）。順序保持された整数の復元。
     let readUint64BE (c: Cursor) =
         readBytes 8 c
         |> Result.map (fun (bs, c) ->
@@ -156,6 +179,31 @@ module internal Read =
     let readStr (c: Cursor) =
         readLengthPrefixed c
         |> Result.map (fun (bs, c) -> Text.Encoding.UTF8.GetString bs, c)
+
+    /// 生のバイト列の固定オフセットから、リトルエンディアン 32bit を読む。
+    /// SSTable の restart 配列（末尾固定位置）のように、
+    /// カーソルを作らず位置を直に指して読む用（境界検査はしない）。
+    let readLE32 (data: byte array) (offset: int) =
+        let at (i: int) = uint32 data.[offset + i]
+        at 0 ||| (at 1 <<< 8) ||| (at 2 <<< 16) ||| (at 3 <<< 24)
+
+    /// `readLE32` の 64bit 版。
+    let readLE64 (data: byte array) (offset: int) =
+        int64 (readLE32 data offset) ||| (int64 (readLE32 data (offset + 4)) <<< 32)
+
+    /// `count` 件を 1 件ずつ読み出してリストにする。
+    /// 「1 件読む」処理は `readOne` に切り出し、ループはここ 1 箇所にまとめる。
+    /// 再帰は末尾位置の match で回す（bind を挟むと TCO が効かなくなる）。
+    let readItems (count: uint64) (readOne: Cursor -> Result<'a * Cursor, DbError>) (c: Cursor) =
+        let rec go (rest: uint64) (c: Cursor) (acc: 'a list) =
+            if rest = 0UL then
+                ret (List.rev acc, c)
+            else
+                match readOne c with
+                | Error e -> Error e
+                | Ok(v, c') -> go (rest - 1UL) c' (v :: acc)
+
+        go count c []
 
 /// 順序保持符号化 (order-preserving encoding)
 /// SSTable のマージはキーのバイト列比較で行うので、
@@ -435,6 +483,11 @@ module internal Hashing =
         let prime = 1099511628211UL
         Array.fold (fun h b -> (h ^^^ uint64 b) * prime) offsetBasis bs
 
+    /// バイト列の 32bit チェックサム（FNV-1a）。
+    /// WAL のフレームと SSTable の Footer の破損検出に使う。
+    let checksum (data: byte array) =
+        Array.fold (fun h b -> (h ^^^ uint32 b) * 16777619u) 2166136261u data
+
     /// ハッシュ値を攪拌する（splitmix64 相当）。
     /// FNV-1a は下位ビットに偏りがちで、Bloom filter のビット分布が悪くなるため。
     let mix (x: uint64) =
@@ -551,17 +604,7 @@ module internal ValueCodec =
             if n > uint64 Int32.MaxValue then
                 return! Error(DbError.corruption (sprintf "ValueCodec: 要素数が大きすぎます (%d)" n))
 
-            let arr = Array.zeroCreate<SqlValue>(int n)
-
-            let rec go i c =
-                if i >= arr.Length then
-                    ret (arr, c)
-                else
-                    match readValue c with
-                    | Error e -> Error e
-                    | Ok(v, c) ->
-                        arr.[i] <- v
-                        go (i + 1) c
-
-            return! go 0 c
+            // 件数付きの読み出しループは `Read.readItems` に一本化している。
+            let! items, c = Read.readItems n readValue c
+            return List.toArray items, c
         }

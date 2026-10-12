@@ -233,6 +233,66 @@ match Schema.resolve schema c with
 - 回帰テスト: `DatabaseTests` の `Database: JOIN の WHERE は右テーブルと横断述語に効く` /
   `Database: LEFT JOIN の WHERE は null 供給側に効く`
 
+### 3.5 入れ子 `Join` に「全スキーマ」を渡すと 3 テーブル結合が 0 行になる
+
+`buildLogical` は `List.fold` で `Join(Join(a, b), c)` と**左深い木**を組む。
+`exec` が左部分木へ `schema`（全テーブル分）をそのまま渡していたので、
+内側の JOIN は「自分と左のテーブル」ではなく「全テーブル」のスキーマで
+`ON` 句を解決してしまう。
+
+- 症状: `FROM a JOIN b ON … JOIN c ON …` が**エラーにならず 0 行**を返す
+  （2 テーブル結合は正しく動く）。
+  `joinPred` の `Schema.resolve` が列を見つけられず `Error` →
+  `joinLoop` の `onError` が `Op.empty` を返すため、**黙って空**になる。
+- 原因: `schema − 右テーブル` を「その level でのみ」計算し、左へ渡すのが
+  **全スキーマ**のままでしたこと。
+
+```fsharp
+// ❌ 左部分木に全スキーマを渡す（内側で外側のテーブルまで解決してしまう）
+exec ctx lTree schema >>= fun lOp -> ...
+
+// ✅ 積む側で「自分の右テーブルを除いたスキーマ」を左へ下ろす
+descend (frame :: stack) leftSchema lTree
+```
+
+あわせて `exec l >>= fun lOp -> exec r >>= …` は JOIN の数だけフレームが積もるので、
+`descend`（積む側・左スパインを降りる）と `unwind`（回す側・引き返して結合する）に
+分けて末尾再帰にした。右部分木の Op は `unwind` で初めて評価するので
+評価順（left → right → join）は変わらない。
+
+- 回帰テスト: `DatabaseTests` の `Database: 3 テーブルの入れ子 JOIN が行を返す` /
+  `末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`（深さ方向の累積を検証）
+
+### 3.6 JOIN の対応付けをテーブル名で探すと自己結合が消える
+
+`buildLogical` は `bindings |> List.findIndex (fun b -> b.RealName = j.Table.Name)` で
+「その JOIN 句がどのバインディングか」を探していた。
+`FROM t AS x JOIN t AS y`（自己結合）だと**両方 `RealName = "t"`** なので先頭にヒットし、
+`| idx when idx = 0 -> …` で **JOIN が丸ごと省略**される。
+
+- 症状: `SELECT p.id, q.v FROM t AS p JOIN t AS q ON p.id = q.id` が
+  `列インデックス 3 が範囲外です（2 列中）: q.v` で落ちる
+  （JOIN が無いので p の 2 列しか無く、q を参照する射影が外れる）。
+  q を参照しなければ**黙って p の全行**を返す。
+- ついでに F# の `List.findIndex` は未マッチだと**例外を投げる**のに、コードは
+  `| -1 -> …` を見ていた（`List.FindIndex` との取り違え）。未マッチ経路は存在しなかった。
+
+```fsharp
+// ❌ RealName で探す（重複時に先頭へヒット、未マッチは例外）
+let idx = bindings |> List.findIndex (fun b -> b.RealName = j.Table.Name)
+
+// ✅ sources と同順なので「i 番目の JOIN 句 = bindings.[i + 1]」で位置対応
+let right = bindings.[i + 1]
+```
+
+あわせて**識別名が重複する** `FROM t JOIN t`（エイリアス無し）は
+`Plan.runSelect` で `ErrorKind.NameError` にする。
+exec が「右テーブルを除いたスキーマ」を**名前で**引く（§3.5）ため、重複名は区別できず
+静かな誤答になる。自己結合は必ずエイリアスで表す。
+
+- 回帰テスト: `DatabaseTests` の `Database: エイリアスでの自己結合が行を返す` /
+  `Database: テーブル名の重複はエラー（エイリアスが必要）`
+
 ---
 
 ## 4. LSM / ストレージの罠
@@ -266,7 +326,7 @@ let fromMem =
 // ❌ 枝刈りだけして中身は全部 merge する
 let files =
     Version.allFiles engine.Version
-    |> List.filter (fun f -> SstEntry.compareBytes f.Largest startKey >= 0)
+    |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
 // ... そのままだと startKey より前のエントリも混ざる
 ```
 
@@ -277,7 +337,7 @@ let files =
 // ✅ merge 後に下限を適用する
 let sliced =
     if Array.isEmpty startKey then merged
-    else merged |> Array.filter (fun e -> SstEntry.compareBytes e.Key startKey >= 0)
+    else merged |> Array.filter (fun e -> Bytes.compare e.Key startKey >= 0)
 ```
 
 **教訓: 「ファイルを選ぶ枝刈り」と「中身の下限」は別物。両方をやる。**
@@ -607,14 +667,19 @@ let updateTables t ... = ...   // ← member から参照不可
 
 ### 8.6 `Result.all` は `seq` を要求する
 
+リスト・配列はそのまま渡せる（2026-10-11 に FSI で検証）。空リストリテラルだけは
+要素型が決まらないので注釈を付ける（FS0030）。
+
 ```fsharp
-// ❌ 推論が壊れる
-Result.all [ r1; r2 ]
-// ✅ Lattice.combine（自作の List 版）を使う
-Lattice.combine [ r1; r2 ]
+// ✅ リストも配列も渡せる
+all [ r1; r2 ]
+
+// ✅ 空のときは注釈で要素型を決める
+let empty: Result<int list, DbError> = all []
 ```
 
-同名 module は 1 アセンブリに 1 つだけなので、`Planner.fs` では `Results` に改名している。
+`Lattice.combine`（Executor.fs）と `Results.combine`（Planner.fs）は同じ処理の三重複だったので、
+2026-10-11 に `Errors.fs` の `ResultOps.all` へ一本化して削除した。
 
 ### 8.7 `SqlValue` は `:?>` できない（FS0016）
 
@@ -752,20 +817,34 @@ exec ctx child schema |> Result.map (fun op -> Ops.sortBy schema op keys)
 exec ctx child schema |> Result.map (fun op -> Ops.sortBy schema op keys)
 
 // ✅ あるいは「積む側」と「回す側」に分けて本当に末尾再帰にする
-let rec readColumns n c acc =
-    match readColumn c with
+let rec readAll n c acc =
+    match readOne c with
     | Error e -> Error e
-    | Ok(cd, c1) -> readColumns (n - 1UL) c1 (cd :: acc)   // 末尾
+    | Ok(v, c1) -> readAll (n - 1UL) c1 (v :: acc)   // 末尾
 ```
 
 **要素数に比例する反復は必ず後者にする**（`match` に直せば末尾になる）。
 `>>=` で受けると候補の数・WHEN 節の数だけスタックが積まれる。
 該当は `IN` の候補リストと `CASE` の WHEN 節（`Eval.eval`）で、
 回帰テストは `ExecutorTests` の `末尾再帰: 巨大な IN 候補と WHEN 節を評価できる`。
+カーソルからの数え上げ読み出しは `Read.readItems`（Serialization.fs）に共通化し、
+`Catalog` / `Wal` が使う。
 
 属性の無い関数（ローカル `let rec` 含む）まで含めた**反復検証**は
 `dotnet run --project tools/TailAudit`（既知分は `tools/TailAudit/TailAudit.baseline` と差分を取り、
 新規があれば exit 1。追認は内容確認のうえ `-- --update`）。
+
+### 8.17 モジュールスコープには DU を `let` 束縛で書けない（FS0010）
+
+ヘルパー化の過程で「テーブルの定義か索引の定義か」を表したいとき、
+`let private Kind = | A | B` と書くと FS0010 になる（`|` が binding に来た）。
+DU は `type` 宣言（モジュールスコープのものは `private` 可）か、
+**フラグと名前だけ返す**（`(bool * string) option`）のどちらか。
+
+- ✅ 1 種類の値だけ返すなら `bool` フラグで足りる（`Catalog.keyKindOf` はこれ）。
+- ❌ 相互再帰でない `let` を `and` で並べると FS0576（`keepExtreme` を `and` にしてしまった）。
+- ❌ ローカル `let tryPrefix prefix = ...` の中で `Encoding.UTF8.GetBytes prefix` を
+  引数注釈なしのままだと FS0041（オーバーロード解決が決められない）。`let p: byte array = ...` と注釈する。
 
 ---
 

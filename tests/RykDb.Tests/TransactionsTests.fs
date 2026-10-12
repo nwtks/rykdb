@@ -75,9 +75,7 @@ let ``Transaction: 同じキーを 2 つの transaction が書くと後者が Co
     let t3 = Transaction.put t3 "t:y" [| 1uy |] [| SqlValue.Int 3L |]
     let mgr, _, _ = TransactionManager.commit mgr t3 |> ok
 
-    match TransactionManager.commit mgr t2 with
-    | Error e -> Assert.Equal<ErrorKind>(ErrorKind.ConflictError, e.Kind)
-    | Ok _ -> Assert.Fail("write-write 競合を検出できなかった")
+    expectErrorKind ErrorKind.ConflictError "write-write 競合を検出できなかった" (TransactionManager.commit mgr t2)
 
 [<Fact>]
 let ``Transaction: 別 keyspace の同じキーは衝突しない`` () =

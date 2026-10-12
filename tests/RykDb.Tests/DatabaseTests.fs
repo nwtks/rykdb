@@ -7,28 +7,10 @@
 
 module RykDb.DatabaseTests
 
-open System
 open System.Diagnostics
-open System.IO
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
-
-let private withDb (tag: string) (f: Database -> unit) =
-    let dir =
-        Path.Combine(Path.GetTempPath(), sprintf "rykdb-db-%s-%d" tag DateTime.Now.Ticks)
-
-    try
-        protect (fun () -> Directory.CreateDirectory dir |> ignore) |> ignore
-        let db = ok (Database.openWith dir)
-        f db
-        ok (db.Close())
-    finally
-        if Directory.Exists dir then
-            try
-                Directory.Delete(dir, true)
-            with _ ->
-                ()
 
 /// 1 文を実行して「新しい Database」と結果の両方を返す。
 let private execRes (db: Database) (sql: string) = ok (db.Execute sql)
@@ -70,9 +52,9 @@ let ``Database: CREATE TABLE の重複はエラー（IF NOT EXISTS なし）`` (
     withDb "ddl3" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
 
-        match db1.Execute "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)" with
-        | Error _ -> ()
-        | Ok _ -> Assert.Fail("重複した CREATE TABLE が OK になっています"))
+        expectError
+            "重複した CREATE TABLE が OK になっています"
+            (db1.Execute "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"))
 
 [<Fact>]
 let ``Database: DROP TABLE でテーブルが消える`` () =
@@ -92,9 +74,7 @@ let ``Database: 存在しない列の索引はエラー`` () =
     withDb "ddl7" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
 
-        match db1.Execute "CREATE INDEX ix ON people (nope)" with
-        | Error _ -> ()
-        | Ok _ -> Assert.Fail("存在しない列の CREATE INDEX が OK になっています"))
+        expectError "存在しない列の CREATE INDEX が OK になっています" (db1.Execute "CREATE INDEX ix ON people (nope)"))
 
 // ---------------------------------------------------------------------------
 // DML
@@ -277,6 +257,124 @@ let ``Database: JOIN`` () =
         Assert.Equal<string>("bob", asText res.Rows.[1].[0]))
 
 [<Fact>]
+let ``Database: 3 テーブルの入れ子 JOIN が行を返す`` () =
+    // exec は左部分木に「全スキーマ」を渡していたため、3 テーブル以上の入れ子
+    // 結合で内側の JOIN が右テーブルの列まで含んだ schema で ON 句を解決し、
+    // 列が見つからずに INNER JOIN が黙って 0 行を返していた。
+    // 左へ下ろすのは「右テーブルを除いたスキーマ」。
+    withDb "join3" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, av INTEGER)"
+        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, bv INTEGER)"
+        let db4, _ = execRes db3 "INSERT INTO a VALUES (1,10),(2,20)"
+        let db5, _ = execRes db4 "INSERT INTO b VALUES (1,100),(2,200)"
+        let db6, _ = execRes db5 "INSERT INTO c VALUES (1,1000),(2,2000)"
+
+        let _, res =
+            ok (db6.Query "SELECT a.v, b.av, c.bv FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id ORDER BY a.id")
+
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int64>(10L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(100L, asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(1000L, asInt res.Rows.[0].[2])
+        Assert.Equal<int64>(20L, asInt res.Rows.[1].[0])
+        Assert.Equal<int64>(200L, asInt res.Rows.[1].[1])
+        Assert.Equal<int64>(2000L, asInt res.Rows.[1].[2]))
+
+[<Fact>]
+let ``末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`` () =
+    // plan の深さは JOIN の数だけ伸びる（サブクエリ未対応なので Join が唯一の源泉）。
+    // exec は descend（積む側）/ unwind（回す側）で末尾化済みだが、
+    // 左へ下ろす「右テーブルを除いたスキーマ」が段をまたいで正しく累積するかは
+    // 深さ方向で検証する（docs/gotchas.md §3.5 のバグは 3 段で発生した）。
+    // 作成は fsync 主導なので段数は 60 に抑える（120 段で 9 秒かかる実測あり）。
+    let n = 60
+
+    withDb "deepjoin" (fun db0 ->
+        let names = Array.init n (fun i -> sprintf "t%d" i)
+
+        let db1 =
+            names
+            |> Array.fold
+                (fun db name -> exec db (sprintf "CREATE TABLE %s (id INTEGER PRIMARY KEY, v INTEGER)" name))
+                db0
+
+        let db2 =
+            names
+            |> Array.mapi (fun i name -> sprintf "INSERT INTO %s VALUES (1,%d),(2,%d)" name i i)
+            |> Array.fold (fun db sql -> exec db sql) db1
+
+        // ON は「1 つ前 のテーブル」と結ぶ（左深いチェーンを作る）。
+        let onClauses =
+            names
+            |> Array.skip 1
+            |> Array.mapi (fun k name -> sprintf "JOIN %s ON %s.id = %s.id" name names.[k] name)
+            |> String.concat " "
+
+        let sql = sprintf "SELECT t0.v, t%d.v FROM t0 %s ORDER BY t0.v" (n - 1) onClauses
+        let _, res = ok (db2.Query sql)
+
+        // id = 1 と 2 の 2 行が全段で一致する（エラーで 0 行になっていないこと）。
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int>(2, res.Columns.Length)
+        Assert.Equal<int64>(0L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(int64 (n - 1), asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(0L, asInt res.Rows.[1].[0])
+        Assert.Equal<int64>(int64 (n - 1), asInt res.Rows.[1].[1]))
+
+[<Fact>]
+let ``Database: エイリアスでの自己結合が行を返す`` () =
+    // JOIN の対応付けを RealName で探していたころは、`FROM t AS x JOIN t AS y` が
+    // 先頭の t にヒットして JOIN が丸ごと省略され、
+    // `列インデックス 3 が範囲外です（2 列中）: q.v` で落ちていた。
+    withDb "selfjoin" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"
+
+        // 右だけを絞り込む WHERE が効くこと（JOIN が本当に組まれていること）。
+        let _, res =
+            ok (db2.Query "SELECT p.id, q.v FROM t AS p JOIN t AS q ON p.id = q.id WHERE q.v > 15 ORDER BY p.id")
+
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int64>(2L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(20L, asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(3L, asInt res.Rows.[1].[0])
+        Assert.Equal<int64>(30L, asInt res.Rows.[1].[1])
+
+        // 非キーでの自己結合（それぞれ自分自身とだけ一致する）。
+        let _, res2 =
+            ok (db2.Query "SELECT p.id, q.id FROM t AS p JOIN t AS q ON p.v = q.v ORDER BY p.id")
+
+        Assert.Equal<int>(3, res2.Rows.Length)
+        Assert.Equal<int64>(2L, asInt res2.Rows.[1].[0])
+        Assert.Equal<int64>(2L, asInt res2.Rows.[1].[1])
+
+        // 3 段の自己結合（p / q / r すべて t のエイリアス）。
+        let _, res3 =
+            ok (
+                db2.Query
+                    "SELECT p.id, q.id, r.v FROM t AS p JOIN t AS q ON p.id = q.id JOIN t AS r ON q.id = r.id WHERE p.v = 30 ORDER BY p.id"
+            )
+
+        Assert.Equal<int>(1, res3.Rows.Length)
+        Assert.Equal<int64>(3L, asInt res3.Rows.[0].[0])
+        Assert.Equal<int64>(3L, asInt res3.Rows.[0].[1])
+        Assert.Equal<int64>(30L, asInt res3.Rows.[0].[2]))
+
+[<Fact>]
+let ``Database: テーブル名の重複はエラー（エイリアスが必要）`` () =
+    // 識別名が重複すると exec が名前でスキーマを引けず（両方が消える）、
+    // エラーではなく静かな誤答になるので、名前解決の段階で止める。
+    withDb "dupjoin" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10)"
+
+        expectErrorKind
+            ErrorKind.NameError
+            "重複したテーブル名がエラーになりません"
+            (db2.Query "SELECT t.id FROM t JOIN t ON t.id = t.id"))
+
+[<Fact>]
 let ``Database: JOIN の WHERE は右テーブルと横断述語に効く`` () =
     withDb "sel11" (fun db0 ->
         let db1 =
@@ -395,12 +493,7 @@ let ``Database: 複数文を ; で渡せる`` () =
 
 [<Fact>]
 let ``Database: 閉じて開き直すとデータが残る`` () =
-    let dir =
-        Path.Combine(Path.GetTempPath(), sprintf "rykdb-i-reopen-%d" DateTime.Now.Ticks)
-
-    try
-        protect (fun () -> Directory.CreateDirectory(dir) |> ignore) |> ignore
-
+    withDir "i-reopen" (fun dir ->
         let db0 = ok (Database.openWith dir)
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2, _ins = ok (db1.Execute "INSERT INTO t VALUES (1, 'kept')")
@@ -417,13 +510,7 @@ let ``Database: 閉じて開き直すとデータが残る`` () =
         let actual: string = asText cell
         Assert.Equal<string>("kept", actual)
 
-        ok (db3.Close())
-    finally
-        if Directory.Exists dir then
-            try
-                Directory.Delete(dir, true)
-            with _ ->
-                ()
+        ok (db3.Close()))
 
 // ---------------------------------------------------------------------------
 // エラー
@@ -431,33 +518,22 @@ let ``Database: 閉じて開き直すとデータが残る`` () =
 
 [<Fact>]
 let ``Database: 存在しないテーブルの SELECT はエラー`` () =
-    withDb "err1" (fun db ->
-        match db.Query "SELECT * FROM nothing" with
-        | Error _ -> ()
-        | Ok _ -> Assert.Fail("存在しないテーブルの SELECT が OK になっています"))
+    withDb "err1" (fun db -> expectError "存在しないテーブルの SELECT が OK になっています" (db.Query "SELECT * FROM nothing"))
 
 [<Fact>]
 let ``Database: 存在しない列の WHERE はエラー`` () =
-    seeded "err2" (fun db ->
-        match db.Query "SELECT id FROM people WHERE nope = 1" with
-        | Error _ -> ()
-        | Ok _ -> Assert.Fail("存在しない列の WHERE が OK になっています"))
+    seeded "err2" (fun db -> expectError "存在しない列の WHERE が OK になっています" (db.Query "SELECT id FROM people WHERE nope = 1"))
 
 [<Fact>]
 let ``Database: 構文エラーはエラー（例外ではない）`` () =
-    withDb "err3" (fun db ->
-        match db.Execute "SELEC 1" with
-        | Error _ -> ()
-        | Ok _ -> Assert.Fail("構文エラーが OK になっています"))
+    withDb "err3" (fun db -> expectError "構文エラーが OK になっています" (db.Execute "SELEC 1"))
 
 [<Fact>]
 let ``Database: NOT NULL 制約違反はエラー`` () =
     withDb "err4" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)"
 
-        match db1.Execute "INSERT INTO t (id) VALUES (1)" with
-        | Error _ -> ()
-        | Ok _ -> Assert.Fail("NOT NULL 違反が OK になっています"))
+        expectError "NOT NULL 違反が OK になっています" (db1.Execute "INSERT INTO t (id) VALUES (1)"))
 
 [<Fact>]
 let ``Database: QueryResult の表示が使える`` () =
@@ -735,3 +811,20 @@ let ``性能: 多数行の insert → point lookup → range scan`` () =
         Assert.True(scanMs < 60000L, sprintf "scan が遅すぎます: %d ms" scanMs)
 
         ok (current.Close()))
+
+// ---------------------------------------------------------------------------
+// 末尾再帰の検証（大量の文でスタックを食わないこと）
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``末尾再帰: 大量の文を 1 度の Execute で実行できる`` () =
+    // Execute の go は `runStatement … |> Result.bind (fun … -> go …)` で
+    // 文の数だけフレームが積まれていた（→ StackOverflow / exit 134）。
+    // `match` で受けて末尾再帰にしてある。
+    let n = 20_000
+
+    withDb "tail-exec" (fun db0 ->
+        let db = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let sql = System.String.Join(";", Array.init n (fun _ -> "SELECT a FROM t"))
+        let (next, _) = ok (db.Execute sql)
+        Assert.Equal<string list>([ "t" ], next.TableNames()))

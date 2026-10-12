@@ -1,20 +1,16 @@
 // ===========================================================================
 // Executor — Volcano（イテレータ）方式の実行層。
-// pull 演算子 `Op`（Done / Step / Compute）で組む。LIMIT / WHERE の
-// 早期打ち切りが効き、無限長でもメモリは 1 行分。
-// 設計（なぜ pull か・snapshot の固定）は docs/architecture.md §6.2、
-// 落とし穴は docs/gotchas.md §2 / §3、NULL の扱いは docs/sql-reference.md §6.2。
+// pull 演算子 Op（Done / Step / Compute）で組む。LIMIT / WHERE の
+// 早期打ち切りが効き、無限長でもメモリは 1行分。
 // ===========================================================================
 
 namespace RykDb.Core
-
-open System
 
 // ---------------------------------------------------------------------------
 // 1. 行
 // ---------------------------------------------------------------------------
 
-/// 1 行 = 列順の SqlValue 配列。メモリ上は配列のまま、回さない。
+/// 1列の SqlValue 配列。メモリ上は配列のまま、回さない。
 type internal Row = SqlValue array
 
 module internal Row =
@@ -23,9 +19,8 @@ module internal Row =
     let private nullTag = "\u0000\0NULL"
 
     /// 等価キー（DISTINCT / GROUP BY / ハッシュ結合のキーに使う）。
-    /// NULL は SQL では「他のどの値とも等しくない」ので、
-    /// ここでは NULL も NULL 同士で等しい として扱う
-    /// （GROUP BY で NULL が 1 つのグループになる挙動に合わせるため）。
+    /// NULL は SQL では「他のどの値とも等しくない」ので、ここでは NULL も NULL 同士で等しい として扱う
+    /// （GROUP BY で NULL が 1つのグループになる挙動に合わせるため）。
     let keyOf (row: Row) =
         row
         |> Array.map (fun v ->
@@ -39,7 +34,7 @@ module internal Row =
 // 2. 出力スキーマ
 // ---------------------------------------------------------------------------
 
-/// 出力の 1 列。
+/// 出力の 1列。
 type internal OutputColumn =
     {
         /// 表示名（別名があればそれ、無ければ列名）
@@ -62,16 +57,8 @@ type internal OutputColumn =
             Qualifier = None
         }
 
-    /// `SELECT expr` で修飾子なしの列を作る。
-    static member ofExpression (label: string) (dt: DataType option) =
-        {
-            Name = label
-            Qualifier = None
-            DataType = dt
-        }
-
 module internal OutputColumn =
-    /// テーブルの 1 列から作る（修飾名はテーブル名か別名）。
+    /// テーブルの 1列から作る（修飾名はテーブル名か別名）。
     let ofTableColumn (table: string) (col: ColumnDefinition) =
         {
             Name = col.Name
@@ -87,19 +74,6 @@ type internal Schema =
         Tables: string list
     }
 
-    static member empty = { Columns = [||]; Tables = [] }
-
-    /// テーブルの全列を並べる。
-    static member ofTable (table: string) (alias: string option) (schema: TableSchema) =
-        let name = defaultArg alias table
-
-        let cols =
-            schema.Columns
-            |> List.map (fun c -> OutputColumn.ofTableColumn name c)
-            |> List.toArray
-
-        { Columns = cols; Tables = [ name ] }
-
     /// 列に別名を付ける（表示名のみ変更）。
     member this.WithAlias (index: int) (label: string) =
         if index < 0 || index >= this.Columns.Length then
@@ -110,7 +84,7 @@ type internal Schema =
 
             { this with Columns = cols }
 
-    /// 列を 1 つだけ残す。
+    /// 列を 1つだけ残す。
     member this.Project1(index: int) =
         if index < 0 || index >= this.Columns.Length then
             { this with Columns = [||] }
@@ -130,39 +104,61 @@ type internal Schema =
     member this.Header = this.Columns |> Array.map (fun c -> c.Display)
 
 module internal Schema =
-    let empty = Schema.empty
+    let empty = { Columns = [||]; Tables = [] }
+
+    /// スキーマ列を左から連結する（FROM / JOIN の出力スキーマ組み立て）。
+    let concatAll (schemas: Schema list) =
+        schemas |> List.fold (fun (acc: Schema) (s: Schema) -> acc.Concat s) empty
+
+    /// `*` / `t.*` が表す出力列を展開する。どちらもなければ None。
+    /// <remarks>
+    /// ヘッダ行（projectHeader）と射影の式（Ops.project）が同じ列を共有する。
+    /// どちらかが先に変わると `SELECT *` の列数とヘッダがずれる（実際にずれた）。
+    /// Expr は `[<NoComparison>]` なので「どちらの star だったか」は
+    /// 別のフラグで返す（qualified = `t.*` なら true）。
+    /// </remarks>
+    let expandStar (schema: Schema) (e: Expr) =
+        match e with
+        | Expr.Star -> Some(false, schema.Columns |> Array.toList)
+        | Expr.QualifiedStar q ->
+            Some(
+                true,
+                schema.Columns
+                |> Array.filter (fun (c: OutputColumn) -> defaultArg c.Qualifier "" = q)
+                |> Array.toList
+            )
+        | _ -> None
 
     /// 射影後のヘッダ行を作る。
     /// `SELECT *` は入力の列名をそのまま（修飾つき）。
     /// `SELECT id` は式を表示する。別名があればそれを使う。
     /// 入力スキーマのヘッダを返すと `SELECT id` が `people.id` になるので、
     /// 射影後の名前を組み立て直す必要がある。
+    /// <remarks>
+    /// `*` は修飾なしの `c.Name`、`t.*` は修飾つきの `c.Display` で出す（元の挙動）。
+    /// </remarks>
     let projectHeader (schema: Schema) (items: SelectItem list) =
         match items with
         | [] -> schema.Header
         | _ ->
             items
-            |> List.collect (fun (item: SelectItem) ->
-                match item.Expression with
-                | Expr.Star -> schema.Columns |> Array.toList |> List.map (fun c -> c.Name)
-                | Expr.QualifiedStar q ->
-                    schema.Columns
-                    |> Array.filter (fun (c: OutputColumn) ->
-                        match c.Qualifier with
-                        | Some qual -> qual = q
-                        | None -> false)
-                    |> Array.toList
-                    |> List.map (fun c -> c.Display)
-                | other ->
+            |> List.collect (fun item ->
+                match expandStar schema item.Expression with
+                | Some(qualified, columns) ->
+                    if qualified then
+                        columns |> List.map (fun c -> c.Display)
+                    else
+                        columns |> List.map (fun c -> c.Name)
+                | None ->
                     match item.Alias with
                     | Some a -> [ a ]
-                    | None -> [ Expr.toDisplayString other ])
+                    | None -> [ Expr.toDisplayString item.Expression ])
             |> List.toArray
 
     /// 式を「列の直接参照」に読み替える。
-    /// `EColumn` はそのまま。修飾子なしの裸の名前（`EName`）も列として扱う
-    /// （パーサが WHERE / ORDER BY の裸の名前を `EName` にするため）。
-    /// 集約呼び出しや式は列ではないので `None`。
+    /// Column はそのまま。修飾子なしの裸の名前（Name）も列として扱う
+    /// （パーサが WHERE / ORDER BY の裸の名前を Name にするため）。
+    /// 集約呼び出しや式は列ではないので None。
     let tryAsColumnRef (e: Expr) =
         match e with
         | Expr.Column c -> Some c
@@ -210,31 +206,37 @@ module internal Schema =
                 DbError.name (sprintf "列 '%s' が曖昧です（該当: %s）" r.Display (many |> List.map string |> String.concat ", "))
             )
 
-    /// テーブル 1 つのスキーマを作る。
-    let ofTable (table: string) (alias: string option) (schema: TableSchema) = Schema.ofTable table alias schema
+    /// テーブルの全列を並べる。
+    let ofTable (table: string) (alias: string option) (schema: TableSchema) =
+        let name = defaultArg alias table
+
+        let cols =
+            schema.Columns
+            |> List.map (fun c -> OutputColumn.ofTableColumn name c)
+            |> List.toArray
+
+        { Columns = cols; Tables = [ name ] }
 
 // ---------------------------------------------------------------------------
 // 3. Op — 不変の pull 演算子
 // ---------------------------------------------------------------------------
 
-/// 1 行取り出す演算子（不変）。
-/// `Done`             = 終わった
-/// `Step (row, next)` = `row` を返した。続きは `next`
-/// `Compute f`        = `f` を呼んで 1 行取り出す
+/// 1行取り出す演算子（不変）。
+/// Done             = 終わった
+/// Step (row, next) = row を返した。続きは next
+/// Compute f        = f を呼んで 1行取り出す
 ///
-/// `Compute` が「ソースだけを包む 1 段」であることが要点。
-/// 変換・フィルタ・結合はすべて「上流の `Op` を受け取って、
-/// `unit -> ...` を返す関数」として書けるので、
-/// ソース側の状態を壊さずに不変のまま合成できる。
-/// `Step` の `next` を呼ぶまで次の行は計算されないので、
-/// 無限長でもメモリは 1 行分だけ。
+/// Compute が「ソースだけを包む 1段」であることが要点。
+/// 変換・フィルタ・結合はすべて「上流の Op を受け取って、`unit -> ...` を返す関数」
+/// として書けるので、ソース側の状態を壊さずに不変のまま合成できる。
+/// Step の next を呼ぶまで次の行は計算されないので、無限長でもメモリは 1行分だけ。
 [<RequireQualifiedAccess>]
 type internal Op =
     | Done
-    /// 1 行と「その次」。`next` は評価されるので長い連鎖を組むには向かない
-    /// （遅延が必要なときは `Compute` を使う）。
+    /// 1行と「その次」。next は評価されるので長い連鎖を組むには向かない
+    /// （遅延が必要なときは Compute を使う）。
     | Step of SqlValue array * Op
-    /// 「次に 1 行を返す関数」。引数は `unit` なので遅延評価される。
+    /// 「次に 1行を返す関数」。引数は unit なので遅延評価される。
     /// ソース側が「まだ計算していない」長い系列を表すときは必ずこれを使う。
     | Compute of (unit -> Result<(SqlValue array * Op) option, DbError>)
 
@@ -242,17 +244,12 @@ module internal Op =
     /// 空の演算子。
     let empty = Op.Done
 
-    /// 1 行だけの演算子。
+    /// 1行だけの演算子。
     let ofRow (row: SqlValue array) = Op.Step(row, Op.Done)
 
     /// 配列を順に返す演算子。次の行は呼び出すたびに計算する。
-    /// <remarks>
-    /// `let rest = go (i + 1)` を先に評価すると、コンストラクト時に
-    /// 行数ぶんのスタックを積む（実測: Debug で約 13 万段で Stack overflow。
-    /// 10 万行の COUNT(*) スキャンは壁の約 76%）。`Compute` で 1 行ずつ作る（§2.1）。
-    /// </remarks>
     let ofArray (rows: SqlValue array array) =
-        let rec go (i: int) : Op =
+        let rec go (i: int) =
             if i >= rows.Length then
                 Op.Done
             else
@@ -260,40 +257,41 @@ module internal Op =
 
         go 0
 
-    /// 1 行取り出す。
-    [<TailCall>]
-    let rec next (op: Op) =
+    /// 1行取り出す。
+    let next (op: Op) =
         match op with
         | Op.Done -> ret None
         | Op.Step(row, nxt) -> ret (Some(row, nxt))
         | Op.Compute f -> f ()
 
-    /// 行を 1 つ変換する。失敗したら打切って Error。
-    /// 変換後の行の「次」は `map` を通した残りにする
-    /// （`nxt` をそのまま渡すと変換が 1 行だけに効き、次から元に戻る）。
-    let rec map (f: SqlValue array -> Result<SqlValue array, DbError>) (src: Op) =
+    /// ソースの次の 1行を引き出して継続に渡す。
+    /// 継続は「行と残りの Op」を受け取り、返した Result をそのまま返す。
+    /// 返した「その行の次」の Op が演算子の残りになる。
+    let pull (src: Op) (cont: SqlValue array -> Op -> Result<(SqlValue array * Op) option, DbError>) =
         Op.Compute(fun () ->
             next src
             >>= function
                 | None -> ret None
-                | Some(row, nxt) -> f row |> Result.map (fun r -> Some(r, map f nxt)))
+                | Some(row, nxt) -> cont row nxt)
+
+    /// 行を 1つ変換する。失敗したら打切って Error。
+    /// 変換後の行の「次」は map を通した残りにする
+    /// （nxt をそのまま渡すと変換が 1行だけに効き、次から元に戻る）。
+    let rec map (f: SqlValue array -> Result<SqlValue array, DbError>) (src: Op) =
+        pull src (fun row nxt -> f row |> Result.map (fun r -> Some(r, map f nxt)))
 
     /// 述語で弾く。偽の行は読み飛ばして次へ進む。
-    /// `p row >>= function` で分岐する（`if/then/else` だと
-    /// `Result` の短絡で `Some(row, nxt)` だけが残ることがある）。
+    /// p row >>= function で分岐する
+    /// （if/then/else だと Result の短絡で Some(row, nxt) だけが残ることがある）。
     let filter (p: SqlValue array -> Result<bool, DbError>) (src: Op) =
-        let rec go (cur: Op) : Op =
-            Op.Compute(fun () ->
-                next cur
-                >>= function
-                    | None -> ret None
-                    | Some(row, nxt) ->
-                        let verdict = p row
+        let rec go (cur: Op) =
+            pull cur (fun row nxt ->
+                let verdict = p row
 
-                        match verdict with
-                        | Ok true -> ret (Some(row, go nxt))
-                        | Ok false -> next (go nxt)
-                        | Error e -> err e)
+                match verdict with
+                | Ok true -> ret (Some(row, go nxt))
+                | Ok false -> next (go nxt)
+                | Error e -> err e)
 
         go src
 
@@ -302,11 +300,7 @@ module internal Op =
         if n <= 0 then
             Op.Done
         else
-            Op.Compute(fun () ->
-                next src
-                >>= function
-                    | None -> ret None
-                    | Some(row, nxt) -> ret (Some(row, take (n - 1) nxt)))
+            pull src (fun row nxt -> ret (Some(row, take (n - 1) nxt)))
 
     /// 先頭 n 行を読み飛ばす。
     let skip (n: int) (src: Op) =
@@ -314,21 +308,11 @@ module internal Op =
             if left <= 0 then
                 cur
             else
-                Op.Compute(fun () ->
-                    next cur
-                    >>= function
-                        | None -> ret None
-                        | Some(_, nxt) -> next (go (left - 1) nxt))
+                pull cur (fun _ nxt -> next (go (left - 1) nxt))
 
         go n src
 
     /// 全行を配列に materialize する。
-    /// <remarks>
-    /// `match` + 再帰で書くとスタックが深くなる。
-    /// `next` の直後に `>>=` を重ねると F# の末尾呼び出し最適化が効かず、
-    /// 10 万行の集約で Stack overflow になる。
-    /// ここでは「再帰 1 段 + ループ」にしてフレームが積み上がるのを防ぐ。
-    /// </remarks>
     let toArray (op: Op) =
         let rows = ResizeArray<SqlValue array>()
 
@@ -347,24 +331,14 @@ module internal Op =
 // ---------------------------------------------------------------------------
 
 module internal Scalar =
-    /// リテラルを実行時値へ。
-    let ofLiteral (l: Literal) =
-        match l with
-        | Literal.Null -> SqlValue.Null
-        | Literal.Bool b -> SqlValue.Bool b
-        | Literal.Int i -> SqlValue.Int i
-        | Literal.Real f -> SqlValue.Real f
-        | Literal.Decimal d -> SqlValue.Decimal d
-        | Literal.String s -> SqlValue.Text s
-        | Literal.Blob b -> SqlValue.Blob b
+    /// リテラルを実行時値へ（変換規則は Literal.ToSqlValue に一本化）。
+    let ofLiteral (l: Literal) = l.ToSqlValue
 
-    /// LIKE のパターン照合。`%` は任意文字列、`_` は 1 文字。
-    /// 正規表現に落とさずに手で照合する（LIKE の方言差を吸収するため）。
     /// LIKE のパターン照合。`%` は任意の文字列、`_` は 1 文字。
     /// 正規表現に落とさずに手で照合する（LIKE の方言差を吸収するため）。
-    /// バックトラックしない。 `%` で後戻りする実装は、進捗しないステップが
-    /// あると無限ループしうる（実際してプロセスが SIGABRT した）。
-    /// ここでは「区間と隙間を左から 1 通りだけ試す」素直な走査にする。
+    /// バックトラックしない。
+    /// `%` で後戻りする実装は、進捗しないステップがあると無限ループしうる。
+    /// ここでは「区間と隙間を左から 1通りだけ試す」素直な走査にする。
     /// 計算量は O(区間数 × テキスト長)。無限ループしないことが最優先。
     let likeMatch (pattern: string) (text: string) =
         let p = pattern.ToCharArray()
@@ -420,13 +394,15 @@ module internal Scalar =
                     elif freeBefore then
                         let rec scan (k: int) =
                             if k + len > n then
-                                false
+                                -1
                             else
                                 match matchSegment seg k with
                                 | -1 -> scan (k + 1)
-                                | r -> go (idx + 1) r
+                                | r -> r
 
-                        scan pos
+                        match scan pos with
+                        | -1 -> false
+                        | next -> go (idx + 1) next
                     else
                         match matchSegment seg pos with
                         | -1 -> false
@@ -498,33 +474,19 @@ module internal Scalar =
             >>= fun () ->
                 match args.[0] with
                 | SqlValue.Int i -> ret (SqlValue.Int i)
-                | SqlValue.Real f -> ret (SqlValue.Real(Math.Round(f, MidpointRounding.AwayFromZero)))
+                | SqlValue.Real f -> ret (SqlValue.Real(System.Math.Round(f, System.MidpointRounding.AwayFromZero)))
                 | SqlValue.Null -> ret SqlValue.Null
                 | other -> Error(DbError.typeError (sprintf "ROUND は数値を受け付けますが %s です" (SqlLiteral.toSqlLiteral other)))
         | _ -> Error(DbError.name (sprintf "未知のスカラー関数 '%s' です" name))
 
 
-/// Result のリストを順に評価して全部の値を返す。
-module internal Lattice =
-    /// `List<Result<'a, DbError>>` を全部評価する。1 つでも Error ならそれを返す。
-    let combine (rs: Result<'a, DbError> list) =
-        let rec go (rest: Result<'a, DbError> list) (acc: 'a list) =
-            match rest with
-            | [] -> ret (List.rev acc)
-            | r :: tail ->
-                match r with
-                | Error e -> Error e
-                | Ok v -> go tail (v :: acc)
-
-        go rs []
-
 // ---------------------------------------------------------------------------
-// 5. 式評価（スカラー・3 値論理）
+// 5. 式評価（スカラー・3値論理）
 // ---------------------------------------------------------------------------
 
 /// スカラー式の評価器。
-/// 集約を含まない式だけを扱う（集約は `Eval` に組めない）。
-/// NULL の伝播と 3 値論理は SQL 標準に合わせる。
+/// 集約を含まない式だけを扱う（集約は Eval に組めない）。
+/// NULL の伝播と 3値論理は SQL 標準に合わせる。
 module internal Eval =
     /// 算術の型決定。片方が REAL / DECIMAL なら結果もそうなる。
     let private arithmeticType (a: SqlValue) (b: SqlValue) =
@@ -551,42 +513,44 @@ module internal Eval =
         else
             ret (liftNumeric a b op)
 
-    /// 比較を 3 値論理に落とす。
+    /// 比較演算子を適用して 3値論理へ落とす。
+    /// <remarks>
+    /// compare（SqlValue を返す文脈）と truthOf（TruthValue を返す文脈）は
+    /// NULL 判定と演算子の表だけが違うので、両方ここへ寄せる。
+    /// 未知の演算子名は Unknown = False 側へ落とす（SQL では到達しない）。
+    /// </remarks>
+    let private applyComparison (opName: string) (c: int) =
+        let tf b =
+            if b then TruthValue.True else TruthValue.False
+
+        match opName with
+        | "eq" -> tf (c = 0)
+        | "ne" -> tf (c <> 0)
+        | "lt" -> tf (c < 0)
+        | "le" -> tf (c <= 0)
+        | "gt" -> tf (c > 0)
+        | "ge" -> tf (c >= 0)
+        | _ -> TruthValue.Unknown
+
+    /// 比較を 3値論理に落とす。
     let private compare (opName: string) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
             ret SqlValue.Null
         else
             SqlValue.compareValues a b
             |> Result.map (fun c ->
-                let r =
-                    match opName with
-                    | "eq" -> c = 0
-                    | "ne" -> c <> 0
-                    | "lt" -> c < 0
-                    | "le" -> c <= 0
-                    | "gt" -> c > 0
-                    | "ge" -> c >= 0
-                    | _ -> false
-
-                if r then SqlValue.Bool true else SqlValue.Bool false)
+                match applyComparison opName c with
+                | TruthValue.True -> SqlValue.Bool true
+                | _ -> SqlValue.Bool false)
 
     /// WHERE 用に TruthValue で判定する（UNKNOWN は偽）。
     let private truthOf (opName: string) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
             ret TruthValue.Unknown
         else
-            SqlValue.compareValues a b
-            |> Result.map (fun c ->
-                match opName with
-                | "eq" -> if c = 0 then TruthValue.True else TruthValue.False
-                | "ne" -> if c <> 0 then TruthValue.True else TruthValue.False
-                | "lt" -> if c < 0 then TruthValue.True else TruthValue.False
-                | "le" -> if c <= 0 then TruthValue.True else TruthValue.False
-                | "gt" -> if c > 0 then TruthValue.True else TruthValue.False
-                | "ge" -> if c >= 0 then TruthValue.True else TruthValue.False
-                | _ -> TruthValue.Unknown)
+            SqlValue.compareValues a b |> Result.map (fun c -> applyComparison opName c)
 
-    /// 2 値（真偽を直接返す）の文脈用。NULL は False。
+    /// 2値（真偽を直接返す）の文脈用。NULL は False。
     let private boolOf (v: SqlValue) =
         match v with
         | SqlValue.Bool b -> b
@@ -609,189 +573,242 @@ module internal Eval =
         else
             ret row.[i]
 
-    /// 式を評価する。集約呼び出しはここでエラーになる。
-    let rec eval (schema: Schema) (row: SqlValue array) (e: Expr) =
-        match e with
-        | Expr.Literal l -> ret (Scalar.ofLiteral l)
-        | Expr.Column c -> Schema.resolve schema c >>= fun i -> valueAt row i e
-        | Expr.Name n ->
-            let probeRef = { Qualifier = None; Name = n }
-            let probeExpr = Expr.Column probeRef
+    /// SqlValue を 3値へ落とす。BOOL はそのまま、NULL と BOOL 以外は UNKNOWN。
+    let private truthOfValue (v: SqlValue) =
+        if SqlValue.isNull v then
+            TruthValue.Unknown
+        else
+            match v with
+            | SqlValue.Bool b -> if b then TruthValue.True else TruthValue.False
+            | _ -> TruthValue.Unknown
 
-            match Schema.resolve schema probeRef with
-            | Ok i -> valueAt row i probeExpr
-            | Error _ -> Error(DbError.name (sprintf "'%s' は列でも関数でもありません" n))
-        | Expr.Star -> Error(DbError.create ErrorKind.SyntaxError "WHERE 句に '*' は置けません")
-        | Expr.QualifiedStar q -> Error(DbError.name (sprintf "'%s.*' はここでは使えません" q))
-        | Expr.Unary(op, x) ->
-            eval schema row x
-            >>= fun v ->
-                match op with
-                | UnaryOp.Not ->
-                    if SqlValue.isNull v then
-                        ret SqlValue.Null
-                    else
-                        ret (if boolOf v then SqlValue.Bool false else SqlValue.Bool true)
-                | UnaryOp.Pos -> ret v
-                | UnaryOp.Neg ->
-                    if SqlValue.isNull v then
-                        ret SqlValue.Null
-                    else
-                        match v with
-                        | SqlValue.Int i -> ret (SqlValue.Int -i)
-                        | SqlValue.Real f -> ret (SqlValue.Real -f)
-                        | SqlValue.Decimal d -> ret (SqlValue.Decimal -d)
-                        | _ -> Error(DbError.typeError (sprintf "'-' は数値に適用できません: %s" (SqlLiteral.toSqlLiteral v)))
-        | Expr.Binary(BinaryOp.And, a, b) ->
-            eval schema row a
-            >>= fun l ->
-                if l = SqlValue.Bool false then
-                    ret (SqlValue.Bool false)
-                else
-                    eval schema row b
-                    >>= fun r ->
-                        if SqlValue.isNull l || SqlValue.isNull r then
-                            ret SqlValue.Null
-                        else
-                            let lt = if boolOf l then TruthValue.True else TruthValue.Unknown
-                            let rt = if boolOf r then TruthValue.True else TruthValue.Unknown
+    /// 3値の判定結果を SqlValue へ戻す（UNKNOWN は NULL）。
+    let private ofTruth (t: TruthValue) =
+        match t with
+        | TruthValue.True -> SqlValue.Bool true
+        | TruthValue.False -> SqlValue.Bool false
+        | TruthValue.Unknown -> SqlValue.Null
 
-                            match TruthValue.and2 lt rt with
-                            | TruthValue.True -> ret (SqlValue.Bool true)
-                            | TruthValue.False -> ret (SqlValue.Bool false)
-                            | TruthValue.Unknown -> ret SqlValue.Null
-        | Expr.Binary(BinaryOp.Or, a, b) ->
-            eval schema row a
-            >>= fun l ->
-                if l = SqlValue.Bool true then
-                    ret (SqlValue.Bool true)
-                else
-                    eval schema row b
-                    >>= fun r ->
-                        if SqlValue.isNull l || SqlValue.isNull r then
-                            ret SqlValue.Null
-                        else
-                            let lt = if boolOf l then TruthValue.Unknown else TruthValue.False
-                            let rt = if boolOf r then TruthValue.Unknown else TruthValue.False
+    /// AND の 3値結合（両辺は既に評価済み）。FALSE での短絡は KBinaryL 側で先に済む。
+    let private andValue (l: SqlValue) (r: SqlValue) =
+        ofTruth (TruthValue.and2 (truthOfValue l) (truthOfValue r))
 
-                            match TruthValue.or2 lt rt with
-                            | TruthValue.True -> ret (SqlValue.Bool true)
-                            | TruthValue.False -> ret (SqlValue.Bool false)
-                            | TruthValue.Unknown -> ret SqlValue.Null
-        | Expr.Binary(op, a, b) ->
-            eval schema row a
-            >>= fun l ->
-                eval schema row b
-                >>= fun r ->
+    /// OR の 3値結合（両辺は既に評価済み）。TRUE での短絡は KBinaryL 側で先に済む。
+    let private orValue (l: SqlValue) (r: SqlValue) =
+        ofTruth (TruthValue.or2 (truthOfValue l) (truthOfValue r))
+
+    /// 継続（評価待ちの処理）。CPS の継続はクロージャではなく値として持つ。
+    /// 再帰を 1つの関数 step の自己再帰にまとめれば末尾呼び出しで回り、
+    /// ラムダの継続（継続の数だけフレームが積もる）や相互再帰（1フレーム残る）の問題がない。
+    type private Kont =
+        /// 単項演算子。値が上がってから適用する。
+        | KUnary of UnaryOp
+        /// 二項演算子の左辺を評価中。上がってから右辺へ進む。
+        | KBinaryL of BinaryOp * Expr
+        /// 二項演算子の右辺を評価中。上がってから両辺を結合する。
+        | KBinaryR of BinaryOp * SqlValue
+        | KIsNull of bool
+        /// BETWEEN は x → lo → hi の順に評価する。
+        | KBetweenX of Expr * Expr * bool
+        | KBetweenLo of SqlValue * Expr * bool
+        | KBetweenHi of SqlValue * SqlValue * bool
+        /// IN の左辺を評価中（候補リストと否定）。
+        | KInX of Expr list * bool
+        /// IN の候補 1件を評価中（左辺の値, 否定, 残りの候補, UNKNOWN を見たか）。
+        | KInArg of SqlValue * bool * Expr list * bool
+        | KLikeX of Expr * bool
+        | KLikeP of SqlValue * bool
+        /// CASE の WHEN を評価中（当該の WHEN/THEN, 残りの枝, ELSE）。
+        | KCaseWhen of (Expr * Expr) * (Expr * Expr) list * Expr option
+        /// 関数の引数 1個を評価中（関数名, 確定済みの逆順, 残りの引数）。
+        | KFuncArg of string * SqlValue list * Expr list
+
+    /// 評価機の状態。式を 1つ降りるか（Descend）、値が上がってきたか（Arrive）。
+    type private Step =
+        | Descend of Expr
+        | Arrive of SqlValue
+
+    /// 式評価機。降りる／上がるを継続スタック Kont でつなぐ（CPS）。
+    /// 再帰はこの関数の自己再帰だけなので全部末尾位置になり、
+    /// 式の深さ・IN の候補数に依存せずスタックは一定（継続はヒープのリストに積む）。
+    [<TailCall>]
+    let rec private step (schema: Schema) (row: SqlValue array) (kont: Kont list) (st: Step) =
+        match st with
+        | Descend e ->
+            match e with
+            | Expr.Literal l -> step schema row kont (Arrive(Scalar.ofLiteral l))
+            | Expr.Column c ->
+                match Schema.resolve schema c with
+                | Error er -> Error er
+                | Ok i ->
+                    match valueAt row i e with
+                    | Error er -> Error er
+                    | Ok v -> step schema row kont (Arrive v)
+            | Expr.Name n ->
+                let probeRef = { Qualifier = None; Name = n }
+
+                match Schema.resolve schema probeRef with
+                | Error _ -> Error(DbError.name (sprintf "'%s' は列でも関数でもありません" n))
+                | Ok i ->
+                    match valueAt row i (Expr.Column probeRef) with
+                    | Error er -> Error er
+                    | Ok v -> step schema row kont (Arrive v)
+            | Expr.Star -> Error(DbError.create ErrorKind.SyntaxError "WHERE 句に '*' は置けません")
+            | Expr.QualifiedStar q -> Error(DbError.name (sprintf "'%s.*' はここでは使えません" q))
+            | Expr.Unary(op, x) -> step schema row (KUnary op :: kont) (Descend x)
+            | Expr.Binary(op, a, b) -> step schema row (KBinaryL(op, b) :: kont) (Descend a)
+            | Expr.IsNull(x, negated) -> step schema row (KIsNull negated :: kont) (Descend x)
+            | Expr.Between(x, lo, hi, negated) -> step schema row (KBetweenX(lo, hi, negated) :: kont) (Descend x)
+            | Expr.InList(x, list, negated) -> step schema row (KInX(list, negated) :: kont) (Descend x)
+            | Expr.Like(x, p, negated) -> step schema row (KLikeX(p, negated) :: kont) (Descend x)
+            | Expr.Case(branches, elseE) ->
+                match branches with
+                | (w, t) :: tail -> step schema row (KCaseWhen((w, t), tail, elseE) :: kont) (Descend w)
+                | [] ->
+                    match elseE with
+                    | Some rest -> step schema row kont (Descend rest)
+                    | None -> step schema row kont (Arrive SqlValue.Null)
+            | Expr.FuncCall(n, args) ->
+                match args with
+                | a :: tail -> step schema row (KFuncArg(n, [], tail) :: kont) (Descend a)
+                | [] ->
+                    match Scalar.applyFunc n [||] with
+                    | Error er -> Error er
+                    | Ok v -> step schema row kont (Arrive v)
+            | Expr.AggCall(f, _, _) -> Error(DbError.name (sprintf "%s は集約なのでここでは評価できません" f.Name))
+        | Arrive v ->
+            match kont with
+            | [] -> ret v
+            | KUnary op :: rest ->
+                let computed =
                     match op with
-                    | BinaryOp.Add -> arith false (+) l r
-                    | BinaryOp.Sub -> arith false (-) l r
-                    | BinaryOp.Mul -> arith false (*) l r
-                    | BinaryOp.Div -> arith true (/) l r
-                    | BinaryOp.Mod -> arith true (%) l r
+                    | UnaryOp.Not ->
+                        ret (
+                            if SqlValue.isNull v then
+                                SqlValue.Null
+                            else
+                                SqlValue.Bool(not (boolOf v))
+                        )
+                    | UnaryOp.Pos -> ret v
+                    | UnaryOp.Neg ->
+                        if SqlValue.isNull v then
+                            ret SqlValue.Null
+                        else
+                            match v with
+                            | SqlValue.Int i -> ret (SqlValue.Int -i)
+                            | SqlValue.Real f -> ret (SqlValue.Real -f)
+                            | SqlValue.Decimal d -> ret (SqlValue.Decimal -d)
+                            | _ -> Error(DbError.typeError (sprintf "'-' は数値に適用できません: %s" (SqlLiteral.toSqlLiteral v)))
+
+                match computed with
+                | Error er -> Error er
+                | Ok res -> step schema row rest (Arrive res)
+            | KBinaryL(op, b) :: rest ->
+                let short =
+                    match op with
+                    | BinaryOp.And when v = SqlValue.Bool false -> Some(SqlValue.Bool false)
+                    | BinaryOp.Or when v = SqlValue.Bool true -> Some(SqlValue.Bool true)
+                    | _ -> None
+
+                match short with
+                | Some res -> step schema row rest (Arrive res)
+                | None -> step schema row (KBinaryR(op, v) :: rest) (Descend b)
+            | KBinaryR(op, l) :: rest ->
+                let combined =
+                    match op with
+                    | BinaryOp.Add -> arith false (+) l v
+                    | BinaryOp.Sub -> arith false (-) l v
+                    | BinaryOp.Mul -> arith false (*) l v
+                    | BinaryOp.Div -> arith true (/) l v
+                    | BinaryOp.Mod -> arith true (%) l v
                     | BinaryOp.Concat ->
-                        if SqlValue.isNull l || SqlValue.isNull r then
+                        if SqlValue.isNull l || SqlValue.isNull v then
                             ret SqlValue.Null
                         else
-                            ret (SqlValue.Text(SqlValue.toDisplayString l + SqlValue.toDisplayString r))
+                            ret (SqlValue.Text(SqlValue.toDisplayString l + SqlValue.toDisplayString v))
                     | BinaryOp.Like ->
-                        if SqlValue.isNull l || SqlValue.isNull r then
+                        if SqlValue.isNull l || SqlValue.isNull v then
                             ret SqlValue.Null
                         else
-                            let pattern = SqlValue.toDisplayString r
-                            let text = SqlValue.toDisplayString l
-                            ret (SqlValue.Bool(Scalar.likeMatch pattern text))
+                            ret (
+                                SqlValue.Bool(
+                                    Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString l)
+                                )
+                            )
                     | BinaryOp.Eq
                     | BinaryOp.Ne
                     | BinaryOp.Lt
                     | BinaryOp.Le
                     | BinaryOp.Gt
-                    | BinaryOp.Ge -> compare (nameOf op) l r
-                    | BinaryOp.And
-                    | BinaryOp.Or -> Error(DbError.internalError "And/Or は先に処理される")
-        | Expr.IsNull(x, negated) ->
-            eval schema row x
-            >>= fun v ->
+                    | BinaryOp.Ge -> compare (nameOf op) l v
+                    | BinaryOp.And -> ret (andValue l v)
+                    | BinaryOp.Or -> ret (orValue l v)
+
+                match combined with
+                | Error er -> Error er
+                | Ok res -> step schema row rest (Arrive res)
+            | KIsNull negated :: rest ->
                 let isNull = SqlValue.isNull v
-                ret (SqlValue.Bool(if negated then not isNull else isNull))
-        | Expr.Between(x, lo, hi, negated) ->
-            eval schema row x
-            >>= fun v ->
-                eval schema row lo
-                >>= fun lov ->
-                    eval schema row hi
-                    >>= fun hiv ->
-                        truthOf "ge" v lov
-                        >>= fun a ->
-                            truthOf "le" v hiv
-                            >>= fun b ->
-                                match TruthValue.and2 a b with
-                                | TruthValue.True -> ret (SqlValue.Bool(not negated))
-                                | TruthValue.False -> ret (SqlValue.Bool negated)
-                                | TruthValue.Unknown -> ret SqlValue.Null
-        | Expr.InList(x, list, negated) ->
-            eval schema row x
-            >>= fun v ->
-                if List.isEmpty list then
-                    ret (SqlValue.Bool negated)
-                else
-                    let rec go (rest: Expr list) (sawUnknown: bool) =
-                        match rest with
-                        | [] ->
-                            if sawUnknown then
-                                ret SqlValue.Null
-                            else
-                                ret (SqlValue.Bool negated)
-                        | e :: tail ->
-                            match eval schema row e with
-                            | Error er -> Error er
-                            | Ok w ->
-                                match truthOf "eq" v w with
-                                | Ok TruthValue.True -> ret (SqlValue.Bool(not negated))
-                                | Ok TruthValue.False -> go tail sawUnknown
-                                | Ok TruthValue.Unknown -> go tail true
-                                | Error er -> Error er
-
-                    go list false
-        | Expr.Like(x, p, negated) ->
-            eval schema row x
-            >>= fun v ->
-                eval schema row p
-                >>= fun pv ->
-                    if SqlValue.isNull v || SqlValue.isNull pv then
-                        ret SqlValue.Null
-                    else
-                        let m = Scalar.likeMatch (SqlValue.toDisplayString pv) (SqlValue.toDisplayString v)
-                        ret (SqlValue.Bool(if negated then not m else m))
-        | Expr.Case(branches, elseE) ->
-            let rec go (rest: (Expr * Expr) list) =
-                match rest with
-                | [] ->
-                    match elseE with
-                    | Some e -> eval schema row e
-                    | None -> ret SqlValue.Null
-                | (w, t) :: tail ->
-                    match eval schema row w with
+                step schema row rest (Arrive(SqlValue.Bool(if negated then not isNull else isNull)))
+            | KBetweenX(lo, hi, negated) :: rest -> step schema row (KBetweenLo(v, hi, negated) :: rest) (Descend lo)
+            | KBetweenLo(x, hi, negated) :: rest -> step schema row (KBetweenHi(x, v, negated) :: rest) (Descend hi)
+            | KBetweenHi(x, lov, negated) :: rest ->
+                match truthOf "ge" x lov with
+                | Error er -> Error er
+                | Ok ge ->
+                    match truthOf "le" x v with
                     | Error er -> Error er
-                    | Ok wv ->
-                        if SqlValue.isNull wv then go tail
-                        elif boolOf wv then eval schema row t
-                        else go tail
+                    | Ok le ->
+                        match TruthValue.and2 ge le with
+                        | TruthValue.True -> step schema row rest (Arrive(SqlValue.Bool(not negated)))
+                        | TruthValue.False -> step schema row rest (Arrive(SqlValue.Bool negated))
+                        | TruthValue.Unknown -> step schema row rest (Arrive SqlValue.Null)
+            | KInX(list, negated) :: rest ->
+                match list with
+                | [] -> step schema row rest (Arrive(SqlValue.Bool negated))
+                | cand :: tail -> step schema row (KInArg(v, negated, tail, false) :: rest) (Descend cand)
+            | KInArg(x, negated, tail, sawUnknown) :: rest ->
+                match truthOf "eq" x v with
+                | Error er -> Error er
+                | Ok TruthValue.True -> step schema row rest (Arrive(SqlValue.Bool(not negated)))
+                | Ok tv ->
+                    let saw = sawUnknown || tv = TruthValue.Unknown
 
-            go branches
-        | Expr.FuncCall(n, args) ->
-            evalArgs schema row args
-            >>= fun values -> Scalar.applyFunc n (values |> List.toArray)
-        | Expr.AggCall(f, _, _) -> Error(DbError.name (sprintf "%s は集約なのでここでは評価できません" f.Name))
+                    match tail with
+                    | [] -> step schema row rest (Arrive(if saw then SqlValue.Null else SqlValue.Bool negated))
+                    | cand :: more -> step schema row (KInArg(x, negated, more, saw) :: rest) (Descend cand)
+            | KLikeX(p, negated) :: rest -> step schema row (KLikeP(v, negated) :: rest) (Descend p)
+            | KLikeP(x, negated) :: rest ->
+                if SqlValue.isNull x || SqlValue.isNull v then
+                    step schema row rest (Arrive SqlValue.Null)
+                else
+                    let m = Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString x)
+                    step schema row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
+            | KCaseWhen((w, t), tail, elseE) :: rest ->
+                let matched = not (SqlValue.isNull v) && boolOf v
 
-    and private evalArgs (schema: Schema) (row: SqlValue array) (args: Expr list) =
-        args
-        |> List.fold
-            (fun acc e ->
-                acc
-                >>= fun (rev: SqlValue list) -> eval schema row e |> Result.map (fun v -> v :: rev))
-            (ret [])
-        |> Result.map List.rev
+                if matched then
+                    step schema row rest (Descend t)
+                else
+                    match tail with
+                    | (w2, t2) :: more -> step schema row (KCaseWhen((w2, t2), more, elseE) :: rest) (Descend w2)
+                    | [] ->
+                        match elseE with
+                        | Some rest2 -> step schema row rest (Descend rest2)
+                        | None -> step schema row rest (Arrive SqlValue.Null)
+            | KFuncArg(n, doneRev, tail) :: rest ->
+                let acc = v :: doneRev
+
+                match tail with
+                | [] ->
+                    match Scalar.applyFunc n (List.rev acc |> List.toArray) with
+                    | Error er -> Error er
+                    | Ok res -> step schema row rest (Arrive res)
+                | a :: more -> step schema row (KFuncArg(n, acc, more) :: rest) (Descend a)
+
+    /// 式を評価する。集約呼び出しはここでエラーになる。
+    /// 評価機 step を空の継続スタックで始める（末尾再帰のまま深さ・候補数に依存しない）。
+    let eval (schema: Schema) (row: SqlValue array) (e: Expr) = step schema row [] (Descend e)
 
     /// WHERE の判定。UNKNOWN は偽（SQL 標準）。
     let matches (schema: Schema) (row: SqlValue array) (predicate: Expr) =
@@ -803,14 +820,6 @@ module internal Eval =
             | SqlValue.Int i -> i <> 0L
             | _ -> false)
 
-/// 式を組み立てる小さなヘルパ。
-module internal Build =
-    /// 列参照を作る（修飾子はそのまま）。
-    let private col (qualifier: string option) (name: string) = { Qualifier = qualifier; Name = name }
-
-    /// 出力列をそのままの列参照にする（`SELECT *` の展開用）。
-    let sameRef (c: OutputColumn) = col c.Qualifier c.Name
-
 // ---------------------------------------------------------------------------
 // 6. 走査演算子
 // ---------------------------------------------------------------------------
@@ -819,21 +828,13 @@ module internal Build =
 type internal ExecContext =
     {
         Store: RowStore
-        /// 読み取りの可視性境界。Op 生成時に 1 回だけ決まる。
+        /// 読み取りの可視性境界。Op 生成時に 1回だけ決まる。
         Visible: uint64 option
         /// テーブル名（別名含む） -> スキーマ
         Schemas: Map<string, TableSchema>
         /// カタログ。索引の定義を引くのに使う。
         Catalog: Catalog
     }
-
-    static member create (store: RowStore) (visible: uint64 option) =
-        {
-            Store = store
-            Visible = visible
-            Schemas = Map.empty
-            Catalog = Catalog.empty
-        }
 
     /// スキーマを登録する（別名つきで）。
     member this.WithSchema (alias: string) (schema: TableSchema) =
@@ -862,6 +863,15 @@ type internal ExecContext =
                 | Some t -> Catalog.toSchema t
                 | None -> Error(DbError.name (sprintf "テーブル '%s' が存在しません" name))
 
+module internal ExecContext =
+    let create (store: RowStore) (visible: uint64 option) =
+        {
+            Store = store
+            Visible = visible
+            Schemas = Map.empty
+            Catalog = Catalog.empty
+        }
+
 module internal Scan =
     /// テーブルのスキーマを引く。無ければエラー。
     let private schemaOf (ctx: ExecContext) (table: string) =
@@ -877,18 +887,18 @@ module internal Scan =
             |> Result.map (fun rows -> Op.ofArray rows)
 
     /// 索引で一致する全行を引く。
-    /// 索引は一意とは限らないので、`WHERE indexed_col = v` が
-    /// 1 行になるとは限らない。`v` を持つ行をすべて返す。
+    /// 索引は一意とは限らないので、`WHERE indexed_col = v` が 1行になるとは限らない。
+    /// `v` を持つ行をすべて返す。
     let byIndex (ctx: ExecContext) (table: string) (indexName: string) (keyValues: SqlValue array) =
         schemaOf ctx table
         >>= fun schema ->
             match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
             | None -> Error(DbError.name (sprintf "テーブル %s に索引 %s がありません" table indexName))
             | Some idx ->
-                Dml.scanByIndexPrefix ctx.Store idx ctx.Visible keyValues Int32.MaxValue
+                Dml.scanByIndexPrefix ctx.Store idx ctx.Visible keyValues System.Int32.MaxValue
                 |> Result.map Op.ofArray
 
-    /// 主キーで 1 行を引く。
+    /// 主キーで 1行を引く。
     let byPrimaryKey (ctx: ExecContext) (table: string) (key: SqlValue array) =
         schemaOf ctx table
         >>= fun schema ->
@@ -899,6 +909,12 @@ module internal Scan =
                 | Some r -> Op.ofRow r)
 
 module internal Ops =
+    /// 列参照を作る（修飾子はそのまま）。
+    let private col (qualifier: string option) (name: string) = { Qualifier = qualifier; Name = name }
+
+    /// 出力列をそのままの列参照にする（`SELECT *` の展開用）。
+    let sameRef (c: OutputColumn) = col c.Qualifier c.Name
+
     /// 集約呼び出しの「識別子」。同じ呼び出しは同じ accum にまとめる。
     /// `COUNT(*)` の引数は `EStar`。DISTINCT フラグではなく、引数で判定する。
     let private isStarArg (x: Expr) =
@@ -906,16 +922,15 @@ module internal Ops =
         | Expr.Star -> true
         | _ -> false
 
-    let private aggKey (f: AggFunc, star: bool, arg: Expr) =
+    let private aggKey (f: AggFunc) (arg: Expr) =
         sprintf "%s(%s)" f.Name (Expr.toDisplayString arg)
 
     /// 述語で弾く。
     let filter (schema: Schema) (src: Op) (predicate: Expr) =
         Op.filter (fun row -> Eval.matches schema row predicate) src
 
-    /// 射影。`items` が `None` なら全列をそのまま。
-    /// 射影。`SELECT` の項目順に値を並べる。
-    /// `*` / `t.*` は対象テーブルの全列に展開する。
+    /// ソート。ORDER BY のキー（列位置と方向）を先に解決してから
+    /// 比較関数へ落とす。`*` / `t.*` はORDER BY には書けない。
     let sortBy (schema: Schema) (src: Op) (keys: RykDb.Core.SortKey list) =
         if List.isEmpty keys then
             ret src
@@ -930,12 +945,12 @@ module internal Ops =
                     match Schema.tryAsColumnRef expr with
                     | None -> Error(DbError.name (sprintf "ORDER BY には列の直接参照だけを書けます（%s）" (Expr.toDisplayString expr)))
                     | Some c ->
-                        let bare: ColumnRef = { Qualifier = None; Name = c.Name }
+                        let bare = { Qualifier = None; Name = c.Name }
 
                         match Schema.resolve schema c with
                         | Ok i -> Ok(i, dir)
                         | Error _ -> Schema.resolve schema bare |> Result.map (fun i -> i, dir))
-                |> Lattice.combine
+                |> all
 
             resolved
             |> Result.bind (fun plan ->
@@ -966,22 +981,16 @@ module internal Ops =
     /// 「直前のキーだけ」で比較するのは `DISTINCT` ではなく `DISTINCT ON` にしかならない
     /// （`2, 1, 2` で 2 が 2 回目に出るため、直前比較では除去できない）。
     ///  Costs O(既出キー数 × 平均キー長)。メモリは全キーに比例する。
-    /// 値が多いテーブルでは使えないが、
-    /// `SELECT DISTINCT` の素直な実装としてはこれが正しい。
+    /// 値が多いテーブルでは使えないが、`SELECT DISTINCT` の素直な実装としてはこれが正しい。
     let distinct (src: Op) =
         let rec go (seen: Set<string>) (cur: Op) =
-            Op.Compute(fun () ->
-                Op.next cur
-                >>= function
-                    | None -> ret None
-                    | Some(row, nxt) ->
-                        let k: string = Row.keyOf row
+            Op.pull cur (fun row nxt ->
+                let k = Row.keyOf row
 
-                        if Set.contains k seen then
-                            Op.next (go seen nxt)
-                        else
-                            let nextOp: Op = go (Set.add k seen) nxt
-                            ret (Some(row, nextOp)))
+                if Set.contains k seen then
+                    Op.next (go seen nxt)
+                else
+                    ret (Some(row, go (Set.add k seen) nxt)))
 
         go Set.empty src
 
@@ -1011,9 +1020,28 @@ module internal Ops =
             First = None
         }
 
-    /// 値 1 つを蓄積に追加する。`isStar` のときは NULL でも数える。
-    /// 1 行を蓄積に加える。
-    /// `isStar` が true（`COUNT(*)`）なら NULL でも数える。
+    /// 極値（MIN / MAX）の蓄積更新。
+    /// 最初に見た値をそのまま採用し、それ以降は wins が真のときだけ入れ替える。
+    /// <remarks>
+    /// MIN と MAX の 2 コピーを 1 本にした。
+    /// Count の加算は呼び出し側の bump が持つのでここに現れない。
+    /// 比較は SqlValue.compareValues（型が違うと TypeError）。
+    /// </remarks>
+    let private keepExtreme
+        (v: SqlValue)
+        (wins: int -> bool)
+        (bumped: Acc)
+        (current: SqlValue option)
+        (set: Acc -> SqlValue -> Acc)
+        =
+        match current with
+        | None -> ret (set bumped v)
+        | Some cur ->
+            SqlValue.compareValues v cur
+            |> Result.map (fun c -> if wins c then set bumped v else bumped)
+
+    /// 値 1行を蓄積に加える。
+    /// isStar が true（`COUNT(*)`）なら NULL でも数える。
     /// それ以外は NULL を無視する（`COUNT(列)` の SQL の挙動）。
     let private addAcc (acc: Acc) (value: SqlValue option) (isStar: bool) =
         let counted =
@@ -1024,11 +1052,13 @@ module internal Ops =
                 | Some v when not (SqlValue.isNull v) -> Some v
                 | _ -> None
 
+        let bump = { acc with Count = acc.Count + 1L }
+
         match counted with
         | None -> ret acc
         | Some v ->
             match acc.Kind with
-            | AggFunc.Count -> ret { acc with Count = acc.Count + 1L }
+            | AggFunc.Count -> ret bump
             | AggFunc.Sum
             | AggFunc.Avg ->
                 match SqlValue.asNumeric v with
@@ -1040,53 +1070,17 @@ module internal Ops =
                     match v with
                     | SqlValue.Real f ->
                         ret
-                            { acc with
-                                Count = acc.Count + 1L
+                            { bump with
                                 SawReal = true
                                 SumReal = acc.SumReal + f
                             }
                     | _ ->
                         ret
-                            { acc with
-                                Count = acc.Count + 1L
+                            { bump with
                                 SumDecimal = acc.SumDecimal + d
                             }
-            | AggFunc.Min ->
-                match acc.Min with
-                | None ->
-                    ret
-                        { acc with
-                            Count = acc.Count + 1L
-                            Min = Some v
-                        }
-                | Some cur ->
-                    SqlValue.compareValues v cur
-                    |> Result.map (fun c ->
-                        if c < 0 then
-                            { acc with
-                                Count = acc.Count + 1L
-                                Min = Some v
-                            }
-                        else
-                            { acc with Count = acc.Count + 1L })
-            | AggFunc.Max ->
-                match acc.Max with
-                | None ->
-                    ret
-                        { acc with
-                            Count = acc.Count + 1L
-                            Max = Some v
-                        }
-                | Some cur ->
-                    SqlValue.compareValues v cur
-                    |> Result.map (fun c ->
-                        if c > 0 then
-                            { acc with
-                                Count = acc.Count + 1L
-                                Max = Some v
-                            }
-                        else
-                            { acc with Count = acc.Count + 1L })
+            | AggFunc.Min -> keepExtreme v (fun c -> c < 0) bump acc.Min (fun b x -> { b with Min = Some x })
+            | AggFunc.Max -> keepExtreme v (fun c -> c > 0) bump acc.Max (fun b x -> { b with Max = Some x })
 
     /// 蓄積を結果値に変える。
     let private finishAcc (acc: Acc) =
@@ -1106,46 +1100,27 @@ module internal Ops =
         | AggFunc.Min -> defaultArg acc.Min SqlValue.Null
         | AggFunc.Max -> defaultArg acc.Max SqlValue.Null
 
-    let rec private collectAggs (e: Expr) (acc: (AggFunc * bool * Expr) list) =
-        match e with
-        | Expr.AggCall(f, _, x) -> (f, isStarArg x, x) :: acc
-        | Expr.Literal _
-        | Expr.Column _
-        | Expr.Name _
-        | Expr.Star
-        | Expr.QualifiedStar _ -> acc
-        | Expr.Unary(_, x) -> collectAggs x acc
-        | Expr.Binary(_, a, b) -> collectAggs b (collectAggs a acc)
-        | Expr.IsNull(x, _) -> collectAggs x acc
-        | Expr.Between(x, a, b, _) -> collectAggs b (collectAggs a (collectAggs x acc))
-        | Expr.InList(x, xs, _) ->
-            let after = xs |> List.fold (fun acc' e' -> collectAggs e' acc') (collectAggs x acc)
-            after
-        | Expr.Like(x, p, _) -> collectAggs p (collectAggs x acc)
-        | Expr.Case(branches, elseE) ->
-            let branchAcc =
-                branches |> List.fold (fun a (w, t) -> collectAggs t (collectAggs w a)) acc
-
-            match elseE with
-            | Some el -> collectAggs el branchAcc
-            | None -> branchAcc
-        | Expr.FuncCall(_, args) -> args |> List.fold (fun a e' -> collectAggs e' a) acc
+    /// 式中の集約呼び出しを pre-order に畳み込む（明示スタックの Expr.fold を使う）。
+    let private collectAggs (e: Expr) (acc: (AggFunc * bool * Expr) list) =
+        Expr.fold
+            (fun a node ->
+                match node with
+                | Expr.AggCall(f, _, x) -> (f, isStarArg x, x) :: a
+                | _ -> a)
+            acc
+            e
 
     /// 式中に現れる集約呼び出しの一覧（実行順に揃える）。
     let aggCalls (exprs: Expr list) =
         exprs |> List.fold (fun acc e -> collectAggs e acc) [] |> List.rev
 
-    /// 式から集約呼び出しを「出現順」で集める（重複は同じ accum にまとめる）。
-    /// 集約呼び出しを、計算済みの結果へ読み替える。
-    /// 集約後の行は「groupBy の値 ++ 各集約の結果」の並び。
     /// 複数の SELECT 項目から集約呼び出しを集める（出現順）。
-    /// `project` は `aggCalls` より前に定義されるので、ここに保存する。
     let private aggCallsOf (items: SelectItem list) =
         aggCalls (items |> List.map (fun i -> i.Expression))
 
     /// 式を「集約後の行の位置」で読み替える。
-    /// `offsets` は「表示文字列 -> 列位置」。集約呼び出しの他、
-    /// GROUP BY の列（`SELECT age, COUNT(*)` の `age`）もここに含まれる。
+    /// offsets は「表示文字列 -> 列位置」。
+    /// 集約呼び出しの他、 GROUP BY の列（`SELECT age, COUNT(*)` の `age`）もここに含まれる。
     let rec private rewriteAggs (e: Expr) (offsets: Map<string, int>) (row: SqlValue array) =
         let slot key =
             match offsets |> Map.tryFind key with
@@ -1153,8 +1128,8 @@ module internal Ops =
             | _ -> None
 
         match e with
-        | Expr.AggCall(f, star, arg) ->
-            match slot (aggKey (f, star, arg)) with
+        | Expr.AggCall(f, _, arg) ->
+            match slot (aggKey f arg) with
             | Some l -> l
             | None -> Expr.Literal Literal.Null
         | Expr.Literal l -> Expr.Literal l
@@ -1168,26 +1143,7 @@ module internal Ops =
             | None -> orig
         | Expr.Star -> Expr.Star
         | Expr.QualifiedStar q -> Expr.QualifiedStar q
-        | Expr.Unary(op, x) -> Expr.Unary(op, rewriteAggs x offsets row)
-        | Expr.Binary(op, a, b) -> Expr.Binary(op, rewriteAggs a offsets row, rewriteAggs b offsets row)
-        | Expr.IsNull(x, neg) -> Expr.IsNull(rewriteAggs x offsets row, neg)
-        | Expr.Between(x, a, b, neg) ->
-            Expr.Between(rewriteAggs x offsets row, rewriteAggs a offsets row, rewriteAggs b offsets row, neg)
-        | Expr.InList(x, xs, neg) ->
-            Expr.InList(rewriteAggs x offsets row, xs |> List.map (fun e2 -> rewriteAggs e2 offsets row), neg)
-        | Expr.Like(x, p, neg) -> Expr.Like(rewriteAggs x offsets row, rewriteAggs p offsets row, neg)
-        | Expr.Case(branches, elseE) ->
-            let bs =
-                branches
-                |> List.map (fun (w, t) -> (rewriteAggs w offsets row, rewriteAggs t offsets row))
-
-            let el =
-                match elseE with
-                | Some e2 -> Some(rewriteAggs e2 offsets row)
-                | None -> None
-
-            Expr.Case(bs, el)
-        | Expr.FuncCall(n, args) -> Expr.FuncCall(n, args |> List.map (fun e2 -> rewriteAggs e2 offsets row))
+        | _ -> Expr.mapChildren (fun c -> rewriteAggs c offsets row) e
 
     /// 集約結果の「列位置」を索引割りで持つ。
     /// GROUP BY の列（位置 0, 1, ...）と各集約の結果（その後）の両方を持つ。
@@ -1196,7 +1152,9 @@ module internal Ops =
             groupBy |> List.mapi (fun i e -> Expr.toDisplayString e, i) |> Map.ofList
 
         let aggSlots =
-            aggs |> List.mapi (fun i a -> aggKey a, List.length groupBy + i) |> Map.ofList
+            aggs
+            |> List.mapi (fun i (f, _, arg) -> aggKey f arg, List.length groupBy + i)
+            |> Map.ofList
 
         Map.fold (fun acc k v -> Map.add k v acc) groupSlots aggSlots
 
@@ -1210,35 +1168,33 @@ module internal Ops =
         =
         rewriteAggs e (aggOffsets groupBy aggs) row
 
-    /// HAVING を張る。集約後の行は位置のみの意味を持つので `Schema.empty` で評価する。
+    /// HAVING を張る。集約後の行は位置のみの意味を持つので Schema.empty で評価する。
     let havingFilter (groupBy: Expr list) (aggs: (AggFunc * bool * Expr) list) (predicate: Expr) =
         fun row ->
             let replaced = substituteAggs groupBy aggs predicate row
             Eval.matches Schema.empty row replaced
 
     /// GROUP BY + 集約。
-    /// `groupBy` が空でも集約があれば 1 グループだけ出す。
-    /// （`SELECT COUNT(*) FROM 空のテーブル` が 0 ではなく 1 行を返さないと
+    /// groupBy が空でも集約があれば 1グループだけ出す。
+    /// （`SELECT COUNT(*) FROM 空のテーブル` が 0 ではなく 1行を返さないと
     ///   SQL の通常の挙動と違ってしまうため）
     let aggregate (schema: Schema) (src: Op) (groupBy: Expr list) (aggs: (AggFunc * bool * Expr) list) =
         Op.toArray src
-        |> Result.bind (fun (rows: SqlValue array array) ->
-            let keyOfRow (row: SqlValue array) : Result<string, DbError> =
+        |> Result.bind (fun rows ->
+            let keyOfRow (row: SqlValue array) =
                 groupBy
                 |> List.map (fun e -> Eval.eval schema row e)
-                |> Lattice.combine
-                |> Result.map (fun (vs: SqlValue list) ->
-                    vs |> List.map SqlLiteral.toSqlLiteral |> String.concat "\u0001")
+                |> all
+                |> Result.map (fun vs -> Row.keyOf (List.toArray vs))
 
-            let order: ResizeArray<string> = ResizeArray<string>()
+            let order = ResizeArray<string>()
 
-            let table: System.Collections.Generic.Dictionary<string, ResizeArray<SqlValue array>> =
+            let table =
                 System.Collections.Generic.Dictionary<string, ResizeArray<SqlValue array>>()
 
             let rec go (i: int) =
                 if i >= rows.Length then
-                    let built: Map<string, SqlValue array list> =
-                        table |> Seq.map (fun kv -> kv.Key, List.ofSeq kv.Value) |> Map.ofSeq
+                    let built = table |> Seq.map (fun kv -> kv.Key, List.ofSeq kv.Value) |> Map.ofSeq
 
                     Ok(List.ofSeq order, built)
                 else
@@ -1256,18 +1212,18 @@ module internal Ops =
                         go (i + 1)
 
             go 0
-            |> Result.map (fun (order: string list, table: Map<string, SqlValue array list>) ->
+            |> Result.map (fun (order, table) ->
                 let rowOf (k: string) =
                     match table |> Map.tryFind k with
                     | None -> None
-                    | Some(members: SqlValue array list) ->
+                    | Some members ->
                         if List.isEmpty members then
                             None
                         else
                             let first = List.head members
 
                             let gv =
-                                match groupBy |> List.map (fun e -> Eval.eval schema first e) |> Lattice.combine with
+                                match groupBy |> List.map (fun e -> Eval.eval schema first e) |> all with
                                 | Ok vs -> List.toArray vs
                                 | Error _ -> [||]
 
@@ -1281,7 +1237,7 @@ module internal Ops =
                                     else
                                         Eval.eval schema row arg |> Result.bind (fun v -> addAcc acc (Some v) false)
 
-                                match List.fold (fun acc row -> acc >>= fun a -> add a row) (ret start) members with
+                                match foldOk add start members with
                                 | Ok acc -> finishAcc acc
                                 | Error _ -> SqlValue.Null
 
@@ -1304,69 +1260,65 @@ module internal Ops =
     let private joinPred (leftSchema: Schema) (rightSchema: Schema) (on: Expr) (l: SqlValue array) (r: SqlValue array) =
         Eval.matches (leftSchema.Concat rightSchema) (Array.append l r) on
 
+    /// nested loop 結合の内側ループ（1つの左行 × 右の全行）を回す共通処理。
+    /// onExhausted matched は右を最後まで試し終えたときの Op。
+    /// onError matched は ON 句の評価が失敗したときの Op。
+    /// matched は「この左行で既に一致を出したか」。
+    /// INNER はどちらも matched を無視し、LEFT だけが NULL 拡張と継続を使い分ける。
+    let private joinLoop
+        (leftSchema: Schema)
+        (rightSchema: Schema)
+        (on: Expr)
+        (onExhausted: bool -> Op)
+        (onError: bool -> Op)
+        (rightRows: SqlValue array array)
+        (lrow: SqlValue array)
+        =
+        let rec loop (matched: bool) (rs: SqlValue array array) =
+            if Array.isEmpty rs then
+                onExhausted matched
+            else
+                let rrow = rs.[0]
+                let rest = rs |> Array.skip 1
+
+                match joinPred leftSchema rightSchema on lrow rrow with
+                | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, loop true rest)))
+                | Ok false -> Op.Compute(fun () -> Op.next (loop matched rest))
+                | Error _ -> onError matched
+
+        loop false rightRows
+
     /// INNER JOIN（nested loop）。右側は内側ループごとに先頭から引き直す。
+    /// 一致が無い左行は捨て、ON 句の評価失敗は全体を打ち切る。
     let innerJoin (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
         Op.toArray right
-        |> Result.map (fun (rightRows: SqlValue array array) ->
-            let rec inner (rs: SqlValue array array) (lrow: SqlValue array) (lnext: Op) : Op =
-                if Array.isEmpty rs then
-                    go lnext
-                else
-                    let rrow = rs.[0]
-                    let rest = rs |> Array.skip 1
-
-                    match joinPred leftSchema rightSchema on lrow rrow with
-                    | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, inner rest lrow lnext)))
-                    | Ok false -> Op.Compute(fun () -> Op.next (inner rest lrow lnext))
-                    | Error _ -> Op.empty
-
-            and go (cur: Op) : Op =
-                Op.Compute(fun () ->
-                    Op.next cur
-                    >>= function
-                        | None -> ret None
-                        | Some(lrow, lnext) -> Op.next (inner rightRows lrow lnext))
+        |> Result.map (fun rightRows ->
+            let rec go (cur: Op) =
+                Op.pull cur (fun lrow lnext ->
+                    Op.next (
+                        joinLoop leftSchema rightSchema on (fun _ -> go lnext) (fun _ -> Op.empty) rightRows lrow
+                    ))
 
             go left)
 
-    /// LEFT JOIN。左の行に右が 1 行も無ければ NULL で埋める。
+    /// LEFT JOIN。左の行に右が 1行も無ければ NULL で埋める。
+    /// 一致済みの左行で ON 句の評価が失敗したときだけ次の左行へ進む
+    /// （未一致なら INNER と同じく打ち切る）。
     let leftJoin (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
         Op.toArray right
-        |> Result.map (fun (rightRows: SqlValue array array) ->
+        |> Result.map (fun rightRows ->
             let width = rightSchema.Columns.Length
 
-            let rec inner (rs: SqlValue array array) (lrow: SqlValue array) (lnext: Op) : Op =
-                if Array.isEmpty rs then
-                    let nulls = Array.create width SqlValue.Null
-                    Op.Step(Array.append lrow nulls, go lnext)
-                else
-                    let rrow = rs.[0]
-                    let rest = rs |> Array.skip 1
+            let rec go (cur: Op) =
+                Op.pull cur (fun lrow lnext ->
+                    let onExhausted matched =
+                        if matched then
+                            go lnext
+                        else
+                            Op.Step(Array.append lrow (Array.create width SqlValue.Null), go lnext)
 
-                    match joinPred leftSchema rightSchema on lrow rrow with
-                    | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, innerAfter rest lrow lnext)))
-                    | Ok false -> Op.Compute(fun () -> Op.next (inner rest lrow lnext))
-                    | Error _ -> Op.empty
-
-            and innerAfter (rs: SqlValue array array) (lrow: SqlValue array) (lnext: Op) : Op =
-                if Array.isEmpty rs then
-                    go lnext
-                else
-                    let rrow = rs.[0]
-                    let rest = rs |> Array.skip 1
-
-                    match joinPred leftSchema rightSchema on lrow rrow with
-                    // `Step` は遅延されないので（§2.1）`Compute` で 1 行ずつ作る。
-                    | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, innerAfter rest lrow lnext)))
-                    | Ok false -> Op.Compute(fun () -> Op.next (innerAfter rest lrow lnext))
-                    | Error _ -> go lnext
-
-            and go (cur: Op) : Op =
-                Op.Compute(fun () ->
-                    Op.next cur
-                    >>= function
-                        | None -> ret None
-                        | Some(lrow, lnext) -> Op.next (inner rightRows lrow lnext))
+                    let onError matched = if matched then go lnext else Op.empty
+                    Op.next (joinLoop leftSchema rightSchema on onExhausted onError rightRows lrow))
 
             go left)
 
@@ -1379,21 +1331,13 @@ module internal Ops =
         if List.isEmpty items then
             src
         else
-            let plan: (SelectItem * Expr list) list =
+            let plan =
                 items
-                |> List.map (fun (item: SelectItem) ->
-                    let exprs: Expr list =
-                        match item.Expression with
-                        | Expr.Star ->
-                            schema.Columns
-                            |> Array.map (fun (c: OutputColumn) -> Expr.Column(Build.sameRef c))
-                            |> Array.toList
-                        | Expr.QualifiedStar q ->
-                            schema.Columns
-                            |> Array.filter (fun (c: OutputColumn) -> defaultArg c.Qualifier "" = q)
-                            |> Array.map (fun (c: OutputColumn) -> Expr.Column(Build.sameRef c))
-                            |> Array.toList
-                        | other -> [ other ]
+                |> List.map (fun item ->
+                    let exprs =
+                        match Schema.expandStar schema item.Expression with
+                        | Some(_, columns) -> columns |> List.map (fun c -> sameRef c |> Expr.Column)
+                        | None -> [ item.Expression ]
 
                     item, exprs)
 
@@ -1401,19 +1345,13 @@ module internal Ops =
             let foundAggs = aggCallsOf items
 
             if List.isEmpty foundAggs then
-                Op.map
-                    (fun row ->
-                        allExprs
-                        |> List.map (fun e -> Eval.eval schema row e)
-                        |> Lattice.combine
-                        |> Result.map List.toArray)
-                    src
+                Op.map (fun row -> allExprs |> List.map (Eval.eval schema row) |> all |> Result.map List.toArray) src
             else
                 Op.map
                     (fun row ->
                         allExprs
                         |> List.map (fun e -> Eval.eval Schema.empty row (substituteAggs groupBy foundAggs e row))
-                        |> Lattice.combine
+                        |> all
                         |> Result.map List.toArray)
                     src
 
@@ -1421,25 +1359,78 @@ module internal Ops =
 // 7. 更新演算子（INSERT / UPDATE / DELETE）
 // ---------------------------------------------------------------------------
 
-// 書き込みは `Transaction` にバッファされ、commit 時にだけ RowStore へ届く。
+// 書き込みは Transaction にバッファされ、commit 時にだけ RowStore へ届く。
 // よって「同じ文の途中で読んだ値」と「書く値」が食い違わない。
 module internal DmlOps =
     /// 定数式だけなら行の外で評価できる（列参照が無い）。
     let private evalConstant (e: Expr) = Eval.eval Schema.empty [||] e
 
-    /// INSERT。`columns` が None ならテーブル定義の順に並べる。
-    /// DEFAULT / NULL の充足と型強制はここで行う。
-    /// `TableSchema.validateRow` が NOT NULL と型を最終確認する。
-    let insert
+    /// WHERE を評価するときの対象スキーマ（UPDATE / DELETE で共通）。
+    let private targetSchemaOf (schema: TableSchema) = Schema.ofTable schema.Name None schema
+
+    /// WHERE の述語。WHERE が無ければ「全部通過」（UPDATE / DELETE で共通）。
+    let private matchesWhere (targetSchema: Schema) (where: Expr option) (row: SqlValue array) =
+        match where with
+        | Some w -> Eval.matches targetSchema row w
+        | None -> ret true
+
+    /// 値式を列位置に対応付け、型強制して (位置, 値) のリストにする。
+    /// INSERT は行の外（定数）で、UPDATE は現在行を参照して評価するので、
+    /// 評価器 evalOne を受け取って両方を同じ経路で処理する。
+    let private gatherWith
+        (evalOne: Expr -> Result<SqlValue, DbError>)
+        (schema: TableSchema)
+        (values: Expr list)
+        (idxs: int list)
+        =
+        let rec gather (vs: Expr list) (is_: int list) (acc: (int * SqlValue) list) =
+            match vs, is_ with
+            | [], [] -> ret acc
+            | v :: rest, i :: restIdx ->
+                match evalOne v with
+                | Error e -> Error e
+                | Ok value ->
+                    let colDef = schema.Columns.[i]
+
+                    match SqlValue.coerce colDef.DataType value with
+                    | Error e -> Error e
+                    | Ok coerced -> gather rest restIdx ((i, coerced) :: acc)
+            | _ -> ret acc
+
+        gather values idxs []
+
+    /// 表を全走査して 1 行ずつ処理する UPDATE / DELETE 共通の土台。
+    /// matched が偽の行は件数を変えず先へ進み、 onRow が「(トランザクション, 件数)」を進めた結果を返す。
+    let private foldRows
+        (txn: Transaction)
         (ctx: ExecContext)
         (schema: TableSchema)
-        (txn: Transaction)
-        (columns: string list option)
-        (rows: Expr list list)
+        (matched: SqlValue array -> Result<bool, DbError>)
+        (onRow: Transaction -> int -> SqlValue array -> Result<Transaction * int, DbError>)
         =
+        Dml.scanByPrimaryKey ctx.Store schema ctx.Visible 0
+        |> Result.bind (fun rows ->
+            rows
+            |> foldOk
+                (fun (t, c) row -> matched row >>= fun keep -> if keep then onRow t c row else ret (t, c))
+                (txn, 0))
+
+    /// gather で埋まった `(列位置, 値)` の対を、列順の行へ戻す。
+    /// 埋まっていない位置は fallback に委ねる
+    /// （INSERT は DEFAULT / NULL、UPDATE は元の値）。
+    let private scatter (width: int) (filled: (int * SqlValue) list) (fallback: int -> SqlValue) =
+        Array.init width (fun i ->
+            match filled |> List.tryFind (fun (j, _) -> j = i) with
+            | Some(_, v) -> v
+            | None -> fallback i)
+
+    /// INSERT。columns が None ならテーブル定義の順に並べる。
+    /// DEFAULT / NULL の充足と型強制はここで行う。
+    /// TableSchema.validateRow が NOT NULL と型を最終確認する。
+    let insert (schema: TableSchema) (txn: Transaction) (columns: string list option) (rows: Expr list list) =
         match columns with
-        | None -> schema.Columns |> List.mapi (fun i c -> i) |> ret
-        | Some names -> names |> List.map (fun n -> schema.RequireIndexOf n) |> Lattice.combine
+        | None -> schema.Columns |> List.mapi (fun i _ -> i) |> ret
+        | Some names -> names |> List.map (fun n -> schema.RequireIndexOf n) |> all
         |> Result.bind (fun idxs ->
             let width = schema.Columns.Length
 
@@ -1451,44 +1442,26 @@ module internal DmlOps =
                             (sprintf "INSERT の列数(%d)と値の数(%d)が合いません" (List.length idxs) (List.length values))
                     )
                 else
-                    let rec gather (values: Expr list) (idxs: int list) (acc: (int * SqlValue) list) =
-                        match values, idxs with
-                        | [], [] -> ret acc
-                        | v :: vs, i :: is_ ->
-                            evalConstant v
-                            >>= fun value ->
-                                let colDef = schema.Columns.[i]
-
-                                SqlValue.coerce colDef.DataType value
-                                >>= fun coerced -> gather vs is_ ((i, coerced) :: acc)
-                        | _ -> ret acc
-
-                    gather values idxs []
-                    |> Result.map (fun (filled: (int * SqlValue) list) ->
-                        Array.init width (fun i ->
-                            match filled |> List.tryFind (fun (j, _) -> j = i) with
-                            | Some(_, v) -> v
-                            | None ->
-                                match schema.Columns.[i].Constraint.Default with
-                                | Some d ->
-                                    match evalConstant d with
-                                    | Ok dv -> dv
-                                    | Error _ -> SqlValue.Null
-                                | None -> SqlValue.Null))
+                    gatherWith evalConstant schema values idxs
+                    |> Result.map (fun filled ->
+                        scatter width filled (fun i ->
+                            match schema.Columns.[i].Constraint.Default with
+                            | Some d ->
+                                match evalConstant d with
+                                | Ok dv -> dv
+                                | Error _ -> SqlValue.Null
+                            | None -> SqlValue.Null))
 
             rows
-            |> List.fold
-                (fun acc values ->
-                    acc
-                    >>= fun (txnAcc, count) ->
-                        buildRow values
-                        >>= fun row -> Dml.insert schema txnAcc row |> Result.map (fun t -> t, count + 1))
-                (ret (txn, 0)))
+            |> foldOk
+                (fun (txnAcc, count) values ->
+                    buildRow values
+                    >>= fun row -> Dml.insert schema txnAcc row |> Result.map (fun t -> t, count + 1))
+                (txn, 0))
 
-    /// UPDATE。`assignments` の右辺は現在行で評価する。
+    /// UPDATE。assignments の右辺は現在行で評価する。
     /// 検索キーは更新前の行の主キー。主キー列を書き換えると
-    /// 古い位置の行が残って重複する
-    /// （sql-reference.md「主キー列は更新できない」）。
+    /// 古い位置の行が残って重複する。
     let update
         (ctx: ExecContext)
         (schema: TableSchema)
@@ -1496,86 +1469,30 @@ module internal DmlOps =
         (assignments: (string * Expr) list)
         (where: Expr option)
         =
-        let targetSchema = Schema.ofTable schema.Name None schema
+        let targetSchema = targetSchemaOf schema
 
         assignments
         |> List.map (fun (name, _) -> schema.RequireIndexOf name)
-        |> Lattice.combine
+        |> all
         |> Result.bind (fun targets ->
-            Dml.scanByPrimaryKey ctx.Store schema ctx.Visible 0
-            |> Result.bind (fun current ->
-                let apply (txnAcc: Transaction) (count: int) (row: SqlValue array) =
-                    let rec gather (values: (string * Expr) list) (targets: int list) (acc: (int * SqlValue) list) =
-                        match values, targets with
-                        | [], [] -> ret acc
-                        | (_, expr) :: vs, i :: is_ ->
-                            Eval.eval targetSchema row expr
-                            >>= fun v ->
-                                let colDef = schema.Columns.[i]
+            let assign (row: SqlValue array) =
+                gatherWith (Eval.eval targetSchema row) schema (List.map snd assignments) targets
+                |> Result.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
 
-                                SqlValue.coerce colDef.DataType v
-                                >>= fun coerced -> gather vs is_ ((i, coerced) :: acc)
-                        | _ -> ret acc
+            foldRows txn ctx schema (matchesWhere targetSchema where) (fun txnAcc count row ->
+                assign row
+                >>= fun newRow ->
+                    let pk = TableSchema.primaryKeyOf schema row
 
-                    let assign (values: (string * Expr) list) (targets: int list) =
-                        gather values targets []
-                        |> Result.map (fun filled ->
-                            Array.mapi
-                                (fun i v ->
-                                    match filled |> List.tryFind (fun (j, _) -> j = i) with
-                                    | Some(_, nv) -> nv
-                                    | None -> v)
-                                row)
-
-                    let matched =
-                        match where with
-                        | Some w -> Eval.matches targetSchema row w >>= fun keep -> ret keep
-                        | None -> ret true
-
-                    matched
-                    >>= fun keep ->
-                        if not keep then
-                            ret (txnAcc, count)
-                        else
-                            assign assignments targets
-                            >>= fun newRow ->
-                                let pk = TableSchema.primaryKeyOf schema row
-
-                                Dml.updateByPrimaryKey ctx.Store schema ctx.Visible txnAcc pk newRow
-                                |> Result.map (fun t -> t, count + 1)
-
-                let initial = txn, 0
-
-                current
-                |> Array.fold (fun acc row -> acc >>= fun (t, c) -> apply t c row) (ret initial)))
+                    Dml.updateByPrimaryKey ctx.Store schema ctx.Visible txnAcc pk newRow
+                    |> Result.map (fun t -> t, count + 1)))
 
     /// DELETE。WHERE に合う行を主キー + 全索引に tombstone で消す。
     let delete (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (where: Expr option) =
-        let targetSchema = Schema.ofTable schema.Name None schema
+        let targetSchema = targetSchemaOf schema
 
-        Dml.scanByPrimaryKey ctx.Store schema ctx.Visible 0
-        |> Result.bind (fun rows ->
-            let initial = txn, 0
+        foldRows txn ctx schema (matchesWhere targetSchema where) (fun t count row ->
+            let pk = TableSchema.primaryKeyOf schema row
 
-            rows
-            |> Array.fold
-                (fun acc row ->
-                    acc
-                    >>= fun (t: Transaction, c: int) ->
-                        match where with
-                        | Some w ->
-                            Eval.matches targetSchema row w
-                            >>= fun keep ->
-                                if not keep then
-                                    ret (t, c)
-                                else
-                                    let pk = TableSchema.primaryKeyOf schema row
-
-                                    Dml.deleteByPrimaryKey ctx.Store schema ctx.Visible t pk
-                                    |> Result.map (fun (t2: Transaction) -> t2, c + 1)
-                        | None ->
-                            let pk = TableSchema.primaryKeyOf schema row
-
-                            Dml.deleteByPrimaryKey ctx.Store schema ctx.Visible t pk
-                            |> Result.map (fun (t2: Transaction) -> t2, c + 1))
-                (ret initial))
+            Dml.deleteByPrimaryKey ctx.Store schema ctx.Visible t pk
+            |> Result.map (fun t2 -> t2, count + 1))

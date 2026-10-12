@@ -10,21 +10,11 @@ open RykDb.TestHelpers
 
 /// 2 列（a, b）のスキーマ。
 let private schema2 =
-    { Schema.empty with
-        Columns =
-            [|
-                {
-                    Name = "a"
-                    Qualifier = None
-                    DataType = Some DataType.Integer
-                }
-                {
-                    Name = "b"
-                    Qualifier = None
-                    DataType = Some DataType.Integer
-                }
-            |]
-    }
+    outSchema
+        [
+            outCol "a" None (Some DataType.Integer)
+            outCol "b" None (Some DataType.Integer)
+        ]
 
 let private row2 (a: int64) (b: int64) = [| SqlValue.Int a; SqlValue.Int b |]
 
@@ -35,11 +25,6 @@ let private opOfRows (rows: SqlValue array list) = Op.ofArray (List.toArray rows
 let private row (values: SqlValue list) = List.toArray values
 
 /// SqlValue から値を取り出す（テスト用）。
-let private asInt (v: SqlValue) =
-    match v with
-    | SqlValue.Int i -> i
-    | other -> failwithf "INTEGER ではありません: %A" other
-
 let private asDec (v: SqlValue) =
     match v with
     | SqlValue.Decimal d -> d
@@ -50,11 +35,6 @@ let private asReal (v: SqlValue) =
     match v with
     | SqlValue.Real f -> f
     | other -> failwithf "REAL ではありません: %A" other
-
-let private asStr (v: SqlValue) =
-    match v with
-    | SqlValue.Text t -> t
-    | other -> failwithf "TEXT ではありません: %A" other
 
 let private col (name: string) =
     Expr.Column { Qualifier = None; Name = name }
@@ -129,6 +109,36 @@ let ``Eval: 3 値論理の AND / OR / NOT`` () =
     Assert.True(SqlValue.isNull (ok (ev r3 (Expr.Unary(UnaryOp.Not, col "a")))))
 
 [<Fact>]
+let ``Eval: AND / OR は右辺の FALSE / TRUE も 3 値論理どおり`` () =
+    // TRUE AND FALSE = FALSE（boolOf 由来の表だと右辺の FALSE が UNKNOWN に化けて NULL になっていた）
+    let r1 = [| SqlValue.Bool true; SqlValue.Bool false |]
+
+    match ok (ev r1 (Expr.Binary(BinaryOp.And, col "a", col "b"))) with
+    | SqlValue.Bool b -> Assert.False b
+    | v -> Assert.Fail(sprintf "TRUE AND FALSE が FALSE になりません: %A" v)
+
+    // FALSE OR TRUE = TRUE（右辺の TRUE が UNKNOWN に化けて NULL になっていた）
+    let r2 = [| SqlValue.Bool false; SqlValue.Bool true |]
+
+    match ok (ev r2 (Expr.Binary(BinaryOp.Or, col "a", col "b"))) with
+    | SqlValue.Bool b -> Assert.True b
+    | v -> Assert.Fail(sprintf "FALSE OR TRUE が TRUE になりません: %A" v)
+
+    // NULL OR TRUE = TRUE（片方が NULL でも TRUE は TRUE のまま）
+    let r3 = [| SqlValue.Null; SqlValue.Bool true |]
+
+    match ok (ev r3 (Expr.Binary(BinaryOp.Or, col "a", col "b"))) with
+    | SqlValue.Bool b -> Assert.True b
+    | v -> Assert.Fail(sprintf "NULL OR TRUE が TRUE になりません: %A" v)
+
+    // NULL AND FALSE = FALSE
+    let r4 = [| SqlValue.Null; SqlValue.Bool false |]
+
+    match ok (ev r4 (Expr.Binary(BinaryOp.And, col "a", col "b"))) with
+    | SqlValue.Bool b -> Assert.False b
+    | v -> Assert.Fail(sprintf "NULL AND FALSE が FALSE になりません: %A" v)
+
+[<Fact>]
 let ``Eval: BETWEEN と IN は NULL を正しく扱う`` () =
     let r = [| SqlValue.Int 5L; SqlValue.Int 1L |]
 
@@ -167,18 +177,75 @@ let ``末尾再帰: 巨大な IN 候補と WHEN 節を評価できる`` () =
     Assert.Equal<int64>(9L, evI r (Expr.Case(branches, Some(Expr.Literal(Literal.Int 9L)))))
 
 [<Fact>]
+let ``末尾再帰: 10 万段の式の木を評価できる`` () =
+    let depth = 100_000
+
+    // 「eval ... >>= fun」の実装では 1 段ごとにフレームが積もり 10 万段で
+    // StackOverflow（exit 134）になる。継続を値として持つ評価機（Eval.step）は
+    // ヒープの継続スタックだけが伸びるので、木の深さに依存せず評価できる。
+    let nots =
+        [ 1..depth ]
+        |> List.fold (fun (acc: Expr) _ -> Expr.Unary(UnaryOp.Not, acc)) (Expr.Literal(Literal.Bool true))
+
+    match ok (ev [||] nots) with
+    // 10 万は偶数なので NOT は打ち消し合って TRUE になる。
+    | SqlValue.Bool b -> Assert.True b
+    | v -> Assert.Fail(sprintf "NOT を %d 段重ねた式が評価できません: %A" depth v)
+
+    // 二項演算子の左深い木（AND の鎖）も同じ。全段 TRUE を通すと全体で TRUE。
+    let ands =
+        [ 1..depth ]
+        |> List.fold
+            (fun (acc: Expr) _ -> Expr.Binary(BinaryOp.And, acc, Expr.Literal(Literal.Bool true)))
+            (Expr.Literal(Literal.Bool true))
+
+    match ok (ev [||] ands) with
+    | SqlValue.Bool b -> Assert.True b
+    | v -> Assert.Fail(sprintf "AND を %d 段重ねた式が評価できません: %A" depth v)
+
+[<Fact>]
+let ``末尾再帰: 多数の列を持つ INSERT / UPDATE が完了する`` () =
+    // 値リストの評価（gatherWith）は `evalOne … >>= fun … -> coerce …
+    // >>= fun … -> gather …` で列の数だけフレームが積まれていた
+    // （→ StackOverflow / exit 134）。`match` で受けて末尾再帰にしてある。
+    let cols = 2_000
+
+    let names = Array.init cols (fun i -> sprintf "c%d" i)
+
+    // 主キーは必須（無いと CREATE TABLE 自体がエラーになる）。
+    let decls =
+        names
+        |> Array.mapi (fun i c -> sprintf "%s INTEGER%s" c (if i = 0 then " PRIMARY KEY" else ""))
+        |> String.concat ", "
+
+    let colList = String.concat ", " names
+    let values = Array.init cols string |> String.concat ", "
+
+    withDb "tail-gather" (fun db0 ->
+        let db1 = exec db0 (sprintf "CREATE TABLE wide (%s)" decls)
+        let db2 = exec db1 (sprintf "INSERT INTO wide (%s) VALUES (%s)" colList values)
+
+        let inserted = query db2 "SELECT * FROM wide"
+        Assert.Equal(1, inserted.Rows.Length)
+        Assert.Equal(cols, inserted.Columns.Length)
+
+        // UPDATE も同じ経路（SET の数だけ gather が回る）。SET の列数は
+        // パーサの assigns にも効くので、こちらも末尾再帰にしてある。
+        // 主キー（c0）は書き換えない（主キー更新は既知の別件なので外す）。
+        let sets =
+            Array.init (cols - 1) (fun i -> sprintf "c%d = %d" (i + 1) (i + 2))
+            |> String.concat ", "
+
+        let db3 = exec db2 (sprintf "UPDATE wide SET %s" sets)
+        let updated = query db3 (sprintf "SELECT c0, c%d FROM wide" (cols - 1))
+
+        Assert.Equal(1, updated.Rows.Length)
+        Assert.Equal<int64>(0L, asInt updated.Rows.[0].[0])
+        Assert.Equal<int64>(int64 cols, asInt updated.Rows.[0].[1]))
+
+[<Fact>]
 let ``Eval: LIKE の % と _`` () =
-    let schema =
-        { Schema.empty with
-            Columns =
-                [|
-                    {
-                        Name = "s"
-                        Qualifier = None
-                        DataType = Some DataType.Text
-                    }
-                |]
-        }
+    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
 
     let test (pattern: string) (text: string) =
         let e = Expr.Like(col "s", Expr.Literal(Literal.String pattern), false)
@@ -199,17 +266,7 @@ let ``Eval: LIKE の % と _`` () =
 
 [<Fact>]
 let ``Eval: スカラー関数`` () =
-    let schema =
-        { Schema.empty with
-            Columns =
-                [|
-                    {
-                        Name = "s"
-                        Qualifier = None
-                        DataType = Some DataType.Text
-                    }
-                |]
-        }
+    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
 
     let call (name: string) (args: Expr list) =
         ok (Eval.eval schema [| SqlValue.Text "  AbC  " |] (Expr.FuncCall(name, args)))
@@ -223,32 +280,13 @@ let ``Eval: スカラー関数`` () =
     | v -> Assert.Fail(sprintf "TRIM が文字列ではありません: %A" v)
 
     // 未知の関数はエラー
-    match Eval.eval schema [||] (Expr.FuncCall("NOPE", [])) with
-    | Error _ -> ()
-    | Ok _ -> Assert.Fail("未知の関数が OK になっています")
+    expectError "未知の関数が OK になっています" (Eval.eval schema [||] (Expr.FuncCall("NOPE", [])))
 
 [<Fact>]
 let ``Eval: 修飾子の無い列名が曖昧ならエラー`` () =
-    let schema =
-        { Schema.empty with
-            Columns =
-                [|
-                    {
-                        Name = "id"
-                        Qualifier = Some "a"
-                        DataType = None
-                    }
-                    {
-                        Name = "id"
-                        Qualifier = Some "b"
-                        DataType = None
-                    }
-                |]
-        }
+    let schema = outSchema [ outCol "id" (Some "a") None; outCol "id" (Some "b") None ]
 
-    match Schema.resolve schema { Qualifier = None; Name = "id" } with
-    | Error _ -> ()
-    | Ok _ -> Assert.Fail("曖昧な列名が解決できてしまいました")
+    expectError "曖昧な列名が解決できてしまいました" (Schema.resolve schema { Qualifier = None; Name = "id" })
 
     // 修飾子付きなら解決できる
     Assert.Equal(1, ok (Schema.resolve schema { Qualifier = Some "b"; Name = "id" }))
@@ -484,28 +522,10 @@ let ``集約: GROUP BY のキーが NULL の行も 1 グループになる`` () 
 // ---------------------------------------------------------------------------
 
 let private leftSchema =
-    { Schema.empty with
-        Columns =
-            [|
-                {
-                    Name = "lid"
-                    Qualifier = Some "l"
-                    DataType = Some DataType.Integer
-                }
-            |]
-    }
+    outSchema [ outCol "lid" (Some "l") (Some DataType.Integer) ]
 
 let private rightSchema =
-    { Schema.empty with
-        Columns =
-            [|
-                {
-                    Name = "rid"
-                    Qualifier = Some "r"
-                    DataType = Some DataType.Integer
-                }
-            |]
-    }
+    outSchema [ outCol "rid" (Some "r") (Some DataType.Integer) ]
 
 let private lcol = Expr.Column { Qualifier = Some "l"; Name = "lid" }
 let private rcol = Expr.Column { Qualifier = Some "r"; Name = "rid" }
@@ -542,25 +562,19 @@ let ``結合: LEFT JOIN は一致が無ければ NULL`` () =
 // 更新（RowStore を使う統合テスト）
 // ---------------------------------------------------------------------------
 
-/// テスト用のテーブルスキーマ。
+/// テスト用のテーブルスキーマ（**索引なし**）。
+/// `TestHelpers.peopleSchema` は索引付きで NOT NULL 検証が付くので、
+/// 索引を触らない DML 経路を検証するこのファイルでは使わない（意図的な差）。
+/// このファイルの `col` は式の列参照ビルダーなので、列定義は共有ヘルパーを明示的に指す。
 let private peopleSchema: TableSchema =
-    let mk (name: string) (dt: DataType) =
-        {
-            Name = name
-            DataType = dt
-            TypeArguments = []
-            Constraint =
-                {
-                    NotNull = false
-                    PrimaryKey = false
-                    Unique = false
-                    Default = None
-                }
-        }
-
     {
         Name = "people"
-        Columns = [ mk "id" DataType.Integer; mk "name" DataType.Text; mk "age" DataType.Integer ]
+        Columns =
+            [
+                TestHelpers.col "id" DataType.Integer
+                TestHelpers.col "name" DataType.Text
+                TestHelpers.col "age" DataType.Integer
+            ]
         PrimaryKey = [ 0 ]
         Indexes = []
     }
@@ -568,21 +582,47 @@ let private peopleSchema: TableSchema =
 let private ctxOf (store: RowStore) =
     ExecContext.create store (Snapshot.noLimit)
 
-let private intArr (v: int64) = [| SqlValue.Int v |]
-let private textArr (v: string) = [| SqlValue.Text v |]
+/// commit して store へ流し込む。引き継いだ TransactionManager を返す。
+let private commitInto (store: RowStore) (mgr: TransactionManager) (txn: Transaction) =
+    let (mgr2, _, batches) = ok (TransactionManager.commit mgr txn)
+    ok (RowStore.writeBatches store batches) |> ignore
+    mgr2
+
+/// alice(20) / bob(30) の 2 行を入れて commit する（UPDATE / DELETE の土台）。
+let private seedPeople (store: RowStore) (mgr: TransactionManager) =
+    let (mgr, txn) = TransactionManager.beginTxn mgr
+
+    let (txn, _) =
+        ok (
+            DmlOps.insert
+                peopleSchema
+                txn
+                None
+                [
+                    [
+                        Expr.Literal(Literal.Int 1L)
+                        Expr.Literal(Literal.String "alice")
+                        Expr.Literal(Literal.Int 20L)
+                    ]
+                    [
+                        Expr.Literal(Literal.Int 2L)
+                        Expr.Literal(Literal.String "bob")
+                        Expr.Literal(Literal.Int 30L)
+                    ]
+                ]
+        )
+
+    commitInto store mgr txn
 
 [<Fact>]
 let ``DML: INSERT は行を追加する`` () =
-    withDir "ins" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-        let ctx = ctxOf store
+    withStore "ins" (fun store ->
         let mgr = TransactionManager.create ()
         let (mgr, txn) = TransactionManager.beginTxn mgr
 
         let (txn, n) =
             ok (
                 DmlOps.insert
-                    ctx
                     peopleSchema
                     txn
                     (Some [ "id"; "name" ])
@@ -591,46 +631,19 @@ let ``DML: INSERT は行を追加する`` () =
 
         Assert.Equal<int>(1, n)
 
-        let (mgr, _, batches) = ok (TransactionManager.commit mgr txn)
-        ok (RowStore.writeBatches store batches) |> ignore
+        commitInto store mgr txn |> ignore
 
         let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
         Assert.Equal<int>(1, rows.Length)
-        Assert.Equal("alice", asStr rows.[0].[1]))
+        Assert.Equal("alice", asText (rows.[0].[1])))
 
 [<Fact>]
 let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
-    withDir "upd" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "upd" (fun store ->
         let ctx = ctxOf store
 
         // まず 2 行入れる
-        let mgr0 = TransactionManager.create ()
-        let (mgr0, txn0) = TransactionManager.beginTxn mgr0
-
-        let (txn0, _) =
-            ok (
-                DmlOps.insert
-                    ctx
-                    peopleSchema
-                    txn0
-                    None
-                    [
-                        [
-                            Expr.Literal(Literal.Int 1L)
-                            Expr.Literal(Literal.String "alice")
-                            Expr.Literal(Literal.Int 20L)
-                        ]
-                        [
-                            Expr.Literal(Literal.Int 2L)
-                            Expr.Literal(Literal.String "bob")
-                            Expr.Literal(Literal.Int 30L)
-                        ]
-                    ]
-            )
-
-        let (mgr0, _, batches0) = ok (TransactionManager.commit mgr0 txn0)
-        ok (RowStore.writeBatches store batches0) |> ignore
+        let mgr0 = seedPeople store (TransactionManager.create ())
 
         // age が 25 以上の行の age を 1 増やす。mgr0 を引き継ぐ
         //（新しい TransactionManager は SeqNo が 1 から始まり、更新が消える）。
@@ -647,8 +660,7 @@ let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
             )
 
         Assert.Equal<int>(1, n)
-        let (mgr1, _, batches1) = ok (TransactionManager.commit mgr1 txn1)
-        ok (RowStore.writeBatches store batches1) |> ignore
+        commitInto store mgr1 txn1 |> ignore
 
         let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
 
@@ -658,39 +670,15 @@ let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
         // 2 行目は 30 -> 31
         Assert.Equal<int64>(31L, asInt rows.[1].[2]))
 
+[<Fact>]
 let ``DML: DELETE は WHERE に合う行を消す`` () =
-    withDir "del" (fun dir ->
-        let store = ok (RowStore.openStore dir)
+    withStore "del" (fun store ->
         let ctx = ctxOf store
-        let mgr = TransactionManager.create ()
-        let (mgr, txn) = TransactionManager.beginTxn mgr
 
-        let (txn, _) =
-            ok (
-                DmlOps.insert
-                    ctx
-                    peopleSchema
-                    txn
-                    None
-                    [
-                        [
-                            Expr.Literal(Literal.Int 1L)
-                            Expr.Literal(Literal.String "alice")
-                            Expr.Literal(Literal.Int 20L)
-                        ]
-                        [
-                            Expr.Literal(Literal.Int 2L)
-                            Expr.Literal(Literal.String "bob")
-                            Expr.Literal(Literal.Int 30L)
-                        ]
-                    ]
-            )
-
-        let (mgr, _, batches) = ok (TransactionManager.commit mgr txn)
-        ok (RowStore.writeBatches store batches) |> ignore
-
-        let mgr2 = TransactionManager.create ()
-        let (mgr2, txn2) = TransactionManager.beginTxn mgr2
+        // seed の TransactionManager を引き継ぐ
+        //（新しい TransactionManager は SeqNo が 1 から始まり、tombstone が消える）。
+        let mgr0 = seedPeople store (TransactionManager.create ())
+        let (mgr2, txn2) = TransactionManager.beginTxn mgr0
 
         let (txn2, n) =
             ok (
@@ -702,18 +690,15 @@ let ``DML: DELETE は WHERE に合う行を消す`` () =
             )
 
         Assert.Equal<int>(1, n)
-        let (mgr2, _, batches2) = ok (TransactionManager.commit mgr2 txn2)
-        ok (RowStore.writeBatches store batches2) |> ignore
+        commitInto store mgr2 txn2 |> ignore
 
         let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
         Assert.Equal<int>(1, rows.Length)
-        Assert.Equal("bob", asStr rows.[0].[1]))
+        Assert.Equal("bob", asText (rows.[0].[1])))
 
 [<Fact>]
 let ``DML: INSERT は列順を明示できる`` () =
-    withDir "inscols" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-        let ctx = ctxOf store
+    withStore "inscols" (fun store ->
         let mgr = TransactionManager.create ()
         let (mgr, txn) = TransactionManager.beginTxn mgr
 
@@ -721,35 +706,29 @@ let ``DML: INSERT は列順を明示できる`` () =
         let (txn, _) =
             ok (
                 DmlOps.insert
-                    ctx
                     peopleSchema
                     txn
                     (Some [ "name"; "id" ])
                     [ [ Expr.Literal(Literal.String "carol"); Expr.Literal(Literal.Int 7L) ] ]
             )
 
-        let (mgr, _, batches) = ok (TransactionManager.commit mgr txn)
-        ok (RowStore.writeBatches store batches) |> ignore
+        commitInto store mgr txn |> ignore
 
         let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
         Assert.Equal<int64>(7L, asInt rows.[0].[0])
-        Assert.Equal("carol", asStr rows.[0].[1])
+        Assert.Equal("carol", asText (rows.[0].[1]))
         // 指定されなかった列は NULL
         Assert.True(SqlValue.isNull rows.[0].[2]))
 
 [<Fact>]
 let ``DML: INSERT の列数不一致はエラー`` () =
-    withDir "insbad" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-        let ctx = ctxOf store
+    withStore "insbad" (fun _ ->
         let mgr = TransactionManager.create ()
         let (mgr, txn) = TransactionManager.beginTxn mgr
 
         let bad = [ [ Expr.Literal(Literal.Int 1L); Expr.Literal(Literal.String "x") ] ]
 
-        match DmlOps.insert ctx peopleSchema txn (Some [ "id" ]) bad with
-        | Error _ -> ()
-        | Ok _ -> Assert.Fail("列数不一致が OK になっています"))
+        expectError "列数不一致が OK になっています" (DmlOps.insert peopleSchema txn (Some [ "id" ]) bad))
 
 // ---------------------------------------------------------------------------
 // スタック深度（gotchas §2.1: Step は遅延しない → Compute ラップ）

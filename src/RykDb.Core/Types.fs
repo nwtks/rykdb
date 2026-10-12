@@ -3,6 +3,20 @@ namespace RykDb.Core
 open System
 open System.Globalization
 
+/// バイト列のユーティリティ。
+/// 依存の無い最下層（Types）に置いて、全モジュールが同じ実装を使えるようにする。
+module internal Bytes =
+    /// 昇順比較（前方が短いほうが小さい）。
+    let compare (a: byte array) (b: byte array) =
+        let n = min a.Length b.Length
+
+        let rec go i =
+            if i >= n then compare a.Length b.Length
+            elif a.[i] = b.[i] then go (i + 1)
+            else compare (int a.[i]) (int b.[i])
+
+        go 0
+
 /// 実行時の値。NULL は他のすべての型と区別できる特別なケースとして持つ。
 [<RequireQualifiedAccess>]
 type SqlValue =
@@ -194,19 +208,6 @@ module internal SqlValue =
 
     let vReal f = SqlValue.Real(normalizeFloat f)
 
-    /// BLOB の辞書順比較。System 側の比較関数に依存せずに素直に実装する。
-    let private compareBytes (x: byte[]) (y: byte[]) =
-        let n = min x.Length y.Length
-
-        let rec firstDiff i =
-            if i >= n then
-                compare x.Length y.Length
-            else
-                let c = compare x.[i] y.[i]
-                if c = 0 then firstDiff (i + 1) else c
-
-        firstDiff 0
-
     /// 値どうしの比較。NULL は比較不能として例外を投げる
     /// （3 値論理は <see cref="compareForSql"/> 側で処理する）。
     /// NaN は NaN と等しく、かつ他のすべての数値より大きいものとして扱う。
@@ -232,7 +233,7 @@ module internal SqlValue =
 
         | SqlValue.Bool x, SqlValue.Bool y -> Ok(compare (if x then 1 else 0) (if y then 1 else 0))
         | SqlValue.Text x, SqlValue.Text y -> Ok(StringComparer.Ordinal.Compare(x, y))
-        | SqlValue.Blob x, SqlValue.Blob y -> Ok(compareBytes x y)
+        | SqlValue.Blob x, SqlValue.Blob y -> Ok(Bytes.compare x y)
         | SqlValue.Uuid x, SqlValue.Uuid y -> Ok(compare x y)
         | SqlValue.Date x, SqlValue.Date y -> Ok(compare x y)
         | SqlValue.Timestamp x, SqlValue.Timestamp y -> Ok(DateTimeOffset.Compare(x, y))

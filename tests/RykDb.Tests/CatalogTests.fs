@@ -9,74 +9,9 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 // ---------------------------------------------------------------------------
-// テスト用のスキーマ
+// スキーマ永続化（peopleSchema / ordersSchema・列定義ビルダーは RykDb.TestHelpers）
 // ---------------------------------------------------------------------------
 
-let private col (name: string) (dt: DataType) =
-    {
-        Name = name
-        DataType = dt
-        TypeArguments = []
-        Constraint =
-            {
-                NotNull = false
-                PrimaryKey = false
-                Unique = false
-                Default = None
-            }
-    }
-
-let private pkCol (name: string) (dt: DataType) =
-    { col name dt with
-        Constraint =
-            {
-                NotNull = true
-                PrimaryKey = true
-                Unique = false
-                Default = None
-            }
-    }
-
-/// テスト用のテーブルスキーマ。
-let private peopleSchema: TableSchema =
-    {
-        Name = "people"
-        Columns =
-            [
-                pkCol "id" DataType.Integer
-                col "name" DataType.Text
-                col "age" DataType.Integer
-            ]
-        PrimaryKey = [ 0 ]
-        Indexes =
-            [
-                {
-                    Name = "ix_people_age"
-                    Columns = [ "age" ]
-                    Unique = false
-                }
-            ]
-    }
-
-let private ordersSchema: TableSchema =
-    {
-        Name = "orders"
-        Columns =
-            [
-                pkCol "oid" DataType.Integer
-                col "person_id" DataType.Integer
-                col "amount" DataType.Integer
-            ]
-        PrimaryKey = [ 0 ]
-        Indexes =
-            [
-                {
-                    Name = "ix_orders_person"
-                    Columns = [ "person_id" ]
-                    Unique = false
-                }
-            ]
-    }
 
 // ---------------------------------------------------------------------------
 // Catalog — 定義の相互変換
@@ -106,9 +41,7 @@ let ``Catalog: 主キー列が存在しない場合はエラー`` () =
             PrimaryKeyColumns = [ "nope" ]
         }
 
-    match Catalog.toSchema bad with
-    | Error _ -> ()
-    | Ok _ -> Assert.Fail("存在しない主キー列で復元できました")
+    expectError "存在しない主キー列で復元できました" (Catalog.toSchema bad)
 
 
 [<Fact>]
@@ -131,9 +64,7 @@ let ``Catalog: 空のカタログにテーブルを追加・検索・削除`` ()
 
 [<Fact>]
 let ``Catalog: 保存したカタログを読み込める`` () =
-    withDir "cat1" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-
+    withStore "cat1" (fun store ->
         let people = Catalog.toDefinition peopleSchema
         let ix = Catalog.toIndexDefinition "people" peopleSchema.Indexes.[0]
 
@@ -151,9 +82,7 @@ let ``Catalog: 保存したカタログを読み込める`` () =
 
 [<Fact>]
 let ``Catalog: 削除した定義は再読込時に消える`` () =
-    withDir "cat2" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-
+    withStore "cat2" (fun store ->
         let people = Catalog.toDefinition peopleSchema
         let orders = Catalog.toDefinition ordersSchema
 
@@ -176,9 +105,7 @@ let ``Catalog: 削除した定義は再読込時に消える`` () =
 
 [<Fact>]
 let ``Catalog: 索引だけを追加して読み込める`` () =
-    withDir "cat3" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-
+    withStore "cat3" (fun store ->
         let ix =
             {
                 IndexName = "ix_x"

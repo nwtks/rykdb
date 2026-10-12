@@ -53,6 +53,118 @@ let withDir (tag: string) (f: string -> unit) =
             with _ ->
                 ()
 
+/// 一時ディレクトリに RowStore を開いて渡し、テスト後に消す。
+/// （`withDir` + `openStore` の 2 行テンプレをまとめる）
+let withStore (tag: string) (f: RowStore -> unit) =
+    withDir tag (fun dir -> f (ok (RowStore.openStore dir)))
+
+/// 一時ディレクトリに DB を開いてテストし、最後に閉じて削除する。
+/// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で持ち替える。
+let withDb (tag: string) (f: Database -> unit) =
+    let dir = newDir tag
+
+    try
+        let db = ok (Database.openWith dir)
+        f db
+        ok (db.Close())
+    finally
+        if Directory.Exists dir then
+            try
+                Directory.Delete(dir, true)
+            with _ ->
+                ()
+
+/// Error でなければテストを落とす（エラー内容まで見るテストは match で個別に書く）。
+let expectError (message: string) (r: Result<'a, DbError>) =
+    match r with
+    | Error _ -> ()
+    | Ok _ -> Assert.Fail message
+
+/// 特定の ErrorKind を返さなければテストを落とす。
+/// 「| Error e -> Assert.Equal<ErrorKind>(kind, e.Kind) | Ok _ -> Assert.Fail msg」の定型をまとめる。
+let expectErrorKind (kind: ErrorKind) (message: string) (r: Result<'a, DbError>) =
+    match r with
+    | Error e -> Assert.Equal<ErrorKind>(kind, e.Kind)
+    | Ok _ -> Assert.Fail message
+
+// ---------------------------------------------------------------------------
+// スキーマを作るときの列定義ビルダー（各ファイルに書くとコピペになるため）
+// ---------------------------------------------------------------------------
+
+/// 制約のない列定義。
+let col (name: string) (dt: DataType) =
+    {
+        Name = name
+        DataType = dt
+        TypeArguments = []
+        Constraint = ColumnConstraint.Empty
+    }
+
+/// NOT NULL + PRIMARY KEY の列定義。
+let pkCol (name: string) (dt: DataType) =
+    { col name dt with
+        Constraint =
+            { ColumnConstraint.Empty with
+                NotNull = true
+                PrimaryKey = true
+            }
+    }
+
+/// 出力 1 列（`SELECT` の出力スキーマ。修飾子と型は省略可）。
+let outCol (name: string) (qualifier: string option) (dataType: DataType option) =
+    {
+        Name = name
+        Qualifier = qualifier
+        DataType = dataType
+    }
+
+/// 出力スキーマ（列のリストだけ指定して `Schema.empty` を敷く）。
+let outSchema (cols: OutputColumn list) =
+    { Schema.empty with
+        Columns = cols |> List.toArray
+    }
+
+/// 共有のテスト用テーブルスキーマ（CatalogTests / PlannerTests が同一定義を使っていた）。
+let peopleSchema: TableSchema =
+    {
+        Name = "people"
+        Columns =
+            [
+                pkCol "id" DataType.Integer
+                col "name" DataType.Text
+                col "age" DataType.Integer
+            ]
+        PrimaryKey = [ 0 ]
+        Indexes =
+            [
+                {
+                    Name = "ix_people_age"
+                    Columns = [ "age" ]
+                    Unique = false
+                }
+            ]
+    }
+
+let ordersSchema: TableSchema =
+    {
+        Name = "orders"
+        Columns =
+            [
+                pkCol "oid" DataType.Integer
+                col "person_id" DataType.Integer
+                col "amount" DataType.Integer
+            ]
+        PrimaryKey = [ 0 ]
+        Indexes =
+            [
+                {
+                    Name = "ix_orders_person"
+                    Columns = [ "person_id" ]
+                    Unique = false
+                }
+            ]
+    }
+
 /// INTEGER でなければテストを落とす。
 let asInt (v: SqlValue) =
     match v with
@@ -165,3 +277,26 @@ let render (vs: SqlValue[]) =
 // KeyBuilder の戻り値はそのままバイト列キー
 let keyOf (v: SqlValue) = KeyBuilder.ofValues [ v ]
 let keyOfTuple (vs: SqlValue[]) = KeyBuilder.ofValues vs
+
+/// 連番の整数から作るテスト用キー。
+/// SSTable / MANIFEST / StorageEngine / WAL の `sstKey`、Memtable / BloomFilter の
+/// `bloomKey` として **7 ファイルに同一実装がコピーされていた**ので一本化した。
+let intKey (i: int) =
+    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
+
+/// INTEGER 1 列の行。
+/// Memtable / StorageEngine / WAL の `valOf` にあたる（Executor の `intArr` も同義）。
+let intRow (i: int) = [| SqlValue.Int(int64 i) |]
+
+/// FileMetaData のテスト用ビルダー（キー lo..hi の連番区間）。
+/// ManifestTests と VersionSetTests に同一実装が 2 ファイル分あった。
+let fmd (num: int64) (level: int) (lo: int) (hi: int) : FileMetaData =
+    {
+        FileNumber = num
+        Level = level
+        Smallest = intKey lo
+        Largest = intKey hi
+        EntryCount = int64 (hi - lo + 1)
+        Size = int64 (hi - lo + 1) * 100L
+        MaxSeqNo = uint64 (hi + 1)
+    }

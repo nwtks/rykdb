@@ -178,6 +178,20 @@ module internal ResultOps =
             (ret [])
         |> Result.map List.rev
 
+    /// 状態を受け取り Result を返す `step` で列を左から畳み込む Result 版 fold。
+    /// 最初の Error で打ち切り、残りの項目は評価しない。
+    /// `xs |> Array.fold (fun acc x -> acc >>= fun s -> step s x) (ret state)`
+    /// と書く手書きパターン（コピペで散らばっていたもの）をこれに集約する。
+    /// 空の列は `Ok state` を返す。副作用は `step` に任せる。
+    let foldOk (step: 's -> 'a -> Result<'s, DbError>) (state: 's) (items: 'a seq) =
+        items
+        |> Seq.fold
+            (fun acc item ->
+                match acc with
+                | Error e -> Error e
+                | Ok s -> step s item)
+            (ret state)
+
     /// .NET の I/O API は例外を送出するため、そこだけ Result へ包む境界。
     let protect (f: unit -> 'a) =
         try

@@ -86,68 +86,20 @@ module internal StorageEngine =
         }
 
     // -----------------------------------------------------------------------
-    // ファイル名
+    // ファイル名（Sstable.fileName / Sstable.path を共有）
     // -----------------------------------------------------------------------
 
-    let private sstFileName (fileNumber: int64) = sprintf "%06d.sst" fileNumber
-
-    let private sstPath (dir: string) (fileNumber: int64) =
-        Path.Combine(dir, sstFileName fileNumber)
-
-    let private parseSstNumber (path: string) =
+    /// ファイル名（拡張子除く）を番号として読む。SSTable でも WAL でも同じ規則。
+    let private parseNumber (path: string) =
         match System.Int64.TryParse(Path.GetFileNameWithoutExtension path) with
         | true, v -> Some v
         | _ -> None
 
-    // -----------------------------------------------------------------------
-    // ソート済み列のマージ
-    // -----------------------------------------------------------------------
-
-    type private Head =
-        {
-            FileNumber: int64
-            Items: SstEntry array
-            Index: int
-        }
-
-    /// 「キー昇順・同一キーは SeqNo 降順」で並んだ列を k-way merge する。
-    /// ソース数は高々 1 + ファイル数なので、head を走査しても十分速い。
-    let private mergeSources (sources: (int64 * SstEntry array) list) =
-        let rec go (heads: Head list) (acc: SstEntry list) =
-            let pick =
-                heads
-                |> List.filter (fun h -> h.Index < h.Items.Length)
-                |> List.fold
-                    (fun best h ->
-                        match best with
-                        | None -> Some h
-                        | Some b ->
-                            if SstEntry.compare h.Items.[h.Index] b.Items.[b.Index] < 0 then
-                                Some h
-                            else
-                                Some b)
-                    None
-
-            match pick with
-            | None -> List.rev acc |> Array.ofList
-            | Some h ->
-                let e = h.Items.[h.Index]
-                let advanced = { h with Index = h.Index + 1 }
-
-                let replaced =
-                    heads |> List.map (fun x -> if x.FileNumber = h.FileNumber then advanced else x)
-
-                go replaced (e :: acc)
-
-        go
-            (sources
-             |> List.map (fun (fid, arr) ->
-                 {
-                     FileNumber = fid
-                     Items = arr
-                     Index = 0
-                 }))
-            []
+    /// snapshot（visible）から見える版かどうか。None なら常に見える。
+    let private isVisible (visible: uint64 option) (e: SstEntry) =
+        match visible with
+        | Some s -> e.SeqNo <= s
+        | None -> true
 
     /// 隣接する同じキーのエントリを 1 つに畳む。
     /// merge 後の並びは「キー昇順・同一キーは SeqNo 降順」。
@@ -155,11 +107,6 @@ module internal StorageEngine =
     /// （= その snapshot から見た最新）を 1 件だけ残す。MVCC の可視性はここで効く。
     /// None なら制限なしで先頭（＝全体最新）を残す。
     let private collapseDuplicates (visible: uint64 option) (items: SstEntry array) =
-        let visibleTo (e: SstEntry) =
-            match visible with
-            | Some s -> e.SeqNo <= s
-            | None -> true
-
         let rec go (acc: SstEntry list) (arr: SstEntry array) (i: int) (emittedKey: byte array option) =
             if i >= arr.Length then
                 List.rev acc |> Array.ofList
@@ -167,8 +114,8 @@ module internal StorageEngine =
                 let e = arr.[i]
 
                 match emittedKey with
-                | Some k when SstEntry.compareBytes k e.Key = 0 -> go acc arr (i + 1) emittedKey
-                | _ when not (visibleTo e) -> go acc arr (i + 1) emittedKey
+                | Some k when Bytes.compare k e.Key = 0 -> go acc arr (i + 1) emittedKey
+                | _ when not (isVisible visible e) -> go acc arr (i + 1) emittedKey
                 | _ -> go (e :: acc) arr (i + 1) (Some e.Key)
 
         go [] items 0 None
@@ -177,12 +124,16 @@ module internal StorageEngine =
     // ファイル読み
     // -------------------------------------------------------------------
 
+    /// SSTable ファイルを直接バイト列で読む（キャッシュを通さない）。
+    let private readFileBytes (dir: string) (fileNumber: int64) =
+        protect (fun () -> File.ReadAllBytes(Sstable.path dir fileNumber))
+
     /// SSTable のファイル単位のバイト列を（キャッシュ経由で）読む。
     let private readSstableBytes (engine: StorageEngine) (fileNumber: int64) =
         match BlockCache.get engine.Cache fileNumber 0 with
         | Some(_, bytes) -> ret bytes
         | None ->
-            protect (fun () -> File.ReadAllBytes(sstPath engine.Dir fileNumber))
+            readFileBytes engine.Dir fileNumber
             |> Result.map (fun bytes ->
                 let entry =
                     {
@@ -198,6 +149,43 @@ module internal StorageEngine =
     let private openSstable (engine: StorageEngine) (f: FileMetaData) =
         readSstableBytes engine f.FileNumber |> Result.bind Sstable.openTable
 
+    /// 開いた reader から全エントリを配列にする。
+    let private readAllEntries reader =
+        Sstable.entries reader |> Result.map Seq.toArray
+
+    /// ファイル 1つを読んで全エントリを配列にする（読む側。キャッシュ経由）。
+    let private entriesOf (engine: StorageEngine) (f: FileMetaData) =
+        openSstable engine f |> Result.bind readAllEntries
+
+    /// ファイル 1つを読んで全エントリを配列にする
+    /// （読む側。engine が無い復旧時 = キャッシュなし）。
+    let private entriesAt (dir: string) (f: FileMetaData) =
+        readFileBytes dir f.FileNumber >>= Sstable.openTable >>= readAllEntries
+
+    /// ファイル列を先頭から順に処理する「回す側」。
+    /// read が 1ファイル分を読み、step が状態を進める。
+    /// 最初の Error で打ち切る。
+    /// read / step は再帰しないので bind で合成してよい。
+    let private foldFiles
+        (read: FileMetaData -> Result<'a, DbError>)
+        (step: 's -> 'a -> 's)
+        (state: 's)
+        (files: FileMetaData list)
+        =
+        let rec go (rest: FileMetaData list) (acc: 's) =
+            match rest with
+            | [] -> ret acc
+            | f :: tail ->
+                match read f with
+                | Error e -> Error e
+                | Ok v -> go tail (step acc v)
+
+        go files state
+
+    /// ディレクトリにある SSTable のファイル番号（孤児削除と open 時の復元で使う）。
+    let private sstNumbersOnDisk (dir: string) =
+        Directory.GetFiles(dir, "*.sst") |> Array.choose parseNumber
+
     // -----------------------------------------------------------------------
     // 検索
     // -----------------------------------------------------------------------
@@ -205,11 +193,8 @@ module internal StorageEngine =
     /// バージョン列から snapshot で見える最初の（＝最新の）版を拾う。
     let private firstVisible (visible: uint64 option) (key: byte array) (seq: seq<SstEntry>) =
         seq
-        |> Seq.takeWhile (fun e -> SstEntry.compareBytes e.Key key = 0)
-        |> Seq.tryFind (fun e ->
-            match visible with
-            | Some s -> e.SeqNo <= s
-            | None -> true)
+        |> Seq.takeWhile (fun e -> Bytes.compare e.Key key = 0)
+        |> Seq.tryFind (isVisible visible)
 
     /// 点ルックアップ。memtable -> L0 -> 各レベルの順に見る。
     /// <paramref name="visible"/> が Some s のときは SeqNo が s 以下の最新版を返す。
@@ -258,29 +243,19 @@ module internal StorageEngine =
 
         let files =
             Version.allFiles engine.Version
-            |> List.filter (fun f -> SstEntry.compareBytes f.Largest startKey >= 0)
+            |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
             |> List.sortByDescending (fun f -> f.FileNumber)
 
-        let rec readAll (files: FileMetaData list) (acc: (int64 * SstEntry array) list) =
-            match files with
-            | [] -> ret (List.rev acc)
-            | f :: rest ->
-                match openSstable engine f with
-                | Error e -> Error e
-                | Ok reader ->
-                    match Sstable.entries reader with
-                    | Error e -> Error e
-                    | Ok seq -> readAll rest ((f.FileNumber, seq |> Seq.toArray) :: acc)
-
-        readAll files []
+        foldFiles (entriesOf engine) (fun acc entries -> entries :: acc) [] files
         |> Result.map (fun sources ->
-            let merged = mergeSources ((0L, memSeq) :: sources) |> collapseDuplicates visible
+            let ordered = List.rev sources
+            let merged = SstEntry.mergeSorted (memSeq :: ordered) |> collapseDuplicates visible
 
             let sliced =
                 if Array.isEmpty startKey then
                     merged
                 else
-                    merged |> Array.filter (fun e -> SstEntry.compareBytes e.Key startKey >= 0)
+                    merged |> Array.filter (fun e -> Bytes.compare e.Key startKey >= 0)
 
             if limit > 0 then sliced |> Array.truncate limit else sliced)
 
@@ -317,27 +292,20 @@ module internal StorageEngine =
 
             Wal.append engine.Wal engine.Dir records |> Result.bind apply
 
-    /// 1 件書く。
-    let put (engine: StorageEngine) (key: byte array) (value: SqlValue array) =
-        let entry = Entry.put key engine.NextSeqNo value
+    /// 1 件書く / 消す（put と tombstone の共通。値は entry 側に入っている）。
+    let private writeOne (engine: StorageEngine) (entry: Entry) =
         let nextSeqNo = engine.NextSeqNo + 1UL
 
-        let bump (e: StorageEngine) =
-            let next = { e with NextSeqNo = nextSeqNo }
-            ret next
+        writeBatch engine [| entry |]
+        |> Result.map (fun next -> { next with NextSeqNo = nextSeqNo })
 
-        writeBatch engine [| entry |] |> Result.bind bump
+    /// 1 件書く。
+    let put (engine: StorageEngine) (key: byte array) (value: SqlValue array) =
+        writeOne engine (Entry.put key engine.NextSeqNo value)
 
     /// 1 件削除する（tombstone を書く）。
     let delete (engine: StorageEngine) (key: byte array) =
-        let entry = Entry.delete key engine.NextSeqNo
-        let nextSeqNo = engine.NextSeqNo + 1UL
-
-        let bump (e: StorageEngine) =
-            let next = { e with NextSeqNo = nextSeqNo }
-            ret next
-
-        writeBatch engine [| entry |] |> Result.bind bump
+        writeOne engine (Entry.delete key engine.NextSeqNo)
 
     // -----------------------------------------------------------------------
     // flush
@@ -345,13 +313,7 @@ module internal StorageEngine =
 
     /// WAL のうち最も新しいファイルの番号。
     let private latestWalNumber (dir: string) =
-        Wal.walFiles dir
-        |> List.choose (fun p ->
-            match System.Int64.TryParse(Path.GetFileNameWithoutExtension p) with
-            | true, v -> Some v
-            | _ -> None)
-        |> List.sort
-        |> List.tryLast
+        Wal.walFiles dir |> List.choose parseNumber |> List.sort |> List.tryLast
 
     /// 古い WAL をすべて消してから、新しい番号の空ファイルを作る。
     /// 順序が重要：先に作ると次に消す対象に入ってしまう。
@@ -392,35 +354,10 @@ module internal StorageEngine =
             let sst = entries |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
             let fileNumber = engine.Version.NextFileNumber
 
-            let writeFile (bytes: byte array) =
-                protect (fun () -> File.WriteAllBytes(sstPath engine.Dir fileNumber, bytes) |> ignore)
-
-            let applyManifest (bytes: byte array) =
-                let maxSeqNo = sst |> Array.fold (fun acc e -> max acc e.SeqNo) 0UL
-
-                let meta =
-                    {
-                        FileNumber = fileNumber
-                        Level = 0
-                        Smallest = sst.[0].Key
-                        Largest = sst.[sst.Length - 1].Key
-                        EntryCount = int64 sst.Length
-                        Size = int64 bytes.Length
-                        MaxSeqNo = maxSeqNo
-                    }
-
-                match
-                    Manifest.logAndApply engine.Dir engine.ManifestNumber engine.Version (VersionEdit.addFile meta)
-                with
-                | Error e -> Error e
-                | Ok(version, manifestNumber) -> finishFlush engine version manifestNumber
-
-            match Sstable.build sst BloomFalsePositiveRate with
-            | Error e -> Error e
-            | Ok bytes ->
-                match writeFile bytes with
-                | Error e -> Error e
-                | Ok() -> applyManifest bytes
+            FileMetaData.writeSstable engine.Dir fileNumber 0 BloomFalsePositiveRate sst
+            |> Result.bind (fun meta ->
+                Manifest.logAndApply engine.Dir engine.ManifestNumber engine.Version (VersionEdit.addFile meta)
+                |> Result.bind (fun (version, manifestNumber) -> finishFlush engine version manifestNumber))
 
     // -----------------------------------------------------------------------
     // Compaction
@@ -435,10 +372,6 @@ module internal StorageEngine =
     /// 3 と 4 の順序が重要: MANIFEST を先に書かないと、
     /// クラッシュ時に「MANIFEST は新しいがファイルは古い」= データ損失になる。
     let private compactOnce (engine: StorageEngine) =
-        let readFile (f: FileMetaData) =
-            openSstable engine f
-            |> Result.bind (fun reader -> Sstable.entries reader |> Result.map (fun seq -> seq |> Seq.toArray))
-
         match
             Compaction.compact
                 engine.Dir
@@ -446,7 +379,7 @@ module internal StorageEngine =
                 engine.Compaction
                 engine.ActiveSnapshot
                 engine.Version.NextFileNumber
-                readFile
+                (entriesOf engine)
         with
         | Error e -> Error e
         | Ok(result, _info) ->
@@ -502,7 +435,7 @@ module internal StorageEngine =
     let private dropMissingFiles (dir: string) (manifestNumber: int64) (version: RykDb.Core.Version) =
         let missing =
             Version.allFiles version
-            |> List.filter (fun f -> not (File.Exists(sstPath dir f.FileNumber)))
+            |> List.filter (fun f -> not (File.Exists(Sstable.path dir f.FileNumber)))
 
         if List.isEmpty missing then
             ret (version, manifestNumber)
@@ -520,43 +453,26 @@ module internal StorageEngine =
         let referenced =
             Version.allFiles version |> List.map (fun f -> f.FileNumber) |> Set.ofList
 
-        let onDisk = Directory.GetFiles(dir, "*.sst") |> Array.choose parseSstNumber
+        let onDisk = sstNumbersOnDisk dir
         let orphans = onDisk |> Array.filter (fun n -> not (Set.contains n referenced))
 
-        protect (fun () -> orphans |> Array.iter (fun n -> File.Delete(sstPath dir n)) |> ignore)
+        protect (fun () -> orphans |> Array.iter (fun n -> File.Delete(Sstable.path dir n)) |> ignore)
 
     /// 既存データの中で最大の seqNo を求める。
     /// WAL が空でも新しい seqNo が既存版より小さくならないようにするため。
     /// 全 SSTable の全エントリを走査する（O(全エントリ)）。
     let private maxSeqNoOnDisk (dir: string) (version: RykDb.Core.Version) =
-        let rec go (files: FileMetaData list) (acc: uint64) =
-            match files with
-            | [] -> ret acc
-            | f :: rest ->
-                match protect (fun () -> File.ReadAllBytes(sstPath dir f.FileNumber)) with
-                | Error e -> Error e
-                | Ok bytes ->
-                    match Sstable.openTable bytes with
-                    | Error e -> Error e
-                    | Ok reader ->
-                        match Sstable.entries reader with
-                        | Error e -> Error e
-                        | Ok seq ->
-                            let m = seq |> Seq.fold (fun acc e -> max acc e.SeqNo) acc
-                            go rest m
-
-        go (Version.allFiles version) 0UL
+        foldFiles
+            (entriesAt dir)
+            (fun (acc: uint64) entries -> max acc (SstEntry.maxSeqNo entries))
+            0UL
+            (Version.allFiles version)
 
     /// ディレクトリ内の全ファイル番号（SSTable と WAL）。
     let private maxFileNumberOnDisk (dir: string) =
-        let ssts = Directory.GetFiles(dir, "*.sst") |> Array.choose parseSstNumber
+        let ssts = sstNumbersOnDisk dir
 
-        let wals =
-            Wal.walFiles dir
-            |> List.choose (fun p ->
-                match System.Int64.TryParse(Path.GetFileNameWithoutExtension p) with
-                | true, v -> Some v
-                | _ -> None)
+        let wals = Wal.walFiles dir |> List.choose parseNumber
 
         Array.append ssts (wals |> List.toArray)
         |> Array.fold (fun acc n -> max acc n) 0L
@@ -597,7 +513,7 @@ module internal StorageEngine =
                         >>= fun replayed ->
                             maxSeqNoOnDisk dir version
                             >>= fun diskMax ->
-                                let walMax = replayed |> Array.fold (fun acc e -> max acc e.SeqNo) 0UL
+                                let walMax = Entry.maxSeqNo replayed
                                 let nextSeqNo = max walMax diskMax + 1UL
 
                                 let bumped =

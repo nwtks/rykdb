@@ -63,65 +63,12 @@ type internal CompactionResult =
     }
 
 module internal Compaction =
-    let private fileName (fileNumber: int64) = sprintf "%06d.sst" fileNumber
-
-    let private path (dir: string) (fileNumber: int64) = Path.Combine(dir, fileName fileNumber)
-
     let private deleteFile (dir: string) (fileNumber: int64) =
         protect (fun () ->
-            let p = path dir fileNumber
+            let p = Sstable.path dir fileNumber
 
             if File.Exists p then
                 File.Delete p)
-
-    // -----------------------------------------------------------------------
-    // ソート済み列のマージ
-    // StorageEngine.scan と同じ k-way merge。各ソースは既に
-    // 「キー昇順・同一キーは SeqNo 降順」で並んでいる。
-    // -----------------------------------------------------------------------
-
-    type private Head =
-        {
-            Id: int
-            Items: SstEntry array
-            Index: int
-        }
-
-    let private splitInto (n: int) (items: SstEntry array) =
-        let rec go acc start =
-            if start >= items.Length then
-                List.rev acc
-            else
-                let len = max 1 (min n (items.Length - start))
-                go (Array.sub items start len :: acc) (start + len)
-
-        go [] 0
-
-    let private mergeSources (sources: SstEntry array list) =
-        let rec go (heads: Head list) (acc: SstEntry list) =
-            let pick =
-                heads
-                |> List.filter (fun h -> h.Index < h.Items.Length)
-                |> List.fold
-                    (fun best h ->
-                        match best with
-                        | None -> Some h
-                        | Some b ->
-                            if SstEntry.compare h.Items.[h.Index] b.Items.[b.Index] < 0 then
-                                Some h
-                            else
-                                Some b)
-                    None
-
-            match pick with
-            | None -> List.rev acc |> Array.ofList
-            | Some h ->
-                let e = h.Items.[h.Index]
-                let advanced = { h with Index = h.Index + 1 }
-                let replaced = heads |> List.map (fun x -> if x.Id = h.Id then advanced else x)
-                go replaced (e :: acc)
-
-        go (sources |> List.mapi (fun i a -> { Id = i; Items = a; Index = 0 })) []
 
     // -----------------------------------------------------------------------
     // GC — 不要バージョンの削除
@@ -131,7 +78,7 @@ module internal Compaction =
         let rec groupEnd (start: int) =
             if start + 1 >= items.Length then
                 items.Length
-            elif SstEntry.compareBytes items.[start + 1].Key items.[start].Key = 0 then
+            elif Bytes.compare items.[start + 1].Key items.[start].Key = 0 then
                 groupEnd (start + 1)
             else
                 start + 1
@@ -184,8 +131,8 @@ module internal Compaction =
         let overlapsWith (files: FileMetaData list) (f: FileMetaData) =
             files
             |> List.exists (fun g ->
-                SstEntry.compareBytes g.Largest f.Smallest >= 0
-                && SstEntry.compareBytes f.Largest g.Smallest >= 0)
+                Bytes.compare g.Largest f.Smallest >= 0
+                && Bytes.compare f.Largest g.Smallest >= 0)
 
         let next =
             if nextLevel > Levels.Max then
@@ -210,71 +157,30 @@ module internal Compaction =
         (nextFileNumber: int64)
         (readFile: FileMetaData -> Result<SstEntry array, DbError>)
         =
-        let makeMeta
-            (chunk: SstEntry array)
-            (bytes: byte array)
-            (fileNumber: int64)
-            (outputLevel: int)
-            (maxSeqNo: uint64)
-            =
-            {
-                FileNumber = fileNumber
-                Level = outputLevel
-                Smallest = chunk.[0].Key
-                Largest = chunk.[chunk.Length - 1].Key
-                EntryCount = int64 chunk.Length
-                Size = int64 bytes.Length
-                MaxSeqNo = maxSeqNo
-            }
+        let writeChunks (rest: SstEntry array list) (outputLevel: int) =
+            rest
+            |> List.mapi (fun i chunk -> nextFileNumber + int64 i, chunk)
+            |> foldOk
+                (fun acc (num, chunk) ->
+                    FileMetaData.writeSstable dir num outputLevel options.BloomFalsePositiveRate chunk
+                    |> Result.map (fun meta -> meta :: acc))
+                []
 
-        let writeOne (chunk: SstEntry array) (fileNumber: int64) (outputLevel: int) (maxSeqNo: uint64) =
-            match Sstable.build chunk options.BloomFalsePositiveRate with
-            | Error e -> Error e
-            | Ok bytes ->
-                match protect (fun () -> File.WriteAllBytes(path dir fileNumber, bytes) |> ignore) with
-                | Error e -> Error e
-                | Ok() -> ret (makeMeta chunk bytes fileNumber outputLevel maxSeqNo)
-
-        let rec writeChunks
-            (rest: SstEntry array list)
-            (num: int64)
-            (outputLevel: int)
-            (maxSeqNo: uint64)
-            (acc: FileMetaData list)
-            =
-            match rest with
-            | [] -> ret acc
-            | chunk :: tail ->
-                let fileNumber = nextFileNumber + num
-
-                match writeOne chunk fileNumber outputLevel maxSeqNo with
-                | Error e -> Error e
-                | Ok meta -> writeChunks tail (num + 1L) outputLevel maxSeqNo (meta :: acc)
-
-        let rec readAll (rest: FileMetaData list) (acc: SstEntry array list) =
-            match rest with
-            | [] -> ret (List.rev acc)
-            | f :: tail ->
-                match readFile f with
-                | Error e -> Error e
-                | Ok items -> readAll tail (items :: acc)
+        let readAll (rest: FileMetaData list) =
+            rest
+            |> foldOk (fun acc f -> readFile f |> Result.map (fun items -> items :: acc)) []
+            |> Result.map List.rev
 
         let finish (sources: SstEntry array list) (outputLevel: int) =
-            let merged = mergeSources sources
+            let merged = SstEntry.mergeSorted sources
             let dropTombstones = outputLevel >= options.DropTombstonesBelowLevel
 
             let cleaned, droppedVersions, droppedTombstones =
                 gc activeSnapshot dropTombstones merged
 
             let info =
-                {
+                { FileMetaData.zero with
                     Level = outputLevel
-                    FileNumber = 0L
-                    EntryCount = 0L
-                    Size = 0L
-                    Smallest = [||]
-                    Largest = [||]
-                    MaxSeqNo = 0UL
                 }
 
             if cleaned.Length = 0 then
@@ -288,10 +194,9 @@ module internal Compaction =
 
                 ret (summary, info)
             else
-                let maxSeqNo = cleaned |> Array.fold (fun acc e -> max acc e.SeqNo) 0UL
-                let chunks = splitInto (max 1 (options.MaxInputFiles * 4)) cleaned
+                let chunks = SstEntry.splitInto (max 1 (options.MaxInputFiles * 4)) cleaned
 
-                match writeChunks chunks 0L outputLevel maxSeqNo [] with
+                match writeChunks chunks outputLevel with
                 | Error e -> Error e
                 | Ok added ->
                     ret (
@@ -313,21 +218,15 @@ module internal Compaction =
                     DroppedVersions = 0
                     DroppedTombstones = 0
                 },
-                {
+                { FileMetaData.zero with
                     FileNumber = -1L
-                    Level = 0
-                    Smallest = [||]
-                    Largest = [||]
-                    EntryCount = 0L
-                    Size = 0L
-                    MaxSeqNo = 0UL
                 }
             )
         | Some plan ->
             let inputs, nextFiles, _ = selectInputs version plan.Level options.MaxInputFiles
             let allInputs = inputs @ nextFiles
 
-            match readAll allInputs [] with
+            match readAll allInputs with
             | Error e -> Error e
             | Ok sources ->
                 match finish sources plan.OutputLevel with
@@ -338,5 +237,4 @@ module internal Compaction =
 
     /// ファイルを実際に削除する。
     let deleteObsolete (dir: string) (files: FileMetaData list) =
-        files
-        |> List.fold (fun acc f -> acc >>= fun () -> deleteFile dir f.FileNumber) (ret ())
+        files |> foldOk (fun () f -> deleteFile dir f.FileNumber) ()

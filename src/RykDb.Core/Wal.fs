@@ -7,7 +7,6 @@
 //
 // 長さ・チェックサムが合わないレコードは書きかけ（torn write）として打ち切る。
 // 追記は「最後に完了する」性質があるので、壊れたレコードの後ろは読まなくてよい。
-// 詳細は docs/architecture.md §9.6。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -52,34 +51,19 @@ module internal Wal =
 
     let path (dir: string) (fileNumber: int64) = Path.Combine(dir, fileName fileNumber)
 
-    let private checksum (data: byte array) =
-        Array.fold (fun h b -> (h ^^^ uint32 b) * 16777619u) 2166136261u data
-
-    let private le32 (v: uint32) =
-        [|
-            for i in 0..3 do
-                yield byte (v >>> 8 * i)
-        |]
-
-    let private readLE32 (data: byte array) (offset: int) =
-        let at (i: int) = uint32 data.[offset + i]
-        at 0 ||| (at 1 <<< 8) ||| (at 2 <<< 16) ||| (at 3 <<< 24)
-
     let private encodeEntry (e: Entry) =
         let body =
-            Writer.empty
-            |> Writer.varint e.SeqNo
-            |> fun w -> Writer.bool e.IsDelete w
-            |> fun w -> Writer.lengthPrefixed e.Key w
-            |> fun w ->
-                match e.Value, e.IsDelete with
-                | Some values, false -> ValueCodec.writeValues values w
-                | _ -> w
-            |> Writer.toArray
+            Writer.build
+                [
+                    Writer.varint e.SeqNo
+                    Writer.bool e.IsDelete
+                    Writer.lengthPrefixed e.Key
+                    match e.Value with
+                    | Some values when not e.IsDelete -> ValueCodec.writeValues values
+                    | _ -> id
+                ]
 
-        Writer.empty
-        |> fun w -> Writer.writeBytes (Writer.toArray (Writer.lengthPrefixed body w)) w
-        |> Writer.toArray
+        Writer.build [ Writer.lengthPrefixed body ]
 
     let private decodeEntry (data: byte array) =
         result {
@@ -110,19 +94,9 @@ module internal Wal =
         |> Writer.toArray
 
     let private decodeBatch (data: byte array) =
-        let decodeEntries (count: uint64) (start: Cursor) =
-            let rec go (i: uint64) (acc: Entry list) (c: Cursor) =
-                if i >= count then
-                    List.rev acc |> Array.ofList |> ret
-                else
-                    match Read.readLengthPrefixed c with
-                    | Error e -> Error e
-                    | Ok(bs, c1) ->
-                        match decodeEntry bs with
-                        | Error e -> Error e
-                        | Ok e -> go (i + 1UL) (e :: acc) c1
-
-            go 0UL [] start
+        let readOne (c: Cursor) =
+            Read.readLengthPrefixed c
+            |> Result.bind (fun (bs, c1) -> decodeEntry bs |> Result.map (fun e -> e, c1))
 
         result {
             let c = Cursor.create data
@@ -132,35 +106,20 @@ module internal Wal =
             if count > uint64 System.Int32.MaxValue then
                 return! Error(DbError.corruption (sprintf "Wal: バッチのエントリ数が大きすぎます (%d)" count))
             else
-                let! entries = decodeEntries count c
-                return txnId, entries
+                let! items, _ = Read.readItems count readOne c
+                return txnId, List.toArray items
         }
 
     let private encodePayload (r: WalRecord) =
-        match r with
-        | WalRecord.Begin txnId ->
-            Writer.empty
-            |> Writer.writeByte TagBegin
-            |> fun w -> Writer.uint64BE txnId w
-            |> Writer.toArray
-        | WalRecord.Commit txnId ->
-            Writer.empty
-            |> Writer.writeByte TagCommit
-            |> fun w -> Writer.uint64BE txnId w
-            |> Writer.toArray
-        | WalRecord.Abort txnId ->
-            Writer.empty
-            |> Writer.writeByte TagAbort
-            |> fun w -> Writer.uint64BE txnId w
-            |> Writer.toArray
-        | WalRecord.Batch(txnId, entries) ->
-            Writer.empty
-            |> Writer.writeByte TagBatch
-            |> fun w -> Writer.writeBytes (encodeBatch txnId entries) w
-            |> Writer.toArray
+        let txnRecord tag txnId =
+            Writer.build [ Writer.writeByte tag; Writer.uint64BE txnId ]
 
-    let private frame (payload: byte array) =
-        Array.concat [| le32 (uint32 payload.Length); le32 (checksum payload); payload |]
+        match r with
+        | WalRecord.Begin txnId -> txnRecord TagBegin txnId
+        | WalRecord.Commit txnId -> txnRecord TagCommit txnId
+        | WalRecord.Abort txnId -> txnRecord TagAbort txnId
+        | WalRecord.Batch(txnId, entries) ->
+            Writer.build [ Writer.writeByte TagBatch; Writer.writeBytes (encodeBatch txnId entries) ]
 
     let private decodePayload (payload: byte array) =
         result {
@@ -184,40 +143,34 @@ module internal Wal =
                 return! Error(DbError.corruption (sprintf "Wal: 不明なレコード種別 %d" (int tag)))
         }
 
-    let private readRecords (data: byte array) =
-        let rec go (pos: int) (acc: WalRecord list) =
-            if pos + 8 > data.Length then
-                List.rev acc, pos
+    /// フレーム 1件を読む（frame が書く [len:u32LE][checksum:u32LE][payload] の対）。
+    /// 短い・チェックサム不一致・payload 不正はすべて Error（呼び出し側で打ち切り）。
+    let private readFrame (c: Cursor) =
+        result {
+            let! len, c1 = Read.readUInt32LE c
+            let! sum, c2 = Read.readUInt32LE c1
+            let n = int len
+
+            if n < 0 then
+                return! Error(DbError.corruption "Wal: フレーム長が不正です")
             else
-                let len = int (readLE32 data pos)
-                let sum = readLE32 data (pos + 4)
+                let! payload, c3 = Read.readBytes n c2
 
-                if len < 0 || pos + 8 + len > data.Length then
-                    List.rev acc, pos
+                if Hashing.checksum payload <> sum then
+                    return! Error(DbError.corruption "Wal: チェックサム不一致")
                 else
-                    let payload = Array.sub data (pos + 8) len
+                    let! r = decodePayload payload
+                    return r, c3
+        }
 
-                    if checksum payload <> sum then
-                        List.rev acc, pos
-                    else
-                        match decodePayload payload with
-                        | Ok r -> go (pos + 8 + len) (r :: acc)
-                        | Error _ -> List.rev acc, pos
+    let private readRecords (data: byte array) =
+        // 壊れた/書きかけレコードで打ち切る（以降のバイトは捨てる）。
+        let rec go (c: Cursor) (acc: WalRecord list) =
+            match readFrame c with
+            | Error _ -> List.rev acc
+            | Ok(r, c') -> go c' (r :: acc)
 
-        go 0 []
-
-    /// ディレクトリ内の WAL ファイル名（復旧時に孤児を消すのに使う）。
-    let walFiles (dir: string) =
-        if Directory.Exists dir then
-            Directory.GetFiles(dir, "*.wal") |> Array.toList
-        else
-            []
-
-    /// WAL ファイルを作る。
-    let create (dir: string) (fileNumber: int64) =
-        protect (fun () ->
-            File.WriteAllBytes(path dir fileNumber, [||])
-            { FileNumber = fileNumber; Size = 0 })
+        go (Cursor.create data) []
 
     /// コミットされたトランザクションのエントリをまとめて返す。
     /// 未コミット / 中断したものは捨てる。
@@ -245,9 +198,17 @@ module internal Wal =
             let p = path dir fileNumber
 
             if File.Exists p then
-                File.ReadAllBytes p |> readRecords |> fst |> committedEntries
+                File.ReadAllBytes p |> readRecords |> committedEntries
             else
                 [||])
+
+    let private frame (payload: byte array) =
+        Writer.build
+            [
+                Writer.uint32LE (uint32 payload.Length)
+                Writer.uint32LE (Hashing.checksum payload)
+                Writer.writeBytes payload
+            ]
 
     /// レコード列を追記する。
     /// Begin / Batch / Commit をまとめて 1 回の書き込みで書き出すので、
@@ -271,6 +232,19 @@ module internal Wal =
             { state with
                 Size = state.Size + bytes.Length
             })
+
+    /// ディレクトリ内の WAL ファイル名（復旧時に孤児を消すのに使う）。
+    let walFiles (dir: string) =
+        if Directory.Exists dir then
+            Directory.GetFiles(dir, "*.wal") |> Array.toList
+        else
+            []
+
+    /// WAL ファイルを作る。
+    let create (dir: string) (fileNumber: int64) =
+        protect (fun () ->
+            File.WriteAllBytes(path dir fileNumber, [||])
+            { FileNumber = fileNumber; Size = 0 })
 
     /// 新しい WAL ファイル番号に切り替える（flush 後に呼ぶ）。
     let rotate (state: WalState) =

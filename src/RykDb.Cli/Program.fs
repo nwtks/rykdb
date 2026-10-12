@@ -40,16 +40,23 @@ type Session(initial: Database) =
 
     member _.Close() = current.Close()
 
-let private splitStatements (input: string) =
+/// `;` 区切りの文を切り出し、空白だけの断片を捨てる。
+/// REPL の行バッファ処理とスクリプト実行が同じ処理を 2 重に持っていたので一本化した。
+let private piecesOf (input: string) =
     input.Split ';'
     |> Array.map (fun s -> s.Trim())
     |> Array.filter (fun s -> not (String.IsNullOrWhiteSpace s))
-    |> Array.toList
+
+let private splitStatements (input: string) = piecesOf input |> Array.toList
+
+/// 色を付けて 1 行出す（エラー・警告表示の定型）。
+let private coloredLine (color: ConsoleColor) (emit: string -> unit) (line: string) =
+    Console.ForegroundColor <- color
+    emit line
+    Console.ResetColor()
 
 let private printError (e: DbError) =
-    Console.ForegroundColor <- ConsoleColor.Red
-    eprintfn "エラー: %s" (DbError.toDisplayString e)
-    Console.ResetColor()
+    coloredLine ConsoleColor.Red (fun m -> eprintfn "エラー: %s" m) (DbError.toDisplayString e)
 
 let private printResult (r: StatementResult) =
     r.ToDisplayLines() |> List.iter (printfn "%s")
@@ -89,9 +96,7 @@ let private dotCommand (session: Session) (line: string) =
         printfn "(rollback しました)"
         true
     | _ ->
-        Console.ForegroundColor <- ConsoleColor.Yellow
-        printfn "未知のコマンドです(`.help` でコマンド一覧)"
-        Console.ResetColor()
+        coloredLine ConsoleColor.Yellow (fun m -> printfn "%s" m) "未知のコマンドです(`.help` でコマンド一覧)"
         true
 
 let private banner (root: string) =
@@ -137,10 +142,7 @@ let private runRepl (session: Session) =
                     else
                         buffer + " " + line
 
-                let pieces =
-                    merged.Split ';'
-                    |> Array.map (fun s -> s.Trim())
-                    |> Array.filter (fun s -> not (String.IsNullOrWhiteSpace s))
+                let pieces = piecesOf merged
 
                 if Array.isEmpty pieces then
                     buffer <- ""

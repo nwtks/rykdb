@@ -1,5 +1,5 @@
 // ===========================================================================
-// BlockCache — `(fileId, blockId) -> byte[]` の LRU（不変実装）。
+// BlockCache — (fileId, blockId) -> byte[] の LRU（不変実装）。
 // 順序は「新しい順」のリスト、要素数は Map で数える。
 // 上限はブロック数で数える（バイト数だと全ブロックの走査が必要になるため）。
 // SSTable は圧縮しないので、読んだブロックをそのままメモリに載せる。
@@ -31,7 +31,6 @@ module internal BlockCache =
             Entries = []
         }
 
-    // `key` は F# の予約語（匿名レコードのキー指定）なので名前を変える。
     let private entryKey (fileNumber: int64) (blockId: int) = fileNumber, blockId
 
     /// キャッシュを読む（あれば最近使った順に更新して返す）。

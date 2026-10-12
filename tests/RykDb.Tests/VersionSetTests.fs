@@ -8,20 +8,6 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-let private sstKey (i: int) =
-    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
-
-let private fmd (num: int64) (level: int) (lo: int) (hi: int) =
-    {
-        FileNumber = num
-        Level = level
-        Smallest = sstKey lo
-        Largest = sstKey hi
-        EntryCount = int64 (hi - lo + 1)
-        Size = int64 (hi - lo + 1) * 100L
-        MaxSeqNo = uint64 (hi + 1)
-    }
-
 let private compose (a: VersionEdit) (b: VersionEdit) =
     {
         AddedFiles = a.AddedFiles @ b.AddedFiles
@@ -60,6 +46,23 @@ let ``VersionSet: 削除でレベル構成が変わる`` () =
     Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts v)
 
 [<Fact>]
+let ``VersionEdit: 変更適用は削除後に追加する`` () =
+    let oldFile = fmd 1L 0 100 199
+    let replacement = fmd 1L 1 200 299
+    let initial = Version.empty |> Version.addFile oldFile
+
+    let updated =
+        VersionEdit.apply
+            initial
+            {
+                AddedFiles = [ replacement ]
+                DeletedFiles = [ oldFile ]
+            }
+
+    Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts updated)
+    Assert.Equal(1L, (Version.filesAt updated 1).[0].FileNumber)
+
+[<Fact>]
 let ``VersionSet: 点ルックアップの候補は新しい順`` () =
     let v =
         Version.empty
@@ -70,13 +73,13 @@ let ``VersionSet: 点ルックアップの候補は新しい順`` () =
     // キー 180 は L0 の 2 ファイルと L1 の 1 ファイルの範囲内。
     // 全レベルを「レベル昇順・番号降順」で読む（L1 までしか読まないと取りこぼす）。
     let candidates =
-        Version.filesForPointLookup v (sstKey 180) |> List.map (fun f -> f.FileNumber)
+        Version.filesForPointLookup v (intKey 180) |> List.map (fun f -> f.FileNumber)
 
     Assert.Equal<int64 list>([ 2L; 1L; 3L ], candidates)
 
     // キー 210 は L0 のファイル 1（100..199）と L1（100..199）の範囲外
     let only2 =
-        Version.filesForPointLookup v (sstKey 210) |> List.map (fun f -> f.FileNumber)
+        Version.filesForPointLookup v (intKey 210) |> List.map (fun f -> f.FileNumber)
 
     Assert.Equal<int64 list>([ 2L ], only2)
 
@@ -85,12 +88,12 @@ let ``VersionSet: 点ルックアップの候補は新しい順`` () =
         Version.empty
         |> Version.addFile (fmd 1L 0 100 199)
         |> Version.addFile (fmd 3L 1 300 399)
-        |> fun v2 -> Version.filesForPointLookup v2 (sstKey 350) |> List.map (fun f -> f.FileNumber)
+        |> fun v2 -> Version.filesForPointLookup v2 (intKey 350) |> List.map (fun f -> f.FileNumber)
 
     Assert.Equal<int64 list>([ 3L ], l1Only)
 
     // 範囲外のキーは候補なし
-    Assert.Empty(Version.filesForPointLookup v (sstKey 9999))
+    Assert.Empty(Version.filesForPointLookup v (intKey 9999))
 
 [<Fact>]
 let ``VersionSet: コンパクション候補を選ぶ`` () =

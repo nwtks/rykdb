@@ -9,11 +9,6 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-let private sstKey (i: int) =
-    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
-
-let private valOf (i: int) = [| SqlValue.Int(int64 i) |]
-
 let private withEngine (dir: string) (f: StorageEngine -> unit) =
     let engine = ok (StorageEngine.openDatabase dir)
     f engine
@@ -30,8 +25,8 @@ let private maybeFlush (engine: StorageEngine) =
 let ``StorageEngine: put して memtable から引ける`` () =
     withDir "se1" (fun dir ->
         withEngine dir (fun engine ->
-            let engine = ok (StorageEngine.put engine (sstKey 1) (valOf 1))
-            let found = ok (StorageEngine.get engine (sstKey 1))
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let found = ok (StorageEngine.get engine (intKey 1))
 
             match found with
             | Some e -> Assert.Equal<uint64>(1UL, e.SeqNo)
@@ -41,24 +36,24 @@ let ``StorageEngine: put して memtable から引ける`` () =
 let ``StorageEngine: flush すると SSTable から引ける`` () =
     withDir "se2" (fun dir ->
         withEngine dir (fun engine ->
-            let engine = ok (StorageEngine.put engine (sstKey 1) (valOf 1))
-            let engine = ok (StorageEngine.put engine (sstKey 2) (valOf 2))
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let engine = ok (StorageEngine.put engine (intKey 2) (intRow 2))
             let engine = ok (StorageEngine.flush engine)
 
             // memtable は空になり、L0 にファイルが 1 個できる
             Assert.Equal(0, engine.Mem.Count)
             Assert.Equal(1, (StorageEngine.stats engine).FileCount)
-            Assert.True((ok (StorageEngine.get engine (sstKey 1))).IsSome)
-            Assert.True((ok (StorageEngine.get engine (sstKey 2))).IsSome)))
+            Assert.True((ok (StorageEngine.get engine (intKey 1))).IsSome)
+            Assert.True((ok (StorageEngine.get engine (intKey 2))).IsSome)))
 
 [<Fact>]
 let ``StorageEngine: 削除は tombstone になる`` () =
     withDir "se3" (fun dir ->
         withEngine dir (fun engine ->
-            let engine = ok (StorageEngine.put engine (sstKey 1) (valOf 1))
-            let engine = ok (StorageEngine.delete engine (sstKey 1))
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let engine = ok (StorageEngine.delete engine (intKey 1))
 
-            match ok (StorageEngine.get engine (sstKey 1)) with
+            match ok (StorageEngine.get engine (intKey 1)) with
             | Some e -> Assert.True(e.IsDelete)
             | None -> Assert.Fail("tombstone が残るはず")))
 
@@ -67,20 +62,20 @@ let ``StorageEngine: scan はキー昇順で重複を畳む`` () =
     withDir "se4" (fun dir ->
         withEngine dir (fun engine ->
             let engine =
-                List.fold (fun e i -> ok (StorageEngine.put e (sstKey i) (valOf i))) engine [ 1; 2; 3 ]
+                List.fold (fun e i -> ok (StorageEngine.put e (intKey i) (intRow i))) engine [ 1; 2; 3 ]
 
             let got = ok (StorageEngine.scan engine [||] 0)
             Assert.Equal(3, got.Length)
-            Assert.Equal<byte array>(sstKey 1, got.[0].Key)
-            Assert.Equal<byte array>(sstKey 2, got.[1].Key)
-            Assert.Equal<byte array>(sstKey 3, got.[2].Key)))
+            Assert.Equal<byte array>(intKey 1, got.[0].Key)
+            Assert.Equal<byte array>(intKey 2, got.[1].Key)
+            Assert.Equal<byte array>(intKey 3, got.[2].Key)))
 
 [<Fact>]
 let ``StorageEngine: scan の limit が効く`` () =
     withDir "se5" (fun dir ->
         withEngine dir (fun engine ->
             let engine =
-                List.fold (fun e i -> ok (StorageEngine.put e (sstKey i) (valOf i))) engine [ 1; 2; 3; 4; 5 ]
+                List.fold (fun e i -> ok (StorageEngine.put e (intKey i) (intRow i))) engine [ 1; 2; 3; 4; 5 ]
 
             let scanned = ok (StorageEngine.scan engine [||] 2)
             Assert.Equal(2, scanned.Length)))
@@ -89,14 +84,14 @@ let ``StorageEngine: scan の limit が効く`` () =
 let ``StorageEngine: flush 済みと memtable をまたいで scan できる`` () =
     withDir "se6" (fun dir ->
         withEngine dir (fun engine ->
-            let engine = ok (StorageEngine.put engine (sstKey 1) (valOf 1))
-            let engine = ok (StorageEngine.put engine (sstKey 2) (valOf 2))
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let engine = ok (StorageEngine.put engine (intKey 2) (intRow 2))
             let engine = ok (StorageEngine.flush engine)
-            let engine = ok (StorageEngine.put engine (sstKey 3) (valOf 3))
+            let engine = ok (StorageEngine.put engine (intKey 3) (intRow 3))
 
             let got = ok (StorageEngine.scan engine [||] 0)
             Assert.Equal(3, got.Length)
-            Assert.Equal<byte array>(sstKey 3, got.[2].Key)))
+            Assert.Equal<byte array>(intKey 3, got.[2].Key)))
 
 // ------------------------------------------------------------------ 復旧
 
@@ -104,43 +99,43 @@ let ``StorageEngine: flush 済みと memtable をまたいで scan できる`` (
 let ``復旧: close して開き直すとデータが残る`` () =
     withDir "re1" (fun dir ->
         withEngine dir (fun engine ->
-            let engine = ok (StorageEngine.put engine (sstKey 1) (valOf 1))
-            let engine = ok (StorageEngine.put engine (sstKey 2) (valOf 2))
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let engine = ok (StorageEngine.put engine (intKey 2) (intRow 2))
             ok (StorageEngine.close engine))
 
         withEngine dir (fun engine ->
             // close は flush しているので L0 から引ける
             Assert.Equal(1, (StorageEngine.stats engine).FileCount)
-            Assert.True((ok (StorageEngine.get engine (sstKey 1))).IsSome)
-            Assert.True((ok (StorageEngine.get engine (sstKey 2))).IsSome)))
+            Assert.True((ok (StorageEngine.get engine (intKey 1))).IsSome)
+            Assert.True((ok (StorageEngine.get engine (intKey 2))).IsSome)))
 
 [<Fact>]
 let ``復旧: close せずにプロセスを終了しても WAL から復旧できる`` () =
     withDir "re2" (fun dir ->
         // flush しないまま「プロセス終了」を模擬する（WAL にだけ残っている）
         withEngine dir (fun engine ->
-            let _ = ok (StorageEngine.put engine (sstKey 1) (valOf 1))
-            let _ = ok (StorageEngine.put engine (sstKey 2) (valOf 2))
+            let _ = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let _ = ok (StorageEngine.put engine (intKey 2) (intRow 2))
             ())
 
         // 開き直すと WAL 再生で値が戻る
         withEngine dir (fun engine ->
-            Assert.True((ok (StorageEngine.get engine (sstKey 1))).IsSome)
-            Assert.True((ok (StorageEngine.get engine (sstKey 2))).IsSome)))
+            Assert.True((ok (StorageEngine.get engine (intKey 1))).IsSome)
+            Assert.True((ok (StorageEngine.get engine (intKey 2))).IsSome)))
 
 [<Fact>]
 let ``復旧: WAL 再生後は SeqNo が既存版より小さくならない`` () =
     withDir "re3" (fun dir ->
         withEngine dir (fun engine ->
-            let engine = ok (StorageEngine.put engine (sstKey 1) (valOf 1))
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
             let engine = ok (StorageEngine.flush engine)
-            let _ = ok (StorageEngine.put engine (sstKey 2) (valOf 2))
+            let _ = ok (StorageEngine.put engine (intKey 2) (intRow 2))
             ())
 
         withEngine dir (fun engine ->
             // 既存の L0 に入る前の seqNo より大きい値で書き再開できる
             let before = engine.NextSeqNo
-            let engine = ok (StorageEngine.put engine (sstKey 3) (valOf 3))
+            let engine = ok (StorageEngine.put engine (intKey 3) (intRow 3))
             Assert.True(engine.NextSeqNo > before)
             let engine = ok (StorageEngine.flush engine)
             let got = ok (StorageEngine.scan engine [||] 0)
@@ -150,7 +145,7 @@ let ``復旧: WAL 再生後は SeqNo が既存版より小さくならない`` (
 let ``復旧: 存在しない SSTable は Version から落とされる`` () =
     withDir "re4" (fun dir ->
         withEngine dir (fun engine ->
-            let engine = ok (StorageEngine.put engine (sstKey 1) (valOf 1))
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
             let _ = ok (StorageEngine.flush engine)
             // flush でできるファイルを消す（クラッシュの模擬）
             let ssts = Directory.GetFiles(dir, "*.sst")
@@ -161,24 +156,24 @@ let ``復旧: 存在しない SSTable は Version から落とされる`` () =
         withEngine dir (fun engine ->
             // Version から落ちているのでエラーにならない
             Assert.Equal(0, (StorageEngine.stats engine).FileCount)
-            Assert.False((ok (StorageEngine.get engine (sstKey 1))).IsSome)))
+            Assert.False((ok (StorageEngine.get engine (intKey 1))).IsSome)))
 
 [<Fact>]
 let ``復旧: 孤児の SSTable は削除される`` () =
     withDir "re5" (fun dir ->
-        withEngine dir (fun engine -> ())
+        withEngine dir (fun _ -> ())
 
         // MANIFEST に無いファイルを 1 個置いてから開く
         File.WriteAllBytes(Path.Combine(dir, "000999.sst"), [| 1uy; 2uy; 3uy |])
 
-        withEngine dir (fun engine -> Assert.False(File.Exists(Path.Combine(dir, "000999.sst")))))
+        withEngine dir (fun _ -> Assert.False(File.Exists(Path.Combine(dir, "000999.sst")))))
 
 [<Fact>]
 let ``復旧: WAL は flush 後に切り替わる`` () =
     withDir "re6" (fun dir ->
         withEngine dir (fun engine ->
             let before = engine.Wal.FileNumber
-            let engine = ok (StorageEngine.put engine (sstKey 1) (valOf 1))
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
             let engine = ok (StorageEngine.flush engine)
 
             Assert.True(engine.Wal.FileNumber > before)

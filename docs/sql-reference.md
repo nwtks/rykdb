@@ -873,25 +873,26 @@ db> .rollback
 
 ### よく見るメッセージ（実測）
 
-| SQL                                     | メッセージ                                               |
-| --------------------------------------- | -------------------------------------------------------- |
-| `SELECT 1;`                             | `FROM が必要ですが見つかりませんでした (位置 1 行)`      |
-| `SELECT * FROM t WHERE id > 1 AND;`     | `式が必要ですが見つかりませんでした (位置 1 行)`         |
-| `SELECT 'abc;`                          | `文字列が閉じられていません (位置 1 行)`                 |
-| `SELECT id FROM nosuchtable;`           | `テーブル 'nosuchtable' が存在しません`                  |
-| `SELECT nosuchcol FROM t;`              | `'nosuchcol' は列でも関数でもありません`                 |
-| `CREATE TABLE t (a INTEGER);`           | `テーブル t に主キーがありません`                        |
-| `CREATE TABLE t (...);`（重複）         | `テーブル t は既に存在します`                            |
-| `CREATE INDEX ix ON t (nosuchcol);`     | `テーブル t に列 nosuchcol がありません`                 |
-| `DROP TABLE nosuch;`                    | `テーブル nosuch が存在しません`                         |
-| `INSERT INTO t (id) VALUES (1, 2);`     | `INSERT の列数(1)と値の数(2)が合いません`                |
-| `INSERT INTO t VALUES (1, NULL, …);`    | `NOT NULL 制約に違反: t.n`                               |
-| `INSERT INTO t VALUES (5, 'z', 'abc');` | `'abc' は 'INTEGER' に変換できません`                    |
-| `SELECT (id) / 0 FROM t;`               | `0 での除算は定義されていません`                         |
-| `SELECT LENGTH(id, n) FROM t;`          | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました` |
-| `SELECT NOSUCHFN(id) FROM t;`           | `未知のスカラー関数 'NOSUCHFN' です`                     |
-| `SELECT active = 1 FROM u;`             | `型 'BOOLEAN' と 'INTEGER' は比較できません`             |
-| `SELECT ROUND(salary) FROM t;`          | `ROUND は数値を受け付けますが 100.5 です`                |
+| SQL                                       | メッセージ                                                  |
+| ----------------------------------------- | ----------------------------------------------------------- |
+| `SELECT 1;`                               | `FROM が必要ですが見つかりませんでした (位置 1 行)`         |
+| `SELECT * FROM t WHERE id > 1 AND;`       | `式が必要ですが見つかりませんでした (位置 1 行)`            |
+| `SELECT 'abc;`                            | `文字列が閉じられていません (位置 1 行)`                    |
+| `SELECT id FROM nosuchtable;`             | `テーブル 'nosuchtable' が存在しません`                     |
+| `SELECT nosuchcol FROM t;`                | `'nosuchcol' は列でも関数でもありません`                    |
+| `CREATE TABLE t (a INTEGER);`             | `テーブル t に主キーがありません`                           |
+| `CREATE TABLE t (...);`（重複）           | `テーブル t は既に存在します`                               |
+| `CREATE INDEX ix ON t (nosuchcol);`       | `テーブル t に列 nosuchcol がありません`                    |
+| `SELECT id FROM t JOIN t ON t.id = t.id;` | `テーブル t が重複しています（エイリアスを付けてください）` |
+| `DROP TABLE nosuch;`                      | `テーブル nosuch が存在しません`                            |
+| `INSERT INTO t (id) VALUES (1, 2);`       | `INSERT の列数(1)と値の数(2)が合いません`                   |
+| `INSERT INTO t VALUES (1, NULL, …);`      | `NOT NULL 制約に違反: t.n`                                  |
+| `INSERT INTO t VALUES (5, 'z', 'abc');`   | `'abc' は 'INTEGER' に変換できません`                       |
+| `SELECT (id) / 0 FROM t;`                 | `0 での除算は定義されていません`                            |
+| `SELECT LENGTH(id, n) FROM t;`            | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`    |
+| `SELECT NOSUCHFN(id) FROM t;`             | `未知のスカラー関数 'NOSUCHFN' です`                        |
+| `SELECT active = 1 FROM u;`               | `型 'BOOLEAN' と 'INTEGER' は比較できません`                |
+| `SELECT ROUND(salary) FROM t;`            | `ROUND は数値を受け付けますが 100.5 です`                   |
 
 ---
 

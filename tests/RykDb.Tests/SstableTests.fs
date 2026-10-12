@@ -9,11 +9,8 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-let private sstKey (i: int) =
-    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
-
 let private sstEntries n =
-    Array.init n (fun i -> SstEntry.make (sstKey i) (uint64 (i + 1)) (Some [| SqlValue.Int(int64 i) |]))
+    Array.init n (fun i -> SstEntry.make (intKey i) (uint64 (i + 1)) (Some [| SqlValue.Int(int64 i) |]))
     |> Array.sortWith SstEntry.compare
 
 [<Fact>]
@@ -49,12 +46,12 @@ let ``SSTable: 複数ブロックに分割される`` () =
 let ``SSTable: rangeScan は startKey 以降を limit 件`` () =
     let reader = ok (Sstable.openTable (ok (Sstable.build (sstEntries 1000) 0.01)))
 
-    let got = ok (Sstable.rangeScan reader (sstKey 500) 10) |> Seq.toArray
+    let got = ok (Sstable.rangeScan reader (intKey 500) 10) |> Seq.toArray
     Assert.Equal(10, got.Length)
-    Assert.True(got.[0].Key = sstKey 500)
+    Assert.True(got.[0].Key = intKey 500)
 
     // 終端を超える limit は実数だけ返す
-    Assert.Equal(50, (ok (Sstable.rangeScan reader (sstKey 950) 100) |> Seq.length))
+    Assert.Equal(50, (ok (Sstable.rangeScan reader (intKey 950) 100) |> Seq.length))
 
 [<Fact>]
 let ``SSTable: Bloom filter は false negative がない`` () =
@@ -67,7 +64,7 @@ let ``SSTable: Bloom filter は false negative がない`` () =
         Assert.True(Sstable.mayContain reader e.Key, "追加したキーが false negative になった")
 
     // 別キー群の誤検出率が設計値を大きく上回らない
-    let others = Array.init 20_000 (fun i -> sstKey (i + 10_000_000))
+    let others = Array.init 20_000 (fun i -> intKey (i + 10_000_000))
     let fp = others |> Array.filter (Sstable.mayContain reader) |> Array.length
     let rate = float fp / float others.Length
     Assert.True(rate <= 0.05, sprintf "誤検出率が高すぎます: %.4f" rate)
@@ -83,13 +80,11 @@ let ``SSTable: 空のテーブル`` () =
 let ``SSTable: 並びが崩れた入力はエラー`` () =
     let bad =
         [|
-            SstEntry.make (sstKey 5) 1UL (Some [| SqlValue.Int 5L |])
-            SstEntry.make (sstKey 1) 2UL (Some [| SqlValue.Int 1L |])
+            SstEntry.make (intKey 5) 1UL (Some [| SqlValue.Int 5L |])
+            SstEntry.make (intKey 1) 2UL (Some [| SqlValue.Int 1L |])
         |]
 
-    match Sstable.build bad 0.01 with
-    | Error e -> Assert.Equal<ErrorKind>(ErrorKind.InternalError, e.Kind)
-    | Ok _ -> Assert.Fail("キー順に並んでいない入力はエラーになるはず")
+    expectErrorKind ErrorKind.InternalError "キー順に並んでいない入力はエラーになるはず" (Sstable.build bad 0.01)
 
 [<Fact>]
 let ``SSTable: 壊れたデータは CorruptionError`` () =
@@ -99,17 +94,13 @@ let ``SSTable: 壊れたデータは CorruptionError`` () =
     let corrupted = Array.copy data
     corrupted.[corrupted.Length / 2] <- corrupted.[corrupted.Length / 2] ^^^ 0xFFuy
 
-    match Sstable.openTable corrupted with
-    | Error e -> Assert.Equal<ErrorKind>(ErrorKind.CorruptionError, e.Kind)
-    | Ok _ -> Assert.Fail("壊れたデータはエラーになるはず")
+    expectErrorKind ErrorKind.CorruptionError "壊れたデータはエラーになるはず" (Sstable.openTable corrupted)
 
     // 先頭 1 バイトを反転するとマジック不一致
     let badMagic = Array.copy data
     badMagic.[0] <- badMagic.[0] ^^^ 0xFFuy
 
-    match Sstable.openTable badMagic with
-    | Error e -> Assert.Equal<ErrorKind>(ErrorKind.CorruptionError, e.Kind)
-    | Ok _ -> Assert.Fail("マジック不一致はエラーになるはず")
+    expectErrorKind ErrorKind.CorruptionError "マジック不一致はエラーになるはず" (Sstable.openTable badMagic)
 
 [<Fact>]
 let ``SSTable: 全 10 型の値を往復できる`` () =
@@ -154,7 +145,7 @@ let ``SSTable: 全 10 型の値を往復できる`` () =
 let ``SSTable: 共通接頭辞が共有される`` () =
     // 共有されない場合と比べてサイズが小さいこと
     let shared =
-        Array.init 1000 (fun i -> SstEntry.make (sstKey i) 1UL (Some [| SqlValue.Int(int64 i) |]))
+        Array.init 1000 (fun i -> SstEntry.make (intKey i) 1UL (Some [| SqlValue.Int(int64 i) |]))
         |> Array.sortWith SstEntry.compare
 
     let withSharedPrefix = ok (Sstable.build shared 0.01)
@@ -180,7 +171,7 @@ let ``末尾再帰: 巨大 SSTable を構築して読み出せる`` () =
     let n = 200_000
 
     let entries =
-        Array.init n (fun i -> SstEntry.make (sstKey i) (uint64 i) (Some [| SqlValue.Int(int64 i) |]))
+        Array.init n (fun i -> SstEntry.make (intKey i) (uint64 i) (Some [| SqlValue.Int(int64 i) |]))
 
     let data = ok (Sstable.build entries 0.01)
     let reader = ok (Sstable.openTable data)
@@ -200,9 +191,9 @@ let ``末尾再帰: 巨大 SSTable を構築して読み出せる`` () =
 let ``Footer: maxSeqNo が保存・復元される`` () =
     let entries =
         [|
-            SstEntry.make (sstKey 1) 7UL (Some [| SqlValue.Int 1L |])
-            SstEntry.make (sstKey 2) 99UL (Some [| SqlValue.Int 2L |])
-            SstEntry.make (sstKey 3) 42UL (Some [| SqlValue.Int 3L |])
+            SstEntry.make (intKey 1) 7UL (Some [| SqlValue.Int 1L |])
+            SstEntry.make (intKey 2) 99UL (Some [| SqlValue.Int 2L |])
+            SstEntry.make (intKey 3) 42UL (Some [| SqlValue.Int 3L |])
         |]
 
     let bytes = ok (Sstable.build entries 0.01)

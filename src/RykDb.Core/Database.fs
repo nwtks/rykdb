@@ -63,19 +63,8 @@ type Database internal (root: string, state: DbState) =
         match target with
         | None -> Error(DbError.internalError "コミットする transaction がありません")
         | Some txn ->
-            TransactionManager.commit state.Manager txn
-            >>= fun (mgr, _commitSeq, batches) ->
-                RowStore.writeBatches state.Store batches
-                |> Result.map (fun store ->
-                    let nextState =
-                        { state with
-                            Store = store
-                            Manager = mgr
-                            Active = None
-                            Pending = None
-                        }
-
-                    Database(root, nextState))
+            DbStateOps.commitTransaction state txn
+            |> Result.map (fun nextState -> Database(root, nextState))
 
     /// ROLLBACK。バッファを捨てる。
     member this.Rollback() =
@@ -114,8 +103,9 @@ type Database internal (root: string, state: DbState) =
                         | Some p -> p
                         | None -> activeTxn
 
-                    Engine.runStatement st running stmt
-                    |> Result.bind (fun (nextState, result) ->
+                    match Engine.runStatement st running stmt with
+                    | Error e -> Error e
+                    | Ok(nextState, result) ->
                         results.Add result
 
                         let carried =
@@ -125,40 +115,32 @@ type Database internal (root: string, state: DbState) =
                             | Statement.Delete _ -> nextState
                             | _ -> { nextState with Pending = st.Pending }
 
-                        go carried tail)
+                        go carried tail
                 | None ->
                     let mgr, txn = TransactionManager.beginTxn st.Manager
 
-                    Catalog.load st.Store
-                    >>= fun fresh ->
+                    match Catalog.load st.Store with
+                    | Error e -> Error e
+                    | Ok fresh ->
                         let startState =
                             { st with
                                 Manager = mgr
                                 Catalog = fresh
                             }
 
-                        Engine.runStatement startState txn stmt
-                        >>= fun (midState, result) ->
+                        match Engine.runStatement startState txn stmt with
+                        | Error e -> Error e
+                        | Ok(midState, result) ->
                             let toCommit =
                                 match midState.Pending with
                                 | Some p -> p
                                 | None -> txn
 
-                            TransactionManager.commit midState.Manager toCommit
-                            >>= fun (mgr2, _, batches) ->
-                                RowStore.writeBatches midState.Store batches
-                                >>= fun store ->
-                                    results.Add result
-
-                                    let nextState =
-                                        { midState with
-                                            Store = store
-                                            Manager = mgr2
-                                            Active = None
-                                            Pending = None
-                                        }
-
-                                    go nextState tail
+                            match DbStateOps.commitTransaction midState toCommit with
+                            | Error e -> Error e
+                            | Ok nextState ->
+                                results.Add result
+                                go nextState tail
 
         Parser.parseStatements sql
         >>= fun stmts ->

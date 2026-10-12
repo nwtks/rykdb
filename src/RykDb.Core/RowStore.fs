@@ -86,14 +86,7 @@ module internal TableSchema =
                     match c.Columns |> List.tryFindIndex (fun col -> col.Name = name) with
                     | Some i -> ret i
                     | None -> Error(DbError.name (sprintf "主キー列 %s が定義されていません" name)))
-                |> List.fold
-                    (fun acc r ->
-                        match acc, r with
-                        | Error e, _ -> Error e
-                        | _, Error e -> Error e
-                        | Ok acc, Ok v -> Ok(v :: acc))
-                    (ret [])
-                |> Result.map List.rev
+                |> all
                 |> Result.map List.sort
                 |> Result.map (fun pk ->
                     {
@@ -114,15 +107,13 @@ module internal TableSchema =
         else
             schema.Columns
             |> List.mapi (fun i col -> (i, col))
-            |> List.fold
-                (fun acc (i, col) ->
-                    acc
-                    >>= fun () ->
-                        if row.[i] = SqlValue.Null && col.Constraint.NotNull then
-                            Error(DbError.constraintViolation (sprintf "NOT NULL 制約に違反: %s.%s" schema.Name col.Name))
-                        else
-                            ret ())
-                (ret ())
+            |> foldOk
+                (fun () (i, col) ->
+                    if row.[i] = SqlValue.Null && col.Constraint.NotNull then
+                        Error(DbError.constraintViolation (sprintf "NOT NULL 制約に違反: %s.%s" schema.Name col.Name))
+                    else
+                        ret ())
+                ()
 
     /// 主キー部分だけ取り出す。
     let primaryKeyOf (schema: TableSchema) (row: SqlValue array) =
@@ -133,28 +124,28 @@ module internal TableSchema =
 // ---------------------------------------------------------------------------
 
 module internal RowKey =
+    /// 索引列の値を列順の行から取り出す。
+    /// 索引キー（indexKey）と検索側のプレフィックス（indexPrefix）が
+    /// 同じ取り出し方をするようにここに一元化する（片方だけ変わると索引経由の参照が壊れる）。
+    let indexValues (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
+        index.Columns
+        |> List.filter (fun name -> schema.IndexOf name >= 0)
+        |> List.map (fun name -> row.[schema.IndexOf name])
+
     /// 主キーの LSM へ入れるキー。
     let primary (schema: TableSchema) (row: SqlValue array) =
         KeyBuilder.ofValues (TableSchema.primaryKeyOf schema row)
 
     /// 索引の LSM へ入れるキー（索引列 + 主キー列）。
     let indexKey (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
-        let indexCols =
-            index.Columns
-            |> List.filter (fun name -> schema.IndexOf name >= 0)
-            |> List.map (fun name -> row.[schema.IndexOf name])
-
-        KeyBuilder.ofIndexAndPrimary indexCols (TableSchema.primaryKeyOf schema row)
+        KeyBuilder.ofIndexAndPrimary (indexValues schema index row) (TableSchema.primaryKeyOf schema row)
 
     /// 索引キー（検索側）。
-    /// <paramref name="row"/> は列順の完全な行で受け取る。
+    /// row は列順の完全な行で受け取る。
     /// 列の値は「索引の列だけ」を並べたものではなく、スキーマのどの列に
     /// あるかが分かる形的（全部入り）である必要がある。
     let indexPrefix (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
-        index.Columns
-        |> List.filter (fun name -> schema.IndexOf name >= 0)
-        |> List.map (fun name -> row.[schema.IndexOf name])
-        |> KeyBuilder.ofValues
+        indexValues schema index row |> KeyBuilder.ofValues
 
 /// 書き込みの単位。(keyspace, key) -> 値（None は削除）。
 module internal Keyspace =
@@ -213,9 +204,8 @@ module internal RowStore =
     /// DB を開く（keyspace は必要に応じて作られる）。
     /// <remarks>
     /// 既存の keyspace ディレクトリはすべて開いておく。
-    /// 開かないまま後始末すると、`Database.openWith` が
-    /// 「SeqNo をどこから採番するか」を知れず、`LastCommitSeqNo = 0` から始まり、
-    /// 既にディスクにある行がすべて「未来」 として見えなくなる。
+    /// 開かないまま後始末すると、Database.openWith が「SeqNo をどこから採番するか」を知れず、
+    /// LastCommitSeqNo = 0 から始まり、既にディスクにある行がすべて「未来」 として見えなくなる。
     /// </remarks>
     let openStore (root: string) =
         protect (fun () -> Directory.CreateDirectory root |> ignore)
@@ -233,10 +223,12 @@ module internal RowStore =
                 match rest with
                 | [] -> ret acc
                 | (ks, dir) :: tail ->
-                    Manifest.ensureDirectory dir
-                    >>= fun () ->
-                        StorageEngine.openDatabase dir
-                        |> Result.bind (fun e -> go tail (Map.add ks (e, dir) acc))
+                    match Manifest.ensureDirectory dir with
+                    | Error err -> Error err
+                    | Ok() ->
+                        match StorageEngine.openDatabase dir with
+                        | Error err -> Error err
+                        | Ok e -> go tail (Map.add ks (e, dir) acc)
 
             go (known |> Array.toList) Map.empty
             |> Result.map (fun engines -> { Root = root; Engines = engines }))
@@ -251,10 +243,7 @@ module internal RowStore =
     let engine (store: RowStore) (keyspace: string) = ensure store keyspace |> Result.map fst
 
     /// keyspace ごとに Entry を書き込む。
-    /// <paramref name="batches"/> は (keyspace, Entry 配列) の列。
-    /// keyspace ごとに(engine へ渡す前に SeqNo を振り直す)。
-    /// 各ツリーは独立なので、SeqNo はツリー内で単調増加（最後の採番 +1 で十分。
-    /// keyspace ごとに Entry を書き込む。
+    /// batches は (keyspace, Entry 配列) の列。
     /// Entry の SeqNo は TransactionManager が採番した値をそのまま使う。
     /// keyspace ごとに 1 から採番し直すと MVCC が壊れる（同じ SeqNo が別のキーを占めてしまう）。
     /// keyspace ごとにエンジンが独立なので 並列に commit できるのは採番、
@@ -267,11 +256,13 @@ module internal RowStore =
                 if Array.isEmpty entries then
                     go tail current
                 else
-                    ensure current ks
-                    >>= fun (e, dir) ->
-                        StorageEngine.writeBatch e entries
-                        >>= fun updated ->
-                            let maxSeq = entries |> Array.fold (fun acc e -> max acc e.SeqNo) 0UL
+                    match ensure current ks with
+                    | Error err -> Error err
+                    | Ok(e, dir) ->
+                        match StorageEngine.writeBatch e entries with
+                        | Error err -> Error err
+                        | Ok updated ->
+                            let maxSeq = Entry.maxSeqNo entries
 
                             let bumped =
                                 { updated with
@@ -319,25 +310,20 @@ module internal RowStore =
     let compactAll (store: RowStore) =
         store.Engines
         |> Map.toList
-        |> List.fold
-            (fun acc (ks, (e, dir)) ->
-                acc
-                >>= fun current ->
-                    StorageEngine.maybeCompact e
-                    >>= fun updated ->
-                        ret
-                            { current with
-                                Engines = Map.add ks (updated, dir) current.Engines
-                            })
-            (ret store)
+        |> foldOk
+            (fun current (ks, (e, dir)) ->
+                StorageEngine.maybeCompact e
+                |> Result.map (fun updated ->
+                    { current with
+                        Engines = Map.add ks (updated, dir) current.Engines
+                    }))
+            store
 
     /// 全 keyspace を close する。
     let close (store: RowStore) =
         store.Engines
         |> Map.toList
-        |> List.fold
-            (fun acc (_, (e, _)) -> acc >>= fun () -> StorageEngine.close e |> Result.map (fun () -> ()))
-            (ret ())
+        |> foldOk (fun () (_, (e, _)) -> StorageEngine.close e |> Result.map (fun _ -> ())) ()
 
 /// DML — スキーマと transaction を使う上位操作。
 /// 1 行の書き込みは「主キーの LSM への 1 件 + 各索引の LSM への 1 件」。
@@ -351,6 +337,35 @@ module internal Dml =
     /// 索引 schema を登録する。
     let private indexSpace (index: IndexSchema) = Keyspace.index index.Name
 
+    /// 旧行と新行の差分を索引へ反映する。
+    /// 同じ索引キーなら上書きだけ行い、キーが変わった場合だけ旧キーを削除する。
+    let private applyIndexChange
+        (schema: TableSchema)
+        (txn: Transaction)
+        (oldRow: SqlValue array option)
+        (newRow: SqlValue array option)
+        =
+        schema.Indexes
+        |> foldOk
+            (fun current index ->
+                let keyFor row = RowKey.indexKey schema index row
+                let space = indexSpace index
+
+                match oldRow, newRow with
+                | None, None -> ret current
+                | None, Some row -> ret (Transaction.put current space (keyFor row) row)
+                | Some row, None -> ret (Transaction.remove current space (keyFor row))
+                | Some oldValue, Some newValue ->
+                    let oldKey = keyFor oldValue
+                    let newKey = keyFor newValue
+
+                    if oldKey = newKey then
+                        ret (Transaction.put current space newKey newValue)
+                    else
+                        let removed = Transaction.remove current space oldKey
+                        ret (Transaction.put removed space newKey newValue))
+            txn
+
     /// 1 行を transaction に積む（まだ DB には入らない）。
     /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。
     let insert (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
@@ -359,19 +374,7 @@ module internal Dml =
             let tks = tableSpace schema
             let pk = RowKey.primary schema row
             let next = Transaction.put txn tks pk row
-
-            let withIndexes =
-                schema.Indexes
-                |> List.fold
-                    (fun acc idx ->
-                        match acc with
-                        | Error e -> Error e
-                        | Ok t ->
-                            let ikey = RowKey.indexKey schema idx row
-                            Ok(Transaction.put t (indexSpace idx) ikey row))
-                    (ret next)
-
-            withIndexes
+            applyIndexChange schema next None (Some row)
 
     /// 主キーで既存行を取り出す。
     let getByPrimaryKey (store: RowStore) (schema: TableSchema) (visible: uint64 option) (key: SqlValue array) =
@@ -446,27 +449,17 @@ module internal Dml =
             | Some row ->
                 let pk = RowKey.primary schema row
                 let next = Transaction.remove txn (tableSpace schema) pk
-
-                schema.Indexes
-                |> List.fold
-                    (fun acc idx ->
-                        match acc with
-                        | Error e -> Error e
-                        | Ok t ->
-                            let ikey = RowKey.indexKey schema idx row
-                            Ok(Transaction.remove t (indexSpace idx) ikey))
-                    (ret next)
+                applyIndexChange schema next (Some row) None
 
     /// 主キーで更新する（主キーと全索引に新しい値を書き込む）。
-    /// 読み手には 1 transaction 分の原子的な書き換えとして見える。
+    /// 読み手には 1transaction 分の原子的な書き換えとして見える。
     /// 削除してから挿入してはいけない。
-    /// `Transaction.Buffers` は `Map&lt;key, value option&gt;` なので、
+    /// Transaction.Buffers は `Map<key, value option>` なので、
     /// 同一キーに「tombstone → put」と書くと最後の put だけが残る
     /// （Map の同一キーは上書きされるため tombstone が消える）。
     /// 逆に「put → tombstone」なら put が消える。
-    /// LSM は「新しい SeqNo の put が古い put を隠す」ので、
-    /// put だけを書けば更新になる。索引側は
-    /// 「古い索引キー → tombstone, 新しい索引キー → put」の 2 件が必要。
+    /// LSM は「新しい SeqNo の put が古い put を隠す」ので、 put だけを書けば更新になる。
+    /// 索引側は「古い索引キー → tombstone, 新しい索引キー → put」の 2件が必要。
     let updateByPrimaryKey
         (store: RowStore)
         (schema: TableSchema)
@@ -481,17 +474,7 @@ module internal Dml =
             >>= function
                 | None -> Error(DbError.notFound "更新する行が見つかりません")
                 | Some oldRow ->
-                    let step (t: Transaction) (idx: IndexSchema) =
-                        let oldKey = RowKey.indexKey schema idx oldRow
-                        let newKey = RowKey.indexKey schema idx newRow
-
-                        if oldKey = newKey then
-                            Transaction.put t (indexSpace idx) newKey newRow
-                        else
-                            let removed = Transaction.remove t (indexSpace idx) oldKey
-                            Transaction.put removed (indexSpace idx) newKey newRow
-
                     let tks = tableSpace schema
                     let newPk = RowKey.primary schema newRow
                     let afterMain = Transaction.put txn tks newPk newRow
-                    schema.Indexes |> List.fold step afterMain |> ret
+                    applyIndexChange schema afterMain (Some oldRow) (Some newRow)

@@ -53,37 +53,36 @@ module internal Transaction =
     /// 書き込み可能な transaction を作る。
     let create (txnId: TxnId) (snap: Snapshot) = empty txnId snap
 
+    /// バッファの 1 スロットを差し替える（`Some value` = 書き込み、`None` = 削除）。
+    /// keyspace ごとの内側 Map が無ければ空から作る。
+    /// put / remove は積む値だけが違うので、この 1 本に集約する。
+    let private setSlot (txn: Transaction) (keyspace: string) (key: byte array) (slot: SqlValue array option) =
+        let inner =
+            match Map.tryFind keyspace txn.Buffers with
+            | Some m -> m
+            | None -> Map.empty
+
+        { txn with
+            Buffers = Map.add keyspace (Map.add key slot inner) txn.Buffers
+        }
+
     /// 値を書き込む（バッファに積む）。
     let put (txn: Transaction) (keyspace: string) (key: byte array) (value: SqlValue array) =
-        let inner =
-            match Map.tryFind keyspace txn.Buffers with
-            | Some m -> m
-            | None -> Map.empty
-
-        { txn with
-            Buffers = Map.add keyspace (Map.add key (Some value) inner) txn.Buffers
-        }
+        setSlot txn keyspace key (Some value)
 
     /// 削除を書き込む（バッファに積む）。
-    let remove (txn: Transaction) (keyspace: string) (key: byte array) =
-        let inner =
-            match Map.tryFind keyspace txn.Buffers with
-            | Some m -> m
-            | None -> Map.empty
+    let remove (txn: Transaction) (keyspace: string) (key: byte array) = setSlot txn keyspace key None
 
-        { txn with
-            Buffers = Map.add keyspace (Map.add key None inner) txn.Buffers
-        }
+    /// 「(keyspace, キー)」を競合検出用の文字列 1 本に畳む。
+    /// Map のキーは byte[] でも構造比較で並ぶので、文字列化は一意性を保てる。
+    let conflictKey (keyspace: string) (key: byte array) =
+        keyspace + ":" + System.Convert.ToBase64String(key)
 
     /// 競合検出用に「(keyspace, キー)」を文字列 1 本に畳んだ集合。
-    /// Map のキーは byte[] でも構造比較で並ぶので、文字列化は一意性を保てる。
     let writeKeys (txn: Transaction) =
         txn.Buffers
         |> Map.toList
-        |> List.collect (fun (ks, m) ->
-            m
-            |> Map.toList
-            |> List.map (fun (k, _) -> ks + ":" + System.Convert.ToBase64String(k)))
+        |> List.collect (fun (ks, m) -> m |> Map.toList |> List.map (fun (k, _) -> conflictKey ks k))
         |> Set.ofList
 
     /// バッファを keyspace ごとに「SeqNo 降順で採番済みの Entry 配列」に変換する。
@@ -215,7 +214,7 @@ module internal TransactionManager =
                             entries
                             |> Array.fold
                                 (fun acc e ->
-                                    let k = ks + ":" + System.Convert.ToBase64String e.Key
+                                    let k = Transaction.conflictKey ks e.Key
 
                                     match acc |> Map.tryFind k with
                                     | Some old when old >= e.SeqNo -> acc

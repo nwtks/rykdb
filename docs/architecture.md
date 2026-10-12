@@ -160,42 +160,34 @@ flowchart TB
 
 ## 2. プロジェクト構成
 
-```
-RykDb.slnx
-├── src/RykDb.Core/     22 ファイル / 10 080 行   ← DB 本体（名前空間 RykDb.Core）
-├── src/RykDb.Cli/       1 ファイル /    238 行   ← SQL REPL
-├── src/RykDb.Server/    3 ファイル /    311 行   ← TCP サーバ + クライアント
-└── tests/RykDb.Tests/  22 ファイル /  5 945 行   ← xUnit（対象ソースと 1:1 対応）
-```
-
 `Directory.Build.props` は全プロジェクトに共通の設定を流します（`TreatWarningsAsErrors` などのゲートは §14）。
 
 ### モジュール一覧（`src/RykDb.Core/`）
 
-| ファイル           | 役割                                                                              |
-| ------------------ | --------------------------------------------------------------------------------- |
-| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`） |
-| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3 値論理）/ `SqlLiteral`                  |
-| `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`         |
-| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                    |
-| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                            |
-| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                         |
-| `Sstable.fs`       | SSTable の構築と読み取り（ブロック / index / Bloom / Footer）                     |
-| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                         |
-| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                       |
-| `Compaction.fs`    | Leveled compaction・k-way merge・版単位 GC・孤児ファイルの特定                    |
-| `BlockCache.fs`    | `(fileNumber, blockId)` → ブロックの LRU キャッシュ                               |
-| `StorageEngine.fs` | LSM ツリー 1 本の公開層（open / put / flush / scan / compact / close）            |
-| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                        |
-| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                       |
-| `Lexer.fs`         | 手書きトークナイザ（読み位置は値が持つ）                                          |
-| `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                            |
-| `RowStore.fs`      | keyspace 束と DML ヘルパ（`Transaction` のバッファへ行・索引を積む）              |
-| `Catalog.fs`       | テーブル・索引定義の永続化                                                        |
-| `Executor.fs`      | pull 演算子 `Op` / `Ops` / `Scan`・式評価 `Eval`・DML `DmlOps`                    |
-| `Planner.fs`       | 名前束縛 → 論理代数 → `Op`                                                        |
-| `Engine.fs`        | 文の実行（`Ddl` / `Engine.runStatement`）                                         |
-| `Database.fs`      | 公開 API（不変ハンドル・transaction・`StatementResult`）                          |
+| ファイル           | 役割                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------ |
+| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）          |
+| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3 値論理）/ `SqlLiteral` / `Bytes`（バイト列比較） |
+| `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`                  |
+| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                             |
+| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                     |
+| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                  |
+| `Sstable.fs`       | SSTable の構築・読み取り・k-way merge（ブロック / index / Bloom / Footer）                 |
+| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                  |
+| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                |
+| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                          |
+| `BlockCache.fs`    | `(fileNumber, blockId)` → ブロックの LRU キャッシュ                                        |
+| `StorageEngine.fs` | LSM ツリー 1 本の公開層（open / put / flush / scan / compact / close）                     |
+| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                 |
+| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                |
+| `Lexer.fs`         | 手書きトークナイザ（読み位置は値が持つ）                                                   |
+| `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                     |
+| `RowStore.fs`      | keyspace 束と DML ヘルパ（`Transaction` のバッファへ行・索引を積む）                       |
+| `Catalog.fs`       | テーブル・索引定義の永続化                                                                 |
+| `Executor.fs`      | pull 演算子 `Op` / `Ops` / `Scan`・式評価 `Eval`・DML `DmlOps`                             |
+| `Planner.fs`       | 名前束縛 → 論理代数 → `Op`                                                                 |
+| `Engine.fs`        | 文の実行（`Ddl` / `Engine.runStatement`）                                                  |
+| `Database.fs`      | 公開 API（不変ハンドル・transaction・`StatementResult`）                                   |
 
 ### F# のコンパイル順
 
@@ -279,15 +271,25 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
   1 つでも外れると FS3569 になり、`TreatWarningsAsErrors` のせいでビルドエラーになる
   （違反箇所の一覧は [`gotchas.md`](gotchas.md) §8.16）。
   構造上末尾にできないものは**付けない理由を呼び出しの直前にコメントで残す**:
-  - `Eval.eval` / `Eval.inferType` / `collectAggs` / `rewriteAggs` / `hasAggregate` —
+  - `Eval.inferType` / `collectAggs` / `rewriteAggs` / `hasAggregate` —
     結果を `>>=` / `match` で「消費してから」分岐するため末尾にならない。
     深さは式の深さ（`MaxExpressionDepth = 200`）で頭打ちになる。
-  - `Planner.exec` — 子ノードの `Result` を `Result.map` / `>>=` で消費する。
+  - `Planner.exec` — 包み（`Filter` / `Aggregate` / `Having` / `Distinct` / `Sort` /
+    `Limit` / `Project`）は子の `Result` を `Result.map` / `>>=` で消費する。
+    深さは 1 文が作るラッパの数（一定）で頭打ち。
+    **`Join` だけは左深い木になるので `descend`（積む側・左スパインを降りる）/
+    `unwind`（回す側・引き返して結合する）に分けて末尾再帰にした**（JOIN 数で
+    スタックが積もらない。左へは「右テーブルを除いたスキーマ」を渡す。`gotchas.md` §3.5）。
   - `Op.map` / `Op.take` / `Op.append` — 再帰が `Compute` の中身の中にある。
     次の 1 行を取りに来たときに 1 段だけ評価されるのでフレームは積み上がらない。
   - 逆に**要素数に比例する反復は `match` に直して末尾再帰にした**
     （`IN` の候補リストと `CASE` の WHEN 節。`eval ... >>= fun` だと候補の数だけスタックが積まれる）。
-    `Catalog.readColumns` / `readNames` は `acc` を積む形にした。
+    カーソルからの数え上げ読み出し（`Catalog` の列定義・名前、`Wal` のバッチ）は
+    `Read.readItems`（Serialization.fs）に集約し、`match` の末尾再帰で回す。
+  - これをさらに進めて **`Eval.eval` は継続を値（`Kont`）として持つ評価機 `Eval.step`** にした
+    （`[<TailCall>]` 付き。CPS だが継続はラムダではなくタグ付きの値）。
+    再帰は `step` の自己再帰だけなので全末尾位置になり、
+    式の深さ・`IN` の候補数に依存せずスタックは一定（継続はヒープのリストに積む）。
 
 ### 3.4 予約語に注意
 
@@ -315,30 +317,6 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 式構文規則は定義上お互いを呼び合う（`parseExpr → parseOr → parseAnd → … → parsePrimary`）ため、
 普通の再帰下降では相互再帰が必ず非末尾再帰になります。
 引数を継続に変えて末尾化しています。
-
-```fsharp
-type private K<'r> = Expr -> PState -> Result<'r, DbError>
-
-[<TailCall>]
-let rec private parseExprC<'r> (k: K<'r>) (st: PState) : Result<'r, DbError> =
-    // >>= で繋ぐとラムダが 1 フレーム残るので、match に書いて直接末尾呼び出しにする。
-    match enterExpr st with
-    | Error e -> Error e
-    | Ok st -> parseOrC (fun e st -> k e (exitExpr st)) st   // 末尾位置
-
-and [<TailCall>] private parseOrC<'r> (k: K<'r>) (st: PState) : Result<'r, DbError> =
-    parseAndC (fun left st -> parseOrLoop k left st.Depth st) st
-
-// ループ本体は名前の付いた and メンバーに持たせる（ラムダ内の同グループ呼び出しは非末尾になる）。
-and [<TailCall>] private parseOrLoop<'r> (k: K<'r>) left baseDepth (st: PState) =
-    if isKeyword st "OR" then
-        match enterExpr (advance st) with
-        | Error e -> Error e
-        | Ok st ->
-            parseAndC (fun right st -> parseOrLoop k (Expr.Binary(BinaryOp.Or, left, right)) baseDepth st) st
-    else
-        k left { st with Depth = baseDepth }
-```
 
 **継続を名前付きメンバーに hoist するのが要点**です。
 ラムダで書くとその中の同グループ呼び出しが「末尾以外」に見え、`[<TailCall>]` を付けた関数に FS3569 が出ます。
@@ -511,6 +489,8 @@ hash join / index nested loop など**結合アルゴリズムの自動選択は
 - `Having` は集約後の行を**位置で読み替えて**から評価します（`Ops.havingFilter`）。
 - `Limit` は `Op.skip`（OFFSET）→ `Op.take`（LIMIT）の順、`limit = 0` は「LIMIT なし」です。
 - 最後に `Plan.runSelect` が `Op.toArray` で行を集め、ヘッダは `Schema.projectHeader`（別名優先、`*` は列名）で組み立てます。
+  `*` / `t.*` の列展開は `Schema.expandStar` に一本化しています（ヘッダと射影の式が同じ列を共有するため）。
+  `*` は修飾なしの列名、`t.*` は修飾つきの表示名で出します。
 
 ### 6.2 Executor — pull 演算子
 
@@ -1213,6 +1193,11 @@ dotnet fantomas src/ tests/   # 整形
    既知分は `tools/TailAudit/TailAudit.baseline` と差分し、**新規があれば exit 1**。
    （ベースラインは `dotnet run --project tools/TailAudit -- --update` で生成する。
    **未生成なら全件を新規とみなして exit 1 になる**ので、内容を確認のうえ生成しておく。）
+   - 非末尾は**「ラムダ内 / 直接」の内訳**を表示する。
+     ラムダ内 = `Compute` / `pull` 継続・CPS 継続（深度は 1 行ごと / `MaxExpressionDepth` で頭打ち）。
+     直接 = 監査部・引数など「結果を消費してから」型（**本来の末尾化候補**）。
+     ベースラインのキーには含めない（内訳が変わっても差分化しないため）。
+   - pipe の**関数側**は末尾として数える（`x \|> f a` = `f a x`）。値側は非末尾のまま。
 3. **テスト** — スタック深度の実測（`末尾再帰:` 系テスト）。
 
 `[<TailCall>]` は構文上の検査にすぎません。

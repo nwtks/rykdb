@@ -26,6 +26,7 @@ dotnet test
   ② `dotnet run --project tools/TailAudit` = 属性の無い関数（ローカル `let rec` 含む）の構文木検査
   （既知分は `tools/TailAudit/TailAudit.baseline` と差分、新規があれば exit 1）
   ③ `dotnet test` = スタック深度の実測（`末尾再帰:` 系）。手順は `tools/TailAudit/Program.fs` のヘッダ参照。
+  非末尾は**「ラムダ内 / 直接」の内訳**を出す（直接が末尾化候補。ラムダ内は深度が頭打ち）。
 
 ## コンパイル順（F# は順序依存）
 

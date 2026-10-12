@@ -9,28 +9,32 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-let private sstKey (i: int) =
-    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
+/// ディレクトリを用意して WAL を 1 つ作る（全テスト共通の土台）。
+let private freshWal (dir: string) =
+    ok (Manifest.ensureDirectory dir)
+    ok (Wal.create dir 1L)
 
-let private valOf (i: int) = [| SqlValue.Int(int64 i) |]
+/// `Begin / Batch / Commit` の 3 レコード（1 トランザクション分）。
+let private commitRecords (txnId: uint64) (entries: Entry array) =
+    [
+        WalRecord.Begin txnId
+        WalRecord.Batch(txnId, entries)
+        WalRecord.Commit txnId
+    ]
 
 [<Fact>]
 let ``WAL: 往復する`` () =
     withDir "wal" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        let w0 = ok (Wal.create dir 1L)
+        let w0 = freshWal dir
 
         let entries =
             [|
-                Entry.put (sstKey 1) 1UL (valOf 1)
-                Entry.put (sstKey 2) 2UL (valOf 2)
-                Entry.delete (sstKey 3) 3UL
+                Entry.put (intKey 1) 1UL (intRow 1)
+                Entry.put (intKey 2) 2UL (intRow 2)
+                Entry.delete (intKey 3) 3UL
             |]
 
-        let records =
-            [ WalRecord.Begin 1UL; WalRecord.Batch(1UL, entries); WalRecord.Commit 1UL ]
-
-        let w1 = ok (Wal.append w0 dir records)
+        let w1 = ok (Wal.append w0 dir (commitRecords 1UL entries))
         let w2 = ok (Wal.append w1 dir [ WalRecord.Begin 2UL; WalRecord.Abort 2UL ])
 
         // 中断した transaction は捨てられ、コミットした分だけ残る
@@ -43,10 +47,9 @@ let ``WAL: 往復する`` () =
 [<Fact>]
 let ``WAL: 未コミットは再生しない`` () =
     withDir "wal2" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        let w0 = ok (Wal.create dir 1L)
+        let w0 = freshWal dir
         // Commit を書かずに終わる = クラッシュした状態
-        let entries = [| Entry.put (sstKey 9) 1UL (valOf 9) |]
+        let entries = [| Entry.put (intKey 9) 1UL (intRow 9) |]
 
         let _w =
             ok (Wal.append w0 dir [ WalRecord.Begin 1UL; WalRecord.Batch(1UL, entries) ])
@@ -56,12 +59,10 @@ let ``WAL: 未コミットは再生しない`` () =
 [<Fact>]
 let ``WAL: 書きかけレコードは読み飛ばす`` () =
     withDir "wal3" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        let w0 = ok (Wal.create dir 1L)
-        let entries = [| Entry.put (sstKey 1) 1UL (valOf 1) |]
+        let w0 = freshWal dir
+        let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
 
-        let w1 =
-            ok (Wal.append w0 dir [ WalRecord.Begin 1UL; WalRecord.Batch(1UL, entries); WalRecord.Commit 1UL ])
+        let w1 = ok (Wal.append w0 dir (commitRecords 1UL entries))
 
         // 末尾に壊れたレコードを書き足す（torn write の再現）
         let path = Wal.path dir w1.FileNumber
@@ -73,16 +74,13 @@ let ``WAL: 書きかけレコードは読み飛ばす`` () =
 [<Fact>]
 let ``WAL: チェックサム不一致は打ち切る`` () =
     withDir "wal4" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        let w0 = ok (Wal.create dir 1L)
-        let first = [| Entry.put (sstKey 1) 1UL (valOf 1) |]
-        let second = [| Entry.put (sstKey 2) 2UL (valOf 2) |]
+        let w0 = freshWal dir
+        let first = [| Entry.put (intKey 1) 1UL (intRow 1) |]
+        let second = [| Entry.put (intKey 2) 2UL (intRow 2) |]
 
-        let wA =
-            ok (Wal.append w0 dir [ WalRecord.Begin 1UL; WalRecord.Batch(1UL, first); WalRecord.Commit 1UL ])
+        let wA = ok (Wal.append w0 dir (commitRecords 1UL first))
 
-        let w1 =
-            ok (Wal.append w0 dir [ WalRecord.Begin 2UL; WalRecord.Batch(2UL, second); WalRecord.Commit 2UL ])
+        let w1 = ok (Wal.append w0 dir (commitRecords 2UL second))
 
         // 2 つ目のレコードのバイトを 1 つだけ壊す
         let path = Wal.path dir w1.FileNumber
@@ -96,12 +94,10 @@ let ``WAL: チェックサム不一致は打ち切る`` () =
 [<Fact>]
 let ``WAL: rotate で番号が進み、新しいファイルへ追記できる`` () =
     withDir "wal-rotate" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        let w0 = ok (Wal.create dir 1L)
-        let first = [| Entry.put (sstKey 1) 1UL (valOf 1) |]
+        let w0 = freshWal dir
+        let first = [| Entry.put (intKey 1) 1UL (intRow 1) |]
 
-        let w1 =
-            ok (Wal.append w0 dir [ WalRecord.Begin 1UL; WalRecord.Batch(1UL, first); WalRecord.Commit 1UL ])
+        let w1 = ok (Wal.append w0 dir (commitRecords 1UL first))
 
         // append は書き込んだバイト数を Size に積む
         Assert.True(w1.Size > w0.Size, "append しても Size が増えていない")
@@ -110,10 +106,9 @@ let ``WAL: rotate で番号が進み、新しいファイルへ追記できる``
         Assert.Equal(2L, w2.FileNumber)
         Assert.Equal(0, w2.Size)
 
-        let second = [| Entry.put (sstKey 2) 2UL (valOf 2) |]
+        let second = [| Entry.put (intKey 2) 2UL (intRow 2) |]
 
-        let _w3 =
-            ok (Wal.append w2 dir [ WalRecord.Begin 2UL; WalRecord.Batch(2UL, second); WalRecord.Commit 2UL ])
+        let _w3 = ok (Wal.append w2 dir (commitRecords 2UL second))
 
         // 古い WAL はそのまま残り、新しい WAL にだけ新しい内容が入る
         Assert.Equal(1, (ok (Wal.read dir 1L)).Length)
@@ -126,12 +121,11 @@ let ``WAL: rotate で番号が進み、新しいファイルへ追記できる``
 [<Fact>]
 let ``WAL: 複数トランザクションはコミットした分だけ、コミット順に再生される`` () =
     withDir "wal-txn" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        let w0 = ok (Wal.create dir 1L)
+        let w0 = freshWal dir
 
-        let t1 = [| Entry.put (sstKey 1) 1UL (valOf 1) |]
-        let t2 = [| Entry.put (sstKey 2) 2UL (valOf 2) |]
-        let t3 = [| Entry.put (sstKey 3) 3UL (valOf 3) |]
+        let t1 = [| Entry.put (intKey 1) 1UL (intRow 1) |]
+        let t2 = [| Entry.put (intKey 2) 2UL (intRow 2) |]
+        let t3 = [| Entry.put (intKey 3) 3UL (intRow 3) |]
 
         // t1 は中断、t2 と t3 はコミット。記録は Begin/Batch が混在する
         let _w =
@@ -159,12 +153,10 @@ let ``WAL: 複数トランザクションはコミットした分だけ、コミ
 [<Fact>]
 let ``WAL: readRaw は未コミットも含めた生の記録を返す`` () =
     withDir "wal-raw" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        let w0 = ok (Wal.create dir 1L)
-        let entries = [| Entry.put (sstKey 1) 1UL (valOf 1) |]
+        let w0 = freshWal dir
+        let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
 
-        let w1 =
-            ok (Wal.append w0 dir [ WalRecord.Begin 1UL; WalRecord.Batch(1UL, entries); WalRecord.Commit 1UL ])
+        let w1 = ok (Wal.append w0 dir (commitRecords 1UL entries))
 
         // コミットしないトランザクションを追記する
         let _w2 =
@@ -176,12 +168,10 @@ let ``WAL: readRaw は未コミットも含めた生の記録を返す`` () =
 [<Fact>]
 let ``WAL: 同じ番号で作り直すと内容を捨ててやり直す`` () =
     withDir "wal-recreate" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        let w0 = ok (Wal.create dir 1L)
-        let entries = [| Entry.put (sstKey 1) 1UL (valOf 1) |]
+        let w0 = freshWal dir
+        let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
 
-        let _w =
-            ok (Wal.append w0 dir [ WalRecord.Begin 1UL; WalRecord.Batch(1UL, entries); WalRecord.Commit 1UL ])
+        let _w = ok (Wal.append w0 dir (commitRecords 1UL entries))
 
         Assert.Equal(1, (ok (Wal.read dir 1L)).Length)
 

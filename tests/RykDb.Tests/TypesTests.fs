@@ -49,13 +49,9 @@ let ``値: NaN は正の quiet NaN に正規化される`` () =
 
 [<Fact>]
 let ``値: 比較できない型の組み合わせは typeError`` () =
-    match SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.Text "1") with
-    | Error e -> Assert.Equal<ErrorKind>(ErrorKind.TypeError, e.Kind)
-    | Ok _ -> Assert.Fail("型エラーになるはず")
+    expectErrorKind ErrorKind.TypeError "型エラーになるはず" (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.Text "1"))
 
-    match SqlValue.compareValues (SqlValue.Bool true) (SqlValue.Int 1L) with
-    | Error e -> Assert.Equal<ErrorKind>(ErrorKind.TypeError, e.Kind)
-    | Ok _ -> Assert.Fail("型エラーになるはず")
+    expectErrorKind ErrorKind.TypeError "型エラーになるはず" (SqlValue.compareValues (SqlValue.Bool true) (SqlValue.Int 1L))
 
 [<Fact>]
 let ``値: 数値 3 種と日時は相互に比較できる`` () =
@@ -104,6 +100,4 @@ let ``値: 型タグの往復と未知タグの扱い`` () =
     |> List.pairwise
     |> List.iter (fun (a, b) -> Assert.True(a < b, "型タグが単調増加でない"))
 
-    match DataType.fromTag 200uy with
-    | Error e -> Assert.Equal<ErrorKind>(ErrorKind.CorruptionError, e.Kind)
-    | Ok _ -> Assert.Fail("未知のタグは CorruptionError になるはず")
+    expectErrorKind ErrorKind.CorruptionError "未知のタグは CorruptionError になるはず" (DataType.fromTag 200uy)

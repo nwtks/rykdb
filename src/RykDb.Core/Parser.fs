@@ -23,28 +23,35 @@ module internal Parser =
     [<Literal>]
     let MaxExpressionDepth = 200
 
+    /// 型名の綴り → DataType の表。綴りを増やすときはここだけ直す
+    /// （型名セットと parseDataType の両方がこの表から導出される）。
+    let private typeTable =
+        [
+            "INTEGER", DataType.Integer
+            "INT", DataType.Integer
+            "BIGINT", DataType.Integer
+            "REAL", DataType.Real
+            "DOUBLE", DataType.Real
+            "TEXT", DataType.Text
+            "VARCHAR", DataType.Text
+            "CHAR", DataType.Text
+            "BLOB", DataType.Blob
+            "BOOLEAN", DataType.Boolean
+            "BOOL", DataType.Boolean
+            "DATE", DataType.Date
+            "TIMESTAMP", DataType.Timestamp
+            "DATETIME", DataType.Timestamp
+            "DECIMAL", DataType.Decimal
+            "NUMERIC", DataType.Decimal
+            "UUID", DataType.Uuid
+        ]
+
     /// 型名として認識される綴り。予約語扱いにはしない。
-    let private typeNames =
-        Set.ofList
-            [
-                "INTEGER"
-                "INT"
-                "BIGINT"
-                "REAL"
-                "DOUBLE"
-                "TEXT"
-                "VARCHAR"
-                "CHAR"
-                "BLOB"
-                "BOOLEAN"
-                "BOOL"
-                "DATE"
-                "TIMESTAMP"
-                "DATETIME"
-                "DECIMAL"
-                "NUMERIC"
-                "UUID"
-            ]
+    let private typeNames = typeTable |> List.map fst |> Set.ofList
+
+    /// 綴り（大文字）から DataType へ。未知なら None。
+    let private dataTypeOfName (name: string) =
+        typeTable |> List.tryFind (fun (n, _) -> n = name) |> Option.map snd
 
     // -----------------------------------------------------------------------
     // 基本操作
@@ -138,55 +145,11 @@ module internal Parser =
     let private parseDataType (st: PState) =
         match peek st with
         | Ident s ->
-            let upper = s.ToUpperInvariant()
-
-            let dataType =
-                match upper with
-                | "INTEGER"
-                | "INT"
-                | "BIGINT" -> Some DataType.Integer
-                | "REAL"
-                | "DOUBLE" -> Some DataType.Real
-                | "TEXT"
-                | "VARCHAR"
-                | "CHAR" -> Some DataType.Text
-                | "BLOB" -> Some DataType.Blob
-                | "BOOLEAN"
-                | "BOOL" -> Some DataType.Boolean
-                | "DATE" -> Some DataType.Date
-                | "TIMESTAMP"
-                | "DATETIME" -> Some DataType.Timestamp
-                | "DECIMAL"
-                | "NUMERIC" -> Some DataType.Decimal
-                | "UUID" -> Some DataType.Uuid
-                | _ -> None
-
-            match dataType with
+            match dataTypeOfName (s.ToUpperInvariant()) with
             | Some dt -> ret (dt, advance st)
             | None -> fail st (sprintf "未知の型 '%s'" s)
         | Keyword k when Set.contains k typeNames ->
-            let dataType =
-                match k with
-                | "INTEGER"
-                | "INT"
-                | "BIGINT" -> Some DataType.Integer
-                | "REAL"
-                | "DOUBLE" -> Some DataType.Real
-                | "TEXT"
-                | "VARCHAR"
-                | "CHAR" -> Some DataType.Text
-                | "BLOB" -> Some DataType.Blob
-                | "BOOLEAN"
-                | "BOOL" -> Some DataType.Boolean
-                | "DATE" -> Some DataType.Date
-                | "TIMESTAMP"
-                | "DATETIME" -> Some DataType.Timestamp
-                | "DECIMAL"
-                | "NUMERIC" -> Some DataType.Decimal
-                | "UUID" -> Some DataType.Uuid
-                | _ -> None
-
-            match dataType with
+            match dataTypeOfName k with
             | Some dt -> ret (dt, advance st)
             | None -> fail st (sprintf "未知の型 '%s'" k)
         | _ -> fail st "型名が必要です"
@@ -232,12 +195,13 @@ module internal Parser =
         | Error e -> Error e
         | Ok st -> parseOrC (fun e st -> k e (exitExpr st)) st
 
-    and private parseCallBodyArgs acc (st: PState) =
+    /// カンマ区切りの式リストを読み、閉じ括弧 ")" まで消費する。関数引数と IN リストで共用する。
+    and private parseExprListToParen acc (st: PState) =
         match parseExprC retE st with
         | Error e -> Error e
         | Ok(e, st) ->
             if isSymbol st "," then
-                parseCallBodyArgs (e :: acc) (advance st)
+                parseExprListToParen (e :: acc) (advance st)
             else
                 match expectSymbol st ")" with
                 | Error e -> Error e
@@ -261,7 +225,7 @@ module internal Parser =
                 let distinct = upper = "COUNT" && isKeyword st "DISTINCT"
                 let st = if distinct then advance st else st
 
-                match parseCallBodyArgs [] st with
+                match parseExprListToParen [] st with
                 | Error e -> Error e
                 | Ok(argList, st) ->
                     match AggFunc.tryParse upper with
@@ -602,12 +566,15 @@ module internal Parser =
                 st
 
         if isKeyword st "JOIN" then
-            parseTableRef (advance st)
-            >>= fun (tbl, st) ->
-                expectKeyword st "ON"
-                >>= fun (_, st) ->
-                    parseExprC retE st
-                    >>= fun (on, st) -> parseJoins st ({ Kind = kind; Table = tbl; On = on } :: acc)
+            match parseTableRef (advance st) with
+            | Error e -> Error e
+            | Ok(tbl, st) ->
+                match expectKeyword st "ON" with
+                | Error e -> Error e
+                | Ok(_, st) ->
+                    match parseExprC retE st with
+                    | Error e -> Error e
+                    | Ok(on, st) -> parseJoins st ({ Kind = kind; Table = tbl; On = on } :: acc)
         else
             ret (List.rev acc, st)
 
@@ -804,10 +771,12 @@ module internal Parser =
                         match parseIdent st with
                         | Error e -> Error e
                         | Ok(col, st) ->
-                            expectSymbol st "="
-                            >>= fun (_, st) ->
-                                parseExpr st
-                                >>= fun (e, st) ->
+                            match expectSymbol st "=" with
+                            | Error e -> Error e
+                            | Ok(_, st) ->
+                                match parseExpr st with
+                                | Error e -> Error e
+                                | Ok(e, st) ->
                                     if isSymbol st "," then
                                         assigns ((col, e) :: acc) (advance st)
                                     else
