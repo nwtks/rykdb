@@ -11,7 +11,6 @@
 //   Begin 以降は Commit / Rollback まで同じ transaction。
 //   snapshot は transaction 開始時に固定(repeatable read)。
 // * DDL は即時反映（カタログを書き換えた時点で見える）。
-// 使い方は docs/architecture.md §12.1、transaction は §8.5。
 // ===========================================================================
 
 namespace RykDb.Core

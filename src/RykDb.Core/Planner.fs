@@ -273,7 +273,7 @@ module internal Optimizer =
     /// 集約・HAVING を掛ける。
     /// <remarks>
     /// GROUP BY / HAVING / 集約の引数 / ORDER BY をすべて修飾名へ直す。
-    /// パーサは裸の名前（`age`）を Name として作るので、ここを通さないと実行時に「列 t.age が存在しません」になる。
+    /// パーサは裸の名前（`age`）を Name として作るので、ここを通さないと実行時に列を解決できずエラーになる。
     /// </remarks>
     let private applyAggregate (schema: Schema) (tree: Logical) (stmt: SelectStatement) =
         let selectExprs =
@@ -481,7 +481,7 @@ module internal Optimizer =
     /// 論理代数ノードの「出力スキーマ」を求める。
     /// <remarks>
     /// 集約の後の行は「groupBy の値 ++ 各集約の結果」なので、
-    /// 入力スキーマ（テーブル定義）をそのまま流すと「列 t.age が存在しません」で落ちる。
+    /// 入力スキーマ（テーブル定義）をそのまま流すと列を解決できずに落ちる。
     /// </remarks>
     let private outputOf (tree: Logical) (inSchema: Schema) =
         match stripWrappers tree with

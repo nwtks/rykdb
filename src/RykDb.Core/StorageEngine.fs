@@ -1,10 +1,10 @@
 // ===========================================================================
-// StorageEngine — LSM ツリーを 1 本公開する層（keyspace 1 本 = ここが 1 本）。
+// StorageEngine — LSM ツリーを 1本公開する層（keyspace 1本 = ここが 1本）。
 //
 // 探索は「memtable -> L0（新しい順）-> 各レベル（新しい順）」の順。
 // 各ステップで Bloom filter と VersionSet の key range で枝刈りする。
 // 可視性（SeqNo <= snapshot）は getAt / scanAt の visible フィルタで判定する。
-// 制約: scan は結果を全部メモリに載せて返す（architecture.md §15.2）。
+// 制約: scan は結果を全部メモリに載せて返す。
 // ===========================================================================
 
 namespace RykDb.Core

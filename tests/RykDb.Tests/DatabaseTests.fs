@@ -326,7 +326,7 @@ let ``末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`` () =
 let ``Database: エイリアスでの自己結合が行を返す`` () =
     // JOIN の対応付けを RealName で探していたころは、`FROM t AS x JOIN t AS y` が
     // 先頭の t にヒットして JOIN が丸ごと省略され、
-    // `列インデックス 3 が範囲外です（2 列中）: q.v` で落ちていた。
+    // 列インデックスが範囲外（2 列中）になって落ちていた。
     withDb "selfjoin" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"

@@ -212,7 +212,6 @@ module internal Read =
 ///   * 数値・日付・時刻は順序を保った整数に写像してビッグエンディアンで書く
 ///   * TEXT / BLOB の 0x00 は 0x00 0xFF に escape し終端に 0x00 を置く
 ///     → 生の前方一致がそのまま正しい接頭辞一致になる
-/// 詳細と検証例は docs/architecture.md §5.2。
 module internal OrderPreserving =
     /// 型タグ。順序は SQL の照合順に従う。
     type Tag =

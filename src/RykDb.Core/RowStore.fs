@@ -7,7 +7,6 @@
 //   ディレクトリ: <root>/<base64(keyspace)>/
 //
 // 行は列順の SqlValue 配列。保存時 ValueCodec でバイト列に落とす。
-// 詳細は docs/architecture.md §7.1。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -328,8 +327,8 @@ module internal RowStore =
 /// DML — スキーマと transaction を使う上位操作。
 /// 1 行の書き込みは「主キーの LSM への 1 件 + 各索引の LSM への 1 件」。
 /// これらは異なる keyspace なので並列に commit できる。
-/// 削除は主キー + 全索引に tombstone を書く（書き漏らすと索引経由で
-/// 消えた行が復活する）。詳細は docs/architecture.md §7.2。
+/// 削除は主キー + 全索引に tombstone を書く
+/// （書き漏らすと索引経由で消えた行が復活する）。
 module internal Dml =
     /// テーブルの keyspace 名（"t:&lt;table&gt;"）。
     let private tableSpace (schema: TableSchema) = Keyspace.table schema.Name

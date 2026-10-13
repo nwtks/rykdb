@@ -35,7 +35,7 @@ type internal FileMetaData =
 module internal FileMetaData =
     /// キー範囲も件数も未確定の空メタデータ。
     /// デコード途中の「番号とレベルだけ分かった」状態や、
-    /// 「compaction はやりませんでした」の報告に使う（フィールドは上書きする）。
+    /// 「compaction なし」の報告に使う（フィールドは上書きする）。
     let zero =
         {
             FileNumber = 0L

@@ -1,12 +1,10 @@
 // ===========================================================================
 // Compaction — Leveled compaction と不要バージョンの回収（GC）。
 //
-// L0 はキー域が重なる複数ファイル、L1 以降は「1 ファイル = 1 キー域」。
-// 1 回の compaction: 入力選択 → k-way merge → gc（同一キーを最新 1 件に畳み、
-// 全 active snapshot より小さい版を捨てる）→ 出力を L+1 に書き、
-// MANIFEST に記録してから入力を削除する。
-// 詳細は docs/architecture.md §9.7、制約（入力をメモリへ全読み・同期実行）は
-// §15.2 を参照。
+// L0 はキー域が重なる複数ファイル、L1 以降は「1ファイル = 1キー域」。
+// 1回の compaction: 入力選択 → k-way merge →
+// gc（同一キーを最新 1件に畳み、全 active snapshot より小さい版を捨てる）→
+// 出力を L+1 に書き、 MANIFEST に記録してから入力を削除する。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -18,7 +16,7 @@ type internal CompactionOptions =
     {
         /// 各レベルの上限。L1 から L6 まで 10 倍ずつ。
         MaxLevelBytes: int64 array
-        /// 1 回の compaction で入力するファイル数の上限
+        /// 1回の compaction で入力するファイル数の上限
         MaxInputFiles: int
         /// このレベル以下（最下位側）へ降ろす compaction で tombstone を消すか（既定値 = 最下位）
         DropTombstonesBelowLevel: int

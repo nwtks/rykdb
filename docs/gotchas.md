@@ -1,7 +1,7 @@
 # 開発で踏んだ落とし穴
 
-このプロジェクトで**実際に踏んで直した**バグと、その原因・対策をまとめたものです。
-「設計の意図」ではなく「間違えると何が壊れるか」を軸にした記録です。
+このプロジェクトで**実際に踏んで直した**バグと、その原因・対策をまとめたもの。
+「設計の意図」ではなく「間違えると何が壊れるか」を軸にした記録。
 
 ---
 
@@ -31,13 +31,13 @@
 | 4   | **O(n) な操作の混入**       | 点検索 43 ms                                       | `rangeScan` を点検索に使った                                    |
 | 5   | **F# の型推論の壊れ**       | 謎の FS0001 / FS0072                               | 引数の型注釈・スコープ                                          |
 
-以下、それぞれを詳述します。
+以下、それぞれを詳述する。
 
 ---
 
 ## 2. pull 演算子（`Op`）の罠
 
-`Executor.fs` の `Op` は Pitt–Patel 型 pull 演算子です。
+`Executor.fs` の `Op` は Pitt–Patel 型 pull 演算子。
 
 ```fsharp
 type Op =
@@ -48,8 +48,8 @@ type Op =
 
 ### 2.1 `Step` は遅延ではない（最重要）
 
-`Step(row, nextOp)` の **`nextOp` は「次の行の値を返す」のではなく「継続を表す値」**です。
-F# は評価が厳しいので `Step(f x, g y)` と書くと **`g y` が先に計算されます**。
+`Step(row, nextOp)` の **`nextOp` は「次の行の値を返す」のではなく「継続を表す値」**。
+F# は評価が厳しいので `Step(f x, g y)` と書くと **`g y` が先に計算される**。
 
 ```fsharp
 // ❌ 無限再帰になる（Step は遅延ではない）
@@ -61,7 +61,7 @@ let rec loop () = Op.Compute(fun () -> ...)
 
 **`Step` は「有限の既知の連鎖」専用。** 無限系列は `Compute` で組む。
 
-有限の連鎖でも、**再帰を第 2 引数（または `let rest = ...`）に渡すとコンストラクト時に「深さ = 要素数」のスタック**を積みます。
+有限の連鎖でも、**再帰を第 2 引数（または `let rest = ...`）に渡すとコンストラクト時に「深さ = 要素数」のスタック**を積む。
 
 ```fsharp
 // ❌ コンストラクト時に全行ぶんのスタックを積む（行数比例で Stack overflow）
@@ -245,7 +245,7 @@ match Schema.resolve schema c with
   `joinPred` の `Schema.resolve` が列を見つけられず `Error` →
   `joinLoop` の `onError` が `Op.empty` を返すため、**黙って空**になる。
 - 原因: `schema − 右テーブル` を「その level でのみ」計算し、左へ渡すのが
-  **全スキーマ**のままでしたこと。
+  **全スキーマ**のままだったこと。
 
 ```fsharp
 // ❌ 左部分木に全スキーマを渡す（内側で外側のテーブルまで解決してしまう）
@@ -683,7 +683,7 @@ let empty: Result<int list, DbError> = all []
 
 ### 8.7 `SqlValue` は `:?>` できない（FS0016）
 
-proper subtype がないので型テストできません。
+proper subtype がないので型テストできない。
 
 ```fsharp
 // ❌ FS0016
@@ -703,8 +703,8 @@ let asInt (v: SqlValue) = match v with | SqlValue.Int n -> n | _ -> 0L
 
 ### 8.9 `Array.takeWhile` は「配列を全部見る」
 
-`Scan.byIndexPrefix` では「先頭から連続する接頭辞一致」を取りたいので `takeWhile` を使いますが、
-**ファイル側の下限が効いていないと 1 件も一致しません**（§4.2 を参照）。
+`Scan.byIndexPrefix` では「先頭から連続する接頭辞一致」を取りたいので `takeWhile` を使うが、
+**ファイル側の下限が効いていないと 1 件も一致しない**（§4.2 を参照）。
 
 ### 8.10 予約語
 
@@ -719,7 +719,7 @@ let f (tree: Logical) = ...
 
 モジュール名に使えないのもある（`CompactionOptions.default` → `CompactionOptions.defaults`）。
 
-`key` / `base` / `begin` / `new` / `old` / `type` / `value` は**匿名レコードのフィールド名にも使えません**。
+`key` / `base` / `begin` / `new` / `old` / `type` / `value` は**匿名レコードのフィールド名にも使えない**。
 
 ```fsharp
 // ❌ 予約語と衝突
@@ -731,7 +731,7 @@ let private writeByte (w: Writer) = ...
 ```
 
 モジュール名と型名が同じ（`BlockCache` / `Wal` / `Memtable`）と
-`Module.field` が型と取り違えられます。型注釈付きのヘルパー経由で構築してください。
+`Module.field` が型と取り違えられます。型注釈付きのヘルパー経由で構築する。
 
 ### 8.11 ローカル関数名が外側の関数と被ると後者が優先される
 
@@ -876,7 +876,7 @@ let withDir tag f =
 
 ### 9.3 `Assert.Equal<int64>(3L, list.Length)` は通らない
 
-`list.Length` は `int`。`Assert.Equal<int>(3, list.Length)` にしてください。
+`list.Length` は `int`。`Assert.Equal<int>(3, list.Length)` にする。
 
 ### 9.4 `dotnet build` / `dotnet test` を並行で走らせない
 
@@ -884,7 +884,7 @@ let withDir tag f =
 
 並行にすると incremental state が壊れ、
 `StorageEngine.fs(338): error FS0039 'isEmpty' is not defined`
-のような**幻影エラー**が出ます（ソース自体は正しい）。
+のような**幻影エラー**が出る（ソース自体は正しい）。
 
 ### 9.5 テストが SIGABRT すると件数が不定になる
 
@@ -944,8 +944,8 @@ dotnet build -t:Rebuild   # FS0020（戻り値の無視）などは整形後に�
 
 ## 11. 設計上の注意点
 
-`architecture.md` §15.3 にあった「**コードから触ってはいけないこと**」の記録です。
-項目ごとの詳しい症状・原因は下の各節にあります。
+以前 `architecture.md` にあった「**コードから触ってはいけないこと**」の記録。
+項目ごとの詳しい症状・原因は下の各節にある。
 
 | #   | 注意点                                | 詳細         |
 | --- | ------------------------------------- | ------------ |
@@ -958,38 +958,38 @@ dotnet build -t:Rebuild   # FS0020（戻り値の無視）などは整形後に�
 
 FSharp.Core の `Array.take` は `Seq.take` 相当で、要素数が足りないと
 `The input sequence has an insufficient number of elements.`
-で落ちます（`Int32.MaxValue` を「全部」の意で渡さない）。
+で落ちる（`Int32.MaxValue` を「全部」の意で渡さない）。
 
 ### 11.2 ファイル番号を巻き戻さない
 
-`NextFileNumber` は MANIFEST に残りません（§4.4）。
+`NextFileNumber` は MANIFEST に残らない（§4.4）。
 復旧時にディスク上の最大番号より小さい値に戻すと、
-**次の flush が既存の SSTable を上書きしてデータを失います。**
-復旧時は必ず `maxFileNumberOnDisk + 1` で上へ進めます。
+**次の flush が既存の SSTable を上書きしてデータを失う。**
+復旧時は必ず `maxFileNumberOnDisk + 1` で上へ進める。
 
 ### 11.3 削除は主キー + 全索引に墓碑を書く
 
 keyspace を分けている代償として、削除は主キー側に加えて**全索引にも
-tombstone を書き込みます。** 索引側を忘れると、
-索引経由の検索で**削除済みの行が復活します**。
+tombstone を書き込む。** 索引側を忘れると、
+索引経由の検索で**削除済みの行が復活する**。
 
 ### 11.4 MANIFEST を先に、ファイル削除を後にする
 
-compaction / version 適用では **MANIFEST への反映が先、入力ファイルの削除が後**です。
+compaction / version 適用では **MANIFEST への反映が先、入力ファイルの削除が後**。
 逆順にすると「MANIFEST は新しいがファイルは古い」状態になり、
-**データ損失**になります（§4.4 参照）。
+**データ損失**になる（§4.4 参照）。
 
 ### 11.5 SSTable の検証はレコードの構造比較を使ってはいけない
 
-並びは「キー昇順・同一キーは SeqNo 降順」（`SstEntry.compare`）です。
+並びは「キー昇順・同一キーは SeqNo 降順」（`SstEntry.compare`）。
 レコードの構造比較（F# のレコード等価）はこの順序と一致しないため、
-検証に使うと正しく並んでいるファイルを「壊れている」と誤判定します。
+検証に使うと正しく並んでいるファイルを「壊れている」と誤判定する。
 
 ### 11.6 順序保持符号化の実装ミス（キー順が壊れる）
 
-- `int64` の順序写像に `~~~` は**使えません**。`-1` のビットパターンが全 1 なので反転すると
-  最小になり `-2` より小さく並びます。正しくは `mapInt64 v = (uint64) v + 0x8000000000000000UL`。
-- `DECIMAL` の raw ビット列（96bit + スケール）も順序保持になりません。
-  内部表現は `(符号, 10進指数, 桁列 29 桁右詰め)` で、**負数は指数も桁列も両方反転**します。
-- `Double.NaN` は .NET では符号ビットが立っています。正の quiet NaN に正規化しないと
-  キー順が壊れます（`SqlValue.normalizeFloat`）。
+- `int64` の順序写像に `~~~` は**使えない**。`-1` のビットパターンが全 1 なので反転すると
+  最小になり `-2` より小さく並ぶ。正しくは `mapInt64 v = (uint64) v + 0x8000000000000000UL`。
+- `DECIMAL` の raw ビット列（96bit + スケール）も順序保持にならない。
+  内部表現は `(符号, 10進指数, 桁列 29 桁右詰め)` で、**負数は指数も桁列も両方反転**する。
+- `Double.NaN` は .NET では符号ビットが立っている。正の quiet NaN に正規化しないと
+  キー順が壊れる（`SqlValue.normalizeFloat`）。

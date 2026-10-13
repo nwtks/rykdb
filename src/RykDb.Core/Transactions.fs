@@ -1,16 +1,15 @@
 // ===========================================================================
 // Transactions — MVCC の snapshot・採番・write-write 競合検出。
 //
-// 1. 採番: コミット済みの論理時計を 1 つに並ばせる（「DB の時刻」）
+// 1. 採番: コミット済みの論理時計を 1つに並ばせる（「DB の時刻」）
 // 2. 可視性: snapshot = SeqNo <= S の書き込みだけ見える。
-//    StorageEngine.getAt / scanAt が SeqNo で絞るので実装はフィルタ 1 つだけ
+//    StorageEngine.getAt / scanAt が SeqNo で絞るので実装はフィルタ 1つだけ
 // 3. 競合検出: 同じキーに書いたら後から commit した方を失敗させる
 //    （first-committer-wins）
 //
 // 書き込みはバッファに貯め、commit 時に一度だけ engine へ流す
 // （read-your-writes・abort 残留なし・commit order 一意）。
 // keyspace 単位の並列性は RowStore が持つ。
-// 詳細は docs/architecture.md §8。
 // ===========================================================================
 
 namespace RykDb.Core
