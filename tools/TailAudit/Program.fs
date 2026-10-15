@@ -12,7 +12,7 @@
 //      ローカル let rec には属性を付けられない（FS0010）ためコンパイラでは見られない。
 //      「再帰呼び出しが末尾位置か」を判定し、ラムダ内・入れ子関数の末尾は
 //      保守的に非末尾と数えて、ベースライン（tools/TailAudit/TailAudit.baseline）で既知分を吸収する。
-//      pipe の**関数側**は末尾を継承する（`x |> f a` = `f a x` → 右が関数側、
+//      pipe の関数側は末尾を継承する（`x |> f a` = `f a x` → 右が関数側、
 //      `f a <| x` = `(f a) x` → 左が関数側）。値側（先に評価される側）は非末尾のまま。
 //      非末尾は「ラムダ内 / 直接」で内訳表示する（直接 = 監査部・引数 = 末尾化候補）。
 //   3) `dotnet test` — 深さが積もる事象を実測（`末尾再帰:` 系テスト・スタック深度）
@@ -262,7 +262,7 @@ let rec walk (targets: Set<string>) (shadow: Set<string>) (tail: bool) (e: SynEx
 
         // `x |> f a` = `f a x` なら関数側は右（argE）、
         // `f a <| x` = `(f a) x` なら関数側は左（funcArgs）。
-        // 演算子の**関数側だけ**は末尾を継承し、値側（先に評価される側）は非末尾のまま。
+        // 演算子の関数側だけは末尾を継承し、値側（先に評価される側）は非末尾のまま。
         let headName = head |> Option.map (fun (n, _) -> n)
         let pipeRight = headName |> Option.exists (fun n -> n.StartsWith "op_PipeRight")
         let pipeLeft = headName |> Option.exists (fun n -> n.StartsWith "op_PipeLeft")

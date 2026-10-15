@@ -210,20 +210,20 @@ module internal Lexer =
         (line: int)
         (start: LexState)
         =
-        let rec go (s: LexState) (sb: StringBuilder) =
+        let rec collectChars (s: LexState) (sb: StringBuilder) =
             if s.Index >= n then
                 Error(DbError.syntax unclosedMsg line)
             elif input.[s.Index] = delim then
                 if s.Index + 1 < n && input.[s.Index + 1] = delim then
                     sb.Append delim |> ignore
-                    go (advance input (advance input s)) sb
+                    collectChars (advance input (advance input s)) sb
                 else
                     Ok(sb.ToString(), advance input s)
             else
                 sb.Append(input.[s.Index]) |> ignore
-                go (advance input s) sb
+                collectChars (advance input s) sb
 
-        go (advance input start) (StringBuilder())
+        collectChars (advance input start) (StringBuilder())
 
     /// 1 トークンを読む。読み後は次の位置を返す。
     let private scanToken (input: string) (s: LexState) (startPos: Position) =
@@ -357,7 +357,7 @@ module internal Lexer =
         let n = input.Length
         let start = { Index = 0; Line = 1; Column = 1 }
 
-        let rec go (s: LexState) (acc: TokenItem list) =
+        let rec collectTokens (s: LexState) (acc: TokenItem list) =
             match skipTrivia input s with
             | Error e -> Error e
             | Ok s when s.Index >= n -> Ok(List.rev ({ Token = Eof; Pos = s.Position } :: acc))
@@ -366,6 +366,6 @@ module internal Lexer =
 
                 match scanToken input s startPos with
                 | Error e -> Error e
-                | Ok(tok, s') -> go s' ({ Token = tok; Pos = startPos } :: acc)
+                | Ok(tok, s') -> collectTokens s' ({ Token = tok; Pos = startPos } :: acc)
 
-        go start []
+        collectTokens start []

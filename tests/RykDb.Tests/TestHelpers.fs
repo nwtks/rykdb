@@ -280,7 +280,7 @@ let keyOfTuple (vs: SqlValue[]) = KeyBuilder.ofValues vs
 
 /// 連番の整数から作るテスト用キー。
 /// SSTable / MANIFEST / StorageEngine / WAL の `sstKey`、Memtable / BloomFilter の
-/// `bloomKey` として **7 ファイルに同一実装がコピーされていた**ので一本化した。
+/// `bloomKey` として 7ファイルに同一実装がコピーされていたので一本化した。
 let intKey (i: int) =
     KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
 

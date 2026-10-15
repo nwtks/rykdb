@@ -45,6 +45,7 @@ ScaffoldingReadMe.txt
 .fake
 CodeCoverage/
 coverage.*
+TailAudit.baseline
 
 # MSBuild Binary and Structured Log
 *.binlog

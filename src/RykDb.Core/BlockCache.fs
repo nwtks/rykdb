@@ -46,7 +46,7 @@ module internal BlockCache =
             let updated = { cache with Entries = found :: rest }
             Some(updated, found.Data)
 
-    /// キャッシュへ入れる（既存のものは置き換えて最近_used にする）。
+    /// キャッシュへ入れる（既存は置き換えて最近使ったものにする）。
     let put (cache: BlockCache) (entry: CacheEntry) =
         let k = entryKey entry.FileNumber entry.BlockId
 
@@ -66,8 +66,3 @@ module internal BlockCache =
         { cache with
             Entries = cache.Entries |> List.filter (fun e -> e.FileNumber <> fileNumber)
         }
-
-    /// キャッシュに載っているか。
-    let contains (cache: BlockCache) (fileNumber: int64) (blockId: int) =
-        let k = entryKey fileNumber blockId
-        cache.Entries |> List.exists (fun e -> entryKey e.FileNumber e.BlockId = k)

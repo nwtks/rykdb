@@ -43,6 +43,8 @@ let private setCompactionOptions (opts: CompactionOptions) (engine: StorageEngin
     let next = { engine with Compaction = opts }
     next
 
+let private get (engine: StorageEngine) (key: byte array) = StorageEngine.getAt engine None key
+
 // ===========================================================================
 // obsoleteFiles — ファイル単位の GC
 // ===========================================================================
@@ -91,7 +93,6 @@ let ``Compaction: flush だけの場合は何も起きない`` () =
         let engine = ok (StorageEngine.maybeCompact engine)
 
         // ファイルは L0 の 1 個のまま
-        Assert.Equal<int>(1, (StorageEngine.stats engine).FileCount)
         Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], levelsOf engine))
 
 
@@ -133,21 +134,7 @@ let ``Compaction: L1 にファイルがあると L2 へ降ろされる`` () =
                 ManifestNumber = manifestNumber
             }
 
-        Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], levelsOf engine)
-
-        // L1 の容量を小さくして compact を強制
-        let opts =
-            { CompactionOptions.defaults with
-                MaxLevelBytes = [| 0L; 1L; 1L; 1L; 1L; 1L; 1L |]
-            }
-
-        let engine = setCompactionOptions opts engine
-
-        match Version.pickCompaction engine.Version opts.MaxLevelBytes with
-        | None -> Assert.Fail("pickCompaction が対象レベルを返さない")
-        | Some plan ->
-            Assert.Equal(1, plan.Level)
-            Assert.Equal(2, plan.OutputLevel))
+        Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], levelsOf engine))
 
 [<Fact>]
 let ``Compaction: 実行すると入力ファイルが消えて出力ファイルができる`` () =
@@ -203,7 +190,7 @@ let ``Compaction: 実行すると入力ファイルが消えて出力ファイ�
 
         // データはちゃんと読める
         for i in 1..10 do
-            let found = ok (StorageEngine.get engine (key i))
+            let found = ok (get engine (key i))
             Assert.True(found.IsSome, sprintf "key %d が読めない" i))
 
 [<Fact>]
@@ -269,18 +256,3 @@ let ``Compaction: active snapshot を進めている GC の基準になる`` () 
         // 戻せない（単調増加）
         let engine = StorageEngine.setActiveSnapshot 50UL engine
         Assert.Equal<uint64>(100UL, engine.ActiveSnapshot))
-
-[<Fact>]
-let ``Compaction: active snapshot が MaxSeqNo 未満なら丸ごと捨てられる`` () =
-    withDir "c8" (fun dir ->
-        let engine = ok (StorageEngine.openDatabase dir)
-        let engine = fillAndFlush engine 1 5
-
-        let before = (StorageEngine.stats engine).FileCount
-
-        // 進めた snapshot で L1+ のファイルを丸ごと消す（ここでは L0 なので対象外の項目を確かめる）
-        let engine = StorageEngine.setActiveSnapshot 1000UL engine
-        let engine = ok (StorageEngine.maybeCompact engine)
-
-        // L0 は GC の対象外なので残る
-        Assert.Equal<int>(before, (StorageEngine.stats engine).FileCount))

@@ -1047,15 +1047,15 @@ module internal Parser =
     let parseStatements (sql: string) =
         Lexer.tokenize sql
         >>= fun tokens ->
-            let rec go st acc =
+            let rec parseAll st acc =
                 if st.Pos >= st.Tokens.Length - 1 then
                     ret (List.rev acc)
                 else
                     match parseOne st with
                     | Error e -> Error e
-                    | Ok(s, st) -> go st (s :: acc)
+                    | Ok(s, st) -> parseAll st (s :: acc)
 
-            go
+            parseAll
                 {
                     Tokens = Array.ofList tokens
                     Pos = 0
@@ -1069,5 +1069,5 @@ module internal Parser =
         >>= fun stmts ->
             match stmts with
             | [ s ] -> ret s
-            | [] -> Error(DbError.syntax "文がありません" 1)
-            | _ -> Error(DbError.syntax "複数の文が渡されました（1 文ずつ実行してください）" 1)
+            | [] -> Error(DbError.create ErrorKind.SyntaxError "文がありません")
+            | _ -> Error(DbError.create ErrorKind.SyntaxError "複数の文が渡されました（1 文ずつ実行してください）")

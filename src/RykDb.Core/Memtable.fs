@@ -1,6 +1,6 @@
 namespace RykDb.Core
 
-/// memtable の 1 エントリ。
+/// memtable の 1エントリ。
 type internal Entry =
     {
         /// keyspace ごとに符号化済みのユーザ指定キー
@@ -28,14 +28,14 @@ module internal Entry =
             Value = None
         }
 
-    let private valueBytes (v: SqlValue) =
-        match v with
-        | SqlValue.Text s -> s.Length + 2
-        | SqlValue.Blob b -> b.Length + 2
-        | SqlValue.Null -> 1
-        | _ -> 9
-
     let approxBytes (e: Entry) =
+        let valueBytes (v: SqlValue) =
+            match v with
+            | SqlValue.Text s -> s.Length + 2
+            | SqlValue.Blob b -> b.Length + 2
+            | SqlValue.Null -> 1
+            | _ -> 9
+
         let payload =
             e.Value
             |> Option.map (fun vs -> 2 + (vs |> Array.sumBy valueBytes))
@@ -47,7 +47,79 @@ module internal Entry =
     let maxSeqNo (entries: Entry seq) =
         entries |> Seq.fold (fun acc e -> max acc e.SeqNo) 0UL
 
-/// 永続 Treap。挿入は根から再構築して新しい memtable を返す（破壊的変更なし）。
+    /// キーの昇順、同一キーは SeqNo の降順（新しい版が先）。
+    let compareKeys (a: Entry) (b: Entry) =
+        match Bytes.compare a.Key b.Key with
+        | 0 -> compare b.SeqNo a.SeqNo
+        | c -> c
+
+    let compareKeyOnly (key: byte array) (e: Entry) = Bytes.compare key e.Key
+
+    let priority (e: Entry) =
+        let h = Hashing.hashBytes e.Key
+        Hashing.mix (h ^^^ e.SeqNo * 0x9E3779B97F4A7C15UL) |> Hashing.mix
+
+    let private encodeEntry (e: Entry) =
+        let body =
+            Writer.build
+                [
+                    Writer.varint e.SeqNo
+                    Writer.bool e.IsDelete
+                    Writer.lengthPrefixed e.Key
+                    match e.Value with
+                    | Some values when not e.IsDelete -> ValueCodec.writeValues values
+                    | _ -> id
+                ]
+
+        Writer.build [ Writer.lengthPrefixed body ]
+
+    let private decodeEntry (data: byte array) =
+        result {
+            let c = Cursor.create data
+            let! seqNo, c = Reader.readVarint c
+            let! isDelete, c = Reader.readBool c
+            let! key, c = Reader.readLengthPrefixed c
+
+            let! value =
+                if isDelete then
+                    ret None
+                else
+                    ValueCodec.readValues c |> Result.map (fun (values, _) -> Some values)
+
+            return
+                {
+                    Key = key
+                    SeqNo = seqNo
+                    Value = value
+                }
+        }
+
+    let encodeBatch (txnId: uint64) (entries: Entry array) =
+        entries
+        |> Array.fold
+            (fun w e -> Writer.writeBytes (encodeEntry e) w)
+            (Writer.empty |> Writer.uint64BE txnId |> Writer.varint (uint64 entries.Length))
+        |> Writer.toArray
+
+    let decodeBatch (data: byte array) =
+        let readOne (c: Cursor) =
+            Reader.readLengthPrefixed c
+            >>= fun (bs, c1) -> decodeEntry bs |> Result.map (fun e -> e, c1)
+
+        result {
+            let c = Cursor.create data
+            let! txnId, c = Reader.readUint64BE c
+            let! count, c = Reader.readVarint c
+
+            if count > uint64 System.Int32.MaxValue then
+                return! Error(sprintf "Wal: バッチのエントリ数が大きすぎます (%d)" count |> DbError.corruption)
+            else
+                let! items, _ = Reader.readItems count readOne c
+                return txnId, List.toArray items
+        }
+
+/// 永続 Treap。
+/// 挿入は根から再構築して新しい memtable を返す（破壊的変更なし）。
 /// 構造は「キー昇順・同一キーは SeqNo 降順」で探索・全順序走査できる平衡木。
 type internal TNode =
     {
@@ -57,7 +129,8 @@ type internal TNode =
         Right: TNode option
     }
 
-/// memtable。挿入は新しい memtable を返す（破壊的変更をしない）。
+/// memtable。
+/// 挿入は新しい memtable を返す（破壊的変更をしない）。
 /// 挿入前のスナップショットはそのまま残るため、読み取りは常に安全。
 type internal Memtable =
     {
@@ -71,7 +144,8 @@ type internal Memtable =
 /// 探索中のノードと、「このエントリを結果に積む」という操作を交互に並べる。
 [<RequireQualifiedAccess>]
 type private Work =
-    /// 探索するノード。None は「ここより先には対象がない」を意味する
+    /// 探索するノード。
+    /// None は「ここより先には対象がない」を意味する。
     | Visit of TNode option
     | Emit of Entry
 
@@ -83,40 +157,29 @@ module internal Memtable =
             ApproxBytes = 0
         }
 
-    /// キーの昇順、同一キーは SeqNo の降順（新しい版が先）。
-    /// バイト比較は `Bytes.compare` に一本化する（順序保持の要なので重複実装しない）。
-    let private compareKeys (a: Entry) (b: Entry) =
-        match Bytes.compare a.Key b.Key with
-        | 0 -> compare b.SeqNo a.SeqNo
-        | c -> c
-
     let private split (root: TNode option) (target: Entry) =
-        let rec go (stack: TNode list) (left: TNode option) (right: TNode option) =
+        let rec unwind (stack: TNode list) (left: TNode option) (right: TNode option) =
             match stack with
             | [] -> left, right
             | r :: rest ->
-                if compareKeys r.Entry target < 0 then
-                    go rest (Some { r with Right = left }) right
+                if Entry.compareKeys r.Entry target < 0 then
+                    unwind rest (Some { r with Right = left }) right
                 else
-                    go rest left (Some { r with Left = right })
+                    unwind rest left (Some { r with Left = right })
 
         let rec down (stack: TNode list) (node: TNode option) =
             match node with
-            | None -> go stack None None
+            | None -> unwind stack None None
             | Some r ->
-                if compareKeys r.Entry target < 0 then
+                if Entry.compareKeys r.Entry target < 0 then
                     down (r :: stack) r.Right
                 else
                     down (r :: stack) r.Left
 
         down [] root
 
-    let private priority (e: Entry) =
-        let h = Hashing.hashBytes e.Key
-        Hashing.mix (h ^^^ e.SeqNo * 0x9E3779B97F4A7C15UL) |> Hashing.mix
-
     let private insertNode (e: Entry) (root: TNode option) =
-        let p = priority e
+        let p = Entry.priority e
 
         let rec rebuild (stack: (TNode * bool) list) (acc: TNode option) =
             match stack with
@@ -130,7 +193,7 @@ module internal Memtable =
 
                 rebuild rest rebuilt
 
-        let rec go (stack: (TNode * bool) list) (node: TNode option) =
+        let rec descend (stack: (TNode * bool) list) (node: TNode option) =
             match node with
             | None ->
                 Some
@@ -155,14 +218,14 @@ module internal Memtable =
                                 Right = right
                             })
                 else
-                    let c = compareKeys e r.Entry
+                    let c = Entry.compareKeys e r.Entry
 
                     if c < 0 then
-                        go ((r, true) :: stack) r.Left
+                        descend ((r, true) :: stack) r.Left
                     else
-                        go ((r, false) :: stack) r.Right
+                        descend ((r, false) :: stack) r.Right
 
-        go [] root
+        descend [] root
 
     let private insert (e: Entry) (mem: Memtable) =
         {
@@ -175,62 +238,52 @@ module internal Memtable =
     let apply (entries: Entry seq) (mem: Memtable) =
         Seq.fold (fun mem e -> insert e mem) mem entries
 
-    let private compareKeyOnly (key: byte array) (e: Entry) = Bytes.compare key e.Key
-
     /// キーの最新バージョン（SeqNo が最大のもの）を返す。
     /// 同一キーの版は SeqNo 降順に並ぶので、最初に拾ったものが最新。
-    /// 点ルックアップ（MVCC の可視性つき）。
-    /// <remarks>
-    /// 点ルックアップ-matched キーだけを辿るので O(log n)。
-    /// rangeScan で済ませると「そのキー以降の全エントリ」を挽くため O(n) になり、
-    /// 10 万行入れた memtable の点検索が 1 回 40 ms になる。
-    /// </remarks>
+    /// ポイントルックアップ（MVCC の可視性つき）。
     let getVisible (mem: Memtable) (key: byte array) (visible: uint64 option) =
-        let rec go (work: TNode option list) (best: Entry option) =
+        let rec search (work: TNode option list) (best: Entry option) =
             match work with
             | [] -> best
-            | None :: rest -> go rest best
+            | None :: rest -> search rest best
             | Some r :: rest ->
-                match compareKeyOnly key r.Entry with
-                | c when c < 0 -> go (r.Left :: rest) best
-                | c when c > 0 -> go (r.Right :: rest) best
+                match Entry.compareKeyOnly key r.Entry with
+                | c when c < 0 -> search (r.Left :: rest) best
+                | c when c > 0 -> search (r.Right :: rest) best
                 | _ ->
                     let visibleEntry =
                         match visible with
                         | Some v when r.Entry.SeqNo > v -> None
                         | _ -> Some r.Entry
 
-                    let best =
+                    let best' =
                         match best, visibleEntry with
                         | Some b, Some e when b.SeqNo >= e.SeqNo -> Some b
                         | _, Some e -> Some e
                         | _ -> best
 
-                    go (r.Right :: r.Left :: rest) best
+                    search (r.Right :: r.Left :: rest) best'
 
-        go [ mem.Root ] None
+        search [ mem.Root ] None
 
-    let private scanFrom (mem: Memtable) (startKey: byte array) (limit: int) =
-        let rec go (work: Work list) (acc: Entry list) (count: int) =
-            if limit > 0 && count >= limit then
-                List.rev acc
-            else
-                match work with
-                | [] -> List.rev acc
-                | Work.Emit e :: rest -> go rest (e :: acc) (count + 1)
-                | Work.Visit None :: rest -> go rest acc count
-                | Work.Visit(Some r) :: rest ->
-                    if Bytes.compare r.Entry.Key startKey < 0 then
-                        go (Work.Visit r.Right :: rest) acc count
-                    else
-                        go (Work.Visit r.Left :: Work.Emit r.Entry :: Work.Visit r.Right :: rest) acc count
+    /// startKey 以降をキー昇順（同一キーは SeqNo 降順）で遅延生成する。
+    /// 状態は「作業リスト + 出した件数」だけで、結果を溜めない
+    /// （余分なメモリは作業リスト＝木の高さ分・期待 O(log n)）。
+    /// limit が 0 以下のときは上限なし。
+    let rangeScan (mem: Memtable) (startKey: byte array) (limit: int) =
+        let rec step struct (work, count) =
+            match work with
+            | [] -> None
+            | _ when limit > 0 && count >= limit -> None
+            | Work.Emit e :: rest -> Some(e, struct (rest, count + 1))
+            | Work.Visit None :: rest -> step struct (rest, count)
+            | Work.Visit(Some r) :: rest ->
+                if Bytes.compare r.Entry.Key startKey < 0 then
+                    step struct (Work.Visit r.Right :: rest, count)
+                else
+                    step struct (Work.Visit r.Left :: Work.Emit r.Entry :: Work.Visit r.Right :: rest, count)
 
-        go [ Work.Visit mem.Root ] [] 0
+        Seq.unfold step struct ([ Work.Visit mem.Root ], 0)
 
     /// キー昇順（同一キーは SeqNo 降順）で全エントリを返す。
-    let toArray (mem: Memtable) = scanFrom mem [||] 0 |> List.toArray
-
-    /// startKey 以降のキーをキー昇順で返す。
-    /// 木を使うので開始位置への到達は O(log n)。
-    let rangeScan (mem: Memtable) (startKey: byte array) (limit: int) =
-        seq { yield! scanFrom mem startKey limit }
+    let toArray (mem: Memtable) = rangeScan mem [||] 0 |> Seq.toArray

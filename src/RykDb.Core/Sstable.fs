@@ -1,18 +1,17 @@
 // ===========================================================================
-// SSTable — 不変のソート済みファイル。メモリ上に展開した byte[] として扱う。
+// SSTable — 不変のソート済みファイル。
+// メモリ上に展開した byte[] として扱う。
 // ブロック境界と索引だけを公開し、ファイル I/O とブロックキャッシュは StorageEngine が担う。
 //
 //   [Block 0]...[Block N-1][Meta][Bloom][Index][Footer 80 bytes]
 //
-// 各ブロックは LevelDB 風の restart 配列を持ち、同じ接頭辞を持つ連続エントリの
-// キー共有部分を圧縮する（entry 形式は buildBlock のコメント）。
+// 各ブロックは LevelDB 風の restart 配列を持ち、同じ接頭辞を持つ連続エントリのキー共有部分を圧縮する
+// （entry 形式は buildBlock のコメント）。
 // ===========================================================================
 
 namespace RykDb.Core
 
-open System.IO
-
-/// SSTable の 1 エントリ。
+/// SSTable の 1エントリ。
 type internal SstEntry =
     {
         Key: byte array
@@ -24,7 +23,8 @@ type internal SstEntry =
     member x.IsDelete = x.Value.IsNone
 
 module internal SstEntry =
-    /// 並び。キー昇順・同一キーは SeqNo 降順（新しい版が先）。
+    /// 並び。
+    /// キー昇順・同一キーは SeqNo 降順（新しい版が先）。
     let compare (a: SstEntry) (b: SstEntry) =
         match Bytes.compare a.Key b.Key with
         | 0 -> compare b.SeqNo a.SeqNo
@@ -37,12 +37,13 @@ module internal SstEntry =
 
         Writer.build [ Writer.varint e.SeqNo; Writer.writeByte tag; ValueCodec.writeValues values ]
 
-    /// 値部分を復元する。キーは呼び出し側が付ける。
+    /// 値部分を復元する。
+    /// キーは呼び出し側が付ける。
     let decodeValue (data: byte array) =
         result {
             let c = Cursor.create data
-            let! seqNo, c = Read.readVarint c
-            let! tag, c = Read.readByte c
+            let! seqNo, c = Reader.readVarint c
+            let! tag, c = Reader.readByte c
             let! values, _ = ValueCodec.readValues c
 
             if tag = 0uy then
@@ -50,7 +51,7 @@ module internal SstEntry =
             elif tag = 1uy then
                 return seqNo, Some values
             else
-                return! Error(DbError.corruption (sprintf "Sstable: 不明な値タグ %d" (int tag)))
+                return! Error(sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
         }
 
     let make key seqNo value =
@@ -62,14 +63,14 @@ module internal SstEntry =
 
     /// 配列を n 個ずつの塊に分ける（SSTable のブロック分けと compaction の出力分けで共用）。
     let splitInto (n: int) (items: 'a array) =
-        let rec go acc start =
+        let rec chunk acc start =
             if start >= items.Length then
                 List.rev acc
             else
                 let len = max 1 (min n (items.Length - start))
-                go (Array.sub items start len :: acc) (start + len)
+                chunk (Array.sub items start len :: acc) (start + len)
 
-        go [] 0
+        chunk [] 0
 
     /// 「キー昇順・同一キーは SeqNo 降順」で並んだ列たちを k-way merge する。
     /// ソース数は高々 1 + ファイル数なので、head を線形に走査しても十分速い。
@@ -81,7 +82,7 @@ module internal SstEntry =
         }
 
     let mergeSorted (sources: SstEntry array list) =
-        let rec go (heads: MergeHead list) (acc: SstEntry list) =
+        let rec merge (heads: MergeHead list) (acc: SstEntry list) =
             let pick =
                 heads
                 |> List.filter (fun h -> h.Index < h.Items.Length)
@@ -102,15 +103,16 @@ module internal SstEntry =
                 let e = h.Items.[h.Index]
                 let advanced = { h with Index = h.Index + 1 }
                 let replaced = heads |> List.mapi (fun i x -> if i = h.Id then advanced else x)
-                go replaced (e :: acc)
+                merge replaced (e :: acc)
 
-        go (sources |> List.mapi (fun i a -> { Id = i; Items = a; Index = 0 })) []
+        merge (sources |> List.mapi (fun i a -> { Id = i; Items = a; Index = 0 })) []
 
     /// エントリ列に含まれる SeqNo の最大値（空なら 0）。
-    let maxSeqNo (items: seq<SstEntry>) =
+    let maxSeqNo (items: SstEntry seq) =
         items |> Seq.fold (fun acc e -> max acc e.SeqNo) 0UL
 
-/// 索引の 1 要素。各ブロックの位置と長さを張る。
+/// 索引の 1要素。
+/// 各ブロックの位置と長さを張る。
 type internal SstIndexEntry =
     {
         /// このブロックに含まれるキーのうち最大のもの
@@ -119,7 +121,7 @@ type internal SstIndexEntry =
         Length: int
     }
 
-/// SSTable の読み取り側。構築後は不変。
+/// SSTable の読み取り側。
 type internal SstReader =
     {
         Data: byte array
@@ -128,16 +130,48 @@ type internal SstReader =
         MaxKey: byte array
         Bloom: BloomFilter option
         EntryCount: int64
-        /// このファイルに含まれる SeqNo の最大値。GC が「消してもよい版」を判断するのに使う
+        /// このファイルに含まれる SeqNo の最大値。
+        /// GC が「消してもよい版」を判断するのに使う。
         MaxSeqNo: uint64
     }
+
+/// SSTable の遅延走査。
+/// next を呼ぶまでブロックを読まない（読むのは 1個ずつ、読み終えたら次のブロックへ）。
+/// ブロックの解析に失敗したら、その時点の next が Error を返して打ち切る
+/// （ファイル全体のチェックサムは openTable が既に見ているので、
+/// ここまで来て parse が落ちるのは掴んでいるファイルが壊れている場合だけ）。
+type internal SstScan = SstScan of (unit -> Result<(SstEntry * SstScan) option, DbError>)
+
+module internal SstScan =
+    /// 終端（これ以上要素は無い）。
+    let empty = SstScan(fun () -> ret None)
+
+    /// 次の 1件。
+    /// None は終端。
+    let next (SstScan step) = step ()
+
+    /// 1件を返す走査。
+    /// 続き（rest）は次を要求されるまで組み立てない
+    /// （ここで組み立てると 1回の next がブロック全体を辿ってしまい、遅延にならない）。
+    let emit (e: SstEntry) (rest: unit -> SstScan) =
+        SstScan(fun () -> Some(e, rest ()) |> ret)
+
+    /// 残りを配列に畳む（壊れたブロックに当たったらその場で Error）。
+    let toArray (scan: SstScan) =
+        let rec drain (cur: SstScan) (acc: SstEntry list) =
+            match next cur with
+            | Error e -> Error e
+            | Ok None -> List.rev acc |> Array.ofList |> ret
+            | Ok(Some(e, nxt)) -> drain nxt (e :: acc)
+
+        drain scan []
 
 module internal Sstable =
     /// Footer の固定長。
     [<Literal>]
     let private FooterSize = 80
 
-    /// 1 ブロックあたりのエントリ数。
+    /// 1ブロックあたりのエントリ数。
     [<Literal>]
     let private EntriesPerBlock = 128
 
@@ -146,7 +180,6 @@ module internal Sstable =
     let private RestartInterval = 16
 
     /// restart 配列の 1エントリのバイト数（オフセットと件数はどちらも u32）。
-    /// 書く側（buildBlock）と読む側（parseBlock）が共有する。
     [<Literal>]
     let private RestartEntryBytes = 4
 
@@ -156,53 +189,30 @@ module internal Sstable =
     [<Literal>]
     let private Version = 1
 
-    /// SSTable のファイル名（%06d.sst）。StorageEngine と Compaction が共有する。
+    /// SSTable のファイル名（%06d.sst）。
     let private fileName (fileNumber: int64) = sprintf "%06d.sst" fileNumber
 
     /// SSTable のフルパス。
-    let path (dir: string) (fileNumber: int64) = Path.Combine(dir, fileName fileNumber)
-
-    /// 2 つのキーの共通接頭辞長。
-    let private sharedPrefix (prev: byte array) (key: byte array) =
-        let n = min prev.Length key.Length
-
-        let rec go i =
-            if i >= n then 0
-            elif prev.[i] = key.[i] then go (i + 1)
-            else i
-
-        go 0
+    let path (dir: string) (fileNumber: int64) =
+        System.IO.Path.Combine(dir, fileName fileNumber)
 
     /// バイト列の列の、各要素の開始オフセットを求める（累積バイト数）。
     /// 結果は要素数 + 1 個で、最後が全体のバイト数。
     let private startOffsets (blocks: byte array list) =
         blocks |> List.scan (fun acc b -> acc + b.Length) 0
 
-    /// Cursor から終端まで 1 件ずつ読み出して配列にまとめる。
-    /// `step` は「読むたびに変わる状態」（キーの接頭辞共有など）を
-    /// `(cursor, state) -> Result<cursor * 要素 * state, DbError>` として受け取る。
-    /// 状態が要らないときは unit を渡す。
-    /// 再帰は末尾位置の match で回す（bind を挟むと TCO が効かなくなる）。
-    let private readItems
-        (step: Cursor -> 'State -> Result<Cursor * 'Item * 'State, DbError>)
-        (c: Cursor)
-        (state: 'State)
-        =
-        let rec go (c: Cursor) (state: 'State) (acc: 'Item list) =
-            if Cursor.atEnd c then
-                ret (List.toArray (List.rev acc))
-            else
-                match step c state with
-                | Error e -> Error e
-                | Ok(c', item, state') -> go c' state' (item :: acc)
+    /// 2つのキーの共通接頭辞長。
+    let private sharedPrefix (prev: byte array) (key: byte array) =
+        let n = min prev.Length key.Length
 
-        go c state []
+        let rec sharedLength i =
+            if i >= n then 0
+            elif prev.[i] = key.[i] then sharedLength (i + 1)
+            else i
 
-    // -----------------------------------------------------------------------
-    // ブロック
-    // -----------------------------------------------------------------------
+        sharedLength 0
 
-    /// エントリ列を 1 ブロックのバイト列へ変換する。
+    /// エントリ列を 1ブロックのバイト列へ変換する。
     let private buildBlock (items: SstEntry array) =
         let body =
             items
@@ -221,14 +231,12 @@ module internal Sstable =
                         Writer.writeBytes value
                     ])
 
-        // restart の位置は累積バイト数から求める（RestartInterval 件ごと）
         let offsets = startOffsets (Array.toList body)
 
         let restarts =
             [ 0..RestartInterval .. body.Length - 1 ]
             |> List.map (fun i -> List.item i offsets)
 
-        // restart 配列は [オフセット × n][件数]（各 u32 = RestartEntryBytes バイト）
         let restartBytes =
             Writer.build (
                 (restarts |> List.map (fun off -> Writer.uint32LE (uint32 off)))
@@ -237,16 +245,34 @@ module internal Sstable =
 
         Array.concat [| Array.concat body; restartBytes |]
 
+    /// Cursor から終端まで 1件ずつ読み出して配列にまとめる。
+    /// step は「読むたびに変わる状態」（キーの接頭辞共有など）を
+    /// `(cursor, state) -> Result<cursor * 要素 * state, DbError>` として受け取る。
+    /// 状態が要らないときは unit を渡す。
+    let private readItems
+        (step: Cursor -> 'State -> Result<Cursor * 'Item * 'State, DbError>)
+        (c: Cursor)
+        (state: 'State)
+        =
+        let rec readAll (c: Cursor) (state: 'State) (acc: 'Item list) =
+            if Cursor.atEnd c then
+                ret (List.toArray (List.rev acc))
+            else
+                match step c state with
+                | Error e -> Error e
+                | Ok(c', item, state') -> readAll c' state' (item :: acc)
+
+        readAll c state []
+
     /// ブロックをエントリ列へ復元する。
     let private parseBlock (data: byte array) =
-        // 読む側。キーは前のエントリと接頭辞を共有するので、直前のキーを状態で受け渡しする。
         let step (c: Cursor) (prev: byte array) =
             result {
-                let! shared, c = Read.readVarint c
-                let! nonShared, c = Read.readVarint c
-                let! valueLen, c = Read.readVarint c
-                let! tail, c = Read.readBytes (int nonShared) c
-                let! valueBytes, c = Read.readBytes (int valueLen) c
+                let! shared, c = Reader.readVarint c
+                let! nonShared, c = Reader.readVarint c
+                let! valueLen, c = Reader.readVarint c
+                let! tail, c = Reader.readBytes (int nonShared) c
+                let! valueBytes, c = Reader.readBytes (int valueLen) c
                 let! seqNo, value = SstEntry.decodeValue valueBytes
 
                 let key =
@@ -260,11 +286,10 @@ module internal Sstable =
 
         let n = data.Length
 
-        // restart 配列（n 個のオフセット + 件数）が末尾に付く。最小编成は 2エントリ分。
         if n < 2 * RestartEntryBytes then
             Error(DbError.corruption "Sstable: ブロックが短すぎます")
         else
-            let numRestarts = int (Read.readLE32 data (n - RestartEntryBytes))
+            let numRestarts = int (Bytes.readLE32 data (n - RestartEntryBytes))
             let restartArraySize = (numRestarts + 1) * RestartEntryBytes
 
             if numRestarts <= 0 || restartArraySize > n then
@@ -324,22 +349,22 @@ module internal Sstable =
         }
 
     /// Footer をカーソルで順に読む。
-    /// フィールドの並びは encodeFooter が実質のレイアウト定義なので、
-    /// オフセットを手で数えない（順に読む分だけ両者がずれにくくなる）。
+    /// フィールドの並びは encodeFooter が実質のレイアウト定義なので、オフセットを手で数えない
+    /// （順に読む分だけ両者がずれにくくなる）。
     /// 戻り値は (マジック文字列, バージョン, 本体, 格納チェックサム)。
     let private readFooter (c: Cursor) =
         result {
-            let! magicBytes, c = Read.readBytes Magic.Length c
-            let! version, c = Read.readUInt32LE c
-            let! maxSeqNo, c = Read.readInt64LE c
-            let! indexOff, c = Read.readInt64LE c
-            let! indexLen, c = Read.readInt64LE c
-            let! bloomOff, c = Read.readInt64LE c
-            let! bloomLen, c = Read.readInt64LE c
-            let! metaOff, c = Read.readInt64LE c
-            let! metaLen, c = Read.readInt64LE c
-            let! entryCount, c = Read.readInt64LE c
-            let! stored, _ = Read.readUInt32LE c
+            let! magicBytes, c = Reader.readBytes Magic.Length c
+            let! version, c = Reader.readUInt32LE c
+            let! maxSeqNo, c = Reader.readInt64LE c
+            let! indexOff, c = Reader.readInt64LE c
+            let! indexLen, c = Reader.readInt64LE c
+            let! bloomOff, c = Reader.readInt64LE c
+            let! bloomLen, c = Reader.readInt64LE c
+            let! metaOff, c = Reader.readInt64LE c
+            let! metaLen, c = Reader.readInt64LE c
+            let! entryCount, c = Reader.readInt64LE c
+            let! stored, _ = Reader.readUInt32LE c
 
             return
                 System.Text.Encoding.ASCII.GetString magicBytes,
@@ -371,7 +396,7 @@ module internal Sstable =
                 if magic <> Magic then
                     Error(DbError.corruption "Sstable: マジックが違います")
                 elif version <> Version then
-                    Error(DbError.corruption (sprintf "Sstable: 未対応のバージョン %d" version))
+                    Error(sprintf "Sstable: 未対応のバージョン %d" version |> DbError.corruption)
                 elif
                     info.IndexOff < 0
                     || info.IndexLen < 0
@@ -390,17 +415,10 @@ module internal Sstable =
                 else
                     ret info
 
-    // -----------------------------------------------------------------------
-    // 構築
-    // -----------------------------------------------------------------------
-
     /// エントリ列から SSTable のバイナリを作る。
     /// 入力はキー昇順・同一キーは SeqNo 降順に並んでいる必要がある（検証する）。
     let build (entries: SstEntry array) (bloomFalsePositiveRate: float) =
         result {
-            // 並びの検証（ここでしか保証されない）
-            // レコードの構造比較だと SeqNo が昇順になってしまうので、
-            // SSTable の並び（キー昇順・同一キーは SeqNo 降順）で判定する
             let unordered =
                 entries
                 |> Array.pairwise
@@ -409,7 +427,6 @@ module internal Sstable =
             if unordered then
                 return! Error(DbError.internalError "Sstable: エントリがキー順に並んでいません")
 
-            // 1) ブロックへ切り分けて連結する。offset は累積から求める。
             let blocks = SstEntry.splitInto EntriesPerBlock entries
             let built = blocks |> List.map buildBlock
             let offsets = startOffsets built
@@ -423,10 +440,8 @@ module internal Sstable =
                         Length = (List.item i built).Length
                     })
 
-            // offsets の最後がデータ領域のサイズ
             let dataSize = List.item built.Length offsets
 
-            // 2) meta block（min_key / max_key）
             let metaBytes =
                 match entries with
                 | [||] -> [||]
@@ -440,7 +455,6 @@ module internal Sstable =
             let metaOff = dataSize
             let bloomOff = metaOff + metaBytes.Length
 
-            // 3) Bloom filter
             let bloomBytes =
                 match entries with
                 | [||] -> [||]
@@ -451,7 +465,6 @@ module internal Sstable =
                         bloomFalsePositiveRate
                     |> BloomFilter.serialize
 
-            // 4) index block
             let indexOff = bloomOff + bloomBytes.Length
 
             let indexBytes =
@@ -484,19 +497,14 @@ module internal Sstable =
             return withFooter
         }
 
-    // -----------------------------------------------------------------------
-    // 読み取り
-    // -----------------------------------------------------------------------
-
     /// index block を SstIndexEntry 配列へ復元する。
     /// 空テーブルのときは index ブロック自体が無いので空配列を返す。
     let private readIndexBlock (data: byte array) (offset: int) (length: int) =
-        // 読む側。index エントリは互いに独立なので状態は要らない（unit）。
         let step (c: Cursor) (_: unit) =
             result {
-                let! lastKey, c1 = Read.readLengthPrefixed c
-                let! off, c2 = Read.readInt64LE c1
-                let! len, c3 = Read.readInt64LE c2
+                let! lastKey, c1 = Reader.readLengthPrefixed c
+                let! off, c2 = Reader.readInt64LE c1
+                let! len, c3 = Reader.readInt64LE c2
 
                 let entry: SstIndexEntry =
                     {
@@ -516,17 +524,15 @@ module internal Sstable =
     /// SSTable を開く。
     let openTable (data: byte array) =
         result {
-            // F# の let! はタプルを 1 行で書く必要がある
             let! footer = decodeFooter data
             let! indexEntries = readIndexBlock data footer.IndexOff footer.IndexLen
 
-            // meta block から min/max を取り出す
             let minKey, maxKey =
                 let metaBytes = Array.sub data footer.MetaOff footer.MetaLen
 
-                match Read.readLengthPrefixed (Cursor.create metaBytes) with
+                match Reader.readLengthPrefixed (Cursor.create metaBytes) with
                 | Ok(mn, c) ->
-                    match Read.readLengthPrefixed c with
+                    match Reader.readLengthPrefixed c with
                     | Ok(mx, _) -> mn, mx
                     | Error _ -> [||], [||]
                 | Error _ -> [||], [||]
@@ -556,26 +562,54 @@ module internal Sstable =
         | None -> true
         | Some bloom -> BloomFilter.mightContain bloom (Hashing.hashBytes key |> Hashing.mix)
 
-    /// ブロック 1 個を読む。
+    /// ブロック 1個を読む。
     let private readBlock (reader: SstReader) (indexEntry: SstIndexEntry) =
         parseBlock (Array.sub reader.Data indexEntry.Offset indexEntry.Length)
 
-    /// 先頭から全エントリを列挙する。
-    let entries (reader: SstReader) =
-        reader.Index
-        |> Array.toList
-        |> List.map (readBlock reader)
-        |> all
-        |> Result.map (fun chunks -> (chunks |> List.toArray |> Array.concat) :> seq<SstEntry>)
-
-    /// startKey 以降のエントリをキー昇順で返す。
-    /// <paramref name="limit"/> が 0 以下のときは上限なし（Memtable.rangeScan と揃える）。
-    let rangeScan (reader: SstReader) (startKey: byte array) (limit: int) =
-        entries reader
-        |> Result.map (fun seq ->
-            let filtered = seq |> Seq.filter (fun e -> Bytes.compare e.Key startKey >= 0)
-
-            if limit > 0 then
-                filtered |> Seq.truncate limit
+    /// startKey を含み得る最初のブロック位置を二分探索する。
+    /// ブロックはキー昇順に並び、LastKey がそのブロックの最大キーなので、
+    /// `LastKey < startKey` のブロックは丸ごと読み飛ばせる。
+    /// 該当が無ければブロック数（走査は空になる）。
+    let private blockIndexFrom (reader: SstReader) (startKey: byte array) =
+        let rec search (lo: int) (hi: int) =
+            if lo >= hi then
+                lo
             else
-                filtered)
+                let mid = lo + (hi - lo) / 2
+
+                if Bytes.compare reader.Index.[mid].LastKey startKey < 0 then
+                    search (mid + 1) hi
+                else
+                    search lo mid
+
+        search 0 reader.Index.Length
+
+    /// startKey 以降のエントリをキー昇順で遅延生成する。
+    /// index の二分探索で開始ブロックへ飛び、ブロックは要求されるまで読まない。
+    /// ブロックの解析に失敗したら、その時点の next が Error を返す。
+    /// limit が 0 以下のときは上限なし（Memtable.rangeScan と揃える）。
+    let rangeScan (reader: SstReader) (startKey: byte array) (limit: int) =
+        let rec fromPos (i: int) (pos: int) (items: SstEntry array) (count: int) =
+            if pos >= items.Length then
+                fromBlock (i + 1) count
+            elif limit > 0 && count >= limit then
+                SstScan.empty
+            elif Bytes.compare items.[pos].Key startKey < 0 then
+                fromPos i (pos + 1) items count
+            else
+                SstScan.emit items.[pos] (fun () -> fromPos i (pos + 1) items (count + 1))
+
+        and fromBlock (i: int) (count: int) =
+            if i >= reader.Index.Length || limit > 0 && count >= limit then
+                SstScan.empty
+            else
+                SstScan(fun () ->
+                    match readBlock reader reader.Index.[i] with
+                    | Error e -> Error e
+                    | Ok items -> SstScan.next (fromPos i 0 items count))
+
+        fromBlock (blockIndexFrom reader startKey) 0
+
+    /// 先頭から全エントリを配列で返す（全件必要ならこちら）。
+    let entries (reader: SstReader) =
+        rangeScan reader [||] 0 |> SstScan.toArray

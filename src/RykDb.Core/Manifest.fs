@@ -9,87 +9,81 @@
 
 namespace RykDb.Core
 
-open System
-open System.IO
-
 module internal Manifest =
     let private fileName (fileNumber: int64) = sprintf "MANIFEST-%06d" fileNumber
 
+    let private manifestPath (dir: string) (fileNumber: int64) =
+        System.IO.Path.Combine(dir, fileName fileNumber)
+
     let private currentFileName = "CURRENT"
 
-    let private currentPath (dir: string) = Path.Combine(dir, currentFileName)
-
-    let private manifestPath (dir: string) (fileNumber: int64) = Path.Combine(dir, fileName fileNumber)
+    let private currentPath (dir: string) =
+        System.IO.Path.Combine(dir, currentFileName)
 
     /// ディレクトリを作る（既にあれば何もしない）。
     let ensureDirectory (dir: string) =
         protect (fun () ->
-            if not (Directory.Exists dir) then
-                Directory.CreateDirectory dir |> ignore)
+            if not (System.IO.Directory.Exists dir) then
+                System.IO.Directory.CreateDirectory dir |> ignore)
 
     let private writeCurrent (dir: string) (fileNumber: int64) =
         protect (fun () ->
             let tmp = currentPath dir + ".tmp"
-            File.WriteAllText(tmp, fileName fileNumber + "\n")
-            File.Move(tmp, currentPath dir, true))
+            System.IO.File.WriteAllText(tmp, fileName fileNumber + "\n")
+            System.IO.File.Move(tmp, currentPath dir, true))
 
     let private readCurrent (dir: string) =
         protect (fun () ->
-            if not (File.Exists(currentPath dir)) then
+            if not (System.IO.File.Exists(currentPath dir)) then
                 None
             else
-                let text = File.ReadAllText(currentPath dir).Trim()
+                let text = System.IO.File.ReadAllText(currentPath dir).Trim()
 
                 if text = "" then
                     None
                 elif text.StartsWith "MANIFEST-" && text.EndsWith ".manifest" then
-                    Some(Int64.Parse(text.Substring(9, text.Length - 9 - ".manifest".Length)))
+                    Some(System.Int64.Parse(text.Substring(9, text.Length - 9 - ".manifest".Length)))
                 elif text.StartsWith "MANIFEST-" then
-                    Some(Int64.Parse(text.Substring 9))
+                    Some(System.Int64.Parse(text.Substring 9))
                 else
-                    raise (InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
-
-    let private append (dir: string) (fileNumber: int64) (edit: VersionEdit) =
-        protect (fun () ->
-            let path = manifestPath dir fileNumber
-            let bytes = VersionEdit.encode edit
-            File.AppendAllText(path, Convert.ToBase64String bytes + "\n"))
-
-    let private readRecord (line: string) =
-        try
-            VersionEdit.decode (Convert.FromBase64String line)
-        with
-        | :? FormatException as e -> Error(DbError.corruption (sprintf "manifest の base64 が不正: %s" e.Message))
-        | e -> Error(DbError.corruption (sprintf "manifest のレコードが不正: %s" e.Message))
+                    raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
 
     let private readAll (dir: string) (fileNumber: int64) =
-        let rec go (lines: string list) (acc: VersionEdit list) =
+        let readRecord (line: string) =
+            try
+                VersionEdit.decode (System.Convert.FromBase64String line)
+            with
+            | :? System.FormatException as e ->
+                Error(sprintf "manifest の base64 が不正: %s" e.Message |> DbError.corruption)
+            | e -> Error(sprintf "manifest のレコードが不正: %s" e.Message |> DbError.corruption)
+
+        let rec decodeLines (lines: string list) (acc: VersionEdit list) =
             match lines with
             | [] -> List.rev acc
             | line :: rest ->
                 if line.Trim() = "" then
-                    go rest acc
+                    decodeLines rest acc
                 else
                     match readRecord line with
-                    | Ok edits -> go rest (edits @ acc)
+                    | Ok edits -> decodeLines rest (edits @ acc)
                     | Error _ -> List.rev acc
 
         let scan () =
             let path = manifestPath dir fileNumber
 
-            if File.Exists path then
-                go (File.ReadAllLines path |> Array.toList) []
+            if System.IO.File.Exists path then
+                decodeLines (System.IO.File.ReadAllLines path |> Array.toList) []
             else
                 []
 
         protect scan
 
-    let private applyAll (edits: VersionEdit list) (initial: RykDb.Core.Version) =
-        List.fold VersionEdit.apply initial edits
-
     /// データベースを開く（新規なら作成する）。
     /// 返り値は (Version, 有効な manifest 番号)。
     let openOrCreate (dir: string) =
+        let applyAll (edits: VersionEdit list) (initial: Version) =
+            List.fold VersionEdit.apply initial edits
+
         result {
             let! _ = ensureDirectory dir
             let! current = readCurrent dir
@@ -101,13 +95,22 @@ module internal Manifest =
                 return version, manifestNumber
             | None ->
                 let manifestNumber = 1L
-                let! _ = protect (fun () -> File.WriteAllText(manifestPath dir manifestNumber, ""))
+
+                let! _ =
+                    protect (fun () -> System.IO.File.WriteAllText(manifestPath dir manifestNumber, ""))
+
                 let! _ = writeCurrent dir manifestNumber
                 return Version.empty, manifestNumber
         }
 
     /// .VersionEdit を反映し、Version と次の manifest 番号を返す。
-    let logAndApply (dir: string) (manifestNumber: int64) (version: RykDb.Core.Version) (edit: VersionEdit) =
+    let logAndApply (dir: string) (manifestNumber: int64) (version: Version) (edit: VersionEdit) =
+        let append (dir: string) (fileNumber: int64) (edit: VersionEdit) =
+            protect (fun () ->
+                let path = manifestPath dir fileNumber
+                let bytes = VersionEdit.encode edit
+                System.IO.File.AppendAllText(path, System.Convert.ToBase64String bytes + "\n"))
+
         result {
             let! _ = append dir manifestNumber edit
             let next = VersionEdit.apply version edit

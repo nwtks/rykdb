@@ -1,8 +1,10 @@
 # アーキテクチャ
 
-**net10.0 / F# 10** で実装された、**LSM-Tree + MVCC + WAL** 組込み RDBMS の内部設計。
-SQL の対応範囲は [`sql-reference.md`](sql-reference.md)、実装時に踏んだ落とし穴は [`gotchas.md`](gotchas.md) を参照。
-コーディング規約は [`coding-conventions.md`](coding-conventions.md)、ビルド・テスト・品質ゲートは [`development.md`](development.md) に分離。
+**.NET 10 / F# 10** で実装された、**LSM-Tree + MVCC + WAL** 組込み RDBMS の内部設計。
+SQL の対応範囲は [`sql-reference.md`](sql-reference.md)、
+実装時に踏んだ落とし穴は [`gotchas.md`](gotchas.md)、
+コーディング規約は [`coding-conventions.md`](coding-conventions.md)、
+ビルド・テスト・品質ゲートは [`development.md`](development.md) を参照。
 
 ---
 
@@ -101,7 +103,8 @@ flowchart TB
 
 ### 設計原則
 
-1. **不変性** — `StorageEngine` / `Version` / `Memtable` / `Catalog` などはすべて値。更新は「新しい値を返す」。読み取りはロックを取らず、snapshot は自然に固定される。
+1. **不変性** — `StorageEngine` / `Version` / `Memtable` / `Catalog` などはすべて値。
+   更新は「新しい値を返す」。読み取りはロックを取らず、snapshot は自然に固定される。
 2. **失敗は値** — 例外を制御フローに使わず、すべて `Result<'T, DbError>` で返す（[`coding-conventions.md`](coding-conventions.md) §1）。
 3. **keyspace シャーディング** — テーブル・索引・カタログがそれぞれ独立した LSM ツリーを持ち、並列性はこの分離で確保する（§6.1）。
 4. **バイト順 = SQL 比較順** — キーのエンコーディングが順序保持であることが、LSM の merge・索引・走査すべての前提（§4.2）。
@@ -109,35 +112,35 @@ flowchart TB
 
 ### 採用している手法（サマリ）
 
-| 領域           | 手法・アルゴリズム                                                                   | 詳細                                                                                                    |
-| -------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
-| ストレージ     | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                          | §8                                                                                                      |
-| memtable       | **永続 Treap**（優先度はハッシュ由来・決定的）                                       | §8.1                                                                                                    |
-| SSTable        | ブロック + **restart 配列 + 接頭辞共有** + Bloom filter + Footer 80 バイト           | §8.2                                                                                                    |
-| キャッシュ     | **LRU**（ブロック単位、不変実装）                                                    | §8.3                                                                                                    |
-| 障害回復       | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                | §8.5–8.6                                                                                                |
-| GC             | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                | §8.7                                                                                                    |
-| 並行制御       | **ロックレス**: 不変ハンドル + **MVCC（Snapshot Isolation）** + first-committer-wins | §7                                                                                                      |
-| キー符号化     | **順序保持エンコーディング**（型タグ・escape・タプル）                               | §4                                                                                                      |
-| 索引           | 複合キー（索引列 ++ 主キー）の prefix 走査                                           | §6                                                                                                      |
-| 実行           | **Volcano 方式の pull 演算子**（不変 `Op`）                                          | §5.2                                                                                                    |
-| 構文解析       | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                        | §3                                                                                                      |
-| エラー処理     | `Result` ベース（`>>=` / `result { }` / `protect`）                                  | [規約 §1](coding-conventions.md#1-例外を使わない)                                                       |
-| ハッシュ       | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                    | §4.2, §8.1                                                                                              |
-| 末尾再帰の監査 | 3 層                                                                                 | [規約 §3](coding-conventions.md#3-末尾再帰を前提にする), [開発 §2](development.md#2-tail-call-監査3-層) |
+| 領域       | 手法・アルゴリズム                                                                   | 詳細                                                |
+| ---------- | ------------------------------------------------------------------------------------ | --------------------------------------------------- |
+| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                          | §8                                                  |
+| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                       | §8.1                                                |
+| SSTable    | ブロック + **restart 配列 + 接頭辞共有** + Bloom filter + Footer 80 バイト           | §8.2                                                |
+| キャッシュ | **LRU**（ブロック単位、不変実装）                                                    | §8.3                                                |
+| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                | §8.5–8.6                                            |
+| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                | §8.7                                                |
+| 並行制御   | **ロックレス**: 不変ハンドル + **MVCC（Snapshot Isolation）** + first-committer-wins | §7                                                  |
+| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                               | §4                                                  |
+| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                            | §6                                                  |
+| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                          | §5.2                                                |
+| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                        | §3                                                  |
+| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                  | [`coding-conventions.md`](coding-conventions.md) §1 |
+| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                    | §4.2, §8.1                                          |
 
 ### 依存の向き
 
-**上から下への一方向のみ。** 下位モジュールは上位を知らない。
+**上から下への一方向のみ**。
+下位モジュールは上位を知らない。
 
-| 層               | モジュール                               | 知っている層                          |
-| ---------------- | ---------------------------------------- | ------------------------------------- |
-| インターフェース | `Database.fs` `RykDb.Cli` `RykDb.Server` | 全部                                  |
-| 実行             | `Engine.fs` `Planner.fs` `Executor.fs`   | `RowStore` `Catalog` `Transactions`   |
-| 行ストア         | `RowStore.fs` `Catalog.fs`               | `StorageEngine` `Transactions`        |
-| MVCC             | `Transactions.fs`                        | `Memtable`（`Entry`）`Errors` `Types` |
-| ストレージ       | `StorageEngine.fs` とその下              | `Errors` `Types` `Serialization`      |
-| フロントエンド   | `Lexer` `Parser` `Ast`                   | `Types` `Errors`                      |
+| 層               | モジュール                               | 知っている層                         |
+| ---------------- | ---------------------------------------- | ------------------------------------ |
+| インターフェース | `Database.fs` `RykDb.Cli` `RykDb.Server` | 全部                                 |
+| 実行             | `Engine.fs` `Planner.fs` `Executor.fs`   | `RowStore` `Catalog` `Transactions`  |
+| 行ストア         | `RowStore.fs` `Catalog.fs`               | `StorageEngine` `Transactions`       |
+| MVCC             | `Transactions.fs`                        | `Memtable`(`Entry`) `Errors` `Types` |
+| ストレージ       | `StorageEngine.fs` とその下              | `Errors` `Types` `Serialization`     |
+| フロントエンド   | `Lexer` `Parser` `Ast`                   | `Types` `Errors`                     |
 
 > **Transactions と RowStore の依存方向**: `Transactions.fs` は `RowStore` を参照しない。
 > 依存は **`RowStore` → `Transactions` → `Memtable`** の向きで、 `RowStore` の DML ヘルパ（`insert` / `updateByPrimaryKey` / `deleteByPrimaryKey`）が `Transaction` のバッファへ行・索引を積む。
@@ -148,9 +151,12 @@ flowchart TB
 `StorageEngine` `Version` `Memtable` `Catalog` `BlockCache` のすべてが**不変レコード**で、操作は「新しい状態を返す」形。
 これは 3つの要求を同時に満たすための選択。
 
-1. **読み取りが lock を取らない。** スナップショットを掴むだけだから。
-2. **MVCC の snapshot が自然に固定される。** 読み取り中に状態が書き換わらない。
-3. **型のレベルで「更新を忘れる」ミスを防ぐ。** ハンドルは `Database` だけ。
+1. **読み取りが lock を取らない**。
+   スナップショットを掴むだけだから。
+2. **MVCC の snapshot が自然に固定される**。
+   読み取り中に状態が書き換わらない。
+3. **型のレベルで「更新を忘れる」ミスを防ぐ**。
+   ハンドルは `Database` だけ。
 
 ただし `Executor` の集約処理・`Op.toArray` と `Database.fs` のクライアント層だけは `ResizeArray` / `Dictionary` を使う（[`coding-conventions.md`](coding-conventions.md) §2）。
 
@@ -245,7 +251,7 @@ CPS・継続の hoist・深さ制限の一般則は [`coding-conventions.md`](co
 ### 4.2 順序保持符号化（LSM 採用の最大の制約）
 
 LSM はキーのマージを**バイト列比較**で行う。
-したがって**「バイト順 == SQL 比較順」** でなければならず、これが設計の中心制約。
+したがって **「バイト順 = SQL 比較順」** でなければならず、これが設計の中心制約。
 
 型タグを SQL 照合順に単調増加させている。
 
@@ -363,7 +369,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化し、�
   └─ それ以外              → SeqScan
 ```
 
-**範囲走査は使わない。**
+**範囲走査は使わない**。
 `ScanMethod.RangeScan` は型としては存在するが Planner から返されることはなく、万一 `Optimizer.exec` に届いても `SeqScan` に落ちる。
 
 - 定数側に使えるのは**リテラルだけ**（`-1` のような符号つきリテラルは可。式・関数は不可）。
@@ -381,9 +387,9 @@ hash join / index nested loop など**結合アルゴリズムの自動選択は
 #### 論理代数 → Op（`Optimizer.exec`）
 
 - `Scan` は `execScan` が `ScanMethod` に応じて `Scan.table` / `Scan.byPrimaryKey` / `Scan.byIndex` へ振り分ける。
-- `Join` は左を「現在のスキーマから右テーブルを除いたもの」、右を「右テーブル 1つだけのスキーマ」で実行し、`Ops.innerJoin` / `Ops.leftJoin` に渡す（ON は左行 ++ 右行で評価）。
+- `Join` は左を「現在のスキーマから右テーブルを除いたもの」、右を「右テーブル 1つだけのスキーマ」で実行し、`Ops.innerJoin` / `Ops.leftJoin` に渡す（ON は左行 + 右行で評価）。
 - `Filter` / `Sort` / `Project` は子の**出力スキーマ**（`outputOf`）を求めてから掛ける。
-  集約の後は行の並びが「groupBy の値 ++ 各集約の結果」に変わるため、「入力スキーマ（テーブル定義）」と取り違えると `SELECT SUM(age)` が引数を評価できず `NULL` になる。
+  集約の後は行の並びが「groupBy の値 + 各集約の結果」に変わるため、「入力スキーマ（テーブル定義）」と取り違えると `SELECT SUM(age)` が引数を評価できず `NULL` になる。
 - `Having` は集約後の行を**位置で読み替えて**から評価する（`Ops.havingFilter`）。
 - `Limit` は `Op.skip`（OFFSET）→ `Op.take`（LIMIT）の順、`limit = 0` は「LIMIT なし」。
 - 最後に `Plan.runSelect` が `Op.toArray` で行を集め、ヘッダは `Schema.projectHeader`（別名優先、`*` は列名）で組み立てる。
@@ -396,7 +402,7 @@ hash join / index nested loop など**結合アルゴリズムの自動選択は
 
 push（差し出し）だと「1行だけ欲しいのに全行計算した」ことになり、`LIMIT 1` や `WHERE` の早期打ち切りが効かない。
 pull は「次の 1行」を上流に要求するので、上流が自然に止まる。
-F# の `seq { }` は内部に mutable な列挙子を持つので、本実装では使わず Pitt–Patel 型の不変な `Op` で組む。
+F# の `seq { }` は内部に mutable な列挙子を持つので、本実装では使わず、「残りの計算」を値として持ち回る不変な pull 演算子 `Op`（Volcano 方式 / イテレータモデル）で組む。
 
 `Step` は**即値**（計算済みの 1行 + 続き）、`Compute` のみが遅延する。
 `Compute` は「次に 1行を返す関数」なので、要求されるまで計算しない。
@@ -407,17 +413,17 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 
 `Ops` モジュールの演算子は以下のとおり。
 
-| 演算子                                    | 役割                                          |
-| ----------------------------------------- | --------------------------------------------- |
-| `Op.ofArray` / `ofList` / `ofRow`         | 材料化済みの行を流す                          |
-| `Op.map` / `filter`                       | 1 対 1 / 1 対 0 の変換                        |
-| `Ops.project`                             | 射影（`*` / `t.*` の展開を含む）              |
-| `Ops.sortBy`                              | ソート（メモリ上に実体化）                    |
-| `Op.take` / `Op.skip`                     | LIMIT / OFFSET                                |
-| `Ops.innerJoin` / `leftJoin`              | 入れ子ループ結合                              |
-| `Ops.aggregate`                           | 集約（`groupBy` 値 ++ 各集約結果 の行を生成） |
-| `Ops.distinct`                            | 重複除去                                      |
-| `Scan.table` / `byPrimaryKey` / `byIndex` | 走査                                          |
+| 演算子                                    | 役割                                         |
+| ----------------------------------------- | -------------------------------------------- |
+| `Op.ofArray` / `ofList` / `ofRow`         | 材料化済みの行を流す                         |
+| `Op.map` / `filter`                       | 1 対 1 / 1 対 0 の変換                       |
+| `Ops.project`                             | 射影（`*` / `t.*` の展開を含む）             |
+| `Ops.sortBy`                              | ソート（メモリ上に実体化）                   |
+| `Op.take` / `Op.skip`                     | LIMIT / OFFSET                               |
+| `Ops.innerJoin` / `leftJoin`              | 入れ子ループ結合                             |
+| `Ops.aggregate`                           | 集約（`groupBy` 値 + 各集約結果 の行を生成） |
+| `Ops.distinct`                            | 重複除去                                     |
+| `Scan.table` / `byPrimaryKey` / `byIndex` | 走査                                         |
 
 遅延の持ち方が演算子ごとに違う。
 
@@ -447,7 +453,7 @@ NULL 同士は等しい扱い）で行う。
 - `ExecContext` は `{ Store; Visible; Schemas; Catalog }`。
   `Visible`（snapshot の SeqNo）は Op を作るときに 1回だけ決まる。
 - `Scan.table` = `Dml.scanByPrimaryKey`（`RowStore.fs` の Dml ヘルパ。主キー順の全走査）。
-  `Scan.byPrimaryKey` = `Dml.getByPrimaryKey`（点検索、無ければ空 Op）。
+  `Scan.byPrimaryKey` = `Dml.getByPrimaryKey`（ポイント検索、無ければ空 Op）。
   `Scan.byIndex` = `Dml.scanByIndexPrefix`（索引の prefix 走査。非一意索引でも全行を返す）。
 - **スキャンは結果を配列で受け取る**（遅延イテレータではない）。
   Op としては 1行ずつ流れるので `LIMIT` は後段を早期に打ち切れるが、ストレージの読み出しはスキャン生成時に終わっている（§12.2）。
@@ -455,7 +461,7 @@ NULL 同士は等しい扱い）で行う。
 #### 集約・ソート・射影の内部
 
 - 集約（`Ops.aggregate`）は全行を読み、グループキー → 行リストの表を作って**最初に現れた順**に 1行ずつ返す。
-  出力は「GROUP BY の値 ++ 各集約の結果」の並び。
+  出力は「GROUP BY の値 + 各集約の結果」の並び。
 - `SUM` / `AVG` は `decimal` で累積する（`REAL` 混在時は `double`）。
   `COUNT(列)` は NULL を数えず、`COUNT(*)` は数える。
   空グループの `SUM` / `AVG` / `MIN` / `MAX` は `NULL`、`COUNT` は 0。
@@ -487,16 +493,16 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 
 ### 5.3 式の評価
 
-`Eval` モジュールがスカラー式を 3 値論理つきで評価する。
+`Eval` モジュールがスカラー式を 3値論理つきで評価する。
 集約呼び出しはここでは評価せず、`Ops.aggregate` / `Ops.project` が先に計算してから結果を定数として読み替える
 （`Ops.substituteAggs`）。
 
-**3 値論理と NULL**
+**3値論理と NULL**
 
 - 比較はオペランドに NULL があると `NULL`（UNKNOWN）を返す。
   `AND` は左が `FALSE` なら右を評価せず `FALSE`、`OR` は左が `TRUE` なら右を評価せず `TRUE`（短絡評価）。
 - `WHERE` / `HAVING` は UNKNOWN を**偽**として扱う（`Eval.matches`）。
-- `BETWEEN` は `>=` と `<=` の AND として 3 値論理で評価する。
+- `BETWEEN` は `>=` と `<=` の AND として 3値論理で評価する。
 - `IN` は「一致する要素があれば TRUE、
   一致せず NULL（UNKNOWN）を 1 つでも見れば UNKNOWN、それ以外は FALSE」。
   空の `IN` は FALSE（`NOT IN` は真偽が反転）。
@@ -576,7 +582,7 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 - `Catalog.eqName` は `OrdinalIgnoreCase` — **SQL の識別子は大文字小文字を区別しない**。
 - **注意** `Catalog.toSchema` は `Indexes = []` で埋まる。
   実行系には `Catalog.indexSchemasOf` 経由で載せ直す必要がある（忘れると索引検索が常に SeqScan になる）。
-- **DDL は即時に効く。**
+- **DDL は即時に効く**。
   `CREATE TABLE` はカタログを書き換えた時点で反映され、暗黙 transaction の開始時にカタログを読み直して直前の DDL を受け取る。
 
 ---
@@ -592,7 +598,7 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 - 採番は `TransactionManager.NextSeqNo` が一元管理し、commit 時に `Transaction.toEntries` がバッファの各エントリへ 1つずつ SeqNo を振る（1 から単調増加）。
 - 最後に振った番号が `LastCommitSeqNo`（= DB の現在時刻）になり、次の snapshot の値になる。
 - 起動時は保存済みの SeqNo（`RowStore.lastSeqNo`）から `TransactionManager` を作り直す。
-  **巻き戻すと、新しい書き込みが古い SeqNo として隠される。**
+  **巻き戻すと、新しい書き込みが古い SeqNo として隠される**。
 
 ### 7.2 可視性
 
@@ -656,7 +662,8 @@ COMMIT
 重要な含意は 2つ。
 
 1. **並行利用は「スレッド / セッションごとに `Database` ハンドルを持つ」のが正**。
-   同じハンドルを複数スレッドで `Execute` すると状態はマージされず、**後から書き換えた方だけが残る**（片方が黙って失われる）。
+   同じハンドルを複数スレッドで `Execute` すると状態はマージされず、**後から書き換えた方だけが残る**
+   （片方が黙って失われる）。
 2. **commit の直列化は「その経路を単一に通る」という規約**であって、mutex による保護ではない。
    ハンドルの受け渡し規約が破られた場合に保護されるものはない、と理解する。
 
@@ -665,7 +672,7 @@ COMMIT
 - **compaction は同期**（バックグラウンドスレッドなし）なので、reader とファイル削除を争わない（§12.2）
 - **WAL は `FileMode.Append, FileShare.Read`** のみ（`Wal.fs`）。書き込み側は常に 1本の経路
 - **TCP サーバは完全逐次** — `AcceptTcpClient` → 1接続を処理 → 次の accept（§11.3）
-- **プロセス間アクセスは非対応**（1 プロセス前提）。**ロックファイルは作成しない**（§10）
+- **プロセス間アクセスは非対応**（1プロセス前提）。**ロックファイルは作成しない**（§10）
 
 ---
 
@@ -685,7 +692,7 @@ COMMIT
 memtable は追記のみなので、レベルごとの insertion buffer として使う。
 構造は「キー昇順・同一キーは SeqNo 降順」で探索・全順序走査できる平衡二分探索木。
 
-**なぜスキップリストではなく Treap なのか。**
+**なぜスキップリストではなく Treap なのか**。
 永続スキップリストも書けるが、パスコピー（探索パスだけを複製する方式）では次の問題がある。
 
 1. 挿入点の「前」ノードが探索パス上に無く、level 0 の鎖が壊れる。
@@ -693,20 +700,26 @@ memtable は追記のみなので、レベルごとの insertion buffer とし�
 3. 前ノードも複製すれば O(n) になり、スキップリストの意味を失う。
 
 Treap は根から再構築するのでこの問題は構造的に発生しない。
-優先度は乱数ではなく**ハッシュから決める**（決定的で、シードの取り違えが起きない）。
+優先度は乱数ではなく**ハッシュから決める**
+（決定的で、シードの取り違えが起きない）。
 
-> 点検索に `rangeScan` を使うと O(n) になる話は [`gotchas.md`](gotchas.md) §4.1 を参照。
+> ポイント検索に `rangeScan` を使うと O(n) になる話は [`gotchas.md`](gotchas.md) §4.1 を参照。
 
-走査時は逆順のまま蓄積して最後に一度だけ `List.rev` する
-（途中で反転すると再帰の各段で向きが変わり並びが崩れる）。
+走査は結果を溜めない。左→自身→右を 1本の作業リスト（`Work`）に積んで回り、
+それを `Seq.unfold` の状態として持ち回る遅延 seq を返す（`scanFrom`）。
+`rangeScan` はそれをそのまま返し、`toArray` だけが `Seq.toArray` で実体化する。
+余分なメモリは作業リスト＝木の高さ分（期待 O(log n)）だけで、`limit` を付ければ必要な分しか辿らない。
 
-- **不変条件**: 「キー昇順・同一キーは SeqNo 降順」。`compareKeys` がこの全順序を定義する。
+- **不変条件**: 「キー昇順・同一キーは SeqNo 降順」。
+  `compareKeys` がこの全順序を定義する。
 - **優先度**: `mix(mix(FNV-1a(key) ^ (SeqNo × 0x9E3779B97F4A7C15)))`。
   乱数シードを使わないため、同じ入力からは常に同じ木になる（決定的）。
-- **更新**: `split` / `insertNode` はたどったノードを明示スタックに積み、引き返しながら組み直して末尾再帰にする（[`coding-conventions.md`](coding-conventions.md) §3）。
-- **走査**: 左→自身→右を 1本の作業リスト（`Work`）に並べ、`List.rev` は最後に 1回だけ。
-- **点検索**: `getVisible` が「snapshot 以下で SeqNo 最大の版」を O(log n) で返す。
-  点検索に `rangeScan` を使うと O(n) になるため使わない。
+- **更新**: `split` / `insertNode` はたどったノードを明示スタックに積み、引き返しながら組み直して末尾再帰にする
+  （[`coding-conventions.md`](coding-conventions.md) §3）。
+- **走査**: `scanFrom` が左→自身→右を作業リスト（`Work`）に並べた遅延 seq を返す
+  （状態は `struct (Work list * int)`＝作業リストと出した件数。結果の蓄積も `List.rev` も無い）。
+- **ポイント検索**: `getVisible` が「snapshot 以下で SeqNo 最大の版」を O(log n) で返す。
+  ポイント検索に `rangeScan` を使うと O(n) になるため使わない。
 
 ### 8.2 SSTable
 
@@ -744,10 +757,16 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | Footer               | `magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8) bloomOff(8) bloomLen(8) metaOff(8) metaLen(8) entryCount(8) checksum(4)` = 80バイト |
 | `maxSeqNo`           | ファイル内の最大 SeqNo（記録用。GC の判定はエントリ単位。§8.7）                                                                              |
 | Bloom filter         | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。読む側は `Sstable.mayContain`                             |
-| 点検索の順路         | Bloom filter → meta（min/max）→ index block → data block                                                                                     |
+| ポイント検索の順路   | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                  |
 
 ファイルは `Sstable.build` が組み立て、`Sstable.openTable` が読み出す。
 読み出しは `BlockCache`（ブロック番号 → 復号済みバイト列）を経由する。
+
+走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
+`rangeScan` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ
+（ブロックの解析失敗は、そのブロックが必要になった `next` が `Error` を返す）。
+`Sstable.entries`（= `rangeScan` + `SstScan.toArray`）だけが全件を配列に実体化する。
+下限の適用は `Memtable.rangeScan` と同じく「読む側」が担い、merge 後に絞り直さない（§8.1）。
 
 ### 8.3 BlockCache
 
@@ -765,11 +784,12 @@ SSTable はブロック圧縮しない（設計方針）ので、読んだブロ
 `Version` は「レベルごとのファイル集合の**不変スナップショット**」。
 
 - `MightContain key` は Bloom より粗い判定（`Smallest ≤ key ≤ Largest`）。
-- `filesForPointLookup` は点ルックアップ用のファイル順（新しい順）を返す。
+- `filesForPointLookup` はポイントルックアップ用のファイル順（新しい順）を返す。
 - **ファイル追加・削除は新しい `Version` を返す**ので、読み取り中に状態が書き換わらない。
 
 `VersionEdit` は Version の変更履歴で、直列化されて MANIFEST に書かれる。
-**`NextFileNumber` は MANIFEST に残らない**（`applyAll` は `Version.empty` から作り直すので 1に戻る）。
+**`NextFileNumber` は MANIFEST に残らない**
+（`applyAll` は `Version.empty` から作り直すので 1に戻る）。
 復旧時には `maxFileNumberOnDisk + 1` で必ず上へ進める必要がある
 （巻き戻すとデータを失う話は [`gotchas.md`](gotchas.md) §4.4 / §11.2）。
 
@@ -784,7 +804,7 @@ SSTable はブロック圧縮しない（設計方針）ので、読んだブロ
 `pickCompaction` は L1 から順に「そのレベルの総バイト数 > 上限」の最初のレベル L を選び、出力先を L+1 にする。
 実際の入力は `Compaction.selectInputs` が「レベル L の全ファイル
 （最大 `MaxInputFiles = 32`）」+「次レベルでキー域が重なるファイル」として確定する。
-点検索のファイル順は「新しいレベルのほうが先（L0 が最新）、同レベルではファイル番号の降順」（`filesForPointLookup`）。
+ポイント検索のファイル順は「新しいレベルのほうが先（L0 が最新）、同レベルではファイル番号の降順」（`filesForPointLookup`）。
 
 ### 8.5 Manifest — 唯一 atomic 更新を要するファイル
 
@@ -824,7 +844,7 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 追記は「最後に完了する」性質があるので、壊れたレコードの後ろは読まなくてよい。
 途中でクラッシュしても open できる理由はここ。
 
-- **1トランザクション分（Begin + Batch + Commit）を 1 回の `append` でまとめて書き**、 `Flush(true)` でディスクまで落とす。
+- **1トランザクション分（Begin + Batch + Commit）を 1 回の `append` でまとめて書き**、`Flush(true)` でディスクまで落とす。
   Begin / Commit が中途半端に分かれない。
 - open 時は `committedEntries` が「Commit まで到達した Batch」だけを再生する。
   未コミットと `Abort` は捨てる。
@@ -861,7 +881,7 @@ GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判
 （`deleteOrphans`: MANIFEST 反映前にクラッシュして残ったファイルの掃除）。
 `FileMetaData.MaxSeqNo` は記録として持つが、削除の根拠にはしない。
 
-> **`VACUUM` は不要。** スペース回収はコンパクション時の自動 GC が行う。
+> **`VACUUM` は不要**。スペース回収はコンパクション時の自動 GC が行う。
 
 **MANIFEST を先に、ファイル削除を後にする**のが重要。
 （逆順だとデータ損失になる話は [`gotchas.md`](gotchas.md) §11.4）。
@@ -905,7 +925,7 @@ SQL 文字列
 
 ```
 Database.openWith root
-  → RowStore.openStore root          既存の keyspace ディレクトリを**全部**開く
+  → RowStore.openStore root          既存の keyspace ディレクトリを全部開く
   → Catalog.load                     __catalog__ keyspace からスキーマを読む
   → RowStore.lastSeqNo               ディスク上の最大 SeqNo を採る
   （各 keyspace で）StorageEngine.openDatabase dir
@@ -916,7 +936,7 @@ Database.openWith root
       └─ NextFileNumber をディスク上の最大番号 + 1 へ進める
 ```
 
-> **既存の keyspace を全部開いておくこと。**
+> **既存の keyspace を全部開いておくこと**。
 > 開かないまま後始末すると `LastCommitSeqNo = 0` から始まり、reopen 直後に 0 行になる
 > （症状と修正の詳細は [`gotchas.md`](gotchas.md) §5.2）。
 
@@ -1003,12 +1023,14 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 1接続 = 1クライアント、逐次処理。1行のテキストを 1行ずつ交換する。
 
-**並行性に関する制約（§7.6 参照）:**
+**並行性に関する制約（§7.6 参照）**:
 
-- `serve` の accept ループは **接続を 1 つずつ処理する**（接続ごとの `Task` / スレッドは起こさない）。
+- `serve` の accept ループは **接続を 1 つずつ処理する**
+  （接続ごとの `Task` / スレッドは起こさない）。
   1接続内も while で逐次。
-- 各接続は `handleClient` 内で `let mutable current = db` に**初期ハンドルをコピー**して始め、実行のたびに `current <- next` で持ち替える。
-- **接続をまたいでハンドルは引き継がれない。**
+- 各接続は `handleClient` 内で `let mutable current = db` に**初期ハンドルをコピー**して始め、
+  実行のたびに `current <- next` で持ち替える。
+- **接続をまたいでハンドルは引き継がれない**。
   次の接続は `serve` に渡された初期 `db` から始まるので、前の接続が変更した後の状態（カタログ・transaction 状態）は見えない。
 
 | 応答                                       | 意味                                                    |
@@ -1056,28 +1078,19 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 - **compaction は同期**（バックグラウンドスレッド化していない）。
   入力はメモリに全部読むので、1回の compaction が大きいと OOM する。
-- **`scan` は結果を全部メモリに載せて返す**（遅延イテレータではない）。
+- **`scan` は結果を全部メモリに載せて返す**
+  （`SstScan` は遅延だが、SQL レベルの `scan` は merge のために実体化する）。
 - **ソート・集約・DISTINCT もメモリに実体化**する。spilling する外部マージは未実装。
 - **範囲走査を使わない**ので、`>` / `<` / `BETWEEN` / `LIKE` は索引を要求しない。
-- **`CREATE INDEX` の backfill は排他を取らない。**
-- **複数プロセスからの同時アクセスは非対応**（1 プロセス前提。ロックファイルを作成しない）。
+- **`CREATE INDEX` の backfill は排他を取らない**。
+- **複数プロセスからの同時アクセスは非対応**（1プロセス前提。ロックファイルを作成しない）。
 - **TCP サーバは接続ごとに逐次処理で、ハンドルを接続間で引き継がない**（§11.3）。
   前の接続の書き込み後の状態は次の接続から見えない。
 - **同一 `Database` ハンドルを複数スレッドで使うと書き込みが失われる**（状態はマージされない。§7.6）。
   並行利用はスレッドごとにハンドルを分ける。
-- **`UNIQUE` 制約・索引は宣言されるだけで重複を検査しない。**
+- **`UNIQUE` 制約・索引は宣言されるだけで重複を検査しない**。
 - **MVCC の版は compaction を跨ぐまでは圧縮も再利用もされない**
   （GC は `SeqNo < ActiveSnapshot` の版を捨てるだけ。ファイル単位では判定しない）。
 - **結合アルゴリズムの自動選択は未実装**（§5.1）。実行時の結合は常に入れ子ループ。
 - **明示 transaction の状態はプロセス内のみ**（`Database` ハンドルが持つ `Manager`）。
   未コミットの書き込みは WAL に残っていても再生されない。
-
----
-
-## 関連ドキュメント
-
-- [`coding-conventions.md`](coding-conventions.md) — コーディング規約（例外・不変・末尾再帰）
-- [`development.md`](development.md) — ビルド・テスト・品質ゲート（tail call 監査を含む）
-- [`sql-reference.md`](sql-reference.md) — SQL 文法・型・関数・エラー・制限
-- [`gotchas.md`](gotchas.md) — 実際に踏んだ落とし穴の記録
-- [`../README.md`](../README.md) — クイックスタート・性能の目安

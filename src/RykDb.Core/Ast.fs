@@ -247,14 +247,14 @@ module internal Expr =
     /// 式木を明示スタックで pre-order にたどり、各ノードについて状態を畳み込む。
     /// 末尾再帰。走査順は「根 → 子を左から右へ」。
     let fold (f: 's -> Expr -> 's) (state: 's) (root: Expr) =
-        let rec go (stack: Expr list) (acc: 's) =
+        let rec foldStack (stack: Expr list) (acc: 's) =
             match stack with
             | [] -> acc
             | e :: rest ->
                 let acc2 = f acc e
-                go (pushAll (List.rev (children e)) rest) acc2
+                foldStack (pushAll (List.rev (children e)) rest) acc2
 
-        go [ root ] state
+        foldStack [ root ] state
 
     /// 式中のすべての列参照を列挙する。束縛と空き列判定に使う。
     /// 末尾再帰の明示スタック走査（ColumnRefs の既存の挙動を維持）。
@@ -283,7 +283,7 @@ module internal Expr =
     /// 式をテキストへ戻す（EXPLAIN やエラーメッセージ用）。
     /// 「式」と「その式を出したあとに吐く文字列」を 1本のスタックで表現し、
     /// 末尾再帰で処理する。
-    /// go x のあとに put ")" と書くと再帰呼び出しが末尾位置にならず、
+    /// writeSteps x のあとに put ")" と書くと再帰呼び出しが末尾位置にならず、
     /// 深い式（1万段超）でスタックを食うため。
     let toDisplayString (e: Expr) =
         let sb = System.Text.StringBuilder()
@@ -291,47 +291,47 @@ module internal Expr =
         let text (s: string) = PrintStep.Text s
         let sub (x: Expr) (closer: PrintStep list) = PrintStep.Sub(x, closer)
 
-        let rec go (steps: PrintStep list) =
+        let rec writeSteps (steps: PrintStep list) =
             match steps with
             | [] -> ()
             | PrintStep.Text s :: rest ->
                 put s
-                go rest
+                writeSteps rest
             | PrintStep.Sub(e, closer) :: rest ->
                 let next = closer @ rest
 
                 match e with
                 | Expr.Literal l ->
                     put (SqlLiteral.toSqlLiteral l.ToSqlValue)
-                    go next
+                    writeSteps next
                 | Expr.Column c ->
                     put c.Display
-                    go next
+                    writeSteps next
                 | Expr.Name n ->
                     put n
-                    go next
+                    writeSteps next
                 | Expr.Star ->
                     put "*"
-                    go next
+                    writeSteps next
                 | Expr.QualifiedStar q ->
                     put q
                     put ".*"
-                    go next
+                    writeSteps next
                 | Expr.Unary(op, x) ->
                     put "("
                     put op.Display
                     put " "
-                    go (sub x [ text ")" ] :: next)
+                    writeSteps (sub x [ text ")" ] :: next)
                 | Expr.Binary(op, a, b) ->
                     put "("
-                    go (sub a [ text " "; text op.Display; text " " ] :: sub b [ text ")" ] :: next)
+                    writeSteps (sub a [ text " "; text op.Display; text " " ] :: sub b [ text ")" ] :: next)
                 | Expr.IsNull(x, neg) ->
                     put "("
-                    go (sub x [ text (if neg then " IS NOT NULL)" else " IS NULL)") ] :: next)
+                    writeSteps (sub x [ text (if neg then " IS NOT NULL)" else " IS NULL)") ] :: next)
                 | Expr.Between(x, a, b, neg) ->
                     put "("
 
-                    go (
+                    writeSteps (
                         sub x [ text (if neg then " NOT BETWEEN " else " BETWEEN ") ]
                         :: sub a [ text " AND " ]
                         :: sub b [ text ")" ]
@@ -344,11 +344,11 @@ module internal Expr =
                     let items =
                         xs |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then "))" else ", ") ])
 
-                    go (sub x [ text (if neg then " NOT IN (" else " IN (") ] :: (items @ next))
+                    writeSteps (sub x [ text (if neg then " NOT IN (" else " IN (") ] :: (items @ next))
                 | Expr.Like(x, p, neg) ->
                     put "("
 
-                    go (
+                    writeSteps (
                         sub x [ text (if neg then " NOT LIKE " else " LIKE ") ]
                         :: sub p [ text ")" ]
                         :: next
@@ -365,7 +365,7 @@ module internal Expr =
                         | Some v -> [ text "ELSE "; sub v [ text " " ] ]
                         | None -> []
 
-                    go ((branchSteps @ elseSteps @ [ text "END)" ]) @ next)
+                    writeSteps ((branchSteps @ elseSteps @ [ text "END)" ]) @ next)
                 | Expr.FuncCall(n, args) ->
                     put n
                     put "("
@@ -374,7 +374,7 @@ module internal Expr =
                     let items =
                         args |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then ")" else ", ") ])
 
-                    go (items @ next)
+                    writeSteps (items @ next)
                 | Expr.AggCall(f, distinct, x) ->
                     put f.Name
                     put "("
@@ -382,9 +382,9 @@ module internal Expr =
                     if distinct then
                         put "DISTINCT "
 
-                    go (sub x [ text ")" ] :: next)
+                    writeSteps (sub x [ text ")" ] :: next)
 
-        go [ PrintStep.Sub(e, []) ]
+        writeSteps [ PrintStep.Sub(e, []) ]
         sb.ToString()
 
 [<RequireQualifiedAccess>]

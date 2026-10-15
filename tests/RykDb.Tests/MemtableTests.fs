@@ -19,7 +19,7 @@ let private build (entries: (int * uint64) list) =
     Memtable.apply es Memtable.empty
 
 // ---------------------------------------------------------------------------
-// 基本の点ルックアップ
+// 基本のポイントルックアップ
 // ---------------------------------------------------------------------------
 
 [<Fact>]
@@ -210,7 +210,7 @@ let ``Memtable: 接頭辞のキーは短い方が小さい`` () =
     Assert.Equal<byte array>(shorter, all.[0].Key)
     Assert.Equal<byte array>(longer, all.[1].Key)
 
-    // 短いキーの点検索が長いキーに引きずられない
+    // 短いキーのポイント検索が長いキーに引きずられない
     Assert.Equal<uint64>(1UL, (entry (Memtable.getVisible mem shorter None)).SeqNo)
     Assert.Equal<uint64>(2UL, (entry (Memtable.getVisible mem longer None)).SeqNo)
 
@@ -252,6 +252,23 @@ let ``Memtable: rangeScan は同一キーの全版を SeqNo 降順で返す`` ()
     Assert.Equal<uint64 array>([| 5UL; 3UL; 2UL; 4UL |], got |> Array.map (fun e -> e.SeqNo))
     Assert.Equal<byte array>(intKey 2, got.[0].Key)
     Assert.Equal<byte array>(intKey 3, got.[3].Key)
+
+[<Fact>]
+let ``Memtable: rangeScan は先頭 1 件だけなら全件を実体化しない`` () =
+    let n = 20_000
+    let mem = build [ for i in 0 .. n - 1 -> (i, uint64 i + 1UL) ]
+
+    // 一度走らせて JIT 分を測定から除く
+    Memtable.rangeScan mem (intKey 0) 0 |> Seq.head |> ignore
+
+    // 先頭 1 件は根から左端まで下りるだけ（O(log n)）。
+    // 全件を list に積んでいたら n 件分（20 万バイト超）を確保してしまう。
+    let before = System.GC.GetAllocatedBytesForCurrentThread()
+    let head = Memtable.rangeScan mem (intKey 0) 0 |> Seq.head
+    let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before
+
+    Assert.Equal<byte array>(intKey 0, head.Key)
+    Assert.True(allocated < 100_000L, $"先頭 1 件の取得で {allocated} バイト確保した（遅延していない）")
 
 // ---------------------------------------------------------------------------
 // 乱数での突き合わせ（参照実装との一致）

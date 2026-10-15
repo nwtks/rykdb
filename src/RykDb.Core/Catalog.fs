@@ -28,7 +28,7 @@ type internal IndexDefinition =
         Unique: bool
     }
 
-/// カタログ全体のスナップショット。不変。
+/// カタログ全体のスナップショット。
 type internal Catalog =
     {
         Tables: TableDefinition list
@@ -182,13 +182,13 @@ module internal Catalog =
         |> Writer.toArray
 
     let private readColumn (c: Cursor) =
-        Read.readStr c
+        Reader.readStr c
         >>= fun (name, c1) ->
-            Read.readByte c1
+            Reader.readByte c1
             >>= fun (tag, c2) ->
-                Read.readByte c2
+                Reader.readByte c2
                 >>= fun (flags, c3) ->
-                    Read.readLengthPrefixed c3
+                    Reader.readLengthPrefixed c3
                     >>= fun (_, c4) ->
                         DataType.fromTag tag
                         |> Result.map (fun dt ->
@@ -209,13 +209,13 @@ module internal Catalog =
     let private decodeTable (name: string) (bytes: byte array) =
         let cur = Cursor.create bytes
 
-        Read.readVarint cur
+        Reader.readVarint cur
         >>= fun (colCount, cur1) ->
-            Read.readItems colCount readColumn cur1
+            Reader.readItems colCount readColumn cur1
             >>= fun (cols, cur2) ->
-                Read.readVarint cur2
+                Reader.readVarint cur2
                 >>= fun (pkCount, cur3) ->
-                    Read.readItems pkCount Read.readStr cur3
+                    Reader.readItems pkCount Reader.readStr cur3
                     |> Result.map (fun (pks, _) ->
                         {
                             Name = name
@@ -235,13 +235,13 @@ module internal Catalog =
     let private decodeIndex (name: string) (bytes: byte array) =
         let cur = Cursor.create bytes
 
-        Read.readStr cur
+        Reader.readStr cur
         >>= fun (table, cur1) ->
-            Read.readBool cur1
+            Reader.readBool cur1
             >>= fun (unique, cur2) ->
-                Read.readVarint cur2
+                Reader.readVarint cur2
                 >>= fun (colCount, cur3) ->
-                    Read.readItems colCount Read.readStr cur3
+                    Reader.readItems colCount Reader.readStr cur3
                     |> Result.map (fun (cols, _) ->
                         {
                             IndexName = name
@@ -283,7 +283,7 @@ module internal Catalog =
 
     /// カタログを読み込む。キーが無ければ空を返す。
     let load (store: RowStore) =
-        let rec go (rest: (byte array * SqlValue array option) array) (acc: Catalog) =
+        let rec decodeRows (rest: (byte array * SqlValue array option) array) (acc: Catalog) =
             if Array.isEmpty rest then
                 ret acc
             else
@@ -291,23 +291,23 @@ module internal Catalog =
                 let tail = rest.[1..]
 
                 match value with
-                | None -> go tail acc
+                | None -> decodeRows tail acc
                 | Some v ->
                     match ofValue v with
-                    | None -> go tail acc
+                    | None -> decodeRows tail acc
                     | Some bytes ->
                         match keyKindOf key with
                         | Some(false, name) ->
                             match decodeTable name bytes with
                             | Error e -> Error e
-                            | Ok t -> go tail (addTable acc t)
+                            | Ok t -> decodeRows tail (addTable acc t)
                         | Some(true, name) ->
                             match decodeIndex name bytes with
                             | Error e -> Error e
-                            | Ok i -> go tail (addIndex acc i)
-                        | None -> go tail acc
+                            | Ok i -> decodeRows tail (addIndex acc i)
+                        | None -> decodeRows tail acc
 
-        RowStore.scan store keyspace [||] 0 |> Result.bind (fun rows -> go rows empty)
+        RowStore.scan store keyspace [||] 0 >>= fun rows -> decodeRows rows empty
 
     /// カタログを保存する（消えた定義は tombstone で落とす）。
     let save (store: RowStore) (catalog: Catalog) =
@@ -335,9 +335,9 @@ module internal Catalog =
             let indexBatches, seq2 = numberList indexBatch catalog.Indexes seq1 []
 
             RowStore.writeBatches store (tableBatches @ indexBatches)
-            |> Result.bind (fun updated ->
+            >>= fun updated ->
                 RowStore.scan updated keyspace [||] 0
-                |> Result.bind (fun rows ->
+                >>= fun rows ->
                     let stale =
                         rows
                         |> Array.choose (fun (key, v) ->
@@ -353,4 +353,4 @@ module internal Catalog =
                         let deletes, _ =
                             numberList (fun (k: byte array) seq -> Entry.delete k seq) stale seq2 []
 
-                        RowStore.writeBatches updated [ (keyspace, Array.ofList deletes) ]))
+                        RowStore.writeBatches updated [ (keyspace, Array.ofList deletes) ]

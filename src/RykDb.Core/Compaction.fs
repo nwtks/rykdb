@@ -2,14 +2,13 @@
 // Compaction — Leveled compaction と不要バージョンの回収（GC）。
 //
 // L0 はキー域が重なる複数ファイル、L1 以降は「1ファイル = 1キー域」。
-// 1回の compaction: 入力選択 → k-way merge →
+// 1回の compaction: 入力選択 →
+// k-way merge →
 // gc（同一キーを最新 1件に畳み、全 active snapshot より小さい版を捨てる）→
 // 出力を L+1 に書き、 MANIFEST に記録してから入力を削除する。
 // ===========================================================================
 
 namespace RykDb.Core
-
-open System.IO
 
 /// レベルごとの容量上限（バイト）。
 type internal CompactionOptions =
@@ -61,17 +60,6 @@ type internal CompactionResult =
     }
 
 module internal Compaction =
-    let private deleteFile (dir: string) (fileNumber: int64) =
-        protect (fun () ->
-            let p = Sstable.path dir fileNumber
-
-            if File.Exists p then
-                File.Delete p)
-
-    // -----------------------------------------------------------------------
-    // GC — 不要バージョンの削除
-    // -----------------------------------------------------------------------
-
     let private gc (activeSnapshot: uint64) (dropTombstones: bool) (items: SstEntry array) =
         let rec groupEnd (start: int) =
             if start + 1 >= items.Length then
@@ -91,7 +79,7 @@ module internal Compaction =
 
         let pickMaxFrom (gs: int) (ge: int) = pickMaxIdx (gs + 1) gs ge
 
-        let rec go (acc: SstEntry list) (i: int) (dv: int) (dt: int) =
+        let rec collectKept (acc: SstEntry list) (i: int) (dv: int) (dt: int) =
             if i >= items.Length then
                 List.rev acc, dv, dt
             else
@@ -113,16 +101,57 @@ module internal Compaction =
                 let dt' = dt + if e.IsDelete then droppedVersions else 0
                 let acc', dt'' = if not keepNewest then acc, dt' + 1 else e :: acc, dt'
                 let acc''' = List.fold (fun a o -> o :: a) acc' older
-                go acc''' ge dv' dt''
+                collectKept acc''' ge dv' dt''
 
-        let kept, dv, dt = go [] 0 0 0
+        let kept, dv, dt = collectKept [] 0 0 0
         kept |> List.toArray, dv, dt
 
-    // -----------------------------------------------------------------------
-    // コンパクション
-    // -----------------------------------------------------------------------
+    /// コンパクションの候補。
+    type private CompactionPlan =
+        {
+            /// 入力となるレベル
+            Level: int
+            /// 出力を置くレベル
+            OutputLevel: int
+            /// 入力ファイル
+            InputFiles: FileMetaData list
+            /// 出力時に重なり判定に使うファイル（1つ上のレベル）
+            GrandParents: FileMetaData list
+        }
 
-    let private selectInputs (version: RykDb.Core.Version) (level: int) (maxFiles: int) =
+    /// コンパクション候補を選ぶ。
+    /// 1段目のレベルから閾値を超えたら、そのレベル全体＋1 段下の全ファイルを入力とする。
+    /// key 範囲の重なり計算は Compaction 側で行う。
+    let private pickCompaction (v: Version) (maxLevelSize: int64 array) =
+        let rec find level =
+            if level > Levels.Max then
+                None
+            else
+                let total = v.Files.[level] |> Array.sumBy (fun f -> f.Size)
+
+                if total > maxLevelSize.[level] then
+                    Some level
+                else
+                    find (level + 1)
+
+        match find 1 with
+        | None -> None
+        | Some level ->
+            let grandParents =
+                if level + 1 <= Levels.Max then
+                    v.Files.[level + 1] |> Array.toList
+                else
+                    []
+
+            Some
+                {
+                    Level = level
+                    OutputLevel = min (level + 1) Levels.Max
+                    InputFiles = v.Files.[level] |> Array.toList
+                    GrandParents = grandParents
+                }
+
+    let private selectInputs (version: Version) (level: int) (maxFiles: int) =
         let inputs = Version.filesAt version level |> Array.toList
         let nextLevel = level + 1
 
@@ -144,12 +173,11 @@ module internal Compaction =
         inputs |> List.truncate maxFiles, next, nextLevel
 
     /// 1 回の Leveled compaction を行う。
-    /// <paramref name="readFile"/> でファイルを読み、
-    /// <paramref name="activeSnapshot"/> を基準に GC してから書き出す。
+    /// readFile でファイルを読み、activeSnapshot を基準に GC してから書き出す。
     /// MANIFEST の更新と実ファイルの削除は呼び出し側（StorageEngine）が行う。
     let compact
         (dir: string)
-        (version: RykDb.Core.Version)
+        (version: Version)
         (options: CompactionOptions)
         (activeSnapshot: uint64)
         (nextFileNumber: int64)
@@ -207,7 +235,7 @@ module internal Compaction =
                         info
                     )
 
-        match Version.pickCompaction version options.MaxLevelBytes with
+        match pickCompaction version options.MaxLevelBytes with
         | None ->
             ret (
                 {
@@ -235,4 +263,11 @@ module internal Compaction =
 
     /// ファイルを実際に削除する。
     let deleteObsolete (dir: string) (files: FileMetaData list) =
+        let deleteFile (dir: string) (fileNumber: int64) =
+            protect (fun () ->
+                let p = Sstable.path dir fileNumber
+
+                if System.IO.File.Exists p then
+                    System.IO.File.Delete p)
+
         files |> foldOk (fun () f -> deleteFile dir f.FileNumber) ()

@@ -46,12 +46,60 @@ let ``SSTable: 複数ブロックに分割される`` () =
 let ``SSTable: rangeScan は startKey 以降を limit 件`` () =
     let reader = ok (Sstable.openTable (ok (Sstable.build (sstEntries 1000) 0.01)))
 
-    let got = ok (Sstable.rangeScan reader (intKey 500) 10) |> Seq.toArray
+    let got = ok (SstScan.toArray (Sstable.rangeScan reader (intKey 500) 10))
     Assert.Equal(10, got.Length)
     Assert.True(got.[0].Key = intKey 500)
 
     // 終端を超える limit は実数だけ返す
-    Assert.Equal(50, (ok (Sstable.rangeScan reader (intKey 950) 100) |> Seq.length))
+    Assert.Equal(50, (ok (SstScan.toArray (Sstable.rangeScan reader (intKey 950) 100)) |> Array.length))
+
+[<Fact>]
+let ``SSTable: rangeScan はブロック境界をまたいでも連続する`` () =
+    // EntriesPerBlock = 128 なので 1000 件で 8 ブロック（境界は 128 の倍数）
+    let reader = ok (Sstable.openTable (ok (Sstable.build (sstEntries 1000) 0.01)))
+
+    // 境界をまたぐ
+    let got = ok (SstScan.toArray (Sstable.rangeScan reader (intKey 120) 20))
+    Assert.Equal(20, got.Length)
+    Assert.Equal<byte array>(intKey 120, got.[0].Key)
+    Assert.Equal<byte array>(intKey 139, got.[19].Key)
+
+    // 境界ちょうどから
+    let fromBoundary = ok (SstScan.toArray (Sstable.rangeScan reader (intKey 128) 3))
+    Assert.Equal(3, fromBoundary.Length)
+    Assert.Equal<byte array>(intKey 128, fromBoundary.[0].Key)
+    Assert.Equal<byte array>(intKey 130, fromBoundary.[2].Key)
+
+    // 最後のブロックの途中からは残りだけ
+    Assert.Equal(10, (ok (SstScan.toArray (Sstable.rangeScan reader (intKey 990) 0)) |> Array.length))
+
+    // MaxKey より後ろは空
+    Assert.Empty(ok (SstScan.toArray (Sstable.rangeScan reader (intKey 1000) 0)))
+
+[<Fact>]
+let ``SSTable: rangeScan は必要なブロックだけ読む`` () =
+    let reader = ok (Sstable.openTable (ok (Sstable.build (sstEntries 20_000) 0.01)))
+
+    // 走査の確保バイト数を測る（1回走らせて JIT 分を除いてから）
+    let measure (scan: unit -> SstEntry array) =
+        scan () |> ignore
+        let before = GC.GetAllocatedBytesForCurrentThread()
+        let got = scan ()
+        GC.GetAllocatedBytesForCurrentThread() - before, got
+
+    let firstAlloc, first =
+        measure (fun () -> ok (SstScan.toArray (Sstable.rangeScan reader (intKey 0) 1)))
+
+    let allAlloc, all =
+        measure (fun () -> ok (SstScan.toArray (Sstable.rangeScan reader (intKey 0) 0)))
+
+    Assert.Equal(1, first.Length)
+    Assert.Equal<byte array>(intKey 0, first.[0].Key)
+    Assert.Equal(20_000, all.Length)
+
+    // 先頭 1 件は 1ブロック（128 件）分しか解析しない。
+    // 全件（20,000 件）を読み切るのに比べ、2桁以上小さいはず。
+    Assert.True(firstAlloc * 10L < allAlloc, $"先頭 1 件で {firstAlloc} バイト（全件は {allAlloc} バイト）")
 
 [<Fact>]
 let ``SSTable: Bloom filter は false negative がない`` () =

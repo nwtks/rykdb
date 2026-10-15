@@ -221,7 +221,7 @@ module internal Schema =
 // 3. Op — 不変の pull 演算子
 // ---------------------------------------------------------------------------
 
-/// 1行取り出す演算子（不変）。
+/// 1行取り出す演算子。
 /// Done             = 終わった
 /// Step (row, next) = row を返した。続きは next
 /// Compute f        = f を呼んで 1行取り出す
@@ -249,13 +249,13 @@ module internal Op =
 
     /// 配列を順に返す演算子。次の行は呼び出すたびに計算する。
     let ofArray (rows: SqlValue array array) =
-        let rec go (i: int) =
+        let rec rowsFrom (i: int) =
             if i >= rows.Length then
                 Op.Done
             else
-                Op.Compute(fun () -> ret (Some(rows.[i], go (i + 1))))
+                Op.Compute(fun () -> ret (Some(rows.[i], rowsFrom (i + 1))))
 
-        go 0
+        rowsFrom 0
 
     /// 1行取り出す。
     let next (op: Op) =
@@ -284,16 +284,16 @@ module internal Op =
     /// p row >>= function で分岐する
     /// （if/then/else だと Result の短絡で Some(row, nxt) だけが残ることがある）。
     let filter (p: SqlValue array -> Result<bool, DbError>) (src: Op) =
-        let rec go (cur: Op) =
+        let rec seekMatch (cur: Op) =
             pull cur (fun row nxt ->
                 let verdict = p row
 
                 match verdict with
-                | Ok true -> ret (Some(row, go nxt))
-                | Ok false -> next (go nxt)
+                | Ok true -> ret (Some(row, seekMatch nxt))
+                | Ok false -> next (seekMatch nxt)
                 | Error e -> err e)
 
-        go src
+        seekMatch src
 
     /// 先頭 n 行だけ。n <= 0 は「全部」。
     let rec take (n: int) (src: Op) =
@@ -304,27 +304,27 @@ module internal Op =
 
     /// 先頭 n 行を読み飛ばす。
     let skip (n: int) (src: Op) =
-        let rec go (left: int) (cur: Op) =
+        let rec drop (left: int) (cur: Op) =
             if left <= 0 then
                 cur
             else
-                pull cur (fun _ nxt -> next (go (left - 1) nxt))
+                pull cur (fun _ nxt -> next (drop (left - 1) nxt))
 
-        go n src
+        drop n src
 
     /// 全行を配列に materialize する。
     let toArray (op: Op) =
         let rows = ResizeArray<SqlValue array>()
 
-        let rec go (cur: Op) =
+        let rec drain (cur: Op) =
             match next cur with
             | Error e -> Error e
             | Ok None -> Ok(rows.ToArray())
             | Ok(Some(row, nxt)) ->
                 rows.Add row
-                go nxt
+                drain nxt
 
-        go op
+        drain op
 
 // ---------------------------------------------------------------------------
 // 4. リテラルとスカラー関数
@@ -370,7 +370,7 @@ module internal Scalar =
             let count = List.length segments
             let anchoredEnd = p.[m - 1] <> '%'
 
-            let rec go (idx: int) (pos: int) =
+            let rec matchFrom (idx: int) (pos: int) =
                 if idx >= count then
                     not anchoredEnd || pos = n
                 else
@@ -402,13 +402,13 @@ module internal Scalar =
 
                         match scan pos with
                         | -1 -> false
-                        | next -> go (idx + 1) next
+                        | next -> matchFrom (idx + 1) next
                     else
                         match matchSegment seg pos with
                         | -1 -> false
-                        | r -> go (idx + 1) r
+                        | r -> matchFrom (idx + 1) r
 
-            go 0 0
+            matchFrom 0 0
 
     /// スカラー関数。未知の関数はエラー。
 
@@ -953,28 +953,28 @@ module internal Ops =
                 |> all
 
             resolved
-            |> Result.bind (fun plan ->
+            >>= fun plan ->
                 let compareWith (a: SqlValue array) (b: SqlValue array) =
-                    let rec go (rest: (int * SortDirection) list) =
+                    let rec compareKeys (rest: (int * SortDirection) list) =
                         match rest with
                         | [] -> 0
                         | (i, dir) :: tail ->
                             match SqlValue.compareValues a.[i] b.[i] with
-                            | Error _ -> go tail
+                            | Error _ -> compareKeys tail
                             | Ok c ->
                                 if c = 0 then
-                                    go tail
+                                    compareKeys tail
                                 else
                                     match dir with
                                     | SortDirection.Ascending -> c
                                     | SortDirection.Descending -> -c
 
-                    go plan
+                    compareKeys plan
 
                 Op.toArray src
                 |> Result.map (fun rows ->
                     let sorted = Array.sortWith compareWith rows
-                    Op.ofArray sorted))
+                    Op.ofArray sorted)
 
     /// 重複除去。保持する順序は最初に現れた順（SQL の DISTINCT と同じ）。
     /// 既出のキーを全部覚える必要がある。
@@ -983,16 +983,16 @@ module internal Ops =
     ///  Costs O(既出キー数 × 平均キー長)。メモリは全キーに比例する。
     /// 値が多いテーブルでは使えないが、`SELECT DISTINCT` の素直な実装としてはこれが正しい。
     let distinct (src: Op) =
-        let rec go (seen: Set<string>) (cur: Op) =
+        let rec skipSeen (seen: Set<string>) (cur: Op) =
             Op.pull cur (fun row nxt ->
                 let k = Row.keyOf row
 
                 if Set.contains k seen then
-                    Op.next (go seen nxt)
+                    Op.next (skipSeen seen nxt)
                 else
-                    ret (Some(row, go (Set.add k seen) nxt)))
+                    ret (Some(row, skipSeen (Set.add k seen) nxt)))
 
-        go Set.empty src
+        skipSeen Set.empty src
 
     /// 集約の 1 項目分の_accumulator。
     /// SUM / AVG は decimal で累積し、最後に型を決める（丸め誤差を避ける）。
@@ -1180,7 +1180,7 @@ module internal Ops =
     ///   SQL の通常の挙動と違ってしまうため）
     let aggregate (schema: Schema) (src: Op) (groupBy: Expr list) (aggs: (AggFunc * bool * Expr) list) =
         Op.toArray src
-        |> Result.bind (fun rows ->
+        >>= fun rows ->
             let keyOfRow (row: SqlValue array) =
                 groupBy
                 |> List.map (fun e -> Eval.eval schema row e)
@@ -1192,7 +1192,7 @@ module internal Ops =
             let table =
                 System.Collections.Generic.Dictionary<string, ResizeArray<SqlValue array>>()
 
-            let rec go (i: int) =
+            let rec groupRows (i: int) =
                 if i >= rows.Length then
                     let built = table |> Seq.map (fun kv -> kv.Key, List.ofSeq kv.Value) |> Map.ofSeq
 
@@ -1209,9 +1209,9 @@ module internal Ops =
                             table.[k] <- bucket
                             order.Add k
 
-                        go (i + 1)
+                        groupRows (i + 1)
 
-            go 0
+            groupRows 0
             |> Result.map (fun (order, table) ->
                 let rowOf (k: string) =
                     match table |> Map.tryFind k with
@@ -1235,7 +1235,7 @@ module internal Ops =
                                     if star then
                                         addAcc acc None true
                                     else
-                                        Eval.eval schema row arg |> Result.bind (fun v -> addAcc acc (Some v) false)
+                                        Eval.eval schema row arg >>= fun v -> addAcc acc (Some v) false
 
                                 match foldOk add start members with
                                 | Ok acc -> finishAcc acc
@@ -1253,7 +1253,7 @@ module internal Ops =
                             | None -> Op.next (chain tail)
                             | Some r -> ret (Some(r, chain tail)))
 
-                chain order))
+                chain order)
 
     /// 結合の述語を「行の組」に対して評価する。
     /// ON 句は両テーブルの列を同時に参照するので、左右を連結した行で評価する。
@@ -1293,13 +1293,20 @@ module internal Ops =
     let innerJoin (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
         Op.toArray right
         |> Result.map (fun rightRows ->
-            let rec go (cur: Op) =
+            let rec joinRows (cur: Op) =
                 Op.pull cur (fun lrow lnext ->
                     Op.next (
-                        joinLoop leftSchema rightSchema on (fun _ -> go lnext) (fun _ -> Op.empty) rightRows lrow
+                        joinLoop
+                            leftSchema
+                            rightSchema
+                            on
+                            (fun _ -> joinRows lnext)
+                            (fun _ -> Op.empty)
+                            rightRows
+                            lrow
                     ))
 
-            go left)
+            joinRows left)
 
     /// LEFT JOIN。左の行に右が 1行も無ければ NULL で埋める。
     /// 一致済みの左行で ON 句の評価が失敗したときだけ次の左行へ進む
@@ -1309,18 +1316,20 @@ module internal Ops =
         |> Result.map (fun rightRows ->
             let width = rightSchema.Columns.Length
 
-            let rec go (cur: Op) =
+            let rec joinRows (cur: Op) =
                 Op.pull cur (fun lrow lnext ->
                     let onExhausted matched =
                         if matched then
-                            go lnext
+                            joinRows lnext
                         else
-                            Op.Step(Array.append lrow (Array.create width SqlValue.Null), go lnext)
+                            Op.Step(Array.append lrow (Array.create width SqlValue.Null), joinRows lnext)
 
-                    let onError matched = if matched then go lnext else Op.empty
+                    let onError matched =
+                        if matched then joinRows lnext else Op.empty
+
                     Op.next (joinLoop leftSchema rightSchema on onExhausted onError rightRows lrow))
 
-            go left)
+            joinRows left)
 
     /// 射影。`SELECT` の項目順に値を並べる。
     /// `*` / `t.*` は対象テーブルの全列に展開する。
@@ -1409,11 +1418,7 @@ module internal DmlOps =
         (onRow: Transaction -> int -> SqlValue array -> Result<Transaction * int, DbError>)
         =
         Dml.scanByPrimaryKey ctx.Store schema ctx.Visible 0
-        |> Result.bind (fun rows ->
-            rows
-            |> foldOk
-                (fun (t, c) row -> matched row >>= fun keep -> if keep then onRow t c row else ret (t, c))
-                (txn, 0))
+        >>= foldOk (fun (t, c) row -> matched row >>= fun keep -> if keep then onRow t c row else ret (t, c)) (txn, 0)
 
     /// gather で埋まった `(列位置, 値)` の対を、列順の行へ戻す。
     /// 埋まっていない位置は fallback に委ねる
@@ -1431,7 +1436,7 @@ module internal DmlOps =
         match columns with
         | None -> schema.Columns |> List.mapi (fun i _ -> i) |> ret
         | Some names -> names |> List.map (fun n -> schema.RequireIndexOf n) |> all
-        |> Result.bind (fun idxs ->
+        >>= fun idxs ->
             let width = schema.Columns.Length
 
             let buildRow (values: Expr list) =
@@ -1457,7 +1462,7 @@ module internal DmlOps =
                 (fun (txnAcc, count) values ->
                     buildRow values
                     >>= fun row -> Dml.insert schema txnAcc row |> Result.map (fun t -> t, count + 1))
-                (txn, 0))
+                (txn, 0)
 
     /// UPDATE。assignments の右辺は現在行で評価する。
     /// 検索キーは更新前の行の主キー。主キー列を書き換えると
@@ -1474,7 +1479,7 @@ module internal DmlOps =
         assignments
         |> List.map (fun (name, _) -> schema.RequireIndexOf name)
         |> all
-        |> Result.bind (fun targets ->
+        >>= fun targets ->
             let assign (row: SqlValue array) =
                 gatherWith (Eval.eval targetSchema row) schema (List.map snd assignments) targets
                 |> Result.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
@@ -1485,7 +1490,7 @@ module internal DmlOps =
                     let pk = TableSchema.primaryKeyOf schema row
 
                     Dml.updateByPrimaryKey ctx.Store schema ctx.Visible txnAcc pk newRow
-                    |> Result.map (fun t -> t, count + 1)))
+                    |> Result.map (fun t -> t, count + 1))
 
     /// DELETE。WHERE に合う行を主キー + 全索引に tombstone で消す。
     let delete (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (where: Expr option) =

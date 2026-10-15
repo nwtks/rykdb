@@ -100,7 +100,7 @@ module internal Transaction =
 
                 step tail (seqNo + 1UL) (e :: acc)
 
-        let rec go
+        let rec perKeyspace
             (spaces: (string * (byte array * SqlValue array option) list) list)
             (seqNo: uint64)
             (acc: (string * Entry array) list)
@@ -109,9 +109,9 @@ module internal Transaction =
             | [] -> List.rev acc, seqNo
             | (ks, entries) :: rest ->
                 let made = step entries seqNo [] |> Array.ofList
-                go rest (seqNo + uint64 entries.Length) ((ks, made) :: acc)
+                perKeyspace rest (seqNo + uint64 entries.Length) ((ks, made) :: acc)
 
-        go (txn.Buffers |> Map.toList |> List.map (fun (ks, m) -> ks, m |> Map.toList)) nextSeqNo []
+        perKeyspace (txn.Buffers |> Map.toList |> List.map (fun (ks, m) -> ks, m |> Map.toList)) nextSeqNo []
 
 // ---------------------------------------------------------------------------
 // TransactionManager

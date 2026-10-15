@@ -8,17 +8,15 @@
 // テストは RykDb.Server.serve を直接呼べる。
 // ===========================================================================
 
-open System
-open System.IO
-open System.Net
-open System.Net.Sockets
-open System.Threading
 open RykDb.Core
 open RykDb.Server
 
 let private parseArgs (argv: string array) =
     let mutable port = 7090
-    let mutable root = Path.Combine(Directory.GetCurrentDirectory(), "rykdb-data")
+
+    let mutable root =
+        System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "rykdb-data")
+
     let positional = ResizeArray<string>()
     let mutable i = 0
     let mutable err: string option = None
@@ -27,7 +25,7 @@ let private parseArgs (argv: string array) =
         let a = argv.[i]
 
         if (a = "-p" || a = "--port") && i + 1 < argv.Length then
-            match Int32.TryParse argv.[i + 1] with
+            match System.Int32.TryParse argv.[i + 1] with
             | true, p ->
                 port <- p
                 i <- i + 2
@@ -55,7 +53,7 @@ let main argv =
             eprintfn "DB を開けません: %s" (DbError.toDisplayString e)
             1
         | Ok db ->
-            let listener = new TcpListener(IPAddress.Any, port)
+            let listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Any, port)
             let mutable started = false
 
             try
@@ -71,11 +69,11 @@ let main argv =
                 printfn "RykDb Server listening on port %d" port
                 printfn "DB: %s" root
                 printfn "Ctrl+C で終了します。"
-                Console.Out.Flush()
+                System.Console.Out.Flush()
 
-                use cts = new CancellationTokenSource()
+                use cts = new System.Threading.CancellationTokenSource()
 
-                Console.CancelKeyPress
+                System.Console.CancelKeyPress
                 |> Event.add (fun e ->
                     e.Cancel <- true
                     cts.Cancel())
@@ -83,7 +81,7 @@ let main argv =
                 try
                     serve db listener cts.Token (fun m ->
                         printfn "%s" m
-                        Console.Out.Flush())
+                        System.Console.Out.Flush())
                 finally
                     db.Close() |> ignore
 

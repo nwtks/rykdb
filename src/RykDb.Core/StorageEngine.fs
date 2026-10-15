@@ -9,9 +9,8 @@
 
 namespace RykDb.Core
 
-open System.IO
-
-/// StorageEngine の不変状態。すべての操作は新しい状態を返す。
+/// StorageEngine の不変状態。
+/// すべての操作は新しい状態を返す。
 type internal StorageEngine =
     {
         /// データベースのディレクトリ
@@ -19,7 +18,7 @@ type internal StorageEngine =
         /// 有効な manifest 番号
         ManifestNumber: int64
         /// 現在の LSM 形状
-        Version: RykDb.Core.Version
+        Version: Version
         /// 書き込み先 memtable
         Mem: Memtable
         /// 現在の WAL
@@ -34,26 +33,9 @@ type internal StorageEngine =
         MemLimitBytes: int
         /// コンパクションの設定
         Compaction: CompactionOptions
-        /// 最古の active snapshot の SeqNo。これより小さい版は誰も読まないので GC できる
+        /// 最古の active snapshot の SeqNo。
+        /// これより小さい版は誰も読まないので GC できる
         ActiveSnapshot: uint64
-    }
-
-    /// memtable が上限に達しているか。
-    member x.NeedsFlush = x.Mem.Count > 0 && x.Mem.ApproxBytes >= x.MemLimitBytes
-
-/// 統計（テストと診断用）。
-type internal StorageStats =
-    {
-        /// memtable 内のエントリ数
-        Entries: int
-        /// memtable の概算バイト数
-        MemBytes: int
-        /// WAL のバイト数
-        WalBytes: int
-        /// SSTable ファイル数
-        FileCount: int
-        /// レベルごとのファイル数
-        Levels: int array
     }
 
 module internal StorageEngine =
@@ -85,121 +67,92 @@ module internal StorageEngine =
             ActiveSnapshot = 0UL
         }
 
-    // -----------------------------------------------------------------------
-    // ファイル名（Sstable.fileName / Sstable.path を共有）
-    // -----------------------------------------------------------------------
-
-    /// ファイル名（拡張子除く）を番号として読む。SSTable でも WAL でも同じ規則。
+    /// ファイル名（拡張子除く）を番号として読む。
+    /// SSTable でも WAL でも同じ規則。
     let private parseNumber (path: string) =
-        match System.Int64.TryParse(Path.GetFileNameWithoutExtension path) with
+        match System.Int64.TryParse(System.IO.Path.GetFileNameWithoutExtension path) with
         | true, v -> Some v
         | _ -> None
 
-    /// snapshot（visible）から見える版かどうか。None なら常に見える。
+    /// snapshot（visible）から見える版かどうか。
+    /// None なら常に見える。
     let private isVisible (visible: uint64 option) (e: SstEntry) =
         match visible with
         | Some s -> e.SeqNo <= s
         | None -> true
 
-    /// 隣接する同じキーのエントリを 1 つに畳む。
-    /// merge 後の並びは「キー昇順・同一キーは SeqNo 降順」。
-    /// <paramref name="visible"/> が Some s のときは SeqNo が s 以下の最初の版
-    /// （= その snapshot から見た最新）を 1 件だけ残す。MVCC の可視性はここで効く。
-    /// None なら制限なしで先頭（＝全体最新）を残す。
-    let private collapseDuplicates (visible: uint64 option) (items: SstEntry array) =
-        let rec go (acc: SstEntry list) (arr: SstEntry array) (i: int) (emittedKey: byte array option) =
-            if i >= arr.Length then
-                List.rev acc |> Array.ofList
-            else
-                let e = arr.[i]
-
-                match emittedKey with
-                | Some k when Bytes.compare k e.Key = 0 -> go acc arr (i + 1) emittedKey
-                | _ when not (isVisible visible e) -> go acc arr (i + 1) emittedKey
-                | _ -> go (e :: acc) arr (i + 1) (Some e.Key)
-
-        go [] items 0 None
-
-    // -----------------------------------------------------------------------
-    // ファイル読み
-    // -------------------------------------------------------------------
-
     /// SSTable ファイルを直接バイト列で読む（キャッシュを通さない）。
     let private readFileBytes (dir: string) (fileNumber: int64) =
-        protect (fun () -> File.ReadAllBytes(Sstable.path dir fileNumber))
+        protect (fun () -> System.IO.File.ReadAllBytes(Sstable.path dir fileNumber))
 
-    /// SSTable のファイル単位のバイト列を（キャッシュ経由で）読む。
-    let private readSstableBytes (engine: StorageEngine) (fileNumber: int64) =
-        match BlockCache.get engine.Cache fileNumber 0 with
-        | Some(_, bytes) -> ret bytes
-        | None ->
-            readFileBytes engine.Dir fileNumber
-            |> Result.map (fun bytes ->
-                let entry =
+    /// ファイルを開く（Bloom と index を持つ reader を作る）。
+    let private openSstable (engine: StorageEngine) (f: FileMetaData) =
+        /// SSTable のファイル単位のバイト列を（キャッシュ経由で）読む。
+        let readSstableBytes (engine: StorageEngine) (fileNumber: int64) =
+            match BlockCache.get engine.Cache fileNumber 0 with
+            | Some(_, bytes) -> ret bytes
+            | None ->
+                readFileBytes engine.Dir fileNumber
+                |> Result.map (fun bytes ->
                     {
                         FileNumber = fileNumber
                         BlockId = 0
                         Data = bytes
                     }
+                    |> BlockCache.put engine.Cache
+                    |> ignore
 
-                BlockCache.put engine.Cache entry |> ignore
-                bytes)
+                    bytes)
 
-    /// ファイルを開く（Bloom と index を持つ reader を作る）。
-    let private openSstable (engine: StorageEngine) (f: FileMetaData) =
-        readSstableBytes engine f.FileNumber |> Result.bind Sstable.openTable
+        readSstableBytes engine f.FileNumber >>= Sstable.openTable
 
-    /// 開いた reader から全エントリを配列にする。
-    let private readAllEntries reader =
-        Sstable.entries reader |> Result.map Seq.toArray
+    /// 開いた reader から startKey 以降の全エントリを配列にする。
+    /// `[||]` なら先頭から全部。index の二分探索で startKey より前のブロックは読み飛ばす。
+    let private readEntriesFrom (startKey: byte array) (reader: SstReader) =
+        Sstable.rangeScan reader startKey 0 |> SstScan.toArray
 
-    /// ファイル 1つを読んで全エントリを配列にする（読む側。キャッシュ経由）。
-    let private entriesOf (engine: StorageEngine) (f: FileMetaData) =
-        openSstable engine f |> Result.bind readAllEntries
+    /// ファイル 1つを読んで startKey 以降の全エントリを配列にする
+    /// （読む側。キャッシュ経由）。
+    let private entriesOf (engine: StorageEngine) (startKey: byte array) (f: FileMetaData) =
+        openSstable engine f >>= readEntriesFrom startKey
 
-    /// ファイル 1つを読んで全エントリを配列にする
-    /// （読む側。engine が無い復旧時 = キャッシュなし）。
-    let private entriesAt (dir: string) (f: FileMetaData) =
-        readFileBytes dir f.FileNumber >>= Sstable.openTable >>= readAllEntries
-
-    /// ファイル列を先頭から順に処理する「回す側」。
-    /// read が 1ファイル分を読み、step が状態を進める。
-    /// 最初の Error で打ち切る。
-    /// read / step は再帰しないので bind で合成してよい。
-    let private foldFiles
-        (read: FileMetaData -> Result<'a, DbError>)
-        (step: 's -> 'a -> 's)
-        (state: 's)
-        (files: FileMetaData list)
-        =
-        let rec go (rest: FileMetaData list) (acc: 's) =
-            match rest with
-            | [] -> ret acc
-            | f :: tail ->
-                match read f with
-                | Error e -> Error e
-                | Ok v -> go tail (step acc v)
-
-        go files state
-
-    /// ディレクトリにある SSTable のファイル番号（孤児削除と open 時の復元で使う）。
-    let private sstNumbersOnDisk (dir: string) =
-        Directory.GetFiles(dir, "*.sst") |> Array.choose parseNumber
-
-    // -----------------------------------------------------------------------
-    // 検索
-    // -----------------------------------------------------------------------
-
-    /// バージョン列から snapshot で見える最初の（＝最新の）版を拾う。
-    let private firstVisible (visible: uint64 option) (key: byte array) (seq: seq<SstEntry>) =
-        seq
-        |> Seq.takeWhile (fun e -> Bytes.compare e.Key key = 0)
-        |> Seq.tryFind (isVisible visible)
-
-    /// 点ルックアップ。memtable -> L0 -> 各レベルの順に見る。
-    /// <paramref name="visible"/> が Some s のときは SeqNo が s 以下の最新版を返す。
-    /// これが MVCC の可視性。None なら制限なし。
+    /// ポイントルックアップ。
+    /// memtable -> L0 -> 各レベルの順に見る。
+    /// visible が Some s のときは SeqNo が s 以下の最新版を返す。
+    /// これが MVCC の可視性。
+    /// None なら制限なし。
     let getAt (engine: StorageEngine) (visible: uint64 option) (key: byte array) =
+        /// 走査の先頭からキーが一致する版をたどり、snapshot で見える最初の（＝最新の）版を拾う。
+        /// 同一キーの版は連続して並ぶので、キーを超えたらそこで打ち切る
+        /// （ブロックを読み切る前に止まるので、ポイント検索は 1ブロックで済む）。
+        let firstVisible (visible: uint64 option) (key: byte array) (scan: SstScan) =
+            let rec seek (cur: SstScan) =
+                match SstScan.next cur with
+                | Error e -> Error e
+                | Ok None -> ret None
+                | Ok(Some(e, nxt)) ->
+                    match Bytes.compare e.Key key with
+                    | c when c < 0 -> seek nxt
+                    | 0 -> if isVisible visible e then ret (Some e) else seek nxt
+                    | _ -> ret None
+
+            seek scan
+
+        let rec probe (files: FileMetaData list) =
+            match files with
+            | [] -> ret None
+            | f :: rest ->
+                match openSstable engine f with
+                | Error e -> Error e
+                | Ok reader ->
+                    if not (Sstable.mayContain reader key) then
+                        probe rest
+                    else
+                        match Sstable.rangeScan reader key 0 |> firstVisible visible key with
+                        | Error e -> Error e
+                        | Ok(Some e) -> ret (Some e)
+                        | Ok None -> probe rest
+
         let fromMem =
             match Memtable.getVisible engine.Mem key visible with
             | None -> ret None
@@ -208,34 +161,31 @@ module internal StorageEngine =
         match fromMem with
         | Error e -> Error e
         | Ok(Some e) -> ret (Some e)
-        | Ok None ->
-            let files = Version.filesForPointLookup engine.Version key
+        | Ok None -> Version.filesForPointLookup engine.Version key |> probe
 
-            let rec go (files: FileMetaData list) =
-                match files with
-                | [] -> ret None
-                | f :: rest ->
-                    match openSstable engine f with
-                    | Error e -> Error e
-                    | Ok reader ->
-                        if not (Sstable.mayContain reader key) then
-                            go rest
-                        else
-                            match Sstable.rangeScan reader key 0 with
-                            | Error e -> Error e
-                            | Ok seq ->
-                                match firstVisible visible key seq with
-                                | Some e -> ret (Some e)
-                                | None -> go rest
-
-            go files
-
-    /// 点ルックアップ（可視性の制限なし）。
-    let get (engine: StorageEngine) (key: byte array) = getAt engine None key
-
-    /// 範囲ルックアップ。キー昇順で返す（同一キーは 1 件だけ）。
-    /// <paramref name="visible"/> が Some s のときは SeqNo が s 以下の版を返す。
+    /// 範囲ルックアップ。
+    /// キー昇順で返す（同一キーは 1 件だけ）。
+    /// visible が Some s のときは SeqNo が s 以下の版を返す。
     let scanAt (engine: StorageEngine) (visible: uint64 option) (startKey: byte array) (limit: int) =
+        /// 隣接する同じキーのエントリを 1 つに畳む。
+        /// merge 後の並びは「キー昇順・同一キーは SeqNo 降順」。
+        /// visible が Some s のときは SeqNo が s 以下の最初の版（= その snapshot から見た最新）を 1 件だけ残す。
+        /// MVCC の可視性はここで効く。
+        /// None なら制限なしで先頭（＝全体最新）を残す。
+        let collapseDuplicates (visible: uint64 option) (items: SstEntry array) =
+            let rec collapse (acc: SstEntry list) (arr: SstEntry array) (i: int) (emittedKey: byte array option) =
+                if i >= arr.Length then
+                    List.rev acc |> Array.ofList
+                else
+                    let e = arr.[i]
+
+                    match emittedKey with
+                    | Some k when Bytes.compare k e.Key = 0 -> collapse acc arr (i + 1) emittedKey
+                    | _ when not (isVisible visible e) -> collapse acc arr (i + 1) emittedKey
+                    | _ -> collapse (e :: acc) arr (i + 1) (Some e.Key)
+
+            collapse [] items 0 None
+
         let memSeq =
             Memtable.rangeScan engine.Mem startKey 0
             |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
@@ -244,38 +194,22 @@ module internal StorageEngine =
         let files =
             Version.allFiles engine.Version
             |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
-            |> List.sortByDescending (fun f -> f.FileNumber)
+            |> List.sortByDescending _.FileNumber
 
-        foldFiles (entriesOf engine) (fun acc entries -> entries :: acc) [] files
+        FileMetaData.foldFiles (entriesOf engine startKey) (fun acc entries -> entries :: acc) [] files
         |> Result.map (fun sources ->
             let ordered = List.rev sources
-            let merged = SstEntry.mergeSorted (memSeq :: ordered) |> collapseDuplicates visible
+            let merged = memSeq :: ordered |> SstEntry.mergeSorted |> collapseDuplicates visible
+            if limit > 0 then merged |> Array.truncate limit else merged)
 
-            let sliced =
-                if Array.isEmpty startKey then
-                    merged
-                else
-                    merged |> Array.filter (fun e -> Bytes.compare e.Key startKey >= 0)
-
-            if limit > 0 then sliced |> Array.truncate limit else sliced)
-
-    /// 範囲ルックアップ（可視性の制限なし）。
-    let scan (engine: StorageEngine) (startKey: byte array) (limit: int) = scanAt engine None startKey limit
-
-    /// 書き込みバッチ。まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、
+    /// 書き込みバッチ。
+    /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、
     /// それから memtable へ反映する。
     let writeBatch (engine: StorageEngine) (entries: Entry array) =
         if entries.Length = 0 then
             ret engine
         else
             let txnId = engine.NextTxnId
-
-            let records =
-                [
-                    WalRecord.Begin txnId
-                    WalRecord.Batch(txnId, entries)
-                    WalRecord.Commit txnId
-                ]
 
             let apply (wal: WalState) =
                 let mem = Memtable.apply entries engine.Mem
@@ -290,7 +224,14 @@ module internal StorageEngine =
 
                 ret next
 
-            Wal.append engine.Wal engine.Dir records |> Result.bind apply
+            let records =
+                [
+                    WalRecord.Begin txnId
+                    WalRecord.Batch(txnId, entries)
+                    WalRecord.Commit txnId
+                ]
+
+            Wal.append engine.Wal engine.Dir records >>= apply
 
     /// 1 件書く / 消す（put と tombstone の共通。値は entry 側に入っている）。
     let private writeOne (engine: StorageEngine) (entry: Entry) =
@@ -301,67 +242,50 @@ module internal StorageEngine =
 
     /// 1 件書く。
     let put (engine: StorageEngine) (key: byte array) (value: SqlValue array) =
-        writeOne engine (Entry.put key engine.NextSeqNo value)
+        Entry.put key engine.NextSeqNo value |> writeOne engine
 
     /// 1 件削除する（tombstone を書く）。
     let delete (engine: StorageEngine) (key: byte array) =
-        writeOne engine (Entry.delete key engine.NextSeqNo)
-
-    // -----------------------------------------------------------------------
-    // flush
-    // -----------------------------------------------------------------------
-
-    /// WAL のうち最も新しいファイルの番号。
-    let private latestWalNumber (dir: string) =
-        Wal.walFiles dir |> List.choose parseNumber |> List.sort |> List.tryLast
-
-    /// 古い WAL をすべて消してから、新しい番号の空ファイルを作る。
-    /// 順序が重要：先に作ると次に消す対象に入ってしまう。
-    let private rotateWal (engine: StorageEngine) (next: WalState) =
-        protect (fun () -> Wal.walFiles engine.Dir |> List.iter (fun p -> File.Delete p) |> ignore)
-        >>= fun () ->
-            Wal.create engine.Dir next.FileNumber
-            >>= fun _ ->
-                let updated: StorageEngine = { engine with Wal = next }
-
-                ret updated
-
-    /// flush の最後段（MANIFEST 反映済み）。CE の外に切り出しているのは、
-    /// `result { }` の中では `>>=` が計算式の Bind に取られてしまうため。
-    let private finishFlush (engine: StorageEngine) (version: RykDb.Core.Version) (manifestNumber: int64) =
-        rotateWal engine (Wal.rotate engine.Wal)
-        >>= fun rotated ->
-            let next: StorageEngine =
-                { rotated with
-                    Version =
-                        { version with
-                            NextFileNumber = version.NextFileNumber + 1L
-                            SequenceNumber = engine.Version.SequenceNumber + 1UL
-                        }
-                    ManifestNumber = manifestNumber
-                    Mem = Memtable.empty
-                }
-
-            ret next
+        Entry.delete key engine.NextSeqNo |> writeOne engine
 
     /// memtable を L0 の SSTable にして書き出す。
     /// memtable が空なら何もしない（WAL も切り替えない）。
     let flush (engine: StorageEngine) =
+        /// 古い WAL をすべて消してから、新しい番号の空ファイルを作る。
+        /// 順序が重要：先に作ると次に消す対象に入ってしまう。
+        let rotateWal (engine: StorageEngine) (next: WalState) =
+            protect (fun () -> Wal.walFiles engine.Dir |> List.iter System.IO.File.Delete |> ignore)
+            >>= fun () ->
+                Wal.create engine.Dir next.FileNumber
+                >>= fun _ -> ret { engine with Wal = next }
+
+        /// flush の最後段（MANIFEST 反映済み）。
+        /// CE の外に切り出しているのは、`result { }` の中では `>>=` が計算式の Bind に取られてしまうため。
+        let finishFlush (engine: StorageEngine) (version: Version) (manifestNumber: int64) =
+            rotateWal engine (Wal.rotate engine.Wal)
+            >>= fun rotated ->
+                ret
+                    { rotated with
+                        Version =
+                            { version with
+                                NextFileNumber = version.NextFileNumber + 1L
+                                SequenceNumber = engine.Version.SequenceNumber + 1UL
+                            }
+                        ManifestNumber = manifestNumber
+                        Mem = Memtable.empty
+                    }
+
         if engine.Mem.Count = 0 then
             ret engine
         else
-            let entries = Memtable.toArray engine.Mem
-            let sst = entries |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
             let fileNumber = engine.Version.NextFileNumber
 
-            FileMetaData.writeSstable engine.Dir fileNumber 0 BloomFalsePositiveRate sst
-            |> Result.bind (fun meta ->
-                Manifest.logAndApply engine.Dir engine.ManifestNumber engine.Version (VersionEdit.addFile meta)
-                |> Result.bind (fun (version, manifestNumber) -> finishFlush engine version manifestNumber))
-
-    // -----------------------------------------------------------------------
-    // Compaction
-    // -----------------------------------------------------------------------
+            Memtable.toArray engine.Mem
+            |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+            |> FileMetaData.writeSstable engine.Dir fileNumber 0 BloomFalsePositiveRate
+            >>= (VersionEdit.addFile
+                 >> Manifest.logAndApply engine.Dir engine.ManifestNumber engine.Version)
+            >>= fun (version, manifestNumber) -> finishFlush engine version manifestNumber
 
     /// 1 回の Leveled compaction を行う。
     /// 手順:
@@ -379,21 +303,19 @@ module internal StorageEngine =
                 engine.Compaction
                 engine.ActiveSnapshot
                 engine.Version.NextFileNumber
-                (entriesOf engine)
+                (entriesOf engine [||])
         with
         | Error e -> Error e
-        | Ok(result, _info) ->
+        | Ok(result, _) ->
             if List.isEmpty result.Added && List.isEmpty result.Removed then
                 ret engine
             else
-                let edit =
-                    {
-                        VersionEdit.AddedFiles = result.Added
-                        DeletedFiles = result.Removed
-                    }
-
-                Manifest.logAndApply engine.Dir engine.ManifestNumber engine.Version edit
-                |> Result.bind (fun (version, manifestNumber) ->
+                {
+                    VersionEdit.AddedFiles = result.Added
+                    DeletedFiles = result.Removed
+                }
+                |> Manifest.logAndApply engine.Dir engine.ManifestNumber engine.Version
+                >>= fun (version, manifestNumber) ->
                     Compaction.deleteObsolete engine.Dir result.Removed
                     |> Result.map (fun () ->
                         let nextNum =
@@ -412,77 +334,81 @@ module internal StorageEngine =
                                 }
                             ManifestNumber = manifestNumber
                             Cache = cache
-                        }))
+                        })
 
     /// 必要なら compaction する。
     let maybeCompact (engine: StorageEngine) = compactOnce engine
 
     /// 最古の active snapshot の SeqNo を進める（GC の基準）。
     let setActiveSnapshot (seqNo: uint64) (engine: StorageEngine) =
-        let next =
-            { engine with
-                ActiveSnapshot = max engine.ActiveSnapshot seqNo
-            }
+        { engine with
+            ActiveSnapshot = max engine.ActiveSnapshot seqNo
+        }
 
-        next
+    /// データベースを開く（新規なら作る）。
+    let openDatabase (dir: string) =
+        /// MANIFEST が指すファイルのうち、存在しないものを Version から落とす。
+        /// （クラッシュ時に flush の MANIFEST だけが書かれ、SSTable が無い状態から復旧する）
+        let dropMissingFiles (dir: string) (manifestNumber: int64) (version: Version) =
+            let missing =
+                Version.allFiles version
+                |> List.filter (fun f -> not (System.IO.File.Exists(Sstable.path dir f.FileNumber)))
 
-    // -----------------------------------------------------------------------
-    // open / close（復旧）
-    // -----------------------------------------------------------------------
-
-    /// MANIFEST が指すファイルのうち、存在しないものを Version から落とす。
-    /// （クラッシュ時に flush の MANIFEST だけが書かれ、SSTable が無い状態から復旧する）
-    let private dropMissingFiles (dir: string) (manifestNumber: int64) (version: RykDb.Core.Version) =
-        let missing =
-            Version.allFiles version
-            |> List.filter (fun f -> not (File.Exists(Sstable.path dir f.FileNumber)))
-
-        if List.isEmpty missing then
-            ret (version, manifestNumber)
-        else
-            let edit =
+            if List.isEmpty missing then
+                ret (version, manifestNumber)
+            else
                 {
                     VersionEdit.AddedFiles = []
                     DeletedFiles = missing
                 }
+                |> Manifest.logAndApply dir manifestNumber version
 
-            Manifest.logAndApply dir manifestNumber version edit
+        /// ディレクトリにある SSTable のファイル番号（孤児削除と open 時の復元で使う）。
+        let sstNumbersOnDisk (dir: string) =
+            System.IO.Directory.GetFiles(dir, "*.sst") |> Array.choose parseNumber
 
-    /// MANIFEST に載っていない .sst（孤児）を消す。
-    let private deleteOrphans (dir: string) (version: RykDb.Core.Version) =
-        let referenced =
-            Version.allFiles version |> List.map (fun f -> f.FileNumber) |> Set.ofList
+        /// MANIFEST に載っていない .sst（孤児）を消す。
+        let deleteOrphans (dir: string) (version: Version) =
+            let referenced =
+                Version.allFiles version |> List.map (fun f -> f.FileNumber) |> Set.ofList
 
-        let onDisk = sstNumbersOnDisk dir
-        let orphans = onDisk |> Array.filter (fun n -> not (Set.contains n referenced))
+            let orphans =
+                sstNumbersOnDisk dir |> Array.filter (fun n -> not (Set.contains n referenced))
 
-        protect (fun () -> orphans |> Array.iter (fun n -> File.Delete(Sstable.path dir n)) |> ignore)
+            protect (fun () ->
+                orphans
+                |> Array.iter (fun n -> System.IO.File.Delete(Sstable.path dir n))
+                |> ignore)
 
-    /// 既存データの中で最大の seqNo を求める。
-    /// WAL が空でも新しい seqNo が既存版より小さくならないようにするため。
-    /// 全 SSTable の全エントリを走査する（O(全エントリ)）。
-    let private maxSeqNoOnDisk (dir: string) (version: RykDb.Core.Version) =
-        foldFiles
-            (entriesAt dir)
-            (fun (acc: uint64) entries -> max acc (SstEntry.maxSeqNo entries))
-            0UL
-            (Version.allFiles version)
+        /// WAL のうち最も新しいファイルの番号。
+        let latestWalNumber (dir: string) =
+            Wal.walFiles dir |> List.choose parseNumber |> List.sort |> List.tryLast
 
-    /// ディレクトリ内の全ファイル番号（SSTable と WAL）。
-    let private maxFileNumberOnDisk (dir: string) =
-        let ssts = sstNumbersOnDisk dir
+        /// ファイル 1つを読んで startKey 以降の全エントリを配列にする
+        /// （読む側。engine が無い復旧時 = キャッシュなし）。
+        let entriesAt (dir: string) (startKey: byte array) (f: FileMetaData) =
+            readFileBytes dir f.FileNumber
+            >>= Sstable.openTable
+            >>= readEntriesFrom startKey
 
-        let wals = Wal.walFiles dir |> List.choose parseNumber
+        /// 既存データの中で最大の seqNo を求める。
+        /// WAL が空でも新しい seqNo が既存版より小さくならないようにするため。
+        /// 全 SSTable の全エントリを走査する（O(全エントリ)）。
+        let maxSeqNoOnDisk (dir: string) (version: Version) =
+            FileMetaData.foldFiles
+                (entriesAt dir [||])
+                (fun (acc: uint64) entries -> max acc (SstEntry.maxSeqNo entries))
+                0UL
+                (Version.allFiles version)
 
-        Array.append ssts (wals |> List.toArray)
-        |> Array.fold (fun acc n -> max acc n) 0L
+        /// ディレクトリ内の全ファイル番号（SSTable と WAL）。
+        let maxFileNumberOnDisk (dir: string) =
+            let ssts = sstNumbersOnDisk dir
+            let wals = Wal.walFiles dir |> List.choose parseNumber |> List.toArray
+            Array.append ssts wals |> Array.fold (fun acc n -> max acc n) 0L
 
-    /// データベースを開く（新規なら作る）。
-    let openDatabase (dir: string) =
-        let build (manifestNumber: int64) (version: RykDb.Core.Version) (walState: WalState) (nextSeqNo: uint64) =
-            let blank = emptyEngine dir
-
-            { blank with
+        let build (manifestNumber: int64) (version: Version) (walState: WalState) (nextSeqNo: uint64) =
+            { emptyEngine dir with
                 ManifestNumber = manifestNumber
                 Version = version
                 Wal = walState
@@ -500,12 +426,12 @@ module internal StorageEngine =
                         | Some n -> n
                         | None -> version.NextFileNumber
 
-                    match File.Exists(Wal.path dir walNumber) with
+                    match System.IO.File.Exists(Wal.path dir walNumber) with
                     | true ->
                         ret
                             {
                                 FileNumber = walNumber
-                                Size = int (FileInfo(Wal.path dir walNumber).Length)
+                                Size = int (System.IO.FileInfo(Wal.path dir walNumber).Length)
                             }
                     | false -> Wal.create dir walNumber
                     >>= fun walState ->
@@ -533,14 +459,4 @@ module internal StorageEngine =
         flush engine
         |> Result.map (fun e ->
             Wal.walFiles e.Dir
-            |> List.iter (fun p -> protect (fun () -> File.Delete p) |> ignore))
-
-    /// 統計（テストと診断用）。
-    let stats (engine: StorageEngine) =
-        {
-            StorageStats.Entries = engine.Mem.Count
-            MemBytes = engine.Mem.ApproxBytes
-            WalBytes = engine.Wal.Size
-            FileCount = engine.Version |> Version.allFiles |> List.length
-            Levels = engine.Version |> Version.levelCounts
-        }
+            |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore))

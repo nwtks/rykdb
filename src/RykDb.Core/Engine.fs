@@ -35,7 +35,7 @@ type StatementResult =
 
             header :: System.String('-', header.Length) :: Array.toList body
 
-/// DB の状態。不変。
+/// DB の状態。
 type internal DbState =
     {
         Root: string
@@ -94,7 +94,7 @@ module internal Ddl =
         | None -> ret state
         | Some defn ->
             Catalog.toSchema defn
-            |> Result.bind (fun schema ->
+            >>= fun schema ->
                 let withIndex =
                     { schema with
                         Indexes = idx :: schema.Indexes
@@ -103,20 +103,18 @@ module internal Ddl =
                 let mgr, txn = TransactionManager.beginTxn state.Manager
 
                 Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
-                |> Result.bind (fun rows ->
-                    rows
-                    |> foldOk
+                >>= foldOk
                         (fun t row ->
                             let key = RowKey.indexKey withIndex idx row
                             ret (Transaction.put t (Keyspace.index idx.Name) key row))
-                        txn)
-                |> Result.bind (fun txn2 ->
+                        txn
+                >>= fun txn2 ->
                     DbStateOps.commitToStore state.Store mgr txn2
                     |> Result.map (fun (store, mgr2) ->
                         { state with
                             Store = store
                             Manager = mgr2
-                        })))
+                        })
 
     let createIndex (state: DbState) (ci: CreateIndex) =
         match Catalog.findTable state.Catalog ci.Table with
@@ -146,7 +144,7 @@ module internal Ddl =
                     let next = Catalog.addIndex state.Catalog defn
 
                     saved state next
-                    |> Result.bind (fun withCatalog -> backfillIndex withCatalog ci.Table idxSchema)
+                    >>= fun withCatalog -> backfillIndex withCatalog ci.Table idxSchema
 
     /// DROP まわりの共通処理。
     /// 見つからなければ ifExists 次第、見つかったら削除してからカタログを保存する。

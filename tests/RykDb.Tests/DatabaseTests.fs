@@ -818,7 +818,7 @@ let ``性能: 多数行の insert → point lookup → range scan`` () =
 
 [<Fact>]
 let ``末尾再帰: 大量の文を 1 度の Execute で実行できる`` () =
-    // Execute の go は `runStatement … |> Result.bind (fun … -> go …)` で
+    // Execute の runStatements は `runStatement … |> Result.bind (fun … -> runStatements …)` で
     // 文の数だけフレームが積まれていた（→ StackOverflow / exit 134）。
     // `match` で受けて末尾再帰にしてある。
     let n = 20_000

@@ -7,10 +7,6 @@
 
 module RykDb.Client
 
-open System
-open System.IO
-open System.Net.Sockets
-open System.Text
 open RykDb.Server
 
 /// サーバの応答。
@@ -21,10 +17,15 @@ type Reply =
 
 /// TCP 経由の SQL クライアント。
 type RykDbClient(host: string, port: int) =
-    let client = new TcpClient(host, port)
+    let client = new System.Net.Sockets.TcpClient(host, port)
     let stream = client.GetStream()
-    let reader = new StreamReader(stream, Encoding.UTF8, false, 1024, true)
-    let writer = new StreamWriter(stream, Encoding.UTF8, 1024, true)
+
+    let reader =
+        new System.IO.StreamReader(stream, System.Text.Encoding.UTF8, false, 1024, true)
+
+    let writer =
+        new System.IO.StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
+
     do writer.AutoFlush <- true
 
     member _.Send(line: string) =
@@ -36,9 +37,9 @@ type RykDbClient(host: string, port: int) =
                 let h = reader.ReadLine()
                 if isNull h then None else Some h
             with
-            | :? IOException -> None
-            | :? SocketException -> None
-            | :? ObjectDisposedException -> None
+            | :? System.IO.IOException -> None
+            | :? System.Net.Sockets.SocketException -> None
+            | :? System.ObjectDisposedException -> None
 
         match header with
         | None -> Halt
@@ -47,11 +48,11 @@ type RykDbClient(host: string, port: int) =
         | Some h ->
             let body = h.Substring(OkTag.Length).Trim()
 
-            match body.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries) with
+            match body.Split([| ' '; '\t' |], System.StringSplitOptions.RemoveEmptyEntries) with
             | [||] -> Rows([], [])
             | parts ->
                 let count =
-                    match Int32.TryParse parts.[0] with
+                    match System.Int32.TryParse parts.[0] with
                     | true, n when n >= 0 -> n
                     | _ -> 0
 
@@ -82,5 +83,5 @@ type RykDbClient(host: string, port: int) =
         stream.Dispose()
         client.Dispose()
 
-    interface IDisposable with
+    interface System.IDisposable with
         member this.Dispose() = this.Close()

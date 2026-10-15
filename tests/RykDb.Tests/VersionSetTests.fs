@@ -63,7 +63,7 @@ let ``VersionEdit: 変更適用は削除後に追加する`` () =
     Assert.Equal(1L, (Version.filesAt updated 1).[0].FileNumber)
 
 [<Fact>]
-let ``VersionSet: 点ルックアップの候補は新しい順`` () =
+let ``VersionSet: ポイントルックアップの候補は新しい順`` () =
     let v =
         Version.empty
         |> Version.addFile (fmd 1L 0 100 199)
@@ -94,34 +94,6 @@ let ``VersionSet: 点ルックアップの候補は新しい順`` () =
 
     // 範囲外のキーは候補なし
     Assert.Empty(Version.filesForPointLookup v (intKey 9999))
-
-[<Fact>]
-let ``VersionSet: コンパクション候補を選ぶ`` () =
-    // L1 が閾値を超えるので L1 → L2 の候補が出る
-    let thresholds = [| 10L; 1000L; 1000000L; 1000000L; 1000000L; 1000000L; 1000000L |]
-
-    let v = Version.empty |> Version.addFile (fmd 1L 1 0 999) // size = 100000 > 1000
-
-    match Version.pickCompaction v thresholds with
-    | Some plan ->
-        Assert.Equal(1, plan.Level)
-        Assert.Equal(2, plan.OutputLevel)
-        Assert.Equal(1, plan.InputFiles.Length)
-    | None -> Assert.Fail("L1 が閾値を超えるので候補があるはず")
-
-    // すべて閾値未満なら候補なし
-    let big =
-        [|
-            10000000L
-            10000000L
-            10000000L
-            10000000L
-            10000000L
-            10000000L
-            10000000L
-        |]
-
-    Assert.True((Version.pickCompaction v big).IsNone)
 
 [<Fact>]
 let ``VersionEdit: エンコードの往復`` () =

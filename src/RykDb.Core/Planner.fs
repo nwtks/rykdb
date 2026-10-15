@@ -87,7 +87,7 @@ module internal Binder =
             | [ q ] -> Some q
             | _ -> None
 
-        let rec go (x: Expr) =
+        let rec qualifyExpr (x: Expr) =
             match x with
             | Expr.Literal l -> retE (Expr.Literal l)
             | Expr.Column c ->
@@ -103,9 +103,9 @@ module internal Binder =
                 | None -> retE x
             | Expr.Star -> retE x
             | Expr.QualifiedStar _ -> retE x
-            | _ -> Expr.mapChildrenM go x
+            | _ -> Expr.mapChildrenM qualifyExpr x
 
-        go e
+        qualifyExpr e
 
     /// 式が参照している列の修飾名（すべて小文字）。
     let private columnsOf (e: Expr) =
@@ -132,12 +132,12 @@ module internal Binder =
 module internal Predicate =
     /// `AND` を平坦化して conjunct のリストにする。
     let splitConjuncts (e: Expr) =
-        let rec go (acc: Expr list) (x: Expr) =
+        let rec flatten (acc: Expr list) (x: Expr) =
             match x with
-            | Expr.Binary(BinaryOp.And, a, b) -> go (go acc a) b
+            | Expr.Binary(BinaryOp.And, a, b) -> flatten (flatten acc a) b
             | _ -> acc @ [ x ]
 
-        go [] e
+        flatten [] e
 
     /// conjunct を全部 `AND` で繋ぎ直す。
     let joinConjuncts (parts: Expr list) =
@@ -202,12 +202,12 @@ module internal Analyzer =
                 | _ -> None
             | _ -> None
 
-        let rec go (x: Expr) =
+        let rec search (x: Expr) =
             match x with
             | Expr.Binary(BinaryOp.And, a, b) ->
-                match go a with
+                match search a with
                 | Some r -> Some r
-                | None -> go b
+                | None -> search b
             | Expr.Binary(BinaryOp.Eq, a, b) ->
                 match colOf a, litOf b with
                 | Some n, Some v -> Some(n, v)
@@ -217,7 +217,7 @@ module internal Analyzer =
                     | _ -> None
             | _ -> None
 
-        go e
+        search e
 
     /// WHERE から等価条件を探して走査方法を決める。
     let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
@@ -301,19 +301,19 @@ module internal Optimizer =
             | None -> ret None
             | Some h ->
                 Binder.qualifyMany schema [ h ]
-                |> Result.bind (fun hs ->
+                >>= fun hs ->
                     match hs with
                     | [ hv ] -> ret (Some hv)
-                    | _ -> Error(DbError.internalError "HAVING の修飾に失敗"))
+                    | _ -> Error(DbError.internalError "HAVING の修飾に失敗")
 
         let groupStage = Binder.qualifyMany schema stmt.GroupBy
 
         aggStage
-        |> Result.bind (fun (selectAggs, orderAggs) ->
+        >>= fun (selectAggs, orderAggs) ->
             havingStage
-            |> Result.bind (fun having ->
+            >>= fun having ->
                 groupStage
-                |> Result.bind (fun groupBy ->
+                >>= fun groupBy ->
                     let allAggs = selectAggs @ orderAggs
                     let hasAgg = not (List.isEmpty allAggs)
                     let hasGroupBy = not (List.isEmpty groupBy)
@@ -325,7 +325,7 @@ module internal Optimizer =
 
                         match having with
                         | None -> ret aggNode
-                        | Some hv -> ret (Logical.Having(hv, allAggs, groupBy, aggNode)))))
+                        | Some hv -> ret (Logical.Having(hv, allAggs, groupBy, aggNode))
 
     /// ORDER BY を掛ける。
     let private applySort (schema: Schema) (tree: Logical) (stmt: SelectStatement) =
@@ -438,7 +438,7 @@ module internal Optimizer =
                                             Binder.qualify allSchema item.Expression
                                             |> Result.map (fun e -> { item with Expression = e }))
                                         |> all
-                                        |> Result.bind (fun items ->
+                                        >>= fun items ->
                                             let projected = Logical.Project(items, withSorted)
 
                                             let deduped =
@@ -447,7 +447,7 @@ module internal Optimizer =
                                                 else
                                                     projected
 
-                                            applyLimit deduped stmt)
+                                            applyLimit deduped stmt
 
     /// 走査を実行する。
     let private execScan (ctx: ExecContext) (name: string) (method: ScanMethod) =
@@ -652,7 +652,7 @@ module internal Plan =
                     let realName = r.Name
 
                     c.SchemaOf realName
-                    |> Result.bind (fun schema ->
+                    >>= fun schema ->
                         let c1 = c.WithSchema realName schema
 
                         let c2 =
@@ -660,7 +660,7 @@ module internal Plan =
                             | None -> c1
                             | Some a -> c1.WithSchema a schema
 
-                        ret (c2, acc.Concat(Schema.ofTable realName r.Alias schema))))
+                        ret (c2, acc.Concat(Schema.ofTable realName r.Alias schema)))
                 (ctx, Schema.empty)
 
         // 識別名が重複すると exec が「右テーブルを除いたスキーマ」を名前で引けず、

@@ -1,9 +1,7 @@
 namespace RykDb.Core
 
-open System
-open System.IO
-
-/// 失敗の分類。エラー報告と回復可能性の判断に使う。
+/// 失敗の分類。
+/// エラー報告と回復可能性の判断に使う。
 [<RequireQualifiedAccess>]
 type ErrorKind =
     /// トークナイザ/パーサが文法を満たさない入力を検出した
@@ -48,7 +46,8 @@ module DbError =
             Detail = None
         }
 
-    /// 構文エラー。行番号を伴う。
+    /// 構文エラー。
+    /// 行番号を伴う。
     let syntax message line =
         {
             Kind = ErrorKind.SyntaxError
@@ -57,21 +56,21 @@ module DbError =
             Detail = None
         }
 
-    let name message = create ErrorKind.NameError message
-    let typeError message = create ErrorKind.TypeError message
+    let inline name message = create ErrorKind.NameError message
+    let inline typeError message = create ErrorKind.TypeError message
 
-    let constraintViolation message =
+    let inline constraintViolation message =
         create ErrorKind.ConstraintViolation message
 
-    let notFound message = create ErrorKind.NotFound message
-    let alreadyExists message = create ErrorKind.AlreadyExists message
-    let capacity message = create ErrorKind.CapacityError message
+    let inline notFound message = create ErrorKind.NotFound message
+    let inline alreadyExists message = create ErrorKind.AlreadyExists message
+    let inline capacity message = create ErrorKind.CapacityError message
 
-    let corruption message =
+    let inline corruption message =
         create ErrorKind.CorruptionError message
 
-    let conflict message = create ErrorKind.ConflictError message
-    let internalError message = create ErrorKind.InternalError message
+    let inline conflict message = create ErrorKind.ConflictError message
+    let inline internalError message = create ErrorKind.InternalError message
 
     /// .NET の I/O 例外を DbError に包む。
     let io (e: exn) =
@@ -127,62 +126,61 @@ type internal DbResultBuilder() =
     member _.DelayFinal(f: unit -> Result<'a, DbError>) = f ()
 
 /// Result の組み合わせ演算子。
-/// x |> f 形式だと読み取りにくい箇所で x >>= fun v -> ... と書けるOperatorsを用意する。
 /// AutoOpen にして RykDb.Core 配下で常に使えるようにする。
 /// これらは Result<'_, DbError> 専用で、制御フローに例外を使わない。
 [<AutoOpen>]
 module internal ResultOps =
-    /// Result 計算式で使うビルダ。result { ... } と書ける。
+    /// Result 計算式で使うビルダ。
     let result = DbResultBuilder()
 
-    /// フラットな bind。x >>= fun v -> ... と書ける。
-    let (>>=) (x: Result<'a, DbError>) (f: 'a -> Result<'b, DbError>) =
+    /// フラットな bind。
+    let inline (>>=) (x: Result<'a, DbError>) (f: 'a -> Result<'b, DbError>) =
         match x with
         | Ok v -> f v
         | Error e -> Error e
 
-    /// 最初の Ok の値を捨て、2 つ目を返す。x *> y。
-    let ( *> ) (x: Result<'a, DbError>) (y: Result<'b, DbError>) =
+    /// 最初の Ok の値を捨て、2つ目を返す。
+    let inline ( *> ) (x: Result<'a, DbError>) (y: Result<'b, DbError>) =
         match x with
         | Ok _ -> y
         | Error e -> Error e
 
-    let ret (x: 'a) = Ok x
+    let inline ret (x: 'a) = Ok x
 
-    let err (e: DbError) = Error e
+    let inline err (e: DbError) = Error e
 
-    let ofOption onNone (o: 'a option) =
+    let inline ofOption onNone (o: 'a option) =
         match o with
         | Some v -> Ok v
         | None -> Error onNone
 
-    let tryGet (r: Result<'a, DbError>) =
+    let inline tryGet (r: Result<'a, DbError>) =
         match r with
         | Ok v -> Some v
         | Error _ -> None
 
-    let valueOr (fallback: 'a) (r: Result<'a, DbError>) =
+    let inline valueOr (fallback: 'a) (r: Result<'a, DbError>) =
         match r with
         | Ok v -> v
         | Error _ -> fallback
 
-    /// Result の列を全て Ok になるまで畳み込む。1 つでも Error があればそれを返す。
+    /// Result の列を全て Ok になるまで畳み込む。
+    /// 1つでも Error があればそれを返す。
     let all (rs: Result<'a, DbError> seq) =
         rs
         |> Seq.fold
             (fun acc r ->
                 match acc, r with
-                | Error e, _ -> Error e
+                | Error e, _
                 | _, Error e -> Error e
                 | Ok acc, Ok v -> Ok(v :: acc))
             (ret [])
         |> Result.map List.rev
 
-    /// 状態を受け取り Result を返す `step` で列を左から畳み込む Result 版 fold。
+    /// 状態を受け取り Result を返す step で列を左から畳み込む Result 版 fold。
     /// 最初の Error で打ち切り、残りの項目は評価しない。
-    /// `xs |> Array.fold (fun acc x -> acc >>= fun s -> step s x) (ret state)`
-    /// と書く手書きパターン（コピペで散らばっていたもの）をこれに集約する。
-    /// 空の列は `Ok state` を返す。副作用は `step` に任せる。
+    /// 空の列は Ok state を返す。
+    /// 副作用は step に任せる。
     let foldOk (step: 's -> 'a -> Result<'s, DbError>) (state: 's) (items: 'a seq) =
         items
         |> Seq.fold
@@ -197,9 +195,9 @@ module internal ResultOps =
         try
             Ok(f ())
         with
-        | :? IOException as e -> Error(DbError.io e)
-        | :? UnauthorizedAccessException as e -> Error(DbError.io e)
-        | :? InvalidDataException as e -> Error(DbError.corruption e.Message)
-        | :? FormatException as e -> Error(DbError.corruption e.Message)
-        | :? OverflowException as e -> Error(DbError.corruption e.Message)
+        | :? System.IO.IOException as e -> Error(DbError.io e)
+        | :? System.UnauthorizedAccessException as e -> Error(DbError.io e)
+        | :? System.IO.InvalidDataException as e -> Error(DbError.corruption e.Message)
+        | :? System.FormatException as e -> Error(DbError.corruption e.Message)
+        | :? System.OverflowException as e -> Error(DbError.corruption e.Message)
         | e -> Error(DbError.internalError e.Message)

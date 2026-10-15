@@ -252,5 +252,5 @@ let ``末尾再帰: 長い varint を読み書きできる`` () =
         let w = Writer.varint v Writer.empty
         let arr = Writer.toArray w
         Assert.Equal(bytes, arr.Length)
-        let got, _ = ok (Read.readVarint (Cursor.create arr))
+        let got, _ = ok (Reader.readVarint (Cursor.create arr))
         Assert.Equal(v, got)

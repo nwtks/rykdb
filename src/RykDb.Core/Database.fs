@@ -91,7 +91,7 @@ type Database internal (root: string, state: DbState) =
     member _.Execute(sql: string) =
         let results = ResizeArray<StatementResult>()
 
-        let rec go (st: DbState) (rest: Statement list) =
+        let rec runStatements (st: DbState) (rest: Statement list) =
             match rest with
             | [] -> ret st
             | stmt :: tail ->
@@ -114,7 +114,7 @@ type Database internal (root: string, state: DbState) =
                             | Statement.Delete _ -> nextState
                             | _ -> { nextState with Pending = st.Pending }
 
-                        go carried tail
+                        runStatements carried tail
                 | None ->
                     let mgr, txn = TransactionManager.beginTxn st.Manager
 
@@ -139,11 +139,11 @@ type Database internal (root: string, state: DbState) =
                             | Error e -> Error e
                             | Ok nextState ->
                                 results.Add result
-                                go nextState tail
+                                runStatements nextState tail
 
         Parser.parseStatements sql
         >>= fun stmts ->
-            go state stmts
+            runStatements state stmts
             |> Result.map (fun finalState ->
                 let selects =
                     results |> Seq.filter (fun r -> not (Array.isEmpty r.Columns)) |> Seq.toList
@@ -174,7 +174,7 @@ module Database =
     /// DB を開く。
     let openWith (root: string) =
         protect (fun () -> Directory.CreateDirectory root |> ignore)
-        |> Result.bind (fun () ->
+        >>= fun () ->
             RowStore.openStore root
             >>= fun store ->
                 Catalog.load store
@@ -199,4 +199,4 @@ module Database =
                             Active = None
                             Pending = None
                         }
-                    )))
+                    ))

@@ -11,11 +11,6 @@
 
 module RykDb.Server
 
-open System
-open System.IO
-open System.Net.Sockets
-open System.Text
-open System.Threading
 open RykDb.Core
 
 [<Literal>]
@@ -31,18 +26,24 @@ let private encode (columns: string array) (rows: SqlValue array array) =
     if rows.Length = 0 then
         sprintf "%s %d" OkTag rows.Length
     else
-        let header = sprintf "%s %d\t%s" OkTag rows.Length (String.Join(",", columns))
+        let header =
+            sprintf "%s %d\t%s" OkTag rows.Length (System.String.Join(",", columns))
 
         let body =
             rows
             |> Array.map (fun r -> r |> Array.map SqlLiteral.toSqlLiteral |> String.concat ",")
 
-        String.Join("\n", Array.append [| header |] body)
+        System.String.Join("\n", Array.append [| header |] body)
 
-let private handleClient (db: Database) (client: TcpClient) (onLog: string -> unit) =
+let private handleClient (db: Database) (client: System.Net.Sockets.TcpClient) (onLog: string -> unit) =
     use stream = client.GetStream()
-    use reader = new StreamReader(stream, Encoding.UTF8, false, 1024, true)
-    use writer = new StreamWriter(stream, Encoding.UTF8, 1024, true)
+
+    use reader =
+        new System.IO.StreamReader(stream, System.Text.Encoding.UTF8, false, 1024, true)
+
+    use writer =
+        new System.IO.StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
+
     writer.AutoFlush <- true
 
     let send (line: string) =
@@ -92,7 +93,12 @@ let private handleClient (db: Database) (client: TcpClient) (onLog: string -> un
 
     onLog "切断されました"
 
-let serve (db: Database) (listener: TcpListener) (stop: CancellationToken) (onLog: string -> unit) =
+let serve
+    (db: Database)
+    (listener: System.Net.Sockets.TcpListener)
+    (stop: System.Threading.CancellationToken)
+    (onLog: string -> unit)
+    =
     use _ =
         stop.Register(fun _ ->
             try
@@ -115,17 +121,17 @@ let serve (db: Database) (listener: TcpListener) (stop: CancellationToken) (onLo
 
             try
                 if client.Client.Connected then
-                    client.Client.Shutdown SocketShutdown.Send
+                    client.Client.Shutdown System.Net.Sockets.SocketShutdown.Send
             with _ ->
                 ()
 
             client.Close()
             onLog (sprintf "[%d] 切断されました" clientId)
         with
-        | :? ObjectDisposedException -> ()
-        | :? InvalidOperationException when stop.IsCancellationRequested -> ()
-        | :? SocketException when stop.IsCancellationRequested -> ()
-        | :? SocketException -> ()
+        | :? System.ObjectDisposedException -> ()
+        | :? System.InvalidOperationException when stop.IsCancellationRequested -> ()
+        | :? System.Net.Sockets.SocketException when stop.IsCancellationRequested -> ()
+        | :? System.Net.Sockets.SocketException -> ()
         | ex ->
             if not stop.IsCancellationRequested then
                 onLog (sprintf "接続処理で例外: %s" ex.Message)

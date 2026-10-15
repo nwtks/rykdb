@@ -208,7 +208,7 @@ module internal RowStore =
     /// </remarks>
     let openStore (root: string) =
         protect (fun () -> Directory.CreateDirectory root |> ignore)
-        |> Result.bind (fun () ->
+        >>= fun () ->
             let known =
                 Directory.GetDirectories root
                 |> Array.choose (fun dir ->
@@ -218,7 +218,7 @@ module internal RowStore =
                     | Some ks -> Some(ks, dir)
                     | None -> None)
 
-            let rec go (rest: (string * string) list) (acc: Map<string, StorageEngine * string>) =
+            let rec openEngines (rest: (string * string) list) (acc: Map<string, StorageEngine * string>) =
                 match rest with
                 | [] -> ret acc
                 | (ks, dir) :: tail ->
@@ -227,10 +227,10 @@ module internal RowStore =
                     | Ok() ->
                         match StorageEngine.openDatabase dir with
                         | Error err -> Error err
-                        | Ok e -> go tail (Map.add ks (e, dir) acc)
+                        | Ok e -> openEngines tail (Map.add ks (e, dir) acc)
 
-            go (known |> Array.toList) Map.empty
-            |> Result.map (fun engines -> { Root = root; Engines = engines }))
+            openEngines (known |> Array.toList) Map.empty
+            |> Result.map (fun engines -> { Root = root; Engines = engines })
 
     /// 全 keyspace の NextSeqNo の最大値 − 1（＝保存済みの SeqNo）。
     let lastSeqNo (store: RowStore) =
@@ -248,12 +248,12 @@ module internal RowStore =
     /// keyspace ごとにエンジンが独立なので 並列に commit できるのは採番、
     /// ではなく「キー集合が重ならないこと」だから。
     let writeBatches (store: RowStore) (batches: (string * Entry array) list) =
-        let rec go (rest: (string * Entry array) list) (current: RowStore) =
+        let rec writeAll (rest: (string * Entry array) list) (current: RowStore) =
             match rest with
             | [] -> ret current
             | (ks, entries) :: tail ->
                 if Array.isEmpty entries then
-                    go tail current
+                    writeAll tail current
                 else
                     match ensure current ks with
                     | Error err -> Error err
@@ -268,18 +268,18 @@ module internal RowStore =
                                     StorageEngine.NextSeqNo = max updated.NextSeqNo (maxSeq + 1UL)
                                 }
 
-                            go
+                            writeAll
                                 tail
                                 { current with
                                     Engines = Map.add ks (bumped, dir) current.Engines
                                 }
 
-        go batches store
+        writeAll batches store
 
     /// keyspace から読む（SeqNo 制限つき）。
     let getAt (store: RowStore) (keyspace: string) (key: byte array) (visible: uint64 option) =
         engine store keyspace
-        |> Result.bind (fun e -> StorageEngine.getAt e visible key)
+        >>= (fun e -> StorageEngine.getAt e visible key)
         |> Result.map (function
             | None -> None
             | Some sst -> sst.Value)
@@ -287,7 +287,7 @@ module internal RowStore =
     /// keyspace を prefix で走査する（主キー/索引の前方一致）。
     let scanAt (store: RowStore) (keyspace: string) (startKey: byte array) (visible: uint64 option) (limit: int) =
         engine store keyspace
-        |> Result.bind (fun e -> StorageEngine.scanAt e visible startKey limit)
+        >>= (fun e -> StorageEngine.scanAt e visible startKey limit)
         |> Result.map (fun entries ->
             entries
             |> Array.map (fun sst -> sst.Key, sst.Value)
