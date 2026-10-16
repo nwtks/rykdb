@@ -60,7 +60,7 @@ type Database internal (root: string, state: DbState) =
             | None -> state.Active
 
         match target with
-        | None -> Error(DbError.internalError "コミットする transaction がありません")
+        | None -> err (DbError.internalError "コミットする transaction がありません")
         | Some txn ->
             DbStateOps.commitTransaction state txn
             |> Result.map (fun nextState -> Database(root, nextState))
@@ -141,62 +141,60 @@ type Database internal (root: string, state: DbState) =
                                 results.Add result
                                 runStatements nextState tail
 
-        Parser.parseStatements sql
-        >>= fun stmts ->
-            runStatements state stmts
-            |> Result.map (fun finalState ->
-                let selects =
-                    results |> Seq.filter (fun r -> not (Array.isEmpty r.Columns)) |> Seq.toList
+        result {
+            let! stmts = Parser.parseStatements sql
+            let! finalState = runStatements state stmts
 
-                let affected = results |> Seq.sumBy (fun r -> r.RowsAffected)
+            let selects =
+                results |> Seq.filter (fun r -> not (Array.isEmpty r.Columns)) |> Seq.toList
 
-                let summary =
-                    match selects with
-                    | [ s ] -> s
-                    | _ ->
-                        {
-                            RowsAffected = affected
-                            Columns = [||]
-                            Rows = [||]
-                        }
+            let summary =
+                match selects with
+                | [ s ] -> s
+                | _ ->
+                    {
+                        RowsAffected = results |> Seq.sumBy _.RowsAffected
+                        Columns = [||]
+                        Rows = [||]
+                    }
 
-                Database(root, finalState), summary)
+            return Database(root, finalState), summary
+        }
 
     /// SELECT を実行する。戻り値の Database を次の呼び出しに渡すこと。
     member this.Query(sql: string) = this.Execute sql
 
     /// テーブル一覧を返す。
-    member _.TableNames() =
-        state.Catalog.Tables |> List.map (fun t -> t.Name)
+    member _.TableNames() = state.Catalog.Tables |> List.map _.Name
 
 [<RequireQualifiedAccess>]
 module Database =
     /// DB を開く。
     let openWith (root: string) =
-        protect (fun () -> Directory.CreateDirectory root |> ignore)
-        >>= fun () ->
-            RowStore.openStore root
-            >>= fun store ->
-                Catalog.load store
-                |> Result.map (fun catalog ->
-                    let lastSeq = RowStore.lastSeqNo store
+        result {
+            do! protect (fun () -> Directory.CreateDirectory root |> ignore)
+            let! store = RowStore.openStore root
+            let! catalog = Catalog.load store
+            let lastSeq = RowStore.lastSeqNo store
 
-                    let manager =
-                        let fresh = TransactionManager.create ()
+            let manager =
+                let fresh = TransactionManager.create ()
 
-                        { fresh with
-                            LastCommitSeqNo = lastSeq
-                            NextSeqNo = lastSeq + 1UL
-                        }
+                { fresh with
+                    LastCommitSeqNo = lastSeq
+                    NextSeqNo = lastSeq + 1UL
+                }
 
-                    Database(
-                        root,
-                        {
-                            Root = root
-                            Store = store
-                            Catalog = catalog
-                            Manager = manager
-                            Active = None
-                            Pending = None
-                        }
-                    ))
+            return
+                Database(
+                    root,
+                    {
+                        Root = root
+                        Store = store
+                        Catalog = catalog
+                        Manager = manager
+                        Active = None
+                        Pending = None
+                    }
+                )
+        }

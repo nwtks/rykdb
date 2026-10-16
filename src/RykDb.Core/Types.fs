@@ -151,7 +151,7 @@ module internal DataType =
         | 7uy -> ret DataType.Text
         | 8uy -> ret DataType.Blob
         | 9uy -> ret DataType.Uuid
-        | other -> Error(DbError.corruption (sprintf "カタログの型タグ %d は未知です" (int other)))
+        | other -> err (sprintf "カタログの型タグ %d は未知です" (int other) |> DbError.corruption)
 
     /// SQL の型名（DDL の読み書きに使う正準表記）。
     let toSqlName t =
@@ -249,13 +249,13 @@ module internal SqlValue =
             | _ ->
                 match asNumeric a, asNumeric b with
                 | Some da, Some db -> Ok(compare da db)
-                | Some _, None -> Error(DbError.typeError "NaN や ±Infinity は数値比較できません")
-                | None, Some _ -> Error(DbError.typeError "NaN や ±Infinity は数値比較できません")
-                | None, None -> Error(DbError.internalError "数値比較の分岐に到達しませんでした（内部不整合）")
+                | Some _, None -> err (DbError.typeError "NaN や ±Infinity は数値比較できません")
+                | None, Some _ -> err (DbError.typeError "NaN や ±Infinity は数値比較できません")
+                | None, None -> err (DbError.internalError "数値比較の分岐に到達しませんでした（内部不整合）")
 
         match a, b with
         | SqlValue.Null, _
-        | _, SqlValue.Null -> Error(DbError.typeError "NULL は比較できません")
+        | _, SqlValue.Null -> err (DbError.typeError "NULL は比較できません")
         | (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _),
           (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _) -> compareNumeric a b
         | SqlValue.Bool x, SqlValue.Bool y -> Ok(compare (if x then 1 else 0) (if y then 1 else 0))
@@ -275,13 +275,9 @@ module internal SqlValue =
 
             Ok(System.DateTimeOffset.Compare(x, ys))
         | _ ->
-            Error(
-                DbError.typeError (
-                    sprintf
-                        "型 '%s' と '%s' は比較できません"
-                        (dataType a |> DataType.toSqlName)
-                        (dataType b |> DataType.toSqlName)
-                )
+            err (
+                sprintf "型 '%s' と '%s' は比較できません" (dataType a |> DataType.toSqlName) (dataType b |> DataType.toSqlName)
+                |> DbError.typeError
             )
 
     /// 関数・制約メッセージ用の簡潔な表示（SQL リテラルではなく）。
@@ -304,10 +300,9 @@ module internal SqlValue =
     /// 変換できない場合は型エラーを返す。
     let coerce (target: DataType) (v: SqlValue) =
         let fail () =
-            Error(
-                DbError.typeError (
-                    sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
-                )
+            err (
+                sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
+                |> DbError.typeError
             )
 
         let asBoolean (v: SqlValue) =

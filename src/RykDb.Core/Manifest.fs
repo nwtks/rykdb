@@ -51,11 +51,11 @@ module internal Manifest =
     let private readAll (dir: string) (fileNumber: int64) =
         let readRecord (line: string) =
             try
-                VersionEdit.decode (System.Convert.FromBase64String line)
+                System.Convert.FromBase64String line |> VersionEdit.decode
             with
             | :? System.FormatException as e ->
-                Error(sprintf "manifest の base64 が不正: %s" e.Message |> DbError.corruption)
-            | e -> Error(sprintf "manifest のレコードが不正: %s" e.Message |> DbError.corruption)
+                err (sprintf "manifest の base64 が不正: %s" e.Message |> DbError.corruption)
+            | e -> err (sprintf "manifest のレコードが不正: %s" e.Message |> DbError.corruption)
 
         let rec decodeLines (lines: string list) (acc: VersionEdit list) =
             match lines with

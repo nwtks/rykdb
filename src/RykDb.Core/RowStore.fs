@@ -50,7 +50,7 @@ type internal TableSchema =
     member this.RequireIndexOf(column: string) =
         match this.IndexOf column with
         | i when i >= 0 -> ret i
-        | _ -> Error(DbError.name (sprintf "テーブル %s に列 %s がありません" this.Name column))
+        | _ -> err (sprintf "テーブル %s に列 %s がありません" this.Name column |> DbError.name)
 
     /// 主キー列名。
     member this.PrimaryKeyColumns =
@@ -60,7 +60,7 @@ module internal TableSchema =
     /// CreateTable の AST からスキーマを作る。
     let ofCreateTable (c: CreateTable) =
         if c.Columns.IsEmpty then
-            Error(DbError.constraintViolation (sprintf "テーブル %s に列がありません" c.Name))
+            err (sprintf "テーブル %s に列がありません" c.Name |> DbError.constraintViolation)
         else
             let fromConstraint =
                 c.Constraints
@@ -72,19 +72,16 @@ module internal TableSchema =
             let pkNames =
                 match fromConstraint with
                 | Some cols -> cols
-                | None ->
-                    c.Columns
-                    |> List.filter (fun col -> col.Constraint.PrimaryKey)
-                    |> List.map (fun col -> col.Name)
+                | None -> c.Columns |> List.filter _.Constraint.PrimaryKey |> List.map _.Name
 
             if List.isEmpty pkNames then
-                Error(DbError.constraintViolation (sprintf "テーブル %s に主キーがありません" c.Name))
+                err (sprintf "テーブル %s に主キーがありません" c.Name |> DbError.constraintViolation)
             else
                 pkNames
                 |> List.map (fun name ->
                     match c.Columns |> List.tryFindIndex (fun col -> col.Name = name) with
                     | Some i -> ret i
-                    | None -> Error(DbError.name (sprintf "主キー列 %s が定義されていません" name)))
+                    | None -> err (sprintf "主キー列 %s が定義されていません" name |> DbError.name))
                 |> all
                 |> Result.map List.sort
                 |> Result.map (fun pk ->
@@ -98,18 +95,20 @@ module internal TableSchema =
     /// NOT NULL 制約と型を検証する。
     let validateRow (schema: TableSchema) (row: SqlValue array) =
         if row.Length <> schema.Columns.Length then
-            Error(
-                DbError.constraintViolation (
-                    sprintf "テーブル %s は %d 列ですが %d 個の値が渡されました" schema.Name schema.Columns.Length row.Length
-                )
+            err (
+                sprintf "テーブル %s は %d 列ですが %d 個の値が渡されました" schema.Name schema.Columns.Length row.Length
+                |> DbError.constraintViolation
             )
         else
             schema.Columns
-            |> List.mapi (fun i col -> (i, col))
+            |> List.mapi (fun i col -> i, col)
             |> foldOk
                 (fun () (i, col) ->
                     if row.[i] = SqlValue.Null && col.Constraint.NotNull then
-                        Error(DbError.constraintViolation (sprintf "NOT NULL 制約に違反: %s.%s" schema.Name col.Name))
+                        err (
+                            sprintf "NOT NULL 制約に違反: %s.%s" schema.Name col.Name
+                            |> DbError.constraintViolation
+                        )
                     else
                         ret ())
                 ()
@@ -118,15 +117,8 @@ module internal TableSchema =
     let primaryKeyOf (schema: TableSchema) (row: SqlValue array) =
         schema.PrimaryKey |> List.map (fun i -> row.[i]) |> List.toArray
 
-// ---------------------------------------------------------------------------
-// キー生成
-// ---------------------------------------------------------------------------
-
 module internal RowKey =
-    /// 索引列の値を列順の行から取り出す。
-    /// 索引キー（indexKey）と検索側のプレフィックス（indexPrefix）が
-    /// 同じ取り出し方をするようにここに一元化する（片方だけ変わると索引経由の参照が壊れる）。
-    let indexValues (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
+    let private indexValues (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
         index.Columns
         |> List.filter (fun name -> schema.IndexOf name >= 0)
         |> List.map (fun name -> row.[schema.IndexOf name])
@@ -141,8 +133,8 @@ module internal RowKey =
 
     /// 索引キー（検索側）。
     /// row は列順の完全な行で受け取る。
-    /// 列の値は「索引の列だけ」を並べたものではなく、スキーマのどの列に
-    /// あるかが分かる形的（全部入り）である必要がある。
+    /// 列の値は「索引の列だけ」を並べたものではなく、
+    /// スキーマのどの列にあるかが分かる形的（全部入り）である必要がある。
     let indexPrefix (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
         indexValues schema index row |> KeyBuilder.ofValues
 
@@ -161,10 +153,10 @@ module internal Keyspace =
     /// ディレクトリ名を keyspace 名に戻す（keyspace 名でなければ `None`）。
     let tryFromDirName (dirName: string) =
         try
-            let bytes = System.Convert.FromBase64String dirName
+            let dir =
+                System.Convert.FromBase64String dirName |> System.Text.Encoding.UTF8.GetString
 
-            match System.Text.Encoding.UTF8.GetString bytes with
-            // ディレクトリ名に使える形なので、keyspace の接頭辞で釣る。
+            match dir with
             | ks when
                 System.String.IsNullOrEmpty ks
                 || not (ks.StartsWith "t:") && not (ks.StartsWith "i:")
@@ -173,11 +165,6 @@ module internal Keyspace =
             | ks -> Some ks
         with _ ->
             None
-
-
-// ---------------------------------------------------------------------------
-// RowStore — keyspace ごとの StorageEngine を束ねる
-// ---------------------------------------------------------------------------
 
 /// keyspace ごとのエンジンとスキーマを束ねたもの。
 type internal RowStore =
@@ -188,10 +175,10 @@ type internal RowStore =
     }
 
 module internal RowStore =
-    let private dirOf (root: string) (keyspace: string) =
-        Path.Combine(root, Keyspace.toDirName keyspace)
-
     let private ensure (store: RowStore) (keyspace: string) =
+        let dirOf (root: string) (keyspace: string) =
+            Path.Combine(root, Keyspace.toDirName keyspace)
+
         match store.Engines |> Map.tryFind keyspace with
         | Some v -> ret v
         | None ->
@@ -204,33 +191,32 @@ module internal RowStore =
     /// <remarks>
     /// 既存の keyspace ディレクトリはすべて開いておく。
     /// 開かないまま後始末すると、Database.openWith が「SeqNo をどこから採番するか」を知れず、
-    /// LastCommitSeqNo = 0 から始まり、既にディスクにある行がすべて「未来」 として見えなくなる。
+    /// LastCommitSeqNo = 0 から始まり、既にディスクにある行がすべて「未来」として見えなくなる。
     /// </remarks>
     let openStore (root: string) =
-        protect (fun () -> Directory.CreateDirectory root |> ignore)
-        >>= fun () ->
-            let known =
-                Directory.GetDirectories root
-                |> Array.choose (fun dir ->
-                    let name = Path.GetFileName dir
-
-                    match Keyspace.tryFromDirName name with
-                    | Some ks -> Some(ks, dir)
-                    | None -> None)
-
-            let rec openEngines (rest: (string * string) list) (acc: Map<string, StorageEngine * string>) =
-                match rest with
-                | [] -> ret acc
-                | (ks, dir) :: tail ->
-                    match Manifest.ensureDirectory dir with
+        let rec openEngines (rest: (string * string) list) (acc: Map<string, StorageEngine * string>) =
+            match rest with
+            | [] -> ret acc
+            | (ks, dir) :: tail ->
+                match Manifest.ensureDirectory dir with
+                | Error err -> Error err
+                | Ok() ->
+                    match StorageEngine.openDatabase dir with
                     | Error err -> Error err
-                    | Ok() ->
-                        match StorageEngine.openDatabase dir with
-                        | Error err -> Error err
-                        | Ok e -> openEngines tail (Map.add ks (e, dir) acc)
+                    | Ok e -> openEngines tail (Map.add ks (e, dir) acc)
 
-            openEngines (known |> Array.toList) Map.empty
-            |> Result.map (fun engines -> { Root = root; Engines = engines })
+        let known =
+            Directory.GetDirectories root
+            |> Array.choose (fun dir ->
+                Path.GetFileName dir
+                |> Keyspace.tryFromDirName
+                |> Option.map (fun ks -> ks, dir))
+
+        result {
+            do! protect (fun () -> Directory.CreateDirectory root |> ignore)
+            let! engines = openEngines (known |> Array.toList) Map.empty
+            return { Root = root; Engines = engines }
+        }
 
     /// 全 keyspace の NextSeqNo の最大値 − 1（＝保存済みの SeqNo）。
     let lastSeqNo (store: RowStore) =
@@ -278,45 +264,27 @@ module internal RowStore =
 
     /// keyspace から読む（SeqNo 制限つき）。
     let getAt (store: RowStore) (keyspace: string) (key: byte array) (visible: uint64 option) =
-        engine store keyspace
-        >>= (fun e -> StorageEngine.getAt e visible key)
-        |> Result.map (function
-            | None -> None
-            | Some sst -> sst.Value)
+        result {
+            let! e = engine store keyspace
+            let! sst = StorageEngine.getAt e visible key
+            return Option.bind _.Value sst
+        }
 
     /// keyspace を prefix で走査する（主キー/索引の前方一致）。
     let scanAt (store: RowStore) (keyspace: string) (startKey: byte array) (visible: uint64 option) (limit: int) =
-        engine store keyspace
-        >>= (fun e -> StorageEngine.scanAt e visible startKey limit)
-        |> Result.map (fun entries ->
-            entries
-            |> Array.map (fun sst -> sst.Key, sst.Value)
-            |> Array.filter (fun (_, v) -> v.IsSome))
+        result {
+            let! e = engine store keyspace
+            let! entries = StorageEngine.scanAt e visible startKey limit
+
+            return
+                entries
+                |> Array.map (fun sst -> sst.Key, sst.Value)
+                |> Array.filter (fun (_, v) -> v.IsSome)
+        }
 
     /// keyspace を走査する（制限なし）。
     let scan (store: RowStore) (keyspace: string) (startKey: byte array) (limit: int) =
         scanAt store keyspace startKey None limit
-
-    /// 全 keyspace の active snapshot を進める（GC の基準）。
-    let setActiveSnapshot (seqNo: uint64) (store: RowStore) =
-        { store with
-            Engines =
-                store.Engines
-                |> Map.map (fun _ (e, dir) -> StorageEngine.setActiveSnapshot seqNo e, dir)
-        }
-
-    /// 全 keyspace の compaction を行う。
-    let compactAll (store: RowStore) =
-        store.Engines
-        |> Map.toList
-        |> foldOk
-            (fun current (ks, (e, dir)) ->
-                StorageEngine.maybeCompact e
-                |> Result.map (fun updated ->
-                    { current with
-                        Engines = Map.add ks (updated, dir) current.Engines
-                    }))
-            store
 
     /// 全 keyspace を close する。
     let close (store: RowStore) =
@@ -325,7 +293,7 @@ module internal RowStore =
         |> foldOk (fun () (_, (e, _)) -> StorageEngine.close e |> Result.map (fun _ -> ())) ()
 
 /// DML — スキーマと transaction を使う上位操作。
-/// 1 行の書き込みは「主キーの LSM への 1 件 + 各索引の LSM への 1 件」。
+/// 1行の書き込みは「主キーの LSM への 1件 + 各索引の LSM への 1件」。
 /// これらは異なる keyspace なので並列に commit できる。
 /// 削除は主キー + 全索引に tombstone を書く
 /// （書き漏らすと索引経由で消えた行が復活する）。
@@ -365,15 +333,16 @@ module internal Dml =
                         ret (Transaction.put removed space newKey newValue))
             txn
 
-    /// 1 行を transaction に積む（まだ DB には入らない）。
+    /// 1行を transaction に積む（まだ DB には入らない）。
     /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。
     let insert (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
-        TableSchema.validateRow schema row
-        >>= fun () ->
+        result {
+            do! TableSchema.validateRow schema row
             let tks = tableSpace schema
             let pk = RowKey.primary schema row
             let next = Transaction.put txn tks pk row
-            applyIndexChange schema next None (Some row)
+            return! applyIndexChange schema next None (Some row)
+        }
 
     /// 主キーで既存行を取り出す。
     let getByPrimaryKey (store: RowStore) (schema: TableSchema) (visible: uint64 option) (key: SqlValue array) =
@@ -384,32 +353,10 @@ module internal Dml =
         RowStore.scanAt store (tableSpace schema) [||] visible limit
         |> Result.map (Array.map (fun (_, v) -> v |> Option.defaultValue [||]))
 
-    /// 索引の値で 1 行を引く。UNIQUE 索引なら前方一致で唯一の行が取れる。
-    /// <paramref name="row"/> は列順の完全な行。
-    let getByIndex
-        (store: RowStore)
-        (schema: TableSchema)
-        (index: IndexSchema)
-        (visible: uint64 option)
-        (cols: SqlValue array)
-        =
-        let prefix = RowKey.indexPrefix schema index cols
-        let ks = indexSpace index
-
-        RowStore.scanAt store ks prefix visible 0
-        |> Result.map (fun rows ->
-            rows
-            |> Array.tryFind (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix)
-            |> Option.bind snd)
-
-
     /// 索引の値に一致する全行を引く。
-    /// 索引は一意とは限らないので `WHERE dept_id = 2` は
-    /// 1 行ではなく「その値を持つ全部の行」を返す。
-    /// 1 件だけ返す実装にすると `SELECT ... WHERE indexed_col = v` が
-    /// 対象の一部だけを返すようになる。
-    /// 索引キーは「索引列の値 ++ 主キー列」なので、キー昇順に走査すると
-    /// 一致するエントリは `prefix` から連続して並ぶ。
+    /// 索引は一意とは限らないので `WHERE dept_id = 2` は 1行ではなく「その値を持つ全部の行」を返す。
+    /// 1件だけ返す実装にすると `SELECT ... WHERE indexed_col = v` が対象の一部だけを返すようになる。
+    /// 索引キーは「索引列の値 + 主キー列」なので、キー昇順に走査すると一致するエントリは `prefix` から連続して並ぶ。
     /// したがって `prefix` から始めて `startsWithPrefix` が外れるまで取る。
     let scanByIndexPrefix
         (store: RowStore)
@@ -433,7 +380,8 @@ module internal Dml =
             else
                 matched)
 
-    /// 主キーで削除する。主キーと全索引に tombstone を書く。
+    /// 主キーで削除する。
+    /// 主キーと全索引に tombstone を書く。
     /// 元の行を取得してから索引キーを組み立てるので、NOT NULL でも壊れない。
     let deleteByPrimaryKey
         (store: RowStore)
@@ -442,13 +390,16 @@ module internal Dml =
         (txn: Transaction)
         (key: SqlValue array)
         =
-        getByPrimaryKey store schema visible key
-        >>= function
-            | None -> Error(DbError.notFound (sprintf "削除する行が見つかりません: %s" schema.Name))
-            | Some row ->
-                let pk = RowKey.primary schema row
+        result {
+            let! row = getByPrimaryKey store schema visible key
+
+            match row with
+            | None -> return! err (sprintf "削除する行が見つかりません: %s" schema.Name |> DbError.notFound)
+            | Some oldRow ->
+                let pk = RowKey.primary schema oldRow
                 let next = Transaction.remove txn (tableSpace schema) pk
-                applyIndexChange schema next (Some row) None
+                return! applyIndexChange schema next (Some oldRow) None
+        }
 
     /// 主キーで更新する（主キーと全索引に新しい値を書き込む）。
     /// 読み手には 1transaction 分の原子的な書き換えとして見える。
@@ -467,13 +418,15 @@ module internal Dml =
         (key: SqlValue array)
         (newRow: SqlValue array)
         =
-        TableSchema.validateRow schema newRow
-        >>= fun () ->
-            getByPrimaryKey store schema visible key
-            >>= function
-                | None -> Error(DbError.notFound "更新する行が見つかりません")
-                | Some oldRow ->
-                    let tks = tableSpace schema
-                    let newPk = RowKey.primary schema newRow
-                    let afterMain = Transaction.put txn tks newPk newRow
-                    applyIndexChange schema afterMain (Some oldRow) (Some newRow)
+        result {
+            do! TableSchema.validateRow schema newRow
+            let! row = getByPrimaryKey store schema visible key
+
+            match row with
+            | None -> return! err (DbError.notFound "更新する行が見つかりません")
+            | Some oldRow ->
+                let tks = tableSpace schema
+                let newPk = RowKey.primary schema newRow
+                let afterMain = Transaction.put txn tks newPk newRow
+                return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
+        }

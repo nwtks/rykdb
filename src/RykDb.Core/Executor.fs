@@ -190,20 +190,20 @@ module internal Schema =
         match hits with
         | [ i ] -> ret i
         | [] ->
-            Error(
-                DbError.name (
-                    sprintf
-                        "列 '%s' が存在しません（使える列: %s）"
-                        r.Display
-                        (if schema.Columns.Length = 0 then
-                             "(なし)"
-                         else
-                             schema.Columns |> Array.map (fun c -> c.Display) |> String.concat ", ")
-                )
+            err (
+                sprintf
+                    "列 '%s' が存在しません（使える列: %s）"
+                    r.Display
+                    (if schema.Columns.Length = 0 then
+                         "(なし)"
+                     else
+                         schema.Columns |> Array.map (fun c -> c.Display) |> String.concat ", ")
+                |> DbError.name
             )
         | many ->
-            Error(
-                DbError.name (sprintf "列 '%s' が曖昧です（該当: %s）" r.Display (many |> List.map string |> String.concat ", "))
+            err (
+                sprintf "列 '%s' が曖昧です（該当: %s）" r.Display (many |> List.map string |> String.concat ", ")
+                |> DbError.name
             )
 
     /// テーブルの全列を並べる。
@@ -419,7 +419,7 @@ module internal Scalar =
             if args.Length = n then
                 ret ()
             else
-                Error(DbError.name (sprintf "%s 関数は %d 個の引数が必要ですが、%d 個渡されました" upper n args.Length))
+                err (sprintf "%s 関数は %d 個の引数が必要ですが、%d 個渡されました" upper n args.Length |> DbError.name)
 
         let asStr (v: SqlValue) =
             match SqlValue.asText v with
@@ -456,7 +456,10 @@ module internal Scalar =
                     | SqlValue.Real f -> ret (SqlValue.Real(abs f))
                     | SqlValue.Decimal d -> ret (SqlValue.Decimal(abs d))
                     | other ->
-                        Error(DbError.typeError (sprintf "ABS は数値を受け付けますが %s です" (SqlLiteral.toSqlLiteral other)))
+                        err (
+                            sprintf "ABS は数値を受け付けますが %s です" (SqlLiteral.toSqlLiteral other)
+                            |> DbError.typeError
+                        )
         | "COALESCE" ->
             let rec find (i: int) =
                 if i >= args.Length then ret SqlValue.Null
@@ -476,8 +479,12 @@ module internal Scalar =
                 | SqlValue.Int i -> ret (SqlValue.Int i)
                 | SqlValue.Real f -> ret (SqlValue.Real(System.Math.Round(f, System.MidpointRounding.AwayFromZero)))
                 | SqlValue.Null -> ret SqlValue.Null
-                | other -> Error(DbError.typeError (sprintf "ROUND は数値を受け付けますが %s です" (SqlLiteral.toSqlLiteral other)))
-        | _ -> Error(DbError.name (sprintf "未知のスカラー関数 '%s' です" name))
+                | other ->
+                    err (
+                        sprintf "ROUND は数値を受け付けますが %s です" (SqlLiteral.toSqlLiteral other)
+                        |> DbError.typeError
+                    )
+        | _ -> err (sprintf "未知のスカラー関数 '%s' です" name |> DbError.name)
 
 
 // ---------------------------------------------------------------------------
@@ -509,7 +516,7 @@ module internal Eval =
         if SqlValue.isNull a || SqlValue.isNull b then
             ret SqlValue.Null
         elif isDivision && SqlValue.asNumeric b = Some 0M then
-            Error(DbError.constraintViolation "0 での除算は定義されていません")
+            err (DbError.constraintViolation "0 での除算は定義されていません")
         else
             ret (liftNumeric a b op)
 
@@ -569,7 +576,10 @@ module internal Eval =
     /// 行の範囲外アクセスを安全なエラーにする。
     let private valueAt (row: SqlValue array) (i: int) (e: Expr) =
         if i < 0 || i >= row.Length then
-            Error(DbError.internalError (sprintf "列インデックス %d が範囲外です（%d 列中）: %s" i row.Length (Expr.toDisplayString e)))
+            err (
+                sprintf "列インデックス %d が範囲外です（%d 列中）: %s" i row.Length (Expr.toDisplayString e)
+                |> DbError.internalError
+            )
         else
             ret row.[i]
 
@@ -648,13 +658,13 @@ module internal Eval =
                 let probeRef = { Qualifier = None; Name = n }
 
                 match Schema.resolve schema probeRef with
-                | Error _ -> Error(DbError.name (sprintf "'%s' は列でも関数でもありません" n))
+                | Error _ -> err (sprintf "'%s' は列でも関数でもありません" n |> DbError.name)
                 | Ok i ->
                     match valueAt row i (Expr.Column probeRef) with
                     | Error er -> Error er
                     | Ok v -> step schema row kont (Arrive v)
-            | Expr.Star -> Error(DbError.create ErrorKind.SyntaxError "WHERE 句に '*' は置けません")
-            | Expr.QualifiedStar q -> Error(DbError.name (sprintf "'%s.*' はここでは使えません" q))
+            | Expr.Star -> err (DbError.create ErrorKind.SyntaxError "WHERE 句に '*' は置けません")
+            | Expr.QualifiedStar q -> err (sprintf "'%s.*' はここでは使えません" q |> DbError.name)
             | Expr.Unary(op, x) -> step schema row (KUnary op :: kont) (Descend x)
             | Expr.Binary(op, a, b) -> step schema row (KBinaryL(op, b) :: kont) (Descend a)
             | Expr.IsNull(x, negated) -> step schema row (KIsNull negated :: kont) (Descend x)
@@ -675,7 +685,7 @@ module internal Eval =
                     match Scalar.applyFunc n [||] with
                     | Error er -> Error er
                     | Ok v -> step schema row kont (Arrive v)
-            | Expr.AggCall(f, _, _) -> Error(DbError.name (sprintf "%s は集約なのでここでは評価できません" f.Name))
+            | Expr.AggCall(f, _, _) -> err (sprintf "%s は集約なのでここでは評価できません" f.Name |> DbError.name)
         | Arrive v ->
             match kont with
             | [] -> ret v
@@ -698,7 +708,7 @@ module internal Eval =
                             | SqlValue.Int i -> ret (SqlValue.Int -i)
                             | SqlValue.Real f -> ret (SqlValue.Real -f)
                             | SqlValue.Decimal d -> ret (SqlValue.Decimal -d)
-                            | _ -> Error(DbError.typeError (sprintf "'-' は数値に適用できません: %s" (SqlLiteral.toSqlLiteral v)))
+                            | _ -> err (sprintf "'-' は数値に適用できません: %s" (SqlLiteral.toSqlLiteral v) |> DbError.typeError)
 
                 match computed with
                 | Error er -> Error er
@@ -861,7 +871,7 @@ type internal ExecContext =
             | None ->
                 match Catalog.findTable this.Catalog name with
                 | Some t -> Catalog.toSchema t
-                | None -> Error(DbError.name (sprintf "テーブル '%s' が存在しません" name))
+                | None -> err (sprintf "テーブル '%s' が存在しません" name |> DbError.name)
 
 module internal ExecContext =
     let create (store: RowStore) (visible: uint64 option) =
@@ -877,7 +887,7 @@ module internal Scan =
     let private schemaOf (ctx: ExecContext) (table: string) =
         match ctx.Schemas |> Map.tryFind table with
         | Some s -> ret s
-        | None -> Error(DbError.name (sprintf "テーブル '%s' が存在しません" table))
+        | None -> err (sprintf "テーブル '%s' が存在しません" table |> DbError.name)
 
     /// テーブルを全走査する（主キー昇順 = 挿入順ではないが LSM のキー順）。
     let table (ctx: ExecContext) (table: string) =
@@ -893,7 +903,7 @@ module internal Scan =
         schemaOf ctx table
         >>= fun schema ->
             match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
-            | None -> Error(DbError.name (sprintf "テーブル %s に索引 %s がありません" table indexName))
+            | None -> err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
             | Some idx ->
                 Dml.scanByIndexPrefix ctx.Store idx ctx.Visible keyValues System.Int32.MaxValue
                 |> Result.map Op.ofArray
@@ -943,7 +953,11 @@ module internal Ops =
                     let dir = sk.Direction
 
                     match Schema.tryAsColumnRef expr with
-                    | None -> Error(DbError.name (sprintf "ORDER BY には列の直接参照だけを書けます（%s）" (Expr.toDisplayString expr)))
+                    | None ->
+                        err (
+                            sprintf "ORDER BY には列の直接参照だけを書けます（%s）" (Expr.toDisplayString expr)
+                            |> DbError.name
+                        )
                     | Some c ->
                         let bare = { Qualifier = None; Name = c.Name }
 
@@ -1063,8 +1077,9 @@ module internal Ops =
             | AggFunc.Avg ->
                 match SqlValue.asNumeric v with
                 | None ->
-                    Error(
-                        DbError.typeError (sprintf "%s は数値だけを受け付けますが %s です" acc.Kind.Name (SqlLiteral.toSqlLiteral v))
+                    err (
+                        sprintf "%s は数値だけを受け付けますが %s です" acc.Kind.Name (SqlLiteral.toSqlLiteral v)
+                        |> DbError.typeError
                     )
                 | Some d ->
                     match v with

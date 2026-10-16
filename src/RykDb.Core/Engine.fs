@@ -82,7 +82,7 @@ module internal Ddl =
 
         match existing, c.IfNotExists with
         | Some _, true -> ret state
-        | Some _, false -> Error(DbError.alreadyExists (sprintf "テーブル %s は既に存在します" c.Name))
+        | Some _, false -> err (sprintf "テーブル %s は既に存在します" c.Name |> DbError.alreadyExists)
         | None, _ ->
             TableSchema.ofCreateTable c
             >>= fun schema ->
@@ -93,43 +93,49 @@ module internal Ddl =
         match Catalog.findTable state.Catalog tableName with
         | None -> ret state
         | Some defn ->
-            Catalog.toSchema defn
-            >>= fun schema ->
+            result {
+                let! schema = Catalog.toSchema defn
+
                 let withIndex =
                     { schema with
                         Indexes = idx :: schema.Indexes
                     }
 
                 let mgr, txn = TransactionManager.beginTxn state.Manager
+                let! rows = Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
 
-                Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
-                >>= foldOk
+                let! txn2 =
+                    foldOk
                         (fun t row ->
                             let key = RowKey.indexKey withIndex idx row
                             ret (Transaction.put t (Keyspace.index idx.Name) key row))
                         txn
-                >>= fun txn2 ->
-                    DbStateOps.commitToStore state.Store mgr txn2
-                    |> Result.map (fun (store, mgr2) ->
-                        { state with
-                            Store = store
-                            Manager = mgr2
-                        })
+                        rows
+
+                let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
+
+                return
+                    { state with
+                        Store = store
+                        Manager = mgr2
+                    }
+            }
 
     let createIndex (state: DbState) (ci: CreateIndex) =
         match Catalog.findTable state.Catalog ci.Table with
-        | None -> Error(DbError.notFound (sprintf "テーブル %s が存在しません" ci.Table))
+        | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
         | Some tableDef ->
             match Catalog.findIndex state.Catalog ci.Name with
-            | Some _ -> Error(DbError.alreadyExists (sprintf "索引 %s は既に存在します" ci.Name))
+            | Some _ -> err (sprintf "索引 %s は既に存在します" ci.Name |> DbError.alreadyExists)
             | None ->
                 let missing =
                     ci.Columns
                     |> List.filter (fun n -> tableDef.Columns |> List.exists (fun c -> Catalog.eqName n c.Name) |> not)
 
                 if not (List.isEmpty missing) then
-                    Error(
-                        DbError.notFound (sprintf "テーブル %s に列 %s がありません" ci.Table (System.String.Join(", ", missing)))
+                    err (
+                        sprintf "テーブル %s に列 %s がありません" ci.Table (System.String.Join(", ", missing))
+                        |> DbError.notFound
                     )
                 else
                     let defn =
@@ -146,8 +152,6 @@ module internal Ddl =
                     saved state next
                     >>= fun withCatalog -> backfillIndex withCatalog ci.Table idxSchema
 
-    /// DROP まわりの共通処理。
-    /// 見つからなければ ifExists 次第、見つかったら削除してからカタログを保存する。
     let private dropItem
         (state: DbState)
         (kind: string)
@@ -162,7 +166,7 @@ module internal Ddl =
             if ifExists then
                 ret state
             else
-                Error(DbError.notFound (sprintf "%s %s が存在しません" kind name))
+                err (sprintf "%s %s が存在しません" kind name |> DbError.notFound)
 
     let dropTable (state: DbState) (name: string) (ifExists: bool) =
         dropItem state "テーブル" name ifExists Catalog.findTable Catalog.removeTable
@@ -189,41 +193,38 @@ module internal Engine =
                 | Error _ -> acc.WithCatalog state.Catalog)
             (base0.WithCatalog state.Catalog)
 
-    let private runInsert (ctx: ExecContext) (st: InsertStatement) (txn: Transaction) =
-        ctx.SchemaOf st.Table.Name
-        >>= fun schema -> DmlOps.insert schema txn st.Columns st.Rows
-
-    let private runUpdate (ctx: ExecContext) (st: UpdateStatement) (txn: Transaction) =
-        ctx.SchemaOf st.Table.Name
-        >>= fun schema -> DmlOps.update ctx schema txn st.Assignments st.Where
-
-    let private runDelete (ctx: ExecContext) (st: DeleteStatement) (txn: Transaction) =
-        ctx.SchemaOf st.Table.Name
-        >>= fun schema -> DmlOps.delete ctx schema txn st.Where
-
-    /// DML（INSERT / UPDATE / DELETE）の共通処理。
-    /// 文脈を作って 1つ実行し、結果の transaction を Pending に入れた新しい state と RowsAffected を返す。
-    let private runDml
-        (state: DbState)
-        (txn: Transaction)
-        (run: ExecContext -> Transaction -> Result<Transaction * int, DbError>)
-        =
-        let ctx = contextOf state txn
-
-        run ctx txn
-        |> Result.map (fun (txn2, n) ->
-            let nextState = { state with Pending = Some txn2 }
-
-            nextState,
-            { StatementResult.empty with
-                RowsAffected = n
-            })
-
-    /// 「state だけ変化し、表示結果は空」の文（DDL / トランザクション制御）の共通形。
-    let private noRows (r: Result<DbState, DbError>) =
-        Result.map (fun s -> s, StatementResult.empty) r
-
     let runStatement (state: DbState) (txn: Transaction) (stmt: Statement) =
+        let runInsert (ctx: ExecContext) (st: InsertStatement) (txn: Transaction) =
+            ctx.SchemaOf st.Table.Name
+            >>= fun schema -> DmlOps.insert schema txn st.Columns st.Rows
+
+        let runUpdate (ctx: ExecContext) (st: UpdateStatement) (txn: Transaction) =
+            ctx.SchemaOf st.Table.Name
+            >>= fun schema -> DmlOps.update ctx schema txn st.Assignments st.Where
+
+        let runDelete (ctx: ExecContext) (st: DeleteStatement) (txn: Transaction) =
+            ctx.SchemaOf st.Table.Name
+            >>= fun schema -> DmlOps.delete ctx schema txn st.Where
+
+        let runDml
+            (state: DbState)
+            (txn: Transaction)
+            (run: ExecContext -> Transaction -> Result<Transaction * int, DbError>)
+            =
+            let ctx = contextOf state txn
+
+            run ctx txn
+            |> Result.map (fun (txn2, n) ->
+                let nextState = { state with Pending = Some txn2 }
+
+                nextState,
+                { StatementResult.empty with
+                    RowsAffected = n
+                })
+
+        let noRows (r: Result<DbState, DbError>) =
+            r |> Result.map (fun s -> s, StatementResult.empty)
+
         match stmt with
         | Statement.Select sel ->
             let ctx = contextOf state txn

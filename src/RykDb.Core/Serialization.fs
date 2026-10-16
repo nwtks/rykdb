@@ -92,7 +92,7 @@ module internal Cursor =
     let atEnd (c: Cursor) = c.Pos >= c.End
 
 module internal Reader =
-    let private eof msg = Error(DbError.corruption msg)
+    let private eof msg = err (DbError.corruption msg)
 
     let readByte (c: Cursor) =
         if Cursor.atEnd c then
@@ -337,7 +337,7 @@ module internal OrderPreserving =
                 with
                 | true, d when not negative -> return d, c
                 | true, d -> return -d, c
-                | _ -> return! Error(sprintf "OrderPreserving: decimal を復元できません: %s" text |> DbError.corruption)
+                | _ -> return! err (sprintf "OrderPreserving: decimal を復元できません: %s" text |> DbError.corruption)
         }
 
     let private guidToOrderedBytes (g: System.Guid) =
@@ -358,15 +358,15 @@ module internal OrderPreserving =
 
         System.Guid.ParseExact(sb.ToString(), "N")
 
-    let private writeEscapedPayload (bs: byte array) (w: Writer) =
-        let escaped =
-            bs
-            |> Array.collect (fun b -> if b = 0uy then [| Terminator; EscapeMarker |] else [| b |])
-
-        w |> Writer.writeBytes escaped |> Writer.writeByte Terminator
-
     /// 値をキーへ追加する（型タグ + escape 済みペイロード + 終端）。
     let writeValue (v: SqlValue) (w: Writer) =
+        let writeEscapedPayload (bs: byte array) (w: Writer) =
+            let escaped =
+                bs
+                |> Array.collect (fun b -> if b = 0uy then [| Terminator; EscapeMarker |] else [| b |])
+
+            w |> Writer.writeBytes escaped |> Writer.writeByte Terminator
+
         let tagged tag = w |> Writer.writeByte (byte tag)
         let terminate = Writer.writeByte Terminator
 
@@ -397,7 +397,7 @@ module internal OrderPreserving =
                 let! t, _ = Reader.readByte c
 
                 if t <> Terminator then
-                    return! Error(sprintf "OrderPreserving: 終端が不正 (0x%02X)" t |> DbError.corruption)
+                    return! err (sprintf "OrderPreserving: 終端が不正 (0x%02X)" t |> DbError.corruption)
                 else
                     return v, c
             }
@@ -422,37 +422,36 @@ module internal OrderPreserving =
         result {
             let! tag, c = Reader.readByte start
 
-            if tag = byte Tag.Null then
-                return! finish SqlValue.Null c
-            elif tag = byte Tag.Bool then
+            match LanguagePrimitives.EnumOfValue<byte, Tag> tag with
+            | Tag.Null -> return! finish SqlValue.Null c
+            | Tag.Bool ->
                 let! v, c = Reader.readBool c
                 return! finish (SqlValue.Bool v) c
-            elif tag = byte Tag.Int then
+            | Tag.Int ->
                 let! v, c = readOrderedInt64 c
                 return! finish (SqlValue.Int v) c
-            elif tag = byte Tag.Real then
+            | Tag.Real ->
                 let! m, c = Reader.readInt64BE c
                 return! finish (unmapDouble m |> SqlValue.normalizeFloat |> SqlValue.Real) c
-            elif tag = byte Tag.Decimal then
+            | Tag.Decimal ->
                 let! v, c = readOrderedDecimal c
                 return! finish (SqlValue.Decimal v) c
-            elif tag = byte Tag.Date then
+            | Tag.Date ->
                 let! days, c = readOrderedInt64 c
                 return! finish (int days |> System.DateOnly.FromDayNumber |> SqlValue.Date) c
-            elif tag = byte Tag.Timestamp then
+            | Tag.Timestamp ->
                 let! ticks, c = readOrderedInt64 c
                 return! finish (System.DateTimeOffset(ticks, System.TimeSpan.Zero) |> SqlValue.Timestamp) c
-            elif tag = byte Tag.Text then
+            | Tag.Text ->
                 let! bytes, c = readEscapedPayload c
                 return! finish (System.Text.Encoding.UTF8.GetString bytes |> SqlValue.Text) c
-            elif tag = byte Tag.Blob then
+            | Tag.Blob ->
                 let! bytes, c = readEscapedPayload c
                 return! finish (SqlValue.Blob bytes) c
-            elif tag = byte Tag.Uuid then
+            | Tag.Uuid ->
                 let! bs, c = Reader.readBytes 16 c
                 return! finish (orderedBytesToGuid bs |> SqlValue.Uuid) c
-            else
-                return! Error(sprintf "OrderPreserving: 不明な型タグ 0x%02X" tag |> DbError.corruption)
+            | _ -> return! err (sprintf "OrderPreserving: 不明な型タグ 0x%02X" tag |> DbError.corruption)
         }
 
     /// キーから 1フィールドだけを読む（返り値は値と読み取り後の位置）。
@@ -533,18 +532,18 @@ module internal ValueCodec =
         result {
             let! tag, c = Reader.readByte c
 
-            if tag = 0uy then
-                return SqlValue.Null, c
-            elif tag = 1uy then
+            match tag with
+            | 0uy -> return SqlValue.Null, c
+            | 1uy ->
                 let! v, c = Reader.readBool c
                 return SqlValue.Bool v, c
-            elif tag = 2uy then
+            | 2uy ->
                 let! v, c = Reader.readInt64LE c
                 return SqlValue.Int v, c
-            elif tag = 3uy then
+            | 3uy ->
                 let! bits, c = Reader.readInt64LE c
                 return System.BitConverter.Int64BitsToDouble bits |> SqlValue.vReal, c
-            elif tag = 4uy then
+            | 4uy ->
                 let! bs, c = Reader.readBytes 32 c
 
                 let bits =
@@ -554,13 +553,13 @@ module internal ValueCodec =
                     |]
 
                 return System.Decimal bits |> SqlValue.Decimal, c
-            elif tag = 5uy then
+            | 5uy ->
                 let! bs, c = Reader.readLengthPrefixed c
                 return System.Text.Encoding.UTF8.GetString bs |> SqlValue.Text, c
-            elif tag = 6uy then
+            | 6uy ->
                 let! bs, c = Reader.readLengthPrefixed c
                 return SqlValue.Blob bs, c
-            elif tag = 7uy then
+            | 7uy ->
                 let! ticks, c = Reader.readInt64LE c
 
                 return
@@ -568,14 +567,13 @@ module internal ValueCodec =
                     |> System.DateOnly.FromDayNumber
                     |> SqlValue.Date,
                     c
-            elif tag = 8uy then
+            | 8uy ->
                 let! ticks, c = Reader.readInt64LE c
                 return System.DateTimeOffset(ticks, System.TimeSpan.Zero) |> SqlValue.Timestamp, c
-            elif tag = 9uy then
+            | 9uy ->
                 let! bs, c = Reader.readBytes 16 c
                 return System.Guid bs |> SqlValue.Uuid, c
-            else
-                return! Error(sprintf "ValueCodec: 不明な型タグ %d" (int tag) |> DbError.corruption)
+            | _ -> return! err (sprintf "ValueCodec: 不明な型タグ %d" (int tag) |> DbError.corruption)
         }
 
     /// 値の並びをまとめて書き出す。
@@ -589,7 +587,7 @@ module internal ValueCodec =
             let! n, c = Reader.readVarint c
 
             if n > uint64 System.Int32.MaxValue then
-                return! Error(sprintf "ValueCodec: 要素数が大きすぎます (%d)" n |> DbError.corruption)
+                return! err (sprintf "ValueCodec: 要素数が大きすぎます (%d)" n |> DbError.corruption)
 
             let! items, c = Reader.readItems n readValue c
             return List.toArray items, c

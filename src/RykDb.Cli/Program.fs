@@ -38,7 +38,6 @@ type Session(initial: Database) =
     member _.Close() = current.Close()
 
 /// `;` 区切りの文を切り出し、空白だけの断片を捨てる。
-/// REPL の行バッファ処理とスクリプト実行が同じ処理を 2 重に持っていたので一本化した。
 let private piecesOf (input: string) =
     input.Split ';'
     |> Array.map (fun s -> s.Trim())
@@ -119,6 +118,20 @@ let private execOne (session: Session) (sql: string) =
             true
 
 let private runRepl (session: Session) =
+    let splitForRun (merged: string) =
+        let pieces = piecesOf merged
+
+        if Array.isEmpty pieces then
+            [||], [||]
+        else
+            let complete = merged.EndsWith(";", System.StringComparison.Ordinal)
+            let last = pieces.Length - 1
+
+            if complete then
+                pieces, [||]
+            else
+                pieces.[0 .. last - 1], pieces.[last..last]
+
     let mutable running = true
     let mutable buffer = ""
 
@@ -138,50 +151,37 @@ let private runRepl (session: Session) =
             if System.String.IsNullOrWhiteSpace buffer && trimmed.StartsWith "." then
                 running <- execOne session trimmed
             else
-                let merged: string =
+                let merged =
                     if System.String.IsNullOrWhiteSpace buffer then
                         line
                     else
                         buffer + " " + line
 
-                let pieces = piecesOf merged
+                let toRun, toKeep = splitForRun merged
 
-                if Array.isEmpty pieces then
-                    buffer <- ""
-                else
-                    let complete = merged.EndsWith(";", System.StringComparison.Ordinal)
-                    let last = pieces.Length - 1
+                for sql in toRun do
+                    if running then
+                        running <- execOne session sql
 
-                    let toRun, toKeep =
-                        if complete then
-                            pieces, [||]
-                        else
-                            pieces.[0 .. last - 1], pieces.[last..last]
-
-                    for sql in toRun do
-                        if running then
-                            running <- execOne session sql
-
-                    buffer <- if Array.isEmpty toKeep then "" else toKeep.[0]
+                buffer <- if Array.isEmpty toKeep then "" else toKeep.[0]
 
 let private runFile (session: Session) (path: string) =
+    let rec runStatements (rest: string list) =
+        match rest with
+        | [] -> Ok()
+        | stmt :: tail ->
+            match session.Run stmt with
+            | Ok r ->
+                printResult r
+                runStatements tail
+            | Error e ->
+                printError e
+                Error e
+
     if not (System.IO.File.Exists path) then
-        Error(DbError.notFound (sprintf "ファイル %s がありません" path))
+        Error(sprintf "ファイル %s がありません" path |> DbError.notFound)
     else
         let sql = System.IO.File.ReadAllText path
-
-        let rec runStatements (rest: string list) =
-            match rest with
-            | [] -> Ok()
-            | stmt :: tail ->
-                match session.Run stmt with
-                | Ok r ->
-                    printResult r
-                    runStatements tail
-                | Error e ->
-                    printError e
-                    Error e
-
         runStatements (splitStatements sql)
 
 [<EntryPoint>]

@@ -72,7 +72,7 @@ module internal Parser =
     /// 戻り値は「深さを増やした状態」か「Error」。
     let private enterExpr (st: PState) =
         if st.Depth >= MaxExpressionDepth then
-            Error(DbError.syntax (sprintf "式の入れ子が深すぎます（上限 %d）" MaxExpressionDepth) (peekPos st).Line)
+            err (DbError.syntax (sprintf "式の入れ子が深すぎます（上限 %d）" MaxExpressionDepth) (peekPos st).Line)
         else
             Ok { st with Depth = st.Depth + 1 }
 
@@ -81,7 +81,7 @@ module internal Parser =
 
     /// 現在位置を添えた構文エラーを返す。送出はしない。
     let private fail (st: PState) (msg: string) =
-        Error(DbError.syntax msg (peekPos st).Line)
+        err (DbError.syntax msg (peekPos st).Line)
 
     let private isSymbol (st: PState) (s: string) =
         match peek st with
@@ -1069,5 +1069,5 @@ module internal Parser =
         >>= fun stmts ->
             match stmts with
             | [ s ] -> ret s
-            | [] -> Error(DbError.create ErrorKind.SyntaxError "文がありません")
-            | _ -> Error(DbError.create ErrorKind.SyntaxError "複数の文が渡されました（1 文ずつ実行してください）")
+            | [] -> err (DbError.create ErrorKind.SyntaxError "文がありません")
+            | _ -> err (DbError.create ErrorKind.SyntaxError "複数の文が渡されました（1 文ずつ実行してください）")

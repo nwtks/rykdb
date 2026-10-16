@@ -304,7 +304,7 @@ module internal Optimizer =
                 >>= fun hs ->
                     match hs with
                     | [ hv ] -> ret (Some hv)
-                    | _ -> Error(DbError.internalError "HAVING の修飾に失敗")
+                    | _ -> err (DbError.internalError "HAVING の修飾に失敗")
 
         let groupStage = Binder.qualifyMany schema stmt.GroupBy
 
@@ -672,7 +672,7 @@ module internal Plan =
             |> List.tryFind (fun (_, c) -> c > 1)
 
         match duplicate with
-        | Some(name, _) -> Error(DbError.name (sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name))
+        | Some(name, _) -> err (sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name)
         | None ->
             registerAll ()
             >>= fun (ctx2, schema) ->

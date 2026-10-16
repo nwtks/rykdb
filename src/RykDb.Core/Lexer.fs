@@ -164,7 +164,7 @@ module internal Lexer =
             if depth <= 0 then
                 ret s
             elif s.Index >= n then
-                Error(DbError.syntax "コメントが閉じられていません" s.Line)
+                err (DbError.syntax "コメントが閉じられていません" s.Line)
             elif s.Index + 1 < n && input.[s.Index] = '/' && input.[s.Index + 1] = '*' then
                 loopBlockComment (advance input (advance input s)) (depth + 1)
             elif s.Index + 1 < n && input.[s.Index] = '*' && input.[s.Index + 1] = '/' then
@@ -212,7 +212,7 @@ module internal Lexer =
         =
         let rec collectChars (s: LexState) (sb: StringBuilder) =
             if s.Index >= n then
-                Error(DbError.syntax unclosedMsg line)
+                err (DbError.syntax unclosedMsg line)
             elif input.[s.Index] = delim then
                 if s.Index + 1 < n && input.[s.Index + 1] = delim then
                     sb.Append delim |> ignore
@@ -235,18 +235,18 @@ module internal Lexer =
 
             let rec collectHex (s: LexState) (sb: StringBuilder) =
                 if s.Index >= n then
-                    Error(DbError.syntax "バイナリリテラルが閉じられていません" startPos.Line)
+                    err (DbError.syntax "バイナリリテラルが閉じられていません" startPos.Line)
                 elif input.[s.Index] = '\'' then
                     let hex = sb.ToString()
 
                     if hex.Length % 2 <> 0 then
-                        Error(DbError.syntax "バイナリリテラルの長さが奇数です" startPos.Line)
+                        err (DbError.syntax "バイナリリテラルの長さが奇数です" startPos.Line)
                     else
                         let nonHex = hex |> Seq.exists (fun ch -> hexValue ch < 0)
 
                         if nonHex then
                             let msg = sprintf "バイナリリテラルに 16 進でない文字があります: %s" hex
-                            Error(DbError.syntax msg startPos.Line)
+                            err (DbError.syntax msg startPos.Line)
                         else
                             let bytes =
                                 [|
@@ -318,11 +318,11 @@ module internal Lexer =
             if hasFraction || hasExponent then
                 match Double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture) with
                 | true, v -> Ok(RealLit v, afterExponent)
-                | _ -> Error(DbError.syntax (sprintf "実数の解析に失敗しました: %s" text) startPos.Line)
+                | _ -> err (DbError.syntax (sprintf "実数の解析に失敗しました: %s" text) startPos.Line)
             else
                 match Int64.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture) with
                 | true, v -> Ok(IntLit v, afterExponent)
-                | _ -> Error(DbError.syntax (sprintf "整数の解析に失敗しました: %s" text) startPos.Line)
+                | _ -> err (DbError.syntax (sprintf "整数の解析に失敗しました: %s" text) startPos.Line)
 
         elif c = '\'' then
             collectDelimited input n '\'' "文字列が閉じられていません" startPos.Line s
@@ -341,7 +341,7 @@ module internal Lexer =
                     && String.CompareOrdinal(input, s.Index, sym, 0, sym.Length) = 0)
 
             match matched with
-            | None -> Error(DbError.syntax (sprintf "予期しない文字 '%c'" c) startPos.Line)
+            | None -> err (DbError.syntax (sprintf "予期しない文字 '%c'" c) startPos.Line)
             | Some sym ->
                 let rec advanceN (st: LexState) (count: int) =
                     if count = 0 then

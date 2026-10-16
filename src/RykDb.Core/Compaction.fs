@@ -24,7 +24,8 @@ type internal CompactionOptions =
     }
 
 module internal CompactionOptions =
-    /// 既定値。L0 は閾値を持たない（flush の出力先なので無制限）。
+    /// 既定値。
+    /// L0 は閾値を持たない（flush の出力先なので無制限）。
     let defaults =
         let mib = 1024L * 1024L
 
@@ -127,7 +128,7 @@ module internal Compaction =
             if level > Levels.Max then
                 None
             else
-                let total = v.Files.[level] |> Array.sumBy (fun f -> f.Size)
+                let total = v.Files.[level] |> Array.sumBy _.Size
 
                 if total > maxLevelSize.[level] then
                     Some level
@@ -151,28 +152,7 @@ module internal Compaction =
                     GrandParents = grandParents
                 }
 
-    let private selectInputs (version: Version) (level: int) (maxFiles: int) =
-        let inputs = Version.filesAt version level |> Array.toList
-        let nextLevel = level + 1
-
-        let overlapsWith (files: FileMetaData list) (f: FileMetaData) =
-            files
-            |> List.exists (fun g ->
-                Bytes.compare g.Largest f.Smallest >= 0
-                && Bytes.compare f.Largest g.Smallest >= 0)
-
-        let next =
-            if nextLevel > Levels.Max then
-                []
-            else
-                Version.filesAt version nextLevel
-                |> Array.toList
-                |> List.filter (overlapsWith inputs)
-                |> List.truncate maxFiles
-
-        inputs |> List.truncate maxFiles, next, nextLevel
-
-    /// 1 回の Leveled compaction を行う。
+    /// 1回の Leveled compaction を行う。
     /// readFile でファイルを読み、activeSnapshot を基準に GC してから書き出す。
     /// MANIFEST の更新と実ファイルの削除は呼び出し側（StorageEngine）が行う。
     let compact
@@ -183,6 +163,32 @@ module internal Compaction =
         (nextFileNumber: int64)
         (readFile: FileMetaData -> Result<SstEntry array, DbError>)
         =
+        let overlapsWith (files: FileMetaData list) (f: FileMetaData) =
+            files
+            |> List.exists (fun g ->
+                Bytes.compare g.Largest f.Smallest >= 0
+                && Bytes.compare f.Largest g.Smallest >= 0)
+
+        let selectInputs (version: Version) (level: int) (maxFiles: int) =
+            let inputs = Version.filesAt version level |> Array.toList
+            let nextLevel = level + 1
+
+            let next =
+                if nextLevel > Levels.Max then
+                    []
+                else
+                    Version.filesAt version nextLevel
+                    |> Array.toList
+                    |> List.filter (overlapsWith inputs)
+                    |> List.truncate maxFiles
+
+            inputs |> List.truncate maxFiles, next, nextLevel
+
+        let readAll (rest: FileMetaData list) =
+            rest
+            |> foldOk (fun acc f -> readFile f |> Result.map (fun items -> items :: acc)) []
+            |> Result.map List.rev
+
         let writeChunks (rest: SstEntry array list) (outputLevel: int) =
             rest
             |> List.mapi (fun i chunk -> nextFileNumber + int64 i, chunk)
@@ -191,11 +197,6 @@ module internal Compaction =
                     FileMetaData.writeSstable dir num outputLevel options.BloomFalsePositiveRate chunk
                     |> Result.map (fun meta -> meta :: acc))
                 []
-
-        let readAll (rest: FileMetaData list) =
-            rest
-            |> foldOk (fun acc f -> readFile f |> Result.map (fun items -> items :: acc)) []
-            |> Result.map List.rev
 
         let finish (sources: SstEntry array list) (outputLevel: int) =
             let merged = SstEntry.mergeSorted sources
@@ -210,15 +211,15 @@ module internal Compaction =
                 }
 
             if cleaned.Length = 0 then
-                let summary =
+                ret (
                     {
                         Added = []
                         Removed = []
                         DroppedVersions = droppedVersions
                         DroppedTombstones = droppedTombstones
-                    }
-
-                ret (summary, info)
+                    },
+                    info
+                )
             else
                 let chunks = SstEntry.splitInto (max 1 (options.MaxInputFiles * 4)) cleaned
 
@@ -235,20 +236,7 @@ module internal Compaction =
                         info
                     )
 
-        match pickCompaction version options.MaxLevelBytes with
-        | None ->
-            ret (
-                {
-                    Added = []
-                    Removed = []
-                    DroppedVersions = 0
-                    DroppedTombstones = 0
-                },
-                { FileMetaData.zero with
-                    FileNumber = -1L
-                }
-            )
-        | Some plan ->
+        let compactPlan (plan: CompactionPlan) =
             let inputs, nextFiles, _ = selectInputs version plan.Level options.MaxInputFiles
             let allInputs = inputs @ nextFiles
 
@@ -261,13 +249,17 @@ module internal Compaction =
                     let final = { result with Removed = allInputs }
                     ret (final, info)
 
-    /// ファイルを実際に削除する。
-    let deleteObsolete (dir: string) (files: FileMetaData list) =
-        let deleteFile (dir: string) (fileNumber: int64) =
-            protect (fun () ->
-                let p = Sstable.path dir fileNumber
-
-                if System.IO.File.Exists p then
-                    System.IO.File.Delete p)
-
-        files |> foldOk (fun () f -> deleteFile dir f.FileNumber) ()
+        match pickCompaction version options.MaxLevelBytes with
+        | Some plan -> compactPlan plan
+        | None ->
+            ret (
+                {
+                    Added = []
+                    Removed = []
+                    DroppedVersions = 0
+                    DroppedTombstones = 0
+                },
+                { FileMetaData.zero with
+                    FileNumber = -1L
+                }
+            )

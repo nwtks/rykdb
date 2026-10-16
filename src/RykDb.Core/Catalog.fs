@@ -110,7 +110,7 @@ module internal Catalog =
             | name :: rest ->
                 match t.Columns |> List.tryFindIndex (fun c -> eqName c.Name name) with
                 | Some i -> findIndices rest (i :: acc)
-                | None -> Error(DbError.name (sprintf "テーブル %s に主キー列 %s がありません" t.Name name))
+                | None -> err (sprintf "テーブル %s に主キー列 %s がありません" t.Name name |> DbError.name)
 
         findIndices t.PrimaryKeyColumns []
         |> Result.map (fun idx ->
@@ -181,47 +181,44 @@ module internal Catalog =
         |> List.fold (fun w name -> Writer.str name w) w2
         |> Writer.toArray
 
-    let private readColumn (c: Cursor) =
-        Reader.readStr c
-        >>= fun (name, c1) ->
-            Reader.readByte c1
-            >>= fun (tag, c2) ->
-                Reader.readByte c2
-                >>= fun (flags, c3) ->
-                    Reader.readLengthPrefixed c3
-                    >>= fun (_, c4) ->
-                        DataType.fromTag tag
-                        |> Result.map (fun dt ->
-                            {
-                                Name = name
-                                DataType = dt
-                                TypeArguments = []
-                                Constraint =
-                                    {
-                                        NotNull = flags &&& 1uy <> 0uy
-                                        PrimaryKey = flags &&& 2uy <> 0uy
-                                        Unique = flags &&& 4uy <> 0uy
-                                        Default = None
-                                    }
-                            },
-                            c4)
-
     let private decodeTable (name: string) (bytes: byte array) =
-        let cur = Cursor.create bytes
+        let readColumn (c: Cursor) =
+            result {
+                let! name, c1 = Reader.readStr c
+                let! tag, c2 = Reader.readByte c1
+                let! flags, c3 = Reader.readByte c2
+                let! _, c4 = Reader.readLengthPrefixed c3
+                let! dt = DataType.fromTag tag
 
-        Reader.readVarint cur
-        >>= fun (colCount, cur1) ->
-            Reader.readItems colCount readColumn cur1
-            >>= fun (cols, cur2) ->
-                Reader.readVarint cur2
-                >>= fun (pkCount, cur3) ->
-                    Reader.readItems pkCount Reader.readStr cur3
-                    |> Result.map (fun (pks, _) ->
-                        {
-                            Name = name
-                            Columns = cols
-                            PrimaryKeyColumns = pks
-                        })
+                return
+                    {
+                        Name = name
+                        DataType = dt
+                        TypeArguments = []
+                        Constraint =
+                            {
+                                NotNull = flags &&& 1uy <> 0uy
+                                PrimaryKey = flags &&& 2uy <> 0uy
+                                Unique = flags &&& 4uy <> 0uy
+                                Default = None
+                            }
+                    },
+                    c4
+            }
+
+        result {
+            let! colCount, cur1 = Cursor.create bytes |> Reader.readVarint
+            let! cols, cur2 = Reader.readItems colCount readColumn cur1
+            let! pkCount, cur3 = Reader.readVarint cur2
+            let! pks, _ = Reader.readItems pkCount Reader.readStr cur3
+
+            return
+                {
+                    Name = name
+                    Columns = cols
+                    PrimaryKeyColumns = pks
+                }
+        }
 
     let private encodeIndex (i: IndexDefinition) =
         let w2 =
@@ -233,28 +230,21 @@ module internal Catalog =
         i.Columns |> List.fold (fun w c -> Writer.str c w) w2 |> Writer.toArray
 
     let private decodeIndex (name: string) (bytes: byte array) =
-        let cur = Cursor.create bytes
+        result {
+            let! table, cur1 = Cursor.create bytes |> Reader.readStr
+            let! unique, cur2 = Reader.readBool cur1
+            let! colCount, cur3 = Reader.readVarint cur2
+            let! cols, _ = Reader.readItems colCount Reader.readStr cur3
 
-        Reader.readStr cur
-        >>= fun (table, cur1) ->
-            Reader.readBool cur1
-            >>= fun (unique, cur2) ->
-                Reader.readVarint cur2
-                >>= fun (colCount, cur3) ->
-                    Reader.readItems colCount Reader.readStr cur3
-                    |> Result.map (fun (cols, _) ->
-                        {
-                            IndexName = name
-                            TableName = table
-                            Columns = cols
-                            Unique = unique
-                        })
+            return
+                {
+                    IndexName = name
+                    TableName = table
+                    Columns = cols
+                    Unique = unique
+                }
+        }
 
-    let private bytesEqual (a: byte array) (b: byte array) =
-        a.Length = b.Length && Array.forall2 (=) a b
-
-    /// キーから「テーブルの定義か索引の定義か」と名前を読み出す。
-    /// isIndex = `index:` プレフィックスなら true。どちらでもなければ None。
     let private keyKindOf (key: byte array) =
         let tryPrefix (prefix: string) =
             let p = System.Text.Encoding.UTF8.GetBytes prefix
@@ -273,16 +263,14 @@ module internal Catalog =
             | Some name -> Some(true, name)
             | None -> None
 
-    let private toValue (bytes: byte array) = [| SqlValue.Blob bytes |]
-
-    let private ofValue (v: SqlValue array) =
-        match v with
-        | [| SqlValue.Blob b |] -> Some b
-        | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
-        | _ -> None
-
     /// カタログを読み込む。キーが無ければ空を返す。
     let load (store: RowStore) =
+        let ofValue (v: SqlValue array) =
+            match v with
+            | [| SqlValue.Blob b |] -> Some b
+            | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
+            | _ -> None
+
         let rec decodeRows (rest: (byte array * SqlValue array option) array) (acc: Catalog) =
             if Array.isEmpty rest then
                 ret acc
@@ -316,11 +304,16 @@ module internal Catalog =
             | [] -> List.rev acc, seq
             | x :: tail -> numberList mk tail (seq + 1UL) (mk x seq :: acc)
 
+        let toValue (bytes: byte array) = [| SqlValue.Blob bytes |]
+
         let tableBatch (t: TableDefinition) (seq: uint64) =
             keyspace, [| Entry.put (tableKey t.Name) seq (toValue (encodeTable t)) |]
 
         let indexBatch (i: IndexDefinition) (seq: uint64) =
             keyspace, [| Entry.put (indexKey i.IndexName) seq (toValue (encodeIndex i)) |]
+
+        let bytesEqual (a: byte array) (b: byte array) =
+            a.Length = b.Length && Array.forall2 (=) a b
 
         let isWanted (key: byte array) =
             match keyKindOf key with
@@ -328,29 +321,26 @@ module internal Catalog =
             | Some(true, _) -> catalog.Indexes |> List.exists (fun i -> bytesEqual key (indexKey i.IndexName))
             | None -> false
 
-        RowStore.engine store keyspace
-        |> Result.map (fun e -> e.NextSeqNo)
-        >>= fun seq0 ->
+        result {
+            let! e = RowStore.engine store keyspace
+            let seq0 = e.NextSeqNo
             let tableBatches, seq1 = numberList tableBatch catalog.Tables seq0 []
             let indexBatches, seq2 = numberList indexBatch catalog.Indexes seq1 []
+            let! updated = RowStore.writeBatches store (tableBatches @ indexBatches)
+            let! rows = RowStore.scan updated keyspace [||] 0
 
-            RowStore.writeBatches store (tableBatches @ indexBatches)
-            >>= fun updated ->
-                RowStore.scan updated keyspace [||] 0
-                >>= fun rows ->
-                    let stale =
-                        rows
-                        |> Array.choose (fun (key, v) ->
-                            match v with
-                            | Some _ when isWanted key -> None
-                            | Some _ -> Some key
-                            | None -> None)
-                        |> Array.toList
+            let stale =
+                rows
+                |> Array.choose (fun (key, v) ->
+                    match v with
+                    | Some _ when isWanted key -> None
+                    | Some _ -> Some key
+                    | None -> None)
+                |> Array.toList
 
-                    if List.isEmpty stale then
-                        ret updated
-                    else
-                        let deletes, _ =
-                            numberList (fun (k: byte array) seq -> Entry.delete k seq) stale seq2 []
-
-                        RowStore.writeBatches updated [ (keyspace, Array.ofList deletes) ]
+            if List.isEmpty stale then
+                return updated
+            else
+                let deletes, _ = numberList Entry.delete stale seq2 []
+                return! RowStore.writeBatches updated [ (keyspace, Array.ofList deletes) ]
+        }

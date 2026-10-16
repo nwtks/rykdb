@@ -103,8 +103,11 @@ module internal Entry =
 
     let decodeBatch (data: byte array) =
         let readOne (c: Cursor) =
-            Reader.readLengthPrefixed c
-            >>= fun (bs, c1) -> decodeEntry bs |> Result.map (fun e -> e, c1)
+            result {
+                let! bs, c1 = Reader.readLengthPrefixed c
+                let! e = decodeEntry bs
+                return e, c1
+            }
 
         result {
             let c = Cursor.create data
@@ -112,7 +115,7 @@ module internal Entry =
             let! count, c = Reader.readVarint c
 
             if count > uint64 System.Int32.MaxValue then
-                return! Error(sprintf "Wal: バッチのエントリ数が大きすぎます (%d)" count |> DbError.corruption)
+                return! err (sprintf "Wal: バッチのエントリ数が大きすぎます (%d)" count |> DbError.corruption)
             else
                 let! items, _ = Reader.readItems count readOne c
                 return txnId, List.toArray items
@@ -208,34 +211,30 @@ module internal Memtable =
                 if p > r.Priority then
                     let left, right = split (Some r) e
 
-                    rebuild
-                        stack
-                        (Some
-                            {
-                                Entry = e
-                                Priority = p
-                                Left = left
-                                Right = right
-                            })
+                    Some
+                        {
+                            Entry = e
+                            Priority = p
+                            Left = left
+                            Right = right
+                        }
+                    |> rebuild stack
+                else if Entry.compareKeys e r.Entry < 0 then
+                    descend ((r, true) :: stack) r.Left
                 else
-                    let c = Entry.compareKeys e r.Entry
-
-                    if c < 0 then
-                        descend ((r, true) :: stack) r.Left
-                    else
-                        descend ((r, false) :: stack) r.Right
+                    descend ((r, false) :: stack) r.Right
 
         descend [] root
 
-    let private insert (e: Entry) (mem: Memtable) =
-        {
-            Root = insertNode e mem.Root
-            Count = mem.Count + 1
-            ApproxBytes = mem.ApproxBytes + Entry.approxBytes e
-        }
-
     /// 複数のエントリをまとめて挿入する。
     let apply (entries: Entry seq) (mem: Memtable) =
+        let insert (e: Entry) (mem: Memtable) =
+            {
+                Root = insertNode e mem.Root
+                Count = mem.Count + 1
+                ApproxBytes = mem.ApproxBytes + Entry.approxBytes e
+            }
+
         Seq.fold (fun mem e -> insert e mem) mem entries
 
     /// キーの最新バージョン（SeqNo が最大のもの）を返す。

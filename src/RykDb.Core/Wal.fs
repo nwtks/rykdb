@@ -71,45 +71,45 @@ module internal Wal =
             let c = Cursor.create payload
             let! tag, c = Reader.readByte c
 
-            if tag = TagBegin then
+            match tag with
+            | TagBegin ->
                 let! txnId, _ = Reader.readUint64BE c
                 return WalRecord.Begin txnId
-            elif tag = TagCommit then
+            | TagCommit ->
                 let! txnId, _ = Reader.readUint64BE c
                 return WalRecord.Commit txnId
-            elif tag = TagAbort then
+            | TagAbort ->
                 let! txnId, _ = Reader.readUint64BE c
                 return WalRecord.Abort txnId
-            elif tag = TagBatch then
+            | TagBatch ->
                 let! bs, _ = Reader.readBytes (Cursor.remaining c) c
                 let! txnId, entries = Entry.decodeBatch bs
                 return WalRecord.Batch(txnId, entries)
-            else
-                return! Error(sprintf "Wal: 不明なレコード種別 %d" (int tag) |> DbError.corruption)
-        }
-
-    /// フレーム 1件を読む（frame が書く [len:u32LE][checksum:u32LE][payload] の対）。
-    /// 短い・チェックサム不一致・payload 不正はすべて Error（呼び出し側で打ち切り）。
-    let private readFrame (c: Cursor) =
-        result {
-            let! len, c1 = Reader.readUInt32LE c
-            let! sum, c2 = Reader.readUInt32LE c1
-            let n = int len
-
-            if n < 0 then
-                return! Error(DbError.corruption "Wal: フレーム長が不正です")
-            else
-                let! payload, c3 = Reader.readBytes n c2
-
-                if Hashing.checksum payload <> sum then
-                    return! Error(DbError.corruption "Wal: チェックサム不一致")
-                else
-                    let! r = decodePayload payload
-                    return r, c3
+            | _ -> return! err (sprintf "Wal: 不明なレコード種別 %d" (int tag) |> DbError.corruption)
         }
 
     let private readRecords (data: byte array) =
-        // 壊れた/書きかけレコードで打ち切る（以降のバイトは捨てる）。
+        /// フレーム 1件を読む（frame が書く [len:u32LE][checksum:u32LE][payload] の対）。
+        /// 短い・チェックサム不一致・payload 不正はすべて Error（呼び出し側で打ち切り）。
+        let readFrame (c: Cursor) =
+            result {
+                let! len, c1 = Reader.readUInt32LE c
+                let! sum, c2 = Reader.readUInt32LE c1
+                let n = int len
+
+                if n < 0 then
+                    return! err (DbError.corruption "Wal: フレーム長が不正です")
+                else
+                    let! payload, c3 = Reader.readBytes n c2
+
+                    if Hashing.checksum payload <> sum then
+                        return! err (DbError.corruption "Wal: チェックサム不一致")
+                    else
+                        let! r = decodePayload payload
+                        return r, c3
+            }
+
+        /// 壊れた/書きかけレコードで打ち切る（以降のバイトは捨てる）。
         let rec readFrames (c: Cursor) (acc: WalRecord list) =
             match readFrame c with
             | Error _ -> List.rev acc

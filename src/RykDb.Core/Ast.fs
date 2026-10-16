@@ -1,6 +1,7 @@
 namespace RykDb.Core
 
-/// SQL テキスト中の位置。エラー報告に使う。
+/// SQL テキスト中の位置。
+/// エラー報告に使う。
 type internal Position = { Offset: int; Line: int; Column: int }
 
 /// リテラル。
@@ -39,7 +40,8 @@ module internal Literal =
         | SqlValue.Timestamp t -> Literal.String(t.UtcDateTime.ToString "yyyy-MM-ddTHH:mm:ss.fffffffZ")
         | SqlValue.Uuid g -> Literal.String(g.ToString "D")
 
-/// 列参照。修飾子の有無を区別したまま保持し、束縛時に解決する。
+/// 列参照。
+/// 修飾子の有無を区別したまま保持し、束縛時に解決する。
 type internal ColumnRef =
     {
         Qualifier: string option
@@ -129,29 +131,34 @@ type internal BinaryOp =
         | Or -> "OR"
         | Like -> "LIKE"
 
-/// 式。束縛後は列参照が解決済みになる。
+/// 式。
+/// 束縛後は列参照が解決済みになる。
 [<RequireQualifiedAccess; NoComparison; NoEquality>]
 type internal Expr =
     | Literal of Literal
     /// 修飾子付きの列参照
     | Column of ColumnRef
-    /// 修飾子なしの裸の名前。スカラー関数の候補。
+    /// 修飾子なしの裸の名前。
+    /// スカラー関数の候補。
     | Name of string
     | Unary of UnaryOp * Expr
     | Binary of BinaryOp * Expr * Expr
     /// 否定なら isNegative = true
     | IsNull of Expr * bool
-    /// low / high。否定なら isNegative = true
+    /// low / high。
+    /// 否定なら isNegative = true
     | Between of Expr * Expr * Expr * bool
     /// 否定なら isNegative = true
     | InList of Expr * Expr list * bool
     /// 否定なら isNegative = true
     | Like of Expr * Expr * bool
-    /// (WHEN 式, THEN 式) の並び。ELSE がないなら None。
+    /// (WHEN 式, THEN 式) の並び。
+    /// ELSE がないなら None。
     | Case of (Expr * Expr) list * Expr option
     /// スカラー関数呼び出し
     | FuncCall of string * Expr list
-    /// 集計呼び出し。COUNT(*) は EStar を持つ。
+    /// 集計呼び出し。
+    /// COUNT(*) は EStar を持つ。
     | AggCall of AggFunc * bool * Expr
     | Star
     /// `t.*`
@@ -168,7 +175,8 @@ type private PrintStep =
     | Sub of Expr * PrintStep list
 
 module internal Expr =
-    /// 直接の子式をリストで返す（走査順は左から右）。再帰は呼び出し側が行う。
+    /// 直接の子式をリストで返す（走査順は左から右）。
+    /// 再帰は呼び出し側が行う。
     let children (e: Expr) =
         match e with
         | Expr.Literal _
@@ -234,19 +242,17 @@ module internal Expr =
         | Expr.FuncCall(n, args) -> args |> List.map f |> all |> Result.map (fun as2 -> Expr.FuncCall(n, as2))
         | Expr.AggCall(f2, star, arg) -> f arg |> Result.map (fun a -> Expr.AggCall(f2, star, a))
 
-    /// 明示的なスタック（末尾再帰で辿る list）へ、xs の要素を先頭から順に積み上げる補助。
-    /// xs @ stack や stack @ xs だと O(n^2) になるので反転しながら畳む。こちらも末尾再帰。
-    let private pushAll (xs: 'a list) (stack: 'a list) =
-        let rec revInto acc =
-            function
-            | [] -> acc
-            | x :: rest -> revInto (x :: acc) rest
-
-        revInto stack xs
-
     /// 式木を明示スタックで pre-order にたどり、各ノードについて状態を畳み込む。
-    /// 末尾再帰。走査順は「根 → 子を左から右へ」。
+    /// 走査順は「根 → 子を左から右へ」。
     let fold (f: 's -> Expr -> 's) (state: 's) (root: Expr) =
+        let pushAll (xs: 'a list) (stack: 'a list) =
+            let rec revInto acc =
+                function
+                | [] -> acc
+                | x :: rest -> revInto (x :: acc) rest
+
+            revInto stack xs
+
         let rec foldStack (stack: Expr list) (acc: 's) =
             match stack with
             | [] -> acc
@@ -256,7 +262,8 @@ module internal Expr =
 
         foldStack [ root ] state
 
-    /// 式中のすべての列参照を列挙する。束縛と空き列判定に使う。
+    /// 式中のすべての列参照を列挙する。
+    /// 束縛と空き列判定に使う。
     /// 末尾再帰の明示スタック走査（ColumnRefs の既存の挙動を維持）。
     let columnRefs (e: Expr) =
         fold
@@ -268,7 +275,8 @@ module internal Expr =
             e
         |> List.rev
 
-    /// 式に集計呼び出しが含まれるか。GROUP BY の妥当性判定に使う。
+    /// 式に集計呼び出しが含まれるか。
+    /// GROUP BY の妥当性判定に使う。
     /// 短絡評価の早期打ち切りは失われるが、結果は論理 OR で同じ。
     let isAggregate (e: Expr) =
         fold
@@ -281,8 +289,7 @@ module internal Expr =
             e
 
     /// 式をテキストへ戻す（EXPLAIN やエラーメッセージ用）。
-    /// 「式」と「その式を出したあとに吐く文字列」を 1本のスタックで表現し、
-    /// 末尾再帰で処理する。
+    /// 「式」と「その式を出したあとに吐く文字列」を 1本のスタックで表現し、末尾再帰で処理する。
     /// writeSteps x のあとに put ")" と書くと再帰呼び出しが末尾位置にならず、
     /// 深い式（1万段超）でスタックを食うため。
     let toDisplayString (e: Expr) =

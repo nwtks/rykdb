@@ -18,6 +18,8 @@ type internal BloomFilter =
     }
 
 module internal BloomFilter =
+    let private ln2 = log 2.0
+
     /// double hashing の位置列。
     /// ハッシュ上位 32bit（h1）を起点、下位 32bit を 1..2^32-1 に正規化した値をステップ幅にする。
     /// ステップは奇数にしないと偏る。
@@ -48,7 +50,6 @@ module internal BloomFilter =
             if expectedCount <= 0 then
                 8
             else
-                let ln2 = log 2.0
                 let m = -float expectedCount * log falsePositiveRate / (ln2 * ln2)
                 max 8 (int (ceil m / 8.0) * 8)
 
@@ -56,7 +57,7 @@ module internal BloomFilter =
             if expectedCount <= 0 then
                 1
             else
-                max 1 (int (ceil (float bitCount / float expectedCount) * log 2.0))
+                max 1 (int (ceil (float bitCount / float expectedCount) * ln2))
 
         let ofHashes (expectedCount: int) (falsePositiveRate: float) (hashes: uint64 seq) =
             let bitCount = bitsFor expectedCount falsePositiveRate
@@ -77,7 +78,7 @@ module internal BloomFilter =
             }
 
         keys
-        |> Seq.map (fun k -> Hashing.hashBytes k |> Hashing.mix)
+        |> Seq.map (Hashing.hashBytes >> Hashing.mix)
         |> ofHashes expectedCount falsePositiveRate
 
     let serialize (filter: BloomFilter) =
@@ -96,20 +97,20 @@ module internal BloomFilter =
             let! version, c = Reader.readByte c
 
             if version <> 1uy then
-                return! Error(sprintf "BloomFilter: 未対応のバージョン %d" version |> DbError.corruption)
+                return! err (sprintf "BloomFilter: 未対応のバージョン %d" version |> DbError.corruption)
 
             let! hashCount, c = Reader.readByte c
             let! count, c = Reader.readVarint c
-            let! bits, c = Reader.readVarint c
+            let! bitsLength, c = Reader.readVarint c
 
-            if bits > uint64 System.Int32.MaxValue then
-                return! Error(DbError.corruption "BloomFilter: ビット数が異常です")
+            if bitsLength > uint64 System.Int32.MaxValue then
+                return! err (DbError.corruption "BloomFilter: ビット数が異常です")
 
-            let! bytes, _ = Reader.readBytes (int bits) c
+            let! bits, _ = Reader.readBytes (int bitsLength) c
 
             return
                 {
-                    Bits = bytes
+                    Bits = bits
                     HashCount = int hashCount
                     Count = int count
                 }

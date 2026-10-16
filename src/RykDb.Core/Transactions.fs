@@ -17,7 +17,8 @@ namespace RykDb.Core
 /// transaction の識別子。
 type internal TxnId = uint64
 
-/// 読み取りの可視性境界。これより大きい SeqNo の書き込みは見えない。
+/// 読み取りの可視性境界。
+/// これより大きい SeqNo の書き込みは見えない。
 type internal Snapshot = { SeqNo: uint64 }
 
 module internal Snapshot =
@@ -27,17 +28,15 @@ module internal Snapshot =
     /// 制限なし。
     let noLimit: uint64 option = None
 
-// ---------------------------------------------------------------------------
-// Transaction
-// ---------------------------------------------------------------------------
-
-/// 書き込み中の transaction。commit まで DB から見えない。
+/// 書き込み中の transaction。
+/// commit まで DB から見えない。
 type internal Transaction =
     {
         TxnId: TxnId
         /// transaction 開始時点の可視性境界
         Snapshot: Snapshot
-        /// keyspace -> (キー -> 値)。同一キーは最後の書き込みが勝つ。
+        /// keyspace -> (キー -> 値)。
+        /// 同一キーは最後の書き込みが勝つ。
         Buffers: Map<string, Map<byte array, SqlValue array option>>
     }
 
@@ -52,9 +51,6 @@ module internal Transaction =
     /// 書き込み可能な transaction を作る。
     let create (txnId: TxnId) (snap: Snapshot) = empty txnId snap
 
-    /// バッファの 1 スロットを差し替える（`Some value` = 書き込み、`None` = 削除）。
-    /// keyspace ごとの内側 Map が無ければ空から作る。
-    /// put / remove は積む値だけが違うので、この 1 本に集約する。
     let private setSlot (txn: Transaction) (keyspace: string) (key: byte array) (slot: SqlValue array option) =
         let inner =
             match Map.tryFind keyspace txn.Buffers with
@@ -72,12 +68,12 @@ module internal Transaction =
     /// 削除を書き込む（バッファに積む）。
     let remove (txn: Transaction) (keyspace: string) (key: byte array) = setSlot txn keyspace key None
 
-    /// 「(keyspace, キー)」を競合検出用の文字列 1 本に畳む。
+    /// 「(keyspace, キー)」を競合検出用の文字列 1本に畳む。
     /// Map のキーは byte[] でも構造比較で並ぶので、文字列化は一意性を保てる。
     let conflictKey (keyspace: string) (key: byte array) =
-        keyspace + ":" + System.Convert.ToBase64String(key)
+        keyspace + ":" + System.Convert.ToBase64String key
 
-    /// 競合検出用に「(keyspace, キー)」を文字列 1 本に畳んだ集合。
+    /// 競合検出用に「(keyspace, キー)」を文字列 1本に畳んだ集合。
     let writeKeys (txn: Transaction) =
         txn.Buffers
         |> Map.toList
@@ -85,7 +81,7 @@ module internal Transaction =
         |> Set.ofList
 
     /// バッファを keyspace ごとに「SeqNo 降順で採番済みの Entry 配列」に変換する。
-    /// 採番は <paramref name="nextSeqNo"/> から 1 つずつ採番する。
+    /// 採番は nextSeqNo から 1つずつ採番する。
     /// 決定的な順序にするため keyspace 名 → キーの昇順で採番する
     /// （同じ transaction は常に同じ SeqNo 割当になる）。
     let toEntries (nextSeqNo: uint64) (txn: Transaction) =
@@ -113,11 +109,7 @@ module internal Transaction =
 
         perKeyspace (txn.Buffers |> Map.toList |> List.map (fun (ks, m) -> ks, m |> Map.toList)) nextSeqNo []
 
-// ---------------------------------------------------------------------------
-// TransactionManager
-// ---------------------------------------------------------------------------
-
-/// active な transaction 1 件分。
+/// active な transaction 1件分。
 type internal TxnRecord =
     {
         Txn: Transaction
@@ -126,8 +118,6 @@ type internal TxnRecord =
     }
 
 /// transaction を管理し、commit order の一意性と write-write 競合を保証する。
-/// commit は直列化する: 採番と競合検査が 1 つの临界域に入る。
-/// 読み取りはこの構造体に一切触らない（snapshot を掴むだけ）。
 type internal TransactionManager =
     {
         /// 次に採番する SeqNo
@@ -166,7 +156,8 @@ module internal TransactionManager =
 
         updated, txn
 
-    /// transaction を破棄する（abort）。バッファは捨てられるので DB には何も残らない。
+    /// transaction を破棄する（abort）。
+    /// バッファは捨てられるので DB には何も残らない。
     let abort (mgr: TransactionManager) (txnId: TxnId) =
         { mgr with
             Active = Map.remove txnId mgr.Active
@@ -178,49 +169,42 @@ module internal TransactionManager =
     /// 2. 問題なければ SeqNo を採番して LastCommitted を更新する。
     /// 返り値の Entry 配列を StorageEngine に流し込むと DB に反映される。
     let commit (mgr: TransactionManager) (txn: Transaction) =
-        let txnId = txn.TxnId
+        let findConflicts (txn: Transaction) (lastCommitted: Map<string, uint64>) (snapSeq: uint64) =
+            Transaction.writeKeys txn
+            |> Set.toList
+            |> List.filter (fun k ->
+                match lastCommitted |> Map.tryFind k with
+                | Some seq -> seq > snapSeq
+                | None -> false)
 
-        // 渡された Transaction 自身を使う。Active に残っている「begin 時の空の
-        // transaction」を使うと、バッファの書き込みが全部消えている。
-        if not (Map.containsKey txnId mgr.Active) then
-            Error(DbError.internalError (sprintf "Transaction %d が存在しません" txnId))
+        let updateLastCommitted (batches: (string * Entry array) list) (lastCommitted: Map<string, uint64>) =
+            batches
+            |> List.fold
+                (fun acc (ks, entries) ->
+                    entries
+                    |> Array.fold
+                        (fun acc e ->
+                            let k = Transaction.conflictKey ks e.Key
+
+                            match acc |> Map.tryFind k with
+                            | Some old when old >= e.SeqNo -> acc
+                            | _ -> Map.add k e.SeqNo acc)
+                        acc)
+                lastCommitted
+
+        if not (Map.containsKey txn.TxnId mgr.Active) then
+            err (sprintf "Transaction %d が存在しません" txn.TxnId |> DbError.internalError)
         else
-            let snapSeq = txn.Snapshot.SeqNo
-
-            // ---- write-write 競合検出 ----
-            // キー集合は「beginTxn 時の空集合」ではなく commit 時のバッファ から計算する。
-            // （begin 時点のままだと 1 つも書かれていないので衝突を検出できない）
-            let conflicting =
-                Transaction.writeKeys txn
-                |> Set.toList
-                |> List.filter (fun k ->
-                    match mgr.LastCommitted |> Map.tryFind k with
-                    | Some seq -> seq > snapSeq
-                    | None -> false)
+            let conflicting = findConflicts txn mgr.LastCommitted txn.Snapshot.SeqNo
 
             if not (List.isEmpty conflicting) then
-                Error(
-                    DbError.conflict (sprintf "Transaction %d が key %d 件と write-write 競合しました" txnId conflicting.Length)
+                err (
+                    sprintf "Transaction %d が key %d 件と write-write 競合しました" txn.TxnId conflicting.Length
+                    |> DbError.conflict
                 )
             else
-                // ---- 採番と バッファの確定 ----
                 let batches, nextSeq = Transaction.toEntries mgr.NextSeqNo txn
-
-                let lastCommitted =
-                    batches
-                    |> List.fold
-                        (fun acc (ks, entries) ->
-                            entries
-                            |> Array.fold
-                                (fun acc e ->
-                                    let k = Transaction.conflictKey ks e.Key
-
-                                    match acc |> Map.tryFind k with
-                                    | Some old when old >= e.SeqNo -> acc
-                                    | _ -> Map.add k e.SeqNo acc)
-                                acc)
-                        mgr.LastCommitted
-
+                let lastCommitted = updateLastCommitted batches mgr.LastCommitted
                 let commitSeq = nextSeq - 1UL
 
                 let updated =
@@ -228,7 +212,7 @@ module internal TransactionManager =
                         NextSeqNo = nextSeq
                         LastCommitted = lastCommitted
                         LastCommitSeqNo = commitSeq
-                        Active = Map.remove txnId mgr.Active
+                        Active = Map.remove txn.TxnId mgr.Active
                     }
 
                 Ok(updated, commitSeq, batches)

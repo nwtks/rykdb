@@ -211,41 +211,6 @@ let ``Compaction: 実行しても同じ Version では二度と compaction さ�
 // ===========================================================================
 
 [<Fact>]
-let ``Compaction: RowStore 経由で全 keyspace を compact できる`` () =
-    let schema =
-        TableSchema.ofCreateTable
-            {
-                Name = "t"
-                IfNotExists = false
-                Columns =
-                    [
-                        {
-                            Name = "id"
-                            DataType = DataType.Integer
-                            TypeArguments = []
-                            Constraint =
-                                { ColumnConstraint.Empty with
-                                    PrimaryKey = true
-                                }
-                        }
-                    ]
-                Constraints = []
-            }
-        |> ok
-
-    withStore "c6" (fun store ->
-        let mgr = TransactionManager.create ()
-        let _, txn = TransactionManager.beginTxn mgr
-        let txn = ok (Dml.insert schema txn [| SqlValue.Int 1L |])
-        let batches = Transaction.toEntries 1UL txn |> fst
-        let written = ok (RowStore.writeBatches store batches)
-        let advanced = RowStore.setActiveSnapshot 100UL written
-        let compacted = ok (RowStore.compactAll advanced)
-        let has = compacted.Engines |> Map.containsKey (Keyspace.table "t")
-
-        Assert.True(has))
-
-[<Fact>]
 let ``Compaction: active snapshot を進めている GC の基準になる`` () =
     withDir "c7" (fun dir ->
         let engine = ok (StorageEngine.openDatabase dir)

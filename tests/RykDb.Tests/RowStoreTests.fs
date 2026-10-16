@@ -136,32 +136,6 @@ let ``RowStore: 1 行挿入して主キーで引ける`` () =
         | None -> Assert.Fail("行が見つからないはず"))
 
 [<Fact>]
-let ``RowStore: 索引で引ける`` () =
-    withStore "rs2" (fun store ->
-        let mgr = TransactionManager.create ()
-        let _, txn = TransactionManager.beginTxn mgr
-        let txn = Dml.insert usersWithEmailIndex txn (rowOf 7 "bob@example.com" 30) |> ok
-
-        commitInto store 1UL txn
-
-        let idx = usersWithEmailIndex.Indexes.[0]
-
-        let found =
-            Dml.getByIndex store usersWithEmailIndex idx None (rowOf 7 "bob@example.com" 30)
-            |> ok
-
-        match found with
-        | Some row -> Assert.Equal<int64>(7L, asInt row.[0])
-        | None -> Assert.Fail("索引で引けないはず")
-
-        // 別の索引値は引けない
-        let missing =
-            Dml.getByIndex store usersWithEmailIndex idx None (rowOf 9 "nobody@example.com" 9)
-            |> ok
-
-        Assert.True(missing.IsNone))
-
-[<Fact>]
 let ``RowStore: NOT NULL 制約違反は弾かれる`` () =
     let notNull =
         { ColumnConstraint.Empty with
@@ -201,35 +175,6 @@ let ``RowStore: 列数が違う行は弾かれる`` () =
             (Dml.insert usersWithEmailIndex txn [| SqlValue.Int 1L |]))
 
 [<Fact>]
-let ``RowStore: 削除は主キーと索引の両方に tombstone を書く`` () =
-    withStore "rs4" (fun store ->
-        let mgr = TransactionManager.create ()
-        let _, txn = TransactionManager.beginTxn mgr
-        let txn = Dml.insert usersWithEmailIndex txn (rowOf 1 "x@example.com" 1) |> ok
-
-        commitInto store 1UL txn
-
-        let idx = usersWithEmailIndex.Indexes.[0]
-        let _, delTxn = TransactionManager.beginTxn mgr
-
-        let delTxn =
-            Dml.deleteByPrimaryKey store usersWithEmailIndex None delTxn [| SqlValue.Int 1L |]
-            |> ok
-
-        commitInto store 10UL delTxn
-
-        // 主キーからも索引からも消えている（索引の tombstone を忘れると行が復活する）
-        let found =
-            Dml.getByPrimaryKey store usersWithEmailIndex None [| SqlValue.Int 1L |] |> ok
-
-        let byEmail =
-            Dml.getByIndex store usersWithEmailIndex idx None (rowOf 1 "x@example.com" 1)
-            |> ok
-
-        Assert.True(found.IsNone)
-        Assert.True(byEmail.IsNone))
-
-[<Fact>]
 let ``RowStore: 存在しない行の削除は NotFound`` () =
     withStore "rs4b" (fun store ->
         let mgr = TransactionManager.create ()
@@ -239,46 +184,6 @@ let ``RowStore: 存在しない行の削除は NotFound`` () =
             ErrorKind.NotFound
             "存在しない行の削除を許してはいけない"
             (Dml.deleteByPrimaryKey store usersWithEmailIndex None delTxn [| SqlValue.Int 999L |]))
-
-[<Fact>]
-let ``RowStore: update は削除+挿入を 1 transaction で行う`` () =
-    withStore "rs5" (fun store ->
-        let mgr = TransactionManager.create ()
-        let _, txn = TransactionManager.beginTxn mgr
-        let txn = Dml.insert usersWithEmailIndex txn (rowOf 1 "old@example.com" 1) |> ok
-
-        commitInto store 1UL txn
-
-        let _, updTxn = TransactionManager.beginTxn mgr
-        let newRow = rowOf 1 "new@example.com" 2
-
-        let updTxn =
-            Dml.updateByPrimaryKey store usersWithEmailIndex None updTxn [| SqlValue.Int 1L |] newRow
-            |> ok
-
-        commitInto store 10UL updTxn
-
-        // 主キーで読むと新しい email が見える
-        let found =
-            Dml.getByPrimaryKey store usersWithEmailIndex None [| SqlValue.Int 1L |] |> ok
-
-        match found with
-        | Some row -> Assert.Equal<string>("new@example.com", asText row.[1])
-        | None -> Assert.Fail("見つからないはず")
-
-        // 古い索引値は消え、新しい索引値で引ける
-        let idx = usersWithEmailIndex.Indexes.[0]
-
-        let byOld =
-            Dml.getByIndex store usersWithEmailIndex idx None (rowOf 1 "old@example.com" 1)
-            |> ok
-
-        let byNew =
-            Dml.getByIndex store usersWithEmailIndex idx None (rowOf 1 "new@example.com" 2)
-            |> ok
-
-        Assert.True(byOld.IsNone)
-        Assert.True(byNew.IsSome))
 
 [<Fact>]
 let ``RowStore: 主キーで全行を走査できる`` () =

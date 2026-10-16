@@ -31,27 +31,23 @@ module internal BlockCache =
             Entries = []
         }
 
-    let private entryKey (fileNumber: int64) (blockId: int) = fileNumber, blockId
+    let private entryKey (entry: CacheEntry) = entry.FileNumber, entry.BlockId
 
     /// キャッシュを読む（あれば最近使った順に更新して返す）。
     let get (cache: BlockCache) (fileNumber: int64) (blockId: int) =
-        let k = entryKey fileNumber blockId
+        let k = fileNumber, blockId
 
-        match cache.Entries |> List.tryFind (fun e -> entryKey e.FileNumber e.BlockId = k) with
+        match cache.Entries |> List.tryFind (fun e -> entryKey e = k) with
         | None -> None
         | Some found ->
-            let rest =
-                cache.Entries |> List.filter (fun e -> entryKey e.FileNumber e.BlockId <> k)
-
+            let rest = cache.Entries |> List.filter (fun e -> entryKey e <> k)
             let updated = { cache with Entries = found :: rest }
             Some(updated, found.Data)
 
     /// キャッシュへ入れる（既存は置き換えて最近使ったものにする）。
     let put (cache: BlockCache) (entry: CacheEntry) =
-        let k = entryKey entry.FileNumber entry.BlockId
-
-        let rest =
-            cache.Entries |> List.filter (fun e -> entryKey e.FileNumber e.BlockId <> k)
+        let k = entryKey entry
+        let rest = cache.Entries |> List.filter (fun e -> entryKey e <> k)
 
         let trimmed =
             if cache.Capacity <= 0 then
