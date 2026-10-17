@@ -24,7 +24,10 @@
     <Compile Include="TransactionsTests.fs" />
     <Compile Include="RowStoreTests.fs" />
     <Compile Include="CompactionTests.fs" />
-    <Compile Include="ExecutorTests.fs" />
+    <Compile Include="DmlOpsTests.fs" />
+    <Compile Include="EvalTests.fs" />
+    <Compile Include="OpsTests.fs" />
+    <Compile Include="SchemaTests.fs" />
     <Compile Include="CatalogTests.fs" />
     <Compile Include="PlannerTests.fs" />
     <Compile Include="DatabaseTests.fs" />

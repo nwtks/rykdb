@@ -27,10 +27,12 @@ type Database internal (root: string, state: DbState) =
     /// DB のルートディレクトリ。
     member _.Root = root
 
-    /// DB を閉じる。全 keyspace のエンジンを閉じる。
+    /// DB を閉じる。
+    /// 全 keyspace のエンジンを閉じる。
     member _.Close() = RowStore.close state.Store
 
-    /// トランザクションを始める。明示的な BEGIN。
+    /// トランザクションを始める。
+    /// 明示的な BEGIN。
     member this.Begin() =
         if state.Active.IsSome then
             this
@@ -48,10 +50,11 @@ type Database internal (root: string, state: DbState) =
     /// 実行中の transaction があるか。
     member _.InTransaction = state.Active.IsSome
 
-    /// COMMIT。バッファをエンジンへ流す。
+    /// COMMIT。
+    /// バッファをエンジンへ流す。
     /// <remarks>
     /// コミットする transaction は「Active か Pending のうちバッファを持つ方」。
-    /// Pending は DML が実行されるたびに更新されるので、複数文の DML を 1 つの transaction にまとめられる。
+    /// Pending は DML が実行されるたびに更新されるので、複数文の DML を 1つの transaction にまとめられる。
     /// </remarks>
     member _.Commit() =
         let target =
@@ -65,7 +68,8 @@ type Database internal (root: string, state: DbState) =
             DbStateOps.commitTransaction state txn
             |> Result.map (fun nextState -> Database(root, nextState))
 
-    /// ROLLBACK。バッファを捨てる。
+    /// ROLLBACK。
+    /// バッファを捨てる。
     member this.Rollback() =
         match state.Active with
         | None -> this
@@ -161,16 +165,15 @@ type Database internal (root: string, state: DbState) =
             return Database(root, finalState), summary
         }
 
-    /// SELECT を実行する。戻り値の Database を次の呼び出しに渡すこと。
+    /// SELECT を実行する。
+    /// 戻り値の Database を次の呼び出しに渡すこと。
     member this.Query(sql: string) = this.Execute sql
 
     /// テーブル一覧を返す。
     member _.TableNames() = state.Catalog.Tables |> List.map _.Name
 
-[<RequireQualifiedAccess>]
-module Database =
     /// DB を開く。
-    let openWith (root: string) =
+    static member openWith(root: string) =
         result {
             do! protect (fun () -> Directory.CreateDirectory root |> ignore)
             let! store = RowStore.openStore root

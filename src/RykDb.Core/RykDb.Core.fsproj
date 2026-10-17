@@ -25,8 +25,12 @@
     <Compile Include="Parser.fs" />
     <Compile Include="RowStore.fs" />
     <Compile Include="Catalog.fs" />
-    <Compile Include="Executor.fs" />
+    <Compile Include="Schema.fs" />
+    <Compile Include="Eval.fs" />
+    <Compile Include="Ops.fs" />
+    <Compile Include="ExecContext.fs" />
     <Compile Include="Planner.fs" />
+    <Compile Include="DmlOps.fs" />
     <Compile Include="Engine.fs" />
     <Compile Include="Database.fs" />
   </ItemGroup>

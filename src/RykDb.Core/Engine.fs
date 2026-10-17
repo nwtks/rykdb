@@ -53,29 +53,38 @@ module internal DbStateOps =
     /// Active / Pending のような state フィールドの更新は呼び出し側で行う
     /// （backfillIndex はトランザクションを外さないため触らない）。
     let commitToStore (store: RowStore) (mgr: TransactionManager) (txn: Transaction) =
-        TransactionManager.commit mgr txn
-        >>= fun (manager, _, batches) -> RowStore.writeBatches store batches |> Result.map (fun next -> next, manager)
+        result {
+            let! manager, _, batches = TransactionManager.commit mgr txn
+            let! next = RowStore.writeBatches store batches
+            return next, manager
+        }
 
     let commitTransaction (state: DbState) (txn: Transaction) =
-        commitToStore state.Store state.Manager txn
-        |> Result.map (fun (store, manager) ->
-            { state with
-                Store = store
-                Manager = manager
-                Active = None
-                Pending = None
-            })
+        result {
+            let! store, manager = commitToStore state.Store state.Manager txn
+
+            return
+                { state with
+                    Store = store
+                    Manager = manager
+                    Active = None
+                    Pending = None
+                }
+        }
 
 module internal Ddl =
     /// カタログを保存し、保存後の Store と新しい Catalog で state を作り直す。
     /// （CREATE / DROP すべてが使う「保存 → state 更新」の定型）
     let private saved (state: DbState) (next: Catalog) =
-        Catalog.save state.Store next
-        |> Result.map (fun store ->
-            { state with
-                Store = store
-                Catalog = next
-            })
+        result {
+            let! store = Catalog.save state.Store next
+
+            return
+                { state with
+                    Store = store
+                    Catalog = next
+                }
+        }
 
     let createTable (state: DbState) (c: CreateTable) =
         let existing = Catalog.findTable state.Catalog c.Name
@@ -84,44 +93,45 @@ module internal Ddl =
         | Some _, true -> ret state
         | Some _, false -> err (sprintf "テーブル %s は既に存在します" c.Name |> DbError.alreadyExists)
         | None, _ ->
-            TableSchema.ofCreateTable c
-            >>= fun schema ->
-                let defn = Catalog.toDefinition schema
-                saved state (Catalog.addTable state.Catalog defn)
-
-    let private backfillIndex (state: DbState) (tableName: string) (idx: IndexSchema) =
-        match Catalog.findTable state.Catalog tableName with
-        | None -> ret state
-        | Some defn ->
             result {
-                let! schema = Catalog.toSchema defn
-
-                let withIndex =
-                    { schema with
-                        Indexes = idx :: schema.Indexes
-                    }
-
-                let mgr, txn = TransactionManager.beginTxn state.Manager
-                let! rows = Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
-
-                let! txn2 =
-                    foldOk
-                        (fun t row ->
-                            let key = RowKey.indexKey withIndex idx row
-                            ret (Transaction.put t (Keyspace.index idx.Name) key row))
-                        txn
-                        rows
-
-                let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
-
-                return
-                    { state with
-                        Store = store
-                        Manager = mgr2
-                    }
+                let! schema = TableSchema.ofCreateTable c
+                let defn = Catalog.toDefinition schema
+                return! saved state (Catalog.addTable state.Catalog defn)
             }
 
     let createIndex (state: DbState) (ci: CreateIndex) =
+        let backfillIndex (state: DbState) (tableName: string) (idx: IndexSchema) =
+            match Catalog.findTable state.Catalog tableName with
+            | None -> ret state
+            | Some defn ->
+                result {
+                    let! schema = Catalog.toSchema defn
+
+                    let withIndex =
+                        { schema with
+                            Indexes = idx :: schema.Indexes
+                        }
+
+                    let mgr, txn = TransactionManager.beginTxn state.Manager
+                    let! rows = Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
+
+                    let! txn2 =
+                        foldOk
+                            (fun t row ->
+                                let key = RowKey.indexKey withIndex idx row
+                                ret (Transaction.put t (Keyspace.index idx.Name) key row))
+                            txn
+                            rows
+
+                    let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
+
+                    return
+                        { state with
+                            Store = store
+                            Manager = mgr2
+                        }
+                }
+
         match Catalog.findTable state.Catalog ci.Table with
         | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
         | Some tableDef ->
@@ -175,35 +185,35 @@ module internal Ddl =
         dropItem state "索引" name ifExists Catalog.findIndex Catalog.removeIndex
 
 module internal Engine =
-    let private contextOf (state: DbState) (txn: Transaction) : ExecContext =
-        let base0 = Snapshot.toVisible txn.Snapshot |> ExecContext.create state.Store
-
-        state.Catalog.Tables
-        |> List.fold
-            (fun acc t ->
-                match Catalog.toSchema t with
-                | Ok schema ->
-                    let withIndexes =
-                        { schema with
-                            Indexes = Catalog.indexSchemasOf state.Catalog t.Name
-                        }
-
-                    let a1 = acc.WithSchema t.Name withIndexes
-                    a1.WithCatalog state.Catalog
-                | Error _ -> acc.WithCatalog state.Catalog)
-            (base0.WithCatalog state.Catalog)
-
     let runStatement (state: DbState) (txn: Transaction) (stmt: Statement) =
+        let addTable ctx t =
+            match Catalog.toSchema t with
+            | Ok schema ->
+                let withIndexes =
+                    { schema with
+                        Indexes = Catalog.indexSchemasOf state.Catalog t.Name
+                    }
+
+                let c1 = ExecContext.withSchema ctx t.Name withIndexes
+                ExecContext.withCatalog c1 state.Catalog
+            | Error _ -> ExecContext.withCatalog ctx state.Catalog
+
+        let contextOf (state: DbState) (txn: Transaction) =
+            let ctx = Snapshot.toVisible txn.Snapshot |> ExecContext.create state.Store
+
+            state.Catalog.Tables
+            |> List.fold addTable (ExecContext.withCatalog ctx state.Catalog)
+
         let runInsert (ctx: ExecContext) (st: InsertStatement) (txn: Transaction) =
-            ctx.SchemaOf st.Table.Name
+            ExecContext.schemaOf ctx st.Table.Name
             >>= fun schema -> DmlOps.insert schema txn st.Columns st.Rows
 
         let runUpdate (ctx: ExecContext) (st: UpdateStatement) (txn: Transaction) =
-            ctx.SchemaOf st.Table.Name
+            ExecContext.schemaOf ctx st.Table.Name
             >>= fun schema -> DmlOps.update ctx schema txn st.Assignments st.Where
 
         let runDelete (ctx: ExecContext) (st: DeleteStatement) (txn: Transaction) =
-            ctx.SchemaOf st.Table.Name
+            ExecContext.schemaOf ctx st.Table.Name
             >>= fun schema -> DmlOps.delete ctx schema txn st.Where
 
         let runDml
@@ -215,9 +225,7 @@ module internal Engine =
 
             run ctx txn
             |> Result.map (fun (txn2, n) ->
-                let nextState = { state with Pending = Some txn2 }
-
-                nextState,
+                { state with Pending = Some txn2 },
                 { StatementResult.empty with
                     RowsAffected = n
                 })

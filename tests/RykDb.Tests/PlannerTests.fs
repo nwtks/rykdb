@@ -17,9 +17,8 @@ open RykDb.TestHelpers
 /// テスト用の ExecContext（people と orders を登録済み）。
 let private ctxOf (store: RowStore) =
     let c0 = ExecContext.create store None
-
-    let c1 = c0.WithSchema "people" peopleSchema
-    let c2 = c1.WithSchema "orders" ordersSchema
+    let c1 = ExecContext.withSchema c0 "people" peopleSchema
+    let c2 = ExecContext.withSchema c1 "orders" ordersSchema
     c2
 
 // ---------------------------------------------------------------------------
@@ -63,7 +62,8 @@ let ``Binder: 修飾子無しの列が曖昧なら付けない`` () =
         }
 
     let combined =
-        Schema.ofTable "t1" None s1 |> fun s -> s.Concat(Schema.ofTable "t2" None s2)
+        Schema.ofTable "t1" None s1
+        |> fun s -> Schema.concat s (Schema.ofTable "t2" None s2)
 
     let bound =
         ok (Binder.qualify combined (Expr.Column { Qualifier = None; Name = "a" }))

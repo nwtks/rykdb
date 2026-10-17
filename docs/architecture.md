@@ -40,7 +40,7 @@ flowchart TB
     subgraph EX["実行"]
         EN["Engine.fs<br/>文の実行（Ddl / Engine）"]
         PL["Planner.fs<br/>束縛 → 論理代数 → Op"]
-        EXE["Executor.fs<br/>pull 演算子"]
+        OPS["Ops.fs / Schema.fs<br/>pull 演算子"]
     end
 
     subgraph ROW["行ストア"]
@@ -77,10 +77,11 @@ flowchart TB
     DB --> CAT
     DB --> MVCC
     EN --> PL
-    EN --> EXE
-    PL --> EXE
-    EXE --> RS
-    EXE --> MVCC
+    EN --> PL
+    EN --> OPS
+    PL --> OPS
+    OPS --> RS
+    OPS --> MVCC
     RS --> SE
     RS --> MVCC
     SE --> MEM
@@ -133,14 +134,14 @@ flowchart TB
 **上から下への一方向のみ**。
 下位モジュールは上位を知らない。
 
-| 層               | モジュール                               | 知っている層                         |
-| ---------------- | ---------------------------------------- | ------------------------------------ |
-| インターフェース | `Database.fs` `RykDb.Cli` `RykDb.Server` | 全部                                 |
-| 実行             | `Engine.fs` `Planner.fs` `Executor.fs`   | `RowStore` `Catalog` `Transactions`  |
-| 行ストア         | `RowStore.fs` `Catalog.fs`               | `StorageEngine` `Transactions`       |
-| MVCC             | `Transactions.fs`                        | `Memtable`(`Entry`) `Errors` `Types` |
-| ストレージ       | `StorageEngine.fs` とその下              | `Errors` `Types` `Serialization`     |
-| フロントエンド   | `Lexer` `Parser` `Ast`                   | `Types` `Errors`                     |
+| 層               | モジュール                                    | 知っている層                         |
+| ---------------- | --------------------------------------------- | ------------------------------------ |
+| インターフェース | `Database.fs` `RykDb.Cli` `RykDb.Server`      | 全部                                 |
+| 実行             | `Engine.fs` `Planner.fs` `Ops.fs` `Schema.fs` | `RowStore` `Catalog` `Transactions`  |
+| 行ストア         | `RowStore.fs` `Catalog.fs`                    | `StorageEngine` `Transactions`       |
+| MVCC             | `Transactions.fs`                             | `Memtable`(`Entry`) `Errors` `Types` |
+| ストレージ       | `StorageEngine.fs` とその下                   | `Errors` `Types` `Serialization`     |
+| フロントエンド   | `Lexer` `Parser` `Ast`                        | `Types` `Errors`                     |
 
 > **Transactions と RowStore の依存方向**: `Transactions.fs` は `RowStore` を参照しない。
 > 依存は **`RowStore` → `Transactions` → `Memtable`** の向きで、 `RowStore` の DML ヘルパ（`insert` / `updateByPrimaryKey` / `deleteByPrimaryKey`）が `Transaction` のバッファへ行・索引を積む。
@@ -158,7 +159,7 @@ flowchart TB
 3. **型のレベルで「更新を忘れる」ミスを防ぐ**。
    ハンドルは `Database` だけ。
 
-ただし `Executor` の集約処理・`Op.toArray` と `Database.fs` のクライアント層だけは `ResizeArray` / `Dictionary` を使う（[`coding-conventions.md`](coding-conventions.md) §2）。
+ただし `Ops` の集約処理・`Op.toArray` と `Database.fs` のクライアント層だけは `ResizeArray` / `Dictionary` を使う（[`coding-conventions.md`](coding-conventions.md) §2）。
 
 ---
 
@@ -168,30 +169,34 @@ flowchart TB
 
 ### モジュール一覧（`src/RykDb.Core/`）
 
-| ファイル           | 役割                                                                                       |
-| ------------------ | ------------------------------------------------------------------------------------------ |
-| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）          |
-| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3 値論理）/ `SqlLiteral` / `Bytes`（バイト列比較） |
-| `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`                  |
-| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                             |
-| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                     |
-| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                  |
-| `Sstable.fs`       | SSTable の構築・読み取り・k-way merge（ブロック / index / Bloom / Footer）                 |
-| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                  |
-| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                |
-| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                          |
-| `BlockCache.fs`    | `(fileNumber, blockId)` → ブロックの LRU キャッシュ                                        |
-| `StorageEngine.fs` | LSM ツリー 1 本の公開層（open / put / flush / scan / compact / close）                     |
-| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                 |
-| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                |
-| `Lexer.fs`         | 手書きトークナイザ（読み位置は値が持つ）                                                   |
-| `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                     |
-| `RowStore.fs`      | keyspace 束と DML ヘルパ（`Transaction` のバッファへ行・索引を積む）                       |
-| `Catalog.fs`       | テーブル・索引定義の永続化                                                                 |
-| `Executor.fs`      | pull 演算子 `Op` / `Ops` / `Scan`・式評価 `Eval`・DML `DmlOps`                             |
-| `Planner.fs`       | 名前束縛 → 論理代数 → `Op`                                                                 |
-| `Engine.fs`        | 文の実行（`Ddl` / `Engine.runStatement`）                                                  |
-| `Database.fs`      | 公開 API（不変ハンドル・transaction・`StatementResult`）                                   |
+| ファイル           | 役割                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------- |
+| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）                 |
+| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3 値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）        |
+| `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`                         |
+| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                                    |
+| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                            |
+| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                         |
+| `Sstable.fs`       | SSTable の構築・読み取り・k-way merge（ブロック / index / Bloom / Footer）                        |
+| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                         |
+| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                       |
+| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                                 |
+| `BlockCache.fs`    | `(fileNumber, blockId)` → ブロックの LRU キャッシュ                                               |
+| `StorageEngine.fs` | LSM ツリー 1 本の公開層（open / put / flush / scan / compact / close）                            |
+| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                        |
+| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                       |
+| `Lexer.fs`         | 手書きトークナイザ（読み位置は値が持つ）                                                          |
+| `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                            |
+| `RowStore.fs`      | keyspace 束と DML ヘルパ（`Transaction` のバッファへ行・索引を積む）                              |
+| `Catalog.fs`       | テーブル・索引定義の永続化                                                                        |
+| `Schema.fs`        | 出力列 `OutputColumn` と演算子の出力スキーマ `Schema`                                             |
+| `Eval.fs`          | スカラー関数 `Scalar` と式評価器 `Eval`                                                           |
+| `Ops.fs`           | pull 演算子 `Op` / `Row` と演算子の組み立て `Ops`（フィルタ・ソート・結合・集約・射影・DISTINCT） |
+| `ExecContext.fs`   | 実行時文脈 `ExecContext` とテーブル走査（`table` / `byPrimaryKey` / `byIndex`）                   |
+| `DmlOps.fs`        | DML `DmlOps`（INSERT / UPDATE / DELETE）                                                          |
+| `Planner.fs`       | 名前束縛 → 論理代数 → `Op`                                                                        |
+| `Engine.fs`        | 文の実行（`Ddl` / `Engine.runStatement`）                                                         |
+| `Database.fs`      | 公開 API（不変ハンドル・transaction・`StatementResult`）                                          |
 
 ### F# のコンパイル順
 
@@ -199,7 +204,8 @@ flowchart TB
 Errors → Types → Serialization → Memtable → Wal → BloomFilter
        → Sstable → VersionSet → Manifest → Compaction → BlockCache
        → StorageEngine → Transactions → Ast → Lexer → Parser
-       → RowStore → Catalog → Executor → Planner → Engine → Database
+       → RowStore → Catalog → Schema → Eval → Ops → ExecContext
+       → Planner → DmlOps → Engine → Database
 ```
 
 F# はファイルを**コンパイル順に評価する**ため、上から下へ一方向の依存になるよう `.fsproj` の `Compile` を手で並べる
@@ -215,7 +221,7 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 - `LexState` は `{ Index; Line; Column }` の不変レコード。
   **前進すると新しい値を返す**ので mutable なインデックスを持たない。
-- 予約語は `Lexer.keywords`、型名は `Lexer.typeNames` の 2 つの `Set` に分ける
+- 予約語は `Lexer` の private `keywords` Set、型名は `Parser.typeNames`（`Parser.typeTable` から導出）の Set に分ける
   （`INTEGER` などを予約語にすると列名に使えなくなるため）。
 - Blob リテラル `X'0A1B'` の判定は**識別子より前**に置く。
   順序を逆にすると `'ABCD'` が文字列になる。
@@ -233,7 +239,7 @@ CPS・継続の hoist・深さ制限の一般則は [`coding-conventions.md`](co
 判別可能共用体 `Expr` / `Statement`。
 式は**列参照の修飾子を保持したまま**持ち、束縛（`Binder.qualify`）の段階で解決する。
 
-`Expr.ColumnRefs` と `Expr.isAggregate` は**明示スタック**で走査する。
+`Expr.columnRefs` と `Expr.isAggregate` は**明示スタック**で走査する。
 `go a @ go b` とすると再帰呼び出しが末尾位置に来ないうえ O(n²) になる。
 `Expr.toDisplayString` も継続の連列表（`PrintStep`）で末尾再帰にしている。
 
@@ -386,7 +392,7 @@ hash join / index nested loop など**結合アルゴリズムの自動選択は
 
 #### 論理代数 → Op（`Optimizer.exec`）
 
-- `Scan` は `execScan` が `ScanMethod` に応じて `Scan.table` / `Scan.byPrimaryKey` / `Scan.byIndex` へ振り分ける。
+- `Scan` は `execScan` が `ScanMethod` に応じて `ExecContext.table` / `ExecContext.byPrimaryKey` / `ExecContext.byIndex` へ振り分ける。
 - `Join` は左を「現在のスキーマから右テーブルを除いたもの」、右を「右テーブル 1つだけのスキーマ」で実行し、`Ops.innerJoin` / `Ops.leftJoin` に渡す（ON は左行 + 右行で評価）。
 - `Filter` / `Sort` / `Project` は子の**出力スキーマ**（`outputOf`）を求めてから掛ける。
   集約の後は行の並びが「groupBy の値 + 各集約の結果」に変わるため、「入力スキーマ（テーブル定義）」と取り違えると `SELECT SUM(age)` が引数を評価できず `NULL` になる。
@@ -396,7 +402,7 @@ hash join / index nested loop など**結合アルゴリズムの自動選択は
   `*` / `t.*` の列展開は `Schema.expandStar` に一本化している（ヘッダと射影の式が同じ列を共有するため）。
   `*` は修飾なしの列名、`t.*` は修飾つきの表示名で出す。
 
-### 5.2 Executor — pull 演算子
+### 5.2 Ops — pull 演算子
 
 #### なぜ pull 方式か
 
@@ -413,48 +419,48 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 
 `Ops` モジュールの演算子は以下のとおり。
 
-| 演算子                                    | 役割                                         |
-| ----------------------------------------- | -------------------------------------------- |
-| `Op.ofArray` / `ofList` / `ofRow`         | 材料化済みの行を流す                         |
-| `Op.map` / `filter`                       | 1 対 1 / 1 対 0 の変換                       |
-| `Ops.project`                             | 射影（`*` / `t.*` の展開を含む）             |
-| `Ops.sortBy`                              | ソート（メモリ上に実体化）                   |
-| `Op.take` / `Op.skip`                     | LIMIT / OFFSET                               |
-| `Ops.innerJoin` / `leftJoin`              | 入れ子ループ結合                             |
-| `Ops.aggregate`                           | 集約（`groupBy` 値 + 各集約結果 の行を生成） |
-| `Ops.distinct`                            | 重複除去                                     |
-| `Scan.table` / `byPrimaryKey` / `byIndex` | 走査                                         |
+| 演算子                                           | 役割                                         |
+| ------------------------------------------------ | -------------------------------------------- |
+| `Op.ofArray` / `ofRow`                           | 材料化済みの行を流す                         |
+| `Op.map` / `filter`                              | 1 対 1 / 1 対 0 の変換                       |
+| `Ops.project`                                    | 射影（`*` / `t.*` の展開を含む）             |
+| `Ops.sortBy`                                     | ソート（メモリ上に実体化）                   |
+| `Op.take` / `Op.skip`                            | LIMIT / OFFSET                               |
+| `Ops.innerJoin` / `leftJoin`                     | 入れ子ループ結合                             |
+| `Ops.aggregate`                                  | 集約（`groupBy` 値 + 各集約結果 の行を生成） |
+| `Ops.distinct`                                   | 重複除去                                     |
+| `ExecContext.table` / `byPrimaryKey` / `byIndex` | 走査                                         |
 
 遅延の持ち方が演算子ごとに違う。
 
 | 演算子                                         | 遅延                                                                        |
 | ---------------------------------------------- | --------------------------------------------------------------------------- |
-| `Op.ofArray` / `ofList` / `ofRow`              | `ofArray` は `Compute` で 1行ずつ（組み立て時に全行分のスタックを積まない） |
+| `Op.ofArray` / `ofRow`                         | `ofArray` は `Compute` で 1行ずつ（組み立て時に全行分のスタックを積まない） |
 | `Op.map` / `Op.filter` / `Op.take` / `Op.skip` | `Compute`。LIMIT / WHERE の早期打ち切りが効く                               |
 | `Ops.project`                                  | `Compute`（1行ずつ）                                                        |
 | `Ops.sortBy` / `Ops.aggregate`                 | **Op 構築時**に全件をメモリに読む（実体化）                                 |
 | `Ops.distinct`                                 | 既出キーの `Set` を持ち回る（出現順を保持）                                 |
 | `Ops.innerJoin` / `leftJoin`                   | 右を materialize し、左を 1行ずつ流す入れ子ループ                           |
-| `Scan.*`                                       | スキャン結果を配列で受け `Op.ofArray` で流す（snapshot は生成時に固定）     |
+| `ExecContext.*`                                | スキャン結果を配列で受け `Op.ofArray` で流す（snapshot は生成時に固定）     |
 
 `DISTINCT` と集約のグループ化は同じキー（`Row.keyOf` = 値の SQL リテラル表記を `U+0001` で連結。
 NULL 同士は等しい扱い）で行う。
 
 #### 演算子の共通規約
 
-- `Op.map` / `filter` / `take` / `skip` / `append` は「次を要求されたときだけ 1段進む」形で、残りの継続も自分自身へ繋ぎ直す
+- `Op.map` / `filter` / `take` / `skip` は「次を要求されたときだけ 1段進む」形で、残りの継続も自分自身へ繋ぎ直す
   （継続をそのまま渡すと変換が 1行だけに効くバグになる）。
 - エラーは `Error` をそのまま返して列挙を打ち切る（例外は使わない）。
-- `Op.toArray` / `Op.count` は `ResizeArray` + `match` 直下の再帰で回す
+- `Op.toArray` は `ResizeArray` + `match` 直下の再帰で回す
   （`>>=` を重ねると末尾呼び出しが効かず 10万行でスタックオーバーフロー。[`coding-conventions.md`](coding-conventions.md) §3）。
 
-#### 走査（`Scan` / `ExecContext`）
+#### 走査（`ExecContext`）
 
 - `ExecContext` は `{ Store; Visible; Schemas; Catalog }`。
   `Visible`（snapshot の SeqNo）は Op を作るときに 1回だけ決まる。
-- `Scan.table` = `Dml.scanByPrimaryKey`（`RowStore.fs` の Dml ヘルパ。主キー順の全走査）。
-  `Scan.byPrimaryKey` = `Dml.getByPrimaryKey`（ポイント検索、無ければ空 Op）。
-  `Scan.byIndex` = `Dml.scanByIndexPrefix`（索引の prefix 走査。非一意索引でも全行を返す）。
+- `ExecContext.table` = `Dml.scanByPrimaryKey`（`RowStore.fs` の Dml ヘルパ。主キー順の全走査）。
+  `ExecContext.byPrimaryKey` = `Dml.getByPrimaryKey`（ポイント検索、無ければ空 Op）。
+  `ExecContext.byIndex` = `Dml.scanByIndexPrefix`（索引の prefix 走査。非一意索引でも全行を返す）。
 - **スキャンは結果を配列で受け取る**（遅延イテレータではない）。
   Op としては 1行ずつ流れるので `LIMIT` は後段を早期に打ち切れるが、ストレージの読み出しはスキャン生成時に終わっている（§12.2）。
 
@@ -555,7 +561,7 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 
 ### 6.2 行の削除
 
-削除は**主キー + 全索引に墓碑（tombstone）**を書く
+削除は **主キー + 全索引に墓碑（tombstone）** を書く
 （keyspace を分けた代償として必要な処理。書き忘れると何が起きるかは [`gotchas.md`](gotchas.md) §11.3）。
 
 ### 6.3 Catalog
@@ -696,7 +702,7 @@ memtable は追記のみなので、レベルごとの insertion buffer とし�
 永続スキップリストも書けるが、パスコピー（探索パスだけを複製する方式）では次の問題がある。
 
 1. 挿入点の「前」ノードが探索パス上に無く、level 0 の鎖が壊れる。
-2. head は全レベルに現れるので、レベルごとに別々にコピーすると `Memtable.Head` として採用する側だけが未更新になる。
+2. head は全レベルに現れるので、レベルごとに別々にコピーすると採用する側だけが未更新になる。
 3. 前ノードも複製すれば O(n) になり、スキップリストの意味を失う。
 
 Treap は根から再構築するのでこの問題は構造的に発生しない。
@@ -783,7 +789,7 @@ SSTable はブロック圧縮しない（設計方針）ので、読んだブロ
 
 `Version` は「レベルごとのファイル集合の**不変スナップショット**」。
 
-- `MightContain key` は Bloom より粗い判定（`Smallest ≤ key ≤ Largest`）。
+- `FileMetaData.mightContain key` は Bloom より粗い判定（`Smallest ≤ key ≤ Largest`）。
 - `filesForPointLookup` はポイントルックアップ用のファイル順（新しい順）を返す。
 - **ファイル追加・削除は新しい `Version` を返す**ので、読み取り中に状態が書き換わらない。
 
@@ -860,7 +866,7 @@ L1〜 … 1ファイル = 1キー域で互いに重ならない（RocksDB/LevelD
 
 1回の compaction:
 
-1. 過剰レベル `L` を選ぶ（`Version.pickCompaction`）
+1. 過剰レベル `L` を選ぶ（`Compaction.pickCompaction`）
 2. `L` の全ファイル + `L+1` でキー域が重なるファイルを**入力**にする
 3. 入力をメモリで読み、k-way merge（各ファイルは既にソート済みなので O(N log k)）
 4. **同一キーの版を SeqNo が新しい 1件に畳む** → ここに墓碑も落ちる
@@ -899,12 +905,12 @@ SQL 文字列
   → Analyzer.bindTable      名前束縛（修飾子を解決）
   → Planner.buildLogical    論理代数
   → 物理化                 走査方法・結合アルゴリズムを決定
-  → Executor.execute        Op の木
+  → Ops / Planner          Op の木
   → Op.toArray              結果行
 ```
 
 走査の探索順は **memtable → L0（新しい順）→ 各レベル（新しい順）**。
-各ステップで Bloom filter と `FileMetaData.MightContain` で枝刈りする。
+各ステップで Bloom filter と `FileMetaData.mightContain` で枝刈りする。
 
 ### 9.2 書き込み（`INSERT` / `UPDATE` / `DELETE`）
 
@@ -918,7 +924,7 @@ SQL 文字列
                                     ├─ Wal.append (Begin/Batch/Commit)
                                     └─ Memtable.apply
 4. memtable が MemLimitBytes に達したら flush → L0 の SSTable
-5. レベルが閾値を超えたら compactOnce
+5. レベルが閾値を超えたら compact（`maybeCompact`）
 ```
 
 ### 9.3 DB を開くとき

@@ -72,8 +72,6 @@ module internal Binder =
     /// 曖昧なら付けない（実行時の Schema.resolve がエラーにする）。
     /// </remarks>
     let qualify (schema: Schema) (e: Expr) =
-        let retE (v: Expr) = ret v
-
         let uniqueQualifier (name: string) =
             let lower = name.ToLowerInvariant()
 
@@ -89,38 +87,37 @@ module internal Binder =
 
         let rec qualifyExpr (x: Expr) =
             match x with
-            | Expr.Literal l -> retE (Expr.Literal l)
+            | Expr.Literal l -> ret (Expr.Literal l)
             | Expr.Column c ->
                 match c.Qualifier with
-                | Some _ -> retE x
+                | Some _ -> ret x
                 | None ->
                     match uniqueQualifier c.Name with
-                    | Some q -> retE (Expr.Column { Qualifier = Some q; Name = c.Name })
-                    | None -> retE x
+                    | Some q -> ret (Expr.Column { Qualifier = Some q; Name = c.Name })
+                    | None -> ret x
             | Expr.Name name ->
                 match uniqueQualifier name with
-                | Some q -> retE (Expr.Column { Qualifier = Some q; Name = name })
-                | None -> retE x
-            | Expr.Star -> retE x
-            | Expr.QualifiedStar _ -> retE x
+                | Some q -> ret (Expr.Column { Qualifier = Some q; Name = name })
+                | None -> ret x
+            | Expr.Star -> ret x
+            | Expr.QualifiedStar _ -> ret x
             | _ -> Expr.mapChildrenM qualifyExpr x
 
         qualifyExpr e
 
-    /// 式が参照している列の修飾名（すべて小文字）。
-    let private columnsOf (e: Expr) =
-        Expr.columnRefs e
-        |> List.map (fun c ->
-            match c.Qualifier with
-            | Some q -> (q + "." + c.Name).ToLowerInvariant()
-            | None -> c.Name.ToLowerInvariant())
-
     /// 複数の式をまとめて修飾名へ。
     let qualifyMany (schema: Schema) (exprs: Expr list) =
-        all (exprs |> List.map (fun e -> qualify schema e))
+        exprs |> List.map (fun e -> qualify schema e) |> all
 
     /// 式が指定したテーブルの列だけを参照しているか。
     let referencesOnly (e: Expr) (table: string) =
+        let columnsOf (e: Expr) =
+            Expr.columnRefs e
+            |> List.map (fun c ->
+                match c.Qualifier with
+                | Some q -> (q + "." + c.Name).ToLowerInvariant()
+                | None -> c.Name.ToLowerInvariant())
+
         let lower = table.ToLowerInvariant()
 
         columnsOf e
@@ -149,10 +146,6 @@ module internal Predicate =
     /// この conjunct は指定テーブルの列だけを参照しているか。
     let isLocalTo (table: string) (e: Expr) = Binder.referencesOnly e table
 
-// ---------------------------------------------------------------------------
-// 3. AST -> 論理代数
-// ---------------------------------------------------------------------------
-
 /// 1 つのテーブルが持つスキーマと、その識別名。
 type internal TableBinding =
     {
@@ -168,7 +161,7 @@ module internal Analyzer =
     let bindTable (ctx: ExecContext) (r: TableRef) =
         let realName = r.Name
 
-        ctx.SchemaOf realName
+        ExecContext.schemaOf ctx realName
         |> Result.map (fun schema ->
             {
                 Ref = r
@@ -183,44 +176,62 @@ module internal Analyzer =
     let schemaOf (b: TableBinding) =
         Schema.ofTable b.RealName b.Ref.Alias b.Schema
 
-    /// `col = 定数` を探す（走査方法を決めるのに使う）。
-    let private tryColumnEqualConstant (table: string) (e: Expr) =
-        let tn = table.ToLowerInvariant()
-
-        let colOf (v: Expr) =
+    /// WHERE から等価条件を探して走査方法を決める。
+    let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
+        let colOf (tn: string) (v: Expr) =
             match v with
             | Expr.Column { Qualifier = Some q; Name = n } when q.ToLowerInvariant() = tn -> Some n
             | _ -> None
 
         let litOf (v: Expr) =
             match v with
-            | Expr.Literal l -> Some(Scalar.ofLiteral l)
+            | Expr.Literal l -> Some l.ToSqlValue
             | Expr.Unary(UnaryOp.Neg, Expr.Literal l) ->
-                match Scalar.ofLiteral l with
+                match l.ToSqlValue with
                 | SqlValue.Int i -> Some(SqlValue.Int -i)
                 | SqlValue.Real f -> Some(SqlValue.Real -f)
                 | _ -> None
             | _ -> None
 
-        let rec search (x: Expr) =
+        let rec search (tn: string) (x: Expr) =
             match x with
             | Expr.Binary(BinaryOp.And, a, b) ->
-                match search a with
+                match search tn a with
                 | Some r -> Some r
-                | None -> search b
+                | None -> search tn b
             | Expr.Binary(BinaryOp.Eq, a, b) ->
-                match colOf a, litOf b with
+                match colOf tn a, litOf b with
                 | Some n, Some v -> Some(n, v)
                 | _ ->
-                    match colOf b, litOf a with
+                    match colOf tn b, litOf a with
                     | Some n, Some v -> Some(n, v)
                     | _ -> None
             | _ -> None
 
-        search e
+        let tryColumnEqualConstant (table: string) (e: Expr) =
+            let tn = table.ToLowerInvariant()
+            search tn e
 
-    /// WHERE から等価条件を探して走査方法を決める。
-    let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
+        let resolveScanMethod (colName: string) (value: SqlValue) =
+            let isPk =
+                b.Schema.PrimaryKey
+                |> List.map (fun i -> b.Schema.Columns.[i].Name)
+                |> List.exists (fun n -> Catalog.eqName n colName)
+
+            if isPk then
+                ScanMethod.PkLookup [| value |]
+            else
+                let found =
+                    Catalog.indexesOf catalog b.RealName
+                    |> List.tryFind (fun i ->
+                        match i.Columns with
+                        | [ c ] -> Catalog.eqName c colName
+                        | _ -> false)
+
+                match found with
+                | Some i -> ScanMethod.IndexLookup(i.IndexName, [| value |])
+                | None -> ScanMethod.SeqScan
+
         let name = refName b
         let all = Predicate.joinConjuncts predicates
 
@@ -228,306 +239,203 @@ module internal Analyzer =
         | Some p ->
             match tryColumnEqualConstant name p with
             | None -> ret ScanMethod.SeqScan
-            | Some(colName, value) ->
-                let isPk =
-                    b.Schema.PrimaryKey
-                    |> List.map (fun i -> b.Schema.Columns.[i].Name)
-                    |> List.exists (fun n -> Catalog.eqName n colName)
-
-                if isPk then
-                    ret (ScanMethod.PkLookup [| value |])
-                else
-                    let found =
-                        Catalog.indexesOf catalog b.RealName
-                        |> List.tryFind (fun i ->
-                            match i.Columns with
-                            | [ c ] -> Catalog.eqName c colName
-                            | _ -> false)
-
-                    match found with
-                    | Some i -> ret (ScanMethod.IndexLookup(i.IndexName, [| value |]))
-                    | None -> ret ScanMethod.SeqScan
+            | Some(colName, value) -> ret (resolveScanMethod colName value)
         | None -> ret ScanMethod.SeqScan
 
-// ---------------------------------------------------------------------------
-// 4. 論理代数 -> 物理 Plan
-// ---------------------------------------------------------------------------
 module internal Optimizer =
-    /// テーブルの出力スキーマを全部連結する。
-    let private concatSchemas (bindings: TableBinding list) =
-        bindings |> List.map Analyzer.schemaOf |> Schema.concatAll
-
-    /// 走査 1つ（+ その直下に落ちた filter）。
-    let private buildScan (catalog: Catalog) (b: TableBinding) (predicates: Expr list) =
-        let name = Analyzer.refName b
-        let local = predicates |> List.filter (Predicate.isLocalTo name)
-
-        Analyzer.chooseScanMethod b catalog predicates
-        >>= fun method ->
-            let scan = Logical.Scan(name, method)
-
-            match Predicate.joinConjuncts local with
-            | None -> ret scan
-            | Some p -> ret (Logical.Filter(p, scan))
-
-    /// 集約・HAVING を掛ける。
-    /// <remarks>
-    /// GROUP BY / HAVING / 集約の引数 / ORDER BY をすべて修飾名へ直す。
-    /// パーサは裸の名前（`age`）を Name として作るので、ここを通さないと実行時に列を解決できずエラーになる。
-    /// </remarks>
-    let private applyAggregate (schema: Schema) (tree: Logical) (stmt: SelectStatement) =
-        let selectExprs =
-            stmt.Items
-            |> List.map (fun item -> item.Expression)
-            |> List.filter (fun e ->
-                match e with
-                | Expr.Star -> false
-                | Expr.QualifiedStar _ -> false
-                | _ -> true)
-
-        let orderExprs = stmt.OrderBy |> List.map (fun k -> k.Expression)
-
-        // 修飾化してから集約呼び出しを集める。
-        let aggStage =
-            Binder.qualifyMany schema (selectExprs @ orderExprs)
-            |> Result.map (fun qs ->
-                let selectAggs = Ops.aggCalls (qs |> List.take (List.length selectExprs))
-                let orderAggs = orderExprs |> List.map (fun e -> Ops.aggCalls [ e ]) |> List.concat
-                selectAggs, orderAggs)
-
-        // HAVING も修飾化する。
-        let havingStage =
-            match stmt.Having with
-            | None -> ret None
-            | Some h ->
-                Binder.qualifyMany schema [ h ]
-                >>= fun hs ->
-                    match hs with
-                    | [ hv ] -> ret (Some hv)
-                    | _ -> err (DbError.internalError "HAVING の修飾に失敗")
-
-        let groupStage = Binder.qualifyMany schema stmt.GroupBy
-
-        aggStage
-        >>= fun (selectAggs, orderAggs) ->
-            havingStage
-            >>= fun having ->
-                groupStage
-                >>= fun groupBy ->
-                    let allAggs = selectAggs @ orderAggs
-                    let hasAgg = not (List.isEmpty allAggs)
-                    let hasGroupBy = not (List.isEmpty groupBy)
-
-                    if not (hasAgg || hasGroupBy) then
-                        ret tree
-                    else
-                        let aggNode = Logical.Aggregate(groupBy, allAggs, tree)
-
-                        match having with
-                        | None -> ret aggNode
-                        | Some hv -> ret (Logical.Having(hv, allAggs, groupBy, aggNode))
-
-    /// ORDER BY を掛ける。
-    let private applySort (schema: Schema) (tree: Logical) (stmt: SelectStatement) =
-        if List.isEmpty stmt.OrderBy then
-            ret tree
-        else
-            // ORDER BY の式も修飾化する（裸の名前 `age` のままだと実行時にエラー）。
-            let qualified =
-                Binder.qualifyMany schema (stmt.OrderBy |> List.map (fun k -> k.Expression))
-
-            qualified
-            |> Result.map (fun qs ->
-                let keys =
-                    List.map2 (fun e (k: RykDb.Core.SortKey) -> { k with Expression = e }) qs stmt.OrderBy
-
-                Logical.Sort(keys, tree))
-
-    /// LIMIT / OFFSET を掛ける。
-    let private applyLimit (tree: Logical) (stmt: SelectStatement) =
-        match stmt.Limit, stmt.Offset with
-        | None, None -> ret tree
-        | _ ->
-            let evalConst (e: Expr) =
-                match e with
-                | Expr.Literal(Literal.Int i) -> int i
-                | _ -> 0
-
-            let limit =
-                match stmt.Limit with
-                | None -> 0
-                | Some e -> max 0 (evalConst e)
-
-            let offset =
-                match stmt.Offset with
-                | None -> 0
-                | Some e -> max 0 (evalConst e)
-
-            ret (Logical.Limit(offset, limit, tree))
-
     /// SELECT 文を論理代数に変換する。
     let buildLogical (ctx: ExecContext) (stmt: SelectStatement) =
-        match stmt.From with
-        | None -> ret []
-        | Some r -> Analyzer.bindTable ctx r |> Result.map (fun b -> [ b ])
-        >>= fun base0 ->
-            stmt.Joins
-            |> List.fold
-                (fun acc j ->
-                    acc
-                    >>= fun bs -> Analyzer.bindTable ctx j.Table |> Result.map (fun b -> bs @ [ b ]))
-                (ret base0)
-            >>= fun bindings ->
-                if List.isEmpty bindings then
-                    ret (Logical.Values [||])
-                else
-                    let allSchema = concatSchemas bindings
+        let bindTables (ctx: ExecContext) (stmt: SelectStatement) =
+            result {
+                let! baseBindings =
+                    match stmt.From with
+                    | None -> ret []
+                    | Some r -> Analyzer.bindTable ctx r |> Result.map (fun b -> [ b ])
 
+                let! bindings =
+                    stmt.Joins
+                    |> List.fold
+                        (fun acc j ->
+                            result {
+                                let! bs = acc
+                                let! b = Analyzer.bindTable ctx j.Table
+                                return bs @ [ b ]
+                            })
+                        (ret baseBindings)
+
+                return bindings
+            }
+
+        let concatSchemas (bindings: TableBinding list) =
+            bindings |> List.map Analyzer.schemaOf |> Schema.concatAll
+
+        let buildScan (catalog: Catalog) (b: TableBinding) (predicates: Expr list) =
+            let name = Analyzer.refName b
+            let local = predicates |> List.filter (Predicate.isLocalTo name)
+
+            result {
+                let! method = Analyzer.chooseScanMethod b catalog predicates
+                let scan = Logical.Scan(name, method)
+
+                match Predicate.joinConjuncts local with
+                | None -> return scan
+                | Some p -> return Logical.Filter(p, scan)
+            }
+
+        let joinStep (bindings: TableBinding list) (predicates: Expr list) accState (i, j) =
+            result {
+                let! acc, topPreds = accState
+                let idx = i + 1
+                let right = bindings.[idx]
+                let leftSchema = bindings |> List.take idx |> concatSchemas
+                let onSchema = Schema.concat leftSchema (Analyzer.schemaOf right)
+                let! on = Binder.qualify onSchema j.On
+                let rightName = Analyzer.refName right
+                let rightPreds = predicates |> List.filter (Predicate.isLocalTo rightName)
+
+                match j.Kind with
+                | JoinKind.Inner ->
+                    let! rightScan = buildScan ctx.Catalog right rightPreds
+                    return Logical.Join(j.Kind, rightName, on, acc, rightScan), topPreds
+                | JoinKind.Left ->
+                    let! rightScan = buildScan ctx.Catalog right []
+                    return Logical.Join(j.Kind, rightName, on, acc, rightScan), topPreds @ rightPreds
+            }
+
+        let applyAggregate (schema: Schema) (tree: Logical) (stmt: SelectStatement) =
+            let selectExprs =
+                stmt.Items
+                |> List.map (fun item -> item.Expression)
+                |> List.filter (fun e ->
+                    match e with
+                    | Expr.Star -> false
+                    | Expr.QualifiedStar _ -> false
+                    | _ -> true)
+
+            let orderExprs = stmt.OrderBy |> List.map (fun k -> k.Expression)
+
+            let aggStage =
+                Binder.qualifyMany schema (selectExprs @ orderExprs)
+                |> Result.map (fun qs ->
+                    let selectAggs = Ops.aggCalls (qs |> List.take (List.length selectExprs))
+                    let orderAggs = orderExprs |> List.map (fun e -> Ops.aggCalls [ e ]) |> List.concat
+                    selectAggs, orderAggs)
+
+            let havingStage =
+                match stmt.Having with
+                | None -> ret None
+                | Some h ->
+                    Binder.qualifyMany schema [ h ]
+                    >>= fun hs ->
+                        match hs with
+                        | [ hv ] -> ret (Some hv)
+                        | _ -> err (DbError.internalError "HAVING の修飾に失敗")
+
+            let groupStage = Binder.qualifyMany schema stmt.GroupBy
+
+            result {
+                let! selectAggs, orderAggs = aggStage
+                let! having = havingStage
+                let! groupBy = groupStage
+                let allAggs = selectAggs @ orderAggs
+                let hasAgg = not (List.isEmpty allAggs)
+                let hasGroupBy = not (List.isEmpty groupBy)
+
+                if not (hasAgg || hasGroupBy) then
+                    return tree
+                else
+                    let aggNode = Logical.Aggregate(groupBy, allAggs, tree)
+
+                    match having with
+                    | None -> return aggNode
+                    | Some hv -> return Logical.Having(hv, allAggs, groupBy, aggNode)
+            }
+
+        let applySort (schema: Schema) (tree: Logical) (stmt: SelectStatement) =
+            if List.isEmpty stmt.OrderBy then
+                ret tree
+            else
+                let qualified =
+                    Binder.qualifyMany schema (stmt.OrderBy |> List.map (fun k -> k.Expression))
+
+                qualified
+                |> Result.map (fun qs ->
+                    let keys =
+                        List.map2 (fun e (k: SortKey) -> { k with Expression = e }) qs stmt.OrderBy
+
+                    Logical.Sort(keys, tree))
+
+        let qualifyItems (schema: Schema) (items: SelectItem list) =
+            items
+            |> List.map (fun item ->
+                Binder.qualify schema item.Expression
+                |> Result.map (fun e -> { item with Expression = e }))
+            |> all
+
+        let applyLimit (tree: Logical) (stmt: SelectStatement) =
+            match stmt.Limit, stmt.Offset with
+            | None, None -> ret tree
+            | _ ->
+                let evalConst (e: Expr) =
+                    match e with
+                    | Expr.Literal(Literal.Int i) -> int i
+                    | _ -> 0
+
+                let limit =
+                    match stmt.Limit with
+                    | None -> 0
+                    | Some e -> max 0 (evalConst e)
+
+                let offset =
+                    match stmt.Offset with
+                    | None -> 0
+                    | Some e -> max 0 (evalConst e)
+
+                ret (Logical.Limit(offset, limit, tree))
+
+        let localToAny (bindings: TableBinding list) (p: Expr) =
+            bindings |> List.exists (fun b -> Predicate.isLocalTo (Analyzer.refName b) p)
+
+        result {
+            let! bindings = bindTables ctx stmt
+
+            if List.isEmpty bindings then
+                return Logical.Values [||]
+            else
+                let allSchema = concatSchemas bindings
+
+                let! predicates =
                     match stmt.Where with
                     | None -> ret []
                     | Some w -> Binder.qualify allSchema w |> Result.map Predicate.splitConjuncts
-                    >>= fun predicates ->
-                        let head = List.head bindings
 
-                        buildScan ctx.Catalog head predicates
-                        >>= fun firstTree ->
-                            let initial = ret (firstTree, [])
+                let head = List.head bindings
+                let! firstTree = buildScan ctx.Catalog head predicates
+                let initial = ret (firstTree, [])
 
-                            List.fold
-                                (fun accState (i, j) ->
-                                    accState
-                                    >>= fun (acc2, topPreds) ->
-                                        let idx = i + 1
-                                        let right = bindings.[idx]
-                                        let leftSchema = bindings |> List.take idx |> concatSchemas
-                                        let onSchema = leftSchema.Concat(Analyzer.schemaOf right)
+                let! joined, topPreds =
+                    List.fold (joinStep bindings predicates) initial (List.indexed stmt.Joins)
 
-                                        Binder.qualify onSchema j.On
-                                        >>= fun on ->
-                                            let rightName = Analyzer.refName right
-                                            let rightPreds = predicates |> List.filter (Predicate.isLocalTo rightName)
+                let cross = predicates |> List.filter (fun p -> not (localToAny bindings p))
 
-                                            match j.Kind with
-                                            | JoinKind.Inner ->
-                                                buildScan ctx.Catalog right rightPreds
-                                                |> Result.map (fun rightScan ->
-                                                    Logical.Join(j.Kind, rightName, on, acc2, rightScan), topPreds)
-                                            | JoinKind.Left ->
-                                                buildScan ctx.Catalog right []
-                                                |> Result.map (fun rightScan ->
-                                                    Logical.Join(j.Kind, rightName, on, acc2, rightScan),
-                                                    topPreds @ rightPreds))
-                                initial
-                                (List.indexed stmt.Joins)
-                            >>= fun (joined, topPreds) ->
-                                let localToAny (p: Expr) =
-                                    bindings |> List.exists (fun b -> Predicate.isLocalTo (Analyzer.refName b) p)
+                let filtered =
+                    match Predicate.joinConjuncts (topPreds @ cross) with
+                    | None -> joined
+                    | Some p -> Logical.Filter(p, joined)
 
-                                let cross = predicates |> List.filter (fun p -> not (localToAny p))
+                let! withAgg = applyAggregate allSchema filtered stmt
+                let! withSorted = applySort allSchema withAgg stmt
+                let! items = qualifyItems allSchema stmt.Items
+                let projected = Logical.Project(items, withSorted)
 
-                                match Predicate.joinConjuncts (topPreds @ cross) with
-                                | None -> joined
-                                | Some p -> Logical.Filter(p, joined)
-                                |> ret
-                                >>= fun t -> applyAggregate allSchema t stmt
-                                >>= fun withAgg ->
-                                    applySort allSchema withAgg stmt
-                                    >>= fun withSorted ->
-                                        stmt.Items
-                                        |> List.map (fun item ->
-                                            Binder.qualify allSchema item.Expression
-                                            |> Result.map (fun e -> { item with Expression = e }))
-                                        |> all
-                                        >>= fun items ->
-                                            let projected = Logical.Project(items, withSorted)
+                let deduped =
+                    if stmt.Distinct then
+                        Logical.Distinct projected
+                    else
+                        projected
 
-                                            let deduped =
-                                                if stmt.Distinct then
-                                                    Logical.Distinct projected
-                                                else
-                                                    projected
-
-                                            applyLimit deduped stmt
-
-    /// 走査を実行する。
-    let private execScan (ctx: ExecContext) (name: string) (method: ScanMethod) =
-        match method with
-        | ScanMethod.SeqScan -> Scan.table ctx name
-        | ScanMethod.PkLookup values -> Scan.byPrimaryKey ctx name values
-        | ScanMethod.IndexLookup(indexName, values) -> Scan.byIndex ctx name indexName values
-        | ScanMethod.RangeScan(_, _, _) -> Scan.table ctx name
-
-    /// 結合を実行する。
-    let private execJoin (kind: JoinKind) (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
-        match kind with
-        | JoinKind.Inner -> Ops.innerJoin leftSchema left rightSchema right on
-        | JoinKind.Left -> Ops.leftJoin leftSchema left rightSchema right on
-
-    /// 包み（Sort / Limit / Distinct / Having / Filter / Project）を全部剥がして、
-    /// その先のノード（集約・スキャンなど）を返す。
-    /// 「行の並びや絞り込みだけ」のノードは出力スキーマも GROUP BY 式も変えない
-    /// ので、outputOf / groupByOf はここで同じ見方を共有する。
-    [<TailCall>]
-    let rec private stripWrappers (tree: Logical) =
-        match tree with
-        | Logical.Sort(_, child) -> stripWrappers child
-        | Logical.Limit(_, _, child) -> stripWrappers child
-        | Logical.Distinct child -> stripWrappers child
-        | Logical.Having(_, _, _, child) -> stripWrappers child
-        | Logical.Filter(_, child) -> stripWrappers child
-        | Logical.Project(_, child) -> stripWrappers child
-        | other -> other
-
-    /// 論理代数ノードの「出力スキーマ」を求める。
-    /// <remarks>
-    /// 集約の後の行は「groupBy の値 ++ 各集約の結果」なので、
-    /// 入力スキーマ（テーブル定義）をそのまま流すと列を解決できずに落ちる。
-    /// </remarks>
-    let private outputOf (tree: Logical) (inSchema: Schema) =
-        match stripWrappers tree with
-        | Logical.Aggregate(groupBy, aggs, _) ->
-            let gv =
-                groupBy
-                |> List.map (fun e ->
-                    {
-                        Name = Expr.toDisplayString e
-                        Qualifier = None
-                        DataType = None
-                    })
-
-            let av =
-                aggs
-                |> List.map (fun (f, star, arg) ->
-                    let suffix = if star then "*" else Expr.toDisplayString arg
-
-                    {
-                        Name = sprintf "%s(%s)" f.Name suffix
-                        Qualifier = None
-                        DataType = None
-                    })
-
-            { Schema.empty with
-                Columns = Array.append (List.toArray gv) (List.toArray av)
-            }
-        | _ -> inSchema
-
-    /// 木の途中にある `LAggregate` の GROUP BY 式を掘り出す。
-    /// 見つからなければ空リスト（＝集約なし）。
-    let private groupByOf (tree: Logical) =
-        match stripWrappers tree with
-        | Logical.Aggregate(groupBy, _, _) -> groupBy
-        | _ -> []
-
-    let private defaultSchema (ctx: ExecContext) (name: string) =
-        match ctx.SchemaOf name with
-        | Ok s -> s
-        | Error _ ->
-            {
-                Name = name
-                Columns = []
-                PrimaryKey = []
-                Indexes = []
-            }
+                return! applyLimit deduped stmt
+        }
 
     /// Join を積む側（左スパインを降りる）と回す側（引き返して結合する）の
     /// 1 段分。右部分木の Op はここで作らず、引き返してから評価する
@@ -554,10 +462,17 @@ module internal Optimizer =
     /// childSchema は「そのノードが結果を読む側」だけが使う。
     /// </remarks>
     let rec exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
-        // Join の木は buildLogical の fold で必ず左深い。
-        // 「左を評価 → 右を評価 → 結合」を exec l >>= fun lOp -> exec r >>= … と書くと
-        // JOIN の数だけフレームが積もって StackOverflow するので、
-        // 積む側（descend）と回す側（unwind）に分ける。
+        let defaultSchema (ctx: ExecContext) (name: string) =
+            match ExecContext.schemaOf ctx name with
+            | Ok s -> s
+            | Error _ ->
+                {
+                    Name = name
+                    Columns = []
+                    PrimaryKey = []
+                    Indexes = []
+                }
+
         let rec descend (stack: JoinFrame list) (left: Schema) (node: Logical) =
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
@@ -586,6 +501,11 @@ module internal Optimizer =
                 descend (frame :: stack) leftSchema lTree
             | other -> exec ctx other left |> Result.map (fun op -> op, stack)
 
+        let execJoin (kind: JoinKind) (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
+            match kind with
+            | JoinKind.Inner -> Ops.innerJoin leftSchema left rightSchema right on
+            | JoinKind.Left -> Ops.leftJoin leftSchema left rightSchema right on
+
         let rec unwind (stack: JoinFrame list) (op: Op) =
             match stack with
             | [] -> ret op
@@ -596,6 +516,56 @@ module internal Optimizer =
                     match execJoin frame.Kind frame.LeftSchema op frame.RightSchema rOp frame.On with
                     | Error e -> Error e
                     | Ok joined -> unwind rest joined
+
+        let execScan (ctx: ExecContext) (name: string) (method: ScanMethod) =
+            match method with
+            | ScanMethod.SeqScan -> ExecContext.table ctx name
+            | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
+            | ScanMethod.IndexLookup(indexName, values) -> ExecContext.byIndex ctx name indexName values
+            | ScanMethod.RangeScan(_, _, _) -> ExecContext.table ctx name
+
+        let rec stripWrappers (tree: Logical) =
+            match tree with
+            | Logical.Sort(_, child) -> stripWrappers child
+            | Logical.Limit(_, _, child) -> stripWrappers child
+            | Logical.Distinct child -> stripWrappers child
+            | Logical.Having(_, _, _, child) -> stripWrappers child
+            | Logical.Filter(_, child) -> stripWrappers child
+            | Logical.Project(_, child) -> stripWrappers child
+            | other -> other
+
+        let outputOf (tree: Logical) (inSchema: Schema) =
+            match stripWrappers tree with
+            | Logical.Aggregate(groupBy, aggs, _) ->
+                let gv =
+                    groupBy
+                    |> List.map (fun e ->
+                        {
+                            Name = Expr.toDisplayString e
+                            Qualifier = None
+                            DataType = None
+                        })
+
+                let av =
+                    aggs
+                    |> List.map (fun (f, star, arg) ->
+                        let suffix = if star then "*" else Expr.toDisplayString arg
+
+                        {
+                            Name = sprintf "%s(%s)" f.Name suffix
+                            Qualifier = None
+                            DataType = None
+                        })
+
+                { Schema.empty with
+                    Columns = Array.append (List.toArray gv) (List.toArray av)
+                }
+            | _ -> inSchema
+
+        let groupByOf (tree: Logical) =
+            match stripWrappers tree with
+            | Logical.Aggregate(groupBy, _, _) -> groupBy
+            | _ -> []
 
         match tree with
         | Logical.Join _ ->
@@ -630,42 +600,33 @@ module internal Optimizer =
             exec ctx child schema
             |> Result.map (fun op -> Ops.project childSchema groupBy op items)
 
-// ---------------------------------------------------------------------------
-// 5. 公開エントリポイント
-// ---------------------------------------------------------------------------
 module internal Plan =
     /// SELECT 文を実行して、結果（列名 + 行）を返す。
     let runSelect (ctx: ExecContext) (stmt: SelectStatement) =
-        // FROM と JOIN のテーブル参照（registerAll と出力スキーマの両方で同じ順に使う）。
-        let sources =
-            (match stmt.From with
-             | None -> []
-             | Some r -> [ r ])
-            @ (stmt.Joins |> List.map (fun j -> j.Table))
-
-        // 登録しながら出力スキーマも左から連結する
-        // （SchemaOf を 登録・buildLogical・出力 の 3回呼さないため）。
-        let registerAll () =
+        let registerAll (sources: TableRef list) =
             sources
             |> foldOk
                 (fun (c: ExecContext, acc: Schema) r ->
-                    let realName = r.Name
-
-                    c.SchemaOf realName
-                    >>= fun schema ->
-                        let c1 = c.WithSchema realName schema
+                    result {
+                        let realName = r.Name
+                        let! schema = ExecContext.schemaOf c realName
+                        let c1 = ExecContext.withSchema c realName schema
 
                         let c2 =
                             match r.Alias with
                             | None -> c1
-                            | Some a -> c1.WithSchema a schema
+                            | Some a -> ExecContext.withSchema c1 a schema
 
-                        ret (c2, acc.Concat(Schema.ofTable realName r.Alias schema)))
+                        return c2, Schema.concat acc (Schema.ofTable realName r.Alias schema)
+                    })
                 (ctx, Schema.empty)
 
-        // 識別名が重複すると exec が「右テーブルを除いたスキーマ」を名前で引けず、
-        // 両方が消えて静かに誤答する（`FROM t JOIN t`）。
-        // 自己結合はエイリアス（`FROM t AS x JOIN t AS y`）で表す。
+        let sources =
+            (match stmt.From with
+             | None -> []
+             | Some r -> [ r ])
+            @ (stmt.Joins |> List.map _.Table)
+
         let duplicate =
             sources
             |> List.countBy (fun r -> defaultArg r.Alias r.Name)
@@ -674,12 +635,11 @@ module internal Plan =
         match duplicate with
         | Some(name, _) -> err (sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name)
         | None ->
-            registerAll ()
-            >>= fun (ctx2, schema) ->
-                Optimizer.buildLogical ctx2 stmt
-                >>= fun tree ->
-                    Optimizer.exec ctx2 tree schema
-                    >>= fun op -> Op.toArray op
-                    |> Result.map (fun rows ->
-                        let header = Schema.projectHeader schema stmt.Items
-                        header, rows)
+            result {
+                let! ctx2, schema = registerAll sources
+                let! tree = Optimizer.buildLogical ctx2 stmt
+                let! op = Optimizer.exec ctx2 tree schema
+                let! rows = Op.toArray op
+                let header = Schema.projectHeader schema stmt.Items
+                return header, rows
+            }
