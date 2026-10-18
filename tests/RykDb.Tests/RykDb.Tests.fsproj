@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -9,27 +9,29 @@
 
   <ItemGroup>
     <Compile Include="TestHelpers.fs" />
+    <Compile Include="ErrorsTests.fs" />
     <Compile Include="TypesTests.fs" />
     <Compile Include="SerializationTests.fs" />
-    <Compile Include="ParserTests.fs" />
-    <Compile Include="AstTests.fs" />
-    <Compile Include="BloomFilterTests.fs" />
     <Compile Include="MemtableTests.fs" />
+    <Compile Include="WalTests.fs" />
+    <Compile Include="BloomFilterTests.fs" />
     <Compile Include="SstableTests.fs" />
     <Compile Include="VersionSetTests.fs" />
     <Compile Include="ManifestTests.fs" />
-    <Compile Include="BlockCacheTests.fs" />
-    <Compile Include="WalTests.fs" />
+    <Compile Include="CompactionTests.fs" />
     <Compile Include="StorageEngineTests.fs" />
     <Compile Include="TransactionsTests.fs" />
+    <Compile Include="AstTests.fs" />
+    <Compile Include="LexerTests.fs" />
+    <Compile Include="ParserTests.fs" />
     <Compile Include="RowStoreTests.fs" />
-    <Compile Include="CompactionTests.fs" />
-    <Compile Include="DmlOpsTests.fs" />
+    <Compile Include="CatalogTests.fs" />
+    <Compile Include="SchemaTests.fs" />
     <Compile Include="EvalTests.fs" />
     <Compile Include="OpsTests.fs" />
-    <Compile Include="SchemaTests.fs" />
-    <Compile Include="CatalogTests.fs" />
+    <Compile Include="ExecContextTests.fs" />
     <Compile Include="PlannerTests.fs" />
+    <Compile Include="EngineTests.fs" />
     <Compile Include="DatabaseTests.fs" />
     <Compile Include="ServerTests.fs" />
     <Compile Include="TestHealthTests.fs" />

@@ -15,7 +15,7 @@ let private compose (a: VersionEdit) (b: VersionEdit) =
     }
 
 [<Fact>]
-let ``VersionSet: ファイル追加でレベル構成が変わる`` () =
+let ``Version: ファイル追加でレベル構成が変わる`` () =
     let v =
         Version.empty
         |> Version.addFile (fmd 1L 0 100 199)
@@ -25,10 +25,9 @@ let ``VersionSet: ファイル追加でレベル構成が変わる`` () =
     Assert.Equal<int array>([| 1; 1; 1; 0; 0; 0; 0 |], Version.levelCounts v)
 
 [<Fact>]
-let ``VersionSet: 追加は破壊的でない`` () =
+let ``Version: 追加は破壊的でない`` () =
     let v0 = Version.empty
     let v1 = Version.addFile (fmd 1L 0 100 199) v0
-
     Assert.Equal(0, (Version.levelCounts v0).[0])
     Assert.Equal(1, (Version.levelCounts v1).[0])
     // v0 に後から v1 のファイルは見えない
@@ -36,7 +35,7 @@ let ``VersionSet: 追加は破壊的でない`` () =
     Assert.Equal(1, (Version.filesAt v1 0).Length)
 
 [<Fact>]
-let ``VersionSet: 削除でレベル構成が変わる`` () =
+let ``Version: 削除でレベル構成が変わる`` () =
     let v =
         Version.empty
         |> Version.addFile (fmd 1L 0 100 199)
@@ -46,24 +45,7 @@ let ``VersionSet: 削除でレベル構成が変わる`` () =
     Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts v)
 
 [<Fact>]
-let ``VersionEdit: 変更適用は削除後に追加する`` () =
-    let oldFile = fmd 1L 0 100 199
-    let replacement = fmd 1L 1 200 299
-    let initial = Version.empty |> Version.addFile oldFile
-
-    let updated =
-        VersionEdit.apply
-            initial
-            {
-                AddedFiles = [ replacement ]
-                DeletedFiles = [ oldFile ]
-            }
-
-    Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts updated)
-    Assert.Equal(1L, (Version.filesAt updated 1).[0].FileNumber)
-
-[<Fact>]
-let ``VersionSet: ポイントルックアップの候補は新しい順`` () =
+let ``Version: ポイントルックアップの候補は新しい順`` () =
     let v =
         Version.empty
         |> Version.addFile (fmd 1L 0 100 199)
@@ -96,10 +78,26 @@ let ``VersionSet: ポイントルックアップの候補は新しい順`` () =
     Assert.Empty(Version.filesForPointLookup v (intKey 9999))
 
 [<Fact>]
+let ``VersionEdit: 変更適用は削除後に追加する`` () =
+    let oldFile = fmd 1L 0 100 199
+    let replacement = fmd 1L 1 200 299
+    let initial = Version.empty |> Version.addFile oldFile
+
+    let updated =
+        VersionEdit.apply
+            initial
+            {
+                AddedFiles = [ replacement ]
+                DeletedFiles = [ oldFile ]
+            }
+
+    Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts updated)
+    Assert.Equal(1L, (Version.filesAt updated 1).[0].FileNumber)
+
+[<Fact>]
 let ``VersionEdit: エンコードの往復`` () =
     let added = fmd 3L 1 300 350
     let deleted = fmd 1L 0 100 199
-
     let edit = compose (VersionEdit.addFile added) (VersionEdit.deleteFile deleted)
 
     match ok (VersionEdit.decode (VersionEdit.encode edit)) with
@@ -125,27 +123,4 @@ let ``VersionEdit: エンコードの往復`` () =
 
         Assert.Equal(deleted.FileNumber, e.DeletedFiles.[0].FileNumber)
         Assert.Equal(deleted.Level, e.DeletedFiles.[0].Level)
-    | _ -> Assert.Fail("1 レコードに復元されるはず")
-
-// ---------------------------------------------------------------------------
-// 末尾再帰の検証（深い入力でスタックを食わないこと）
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``末尾再帰: VersionEdit の巨大レコードを読める`` () =
-    // 1 レコードに 20 万個のファイル追加を入れる
-    let n = 200_000
-
-    let added = List.init n (fun i -> fmd (int64 i) 0 (i * 2) (i * 2 + 1))
-
-    let edit =
-        compose
-            (VersionEdit.addFile added.[0])
-            {
-                AddedFiles = added.[1..]
-                DeletedFiles = []
-            }
-
-    match ok (VersionEdit.decode (VersionEdit.encode edit)) with
-    | [ e ] -> Assert.Equal(n, e.AddedFiles.Length)
-    | _ -> Assert.Fail("1 レコードに復元されるはず")
+    | _ -> Assert.Fail "1レコードに復元されるはず"

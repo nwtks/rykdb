@@ -27,8 +27,6 @@ type internal StorageEngine =
         NextSeqNo: uint64
         /// 次に採番する txnId
         NextTxnId: uint64
-        /// ファイルキャッシュ
-        Cache: BlockCache
         /// memtable のメモリ上限（超えたら flush する）
         MemLimitBytes: int
         /// コンパクションの設定
@@ -47,10 +45,6 @@ module internal StorageEngine =
     [<Literal>]
     let private DefaultMemLimitBytes = 64 * 1024 * 1024
 
-    /// 既定のファイルキャッシュ容量（ファイル数）。
-    [<Literal>]
-    let private DefaultCacheFiles = 32
-
     /// 既定値で埋めた空の engine（Dir のみ引数から取る）。
     let private emptyEngine dir =
         {
@@ -61,7 +55,6 @@ module internal StorageEngine =
             Wal = { FileNumber = 1L; Size = 0 }
             NextSeqNo = 1UL
             NextTxnId = 1UL
-            Cache = BlockCache.create DefaultCacheFiles
             MemLimitBytes = DefaultMemLimitBytes
             Compaction = CompactionOptions.defaults
             ActiveSnapshot = 0UL
@@ -81,29 +74,13 @@ module internal StorageEngine =
         | Some s -> e.SeqNo <= s
         | None -> true
 
-    /// SSTable ファイルを直接バイト列で読む（キャッシュを通さない）。
+    /// SSTable ファイルをバイト列で読む。
     let private readFileBytes (dir: string) (fileNumber: int64) =
         protect (fun () -> System.IO.File.ReadAllBytes(Sstable.path dir fileNumber))
 
     /// ファイルを開く（Bloom と index を持つ reader を作る）。
     let private openSstable (engine: StorageEngine) (f: FileMetaData) =
-        let readSstableBytes (engine: StorageEngine) (fileNumber: int64) =
-            match BlockCache.get engine.Cache fileNumber 0 with
-            | Some(_, bytes) -> ret bytes
-            | None ->
-                readFileBytes engine.Dir fileNumber
-                |> Result.map (fun bytes ->
-                    {
-                        FileNumber = fileNumber
-                        BlockId = 0
-                        Data = bytes
-                    }
-                    |> BlockCache.put engine.Cache
-                    |> ignore
-
-                    bytes)
-
-        readSstableBytes engine f.FileNumber >>= Sstable.openTable
+        readFileBytes engine.Dir f.FileNumber >>= Sstable.openTable
 
     /// 開いた reader から startKey 以降の全エントリを配列にする。
     /// `[||]` なら先頭から全部。
@@ -149,15 +126,9 @@ module internal StorageEngine =
                         | Ok(Some e) -> ret (Some e)
                         | Ok None -> probe rest
 
-        let fromMem =
-            match Memtable.getVisible engine.Mem key visible with
-            | None -> ret None
-            | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
-
-        match fromMem with
-        | Error e -> Error e
-        | Ok(Some e) -> ret (Some e)
-        | Ok None -> Version.filesForPointLookup engine.Version key |> probe
+        match Memtable.getVisible engine.Mem key visible with
+        | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
+        | None -> Version.filesForPointLookup engine.Version key |> probe
 
     /// 範囲ルックアップ。
     /// キー昇順で返す（同一キーは 1 件だけ）。
@@ -208,22 +179,19 @@ module internal StorageEngine =
             }
 
         result {
-            if entries.Length = 0 then
-                return engine
-            else
-                let txnId = engine.NextTxnId
+            let txnId = engine.NextTxnId
 
-                let! wal =
-                    Wal.append
-                        engine.Wal
-                        engine.Dir
-                        [
-                            WalRecord.Begin txnId
-                            WalRecord.Batch(txnId, entries)
-                            WalRecord.Commit txnId
-                        ]
+            let! wal =
+                Wal.append
+                    engine.Wal
+                    engine.Dir
+                    [
+                        WalRecord.Begin txnId
+                        WalRecord.Batch(txnId, entries)
+                        WalRecord.Commit txnId
+                    ]
 
-                return apply wal txnId
+            return apply wal txnId
         }
 
     let private writeOne (engine: StorageEngine) (entry: Entry) =
@@ -299,17 +267,12 @@ module internal StorageEngine =
                 | [] -> version.NextFileNumber
                 | files -> files |> List.map _.FileNumber |> List.max |> (+) 1L
 
-            let cache =
-                result.Removed
-                |> List.fold (fun c f -> BlockCache.invalidateFile c f.FileNumber) engine.Cache
-
             { engine with
                 Version =
                     { version with
                         NextFileNumber = nextNum
                     }
                 ManifestNumber = manifestNumber
-                Cache = cache
             }
 
         result {
@@ -341,12 +304,6 @@ module internal StorageEngine =
 
     /// 必要なら compaction する。
     let maybeCompact (engine: StorageEngine) = compactOnce engine
-
-    /// 最古の active snapshot の SeqNo を進める（GC の基準）。
-    let setActiveSnapshot (seqNo: uint64) (engine: StorageEngine) =
-        { engine with
-            ActiveSnapshot = max engine.ActiveSnapshot seqNo
-        }
 
     /// データベースを開く（新規なら作る）。
     let openDatabase (dir: string) =

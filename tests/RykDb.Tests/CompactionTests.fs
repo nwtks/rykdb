@@ -9,215 +9,215 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-let private key (i: int) =
-    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
+/// 与えたエントリ列を SSTable として書き、メタデータを返す。
+let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) =
+    entries
+    |> List.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+    |> List.toArray
+    |> FileMetaData.writeSstable dir num level 0.01
+    |> ok
 
-let private valueOf (i: int) = [| SqlValue.Int(int64 i) |]
+/// 書いた SSTable を読み戻す（compact の readFile と同じ経路）。
+let private readBack (dir: string) (f: FileMetaData) =
+    protect (fun () -> File.ReadAllBytes(Sstable.path dir f.FileNumber))
+    >>= Sstable.openTable
+    >>= fun reader -> Sstable.rangeScan reader [||] 0 |> SstScan.toArray
 
-/// N 個の key を書いて flush する。
-let private fillAndFlush (engine: StorageEngine) (from: int) (count: int) =
-    let engine =
-        List.fold (fun e i -> ok (StorageEngine.put e (key i) (valueOf i))) engine [ from .. from + count - 1 ]
-
-    ok (StorageEngine.flush engine)
-
-/// レベルごとのファイル数。
-let private levelsOf (engine: StorageEngine) = engine.Version |> Version.levelCounts
-
-let private unreferencedFiles (dir: string) (version: RykDb.Core.Version) =
-    let known =
-        Version.allFiles version |> List.map (fun f -> f.FileNumber) |> Set.ofList
-
-    protect (fun () ->
-        Directory.GetFiles(dir, "*.sst")
-        |> Array.choose (fun p ->
-            let stem = Path.GetFileNameWithoutExtension p
-
-            match System.Int64.TryParse stem with
-            | true, n when not (Set.contains n known) -> Some n
-            | _ -> None)
-        |> Array.toList
-        |> List.sort)
-
-let private setCompactionOptions (opts: CompactionOptions) (engine: StorageEngine) =
-    let next = { engine with Compaction = opts }
-    next
-
-let private get (engine: StorageEngine) (key: byte array) = StorageEngine.getAt engine None key
-
-// ===========================================================================
-// obsoleteFiles — ファイル単位の GC
-// ===========================================================================
-
-let private file (num: int64) (level: int) (maxSeqNo: uint64) =
-    {
-        FileNumber = num
-        Level = level
-        Smallest = key 1
-        Largest = key 1000
-        EntryCount = 10L
-        Size = 1000L
-        MaxSeqNo = maxSeqNo
+/// 閾値を全レベル 0 にして「最初の非空レベル」から compaction させる。
+let private pickFirstLevel =
+    { CompactionOptions.defaults with
+        MaxLevelBytes = Array.create Levels.Count 0L
     }
 
-[<Fact>]
-let ``GC: Version に無いファイルだけが孤児候補になる`` () =
-    withDir "orph" (fun dir ->
-        protect (fun () -> Directory.CreateDirectory(dir) |> ignore) |> ignore
+/// 1回 compact して結果だけ返す。
+let private compactAll (dir: string) (version: Version) (activeSnapshot: uint64) (options: CompactionOptions) =
+    ok (Compaction.compact dir version options activeSnapshot 100L (readBack dir))
 
-        let v1: RykDb.Core.Version = Version.addFile (file 1L 1 5UL) Version.empty
-        let referenced: RykDb.Core.Version = Version.addFile (file 2L 1 50UL) v1
-
-        // Version が参照している 1, 2 と、参照していない 3, 4 を置く
-        for n in [ 1L; 2L; 3L; 4L ] do
-            protect (fun () -> File.WriteAllBytes(Path.Combine(dir, sprintf "%06d.sst" n), [||]))
-            |> ignore
-
-        let orphans: int64 list = ok (unreferencedFiles dir referenced)
-
-        Assert.Equal<int>(2, orphans.Length)
-        Assert.Equal<int64>(3L, orphans.[0])
-        Assert.Equal<int64>(4L, orphans.[1]))
-
-// ===========================================================================
-// StorageEngine の compactOnce
-// ===========================================================================
+let private entryOf (i: int) =
+    Entry.put (intKey i) (uint64 i) (intRow i)
 
 [<Fact>]
-let ``Compaction: flush だけの場合は何も起きない`` () =
-    withDir "c1" (fun dir ->
-        let engine = ok (StorageEngine.openDatabase dir)
-        let engine = fillAndFlush engine 1 10
+let ``Compaction: 同一キーは最新版を残し、snapshot より古い版を落とす`` () =
+    withDir "comp-gc" (fun dir ->
+        let f =
+            mkSst
+                dir
+                10L
+                1
+                [
+                    Entry.put (intKey 1) 5UL (intRow 5)
+                    Entry.put (intKey 1) 3UL (intRow 3)
+                    Entry.put (intKey 1) 1UL (intRow 1)
+                    Entry.put (intKey 2) 2UL (intRow 2)
+                ]
 
-        // L1 以降が無いので pickCompaction は None を返す
-        let engine = ok (StorageEngine.maybeCompact engine)
+        let version = Version.addFile f Version.empty
+        let result, _ = compactAll dir version 4UL pickFirstLevel
+        // key1 の seq 1, 3 は snapshot 4 より古いので捨てる
+        Assert.Equal(2, result.DroppedVersions)
+        Assert.Equal(0, result.DroppedTombstones)
+        Assert.Equal<int64 list>([ 10L ], result.Removed |> List.map _.FileNumber)
 
-        // ファイルは L0 の 1 個のまま
-        Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], levelsOf engine))
+        let out = List.exactlyOne result.Added
+        Assert.Equal(2, out.Level)
+        Assert.Equal(2L, out.EntryCount)
 
-
-[<Fact>]
-let ``Compaction: L1 にファイルがあると L2 へ降ろされる`` () =
-    withDir "c3" (fun dir ->
-        let engine = ok (StorageEngine.openDatabase dir)
-
-        // flush は L0 に出すだけなので、Version を直接操作して L1 のファイルを作る。
-        let arr =
-            Array.init 10 (fun i -> SstEntry.make (key (i + 1)) (uint64 (i + 1)) (Some(valueOf i)))
-
-        let e1 = ok (Sstable.build arr 0.01)
-
-        let fileNumber = engine.Version.NextFileNumber
-
-        protect (fun () -> File.WriteAllBytes(Path.Combine(dir, sprintf "%06d.sst" fileNumber), e1))
-        |> ignore
-
-        let meta =
-            {
-                FileNumber = fileNumber
-                Level = 1
-                Smallest = key 1
-                Largest = key 10
-                EntryCount = 10L
-                Size = int64 e1.Length
-                MaxSeqNo = 10UL
-            }
-
-        let edit = VersionEdit.addFile meta
-
-        let (version, manifestNumber) =
-            ok (Manifest.logAndApply dir engine.ManifestNumber engine.Version edit)
-
-        let engine =
-            { engine with
-                Version = version
-                ManifestNumber = manifestNumber
-            }
-
-        Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], levelsOf engine))
+        let entries = ok (readBack dir out)
+        Assert.Equal<int>(2, entries.Length)
+        Assert.Equal<byte array>(intKey 1, entries.[0].Key)
+        Assert.Equal<uint64>(5UL, entries.[0].SeqNo)
+        Assert.Equal<byte array>(intKey 2, entries.[1].Key))
 
 [<Fact>]
-let ``Compaction: 実行すると入力ファイルが消えて出力ファイルができる`` () =
-    withDir "c4" (fun dir ->
-        let engine = ok (StorageEngine.openDatabase dir)
+let ``Compaction: snapshot が生きている版は GC しない`` () =
+    withDir "comp-snap" (fun dir ->
+        let f =
+            mkSst
+                dir
+                10L
+                1
+                [
+                    Entry.put (intKey 1) 5UL (intRow 5)
+                    Entry.put (intKey 1) 3UL (intRow 3)
+                    Entry.put (intKey 1) 1UL (intRow 1)
+                ]
 
-        // L1 にファイルを作る（キーは 1..10）
-        let arr =
-            Array.init 10 (fun i -> SstEntry.make (key (i + 1)) (uint64 (i + 1)) (Some(valueOf i)))
+        let version = Version.addFile f Version.empty
+        // snapshot 2 が見ている seq 3 は残し、seq 1 だけ落とす
+        let result, _ = compactAll dir version 2UL pickFirstLevel
+        Assert.Equal(1, result.DroppedVersions)
 
-        let bytes = ok (Sstable.build arr 0.01)
-        let fileNumber = engine.Version.NextFileNumber
-
-        protect (fun () -> File.WriteAllBytes(Path.Combine(dir, sprintf "%06d.sst" fileNumber), bytes))
-        |> ignore
-
-        let meta =
-            {
-                FileNumber = fileNumber
-                Level = 1
-                Smallest = key 1
-                Largest = key 10
-                EntryCount = 10L
-                Size = int64 bytes.Length
-                MaxSeqNo = 10UL
-            }
-
-        let edit = VersionEdit.addFile meta
-
-        let (version, manifestNumber) =
-            ok (Manifest.logAndApply dir engine.ManifestNumber engine.Version edit)
-
-        let engine =
-            { engine with
-                Version = version
-                ManifestNumber = manifestNumber
-            }
-
-        let opts =
-            { CompactionOptions.defaults with
-                MaxLevelBytes = [| 0L; 1L; 1L; 1L; 1L; 1L; 1L |]
-            }
-
-        let engine = setCompactionOptions opts engine
-
-        let engine = ok (StorageEngine.maybeCompact engine)
-
-        // L1 のファイルが L2 に移動した
-        Assert.Equal<int array>([| 0; 0; 1; 0; 0; 0; 0 |], levelsOf engine)
-
-        // 入力ファイルは削除されている
-        Assert.False(File.Exists(Path.Combine(dir, sprintf "%06d.sst" fileNumber)))
-
-        // データはちゃんと読める
-        for i in 1..10 do
-            let found = ok (get engine (key i))
-            Assert.True(found.IsSome, sprintf "key %d が読めない" i))
+        let entries = ok (readBack dir (List.exactlyOne result.Added))
+        Assert.Equal<int>(2, entries.Length)
+        Assert.Equal<uint64>(5UL, entries.[0].SeqNo)
+        Assert.Equal<uint64>(3UL, entries.[1].SeqNo))
 
 [<Fact>]
-let ``Compaction: 実行しても同じ Version では二度と compaction されない`` () =
-    // MANIFEST に同じファイルが追加されないことの確認（ファイル番号の巻き戻し防止）
-    withDir "c5" (fun dir ->
-        let engine = ok (StorageEngine.openDatabase dir)
-        let engine = fillAndFlush engine 1 5
-        let before = engine.Version.NextFileNumber
-
-        let engine = ok (StorageEngine.maybeCompact engine)
-
-        // NextFileNumber は減らない
-        Assert.True(engine.Version.NextFileNumber >= before))
-
-// ===========================================================================
-// RowStore 経由の compaction
-// ===========================================================================
+let ``Compaction: 閾値を超えないレベルは compaction しない`` () =
+    withDir "comp-none" (fun dir ->
+        let f = mkSst dir 10L 1 [ entryOf 1 ]
+        let version = Version.addFile f Version.empty
+        // 既定の閾値（L1 = 10MiB）には遠く届かない
+        let result, info = compactAll dir version 0UL CompactionOptions.defaults
+        Assert.Empty result.Added
+        Assert.Empty result.Removed
+        Assert.Equal(0, result.DroppedVersions)
+        Assert.Equal(-1L, info.FileNumber)
+        Assert.True(File.Exists(Sstable.path dir 10L)))
 
 [<Fact>]
-let ``Compaction: active snapshot を進めている GC の基準になる`` () =
-    withDir "c7" (fun dir ->
-        let engine = ok (StorageEngine.openDatabase dir)
-        let engine = StorageEngine.setActiveSnapshot 100UL engine
+let ``Compaction: 上のレベルの重なるファイルも入力に含める`` () =
+    withDir "comp-inputs" (fun dir ->
+        let f1 =
+            mkSst dir 10L 1 [ entryOf 1; entryOf 2; Entry.put (intKey 3) 3UL (intRow 3) ]
+        // key3 で f1 と重なる L2 のファイル
+        let f2 = mkSst dir 11L 2 [ Entry.put (intKey 3) 33UL (intRow 3); entryOf 4 ]
+        let version = Version.empty |> Version.addFile f1 |> Version.addFile f2
+        let result, _ = compactAll dir version 10UL pickFirstLevel
+        // 入力は L1 の f1 と、重なる L2 の f2 の両方
+        Assert.Equal<int64 list>([ 10L; 11L ], result.Removed |> List.map _.FileNumber)
+        // key3 の古い版（seq 3 < snapshot 10）だけ落ちる
+        Assert.Equal(1, result.DroppedVersions)
 
-        Assert.Equal<uint64>(100UL, engine.ActiveSnapshot)
+        let out = List.exactlyOne result.Added
+        Assert.Equal(2, out.Level)
+        Assert.Equal(4L, out.EntryCount)
 
-        // 戻せない（単調増加）
-        let engine = StorageEngine.setActiveSnapshot 50UL engine
-        Assert.Equal<uint64>(100UL, engine.ActiveSnapshot))
+        let entries = ok (readBack dir out)
+        Assert.Equal<int>(4, entries.Length)
+        Assert.Equal<uint64>(1UL, entries.[0].SeqNo)
+        Assert.Equal<uint64>(33UL, entries.[2].SeqNo))
+
+[<Fact>]
+let ``Compaction: 重ならない上のレベルファイルは入力に含めない`` () =
+    withDir "comp-no-overlap" (fun dir ->
+        // L1 のキー域は 5..6
+        let f1 = mkSst dir 10L 1 [ entryOf 5; entryOf 6 ]
+        // L2 には下側（0）と上側（9）の、重ならないファイルを置く
+        let below = mkSst dir 11L 2 [ entryOf 0 ]
+        let above = mkSst dir 12L 2 [ entryOf 9 ]
+
+        let version =
+            Version.empty
+            |> Version.addFile f1
+            |> Version.addFile below
+            |> Version.addFile above
+
+        let result, _ = compactAll dir version 0UL pickFirstLevel
+        // 入力は L1 の f1 だけ。重ならない L2 の 2 ファイルは入力に含めない
+        Assert.Equal<int64 list>([ 10L ], result.Removed |> List.map _.FileNumber)
+        Assert.True(File.Exists(Sstable.path dir 11L))
+        Assert.True(File.Exists(Sstable.path dir 12L)))
+
+[<Fact>]
+let ``Compaction: 最下位レベルへの出力では tombstone を落とす`` () =
+    withDir "comp-bottom" (fun dir ->
+        let f =
+            mkSst dir 10L 5 [ Entry.delete (intKey 1) 5UL; Entry.put (intKey 2) 2UL (intRow 2) ]
+
+        let version = Version.addFile f Version.empty
+        // 全レベル閾値 0 → L5 が選ばれ、出力は L6（最下位）
+        let result, _ = compactAll dir version 0UL pickFirstLevel
+        Assert.Equal(0, result.DroppedVersions)
+        Assert.Equal(1, result.DroppedTombstones)
+
+        let out = List.exactlyOne result.Added
+        Assert.Equal(Levels.Max, out.Level)
+
+        let entries = ok (readBack dir out)
+        Assert.Equal<int>(1, entries.Length)
+        Assert.Equal<byte array>(intKey 2, entries.[0].Key))
+
+[<Fact>]
+let ``Compaction: 途中のレベルへの出力では tombstone を残す`` () =
+    withDir "comp-keep-tomb" (fun dir ->
+        let f =
+            mkSst dir 10L 1 [ Entry.delete (intKey 1) 5UL; Entry.put (intKey 2) 2UL (intRow 2) ]
+
+        let version = Version.addFile f Version.empty
+        // 出力は L2。まだ下に古い版が残りうるので tombstone は消せない
+        let result, _ = compactAll dir version 0UL pickFirstLevel
+        Assert.Equal(0, result.DroppedVersions)
+        Assert.Equal(0, result.DroppedTombstones)
+
+        let entries = ok (readBack dir (List.exactlyOne result.Added))
+        Assert.Equal<int>(2, entries.Length)
+        Assert.True(entries.[0].IsDelete))
+
+[<Fact>]
+let ``Compaction: 最下位レベルの compaction で tombstone だけなら出力しない`` () =
+    withDir "comp-last-empty" (fun dir ->
+        let f =
+            mkSst dir 10L Levels.Max [ Entry.delete (intKey 1) 5UL; Entry.delete (intKey 2) 6UL ]
+
+        let version = Version.addFile f Version.empty
+        // L6 だけが閾値超え → 出力先も L6。tombstone は全部落ちて空になる
+        let result, info = compactAll dir version 0UL pickFirstLevel
+        Assert.Empty result.Added
+        Assert.Equal<int64 list>([ 10L ], result.Removed |> List.map _.FileNumber)
+        Assert.Equal(0, result.DroppedVersions)
+        Assert.Equal(2, result.DroppedTombstones)
+        Assert.Equal(Levels.Max, info.Level)
+        // 実ファイルの削除は呼び出し側（MANIFEST 更新後）の責務
+        Assert.True(File.Exists(Sstable.path dir 10L)))
+
+[<Fact>]
+let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
+    withDir "comp-write-fail" (fun dir ->
+        let f = mkSst dir 10L 1 [ entryOf 1 ]
+        let version = Version.addFile f Version.empty
+        // 存在しないディレクトリを出力先にする → 書き込みが IoError で失敗する
+        let missing = Path.Combine(dir, "missing")
+        let r = Compaction.compact missing version pickFirstLevel 0UL 100L (readBack dir)
+        expectErrorKind ErrorKind.IoError "書き込み失敗は IoError になる" r
+        // 入力ファイルは消さない（削除は呼び出し側の責務）
+        Assert.True(File.Exists(Sstable.path dir 10L)))
+
+[<Fact>]
+let ``Compaction: 入力の読み込みに失敗したらそのエラーを返す`` () =
+    withDir "comp-read-fail" (fun dir ->
+        let f = fmd 10L 1 1 1
+        let version = Version.addFile f Version.empty
+        let broken (_: FileMetaData) = err (DbError.corruption "壊れた SSTable")
+        let r = Compaction.compact dir version pickFirstLevel 0UL 100L broken
+        expectErrorKind ErrorKind.CorruptionError "読み込みエラーはそのまま伝播する" r)

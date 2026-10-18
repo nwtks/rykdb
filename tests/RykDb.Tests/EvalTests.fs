@@ -32,6 +32,92 @@ let private evI (row: SqlValue array) (e: Expr) =
     | v -> failwithf "INTEGER 以外が返りました: %A" v
 
 [<Fact>]
+let ``Eval: LIKE の % と _`` () =
+    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
+
+    let test (pattern: string) (text: string) =
+        let e = Expr.Like(col "s", Expr.Literal(Literal.String pattern), false)
+
+        match ok (Eval.eval schema [| SqlValue.Text text |] e) with
+        | SqlValue.Bool b -> b
+        | v -> failwithf "BOOLEAN 以外: %A" v
+
+    Assert.True(test "ab%" "abcdef")
+    // "%cd" は「cd で終わる」必要があり、"abcdef" は "def" で終わるので不一致。
+    Assert.False(test "%cd" "abcdef")
+    Assert.True(test "%cd" "abcd")
+    Assert.True(test "a_c" "abc")
+    Assert.False(test "a_c" "abbc")
+    Assert.True(test "%" "anything")
+    // `%` の後に何もない（0 文字一致）も許す
+    Assert.True(test "abc%" "abc")
+
+[<Fact>]
+let ``Eval: スカラー関数`` () =
+    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
+
+    let call (name: string) (args: Expr list) =
+        ok (Eval.eval schema [| SqlValue.Text "  AbC  " |] (Expr.FuncCall(name, args)))
+
+    match call "UPPER" [ col "s" ] with
+    | SqlValue.Text t -> Assert.Equal("  ABC  ", t)
+    | v -> Assert.Fail(sprintf "UPPER が文字列ではありません: %A" v)
+
+    match call "TRIM" [ col "s" ] with
+    | SqlValue.Text t -> Assert.Equal("AbC", t)
+    | v -> Assert.Fail(sprintf "TRIM が文字列ではありません: %A" v)
+
+    // 未知の関数はエラー
+    expectError "未知の関数が OK になっています" (Eval.eval schema [||] (Expr.FuncCall("NOPE", [])))
+
+[<Fact>]
+let ``Eval: スカラー関数の LOWER / LENGTH / COALESCE`` () =
+    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
+
+    let call (name: string) (args: Expr list) =
+        ok (Eval.eval schema [| SqlValue.Text "  AbC  " |] (Expr.FuncCall(name, args)))
+
+    match call "LOWER" [ col "s" ] with
+    | SqlValue.Text t -> Assert.Equal("  abc  ", t)
+    | v -> Assert.Fail(sprintf "LOWER が文字列ではありません: %A" v)
+
+    match call "LENGTH" [ col "s" ] with
+    | SqlValue.Int n -> Assert.Equal(7L, n)
+    | v -> Assert.Fail(sprintf "LENGTH が整数ではありません: %A" v)
+
+    // NULL は NULL のまま伝播する
+    Assert.Equal(SqlValue.Null, call "LENGTH" [ Expr.Literal Literal.Null ])
+
+    // COALESCE は最初の非 NULL を返し、全部 NULL なら NULL
+    Assert.Equal(SqlValue.Int 5L, call "COALESCE" [ Expr.Literal Literal.Null; Expr.Literal(Literal.Int 5L) ])
+    Assert.Equal(SqlValue.Int 7L, call "COALESCE" [ Expr.Literal(Literal.Int 7L); Expr.Literal(Literal.Int 5L) ])
+    Assert.Equal(SqlValue.Null, call "COALESCE" [ Expr.Literal Literal.Null; Expr.Literal Literal.Null ])
+    Assert.Equal(SqlValue.Null, call "COALESCE" [])
+
+[<Fact>]
+let ``Eval: スカラー関数の ABS / ROUND`` () =
+    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
+
+    let call (name: string) (args: Expr list) =
+        Eval.eval schema [||] (Expr.FuncCall(name, args))
+
+    Assert.Equal(SqlValue.Int 3L, ok (call "ABS" [ Expr.Literal(Literal.Int -3L) ]))
+    Assert.Equal(SqlValue.Real 2.5, ok (call "ABS" [ Expr.Literal(Literal.Real -2.5) ]))
+    Assert.Equal(SqlValue.Decimal 1.5M, ok (call "ABS" [ Expr.Literal(Literal.Decimal -1.5M) ]))
+    Assert.Equal(SqlValue.Null, ok (call "ABS" [ Expr.Literal Literal.Null ]))
+    expectErrorKind ErrorKind.TypeError "ABS は数値以外を受け付けない" (call "ABS" [ Expr.Literal(Literal.String "x") ])
+
+    // ROUND は 0.5 を遠い方へ丸める（AwayFromZero）
+    Assert.Equal(SqlValue.Real 3.0, ok (call "ROUND" [ Expr.Literal(Literal.Real 2.5) ]))
+    Assert.Equal(SqlValue.Real 2.0, ok (call "ROUND" [ Expr.Literal(Literal.Real 2.4) ]))
+    Assert.Equal(SqlValue.Int 7L, ok (call "ROUND" [ Expr.Literal(Literal.Int 7L) ]))
+    Assert.Equal(SqlValue.Null, ok (call "ROUND" [ Expr.Literal Literal.Null ]))
+    expectErrorKind ErrorKind.TypeError "ROUND は数値以外を受け付けない" (call "ROUND" [ Expr.Literal(Literal.String "x") ])
+
+    // 引数個数の不一致は名前エラー
+    expectErrorKind ErrorKind.NameError "引数が足りない" (call "UPPER" [])
+
+[<Fact>]
 let ``Eval: 算術は SQL の昇格規則に従う`` () =
     // int + int = int
     Assert.Equal<int64>(7L, evI (row2 3L 4L) (Expr.Binary(BinaryOp.Add, col "a", col "b")))
@@ -63,14 +149,6 @@ let ``Eval: NULL の比較は NULL（UNKNOWN）であって FALSE ではない``
     match ok (ev r (Expr.IsNull(col "a", false))) with
     | SqlValue.Bool b -> Assert.True b
     | v -> Assert.Fail(sprintf "IS NULL が TRUE になりません: %A" v)
-
-[<Fact>]
-let ``Eval: WHERE では UNKNOWN を偽として扱う`` () =
-    let r = [| SqlValue.Null; SqlValue.Int 1L |]
-    let pred = Expr.Binary(BinaryOp.Gt, col "a", col "b")
-
-    // UNKNOWN なので偽
-    Assert.False(ok (Eval.matches schema2 r pred))
 
 [<Fact>]
 let ``Eval: 3 値論理の AND / OR / NOT`` () =
@@ -189,40 +267,9 @@ let ``末尾再帰: 10 万段の式の木を評価できる`` () =
     | v -> Assert.Fail(sprintf "AND を %d 段重ねた式が評価できません: %A" depth v)
 
 [<Fact>]
-let ``Eval: LIKE の % と _`` () =
-    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
+let ``Eval: WHERE では UNKNOWN を偽として扱う`` () =
+    let r = [| SqlValue.Null; SqlValue.Int 1L |]
+    let pred = Expr.Binary(BinaryOp.Gt, col "a", col "b")
 
-    let test (pattern: string) (text: string) =
-        let e = Expr.Like(col "s", Expr.Literal(Literal.String pattern), false)
-
-        match ok (Eval.eval schema [| SqlValue.Text text |] e) with
-        | SqlValue.Bool b -> b
-        | v -> failwithf "BOOLEAN 以外: %A" v
-
-    Assert.True(test "ab%" "abcdef")
-    // "%cd" は「cd で終わる」必要があり、"abcdef" は "def" で終わるので不一致。
-    Assert.False(test "%cd" "abcdef")
-    Assert.True(test "%cd" "abcd")
-    Assert.True(test "a_c" "abc")
-    Assert.False(test "a_c" "abbc")
-    Assert.True(test "%" "anything")
-    // `%` の後に何もない（0 文字一致）も許す
-    Assert.True(test "abc%" "abc")
-
-[<Fact>]
-let ``Eval: スカラー関数`` () =
-    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
-
-    let call (name: string) (args: Expr list) =
-        ok (Eval.eval schema [| SqlValue.Text "  AbC  " |] (Expr.FuncCall(name, args)))
-
-    match call "UPPER" [ col "s" ] with
-    | SqlValue.Text t -> Assert.Equal("  ABC  ", t)
-    | v -> Assert.Fail(sprintf "UPPER が文字列ではありません: %A" v)
-
-    match call "TRIM" [ col "s" ] with
-    | SqlValue.Text t -> Assert.Equal("AbC", t)
-    | v -> Assert.Fail(sprintf "TRIM が文字列ではありません: %A" v)
-
-    // 未知の関数はエラー
-    expectError "未知の関数が OK になっています" (Eval.eval schema [||] (Expr.FuncCall("NOPE", [])))
+    // UNKNOWN なので偽
+    Assert.False(ok (Eval.matches schema2 r pred))

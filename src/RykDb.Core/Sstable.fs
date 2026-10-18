@@ -23,6 +23,13 @@ type internal SstEntry =
     member x.IsDelete = x.Value.IsNone
 
 module internal SstEntry =
+    let make key seqNo value =
+        {
+            Key = key
+            SeqNo = seqNo
+            Value = value
+        }
+
     /// 並び。
     /// キー昇順・同一キーは SeqNo 降順（新しい版が先）。
     let compare (a: SstEntry) (b: SstEntry) =
@@ -52,13 +59,6 @@ module internal SstEntry =
                 return seqNo, Some values
             else
                 return! err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
-        }
-
-    let make key seqNo value =
-        {
-            Key = key
-            SeqNo = seqNo
-            Value = value
         }
 
     /// 配列を n 個ずつの塊に分ける（SSTable のブロック分けと compaction の出力分けで共用）。
@@ -124,7 +124,7 @@ module internal SstScan =
 
     /// 次の 1件。
     /// None は終端。
-    let next (SstScan step) = step ()
+    let inline next (SstScan step) = step ()
 
     /// 1件を返す走査。
     /// 続き（rest）は次を要求されるまで組み立てない
@@ -141,7 +141,6 @@ module internal SstScan =
             | Ok(Some(e, nxt)) -> drain nxt (e :: acc)
 
         drain scan []
-
 
 /// 索引の 1要素。
 /// 各ブロックの位置と長さを張る。
@@ -552,11 +551,11 @@ module internal Sstable =
         | None -> true
         | Some bloom -> Hashing.hashBytes key |> Hashing.mix |> BloomFilter.mightContain bloom
 
-    /// startKey を含み得る最初のブロック位置を二分探索する。
-    /// ブロックはキー昇順に並び、LastKey がそのブロックの最大キーなので、
-    /// `LastKey < startKey` のブロックは丸ごと読み飛ばせる。
-    /// 該当が無ければブロック数（走査は空になる）。
-    let private blockIndexFrom (reader: SstReader) (startKey: byte array) =
+    /// startKey 以降のエントリをキー昇順で遅延生成する。
+    /// index の二分探索で開始ブロックへ飛び、ブロックは要求されるまで読まない。
+    /// ブロックの解析に失敗したら、その時点の next が Error を返す。
+    /// limit が 0 以下のときは上限なし（Memtable.rangeScan と揃える）。
+    let rangeScan (reader: SstReader) (startKey: byte array) (limit: int) =
         let rec search (lo: int) (hi: int) =
             if lo >= hi then
                 lo
@@ -568,13 +567,6 @@ module internal Sstable =
                 else
                     search lo mid
 
-        search 0 reader.Index.Length
-
-    /// startKey 以降のエントリをキー昇順で遅延生成する。
-    /// index の二分探索で開始ブロックへ飛び、ブロックは要求されるまで読まない。
-    /// ブロックの解析に失敗したら、その時点の next が Error を返す。
-    /// limit が 0 以下のときは上限なし（Memtable.rangeScan と揃える）。
-    let rangeScan (reader: SstReader) (startKey: byte array) (limit: int) =
         let readBlock (reader: SstReader) (indexEntry: SstIndexEntry) =
             Array.sub reader.Data indexEntry.Offset indexEntry.Length |> parseBlock
 
@@ -597,7 +589,7 @@ module internal Sstable =
                     | Error e -> Error e
                     | Ok items -> SstScan.next (fromPos i 0 items count))
 
-        fromBlock (blockIndexFrom reader startKey) 0
+        fromBlock (search 0 reader.Index.Length) 0
 
     /// 先頭から全エントリを配列で返す（全件必要ならこちら）。
     let entries (reader: SstReader) =

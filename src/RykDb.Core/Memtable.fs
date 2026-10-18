@@ -53,7 +53,7 @@ module internal Entry =
         | 0 -> compare b.SeqNo a.SeqNo
         | c -> c
 
-    let compareKeyOnly (key: byte array) (e: Entry) = Bytes.compare key e.Key
+    let inline compareKeyOnly (key: byte array) (e: Entry) = Bytes.compare key e.Key
 
     let priority (e: Entry) =
         let h = Hashing.hashBytes e.Key
@@ -160,29 +160,27 @@ module internal Memtable =
             ApproxBytes = 0
         }
 
-    let private split (root: TNode option) (target: Entry) =
-        let rec unwind (stack: TNode list) (left: TNode option) (right: TNode option) =
+    /// 複数のエントリをまとめて挿入する。
+    let apply (entries: Entry seq) (mem: Memtable) =
+        let rec unwind (target: Entry) (stack: TNode list) (left: TNode option) (right: TNode option) =
             match stack with
             | [] -> left, right
             | r :: rest ->
                 if Entry.compareKeys r.Entry target < 0 then
-                    unwind rest (Some { r with Right = left }) right
+                    unwind target rest (Some { r with Right = left }) right
                 else
-                    unwind rest left (Some { r with Left = right })
+                    unwind target rest left (Some { r with Left = right })
 
-        let rec down (stack: TNode list) (node: TNode option) =
+        let rec down (target: Entry) (stack: TNode list) (node: TNode option) =
             match node with
-            | None -> unwind stack None None
+            | None -> unwind target stack None None
             | Some r ->
                 if Entry.compareKeys r.Entry target < 0 then
-                    down (r :: stack) r.Right
+                    down target (r :: stack) r.Right
                 else
-                    down (r :: stack) r.Left
+                    down target (r :: stack) r.Left
 
-        down [] root
-
-    let private insertNode (e: Entry) (root: TNode option) =
-        let p = Entry.priority e
+        let split (root: TNode option) (target: Entry) = down target [] root
 
         let rec rebuild (stack: (TNode * bool) list) (acc: TNode option) =
             match stack with
@@ -196,7 +194,7 @@ module internal Memtable =
 
                 rebuild rest rebuilt
 
-        let rec descend (stack: (TNode * bool) list) (node: TNode option) =
+        let rec descend (e: Entry) (p: uint64) (stack: (TNode * bool) list) (node: TNode option) =
             match node with
             | None ->
                 Some
@@ -220,14 +218,14 @@ module internal Memtable =
                         }
                     |> rebuild stack
                 else if Entry.compareKeys e r.Entry < 0 then
-                    descend ((r, true) :: stack) r.Left
+                    descend e p ((r, true) :: stack) r.Left
                 else
-                    descend ((r, false) :: stack) r.Right
+                    descend e p ((r, false) :: stack) r.Right
 
-        descend [] root
+        let insertNode (e: Entry) (root: TNode option) =
+            let p = Entry.priority e
+            descend e p [] root
 
-    /// 複数のエントリをまとめて挿入する。
-    let apply (entries: Entry seq) (mem: Memtable) =
         let insert (e: Entry) (mem: Memtable) =
             {
                 Root = insertNode e mem.Root

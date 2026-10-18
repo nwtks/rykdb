@@ -17,7 +17,6 @@
     <Compile Include="VersionSet.fs" />
     <Compile Include="Manifest.fs" />
     <Compile Include="Compaction.fs" />
-    <Compile Include="BlockCache.fs" />
     <Compile Include="StorageEngine.fs" />
     <Compile Include="Transactions.fs" />
     <Compile Include="Ast.fs" />
@@ -30,7 +29,6 @@
     <Compile Include="Ops.fs" />
     <Compile Include="ExecContext.fs" />
     <Compile Include="Planner.fs" />
-    <Compile Include="DmlOps.fs" />
     <Compile Include="Engine.fs" />
     <Compile Include="Database.fs" />
   </ItemGroup>

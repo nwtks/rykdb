@@ -57,7 +57,6 @@ flowchart TB
         VS["VersionSet.fs"]
         MF["Manifest.fs"]
         CO["Compaction.fs"]
-        BC["BlockCache.fs"]
         WAL["Wal.fs"]
         SER["Serialization.fs<br/>順序保持符号化"]
     end
@@ -89,7 +88,6 @@ flowchart TB
     SE --> VS
     SE --> MF
     SE --> CO
-    SE --> BC
     SE --> WAL
     SST --> SER
     MEM --> SER
@@ -118,9 +116,8 @@ flowchart TB
 | ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                          | §8                                                  |
 | memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                       | §8.1                                                |
 | SSTable    | ブロック + **restart 配列 + 接頭辞共有** + Bloom filter + Footer 80 バイト           | §8.2                                                |
-| キャッシュ | **LRU**（ブロック単位、不変実装）                                                    | §8.3                                                |
-| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                | §8.5–8.6                                            |
-| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                | §8.7                                                |
+| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                | §8.4–8.5                                            |
+| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                | §8.6                                                |
 | 並行制御   | **ロックレス**: 不変ハンドル + **MVCC（Snapshot Isolation）** + first-committer-wins | §7                                                  |
 | キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                               | §4                                                  |
 | 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                            | §6                                                  |
@@ -149,7 +146,7 @@ flowchart TB
 
 ### なぜ不変（immutable）か
 
-`StorageEngine` `Version` `Memtable` `Catalog` `BlockCache` のすべてが**不変レコード**で、操作は「新しい状態を返す」形。
+`StorageEngine` `Version` `Memtable` `Catalog` のすべてが**不変レコード**で、操作は「新しい状態を返す」形。
 これは 3つの要求を同時に満たすための選択。
 
 1. **読み取りが lock を取らない**。
@@ -181,7 +178,6 @@ flowchart TB
 | `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                         |
 | `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                       |
 | `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                                 |
-| `BlockCache.fs`    | `(fileNumber, blockId)` → ブロックの LRU キャッシュ                                               |
 | `StorageEngine.fs` | LSM ツリー 1 本の公開層（open / put / flush / scan / compact / close）                            |
 | `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                        |
 | `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                       |
@@ -202,7 +198,7 @@ flowchart TB
 
 ```
 Errors → Types → Serialization → Memtable → Wal → BloomFilter
-       → Sstable → VersionSet → Manifest → Compaction → BlockCache
+       → Sstable → VersionSet → Manifest → Compaction
        → StorageEngine → Transactions → Ast → Lexer → Parser
        → RowStore → Catalog → Schema → Eval → Ops → ExecContext
        → Planner → DmlOps → Engine → Database
@@ -689,7 +685,6 @@ COMMIT
 | 既定値                        | 値     |
 | ----------------------------- | ------ |
 | `DefaultMemLimitBytes`        | 64 MiB |
-| `DefaultCacheFiles`           | 32     |
 | `BloomFalsePositiveRate`      | 0.01   |
 | `Levels.Count` / `Levels.Max` | 7 / 6  |
 
@@ -761,12 +756,13 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | restart 間隔         | `RestartInterval = 16`                                                                                                                       |
 | チェックサム         | **FNV-1a 32bit**（CRC32C ではない。Footer は Footer より前の全バイトを対象）                                                                 |
 | Footer               | `magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8) bloomOff(8) bloomLen(8) metaOff(8) metaLen(8) entryCount(8) checksum(4)` = 80バイト |
-| `maxSeqNo`           | ファイル内の最大 SeqNo（記録用。GC の判定はエントリ単位。§8.7）                                                                              |
+| `maxSeqNo`           | ファイル内の最大 SeqNo（記録用。GC の判定はエントリ単位。§8.6）                                                                              |
 | Bloom filter         | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。読む側は `Sstable.mayContain`                             |
 | ポイント検索の順路   | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                  |
 
 ファイルは `Sstable.build` が組み立て、`Sstable.openTable` が読み出す。
-読み出しは `BlockCache`（ブロック番号 → 復号済みバイト列）を経由する。
+読み出しはファイル全体を読んで Footer / index / Bloom を解析する
+（プロセス内のブロックキャッシュは持たない。不変 engine は読み取り中に更新できないため）。
 
 走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
 `rangeScan` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ
@@ -774,18 +770,7 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 `Sstable.entries`（= `rangeScan` + `SstScan.toArray`）だけが全件を配列に実体化する。
 下限の適用は `Memtable.rangeScan` と同じく「読む側」が担い、merge 後に絞り直さない（§8.1）。
 
-### 8.3 BlockCache
-
-`(fileNumber, blockId) -> byte[]` の LRU。
-**不変実装**で、順序は「新しい順」の `list` として持ち、要素数は `Map` で数える。
-上限は**ブロック数**で数える（バイト数で数えると全ブロックを走査することになるため）。
-
-SSTable はブロック圧縮しない（設計方針）ので、読んだブロックをそのままメモリに載せる。
-
-- 既定の上限は `DefaultCacheFiles = 32`。カウントするのは**ブロック数**。
-- compaction で入力ファイルを消したら `invalidateFile` で該当ファイルのブロックを捨てる。
-
-### 8.4 VersionSet
+### 8.3 VersionSet
 
 `Version` は「レベルごとのファイル集合の**不変スナップショット**」。
 
@@ -812,7 +797,7 @@ SSTable はブロック圧縮しない（設計方針）ので、読んだブロ
 （最大 `MaxInputFiles = 32`）」+「次レベルでキー域が重なるファイル」として確定する。
 ポイント検索のファイル順は「新しいレベルのほうが先（L0 が最新）、同レベルではファイル番号の降順」（`filesForPointLookup`）。
 
-### 8.5 Manifest — 唯一 atomic 更新を要するファイル
+### 8.4 Manifest — 唯一 atomic 更新を要するファイル
 
 ```
 CURRENT           「1行の有効な MANIFEST 番号」
@@ -828,9 +813,9 @@ MANIFEST-000001   追記専用の VersionSet 定義
 `+1` すると別ファイルを指し、追記先がずれて復旧が空になる。
 
 復旧時は `applyAll` が `Version.empty` から VersionEdit 列を再適用して Version を作り直すため、`NextFileNumber` は 1 に戻る。
-`openDatabase` が `maxFileNumberOnDisk + 1` まで進め直すのはこのため（§8.4）。
+`openDatabase` が `maxFileNumberOnDisk + 1` まで進め直すのはこのため（§8.3）。
 
-### 8.6 WAL — 論理ログ
+### 8.5 WAL — 論理ログ
 
 ページイメージではなく更新内容を記録する。
 
@@ -857,7 +842,7 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 - flush / close の後は `rotate` する（旧ファイルを先に全部消してから、新番号で再作成）。
   **削除 → 作成の順**でないと、作ったばかりのファイルが削除対象に入る。
 
-### 8.7 Compaction — Leveled + GC
+### 8.6 Compaction — Leveled + GC
 
 ```
 L0  … flush の出力先。複数のファイルがキー域が重なる
@@ -869,7 +854,7 @@ L1〜 … 1ファイル = 1キー域で互いに重ならない（RocksDB/LevelD
 1. 過剰レベル `L` を選ぶ（`Compaction.pickCompaction`）
 2. `L` の全ファイル + `L+1` でキー域が重なるファイルを**入力**にする
 3. 入力をメモリで読み、k-way merge（各ファイルは既にソート済みなので O(N log k)）
-4. **同一キーの版を SeqNo が新しい 1件に畳む** → ここに墓碑も落ちる
+4. **同一キーの版を SeqNo が新しい 1件に畳む**（merge 後の並びは「キー昇順・同一キーは SeqNo 降順」なのでグループ先頭が最新版） → ここに墓碑も落ちる
 5. **GC**: 全 active snapshot の SeqNo より小さい版を落とす
 6. 出力ファイルを `L+1` に書き、MANIFEST に記録、入力ファイルを削除
 
@@ -1076,7 +1061,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 | --------------------- | ------------------------------------------------------- |
 | B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針 |
 | 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）             |
-| ページイメージ WAL    | 論理ログのほうが安全（§8.6）                            |
+| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                            |
 | ブロック圧縮 / 暗号化 | スコープ外                                              |
 | lock-free データ構造  | keyspace シャーディングで十分（§7.4）                   |
 

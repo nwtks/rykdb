@@ -49,13 +49,6 @@ let private lcol = Expr.Column { Qualifier = Some "l"; Name = "lid" }
 let private rcol = Expr.Column { Qualifier = Some "r"; Name = "rid" }
 
 [<Fact>]
-let ``Op: 配列の演算子は 1 行ずつ返す`` () =
-    let op: Op = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
-    let rows = ok (Op.toArray op)
-    Assert.Equal<int>(2, rows.Length)
-    Assert.Equal<int64>(1L, asInt rows.[0].[0])
-
-[<Fact>]
 let ``Op: 次の行を引くまで計算しない`` () =
     // 無限に伸びる Op でも 1 行しか引かずに終わる。
     let rec infinite (n: int) : Op =
@@ -69,20 +62,24 @@ let ``Op: 次の行を引くまで計算しない`` () =
     Assert.Equal<int64>(2L, asInt rows.[2].[0])
 
 [<Fact>]
-let ``Op: 大きな Op でも take は早期に打ち切る`` () =
-    // 1000 万行の Op を遅延評価で作る。Step の tail を先に評価すると
-    // 1000 万個が先に出来上がるので、Compute で 1 行ずつ生成する。
-    let rec counter (n: int) : Op =
-        Op.Compute(fun () ->
-            if n >= 10_000_000 then
-                ret None
-            else
-                ret (Some(row [ SqlValue.Int(int64 n) ], counter (n + 1))))
+let ``Op: 配列の演算子は 1 行ずつ返す`` () =
+    let op: Op = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
+    let rows = ok (Op.toArray op)
+    Assert.Equal<int>(2, rows.Length)
+    Assert.Equal<int64>(1L, asInt rows.[0].[0])
 
-    let rows = ok (Op.toArray (Op.take 3 (counter 0)))
-    Assert.Equal<int>(3, rows.Length)
-    Assert.Equal<int64>(0L, asInt rows.[0].[0])
-    Assert.Equal<int64>(2L, asInt rows.[2].[0])
+[<Fact>]
+let ``末尾再帰: Op.ofArray を 20 万行組み立ててもスタックを食わない`` () =
+    // 「let rest = rowsFrom (i + 1) を先に評価する」実装だとコンストラクト時に
+    // 行数ぶんのスタックを積み、実測 約 13 万段（Debug）で Stack overflow になる。
+    // Compute ラップで「次を要求されてから 1 行だけ」作ることを深い入力で検証する。
+    let rows = Array.init 200_000 (fun i -> [| SqlValue.Int(int64 i) |])
+    let op = Op.ofArray rows
+    let got = ok (Op.toArray op)
+
+    Assert.Equal<int>(200_000, got.Length)
+    Assert.Equal<int64>(0L, (got.[0].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L))
+    Assert.Equal<int64>(199_999L, (got.[got.Length - 1].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L))
 
 [<Fact>]
 let ``Op: filter と skip`` () =
@@ -101,6 +98,22 @@ let ``Op: filter と skip`` () =
     let rows = ok (Op.toArray op)
     Assert.Equal<int>(1, rows.Length)
     Assert.Equal<int64>(4L, asInt rows.[0].[0])
+
+[<Fact>]
+let ``Op: 大きな Op でも take は早期に打ち切る`` () =
+    // 1000 万行の Op を遅延評価で作る。Step の tail を先に評価すると
+    // 1000 万個が先に出来上がるので、Compute で 1 行ずつ生成する。
+    let rec counter (n: int) : Op =
+        Op.Compute(fun () ->
+            if n >= 10_000_000 then
+                ret None
+            else
+                ret (Some(row [ SqlValue.Int(int64 n) ], counter (n + 1))))
+
+    let rows = ok (Op.toArray (Op.take 3 (counter 0)))
+    Assert.Equal<int>(3, rows.Length)
+    Assert.Equal<int64>(0L, asInt rows.[0].[0])
+    Assert.Equal<int64>(2L, asInt rows.[2].[0])
 
 [<Fact>]
 let ``sortBy: 昇順と降順`` () =
@@ -285,16 +298,3 @@ let ``結合: LEFT JOIN は一致が無ければ NULL`` () =
 
     // 2 は一致
     Assert.Equal<int64>(2L, asInt rows.[1].[1])
-
-[<Fact>]
-let ``末尾再帰: Op.ofArray を 20 万行組み立ててもスタックを食わない`` () =
-    // 「let rest = rowsFrom (i + 1) を先に評価する」実装だとコンストラクト時に
-    // 行数ぶんのスタックを積み、実測 約 13 万段（Debug）で Stack overflow になる。
-    // Compute ラップで「次を要求されてから 1 行だけ」作ることを深い入力で検証する。
-    let rows = Array.init 200_000 (fun i -> [| SqlValue.Int(int64 i) |])
-    let op = Op.ofArray rows
-    let got = ok (Op.toArray op)
-
-    Assert.Equal<int>(200_000, got.Length)
-    Assert.Equal<int64>(0L, (got.[0].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L))
-    Assert.Equal<int64>(199_999L, (got.[got.Length - 1].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L))

@@ -39,11 +39,6 @@ module internal BloomFilter =
                 yield int ((h1 + uint64 i * step) % n)
         |]
 
-    /// キーが含まれ得るなら true（false positive を許す）。
-    let mightContain (filter: BloomFilter) (keyHash: uint64) =
-        positionsFor filter.Bits.Length filter.HashCount keyHash
-        |> Array.forall (fun pos -> filter.Bits.[pos / 8] &&& (1uy <<< pos % 8) <> 0uy)
-
     /// キー列から filter を構築する（ハッシュはキーから導出）。
     let ofKeys (keys: byte array seq) (expectedCount: int) (falsePositiveRate: float) =
         let bitsFor (expectedCount: int) (falsePositiveRate: float) =
@@ -80,6 +75,11 @@ module internal BloomFilter =
         keys
         |> Seq.map (Hashing.hashBytes >> Hashing.mix)
         |> ofHashes expectedCount falsePositiveRate
+
+    /// キーが含まれ得るなら true（false positive を許す）。
+    let mightContain (filter: BloomFilter) (keyHash: uint64) =
+        positionsFor filter.Bits.Length filter.HashCount keyHash
+        |> Array.forall (fun pos -> filter.Bits.[pos / 8] &&& (1uy <<< pos % 8) <> 0uy)
 
     let serialize (filter: BloomFilter) =
         Writer.build

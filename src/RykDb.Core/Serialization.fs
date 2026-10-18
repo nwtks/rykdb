@@ -88,8 +88,8 @@ module internal Cursor =
             End = offset + length
         }
 
-    let remaining (c: Cursor) = c.End - c.Pos
-    let atEnd (c: Cursor) = c.Pos >= c.End
+    let inline remaining (c: Cursor) = c.End - c.Pos
+    let inline atEnd (c: Cursor) = c.Pos >= c.End
 
 module internal Reader =
     let private eof msg = err (DbError.corruption msg)
@@ -105,6 +105,9 @@ module internal Reader =
             eof (sprintf "Reader: %d バイトを読み取れません（残り %d）" count (Cursor.remaining c))
         else
             Ok(Array.sub c.Data c.Pos count, { c with Pos = c.Pos + count })
+
+    let readBool (c: Cursor) =
+        readByte c |> Result.map (fun (b, c) -> b <> 0uy, c)
 
     /// 符号なし LEB128 を読む。
     let readVarint (c: Cursor) =
@@ -130,21 +133,6 @@ module internal Reader =
             let v = bs |> Array.mapi (fun i b -> int64 b <<< 8 * i) |> Array.sum
             v, c)
 
-    /// ビッグエンディアン 8バイトを読む（順序保持された整数の復元）。
-    let readInt64BE (c: Cursor) =
-        readBytes 8 c
-        |> Result.map (fun (bs, c) ->
-            let v = bs |> Array.fold (fun acc b -> acc <<< 8 ||| int64 b) 0L
-            v, c)
-
-    /// ビッグエンディアン 8バイト（符号なし）。
-    /// 順序保持された整数の復元。
-    let readUint64BE (c: Cursor) =
-        readBytes 8 c
-        |> Result.map (fun (bs, c) ->
-            let v = bs |> Array.fold (fun acc b -> acc <<< 8 ||| uint64 b) 0UL
-            v, c)
-
     /// リトルエンディアン 4バイト（符号なし）を読む。
     let readUInt32LE (c: Cursor) =
         readBytes 4 c
@@ -157,8 +145,13 @@ module internal Reader =
 
             v, c)
 
-    let readBool (c: Cursor) =
-        readByte c |> Result.map (fun (b, c) -> b <> 0uy, c)
+    /// ビッグエンディアン 8バイト（符号なし）。
+    /// 順序保持された整数の復元。
+    let readUint64BE (c: Cursor) =
+        readBytes 8 c
+        |> Result.map (fun (bs, c) ->
+            let v = bs |> Array.fold (fun acc b -> acc <<< 8 ||| uint64 b) 0UL
+            v, c)
 
     let readLengthPrefixed (c: Cursor) =
         readVarint c
@@ -303,15 +296,14 @@ module internal OrderPreserving =
 
         w
         |> Writer.writeByte (if negative then 0x00uy else 0x01uy)
-        |> Writer.writeBytes (Array.init 8 (fun i -> byte (mapInt64 exponentValue >>> 8 * (7 - i) &&& 0xFFuL)))
+        |> writeOrderedInt64 exponentValue
         |> Writer.writeBytes digitBytes
 
     let private readOrderedDecimal (c: Cursor) =
         result {
             let! sign, c = Reader.readByte c
-            let! expBytes, c = Reader.readBytes 8 c
+            let! raw, c = Reader.readUint64BE c
             let! digitBytes, c = Reader.readBytes DecimalMaxDigits c
-            let raw = expBytes |> Array.fold (fun (acc: uint64) b -> acc <<< 8 ||| uint64 b) 0UL
             let negative = sign = 0uy
             let stored = unmapInt64 raw
             let exponent = if negative then -stored else stored
@@ -415,7 +407,7 @@ module internal OrderPreserving =
                     match Reader.readByte c with
                     | Error e -> Error e
                     | Ok(EscapeMarker, c) -> unescape c (Terminator :: acc)
-                    | Ok(_, c) -> finish c
+                    | Ok(_, _) -> finish c
 
             unescape c []
 
@@ -431,8 +423,8 @@ module internal OrderPreserving =
                 let! v, c = readOrderedInt64 c
                 return! finish (SqlValue.Int v) c
             | Tag.Real ->
-                let! m, c = Reader.readInt64BE c
-                return! finish (unmapDouble m |> SqlValue.normalizeFloat |> SqlValue.Real) c
+                let! m, c = Reader.readUint64BE c
+                return! finish (unmapDouble (int64 m) |> SqlValue.normalizeFloat |> SqlValue.Real) c
             | Tag.Decimal ->
                 let! v, c = readOrderedDecimal c
                 return! finish (SqlValue.Decimal v) c

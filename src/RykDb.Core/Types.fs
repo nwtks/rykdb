@@ -18,10 +18,6 @@ module internal Bytes =
         let at (i: int) = uint32 data.[offset + i]
         at 0 ||| (at 1 <<< 8) ||| (at 2 <<< 16) ||| (at 3 <<< 24)
 
-    /// readLE32 の 64bit 版。
-    let readLE64 (data: byte array) (offset: int) =
-        int64 (readLE32 data offset) ||| (int64 (readLE32 data (offset + 4)) <<< 32)
-
 /// 実行時の値。
 /// NULL は他のすべての型と区別できる特別なケースとして持つ。
 [<RequireQualifiedAccess>]
@@ -73,20 +69,6 @@ module SqlLiteral =
         | SqlValue.Decimal d -> d.ToString System.Globalization.CultureInfo.InvariantCulture
         | SqlValue.Uuid g -> g.ToString("D", System.Globalization.CultureInfo.InvariantCulture)
 
-/// サポートする SQL の型。
-[<RequireQualifiedAccess>]
-type internal DataType =
-    | Null
-    | Boolean
-    | Integer
-    | Real
-    | Text
-    | Blob
-    | Date
-    | Timestamp
-    | Decimal
-    | Uuid
-
 /// SQL の 3値論理。
 /// 比較結果は TRUE / FALSE だけでなく UNKNOWN を持つ。
 [<RequireQualifiedAccess>]
@@ -115,6 +97,20 @@ module internal TruthValue =
             TruthValue.Unknown
         else
             TruthValue.False
+
+/// サポートする SQL の型。
+[<RequireQualifiedAccess>]
+type internal DataType =
+    | Null
+    | Boolean
+    | Integer
+    | Real
+    | Text
+    | Blob
+    | Date
+    | Timestamp
+    | Decimal
+    | Uuid
 
 module internal DataType =
     /// SQL の照合順序における型の順位。
@@ -197,13 +193,6 @@ module internal SqlValue =
         | SqlValue.Real f -> Some(decimal f)
         | SqlValue.Decimal d -> Some d
         | _ -> None
-
-    /// decimal に変換できる値か。
-    /// NaN と ±Infinity は false。
-    let private isDecimalRepresentable v =
-        match v with
-        | SqlValue.Real f -> not (System.Double.IsNaN f || System.Double.IsInfinity f)
-        | _ -> true
 
     let inline asInt64 v =
         match v with
@@ -304,6 +293,11 @@ module internal SqlValue =
                 sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
                 |> DbError.typeError
             )
+
+        let isDecimalRepresentable v =
+            match v with
+            | SqlValue.Real f -> not (System.Double.IsNaN f || System.Double.IsInfinity f)
+            | _ -> true
 
         let asBoolean (v: SqlValue) =
             match v with

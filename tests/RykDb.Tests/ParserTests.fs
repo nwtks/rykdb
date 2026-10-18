@@ -112,38 +112,8 @@ let private repeatedWhere (sql: string) =
     [ 1..5 ] |> List.map (fun _ -> whereTextOf sql) |> List.distinct
 
 // ---------------------------------------------------------------------------
-// パーサ
+// パーサ: 式（parseExpr）
 // ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``パーサ: SELECT 各種`` () =
-    let sel = parseSelectOk "SELECT * FROM users"
-
-    Assert.Equal("users", (sel.From |> Option.map (fun t -> t.Name) |> Option.defaultValue ""))
-    Assert.Equal(1, sel.Items.Length)
-    Assert.Empty(sel.Joins)
-
-    let sel2 =
-        parseSelectOk
-            "SELECT DISTINCT a, b AS bb, COUNT(*) FROM t WHERE a > 1 GROUP BY a HAVING COUNT(*) > 2 ORDER BY a DESC LIMIT 10 OFFSET 5"
-
-    Assert.True(sel2.Distinct)
-    Assert.Equal(3, sel2.Items.Length)
-    Assert.Equal(1, sel2.GroupBy.Length)
-    Assert.True(sel2.Having.IsSome)
-    Assert.Equal(1, sel2.OrderBy.Length)
-    Assert.Equal<SortDirection>(SortDirection.Descending, sel2.OrderBy.[0].Direction)
-    Assert.True(sel2.Limit.IsSome)
-    Assert.True(sel2.Offset.IsSome)
-
-[<Fact>]
-let ``パーサ: JOIN`` () =
-    let sel =
-        parseSelectOk "SELECT * FROM a INNER JOIN b ON a.id = b.id LEFT JOIN c ON c.id = a.id"
-
-    Assert.Equal(2, sel.Joins.Length)
-    Assert.Equal<JoinKind>(JoinKind.Inner, sel.Joins.[0].Kind)
-    Assert.Equal<JoinKind>(JoinKind.Left, sel.Joins.[1].Kind)
 
 [<Fact>]
 let ``パーサ: 演算子優先順位`` () =
@@ -193,62 +163,6 @@ let ``パーサ: IS NULL / IN / LIKE / NOT`` () =
     | other -> Assert.Fail("NOT ではない")
 
 [<Fact>]
-let ``パーサ: INSERT / UPDATE / DELETE`` () =
-    let ins = parseInsertOk "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')"
-    Assert.Equal(2, ins.Rows.Length)
-    Assert.Equal<string list option>(Some [ "a"; "b" ], ins.Columns)
-
-    let ins2 = parseInsertOk "INSERT INTO t VALUES (1)"
-    Assert.True(ins2.Columns.IsNone)
-
-    let upd = parseUpdateOk "UPDATE t SET a = 1, b = 2 WHERE id = 3"
-    Assert.Equal(2, upd.Assignments.Length)
-    Assert.True(upd.Where.IsSome)
-
-    let del = parseDeleteOk "DELETE FROM t WHERE id = 1"
-    Assert.True(del.Where.IsSome)
-
-[<Fact>]
-let ``パーサ: CREATE TABLE / INDEX / DROP`` () =
-    let ct =
-        parseCreateTableOk
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER DEFAULT 0, UNIQUE(name, age))"
-
-    Assert.Equal("users", ct.Name)
-    Assert.Equal(3, ct.Columns.Length)
-    Assert.Equal<DataType>(DataType.Integer, ct.Columns.[0].DataType)
-    Assert.True(ct.Columns.[0].Constraint.PrimaryKey)
-    Assert.True(ct.Columns.[1].Constraint.NotNull)
-    Assert.True(ct.Columns.[2].Constraint.Default.IsSome)
-    Assert.Equal(1, ct.Constraints.Length)
-
-    let ci = parseCreateIndexOk "CREATE UNIQUE INDEX idx ON users (name)"
-    Assert.Equal("idx", ci.Name)
-    Assert.Equal("users", ci.Table)
-    Assert.Equal<string list>([ "name" ], ci.Columns)
-    Assert.True(ci.Unique)
-
-    let (n, ifEx) = parseDropTableOk "DROP TABLE IF EXISTS users"
-    Assert.Equal("users", n)
-    Assert.True(ifEx)
-
-[<Fact>]
-let ``パーサ: トランザクション制御`` () =
-    // xUnit の IsType は F# のオーバーロード解決が噛み合わないため、
-    // パターンマッチで検証する。
-    match parseOneOk "BEGIN" with
-    | Statement.Begin -> ()
-    | other -> Assert.Fail(sprintf "BEGIN ではない: %A" other)
-
-    match parseOneOk "COMMIT" with
-    | Statement.Commit -> ()
-    | other -> Assert.Fail(sprintf "COMMIT ではない: %A" other)
-
-    match parseOneOk "ROLLBACK" with
-    | Statement.Rollback -> ()
-    | other -> Assert.Fail(sprintf "ROLLBACK ではない: %A" other)
-
-[<Fact>]
 let ``パーサ: CASE と関数`` () =
     match (parseSelectOk "SELECT CASE WHEN a = 1 THEN 'one' ELSE 'other' END FROM t").Items.[0].Expression with
     | Expr.Case(_, Some _) -> ()
@@ -284,22 +198,6 @@ let ``パーサ: リテラルとコメント`` () =
     match whereOf "SELECT * FROM t WHERE a = -1" with
     | Expr.Binary(BinaryOp.Eq, _, Expr.Unary(UnaryOp.Neg, _)) -> ()
     | other -> Assert.Fail(sprintf "負数が誤り: %s" (Expr.toDisplayString other))
-
-[<Fact>]
-let ``パーサ: 複数文`` () =
-    match ok (Parser.parseStatements "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);") with
-    | [ Statement.CreateTable _; Statement.Insert _ ] -> ()
-    | other -> Assert.Fail(sprintf "想定外の文列: %A" other)
-
-[<Fact>]
-let ``パーサ: 構文エラーは位置つき DbError`` () =
-    match Parser.parseStatement "SELECT * FROM" with
-    | Error e ->
-        Assert.Equal<ErrorKind>(ErrorKind.SyntaxError, e.Kind)
-        Assert.True(e.Position.IsSome)
-    | Ok _ -> Assert.Fail("エラーになるべき")
-
-    expectErrorKind ErrorKind.SyntaxError "エラーになるべき" (Parser.parseStatement "SELCT * FROM t")
 
 // ---------------------------------------------------------------------------
 // 末尾再帰の検証（深い入力でスタックを食わないこと）
@@ -343,6 +241,10 @@ let ``末尾再帰: 上限内の演算子チェーンは受理される`` () =
 
     for _ in 1..3 do
         Assert.True((parseSelectOk sql).Where.IsSome)
+
+// ---------------------------------------------------------------------------
+// hoist / CPS 化した式構文規則の検証
+// ---------------------------------------------------------------------------
 
 [<Theory>]
 // hoist した比較演算子の分岐を全部なぞる（判定を Option にして「関数を作る」束縛を避けていること）。
@@ -474,25 +376,18 @@ let ``CPS: 継続は 1 回だけ呼ばれ、同じ式が連続しても影響さ
     Assert.Single<string>(rendered) |> ignore
     Assert.Equal<string>("(((a BETWEEN 1 AND 9) AND (b IN (1, 2))) OR (c IS NULL))", rendered.[0])
 
-[<Fact>]
-let ``末尾再帰: 大量の文を分解できる`` () =
-    let n = 100_000
-
-    let sql =
-        String.Join(";", Array.init n (fun i -> sprintf "SELECT a FROM t%d WHERE a = %d" (i % 7) i))
-
-    Assert.Equal(n, (ok (Parser.parseStatements sql)).Length)
+// ---------------------------------------------------------------------------
+// パーサ: JOIN（parseJoins）
+// ---------------------------------------------------------------------------
 
 [<Fact>]
-let ``末尾再帰: 大量の SET 句がパースできる`` () =
-    // UPDATE の SET 連なりは `expectSymbol >>= … parseExpr >>= fun … -> assigns …`
-    // で列の数だけフレームが積まれていた。`match` で受けて末尾再帰にしてある。
-    let n = 200_000
+let ``パーサ: JOIN`` () =
+    let sel =
+        parseSelectOk "SELECT * FROM a INNER JOIN b ON a.id = b.id LEFT JOIN c ON c.id = a.id"
 
-    let body = Array.init n (fun i -> sprintf "c%d = %d" i i) |> String.concat ", "
-
-    let upd = parseUpdateOk (sprintf "UPDATE t SET %s" body)
-    Assert.Equal(n, upd.Assignments.Length)
+    Assert.Equal(2, sel.Joins.Length)
+    Assert.Equal<JoinKind>(JoinKind.Inner, sel.Joins.[0].Kind)
+    Assert.Equal<JoinKind>(JoinKind.Left, sel.Joins.[1].Kind)
 
 [<Fact>]
 let ``末尾再帰: 大量の JOIN 句がパースできる`` () =
@@ -507,3 +402,120 @@ let ``末尾再帰: 大量の JOIN 句がパースできる`` () =
 
     let sel = parseSelectOk (sprintf "SELECT * FROM t0 %s" joins)
     Assert.Equal(n, sel.Joins.Length)
+
+// ---------------------------------------------------------------------------
+// パーサ: 文（parseSelect → parseInsert → parseUpdate → parseCreateTable → parseStatements → parseStatement）
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``パーサ: SELECT 各種`` () =
+    let sel = parseSelectOk "SELECT * FROM users"
+
+    Assert.Equal("users", (sel.From |> Option.map (fun t -> t.Name) |> Option.defaultValue ""))
+    Assert.Equal(1, sel.Items.Length)
+    Assert.Empty(sel.Joins)
+
+    let sel2 =
+        parseSelectOk
+            "SELECT DISTINCT a, b AS bb, COUNT(*) FROM t WHERE a > 1 GROUP BY a HAVING COUNT(*) > 2 ORDER BY a DESC LIMIT 10 OFFSET 5"
+
+    Assert.True(sel2.Distinct)
+    Assert.Equal(3, sel2.Items.Length)
+    Assert.Equal(1, sel2.GroupBy.Length)
+    Assert.True(sel2.Having.IsSome)
+    Assert.Equal(1, sel2.OrderBy.Length)
+    Assert.Equal<SortDirection>(SortDirection.Descending, sel2.OrderBy.[0].Direction)
+    Assert.True(sel2.Limit.IsSome)
+    Assert.True(sel2.Offset.IsSome)
+
+[<Fact>]
+let ``パーサ: INSERT / UPDATE / DELETE`` () =
+    let ins = parseInsertOk "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')"
+    Assert.Equal(2, ins.Rows.Length)
+    Assert.Equal<string list option>(Some [ "a"; "b" ], ins.Columns)
+
+    let ins2 = parseInsertOk "INSERT INTO t VALUES (1)"
+    Assert.True(ins2.Columns.IsNone)
+
+    let upd = parseUpdateOk "UPDATE t SET a = 1, b = 2 WHERE id = 3"
+    Assert.Equal(2, upd.Assignments.Length)
+    Assert.True(upd.Where.IsSome)
+
+    let del = parseDeleteOk "DELETE FROM t WHERE id = 1"
+    Assert.True(del.Where.IsSome)
+
+[<Fact>]
+let ``末尾再帰: 大量の SET 句がパースできる`` () =
+    // UPDATE の SET 連なりは `expectSymbol >>= … parseExpr >>= fun … -> assigns …`
+    // で列の数だけフレームが積まれていた。`match` で受けて末尾再帰にしてある。
+    let n = 200_000
+
+    let body = Array.init n (fun i -> sprintf "c%d = %d" i i) |> String.concat ", "
+
+    let upd = parseUpdateOk (sprintf "UPDATE t SET %s" body)
+    Assert.Equal(n, upd.Assignments.Length)
+
+[<Fact>]
+let ``パーサ: CREATE TABLE / INDEX / DROP`` () =
+    let ct =
+        parseCreateTableOk
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER DEFAULT 0, UNIQUE(name, age))"
+
+    Assert.Equal("users", ct.Name)
+    Assert.Equal(3, ct.Columns.Length)
+    Assert.Equal<DataType>(DataType.Integer, ct.Columns.[0].DataType)
+    Assert.True(ct.Columns.[0].Constraint.PrimaryKey)
+    Assert.True(ct.Columns.[1].Constraint.NotNull)
+    Assert.True(ct.Columns.[2].Constraint.Default.IsSome)
+    Assert.Equal(1, ct.Constraints.Length)
+
+    let ci = parseCreateIndexOk "CREATE UNIQUE INDEX idx ON users (name)"
+    Assert.Equal("idx", ci.Name)
+    Assert.Equal("users", ci.Table)
+    Assert.Equal<string list>([ "name" ], ci.Columns)
+    Assert.True(ci.Unique)
+
+    let (n, ifEx) = parseDropTableOk "DROP TABLE IF EXISTS users"
+    Assert.Equal("users", n)
+    Assert.True(ifEx)
+
+[<Fact>]
+let ``パーサ: 複数文`` () =
+    match ok (Parser.parseStatements "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);") with
+    | [ Statement.CreateTable _; Statement.Insert _ ] -> ()
+    | other -> Assert.Fail(sprintf "想定外の文列: %A" other)
+
+[<Fact>]
+let ``末尾再帰: 大量の文を分解できる`` () =
+    let n = 100_000
+
+    let sql =
+        String.Join(";", Array.init n (fun i -> sprintf "SELECT a FROM t%d WHERE a = %d" (i % 7) i))
+
+    Assert.Equal(n, (ok (Parser.parseStatements sql)).Length)
+
+[<Fact>]
+let ``パーサ: トランザクション制御`` () =
+    // xUnit の IsType は F# のオーバーロード解決が噛み合わないため、
+    // パターンマッチで検証する。
+    match parseOneOk "BEGIN" with
+    | Statement.Begin -> ()
+    | other -> Assert.Fail(sprintf "BEGIN ではない: %A" other)
+
+    match parseOneOk "COMMIT" with
+    | Statement.Commit -> ()
+    | other -> Assert.Fail(sprintf "COMMIT ではない: %A" other)
+
+    match parseOneOk "ROLLBACK" with
+    | Statement.Rollback -> ()
+    | other -> Assert.Fail(sprintf "ROLLBACK ではない: %A" other)
+
+[<Fact>]
+let ``パーサ: 構文エラーは位置つき DbError`` () =
+    match Parser.parseStatement "SELECT * FROM" with
+    | Error e ->
+        Assert.Equal<ErrorKind>(ErrorKind.SyntaxError, e.Kind)
+        Assert.True(e.Position.IsSome)
+    | Ok _ -> Assert.Fail("エラーになるべき")
+
+    expectErrorKind ErrorKind.SyntaxError "エラーになるべき" (Parser.parseStatement "SELCT * FROM t")

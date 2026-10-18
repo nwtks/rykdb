@@ -13,6 +13,29 @@ let private name n = Expr.Name n
 let private unary op e = Expr.Unary(op, e)
 let private binary op a b = Expr.Binary(op, a, b)
 
+[<Fact>]
+let ``Ast: children は直接の子ノードを返す`` () =
+    let e = Expr.Binary(BinaryOp.Add, Expr.Name "a", Expr.Name "b")
+    let cs = Expr.children e
+    Assert.Equal(2, cs.Length)
+
+    // リーフは空
+    Assert.Empty(Expr.children (Expr.Name "x"))
+
+[<Fact>]
+let ``Ast: mapChildren は子を変換する`` () =
+    let e = Expr.Binary(BinaryOp.Add, Expr.Name "a", Expr.Name "b")
+    let e2 = Expr.mapChildren (fun _ -> Expr.Name "z") e
+
+    match e2 with
+    | Expr.Binary(_, Expr.Name "z", Expr.Name "z") -> ()
+    | other -> Assert.Fail(sprintf "mapChildren が想定外: %A" other)
+
+[<Fact>]
+let ``Ast: fold は全ノードを訪問する`` () =
+    let e = Expr.Binary(BinaryOp.Add, Expr.Name "a", Expr.Name "b")
+    let count = Expr.fold (fun acc _ -> acc + 1) 0 e
+    Assert.Equal(3, count)
 
 [<Fact>]
 let ``末尾再帰: AST の深い走査でスタックを食わない`` () =
@@ -32,6 +55,32 @@ let ``末尾再帰: AST の深い走査でスタックを食わない`` () =
     // toDisplayString（StringBuilder 蓄積版）
     let rendered = Expr.toDisplayString deep
     Assert.Equal(depth * 4 + 1, rendered.Length) // 1 段ごとに "(-" と ")" の 4 文字
+
+[<Fact>]
+let ``Ast: ColumnRefs が各ノードから列参照を集める`` () =
+    let c1 = column (Some "t") "a"
+    let c2 = column None "b"
+
+    // Binary / AggCall / FuncCall / IsNull を 1 つの式に混ぜる
+    let sample =
+        Expr.Binary(
+            BinaryOp.Add,
+            Expr.AggCall(AggFunc.Max, false, c1),
+            Expr.FuncCall("ABS", [ c2; Expr.IsNull(c1, false) ])
+        )
+
+    let got = Expr.columnRefs sample |> List.map (fun c -> c.Display) |> List.sort
+    Assert.Equal<string list>([ "b"; "t.a"; "t.a" ] |> List.sort, got)
+
+    // Case の中（WHEN 条件・THEN 本体・ELSE）も集める
+    let caseE =
+        Expr.Case([ (Expr.Binary(BinaryOp.Gt, column None "x", c1), column None "y") ], Some(column None "z"))
+
+    let caseRefs = Expr.columnRefs caseE |> List.map (fun c -> c.Display) |> List.sort
+    Assert.Equal<string list>([ "x"; "t.a"; "y"; "z" ] |> List.sort, caseRefs)
+
+    // 列参照のない式は空
+    Assert.Empty(Expr.columnRefs (Expr.Binary(BinaryOp.Add, name "a", literal (Literal.Int 1L))))
 
 [<Fact>]
 let ``末尾再帰: 集計呼び出しを含む深い AST も走査できる`` () =
@@ -63,7 +112,7 @@ let ``Ast: InList と Case の表示が壊れない（回帰）`` () =
     // 以前は WHEN / THEN / ELSE / END が出力されていなかった
     let caseE =
         Expr.Case(
-            [ (name "a", literal (Literal.Int 1L)); (name "b", literal (Literal.Int 2L)) ],
+            [ name "a", literal (Literal.Int 1L); name "b", literal (Literal.Int 2L) ],
             Some(literal (Literal.Int 3L))
         )
 
@@ -96,29 +145,3 @@ let ``Ast: その他の演算子の表示`` () =
     Assert.Equal<string>("(a LIKE 'x%')", Expr.toDisplayString (Expr.Like(a, literal (Literal.String "x%"), false)))
 
     Assert.Equal<string>("t.*", Expr.toDisplayString (Expr.QualifiedStar "t"))
-
-[<Fact>]
-let ``Ast: ColumnRefs が各ノードから列参照を集める`` () =
-    let c1 = column (Some "t") "a"
-    let c2 = column None "b"
-
-    // Binary / AggCall / FuncCall / IsNull を 1 つの式に混ぜる
-    let sample =
-        Expr.Binary(
-            BinaryOp.Add,
-            Expr.AggCall(AggFunc.Max, false, c1),
-            Expr.FuncCall("ABS", [ c2; Expr.IsNull(c1, false) ])
-        )
-
-    let got = Expr.columnRefs sample |> List.map (fun c -> c.Display) |> List.sort
-    Assert.Equal<string list>([ "b"; "t.a"; "t.a" ] |> List.sort, got)
-
-    // Case の中（WHEN 条件・THEN 本体・ELSE）も集める
-    let caseE =
-        Expr.Case([ (Expr.Binary(BinaryOp.Gt, column None "x", c1), column None "y") ], Some(column None "z"))
-
-    let caseRefs = Expr.columnRefs caseE |> List.map (fun c -> c.Display) |> List.sort
-    Assert.Equal<string list>([ "x"; "t.a"; "y"; "z" ] |> List.sort, caseRefs)
-
-    // 列参照のない式は空
-    Assert.Empty(Expr.columnRefs (Expr.Binary(BinaryOp.Add, name "a", literal (Literal.Int 1L))))

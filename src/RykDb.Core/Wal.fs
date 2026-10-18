@@ -88,66 +88,6 @@ module internal Wal =
             | _ -> return! err (sprintf "Wal: 不明なレコード種別 %d" (int tag) |> DbError.corruption)
         }
 
-    let private readRecords (data: byte array) =
-        /// フレーム 1件を読む（frame が書く [len:u32LE][checksum:u32LE][payload] の対）。
-        /// 短い・チェックサム不一致・payload 不正はすべて Error（呼び出し側で打ち切り）。
-        let readFrame (c: Cursor) =
-            result {
-                let! len, c1 = Reader.readUInt32LE c
-                let! sum, c2 = Reader.readUInt32LE c1
-                let n = int len
-
-                if n < 0 then
-                    return! err (DbError.corruption "Wal: フレーム長が不正です")
-                else
-                    let! payload, c3 = Reader.readBytes n c2
-
-                    if Hashing.checksum payload <> sum then
-                        return! err (DbError.corruption "Wal: チェックサム不一致")
-                    else
-                        let! r = decodePayload payload
-                        return r, c3
-            }
-
-        /// 壊れた/書きかけレコードで打ち切る（以降のバイトは捨てる）。
-        let rec readFrames (c: Cursor) (acc: WalRecord list) =
-            match readFrame c with
-            | Error _ -> List.rev acc
-            | Ok(r, c') -> readFrames c' (r :: acc)
-
-        readFrames (Cursor.create data) []
-
-    /// コミットされたトランザクションのエントリをまとめて返す。
-    /// 未コミット / 中断したものは捨てる。
-    let private committedEntries (records: WalRecord list) =
-        let rec selectCommitted (recs: WalRecord list) (pending: (uint64 * Entry array) list) (acc: Entry list) =
-            match recs with
-            | [] -> List.rev acc |> Array.ofList
-            | WalRecord.Batch(txnId, entries) :: rest -> selectCommitted rest ((txnId, entries) :: pending) acc
-            | WalRecord.Abort txnId :: rest ->
-                selectCommitted rest (pending |> List.filter (fun (t, _) -> t <> txnId)) acc
-            | WalRecord.Commit txnId :: rest ->
-                let mine =
-                    pending
-                    |> List.filter (fun (t, _) -> t = txnId)
-                    |> List.collect (fun (_, e) -> Array.toList e)
-                    |> List.rev
-
-                selectCommitted rest (pending |> List.filter (fun (t, _) -> t <> txnId)) (mine @ acc)
-            | WalRecord.Begin _ :: rest -> selectCommitted rest pending acc
-
-        selectCommitted records [] []
-
-    /// WAL ファイルを読み、コミット済みエントリを返す。
-    let read (dir: string) (fileNumber: int64) =
-        protect (fun () ->
-            let p = path dir fileNumber
-
-            if System.IO.File.Exists p then
-                System.IO.File.ReadAllBytes p |> readRecords |> committedEntries
-            else
-                [||])
-
     /// レコード列を追記する。
     /// Begin / Batch / Commit をまとめて 1回の書き込みで書き出すので、
     /// コミット済みトランザクションが中途半端にならない。
@@ -179,6 +119,60 @@ module internal Wal =
             { state with
                 Size = state.Size + bytes.Length
             })
+
+    /// WAL ファイルを読み、コミット済みエントリを返す。
+    let read (dir: string) (fileNumber: int64) =
+        let readFrame (c: Cursor) =
+            result {
+                let! len, c1 = Reader.readUInt32LE c
+                let! sum, c2 = Reader.readUInt32LE c1
+                let n = int len
+
+                if n < 0 then
+                    return! err (DbError.corruption "Wal: フレーム長が不正です")
+                else
+                    let! payload, c3 = Reader.readBytes n c2
+
+                    if Hashing.checksum payload <> sum then
+                        return! err (DbError.corruption "Wal: チェックサム不一致")
+                    else
+                        let! r = decodePayload payload
+                        return r, c3
+            }
+
+        /// 壊れた/書きかけレコードで打ち切る（以降のバイトは捨てる）。
+        let rec readFrames (c: Cursor) (acc: WalRecord list) =
+            match readFrame c with
+            | Error _ -> List.rev acc
+            | Ok(r, c') -> readFrames c' (r :: acc)
+
+        let readRecords (data: byte array) = readFrames (Cursor.create data) []
+
+        let rec selectCommitted (recs: WalRecord list) (pending: (uint64 * Entry array) list) (acc: Entry list) =
+            match recs with
+            | [] -> List.rev acc |> Array.ofList
+            | WalRecord.Batch(txnId, entries) :: rest -> selectCommitted rest ((txnId, entries) :: pending) acc
+            | WalRecord.Abort txnId :: rest ->
+                selectCommitted rest (pending |> List.filter (fun (t, _) -> t <> txnId)) acc
+            | WalRecord.Commit txnId :: rest ->
+                let mine =
+                    pending
+                    |> List.filter (fun (t, _) -> t = txnId)
+                    |> List.collect (fun (_, e) -> Array.toList e)
+                    |> List.rev
+
+                selectCommitted rest (pending |> List.filter (fun (t, _) -> t <> txnId)) (mine @ acc)
+            | WalRecord.Begin _ :: rest -> selectCommitted rest pending acc
+
+        let committedEntries (records: WalRecord list) = selectCommitted records [] []
+
+        protect (fun () ->
+            let p = path dir fileNumber
+
+            if System.IO.File.Exists p then
+                System.IO.File.ReadAllBytes p |> readRecords |> committedEntries
+            else
+                [||])
 
     /// ディレクトリ内の WAL ファイル名（復旧時に孤児を消すのに使う）。
     let walFiles (dir: string) =

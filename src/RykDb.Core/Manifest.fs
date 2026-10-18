@@ -15,6 +15,7 @@ module internal Manifest =
     let private manifestPath (dir: string) (fileNumber: int64) =
         System.IO.Path.Combine(dir, fileName fileNumber)
 
+    [<Literal>]
     let private currentFileName = "CURRENT"
 
     let private currentPath (dir: string) =
@@ -26,29 +27,25 @@ module internal Manifest =
             if not (System.IO.Directory.Exists dir) then
                 System.IO.Directory.CreateDirectory dir |> ignore)
 
-    let private writeCurrent (dir: string) (fileNumber: int64) =
-        protect (fun () ->
-            let tmp = currentPath dir + ".tmp"
-            System.IO.File.WriteAllText(tmp, fileName fileNumber + "\n")
-            System.IO.File.Move(tmp, currentPath dir, true))
-
-    let private readCurrent (dir: string) =
-        protect (fun () ->
-            if not (System.IO.File.Exists(currentPath dir)) then
-                None
-            else
-                let text = System.IO.File.ReadAllText(currentPath dir).Trim()
-
-                if text = "" then
+    /// データベースを開く（新規なら作成する）。
+    /// 返り値は (Version, 有効な manifest 番号)。
+    let openOrCreate (dir: string) =
+        let readCurrent (dir: string) =
+            protect (fun () ->
+                if not (System.IO.File.Exists(currentPath dir)) then
                     None
-                elif text.StartsWith "MANIFEST-" && text.EndsWith ".manifest" then
-                    Some(System.Int64.Parse(text.Substring(9, text.Length - 9 - ".manifest".Length)))
-                elif text.StartsWith "MANIFEST-" then
-                    Some(System.Int64.Parse(text.Substring 9))
                 else
-                    raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
+                    let text = System.IO.File.ReadAllText(currentPath dir).Trim()
 
-    let private readAll (dir: string) (fileNumber: int64) =
+                    if text = "" then
+                        None
+                    elif text.StartsWith "MANIFEST-" && text.EndsWith ".manifest" then
+                        Some(System.Int64.Parse(text.Substring(9, text.Length - 9 - ".manifest".Length)))
+                    elif text.StartsWith "MANIFEST-" then
+                        Some(System.Int64.Parse(text.Substring 9))
+                    else
+                        raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
+
         let readRecord (line: string) =
             try
                 System.Convert.FromBase64String line |> VersionEdit.decode
@@ -68,7 +65,7 @@ module internal Manifest =
                     | Ok edits -> decodeLines rest (edits @ acc)
                     | Error _ -> List.rev acc
 
-        let scan () =
+        let scan (dir: string) (fileNumber: int64) =
             let path = manifestPath dir fileNumber
 
             if System.IO.File.Exists path then
@@ -76,13 +73,16 @@ module internal Manifest =
             else
                 []
 
-        protect scan
+        let readAll (dir: string) (fileNumber: int64) = protect (fun () -> scan dir fileNumber)
 
-    /// データベースを開く（新規なら作成する）。
-    /// 返り値は (Version, 有効な manifest 番号)。
-    let openOrCreate (dir: string) =
         let applyAll (edits: VersionEdit list) (initial: Version) =
             List.fold VersionEdit.apply initial edits
+
+        let writeCurrent (dir: string) (fileNumber: int64) =
+            protect (fun () ->
+                let tmp = currentPath dir + ".tmp"
+                System.IO.File.WriteAllText(tmp, fileName fileNumber + "\n")
+                System.IO.File.Move(tmp, currentPath dir, true))
 
         result {
             let! _ = ensureDirectory dir

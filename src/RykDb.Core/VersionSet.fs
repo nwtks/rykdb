@@ -31,11 +31,11 @@ module internal Version =
         }
 
     /// 指定レベルのファイル列。
-    let filesAt (v: Version) (level: int) = v.Files.[level]
+    let inline filesAt (v: Version) (level: int) = v.Files.[level]
 
     /// ファイルを追加した新しい Version を返す。
     let addFile (f: FileMetaData) (v: Version) =
-        let levelFiles = v.Files.[f.Level]
+        let levelFiles = filesAt v f.Level
 
         let merged =
             Array.append [| f |] levelFiles
@@ -57,13 +57,6 @@ module internal Version =
 
         { v with Files = newFiles }
 
-    /// すべてのファイル（レベル昇順、同レベルはキー昇順）。
-    let allFiles (v: Version) =
-        v.Files |> Array.collect id |> Array.toList
-
-    /// レベルごとのファイル数。
-    let levelCounts (v: Version) = v.Files |> Array.map Array.length
-
     /// ポイントルックアップで consulted すべきファイル（新しい順）。
     let filesForPointLookup (v: Version) (key: byte array) =
         v.Files
@@ -73,6 +66,13 @@ module internal Version =
         |> Array.sortByDescending (fun (level, f) -> struct (-level, f.FileNumber))
         |> Array.map snd
         |> Array.toList
+
+    /// すべてのファイル（レベル昇順、同レベルはキー昇順）。
+    let allFiles (v: Version) =
+        v.Files |> Array.collect id |> Array.toList
+
+    /// レベルごとのファイル数。
+    let levelCounts (v: Version) = v.Files |> Array.map Array.length
 
 /// 1回のバージョン変更。
 type internal VersionEdit =

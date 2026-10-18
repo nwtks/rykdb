@@ -9,6 +9,18 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 [<Fact>]
+let ``テストデータ: 文字列に NUL や多バイト文字が含まれる`` () =
+    // escape 経路を通すため、NUL や制御文字、マルチバイト文字が必ず混ざっていること
+    let texts = Array.init 300 (fun _ -> randomText ())
+    let hasNul = texts |> Array.exists (fun s -> s.Contains(char 0))
+
+    let hasMultiByte =
+        texts |> Array.exists (fun s -> s |> Seq.exists (fun c -> int c > 0x7F))
+
+    Assert.True(hasNul, "NUL を含む文字列が生成されていません（escape 経路が未検証）")
+    Assert.True(hasMultiByte, "多バイト文字を含む文字列が生成されていません")
+
+[<Fact>]
 let ``テストデータ: 乱数生成器が実際に多様な値を返す`` () =
     let samples = Array.init 200 (fun _ -> randomValue ())
 
@@ -39,18 +51,6 @@ let ``テストデータ: 乱数生成器が実際に多様な値を返す`` () 
             "UUID"
         ] do
         Assert.True(Set.contains t typesCovered, sprintf "型 %s が生成されていません" t)
-
-[<Fact>]
-let ``テストデータ: 文字列に NUL や多バイト文字が含まれる`` () =
-    // escape 経路を通すため、NUL や制御文字、マルチバイト文字が必ず混ざっていること
-    let texts = Array.init 300 (fun _ -> randomText ())
-    let hasNul = texts |> Array.exists (fun s -> s.Contains(char 0))
-
-    let hasMultiByte =
-        texts |> Array.exists (fun s -> s |> Seq.exists (fun c -> int c > 0x7F))
-
-    Assert.True(hasNul, "NUL を含む文字列が生成されていません（escape 経路が未検証）")
-    Assert.True(hasMultiByte, "多バイト文字を含む文字列が生成されていません")
 
 // ---------------------------------------------------------------------------
 // 「テストが 1 つも走っていない」検出（FS0842 対策）
@@ -87,7 +87,7 @@ let ``テスト: 各テストモジュールが 1 つ以上の Fact を持つ`` 
             | _ -> None)
         |> Array.sort
 
-    Assert.True(modules.Length >= 24, sprintf "テストモジュールが %d 個しか見つかりません" modules.Length)
+    Assert.True(modules.Length >= 26, sprintf "テストモジュールが %d 個しか見つかりません" modules.Length)
 
     for moduleName in modules do
         let count = (namesOf moduleName).Length

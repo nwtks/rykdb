@@ -1,8 +1,8 @@
 // ===========================================================================
-// DmlOps.fs のテスト: INSERT / UPDATE / DELETE
+// Engine.fs のテスト: INSERT / UPDATE / DELETE
 // ===========================================================================
 
-module RykDb.DmlOpsTests
+module RykDb.EngineTests
 
 open Xunit
 open RykDb.Core
@@ -64,6 +64,46 @@ let private col (name: string) =
     Expr.Column { Qualifier = None; Name = name }
 
 [<Fact>]
+let ``末尾再帰: 多数の列を持つ INSERT / UPDATE が完了する`` () =
+    // 値リストの評価（gatherWith）は `evalOne … >>= fun … -> coerce …
+    // >>= fun … -> gather …` で列の数だけフレームが積まれていた
+    // （→ StackOverflow / exit 134）。`match` で受けて末尾再帰にしてある。
+    let cols = 2_000
+
+    let names = Array.init cols (fun i -> sprintf "c%d" i)
+
+    // 主キーは必須（無いと CREATE TABLE 自体がエラーになる）。
+    let decls =
+        names
+        |> Array.mapi (fun i c -> sprintf "%s INTEGER%s" c (if i = 0 then " PRIMARY KEY" else ""))
+        |> String.concat ", "
+
+    let colList = String.concat ", " names
+    let values = Array.init cols string |> String.concat ", "
+
+    withDb "tail-gather" (fun db0 ->
+        let db1 = exec db0 (sprintf "CREATE TABLE wide (%s)" decls)
+        let db2 = exec db1 (sprintf "INSERT INTO wide (%s) VALUES (%s)" colList values)
+
+        let inserted = query db2 "SELECT * FROM wide"
+        Assert.Equal(1, inserted.Rows.Length)
+        Assert.Equal(cols, inserted.Columns.Length)
+
+        // UPDATE も同じ経路（SET の数だけ gather が回る）。SET の列数は
+        // パーサの assigns にも効くので、こちらも末尾再帰にしてある。
+        // 主キー（c0）は書き換えない（主キー更新は既知の別件なので外す）。
+        let sets =
+            Array.init (cols - 1) (fun i -> sprintf "c%d = %d" (i + 1) (i + 2))
+            |> String.concat ", "
+
+        let db3 = exec db2 (sprintf "UPDATE wide SET %s" sets)
+        let updated = query db3 (sprintf "SELECT c0, c%d FROM wide" (cols - 1))
+
+        Assert.Equal(1, updated.Rows.Length)
+        Assert.Equal<int64>(0L, asInt updated.Rows.[0].[0])
+        Assert.Equal<int64>(int64 cols, asInt updated.Rows.[0].[1]))
+
+[<Fact>]
 let ``DML: INSERT は行を追加する`` () =
     withStore "ins" (fun store ->
         let mgr = TransactionManager.create ()
@@ -85,6 +125,40 @@ let ``DML: INSERT は行を追加する`` () =
         let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
         Assert.Equal<int>(1, rows.Length)
         Assert.Equal("alice", asText (rows.[0].[1])))
+
+[<Fact>]
+let ``DML: INSERT は列順を明示できる`` () =
+    withStore "inscols" (fun store ->
+        let mgr = TransactionManager.create ()
+        let (mgr, txn) = TransactionManager.beginTxn mgr
+
+        // name, id の順で渡す
+        let (txn, _) =
+            ok (
+                DmlOps.insert
+                    peopleSchema
+                    txn
+                    (Some [ "name"; "id" ])
+                    [ [ Expr.Literal(Literal.String "carol"); Expr.Literal(Literal.Int 7L) ] ]
+            )
+
+        commitInto store mgr txn |> ignore
+
+        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
+        Assert.Equal<int64>(7L, asInt rows.[0].[0])
+        Assert.Equal("carol", asText (rows.[0].[1]))
+        // 指定されなかった列は NULL
+        Assert.True(SqlValue.isNull rows.[0].[2]))
+
+[<Fact>]
+let ``DML: INSERT の列数不一致はエラー`` () =
+    withStore "insbad" (fun _ ->
+        let mgr = TransactionManager.create ()
+        let mgr, txn = TransactionManager.beginTxn mgr
+
+        let bad = [ [ Expr.Literal(Literal.Int 1L); Expr.Literal(Literal.String "x") ] ]
+
+        expectError "列数不一致が OK になっています" (DmlOps.insert peopleSchema txn (Some [ "id" ]) bad))
 
 [<Fact>]
 let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
@@ -144,77 +218,3 @@ let ``DML: DELETE は WHERE に合う行を消す`` () =
         let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
         Assert.Equal<int>(1, rows.Length)
         Assert.Equal("bob", asText (rows.[0].[1])))
-
-[<Fact>]
-let ``DML: INSERT は列順を明示できる`` () =
-    withStore "inscols" (fun store ->
-        let mgr = TransactionManager.create ()
-        let (mgr, txn) = TransactionManager.beginTxn mgr
-
-        // name, id の順で渡す
-        let (txn, _) =
-            ok (
-                DmlOps.insert
-                    peopleSchema
-                    txn
-                    (Some [ "name"; "id" ])
-                    [ [ Expr.Literal(Literal.String "carol"); Expr.Literal(Literal.Int 7L) ] ]
-            )
-
-        commitInto store mgr txn |> ignore
-
-        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
-        Assert.Equal<int64>(7L, asInt rows.[0].[0])
-        Assert.Equal("carol", asText (rows.[0].[1]))
-        // 指定されなかった列は NULL
-        Assert.True(SqlValue.isNull rows.[0].[2]))
-
-[<Fact>]
-let ``DML: INSERT の列数不一致はエラー`` () =
-    withStore "insbad" (fun _ ->
-        let mgr = TransactionManager.create ()
-        let (mgr, txn) = TransactionManager.beginTxn mgr
-
-        let bad = [ [ Expr.Literal(Literal.Int 1L); Expr.Literal(Literal.String "x") ] ]
-
-        expectError "列数不一致が OK になっています" (DmlOps.insert peopleSchema txn (Some [ "id" ]) bad))
-
-[<Fact>]
-let ``末尾再帰: 多数の列を持つ INSERT / UPDATE が完了する`` () =
-    // 値リストの評価（gatherWith）は `evalOne … >>= fun … -> coerce …
-    // >>= fun … -> gather …` で列の数だけフレームが積まれていた
-    // （→ StackOverflow / exit 134）。`match` で受けて末尾再帰にしてある。
-    let cols = 2_000
-
-    let names = Array.init cols (fun i -> sprintf "c%d" i)
-
-    // 主キーは必須（無いと CREATE TABLE 自体がエラーになる）。
-    let decls =
-        names
-        |> Array.mapi (fun i c -> sprintf "%s INTEGER%s" c (if i = 0 then " PRIMARY KEY" else ""))
-        |> String.concat ", "
-
-    let colList = String.concat ", " names
-    let values = Array.init cols string |> String.concat ", "
-
-    withDb "tail-gather" (fun db0 ->
-        let db1 = exec db0 (sprintf "CREATE TABLE wide (%s)" decls)
-        let db2 = exec db1 (sprintf "INSERT INTO wide (%s) VALUES (%s)" colList values)
-
-        let inserted = query db2 "SELECT * FROM wide"
-        Assert.Equal(1, inserted.Rows.Length)
-        Assert.Equal(cols, inserted.Columns.Length)
-
-        // UPDATE も同じ経路（SET の数だけ gather が回る）。SET の列数は
-        // パーサの assigns にも効くので、こちらも末尾再帰にしてある。
-        // 主キー（c0）は書き換えない（主キー更新は既知の別件なので外す）。
-        let sets =
-            Array.init (cols - 1) (fun i -> sprintf "c%d = %d" (i + 1) (i + 2))
-            |> String.concat ", "
-
-        let db3 = exec db2 (sprintf "UPDATE wide SET %s" sets)
-        let updated = query db3 (sprintf "SELECT c0, c%d FROM wide" (cols - 1))
-
-        Assert.Equal(1, updated.Rows.Length)
-        Assert.Equal<int64>(0L, asInt updated.Rows.[0].[0])
-        Assert.Equal<int64>(int64 cols, asInt updated.Rows.[0].[1]))

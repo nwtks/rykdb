@@ -26,7 +26,83 @@ let private seedLibrary (db: Database) =
     |> fun d -> exec d "CREATE INDEX idx_orders_pid ON orders (person_id)"
 
 // ---------------------------------------------------------------------------
-// DDL
+// トランザクション（Begin / Commit / Rollback）
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``Database: BEGIN/COMMIT でまとめて反映される`` () =
+    withDb "tx1" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = db1.Begin()
+        Assert.True(db2.InTransaction)
+
+        let db3, _ = ok (db2.Execute "INSERT INTO t VALUES (1, 1)")
+        let db4, _ = ok (db3.Execute "INSERT INTO t VALUES (2, 2)")
+        let db5 = ok (db4.Commit())
+
+        Assert.False(db5.InTransaction)
+        let _db11, res = ok (db5.Query "SELECT id FROM t")
+        Assert.Equal<int>(2, res.Rows.Length))
+
+// クラッシュ耐性（未 commit の transaction は WAL 再生後も残らない）
+
+[<Fact>]
+let ``E2E: commit してない transaction は残らない`` () =
+    withDir "crash2" (fun dir ->
+        let db = seedLibrary (ok (Database.openWith dir))
+
+        // 明示 transaction を開いて write してから捨てる。
+        let tx = db.Begin()
+        let tx2 = exec tx "INSERT INTO people VALUES (99, 'ghost', 1)"
+        Assert.True(tx2.InTransaction)
+
+        // `Close` しないので、幽霊行は WAL にしか無い。
+        let reopened = ok (Database.openWith dir)
+        let count = query reopened "SELECT COUNT(*) FROM people"
+        Assert.Equal<int64>(4L, asInt count.Rows.[0].[0])
+
+        ok (reopened.Close()))
+
+// MVCC 分離（Begin で固定した snapshot）
+
+[<Fact>]
+let ``E2E: 別ハンドルの書き込みは既存 transaction に見えない`` () =
+    withDir "mvcc" (fun dir ->
+        let db = seedLibrary (ok (Database.openWith dir))
+
+        // 読み取り専用 transaction を開く（`Active` だけ立てる）。
+        let reader = db.Begin()
+        Assert.True(reader.InTransaction)
+
+        // 別のハンドルから書き込む。
+        let writer = exec db "INSERT INTO people VALUES (5, 'erin', 41)"
+
+        // reader は commit していないので、新しい行は見えない。
+        let before = query reader "SELECT COUNT(*) FROM people"
+        Assert.Equal<int64>(4L, asInt before.Rows.[0].[0])
+
+        // 書き込んだ側からは見える。
+        let after = query writer "SELECT COUNT(*) FROM people"
+        Assert.Equal<int64>(5L, asInt after.Rows.[0].[0])
+
+        ok (writer.Close()))
+
+[<Fact>]
+let ``Database: ROLLBACK で元に戻る`` () =
+    withDb "tx2" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 1)")
+
+        let db3 = db2.Begin()
+        let db4, _ = ok (db3.Execute "INSERT INTO t VALUES (2, 2)")
+        let db5 = db4.Rollback()
+
+        Assert.False(db5.InTransaction)
+        let _db12, res = ok (db5.Query "SELECT id FROM t")
+        Assert.Equal<int>(1, res.Rows.Length))
+
+// ---------------------------------------------------------------------------
+// 実行（Execute）: DDL → DML → SELECT → エラー → 回帰 → E2E → 性能 → 末尾再帰
 // ---------------------------------------------------------------------------
 
 [<Fact>]
@@ -75,10 +151,6 @@ let ``Database: 存在しない列の索引はエラー`` () =
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
 
         expectError "存在しない列の CREATE INDEX が OK になっています" (db1.Execute "CREATE INDEX ix ON people (nope)"))
-
-// ---------------------------------------------------------------------------
-// DML
-// ---------------------------------------------------------------------------
 
 [<Fact>]
 let ``Database: INSERT した行が SELECT で見える`` () =
@@ -134,10 +206,6 @@ let ``Database: DELETE は WHERE に合う行を消す`` () =
         let _db4, res = ok (db3.Query "SELECT id FROM t")
         Assert.Equal<int>(1, res.Rows.Length)
         Assert.Equal<int64>(1L, asInt res.Rows.[0].[0]))
-
-// ---------------------------------------------------------------------------
-// SELECT
-// ---------------------------------------------------------------------------
 
 /// テスト用のテーブルを用意する。
 let private seeded (tag: string) (f: Database -> unit) =
@@ -442,39 +510,6 @@ let ``Database: LEFT JOIN の WHERE は null 供給側に効く`` () =
         Assert.Equal<int>(1, matched.Rows.Length)
         Assert.Equal<int64>(1L, asInt matched.Rows.[0].[0]))
 
-// ---------------------------------------------------------------------------
-// トランザクション
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``Database: BEGIN/COMMIT でまとめて反映される`` () =
-    withDb "tx1" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = db1.Begin()
-        Assert.True(db2.InTransaction)
-
-        let db3, _ = ok (db2.Execute "INSERT INTO t VALUES (1, 1)")
-        let db4, _ = ok (db3.Execute "INSERT INTO t VALUES (2, 2)")
-        let db5 = ok (db4.Commit())
-
-        Assert.False(db5.InTransaction)
-        let _db11, res = ok (db5.Query "SELECT id FROM t")
-        Assert.Equal<int>(2, res.Rows.Length))
-
-[<Fact>]
-let ``Database: ROLLBACK で元に戻る`` () =
-    withDb "tx2" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 1)")
-
-        let db3 = db2.Begin()
-        let db4, _ = ok (db3.Execute "INSERT INTO t VALUES (2, 2)")
-        let db5 = db4.Rollback()
-
-        Assert.False(db5.InTransaction)
-        let _db12, res = ok (db5.Query "SELECT id FROM t")
-        Assert.Equal<int>(1, res.Rows.Length))
-
 [<Fact>]
 let ``Database: 複数文を ; で渡せる`` () =
     withDb "tx3" (fun db0 ->
@@ -486,31 +521,6 @@ let ``Database: 複数文を ; で渡せる`` () =
         let db, _r = execRes db0 sql
         let _q, res = execRes db "SELECT id FROM t"
         Assert.Equal<int>(2, res.Rows.Length))
-
-// ---------------------------------------------------------------------------
-// 永続化
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``Database: 閉じて開き直すとデータが残る`` () =
-    withDir "i-reopen" (fun dir ->
-        let db0 = ok (Database.openWith dir)
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
-        let db2, _ins = ok (db1.Execute "INSERT INTO t VALUES (1, 'kept')")
-        ok (db2.Close())
-
-        // 開き直す
-        let db3 = ok (Database.openWith dir)
-        Assert.Equal<string list>([ "t" ], db3.TableNames())
-
-        let _db4, res = ok (db3.Query "SELECT v FROM t")
-        Assert.Equal<int>(1, res.Rows.Length)
-
-        let cell: SqlValue = res.Rows.[0].[0]
-        let actual: string = asText cell
-        Assert.Equal<string>("kept", actual)
-
-        ok (db3.Close()))
 
 // ---------------------------------------------------------------------------
 // エラー
@@ -668,92 +678,6 @@ let ``E2E: 一連の流れが誤差なく通る`` () =
         ok (db3.Close()))
 
 // ---------------------------------------------------------------------------
-// 再オープン（永続性）
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``E2E: プロセス再起動を模して Disk から復元できる`` () =
-    withDir "reopen" (fun dir ->
-        let db = seedLibrary (ok (Database.openWith dir))
-        ok (db.Close())
-
-        // 別ハンドルを「別プロセス」として扱う。
-        let reopened = ok (Database.openWith dir)
-
-        // `TableNames` の並び順は保証されない（keyspace の base64 順）のでソートする。
-        Assert.Equal<string list>([ "orders"; "people" ], reopened.TableNames() |> List.sort)
-
-        let people = query reopened "SELECT COUNT(*) FROM people"
-        Assert.Equal<int64>(4L, asInt people.Rows.[0].[0])
-
-        // 索引が「作られる前」に入った行も引ける（backfill の検証）
-        let byIndex = query reopened "SELECT id FROM people WHERE name = 'carol'"
-        Assert.Equal<int>(1, byIndex.Rows.Length)
-        Assert.Equal<int64>(3L, asInt byIndex.Rows.[0].[0])
-
-        ok (reopened.Close()))
-
-// ---------------------------------------------------------------------------
-// クラッシュ耐性（Close を呼ばずに再オープン → WAL 再生）
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``E2E: Close しなくても commit 済みの行は残る`` () =
-    withDir "crash" (fun dir ->
-        let _db = seedLibrary (ok (Database.openWith dir))
-        // Close を呼ばない（memtable は SSTable 未落下、残るのは WAL 再生のみ）。
-
-        let reopened = ok (Database.openWith dir)
-
-        let count = query reopened "SELECT COUNT(*) FROM people"
-        Assert.Equal<int64>(4L, asInt count.Rows.[0].[0])
-
-        ok (reopened.Close()))
-
-[<Fact>]
-let ``E2E: commit してない transaction は残らない`` () =
-    withDir "crash2" (fun dir ->
-        let db = seedLibrary (ok (Database.openWith dir))
-
-        // 明示 transaction を開いて write してから捨てる。
-        let tx = db.Begin()
-        let tx2 = exec tx "INSERT INTO people VALUES (99, 'ghost', 1)"
-        Assert.True(tx2.InTransaction)
-
-        // `Close` しないので、幽霊行は WAL にしか無い。
-        let reopened = ok (Database.openWith dir)
-        let count = query reopened "SELECT COUNT(*) FROM people"
-        Assert.Equal<int64>(4L, asInt count.Rows.[0].[0])
-
-        ok (reopened.Close()))
-
-// ---------------------------------------------------------------------------
-// MVCC 分離
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``E2E: 別ハンドルの書き込みは既存 transaction に見えない`` () =
-    withDir "mvcc" (fun dir ->
-        let db = seedLibrary (ok (Database.openWith dir))
-
-        // 読み取り専用 transaction を開く（`Active` だけ立てる）。
-        let reader = db.Begin()
-        Assert.True(reader.InTransaction)
-
-        // 別のハンドルから書き込む。
-        let writer = exec db "INSERT INTO people VALUES (5, 'erin', 41)"
-
-        // reader は commit していないので、新しい行は見えない。
-        let before = query reader "SELECT COUNT(*) FROM people"
-        Assert.Equal<int64>(4L, asInt before.Rows.[0].[0])
-
-        // 書き込んだ側からは見える。
-        let after = query writer "SELECT COUNT(*) FROM people"
-        Assert.Equal<int64>(5L, asInt after.Rows.[0].[0])
-
-        ok (writer.Close()))
-
-// ---------------------------------------------------------------------------
 // 性能スモーク
 // ---------------------------------------------------------------------------
 
@@ -828,3 +752,65 @@ let ``末尾再帰: 大量の文を 1 度の Execute で実行できる`` () =
         let sql = System.String.Join(";", Array.init n (fun _ -> "SELECT a FROM t"))
         let (next, _) = ok (db.Execute sql)
         Assert.Equal<string list>([ "t" ], next.TableNames()))
+
+// ---------------------------------------------------------------------------
+// 再オープン（openWith / Close）: 永続性とクラッシュ耐性
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``Database: 閉じて開き直すとデータが残る`` () =
+    withDir "i-reopen" (fun dir ->
+        let db0 = ok (Database.openWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+        let db2, _ins = ok (db1.Execute "INSERT INTO t VALUES (1, 'kept')")
+        ok (db2.Close())
+
+        // 開き直す
+        let db3 = ok (Database.openWith dir)
+        Assert.Equal<string list>([ "t" ], db3.TableNames())
+
+        let _db4, res = ok (db3.Query "SELECT v FROM t")
+        Assert.Equal<int>(1, res.Rows.Length)
+
+        let cell: SqlValue = res.Rows.[0].[0]
+        let actual: string = asText cell
+        Assert.Equal<string>("kept", actual)
+
+        ok (db3.Close()))
+
+[<Fact>]
+let ``E2E: プロセス再起動を模して Disk から復元できる`` () =
+    withDir "reopen" (fun dir ->
+        let db = seedLibrary (ok (Database.openWith dir))
+        ok (db.Close())
+
+        // 別ハンドルを「別プロセス」として扱う。
+        let reopened = ok (Database.openWith dir)
+
+        // `TableNames` の並び順は保証されない（keyspace の base64 順）のでソートする。
+        Assert.Equal<string list>([ "orders"; "people" ], reopened.TableNames() |> List.sort)
+
+        let people = query reopened "SELECT COUNT(*) FROM people"
+        Assert.Equal<int64>(4L, asInt people.Rows.[0].[0])
+
+        // 索引が「作られる前」に入った行も引ける（backfill の検証）
+        let byIndex = query reopened "SELECT id FROM people WHERE name = 'carol'"
+        Assert.Equal<int>(1, byIndex.Rows.Length)
+        Assert.Equal<int64>(3L, asInt byIndex.Rows.[0].[0])
+
+        ok (reopened.Close()))
+
+// クラッシュ耐性（Close を呼ばずに再オープン → WAL 再生）
+
+[<Fact>]
+let ``E2E: Close しなくても commit 済みの行は残る`` () =
+    withDir "crash" (fun dir ->
+        let _db = seedLibrary (ok (Database.openWith dir))
+        // Close を呼ばない（memtable は SSTable 未落下、残るのは WAL 再生のみ）。
+
+        let reopened = ok (Database.openWith dir)
+
+        let count = query reopened "SELECT COUNT(*) FROM people"
+        Assert.Equal<int64>(4L, asInt count.Rows.[0].[0])
+
+        ok (reopened.Close()))

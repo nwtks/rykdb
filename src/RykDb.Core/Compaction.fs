@@ -61,6 +61,10 @@ type internal CompactionResult =
     }
 
 module internal Compaction =
+    /// 不要な版を捨てる（GC）。
+    /// 入力は `SstEntry.mergeSorted` の出力 = 「キー昇順・同一キーは SeqNo 降順」なので、
+    /// 各キーグループの先頭が最新版。
+    /// グループの 2件目以降は active snapshot から見える版だけ残す。
     let private gc (activeSnapshot: uint64) (dropTombstones: bool) (items: SstEntry array) =
         let rec groupEnd (start: int) =
             if start + 1 >= items.Length then
@@ -70,29 +74,18 @@ module internal Compaction =
             else
                 start + 1
 
-        let rec pickMaxIdx (i: int) (best: int) (ge: int) =
-            if i >= ge then
-                best
-            elif items.[i].SeqNo > items.[best].SeqNo then
-                pickMaxIdx (i + 1) i ge
-            else
-                pickMaxIdx (i + 1) best ge
-
-        let pickMaxFrom (gs: int) (ge: int) = pickMaxIdx (gs + 1) gs ge
-
         let rec collectKept (acc: SstEntry list) (i: int) (dv: int) (dt: int) =
             if i >= items.Length then
                 List.rev acc, dv, dt
             else
                 let ge = groupEnd i
                 let count = ge - i
-                let best = pickMaxFrom i ge
-                let e = items.[best]
+                let e = items.[i]
 
                 let older =
                     [
-                        for j in i .. ge - 1 do
-                            if j <> best && items.[j].SeqNo >= activeSnapshot then
+                        for j in i + 1 .. ge - 1 do
+                            if items.[j].SeqNo >= activeSnapshot then
                                 yield items.[j]
                     ]
 
@@ -154,7 +147,7 @@ module internal Compaction =
 
     /// 1回の Leveled compaction を行う。
     /// readFile でファイルを読み、activeSnapshot を基準に GC してから書き出す。
-    /// MANIFEST の更新と実ファイルの削除は呼び出し側（StorageEngine）が行う。
+    /// MANIFEST の更新と実ファイルの削除は呼び出し側が行う。
     let compact
         (dir: string)
         (version: Version)
@@ -221,7 +214,7 @@ module internal Compaction =
                     info
                 )
             else
-                let chunks = SstEntry.splitInto (max 1 (options.MaxInputFiles * 4)) cleaned
+                let chunks = SstEntry.splitInto (options.MaxInputFiles * 4) cleaned
 
                 match writeChunks chunks outputLevel with
                 | Error e -> Error e

@@ -139,30 +139,9 @@ module internal ResultOps =
         | Ok v -> f v
         | Error e -> Error e
 
-    /// 最初の Ok の値を捨て、2つ目を返す。
-    let inline ( *> ) (x: Result<'a, DbError>) (y: Result<'b, DbError>) =
-        match x with
-        | Ok _ -> y
-        | Error e -> Error e
-
     let inline ret (x: 'a) = Ok x
 
     let inline err (e: DbError) = Error e
-
-    let inline ofOption onNone (o: 'a option) =
-        match o with
-        | Some v -> Ok v
-        | None -> Error onNone
-
-    let inline tryGet (r: Result<'a, DbError>) =
-        match r with
-        | Ok v -> Some v
-        | Error _ -> None
-
-    let inline valueOr (fallback: 'a) (r: Result<'a, DbError>) =
-        match r with
-        | Ok v -> v
-        | Error _ -> fallback
 
     /// Result の列を全て Ok になるまで畳み込む。
     /// 1つでも Error があればそれを返す。

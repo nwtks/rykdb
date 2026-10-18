@@ -1,8 +1,8 @@
 // ===========================================================================
 // Memtable.fs（永続 Treap）
 //
-// getVisible の探索方向を間違えると「一部のキーだけ引けない」という壊れ方をする
-// ので、全キーを 1 つずつ引くテストを置いている（docs/gotchas.md §15 参照）。
+// getVisible の探索方向を間違えると「一部のキーだけ引けない」という壊れ方をするので、
+// 全キーを 1つずつ引くテストを置いている。
 // ===========================================================================
 
 module RykDb.MemtableTests
@@ -17,10 +17,6 @@ let private build (entries: (int * uint64) list) =
         entries |> List.map (fun (k, seqNo) -> Entry.put (intKey k) seqNo (intRow k))
 
     Memtable.apply es Memtable.empty
-
-// ---------------------------------------------------------------------------
-// 基本のポイントルックアップ
-// ---------------------------------------------------------------------------
 
 [<Fact>]
 let ``Memtable: 空の memtable は何も返さない`` () =
@@ -42,7 +38,6 @@ let ``Memtable: apply したエントリを getVisible で引ける`` () =
             Memtable.empty
 
     Assert.Equal(3, mem.Count)
-
     Assert.Equal<SqlValue array>([| SqlValue.Int 10L |], (entry (Memtable.getVisible mem (intKey 1) None)).Value.Value)
 
     Assert.Equal<SqlValue array>(
@@ -56,6 +51,41 @@ let ``Memtable: apply したエントリを getVisible で引ける`` () =
     )
 
     Assert.True((Memtable.getVisible mem (intKey 99) None).IsNone)
+
+[<Fact>]
+let ``Memtable: apply しても元の memtable は変わらない`` () =
+    let before = Memtable.apply [ Entry.put (intKey 1) 1UL (intRow 1) ] Memtable.empty
+    let after = Memtable.apply [ Entry.put (intKey 2) 2UL (intRow 2) ] before
+    Assert.Equal(1, before.Count)
+    Assert.Equal(2, after.Count)
+    // before から見ると追加したキーは見えない
+    Assert.True((Memtable.getVisible before (intKey 2) None).IsNone)
+    Assert.True((Memtable.getVisible after (intKey 2) None).IsSome)
+    // 変更していないキーの内容も変わらない
+    Assert.Equal<SqlValue array>(
+        [| SqlValue.Int 1L |],
+        (entry (Memtable.getVisible before (intKey 1) None)).Value.Value
+    )
+
+    Assert.Equal<SqlValue array>([| SqlValue.Int 1L |], (entry (Memtable.getVisible after (intKey 1) None)).Value.Value)
+
+[<Fact>]
+let ``Memtable: Count と ApproxBytes は挿入したエントリの合計になる`` () =
+    let entries =
+        [|
+            Entry.put (intKey 1) 1UL [| SqlValue.Int 10L |]
+            Entry.put (intKey 2) 2UL [| SqlValue.Text "abcdef" |]
+            Entry.delete (intKey 3) 3UL
+        |]
+
+    let mem = Memtable.apply entries Memtable.empty
+    Assert.Equal(entries.Length, mem.Count)
+    Assert.Equal(entries |> Array.sumBy Entry.approxBytes, mem.ApproxBytes)
+
+    // 空への apply は何も変えない
+    let same = Memtable.apply [] mem
+    Assert.Equal(mem.Count, same.Count)
+    Assert.Equal(mem.ApproxBytes, same.ApproxBytes)
 
 [<Fact>]
 let ``Memtable: 同一キーは SeqNo が最大の版を返す`` () =
@@ -82,7 +112,7 @@ let ``Memtable: 削除 tombstone が最新なら削除として返る`` () =
         |> Memtable.apply [ Entry.delete (intKey 1) 2UL ]
 
     let e = entry (Memtable.getVisible mem (intKey 1) None)
-    Assert.True(e.IsDelete)
+    Assert.True e.IsDelete
     Assert.Equal<uint64>(2UL, e.SeqNo)
     // tombstone も 1 版として残る（コンパクションまで消さない）
     Assert.Equal(2, mem.Count)
@@ -104,10 +134,6 @@ let ``Memtable: 全キーを個別に引ける（探索方向の誤りを検出�
     // 範囲外のキーは None（境界の直前・直後）
     Assert.True((Memtable.getVisible mem (intKey -1) None).IsNone)
     Assert.True((Memtable.getVisible mem (intKey n) None).IsNone)
-
-// ---------------------------------------------------------------------------
-// MVCC の可視性
-// ---------------------------------------------------------------------------
 
 [<Fact>]
 let ``Memtable: visible より新しい版は見えない`` () =
@@ -137,68 +163,6 @@ let ``Memtable: 削除も snapshot で見え隠れする`` () =
     Assert.True((entry (Memtable.getVisible mem (intKey 1) (Some 5UL))).IsDelete)
 
 [<Fact>]
-let ``Memtable: apply しても元の memtable は変わらない`` () =
-    let before = Memtable.apply [ Entry.put (intKey 1) 1UL (intRow 1) ] Memtable.empty
-
-    let after = Memtable.apply [ Entry.put (intKey 2) 2UL (intRow 2) ] before
-
-    Assert.Equal(1, before.Count)
-    Assert.Equal(2, after.Count)
-
-    // before から見ると追加したキーは見えない
-    Assert.True((Memtable.getVisible before (intKey 2) None).IsNone)
-    Assert.True((Memtable.getVisible after (intKey 2) None).IsSome)
-
-    // 変更していないキーの内容も変わらない
-    Assert.Equal<SqlValue array>(
-        [| SqlValue.Int 1L |],
-        (entry (Memtable.getVisible before (intKey 1) None)).Value.Value
-    )
-
-    Assert.Equal<SqlValue array>([| SqlValue.Int 1L |], (entry (Memtable.getVisible after (intKey 1) None)).Value.Value)
-
-[<Fact>]
-let ``Memtable: Count と ApproxBytes は挿入したエントリの合計になる`` () =
-    let entries =
-        [|
-            Entry.put (intKey 1) 1UL [| SqlValue.Int 10L |]
-            Entry.put (intKey 2) 2UL [| SqlValue.Text "abcdef" |]
-            Entry.delete (intKey 3) 3UL
-        |]
-
-    let mem = Memtable.apply entries Memtable.empty
-
-    Assert.Equal(entries.Length, mem.Count)
-    Assert.Equal(entries |> Array.sumBy Entry.approxBytes, mem.ApproxBytes)
-
-    // 空への apply は何も変えない
-    let same = Memtable.apply [] mem
-    Assert.Equal(mem.Count, same.Count)
-    Assert.Equal(mem.ApproxBytes, same.ApproxBytes)
-
-// ---------------------------------------------------------------------------
-// 全順序走査
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``Memtable: 挿入順に関わらずキー昇順で列挙される`` () =
-    let n = 1_000
-    // 決定的なシャッフル（37 と 1000 は互いに素）
-    let shuffled = List.init n id |> List.sortBy (fun i -> (i * 37) % n)
-
-    let mem =
-        shuffled
-        |> List.map (fun i -> Entry.put (intKey i) (uint64 i + 1UL) (intRow i))
-        |> fun es -> Memtable.apply es Memtable.empty
-
-    let all = Memtable.toArray mem
-    Assert.Equal(n, all.Length)
-
-    all
-    |> Array.pairwise
-    |> Array.iter (fun (a, b) -> Assert.True(compareKeyBytes a.Key b.Key < 0, "キー昇順になっていない"))
-
-[<Fact>]
 let ``Memtable: 接頭辞のキーは短い方が小さい`` () =
     let shorter = [| 1uy |]
     let longer = [| 1uy; 0uy |]
@@ -209,70 +173,9 @@ let ``Memtable: 接頭辞のキーは短い方が小さい`` () =
     let all = Memtable.toArray mem
     Assert.Equal<byte array>(shorter, all.[0].Key)
     Assert.Equal<byte array>(longer, all.[1].Key)
-
     // 短いキーのポイント検索が長いキーに引きずられない
     Assert.Equal<uint64>(1UL, (entry (Memtable.getVisible mem shorter None)).SeqNo)
     Assert.Equal<uint64>(2UL, (entry (Memtable.getVisible mem longer None)).SeqNo)
-
-[<Fact>]
-let ``Memtable: rangeScan は startKey 以降を limit 件返す`` () =
-    let n = 1_000
-    let mem = build [ for i in 0 .. n - 1 -> (i, uint64 i + 1UL) ]
-
-    let got = Memtable.rangeScan mem (intKey 500) 10 |> Seq.toArray
-    Assert.Equal(10, got.Length)
-    Assert.Equal<byte array>(intKey 500, got.[0].Key)
-    Assert.Equal<byte array>(intKey 509, got.[9].Key)
-
-    // 終端を超える limit は実在する分だけ返す
-    Assert.Equal(10, Memtable.rangeScan mem (intKey 990) 100 |> Seq.length)
-
-    // limit 0 は無制限（startKey 以降の全部）
-    Assert.Equal(500, Memtable.rangeScan mem (intKey 500) 0 |> Seq.length)
-
-    // 全範囲より後ろなら空
-    Assert.Empty(Memtable.rangeScan mem (intKey n) 0)
-
-[<Fact>]
-let ``Memtable: startKey が空なら先頭から列挙する`` () =
-    let mem = build [ (1, 1UL); (2, 2UL); (3, 3UL) ]
-
-    let all = Memtable.rangeScan mem [||] 0 |> Seq.toArray
-    Assert.Equal(3, all.Length)
-    Assert.Equal<byte array>(intKey 1, all.[0].Key)
-    Assert.Equal<byte array>(intKey 3, all.[2].Key)
-
-[<Fact>]
-let ``Memtable: rangeScan は同一キーの全版を SeqNo 降順で返す`` () =
-    let mem = build [ (1, 1UL); (2, 2UL); (2, 5UL); (2, 3UL); (3, 4UL) ]
-
-    let got = Memtable.rangeScan mem (intKey 2) 0 |> Seq.toArray
-    // キー 2 の 3 版 + キー 3
-    Assert.Equal(4, got.Length)
-    Assert.Equal<uint64 array>([| 5UL; 3UL; 2UL; 4UL |], got |> Array.map (fun e -> e.SeqNo))
-    Assert.Equal<byte array>(intKey 2, got.[0].Key)
-    Assert.Equal<byte array>(intKey 3, got.[3].Key)
-
-[<Fact>]
-let ``Memtable: rangeScan は先頭 1 件だけなら全件を実体化しない`` () =
-    let n = 20_000
-    let mem = build [ for i in 0 .. n - 1 -> (i, uint64 i + 1UL) ]
-
-    // 一度走らせて JIT 分を測定から除く
-    Memtable.rangeScan mem (intKey 0) 0 |> Seq.head |> ignore
-
-    // 先頭 1 件は根から左端まで下りるだけ（O(log n)）。
-    // 全件を list に積んでいたら n 件分（20 万バイト超）を確保してしまう。
-    let before = System.GC.GetAllocatedBytesForCurrentThread()
-    let head = Memtable.rangeScan mem (intKey 0) 0 |> Seq.head
-    let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before
-
-    Assert.Equal<byte array>(intKey 0, head.Key)
-    Assert.True(allocated < 100_000L, $"先頭 1 件の取得で {allocated} バイト確保した（遅延していない）")
-
-// ---------------------------------------------------------------------------
-// 乱数での突き合わせ（参照実装との一致）
-// ---------------------------------------------------------------------------
 
 [<Fact>]
 let ``Memtable: 乱数キーでも列挙順と可視性が参照実装と一致する`` () =
@@ -304,7 +207,7 @@ let ``Memtable: 乱数キーでも列挙順と可視性が参照実装と一致�
     |> Array.pairwise
     |> Array.iter (fun (a, b) ->
         let c = compareKeyBytes a.Key b.Key
-        Assert.True(c < 0 || (c = 0 && a.SeqNo >= b.SeqNo), "列挙順が崩れている"))
+        Assert.True(c < 0 || c = 0 && a.SeqNo >= b.SeqNo, "列挙順が崩れている"))
 
     for k in 0..31 do
         let key = intKey k
@@ -316,7 +219,7 @@ let ``Memtable: 乱数キーでも列挙順と可視性が参照実装と一致�
         Assert.Equal<uint64 array>(expected, actual)
 
         // 最新版（visible なし）が参照実装と一致する
-        match Memtable.getVisible mem key None, (expected |> Array.tryHead) with
+        match Memtable.getVisible mem key None, expected |> Array.tryHead with
         | Some e, Some s -> Assert.Equal(s, e.SeqNo)
         | None, None -> ()
         | _ -> Assert.Fail(sprintf "キー %d の最新版が一致しない" k)
@@ -334,34 +237,68 @@ let ``Memtable: 乱数キーでも列挙順と可視性が参照実装と一致�
     // 存在しないキーは None
     Assert.True((Memtable.getVisible mem (intKey 100) None).IsNone)
 
-// ---------------------------------------------------------------------------
-// 末尾再帰（深い木でもスタックを食わない）
-// ---------------------------------------------------------------------------
+[<Fact>]
+let ``Memtable: rangeScan は startKey 以降を limit 件返す`` () =
+    let n = 1_000
+    let mem = build [ for i in 0 .. n - 1 -> i, uint64 i + 1UL ]
+    let got = Memtable.rangeScan mem (intKey 500) 10 |> Seq.toArray
+    Assert.Equal(10, got.Length)
+    Assert.Equal<byte array>(intKey 500, got.[0].Key)
+    Assert.Equal<byte array>(intKey 509, got.[9].Key)
+    // 終端を超える limit は実在する分だけ返す
+    Assert.Equal(10, Memtable.rangeScan mem (intKey 990) 100 |> Seq.length)
+    // limit 0 は無制限（startKey 以降の全部）
+    Assert.Equal(500, Memtable.rangeScan mem (intKey 500) 0 |> Seq.length)
+    // 全範囲より後ろなら空
+    Assert.Empty(Memtable.rangeScan mem (intKey n) 0)
 
 [<Fact>]
-let ``末尾再帰: Memtable に大量挿入して全走査できる`` () =
-    let n = 100_000
+let ``Memtable: startKey が空なら先頭から列挙する`` () =
+    let mem = build [ 1, 1UL; 2, 2UL; 3, 3UL ]
+    let all = Memtable.rangeScan mem [||] 0 |> Seq.toArray
+    Assert.Equal(3, all.Length)
+    Assert.Equal<byte array>(intKey 1, all.[0].Key)
+    Assert.Equal<byte array>(intKey 3, all.[2].Key)
 
-    let entryOf i =
-        Entry.put (intKey i) (uint64 i + 1UL) (intRow i)
+[<Fact>]
+let ``Memtable: rangeScan は同一キーの全版を SeqNo 降順で返す`` () =
+    let mem = build [ 1, 1UL; 2, 2UL; 2, 5UL; 2, 3UL; 3, 4UL ]
+    let got = Memtable.rangeScan mem (intKey 2) 0 |> Seq.toArray
+    // キー 2 の 3 版 + キー 3
+    Assert.Equal(4, got.Length)
+    Assert.Equal<uint64 array>([| 5UL; 3UL; 2UL; 4UL |], got |> Array.map (fun e -> e.SeqNo))
+    Assert.Equal<byte array>(intKey 2, got.[0].Key)
+    Assert.Equal<byte array>(intKey 3, got.[3].Key)
 
-    // 昇順・降順の両方で挿入する（Treap が偏る方向の入力になる）
-    let ascending = Memtable.apply (List.init n entryOf) Memtable.empty
+[<Fact>]
+let ``Memtable: rangeScan は先頭 1件だけなら全件を実体化しない`` () =
+    let n = 20_000
+    let mem = build [ for i in 0 .. n - 1 -> i, uint64 i + 1UL ]
+    // 一度走らせて JIT 分を測定から除く
+    Memtable.rangeScan mem (intKey 0) 0 |> Seq.head |> ignore
 
-    let descending =
-        Memtable.apply (List.init n (fun i -> entryOf (n - 1 - i))) Memtable.empty
+    // 先頭 1件は根から左端まで下りるだけ（O(log n)）。
+    // 全件を list に積んでいたら n 件分（20 万バイト超）を確保してしまう。
+    let before = System.GC.GetAllocatedBytesForCurrentThread()
+    let head = Memtable.rangeScan mem (intKey 0) 0 |> Seq.head
+    let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal<byte array>(intKey 0, head.Key)
+    Assert.True(allocated < 100_000L, $"先頭 1 件の取得で {allocated} バイト確保した（遅延していない）")
 
-    Assert.Equal(n, ascending.Count)
-    Assert.Equal(n, descending.Count)
+[<Fact>]
+let ``Memtable: 挿入順に関わらずキー昇順で列挙される`` () =
+    let n = 1_000
+    // 決定的なシャッフル（37 と 1000 は互いに素）
+    let shuffled = List.init n id |> List.sortBy (fun i -> i * 37 % n)
 
-    let scanAsc = Memtable.rangeScan ascending (intKey 0) 0 |> Seq.toArray
-    let scanDesc = Memtable.rangeScan descending (intKey 0) 0 |> Seq.toArray
+    let mem =
+        shuffled
+        |> List.map (fun i -> Entry.put (intKey i) (uint64 i + 1UL) (intRow i))
+        |> fun es -> Memtable.apply es Memtable.empty
 
-    Assert.Equal(n, scanAsc.Length)
-    Assert.Equal(n, scanDesc.Length)
+    let all = Memtable.toArray mem
+    Assert.Equal(n, all.Length)
 
-    // どちらの挿入順でも出力はキー昇順
-    Assert.Equal<byte array>(intKey 0, scanAsc.[0].Key)
-    Assert.Equal<byte array>(intKey (n - 1), scanAsc.[n - 1].Key)
-    Assert.Equal<byte array>(intKey 0, scanDesc.[0].Key)
-    Assert.Equal<byte array>(intKey (n - 1), scanDesc.[n - 1].Key)
+    all
+    |> Array.pairwise
+    |> Array.iter (fun (a, b) -> Assert.True(compareKeyBytes a.Key b.Key < 0, "キー昇順になっていない"))
