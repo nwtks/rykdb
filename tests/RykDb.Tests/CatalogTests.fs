@@ -9,21 +9,19 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 [<Fact>]
-let ``Catalog: 空のカタログにテーブルを追加・検索・削除`` () =
+let ``Catalog.addTable: 空のカタログにテーブルを追加・検索・削除`` () =
     let defn = Catalog.toDefinition peopleSchema
     let c1 = Catalog.addTable Catalog.empty defn
-
-    Assert.Single(c1.Tables) |> ignore
+    Assert.Single c1.Tables |> ignore
     Assert.True(Catalog.findTable c1 "people" |> Option.isSome)
-
     // SQL の識別子は大文字小文字を区別しない
     Assert.True(Catalog.findTable c1 "PEOPLE" |> Option.isSome)
 
     let c2 = Catalog.removeTable c1 "people"
-    Assert.Empty(c2.Tables)
+    Assert.Empty c2.Tables
 
 [<Fact>]
-let ``Catalog: 索引だけを追加して読み込める`` () =
+let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
     withStore "cat3" (fun store ->
         let ix =
             {
@@ -36,14 +34,13 @@ let ``Catalog: 索引だけを追加して読み込める`` () =
         let c = ix |> Catalog.addIndex Catalog.empty
         let store = ok (Catalog.save store c)
         let loaded = ok (Catalog.load store)
-
-        Assert.Empty(loaded.Tables)
-        Assert.Single(loaded.Indexes) |> ignore
+        Assert.Empty loaded.Tables
+        Assert.Single loaded.Indexes |> ignore
         Assert.Equal<string list>([ "a"; "b" ], loaded.Indexes.[0].Columns)
         Assert.True(loaded.Indexes.[0].Unique))
 
 [<Fact>]
-let ``Catalog: 削除した定義は再読込時に消える`` () =
+let ``Catalog.removeTable: 削除した定義は再読込時に消える`` () =
     withStore "cat2" (fun store ->
         let people = Catalog.toDefinition peopleSchema
         let orders = Catalog.toDefinition ordersSchema
@@ -51,28 +48,24 @@ let ``Catalog: 削除した定義は再読込時に消える`` () =
         let c1 =
             Catalog.empty
             |> (fun c -> Catalog.addTable c people)
-            |> (fun c -> Catalog.addTable c orders)
+            |> fun c -> Catalog.addTable c orders
 
         let store = ok (Catalog.save store c1)
-
         // people を消して保存し直す
         let c2 = Catalog.removeTable c1 "people"
         let store = ok (Catalog.save store c2)
-
         let loaded = ok (Catalog.load store)
-
-        Assert.Single(loaded.Tables) |> ignore
+        Assert.Single loaded.Tables |> ignore
         Assert.Equal<string>("orders", loaded.Tables.[0].Name)
         Assert.True(Catalog.findTable loaded "people" |> Option.isNone))
 
 [<Fact>]
-let ``Catalog: TableSchema を定義に変換して戻すと元に戻る`` () =
+let ``Catalog.toSchema: TableSchema を定義に変換して戻すと元に戻る`` () =
     let defn = Catalog.toDefinition peopleSchema
     Assert.Equal<string>("people", defn.Name)
     Assert.Equal<int>(3, defn.Columns.Length)
 
     let back = ok (Catalog.toSchema defn)
-
     Assert.Equal<string>("people", back.Name)
     Assert.Equal<int>(3, back.Columns.Length)
     Assert.Equal<int>([| 0 |], back.PrimaryKey)
@@ -81,7 +74,7 @@ let ``Catalog: TableSchema を定義に変換して戻すと元に戻る`` () =
     Assert.True(back.Columns.[0].Constraint.PrimaryKey)
 
 [<Fact>]
-let ``Catalog: 主キー列が存在しない場合はエラー`` () =
+let ``Catalog.toSchema: 主キー列が存在しない場合はエラー`` () =
     let bad =
         {
             Name = "broken"
@@ -92,7 +85,7 @@ let ``Catalog: 主キー列が存在しない場合はエラー`` () =
     expectError "存在しない主キー列で復元できました" (Catalog.toSchema bad)
 
 [<Fact>]
-let ``Catalog: removeIndex は指定した索引だけ消す`` () =
+let ``Catalog.removeIndex: removeIndex は指定した索引だけ消す`` () =
     let ixA =
         {
             IndexName = "ix_a"
@@ -113,13 +106,48 @@ let ``Catalog: removeIndex は指定した索引だけ消す`` () =
         Catalog.empty
         |> (fun c -> Catalog.addIndex c ixA)
         |> (fun c -> Catalog.addIndex c ixB)
-        |> (fun c -> Catalog.removeIndex c "IX_A") // 大文字小文字は無視
+        |> fun c -> Catalog.removeIndex c "IX_A" // 大文字小文字は無視
 
     Assert.True(Catalog.findIndex c "ix_a" |> Option.isNone)
     Assert.True(Catalog.findIndex c "ix_b" |> Option.isSome)
 
 [<Fact>]
-let ``Catalog: 未知のキーや不正な値は読み飛ばす`` () =
+let ``Catalog: 保存したカタログを読み込める`` () =
+    withStore "cat1" (fun store ->
+        let people = Catalog.toDefinition peopleSchema
+        let ix = Catalog.toIndexDefinition "people" peopleSchema.Indexes.[0]
+
+        let c =
+            people |> Catalog.addTable Catalog.empty |> fun c -> ix |> Catalog.addIndex c
+
+        let store = ok (Catalog.save store c)
+        let loaded = ok (Catalog.load store)
+        Assert.Single loaded.Tables |> ignore
+        Assert.Single loaded.Indexes |> ignore
+        Assert.Equal<string>("people", loaded.Tables.[0].Name)
+        Assert.Equal<string>("ix_people_age", loaded.Indexes.[0].IndexName)
+        Assert.Equal<string>("people", loaded.Indexes.[0].TableName))
+
+[<Fact>]
+let ``Catalog.save: カタログ外のエントリは保存時に掃除される`` () =
+    withStore "cat-sweep" (fun store ->
+        let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s
+
+        let store =
+            ok (
+                RowStore.writeBatches
+                    store
+                    [
+                        ("__catalog__", [| Entry.put (utf8 "junk:x") 1UL [| SqlValue.Blob [||] |] |])
+                    ]
+            )
+
+        // 空カタログを保存 → 未知キーは tombstone で消える
+        let store = ok (Catalog.save store Catalog.empty)
+        Assert.Equal<int>(0, (ok (Catalog.load store)).Tables.Length))
+
+[<Fact>]
+let ``Catalog.load: 未知のキーや不正な値は読み飛ばす`` () =
     withStore "cat-junk" (fun store ->
         let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s
 
@@ -153,13 +181,12 @@ let ``Catalog: 未知のキーや不正な値は読み飛ばす`` () =
 
         let store = ok (RowStore.writeBatches store [ ("__catalog__", entries) ])
         let loaded = ok (Catalog.load store)
-
         Assert.Equal<int>(2, loaded.Tables.Length)
         Assert.True(Catalog.findTable loaded "people2" |> Option.isSome)
         Assert.False(Catalog.findTable loaded "weird" |> Option.isSome))
 
 [<Fact>]
-let ``Catalog: 壊れた定義はエラー`` () =
+let ``Catalog.load: 壊れた定義はエラー`` () =
     withStore "cat-broken" (fun store ->
         let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s
 
@@ -185,39 +212,3 @@ let ``Catalog: 壊れた定義はエラー`` () =
             )
 
         expectError "壊れた索引定義を読めてしまう" (Catalog.load store))
-
-[<Fact>]
-let ``Catalog: カタログ外のエントリは保存時に掃除される`` () =
-    withStore "cat-sweep" (fun store ->
-        let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s
-
-        let store =
-            ok (
-                RowStore.writeBatches
-                    store
-                    [
-                        ("__catalog__", [| Entry.put (utf8 "junk:x") 1UL [| SqlValue.Blob [||] |] |])
-                    ]
-            )
-
-        // 空カタログを保存 → 未知キーは tombstone で消える
-        let store = ok (Catalog.save store Catalog.empty)
-        Assert.Equal<int>(0, (ok (Catalog.load store)).Tables.Length))
-
-[<Fact>]
-let ``Catalog: 保存したカタログを読み込める`` () =
-    withStore "cat1" (fun store ->
-        let people = Catalog.toDefinition peopleSchema
-        let ix = Catalog.toIndexDefinition "people" peopleSchema.Indexes.[0]
-
-        let c =
-            people |> Catalog.addTable Catalog.empty |> (fun c -> ix |> Catalog.addIndex c)
-
-        let store = ok (Catalog.save store c)
-        let loaded = ok (Catalog.load store)
-
-        Assert.Single(loaded.Tables) |> ignore
-        Assert.Single(loaded.Indexes) |> ignore
-        Assert.Equal<string>("people", loaded.Tables.[0].Name)
-        Assert.Equal<string>("ix_people_age", loaded.Indexes.[0].IndexName)
-        Assert.Equal<string>("people", loaded.Indexes.[0].TableName))

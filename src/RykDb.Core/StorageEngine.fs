@@ -409,3 +409,32 @@ module internal StorageEngine =
         |> Result.map (fun e ->
             Wal.walFiles e.Dir
             |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore))
+
+/// RowStore が使う StorageEngine の操作面。
+/// テストではメモリ実装に差し替えられる。
+type internal IStorageEngine =
+    abstract NextSeqNo: uint64
+    abstract GetAt: visible: uint64 option -> key: byte array -> Result<SstEntry option, DbError>
+    abstract ScanAt: visible: uint64 option -> startKey: byte array -> limit: int -> Result<SstEntry array, DbError>
+    abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
+    abstract WithNextSeqNo: nextSeqNo: uint64 -> IStorageEngine
+    abstract Close: unit -> Result<unit, DbError>
+
+/// 実ディスクの StorageEngine を IStorageEngine として公開する。
+type internal DiskStorageEngine(engine: StorageEngine) =
+    interface IStorageEngine with
+        member _.NextSeqNo = engine.NextSeqNo
+        member _.GetAt visible key = StorageEngine.getAt engine visible key
+
+        member _.ScanAt visible startKey limit =
+            StorageEngine.scanAt engine visible startKey limit
+
+        member _.WriteBatch entries =
+            StorageEngine.writeBatch engine entries
+            |> Result.map (fun next -> DiskStorageEngine next :> IStorageEngine)
+
+        member _.WithNextSeqNo nextSeqNo =
+            DiskStorageEngine { engine with NextSeqNo = nextSeqNo } :> IStorageEngine
+
+        member _.Close() =
+            StorageEngine.close engine |> Result.map ignore

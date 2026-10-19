@@ -53,26 +53,74 @@ let withDir (tag: string) (f: string -> unit) =
             with _ ->
                 ()
 
-/// 一時ディレクトリに RowStore を開いて渡し、テスト後に消す。
-/// （`withDir` + `openStore` の 2 行テンプレをまとめる）
-let withStore (tag: string) (f: RowStore -> unit) =
-    withDir tag (fun dir -> f (ok (RowStore.openStore dir)))
+/// テスト用メモリエンジンの keyspace ごとの永続状態。
+/// ディスクの WAL replay 相当で、store を作り直しても内容が見える。
+type private MemoryEngineState() =
+    member val Mem = Memtable.empty with get, set
+    member val NextSeqNo = 1UL with get, set
 
-/// 一時ディレクトリに DB を開いてテストし、最後に閉じて削除する。
+/// テスト用のメモリ StorageEngine。
+/// ディスク I/O をせず、memtable だけで getAt / scanAt / writeBatch を実装する。
+type private MemoryStorageEngine(state: MemoryEngineState, mem: Memtable, nextSeqNo: uint64) =
+    interface IStorageEngine with
+        member _.NextSeqNo = nextSeqNo
+
+        member _.GetAt visible key =
+            Memtable.getVisible mem key visible
+            |> Option.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+            |> ret
+
+        member _.ScanAt visible startKey limit =
+            let entries =
+                Memtable.rangeScan mem startKey 0
+                |> Seq.filter (fun e ->
+                    match visible with
+                    | Some v -> e.SeqNo <= v
+                    | None -> true)
+                |> Seq.distinctBy (fun e -> e.Key)
+                |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+
+            (if limit > 0 then Seq.truncate limit entries else entries)
+            |> Seq.toArray
+            |> ret
+
+        member _.WriteBatch entries =
+            let nextMem = Memtable.apply entries state.Mem
+            state.Mem <- nextMem
+            MemoryStorageEngine(state, nextMem, nextSeqNo) :> IStorageEngine |> ret
+
+        member _.WithNextSeqNo next =
+            state.NextSeqNo <- max state.NextSeqNo next
+            MemoryStorageEngine(state, mem, next) :> IStorageEngine
+
+        member _.Close() = ret ()
+
+/// メモリ上の StorageEngine を作る。
+/// 同じ store の中では keyspace ごとに状態を共有する（再オープンで内容が見える）。
+let private newMemoryEngineFactory () =
+    let states = System.Collections.Generic.Dictionary<string, MemoryEngineState>()
+
+    fun keyspace ->
+        match states.TryGetValue keyspace with
+        | true, state -> ret (MemoryStorageEngine(state, state.Mem, state.NextSeqNo) :> IStorageEngine)
+        | _ ->
+            let state = MemoryEngineState()
+            states.[keyspace] <- state
+            ret (MemoryStorageEngine(state, state.Mem, state.NextSeqNo) :> IStorageEngine)
+
+/// メモリ上の RowStore を渡す（ディスク I/O なし）。
+let withStore (_tag: string) (f: RowStore -> unit) =
+    f (RowStore.openStoreWith "" (newMemoryEngineFactory ()))
+
+/// メモリ上の DB を開いてテストし、最後に閉じる（ディスク I/O なし）。
 /// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で持ち替える。
-let withDb (tag: string) (f: Database -> unit) =
-    let dir = newDir tag
+let withDb (_tag: string) (f: Database -> unit) =
+    let db = ok (Database.openWithEngine "" (newMemoryEngineFactory ()))
 
     try
-        let db = ok (Database.openWith dir)
         f db
-        ok (db.Close())
     finally
-        if Directory.Exists dir then
-            try
-                Directory.Delete(dir, true)
-            with _ ->
-                ()
+        ok (db.Close()) |> ignore
 
 /// Error でなければテストを落とす（エラー内容まで見るテストは match で個別に書く）。
 let expectError (message: string) (r: Result<'a, DbError>) =

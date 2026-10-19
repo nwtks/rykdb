@@ -681,6 +681,8 @@ COMMIT
 ## 8. ストレージ層
 
 `StorageEngine` が **LSM ツリー 1本**を公開する層。
+`RowStore` は `IStorageEngine`（`NextSeqNo` / `GetAt` / `ScanAt` / `WriteBatch` / `WithNextSeqNo` / `Close`）越しに扱う。
+テストではこれをメモリ実装に差し替え、ディスク I/O なしで上位層を検証する。
 
 | 既定値                        | 値     |
 | ----------------------------- | ------ |

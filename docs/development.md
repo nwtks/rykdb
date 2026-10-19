@@ -79,6 +79,8 @@ Parser / Planner / Executor / Catalog の連携バグはそこだけで分かる
   `let ``説明`` () = ...` の**関数形**（FS0842: 関数でないと黙って無視される）。
 - 共通ヘルパー（`ok` / `withDir` / `asInt` / 乱数生成）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
   ファイル固有の fixture（スキーマなど）は各ファイルに private で置く。
+- `withStore` / `withDb` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
+  ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Database.openWith` を直接使って検証する。
 - 新しいファイルは `.fsproj` の Compile 順（= src のコンパイル順）に追加する。
 - 一時ディレクトリは `Path.GetTempPath()` + `Ticks`。
   `try/finally` で必ず削除する。

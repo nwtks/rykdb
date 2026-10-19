@@ -163,25 +163,32 @@ module internal Keyspace =
             None
 
 /// keyspace ごとのエンジンとスキーマを束ねたもの。
+/// エンジンの開き方を差し替えられるので、テストではディスクに触れない実装を使える。
+[<NoEquality; NoComparison>]
 type internal RowStore =
     {
         Root: string
-        /// keyspace → (ディレクトリ, エンジン)
-        Engines: Map<string, StorageEngine * string>
+        /// keyspace → エンジン
+        Engines: Map<string, IStorageEngine>
+        /// まだ開いていない keyspace のエンジンを作る
+        OpenEngine: string -> Result<IStorageEngine, DbError>
     }
 
 module internal RowStore =
     let private ensure (store: RowStore) (keyspace: string) =
-        let dirOf (root: string) (keyspace: string) =
-            Path.Combine(root, Keyspace.toDirName keyspace)
-
         match store.Engines |> Map.tryFind keyspace with
-        | Some v -> ret v
-        | None ->
-            let dir = dirOf store.Root keyspace
+        | Some engine -> ret engine
+        | None -> store.OpenEngine keyspace
 
-            Manifest.ensureDirectory dir
-            >>= fun () -> StorageEngine.openDatabase dir |> Result.map (fun engine -> engine, dir)
+    /// ディスク上の keyspace エンジンを開く。
+    let private openDiskEngine (root: string) (keyspace: string) =
+        let dir = Path.Combine(root, Keyspace.toDirName keyspace)
+
+        result {
+            do! Manifest.ensureDirectory dir
+            let! engine = StorageEngine.openDatabase dir
+            return DiskStorageEngine engine :> IStorageEngine
+        }
 
     /// DB を開く（keyspace は必要に応じて作られる）。
     /// <remarks>
@@ -190,32 +197,46 @@ module internal RowStore =
     /// LastCommitSeqNo = 0 から始まり、既にディスクにある行がすべて「未来」として見えなくなる。
     /// </remarks>
     let openStore (root: string) =
-        let rec openEngines (rest: (string * string) list) (acc: Map<string, StorageEngine * string>) =
+        let openEngine = openDiskEngine root
+
+        let rec openEngines (rest: string list) (acc: Map<string, IStorageEngine>) =
             match rest with
             | [] -> ret acc
-            | (ks, dir) :: tail ->
-                match Manifest.ensureDirectory dir with
+            | ks :: tail ->
+                match openEngine ks with
                 | Error err -> Error err
-                | Ok() ->
-                    match StorageEngine.openDatabase dir with
-                    | Error err -> Error err
-                    | Ok e -> openEngines tail (Map.add ks (e, dir) acc)
-
-        let known =
-            Directory.GetDirectories root
-            |> Array.choose (fun dir ->
-                Path.GetFileName dir
-                |> Keyspace.tryFromDirName
-                |> Option.map (fun ks -> ks, dir))
+                | Ok e -> openEngines tail (Map.add ks e acc)
 
         result {
             do! protect (fun () -> Directory.CreateDirectory root |> ignore)
-            let! engines = openEngines (known |> Array.toList) Map.empty
-            return { Root = root; Engines = engines }
+
+            let! known =
+                protect (fun () ->
+                    Directory.GetDirectories root
+                    |> Array.choose (fun dir -> Path.GetFileName dir |> Keyspace.tryFromDirName)
+                    |> Array.toList)
+
+            let! engines = openEngines known Map.empty
+
+            return
+                {
+                    Root = root
+                    Engines = engines
+                    OpenEngine = openEngine
+                }
+        }
+
+    /// エンジンの開き方を差し替えて、空の RowStore を作る（テスト用）。
+    /// ディスクに触れない実装を渡せば、keyspace はすべてメモリ上に作られる。
+    let openStoreWith (root: string) (openEngine: string -> Result<IStorageEngine, DbError>) =
+        {
+            Root = root
+            Engines = Map.empty
+            OpenEngine = openEngine
         }
 
     /// keyspace のエンジン（無ければ作る）。
-    let engine (store: RowStore) (keyspace: string) = ensure store keyspace |> Result.map fst
+    let engine (store: RowStore) (keyspace: string) = ensure store keyspace
 
     /// keyspace ごとに Entry を書き込む。
     /// batches は (keyspace, Entry 配列) の列。
@@ -233,21 +254,17 @@ module internal RowStore =
                 else
                     match ensure current ks with
                     | Error err -> Error err
-                    | Ok(e, dir) ->
-                        match StorageEngine.writeBatch e entries with
+                    | Ok engine ->
+                        match engine.WriteBatch entries with
                         | Error err -> Error err
                         | Ok updated ->
                             let maxSeq = Entry.maxSeqNo entries
-
-                            let bumped =
-                                { updated with
-                                    StorageEngine.NextSeqNo = max updated.NextSeqNo (maxSeq + 1UL)
-                                }
+                            let bumped = updated.WithNextSeqNo(max updated.NextSeqNo (maxSeq + 1UL))
 
                             writeAll
                                 tail
                                 { current with
-                                    Engines = Map.add ks (bumped, dir) current.Engines
+                                    Engines = Map.add ks bumped current.Engines
                                 }
 
         writeAll batches store
@@ -256,7 +273,7 @@ module internal RowStore =
     let getAt (store: RowStore) (keyspace: string) (key: byte array) (visible: uint64 option) =
         result {
             let! e = engine store keyspace
-            let! sst = StorageEngine.getAt e visible key
+            let! sst = e.GetAt visible key
             return Option.bind _.Value sst
         }
 
@@ -264,7 +281,7 @@ module internal RowStore =
     let scanAt (store: RowStore) (keyspace: string) (startKey: byte array) (visible: uint64 option) (limit: int) =
         result {
             let! e = engine store keyspace
-            let! entries = StorageEngine.scanAt e visible startKey limit
+            let! entries = e.ScanAt visible startKey limit
 
             return
                 entries
@@ -280,13 +297,11 @@ module internal RowStore =
     let lastSeqNo (store: RowStore) =
         store.Engines
         |> Map.toList
-        |> List.fold (fun acc (_, (e, _)) -> max acc (if e.NextSeqNo = 0UL then 0UL else e.NextSeqNo - 1UL)) 0UL
+        |> List.fold (fun acc (_, e) -> max acc (if e.NextSeqNo = 0UL then 0UL else e.NextSeqNo - 1UL)) 0UL
 
     /// 全 keyspace を close する。
     let close (store: RowStore) =
-        store.Engines
-        |> Map.toList
-        |> foldOk (fun () (_, (e, _)) -> StorageEngine.close e |> Result.map (fun _ -> ())) ()
+        store.Engines |> Map.toList |> foldOk (fun () (_, e) -> e.Close()) ()
 
 /// DML — スキーマと transaction を使う上位操作。
 /// 1行の書き込みは「主キーの LSM への 1件 + 各索引の LSM への 1件」。

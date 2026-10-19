@@ -21,7 +21,7 @@ let ``ExecContext.create: 空の Schemas / Catalog`` () =
     withStore "ec-create" (fun store ->
         let ctx = ExecContext.create store (Snapshot.noLimit)
         Assert.True(Map.isEmpty ctx.Schemas)
-        Assert.Equal(store, ctx.Store))
+        Assert.Same(store, ctx.Store))
 
 [<Fact>]
 let ``ExecContext.withSchema: スキーマを登録する`` () =

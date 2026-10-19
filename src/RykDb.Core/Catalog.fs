@@ -40,15 +40,15 @@ module internal Catalog =
 
     let private keyspace = "__catalog__"
 
-    /// SQL の識別子は大文字小文字を区別しない（OrdinalIgnoreCase）。
-    let eqName (a: string) (b: string) =
-        System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
-
     let private tableKey (name: string) =
         System.Text.Encoding.UTF8.GetBytes("table:" + name)
 
     let private indexKey (name: string) =
         System.Text.Encoding.UTF8.GetBytes("index:" + name)
+
+    /// SQL の識別子は大文字小文字を区別しない（OrdinalIgnoreCase）。
+    let eqName (a: string) (b: string) =
+        System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
 
     /// テーブルを探す。無ければ None。
     let findTable (c: Catalog) (name: string) =
@@ -75,17 +75,17 @@ module internal Catalog =
             Tables = upsert (fun (x: TableDefinition) -> x.Name) t c.Tables
         }
 
-    /// 索引を追加（同名があれば置き換える）。
-    let addIndex (c: Catalog) (i: IndexDefinition) =
-        { c with
-            Indexes = upsert (fun (x: IndexDefinition) -> x.IndexName) i c.Indexes
-        }
-
     /// テーブルを削除する（そのテーブルの索引も消える）。
     let removeTable (c: Catalog) (name: string) =
         { c with
             Tables = c.Tables |> List.filter (fun t -> not (eqName t.Name name))
             Indexes = c.Indexes |> List.filter (fun i -> not (eqName i.TableName name))
+        }
+
+    /// 索引を追加（同名があれば置き換える）。
+    let addIndex (c: Catalog) (i: IndexDefinition) =
+        { c with
+            Indexes = upsert (fun (x: IndexDefinition) -> x.IndexName) i c.Indexes
         }
 
     /// 索引を削除する。
@@ -263,40 +263,6 @@ module internal Catalog =
             | Some name -> Some(true, name)
             | None -> None
 
-    /// カタログを読み込む。キーが無ければ空を返す。
-    let load (store: RowStore) =
-        let ofValue (v: SqlValue array) =
-            match v with
-            | [| SqlValue.Blob b |] -> Some b
-            | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
-            | _ -> None
-
-        let rec decodeRows (rest: (byte array * SqlValue array option) array) (acc: Catalog) =
-            if Array.isEmpty rest then
-                ret acc
-            else
-                let key, value = rest.[0]
-                let tail = rest.[1..]
-
-                match value with
-                | None -> decodeRows tail acc
-                | Some v ->
-                    match ofValue v with
-                    | None -> decodeRows tail acc
-                    | Some bytes ->
-                        match keyKindOf key with
-                        | Some(false, name) ->
-                            match decodeTable name bytes with
-                            | Error e -> Error e
-                            | Ok t -> decodeRows tail (addTable acc t)
-                        | Some(true, name) ->
-                            match decodeIndex name bytes with
-                            | Error e -> Error e
-                            | Ok i -> decodeRows tail (addIndex acc i)
-                        | None -> decodeRows tail acc
-
-        RowStore.scan store keyspace [||] 0 >>= fun rows -> decodeRows rows empty
-
     /// カタログを保存する（消えた定義は tombstone で落とす）。
     let save (store: RowStore) (catalog: Catalog) =
         let rec numberList (mk: 'a -> uint64 -> 'b) (rest: 'a list) (seq: uint64) (acc: 'b list) =
@@ -344,3 +310,37 @@ module internal Catalog =
                 let deletes, _ = numberList Entry.delete stale seq2 []
                 return! RowStore.writeBatches updated [ (keyspace, Array.ofList deletes) ]
         }
+
+    /// カタログを読み込む。キーが無ければ空を返す。
+    let load (store: RowStore) =
+        let ofValue (v: SqlValue array) =
+            match v with
+            | [| SqlValue.Blob b |] -> Some b
+            | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
+            | _ -> None
+
+        let rec decodeRows (rest: (byte array * SqlValue array option) array) (acc: Catalog) =
+            if Array.isEmpty rest then
+                ret acc
+            else
+                let key, value = rest.[0]
+                let tail = rest.[1..]
+
+                match value with
+                | None -> decodeRows tail acc
+                | Some v ->
+                    match ofValue v with
+                    | None -> decodeRows tail acc
+                    | Some bytes ->
+                        match keyKindOf key with
+                        | Some(false, name) ->
+                            match decodeTable name bytes with
+                            | Error e -> Error e
+                            | Ok t -> decodeRows tail (addTable acc t)
+                        | Some(true, name) ->
+                            match decodeIndex name bytes with
+                            | Error e -> Error e
+                            | Ok i -> decodeRows tail (addIndex acc i)
+                        | None -> decodeRows tail acc
+
+        RowStore.scan store keyspace [||] 0 >>= fun rows -> decodeRows rows empty

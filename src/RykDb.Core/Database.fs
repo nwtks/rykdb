@@ -15,8 +15,6 @@
 
 namespace RykDb.Core
 
-open System.IO
-
 /// DB のハンドル。
 /// <remarks>
 /// ハンドルは underlying state を不変に持つ。
@@ -172,11 +170,9 @@ type Database internal (root: string, state: DbState) =
     /// テーブル一覧を返す。
     member _.TableNames() = state.Catalog.Tables |> List.map _.Name
 
-    /// DB を開く。
-    static member openWith(root: string) =
+    /// 与えた RowStore で DB を開く。
+    static member internal openWithStore (root: string) (store: RowStore) =
         result {
-            do! protect (fun () -> Directory.CreateDirectory root |> ignore)
-            let! store = RowStore.openStore root
             let! catalog = Catalog.load store
             let lastSeq = RowStore.lastSeqNo store
 
@@ -200,4 +196,15 @@ type Database internal (root: string, state: DbState) =
                         Pending = None
                     }
                 )
+        }
+
+    /// エンジンの開き方を差し替えて DB を開く（テスト用）。
+    static member internal openWithEngine (root: string) (openEngine: string -> Result<IStorageEngine, DbError>) =
+        Database.openWithStore root (RowStore.openStoreWith root openEngine)
+
+    /// DB を開く。
+    static member openWith(root: string) =
+        result {
+            let! store = RowStore.openStore root
+            return! Database.openWithStore root store
         }
