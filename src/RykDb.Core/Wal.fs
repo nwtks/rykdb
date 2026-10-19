@@ -46,11 +46,6 @@ module internal Wal =
     [<Literal>]
     let private TagAbort = 3uy
 
-    let private fileName (fileNumber: int64) = sprintf "%06d.wal" fileNumber
-
-    let path (dir: string) (fileNumber: int64) =
-        System.IO.Path.Combine(dir, fileName fileNumber)
-
     let private encodePayload (r: WalRecord) =
         let txnRecord tag txnId =
             Writer.build [ Writer.writeByte tag; Writer.uint64BE txnId ]
@@ -88,10 +83,7 @@ module internal Wal =
             | _ -> return! err (sprintf "Wal: 不明なレコード種別 %d" (int tag) |> DbError.corruption)
         }
 
-    /// レコード列を追記する。
-    /// Begin / Batch / Commit をまとめて 1回の書き込みで書き出すので、
-    /// コミット済みトランザクションが中途半端にならない。
-    let append (state: WalState) (dir: string) (records: WalRecord list) =
+    let encodeFrames (records: WalRecord list) =
         let frame (payload: byte array) =
             Writer.build
                 [
@@ -100,28 +92,9 @@ module internal Wal =
                     Writer.writeBytes payload
                 ]
 
-        let bytes =
-            records |> List.map (encodePayload >> frame) |> List.toArray |> Array.concat
+        records |> List.map (encodePayload >> frame) |> List.toArray |> Array.concat
 
-        protect (fun () ->
-            if bytes.Length > 0 then
-                use fs =
-                    new System.IO.FileStream(
-                        path dir state.FileNumber,
-                        System.IO.FileMode.Append,
-                        System.IO.FileAccess.Write,
-                        System.IO.FileShare.Read
-                    )
-
-                fs.Write(bytes, 0, bytes.Length)
-                fs.Flush true
-
-            { state with
-                Size = state.Size + bytes.Length
-            })
-
-    /// WAL ファイルを読み、コミット済みエントリを返す。
-    let read (dir: string) (fileNumber: int64) =
+    let decodeFrames (data: byte array) =
         let readFrame (c: Cursor) =
             result {
                 let! len, c1 = Reader.readUInt32LE c
@@ -146,8 +119,9 @@ module internal Wal =
             | Error _ -> List.rev acc
             | Ok(r, c') -> readFrames c' (r :: acc)
 
-        let readRecords (data: byte array) = readFrames (Cursor.create data) []
+        readFrames (Cursor.create data) []
 
+    let committedEntries (records: WalRecord list) =
         let rec selectCommitted (recs: WalRecord list) (pending: (uint64 * Entry array) list) (acc: Entry list) =
             match recs with
             | [] -> List.rev acc |> Array.ofList
@@ -164,13 +138,43 @@ module internal Wal =
                 selectCommitted rest (pending |> List.filter (fun (t, _) -> t <> txnId)) (mine @ acc)
             | WalRecord.Begin _ :: rest -> selectCommitted rest pending acc
 
-        let committedEntries (records: WalRecord list) = selectCommitted records [] []
+        selectCommitted records [] []
 
+    let private fileName (fileNumber: int64) = sprintf "%06d.wal" fileNumber
+
+    let path (dir: string) (fileNumber: int64) =
+        System.IO.Path.Combine(dir, fileName fileNumber)
+
+    /// レコード列を追記する。
+    /// Begin / Batch / Commit をまとめて 1回の書き込みで書き出すので、
+    /// コミット済みトランザクションが中途半端にならない。
+    let append (state: WalState) (dir: string) (records: WalRecord list) =
+        let bytes = encodeFrames records
+
+        protect (fun () ->
+            if bytes.Length > 0 then
+                use fs =
+                    new System.IO.FileStream(
+                        path dir state.FileNumber,
+                        System.IO.FileMode.Append,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.Read
+                    )
+
+                fs.Write(bytes, 0, bytes.Length)
+                fs.Flush true
+
+            { state with
+                Size = state.Size + bytes.Length
+            })
+
+    /// WAL ファイルを読み、コミット済みエントリを返す。
+    let read (dir: string) (fileNumber: int64) =
         protect (fun () ->
             let p = path dir fileNumber
 
             if System.IO.File.Exists p then
-                System.IO.File.ReadAllBytes p |> readRecords |> committedEntries
+                System.IO.File.ReadAllBytes p |> decodeFrames |> committedEntries
             else
                 [||])
 

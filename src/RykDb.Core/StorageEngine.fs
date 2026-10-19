@@ -76,7 +76,7 @@ module internal StorageEngine =
 
     /// SSTable ファイルをバイト列で読む。
     let private readFileBytes (dir: string) (fileNumber: int64) =
-        protect (fun () -> System.IO.File.ReadAllBytes(Sstable.path dir fileNumber))
+        protect (fun () -> System.IO.File.ReadAllBytes(FileMetaData.path dir fileNumber))
 
     /// ファイルを開く（Bloom と index を持つ reader を作る）。
     let private openSstable (engine: StorageEngine) (f: FileMetaData) =
@@ -310,7 +310,7 @@ module internal StorageEngine =
         let dropMissingFiles (dir: string) (manifestNumber: int64) (version: Version) =
             let missing =
                 Version.allFiles version
-                |> List.filter (fun f -> not (System.IO.File.Exists(Sstable.path dir f.FileNumber)))
+                |> List.filter (fun f -> not (System.IO.File.Exists(FileMetaData.path dir f.FileNumber)))
 
             if List.isEmpty missing then
                 ret (version, manifestNumber)
@@ -332,7 +332,7 @@ module internal StorageEngine =
 
             protect (fun () ->
                 orphans
-                |> Array.iter (fun n -> System.IO.File.Delete(Sstable.path dir n))
+                |> Array.iter (fun n -> System.IO.File.Delete(FileMetaData.path dir n))
                 |> ignore)
 
         let latestWalNumber (dir: string) =

@@ -144,3 +144,18 @@ let ``ResultOps.protect: IOException を IoError に`` () =
 [<Fact>]
 let ``ResultOps.protect: 正常値を返す`` () =
     Assert.Equal(Ok 42, protect (fun () -> 42))
+
+[<Fact>]
+let ``ResultOps.protect: 壊れたデータの例外は CorruptionError に`` () =
+    let check kind (f: unit -> 'a) =
+        match protect f with
+        | Error e -> Assert.Equal(kind, e.Kind)
+        | Ok _ -> Assert.Fail "例外は Error に包まれるべき"
+
+    // ファイル内容の破損を表す例外（Format / Overflow）は CorruptionError
+    check ErrorKind.CorruptionError (fun () -> raise (System.FormatException "bad"))
+    check ErrorKind.CorruptionError (fun () -> raise (System.OverflowException "big"))
+    // 権限エラーも I/O エラーとして扱う
+    check ErrorKind.IoError (fun () -> raise (System.UnauthorizedAccessException "denied"))
+    // それ以外の例外は InternalError
+    check ErrorKind.InternalError (fun () -> failwith "boom")

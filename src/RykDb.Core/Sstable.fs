@@ -189,13 +189,6 @@ module internal Sstable =
     [<Literal>]
     let private Version = 1
 
-    /// SSTable のファイル名（%06d.sst）。
-    let private fileName (fileNumber: int64) = sprintf "%06d.sst" fileNumber
-
-    /// SSTable のフルパス。
-    let path (dir: string) (fileNumber: int64) =
-        System.IO.Path.Combine(dir, fileName fileNumber)
-
     /// バイト列の列の、各要素の開始オフセットを求める（累積バイト数）。
     /// 結果は要素数 + 1 個で、最後が全体のバイト数。
     let private startOffsets (blocks: byte array list) =
@@ -628,6 +621,13 @@ module internal FileMetaData =
             MaxSeqNo = 0UL
         }
 
+    /// SSTable のファイル名（%06d.sst）。
+    let private fileName (fileNumber: int64) = sprintf "%06d.sst" fileNumber
+
+    /// SSTable のフルパス。
+    let path (dir: string) (fileNumber: int64) =
+        System.IO.Path.Combine(dir, fileName fileNumber)
+
     /// エントリ列を SSTable としてビルドし、ファイルに書き、メタデータを返す。
     /// ビルド・書き出し・メタ算出が 1つの経路を通るので、「書いたバイト数」と Size が食い違うことが無い。
     let writeSstable
@@ -651,7 +651,7 @@ module internal FileMetaData =
         match Sstable.build entries bloomFalsePositiveRate with
         | Error e -> Error e
         | Ok bytes ->
-            match protect (fun () -> System.IO.File.WriteAllBytes(Sstable.path dir fileNumber, bytes) |> ignore) with
+            match protect (fun () -> System.IO.File.WriteAllBytes(path dir fileNumber, bytes) |> ignore) with
             | Error e -> Error e
             | Ok() -> ret (ofChunk fileNumber level (int64 bytes.Length) entries)
 
@@ -683,7 +683,7 @@ module internal FileMetaData =
     let deleteObsolete (dir: string) (files: FileMetaData list) =
         let deleteFile (dir: string) (fileNumber: int64) =
             protect (fun () ->
-                let p = Sstable.path dir fileNumber
+                let p = path dir fileNumber
 
                 if System.IO.File.Exists p then
                     System.IO.File.Delete p)

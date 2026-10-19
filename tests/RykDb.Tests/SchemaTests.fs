@@ -57,6 +57,32 @@ let ``Schema.projectHeader: * は入力列名`` () =
     Assert.Equal<string array>([| "id" |], h)
 
 [<Fact>]
+let ``Schema.projectHeader: 空なら入力ヘッダ / t.* は修飾つき`` () =
+    let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
+
+    // 射影が空なら入力スキーマのヘッダをそのまま返す
+    Assert.Equal<string array>([| "t.id" |], Schema.projectHeader s [])
+
+    // t.* は修飾つきの表示名で出す
+    let h =
+        Schema.projectHeader
+            s
+            [
+                {
+                    Expression = Expr.QualifiedStar "t"
+                    Alias = None
+                }
+            ]
+
+    Assert.Equal<string array>([| "t.id" |], h)
+
+[<Fact>]
+let ``Schema.resolve: 空スキーマのエラーは (なし) を出す`` () =
+    match Schema.resolve (outSchema []) { Qualifier = None; Name = "x" } with
+    | Error e -> Assert.Contains("(なし)", e.Message)
+    | Ok _ -> Assert.Fail "NameError になるべき"
+
+[<Fact>]
 let ``Schema.tryAsColumnRef: Column / Name を列参照に`` () =
     match Schema.tryAsColumnRef (Expr.Column { Qualifier = Some "t"; Name = "id" }) with
     | Some c -> Assert.Equal("id", c.Name)

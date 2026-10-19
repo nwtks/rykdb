@@ -6,6 +6,7 @@ module RykDb.AstTests
 
 open Xunit
 open RykDb.Core
+open RykDb.TestHelpers
 
 let private literal l = Expr.Literal l
 let private column q n = Expr.Column { Qualifier = q; Name = n }
@@ -21,6 +22,11 @@ let ``Ast: children は直接の子ノードを返す`` () =
 
     // リーフは空
     Assert.Empty(Expr.children (Expr.Name "x"))
+
+    // 3 引数・リスト・LIKE も子を返す
+    Assert.Equal(3, (Expr.children (Expr.Between(name "a", name "b", name "c", false))).Length)
+    Assert.Equal(3, (Expr.children (Expr.InList(name "a", [ name "b"; name "c" ], false))).Length)
+    Assert.Equal(2, (Expr.children (Expr.Like(name "a", name "b", false))).Length)
 
 [<Fact>]
 let ``Ast: mapChildren は子を変換する`` () =
@@ -145,3 +151,121 @@ let ``Ast: その他の演算子の表示`` () =
     Assert.Equal<string>("(a LIKE 'x%')", Expr.toDisplayString (Expr.Like(a, literal (Literal.String "x%"), false)))
 
     Assert.Equal<string>("t.*", Expr.toDisplayString (Expr.QualifiedStar "t"))
+
+[<Fact>]
+let ``Ast: mapChildren は全ケースで子を置き換える`` () =
+    let bump (e: Expr) =
+        match e with
+        | Expr.Name n -> Expr.Name(n + "!")
+        | other -> other
+
+    let namesOf (e: Expr) =
+        Expr.fold
+            (fun acc e ->
+                match e with
+                | Expr.Name n -> n :: acc
+                | _ -> acc)
+            []
+            e
+        |> List.sort
+
+    // 子を持つ全ケースを列挙し、直接の子（リーフ名）がすべて置き換わることを見る
+    let samples =
+        [
+            Expr.Unary(UnaryOp.Not, name "a"), [ "a" ]
+            Expr.Binary(BinaryOp.Add, name "a", name "b"), [ "a"; "b" ]
+            Expr.IsNull(name "a", false), [ "a" ]
+            Expr.Between(name "a", name "b", name "c", false), [ "a"; "b"; "c" ]
+            Expr.InList(name "a", [ name "b"; name "c" ], false), [ "a"; "b"; "c" ]
+            Expr.Like(name "a", name "b", false), [ "a"; "b" ]
+            Expr.Case([ (name "a", name "b") ], Some(name "c")), [ "a"; "b"; "c" ]
+            Expr.Case([ (name "a", name "b") ], None), [ "a"; "b" ]
+            Expr.FuncCall("ABS", [ name "a" ]), [ "a" ]
+            Expr.AggCall(AggFunc.Sum, false, name "a"), [ "a" ]
+        ]
+
+    for e, expected in samples do
+        Assert.Equal<string list>(
+            expected |> List.map (fun n -> n + "!") |> List.sort,
+            namesOf (Expr.mapChildren bump e)
+        )
+
+    // リーフは変換されない
+    Assert.Equal<string>("t.*", Expr.toDisplayString (Expr.mapChildren bump (Expr.QualifiedStar "t")))
+    Assert.Equal<string>("a", Expr.toDisplayString (Expr.mapChildren bump (name "a")))
+
+[<Fact>]
+let ``Ast: mapChildrenM は全ケースで子を置き換える`` () =
+    let bump (e: Expr) =
+        match e with
+        | Expr.Name n -> ret (Expr.Name(n + "!"))
+        | other -> ret other
+
+    let namesOf (e: Expr) =
+        Expr.fold
+            (fun acc e ->
+                match e with
+                | Expr.Name n -> n :: acc
+                | _ -> acc)
+            []
+            e
+        |> List.sort
+
+    let samples =
+        [
+            Expr.Unary(UnaryOp.Not, name "a"), [ "a" ]
+            Expr.Binary(BinaryOp.Add, name "a", name "b"), [ "a"; "b" ]
+            Expr.IsNull(name "a", false), [ "a" ]
+            Expr.Between(name "a", name "b", name "c", false), [ "a"; "b"; "c" ]
+            Expr.InList(name "a", [ name "b"; name "c" ], false), [ "a"; "b"; "c" ]
+            Expr.Like(name "a", name "b", false), [ "a"; "b" ]
+            Expr.Case([ (name "a", name "b") ], Some(name "c")), [ "a"; "b"; "c" ]
+            Expr.Case([ (name "a", name "b") ], None), [ "a"; "b" ]
+            Expr.FuncCall("ABS", [ name "a" ]), [ "a" ]
+            Expr.AggCall(AggFunc.Sum, false, name "a"), [ "a" ]
+        ]
+
+    for e, expected in samples do
+        let got = namesOf (ok (Expr.mapChildrenM bump e))
+        Assert.Equal<string list>(expected |> List.map (fun n -> n + "!") |> List.sort, got)
+
+    // リーフは変換されない
+    Assert.Equal<string>("t.*", Expr.toDisplayString (ok (Expr.mapChildrenM bump (Expr.QualifiedStar "t"))))
+
+    // 子の変換が失敗したら全体も失敗する
+    expectError
+        "子の変換失敗が伝播していません"
+        (Expr.mapChildrenM (fun _ -> err (DbError.name "x")) (binary BinaryOp.Add (name "a") (name "b")))
+
+[<Fact>]
+let ``Ast: Literal と SqlValue の相互変換`` () =
+    // BLOB リテラル → SqlValue
+    match (Literal.Blob [| 1uy; 2uy |]).ToSqlValue with
+    | SqlValue.Blob b -> Assert.Equal<byte array>([| 1uy; 2uy |], b)
+    | v -> Assert.Fail(sprintf "BLOB が Blob になりません: %A" v)
+
+    // SqlValue → リテラル表示（DDL 再構築用）。全ケースがリテラルへ落ちる。
+    let cases: (SqlValue * Literal) list =
+        [
+            SqlValue.Null, Literal.Null
+            SqlValue.Bool true, Literal.Bool true
+            SqlValue.Int 3L, Literal.Int 3L
+            SqlValue.Real 1.5, Literal.Real 1.5
+            SqlValue.Decimal 2.5M, Literal.Decimal 2.5M
+            SqlValue.Text "x", Literal.String "x"
+            SqlValue.Blob [| 7uy |], Literal.Blob [| 7uy |]
+            SqlValue.Date(System.DateOnly(2026, 10, 18)), Literal.String "2026-10-18"
+            SqlValue.Timestamp(System.DateTimeOffset(2026, 10, 18, 1, 2, 3, System.TimeSpan.Zero)),
+            Literal.String "2026-10-18T01:02:03.0000000Z"
+            SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-000000000001"),
+            Literal.String "00000000-0000-0000-0000-000000000001"
+        ]
+
+    for v, expected in cases do
+        Assert.Equal(expected, Literal.ofValue v)
+
+[<Fact>]
+let ``Ast: AggFunc と BinaryOp の表示名`` () =
+    Assert.Equal("AVG", AggFunc.Avg.Name)
+    Assert.Equal("LIKE", BinaryOp.Like.Display)
+    Assert.Equal<string>("(a LIKE b)", Expr.toDisplayString (binary BinaryOp.Like (name "a") (name "b")))

@@ -68,25 +68,16 @@ let private commitInto (store: RowStore) (nextSeq: uint64) (txn: Transaction) =
     let batches = Transaction.toEntries nextSeq txn |> fst
     RowStore.writeBatches store batches |> ok |> ignore
 
-// ===========================================================================
-// RowStore
-// ===========================================================================
-
-
-// ---------------------------------------------------------------------------
-// TableSchema
-// ---------------------------------------------------------------------------
-
 [<Fact>]
-let ``RowStore: スキーマを AST から作れる`` () =
+let ``TableSchema: スキーマを AST から作れる`` () =
     Assert.Equal("users", usersSchema.Name)
     Assert.Equal<int list>([ 0 ], usersSchema.PrimaryKey)
-    Assert.Equal<string array>([| "id" |], usersSchema.PrimaryKeyColumns)
-    Assert.Equal(1, usersSchema.IndexOf "email")
-    Assert.Equal(-1, usersSchema.IndexOf "nope")
+    Assert.Equal<string array>([| "id" |], TableSchema.primaryKeyColumns usersSchema)
+    Assert.Equal(1, TableSchema.indexOf usersSchema "email")
+    Assert.Equal(-1, TableSchema.indexOf usersSchema "nope")
 
 [<Fact>]
-let ``RowStore: 主キー無し・列無しのテーブルはエラー`` () =
+let ``TableSchema.ofCreateTable: 主キー無し・列無しのテーブルはエラー`` () =
     let noCols =
         {
             Name = "t"
@@ -116,8 +107,35 @@ let ``RowStore: 主キー無し・列無しのテーブルはエラー`` () =
     expectErrorKind ErrorKind.ConstraintViolation "主キー無しのテーブルを許してはいけない" (TableSchema.ofCreateTable noPk)
 
 [<Fact>]
+let ``TableSchema.ofCreateTable: テーブル制約の主キーを使う`` () =
+    let ast =
+        {
+            Name = "composite"
+            IfNotExists = false
+            Columns = [ col "a" DataType.Integer; col "b" DataType.Integer ]
+            Constraints = [ TableConstraint.PrimaryKeyColumns [ "b"; "a" ] ]
+        }
+
+    let schema = ok (TableSchema.ofCreateTable ast)
+    // 列位置に直して昇順に揃う
+    Assert.Equal<int list>([ 0; 1 ], schema.PrimaryKey)
+
+    // 存在しない主キー列はエラー
+    let bad =
+        { ast with
+            Constraints = [ TableConstraint.PrimaryKeyColumns [ "nope" ] ]
+        }
+
+    expectErrorKind ErrorKind.NameError "存在しない主キー列で作れてしまう" (TableSchema.ofCreateTable bad)
+
+[<Fact>]
+let ``TableSchema.requireIndexOf: 無い列はエラー`` () =
+    Assert.Equal<int>(0, ok (TableSchema.requireIndexOf peopleSchema "id"))
+    expectErrorKind ErrorKind.NameError "無い列で位置が返った" (TableSchema.requireIndexOf peopleSchema "nope")
+
+[<Fact>]
 let ``TableSchema.validateRow: 列数不一致はエラー`` () =
-    let schema = TestHelpers.peopleSchema
+    let schema = peopleSchema
     let row = [| SqlValue.Int 7L |]
 
     match TableSchema.validateRow schema row with
@@ -126,7 +144,7 @@ let ``TableSchema.validateRow: 列数不一致はエラー`` () =
 
 [<Fact>]
 let ``TableSchema.validateRow: NOT NULL 違反はエラー`` () =
-    let schema = TestHelpers.peopleSchema
+    let schema = peopleSchema
     let row = [| SqlValue.Null; SqlValue.Text "alice"; SqlValue.Int 20L |]
 
     match TableSchema.validateRow schema row with
@@ -135,7 +153,7 @@ let ``TableSchema.validateRow: NOT NULL 違反はエラー`` () =
 
 [<Fact>]
 let ``TableSchema.validateRow: 正常行は Ok`` () =
-    let schema = TestHelpers.peopleSchema
+    let schema = peopleSchema
     let row = [| SqlValue.Int 7L; SqlValue.Text "alice"; SqlValue.Int 20L |]
 
     match TableSchema.validateRow schema row with
@@ -144,26 +162,22 @@ let ``TableSchema.validateRow: 正常行は Ok`` () =
 
 [<Fact>]
 let ``TableSchema.primaryKeyOf: 主キー列を取り出す`` () =
-    let schema = TestHelpers.peopleSchema
+    let schema = peopleSchema
     let row = [| SqlValue.Int 7L; SqlValue.Text "alice"; SqlValue.Int 20L |]
     let pk = TableSchema.primaryKeyOf schema row
     Assert.Equal<int>(1, pk.Length)
     Assert.Equal(SqlValue.Int 7L, pk.[0])
 
-// ---------------------------------------------------------------------------
-// RowKey / Keyspace
-// ---------------------------------------------------------------------------
-
 [<Fact>]
 let ``RowKey.primary: 主キー列を符号化する`` () =
-    let schema = TestHelpers.peopleSchema
+    let schema = peopleSchema
     let row = [| SqlValue.Int 7L; SqlValue.Text "alice"; SqlValue.Int 20L |]
     let k = RowKey.primary schema row
     Assert.True(k.Length > 0)
 
 [<Fact>]
 let ``RowKey.indexKey: 索引列 + 主キー列を符号化する`` () =
-    let schema = TestHelpers.peopleSchema
+    let schema = peopleSchema
     let idx = schema.Indexes.[0]
     let row = [| SqlValue.Int 7L; SqlValue.Text "alice"; SqlValue.Int 20L |]
     let k = RowKey.indexKey schema idx row
@@ -173,7 +187,7 @@ let ``RowKey.indexKey: 索引列 + 主キー列を符号化する`` () =
 
 [<Fact>]
 let ``RowKey.indexPrefix: 索引列だけを符号化する`` () =
-    let schema = TestHelpers.peopleSchema
+    let schema = peopleSchema
     let idx = schema.Indexes.[0]
     let row = [| SqlValue.Int 7L; SqlValue.Text "alice"; SqlValue.Int 20L |]
     let p = RowKey.indexPrefix schema idx row
@@ -185,7 +199,7 @@ let ``Keyspace: table / index の名前`` () =
     Assert.Equal("i:ix_people_age", Keyspace.index "ix_people_age")
 
 [<Fact>]
-let ``RowStore: keyspace はテーブルと索引で別になる`` () =
+let ``Keyspace: keyspace はテーブルと索引で別になる`` () =
     Assert.Equal<string>("t:users", Keyspace.table "users")
     Assert.Equal<string>("i:users_email", Keyspace.index "users_email")
     Assert.NotEqual<string>(Keyspace.table "users", Keyspace.index "users_email")
@@ -204,10 +218,6 @@ let ``Keyspace: 不正なディレクトリ名は None`` () =
     Assert.True((Keyspace.tryFromDirName "!!!").IsNone)
     Assert.True((Keyspace.tryFromDirName (Keyspace.toDirName "foo")).IsNone)
 
-// ---------------------------------------------------------------------------
-// RowStore / Dml
-// ---------------------------------------------------------------------------
-
 [<Fact>]
 let ``RowStore: keyspace ごとに独立したディレクトリを持つ`` () =
     withDir "rs7" (fun dir ->
@@ -215,25 +225,43 @@ let ``RowStore: keyspace ごとに独立したディレクトリを持つ`` () =
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
         let txn = Dml.insert usersWithEmailIndex txn (rowOf 1 "a@x.com" 1) |> ok
-
         commitInto store 1UL txn
 
         // 主キーのツリーと索引のツリーで別のディレクトリができている
-        let dirs = Directory.GetDirectories(dir)
+        let dirs = Directory.GetDirectories dir
         Assert.True(dirs.Length >= 2)
 
         let hasWal =
             dirs |> Array.exists (fun d -> Directory.GetFiles(d, "*.wal").Length > 0)
 
-        Assert.True(hasWal))
+        Assert.True hasWal)
 
 [<Fact>]
-let ``RowStore: 1 行挿入して主キーで引ける`` () =
+let ``RowStore.openStore: 壊れた keyspace は開けない`` () =
+    withDir "rs-corrupt" (fun dir ->
+        let ksDir = Path.Combine(dir, Keyspace.toDirName "t:broken")
+        Directory.CreateDirectory ksDir |> ignore
+        File.WriteAllText(Path.Combine(ksDir, "CURRENT"), "壊れた CURRENT")
+        expectError "壊れた keyspace を開けてしまう" (RowStore.openStore dir))
+
+[<Fact>]
+let ``RowStore.openStore: 壊れた MANIFEST レコードは読み飛ばす`` () =
+    withDir "rs-manifest" (fun dir ->
+        // ルートの keyspace 開設時（openStore では subdirectory のみ走査）に読ませる
+        let ksDir = Path.Combine(dir, Keyspace.toDirName "t:manifest")
+        Directory.CreateDirectory ksDir |> ignore
+        File.WriteAllText(Path.Combine(ksDir, "CURRENT"), "MANIFEST-000001")
+        // base64 としては正しいが、中身が VersionEdit として壊れている
+        File.WriteAllText(Path.Combine(ksDir, "MANIFEST-000001"), "AA==")
+        // レコード単位で捨てて先へ進む（開けるが、その前後も読める）
+        ok (RowStore.openStore dir) |> ignore)
+
+[<Fact>]
+let ``Dml.getByPrimaryKey: 1 行挿入して主キーで引ける`` () =
     withStore "rs1" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
         let txn = Dml.insert usersWithEmailIndex txn (rowOf 1 "a@example.com" 20) |> ok
-
         commitInto store 1UL txn
 
         let found =
@@ -241,49 +269,10 @@ let ``RowStore: 1 行挿入して主キーで引ける`` () =
 
         match found with
         | Some row -> Assert.Equal<string>("a@example.com", asText row.[1])
-        | None -> Assert.Fail("行が見つからないはず"))
+        | None -> Assert.Fail "行が見つからないはず")
 
 [<Fact>]
-let ``RowStore: NOT NULL 制約違反は弾かれる`` () =
-    let notNull =
-        { ColumnConstraint.Empty with
-            NotNull = true
-        }
-
-    let emailCol = usersWithEmailIndex.Columns.[1]
-
-    let schema =
-        { usersWithEmailIndex with
-            Columns =
-                [
-                    usersWithEmailIndex.Columns.[0]
-                    { emailCol with Constraint = notNull }
-                    usersWithEmailIndex.Columns.[2]
-                ]
-        }
-
-    withStore "rs3" (fun _ ->
-        let mgr = TransactionManager.create ()
-        let _, txn = TransactionManager.beginTxn mgr
-
-        // email が NULL
-        let bad = [| SqlValue.Int 1L; SqlValue.Null; SqlValue.Int 20L |]
-
-        expectErrorKind ErrorKind.ConstraintViolation "NOT NULL 制約違反を検出できなかった" (Dml.insert schema txn bad))
-
-[<Fact>]
-let ``RowStore: 列数が違う行は弾かれる`` () =
-    withStore "rs3b" (fun _ ->
-        let mgr = TransactionManager.create ()
-        let _, txn = TransactionManager.beginTxn mgr
-
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "列数不一致を検出できなかった"
-            (Dml.insert usersWithEmailIndex txn [| SqlValue.Int 1L |]))
-
-[<Fact>]
-let ``RowStore: 複数テーブルは別 keyspace に載る`` () =
+let ``Dml.getByPrimaryKey: 複数テーブルは別 keyspace に載る`` () =
     let other =
         TableSchema.ofCreateTable
             {
@@ -327,11 +316,11 @@ let ``RowStore: 複数テーブルは別 keyspace に載る`` () =
 
         let o = Dml.getByPrimaryKey store other None [| SqlValue.Int 1L |] |> ok
 
-        Assert.True(u.IsSome)
-        Assert.True(o.IsSome))
+        Assert.True u.IsSome
+        Assert.True o.IsSome)
 
 [<Fact>]
-let ``RowStore: 主キーで全行を走査できる`` () =
+let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる`` () =
     withStore "rs6" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
@@ -351,7 +340,7 @@ let ``RowStore: 主キーで全行を走査できる`` () =
             Assert.Equal<int64>(int64 (i + 1), asInt rows.[i].[0]))
 
 [<Fact>]
-let ``RowStore: 主キーで全行を走査できる（limit）`` () =
+let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる（limit）`` () =
     withStore "rs6b" (fun store ->
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
@@ -368,7 +357,84 @@ let ``RowStore: 主キーで全行を走査できる（limit）`` () =
         Assert.Equal(2, rows.Length))
 
 [<Fact>]
-let ``RowStore: 存在しない行の削除は NotFound`` () =
+let ``Dml.scanByIndexPrefix: limit で件数を絞れる`` () =
+    let schema =
+        withIndex
+            usersSchema
+            {
+                Name = "users_age"
+                Columns = [ "age" ]
+                Unique = false
+            }
+
+    withStore "rs-idx-limit" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+
+        let txn =
+            [ 1; 2; 3 ]
+            |> List.fold (fun t i -> Dml.insert schema t (rowOf i (sprintf "u%d@x.com" i) 20) |> ok) txn
+
+        commitInto store 1UL txn
+
+        let all =
+            ok (Dml.scanByIndexPrefix store schema.Indexes.[0] None [| SqlValue.Int 20L |] 0)
+
+        Assert.Equal(3, all.Length)
+
+        let limited =
+            ok (Dml.scanByIndexPrefix store schema.Indexes.[0] None [| SqlValue.Int 20L |] 2)
+
+        Assert.Equal(2, limited.Length))
+
+[<Fact>]
+let ``Dml.insert: NOT NULL 制約違反は弾かれる`` () =
+    let notNull =
+        { ColumnConstraint.Empty with
+            NotNull = true
+        }
+
+    let emailCol = usersWithEmailIndex.Columns.[1]
+
+    let schema =
+        { usersWithEmailIndex with
+            Columns =
+                [
+                    usersWithEmailIndex.Columns.[0]
+                    { emailCol with Constraint = notNull }
+                    usersWithEmailIndex.Columns.[2]
+                ]
+        }
+
+    let mgr = TransactionManager.create ()
+    let _, txn = TransactionManager.beginTxn mgr
+    // email が NULL
+    let bad = [| SqlValue.Int 1L; SqlValue.Null; SqlValue.Int 20L |]
+    expectErrorKind ErrorKind.ConstraintViolation "NOT NULL 制約違反を検出できなかった" (Dml.insert schema txn bad)
+
+[<Fact>]
+let ``Dml.insert: 列数が違う行は弾かれる`` () =
+    let mgr = TransactionManager.create ()
+    let _, txn = TransactionManager.beginTxn mgr
+
+    expectErrorKind
+        ErrorKind.ConstraintViolation
+        "列数不一致を検出できなかった"
+        (Dml.insert usersWithEmailIndex txn [| SqlValue.Int 1L |])
+
+[<Fact>]
+let ``Dml.updateByPrimaryKey: 存在しない行の更新は NotFound`` () =
+    withStore "rs-upd-miss" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+
+        expectErrorKind
+            ErrorKind.NotFound
+            "存在しない行の更新を許してはいけない"
+            (Dml.updateByPrimaryKey store usersWithEmailIndex None txn [| SqlValue.Int 999L |] (rowOf 999 "a@x.com" 1)))
+
+[<Fact>]
+let ``Dml.deleteByPrimaryKey: 存在しない行の削除は NotFound`` () =
     withStore "rs4b" (fun store ->
         let mgr = TransactionManager.create ()
         let _, delTxn = TransactionManager.beginTxn mgr

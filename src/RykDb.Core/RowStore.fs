@@ -13,10 +13,6 @@ namespace RykDb.Core
 
 open System.IO
 
-// ---------------------------------------------------------------------------
-// スキーマ
-// ---------------------------------------------------------------------------
-
 /// 索引の定義。
 type internal IndexSchema =
     {
@@ -38,23 +34,6 @@ type internal TableSchema =
         /// この表の索引
         Indexes: IndexSchema list
     }
-
-    /// 列名 → 位置。
-    member this.IndexOf(column: string) =
-        this.Columns
-        |> List.tryFindIndex (fun c -> c.Name = column)
-        |> Option.map (fun i -> i)
-        |> Option.defaultValue -1
-
-    /// 列名 → 位置（見つからなければエラー）。
-    member this.RequireIndexOf(column: string) =
-        match this.IndexOf column with
-        | i when i >= 0 -> ret i
-        | _ -> err (sprintf "テーブル %s に列 %s がありません" this.Name column |> DbError.name)
-
-    /// 主キー列名。
-    member this.PrimaryKeyColumns =
-        this.PrimaryKey |> List.map (fun i -> this.Columns.[i].Name) |> List.toArray
 
 module internal TableSchema =
     /// CreateTable の AST からスキーマを作る。
@@ -117,11 +96,28 @@ module internal TableSchema =
     let primaryKeyOf (schema: TableSchema) (row: SqlValue array) =
         schema.PrimaryKey |> List.map (fun i -> row.[i]) |> List.toArray
 
+    /// 主キー列名。
+    let primaryKeyColumns (schema: TableSchema) =
+        schema.PrimaryKey |> List.map (fun i -> schema.Columns.[i].Name) |> List.toArray
+
+    /// 列名 → 位置。
+    let indexOf (schema: TableSchema) (column: string) =
+        schema.Columns
+        |> List.tryFindIndex (fun c -> c.Name = column)
+        |> Option.map (fun i -> i)
+        |> Option.defaultValue -1
+
+    /// 列名 → 位置（見つからなければエラー）。
+    let requireIndexOf (schema: TableSchema) (column: string) =
+        match indexOf schema column with
+        | i when i >= 0 -> ret i
+        | _ -> err (sprintf "テーブル %s に列 %s がありません" schema.Name column |> DbError.name)
+
 module internal RowKey =
     let private indexValues (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
         index.Columns
-        |> List.filter (fun name -> schema.IndexOf name >= 0)
-        |> List.map (fun name -> row.[schema.IndexOf name])
+        |> List.filter (fun name -> TableSchema.indexOf schema name >= 0)
+        |> List.map (fun name -> row.[TableSchema.indexOf schema name])
 
     /// 主キーの LSM へ入れるキー。
     let primary (schema: TableSchema) (row: SqlValue array) =
@@ -218,12 +214,6 @@ module internal RowStore =
             return { Root = root; Engines = engines }
         }
 
-    /// 全 keyspace の NextSeqNo の最大値 − 1（＝保存済みの SeqNo）。
-    let lastSeqNo (store: RowStore) =
-        store.Engines
-        |> Map.toList
-        |> List.fold (fun acc (_, (e, _)) -> max acc (if e.NextSeqNo = 0UL then 0UL else e.NextSeqNo - 1UL)) 0UL
-
     /// keyspace のエンジン（無ければ作る）。
     let engine (store: RowStore) (keyspace: string) = ensure store keyspace |> Result.map fst
 
@@ -286,6 +276,12 @@ module internal RowStore =
     let scan (store: RowStore) (keyspace: string) (startKey: byte array) (limit: int) =
         scanAt store keyspace startKey None limit
 
+    /// 全 keyspace の NextSeqNo の最大値 − 1（＝保存済みの SeqNo）。
+    let lastSeqNo (store: RowStore) =
+        store.Engines
+        |> Map.toList
+        |> List.fold (fun acc (_, (e, _)) -> max acc (if e.NextSeqNo = 0UL then 0UL else e.NextSeqNo - 1UL)) 0UL
+
     /// 全 keyspace を close する。
     let close (store: RowStore) =
         store.Engines
@@ -333,17 +329,6 @@ module internal Dml =
                         ret (Transaction.put removed space newKey newValue))
             txn
 
-    /// 1行を transaction に積む（まだ DB には入らない）。
-    /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。
-    let insert (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
-        result {
-            do! TableSchema.validateRow schema row
-            let tks = tableSpace schema
-            let pk = RowKey.primary schema row
-            let next = Transaction.put txn tks pk row
-            return! applyIndexChange schema next None (Some row)
-        }
-
     /// 主キーで既存行を取り出す。
     let getByPrimaryKey (store: RowStore) (schema: TableSchema) (visible: uint64 option) (key: SqlValue array) =
         RowStore.getAt store (tableSpace schema) (KeyBuilder.ofValues key) visible
@@ -380,25 +365,15 @@ module internal Dml =
             else
                 matched)
 
-    /// 主キーで削除する。
-    /// 主キーと全索引に tombstone を書く。
-    /// 元の行を取得してから索引キーを組み立てるので、NOT NULL でも壊れない。
-    let deleteByPrimaryKey
-        (store: RowStore)
-        (schema: TableSchema)
-        (visible: uint64 option)
-        (txn: Transaction)
-        (key: SqlValue array)
-        =
+    /// 1行を transaction に積む（まだ DB には入らない）。
+    /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。
+    let insert (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
         result {
-            let! row = getByPrimaryKey store schema visible key
-
-            match row with
-            | None -> return! err (sprintf "削除する行が見つかりません: %s" schema.Name |> DbError.notFound)
-            | Some oldRow ->
-                let pk = RowKey.primary schema oldRow
-                let next = Transaction.remove txn (tableSpace schema) pk
-                return! applyIndexChange schema next (Some oldRow) None
+            do! TableSchema.validateRow schema row
+            let tks = tableSpace schema
+            let pk = RowKey.primary schema row
+            let next = Transaction.put txn tks pk row
+            return! applyIndexChange schema next None (Some row)
         }
 
     /// 主キーで更新する（主キーと全索引に新しい値を書き込む）。
@@ -429,4 +404,25 @@ module internal Dml =
                 let newPk = RowKey.primary schema newRow
                 let afterMain = Transaction.put txn tks newPk newRow
                 return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
+        }
+
+    /// 主キーで削除する。
+    /// 主キーと全索引に tombstone を書く。
+    /// 元の行を取得してから索引キーを組み立てるので、NOT NULL でも壊れない。
+    let deleteByPrimaryKey
+        (store: RowStore)
+        (schema: TableSchema)
+        (visible: uint64 option)
+        (txn: Transaction)
+        (key: SqlValue array)
+        =
+        result {
+            let! row = getByPrimaryKey store schema visible key
+
+            match row with
+            | None -> return! err (sprintf "削除する行が見つかりません: %s" schema.Name |> DbError.notFound)
+            | Some oldRow ->
+                let pk = RowKey.primary schema oldRow
+                let next = Transaction.remove txn (tableSpace schema) pk
+                return! applyIndexChange schema next (Some oldRow) None
         }

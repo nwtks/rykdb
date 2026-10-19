@@ -92,6 +92,119 @@ let ``Catalog: 主キー列が存在しない場合はエラー`` () =
     expectError "存在しない主キー列で復元できました" (Catalog.toSchema bad)
 
 [<Fact>]
+let ``Catalog: removeIndex は指定した索引だけ消す`` () =
+    let ixA =
+        {
+            IndexName = "ix_a"
+            TableName = "t"
+            Columns = [ "a" ]
+            Unique = false
+        }
+
+    let ixB =
+        {
+            IndexName = "ix_b"
+            TableName = "t"
+            Columns = [ "b" ]
+            Unique = false
+        }
+
+    let c =
+        Catalog.empty
+        |> (fun c -> Catalog.addIndex c ixA)
+        |> (fun c -> Catalog.addIndex c ixB)
+        |> (fun c -> Catalog.removeIndex c "IX_A") // 大文字小文字は無視
+
+    Assert.True(Catalog.findIndex c "ix_a" |> Option.isNone)
+    Assert.True(Catalog.findIndex c "ix_b" |> Option.isSome)
+
+[<Fact>]
+let ``Catalog: 未知のキーや不正な値は読み飛ばす`` () =
+    withStore "cat-junk" (fun store ->
+        let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s
+
+        // 有効なテーブルを保存しておき、その値を TEXT として持ち直して読ませる
+        let people = Catalog.toDefinition peopleSchema
+        let store = ok (Catalog.save store (Catalog.addTable Catalog.empty people))
+        let raw = ok (RowStore.scan store "__catalog__" [||] 0)
+
+        let value =
+            match raw.[0] with
+            | _, Some v -> v
+            | _, None -> failwith "カタログの値がありません"
+
+        // Latin1 は 1 バイト = 1 文字なので、ASCII の定義なら TEXT として往復できる
+        let asText =
+            match value with
+            | [| SqlValue.Blob b |] -> System.Text.Encoding.Latin1.GetString b
+            | _ -> failwith "BLOB ではありません"
+
+        let entries =
+            [|
+                // 短すぎるキー（プレフィクスの判定まで届かない）
+                Entry.put (utf8 "x") 100UL [| SqlValue.Blob [||] |]
+                // 未知のプレフィクス
+                Entry.put (utf8 "junk:y") 101UL [| SqlValue.Blob [||] |]
+                // 1 列の BLOB / TEXT ではない値
+                Entry.put (utf8 "table:weird") 102UL [| SqlValue.Blob [||]; SqlValue.Int 1L |]
+                // 同じ内容を TEXT として持つ別テーブル
+                Entry.put (utf8 "table:people2") 103UL [| SqlValue.Text asText |]
+            |]
+
+        let store = ok (RowStore.writeBatches store [ ("__catalog__", entries) ])
+        let loaded = ok (Catalog.load store)
+
+        Assert.Equal<int>(2, loaded.Tables.Length)
+        Assert.True(Catalog.findTable loaded "people2" |> Option.isSome)
+        Assert.False(Catalog.findTable loaded "weird" |> Option.isSome))
+
+[<Fact>]
+let ``Catalog: 壊れた定義はエラー`` () =
+    withStore "cat-broken" (fun store ->
+        let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s
+
+        let store =
+            ok (
+                RowStore.writeBatches
+                    store
+                    [
+                        ("__catalog__", [| Entry.put (utf8 "table:broken") 1UL [| SqlValue.Blob [||] |] |])
+                    ]
+            )
+
+        expectError "壊れたテーブル定義を読めてしまう" (Catalog.load store)
+
+        // 索引定義も同様
+        let store =
+            ok (
+                RowStore.writeBatches
+                    store
+                    [
+                        ("__catalog__", [| Entry.put (utf8 "index:broken") 2UL [| SqlValue.Blob [||] |] |])
+                    ]
+            )
+
+        expectError "壊れた索引定義を読めてしまう" (Catalog.load store))
+
+[<Fact>]
+let ``Catalog: カタログ外のエントリは保存時に掃除される`` () =
+    withStore "cat-sweep" (fun store ->
+        let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s
+
+        let store =
+            ok (
+                RowStore.writeBatches
+                    store
+                    [
+                        ("__catalog__", [| Entry.put (utf8 "junk:x") 1UL [| SqlValue.Blob [||] |] |])
+                    ]
+            )
+
+        // 空カタログを保存 → 未知キーは tombstone で消える
+        let store = ok (Catalog.save store Catalog.empty)
+        Assert.Equal<int>(0, (ok (Catalog.load store)).Tables.Length))
+
+[<Fact>]
 let ``Catalog: 保存したカタログを読み込める`` () =
     withStore "cat1" (fun store ->
         let people = Catalog.toDefinition peopleSchema

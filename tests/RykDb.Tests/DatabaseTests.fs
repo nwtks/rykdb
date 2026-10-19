@@ -101,6 +101,55 @@ let ``Database: ROLLBACK で元に戻る`` () =
         let _db12, res = ok (db5.Query "SELECT id FROM t")
         Assert.Equal<int>(1, res.Rows.Length))
 
+[<Fact>]
+let ``Database: 二重 Begin と空の Commit / Rollback`` () =
+    withDb "tx3" (fun db0 ->
+        // 二重 Begin は進行中の transaction を維持する
+        let db1 = db0.Begin()
+        let db2 = db1.Begin()
+        Assert.True(db2.InTransaction)
+
+        // DML なしの Commit は Active の transaction をそのまま流す
+        let db3 = ok (db2.Commit())
+        Assert.False(db3.InTransaction)
+
+        // transaction が無い状態の Commit はエラー
+        expectError "transaction が無い Commit はエラー" (db3.Commit())
+
+        // transaction が無い状態の Rollback は自分自身を返す
+        let db4 = db3.Rollback()
+        Assert.False(db4.InTransaction))
+
+[<Fact>]
+let ``Database: transaction 中の文エラーはそのまま返る`` () =
+    withDb "tx4" (fun db0 ->
+        let db1 = db0.Begin()
+        expectError "BEGIN 中の存在しないテーブル" (db1.Execute "SELECT * FROM nope"))
+
+[<Fact>]
+let ``Database: SQL の BEGIN / COMMIT / ROLLBACK は受理される（文としては無効）`` () =
+    // docs/sql-reference.md の既知の制限どおり、文としての txn 制御は何もしない。
+    withDb "tx5" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "BEGIN"
+        let db3 = exec db2 "INSERT INTO t VALUES (1)"
+        let db4 = exec db3 "COMMIT"
+        let db5, res = ok (db4.Query "SELECT id FROM t")
+
+        Assert.Equal<int>(1, res.Rows.Length)
+        // SQL の BEGIN は session の transaction を作らない
+        Assert.False(db5.InTransaction)
+        let db6 = exec db5 "ROLLBACK"
+        let _, after = ok (db6.Query "SELECT id FROM t")
+        Assert.Equal<int>(1, after.Rows.Length))
+
+[<Fact>]
+let ``Database: Root はルートディレクトリを返す`` () =
+    withDir "rootprop" (fun dir ->
+        let db = ok (Database.openWith dir)
+        Assert.Equal(dir, db.Root)
+        ok (db.Close()))
+
 // ---------------------------------------------------------------------------
 // 実行（Execute）: DDL → DML → SELECT → エラー → 回帰 → E2E → 性能 → 末尾再帰
 // ---------------------------------------------------------------------------
@@ -133,6 +182,22 @@ let ``Database: CREATE TABLE の重複はエラー（IF NOT EXISTS なし）`` (
             (db1.Execute "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"))
 
 [<Fact>]
+let ``Database: テーブル制約の複合主キー`` () =
+    withDb "ddl6" (fun db0 ->
+        // 主キーをテーブル制約で指定（列制約ではない）
+        let db1 =
+            exec db0 "CREATE TABLE t (a INTEGER, b INTEGER, v INTEGER, PRIMARY KEY (a, b))"
+
+        let db2, ins = ok (db1.Execute "INSERT INTO t (a, b) VALUES (1, 2), (1, 3)")
+        Assert.Equal<int>(2, ins.RowsAffected)
+
+        // 同じ a でも b が違えば別の行
+        let _, res = ok (db2.Query "SELECT a, b FROM t ORDER BY b")
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int64>(2L, asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(3L, asInt res.Rows.[1].[1]))
+
+[<Fact>]
 let ``Database: DROP TABLE でテーブルが消える`` () =
     withDb "ddl4" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
@@ -151,6 +216,52 @@ let ``Database: 存在しない列の索引はエラー`` () =
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
 
         expectError "存在しない列の CREATE INDEX が OK になっています" (db1.Execute "CREATE INDEX ix ON people (nope)"))
+
+[<Fact>]
+let ``Database: 存在しないテーブルの索引と索引名の重複はエラー`` () =
+    withDb "ddl8" (fun db0 ->
+        expectError "存在しないテーブルの CREATE INDEX が OK になっています" (db0.Execute "CREATE INDEX ix ON nope (a)")
+
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let db2 = exec db1 "CREATE INDEX ix_a ON t (a)"
+
+        expectError "同名の CREATE INDEX が OK になっています" (db2.Execute "CREATE INDEX ix_a ON t (a)"))
+
+[<Fact>]
+let ``Database: DROP INDEX で索引が消える`` () =
+    withDb "ddl9" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let db2, _ = execRes db1 "INSERT INTO t VALUES (1, 10)"
+
+        let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
+        // 索引を使う検索が通る
+        let _, found = ok (db3.Query "SELECT id FROM t WHERE a = 10")
+        Assert.Equal<int>(1, found.Rows.Length)
+
+        let db4 = exec db3 "DROP INDEX ix_a"
+        let _, after = ok (db4.Query "SELECT id FROM t WHERE a = 10")
+        Assert.Equal<int>(1, after.Rows.Length)
+
+        // 消えたので同じ名前で作り直せる
+        let db5 = exec db4 "CREATE INDEX ix_a ON t (a)"
+        let _, again = ok (db5.Query "SELECT id FROM t WHERE a = 10")
+        Assert.Equal<int>(1, again.Rows.Length))
+
+[<Fact>]
+let ``Database: DROP INDEX IF EXISTS と存在しない索引のエラー`` () =
+    withDb "ddl10" (fun db0 ->
+        let db1 = exec db0 "DROP INDEX IF EXISTS nothing"
+
+        expectError "存在しない DROP INDEX が OK になっています" (db1.Execute "DROP INDEX nothing"))
+
+[<Fact>]
+let ``Database: DEFAULT 付きの列定義も保存できる`` () =
+    withDb "ddl-default" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT DEFAULT 'x')"
+
+        // 保存時に DEFAULT 式が書かれる（再読込後に既定値として使われるかは別問題）
+        let _, rows = ok (db1.Query "SELECT id, v FROM t")
+        Assert.Empty rows.Rows)
 
 [<Fact>]
 let ``Database: INSERT した行が SELECT で見える`` () =
@@ -258,6 +369,27 @@ let ``Database: GROUP BY と COUNT`` () =
         Assert.Equal<int64>(1L, asInt res.Rows.[0].[1])
         Assert.Equal<int64>(30L, asInt res.Rows.[1].[0])
         Assert.Equal<int64>(2L, asInt res.Rows.[1].[1]))
+
+[<Fact>]
+let ``Database: HAVING でグループを絞る`` () =
+    seeded "sel-having" (fun db ->
+        let db2, _r = execRes db "INSERT INTO people VALUES (4,'dave',30)"
+
+        // age 30 のグループ（2 人）だけ残る
+        let _q, res =
+            execRes db2 "SELECT age, COUNT(*) FROM people GROUP BY age HAVING COUNT(*) > 1 ORDER BY age"
+
+        Assert.Equal<int>(1, res.Rows.Length)
+        Assert.Equal<int64>(30L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(2L, asInt res.Rows.[0].[1])
+
+        // 集約を含まない HAVING も動く（グループ側の値で評価される）
+        let _q2, res2 =
+            execRes db2 "SELECT age FROM people GROUP BY age HAVING age >= 30 ORDER BY age"
+
+        Assert.Equal<int>(2, res2.Rows.Length)
+        Assert.Equal<int64>(30L, asInt res2.Rows.[0].[0])
+        Assert.Equal<int64>(35L, asInt res2.Rows.[1].[0]))
 
 [<Fact>]
 let ``Database: LIMIT`` () =
@@ -606,6 +738,36 @@ let ``Database: 索引の等価検索は一致する行をすべて返す`` () =
         Assert.Equal<int>(2, res.Rows.Length)
         Assert.Equal<int64>(2L, asInt res.Rows.[0].[0])
         Assert.Equal<int64>(3L, asInt res.Rows.[1].[0]))
+
+[<Fact>]
+let ``Database: 索引列を更新すると索引も追従する`` () =
+    withDb "reg-index-upd" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1,10),(2,20)")
+        let db3 = exec db2 "CREATE INDEX ix_g ON t (g)"
+        // 索引キーが変わる更新（古いキーの削除 + 新しいキーの追加）
+        let db4, upd = ok (db3.Execute "UPDATE t SET g = 99 WHERE id = 1")
+        Assert.Equal<int>(1, upd.RowsAffected)
+
+        let _, hit = ok (db4.Query "SELECT id FROM t WHERE g = 99")
+        Assert.Equal<int>(1, hit.Rows.Length)
+        Assert.Equal<int64>(1L, asInt hit.Rows.[0].[0])
+
+        // 古い索引エントリからは復活しない
+        let _, miss = ok (db4.Query "SELECT id FROM t WHERE g = 10")
+        Assert.Equal<int>(0, miss.Rows.Length))
+
+[<Fact>]
+let ``Database: 負数の主キー等値検索`` () =
+    withDb "reg-negpk" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (-5, 50), (5, 50)")
+        // 主キー検索（Unary Neg のリテラルから PkLookup が選ばれる）
+        let _, res = ok (db2.Query "SELECT id, v FROM t WHERE id = -5")
+
+        Assert.Equal<int>(1, res.Rows.Length)
+        Assert.Equal<int64>(-5L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(50L, asInt res.Rows.[0].[1]))
 
 // ===========================================================================
 // E2E（通し経路）

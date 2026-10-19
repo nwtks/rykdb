@@ -830,7 +830,9 @@ module internal Parser =
                     else
                         expectSymbol st ")"
                         |> Result.map (fun (_, st) ->
-                            List.rev acc |> List.choose (fun (n, ok) -> if ok then Some("n", n) else None), st)
+                            List.rev (v :: acc)
+                            |> List.choose (fun (n, ok) -> if ok then Some("n", n) else None),
+                            st)
 
             loop [] (advance st)
 

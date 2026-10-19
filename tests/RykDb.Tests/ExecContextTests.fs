@@ -55,6 +55,27 @@ let ``ExecContext.schemaOf: 未登録は NameError`` () =
         | Ok _ -> Assert.Fail "NameError になるべき")
 
 [<Fact>]
+let ``ExecContext.schemaOf: 大文字小文字違いのキーでも引ける`` () =
+    withStore "ec-schemaof-alias" (fun store ->
+        let c0 = ExecContext.create store (Snapshot.noLimit)
+        let c1 = ExecContext.withSchema c0 "People" peopleSchema
+
+        // Map は Ordinal なので完全一致しないが、eqName で一致するキーへ落ちる
+        let s = ok (ExecContext.schemaOf c1 "people")
+        Assert.Equal("people", s.Name))
+
+[<Fact>]
+let ``ExecContext.schemaOf: カタログのテーブルへフォールバックする`` () =
+    withStore "ec-schemaof-cat" (fun store ->
+        let cat = Catalog.addTable Catalog.empty (Catalog.toDefinition peopleSchema)
+        let c0 = ExecContext.create store (Snapshot.noLimit)
+        let c1 = ExecContext.withCatalog c0 cat
+
+        // Schemas に無くても Catalog から引ける
+        let s = ok (ExecContext.schemaOf c1 "PEOPLE")
+        Assert.Equal("people", s.Name))
+
+[<Fact>]
 let ``ExecContext.table: 登録スキーマで全走査`` () =
     withStore "ec-table" (fun store ->
         let c0 = ExecContext.create store (Snapshot.noLimit)

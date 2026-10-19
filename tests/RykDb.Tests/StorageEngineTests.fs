@@ -30,7 +30,8 @@ let private pickFirstLevel =
 /// ファイルの Bloom を読み、[lo..hi] の範囲で「含まれないのに偽陽性で通る」キーを探す。
 /// Bloom は決定的なので、同じファイルなら常に同じ結果になる。
 let private findBloomFalsePositive (dir: string) (fileNumber: int64) (lo: int) (hi: int) =
-    let reader = ok (Sstable.openTable (File.ReadAllBytes(Sstable.path dir fileNumber)))
+    let reader =
+        ok (Sstable.openTable (File.ReadAllBytes(FileMetaData.path dir fileNumber)))
 
     [ lo..hi ]
     |> List.tryPick (fun i ->
@@ -39,7 +40,8 @@ let private findBloomFalsePositive (dir: string) (fileNumber: int64) (lo: int) (
 
 /// ファイルの Bloom を読み、[lo..hi] の範囲で「確実に含まれない」と言われるキーを探す。
 let private findBloomMiss (dir: string) (fileNumber: int64) (lo: int) (hi: int) =
-    let reader = ok (Sstable.openTable (File.ReadAllBytes(Sstable.path dir fileNumber)))
+    let reader =
+        ok (Sstable.openTable (File.ReadAllBytes(FileMetaData.path dir fileNumber)))
 
     [ lo..hi ]
     |> List.tryPick (fun i ->
@@ -49,7 +51,7 @@ let private findBloomMiss (dir: string) (fileNumber: int64) (lo: int) (hi: int) 
 /// SSTable の本文を書き換え、Footer のチェックサムを合わせ直す。
 /// 「開けるが中身が壊れたファイル」を作る（FooterSize = 80、checksum は先頭から 76 バイト目）。
 let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array -> unit) =
-    let path = Sstable.path dir fileNumber
+    let path = FileMetaData.path dir fileNumber
     let data = File.ReadAllBytes path
     patch data
 
@@ -60,6 +62,9 @@ let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array ->
     data.[footerStart + 78] <- byte (checksum >>> 16)
     data.[footerStart + 79] <- byte (checksum >>> 24)
     File.WriteAllBytes(path, data)
+
+let private rowKey (i: int) =
+    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
 
 [<Fact>]
 let ``StorageEngine.getAt: put して memtable から引ける`` () =
@@ -82,6 +87,32 @@ let ``StorageEngine.getAt: 削除は tombstone になる`` () =
             match ok (StorageEngine.getAt engine None (intKey 1)) with
             | Some e -> Assert.True e.IsDelete
             | None -> Assert.Fail "tombstone が残るはず"))
+
+[<Fact>]
+let ``StorageEngine.getAt: 古い snapshot からは commit 前の版が見える`` () =
+    withDir "mv1" (fun dir ->
+        let engine = StorageEngine.openDatabase dir |> ok
+        let engine = StorageEngine.put engine (rowKey 1) [| SqlValue.Int 1L |] |> ok
+        let snapBefore = engine.NextSeqNo - 1UL
+        let engine = StorageEngine.put engine (rowKey 1) [| SqlValue.Int 99L |] |> ok
+        // memtable には同じキーの 2 版がある
+        Assert.Equal(2, engine.Mem.Count)
+
+        let newest = StorageEngine.getAt engine (Some engine.NextSeqNo) (rowKey 1) |> ok
+
+        match newest with
+        | Some e -> Assert.Equal<int64>(99L, asInt e.Value.Value.[0])
+        | None -> Assert.Fail "最新版が見つからないはず"
+
+        let older = StorageEngine.getAt engine (Some snapBefore) (rowKey 1) |> ok
+
+        match older with
+        | Some e -> Assert.Equal<int64>(1L, asInt e.Value.Value.[0])
+        | None -> Assert.Fail "古い版が見つからないはず"
+
+        // snapshot が古すぎると「まだ書かれていない」ことになる
+        let none = StorageEngine.getAt engine (Some 0UL) (rowKey 1) |> ok
+        Assert.True none.IsNone)
 
 [<Fact>]
 let ``StorageEngine.getAt: ファイルが消えていれば IoError`` () =
@@ -176,7 +207,7 @@ let ``StorageEngine.getAt: 壊れたブロックは CorruptionError`` () =
 
             // ブロック末尾の restart 件数を巨大値にして壊し、チェックサムは合わせ直す
             let block =
-                (ok (Sstable.openTable (File.ReadAllBytes(Sstable.path dir 10L)))).Index.[0]
+                (ok (Sstable.openTable (File.ReadAllBytes(FileMetaData.path dir 10L)))).Index.[0]
 
             patchSstable dir 10L (fun data ->
                 let at = block.Offset + block.Length - 4
@@ -236,6 +267,22 @@ let ``StorageEngine.scanAt: limit が効く`` () =
             Assert.Equal(2, scanned.Length)))
 
 [<Fact>]
+let ``StorageEngine.scanAt: scan も snapshot で版を絞る`` () =
+    withDir "mv2" (fun dir ->
+        let engine = StorageEngine.openDatabase dir |> ok
+        let engine = StorageEngine.put engine (rowKey 1) [| SqlValue.Int 1L |] |> ok
+        let snapBefore = engine.NextSeqNo - 1UL
+        let engine = StorageEngine.put engine (rowKey 1) [| SqlValue.Int 2L |] |> ok
+        let engine = StorageEngine.put engine (rowKey 2) [| SqlValue.Int 20L |] |> ok
+
+        let old = StorageEngine.scanAt engine (Some snapBefore) [||] 0 |> ok
+        Assert.Equal(1, old.Length)
+        Assert.Equal<int64>(1L, asInt old.[0].Value.Value.[0])
+
+        let all = StorageEngine.scanAt engine None [||] 0 |> ok
+        Assert.Equal(2, all.Length))
+
+[<Fact>]
 let ``StorageEngine: flush すると SSTable から引ける`` () =
     withDir "se2" (fun dir ->
         withEngine dir (fun engine ->
@@ -258,6 +305,28 @@ let ``StorageEngine: flush 済みと memtable をまたいで scan できる`` (
             let got = ok (StorageEngine.scanAt engine None [||] 0)
             Assert.Equal(3, got.Length)
             Assert.Equal<byte array>(intKey 3, got.[2].Key)))
+
+[<Fact>]
+let ``StorageEngine: flush 後も古い snapshot が効く`` () =
+    withDir "mv3" (fun dir ->
+        let engine = StorageEngine.openDatabase dir |> ok
+        let engine = StorageEngine.put engine (rowKey 1) [| SqlValue.Int 1L |] |> ok
+        let engine = StorageEngine.flush engine |> ok
+
+        // 古い版が SSTable にある状態で新しい版を書く
+        let engine = StorageEngine.put engine (rowKey 1) [| SqlValue.Int 2L |] |> ok
+        let old = StorageEngine.getAt engine (Some 1UL) (rowKey 1) |> ok
+
+        match old with
+        | Some e -> Assert.Equal<int64>(1L, asInt e.Value.Value.[0])
+        | None -> Assert.Fail "SSTable にある古い版が見つからないはず"
+
+        let latest = StorageEngine.getAt engine None (rowKey 1) |> ok
+
+        match latest with
+        | Some e -> Assert.Equal<int64>(2L, asInt e.Value.Value.[0])
+        | None -> Assert.Fail "memtable にある新しい版が見つからないはず")
+
 
 [<Fact>]
 let ``StorageEngine: WAL は flush 後に切り替わる`` () =
@@ -325,12 +394,12 @@ let ``StorageEngine: Version に無い SSTable は開き直しで回収される
         let engine = ok (StorageEngine.flush engine)
         let referenced = Version.allFiles engine.Version |> List.map _.FileNumber
         // Version が参照しないファイルを置く
-        File.WriteAllBytes(Sstable.path dir 9L, [||])
+        File.WriteAllBytes(FileMetaData.path dir 9L, [||])
 
         let reopened = ok (StorageEngine.openDatabase dir)
         Assert.Equal<int64 list>(referenced, Version.allFiles reopened.Version |> List.map _.FileNumber)
-        Assert.True(File.Exists(Sstable.path dir (List.exactlyOne referenced)))
-        Assert.False(File.Exists(Sstable.path dir 9L)))
+        Assert.True(File.Exists(FileMetaData.path dir (List.exactlyOne referenced)))
+        Assert.False(File.Exists(FileMetaData.path dir 9L)))
 
 [<Fact>]
 let ``StorageEngine: 存在しない SSTable は Version から落とされる`` () =
@@ -403,11 +472,11 @@ let ``StorageEngine.maybeCompact: L1→L2 を反映し、入力ファイルを�
         Assert.Empty(compacted.Version.Files.[1])
         Assert.Equal(1, compacted.Version.Files.[2].Length)
         // 入力ファイルは消え、出力ファイルだけが残る
-        Assert.False(File.Exists(Sstable.path dir 10L))
-        Assert.False(File.Exists(Sstable.path dir 11L))
+        Assert.False(File.Exists(FileMetaData.path dir 10L))
+        Assert.False(File.Exists(FileMetaData.path dir 11L))
 
         let out = compacted.Version.Files.[2].[0]
-        Assert.True(File.Exists(Sstable.path dir out.FileNumber))
+        Assert.True(File.Exists(FileMetaData.path dir out.FileNumber))
 
         // データは引ける（key3 は新しい seq 13 の版）
         match ok (StorageEngine.getAt compacted None (intKey 3)) with
@@ -451,7 +520,7 @@ let ``StorageEngine.maybeCompact: 全部 tombstone なら出力なしで入力�
 
             let compacted = ok (StorageEngine.maybeCompact engine)
             Assert.Empty(Version.allFiles compacted.Version)
-            Assert.False(File.Exists(Sstable.path dir 10L))
+            Assert.False(File.Exists(FileMetaData.path dir 10L))
 
             // MANIFEST にも反映されている（開き直しても空のまま）
             let reopened = ok (StorageEngine.openDatabase dir)

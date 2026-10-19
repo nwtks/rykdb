@@ -194,6 +194,110 @@ let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
         Assert.Equal<int64>(31L, asInt rows.[1].[2]))
 
 [<Fact>]
+let ``StatementResult: 表示行はヘッダ・区切り・行を並べる`` () =
+    Assert.Equal<string list>([ "(0 rows)" ], StatementResult.empty.ToDisplayLines())
+
+    let r =
+        {
+            RowsAffected = 0
+            Columns = [| "a"; "b" |]
+            Rows = [| [| SqlValue.Int 1L; SqlValue.Text "x" |] |]
+        }
+
+    Assert.Equal<string list>([ "a | b"; "-----"; "  1, 'x'" ], r.ToDisplayLines())
+
+[<Fact>]
+let ``DML: INSERT の値の評価失敗はエラー`` () =
+    withStore "ins-eval" (fun _ ->
+        let mgr = TransactionManager.create ()
+        let mgr, txn = TransactionManager.beginTxn mgr
+
+        // 定数式として評価できない列参照
+        let bad = [ [ col "nope" ] ]
+
+        expectError "評価できない式が OK になっています" (DmlOps.insert peopleSchema txn (Some [ "id" ]) bad))
+
+[<Fact>]
+let ``DML: INSERT の型強制失敗はエラー`` () =
+    withStore "ins-coerce" (fun _ ->
+        let mgr = TransactionManager.create ()
+        let mgr, txn = TransactionManager.beginTxn mgr
+
+        // INTEGER 列へ数値でない文字列は強制できない
+        let bad = [ [ Expr.Literal(Literal.String "abc") ] ]
+
+        expectError "型強制できない値が OK になっています" (DmlOps.insert peopleSchema txn (Some [ "id" ]) bad))
+
+[<Fact>]
+let ``DML: INSERT は DEFAULT で不足列を埋める`` () =
+    let ageCol = TestHelpers.col "age" DataType.Integer
+
+    let age =
+        { ageCol with
+            Constraint =
+                { ColumnConstraint.Empty with
+                    Default = Some(Expr.Literal(Literal.Int 42L))
+                }
+        }
+
+    let schema =
+        { peopleSchema with
+            Columns =
+                [
+                    TestHelpers.col "id" DataType.Integer
+                    TestHelpers.col "name" DataType.Text
+                    age
+                ]
+        }
+
+    withStore "ins-default" (fun store ->
+        let mgr = TransactionManager.create ()
+        let mgr, txn = TransactionManager.beginTxn mgr
+
+        let txn, n =
+            ok (DmlOps.insert schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
+
+        Assert.Equal<int>(1, n)
+        commitInto store mgr txn |> ignore
+
+        let rows = ok (Dml.scanByPrimaryKey store schema None 0)
+        Assert.Equal<int64>(42L, asInt rows.[0].[2]))
+
+[<Fact>]
+let ``DML: INSERT は評価できない DEFAULT を NULL にする`` () =
+    let ageCol = TestHelpers.col "age" DataType.Integer
+
+    let age =
+        { ageCol with
+            Constraint =
+                { ColumnConstraint.Empty with
+                    Default = Some(col "nope")
+                }
+        }
+
+    let schema =
+        { peopleSchema with
+            Columns =
+                [
+                    TestHelpers.col "id" DataType.Integer
+                    TestHelpers.col "name" DataType.Text
+                    age
+                ]
+        }
+
+    withStore "ins-default-bad" (fun store ->
+        let mgr = TransactionManager.create ()
+        let mgr, txn = TransactionManager.beginTxn mgr
+
+        let txn, _ =
+            ok (DmlOps.insert schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
+
+        commitInto store mgr txn |> ignore
+
+        let rows = ok (Dml.scanByPrimaryKey store schema None 0)
+        Assert.True(SqlValue.isNull rows.[0].[2]))
+
+[<Fact>]
 let ``DML: DELETE は WHERE に合う行を消す`` () =
     withStore "del" (fun store ->
         let ctx = ctxOf store

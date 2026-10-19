@@ -9,7 +9,7 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-/// ディレクトリを用意して WAL を 1つ作る（全テスト共通の土台）。
+/// ディレクトリを用意して WAL を 1つ作る（ディスク経路のテスト用）。
 let private freshWal (dir: string) =
     ok (Manifest.ensureDirectory dir)
     ok (Wal.create dir 1L)
@@ -22,103 +22,127 @@ let private commitRecords (txnId: uint64) (entries: Entry array) =
         WalRecord.Commit txnId
     ]
 
+/// ディスクを介さずにレコード列を往復させる。
+let private roundTrip (records: WalRecord list) =
+    records |> Wal.encodeFrames |> Wal.decodeFrames |> Wal.committedEntries
+
 [<Fact>]
 let ``Wal: 往復する`` () =
-    withDir "wal" (fun dir ->
-        let w0 = freshWal dir
+    let entries =
+        [|
+            Entry.put (intKey 1) 1UL (intRow 1)
+            Entry.put (intKey 2) 2UL (intRow 2)
+            Entry.delete (intKey 3) 3UL
+        |]
 
-        let entries =
-            [|
-                Entry.put (intKey 1) 1UL (intRow 1)
-                Entry.put (intKey 2) 2UL (intRow 2)
-                Entry.delete (intKey 3) 3UL
-            |]
+    let records =
+        commitRecords 1UL entries @ [ WalRecord.Begin 2UL; WalRecord.Abort 2UL ]
 
-        let w1 = ok (Wal.append w0 dir (commitRecords 1UL entries))
-        let _w2 = ok (Wal.append w1 dir [ WalRecord.Begin 2UL; WalRecord.Abort 2UL ])
-
-        // 中断した transaction は捨てられ、コミットした分だけ残る
-        let recovered = ok (Wal.read dir 1L)
-        Assert.Equal(3, recovered.Length)
-        Assert.Equal<uint64>(1UL, recovered.[0].SeqNo)
-        Assert.Equal<uint64>(3UL, recovered.[2].SeqNo)
-        Assert.True(recovered.[2].IsDelete))
+    // 中断した transaction は捨てられ、コミットした分だけ残る
+    let recovered = roundTrip records
+    Assert.Equal(3, recovered.Length)
+    Assert.Equal<uint64>(1UL, recovered.[0].SeqNo)
+    Assert.Equal<uint64>(3UL, recovered.[2].SeqNo)
+    Assert.True(recovered.[2].IsDelete)
 
 [<Fact>]
-let ``WAL: 未コミットは再生しない`` () =
-    withDir "wal2" (fun dir ->
-        let w0 = freshWal dir
-        // Commit を書かずに終わる = クラッシュした状態
-        let entries = [| Entry.put (intKey 9) 1UL (intRow 9) |]
+let ``Wal.decodeFrames: 書きかけレコードは読み飛ばす`` () =
+    let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
 
-        let _w =
-            ok (Wal.append w0 dir [ WalRecord.Begin 1UL; WalRecord.Batch(1UL, entries) ])
+    // 末尾に壊れたレコードを書き足す（torn write の再現）
+    let data =
+        Array.append
+            (Wal.encodeFrames (commitRecords 1UL entries))
+            [| 0x10uy; 0x00uy; 0x00uy; 0x00uy; 0xFFuy; 0xFFuy; 0xFFuy; 0xFFuy |]
 
-        Assert.Empty(ok (Wal.read dir 1L)))
-
-[<Fact>]
-let ``Wal: 書きかけレコードは読み飛ばす`` () =
-    withDir "wal3" (fun dir ->
-        let w0 = freshWal dir
-        let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
-        let w1 = ok (Wal.append w0 dir (commitRecords 1UL entries))
-
-        // 末尾に壊れたレコードを書き足す（torn write の再現）
-        let path = Wal.path dir w1.FileNumber
-        File.AppendAllBytes(path, [| 0x10uy; 0x00uy; 0x00uy; 0x00uy; 0xFFuy; 0xFFuy; 0xFFuy; 0xFFuy |])
-        // 壊れたレコードは打ち切られるが、それまでのものは読める
-        Assert.Equal(1, (ok (Wal.read dir 1L)).Length))
+    // 壊れたレコードは打ち切られるが、それまでのものは読める
+    let recovered = data |> Wal.decodeFrames |> Wal.committedEntries
+    Assert.Equal(1, recovered.Length)
 
 [<Fact>]
-let ``WAL: チェックサム不一致は打ち切る`` () =
-    withDir "wal4" (fun dir ->
-        let w0 = freshWal dir
-        let first = [| Entry.put (intKey 1) 1UL (intRow 1) |]
-        let second = [| Entry.put (intKey 2) 2UL (intRow 2) |]
-        let _w1 = ok (Wal.append w0 dir (commitRecords 1UL first))
-        let w2 = ok (Wal.append w0 dir (commitRecords 2UL second))
+let ``Wal.decodeFrames: チェックサム不一致は打ち切る`` () =
+    let first = [| Entry.put (intKey 1) 1UL (intRow 1) |]
+    let second = [| Entry.put (intKey 2) 2UL (intRow 2) |]
 
-        // 2つ目のレコードのバイトを 1つだけ壊す
-        let path = Wal.path dir w2.FileNumber
-        let bytes = File.ReadAllBytes path
-        bytes.[bytes.Length - 1] <- bytes.[bytes.Length - 1] ^^^ 0xFFuy
-        File.WriteAllBytes(path, bytes)
-        // 壊れた 2つ目で打ち切られ、1つ目だけ残る
-        Assert.Equal(1, (ok (Wal.read dir 1L)).Length))
+    // 2つ目のレコードのバイトを 1つだけ壊す
+    let secondFrame = Wal.encodeFrames (commitRecords 2UL second)
+    secondFrame.[secondFrame.Length - 1] <- secondFrame.[secondFrame.Length - 1] ^^^ 0xFFuy
+
+    let data = Array.append (Wal.encodeFrames (commitRecords 1UL first)) secondFrame
+
+    // 壊れた 2つ目で打ち切られ、1つ目だけ残る
+    let recovered = data |> Wal.decodeFrames |> Wal.committedEntries
+    Assert.Equal(1, recovered.Length)
 
 [<Fact>]
-let ``WAL: 複数トランザクションはコミットした分だけ、コミット順に再生される`` () =
-    withDir "wal-txn" (fun dir ->
-        let w0 = freshWal dir
-        let t1 = [| Entry.put (intKey 1) 1UL (intRow 1) |]
-        let t2 = [| Entry.put (intKey 2) 2UL (intRow 2) |]
-        let t3 = [| Entry.put (intKey 3) 3UL (intRow 3) |]
+let ``Wal.decodeFrames: 不明なレコード種別は打ち切る`` () =
+    let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
 
-        // t1 は中断、t2 と t3 はコミット。記録は Begin/Batch が混在する
-        let _w =
-            ok (
-                Wal.append
-                    w0
-                    dir
-                    [
-                        WalRecord.Begin 1UL
-                        WalRecord.Batch(1UL, t1)
-                        WalRecord.Begin 2UL
-                        WalRecord.Batch(2UL, t2)
-                        WalRecord.Begin 3UL
-                        WalRecord.Batch(3UL, t3)
-                        WalRecord.Abort 1UL
-                        WalRecord.Commit 2UL
-                        WalRecord.Commit 3UL
-                    ]
-            )
+    // フレームとしては正しい（長さも checksum も合っている）が、種別が未知
+    let payload = [| 0x7Fuy |]
 
-        // コミット済みの t2, t3 だけがコミット順に並ぶ
-        let recovered = ok (Wal.read dir 1L)
-        Assert.Equal<uint64 array>([| 2UL; 3UL |], recovered |> Array.map (fun e -> e.SeqNo)))
+    let frame =
+        Writer.build
+            [
+                Writer.uint32LE (uint32 payload.Length)
+                Writer.uint32LE (Hashing.checksum payload)
+                Writer.writeBytes payload
+            ]
+
+    let data = Array.append (Wal.encodeFrames (commitRecords 1UL entries)) frame
+
+    // 不明レコードで打ち切られ、それまでの 1 件は読める
+    let recovered = data |> Wal.decodeFrames |> Wal.committedEntries
+    Assert.Equal(1, recovered.Length)
 
 [<Fact>]
-let ``WAL: 同じ番号で作り直すと内容を捨ててやり直す`` () =
+let ``Wal.decodeFrames: 長さが Int32 を超えるフレームは打ち切る`` () =
+    let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
+
+    // 長さ 0xFFFFFFFF は int で負になる（不正なフレーム）
+    let data =
+        Array.append
+            (Wal.encodeFrames (commitRecords 1UL entries))
+            [| 0xFFuy; 0xFFuy; 0xFFuy; 0xFFuy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
+
+    let recovered = data |> Wal.decodeFrames |> Wal.committedEntries
+    Assert.Equal(1, recovered.Length)
+
+[<Fact>]
+let ``Wal.committedEntries: 未コミットは再生しない`` () =
+    let entries = [| Entry.put (intKey 9) 1UL (intRow 9) |]
+
+    let recovered =
+        Wal.committedEntries [ WalRecord.Begin 1UL; WalRecord.Batch(1UL, entries) ]
+
+    Assert.Empty recovered
+
+[<Fact>]
+let ``Wal.committedEntries: 複数トランザクションはコミットした分だけ、コミット順に再生される`` () =
+    let t1 = [| Entry.put (intKey 1) 1UL (intRow 1) |]
+    let t2 = [| Entry.put (intKey 2) 2UL (intRow 2) |]
+    let t3 = [| Entry.put (intKey 3) 3UL (intRow 3) |]
+
+    // t1 は中断、t2 と t3 はコミット。記録は Begin/Batch が混在する
+    let recovered =
+        Wal.committedEntries
+            [
+                WalRecord.Begin 1UL
+                WalRecord.Batch(1UL, t1)
+                WalRecord.Begin 2UL
+                WalRecord.Batch(2UL, t2)
+                WalRecord.Begin 3UL
+                WalRecord.Batch(3UL, t3)
+                WalRecord.Abort 1UL
+                WalRecord.Commit 2UL
+                WalRecord.Commit 3UL
+            ]
+
+    // コミット済みの t2, t3 だけがコミット順に並ぶ
+    Assert.Equal<uint64 array>([| 2UL; 3UL |], recovered |> Array.map (fun e -> e.SeqNo))
+
+[<Fact>]
+let ``Wal.read: 同じ番号で作り直すと内容を捨ててやり直す`` () =
     withDir "wal-recreate" (fun dir ->
         let w0 = freshWal dir
         let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
@@ -130,7 +154,14 @@ let ``WAL: 同じ番号で作り直すと内容を捨ててやり直す`` () =
         Assert.Empty(ok (Wal.read dir 1L)))
 
 [<Fact>]
-let ``WAL: rotate で番号が進み、新しいファイルへ追記できる`` () =
+let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
+    let missing =
+        Path.Combine(Path.GetTempPath(), "rykdb-wal-missing-" + string System.DateTime.UtcNow.Ticks)
+
+    Assert.Empty(Wal.walFiles missing)
+
+[<Fact>]
+let ``Wal.rotate: rotate で番号が進み、新しいファイルへ追記できる`` () =
     withDir "wal-rotate" (fun dir ->
         let w0 = freshWal dir
         let first = [| Entry.put (intKey 1) 1UL (intRow 1) |]

@@ -9,7 +9,7 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 [<Fact>]
-let ``BloomFilter: 追加したキーはすべて maybe present`` () =
+let ``BloomFilter.mightContain: 追加したキーはすべて maybe present`` () =
     let n = 20_000
     let keys = Array.init n intKey
     let filter = BloomFilter.ofKeys keys n 0.01
@@ -19,7 +19,7 @@ let ``BloomFilter: 追加したキーはすべて maybe present`` () =
         Assert.True(BloomFilter.mightContain filter h, "追加したキーが false negative になった")
 
 [<Fact>]
-let ``BloomFilter: 追加していないキーはほぼ「なし」になる`` () =
+let ``BloomFilter.mightContain: 追加していないキーはほぼ「なし」になる`` () =
     let n = 10_000
     let p = 0.01
     let keys = Array.init n intKey
@@ -37,7 +37,7 @@ let ``BloomFilter: 追加していないキーはほぼ「なし」になる`` (
     Assert.True(rate <= p * 2.0, sprintf "誤検出率が高すぎます: %.4f (設計 %.2f)" rate p)
 
 [<Fact>]
-let ``BloomFilter: 空のフィルタは何も含まない`` () =
+let ``BloomFilter.mightContain: 空のフィルタは何も含まない`` () =
     let filter = BloomFilter.ofKeys [] 0 0.01
     Assert.Equal(0, filter.Count)
 
@@ -46,7 +46,7 @@ let ``BloomFilter: 空のフィルタは何も含まない`` () =
         Assert.False(BloomFilter.mightContain filter h, "空のフィルタが値を含んでいる")
 
 [<Fact>]
-let ``BloomFilter: 直列化の往復`` () =
+let ``BloomFilter.serialize: 直列化の往復`` () =
     let keys = Array.init 5_000 intKey
     let filter = BloomFilter.ofKeys keys 5_000 0.01
     let restored = ok (BloomFilter.deserialize (BloomFilter.serialize filter))
@@ -58,7 +58,7 @@ let ``BloomFilter: 直列化の往復`` () =
         Assert.True(BloomFilter.mightContain restored (Hashing.hashBytes k |> Hashing.mix))
 
 [<Fact>]
-let ``BloomFilter: 直列化は決定的で、往復後も同じバイト列になる`` () =
+let ``BloomFilter.serialize: 直列化は決定的で、往復後も同じバイト列になる`` () =
     let keys = Array.init 500 intKey
     let a = BloomFilter.serialize (BloomFilter.ofKeys keys 500 0.01)
     let b = BloomFilter.serialize (BloomFilter.ofKeys keys 500 0.01)
@@ -69,7 +69,19 @@ let ``BloomFilter: 直列化は決定的で、往復後も同じバイト列に�
     Assert.Equal<byte array>(a, BloomFilter.serialize restored)
 
 [<Fact>]
-let ``BloomFilter: 壊れたデータは CorruptionError`` () =
-    let keys = Array.init 100 intKey
-    let _ = BloomFilter.serialize (BloomFilter.ofKeys keys 100 0.01)
+let ``BloomFilter.deserialize: 壊れたデータは CorruptionError`` () =
     expectErrorKind ErrorKind.CorruptionError "壊れたデータはエラーになるはず" (BloomFilter.deserialize [| 9uy; 3uy |])
+
+[<Fact>]
+let ``BloomFilter.deserialize: ビット数が Int32 を超えるデータは CorruptionError`` () =
+    // version=1, hashCount=1, count=0, bitsLength=Int32.MaxValue+1
+    let data =
+        Writer.build
+            [
+                Writer.writeByte 1uy
+                Writer.writeByte 1uy
+                Writer.varint 0UL
+                Writer.varint (uint64 System.Int32.MaxValue + 1UL)
+            ]
+
+    expectErrorKind ErrorKind.CorruptionError "ビット数が異常" (BloomFilter.deserialize data)

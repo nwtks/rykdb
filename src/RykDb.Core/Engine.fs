@@ -158,7 +158,7 @@ module internal DmlOps =
 
         match columns with
         | None -> schema.Columns |> List.mapi (fun i _ -> i) |> ret
-        | Some names -> names |> List.map (fun n -> schema.RequireIndexOf n) |> all
+        | Some names -> names |> List.map (TableSchema.requireIndexOf schema) |> all
         >>= fun idxs ->
             rows
             |> foldOk
@@ -188,7 +188,7 @@ module internal DmlOps =
         let targetSchema = targetSchemaOf schema
 
         assignments
-        |> List.map (fun (name, _) -> schema.RequireIndexOf name)
+        |> List.map (fun (name, _) -> TableSchema.requireIndexOf schema name)
         |> all
         >>= fun targets ->
             foldRows txn ctx schema (matchesWhere targetSchema where) (fun txnAcc count row ->

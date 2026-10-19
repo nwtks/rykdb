@@ -111,19 +111,7 @@ type internal DbResultBuilder() =
         | Ok _ -> b
         | Error e -> Error e
 
-    member _.BindFinal(m: Result<'a, DbError>, f: 'a -> Result<'b, DbError>) =
-        match m with
-        | Ok v -> f v
-        | Error e -> Error e
-
     member _.ReturnFromFinal(v: Result<'a, DbError>) = v
-
-    member _.CombineFinal(a: Result<unit, DbError>, b: Result<'b, DbError>) =
-        match a with
-        | Ok _ -> b
-        | Error e -> Error e
-
-    member _.DelayFinal(f: unit -> Result<'a, DbError>) = f ()
 
 /// Result の組み合わせ演算子。
 /// AutoOpen にして RykDb.Core 配下で常に使えるようにする。

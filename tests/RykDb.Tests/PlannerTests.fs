@@ -72,6 +72,15 @@ let ``Binder: 修飾子無しの列が曖昧なら付けない`` () =
     | Expr.Column c -> Assert.True(String.IsNullOrEmpty(defaultArg c.Qualifier ""))
     | _ -> Assert.Fail("Expr.EColumn ではない")
 
+[<Fact>]
+let ``Binder: スターは修飾の対象外`` () =
+    let only = Schema.ofTable "people" None peopleSchema
+    let bound = ok (Binder.qualify only (Expr.QualifiedStar "people"))
+
+    match bound with
+    | Expr.QualifiedStar q -> Assert.Equal<string>("people", q)
+    | other -> Assert.Fail(sprintf "QualifiedStar ではない: %A" other)
+
 // ---------------------------------------------------------------------------
 // Planner — 述語の分割
 // ---------------------------------------------------------------------------
@@ -96,6 +105,13 @@ let ``Predicate: split した conjunct を AND で戻せる`` () =
     Assert.True(rejoined |> Option.isSome)
     // 分割 → 再結合 で conjunct が 2 個のまま保たれる
     Assert.Equal<int>(2, Predicate.splitConjuncts rejoined.Value |> List.length)
+
+[<Fact>]
+let ``Predicate: 修飾子なしの列参照は local とみなす`` () =
+    // 修飾子が無い列はどのテーブル由来か決められないので、局所判定では弾かない
+    Assert.True(Predicate.isLocalTo "people" (Expr.Column { Qualifier = None; Name = "x" }))
+    // 列参照を含まない式も true
+    Assert.True(Predicate.isLocalTo "people" (Expr.Literal(Literal.Int 1L)))
 
 // ---------------------------------------------------------------------------
 // Planner — 走査方法の選択
@@ -155,6 +171,80 @@ let ``Analyzer: 等価条件が無ければ全走査`` () =
         let m = ok (Analyzer.chooseScanMethod b Catalog.empty [ pred ])
 
         Assert.Equal<ScanMethod>(ScanMethod.SeqScan, m))
+
+[<Fact>]
+let ``Analyzer: AND の奥と左右対称の等価条件を探せる`` () =
+    withStore "an5" (fun store ->
+        let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
+
+        // 最初の conjunct は等価ではない → 2 番目が採用される
+        let first = Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))
+        let second = Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Literal(Literal.Int 7L))
+
+        match ok (Analyzer.chooseScanMethod b Catalog.empty [ first; second ]) with
+        | ScanMethod.PkLookup values -> Assert.Equal<int64>(7L, asInt values.[0])
+        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
+
+        // 値 = 列 の順（左右対称）でも探せる
+        let reversed = Expr.Binary(BinaryOp.Eq, Expr.Literal(Literal.Int 8L), pCol "id")
+
+        match ok (Analyzer.chooseScanMethod b Catalog.empty [ reversed ]) with
+        | ScanMethod.PkLookup values -> Assert.Equal<int64>(8L, asInt values.[0])
+        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m))
+
+[<Fact>]
+let ``Analyzer: 1 つの conjunct 内の AND も掘れる`` () =
+    withStore "an7" (fun store ->
+        let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
+
+        // 左の枝で見つかる（search の Some r 経路）
+        let leftHit =
+            Expr.Binary(
+                BinaryOp.And,
+                Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Literal(Literal.Int 9L)),
+                Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))
+            )
+
+        match ok (Analyzer.chooseScanMethod b Catalog.empty [ leftHit ]) with
+        | ScanMethod.PkLookup values -> Assert.Equal<int64>(9L, asInt values.[0])
+        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
+
+        // 左の枝では見つからず右で見つかる（search の None → 右の経路）
+        let rightHit =
+            Expr.Binary(
+                BinaryOp.And,
+                Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L)),
+                Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Literal(Literal.Int 10L))
+            )
+
+        match ok (Analyzer.chooseScanMethod b Catalog.empty [ rightHit ]) with
+        | ScanMethod.PkLookup values -> Assert.Equal<int64>(10L, asInt values.[0])
+        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m))
+
+[<Fact>]
+let ``Analyzer: 負のリテラルは等値条件に使える`` () =
+    withStore "an6" (fun store ->
+        let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
+
+        // 整数の単項マイナス → 主キー検索
+        let negInt =
+            Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Unary(UnaryOp.Neg, Expr.Literal(Literal.Int 5L)))
+
+        match ok (Analyzer.chooseScanMethod b Catalog.empty [ negInt ]) with
+        | ScanMethod.PkLookup values -> Assert.Equal<int64>(-5L, asInt values.[0])
+        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
+
+        // 実数の単項マイナスも定数として解釈される（索引が無いので結果は全走査）
+        let negReal =
+            Expr.Binary(BinaryOp.Eq, pCol "age", Expr.Unary(UnaryOp.Neg, Expr.Literal(Literal.Real 1.5)))
+
+        Assert.Equal<ScanMethod>(ScanMethod.SeqScan, ok (Analyzer.chooseScanMethod b Catalog.empty [ negReal ]))
+
+        // 数値でない単項マイナスは定数とみなさない
+        let negText =
+            Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Unary(UnaryOp.Neg, Expr.Literal(Literal.String "x")))
+
+        Assert.Equal<ScanMethod>(ScanMethod.SeqScan, ok (Analyzer.chooseScanMethod b Catalog.empty [ negText ])))
 
 // ---------------------------------------------------------------------------
 // Planner — SELECT 文全体の論理代数
@@ -326,3 +416,189 @@ let ``Planner: FROM が無ければ LValues になる`` () =
         match tree with
         | Logical.Values _ -> ()
         | _ -> Assert.Fail(sprintf "FROM なしなのに LValues でない: %A" tree))
+
+[<Fact>]
+let ``Planner: 集約とスターが同時でもスターは集約対象から外れる`` () =
+    withStore "pl8" (fun store ->
+        let ctx = ctxOf store
+
+        let items =
+            [
+                {
+                    Expression = Expr.QualifiedStar "people"
+                    Alias = None
+                }
+                {
+                    Expression = Expr.AggCall(AggFunc.Count, true, Expr.Literal(Literal.Null))
+                    Alias = None
+                }
+            ]
+
+        let stmt = selectOf items (Some { Name = "people"; Alias = None }) [] None
+        let tree = ok (Optimizer.buildLogical ctx stmt)
+
+        // 集約リストは COUNT(*) の 1 個だけ（t.* は集約対象にならない）
+        match tree with
+        | Logical.Project(_, Logical.Aggregate(_, aggs, _)) -> Assert.Equal<int>(1, aggs |> List.length)
+        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+
+[<Fact>]
+let ``Planner: 定数でない LIMIT と OFFSET だけの指定`` () =
+    withStore "pl9" (fun store ->
+        let ctx = ctxOf store
+
+        let plain =
+            selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
+
+        // LIMIT が非リテラル → 0（制限なし）として扱う
+        let stmt1 =
+            { plain with
+                Limit = Some(Expr.Column { Qualifier = None; Name = "nope" })
+            }
+
+        match ok (Optimizer.buildLogical ctx stmt1) with
+        | Logical.Limit(0, 0, _) -> ()
+        | other -> Assert.Fail(sprintf "LIMIT が 0 になっていない: %A" other)
+
+        // OFFSET だけ指定（Limit = None の分岐）
+        let stmt2 =
+            { plain with
+                Offset = Some(Expr.Literal(Literal.Int 3L))
+            }
+
+        match ok (Optimizer.buildLogical ctx stmt2) with
+        | Logical.Limit(3, 0, _) -> ()
+        | other -> Assert.Fail(sprintf "OFFSET が 3 になっていない: %A" other))
+
+[<Fact>]
+let ``Plan: FROM なしの SELECT は 1 行の定数を返す`` () =
+    withStore "pl10" (fun store ->
+        let ctx = ctxOf store
+
+        let stmt =
+            selectOf
+                [
+                    {
+                        Expression = Expr.Literal(Literal.Int 1L)
+                        Alias = None
+                    }
+                ]
+                None
+                []
+                None
+
+        let columns, rows = ok (Plan.runSelect ctx stmt)
+
+        // FROM なしは現状 Project を挟まず 1 行 0 列を返す（Parser からは到達しない）
+        Assert.Equal<int>(1, columns.Length)
+        Assert.Equal<int>(1, rows.Length)
+        Assert.Empty(rows.[0]))
+
+// ---------------------------------------------------------------------------
+// Planner — Op への変換（Optimizer.exec）
+// SQL 経由では作れない木を直接渡す（Values / RangeScan / Join のエラー経路）
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``Optimizer.exec: RangeScan は全走査へ落ちる`` () =
+    withStore "ex-range" (fun store ->
+        let ctx = ctxOf store
+        let schema = Schema.ofTable "people" None peopleSchema
+
+        // 範囲走査はまだ Plan からは作られない（現状は全走査と同じ）
+        let tree =
+            Logical.Scan("people", ScanMethod.RangeScan("ix_people_age", [| SqlValue.Int 1L |], [| SqlValue.Int 9L |]))
+
+        let rows = ok (Op.toArray (ok (Optimizer.exec ctx tree schema)))
+        Assert.Empty(rows))
+
+[<Fact>]
+let ``Optimizer.exec: Join 右側のスキーマが引けなくても空スキーマで続行する`` () =
+    withStore "ex-defschema" (fun store ->
+        let ctx = ctxOf store
+        let schema = Schema.ofTable "people" None peopleSchema
+
+        // 登録に無い Join 名（defaultSchema の Error 経路）
+        let tree =
+            Logical.Join(
+                JoinKind.Inner,
+                "missing",
+                Expr.Literal(Literal.Bool true),
+                Logical.Scan("people", ScanMethod.SeqScan),
+                Logical.Scan("people", ScanMethod.SeqScan)
+            )
+
+        let rows = ok (Op.toArray (ok (Optimizer.exec ctx tree schema)))
+        Assert.Empty(rows))
+
+[<Fact>]
+let ``Optimizer.exec: Join の左右でエラーになった木は Error を返す`` () =
+    withStore "ex-joinerr" (fun store ->
+        let ctx = ctxOf store
+        let schema = Schema.ofTable "people" None peopleSchema
+        let on = Expr.Literal(Literal.Bool true)
+
+        // 左部分木の実行が失敗する（descend の Error 経路）
+        let badLeft =
+            Logical.Join(
+                JoinKind.Inner,
+                "people",
+                on,
+                Logical.Scan("missing", ScanMethod.SeqScan),
+                Logical.Scan("people", ScanMethod.SeqScan)
+            )
+
+        expectError "左部分木の失敗が伝播していません" (Optimizer.exec ctx badLeft schema)
+
+        // 右部分木の実行が失敗する（unwind の Error 経路）
+        let badRight =
+            Logical.Join(
+                JoinKind.Inner,
+                "people",
+                on,
+                Logical.Scan("people", ScanMethod.SeqScan),
+                Logical.Scan("missing", ScanMethod.SeqScan)
+            )
+
+        expectError "右部分木の失敗が伝播していません" (Optimizer.exec ctx badRight schema)
+
+        // 右部分木の materialize が失敗する（join 実行時の Error 経路）。
+        // 行がある Values にできない式を評価させる（行が無いと評価されない）。
+        let badCol = Expr.Column { Qualifier = None; Name = "nope" }
+
+        let failingRight = Logical.Filter(badCol, Logical.Values [| SqlValue.Int 1L |])
+
+        let badJoin =
+            Logical.Join(JoinKind.Inner, "people", on, Logical.Scan("people", ScanMethod.SeqScan), failingRight)
+
+        expectError "右の評価失敗が join で伝播していません" (Optimizer.exec ctx badJoin schema))
+
+[<Fact>]
+let ``Optimizer.exec: Filter の下のラッパーを透過する`` () =
+    withStore "ex-wrappers" (fun store ->
+        let ctx = ctxOf store
+        let schema = Schema.ofTable "people" None peopleSchema
+        let p = Expr.Literal(Literal.Bool true)
+        let scan = Logical.Scan("people", ScanMethod.SeqScan)
+
+        // outputOf が stripWrappers で中身まで降りること（Limit / Distinct / Sort / Having / Project）
+        let wrappers =
+            [
+                Logical.Limit(0, 0, scan)
+                Logical.Distinct scan
+                Logical.Sort(
+                    [
+                        {
+                            Expression = pCol "id"
+                            Direction = SortDirection.Ascending
+                        }
+                    ],
+                    scan
+                )
+                Logical.Having(p, [], [], scan)
+                Logical.Project([ { Expression = Expr.Star; Alias = None } ], scan)
+            ]
+
+        for w in wrappers do
+            let rows = ok (Op.toArray (ok (Optimizer.exec ctx (Logical.Filter(p, w)) schema)))
+            Assert.Empty(rows))

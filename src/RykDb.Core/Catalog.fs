@@ -99,7 +99,7 @@ module internal Catalog =
         {
             Name = schema.Name
             Columns = schema.Columns
-            PrimaryKeyColumns = List.ofArray schema.PrimaryKeyColumns
+            PrimaryKeyColumns = TableSchema.primaryKeyColumns schema |> List.ofArray
         }
 
     /// 永続化形を TableSchema に戻す。

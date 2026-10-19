@@ -102,3 +102,54 @@ let ``Lexer: 空入力は Eof のみ`` () =
     match ts.Head.Token with
     | Token.Eof -> ()
     | other -> Assert.Fail(sprintf "Eof ではない: %A" other)
+
+[<Fact>]
+let ``Lexer: 入れ子のブロックコメントを読み飛ばす`` () =
+    let ks = kinds "/* a /* b */ c */ 1"
+    Assert.Equal<Token list>([ Token.IntLit 1L; Token.Eof ], ks)
+
+[<Fact>]
+let ``Lexer: 実数の指数表記`` () =
+    let ks = kinds "1e5 1.5E+3 1.5e-3"
+
+    Assert.Equal<Token list>(
+        [
+            Token.RealLit 100000.0
+            Token.RealLit 1500.0
+            Token.RealLit 0.0015
+            Token.Eof
+        ],
+        ks
+    )
+
+[<Fact>]
+let ``Lexer: 大きすぎる整数はエラー`` () =
+    // Int64 に収まらない桁数は Int64.TryParse が失敗する
+    match Lexer.tokenize "99999999999999999999" with
+    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
+    | Ok _ -> Assert.Fail "エラーになるべき"
+
+[<Fact>]
+let ``Lexer: バイナリリテラルの異常系はエラー`` () =
+    let bad (sql: string) =
+        match Lexer.tokenize sql with
+        | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
+        | Ok _ -> Assert.Fail(sprintf "エラーになるべき: %s" sql)
+
+    bad "X'12" // 閉じていない
+    bad "X'123'" // 桁数が奇数
+    bad "X'0G'" // 16 進でない文字
+
+[<Fact>]
+let ``Lexer: TokenItem.Describe が全トークン種別を説明する`` () =
+    let d (sql: string) = (tokens sql).[0].Describe
+
+    Assert.Equal("識別子 a", d "a")
+    Assert.Equal("引用識別子 c", d "\"c\"")
+    Assert.Equal("予約語 SELECT", d "SELECT")
+    Assert.Equal("整数 42", d "42")
+    Assert.Equal("実数 3.14", d "3.14")
+    Assert.Equal("文字列", d "'x'")
+    Assert.Equal("バイナリ", d "X'AB'")
+    Assert.Equal("記号 +", d "+")
+    Assert.Equal("文の終わり", d "")

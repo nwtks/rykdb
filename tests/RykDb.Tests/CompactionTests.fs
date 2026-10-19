@@ -19,7 +19,7 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
 
 /// 書いた SSTable を読み戻す（compact の readFile と同じ経路）。
 let private readBack (dir: string) (f: FileMetaData) =
-    protect (fun () -> File.ReadAllBytes(Sstable.path dir f.FileNumber))
+    protect (fun () -> File.ReadAllBytes(FileMetaData.path dir f.FileNumber))
     >>= Sstable.openTable
     >>= fun reader -> Sstable.rangeScan reader [||] 0 |> SstScan.toArray
 
@@ -103,7 +103,7 @@ let ``Compaction: 閾値を超えないレベルは compaction しない`` () =
         Assert.Empty result.Removed
         Assert.Equal(0, result.DroppedVersions)
         Assert.Equal(-1L, info.FileNumber)
-        Assert.True(File.Exists(Sstable.path dir 10L)))
+        Assert.True(File.Exists(FileMetaData.path dir 10L)))
 
 [<Fact>]
 let ``Compaction: 上のレベルの重なるファイルも入力に含める`` () =
@@ -146,8 +146,8 @@ let ``Compaction: 重ならない上のレベルファイルは入力に含め�
         let result, _ = compactAll dir version 0UL pickFirstLevel
         // 入力は L1 の f1 だけ。重ならない L2 の 2 ファイルは入力に含めない
         Assert.Equal<int64 list>([ 10L ], result.Removed |> List.map _.FileNumber)
-        Assert.True(File.Exists(Sstable.path dir 11L))
-        Assert.True(File.Exists(Sstable.path dir 12L)))
+        Assert.True(File.Exists(FileMetaData.path dir 11L))
+        Assert.True(File.Exists(FileMetaData.path dir 12L)))
 
 [<Fact>]
 let ``Compaction: 最下位レベルへの出力では tombstone を落とす`` () =
@@ -199,7 +199,7 @@ let ``Compaction: 最下位レベルの compaction で tombstone だけなら出
         Assert.Equal(2, result.DroppedTombstones)
         Assert.Equal(Levels.Max, info.Level)
         // 実ファイルの削除は呼び出し側（MANIFEST 更新後）の責務
-        Assert.True(File.Exists(Sstable.path dir 10L)))
+        Assert.True(File.Exists(FileMetaData.path dir 10L)))
 
 [<Fact>]
 let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
@@ -211,7 +211,7 @@ let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
         let r = Compaction.compact missing version pickFirstLevel 0UL 100L (readBack dir)
         expectErrorKind ErrorKind.IoError "書き込み失敗は IoError になる" r
         // 入力ファイルは消さない（削除は呼び出し側の責務）
-        Assert.True(File.Exists(Sstable.path dir 10L)))
+        Assert.True(File.Exists(FileMetaData.path dir 10L)))
 
 [<Fact>]
 let ``Compaction: 入力の読み込みに失敗したらそのエラーを返す`` () =
