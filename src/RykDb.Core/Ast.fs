@@ -194,53 +194,111 @@ module internal Expr =
         | Expr.FuncCall(_, args) -> args
         | Expr.AggCall(_, _, x) -> [ x ]
 
-    /// 各子式に f を適用して式を再構成する（構造は維持）。
-    let mapChildren (f: Expr -> Expr) (e: Expr) =
-        match e with
-        | Expr.Literal _
-        | Expr.Column _
-        | Expr.Name _
-        | Expr.Star
-        | Expr.QualifiedStar _ -> e
-        | Expr.Unary(op, x) -> Expr.Unary(op, f x)
-        | Expr.Binary(op, a, b) -> Expr.Binary(op, f a, f b)
-        | Expr.IsNull(x, neg) -> Expr.IsNull(f x, neg)
-        | Expr.Between(x, a, b, neg) -> Expr.Between(f x, f a, f b, neg)
-        | Expr.InList(x, xs, neg) -> Expr.InList(f x, List.map f xs, neg)
-        | Expr.Like(x, p, neg) -> Expr.Like(f x, f p, neg)
-        | Expr.Case(branches, elseE) -> Expr.Case(List.map (fun (w, t) -> f w, f t) branches, Option.map f elseE)
-        | Expr.FuncCall(n, args) -> Expr.FuncCall(n, List.map f args)
-        | Expr.AggCall(f2, star, x) -> Expr.AggCall(f2, star, f x)
+    /// `children` が返す順・個数で子式を差し替えて式を組み立て直す（`mapChildren` の組み立て側）。
+    /// <remarks>
+    /// `children` の逆変換で、順序・個数が一致するのは呼び出し側の不変条件。
+    /// 合わないのは到達不能なので `internalError` にする（例外は使わない）。
+    /// 自分で子を辿らないので深い式でもスタックを食わず、
+    /// 調用側（`Expr.rewrite` の評価機）が子を 1つずつ加工して最後にここへ渡す。
+    /// </remarks>
+    let plugChildren (e: Expr) (kids: Expr list) =
+        let miss () =
+            err (
+                sprintf "plugChildren: 子の個数が合いません（%d 個）" (List.length kids)
+                |> DbError.internalError
+            )
 
-    /// 各子式にモナド関数 f（Result を返す）を適用して式を再構成する。
-    let mapChildrenM (f: Expr -> Result<Expr, DbError>) (e: Expr) =
-        match e with
-        | Expr.Literal _
-        | Expr.Column _
-        | Expr.Name _
-        | Expr.Star
-        | Expr.QualifiedStar _ -> ret e
-        | Expr.Unary(op, x) -> f x |> Result.map (fun i -> Expr.Unary(op, i))
-        | Expr.Binary(op, a, b) -> f a >>= fun a2 -> f b |> Result.map (fun b2 -> Expr.Binary(op, a2, b2))
-        | Expr.IsNull(x, neg) -> f x |> Result.map (fun i -> Expr.IsNull(i, neg))
-        | Expr.Between(a, b, c, neg) ->
-            f a
-            >>= fun a2 -> f b >>= fun b2 -> f c |> Result.map (fun c2 -> Expr.Between(a2, b2, c2, neg))
-        | Expr.InList(a, xs, neg) ->
-            f a
-            >>= fun a2 -> xs |> List.map f |> all |> Result.map (fun vs -> Expr.InList(a2, vs, neg))
-        | Expr.Like(a, b, neg) -> f a >>= fun a2 -> f b |> Result.map (fun b2 -> Expr.Like(a2, b2, neg))
-        | Expr.Case(branches, elseE) ->
-            branches
-            |> List.map (fun (w, t) -> f w >>= fun w2 -> f t |> Result.map (fun t2 -> w2, t2))
-            |> all
-            >>= fun branches2 ->
-                match elseE with
-                | None -> ret None
-                | Some e2 -> f e2 |> Result.map Some
-                |> Result.map (fun el -> Expr.Case(branches2, el))
-        | Expr.FuncCall(n, args) -> args |> List.map f |> all |> Result.map (fun as2 -> Expr.FuncCall(n, as2))
-        | Expr.AggCall(f2, star, arg) -> f arg |> Result.map (fun a -> Expr.AggCall(f2, star, a))
+        if List.length kids <> List.length (children e) then
+            miss ()
+        else
+            match e, kids with
+            | Expr.Literal _, [] -> ret e
+            | Expr.Column _, [] -> ret e
+            | Expr.Name _, [] -> ret e
+            | Expr.Star, [] -> ret e
+            | Expr.QualifiedStar _, [] -> ret e
+            | Expr.Unary(op, _), [ x ] -> ret (Expr.Unary(op, x))
+            | Expr.Binary(op, _, _), [ a; b ] -> ret (Expr.Binary(op, a, b))
+            | Expr.IsNull(_, neg), [ x ] -> ret (Expr.IsNull(x, neg))
+            | Expr.Between(_, _, _, neg), [ x; lo; hi ] -> ret (Expr.Between(x, lo, hi, neg))
+            | Expr.InList(_, _, neg), x :: xs -> ret (Expr.InList(x, xs, neg))
+            | Expr.Like(_, _, neg), [ x; p ] -> ret (Expr.Like(x, p, neg))
+            | Expr.Case(_, elseE), _ ->
+                let rec toPairs (rest: Expr list) (acc: (Expr * Expr) list) =
+                    match rest with
+                    | w :: t :: tail -> toPairs tail ((w, t) :: acc)
+                    | _ -> List.rev acc
+
+                match elseE, List.rev kids with
+                | None, _ -> ret (Expr.Case(toPairs kids [], None))
+                | Some _, last :: branchRev -> ret (Expr.Case(toPairs (List.rev branchRev) [], Some last))
+                | Some _, [] -> miss ()
+            | Expr.FuncCall(n, _), xs -> ret (Expr.FuncCall(n, xs))
+            | Expr.AggCall(f, star, _), [ x ] -> ret (Expr.AggCall(f, star, x))
+            | _ -> miss ()
+
+    /// 書き換え待ちの親ノード。
+    /// 子を 1つずつ加工してから `plugChildren` で組み立てる。
+    /// <remarks>
+    /// 継続はラムダではなく値として持つ（`Eval.Kont` / `ExecFrame` と同じ方針）。
+    /// `Parent` は子が加工される前の式、`Done` は加工済みの子（`children` の逆順）。
+    /// `Rest` が尽きたら `Done` を `plugChildren` に渡して親を組み直す。
+    /// </remarks>
+    type private RewriteFrame =
+        {
+            /// 組み立ての雛形（子はまだ加工前）
+            Parent: Expr
+            /// 加工済みの子（`children` の逆順）
+            Done: Expr list
+            /// まだ加工していない子（先頭が次の訪問先）
+            Rest: Expr list
+        }
+
+    /// 書き換え機の状態。
+    /// 式を 1つ降りるか（`Visit`）、加工済みの式が上がってきたか（`Arrive`）。
+    type private RewriteStep =
+        | Visit of Expr
+        | Arrive of Expr
+
+    /// 式を 1ノードずつ降り、上がってきた子で親を組み立てる書き換え機。
+    /// <remarks>
+    /// 葉の判定は呼び出し側が作った `rewriteLeaf` に任せる。
+    /// `rewriteLeaf` の返した式に子が無ければそこで確定し、有れば子を 1つずつ降る
+    /// （`AggCall` のように「子を持つが葉として扱う」ノードもこれで表現できる）。
+    /// 再帰はこの関数の自己再帰だけ（全部末尾位置）なので、
+    /// 式の深さに依存せずスタックは一定（フレームはヒープの list に積む）。
+    /// </remarks>
+    [<TailCall>]
+    let rec private rewriteLoop (rewriteLeaf: Expr -> Expr) (frames: RewriteFrame list) (st: RewriteStep) =
+        match st with
+        | Visit x ->
+            let x2 = rewriteLeaf x
+
+            match children x2 with
+            | [] -> rewriteLoop rewriteLeaf frames (Arrive x2)
+            | c :: rest ->
+                let frame = { Parent = x2; Done = []; Rest = rest }
+                rewriteLoop rewriteLeaf (frame :: frames) (Visit c)
+        | Arrive v ->
+            match frames with
+            | [] -> ret v
+            | frame :: more ->
+                match frame.Rest with
+                | c :: rest ->
+                    let next =
+                        { frame with
+                            Done = v :: frame.Done
+                            Rest = rest
+                        }
+
+                    rewriteLoop rewriteLeaf (next :: more) (Visit c)
+                | [] ->
+                    match plugChildren frame.Parent (List.rev (v :: frame.Done)) with
+                    | Error er -> Error er
+                    | Ok parent -> rewriteLoop rewriteLeaf more (Arrive parent)
+
+    /// 葉の書き換え関数で式を組み直す（末尾再帰。式の深さに依存せずスタックは一定）。
+    let rewrite (rewriteLeaf: Expr -> Expr) (root: Expr) = rewriteLoop rewriteLeaf [] (Visit root)
 
     /// 式木を明示スタックで pre-order にたどり、各ノードについて状態を畳み込む。
     /// 走査順は「根 → 子を左から右へ」。

@@ -29,15 +29,6 @@ let ``Ast: children は直接の子ノードを返す`` () =
     Assert.Equal(2, (Expr.children (Expr.Like(name "a", name "b", false))).Length)
 
 [<Fact>]
-let ``Ast: mapChildren は子を変換する`` () =
-    let e = Expr.Binary(BinaryOp.Add, Expr.Name "a", Expr.Name "b")
-    let e2 = Expr.mapChildren (fun _ -> Expr.Name "z") e
-
-    match e2 with
-    | Expr.Binary(_, Expr.Name "z", Expr.Name "z") -> ()
-    | other -> Assert.Fail(sprintf "mapChildren が想定外: %A" other)
-
-[<Fact>]
 let ``Ast: fold は全ノードを訪問する`` () =
     let e = Expr.Binary(BinaryOp.Add, Expr.Name "a", Expr.Name "b")
     let count = Expr.fold (fun acc _ -> acc + 1) 0 e
@@ -153,89 +144,33 @@ let ``Ast: その他の演算子の表示`` () =
     Assert.Equal<string>("t.*", Expr.toDisplayString (Expr.QualifiedStar "t"))
 
 [<Fact>]
-let ``Ast: mapChildren は全ケースで子を置き換える`` () =
+let ``Ast: plugChildren は children の順で子を差し替える`` () =
     let bump (e: Expr) =
         match e with
         | Expr.Name n -> Expr.Name(n + "!")
         | other -> other
 
-    let namesOf (e: Expr) =
-        Expr.fold
-            (fun acc e ->
-                match e with
-                | Expr.Name n -> n :: acc
-                | _ -> acc)
-            []
-            e
-        |> List.sort
-
-    // 子を持つ全ケースを列挙し、直接の子（リーフ名）がすべて置き換わることを見る
     let samples =
         [
-            Expr.Unary(UnaryOp.Not, name "a"), [ "a" ]
-            Expr.Binary(BinaryOp.Add, name "a", name "b"), [ "a"; "b" ]
-            Expr.IsNull(name "a", false), [ "a" ]
-            Expr.Between(name "a", name "b", name "c", false), [ "a"; "b"; "c" ]
-            Expr.InList(name "a", [ name "b"; name "c" ], false), [ "a"; "b"; "c" ]
-            Expr.Like(name "a", name "b", false), [ "a"; "b" ]
-            Expr.Case([ (name "a", name "b") ], Some(name "c")), [ "a"; "b"; "c" ]
-            Expr.Case([ (name "a", name "b") ], None), [ "a"; "b" ]
-            Expr.FuncCall("ABS", [ name "a" ]), [ "a" ]
-            Expr.AggCall(AggFunc.Sum, false, name "a"), [ "a" ]
+            Expr.Unary(UnaryOp.Not, name "a")
+            Expr.Binary(BinaryOp.Add, name "a", name "b")
+            Expr.IsNull(name "a", false)
+            Expr.Between(name "a", name "b", name "c", false)
+            Expr.InList(name "a", [ name "b"; name "c" ], false)
+            Expr.Like(name "a", name "b", false)
+            Expr.Case([ (name "a", name "b") ], Some(name "c"))
+            Expr.Case([ (name "a", name "b") ], None)
+            Expr.Case([ name "a", name "b"; name "c", name "d" ], Some(name "e"))
+            Expr.FuncCall("ABS", [ name "a" ])
+            Expr.FuncCall("ABS", [])
+            Expr.AggCall(AggFunc.Sum, false, name "a")
         ]
 
-    for e, expected in samples do
-        Assert.Equal<string list>(
-            expected |> List.map (fun n -> n + "!") |> List.sort,
-            namesOf (Expr.mapChildren bump e)
-        )
+    // リーフは子 0 個のまま
+    Assert.Equal<string>("a", Expr.toDisplayString (ok (Expr.plugChildren (name "a") [])))
 
-    // リーフは変換されない
-    Assert.Equal<string>("t.*", Expr.toDisplayString (Expr.mapChildren bump (Expr.QualifiedStar "t")))
-    Assert.Equal<string>("a", Expr.toDisplayString (Expr.mapChildren bump (name "a")))
-
-[<Fact>]
-let ``Ast: mapChildrenM は全ケースで子を置き換える`` () =
-    let bump (e: Expr) =
-        match e with
-        | Expr.Name n -> ret (Expr.Name(n + "!"))
-        | other -> ret other
-
-    let namesOf (e: Expr) =
-        Expr.fold
-            (fun acc e ->
-                match e with
-                | Expr.Name n -> n :: acc
-                | _ -> acc)
-            []
-            e
-        |> List.sort
-
-    let samples =
-        [
-            Expr.Unary(UnaryOp.Not, name "a"), [ "a" ]
-            Expr.Binary(BinaryOp.Add, name "a", name "b"), [ "a"; "b" ]
-            Expr.IsNull(name "a", false), [ "a" ]
-            Expr.Between(name "a", name "b", name "c", false), [ "a"; "b"; "c" ]
-            Expr.InList(name "a", [ name "b"; name "c" ], false), [ "a"; "b"; "c" ]
-            Expr.Like(name "a", name "b", false), [ "a"; "b" ]
-            Expr.Case([ (name "a", name "b") ], Some(name "c")), [ "a"; "b"; "c" ]
-            Expr.Case([ (name "a", name "b") ], None), [ "a"; "b" ]
-            Expr.FuncCall("ABS", [ name "a" ]), [ "a" ]
-            Expr.AggCall(AggFunc.Sum, false, name "a"), [ "a" ]
-        ]
-
-    for e, expected in samples do
-        let got = namesOf (ok (Expr.mapChildrenM bump e))
-        Assert.Equal<string list>(expected |> List.map (fun n -> n + "!") |> List.sort, got)
-
-    // リーフは変換されない
-    Assert.Equal<string>("t.*", Expr.toDisplayString (ok (Expr.mapChildrenM bump (Expr.QualifiedStar "t"))))
-
-    // 子の変換が失敗したら全体も失敗する
-    expectError
-        "子の変換失敗が伝播していません"
-        (Expr.mapChildrenM (fun _ -> err (DbError.name "x")) (binary BinaryOp.Add (name "a") (name "b")))
+    // 子の個数が合わないのは到達不能なので internalError で落とす
+    expectError "子の個数不一致を検出できていません" (Expr.plugChildren (binary BinaryOp.Add (name "a") (name "b")) [ name "a" ])
 
 [<Fact>]
 let ``Ast: Literal と SqlValue の相互変換`` () =

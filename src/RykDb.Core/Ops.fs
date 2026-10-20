@@ -226,35 +226,39 @@ module internal Ops =
 
         exprs |> List.fold (fun acc e -> collectAggs e acc) [] |> List.rev
 
+    /// 集約呼び出しの識別キー（`COUNT(age)` のような表示文字列）。
+    let private aggKey (f: AggFunc) (arg: Expr) =
+        sprintf "%s(%s)" f.Name (Expr.toDisplayString arg)
+
+    /// 集約後の行のスロット番号表。
+    /// GROUP BY 式が先頭に、集約呼び出しがその後に並ぶ（`Ops.aggregate` の出力順）。
+    /// 行に依存しないので 1クエリにつき 1回だけ作る。
+    let private aggOffsets (groupBy: Expr list) (aggs: (AggFunc * bool * Expr) list) =
+        let groupSlots =
+            groupBy |> List.mapi (fun i e -> Expr.toDisplayString e, i) |> Map.ofList
+
+        let aggSlots =
+            aggs
+            |> List.mapi (fun i (f, _, arg) -> aggKey f arg, List.length groupBy + i)
+            |> Map.ofList
+
+        Map.fold (fun acc k v -> Map.add k v acc) groupSlots aggSlots
+
     /// 集約呼び出しの式を、計算済みの値（定数）へ置き換える。
     /// HAVING と SELECT 項目の両方で使う。
-    let private substituteAggs
-        (groupBy: Expr list)
-        (aggs: (AggFunc * bool * Expr) list)
-        (e: Expr)
-        (row: SqlValue array)
-        =
-        let aggKey (f: AggFunc) (arg: Expr) =
-            sprintf "%s(%s)" f.Name (Expr.toDisplayString arg)
+    /// `offsets` は `aggOffsets` の結果。
+    /// 行に依存するのは `row` だけなので offsets は呼び出し側で 1回だけ作る
+    /// （`project` / `havingFilter` は出力 1行ごとに呼ぶため、
+    /// ここで作ると行数ぶんだけマップを組み直すことになる）。
+    /// 組み立ては `Expr.rewrite`（末尾再帰の評価機）に任せるので、式の深さに依存しない。
+    let private substituteAggs (offsets: Map<string, int>) (e: Expr) (row: SqlValue array) =
+        let slot key =
+            match offsets |> Map.tryFind key with
+            | Some i when i >= 0 && i < row.Length -> Some(Expr.Literal(Literal.ofValue row.[i]))
+            | _ -> None
 
-        let aggOffsets (groupBy: Expr list) (aggs: (AggFunc * bool * Expr) list) =
-            let groupSlots =
-                groupBy |> List.mapi (fun i e -> Expr.toDisplayString e, i) |> Map.ofList
-
-            let aggSlots =
-                aggs
-                |> List.mapi (fun i (f, _, arg) -> aggKey f arg, List.length groupBy + i)
-                |> Map.ofList
-
-            Map.fold (fun acc k v -> Map.add k v acc) groupSlots aggSlots
-
-        let rec rewriteAggs (e: Expr) (offsets: Map<string, int>) (row: SqlValue array) =
-            let slot key =
-                match offsets |> Map.tryFind key with
-                | Some i when i >= 0 && i < row.Length -> Some(Expr.Literal(Literal.ofValue row.[i]))
-                | _ -> None
-
-            match e with
+        let rewriteLeaf (x: Expr) =
+            match x with
             | Expr.AggCall(f, _, arg) ->
                 match slot (aggKey f arg) with
                 | Some l -> l
@@ -268,18 +272,17 @@ module internal Ops =
                 match slot n with
                 | Some l -> l
                 | None -> orig
-            | Expr.Star -> Expr.Star
-            | Expr.QualifiedStar q -> Expr.QualifiedStar q
-            | _ -> Expr.mapChildren (fun c -> rewriteAggs c offsets row) e
+            | other -> other
 
-        rewriteAggs e (aggOffsets groupBy aggs) row
+        Expr.rewrite rewriteLeaf e
 
     /// HAVING を張る。
     /// 集約後の行は位置のみの意味を持つので Schema.empty で評価する。
+    /// offsets はクロージャを 1回作るときにだけ組み立て、行ごとに持ち越さない。
     let havingFilter (groupBy: Expr list) (aggs: (AggFunc * bool * Expr) list) (predicate: Expr) =
-        fun row ->
-            let replaced = substituteAggs groupBy aggs predicate row
-            Eval.matches Schema.empty row replaced
+        let offsets = aggOffsets groupBy aggs
+
+        fun row -> substituteAggs offsets predicate row >>= Eval.matches Schema.empty row
 
     /// 集約の 1 項目分の_accumulator。
     /// SUM / AVG は decimal で累積し、最後に型を決める（丸め誤差を避ける）。
@@ -561,10 +564,12 @@ module internal Ops =
             if List.isEmpty foundAggs then
                 Op.map (fun row -> allExprs |> List.map (Eval.eval schema row) |> all |> Result.map List.toArray) src
             else
+                let offsets = aggOffsets groupBy foundAggs
+
                 Op.map
                     (fun row ->
                         allExprs
-                        |> List.map (fun e -> Eval.eval Schema.empty row (substituteAggs groupBy foundAggs e row))
+                        |> List.map (fun e -> substituteAggs offsets e row >>= Eval.eval Schema.empty row)
                         |> all
                         |> Result.map List.toArray)
                     src

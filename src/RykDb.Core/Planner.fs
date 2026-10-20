@@ -70,6 +70,8 @@ module internal Binder =
     /// <remarks>
     /// 修飾子なしで一意に決まる場合にだけ修飾名を付ける。
     /// 曖昧なら付けない（実行時の Schema.resolve がエラーにする）。
+    /// 葉だけを直し、非葉ノードは形を保ったまま子を 1つずつ加工してから
+    /// `Expr.plugChildren` で組み直す（`Expr.rewrite` の評価機）。
     /// </remarks>
     let qualify (schema: Schema) (e: Expr) =
         let uniqueQualifier (name: string) =
@@ -85,25 +87,22 @@ module internal Binder =
             | [ q ] -> Some q
             | _ -> None
 
-        let rec qualifyExpr (x: Expr) =
+        let rewriteLeaf (x: Expr) =
             match x with
-            | Expr.Literal l -> ret (Expr.Literal l)
             | Expr.Column c ->
                 match c.Qualifier with
-                | Some _ -> ret x
+                | Some _ -> x
                 | None ->
                     match uniqueQualifier c.Name with
-                    | Some q -> ret (Expr.Column { Qualifier = Some q; Name = c.Name })
-                    | None -> ret x
+                    | Some q -> Expr.Column { Qualifier = Some q; Name = c.Name }
+                    | None -> x
             | Expr.Name name ->
                 match uniqueQualifier name with
-                | Some q -> ret (Expr.Column { Qualifier = Some q; Name = name })
-                | None -> ret x
-            | Expr.Star -> ret x
-            | Expr.QualifiedStar _ -> ret x
-            | _ -> Expr.mapChildrenM qualifyExpr x
+                | Some q -> Expr.Column { Qualifier = Some q; Name = name }
+                | None -> x
+            | _ -> x
 
-        qualifyExpr e
+        Expr.rewrite rewriteLeaf e
 
     /// 複数の式をまとめて修飾名へ。
     let qualifyMany (schema: Schema) (exprs: Expr list) =
@@ -127,14 +126,20 @@ module internal Binder =
             | i -> full.[0 .. i - 1] = lower)
 
 module internal Predicate =
-    /// `AND` を平坦化して conjunct のリストにする。
-    let splitConjuncts (e: Expr) =
-        let rec flatten (acc: Expr list) (x: Expr) =
-            match x with
-            | Expr.Binary(BinaryOp.And, a, b) -> flatten (flatten acc a) b
-            | _ -> acc @ [ x ]
+    /// 未処理の式のスタックを辿って `AND` を平坦化する。
+    /// conjunct は逆順で積み、最後に `List.rev` する（末尾再帰・O(n)）。
+    [<TailCall>]
+    let rec private flattenLoop (pending: Expr list) (acc: Expr list) =
+        match pending with
+        | [] -> List.rev acc
+        | Expr.Binary(BinaryOp.And, a, b) :: rest -> flattenLoop (a :: b :: rest) acc
+        | x :: rest -> flattenLoop rest (x :: acc)
 
-        flatten [] e
+    /// `AND` を平坦化して conjunct のリストにする。
+    /// <remarks>
+    /// 両方の再帰が末尾位置にあるので、深い `AND` チェーンでもスタックが積み上がらない。
+    /// </remarks>
+    let splitConjuncts (e: Expr) = flattenLoop [ e ] []
 
     /// conjunct を全部 `AND` で繋ぎ直す。
     let joinConjuncts (parts: Expr list) =
@@ -437,9 +442,9 @@ module internal Optimizer =
                 return! applyLimit deduped stmt
         }
 
-    /// Join を積む側（左スパインを降りる）と回す側（引き返して結合する）の
-    /// 1 段分。右部分木の Op はここで作らず、引き返してから評価する
-    /// （評価順が left → right → join のまま変わらないようにするため）。
+    /// Join の結合待ち情報。
+    /// 右部分木の Op は左部分木を評価した後に作る
+    /// （評価順を left → right → join に保つため）。
     type private JoinFrame =
         {
             Kind: JoinKind
@@ -450,43 +455,113 @@ module internal Optimizer =
             RightSchema: Schema
         }
 
-    /// 論理代数を Op に落とす。
-    /// <remarks>
-    /// 下へ渡すスキーマは常に「入力スキーマ」schema のまま。
-    /// outputOf child schema は「child の出力スキーマ」であって、
-    /// child を実行するときの入力スキーマではない。
-    /// ここを間違えると、`SELECT SUM(age) FROM t` で
-    /// 集約ノードが「集約後のヘッダ（`SUM(t.age)`）」を入力として受け取るため、
-    /// 引数の `t.age` を評価できず `SUM` が Null になり、
-    /// `GROUP BY` も別の列でグループ化してしまう。
-    /// childSchema は「そのノードが結果を読む側」だけが使う。
-    /// </remarks>
-    let rec exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
-        let defaultSchema (ctx: ExecContext) (name: string) =
-            match ExecContext.schemaOf ctx name with
-            | Ok s -> s
-            | Error _ ->
-                {
-                    Name = name
-                    Columns = []
-                    PrimaryKey = []
-                    Indexes = []
-                }
+    /// 評価待ちの処理。
+    /// Result を消費してから次へ進む処理をクロージャではなく値として積む。
+    type private ExecFrame =
+        | FilterFrame of Expr * Schema
+        | AggregateFrame of Expr list * (AggFunc * bool * Expr) list * Schema
+        | HavingFrame of Expr * (AggFunc * bool * Expr) list * Expr list
+        | DistinctFrame
+        | SortFrame of SortKey list * Schema
+        | LimitFrame of int * int
+        | ProjectFrame of SelectItem list * Schema * Expr list
+        /// 左部分木を評価し終えた Join。次に右部分木を評価する。
+        | JoinRightFrame of JoinFrame
+        /// 右部分木も評価し終えた Join。左 Op を保持している。
+        | JoinApplyFrame of JoinFrame * Op
 
-        let rec descend (stack: JoinFrame list) (left: Schema) (node: Logical) =
+    /// 評価機の状態。
+    /// 木を 1つ降りるか、Op が上がってきたか。
+    type private ExecStep =
+        | EvalNode of Logical * Schema
+        | ApplyOp of Op
+
+    let private defaultSchema (ctx: ExecContext) (name: string) =
+        match ExecContext.schemaOf ctx name with
+        | Ok s -> s
+        | Error _ ->
+            {
+                Name = name
+                Columns = []
+                PrimaryKey = []
+                Indexes = []
+            }
+
+    let private execJoin (kind: JoinKind) (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
+        match kind with
+        | JoinKind.Inner -> Ops.innerJoin leftSchema left rightSchema right on
+        | JoinKind.Left -> Ops.leftJoin leftSchema left rightSchema right on
+
+    let private execScan (ctx: ExecContext) (name: string) (method: ScanMethod) =
+        match method with
+        | ScanMethod.SeqScan -> ExecContext.table ctx name
+        | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
+        | ScanMethod.IndexLookup(indexName, values) -> ExecContext.byIndex ctx name indexName values
+        | ScanMethod.RangeScan(_, _, _) -> ExecContext.table ctx name
+
+    [<TailCall>]
+    let rec private stripWrappers (tree: Logical) =
+        match tree with
+        | Logical.Sort(_, child) -> stripWrappers child
+        | Logical.Limit(_, _, child) -> stripWrappers child
+        | Logical.Distinct child -> stripWrappers child
+        | Logical.Having(_, _, _, child) -> stripWrappers child
+        | Logical.Filter(_, child) -> stripWrappers child
+        | Logical.Project(_, child) -> stripWrappers child
+        | other -> other
+
+    let private outputOf (tree: Logical) (inSchema: Schema) =
+        match stripWrappers tree with
+        | Logical.Aggregate(groupBy, aggs, _) ->
+            let gv =
+                groupBy
+                |> List.map (fun e ->
+                    {
+                        Name = Expr.toDisplayString e
+                        Qualifier = None
+                        DataType = None
+                    })
+
+            let av =
+                aggs
+                |> List.map (fun (f, star, arg) ->
+                    let suffix = if star then "*" else Expr.toDisplayString arg
+
+                    {
+                        Name = sprintf "%s(%s)" f.Name suffix
+                        Qualifier = None
+                        DataType = None
+                    })
+
+            { Schema.empty with
+                Columns = Array.append (List.toArray gv) (List.toArray av)
+            }
+        | _ -> inSchema
+
+    let private groupByOf (tree: Logical) =
+        match stripWrappers tree with
+        | Logical.Aggregate(groupBy, _, _) -> groupBy
+        | _ -> []
+
+    /// 論理木を 1ノードずつ処理する。
+    /// 継続は ExecFrame list に積むので、ラッパの深さに依存せずスタックは一定。
+    [<TailCall>]
+    let rec private run (ctx: ExecContext) (frames: ExecFrame list) (step: ExecStep) =
+        match step with
+        | EvalNode(node, inSchema) ->
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
                 let rightSchema = Schema.ofTable name None (defaultSchema ctx name)
 
                 let leftSchema =
-                    { left with
+                    { inSchema with
                         Columns =
-                            left.Columns
+                            inSchema.Columns
                             |> Array.filter (fun c ->
                                 match c.Qualifier with
                                 | Some q -> not (Catalog.eqName q name)
                                 | None -> true)
-                        Tables = left.Tables |> List.filter (fun t -> not (Catalog.eqName t name))
+                        Tables = inSchema.Tables |> List.filter (fun t -> not (Catalog.eqName t name))
                     }
 
                 let frame =
@@ -498,107 +573,71 @@ module internal Optimizer =
                         RightSchema = rightSchema
                     }
 
-                descend (frame :: stack) leftSchema lTree
-            | other -> exec ctx other left |> Result.map (fun op -> op, stack)
-
-        let execJoin (kind: JoinKind) (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
-            match kind with
-            | JoinKind.Inner -> Ops.innerJoin leftSchema left rightSchema right on
-            | JoinKind.Left -> Ops.leftJoin leftSchema left rightSchema right on
-
-        let rec unwind (stack: JoinFrame list) (op: Op) =
-            match stack with
+                run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema))
+            | Logical.Values values -> run ctx frames (ApplyOp(Op.ofRow values))
+            | Logical.Scan(name, method) ->
+                match execScan ctx name method with
+                | Error e -> Error e
+                | Ok op -> run ctx frames (ApplyOp op)
+            | Logical.Filter(p, child) ->
+                let childSchema = outputOf child inSchema
+                run ctx (FilterFrame(p, childSchema) :: frames) (EvalNode(child, childSchema))
+            | Logical.Aggregate(groupBy, aggs, child) ->
+                run ctx (AggregateFrame(groupBy, aggs, inSchema) :: frames) (EvalNode(child, inSchema))
+            | Logical.Having(h, aggs, groupBy, child) ->
+                run ctx (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema))
+            | Logical.Distinct child -> run ctx (DistinctFrame :: frames) (EvalNode(child, inSchema))
+            | Logical.Sort(keys, child) ->
+                let childSchema = outputOf child inSchema
+                run ctx (SortFrame(keys, childSchema) :: frames) (EvalNode(child, inSchema))
+            | Logical.Limit(offset, limit, child) ->
+                run ctx (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema))
+            | Logical.Project(items, child) ->
+                let childSchema = outputOf child inSchema
+                let groupBy = groupByOf child
+                run ctx (ProjectFrame(items, childSchema, groupBy) :: frames) (EvalNode(child, inSchema))
+        | ApplyOp op ->
+            match frames with
             | [] -> ret op
             | frame :: rest ->
-                match exec ctx frame.Right frame.RightSchema with
-                | Error e -> Error e
-                | Ok rOp ->
-                    match execJoin frame.Kind frame.LeftSchema op frame.RightSchema rOp frame.On with
+                match frame with
+                | FilterFrame(p, childSchema) -> run ctx rest (ApplyOp(Ops.filter childSchema op p))
+                | AggregateFrame(groupBy, aggs, inSchema) ->
+                    match Ops.aggregate inSchema op groupBy aggs with
                     | Error e -> Error e
-                    | Ok joined -> unwind rest joined
+                    | Ok aggregated -> run ctx rest (ApplyOp aggregated)
+                | HavingFrame(h, aggs, groupBy) ->
+                    let p = Ops.havingFilter groupBy aggs h
+                    run ctx rest (ApplyOp(Op.filter p op))
+                | DistinctFrame -> run ctx rest (ApplyOp(Ops.distinct op))
+                | SortFrame(keys, childSchema) ->
+                    match Ops.sortBy childSchema op keys with
+                    | Error e -> Error e
+                    | Ok sorted -> run ctx rest (ApplyOp sorted)
+                | LimitFrame(offset, limit) ->
+                    let skipped = if offset > 0 then Op.skip offset op else op
+                    let limited = if limit > 0 then Op.take limit skipped else skipped
+                    run ctx rest (ApplyOp limited)
+                | ProjectFrame(items, childSchema, groupBy) ->
+                    run ctx rest (ApplyOp(Ops.project childSchema groupBy op items))
+                | JoinRightFrame frame ->
+                    run ctx (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema))
+                | JoinApplyFrame(frame, leftOp) ->
+                    match execJoin frame.Kind frame.LeftSchema leftOp frame.RightSchema op frame.On with
+                    | Error e -> Error e
+                    | Ok joined -> run ctx rest (ApplyOp joined)
 
-        let execScan (ctx: ExecContext) (name: string) (method: ScanMethod) =
-            match method with
-            | ScanMethod.SeqScan -> ExecContext.table ctx name
-            | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
-            | ScanMethod.IndexLookup(indexName, values) -> ExecContext.byIndex ctx name indexName values
-            | ScanMethod.RangeScan(_, _, _) -> ExecContext.table ctx name
-
-        let rec stripWrappers (tree: Logical) =
-            match tree with
-            | Logical.Sort(_, child) -> stripWrappers child
-            | Logical.Limit(_, _, child) -> stripWrappers child
-            | Logical.Distinct child -> stripWrappers child
-            | Logical.Having(_, _, _, child) -> stripWrappers child
-            | Logical.Filter(_, child) -> stripWrappers child
-            | Logical.Project(_, child) -> stripWrappers child
-            | other -> other
-
-        let outputOf (tree: Logical) (inSchema: Schema) =
-            match stripWrappers tree with
-            | Logical.Aggregate(groupBy, aggs, _) ->
-                let gv =
-                    groupBy
-                    |> List.map (fun e ->
-                        {
-                            Name = Expr.toDisplayString e
-                            Qualifier = None
-                            DataType = None
-                        })
-
-                let av =
-                    aggs
-                    |> List.map (fun (f, star, arg) ->
-                        let suffix = if star then "*" else Expr.toDisplayString arg
-
-                        {
-                            Name = sprintf "%s(%s)" f.Name suffix
-                            Qualifier = None
-                            DataType = None
-                        })
-
-                { Schema.empty with
-                    Columns = Array.append (List.toArray gv) (List.toArray av)
-                }
-            | _ -> inSchema
-
-        let groupByOf (tree: Logical) =
-            match stripWrappers tree with
-            | Logical.Aggregate(groupBy, _, _) -> groupBy
-            | _ -> []
-
-        match tree with
-        | Logical.Join _ ->
-            match descend [] schema tree with
-            | Error e -> Error e
-            | Ok(op, stack) -> unwind stack op
-        | Logical.Values values -> ret (Op.ofRow values)
-        | Logical.Scan(name, method) -> execScan ctx name method
-        | Logical.Filter(p, child) ->
-            let childSchema = outputOf child schema
-            exec ctx child childSchema |> Result.map (fun op -> Ops.filter childSchema op p)
-        | Logical.Aggregate(groupBy, aggs, child) ->
-            exec ctx child schema >>= fun op -> Ops.aggregate schema op groupBy aggs
-        | Logical.Having(h, aggs, groupBy, child) ->
-            exec ctx child schema
-            >>= fun op ->
-                let p = Ops.havingFilter groupBy aggs h
-                Op.filter p op |> ret
-        | Logical.Distinct child -> exec ctx child schema |> Result.map Ops.distinct
-        | Logical.Sort(keys, child) ->
-            let childSchema = outputOf child schema
-            exec ctx child schema >>= fun op -> Ops.sortBy childSchema op keys
-        | Logical.Limit(offset, limit, child) ->
-            exec ctx child schema
-            |> Result.map (fun op ->
-                let skipped = if offset > 0 then Op.skip offset op else op
-                if limit > 0 then Op.take limit skipped else skipped)
-        | Logical.Project(items, child) ->
-            let childSchema = outputOf child schema
-            let groupBy = groupByOf child
-
-            exec ctx child schema
-            |> Result.map (fun op -> Ops.project childSchema groupBy op items)
+    /// 論理代数を Op に落とす。
+    /// <remarks>
+    /// 下へ渡すスキーマは常に「入力スキーマ」schema のまま。
+    /// outputOf child schema は「child の出力スキーマ」であって、
+    /// child を実行するときの入力スキーマではない。
+    /// ここを間違えると、`SELECT SUM(age) FROM t` で
+    /// 集約ノードが「集約後のヘッダ（`SUM(t.age)`）」を入力として受け取るため、
+    /// 引数の `t.age` を評価できず `SUM` が Null になり、 `GROUP BY` も別の列でグループ化してしまう。
+    /// childSchema は「そのノードが結果を読む側」だけが使う。
+    /// </remarks>
+    let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) = run ctx [] (EvalNode(tree, schema))
 
 module internal Plan =
     /// SELECT 文を実行して、結果（列名 + 行）を返す。

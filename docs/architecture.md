@@ -239,6 +239,12 @@ CPS・継続の hoist・深さ制限の一般則は [`coding-conventions.md`](co
 `go a @ go b` とすると再帰呼び出しが末尾位置に来ないうえ O(n²) になる。
 `Expr.toDisplayString` も継続の連列表（`PrintStep`）で末尾再帰にしている。
 
+組み立ては `Expr.plugChildren`（`children` の逆変換）が担う。
+自分では再帰せず、評価機 **`Expr.rewrite`**（`Ast.fs`、`[<TailCall>]` 付き）が
+子を 1つずつ加工した列を受け取って式に戻すだけなので、深い式でもスタックを食わない。
+`Expr.rewrite` は葉の書き換え関数を受け取る形で、束縛（`Binder.qualify`）と
+集約後の読み替え（`Ops.substituteAggs`）が共用している。
+
 ---
 
 ## 4. 型と順序保持エンコーディング

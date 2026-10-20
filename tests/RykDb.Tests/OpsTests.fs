@@ -16,8 +16,6 @@ let private schema2 =
             outCol "b" None (Some DataType.Integer)
         ]
 
-let private row2 (a: int64) (b: int64) = [| SqlValue.Int a; SqlValue.Int b |]
-
 /// 行の配列を Op にする（入れ子の配列推論を避けるため明示的に作る）。
 let private opOfRows (rows: SqlValue array list) = Op.ofArray (List.toArray rows)
 
@@ -56,7 +54,6 @@ let ``Op: 次の行を引くまで計算しない`` () =
 
     let op = Op.take 3 (infinite 0)
     let rows = ok (Op.toArray op)
-
     Assert.Equal<int>(3, rows.Length)
     Assert.Equal<int64>(0L, asInt rows.[0].[0])
     Assert.Equal<int64>(2L, asInt rows.[2].[0])
@@ -454,6 +451,22 @@ let ``havingFilter: 集約値とグループ値を定数へ置き換える`` () 
     // スターは置き換えず、そのまま評価エラーになる
     expectError "WHERE の * が OK になっています" (eval Expr.Star)
     expectError "WHERE の t.* が OK になっています" (eval (Expr.QualifiedStar "t"))
+
+[<Fact>]
+let ``末尾再帰: 20 万段の式を havingFilter してもスタックを食わない`` () =
+    let depth = 200_000
+
+    // テスト側も末尾再帰（fold）で組む（SQL 経由だと MaxExpressionDepth = 200 で頭打ちになる）
+    let deep =
+        List.init depth (fun _ -> Expr.Literal(Literal.Bool true))
+        |> List.fold (fun acc e -> Expr.Binary(BinaryOp.And, acc, e)) (Expr.Literal(Literal.Bool true))
+
+    let groupBy = [ col "a" ]
+    let aggs = [ (AggFunc.Count, true, Expr.Star) ]
+    // 行 = [a; COUNT(*)]
+    let r = [| SqlValue.Int 7L; SqlValue.Int 3L |]
+
+    Assert.True(ok (Ops.havingFilter groupBy aggs deep r))
 
 [<Fact>]
 let ``結合: INNER JOIN は ON の評価失敗で打ち切る`` () =

@@ -145,14 +145,13 @@ let rec go (cur: Op) : Result<SqlValue array array, DbError> =
 ### 3.1 下へ渡すのは「入力スキーマ」
 
 ```fsharp
-let rec exec (ctx: ExecContext) (tree: Logical) (schema: Schema) : Result<Op, DbError> =
-    match tree with
-    | Limit(_, _, child) ->
-        let childSchema = outputOf ctx child schema     // ← child の出力スキーマ
-        exec ctx child childSchema                     // ← ❌ これを渡すと破綻
+// run の EvalNode 分岐（継続は ExecFrame list に積む）
+| Logical.Sort(keys, child) ->
+    let childSchema = outputOf child inSchema               // ← child の出力スキーマ
+    run ctx (SortFrame(keys, childSchema) :: frames) (EvalNode(child, childSchema)) // ← ❌ 破綻
 ```
 
-`outputOf ctx child schema` は「**child の出力**スキーマ」であって、「child を**実行**するときの**入力**スキーマ」ではない。
+`outputOf child inSchema` は「**child の出力**スキーマ」であって、「child を**実行**するときの**入力**スキーマ」ではない。
 
 これを間違えると、集約ノードが「集約後のヘッダ（`SUM(t.age)` など）」を**入力**として受け取る:
 
@@ -160,13 +159,10 @@ let rec exec (ctx: ExecContext) (tree: Logical) (schema: Schema) : Result<Op, Db
 - `GROUP BY age` → `id` でグループ化してしまう
 
 ```fsharp
-// ✅ childSchema は「結果を読む側」だけが使う。下へは schema を渡す。
-| Limit(_, _, child) ->
-    let childSchema = outputOf ctx child schema
-    exec ctx child schema
-    |> Result.map (fun op ->
-        let limited = if limit > 0 then Op.take limit op else op
-        ...)
+// ✅ childSchema は「結果を読む側」だけが使う。下へは inSchema を渡す。
+| Logical.Sort(keys, child) ->
+    let childSchema = outputOf child inSchema
+    run ctx (SortFrame(keys, childSchema) :: frames) (EvalNode(child, inSchema))
 ```
 
 ### 3.2 `Aggregate` は「包みを剥がして」探す
@@ -241,16 +237,17 @@ match Schema.resolve schema c with
 
 ```fsharp
 // ❌ 左部分木に全スキーマを渡す（内側で外側のテーブルまで解決してしまう）
-exec ctx lTree schema >>= fun lOp -> ...
+run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, inSchema))
 
 // ✅ 積む側で「自分の右テーブルを除いたスキーマ」を左へ下ろす
-descend (frame :: stack) leftSchema lTree
+run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema))
 ```
 
 あわせて `exec l >>= fun lOp -> exec r >>= …` は JOIN の数だけフレームが積もるので、
-`descend`（積む側・左スパインを降りる）と `unwind`（回す側・引き返して結合する）に
-分けて末尾再帰にした。右部分木の Op は `unwind` で初めて評価するので
-評価順（left → right → join）は変わらない。
+`JoinRightFrame`（左を評価し終えたら右を評価）と
+`JoinApplyFrame`（右も評価し終えたら結合）を `ExecFrame list` に積む。
+ラッパも含めて単一の `run` の自己再帰で回すので、
+評価順（left → right → join）を保ったまま末尾再帰になる。
 
 - 回帰テスト: `DatabaseTests` の `Database: 3テーブルの入れ子 JOIN が行を返す` /
   `末尾再帰: 60段の入れ子 JOIN が正しい行を返す`（深さ方向の累積を検証）
@@ -824,6 +821,11 @@ let rec readAll n c acc =
     | Error e -> Error e
     | Ok(v, c1) -> readAll (n - 1UL) c1 (v :: acc)   // 末尾
 ```
+
+**ローカルの `let rec` には `[<TailCall>]` を書けない**（FS0010 → `TreatWarningsAsErrors` でエラー）。
+末尾化したい関数が関数の中にいるなら、機を**モジュールスコープへ引き上げて**必要なものは引数で渡す
+（`Expr.rewriteLoop`（`Ast.fs`）は `rewriteLeaf` を受け取る形で、
+`Binder.qualify` と `Ops.substituteAggs` が共用している）。
 
 **要素数に比例する反復は必ず後者にする**（`match` に直せば末尾になる）。
 `>>=` で受けると候補の数・WHEN 節の数だけスタックが積まれる。

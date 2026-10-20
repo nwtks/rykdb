@@ -82,6 +82,61 @@ let ``Binder: スターは修飾の対象外`` () =
     | other -> Assert.Fail(sprintf "QualifiedStar ではない: %A" other)
 
 // ---------------------------------------------------------------------------
+// Binder.qualify の評価機（全ノード種の組み立て・末尾再帰）
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``Binder: 全ノード種を qualify しても構造が保たれる`` () =
+    let schema = Schema.ofTable "people" None peopleSchema
+    // `id` は people だけの一意な列なので、裸の名前はすべて people.id に修飾される
+    let n = Expr.Name "id"
+    let q = pCol "id"
+    let i1 = Expr.Literal(Literal.Int 1L)
+    let i2 = Expr.Literal(Literal.Int 2L)
+    let text = Expr.Literal(Literal.String "x%")
+
+    // 入力（葉 = 裸の名前）と、葉を修飾済みにした期待値を並べて比較する
+    let samples =
+        [
+            Expr.Unary(UnaryOp.Not, n), Expr.Unary(UnaryOp.Not, q)
+            Expr.Binary(BinaryOp.Add, n, i1), Expr.Binary(BinaryOp.Add, q, i1)
+            Expr.IsNull(n, false), Expr.IsNull(q, false)
+            Expr.Between(n, i1, i2, false), Expr.Between(q, i1, i2, false)
+            Expr.InList(n, [ i1; i2 ], true), Expr.InList(q, [ i1; i2 ], true)
+            Expr.Like(n, text, false), Expr.Like(q, text, false)
+            Expr.Case([ (n, i1); (n, i2) ], Some i1), Expr.Case([ (q, i1); (q, i2) ], Some i1)
+            Expr.Case([ (n, i1) ], None), Expr.Case([ (q, i1) ], None)
+            Expr.FuncCall("ABS", [ n ]), Expr.FuncCall("ABS", [ q ])
+            Expr.AggCall(AggFunc.Sum, false, n), Expr.AggCall(AggFunc.Sum, false, q)
+            Expr.Binary(BinaryOp.And, Expr.Binary(BinaryOp.Or, n, i1), Expr.IsNull(n, true)),
+            Expr.Binary(BinaryOp.And, Expr.Binary(BinaryOp.Or, q, i1), Expr.IsNull(q, true))
+        ]
+
+    for input, expected in samples do
+        Assert.Equal<string>(Expr.toDisplayString expected, Expr.toDisplayString (ok (Binder.qualify schema input)))
+
+[<Fact>]
+let ``末尾再帰: 20 万段の式を qualify してもスタックを食わない`` () =
+    let depth = 200_000
+    let schema = Schema.ofTable "people" None peopleSchema
+
+    // テスト側も末尾再帰で組む（SQL 経由だと MaxExpressionDepth = 200 で頭打ちになる）
+    let deep =
+        List.init depth (fun _ -> ())
+        |> List.fold (fun acc _ -> Expr.Unary(UnaryOp.Neg, acc)) (Expr.Name "id")
+
+    let bound = ok (Binder.qualify schema deep)
+
+    // 葉まで降りて people.id に修飾されていること
+    let refs = Expr.columnRefs bound
+    Assert.Equal<int>(1, refs.Length)
+    Assert.Equal<string>("people", defaultArg refs.[0].Qualifier "")
+    Assert.Equal<string>("id", refs.[0].Name)
+
+    // 深い構造が壊れていないこと（1 段 = "(-" と ")" の 4 文字、葉 = "people.id" の 9 文字）
+    Assert.Equal<int>(depth * 4 + 9, (Expr.toDisplayString bound).Length)
+
+// ---------------------------------------------------------------------------
 // Planner — 述語の分割
 // ---------------------------------------------------------------------------
 

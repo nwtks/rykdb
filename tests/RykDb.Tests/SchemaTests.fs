@@ -59,7 +59,6 @@ let ``Schema.projectHeader: * は入力列名`` () =
 [<Fact>]
 let ``Schema.projectHeader: 空なら入力ヘッダ / t.* は修飾つき`` () =
     let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
-
     // 射影が空なら入力スキーマのヘッダをそのまま返す
     Assert.Equal<string array>([| "t.id" |], Schema.projectHeader s [])
 
@@ -77,12 +76,6 @@ let ``Schema.projectHeader: 空なら入力ヘッダ / t.* は修飾つき`` () 
     Assert.Equal<string array>([| "t.id" |], h)
 
 [<Fact>]
-let ``Schema.resolve: 空スキーマのエラーは (なし) を出す`` () =
-    match Schema.resolve (outSchema []) { Qualifier = None; Name = "x" } with
-    | Error e -> Assert.Contains("(なし)", e.Message)
-    | Ok _ -> Assert.Fail "NameError になるべき"
-
-[<Fact>]
 let ``Schema.tryAsColumnRef: Column / Name を列参照に`` () =
     match Schema.tryAsColumnRef (Expr.Column { Qualifier = Some "t"; Name = "id" }) with
     | Some c -> Assert.Equal("id", c.Name)
@@ -96,15 +89,20 @@ let ``Schema.tryAsColumnRef: Column / Name を列参照に`` () =
 
 [<Fact>]
 let ``Schema.ofTable: テーブルの全列を並べる`` () =
-    let ts = TestHelpers.peopleSchema
+    let ts = peopleSchema
     let s = Schema.ofTable "people" None ts
     Assert.Equal(ts.Columns.Length, s.Columns.Length)
     Assert.Equal<string list>([ "people" ], s.Tables)
 
 [<Fact>]
-let ``Eval: 修飾子の無い列名が曖昧ならエラー`` () =
-    let schema = outSchema [ outCol "id" (Some "a") None; outCol "id" (Some "b") None ]
+let ``Schema.resolve: 空スキーマのエラーは (なし) を出す`` () =
+    match Schema.resolve (outSchema []) { Qualifier = None; Name = "x" } with
+    | Error e -> Assert.Contains("(なし)", e.Message)
+    | Ok _ -> Assert.Fail "NameError になるべき"
 
+[<Fact>]
+let ``Schema.resolve: 修飾子の無い列名が曖昧ならエラー`` () =
+    let schema = outSchema [ outCol "id" (Some "a") None; outCol "id" (Some "b") None ]
     expectError "曖昧な列名が解決できてしまいました" (Schema.resolve schema { Qualifier = None; Name = "id" })
 
     // 修飾子付きなら解決できる

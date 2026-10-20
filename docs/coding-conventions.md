@@ -81,15 +81,9 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - **`[<TailCall>]` は「その関数本体の自己再帰が全部末尾位置」のときだけ付ける**。
   1つでも外れると FS3569 になり、`TreatWarningsAsErrors` のせいでビルドエラーになる。
   構造上末尾にできないものは**付けない理由を呼び出しの直前にコメントで残す**:
-  - `Eval.inferType` / `collectAggs` / `rewriteAggs` / `hasAggregate` —
-    結果を `>>=` / `match` で「消費してから」分岐するため末尾にならない。
-    深さは式の深さ（`MaxExpressionDepth = 200`）で頭打ちになる。
-  - `Planner.exec` — 包み（`Filter` / `Aggregate` / `Having` / `Distinct` / `Sort` / `Limit` / `Project`）
-    は子の `Result` を `Result.map` / `>>=` で消費する。
-    深さは 1文が作るラッパの数（一定）で頭打ち。
-    **`Join` だけは左深い木になるので `descend`（積む側・左スパインを降りる）** /
-    **`unwind`（回す側・引き返して結合する）に分けて末尾再帰にする**
-    （JOIN 数でスタックが積もらない。左へは「右テーブルを除いたスキーマ」を渡す。）。
+  - `Planner.search`（`Optimizer.buildLogical` の点探索候補探し）—
+    `match` で左の結果を「消費してから」AND の右へ分岐するため末尾にならない。
+    深さは WHERE 式の深さ（`MaxExpressionDepth = 200`）で頭打ちになる。
   - `Op.map` / `Op.take` / `Op.append` — 再帰が `Compute` の中身の中にある。
     次の 1行を取りに来たときに 1段だけ評価されるのでフレームは積み上がらない。
     同じ型が `Sstable.rangeScan` の `fromPos` / `fromBlock`
@@ -102,6 +96,21 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
     （`[<TailCall>]` 付き。CPS だが継続はラムダではなくタグ付きの値）。
     再帰は `step` の自己再帰だけなので全末尾位置になり、
     式の深さ・`IN` の候補数に依存せずスタックは一定（継続はヒープのリストに積む）。
+  - `Planner.exec` も同じ方式。論理木の評価を `ExecFrame`（継続）と
+    `ExecStep`（`EvalNode` / `ApplyOp`）に分け、`run` の自己再帰だけにまとめる
+    （`[<TailCall>]` 付き）。ラッパ（`Filter` / `Aggregate` / `Having` / `Distinct` /
+    `Sort` / `Limit` / `Project`）と `Join` の左右評価をすべて `ExecFrame list` に積むので、
+    継続はヒープ、スタックは論理木の深さに依存しない。
+    `Join` は左 → 右 → 結合の順を `JoinRightFrame` / `JoinApplyFrame` で保つ。
+  - 式の走査・組み立ては**評価機 `Expr.rewrite`（`Ast.fs`）を共用**する。
+    葉の書き換え関数（`rewriteLeaf`）だけを受け取り、非葉ノードは `RewriteFrame`（`Parent` / `Done` / `Rest`）に積んで、
+    上がてきた子を `Expr.plugChildren`（`Expr.children` の逆変換）で組み直す。
+    `rewriteLoop` の自己再帰だけ（`[<TailCall>]` 付き）なので、式の深さに依存せずスタックは一定。
+    使うのは束縛の `Binder.qualify` と、集約後の読み替え `Ops.substituteAggs`
+    （`AggCall` のように子を持つノードを丸ごと定数へ置き換えるのも `rewriteLeaf` で表現できる）。
+    検証は `PlannerTests` の `末尾再帰: 20 万段の式を qualify してもスタックを食わない`、
+    `OpsTests` の `末尾再帰: 20 万段の式を havingFilter してもスタックを食わない`、
+    `AstTests` の `plugChildren は children の順で子を差し替える`。
 
 ## 4. 予約語に注意
 
