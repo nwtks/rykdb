@@ -834,6 +834,10 @@ let rec readAll n c acc =
 カーソルからの数え上げ読み出しは `Reader.readItems`（Serialization.fs）に共通化し、
 `Catalog` / `Wal` が使う。
 
+**Debug の `Tailcalls` は既定で false**。`dotnet test` / `dotnet run` は Debug なので、
+CPS の相互末尾再帰が `tail.` にならず、50 万個の `IN` リストで `Stack overflow.`（exit 134）になる。
+`Directory.Build.props` の `<Tailcalls>true</Tailcalls>` を消すと再発するので注意。
+
 属性の無い関数（ローカル `let rec` 含む）まで含めた**反復検証**は `dotnet run --project tools/TailAudit`
 （既知分は `tools/TailAudit/TailAudit.baseline` と差分を取り、新規があれば exit 1。
 追認は内容確認のうえ `-- --update`）。

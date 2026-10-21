@@ -6,5 +6,6 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <WarningLevel>3</WarningLevel>
+    <Tailcalls>true</Tailcalls>
   </PropertyGroup>
 </Project>

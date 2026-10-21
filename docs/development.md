@@ -56,6 +56,8 @@ dotnet fantomas src/ tests/   # 整形
 3. **テスト** — スタック深度の実測（`末尾再帰:` 系テスト）。
 
 `[<TailCall>]` は構文上の検査にすぎない。
+`Directory.Build.props` の `<Tailcalls>true</Tailcalls>` により Debug でも実際の `tail.` を出力する。
+この設定を外すと CPS の相互再帰がテストでスタックオーバーフローする（[`gotchas.md`](gotchas.md) §8.16）。
 CPS でのスタック深度とその上限は [`coding-conventions.md`](coding-conventions.md) §3 を参照。
 
 ## 3. テスト構成

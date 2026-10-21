@@ -301,6 +301,24 @@ let ``Analyzer: 負のリテラルは等値条件に使える`` () =
 
         Assert.Equal<ScanMethod>(ScanMethod.SeqScan, ok (Analyzer.chooseScanMethod b Catalog.empty [ negText ])))
 
+[<Fact>]
+let ``末尾再帰: 20 万段の AND を chooseScanMethod してもスタックを食わない`` () =
+    withStore "an8" (fun store ->
+        let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
+
+        // 左結合の AND の最深部に等値条件を置く。探索が非末尾だと、
+        // この条件にたどり着くまでにスタックが積もる。
+        let hit = Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Literal(Literal.Int 42L))
+        let miss = Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))
+
+        let deep =
+            List.init 200_000 (fun _ -> miss)
+            |> List.fold (fun acc p -> Expr.Binary(BinaryOp.And, acc, p)) hit
+
+        match ok (Analyzer.chooseScanMethod b Catalog.empty [ deep ]) with
+        | ScanMethod.PkLookup values -> Assert.Equal<int64>(42L, asInt values.[0])
+        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m))
+
 // ---------------------------------------------------------------------------
 // Planner — SELECT 文全体の論理代数
 // ---------------------------------------------------------------------------

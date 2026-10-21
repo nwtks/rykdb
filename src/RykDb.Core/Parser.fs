@@ -176,7 +176,8 @@ module internal Parser =
     // 「異常な入力を早期に検知し、既定より読みやすいエラーにする」目的で残す。
     // -----------------------------------------------------------------------
 
-    /// 継続。「式を 1 つ読んだ後に残りをする」。
+    /// 継続。
+    /// 「式を 1 つ読んだ後に残りをする」。
     /// 戻り値の型 'r は呼び出し側ごとに違うので（式だけ / (Expr*Expr) list / Expr option …）
     /// .generic にしてある。
     type private K<'r> = Expr -> PState -> Result<'r, DbError>
@@ -184,7 +185,8 @@ module internal Parser =
     /// 終端の継続（読んだ式をそのまま返す）。
     let private retE (e: Expr) (st: PState) = ret (e, st)
 
-    /// 式再帰の唯一の入口。深さを管理して、深い入れ子をスタックではなくエラーにする。
+    /// 式再帰の唯一の入口。
+    /// 深さを管理して、深い入れ子をスタックではなくエラーにする。
     /// 継続が呼ばれるのは「式の読み終え時」なので、その時点で深さを戻す。
     /// 構文規則は mutually recursive なので、そのままでは必ず非末尾再帰になる。
     /// 継続（continuation）を渡して「式を 1 つ読んだときに、残りを k に渡す」形にすることで、
@@ -195,17 +197,25 @@ module internal Parser =
         | Error e -> Error e
         | Ok st -> parseOrC (fun e st -> k e (exitExpr st)) st
 
-    /// カンマ区切りの式リストを読み、閉じ括弧 ")" まで消費する。関数引数と IN リストで共用する。
-    and private parseExprListToParen acc (st: PState) =
-        match parseExprC retE st with
-        | Error e -> Error e
-        | Ok(e, st) ->
-            if isSymbol st "," then
-                parseExprListToParen (e :: acc) (advance st)
-            else
-                match expectSymbol st ")" with
-                | Error e -> Error e
-                | Ok(_, st) -> ret (List.rev (e :: acc), st)
+    and [<TailCall>] private parseExprListElemC<'r>
+        (k: Expr list -> PState -> Result<'r, DbError>)
+        (acc: Expr list)
+        (e: Expr)
+        (st: PState)
+        =
+        if isSymbol st "," then
+            parseExprListToParen k (e :: acc) (advance st)
+        else
+            match expectSymbol st ")" with
+            | Error e -> Error e
+            | Ok(_, st) -> k (List.rev (e :: acc)) st
+
+    and [<TailCall>] private parseExprListToParen<'r>
+        (k: Expr list -> PState -> Result<'r, DbError>)
+        (acc: Expr list)
+        (st: PState)
+        : Result<'r, DbError> =
+        parseExprC (parseExprListElemC k acc) st
 
     and [<TailCall>] private parseCallBodyC<'r> (k: K<'r>) (st: PState) (name: string) =
         match expectSymbol st "(" with
@@ -225,12 +235,14 @@ module internal Parser =
                 let distinct = upper = "COUNT" && isKeyword st "DISTINCT"
                 let st = if distinct then advance st else st
 
-                match parseExprListToParen [] st with
-                | Error e -> Error e
-                | Ok(argList, st) ->
-                    match AggFunc.tryParse upper with
-                    | Some agg when List.length argList = 1 -> k (Expr.AggCall(agg, distinct, List.head argList)) st
-                    | _ -> k (Expr.FuncCall(upper, argList)) st
+                parseExprListToParen
+                    (fun argList st ->
+                        match AggFunc.tryParse upper with
+                        | Some agg when List.length argList = 1 ->
+                            k (Expr.AggCall(agg, distinct, List.head argList)) st
+                        | _ -> k (Expr.FuncCall(upper, argList)) st)
+                    []
+                    st
 
     and [<TailCall>] private parseNamedPrimaryC<'r> (k: K<'r>) (st: PState) (name: string) =
         let st = advance st
@@ -247,40 +259,40 @@ module internal Parser =
         else
             k (Expr.Name name) st
 
-    and private parseCaseBranches acc (st: PState) =
+    and [<TailCall>] private parseCaseBranches<'r>
+        (k: (Expr * Expr) list -> PState -> Result<'r, DbError>)
+        (acc: (Expr * Expr) list)
+        (st: PState)
+        =
         if isKeyword st "WHEN" then
-            match parseExprC retE (advance st) with
-            | Error e -> Error e
-            | Ok(cond, st) ->
-                match expectKeyword st "THEN" with
-                | Error e -> Error e
-                | Ok(_, st) ->
-                    match parseExprC retE st with
+            parseExprC
+                (fun cond st ->
+                    match expectKeyword st "THEN" with
                     | Error e -> Error e
-                    | Ok(res, st) -> parseCaseBranches ((cond, res) :: acc) st
+                    | Ok(_, st) -> parseExprC (fun res st -> parseCaseBranches k ((cond, res) :: acc) st) st)
+                (advance st)
         else
-            ret (List.rev acc, st)
+            k (List.rev acc) st
+
+    and [<TailCall>] private parseCaseTailC<'r> (k: K<'r>) (bs: (Expr * Expr) list) (st: PState) =
+        if List.isEmpty bs then
+            fail st "CASE には WHEN 句が必要です"
+        elif isKeyword st "ELSE" then
+            parseExprC
+                (fun elseE st ->
+                    match expectKeyword st "END" with
+                    | Error e -> Error e
+                    | Ok(_, st) -> k (Expr.Case(bs, Some elseE)) st)
+                (advance st)
+        else
+            match expectKeyword st "END" with
+            | Error e -> Error e
+            | Ok(_, st) -> k (Expr.Case(bs, None)) st
 
     and [<TailCall>] private parseCaseC<'r> (k: K<'r>) (st: PState) =
         match expectKeyword st "CASE" with
         | Error e -> Error e
-        | Ok(_, st) ->
-            match parseCaseBranches [] st with
-            | Error e -> Error e
-            | Ok(bs, st) ->
-                if List.isEmpty bs then
-                    fail st "CASE には WHEN 句が必要です"
-                else if isKeyword st "ELSE" then
-                    parseExprC
-                        (fun elseE st ->
-                            match expectKeyword st "END" with
-                            | Error e -> Error e
-                            | Ok(_, st) -> k (Expr.Case(bs, Some elseE)) st)
-                        (advance st)
-                else
-                    match expectKeyword st "END" with
-                    | Error e -> Error e
-                    | Ok(_, st) -> k (Expr.Case(bs, None)) st
+        | Ok(_, st) -> parseCaseBranches (parseCaseTailC k) [] st
 
     and [<TailCall>] private parsePrimaryC<'r> (k: K<'r>) (st: PState) =
         match peek st with
@@ -364,24 +376,30 @@ module internal Parser =
     and [<TailCall>] private parseBetweenBodyC<'r> (k: Expr -> Expr -> PState -> Result<'r, DbError>) (st: PState) =
         parseAdditiveC (parseBetweenAndC k) st
 
-    and private parseInListBodyLoop acc (st: PState) =
-        match parseExprC retE st with
-        | Error e -> Error e
-        | Ok(e, st) ->
-            if isSymbol st "," then
-                parseInListBodyLoop (e :: acc) (advance st)
-            else
-                match expectSymbol st ")" with
-                | Error e -> Error e
-                | Ok(_, st) -> ret (List.rev (e :: acc), st)
+    and [<TailCall>] private parseInListBodyElemC<'r>
+        (k: Expr list -> PState -> Result<'r, DbError>)
+        (acc: Expr list)
+        (e: Expr)
+        (st: PState)
+        =
+        if isSymbol st "," then
+            parseInListBodyLoop k (e :: acc) (advance st)
+        else
+            match expectSymbol st ")" with
+            | Error e -> Error e
+            | Ok(_, st) -> k (List.rev (e :: acc)) st
+
+    and [<TailCall>] private parseInListBodyLoop<'r>
+        (k: Expr list -> PState -> Result<'r, DbError>)
+        (acc: Expr list)
+        (st: PState)
+        : Result<'r, DbError> =
+        parseExprC (parseInListBodyElemC k acc) st
 
     and [<TailCall>] private parseInListBodyC<'r> (k: Expr list -> PState -> Result<'r, DbError>) (st: PState) =
         match expectSymbol st "(" with
         | Error e -> Error e
-        | Ok(_, st) ->
-            match parseInListBodyLoop [] st with
-            | Error e -> Error e
-            | Ok(xs, st) -> k xs st
+        | Ok(_, st) -> parseInListBodyLoop k [] st
 
     and [<TailCall>] private parsePredicateTail<'r> (k: K<'r>) (left: Expr) (st: PState) =
         let compareOp =

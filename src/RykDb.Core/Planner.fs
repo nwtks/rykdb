@@ -181,42 +181,42 @@ module internal Analyzer =
     let schemaOf (b: TableBinding) =
         Schema.ofTable b.RealName b.Ref.Alias b.Schema
 
-    /// WHERE から等価条件を探して走査方法を決める。
-    let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
-        let colOf (tn: string) (v: Expr) =
-            match v with
-            | Expr.Column { Qualifier = Some q; Name = n } when q.ToLowerInvariant() = tn -> Some n
-            | _ -> None
+    /// 指定テーブルの修飾付き列参照から列名を取り出す。
+    let private colOf (tn: string) (v: Expr) =
+        match v with
+        | Expr.Column { Qualifier = Some q; Name = n } when q.ToLowerInvariant() = tn -> Some n
+        | _ -> None
 
-        let litOf (v: Expr) =
-            match v with
-            | Expr.Literal l -> Some l.ToSqlValue
-            | Expr.Unary(UnaryOp.Neg, Expr.Literal l) ->
-                match l.ToSqlValue with
-                | SqlValue.Int i -> Some(SqlValue.Int -i)
-                | SqlValue.Real f -> Some(SqlValue.Real -f)
-                | _ -> None
+    /// リテラル（負の数を含む）を SqlValue にする。
+    let private litOf (v: Expr) =
+        match v with
+        | Expr.Literal l -> Some l.ToSqlValue
+        | Expr.Unary(UnaryOp.Neg, Expr.Literal l) ->
+            match l.ToSqlValue with
+            | SqlValue.Int i -> Some(SqlValue.Int -i)
+            | SqlValue.Real f -> Some(SqlValue.Real -f)
             | _ -> None
+        | _ -> None
 
-        let rec search (tn: string) (x: Expr) =
+    /// 未処理の式のスタックを辿り、AND の奥にある最初の等値条件を返す。
+    [<TailCall>]
+    let rec private findEquality (tn: string) (pending: Expr list) =
+        match pending with
+        | [] -> None
+        | x :: rest ->
             match x with
-            | Expr.Binary(BinaryOp.And, a, b) ->
-                match search tn a with
-                | Some r -> Some r
-                | None -> search tn b
+            | Expr.Binary(BinaryOp.And, a, b) -> findEquality tn (a :: b :: rest)
             | Expr.Binary(BinaryOp.Eq, a, b) ->
                 match colOf tn a, litOf b with
                 | Some n, Some v -> Some(n, v)
                 | _ ->
                     match colOf tn b, litOf a with
                     | Some n, Some v -> Some(n, v)
-                    | _ -> None
-            | _ -> None
+                    | _ -> findEquality tn rest
+            | _ -> findEquality tn rest
 
-        let tryColumnEqualConstant (table: string) (e: Expr) =
-            let tn = table.ToLowerInvariant()
-            search tn e
-
+    /// WHERE から等価条件を探して走査方法を決める。
+    let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
         let resolveScanMethod (colName: string) (value: SqlValue) =
             let isPk =
                 b.Schema.PrimaryKey
@@ -238,14 +238,10 @@ module internal Analyzer =
                 | None -> ScanMethod.SeqScan
 
         let name = refName b
-        let all = Predicate.joinConjuncts predicates
 
-        match all with
-        | Some p ->
-            match tryColumnEqualConstant name p with
-            | None -> ret ScanMethod.SeqScan
-            | Some(colName, value) -> ret (resolveScanMethod colName value)
+        match findEquality (name.ToLowerInvariant()) predicates with
         | None -> ret ScanMethod.SeqScan
+        | Some(colName, value) -> ret (resolveScanMethod colName value)
 
 module internal Optimizer =
     /// SELECT 文を論理代数に変換する。
