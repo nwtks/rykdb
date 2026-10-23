@@ -92,6 +92,7 @@ let private handleClient (db: Database) (client: System.Net.Sockets.TcpClient) (
                         running <- send (encode result.Columns result.Rows)
 
     onLog "切断されました"
+    current
 
 let serve
     (db: Database)
@@ -107,6 +108,7 @@ let serve
                 ())
 
     let mutable clientId = 0
+    let mutable currentDb = db
 
     while not stop.IsCancellationRequested do
         try
@@ -115,7 +117,10 @@ let serve
             onLog (sprintf "[%d] 接続されました" clientId)
 
             try
-                handleClient db client (fun m -> onLog (sprintf "[%d] %s" clientId m))
+                let finalDb =
+                    handleClient currentDb client (fun m -> onLog (sprintf "[%d] %s" clientId m))
+
+                currentDb <- finalDb
             with ex ->
                 onLog (sprintf "[%d] 例外: %s" clientId ex.Message)
 
@@ -137,3 +142,4 @@ let serve
                 onLog (sprintf "接続処理で例外: %s" ex.Message)
 
     listener.Stop()
+    currentDb.Close() |> ignore

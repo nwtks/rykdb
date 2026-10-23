@@ -202,6 +202,43 @@ let ``Compaction: 最下位レベルの compaction で tombstone だけなら出
         Assert.True(File.Exists(FileMetaData.path dir 10L)))
 
 [<Fact>]
+let ``Compaction: L0 のファイル数が閾値に達したら L1 へ compaction する`` () =
+    withDir "comp-l0" (fun dir ->
+        let files =
+            [
+                for i in 1..3 -> mkSst dir (int64 (10 + i)) 0 [ Entry.put (intKey i) (uint64 i) (intRow i) ]
+            ]
+
+        let version = files |> List.fold (fun v f -> Version.addFile f v) Version.empty
+        let before, _ = compactAll dir version 0UL CompactionOptions.defaults
+        Assert.Empty before.Added
+        Assert.Equal(3, Version.filesAt version 0 |> Array.length)
+
+        let fourth = mkSst dir 20L 0 [ Entry.put (intKey 4) 4UL (intRow 4) ]
+        let version = Version.addFile fourth version
+        let result, _ = compactAll dir version 0UL CompactionOptions.defaults
+        Assert.Equal<int64 list>([ 11L; 12L; 13L; 20L ], result.Removed |> List.map _.FileNumber |> List.sort)
+        Assert.Equal(1, result.Added.Length)
+        Assert.Equal(1, result.Added.[0].Level)
+        Assert.Equal(4L, result.Added.[0].EntryCount))
+
+[<Fact>]
+let ``Compaction: 古い版が残るなら最下位でも tombstone を消さない`` () =
+    withDir "comp-keep-old-tomb" (fun dir ->
+        let f =
+            mkSst dir 10L Levels.Max [ Entry.delete (intKey 1) 5UL; Entry.put (intKey 1) 3UL (intRow 1) ]
+
+        let version = Version.addFile f Version.empty
+        let result, _ = compactAll dir version 0UL pickFirstLevel
+        Assert.Equal(0, result.DroppedVersions)
+        Assert.Equal(0, result.DroppedTombstones)
+
+        let entries = ok (readBack dir (List.exactlyOne result.Added))
+        Assert.Equal<int>(2, entries.Length)
+        Assert.True(entries.[0].IsDelete)
+        Assert.Equal<uint64>(3UL, entries.[1].SeqNo))
+
+[<Fact>]
 let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
     withDir "comp-write-fail" (fun dir ->
         let f = mkSst dir 10L 1 [ entryOf 1 ]

@@ -60,7 +60,7 @@ column_constraint ::= NOT NULL | PRIMARY KEY | UNIQUE | DEFAULT expr
 txn            ::= BEGIN | COMMIT | ROLLBACK
 ```
 
-> **注意** `BEGIN` / `COMMIT` / `ROLLBACK` は構文としては受理されるが、**実行しても何も起きない**。
+> **注意** `BEGIN` / `COMMIT` / `ROLLBACK` は SQL 文として transaction を制御する（§12）。
 > 詳しくは [12. トランザクション](#12-トランザクション)。
 
 文は `;` で区切れる（末尾の `;` は省略可）。
@@ -263,18 +263,13 @@ SELECT "Order Id" FROM "My Table";      -- 引用識別子
 - 修飾なしの列名は `FROM` にあるテーブルの順に探す。
 - 結合句で同じ列名が複数の表にあれば、修飾が必須。
 
-### ［制限］`SELECT` 項目の先頭が裸の識別子・関数呼び出しのとき
+### `SELECT` 項目の後置演算子
 
-`SELECT` の項目は「識別子」「`関数名(...)`」「`*`」をそのまま 1項目として扱い、
-**後ろに演算子が続く場合は式として解析されない**。
-演算子を使うときは全体を括弧で囲む。
+`SELECT` の項目は式として解析されるので、裸の識別子・関数呼び出しの後に演算子を書ける。
 
 ```sql
-SELECT name || ' (' || dept_id || ')' FROM p;   -- SyntaxError（FROM が必要）
-SELECT (name || ' (' || dept_id || ')') FROM p; -- OK
-
-SELECT SUM(d) + 0.5 FROM t;     -- SyntaxError（FROM が必要）
-SELECT (SUM(d)) + 0.5 FROM t;   -- OK
+SELECT name || 'x' FROM t;          -- OK
+SELECT SUM(d) + 0.5 FROM t;        -- OK
 ```
 
 ---
@@ -400,23 +395,23 @@ HAVING COUNT(*) > 1
 - `SUM` / `AVG` は `SUM / COUNT` を実行時に計算する。
 - `MIN` / `MAX` は文字列・日付・時刻にも使える。
 - `GROUP BY` を書かない `SELECT SUM(x) FROM t` は表全体の 1グループとして集計される。
-- ［制限］**集約関数のエラーは握り潰され `NULL` になる**。
+- 集約関数のエラーは**伝播する**。
   文字列列に `SUM` を掛けると `NULL` が返り、エラーにはならない。
-- ［制限］**`COUNT(DISTINCT x)` は構文は通るが重複排除しない**（`COUNT(x)` と同じ結果）。
+- `COUNT(DISTINCT x)` は**重複排除する**。
 
 ### 6.6 スカラー関数
 
 関数名は大文字小文字を区別しない。
 
-| 関数                |   引数 | 戻り値               | `NULL` の扱い           | 備考                                                                 |
-| ------------------- | -----: | -------------------- | ----------------------- | -------------------------------------------------------------------- |
-| `UPPER(x)`          |      1 | `TEXT`               | ［制限］文字列 `"NULL"` | 大文字化                                                             |
-| `LOWER(x)`          |      1 | `TEXT`               | ［制限］文字列 `"NULL"` | 小文字化                                                             |
-| `TRIM(x)`           |      1 | `TEXT`               | ［制限］文字列 `"NULL"` | 前後の空白を削除                                                     |
-| `LENGTH(x)`         |      1 | `INTEGER`            | `NULL`                  | UTF-16 文字数                                                        |
-| `ABS(x)`            |      1 | 入力と同じ数値型     | `NULL`                  | 非数値はエラー                                                       |
-| `ROUND(x)`          |      1 | `REAL`               | `NULL`                  | 0.5 は 1 へ（四捨五入・`AwayFromZero`）。**`INTEGER` / `REAL` のみ** |
-| `COALESCE(a, b, …)` | 1 以上 | 最初の非 `NULL` の型 | 全滅なら `NULL`         | 引数数は自由                                                         |
+| 関数                |   引数 | 戻り値               | `NULL` の扱い    | 備考                                                                 |
+| ------------------- | -----: | -------------------- | ---------------- | -------------------------------------------------------------------- |
+| `UPPER(x)`          |      1 | `TEXT`               | 大文字化         |
+| `LOWER(x)`          |      1 | `TEXT`               | 小文字化         |
+| `TRIM(x)`           |      1 | `TEXT`               | 前後の空白を削除 |
+| `LENGTH(x)`         |      1 | `INTEGER`            | `NULL`           | UTF-16 文字数                                                        |
+| `ABS(x)`            |      1 | 入力と同じ数値型     | `NULL`           | 非数値はエラー                                                       |
+| `ROUND(x)`          |      1 | `REAL`               | `NULL`           | 0.5 は 1 へ（四捨五入・`AwayFromZero`）。**`INTEGER` / `REAL` のみ** |
+| `COALESCE(a, b, …)` | 1 以上 | 最初の非 `NULL` の型 | 全滅なら `NULL`  | 引数数は自由                                                         |
 
 - **未知の関数**は `未知のスカラー関数 '…' です`。
 - **引数数が違う**場合は `… 関数は 1個の引数が必要ですが、2個渡されました`。
@@ -500,24 +495,29 @@ FROM → JOIN → WHERE → GROUP BY → HAVING → 集約 → ORDER BY → 射�
 
 ### 7.4 索引が使われる条件
 
-`WHERE` に**列 = 定数**（＝リテラル、または負の数値リテラル）の等価述語が `AND` で連結されているとき、左から順に評価される。
+`WHERE` に**列 = 定数**（＝リテラル、または負の数値リテラル）の等価述語が `AND` で連結されているとき、それらをまとめて評価する。
 
-| 条件                           | 走査方法                           |
-| ------------------------------ | ---------------------------------- |
-| 主キー列 `= 定数`              | ポイントルックアップ（`PkLookup`） |
-| `CREATE INDEX` した列 `= 定数` | 索引ルックアップ（`IndexLookup`）  |
-| それ以外                       | 全走査（`SeqScan`）                |
+| 条件                               | 走査方法                           |
+| ---------------------------------- | ---------------------------------- |
+| 主キーの全列 `= 定数`              | ポイントルックアップ（`PkLookup`） |
+| 主キーの一部の列 `= 定数`          | 全走査（`SeqScan`）                |
+| `CREATE INDEX` した単一列 `= 定数` | 索引ルックアップ（`IndexLookup`）  |
+| 単一列の主キー / 単一列索引に下限のある範囲条件 (`>`, `>=`, `<`, `<=`, `BETWEEN`) | 範囲走査（`RangeScan` / `IndexRangeScan`） |
+| それ以外                           | 全走査（`SeqScan`）                |
+
+主キー・索引は値のバイト列表現で引くため、列の宣言型とリテラルの型が一致するときだけ使う。
+型が違うリテラルは全走査に落ち、比較時に `TypeError` になる。
 
 ```sql
 CREATE INDEX idx_dept ON people (dept_id);
 SELECT id FROM people WHERE dept_id = 2;   -- 索引が使われる（一致する行をすべて返す）
-SELECT id FROM people WHERE dept_id > 2;   -- 全走査（範囲検索はない）
+SELECT id FROM people WHERE dept_id > 2;   -- 単一列索引なので範囲走査が使われる
 ```
 
 制限:
 
-- **範囲走査は使わない**。
-  `>`, `<`, `BETWEEN`, `LIKE` は索引を要求しない。
+- **範囲走査は単一列の主キー / 単一列索引に限る**（下限のある条件のみ）。
+  `LIKE` は索引を要求しない。`>` / `<` / `BETWEEN` のうち下限が無い条件（`<` のみなど）は全走査になる。
 - **複合索引の Leftmost prefix は考慮しない**。
   索引の**いずれかの列**に等価条件があればその索引で値だけ引く
   （`WHERE b = 2` が複合索引 `(a, b)` を使っても、 `b = 2` だけでは意味がないのに使ってしまう）。
@@ -547,7 +547,7 @@ SELECT p.id, d.dname
 
 ### 7.6 `ORDER BY` の安定性
 
-ソートはメモリ上に実体化してから安定ソートする。
+ソートはメモリ上に実体化してから `Array.sortWith`（不安定ソート）で並べる。
 同値な行の順序は保証されない（`ORDER BY` のキーが一意でないとき）。
 
 ### 7.7 `LIMIT` / `OFFSET`
@@ -558,7 +558,7 @@ SELECT p.id, d.dname
   `OFFSET` → `LIMIT` の順で適用される。
 - `LIMIT` だけの形か `LIMIT n OFFSET m` の形だけ書ける
   （`OFFSET` 単独は不可）。
-- ［制限］`LIMIT 0` は「0行」ではなく「**制限なし**」として扱われる。
+- `LIMIT 0` は「0 行」を返す。
 
 ```sql
 SELECT id FROM people ORDER BY id LIMIT 2;            -- 先頭 2 行
@@ -619,17 +619,17 @@ INSERT INTO テーブル [ (列 [, 列 …]) ] VALUES (式 [, 式 …]) [, (式 
 - `NOT NULL` 制約は行ごとに検証される。
 - **1つの `INSERT` は 1トランザクション**（途中で失敗したら何も残らない）。
 
-### 主キー重複は upsert
+### 主キー重複はエラー
 
-**エラーにならず上書きされる**。［制限］
-複数列の主キーも同じで、値の組が一致すれば上書きされる。
+**エラーになる**（upsert しない）。
+複数列の主キーも同じで、値の組が一致すればエラーになる。
 
-### `UNIQUE` は検査されない
+### `UNIQUE` は検査される
 
-`UNIQUE` 制約・`UNIQUE` 索引も宣言できるが、**重複はエラーにならない**。［制限］
+`UNIQUE` 制約・`UNIQUE` 索引は重複を検査する。
 
 ```sql
-INSERT INTO people VALUES (1, 'alice2', 30, 1, 1.0);  -- id=1 が置き換わる
+INSERT INTO people VALUES (1, 'alice2', 30, 1, 1.0);  -- id=1 が既に存在するのでエラー
 ```
 
 ### 例
@@ -657,15 +657,15 @@ UPDATE テーブル SET 列 = 式 [, 列 = 式 …] [ WHERE 条件 ];
 - 影響行数は `StatementResult.RowsAffected` に入る。
 - 索引があるテーブルでは、更新のたびにすべての索引のエントリが書き直される。
 
-### ［制限］主キー列は更新できない
+### 主キー列は更新できない
 
-主キー列を `SET` すると、行が新しい主キーの位置にも**コピーされるだけで、古い主キー位置の行は消えない**（幽霊行）。
-`RowsAffected` は 1 になるが、行数は増えてしまう。
+主キー列を `SET` するとエラーになる（幽霊行を防ぐため）。
+主キーを変えたい場合は `DELETE` + `INSERT` を使う。
 
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT);
 INSERT INTO t VALUES (1,'a'),(2,'b');
-UPDATE t SET id = 100 WHERE id = 1;   -- RowsAffected = 1
+UPDATE t SET id = 100 WHERE id = 1;   -- エラー
 
 SELECT id, n FROM t ORDER BY id;
 -- 1, 'a'      ← 消えない
@@ -729,8 +729,10 @@ CREATE TABLE people (
 | ------------- | ------------ | --------------------------------------------------------- |
 | `NOT NULL`    | 列           | **検査される**（`NULL` を入れると `ConstraintViolation`） |
 | `PRIMARY KEY` | 列・テーブル | **必須**。`NOT NULL` も付く                               |
-| `UNIQUE`      | 列・テーブル | **宣言だけ。重複は検査されない**［制限］                  |
+| `UNIQUE`      | 列・テーブル | 重複を検査する                                            |
 | `DEFAULT`     | 列           | `INSERT` で値を省略したときに使われる（定数式のみ）       |
+
+`DEFAULT` はカタログに保存され、DB を再オープンした後も使われる。
 
 - **主キーは省略できない**。
   1つも無いと`テーブル t に主キーがありません` になる。
@@ -757,7 +759,7 @@ CREATE [UNIQUE] INDEX 索引名 ON テーブル (列 [, 列 …]);
 - **既存の行はすべて索引に投入される**（backfill）。
   backfill の間は排他を取らないので、並行 insert との整合は保証されない。
 - 索引は**独立した LSM ツリー**（keyspace `i:<索引名>`）に格納される。
-- `UNIQUE` は**宣言だけ**で、重複は検査されない［制限］。
+- `UNIQUE` は重複を検査する。
 - 同名の索引が既にあれば `索引 <名前> は既に存在します`。
 - 索引する列が存在しない場合は `テーブル <t> に列 <c> がありません`。
 - `IF NOT EXISTS` は**ない**。
@@ -789,14 +791,24 @@ DROP INDEX idx_dept;
 
 ### SQL 文としての BEGIN / COMMIT / ROLLBACK
 
-［制限］**構文としては受理されるが、実行しても何も起きない**。
-特に `ROLLBACK` を書いても行は取り消されない。
+`BEGIN` / `COMMIT` / `ROLLBACK` は SQL 文として受理され、**暗黙の transaction を明示的に制御する**。
 
 ```sql
 BEGIN;
-INSERT INTO people VALUES (9, 'eve', 50, 1, 1.0);
-ROLLBACK;            -- ← 取り消されない
+INSERT INTO t VALUES (1, 'a');
+INSERT INTO t VALUES (2, 'b');
+COMMIT;          -- 両方を確定
+
+BEGIN;
+DELETE FROM t WHERE id = 1;
+ROLLBACK;        -- 削除を取り消し
 ```
+
+- `BEGIN` は新しい transaction を始める（既に transaction 中なら何もしない）。
+- `COMMIT` はバッファをエンジンへ流す。
+- `ROLLBACK` はバッファを捨てる。
+- 1 つの `Execute` / スクリプト内で複数文を `;` 区切りで渡した場合、`BEGIN` 以降は同じ transaction で実行される。
+- ライブラリ API の `Database.Begin()` / `Commit()` / `Rollback()` と等価。
 
 ### 暗黙のトランザクション
 
@@ -846,11 +858,13 @@ let db4 = db2.Rollback()                           // 破棄
 
 | コマンド    | 効果                             |
 | ----------- | -------------------------------- |
+| `.begin`    | transaction を開始               |
 | `.commit`   | 開いているトランザクションを確定 |
 | `.rollback` | 開いているトランザクションを破棄 |
 
 ```
-db> BEGIN;
+db> .begin
+(begin しました)
 db> INSERT INTO people VALUES (9, 'eve', 50, 1, 1.0);
 db> .rollback
 (rollback しました)
@@ -927,30 +941,21 @@ db> .rollback
 
 ### 実装上の制約
 
-| 項目                            | 内容                                                                          |
-| ------------------------------- | ----------------------------------------------------------------------------- |
-| `COUNT(DISTINCT x)`             | 構文は通るが**重複排除しない**（`COUNT(x)` と同じ結果）                       |
-| 集約関数のエラー                | 握り潰されて `NULL` になる（文字列列への `SUM` など）                         |
-| `ROUND(x)`                      | `INTEGER` / `REAL` のみ。`DECIMAL` は実行時エラー                             |
-| `UPPER(NULL)` など              | `NULL` ではなく文字列 `'NULL'` を返す                                         |
-| `UNIQUE` 制約・索引             | 宣言されるが**重複を検査しない**                                              |
-| 主キー重複 `INSERT`             | エラーにならず**上書き**（upsert）                                            |
-| `UPDATE` での主キー変更         | 行が複製され、幽霊行が残る                                                    |
-| `BEGIN` / `COMMIT` / `ROLLBACK` | **文としては無効**。ライブラリ API / ドットコマンドを使う                     |
-| `SELECT` の `FROM`              | **省略不可**。定数だけの SELECT は書けない                                    |
-| 演算子の後置                    | `SELECT` 項目の先頭が裸の識別子・関数のとき演算子を追記できない（括弧で囲む） |
-| 索引                            | 等価一致のみ。範囲走査・複合索引の Leftmost prefix は使わない                 |
-| `LIMIT` / `OFFSET`              | 整数リテラルのみ。`LIMIT 0` は「制限なし」                                    |
-| 型引数                          | `VARCHAR(32)` は宣言のみ。切り詰めなし                                        |
-| ソート                          | メモリ上に実体化。spilling する外部マージは未実装                             |
-| `AVG`                           | `SUM / COUNT` を実行時に計算                                                  |
-| `UPDATE` / `DELETE`             | `LIMIT` 相当の句がない                                                        |
-| `ORDER BY`                      | 同値行の順序は保証しない                                                      |
+| 項目                | 内容                                                          |
+| ------------------- | ------------------------------------------------------------- |
+| `SELECT` の `FROM`  | **省略不可**。定数だけの SELECT は書けない                    |
+| 索引                | 等価一致のみ。範囲走査・複合索引の Leftmost prefix は使わない |
+| `LIMIT` / `OFFSET`  | 整数リテラルのみ。`LIMIT 0` は「0 行」                        |
+| 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                        |
+| ソート              | メモリ上に実体化。spilling する外部マージは未実装             |
+| `AVG`               | `SUM / COUNT` を実行時に計算                                  |
+| `UPDATE` / `DELETE` | `LIMIT` 相当の句がない                                        |
+| `ORDER BY`          | 同値行の順序は保証しない                                      |
 
 ### 演算の注意
 
 - `INTEGER / INTEGER` は切り捨て（`10 / 4` → `2`）。実数にしたいなら `10 / 4.0`。
-- `UPPER(NULL)` / `LOWER(NULL)` / `TRIM(NULL)` は文字列 `'NULL'` を返す。
+- `UPPER(NULL)` / `LOWER(NULL)` / `TRIM(NULL)` は `NULL` を返す。
 - `DATE` と `TIMESTAMP` は相互比較できるが、`DATE` は UTC 午前 0時として扱われる。
 - `REAL` の `NaN` は `REAL` 同士の比較でのみ特別扱いされる（`NaN` が最大、`NaN = NaN` は真）。
   `NaN` と `INTEGER` / `DECIMAL` を比較すると `TypeError`（`NaN や ±Infinity は数値比較できません`）になる。

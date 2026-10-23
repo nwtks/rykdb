@@ -56,8 +56,26 @@ let ``SqlValue: asNumeric は NaN と無限大を拒否する`` () =
     Assert.True((SqlValue.asNumeric (SqlValue.Real Double.NegativeInfinity)).IsNone)
     Assert.Equal<decimal option>(Some 2.5M, SqlValue.asNumeric (SqlValue.Real 2.5))
     Assert.Equal<decimal option>(Some 3M, SqlValue.asNumeric (SqlValue.Int 3L))
+    Assert.True((SqlValue.asNumeric (SqlValue.Real 1e30)).IsNone)
     Assert.True((SqlValue.asNumeric (SqlValue.Text "3")).IsNone)
     Assert.True((SqlValue.asNumeric SqlValue.Null).IsNone)
+
+[<Fact>]
+let ``SqlValue.compareValues: decimal 範囲外と極小の REAL も比較できる`` () =
+    // 範囲外の REAL は float 比較へ落ち、例外を出さない
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Real 1e30) (SqlValue.Decimal 1M)) > 0)
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.Real 1e30)) < 0)
+    // 極小の REAL は 0 と同じにせず、符号と相対順序を保つ
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Real 1e-30) (SqlValue.Int 0L)) > 0)
+
+    Assert.True(
+        ok (SqlValue.compareValues (SqlValue.Decimal 0.0000000000000000000000000001M) (SqlValue.Real 1e-30)) > 0
+    )
+    // NaN / Infinity と Int・Decimal の比較は従来どおり型エラー
+    expectErrorKind
+        ErrorKind.TypeError
+        "Infinity と INTEGER"
+        (SqlValue.compareValues (SqlValue.Real Double.PositiveInfinity) (SqlValue.Int 1L))
 
 [<Fact>]
 let ``SqlValue.asText: Text だけ Some`` () =
@@ -213,6 +231,14 @@ let ``SqlValue.coerce: Integer は整数的な値だけ受ける`` () =
     expectErrorKind ErrorKind.TypeError "小数は型エラー" (SqlValue.coerce DataType.Integer (SqlValue.Real 3.5))
     expectErrorKind ErrorKind.TypeError "小数の DECIMAL は型エラー" (SqlValue.coerce DataType.Integer (SqlValue.Decimal 4.5M))
     expectErrorKind ErrorKind.TypeError "NaN は型エラー" (SqlValue.coerce DataType.Integer (SqlValue.Real System.Double.NaN))
+    // int64 の範囲外は飽和させず型エラー
+    expectErrorKind ErrorKind.TypeError "正の範囲外" (SqlValue.coerce DataType.Integer (SqlValue.Real 1e30))
+    expectErrorKind ErrorKind.TypeError "負の範囲外" (SqlValue.coerce DataType.Integer (SqlValue.Real -1e30))
+
+    Assert.Equal(
+        SqlValue.Int System.Int64.MinValue,
+        ok (SqlValue.coerce DataType.Integer (SqlValue.Real -9223372036854775808.0))
+    )
 
 [<Fact>]
 let ``SqlValue.coerce: Decimal は有限の数値だけ受ける`` () =
@@ -228,6 +254,7 @@ let ``SqlValue.coerce: Decimal は有限の数値だけ受ける`` () =
         "Infinity は型エラー"
         (SqlValue.coerce DataType.Decimal (SqlValue.Real Double.PositiveInfinity))
 
+    expectErrorKind ErrorKind.TypeError "decimal の範囲外は型エラー" (SqlValue.coerce DataType.Decimal (SqlValue.Real 1e30))
     expectErrorKind ErrorKind.TypeError "文字列は型エラー" (SqlValue.coerce DataType.Decimal (SqlValue.Text "1"))
 
 [<Fact>]

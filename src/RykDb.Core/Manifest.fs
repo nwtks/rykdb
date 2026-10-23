@@ -82,6 +82,17 @@ module internal Manifest =
             protect (fun () ->
                 let tmp = currentPath dir + ".tmp"
                 System.IO.File.WriteAllText(tmp, fileName fileNumber + "\n")
+
+                use fs =
+                    new System.IO.FileStream(
+                        tmp,
+                        System.IO.FileMode.Open,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.None
+                    )
+
+                fs.Flush(true)
+                fs.Close()
                 System.IO.File.Move(tmp, currentPath dir, true))
 
         result {
@@ -109,7 +120,19 @@ module internal Manifest =
             protect (fun () ->
                 let path = manifestPath dir fileNumber
                 let bytes = VersionEdit.encode edit
-                System.IO.File.AppendAllText(path, System.Convert.ToBase64String bytes + "\n"))
+
+                use fs =
+                    new System.IO.FileStream(
+                        path,
+                        System.IO.FileMode.Append,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.Read
+                    )
+
+                let text = System.Convert.ToBase64String bytes + "\n"
+                let data = System.Text.Encoding.UTF8.GetBytes text
+                fs.Write(data, 0, data.Length)
+                fs.Flush(true))
 
         result {
             let! _ = append dir manifestNumber edit

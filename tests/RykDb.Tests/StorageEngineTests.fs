@@ -250,7 +250,7 @@ let ``StorageEngine.scanAt: キー昇順で重複を畳む`` () =
             let engine =
                 List.fold (fun e i -> ok (StorageEngine.put e (intKey i) (intRow i))) engine [ 1; 2; 3 ]
 
-            let got = ok (StorageEngine.scanAt engine None [||] 0)
+            let got = ok (StorageEngine.scanAt engine None [||] 0) |> Seq.toArray
             Assert.Equal(3, got.Length)
             Assert.Equal<byte array>(intKey 1, got.[0].Key)
             Assert.Equal<byte array>(intKey 2, got.[1].Key)
@@ -263,7 +263,7 @@ let ``StorageEngine.scanAt: limit が効く`` () =
             let engine =
                 List.fold (fun e i -> ok (StorageEngine.put e (intKey i) (intRow i))) engine [ 1; 2; 3; 4; 5 ]
 
-            let scanned = ok (StorageEngine.scanAt engine None [||] 2)
+            let scanned = ok (StorageEngine.scanAt engine None [||] 2) |> Seq.toArray
             Assert.Equal(2, scanned.Length)))
 
 [<Fact>]
@@ -275,11 +275,11 @@ let ``StorageEngine.scanAt: scan も snapshot で版を絞る`` () =
         let engine = StorageEngine.put engine (rowKey 1) [| SqlValue.Int 2L |] |> ok
         let engine = StorageEngine.put engine (rowKey 2) [| SqlValue.Int 20L |] |> ok
 
-        let old = StorageEngine.scanAt engine (Some snapBefore) [||] 0 |> ok
+        let old = StorageEngine.scanAt engine (Some snapBefore) [||] 0 |> ok |> Seq.toArray
         Assert.Equal(1, old.Length)
         Assert.Equal<int64>(1L, asInt old.[0].Value.Value.[0])
 
-        let all = StorageEngine.scanAt engine None [||] 0 |> ok
+        let all = StorageEngine.scanAt engine None [||] 0 |> ok |> Seq.toArray
         Assert.Equal(2, all.Length))
 
 [<Fact>]
@@ -295,6 +295,57 @@ let ``StorageEngine: flush すると SSTable から引ける`` () =
             Assert.True((ok (StorageEngine.getAt engine None (intKey 2))).IsSome)))
 
 [<Fact>]
+let ``StorageEngine.maybeFlush: 上限を超えたら flush する`` () =
+    withDir "se-auto-flush" (fun dir ->
+        withEngine dir (fun engine ->
+            let engine = { engine with MemLimitBytes = 1 }
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let beforeWal = engine.Wal.FileNumber
+            let flushed = ok (StorageEngine.maybeFlush engine)
+            Assert.Equal(0, flushed.Mem.Count)
+            Assert.Equal(1, Version.filesAt flushed.Version 0 |> Array.length)
+            Assert.True(flushed.Wal.FileNumber > beforeWal)
+            Assert.True((ok (StorageEngine.getAt flushed None (intKey 1))).IsSome)))
+
+[<Fact>]
+let ``StorageEngine.maybeFlush: 上限以下なら何もしない`` () =
+    withDir "se-no-flush" (fun dir ->
+        withEngine dir (fun engine ->
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let same = ok (StorageEngine.maybeFlush engine)
+            Assert.Equal(1, same.Mem.Count)
+            Assert.Empty(Version.filesAt same.Version 0)))
+
+[<Fact>]
+let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush する`` () =
+    withDir "se-disk-flush" (fun dir ->
+        let engine = ok (StorageEngine.openDatabase dir)
+        let disk = DiskStorageEngine { engine with MemLimitBytes = 1 } :> IStorageEngine
+        let disk = ok (disk.WriteBatch [| Entry.put (intKey 1) 1UL (intRow 1) |])
+        let disk = ok (disk.MaybeFlush())
+
+        Assert.NotEmpty(Directory.GetFiles(dir, "*.sst"))
+        Assert.True((ok (disk.GetAt None (intKey 1))).IsSome))
+
+[<Fact>]
+let ``StorageEngine.maybeCompact: L0 が閾値に達したら L1 へ compaction する`` () =
+    withDir "se-l0-compact" (fun dir ->
+        let engine =
+            [ 1..4 ]
+            |> List.fold
+                (fun engine i ->
+                    let engine = ok (StorageEngine.put engine (intKey i) (intRow i))
+                    ok (StorageEngine.flush engine))
+                (ok (StorageEngine.openDatabase dir))
+
+        Assert.Equal(4, Version.filesAt engine.Version 0 |> Array.length)
+        let compacted = ok (StorageEngine.maybeCompact engine)
+        Assert.Empty(Version.filesAt compacted.Version 0)
+        Assert.Equal(1, Version.filesAt compacted.Version 1 |> Array.length)
+        let got = ok (StorageEngine.scanAt compacted None [||] 0) |> Seq.length
+        Assert.Equal(4, got))
+
+[<Fact>]
 let ``StorageEngine: flush 済みと memtable をまたいで scan できる`` () =
     withDir "se6" (fun dir ->
         withEngine dir (fun engine ->
@@ -302,7 +353,7 @@ let ``StorageEngine: flush 済みと memtable をまたいで scan できる`` (
             let engine = ok (StorageEngine.put engine (intKey 2) (intRow 2))
             let engine = ok (StorageEngine.flush engine)
             let engine = ok (StorageEngine.put engine (intKey 3) (intRow 3))
-            let got = ok (StorageEngine.scanAt engine None [||] 0)
+            let got = ok (StorageEngine.scanAt engine None [||] 0) |> Seq.toArray
             Assert.Equal(3, got.Length)
             Assert.Equal<byte array>(intKey 3, got.[2].Key)))
 
@@ -383,7 +434,7 @@ let ``StorageEngine: WAL 再生後は SeqNo が既存版より小さくならな
             let engine = ok (StorageEngine.put engine (intKey 3) (intRow 3))
             Assert.True(engine.NextSeqNo > before)
             let engine = ok (StorageEngine.flush engine)
-            let got = ok (StorageEngine.scanAt engine None [||] 0)
+            let got = ok (StorageEngine.scanAt engine None [||] 0) |> Seq.toArray
             Assert.Equal(3, got.Length)))
 
 [<Fact>]

@@ -123,6 +123,36 @@ let ``TransactionManager.commit: 別 keyspace の同じキーは衝突しない`
     Assert.True(seq2 > seq1)
 
 [<Fact>]
+let ``TransactionManager.activeSnapshot: 最古の active snapshot を返す`` () =
+    let mgr = TransactionManager.create ()
+    // active が無ければ「次の SeqNo」
+    Assert.Equal<uint64>(1UL, TransactionManager.activeSnapshot mgr)
+
+    let mgr1, t1 = TransactionManager.beginTxn mgr
+    Assert.Equal<uint64>(0UL, TransactionManager.activeSnapshot mgr1)
+    let t1 = Transaction.put t1 "t:x" [| 1uy |] [| SqlValue.Int 1L |]
+    let mgr2, _, _ = TransactionManager.commit mgr1 t1 |> ok
+    Assert.Equal<uint64>(2UL, TransactionManager.activeSnapshot mgr2)
+
+    // t2 (snapshot 1) が残っている間は、t3 が commit しても境界は 1 のまま
+    let mgr3, t2 = TransactionManager.beginTxn mgr2
+    let mgr4, t3 = TransactionManager.beginTxn mgr3
+    let t3 = Transaction.put t3 "t:y" [| 2uy |] [| SqlValue.Int 2L |]
+    let mgr5, _, _ = TransactionManager.commit mgr4 t3 |> ok
+    Assert.Equal<uint64>(1UL, TransactionManager.activeSnapshot mgr5)
+
+    let mgr6 = TransactionManager.abort mgr5 t2.TxnId
+    Assert.Equal<uint64>(3UL, TransactionManager.activeSnapshot mgr6)
+
+    // SeqNo が上限なら +1 しない
+    let saturated =
+        { TransactionManager.create () with
+            LastCommitSeqNo = System.UInt64.MaxValue
+        }
+
+    Assert.Equal<uint64>(System.UInt64.MaxValue, TransactionManager.activeSnapshot saturated)
+
+[<Fact>]
 let ``TransactionManager.commit: abort 済み transaction の commit はエラー`` () =
     let mgr = TransactionManager.create ()
     let mgr, txn = TransactionManager.beginTxn mgr

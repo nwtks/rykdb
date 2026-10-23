@@ -253,6 +253,48 @@ let ``Eval.eval: 算術の型昇格は DECIMAL / REAL / 非数値も扱う`` () 
     Assert.True(SqlValue.isNull (arith2 BinaryOp.Add (Literal.String "x") (Literal.Int 1L)))
 
 [<Fact>]
+let ``Eval.eval: 数値演算は範囲外で DbError を返し、REAL は精度を落とさない`` () =
+    let arith2 op (l: Literal) (r: Literal) =
+        ev [||] (Expr.Binary(op, Expr.Literal l, Expr.Literal r))
+
+    // 整数のオーバーフローは例外ではなく制約違反
+    expectErrorKind
+        ErrorKind.ConstraintViolation
+        "整数加算のオーバーフロー"
+        (arith2 BinaryOp.Add (Literal.Int System.Int64.MaxValue) (Literal.Int 1L))
+
+    expectErrorKind
+        ErrorKind.ConstraintViolation
+        "整数除算のオーバーフロー"
+        (arith2 BinaryOp.Div (Literal.Int System.Int64.MinValue) (Literal.Int -1L))
+
+    expectErrorKind
+        ErrorKind.ConstraintViolation
+        "DECIMAL 乗算のオーバーフロー"
+        (arith2 BinaryOp.Mul (Literal.Decimal System.Decimal.MaxValue) (Literal.Decimal 2M))
+
+    // REAL は decimal を経由せず float で計算する
+    let assertReal (expected: float) (r: Result<SqlValue, DbError>) =
+        match ok r with
+        | SqlValue.Real actual ->
+            Assert.True(
+                abs (actual - expected) <= abs expected * 1e-12,
+                sprintf "REAL が想定外: expected=%g actual=%g" expected actual
+            )
+        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+
+    assertReal 2e30 (arith2 BinaryOp.Add (Literal.Real 1e30) (Literal.Real 1e30))
+    assertReal 1e60 (arith2 BinaryOp.Mul (Literal.Real 1e30) (Literal.Real 1e30))
+    assertReal 1e-30 (arith2 BinaryOp.Mul (Literal.Real 1e-30) (Literal.Real 1.0))
+    assertReal 1e30 (arith2 BinaryOp.Add (Literal.Real 1e30) (Literal.Int 1L))
+
+[<Fact>]
+let ``Eval.eval: ABS と単項マイナスは Int64.MinValue で DbError`` () =
+    let minInt = Expr.Literal(Literal.Int System.Int64.MinValue)
+    expectErrorKind ErrorKind.ConstraintViolation "ABS(Int64.MinValue)" (ev [||] (Expr.FuncCall("ABS", [ minInt ])))
+    expectErrorKind ErrorKind.ConstraintViolation "単項マイナス Int64.MinValue" (ev [||] (Expr.Unary(UnaryOp.Neg, minInt)))
+
+[<Fact>]
 let ``Eval.eval: 比較演算子は値としても動く`` () =
     let r = row2 1L 2L
     Assert.Equal(SqlValue.Bool true, ok (ev r (Expr.Binary(BinaryOp.Ne, col "a", col "b"))))

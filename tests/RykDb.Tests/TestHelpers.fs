@@ -64,6 +64,7 @@ type private MemoryEngineState() =
 type private MemoryStorageEngine(state: MemoryEngineState, mem: Memtable, nextSeqNo: uint64) =
     interface IStorageEngine with
         member _.NextSeqNo = nextSeqNo
+        member _.ActiveSnapshot = 0UL
 
         member _.GetAt visible key =
             Memtable.getVisible mem key visible
@@ -79,10 +80,9 @@ type private MemoryStorageEngine(state: MemoryEngineState, mem: Memtable, nextSe
                     | None -> true)
                 |> Seq.distinctBy (fun e -> e.Key)
                 |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+                |> Seq.filter (fun e -> e.Value.IsSome)
 
-            (if limit > 0 then Seq.truncate limit entries else entries)
-            |> Seq.toArray
-            |> ret
+            (if limit > 0 then Seq.truncate limit entries else entries) |> ret
 
         member _.WriteBatch entries =
             let nextMem = Memtable.apply entries state.Mem
@@ -92,6 +92,12 @@ type private MemoryStorageEngine(state: MemoryEngineState, mem: Memtable, nextSe
         member _.WithNextSeqNo next =
             state.NextSeqNo <- max state.NextSeqNo next
             MemoryStorageEngine(state, mem, next) :> IStorageEngine
+
+        member _.WithActiveSnapshot _ =
+            MemoryStorageEngine(state, mem, nextSeqNo) :> IStorageEngine
+
+        member _.MaybeFlush() =
+            MemoryStorageEngine(state, mem, nextSeqNo) :> IStorageEngine |> ret
 
         member _.Close() = ret ()
 

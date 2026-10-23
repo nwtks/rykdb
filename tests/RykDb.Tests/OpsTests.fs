@@ -73,10 +73,9 @@ let ``末尾再帰: Op.ofArray を 20 万行組み立ててもスタックを食
     let rows = Array.init 200_000 (fun i -> [| SqlValue.Int(int64 i) |])
     let op = Op.ofArray rows
     let got = ok (Op.toArray op)
-
     Assert.Equal<int>(200_000, got.Length)
-    Assert.Equal<int64>(0L, (got.[0].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L))
-    Assert.Equal<int64>(199_999L, (got.[got.Length - 1].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L))
+    Assert.Equal<int64>(0L, got.[0].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L)
+    Assert.Equal<int64>(199_999L, got.[got.Length - 1].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L)
 
 [<Fact>]
 let ``Op: filter と skip`` () =
@@ -127,7 +126,6 @@ let ``sortBy: 昇順と降順`` () =
 
     let sorted = ok (Ops.sortBy schema2 op keys)
     let rows = ok (Op.toArray sorted)
-
     Assert.Equal<int64>(1L, asInt rows.[0].[0])
     Assert.Equal<int64>(3L, asInt rows.[2].[0])
 
@@ -140,7 +138,6 @@ let ``sortBy: 昇順と降順`` () =
         ]
 
     let rows2 = ok (Op.toArray (ok (Ops.sortBy schema2 op desc)))
-
     Assert.Equal<int64>(3L, asInt rows2.[0].[0])
 
 [<Fact>]
@@ -183,7 +180,6 @@ let ``distinct: 最初に現れた順序を保つ`` () =
             |]
 
     let rows = ok (Op.toArray (Ops.distinct op))
-
     Assert.Equal<int>(2, rows.Length)
     Assert.Equal<int64>(2L, asInt rows.[0].[0])
     Assert.Equal<int64>(1L, asInt rows.[1].[0])
@@ -201,12 +197,12 @@ let ``集約: COUNT / SUM / AVG / MIN / MAX`` () =
 
     let aggs =
         [
-            (AggFunc.Count, true, Expr.Literal(Literal.Null))
-            (AggFunc.Count, false, col "a")
-            (AggFunc.Sum, false, col "a")
-            (AggFunc.Avg, false, col "a")
-            (AggFunc.Min, false, col "a")
-            (AggFunc.Max, false, col "a")
+            AggFunc.Count, true, false, Expr.Literal Literal.Null
+            AggFunc.Count, false, false, col "a"
+            AggFunc.Sum, false, false, col "a"
+            AggFunc.Avg, false, false, col "a"
+            AggFunc.Min, false, false, col "a"
+            AggFunc.Max, false, false, col "a"
         ]
 
     let rows = ok (Op.toArray (ok (Ops.aggregate schema2 op [] aggs)))
@@ -215,10 +211,8 @@ let ``集約: COUNT / SUM / AVG / MIN / MAX`` () =
     let r = rows.[0]
     // COUNT(*) は NULL を含むので 4
     Assert.Equal<int64>(4L, asInt r.[0])
-
     // COUNT(列) は NULL を数えないので 3
     Assert.Equal<int64>(3L, asInt r.[1])
-
     // SUM は NULL を無視して 6
     Assert.Equal(6M, asDec r.[2])
     // AVG = 6 / 3 = 2
@@ -229,7 +223,11 @@ let ``集約: COUNT / SUM / AVG / MIN / MAX`` () =
 [<Fact>]
 let ``集約: 行が 0 でも COUNT(*) は 1 行を返す`` () =
     let rows =
-        ok (Op.toArray (ok (Ops.aggregate schema2 Op.Done [] [ (AggFunc.Count, true, Expr.Literal(Literal.Null)) ])))
+        ok (
+            Op.toArray (
+                ok (Ops.aggregate schema2 Op.Done [] [ (AggFunc.Count, true, false, Expr.Literal(Literal.Null)) ])
+            )
+        )
 
     // 0 件なら 0 行（1 行 (0) を返さない）。
     Assert.Equal<int>(0, rows.Length)
@@ -244,7 +242,7 @@ let ``集約: GROUP BY でグループごとに 1 行`` () =
                 row [ SqlValue.Int 2L; SqlValue.Int 30L ]
             ]
 
-    let aggs = [ (AggFunc.Sum, false, col "b") ]
+    let aggs = [ (AggFunc.Sum, false, false, col "b") ]
     let rows = ok (Op.toArray (ok (Ops.aggregate schema2 op [ col "a" ] aggs)))
 
     // 2 グループ
@@ -261,7 +259,7 @@ let ``集約: GROUP BY のキーが NULL の行も 1 グループになる`` () 
     let op: Op =
         Op.ofArray [| [| SqlValue.Null; SqlValue.Int 1L |]; [| SqlValue.Null; SqlValue.Int 2L |] |]
 
-    let aggs = [ (AggFunc.Count, true, Expr.Literal(Literal.Null)) ]
+    let aggs = [ (AggFunc.Count, true, false, Expr.Literal Literal.Null) ]
     let rows = ok (Op.toArray (ok (Ops.aggregate schema2 op [ col "a" ] aggs)))
 
     // SQL では NULL が別のグループになるが、本実装は NULL 同士を等しい扱いにする。
@@ -319,7 +317,7 @@ let ``sortBy: 列参照でないキーはエラー`` () =
     expectErrorKind ErrorKind.NameError "ORDER BY の非列キーが OK になっています" (Ops.sortBy schema2 op keys)
 
 [<Fact>]
-let ``sortBy: 同値のキーは次のキーで、比較不能なキーは安定順で決める`` () =
+let ``sortBy: 同値のキーは次のキーで、比較不能なキーは Error になる`` () =
     // 1 列目に同じ TEXT を入れて同値にし、2 列目の差で順序が決まるようにする。
     let op =
         opOfRows
@@ -346,7 +344,7 @@ let ``sortBy: 同値のキーは次のキーで、比較不能なキーは安定
     Assert.Equal<int64>(1L, asInt rows.[0].[1])
     Assert.Equal<int64>(2L, asInt rows.[1].[1])
 
-    // キーが 1 本だけで比較不能（型が合わない）なら順序はそのまま（安定ソート）
+    // キーが 1 本だけで比較不能（型が合わない）なら Error になる（握り潰さない）
     let op2 =
         opOfRows
             [
@@ -362,9 +360,9 @@ let ``sortBy: 同値のキーは次のキーで、比較不能なキーは安定
             }
         ]
 
-    let rows1 = ok (Op.toArray (ok (Ops.sortBy schema2 op2 keys1)))
-    Assert.Equal<SqlValue>(SqlValue.Int 1L, rows1.[0].[0])
-    Assert.Equal<SqlValue>(SqlValue.Text "x", rows1.[1].[0])
+    // キーが 1 本だけで比較不能（型が合わない）なら Error になる（握り潰さない）
+    let r1 = Ops.sortBy schema2 op2 keys1
+    expectErrorKind ErrorKind.TypeError "比較不能なキーは Error になる" r1
 
 [<Fact>]
 let ``project: 項目が空なら入力をそのまま返す`` () =
@@ -380,7 +378,7 @@ let ``集約: GROUP BY 式の評価失敗は Error`` () =
     expectErrorKind
         ErrorKind.NameError
         "存在しない列の GROUP BY が OK になっています"
-        (Ops.aggregate schema2 op [ col "nope" ] [ (AggFunc.Count, true, Expr.Literal(Literal.Null)) ])
+        (Ops.aggregate schema2 op [ col "nope" ] [ (AggFunc.Count, true, false, Expr.Literal Literal.Null) ])
 
 [<Fact>]
 let ``集約: SUM / AVG の REAL と非数値`` () =
@@ -390,33 +388,38 @@ let ``集約: SUM / AVG の REAL と非数値`` () =
     let rows =
         ok (
             Op.toArray (
-                ok (Ops.aggregate schema2 reals [] [ (AggFunc.Sum, false, col "a"); (AggFunc.Avg, false, col "a") ])
+                ok (
+                    Ops.aggregate
+                        schema2
+                        reals
+                        []
+                        [ AggFunc.Sum, false, false, col "a"; AggFunc.Avg, false, false, col "a" ]
+                )
             )
         )
 
     Assert.Equal(4.0, asReal rows.[0].[0], 6)
     Assert.Equal(2.0, asReal rows.[0].[1], 6)
 
-    // 数値でない値は Null になる（エラーは集約値へ閉じ込める）
+    // 数値でない値は Error になる（F15: 集約エラーは伝播する）
     let texts = opOfRows [ row [ SqlValue.Text "x" ] ]
-
-    let rows2 =
-        ok (Op.toArray (ok (Ops.aggregate schema2 texts [] [ (AggFunc.Sum, false, col "a") ])))
-
-    Assert.True(SqlValue.isNull rows2.[0].[0])
+    let r2 = Ops.aggregate schema2 texts [] [ (AggFunc.Sum, false, false, col "a") ]
+    expectError "SUM(文字列) は Error になる" r2
 
     // AVG で全行 NULL は 0 除算せず NULL
     let nulls = opOfRows [ row [ SqlValue.Null ] ]
 
     let rows3 =
-        ok (Op.toArray (ok (Ops.aggregate schema2 nulls [] [ (AggFunc.Avg, false, col "a") ])))
+        ok (Op.toArray (ok (Ops.aggregate schema2 nulls [] [ (AggFunc.Avg, false, false, col "a") ])))
 
     Assert.True(SqlValue.isNull rows3.[0].[0])
 
 [<Fact>]
 let ``havingFilter: 集約値とグループ値を定数へ置き換える`` () =
     let groupBy = [ col "a" ]
-    let aggs = [ (AggFunc.Count, true, Expr.Star); (AggFunc.Sum, false, col "b") ]
+
+    let aggs =
+        [ AggFunc.Count, true, false, Expr.Star; AggFunc.Sum, false, false, col "b" ]
     // 行 = [a; COUNT(*); SUM(b)]
     let r = [| SqlValue.Int 7L; SqlValue.Int 3L; SqlValue.Int 10L |]
 
@@ -424,21 +427,19 @@ let ``havingFilter: 集約値とグループ値を定数へ置き換える`` () 
 
     // 集約値（COUNT(*)）
     Assert.True(
-        ok (eval (Expr.Binary(BinaryOp.Gt, Expr.AggCall(AggFunc.Count, true, Expr.Star), Expr.Literal(Literal.Int 2L))))
+        ok (
+            eval (Expr.Binary(BinaryOp.Gt, Expr.AggCall(AggFunc.Count, false, Expr.Star), Expr.Literal(Literal.Int 2L)))
+        )
     )
 
     // グループ値（列 → 先頭の値）
     Assert.True(ok (eval (Expr.Binary(BinaryOp.Eq, col "a", Expr.Literal(Literal.Int 7L)))))
-
     // 定数はそのまま
     Assert.True(ok (eval (Expr.Literal(Literal.Bool true))))
-
     // Name でも集約キーに一致すれば置き換える
     Assert.True(ok (eval (Expr.Binary(BinaryOp.Eq, Expr.Name "COUNT(*)", Expr.Literal(Literal.Int 3L)))))
-
     // 子を持つ式は再帰的に置き換える
     Assert.True(ok (eval (Expr.Binary(BinaryOp.And, Expr.Literal(Literal.Bool true), Expr.Literal(Literal.Bool true)))))
-
     // 集約リストに無い集約は NULL になる（比較は UNKNOWN → 偽）
     Assert.False(
         ok (eval (Expr.Binary(BinaryOp.Eq, Expr.AggCall(AggFunc.Min, false, col "b"), Expr.Literal(Literal.Int 99L))))
@@ -447,7 +448,6 @@ let ``havingFilter: 集約値とグループ値を定数へ置き換える`` () 
     // 集約でもグループ値でもない Name / 列は置き換えられない（評価時にエラー）
     expectError "未知の Name が OK になっています" (eval (Expr.Name "zz"))
     expectError "未知の列が OK になっています" (eval (col "zz"))
-
     // スターは置き換えず、そのまま評価エラーになる
     expectError "WHERE の * が OK になっています" (eval Expr.Star)
     expectError "WHERE の t.* が OK になっています" (eval (Expr.QualifiedStar "t"))
@@ -462,10 +462,9 @@ let ``末尾再帰: 20 万段の式を havingFilter してもスタックを食�
         |> List.fold (fun acc e -> Expr.Binary(BinaryOp.And, acc, e)) (Expr.Literal(Literal.Bool true))
 
     let groupBy = [ col "a" ]
-    let aggs = [ (AggFunc.Count, true, Expr.Star) ]
+    let aggs = [ (AggFunc.Count, true, false, Expr.Star) ]
     // 行 = [a; COUNT(*)]
     let r = [| SqlValue.Int 7L; SqlValue.Int 3L |]
-
     Assert.True(ok (Ops.havingFilter groupBy aggs deep r))
 
 [<Fact>]
@@ -477,9 +476,8 @@ let ``結合: INNER JOIN は ON の評価失敗で打ち切る`` () =
         Expr.Binary(BinaryOp.Div, Expr.Literal(Literal.Int 1L), Expr.Literal(Literal.Int 0L))
 
     let on = Expr.Binary(BinaryOp.Eq, div0, Expr.Literal(Literal.Int 0L))
-
     let rows = ok (Op.toArray (ok (Ops.innerJoin leftSchema left rightSchema right on)))
-    Assert.Empty(rows)
+    Assert.Empty rows
 
 [<Fact>]
 let ``結合: LEFT JOIN は一致後の ON 評価失敗で次の行へ進む`` () =
@@ -499,7 +497,6 @@ let ``結合: LEFT JOIN は一致後の ON 評価失敗で次の行へ進む`` (
         )
 
     let rows = ok (Op.toArray (ok (Ops.leftJoin leftSchema left rightSchema right on)))
-
     // 一致した 1 行だけが返り、エラーで止まらない
     Assert.Equal<int>(1, rows.Length)
     Assert.Equal<int64>(1L, asInt rows.[0].[0])

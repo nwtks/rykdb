@@ -125,18 +125,16 @@ module internal Parser =
 
     /// 括弧で囲まれた識別子リストを読む。
     let private parseParenIdentList (st: PState) =
-        expectSymbol st "("
-        >>= fun (_, st) ->
-            let rec loop acc (st: PState) =
-                match parseIdent st with
-                | Error e -> Error e
-                | Ok(c, st) ->
-                    if isSymbol st "," then
-                        loop (c :: acc) (advance st)
-                    else
-                        expectSymbol st ")" |> Result.map (fun (_, st) -> List.rev (c :: acc), st)
+        let rec loop acc (st: PState) =
+            match parseIdent st with
+            | Error e -> Error e
+            | Ok(c, st) ->
+                if isSymbol st "," then
+                    loop (c :: acc) (advance st)
+                else
+                    expectSymbol st ")" |> Result.map (fun (_, st) -> List.rev (c :: acc), st)
 
-            loop [] st
+        expectSymbol st "(" >>= fun (_, st) -> loop [] st
 
     // -----------------------------------------------------------------------
     // 型名
@@ -501,10 +499,11 @@ module internal Parser =
             | _ -> ret (None, st)
 
     let private parseTableRef st =
-        parseIdent st
-        >>= fun (name, st) ->
-            parseOptAlias st
-            |> Result.map (fun (alias, st) -> { Name = name; Alias = alias }, st)
+        result {
+            let! name, st = parseIdent st
+            let! alias, st = parseOptAlias st
+            return { Name = name; Alias = alias }, st
+        }
 
     /// 現在位置が `識別子 . *` の形かどうかを返す。
     let private isDotStar st =
@@ -533,42 +532,19 @@ module internal Parser =
             )
         else
             match peek st with
-            | Ident name
-            | QuotedIdent name ->
-                let st = advance st
-
-                let finish (e: Expr) (st: PState) : Result<SelectItem * PState, DbError> =
-                    parseOptAlias st
-                    |> Result.map (fun (alias, st) -> { Expression = e; Alias = alias }, st)
-
-                if isSymbol st "(" then
-                    parseCallBodyC finish st name
-                elif isSymbol st "." then
-                    let st1 = advance st
-
-                    match peek st1 with
-                    | Ident colName
-                    | QuotedIdent colName ->
-                        let st2 = advance st1
-
-                        let e =
-                            Expr.Column
-                                {
-                                    Qualifier = Some name
-                                    Name = colName
-                                }
-
-                        finish e st2
-                    | _ ->
-                        let back = st |> fun s -> { s with Pos = s.Pos - 1 }
-                        parseExprC (fun (e: Expr) (s: PState) -> ret ({ Expression = e; Alias = None }, s)) back
-                else
-                    finish (Expr.Name name) st
+            | Ident _
+            | QuotedIdent _ ->
+                parseExprC
+                    (fun (e: Expr) (st: PState) ->
+                        parseOptAlias st
+                        |> Result.map (fun (alias, st) -> { Expression = e; Alias = alias }, st))
+                    st
             | _ ->
-                parseExprC retE st
-                >>= fun (e, st) ->
-                    parseOptAlias st
-                    |> Result.map (fun (alias, st) -> { Expression = e; Alias = alias }, st)
+                result {
+                    let! e, st = parseExprC retE st
+                    let! alias, st = parseOptAlias st
+                    return { Expression = e; Alias = alias }, st
+                }
 
     [<TailCall>]
     let rec private parseJoins st acc =
@@ -603,19 +579,17 @@ module internal Parser =
             ret (None, st)
 
     let private parseGroupBy st acc =
-        if isKeyword st "GROUP" then
-            expectKeyword (advance st) "BY"
-            >>= fun (_, st) ->
-                let rec loop acc (st: PState) =
-                    match parseExprC retE st with
-                    | Error e -> Error e
-                    | Ok(e, st) ->
-                        if isSymbol st "," then
-                            loop (e :: acc) (advance st)
-                        else
-                            ret (List.rev (e :: acc), st)
+        let rec loop acc (st: PState) =
+            match parseExprC retE st with
+            | Error e -> Error e
+            | Ok(e, st) ->
+                if isSymbol st "," then
+                    loop (e :: acc) (advance st)
+                else
+                    ret (List.rev (e :: acc), st)
 
-                loop acc st
+        if isKeyword st "GROUP" then
+            expectKeyword (advance st) "BY" >>= fun (_, st) -> loop acc st
         else
             ret (acc, st)
 
@@ -626,204 +600,185 @@ module internal Parser =
             ret (None, st)
 
     let private parseOrderBy st acc =
+        let rec loop acc (st: PState) =
+            match parseExprC retE st with
+            | Error e -> Error e
+            | Ok(e, st) ->
+                let dir =
+                    if isKeyword st "DESC" then SortDirection.Descending
+                    elif isKeyword st "ASC" then SortDirection.Ascending
+                    else SortDirection.Ascending
+
+                let st =
+                    if isKeyword st "DESC" || isKeyword st "ASC" then
+                        advance st
+                    else
+                        st
+
+                let key: SortKey = { Expression = e; Direction = dir }
+
+                if isSymbol st "," then
+                    loop (key :: acc) (advance st)
+                else
+                    ret (List.rev (key :: acc), st)
+
         if isKeyword st "ORDER" then
-            expectKeyword (advance st) "BY"
-            >>= fun (_, st) ->
-                let rec loop acc (st: PState) =
-                    match parseExprC retE st with
-                    | Error e -> Error e
-                    | Ok(e, st) ->
-                        let dir =
-                            if isKeyword st "DESC" then SortDirection.Descending
-                            elif isKeyword st "ASC" then SortDirection.Ascending
-                            else SortDirection.Ascending
-
-                        let st =
-                            if isKeyword st "DESC" || isKeyword st "ASC" then
-                                advance st
-                            else
-                                st
-
-                        let key: SortKey = { Expression = e; Direction = dir }
-
-                        if isSymbol st "," then
-                            loop (key :: acc) (advance st)
-                        else
-                            ret (List.rev (key :: acc), st)
-
-                loop acc st
+            expectKeyword (advance st) "BY" >>= fun (_, st) -> loop acc st
         else
             ret (acc, st)
 
     let private parseLimitOffset st =
-        let limit =
-            if isKeyword st "LIMIT" then
-                parseExprC (fun e st -> ret (Some e, st)) (advance st)
-            else
-                ret (None, st)
+        result {
+            let! limit, st =
+                if isKeyword st "LIMIT" then
+                    parseExprC (fun e st -> ret (Some e, st)) (advance st)
+                else
+                    ret (None, st)
 
-        limit
-        >>= fun (limit, st) ->
-            let offset =
+            let! offset, st =
                 if isKeyword st "OFFSET" then
                     parseExprC (fun e st -> ret (Some e, st)) (advance st)
                 else
                     ret (None, st)
 
-            offset |> Result.map (fun (offset, st) -> limit, offset, st)
+            return limit, offset, st
+        }
 
     let private parseSelect st =
-        expectKeyword st "SELECT"
-        >>= fun (_, st) ->
+        let rec items acc (st: PState) =
+            match parseSelectItem st with
+            | Error e -> Error e
+            | Ok(it, st) ->
+                if isSymbol st "," then
+                    items (it :: acc) (advance st)
+                else
+                    ret (List.rev (it :: acc), st)
+
+        result {
+            let! _, st = expectKeyword st "SELECT"
             let distinct = isKeyword st "DISTINCT"
             let st = if distinct then advance st else st
+            let! its, st = items [] st
+            let! _, st = expectKeyword st "FROM"
+            let! fromRef, st = parseTableRef st
+            let! joins, st = parseJoins st []
+            let! whereE, st = parseWhere st
+            let! groupBy, st = parseGroupBy st []
+            let! having, st = parseHaving st
+            let! orderBy, st = parseOrderBy st []
+            let! limit, offset, st = parseLimitOffset st
+            let! _, st = eatOptionalSemicolon st
 
-            let rec items acc (st: PState) =
-                match parseSelectItem st with
-                | Error e -> Error e
-                | Ok(it, st) ->
-                    if isSymbol st "," then
-                        items (it :: acc) (advance st)
-                    else
-                        ret (List.rev (it :: acc), st)
+            let sel =
+                {
+                    Distinct = distinct
+                    Items = its
+                    From = Some fromRef
+                    Joins = joins
+                    Where = whereE
+                    GroupBy = groupBy
+                    Having = having
+                    OrderBy = orderBy
+                    Limit = limit
+                    Offset = offset
+                }
 
-            items [] st
-            >>= fun (its, st) ->
-                expectKeyword st "FROM"
-                >>= fun (_, st) ->
-                    parseTableRef st
-                    >>= fun (fromRef, st) ->
-                        parseJoins st []
-                        >>= fun (joins, st) ->
-                            parseWhere st
-                            >>= fun (whereE, st) ->
-                                parseGroupBy st []
-                                >>= fun (groupBy, st) ->
-                                    parseHaving st
-                                    >>= fun (having, st) ->
-                                        parseOrderBy st []
-                                        >>= fun (orderBy, st) ->
-                                            parseLimitOffset st
-                                            >>= fun (limit, offset, st) ->
-                                                eatOptionalSemicolon st
-                                                |> Result.map (fun (_, st) ->
-                                                    let sel =
-                                                        {
-                                                            Distinct = distinct
-                                                            Items = its
-                                                            From = Some fromRef
-                                                            Joins = joins
-                                                            Where = whereE
-                                                            GroupBy = groupBy
-                                                            Having = having
-                                                            OrderBy = orderBy
-                                                            Limit = limit
-                                                            Offset = offset
-                                                        }
-
-                                                    Statement.Select sel, st)
+            return Statement.Select sel, st
+        }
 
     // -----------------------------------------------------------------------
     // INSERT / UPDATE / DELETE
     // -----------------------------------------------------------------------
 
     let private parseInsert st =
-        expectKeyword st "INSERT"
-        >>= fun (_, st) ->
-            expectKeyword st "INTO"
-            >>= fun (_, st) ->
-                parseTableRef st
-                >>= fun (tbl, st) ->
-                    let hasColumns = isSymbol st "("
+        let rec one acc (st: PState) =
+            match parseExprC retE st with
+            | Error e -> Error e
+            | Ok(e, st) ->
+                if isSymbol st "," then
+                    one (e :: acc) (advance st)
+                else
+                    expectSymbol st ")" |> Result.map (fun (_, st) -> List.rev (e :: acc), st)
 
-                    let columnsResult =
-                        if hasColumns then
-                            parseParenIdentList st |> Result.map (fun (cols, st) -> Some cols, st)
-                        else
-                            ret (None, st)
+        let rec rows acc (st: PState) =
+            match expectSymbol st "(" with
+            | Error e -> Error e
+            | Ok(_, st) ->
+                match one [] st with
+                | Error e -> Error e
+                | Ok(r, st) ->
+                    if isSymbol st "," then
+                        rows (r :: acc) (advance st)
+                    else
+                        ret (List.rev (r :: acc), st)
 
-                    columnsResult
-                    >>= fun (columns, st) ->
-                        expectKeyword st "VALUES"
-                        >>= fun (_, st) ->
-                            let rec one acc (st: PState) =
-                                match parseExprC retE st with
-                                | Error e -> Error e
-                                | Ok(e, st) ->
-                                    if isSymbol st "," then
-                                        one (e :: acc) (advance st)
-                                    else
-                                        expectSymbol st ")" |> Result.map (fun (_, st) -> List.rev (e :: acc), st)
+        result {
+            let! _, st = expectKeyword st "INSERT"
+            let! _, st = expectKeyword st "INTO"
+            let! tbl, st = parseTableRef st
+            let hasColumns = isSymbol st "("
 
-                            let rec rows acc (st: PState) =
-                                match expectSymbol st "(" with
-                                | Error e -> Error e
-                                | Ok(_, st) ->
-                                    match one [] st with
-                                    | Error e -> Error e
-                                    | Ok(r, st) ->
-                                        if isSymbol st "," then
-                                            rows (r :: acc) (advance st)
-                                        else
-                                            ret (List.rev (r :: acc), st)
+            let! columns, st =
+                if hasColumns then
+                    parseParenIdentList st |> Result.map (fun (cols, st) -> Some cols, st)
+                else
+                    ret (None, st)
 
-                            rows [] st
-                            >>= fun (rs, st) ->
-                                eatOptionalSemicolon st
-                                |> Result.map (fun (_, st) ->
-                                    {
-                                        Table = tbl
-                                        Columns = columns
-                                        Rows = rs
-                                    },
-                                    st)
+            let! _, st = expectKeyword st "VALUES"
+            let! rs, st = rows [] st
+            let! _, st = eatOptionalSemicolon st
+
+            return
+                {
+                    Table = tbl
+                    Columns = columns
+                    Rows = rs
+                },
+                st
+        }
 
     let private parseUpdate st =
-        expectKeyword st "UPDATE"
-        >>= fun (_, st) ->
-            parseTableRef st
-            >>= fun (tbl, st) ->
-                expectKeyword st "SET"
-                >>= fun (_, st) ->
-                    let rec assigns acc (st: PState) =
-                        match parseIdent st with
-                        | Error e -> Error e
-                        | Ok(col, st) ->
-                            match expectSymbol st "=" with
-                            | Error e -> Error e
-                            | Ok(_, st) ->
-                                match parseExpr st with
-                                | Error e -> Error e
-                                | Ok(e, st) ->
-                                    if isSymbol st "," then
-                                        assigns ((col, e) :: acc) (advance st)
-                                    else
-                                        ret (List.rev ((col, e) :: acc), st)
+        let rec assigns acc (st: PState) =
+            match parseIdent st with
+            | Error e -> Error e
+            | Ok(col, st) ->
+                match expectSymbol st "=" with
+                | Error e -> Error e
+                | Ok(_, st) ->
+                    match parseExpr st with
+                    | Error e -> Error e
+                    | Ok(e, st) ->
+                        if isSymbol st "," then
+                            assigns ((col, e) :: acc) (advance st)
+                        else
+                            ret (List.rev ((col, e) :: acc), st)
 
-                    assigns [] st
-                    >>= fun (asg, st) ->
-                        parseWhere st
-                        >>= fun (whereE, st) ->
-                            eatOptionalSemicolon st
-                            |> Result.map (fun (_, st) ->
-                                {
-                                    Table = tbl
-                                    Assignments = asg
-                                    Where = whereE
-                                },
-                                st)
+        result {
+            let! _, st = expectKeyword st "UPDATE"
+            let! tbl, st = parseTableRef st
+            let! _, st = expectKeyword st "SET"
+            let! asg, st = assigns [] st
+            let! whereE, st = parseWhere st
+            let! _, st = eatOptionalSemicolon st
+
+            return
+                {
+                    Table = tbl
+                    Assignments = asg
+                    Where = whereE
+                },
+                st
+        }
 
     let private parseDelete st =
-        expectKeyword st "DELETE"
-        >>= fun (_, st) ->
-            expectKeyword st "FROM"
-            >>= fun (_, st) ->
-                parseTableRef st
-                >>= fun (tbl, st) ->
-                    parseWhere st
-                    >>= fun (whereE, st) ->
-                        eatOptionalSemicolon st
-                        |> Result.map (fun (_, st) -> { Table = tbl; Where = whereE }, st)
+        result {
+            let! _, st = expectKeyword st "DELETE"
+            let! _, st = expectKeyword st "FROM"
+            let! tbl, st = parseTableRef st
+            let! whereE, st = parseWhere st
+            let! _, st = eatOptionalSemicolon st
+            return { Table = tbl; Where = whereE }, st
+        }
 
     // -----------------------------------------------------------------------
     // DDL
@@ -831,27 +786,27 @@ module internal Parser =
 
     /// VARCHAR(32) のような型引数を読む。
     let private parseTypeArguments (st: PState) =
+        let rec loop acc (st: PState) =
+            match parseExprC retE st with
+            | Error e -> Error e
+            | Ok(e, st) ->
+                let v =
+                    match e with
+                    | Expr.Literal(Literal.Int n) -> int n, true
+                    | _ -> 0, false
+
+                if isSymbol st "," then
+                    loop (v :: acc) (advance st)
+                else
+                    expectSymbol st ")"
+                    |> Result.map (fun (_, st) ->
+                        List.rev (v :: acc)
+                        |> List.choose (fun (n, ok) -> if ok then Some("n", n) else None),
+                        st)
+
         if not (isSymbol st "(") then
             ret ([], st)
         else
-            let rec loop acc (st: PState) =
-                match parseExprC retE st with
-                | Error e -> Error e
-                | Ok(e, st) ->
-                    let v =
-                        match e with
-                        | Expr.Literal(Literal.Int n) -> int n, true
-                        | _ -> 0, false
-
-                    if isSymbol st "," then
-                        loop (v :: acc) (advance st)
-                    else
-                        expectSymbol st ")"
-                        |> Result.map (fun (_, st) ->
-                            List.rev (v :: acc)
-                            |> List.choose (fun (n, ok) -> if ok then Some("n", n) else None),
-                            st)
-
             loop [] (advance st)
 
     let private parseColumnConstraint st acc =
@@ -882,8 +837,9 @@ module internal Parser =
         loop acc st
 
     let private parseColumnDefinition st =
-        parseIdent st
-        >>= fun (name, st) ->
+        result {
+            let! name, st = parseIdent st
+
             let isConstraintOnly =
                 match peek st with
                 | Keyword "NOT"
@@ -892,25 +848,24 @@ module internal Parser =
                 | Keyword "DEFAULT" -> true
                 | _ -> false
 
-            let typeResult =
+            let! dt, st =
                 if isConstraintOnly then
                     ret (DataType.Text, st)
                 else
                     parseDataType st
 
-            typeResult
-            >>= fun (dt, st) ->
-                parseTypeArguments st
-                >>= fun (args, st) ->
-                    parseColumnConstraint st ColumnConstraint.Empty
-                    |> Result.map (fun (columnConstraint, st) ->
-                        {
-                            Name = name
-                            DataType = dt
-                            TypeArguments = args
-                            Constraint = columnConstraint
-                        },
-                        st)
+            let! args, st = parseTypeArguments st
+            let! columnConstraint, st = parseColumnConstraint st ColumnConstraint.Empty
+
+            return
+                {
+                    Name = name
+                    DataType = dt
+                    TypeArguments = args
+                    Constraint = columnConstraint
+                },
+                st
+        }
 
     /// `IF [NOT] EXISTS` を読む。
     /// `NOT` は省略形（`IF EXISTS`）にも許可される SQL 実装があるため、
@@ -925,105 +880,93 @@ module internal Parser =
             ret (false, st)
 
     let private parseCreateTable st =
-        expectKeyword st "CREATE"
-        >>= fun (_, st) ->
-            expectKeyword st "TABLE"
-            >>= fun (_, st) ->
-                parseIfExists st
-                >>= fun (ifNotExists, st) ->
-                    parseIdent st
-                    >>= fun (name, st) ->
-                        expectSymbol st "("
-                        >>= fun (_, st) ->
-                            let rec body cols constrs (st: PState) =
-                                let next =
-                                    if isKeyword st "PRIMARY" then
-                                        match expectKeyword st "PRIMARY" with
-                                        | Error e -> Error e
-                                        | Ok(_, st) ->
-                                            match expectKeyword st "KEY" with
-                                            | Error e -> Error e
-                                            | Ok(_, st) ->
-                                                parseParenIdentList st
-                                                |> Result.map (fun (pkCols, st) ->
-                                                    cols, TableConstraint.PrimaryKeyColumns pkCols :: constrs, st)
-                                    elif isKeyword st "UNIQUE" then
-                                        parseParenIdentList (advance st)
-                                        |> Result.map (fun (uqCols, st) ->
-                                            cols, TableConstraint.UniqueColumns uqCols :: constrs, st)
-                                    else
-                                        parseColumnDefinition st |> Result.map (fun (c, st) -> c :: cols, constrs, st)
+        let rec body cols constrs (st: PState) =
+            let next =
+                if isKeyword st "PRIMARY" then
+                    match expectKeyword st "PRIMARY" with
+                    | Error e -> Error e
+                    | Ok(_, st) ->
+                        match expectKeyword st "KEY" with
+                        | Error e -> Error e
+                        | Ok(_, st) ->
+                            parseParenIdentList st
+                            |> Result.map (fun (pkCols, st) ->
+                                cols, TableConstraint.PrimaryKeyColumns pkCols :: constrs, st)
+                elif isKeyword st "UNIQUE" then
+                    parseParenIdentList (advance st)
+                    |> Result.map (fun (uqCols, st) -> cols, TableConstraint.UniqueColumns uqCols :: constrs, st)
+                else
+                    parseColumnDefinition st |> Result.map (fun (c, st) -> c :: cols, constrs, st)
 
-                                match next with
-                                | Error e -> Error e
-                                | Ok(cols, constrs, st) ->
-                                    if isSymbol st "," then
-                                        body cols constrs (advance st)
-                                    else
-                                        expectSymbol st ")"
-                                        |> Result.map (fun (_, st) -> List.rev cols, List.rev constrs, st)
+            match next with
+            | Error e -> Error e
+            | Ok(cols, constrs, st) ->
+                if isSymbol st "," then
+                    body cols constrs (advance st)
+                else
+                    expectSymbol st ")"
+                    |> Result.map (fun (_, st) -> List.rev cols, List.rev constrs, st)
 
-                            body [] [] st
-                            >>= fun (cols, constrs, st) ->
-                                eatOptionalSemicolon st
-                                |> Result.map (fun (_, st) ->
-                                    {
-                                        Name = name
-                                        IfNotExists = ifNotExists
-                                        Columns = cols
-                                        Constraints = constrs
-                                    },
-                                    st)
+        result {
+            let! _, st = expectKeyword st "CREATE"
+            let! _, st = expectKeyword st "TABLE"
+            let! ifNotExists, st = parseIfExists st
+            let! name, st = parseIdent st
+            let! _, st = expectSymbol st "("
+            let! cols, constrs, st = body [] [] st
+            let! _, st = eatOptionalSemicolon st
+
+            return
+                {
+                    Name = name
+                    IfNotExists = ifNotExists
+                    Columns = cols
+                    Constraints = constrs
+                },
+                st
+        }
 
     let private parseCreateIndex st =
-        expectKeyword st "CREATE"
-        >>= fun (_, st) ->
+        result {
+            let! _, st = expectKeyword st "CREATE"
             let unique = isKeyword st "UNIQUE"
             let st = if unique then advance st else st
+            let! _, st = expectKeyword st "INDEX"
+            let! name, st = parseIdent st
+            let! _, st = expectKeyword st "ON"
+            let! tbl, st = parseIdent st
+            let! cols, st = parseParenIdentList st
+            let! _, st = eatOptionalSemicolon st
 
-            expectKeyword st "INDEX"
-            >>= fun (_, st) ->
-                parseIdent st
-                >>= fun (name, st) ->
-                    expectKeyword st "ON"
-                    >>= fun (_, st) ->
-                        parseIdent st
-                        >>= fun (tbl, st) ->
-                            parseParenIdentList st
-                            >>= fun (cols, st) ->
-                                eatOptionalSemicolon st
-                                |> Result.map (fun (_, st) ->
-                                    {
-                                        Name = name
-                                        Table = tbl
-                                        Columns = cols
-                                        Unique = unique
-                                    },
-                                    st)
+            return
+                {
+                    Name = name
+                    Table = tbl
+                    Columns = cols
+                    Unique = unique
+                },
+                st
+        }
 
     let private parseDropTable st =
-        expectKeyword st "DROP"
-        >>= fun (_, st) ->
-            expectKeyword st "TABLE"
-            >>= fun (_, st) ->
-                parseIfExists st
-                >>= fun (ifEx, st) ->
-                    parseIdent st
-                    >>= fun (name, st) ->
-                        eatOptionalSemicolon st
-                        |> Result.map (fun (_, st) -> Statement.DropTable(name, ifEx), st)
+        result {
+            let! _, st = expectKeyword st "DROP"
+            let! _, st = expectKeyword st "TABLE"
+            let! ifEx, st = parseIfExists st
+            let! name, st = parseIdent st
+            let! _, st = eatOptionalSemicolon st
+            return Statement.DropTable(name, ifEx), st
+        }
 
     let private parseDropIndex st =
-        expectKeyword st "DROP"
-        >>= fun (_, st) ->
-            expectKeyword st "INDEX"
-            >>= fun (_, st) ->
-                parseIfExists st
-                >>= fun (ifEx, st) ->
-                    parseIdent st
-                    >>= fun (name, st) ->
-                        eatOptionalSemicolon st
-                        |> Result.map (fun (_, st) -> Statement.DropIndex(name, ifEx), st)
+        result {
+            let! _, st = expectKeyword st "DROP"
+            let! _, st = expectKeyword st "INDEX"
+            let! ifEx, st = parseIfExists st
+            let! name, st = parseIdent st
+            let! _, st = eatOptionalSemicolon st
+            return Statement.DropIndex(name, ifEx), st
+        }
 
     // -----------------------------------------------------------------------
     // 入口
@@ -1065,16 +1008,16 @@ module internal Parser =
 
     /// SQL テキストを 1 文以上へ分解して AST にする。
     let parseStatements (sql: string) =
+        let rec parseAll st acc =
+            if st.Pos >= st.Tokens.Length - 1 then
+                ret (List.rev acc)
+            else
+                match parseOne st with
+                | Error e -> Error e
+                | Ok(s, st) -> parseAll st (s :: acc)
+
         Lexer.tokenize sql
         >>= fun tokens ->
-            let rec parseAll st acc =
-                if st.Pos >= st.Tokens.Length - 1 then
-                    ret (List.rev acc)
-                else
-                    match parseOne st with
-                    | Error e -> Error e
-                    | Ok(s, st) -> parseAll st (s :: acc)
-
             parseAll
                 {
                     Tokens = Array.ofList tokens
@@ -1091,3 +1034,24 @@ module internal Parser =
             | [ s ] -> ret s
             | [] -> err (DbError.create ErrorKind.SyntaxError "文がありません")
             | _ -> err (DbError.create ErrorKind.SyntaxError "複数の文が渡されました（1 文ずつ実行してください）")
+
+    /// SQL テキストを 1 つの式として解析する。
+    /// DEFAULT の永続化文字列を復元するために使う。
+    let parseExpression (sql: string) =
+        result {
+            let! tokens = Lexer.tokenize sql
+
+            let st =
+                {
+                    Tokens = Array.ofList tokens
+                    Pos = 0
+                    Depth = 0
+                }
+
+            let! e, st = parseExpr st
+
+            if st.Pos >= st.Tokens.Length - 1 then
+                return e
+            else
+                return! err (DbError.create ErrorKind.SyntaxError "式の後に余分なトークンがあります")
+        }

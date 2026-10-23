@@ -13,6 +13,9 @@ type internal ExecContext =
         /// カタログ。
         /// 索引の定義を引くのに使う。
         Catalog: Catalog
+        /// 読み取りに重ねる transaction のバッファ。
+        /// read-your-writes を実現する。
+        Txn: Transaction
     }
 
 module internal ExecContext =
@@ -22,6 +25,7 @@ module internal ExecContext =
             Visible = visible
             Schemas = Map.empty
             Catalog = Catalog.empty
+            Txn = Transaction.create 0UL { SeqNo = 0UL }
         }
 
     /// スキーマを登録する（別名つきで）。
@@ -32,6 +36,9 @@ module internal ExecContext =
 
     /// カタログを差し替える（Plan の実行時に索引定義を引くため）。
     let withCatalog (ctx: ExecContext) (catalog: Catalog) = { ctx with Catalog = catalog }
+
+    /// 読み取りへ重ねる transaction を設定する。
+    let withTransaction (ctx: ExecContext) (txn: Transaction) = { ctx with Txn = txn }
 
     /// テーブルのスキーマを引く。
     /// 別名で登録されていればそれを、無ければ実テーブル名で探す。
@@ -55,8 +62,19 @@ module internal ExecContext =
     let table (ctx: ExecContext) (table: string) =
         result {
             let! schema = schemaOf ctx table
-            let! rows = Dml.scanByPrimaryKey ctx.Store schema ctx.Visible 0
-            return Op.ofArray rows
+            let! rows = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible ctx.Txn 0
+            return Op.ofSeq rows
+        }
+
+    /// 主キーの範囲走査。
+    let rangeScan (ctx: ExecContext) (table: string) (startKey: SqlValue array) (endKey: SqlValue array option) =
+        result {
+            let! schema = schemaOf ctx table
+
+            let! rows =
+                Dml.scanByPrimaryKeyRangeWithTxn ctx.Store schema ctx.Visible ctx.Txn startKey endKey 0
+
+            return Op.ofSeq rows
         }
 
     /// 索引で一致する全行を引く。
@@ -70,16 +88,45 @@ module internal ExecContext =
             | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
             | Some idx ->
                 let! rows =
-                    Dml.scanByIndexPrefix ctx.Store idx ctx.Visible keyValues System.Int32.MaxValue
+                    Dml.scanByIndexPrefixWithTxn
+                        ctx.Store
+                        schema
+                        idx
+                        ctx.Visible
+                        ctx.Txn
+                        keyValues
+                        System.Int32.MaxValue
 
-                return Op.ofArray rows
+                return Op.ofSeq rows
+        }
+
+    /// 索引の値が範囲 [lower, upper] に入る行を引く。
+    let byIndexRange (ctx: ExecContext) (table: string) (indexName: string) (lower: SqlValue) (upper: SqlValue option) =
+        result {
+            let! schema = schemaOf ctx table
+
+            match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
+            | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
+            | Some idx ->
+                let! rows =
+                    Dml.scanByIndexRangeWithTxn
+                        ctx.Store
+                        schema
+                        idx
+                        ctx.Visible
+                        ctx.Txn
+                        lower
+                        upper
+                        System.Int32.MaxValue
+
+                return Op.ofSeq rows
         }
 
     /// 主キーで 1行を引く。
     let byPrimaryKey (ctx: ExecContext) (table: string) (key: SqlValue array) =
         result {
             let! schema = schemaOf ctx table
-            let! row = Dml.getByPrimaryKey ctx.Store schema ctx.Visible key
+            let! row = Dml.getByPrimaryKeyWithTxn ctx.Store schema ctx.Visible ctx.Txn key
 
             match row with
             | None -> return Op.empty

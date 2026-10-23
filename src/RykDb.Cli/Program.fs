@@ -24,6 +24,10 @@ type Session(initial: Database) =
             Ok result
         | Error e -> Error e
 
+    member _.Begin() =
+        current <- current.Begin()
+        Ok()
+
     member _.Commit() =
         match current.Commit() with
         | Ok next ->
@@ -37,15 +41,52 @@ type Session(initial: Database) =
 
     member _.Close() = current.Close()
 
-/// `;` 区切りの文を切り出し、空白だけの断片を捨てる。
 let private piecesOf (input: string) =
-    input.Split ';'
-    |> Array.map (fun s -> s.Trim())
-    |> Array.filter (fun s -> not (System.String.IsNullOrWhiteSpace s))
+    let pieces = ResizeArray<string>()
+    let buf = System.Text.StringBuilder()
+
+    let flush () =
+        let text = buf.ToString().Trim()
+
+        if not (System.String.IsNullOrWhiteSpace text) then
+            pieces.Add text
+
+        buf.Clear() |> ignore
+
+    let rec loop (i: int) (inString: bool) =
+        if i >= input.Length then
+            flush ()
+            pieces.ToArray()
+        else
+            let c = input.[i]
+
+            if inString then
+                buf.Append c |> ignore
+
+                if c = '\'' then
+                    if i + 1 < input.Length && input.[i + 1] = '\'' then
+                        buf.Append '\'' |> ignore
+                        loop (i + 2) true
+                    else
+                        loop (i + 1) false
+                else
+                    loop (i + 1) true
+            else
+                match c with
+                | '\'' ->
+                    buf.Append c |> ignore
+                    loop (i + 1) true
+                | ';' ->
+                    flush ()
+                    loop (i + 1) false
+                | _ ->
+                    buf.Append c |> ignore
+                    loop (i + 1) false
+
+    loop 0 false
 
 let private splitStatements (input: string) = piecesOf input |> Array.toList
 
-/// 色を付けて 1 行出す（エラー・警告表示の定型）。
 let private coloredLine (color: System.ConsoleColor) (emit: string -> unit) (line: string) =
     System.Console.ForegroundColor <- color
     emit line
@@ -66,6 +107,7 @@ let private dotCommand (session: Session) (line: string) =
     | [| ".help" |] ->
         printfn "コマンド:"
         printfn "  .tables             テーブル一覧"
+        printfn "  .begin              transaction を開始"
         printfn "  .commit             現在の transaction を commit"
         printfn "  .rollback           現在の transaction を破棄"
         printfn "  .exit               終了"
@@ -79,6 +121,12 @@ let private dotCommand (session: Session) (line: string) =
             printfn "(テーブルはありません)"
         else
             names |> List.iter (fun n -> printfn "  %s" n)
+
+        true
+    | [| ".begin" |] ->
+        match session.Begin() with
+        | Ok() -> printfn "(begin しました)"
+        | Error e -> printError e
 
         true
     | [| ".commit" |] ->

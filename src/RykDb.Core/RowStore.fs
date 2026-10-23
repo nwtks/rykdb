@@ -162,6 +162,94 @@ module internal Keyspace =
         with _ ->
             None
 
+/// keyspace を跨ぐ commit の意図ログ。
+/// 各 keyspace の WAL は独立しているため、途中でクラッシュすると
+/// 「テーブルは書けたが索引が書けていない」状態になりうる。
+/// 全バッチを 1つのファイルへ原子的に公開してから書き込み、
+/// 再オープン時に残っていれば未適用分をやり直す。
+module internal CommitIntent =
+    let private dir (root: string) = Path.Combine(root, ".commit")
+
+    let private encode (batches: (string * Entry array) list) =
+        let steps =
+            [
+                yield Writer.varint (uint64 batches.Length)
+
+                for ks, entries in batches do
+                    yield Writer.str ks
+                    yield Writer.lengthPrefixed (Entry.encodeBatch 0UL entries)
+            ]
+
+        Writer.build steps
+
+    let private decode (data: byte array) =
+        let readOne (c: Cursor) =
+            result {
+                let! ks, c1 = Reader.readStr c
+                let! batchBytes, c2 = Reader.readLengthPrefixed c1
+                let! _, entries = Entry.decodeBatch batchBytes
+                return (ks, entries), c2
+            }
+
+        result {
+            let c = Cursor.create data
+            let! count, c1 = Reader.readVarint c
+
+            if count > uint64 System.Int32.MaxValue then
+                return! err (DbError.corruption "CommitIntent: バッチ数が大きすぎます")
+            else
+                let! batches, _ = Reader.readItems count readOne c1
+                return batches
+        }
+
+    /// 未適用の intent ファイル（SeqNo の昇順）。
+    let pending (root: string) =
+        protect (fun () ->
+            let d = dir root
+
+            if Directory.Exists d then
+                Directory.GetFiles(d, "*.commit") |> Array.sort
+            else
+                [||])
+
+    /// バッチを intent として公開する。
+    /// 一時ファイルへ書いて flush してから rename するので、
+    /// 途中でクラッシュしても半端な intent は見えない。
+    let publish (root: string) (batches: (string * Entry array) list) =
+        protect (fun () ->
+            let d = dir root
+            Directory.CreateDirectory d |> ignore
+
+            let maxSeq =
+                batches
+                |> List.collect (fun (_, entries) -> Array.toList entries)
+                |> List.map _.SeqNo
+                |> List.max
+
+            let name =
+                sprintf "%s-%s.commit" (maxSeq.ToString("D20")) (System.Guid.NewGuid().ToString("N"))
+
+            let final = Path.Combine(d, name)
+            let temp = final + ".tmp"
+            let bytes = encode batches
+            use fs = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None)
+            fs.Write(bytes, 0, bytes.Length)
+            fs.Flush true
+            File.Move(temp, final, true)
+            final)
+
+    /// intent を読む。
+    let read (path: string) =
+        protect (fun () -> File.ReadAllBytes path) >>= decode
+
+    /// intent を消す。
+    /// 失敗を握り潰すと、その後に同じキーが更新・GC されたあとの再起動で
+    /// 古い intent が再適用され得るので、エラーとして返す。
+    let remove (path: string) =
+        protect (fun () ->
+            if File.Exists path then
+                File.Delete path)
+
 /// keyspace ごとのエンジンとスキーマを束ねたもの。
 /// エンジンの開き方を差し替えられるので、テストではディスクに触れない実装を使える。
 [<NoEquality; NoComparison>]
@@ -189,6 +277,91 @@ module internal RowStore =
             let! engine = StorageEngine.openDatabase dir
             return DiskStorageEngine engine :> IStorageEngine
         }
+
+    /// すでに同じ (key, SeqNo, value) が入っているエントリを除く。
+    /// commit intent の再適用で物理エントリが重複しないようにする。
+    let private filterApplied (engine: IStorageEngine) (entries: Entry array) =
+        let rec loop (rest: Entry list) (acc: Entry list) =
+            match rest with
+            | [] -> ret (List.rev acc |> List.toArray)
+            | e :: tail ->
+                match engine.GetAt (Some e.SeqNo) e.Key with
+                | Error err -> Error err
+                | Ok(Some existing) when existing.SeqNo = e.SeqNo && existing.Value = e.Value -> loop tail acc
+                | Ok _ -> loop tail (e :: acc)
+
+        loop (Array.toList entries) []
+
+    let private applyBatchesCore
+        (idempotent: bool)
+        (activeSnapshot: uint64)
+        (store: RowStore)
+        (batches: (string * Entry array) list)
+        =
+        let rec writeAll (rest: (string * Entry array) list) (current: RowStore) =
+            match rest with
+            | [] -> ret current
+            | (ks, entries) :: tail ->
+                if Array.isEmpty entries then
+                    writeAll tail current
+                else
+                    match ensure current ks with
+                    | Error err -> Error err
+                    | Ok engine ->
+                        let engine = engine.WithActiveSnapshot activeSnapshot
+
+                        let filtered =
+                            if idempotent then
+                                filterApplied engine entries
+                            else
+                                ret entries
+
+                        match filtered with
+                        | Error err -> Error err
+                        | Ok entries when Array.isEmpty entries -> writeAll tail current
+                        | Ok entries ->
+                            match engine.WriteBatch entries with
+                            | Error err -> Error err
+                            | Ok updated ->
+                                let maxSeq = Entry.maxSeqNo entries
+                                let bumped = updated.WithNextSeqNo(max updated.NextSeqNo (maxSeq + 1UL))
+
+                                match bumped.MaybeFlush() with
+                                | Error err -> Error err
+                                | Ok flushed ->
+                                    writeAll
+                                        tail
+                                        { current with
+                                            Engines = Map.add ks flushed current.Engines
+                                        }
+
+        writeAll batches store
+
+    /// keyspace ごとにバッチを適用する（intent の公開・削除はしない）。
+    /// activeSnapshot は compaction の GC 境界。0 は「全版を残す」。
+    let applyBatches (activeSnapshot: uint64) (store: RowStore) (batches: (string * Entry array) list) =
+        applyBatchesCore false activeSnapshot store batches
+
+    /// 残っている commit intent を順に適用する（再オープン時の回復）。
+    let private replayPending (store: RowStore) =
+        if System.String.IsNullOrEmpty store.Root then
+            ret store
+        else
+            result {
+                let! files = CommitIntent.pending store.Root
+
+                return!
+                    files
+                    |> foldOk
+                        (fun current path ->
+                            result {
+                                let! batches = CommitIntent.read path
+                                let! next = applyBatchesCore true 0UL current batches
+                                let! () = CommitIntent.remove path
+                                return next
+                            })
+                        store
+            }
 
     /// DB を開く（keyspace は必要に応じて作られる）。
     /// <remarks>
@@ -218,12 +391,14 @@ module internal RowStore =
 
             let! engines = openEngines known Map.empty
 
-            return
+            let store =
                 {
                     Root = root
                     Engines = engines
                     OpenEngine = openEngine
                 }
+
+            return! replayPending store
         }
 
     /// エンジンの開き方を差し替えて、空の RowStore を作る（テスト用）。
@@ -242,32 +417,27 @@ module internal RowStore =
     /// batches は (keyspace, Entry 配列) の列。
     /// Entry の SeqNo は TransactionManager が採番した値をそのまま使う。
     /// keyspace ごとに 1 から採番し直すと MVCC が壊れる（同じ SeqNo が別のキーを占めてしまう）。
-    /// keyspace ごとにエンジンが独立なので 並列に commit できるのは採番、
-    /// ではなく「キー集合が重ならないこと」だから。
+    /// ディスクでは先に commit intent を公開するので、途中でクラッシュしても
+    /// 再オープン時に全 keyspace へ適用し直せる。
+    let writeBatchesWithSnapshot (activeSnapshot: uint64) (store: RowStore) (batches: (string * Entry array) list) =
+        let nonEmpty =
+            batches |> List.filter (fun (_, entries) -> not (Array.isEmpty entries))
+
+        if List.isEmpty nonEmpty then
+            ret store
+        elif nonEmpty.Length = 1 || System.String.IsNullOrEmpty store.Root then
+            applyBatches activeSnapshot store nonEmpty
+        else
+            result {
+                let! intent = CommitIntent.publish store.Root nonEmpty
+                let! next = applyBatches activeSnapshot store nonEmpty
+                let! () = CommitIntent.remove intent
+                return next
+            }
+
+    /// GC 境界を指定しない書き込み（カタログ・索引 backfill・テスト用）。
     let writeBatches (store: RowStore) (batches: (string * Entry array) list) =
-        let rec writeAll (rest: (string * Entry array) list) (current: RowStore) =
-            match rest with
-            | [] -> ret current
-            | (ks, entries) :: tail ->
-                if Array.isEmpty entries then
-                    writeAll tail current
-                else
-                    match ensure current ks with
-                    | Error err -> Error err
-                    | Ok engine ->
-                        match engine.WriteBatch entries with
-                        | Error err -> Error err
-                        | Ok updated ->
-                            let maxSeq = Entry.maxSeqNo entries
-                            let bumped = updated.WithNextSeqNo(max updated.NextSeqNo (maxSeq + 1UL))
-
-                            writeAll
-                                tail
-                                { current with
-                                    Engines = Map.add ks bumped current.Engines
-                                }
-
-        writeAll batches store
+        writeBatchesWithSnapshot 0UL store batches
 
     /// keyspace から読む（SeqNo 制限つき）。
     let getAt (store: RowStore) (keyspace: string) (key: byte array) (visible: uint64 option) =
@@ -285,8 +455,8 @@ module internal RowStore =
 
             return
                 entries
-                |> Array.map (fun sst -> sst.Key, sst.Value)
-                |> Array.filter (fun (_, v) -> v.IsSome)
+                |> Seq.map (fun sst -> sst.Key, sst.Value)
+                |> Seq.filter (fun (_, v) -> v.IsSome)
         }
 
     /// keyspace を走査する（制限なし）。
@@ -348,10 +518,125 @@ module internal Dml =
     let getByPrimaryKey (store: RowStore) (schema: TableSchema) (visible: uint64 option) (key: SqlValue array) =
         RowStore.getAt store (tableSpace schema) (KeyBuilder.ofValues key) visible
 
+    /// store の行に txn の書き込みを重ねる。
+    /// 追加・削除の後もキー昇順を保つ（走査結果の順序を安定させるため）。
+    let private overlayRows
+        (keyOf: SqlValue array -> byte array)
+        (slots: (byte array * SqlValue array option) list)
+        (rows: seq<SqlValue array>)
+        =
+        if List.isEmpty slots then
+            rows
+        else
+            let slotMap = Map.ofList slots
+            let keyed = rows |> Seq.map (fun row -> keyOf row, row) |> Seq.toArray
+
+            let kept =
+                keyed
+                |> Array.choose (fun (key, row) ->
+                    match Map.tryFind key slotMap with
+                    | Some None -> None
+                    | Some(Some value) -> Some(key, value)
+                    | None -> Some(key, row))
+
+            let existing = keyed |> Array.map fst |> Set.ofArray
+
+            let added =
+                slots
+                |> List.choose (fun (key, value) ->
+                    match value with
+                    | Some row when not (Set.contains key existing) -> Some(key, row)
+                    | _ -> None)
+
+            Array.append kept (Array.ofList added)
+            |> Array.sortWith (fun (a, _) (b, _) -> Bytes.compare a b)
+            |> Array.map snd
+            |> Seq.ofArray
+
+    /// 主キーで既存行を取り出す（txn の書き込みを含む）。
+    let getByPrimaryKeyWithTxn
+        (store: RowStore)
+        (schema: TableSchema)
+        (visible: uint64 option)
+        (txn: Transaction)
+        (key: SqlValue array)
+        =
+        match Transaction.tryFind txn (tableSpace schema) (KeyBuilder.ofValues key) with
+        | Some slot -> ret slot
+        | None -> getByPrimaryKey store schema visible key
+
     /// 主キーで prefix 走査する（キー昇順）。
     let scanByPrimaryKey (store: RowStore) (schema: TableSchema) (visible: uint64 option) (limit: int) =
         RowStore.scanAt store (tableSpace schema) [||] visible limit
-        |> Result.map (Array.map (fun (_, v) -> v |> Option.defaultValue [||]))
+        |> Result.map (Seq.map (fun (_, v) -> v |> Option.defaultValue [||]))
+
+    /// 主キーの範囲走査（startKey 以上、endKey 以下）。
+    let scanByPrimaryKeyRange
+        (store: RowStore)
+        (schema: TableSchema)
+        (visible: uint64 option)
+        (startKey: SqlValue array)
+        (endKey: SqlValue array option)
+        (limit: int)
+        =
+        let startBytes = KeyBuilder.ofValues startKey
+
+        RowStore.scanAt store (tableSpace schema) startBytes visible 0
+        |> Result.map (fun rows ->
+            let matched =
+                rows
+                |> Seq.choose (fun (k, v) ->
+                    match v with
+                    | Some row ->
+                        match endKey with
+                        | None -> Some row
+                        | Some ek when Bytes.compare k (KeyBuilder.ofValues ek) <= 0 -> Some row
+                        | _ -> None
+                    | None -> None)
+
+            if limit > 0 then Seq.truncate limit matched else matched)
+
+    /// 主キーで prefix 走査する（txn の書き込みを含む）。
+    let scanByPrimaryKeyWithTxn
+        (store: RowStore)
+        (schema: TableSchema)
+        (visible: uint64 option)
+        (txn: Transaction)
+        (limit: int)
+        =
+        scanByPrimaryKey store schema visible 0
+        |> Result.map (fun rows ->
+            let merged =
+                overlayRows (RowKey.primary schema) (Transaction.slotsOf txn (tableSpace schema)) rows
+
+            if limit > 0 then Seq.truncate limit merged else merged)
+
+    /// 主キーの範囲走査（txn の書き込みを含む）。
+    let scanByPrimaryKeyRangeWithTxn
+        (store: RowStore)
+        (schema: TableSchema)
+        (visible: uint64 option)
+        (txn: Transaction)
+        (startKey: SqlValue array)
+        (endKey: SqlValue array option)
+        (limit: int)
+        =
+        scanByPrimaryKeyRange store schema visible startKey endKey 0
+        |> Result.map (fun rows ->
+            let merged =
+                overlayRows (RowKey.primary schema) (Transaction.slotsOf txn (tableSpace schema)) rows
+
+            let filtered =
+                match endKey with
+                | None -> merged
+                | Some ek ->
+                    merged
+                    |> Seq.filter (fun row ->
+                        let pk = TableSchema.primaryKeyOf schema row
+                        let pkBytes = KeyBuilder.ofValues pk
+                        Bytes.compare pkBytes (KeyBuilder.ofValues ek) <= 0)
+
+            if limit > 0 then Seq.truncate limit filtered else filtered)
 
     /// 索引の値に一致する全行を引く。
     /// 索引は一意とは限らないので `WHERE dept_id = 2` は 1行ではなく「その値を持つ全部の行」を返す。
@@ -368,17 +653,108 @@ module internal Dml =
         let prefix = KeyBuilder.ofValues values
         let ks = indexSpace index
 
-        RowStore.scanAt store ks prefix visible 0
+        RowStore.scanAt store ks prefix visible limit
         |> Result.map (fun rows ->
             let matched =
                 rows
-                |> Array.takeWhile (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix)
-                |> Array.choose snd
+                |> Seq.takeWhile (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix)
+                |> Seq.choose snd
 
-            if limit > 0 && limit < matched.Length then
-                Array.take limit matched
-            else
-                matched)
+            if limit > 0 then Seq.truncate limit matched else matched)
+
+    /// 索引の値に一致する全行を引く（txn の書き込みを含む）。
+    let scanByIndexPrefixWithTxn
+        (store: RowStore)
+        (schema: TableSchema)
+        (index: IndexSchema)
+        (visible: uint64 option)
+        (txn: Transaction)
+        (values: SqlValue array)
+        (limit: int)
+        =
+        let prefix = KeyBuilder.ofValues values
+
+        let slots =
+            Transaction.slotsOf txn (indexSpace index)
+            |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
+
+        let deletionCount = slots |> List.filter (fun (_, v) -> v.IsNone) |> List.length
+        let storeLimit = if limit > 0 then limit + deletionCount else 0
+
+        scanByIndexPrefix store index visible values storeLimit
+        |> Result.map (fun rows ->
+            let merged = overlayRows (RowKey.indexKey schema index) slots rows
+
+            if limit > 0 then Seq.truncate limit merged else merged)
+
+    /// 索引の値が範囲 [lower, upper] に入る行を引く。
+    let scanByIndexRange
+        (store: RowStore)
+        (index: IndexSchema)
+        (visible: uint64 option)
+        (lower: SqlValue)
+        (upper: SqlValue option)
+        (limit: int)
+        =
+        let loBytes = KeyBuilder.ofValues [| lower |]
+
+        let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues [| v |])
+
+        let inRange (key: byte array) =
+            let lowerOk = Bytes.compare key loBytes >= 0
+
+            let upperOk =
+                match hiBytes with
+                | None -> true
+                | Some hb -> Bytes.compare key hb <= 0 || KeyBuilder.startsWithPrefix key hb
+
+            lowerOk && upperOk
+
+        let ks = indexSpace index
+
+        RowStore.scanAt store ks loBytes visible 0
+        |> Result.map (fun rows ->
+            let matched = rows |> Seq.filter (fun (k, _) -> inRange k) |> Seq.choose snd
+
+            if limit > 0 then Seq.truncate limit matched else matched)
+
+    /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
+    let scanByIndexRangeWithTxn
+        (store: RowStore)
+        (schema: TableSchema)
+        (index: IndexSchema)
+        (visible: uint64 option)
+        (txn: Transaction)
+        (lower: SqlValue)
+        (upper: SqlValue option)
+        (limit: int)
+        =
+        let loBytes = KeyBuilder.ofValues [| lower |]
+
+        let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues [| v |])
+
+        let inRange (key: byte array) =
+            let lowerOk = Bytes.compare key loBytes >= 0
+
+            let upperOk =
+                match hiBytes with
+                | None -> true
+                | Some hb -> Bytes.compare key hb <= 0 || KeyBuilder.startsWithPrefix key hb
+
+            lowerOk && upperOk
+
+        let slots =
+            Transaction.slotsOf txn (indexSpace index)
+            |> List.filter (fun (key, _) -> inRange key)
+
+        let deletionCount = slots |> List.filter (fun (_, v) -> v.IsNone) |> List.length
+        let storeLimit = if limit > 0 then limit + deletionCount else 0
+
+        scanByIndexRange store index visible lower upper storeLimit
+        |> Result.map (fun rows ->
+            let merged = overlayRows (RowKey.indexKey schema index) slots rows
+
+            if limit > 0 then Seq.truncate limit merged else merged)
 
     /// 1行を transaction に積む（まだ DB には入らない）。
     /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。
@@ -387,6 +763,11 @@ module internal Dml =
             do! TableSchema.validateRow schema row
             let tks = tableSpace schema
             let pk = RowKey.primary schema row
+
+            match Transaction.tryFind txn tks pk with
+            | Some(Some _) -> return! err (DbError.constraintViolation (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name))
+            | _ -> ()
+
             let next = Transaction.put txn tks pk row
             return! applyIndexChange schema next None (Some row)
         }
@@ -410,15 +791,25 @@ module internal Dml =
         =
         result {
             do! TableSchema.validateRow schema newRow
-            let! row = getByPrimaryKey store schema visible key
+            let! row = getByPrimaryKeyWithTxn store schema visible txn key
 
             match row with
             | None -> return! err (DbError.notFound "更新する行が見つかりません")
             | Some oldRow ->
-                let tks = tableSpace schema
-                let newPk = RowKey.primary schema newRow
-                let afterMain = Transaction.put txn tks newPk newRow
-                return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
+                let oldPkValues = TableSchema.primaryKeyOf schema oldRow
+                let newPkValues = TableSchema.primaryKeyOf schema newRow
+
+                if not (Array.forall2 (=) oldPkValues newPkValues) then
+                    return!
+                        err (
+                            sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
+                            |> DbError.constraintViolation
+                        )
+                else
+                    let tks = tableSpace schema
+                    let newPk = RowKey.primary schema newRow
+                    let afterMain = Transaction.put txn tks newPk newRow
+                    return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
         }
 
     /// 主キーで削除する。
@@ -432,7 +823,7 @@ module internal Dml =
         (key: SqlValue array)
         =
         result {
-            let! row = getByPrimaryKey store schema visible key
+            let! row = getByPrimaryKeyWithTxn store schema visible txn key
 
             match row with
             | None -> return! err (sprintf "削除する行が見つかりません: %s" schema.Name |> DbError.notFound)

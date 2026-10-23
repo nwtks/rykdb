@@ -4,7 +4,6 @@
 // 探索は「memtable -> L0（新しい順）-> 各レベル（新しい順）」の順。
 // 各ステップで Bloom filter と VersionSet の key range で枝刈りする。
 // 可視性（SeqNo <= snapshot）は getAt / scanAt の visible フィルタで判定する。
-// 制約: scan は結果を全部メモリに載せて返す。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -98,18 +97,21 @@ module internal StorageEngine =
     /// これが MVCC の可視性。
     /// None なら制限なし。
     let getAt (engine: StorageEngine) (visible: uint64 option) (key: byte array) =
-        let firstVisible (visible: uint64 option) (key: byte array) (scan: SstScan) =
-            let rec seek (cur: SstScan) =
-                match SstScan.next cur with
-                | Error e -> Error e
-                | Ok None -> ret None
-                | Ok(Some(e, nxt)) ->
-                    match Bytes.compare e.Key key with
-                    | c when c < 0 -> seek nxt
-                    | 0 -> if isVisible visible e then ret (Some e) else seek nxt
-                    | _ -> ret None
+        let rec seek (visible: uint64 option) (key: byte array) (cur: SstScan) =
+            match SstScan.next cur with
+            | Error e -> Error e
+            | Ok None -> ret None
+            | Ok(Some(e, nxt)) ->
+                match Bytes.compare e.Key key with
+                | c when c < 0 -> seek visible key nxt
+                | 0 ->
+                    if isVisible visible e then
+                        ret (Some e)
+                    else
+                        seek visible key nxt
+                | _ -> ret None
 
-            seek scan
+        let firstVisible (visible: uint64 option) (key: byte array) (scan: SstScan) = seek visible key scan
 
         let rec probe (files: FileMetaData list) =
             match files with
@@ -130,39 +132,112 @@ module internal StorageEngine =
         | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
         | None -> Version.filesForPointLookup engine.Version key |> probe
 
+    /// 遅延 k-way merge（キー昇順・同一キーは SeqNo 降順）。
+    let private lazyMerge (sources: seq<SstEntry> list) =
+        let initialState =
+            sources
+            |> List.map (fun s -> s.GetEnumerator())
+            |> List.map (fun e -> if e.MoveNext() then Some e.Current, e else None, e)
+
+        Seq.unfold
+            (fun state ->
+                let candidates =
+                    state |> List.choose (fun (cur, e) -> cur |> Option.map (fun c -> c, e))
+
+                if List.isEmpty candidates then
+                    None
+                else
+                    let smallest, smallestEnum =
+                        candidates
+                        |> List.fold
+                            (fun (best: (SstEntry * System.Collections.Generic.IEnumerator<SstEntry>) option) (c, e) ->
+                                match best with
+                                | None -> Some(c, e)
+                                | Some(bc, _) -> if SstEntry.compare c bc < 0 then Some(c, e) else best)
+                            None
+                        |> Option.get
+
+                    let newCur =
+                        if smallestEnum.MoveNext() then
+                            Some smallestEnum.Current
+                        else
+                            None
+
+                    let newState =
+                        state
+                        |> List.map (fun (cur, e) -> if e = smallestEnum then newCur, e else cur, e)
+
+                    Some(smallest, newState))
+            initialState
+
+    /// 遅延 collapseDuplicates（同一キーの最新版だけ残す）。
+    let private collapseDuplicatesLazy (visible: uint64 option) (src: seq<SstEntry>) =
+        let isVisible (e: SstEntry) =
+            match visible with
+            | Some s -> e.SeqNo <= s
+            | None -> true
+
+        Seq.unfold
+            (fun (cur: System.Collections.Generic.IEnumerator<SstEntry>, emittedKey: byte array option) ->
+                let rec next () =
+                    if cur.MoveNext() then
+                        let e = cur.Current
+
+                        match emittedKey with
+                        | Some k when Bytes.compare k e.Key = 0 ->
+                            // 同一キーの古い版 → スキップ
+                            next ()
+                        | _ when not (isVisible e) ->
+                            // 見えない版 → スキップ
+                            next ()
+                        | _ -> Some(e, (cur, Some e.Key))
+                    else
+                        None
+
+                next ())
+            (src.GetEnumerator(), None)
+
     /// 範囲ルックアップ。
     /// キー昇順で返す（同一キーは 1 件だけ）。
     /// visible が Some s のときは SeqNo が s 以下の版を返す。
+    /// 遅延 pull で merge し、limit 件で早期打ち切りする。
     let scanAt (engine: StorageEngine) (visible: uint64 option) (startKey: byte array) (limit: int) =
-        let collapseDuplicates (visible: uint64 option) (items: SstEntry array) =
-            let rec collapse (acc: SstEntry list) (arr: SstEntry array) (i: int) (emittedKey: byte array option) =
-                if i >= arr.Length then
-                    List.rev acc |> Array.ofList
-                else
-                    let e = arr.[i]
-
-                    match emittedKey with
-                    | Some k when Bytes.compare k e.Key = 0 -> collapse acc arr (i + 1) emittedKey
-                    | _ when not (isVisible visible e) -> collapse acc arr (i + 1) emittedKey
-                    | _ -> collapse (e :: acc) arr (i + 1) (Some e.Key)
-
-            collapse [] items 0 None
-
-        let memSeq =
-            Memtable.rangeScan engine.Mem startKey 0
-            |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
-            |> Seq.toArray
-
-        let files =
+        // SST ファイルを開く（ヘッダ読み取りのみ・高速）。
+        let sstFiles =
             Version.allFiles engine.Version
             |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
             |> List.sortByDescending _.FileNumber
 
-        FileMetaData.foldFiles (entriesOf engine startKey) (fun acc entries -> entries :: acc) [] files
-        |> Result.map (fun sources ->
-            let ordered = List.rev sources
-            let merged = memSeq :: ordered |> SstEntry.mergeSorted |> collapseDuplicates visible
-            if limit > 0 then merged |> Array.truncate limit else merged)
+        let opened = sstFiles |> List.map (fun f -> openSstable engine f)
+
+        let openErrors =
+            opened
+            |> List.choose (function
+                | Error e -> Some e
+                | _ -> None)
+
+        if not (List.isEmpty openErrors) then
+            Error(List.head openErrors)
+        else
+            let readers =
+                opened
+                |> List.choose (function
+                    | Ok r -> Some r
+                    | _ -> None)
+
+            let memSeq =
+                Memtable.rangeScan engine.Mem startKey 0
+                |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+
+            let sstSeqs =
+                readers |> List.map (fun r -> Sstable.rangeScan r startKey 0 |> SstScan.toSeq)
+
+            let sources = memSeq :: sstSeqs
+            let merged = lazyMerge sources
+            let deduped = collapseDuplicatesLazy visible merged
+            let live = Seq.filter (fun e -> e.Value.IsSome) deduped
+            let taken = if limit > 0 then Seq.truncate limit live else live
+            Ok taken
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、
@@ -305,6 +380,14 @@ module internal StorageEngine =
     /// 必要なら compaction する。
     let maybeCompact (engine: StorageEngine) = compactOnce engine
 
+    /// memtable が上限に達していれば flush し、続けて compaction する。
+    /// 上限に達していなければ何もしない。
+    let maybeFlush (engine: StorageEngine) =
+        if engine.Mem.Count > 0 && engine.Mem.ApproxBytes >= engine.MemLimitBytes then
+            flush engine >>= maybeCompact
+        else
+            ret engine
+
     /// データベースを開く（新規なら作る）。
     let openDatabase (dir: string) =
         let dropMissingFiles (dir: string) (manifestNumber: int64) (version: Version) =
@@ -414,16 +497,20 @@ module internal StorageEngine =
 /// テストではメモリ実装に差し替えられる。
 type internal IStorageEngine =
     abstract NextSeqNo: uint64
+    abstract ActiveSnapshot: uint64
     abstract GetAt: visible: uint64 option -> key: byte array -> Result<SstEntry option, DbError>
-    abstract ScanAt: visible: uint64 option -> startKey: byte array -> limit: int -> Result<SstEntry array, DbError>
+    abstract ScanAt: visible: uint64 option -> startKey: byte array -> limit: int -> Result<seq<SstEntry>, DbError>
     abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
     abstract WithNextSeqNo: nextSeqNo: uint64 -> IStorageEngine
+    abstract WithActiveSnapshot: snapshot: uint64 -> IStorageEngine
+    abstract MaybeFlush: unit -> Result<IStorageEngine, DbError>
     abstract Close: unit -> Result<unit, DbError>
 
 /// 実ディスクの StorageEngine を IStorageEngine として公開する。
 type internal DiskStorageEngine(engine: StorageEngine) =
     interface IStorageEngine with
         member _.NextSeqNo = engine.NextSeqNo
+        member _.ActiveSnapshot = engine.ActiveSnapshot
         member _.GetAt visible key = StorageEngine.getAt engine visible key
 
         member _.ScanAt visible startKey limit =
@@ -435,6 +522,17 @@ type internal DiskStorageEngine(engine: StorageEngine) =
 
         member _.WithNextSeqNo nextSeqNo =
             DiskStorageEngine { engine with NextSeqNo = nextSeqNo } :> IStorageEngine
+
+        member _.WithActiveSnapshot snapshot =
+            DiskStorageEngine
+                { engine with
+                    ActiveSnapshot = snapshot
+                }
+            :> IStorageEngine
+
+        member _.MaybeFlush() =
+            StorageEngine.maybeFlush engine
+            |> Result.map (fun next -> DiskStorageEngine next :> IStorageEngine)
 
         member _.Close() =
             StorageEngine.close engine |> Result.map ignore

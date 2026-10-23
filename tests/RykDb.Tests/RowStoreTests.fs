@@ -333,7 +333,9 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる`` () =
 
         commitInto store 1UL txn
 
-        let rows = Dml.scanByPrimaryKey store usersWithEmailIndex None 0 |> ok
+        let rows =
+            Dml.scanByPrimaryKey store usersWithEmailIndex None 0 |> ok |> Seq.toArray
+
         Assert.Equal(3, rows.Length)
 
         for i in 0..2 do
@@ -353,7 +355,9 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる（limit）`` ()
 
         commitInto store 1UL txn
 
-        let rows = Dml.scanByPrimaryKey store usersWithEmailIndex None 2 |> ok
+        let rows =
+            Dml.scanByPrimaryKey store usersWithEmailIndex None 2 |> ok |> Seq.toArray
+
         Assert.Equal(2, rows.Length))
 
 [<Fact>]
@@ -379,11 +383,13 @@ let ``Dml.scanByIndexPrefix: limit で件数を絞れる`` () =
 
         let all =
             ok (Dml.scanByIndexPrefix store schema.Indexes.[0] None [| SqlValue.Int 20L |] 0)
+            |> Seq.toArray
 
         Assert.Equal(3, all.Length)
 
         let limited =
             ok (Dml.scanByIndexPrefix store schema.Indexes.[0] None [| SqlValue.Int 20L |] 2)
+            |> Seq.toArray
 
         Assert.Equal(2, limited.Length))
 
@@ -443,3 +449,42 @@ let ``Dml.deleteByPrimaryKey: 存在しない行の削除は NotFound`` () =
             ErrorKind.NotFound
             "存在しない行の削除を許してはいけない"
             (Dml.deleteByPrimaryKey store usersWithEmailIndex None delTxn [| SqlValue.Int 999L |]))
+
+[<Fact>]
+let ``RowStore.writeBatchesWithSnapshot: engine に GC 境界を設定する`` () =
+    withDir "rs-snapshot" (fun dir ->
+        let store = RowStore.openStore dir |> ok
+        let batch = "t:a", [| Entry.put (intKey 1) 1UL (intRow 1) |]
+        let store = RowStore.writeBatchesWithSnapshot 7UL store [ batch ] |> ok
+        let engine = RowStore.engine store "t:a" |> ok
+        Assert.Equal(7UL, engine.ActiveSnapshot)
+        RowStore.close store |> ok)
+
+[<Fact>]
+let ``RowStore: commit intent が残っていれば再オープンで全 keyspace を適用する`` () =
+    withDir "rs-intent" (fun dir ->
+        let b1 = "t:a", [| Entry.put (intKey 1) 1UL [| SqlValue.Int 1L |] |]
+        let b2 = "t:b", [| Entry.put (intKey 2) 2UL [| SqlValue.Int 2L |] |]
+        let store = RowStore.openStore dir |> ok
+        let intent = CommitIntent.publish dir [ b1; b2 ] |> ok
+        // 1 keyspace だけ書いたところでクラッシュした状態（intent は残す）
+        RowStore.applyBatches 0UL store [ b1 ] |> ok |> ignore
+        let reopened = RowStore.openStore dir |> ok
+
+        Assert.Equal(
+            Some 1UL,
+            (RowStore.engine reopened "t:a" |> ok).GetAt None (intKey 1)
+            |> ok
+            |> Option.map _.SeqNo
+        )
+
+        Assert.Equal(
+            Some 2UL,
+            (RowStore.engine reopened "t:b" |> ok).GetAt None (intKey 2)
+            |> ok
+            |> Option.map _.SeqNo
+        )
+        // 適用後は intent が消える
+        Assert.False(File.Exists intent)
+        Assert.Empty(CommitIntent.pending dir |> ok)
+        RowStore.close reopened |> ok)

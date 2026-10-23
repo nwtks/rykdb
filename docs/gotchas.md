@@ -441,6 +441,8 @@ let obsolete = Version.allFiles version
 
 - **版（エントリ）単位の GC**: 同キーのうち SeqNo 最大の版は**必ず残す**。
   その次に新しい版のうち `SeqNo < activeSnapshot` のものだけ捨てる。
+- 最下位レベルでも、**同じキーの古い版が残るなら tombstone は消さない**。
+  消すと下位の古い値が復活する（`Compaction.gc` は `older.IsEmpty` のときだけ落とす）。
 - **ファイル単位の回収は SeqNo で判定しない**。
   LevelDB と同じ「Version が参照していないファイル」だけ
   （MANIFEST 反映前に取り残されたものの掃除用）。
@@ -1012,3 +1014,23 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
   単一フィールドのキーでは終端が末尾に来て `Cursor.atEnd` の分岐だけを通るため露見しない
   （src からの `readFirstValue` 呼び出しが無く、テストも単一フィールドのみだったため潜在化していた）。
 - 回帰テスト: `SerializationTests` の `OrderPreserving: 複合キーの先頭フィールドを読める`
+
+### 11.8 keyspace 横断 commit は「先に intent、最後に削除」
+
+テーブルと索引は別 keyspace・別 WAL。テーブルだけ書けて索引が書けないクラッシュを防ぐため、
+`RowStore.writeBatchesWithSnapshot` は全バッチを `.commit/` の intent に原子的公開してから書き、
+全 keyspace の適用後に intent を削除する。
+
+- intent のペイロードは `Entry.encodeBatch`（txnId + 件数 + 各エントリ）を
+  `Writer.lengthPrefixed` で包む。`Writer.writeBytes` で包むと
+  `Reader.readLengthPrefixed` が先頭 8 バイトを長さと誤認し、`Reader: 8 バイトを読み取れません` になる。
+- 再適用は `filterApplied` が `(key, SeqNo, value)` の完全一致を `GetAt` で確認して読み飛ばす。
+  これを Memtable 全体の重複排除にしてはいけない（通常の同一 SeqNo 重複の意味が変わる）。
+- intent 削除の失敗はエラーにする。握り潰して書き込みを続けると、後で同じキーが GC されたあとの再起動で古い intent が再適用され得る。
+
+### 11.9 `ActiveSnapshot = 0` は「全版を残す」
+
+`Compaction.gc` は `SeqNo < ActiveSnapshot` の版を捨てる。
+0 を「最新版だけ残す」と解釈すると全履歴を失う。
+replay 中や境界未設定時は 0 のままにし、通常の commit では
+`TransactionManager.activeSnapshot`（active の最小 snapshot、無ければ `LastCommitSeqNo + 1`）を設定する。

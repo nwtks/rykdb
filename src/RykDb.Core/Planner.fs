@@ -26,7 +26,9 @@ type internal ScanMethod =
     /// 索引の等値検索
     | IndexLookup of string * SqlValue array
     /// 範囲走査（主キー / 索引の前方一致）
-    | RangeScan of string * SqlValue array * SqlValue array
+    | RangeScan of string * SqlValue array * SqlValue array option
+    /// 索引の範囲走査（索引列の値が [lower, upper] の行）
+    | IndexRangeScan of string * SqlValue * SqlValue option
 
 /// 結合アルゴリズム。
 [<RequireQualifiedAccess>]
@@ -52,10 +54,10 @@ type internal Logical =
     /// 結合。右部分木に走査方法と WHERE の pushdown 結果（Filter）を含む
     | Join of JoinKind * string * Expr * Logical * Logical
     /// 集約（groupBy + 集約リスト）
-    | Aggregate of Expr list * (AggFunc * bool * Expr) list * Logical
+    | Aggregate of Expr list * (AggFunc * bool * bool * Expr) list * Logical
     /// HAVING（集約後の述語）。第 3 引数は集約呼び出しの一覧
     /// （評価時に havingFilter に渡すため）。
-    | Having of Expr * (AggFunc * bool * Expr) list * Expr list * Logical
+    | Having of Expr * (AggFunc * bool * bool * Expr) list * Expr list * Logical
     /// DISTINCT
     | Distinct of Logical
     /// 並び替え
@@ -124,6 +126,27 @@ module internal Binder =
             match full.LastIndexOf '.' with
             | -1 -> true
             | i -> full.[0 .. i - 1] = lower)
+
+    /// 修飾子なしの列が、結合後スキーマで複数テーブルにまたがって存在するか。
+    /// そのような式はどのテーブルにも pushdown してはいけない
+    /// （各テーブルで個別に評価すると、曖昧エラーにならず意味が変わる）。
+    let hasAmbiguousColumn (schema: Schema) (e: Expr) =
+        let unqualifiedNames =
+            Expr.fold
+                (fun acc x ->
+                    match x with
+                    | Expr.Column { Qualifier = None; Name = n } -> n :: acc
+                    | Expr.Name n -> n :: acc
+                    | _ -> acc)
+                []
+                e
+
+        unqualifiedNames
+        |> List.exists (fun name ->
+            schema.Columns
+            |> Array.filter (fun (c: OutputColumn) -> Catalog.eqName c.Name name)
+            |> Array.length
+            |> fun count -> count > 1)
 
 module internal Predicate =
     /// 未処理の式のスタックを辿って `AND` を平坦化する。
@@ -198,50 +221,166 @@ module internal Analyzer =
             | _ -> None
         | _ -> None
 
-    /// 未処理の式のスタックを辿り、AND の奥にある最初の等値条件を返す。
-    [<TailCall>]
-    let rec private findEquality (tn: string) (pending: Expr list) =
-        match pending with
-        | [] -> None
-        | x :: rest ->
-            match x with
-            | Expr.Binary(BinaryOp.And, a, b) -> findEquality tn (a :: b :: rest)
+    /// WHERE の conjunct から、指定テーブルの等値条件をすべて取り出す。
+    /// キー比較では値の型も一致している必要があるため、型は後段で確認する。
+    let private equalitiesOf (tn: string) (predicates: Expr list) =
+        predicates
+        |> List.collect Predicate.splitConjuncts
+        |> List.choose (fun e ->
+            match e with
             | Expr.Binary(BinaryOp.Eq, a, b) ->
                 match colOf tn a, litOf b with
-                | Some n, Some v -> Some(n, v)
+                | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
                 | _ ->
                     match colOf tn b, litOf a with
-                    | Some n, Some v -> Some(n, v)
-                    | _ -> findEquality tn rest
-            | _ -> findEquality tn rest
+                    | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
+                    | _ -> None
+            | _ -> None)
+
+    /// 列の宣言型とリテラルの型が一致するか。
+    /// 主キー・索引は値のバイト列表現で引くため、暗黙変換できるだけでは足りない。
+    let private typeMatches (schema: TableSchema) (colName: string) (value: SqlValue) =
+        schema.Columns
+        |> List.exists (fun c -> Catalog.eqName c.Name colName && c.DataType = SqlValue.dataType value)
+
+    /// WHERE から PK 列の範囲条件を取り出す。
+    /// 戻り値は (lower, upper) の SqlValue option。lower/upper が Some なら範囲条件あり。
+    let private rangeBounds (tn: string) (colName: string) (predicates: Expr list) =
+        let rec loop (lower: SqlValue option) (upper: SqlValue option) (rest: Expr list) =
+            match rest with
+            | [] -> lower, upper
+            | e :: tail ->
+                match e with
+                | Expr.Binary(BinaryOp.Gt, a, b) ->
+                    let lower' =
+                        match colOf tn a, litOf b with
+                        | Some n, Some v when Catalog.eqName n colName -> Some v
+                        | _ -> lower
+
+                    let upper' =
+                        match colOf tn b, litOf a with
+                        | Some n, Some v when Catalog.eqName n colName -> Some v
+                        | _ -> upper
+
+                    loop lower' upper' tail
+                | Expr.Binary(BinaryOp.Ge, a, b) ->
+                    let lower' =
+                        match colOf tn a, litOf b with
+                        | Some n, Some v when Catalog.eqName n colName -> Some v
+                        | _ -> lower
+
+                    let upper' =
+                        match colOf tn b, litOf a with
+                        | Some n, Some v when Catalog.eqName n colName -> Some v
+                        | _ -> upper
+
+                    loop lower' upper' tail
+                | Expr.Binary(BinaryOp.Lt, a, b) ->
+                    let upper' =
+                        match colOf tn a, litOf b with
+                        | Some n, Some v when Catalog.eqName n colName -> Some v
+                        | _ -> upper
+
+                    let lower' =
+                        match colOf tn b, litOf a with
+                        | Some n, Some v when Catalog.eqName n colName -> Some v
+                        | _ -> lower
+
+                    loop lower' upper' tail
+                | Expr.Binary(BinaryOp.Le, a, b) ->
+                    let upper' =
+                        match colOf tn a, litOf b with
+                        | Some n, Some v when Catalog.eqName n colName -> Some v
+                        | _ -> upper
+
+                    let lower' =
+                        match colOf tn b, litOf a with
+                        | Some n, Some v when Catalog.eqName n colName -> Some v
+                        | _ -> lower
+
+                    loop lower' upper' tail
+                | Expr.Between(x, lo, hi, false) ->
+                    match colOf tn x with
+                    | Some n when Catalog.eqName n colName ->
+                        match litOf lo, litOf hi with
+                        | Some lv, Some hv -> loop (Some lv) (Some hv) tail
+                        | _ -> loop lower upper tail
+                    | _ -> loop lower upper tail
+                | _ -> loop lower upper tail
+
+        let conjuncts = predicates |> List.collect Predicate.splitConjuncts
+        loop None None conjuncts
 
     /// WHERE から等価条件を探して走査方法を決める。
+    /// 複合主キーは全列の等値条件が揃ったときだけ PkLookup にする。
     let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
-        let resolveScanMethod (colName: string) (value: SqlValue) =
-            let isPk =
-                b.Schema.PrimaryKey
-                |> List.map (fun i -> b.Schema.Columns.[i].Name)
-                |> List.exists (fun n -> Catalog.eqName n colName)
-
-            if isPk then
-                ScanMethod.PkLookup [| value |]
-            else
-                let found =
-                    Catalog.indexesOf catalog b.RealName
-                    |> List.tryFind (fun i ->
-                        match i.Columns with
-                        | [ c ] -> Catalog.eqName c colName
-                        | _ -> false)
-
-                match found with
-                | Some i -> ScanMethod.IndexLookup(i.IndexName, [| value |])
-                | None -> ScanMethod.SeqScan
-
         let name = refName b
+        let equals = equalitiesOf (name.ToLowerInvariant()) predicates
 
-        match findEquality (name.ToLowerInvariant()) predicates with
-        | None -> ret ScanMethod.SeqScan
-        | Some(colName, value) -> ret (resolveScanMethod colName value)
+        let findValue (colName: string) =
+            equals
+            |> List.tryPick (fun (n, v) ->
+                if Catalog.eqName n colName && typeMatches b.Schema n v then
+                    Some v
+                else
+                    None)
+
+        let tryIndexEquality () =
+            Catalog.indexesOf catalog b.RealName
+            |> List.tryPick (fun i ->
+                match i.Columns with
+                | [ c ] ->
+                    findValue c
+                    |> Option.map (fun v -> ScanMethod.IndexLookup(i.IndexName, [| v |]))
+                | _ -> None)
+
+        let tryIndexRange () =
+            Catalog.indexesOf catalog b.RealName
+            |> List.tryPick (fun i ->
+                match i.Columns with
+                | [ c ] ->
+                    let lo, hi = rangeBounds (name.ToLowerInvariant()) c predicates
+
+                    match lo with
+                    | Some lv when typeMatches b.Schema c lv ->
+                        let upper = hi |> Option.filter (fun v -> typeMatches b.Schema c v)
+                        Some(ScanMethod.IndexRangeScan(i.IndexName, lv, upper))
+                    | _ -> None
+                | _ -> None)
+
+        let pkNames = b.Schema.PrimaryKey |> List.map (fun i -> b.Schema.Columns.[i].Name)
+        let pkValues = pkNames |> List.map findValue
+
+        if not pkNames.IsEmpty && pkValues |> List.forall Option.isSome then
+            ret (ScanMethod.PkLookup(pkValues |> List.choose id |> Array.ofList))
+        else if pkNames.Length = 1 then
+            let pkCol = pkNames.Head
+            let lower, upper = rangeBounds (name.ToLowerInvariant()) pkCol predicates
+
+            match lower with
+            | Some lv when typeMatches b.Schema pkCol lv ->
+                let startKey = [| lv |]
+
+                let endKey =
+                    upper
+                    |> Option.filter (fun v -> typeMatches b.Schema pkCol v)
+                    |> Option.map (fun v -> [| v |])
+
+                ret (ScanMethod.RangeScan(name, startKey, endKey))
+            | _ ->
+                match tryIndexEquality () with
+                | Some m -> ret m
+                | None ->
+                    match tryIndexRange () with
+                    | Some m -> ret m
+                    | None -> ret ScanMethod.SeqScan
+        else
+            match tryIndexEquality () with
+            | Some m -> ret m
+            | None ->
+                match tryIndexRange () with
+                | Some m -> ret m
+                | None -> ret ScanMethod.SeqScan
 
 module internal Optimizer =
     /// SELECT 文を論理代数に変換する。
@@ -270,12 +409,15 @@ module internal Optimizer =
         let concatSchemas (bindings: TableBinding list) =
             bindings |> List.map Analyzer.schemaOf |> Schema.concatAll
 
-        let buildScan (catalog: Catalog) (b: TableBinding) (predicates: Expr list) =
+        let buildScan (catalog: Catalog) (allSchema: Schema) (b: TableBinding) (predicates: Expr list) =
             let name = Analyzer.refName b
-            let local = predicates |> List.filter (Predicate.isLocalTo name)
+
+            let local =
+                predicates
+                |> List.filter (fun p -> Predicate.isLocalTo name p && not (Binder.hasAmbiguousColumn allSchema p))
 
             result {
-                let! method = Analyzer.chooseScanMethod b catalog predicates
+                let! method = Analyzer.chooseScanMethod b catalog local
                 let scan = Logical.Scan(name, method)
 
                 match Predicate.joinConjuncts local with
@@ -289,17 +431,22 @@ module internal Optimizer =
                 let idx = i + 1
                 let right = bindings.[idx]
                 let leftSchema = bindings |> List.take idx |> concatSchemas
+                let allSchema = concatSchemas bindings
                 let onSchema = Schema.concat leftSchema (Analyzer.schemaOf right)
                 let! on = Binder.qualify onSchema j.On
                 let rightName = Analyzer.refName right
-                let rightPreds = predicates |> List.filter (Predicate.isLocalTo rightName)
+
+                let rightPreds =
+                    predicates
+                    |> List.filter (fun p ->
+                        Predicate.isLocalTo rightName p && not (Binder.hasAmbiguousColumn allSchema p))
 
                 match j.Kind with
                 | JoinKind.Inner ->
-                    let! rightScan = buildScan ctx.Catalog right rightPreds
+                    let! rightScan = buildScan ctx.Catalog allSchema right rightPreds
                     return Logical.Join(j.Kind, rightName, on, acc, rightScan), topPreds
                 | JoinKind.Left ->
-                    let! rightScan = buildScan ctx.Catalog right []
+                    let! rightScan = buildScan ctx.Catalog allSchema right []
                     return Logical.Join(j.Kind, rightName, on, acc, rightScan), topPreds @ rightPreds
             }
 
@@ -384,7 +531,7 @@ module internal Optimizer =
 
                 let limit =
                     match stmt.Limit with
-                    | None -> 0
+                    | None -> -1
                     | Some e -> max 0 (evalConst e)
 
                 let offset =
@@ -394,8 +541,9 @@ module internal Optimizer =
 
                 ret (Logical.Limit(offset, limit, tree))
 
-        let localToAny (bindings: TableBinding list) (p: Expr) =
-            bindings |> List.exists (fun b -> Predicate.isLocalTo (Analyzer.refName b) p)
+        let localToAny (allSchema: Schema) (bindings: TableBinding list) (p: Expr) =
+            not (Binder.hasAmbiguousColumn allSchema p)
+            && bindings |> List.exists (fun b -> Predicate.isLocalTo (Analyzer.refName b) p)
 
         result {
             let! bindings = bindTables ctx stmt
@@ -411,13 +559,14 @@ module internal Optimizer =
                     | Some w -> Binder.qualify allSchema w |> Result.map Predicate.splitConjuncts
 
                 let head = List.head bindings
-                let! firstTree = buildScan ctx.Catalog head predicates
+                let! firstTree = buildScan ctx.Catalog allSchema head predicates
                 let initial = ret (firstTree, [])
 
                 let! joined, topPreds =
                     List.fold (joinStep bindings predicates) initial (List.indexed stmt.Joins)
 
-                let cross = predicates |> List.filter (fun p -> not (localToAny bindings p))
+                let cross =
+                    predicates |> List.filter (fun p -> not (localToAny allSchema bindings p))
 
                 let filtered =
                     match Predicate.joinConjuncts (topPreds @ cross) with
@@ -455,8 +604,8 @@ module internal Optimizer =
     /// Result を消費してから次へ進む処理をクロージャではなく値として積む。
     type private ExecFrame =
         | FilterFrame of Expr * Schema
-        | AggregateFrame of Expr list * (AggFunc * bool * Expr) list * Schema
-        | HavingFrame of Expr * (AggFunc * bool * Expr) list * Expr list
+        | AggregateFrame of Expr list * (AggFunc * bool * bool * Expr) list * Schema
+        | HavingFrame of Expr * (AggFunc * bool * bool * Expr) list * Expr list
         | DistinctFrame
         | SortFrame of SortKey list * Schema
         | LimitFrame of int * int
@@ -493,7 +642,8 @@ module internal Optimizer =
         | ScanMethod.SeqScan -> ExecContext.table ctx name
         | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
         | ScanMethod.IndexLookup(indexName, values) -> ExecContext.byIndex ctx name indexName values
-        | ScanMethod.RangeScan(_, _, _) -> ExecContext.table ctx name
+        | ScanMethod.RangeScan(_, startKey, endKey) -> ExecContext.rangeScan ctx name startKey endKey
+        | ScanMethod.IndexRangeScan(indexName, lower, upper) -> ExecContext.byIndexRange ctx name indexName lower upper
 
     [<TailCall>]
     let rec private stripWrappers (tree: Logical) =
@@ -520,7 +670,7 @@ module internal Optimizer =
 
             let av =
                 aggs
-                |> List.map (fun (f, star, arg) ->
+                |> List.map (fun (f, star, _, arg) ->
                     let suffix = if star then "*" else Expr.toDisplayString arg
 
                     {
@@ -612,7 +762,7 @@ module internal Optimizer =
                     | Ok sorted -> run ctx rest (ApplyOp sorted)
                 | LimitFrame(offset, limit) ->
                     let skipped = if offset > 0 then Op.skip offset op else op
-                    let limited = if limit > 0 then Op.take limit skipped else skipped
+                    let limited = if limit >= 0 then Op.take limit skipped else skipped
                     run ctx rest (ApplyOp limited)
                 | ProjectFrame(items, childSchema, groupBy) ->
                     run ctx rest (ApplyOp(Ops.project childSchema groupBy op items))

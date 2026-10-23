@@ -208,6 +208,11 @@ module internal Expr =
                 |> DbError.internalError
             )
 
+        let rec toPairs (rest: Expr list) (acc: (Expr * Expr) list) =
+            match rest with
+            | w :: t :: tail -> toPairs tail ((w, t) :: acc)
+            | _ -> List.rev acc
+
         if List.length kids <> List.length (children e) then
             miss ()
         else
@@ -224,11 +229,6 @@ module internal Expr =
             | Expr.InList(_, _, neg), x :: xs -> ret (Expr.InList(x, xs, neg))
             | Expr.Like(_, _, neg), [ x; p ] -> ret (Expr.Like(x, p, neg))
             | Expr.Case(_, elseE), _ ->
-                let rec toPairs (rest: Expr list) (acc: (Expr * Expr) list) =
-                    match rest with
-                    | w :: t :: tail -> toPairs tail ((w, t) :: acc)
-                    | _ -> List.rev acc
-
                 match elseE, List.rev kids with
                 | None, _ -> ret (Expr.Case(toPairs kids [], None))
                 | Some _, last :: branchRev -> ret (Expr.Case(toPairs (List.rev branchRev) [], Some last))
@@ -303,13 +303,12 @@ module internal Expr =
     /// 式木を明示スタックで pre-order にたどり、各ノードについて状態を畳み込む。
     /// 走査順は「根 → 子を左から右へ」。
     let fold (f: 's -> Expr -> 's) (state: 's) (root: Expr) =
-        let pushAll (xs: 'a list) (stack: 'a list) =
-            let rec revInto acc =
-                function
-                | [] -> acc
-                | x :: rest -> revInto (x :: acc) rest
+        let rec revInto acc =
+            function
+            | [] -> acc
+            | x :: rest -> revInto (x :: acc) rest
 
-            revInto stack xs
+        let pushAll (xs: 'a list) (stack: 'a list) = revInto stack xs
 
         let rec foldStack (stack: Expr list) (acc: 's) =
             match stack with

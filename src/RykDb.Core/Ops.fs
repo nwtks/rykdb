@@ -61,6 +61,20 @@ module internal Op =
 
         rowsFrom 0
 
+    /// seq を順に返す演算子（遅延）。
+    /// 次の行は呼び出すたびに計算する。
+    /// ソース seq は純粋（副作用なし）であることを前提とする。
+    let ofSeq (rows: seq<SqlValue array>) =
+        let e = rows.GetEnumerator()
+
+        let rec rowsFrom () =
+            if e.MoveNext() then
+                Op.Compute(fun () -> ret (Some(e.Current, rowsFrom ())))
+            else
+                Op.Done
+
+        rowsFrom ()
+
     /// 1行取り出す。
     let next (op: Op) =
         match op with
@@ -186,11 +200,28 @@ module internal Ops =
             result {
                 let! plan = resolved
                 let! rows = Op.toArray src
-                let sorted = Array.sortWith (compareWith plan) rows
-                return Op.ofArray sorted
+
+                let validationError =
+                    if rows.Length <= 1 then
+                        None
+                    else
+                        plan
+                        |> List.tryPick (fun (i, _) ->
+                            rows
+                            |> Array.tryPick (fun r ->
+                                match SqlValue.compareValues rows.[0].[i] r.[i] with
+                                | Error e -> Some e
+                                | Ok _ -> None))
+
+                match validationError with
+                | Some e -> return! Error e
+                | None ->
+                    let sorted = Array.sortWith (compareWith plan) rows
+                    return Op.ofArray sorted
             }
 
-    /// 重複除去。保持する順序は最初に現れた順（SQL の DISTINCT と同じ）。
+    /// 重複除去。
+    /// 保持する順序は最初に現れた順（SQL の DISTINCT と同じ）。
     /// 既出のキーを全部覚える必要がある。
     /// 「直前のキーだけ」で比較するのは `DISTINCT` ではなく `DISTINCT ON` にしかならない
     /// （`2, 1, 2` で 2 が 2 回目に出るため、直前比較では除去できない）。
@@ -215,11 +246,11 @@ module internal Ops =
             | Expr.Star -> true
             | _ -> false
 
-        let collectAggs (e: Expr) (acc: (AggFunc * bool * Expr) list) =
+        let collectAggs (e: Expr) (acc: (AggFunc * bool * bool * Expr) list) =
             Expr.fold
                 (fun a node ->
                     match node with
-                    | Expr.AggCall(f, _, x) -> (f, isStarArg x, x) :: a
+                    | Expr.AggCall(f, distinct, x) -> (f, isStarArg x, distinct, x) :: a
                     | _ -> a)
                 acc
                 e
@@ -227,19 +258,22 @@ module internal Ops =
         exprs |> List.fold (fun acc e -> collectAggs e acc) [] |> List.rev
 
     /// 集約呼び出しの識別キー（`COUNT(age)` のような表示文字列）。
-    let private aggKey (f: AggFunc) (arg: Expr) =
-        sprintf "%s(%s)" f.Name (Expr.toDisplayString arg)
+    let private aggKey (f: AggFunc) (distinct: bool) (arg: Expr) =
+        if distinct then
+            sprintf "%s(DISTINCT %s)" f.Name (Expr.toDisplayString arg)
+        else
+            sprintf "%s(%s)" f.Name (Expr.toDisplayString arg)
 
     /// 集約後の行のスロット番号表。
     /// GROUP BY 式が先頭に、集約呼び出しがその後に並ぶ（`Ops.aggregate` の出力順）。
     /// 行に依存しないので 1クエリにつき 1回だけ作る。
-    let private aggOffsets (groupBy: Expr list) (aggs: (AggFunc * bool * Expr) list) =
+    let private aggOffsets (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
         let groupSlots =
             groupBy |> List.mapi (fun i e -> Expr.toDisplayString e, i) |> Map.ofList
 
         let aggSlots =
             aggs
-            |> List.mapi (fun i (f, _, arg) -> aggKey f arg, List.length groupBy + i)
+            |> List.mapi (fun i (f, _, distinct, arg) -> aggKey f distinct arg, List.length groupBy + i)
             |> Map.ofList
 
         Map.fold (fun acc k v -> Map.add k v acc) groupSlots aggSlots
@@ -259,8 +293,8 @@ module internal Ops =
 
         let rewriteLeaf (x: Expr) =
             match x with
-            | Expr.AggCall(f, _, arg) ->
-                match slot (aggKey f arg) with
+            | Expr.AggCall(f, distinct, arg) ->
+                match slot (aggKey f distinct arg) with
                 | Some l -> l
                 | None -> Expr.Literal Literal.Null
             | Expr.Literal l -> Expr.Literal l
@@ -279,9 +313,8 @@ module internal Ops =
     /// HAVING を張る。
     /// 集約後の行は位置のみの意味を持つので Schema.empty で評価する。
     /// offsets はクロージャを 1回作るときにだけ組み立て、行ごとに持ち越さない。
-    let havingFilter (groupBy: Expr list) (aggs: (AggFunc * bool * Expr) list) (predicate: Expr) =
+    let havingFilter (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (predicate: Expr) =
         let offsets = aggOffsets groupBy aggs
-
         fun row -> substituteAggs offsets predicate row >>= Eval.matches Schema.empty row
 
     /// 集約の 1 項目分の_accumulator。
@@ -296,13 +329,14 @@ module internal Ops =
             Min: SqlValue option
             Max: SqlValue option
             First: SqlValue option
+            Seen: SqlValue list
         }
 
     /// GROUP BY + 集約。
     /// groupBy が空でも集約があれば 1グループだけ出す。
     /// （`SELECT COUNT(*) FROM 空のテーブル` が 0 ではなく 1行を返さないと
     ///   SQL の通常の挙動と違ってしまうため）
-    let aggregate (schema: Schema) (src: Op) (groupBy: Expr list) (aggs: (AggFunc * bool * Expr) list) =
+    let aggregate (schema: Schema) (src: Op) (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
         let order = ResizeArray<string>()
 
         let table =
@@ -317,7 +351,6 @@ module internal Ops =
         let rec groupRows (rows: SqlValue array array) (i: int) =
             if i >= rows.Length then
                 let built = table |> Seq.map (fun kv -> kv.Key, List.ofSeq kv.Value) |> Map.ofSeq
-
                 Ok(List.ofSeq order, built)
             else
                 match keyOfRow rows.[i] with
@@ -343,7 +376,17 @@ module internal Ops =
                 Min = None
                 Max = None
                 First = None
+                Seen = []
             }
+
+        let addDecimal (a: decimal) (b: decimal) =
+            let maxD = System.Decimal.MaxValue
+            let minD = System.Decimal.MinValue
+
+            if a > 0M && b > 0M && a > maxD - b || a < 0M && b < 0M && a < minD - b then
+                err (DbError.constraintViolation "SUM の結果が DECIMAL の範囲を超えました")
+            else
+                ret (a + b)
 
         let keepExtreme
             (v: SqlValue)
@@ -351,52 +394,81 @@ module internal Ops =
             (bumped: Acc)
             (current: SqlValue option)
             (set: Acc -> SqlValue -> Acc)
+            (seen: SqlValue list)
             =
             match current with
-            | None -> ret (set bumped v)
+            | None -> ret (set { bumped with Seen = seen } v)
             | Some cur ->
                 SqlValue.compareValues v cur
-                |> Result.map (fun c -> if wins c then set bumped v else bumped)
+                |> Result.map (fun c ->
+                    if wins c then
+                        set { bumped with Seen = seen } v
+                    else
+                        { bumped with Seen = seen })
 
-        let addAcc (acc: Acc) (value: SqlValue option) (isStar: bool) =
-            let counted =
-                if isStar then
-                    Some SqlValue.Null
-                else
-                    match value with
-                    | Some v when not (SqlValue.isNull v) -> Some v
-                    | _ -> None
-
-            let bump = { acc with Count = acc.Count + 1L }
-
-            match counted with
-            | None -> ret acc
-            | Some v ->
-                match acc.Kind with
-                | AggFunc.Count -> ret bump
-                | AggFunc.Sum
-                | AggFunc.Avg ->
+        let addValue (acc: Acc) (bump: Acc) (v: SqlValue) (newSeen: SqlValue list) =
+            match acc.Kind with
+            | AggFunc.Count -> ret { bump with Seen = newSeen }
+            | AggFunc.Sum
+            | AggFunc.Avg ->
+                match v with
+                | SqlValue.Real f ->
+                    ret
+                        { bump with
+                            SawReal = true
+                            SumReal = acc.SumReal + f
+                            Seen = newSeen
+                        }
+                | SqlValue.Int _
+                | SqlValue.Decimal _ ->
                     match SqlValue.asNumeric v with
-                    | None ->
-                        err (
-                            sprintf "%s は数値だけを受け付けますが %s です" acc.Kind.Name (SqlLiteral.toSqlLiteral v)
-                            |> DbError.typeError
-                        )
                     | Some d ->
-                        match v with
-                        | SqlValue.Real f ->
-                            ret
-                                { bump with
-                                    SawReal = true
-                                    SumReal = acc.SumReal + f
-                                }
-                        | _ ->
-                            ret
-                                { bump with
-                                    SumDecimal = acc.SumDecimal + d
-                                }
-                | AggFunc.Min -> keepExtreme v (fun c -> c < 0) bump acc.Min (fun b x -> { b with Min = Some x })
-                | AggFunc.Max -> keepExtreme v (fun c -> c > 0) bump acc.Max (fun b x -> { b with Max = Some x })
+                        addDecimal acc.SumDecimal d
+                        |> Result.map (fun sum ->
+                            { bump with
+                                SumDecimal = sum
+                                Seen = newSeen
+                            })
+                    | None -> err (DbError.internalError "数値の変換に失敗しました（内部不整合）")
+                | _ ->
+                    err (
+                        sprintf "%s は数値だけを受け付けますが %s です" acc.Kind.Name (SqlLiteral.toSqlLiteral v)
+                        |> DbError.typeError
+                    )
+            | AggFunc.Min -> keepExtreme v (fun c -> c < 0) bump acc.Min (fun b x -> { b with Min = Some x }) newSeen
+            | AggFunc.Max -> keepExtreme v (fun c -> c > 0) bump acc.Max (fun b x -> { b with Max = Some x }) newSeen
+
+        let addAcc (acc: Acc) (value: SqlValue option) (isStar: bool) (distinct: bool) =
+            let alreadySeen =
+                distinct
+                && match value with
+                   | Some v when not (SqlValue.isNull v) -> List.contains v acc.Seen
+                   | _ -> false
+
+            if alreadySeen then
+                ret acc
+            else
+                let counted =
+                    if isStar then
+                        Some SqlValue.Null
+                    else
+                        match value with
+                        | Some v when not (SqlValue.isNull v) -> Some v
+                        | _ -> None
+
+                let bump = { acc with Count = acc.Count + 1L }
+
+                let newSeen =
+                    if distinct then
+                        match value with
+                        | Some v when not (SqlValue.isNull v) -> v :: acc.Seen
+                        | _ -> acc.Seen
+                    else
+                        acc.Seen
+
+                match counted with
+                | None -> ret { acc with Seen = newSeen }
+                | Some v -> addValue acc bump v newSeen
 
         let finishAcc (acc: Acc) =
             match acc.Kind with
@@ -415,50 +487,50 @@ module internal Ops =
             | AggFunc.Min -> defaultArg acc.Min SqlValue.Null
             | AggFunc.Max -> defaultArg acc.Max SqlValue.Null
 
-        let oneAgg members (spec: AggFunc * bool * Expr) =
-            let f, star, arg = spec
+        let add (star: bool) (distinct: bool) (arg: Expr) (acc: Acc) (row: SqlValue array) =
+            if star then
+                addAcc acc None true distinct
+            else
+                Eval.eval schema row arg >>= fun v -> addAcc acc (Some v) false distinct
+
+        let oneAgg (members: SqlValue array seq) (spec: AggFunc * bool * bool * Expr) =
+            let f, star, distinct, arg = spec
             let start = emptyAcc f
 
-            let add (acc: Acc) (row: SqlValue array) =
-                if star then
-                    addAcc acc None true
-                else
-                    Eval.eval schema row arg >>= fun v -> addAcc acc (Some v) false
+            match foldOk (add star distinct arg) start members with
+            | Ok acc -> Ok(finishAcc acc)
+            | Error e -> Error e
 
-            match foldOk add start members with
-            | Ok acc -> finishAcc acc
-            | Error _ -> SqlValue.Null
-
-        let rowOf table (k: string) =
+        let rowOf (table: Map<string, SqlValue array list>) (k: string) =
             match table |> Map.tryFind k with
-            | None -> None
+            | None -> Ok None
             | Some members ->
                 if List.isEmpty members then
-                    None
+                    Ok None
                 else
-                    let first = List.head members
+                    result {
+                        let first = List.head members
+                        let! vs = groupBy |> List.map (fun e -> Eval.eval schema first e) |> all
+                        let gv = List.toArray vs
+                        let! av = aggs |> List.map (oneAgg members) |> all
+                        return Some(Array.concat [| gv; List.toArray av |])
+                    }
 
-                    let gv =
-                        match groupBy |> List.map (fun e -> Eval.eval schema first e) |> all with
-                        | Ok vs -> List.toArray vs
-                        | Error _ -> [||]
-
-                    let av = aggs |> List.map (oneAgg members) |> List.toArray
-                    Some(Array.concat [| gv; av |])
-
-        let rec chain table (ks: string list) =
+        let rec build (table: Map<string, SqlValue array list>) (ks: string list) (acc: ResizeArray<SqlValue array>) =
             match ks with
-            | [] -> Op.Done
+            | [] -> Ok(Op.ofArray (acc.ToArray()))
             | k :: tail ->
-                Op.Compute(fun () ->
-                    match rowOf table k with
-                    | None -> Op.next (chain table tail)
-                    | Some r -> ret (Some(r, chain table tail)))
+                match rowOf table k with
+                | Error e -> Error e
+                | Ok None -> build table tail acc
+                | Ok(Some r) ->
+                    acc.Add r
+                    build table tail acc
 
         result {
             let! rows = Op.toArray src
             let! order, table = groupRows rows 0
-            return chain table order
+            return! build table order (ResizeArray<SqlValue array>())
         }
 
     /// nested loop 結合の内側ループ（1つの左行 × 右の全行）を回す共通処理。
@@ -478,19 +550,18 @@ module internal Ops =
         let joinPred (leftSchema: Schema) (rightSchema: Schema) (on: Expr) (l: SqlValue array) (r: SqlValue array) =
             Eval.matches (Schema.concat leftSchema rightSchema) (Array.append l r) on
 
-        let rec loop (matched: bool) (rs: SqlValue array array) =
-            if Array.isEmpty rs then
+        let rec loop (matched: bool) (i: int) =
+            if i >= rightRows.Length then
                 onExhausted matched
             else
-                let rrow = rs.[0]
-                let rest = rs |> Array.skip 1
+                let rrow = rightRows.[i]
 
                 match joinPred leftSchema rightSchema on lrow rrow with
-                | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, loop true rest)))
-                | Ok false -> Op.Compute(fun () -> Op.next (loop matched rest))
+                | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, loop true (i + 1))))
+                | Ok false -> Op.Compute(fun () -> Op.next (loop matched (i + 1)))
                 | Error _ -> onError matched
 
-        loop false rightRows
+        loop false 0
 
     /// INNER JOIN（nested loop）。
     /// 右側は内側ループごとに先頭から引き直す。

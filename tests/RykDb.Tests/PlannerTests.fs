@@ -302,6 +302,56 @@ let ``Analyzer: 負のリテラルは等値条件に使える`` () =
         Assert.Equal<ScanMethod>(ScanMethod.SeqScan, ok (Analyzer.chooseScanMethod b Catalog.empty [ negText ])))
 
 [<Fact>]
+let ``Analyzer: 複合主キーは全列一致のときだけ PkLookup`` () =
+    withStore "an-comp" (fun store ->
+        let schema =
+            {
+                Name = "pairs"
+                Columns =
+                    [
+                        pkCol "a" DataType.Integer
+                        pkCol "b" DataType.Integer
+                        col "v" DataType.Text
+                    ]
+                PrimaryKey = [ 0; 1 ]
+                Indexes = []
+            }
+
+        let ctx = ExecContext.withSchema (ExecContext.create store None) "pairs" schema
+        let b = ok (Analyzer.bindTable ctx { Name = "pairs"; Alias = None })
+
+        let eq name value =
+            Expr.Binary(
+                BinaryOp.Eq,
+                Expr.Column
+                    {
+                        Qualifier = Some "pairs"
+                        Name = name
+                    },
+                Expr.Literal value
+            )
+
+        // 列の順序が逆でも主キー順に組み立てる
+        let preds = [ eq "b" (Literal.Int 2L); eq "a" (Literal.Int 1L) ]
+
+        match ok (Analyzer.chooseScanMethod b Catalog.empty preds) with
+        | ScanMethod.PkLookup values ->
+            Assert.Equal<int>(2, values.Length)
+            Assert.Equal<int64>(1L, asInt values.[0])
+            Assert.Equal<int64>(2L, asInt values.[1])
+        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
+
+        // 部分一致は全走査
+        match ok (Analyzer.chooseScanMethod b Catalog.empty [ eq "a" (Literal.Int 1L) ]) with
+        | ScanMethod.SeqScan -> ()
+        | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m)
+
+        // キー列の型と違うリテラルは全走査（比較時に型エラーにする）
+        match ok (Analyzer.chooseScanMethod b Catalog.empty [ eq "a" (Literal.String "1") ]) with
+        | ScanMethod.SeqScan -> ()
+        | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m))
+
+[<Fact>]
 let ``末尾再帰: 20 万段の AND を chooseScanMethod してもスタックを食わない`` () =
     withStore "an8" (fun store ->
         let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
@@ -523,7 +573,7 @@ let ``Planner: 定数でない LIMIT と OFFSET だけの指定`` () =
         let plain =
             selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
 
-        // LIMIT が非リテラル → 0（制限なし）として扱う
+        // LIMIT が非リテラル → 0（0 行）として扱う
         let stmt1 =
             { plain with
                 Limit = Some(Expr.Column { Qualifier = None; Name = "nope" })
@@ -533,14 +583,14 @@ let ``Planner: 定数でない LIMIT と OFFSET だけの指定`` () =
         | Logical.Limit(0, 0, _) -> ()
         | other -> Assert.Fail(sprintf "LIMIT が 0 になっていない: %A" other)
 
-        // OFFSET だけ指定（Limit = None の分岐）
+        // OFFSET だけ指定（Limit = None の分岐）→ limit = -1（制限なし）
         let stmt2 =
             { plain with
                 Offset = Some(Expr.Literal(Literal.Int 3L))
             }
 
         match ok (Optimizer.buildLogical ctx stmt2) with
-        | Logical.Limit(3, 0, _) -> ()
+        | Logical.Limit(3, -1, _) -> ()
         | other -> Assert.Fail(sprintf "OFFSET が 3 になっていない: %A" other))
 
 [<Fact>]
@@ -580,7 +630,10 @@ let ``Optimizer.exec: RangeScan は全走査へ落ちる`` () =
 
         // 範囲走査はまだ Plan からは作られない（現状は全走査と同じ）
         let tree =
-            Logical.Scan("people", ScanMethod.RangeScan("ix_people_age", [| SqlValue.Int 1L |], [| SqlValue.Int 9L |]))
+            Logical.Scan(
+                "people",
+                ScanMethod.RangeScan("ix_people_age", [| SqlValue.Int 1L |], Some [| SqlValue.Int 9L |])
+            )
 
         let rows = ok (Op.toArray (ok (Optimizer.exec ctx tree schema)))
         Assert.Empty(rows))

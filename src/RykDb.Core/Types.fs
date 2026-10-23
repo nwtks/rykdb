@@ -182,15 +182,21 @@ module internal SqlValue =
         | SqlValue.Null -> true
         | _ -> false
 
+    /// REAL が decimal へ安全に変換できる範囲かを返す。
+    /// 変換自体が例外を送出し得るため、境界判定をここへ集約する。
+    let inline private fitsDecimal (f: float) =
+        not (System.Double.IsNaN f || System.Double.IsInfinity f)
+        && System.Math.Abs f <= 7.9e28
+
     /// 数値として取り出す。
     /// 非数値なら None。
-    /// NaOf と ±Infinity は decimal に表現できないので None を返す
+    /// NaN と ±Infinity、および decimal の範囲外の REAL は None を返す
     /// （System.Decimal の変換は例外を送出するため）。
     let asNumeric v =
         match v with
         | SqlValue.Int i -> Some(decimal i)
-        | SqlValue.Real f when System.Double.IsNaN f || System.Double.IsInfinity f -> None
-        | SqlValue.Real f -> Some(decimal f)
+        | SqlValue.Real f when fitsDecimal f -> Some(decimal f)
+        | SqlValue.Real _ -> None
         | SqlValue.Decimal d -> Some d
         | _ -> None
 
@@ -224,6 +230,30 @@ module internal SqlValue =
     /// NULL は比較不能として例外を投げる。
     /// NaN は NaN と等しく、かつ他のすべての数値より大きいものとして扱う。
     let compareValues (a: SqlValue) (b: SqlValue) =
+        let decimalOf =
+            function
+            | SqlValue.Int i -> decimal i
+            | SqlValue.Decimal d -> d
+            | _ -> 0M
+
+        let floatOf =
+            function
+            | SqlValue.Int i -> float i
+            | SqlValue.Decimal d -> float d
+            | SqlValue.Real f -> f
+            | _ -> 0.0
+
+        /// decimal の精度に収まる REAL は decimal で比較し、
+        /// 範囲外・極小の REAL は float で比較する。
+        /// どちらも値の大小関係は保たれる。
+        let compareReal (f: float) (other: SqlValue) =
+            if System.Double.IsNaN f || System.Double.IsInfinity f then
+                err (DbError.typeError "NaN や ±Infinity は数値比較できません")
+            elif fitsDecimal f && (f = 0.0 || System.Math.Abs f >= 1e-28) then
+                Ok(compare (decimal f) (decimalOf other))
+            else
+                Ok(compare f (floatOf other))
+
         let compareNumeric (a: SqlValue) (b: SqlValue) =
             match a, b with
             | SqlValue.Real fa, SqlValue.Real fb ->
@@ -235,12 +265,9 @@ module internal SqlValue =
                     Ok -1
                 else
                     Ok(compare fa fb)
-            | _ ->
-                match asNumeric a, asNumeric b with
-                | Some da, Some db -> Ok(compare da db)
-                | Some _, None -> err (DbError.typeError "NaN や ±Infinity は数値比較できません")
-                | None, Some _ -> err (DbError.typeError "NaN や ±Infinity は数値比較できません")
-                | None, None -> err (DbError.internalError "数値比較の分岐に到達しませんでした（内部不整合）")
+            | SqlValue.Real fa, _ -> compareReal fa b
+            | _, SqlValue.Real fb -> compareReal fb a |> Result.map (fun c -> -c)
+            | _ -> Ok(compare (decimalOf a) (decimalOf b))
 
         match a, b with
         | SqlValue.Null, _
@@ -284,6 +311,12 @@ module internal SqlValue =
         | SqlValue.Decimal d -> d.ToString System.Globalization.CultureInfo.InvariantCulture
         | SqlValue.Uuid g -> g.ToString("D", System.Globalization.CultureInfo.InvariantCulture)
 
+    [<Literal>]
+    let private Int64MinAsFloat = -9223372036854775808.0
+
+    [<Literal>]
+    let private Int64MaxAsFloat = 9223372036854775808.0
+
     /// 暗黙変換。
     /// SQL の通常の型強制の規則を表す。
     /// 変換できない場合は型エラーを返す。
@@ -296,7 +329,7 @@ module internal SqlValue =
 
         let isDecimalRepresentable v =
             match v with
-            | SqlValue.Real f -> not (System.Double.IsNaN f || System.Double.IsInfinity f)
+            | SqlValue.Real f -> fitsDecimal f
             | _ -> true
 
         let asBoolean (v: SqlValue) =
@@ -315,9 +348,16 @@ module internal SqlValue =
             | SqlValue.Real f when
                 not (System.Double.IsNaN f || System.Double.IsInfinity f)
                 && System.Math.Truncate f = f
+                && f >= Int64MinAsFloat
+                && f < Int64MaxAsFloat
                 ->
                 Ok(SqlValue.Int(int64 f))
-            | SqlValue.Decimal d when System.Decimal.Truncate d = d -> Ok(SqlValue.Int(int64 d))
+            | SqlValue.Decimal d when
+                System.Decimal.Truncate d = d
+                && d >= decimal System.Int64.MinValue
+                && d <= decimal System.Int64.MaxValue
+                ->
+                Ok(SqlValue.Int(int64 d))
             | _ -> fail ()
 
         let asReal (v: SqlValue) =

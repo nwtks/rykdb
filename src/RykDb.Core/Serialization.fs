@@ -394,22 +394,21 @@ module internal OrderPreserving =
                     return v, c
             }
 
-        let readEscapedPayload (c: Cursor) =
-            let rec unescape c acc =
-                let finish c =
-                    Ok(List.rev acc |> List.toArray, { c with Pos = c.Pos - 1 })
+        let rec unescape (c: Cursor) (acc: byte list) =
+            let finish c =
+                Ok(List.rev acc |> List.toArray, { c with Pos = c.Pos - 1 })
 
+            match Reader.readByte c with
+            | Error e -> Error e
+            | Ok(b, c) when b <> Terminator -> unescape c (b :: acc)
+            | Ok(_, c) when Cursor.atEnd c -> finish c
+            | Ok(_, c) ->
                 match Reader.readByte c with
                 | Error e -> Error e
-                | Ok(b, c) when b <> Terminator -> unescape c (b :: acc)
-                | Ok(_, c) when Cursor.atEnd c -> finish c
-                | Ok(_, c) ->
-                    match Reader.readByte c with
-                    | Error e -> Error e
-                    | Ok(EscapeMarker, c) -> unescape c (Terminator :: acc)
-                    | Ok(_, _) -> finish c
+                | Ok(EscapeMarker, c) -> unescape c (Terminator :: acc)
+                | Ok(_, _) -> finish c
 
-            unescape c []
+        let readEscapedPayload (c: Cursor) = unescape c []
 
         result {
             let! tag, c = Reader.readByte start

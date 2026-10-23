@@ -187,8 +187,16 @@ module internal Catalog =
                 let! name, c1 = Reader.readStr c
                 let! tag, c2 = Reader.readByte c1
                 let! flags, c3 = Reader.readByte c2
-                let! _, c4 = Reader.readLengthPrefixed c3
+                let! defaultText, c4 = Reader.readStr c3
                 let! dt = DataType.fromTag tag
+
+                let! defaultExpr =
+                    if defaultText = "" then
+                        ret None
+                    else
+                        match Parser.parseExpression defaultText with
+                        | Ok e -> ret (Some e)
+                        | Error e -> err (DbError.corruption (sprintf "DEFAULT 式を復元できません: %s" e.Message))
 
                 return
                     {
@@ -200,7 +208,7 @@ module internal Catalog =
                                 NotNull = flags &&& 1uy <> 0uy
                                 PrimaryKey = flags &&& 2uy <> 0uy
                                 Unique = flags &&& 4uy <> 0uy
-                                Default = None
+                                Default = defaultExpr
                             }
                     },
                     c4
@@ -297,12 +305,12 @@ module internal Catalog =
 
             let stale =
                 rows
-                |> Array.choose (fun (key, v) ->
+                |> Seq.choose (fun (key, v) ->
                     match v with
                     | Some _ when isWanted key -> None
                     | Some _ -> Some key
                     | None -> None)
-                |> Array.toList
+                |> Seq.toList
 
             if List.isEmpty stale then
                 return updated
@@ -343,4 +351,5 @@ module internal Catalog =
                             | Ok i -> decodeRows tail (addIndex acc i)
                         | None -> decodeRows tail acc
 
-        RowStore.scan store keyspace [||] 0 >>= fun rows -> decodeRows rows empty
+        RowStore.scan store keyspace [||] 0
+        >>= fun rows -> decodeRows (Seq.toArray rows) empty

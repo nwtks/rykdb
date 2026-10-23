@@ -55,7 +55,8 @@ module internal DbStateOps =
     let commitToStore (store: RowStore) (mgr: TransactionManager) (txn: Transaction) =
         result {
             let! manager, _, batches = TransactionManager.commit mgr txn
-            let! next = RowStore.writeBatches store batches
+            let snapshot = TransactionManager.activeSnapshot manager
+            let! next = RowStore.writeBatchesWithSnapshot snapshot store batches
             return next, manager
         }
 
@@ -119,7 +120,7 @@ module internal DmlOps =
         (matched: SqlValue array -> Result<bool, DbError>)
         (onRow: Transaction -> int -> SqlValue array -> Result<Transaction * int, DbError>)
         =
-        Dml.scanByPrimaryKey ctx.Store schema ctx.Visible 0
+        Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn 0
         >>= foldOk (fun (t, c) row -> matched row >>= fun keep -> if keep then onRow t c row else ret (t, c)) (txn, 0)
 
     /// gather で埋まった `(列位置, 値)` の対を、列順の行へ戻す。
@@ -135,8 +136,46 @@ module internal DmlOps =
     /// columns が None ならテーブル定義の順に並べる。
     /// DEFAULT / NULL の充足と型強制はここで行う。
     /// TableSchema.validateRow が NOT NULL と型を最終確認する。
-    let insert (schema: TableSchema) (txn: Transaction) (columns: string list option) (rows: Expr list list) =
+    let insert
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (txn: Transaction)
+        (columns: string list option)
+        (rows: Expr list list)
+        =
         let evalConstant (e: Expr) = Eval.eval Schema.empty [||] e
+
+        let indexValues (index: IndexSchema) (row: SqlValue array) =
+            index.Columns
+            |> List.map (fun name -> row.[TableSchema.indexOf schema name])
+            |> List.toArray
+
+        let rec check (row: SqlValue array) (pk: SqlValue array) (indexes: IndexSchema list) =
+            match indexes with
+            | [] -> ret ()
+            | idx :: rest ->
+                let values = indexValues idx row
+
+                match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txn values 1 with
+                | Error e -> Error e
+                | Ok rows ->
+                    if
+                        rows
+                        |> Seq.exists (fun r ->
+                            let existingPk = TableSchema.primaryKeyOf schema r
+                            not (Array.forall2 (=) existingPk pk))
+                    then
+                        err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                    else
+                        check row pk rest
+
+        let checkUnique (txn: Transaction) (row: SqlValue array) =
+            let pk = TableSchema.primaryKeyOf schema row
+
+            match Dml.getByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn pk with
+            | Error e -> Error e
+            | Ok(Some _) -> err (DbError.constraintViolation (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name))
+            | Ok None -> check row pk (schema.Indexes |> List.filter _.Unique)
 
         let buildRow idxs width (values: Expr list) =
             if List.length values <> List.length idxs then
@@ -165,6 +204,7 @@ module internal DmlOps =
                 (fun (txnAcc, count) values ->
                     result {
                         let! row = buildRow idxs schema.Columns.Length values
+                        do! checkUnique txnAcc row
                         let! t = Dml.insert schema txnAcc row
                         return t, count + 1
                     })
@@ -185,6 +225,33 @@ module internal DmlOps =
             gatherWith (Eval.eval targetSchema row) schema (List.map snd assignments) targets
             |> Result.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
 
+        let rec checkUniqueUpdate
+            (txnAcc: Transaction)
+            (newRow: SqlValue array)
+            (newPk: SqlValue array)
+            (indexes: IndexSchema list)
+            =
+            match indexes with
+            | [] -> ret ()
+            | idx :: rest ->
+                let values =
+                    idx.Columns
+                    |> List.map (fun name -> newRow.[TableSchema.indexOf schema name])
+                    |> List.toArray
+
+                match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txnAcc values 1 with
+                | Error e -> Error e
+                | Ok rows ->
+                    if
+                        rows
+                        |> Seq.exists (fun r ->
+                            let existingPk = TableSchema.primaryKeyOf schema r
+                            not (Array.forall2 (=) existingPk newPk))
+                    then
+                        err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                    else
+                        checkUniqueUpdate txnAcc newRow newPk rest
+
         let targetSchema = targetSchemaOf schema
 
         assignments
@@ -195,7 +262,8 @@ module internal DmlOps =
                 result {
                     let! newRow = assign targetSchema targets row
                     let pk = TableSchema.primaryKeyOf schema row
-
+                    let newPk = TableSchema.primaryKeyOf schema newRow
+                    do! checkUniqueUpdate txnAcc newRow newPk (schema.Indexes |> List.filter _.Unique)
                     let! t = Dml.updateByPrimaryKey ctx.Store schema ctx.Visible txnAcc pk newRow
                     return t, count + 1
                 })
@@ -235,7 +303,33 @@ module internal Ddl =
             result {
                 let! schema = TableSchema.ofCreateTable c
                 let defn = Catalog.toDefinition schema
-                return! saved state (Catalog.addTable state.Catalog defn)
+
+                let implicitUniqueCols =
+                    (schema.Columns
+                     |> List.filter (fun col -> col.Constraint.Unique)
+                     |> List.map (fun col -> [ col.Name ]))
+                    @ (c.Constraints
+                       |> List.choose (fun tc ->
+                           match tc with
+                           | TableConstraint.UniqueColumns cols -> Some cols
+                           | _ -> None))
+
+                let implicitIndexes =
+                    implicitUniqueCols
+                    |> List.mapi (fun i cols ->
+                        {
+                            IndexName = sprintf "__unique_%s_%d" c.Name i
+                            TableName = c.Name
+                            Columns = cols
+                            Unique = true
+                        })
+
+                let catalog1 = Catalog.addTable state.Catalog defn
+
+                let catalog2 =
+                    implicitIndexes |> List.fold (fun cat idx -> Catalog.addIndex cat idx) catalog1
+
+                return! saved state catalog2
             }
 
     let createIndex (state: DbState) (ci: CreateIndex) =
@@ -338,14 +432,15 @@ module internal Engine =
             | Error _ -> ExecContext.withCatalog ctx state.Catalog
 
         let contextOf (state: DbState) (txn: Transaction) =
-            let ctx = Snapshot.toVisible txn.Snapshot |> ExecContext.create state.Store
+            let ctx = ExecContext.create state.Store (Snapshot.toVisible txn.Snapshot)
+            let ctx = ExecContext.withTransaction ctx txn
 
             state.Catalog.Tables
             |> List.fold addTable (ExecContext.withCatalog ctx state.Catalog)
 
         let runInsert (ctx: ExecContext) (st: InsertStatement) (txn: Transaction) =
             ExecContext.schemaOf ctx st.Table.Name
-            >>= fun schema -> DmlOps.insert schema txn st.Columns st.Rows
+            >>= fun schema -> DmlOps.insert ctx schema txn st.Columns st.Rows
 
         let runUpdate (ctx: ExecContext) (st: UpdateStatement) (txn: Transaction) =
             ExecContext.schemaOf ctx st.Table.Name

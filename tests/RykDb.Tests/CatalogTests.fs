@@ -129,6 +129,43 @@ let ``Catalog: 保存したカタログを読み込める`` () =
         Assert.Equal<string>("people", loaded.Indexes.[0].TableName))
 
 [<Fact>]
+let ``Catalog: DEFAULT 式は保存・再読込しても復元される`` () =
+    withStore "cat-default" (fun store ->
+        let defaultCol name dt value =
+            { col name dt with
+                Constraint =
+                    { ColumnConstraint.Empty with
+                        Default = Some value
+                    }
+            }
+
+        let defn =
+            {
+                Name = "t"
+                Columns =
+                    [
+                        pkCol "id" DataType.Integer
+                        defaultCol "v" DataType.Integer (Expr.Literal(Literal.Int 42L))
+                        defaultCol "s" DataType.Text (Expr.Literal(Literal.String "it's"))
+                    ]
+                PrimaryKeyColumns = [ "id" ]
+            }
+
+        let store = ok (Catalog.save store (Catalog.addTable Catalog.empty defn))
+        let loaded = ok (Catalog.load store)
+
+        match Catalog.findTable loaded "t" with
+        | None -> Assert.Fail("テーブルが読み込まれていません")
+        | Some t ->
+            let defaults =
+                t.Columns
+                |> List.map (fun c -> Option.map Expr.toDisplayString c.Constraint.Default)
+                |> List.tail
+
+            Assert.Equal<string option>(Some "42", defaults.[0])
+            Assert.Equal<string option>(Some "'it''s'", defaults.[1]))
+
+[<Fact>]
 let ``Catalog.save: カタログ外のエントリは保存時に掃除される`` () =
     withStore "cat-sweep" (fun store ->
         let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s
@@ -154,7 +191,7 @@ let ``Catalog.load: 未知のキーや不正な値は読み飛ばす`` () =
         // 有効なテーブルを保存しておき、その値を TEXT として持ち直して読ませる
         let people = Catalog.toDefinition peopleSchema
         let store = ok (Catalog.save store (Catalog.addTable Catalog.empty people))
-        let raw = ok (RowStore.scan store "__catalog__" [||] 0)
+        let raw = ok (RowStore.scan store "__catalog__" [||] 0) |> Seq.toArray
 
         let value =
             match raw.[0] with

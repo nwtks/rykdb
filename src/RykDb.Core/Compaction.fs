@@ -15,6 +15,8 @@ type internal CompactionOptions =
     {
         /// 各レベルの上限。L1 から L6 まで 10 倍ずつ。
         MaxLevelBytes: int64 array
+        /// L0 のファイル数がこの数以上になったら L0 → L1 の compaction を行う
+        L0CompactionTrigger: int
         /// 1回の compaction で入力するファイル数の上限
         MaxInputFiles: int
         /// このレベル以下（最下位側）へ降ろす compaction で tombstone を消すか（既定値 = 最下位）
@@ -25,7 +27,7 @@ type internal CompactionOptions =
 
 module internal CompactionOptions =
     /// 既定値。
-    /// L0 は閾値を持たない（flush の出力先なので無制限）。
+    /// L0 はファイル数が L0CompactionTrigger に達したら L1 へ compaction する。
     let defaults =
         let mib = 1024L * 1024L
 
@@ -42,6 +44,7 @@ module internal CompactionOptions =
 
         {
             MaxLevelBytes = limits
+            L0CompactionTrigger = 4
             MaxInputFiles = 32
             DropTombstonesBelowLevel = Levels.Max
             BloomFalsePositiveRate = 0.01
@@ -90,12 +93,12 @@ module internal Compaction =
                     ]
 
                 let droppedVersions = count - 1 - older.Length
-                let keepNewest = if e.IsDelete && dropTombstones then false else true
+                let keepNewest = not (e.IsDelete && dropTombstones && List.isEmpty older)
                 let dv' = dv + droppedVersions
-                let dt' = dt + if e.IsDelete then droppedVersions else 0
-                let acc', dt'' = if not keepNewest then acc, dt' + 1 else e :: acc, dt'
-                let acc''' = List.fold (fun a o -> o :: a) acc' older
-                collectKept acc''' ge dv' dt''
+                let dt' = if keepNewest then dt else dt + 1
+                let acc' = if keepNewest then e :: acc else acc
+                let acc'' = List.fold (fun a o -> o :: a) acc' older
+                collectKept acc'' ge dv' dt'
 
         let kept, dv, dt = collectKept [] 0 0 0
         kept |> List.toArray, dv, dt
@@ -114,21 +117,23 @@ module internal Compaction =
         }
 
     /// コンパクション候補を選ぶ。
-    /// 1段目のレベルから閾値を超えたら、そのレベル全体＋1 段下の全ファイルを入力とする。
+    /// L0 はファイル数、L1 以降は総バイト数が閾値を超えた最初のレベルを選び、
+    /// そのレベル全体＋1 段下の全ファイルを入力とする。
     /// key 範囲の重なり計算は Compaction 側で行う。
-    let private pickCompaction (v: Version) (maxLevelSize: int64 array) =
-        let rec find level =
-            if level > Levels.Max then
-                None
+    let private pickCompaction (v: Version) (options: CompactionOptions) =
+        let exceeded level =
+            if level = 0 then
+                let count = v.Files.[0].Length
+                count > 0 && count >= options.L0CompactionTrigger
             else
-                let total = v.Files.[level] |> Array.sumBy _.Size
+                v.Files.[level] |> Array.sumBy _.Size > options.MaxLevelBytes.[level]
 
-                if total > maxLevelSize.[level] then
-                    Some level
-                else
-                    find (level + 1)
+        let rec find level =
+            if level > Levels.Max then None
+            elif exceeded level then Some level
+            else find (level + 1)
 
-        match find 1 with
+        match find 0 with
         | None -> None
         | Some level ->
             let grandParents =
@@ -163,7 +168,7 @@ module internal Compaction =
                 && Bytes.compare f.Largest g.Smallest >= 0)
 
         let selectInputs (version: Version) (level: int) (maxFiles: int) =
-            let inputs = Version.filesAt version level |> Array.toList
+            let inputs = Version.filesAt version level |> Array.toList |> List.truncate maxFiles
             let nextLevel = level + 1
 
             let next =
@@ -175,7 +180,7 @@ module internal Compaction =
                     |> List.filter (overlapsWith inputs)
                     |> List.truncate maxFiles
 
-            inputs |> List.truncate maxFiles, next, nextLevel
+            inputs, next, nextLevel
 
         let readAll (rest: FileMetaData list) =
             rest
@@ -216,10 +221,10 @@ module internal Compaction =
             else
                 let chunks = SstEntry.splitInto (options.MaxInputFiles * 4) cleaned
 
-                match writeChunks chunks outputLevel with
-                | Error e -> Error e
-                | Ok added ->
-                    ret (
+                result {
+                    let! added = writeChunks chunks outputLevel
+
+                    return
                         {
                             Added = added
                             Removed = []
@@ -227,22 +232,20 @@ module internal Compaction =
                             DroppedTombstones = droppedTombstones
                         },
                         info
-                    )
+                }
 
         let compactPlan (plan: CompactionPlan) =
             let inputs, nextFiles, _ = selectInputs version plan.Level options.MaxInputFiles
             let allInputs = inputs @ nextFiles
 
-            match readAll allInputs with
-            | Error e -> Error e
-            | Ok sources ->
-                match finish sources plan.OutputLevel with
-                | Error e -> Error e
-                | Ok(result, info) ->
-                    let final = { result with Removed = allInputs }
-                    ret (final, info)
+            result {
+                let! sources = readAll allInputs
+                let! result, info = finish sources plan.OutputLevel
+                let final = { result with Removed = allInputs }
+                return final, info
+            }
 
-        match pickCompaction version options.MaxLevelBytes with
+        match pickCompaction version options with
         | Some plan -> compactPlan plan
         | None ->
             ret (

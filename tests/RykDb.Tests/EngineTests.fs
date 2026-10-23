@@ -17,30 +17,31 @@ let private peopleSchema: TableSchema =
         Name = "people"
         Columns =
             [
-                TestHelpers.col "id" DataType.Integer
-                TestHelpers.col "name" DataType.Text
-                TestHelpers.col "age" DataType.Integer
+                col "id" DataType.Integer
+                col "name" DataType.Text
+                col "age" DataType.Integer
             ]
         PrimaryKey = [ 0 ]
         Indexes = []
     }
 
 let private ctxOf (store: RowStore) =
-    ExecContext.create store (Snapshot.noLimit)
+    ExecContext.create store Snapshot.noLimit
 
 /// commit して store へ流し込む。引き継いだ TransactionManager を返す。
 let private commitInto (store: RowStore) (mgr: TransactionManager) (txn: Transaction) =
-    let (mgr2, _, batches) = ok (TransactionManager.commit mgr txn)
+    let mgr2, _, batches = ok (TransactionManager.commit mgr txn)
     ok (RowStore.writeBatches store batches) |> ignore
     mgr2
 
 /// alice(20) / bob(30) の 2 行を入れて commit する（UPDATE / DELETE の土台）。
 let private seedPeople (store: RowStore) (mgr: TransactionManager) =
-    let (mgr, txn) = TransactionManager.beginTxn mgr
+    let mgr, txn = TransactionManager.beginTxn mgr
 
-    let (txn, _) =
+    let txn, _ =
         ok (
             DmlOps.insert
+                (ctxOf store)
                 peopleSchema
                 txn
                 None
@@ -69,7 +70,6 @@ let ``末尾再帰: 多数の列を持つ INSERT / UPDATE が完了する`` () =
     // >>= fun … -> gather …` で列の数だけフレームが積まれていた
     // （→ StackOverflow / exit 134）。`match` で受けて末尾再帰にしてある。
     let cols = 2_000
-
     let names = Array.init cols (fun i -> sprintf "c%d" i)
 
     // 主キーは必須（無いと CREATE TABLE 自体がエラーになる）。
@@ -84,7 +84,6 @@ let ``末尾再帰: 多数の列を持つ INSERT / UPDATE が完了する`` () =
     withDb "tail-gather" (fun db0 ->
         let db1 = exec db0 (sprintf "CREATE TABLE wide (%s)" decls)
         let db2 = exec db1 (sprintf "INSERT INTO wide (%s) VALUES (%s)" colList values)
-
         let inserted = query db2 "SELECT * FROM wide"
         Assert.Equal(1, inserted.Rows.Length)
         Assert.Equal(cols, inserted.Columns.Length)
@@ -98,7 +97,6 @@ let ``末尾再帰: 多数の列を持つ INSERT / UPDATE が完了する`` () =
 
         let db3 = exec db2 (sprintf "UPDATE wide SET %s" sets)
         let updated = query db3 (sprintf "SELECT c0, c%d FROM wide" (cols - 1))
-
         Assert.Equal(1, updated.Rows.Length)
         Assert.Equal<int64>(0L, asInt updated.Rows.[0].[0])
         Assert.Equal<int64>(int64 cols, asInt updated.Rows.[0].[1]))
@@ -107,11 +105,12 @@ let ``末尾再帰: 多数の列を持つ INSERT / UPDATE が完了する`` () =
 let ``DML: INSERT は行を追加する`` () =
     withStore "ins" (fun store ->
         let mgr = TransactionManager.create ()
-        let (mgr, txn) = TransactionManager.beginTxn mgr
+        let mgr, txn = TransactionManager.beginTxn mgr
 
-        let (txn, n) =
+        let txn, n =
             ok (
                 DmlOps.insert
+                    (ctxOf store)
                     peopleSchema
                     txn
                     (Some [ "id"; "name" ])
@@ -121,21 +120,21 @@ let ``DML: INSERT は行を追加する`` () =
         Assert.Equal<int>(1, n)
 
         commitInto store mgr txn |> ignore
-
-        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
+        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0) |> Seq.toArray
         Assert.Equal<int>(1, rows.Length)
-        Assert.Equal("alice", asText (rows.[0].[1])))
+        Assert.Equal("alice", asText rows.[0].[1]))
 
 [<Fact>]
 let ``DML: INSERT は列順を明示できる`` () =
     withStore "inscols" (fun store ->
         let mgr = TransactionManager.create ()
-        let (mgr, txn) = TransactionManager.beginTxn mgr
+        let mgr, txn = TransactionManager.beginTxn mgr
 
         // name, id の順で渡す
-        let (txn, _) =
+        let txn, _ =
             ok (
                 DmlOps.insert
+                    (ctxOf store)
                     peopleSchema
                     txn
                     (Some [ "name"; "id" ])
@@ -143,22 +142,20 @@ let ``DML: INSERT は列順を明示できる`` () =
             )
 
         commitInto store mgr txn |> ignore
-
-        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
+        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0) |> Seq.toArray
         Assert.Equal<int64>(7L, asInt rows.[0].[0])
-        Assert.Equal("carol", asText (rows.[0].[1]))
+        Assert.Equal("carol", asText rows.[0].[1])
         // 指定されなかった列は NULL
         Assert.True(SqlValue.isNull rows.[0].[2]))
 
 [<Fact>]
 let ``DML: INSERT の列数不一致はエラー`` () =
-    withStore "insbad" (fun _ ->
+    withStore "insbad" (fun store ->
+        let _ = ctxOf store
         let mgr = TransactionManager.create ()
-        let mgr, txn = TransactionManager.beginTxn mgr
-
+        let _, txn = TransactionManager.beginTxn mgr
         let bad = [ [ Expr.Literal(Literal.Int 1L); Expr.Literal(Literal.String "x") ] ]
-
-        expectError "列数不一致が OK になっています" (DmlOps.insert peopleSchema txn (Some [ "id" ]) bad))
+        expectError "列数不一致が OK になっています" (DmlOps.insert (ctxOf store) peopleSchema txn (Some [ "id" ]) bad))
 
 [<Fact>]
 let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
@@ -167,12 +164,11 @@ let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
 
         // まず 2 行入れる
         let mgr0 = seedPeople store (TransactionManager.create ())
-
         // age が 25 以上の行の age を 1 増やす。mgr0 を引き継ぐ
         //（新しい TransactionManager は SeqNo が 1 から始まり、更新が消える）。
-        let (mgr1, txn1) = TransactionManager.beginTxn mgr0
+        let mgr1, txn1 = TransactionManager.beginTxn mgr0
 
-        let (txn1, n) =
+        let txn1, n =
             ok (
                 DmlOps.update
                     ctx
@@ -183,13 +179,11 @@ let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
             )
 
         Assert.Equal<int>(1, n)
+
         commitInto store mgr1 txn1 |> ignore
-
-        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
-
+        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0) |> Seq.toArray
         // 1 行目は age 20（WHERE に合わないので変更なし）
         Assert.Equal<int64>(20L, asInt rows.[0].[2])
-
         // 2 行目は 30 -> 31
         Assert.Equal<int64>(31L, asInt rows.[1].[2]))
 
@@ -208,25 +202,25 @@ let ``StatementResult: 表示行はヘッダ・区切り・行を並べる`` () 
 
 [<Fact>]
 let ``DML: INSERT の値の評価失敗はエラー`` () =
-    withStore "ins-eval" (fun _ ->
+    withStore "ins-eval" (fun store ->
+        let _ = ctxOf store
         let mgr = TransactionManager.create ()
-        let mgr, txn = TransactionManager.beginTxn mgr
+        let _, txn = TransactionManager.beginTxn mgr
 
         // 定数式として評価できない列参照
         let bad = [ [ col "nope" ] ]
-
-        expectError "評価できない式が OK になっています" (DmlOps.insert peopleSchema txn (Some [ "id" ]) bad))
+        expectError "評価できない式が OK になっています" (DmlOps.insert (ctxOf store) peopleSchema txn (Some [ "id" ]) bad))
 
 [<Fact>]
 let ``DML: INSERT の型強制失敗はエラー`` () =
-    withStore "ins-coerce" (fun _ ->
+    withStore "ins-coerce" (fun store ->
+        let _ = ctxOf store
         let mgr = TransactionManager.create ()
-        let mgr, txn = TransactionManager.beginTxn mgr
+        let _, txn = TransactionManager.beginTxn mgr
 
         // INTEGER 列へ数値でない文字列は強制できない
         let bad = [ [ Expr.Literal(Literal.String "abc") ] ]
-
-        expectError "型強制できない値が OK になっています" (DmlOps.insert peopleSchema txn (Some [ "id" ]) bad))
+        expectError "型強制できない値が OK になっています" (DmlOps.insert (ctxOf store) peopleSchema txn (Some [ "id" ]) bad))
 
 [<Fact>]
 let ``DML: INSERT は DEFAULT で不足列を埋める`` () =
@@ -255,12 +249,12 @@ let ``DML: INSERT は DEFAULT で不足列を埋める`` () =
         let mgr, txn = TransactionManager.beginTxn mgr
 
         let txn, n =
-            ok (DmlOps.insert schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
+            ok (DmlOps.insert (ctxOf store) schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
 
         Assert.Equal<int>(1, n)
-        commitInto store mgr txn |> ignore
 
-        let rows = ok (Dml.scanByPrimaryKey store schema None 0)
+        commitInto store mgr txn |> ignore
+        let rows = ok (Dml.scanByPrimaryKey store schema None 0) |> Seq.toArray
         Assert.Equal<int64>(42L, asInt rows.[0].[2]))
 
 [<Fact>]
@@ -290,11 +284,10 @@ let ``DML: INSERT は評価できない DEFAULT を NULL にする`` () =
         let mgr, txn = TransactionManager.beginTxn mgr
 
         let txn, _ =
-            ok (DmlOps.insert schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
+            ok (DmlOps.insert (ctxOf store) schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
 
         commitInto store mgr txn |> ignore
-
-        let rows = ok (Dml.scanByPrimaryKey store schema None 0)
+        let rows = ok (Dml.scanByPrimaryKey store schema None 0) |> Seq.toArray
         Assert.True(SqlValue.isNull rows.[0].[2]))
 
 [<Fact>]
@@ -305,9 +298,9 @@ let ``DML: DELETE は WHERE に合う行を消す`` () =
         // seed の TransactionManager を引き継ぐ
         //（新しい TransactionManager は SeqNo が 1 から始まり、tombstone が消える）。
         let mgr0 = seedPeople store (TransactionManager.create ())
-        let (mgr2, txn2) = TransactionManager.beginTxn mgr0
+        let mgr2, txn2 = TransactionManager.beginTxn mgr0
 
-        let (txn2, n) =
+        let txn2, n =
             ok (
                 DmlOps.delete
                     ctx
@@ -317,8 +310,8 @@ let ``DML: DELETE は WHERE に合う行を消す`` () =
             )
 
         Assert.Equal<int>(1, n)
-        commitInto store mgr2 txn2 |> ignore
 
-        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0)
+        commitInto store mgr2 txn2 |> ignore
+        let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0) |> Seq.toArray
         Assert.Equal<int>(1, rows.Length)
-        Assert.Equal("bob", asText (rows.[0].[1])))
+        Assert.Equal("bob", asText rows.[0].[1]))

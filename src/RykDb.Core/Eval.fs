@@ -97,13 +97,19 @@ module internal Scalar =
         | "UPPER" ->
             arity 1
             >>= fun () ->
-                let t = asStr args.[0]
-                ret (SqlValue.Text(t.ToUpperInvariant()))
+                if SqlValue.isNull args.[0] then
+                    ret SqlValue.Null
+                else
+                    let t = asStr args.[0]
+                    ret (SqlValue.Text(t.ToUpperInvariant()))
         | "LOWER" ->
             arity 1
             >>= fun () ->
-                let t = asStr args.[0]
-                ret (SqlValue.Text(t.ToLowerInvariant()))
+                if SqlValue.isNull args.[0] then
+                    ret SqlValue.Null
+                else
+                    let t = asStr args.[0]
+                    ret (SqlValue.Text(t.ToLowerInvariant()))
         | "LENGTH" ->
             arity 1
             >>= fun () ->
@@ -119,6 +125,8 @@ module internal Scalar =
                     ret SqlValue.Null
                 else
                     match args.[0] with
+                    | SqlValue.Int i when i = System.Int64.MinValue ->
+                        err (DbError.constraintViolation "ABS の結果が範囲を超えました")
                     | SqlValue.Int i -> ret (SqlValue.Int(abs i))
                     | SqlValue.Real f -> ret (SqlValue.Real(abs f))
                     | SqlValue.Decimal d -> ret (SqlValue.Decimal(abs d))
@@ -137,14 +145,19 @@ module internal Scalar =
         | "TRIM" ->
             arity 1
             >>= fun () ->
-                let t = (asStr args.[0]).Trim()
-                ret (SqlValue.Text t)
+                if SqlValue.isNull args.[0] then
+                    ret SqlValue.Null
+                else
+                    let t = (asStr args.[0]).Trim()
+                    ret (SqlValue.Text t)
         | "ROUND" ->
             arity 1
             >>= fun () ->
                 match args.[0] with
                 | SqlValue.Int i -> ret (SqlValue.Int i)
                 | SqlValue.Real f -> ret (SqlValue.Real(System.Math.Round(f, System.MidpointRounding.AwayFromZero)))
+                | SqlValue.Decimal d ->
+                    ret (SqlValue.Decimal(System.Math.Round(d, System.MidpointRounding.AwayFromZero)))
                 | SqlValue.Null -> ret SqlValue.Null
                 | other ->
                     err (
@@ -157,28 +170,112 @@ module internal Scalar =
 /// 集約を含まない式だけを扱う（集約は Eval に組めない）。
 /// NULL の伝播と 3値論理は SQL 標準に合わせる。
 module internal Eval =
-    let private arith (isDivision: bool) (op: decimal -> decimal -> decimal) (a: SqlValue) (b: SqlValue) =
-        let arithmeticType (a: SqlValue) (b: SqlValue) =
-            match a, b with
-            | (SqlValue.Int _ | SqlValue.Null), (SqlValue.Int _ | SqlValue.Null) -> DataType.Integer
-            | (SqlValue.Decimal _ | SqlValue.Null), (SqlValue.Decimal _ | SqlValue.Null) -> DataType.Decimal
-            | _, _ -> DataType.Real
+    type private ArithOp =
+        | Add
+        | Sub
+        | Mul
+        | Div
+        | Mod
 
-        let liftNumeric (a: SqlValue) (b: SqlValue) (op: decimal -> decimal -> decimal) =
-            match SqlValue.asNumeric a, SqlValue.asNumeric b with
-            | Some x, Some y ->
-                match arithmeticType a b with
-                | DataType.Integer -> SqlValue.Int(op x y |> int64)
-                | DataType.Decimal -> SqlValue.Decimal(op x y)
-                | _ -> SqlValue.Real(double (op x y))
-            | _ -> SqlValue.Null
+    let private overflowError () =
+        err (DbError.constraintViolation "数値演算の結果が表現可能な範囲を超えました")
 
+    let private intArith (op: ArithOp) (a: int64) (b: int64) =
+        let x = System.Numerics.BigInteger a
+        let y = System.Numerics.BigInteger b
+
+        let r =
+            match op with
+            | Add -> x + y
+            | Sub -> x - y
+            | Mul -> x * y
+            | Div -> x / y
+            | Mod -> x % y
+
+        if
+            r < System.Numerics.BigInteger System.Int64.MinValue
+            || r > System.Numerics.BigInteger System.Int64.MaxValue
+        then
+            overflowError ()
+        else
+            ret (SqlValue.Int(int64 r))
+
+    let private decimalArith (op: ArithOp) (a: decimal) (b: decimal) =
+        let maxD = System.Decimal.MaxValue
+        let minD = System.Decimal.MinValue
+
+        match op with
+        | Add when a > 0M && b > 0M && a > maxD - b -> overflowError ()
+        | Add when a < 0M && b < 0M && a < minD - b -> overflowError ()
+        | Add -> ret (SqlValue.Decimal(a + b))
+        | Sub when a < 0M && b > 0M && a < minD + b -> overflowError ()
+        | Sub when a > 0M && b < 0M && a > maxD + b -> overflowError ()
+        | Sub -> ret (SqlValue.Decimal(a - b))
+        | Mul when a = 0M || b = 0M -> ret (SqlValue.Decimal 0M)
+        | Mul ->
+            let aa = abs a
+            let bb = abs b
+            let overflows = if bb >= 1M then aa > maxD / bb else aa > maxD * bb
+
+            if overflows then
+                overflowError ()
+            else
+                ret (SqlValue.Decimal(a * b))
+        | Div when abs b < 1M ->
+            if abs a > maxD * abs b then
+                overflowError ()
+            else
+                ret (SqlValue.Decimal(a / b))
+        | Div -> ret (SqlValue.Decimal(a / b))
+        | Mod -> ret (SqlValue.Decimal(a % b))
+
+    let private realArith (op: ArithOp) (a: float) (b: float) =
+        let r =
+            match op with
+            | Add -> a + b
+            | Sub -> a - b
+            | Mul -> a * b
+            | Div -> a / b
+            | Mod -> a % b
+
+        ret (SqlValue.Real r)
+
+    let private decimalOf (v: SqlValue) =
+        match v with
+        | SqlValue.Int i -> decimal i
+        | SqlValue.Decimal d -> d
+        | _ -> 0M
+
+    let private floatOf (v: SqlValue) =
+        match v with
+        | SqlValue.Int i -> float i
+        | SqlValue.Decimal d -> float d
+        | SqlValue.Real f -> f
+        | _ -> 0.0
+
+    let private isZero (v: SqlValue) =
+        match v with
+        | SqlValue.Int 0L
+        | SqlValue.Decimal 0M
+        | SqlValue.Real 0.0 -> true
+        | _ -> false
+
+    let private liftNumeric (op: ArithOp) (a: SqlValue) (b: SqlValue) =
+        match a, b with
+        | SqlValue.Int x, SqlValue.Int y -> intArith op x y
+        | (SqlValue.Int _ | SqlValue.Decimal _), (SqlValue.Int _ | SqlValue.Decimal _) ->
+            decimalArith op (decimalOf a) (decimalOf b)
+        | (SqlValue.Int _ | SqlValue.Decimal _ | SqlValue.Real _),
+          (SqlValue.Int _ | SqlValue.Decimal _ | SqlValue.Real _) -> realArith op (floatOf a) (floatOf b)
+        | _ -> ret SqlValue.Null
+
+    let private arith (op: ArithOp) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
             ret SqlValue.Null
-        elif isDivision && SqlValue.asNumeric b = Some 0M then
+        elif (op = Div || op = Mod) && isZero b then
             err (DbError.constraintViolation "0 での除算は定義されていません")
         else
-            ret (liftNumeric a b op)
+            liftNumeric op a b
 
     /// 比較演算子を適用して 3値論理へ落とす。
     /// <remarks>
@@ -375,6 +472,8 @@ module internal Eval =
                             ret SqlValue.Null
                         else
                             match v with
+                            | SqlValue.Int i when i = System.Int64.MinValue ->
+                                err (DbError.constraintViolation "符号反転の結果が範囲を超えました")
                             | SqlValue.Int i -> ret (SqlValue.Int -i)
                             | SqlValue.Real f -> ret (SqlValue.Real -f)
                             | SqlValue.Decimal d -> ret (SqlValue.Decimal -d)
@@ -396,11 +495,11 @@ module internal Eval =
             | KBinaryR(op, l) :: rest ->
                 let combined =
                     match op with
-                    | BinaryOp.Add -> arith false (+) l v
-                    | BinaryOp.Sub -> arith false (-) l v
-                    | BinaryOp.Mul -> arith false (*) l v
-                    | BinaryOp.Div -> arith true (/) l v
-                    | BinaryOp.Mod -> arith true (%) l v
+                    | BinaryOp.Add -> arith ArithOp.Add l v
+                    | BinaryOp.Sub -> arith ArithOp.Sub l v
+                    | BinaryOp.Mul -> arith ArithOp.Mul l v
+                    | BinaryOp.Div -> arith ArithOp.Div l v
+                    | BinaryOp.Mod -> arith ArithOp.Mod l v
                     | BinaryOp.Concat ->
                         if SqlValue.isNull l || SqlValue.isNull v then
                             ret SqlValue.Null

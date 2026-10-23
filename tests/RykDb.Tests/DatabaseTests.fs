@@ -144,6 +144,47 @@ let ``Database: SQL の BEGIN / COMMIT / ROLLBACK は受理される（文とし
         Assert.Equal<int>(1, after.Rows.Length))
 
 [<Fact>]
+let ``E2E: 明示 transaction 内の書き込みが SELECT に見える`` () =
+    withDb "tx6" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let tx0 = db1.Begin()
+        let tx1, _ = ok (tx0.Execute "INSERT INTO t VALUES (1, 10)")
+
+        let tx2, added = ok (tx1.Query "SELECT id, v FROM t")
+        Assert.Equal<int>(1, added.Rows.Length)
+        Assert.Equal<int64>(1L, asInt added.Rows.[0].[0])
+        Assert.Equal<int64>(10L, asInt added.Rows.[0].[1])
+
+        let tx3, _ = ok (tx2.Execute "UPDATE t SET v = 20 WHERE id = 1")
+        let tx4, updated = ok (tx3.Query "SELECT v FROM t")
+        Assert.Equal<int64>(20L, asInt updated.Rows.[0].[0])
+
+        let tx5, _ = ok (tx4.Execute "DELETE FROM t WHERE id = 1")
+        let tx6, deleted = ok (tx5.Query "SELECT id FROM t")
+        Assert.Equal<int>(0, deleted.Rows.Length)
+
+        let committed = ok (tx6.Commit())
+        let _, after = ok (committed.Query "SELECT id FROM t")
+        Assert.Equal<int>(0, after.Rows.Length))
+
+[<Fact>]
+let ``E2E: 明示 transaction 内の索引検索が書き込みを見る`` () =
+    withDb "tx7" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "CREATE INDEX ix_t_v ON t (v)"
+        let tx0 = db2.Begin()
+        let tx1, _ = ok (tx0.Execute "INSERT INTO t VALUES (1, 7)")
+
+        let tx2, found = ok (tx1.Query "SELECT id FROM t WHERE v = 7")
+        Assert.Equal<int>(1, found.Rows.Length)
+
+        let tx3, _ = ok (tx2.Execute "UPDATE t SET v = 8 WHERE id = 1")
+        let tx4, oldKey = ok (tx3.Query "SELECT id FROM t WHERE v = 7")
+        Assert.Equal<int>(0, oldKey.Rows.Length)
+        let _, newKey = ok (tx4.Query "SELECT id FROM t WHERE v = 8")
+        Assert.Equal<int>(1, newKey.Rows.Length))
+
+[<Fact>]
 let ``Database: Root はルートディレクトリを返す`` () =
     withDir "rootprop" (fun dir ->
         let db = ok (Database.openWith dir)
@@ -196,6 +237,27 @@ let ``Database: テーブル制約の複合主キー`` () =
         Assert.Equal<int>(2, res.Rows.Length)
         Assert.Equal<int64>(2L, asInt res.Rows.[0].[1])
         Assert.Equal<int64>(3L, asInt res.Rows.[1].[1]))
+
+[<Fact>]
+let ``E2E: 複合主キーは全列一致で検索でき、部分一致も取りこぼさない`` () =
+    withDb "ddl6-search" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE t (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))"
+
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 2, 'x'), (1, 3, 'y'), (2, 2, 'z')"
+
+        let _, full = ok (db2.Query "SELECT v FROM t WHERE a = 1 AND b = 2")
+        Assert.Equal<int>(1, full.Rows.Length)
+        Assert.Equal<string>("x", asText full.Rows.[0].[0])
+
+        let _, partialA = ok (db2.Query "SELECT v FROM t WHERE a = 1 ORDER BY b")
+        Assert.Equal<string list>([ "x"; "y" ], partialA.Rows |> Array.map (fun r -> asText r.[0]) |> List.ofArray)
+
+        let _, partialB = ok (db2.Query "SELECT v FROM t WHERE b = 2 ORDER BY a")
+        Assert.Equal<string list>([ "x"; "z" ], partialB.Rows |> Array.map (fun r -> asText r.[0]) |> List.ofArray)
+
+        // 型が違うリテラルは黙って 0 行にせず、比較時に型エラーにする
+        expectErrorKind ErrorKind.TypeError "型不一致の主キー検索" (db2.Query "SELECT v FROM t WHERE a = '1'"))
 
 [<Fact>]
 let ``Database: DROP TABLE でテーブルが消える`` () =
@@ -262,6 +324,81 @@ let ``Database: DEFAULT 付きの列定義も保存できる`` () =
         // 保存時に DEFAULT 式が書かれる（再読込後に既定値として使われるかは別問題）
         let _, rows = ok (db1.Query "SELECT id, v FROM t")
         Assert.Empty rows.Rows)
+
+[<Fact>]
+let ``E2E: DEFAULT は再オープン後も既定値として使われる`` () =
+    withDir "default-e2e" (fun dir ->
+        let db0 = ok (Database.openWith dir)
+
+        let db1 =
+            exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 42, s TEXT DEFAULT 'hi')"
+
+        let db2 = exec db1 "INSERT INTO t (id) VALUES (1)"
+        let _, before = ok (db2.Query "SELECT v, s FROM t WHERE id = 1")
+        Assert.Equal<int64>(42L, asInt before.Rows.[0].[0])
+        Assert.Equal<string>("hi", asText before.Rows.[0].[1])
+        ok (db2.Close())
+
+        let db3 = ok (Database.openWith dir)
+        let _, after = ok (db3.Query "SELECT v, s FROM t WHERE id = 1")
+        Assert.Equal<int64>(42L, asInt after.Rows.[0].[0])
+        Assert.Equal<string>("hi", asText after.Rows.[0].[1])
+
+        let db4 = exec db3 "INSERT INTO t (id) VALUES (2)"
+        let _, inserted = ok (db4.Query "SELECT v, s FROM t WHERE id = 2")
+        Assert.Equal<int64>(42L, asInt inserted.Rows.[0].[0])
+        Assert.Equal<string>("hi", asText inserted.Rows.[0].[1])
+        ok (db4.Close()))
+
+[<Fact>]
+let ``E2E: 数値の範囲外は例外ではなくエラーを返す`` () =
+    withDb "numeric-e2e" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL, d DECIMAL)"
+        let db2 = exec db1 "INSERT INTO t (id, v, d) VALUES (1, 1e30, 7.9e28)"
+
+        // REAL は decimal の範囲を超えてもそのまま計算できる
+        let _, big = ok (db2.Query "SELECT (v * v) FROM t WHERE id = 1")
+
+        match big.Rows.[0].[0] with
+        | SqlValue.Real f -> Assert.True(f > 1e59 && f < 1e61, sprintf "想定外の REAL: %f" f)
+        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+
+        // 極小の REAL も 0 に丸めない
+        let _, tiny = ok (db2.Query "SELECT (1e-30 * 1.0) FROM t WHERE id = 1")
+
+        match tiny.Rows.[0].[0] with
+        | SqlValue.Real f -> Assert.True(f > 0.0 && f < 1e-29, sprintf "想定外の REAL: %f" f)
+        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+
+        let _, sum = ok (db2.Query "SELECT SUM(v) FROM t")
+
+        match sum.Rows.[0].[0] with
+        | SqlValue.Real f -> Assert.Equal(1e30, f)
+        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+
+        // 整数・DECIMAL のオーバーフローは DbError になる
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "整数加算のオーバーフロー"
+            (db2.Query "SELECT 9223372036854775807 + 1 FROM t")
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "整数除算のオーバーフロー"
+            (db2.Query "SELECT (-9223372036854775807 - 1) / -1 FROM t")
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "ABS のオーバーフロー"
+            (db2.Query "SELECT ABS(-9223372036854775807 - 1) FROM t")
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "DECIMAL 乗算のオーバーフロー"
+            (db2.Query "SELECT (d * d) FROM t WHERE id = 1")
+
+        // DECIMAL の範囲外の REAL は変換時に型エラー
+        expectErrorKind ErrorKind.TypeError "DECIMAL の範囲外" (db2.Execute "INSERT INTO t (id, d) VALUES (2, 1e30)"))
 
 [<Fact>]
 let ``Database: INSERT した行が SELECT で見える`` () =
@@ -562,6 +699,19 @@ let ``Database: エイリアスでの自己結合が行を返す`` () =
         Assert.Equal<int64>(30L, asInt res3.Rows.[0].[2]))
 
 [<Fact>]
+let ``Database: JOIN の非修飾で曖昧な列は NameError`` () =
+    // 非修飾 id は p と q の両方にある。各テーブルへ pushdown すると
+    // それぞれ id = 1 で絞ってしまい、曖昧エラーにならず意味が変わる。
+    withDb "joinambig" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20)"
+
+        expectErrorKind
+            ErrorKind.NameError
+            "JOIN の曖昧な非修飾列がエラーになりません"
+            (db2.Query "SELECT p.id FROM t AS p JOIN t AS q ON p.id = q.id WHERE id = 1"))
+
+[<Fact>]
 let ``Database: テーブル名の重複はエラー（エイリアスが必要）`` () =
     // 識別名が重複すると exec が名前でスキーマを引けず（両方が消える）、
     // エラーではなく静かな誤答になるので、名前解決の段階で止める。
@@ -597,6 +747,15 @@ let ``Database: JOIN の WHERE は右テーブルと横断述語に効く`` () =
 
         Assert.Equal<int>(1, rightOnly.Rows.Length)
         Assert.Equal<int64>(1L, asInt rightOnly.Rows.[0].[0])
+
+        // 非修飾でも一意に決まる列（amount は orders だけ）は従来どおり pushdown できる
+        let _, unqualifiedUnique =
+            ok (
+                db4.Query "SELECT people.id FROM people JOIN orders ON people.id = orders.person_id WHERE amount = 100"
+            )
+
+        Assert.Equal<int>(1, unqualifiedUnique.Rows.Length)
+        Assert.Equal<int64>(1L, asInt unqualifiedUnique.Rows.[0].[0])
 
         // 2 テーブルにまたがる WHERE（ON に無い述語が JOIN 上で評価される）
         let _, cross =

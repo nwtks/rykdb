@@ -142,6 +142,22 @@ module internal SstScan =
 
         drain scan []
 
+    /// 残りを遅延シーケンスに変換する。
+    /// エラーが発生した場合はシーケンスが打ち切られる（エラーは呼び出し側で検出できない）。
+    /// 正確なエラー伝播が必要な場合は toArray を使うこと。
+    let toSeq (scan: SstScan) =
+        let rec pull (cur: SstScan) =
+            seq {
+                match next cur with
+                | Error _ -> ()
+                | Ok None -> ()
+                | Ok(Some(e, nxt)) ->
+                    yield e
+                    yield! pull nxt
+            }
+
+        pull scan
+
 /// 索引の 1要素。
 /// 各ブロックの位置と長さを張る。
 type internal SstIndexEntry =
@@ -648,12 +664,25 @@ module internal FileMetaData =
                 MaxSeqNo = SstEntry.maxSeqNo entries
             }
 
-        match Sstable.build entries bloomFalsePositiveRate with
-        | Error e -> Error e
-        | Ok bytes ->
-            match protect (fun () -> System.IO.File.WriteAllBytes(path dir fileNumber, bytes) |> ignore) with
-            | Error e -> Error e
-            | Ok() -> ret (ofChunk fileNumber level (int64 bytes.Length) entries)
+        result {
+            let! bytes = Sstable.build entries bloomFalsePositiveRate
+
+            let! () =
+                protect (fun () ->
+                    System.IO.File.WriteAllBytes(path dir fileNumber, bytes)
+
+                    use fs =
+                        new System.IO.FileStream(
+                            path dir fileNumber,
+                            System.IO.FileMode.Open,
+                            System.IO.FileAccess.Write,
+                            System.IO.FileShare.None
+                        )
+
+                    fs.Flush true)
+
+            return ofChunk fileNumber level (int64 bytes.Length) entries
+        }
 
     /// このファイルが [key] を持ち得るか（Bloom より粗い判定）。
     let mightContain (f: FileMetaData) (key: byte array) =

@@ -97,51 +97,120 @@ type Database internal (root: string, state: DbState) =
             match rest with
             | [] -> ret st
             | stmt :: tail ->
-                match st.Active with
-                | Some activeTxn ->
-                    let running =
-                        match st.Pending with
-                        | Some p -> p
-                        | None -> activeTxn
+                match stmt with
+                | Statement.Begin ->
+                    if st.Active.IsSome then
+                        results.Add StatementResult.empty
+                        runStatements st tail
+                    else
+                        let mgr, txn = TransactionManager.beginTxn st.Manager
 
-                    match Engine.runStatement st running stmt with
-                    | Error e -> Error e
-                    | Ok(nextState, result) ->
-                        results.Add result
-
-                        let carried =
-                            match stmt with
-                            | Statement.Insert _
-                            | Statement.Update _
-                            | Statement.Delete _ -> nextState
-                            | _ -> { nextState with Pending = st.Pending }
-
-                        runStatements carried tail
-                | None ->
-                    let mgr, txn = TransactionManager.beginTxn st.Manager
-
-                    match Catalog.load st.Store with
-                    | Error e -> Error e
-                    | Ok fresh ->
-                        let startState =
-                            { st with
-                                Manager = mgr
-                                Catalog = fresh
-                            }
-
-                        match Engine.runStatement startState txn stmt with
+                        match Catalog.load st.Store with
                         | Error e -> Error e
-                        | Ok(midState, result) ->
-                            let toCommit =
-                                match midState.Pending with
-                                | Some p -> p
-                                | None -> txn
+                        | Ok fresh ->
+                            let nextState =
+                                { st with
+                                    Manager = mgr
+                                    Active = Some txn
+                                    Catalog = fresh
+                                }
 
-                            match DbStateOps.commitTransaction midState toCommit with
+                            results.Add StatementResult.empty
+                            runStatements nextState tail
+                | Statement.Commit ->
+                    match st.Active with
+                    | None ->
+                        results.Add StatementResult.empty
+                        runStatements st tail
+                    | Some _ ->
+                        let target =
+                            match st.Pending with
+                            | Some p -> Some p
+                            | None -> st.Active
+
+                        match target with
+                        | None ->
+                            results.Add StatementResult.empty
+                            runStatements st tail
+                        | Some txn ->
+                            match DbStateOps.commitTransaction st txn with
                             | Error e -> Error e
                             | Ok nextState ->
-                                results.Add result
+                                results.Add StatementResult.empty
                                 runStatements nextState tail
+                | Statement.Rollback ->
+                    match st.Active with
+                    | None ->
+                        results.Add StatementResult.empty
+                        runStatements st tail
+                    | Some txn ->
+                        let mgr = TransactionManager.abort st.Manager txn.TxnId
+
+                        let nextState =
+                            { st with
+                                Manager = mgr
+                                Active = None
+                                Pending = None
+                            }
+
+                        results.Add StatementResult.empty
+                        runStatements nextState tail
+                | _ ->
+                    match st.Active with
+                    | Some activeTxn ->
+                        let running =
+                            match st.Pending with
+                            | Some p -> p
+                            | None -> activeTxn
+
+                        match Engine.runStatement st running stmt with
+                        | Error e -> Error e
+                        | Ok(nextState, result) ->
+                            results.Add result
+
+                            let carried =
+                                match stmt with
+                                | Statement.Insert _
+                                | Statement.Update _
+                                | Statement.Delete _ -> nextState
+                                | _ -> { nextState with Pending = st.Pending }
+
+                            runStatements carried tail
+                    | None ->
+                        let mgr, txn = TransactionManager.beginTxn st.Manager
+
+                        let needsReload =
+                            match stmt with
+                            | Statement.CreateTable _
+                            | Statement.DropTable _
+                            | Statement.CreateIndex _
+                            | Statement.DropIndex _ -> true
+                            | _ -> false
+
+                        let catalogResult = if needsReload then Catalog.load st.Store else Ok st.Catalog
+
+                        match catalogResult with
+                        | Error e -> Error e
+                        | Ok fresh ->
+                            let startState =
+                                { st with
+                                    Manager = mgr
+                                    Catalog = fresh
+                                }
+
+                            match Engine.runStatement startState txn stmt with
+                            | Error e -> Error e
+                            | Ok(midState, result) ->
+                                let toCommit =
+                                    match midState.Pending with
+                                    | Some p -> p
+                                    | None -> txn
+
+                                match DbStateOps.commitTransaction midState toCommit with
+                                | Error e -> Error e
+                                | Ok nextState ->
+                                    results.Add result
+                                    runStatements nextState tail
 
         result {
             let! stmts = Parser.parseStatements sql

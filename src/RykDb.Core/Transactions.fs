@@ -68,6 +68,18 @@ module internal Transaction =
     /// 削除を書き込む（バッファに積む）。
     let remove (txn: Transaction) (keyspace: string) (key: byte array) = setSlot txn keyspace key None
 
+    /// txn がこのキーへ書いた内容。
+    /// 外側の None は未書き込み、内側の None は削除を表す。
+    let tryFind (txn: Transaction) (keyspace: string) (key: byte array) =
+        txn.Buffers |> Map.tryFind keyspace |> Option.bind (Map.tryFind key)
+
+    /// txn が keyspace に書いた全スロット。
+    let slotsOf (txn: Transaction) (keyspace: string) =
+        txn.Buffers
+        |> Map.tryFind keyspace
+        |> Option.map Map.toList
+        |> Option.defaultValue []
+
     /// 「(keyspace, キー)」を競合検出用の文字列 1本に畳む。
     /// Map のキーは byte[] でも構造比較で並ぶので、文字列化は一意性を保てる。
     let conflictKey (keyspace: string) (key: byte array) =
@@ -162,6 +174,22 @@ module internal TransactionManager =
         { mgr with
             Active = Map.remove txnId mgr.Active
         }
+
+    /// GC の境界になる最古の active snapshot。
+    /// active な transaction が無ければ「次の commit で採番される SeqNo」を返す
+    /// （現在の最後の commit までは誰も見ないので、古い版を捨てられる）。
+    let activeSnapshot (mgr: TransactionManager) =
+        let oldest =
+            mgr.Active
+            |> Map.fold (fun acc _ record -> min acc record.Txn.Snapshot.SeqNo) System.UInt64.MaxValue
+
+        if oldest = System.UInt64.MaxValue then
+            if mgr.LastCommitSeqNo = System.UInt64.MaxValue then
+                mgr.LastCommitSeqNo
+            else
+                mgr.LastCommitSeqNo + 1UL
+        else
+            oldest
 
     /// commit する。
     /// 1. write-write 競合を検査する。

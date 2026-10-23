@@ -142,7 +142,7 @@ flowchart TB
 
 > **Transactions と RowStore の依存方向**: `Transactions.fs` は `RowStore` を参照しない。
 > 依存は **`RowStore` → `Transactions` → `Memtable`** の向きで、 `RowStore` の DML ヘルパ（`insert` / `updateByPrimaryKey` / `deleteByPrimaryKey`）が `Transaction` のバッファへ行・索引を積む。
-> commit 時に `TransactionManager.commit` の出力を `RowStore.writeBatches` に渡すのは `Database` / `Engine` / `Catalog`（§7.4）。
+> commit 時に `TransactionManager.commit` の出力を `RowStore.writeBatchesWithSnapshot` に渡すのは `Database` / `Engine`（§7.5）。
 
 ### なぜ不変（immutable）か
 
@@ -189,7 +189,7 @@ flowchart TB
 | `Eval.fs`          | スカラー関数 `Scalar` と式評価器 `Eval`                                                           |
 | `Ops.fs`           | pull 演算子 `Op` / `Row` と演算子の組み立て `Ops`（フィルタ・ソート・結合・集約・射影・DISTINCT） |
 | `ExecContext.fs`   | 実行時文脈 `ExecContext` とテーブル走査（`table` / `byPrimaryKey` / `byIndex`）                   |
-| `DmlOps.fs`        | DML `DmlOps`（INSERT / UPDATE / DELETE）                                                          |
+| `Engine.fs`        | DML `DmlOps`（INSERT / UPDATE / DELETE）もここに同居（`DmlOps` モジュール）                       |
 | `Planner.fs`       | 名前束縛 → 論理代数 → `Op`                                                                        |
 | `Engine.fs`        | 文の実行（`Ddl` / `Engine.runStatement`）                                                         |
 | `Database.fs`      | 公開 API（不変ハンドル・transaction・`StatementResult`）                                          |
@@ -201,7 +201,7 @@ Errors → Types → Serialization → Memtable → Wal → BloomFilter
        → Sstable → VersionSet → Manifest → Compaction
        → StorageEngine → Transactions → Ast → Lexer → Parser
        → RowStore → Catalog → Schema → Eval → Ops → ExecContext
-       → Planner → DmlOps → Engine → Database
+       → Planner → Engine → Database
 ```
 
 F# はファイルを**コンパイル順に評価する**ため、上から下へ一方向の依存になるよう `.fsproj` の `Compile` を手で並べる
@@ -371,18 +371,23 @@ flowchart LR
 #### 走査方法の選択（`chooseScanMethod`）
 
 ```
-WHERE に「列 = 定数」の等価述語があるか（AND を平坦化し、左から順に最初の 1つを見る）
-  ├─ 主キー列なら          → PkLookup
-  ├─ 単一列索引と完全一致なら → IndexLookup
-  └─ それ以外              → SeqScan
+WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して全 conjunct を見る）
+  ├─ 主キーの全列に型一致の等値条件がある → PkLookup（値を PK 順に並べる）
+  ├─ 単一列索引と型一致の等値条件がある   → IndexLookup
+  └─ それ以外                             → SeqScan
 ```
 
-**範囲走査は使わない**。
-`ScanMethod.RangeScan` は型としては存在するが Planner から返されることはなく、万一 `Optimizer.exec` に届いても `SeqScan` に落ちる。
+等価条件が無くても、**単一列の主キーまたは単一列索引**に下限のある範囲条件
+（`>` / `>=` / `<` / `<=` / `BETWEEN`）があれば、その列の `RangeScan` / `IndexRangeScan` を使う
+（下限が無い `<` / `<=` のみの条件は `SeqScan` のまま）。
+範囲走査はあくまで**走査範囲の絞り込み**で、厳密な境界判定は上位の `Filter` が担う。
 
 - 定数側に使えるのは**リテラルだけ**（`-1` のような符号つきリテラルは可。式・関数は不可）。
 - 対象になるのは **`columns` が 1列の索引**だけ（複合索引は Leftmost prefix も考慮しない）。
-- 主キーは列名で判定し、値を 1つだけ持つ `PkLookup` を作る。
+- 主キーは全列の等値条件が揃ったときだけ `PkLookup` にする。
+  部分一致は `SeqScan` で残りを `Filter` する。
+- 主キー・索引は値のバイト列表現で引くため、**列の宣言型とリテラルの型が一致するときだけ**使う。
+  型不一致は `SeqScan` に落とし、比較時に `TypeError` にする。
 
 #### 結合アルゴリズム
 
@@ -474,7 +479,8 @@ NULL 同士は等しい扱い）で行う。
   `COUNT(列)` は NULL を数えず、`COUNT(*)` は数える。
   空グループの `SUM` / `AVG` / `MIN` / `MAX` は `NULL`、`COUNT` は 0。
 - `SUM` は数値列なら `DECIMAL`（`REAL` 混在時のみ `REAL`）、`AVG` は常に `REAL` を返す。
-  `COUNT(DISTINCT …)` の DISTINCT フラグは現状無視される（`COUNT(列)` と同じ）。
+  `COUNT(DISTINCT x)` は重複排除する（`Ops.aggregate` の `addAcc` が `distinct` フラグで `Seen` を管理）。
+  `SUM` / `AVG` / `MIN` / `MAX` の `DISTINCT` はパーサが受理しない（`COUNT` のみ）。
 - ソート（`Ops.sortBy`）はキーを「列インデックス + 向き」に解決して `Array.sortWith` で並べる。
   ORDER BY に書けるのは**列の直接参照だけ**（式はエラー）。
   解決は修飾つき（`t.age`）を優先するので、集約後の出力（列名が `SUM(t.age)` になる）でも動く。
@@ -580,7 +586,8 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 1. `DEFAULT` の式や制約をあとから変えられる。
    SQL テキストだと「定義が 1つ変わっただけで全部のパースをやり直す」になる。
 2. 復元した型が `TableSchema` として**同じ形**になる。
-   AST を復元してから `TableSchema.ofCreateTable` に戻すと、 DEFAULT のリテラル表現が往復で壊れる可能性がある。
+   SQL テキストを保存すると、主キー・制約・型の解釈まで文法に依存する。
+   DEFAULT だけは保存した表示文字列を式へ再パースする（再オープン後も既定値として使える）。
 
 既存の LSM（Treap / SSTable / WAL / Compaction）を全部流用できるので、DDL 用の永続化層を別に書かなくて済む。
 書き込みと commit の一貫性も既存エンジンからそのまま得られる。
@@ -635,7 +642,11 @@ BEGIN
   └─ （読みはバッファを見る → read-your-writes）
 COMMIT
   ├─ TransactionManager.commit → 競合検出 → WriteBatch
-  └─ RowStore.writeBatches → StorageEngine.writeBatch（keyspace ごとに 1本）
+  ├─ TransactionManager.activeSnapshot → GC 境界
+  └─ RowStore.writeBatchesWithSnapshot
+       ├─ 複数 keyspace なら .commit intent を原子的に公開
+       ├─ keyspace ごとに StorageEngine.writeBatch
+       └─ 全 keyspace の適用後に intent を削除
 ```
 
 これにより次の 3つが同時に保証される。
@@ -647,15 +658,33 @@ COMMIT
 読み取りは lock を取らず（`StorageEngine` が不変だから）、書き込みの直列化はこのモジュールの中だけに閉じている。
 **keyspace 単位の並列性は `RowStore` が持つ** — keyspace が違えば commit も衝突もしない。
 
-### 7.5 .Database の transaction モデル
+### 7.5 keyspace 横断 commit と ActiveSnapshot
+
+1 トランザクションがテーブルと索引など複数 keyspace に書く場合、各 WAL は独立しているため、
+「テーブルは書けたが索引は書けていない」中途半端な状態が起こり得る。
+`RowStore.writeBatchesWithSnapshot` は全バッチを `.commit/` 配下の intent ファイルへ
+`Flush(true)` + `File.Move` で原子的に公開してから keyspace ごとに書き、完了後に intent を削除する。
+再オープン時に intent が残っていれば `replayPending` が再適用する。
+再適用では同じ `(key, SeqNo, value)` を `filterApplied` が読み飛ばすので、物理エントリは重複しない。
+1 keyspace だけの書き込みは WAL 追記自体が原子的なので intent を作らない。
+
+`TransactionManager.activeSnapshot` は active な transaction の **最小 snapshot** を返す
+（無ければ `LastCommitSeqNo + 1`）。
+この値を各 `StorageEngine.ActiveSnapshot` に設定し、compaction の GC は「この SeqNo より古い版」だけを捨てる。
+replay 中は 0（全版を残す）を使う。
+ActiveSnapshot は Database ハンドル単位の `TransactionManager` から計算するため、
+別ハンドルの active transaction は考慮しない（§12.2）。
+
+### 7.6 .Database の transaction モデル
 
 `Execute` / `Query` は**暗黙の transaction**で実行し、自動的に commit する。
 `Begin()` 以降は `Commit()` / `Rollback()` するまで同じ transaction を使う。
 
-> **注意** SQL 文としての `BEGIN` / `COMMIT` / `ROLLBACK` は**構文としては受理されるが、実行しても何も起きない**（`Engine.runStatement` が no-op）。
+> **注意** SQL 文としての `BEGIN` / `COMMIT` / `ROLLBACK` は transaction を制御する（`Database.Execute` の `runStatements` で処理）。
+> `Engine.runStatement` には到達しない。
 > 明示 transaction はライブラリ API の `db.Begin()` / CLI の `.commit` `.rollback` を使う。
 
-### 7.6 同時実行制御 — ロックは 1つもない
+### 7.7 同時実行制御 — ロックは 1つもない
 
 `src/` 全体に `lock` / `Monitor` / `SemaphoreSlim` / `Mutex` / `Interlocked` は存在しない。
 同時実行制御は次の 4層の組み合わせで成り立っている。
@@ -664,7 +693,7 @@ COMMIT
 | -------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
 | 1. 不変レコード            | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」） |
 | 2. `Database` ハンドル     | **書き込みの直列化の単位**     | `Execute` は新しい `Database` を返す。直列化は「ハンドルを持ち替える」ことで行われ、ロックは介在しない                  |
-| 3. MVCC + 競合検査         | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.4）                         |
+| 3. MVCC + 競合検査         | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                         |
 | 4. keyspace シャーディング | **並列性の供給源**             | `t:` / `i:` / `__catalog__` は独立ツリー。lock-free 構造を採用しなくてよい理由（§6.1, §12.1）                           |
 
 重要な含意は 2つ。
@@ -796,11 +825,12 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 
 | レベル | 役割                                   | 容量上限                                    |
 | ------ | -------------------------------------- | ------------------------------------------- |
-| L0     | flush の出力先（キー域の重なりを許す） | なし                                        |
+| L0     | flush の出力先（キー域の重なりを許す） | 4 ファイル（`L0CompactionTrigger`）         |
 | L1〜L5 | 1 ファイル = 1 キー域                  | 10 MiB / 100 MiB / 1 GiB / 10 GiB / 100 GiB |
 | L6     | 最下位                                 | 1 TiB                                       |
 
-`pickCompaction` は L1 から順に「そのレベルの総バイト数 > 上限」の最初のレベル L を選び、出力先を L+1 にする。
+`pickCompaction` は L0 のファイル数が `L0CompactionTrigger` 以上なら L0 を、
+L1 以降は「そのレベルの総バイト数 > 上限」の最初のレベル L を選び、出力先を L+1 にする。
 実際の入力は `Compaction.selectInputs` が「レベル L の全ファイル
 （最大 `MaxInputFiles = 32`）」+「次レベルでキー域が重なるファイル」として確定する。
 ポイント検索のファイル順は「新しいレベルのほうが先（L0 が最新）、同レベルではファイル番号の降順」（`filesForPointLookup`）。
@@ -849,6 +879,8 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
   未コミットと `Abort` は捨てる。
 - flush / close の後は `rotate` する（旧ファイルを先に全部消してから、新番号で再作成）。
   **削除 → 作成の順**でないと、作ったばかりのファイルが削除対象に入る。
+- 複数 keyspace にまたがる commit は、WAL の前に `.commit` intent を置く（§7.5）。
+  intent は `maxSeq` でソートして再生し、適用後に削除する。
 
 ### 8.6 Compaction — Leveled + GC
 
@@ -868,6 +900,8 @@ L1〜 … 1ファイル = 1キー域で互いに重ならない（RocksDB/LevelD
 
 GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判定は**しない**
 （snapshot S の読み手は `SeqNo <= S` の版を見るので、**SeqNo が小さい版こそ**まだ読まれ得る）。
+`ActiveSnapshot` は `TransactionManager.activeSnapshot` が返す最古の active snapshot で、active が無ければ次の SeqNo。
+0 は「全版を残す」を意味する（replay 時など）。
 
 | 条件                                   | 措置                                                                                |
 | -------------------------------------- | ----------------------------------------------------------------------------------- |
@@ -913,12 +947,19 @@ SQL 文字列
 3. commit 時:
    ├─ TransactionManager.commit → 競合検出（first-committer-wins）
    ├─ Transaction.toEntries    → WriteBatch
-   └─ RowStore.writeBatches    → keyspace ごとに StorageEngine.writeBatch
-                                    ├─ Wal.append (Begin/Batch/Commit)
-                                    └─ Memtable.apply
-4. memtable が MemLimitBytes に達したら flush → L0 の SSTable
-5. レベルが閾値を超えたら compact（`maybeCompact`）
+   └─ RowStore.writeBatchesWithSnapshot
+        ├─ 複数 keyspace なら .commit intent を公開（§7.5）
+        ├─ keyspace ごとに StorageEngine.writeBatch
+        │    ├─ Wal.append (Begin/Batch/Commit)
+        │    └─ Memtable.apply
+        └─ intent を削除
+4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.writeAll` が各 keyspace の `WriteBatch` 後に `MaybeFlush` を呼ぶ。memtable が上限未満なら何もしない）
+5. レベルが閾値を超えたら compact（`maybeCompact`）（`maybeFlush` が `flush >>= maybeCompact` で連鎖するため、flush と同時に評価される）
 ```
+
+flush / compact は `RowStore` が各 keyspace の `WriteBatch` 後に `IStorageEngine.MaybeFlush` を呼んで実行する
+（memtable が上限未満なら何もしない）。
+また、各 `WriteBatch` の前に `TransactionManager.activeSnapshot` を `IStorageEngine.ActiveSnapshot` へ設定する。
 
 ### 9.3 DB を開くとき
 
@@ -971,7 +1012,7 @@ Database.openWith root
 | `%06d.wal`      | 先行ログ                          |
 | `%06d.sst`      | データファイル                    |
 
-ロックファイルは作成しない（1プロセス前提。§7.6）。
+ロックファイルは作成しない（1プロセス前提。§7.7）。
 
 ---
 
@@ -1022,7 +1063,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 1接続 = 1クライアント、逐次処理。1行のテキストを 1行ずつ交換する。
 
-**並行性に関する制約（§7.6 参照）**:
+**並行性に関する制約（§7.7 参照）**:
 
 - `serve` の accept ループは **接続を 1 つずつ処理する**
   （接続ごとの `Task` / スレッドは起こさない）。
@@ -1080,16 +1121,23 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **`scan` は結果を全部メモリに載せて返す**
   （`SstScan` は遅延だが、SQL レベルの `scan` は merge のために実体化する）。
 - **ソート・集約・DISTINCT もメモリに実体化**する。spilling する外部マージは未実装。
-- **範囲走査を使わない**ので、`>` / `<` / `BETWEEN` / `LIKE` は索引を要求しない。
+- **範囲走査は単一列の主キー / 単一列索引に限る**（下限のある条件のみ）。
+  `>` / `<` / `BETWEEN` / `LIKE` のうち、`LIKE` は索引を要求しない。
+  複合索引の Leftmost prefix は考慮しない。
 - **`CREATE INDEX` の backfill は排他を取らない**。
 - **複数プロセスからの同時アクセスは非対応**（1プロセス前提。ロックファイルを作成しない）。
 - **TCP サーバは接続ごとに逐次処理で、ハンドルを接続間で引き継がない**（§11.3）。
   前の接続の書き込み後の状態は次の接続から見えない。
-- **同一 `Database` ハンドルを複数スレッドで使うと書き込みが失われる**（状態はマージされない。§7.6）。
+- **同一 `Database` ハンドルを複数スレッドで使うと書き込みが失われる**（状態はマージされない。§7.7）。
   並行利用はスレッドごとにハンドルを分ける。
-- **`UNIQUE` 制約・索引は宣言されるだけで重複を検査しない**。
 - **MVCC の版は compaction を跨ぐまでは圧縮も再利用もされない**
   （GC は `SeqNo < ActiveSnapshot` の版を捨てるだけ。ファイル単位では判定しない）。
-- **結合アルゴリズムの自動選択は未実装**（§5.1）。実行時の結合は常に入れ子ループ。
+- **結合アルゴリズムの自動選択は未実装**（§5.1）。
+  実行時の結合は常に入れ子ループ。
 - **明示 transaction の状態はプロセス内のみ**（`Database` ハンドルが持つ `Manager`）。
   未コミットの書き込みは WAL に残っていても再生されない。
+- **ActiveSnapshot は単一 Database ハンドルの active transaction だけを見る**。
+  同じ DB を別ハンドルで開いて長い transaction を走らせても GC 境界には反映されない。
+- **keyspace 横断 commit は intent で回復するが、全 WAL 書込後・intent 削除前の crash ではcommit の成否が一意に決まらない**
+  （replay では適用済みになる）。
+  物理重複は `filterApplied` で防ぐ。
