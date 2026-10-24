@@ -32,7 +32,7 @@ let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
             }
 
         let c = ix |> Catalog.addIndex Catalog.empty
-        let store = ok (Catalog.save store c)
+        let store = ok (Catalog.save store Catalog.empty c)
         let loaded = ok (Catalog.load store)
         Assert.Empty loaded.Tables
         Assert.Single loaded.Indexes |> ignore
@@ -50,10 +50,10 @@ let ``Catalog.removeTable: 削除した定義は再読込時に消える`` () =
             |> (fun c -> Catalog.addTable c people)
             |> fun c -> Catalog.addTable c orders
 
-        let store = ok (Catalog.save store c1)
-        // people を消して保存し直す
+        let store = ok (Catalog.save store Catalog.empty c1)
+        // people を消して保存し直す（消えた定義は tombstone で落ちる）
         let c2 = Catalog.removeTable c1 "people"
-        let store = ok (Catalog.save store c2)
+        let store = ok (Catalog.save store c1 c2)
         let loaded = ok (Catalog.load store)
         Assert.Single loaded.Tables |> ignore
         Assert.Equal<string>("orders", loaded.Tables.[0].Name)
@@ -120,7 +120,7 @@ let ``Catalog: 保存したカタログを読み込める`` () =
         let c =
             people |> Catalog.addTable Catalog.empty |> fun c -> ix |> Catalog.addIndex c
 
-        let store = ok (Catalog.save store c)
+        let store = ok (Catalog.save store Catalog.empty c)
         let loaded = ok (Catalog.load store)
         Assert.Single loaded.Tables |> ignore
         Assert.Single loaded.Indexes |> ignore
@@ -151,7 +151,9 @@ let ``Catalog: DEFAULT 式は保存・再読込しても復元される`` () =
                 PrimaryKeyColumns = [ "id" ]
             }
 
-        let store = ok (Catalog.save store (Catalog.addTable Catalog.empty defn))
+        let store =
+            ok (Catalog.save store Catalog.empty (Catalog.addTable Catalog.empty defn))
+
         let loaded = ok (Catalog.load store)
 
         match Catalog.findTable loaded "t" with
@@ -166,22 +168,21 @@ let ``Catalog: DEFAULT 式は保存・再読込しても復元される`` () =
             Assert.Equal<string option>(Some "'it''s'", defaults.[1]))
 
 [<Fact>]
-let ``Catalog.save: カタログ外のエントリは保存時に掃除される`` () =
+let ``Catalog.save: 消えた定義は差分から tombstone で落ちる`` () =
     withStore "cat-sweep" (fun store ->
-        let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s
+        let people = Catalog.toDefinition peopleSchema
 
-        let store =
-            ok (
-                RowStore.writeBatches
-                    store
-                    [
-                        ("__catalog__", [| Entry.put (utf8 "junk:x") 1UL [| SqlValue.Blob [||] |] |])
-                    ]
-            )
+        // テーブルを保存する
+        let c1 = Catalog.addTable Catalog.empty people
+        let store = ok (Catalog.save store Catalog.empty c1)
+        let loaded = ok (Catalog.load store)
+        Assert.Single loaded.Tables |> ignore
 
-        // 空カタログを保存 → 未知キーは tombstone で消える
-        let store = ok (Catalog.save store Catalog.empty)
-        Assert.Equal<int>(0, (ok (Catalog.load store)).Tables.Length))
+        // 消えた定義は「保存前と保存後の差分」から tombstone にして落とす
+        // （カタログ keyspace を全走査しない）。
+        let store = ok (Catalog.save store c1 Catalog.empty)
+        let loaded = ok (Catalog.load store)
+        Assert.Empty loaded.Tables)
 
 [<Fact>]
 let ``Catalog.load: 未知のキーや不正な値は読み飛ばす`` () =
@@ -190,7 +191,10 @@ let ``Catalog.load: 未知のキーや不正な値は読み飛ばす`` () =
 
         // 有効なテーブルを保存しておき、その値を TEXT として持ち直して読ませる
         let people = Catalog.toDefinition peopleSchema
-        let store = ok (Catalog.save store (Catalog.addTable Catalog.empty people))
+
+        let store =
+            ok (Catalog.save store Catalog.empty (Catalog.addTable Catalog.empty people))
+
         let raw = ok (RowStore.scan store "__catalog__" [||] 0) |> Seq.toArray
 
         let value =

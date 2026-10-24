@@ -132,43 +132,112 @@ module internal StorageEngine =
         | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
         | None -> Version.filesForPointLookup engine.Version key |> probe
 
+    /// 遅延 k-way merge のソース。
+    type private MergeSource =
+        /// 未オープンのファイル。byte array はそのファイルが返し得る最小キーの下限。
+        | Unopened of byte array * FileMetaData
+        /// オープン済み（先頭エントリと残りの走査）。
+        | Opened of SstEntry * SstScan
+        /// 使い切った／開けなかったソース。
+        | Drained
+
+    /// ファイルが返し得る最小キーの下限。
+    /// rangeScan は startKey 以降を返すので、Smallest と startKey の大きい方。
+    let private sourceBound (startKey: byte array) (f: FileMetaData) =
+        if Bytes.compare f.Smallest startKey > 0 then
+            f.Smallest
+        else
+            startKey
+
+    /// seq を SstScan へ変換する（列挙は要求されたときに行われる）。
+    /// pull は SstScan.emit へ「次を要求されたときに呼ぶ値」として渡すだけなので
+    /// 再帰は 1段ずつ戻ってから次を組み立てる。
+    let private seqToScan (rows: seq<SstEntry>) =
+        let e = rows.GetEnumerator()
+
+        let rec pull () =
+            if e.MoveNext() then
+                SstScan.emit e.Current pull
+            else
+                SstScan.empty
+
+        pull ()
+
     /// 遅延 k-way merge（キー昇順・同一キーは SeqNo 降順）。
-    let private lazyMerge (sources: seq<SstEntry> list) =
-        let initialState =
-            sources
-            |> List.map (fun s -> s.GetEnumerator())
-            |> List.map (fun e -> if e.MoveNext() then Some e.Current, e else None, e)
+    /// 各ファイルの先頭が比較できるまで開かない。
+    /// 未オープンの下限が現在の最小の先頭を超えないものは、比較のために開く
+    /// （そのファイルからより小さいキーが返るかもしれない）。
+    /// 下限が進んだ先のファイルは開かないので、limit で打ち切られる走査では
+    /// 必要なファイルだけを読み、残りの先行読み込みを省く。
+    /// 開けなかった・壊れたファイルはそのソースを打ち切る
+    /// （SstScan.toSeq と同じ「列挙時に起きたエラーは打ち切り」の扱い。
+    ///   ファイルの欠落は scanAt が先に検出して IoError として返す）。
+    let private lazyMergeScan (engine: StorageEngine) (startKey: byte array) (sources: MergeSource list) =
+        let openSource (f: FileMetaData) =
+            match openSstable engine f with
+            | Error _ -> Drained
+            | Ok reader ->
+                match SstScan.next (Sstable.rangeScan reader startKey 0) with
+                | Error _ -> Drained
+                | Ok None -> Drained
+                | Ok(Some(e, nxt)) -> Opened(e, nxt)
 
-        Seq.unfold
-            (fun state ->
-                let candidates =
-                    state |> List.choose (fun (cur, e) -> cur |> Option.map (fun c -> c, e))
-
-                if List.isEmpty candidates then
-                    None
+        let rec replace (b: byte array) (s: MergeSource list) (acc: MergeSource list) =
+            match s with
+            | (Unopened(_, f) as src) :: tail ->
+                if Bytes.compare (sourceBound startKey f) b = 0 then
+                    List.rev acc @ openSource f :: tail
                 else
-                    let smallest, smallestEnum =
-                        candidates
-                        |> List.fold
-                            (fun (best: (SstEntry * System.Collections.Generic.IEnumerator<SstEntry>) option) (c, e) ->
-                                match best with
-                                | None -> Some(c, e)
-                                | Some(bc, _) -> if SstEntry.compare c bc < 0 then Some(c, e) else best)
-                            None
-                        |> Option.get
+                    replace b tail (src :: acc)
+            | src :: tail -> replace b tail (src :: acc)
+            | [] -> List.rev acc
 
-                    let newCur =
-                        if smallestEnum.MoveNext() then
-                            Some smallestEnum.Current
-                        else
-                            None
+        let rec advance (state: MergeSource list) =
+            let best =
+                state
+                |> List.indexed
+                |> List.choose (function
+                    | i, Opened(e, rest) -> Some(i, e, rest)
+                    | _ -> None)
+                |> List.fold
+                    (fun acc (i, e, rest) ->
+                        match acc with
+                        | None -> Some(i, e, rest)
+                        | Some(_, be, _) -> if SstEntry.compare e be < 0 then Some(i, e, rest) else acc)
+                    None
 
-                    let newState =
-                        state
-                        |> List.map (fun (cur, e) -> if e = smallestEnum then newCur, e else cur, e)
+            let minBound =
+                state
+                |> List.choose (function
+                    | Unopened(b, _) -> Some b
+                    | _ -> None)
+                |> function
+                    | [] -> None
+                    | b :: rest -> Some(List.fold (fun acc b -> if Bytes.compare b acc < 0 then b else acc) b rest)
 
-                    Some(smallest, newState))
-            initialState
+            let bestKey = best |> Option.map (fun (_, e, _) -> e.Key)
+
+            match minBound with
+            | Some b when
+                (match bestKey with
+                 | None -> true
+                 | Some k -> Bytes.compare b k <= 0)
+                ->
+                advance (replace b state [])
+            | _ ->
+                match best with
+                | None -> None
+                | Some(i, e, rest) ->
+                    let nextSource =
+                        match SstScan.next rest with
+                        | Error _ -> Drained
+                        | Ok None -> Drained
+                        | Ok(Some(e2, nxt)) -> Opened(e2, nxt)
+
+                    let nextState = state |> List.mapi (fun j s -> if j = i then nextSource else s)
+                    Some(e, nextState)
+
+        Seq.unfold advance sources
 
     /// 遅延 collapseDuplicates（同一キーの最新版だけ残す）。
     let private collapseDuplicatesLazy (visible: uint64 option) (src: seq<SstEntry>) =
@@ -198,46 +267,69 @@ module internal StorageEngine =
             (src.GetEnumerator(), None)
 
     /// 範囲ルックアップ。
-    /// キー昇順で返す（同一キーは 1 件だけ）。
+    /// キー昇順で返す（同一キーは 1件だけ）。
     /// visible が Some s のときは SeqNo が s 以下の版を返す。
     /// 遅延 pull で merge し、limit 件で早期打ち切りする。
     let scanAt (engine: StorageEngine) (visible: uint64 option) (startKey: byte array) (limit: int) =
-        // SST ファイルを開く（ヘッダ読み取りのみ・高速）。
         let sstFiles =
             Version.allFiles engine.Version
             |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
             |> List.sortByDescending _.FileNumber
 
-        let opened = sstFiles |> List.map (fun f -> openSstable engine f)
+        let memSeq =
+            Memtable.rangeScan engine.Mem startKey 0
+            |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
 
-        let openErrors =
-            opened
-            |> List.choose (function
-                | Error e -> Some e
-                | _ -> None)
+        let memSource =
+            match SstScan.next (seqToScan memSeq) with
+            | Ok(Some(e, nxt)) -> Opened(e, nxt)
+            | _ -> Drained
 
-        if not (List.isEmpty openErrors) then
-            Error(List.head openErrors)
-        else
-            let readers =
-                opened
-                |> List.choose (function
-                    | Ok r -> Some r
-                    | _ -> None)
-
-            let memSeq =
-                Memtable.rangeScan engine.Mem startKey 0
-                |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
-
-            let sstSeqs =
-                readers |> List.map (fun r -> Sstable.rangeScan r startKey 0 |> SstScan.toSeq)
-
-            let sources = memSeq :: sstSeqs
-            let merged = lazyMerge sources
+        let finalize (merged: seq<SstEntry>) =
             let deduped = collapseDuplicatesLazy visible merged
             let live = Seq.filter (fun e -> e.Value.IsSome) deduped
-            let taken = if limit > 0 then Seq.truncate limit live else live
-            Ok taken
+            if limit > 0 then Seq.truncate limit live else live
+
+        if limit <= 0 then
+            let opened =
+                sstFiles
+                |> List.map (fun f -> Result.map (fun r -> Sstable.rangeScan r startKey 0) (openSstable engine f))
+
+            let openErrors =
+                opened
+                |> List.choose (function
+                    | Error e -> Some e
+                    | _ -> None)
+
+            if not (List.isEmpty openErrors) then
+                Error(List.head openErrors)
+            else
+                let sources =
+                    opened
+                    |> List.choose (function
+                        | Ok scan ->
+                            match SstScan.next scan with
+                            | Ok(Some(e, nxt)) -> Some(Opened(e, nxt))
+                            | _ -> Some Drained
+                        | Error _ -> None)
+
+                Ok(finalize (lazyMergeScan engine startKey (memSource :: sources)))
+        else
+            let missing =
+                sstFiles
+                |> List.filter (fun f -> not (System.IO.File.Exists(FileMetaData.path engine.Dir f.FileNumber)))
+
+            match missing with
+            | f :: _ ->
+                err (
+                    sprintf "SSTable ファイルが見つかりません: %s" (FileMetaData.path engine.Dir f.FileNumber)
+                    |> DbError.create ErrorKind.IoError
+                )
+            | [] ->
+                let fileSources =
+                    sstFiles |> List.map (fun f -> Unopened(sourceBound startKey f, f))
+
+                Ok(finalize (lazyMergeScan engine startKey (memSource :: fileSources)))
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、

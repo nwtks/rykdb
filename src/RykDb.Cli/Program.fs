@@ -36,8 +36,11 @@ type Session(initial: Database) =
         | Error e -> Error e
 
     member _.Rollback() =
-        current <- current.Rollback()
-        Ok()
+        match current.Rollback() with
+        | Ok next ->
+            current <- next
+            Ok()
+        | Error e -> Error e
 
     member _.Close() = current.Close()
 
@@ -136,8 +139,10 @@ let private dotCommand (session: Session) (line: string) =
 
         true
     | [| ".rollback" |] ->
-        session.Rollback() |> ignore
-        printfn "(rollback しました)"
+        match session.Rollback() with
+        | Ok() -> printfn "(rollback しました)"
+        | Error e -> printError e
+
         true
     | _ ->
         coloredLine System.ConsoleColor.Yellow (fun m -> printfn "%s" m) "未知のコマンドです(`.help` でコマンド一覧)"

@@ -71,6 +71,7 @@ module internal Op =
             if e.MoveNext() then
                 Op.Compute(fun () -> ret (Some(e.Current, rowsFrom ())))
             else
+                (e :> System.IDisposable).Dispose() |> ignore
                 Op.Done
 
         rowsFrom ()

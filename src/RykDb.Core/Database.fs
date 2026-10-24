@@ -37,13 +37,24 @@ type Database internal (root: string, state: DbState) =
         else
             let mgr, txn = TransactionManager.beginTxn state.Manager
 
-            let nextState =
-                { state with
-                    Manager = mgr
-                    Active = Some txn
-                }
+            match Catalog.load state.Store with
+            | Error _ ->
+                let nextState =
+                    { state with
+                        Manager = mgr
+                        Active = Some txn
+                    }
 
-            Database(root, nextState)
+                Database(root, nextState)
+            | Ok fresh ->
+                let nextState =
+                    { state with
+                        Manager = mgr
+                        Active = Some txn
+                        Catalog = fresh
+                    }
+
+                Database(root, nextState)
 
     /// 実行中の transaction があるか。
     member _.InTransaction = state.Active.IsSome
@@ -68,9 +79,9 @@ type Database internal (root: string, state: DbState) =
 
     /// ROLLBACK。
     /// バッファを捨てる。
-    member this.Rollback() =
+    member _.Rollback() =
         match state.Active with
-        | None -> this
+        | None -> err (DbError.internalError "ロールバックする transaction がありません")
         | Some txn ->
             let mgr = TransactionManager.abort state.Manager txn.TxnId
 
@@ -81,7 +92,7 @@ type Database internal (root: string, state: DbState) =
                     Pending = None
                 }
 
-            Database(root, nextState)
+            Ok(Database(root, nextState))
 
     /// 単一文または複数文を実行する。
     /// <remarks>

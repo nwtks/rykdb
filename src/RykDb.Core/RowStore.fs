@@ -692,13 +692,12 @@ module internal Dml =
         (store: RowStore)
         (index: IndexSchema)
         (visible: uint64 option)
-        (lower: SqlValue)
-        (upper: SqlValue option)
+        (lower: SqlValue array)
+        (upper: SqlValue array option)
         (limit: int)
         =
-        let loBytes = KeyBuilder.ofValues [| lower |]
-
-        let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues [| v |])
+        let loBytes = KeyBuilder.ofValues lower
+        let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues v)
 
         let inRange (key: byte array) =
             let lowerOk = Bytes.compare key loBytes >= 0
@@ -715,7 +714,6 @@ module internal Dml =
         RowStore.scanAt store ks loBytes visible 0
         |> Result.map (fun rows ->
             let matched = rows |> Seq.filter (fun (k, _) -> inRange k) |> Seq.choose snd
-
             if limit > 0 then Seq.truncate limit matched else matched)
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
@@ -725,13 +723,12 @@ module internal Dml =
         (index: IndexSchema)
         (visible: uint64 option)
         (txn: Transaction)
-        (lower: SqlValue)
-        (upper: SqlValue option)
+        (lower: SqlValue array)
+        (upper: SqlValue array option)
         (limit: int)
         =
-        let loBytes = KeyBuilder.ofValues [| lower |]
-
-        let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues [| v |])
+        let loBytes = KeyBuilder.ofValues lower
+        let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues v)
 
         let inRange (key: byte array) =
             let lowerOk = Bytes.compare key loBytes >= 0
@@ -753,7 +750,6 @@ module internal Dml =
         scanByIndexRange store index visible lower upper storeLimit
         |> Result.map (fun rows ->
             let merged = overlayRows (RowKey.indexKey schema index) slots rows
-
             if limit > 0 then Seq.truncate limit merged else merged)
 
     /// 1行を transaction に積む（まだ DB には入らない）。

@@ -101,7 +101,13 @@ module internal ExecContext =
         }
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く。
-    let byIndexRange (ctx: ExecContext) (table: string) (indexName: string) (lower: SqlValue) (upper: SqlValue option) =
+    let byIndexRange
+        (ctx: ExecContext)
+        (table: string)
+        (indexName: string)
+        (lower: SqlValue array)
+        (upper: SqlValue array option)
+        =
         result {
             let! schema = schemaOf ctx table
 

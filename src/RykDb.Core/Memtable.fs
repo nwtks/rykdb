@@ -238,30 +238,32 @@ module internal Memtable =
     /// キーの最新バージョン（SeqNo が最大のもの）を返す。
     /// 同一キーの版は SeqNo 降順に並ぶので、最初に拾ったものが最新。
     /// ポイントルックアップ（MVCC の可視性つき）。
+    /// <remarks>
+    /// 同じキーの版は木の中で連続して並ぶ（キーの昇順・同一キーは SeqNo 降順）。
+    /// 可視な版（SeqNo が visible 以下）は複合キー順では後ろにあるので、
+    /// 「(キー, visible) 以上の最小のノード」を探す（ceiling 探索）。
+    /// それが同じキーなら可視な最新版になる（探索は対数時間）。
+    /// </remarks>
     let getVisible (mem: Memtable) (key: byte array) (visible: uint64 option) =
-        let rec search (work: TNode option list) (best: Entry option) =
-            match work with
-            | [] -> best
-            | None :: rest -> search rest best
-            | Some r :: rest ->
-                match Entry.compareKeyOnly key r.Entry with
-                | c when c < 0 -> search (r.Left :: rest) best
-                | c when c > 0 -> search (r.Right :: rest) best
-                | _ ->
-                    let visibleEntry =
-                        match visible with
-                        | Some v when r.Entry.SeqNo > v -> None
-                        | _ -> Some r.Entry
+        let bound =
+            match visible with
+            | Some v -> v
+            | None -> System.UInt64.MaxValue
 
-                    let best' =
-                        match best, visibleEntry with
-                        | Some b, Some e when b.SeqNo >= e.SeqNo -> Some b
-                        | _, Some e -> Some e
-                        | _ -> best
+        let rec ceiling (node: TNode option) (best: TNode option) =
+            match node with
+            | None -> best
+            | Some r ->
+                let c = Bytes.compare r.Entry.Key key
 
-                    search (r.Right :: r.Left :: rest) best'
+                if c > 0 then ceiling r.Left (Some r)
+                elif c < 0 then ceiling r.Right best
+                else if r.Entry.SeqNo <= bound then ceiling r.Left (Some r)
+                else ceiling r.Right best
 
-        search [ mem.Root ] None
+        match ceiling mem.Root None with
+        | Some r when Bytes.compare r.Entry.Key key = 0 -> Some r.Entry
+        | _ -> None
 
     /// startKey 以降をキー昇順（同一キーは SeqNo 降順）で遅延生成する。
     /// 状態は「作業リスト + 出した件数」だけで、結果を溜めない

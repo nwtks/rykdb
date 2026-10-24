@@ -28,7 +28,7 @@ type internal ScanMethod =
     /// 範囲走査（主キー / 索引の前方一致）
     | RangeScan of string * SqlValue array * SqlValue array option
     /// 索引の範囲走査（索引列の値が [lower, upper] の行）
-    | IndexRangeScan of string * SqlValue * SqlValue option
+    | IndexRangeScan of string * SqlValue array * SqlValue array option
 
 /// 結合アルゴリズム。
 [<RequireQualifiedAccess>]
@@ -147,6 +147,83 @@ module internal Binder =
             |> Array.filter (fun (c: OutputColumn) -> Catalog.eqName c.Name name)
             |> Array.length
             |> fun count -> count > 1)
+
+/// SELECT 項目の別名。
+/// 別名を ORDER BY / GROUP BY / HAVING で参照できるようにするために使う。
+module internal Alias =
+    /// 別名（小文字）→ 式 の表。別名が重複したときは後の項目を優先する。
+    let ofItems (items: SelectItem list) =
+        items
+        |> List.fold
+            (fun acc item ->
+                match item.Alias with
+                | Some a -> Map.add (a.ToLowerInvariant()) item.Expression acc
+                | None -> acc)
+            Map.empty
+
+    /// 式に現れる裸の名前（小文字）。
+    let namesOf (e: Expr) =
+        Expr.fold
+            (fun acc node ->
+                match node with
+                | Expr.Name n -> n.ToLowerInvariant() :: acc
+                | _ -> acc)
+            []
+            e
+
+    /// 自分自身に循環参照する別名を除く。
+    /// （差し替えで無限ループにしないため）
+    let dropCyclic (aliases: Map<string, Expr>) =
+        let edges =
+            aliases
+            |> Map.map (fun _ v -> namesOf v |> List.filter (fun n -> Map.containsKey n aliases))
+
+        let rec loop (start: string) (visited: Set<string>) (stack: string list) =
+            match stack with
+            | [] -> false
+            | n :: rest ->
+                if n = start then
+                    true
+                elif Set.contains n visited then
+                    loop start visited rest
+                else
+                    let next =
+                        match Map.tryFind n edges with
+                        | Some l -> l
+                        | None -> []
+
+                    loop start (Set.add n visited) (next @ rest)
+
+        let reachesSelf (start: string) =
+            match Map.tryFind start edges with
+            | Some l -> l
+            | None -> []
+            |> loop start Set.empty
+
+        aliases |> Map.filter (fun k _ -> not (reachesSelf k))
+
+    /// 別名を式に差し替える。
+    /// 入力のスキーマに同名の列があれば列を優先する（曖昧を避ける）。
+    /// 差し替えた式の中の名前も差し替え対象になる（別名の連鎖を解決する）。
+    /// （`Expr.rewrite` はplugChildren の失敗を返すので Result になる）
+    let substitute (schema: Schema) (aliases: Map<string, Expr>) (e: Expr) =
+        let rewriteLeaf (x: Expr) =
+            match x with
+            | Expr.Name name ->
+                match Map.tryFind (name.ToLowerInvariant()) aliases with
+                | Some replacement ->
+                    match Schema.resolve schema { Qualifier = None; Name = name } with
+                    | Ok _ -> x
+                    | Error _ -> replacement
+                | None -> x
+            | _ -> x
+
+        Expr.rewrite rewriteLeaf e
+
+    /// 集計を含む別名は差し替えない表（GROUP BY 用）。
+    /// 集計をグループキーにすると意味が壊れるため）。
+    let withoutAggregates (aliases: Map<string, Expr>) =
+        aliases |> Map.filter (fun _ e -> not (Expr.isAggregate e))
 
 module internal Predicate =
     /// 未処理の式のスタックを辿って `AND` を平坦化する。
@@ -306,6 +383,35 @@ module internal Analyzer =
                         | Some lv, Some hv -> loop (Some lv) (Some hv) tail
                         | _ -> loop lower upper tail
                     | _ -> loop lower upper tail
+                | Expr.Like(x, p, false) ->
+                    match colOf tn x, litOf p with
+                    | Some n, Some(SqlValue.Text pattern) when Catalog.eqName n colName ->
+                        if
+                            pattern.EndsWith "%"
+                            && not (pattern.Contains "_")
+                            && pattern.IndexOf "%" = pattern.Length - 1
+                        then
+                            let prefix = pattern.Substring(0, pattern.Length - 1)
+                            let lower' = Some(SqlValue.Text prefix)
+
+                            let upper' =
+                                if prefix = "" then
+                                    None
+                                else
+                                    let lastChar = prefix.[prefix.Length - 1]
+
+                                    if int lastChar < 0xFFFF then
+                                        let newPrefix =
+                                            prefix.Substring(0, prefix.Length - 1) + string (char (int lastChar + 1))
+
+                                        Some(SqlValue.Text newPrefix)
+                                    else
+                                        None
+
+                            loop lower' upper' tail
+                        else
+                            loop lower upper tail
+                    | _ -> loop lower upper tail
                 | _ -> loop lower upper tail
 
         let conjuncts = predicates |> List.collect Predicate.splitConjuncts
@@ -338,15 +444,55 @@ module internal Analyzer =
             Catalog.indexesOf catalog b.RealName
             |> List.tryPick (fun i ->
                 match i.Columns with
-                | [ c ] ->
-                    let lo, hi = rangeBounds (name.ToLowerInvariant()) c predicates
+                | [] -> None
+                | cols ->
+                    let rangeColIdx =
+                        cols
+                        |> List.tryFindIndex (fun c ->
+                            let lo, _ = rangeBounds (name.ToLowerInvariant()) c predicates
 
-                    match lo with
-                    | Some lv when typeMatches b.Schema c lv ->
-                        let upper = hi |> Option.filter (fun v -> typeMatches b.Schema c v)
-                        Some(ScanMethod.IndexRangeScan(i.IndexName, lv, upper))
-                    | _ -> None
-                | _ -> None)
+                            match lo with
+                            | Some lv when typeMatches b.Schema c lv -> true
+                            | _ -> false)
+
+                    match rangeColIdx with
+                    | Some idx ->
+                        let rangeCol = cols.[idx]
+                        let lo, hi = rangeBounds (name.ToLowerInvariant()) rangeCol predicates
+
+                        match lo with
+                        | Some lv when typeMatches b.Schema rangeCol lv ->
+                            let upper = hi |> Option.filter (fun v -> typeMatches b.Schema rangeCol v)
+                            let prefixCols = cols |> List.take idx
+                            let prefixVals = prefixCols |> List.map (fun c -> findValue c)
+
+                            if prefixVals |> List.forall Option.isSome then
+                                let lowerKey = (prefixVals |> List.choose id) @ [ lv ] |> Array.ofList
+
+                                let upperKey =
+                                    upper
+                                    |> Option.map (fun uv -> (prefixVals |> List.choose id) @ [ uv ] |> Array.ofList)
+
+                                Some(ScanMethod.IndexRangeScan(i.IndexName, lowerKey, upperKey))
+                            else
+                                None
+                        | _ -> None
+                    | None ->
+                        let firstCol = cols.Head
+                        let lo, hi = rangeBounds (name.ToLowerInvariant()) firstCol predicates
+
+                        match lo with
+                        | Some lv when typeMatches b.Schema firstCol lv ->
+                            let upper = hi |> Option.filter (fun v -> typeMatches b.Schema firstCol v)
+
+                            Some(
+                                ScanMethod.IndexRangeScan(
+                                    i.IndexName,
+                                    [| lv |],
+                                    upper |> Option.map (fun v -> [| v |])
+                                )
+                            )
+                        | _ -> None)
 
         let pkNames = b.Schema.PrimaryKey |> List.map (fun i -> b.Schema.Columns.[i].Name)
         let pkValues = pkNames |> List.map findValue
@@ -451,6 +597,8 @@ module internal Optimizer =
             }
 
         let applyAggregate (schema: Schema) (tree: Logical) (stmt: SelectStatement) =
+            let aliases = Alias.dropCyclic (Alias.ofItems stmt.Items)
+
             let selectExprs =
                 stmt.Items
                 |> List.map (fun item -> item.Expression)
@@ -460,31 +608,37 @@ module internal Optimizer =
                     | Expr.QualifiedStar _ -> false
                     | _ -> true)
 
-            let orderExprs = stmt.OrderBy |> List.map (fun k -> k.Expression)
-
-            let aggStage =
-                Binder.qualifyMany schema (selectExprs @ orderExprs)
-                |> Result.map (fun qs ->
-                    let selectAggs = Ops.aggCalls (qs |> List.take (List.length selectExprs))
-                    let orderAggs = orderExprs |> List.map (fun e -> Ops.aggCalls [ e ]) |> List.concat
-                    selectAggs, orderAggs)
-
-            let havingStage =
-                match stmt.Having with
-                | None -> ret None
-                | Some h ->
-                    Binder.qualifyMany schema [ h ]
-                    >>= fun hs ->
-                        match hs with
-                        | [ hv ] -> ret (Some hv)
-                        | _ -> err (DbError.internalError "HAVING の修飾に失敗")
-
-            let groupStage = Binder.qualifyMany schema stmt.GroupBy
-
             result {
-                let! selectAggs, orderAggs = aggStage
-                let! having = havingStage
-                let! groupBy = groupStage
+                let! orderExprs =
+                    stmt.OrderBy
+                    |> List.map (fun k -> Alias.substitute schema aliases k.Expression)
+                    |> all
+
+                let! qs = Binder.qualifyMany schema (selectExprs @ orderExprs)
+                let selectAggs = Ops.aggCalls (qs |> List.take (List.length selectExprs))
+                let orderAggs = orderExprs |> List.map (fun e -> Ops.aggCalls [ e ]) |> List.concat
+
+                let! having =
+                    match stmt.Having with
+                    | None -> ret None
+                    | Some h ->
+                        result {
+                            let! h' = Alias.substitute schema aliases h
+                            let! hs = Binder.qualifyMany schema [ h' ]
+
+                            match hs with
+                            | [ hv ] -> return Some hv
+                            | _ -> return! err (DbError.internalError "HAVING の修飾に失敗")
+                        }
+
+                let! groupBy =
+                    let groupAliases = Alias.withoutAggregates aliases
+
+                    stmt.GroupBy
+                    |> List.map (Alias.substitute schema groupAliases)
+                    |> all
+                    |> Result.bind (Binder.qualifyMany schema)
+
                 let allAggs = selectAggs @ orderAggs
                 let hasAgg = not (List.isEmpty allAggs)
                 let hasGroupBy = not (List.isEmpty groupBy)
@@ -503,15 +657,21 @@ module internal Optimizer =
             if List.isEmpty stmt.OrderBy then
                 ret tree
             else
-                let qualified =
-                    Binder.qualifyMany schema (stmt.OrderBy |> List.map (fun k -> k.Expression))
+                let aliases = Alias.dropCyclic (Alias.ofItems stmt.Items)
 
-                qualified
-                |> Result.map (fun qs ->
+                result {
+                    let! exprs =
+                        stmt.OrderBy
+                        |> List.map (fun k -> Alias.substitute schema aliases k.Expression)
+                        |> all
+
+                    let! qualified = Binder.qualifyMany schema exprs
+
                     let keys =
-                        List.map2 (fun e (k: SortKey) -> { k with Expression = e }) qs stmt.OrderBy
+                        List.map2 (fun e (k: SortKey) -> { k with Expression = e }) qualified stmt.OrderBy
 
-                    Logical.Sort(keys, tree))
+                    return Logical.Sort(keys, tree)
+                }
 
         let qualifyItems (schema: Schema) (items: SelectItem list) =
             items

@@ -282,6 +282,70 @@ let ``StorageEngine.scanAt: scan も snapshot で版を絞る`` () =
         let all = StorageEngine.scanAt engine None [||] 0 |> ok |> Seq.toArray
         Assert.Equal(2, all.Length))
 
+/// キー 1..2 のファイル（10）とキー 3..4 のファイル（11）を作り、11 のマジックを
+/// 壊す（openTable が失敗する＝開封時に検出される壊れたファイル）。
+let private twoFilesWithBrokenSecond (dir: string) =
+    let f1 =
+        mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1); Entry.put (intKey 2) 2UL (intRow 2) ]
+
+    let f2 =
+        mkSst dir 11L 0 [ Entry.put (intKey 3) 3UL (intRow 3); Entry.put (intKey 4) 4UL (intRow 4) ]
+
+    patchSstable dir 11L (fun data ->
+        let footerStart = data.Length - 80
+        data.[footerStart] <- 0x00uy)
+
+    f1, f2
+
+[<Fact>]
+let ``StorageEngine.scanAt: limit つき走査は必要にならないファイルを開かない`` () =
+    withDir "se-lazy-open" (fun dir ->
+        withEngine dir (fun engine ->
+            let f1, f2 = twoFilesWithBrokenSecond dir
+
+            let engine =
+                { engine with
+                    Version = Version.empty |> Version.addFile f1 |> Version.addFile f2
+                }
+
+            // 壊れたファイル 11 の下限はキー 3。limit 1 の走査はファイル 10 の
+            // 先頭（キー 1）だけで満たされるので、ファイル 11 を開かずに済む。
+            let scanned = ok (StorageEngine.scanAt engine None (intKey 1) 1) |> Seq.toArray
+            Assert.Equal(1, scanned.Length)
+            Assert.Equal(0, Bytes.compare scanned.[0].Key (intKey 1))))
+
+[<Fact>]
+let ``StorageEngine.scanAt: 制限なしの走査は壊れたファイルを先に検出する`` () =
+    withDir "se-eager-open" (fun dir ->
+        withEngine dir (fun engine ->
+            let f1, f2 = twoFilesWithBrokenSecond dir
+
+            let engine =
+                { engine with
+                    Version = Version.empty |> Version.addFile f1 |> Version.addFile f2
+                }
+
+            // 制限なしの走査は全ファイルを読むので、開封時に全ファイルを開いて
+            // 壊れたファイルを Result で検出する。
+            expectErrorKind ErrorKind.CorruptionError "制限なしの走査は壊れたファイルを検出する" (StorageEngine.scanAt engine None [||] 0)))
+
+[<Fact>]
+let ``StorageEngine.scanAt: limit つき走査でも欠落ファイルは先に検出する`` () =
+    withDir "se-missing-open" (fun dir ->
+        withEngine dir (fun engine ->
+            let f1, f2 = twoFilesWithBrokenSecond dir
+            File.Delete(FileMetaData.path dir 11L)
+
+            let engine =
+                { engine with
+                    Version = Version.empty |> Version.addFile f1 |> Version.addFile f2
+                }
+
+            expectErrorKind
+                ErrorKind.IoError
+                "欠落ファイルは limit つき走査でも検出する"
+                (StorageEngine.scanAt engine None (intKey 1) 1)))
+
 [<Fact>]
 let ``StorageEngine: flush すると SSTable から引ける`` () =
     withDir "se2" (fun dir ->

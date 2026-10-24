@@ -284,7 +284,7 @@ module internal Ddl =
     /// （CREATE / DROP すべてが使う「保存 → state 更新」の定型）
     let private saved (state: DbState) (next: Catalog) =
         result {
-            let! store = Catalog.save state.Store next
+            let! store = Catalog.save state.Store state.Catalog next
 
             return
                 { state with

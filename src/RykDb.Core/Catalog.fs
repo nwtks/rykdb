@@ -272,7 +272,12 @@ module internal Catalog =
             | None -> None
 
     /// カタログを保存する（消えた定義は tombstone で落とす）。
-    let save (store: RowStore) (catalog: Catalog) =
+    /// previous は保存前のカタログ（store にあった内容）。
+    /// 消えた定義は「previous にあり catalog にないキー」として差分だけで求める
+    /// （カタログ keyspace の全走査をしない）。
+    /// 書き込みは 1バッチにまとめる
+    /// （tombstone も同じバッチに含めるので WAL の fsync は 1回で済む）。
+    let save (store: RowStore) (previous: Catalog) (catalog: Catalog) =
         let rec numberList (mk: 'a -> uint64 -> 'b) (rest: 'a list) (seq: uint64) (acc: 'b list) =
             match rest with
             | [] -> List.rev acc, seq
@@ -286,37 +291,34 @@ module internal Catalog =
         let indexBatch (i: IndexDefinition) (seq: uint64) =
             keyspace, [| Entry.put (indexKey i.IndexName) seq (toValue (encodeIndex i)) |]
 
+        let deleteBatch (key: byte array) (seq: uint64) = keyspace, [| Entry.delete key seq |]
+
         let bytesEqual (a: byte array) (b: byte array) =
             a.Length = b.Length && Array.forall2 (=) a b
 
-        let isWanted (key: byte array) =
-            match keyKindOf key with
-            | Some(false, _) -> catalog.Tables |> List.exists (fun t -> bytesEqual key (tableKey t.Name))
-            | Some(true, _) -> catalog.Indexes |> List.exists (fun i -> bytesEqual key (indexKey i.IndexName))
-            | None -> false
+        let staleKeys =
+            let wanted =
+                (catalog.Tables |> List.map (fun t -> tableKey t.Name))
+                @ (catalog.Indexes |> List.map (fun i -> indexKey i.IndexName))
+
+            let known =
+                (previous.Tables |> List.map (fun t -> tableKey t.Name))
+                @ (previous.Indexes |> List.map (fun i -> indexKey i.IndexName))
+
+            known
+            |> List.filter (fun k -> not (wanted |> List.exists (fun w -> bytesEqual k w)))
 
         result {
             let! e = RowStore.engine store keyspace
             let seq0 = e.NextSeqNo
             let tableBatches, seq1 = numberList tableBatch catalog.Tables seq0 []
             let indexBatches, seq2 = numberList indexBatch catalog.Indexes seq1 []
-            let! updated = RowStore.writeBatches store (tableBatches @ indexBatches)
-            let! rows = RowStore.scan updated keyspace [||] 0
+            let deleteBatches, _ = numberList deleteBatch staleKeys seq2 []
 
-            let stale =
-                rows
-                |> Seq.choose (fun (key, v) ->
-                    match v with
-                    | Some _ when isWanted key -> None
-                    | Some _ -> Some key
-                    | None -> None)
-                |> Seq.toList
+            let! updated =
+                RowStore.writeBatches store (tableBatches @ indexBatches @ deleteBatches)
 
-            if List.isEmpty stale then
-                return updated
-            else
-                let deletes, _ = numberList Entry.delete stale seq2 []
-                return! RowStore.writeBatches updated [ (keyspace, Array.ofList deletes) ]
+            return updated
         }
 
     /// カタログを読み込む。キーが無ければ空を返す。

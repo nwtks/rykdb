@@ -302,3 +302,51 @@ let ``Memtable: 挿入順に関わらずキー昇順で列挙される`` () =
     all
     |> Array.pairwise
     |> Array.iter (fun (a, b) -> Assert.True(compareKeyBytes a.Key b.Key < 0, "キー昇順になっていない"))
+
+[<Fact>]
+let ``Memtable: 別のキーが混ざっていても可視な最新版を返す`` () =
+    // 同じキーの版が連続して並ぶ保証はない（Treap の形は挿入順で変わる）。
+    let mem =
+        Memtable.apply
+            [|
+                Entry.put (intKey 1) 1UL (intRow 1)
+                Entry.put (intKey 2) 2UL (intRow 2)
+                Entry.put (intKey 1) 5UL (intRow 5)
+                Entry.put (intKey 2) 7UL (intRow 7)
+                Entry.put (intKey 1) 9UL (intRow 9)
+            |]
+            Memtable.empty
+
+    // 最新版（SeqNo が最大の版）
+    Assert.Equal<uint64>(9UL, (entry (Memtable.getVisible mem (intKey 1) None)).SeqNo)
+    Assert.Equal<uint64>(7UL, (entry (Memtable.getVisible mem (intKey 2) None)).SeqNo)
+
+    // snapshot で切ると、その時点で最新の版
+    Assert.Equal<uint64>(5UL, (entry (Memtable.getVisible mem (intKey 1) (Some 6UL))).SeqNo)
+    Assert.Equal<uint64>(2UL, (entry (Memtable.getVisible mem (intKey 2) (Some 6UL))).SeqNo)
+    Assert.Equal<uint64>(1UL, (entry (Memtable.getVisible mem (intKey 1) (Some 1UL))).SeqNo)
+
+    // どの版も見えない / 存在しないキー
+    Assert.True((Memtable.getVisible mem (intKey 1) (Some 0UL)).IsNone)
+    Assert.True((Memtable.getVisible mem (intKey 99) None).IsNone)
+    Assert.True((Memtable.getVisible mem (intKey 99) (Some 100UL)).IsNone)
+
+[<Fact>]
+let ``Memtable: getVisible は探索が対数時間（多数の版があっても比例しない）`` () =
+    // 同じキーの版を 2 万個積む。
+    // 以前は一致したノードの子をすべて辿っていた（木の大きさに比例）ので、
+    // 1 回の参照で 2 万ノードを歩いていた。今は対数時間。
+    let versions = 20_000
+
+    let mem =
+        Seq.init versions (fun i -> Entry.put (intKey 1) (uint64 i) (intRow i))
+        |> fun es -> Memtable.apply es Memtable.empty
+
+    let sw = System.Diagnostics.Stopwatch.StartNew()
+
+    for _ in 1..10_000 do
+        Memtable.getVisible mem (intKey 1) None |> ignore
+
+    let ms = sw.ElapsedMilliseconds
+    // 「実用時間内」の緩い基準（探索が木の大きさに比例していないこと）。
+    Assert.True(ms < 2000L, sprintf "getVisible が遅すぎます: %d ms" ms)
