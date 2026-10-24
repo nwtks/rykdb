@@ -136,7 +136,9 @@ type internal TransactionManager =
         NextSeqNo: uint64
         /// 次に採番する TxnId
         NextTxnId: TxnId
-        /// commit 済みの transaction が最後に書いた (keyspace:キー) -> SeqNo
+        /// commit 済みの transaction が最後に書いた (keyspace:キー) -> SeqNo。
+        /// commit のたびに `activeSnapshot` より古い版を捨てるので、
+        /// サイズは「最古の active snapshot 以降に書かれたキー」に収まって無限成長しない。
         LastCommitted: Map<string, uint64>
         /// アクティブな transaction
         Active: Map<TxnId, TxnRecord>
@@ -195,6 +197,11 @@ module internal TransactionManager =
     /// 1. write-write 競合を検査する。
     ///    「transaction の snapshot より後に、衝突する key が commit 済み」であれば衝突。
     /// 2. 問題なければ SeqNo を採番して LastCommitted を更新する。
+    /// 3. LastCommitted のうち SeqNo < activeSnapshot の版を掃除する。
+    ///    衝突判定は「commit が transaction の snapshot より後」でしか起こらない
+    ///    （未来の snapshot は現在の LastCommitSeqNo 以上）なので、
+    ///    「全部の active snapshot 以降に commit された版」以外は捨てられる。
+    ///    捨てないと書き込んだ全キーがプロセス寿命の間メモリに残り続ける。
     /// 返り値の Entry 配列を StorageEngine に流し込むと DB に反映される。
     let commit (mgr: TransactionManager) (txn: Transaction) =
         let findConflicts (txn: Transaction) (lastCommitted: Map<string, uint64>) (snapSeq: uint64) =
@@ -232,15 +239,22 @@ module internal TransactionManager =
                 )
             else
                 let batches, nextSeq = Transaction.toEntries mgr.NextSeqNo txn
-                let lastCommitted = updateLastCommitted batches mgr.LastCommitted
+                let committed = updateLastCommitted batches mgr.LastCommitted
                 let commitSeq = nextSeq - 1UL
 
-                let updated =
+                let staged =
                     { mgr with
+                        Active = Map.remove txn.TxnId mgr.Active
+                    }
+
+                let gcThreshold = activeSnapshot staged
+                let lastCommitted = committed |> Map.filter (fun _ seq -> seq >= gcThreshold)
+
+                let updated =
+                    { staged with
                         NextSeqNo = nextSeq
                         LastCommitted = lastCommitted
                         LastCommitSeqNo = commitSeq
-                        Active = Map.remove txn.TxnId mgr.Active
                     }
 
                 Ok(updated, commitSeq, batches)

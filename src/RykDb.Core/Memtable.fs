@@ -30,11 +30,13 @@ module internal Entry =
 
     let approxBytes (e: Entry) =
         let valueBytes (v: SqlValue) =
-            match v with
-            | SqlValue.Text s -> s.Length + 2
-            | SqlValue.Blob b -> b.Length + 2
-            | SqlValue.Null -> 1
-            | _ -> 9
+            match ValueCodec.fixedEncodedBytes v with
+            | Some n -> n
+            | None ->
+                match v with
+                | SqlValue.Text s -> s.Length + 2
+                | SqlValue.Blob b -> b.Length + 2
+                | _ -> 1
 
         let payload =
             e.Value

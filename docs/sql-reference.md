@@ -395,6 +395,7 @@ HAVING COUNT(*) > 1
 - `SUM` / `AVG` は `SUM / COUNT` を実行時に計算する。
 - `MIN` / `MAX` は文字列・日付・時刻にも使える。
 - `GROUP BY` を書かない `SELECT SUM(x) FROM t` は表全体の 1グループとして集計される。
+  入力が 0行でも 1行を返す（`COUNT(*)` は `0`、`SUM` / `AVG` / `MIN` / `MAX` は `NULL`）。
 - 集約関数のエラーは**伝播する**。
   文字列列に `SUM` を掛けると `NULL` が返り、エラーにはならない。
 - `COUNT(DISTINCT x)` は**重複排除する**。
@@ -550,6 +551,7 @@ SELECT id FROM people WHERE dept_id > 2;   -- 単一列索引なので範囲走�
 
 - 結合順序は `FROM` に書かれた順（選択性に基づく並べ替えは未実装）。
 - `LEFT JOIN` は右側の一致がない場合に `NULL` を補う。
+- `ON` 句の評価が失敗した場合（型エラーなど）は、黙って行を落とさず**クエリ全体がエラー**になる。
 
 ```sql
 SELECT p.id, p.name, d.dname
@@ -795,8 +797,10 @@ DROP INDEX [IF EXISTS] 索引名;
 ```
 
 - `IF EXISTS` を付けると、存在しなくても**エラーにならない**。
-- `DROP TABLE` はテーブル本体と、その索引 keyspace だけを消す
+- `DROP TABLE` はテーブル本体と、その索引 keyspace のエントリに tombstone を書いてからカタログ定義を外す
   （行データは LSM の compaction で再利用されるため即座に解放される）。
+  カタログだけを外すと、同名で再作成したときに旧データが復活するため、tombstone を先に確定させる。
+- `DROP INDEX` も索引 keyspace の全エントリに tombstone を書いてから定義を外す。
 
 ```sql
 DROP TABLE IF EXISTS tmp_data;

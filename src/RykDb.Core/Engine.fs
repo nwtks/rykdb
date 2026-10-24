@@ -395,27 +395,80 @@ module internal Ddl =
                     saved state next
                     >>= fun withCatalog -> backfillIndex withCatalog ci.Table idxSchema
 
-    let private dropItem
-        (state: DbState)
-        (kind: string)
-        (name: string)
-        (ifExists: bool)
-        (find: Catalog -> string -> 'a option)
-        (remove: Catalog -> string -> Catalog)
-        =
-        match find state.Catalog name with
-        | Some _ -> saved state (remove state.Catalog name)
+    /// DROP TABLE。
+    /// 手順:
+    ///   1. 残りの全行を「主キー + 全索引」に tombstone で消す（DML.DELETE と同じ経路）
+    ///   2. commit してからカタログから定義を外す
+    /// カタログを先に外して keyspace を残すと、同名で再 CREATE したときに旧データがそのまま見える
+    /// （keyspace は名前由来のディレクトリで再利用される）。
+    let dropTable (state: DbState) (name: string) (ifExists: bool) =
+        match Catalog.findTable state.Catalog name with
         | None ->
             if ifExists then
                 ret state
             else
-                err (sprintf "%s %s が存在しません" kind name |> DbError.notFound)
+                err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
+        | Some defn ->
+            result {
+                let! schema = Catalog.toSchema defn
 
-    let dropTable (state: DbState) (name: string) (ifExists: bool) =
-        dropItem state "テーブル" name ifExists Catalog.findTable Catalog.removeTable
+                let withIndexes =
+                    { schema with
+                        Indexes = Catalog.indexSchemasOf state.Catalog schema.Name
+                    }
 
+                let mgr, txn = TransactionManager.beginTxn state.Manager
+                let! rows = Dml.scanByPrimaryKey state.Store withIndexes Snapshot.noLimit 0
+
+                let! txn2 =
+                    foldOk
+                        (fun t row ->
+                            let pk = TableSchema.primaryKeyOf schema row
+                            Dml.deleteByPrimaryKey state.Store withIndexes Snapshot.noLimit t pk)
+                        txn
+                        rows
+
+                let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
+
+                return!
+                    saved
+                        { state with
+                            Store = store
+                            Manager = mgr2
+                        }
+                        (Catalog.removeTable state.Catalog name)
+            }
+
+    /// DROP INDEX。
+    /// 索引 keyspace の全エントリへ tombstone を書いてからカタログから定義を外す。
+    /// 書かないと、消した行の索引エントリが keyspace に残り、
+    /// 同名で CREATE INDEX し直したときに tombstone のない旧エントリが見えてしまう。
     let dropIndex (state: DbState) (name: string) (ifExists: bool) =
-        dropItem state "索引" name ifExists Catalog.findIndex Catalog.removeIndex
+        match Catalog.findIndex state.Catalog name with
+        | None ->
+            if ifExists then
+                ret state
+            else
+                err (sprintf "索引 %s が存在しません" name |> DbError.notFound)
+        | Some defn ->
+            result {
+                let space = Keyspace.index defn.IndexName
+                let mgr, txn = TransactionManager.beginTxn state.Manager
+                let! entries = RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
+
+                let! txn2 =
+                    foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn entries
+
+                let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
+
+                return!
+                    saved
+                        { state with
+                            Store = store
+                            Manager = mgr2
+                        }
+                        (Catalog.removeIndex state.Catalog name)
+            }
 
 module internal Engine =
     let runStatement (state: DbState) (txn: Transaction) (stmt: Statement) =

@@ -138,6 +138,19 @@ let rec go (cur: Op) : Result<SqlValue array array, DbError> =
 // ✅ 既出の値を全部覚える（Set<string> / HashSet）必要がある
 ```
 
+### 2.5 評価エラーを `Op.empty` で「0 行」にしない
+
+JOIN の ON 句のように行ごとに評価する式が失敗したとき、`Op.empty` に落とすと
+**エラーが消えて「一致なし」の結果**になる。
+`INNER JOIN` では空結果、`LEFT JOIN` では NULL 拡張行が返り、どちらも原因を隠す。
+
+```fsharp
+// ❌ 評価失敗を「行が無い」と区別できない
+| Error _ -> Op.empty
+// ✅ Op の計算としてエラーを流す（戻り値の Result で呼び出し元へ届く）
+| Error e -> Op.Compute(fun () -> err e)
+```
+
 ---
 
 ## 3. `Optimizer.exec` の罠
@@ -1034,3 +1047,38 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
 0 を「最新版だけ残す」と解釈すると全履歴を失う。
 replay 中や境界未設定時は 0 のままにし、通常の commit では
 `TransactionManager.activeSnapshot`（active の最小 snapshot、無ければ `LastCommitSeqNo + 1`）を設定する。
+
+### 11.10 DROP は「keyspace の tombstone → カタログ削除」の順で行う
+
+`DROP TABLE` / `DROP INDEX` はカタログから定義を外すだけでは不十分。
+keyspace のディレクトリ名は名前から決まる（`t:<name>` / `i:<name>`）ので、
+残骸があるまま同名で再作成すると**旧データや旧索引エントリが見える**。
+特に「索引を DROP → 行を DELETE → 同名 CREATE INDEX」の順では、
+DELETE 時に索引 tombstone が書かれないため、backfill 後の索引検索で削除済みの行が復活する。
+
+- `DROP TABLE`: 残りの全行を `Dml.deleteByPrimaryKey`（主キー + 全索引へ tombstone）で消して commit し、その後 `Catalog.removeTable`。
+- `DROP INDEX`: 索引 keyspace の全キーへ `Transaction.remove` を書いて commit し、その後 `Catalog.removeIndex`。
+- 順序を逆にすると「カタログに無いのに keyspace は残る」状態で窓が空く。
+  tombstone を先に確定させること。
+
+### 11.11 compaction の出力分割は「件数」ではなく「バイト」
+
+`SstEntry.splitInto (MaxInputFiles * 4)` のように **ファイル数の上限をエントリ数として使う**と、
+値の大きさに関係なく 128エントリで分割され、大きい値では 1ファイルが肥大化する。
+出力は `CompactionOptions.OutputFileTargetBytes`（既定 4MiB）と `SstEntry.splitIntoBytes` で分ける。
+`splitIntoBytes` は概算バイト（`SstEntry.approximateBytes`）で切るので、厳密なファイルサイズではない。
+固定長の型の定数は `ValueCodec.fixedEncodedBytes` に集約し、memtable の `Entry.approxBytes` と共有する
+（TEXT / BLOB だけは、memtable が安価な UTF-16 長、SSTable が UTF-8 実バイト数と方針が違う）。
+1エントリが目標を超える場合は、空の塊を作らず 1エントリだけのファイルにする。
+
+### 11.12 `LastCommitted` は commit のたびに active snapshot 以前を捨てる
+
+`LastCommitted` は書き込みキーの衝突検出用だが、捨てないと**プロセス寿命の間ずっと全キーを保持**する。
+`TransactionManager.commit` は自分の transaction を `Active` から外した後で `activeSnapshot` を取り直し、
+`SeqNo < その値` の版を `Map.filter` で捨てる。
+
+- 生きている transaction の snapshot 以降の版だけが衝突判定に使われる
+  （衝突条件は「commit の SeqNo > txn の snapshot」なので、それより古い版は不要）。
+- active が無ければ境界は `LastCommitSeqNo + 1`。次の commit で直前の commit の版まで掃除される。
+- 掃除を「commit した版そのものを除く」にすると、まだ古い snapshot の transaction が
+  同じキーを書いたときに衝突を見逃すので、必ず `activeSnapshot` を基準にする。

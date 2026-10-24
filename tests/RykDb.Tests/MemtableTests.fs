@@ -88,6 +88,29 @@ let ``Memtable: Count と ApproxBytes は挿入したエントリの合計にな
     Assert.Equal(mem.ApproxBytes, same.ApproxBytes)
 
 [<Fact>]
+let ``Memtable / SSTable の概算は固定長の値で同じ定数を使う`` () =
+    let values =
+        [
+            SqlValue.Null
+            SqlValue.Bool true
+            SqlValue.Int 42L
+            SqlValue.Real 1.5
+            SqlValue.Decimal 1.5M
+            SqlValue.Date(System.DateOnly(2026, 1, 2))
+            SqlValue.Timestamp(System.DateTimeOffset(2026, 1, 2, 3, 4, 5, System.TimeSpan.Zero))
+            SqlValue.Uuid System.Guid.Empty
+        ]
+
+    let key = [| 1uy |]
+
+    // Entry 側の overhead は「キー + SeqNo 8 + 値の個数 2」、
+    // SstEntry 側は「キー + 値の個数 4」。固定長なら差は常に 6 になる。
+    for v in values do
+        let a = Entry.approxBytes (Entry.put key 1UL [| v |])
+        let b = SstEntry.approximateBytes (SstEntry.make key 1UL (Some [| v |]))
+        Assert.Equal(6, a - b)
+
+[<Fact>]
 let ``Memtable: 同一キーは SeqNo が最大の版を返す`` () =
     // 挿入順をわざとばらばらにする
     let mem =

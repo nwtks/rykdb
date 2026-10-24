@@ -65,6 +65,31 @@ let ``SstEntry.splitInto: n 件ずつに分割`` () =
     Assert.Equal(1, chunks.[2].Length)
 
 [<Fact>]
+let ``SstEntry.splitIntoBytes: エントリ数ではなく概算バイトで分割`` () =
+    let text = String.replicate 1000 "x"
+
+    let items =
+        [| 1; 2; 3 |]
+        |> Array.map (fun i -> SstEntry.make (intKey i) (uint64 i) (Some [| SqlValue.Text text |]))
+
+    // 1件あたり約 1KB。目標 2.5KB なら 2 + 1 に分かれる。
+    let chunks = SstEntry.splitIntoBytes 2500L items
+    Assert.Equal(2, chunks.Length)
+    Assert.Equal(2, chunks.[0].Length)
+    Assert.Equal(1, chunks.[1].Length)
+
+    // 空入力は空。
+    Assert.Empty(SstEntry.splitIntoBytes 2500L [||])
+
+    // 1件だけで目標を超えても、空の塊を作らず 1件ずつ出す。
+    let big =
+        [|
+            SstEntry.make (intKey 1) 1UL (Some [| SqlValue.Text(String.replicate 5000 "y") |])
+        |]
+
+    Assert.Equal(1, (SstEntry.splitIntoBytes 100L big).Length)
+
+[<Fact>]
 let ``SstEntry.mergeSorted: ソート済みにマージ`` () =
     let a = [| SstEntry.make (intKey 1) 1UL None; SstEntry.make (intKey 3) 1UL None |]
     let b = [| SstEntry.make (intKey 2) 1UL None; SstEntry.make (intKey 4) 1UL None |]

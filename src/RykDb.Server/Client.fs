@@ -15,6 +15,36 @@ type Reply =
     | Failure of string
     | Halt
 
+/// サーバがプロトコルに載せるために付けたエスケープ
+/// （`\\` / `\n` / `\r`）を 1パスで元へ戻す。
+let private unescapeLine (s: string) =
+    let sb = System.Text.StringBuilder s.Length
+
+    let rec loop i =
+        if i >= s.Length then
+            sb.ToString()
+        else
+            match s.[i] with
+            | '\\' when i + 1 < s.Length ->
+                match s.[i + 1] with
+                | 'n' ->
+                    sb.Append '\n' |> ignore
+                    loop (i + 2)
+                | 'r' ->
+                    sb.Append '\r' |> ignore
+                    loop (i + 2)
+                | '\\' ->
+                    sb.Append '\\' |> ignore
+                    loop (i + 2)
+                | _ ->
+                    sb.Append '\\' |> ignore
+                    loop (i + 1)
+            | c ->
+                sb.Append c |> ignore
+                loop (i + 1)
+
+    loop 0
+
 /// TCP 経由の SQL クライアント。
 type RykDbClient(host: string, port: int) =
     let client = new System.Net.Sockets.TcpClient(host, port)
@@ -66,7 +96,7 @@ type RykDbClient(host: string, port: int) =
                         |> List.choose (fun _ ->
                             let r = reader.ReadLine()
 
-                            if isNull r then None else Some r)
+                            if isNull r then None else Some(unescapeLine r))
 
                     Rows(columns, rows)
 

@@ -19,6 +19,8 @@ type internal CompactionOptions =
         L0CompactionTrigger: int
         /// 1回の compaction で入力するファイル数の上限
         MaxInputFiles: int
+        /// 出力 SSTable ファイルの目標バイト数（概算値で近似するため厳密ではない）
+        OutputFileTargetBytes: int64
         /// このレベル以下（最下位側）へ降ろす compaction で tombstone を消すか（既定値 = 最下位）
         DropTombstonesBelowLevel: int
         /// Bloom filter の誤検出率
@@ -46,6 +48,7 @@ module internal CompactionOptions =
             MaxLevelBytes = limits
             L0CompactionTrigger = 4
             MaxInputFiles = 32
+            OutputFileTargetBytes = 4L * mib
             DropTombstonesBelowLevel = Levels.Max
             BloomFalsePositiveRate = 0.01
         }
@@ -219,7 +222,7 @@ module internal Compaction =
                     info
                 )
             else
-                let chunks = SstEntry.splitInto (options.MaxInputFiles * 4) cleaned
+                let chunks = SstEntry.splitIntoBytes options.OutputFileTargetBytes cleaned
 
                 result {
                     let! added = writeChunks chunks outputLevel

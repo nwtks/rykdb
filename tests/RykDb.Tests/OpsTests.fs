@@ -221,7 +221,7 @@ let ``集約: COUNT / SUM / AVG / MIN / MAX`` () =
     Assert.Equal<int64>(3L, asInt r.[5])
 
 [<Fact>]
-let ``集約: 行が 0 でも COUNT(*) は 1 行を返す`` () =
+let ``集約: 行が 0 でも COUNT(*) は 1行を返す`` () =
     let rows =
         ok (
             Op.toArray (
@@ -229,11 +229,12 @@ let ``集約: 行が 0 でも COUNT(*) は 1 行を返す`` () =
             )
         )
 
-    // 0 件なら 0 行（1 行 (0) を返さない）。
-    Assert.Equal<int>(0, rows.Length)
+    // SQL 標準どおり、GROUP BY なしの集約は入力 0行でも 1行 (0) を返す。
+    Assert.Equal<int>(1, rows.Length)
+    Assert.Equal<int64>(0L, asInt rows.[0].[0])
 
 [<Fact>]
-let ``集約: GROUP BY でグループごとに 1 行`` () =
+let ``集約: GROUP BY でグループごとに 1行`` () =
     let op =
         opOfRows
             [
@@ -244,8 +245,7 @@ let ``集約: GROUP BY でグループごとに 1 行`` () =
 
     let aggs = [ (AggFunc.Sum, false, false, col "b") ]
     let rows = ok (Op.toArray (ok (Ops.aggregate schema2 op [ col "a" ] aggs)))
-
-    // 2 グループ
+    // 2グループ
     Assert.Equal<int>(2, rows.Length)
 
     // 最初に現れたグループが先
@@ -255,7 +255,7 @@ let ``集約: GROUP BY でグループごとに 1 行`` () =
     Assert.Equal(30M, asDec rows.[1].[1])
 
 [<Fact>]
-let ``集約: GROUP BY のキーが NULL の行も 1 グループになる`` () =
+let ``集約: GROUP BY のキーが NULL の行も 1グループになる`` () =
     let op: Op =
         Op.ofArray [| [| SqlValue.Null; SqlValue.Int 1L |]; [| SqlValue.Null; SqlValue.Int 2L |] |]
 
@@ -468,7 +468,7 @@ let ``末尾再帰: 20 万段の式を havingFilter してもスタックを食�
     Assert.True(ok (Ops.havingFilter groupBy aggs deep r))
 
 [<Fact>]
-let ``結合: INNER JOIN は ON の評価失敗で打ち切る`` () =
+let ``結合: INNER JOIN の ON 評価失敗は Error になる`` () =
     let left = Op.ofArray [| [| SqlValue.Int 1L |] |]
     let right = Op.ofArray [| [| SqlValue.Int 1L |] |]
 
@@ -476,16 +476,16 @@ let ``結合: INNER JOIN は ON の評価失敗で打ち切る`` () =
         Expr.Binary(BinaryOp.Div, Expr.Literal(Literal.Int 1L), Expr.Literal(Literal.Int 0L))
 
     let on = Expr.Binary(BinaryOp.Eq, div0, Expr.Literal(Literal.Int 0L))
-    let rows = ok (Op.toArray (ok (Ops.innerJoin leftSchema left rightSchema right on)))
-    Assert.Empty rows
+
+    // 黙って空結果にせず、エラーとして呼び出し元へ返す。
+    expectError "ON の評価失敗が握り潰されています" (Op.toArray (ok (Ops.innerJoin leftSchema left rightSchema right on)))
 
 [<Fact>]
-let ``結合: LEFT JOIN は一致後の ON 評価失敗で次の行へ進む`` () =
+let ``結合: LEFT JOIN の ON 評価失敗も Error になる`` () =
     let left = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
     let right = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
 
-    // 「左が一致すれば true、そうでなければ 1/0 を評価してエラー」。
-    // 左 1 行目は右 1 行目と一致した後にエラーへ当たるので、次の左行へ進む（NULL 拡張はしない）。
+    // 一致した後にエラーへ当たっても、中途半端な行を返さずエラーにする。
     let div0 =
         Expr.Binary(BinaryOp.Div, Expr.Literal(Literal.Int 1L), Expr.Literal(Literal.Int 0L))
 
@@ -496,8 +496,4 @@ let ``結合: LEFT JOIN は一致後の ON 評価失敗で次の行へ進む`` (
             Expr.Binary(BinaryOp.Eq, div0, Expr.Literal(Literal.Int 0L))
         )
 
-    let rows = ok (Op.toArray (ok (Ops.leftJoin leftSchema left rightSchema right on)))
-    // 一致した 1 行だけが返り、エラーで止まらない
-    Assert.Equal<int>(1, rows.Length)
-    Assert.Equal<int64>(1L, asInt rows.[0].[0])
-    Assert.Equal<int64>(1L, asInt rows.[0].[1])
+    expectError "ON の評価失敗が握り潰されています" (Op.toArray (ok (Ops.leftJoin leftSchema left rightSchema right on)))

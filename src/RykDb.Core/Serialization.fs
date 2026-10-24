@@ -583,3 +583,18 @@ module internal ValueCodec =
             let! items, c = Reader.readItems n readValue c
             return List.toArray items, c
         }
+
+    /// 固定長の値の符号化サイズ（型タグ込み）。
+    /// TEXT / BLOB は長さ依存なので `None`。
+    let fixedEncodedBytes (v: SqlValue) =
+        match v with
+        | SqlValue.Null -> Some 1
+        | SqlValue.Bool _ -> Some 2
+        | SqlValue.Int _ -> Some 9
+        | SqlValue.Real _ -> Some 9
+        | SqlValue.Decimal _ -> Some 33
+        | SqlValue.Date _ -> Some 9
+        | SqlValue.Timestamp _ -> Some 9
+        | SqlValue.Uuid _ -> Some 17
+        | SqlValue.Text _
+        | SqlValue.Blob _ -> None

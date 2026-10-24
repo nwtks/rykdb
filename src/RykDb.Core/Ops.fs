@@ -334,9 +334,8 @@ module internal Ops =
         }
 
     /// GROUP BY + 集約。
-    /// groupBy が空でも集約があれば 1グループだけ出す。
-    /// （`SELECT COUNT(*) FROM 空のテーブル` が 0 ではなく 1行を返さないと
-    ///   SQL の通常の挙動と違ってしまうため）
+    /// groupBy が空でも集約があれば 1グループだけ出す
+    /// （`SELECT COUNT(*) FROM 空のテーブル` が 0 ではなく 1行を返すため。SQL の通常の挙動）。
     let aggregate (schema: Schema) (src: Op) (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
         let order = ResizeArray<string>()
 
@@ -531,12 +530,20 @@ module internal Ops =
         result {
             let! rows = Op.toArray src
             let! order, table = groupRows rows 0
-            return! build table order (ResizeArray<SqlValue array>())
+
+            if List.isEmpty order && List.isEmpty groupBy then
+                let vals =
+                    aggs |> List.map (fun (f, _, _, _) -> finishAcc (emptyAcc f)) |> List.toArray
+
+                return Op.ofArray [| vals |]
+            else
+                return! build table order (ResizeArray<SqlValue array>())
         }
 
     /// nested loop 結合の内側ループ（1つの左行 × 右の全行）を回す共通処理。
     /// onExhausted matched は右を最後まで試し終えたときの Op。
-    /// onError matched は ON 句の評価が失敗したときの Op。
+    /// onError error matched は ON 句の評価が失敗したときの Op。
+    /// 失敗はエラーとして流す（黙って行を落とすと気づきにくい誤答になる）。
     /// matched は「この左行で既に一致を出したか」。
     /// INNER はどちらも matched を無視し、LEFT だけが NULL 拡張と継続を使い分ける。
     let private joinLoop
@@ -544,7 +551,7 @@ module internal Ops =
         (rightSchema: Schema)
         (on: Expr)
         (onExhausted: bool -> Op)
-        (onError: bool -> Op)
+        (onError: DbError -> bool -> Op)
         (rightRows: SqlValue array array)
         (lrow: SqlValue array)
         =
@@ -560,13 +567,13 @@ module internal Ops =
                 match joinPred leftSchema rightSchema on lrow rrow with
                 | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, loop true (i + 1))))
                 | Ok false -> Op.Compute(fun () -> Op.next (loop matched (i + 1)))
-                | Error _ -> onError matched
+                | Error e -> onError e matched
 
         loop false 0
 
     /// INNER JOIN（nested loop）。
     /// 右側は内側ループごとに先頭から引き直す。
-    /// 一致が無い左行は捨て、ON 句の評価失敗は全体を打ち切る。
+    /// 一致が無い左行は捨て、ON 句の評価が失敗したらクエリ全体を Error で落とす。
     let innerJoin (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
         let rec joinRows rightRows (cur: Op) =
             Op.pull cur (fun lrow lnext ->
@@ -576,7 +583,7 @@ module internal Ops =
                         rightSchema
                         on
                         (fun _ -> joinRows rightRows lnext)
-                        (fun _ -> Op.empty)
+                        (fun e _ -> Op.Compute(fun () -> err e))
                         rightRows
                         lrow
                 ))
@@ -585,8 +592,7 @@ module internal Ops =
 
     /// LEFT JOIN。
     /// 左の行に右が 1行も無ければ NULL で埋める。
-    /// 一致済みの左行で ON 句の評価が失敗したときだけ次の左行へ進む
-    /// （未一致なら INNER と同じく打ち切る）。
+    /// ON 句の評価が失敗したらクエリ全体を Error で落とす。
     let leftJoin (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
         let rec joinRows rightRows width (cur: Op) =
             Op.pull cur (fun lrow lnext ->
@@ -596,9 +602,7 @@ module internal Ops =
                     else
                         Op.Step(Array.append lrow (Array.create width SqlValue.Null), joinRows rightRows width lnext)
 
-                let onError matched =
-                    if matched then joinRows rightRows width lnext else Op.empty
-
+                let onError e _ = Op.Compute(fun () -> err e)
                 Op.next (joinLoop leftSchema rightSchema on onExhausted onError rightRows lrow))
 
         Op.toArray right

@@ -258,3 +258,28 @@ let ``Compaction: 入力の読み込みに失敗したらそのエラーを返�
         let broken (_: FileMetaData) = err (DbError.corruption "壊れた SSTable")
         let r = Compaction.compact dir version pickFirstLevel 0UL 100L broken
         expectErrorKind ErrorKind.CorruptionError "読み込みエラーはそのまま伝播する" r)
+
+[<Fact>]
+let ``Compaction: 出力はエントリ数ではなく OutputFileTargetBytes ごとに分ける`` () =
+    withDir "comp-split-bytes" (fun dir ->
+        let text = String.replicate 2000 "x"
+
+        let es =
+            [ 1..5 ]
+            |> List.map (fun i -> Entry.put (intKey i) (uint64 i) [| SqlValue.Text text |])
+
+        let f = mkSst dir 10L 1 es
+        let version = Version.addFile f Version.empty
+
+        // 1エントリ約 2KB。旧実装の「128エントリ」では 1ファイルに収まるが、
+        // 目標 5KB なら 2 + 2 + 1 に割れる。
+        let options =
+            { pickFirstLevel with
+                OutputFileTargetBytes = 5000L
+            }
+
+        let result, _ = compactAll dir version 0UL options
+
+        let counts = result.Added |> List.sortBy _.FileNumber |> List.map _.EntryCount
+
+        Assert.Equal<int64 list>([ 2L; 2L; 1L ], counts))

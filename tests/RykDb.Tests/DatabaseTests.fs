@@ -938,6 +938,46 @@ let ``Database: 索引列を更新すると索引も追従する`` () =
         Assert.Equal<int>(0, miss.Rows.Length))
 
 [<Fact>]
+let ``Database: DROP TABLE 後の同名再作成で旧データが復活しない`` () =
+    withDb "drop-table-recreate" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 'old'), (2, 'old')")
+        let db3 = exec db2 "DROP TABLE t"
+        let db4 = exec db3 "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"
+        let _, res = ok (db4.Query "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(0L, asInt res.Rows.[0].[0]))
+
+[<Fact>]
+let ``Database: 索引ごと DROP TABLE しても旧索引エントリが復活しない`` () =
+    withDb "drop-table-index" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1,10),(2,20)")
+        let db3 = exec db2 "CREATE INDEX ix_g ON t (g)"
+        let db4 = exec db3 "DROP TABLE t"
+        let db5 = exec db4 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db6 = exec db5 "CREATE INDEX ix_g ON t (g)"
+        let _, res = ok (db6.Query "SELECT id FROM t WHERE g = 10")
+        Assert.Equal<int>(0, res.Rows.Length))
+
+[<Fact>]
+let ``Database: DROP INDEX 後の同名再作成で旧索引エントリが復活しない`` () =
+    withDb "drop-index-recreate" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1,10),(2,20)")
+        let db3 = exec db2 "CREATE INDEX ix_g ON t (g)"
+        // 索引を落としてから行を消す（この間は索引 tombstone が書かれない）
+        let db4 = exec db3 "DROP INDEX ix_g"
+        let db5 = exec db4 "DELETE FROM t WHERE id = 1"
+        let db6 = exec db5 "CREATE INDEX ix_g ON t (g)"
+        // 旧エントリが keyspace に残っていれば、消した行が索引検索で復活する
+        let _, gone = ok (db6.Query "SELECT id FROM t WHERE g = 10")
+        Assert.Equal<int>(0, gone.Rows.Length)
+
+        let _, alive = ok (db6.Query "SELECT id FROM t WHERE g = 20")
+        Assert.Equal<int>(1, alive.Rows.Length)
+        Assert.Equal<int64>(2L, asInt alive.Rows.[0].[0]))
+
+[<Fact>]
 let ``Database: 負数の主キー等値検索`` () =
     withDb "reg-negpk" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"

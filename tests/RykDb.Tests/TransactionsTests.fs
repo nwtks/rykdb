@@ -153,6 +153,37 @@ let ``TransactionManager.activeSnapshot: 最古の active snapshot を返す`` (
     Assert.Equal<uint64>(System.UInt64.MaxValue, TransactionManager.activeSnapshot saturated)
 
 [<Fact>]
+let ``TransactionManager.commit: active が無くなれば LastCommitted も掃除する`` () =
+    let mgr = TransactionManager.create ()
+    let mgr, t1 = TransactionManager.beginTxn mgr
+    let t1 = Transaction.put t1 "t:x" [| 1uy |] [| SqlValue.Int 1L |]
+    let mgr, _, _ = TransactionManager.commit mgr t1 |> ok
+
+    // commit 直後は自分の版が残る
+    Assert.Equal<int>(1, mgr.LastCommitted.Count)
+
+    // active の無い状態で次の commit が来たら、もう衝突判定に使わないので捨てられる
+    let mgr, t2 = TransactionManager.beginTxn mgr
+    let mgr, _, _ = TransactionManager.commit mgr t2 |> ok
+    Assert.Equal<int>(0, mgr.LastCommitted.Count)
+
+[<Fact>]
+let ``TransactionManager.commit: 古い snapshot の transaction が居る間は掃除しない`` () =
+    let mgr = TransactionManager.create ()
+    let mgr, old = TransactionManager.beginTxn mgr
+    let mgr, w = TransactionManager.beginTxn mgr
+    let w = Transaction.put w "t:x" [| 1uy |] [| SqlValue.Int 1L |]
+    let mgr, _, _ = TransactionManager.commit mgr w |> ok
+
+    // old (snapshot 0) が生きている間は、衝突検出のために版を残す
+    Assert.True(mgr.LastCommitted.ContainsKey(Transaction.conflictKey "t:x" [| 1uy |]))
+
+    let mgr = TransactionManager.abort mgr old.TxnId
+    let mgr, w2 = TransactionManager.beginTxn mgr
+    let mgr, _, _ = TransactionManager.commit mgr w2 |> ok
+    Assert.Equal<int>(0, mgr.LastCommitted.Count)
+
+[<Fact>]
 let ``TransactionManager.commit: abort 済み transaction の commit はエラー`` () =
     let mgr = TransactionManager.create ()
     let mgr, txn = TransactionManager.beginTxn mgr

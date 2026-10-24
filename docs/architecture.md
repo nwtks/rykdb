@@ -633,6 +633,8 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 競合キーの照合は `keyspace + ":" + base64(キー)` の文字列で行う。
 `LastCommitted` はプロセス内の状態で、ディスクには残さない
 （commit 済みのデータは再起動後も WAL / SSTable から読める）。
+commit のたびに、その transaction を `Active` から外した後の `activeSnapshot` を境界として`SeqNo < 境界` の版を捨てる
+（生きている transaction の衝突判定に要る版だけ残す）。
 
 ### 7.4 書き込みは commit 時にしかエンジンへ届かない
 
@@ -833,6 +835,8 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 L1 以降は「そのレベルの総バイト数 > 上限」の最初のレベル L を選び、出力先を L+1 にする。
 実際の入力は `Compaction.selectInputs` が「レベル L の全ファイル
 （最大 `MaxInputFiles = 32`）」+「次レベルでキー域が重なるファイル」として確定する。
+出力ファイルは件数ではなく `OutputFileTargetBytes`（既定 4 MiB）を目標に `SstEntry.splitIntoBytes` で分ける
+（概算バイトなので厳密なサイズではない）。
 ポイント検索のファイル順は「新しいレベルのほうが先（L0 が最新）、同レベルではファイル番号の降順」（`filesForPointLookup`）。
 
 ### 8.4 Manifest — 唯一 atomic 更新を要するファイル
@@ -1070,8 +1074,11 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   1接続内も while で逐次。
 - 各接続は `handleClient` 内で `let mutable current = db` に**初期ハンドルをコピー**して始め、
   実行のたびに `current <- next` で持ち替える。
-- **接続をまたいでハンドルは引き継がれない**。
-  次の接続は `serve` に渡された初期 `db` から始まるので、前の接続が変更した後の状態（カタログ・transaction 状態）は見えない。
+- 接続終了時のハンドルは `serve` の `currentDb` へ引き継がれ、次の接続はその状態から始まる。
+  明示 transaction が残っている場合は、切断時に `Rollback()` してから引き継ぐ。
+- データ行の中のバックスラッシュ・改行・CR は `\\` / `\n` / `\r` にエスケープして返す
+  （`RykDb.Client` が読み取り時に元へ戻す）。
+  TEXT に生の改行が入っていても 1応答 = 1行を保つ。
 
 | 応答                                       | 意味                                                    |
 | ------------------------------------------ | ------------------------------------------------------- |
@@ -1126,8 +1133,8 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   複合索引の Leftmost prefix は考慮しない。
 - **`CREATE INDEX` の backfill は排他を取らない**。
 - **複数プロセスからの同時アクセスは非対応**（1プロセス前提。ロックファイルを作成しない）。
-- **TCP サーバは接続ごとに逐次処理で、ハンドルを接続間で引き継がない**（§11.3）。
-  前の接続の書き込み後の状態は次の接続から見えない。
+- **TCP サーバは接続ごとに逐次処理で、ハンドルは接続間で引き継がれる**（§11.3）。
+  明示 transaction の途中で切れた場合は rollback してから次の接続へ渡す。
 - **同一 `Database` ハンドルを複数スレッドで使うと書き込みが失われる**（状態はマージされない。§7.7）。
   並行利用はスレッドごとにハンドルを分ける。
 - **MVCC の版は compaction を跨ぐまでは圧縮も再利用もされない**

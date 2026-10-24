@@ -61,7 +61,7 @@ module internal SstEntry =
                 return! err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
         }
 
-    /// 配列を n 個ずつの塊に分ける（SSTable のブロック分けと compaction の出力分けで共用）。
+    /// 配列を n 個ずつの塊に分ける（SSTable のブロック分けに使う）。
     let splitInto (n: int) (items: 'a array) =
         let rec chunk acc start =
             if start >= items.Length then
@@ -71,6 +71,41 @@ module internal SstEntry =
                 chunk (Array.sub items start len :: acc) (start + len)
 
         chunk [] 0
+
+    /// 1エントリの符号化後のおおよそのバイト数。
+    /// compaction の出力をバイト幅で分けるための見積りで、実際の SSTable サイズとは厳密には一致しない。
+    let approximateBytes (e: SstEntry) =
+        let valueBytes (v: SqlValue) =
+            match ValueCodec.fixedEncodedBytes v with
+            | Some n -> n
+            | None ->
+                match v with
+                | SqlValue.Text s -> 5 + System.Text.Encoding.UTF8.GetByteCount s
+                | SqlValue.Blob bs -> 5 + bs.Length
+                | _ -> 1
+
+        let valueTotal =
+            match e.Value with
+            | None -> 2
+            | Some vs -> Array.sumBy valueBytes vs + 4
+
+        e.Key.Length + valueTotal
+
+    /// 配列を「おおよそのバイト幅」で塊に分ける。
+    /// 1塊は必ず 1エントリ以上で、超過する塊は要素が概算バイトを超えない限り targetBytes 以下になる。
+    let splitIntoBytes (targetBytes: int64) (items: SstEntry array) =
+        let rec chunk i segStart segSize acc =
+            if i >= items.Length then
+                if i = segStart then
+                    List.rev acc
+                else
+                    List.rev (Array.sub items segStart (i - segStart) :: acc)
+            elif i > segStart && segSize + int64 (approximateBytes items.[i]) > targetBytes then
+                chunk i i 0L (Array.sub items segStart (i - segStart) :: acc)
+            else
+                chunk (i + 1) segStart (segSize + int64 (approximateBytes items.[i])) acc
+
+        chunk 0 0 0L []
 
     /// 「キー昇順・同一キーは SeqNo 降順」で並んだ列たちを k-way merge する。
     /// ソース数は高々 1 + ファイル数なので、head を線形に走査しても十分速い。

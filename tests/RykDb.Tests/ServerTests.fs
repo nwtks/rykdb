@@ -383,3 +383,121 @@ let ``Client: 接続が RST で切れたら Halt`` () =
     finally
         listener.Stop()
         task.Wait 5000 |> ignore
+
+[<Fact>]
+let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコルを壊さない`` () =
+    let dir = newDir "tcp-newline"
+    let db = ok (Database.openWith dir)
+    let db, _ = ok (db.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+
+    let db, _ =
+        ok (db.Execute "INSERT INTO t VALUES (1, 'a\nb'), (2, 'c\rd'), (3, 'C:\\temp')")
+
+    let listener = new TcpListener(IPAddress.Loopback, 0)
+    listener.Start()
+    let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+    let cts = new CancellationTokenSource()
+    let finished = new ManualResetEventSlim false
+
+    Task.Run(fun () ->
+        try
+            serve db listener cts.Token (fun _ -> ())
+        finally
+            finished.Set())
+    |> ignore
+
+    try
+        // 生の応答では改行が \n などのエスケープとして 1行に収まる。
+        let raw = new TcpClient("127.0.0.1", port)
+
+        try
+            let stream = raw.GetStream()
+            use writer = new StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
+            use reader = new StreamReader(stream, System.Text.Encoding.UTF8, false, 1024, true)
+            writer.AutoFlush <- true
+
+            writer.WriteLine "SELECT id, v FROM t ORDER BY id"
+            Assert.Equal<string>("OK 3\tid,v", reader.ReadLine())
+            Assert.Equal<string>("1,'a\\nb'", reader.ReadLine())
+            Assert.Equal<string>("2,'c\\rd'", reader.ReadLine())
+            Assert.Equal<string>("3,'C:\\\\temp'", reader.ReadLine())
+
+            // 続けて別の応答がずれずに読める = 余分な行が混ざっていない。
+            writer.WriteLine ".ping"
+            Assert.Equal<string>("OK 0\tpong", reader.ReadLine())
+
+            writer.WriteLine ".exit"
+            Assert.Equal<string>("HALT", reader.ReadLine())
+        finally
+            raw.Dispose()
+
+        // クライアント API はエスケープを戻すので、ライブラリと同じ値が見える。
+        use client = new RykDbClient("127.0.0.1", port)
+        let _, rows = okRows (client.Query "SELECT id, v FROM t ORDER BY id")
+
+        Assert.Equal<string list>([ "1,'a\nb'"; "2,'c\rd'"; "3,'C:\\temp'" ], rows)
+    finally
+        cts.Cancel()
+        finished.Wait 10000 |> ignore
+        cts.Dispose()
+        db.Close() |> ignore
+
+        if Directory.Exists dir then
+            try
+                Directory.Delete(dir, true)
+            with _ ->
+                ()
+
+[<Fact>]
+let ``TCP: 切断時に open transaction は rollback される`` () =
+    let dir = newDir "tcp-rollback"
+    let db = ok (Database.openWith dir)
+    let listener = new TcpListener(IPAddress.Loopback, 0)
+    listener.Start()
+    let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+    let cts = new CancellationTokenSource()
+    let finished = new ManualResetEventSlim false
+
+    Task.Run(fun () ->
+        try
+            serve db listener cts.Token (fun _ -> ())
+        finally
+            finished.Set())
+    |> ignore
+
+    try
+        // BEGIN して INSERT したまま .exit も ROLLBACK も送らずに切る。
+        let raw = new TcpClient("127.0.0.1", port)
+
+        try
+            let stream = raw.GetStream()
+            use writer = new StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
+            use reader = new StreamReader(stream, System.Text.Encoding.UTF8, false, 1024, true)
+            writer.AutoFlush <- true
+
+            writer.WriteLine "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+            Assert.Equal<string>("OK 0", reader.ReadLine())
+
+            writer.WriteLine "BEGIN"
+            Assert.Equal<string>("OK 0", reader.ReadLine())
+
+            writer.WriteLine "INSERT INTO t VALUES (1)"
+            Assert.Equal<string>("OK 0", reader.ReadLine())
+        finally
+            raw.Dispose()
+
+        // 次の接続では rollback 済みで、行は見えない。
+        use client = new RykDbClient("127.0.0.1", port)
+        let _, rows = okRows (client.Query "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "0" ], rows)
+    finally
+        cts.Cancel()
+        finished.Wait 10000 |> ignore
+        cts.Dispose()
+        db.Close() |> ignore
+
+        if Directory.Exists dir then
+            try
+                Directory.Delete(dir, true)
+            with _ ->
+                ()

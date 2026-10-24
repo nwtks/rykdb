@@ -6,6 +6,10 @@
 //   ERR <メッセージ>        失敗
 //   HALT                    終了
 //
+// データ行の中のバックスラッシュ・改行・CR は `\\` / `\n` / `\r` にエスケープする
+// （TEXT に生の改行が入っていても 1応答 = 1行を保つ）。
+// クライアント側は RykDb.Client が元へ戻す。
+//
 // テストや他のホストは serve / handleClient を直接使える。
 // ===========================================================================
 
@@ -22,6 +26,21 @@ let ErrTag = "ERR"
 [<Literal>]
 let HaltTag = "HALT"
 
+/// 応答の 1データ行をプロトコルに載せられる形にする。
+/// バックスラッシュ・改行・CR をエスケープする（クライアント側で元へ戻す）。
+let private escapeLine (s: string) =
+    let sb = System.Text.StringBuilder s.Length
+
+    s
+    |> String.iter (fun c ->
+        match c with
+        | '\\' -> sb.Append "\\\\" |> ignore
+        | '\n' -> sb.Append "\\n" |> ignore
+        | '\r' -> sb.Append "\\r" |> ignore
+        | c -> sb.Append c |> ignore)
+
+    sb.ToString()
+
 let private encode (columns: string array) (rows: SqlValue array array) =
     if rows.Length = 0 then
         sprintf "%s %d" OkTag rows.Length
@@ -31,7 +50,7 @@ let private encode (columns: string array) (rows: SqlValue array array) =
 
         let body =
             rows
-            |> Array.map (fun r -> r |> Array.map SqlLiteral.toSqlLiteral |> String.concat ",")
+            |> Array.map (fun r -> r |> Array.map SqlLiteral.toSqlLiteral |> String.concat "," |> escapeLine)
 
         System.String.Join("\n", Array.append [| header |] body)
 
@@ -90,6 +109,11 @@ let private handleClient (db: Database) (client: System.Net.Sockets.TcpClient) (
                     | Ok(next, result) ->
                         current <- next
                         running <- send (encode result.Columns result.Rows)
+
+    if current.InTransaction then
+        match current.Rollback() with
+        | Ok rolledBack -> current <- rolledBack
+        | Error e -> onLog (sprintf "切断時のロールバックに失敗しました: %s" (DbError.toDisplayString e))
 
     onLog "切断されました"
     current
