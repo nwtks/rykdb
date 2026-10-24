@@ -401,6 +401,38 @@ let ``Analyzer: 複合索引は前置等値 + 範囲で IndexRangeScan`` () =
 
         match ok (Analyzer.chooseScanMethod b catalog [ onlyRange ]) with
         | ScanMethod.SeqScan -> ()
+        | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m)
+
+        // 全列等値 → IndexLookup（複合索引でも使う）
+        let bothEq =
+            [
+                Expr.Binary(BinaryOp.Eq, colRef "a", Expr.Literal(Literal.Int 1L))
+                Expr.Binary(BinaryOp.Eq, colRef "b", Expr.Literal(Literal.Int 2L))
+            ]
+
+        match ok (Analyzer.chooseScanMethod b catalog bothEq) with
+        | ScanMethod.IndexLookup(name, values) ->
+            Assert.Equal<string>("ix_pair", name)
+            Assert.Equal<int>(2, values.Length)
+            Assert.Equal<int64>(1L, asInt values.[0])
+            Assert.Equal<int64>(2L, asInt values.[1])
+        | m -> Assert.Fail(sprintf "IndexLookup ではない: %A" m)
+
+        // 前置 1列だけの等値 → IndexLookup（全列でなくても先頭から連続していれば使う）
+        let onlyPrefix = Expr.Binary(BinaryOp.Eq, colRef "a", Expr.Literal(Literal.Int 1L))
+
+        match ok (Analyzer.chooseScanMethod b catalog [ onlyPrefix ]) with
+        | ScanMethod.IndexLookup(name, values) ->
+            Assert.Equal<string>("ix_pair", name)
+            Assert.Equal<int>(1, values.Length)
+            Assert.Equal<int64>(1L, asInt values.[0])
+        | m -> Assert.Fail(sprintf "IndexLookup ではない: %A" m)
+
+        // 先頭でない列だけの等値は索引の前置にならない → SeqScan
+        let onlySecond = Expr.Binary(BinaryOp.Eq, colRef "b", Expr.Literal(Literal.Int 2L))
+
+        match ok (Analyzer.chooseScanMethod b catalog [ onlySecond ]) with
+        | ScanMethod.SeqScan -> ()
         | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m))
 
 [<Fact>]

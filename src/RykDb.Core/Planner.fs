@@ -23,7 +23,7 @@ type internal ScanMethod =
     | SeqScan
     /// 主キーの等値検索
     | PkLookup of SqlValue array
-    /// 索引の等値検索
+    /// 索引の等値検索（単一列索引は 1値、複合索引は全列の値）
     | IndexLookup of string * SqlValue array
     /// 範囲走査（主キー / 索引の前方一致）
     | RangeScan of string * SqlValue array * SqlValue array option
@@ -418,7 +418,7 @@ module internal Analyzer =
         loop None None conjuncts
 
     /// WHERE から等価条件を探して走査方法を決める。
-    /// 複合主キーは全列の等値条件が揃ったときだけ PkLookup にする。
+    /// 複合主キー・複合索引は、全列の等値条件が揃ったときだけ Lookup にする。
     let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
         let name = refName b
         let equals = equalitiesOf (name.ToLowerInvariant()) predicates
@@ -431,14 +431,19 @@ module internal Analyzer =
                 else
                     None)
 
+        let equalityPrefix (i: IndexDefinition) =
+            i.Columns
+            |> List.map findValue
+            |> List.takeWhile Option.isSome
+            |> List.choose id
+
         let tryIndexEquality () =
             Catalog.indexesOf catalog b.RealName
-            |> List.tryPick (fun i ->
-                match i.Columns with
-                | [ c ] ->
-                    findValue c
-                    |> Option.map (fun v -> ScanMethod.IndexLookup(i.IndexName, [| v |]))
-                | _ -> None)
+            |> List.choose (fun i ->
+                let values = equalityPrefix i
+                if List.isEmpty values then None else Some(i, values))
+            |> List.sortByDescending (fun (_, values) -> List.length values)
+            |> List.tryHead
 
         let tryIndexRange () =
             Catalog.indexesOf catalog b.RealName
@@ -494,6 +499,22 @@ module internal Analyzer =
                             )
                         | _ -> None)
 
+        let tryIndexMethod () =
+            match tryIndexEquality (), tryIndexRange () with
+            | Some(i, values), Some range ->
+                let rangeLen =
+                    match range with
+                    | ScanMethod.IndexRangeScan(_, lower, _) -> lower.Length
+                    | _ -> 0
+
+                if List.length values >= rangeLen then
+                    Some(ScanMethod.IndexLookup(i.IndexName, Array.ofList values))
+                else
+                    Some range
+            | Some(i, values), None -> Some(ScanMethod.IndexLookup(i.IndexName, Array.ofList values))
+            | None, Some range -> Some range
+            | None, None -> None
+
         let pkNames = b.Schema.PrimaryKey |> List.map (fun i -> b.Schema.Columns.[i].Name)
         let pkValues = pkNames |> List.map findValue
 
@@ -514,19 +535,13 @@ module internal Analyzer =
 
                 ret (ScanMethod.RangeScan(name, startKey, endKey))
             | _ ->
-                match tryIndexEquality () with
-                | Some m -> ret m
-                | None ->
-                    match tryIndexRange () with
-                    | Some m -> ret m
-                    | None -> ret ScanMethod.SeqScan
-        else
-            match tryIndexEquality () with
-            | Some m -> ret m
-            | None ->
-                match tryIndexRange () with
+                match tryIndexMethod () with
                 | Some m -> ret m
                 | None -> ret ScanMethod.SeqScan
+        else
+            match tryIndexMethod () with
+            | Some m -> ret m
+            | None -> ret ScanMethod.SeqScan
 
 module internal Optimizer =
     /// SELECT 文を論理代数に変換する。

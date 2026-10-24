@@ -524,7 +524,7 @@ SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
 | ---------------------------------------------------------------------- | ---------------- |
 | 主キーの全列 `= 定数`                                                  | `PkLookup`       |
 | 主キーの一部の列 `= 定数`                                              | `SeqScan`        |
-| `CREATE INDEX` した**単一列** `= 定数`                                 | `IndexLookup`    |
+| 索引の**先頭から連続する** `= 定数`（1列以上）                         | `IndexLookup`    |
 | 単一列の主キーに下限のある範囲条件 (`>`, `>=`, `BETWEEN`, `LIKE 'x%'`) | `RangeScan`      |
 | 索引（**複合可**）の範囲条件。ただし範囲列より前の全列に `= 定数`      | `IndexRangeScan` |
 | それ以外                                                               | `SeqScan`        |
@@ -541,15 +541,17 @@ SELECT id FROM people WHERE name LIKE 'car%'; -- 接頭辞 → 範囲（索引�
 CREATE INDEX ix_pair ON t (a, b);
 SELECT id FROM t WHERE a = 1 AND b > 2;       -- 前置 a が等値 + b が範囲 → IndexRangeScan
 SELECT id FROM t WHERE b > 2;                 -- 前置 a が無い → SeqScan
-SELECT id FROM t WHERE a = 1 AND b = 2;       -- 複合索引の全列等値は SeqScan
+SELECT id FROM t WHERE a = 1 AND b = 2;       -- 全列等値 → IndexLookup
+SELECT id FROM t WHERE a = 1;                 -- 前置 1列の等値 → IndexLookup
 ```
 
 制限:
 
 - **範囲走査は下限のある条件のみ**。`<` / `<=` だけの条件は全走査になる。
-- **索引の等値一致（`IndexLookup`）は単一列索引だけ**。
-  複合索引は「前置列すべてが `=`、その次の 1列が範囲」の形でのみ使う。
-  複合索引の全列 `=` は `IndexLookup` にならず `SeqScan`（将来的な改善点）。
+- **索引の等値一致（`IndexLookup`）は、索引の先頭から連続する `= 定数` が 1列以上あるとき**
+  （全列でなくてもよい）。
+  範囲条件がその次の列にある場合は、より多くの列を絞れる `IndexRangeScan` を優先する。
+  複合索引の範囲は「前置列すべてが `=`、その次の 1列が範囲」の形で使う。
 - `LIKE` は **`%` が末尾のみ・`_` なし**のときだけ範囲に変換する。
   `LIKE '%x'` や `LIKE 'a_b%'` は全走査 + 後段の `Filter`。
 - 型が一致しないリテラルは全走査に落ちる（比較時に `TypeError`）。
@@ -984,17 +986,17 @@ db> .rollback
 
 ### 実装上の制約
 
-| 項目                | 内容                                                                                           |
-| ------------------- | ---------------------------------------------------------------------------------------------- |
-| `SELECT` の `FROM`  | **省略不可**。定数だけの SELECT は書けない                                                     |
-| 索引                | 単一列は等値・範囲。複合索引は「前置列の等値 + 次列の範囲」のみ。`LIKE 'prefix%'` は範囲に変換 |
-| `LIMIT` / `OFFSET`  | 0 以上の整数リテラルのみ（式・負数はエラー）。`LIMIT 0` は「0 行」                             |
-| 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                                                         |
-| ソート              | メモリ上に実体化。spilling する外部マージは未実装                                              |
-| `AVG`               | `SUM / COUNT` を実行時に計算                                                                   |
-| `UPDATE` / `DELETE` | `LIMIT` 相当の句がない                                                                         |
-| DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）                                     |
-| `ORDER BY`          | 同値行の順序は保証しない                                                                       |
+| 項目                | 内容                                                                                            |
+| ------------------- | ----------------------------------------------------------------------------------------------- |
+| `SELECT` の `FROM`  | **省略不可**。定数だけの SELECT は書けない                                                      |
+| 索引                | 単一列・複合索引の前置等値（1列以上）、複合索引の前置等値 + 次列の範囲、`LIKE 'prefix%'` の範囲 |
+| `LIMIT` / `OFFSET`  | 0 以上の整数リテラルのみ（式・負数はエラー）。`LIMIT 0` は「0 行」                              |
+| 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                                                          |
+| ソート              | メモリ上に実体化。spilling する外部マージは未実装                                               |
+| `AVG`               | `SUM / COUNT` を実行時に計算                                                                    |
+| `UPDATE` / `DELETE` | `LIMIT` 相当の句がない                                                                          |
+| DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）                                      |
+| `ORDER BY`          | 同値行の順序は保証しない                                                                        |
 
 ### 演算の注意
 

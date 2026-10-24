@@ -534,10 +534,10 @@ let found =
         | _ -> false)
 ```
 
-- 等値一致に使えるのは**単一列索引だけ**。
-  複合索引は「前置列すべてが等値 + 次列が範囲」の範囲走査でのみ使う
-  （`Analyzer.chooseScanMethod` の `tryIndexRange`）。
-- 複合索引の全列 `=` は `IndexLookup` にならず `SeqScan`（将来的な改善点）。
+- 等値一致は索引の**先頭から連続する** `= 定数` が 1列以上あれば `IndexLookup`
+  （`Analyzer.chooseScanMethod` の `tryIndexEquality`）。
+- 範囲条件がその次の列にある場合は、より多くの列を絞れる `IndexRangeScan` を優先（`tryIndexMethod`）。
+- 複合索引の範囲は「前置列すべてが等値 + 次列が範囲」（`tryIndexRange`）。
 
 ### 6.2 `Catalog.toSchema` は `Indexes = []` で埋まる
 

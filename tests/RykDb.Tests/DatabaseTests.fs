@@ -246,6 +246,22 @@ let ``Database: Query は SELECT 専用`` () =
         expectErrorKind ErrorKind.SyntaxError "Query で INSERT" (db0.Query "INSERT INTO t VALUES (1)"))
 
 [<Fact>]
+let ``Database: 複合索引の全列等値で行を引ける`` () =
+    withDb "comp-index-eq" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (a INTEGER, b INTEGER, id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 2, 10), (1, 3, 11), (2, 2, 12)"
+        let db3 = exec db2 "CREATE INDEX ix_ab ON t (a, b)"
+
+        // 索引の backfill 後、全列等値で 1 行だけ返る
+        let _, r = ok (db3.Query "SELECT id FROM t WHERE a = 1 AND b = 2")
+        Assert.Equal<int>(1, r.Rows.Length)
+        Assert.Equal<int64>(10L, asInt r.Rows.[0].[0])
+
+        // 前置 1列だけでも IndexLookup（結果は同じ）
+        let _, prefix = ok (db3.Query "SELECT id FROM t WHERE a = 1")
+        Assert.Equal<int>(2, prefix.Rows.Length))
+
+[<Fact>]
 let ``Database: VARCHAR(32) は再オープン後も使える`` () =
     withDir "varchar-reopen" (fun dir ->
         let db0 = ok (Database.openWith dir)
