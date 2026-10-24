@@ -899,7 +899,7 @@ L1〜 … 1ファイル = 1キー域で互いに重ならない（RocksDB/LevelD
 2. `L` の全ファイル + `L+1` でキー域が重なるファイルを**入力**にする
 3. 入力をメモリで読み、k-way merge（各ファイルは既にソート済みなので O(N log k)）
 4. **同一キーの版を SeqNo が新しい 1件に畳む**（merge 後の並びは「キー昇順・同一キーは SeqNo 降順」なのでグループ先頭が最新版） → ここに墓碑も落ちる
-5. **GC**: 全 active snapshot の SeqNo より小さい版を落とす
+5. **GC**: 最新版と「最古の active snapshot が見る版」を残し、それ以外の古い版を落とす
 6. 出力ファイルを `L+1` に書き、MANIFEST に記録、入力ファイルを削除
 
 GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判定は**しない**
@@ -910,12 +910,14 @@ GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判
 | 条件                                   | 措置                                                                                |
 | -------------------------------------- | ----------------------------------------------------------------------------------- |
 | 同一キーの最新版                       | **必ず残す**                                                                        |
-| 最新版以外で `SeqNo < ActiveSnapshot`  | 捨てる（どの snapshot からも見えない）                                              |
-| 最新版以外で `SeqNo >= ActiveSnapshot` | 残す（将来の snapshot から見える）                                                  |
+| 最新版以外で `SeqNo > ActiveSnapshot`  | 残す（将来の snapshot から見える）                                                  |
+| 最新版以外で `SeqNo <= ActiveSnapshot` | **最新の 1件だけ**残す（最古の snapshot が見る版）。残りは捨てる                    |
+| 最新版が `ActiveSnapshot` 以下         | 最新版が全 snapshot から見えるので、それより古い版は全て捨てる                      |
 | tombstone                              | 出力が最下位レベル（`DropTombstonesBelowLevel = Levels.Max`）に達したときだけ捨てる |
 
 ファイル単位の回収は「**Version が参照していないファイル**」だけ。
-（`deleteOrphans`: MANIFEST 反映前にクラッシュして残ったファイルの掃除）。
+（`quarantineOrphans`: MANIFEST 反映前にクラッシュして残ったファイルは削除せず、`<keyspace>/.orphans/` へ退避する。
+MANIFEST の読み落としで消してしまう事故を避けるため）。
 `FileMetaData.MaxSeqNo` は記録として持つが、削除の根拠にはしない。
 
 > **`VACUUM` は不要**。スペース回収はコンパクション時の自動 GC が行う。

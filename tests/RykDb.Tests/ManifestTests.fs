@@ -61,16 +61,30 @@ let ``Manifest: 同じ CURRENT をもう一度開いても状態は変わらな�
         Assert.Equal<int array>(Version.levelCounts v0, Version.levelCounts v1))
 
 [<Fact>]
-let ``Manifest: 途中の壊れたレコードで読み込みを打ち切る`` () =
+let ``Manifest: 末尾の書きかけレコードは読み飛ばす`` () =
     withDir "manifest-bad-record" (fun dir ->
         let v0, mn = ok (Manifest.openOrCreate dir)
         let _ = applyEdit dir mn v0 (VersionEdit.addFile (fmd 1L 0 100 199))
-        // 2 行目に不正な base64 を追記する
+        // 末尾に不正な base64 を追記する（クラッシュで書きかけになった追記を模擬）
         File.AppendAllText(Path.Combine(dir, "MANIFEST-000001"), "!!!not-base64!!!\n")
 
-        // 打ち切られるので 1 件目までの状態が残る
+        // 末尾だけなので読み飛ばし、1 件目までの状態が残る
         let reopened, _ = ok (Manifest.openOrCreate dir)
         Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], Version.levelCounts reopened))
+
+[<Fact>]
+let ``Manifest: 途中の壊れたレコードは CorruptionError`` () =
+    withDir "manifest-mid-corrupt" (fun dir ->
+        let v0, mn = ok (Manifest.openOrCreate dir)
+        let _ = applyEdit dir mn v0 (VersionEdit.addFile (fmd 1L 0 100 199))
+        let _ = applyEdit dir mn v0 (VersionEdit.addFile (fmd 2L 0 100 199))
+
+        // 有効な 2 行の間に壊れた行を挿入する（bit rot を模擬）
+        let path = Path.Combine(dir, "MANIFEST-000001")
+        let lines = File.ReadAllLines path
+        File.WriteAllLines(path, Array.append [| lines.[0]; "!!!not-base64!!!" |] lines.[1..])
+
+        expectErrorKind ErrorKind.CorruptionError "途中の破損は黙って捨てない" (Manifest.openOrCreate dir))
 
 [<Fact>]
 let ``Manifest: 空行は読み飛ばす`` () =
@@ -98,11 +112,40 @@ let ``Manifest: CURRENT の .manifest 付き表記は番号として読む`` () 
     withDir "manifest-suffix" (fun dir ->
         ok (Manifest.ensureDirectory dir)
         File.WriteAllText(Path.Combine(dir, "CURRENT"), "MANIFEST-000007.manifest\n")
+        // 指している MANIFEST は空でよい
+        File.WriteAllText(Path.Combine(dir, "MANIFEST-000007"), "")
 
-        // 指している MANIFEST が無くても空の Version で開ける
         let version, manifestNumber = ok (Manifest.openOrCreate dir)
         Assert.Equal(7L, manifestNumber)
         Assert.Empty(Version.allFiles version))
+
+[<Fact>]
+let ``Manifest: CURRENT が指す MANIFEST が無ければ CorruptionError`` () =
+    withDir "manifest-missing" (fun dir ->
+        ok (Manifest.ensureDirectory dir)
+        File.WriteAllText(Path.Combine(dir, "CURRENT"), "MANIFEST-000007\n")
+
+        // 空の Version で開くと SSTable が孤児になるので、開かずにエラーにする
+        expectErrorKind ErrorKind.CorruptionError "manifest の欠落はエラーになる" (Manifest.openOrCreate dir))
+
+[<Fact>]
+let ``Manifest: CURRENT が無いのに SSTable があれば CorruptionError`` () =
+    withDir "manifest-no-current" (fun dir ->
+        ok (Manifest.ensureDirectory dir)
+        File.WriteAllBytes(Path.Combine(dir, "000001.sst"), [| 1uy |])
+
+        expectErrorKind ErrorKind.CorruptionError "SSTable を孤児にしないため開かない" (Manifest.openOrCreate dir))
+
+[<Fact>]
+let ``Manifest: 中身があるのに Version が空なら CorruptionError`` () =
+    withDir "manifest-empty-version" (fun dir ->
+        ok (Manifest.ensureDirectory dir)
+        File.WriteAllText(Path.Combine(dir, "CURRENT"), "MANIFEST-000001\n")
+        // "AAAA" は長さ 0 の VersionEdit としてデコードされ、Version が空になる
+        File.WriteAllText(Path.Combine(dir, "MANIFEST-000001"), "AAAA\n")
+        File.WriteAllBytes(Path.Combine(dir, "000002.sst"), [| 1uy |])
+
+        expectErrorKind ErrorKind.CorruptionError "SSTable があるのに空の Version はエラー" (Manifest.openOrCreate dir))
 
 [<Fact>]
 let ``Manifest: CURRENT が不正なら CorruptionError`` () =

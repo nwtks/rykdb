@@ -111,7 +111,7 @@ module internal Reader =
 
     /// 符号なし LEB128 を読む。
     let readVarint (c: Cursor) =
-        let rec decode shift acc (c: Cursor) =
+        let rec decode shift acc c =
             if shift > 63 then
                 eof "Reader: varint が長すぎます"
             else
@@ -169,7 +169,7 @@ module internal Reader =
     /// count 件を 1件ずつ読み出してリストにする。
     /// 「1件読む」処理は readOne に切り出し、ループはここ 1箇所にまとめる。
     let readItems (count: uint64) (readOne: Cursor -> Result<'a * Cursor, DbError>) (c: Cursor) =
-        let rec readRemaining (rest: uint64) (c: Cursor) (acc: 'a list) =
+        let rec readRemaining rest c acc =
             if rest = 0UL then
                 ret (List.rev acc, c)
             else
@@ -250,7 +250,7 @@ module internal OrderPreserving =
     /// 同じ符号・同じ指数なら D の右詰め比較が値の比較そのものになる。
     /// 指数は順序保持された 8バイト整数で書く。
     let private decimalParts (v: decimal) =
-        let rec trim (u: System.Numerics.BigInteger) (s: int) =
+        let rec trim u s =
             if u % System.Numerics.BigInteger 10 = System.Numerics.BigInteger.Zero then
                 trim (u / System.Numerics.BigInteger 10) (s - 1)
             else
@@ -352,7 +352,7 @@ module internal OrderPreserving =
 
     /// 値をキーへ追加する（型タグ + escape 済みペイロード + 終端）。
     let writeValue (v: SqlValue) (w: Writer) =
-        let writeEscapedPayload (bs: byte array) (w: Writer) =
+        let writeEscapedPayload bs w =
             let escaped =
                 bs
                 |> Array.collect (fun b -> if b = 0uy then [| Terminator; EscapeMarker |] else [| b |])
@@ -384,17 +384,7 @@ module internal OrderPreserving =
     /// キーに書き込んだ 1フィールドを読む。
     /// escape を解き、フィールド終端まで消費して値を返す。
     let private readValue (start: Cursor) =
-        let finish (v: SqlValue) (c: Cursor) =
-            result {
-                let! t, _ = Reader.readByte c
-
-                if t <> Terminator then
-                    return! err (sprintf "OrderPreserving: 終端が不正 (0x%02X)" t |> DbError.corruption)
-                else
-                    return v, c
-            }
-
-        let rec unescape (c: Cursor) (acc: byte list) =
+        let rec unescape c acc =
             let finish c =
                 Ok(List.rev acc |> List.toArray, { c with Pos = c.Pos - 1 })
 
@@ -408,7 +398,17 @@ module internal OrderPreserving =
                 | Ok(EscapeMarker, c) -> unescape c (Terminator :: acc)
                 | Ok(_, _) -> finish c
 
-        let readEscapedPayload (c: Cursor) = unescape c []
+        let readEscapedPayload c = unescape c []
+
+        let finish v c =
+            result {
+                let! t, _ = Reader.readByte c
+
+                if t <> Terminator then
+                    return! err (sprintf "OrderPreserving: 終端が不正 (0x%02X)" t |> DbError.corruption)
+                else
+                    return v, c
+            }
 
         result {
             let! tag, c = Reader.readByte start
@@ -482,9 +482,7 @@ module internal KeyBuilder =
     /// 索引キー（索引列 + 主キー列）。
     /// 主キーは行を一意に特定するために末尾へ追加する。
     let ofIndexAndPrimary (indexCols: SqlValue seq) (primaryCols: SqlValue seq) =
-        let appendCols (w: Writer) (cols: SqlValue seq) =
-            Seq.fold (fun w v -> OrderPreserving.writeValue v w) w cols
-
+        let appendCols = Seq.fold (fun w v -> OrderPreserving.writeValue v w)
         let withIndex = appendCols Writer.empty indexCols
         appendCols withIndex primaryCols |> Writer.toArray
 

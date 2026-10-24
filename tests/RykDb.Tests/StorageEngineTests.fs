@@ -642,12 +642,51 @@ let ``StorageEngine.maybeCompact: 全部 tombstone なら出力なしで入力�
             Assert.Empty(Version.allFiles reopened.Version)))
 
 [<Fact>]
-let ``StorageEngine: 孤児の SSTable は削除される`` () =
+let ``StorageEngine: 孤児の SSTable は削除せず退避する`` () =
     withDir "re5" (fun dir ->
         withEngine dir (fun _ -> ())
         // MANIFEST に無いファイルを 1 個置いてから開く
         File.WriteAllBytes(Path.Combine(dir, "000999.sst"), [| 1uy; 2uy; 3uy |])
-        withEngine dir (fun _ -> Assert.False(File.Exists(Path.Combine(dir, "000999.sst")))))
+
+        withEngine dir (fun _ ->
+            // 消さずに .orphans へ移す（manifest の読み落としで消すと復元できない）
+            Assert.False(File.Exists(Path.Combine(dir, "000999.sst")))
+            Assert.Single(Directory.GetFiles(Path.Combine(dir, ".orphans"))) |> ignore))
+
+[<Fact>]
+let ``StorageEngine: manifest の途中破損では開かず SSTable を残す`` () =
+    withDir "open-corrupt-manifest" (fun dir ->
+        let engine = ok (StorageEngine.openDatabase dir)
+        let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+        let _ = ok (StorageEngine.flush engine)
+
+        // 有効な行の前に壊れた行を置く（bit rot を模擬）
+        let manifestPath = Path.Combine(dir, "MANIFEST-000001")
+        let valid = File.ReadAllLines manifestPath
+        Assert.NotEmpty valid
+        File.WriteAllLines(manifestPath, Array.append [| "!!!broken!!!" |] valid)
+
+        expectErrorKind ErrorKind.CorruptionError "途中の破損は CorruptionError" (StorageEngine.openDatabase dir)
+        // SSTable は削除も退避もされていない
+        Assert.NotEmpty(Directory.GetFiles(dir, "*.sst"))
+        Assert.False(Directory.Exists(Path.Combine(dir, ".orphans"))))
+
+[<Fact>]
+let ``StorageEngine: 古いハンドルの close は WAL を消さない`` () =
+    withDir "close-stale" (fun dir ->
+        let engine0 = ok (StorageEngine.openDatabase dir)
+        let engine1 = ok (StorageEngine.put engine0 (intKey 1) (intRow 1))
+        let engine2 = ok (StorageEngine.put engine1 (intKey 2) (intRow 2))
+
+        // engine1 は engine2 より前の状態。WAL には engine2 の分が追記されている。
+        ok (StorageEngine.close engine1)
+
+        // 古いハンドルの close で WAL が消えていれば、engine2 の書き込みは失われる
+        let reopened = ok (StorageEngine.openDatabase dir)
+        Assert.True((ok (StorageEngine.getAt reopened None (intKey 1))).IsSome)
+        Assert.True((ok (StorageEngine.getAt reopened None (intKey 2))).IsSome)
+
+        ok (StorageEngine.close engine2))
 
 [<Fact>]
 let ``StorageEngine: 番号として読めない .sst は無視される`` () =

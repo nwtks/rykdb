@@ -345,15 +345,21 @@ module internal Ddl =
                             Indexes = idx :: schema.Indexes
                         }
 
+                    let space = Keyspace.index idx.Name
                     let mgr, txn = TransactionManager.beginTxn state.Manager
+                    let! existing = RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
+
+                    let! txn1 =
+                        foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn existing
+
                     let! rows = Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
 
                     let! txn2 =
                         foldOk
                             (fun t row ->
                                 let key = RowKey.indexKey withIndex idx row
-                                ret (Transaction.put t (Keyspace.index idx.Name) key row))
-                            txn
+                                ret (Transaction.put t space key row))
+                            txn1
                             rows
 
                     let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
@@ -391,9 +397,7 @@ module internal Ddl =
 
                     let idxSchema = Catalog.toIndexSchema defn
                     let next = Catalog.addIndex state.Catalog defn
-
-                    saved state next
-                    >>= fun withCatalog -> backfillIndex withCatalog ci.Table idxSchema
+                    backfillIndex state ci.Table idxSchema >>= fun filled -> saved filled next
 
     /// DROP TABLE。
     /// 手順:
@@ -520,6 +524,16 @@ module internal Engine =
         let noRows (r: Result<DbState, DbError>) =
             r |> Result.map (fun s -> s, StatementResult.empty)
 
+        let ddl (run: unit -> Result<DbState, DbError>) =
+            if state.Active.IsSome then
+                err (
+                    DbError.create
+                        ErrorKind.SyntaxError
+                        "トランザクション中は DDL（CREATE / DROP）を実行できません。COMMIT または ROLLBACK してから実行してください"
+                )
+            else
+                run ()
+
         match stmt with
         | Statement.Select sel ->
             let ctx = contextOf state txn
@@ -537,10 +551,10 @@ module internal Engine =
         | Statement.Insert st -> runDml state txn (fun ctx -> runInsert ctx st)
         | Statement.Update st -> runDml state txn (fun ctx -> runUpdate ctx st)
         | Statement.Delete st -> runDml state txn (fun ctx -> runDelete ctx st)
-        | Statement.CreateTable c -> noRows (Ddl.createTable state c)
-        | Statement.DropTable(n, ifE) -> noRows (Ddl.dropTable state n ifE)
-        | Statement.CreateIndex ci -> noRows (Ddl.createIndex state ci)
-        | Statement.DropIndex(n, ifE) -> noRows (Ddl.dropIndex state n ifE)
+        | Statement.CreateTable c -> noRows (ddl (fun () -> Ddl.createTable state c))
+        | Statement.DropTable(n, ifE) -> noRows (ddl (fun () -> Ddl.dropTable state n ifE))
+        | Statement.CreateIndex ci -> noRows (ddl (fun () -> Ddl.createIndex state ci))
+        | Statement.DropIndex(n, ifE) -> noRows (ddl (fun () -> Ddl.dropIndex state n ifE))
         | Statement.Begin
         | Statement.Commit
         | Statement.Rollback -> ret (state, StatementResult.empty)

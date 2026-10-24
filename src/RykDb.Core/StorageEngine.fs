@@ -31,7 +31,8 @@ type internal StorageEngine =
         /// コンパクションの設定
         Compaction: CompactionOptions
         /// 最古の active snapshot の SeqNo。
-        /// これより小さい版は誰も読まないので GC できる
+        /// GC は「これより新しい版」と「これ以下の最新 1版」を残す（Compaction.gc）。
+        /// 0 は「全版を残す」。
         ActiveSnapshot: uint64
     }
 
@@ -499,16 +500,30 @@ module internal StorageEngine =
         let sstNumbersOnDisk (dir: string) =
             System.IO.Directory.GetFiles(dir, "*.sst") |> Array.choose parseNumber
 
-        let deleteOrphans (dir: string) (version: Version) =
+        let move quarantine (n: int64) =
+            let source = FileMetaData.path dir n
+            let name = System.IO.Path.GetFileName source
+            let target = System.IO.Path.Combine(quarantine, name)
+
+            let target =
+                if System.IO.File.Exists target then
+                    target + "." + string System.DateTime.UtcNow.Ticks
+                else
+                    target
+
+            System.IO.File.Move(source, target, true)
+
+        let quarantineOrphans (dir: string) (version: Version) =
             let referenced = Version.allFiles version |> List.map _.FileNumber |> Set.ofList
 
             let orphans =
                 sstNumbersOnDisk dir |> Array.filter (fun n -> not (Set.contains n referenced))
 
             protect (fun () ->
-                orphans
-                |> Array.iter (fun n -> System.IO.File.Delete(FileMetaData.path dir n))
-                |> ignore)
+                if not (Array.isEmpty orphans) then
+                    let quarantine = System.IO.Path.Combine(dir, ".orphans")
+                    System.IO.Directory.CreateDirectory quarantine |> ignore
+                    Array.iter (move quarantine) orphans)
 
         let latestWalNumber (dir: string) =
             Wal.walFiles dir |> List.choose parseNumber |> List.sort |> List.tryLast
@@ -571,7 +586,7 @@ module internal StorageEngine =
         result {
             let! version, manifestNumber = Manifest.openOrCreate dir
             let! version', manifestNumber' = dropMissingFiles dir manifestNumber version
-            do! deleteOrphans dir version'
+            do! quarantineOrphans dir version'
             let! walState = openOrCreateWal dir version'
             let! replayed = Wal.read dir walState.FileNumber
             let! diskMax = maxSeqNoOnDisk dir version'
@@ -579,11 +594,25 @@ module internal StorageEngine =
         }
 
     /// データベースを閉じる（memtable を flush してから WAL を消す）。
+    /// <remarks>
+    /// ハンドルは不変なので、古いハンドルでも `Close` を呼べる。
+    /// 古いハンドルの WAL は新しいハンドルが既に書き進めているため、
+    /// WAL の実サイズがハンドルの記録と一致しないときは flush も WAL 削除もしない
+    /// （古い memtable を flush すると新しいハンドルの書き込みを消してしまう）。
+    /// </remarks>
     let close (engine: StorageEngine) =
-        flush engine
-        |> Result.map (fun e ->
-            Wal.walFiles e.Dir
-            |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore))
+        let isLatestWriter =
+            match protect (fun () -> System.IO.FileInfo(Wal.path engine.Dir engine.Wal.FileNumber).Length) with
+            | Ok size -> size = int64 engine.Wal.Size
+            | Error _ -> false
+
+        if not isLatestWriter then
+            ret ()
+        else
+            flush engine
+            |> Result.map (fun e ->
+                Wal.walFiles e.Dir
+                |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore))
 
 /// RowStore が使う StorageEngine の操作面。
 /// テストではメモリ実装に差し替えられる。

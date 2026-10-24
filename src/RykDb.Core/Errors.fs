@@ -148,9 +148,8 @@ module internal ResultOps =
     /// 最初の Error で打ち切り、残りの項目は評価しない。
     /// 空の列は Ok state を返す。
     /// 副作用は step に任せる。
-    let foldOk (step: 's -> 'a -> Result<'s, DbError>) (state: 's) (items: 'a seq) =
-        items
-        |> Seq.fold
+    let foldOk (step: 's -> 'a -> Result<'s, DbError>) (state: 's) =
+        Seq.fold
             (fun acc item ->
                 match acc with
                 | Error e -> Error e

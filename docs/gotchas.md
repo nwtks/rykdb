@@ -453,12 +453,17 @@ let obsolete = Version.allFiles version
 正しい方針:
 
 - **版（エントリ）単位の GC**: 同キーのうち SeqNo 最大の版は**必ず残す**。
-  その次に新しい版のうち `SeqNo < activeSnapshot` のものだけ捨てる。
+- 最新版以外は `SeqNo > activeSnapshot` の版を全部残す。
+  `SeqNo <= activeSnapshot` の版は **最新の 1件だけ**残す
+  （最古の active snapshot が読むのはこの版）。
+  それより古い版だけ捨てる。
+- 最新版が `activeSnapshot` 以下なら、最新版自身が全 snapshot から見えるのでそれより古い版は全て捨てる
+  （`Compaction.gc` の `keepOlder`）。
 - 最下位レベルでも、**同じキーの古い版が残るなら tombstone は消さない**。
   消すと下位の古い値が復活する（`Compaction.gc` は `older.IsEmpty` のときだけ落とす）。
 - **ファイル単位の回収は SeqNo で判定しない**。
   LevelDB と同じ「Version が参照していないファイル」だけ
-  （MANIFEST 反映前に取り残されたものの掃除用）。
+  （`quarantineOrphans` が `.orphans/` へ退避する。削除はしない）。
 
 ### 5.4 `Transaction.Buffers` は「同一キーに put と delete を書くと打ち消し合う」
 
@@ -1043,8 +1048,8 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
 
 ### 11.9 `ActiveSnapshot = 0` は「全版を残す」
 
-`Compaction.gc` は `SeqNo < ActiveSnapshot` の版を捨てる。
-0 を「最新版だけ残す」と解釈すると全履歴を失う。
+`Compaction.gc` は `ActiveSnapshot = 0` を「全版を残す」として扱う。
+0 を「最新版だけ残す」と解釈すると replay 中や境界未設定時に履歴を失う。
 replay 中や境界未設定時は 0 のままにし、通常の commit では
 `TransactionManager.activeSnapshot`（active の最小 snapshot、無ければ `LastCommitSeqNo + 1`）を設定する。
 
@@ -1082,3 +1087,46 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 - active が無ければ境界は `LastCommitSeqNo + 1`。次の commit で直前の commit の版まで掃除される。
 - 掃除を「commit した版そのものを除く」にすると、まだ古い snapshot の transaction が
   同じキーを書いたときに衝突を見逃すので、必ず `activeSnapshot` を基準にする。
+
+### 11.13 MANIFEST が壊れていたら「空の Version」で開かずエラーにする
+
+`Manifest.decodeLines` は**途中**のレコード破損を `CorruptionError` にし、**末尾の書きかけ**だけを読み飛ばす。
+`CURRENT` の指す manifest が無い場合や、`CURRENT` が無い/空なのに `*.sst` が残っている場合もエラーにする。
+
+- 空の Version を返すと `StorageEngine.openDatabase` が全 SSTable を孤児として扱い、**データが見えなくなる**。
+- 孤児は削除せず `<keyspace>/.orphans/` へ退避する（`quarantineOrphans`）。
+  manifest を読み落としただけのケースでも実体は復元できる。
+- 末尾の書きかけを許容するのは、`logAndApply` の `fs.Write` + `Flush(true)` が途中で切れた場合のため。
+- 回帰テスト: `Manifest: 途中の壊れたレコードは CorruptionError` /
+  `StorageEngine: manifest の途中破損では開かず SSTable を残す`。
+
+### 11.14 古い `Database` ハンドルの `Close` は WAL を消さない
+
+ハンドルは不変で、`Execute` は新しいハンドルを返す。
+古いハンドルも `Close` を呼べるが、そのまま flush / WAL 削除をすると
+**新しいハンドルの commit 済みデータを失う**。
+
+`StorageEngine.close` は WAL の実サイズとハンドルの `Wal.Size` を比較し、
+一致する（= 自分が最新の書き手）ときだけ flush と WAL 削除を行う。
+一致しなければ何もしない（データは WAL に残っており、新しいハンドルが flush する）。
+
+- 回帰テスト: `Database: 古いハンドルを Close しても新しいハンドルの commit は失われない`。
+
+### 11.15 DDL は明示トランザクションに参加しない（ので拒否する）
+
+カタログと SSTable（索引 backfill）の更新を同じ transaction に載せる設計になっていない。
+黙って DDL を auto-commit すると:
+
+- `BEGIN; CREATE TABLE ...; ROLLBACK` でテーブルが残る。
+- `BEGIN; INSERT ...; CREATE INDEX ...; COMMIT` の backfill が未 commit 行を見ないため、
+  索引検索が行を取りこぼす。
+
+`Engine.runStatement` は `Active` な transaction があるとき DDL を `SyntaxError` にする。
+DDL を transaction に載せる設計に変えるまでは、この制約を維持する。
+
+### 11.16 `CREATE INDEX` は backfill → カタログの順で行う
+
+逆順（カタログ → backfill）だと backfill の失敗で「索引はあるが中身が無い」状態が永続化され、
+再オープン後も索引検索が行を取りこぼす。
+`Ddl.createIndex` は索引 keyspace を先に空にしてから backfill し、成功後にカタログへ登録する。
+途中で失敗しても、次回の `CREATE INDEX` が残骸を消してからやり直す。

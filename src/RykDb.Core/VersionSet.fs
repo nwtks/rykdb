@@ -31,7 +31,7 @@ module internal Version =
         }
 
     /// 指定レベルのファイル列。
-    let inline filesAt (v: Version) (level: int) = v.Files.[level]
+    let filesAt (v: Version) (level: int) = v.Files.[level]
 
     /// ファイルを追加した新しい Version を返す。
     let addFile (f: FileMetaData) (v: Version) =

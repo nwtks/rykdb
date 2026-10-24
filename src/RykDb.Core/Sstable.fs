@@ -159,7 +159,7 @@ module internal SstScan =
 
     /// 次の 1件。
     /// None は終端。
-    let inline next (SstScan step) = step ()
+    let next (SstScan step) = step ()
 
     /// 1件を返す走査。
     /// 続き（rest）は次を要求されるまで組み立てない

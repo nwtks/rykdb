@@ -4,7 +4,7 @@
 // L0 はキー域が重なる複数ファイル、L1 以降は「1ファイル = 1キー域」。
 // 1回の compaction: 入力選択 →
 // k-way merge →
-// gc（同一キーを最新 1件に畳み、全 active snapshot より小さい版を捨てる）→
+// gc（同一キーを最新 1件に畳み、どの snapshot からも見えない古い版を捨てる）→
 // 出力を L+1 に書き、 MANIFEST に記録してから入力を削除する。
 // ===========================================================================
 
@@ -70,7 +70,11 @@ module internal Compaction =
     /// 不要な版を捨てる（GC）。
     /// 入力は `SstEntry.mergeSorted` の出力 = 「キー昇順・同一キーは SeqNo 降順」なので、
     /// 各キーグループの先頭が最新版。
-    /// グループの 2件目以降は active snapshot から見える版だけ残す。
+    /// 可視性は `SeqNo <= snapshot`。
+    /// したがって最古の active snapshot `S` が読むのは**`SeqNo <= S` のうち最新の 1件**であり、
+    /// `S` より小さい版を一律に捨ててはいけない。
+    /// 残すのは「最新版」+「`SeqNo > S` の全版」+「`SeqNo <= S` の最新 1件」。
+    /// `activeSnapshot = 0` は「全版を残す」。
     let private gc (activeSnapshot: uint64) (dropTombstones: bool) (items: SstEntry array) =
         let rec groupEnd (start: int) =
             if start + 1 >= items.Length then
@@ -80,28 +84,40 @@ module internal Compaction =
             else
                 start + 1
 
+        let rec loop
+            (newest: SstEntry)
+            (finish: int)
+            (j: int)
+            (kept: SstEntry list)
+            (dropped: int)
+            (keptVisible: bool)
+            =
+            if j >= finish then
+                List.rev kept, dropped
+            else
+                let item = items.[j]
+
+                if activeSnapshot = 0UL || item.SeqNo > activeSnapshot then
+                    loop newest finish (j + 1) (item :: kept) dropped keptVisible
+                elif newest.SeqNo > activeSnapshot && not keptVisible then
+                    loop newest finish (j + 1) (item :: kept) dropped true
+                else
+                    loop newest finish (j + 1) kept (dropped + 1) keptVisible
+
+        let keepOlder (newest: SstEntry) (start: int) (finish: int) = loop newest finish start [] 0 false
+
         let rec collectKept (acc: SstEntry list) (i: int) (dv: int) (dt: int) =
             if i >= items.Length then
                 List.rev acc, dv, dt
             else
                 let ge = groupEnd i
-                let count = ge - i
-                let e = items.[i]
-
-                let older =
-                    [
-                        for j in i + 1 .. ge - 1 do
-                            if items.[j].SeqNo >= activeSnapshot then
-                                yield items.[j]
-                    ]
-
-                let droppedVersions = count - 1 - older.Length
-                let keepNewest = not (e.IsDelete && dropTombstones && List.isEmpty older)
-                let dv' = dv + droppedVersions
+                let newest = items.[i]
+                let older, dropped = keepOlder newest (i + 1) ge
+                let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty older)
                 let dt' = if keepNewest then dt else dt + 1
-                let acc' = if keepNewest then e :: acc else acc
+                let acc' = if keepNewest then newest :: acc else acc
                 let acc'' = List.fold (fun a o -> o :: a) acc' older
-                collectKept acc'' ge dv' dt'
+                collectKept acc'' ge (dv + dropped) dt'
 
         let kept, dv, dt = collectKept [] 0 0 0
         kept |> List.toArray, dv, dt

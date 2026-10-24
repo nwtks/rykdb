@@ -15,7 +15,7 @@ module internal Bytes =
 
     /// 生のバイト列の固定オフセットから、リトルエンディアン 32bit を読む。
     let readLE32 (data: byte array) (offset: int) =
-        let at (i: int) = uint32 data.[offset + i]
+        let at i = uint32 data.[offset + i]
         at 0 ||| (at 1 <<< 8) ||| (at 2 <<< 16) ||| (at 3 <<< 24)
 
 /// 実行時の値。
@@ -36,7 +36,7 @@ type SqlValue =
 [<RequireQualifiedAccess>]
 module SqlLiteral =
     /// SQL リテラルとしての表示。
-    let toSqlLiteral (v: SqlValue) =
+    let toSqlLiteral =
         let formatReal (f: double) =
             if System.Double.IsNaN f then
                 "NaN"
@@ -56,7 +56,7 @@ module SqlLiteral =
 
             sb.Append('\'').ToString()
 
-        match v with
+        function
         | SqlValue.Null -> "NULL"
         | SqlValue.Bool b -> if b then "TRUE" else "FALSE"
         | SqlValue.Int i -> i.ToString System.Globalization.CultureInfo.InvariantCulture
@@ -80,7 +80,7 @@ type internal TruthValue =
 module internal TruthValue =
     /// SQL の 3値論理の AND。
     /// FALSE が一つでもあれば FALSE、それ以外は UNKNOWN を返す。
-    let and2 a b =
+    let and2 (a: TruthValue) (b: TruthValue) =
         if a = TruthValue.False || b = TruthValue.False then
             TruthValue.False
         elif a = TruthValue.Unknown || b = TruthValue.Unknown then
@@ -90,7 +90,7 @@ module internal TruthValue =
 
     /// SQL の 3値論理の OR。
     /// TRUE が一つでもあれば TRUE。
-    let or2 a b =
+    let or2 (a: TruthValue) (b: TruthValue) =
         if a = TruthValue.True || b = TruthValue.True then
             TruthValue.True
         elif a = TruthValue.Unknown || b = TruthValue.Unknown then
@@ -116,8 +116,8 @@ module internal DataType =
     /// SQL の照合順序における型の順位。
     /// 異なる型を並べ替えるときの決定的なタイブレークに使う。
     /// 数値 3種は互いに数値比較されるので、ここでは型タグの符号で決めてよい。
-    let rank t =
-        match t with
+    let rank =
+        function
         | DataType.Null -> 0
         | DataType.Boolean -> 1
         | DataType.Integer -> 2
@@ -131,12 +131,12 @@ module internal DataType =
 
     /// 型を 1バイトのタグにする（カタログの永続化に使う）。
     /// rank の順に単調増加させてあるので、復元不能でも比較はできる。
-    let inline toTag (t: DataType) = byte (rank t)
+    let inline toTag (t: DataType) = rank t |> byte
 
     /// タグから型を復元する。
     /// 範囲外なら InternalError。
-    let fromTag (b: byte) =
-        match b with
+    let fromTag =
+        function
         | 0uy -> ret DataType.Null
         | 1uy -> ret DataType.Boolean
         | 2uy -> ret DataType.Integer
@@ -150,8 +150,8 @@ module internal DataType =
         | other -> err (sprintf "カタログの型タグ %d は未知です" (int other) |> DbError.corruption)
 
     /// SQL の型名（DDL の読み書きに使う正準表記）。
-    let toSqlName t =
-        match t with
+    let toSqlName =
+        function
         | DataType.Null -> "NULL"
         | DataType.Boolean -> "BOOLEAN"
         | DataType.Integer -> "INTEGER"
@@ -164,8 +164,8 @@ module internal DataType =
         | DataType.Uuid -> "UUID"
 
 module internal SqlValue =
-    let dataType v =
-        match v with
+    let dataType =
+        function
         | SqlValue.Null -> DataType.Null
         | SqlValue.Bool _ -> DataType.Boolean
         | SqlValue.Int _ -> DataType.Integer
@@ -177,36 +177,46 @@ module internal SqlValue =
         | SqlValue.Decimal _ -> DataType.Decimal
         | SqlValue.Uuid _ -> DataType.Uuid
 
-    let inline isNull (v: SqlValue) =
-        match v with
+    let isNull =
+        function
         | SqlValue.Null -> true
         | _ -> false
 
+    /// REAL を decimal へ変換できる絶対値の上限。
+    /// System.Decimal の最大値（約 7.9228e28）より少し小さい安全側の値。
+    [<Literal>]
+    let private DecimalMaxAsFloat = 7.9e28
+
+    /// REAL を decimal で比較できる絶対値の下限（decimal の最小正値）。
+    /// これ未満の極小値は decimal では 0 に潰れるため float で比較する。
+    [<Literal>]
+    let private DecimalMinMagnitudeAsFloat = 1e-28
+
     /// REAL が decimal へ安全に変換できる範囲かを返す。
     /// 変換自体が例外を送出し得るため、境界判定をここへ集約する。
-    let inline private fitsDecimal (f: float) =
+    let private fitsDecimal (f: float) =
         not (System.Double.IsNaN f || System.Double.IsInfinity f)
-        && System.Math.Abs f <= 7.9e28
+        && System.Math.Abs f <= DecimalMaxAsFloat
 
     /// 数値として取り出す。
     /// 非数値なら None。
     /// NaN と ±Infinity、および decimal の範囲外の REAL は None を返す
     /// （System.Decimal の変換は例外を送出するため）。
-    let asNumeric v =
-        match v with
+    let asNumeric =
+        function
         | SqlValue.Int i -> Some(decimal i)
         | SqlValue.Real f when fitsDecimal f -> Some(decimal f)
         | SqlValue.Real _ -> None
         | SqlValue.Decimal d -> Some d
         | _ -> None
 
-    let inline asInt64 v =
-        match v with
+    let asInt64 =
+        function
         | SqlValue.Int i -> Some i
         | _ -> None
 
-    let inline asText v =
-        match v with
+    let asText =
+        function
         | SqlValue.Text s -> Some s
         | _ -> None
 
@@ -221,10 +231,10 @@ module internal SqlValue =
     /// NaN を単一のビットパターンに正規化する。
     /// キー符号化の順序を一意にし、「NaN は他のすべての数値より大きい」という
     /// SQL 比較の規則と矛盾しないようにする。
-    let inline normalizeFloat f =
+    let normalizeFloat (f: float) =
         if System.Double.IsNaN f then canonicalNaN else f
 
-    let inline vReal f = normalizeFloat f |> SqlValue.Real
+    let vReal = normalizeFloat >> SqlValue.Real
 
     /// 値どうしの比較。
     /// NULL は比較不能として例外を投げる。
@@ -243,18 +253,15 @@ module internal SqlValue =
             | SqlValue.Real f -> f
             | _ -> 0.0
 
-        /// decimal の精度に収まる REAL は decimal で比較し、
-        /// 範囲外・極小の REAL は float で比較する。
-        /// どちらも値の大小関係は保たれる。
-        let compareReal (f: float) (other: SqlValue) =
+        let compareReal f other =
             if System.Double.IsNaN f || System.Double.IsInfinity f then
                 err (DbError.typeError "NaN や ±Infinity は数値比較できません")
-            elif fitsDecimal f && (f = 0.0 || System.Math.Abs f >= 1e-28) then
+            elif fitsDecimal f && (f = 0.0 || System.Math.Abs f >= DecimalMinMagnitudeAsFloat) then
                 Ok(compare (decimal f) (decimalOf other))
             else
                 Ok(compare f (floatOf other))
 
-        let compareNumeric (a: SqlValue) (b: SqlValue) =
+        let compareNumeric a b =
             match a, b with
             | SqlValue.Real fa, SqlValue.Real fb ->
                 if System.Double.IsNaN fa && System.Double.IsNaN fb then
@@ -297,8 +304,8 @@ module internal SqlValue =
             )
 
     /// 関数・制約メッセージ用の簡潔な表示（SQL リテラルではなく）。
-    let toDisplayString (v: SqlValue) =
-        match v with
+    let toDisplayString =
+        function
         | SqlValue.Null -> "NULL"
         | SqlValue.Bool b -> if b then "true" else "false"
         | SqlValue.Int i -> i.ToString System.Globalization.CultureInfo.InvariantCulture
@@ -327,62 +334,62 @@ module internal SqlValue =
                 |> DbError.typeError
             )
 
-        let isDecimalRepresentable v =
-            match v with
+        let isDecimalRepresentable =
+            function
             | SqlValue.Real f -> fitsDecimal f
             | _ -> true
 
-        let asBoolean (v: SqlValue) =
-            match v with
-            | SqlValue.Bool _ -> Ok v
+        let asBoolean =
+            function
+            | SqlValue.Bool _ as v -> Ok v
             | SqlValue.Int i when i = 0L -> Ok(SqlValue.Bool false)
             | SqlValue.Int i when i = 1L -> Ok(SqlValue.Bool true)
             | SqlValue.Real f when f = 0.0 -> Ok(SqlValue.Bool false)
             | SqlValue.Real f when f = 1.0 -> Ok(SqlValue.Bool true)
             | _ -> fail ()
 
-        let asInteger (v: SqlValue) =
-            match v with
-            | SqlValue.Int _ -> Ok v
-            | SqlValue.Bool b -> Ok(SqlValue.Int(if b then 1L else 0L))
+        let asInteger =
+            function
+            | SqlValue.Int _ as v -> Ok v
+            | SqlValue.Bool b -> (if b then 1L else 0L) |> SqlValue.Int |> Ok
             | SqlValue.Real f when
                 not (System.Double.IsNaN f || System.Double.IsInfinity f)
                 && System.Math.Truncate f = f
                 && f >= Int64MinAsFloat
                 && f < Int64MaxAsFloat
                 ->
-                Ok(SqlValue.Int(int64 f))
+                int64 f |> SqlValue.Int |> Ok
             | SqlValue.Decimal d when
                 System.Decimal.Truncate d = d
                 && d >= decimal System.Int64.MinValue
                 && d <= decimal System.Int64.MaxValue
                 ->
-                Ok(SqlValue.Int(int64 d))
+                int64 d |> SqlValue.Int |> Ok
             | _ -> fail ()
 
-        let asReal (v: SqlValue) =
-            match v with
-            | SqlValue.Real _ -> Ok v
-            | SqlValue.Int i -> Ok(SqlValue.Real(float i))
-            | SqlValue.Bool b -> Ok(SqlValue.Real(if b then 1.0 else 0.0))
-            | SqlValue.Decimal d -> Ok(SqlValue.Real(float d))
+        let asReal =
+            function
+            | SqlValue.Real _ as v -> Ok v
+            | SqlValue.Int i -> float i |> SqlValue.Real |> Ok
+            | SqlValue.Bool b -> (if b then 1.0 else 0.0) |> SqlValue.Real |> Ok
+            | SqlValue.Decimal d -> float d |> SqlValue.Real |> Ok
             | _ -> fail ()
 
-        let asDecimal (v: SqlValue) =
+        let asDecimal v =
             if not (isDecimalRepresentable v) then
                 fail ()
             else
                 match v with
                 | SqlValue.Decimal _ -> Ok v
-                | SqlValue.Int i -> Ok(SqlValue.Decimal(decimal i))
-                | SqlValue.Real f -> Ok(SqlValue.Decimal(decimal f))
-                | SqlValue.Bool b -> Ok(SqlValue.Decimal(if b then 1.0M else 0.0M))
+                | SqlValue.Int i -> decimal i |> SqlValue.Decimal |> Ok
+                | SqlValue.Real f -> decimal f |> SqlValue.Decimal |> Ok
+                | SqlValue.Bool b -> (if b then 1.0M else 0.0M) |> SqlValue.Decimal |> Ok
                 | _ -> fail ()
 
-        let asDate (v: SqlValue) =
-            match v with
-            | SqlValue.Date _ -> Ok v
-            | SqlValue.Timestamp t -> Ok(SqlValue.Date(System.DateOnly.FromDateTime t.UtcDateTime))
+        let asDate =
+            function
+            | SqlValue.Date _ as v -> Ok v
+            | SqlValue.Timestamp t -> System.DateOnly.FromDateTime t.UtcDateTime |> SqlValue.Date |> Ok
             | SqlValue.Text s ->
                 match
                     System.DateOnly.TryParseExact(
@@ -392,19 +399,17 @@ module internal SqlValue =
                         System.Globalization.DateTimeStyles.None
                     )
                 with
-                | true, d -> Ok(SqlValue.Date d)
+                | true, d -> d |> SqlValue.Date |> Ok
                 | _ -> fail ()
             | _ -> fail ()
 
-        let asTimestamp (v: SqlValue) =
-            match v with
-            | SqlValue.Timestamp _ -> Ok v
+        let asTimestamp =
+            function
+            | SqlValue.Timestamp _ as v -> Ok v
             | SqlValue.Date d ->
-                Ok(
-                    SqlValue.Timestamp(
-                        System.DateTimeOffset(d.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
-                    )
-                )
+                System.DateTimeOffset(d.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
+                |> SqlValue.Timestamp
+                |> Ok
             | SqlValue.Text s ->
                 match
                     System.DateTimeOffset.TryParse(
@@ -414,7 +419,7 @@ module internal SqlValue =
                         ||| System.Globalization.DateTimeStyles.AdjustToUniversal
                     )
                 with
-                | true, t -> Ok(SqlValue.Timestamp t)
+                | true, t -> t |> SqlValue.Timestamp |> Ok
                 | _ -> fail ()
             | _ -> fail ()
 
@@ -430,11 +435,11 @@ module internal SqlValue =
             | DataType.Text ->
                 match v with
                 | SqlValue.Text _ -> Ok v
-                | _ -> Ok(SqlValue.Text(SqlLiteral.toSqlLiteral v))
+                | _ -> SqlLiteral.toSqlLiteral v |> SqlValue.Text |> Ok
             | DataType.Blob ->
                 match v with
                 | SqlValue.Blob _ -> Ok v
-                | SqlValue.Text s -> Ok(SqlValue.Blob(System.Text.Encoding.UTF8.GetBytes s))
+                | SqlValue.Text s -> System.Text.Encoding.UTF8.GetBytes s |> SqlValue.Blob |> Ok
                 | _ -> fail ()
             | DataType.Date -> asDate v
             | DataType.Timestamp -> asTimestamp v
@@ -443,6 +448,6 @@ module internal SqlValue =
                 | SqlValue.Uuid _ -> Ok v
                 | SqlValue.Text s ->
                     match System.Guid.TryParse s with
-                    | true, g -> Ok(SqlValue.Uuid g)
+                    | true, g -> g |> SqlValue.Uuid |> Ok
                     | _ -> fail ()
                 | _ -> fail ()

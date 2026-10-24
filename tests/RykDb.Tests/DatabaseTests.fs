@@ -124,6 +124,22 @@ let ``Database: transaction 中の文エラーはそのまま返る`` () =
         expectError "BEGIN 中の存在しないテーブル" (db1.Execute "SELECT * FROM nope"))
 
 [<Fact>]
+let ``Database: 明示 transaction 中の DDL はエラーになる`` () =
+    withDb "tx-ddl" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let tx = db1.Begin()
+
+        // DDL は自動 commit されて ROLLBACK で戻らないので、明示的に拒否する
+        expectError "BEGIN 中の CREATE TABLE" (tx.Execute "CREATE TABLE u (id INTEGER PRIMARY KEY)")
+        expectError "BEGIN 中の CREATE INDEX" (tx.Execute "CREATE INDEX ix ON t (v)")
+        expectError "BEGIN 中の DROP TABLE" (tx.Execute "DROP TABLE t")
+
+        // transaction を閉じれば DDL できる
+        let committed = ok (tx.Commit())
+        let db2 = exec committed "CREATE TABLE u (id INTEGER PRIMARY KEY)"
+        Assert.Contains("u", db2.TableNames()))
+
+[<Fact>]
 let ``Database: SQL の BEGIN / COMMIT / ROLLBACK は受理される（文としては無効）`` () =
     // docs/sql-reference.md の既知の制限どおり、文としての txn 制御は何もしない。
     withDb "tx5" (fun db0 ->
@@ -1157,6 +1173,25 @@ let ``Database: 閉じて開き直すとデータが残る`` () =
         Assert.Equal<string>("kept", actual)
 
         ok (db3.Close()))
+
+[<Fact>]
+let ``Database: 古いハンドルを Close しても新しいハンドルの commit は失われない`` () =
+    withDir "stale-close" (fun dir ->
+        let db0 = ok (Database.openWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1)")
+        let db3, _ = ok (db2.Execute "INSERT INTO t VALUES (2)")
+
+        let before = query db3 "SELECT COUNT(*) FROM t"
+        Assert.Equal<int64>(2L, asInt before.Rows.[0].[0])
+
+        // db2 は db3 より前の状態。古いハンドルの Close で WAL を消してはいけない。
+        ok (db2.Close())
+
+        let reopened = ok (Database.openWith dir)
+        let after = query reopened "SELECT COUNT(*) FROM t"
+        Assert.Equal<int64>(2L, asInt after.Rows.[0].[0])
+        ok (reopened.Close()))
 
 [<Fact>]
 let ``E2E: プロセス再起動を模して Disk から復元できる`` () =

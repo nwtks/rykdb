@@ -113,7 +113,6 @@ module internal Wal =
                         return r, c3
             }
 
-        /// 壊れた/書きかけレコードで打ち切る（以降のバイトは捨てる）。
         let rec readFrames (c: Cursor) (acc: WalRecord list) =
             match readFrame c with
             | Error _ -> List.rev acc

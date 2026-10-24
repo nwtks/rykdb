@@ -5,6 +5,8 @@
 // CURRENT は一時ファイルに書いてから原子的にリネームで切り替えるので、
 // クラッシュしても常に有効な manifest を指す。
 // 各 VersionEdit は長さ付きで包むので、途中で切れた追記も検出できる。
+// 途中のレコードが壊れていれば CorruptionError にして開かない（SSTable を消さない）。
+// 末尾の書きかけ（後ろに有効な行が無い）だけはクラッシュ時の追記とみなして読み飛ばす。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -56,24 +58,33 @@ module internal Manifest =
 
         let rec decodeLines (lines: string list) (acc: VersionEdit list) =
             match lines with
-            | [] -> List.rev acc
+            | [] -> Ok(List.rev acc, false)
             | line :: rest ->
                 if line.Trim() = "" then
                     decodeLines rest acc
                 else
                     match readRecord line with
-                    | Ok edits -> decodeLines rest (edits @ acc)
-                    | Error _ -> List.rev acc
+                    | Ok edits -> decodeLines rest (List.rev edits @ acc)
+                    | Error _ when rest |> List.forall (fun l -> l.Trim() = "") -> Ok(List.rev acc, true)
+                    | Error e -> Error e
 
-        let scan (dir: string) (fileNumber: int64) =
+        let read dir fileNumber =
             let path = manifestPath dir fileNumber
 
             if System.IO.File.Exists path then
-                decodeLines (System.IO.File.ReadAllLines path |> Array.toList) []
+                Ok(System.IO.File.ReadAllLines path |> Array.toList)
             else
-                []
+                Error(DbError.corruption (sprintf "有効な manifest が見つかりません: %s" (fileName fileNumber)))
 
-        let readAll (dir: string) (fileNumber: int64) = protect (fun () -> scan dir fileNumber)
+        let readAll (dir: string) (fileNumber: int64) =
+            match protect (fun () -> read dir fileNumber) with
+            | Error e -> Error e
+            | Ok(Error e) -> Error e
+            | Ok(Ok lines) ->
+                let hasContent = lines |> List.exists (fun line -> line.Trim() <> "")
+
+                decodeLines lines []
+                |> Result.map (fun (edits, truncated) -> edits, truncated, hasContent)
 
         let applyAll (edits: VersionEdit list) (initial: Version) =
             List.fold VersionEdit.apply initial edits
@@ -91,27 +102,39 @@ module internal Manifest =
                         System.IO.FileShare.None
                     )
 
-                fs.Flush(true)
+                fs.Flush true
                 fs.Close()
                 System.IO.File.Move(tmp, currentPath dir, true))
 
+        let hasSstFiles (dir: string) =
+            protect (fun () -> System.IO.Directory.GetFiles(dir, "*.sst").Length > 0)
+
         result {
             let! _ = ensureDirectory dir
+            let! hasSsts = hasSstFiles dir
             let! current = readCurrent dir
 
             match current with
             | Some manifestNumber ->
-                let! edits = readAll dir manifestNumber
+                let! decoded = readAll dir manifestNumber
+                let edits, _, hasContent = decoded
                 let version = applyAll edits Version.empty
-                return version, manifestNumber
+
+                if List.isEmpty (Version.allFiles version) && hasContent && hasSsts then
+                    return! err (DbError.corruption "manifest が壊れており、SSTable の管理情報を復元できません（SSTable は変更していません）")
+                else
+                    return version, manifestNumber
             | None ->
-                let manifestNumber = 1L
+                if hasSsts then
+                    return! err (DbError.corruption "CURRENT が無いのに SSTable が残っています（データ損失の恐れ）")
+                else
+                    let manifestNumber = 1L
 
-                let! _ =
-                    protect (fun () -> System.IO.File.WriteAllText(manifestPath dir manifestNumber, ""))
+                    let! _ =
+                        protect (fun () -> System.IO.File.WriteAllText(manifestPath dir manifestNumber, ""))
 
-                let! _ = writeCurrent dir manifestNumber
-                return Version.empty, manifestNumber
+                    let! _ = writeCurrent dir manifestNumber
+                    return Version.empty, manifestNumber
         }
 
     /// .VersionEdit を反映し、Version と次の manifest 番号を返す。

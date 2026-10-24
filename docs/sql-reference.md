@@ -829,6 +829,9 @@ ROLLBACK;        -- 削除を取り消し
 - `BEGIN` は新しい transaction を始める（既に transaction 中なら何もしない）。
 - `COMMIT` はバッファをエンジンへ流す。
 - `ROLLBACK` はバッファを捨てる。
+- **DDL（`CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX`）は明示 transaction 中には実行できない**
+  （即時反映のため）。
+  `COMMIT` または `ROLLBACK` してから実行する。
 - 1 つの `Execute` / スクリプト内で複数文を `;` 区切りで渡した場合、`BEGIN` 以降は同じ transaction で実行される。
 - ライブラリ API の `Database.Begin()` / `Commit()` / `Rollback()` と等価。
 
@@ -972,6 +975,7 @@ db> .rollback
 | ソート              | メモリ上に実体化。spilling する外部マージは未実装             |
 | `AVG`               | `SUM / COUNT` を実行時に計算                                  |
 | `UPDATE` / `DELETE` | `LIMIT` 相当の句がない                                        |
+| DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）    |
 | `ORDER BY`          | 同値行の順序は保証しない                                      |
 
 ### 演算の注意

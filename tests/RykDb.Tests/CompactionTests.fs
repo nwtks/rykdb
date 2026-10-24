@@ -37,7 +37,7 @@ let private entryOf (i: int) =
     Entry.put (intKey i) (uint64 i) (intRow i)
 
 [<Fact>]
-let ``Compaction: 同一キーは最新版を残し、snapshot より古い版を落とす`` () =
+let ``Compaction: 同名キーは最新版と最古 snapshot が見る版を残す`` () =
     withDir "comp-gc" (fun dir ->
         let f =
             mkSst
@@ -53,20 +53,23 @@ let ``Compaction: 同一キーは最新版を残し、snapshot より古い版�
 
         let version = Version.addFile f Version.empty
         let result, _ = compactAll dir version 4UL pickFirstLevel
-        // key1 の seq 1, 3 は snapshot 4 より古いので捨てる
-        Assert.Equal(2, result.DroppedVersions)
+        // snapshot 4 が見るのは key1 の seq 3（SeqNo <= 4 の最新）。
+        // seq 1 だけがどの snapshot からも見えないので落ちる。
+        Assert.Equal(1, result.DroppedVersions)
         Assert.Equal(0, result.DroppedTombstones)
         Assert.Equal<int64 list>([ 10L ], result.Removed |> List.map _.FileNumber)
 
         let out = List.exactlyOne result.Added
         Assert.Equal(2, out.Level)
-        Assert.Equal(2L, out.EntryCount)
+        Assert.Equal(3L, out.EntryCount)
 
         let entries = ok (readBack dir out)
-        Assert.Equal<int>(2, entries.Length)
+        Assert.Equal<int>(3, entries.Length)
         Assert.Equal<byte array>(intKey 1, entries.[0].Key)
         Assert.Equal<uint64>(5UL, entries.[0].SeqNo)
-        Assert.Equal<byte array>(intKey 2, entries.[1].Key))
+        Assert.Equal<byte array>(intKey 1, entries.[1].Key)
+        Assert.Equal<uint64>(3UL, entries.[1].SeqNo)
+        Assert.Equal<byte array>(intKey 2, entries.[2].Key))
 
 [<Fact>]
 let ``Compaction: snapshot が生きている版は GC しない`` () =
@@ -83,14 +86,48 @@ let ``Compaction: snapshot が生きている版は GC しない`` () =
                 ]
 
         let version = Version.addFile f Version.empty
-        // snapshot 2 が見ている seq 3 は残し、seq 1 だけ落とす
+        // snapshot 2 が見るのは seq 1。落とすとデータ損失になる。
+        // seq 5, 3 も将来の snapshot 用に残るので、何も落ちない。
         let result, _ = compactAll dir version 2UL pickFirstLevel
-        Assert.Equal(1, result.DroppedVersions)
+        Assert.Equal(0, result.DroppedVersions)
+
+        let entries = ok (readBack dir (List.exactlyOne result.Added))
+        Assert.Equal<int>(3, entries.Length)
+        Assert.Equal<uint64>(5UL, entries.[0].SeqNo)
+        Assert.Equal<uint64>(3UL, entries.[1].SeqNo)
+        Assert.Equal<uint64>(1UL, entries.[2].SeqNo))
+
+[<Fact>]
+let ``Compaction: 新しい版があっても active snapshot が見る旧版を残す`` () =
+    withDir "comp-gc-visible" (fun dir ->
+        let f =
+            mkSst dir 10L 1 [ Entry.put (intKey 1) 10UL (intRow 10); Entry.put (intKey 1) 5UL (intRow 5) ]
+
+        let version = Version.addFile f Version.empty
+        // snapshot 7 は seq 10 を見ない。seq 5 が唯一の可視版になる。
+        let result, _ = compactAll dir version 7UL pickFirstLevel
+        Assert.Equal(0, result.DroppedVersions)
 
         let entries = ok (readBack dir (List.exactlyOne result.Added))
         Assert.Equal<int>(2, entries.Length)
-        Assert.Equal<uint64>(5UL, entries.[0].SeqNo)
-        Assert.Equal<uint64>(3UL, entries.[1].SeqNo))
+        Assert.Equal<uint64>(10UL, entries.[0].SeqNo)
+        Assert.Equal<uint64>(5UL, entries.[1].SeqNo))
+
+[<Fact>]
+let ``Compaction: active snapshot より古い版だけなら最新版以外を落とす`` () =
+    withDir "comp-gc-optimal" (fun dir ->
+        let f =
+            mkSst dir 10L 1 [ Entry.put (intKey 1) 5UL (intRow 5); Entry.put (intKey 1) 3UL (intRow 3) ]
+
+        let version = Version.addFile f Version.empty
+        // active が無いときの境界は LastCommitSeqNo + 1。
+        // 最新版 5 が境界以下なので、3 はどの snapshot からも見えない。
+        let result, _ = compactAll dir version 6UL pickFirstLevel
+        Assert.Equal(1, result.DroppedVersions)
+
+        let entries = ok (readBack dir (List.exactlyOne result.Added))
+        Assert.Equal<int>(1, entries.Length)
+        Assert.Equal<uint64>(5UL, entries.[0].SeqNo))
 
 [<Fact>]
 let ``Compaction: 閾値を超えないレベルは compaction しない`` () =
@@ -116,15 +153,15 @@ let ``Compaction: 上のレベルの重なるファイルも入力に含める``
         let result, _ = compactAll dir version 10UL pickFirstLevel
         // 入力は L1 の f1 と、重なる L2 の f2 の両方
         Assert.Equal<int64 list>([ 10L; 11L ], result.Removed |> List.map _.FileNumber)
-        // key3 の古い版（seq 3 < snapshot 10）だけ落ちる
-        Assert.Equal(1, result.DroppedVersions)
+        // key3 の seq 3 は snapshot 10 が見る版なので残す（seq 33 はそれより新しい）
+        Assert.Equal(0, result.DroppedVersions)
 
         let out = List.exactlyOne result.Added
         Assert.Equal(2, out.Level)
-        Assert.Equal(4L, out.EntryCount)
+        Assert.Equal(5L, out.EntryCount)
 
         let entries = ok (readBack dir out)
-        Assert.Equal<int>(4, entries.Length)
+        Assert.Equal<int>(5, entries.Length)
         Assert.Equal<uint64>(1UL, entries.[0].SeqNo)
         Assert.Equal<uint64>(33UL, entries.[2].SeqNo))
 
