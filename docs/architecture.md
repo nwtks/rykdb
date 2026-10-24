@@ -801,8 +801,12 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | ポイント検索の順路   | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                  |
 
 ファイルは `Sstable.build` が組み立て、`Sstable.openTable` が読み出す。
-読み出しはファイル全体を読んで Footer / index / Bloom を解析する
-（プロセス内のブロックキャッシュは持たない。不変 engine は読み取り中に更新できないため）。
+読み出しはファイル全体を読んで Footer / index / Bloom を解析する。
+パース済みの `SstReader` は `SstReaderCache` が**弱参照**で保持する
+（キーは「パス + サイズ + mtime」。
+ファイル番号は単調増加で中身は書き換わらないため安全に共有でき、GC が回収できるのでメモリを圧迫しない）。
+同じファイルの 2 回目以降の検索・走査はファイル全体の再読み込みとチェックサムを省略できる。
+（不変 engine は読み取り中に状態を持てないため、キャッシュはモジュール内のサイドテーブル）。
 
 走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
 `rangeScan` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ

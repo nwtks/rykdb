@@ -16,44 +16,60 @@ module internal Scalar =
         if m = 0 then
             n = 0
         else
-            let rec collect (i: int) (cur: List<char>) (acc: List<char list>) =
+            let segStarts = Array.zeroCreate<int> m
+            let segLengths = Array.zeroCreate<int> m
+
+            let rec collect (i: int) (count: int) (start: int) =
                 if i >= m then
-                    List.rev (List.rev cur :: acc)
+                    if start >= 0 then
+                        segStarts.[count] <- start
+                        segLengths.[count] <- i - start
+                        count + 1
+                    else
+                        count
                 elif p.[i] = '%' then
-                    let acc2 = if List.isEmpty cur then acc else List.rev cur :: acc
-                    collect (i + 1) [] acc2
+                    if start >= 0 then
+                        segStarts.[count] <- start
+                        segLengths.[count] <- i - start
+                        collect (i + 1) (count + 1) -1
+                    else
+                        collect (i + 1) count -1
                 else
-                    collect (i + 1) (p.[i] :: cur) acc
+                    collect (i + 1) count (if start >= 0 then start else i)
 
-            let rec matchSegment (seg: List<char>) (ti: int) =
-                match seg with
-                | [] -> ti
-                | c :: rest ->
-                    if ti >= n then -1
-                    elif c = '_' || c = t.[ti] then matchSegment rest (ti + 1)
-                    else -1
+            let matchSegment (start: int) (len: int) (ti: int) =
+                let rec loop (k: int) (pos: int) =
+                    if k >= len then
+                        pos
+                    elif pos >= n then
+                        -1
+                    elif p.[start + k] = '_' || p.[start + k] = t.[pos] then
+                        loop (k + 1) (pos + 1)
+                    else
+                        -1
 
-            let segments = collect 0 [] []
-            let count = List.length segments
+                loop 0 ti
+
+            let count = collect 0 0 -1
             let anchoredEnd = p.[m - 1] <> '%'
 
             let rec matchFrom (idx: int) (pos: int) =
                 if idx >= count then
                     not anchoredEnd || pos = n
                 else
-                    let seg = List.item idx segments
+                    let start = segStarts.[idx]
+                    let len = segLengths.[idx]
                     let isLast = idx = count - 1
                     let freeBefore = if idx = 0 then p.[0] = '%' else true
-                    let len = List.length seg
 
                     if isLast && anchoredEnd && not freeBefore then
-                        matchSegment seg pos = n
+                        matchSegment start len pos = n
                     elif isLast && anchoredEnd then
                         let rec scan (k: int) =
                             if k + len > n then
                                 false
                             else
-                                match matchSegment seg k with
+                                match matchSegment start len k with
                                 | -1 -> scan (k + 1)
                                 | r -> r = n
 
@@ -63,7 +79,7 @@ module internal Scalar =
                             if k + len > n then
                                 -1
                             else
-                                match matchSegment seg k with
+                                match matchSegment start len k with
                                 | -1 -> scan (k + 1)
                                 | r -> r
 
@@ -71,7 +87,7 @@ module internal Scalar =
                         | -1 -> false
                         | next -> matchFrom (idx + 1) next
                     else
-                        match matchSegment seg pos with
+                        match matchSegment start len pos with
                         | -1 -> false
                         | r -> matchFrom (idx + 1) r
 

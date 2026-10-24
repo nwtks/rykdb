@@ -36,6 +36,34 @@ type internal StorageEngine =
         ActiveSnapshot: uint64
     }
 
+/// パース済み SSTable reader のプロセス内キャッシュ。
+/// SSTable は一度書かれたら内容が変わらない（ファイル番号は単調増加）ので、
+/// パス + サイズ + mtime をキーにすれば安全に再利用できる。
+/// 大きな DB でもメモリを圧迫しないよう、値は弱参照で持つ（GC が回収できる）。
+module internal SstReaderCache =
+    let private cache =
+        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstReader>>(
+            System.StringComparer.Ordinal
+        )
+
+    /// ファイルの同一性を表すキー。
+    /// 同じ番号のファイルが差し替わった場合はサイズ/mtime が変わるので別キーになる。
+    let keyOf (path: string) (info: System.IO.FileInfo) =
+        sprintf "%s|%d|%d" path info.Length info.LastWriteTimeUtc.Ticks
+
+    let tryGet (key: string) =
+        match cache.TryGetValue key with
+        | true, weak ->
+            match weak.TryGetTarget() with
+            | true, reader -> Some reader
+            | _ ->
+                cache.TryRemove key |> ignore
+                None
+        | _ -> None
+
+    let put (key: string) (reader: SstReader) =
+        cache.[key] <- System.WeakReference<SstReader> reader
+
 module internal StorageEngine =
     /// SSTable に書く Bloom filter の誤検出率。
     [<Literal>]
@@ -79,8 +107,21 @@ module internal StorageEngine =
         protect (fun () -> System.IO.File.ReadAllBytes(FileMetaData.path dir fileNumber))
 
     /// ファイルを開く（Bloom と index を持つ reader を作る）。
+    /// パース結果は弱参照キャッシュに載せ、同じファイルを何度も読まない。
     let private openSstable (engine: StorageEngine) (f: FileMetaData) =
-        readFileBytes engine.Dir f.FileNumber >>= Sstable.openTable
+        let path = FileMetaData.path engine.Dir f.FileNumber
+
+        match protect (fun () -> SstReaderCache.keyOf path (System.IO.FileInfo path)) with
+        | Error e -> Error e
+        | Ok key ->
+            match SstReaderCache.tryGet key with
+            | Some reader -> Ok reader
+            | None ->
+                readFileBytes engine.Dir f.FileNumber
+                >>= Sstable.openTable
+                >>= fun reader ->
+                    SstReaderCache.put key reader
+                    Ok reader
 
     /// 開いた reader から startKey 以降の全エントリを配列にする。
     /// `[||]` なら先頭から全部。
@@ -159,21 +200,32 @@ module internal StorageEngine =
     /// 走査中のブロック解析エラーは打ち切るが、ファイル全体のチェックサムは
     /// `openTable` が検証済みなので、実際の破損はそこで CorruptionError になる。
     let private lazyMergeScan (sources: MergeSource list) =
-        let advance (state: MergeSource list) =
-            let best =
-                state
-                |> List.indexed
-                |> List.choose (function
-                    | i, Opened(e, rest) -> Some(i, e, rest)
-                    | _ -> None)
-                |> List.fold
-                    (fun acc (i, e, rest) ->
-                        match acc with
-                        | None -> Some(i, e, rest)
-                        | Some(_, be, _) -> if SstEntry.compare e be < 0 then Some(i, e, rest) else acc)
-                    None
+        let rec pick (i: int) (best: (int * SstEntry * SstScan) option) (rest: MergeSource list) =
+            match rest with
+            | [] -> best
+            | Opened(e, scan) :: tail ->
+                match best with
+                | None -> pick (i + 1) (Some(i, e, scan)) tail
+                | Some(_, be, _) ->
+                    if SstEntry.compare e be < 0 then
+                        pick (i + 1) (Some(i, e, scan)) tail
+                    else
+                        pick (i + 1) best tail
+            | Drained :: tail -> pick (i + 1) best tail
 
-            match best with
+        let rec loop rest value (k: int) (revPrefix: MergeSource list) (tail: MergeSource list) =
+            match tail with
+            | [] -> rest
+            | s :: tail' ->
+                if k = 0 then
+                    List.append (List.rev revPrefix) (value :: tail')
+                else
+                    loop rest value (k - 1) (s :: revPrefix) tail'
+
+        let replaceAt (i: int) (value: MergeSource) (rest: MergeSource list) = loop rest value i [] rest
+
+        let rec advance (state: MergeSource list) =
+            match pick 0 None state with
             | None -> None
             | Some(i, e, rest) ->
                 let nextSource =
@@ -182,8 +234,7 @@ module internal StorageEngine =
                     | Ok None -> Drained
                     | Ok(Some(e2, nxt)) -> Opened(e2, nxt)
 
-                let nextState = state |> List.mapi (fun j s -> if j = i then nextSource else s)
-                Some(e, nextState)
+                Some(e, replaceAt i nextSource state)
 
         Seq.unfold advance sources
 

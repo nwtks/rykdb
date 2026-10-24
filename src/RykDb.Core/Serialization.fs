@@ -127,31 +127,63 @@ module internal Reader =
 
         decode 0 0UL c
 
+    /// リトルエンディアン 8バイト。
+    /// 値ごとに配列を作らない（行のデコードで最も呼ばれる）。
     let readInt64LE (c: Cursor) =
-        readBytes 8 c
-        |> Result.map (fun (bs, c) ->
-            let v = bs |> Array.mapi (fun i b -> int64 b <<< 8 * i) |> Array.sum
-            v, c)
+        if c.Pos + 8 > c.End then
+            eof "Reader: 読み取り位置が末尾を超えました"
+        else
+            let d = c.Data
+            let p = c.Pos
+
+            let v =
+                int64 d.[p]
+                ||| (int64 d.[p + 1] <<< 8)
+                ||| (int64 d.[p + 2] <<< 16)
+                ||| (int64 d.[p + 3] <<< 24)
+                ||| (int64 d.[p + 4] <<< 32)
+                ||| (int64 d.[p + 5] <<< 40)
+                ||| (int64 d.[p + 6] <<< 48)
+                ||| (int64 d.[p + 7] <<< 56)
+
+            Ok(v, { c with Pos = p + 8 })
 
     /// リトルエンディアン 4バイト（符号なし）を読む。
     let readUInt32LE (c: Cursor) =
-        readBytes 4 c
-        |> Result.map (fun (bs, c) ->
-            let v =
-                uint32 bs.[0]
-                ||| (uint32 bs.[1] <<< 8)
-                ||| (uint32 bs.[2] <<< 16)
-                ||| (uint32 bs.[3] <<< 24)
+        if c.Pos + 4 > c.End then
+            eof "Reader: 読み取り位置が末尾を超えました"
+        else
+            let d = c.Data
+            let p = c.Pos
 
-            v, c)
+            let v =
+                uint32 d.[p]
+                ||| (uint32 d.[p + 1] <<< 8)
+                ||| (uint32 d.[p + 2] <<< 16)
+                ||| (uint32 d.[p + 3] <<< 24)
+
+            Ok(v, { c with Pos = p + 4 })
 
     /// ビッグエンディアン 8バイト（符号なし）。
     /// 順序保持された整数の復元。
     let readUint64BE (c: Cursor) =
-        readBytes 8 c
-        |> Result.map (fun (bs, c) ->
-            let v = bs |> Array.fold (fun acc b -> acc <<< 8 ||| uint64 b) 0UL
-            v, c)
+        if c.Pos + 8 > c.End then
+            eof "Reader: 読み取り位置が末尾を超えました"
+        else
+            let d = c.Data
+            let p = c.Pos
+
+            let v =
+                (uint64 d.[p] <<< 56)
+                ||| (uint64 d.[p + 1] <<< 48)
+                ||| (uint64 d.[p + 2] <<< 40)
+                ||| (uint64 d.[p + 3] <<< 32)
+                ||| (uint64 d.[p + 4] <<< 24)
+                ||| (uint64 d.[p + 5] <<< 16)
+                ||| (uint64 d.[p + 6] <<< 8)
+                ||| uint64 d.[p + 7]
+
+            Ok(v, { c with Pos = p + 8 })
 
     let readLengthPrefixed (c: Cursor) =
         readVarint c

@@ -139,6 +139,28 @@ let ``StorageEngine.scanAt: ファイルが消えていれば IoError`` () =
             expectErrorKind ErrorKind.IoError "limit ありの scan は IoError" (StorageEngine.scanAt engine None [||] 10)))
 
 [<Fact>]
+let ``StorageEngine: reader キャッシュ後でもファイル改竄を検出する`` () =
+    withDir "se-cache-stamp" (fun dir ->
+        withEngine dir (fun engine ->
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let engine = ok (StorageEngine.flush engine)
+
+            // 1回読んで reader をキャッシュに載せる
+            Assert.True((ok (StorageEngine.getAt engine None (intKey 1))).IsSome)
+
+            // 同じサイズのままビットを壊し、mtime を確実に進める
+            let path = Directory.GetFiles(dir, "*.sst") |> Array.exactlyOne
+            let bytes = File.ReadAllBytes path
+            bytes.[0] <- bytes.[0] ^^^ 0xFFuy
+            File.WriteAllBytes(path, bytes)
+            File.SetLastWriteTimeUtc(path, System.DateTime.UtcNow.AddSeconds 1.0)
+
+            expectErrorKind
+                ErrorKind.CorruptionError
+                "キャッシュのキーに mtime が入っていないと古い reader を返す"
+                (StorageEngine.getAt engine None (intKey 1))))
+
+[<Fact>]
 let ``StorageEngine.getAt: Bloom が「無い」と言うキーはスキャンせず None`` () =
     withDir "se-bloom-miss" (fun dir ->
         withEngine dir (fun engine ->

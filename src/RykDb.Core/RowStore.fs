@@ -809,6 +809,33 @@ module internal Dml =
                     return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
         }
 
+    /// 走査済みの行をそのまま使って更新する（主キー検索をやり直さない）。
+    /// 主キーは変更できない（DELETE + INSERT を使う）。
+    let updateRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) (newRow: SqlValue array) =
+        result {
+            do! TableSchema.validateRow schema newRow
+
+            let oldPkValues = TableSchema.primaryKeyOf schema oldRow
+            let newPkValues = TableSchema.primaryKeyOf schema newRow
+
+            if not (Array.forall2 (=) oldPkValues newPkValues) then
+                return!
+                    err (
+                        sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
+                        |> DbError.constraintViolation
+                    )
+            else
+                let newPk = RowKey.primary schema newRow
+                let afterMain = Transaction.put txn (tableSpace schema) newPk newRow
+                return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
+        }
+
+    /// 走査済みの行をそのまま使って削除する（主キー検索をやり直さない）。
+    let deleteRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) =
+        let pk = RowKey.primary schema oldRow
+        let next = Transaction.remove txn (tableSpace schema) pk
+        applyIndexChange schema next (Some oldRow) None
+
     /// 主キーで削除する。
     /// 主キーと全索引に tombstone を書く。
     /// 元の行を取得してから索引キーを組み立てるので、NOT NULL でも壊れない。

@@ -125,26 +125,27 @@ module internal Schema =
         { Columns = cols; Tables = [ name ] }
 
     /// 列参照を解決する。見つからなければエラー、曖昧ならエラー。
+    /// 大文字小文字を区別しない（`SqlName.equal` と同じ規則）。
+    /// 行ごとに呼ばれるので、文字列の小文字化や一時配列を作らない。
     let resolve (schema: Schema) (r: ColumnRef) =
-        let isMatch (wanted: string) (c: OutputColumn) =
-            let full = c.Display.ToLowerInvariant()
-            let bare = c.Name.ToLowerInvariant()
-            let qual = defaultArg c.Qualifier "" |> fun s -> s.ToLowerInvariant()
-
+        let isMatch (c: OutputColumn) =
             match r.Qualifier with
             | Some q ->
-                let q' = q.ToLowerInvariant()
-                full = wanted || qual = q' && bare = r.Name.ToLowerInvariant()
-            | None -> bare = wanted
+                SqlName.equal c.Display r.Display
+                || match c.Qualifier with
+                   | Some cq -> SqlName.equal cq q && SqlName.equal c.Name r.Name
+                   | None -> false
+            | None -> SqlName.equal c.Name r.Name
 
-        let wanted = r.Display.ToLowerInvariant()
+        let rec collect (i: int) (acc: int list) =
+            if i >= schema.Columns.Length then
+                List.rev acc
+            elif isMatch schema.Columns.[i] then
+                collect (i + 1) (i :: acc)
+            else
+                collect (i + 1) acc
 
-        let hits =
-            schema.Columns
-            |> Array.mapi (fun i c -> i, c)
-            |> Array.filter (fun (_, c) -> isMatch wanted c)
-            |> Array.map fst
-            |> Array.toList
+        let hits = collect 0 []
 
         match hits with
         | [ i ] -> ret i

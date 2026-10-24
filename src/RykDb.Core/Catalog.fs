@@ -328,29 +328,28 @@ module internal Catalog =
             | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
             | _ -> None
 
-        let rec decodeRows (rest: (byte array * SqlValue array option) array) (acc: Catalog) =
-            if Array.isEmpty rest then
+        let rec decodeRows (rows: (byte array * SqlValue array option) array) (i: int) (acc: Catalog) =
+            if i >= rows.Length then
                 ret acc
             else
-                let key, value = rest.[0]
-                let tail = rest.[1..]
+                let key, value = rows.[i]
 
                 match value with
-                | None -> decodeRows tail acc
+                | None -> decodeRows rows (i + 1) acc
                 | Some v ->
                     match ofValue v with
-                    | None -> decodeRows tail acc
+                    | None -> decodeRows rows (i + 1) acc
                     | Some bytes ->
                         match keyKindOf key with
                         | Some(false, name) ->
                             match decodeTable name bytes with
                             | Error e -> Error e
-                            | Ok t -> decodeRows tail (addTable acc t)
+                            | Ok t -> decodeRows rows (i + 1) (addTable acc t)
                         | Some(true, name) ->
                             match decodeIndex name bytes with
                             | Error e -> Error e
-                            | Ok i -> decodeRows tail (addIndex acc i)
-                        | None -> decodeRows tail acc
+                            | Ok idx -> decodeRows rows (i + 1) (addIndex acc idx)
+                        | None -> decodeRows rows (i + 1) acc
 
         RowStore.scan store keyspace [||] 0
-        >>= fun rows -> decodeRows (Seq.toArray rows) empty
+        >>= fun rows -> decodeRows (Seq.toArray rows) 0 empty

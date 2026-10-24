@@ -117,28 +117,40 @@ module internal SstEntry =
         }
 
     let mergeSorted (sources: SstEntry array list) =
-        let rec merge (heads: MergeHead list) (acc: SstEntry list) =
-            let pick =
-                heads
-                |> List.filter (fun h -> h.Index < h.Items.Length)
-                |> List.fold
-                    (fun best h ->
-                        match best with
-                        | None -> Some h
-                        | Some b ->
-                            if compare h.Items.[h.Index] b.Items.[b.Index] < 0 then
-                                Some h
-                            else
-                                Some b)
-                    None
+        let replaceAt (i: int) (value: MergeHead) (heads: MergeHead list) =
+            let rec loop (k: int) (revPrefix: MergeHead list) (rest: MergeHead list) =
+                match rest with
+                | [] -> heads
+                | h :: tail ->
+                    if k = 0 then
+                        List.append (List.rev revPrefix) (value :: tail)
+                    else
+                        loop (k - 1) (h :: revPrefix) tail
 
-            match pick with
+            loop i [] heads
+
+        let rec pick (best: MergeHead option) (heads: MergeHead list) =
+            match heads with
+            | [] -> best
+            | h :: tail ->
+                if h.Index >= h.Items.Length then
+                    pick best tail
+                else
+                    match best with
+                    | None -> pick (Some h) tail
+                    | Some b ->
+                        if compare h.Items.[h.Index] b.Items.[b.Index] < 0 then
+                            pick (Some h) tail
+                        else
+                            pick best tail
+
+        let rec merge (heads: MergeHead list) (acc: SstEntry list) =
+            match pick None heads with
             | None -> List.rev acc |> Array.ofList
             | Some h ->
                 let e = h.Items.[h.Index]
                 let advanced = { h with Index = h.Index + 1 }
-                let replaced = heads |> List.mapi (fun i x -> if i = h.Id then advanced else x)
-                merge replaced (e :: acc)
+                merge (replaceAt h.Id advanced heads) (e :: acc)
 
         merge (sources |> List.mapi (fun i a -> { Id = i; Items = a; Index = 0 })) []
 
@@ -240,10 +252,6 @@ module internal Sstable =
     [<Literal>]
     let private Version = 1
 
-    /// バイト列の列の、各要素の開始オフセットを求める（累積バイト数）。
-    /// 結果は要素数 + 1 個で、最後が全体のバイト数。
-    let private startOffsets (blocks: byte array list) =
-        blocks |> List.scan (fun acc b -> acc + b.Length) 0
 
     /// Cursor から終端まで 1件ずつ読み出して配列にまとめる。
     /// step は「読むたびに変わる状態」（キーの接頭辞共有など）を
@@ -291,19 +299,28 @@ module internal Sstable =
                     Writer.writeBytes value
                 ]
 
+        let rec copy (body: byte array array) result (i: int) (pos: int) =
+            if i < body.Length then
+                let b = body.[i]
+                Array.blit b 0 result pos b.Length
+                copy body result (i + 1) (pos + b.Length)
+
         let body = items |> Array.mapi encodeEntry
-        let offsets = Array.toList body |> startOffsets
+        let offsets = body |> Array.scan (fun acc b -> acc + b.Length) 0
 
         let restarts =
-            [ 0..RestartInterval .. body.Length - 1 ]
-            |> List.map (fun i -> List.item i offsets)
+            [| 0..RestartInterval .. body.Length - 1 |] |> Array.map (fun i -> offsets.[i])
 
         let restartBytes =
-            (restarts |> List.map (fun off -> Writer.uint32LE (uint32 off)))
-            @ [ Writer.uint32LE (uint32 restarts.Length) ]
-            |> Writer.build
+            Writer.build (
+                (restarts |> Array.map (fun off -> Writer.uint32LE (uint32 off)) |> Array.toList)
+                @ [ Writer.uint32LE (uint32 restarts.Length) ]
+            )
 
-        Array.concat [| Array.concat body; restartBytes |]
+        let result = Array.zeroCreate<byte>(offsets.[body.Length] + restartBytes.Length)
+        copy body result 0 0
+        Array.blit restartBytes 0 result offsets.[body.Length] restartBytes.Length
+        result
 
     /// ブロックをエントリ列へ復元する。
     let private parseBlock (data: byte array) =
@@ -479,45 +496,47 @@ module internal Sstable =
                     bloomFalsePositiveRate
                 |> BloomFilter.serialize
 
-        let indexBytesOf (blocks: SstEntry array list) (built: byte array list) (offsets: int list) =
+        let indexBytesOf (blocks: SstEntry array array) (built: byte array array) (offsets: int array) =
             blocks
-            |> List.mapi (fun i items ->
+            |> Array.mapi (fun i items ->
                 {
                     LastKey = items.[items.Length - 1].Key
-                    Offset = List.item i offsets
-                    Length = (List.item i built).Length
+                    Offset = offsets.[i]
+                    Length = built.[i].Length
                 })
-            |> List.collect (fun e ->
-                [
+            |> Array.collect (fun e ->
+                [|
                     Writer.lengthPrefixed e.LastKey
                     Writer.int64LE (int64 e.Offset)
                     Writer.int64LE (int64 e.Length)
-                ])
+                |])
+            |> Array.toList
             |> Writer.build
 
-        result {
-            let unordered =
-                entries
-                |> Array.pairwise
-                |> Array.exists (fun (a, b) -> SstEntry.compare a b > 0)
+        let rec unorderedFrom (i: int) =
+            if i >= entries.Length then
+                false
+            elif SstEntry.compare entries.[i - 1] entries.[i] > 0 then
+                true
+            else
+                unorderedFrom (i + 1)
 
-            if unordered then
+        result {
+            if entries.Length > 1 && unorderedFrom 1 then
                 return! err (DbError.internalError "Sstable: エントリがキー順に並んでいません")
 
             let maxSeqNo = SstEntry.maxSeqNo entries
-            let blocks = SstEntry.splitInto EntriesPerBlock entries
-            let built = blocks |> List.map buildBlock
-            let offsets = startOffsets built
-            let dataSize = List.item built.Length offsets
+            let blocks = SstEntry.splitInto EntriesPerBlock entries |> List.toArray
+            let built = blocks |> Array.map buildBlock
+            let offsets = built |> Array.scan (fun acc b -> acc + b.Length) 0
+            let dataSize = offsets.[built.Length]
             let metaOff = dataSize
             let metaBytes = metaBytesOf entries
             let bloomOff = metaOff + metaBytes.Length
             let bloomBytes = bloomBytesOf entries bloomFalsePositiveRate
             let indexOff = bloomOff + bloomBytes.Length
             let indexBytes = indexBytesOf blocks built offsets
-
-            let body =
-                Array.concat (List.toArray (built @ [ metaBytes; bloomBytes; indexBytes ]))
+            let body = Array.concat [| yield! built; metaBytes; bloomBytes; indexBytes |]
 
             let! withFooter =
                 encodeFooter

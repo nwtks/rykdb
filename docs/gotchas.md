@@ -1167,3 +1167,19 @@ DDL を transaction に載せる設計に変えるまでは、この制約を維
 - `Database.Begin()` は `Result<Database, DbError>` を返す（カタログ再読み込みの失敗を隠さない）。
 - `Engine.contextOf`: `Catalog.toSchema` の失敗を無視せず、文のエラーとして返す。
 - `Ops.sortBy`: 非 NULL の代表値と比較できない値があれば、ソート前にエラーにする。
+
+### 11.22 SSTable の reader キャッシュは「パス + サイズ + mtime」で無効化する
+
+`SstReaderCache` はパース済み `SstReader` を弱参照で保持する。
+キーにサイズと mtime を含めないと、同じファイル番号のファイルを差し替えたときに古い内容を返す。
+
+- テストで SSTable を書き換えたら `File.SetLastWriteTimeUtc` で mtime を確実に進める。
+- キャッシュは弱参照なので、メモリが逼迫すれば GC が回収する（LRU ではない）。
+- 欠落ファイルはキー計算（`FileInfo.Length`）の時点で IoError になる。
+
+### 11.23 DISTINCT / GROUP BY のキーは文字列化しない
+
+`Row.keyOf` は `SqlValue array` をそのまま返し、`Set` / `Map` / `HashIdentity.Structural` の構造比較で重複を判定する
+（NULL は NULL 同士で等しい）。
+`COUNT(DISTINCT)` は `Set<SqlValue>`。
+`SqlLiteral` による文字列化は表示専用で、行ごとのホットパスでは使わない。

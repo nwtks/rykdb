@@ -273,10 +273,9 @@ module internal DmlOps =
             foldRows txn ctx schema (matchesWhere targetSchema where) (fun txnAcc count row ->
                 result {
                     let! newRow = assign targetSchema targets row
-                    let pk = TableSchema.primaryKeyOf schema row
                     let newPk = TableSchema.primaryKeyOf schema newRow
                     do! checkUniqueUpdate txnAcc newRow newPk (schema.Indexes |> List.filter _.Unique)
-                    let! t = Dml.updateByPrimaryKey ctx.Store schema ctx.Visible txnAcc pk newRow
+                    let! t = Dml.updateRow schema txnAcc row newRow
                     return t, count + 1
                 })
 
@@ -286,10 +285,7 @@ module internal DmlOps =
         let targetSchema = targetSchemaOf schema
 
         foldRows txn ctx schema (matchesWhere targetSchema where) (fun t count row ->
-            let pk = TableSchema.primaryKeyOf schema row
-
-            Dml.deleteByPrimaryKey ctx.Store schema ctx.Visible t pk
-            |> Result.map (fun t2 -> t2, count + 1))
+            Dml.deleteRow schema t row |> Result.map (fun t2 -> t2, count + 1))
 
 module internal Ddl =
     /// カタログを保存し、保存後の Store と新しい Catalog で state を作り直す。
@@ -435,15 +431,7 @@ module internal Ddl =
 
                 let mgr, txn = TransactionManager.beginTxn state.Manager
                 let! rows = Dml.scanByPrimaryKey state.Store withIndexes Snapshot.noLimit 0
-
-                let! txn2 =
-                    foldOk
-                        (fun t row ->
-                            let pk = TableSchema.primaryKeyOf schema row
-                            Dml.deleteByPrimaryKey state.Store withIndexes Snapshot.noLimit t pk)
-                        txn
-                        rows
-
+                let! txn2 = foldOk (fun t row -> Dml.deleteRow withIndexes t row) txn rows
                 let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
 
                 return!

@@ -4,24 +4,6 @@ namespace RykDb.Core
 /// メモリ上は配列のまま、回さない。
 type internal Row = SqlValue array
 
-module internal Row =
-    /// 全 NULL のときの等価キー用の印。
-    /// 文字列に現れない制御文字を使う。
-    [<Literal>]
-    let private nullTag = "\u0000\0NULL"
-
-    /// 等価キー（DISTINCT / GROUP BY / ハッシュ結合のキーに使う）。
-    /// NULL は SQL では「他のどの値とも等しくない」ので、ここでは NULL も NULL 同士で等しい として扱う
-    /// （GROUP BY で NULL が 1つのグループになる挙動に合わせるため）。
-    let keyOf (row: Row) =
-        row
-        |> Array.map (fun v ->
-            if SqlValue.isNull v then
-                nullTag
-            else
-                SqlLiteral.toSqlLiteral v)
-        |> String.concat "\u0001"
-
 /// 1行取り出す演算子。
 /// Done             = 終わった
 /// Step (row, next) = row を返した。続きは next
@@ -238,14 +220,12 @@ module internal Ops =
     ///  Costs O(既出キー数 × 平均キー長)。メモリは全キーに比例する。
     /// 値が多いテーブルでは使えないが、`SELECT DISTINCT` の素直な実装としてはこれが正しい。
     let distinct (src: Op) =
-        let rec skipSeen (seen: Set<string>) (cur: Op) =
+        let rec skipSeen (seen: Set<Row>) (cur: Op) =
             Op.pull cur (fun row nxt ->
-                let k = Row.keyOf row
-
-                if Set.contains k seen then
+                if Set.contains row seen then
                     Op.next (skipSeen seen nxt)
                 else
-                    ret (Some(row, skipSeen (Set.add k seen) nxt)))
+                    ret (Some(row, skipSeen (Set.add row seen) nxt)))
 
         skipSeen Set.empty src
 
@@ -339,23 +319,25 @@ module internal Ops =
             Min: SqlValue option
             Max: SqlValue option
             First: SqlValue option
-            Seen: SqlValue list
+            Seen: Set<SqlValue>
         }
 
     /// GROUP BY + 集約。
     /// groupBy が空でも集約があれば 1グループだけ出す
     /// （`SELECT COUNT(*) FROM 空のテーブル` が 0 ではなく 1行を返すため。SQL の通常の挙動）。
     let aggregate (schema: Schema) (src: Op) (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
-        let order = ResizeArray<string>()
+        let order = ResizeArray<SqlValue array>()
 
         let table =
-            System.Collections.Generic.Dictionary<string, ResizeArray<SqlValue array>>()
+            System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<SqlValue array>>(
+                HashIdentity.Structural: System.Collections.Generic.IEqualityComparer<SqlValue array>
+            )
 
         let keyOfRow (row: SqlValue array) =
             groupBy
             |> List.map (fun e -> Eval.eval schema row e)
             |> all
-            |> Result.map (fun vs -> Row.keyOf (List.toArray vs))
+            |> Result.map List.toArray
 
         let rec groupRows (rows: SqlValue array array) (i: int) =
             if i >= rows.Length then
@@ -385,7 +367,7 @@ module internal Ops =
                 Min = None
                 Max = None
                 First = None
-                Seen = []
+                Seen = Set.empty
             }
 
         let addDecimal (a: decimal) (b: decimal) =
@@ -403,7 +385,7 @@ module internal Ops =
             (bumped: Acc)
             (current: SqlValue option)
             (set: Acc -> SqlValue -> Acc)
-            (seen: SqlValue list)
+            (seen: Set<SqlValue>)
             =
             match current with
             | None -> ret (set { bumped with Seen = seen } v)
@@ -415,7 +397,7 @@ module internal Ops =
                     else
                         { bumped with Seen = seen })
 
-        let addValue (acc: Acc) (bump: Acc) (v: SqlValue) (newSeen: SqlValue list) =
+        let addValue (acc: Acc) (bump: Acc) (v: SqlValue) (newSeen: Set<SqlValue>) =
             match acc.Kind with
             | AggFunc.Count -> ret { bump with Seen = newSeen }
             | AggFunc.Sum
@@ -459,7 +441,7 @@ module internal Ops =
             let alreadySeen =
                 distinct
                 && match value with
-                   | Some v when not (SqlValue.isNull v) -> List.contains v acc.Seen
+                   | Some v when not (SqlValue.isNull v) -> Set.contains v acc.Seen
                    | _ -> false
 
             if alreadySeen then
@@ -478,7 +460,7 @@ module internal Ops =
                 let newSeen =
                     if distinct then
                         match value with
-                        | Some v when not (SqlValue.isNull v) -> v :: acc.Seen
+                        | Some v when not (SqlValue.isNull v) -> Set.add v acc.Seen
                         | _ -> acc.Seen
                     else
                         acc.Seen
@@ -518,7 +500,7 @@ module internal Ops =
             | Ok acc -> Ok(finishAcc acc)
             | Error e -> Error e
 
-        let rowOf (table: Map<string, SqlValue array list>) (k: string) =
+        let rowOf (table: Map<SqlValue array, SqlValue array list>) (k: SqlValue array) =
             match table |> Map.tryFind k with
             | None -> Ok None
             | Some members ->
@@ -533,7 +515,11 @@ module internal Ops =
                         return Some(Array.concat [| gv; List.toArray av |])
                     }
 
-        let rec build (table: Map<string, SqlValue array list>) (ks: string list) (acc: ResizeArray<SqlValue array>) =
+        let rec build
+            (table: Map<SqlValue array, SqlValue array list>)
+            (ks: SqlValue array list)
+            (acc: ResizeArray<SqlValue array>)
+            =
             match ks with
             | [] -> Ok(Op.ofArray (acc.ToArray()))
             | k :: tail ->
