@@ -25,8 +25,12 @@ type Database internal (root: string, state: DbState) =
     /// DB のルートディレクトリ。
     member _.Root = root
 
-    /// DB を閉じる。
-    /// 全 keyspace のエンジンを閉じる。
+    /// DB を閉じる（全 keyspace の memtable を flush し、WAL を削除する）。
+    /// <remarks>
+    /// ハンドルは不変なので「閉じた」状態をこのハンドルには記録しない。
+    /// Close 後に同じハンドルで Execute すると WAL が再作成されるため、Close 後は破棄すること。
+    /// 二重 Close は安全（2 回目は何もしない）。
+    /// </remarks>
     member _.Close() = RowStore.close state.Store
 
     /// トランザクションを始める。
@@ -236,9 +240,27 @@ type Database internal (root: string, state: DbState) =
             return Database(root, finalState), summary
         }
 
-    /// SELECT を実行する。
+    /// SELECT 専用の実行。
     /// 戻り値の Database を次の呼び出しに渡すこと。
-    member this.Query(sql: string) = this.Execute sql
+    /// DDL / DML / BEGIN / COMMIT / ROLLBACK は `Execute` を使う。
+    member this.Query(sql: string) =
+        match Parser.parseStatements sql with
+        | Error e -> Error e
+        | Ok statements ->
+            if
+                statements
+                |> List.forall (fun stmt ->
+                    match stmt with
+                    | Statement.Select _ -> true
+                    | _ -> false)
+            then
+                this.Execute sql
+            else
+                err (
+                    DbError.create
+                        ErrorKind.SyntaxError
+                        "Query は SELECT 専用です（DDL / DML / BEGIN / COMMIT は Execute を使ってください）"
+                )
 
     /// テーブル一覧を返す。
     member _.TableNames() = state.Catalog.Tables |> List.map _.Name

@@ -99,6 +99,7 @@ let db = ok (Database.openWith "./mydata")
 let db, _ = ok (db.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
 let db, _ = ok (db.Execute "INSERT INTO t VALUES (1, 10), (2, 20)")
 
+// Query は SELECT 専用（DDL / DML は Execute を使う）。
 let db, result = ok (db.Query "SELECT id, v FROM t ORDER BY id")
 printfn "%A" result.Rows          // [|[|Int 1L; Int 10L|]; [|Int 2L; Int 20L|]|]
 printfn "%A" result.Columns       // [|"id"; "v"|]
@@ -106,7 +107,7 @@ printfn "%A" result.RowsAffected  // 2
 
 result.ToDisplayLines()          // [ "id | v"; "------"; "  1, 10"; "  2, 20" ]
 db.TableNames()                  // [ "t" ]
-db.Close()
+ok (db.Close())
 ```
 
 ---
@@ -119,9 +120,10 @@ Debug ビルド・単一スレッド・10万行（`INTEGER` 主キー 1列 + `IN
 | --------------------------------- | --------------------- |
 | INSERT 10万行（2,000行ずつ bulk） | 約 3.0秒              |
 | ポイント検索 200回                | 約 0.06秒（0.3ms/回） |
-| 全走査（`COUNT(*)`）              | 約 0.2秒              |
+| 全走査（`COUNT(*)`）              | 約 0.8秒              |
 
 Release ビルドではこれより速くなる。
+SSTable の reader はプロセス内で弱参照キャッシュされるため、2 回目以降の検索・走査は速い。
 Bloom filter の bits/key とレベルファウト比は未調整。
 
 ---

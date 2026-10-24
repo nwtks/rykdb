@@ -103,22 +103,24 @@ module internal TableSchema =
     /// 列名 → 位置。
     /// SQL の識別子は大文字小文字を区別しないので、ここで正規化する。
     let indexOf (schema: TableSchema) (column: string) =
-        schema.Columns
-        |> List.tryFindIndex (fun c -> SqlName.equal c.Name column)
-        |> Option.map (fun i -> i)
-        |> Option.defaultValue -1
+        schema.Columns |> List.tryFindIndex (fun c -> SqlName.equal c.Name column)
 
     /// 列名 → 位置（見つからなければエラー）。
     let requireIndexOf (schema: TableSchema) (column: string) =
         match indexOf schema column with
-        | i when i >= 0 -> ret i
-        | _ -> err (sprintf "テーブル %s に列 %s がありません" schema.Name column |> DbError.name)
+        | Some i -> ret i
+        | None -> err (sprintf "テーブル %s に列 %s がありません" schema.Name column |> DbError.name)
 
 module internal RowKey =
+    /// 索引の列値を取り出す。
+    /// 索引列は CREATE INDEX で検証済み。
+    /// 万一欠けている場合は、その列を落とす（防御）。
     let private indexValues (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
         index.Columns
-        |> List.filter (fun name -> TableSchema.indexOf schema name >= 0)
-        |> List.map (fun name -> row.[TableSchema.indexOf schema name])
+        |> List.choose (fun name ->
+            match TableSchema.indexOf schema name with
+            | Some i -> Some row.[i]
+            | None -> None)
 
     /// 主キーの LSM へ入れるキー。
     let primary (schema: TableSchema) (row: SqlValue array) =

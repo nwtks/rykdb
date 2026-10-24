@@ -534,6 +534,11 @@ let found =
         | _ -> false)
 ```
 
+- 等値一致に使えるのは**単一列索引だけ**。
+  複合索引は「前置列すべてが等値 + 次列が範囲」の範囲走査でのみ使う
+  （`Analyzer.chooseScanMethod` の `tryIndexRange`）。
+- 複合索引の全列 `=` は `IndexLookup` にならず `SeqScan`（将来的な改善点）。
+
 ### 6.2 `Catalog.toSchema` は `Indexes = []` で埋まる
 
 索引を定義しても実行系の `TableSchema.Indexes` に載らないと、
@@ -562,8 +567,8 @@ Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
 
 ### 6.4 `Dml.getByIndex` は「完全な行」が必要
 
-`RowKey.indexPrefix` は `row.[schema.IndexOf name]` を使うので、**完全な行**を要求する。
-索引の値だけを持つ実行計画からは `IndexOutOfRangeException` になる。
+`RowKey.indexPrefix` は索引列の位置を `TableSchema.indexOf`（`Option`）で引き、見つからない列は落とす。
+**完全な行**を要求する。
 
 ```fsharp
 // ✅ 値だけで引くなら専用の関数を使う

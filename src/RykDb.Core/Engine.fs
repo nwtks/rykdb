@@ -147,27 +147,29 @@ module internal DmlOps =
 
         let indexValues (index: IndexSchema) (row: SqlValue array) =
             index.Columns
-            |> List.map (fun name -> row.[TableSchema.indexOf schema name])
-            |> List.toArray
+            |> List.map (TableSchema.requireIndexOf schema)
+            |> all
+            |> Result.map (fun positions -> positions |> List.map (fun i -> row.[i]) |> List.toArray)
 
         let rec check (row: SqlValue array) (pk: SqlValue array) (indexes: IndexSchema list) =
             match indexes with
             | [] -> ret ()
             | idx :: rest ->
-                let values = indexValues idx row
-
-                match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txn values 1 with
+                match indexValues idx row with
                 | Error e -> Error e
-                | Ok rows ->
-                    if
-                        rows
-                        |> Seq.exists (fun r ->
-                            let existingPk = TableSchema.primaryKeyOf schema r
-                            not (Array.forall2 (=) existingPk pk))
-                    then
-                        err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                    else
-                        check row pk rest
+                | Ok values ->
+                    match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txn values 1 with
+                    | Error e -> Error e
+                    | Ok rows ->
+                        if
+                            rows
+                            |> Seq.exists (fun r ->
+                                let existingPk = TableSchema.primaryKeyOf schema r
+                                not (Array.forall2 (=) existingPk pk))
+                        then
+                            err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                        else
+                            check row pk rest
 
         let checkUnique (txn: Transaction) (row: SqlValue array) =
             let pk = TableSchema.primaryKeyOf schema row
@@ -246,23 +248,23 @@ module internal DmlOps =
             match indexes with
             | [] -> ret ()
             | idx :: rest ->
-                let values =
-                    idx.Columns
-                    |> List.map (fun name -> newRow.[TableSchema.indexOf schema name])
-                    |> List.toArray
-
-                match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txnAcc values 1 with
+                match idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all with
                 | Error e -> Error e
-                | Ok rows ->
-                    if
-                        rows
-                        |> Seq.exists (fun r ->
-                            let existingPk = TableSchema.primaryKeyOf schema r
-                            not (Array.forall2 (=) existingPk newPk))
-                    then
-                        err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                    else
-                        checkUniqueUpdate txnAcc newRow newPk rest
+                | Ok positions ->
+                    let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
+
+                    match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txnAcc values 1 with
+                    | Error e -> Error e
+                    | Ok rows ->
+                        if
+                            rows
+                            |> Seq.exists (fun r ->
+                                let existingPk = TableSchema.primaryKeyOf schema r
+                                not (Array.forall2 (=) existingPk newPk))
+                        then
+                            err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                        else
+                            checkUniqueUpdate txnAcc newRow newPk rest
 
         let targetSchema = targetSchemaOf schema
 

@@ -201,6 +201,7 @@ module internal Catalog =
                     {
                         Name = name
                         DataType = dt
+                        // 型引数は宣言のみで実行時の意味を持たないため保存しない。
                         TypeArguments = []
                         Constraint =
                             {

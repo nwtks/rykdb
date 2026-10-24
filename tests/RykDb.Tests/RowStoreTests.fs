@@ -73,8 +73,8 @@ let ``TableSchema: スキーマを AST から作れる`` () =
     Assert.Equal("users", usersSchema.Name)
     Assert.Equal<int list>([ 0 ], usersSchema.PrimaryKey)
     Assert.Equal<string array>([| "id" |], TableSchema.primaryKeyColumns usersSchema)
-    Assert.Equal(1, TableSchema.indexOf usersSchema "email")
-    Assert.Equal(-1, TableSchema.indexOf usersSchema "nope")
+    Assert.Equal<int option>(Some 1, TableSchema.indexOf usersSchema "email")
+    Assert.Equal<int option>(None, TableSchema.indexOf usersSchema "nope")
 
 [<Fact>]
 let ``TableSchema.ofCreateTable: 主キー無し・列無しのテーブルはエラー`` () =

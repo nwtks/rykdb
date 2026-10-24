@@ -377,13 +377,18 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
   └─ それ以外                             → SeqScan
 ```
 
-等価条件が無くても、**単一列の主キーまたは単一列索引**に下限のある範囲条件
-（`>` / `>=` / `<` / `<=` / `BETWEEN`）があれば、その列の `RangeScan` / `IndexRangeScan` を使う
-（下限が無い `<` / `<=` のみの条件は `SeqScan` のまま）。
+等価条件が無くても、下限のある範囲条件（`>` / `>=` / `BETWEEN`）や
+`LIKE 'prefix%'`（`%` が末尾のみ・`_` なし）があれば範囲走査を使う
+（`<` / `<=` だけの条件は下限が無いので `SeqScan` のまま）。
 範囲走査はあくまで**走査範囲の絞り込み**で、厳密な境界判定は上位の `Filter` が担う。
 
 - 定数側に使えるのは**リテラルだけ**（`-1` のような符号つきリテラルは可。式・関数は不可）。
-- 対象になるのは **`columns` が 1列の索引**だけ（複合索引は Leftmost prefix も考慮しない）。
+- **等値一致（`IndexLookup`）は単一列索引だけ**。
+  複合索引は「範囲列より前の全列が `= 定数`、範囲列が下限付きの範囲条件」のときだけ `IndexRangeScan` に使う
+  （Leftmost prefix の範囲版）。
+  複合索引の全列 `=` は `IndexLookup` にならず `SeqScan`。
+- `LIKE 'prefix%'` は `[prefix, prefix+1)` の範囲に変換する。
+  `LIKE '%x'` や `_` を含むものは `SeqScan` + `Filter`。
 - 主キーは全列の等値条件が揃ったときだけ `PkLookup` にする。
   部分一致は `SeqScan` で残りを `Filter` する。
 - 主キー・索引は値のバイト列表現で引くため、**列の宣言型とリテラルの型が一致するときだけ**使う。
@@ -680,7 +685,8 @@ ActiveSnapshot は Database ハンドル単位の `TransactionManager` から計
 
 ### 7.6 .Database の transaction モデル
 
-`Execute` / `Query` は**暗黙の transaction**で実行し、自動的に commit する。
+`Execute` は任意の SQL を、`Query` は **SELECT 専用**（それ以外は `SyntaxError`）で実行し、
+暗黙の transaction で自動的に commit する。
 `Begin()` 以降は `Commit()` / `Rollback()` するまで同じ transaction を使う。
 
 > **注意** SQL 文としての `BEGIN` / `COMMIT` / `ROLLBACK` は transaction を制御する（`Database.Execute` の `runStatements` で処理）。
@@ -995,6 +1001,8 @@ Database.openWith root
 
 `Database.Close()` は **全 keyspace の `StorageEngine.close`** を行い、memtable を flush してから WAL を削除する。
 これを省くと再起動時にデータが読めない。
+不変ハンドルには「閉じた」状態を記録しないため、Close 後のハンドルは破棄する
+（同じハンドルで `Execute` すると WAL が再作成される。二重 Close は安全）。
 
 ---
 

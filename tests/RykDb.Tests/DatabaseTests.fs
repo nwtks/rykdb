@@ -240,6 +240,26 @@ let ``Database: DEFAULT の評価エラーは NULL にしない`` () =
         expectError "壊れた DEFAULT はエラーになる" (db1.Execute "INSERT INTO t (id) VALUES (1)"))
 
 [<Fact>]
+let ``Database: Query は SELECT 専用`` () =
+    withDb "query-only" (fun db0 ->
+        expectErrorKind ErrorKind.SyntaxError "Query で CREATE" (db0.Query "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        expectErrorKind ErrorKind.SyntaxError "Query で INSERT" (db0.Query "INSERT INTO t VALUES (1)"))
+
+[<Fact>]
+let ``Database: VARCHAR(32) は再オープン後も使える`` () =
+    withDir "varchar-reopen" (fun dir ->
+        let db0 = ok (Database.openWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(32))"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 'abc')"
+        ok (db2.Close())
+
+        // 型引数はカタログに保存されないが、列型（TEXT）と値はそのまま使える
+        let db3 = ok (Database.openWith dir)
+        let _, r = ok (db3.Query "SELECT v FROM t")
+        Assert.Equal<string>("abc", asText r.Rows.[0].[0])
+        ok (db3.Close()))
+
+[<Fact>]
 let ``Database: SQL の BEGIN / COMMIT / ROLLBACK は受理される（文としては無効）`` () =
     // docs/sql-reference.md の既知の制限どおり、文としての txn 制御は何もしない。
     withDb "tx5" (fun db0 ->

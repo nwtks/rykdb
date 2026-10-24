@@ -352,6 +352,93 @@ let ``Analyzer: 複合主キーは全列一致のときだけ PkLookup`` () =
         | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m))
 
 [<Fact>]
+let ``Analyzer: 複合索引は前置等値 + 範囲で IndexRangeScan`` () =
+    withStore "an-comp-range" (fun store ->
+        let schema =
+            {
+                Name = "pairs"
+                Columns = [ col "a" DataType.Integer; col "b" DataType.Integer; col "v" DataType.Text ]
+                PrimaryKey = []
+                Indexes =
+                    [
+                        {
+                            Name = "ix_pair"
+                            Columns = [ "a"; "b" ]
+                            Unique = false
+                        }
+                    ]
+            }
+
+        let ctx = ExecContext.withSchema (ExecContext.create store None) "pairs" schema
+        let b = ok (Analyzer.bindTable ctx { Name = "pairs"; Alias = None })
+        let ix = Catalog.toIndexDefinition "pairs" schema.Indexes.[0]
+        let catalog = ix |> Catalog.addIndex Catalog.empty
+
+        let colRef name =
+            Expr.Column
+                {
+                    Qualifier = Some "pairs"
+                    Name = name
+                }
+
+        let preds =
+            [
+                Expr.Binary(BinaryOp.Eq, colRef "a", Expr.Literal(Literal.Int 1L))
+                Expr.Binary(BinaryOp.Gt, colRef "b", Expr.Literal(Literal.Int 2L))
+            ]
+
+        match ok (Analyzer.chooseScanMethod b catalog preds) with
+        | ScanMethod.IndexRangeScan(name, lower, upper) ->
+            Assert.Equal<string>("ix_pair", name)
+            Assert.Equal<int>(2, lower.Length)
+            Assert.Equal<int64>(1L, asInt lower.[0])
+            Assert.Equal<int64>(2L, asInt lower.[1])
+            Assert.True upper.IsNone
+        | m -> Assert.Fail(sprintf "IndexRangeScan ではない: %A" m)
+
+        // 前置 a の等値が無ければ全走査
+        let onlyRange = Expr.Binary(BinaryOp.Gt, colRef "b", Expr.Literal(Literal.Int 2L))
+
+        match ok (Analyzer.chooseScanMethod b catalog [ onlyRange ]) with
+        | ScanMethod.SeqScan -> ()
+        | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m))
+
+[<Fact>]
+let ``Analyzer: LIKE 'prefix%' は索引の範囲走査にする`` () =
+    withStore "an-like" (fun store ->
+        let schema =
+            {
+                Name = "items"
+                Columns = [ col "id" DataType.Integer; col "s" DataType.Text ]
+                PrimaryKey = [ 0 ]
+                Indexes =
+                    [
+                        {
+                            Name = "ix_s"
+                            Columns = [ "s" ]
+                            Unique = false
+                        }
+                    ]
+            }
+
+        let ctx = ExecContext.withSchema (ExecContext.create store None) "items" schema
+        let b = ok (Analyzer.bindTable ctx { Name = "items"; Alias = None })
+        let ix = Catalog.toIndexDefinition "items" schema.Indexes.[0]
+        let catalog = ix |> Catalog.addIndex Catalog.empty
+
+        let pred =
+            Expr.Like(Expr.Column { Qualifier = Some "items"; Name = "s" }, Expr.Literal(Literal.String "ab%"), false)
+
+        match ok (Analyzer.chooseScanMethod b catalog [ pred ]) with
+        | ScanMethod.IndexRangeScan(name, lower, upper) ->
+            Assert.Equal<string>("ix_s", name)
+            Assert.Equal<int>(1, lower.Length)
+            Assert.Equal<string>("ab", asText lower.[0])
+            Assert.True upper.IsSome
+            Assert.Equal<string>("ac", asText upper.Value.[0])
+        | m -> Assert.Fail(sprintf "IndexRangeScan ではない: %A" m))
+
+[<Fact>]
 let ``末尾再帰: 20 万段の AND を chooseScanMethod してもスタックを食わない`` () =
     withStore "an8" (fun store ->
         let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
