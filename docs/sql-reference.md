@@ -395,6 +395,9 @@ HAVING COUNT(*) > 1
 - `SUM` / `AVG` は `SUM / COUNT` を実行時に計算する。
 - `MIN` / `MAX` は文字列・日付・時刻にも使える。
 - `GROUP BY` を書かない `SELECT SUM(x) FROM t` は表全体の 1グループとして集計される。
+- `GROUP BY` / 集約関数を使うときに `SELECT *` は書けない（列を明示する）。
+- 集約も `GROUP BY` も無い `HAVING` は `SyntaxError`。
+- `SUM` / `AVG` は `INTEGER` / `DECIMAL` / `REAL` が混在しても合計を落とさない（REAL で返る）。
   入力が 0行でも 1行を返す（`COUNT(*)` は `0`、`SUM` / `AVG` / `MIN` / `MAX` は `NULL`）。
 - 集約関数のエラーは**伝播する**。
   文字列列に `SUM` を掛けると `NULL` が返り、エラーにはならない。
@@ -572,8 +575,7 @@ SELECT p.id, d.dname
 
 ### 7.7 `LIMIT` / `OFFSET`
 
-- 値は**整数リテラル**
-  （それ以外は 0 とみなされ「制限なし」になる）。
+- 値は **0 以上の整数リテラル**（式・負数・範囲外は `SyntaxError`）。
 - 評価は最後に 1回だけ。
   `OFFSET` → `LIMIT` の順で適用される。
 - `LIMIT` だけの形か `LIMIT n OFFSET m` の形だけ書ける
@@ -827,6 +829,8 @@ ROLLBACK;        -- 削除を取り消し
 ```
 
 - `BEGIN` は新しい transaction を始める（既に transaction 中なら何もしない）。
+  ライブラリ API の `Database.Begin()` も `Commit()` / `Rollback()` と同じく `Result` を返す。
+- 識別子（テーブル・列・索引・別名）は**大文字小文字を区別しない**。
 - `COMMIT` はバッファをエンジンへ流す。
 - `ROLLBACK` はバッファを捨てる。
 - **DDL（`CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX`）は明示 transaction 中には実行できない**
@@ -863,7 +867,7 @@ let ok =
     | Error e -> failwith (DbError.toDisplayString e)
 
 let db  = ok (Database.openWith "./mydata")
-let db1 = db.Begin()                               // 明示トランザクション開始
+let db1 = ok (db.Begin())                          // 明示トランザクション開始（Result）
 let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 10)")
 let db3 = ok (db2.Commit())                        // 確定
 // または
@@ -966,17 +970,17 @@ db> .rollback
 
 ### 実装上の制約
 
-| 項目                | 内容                                                          |
-| ------------------- | ------------------------------------------------------------- |
-| `SELECT` の `FROM`  | **省略不可**。定数だけの SELECT は書けない                    |
-| 索引                | 等価一致のみ。範囲走査・複合索引の Leftmost prefix は使わない |
-| `LIMIT` / `OFFSET`  | 整数リテラルのみ。`LIMIT 0` は「0 行」                        |
-| 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                        |
-| ソート              | メモリ上に実体化。spilling する外部マージは未実装             |
-| `AVG`               | `SUM / COUNT` を実行時に計算                                  |
-| `UPDATE` / `DELETE` | `LIMIT` 相当の句がない                                        |
-| DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）    |
-| `ORDER BY`          | 同値行の順序は保証しない                                      |
+| 項目                | 内容                                                               |
+| ------------------- | ------------------------------------------------------------------ |
+| `SELECT` の `FROM`  | **省略不可**。定数だけの SELECT は書けない                         |
+| 索引                | 等価一致のみ。範囲走査・複合索引の Leftmost prefix は使わない      |
+| `LIMIT` / `OFFSET`  | 0 以上の整数リテラルのみ（式・負数はエラー）。`LIMIT 0` は「0 行」 |
+| 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                             |
+| ソート              | メモリ上に実体化。spilling する外部マージは未実装                  |
+| `AVG`               | `SUM / COUNT` を実行時に計算                                       |
+| `UPDATE` / `DELETE` | `LIMIT` 相当の句がない                                             |
+| DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）         |
+| `ORDER BY`          | 同値行の順序は保証しない                                           |
 
 ### 演算の注意
 

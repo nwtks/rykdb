@@ -541,7 +541,7 @@ let ``Planner: FROM が無ければ LValues になる`` () =
         | _ -> Assert.Fail(sprintf "FROM なしなのに LValues でない: %A" tree))
 
 [<Fact>]
-let ``Planner: 集約とスターが同時でもスターは集約対象から外れる`` () =
+let ``Planner: 集約と * の併用はエラー`` () =
     withStore "pl8" (fun store ->
         let ctx = ctxOf store
 
@@ -558,30 +558,25 @@ let ``Planner: 集約とスターが同時でもスターは集約対象から�
             ]
 
         let stmt = selectOf items (Some { Name = "people"; Alias = None }) [] None
-        let tree = ok (Optimizer.buildLogical ctx stmt)
 
-        // 集約リストは COUNT(*) の 1 個だけ（t.* は集約対象にならない）
-        match tree with
-        | Logical.Project(_, Logical.Aggregate(_, aggs, _)) -> Assert.Equal<int>(1, aggs |> List.length)
-        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+        // ヘッダは入力スキーマ、行は集約出力スキーマで作られるため、併用すると列数が食い違う。
+        expectErrorKind ErrorKind.SyntaxError "集約と * は併用できない" (Optimizer.buildLogical ctx stmt))
 
 [<Fact>]
-let ``Planner: 定数でない LIMIT と OFFSET だけの指定`` () =
+let ``Planner: 定数でない LIMIT はエラー、OFFSET 単独は制限なし`` () =
     withStore "pl9" (fun store ->
         let ctx = ctxOf store
 
         let plain =
             selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
 
-        // LIMIT が非リテラル → 0（0 行）として扱う
+        // LIMIT が非リテラル → 0 行に丸めずエラー
         let stmt1 =
             { plain with
                 Limit = Some(Expr.Column { Qualifier = None; Name = "nope" })
             }
 
-        match ok (Optimizer.buildLogical ctx stmt1) with
-        | Logical.Limit(0, 0, _) -> ()
-        | other -> Assert.Fail(sprintf "LIMIT が 0 になっていない: %A" other)
+        expectErrorKind ErrorKind.SyntaxError "LIMIT は整数リテラル" (Optimizer.buildLogical ctx stmt1)
 
         // OFFSET だけ指定（Limit = None の分岐）→ limit = -1（制限なし）
         let stmt2 =

@@ -126,6 +126,19 @@ let ``StorageEngine.getAt: ファイルが消えていれば IoError`` () =
             expectErrorKind ErrorKind.IoError "ファイルが無ければ IoError" (StorageEngine.getAt engine None (intKey 1))))
 
 [<Fact>]
+let ``StorageEngine.scanAt: ファイルが消えていれば IoError`` () =
+    withDir "se-missing-scan" (fun dir ->
+        withEngine dir (fun engine ->
+            let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
+            let engine = ok (StorageEngine.flush engine)
+            // Version は参照しているのに実ファイルだけ消える。
+            // 開けなかったファイルを「空」と見なすと、Ok のまま行が欠ける。
+            Directory.GetFiles(dir, "*.sst") |> Array.iter (fun p -> File.Delete p)
+
+            expectErrorKind ErrorKind.IoError "limit 0 の scan は IoError" (StorageEngine.scanAt engine None [||] 0)
+            expectErrorKind ErrorKind.IoError "limit ありの scan は IoError" (StorageEngine.scanAt engine None [||] 10)))
+
+[<Fact>]
 let ``StorageEngine.getAt: Bloom が「無い」と言うキーはスキャンせず None`` () =
     withDir "se-bloom-miss" (fun dir ->
         withEngine dir (fun engine ->
@@ -298,7 +311,7 @@ let private twoFilesWithBrokenSecond (dir: string) =
     f1, f2
 
 [<Fact>]
-let ``StorageEngine.scanAt: limit つき走査は必要にならないファイルを開かない`` () =
+let ``StorageEngine.scanAt: limit つきでも壊れたファイルを検出する`` () =
     withDir "se-lazy-open" (fun dir ->
         withEngine dir (fun engine ->
             let f1, f2 = twoFilesWithBrokenSecond dir
@@ -308,11 +321,12 @@ let ``StorageEngine.scanAt: limit つき走査は必要にならないファイ�
                     Version = Version.empty |> Version.addFile f1 |> Version.addFile f2
                 }
 
-            // 壊れたファイル 11 の下限はキー 3。limit 1 の走査はファイル 10 の
-            // 先頭（キー 1）だけで満たされるので、ファイル 11 を開かずに済む。
-            let scanned = ok (StorageEngine.scanAt engine None (intKey 1) 1) |> Seq.toArray
-            Assert.Equal(1, scanned.Length)
-            Assert.Equal(0, Bytes.compare scanned.[0].Key (intKey 1))))
+            // limit で打ち切られる走査でも、候補ファイルは先に開く。
+            // 開けなかったファイルを「空」と見なすと、Ok のまま行が欠ける。
+            expectErrorKind
+                ErrorKind.CorruptionError
+                "limit つきでも壊れたファイルを検出する"
+                (StorageEngine.scanAt engine None (intKey 1) 1)))
 
 [<Fact>]
 let ``StorageEngine.scanAt: 制限なしの走査は壊れたファイルを先に検出する`` () =

@@ -69,7 +69,7 @@ module internal Schema =
             Some(
                 true,
                 schema.Columns
-                |> Array.filter (fun (c: OutputColumn) -> defaultArg c.Qualifier "" = q)
+                |> Array.filter (fun (c: OutputColumn) -> SqlName.equal (defaultArg c.Qualifier "") q)
                 |> Array.toList
             )
         | _ -> None
@@ -135,7 +135,7 @@ module internal Schema =
             | Some q ->
                 let q' = q.ToLowerInvariant()
                 full = wanted || qual = q' && bare = r.Name.ToLowerInvariant()
-            | None -> bare = wanted || qual = wanted
+            | None -> bare = wanted
 
         let wanted = r.Display.ToLowerInvariant()
 

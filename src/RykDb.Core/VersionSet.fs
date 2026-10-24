@@ -130,7 +130,12 @@ module internal VersionEdit =
             Reader.readVarint c |> Result.map (fun (v, c) -> int64 v, c)
 
         let readLevel c =
-            Reader.readVarint c |> Result.map (fun (v, c) -> int v, c)
+            Reader.readVarint c
+            >>= fun (v, c) ->
+                if v > uint64 Levels.Max then
+                    err (sprintf "VersionEdit: レベル %d が範囲外です" v |> DbError.corruption)
+                else
+                    ret (int v, c)
 
         let decodeFile (c: Cursor) =
             result {

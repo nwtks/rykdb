@@ -643,8 +643,22 @@ module internal Optimizer =
                 let hasAgg = not (List.isEmpty allAggs)
                 let hasGroupBy = not (List.isEmpty groupBy)
 
-                if not (hasAgg || hasGroupBy) then
-                    return tree
+                let hasStar =
+                    stmt.Items.IsEmpty
+                    || stmt.Items
+                       |> List.exists (fun item ->
+                           match item.Expression with
+                           | Expr.Star
+                           | Expr.QualifiedStar _ -> true
+                           | _ -> false)
+
+                if (hasAgg || hasGroupBy) && hasStar then
+                    return!
+                        err (DbError.create ErrorKind.SyntaxError "GROUP BY / 集約関数を使うときは SELECT * を書けません（列を明示してください）")
+                elif not (hasAgg || hasGroupBy) then
+                    match having with
+                    | Some _ -> return! err (DbError.create ErrorKind.SyntaxError "HAVING には GROUP BY か集約関数が必要です")
+                    | None -> return tree
                 else
                     let aggNode = Logical.Aggregate(groupBy, allAggs, tree)
 
@@ -680,26 +694,34 @@ module internal Optimizer =
                 |> Result.map (fun e -> { item with Expression = e }))
             |> all
 
+        let evalCount (what: string) (e: Expr) =
+            match e with
+            | Expr.Literal(Literal.Int i) when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
+            | Expr.Literal(Literal.Int _) ->
+                err (
+                    DbError.create
+                        ErrorKind.SyntaxError
+                        (sprintf "%s は 0 以上 %d 以下の整数で指定してください" what System.Int32.MaxValue)
+                )
+            | _ -> err (DbError.create ErrorKind.SyntaxError (sprintf "%s は整数リテラルで指定してください" what))
+
         let applyLimit (tree: Logical) (stmt: SelectStatement) =
             match stmt.Limit, stmt.Offset with
             | None, None -> ret tree
             | _ ->
-                let evalConst (e: Expr) =
-                    match e with
-                    | Expr.Literal(Literal.Int i) -> int i
-                    | _ -> 0
+                result {
+                    let! limit =
+                        match stmt.Limit with
+                        | None -> ret -1
+                        | Some e -> evalCount "LIMIT" e
 
-                let limit =
-                    match stmt.Limit with
-                    | None -> -1
-                    | Some e -> max 0 (evalConst e)
+                    let! offset =
+                        match stmt.Offset with
+                        | None -> ret 0
+                        | Some e -> evalCount "OFFSET" e
 
-                let offset =
-                    match stmt.Offset with
-                    | None -> 0
-                    | Some e -> max 0 (evalConst e)
-
-                ret (Logical.Limit(offset, limit, tree))
+                    return Logical.Limit(offset, limit, tree)
+                }
 
         let localToAny (allSchema: Schema) (bindings: TableBinding list) (p: Expr) =
             not (Binder.hasAmbiguousColumn allSchema p)

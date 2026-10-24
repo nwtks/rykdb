@@ -47,8 +47,7 @@ module internal Catalog =
         System.Text.Encoding.UTF8.GetBytes("index:" + name)
 
     /// SQL の識別子は大文字小文字を区別しない（OrdinalIgnoreCase）。
-    let eqName (a: string) (b: string) =
-        System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
+    let eqName (a: string) (b: string) = SqlName.equal a b
 
     /// テーブルを探す。無ければ None。
     let findTable (c: Catalog) (name: string) =

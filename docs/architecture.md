@@ -345,7 +345,7 @@ flowchart LR
 - **集約の検出**は SELECT 項目と ORDER BY から（`Ops.aggCalls`）。
   GROUP BY があるか集約呼び出しがあれば `Aggregate` を作り、HAVING があればその上に `Having` を置く。
 - **ORDER BY に書けるのは列の直接参照だけ**（式は実行時にエラー）。
-- **LIMIT / OFFSET は整数リテラルのみ**（それ以外は 0 = 制限なし扱い）。
+- **LIMIT / OFFSET は 0 以上の整数リテラルのみ**（式・負数は `SyntaxError`）。
   `LIMIT` は最外層に置き、`OFFSET` を先、`LIMIT` を後に適用する。
 
 #### 最適化ルール（実装済みの範囲）
@@ -404,7 +404,7 @@ hash join / index nested loop など**結合アルゴリズムの自動選択は
 - `Filter` / `Sort` / `Project` は子の**出力スキーマ**（`outputOf`）を求めてから掛ける。
   集約の後は行の並びが「groupBy の値 + 各集約の結果」に変わるため、「入力スキーマ（テーブル定義）」と取り違えると `SELECT SUM(age)` が引数を評価できず `NULL` になる。
 - `Having` は集約後の行を**位置で読み替えて**から評価する（`Ops.havingFilter`）。
-- `Limit` は `Op.skip`（OFFSET）→ `Op.take`（LIMIT）の順、`limit = 0` は「LIMIT なし」。
+- `Limit` は `Op.skip`（OFFSET）→ `Op.take`（LIMIT）の順。`limit = -1` が「LIMIT なし」、`limit = 0` は 0 行。
 - 最後に `Plan.runSelect` が `Op.toArray` で行を集め、ヘッダは `Schema.projectHeader`（別名優先、`*` は列名）で組み立てる。
   `*` / `t.*` の列展開は `Schema.expandStar` に一本化している（ヘッダと射影の式が同じ列を共有するため）。
   `*` は修飾なしの列名、`t.*` は修飾つきの表示名で出す。
@@ -594,7 +594,8 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 
 - キーは `table:<名前>` / `index:<名前>`（索引定義は属するテーブル名を含む）。
 - `TableDefinition`（永続化形）と `TableSchema`（実行用）を相互変換する。
-- `Catalog.eqName` は `OrdinalIgnoreCase` — **SQL の識別子は大文字小文字を区別しない**。
+- `SqlName.equal`（`Types.fs`）は `OrdinalIgnoreCase` — **SQL の識別子は大文字小文字を区別しない**。
+  `Catalog.eqName` / `TableSchema.indexOf` / `Schema.expandStar` はすべてこれを使う。
 - **注意** `Catalog.toSchema` は `Indexes = []` で埋まる。
   実行系には `Catalog.indexSchemasOf` 経由で載せ直す必要がある（忘れると索引検索が常に SeqScan になる）。
 - **DDL は即時に効く**。

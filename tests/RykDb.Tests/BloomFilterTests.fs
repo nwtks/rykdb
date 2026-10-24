@@ -85,3 +85,28 @@ let ``BloomFilter.deserialize: ビット数が Int32 を超えるデータは Co
             ]
 
     expectErrorKind ErrorKind.CorruptionError "ビット数が異常" (BloomFilter.deserialize data)
+
+[<Fact>]
+let ``BloomFilter.deserialize: ビット数 0 とハッシュ数 0 は CorruptionError`` () =
+    let zeroBits =
+        Writer.build
+            [
+                Writer.writeByte 1uy
+                Writer.writeByte 1uy
+                Writer.varint 0UL
+                Writer.varint 0UL
+            ]
+
+    expectErrorKind ErrorKind.CorruptionError "ビット数 0 は除算で落ちる前に弾く" (BloomFilter.deserialize zeroBits)
+
+    let zeroHashes =
+        Writer.build
+            [
+                Writer.writeByte 1uy
+                Writer.writeByte 0uy
+                Writer.varint 0UL
+                Writer.varint 8UL
+                Writer.writeBytes [| 0uy |]
+            ]
+
+    expectErrorKind ErrorKind.CorruptionError "ハッシュ数 0 は弾く" (BloomFilter.deserialize zeroHashes)

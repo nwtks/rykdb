@@ -25,8 +25,11 @@ type Session(initial: Database) =
         | Error e -> Error e
 
     member _.Begin() =
-        current <- current.Begin()
-        Ok()
+        match current.Begin() with
+        | Ok next ->
+            current <- next
+            Ok()
+        | Error e -> Error e
 
     member _.Commit() =
         match current.Commit() with

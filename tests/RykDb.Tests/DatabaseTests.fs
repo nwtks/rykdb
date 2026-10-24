@@ -15,6 +15,14 @@ open RykDb.TestHelpers
 /// 1 文を実行して「新しい Database」と結果の両方を返す。
 let private execRes (db: Database) (sql: string) = ok (db.Execute sql)
 
+/// REAL を取り出す（集計結果の検証用）。
+let private asReal (v: SqlValue) =
+    match v with
+    | SqlValue.Real f -> f
+    | _ ->
+        Assert.Fail(sprintf "REAL ではありません: %A" v)
+        0.0
+
 /// ライブラリ API で DB を仕込む（E2E で共通）。
 let private seedLibrary (db: Database) =
     db
@@ -33,7 +41,7 @@ let private seedLibrary (db: Database) =
 let ``Database: BEGIN/COMMIT でまとめて反映される`` () =
     withDb "tx1" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = db1.Begin()
+        let db2 = ok (db1.Begin())
         Assert.True db2.InTransaction
 
         let db3, _ = ok (db2.Execute "INSERT INTO t VALUES (1, 1)")
@@ -52,7 +60,7 @@ let ``E2E: commit してない transaction は残らない`` () =
         let db = seedLibrary (ok (Database.openWith dir))
 
         // 明示 transaction を開いて write してから捨てる。
-        let tx = db.Begin()
+        let tx = ok (db.Begin())
         let tx2 = exec tx "INSERT INTO people VALUES (99, 'ghost', 1)"
         Assert.True tx2.InTransaction
 
@@ -71,7 +79,7 @@ let ``E2E: 別ハンドルの書き込みは既存 transaction に見えない``
         let db = seedLibrary (ok (Database.openWith dir))
 
         // 読み取り専用 transaction を開く（`Active` だけ立てる）。
-        let reader = db.Begin()
+        let reader = ok (db.Begin())
         Assert.True reader.InTransaction
 
         // 別のハンドルから書き込む。
@@ -92,7 +100,7 @@ let ``Database: ROLLBACK で元に戻る`` () =
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 1)")
 
-        let db3 = db2.Begin()
+        let db3 = ok (db2.Begin())
         let db4, _ = ok (db3.Execute "INSERT INTO t VALUES (2, 2)")
         let db5 = ok (db4.Rollback())
         Assert.False db5.InTransaction
@@ -104,8 +112,8 @@ let ``Database: ROLLBACK で元に戻る`` () =
 let ``Database: 二重 Begin と空の Commit / Rollback`` () =
     withDb "tx3" (fun db0 ->
         // 二重 Begin は進行中の transaction を維持する
-        let db1 = db0.Begin()
-        let db2 = db1.Begin()
+        let db1 = ok (db0.Begin())
+        let db2 = ok (db1.Begin())
         Assert.True db2.InTransaction
 
         // DML なしの Commit は Active の transaction をそのまま流す
@@ -120,14 +128,14 @@ let ``Database: 二重 Begin と空の Commit / Rollback`` () =
 [<Fact>]
 let ``Database: transaction 中の文エラーはそのまま返る`` () =
     withDb "tx4" (fun db0 ->
-        let db1 = db0.Begin()
+        let db1 = ok (db0.Begin())
         expectError "BEGIN 中の存在しないテーブル" (db1.Execute "SELECT * FROM nope"))
 
 [<Fact>]
 let ``Database: 明示 transaction 中の DDL はエラーになる`` () =
     withDb "tx-ddl" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let tx = db1.Begin()
+        let tx = ok (db1.Begin())
 
         // DDL は自動 commit されて ROLLBACK で戻らないので、明示的に拒否する
         expectError "BEGIN 中の CREATE TABLE" (tx.Execute "CREATE TABLE u (id INTEGER PRIMARY KEY)")
@@ -138,6 +146,98 @@ let ``Database: 明示 transaction 中の DDL はエラーになる`` () =
         let committed = ok (tx.Commit())
         let db2 = exec committed "CREATE TABLE u (id INTEGER PRIMARY KEY)"
         Assert.Contains("u", db2.TableNames()))
+
+// ---------------------------------------------------------------------------
+// 静かな誤答を防ぐ（識別子の大小文字・集計・HAVING・LIMIT・DEFAULT）
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``Database: 索引列と主キーの大文字小文字は区別しない`` () =
+    withDb "case-ident" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT)"
+        let db2 = exec db1 "INSERT INTO c VALUES (1, 'a'), (2, 'b')"
+        let db3 = exec db2 "CREATE INDEX ci ON c (V)"
+
+        // 索引キーが正しく作られ、索引経由でも行が見つかる
+        let _, byIndex = ok (db3.Query "SELECT id FROM c WHERE v = 'b'")
+        Assert.Equal<int>(1, byIndex.Rows.Length)
+        Assert.Equal<int64>(2L, asInt byIndex.Rows.[0].[0])
+
+        // PRIMARY KEY (ID) の表記も通る
+        let db4 = exec db3 "CREATE TABLE p (id INTEGER, v TEXT, PRIMARY KEY (ID))"
+        let _, inserted = ok (db4.Execute "INSERT INTO p VALUES (1, 'x')")
+        Assert.Equal(1, inserted.RowsAffected))
+
+[<Fact>]
+let ``Database: SUM / AVG は型が混在しても値を落とさない`` () =
+    withDb "sum-mixed" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE s (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO s VALUES (1), (2), (3)"
+
+        // 1 + 1.5 + 1.5 = 4.0（INT と REAL の混在）
+        let _, sum =
+            ok (db2.Query "SELECT SUM(CASE WHEN id = 1 THEN 1 ELSE 1.5 END) FROM s")
+
+        Assert.Equal(4.0, asReal sum.Rows.[0].[0], 10)
+
+        let _, avg =
+            ok (db2.Query "SELECT AVG(CASE WHEN id = 1 THEN 1 ELSE 1.5 END) FROM s")
+
+        Assert.Equal(4.0 / 3.0, asReal avg.Rows.[0].[0], 10))
+
+[<Fact>]
+let ``Database: 集約なしの HAVING はエラー`` () =
+    withDb "having-noagg" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
+
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "HAVING には GROUP BY か集約が必要"
+            (db2.Query "SELECT id FROM t HAVING id = 999"))
+
+[<Fact>]
+let ``Database: GROUP BY と * の併用はエラー`` () =
+    withDb "group-star" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10), (2, 10)"
+        expectErrorKind ErrorKind.SyntaxError "SELECT * は GROUP BY と併用できない" (db2.Query "SELECT * FROM t GROUP BY v"))
+
+[<Fact>]
+let ``Database: テーブル名と同じ非修飾名は列として解決しない`` () =
+    withDb "resolve-qual" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE q (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO q VALUES (1)"
+        expectErrorKind ErrorKind.NameError "テーブル名を列として解決しない" (db2.Query "SELECT q FROM q"))
+
+[<Fact>]
+let ``Database: t.* の大文字小文字は区別しない`` () =
+    withDb "star-case" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE st (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO st VALUES (1)"
+        let _, r = ok (db2.Query "SELECT ST.* FROM st")
+        Assert.Equal<string list>([ "st.id" ], r.Columns |> Array.toList))
+
+[<Fact>]
+let ``Database: LIMIT の非リテラルと負数はエラー`` () =
+    withDb "limit-expr" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1), (2), (3)"
+        expectErrorKind ErrorKind.SyntaxError "LIMIT 1+0 はエラー" (db2.Query "SELECT id FROM t LIMIT 1+0")
+        expectErrorKind ErrorKind.SyntaxError "LIMIT -1 はエラー" (db2.Query "SELECT id FROM t LIMIT -1")
+        expectErrorKind ErrorKind.SyntaxError "OFFSET 1+0 はエラー" (db2.Query "SELECT id FROM t LIMIT 1 OFFSET 1+0")
+
+        // LIMIT 0 は 0 行（従来どおり）
+        let _, none = ok (db2.Query "SELECT id FROM t LIMIT 0")
+        Assert.Empty none.Rows)
+
+[<Fact>]
+let ``Database: DEFAULT の評価エラーは NULL にしない`` () =
+    withDb "default-error" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (1 / 0))"
+
+        expectError "壊れた DEFAULT はエラーになる" (db1.Execute "INSERT INTO t (id) VALUES (1)"))
 
 [<Fact>]
 let ``Database: SQL の BEGIN / COMMIT / ROLLBACK は受理される（文としては無効）`` () =
@@ -160,7 +260,7 @@ let ``Database: SQL の BEGIN / COMMIT / ROLLBACK は受理される（文とし
 let ``E2E: 明示 transaction 内の書き込みが SELECT に見える`` () =
     withDb "tx6" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let tx0 = db1.Begin()
+        let tx0 = ok (db1.Begin())
         let tx1, _ = ok (tx0.Execute "INSERT INTO t VALUES (1, 10)")
 
         let tx2, added = ok (tx1.Query "SELECT id, v FROM t")
@@ -185,7 +285,7 @@ let ``E2E: 明示 transaction 内の索引検索が書き込みを見る`` () =
     withDb "tx7" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE INDEX ix_t_v ON t (v)"
-        let tx0 = db2.Begin()
+        let tx0 = ok (db2.Begin())
         let tx1, _ = ok (tx0.Execute "INSERT INTO t VALUES (1, 7)")
 
         let tx2, found = ok (tx1.Query "SELECT id FROM t WHERE v = 7")

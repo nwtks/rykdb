@@ -31,22 +31,15 @@ type Database internal (root: string, state: DbState) =
 
     /// トランザクションを始める。
     /// 明示的な BEGIN。
+    /// カタログの再読み込みに失敗したらエラーを返す（古いカタログで黙って続行しない）。
     member this.Begin() =
         if state.Active.IsSome then
-            this
+            ret this
         else
             let mgr, txn = TransactionManager.beginTxn state.Manager
 
-            match Catalog.load state.Store with
-            | Error _ ->
-                let nextState =
-                    { state with
-                        Manager = mgr
-                        Active = Some txn
-                    }
-
-                Database(root, nextState)
-            | Ok fresh ->
+            Catalog.load state.Store
+            |> Result.map (fun fresh ->
                 let nextState =
                     { state with
                         Manager = mgr
@@ -54,7 +47,7 @@ type Database internal (root: string, state: DbState) =
                         Catalog = fresh
                     }
 
-                Database(root, nextState)
+                Database(root, nextState))
 
     /// 実行中の transaction があるか。
     member _.InTransaction = state.Active.IsSome

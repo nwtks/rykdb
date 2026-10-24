@@ -117,7 +117,8 @@ module internal Op =
         seekMatch src
 
     /// 先頭 n 行だけ。
-    /// n <= 0 は「全部」。
+    /// n <= 0 は 0 行（`LIMIT 0` は 0 行）。
+    /// 「制限なし」は呼び出し側が take を呼ばないことで表す。
     let rec take (n: int) (src: Op) =
         if n <= 0 then
             Op.Done
@@ -208,11 +209,19 @@ module internal Ops =
                     else
                         plan
                         |> List.tryPick (fun (i, _) ->
-                            rows
-                            |> Array.tryPick (fun r ->
-                                match SqlValue.compareValues rows.[0].[i] r.[i] with
-                                | Error e -> Some e
-                                | Ok _ -> None))
+                            let values = rows |> Array.map (fun row -> row.[i])
+
+                            match values |> Array.tryFind (fun v -> not (SqlValue.isNull v)) with
+                            | None -> None
+                            | Some representative ->
+                                values
+                                |> Array.tryPick (fun v ->
+                                    if SqlValue.isNull v then
+                                        None
+                                    else
+                                        match SqlValue.compareValues representative v with
+                                        | Error e -> Some e
+                                        | Ok _ -> None))
 
                 match validationError with
                 | Some e -> return! Error e
@@ -416,19 +425,27 @@ module internal Ops =
                     ret
                         { bump with
                             SawReal = true
-                            SumReal = acc.SumReal + f
+                            SumReal = acc.SumReal + float acc.SumDecimal + f
+                            SumDecimal = 0M
                             Seen = newSeen
                         }
                 | SqlValue.Int _
                 | SqlValue.Decimal _ ->
                     match SqlValue.asNumeric v with
                     | Some d ->
-                        addDecimal acc.SumDecimal d
-                        |> Result.map (fun sum ->
-                            { bump with
-                                SumDecimal = sum
-                                Seen = newSeen
-                            })
+                        if acc.SawReal then
+                            ret
+                                { bump with
+                                    SumReal = acc.SumReal + float d
+                                    Seen = newSeen
+                                }
+                        else
+                            addDecimal acc.SumDecimal d
+                            |> Result.map (fun sum ->
+                                { bump with
+                                    SumDecimal = sum
+                                    Seen = newSeen
+                                })
                     | None -> err (DbError.internalError "数値の変換に失敗しました（内部不整合）")
                 | _ ->
                     err (

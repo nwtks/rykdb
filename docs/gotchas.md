@@ -1130,3 +1130,40 @@ DDL を transaction に載せる設計に変えるまでは、この制約を維
 再オープン後も索引検索が行を取りこぼす。
 `Ddl.createIndex` は索引 keyspace を先に空にしてから backfill し、成功後にカタログへ登録する。
 途中で失敗しても、次回の `CREATE INDEX` が残骸を消してからやり直す。
+
+### 11.17 識別子の比較は `SqlName.equal` に一本化する
+
+`TableSchema.indexOf` が完全一致で `Catalog.eqName` が `OrdinalIgnoreCase` だったため、
+`CREATE INDEX ix ON c (V)` が成功しても索引キーに列が入らず、索引検索が **0 行** を返していた
+（UNIQUE 索引では `row.[-1]` で未捕捉の `IndexOutOfRangeException`）。
+`Types.fs` の `SqlName.equal` をカタログ・スキーマ・実行層で共用する。
+`PRIMARY KEY (ID)` と列 `id` の対応も同じ規則で解決する。
+
+### 11.18 `LIMIT` / `OFFSET` は 0 以上の整数リテラル
+
+非リテラルを `0` に丸めると `LIMIT 1+0` が **0 行** になる（かつてドキュメントは「制限なし」と書いていた）。
+`Planner.applyLimit` は式・負数・`Int32.MaxValue` 超を `SyntaxError` にする。
+`Limit` ノードの `-1` が「LIMIT なし」、`0` は 0 行。
+
+### 11.19 走査は候補 SSTable を先に開く
+
+`lazyMergeScan` が開けなかったファイルを `Drained`（空）と見なしていたため、
+壊れた SSTable があると `Ok` のまま行が欠けた（静かな誤答）。
+`StorageEngine.scanAt` は `limit` の有無にかかわらず候補ファイルを先に `openSstable` し、
+エラーをそのまま返す。`limit` による遅延オープンは諦めた（正しさを優先）。
+
+### 11.20 壊れたデータは未捕捉例外にしない
+
+ファイル内容から値を復元するコンストラクタは例外を送出し得る。境界で検証して `CorruptionError` にする:
+
+- `Sstable.parseBlock`: `shared > prev.Length` を拒否。restart 件数は `(n / 4) - 1` 以下に制限（加算オーバーフロー防止）。
+- `ValueCodec`: DECIMAL の flags/scale（scale ≤ 28・予約ビット 0）、DATE / TIMESTAMP の範囲。
+- `VersionEdit`: レベルは `0..Levels.Max`。
+- `BloomFilter.deserialize`: ビット数・ハッシュ数 0 を拒否（`% 0` の防止）。
+
+### 11.21 `Result` を握り潰さない（DEFAULT / `Begin()` / schema）
+
+- `DmlOps.insert`: 未指定列の DEFAULT の評価エラーを `NULL` にしない（値を指定した列の DEFAULT は評価しない）。
+- `Database.Begin()` は `Result<Database, DbError>` を返す（カタログ再読み込みの失敗を隠さない）。
+- `Engine.contextOf`: `Catalog.toSchema` の失敗を無視せず、文のエラーとして返す。
+- `Ops.sortBy`: 非 NULL の代表値と比較できない値があれば、ソート前にエラーにする。

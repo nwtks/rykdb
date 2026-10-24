@@ -177,7 +177,7 @@ module internal DmlOps =
             | Ok(Some _) -> err (DbError.constraintViolation (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name))
             | Ok None -> check row pk (schema.Indexes |> List.filter _.Unique)
 
-        let buildRow idxs width (values: Expr list) =
+        let buildRow (defaults: SqlValue array) idxs width (values: Expr list) =
             if List.length values <> List.length idxs then
                 Error(
                     DbError.create
@@ -186,29 +186,41 @@ module internal DmlOps =
                 )
             else
                 gatherWith evalConstant schema values idxs
-                |> Result.map (fun filled ->
-                    scatter width filled (fun i ->
-                        match schema.Columns.[i].Constraint.Default with
-                        | Some d ->
-                            match evalConstant d with
-                            | Ok dv -> dv
-                            | Error _ -> SqlValue.Null
-                        | None -> SqlValue.Null))
+                |> Result.map (fun filled -> scatter width filled (fun i -> defaults.[i]))
 
-        match columns with
-        | None -> schema.Columns |> List.mapi (fun i _ -> i) |> ret
-        | Some names -> names |> List.map (TableSchema.requireIndexOf schema) |> all
-        >>= fun idxs ->
-            rows
-            |> foldOk
-                (fun (txnAcc, count) values ->
-                    result {
-                        let! row = buildRow idxs schema.Columns.Length values
-                        do! checkUnique txnAcc row
-                        let! t = Dml.insert schema txnAcc row
-                        return t, count + 1
-                    })
-                (txn, 0)
+        result {
+            let! idxs =
+                match columns with
+                | None -> schema.Columns |> List.mapi (fun i _ -> i) |> ret
+                | Some names -> names |> List.map (TableSchema.requireIndexOf schema) |> all
+
+            let supplied = Set.ofList idxs
+
+            let! defaultValues =
+                schema.Columns
+                |> List.mapi (fun i col ->
+                    if Set.contains i supplied then
+                        ret SqlValue.Null
+                    else
+                        match col.Constraint.Default with
+                        | Some d -> evalConstant d
+                        | None -> ret SqlValue.Null)
+                |> all
+
+            let defaults = List.toArray defaultValues
+
+            return!
+                rows
+                |> foldOk
+                    (fun (txnAcc, count) values ->
+                        result {
+                            let! row = buildRow defaults idxs schema.Columns.Length values
+                            do! checkUnique txnAcc row
+                            let! t = Dml.insert schema txnAcc row
+                            return t, count + 1
+                        })
+                    (txn, 0)
+        }
 
     /// UPDATE。
     /// assignments の右辺は現在行で評価する。
@@ -484,16 +496,15 @@ module internal Engine =
                         Indexes = Catalog.indexSchemasOf state.Catalog t.Name
                     }
 
-                let c1 = ExecContext.withSchema ctx t.Name withIndexes
-                ExecContext.withCatalog c1 state.Catalog
-            | Error _ -> ExecContext.withCatalog ctx state.Catalog
+                ret (ExecContext.withSchema ctx t.Name withIndexes)
+            | Error e -> Error e
 
         let contextOf (state: DbState) (txn: Transaction) =
             let ctx = ExecContext.create state.Store (Snapshot.toVisible txn.Snapshot)
             let ctx = ExecContext.withTransaction ctx txn
+            let ctx = ExecContext.withCatalog ctx state.Catalog
 
-            state.Catalog.Tables
-            |> List.fold addTable (ExecContext.withCatalog ctx state.Catalog)
+            state.Catalog.Tables |> foldOk addTable ctx
 
         let runInsert (ctx: ExecContext) (st: InsertStatement) (txn: Transaction) =
             ExecContext.schemaOf ctx st.Table.Name
@@ -512,14 +523,17 @@ module internal Engine =
             (txn: Transaction)
             (run: ExecContext -> Transaction -> Result<Transaction * int, DbError>)
             =
-            let ctx = contextOf state txn
+            result {
+                let! ctx = contextOf state txn
+                let! outcome = run ctx txn
+                let txn2, n = outcome
 
-            run ctx txn
-            |> Result.map (fun (txn2, n) ->
-                { state with Pending = Some txn2 },
-                { StatementResult.empty with
-                    RowsAffected = n
-                })
+                return
+                    { state with Pending = Some txn2 },
+                    { StatementResult.empty with
+                        RowsAffected = n
+                    }
+            }
 
         let noRows (r: Result<DbState, DbError>) =
             r |> Result.map (fun s -> s, StatementResult.empty)
@@ -536,18 +550,18 @@ module internal Engine =
 
         match stmt with
         | Statement.Select sel ->
-            let ctx = contextOf state txn
+            contextOf state txn
+            >>= fun ctx ->
+                Plan.runSelect ctx sel
+                |> Result.map (fun (columns, rows) ->
+                    let result =
+                        {
+                            RowsAffected = rows.Length
+                            Columns = columns
+                            Rows = rows
+                        }
 
-            Plan.runSelect ctx sel
-            |> Result.map (fun (columns, rows) ->
-                let result =
-                    {
-                        RowsAffected = rows.Length
-                        Columns = columns
-                        Rows = rows
-                    }
-
-                state, result)
+                    state, result)
         | Statement.Insert st -> runDml state txn (fun ctx -> runInsert ctx st)
         | Statement.Update st -> runDml state txn (fun ctx -> runUpdate ctx st)
         | Statement.Delete st -> runDml state txn (fun ctx -> runDelete ctx st)

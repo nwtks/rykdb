@@ -133,22 +133,12 @@ module internal StorageEngine =
         | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
         | None -> Version.filesForPointLookup engine.Version key |> probe
 
-    /// 遅延 k-way merge のソース。
+    /// k-way merge のソース。
     type private MergeSource =
-        /// 未オープンのファイル。byte array はそのファイルが返し得る最小キーの下限。
-        | Unopened of byte array * FileMetaData
         /// オープン済み（先頭エントリと残りの走査）。
         | Opened of SstEntry * SstScan
-        /// 使い切った／開けなかったソース。
+        /// 空。
         | Drained
-
-    /// ファイルが返し得る最小キーの下限。
-    /// rangeScan は startKey 以降を返すので、Smallest と startKey の大きい方。
-    let private sourceBound (startKey: byte array) (f: FileMetaData) =
-        if Bytes.compare f.Smallest startKey > 0 then
-            f.Smallest
-        else
-            startKey
 
     /// seq を SstScan へ変換する（列挙は要求されたときに行われる）。
     /// pull は SstScan.emit へ「次を要求されたときに呼ぶ値」として渡すだけなので
@@ -165,35 +155,11 @@ module internal StorageEngine =
         pull ()
 
     /// 遅延 k-way merge（キー昇順・同一キーは SeqNo 降順）。
-    /// 各ファイルの先頭が比較できるまで開かない。
-    /// 未オープンの下限が現在の最小の先頭を超えないものは、比較のために開く
-    /// （そのファイルからより小さいキーが返るかもしれない）。
-    /// 下限が進んだ先のファイルは開かないので、limit で打ち切られる走査では
-    /// 必要なファイルだけを読み、残りの先行読み込みを省く。
-    /// 開けなかった・壊れたファイルはそのソースを打ち切る
-    /// （SstScan.toSeq と同じ「列挙時に起きたエラーは打ち切り」の扱い。
-    ///   ファイルの欠落は scanAt が先に検出して IoError として返す）。
-    let private lazyMergeScan (engine: StorageEngine) (startKey: byte array) (sources: MergeSource list) =
-        let openSource (f: FileMetaData) =
-            match openSstable engine f with
-            | Error _ -> Drained
-            | Ok reader ->
-                match SstScan.next (Sstable.rangeScan reader startKey 0) with
-                | Error _ -> Drained
-                | Ok None -> Drained
-                | Ok(Some(e, nxt)) -> Opened(e, nxt)
-
-        let rec replace (b: byte array) (s: MergeSource list) (acc: MergeSource list) =
-            match s with
-            | (Unopened(_, f) as src) :: tail ->
-                if Bytes.compare (sourceBound startKey f) b = 0 then
-                    List.rev acc @ openSource f :: tail
-                else
-                    replace b tail (src :: acc)
-            | src :: tail -> replace b tail (src :: acc)
-            | [] -> List.rev acc
-
-        let rec advance (state: MergeSource list) =
+    /// 呼び出し側が全ファイルを先に開く（開けなかったファイルを黙って飛ばさないため）。
+    /// 走査中のブロック解析エラーは打ち切るが、ファイル全体のチェックサムは
+    /// `openTable` が検証済みなので、実際の破損はそこで CorruptionError になる。
+    let private lazyMergeScan (sources: MergeSource list) =
+        let advance (state: MergeSource list) =
             let best =
                 state
                 |> List.indexed
@@ -207,36 +173,17 @@ module internal StorageEngine =
                         | Some(_, be, _) -> if SstEntry.compare e be < 0 then Some(i, e, rest) else acc)
                     None
 
-            let minBound =
-                state
-                |> List.choose (function
-                    | Unopened(b, _) -> Some b
-                    | _ -> None)
-                |> function
-                    | [] -> None
-                    | b :: rest -> Some(List.fold (fun acc b -> if Bytes.compare b acc < 0 then b else acc) b rest)
+            match best with
+            | None -> None
+            | Some(i, e, rest) ->
+                let nextSource =
+                    match SstScan.next rest with
+                    | Error _ -> Drained
+                    | Ok None -> Drained
+                    | Ok(Some(e2, nxt)) -> Opened(e2, nxt)
 
-            let bestKey = best |> Option.map (fun (_, e, _) -> e.Key)
-
-            match minBound with
-            | Some b when
-                (match bestKey with
-                 | None -> true
-                 | Some k -> Bytes.compare b k <= 0)
-                ->
-                advance (replace b state [])
-            | _ ->
-                match best with
-                | None -> None
-                | Some(i, e, rest) ->
-                    let nextSource =
-                        match SstScan.next rest with
-                        | Error _ -> Drained
-                        | Ok None -> Drained
-                        | Ok(Some(e2, nxt)) -> Opened(e2, nxt)
-
-                    let nextState = state |> List.mapi (fun j s -> if j = i then nextSource else s)
-                    Some(e, nextState)
+                let nextState = state |> List.mapi (fun j s -> if j = i then nextSource else s)
+                Some(e, nextState)
 
         Seq.unfold advance sources
 
@@ -291,46 +238,20 @@ module internal StorageEngine =
             let live = Seq.filter (fun e -> e.Value.IsSome) deduped
             if limit > 0 then Seq.truncate limit live else live
 
-        if limit <= 0 then
-            let opened =
-                sstFiles
-                |> List.map (fun f -> Result.map (fun r -> Sstable.rangeScan r startKey 0) (openSstable engine f))
+        let rec openAll (rest: FileMetaData list) (acc: MergeSource list) =
+            match rest with
+            | [] -> ret (List.rev acc)
+            | f :: tail ->
+                match openSstable engine f with
+                | Error e -> Error e
+                | Ok reader ->
+                    match SstScan.next (Sstable.rangeScan reader startKey 0) with
+                    | Error e -> Error e
+                    | Ok None -> openAll tail (Drained :: acc)
+                    | Ok(Some(e, nxt)) -> openAll tail (Opened(e, nxt) :: acc)
 
-            let openErrors =
-                opened
-                |> List.choose (function
-                    | Error e -> Some e
-                    | _ -> None)
-
-            if not (List.isEmpty openErrors) then
-                Error(List.head openErrors)
-            else
-                let sources =
-                    opened
-                    |> List.choose (function
-                        | Ok scan ->
-                            match SstScan.next scan with
-                            | Ok(Some(e, nxt)) -> Some(Opened(e, nxt))
-                            | _ -> Some Drained
-                        | Error _ -> None)
-
-                Ok(finalize (lazyMergeScan engine startKey (memSource :: sources)))
-        else
-            let missing =
-                sstFiles
-                |> List.filter (fun f -> not (System.IO.File.Exists(FileMetaData.path engine.Dir f.FileNumber)))
-
-            match missing with
-            | f :: _ ->
-                err (
-                    sprintf "SSTable ファイルが見つかりません: %s" (FileMetaData.path engine.Dir f.FileNumber)
-                    |> DbError.create ErrorKind.IoError
-                )
-            | [] ->
-                let fileSources =
-                    sstFiles |> List.map (fun f -> Unopened(sourceBound startKey f, f))
-
-                Ok(finalize (lazyMergeScan engine startKey (memSource :: fileSources)))
+        openAll sstFiles []
+        |> Result.map (fun sources -> finalize (lazyMergeScan (memSource :: sources)))
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、

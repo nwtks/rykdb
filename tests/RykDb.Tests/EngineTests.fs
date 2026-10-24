@@ -258,7 +258,7 @@ let ``DML: INSERT は DEFAULT で不足列を埋める`` () =
         Assert.Equal<int64>(42L, asInt rows.[0].[2]))
 
 [<Fact>]
-let ``DML: INSERT は評価できない DEFAULT を NULL にする`` () =
+let ``DML: INSERT は評価できない DEFAULT をエラーにする`` () =
     let ageCol = TestHelpers.col "age" DataType.Integer
 
     let age =
@@ -283,12 +283,13 @@ let ``DML: INSERT は評価できない DEFAULT を NULL にする`` () =
         let mgr = TransactionManager.create ()
         let mgr, txn = TransactionManager.beginTxn mgr
 
-        let txn, _ =
-            ok (DmlOps.insert (ctxOf store) schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
+        // 値を渡していない列の DEFAULT は評価される。評価エラーは NULL で握り潰さない。
+        expectError
+            "評価できない DEFAULT はエラー"
+            (DmlOps.insert (ctxOf store) schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
 
-        commitInto store mgr txn |> ignore
         let rows = ok (Dml.scanByPrimaryKey store schema None 0) |> Seq.toArray
-        Assert.True(SqlValue.isNull rows.[0].[2]))
+        Assert.Empty rows)
 
 [<Fact>]
 let ``DML: DELETE は WHERE に合う行を消す`` () =

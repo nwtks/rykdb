@@ -541,6 +541,12 @@ module internal ValueCodec =
                             yield System.BitConverter.ToInt64(bs, i * 8) |> int
                     |]
 
+                let flags = uint32 bits.[3]
+                let scale = flags >>> 16 &&& 0xFFu
+
+                if scale > 28u || flags &&& 0x7F00FFFFu <> 0u then
+                    return! err (DbError.corruption "ValueCodec: DECIMAL のビット列が不正です")
+
                 return System.Decimal bits |> SqlValue.Decimal, c
             | 5uy ->
                 let! bs, c = Reader.readLengthPrefixed c
@@ -550,14 +556,21 @@ module internal ValueCodec =
                 return SqlValue.Blob bs, c
             | 7uy ->
                 let! ticks, c = Reader.readInt64LE c
+                let days = ticks / System.TimeSpan.TicksPerDay
 
-                return
-                    int (ticks / System.TimeSpan.TicksPerDay)
-                    |> System.DateOnly.FromDayNumber
-                    |> SqlValue.Date,
-                    c
+                if
+                    days < int64 System.DateOnly.MinValue.DayNumber
+                    || days > int64 System.DateOnly.MaxValue.DayNumber
+                then
+                    return! err (DbError.corruption "ValueCodec: DATE の範囲が不正です")
+
+                return SqlValue.Date(System.DateOnly.FromDayNumber(int days)), c
             | 8uy ->
                 let! ticks, c = Reader.readInt64LE c
+
+                if ticks < 0L || ticks > System.DateTimeOffset.MaxValue.Ticks then
+                    return! err (DbError.corruption "ValueCodec: TIMESTAMP の範囲が不正です")
+
                 return System.DateTimeOffset(ticks, System.TimeSpan.Zero) |> SqlValue.Timestamp, c
             | 9uy ->
                 let! bs, c = Reader.readBytes 16 c

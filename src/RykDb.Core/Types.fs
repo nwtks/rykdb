@@ -18,6 +18,13 @@ module internal Bytes =
         let at i = uint32 data.[offset + i]
         at 0 ||| (at 1 <<< 8) ||| (at 2 <<< 16) ||| (at 3 <<< 24)
 
+/// SQL の識別子比較。
+/// テーブル名・列名・索引名・別名は大文字小文字を区別しない。
+/// スキーマ・カタログ・実行層で同じ規則を使うため、ここに 1つだけ置く。
+module internal SqlName =
+    let equal (a: string) (b: string) =
+        System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
+
 /// 実行時の値。
 /// NULL は他のすべての型と区別できる特別なケースとして持つ。
 [<RequireQualifiedAccess>]

@@ -58,7 +58,7 @@ module internal TableSchema =
             else
                 pkNames
                 |> List.map (fun name ->
-                    match c.Columns |> List.tryFindIndex (fun col -> col.Name = name) with
+                    match c.Columns |> List.tryFindIndex (fun col -> SqlName.equal col.Name name) with
                     | Some i -> ret i
                     | None -> err (sprintf "主キー列 %s が定義されていません" name |> DbError.name))
                 |> all
@@ -101,9 +101,10 @@ module internal TableSchema =
         schema.PrimaryKey |> List.map (fun i -> schema.Columns.[i].Name) |> List.toArray
 
     /// 列名 → 位置。
+    /// SQL の識別子は大文字小文字を区別しないので、ここで正規化する。
     let indexOf (schema: TableSchema) (column: string) =
         schema.Columns
-        |> List.tryFindIndex (fun c -> c.Name = column)
+        |> List.tryFindIndex (fun c -> SqlName.equal c.Name column)
         |> Option.map (fun i -> i)
         |> Option.defaultValue -1
 

@@ -95,6 +95,18 @@ let ``VersionEdit: 変更適用は削除後に追加する`` () =
     Assert.Equal(1L, (Version.filesAt updated 1).[0].FileNumber)
 
 [<Fact>]
+let ``VersionEdit: レベルが範囲外なら CorruptionError`` () =
+    let bad =
+        { (fmd 1L 0 100 199) with
+            Level = Levels.Max + 1
+        }
+
+    expectErrorKind
+        ErrorKind.CorruptionError
+        "レベルは 0..Max の範囲内"
+        (VersionEdit.decode (VersionEdit.encode (VersionEdit.addFile bad)))
+
+[<Fact>]
 let ``VersionEdit: エンコードの往復`` () =
     let added = fmd 3L 1 300 350
     let deleted = fmd 1L 0 100 199

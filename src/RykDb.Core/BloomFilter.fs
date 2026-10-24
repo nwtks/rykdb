@@ -103,8 +103,11 @@ module internal BloomFilter =
             let! count, c = Reader.readVarint c
             let! bitsLength, c = Reader.readVarint c
 
-            if bitsLength > uint64 System.Int32.MaxValue then
+            if bitsLength = 0UL || bitsLength > uint64 System.Int32.MaxValue then
                 return! err (DbError.corruption "BloomFilter: ビット数が異常です")
+
+            if hashCount = 0uy then
+                return! err (DbError.corruption "BloomFilter: ハッシュ数が 0 です")
 
             let! bits, _ = Reader.readBytes (int bitsLength) c
 

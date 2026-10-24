@@ -310,6 +310,10 @@ module internal Sstable =
         let decodeEntry (c: Cursor) (prev: byte array) =
             result {
                 let! shared, c = Reader.readVarint c
+
+                if shared > uint64 prev.Length then
+                    return! err (DbError.corruption "Sstable: 接頭辞長が直前のキーを超えています")
+
                 let! nonShared, c = Reader.readVarint c
                 let! valueLen, c = Reader.readVarint c
                 let! tail, c = Reader.readBytes (int nonShared) c
@@ -331,12 +335,11 @@ module internal Sstable =
             err (DbError.corruption "Sstable: ブロックが短すぎます")
         else
             let numRestarts = int (Bytes.readLE32 data (n - RestartEntryBytes))
-            let restartArraySize = (numRestarts + 1) * RestartEntryBytes
 
-            if numRestarts <= 0 || restartArraySize > n then
+            if numRestarts <= 0 || numRestarts > n / RestartEntryBytes - 1 then
                 err (DbError.corruption "Sstable: restart 配列が不正です")
             else
-                // restart 配列の手前までがエントリ領域。カーソルの End をそこに合わせる。
+                let restartArraySize = (numRestarts + 1) * RestartEntryBytes
                 readItems decodeEntry (Cursor.createSlice data 0 (n - restartArraySize)) [||]
 
     // Footer
@@ -700,6 +703,9 @@ module internal FileMetaData =
             }
 
         result {
+            if entries.Length = 0 then
+                return! err (DbError.internalError "Sstable: 空のエントリ列は書き出せません")
+
             let! bytes = Sstable.build entries bloomFalsePositiveRate
 
             let! () =
