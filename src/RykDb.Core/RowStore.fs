@@ -271,36 +271,23 @@ module internal RowStore =
         | Some engine -> ret engine
         | None -> store.OpenEngine keyspace
 
-    /// ディスク上の keyspace エンジンを開く。
-    let private openDiskEngine (root: string) (keyspace: string) =
-        let dir = Path.Combine(root, Keyspace.toDirName keyspace)
-
-        result {
-            do! Manifest.ensureDirectory dir
-            let! engine = StorageEngine.openDatabase dir
-            return DiskStorageEngine engine :> IStorageEngine
-        }
-
-    /// すでに同じ (key, SeqNo, value) が入っているエントリを除く。
-    /// commit intent の再適用で物理エントリが重複しないようにする。
-    let private filterApplied (engine: IStorageEngine) (entries: Entry array) =
-        let rec loop (rest: Entry list) (acc: Entry list) =
-            match rest with
-            | [] -> ret (List.rev acc |> List.toArray)
-            | e :: tail ->
-                match engine.GetAt (Some e.SeqNo) e.Key with
-                | Error err -> Error err
-                | Ok(Some existing) when existing.SeqNo = e.SeqNo && existing.Value = e.Value -> loop tail acc
-                | Ok _ -> loop tail (e :: acc)
-
-        loop (Array.toList entries) []
-
     let private applyBatchesCore
         (idempotent: bool)
         (activeSnapshot: uint64)
         (store: RowStore)
         (batches: (string * Entry array) list)
         =
+        let rec loop (engine: IStorageEngine) (rest: Entry list) (acc: Entry list) =
+            match rest with
+            | [] -> ret (List.rev acc |> List.toArray)
+            | e :: tail ->
+                match engine.GetAt (Some e.SeqNo) e.Key with
+                | Error err -> Error err
+                | Ok(Some existing) when existing.SeqNo = e.SeqNo && existing.Value = e.Value -> loop engine tail acc
+                | Ok _ -> loop engine tail (e :: acc)
+
+        let filterApplied (engine: IStorageEngine) (entries: Entry array) = loop engine (Array.toList entries) []
+
         let rec writeAll (rest: (string * Entry array) list) (current: RowStore) =
             match rest with
             | [] -> ret current
@@ -345,27 +332,6 @@ module internal RowStore =
     let applyBatches (activeSnapshot: uint64) (store: RowStore) (batches: (string * Entry array) list) =
         applyBatchesCore false activeSnapshot store batches
 
-    /// 残っている commit intent を順に適用する（再オープン時の回復）。
-    let private replayPending (store: RowStore) =
-        if System.String.IsNullOrEmpty store.Root then
-            ret store
-        else
-            result {
-                let! files = CommitIntent.pending store.Root
-
-                return!
-                    files
-                    |> foldOk
-                        (fun current path ->
-                            result {
-                                let! batches = CommitIntent.read path
-                                let! next = applyBatchesCore true 0UL current batches
-                                let! () = CommitIntent.remove path
-                                return next
-                            })
-                        store
-            }
-
     /// DB を開く（keyspace は必要に応じて作られる）。
     /// <remarks>
     /// 既存の keyspace ディレクトリはすべて開いておく。
@@ -373,6 +339,16 @@ module internal RowStore =
     /// LastCommitSeqNo = 0 から始まり、既にディスクにある行がすべて「未来」として見えなくなる。
     /// </remarks>
     let openStore (root: string) =
+        /// ディスク上の keyspace エンジンを開く。
+        let openDiskEngine (root: string) (keyspace: string) =
+            let dir = Path.Combine(root, Keyspace.toDirName keyspace)
+
+            result {
+                do! Manifest.ensureDirectory dir
+                let! engine = StorageEngine.openDatabase dir
+                return DiskStorageEngine engine :> IStorageEngine
+            }
+
         let openEngine = openDiskEngine root
 
         let rec openEngines (rest: string list) (acc: Map<string, IStorageEngine>) =
@@ -382,6 +358,26 @@ module internal RowStore =
                 match openEngine ks with
                 | Error err -> Error err
                 | Ok e -> openEngines tail (Map.add ks e acc)
+
+        let replayPending (store: RowStore) =
+            if System.String.IsNullOrEmpty store.Root then
+                ret store
+            else
+                result {
+                    let! files = CommitIntent.pending store.Root
+
+                    return!
+                        files
+                        |> foldOk
+                            (fun current path ->
+                                result {
+                                    let! batches = CommitIntent.read path
+                                    let! next = applyBatchesCore true 0UL current batches
+                                    let! () = CommitIntent.remove path
+                                    return next
+                                })
+                            store
+                }
 
         result {
             do! protect (fun () -> Directory.CreateDirectory root |> ignore)
@@ -517,10 +513,6 @@ module internal Dml =
                         ret (Transaction.put removed space newKey newValue))
             txn
 
-    /// 主キーで既存行を取り出す。
-    let getByPrimaryKey (store: RowStore) (schema: TableSchema) (visible: uint64 option) (key: SqlValue array) =
-        RowStore.getAt store (tableSpace schema) (KeyBuilder.ofValues key) visible
-
     /// store の行に txn の書き込みを重ねる。
     /// 追加・削除の後もキー昇順を保つ（走査結果の順序を安定させるため）。
     let private overlayRows
@@ -564,6 +556,9 @@ module internal Dml =
         (txn: Transaction)
         (key: SqlValue array)
         =
+        let getByPrimaryKey (store: RowStore) (schema: TableSchema) (visible: uint64 option) (key: SqlValue array) =
+            RowStore.getAt store (tableSpace schema) (KeyBuilder.ofValues key) visible
+
         match Transaction.tryFind txn (tableSpace schema) (KeyBuilder.ofValues key) with
         | Some slot -> ret slot
         | None -> getByPrimaryKey store schema visible key
@@ -572,32 +567,6 @@ module internal Dml =
     let scanByPrimaryKey (store: RowStore) (schema: TableSchema) (visible: uint64 option) (limit: int) =
         RowStore.scanAt store (tableSpace schema) [||] visible limit
         |> Result.map (Seq.map (fun (_, v) -> v |> Option.defaultValue [||]))
-
-    /// 主キーの範囲走査（startKey 以上、endKey 以下）。
-    let scanByPrimaryKeyRange
-        (store: RowStore)
-        (schema: TableSchema)
-        (visible: uint64 option)
-        (startKey: SqlValue array)
-        (endKey: SqlValue array option)
-        (limit: int)
-        =
-        let startBytes = KeyBuilder.ofValues startKey
-
-        RowStore.scanAt store (tableSpace schema) startBytes visible limit
-        |> Result.map (fun rows ->
-            let matched =
-                rows
-                |> Seq.choose (fun (k, v) ->
-                    match v with
-                    | Some row ->
-                        match endKey with
-                        | None -> Some row
-                        | Some ek when Bytes.compare k (KeyBuilder.ofValues ek) <= 0 -> Some row
-                        | _ -> None
-                    | None -> None)
-
-            if limit > 0 then Seq.truncate limit matched else matched)
 
     /// 主キーで prefix 走査する（txn の書き込みを含む）。
     let scanByPrimaryKeyWithTxn
@@ -630,14 +599,39 @@ module internal Dml =
         (endKey: SqlValue array option)
         (limit: int)
         =
+        let scanByPrimaryKeyRange
+            (store: RowStore)
+            (schema: TableSchema)
+            (visible: uint64 option)
+            (startKey: SqlValue array)
+            (endKey: SqlValue array option)
+            (limit: int)
+            =
+            let startBytes = KeyBuilder.ofValues startKey
+
+            RowStore.scanAt store (tableSpace schema) startBytes visible limit
+            |> Result.map (fun rows ->
+                let matched =
+                    rows
+                    |> Seq.choose (fun (k, v) ->
+                        match v with
+                        | Some row ->
+                            match endKey with
+                            | None -> Some row
+                            | Some ek when Bytes.compare k (KeyBuilder.ofValues ek) <= 0 -> Some row
+                            | _ -> None
+                        | None -> None)
+
+                if limit > 0 then Seq.truncate limit matched else matched)
+
         let startBytes = KeyBuilder.ofValues startKey
         let endBytes = endKey |> Option.map KeyBuilder.ofValues
 
         let inRange (key: byte array) =
             Bytes.compare key startBytes >= 0
-            && (match endBytes with
-                | None -> true
-                | Some eb -> Bytes.compare key eb <= 0)
+            && match endBytes with
+               | None -> true
+               | Some eb -> Bytes.compare key eb <= 0
 
         let slots =
             Transaction.slotsOf txn (tableSpace schema)
@@ -664,30 +658,6 @@ module internal Dml =
 
             if limit > 0 then Seq.truncate limit filtered else filtered)
 
-    /// 索引の値に一致する全行を引く。
-    /// 索引は一意とは限らないので `WHERE dept_id = 2` は 1行ではなく「その値を持つ全部の行」を返す。
-    /// 1件だけ返す実装にすると `SELECT ... WHERE indexed_col = v` が対象の一部だけを返すようになる。
-    /// 索引キーは「索引列の値 + 主キー列」なので、キー昇順に走査すると一致するエントリは `prefix` から連続して並ぶ。
-    /// したがって `prefix` から始めて `startsWithPrefix` が外れるまで取る。
-    let scanByIndexPrefix
-        (store: RowStore)
-        (index: IndexSchema)
-        (visible: uint64 option)
-        (values: SqlValue array)
-        (limit: int)
-        =
-        let prefix = KeyBuilder.ofValues values
-        let ks = indexSpace index
-
-        RowStore.scanAt store ks prefix visible limit
-        |> Result.map (fun rows ->
-            let matched =
-                rows
-                |> Seq.takeWhile (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix)
-                |> Seq.choose snd
-
-            if limit > 0 then Seq.truncate limit matched else matched)
-
     /// 索引の値に一致する全行を引く（txn の書き込みを含む）。
     let scanByIndexPrefixWithTxn
         (store: RowStore)
@@ -698,6 +668,25 @@ module internal Dml =
         (values: SqlValue array)
         (limit: int)
         =
+        let scanByIndexPrefix
+            (store: RowStore)
+            (index: IndexSchema)
+            (visible: uint64 option)
+            (values: SqlValue array)
+            (limit: int)
+            =
+            let prefix = KeyBuilder.ofValues values
+            let ks = indexSpace index
+
+            RowStore.scanAt store ks prefix visible limit
+            |> Result.map (fun rows ->
+                let matched =
+                    rows
+                    |> Seq.takeWhile (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix)
+                    |> Seq.choose snd
+
+                if limit > 0 then Seq.truncate limit matched else matched)
+
         let prefix = KeyBuilder.ofValues values
 
         let slots =
@@ -713,35 +702,6 @@ module internal Dml =
 
             if limit > 0 then Seq.truncate limit merged else merged)
 
-    /// 索引の値が範囲 [lower, upper] に入る行を引く。
-    let scanByIndexRange
-        (store: RowStore)
-        (index: IndexSchema)
-        (visible: uint64 option)
-        (lower: SqlValue array)
-        (upper: SqlValue array option)
-        (limit: int)
-        =
-        let loBytes = KeyBuilder.ofValues lower
-        let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues v)
-
-        let inRange (key: byte array) =
-            let lowerOk = Bytes.compare key loBytes >= 0
-
-            let upperOk =
-                match hiBytes with
-                | None -> true
-                | Some hb -> Bytes.compare key hb <= 0 || KeyBuilder.startsWithPrefix key hb
-
-            lowerOk && upperOk
-
-        let ks = indexSpace index
-
-        RowStore.scanAt store ks loBytes visible limit
-        |> Result.map (fun rows ->
-            let matched = rows |> Seq.filter (fun (k, _) -> inRange k) |> Seq.choose snd
-            if limit > 0 then Seq.truncate limit matched else matched)
-
     /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
     let scanByIndexRangeWithTxn
         (store: RowStore)
@@ -753,6 +713,34 @@ module internal Dml =
         (upper: SqlValue array option)
         (limit: int)
         =
+        let scanByIndexRange
+            (store: RowStore)
+            (index: IndexSchema)
+            (visible: uint64 option)
+            (lower: SqlValue array)
+            (upper: SqlValue array option)
+            (limit: int)
+            =
+            let loBytes = KeyBuilder.ofValues lower
+            let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues v)
+
+            let inRange (key: byte array) =
+                let lowerOk = Bytes.compare key loBytes >= 0
+
+                let upperOk =
+                    match hiBytes with
+                    | None -> true
+                    | Some hb -> Bytes.compare key hb <= 0 || KeyBuilder.startsWithPrefix key hb
+
+                lowerOk && upperOk
+
+            let ks = indexSpace index
+
+            RowStore.scanAt store ks loBytes visible limit
+            |> Result.map (fun rows ->
+                let matched = rows |> Seq.filter (fun (k, _) -> inRange k) |> Seq.choose snd
+                if limit > 0 then Seq.truncate limit matched else matched)
+
         let loBytes = KeyBuilder.ofValues lower
         let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues v)
 
@@ -855,12 +843,6 @@ module internal Dml =
                 return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
         }
 
-    /// 走査済みの行をそのまま使って削除する（主キー検索をやり直さない）。
-    let deleteRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) =
-        let pk = RowKey.primary schema oldRow
-        let next = Transaction.remove txn (tableSpace schema) pk
-        applyIndexChange schema next (Some oldRow) None
-
     /// 主キーで削除する。
     /// 主キーと全索引に tombstone を書く。
     /// 元の行を取得してから索引キーを組み立てるので、NOT NULL でも壊れない。
@@ -881,3 +863,9 @@ module internal Dml =
                 let next = Transaction.remove txn (tableSpace schema) pk
                 return! applyIndexChange schema next (Some oldRow) None
         }
+
+    /// 走査済みの行をそのまま使って削除する（主キー検索をやり直さない）。
+    let deleteRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) =
+        let pk = RowKey.primary schema oldRow
+        let next = Transaction.remove txn (tableSpace schema) pk
+        applyIndexChange schema next (Some oldRow) None

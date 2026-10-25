@@ -572,6 +572,76 @@ let ``Planner: JOIN があれば LJoin が作られる`` () =
         | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
 
 [<Fact>]
+let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば IndexNestedLoop`` () =
+    let leftTable =
+        {
+            Name = "l"
+            Columns = [ col "a" DataType.Integer ]
+            PrimaryKey = [ 0 ]
+            Indexes = []
+        }
+
+    let rightTable =
+        {
+            Name = "r"
+            Columns = [ col "a" DataType.Integer ]
+            PrimaryKey = [ 0 ]
+            Indexes =
+                [
+                    {
+                        Name = "ix_r_a"
+                        Columns = [ "a" ]
+                        Unique = false
+                    }
+                ]
+        }
+
+    let leftSchema = Schema.ofTable "l" None leftTable
+    let rightSchema = Schema.ofTable "r" None rightTable
+
+    let on =
+        Expr.Binary(
+            BinaryOp.Eq,
+            Expr.Column { Qualifier = Some "l"; Name = "a" },
+            Expr.Column { Qualifier = Some "r"; Name = "a" }
+        )
+
+    let leftSmall = Logical.Limit(0, 1, Logical.Scan("l", ScanMethod.SeqScan))
+
+    let rightScan = Logical.Scan("r", ScanMethod.SeqScan)
+
+    match Analyzer.chooseJoinAlgorithm leftSmall leftSchema rightSchema rightTable rightScan on with
+    | JoinAlgorithm.IndexNestedLoop name, _, Some lefts ->
+        Assert.Equal<string>("ix_r_a", name)
+        Assert.Equal<int array>([| 0 |], lefts)
+    | other -> Assert.Fail(sprintf "IndexNestedLoop ではありません: %A" other)
+
+    // 左が大きい（Limit なし）ならハッシュ結合
+    match
+        Analyzer.chooseJoinAlgorithm
+            (Logical.Scan("l", ScanMethod.SeqScan))
+            leftSchema
+            rightSchema
+            rightTable
+            rightScan
+            on
+    with
+    | JoinAlgorithm.HashJoin, _, _ -> ()
+    | other -> Assert.Fail(sprintf "HashJoin ではありません: %A" other)
+
+    // 非等値なら入れ子ループ
+    let nonEqui =
+        Expr.Binary(
+            BinaryOp.Gt,
+            Expr.Column { Qualifier = Some "l"; Name = "a" },
+            Expr.Column { Qualifier = Some "r"; Name = "a" }
+        )
+
+    match Analyzer.chooseJoinAlgorithm leftSmall leftSchema rightSchema rightTable rightScan nonEqui with
+    | JoinAlgorithm.NestedLoop, _, _ -> ()
+    | other -> Assert.Fail(sprintf "NestedLoop ではありません: %A" other)
+
+[<Fact>]
 let ``Planner: GROUP BY があれば LAggregate が作られる`` () =
     withStore "pl4" (fun store ->
         let ctx = ctxOf store

@@ -91,21 +91,6 @@ module internal StorageEngine =
     [<Literal>]
     let private DefaultMemLimitBytes = 64 * 1024 * 1024
 
-    /// 既定値で埋めた空の engine（Dir のみ引数から取る）。
-    let private emptyEngine dir =
-        {
-            Dir = dir
-            ManifestNumber = 1L
-            Version = Version.empty
-            Mem = Memtable.empty
-            Wal = { FileNumber = 1L; Size = 0 }
-            NextSeqNo = 1UL
-            NextTxnId = 1UL
-            MemLimitBytes = DefaultMemLimitBytes
-            Compaction = CompactionOptions.defaults
-            ActiveSnapshot = 0UL
-        }
-
     /// ファイル名（拡張子除く）を番号として読む。
     /// SSTable でも WAL でも同じ規則。
     let private parseNumber (path: string) =
@@ -120,13 +105,12 @@ module internal StorageEngine =
         | Some s -> e.SeqNo <= s
         | None -> true
 
-    /// SSTable ファイルをバイト列で読む。
-    let private readFileBytes (dir: string) (fileNumber: int64) =
-        protect (fun () -> System.IO.File.ReadAllBytes(FileMetaData.path dir fileNumber))
-
     /// ファイルを開く（Bloom と index を持つ reader を作る）。
     /// パース結果は弱参照キャッシュに載せ、同じファイルを何度も読まない。
     let private openSstable (engine: StorageEngine) (f: FileMetaData) =
+        let readFileBytes (dir: string) (fileNumber: int64) =
+            protect (fun () -> System.IO.File.ReadAllBytes(FileMetaData.path dir fileNumber))
+
         let path = FileMetaData.path engine.Dir f.FileNumber
 
         match protect (fun () -> SstReaderCache.keyOf path (System.IO.FileInfo path)) with
@@ -155,16 +139,6 @@ module internal StorageEngine =
                 >>= fun partial ->
                     SstPartialCache.put key partial
                     Ok partial
-
-    /// 開いた reader から startKey 以降の全エントリを配列にする。
-    /// `[||]` なら先頭から全部。
-    /// index の二分探索で startKey より前のブロックは読み飛ばす。
-    let private readEntriesFrom (startKey: byte array) (reader: SstReader) =
-        Sstable.rangeScan reader startKey 0 |> SstScan.toArray
-
-    /// ファイル 1つを読んで startKey 以降の全エントリを配列にする。
-    let private entriesOf (engine: StorageEngine) (startKey: byte array) (f: FileMetaData) =
-        openSstable engine f >>= readEntriesFrom startKey
 
     /// ポイントルックアップ。
     /// memtable -> L0 -> 各レベルの順に見る。
@@ -224,32 +198,29 @@ module internal StorageEngine =
         /// 空。
         | Drained
 
-    /// ファイルが返し得る最小キーの下限（rangeScan は startKey 以降を返す）。
-    let private sourceBound (startKey: byte array) (f: FileMetaData) =
-        if Bytes.compare f.Smallest startKey > 0 then
-            f.Smallest
-        else
-            startKey
-
-    /// seq を SstScan へ変換する（列挙は要求されたときに行われる）。
-    /// pull は SstScan.emit へ「次を要求されたときに呼ぶ値」として渡すだけなので
-    /// 再帰は 1段ずつ戻ってから次を組み立てる。
-    let private seqToScan (rows: seq<SstEntry>) =
-        let e = rows.GetEnumerator()
-
-        let rec pull () =
-            if e.MoveNext() then
-                SstScan.emit e.Current pull
+    /// 範囲ルックアップ。
+    /// キー昇順で返す（同一キーは 1件だけ）。
+    /// visible が Some s のときは SeqNo が s 以下の版を返す。
+    /// limit > 0 のときは必要なファイルだけを開いて先頭 limit 件を返す。
+    /// limit <= 0 のときは全ファイルを開いてチェックサムを検証してから遅延 merge する。
+    let scanAt (engine: StorageEngine) (visible: uint64 option) (startKey: byte array) (limit: int) =
+        let sourceBound (startKey: byte array) (f: FileMetaData) =
+            if Bytes.compare f.Smallest startKey > 0 then
+                f.Smallest
             else
-                SstScan.empty
+                startKey
 
-        pull ()
+        let seqToScan (rows: seq<SstEntry>) =
+            let e = rows.GetEnumerator()
 
-    /// 遅延 k-way merge（キー昇順・同一キーは SeqNo 降順）。
-    /// 呼び出し側が全ファイルを先に開く（開けなかったファイルを黙って飛ばさないため）。
-    /// 走査中のブロック解析エラーは打ち切るが、ファイル全体のチェックサムは
-    /// `openTable` が検証済みなので、実際の破損はそこで CorruptionError になる。
-    let private lazyMergeScan (sources: MergeSource list) =
+            let rec pull () =
+                if e.MoveNext() then
+                    SstScan.emit e.Current pull
+                else
+                    SstScan.empty
+
+            pull ()
+
         let rec pick (i: int) (best: (int * SstEntry * SstScan) option) (rest: MergeSource list) =
             match rest with
             | [] -> best
@@ -287,46 +258,35 @@ module internal StorageEngine =
 
                 Some(e, replaceAt i nextSource state)
 
-        Seq.unfold advance sources
+        let lazyMergeScan (sources: MergeSource list) = Seq.unfold advance sources
 
-    /// 遅延 collapseDuplicates（同一キーの最新版だけ残す）。
-    let private collapseDuplicatesLazy (visible: uint64 option) (src: seq<SstEntry>) =
         let isVisible (e: SstEntry) =
             match visible with
             | Some s -> e.SeqNo <= s
             | None -> true
 
-        Seq.unfold
-            (fun (cur: System.Collections.Generic.IEnumerator<SstEntry>, emittedKey: byte array option) ->
-                let rec next () =
-                    if cur.MoveNext() then
-                        let e = cur.Current
+        /// 遅延 collapseDuplicates（同一キーの最新版だけ残す）。
+        let collapseDuplicatesLazy (src: seq<SstEntry>) =
+            Seq.unfold
+                (fun (cur: System.Collections.Generic.IEnumerator<SstEntry>, emittedKey: byte array option) ->
+                    let rec next () =
+                        if cur.MoveNext() then
+                            let e = cur.Current
 
-                        match emittedKey with
-                        | Some k when Bytes.compare k e.Key = 0 ->
-                            // 同一キーの古い版 → スキップ
-                            next ()
-                        | _ when not (isVisible e) ->
-                            // 見えない版 → スキップ
-                            next ()
-                        | _ -> Some(e, (cur, Some e.Key))
-                    else
-                        None
+                            match emittedKey with
+                            | Some k when Bytes.compare k e.Key = 0 ->
+                                // 同一キーの古い版 → スキップ
+                                next ()
+                            | _ when not (isVisible e) ->
+                                // 見えない版 → スキップ
+                                next ()
+                            | _ -> Some(e, (cur, Some e.Key))
+                        else
+                            None
 
-                next ())
-            (src.GetEnumerator(), None)
+                    next ())
+                (src.GetEnumerator(), None)
 
-    /// 先頭 limit 件の「可視・最新・非 tombstone」エントリを集める。
-    /// 必要になったファイルだけを開き、limit に達したら残りは開かない
-    /// （未オープンのファイルの下限は最後に返したキーより大きいので、先頭 limit 件には寄与しない）。
-    /// limit に達する前に開封・ブロック解析のエラーがあれば Error を返す。
-    let private collectLimited
-        (engine: StorageEngine)
-        (visible: uint64 option)
-        (startKey: byte array)
-        (limit: int)
-        (sources: MergeSource list)
-        =
         let rec pickOpened (i: int) (best: (int * SstEntry * SstScan) option) (rest: MergeSource list) =
             match rest with
             | [] -> best
@@ -421,7 +381,7 @@ module internal StorageEngine =
                                 | Some k -> Bytes.compare k e.Key = 0
                                 | None -> false
 
-                            if sameKey || not (isVisible visible e) then
+                            if sameKey || not (isVisible e) then
                                 collect state' emittedKey count acc
                             else
                                 let appended = e.Value.IsSome
@@ -432,14 +392,20 @@ module internal StorageEngine =
                                     (if appended then count + 1 else count)
                                     (if appended then e :: acc else acc)
 
-        collect sources None 0 []
+        let collectLimited (sources: MergeSource list) = collect sources None 0 []
 
-    /// 範囲ルックアップ。
-    /// キー昇順で返す（同一キーは 1件だけ）。
-    /// visible が Some s のときは SeqNo が s 以下の版を返す。
-    /// limit > 0 のときは必要なファイルだけを開いて先頭 limit 件を返す。
-    /// limit <= 0 のときは全ファイルを開いてチェックサムを検証してから遅延 merge する。
-    let scanAt (engine: StorageEngine) (visible: uint64 option) (startKey: byte array) (limit: int) =
+        let rec openAll (rest: FileMetaData list) (acc: MergeSource list) =
+            match rest with
+            | [] -> ret (List.rev acc)
+            | f :: tail ->
+                match openSstable engine f with
+                | Error e -> Error e
+                | Ok reader ->
+                    match SstScan.next (Sstable.rangeScan reader startKey 0) with
+                    | Error e -> Error e
+                    | Ok None -> openAll tail (Drained :: acc)
+                    | Ok(Some(e, nxt)) -> openAll tail (Opened(e, nxt) :: acc)
+
         let sstFiles =
             Version.allFiles engine.Version
             |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
@@ -454,28 +420,15 @@ module internal StorageEngine =
             | Ok(Some(e, nxt)) -> Opened(e, nxt)
             | _ -> Drained
 
-        let finalize (merged: seq<SstEntry>) =
-            collapseDuplicatesLazy visible merged |> Seq.filter (fun e -> e.Value.IsSome)
-
-        let rec openAll (rest: FileMetaData list) (acc: MergeSource list) =
-            match rest with
-            | [] -> ret (List.rev acc)
-            | f :: tail ->
-                match openSstable engine f with
-                | Error e -> Error e
-                | Ok reader ->
-                    match SstScan.next (Sstable.rangeScan reader startKey 0) with
-                    | Error e -> Error e
-                    | Ok None -> openAll tail (Drained :: acc)
-                    | Ok(Some(e, nxt)) -> openAll tail (Opened(e, nxt) :: acc)
-
         if limit > 0 then
             let fileSources =
                 sstFiles |> List.map (fun f -> Unopened(sourceBound startKey f, f))
 
-            collectLimited engine visible startKey limit (memSource :: fileSources)
-            |> Result.map Seq.ofList
+            collectLimited (memSource :: fileSources) |> Result.map Seq.ofList
         else
+            let finalize (merged: seq<SstEntry>) =
+                collapseDuplicatesLazy merged |> Seq.filter (fun e -> e.Value.IsSome)
+
             openAll sstFiles []
             |> Result.map (fun sources -> finalize (lazyMergeScan (memSource :: sources)))
 
@@ -576,6 +529,12 @@ module internal StorageEngine =
     /// 3 と 4 の順序が重要: MANIFEST を先に書かないと、
     /// クラッシュ時に「MANIFEST は新しいがファイルは古い」= データ損失になる。
     let private compactOnce (engine: StorageEngine) =
+        let readEntriesFrom (startKey: byte array) (reader: SstReader) =
+            Sstable.rangeScan reader startKey 0 |> SstScan.toArray
+
+        let entriesOf (engine: StorageEngine) (startKey: byte array) (f: FileMetaData) =
+            openSstable engine f >>= readEntriesFrom startKey
+
         let buildCompacted (version: Version) (manifestNumber: int64) (result: CompactionResult) =
             let nextNum =
                 match result.Added with
@@ -697,6 +656,20 @@ module internal StorageEngine =
             let ssts = sstNumbersOnDisk dir
             let wals = Wal.walFiles dir |> List.choose parseNumber |> List.toArray
             Array.append ssts wals |> Array.fold (fun acc n -> max acc n) 0L
+
+        let emptyEngine dir =
+            {
+                Dir = dir
+                ManifestNumber = 1L
+                Version = Version.empty
+                Mem = Memtable.empty
+                Wal = { FileNumber = 1L; Size = 0 }
+                NextSeqNo = 1UL
+                NextTxnId = 1UL
+                MemLimitBytes = DefaultMemLimitBytes
+                Compaction = CompactionOptions.defaults
+                ActiveSnapshot = 0UL
+            }
 
         let buildRecovered
             (version: Version)

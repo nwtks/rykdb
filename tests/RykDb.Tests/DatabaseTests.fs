@@ -910,6 +910,84 @@ let ``Database: エイリアスでの自己結合が行を返す`` () =
         Assert.Equal<int64>(30L, asInt res3.Rows.[0].[2]))
 
 [<Fact>]
+let ``Database: ハッシュ結合（INNER / LEFT / NULL キー）`` () =
+    withDb "joinhash" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db3 = exec db2 "INSERT INTO a VALUES (1,10),(2,20),(3,NULL)"
+        let db4 = exec db3 "INSERT INTO b VALUES (1,10),(2,10),(3,30),(4,NULL)"
+
+        // INNER: NULL キーは一致しない（a3 は落ちる）
+        let _, inner =
+            ok (db4.Query "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id")
+
+        Assert.Equal<int>(2, inner.Rows.Length)
+        Assert.Equal<int64>(1L, asInt inner.Rows.[0].[0])
+        Assert.Equal<int64>(1L, asInt inner.Rows.[0].[1])
+        Assert.Equal<int64>(1L, asInt inner.Rows.[1].[0])
+        Assert.Equal<int64>(2L, asInt inner.Rows.[1].[1])
+
+        // LEFT: 一致しない a2 / a3 は右側 NULL
+        let _, left =
+            ok (db4.Query "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id, b.id")
+
+        Assert.Equal<int>(4, left.Rows.Length)
+        Assert.True(SqlValue.isNull left.Rows.[2].[1])
+        Assert.True(SqlValue.isNull left.Rows.[3].[1])
+
+        // 残りの ON 句（b.id = 1）はハッシュ結合でも評価される
+        let _, residual =
+            ok (db4.Query "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND b.id = 1")
+
+        Assert.Equal<int>(1, residual.Rows.Length)
+        Assert.Equal<int64>(1L, asInt residual.Rows.[0].[1]))
+
+[<Fact>]
+let ``Database: インデックス入れ子ループ（右索引 + 左が小さい）`` () =
+    withDb "joinindex" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE depts (id INTEGER PRIMARY KEY, name TEXT)"
+
+        let db2 =
+            exec db1 "CREATE TABLE users (id INTEGER PRIMARY KEY, dept_id INTEGER, name TEXT)"
+
+        let db3 = exec db2 "CREATE INDEX ix_users_dept ON users (dept_id)"
+        let db4 = exec db3 "INSERT INTO depts VALUES (1,'eng'),(2,'sales'),(3,'empty')"
+
+        let db5 =
+            exec db4 "INSERT INTO users VALUES (1,1,'alice'),(2,1,'bob'),(3,2,'carol')"
+
+        // 左は主キー 1 行、右 dept_id に索引 → IndexNestedLoop
+        let _, inner =
+            ok (
+                db5.Query
+                    "SELECT depts.name, users.name FROM depts JOIN users ON depts.id = users.dept_id WHERE depts.id = 1 ORDER BY users.id"
+            )
+
+        Assert.Equal<int>(2, inner.Rows.Length)
+        Assert.Equal<string>("alice", asText inner.Rows.[0].[1])
+        Assert.Equal<string>("bob", asText inner.Rows.[1].[1])
+
+        // 一致なしの LEFT JOIN は右側 NULL
+        let _, left =
+            ok (
+                db5.Query
+                    "SELECT depts.name, users.name FROM depts LEFT JOIN users ON depts.id = users.dept_id WHERE depts.id = 3"
+            )
+
+        Assert.Equal<int>(1, left.Rows.Length)
+        Assert.True(SqlValue.isNull left.Rows.[0].[1])
+
+        // 等値キー以外の ON 句も索引結合で評価される
+        let _, residual =
+            ok (
+                db5.Query
+                    "SELECT users.name FROM depts JOIN users ON depts.id = users.dept_id AND users.name = 'bob' WHERE depts.id = 1"
+            )
+
+        Assert.Equal<int>(1, residual.Rows.Length)
+        Assert.Equal<string>("bob", asText residual.Rows.[0].[0]))
+
+[<Fact>]
 let ``Database: JOIN の非修飾で曖昧な列は NameError`` () =
     // 非修飾 id は p と q の両方にある。各テーブルへ pushdown すると
     // それぞれ id = 1 で絞ってしまい、曖昧エラーにならず意味が変わる。

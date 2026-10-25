@@ -257,69 +257,6 @@ let ``RowStore.openStore: 壊れた MANIFEST レコードは読み飛ばす`` ()
         ok (RowStore.openStore dir) |> ignore)
 
 [<Fact>]
-let ``Dml.getByPrimaryKey: 1 行挿入して主キーで引ける`` () =
-    withStore "rs1" (fun store ->
-        let mgr = TransactionManager.create ()
-        let _, txn = TransactionManager.beginTxn mgr
-        let txn = Dml.insert usersWithEmailIndex txn (rowOf 1 "a@example.com" 20) |> ok
-        commitInto store 1UL txn
-
-        let found =
-            Dml.getByPrimaryKey store usersWithEmailIndex None [| SqlValue.Int 1L |] |> ok
-
-        match found with
-        | Some row -> Assert.Equal<string>("a@example.com", asText row.[1])
-        | None -> Assert.Fail "行が見つからないはず")
-
-[<Fact>]
-let ``Dml.getByPrimaryKey: 複数テーブルは別 keyspace に載る`` () =
-    let other =
-        TableSchema.ofCreateTable
-            {
-                Name = "orders"
-                IfNotExists = false
-                Columns =
-                    [
-                        {
-                            Name = "id"
-                            DataType = DataType.Integer
-                            TypeArguments = []
-                            Constraint =
-                                { ColumnConstraint.Empty with
-                                    PrimaryKey = true
-                                }
-                        }
-                        {
-                            Name = "user_id"
-                            DataType = DataType.Integer
-                            TypeArguments = []
-                            Constraint = ColumnConstraint.Empty
-                        }
-                    ]
-                Constraints = []
-            }
-        |> ok
-
-    withStore "rs8" (fun store ->
-        let mgr = TransactionManager.create ()
-        let _, t1 = TransactionManager.beginTxn mgr
-        let t1 = Dml.insert usersWithEmailIndex t1 (rowOf 1 "a@x.com" 1) |> ok
-        commitInto store 1UL t1
-
-        let _, t2 = TransactionManager.beginTxn mgr
-        let t2 = Dml.insert other t2 [| SqlValue.Int 1L; SqlValue.Int 1L |] |> ok
-        commitInto store 10UL t2
-
-        // 両方のテーブルが独立に引ける（シャーディングの確認）
-        let u =
-            Dml.getByPrimaryKey store usersWithEmailIndex None [| SqlValue.Int 1L |] |> ok
-
-        let o = Dml.getByPrimaryKey store other None [| SqlValue.Int 1L |] |> ok
-
-        Assert.True u.IsSome
-        Assert.True o.IsSome)
-
-[<Fact>]
 let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる`` () =
     withStore "rs6" (fun store ->
         let mgr = TransactionManager.create ()
@@ -359,39 +296,6 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる（limit）`` ()
             Dml.scanByPrimaryKey store usersWithEmailIndex None 2 |> ok |> Seq.toArray
 
         Assert.Equal(2, rows.Length))
-
-[<Fact>]
-let ``Dml.scanByIndexPrefix: limit で件数を絞れる`` () =
-    let schema =
-        withIndex
-            usersSchema
-            {
-                Name = "users_age"
-                Columns = [ "age" ]
-                Unique = false
-            }
-
-    withStore "rs-idx-limit" (fun store ->
-        let mgr = TransactionManager.create ()
-        let _, txn = TransactionManager.beginTxn mgr
-
-        let txn =
-            [ 1; 2; 3 ]
-            |> List.fold (fun t i -> Dml.insert schema t (rowOf i (sprintf "u%d@x.com" i) 20) |> ok) txn
-
-        commitInto store 1UL txn
-
-        let all =
-            ok (Dml.scanByIndexPrefix store schema.Indexes.[0] None [| SqlValue.Int 20L |] 0)
-            |> Seq.toArray
-
-        Assert.Equal(3, all.Length)
-
-        let limited =
-            ok (Dml.scanByIndexPrefix store schema.Indexes.[0] None [| SqlValue.Int 20L |] 2)
-            |> Seq.toArray
-
-        Assert.Equal(2, limited.Length))
 
 [<Fact>]
 let ``Dml.insert: NOT NULL 制約違反は弾かれる`` () =

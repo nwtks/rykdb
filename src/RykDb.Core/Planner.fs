@@ -42,6 +42,17 @@ type internal JoinAlgorithm =
     /// インデックス入れ子ループ（右を索引で引く）
     | IndexNestedLoop of string
 
+/// 左×右の等値結合キー。
+type internal JoinKeys =
+    {
+        /// 左スキーマ内の列位置
+        LeftIndices: int array
+        /// 右スキーマ内の列位置
+        RightIndices: int array
+        /// 等値キー以外の ON 句
+        Residual: Expr option
+    }
+
 /// 論理代数（実行方法をまだ決めていない木）。
 [<RequireQualifiedAccess>]
 type internal Logical =
@@ -281,49 +292,173 @@ module internal Analyzer =
     let schemaOf (b: TableBinding) =
         Schema.ofTable b.RealName b.Ref.Alias b.Schema
 
-    /// 指定テーブルの修飾付き列参照から列名を取り出す。
-    let private colOf (tn: string) (v: Expr) =
-        match v with
-        | Expr.Column { Qualifier = Some q; Name = n } when q.ToLowerInvariant() = tn -> Some n
-        | _ -> None
+    /// 結合アルゴリズムを選ぶ。
+    /// - 等値キーなし: 入れ子ループ
+    /// - 左が小さい（上限 32行）かつ右に使える索引: インデックス入れ子ループ
+    /// - それ以外の等値結合: ハッシュ結合
+    let chooseJoinAlgorithm
+        (leftTree: Logical)
+        (leftSchema: Schema)
+        (rightSchema: Schema)
+        (rightTable: TableSchema)
+        (rightTree: Logical)
+        (on: Expr)
+        =
+        let isMatch (r: ColumnRef) (c: OutputColumn) =
+            match r.Qualifier with
+            | Some q ->
+                SqlName.equal c.Name r.Name
+                && match c.Qualifier with
+                   | Some cq -> SqlName.equal cq q
+                   | None -> false
+            | None -> SqlName.equal c.Name r.Name
 
-    /// リテラル（負の数を含む）を SqlValue にする。
-    let private litOf (v: Expr) =
-        match v with
-        | Expr.Literal l -> Some l.ToSqlValue
-        | Expr.Unary(UnaryOp.Neg, Expr.Literal l) ->
-            match l.ToSqlValue with
-            | SqlValue.Int i -> Some(SqlValue.Int -i)
-            | SqlValue.Real f -> Some(SqlValue.Real -f)
+        let columnIndexIn (schema: Schema) (expr: Expr) =
+            match Schema.tryAsColumnRef expr with
+            | None -> None
+            | Some r ->
+                let hits =
+                    schema.Columns |> Array.indexed |> Array.filter (fun (_, c) -> isMatch r c)
+
+                match hits with
+                | [| i, _ |] -> Some i
+                | _ -> None
+
+        let tryPair (l, r) =
+            match columnIndexIn leftSchema l, columnIndexIn rightSchema r with
+            | Some li, Some ri ->
+                match leftSchema.Columns.[li].DataType, rightSchema.Columns.[ri].DataType with
+                | Some lt, Some rt when lt = rt -> Some(li, ri)
+                | _ -> None
             | _ -> None
-        | _ -> None
 
-    /// WHERE の conjunct から、指定テーブルの等値条件をすべて取り出す。
-    /// キー比較では値の型も一致している必要があるため、型は後段で確認する。
-    let private equalitiesOf (tn: string) (predicates: Expr list) =
-        predicates
-        |> List.collect Predicate.splitConjuncts
-        |> List.choose (fun e ->
-            match e with
-            | Expr.Binary(BinaryOp.Eq, a, b) ->
-                match colOf tn a, litOf b with
-                | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
-                | _ ->
-                    match colOf tn b, litOf a with
+        let joinKeys (on: Expr) =
+            let keyPairs, residual =
+                on
+                |> Predicate.splitConjuncts
+                |> List.fold
+                    (fun (keys, residual) conjunct ->
+                        match conjunct with
+                        | Expr.Binary(BinaryOp.Eq, a, b) ->
+                            let pair =
+                                match tryPair (a, b) with
+                                | Some p -> Some p
+                                | None -> tryPair (b, a)
+
+                            match pair with
+                            | Some(li, ri) -> (li, ri) :: keys, residual
+                            | None -> keys, conjunct :: residual
+                        | _ -> keys, conjunct :: residual)
+                    ([], [])
+
+            if List.isEmpty keyPairs then
+                None
+            else
+                let ordered = List.rev keyPairs
+
+                Some
+                    {
+                        LeftIndices = ordered |> List.map fst |> Array.ofList
+                        RightIndices = ordered |> List.map snd |> Array.ofList
+                        Residual = Predicate.joinConjuncts (List.rev residual)
+                    }
+
+        let rightIndexForJoin (rightSchema: Schema) (rightTable: TableSchema) (keys: JoinKeys) =
+            let keyNames =
+                keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
+
+            let findLeft (colName: string) =
+                keys.RightIndices
+                |> Array.tryFindIndex (fun ri -> Catalog.eqName rightSchema.Columns.[ri].Name colName)
+                |> Option.map (fun keyPos -> keys.LeftIndices.[keyPos])
+
+            rightTable.Indexes
+            |> List.choose (fun idx ->
+                let coversAll =
+                    idx.Columns.Length = keyNames.Length
+                    && idx.Columns
+                       |> List.forall (fun c -> keyNames |> Array.exists (fun k -> Catalog.eqName c k))
+                    && keyNames
+                       |> Array.forall (fun k -> idx.Columns |> List.exists (fun c -> Catalog.eqName c k))
+
+                if not coversAll then
+                    None
+                else
+                    let lefts = idx.Columns |> List.map findLeft
+
+                    if lefts |> List.forall Option.isSome then
+                        Some(idx.Name, lefts |> List.choose id |> Array.ofList)
+                    else
+                        None)
+            |> List.tryHead
+
+        let rec estimatedRows (tree: Logical) =
+            match tree with
+            | Logical.Values _ -> 1
+            | Logical.Limit(_, limit, _) when limit >= 0 -> limit
+            | Logical.Scan(_, ScanMethod.PkLookup _) -> 1
+            | Logical.Project(_, child) -> estimatedRows child
+            | Logical.Filter(_, child) -> estimatedRows child
+            | Logical.Sort(_, child) -> estimatedRows child
+            | Logical.Distinct child -> estimatedRows child
+            | _ -> System.Int32.MaxValue
+
+        match joinKeys on with
+        | None -> JoinAlgorithm.NestedLoop, None, None
+        | Some keys ->
+            let index =
+                match rightTree with
+                | Logical.Scan(_, _) -> rightIndexForJoin rightSchema rightTable keys
+                | _ -> None
+
+            match index with
+            | Some(indexName, leftIndices) when estimatedRows leftTree <= 32 ->
+                JoinAlgorithm.IndexNestedLoop indexName, Some keys, Some leftIndices
+            | _ -> JoinAlgorithm.HashJoin, Some keys, None
+
+    /// WHERE から等価条件を探して走査方法を決める。
+    /// 複合主キー・複合索引は、全列の等値条件が揃ったときだけ Lookup にする。
+    let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
+        let colOf (tn: string) (v: Expr) =
+            match v with
+            | Expr.Column { Qualifier = Some q; Name = n } when q.ToLowerInvariant() = tn -> Some n
+            | _ -> None
+
+        let litOf (v: Expr) =
+            match v with
+            | Expr.Literal l -> Some l.ToSqlValue
+            | Expr.Unary(UnaryOp.Neg, Expr.Literal l) ->
+                match l.ToSqlValue with
+                | SqlValue.Int i -> Some(SqlValue.Int -i)
+                | SqlValue.Real f -> Some(SqlValue.Real -f)
+                | _ -> None
+            | _ -> None
+
+        let equalitiesOf (tn: string) (predicates: Expr list) =
+            predicates
+            |> List.collect Predicate.splitConjuncts
+            |> List.choose (fun e ->
+                match e with
+                | Expr.Binary(BinaryOp.Eq, a, b) ->
+                    match colOf tn a, litOf b with
                     | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
-                    | _ -> None
-            | _ -> None)
+                    | _ ->
+                        match colOf tn b, litOf a with
+                        | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
+                        | _ -> None
+                | _ -> None)
 
-    /// 列の宣言型とリテラルの型が一致するか。
-    /// 主キー・索引は値のバイト列表現で引くため、暗黙変換できるだけでは足りない。
-    let private typeMatches (schema: TableSchema) (colName: string) (value: SqlValue) =
-        schema.Columns
-        |> List.exists (fun c -> Catalog.eqName c.Name colName && c.DataType = SqlValue.dataType value)
+        let typeMatches (schema: TableSchema) (colName: string) (value: SqlValue) =
+            schema.Columns
+            |> List.exists (fun c -> Catalog.eqName c.Name colName && c.DataType = SqlValue.dataType value)
 
-    /// WHERE から PK 列の範囲条件を取り出す。
-    /// 戻り値は (lower, upper) の SqlValue option。lower/upper が Some なら範囲条件あり。
-    let private rangeBounds (tn: string) (colName: string) (predicates: Expr list) =
-        let rec loop (lower: SqlValue option) (upper: SqlValue option) (rest: Expr list) =
+        let rec loop
+            (tn: string)
+            (colName: string)
+            (lower: SqlValue option)
+            (upper: SqlValue option)
+            (rest: Expr list)
+            =
             match rest with
             | [] -> lower, upper
             | e :: tail ->
@@ -339,7 +474,7 @@ module internal Analyzer =
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> upper
 
-                    loop lower' upper' tail
+                    loop tn colName lower' upper' tail
                 | Expr.Binary(BinaryOp.Ge, a, b) ->
                     let lower' =
                         match colOf tn a, litOf b with
@@ -351,7 +486,7 @@ module internal Analyzer =
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> upper
 
-                    loop lower' upper' tail
+                    loop tn colName lower' upper' tail
                 | Expr.Binary(BinaryOp.Lt, a, b) ->
                     let upper' =
                         match colOf tn a, litOf b with
@@ -363,7 +498,7 @@ module internal Analyzer =
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> lower
 
-                    loop lower' upper' tail
+                    loop tn colName lower' upper' tail
                 | Expr.Binary(BinaryOp.Le, a, b) ->
                     let upper' =
                         match colOf tn a, litOf b with
@@ -375,14 +510,14 @@ module internal Analyzer =
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> lower
 
-                    loop lower' upper' tail
+                    loop tn colName lower' upper' tail
                 | Expr.Between(x, lo, hi, false) ->
                     match colOf tn x with
                     | Some n when Catalog.eqName n colName ->
                         match litOf lo, litOf hi with
-                        | Some lv, Some hv -> loop (Some lv) (Some hv) tail
-                        | _ -> loop lower upper tail
-                    | _ -> loop lower upper tail
+                        | Some lv, Some hv -> loop tn colName (Some lv) (Some hv) tail
+                        | _ -> loop tn colName lower upper tail
+                    | _ -> loop tn colName lower upper tail
                 | Expr.Like(x, p, false) ->
                     match colOf tn x, litOf p with
                     | Some n, Some(SqlValue.Text pattern) when Catalog.eqName n colName ->
@@ -408,18 +543,16 @@ module internal Analyzer =
                                     else
                                         None
 
-                            loop lower' upper' tail
+                            loop tn colName lower' upper' tail
                         else
-                            loop lower upper tail
-                    | _ -> loop lower upper tail
-                | _ -> loop lower upper tail
+                            loop tn colName lower upper tail
+                    | _ -> loop tn colName lower upper tail
+                | _ -> loop tn colName lower upper tail
 
-        let conjuncts = predicates |> List.collect Predicate.splitConjuncts
-        loop None None conjuncts
+        let rangeBounds (tn: string) (colName: string) (predicates: Expr list) =
+            let conjuncts = predicates |> List.collect Predicate.splitConjuncts
+            loop tn colName None None conjuncts
 
-    /// WHERE から等価条件を探して走査方法を決める。
-    /// 複合主キー・複合索引は、全列の等値条件が揃ったときだけ Lookup にする。
-    let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
         let name = refName b
         let equals = equalitiesOf (name.ToLowerInvariant()) predicates
 
@@ -795,6 +928,12 @@ module internal Optimizer =
             /// 右テーブルを除いたスキーマ（左部分木へ下ろすもの）
             LeftSchema: Schema
             RightSchema: Schema
+            /// 右テーブルの参照名（別名含む）
+            RightName: string
+            Algorithm: JoinAlgorithm
+            Keys: JoinKeys option
+            /// インデックス列順の左キー位置
+            LeftKeyIndices: int array
         }
 
     /// 評価待ちの処理。
@@ -809,6 +948,8 @@ module internal Optimizer =
         | ProjectFrame of SelectItem list * Schema * Expr list
         /// 左部分木を評価し終えた Join。次に右部分木を評価する。
         | JoinRightFrame of JoinFrame
+        /// 左部分木を評価し終えた Index Nested Loop。右部分木は評価しない。
+        | JoinIndexLeftFrame of JoinFrame
         /// 右部分木も評価し終えた Join。左 Op を保持している。
         | JoinApplyFrame of JoinFrame * Op
 
@@ -819,96 +960,122 @@ module internal Optimizer =
         | EvalNode of Logical * Schema * int option
         | ApplyOp of Op
 
-    let private defaultSchema (ctx: ExecContext) (name: string) =
-        match ExecContext.schemaOf ctx name with
-        | Ok s -> s
-        | Error _ ->
-            {
-                Name = name
-                Columns = []
-                PrimaryKey = []
-                Indexes = []
-            }
-
-    let private execJoin (kind: JoinKind) (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
-        match kind with
-        | JoinKind.Inner -> Ops.innerJoin leftSchema left rightSchema right on
-        | JoinKind.Left -> Ops.leftJoin leftSchema left rightSchema right on
-
-    /// int の加算（オーバーフロー時は MaxValue に丸める）。
-    let private addClamp (a: int) (b: int) =
-        if a > System.Int32.MaxValue - b then
-            System.Int32.MaxValue
-        else
-            a + b
-
-    let private execScan (ctx: ExecContext) (name: string) (method: ScanMethod) (hint: int option) =
-        match hint with
-        | Some 0 -> ret Op.empty
-        | _ ->
-            let limit = defaultArg hint 0
-
-            match method with
-            | ScanMethod.SeqScan -> ExecContext.table ctx name limit
-            | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
-            | ScanMethod.IndexLookup(indexName, values) -> ExecContext.byIndex ctx name indexName values limit
-            | ScanMethod.RangeScan(_, startKey, endKey) -> ExecContext.rangeScan ctx name startKey endKey limit
-            | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
-                ExecContext.byIndexRange ctx name indexName lower upper limit
-
-    [<TailCall>]
-    let rec private stripWrappers (tree: Logical) =
-        match tree with
-        | Logical.Sort(_, child) -> stripWrappers child
-        | Logical.Limit(_, _, child) -> stripWrappers child
-        | Logical.Distinct child -> stripWrappers child
-        | Logical.Having(_, _, _, child) -> stripWrappers child
-        | Logical.Filter(_, child) -> stripWrappers child
-        | Logical.Project(_, child) -> stripWrappers child
-        | other -> other
-
-    let private outputOf (tree: Logical) (inSchema: Schema) =
-        match stripWrappers tree with
-        | Logical.Aggregate(groupBy, aggs, _) ->
-            let gv =
-                groupBy
-                |> List.map (fun e ->
-                    {
-                        Name = Expr.toDisplayString e
-                        Qualifier = None
-                        DataType = None
-                    })
-
-            let av =
-                aggs
-                |> List.map (fun (f, star, _, arg) ->
-                    let suffix = if star then "*" else Expr.toDisplayString arg
-
-                    {
-                        Name = sprintf "%s(%s)" f.Name suffix
-                        Qualifier = None
-                        DataType = None
-                    })
-
-            { Schema.empty with
-                Columns = Array.append (List.toArray gv) (List.toArray av)
-            }
-        | _ -> inSchema
-
-    let private groupByOf (tree: Logical) =
-        match stripWrappers tree with
-        | Logical.Aggregate(groupBy, _, _) -> groupBy
-        | _ -> []
-
     /// 論理木を 1ノードずつ処理する。
     /// 継続は ExecFrame list に積むので、ラッパの深さに依存せずスタックは一定。
     [<TailCall>]
     let rec private run (ctx: ExecContext) (frames: ExecFrame list) (step: ExecStep) =
+        let defaultSchema (ctx: ExecContext) (name: string) =
+            match ExecContext.schemaOf ctx name with
+            | Ok s -> s
+            | Error _ ->
+                {
+                    Name = name
+                    Columns = []
+                    PrimaryKey = []
+                    Indexes = []
+                }
+
+        let execScan (ctx: ExecContext) (name: string) (method: ScanMethod) (hint: int option) =
+            match hint with
+            | Some 0 -> ret Op.empty
+            | _ ->
+                let limit = defaultArg hint 0
+
+                match method with
+                | ScanMethod.SeqScan -> ExecContext.table ctx name limit
+                | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
+                | ScanMethod.IndexLookup(indexName, values) -> ExecContext.byIndex ctx name indexName values limit
+                | ScanMethod.RangeScan(_, startKey, endKey) -> ExecContext.rangeScan ctx name startKey endKey limit
+                | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
+                    ExecContext.byIndexRange ctx name indexName lower upper limit
+
+        let rec stripWrappers (tree: Logical) =
+            match tree with
+            | Logical.Sort(_, child) -> stripWrappers child
+            | Logical.Limit(_, _, child) -> stripWrappers child
+            | Logical.Distinct child -> stripWrappers child
+            | Logical.Having(_, _, _, child) -> stripWrappers child
+            | Logical.Filter(_, child) -> stripWrappers child
+            | Logical.Project(_, child) -> stripWrappers child
+            | other -> other
+
+        let outputOf (tree: Logical) (inSchema: Schema) =
+            match stripWrappers tree with
+            | Logical.Aggregate(groupBy, aggs, _) ->
+                let gv =
+                    groupBy
+                    |> List.map (fun e ->
+                        {
+                            Name = Expr.toDisplayString e
+                            Qualifier = None
+                            DataType = None
+                        })
+
+                let av =
+                    aggs
+                    |> List.map (fun (f, star, _, arg) ->
+                        let suffix = if star then "*" else Expr.toDisplayString arg
+
+                        {
+                            Name = sprintf "%s(%s)" f.Name suffix
+                            Qualifier = None
+                            DataType = None
+                        })
+
+                { Schema.empty with
+                    Columns = Array.append (List.toArray gv) (List.toArray av)
+                }
+            | _ -> inSchema
+
+        let groupByOf (tree: Logical) =
+            match stripWrappers tree with
+            | Logical.Aggregate(groupBy, _, _) -> groupBy
+            | _ -> []
+
+        let addClamp (a: int) (b: int) =
+            if a > System.Int32.MaxValue - b then
+                System.Int32.MaxValue
+            else
+                a + b
+
+        let execJoin (frame: JoinFrame) (left: Op) (right: Op) =
+            match frame.Algorithm with
+            | JoinAlgorithm.NestedLoop ->
+                match frame.Kind with
+                | JoinKind.Inner -> Ops.innerJoin frame.LeftSchema left frame.RightSchema right frame.On
+                | JoinKind.Left -> Ops.leftJoin frame.LeftSchema left frame.RightSchema right frame.On
+            | JoinAlgorithm.HashJoin ->
+                let keys = frame.Keys.Value
+
+                match frame.Kind with
+                | JoinKind.Inner ->
+                    Ops.innerJoinHash
+                        frame.LeftSchema
+                        left
+                        frame.RightSchema
+                        right
+                        keys.LeftIndices
+                        keys.RightIndices
+                        keys.Residual
+                | JoinKind.Left ->
+                    Ops.leftJoinHash
+                        frame.LeftSchema
+                        left
+                        frame.RightSchema
+                        right
+                        keys.LeftIndices
+                        keys.RightIndices
+                        keys.Residual
+            | JoinAlgorithm.IndexNestedLoop _ ->
+                err (DbError.internalError "index nested loop は JoinIndexLeftFrame で実行します")
+            | JoinAlgorithm.MergeJoin -> err (DbError.internalError "merge join は未実装です")
+
         match step with
         | EvalNode(node, inSchema, hint) ->
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
-                let rightSchema = Schema.ofTable name None (defaultSchema ctx name)
+                let rightTable = defaultSchema ctx name
+                let rightSchema = Schema.ofTable name None rightTable
 
                 let leftSchema =
                     { inSchema with
@@ -921,6 +1088,9 @@ module internal Optimizer =
                         Tables = inSchema.Tables |> List.filter (fun t -> not (Catalog.eqName t name))
                     }
 
+                let algorithm, keys, leftKeyIndices =
+                    Analyzer.chooseJoinAlgorithm lTree leftSchema rightSchema rightTable rTree on
+
                 let frame =
                     {
                         Kind = kind
@@ -928,9 +1098,16 @@ module internal Optimizer =
                         On = on
                         LeftSchema = leftSchema
                         RightSchema = rightSchema
+                        RightName = name
+                        Algorithm = algorithm
+                        Keys = keys
+                        LeftKeyIndices = defaultArg leftKeyIndices [||]
                     }
 
-                run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
+                match algorithm with
+                | JoinAlgorithm.IndexNestedLoop _ ->
+                    run ctx (JoinIndexLeftFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
+                | _ -> run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
             | Logical.Values values -> run ctx frames (ApplyOp(Op.ofRow values))
             | Logical.Scan(name, method) ->
                 match execScan ctx name method hint with
@@ -992,10 +1169,41 @@ module internal Optimizer =
                     run ctx rest (ApplyOp limited)
                 | ProjectFrame(items, childSchema, groupBy) ->
                     run ctx rest (ApplyOp(Ops.project childSchema groupBy op items))
+                | JoinIndexLeftFrame frame ->
+                    let keys = frame.Keys.Value
+
+                    let indexName =
+                        match frame.Algorithm with
+                        | JoinAlgorithm.IndexNestedLoop indexName -> indexName
+                        | _ -> ""
+
+                    let lookup (keyValues: SqlValue array) =
+                        ExecContext.byIndex ctx frame.RightName indexName keyValues 0
+
+                    let joined =
+                        match frame.Kind with
+                        | JoinKind.Inner ->
+                            Ops.innerJoinIndexed
+                                frame.LeftSchema
+                                op
+                                frame.RightSchema
+                                frame.LeftKeyIndices
+                                lookup
+                                keys.Residual
+                        | JoinKind.Left ->
+                            Ops.leftJoinIndexed
+                                frame.LeftSchema
+                                op
+                                frame.RightSchema
+                                frame.LeftKeyIndices
+                                lookup
+                                keys.Residual
+
+                    run ctx rest (ApplyOp joined)
                 | JoinRightFrame frame ->
                     run ctx (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
                 | JoinApplyFrame(frame, leftOp) ->
-                    match execJoin frame.Kind frame.LeftSchema leftOp frame.RightSchema op frame.On with
+                    match execJoin frame leftOp op with
                     | Error e -> Error e
                     | Ok joined -> run ctx rest (ApplyOp joined)
 

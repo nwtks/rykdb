@@ -55,8 +55,6 @@ module internal Entry =
         | 0 -> compare b.SeqNo a.SeqNo
         | c -> c
 
-    let inline compareKeyOnly (key: byte array) (e: Entry) = Bytes.compare key e.Key
-
     let priority (e: Entry) =
         let h = Hashing.hashBytes e.Key
         Hashing.mix (h ^^^ e.SeqNo * 0x9E3779B97F4A7C15UL) |> Hashing.mix
@@ -144,15 +142,6 @@ type internal Memtable =
         /// メモリ上限判定用の概算サイズ
         ApproxBytes: int
     }
-
-/// 範囲走査の作業リスト。
-/// 探索中のノードと、「このエントリを結果に積む」という操作を交互に並べる。
-[<RequireQualifiedAccess>]
-type private Work =
-    /// 探索するノード。
-    /// None は「ここより先には対象がない」を意味する。
-    | Visit of TNode option
-    | Emit of Entry
 
 module internal Memtable =
     let empty =
@@ -267,6 +256,14 @@ module internal Memtable =
         | Some r when Bytes.compare r.Entry.Key key = 0 -> Some r.Entry
         | _ -> None
 
+    /// 範囲走査の作業リスト。
+    /// 探索中のノードと、「このエントリを結果に積む」という操作を交互に並べる。
+    type private Work =
+        /// 探索するノード。
+        /// None は「ここより先には対象がない」を意味する。
+        | Visit of TNode option
+        | Emit of Entry
+
     /// startKey 以降をキー昇順（同一キーは SeqNo 降順）で遅延生成する。
     /// 状態は「作業リスト + 出した件数」だけで、結果を溜めない
     /// （余分なメモリは作業リスト＝木の高さ分・期待 O(log n)）。
@@ -276,15 +273,15 @@ module internal Memtable =
             match work with
             | [] -> None
             | _ when limit > 0 && count >= limit -> None
-            | Work.Emit e :: rest -> Some(e, struct (rest, count + 1))
-            | Work.Visit None :: rest -> step struct (rest, count)
-            | Work.Visit(Some r) :: rest ->
+            | Emit e :: rest -> Some(e, struct (rest, count + 1))
+            | Visit None :: rest -> step struct (rest, count)
+            | Visit(Some r) :: rest ->
                 if Bytes.compare r.Entry.Key startKey < 0 then
-                    step struct (Work.Visit r.Right :: rest, count)
+                    step struct (Visit r.Right :: rest, count)
                 else
-                    step struct (Work.Visit r.Left :: Work.Emit r.Entry :: Work.Visit r.Right :: rest, count)
+                    step struct (Visit r.Left :: Emit r.Entry :: Visit r.Right :: rest, count)
 
-        Seq.unfold step struct ([ Work.Visit mem.Root ], 0)
+        Seq.unfold step struct ([ Visit mem.Root ], 0)
 
     /// キー昇順（同一キーは SeqNo 降順）で全エントリを返す。
     let toArray (mem: Memtable) = rangeScan mem [||] 0 |> Seq.toArray

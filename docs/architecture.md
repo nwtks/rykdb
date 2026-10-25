@@ -397,16 +397,33 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
 
 #### 結合アルゴリズム
 
-実行時の結合は **入れ子ループ（`Ops.innerJoin` / `Ops.leftJoin`）だけ**。
-hash join / index nested loop など**結合アルゴリズムの自動選択は未実装**で、
-`Optimizer.exec` から呼ばれる演算子もこの 2つだけ。
+`Optimizer` は `ON` 句から左×右の等値キーを取り出し、次の順で選ぶ。
 
-結合順序は `FROM` に書かれた順（選択性による並べ替えも未実装）。
+1. **インデックス入れ子ループ**（`JoinAlgorithm.IndexNestedLoop`）:
+   左部分木の見積りが 32 行以下（`Limit` / 主キー等値 / `VALUES`）で、
+   右テーブルに結合キー全列を満たす索引があり、右部分木が `Scan` のとき。
+   右は左行ごとに `ExecContext.byIndex` で引く。
+2. **ハッシュ結合**（`HashJoin`）:
+   等値キーがあり、上記以外。右側を `Dictionary<SqlValue array, ...>` のハッシュ表にする。
+3. **入れ子ループ**（`NestedLoop`）:
+   等値キーがない（非等値・複合条件）。
+
+- キー列の型が一致する等値条件だけをキーにする（型不一致は入れ子ループ）。
+- NULL キーは一致しない（ハッシュ/索引とも）。
+- 等値キー以外の `ON` 句（residual）は結合時に評価する。
+- インデックス入れ子ループは右部分木が `Filter` のときは使わない
+  （右への WHERE pushdown を落とさないため）。
+  LEFT JOIN の右側述語は結合後に評価されるので `Scan` のまま使える。
+- 結合順序は `FROM` に書かれた順（選択性による並べ替えも未実装）。
 
 #### 論理代数 → Op（`Optimizer.exec`）
 
 - `Scan` は `execScan` が `ScanMethod` に応じて `ExecContext.table` / `ExecContext.byPrimaryKey` / `ExecContext.byIndex` へ振り分ける。
-- `Join` は左を「現在のスキーマから右テーブルを除いたもの」、右を「右テーブル 1つだけのスキーマ」で実行し、`Ops.innerJoin` / `Ops.leftJoin` に渡す（ON は左行 + 右行で評価）。
+- `Join` は左を「現在のスキーマから右テーブルを除いたもの」、右を「右テーブル 1つだけのスキーマ」で実行し、
+  戦略に応じて `Ops.innerJoin` / `Ops.leftJoin`（入れ子ループ）、
+  `Ops.innerJoinHash` / `Ops.leftJoinHash`（ハッシュ）、
+  `Ops.innerJoinIndexed` / `Ops.leftJoinIndexed`（インデックス）へ振り分ける
+  （ON は左行 + 右行で評価）。
 - `Filter` / `Sort` / `Project` は子の**出力スキーマ**（`outputOf`）を求めてから掛ける。
   集約の後は行の並びが「groupBy の値 + 各集約の結果」に変わるため、「入力スキーマ（テーブル定義）」と取り違えると `SELECT SUM(age)` が引数を評価できず `NULL` になる。
 - `Having` は集約後の行を**位置で読み替えて**から評価する（`Ops.havingFilter`）。
@@ -1187,8 +1204,8 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   並行利用はスレッドごとにハンドルを分ける。
 - **MVCC の版は compaction を跨ぐまでは圧縮も再利用もされない**
   （GC は `SeqNo < ActiveSnapshot` の版を捨てるだけ。ファイル単位では判定しない）。
-- **結合アルゴリズムの自動選択は未実装**（§5.1）。
-  実行時の結合は常に入れ子ループ。
+- 結合アルゴリズムは `ON` の等値キーと左の見積りで自動選択する（§5.1）。
+  等値キーでも列型が違う場合は入れ子ループになる。
 - **明示 transaction の状態はプロセス内のみ**（`Database` ハンドルが持つ `Manager`）。
   未コミットの書き込みは WAL に残っていても再生されない。
 - **ActiveSnapshot は単一 Database ハンドルの active transaction だけを見る**。

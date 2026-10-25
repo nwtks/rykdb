@@ -41,15 +41,13 @@ type internal Transaction =
     }
 
 module internal Transaction =
-    let private empty (txnId: TxnId) (snap: Snapshot) =
+    /// 書き込み可能な transaction を作る。
+    let create (txnId: TxnId) (snap: Snapshot) =
         {
             TxnId = txnId
             Snapshot = snap
             Buffers = Map.empty
         }
-
-    /// 書き込み可能な transaction を作る。
-    let create (txnId: TxnId) (snap: Snapshot) = empty txnId snap
 
     let private setSlot (txn: Transaction) (keyspace: string) (key: byte array) (slot: SqlValue array option) =
         let inner =

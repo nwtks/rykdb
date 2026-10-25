@@ -295,6 +295,105 @@ let ``結合: LEFT JOIN は一致が無ければ NULL`` () =
     Assert.Equal<int64>(2L, asInt rows.[1].[1])
 
 [<Fact>]
+let ``結合: ハッシュ INNER JOIN`` () =
+    let left =
+        Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |]; [| SqlValue.Int 3L |] |]
+
+    let right = Op.ofArray [| [| SqlValue.Int 2L |]; [| SqlValue.Int 3L |] |]
+
+    let rows =
+        ok (Op.toArray (ok (Ops.innerJoinHash leftSchema left rightSchema right [| 0 |] [| 0 |] None)))
+
+    Assert.Equal<int>(2, rows.Length)
+    Assert.Equal<int64>(2L, asInt rows.[0].[0])
+    Assert.Equal<int64>(3L, asInt rows.[1].[0])
+
+[<Fact>]
+let ``結合: ハッシュ LEFT JOIN は一致が無ければ NULL`` () =
+    let left = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
+    let right = Op.ofArray [| [| SqlValue.Int 2L |] |]
+
+    let rows =
+        ok (Op.toArray (ok (Ops.leftJoinHash leftSchema left rightSchema right [| 0 |] [| 0 |] None)))
+
+    Assert.Equal<int>(2, rows.Length)
+    Assert.True(SqlValue.isNull rows.[0].[1])
+    Assert.Equal<int64>(2L, asInt rows.[1].[1])
+
+[<Fact>]
+let ``結合: ハッシュ結合は NULL キーを一致させない`` () =
+    let left = Op.ofArray [| [| SqlValue.Null |]; [| SqlValue.Int 2L |] |]
+    let right = Op.ofArray [| [| SqlValue.Null |]; [| SqlValue.Int 2L |] |]
+
+    let rows =
+        ok (Op.toArray (ok (Ops.innerJoinHash leftSchema left rightSchema right [| 0 |] [| 0 |] None)))
+
+    Assert.Equal<int>(1, rows.Length)
+    Assert.Equal<int64>(2L, asInt rows.[0].[0])
+
+[<Fact>]
+let ``結合: ハッシュ結合は複合キーと残りの ON 句を評価する`` () =
+    let leftSchema2 =
+        outSchema
+            [
+                outCol "a" (Some "l") (Some DataType.Integer)
+                outCol "b" (Some "l") (Some DataType.Integer)
+            ]
+
+    let rightSchema2 =
+        outSchema
+            [
+                outCol "a" (Some "r") (Some DataType.Integer)
+                outCol "b" (Some "r") (Some DataType.Integer)
+            ]
+
+    let left = Op.ofArray [| [| SqlValue.Int 1L; SqlValue.Int 10L |] |]
+
+    let right =
+        Op.ofArray
+            [|
+                [| SqlValue.Int 1L; SqlValue.Int 10L |]
+                [| SqlValue.Int 1L; SqlValue.Int 20L |]
+            |]
+
+    let residual =
+        Expr.Binary(BinaryOp.Gt, Expr.Column { Qualifier = Some "r"; Name = "b" }, Expr.Literal(Literal.Int 15L))
+
+    // キー a だけでは 2 行候補。b > 15 で 1 行に絞る。
+    let rows =
+        ok (Op.toArray (ok (Ops.innerJoinHash leftSchema2 left rightSchema2 right [| 0 |] [| 0 |] (Some residual))))
+
+    Assert.Equal<int>(1, rows.Length)
+    Assert.Equal<int64>(20L, asInt rows.[0].[3])
+
+[<Fact>]
+let ``結合: インデックス入れ子ループ（INNER / LEFT）`` () =
+    let left =
+        Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |]; [| SqlValue.Int 3L |] |]
+
+    let lookup key =
+        match key with
+        | [| SqlValue.Int 2L |] -> Ok(Op.ofArray [| [| SqlValue.Int 2L |] |])
+        | [| SqlValue.Int 3L |] -> Ok(Op.ofArray [| [| SqlValue.Int 3L |] |])
+        | _ -> Ok Op.empty
+
+    let inner =
+        ok (Op.toArray (Ops.innerJoinIndexed leftSchema left rightSchema [| 0 |] lookup None))
+
+    Assert.Equal<int>(2, inner.Length)
+    Assert.Equal<int64>(2L, asInt inner.[0].[0])
+    Assert.Equal<int64>(3L, asInt inner.[1].[0])
+
+    let left2 = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
+
+    let leftRows =
+        ok (Op.toArray (Ops.leftJoinIndexed leftSchema left2 rightSchema [| 0 |] lookup None))
+
+    Assert.Equal<int>(2, leftRows.Length)
+    Assert.True(SqlValue.isNull leftRows.[0].[1])
+    Assert.Equal<int64>(2L, asInt leftRows.[1].[1])
+
+[<Fact>]
 let ``sortBy: キーが空なら入力をそのまま返す`` () =
     let op = opOfRows [ row [ SqlValue.Int 2L ]; row [ SqlValue.Int 1L ] ]
     let rows = ok (Op.toArray (ok (Ops.sortBy schema2 op [])))

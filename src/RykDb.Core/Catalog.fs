@@ -40,12 +40,6 @@ module internal Catalog =
 
     let private keyspace = "__catalog__"
 
-    let private tableKey (name: string) =
-        System.Text.Encoding.UTF8.GetBytes("table:" + name)
-
-    let private indexKey (name: string) =
-        System.Text.Encoding.UTF8.GetBytes("index:" + name)
-
     /// SQL の識別子は大文字小文字を区別しない（OrdinalIgnoreCase）。
     let eqName (a: string) (b: string) = SqlName.equal a b
 
@@ -253,24 +247,6 @@ module internal Catalog =
                 }
         }
 
-    let private keyKindOf (key: byte array) =
-        let tryPrefix (prefix: string) =
-            let p = System.Text.Encoding.UTF8.GetBytes prefix
-
-            if key.Length < p.Length then
-                None
-            elif Array.forall2 (=) key.[0 .. p.Length - 1] p then
-                Some(System.Text.Encoding.UTF8.GetString(key, p.Length, key.Length - p.Length))
-            else
-                None
-
-        match tryPrefix "table:" with
-        | Some name -> Some(false, name)
-        | None ->
-            match tryPrefix "index:" with
-            | Some name -> Some(true, name)
-            | None -> None
-
     /// カタログを保存する（消えた定義は tombstone で落とす）。
     /// previous は保存前のカタログ（store にあった内容）。
     /// 消えた定義は「previous にあり catalog にないキー」として差分だけで求める
@@ -278,6 +254,12 @@ module internal Catalog =
     /// 書き込みは 1バッチにまとめる
     /// （tombstone も同じバッチに含めるので WAL の fsync は 1回で済む）。
     let save (store: RowStore) (previous: Catalog) (catalog: Catalog) =
+        let tableKey (name: string) =
+            System.Text.Encoding.UTF8.GetBytes("table:" + name)
+
+        let indexKey (name: string) =
+            System.Text.Encoding.UTF8.GetBytes("index:" + name)
+
         let rec numberList (mk: 'a -> uint64 -> 'b) (rest: 'a list) (seq: uint64) (acc: 'b list) =
             match rest with
             | [] -> List.rev acc, seq
@@ -328,6 +310,24 @@ module internal Catalog =
             | [| SqlValue.Blob b |] -> Some b
             | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
             | _ -> None
+
+        let tryPrefix (key: byte array) (prefix: string) =
+            let p = System.Text.Encoding.UTF8.GetBytes prefix
+
+            if key.Length < p.Length then
+                None
+            elif Array.forall2 (=) key.[0 .. p.Length - 1] p then
+                Some(System.Text.Encoding.UTF8.GetString(key, p.Length, key.Length - p.Length))
+            else
+                None
+
+        let keyKindOf (key: byte array) =
+            match tryPrefix key "table:" with
+            | Some name -> Some(false, name)
+            | None ->
+                match tryPrefix key "index:" with
+                | Some name -> Some(true, name)
+                | None -> None
 
         let rec decodeRows (rows: (byte array * SqlValue array option) array) (i: int) (acc: Catalog) =
             if i >= rows.Length then

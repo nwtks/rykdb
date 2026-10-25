@@ -15,20 +15,6 @@ let private unary op e = Expr.Unary(op, e)
 let private binary op a b = Expr.Binary(op, a, b)
 
 [<Fact>]
-let ``Ast: children は直接の子ノードを返す`` () =
-    let e = Expr.Binary(BinaryOp.Add, Expr.Name "a", Expr.Name "b")
-    let cs = Expr.children e
-    Assert.Equal(2, cs.Length)
-
-    // リーフは空
-    Assert.Empty(Expr.children (Expr.Name "x"))
-
-    // 3 引数・リスト・LIKE も子を返す
-    Assert.Equal(3, (Expr.children (Expr.Between(name "a", name "b", name "c", false))).Length)
-    Assert.Equal(3, (Expr.children (Expr.InList(name "a", [ name "b"; name "c" ], false))).Length)
-    Assert.Equal(2, (Expr.children (Expr.Like(name "a", name "b", false))).Length)
-
-[<Fact>]
 let ``Ast: fold は全ノードを訪問する`` () =
     let e = Expr.Binary(BinaryOp.Add, Expr.Name "a", Expr.Name "b")
     let count = Expr.fold (fun acc _ -> acc + 1) 0 e
@@ -142,35 +128,6 @@ let ``Ast: その他の演算子の表示`` () =
     Assert.Equal<string>("(a LIKE 'x%')", Expr.toDisplayString (Expr.Like(a, literal (Literal.String "x%"), false)))
 
     Assert.Equal<string>("t.*", Expr.toDisplayString (Expr.QualifiedStar "t"))
-
-[<Fact>]
-let ``Ast: plugChildren は children の順で子を差し替える`` () =
-    let bump (e: Expr) =
-        match e with
-        | Expr.Name n -> Expr.Name(n + "!")
-        | other -> other
-
-    let samples =
-        [
-            Expr.Unary(UnaryOp.Not, name "a")
-            Expr.Binary(BinaryOp.Add, name "a", name "b")
-            Expr.IsNull(name "a", false)
-            Expr.Between(name "a", name "b", name "c", false)
-            Expr.InList(name "a", [ name "b"; name "c" ], false)
-            Expr.Like(name "a", name "b", false)
-            Expr.Case([ (name "a", name "b") ], Some(name "c"))
-            Expr.Case([ (name "a", name "b") ], None)
-            Expr.Case([ name "a", name "b"; name "c", name "d" ], Some(name "e"))
-            Expr.FuncCall("ABS", [ name "a" ])
-            Expr.FuncCall("ABS", [])
-            Expr.AggCall(AggFunc.Sum, false, name "a")
-        ]
-
-    // リーフは子 0 個のまま
-    Assert.Equal<string>("a", Expr.toDisplayString (ok (Expr.plugChildren (name "a") [])))
-
-    // 子の個数が合わないのは到達不能なので internalError で落とす
-    expectError "子の個数不一致を検出できていません" (Expr.plugChildren (binary BinaryOp.Add (name "a") (name "b")) [ name "a" ])
 
 [<Fact>]
 let ``Ast: Literal と SqlValue の相互変換`` () =

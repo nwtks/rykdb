@@ -611,7 +611,148 @@ module internal Ops =
         Op.toArray right
         |> Result.map (fun rightRows -> joinRows rightRows rightSchema.Columns.Length left)
 
-    /// 射影。`SELECT` の項目順に値を並べる。
+    /// 等値結合のキーが NULL を含むか（SQL では NULL は一致しない）。
+    let private hasNullKey (row: SqlValue array) (indices: int array) =
+        indices |> Array.exists (fun i -> SqlValue.isNull row.[i])
+
+    let private keyOf (row: SqlValue array) (indices: int array) = indices |> Array.map (fun i -> row.[i])
+
+    /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
+    /// lookupRows は左キーから右行の配列を返す（見つからなければ空配列）。
+    /// <remarks>
+    /// Op.Compute の継続内の相互再帰は「次の行を要求されたとき」に 1段ずつ進むので、スタックは積み上がらない。
+    /// TailAudit はラムダ内の呼び出しを非末尾として報告するためベースラインに登録している。
+    /// </remarks>
+    let private joinProbe
+        (leftSchema: Schema)
+        (left: Op)
+        (rightSchema: Schema)
+        (leftKeys: int array)
+        (lookupRows: SqlValue array -> Result<SqlValue array array, DbError>)
+        (residual: Expr option)
+        (isLeft: bool)
+        =
+        let residualMatches
+            (leftSchema: Schema)
+            (rightSchema: Schema)
+            (residual: Expr option)
+            (lrow: SqlValue array)
+            (rrow: SqlValue array)
+            =
+            match residual with
+            | None -> ret true
+            | Some p -> Eval.matches (Schema.concat leftSchema rightSchema) (Array.append lrow rrow) p
+
+        let rightWidth = rightSchema.Columns.Length
+
+        let padded (lrow: SqlValue array) =
+            Array.append lrow (Array.create rightWidth SqlValue.Null)
+
+        let rec probe (cur: Op) =
+            Op.pull cur (fun lrow lnext ->
+                if hasNullKey lrow leftKeys then
+                    if isLeft then
+                        Op.next (Op.Compute(fun () -> ret (Some(padded lrow, probe lnext))))
+                    else
+                        Op.next (probe lnext)
+                else
+                    match lookupRows (keyOf lrow leftKeys) with
+                    | Error e -> err e
+                    | Ok rows -> Op.next (emit lrow lnext rows 0 false))
+
+        and emit (lrow: SqlValue array) (lnext: Op) (rows: SqlValue array array) (i: int) (matched: bool) =
+            if i >= rows.Length then
+                if isLeft && not matched then
+                    Op.Compute(fun () -> ret (Some(padded lrow, probe lnext)))
+                else
+                    probe lnext
+            else
+                let rrow = rows.[i]
+
+                match residualMatches leftSchema rightSchema residual lrow rrow with
+                | Error e -> Op.Compute(fun () -> err e)
+                | Ok false -> Op.Compute(fun () -> Op.next (emit lrow lnext rows (i + 1) matched))
+                | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, emit lrow lnext rows (i + 1) true)))
+
+        probe left
+
+    /// 右側のハッシュ表を作る（NULL キーは登録しない）。
+    let private buildHashTable (rightRows: SqlValue array array) (rightKeys: int array) =
+        let table =
+            System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<SqlValue array>> HashIdentity.Structural
+
+        for rrow in rightRows do
+            if not (hasNullKey rrow rightKeys) then
+                let key = keyOf rrow rightKeys
+
+                match table.TryGetValue key with
+                | true, bucket -> bucket.Add rrow
+                | _ -> table.[key] <- ResizeArray<SqlValue array>([ rrow ])
+
+        table
+
+    let private lookupHash
+        (table: System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<SqlValue array>>)
+        (key: SqlValue array)
+        =
+        match table.TryGetValue key with
+        | true, bucket -> ret (bucket.ToArray())
+        | _ -> ret [||]
+
+    /// INNER JOIN（ハッシュ結合）。右側をハッシュ表にする。
+    let innerJoinHash
+        (leftSchema: Schema)
+        (left: Op)
+        (rightSchema: Schema)
+        (right: Op)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (residual: Expr option)
+        =
+        Op.toArray right
+        |> Result.map (fun rightRows ->
+            let table = buildHashTable rightRows rightKeys
+            joinProbe leftSchema left rightSchema leftKeys (lookupHash table) residual false)
+
+    /// LEFT JOIN（ハッシュ結合）。
+    let leftJoinHash
+        (leftSchema: Schema)
+        (left: Op)
+        (rightSchema: Schema)
+        (right: Op)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (residual: Expr option)
+        =
+        Op.toArray right
+        |> Result.map (fun rightRows ->
+            let table = buildHashTable rightRows rightKeys
+            joinProbe leftSchema left rightSchema leftKeys (lookupHash table) residual true)
+
+    /// INNER JOIN（インデックス入れ子ループ）。
+    let innerJoinIndexed
+        (leftSchema: Schema)
+        (left: Op)
+        (rightSchema: Schema)
+        (leftKeys: int array)
+        (lookup: SqlValue array -> Result<Op, DbError>)
+        (residual: Expr option)
+        =
+        joinProbe leftSchema left rightSchema leftKeys (fun key -> lookup key |> Result.bind Op.toArray) residual false
+
+    /// LEFT JOIN（インデックス入れ子ループ）。
+    let leftJoinIndexed
+        (leftSchema: Schema)
+        (left: Op)
+        (rightSchema: Schema)
+        (leftKeys: int array)
+        (lookup: SqlValue array -> Result<Op, DbError>)
+        (residual: Expr option)
+        =
+        joinProbe leftSchema left rightSchema leftKeys (fun key -> lookup key |> Result.bind Op.toArray) residual true
+
+    /// 射影。
+    /// `SELECT` の項目順に値を並べる。
     /// `*` / `t.*` は対象テーブルの全列に展開する。
     /// `groupBy` は「射影の入力が集約結果」のときの GROUP BY 式。
     /// `SELECT age, COUNT(*) ... GROUP BY age` の `age` を

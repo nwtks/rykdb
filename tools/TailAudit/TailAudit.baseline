@@ -4,6 +4,8 @@ src/RykDb.Core/Ops.fs|drop|drop|call
 src/RykDb.Core/Ops.fs|joinRows|joinRows|call
 src/RykDb.Core/Ops.fs|loop|loop|call
 src/RykDb.Core/Ops.fs|map|map|call
+src/RykDb.Core/Ops.fs|probe/emit|emit|call
+src/RykDb.Core/Ops.fs|probe/emit|probe|call
 src/RykDb.Core/Ops.fs|rowsFrom|rowsFrom|call
 src/RykDb.Core/Ops.fs|seekMatch|seekMatch|call
 src/RykDb.Core/Ops.fs|skipSeen|skipSeen|call
