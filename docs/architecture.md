@@ -699,10 +699,18 @@ COMMIT
 
 `TransactionManager.activeSnapshot` は active な transaction の **最小 snapshot** を返す
 （無ければ `LastCommitSeqNo + 1`）。
-この値を各 `StorageEngine.ActiveSnapshot` に設定し、compaction の GC は「この SeqNo より古い版」だけを捨てる。
+さらに `ActiveSnapshotRegistry`（`Transactions.fs`）が、
+**同じ DB を開いている全ハンドルの active snapshot** をプロセス内で集約する。
+commit 時の GC 境界は両者の最小値で、これが各 `StorageEngine.ActiveSnapshot` に設定され、
+compaction の GC は「この SeqNo より古い版」だけを捨てる。
 replay 中は 0（全版を残す）を使う。
-ActiveSnapshot は Database ハンドル単位の `TransactionManager` から計算するため、
-別ハンドルの active transaction は考慮しない（§12.2）。
+
+登録は `Database.Begin()`（および `Execute` の暗黙・明示 transaction）で行い、
+commit 成功・rollback・`Close` で解除する。
+登録し忘れ・解除し忘れは「版を余分に残す」側に倒れるので、データを失う方向には働かない。
+トークンは `obj()` の参照等価（Core は `mutable` / `ref` を 0件に保つ規約のため、連番カウンタを使わない）。
+同じ DB を相対パスと絶対パスで開いても同じ束に入るよう `Path.GetFullPath` で正規化する。
+複数プロセスからの同時アクセスは非対応（§12.2）なので、プロセス内の表で十分。
 
 ### 7.6 .Database の transaction モデル
 
@@ -1213,8 +1221,9 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   等値キーでも列型が違う場合は入れ子ループになる。
 - **明示 transaction の状態はプロセス内のみ**（`Database` ハンドルが持つ `Manager`）。
   未コミットの書き込みは WAL に残っていても再生されない。
-- **ActiveSnapshot は単一 Database ハンドルの active transaction だけを見る**。
-  同じ DB を別ハンドルで開いて長い transaction を走らせても GC 境界には反映されない。
+- **ActiveSnapshot はプロセス内の全ハンドル分を集約する**（`ActiveSnapshotRegistry`）。
+  別ハンドルの長い transaction も GC 境界に反映される。
+  ただし複数プロセスは非対応なので、他プロセスの transaction は依然として見えない。
 - **keyspace 横断 commit は intent で回復するが、全 WAL 書込後・intent 削除前の crash ではcommit の成否が一意に決まらない**
   （replay では適用済みになる）。
   物理重複は `filterApplied` で防ぐ。

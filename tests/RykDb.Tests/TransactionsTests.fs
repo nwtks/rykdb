@@ -191,3 +191,58 @@ let ``TransactionManager.commit: abort 済み transaction の commit はエラ�
 
     // Active から消えているので内部エラーになる
     expectErrorKind ErrorKind.InternalError "abort 済みの commit" (TransactionManager.commit mgr txn)
+
+/// root の重複を避ける（xUnit はテストクラス単位で並列に走る）。
+let private freshRoot (tag: string) =
+    System.IO.Path.Combine(System.IO.Path.GetTempPath(), tag + "-" + string (System.DateTime.UtcNow.Ticks))
+
+[<Fact>]
+let ``ActiveSnapshotRegistry: root ごとに最古の active snapshot を返す`` () =
+    let root = freshRoot "reg"
+
+    let first = ActiveSnapshotRegistry.register root 10UL
+    let second = ActiveSnapshotRegistry.register root 7UL
+
+    Assert.Equal<uint64 option>(Some 7UL, ActiveSnapshotRegistry.oldestExcept None root)
+
+    // 自分自身の登録は除外できる（これから commit する transaction）
+    Assert.Equal<uint64 option>(Some 10UL, ActiveSnapshotRegistry.oldestExcept (Some second) root)
+
+    ActiveSnapshotRegistry.unregister root first
+    Assert.Equal<uint64 option>(Some 7UL, ActiveSnapshotRegistry.oldestExcept None root)
+
+    ActiveSnapshotRegistry.unregister root second
+    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept None root)
+
+[<Fact>]
+let ``ActiveSnapshotRegistry: 別 root は混ざらない`` () =
+    let root = freshRoot "reg-a"
+    let other = freshRoot "reg-b"
+
+    let a = ActiveSnapshotRegistry.register root 5UL
+    let b = ActiveSnapshotRegistry.register other 3UL
+
+    Assert.Equal<uint64 option>(Some 5UL, ActiveSnapshotRegistry.oldestExcept None root)
+    Assert.Equal<uint64 option>(Some 3UL, ActiveSnapshotRegistry.oldestExcept None other)
+
+    ActiveSnapshotRegistry.unregister root a
+    ActiveSnapshotRegistry.unregister other b
+
+    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept None root)
+    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept None other)
+
+[<Fact>]
+let ``ActiveSnapshotRegistry: 相対パスと絶対パスは同じ DB として扱う`` () =
+    let rel = "./" + System.IO.Path.GetFileName(freshRoot "reg-path")
+
+    let token = ActiveSnapshotRegistry.register rel 4UL
+
+    // GetFullPath で正規化するので、同じ DB を別表記で開いても同じ束になる
+    let full = System.IO.Path.GetFullPath rel
+
+    match ActiveSnapshotRegistry.oldestExcept None full with
+    | Some snap -> Assert.Equal(4UL, snap)
+    | None -> Assert.Fail "相対パスで登録した snapshot が引けない"
+
+    ActiveSnapshotRegistry.unregister full token
+    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept None rel)

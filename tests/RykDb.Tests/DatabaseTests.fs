@@ -1495,3 +1495,38 @@ let ``E2E: Close しなくても commit 済みの行は残る`` () =
         Assert.Equal<int64>(4L, asInt count.Rows.[0].[0])
 
         ok (reopened.Close()))
+
+[<Fact>]
+let ``Database: active transaction は snapshot registry に登録され、commit / rollback / Close で外れる`` () =
+    withDir "reg-lifecycle" (fun dir ->
+        let db = ok (Database.openWith dir)
+        let root = db.Root
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+
+        // 明示 transaction: Begin で登録、Commit で解除
+        let tx = ok (db.Begin())
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsSome)
+        let committed = ok (tx.Commit())
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+
+        // Rollback でも解除
+        let tx2 = ok (committed.Begin())
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsSome)
+        let rolledBack = ok (tx2.Rollback())
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+
+        // SQL の BEGIN / COMMIT 経由でも同じ
+        let sqlTx, _ = ok (rolledBack.Execute "BEGIN")
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsSome)
+        let sqlDone, _ = ok (sqlTx.Execute "COMMIT")
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+
+        // 暗黙 transaction は Execute の中で登録・解除が完結する
+        let withTable, _ = ok (sqlDone.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+
+        // Close でも解除される（閉じたハンドルの snapshot は誰も読めない）
+        let openTx = ok (withTable.Begin())
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsSome)
+        ok (openTx.Close())
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone))

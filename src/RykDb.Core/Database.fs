@@ -30,8 +30,15 @@ type Database internal (root: string, state: DbState) =
     /// ハンドルは不変なので「閉じた」状態をこのハンドルには記録しない。
     /// Close 後に同じハンドルで Execute すると WAL が再作成されるため、Close 後は破棄すること。
     /// 二重 Close は安全（2 回目は何もしない）。
+    /// 進行中の transaction は ActiveSnapshot の登録から外す
+    /// （閉じたハンドルの transaction はもう読めないため、版を残す理由が無い）。
     /// </remarks>
-    member _.Close() = RowStore.close state.Store
+    member _.Close() =
+        match state.ActiveRegistration with
+        | Some token -> ActiveSnapshotRegistry.unregister root token
+        | None -> ()
+
+        RowStore.close state.Store
 
     /// トランザクションを始める。
     /// 明示的な BEGIN。
@@ -41,17 +48,22 @@ type Database internal (root: string, state: DbState) =
             ret this
         else
             let mgr, txn = TransactionManager.beginTxn state.Manager
+            let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
 
-            Catalog.load state.Store
-            |> Result.map (fun fresh ->
+            match Catalog.load state.Store with
+            | Error e ->
+                ActiveSnapshotRegistry.unregister state.Root registration
+                Error e
+            | Ok fresh ->
                 let nextState =
                     { state with
                         Manager = mgr
                         Active = Some txn
                         Catalog = fresh
+                        ActiveRegistration = Some registration
                     }
 
-                Database(root, nextState))
+                Ok(Database(root, nextState))
 
     /// 実行中の transaction があるか。
     member _.InTransaction = state.Active.IsSome
@@ -72,7 +84,12 @@ type Database internal (root: string, state: DbState) =
         | None -> err (DbError.internalError "コミットする transaction がありません")
         | Some txn ->
             DbStateOps.commitTransaction state txn
-            |> Result.map (fun nextState -> Database(root, nextState))
+            |> Result.map (fun nextState ->
+                match state.ActiveRegistration with
+                | Some token -> ActiveSnapshotRegistry.unregister root token
+                | None -> ()
+
+                Database(root, nextState))
 
     /// ROLLBACK。
     /// バッファを捨てる。
@@ -82,11 +99,16 @@ type Database internal (root: string, state: DbState) =
         | Some txn ->
             let mgr = TransactionManager.abort state.Manager txn.TxnId
 
+            match state.ActiveRegistration with
+            | Some token -> ActiveSnapshotRegistry.unregister root token
+            | None -> ()
+
             let nextState =
                 { state with
                     Manager = mgr
                     Active = None
                     Pending = None
+                    ActiveRegistration = None
                 }
 
             Ok(Database(root, nextState))
@@ -112,15 +134,19 @@ type Database internal (root: string, state: DbState) =
                         runStatements st tail
                     else
                         let mgr, txn = TransactionManager.beginTxn st.Manager
+                        let registration = ActiveSnapshotRegistry.register st.Root txn.Snapshot.SeqNo
 
                         match Catalog.load st.Store with
-                        | Error e -> Error e
+                        | Error e ->
+                            ActiveSnapshotRegistry.unregister st.Root registration
+                            Error e
                         | Ok fresh ->
                             let nextState =
                                 { st with
                                     Manager = mgr
                                     Active = Some txn
                                     Catalog = fresh
+                                    ActiveRegistration = Some registration
                                 }
 
                             results.Add StatementResult.empty
@@ -144,6 +170,10 @@ type Database internal (root: string, state: DbState) =
                             match DbStateOps.commitTransaction st txn with
                             | Error e -> Error e
                             | Ok nextState ->
+                                match st.ActiveRegistration with
+                                | Some token -> ActiveSnapshotRegistry.unregister st.Root token
+                                | None -> ()
+
                                 results.Add StatementResult.empty
                                 runStatements nextState tail
                 | Statement.Rollback ->
@@ -154,11 +184,16 @@ type Database internal (root: string, state: DbState) =
                     | Some txn ->
                         let mgr = TransactionManager.abort st.Manager txn.TxnId
 
+                        match st.ActiveRegistration with
+                        | Some token -> ActiveSnapshotRegistry.unregister st.Root token
+                        | None -> ()
+
                         let nextState =
                             { st with
                                 Manager = mgr
                                 Active = None
                                 Pending = None
+                                ActiveRegistration = None
                             }
 
                         results.Add StatementResult.empty
@@ -186,6 +221,7 @@ type Database internal (root: string, state: DbState) =
                             runStatements carried tail
                     | None ->
                         let mgr, txn = TransactionManager.beginTxn st.Manager
+                        let registration = ActiveSnapshotRegistry.register st.Root txn.Snapshot.SeqNo
 
                         let needsReload =
                             match stmt with
@@ -198,16 +234,21 @@ type Database internal (root: string, state: DbState) =
                         let catalogResult = if needsReload then Catalog.load st.Store else Ok st.Catalog
 
                         match catalogResult with
-                        | Error e -> Error e
+                        | Error e ->
+                            ActiveSnapshotRegistry.unregister st.Root registration
+                            Error e
                         | Ok fresh ->
                             let startState =
                                 { st with
                                     Manager = mgr
                                     Catalog = fresh
+                                    ActiveRegistration = Some registration
                                 }
 
                             match Engine.runStatement startState txn stmt with
-                            | Error e -> Error e
+                            | Error e ->
+                                ActiveSnapshotRegistry.unregister st.Root registration
+                                Error e
                             | Ok(midState, result) ->
                                 let toCommit =
                                     match midState.Pending with
@@ -215,8 +256,11 @@ type Database internal (root: string, state: DbState) =
                                     | None -> txn
 
                                 match DbStateOps.commitTransaction midState toCommit with
-                                | Error e -> Error e
+                                | Error e ->
+                                    ActiveSnapshotRegistry.unregister st.Root registration
+                                    Error e
                                 | Ok nextState ->
+                                    ActiveSnapshotRegistry.unregister st.Root registration
                                     results.Add result
                                     runStatements nextState tail
 
@@ -289,6 +333,7 @@ type Database internal (root: string, state: DbState) =
                         Manager = manager
                         Active = None
                         Pending = None
+                        ActiveRegistration = None
                     }
                 )
         }

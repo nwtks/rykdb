@@ -44,6 +44,10 @@ type internal DbState =
         Manager: TransactionManager
         Active: Transaction option
         Pending: Transaction option
+        /// 進行中 transaction の ActiveSnapshot 登録（解除に使うトークン）。
+        /// 他のハンドルの compaction が、この snapshot より新しい版だけを残して
+        /// 古い版を捨ててしまわないようにするために登録する。
+        ActiveRegistration: obj option
     }
 
 /// Transaction を commit して DbState に反映する共通処理。
@@ -52,17 +56,33 @@ module internal DbStateOps =
     /// 戻り値は (書き込み後の Store, commit 後の Manager)。
     /// Active / Pending のような state フィールドの更新は呼び出し側で行う
     /// （backfillIndex はトランザクションを外さないため触らない）。
-    let commitToStore (store: RowStore) (mgr: TransactionManager) (txn: Transaction) =
+    /// GC 境界は「自ハンドルの active snapshot」と「同じ DB を開いている他ハンドルの active snapshot」の最小値。
+    /// 後者は `ActiveSnapshotRegistry` から集約する（`registration` は自分自身の登録で、除外する）。
+    let commitToStore
+        (root: string)
+        (registration: obj option)
+        (store: RowStore)
+        (mgr: TransactionManager)
+        (txn: Transaction)
+        =
         result {
             let! manager, _, batches = TransactionManager.commit mgr txn
-            let snapshot = TransactionManager.activeSnapshot manager
+
+            let snapshot =
+                let own = TransactionManager.activeSnapshot manager
+
+                match ActiveSnapshotRegistry.oldestExcept registration root with
+                | Some other -> min own other
+                | None -> own
+
             let! next = RowStore.writeBatchesWithSnapshot snapshot store batches
             return next, manager
         }
 
     let commitTransaction (state: DbState) (txn: Transaction) =
         result {
-            let! store, manager = commitToStore state.Store state.Manager txn
+            let! store, manager =
+                commitToStore state.Root state.ActiveRegistration state.Store state.Manager txn
 
             return
                 { state with
@@ -70,6 +90,7 @@ module internal DbStateOps =
                     Manager = manager
                     Active = None
                     Pending = None
+                    ActiveRegistration = None
                 }
         }
 
@@ -390,7 +411,8 @@ module internal Ddl =
                     let! txn2 =
                         foldOk (fun t row -> ret (Transaction.put t space (indexKeyFor row) row)) txn rows
 
-                    let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
+                    let! store, mgr2 =
+                        DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
 
                     return
                         { state with
@@ -452,7 +474,9 @@ module internal Ddl =
                 let mgr, txn = TransactionManager.beginTxn state.Manager
                 let! rows = Dml.scanByPrimaryKey state.Store withIndexes Snapshot.noLimit 0
                 let! txn2 = foldOk (fun t row -> Dml.deleteRow withIndexes t row) txn rows
-                let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
+
+                let! store, mgr2 =
+                    DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
 
                 return!
                     saved
@@ -483,7 +507,8 @@ module internal Ddl =
                 let! txn2 =
                     foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn entries
 
-                let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
+                let! store, mgr2 =
+                    DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
 
                 return!
                     saved

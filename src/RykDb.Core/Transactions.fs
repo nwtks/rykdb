@@ -256,3 +256,75 @@ module internal TransactionManager =
                     }
 
                 Ok(updated, commitSeq, batches)
+
+/// プロセス内で開いている全ハンドルの active transaction の snapshot を集約する。
+/// <remarks>
+/// GC の境界は「最古の active snapshot」なので、
+/// 同じ DB を別ハンドルで開いて長い transaction を走らせている場合も、
+/// その snapshot を考慮しないと compaction がまだ必要な版を捨ててしまう
+/// （`TransactionManager` はハンドル単位のため分からない）。
+/// 複数プロセスからの同時アクセスは非対応（architecture §12.2）なので、プロセス内の表で十分。
+/// 永続化もしない（再オープン後の transaction は存在しない）。
+/// トークンは `obj()` の参照等価。
+/// Core は `mutable` / `ref` を 0件に保つ規約なので、
+/// 連番カウンタではなく参照等価のオブジェクトを鍵にする。
+/// </remarks>
+module internal ActiveSnapshotRegistry =
+    /// 正規化した root -> (登録トークン -> snapshot)。
+    let private byRoot =
+        System.Collections.Concurrent.ConcurrentDictionary<
+            string,
+            System.Collections.Concurrent.ConcurrentDictionary<obj, uint64>
+         >
+            System.StringComparer.Ordinal
+
+    /// 同じ DB を相対パスと絶対パスで開いても同じ束に入るようにする。
+    let private keyOf (root: string) =
+        if System.String.IsNullOrEmpty root then
+            ""
+        else
+            match protect (fun () -> System.IO.Path.GetFullPath root) with
+            | Ok full -> full
+            | Error _ -> root
+
+    let private bucket (root: string) =
+        byRoot.GetOrAdd(keyOf root, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<obj, uint64>())
+
+    /// snapshot を登録し、解除に使うトークンを返す。
+    let register (root: string) (snapshot: uint64) =
+        let token = obj ()
+        (bucket root).[token] <- snapshot
+        token
+
+    /// 登録を解除する（commit 成功・rollback・Close）。
+    /// 解除し忘れても「版を余分に残す」側にしか倒れない（安全側）。
+    let unregister (root: string) (token: obj) =
+        match byRoot.TryGetValue(keyOf root) with
+        | true, inner ->
+            inner.TryRemove token |> ignore
+
+            if inner.IsEmpty then
+                byRoot.TryRemove(keyOf root) |> ignore
+        | _ -> ()
+
+    /// その root で active な snapshot の最小値。
+    /// token に自分の登録を渡すと、これから commit する transaction 自身を除外できる。
+    let oldestExcept (token: obj option) (root: string) =
+        match byRoot.TryGetValue(keyOf root) with
+        | true, inner ->
+            inner
+            |> Seq.fold
+                (fun acc pair ->
+                    let isSelf =
+                        match token with
+                        | Some t -> System.Object.ReferenceEquals(t, pair.Key)
+                        | None -> false
+
+                    if isSelf then
+                        acc
+                    else
+                        match acc with
+                        | Some current -> Some(min current pair.Value)
+                        | None -> Some pair.Value)
+                None
+        | _ -> None

@@ -316,3 +316,55 @@ let ``DML: DELETE は WHERE に合う行を消す`` () =
         let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0) |> Seq.toArray
         Assert.Equal<int>(1, rows.Length)
         Assert.Equal("bob", asText rows.[0].[1]))
+
+[<Fact>]
+let ``DbStateOps.commitToStore: 別ハンドルの active snapshot を GC 境界に使う`` () =
+    withDir "commit-boundary" (fun dir ->
+        let store = ok (RowStore.openStore dir)
+
+        // 既に SeqNo 10 まで commit 済みのハンドル（SeqNo 11 から採番する）。
+        let mgr =
+            { TransactionManager.create () with
+                LastCommitSeqNo = 10UL
+                NextSeqNo = 11UL
+            }
+
+        let mgr, txn = TransactionManager.beginTxn mgr
+        let txn = Transaction.put txn "t:a" (intKey 1) (intRow 1)
+
+        // 同じ DB を開いた別ハンドルが snapshot 5 で読み始めている状態。
+        let other = ActiveSnapshotRegistry.register dir 5UL
+
+        let committed, _ = ok (DbStateOps.commitToStore dir None store mgr txn)
+        let engine = ok (RowStore.engine committed "t:a")
+
+        // 自ハンドルだけなら 12（LastCommitSeqNo 11 + 1）だが、別ハンドルの 5 が下限になる。
+        Assert.Equal(5UL, engine.ActiveSnapshot)
+
+        ActiveSnapshotRegistry.unregister dir other
+        RowStore.close committed |> ok)
+
+[<Fact>]
+let ``DbStateOps.commitToStore: 自分の登録は GC 境界から除外する`` () =
+    withDir "commit-boundary-self" (fun dir ->
+        let store = ok (RowStore.openStore dir)
+
+        let mgr =
+            { TransactionManager.create () with
+                LastCommitSeqNo = 10UL
+                NextSeqNo = 11UL
+            }
+
+        let mgr, txn = TransactionManager.beginTxn mgr
+        let txn = Transaction.put txn "t:a" (intKey 1) (intRow 1)
+
+        // 自分（これから commit する transaction）の登録は除外し、他の登録だけを見る。
+        let own = ActiveSnapshotRegistry.register dir txn.Snapshot.SeqNo
+
+        let committed, _ = ok (DbStateOps.commitToStore dir (Some own) store mgr txn)
+        let engine = ok (RowStore.engine committed "t:a")
+
+        Assert.Equal(12UL, engine.ActiveSnapshot)
+
+        ActiveSnapshotRegistry.unregister dir own
+        RowStore.close committed |> ok)
