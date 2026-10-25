@@ -815,7 +815,8 @@ module internal Optimizer =
     /// 評価機の状態。
     /// 木を 1つ降りるか、Op が上がってきたか。
     type private ExecStep =
-        | EvalNode of Logical * Schema
+        /// 第 3要素はストレージへ降ろせる件数ヒント（Some 0 は「0行」）。
+        | EvalNode of Logical * Schema * int option
         | ApplyOp of Op
 
     let private defaultSchema (ctx: ExecContext) (name: string) =
@@ -834,13 +835,26 @@ module internal Optimizer =
         | JoinKind.Inner -> Ops.innerJoin leftSchema left rightSchema right on
         | JoinKind.Left -> Ops.leftJoin leftSchema left rightSchema right on
 
-    let private execScan (ctx: ExecContext) (name: string) (method: ScanMethod) =
-        match method with
-        | ScanMethod.SeqScan -> ExecContext.table ctx name
-        | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
-        | ScanMethod.IndexLookup(indexName, values) -> ExecContext.byIndex ctx name indexName values
-        | ScanMethod.RangeScan(_, startKey, endKey) -> ExecContext.rangeScan ctx name startKey endKey
-        | ScanMethod.IndexRangeScan(indexName, lower, upper) -> ExecContext.byIndexRange ctx name indexName lower upper
+    /// int の加算（オーバーフロー時は MaxValue に丸める）。
+    let private addClamp (a: int) (b: int) =
+        if a > System.Int32.MaxValue - b then
+            System.Int32.MaxValue
+        else
+            a + b
+
+    let private execScan (ctx: ExecContext) (name: string) (method: ScanMethod) (hint: int option) =
+        match hint with
+        | Some 0 -> ret Op.empty
+        | _ ->
+            let limit = defaultArg hint 0
+
+            match method with
+            | ScanMethod.SeqScan -> ExecContext.table ctx name limit
+            | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
+            | ScanMethod.IndexLookup(indexName, values) -> ExecContext.byIndex ctx name indexName values limit
+            | ScanMethod.RangeScan(_, startKey, endKey) -> ExecContext.rangeScan ctx name startKey endKey limit
+            | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
+                ExecContext.byIndexRange ctx name indexName lower upper limit
 
     [<TailCall>]
     let rec private stripWrappers (tree: Logical) =
@@ -891,7 +905,7 @@ module internal Optimizer =
     [<TailCall>]
     let rec private run (ctx: ExecContext) (frames: ExecFrame list) (step: ExecStep) =
         match step with
-        | EvalNode(node, inSchema) ->
+        | EvalNode(node, inSchema, hint) ->
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
                 let rightSchema = Schema.ofTable name None (defaultSchema ctx name)
@@ -916,29 +930,44 @@ module internal Optimizer =
                         RightSchema = rightSchema
                     }
 
-                run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema))
+                run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
             | Logical.Values values -> run ctx frames (ApplyOp(Op.ofRow values))
             | Logical.Scan(name, method) ->
-                match execScan ctx name method with
+                match execScan ctx name method hint with
                 | Error e -> Error e
                 | Ok op -> run ctx frames (ApplyOp op)
             | Logical.Filter(p, child) ->
                 let childSchema = outputOf child inSchema
-                run ctx (FilterFrame(p, childSchema) :: frames) (EvalNode(child, childSchema))
+                run ctx (FilterFrame(p, childSchema) :: frames) (EvalNode(child, childSchema, None))
             | Logical.Aggregate(groupBy, aggs, child) ->
-                run ctx (AggregateFrame(groupBy, aggs, inSchema) :: frames) (EvalNode(child, inSchema))
+                run ctx (AggregateFrame(groupBy, aggs, inSchema) :: frames) (EvalNode(child, inSchema, None))
             | Logical.Having(h, aggs, groupBy, child) ->
-                run ctx (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema))
-            | Logical.Distinct child -> run ctx (DistinctFrame :: frames) (EvalNode(child, inSchema))
+                run ctx (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema, None))
+            | Logical.Distinct child -> run ctx (DistinctFrame :: frames) (EvalNode(child, inSchema, None))
             | Logical.Sort(keys, child) ->
                 let childSchema = outputOf child inSchema
-                run ctx (SortFrame(keys, childSchema) :: frames) (EvalNode(child, inSchema))
+                run ctx (SortFrame(keys, childSchema) :: frames) (EvalNode(child, inSchema, None))
             | Logical.Limit(offset, limit, child) ->
-                run ctx (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema))
+                let childHint =
+                    if limit = 0 then
+                        Some 0
+                    else
+                        match limit with
+                        | l when l >= 0 ->
+                            let inner = addClamp offset l
+
+                            Some(
+                                match hint with
+                                | Some h -> min h inner
+                                | None -> inner
+                            )
+                        | _ -> hint |> Option.map (fun h -> addClamp offset h)
+
+                run ctx (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema, childHint))
             | Logical.Project(items, child) ->
                 let childSchema = outputOf child inSchema
                 let groupBy = groupByOf child
-                run ctx (ProjectFrame(items, childSchema, groupBy) :: frames) (EvalNode(child, inSchema))
+                run ctx (ProjectFrame(items, childSchema, groupBy) :: frames) (EvalNode(child, inSchema, hint))
         | ApplyOp op ->
             match frames with
             | [] -> ret op
@@ -964,7 +993,7 @@ module internal Optimizer =
                 | ProjectFrame(items, childSchema, groupBy) ->
                     run ctx rest (ApplyOp(Ops.project childSchema groupBy op items))
                 | JoinRightFrame frame ->
-                    run ctx (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema))
+                    run ctx (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
                 | JoinApplyFrame(frame, leftOp) ->
                     match execJoin frame.Kind frame.LeftSchema leftOp frame.RightSchema op frame.On with
                     | Error e -> Error e
@@ -980,7 +1009,8 @@ module internal Optimizer =
     /// 引数の `t.age` を評価できず `SUM` が Null になり、 `GROUP BY` も別の列でグループ化してしまう。
     /// childSchema は「そのノードが結果を読む側」だけが使う。
     /// </remarks>
-    let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) = run ctx [] (EvalNode(tree, schema))
+    let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
+        run ctx [] (EvalNode(tree, schema, None))
 
 module internal Plan =
     /// SELECT 文を実行して、結果（列名 + 行）を返す。

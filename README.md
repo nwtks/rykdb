@@ -124,6 +124,7 @@ Debug ビルド・単一スレッド・10万行（`INTEGER` 主キー 1列 + `IN
 
 Release ビルドではこれより速くなる。
 SSTable の reader はプロセス内で弱参照キャッシュされるため、2 回目以降の検索・走査は速い。
+`LIMIT` は単純な全走査ならストレージへ降り、先頭 `OFFSET + LIMIT` 行に必要な SSTable だけを開く。
 Bloom filter の bits/key とレベルファウト比は未調整。
 
 ---

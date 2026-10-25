@@ -584,7 +584,7 @@ module internal Dml =
         =
         let startBytes = KeyBuilder.ofValues startKey
 
-        RowStore.scanAt store (tableSpace schema) startBytes visible 0
+        RowStore.scanAt store (tableSpace schema) startBytes visible limit
         |> Result.map (fun rows ->
             let matched =
                 rows
@@ -607,10 +607,16 @@ module internal Dml =
         (txn: Transaction)
         (limit: int)
         =
-        scanByPrimaryKey store schema visible 0
+        let slots = Transaction.slotsOf txn (tableSpace schema)
+
+        let deletionCount =
+            slots |> List.filter (fun (_, value) -> value.IsNone) |> List.length
+
+        let storeLimit = if limit > 0 then limit + deletionCount else 0
+
+        scanByPrimaryKey store schema visible storeLimit
         |> Result.map (fun rows ->
-            let merged =
-                overlayRows (RowKey.primary schema) (Transaction.slotsOf txn (tableSpace schema)) rows
+            let merged = overlayRows (RowKey.primary schema) slots rows
 
             if limit > 0 then Seq.truncate limit merged else merged)
 
@@ -624,10 +630,27 @@ module internal Dml =
         (endKey: SqlValue array option)
         (limit: int)
         =
-        scanByPrimaryKeyRange store schema visible startKey endKey 0
+        let startBytes = KeyBuilder.ofValues startKey
+        let endBytes = endKey |> Option.map KeyBuilder.ofValues
+
+        let inRange (key: byte array) =
+            Bytes.compare key startBytes >= 0
+            && (match endBytes with
+                | None -> true
+                | Some eb -> Bytes.compare key eb <= 0)
+
+        let slots =
+            Transaction.slotsOf txn (tableSpace schema)
+            |> List.filter (fun (key, _) -> inRange key)
+
+        let deletionCount =
+            slots |> List.filter (fun (_, value) -> value.IsNone) |> List.length
+
+        let storeLimit = if limit > 0 then limit + deletionCount else 0
+
+        scanByPrimaryKeyRange store schema visible startKey endKey storeLimit
         |> Result.map (fun rows ->
-            let merged =
-                overlayRows (RowKey.primary schema) (Transaction.slotsOf txn (tableSpace schema)) rows
+            let merged = overlayRows (RowKey.primary schema) slots rows
 
             let filtered =
                 match endKey with
@@ -714,7 +737,7 @@ module internal Dml =
 
         let ks = indexSpace index
 
-        RowStore.scanAt store ks loBytes visible 0
+        RowStore.scanAt store ks loBytes visible limit
         |> Result.map (fun rows ->
             let matched = rows |> Seq.filter (fun (k, _) -> inRange k) |> Seq.choose snd
             if limit > 0 then Seq.truncate limit matched else matched)

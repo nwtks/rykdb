@@ -333,7 +333,7 @@ let private twoFilesWithBrokenSecond (dir: string) =
     f1, f2
 
 [<Fact>]
-let ``StorageEngine.scanAt: limit つきでも壊れたファイルを検出する`` () =
+let ``StorageEngine.scanAt: limit 1 は後続の壊れたファイルを開かない`` () =
     withDir "se-lazy-open" (fun dir ->
         withEngine dir (fun engine ->
             let f1, f2 = twoFilesWithBrokenSecond dir
@@ -343,12 +343,16 @@ let ``StorageEngine.scanAt: limit つきでも壊れたファイルを検出す�
                     Version = Version.empty |> Version.addFile f1 |> Version.addFile f2
                 }
 
-            // limit で打ち切られる走査でも、候補ファイルは先に開く。
-            // 開けなかったファイルを「空」と見なすと、Ok のまま行が欠ける。
+            // 先頭 1行はファイル 10 だけで足りる。ファイル 11 の下限はキー 3 なので開かない。
+            let scanned = ok (StorageEngine.scanAt engine None (intKey 1) 1) |> Seq.toArray
+            Assert.Equal(1, scanned.Length)
+            Assert.Equal(0, Bytes.compare scanned.[0].Key (intKey 1))
+
+            // 全 4行が必要ならファイル 11 を開くので、壊れていることを検出できる。
             expectErrorKind
                 ErrorKind.CorruptionError
-                "limit つきでも壊れたファイルを検出する"
-                (StorageEngine.scanAt engine None (intKey 1) 1)))
+                "必要なファイルの破損は検出する"
+                (StorageEngine.scanAt engine None (intKey 1) 10)))
 
 [<Fact>]
 let ``StorageEngine.scanAt: 制限なしの走査は壊れたファイルを先に検出する`` () =
@@ -366,7 +370,7 @@ let ``StorageEngine.scanAt: 制限なしの走査は壊れたファイルを先�
             expectErrorKind ErrorKind.CorruptionError "制限なしの走査は壊れたファイルを検出する" (StorageEngine.scanAt engine None [||] 0)))
 
 [<Fact>]
-let ``StorageEngine.scanAt: limit つき走査でも欠落ファイルは先に検出する`` () =
+let ``StorageEngine.scanAt: 欠落ファイルは必要になった時点で検出する`` () =
     withDir "se-missing-open" (fun dir ->
         withEngine dir (fun engine ->
             let f1, f2 = twoFilesWithBrokenSecond dir
@@ -377,10 +381,12 @@ let ``StorageEngine.scanAt: limit つき走査でも欠落ファイルは先に�
                     Version = Version.empty |> Version.addFile f1 |> Version.addFile f2
                 }
 
-            expectErrorKind
-                ErrorKind.IoError
-                "欠落ファイルは limit つき走査でも検出する"
-                (StorageEngine.scanAt engine None (intKey 1) 1)))
+            // limit 1 はファイル 11 を必要としないので、欠落していても先頭 1 行は返せる。
+            let scanned = ok (StorageEngine.scanAt engine None (intKey 1) 1) |> Seq.toArray
+            Assert.Equal(1, scanned.Length)
+
+            // 全行が必要ならファイル 11 を開こうとして IoError になる。
+            expectErrorKind ErrorKind.IoError "欠落ファイルは必要になれば検出する" (StorageEngine.scanAt engine None (intKey 1) 10)))
 
 [<Fact>]
 let ``StorageEngine: flush すると SSTable から引ける`` () =

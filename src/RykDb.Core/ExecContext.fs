@@ -59,20 +59,27 @@ module internal ExecContext =
                 | None -> err (sprintf "テーブル '%s' が存在しません" name |> DbError.name)
 
     /// テーブルを全走査する（主キー昇順 = 挿入順ではないが LSM のキー順）。
-    let table (ctx: ExecContext) (table: string) =
+    /// limit > 0 なら先頭 limit 件だけをストレージから引く。
+    let table (ctx: ExecContext) (table: string) (limit: int) =
         result {
             let! schema = schemaOf ctx table
-            let! rows = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible ctx.Txn 0
+            let! rows = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible ctx.Txn limit
             return Op.ofSeq rows
         }
 
     /// 主キーの範囲走査。
-    let rangeScan (ctx: ExecContext) (table: string) (startKey: SqlValue array) (endKey: SqlValue array option) =
+    let rangeScan
+        (ctx: ExecContext)
+        (table: string)
+        (startKey: SqlValue array)
+        (endKey: SqlValue array option)
+        (limit: int)
+        =
         result {
             let! schema = schemaOf ctx table
 
             let! rows =
-                Dml.scanByPrimaryKeyRangeWithTxn ctx.Store schema ctx.Visible ctx.Txn startKey endKey 0
+                Dml.scanByPrimaryKeyRangeWithTxn ctx.Store schema ctx.Visible ctx.Txn startKey endKey limit
 
             return Op.ofSeq rows
         }
@@ -80,7 +87,7 @@ module internal ExecContext =
     /// 索引で一致する全行を引く。
     /// 索引は一意とは限らないので、`WHERE indexed_col = v` が 1行になるとは限らない。
     /// `v` を持つ行をすべて返す。
-    let byIndex (ctx: ExecContext) (table: string) (indexName: string) (keyValues: SqlValue array) =
+    let byIndex (ctx: ExecContext) (table: string) (indexName: string) (keyValues: SqlValue array) (limit: int) =
         result {
             let! schema = schemaOf ctx table
 
@@ -88,14 +95,7 @@ module internal ExecContext =
             | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
             | Some idx ->
                 let! rows =
-                    Dml.scanByIndexPrefixWithTxn
-                        ctx.Store
-                        schema
-                        idx
-                        ctx.Visible
-                        ctx.Txn
-                        keyValues
-                        System.Int32.MaxValue
+                    Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible ctx.Txn keyValues limit
 
                 return Op.ofSeq rows
         }
@@ -107,6 +107,7 @@ module internal ExecContext =
         (indexName: string)
         (lower: SqlValue array)
         (upper: SqlValue array option)
+        (limit: int)
         =
         result {
             let! schema = schemaOf ctx table
@@ -115,15 +116,7 @@ module internal ExecContext =
             | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
             | Some idx ->
                 let! rows =
-                    Dml.scanByIndexRangeWithTxn
-                        ctx.Store
-                        schema
-                        idx
-                        ctx.Visible
-                        ctx.Txn
-                        lower
-                        upper
-                        System.Int32.MaxValue
+                    Dml.scanByIndexRangeWithTxn ctx.Store schema idx ctx.Visible ctx.Txn lower upper limit
 
                 return Op.ofSeq rows
         }

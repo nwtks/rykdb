@@ -475,7 +475,10 @@ NULL 同士は等しい扱い）で行う。
   `ExecContext.byPrimaryKey` = `Dml.getByPrimaryKey`（ポイント検索、無ければ空 Op）。
   `ExecContext.byIndex` = `Dml.scanByIndexPrefix`（索引の prefix 走査。非一意索引でも全行を返す）。
 - **スキャンは結果を配列で受け取る**（遅延イテレータではない）。
-  Op としては 1行ずつ流れるので `LIMIT` は後段を早期に打ち切れるが、ストレージの読み出しはスキャン生成時に終わっている（§12.2）。
+  `Optimizer` は `Limit` の件数ヒント（`OFFSET + LIMIT`）を `Project` だけ通して `Scan` へ降ろす。
+  `ExecContext.table` / `rangeScan` / `byIndex` / `byIndexRange` はこれを `Dml` → `RowStore` → `StorageEngine.scanAt` まで渡す。
+  `Filter` / `Sort` / `Aggregate` / `Distinct` / `Join` は行数を変える（または順序を作る）ためヒントを落とす。
+  limit > 0 の `scanAt` は必要なファイルだけを開いて先頭 limit 件を返す（§8.2）。
 
 #### 集約・ソート・射影の内部
 
@@ -814,6 +817,15 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 ファイル番号は単調増加で中身は書き換わらないため安全に共有でき、GC が回収できるのでメモリを圧迫しない）。
 同じファイルの 2 回目以降の検索・走査はファイル全体の再読み込みとチェックサムを省略できる。
 （不変 engine は読み取り中に状態を持てないため、キャッシュはモジュール内のサイドテーブル）。
+
+`scanAt` は `limit > 0` のとき `collectLimited` を使う。
+これは未オープンのファイルをキー下限順に必要になった時点で開き、
+可視・最新・非 tombstone のエントリを `limit` 件集めたら止まる
+（未オープンのファイルの下限は最後に返したキーより大きいので、先頭 `limit` 件には寄与しない）。
+limit に達する前に開封・ブロック解析のエラーがあれば `Error` を返す。
+`limit <= 0`（全件走査）は従来どおり全ファイルを開いてチェックサムを検証してから遅延 merge する。
+そのため、limit で到達しない後続ファイルの破損・欠落はそのクエリでは検出されない
+（`openDatabase` は MaxSeqNo 復元で全 SSTable を読むので、起動時には検出される）。
 
 走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
 `rangeScan` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ

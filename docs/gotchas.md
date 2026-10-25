@@ -1188,3 +1188,18 @@ DDL を transaction に載せる設計に変えるまでは、この制約を維
 （NULL は NULL 同士で等しい）。
 `COUNT(DISTINCT)` は `Set<SqlValue>`。
 `SqlLiteral` による文字列化は表示専用で、行ごとのホットパスでは使わない。
+
+### 11.24 limit 付き scan は後続の SSTable を開かない
+
+`StorageEngine.scanAt` は `limit > 0` のとき `collectLimited` で
+**必要になったファイルだけ**を開き、`limit` 件に達したら止まる。
+そのため、limit で到達しない後続 SSTable の破損・欠落はそのクエリでは検出されない
+（全件走査 / `limit = 0` は全ファイルを開いて検出する）。
+これは「先頭 limit 件に寄与しないファイルは読まない」という最適化の副作用。
+`openDatabase` は MaxSeqNo 復元のために全 SSTable を読むので、起動時には検出される。
+
+### 11.25 LIMIT pushdown は Filter / Sort / Aggregate を越えない
+
+`Optimizer` は `Limit` の件数ヒント（`OFFSET + LIMIT`）を `Project` だけ通して `Scan` に降ろす。
+`Filter` / `Sort` / `Aggregate` / `Distinct` / `Join` は行数を変える（または順序を作る）ため、
+ヒントを落として全件走査に戻す。`WHERE` 付きの `LIMIT` は pushdown されない。

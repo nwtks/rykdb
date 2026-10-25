@@ -176,10 +176,19 @@ module internal StorageEngine =
 
     /// k-way merge のソース。
     type private MergeSource =
+        /// 未オープンのファイル。byte array はそのファイルが返し得る最小キーの下限。
+        | Unopened of byte array * FileMetaData
         /// オープン済み（先頭エントリと残りの走査）。
         | Opened of SstEntry * SstScan
         /// 空。
         | Drained
+
+    /// ファイルが返し得る最小キーの下限（rangeScan は startKey 以降を返す）。
+    let private sourceBound (startKey: byte array) (f: FileMetaData) =
+        if Bytes.compare f.Smallest startKey > 0 then
+            f.Smallest
+        else
+            startKey
 
     /// seq を SstScan へ変換する（列挙は要求されたときに行われる）。
     /// pull は SstScan.emit へ「次を要求されたときに呼ぶ値」として渡すだけなので
@@ -211,6 +220,7 @@ module internal StorageEngine =
                         pick (i + 1) (Some(i, e, scan)) tail
                     else
                         pick (i + 1) best tail
+            | Unopened _ :: tail
             | Drained :: tail -> pick (i + 1) best tail
 
         let rec loop rest value (k: int) (revPrefix: MergeSource list) (tail: MergeSource list) =
@@ -265,10 +275,121 @@ module internal StorageEngine =
                 next ())
             (src.GetEnumerator(), None)
 
+    /// 先頭 limit 件の「可視・最新・非 tombstone」エントリを集める。
+    /// 必要になったファイルだけを開き、limit に達したら残りは開かない
+    /// （未オープンのファイルの下限は最後に返したキーより大きいので、先頭 limit 件には寄与しない）。
+    /// limit に達する前に開封・ブロック解析のエラーがあれば Error を返す。
+    let private collectLimited
+        (engine: StorageEngine)
+        (visible: uint64 option)
+        (startKey: byte array)
+        (limit: int)
+        (sources: MergeSource list)
+        =
+        let rec pickOpened (i: int) (best: (int * SstEntry * SstScan) option) (rest: MergeSource list) =
+            match rest with
+            | [] -> best
+            | Opened(e, scan) :: tail ->
+                match best with
+                | None -> pickOpened (i + 1) (Some(i, e, scan)) tail
+                | Some(_, be, _) ->
+                    if SstEntry.compare e be < 0 then
+                        pickOpened (i + 1) (Some(i, e, scan)) tail
+                    else
+                        pickOpened (i + 1) best tail
+            | Unopened _ :: tail
+            | Drained :: tail -> pickOpened (i + 1) best tail
+
+        let rec pickUnopened (i: int) (best: (int * byte array * FileMetaData) option) (rest: MergeSource list) =
+            match rest with
+            | [] -> best
+            | Unopened(bound, f) :: tail ->
+                match best with
+                | None -> pickUnopened (i + 1) (Some(i, bound, f)) tail
+                | Some(_, bestBound, _) ->
+                    if Bytes.compare bound bestBound < 0 then
+                        pickUnopened (i + 1) (Some(i, bound, f)) tail
+                    else
+                        pickUnopened (i + 1) best tail
+            | _ :: tail -> pickUnopened (i + 1) best tail
+
+        let replaceAt (i: int) (value: MergeSource) (list: MergeSource list) =
+            let rec loop (k: int) (revPrefix: MergeSource list) (rest: MergeSource list) =
+                match rest with
+                | [] -> list
+                | s :: tail ->
+                    if k = 0 then
+                        List.append (List.rev revPrefix) (value :: tail)
+                    else
+                        loop (k - 1) (s :: revPrefix) tail
+
+            loop i [] list
+
+        let openAt (i: int) (f: FileMetaData) (state: MergeSource list) =
+            match openSstable engine f with
+            | Error e -> Error e
+            | Ok reader ->
+                match SstScan.next (Sstable.rangeScan reader startKey 0) with
+                | Error e -> Error e
+                | Ok None -> Ok(replaceAt i Drained state)
+                | Ok(Some(e, nxt)) -> Ok(replaceAt i (Opened(e, nxt)) state)
+
+        let rec prepare (state: MergeSource list) =
+            match pickOpened 0 None state, pickUnopened 0 None state with
+            | None, None -> Ok state
+            | None, Some(i, _, f) ->
+                match openAt i f state with
+                | Error e -> Error e
+                | Ok state' -> prepare state'
+            | Some(_, e, _), Some(i, bound, f) when Bytes.compare bound e.Key <= 0 ->
+                match openAt i f state with
+                | Error e -> Error e
+                | Ok state' -> prepare state'
+            | Some _, _ -> Ok state
+
+        let rec collect (state: MergeSource list) (emittedKey: byte array option) (count: int) (acc: SstEntry list) =
+            if count >= limit then
+                Ok(List.rev acc)
+            else
+                match prepare state with
+                | Error e -> Error e
+                | Ok state ->
+                    match pickOpened 0 None state with
+                    | None -> Ok(List.rev acc)
+                    | Some(i, e, rest) ->
+                        match SstScan.next rest with
+                        | Error err -> Error err
+                        | Ok next ->
+                            let nextSource =
+                                match next with
+                                | None -> Drained
+                                | Some(e2, nxt) -> Opened(e2, nxt)
+
+                            let state' = replaceAt i nextSource state
+
+                            let sameKey =
+                                match emittedKey with
+                                | Some k -> Bytes.compare k e.Key = 0
+                                | None -> false
+
+                            if sameKey || not (isVisible visible e) then
+                                collect state' emittedKey count acc
+                            else
+                                let appended = e.Value.IsSome
+
+                                collect
+                                    state'
+                                    (Some e.Key)
+                                    (if appended then count + 1 else count)
+                                    (if appended then e :: acc else acc)
+
+        collect sources None 0 []
+
     /// 範囲ルックアップ。
     /// キー昇順で返す（同一キーは 1件だけ）。
     /// visible が Some s のときは SeqNo が s 以下の版を返す。
-    /// 遅延 pull で merge し、limit 件で早期打ち切りする。
+    /// limit > 0 のときは必要なファイルだけを開いて先頭 limit 件を返す。
+    /// limit <= 0 のときは全ファイルを開いてチェックサムを検証してから遅延 merge する。
     let scanAt (engine: StorageEngine) (visible: uint64 option) (startKey: byte array) (limit: int) =
         let sstFiles =
             Version.allFiles engine.Version
@@ -285,9 +406,7 @@ module internal StorageEngine =
             | _ -> Drained
 
         let finalize (merged: seq<SstEntry>) =
-            let deduped = collapseDuplicatesLazy visible merged
-            let live = Seq.filter (fun e -> e.Value.IsSome) deduped
-            if limit > 0 then Seq.truncate limit live else live
+            collapseDuplicatesLazy visible merged |> Seq.filter (fun e -> e.Value.IsSome)
 
         let rec openAll (rest: FileMetaData list) (acc: MergeSource list) =
             match rest with
@@ -301,8 +420,15 @@ module internal StorageEngine =
                     | Ok None -> openAll tail (Drained :: acc)
                     | Ok(Some(e, nxt)) -> openAll tail (Opened(e, nxt) :: acc)
 
-        openAll sstFiles []
-        |> Result.map (fun sources -> finalize (lazyMergeScan (memSource :: sources)))
+        if limit > 0 then
+            let fileSources =
+                sstFiles |> List.map (fun f -> Unopened(sourceBound startKey f, f))
+
+            collectLimited engine visible startKey limit (memSource :: fileSources)
+            |> Result.map Seq.ofList
+        else
+            openAll sstFiles []
+            |> Result.map (fun sources -> finalize (lazyMergeScan (memSource :: sources)))
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、

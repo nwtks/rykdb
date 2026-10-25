@@ -262,6 +262,44 @@ let ``Database: 複合索引の全列等値で行を引ける`` () =
         Assert.Equal<int>(2, prefix.Rows.Length))
 
 [<Fact>]
+let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
+    withDir "limit-pushdown" (fun dir ->
+        // 2回に分けて Close し、テーブル t の SSTable を 2 個作る。
+        let db0 = ok (Database.openWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
+        ok (db2.Close())
+
+        let db3 = ok (Database.openWith dir)
+        let db4 = exec db3 "INSERT INTO t VALUES (3), (4)"
+        ok (db4.Close())
+
+        // openDatabase は MaxSeqNo の復元で全 SSTable を読むため、open 後に壊す。
+        let db5 = ok (Database.openWith dir)
+
+        // テーブル t の最新 SSTable（キー 3,4）を壊す。
+        let tableDir = System.IO.Path.Combine(dir, Keyspace.toDirName (Keyspace.table "t"))
+
+        let newest =
+            System.IO.Directory.GetFiles(tableDir, "*.sst")
+            |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
+
+        let bytes = System.IO.File.ReadAllBytes newest
+        bytes.[0] <- bytes.[0] ^^^ 0xFFuy
+        System.IO.File.WriteAllBytes(newest, bytes)
+        System.IO.File.SetLastWriteTimeUtc(newest, System.DateTime.UtcNow.AddSeconds 1.0)
+
+        // LIMIT 1 は先頭 1行だけなので、キー 3 以降の壊れた SSTable を開かない。
+        let _, one = ok (db5.Query "SELECT id FROM t LIMIT 1")
+        Assert.Equal<int>(1, one.Rows.Length)
+        Assert.Equal<int64>(1L, asInt one.Rows.[0].[0])
+
+        // 全行が必要なら壊れた SSTable を開くので CorruptionError。
+        expectErrorKind ErrorKind.CorruptionError "LIMIT 10 は壊れた SSTable を開く" (db5.Query "SELECT id FROM t LIMIT 10")
+
+        ok (db5.Close()))
+
+[<Fact>]
 let ``Database: VARCHAR(32) は再オープン後も使える`` () =
     withDir "varchar-reopen" (fun dir ->
         let db0 = ok (Database.openWith dir)

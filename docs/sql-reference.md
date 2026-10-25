@@ -590,7 +590,11 @@ SELECT p.id, d.dname
   `OFFSET` → `LIMIT` の順で適用される。
 - `LIMIT` だけの形か `LIMIT n OFFSET m` の形だけ書ける
   （`OFFSET` 単独は不可）。
-- `LIMIT 0` は「0 行」を返す。
+- `LIMIT 0` は「0 行」を返す（スキャン自体を実行しない）。
+- **単純な全走査**（`WHERE` / `ORDER BY` / `GROUP BY` / `DISTINCT` / 結合なし）では、
+  `OFFSET + LIMIT` の件数をストレージへ降ろす。
+  ストレージは先頭 `OFFSET + LIMIT` 行だけをデコードし、必要になるまで後続の SSTable を開かない。
+  `WHERE` など行数を変える演算子がある場合は全件走査のまま（ヒントを降ろさない）。
 
 ```sql
 SELECT id FROM people ORDER BY id LIMIT 2;            -- 先頭 2 行

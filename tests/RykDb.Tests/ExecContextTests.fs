@@ -80,7 +80,7 @@ let ``ExecContext.table: 登録スキーマで全走査`` () =
     withStore "ec-table" (fun store ->
         let c0 = ExecContext.create store Snapshot.noLimit
         let c1 = ExecContext.withSchema c0 "people" peopleSchema
-        let op = ok (ExecContext.table c1 "people")
+        let op = ok (ExecContext.table c1 "people" 0)
         let rows = ok (Op.toArray op)
         Assert.Equal(0, rows.Length))
 
@@ -89,7 +89,7 @@ let ``ExecContext.byIndex: 未登録テーブルは NameError`` () =
     withStore "ec-byindex-miss-table" (fun store ->
         let c0 = ExecContext.create store Snapshot.noLimit
 
-        match ExecContext.byIndex c0 "nope" "ix" [| SqlValue.Int 1L |] with
+        match ExecContext.byIndex c0 "nope" "ix" [| SqlValue.Int 1L |] 0 with
         | Error e -> Assert.Equal(ErrorKind.NameError, e.Kind)
         | Ok _ -> Assert.Fail "NameError になるべき")
 
@@ -99,7 +99,7 @@ let ``ExecContext.byIndex: 未登録索引は NameError`` () =
         let c0 = ExecContext.create store Snapshot.noLimit
         let c1 = ExecContext.withSchema c0 "people" peopleSchema
 
-        match ExecContext.byIndex c1 "people" "nope" [| SqlValue.Int 1L |] with
+        match ExecContext.byIndex c1 "people" "nope" [| SqlValue.Int 1L |] 0 with
         | Error e -> Assert.Equal(ErrorKind.NameError, e.Kind)
         | Ok _ -> Assert.Fail "NameError になるべき")
 
@@ -108,7 +108,10 @@ let ``ExecContext.byIndex: 空の store は空の Op`` () =
     withStore "ec-byindex-empty" (fun store ->
         let c0 = ExecContext.create store Snapshot.noLimit
         let c1 = ExecContext.withSchema c0 "people" TestHelpers.peopleSchema
-        let op = ok (ExecContext.byIndex c1 "people" "ix_people_age" [| SqlValue.Int 1L |])
+
+        let op =
+            ok (ExecContext.byIndex c1 "people" "ix_people_age" [| SqlValue.Int 1L |] 0)
+
         let rows = ok (Op.toArray op)
         Assert.Equal(0, rows.Length))
 
