@@ -13,7 +13,7 @@ let private sstEntries n =
     Array.init n (fun i -> SstEntry.make (intKey i) (uint64 (i + 1)) (Some [| SqlValue.Int(int64 i) |]))
     |> Array.sortWith SstEntry.compare
 
-/// Footer 末尾の 4バイト（先頭 80バイトのチェックサム）を付け直す。
+/// Footer 末尾の 4バイト（先頭 FooterSize-4 バイトのチェックサム）を付け直す。
 let private fixFooterChecksum (bytes: byte array) =
     let footerStart = bytes.Length - Sstable.FooterSize
 
@@ -114,6 +114,26 @@ let ``SstEntry.mergeSorted: ソート済みにマージ`` () =
     // キー昇順
     for i in 1 .. keys.Length - 1 do
         Assert.True(SstEntry.compare merged.[i - 1] merged.[i] <= 0)
+
+[<Fact>]
+let ``SstEntry.mergeSorted: 多数のソースをまとめてマージできる`` () =
+    // 左偏ヒープは右スパインを明示スタックで降りてから組み直す。
+    // ソース数を増やし、再帰版と同じ順序・件数になることを固定する。
+    let sources =
+        [ 1..64 ]
+        |> List.map (fun i ->
+            [|
+                SstEntry.make (intKey (i * 2)) 1UL None
+                SstEntry.make (intKey (i * 2 + 128)) 1UL None
+            |])
+
+    let merged = SstEntry.mergeSorted sources
+    let expected = [ 2..2..128 ] @ [ 130..2..256 ]
+
+    Assert.Equal(expected.Length, merged.Length)
+
+    expected
+    |> List.iteri (fun i n -> Assert.True(intKey n = merged.[i].Key, sprintf "位置 %d が %d ではありません" i n))
 
 [<Fact>]
 let ``SstEntry.maxSeqNo: 最大 SeqNo を返す`` () =
@@ -290,7 +310,7 @@ let ``Sstable.openTable: マジック不一致は CorruptionError`` () =
 let ``Sstable.openTable: 未対応バージョンは CorruptionError`` () =
     let data = ok (Sstable.build (sstEntries 3) 0.01)
     let bad = Array.copy data
-    bad.[bad.Length - Sstable.FooterSize + 8] <- 4uy
+    bad.[bad.Length - Sstable.FooterSize + 8] <- 5uy
     fixFooterChecksum bad
     expectErrorKind ErrorKind.CorruptionError "未対応バージョンはエラーになるはず" (Sstable.openTable bad)
 
@@ -328,6 +348,22 @@ let ``Sstable.openTable: Footer に満たないデータは CorruptionError`` ()
     expectErrorKind ErrorKind.CorruptionError "短すぎるデータはエラー" (Sstable.openTable (Array.create 10 0uy))
 
 [<Fact>]
+let ``Sstable.openTable: v3 Footer を読み取れる`` () =
+    let data = ok (Sstable.build (sstEntries 3) 0.01)
+    let footerStartV4 = data.Length - Sstable.FooterSize
+    let legacyFooter = Array.sub data footerStartV4 80
+    legacyFooter.[8] <- 3uy
+
+    let legacyChecksum = Hashing.checksumRange legacyFooter 0 80
+
+    let footer =
+        Writer.build [ Writer.writeBytes legacyFooter; Writer.uint32LE legacyChecksum ]
+
+    let legacyData = Array.concat [ Array.sub data 0 footerStartV4; footer ]
+    let reader = ok (Sstable.openTable legacyData)
+    Assert.Equal<int64>(3L, reader.EntryCount)
+
+[<Fact>]
 let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開ける`` () =
     // 1個目の長さ付きキーは読めるが 2個目が途中で切れている meta 領域
     let body = [| 0x01uy; 0x61uy |]
@@ -336,7 +372,7 @@ let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開�
         Writer.build
             [
                 Writer.writeBytes (System.Text.Encoding.ASCII.GetBytes "RykDbSST")
-                Writer.uint32LE 3u
+                Writer.uint32LE 4u
                 Writer.int64LE 0L
                 Writer.int64LE 0L
                 Writer.int64LE 0L
@@ -346,6 +382,7 @@ let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開�
                 Writer.int64LE 2L
                 Writer.int64LE 0L
                 Writer.uint32LE (Hashing.checksum body)
+                Writer.uint32LE (Hashing.checksum [||])
             ]
 
     let footerChecksum = Hashing.checksum footerBody
@@ -374,6 +411,23 @@ let ``Sstable.openPartial: Footer のチェックサム不一致は CorruptionEr
         System.IO.File.WriteAllBytes(path, bad)
         expectErrorKind ErrorKind.CorruptionError "部分読みでも Footer の破損を検出する" (Sstable.openPartial path)
         expectErrorKind ErrorKind.CorruptionError "全体読みでも Footer の破損を検出する" (Sstable.openTable bad))
+
+[<Fact>]
+let ``Sstable.openPartial: Bloom メタデータの破損は checksum で検出`` () =
+    withDir "sst-partial-meta-checksum" (fun dir ->
+        let data = ok (Sstable.build (sstEntries 100) 0.01)
+        let path = System.IO.Path.Combine(dir, "1.sst")
+        let footerStart = data.Length - Sstable.FooterSize
+
+        let bloomOffset =
+            [ 0..7 ]
+            |> List.fold (fun acc i -> acc ||| (int64 data.[footerStart + 36 + i] <<< (i * 8))) 0L
+            |> int
+
+        data.[bloomOffset] <- data.[bloomOffset] ^^^ 0x01uy
+        System.IO.File.WriteAllBytes(path, data)
+
+        expectErrorKind ErrorKind.CorruptionError "部分読みで Bloom の改変を見逃さない" (Sstable.openPartial path))
 
 [<Fact>]
 let ``Sstable.openPartial: 全件・limit・lookup が全読みと一致する`` () =

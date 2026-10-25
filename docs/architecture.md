@@ -115,7 +115,7 @@ flowchart TB
 | ---------- | ------------------------------------------------------------------------------------ | --------------------------------------------------- |
 | ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                          | §8                                                  |
 | memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                       | §8.1                                                |
-| SSTable    | ブロック + **restart 配列 + 接頭辞共有** + Bloom filter + Footer 84 バイト           | §8.2                                                |
+| SSTable    | ブロック + **restart 配列 + 接頭辞共有** + Bloom filter + Footer v4（88 バイト）     | §8.2                                                |
 | 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                | §8.4–8.5                                            |
 | GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                | §8.6                                                |
 | 並行制御   | **ロックレス**: 不変ハンドル + **MVCC（Snapshot Isolation）** + first-committer-wins | §7                                                  |
@@ -796,7 +796,7 @@ Treap は根から再構築するのでこの問題は構造的に発生しな�
 [Meta block]        min_key / max_key（長さ付き）
 [Bloom filter]
 [Index block]       ブロックごとに (最終キー, オフセット, 長さ)
-[Footer 84 bytes]   各セクションの位置・長さ・エントリ数・チェックサム（+ Footer チェックサム）
+[Footer v4 88 bytes] 各セクションの位置・長さ・エントリ数・全体/メタデータ/Footer チェックサム
 ```
 
 各ブロックは LevelDB 風の restart 配列を持つ。
@@ -829,7 +829,7 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | Bloom filter           | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。読む側は `Sstable.mayContain`                                               |
 | ポイント検索の順路     | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                                    |
 
-ファイルは `Sstable.build` が組み立てる。読み出しは 2通りある。
+ファイルは `Sstable.build` が v4 形式を組み立てる。読み出しは 2通りあり、既存 v3 形式も読み取れる。
 
 - **部分読み**（`Sstable.openPartial`）: Footer / meta / Bloom / index だけを読み、
   `SstPartial`（パス + インデックス）を返す。データブロックは `rangeScanPartial` /
@@ -855,13 +855,18 @@ v2 の各ブロックは末尾に 4バイトのチェックサム、v3 の Foote
 `openDatabase` は `FileMetaData.MaxSeqNo` から NextSeqNo を復元するため、
 起動時に SSTable のデータブロックを読まない。
 
-`scanAt` は `limit > 0` のとき `collectLimited` を使う。
-これは未オープンのファイルをキー下限順に必要になった時点で開き（部分読み）、
-可視・最新・非 tombstone のエントリを `limit` 件集めたら止まる
+`scanAt` は未オープンのファイルを「返し得る最小キー」の昇順キューに持ち、
+ヒープの最小キー以下になった時点で 1ファイルずつ開く（部分読み）。
+開く順序を守らないとキー順が崩れるため、`limit` の有無にかかわらず必要になったら必ず開く。
+ヒープは最初に 1回だけ組み、以降は「取り出したソースの続きを積み直す」だけなので、
+1行あたりのコストは O(log ファイル数)（行ごとにソース列から作り直さない）。
+
+`limit > 0` は可視・最新・非 tombstone のエントリを `limit` 件集めたら止まる
 （未オープンのファイルの下限は最後に返したキーより大きいので、先頭 `limit` 件には寄与しない）。
 limit に達する前に開封・ブロック解析のエラーがあれば `Error` を返す。
-`limit <= 0`（全件走査）は全ファイルを開いて全体チェックサムを検証してから遅延 merge する。
-そのため、limit で到達しない後続ファイル・ブロックの破損・欠落はそのクエリでは検出されない。
+`limit <= 0`（全件走査）は最後まで読むので全ファイルを開くが、
+開くのは merge がその範囲に到達した時点であり、最初に一括では読まない。
+そのため、`limit` で到達しない後続ファイル・ブロックの破損・欠落はそのクエリでは検出されない。
 
 走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
 `rangeScan` / `rangeScanPartial` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ
@@ -931,11 +936,11 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 [payloadLength:u32LE][checksum:u32LE(FNV-1a)][payload]
 ```
 
-- `payloadLength` が残りバイト数を超える → 書きかけ（torn write）なので打ち切る
-- `checksum` が一致しない → 書きかけなので打ち切る
+- ヘッダー／payload が末尾で不完全 → 書きかけ（torn write）なので打ち切る
+- 完全なフレームの checksum 不一致、未知タグ、payload 破損 → `CorruptionError`
 
-追記は「最後に完了する」性質があるので、壊れたレコードの後ろは読まなくてよい。
-途中でクラッシュしても open できる理由はここ。
+追記は「最後に完了する」性質があるため、末尾の不完全なフレームは無視できる。
+完全なフレームの破損は末尾の torn write と区別できず、データ欠落を隠すため open を失敗させる。
 
 - **1トランザクション分（Begin + Batch + Commit）を 1 回の `append` でまとめて書き**、`Flush(true)` でディスクまで落とす。
   Begin / Commit が中途半端に分かれない。
@@ -1193,17 +1198,17 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **`scan` は結果を全部メモリに載せて返す**
   （`SstScan` は遅延だが、SQL レベルの `scan` は merge のために実体化する）。
 - **ソート・集約・DISTINCT もメモリに実体化**する。spilling する外部マージは未実装。
-- **範囲走査は単一列の主キー / 単一列索引に限る**（下限のある条件のみ）。
+- **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件に限る**（下限のある条件のみ）。
   `>` / `<` / `BETWEEN` / `LIKE` のうち、`LIKE` は索引を要求しない。
-  複合索引の Leftmost prefix は考慮しない。
+- **`CREATE UNIQUE INDEX` は backfill 中も既存行の重複を検査する**。
 - **`CREATE INDEX` の backfill は排他を取らない**。
 - **複数プロセスからの同時アクセスは非対応**（1プロセス前提。ロックファイルを作成しない）。
 - **TCP サーバは接続ごとに逐次処理で、ハンドルは接続間で引き継がれる**（§11.3）。
   明示 transaction の途中で切れた場合は rollback してから次の接続へ渡す。
 - **同一 `Database` ハンドルを複数スレッドで使うと書き込みが失われる**（状態はマージされない。§7.7）。
   並行利用はスレッドごとにハンドルを分ける。
-- **MVCC の版は compaction を跨ぐまでは圧縮も再利用もされない**
-  （GC は `SeqNo < ActiveSnapshot` の版を捨てるだけ。ファイル単位では判定しない）。
+- **MVCC の版は compaction まで圧縮・再利用されない**
+  （GC は最古の active snapshot から見えない版を捨てる。ファイル単位では判定しない）。
 - 結合アルゴリズムは `ON` の等値キーと左の見積りで自動選択する（§5.1）。
   等値キーでも列型が違う場合は入れ子ループになる。
 - **明示 transaction の状態はプロセス内のみ**（`Database` ハンドルが持つ `Manager`）。

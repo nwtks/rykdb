@@ -108,7 +108,6 @@ module internal SstEntry =
         chunk 0 0 0L []
 
     /// 「キー昇順・同一キーは SeqNo 降順」で並んだ列たちを k-way merge する。
-    /// ソース数は高々 1 + ファイル数なので、head を線形に走査しても十分速い。
     type private MergeHead =
         {
             Id: int
@@ -116,43 +115,64 @@ module internal SstEntry =
             Index: int
         }
 
+    type private MergeHeap =
+        | Empty
+        | Node of int * MergeHead * MergeHeap * MergeHeap
+
     let mergeSorted (sources: SstEntry array list) =
-        let replaceAt (i: int) (value: MergeHead) (heads: MergeHead list) =
-            let rec loop (k: int) (revPrefix: MergeHead list) (rest: MergeHead list) =
-                match rest with
-                | [] -> heads
-                | h :: tail ->
-                    if k = 0 then
-                        List.append (List.rev revPrefix) (value :: tail)
-                    else
-                        loop (k - 1) (h :: revPrefix) tail
+        let compareEntries (a: SstEntry) (b: SstEntry) =
+            match Bytes.compare a.Key b.Key with
+            | 0 -> Operators.compare b.SeqNo a.SeqNo
+            | order -> order
 
-            loop i [] heads
+        let compareHead (a: MergeHead) (b: MergeHead) =
+            match compareEntries a.Items.[a.Index] b.Items.[b.Index] with
+            | 0 -> Operators.compare a.Id b.Id
+            | c -> c
 
-        let rec pick (best: MergeHead option) (heads: MergeHead list) =
-            match heads with
-            | [] -> best
-            | h :: tail ->
-                if h.Index >= h.Items.Length then
-                    pick best tail
-                else
-                    match best with
-                    | None -> pick (Some h) tail
-                    | Some b ->
-                        if compare h.Items.[h.Index] b.Items.[b.Index] < 0 then
-                            pick (Some h) tail
-                        else
-                            pick best tail
+        let rank =
+            function
+            | Empty -> 0
+            | Node(r, _, _, _) -> r
 
-        let rec merge (heads: MergeHead list) (acc: SstEntry list) =
-            match pick None heads with
-            | None -> List.rev acc |> Array.ofList
-            | Some h ->
+        let makeNode head left right =
+            if rank left >= rank right then
+                Node(rank right + 1, head, left, right)
+            else
+                Node(rank left + 1, head, right, left)
+
+        let rec descend (picked: (MergeHead * MergeHeap) list) (a: MergeHeap) (b: MergeHeap) =
+            match a, b with
+            | Empty, heap
+            | heap, Empty -> picked, heap
+            | Node(_, ha, _, _), Node(_, hb, _, _) when compareHead ha hb > 0 -> descend picked b a
+            | Node(_, ha, left, right), _ -> descend ((ha, left) :: picked) right b
+
+        let mergeHeap (first: MergeHeap) (second: MergeHeap) =
+            let picked, rest = descend [] first second
+            List.fold (fun acc (head, left) -> makeNode head left acc) rest picked
+
+        let rec merge (acc: SstEntry list) =
+            function
+            | Empty -> List.rev acc |> Array.ofList
+            | Node(_, h, left, right) ->
                 let e = h.Items.[h.Index]
                 let advanced = { h with Index = h.Index + 1 }
-                merge (replaceAt h.Id advanced heads) (e :: acc)
+                let rest = mergeHeap left right
 
-        merge (sources |> List.mapi (fun i a -> { Id = i; Items = a; Index = 0 })) []
+                let nextHeap =
+                    if advanced.Index < advanced.Items.Length then
+                        mergeHeap rest (Node(1, advanced, Empty, Empty))
+                    else
+                        rest
+
+                merge (e :: acc) nextHeap
+
+        sources
+        |> List.mapi (fun i items -> { Id = i; Items = items; Index = 0 })
+        |> List.filter (fun head -> head.Items.Length > 0)
+        |> List.fold (fun heap head -> mergeHeap heap (Node(1, head, Empty, Empty))) Empty
+        |> merge []
 
     /// エントリ列に含まれる SeqNo の最大値（空なら 0）。
     let maxSeqNo (items: SstEntry seq) =
@@ -246,10 +266,6 @@ type internal SstPartial =
     }
 
 module internal Sstable =
-    /// Footer の固定長（本体 80 + Footer チェックサム 4）。
-    [<Literal>]
-    let internal FooterSize = 84
-
     /// 1ブロックあたりのエントリ数。
     [<Literal>]
     let private EntriesPerBlock = 128
@@ -267,13 +283,28 @@ module internal Sstable =
 
     /// 書き出すファイルのバージョン。
     /// v2 は各ブロックの末尾に 4バイトのチェックサム、
-    /// v3 は Footer 自身のチェックサムを持つ。
+    /// v3 は Footer 自身のチェックサム、v4 は部分読みメタデータのチェックサムを持つ。
     [<Literal>]
-    let private Version = 3
+    let private Version = 4
 
-    /// 読み取り可能な最小バージョン（v3 未満は Footer 長が異なるため読まない）。
+    /// v3 と v4 を読み取る。v3 は全体 checksum でメタデータを検証する。
     [<Literal>]
     let private MinReadableVersion = 3
+
+    /// 最新 Footer の固定長（本体 84 + Footer チェックサム 4）。
+    [<Literal>]
+    let internal FooterSize = 88
+
+    [<Literal>]
+    let private FooterSizeV3 = 84
+
+    /// v4 Footer で footerChecksum がカバーするバイト数（metadataChecksum フィールド込み）。
+    [<Literal>]
+    let private FooterChecksumLengthV4 = 84
+
+    /// v3 Footer で footerChecksum がカバーするバイト数（metadataChecksum フィールドなし）。
+    [<Literal>]
+    let private FooterChecksumLengthV3 = 80
 
     /// Cursor から終端まで 1件ずつ読み出して配列にまとめる。
     /// step は「読むたびに変わる状態」（キーの接頭辞共有など）を
@@ -297,9 +328,9 @@ module internal Sstable =
     // Footer
     //   magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8)
     //   bloomOff(8) bloomLen(8) metaOff(8) metaLen(8) entryCount(8)
-    //   checksum(4) footerChecksum(4)
-    //   = 8 + 4 + 8 * 8 + 4 + 4 = 84バイト（FooterSize と一致させる）
-    // footerChecksum は先頭 80バイト（checksum を含む）のチェックサム。
+    //   checksum(4) metadataChecksum(4) footerChecksum(4)
+    //   = 8 + 4 + 8 * 8 + 4 + 4 + 4 = 88バイト（FooterSize と一致させる）
+    // footerChecksum は先頭 84バイト（checksum と metadataChecksum を含む）のチェックサム。
     // 部分読みではこのフッターだけを検証できる。
     //
     // maxSeqNo は GC のために必要。
@@ -317,6 +348,9 @@ module internal Sstable =
         (metaLen: int)
         (entryCount: int)
         =
+        let metadataChecksum =
+            Hashing.checksumRange data metaOff (indexOff + indexLen - metaOff)
+
         let body =
             Writer.build
                 [
@@ -331,9 +365,9 @@ module internal Sstable =
                     Writer.int64LE (int64 metaLen)
                     Writer.int64LE (int64 entryCount)
                     Writer.uint32LE (Hashing.checksum data)
+                    Writer.uint32LE metadataChecksum
                 ]
 
-        // Footer 自身のチェックサム（先頭 80バイト対象）。
         let footerChecksum = Hashing.checksum body
 
         let withChecksum =
@@ -353,6 +387,7 @@ module internal Sstable =
             MetaOff: int
             MetaLen: int
             EntryCount: int
+            MetadataChecksum: uint32 option
         }
 
     let private readFooterFields (footerBytes: byte array) =
@@ -369,9 +404,22 @@ module internal Sstable =
             let! metaLen, c = Reader.readInt64LE c
             let! entryCount, c = Reader.readInt64LE c
             let! stored, c = Reader.readUInt32LE c
+
+            let! metadataChecksum, c =
+                if version >= 4u then
+                    Reader.readUInt32LE c |> Result.map (fun (sum, next) -> Some sum, next)
+                else
+                    ret (None, c)
+
             let! footerChecksum, _ = Reader.readUInt32LE c
 
-            if Hashing.checksumRange footerBytes 0 (FooterSize - 4) <> footerChecksum then
+            let checksumLength =
+                if version >= 4u then
+                    FooterChecksumLengthV4
+                else
+                    FooterChecksumLengthV3
+
+            if Hashing.checksumRange footerBytes 0 checksumLength <> footerChecksum then
                 return! err (DbError.corruption "Sstable: Footer のチェックサム不一致")
             else
                 let fitsInt (v: int64) =
@@ -401,6 +449,7 @@ module internal Sstable =
                             MetaOff = int metaOff
                             MetaLen = int metaLen
                             EntryCount = int entryCount
+                            MetadataChecksum = metadataChecksum
                         },
                         stored
         }
@@ -421,13 +470,24 @@ module internal Sstable =
             ret info
 
     let private decodeFooter (data: byte array) =
-        let footerStart = data.Length - FooterSize
+        let footerBytesAt size =
+            let start = data.Length - size
 
-        if footerStart < 0 then
-            err (DbError.corruption "Sstable: Footer がありません")
-        else
-            let footerBytes = Array.sub data footerStart FooterSize
+            if start < 0 then
+                None
+            else
+                let bytes = Array.sub data start size
 
+                if System.Text.Encoding.ASCII.GetString(bytes, 0, Magic.Length) = Magic then
+                    Some(start, bytes)
+                else
+                    None
+
+        let parsed = [ FooterSize; FooterSizeV3 ] |> List.tryPick footerBytesAt
+
+        match parsed with
+        | None -> err (DbError.corruption "Sstable: Footer がありません")
+        | Some(footerStart, footerBytes) ->
             match readFooterFields footerBytes with
             | Error e -> Error e
             | Ok(magic, _, info, stored) ->
@@ -438,11 +498,6 @@ module internal Sstable =
                         err (DbError.corruption "Sstable: チェックサム不一致（ファイルが壊れています）")
                     else
                         ret info
-
-    let private parseFooterBytes (footerBytes: byte array) (footerStart: int64) =
-        match readFooterFields footerBytes with
-        | Error e -> Error e
-        | Ok(magic, _, info, _) -> validateFooter info magic footerStart
 
     /// エントリ列から SSTable のバイナリを作る。
     /// 入力はキー昇順・同一キーは SeqNo 降順に並んでいる必要がある（検証する）。
@@ -658,14 +713,35 @@ module internal Sstable =
                 stream.ReadExactly(buffer, 0, length)
                 buffer
 
-        let readAll (stream: System.IO.FileStream) =
-            let footerStart = stream.Length - int64 FooterSize
+        let readFooter (stream: System.IO.FileStream) size =
+            let start = stream.Length - int64 size
 
-            if footerStart < 0L then
-                Error(DbError.corruption "Sstable: Footer がありません")
+            if start < 0L then
+                None
             else
-                let footerBytes = readRegion stream footerStart FooterSize
+                let bytes = readRegion stream start size
 
+                if System.Text.Encoding.ASCII.GetString(bytes, 0, Magic.Length) = Magic then
+                    Some(start, bytes)
+                else
+                    None
+
+        let parseFooterBytes (footerBytes: byte array) (footerStart: int64) =
+            match readFooterFields footerBytes with
+            | Error e -> Error e
+            | Ok(magic, _, info, _) -> validateFooter info magic footerStart
+
+        let metadataChecksum (metaBytes: byte array) (bloomBytes: byte array) (indexBytes: byte array) =
+            Hashing.checksum (Array.concat [| metaBytes; bloomBytes; indexBytes |])
+
+        let readAll (stream: System.IO.FileStream) =
+            let parsed =
+                readFooter stream FooterSize
+                |> Option.orElseWith (fun () -> readFooter stream FooterSizeV3)
+
+            match parsed with
+            | None -> Error(DbError.corruption "Sstable: Footer がありません")
+            | Some(footerStart, footerBytes) ->
                 match parseFooterBytes footerBytes footerStart with
                 | Error e -> Error e
                 | Ok footer ->
@@ -677,6 +753,11 @@ module internal Sstable =
                     result {
                         let! bloom = readBloomBytes bloomBytes
                         let! indexEntries = parseIndexBytes indexBytes
+
+                        match footer.MetadataChecksum with
+                        | Some expected when metadataChecksum metaBytes bloomBytes indexBytes <> expected ->
+                            return! err (DbError.corruption "Sstable: 部分読みメタデータのチェックサム不一致")
+                        | _ -> ()
 
                         return
                             {
@@ -837,17 +918,22 @@ module internal Sstable =
 
         let parseRawBlock (i: int) (raw: byte array) (startOffset: int) =
             let ie = partial.Index.[i]
-            let data = Array.sub raw (ie.Offset - startOffset) ie.Length
+            let relativeOffset = ie.Offset - startOffset
 
-            parseBlock partial.HasBlockChecksums data
-            |> Result.bind (fun entries ->
-                if
-                    entries.Length = 0
-                    || Bytes.compare entries.[entries.Length - 1].Key ie.LastKey <> 0
-                then
-                    err (DbError.corruption "Sstable: 索引の LastKey とブロックが一致しません")
-                else
-                    ret entries)
+            if relativeOffset < 0 || ie.Length < 0 || relativeOffset > raw.Length - ie.Length then
+                err (DbError.corruption "Sstable: 索引範囲が読み込みブロックの範囲外です")
+            else
+                let data = Array.sub raw relativeOffset ie.Length
+
+                parseBlock partial.HasBlockChecksums data
+                |> Result.bind (fun entries ->
+                    if
+                        entries.Length = 0
+                        || Bytes.compare entries.[entries.Length - 1].Key ie.LastKey <> 0
+                    then
+                        err (DbError.corruption "Sstable: 索引の LastKey とブロックが一致しません")
+                    else
+                        ret entries)
 
         let rec scanEntries
             (raw: byte array)

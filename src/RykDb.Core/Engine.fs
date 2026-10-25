@@ -127,9 +127,11 @@ module internal DmlOps =
     /// 埋まっていない位置は fallback に委ねる
     /// （INSERT は DEFAULT / NULL、UPDATE は元の値）。
     let private scatter (width: int) (filled: (int * SqlValue) list) (fallback: int -> SqlValue) =
+        let values = Map.ofList filled
+
         Array.init width (fun i ->
-            match filled |> List.tryFind (fun (j, _) -> j = i) with
-            | Some(_, v) -> v
+            match Map.tryFind i values with
+            | Some v -> v
             | None -> fallback i)
 
     /// INSERT。
@@ -343,6 +345,27 @@ module internal Ddl =
             }
 
     let createIndex (state: DbState) (ci: CreateIndex) =
+        let duplicateUniqueValues (schema: TableSchema) (index: IndexSchema) (rows: SqlValue array seq) =
+            let indexColumns =
+                index.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
+
+            match indexColumns with
+            | Error e -> Error e
+            | Ok positions ->
+                rows
+                |> Seq.fold
+                    (fun result row ->
+                        result
+                        >>= fun seen ->
+                            let key =
+                                positions |> List.map (fun position -> row.[position]) |> KeyBuilder.ofValues
+
+                            if Set.contains key seen then
+                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" index.Name))
+                            else
+                                ret (Set.add key seen))
+                    (ret Set.empty)
+
         let backfillIndex (state: DbState) (tableName: string) (idx: IndexSchema) =
             match Catalog.findTable state.Catalog tableName with
             | None -> ret state
@@ -357,20 +380,15 @@ module internal Ddl =
 
                     let space = Keyspace.index idx.Name
                     let mgr, txn = TransactionManager.beginTxn state.Manager
-                    let! existing = RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
-
-                    let! txn1 =
-                        foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn existing
-
                     let! rows = Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
+                    let indexKeyFor row = RowKey.indexKey withIndex idx row
+
+                    if idx.Unique then
+                        let! _ = duplicateUniqueValues withIndex idx rows
+                        ()
 
                     let! txn2 =
-                        foldOk
-                            (fun t row ->
-                                let key = RowKey.indexKey withIndex idx row
-                                ret (Transaction.put t space key row))
-                            txn1
-                            rows
+                        foldOk (fun t row -> ret (Transaction.put t space (indexKeyFor row) row)) txn rows
 
                     let! store, mgr2 = DbStateOps.commitToStore state.Store mgr txn2
 

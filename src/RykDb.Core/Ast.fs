@@ -209,18 +209,18 @@ module internal Expr =
 
     /// 葉の書き換え関数で式を組み直す（末尾再帰。式の深さに依存せずスタックは一定）。
     let rewrite (rewriteLeaf: Expr -> Expr) (root: Expr) =
-        let miss (kids: Expr list) =
+        let miss kids =
             err (
                 sprintf "plugChildren: 子の個数が合いません（%d 個）" (List.length kids)
                 |> DbError.internalError
             )
 
-        let rec toPairs (rest: Expr list) (acc: (Expr * Expr) list) =
-            match rest with
-            | w :: t :: tail -> toPairs tail ((w, t) :: acc)
+        let rec toPairs acc =
+            function
+            | w :: t :: tail -> toPairs ((w, t) :: acc) tail
             | _ -> List.rev acc
 
-        let plugChildren (e: Expr) (kids: Expr list) =
+        let plugChildren kids e =
             if List.length kids <> List.length (children e) then
                 miss kids
             else
@@ -238,23 +238,23 @@ module internal Expr =
                 | Expr.Like(_, _, neg), [ x; p ] -> ret (Expr.Like(x, p, neg))
                 | Expr.Case(_, elseE), _ ->
                     match elseE, List.rev kids with
-                    | None, _ -> ret (Expr.Case(toPairs kids [], None))
-                    | Some _, last :: branchRev -> ret (Expr.Case(toPairs (List.rev branchRev) [], Some last))
+                    | None, _ -> ret (Expr.Case(toPairs [] kids, None))
+                    | Some _, last :: branchRev -> ret (Expr.Case(toPairs [] (List.rev branchRev), Some last))
                     | Some _, [] -> miss kids
                 | Expr.FuncCall(n, _), xs -> ret (Expr.FuncCall(n, xs))
                 | Expr.AggCall(f, star, _), [ x ] -> ret (Expr.AggCall(f, star, x))
                 | _ -> miss kids
 
-        let rec rewriteLoop (rewriteLeaf: Expr -> Expr) (frames: RewriteFrame list) =
+        let rec rewriteLoop frames =
             function
             | Visit x ->
                 let x2 = rewriteLeaf x
 
                 match children x2 with
-                | [] -> rewriteLoop rewriteLeaf frames (Arrive x2)
+                | [] -> rewriteLoop frames (Arrive x2)
                 | c :: rest ->
                     let frame = { Parent = x2; Done = []; Rest = rest }
-                    rewriteLoop rewriteLeaf (frame :: frames) (Visit c)
+                    rewriteLoop (frame :: frames) (Visit c)
             | Arrive v ->
                 match frames with
                 | [] -> ret v
@@ -267,13 +267,13 @@ module internal Expr =
                                 Rest = rest
                             }
 
-                        rewriteLoop rewriteLeaf (next :: more) (Visit c)
+                        rewriteLoop (next :: more) (Visit c)
                     | [] ->
-                        match plugChildren frame.Parent (List.rev (v :: frame.Done)) with
+                        match plugChildren (v :: frame.Done |> List.rev) frame.Parent with
                         | Error er -> Error er
-                        | Ok parent -> rewriteLoop rewriteLeaf more (Arrive parent)
+                        | Ok parent -> rewriteLoop more (Arrive parent)
 
-        rewriteLoop rewriteLeaf [] (Visit root)
+        rewriteLoop [] (Visit root)
 
     /// 式木を明示スタックで pre-order にたどり、各ノードについて状態を畳み込む。
     /// 走査順は「根 → 子を左から右へ」。
@@ -283,16 +283,14 @@ module internal Expr =
             | [] -> acc
             | x :: rest -> revInto (x :: acc) rest
 
-        let pushAll (xs: 'a list) (stack: 'a list) = revInto stack xs
-
-        let rec foldStack (stack: Expr list) acc =
-            match stack with
+        let rec foldStack acc =
+            function
             | [] -> acc
             | e :: rest ->
                 let acc2 = f acc e
-                foldStack (pushAll (List.rev (children e)) rest) acc2
+                children e |> List.rev |> revInto rest |> foldStack acc2
 
-        foldStack [ root ] state
+        foldStack state [ root ]
 
     /// 式中のすべての列参照を列挙する。
     /// 束縛と空き列判定に使う。
@@ -336,11 +334,11 @@ module internal Expr =
     let toDisplayString (e: Expr) =
         let sb = System.Text.StringBuilder()
         let put (s: string) = sb.Append s |> ignore
-        let text (s: string) = Text s
-        let sub (x: Expr) (closer: PrintStep list) = Sub(x, closer)
+        let text s = Text s
+        let sub x closer = Sub(x, closer)
 
-        let rec writeSteps (steps: PrintStep list) =
-            match steps with
+        let rec writeSteps =
+            function
             | [] -> ()
             | Text s :: rest ->
                 put s
@@ -369,22 +367,25 @@ module internal Expr =
                     put "("
                     put op.Display
                     put " "
-                    writeSteps (sub x [ text ")" ] :: next)
+                    sub x [ text ")" ] :: next |> writeSteps
                 | Expr.Binary(op, a, b) ->
                     put "("
-                    writeSteps (sub a [ text " "; text op.Display; text " " ] :: sub b [ text ")" ] :: next)
+
+                    sub a [ text " "; text op.Display; text " " ] :: sub b [ text ")" ] :: next
+                    |> writeSteps
                 | Expr.IsNull(x, neg) ->
                     put "("
-                    writeSteps (sub x [ text (if neg then " IS NOT NULL)" else " IS NULL)") ] :: next)
+
+                    sub x [ text (if neg then " IS NOT NULL)" else " IS NULL)") ] :: next
+                    |> writeSteps
                 | Expr.Between(x, a, b, neg) ->
                     put "("
 
-                    writeSteps (
-                        sub x [ text (if neg then " NOT BETWEEN " else " BETWEEN ") ]
-                        :: sub a [ text " AND " ]
-                        :: sub b [ text ")" ]
-                        :: next
-                    )
+                    sub x [ text (if neg then " NOT BETWEEN " else " BETWEEN ") ]
+                    :: sub a [ text " AND " ]
+                    :: sub b [ text ")" ]
+                    :: next
+                    |> writeSteps
                 | Expr.InList(x, xs, neg) ->
                     put "("
                     let n = List.length xs
@@ -392,15 +393,15 @@ module internal Expr =
                     let items =
                         xs |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then "))" else ", ") ])
 
-                    writeSteps (sub x [ text (if neg then " NOT IN (" else " IN (") ] :: (items @ next))
+                    sub x [ text (if neg then " NOT IN (" else " IN (") ] :: (items @ next)
+                    |> writeSteps
                 | Expr.Like(x, p, neg) ->
                     put "("
 
-                    writeSteps (
-                        sub x [ text (if neg then " NOT LIKE " else " LIKE ") ]
-                        :: sub p [ text ")" ]
-                        :: next
-                    )
+                    sub x [ text (if neg then " NOT LIKE " else " LIKE ") ]
+                    :: sub p [ text ")" ]
+                    :: next
+                    |> writeSteps
                 | Expr.Case(branches, elseE) ->
                     put "(CASE "
 
@@ -413,16 +414,16 @@ module internal Expr =
                         | Some v -> [ text "ELSE "; sub v [ text " " ] ]
                         | None -> []
 
-                    writeSteps ((branchSteps @ elseSteps @ [ text "END)" ]) @ next)
+                    (branchSteps @ elseSteps @ [ text "END)" ]) @ next |> writeSteps
                 | Expr.FuncCall(n, args) ->
                     put n
                     put "("
-                    let n = List.length args
+                    let n' = List.length args
 
                     let items =
-                        args |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then ")" else ", ") ])
+                        args |> List.mapi (fun i y -> sub y [ text (if i = n' - 1 then ")" else ", ") ])
 
-                    writeSteps (items @ next)
+                    items @ next |> writeSteps
                 | Expr.AggCall(f, distinct, x) ->
                     put f.Name
                     put "("
@@ -430,7 +431,7 @@ module internal Expr =
                     if distinct then
                         put "DISTINCT "
 
-                    writeSteps (sub x [ text ")" ] :: next)
+                    sub x [ text ")" ] :: next |> writeSteps
 
         writeSteps [ Sub(e, []) ]
         sb.ToString()

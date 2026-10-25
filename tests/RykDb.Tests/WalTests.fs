@@ -24,7 +24,7 @@ let private commitRecords (txnId: uint64) (entries: Entry array) =
 
 /// ディスクを介さずにレコード列を往復させる。
 let private roundTrip (records: WalRecord list) =
-    records |> Wal.encodeFrames |> Wal.decodeFrames |> Wal.committedEntries
+    records |> Wal.encodeFrames |> Wal.decodeFrames |> ok |> Wal.committedEntries
 
 [<Fact>]
 let ``Wal: 往復する`` () =
@@ -56,11 +56,35 @@ let ``Wal.decodeFrames: 書きかけレコードは読み飛ばす`` () =
             [| 0x10uy; 0x00uy; 0x00uy; 0x00uy; 0xFFuy; 0xFFuy; 0xFFuy; 0xFFuy |]
 
     // 壊れたレコードは打ち切られるが、それまでのものは読める
-    let recovered = data |> Wal.decodeFrames |> Wal.committedEntries
+    let recovered = data |> Wal.decodeFrames |> ok |> Wal.committedEntries
     Assert.Equal(1, recovered.Length)
 
 [<Fact>]
-let ``Wal.decodeFrames: チェックサム不一致は打ち切る`` () =
+let ``Wal.decodeFrames: 不完全な payload の後ろにあるフレームを復旧しない`` () =
+    let goodTail =
+        Wal.encodeFrames (commitRecords 2UL [| Entry.put (intKey 2) 2UL (intRow 2) |])
+
+    let tornHeader =
+        Writer.build
+            [
+                Writer.uint32LE 100u
+                Writer.uint32LE 0u
+                Writer.writeBytes [| 1uy; 2uy; 3uy |]
+            ]
+
+    let data =
+        Array.concat
+            [
+                Wal.encodeFrames (commitRecords 1UL [| Entry.put (intKey 1) 1UL (intRow 1) |])
+                tornHeader
+                goodTail
+            ]
+
+    let recovered = ok (Wal.decodeFrames data) |> Wal.committedEntries
+    Assert.Equal<uint64 array>([| 1UL |], recovered |> Array.map _.SeqNo)
+
+[<Fact>]
+let ``Wal.decodeFrames: 完全なフレームのチェックサム不一致は破損`` () =
     let first = [| Entry.put (intKey 1) 1UL (intRow 1) |]
     let second = [| Entry.put (intKey 2) 2UL (intRow 2) |]
 
@@ -70,12 +94,11 @@ let ``Wal.decodeFrames: チェックサム不一致は打ち切る`` () =
 
     let data = Array.append (Wal.encodeFrames (commitRecords 1UL first)) secondFrame
 
-    // 壊れた 2つ目で打ち切られ、1つ目だけ残る
-    let recovered = data |> Wal.decodeFrames |> Wal.committedEntries
-    Assert.Equal(1, recovered.Length)
+    // 完全なフレームの checksum 不一致は torn tail と区別して返す
+    expectErrorKind ErrorKind.CorruptionError "完全な壊れたフレームは破損" (Wal.decodeFrames data)
 
 [<Fact>]
-let ``Wal.decodeFrames: 不明なレコード種別は打ち切る`` () =
+let ``Wal.decodeFrames: 不明なレコード種別は破損`` () =
     let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
 
     // フレームとしては正しい（長さも checksum も合っている）が、種別が未知
@@ -91,9 +114,8 @@ let ``Wal.decodeFrames: 不明なレコード種別は打ち切る`` () =
 
     let data = Array.append (Wal.encodeFrames (commitRecords 1UL entries)) frame
 
-    // 不明レコードで打ち切られ、それまでの 1 件は読める
-    let recovered = data |> Wal.decodeFrames |> Wal.committedEntries
-    Assert.Equal(1, recovered.Length)
+    // 完全で checksum の正しい未知レコードは破損
+    expectErrorKind ErrorKind.CorruptionError "未知レコードは破損" (Wal.decodeFrames data)
 
 [<Fact>]
 let ``Wal.decodeFrames: 長さが Int32 を超えるフレームは打ち切る`` () =
@@ -105,7 +127,7 @@ let ``Wal.decodeFrames: 長さが Int32 を超えるフレームは打ち切る`
             (Wal.encodeFrames (commitRecords 1UL entries))
             [| 0xFFuy; 0xFFuy; 0xFFuy; 0xFFuy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
 
-    let recovered = data |> Wal.decodeFrames |> Wal.committedEntries
+    let recovered = data |> Wal.decodeFrames |> ok |> Wal.committedEntries
     Assert.Equal(1, recovered.Length)
 
 [<Fact>]

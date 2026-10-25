@@ -198,7 +198,7 @@ let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` 
     |> ignore
 
     try
-        // 空行 → 空の 1 行が返る
+        // 空行 → 有効な空結果応答
         use raw = new TcpClient("127.0.0.1", port)
         let stream = raw.GetStream()
         use writer = new StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
@@ -206,7 +206,7 @@ let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` 
         writer.AutoFlush <- true
 
         writer.WriteLine ""
-        Assert.Equal<string>("", reader.ReadLine())
+        Assert.Equal<string>("OK 0", reader.ReadLine())
 
         writer.WriteLine ".ping"
         Assert.Equal<string>("OK 0\tpong", reader.ReadLine())
@@ -333,22 +333,22 @@ let private withFakeServer (respond: string -> string option) (f: int -> unit) =
         task.Wait 5000 |> ignore
 
 [<Fact>]
-let ``Client: タグだけの OK は空の結果`` () =
+let ``Client: 不正な短い OK は Failure`` () =
     withFakeServer (fun _ -> Some "OK") (fun port ->
         use c = new RykDbClient("127.0.0.1", port)
 
         match c.Query "x" with
-        | Rows([], []) -> ()
-        | other -> Assert.Fail(sprintf "空の Rows ではない: %A" other))
+        | Failure _ -> ()
+        | other -> Assert.Fail(sprintf "Failure ではない: %A" other))
 
 [<Fact>]
-let ``Client: 件数が数値でなければ 0 行`` () =
+let ``Client: 不正な件数は Failure`` () =
     withFakeServer (fun _ -> Some "OK abc\tcol") (fun port ->
         use c = new RykDbClient("127.0.0.1", port)
 
         match c.Query "x" with
-        | Rows([ "col" ], []) -> ()
-        | other -> Assert.Fail(sprintf "列だけの Rows ではない: %A" other))
+        | Failure _ -> ()
+        | other -> Assert.Fail(sprintf "Failure ではない: %A" other))
 
 [<Fact>]
 let ``Client: 応答の列と行を読む`` () =

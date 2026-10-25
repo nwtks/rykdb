@@ -113,12 +113,21 @@ module internal Wal =
                         return r, c3
             }
 
-        let rec readFrames (c: Cursor) (acc: WalRecord list) =
-            match readFrame c with
-            | Error _ -> List.rev acc
-            | Ok(r, c') -> readFrames c' (r :: acc)
+        let rec decodeAt (c: Cursor) (acc: WalRecord list) =
+            if Cursor.atEnd c then
+                ret (List.rev acc)
+            elif Cursor.remaining c < 8 then
+                ret (List.rev acc)
+            else
+                match Reader.readUInt32LE c with
+                | Error e -> Error e
+                | Ok(length, _) when uint64 length > uint64 (Cursor.remaining c - 8) -> ret (List.rev acc)
+                | _ ->
+                    match readFrame c with
+                    | Error e -> Error e
+                    | Ok(record, next) -> decodeAt next (record :: acc)
 
-        readFrames (Cursor.create data) []
+        decodeAt (Cursor.create data) []
 
     let committedEntries (records: WalRecord list) =
         let rec selectCommitted (recs: WalRecord list) (pending: (uint64 * Entry array) list) (acc: Entry list) =
@@ -169,13 +178,16 @@ module internal Wal =
 
     /// WAL ファイルを読み、コミット済みエントリを返す。
     let read (dir: string) (fileNumber: int64) =
-        protect (fun () ->
-            let p = path dir fileNumber
+        let p = path dir fileNumber
 
-            if System.IO.File.Exists p then
-                System.IO.File.ReadAllBytes p |> decodeFrames |> committedEntries
+        protect (fun () -> System.IO.File.Exists p)
+        >>= fun exists ->
+            if exists then
+                protect (fun () -> System.IO.File.ReadAllBytes p)
+                >>= decodeFrames
+                |> Result.map committedEntries
             else
-                [||])
+                ret [||]
 
     /// ディレクトリ内の WAL ファイル名（復旧時に孤児を消すのに使う）。
     let walFiles (dir: string) =

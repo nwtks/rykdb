@@ -41,20 +41,20 @@ module internal BloomFilter =
 
     /// キー列から filter を構築する（ハッシュはキーから導出）。
     let ofKeys (keys: byte array seq) (expectedCount: int) (falsePositiveRate: float) =
-        let bitsFor (expectedCount: int) (falsePositiveRate: float) =
+        let bitsFor expectedCount falsePositiveRate =
             if expectedCount <= 0 then
                 8
             else
                 let m = -float expectedCount * log falsePositiveRate / (ln2 * ln2)
                 max 8 (int (ceil m / 8.0) * 8)
 
-        let hashesFor (expectedCount: int) (bitCount: int) =
+        let hashesFor expectedCount bitCount =
             if expectedCount <= 0 then
                 1
             else
                 max 1 (int (ceil (float bitCount / float expectedCount) * ln2))
 
-        let ofHashes (expectedCount: int) (falsePositiveRate: float) (hashes: uint64 seq) =
+        let ofHashes expectedCount falsePositiveRate hashes =
             let bitCount = bitsFor expectedCount falsePositiveRate
             let hashCount = hashesFor expectedCount bitCount
 

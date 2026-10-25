@@ -83,6 +83,9 @@ module internal SstPartialCache =
         cache.[key] <- System.WeakReference<SstPartial> partial
 
 module internal StorageEngine =
+    // writeBatch と close は、同じ immutable handle 系列の WAL 競合を防ぐため直列化する。
+    let private writeCloseGate = new System.Threading.SemaphoreSlim(1, 1)
+
     /// SSTable に書く Bloom filter の誤検出率。
     [<Literal>]
     let private BloomFalsePositiveRate = 0.01
@@ -185,24 +188,21 @@ module internal StorageEngine =
                             | Ok(Some e) -> ret (Some e)
                             | Ok None -> probe rest
 
-        match Memtable.getVisible engine.Mem key visible with
+        match Memtable.getVisible key visible engine.Mem with
         | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
         | None -> Version.filesForPointLookup engine.Version key |> probe
 
-    /// k-way merge のソース。
-    type private MergeSource =
-        /// 未オープンのファイル。byte array はそのファイルが返し得る最小キーの下限。
-        | Unopened of byte array * FileMetaData
-        /// オープン済み（先頭エントリと残りの走査）。
-        | Opened of SstEntry * SstScan
-        /// 空。
-        | Drained
+    type private MergeHeap =
+        | MergeEmpty
+        | MergeNode of int * int * SstEntry * SstScan * MergeHeap * MergeHeap
 
     /// 範囲ルックアップ。
     /// キー昇順で返す（同一キーは 1件だけ）。
     /// visible が Some s のときは SeqNo が s 以下の版を返す。
     /// limit > 0 のときは必要なファイルだけを開いて先頭 limit 件を返す。
-    /// limit <= 0 のときは全ファイルを開いてチェックサムを検証してから遅延 merge する。
+    /// limit <= 0 のときは最後まで読むので全ファイルを開く（破損・欠落はその時点で検出する）。
+    /// ヒープは 1回だけ組み、以降は「取り出したソースの続きを戻す」だけにする
+    /// （行ごとにソース列から作り直すと O(行数 × ファイル数 log ファイル数) になる）。
     let scanAt (engine: StorageEngine) (visible: uint64 option) (startKey: byte array) (limit: int) =
         let sourceBound (startKey: byte array) (f: FileMetaData) =
             if Bytes.compare f.Smallest startKey > 0 then
@@ -221,112 +221,47 @@ module internal StorageEngine =
 
             pull ()
 
-        let rec pick (i: int) (best: (int * SstEntry * SstScan) option) (rest: MergeSource list) =
-            match rest with
-            | [] -> best
-            | Opened(e, scan) :: tail ->
-                match best with
-                | None -> pick (i + 1) (Some(i, e, scan)) tail
-                | Some(_, be, _) ->
-                    if SstEntry.compare e be < 0 then
-                        pick (i + 1) (Some(i, e, scan)) tail
-                    else
-                        pick (i + 1) best tail
-            | Unopened _ :: tail
-            | Drained :: tail -> pick (i + 1) best tail
+        let heapRank =
+            function
+            | MergeEmpty -> 0
+            | MergeNode(rank, _, _, _, _, _) -> rank
 
-        let rec loop rest value (k: int) (revPrefix: MergeSource list) (tail: MergeSource list) =
-            match tail with
-            | [] -> rest
-            | s :: tail' ->
-                if k = 0 then
-                    List.append (List.rev revPrefix) (value :: tail')
-                else
-                    loop rest value (k - 1) (s :: revPrefix) tail'
+        let heapNode sourceIndex entry scan left right =
+            if heapRank left >= heapRank right then
+                MergeNode(heapRank right + 1, sourceIndex, entry, scan, left, right)
+            else
+                MergeNode(heapRank left + 1, sourceIndex, entry, scan, right, left)
 
-        let replaceAt (i: int) (value: MergeSource) (rest: MergeSource list) = loop rest value i [] rest
+        let mergeHeap (first: MergeHeap) (second: MergeHeap) =
+            let rec descend (picked: (int * SstEntry * SstScan * MergeHeap) list) (a: MergeHeap) (b: MergeHeap) =
+                match a, b with
+                | MergeEmpty, heap
+                | heap, MergeEmpty -> picked, heap
+                | MergeNode(_, _, ae, _, _, _), MergeNode(_, _, be, _, _, _) when SstEntry.compare ae be > 0 ->
+                    descend picked b a
+                | MergeNode(_, sourceIndex, entry, scan, left, right), _ ->
+                    descend ((sourceIndex, entry, scan, left) :: picked) right b
 
-        let rec advance (state: MergeSource list) =
-            match pick 0 None state with
-            | None -> None
-            | Some(i, e, rest) ->
-                let nextSource =
-                    match SstScan.next rest with
-                    | Error _ -> Drained
-                    | Ok None -> Drained
-                    | Ok(Some(e2, nxt)) -> Opened(e2, nxt)
+            let picked, rest = descend [] first second
+            List.fold (fun acc (sourceIndex, entry, scan, left) -> heapNode sourceIndex entry scan left acc) rest picked
 
-                Some(e, replaceAt i nextSource state)
+        let popHeap =
+            function
+            | MergeEmpty -> None
+            | MergeNode(_, sourceIndex, entry, scan, left, right) ->
+                Some((sourceIndex, entry, scan), mergeHeap left right)
 
-        let lazyMergeScan (sources: MergeSource list) = Seq.unfold advance sources
+        let heapTop =
+            function
+            | MergeEmpty -> None
+            | MergeNode(_, _, entry, _, _, _) -> Some entry
 
         let isVisible (e: SstEntry) =
             match visible with
             | Some s -> e.SeqNo <= s
             | None -> true
 
-        /// 遅延 collapseDuplicates（同一キーの最新版だけ残す）。
-        let collapseDuplicatesLazy (src: seq<SstEntry>) =
-            Seq.unfold
-                (fun (cur: System.Collections.Generic.IEnumerator<SstEntry>, emittedKey: byte array option) ->
-                    let rec next () =
-                        if cur.MoveNext() then
-                            let e = cur.Current
-
-                            match emittedKey with
-                            | Some k when Bytes.compare k e.Key = 0 ->
-                                // 同一キーの古い版 → スキップ
-                                next ()
-                            | _ when not (isVisible e) ->
-                                // 見えない版 → スキップ
-                                next ()
-                            | _ -> Some(e, (cur, Some e.Key))
-                        else
-                            None
-
-                    next ())
-                (src.GetEnumerator(), None)
-
-        let rec pickOpened (i: int) (best: (int * SstEntry * SstScan) option) (rest: MergeSource list) =
-            match rest with
-            | [] -> best
-            | Opened(e, scan) :: tail ->
-                match best with
-                | None -> pickOpened (i + 1) (Some(i, e, scan)) tail
-                | Some(_, be, _) ->
-                    if SstEntry.compare e be < 0 then
-                        pickOpened (i + 1) (Some(i, e, scan)) tail
-                    else
-                        pickOpened (i + 1) best tail
-            | Unopened _ :: tail
-            | Drained :: tail -> pickOpened (i + 1) best tail
-
-        let rec pickUnopened (i: int) (best: (int * byte array * FileMetaData) option) (rest: MergeSource list) =
-            match rest with
-            | [] -> best
-            | Unopened(bound, f) :: tail ->
-                match best with
-                | None -> pickUnopened (i + 1) (Some(i, bound, f)) tail
-                | Some(_, bestBound, _) ->
-                    if Bytes.compare bound bestBound < 0 then
-                        pickUnopened (i + 1) (Some(i, bound, f)) tail
-                    else
-                        pickUnopened (i + 1) best tail
-            | _ :: tail -> pickUnopened (i + 1) best tail
-
-        let replaceAt (i: int) (value: MergeSource) (list: MergeSource list) =
-            let rec loop (k: int) (revPrefix: MergeSource list) (rest: MergeSource list) =
-                match rest with
-                | [] -> list
-                | s :: tail ->
-                    if k = 0 then
-                        List.append (List.rev revPrefix) (value :: tail)
-                    else
-                        loop (k - 1) (s :: revPrefix) tail
-
-            loop i [] list
-
-        let openAt (i: int) (f: FileMetaData) (state: MergeSource list) =
+        let openPending (index: int) (f: FileMetaData) (heap: MergeHeap) =
             let startScan =
                 match openPartialSst engine f with
                 | Error e -> Error e
@@ -340,97 +275,113 @@ module internal StorageEngine =
             | Ok scan ->
                 match SstScan.next scan with
                 | Error e -> Error e
-                | Ok None -> Ok(replaceAt i Drained state)
-                | Ok(Some(e, nxt)) -> Ok(replaceAt i (Opened(e, nxt)) state)
+                | Ok None -> Ok heap
+                | Ok(Some(e, nxt)) -> Ok(mergeHeap heap (MergeNode(1, index, e, nxt, MergeEmpty, MergeEmpty)))
 
-        let rec prepare (state: MergeSource list) =
-            match pickOpened 0 None state, pickUnopened 0 None state with
-            | None, None -> Ok state
-            | None, Some(i, _, f) ->
-                match openAt i f state with
-                | Error e -> Error e
-                | Ok state' -> prepare state'
-            | Some(_, e, _), Some(i, bound, f) when Bytes.compare bound e.Key <= 0 ->
-                match openAt i f state with
-                | Error e -> Error e
-                | Ok state' -> prepare state'
-            | Some _, _ -> Ok state
+        let rec prepare (heap: MergeHeap) (pending: (int * byte array * FileMetaData) list) =
+            match pending with
+            | [] -> Ok(heap, [])
+            | (index, bound, f) :: rest ->
+                match heapTop heap with
+                | Some top when Bytes.compare bound top.Key > 0 -> Ok(heap, pending)
+                | _ ->
+                    match openPending index f heap with
+                    | Error e -> Error e
+                    | Ok heap' -> prepare heap' rest
 
-        let rec collect (state: MergeSource list) (emittedKey: byte array option) (count: int) (acc: SstEntry list) =
-            if count >= limit then
+        let advance (heap: MergeHeap) (index: int) (rest: SstScan) =
+            match SstScan.next rest with
+            | Error e -> Error e
+            | Ok None -> Ok heap
+            | Ok(Some(e2, nxt)) -> Ok(mergeHeap heap (MergeNode(1, index, e2, nxt, MergeEmpty, MergeEmpty)))
+
+        let rec collect
+            (heap: MergeHeap)
+            (pending: (int * byte array * FileMetaData) list)
+            (emittedKey: byte array option)
+            (count: int)
+            (acc: SstEntry list)
+            =
+            if limit > 0 && count >= limit then
                 Ok(List.rev acc)
             else
-                match prepare state with
+                match prepare heap pending with
                 | Error e -> Error e
-                | Ok state ->
-                    match pickOpened 0 None state with
+                | Ok(ready, remaining) ->
+                    match popHeap ready with
                     | None -> Ok(List.rev acc)
-                    | Some(i, e, rest) ->
-                        match SstScan.next rest with
+                    | Some((index, e, rest), restHeap) ->
+                        match advance restHeap index rest with
                         | Error err -> Error err
-                        | Ok next ->
-                            let nextSource =
-                                match next with
-                                | None -> Drained
-                                | Some(e2, nxt) -> Opened(e2, nxt)
-
-                            let state' = replaceAt i nextSource state
-
+                        | Ok heap' ->
                             let sameKey =
                                 match emittedKey with
                                 | Some k -> Bytes.compare k e.Key = 0
                                 | None -> false
 
                             if sameKey || not (isVisible e) then
-                                collect state' emittedKey count acc
+                                collect heap' remaining emittedKey count acc
                             else
                                 let appended = e.Value.IsSome
 
                                 collect
-                                    state'
+                                    heap'
+                                    remaining
                                     (Some e.Key)
                                     (if appended then count + 1 else count)
                                     (if appended then e :: acc else acc)
 
-        let collectLimited (sources: MergeSource list) = collect sources None 0 []
-
-        let rec openAll (rest: FileMetaData list) (acc: MergeSource list) =
-            match rest with
-            | [] -> ret (List.rev acc)
-            | f :: tail ->
-                match openSstable engine f with
-                | Error e -> Error e
-                | Ok reader ->
-                    match SstScan.next (Sstable.rangeScan reader startKey 0) with
+        let rec collectAll
+            (heap: MergeHeap)
+            (pending: (int * byte array * FileMetaData) list)
+            (emittedKey: byte array option)
+            (acc: SstEntry list)
+            =
+            match prepare heap pending with
+            | Error e -> Error e
+            | Ok(ready, remaining) ->
+                match popHeap ready with
+                | None -> Ok(List.rev acc)
+                | Some((index, e, rest), restHeap) ->
+                    match advance restHeap index rest with
                     | Error e -> Error e
-                    | Ok None -> openAll tail (Drained :: acc)
-                    | Ok(Some(e, nxt)) -> openAll tail (Opened(e, nxt) :: acc)
+                    | Ok heap' ->
+                        let sameKey =
+                            match emittedKey with
+                            | Some k -> Bytes.compare k e.Key = 0
+                            | None -> false
 
-        let sstFiles =
+                        if sameKey || not (isVisible e) then
+                            collectAll heap' remaining emittedKey acc
+                        elif e.Value.IsSome then
+                            collectAll heap' remaining (Some e.Key) (e :: acc)
+                        else
+                            collectAll heap' remaining (Some e.Key) acc
+
+        let pendingFiles =
             Version.allFiles engine.Version
             |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
-            |> List.sortByDescending _.FileNumber
+            |> List.map (fun f -> sourceBound startKey f, f)
+            |> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b)
+            |> List.mapi (fun i (bound, f) -> (i + 1, bound, f))
 
         let memSeq =
-            Memtable.rangeScan engine.Mem startKey 0
+            Memtable.rangeScan startKey 0 engine.Mem
             |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
 
-        let memSource =
+        let initial =
             match SstScan.next (seqToScan memSeq) with
-            | Ok(Some(e, nxt)) -> Opened(e, nxt)
-            | _ -> Drained
+            | Error e -> Error e
+            | Ok None -> Ok MergeEmpty
+            | Ok(Some(e, nxt)) -> Ok(mergeHeap MergeEmpty (MergeNode(1, 0, e, nxt, MergeEmpty, MergeEmpty)))
 
-        if limit > 0 then
-            let fileSources =
-                sstFiles |> List.map (fun f -> Unopened(sourceBound startKey f, f))
-
-            collectLimited (memSource :: fileSources) |> Result.map Seq.ofList
-        else
-            let finalize (merged: seq<SstEntry>) =
-                collapseDuplicatesLazy merged |> Seq.filter (fun e -> e.Value.IsSome)
-
-            openAll sstFiles []
-            |> Result.map (fun sources -> finalize (lazyMergeScan (memSource :: sources)))
+        match initial with
+        | Error e -> Error e
+        | Ok heap ->
+            if limit > 0 then
+                collect heap pendingFiles None 0 [] |> Result.map Seq.ofList
+            else
+                collectAll heap pendingFiles None [] |> Result.map Seq.ofList
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、
@@ -446,21 +397,26 @@ module internal StorageEngine =
                 NextTxnId = nextTxnId
             }
 
-        result {
-            let txnId = engine.NextTxnId
+        writeCloseGate.Wait()
 
-            let! wal =
-                Wal.append
-                    engine.Wal
-                    engine.Dir
-                    [
-                        WalRecord.Begin txnId
-                        WalRecord.Batch(txnId, entries)
-                        WalRecord.Commit txnId
-                    ]
+        try
+            result {
+                let txnId = engine.NextTxnId
 
-            return apply wal txnId
-        }
+                let! wal =
+                    Wal.append
+                        engine.Wal
+                        engine.Dir
+                        [
+                            WalRecord.Begin txnId
+                            WalRecord.Batch(txnId, entries)
+                            WalRecord.Commit txnId
+                        ]
+
+                return apply wal txnId
+            }
+        finally
+            writeCloseGate.Release() |> ignore
 
     let private writeOne (engine: StorageEngine) (entry: Entry) =
         let nextSeqNo = engine.NextSeqNo + 1UL
@@ -640,14 +596,13 @@ module internal StorageEngine =
                 | Some n -> n
                 | None -> version.NextFileNumber
 
-            if System.IO.File.Exists(Wal.path dir walNumber) then
-                ret
-                    {
-                        FileNumber = walNumber
-                        Size = int (System.IO.FileInfo(Wal.path dir walNumber).Length)
-                    }
-            else
-                Wal.create dir walNumber
+            protect (fun () -> System.IO.File.Exists(Wal.path dir walNumber))
+            >>= fun exists ->
+                if exists then
+                    protect (fun () -> int (System.IO.FileInfo(Wal.path dir walNumber).Length))
+                    |> Result.map (fun size -> { FileNumber = walNumber; Size = size })
+                else
+                    Wal.create dir walNumber
 
         let maxSeqNoOnDisk (version: Version) =
             Version.allFiles version |> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
@@ -712,18 +667,23 @@ module internal StorageEngine =
     /// （古い memtable を flush すると新しいハンドルの書き込みを消してしまう）。
     /// </remarks>
     let close (engine: StorageEngine) =
-        let isLatestWriter =
-            match protect (fun () -> System.IO.FileInfo(Wal.path engine.Dir engine.Wal.FileNumber).Length) with
-            | Ok size -> size = int64 engine.Wal.Size
-            | Error _ -> false
+        writeCloseGate.Wait()
 
-        if not isLatestWriter then
-            ret ()
-        else
-            flush engine
-            |> Result.map (fun e ->
-                Wal.walFiles e.Dir
-                |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore))
+        try
+            let isLatestWriter =
+                match protect (fun () -> System.IO.FileInfo(Wal.path engine.Dir engine.Wal.FileNumber).Length) with
+                | Ok size -> size = int64 engine.Wal.Size
+                | Error _ -> false
+
+            if not isLatestWriter then
+                ret ()
+            else
+                flush engine
+                |> Result.map (fun e ->
+                    Wal.walFiles e.Dir
+                    |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore))
+        finally
+            writeCloseGate.Release() |> ignore
 
 /// RowStore が使う StorageEngine の操作面。
 /// テストではメモリ実装に差し替えられる。

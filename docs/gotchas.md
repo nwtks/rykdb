@@ -395,6 +395,27 @@ Array.mapi (fun level files -> ...)
 Footer 自身のチェックサムを追加したときは `80 → 84` に変更した。
 **放置するとファイル名の長さがずれて、.footer の読み取りが壊れる**。
 
+### 4.7 「状態を進めるヘルパー」は進んだ状態も返す（`scanAt` の無限ループ）
+
+`scanAt` の k-way merge は、ヒープと「まだ開いていないファイル一覧（pending）」を持ち回る。
+`prepare` がファイルを開いてヒープへ積むとき、**pending の残りも返さないと、
+呼び出し側は毎行同じファイルを開き直し、同じ先頭エントリを積み続けて終わらない**。
+
+```fsharp
+// ❌ heap だけ返す → 次の行で同じファイルを再オープン（無限ループ）
+let rec prepare heap pending = ...
+// ✅ 使い切った pending も返す
+let rec prepare heap pending =
+    | [] -> Ok(heap, [])
+    | (i, bound, f) :: rest -> ... Ok(heap', rest) / Ok(heap, pending)
+```
+
+症状は「SSTable だけの keyspace（Close 直後・再オープン直後）を読むと固まる」。
+memtable に 1件でもあると先へ進むため、テストが無いと気づきにくい。
+回帰テストは `StorageEngineTests` の
+`scanAt: memtable が空でも SSTable だけを走査できる` /
+`scanAt: memtable と複数ファイルを混ぜてもキー順と最新版を保つ`。
+
 ---
 
 ## 5. MVCC / トランザクションの罠

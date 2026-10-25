@@ -48,24 +48,41 @@ let private findBloomMiss (dir: string) (fileNumber: int64) (lo: int) (hi: int) 
         let k = intKey i
         if not (Sstable.mayContain reader k) then Some k else None)
 
-/// SSTable の本文を書き換え、Footer のチェックサムを合わせ直す。
+/// SSTable の本文を書き換え、全体・メタデータ・Footer のチェックサムを合わせ直す。
 /// 「開けるが中身が壊れたファイル」を作る
-/// （FooterSize = 84、全体 checksum は +76、Footer 自身の checksum は +80）。
+/// （FooterSize = 88、全体 checksum は +76、metadata checksum は +80、Footer checksum は +84）。
 let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array -> unit) =
     let path = FileMetaData.path dir fileNumber
     let data = File.ReadAllBytes path
-    patch data
+
     let footerStart = data.Length - Sstable.FooterSize
+
+    let readI64 offset =
+        [ 0..7 ]
+        |> List.fold (fun acc i -> acc ||| (int64 data.[data.Length - Sstable.FooterSize + offset + i] <<< (i * 8))) 0L
+
+    let writeU32 offset (value: uint32) =
+        for i in 0..3 do
+            data.[footerStart + offset + i] <- byte (value >>> (i * 8) &&& 0xFFu)
+
+    patch data
     let bodyChecksum = Hashing.checksum (Array.sub data 0 footerStart)
 
-    for i in 0..3 do
-        data.[footerStart + 76 + i] <- byte (bodyChecksum >>> (8 * i) &&& 0xFFu)
+    writeU32 76 bodyChecksum
+
+    let metadataOffset = int (readI64 52)
+    let indexOffset = int (readI64 20)
+    let indexLength = int (readI64 28)
+
+    let metadataChecksum =
+        Hashing.checksumRange data metadataOffset (indexOffset + indexLength - metadataOffset)
+
+    writeU32 80 metadataChecksum
 
     let footerChecksum =
         Hashing.checksum (Array.sub data footerStart (Sstable.FooterSize - 4))
 
-    for i in 0..3 do
-        data.[footerStart + Sstable.FooterSize - 4 + i] <- byte (footerChecksum >>> (8 * i) &&& 0xFFu)
+    writeU32 (Sstable.FooterSize - 4) footerChecksum
 
     File.WriteAllBytes(path, data)
 
@@ -306,6 +323,93 @@ let ``StorageEngine.scanAt: limit が効く`` () =
 
             let scanned = ok (StorageEngine.scanAt engine None [||] 2) |> Seq.toArray
             Assert.Equal(2, scanned.Length)))
+
+[<Fact>]
+let ``StorageEngine.scanAt: 多数のファイルをキー昇順にマージする`` () =
+    withDir "se-many-files" (fun dir ->
+        withEngine dir (fun engine ->
+            // 32 ファイル × 2 エントリ。左偏ヒープのマージ（明示スタック）を多ソースで通す。
+            let files =
+                [ 1..32 ]
+                |> List.map (fun i ->
+                    mkSst
+                        dir
+                        (int64 (100 + i))
+                        0
+                        [
+                            Entry.put (intKey (i * 2)) (uint64 i) (intRow (i * 2))
+                            Entry.put (intKey (i * 2 + 100)) (uint64 i) (intRow (i * 2 + 100))
+                        ])
+
+            let engine =
+                { engine with
+                    Version = List.fold (fun v f -> Version.addFile f v) Version.empty files
+                }
+
+            let got = ok (StorageEngine.scanAt engine None [||] 0) |> Seq.toArray
+            let expected = [ 2..2..64 ] @ [ 102..2..164 ]
+
+            Assert.Equal(expected.Length, got.Length)
+
+            expected
+            |> List.iteri (fun i n ->
+                Assert.True(Bytes.compare got.[i].Key (intKey n) = 0, sprintf "位置 %d が %d ではありません" i n))))
+
+[<Fact>]
+let ``StorageEngine.scanAt: memtable と複数ファイルを混ぜてもキー順と最新版を保つ`` () =
+    withDir "se-mixed" (fun dir ->
+        withEngine dir (fun engine ->
+            // ファイル A: 1, 4, 7 / ファイル B: 2, 5 / memtable: 3, 5, 6。
+            // キー 5 はファイル B と memtable の両方にあり、SeqNo の大きい memtable が勝つ。
+            let fileA =
+                mkSst
+                    dir
+                    10L
+                    0
+                    [
+                        Entry.put (intKey 1) 1UL (intRow 1)
+                        Entry.put (intKey 4) 4UL (intRow 4)
+                        Entry.put (intKey 7) 7UL (intRow 7)
+                    ]
+
+            let fileB =
+                mkSst dir 11L 0 [ Entry.put (intKey 2) 2UL (intRow 2); Entry.put (intKey 5) 1UL (intRow 50) ]
+
+            let engine =
+                { engine with
+                    Version = Version.empty |> Version.addFile fileA |> Version.addFile fileB
+                }
+
+            let engine =
+                List.fold (fun e i -> ok (StorageEngine.put e (intKey i) (intRow i))) engine [ 3; 5; 6 ]
+
+            let got = ok (StorageEngine.scanAt engine None [||] 0) |> Seq.toArray
+            Assert.Equal(7, got.Length)
+
+            [ 1..7 ]
+            |> List.iteri (fun i n -> Assert.Equal<byte array>(intKey n, got.[i].Key))
+
+            // キー 5 はファイルの 50 ではなく memtable の 5 が見える
+            Assert.Equal<int64>(5L, asInt got.[4].Value.Value.[0])))
+
+[<Fact>]
+let ``StorageEngine.scanAt: memtable が空でも SSTable だけを走査できる`` () =
+    withDir "se-file-only" (fun dir ->
+        withEngine dir (fun engine ->
+            // Close 後や再オープン直後は「SSTable だけ / memtable 空」になる。
+            // 未オープンのファイルを開いたら pending から外さないと、毎行開き直して無限に積む。
+            let f =
+                mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1); Entry.put (intKey 2) 2UL (intRow 2) ]
+
+            let engine =
+                { engine with
+                    Version = Version.empty |> Version.addFile f
+                }
+
+            let got = ok (StorageEngine.scanAt engine None [||] 0) |> Seq.toArray
+            Assert.Equal(2, got.Length)
+            Assert.Equal<byte array>(intKey 1, got.[0].Key)
+            Assert.Equal<byte array>(intKey 2, got.[1].Key)))
 
 [<Fact>]
 let ``StorageEngine.scanAt: scan も snapshot で版を絞る`` () =

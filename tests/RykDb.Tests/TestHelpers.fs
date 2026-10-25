@@ -67,13 +67,13 @@ type private MemoryStorageEngine(state: MemoryEngineState, mem: Memtable, nextSe
         member _.ActiveSnapshot = 0UL
 
         member _.GetAt visible key =
-            Memtable.getVisible mem key visible
+            Memtable.getVisible key visible mem
             |> Option.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
             |> ret
 
         member _.ScanAt visible startKey limit =
             let entries =
-                Memtable.rangeScan mem startKey 0
+                Memtable.rangeScan startKey 0 mem
                 |> Seq.filter (fun e ->
                     match visible with
                     | Some v -> e.SeqNo <= v

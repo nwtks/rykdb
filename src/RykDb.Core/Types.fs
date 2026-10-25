@@ -1,30 +1,5 @@
 namespace RykDb.Core
 
-/// バイト列のユーティリティ。
-module internal Bytes =
-    /// 昇順比較（前方が短いほうが小さい）。
-    let compare (a: byte array) (b: byte array) =
-        let n = min a.Length b.Length
-
-        let rec compareAt i =
-            if i >= n then compare a.Length b.Length
-            elif a.[i] = b.[i] then compareAt (i + 1)
-            else compare (int a.[i]) (int b.[i])
-
-        compareAt 0
-
-    /// 生のバイト列の固定オフセットから、リトルエンディアン 32bit を読む。
-    let readLE32 (data: byte array) (offset: int) =
-        let at i = uint32 data.[offset + i]
-        at 0 ||| (at 1 <<< 8) ||| (at 2 <<< 16) ||| (at 3 <<< 24)
-
-/// SQL の識別子比較。
-/// テーブル名・列名・索引名・別名は大文字小文字を区別しない。
-/// スキーマ・カタログ・実行層で同じ規則を使うため、ここに 1つだけ置く。
-module internal SqlName =
-    let equal (a: string) (b: string) =
-        System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
-
 /// 実行時の値。
 /// NULL は他のすべての型と区別できる特別なケースとして持つ。
 [<RequireQualifiedAccess>]
@@ -75,6 +50,31 @@ module SqlLiteral =
             t.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ", System.Globalization.CultureInfo.InvariantCulture)
         | SqlValue.Decimal d -> d.ToString System.Globalization.CultureInfo.InvariantCulture
         | SqlValue.Uuid g -> g.ToString("D", System.Globalization.CultureInfo.InvariantCulture)
+
+/// バイト列のユーティリティ。
+module internal Bytes =
+    /// 昇順比較（前方が短いほうが小さい）。
+    let compare (a: byte array) (b: byte array) =
+        let n = min a.Length b.Length
+
+        let rec compareAt i =
+            if i >= n then compare a.Length b.Length
+            elif a.[i] = b.[i] then compareAt (i + 1)
+            else compare (int a.[i]) (int b.[i])
+
+        compareAt 0
+
+    /// 生のバイト列の固定オフセットから、リトルエンディアン 32bit を読む。
+    let readLE32 (data: byte array) (offset: int) =
+        let at i = uint32 data.[offset + i]
+        at 0 ||| (at 1 <<< 8) ||| (at 2 <<< 16) ||| (at 3 <<< 24)
+
+/// SQL の識別子比較。
+/// テーブル名・列名・索引名・別名は大文字小文字を区別しない。
+/// スキーマ・カタログ・実行層で同じ規則を使うため、ここに 1つだけ置く。
+module internal SqlName =
+    let equal (a: string) (b: string) =
+        System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
 
 /// SQL の 3値論理。
 /// 比較結果は TRUE / FALSE だけでなく UNKNOWN を持つ。

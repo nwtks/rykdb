@@ -107,6 +107,17 @@ let ``Reader: 負のバイト数は CorruptionError`` () =
     expectErrorKind ErrorKind.CorruptionError "負のバイト数はエラー" (Reader.readBytes -1 (Cursor.create [| 1uy |]))
 
 [<Fact>]
+let ``Reader: オーバーフローするバイト数指定は CorruptionError`` () =
+    let cursor =
+        {
+            Data = [| 1uy; 2uy |]
+            Pos = 1
+            End = Int32.MaxValue
+        }
+
+    expectErrorKind ErrorKind.CorruptionError "範囲検査をオーバーフローで回避できない" (Reader.readBytes Int32.MaxValue cursor)
+
+[<Fact>]
 let ``Reader: 10 バイトを超える varint は CorruptionError`` () =
     expectErrorKind
         ErrorKind.CorruptionError
@@ -130,7 +141,7 @@ let ``Reader: readItems は n 件読む`` () =
     let c = Cursor.create w
 
     let items, c2 =
-        ok (Reader.readItems 3UL (fun c -> Reader.readByte c |> Result.map (fun (b, c) -> int b, c)) c)
+        ok (Reader.readItems (fun c -> Reader.readByte c |> Result.map (fun (b, c) -> int b, c)) 3UL c)
 
     Assert.Equal<int list>([ 1; 2; 3 ], items)
     Assert.True(Cursor.atEnd c2)
@@ -140,7 +151,7 @@ let ``Reader: readItems は readOne のエラーを伝播する`` () =
     expectErrorKind
         ErrorKind.CorruptionError
         "要素の読み取りエラーは伝播する"
-        (Reader.readItems 1UL Reader.readByte (Cursor.create [||]))
+        (Reader.readItems Reader.readByte 1UL (Cursor.create [||]))
 
 [<Fact>]
 let ``OrderPreserving: 全型の往復`` () =

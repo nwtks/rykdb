@@ -210,9 +210,9 @@ module internal Catalog =
 
         result {
             let! colCount, cur1 = Cursor.create bytes |> Reader.readVarint
-            let! cols, cur2 = Reader.readItems colCount readColumn cur1
+            let! cols, cur2 = Reader.readItems readColumn colCount cur1
             let! pkCount, cur3 = Reader.readVarint cur2
-            let! pks, _ = Reader.readItems pkCount Reader.readStr cur3
+            let! pks, _ = Reader.readItems Reader.readStr pkCount cur3
 
             return
                 {
@@ -236,7 +236,7 @@ module internal Catalog =
             let! table, cur1 = Cursor.create bytes |> Reader.readStr
             let! unique, cur2 = Reader.readBool cur1
             let! colCount, cur3 = Reader.readVarint cur2
-            let! cols, _ = Reader.readItems colCount Reader.readStr cur3
+            let! cols, _ = Reader.readItems Reader.readStr colCount cur3
 
             return
                 {

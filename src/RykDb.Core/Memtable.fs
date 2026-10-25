@@ -29,7 +29,7 @@ module internal Entry =
         }
 
     let approxBytes (e: Entry) =
-        let valueBytes (v: SqlValue) =
+        let valueBytes v =
             match ValueCodec.fixedEncodedBytes v with
             | Some n -> n
             | None ->
@@ -102,7 +102,7 @@ module internal Entry =
         |> Writer.toArray
 
     let decodeBatch (data: byte array) =
-        let readOne (c: Cursor) =
+        let readOne c =
             result {
                 let! bs, c1 = Reader.readLengthPrefixed c
                 let! e = decodeEntry bs
@@ -117,7 +117,7 @@ module internal Entry =
             if count > uint64 System.Int32.MaxValue then
                 return! err (sprintf "Wal: バッチのエントリ数が大きすぎます (%d)" count |> DbError.corruption)
             else
-                let! items, _ = Reader.readItems count readOne c
+                let! items, _ = Reader.readItems readOne count c
                 return txnId, List.toArray items
         }
 
@@ -153,40 +153,40 @@ module internal Memtable =
 
     /// 複数のエントリをまとめて挿入する。
     let apply (entries: Entry seq) (mem: Memtable) =
-        let rec unwind (target: Entry) (stack: TNode list) (left: TNode option) (right: TNode option) =
+        let rec unwind left right stack target =
             match stack with
             | [] -> left, right
             | r :: rest ->
                 if Entry.compareKeys r.Entry target < 0 then
-                    unwind target rest (Some { r with Right = left }) right
+                    unwind (Some { r with Right = left }) right rest target
                 else
-                    unwind target rest left (Some { r with Left = right })
+                    unwind left (Some { r with Left = right }) rest target
 
-        let rec down (target: Entry) (stack: TNode list) (node: TNode option) =
+        let rec down node stack target =
             match node with
-            | None -> unwind target stack None None
+            | None -> unwind None None stack target
             | Some r ->
                 if Entry.compareKeys r.Entry target < 0 then
-                    down target (r :: stack) r.Right
+                    down r.Right (r :: stack) target
                 else
-                    down target (r :: stack) r.Left
+                    down r.Left (r :: stack) target
 
-        let split (root: TNode option) (target: Entry) = down target [] root
+        let split root target = down root [] target
 
-        let rec rebuild (stack: (TNode * bool) list) (acc: TNode option) =
+        let rec rebuild stack node =
             match stack with
-            | [] -> acc
+            | [] -> node
             | (r, wentLeft) :: rest ->
                 let rebuilt =
                     if wentLeft then
-                        Some { r with Left = acc }
+                        Some { r with Left = node }
                     else
-                        Some { r with Right = acc }
+                        Some { r with Right = node }
 
                 rebuild rest rebuilt
 
-        let rec descend (e: Entry) (p: uint64) (stack: (TNode * bool) list) (node: TNode option) =
-            match node with
+        let rec descend e p stack =
+            function
             | None ->
                 Some
                     {
@@ -213,11 +213,11 @@ module internal Memtable =
                 else
                     descend e p ((r, false) :: stack) r.Right
 
-        let insertNode (e: Entry) (root: TNode option) =
+        let insertNode e root =
             let p = Entry.priority e
             descend e p [] root
 
-        let insert (e: Entry) (mem: Memtable) =
+        let insert e mem =
             {
                 Root = insertNode e mem.Root
                 Count = mem.Count + 1
@@ -235,7 +235,7 @@ module internal Memtable =
     /// 「(キー, visible) 以上の最小のノード」を探す（ceiling 探索）。
     /// それが同じキーなら可視な最新版になる（探索は対数時間）。
     /// </remarks>
-    let getVisible (mem: Memtable) (key: byte array) (visible: uint64 option) =
+    let getVisible (key: byte array) (visible: uint64 option) (mem: Memtable) =
         let bound =
             match visible with
             | Some v -> v
@@ -268,7 +268,7 @@ module internal Memtable =
     /// 状態は「作業リスト + 出した件数」だけで、結果を溜めない
     /// （余分なメモリは作業リスト＝木の高さ分・期待 O(log n)）。
     /// limit が 0 以下のときは上限なし。
-    let rangeScan (mem: Memtable) (startKey: byte array) (limit: int) =
+    let rangeScan (startKey: byte array) (limit: int) (mem: Memtable) =
         let rec step struct (work, count) =
             match work with
             | [] -> None
@@ -284,4 +284,4 @@ module internal Memtable =
         Seq.unfold step struct ([ Visit mem.Root ], 0)
 
     /// キー昇順（同一キーは SeqNo 降順）で全エントリを返す。
-    let toArray (mem: Memtable) = rangeScan mem [||] 0 |> Seq.toArray
+    let toArray (mem: Memtable) = rangeScan [||] 0 mem |> Seq.toArray

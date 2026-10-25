@@ -11,17 +11,17 @@ namespace RykDb.Core
 type internal Writer = { Chunks: byte array list }
 
 module internal Writer =
-    let empty: Writer = { Chunks = [] }
+    let empty = { Chunks = [] }
 
-    let private add (w: Writer) (b: byte array) =
+    let private add (b: byte array) (w: Writer) =
         if b.Length = 0 then w else { Chunks = b :: w.Chunks }
 
-    let writeByte (b: byte) (w: Writer) = add w [| b |]
+    let writeByte (b: byte) (w: Writer) = add [| b |] w
 
     /// バイト列を追加する。並びは保たれる。
-    let writeBytes (bs: byte array) (w: Writer) = add w bs
+    let writeBytes (bs: byte array) (w: Writer) = add bs w
 
-    let bool (v: bool) (w: Writer) = add w [| if v then 1uy else 0uy |]
+    let bool (v: bool) (w: Writer) = add [| if v then 1uy else 0uy |] w
 
     /// 符号なし LEB128（順序保持ではない）。
     let varint (v: uint64) (w: Writer) =
@@ -29,23 +29,23 @@ module internal Writer =
             if x >= 0x80UL then
                 emit (x >>> 7) (byte (x &&& 0x7FUL ||| 0x80UL) :: acc)
             else
-                add w (byte x :: acc |> List.rev |> List.toArray)
+                add (byte x :: acc |> List.rev |> List.toArray) w
 
         emit v []
 
     /// リトルエンディアン 8バイト。
     let int64LE (v: int64) (w: Writer) =
-        add w (Array.init 8 (fun i -> byte (v >>> 8 * i &&& 0xFFL)))
+        add (Array.init 8 (fun i -> byte (v >>> 8 * i &&& 0xFFL))) w
 
     /// リトルエンディアン 4バイト（符号なし）。
     /// WAL のフレームヘッダや SSTable の Footer など固定長フィールド用。
     let uint32LE (v: uint32) (w: Writer) =
-        add w (Array.init 4 (fun i -> byte (v >>> 8 * i &&& 0xFFu)))
+        add (Array.init 4 (fun i -> byte (v >>> 8 * i &&& 0xFFu))) w
 
     /// ビッグエンディアン 8バイト（符号なし）。
     /// 順序保持符号化で使う。
     let uint64BE (v: uint64) (w: Writer) =
-        add w (Array.init 8 (fun i -> byte (v >>> 8 * (7 - i) &&& 0xFFUL)))
+        add (Array.init 8 (fun i -> byte (v >>> 8 * (7 - i) &&& 0xFFUL))) w
 
     /// 長さ付きバイト列（varint 長 + 実体）。
     let lengthPrefixed (bs: byte array) (w: Writer) =
@@ -101,7 +101,13 @@ module internal Reader =
             Ok(c.Data.[c.Pos], { c with Pos = c.Pos + 1 })
 
     let readBytes (count: int) (c: Cursor) =
-        if count < 0 || c.Pos + count > c.End then
+        if
+            count < 0
+            || c.Pos < 0
+            || c.End < c.Pos
+            || c.End > c.Data.Length
+            || count > c.End - c.Pos
+        then
             eof (sprintf "Reader: %d バイトを読み取れません（残り %d）" count (Cursor.remaining c))
         else
             Ok(Array.sub c.Data c.Pos count, { c with Pos = c.Pos + count })
@@ -200,16 +206,16 @@ module internal Reader =
 
     /// count 件を 1件ずつ読み出してリストにする。
     /// 「1件読む」処理は readOne に切り出し、ループはここ 1箇所にまとめる。
-    let readItems (count: uint64) (readOne: Cursor -> Result<'a * Cursor, DbError>) (c: Cursor) =
-        let rec readRemaining rest c acc =
+    let readItems (readOne: Cursor -> Result<'a * Cursor, DbError>) (count: uint64) (c: Cursor) =
+        let rec readRemaining rest acc c =
             if rest = 0UL then
                 ret (List.rev acc, c)
             else
                 match readOne c with
                 | Error e -> Error e
-                | Ok(v, c') -> readRemaining (rest - 1UL) c' (v :: acc)
+                | Ok(v, c') -> readRemaining (rest - 1UL) (v :: acc) c'
 
-        readRemaining count c []
+        readRemaining count [] c
 
 /// 順序保持符号化 (order-preserving encoding)
 /// SSTable のマージはキーのバイト列比較で行うので、「バイト列の大小関係 = SQL の比較結果」でなければならない。
@@ -272,40 +278,31 @@ module internal OrderPreserving =
     [<Literal>]
     let private DecimalMaxDigits = 29
 
-    /// decimal を順序を保ったバイト列へ写像する。
-    /// raw な 128bit ビット列は使えない。
-    /// decimal の内部表現は「非スケール値（96bit）＋ スケール（10 進指数）」なので、
-    /// 0.000001（スケール 6）と Decimal.MaxValue（スケール 0）のビット列をそのまま比較しても数値順にならない。
-    /// そこで値=value = D x 10^(-s) という正規形（末尾 0 を落とした桁列 D とスケール s）に直して、
-    ///   (符号, 10 進指数 e = len(D) - s, D を右詰めした 29桁)
-    /// の順に並べる。
-    /// 同じ符号・同じ指数なら D の右詰め比較が値の比較そのものになる。
-    /// 指数は順序保持された 8バイト整数で書く。
-    let private decimalParts (v: decimal) =
-        let rec trim u s =
-            if u % System.Numerics.BigInteger 10 = System.Numerics.BigInteger.Zero then
-                trim (u / System.Numerics.BigInteger 10) (s - 1)
-            else
-                u, s
-
-        let bits = System.Decimal.GetBits v
-        let flags = uint32 bits.[3]
-        let negative = flags &&& 0x80000000u <> 0u
-        let scale = int (flags >>> 16 &&& 0xFFu)
-
-        let unscaled =
-            System.Numerics.BigInteger(uint32 bits.[0])
-            + (System.Numerics.BigInteger(uint32 bits.[1]) <<< 32)
-            + (System.Numerics.BigInteger(uint32 bits.[2]) <<< 64)
-
-        if unscaled.IsZero then
-            false, 0, ""
-        else
-            let u, s = trim unscaled scale
-            let digits = u.ToString()
-            negative, int digits.Length - s, digits
-
     let private writeOrderedDecimal (v: decimal) (w: Writer) =
+        let rec trim unscaled scale =
+            if unscaled % System.Numerics.BigInteger 10 = System.Numerics.BigInteger.Zero then
+                trim (unscaled / System.Numerics.BigInteger 10) (scale - 1)
+            else
+                unscaled, scale
+
+        let decimalParts v =
+            let bits = System.Decimal.GetBits v
+            let flags = uint32 bits.[3]
+            let negative = flags &&& 0x80000000u <> 0u
+            let scale = int (flags >>> 16 &&& 0xFFu)
+
+            let unscaled =
+                System.Numerics.BigInteger(uint32 bits.[0])
+                + (System.Numerics.BigInteger(uint32 bits.[1]) <<< 32)
+                + (System.Numerics.BigInteger(uint32 bits.[2]) <<< 64)
+
+            if unscaled.IsZero then
+                false, 0, ""
+            else
+                let u, s = trim unscaled scale
+                let digits = u.ToString()
+                negative, int digits.Length - s, digits
+
         let negative, exponent, digits = decimalParts v
         let isZero = digits = ""
 
@@ -332,36 +329,42 @@ module internal OrderPreserving =
         |> Writer.writeBytes digitBytes
 
     let private readOrderedDecimal (c: Cursor) =
+        let restoreDecimal negative raw digitBytes =
+            let stored = unmapInt64 raw
+            let exponent = if negative then -stored else stored
+
+            let digits =
+                digitBytes
+                |> Array.map (fun b -> if negative then 9uy - b else b)
+                |> Array.map (fun b -> char (int (b + 0x30uy)))
+                |> System.String
+
+            let text = sprintf "%sE%d" digits (exponent - int64 DecimalMaxDigits)
+
+            match
+                System.Decimal.TryParse(
+                    text,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture
+                )
+            with
+            | true, d when not negative -> ret d
+            | true, d -> ret -d
+            | _ -> err (sprintf "OrderPreserving: decimal を復元できません: %s" text |> DbError.corruption)
+
         result {
             let! sign, c = Reader.readByte c
             let! raw, c = Reader.readUint64BE c
             let! digitBytes, c = Reader.readBytes DecimalMaxDigits c
-            let negative = sign = 0uy
-            let stored = unmapInt64 raw
-            let exponent = if negative then -stored else stored
             let isZero = digitBytes |> Array.forall (fun b -> b = 0uy)
 
-            if isZero then
-                return 0M, c
-            else
-                let digits =
-                    digitBytes
-                    |> Array.map (fun b -> if negative then 9uy - b else b)
-                    |> Array.map (fun b -> char (int (b + 0x30uy)))
-                    |> System.String
+            let! value =
+                if isZero then
+                    ret 0M
+                else
+                    restoreDecimal (sign = 0uy) raw digitBytes
 
-                let text = sprintf "%sE%d" digits (exponent - int64 DecimalMaxDigits)
-
-                match
-                    System.Decimal.TryParse(
-                        text,
-                        System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture
-                    )
-                with
-                | true, d when not negative -> return d, c
-                | true, d -> return -d, c
-                | _ -> return! err (sprintf "OrderPreserving: decimal を復元できません: %s" text |> DbError.corruption)
+            return value, c
         }
 
     let private guidToOrderedBytes (g: System.Guid) =
@@ -415,22 +418,22 @@ module internal OrderPreserving =
 
     /// キーに書き込んだ 1フィールドを読む。
     /// escape を解き、フィールド終端まで消費して値を返す。
-    let private readValue (start: Cursor) =
-        let rec unescape c acc =
+    let private readValue (c: Cursor) =
+        let rec unescape acc c =
             let finish c =
                 Ok(List.rev acc |> List.toArray, { c with Pos = c.Pos - 1 })
 
             match Reader.readByte c with
             | Error e -> Error e
-            | Ok(b, c) when b <> Terminator -> unescape c (b :: acc)
+            | Ok(b, c) when b <> Terminator -> unescape (b :: acc) c
             | Ok(_, c) when Cursor.atEnd c -> finish c
             | Ok(_, c) ->
                 match Reader.readByte c with
                 | Error e -> Error e
-                | Ok(EscapeMarker, c) -> unescape c (Terminator :: acc)
+                | Ok(EscapeMarker, c) -> unescape (Terminator :: acc) c
                 | Ok(_, _) -> finish c
 
-        let readEscapedPayload c = unescape c []
+        let readEscapedPayload c = unescape [] c
 
         let finish v c =
             result {
@@ -443,7 +446,7 @@ module internal OrderPreserving =
             }
 
         result {
-            let! tag, c = Reader.readByte start
+            let! tag, c = Reader.readByte c
 
             match LanguagePrimitives.EnumOfValue<byte, Tag> tag with
             | Tag.Null -> return! finish SqlValue.Null c
@@ -498,7 +501,7 @@ module internal Hashing =
     /// 範囲指定の 32bit チェックサム（FNV-1a）。
     /// SSTable のブロック末尾チェックサムを、コピーを作らずに計算する。
     let checksumRange (data: byte array) (offset: int) (length: int) =
-        let rec loop (i: int) (h: uint32) =
+        let rec loop i h =
             if i >= offset + length then
                 h
             else
@@ -634,7 +637,7 @@ module internal ValueCodec =
             if n > uint64 System.Int32.MaxValue then
                 return! err (sprintf "ValueCodec: 要素数が大きすぎます (%d)" n |> DbError.corruption)
 
-            let! items, c = Reader.readItems n readValue c
+            let! items, c = Reader.readItems readValue n c
             return List.toArray items, c
         }
 

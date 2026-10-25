@@ -59,6 +59,14 @@ type RykDbClient(host: string, port: int) =
     do writer.AutoFlush <- true
 
     member _.Send(line: string) =
+        let rec readRows columns remaining acc =
+            if remaining = 0 then
+                Rows(columns, List.rev acc)
+            else
+                match reader.ReadLine() with
+                | null -> Failure "サーバ応答が途中で切断されました"
+                | row -> readRows columns (remaining - 1) (unescapeLine row :: acc)
+
         writer.WriteLine line
         writer.Flush()
 
@@ -75,30 +83,22 @@ type RykDbClient(host: string, port: int) =
         | None -> Halt
         | Some h when h.StartsWith HaltTag -> Halt
         | Some h when h.StartsWith ErrTag -> Failure(h.Substring(ErrTag.Length).Trim())
-        | Some h ->
-            let body = h.Substring(OkTag.Length).Trim()
+        | Some h when h.StartsWith(OkTag + " ", System.StringComparison.Ordinal) ->
+            let tab = h.IndexOf '\t'
+            let status = if tab < 0 then h else h.Substring(0, tab)
+            let columnsText = if tab < 0 then None else Some(h.Substring(tab + 1))
+            let countText = status.Substring(OkTag.Length).Trim()
 
-            match body.Split([| ' '; '\t' |], System.StringSplitOptions.RemoveEmptyEntries) with
-            | [||] -> Rows([], [])
-            | parts ->
-                let count =
-                    match System.Int32.TryParse parts.[0] with
-                    | true, n when n >= 0 -> n
-                    | _ -> 0
+            match System.Int32.TryParse countText, columnsText with
+            | (true, count), columnsText when count >= 0 ->
+                let columns =
+                    columnsText
+                    |> Option.map (fun text -> text.Split ',' |> Array.toList)
+                    |> Option.defaultValue []
 
-                if parts.Length < 2 then
-                    Rows([], [])
-                else
-                    let columns = parts.[1].Split ',' |> Array.toList
-
-                    let rows =
-                        [ 1..count ]
-                        |> List.choose (fun _ ->
-                            let r = reader.ReadLine()
-
-                            if isNull r then None else Some(unescapeLine r))
-
-                    Rows(columns, rows)
+                readRows columns count []
+            | _ -> Failure(sprintf "不正なサーバ応答ヘッダー: %s" h)
+        | Some h -> Failure(sprintf "不正なサーバ応答: %s" h)
 
     member this.Query(sql: string) = this.Send sql
 

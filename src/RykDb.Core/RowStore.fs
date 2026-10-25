@@ -201,7 +201,7 @@ module internal CommitIntent =
             if count > uint64 System.Int32.MaxValue then
                 return! err (DbError.corruption "CommitIntent: バッチ数が大きすぎます")
             else
-                let! batches, _ = Reader.readItems count readOne c1
+                let! batches, _ = Reader.readItems readOne count c1
                 return batches
         }
 
@@ -235,9 +235,12 @@ module internal CommitIntent =
             let final = Path.Combine(d, name)
             let temp = final + ".tmp"
             let bytes = encode batches
-            use fs = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None)
-            fs.Write(bytes, 0, bytes.Length)
-            fs.Flush true
+
+            do
+                use fs = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None)
+                fs.Write(bytes, 0, bytes.Length)
+                fs.Flush true
+
             File.Move(temp, final, true)
             final)
 
@@ -548,6 +551,28 @@ module internal Dml =
             |> Array.map snd
             |> Seq.ofArray
 
+    let private applyLimit (limit: int) (rows: seq<SqlValue array>) =
+        if limit > 0 then Seq.truncate limit rows else rows
+
+    let private storeLimitFor (limit: int) (slots: (byte array * SqlValue array option) list) =
+        if limit <= 0 then
+            0
+        else
+            let deletions = slots |> List.filter (fun (_, value) -> value.IsNone) |> List.length
+            int (min (int64 System.Int32.MaxValue) (int64 limit + int64 deletions))
+
+    let private inKeyRange (lowerBytes: byte array) (upperBytes: byte array option) (key: byte array) =
+        Bytes.compare key lowerBytes >= 0
+        && match upperBytes with
+           | None -> true
+           | Some hb -> Bytes.compare key hb <= 0
+
+    let private inIndexRange (lowerBytes: byte array) (upperBytes: byte array option) (key: byte array) =
+        inKeyRange lowerBytes upperBytes key
+        || match upperBytes with
+           | Some hb -> KeyBuilder.startsWithPrefix key hb
+           | None -> false
+
     /// 主キーで既存行を取り出す（txn の書き込みを含む）。
     let getByPrimaryKeyWithTxn
         (store: RowStore)
@@ -578,16 +603,8 @@ module internal Dml =
         =
         let slots = Transaction.slotsOf txn (tableSpace schema)
 
-        let deletionCount =
-            slots |> List.filter (fun (_, value) -> value.IsNone) |> List.length
-
-        let storeLimit = if limit > 0 then limit + deletionCount else 0
-
-        scanByPrimaryKey store schema visible storeLimit
-        |> Result.map (fun rows ->
-            let merged = overlayRows (RowKey.primary schema) slots rows
-
-            if limit > 0 then Seq.truncate limit merged else merged)
+        scanByPrimaryKey store schema visible (storeLimitFor limit slots)
+        |> Result.map (fun rows -> overlayRows (RowKey.primary schema) slots rows |> applyLimit limit)
 
     /// 主キーの範囲走査（txn の書き込みを含む）。
     let scanByPrimaryKeyRangeWithTxn
@@ -599,64 +616,42 @@ module internal Dml =
         (endKey: SqlValue array option)
         (limit: int)
         =
-        let scanByPrimaryKeyRange
+        let scanPrimaryKeyRange
             (store: RowStore)
             (schema: TableSchema)
             (visible: uint64 option)
-            (startKey: SqlValue array)
-            (endKey: SqlValue array option)
+            (lowerBytes: byte array)
+            (upperBytes: byte array option)
             (limit: int)
             =
-            let startBytes = KeyBuilder.ofValues startKey
-
-            RowStore.scanAt store (tableSpace schema) startBytes visible limit
+            RowStore.scanAt store (tableSpace schema) lowerBytes visible limit
             |> Result.map (fun rows ->
-                let matched =
-                    rows
-                    |> Seq.choose (fun (k, v) ->
-                        match v with
-                        | Some row ->
-                            match endKey with
-                            | None -> Some row
-                            | Some ek when Bytes.compare k (KeyBuilder.ofValues ek) <= 0 -> Some row
-                            | _ -> None
-                        | None -> None)
-
-                if limit > 0 then Seq.truncate limit matched else matched)
+                rows
+                |> Seq.choose (fun (key, value) ->
+                    match value with
+                    | Some row when inKeyRange lowerBytes upperBytes key -> Some row
+                    | _ -> None)
+                |> applyLimit limit)
 
         let startBytes = KeyBuilder.ofValues startKey
         let endBytes = endKey |> Option.map KeyBuilder.ofValues
 
-        let inRange (key: byte array) =
-            Bytes.compare key startBytes >= 0
-            && match endBytes with
-               | None -> true
-               | Some eb -> Bytes.compare key eb <= 0
-
         let slots =
             Transaction.slotsOf txn (tableSpace schema)
-            |> List.filter (fun (key, _) -> inRange key)
+            |> List.filter (fun (key, _) -> inKeyRange startBytes endBytes key)
 
-        let deletionCount =
-            slots |> List.filter (fun (_, value) -> value.IsNone) |> List.length
-
-        let storeLimit = if limit > 0 then limit + deletionCount else 0
-
-        scanByPrimaryKeyRange store schema visible startKey endKey storeLimit
+        scanPrimaryKeyRange store schema visible startBytes endBytes (storeLimitFor limit slots)
         |> Result.map (fun rows ->
             let merged = overlayRows (RowKey.primary schema) slots rows
 
             let filtered =
-                match endKey with
+                match endBytes with
                 | None -> merged
-                | Some ek ->
+                | Some eb ->
                     merged
-                    |> Seq.filter (fun row ->
-                        let pk = TableSchema.primaryKeyOf schema row
-                        let pkBytes = KeyBuilder.ofValues pk
-                        Bytes.compare pkBytes (KeyBuilder.ofValues ek) <= 0)
+                    |> Seq.filter (fun row -> Bytes.compare (RowKey.primary schema row) eb <= 0)
 
-            if limit > 0 then Seq.truncate limit filtered else filtered)
+            applyLimit limit filtered)
 
     /// 索引の値に一致する全行を引く（txn の書き込みを含む）。
     let scanByIndexPrefixWithTxn
@@ -668,24 +663,19 @@ module internal Dml =
         (values: SqlValue array)
         (limit: int)
         =
-        let scanByIndexPrefix
+        let scanIndexPrefix
             (store: RowStore)
             (index: IndexSchema)
             (visible: uint64 option)
-            (values: SqlValue array)
+            (prefix: byte array)
             (limit: int)
             =
-            let prefix = KeyBuilder.ofValues values
-            let ks = indexSpace index
-
-            RowStore.scanAt store ks prefix visible limit
+            RowStore.scanAt store (indexSpace index) prefix visible limit
             |> Result.map (fun rows ->
-                let matched =
-                    rows
-                    |> Seq.takeWhile (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix)
-                    |> Seq.choose snd
-
-                if limit > 0 then Seq.truncate limit matched else matched)
+                rows
+                |> Seq.takeWhile (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
+                |> Seq.choose snd
+                |> applyLimit limit)
 
         let prefix = KeyBuilder.ofValues values
 
@@ -693,14 +683,8 @@ module internal Dml =
             Transaction.slotsOf txn (indexSpace index)
             |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
 
-        let deletionCount = slots |> List.filter (fun (_, v) -> v.IsNone) |> List.length
-        let storeLimit = if limit > 0 then limit + deletionCount else 0
-
-        scanByIndexPrefix store index visible values storeLimit
-        |> Result.map (fun rows ->
-            let merged = overlayRows (RowKey.indexKey schema index) slots rows
-
-            if limit > 0 then Seq.truncate limit merged else merged)
+        scanIndexPrefix store index visible prefix (storeLimitFor limit slots)
+        |> Result.map (fun rows -> overlayRows (RowKey.indexKey schema index) slots rows |> applyLimit limit)
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
     let scanByIndexRangeWithTxn
@@ -713,58 +697,30 @@ module internal Dml =
         (upper: SqlValue array option)
         (limit: int)
         =
-        let scanByIndexRange
+        let scanIndexRange
             (store: RowStore)
             (index: IndexSchema)
             (visible: uint64 option)
-            (lower: SqlValue array)
-            (upper: SqlValue array option)
+            (lowerBytes: byte array)
+            (upperBytes: byte array option)
             (limit: int)
             =
-            let loBytes = KeyBuilder.ofValues lower
-            let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues v)
-
-            let inRange (key: byte array) =
-                let lowerOk = Bytes.compare key loBytes >= 0
-
-                let upperOk =
-                    match hiBytes with
-                    | None -> true
-                    | Some hb -> Bytes.compare key hb <= 0 || KeyBuilder.startsWithPrefix key hb
-
-                lowerOk && upperOk
-
-            let ks = indexSpace index
-
-            RowStore.scanAt store ks loBytes visible limit
+            RowStore.scanAt store (indexSpace index) lowerBytes visible limit
             |> Result.map (fun rows ->
-                let matched = rows |> Seq.filter (fun (k, _) -> inRange k) |> Seq.choose snd
-                if limit > 0 then Seq.truncate limit matched else matched)
+                rows
+                |> Seq.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
+                |> Seq.choose snd
+                |> applyLimit limit)
 
-        let loBytes = KeyBuilder.ofValues lower
-        let hiBytes = upper |> Option.map (fun v -> KeyBuilder.ofValues v)
-
-        let inRange (key: byte array) =
-            let lowerOk = Bytes.compare key loBytes >= 0
-
-            let upperOk =
-                match hiBytes with
-                | None -> true
-                | Some hb -> Bytes.compare key hb <= 0 || KeyBuilder.startsWithPrefix key hb
-
-            lowerOk && upperOk
+        let lowerBytes = KeyBuilder.ofValues lower
+        let upperBytes = upper |> Option.map KeyBuilder.ofValues
 
         let slots =
             Transaction.slotsOf txn (indexSpace index)
-            |> List.filter (fun (key, _) -> inRange key)
+            |> List.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
 
-        let deletionCount = slots |> List.filter (fun (_, v) -> v.IsNone) |> List.length
-        let storeLimit = if limit > 0 then limit + deletionCount else 0
-
-        scanByIndexRange store index visible lower upper storeLimit
-        |> Result.map (fun rows ->
-            let merged = overlayRows (RowKey.indexKey schema index) slots rows
-            if limit > 0 then Seq.truncate limit merged else merged)
+        scanIndexRange store index visible lowerBytes upperBytes (storeLimitFor limit slots)
+        |> Result.map (fun rows -> overlayRows (RowKey.indexKey schema index) slots rows |> applyLimit limit)
 
     /// 1行を transaction に積む（まだ DB には入らない）。
     /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。
@@ -780,6 +736,25 @@ module internal Dml =
 
             let next = Transaction.put txn tks pk row
             return! applyIndexChange schema next None (Some row)
+        }
+
+    let private replaceRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) (newRow: SqlValue array) =
+        let ensureSamePrimaryKey (schema: TableSchema) (oldRow: SqlValue array) (newRow: SqlValue array) =
+            if Array.forall2 (=) (TableSchema.primaryKeyOf schema oldRow) (TableSchema.primaryKeyOf schema newRow) then
+                ret ()
+            else
+                err (
+                    sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
+                    |> DbError.constraintViolation
+                )
+
+        result {
+            do! ensureSamePrimaryKey schema oldRow newRow
+
+            let afterMain =
+                Transaction.put txn (tableSpace schema) (RowKey.primary schema newRow) newRow
+
+            return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
         }
 
     /// 主キーで更新する（主キーと全索引に新しい値を書き込む）。
@@ -805,21 +780,7 @@ module internal Dml =
 
             match row with
             | None -> return! err (DbError.notFound "更新する行が見つかりません")
-            | Some oldRow ->
-                let oldPkValues = TableSchema.primaryKeyOf schema oldRow
-                let newPkValues = TableSchema.primaryKeyOf schema newRow
-
-                if not (Array.forall2 (=) oldPkValues newPkValues) then
-                    return!
-                        err (
-                            sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
-                            |> DbError.constraintViolation
-                        )
-                else
-                    let tks = tableSpace schema
-                    let newPk = RowKey.primary schema newRow
-                    let afterMain = Transaction.put txn tks newPk newRow
-                    return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
+            | Some oldRow -> return! replaceRow schema txn oldRow newRow
         }
 
     /// 走査済みの行をそのまま使って更新する（主キー検索をやり直さない）。
@@ -827,21 +788,12 @@ module internal Dml =
     let updateRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) (newRow: SqlValue array) =
         result {
             do! TableSchema.validateRow schema newRow
-
-            let oldPkValues = TableSchema.primaryKeyOf schema oldRow
-            let newPkValues = TableSchema.primaryKeyOf schema newRow
-
-            if not (Array.forall2 (=) oldPkValues newPkValues) then
-                return!
-                    err (
-                        sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
-                        |> DbError.constraintViolation
-                    )
-            else
-                let newPk = RowKey.primary schema newRow
-                let afterMain = Transaction.put txn (tableSpace schema) newPk newRow
-                return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
+            return! replaceRow schema txn oldRow newRow
         }
+
+    let private removeRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) =
+        let next = Transaction.remove txn (tableSpace schema) (RowKey.primary schema oldRow)
+        applyIndexChange schema next (Some oldRow) None
 
     /// 主キーで削除する。
     /// 主キーと全索引に tombstone を書く。
@@ -858,14 +810,8 @@ module internal Dml =
 
             match row with
             | None -> return! err (sprintf "削除する行が見つかりません: %s" schema.Name |> DbError.notFound)
-            | Some oldRow ->
-                let pk = RowKey.primary schema oldRow
-                let next = Transaction.remove txn (tableSpace schema) pk
-                return! applyIndexChange schema next (Some oldRow) None
+            | Some oldRow -> return! removeRow schema txn oldRow
         }
 
     /// 走査済みの行をそのまま使って削除する（主キー検索をやり直さない）。
-    let deleteRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) =
-        let pk = RowKey.primary schema oldRow
-        let next = Transaction.remove txn (tableSpace schema) pk
-        applyIndexChange schema next (Some oldRow) None
+    let deleteRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) = removeRow schema txn oldRow

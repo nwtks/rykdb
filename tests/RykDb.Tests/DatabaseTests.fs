@@ -476,6 +476,22 @@ let ``Database: 存在しないテーブルの索引と索引名の重複はエ�
         expectError "同名の CREATE INDEX が OK になっています" (db2.Execute "CREATE INDEX ix_a ON t (a)"))
 
 [<Fact>]
+let ``Database: UNIQUE 索引の backfill は重複値を拒否する`` () =
+    withDb "ddl-unique-backfill" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 7), (2, 7)"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "重複値を含む UNIQUE 索引"
+            (db2.Execute "CREATE UNIQUE INDEX ix_a ON t (a)")
+
+        // 失敗した backfill 後も同じ名前で作成でき、索引 keyspace が不完全なまま公開されていないことを確認する。
+        let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
+        let _, found = ok (db3.Query "SELECT id FROM t WHERE a = 7")
+        Assert.Equal<int>(2, found.Rows.Length))
+
+[<Fact>]
 let ``Database: DROP INDEX で索引が消える`` () =
     withDb "ddl9" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"

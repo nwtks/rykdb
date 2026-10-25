@@ -85,7 +85,7 @@ let private handleClient (db: Database) (client: System.Net.Sockets.TcpClient) (
             let sql = line.Trim()
 
             if sql.Length = 0 then
-                running <- send ""
+                running <- send (sprintf "%s 0" OkTag)
             else
                 match sql with
                 | ".exit"
@@ -137,6 +137,7 @@ let serve
     while not stop.IsCancellationRequested do
         try
             let client = listener.AcceptTcpClient()
+            client.ReceiveTimeout <- 30000
             clientId <- clientId + 1
             onLog (sprintf "[%d] 接続されました" clientId)
 
