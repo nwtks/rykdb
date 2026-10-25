@@ -747,7 +747,7 @@ commit 成功・rollback・`Close` で解除する。
 - **compaction は同期**（バックグラウンドスレッドなし）なので、reader とファイル削除を争わない（§12.2）
 - **WAL は `FileMode.Append, FileShare.Read`** のみ（`Wal.fs`）。書き込み側は常に 1本の経路
 - **TCP サーバは完全逐次** — `AcceptTcpClient` → 1接続を処理 → 次の accept（§11.3）
-- **プロセス間アクセスは非対応**（1プロセス前提）。**ロックファイルは作成しない**（§10）
+- **プロセス間は `.rykdb.lock` で排他**する（root 直下、`FileShare.None`。§7.9）
 
 ### 7.8 DDL の排他（`RootGate`）
 
@@ -778,6 +778,22 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 ロックはプロセス内の表に残る（開いた DB の数だけ。数はふつう小さい）。
 **トランザクションを commit / rollback せずに捨てると、その登録が残り DDL が失敗し続ける**ので、
 `Rollback()` か `Close()` で必ず終わらせる。
+
+### 7.9 プロセス間の排他（`.rykdb.lock`）
+
+WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つのプロセスが同じ DB を書くと壊れる。
+そこで `RowStore.openStore` は root の **`.rykdb.lock` を `FileShare.None` で開いたまま保持**し（`ProcessLock`、`RowStore.fs`）、
+開けなければ `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.lock）`）で失敗する。
+
+- **同一プロセス内の複数ハンドルはロックを共有する**。
+  台帳（正規化 root → トークン → `FileStream`）を持ち、
+  2つ目の `Database.openWith` は既存のロックにトークンを足すだけ。
+  既存の「開いたまま開き直す」テスト（クラッシュ再現）もそのまま動く。
+- **`Close()` でトークンが外れ、最後の 1本が外れたらファイルロックも解放する**。
+  二重 `Close()` は無害。
+- 全ハンドルを Close しないままプロセスが終了しても、OS がロックを解放する。
+- 強制力は OS のファイル共有に依存する（同一マシン・同一ファイルシステムが前提）。
+  ネットワークファイルシステムでは保証されない。
 
 ---
 
@@ -1124,7 +1140,7 @@ Database.openWith root
 | `%06d.wal`      | 先行ログ                          |
 | `%06d.sst`      | データファイル                    |
 
-ロックファイルは作成しない（1プロセス前提。§7.7）。
+ロックファイル（`root/.rykdb.lock`）は 0バイトのまま置かれる。中身は使わない（§7.9）。
 
 ---
 
@@ -1242,7 +1258,11 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **DDL はプロセス内で排他**（`RootGate`）。
   `CREATE INDEX` の backfill 中は他の文が待つ。
   同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。
-- **複数プロセスからの同時アクセスは非対応**（1プロセス前提。ロックファイルを作成しない）。
+- **複数プロセスからの同時アクセスは、プロセス間ロックで拒否する**（§7.9）。
+  2つ目のプロセスは `Database.openWith` が `IoError` で失敗する。
+  同一プロセス内の複数ハンドルはロックを共有するため、そちらは制限なし。
+  ただし gc 境界の集約（`ActiveSnapshotRegistry`）と DDL の排他（`RootGate`）は**プロセス内だけ**なので、
+  別プロセスの transaction は見えない。
 - **TCP サーバは接続ごとに逐次処理で、ハンドルは接続間で引き継がれる**（§11.3）。
   明示 transaction の途中で切れた場合は rollback してから次の接続へ渡す。
 - **同一 `Database` ハンドルを複数スレッドで使うと書き込みが失われる**（状態はマージされない。§7.7）。
@@ -1255,7 +1275,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   未コミットの書き込みは WAL に残っていても再生されない。
 - **ActiveSnapshot はプロセス内の全ハンドル分を集約する**（`ActiveSnapshotRegistry`）。
   別ハンドルの長い transaction も GC 境界に反映される。
-  ただし複数プロセスは非対応なので、他プロセスの transaction は依然として見えない。
+  他プロセスはそもそも開けない（§7.9）ので、見えない transaction は存在しない。
 - **keyspace 横断 commit は intent で回復するが、全 WAL 書込後・intent 削除前の crash ではcommit の成否が一意に決まらない**
   （replay では適用済みになる）。
   物理重複は `filterApplied` で防ぐ。

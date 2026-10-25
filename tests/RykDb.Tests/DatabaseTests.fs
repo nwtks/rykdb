@@ -52,8 +52,6 @@ let ``Database: BEGIN/COMMIT でまとめて反映される`` () =
         let _db11, res = ok (db5.Query "SELECT id FROM t")
         Assert.Equal<int>(2, res.Rows.Length))
 
-// クラッシュ耐性（未 commit の transaction は WAL 再生後も残らない）
-
 [<Fact>]
 let ``E2E: commit してない transaction は残らない`` () =
     withDir "crash2" (fun dir ->
@@ -70,8 +68,6 @@ let ``E2E: commit してない transaction は残らない`` () =
         Assert.Equal<int64>(4L, asInt count.Rows.[0].[0])
 
         ok (reopened.Close()))
-
-// MVCC 分離（Begin で固定した snapshot）
 
 [<Fact>]
 let ``E2E: 別ハンドルの書き込みは既存 transaction に見えない`` () =
@@ -1482,8 +1478,6 @@ let ``E2E: プロセス再起動を模して Disk から復元できる`` () =
 
         ok (reopened.Close()))
 
-// クラッシュ耐性（Close を呼ばずに再オープン → WAL 再生）
-
 [<Fact>]
 let ``E2E: Close しなくても commit 済みの行は残る`` () =
     withDir "crash" (fun dir ->
@@ -1531,7 +1525,51 @@ let ``Database: active transaction は snapshot registry に登録され、commi
         ok (openTx.Close())
         Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone))
 
-// CREATE INDEX の排他
+[<Fact>]
+let ``Database: 別プロセスが開いている DB は開けない`` () =
+    withDir "proc-lock" (fun dir ->
+        // 別プロセスが `FileShare.None` でロックを押さえている状態（同一プロセスの別 fd でも同じ扱い）。
+        use _held =
+            new System.IO.FileStream(
+                System.IO.Path.Combine(dir, ".rykdb.lock"),
+                System.IO.FileMode.OpenOrCreate,
+                System.IO.FileAccess.ReadWrite,
+                System.IO.FileShare.None
+            )
+
+        expectErrorKind ErrorKind.IoError "別プロセスが開いている DB は開けない" (Database.openWith dir))
+
+[<Fact>]
+let ``Database: 同じプロセスの複数ハンドルはロックを共有し、最後の Close で外れる`` () =
+    withDir "proc-lock-share" (fun dir ->
+        let lockPath = System.IO.Path.Combine(dir, ".rykdb.lock")
+
+        let canLockExternally () =
+            try
+                use fs =
+                    new System.IO.FileStream(
+                        lockPath,
+                        System.IO.FileMode.OpenOrCreate,
+                        System.IO.FileAccess.ReadWrite,
+                        System.IO.FileShare.None
+                    )
+
+                true
+            with :? System.IO.IOException ->
+                false
+
+        let db1 = ok (Database.openWith dir)
+        // 同じプロセスなので 2つ目も開ける（ロックは共有）。
+        let db2 = ok (Database.openWith dir)
+        Assert.False(canLockExternally ())
+
+        // 片方だけ閉じてもロックは残る。
+        ok (db1.Close())
+        Assert.False(canLockExternally ())
+
+        // 最後のハンドルを閉じると外れる（他プロセスが開ける）。
+        ok (db2.Close())
+        Assert.True(canLockExternally ()))
 
 [<Fact>]
 let ``Database: 実行中の transaction があると DDL は ConflictError`` () =

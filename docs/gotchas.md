@@ -1176,6 +1176,23 @@ DDL だけはプロセス内で排他にする必要がある。
   `Close()` でも解除される。
 - 回帰テスト: `Database: 実行中の transaction があると DDL は ConflictError`。
 
+### 11.16b プロセス間の排他は「ロックファイル + 台帳」で行う
+
+`FileShare.None` だけでは**同一プロセス内の 2つ目のオープンも失敗する**
+（`flock` は open file description 単位）。
+クラッシュ再現テストのように「開いたまま開き直す」使い方を壊さないため、`ProcessLock` は台帳を持つ。
+
+- 台帳: 正規化 root → (トークン → 共有する `FileStream`)。
+  2つ目のオープンは既存ストリームにトークンを足すだけ。
+- `RowStore.close` がトークンを外し、**最後の 1本**が外れたら `Dispose` してロック解放。
+  二重 `Close` は無害（`TryRemove` が 1回しか成功しない）。
+- 開く途中で失敗したら（壊れた MANIFEST など）**必ず解放する**。
+  押さえたままだと、同じプロセスからも再オープンできないように見える。
+- 注意: `FileShare` の強制力は OS / ファイルシステム依存（同一マシンのローカル FS 前提）。
+- 回帰テスト:
+  `Database: 別プロセスが開いている DB は開けない` /
+  `Database: 同じプロセスの複数ハンドルはロックを共有し、最後の Close で外れる`。
+
 ### 11.17 識別子の比較は `SqlName.equal` に一本化する
 
 `TableSchema.indexOf` が完全一致で `Catalog.eqName` が `OrdinalIgnoreCase` だったため、

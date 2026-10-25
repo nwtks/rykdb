@@ -11,8 +11,6 @@
 
 namespace RykDb.Core
 
-open System.IO
-
 /// 索引の定義。
 type internal IndexSchema =
     {
@@ -171,7 +169,7 @@ module internal Keyspace =
 /// 全バッチを 1つのファイルへ原子的に公開してから書き込み、
 /// 再オープン時に残っていれば未適用分をやり直す。
 module internal CommitIntent =
-    let private dir (root: string) = Path.Combine(root, ".commit")
+    let private dir (root: string) = System.IO.Path.Combine(root, ".commit")
 
     let private encode (batches: (string * Entry array) list) =
         let steps =
@@ -210,8 +208,8 @@ module internal CommitIntent =
         protect (fun () ->
             let d = dir root
 
-            if Directory.Exists d then
-                Directory.GetFiles(d, "*.commit") |> Array.sort
+            if System.IO.Directory.Exists d then
+                System.IO.Directory.GetFiles(d, "*.commit") |> Array.sort
             else
                 [||])
 
@@ -221,7 +219,7 @@ module internal CommitIntent =
     let publish (root: string) (batches: (string * Entry array) list) =
         protect (fun () ->
             let d = dir root
-            Directory.CreateDirectory d |> ignore
+            System.IO.Directory.CreateDirectory d |> ignore
 
             let maxSeq =
                 batches
@@ -232,29 +230,36 @@ module internal CommitIntent =
             let name =
                 sprintf "%s-%s.commit" (maxSeq.ToString("D20")) (System.Guid.NewGuid().ToString("N"))
 
-            let final = Path.Combine(d, name)
+            let final = System.IO.Path.Combine(d, name)
             let temp = final + ".tmp"
             let bytes = encode batches
 
             do
-                use fs = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None)
+                use fs =
+                    new System.IO.FileStream(
+                        temp,
+                        System.IO.FileMode.Create,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.None
+                    )
+
                 fs.Write(bytes, 0, bytes.Length)
                 fs.Flush true
 
-            File.Move(temp, final, true)
+            System.IO.File.Move(temp, final, true)
             final)
 
     /// intent を読む。
     let read (path: string) =
-        protect (fun () -> File.ReadAllBytes path) >>= decode
+        protect (fun () -> System.IO.File.ReadAllBytes path) >>= decode
 
     /// intent を消す。
     /// 失敗を握り潰すと、その後に同じキーが更新・GC されたあとの再起動で
     /// 古い intent が再適用され得るので、エラーとして返す。
     let remove (path: string) =
         protect (fun () ->
-            if File.Exists path then
-                File.Delete path)
+            if System.IO.File.Exists path then
+                System.IO.File.Delete path)
 
 /// keyspace ごとのエンジンとスキーマを束ねたもの。
 /// エンジンの開き方を差し替えられるので、テストではディスクに触れない実装を使える。
@@ -266,7 +271,96 @@ type internal RowStore =
         Engines: Map<string, IStorageEngine>
         /// まだ開いていない keyspace のエンジンを作る
         OpenEngine: string -> Result<IStorageEngine, DbError>
+        /// プロセス間ロックのトークン。
+        /// メモリ上のテスト用 store は None（ファイルを作らない）。
+        Lock: obj option
     }
+
+/// 同じ DB を 2つのプロセスが同時に開かないようにする（`.rykdb.lock`）。
+/// <remarks>
+/// 全 keyspace の WAL / MANIFEST はプロセスを跨いだ排他を持たないため、
+/// 2つのプロセスが書くとデータを壊す。
+/// 開くときに root の `.rykdb.lock` を `FileShare.None` で押さえ、
+/// 取れなければ `IoError` で失敗する（fail-fast）。
+/// **同じプロセス内の複数ハンドルはロックを共有する**（台帳のトークンで数える）ので、
+/// 従来どおり `Database.openWith` を何度も呼べる（クラッシュ再現テストもそのまま動く）。
+/// Close で最後のトークンが外れたらファイルロックも解放する。
+/// 全ハンドルを Close しないままプロセスが終了しても、OS がロックを解放する。
+/// </remarks>
+module internal ProcessLock =
+    /// root に置くロックファイル名。
+    let private fileName = ".rykdb.lock"
+
+    /// 台帳の更新だけを直列化する（ロック自体は root ごとに 1本）。
+    let private gate = new System.Threading.SemaphoreSlim(1, 1)
+
+    /// 正規化した root -> (トークン -> プロセス内で共有する FileStream)。
+    let private held =
+        System.Collections.Concurrent.ConcurrentDictionary<
+            string,
+            System.Collections.Concurrent.ConcurrentDictionary<obj, System.IO.FileStream>
+         >
+            System.StringComparer.Ordinal
+
+    /// ロックを取り、解除に使うトークンを返す。
+    /// 別プロセスが既に開いていれば `IoError`。
+    let acquire (root: string) =
+        gate.Wait()
+
+        try
+            let key = RootKey.normalize root
+
+            let bucket =
+                held.GetOrAdd(
+                    key,
+                    fun _ -> System.Collections.Concurrent.ConcurrentDictionary<obj, System.IO.FileStream>()
+                )
+
+            let token = obj ()
+
+            match bucket |> Seq.tryHead with
+            | Some existing ->
+                bucket.[token] <- existing.Value
+                ret token
+            | None ->
+                let path = System.IO.Path.Combine(key, fileName)
+
+                match
+                    protect (fun () ->
+                        new System.IO.FileStream(
+                            path,
+                            System.IO.FileMode.OpenOrCreate,
+                            System.IO.FileAccess.ReadWrite,
+                            System.IO.FileShare.None
+                        ))
+                with
+                | Ok stream ->
+                    bucket.[token] <- stream
+                    ret token
+                | Error _ ->
+                    err (DbError.create ErrorKind.IoError (sprintf "データベース %s は別のプロセスが開いています（%s）" key fileName))
+        finally
+            gate.Release() |> ignore
+
+    /// ロックを解除する（二重解除は無害）。
+    /// 同じ root を開いている他トークンが残っていればロックは保持したまま。
+    let release (root: string) (token: obj) =
+        gate.Wait()
+
+        try
+            let key = RootKey.normalize root
+
+            match held.TryGetValue key with
+            | true, bucket ->
+                match bucket.TryRemove token with
+                | true, stream ->
+                    if bucket.IsEmpty then
+                        held.TryRemove key |> ignore
+                        protect (fun () -> stream.Dispose()) |> ignore
+                | _ -> ()
+            | _ -> ()
+        finally
+            gate.Release() |> ignore
 
 module internal RowStore =
     let private ensure (store: RowStore) (keyspace: string) =
@@ -342,9 +436,8 @@ module internal RowStore =
     /// LastCommitSeqNo = 0 から始まり、既にディスクにある行がすべて「未来」として見えなくなる。
     /// </remarks>
     let openStore (root: string) =
-        /// ディスク上の keyspace エンジンを開く。
         let openDiskEngine (root: string) (keyspace: string) =
-            let dir = Path.Combine(root, Keyspace.toDirName keyspace)
+            let dir = System.IO.Path.Combine(root, Keyspace.toDirName keyspace)
 
             result {
                 do! Manifest.ensureDirectory dir
@@ -383,12 +476,13 @@ module internal RowStore =
                 }
 
         result {
-            do! protect (fun () -> Directory.CreateDirectory root |> ignore)
+            do! protect (fun () -> System.IO.Directory.CreateDirectory root |> ignore)
+            let! token = ProcessLock.acquire root
 
             let! known =
                 protect (fun () ->
-                    Directory.GetDirectories root
-                    |> Array.choose (fun dir -> Path.GetFileName dir |> Keyspace.tryFromDirName)
+                    System.IO.Directory.GetDirectories root
+                    |> Array.choose (fun dir -> System.IO.Path.GetFileName dir |> Keyspace.tryFromDirName)
                     |> Array.toList)
 
             let! engines = openEngines known Map.empty
@@ -398,9 +492,14 @@ module internal RowStore =
                     Root = root
                     Engines = engines
                     OpenEngine = openEngine
+                    Lock = Some token
                 }
 
-            return! replayPending store
+            match replayPending store with
+            | Ok ready -> return ready
+            | Error e ->
+                ProcessLock.release root token
+                return! Error e
         }
 
     /// エンジンの開き方を差し替えて、空の RowStore を作る（テスト用）。
@@ -410,6 +509,7 @@ module internal RowStore =
             Root = root
             Engines = Map.empty
             OpenEngine = openEngine
+            Lock = None
         }
 
     /// keyspace のエンジン（無ければ作る）。
@@ -471,9 +571,16 @@ module internal RowStore =
         |> Map.toList
         |> List.fold (fun acc (_, e) -> max acc (if e.NextSeqNo = 0UL then 0UL else e.NextSeqNo - 1UL)) 0UL
 
-    /// 全 keyspace を close する。
+    /// 全 keyspace を close し、プロセス間ロックを外す。
+    /// ロックの解除は二重 Close でも無害（トークンは一度しか外れない）。
     let close (store: RowStore) =
-        store.Engines |> Map.toList |> foldOk (fun () (_, e) -> e.Close()) ()
+        let outcome = store.Engines |> Map.toList |> foldOk (fun () (_, e) -> e.Close()) ()
+
+        match store.Lock with
+        | Some token -> ProcessLock.release store.Root token
+        | None -> ()
+
+        outcome
 
 /// DML — スキーマと transaction を使う上位操作。
 /// 1行の書き込みは「主キーの LSM への 1件 + 各索引の LSM への 1件」。
