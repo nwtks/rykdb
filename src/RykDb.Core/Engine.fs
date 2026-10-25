@@ -58,6 +58,7 @@ module internal DbStateOps =
     /// （backfillIndex はトランザクションを外さないため触らない）。
     /// GC 境界は「自ハンドルの active snapshot」と「同じ DB を開いている他ハンドルの active snapshot」の最小値。
     /// 後者は `ActiveSnapshotRegistry` から集約する（`registration` は自分自身の登録で、除外する）。
+    /// 書き込みは `RootGate` の共有ロックを取り、DDL の排他と交差しないようにする。
     let commitToStore
         (root: string)
         (registration: obj option)
@@ -65,19 +66,20 @@ module internal DbStateOps =
         (mgr: TransactionManager)
         (txn: Transaction)
         =
-        result {
-            let! manager, _, batches = TransactionManager.commit mgr txn
+        RootGate.withShared root (fun () ->
+            result {
+                let! manager, _, batches = TransactionManager.commit mgr txn
 
-            let snapshot =
-                let own = TransactionManager.activeSnapshot manager
+                let snapshot =
+                    let own = TransactionManager.activeSnapshot manager
 
-                match ActiveSnapshotRegistry.oldestExcept registration root with
-                | Some other -> min own other
-                | None -> own
+                    match ActiveSnapshotRegistry.oldestExcept registration root with
+                    | Some other -> min own other
+                    | None -> own
 
-            let! next = RowStore.writeBatchesWithSnapshot snapshot store batches
-            return next, manager
-        }
+                let! next = RowStore.writeBatchesWithSnapshot snapshot store batches
+                return next, manager
+            })
 
     let commitTransaction (state: DbState) (txn: Transaction) =
         result {
@@ -326,44 +328,61 @@ module internal Ddl =
                 }
         }
 
+    /// DDL を排他の内側で実行する。
+    /// <remarks>
+    /// - 書き込み中の文があれば、それが終わるまで待つ（`RootGate` の共有ロック）。
+    /// - 実行中の transaction があれば **待たずに ConflictError** にする。
+    ///   古いスキーマで計算した索引エントリを commit されると、索引に載らない行ができるため。
+    ///   待つと、commit されないまま残った transaction で永久に止まるので失敗側に倒す。
+    /// - 新しい transaction の開始と文の実行は排他の間ブロックされる（実行後は新しいカタログを見る）。
+    /// </remarks>
+    let private exclusiveDdl (state: DbState) (run: DbState -> Result<DbState, DbError>) =
+        RootGate.withExclusive state.Root (fun () ->
+            match ActiveSnapshotRegistry.oldestExcept state.ActiveRegistration state.Root with
+            | Some _ -> err (DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください")
+            | None -> run state)
+
     let createTable (state: DbState) (c: CreateTable) =
-        let existing = Catalog.findTable state.Catalog c.Name
+        let createTableCore (state: DbState) (c: CreateTable) =
+            let existing = Catalog.findTable state.Catalog c.Name
 
-        match existing, c.IfNotExists with
-        | Some _, true -> ret state
-        | Some _, false -> err (sprintf "テーブル %s は既に存在します" c.Name |> DbError.alreadyExists)
-        | None, _ ->
-            result {
-                let! schema = TableSchema.ofCreateTable c
-                let defn = Catalog.toDefinition schema
+            match existing, c.IfNotExists with
+            | Some _, true -> ret state
+            | Some _, false -> err (sprintf "テーブル %s は既に存在します" c.Name |> DbError.alreadyExists)
+            | None, _ ->
+                result {
+                    let! schema = TableSchema.ofCreateTable c
+                    let defn = Catalog.toDefinition schema
 
-                let implicitUniqueCols =
-                    (schema.Columns
-                     |> List.filter (fun col -> col.Constraint.Unique)
-                     |> List.map (fun col -> [ col.Name ]))
-                    @ (c.Constraints
-                       |> List.choose (fun tc ->
-                           match tc with
-                           | TableConstraint.UniqueColumns cols -> Some cols
-                           | _ -> None))
+                    let implicitUniqueCols =
+                        (schema.Columns
+                         |> List.filter (fun col -> col.Constraint.Unique)
+                         |> List.map (fun col -> [ col.Name ]))
+                        @ (c.Constraints
+                           |> List.choose (fun tc ->
+                               match tc with
+                               | TableConstraint.UniqueColumns cols -> Some cols
+                               | _ -> None))
 
-                let implicitIndexes =
-                    implicitUniqueCols
-                    |> List.mapi (fun i cols ->
-                        {
-                            IndexName = sprintf "__unique_%s_%d" c.Name i
-                            TableName = c.Name
-                            Columns = cols
-                            Unique = true
-                        })
+                    let implicitIndexes =
+                        implicitUniqueCols
+                        |> List.mapi (fun i cols ->
+                            {
+                                IndexName = sprintf "__unique_%s_%d" c.Name i
+                                TableName = c.Name
+                                Columns = cols
+                                Unique = true
+                            })
 
-                let catalog1 = Catalog.addTable state.Catalog defn
+                    let catalog1 = Catalog.addTable state.Catalog defn
 
-                let catalog2 =
-                    implicitIndexes |> List.fold (fun cat idx -> Catalog.addIndex cat idx) catalog1
+                    let catalog2 =
+                        implicitIndexes |> List.fold (fun cat idx -> Catalog.addIndex cat idx) catalog1
 
-                return! saved state catalog2
-            }
+                    return! saved state catalog2
+                }
+
+        exclusiveDdl state (fun fresh -> createTableCore fresh c)
 
     let createIndex (state: DbState) (ci: CreateIndex) =
         let duplicateUniqueValues (schema: TableSchema) (index: IndexSchema) (rows: SqlValue array seq) =
@@ -421,33 +440,37 @@ module internal Ddl =
                         }
                 }
 
-        match Catalog.findTable state.Catalog ci.Table with
-        | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
-        | Some tableDef ->
-            match Catalog.findIndex state.Catalog ci.Name with
-            | Some _ -> err (sprintf "索引 %s は既に存在します" ci.Name |> DbError.alreadyExists)
-            | None ->
-                let missing =
-                    ci.Columns
-                    |> List.filter (fun n -> tableDef.Columns |> List.exists (fun c -> Catalog.eqName n c.Name) |> not)
+        let createIndexCore (state: DbState) (ci: CreateIndex) =
+            match Catalog.findTable state.Catalog ci.Table with
+            | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
+            | Some tableDef ->
+                match Catalog.findIndex state.Catalog ci.Name with
+                | Some _ -> err (sprintf "索引 %s は既に存在します" ci.Name |> DbError.alreadyExists)
+                | None ->
+                    let missing =
+                        ci.Columns
+                        |> List.filter (fun n ->
+                            tableDef.Columns |> List.exists (fun c -> Catalog.eqName n c.Name) |> not)
 
-                if not (List.isEmpty missing) then
-                    err (
-                        sprintf "テーブル %s に列 %s がありません" ci.Table (System.String.Join(", ", missing))
-                        |> DbError.notFound
-                    )
-                else
-                    let defn =
-                        {
-                            IndexName = ci.Name
-                            TableName = ci.Table
-                            Columns = ci.Columns
-                            Unique = ci.Unique
-                        }
+                    if not (List.isEmpty missing) then
+                        err (
+                            sprintf "テーブル %s に列 %s がありません" ci.Table (System.String.Join(", ", missing))
+                            |> DbError.notFound
+                        )
+                    else
+                        let defn =
+                            {
+                                IndexName = ci.Name
+                                TableName = ci.Table
+                                Columns = ci.Columns
+                                Unique = ci.Unique
+                            }
 
-                    let idxSchema = Catalog.toIndexSchema defn
-                    let next = Catalog.addIndex state.Catalog defn
-                    backfillIndex state ci.Table idxSchema >>= fun filled -> saved filled next
+                        let idxSchema = Catalog.toIndexSchema defn
+                        let next = Catalog.addIndex state.Catalog defn
+                        backfillIndex state ci.Table idxSchema >>= fun filled -> saved filled next
+
+        exclusiveDdl state (fun fresh -> createIndexCore fresh ci)
 
     /// DROP TABLE。
     /// 手順:
@@ -456,68 +479,74 @@ module internal Ddl =
     /// カタログを先に外して keyspace を残すと、同名で再 CREATE したときに旧データがそのまま見える
     /// （keyspace は名前由来のディレクトリで再利用される）。
     let dropTable (state: DbState) (name: string) (ifExists: bool) =
-        match Catalog.findTable state.Catalog name with
-        | None ->
-            if ifExists then
-                ret state
-            else
-                err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
-        | Some defn ->
-            result {
-                let! schema = Catalog.toSchema defn
+        let dropTableCore (state: DbState) (name: string) (ifExists: bool) =
+            match Catalog.findTable state.Catalog name with
+            | None ->
+                if ifExists then
+                    ret state
+                else
+                    err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
+            | Some defn ->
+                result {
+                    let! schema = Catalog.toSchema defn
 
-                let withIndexes =
-                    { schema with
-                        Indexes = Catalog.indexSchemasOf state.Catalog schema.Name
-                    }
-
-                let mgr, txn = TransactionManager.beginTxn state.Manager
-                let! rows = Dml.scanByPrimaryKey state.Store withIndexes Snapshot.noLimit 0
-                let! txn2 = foldOk (fun t row -> Dml.deleteRow withIndexes t row) txn rows
-
-                let! store, mgr2 =
-                    DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
-
-                return!
-                    saved
-                        { state with
-                            Store = store
-                            Manager = mgr2
+                    let withIndexes =
+                        { schema with
+                            Indexes = Catalog.indexSchemasOf state.Catalog schema.Name
                         }
-                        (Catalog.removeTable state.Catalog name)
-            }
+
+                    let mgr, txn = TransactionManager.beginTxn state.Manager
+                    let! rows = Dml.scanByPrimaryKey state.Store withIndexes Snapshot.noLimit 0
+                    let! txn2 = foldOk (fun t row -> Dml.deleteRow withIndexes t row) txn rows
+
+                    let! store, mgr2 =
+                        DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
+
+                    return!
+                        saved
+                            { state with
+                                Store = store
+                                Manager = mgr2
+                            }
+                            (Catalog.removeTable state.Catalog name)
+                }
+
+        exclusiveDdl state (fun fresh -> dropTableCore fresh name ifExists)
 
     /// DROP INDEX。
     /// 索引 keyspace の全エントリへ tombstone を書いてからカタログから定義を外す。
     /// 書かないと、消した行の索引エントリが keyspace に残り、
     /// 同名で CREATE INDEX し直したときに tombstone のない旧エントリが見えてしまう。
     let dropIndex (state: DbState) (name: string) (ifExists: bool) =
-        match Catalog.findIndex state.Catalog name with
-        | None ->
-            if ifExists then
-                ret state
-            else
-                err (sprintf "索引 %s が存在しません" name |> DbError.notFound)
-        | Some defn ->
-            result {
-                let space = Keyspace.index defn.IndexName
-                let mgr, txn = TransactionManager.beginTxn state.Manager
-                let! entries = RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
+        let dropIndexCore (state: DbState) (name: string) (ifExists: bool) =
+            match Catalog.findIndex state.Catalog name with
+            | None ->
+                if ifExists then
+                    ret state
+                else
+                    err (sprintf "索引 %s が存在しません" name |> DbError.notFound)
+            | Some defn ->
+                result {
+                    let space = Keyspace.index defn.IndexName
+                    let mgr, txn = TransactionManager.beginTxn state.Manager
+                    let! entries = RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
 
-                let! txn2 =
-                    foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn entries
+                    let! txn2 =
+                        foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn entries
 
-                let! store, mgr2 =
-                    DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
+                    let! store, mgr2 =
+                        DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
 
-                return!
-                    saved
-                        { state with
-                            Store = store
-                            Manager = mgr2
-                        }
-                        (Catalog.removeIndex state.Catalog name)
-            }
+                    return!
+                        saved
+                            { state with
+                                Store = store
+                                Manager = mgr2
+                            }
+                            (Catalog.removeIndex state.Catalog name)
+                }
+
+        exclusiveDdl state (fun fresh -> dropIndexCore fresh name ifExists)
 
 module internal Engine =
     let runStatement (state: DbState) (txn: Transaction) (stmt: Statement) =

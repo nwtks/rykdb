@@ -257,6 +257,16 @@ module internal TransactionManager =
 
                 Ok(updated, commitSeq, batches)
 
+/// 同じ DB を指す root 表記の揺れ（相対・絶対・末尾の /）を吸収する。
+module internal RootKey =
+    let normalize (root: string) =
+        if System.String.IsNullOrEmpty root then
+            ""
+        else
+            match protect (fun () -> System.IO.Path.GetFullPath root) with
+            | Ok full -> full
+            | Error _ -> root
+
 /// プロセス内で開いている全ハンドルの active transaction の snapshot を集約する。
 /// <remarks>
 /// GC の境界は「最古の active snapshot」なので、
@@ -278,17 +288,11 @@ module internal ActiveSnapshotRegistry =
          >
             System.StringComparer.Ordinal
 
-    /// 同じ DB を相対パスと絶対パスで開いても同じ束に入るようにする。
-    let private keyOf (root: string) =
-        if System.String.IsNullOrEmpty root then
-            ""
-        else
-            match protect (fun () -> System.IO.Path.GetFullPath root) with
-            | Ok full -> full
-            | Error _ -> root
-
     let private bucket (root: string) =
-        byRoot.GetOrAdd(keyOf root, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<obj, uint64>())
+        byRoot.GetOrAdd(
+            RootKey.normalize root,
+            fun _ -> System.Collections.Concurrent.ConcurrentDictionary<obj, uint64>()
+        )
 
     /// snapshot を登録し、解除に使うトークンを返す。
     let register (root: string) (snapshot: uint64) =
@@ -299,18 +303,20 @@ module internal ActiveSnapshotRegistry =
     /// 登録を解除する（commit 成功・rollback・Close）。
     /// 解除し忘れても「版を余分に残す」側にしか倒れない（安全側）。
     let unregister (root: string) (token: obj) =
-        match byRoot.TryGetValue(keyOf root) with
+        let key = RootKey.normalize root
+
+        match byRoot.TryGetValue key with
         | true, inner ->
             inner.TryRemove token |> ignore
 
             if inner.IsEmpty then
-                byRoot.TryRemove(keyOf root) |> ignore
+                byRoot.TryRemove key |> ignore
         | _ -> ()
 
     /// その root で active な snapshot の最小値。
     /// token に自分の登録を渡すと、これから commit する transaction 自身を除外できる。
     let oldestExcept (token: obj option) (root: string) =
-        match byRoot.TryGetValue(keyOf root) with
+        match byRoot.TryGetValue(RootKey.normalize root) with
         | true, inner ->
             inner
             |> Seq.fold
@@ -328,3 +334,55 @@ module internal ActiveSnapshotRegistry =
                         | None -> Some pair.Value)
                 None
         | _ -> None
+
+/// 進行中の書き込みと DDL を同じ root 単位で直列化する。
+/// <remarks>
+/// `CREATE INDEX` の backfill は「テーブルを走査して索引エントリを書く」ので、
+/// 途中で別の書き込みが入ると索引に載らない行ができる。
+/// - **DDL**（CREATE INDEX / DROP INDEX / DROP TABLE / CREATE TABLE）は排他ロックを取る。
+/// - **文の実行と commit** は共有ロックを取り、DDL の実行中は待つ。
+/// 明示 transaction はロックを保持しない（DDL と重なった場合は
+/// commit 時にカタログ版の不一致を検出して ConflictError にする。architecture §12.2）。
+/// 同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
+/// </remarks>
+module internal RootGate =
+    /// 正規化した root -> ゲート。
+    let private gates =
+        System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.ReaderWriterLockSlim>
+            System.StringComparer.Ordinal
+
+    let private gateOf (root: string) =
+        gates.GetOrAdd(
+            RootKey.normalize root,
+            fun _ -> new System.Threading.ReaderWriterLockSlim(System.Threading.LockRecursionPolicy.SupportsRecursion)
+        )
+
+    /// 書き込み系（文の実行と commit）の共有ロック。
+    /// 既にこのスレッドがロックを持っていれば何もしない（DDL の内部 commit・入れ子の commit）。
+    let withShared (root: string) (f: unit -> 'r) =
+        let gate = gateOf root
+
+        if gate.IsReadLockHeld || gate.IsWriteLockHeld then
+            f ()
+        else
+            gate.EnterReadLock()
+
+            try
+                f ()
+            finally
+                gate.ExitReadLock()
+
+    /// DDL の排他ロック。
+    /// 書き込み中の文があれば終わるまで待つ。
+    let withExclusive (root: string) (f: unit -> 'r) =
+        let gate = gateOf root
+
+        if gate.IsWriteLockHeld then
+            f ()
+        else
+            gate.EnterWriteLock()
+
+            try
+                f ()
+            finally
+                gate.ExitWriteLock()

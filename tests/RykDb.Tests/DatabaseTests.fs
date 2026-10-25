@@ -1530,3 +1530,31 @@ let ``Database: active transaction は snapshot registry に登録され、commi
         Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsSome)
         ok (openTx.Close())
         Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone))
+
+// CREATE INDEX の排他
+
+[<Fact>]
+let ``Database: 実行中の transaction があると DDL は ConflictError`` () =
+    withDir "ddl-conflict" (fun dir ->
+        let db1 = ok (Database.openWith dir)
+        let db2 = exec db1 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+
+        // BEGIN は新しいハンドルを返す。元のハンドルは transaction を持たないので DDL を試せる。
+        let tx = ok (db2.Begin())
+        let tx2, _ = ok (tx.Execute "INSERT INTO t VALUES (1, 10)")
+
+        // backfill 中に古いスキーマの transaction が commit すると索引が壊れるので、排他にする。
+        expectErrorKind
+            ErrorKind.ConflictError
+            "実行中の transaction があると CREATE INDEX は ConflictError"
+            (db2.Execute "CREATE INDEX ix_v ON t (v)")
+
+        // transaction を終わらせれば通る（そのあとは索引が維持される）。
+        let rolled = ok (tx2.Rollback())
+        let made = exec db2 "CREATE INDEX ix_v ON t (v)"
+        let inserted = exec made "INSERT INTO t VALUES (2, 20)"
+        let _, found = ok (inserted.Query "SELECT id FROM t WHERE v = 20")
+        Assert.Equal<int>(1, found.Rows.Length)
+
+        ok (inserted.Close())
+        ok (rolled.Close()))

@@ -111,20 +111,20 @@ flowchart TB
 
 ### 採用している手法（サマリ）
 
-| 領域       | 手法・アルゴリズム                                                                   | 詳細                                                |
-| ---------- | ------------------------------------------------------------------------------------ | --------------------------------------------------- |
-| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                          | §8                                                  |
-| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                       | §8.1                                                |
-| SSTable    | ブロック + **restart 配列 + 接頭辞共有** + Bloom filter + Footer v4（88 バイト）     | §8.2                                                |
-| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                | §8.4–8.5                                            |
-| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                | §8.6                                                |
-| 並行制御   | **ロックレス**: 不変ハンドル + **MVCC（Snapshot Isolation）** + first-committer-wins | §7                                                  |
-| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                               | §4                                                  |
-| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                            | §6                                                  |
-| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                          | §5.2                                                |
-| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                        | §3                                                  |
-| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                  | [`coding-conventions.md`](coding-conventions.md) §1 |
-| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                    | §4.2, §8.1                                          |
+| 領域       | 手法・アルゴリズム                                                                 | 詳細                                                |
+| ---------- | ---------------------------------------------------------------------------------- | --------------------------------------------------- |
+| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                        | §8                                                  |
+| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                     | §8.1                                                |
+| SSTable    | ブロック + **restart 配列 + 接頭辞共有** + Bloom filter + Footer v4（88 バイト）   | §8.2                                                |
+| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                              | §8.4–8.5                                            |
+| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                              | §8.6                                                |
+| 並行制御   | **不変ハンドル + MVCC（Snapshot Isolation）** + first-committer-wins。DDL だけ排他 | §7                                                  |
+| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                             | §4                                                  |
+| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                          | §6                                                  |
+| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                        | §5.2                                                |
+| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                      | §3                                                  |
+| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                | [`coding-conventions.md`](coding-conventions.md) §1 |
+| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                  | §4.2, §8.1                                          |
 
 ### 依存の向き
 
@@ -722,9 +722,9 @@ commit 成功・rollback・`Close` で解除する。
 > `Engine.runStatement` には到達しない。
 > 明示 transaction はライブラリ API の `db.Begin()` / CLI の `.commit` `.rollback` を使う。
 
-### 7.7 同時実行制御 — ロックは 1つもない
+### 7.7 同時実行制御 — 半導は値、DDL だけ排他
 
-`src/` 全体に `lock` / `Monitor` / `SemaphoreSlim` / `Mutex` / `Interlocked` は存在しない。
+通常の書き込み経路に `lock` / `Monitor` / `Interlocked` はない。
 同時実行制御は次の 4層の組み合わせで成り立っている。
 
 | 層                         | 役割                           | 詳細                                                                                                                    |
@@ -748,6 +748,36 @@ commit 成功・rollback・`Close` で解除する。
 - **WAL は `FileMode.Append, FileShare.Read`** のみ（`Wal.fs`）。書き込み側は常に 1本の経路
 - **TCP サーバは完全逐次** — `AcceptTcpClient` → 1接続を処理 → 次の accept（§11.3）
 - **プロセス間アクセスは非対応**（1プロセス前提）。**ロックファイルは作成しない**（§10）
+
+### 7.8 DDL の排他（`RootGate`）
+
+`CREATE INDEX` の backfill は「テーブルを走査して索引エントリを書く」ので、
+途中に他の書き込みが入ると**索引に載らない行**ができる（または消えた行のエントリが残る）。
+そこで **DDL だけはプロセス内で排他**にする（`RootGate`、`Transactions.fs`）。
+
+| 操作                                    | ゲート                               |
+| --------------------------------------- | ------------------------------------ |
+| DDL（CREATE / DROP TABLE / INDEX）      | **排他**（`RootGate.withExclusive`） |
+| 文の実行と commit（暗黙 transaction）   | 共有（`RootGate.withShared`）        |
+| `Database.Begin()` の登録とカタログ読込 | 共有（短時間だけ保持）               |
+
+DDL は次を順に行う。
+
+1. 排他を取る（実行中の文があれば終わるまで**待つ**）。
+2. `ActiveSnapshotRegistry` を見て、**同じ root で実行中の transaction があれば `ConflictError`** を返す。
+   待たないのは、commit されないまま残った transaction で DDL が永久に止まらないため。
+3. backfill → 索引エントリの commit → カタログ保存。
+
+排他を持っている間は新しい文と `Begin()` がブロックされるので、
+DDL の後に始まる transaction は必ず**新しいカタログ**を読む。
+古いカタログの transaction は step 2 で弾かれるので、
+「索引を作ったのに、その索引を知らない transaction が後から commit する」経路がない。
+
+ゲートは root（正規化した絶対パス）単位の `ReaderWriterLockSlim` で、
+同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
+ロックはプロセス内の表に残る（開いた DB の数だけ。数はふつう小さい）。
+**トランザクションを commit / rollback せずに捨てると、その登録が残り DDL が失敗し続ける**ので、
+`Rollback()` か `Close()` で必ず終わらせる。
 
 ---
 
@@ -1209,7 +1239,9 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件に限る**（下限のある条件のみ）。
   `>` / `<` / `BETWEEN` / `LIKE` のうち、`LIKE` は索引を要求しない。
 - **`CREATE UNIQUE INDEX` は backfill 中も既存行の重複を検査する**。
-- **`CREATE INDEX` の backfill は排他を取らない**。
+- **DDL はプロセス内で排他**（`RootGate`）。
+  `CREATE INDEX` の backfill 中は他の文が待つ。
+  同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。
 - **複数プロセスからの同時アクセスは非対応**（1プロセス前提。ロックファイルを作成しない）。
 - **TCP サーバは接続ごとに逐次処理で、ハンドルは接続間で引き継がれる**（§11.3）。
   明示 transaction の途中で切れた場合は rollback してから次の接続へ渡す。

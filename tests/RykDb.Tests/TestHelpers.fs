@@ -120,8 +120,16 @@ let withStore (_tag: string) (f: RowStore -> unit) =
 
 /// メモリ上の DB を開いてテストし、最後に閉じる（ディスク I/O なし）。
 /// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で持ち替える。
+/// <remarks>
+/// root はテストごとに一意にする。root はプロセス内の `RootGate` /
+/// `ActiveSnapshotRegistry` のキーなので、空文字を共有すると
+/// 並行する他のテストの transaction が DDL の排他判定に引っかかる。
+/// store 側の root は空のまま（commit intent をディスクに書かない）。
+/// </remarks>
 let withDb (_tag: string) (f: Database -> unit) =
-    let db = ok (Database.openWithEngine "" (newMemoryEngineFactory ()))
+    let root = "mem:" + Guid.NewGuid().ToString("N")
+    let store = RowStore.openStoreWith "" (newMemoryEngineFactory ())
+    let db = ok (Database.openWithStore root store)
 
     try
         f db

@@ -1158,6 +1158,24 @@ DDL を transaction に載せる設計に変えるまでは、この制約を維
 `Ddl.createIndex` は索引 keyspace を先に空にしてから backfill し、成功後にカタログへ登録する。
 途中で失敗しても、次回の `CREATE INDEX` が残骸を消してからやり直す。
 
+### 11.16a DDL（CREATE INDEX など）は `RootGate` で排他にする
+
+backfill の途中に別の書き込みが入ると、**その行が索引に載らない**（逆に、消えた行の
+エントリが残る）。
+DDL だけはプロセス内で排他にする必要がある。
+
+- 文の実行と commit は `RootGate.withShared`、DDL は `RootGate.withExclusive`（§7.8）。
+- DDL は排他を取ったあと `ActiveSnapshotRegistry` を見て、
+  **同じ root で実行中の transaction があれば `ConflictError`** を返す。
+  古いカタログで計算した索引エントリを後から commit されるのを防ぐため。
+  **待たない**（commit されないまま残った transaction で永久に止まらないように）。
+- 同じスレッドで「共有 → 排他」の昇格はできない。
+  そのため `Database.Execute` は **DDL 文だけ共有ロックを取らない**（`Ddl` 側が排他を取る）。
+- 結果: トランザクションを `Rollback` / `Commit` せずに捨てると、その登録が残り、
+  **その root の DDL が失敗し続ける**。
+  `Close()` でも解除される。
+- 回帰テスト: `Database: 実行中の transaction があると DDL は ConflictError`。
+
 ### 11.17 識別子の比較は `SqlName.equal` に一本化する
 
 `TableSchema.indexOf` が完全一致で `Catalog.eqName` が `OrdinalIgnoreCase` だったため、

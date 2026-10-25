@@ -47,23 +47,24 @@ type Database internal (root: string, state: DbState) =
         if state.Active.IsSome then
             ret this
         else
-            let mgr, txn = TransactionManager.beginTxn state.Manager
-            let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
+            RootGate.withShared state.Root (fun () ->
+                let mgr, txn = TransactionManager.beginTxn state.Manager
+                let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
 
-            match Catalog.load state.Store with
-            | Error e ->
-                ActiveSnapshotRegistry.unregister state.Root registration
-                Error e
-            | Ok fresh ->
-                let nextState =
-                    { state with
-                        Manager = mgr
-                        Active = Some txn
-                        Catalog = fresh
-                        ActiveRegistration = Some registration
-                    }
+                match Catalog.load state.Store with
+                | Error e ->
+                    ActiveSnapshotRegistry.unregister state.Root registration
+                    Error e
+                | Ok fresh ->
+                    let nextState =
+                        { state with
+                            Manager = mgr
+                            Active = Some txn
+                            Catalog = fresh
+                            ActiveRegistration = Some registration
+                        }
 
-                Ok(Database(root, nextState))
+                    Ok(Database(root, nextState)))
 
     /// 実行中の transaction があるか。
     member _.InTransaction = state.Active.IsSome
@@ -133,22 +134,27 @@ type Database internal (root: string, state: DbState) =
                         results.Add StatementResult.empty
                         runStatements st tail
                     else
-                        let mgr, txn = TransactionManager.beginTxn st.Manager
-                        let registration = ActiveSnapshotRegistry.register st.Root txn.Snapshot.SeqNo
+                        let started =
+                            RootGate.withShared st.Root (fun () ->
+                                let mgr, txn = TransactionManager.beginTxn st.Manager
+                                let registration = ActiveSnapshotRegistry.register st.Root txn.Snapshot.SeqNo
 
-                        match Catalog.load st.Store with
-                        | Error e ->
-                            ActiveSnapshotRegistry.unregister st.Root registration
-                            Error e
-                        | Ok fresh ->
-                            let nextState =
-                                { st with
-                                    Manager = mgr
-                                    Active = Some txn
-                                    Catalog = fresh
-                                    ActiveRegistration = Some registration
-                                }
+                                match Catalog.load st.Store with
+                                | Error e ->
+                                    ActiveSnapshotRegistry.unregister st.Root registration
+                                    Error e
+                                | Ok fresh ->
+                                    Ok
+                                        { st with
+                                            Manager = mgr
+                                            Active = Some txn
+                                            Catalog = fresh
+                                            ActiveRegistration = Some registration
+                                        })
 
+                        match started with
+                        | Error e -> Error e
+                        | Ok nextState ->
                             results.Add StatementResult.empty
                             runStatements nextState tail
                 | Statement.Commit ->
@@ -223,7 +229,7 @@ type Database internal (root: string, state: DbState) =
                         let mgr, txn = TransactionManager.beginTxn st.Manager
                         let registration = ActiveSnapshotRegistry.register st.Root txn.Snapshot.SeqNo
 
-                        let needsReload =
+                        let isDdl =
                             match stmt with
                             | Statement.CreateTable _
                             | Statement.DropTable _
@@ -231,38 +237,34 @@ type Database internal (root: string, state: DbState) =
                             | Statement.DropIndex _ -> true
                             | _ -> false
 
-                        let catalogResult = if needsReload then Catalog.load st.Store else Ok st.Catalog
+                        let run () =
+                            result {
+                                let startState =
+                                    { st with
+                                        Manager = mgr
+                                        ActiveRegistration = Some registration
+                                    }
 
-                        match catalogResult with
-                        | Error e ->
-                            ActiveSnapshotRegistry.unregister st.Root registration
-                            Error e
-                        | Ok fresh ->
-                            let startState =
-                                { st with
-                                    Manager = mgr
-                                    Catalog = fresh
-                                    ActiveRegistration = Some registration
-                                }
+                                let! midState, result = Engine.runStatement startState txn stmt
 
-                            match Engine.runStatement startState txn stmt with
-                            | Error e ->
-                                ActiveSnapshotRegistry.unregister st.Root registration
-                                Error e
-                            | Ok(midState, result) ->
                                 let toCommit =
                                     match midState.Pending with
                                     | Some p -> p
                                     | None -> txn
 
-                                match DbStateOps.commitTransaction midState toCommit with
-                                | Error e ->
-                                    ActiveSnapshotRegistry.unregister st.Root registration
-                                    Error e
-                                | Ok nextState ->
-                                    ActiveSnapshotRegistry.unregister st.Root registration
-                                    results.Add result
-                                    runStatements nextState tail
+                                let! nextState = DbStateOps.commitTransaction midState toCommit
+                                return nextState, result
+                            }
+
+                        let finish (r: Result<DbState * StatementResult, DbError>) =
+                            ActiveSnapshotRegistry.unregister st.Root registration
+                            r
+
+                        match (if isDdl then run () else RootGate.withShared st.Root run) |> finish with
+                        | Error e -> Error e
+                        | Ok(nextState, result) ->
+                            results.Add result
+                            runStatements nextState tail
 
         result {
             let! stmts = Parser.parseStatements sql

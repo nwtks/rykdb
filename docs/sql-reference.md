@@ -801,7 +801,10 @@ CREATE [UNIQUE] INDEX 索引名 ON テーブル (列 [, 列 …]);
 ```
 
 - **既存の行はすべて索引に投入される**（backfill）。
-  backfill の間は排他を取らないので、並行 insert との整合は保証されない。
+- backfill は **プロセス内で排他**。
+  同じ DB で実行中の transaction があれば `ConflictError`（`実行中の transaction があります。…`）を返すので、
+  COMMIT / ROLLBACK してから実行する。
+  他の文は backfill が終わるまで待つ。
 - 索引は**独立した LSM ツリー**（keyspace `i:<索引名>`）に格納される。
 - `UNIQUE` は重複を検査する。
 - 同名の索引が既にあれば `索引 <名前> は既に存在します`。
