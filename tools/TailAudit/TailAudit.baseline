@@ -20,5 +20,7 @@ src/RykDb.Core/Parser.fs|parseExprC/parseExprListElemC/parseExprListToParen/pars
 src/RykDb.Core/Parser.fs|parseExprC/parseExprListElemC/parseExprListToParen/parseCallBodyC/parseNamedPrimaryC/parseCaseBranches/parseCaseTailC/parseCaseC/parsePrimaryC/parseUnaryC/parseMultiplicativeLoop/parseMultiplicativeC/parseAdditiveLoop/parseAdditiveC/parseBetweenAndC/parseBetweenBodyC/parseInListBodyElemC/parseInListBodyLoop/parseInListBodyC/parsePredicateTail/parsePredicateC/parseNotC/parseAndLoop/parseAndC/parseOrLoop/parseOrC|parseOrLoop|call
 src/RykDb.Core/Parser.fs|parseExprC/parseExprListElemC/parseExprListToParen/parseCallBodyC/parseNamedPrimaryC/parseCaseBranches/parseCaseTailC/parseCaseC/parsePrimaryC/parseUnaryC/parseMultiplicativeLoop/parseMultiplicativeC/parseAdditiveLoop/parseAdditiveC/parseBetweenAndC/parseBetweenBodyC/parseInListBodyElemC/parseInListBodyLoop/parseInListBodyC/parsePredicateTail/parsePredicateC/parseNotC/parseAndLoop/parseAndC/parseOrLoop/parseOrC|parsePredicateTail|call
 src/RykDb.Core/Sstable.fs|fromPos/fromBlock|fromPos|call
+src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|loadBlock|call
+src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|scanEntries|call
 src/RykDb.Core/Sstable.fs|pull|pull|call
 src/RykDb.Core/StorageEngine.fs|pull|pull|bare

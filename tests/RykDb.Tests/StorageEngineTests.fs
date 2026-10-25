@@ -49,18 +49,24 @@ let private findBloomMiss (dir: string) (fileNumber: int64) (lo: int) (hi: int) 
         if not (Sstable.mayContain reader k) then Some k else None)
 
 /// SSTable の本文を書き換え、Footer のチェックサムを合わせ直す。
-/// 「開けるが中身が壊れたファイル」を作る（FooterSize = 80、checksum は先頭から 76 バイト目）。
+/// 「開けるが中身が壊れたファイル」を作る
+/// （FooterSize = 84、全体 checksum は +76、Footer 自身の checksum は +80）。
 let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array -> unit) =
     let path = FileMetaData.path dir fileNumber
     let data = File.ReadAllBytes path
     patch data
+    let footerStart = data.Length - Sstable.FooterSize
+    let bodyChecksum = Hashing.checksum (Array.sub data 0 footerStart)
 
-    let footerStart = data.Length - 80
-    let checksum = Hashing.checksum (Array.sub data 0 footerStart)
-    data.[footerStart + 76] <- byte checksum
-    data.[footerStart + 77] <- byte (checksum >>> 8)
-    data.[footerStart + 78] <- byte (checksum >>> 16)
-    data.[footerStart + 79] <- byte (checksum >>> 24)
+    for i in 0..3 do
+        data.[footerStart + 76 + i] <- byte (bodyChecksum >>> (8 * i) &&& 0xFFu)
+
+    let footerChecksum =
+        Hashing.checksum (Array.sub data footerStart (Sstable.FooterSize - 4))
+
+    for i in 0..3 do
+        data.[footerStart + Sstable.FooterSize - 4 + i] <- byte (footerChecksum >>> (8 * i) &&& 0xFFu)
+
     File.WriteAllBytes(path, data)
 
 let private rowKey (i: int) =
@@ -326,9 +332,7 @@ let private twoFilesWithBrokenSecond (dir: string) =
     let f2 =
         mkSst dir 11L 0 [ Entry.put (intKey 3) 3UL (intRow 3); Entry.put (intKey 4) 4UL (intRow 4) ]
 
-    patchSstable dir 11L (fun data ->
-        let footerStart = data.Length - 80
-        data.[footerStart] <- 0x00uy)
+    patchSstable dir 11L (fun data -> data.[data.Length - Sstable.FooterSize] <- 0x00uy)
 
     f1, f2
 
@@ -387,6 +391,43 @@ let ``StorageEngine.scanAt: 欠落ファイルは必要になった時点で検�
 
             // 全行が必要ならファイル 11 を開こうとして IoError になる。
             expectErrorKind ErrorKind.IoError "欠落ファイルは必要になれば検出する" (StorageEngine.scanAt engine None (intKey 1) 10)))
+
+[<Fact>]
+let ``StorageEngine.getAt / scanAt: 必要なブロックだけを部分読みする`` () =
+    withDir "se-partial-blocks" (fun dir ->
+        withEngine dir (fun engine ->
+            // 300件 = 3ブロック（128件ずつ）
+            let entries =
+                [ for i in 0..299 -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i) ]
+
+            let f = mkSst dir 10L 0 entries
+
+            // 2番目のブロックの内部を壊す（全体チェックサムも合わなくなる）。
+            let path = FileMetaData.path dir 10L
+            let reader = ok (Sstable.openTable (File.ReadAllBytes path))
+            let block = reader.Index.[1]
+            let data = File.ReadAllBytes path
+            data.[block.Offset + 2] <- data.[block.Offset + 2] ^^^ 0xFFuy
+            File.WriteAllBytes(path, data)
+            File.SetLastWriteTimeUtc(path, System.DateTime.UtcNow.AddSeconds 1.0)
+
+            let engine =
+                { engine with
+                    Version = Version.empty |> Version.addFile f
+                }
+
+            // ブロック 0 のキーは読める
+            Assert.True((ok (StorageEngine.getAt engine None (intKey 1))).IsSome)
+
+            // ブロック 1 のキーは壊れている
+            expectErrorKind ErrorKind.CorruptionError "必要なブロックの破損は検出する" (StorageEngine.getAt engine None (intKey 200))
+
+            // limit 5 はブロック 0 だけで足りる
+            let five = ok (StorageEngine.scanAt engine None [||] 5) |> Seq.toArray
+            Assert.Equal<int>(5, five.Length)
+
+            // 全件走査は全体チェックサムで壊れていることを検出する
+            expectErrorKind ErrorKind.CorruptionError "全件走査は全体チェックサムで検出する" (StorageEngine.scanAt engine None [||] 0)))
 
 [<Fact>]
 let ``StorageEngine: flush すると SSTable から引ける`` () =

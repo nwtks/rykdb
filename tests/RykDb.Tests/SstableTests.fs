@@ -13,7 +13,17 @@ let private sstEntries n =
     Array.init n (fun i -> SstEntry.make (intKey i) (uint64 (i + 1)) (Some [| SqlValue.Int(int64 i) |]))
     |> Array.sortWith SstEntry.compare
 
-/// ブロック解析の異常系用: 1 ブロック分のデータだけを持つ読み取り側を組み立てる。
+/// Footer 末尾の 4バイト（先頭 80バイトのチェックサム）を付け直す。
+let private fixFooterChecksum (bytes: byte array) =
+    let footerStart = bytes.Length - Sstable.FooterSize
+
+    let checksum =
+        Hashing.checksum (Array.sub bytes footerStart (Sstable.FooterSize - 4))
+
+    for i in 0..3 do
+        bytes.[footerStart + Sstable.FooterSize - 4 + i] <- byte (checksum >>> (8 * i) &&& 0xFFu)
+
+/// ブロック解析の異常系用: 1ブロック分のデータだけを持つ読み取り側を組み立てる。
 let private craftedReader (data: byte array) (offset: int) (length: int) =
     {
         Data = data
@@ -30,7 +40,13 @@ let private craftedReader (data: byte array) (offset: int) (length: int) =
         Bloom = None
         EntryCount = 0L
         MaxSeqNo = 0UL
+        // craftedReader は生のブロックを渡すので、チェックサム検証は行わない。
+        HasBlockChecksums = false
     }
+
+/// 先頭から全エントリを配列で返す（全件必要ならこちら）。
+let private readEntries (reader: SstReader) =
+    Sstable.rangeScan reader [||] 0 |> SstScan.toArray
 
 [<Fact>]
 let ``SstEntry.make / compare: キー昇順・SeqNo 降順`` () =
@@ -152,7 +168,7 @@ let ``SSTable: 構築と全件走査の往復`` () =
     let reader = ok (Sstable.openTable data)
     Assert.Equal<int64>(int64 entries.Length, reader.EntryCount)
 
-    let all = ok (Sstable.entries reader) |> Seq.toArray
+    let all = ok (readEntries reader) |> Seq.toArray
     Assert.Equal(entries.Length, all.Length)
 
     for i in 0 .. entries.Length - 1 do
@@ -178,7 +194,7 @@ let ``SSTable: 空のテーブル`` () =
     let data = ok (Sstable.build [||] 0.01)
     let reader = ok (Sstable.openTable data)
     Assert.Equal<int64>(0L, reader.EntryCount)
-    Assert.Equal(0, ok (Sstable.entries reader) |> Seq.length)
+    Assert.Equal(0, ok (readEntries reader) |> Seq.length)
 
 [<Fact>]
 let ``SSTable: 全 10型の値を往復できる`` () =
@@ -210,7 +226,7 @@ let ``SSTable: 全 10型の値を往復できる`` () =
         |> Array.sortWith SstEntry.compare
 
     let reader = ok (Sstable.openTable (ok (Sstable.build entries 0.01)))
-    let all = ok (Sstable.entries reader) |> Seq.toArray
+    let all = ok (readEntries reader) |> Seq.toArray
 
     for i in 0 .. values.Length - 1 do
         let got = all.[i].Value.Value
@@ -265,20 +281,23 @@ let ``Sstable.openTable: チェックサム不一致は CorruptionError`` () =
 let ``Sstable.openTable: マジック不一致は CorruptionError`` () =
     let data = ok (Sstable.build (sstEntries 500) 0.01)
     let badMagic = Array.copy data
-    badMagic.[badMagic.Length - 80] <- badMagic.[badMagic.Length - 80] ^^^ 0xFFuy
+    let footerStart = badMagic.Length - Sstable.FooterSize
+    badMagic.[footerStart] <- badMagic.[footerStart] ^^^ 0xFFuy
+    fixFooterChecksum badMagic
     expectErrorKind ErrorKind.CorruptionError "マジック不一致はエラーになるはず" (Sstable.openTable badMagic)
 
 [<Fact>]
 let ``Sstable.openTable: 未対応バージョンは CorruptionError`` () =
     let data = ok (Sstable.build (sstEntries 3) 0.01)
     let bad = Array.copy data
-    bad.[bad.Length - 80 + 8] <- 2uy
+    bad.[bad.Length - Sstable.FooterSize + 8] <- 4uy
+    fixFooterChecksum bad
     expectErrorKind ErrorKind.CorruptionError "未対応バージョンはエラーになるはず" (Sstable.openTable bad)
 
 [<Fact>]
 let ``Sstable.openTable: Footer の範囲が不正なら CorruptionError`` () =
     let baseBytes = ok (Sstable.build (sstEntries 3) 0.01)
-    let footerStart = baseBytes.Length - 80
+    let footerStart = baseBytes.Length - Sstable.FooterSize
 
     let writeI64 (bytes: byte array) (off: int) (v: int64) =
         for i in 0..7 do
@@ -300,6 +319,8 @@ let ``Sstable.openTable: Footer の範囲が不正なら CorruptionError`` () =
     for name, patch in cases do
         let bytes = Array.copy baseBytes
         patch bytes
+        // Footer のチェックサムを直して、範囲検証まで到達させる。
+        fixFooterChecksum bytes
         expectErrorKind ErrorKind.CorruptionError name (Sstable.openTable bytes)
 
 [<Fact>]
@@ -308,14 +329,14 @@ let ``Sstable.openTable: Footer に満たないデータは CorruptionError`` ()
 
 [<Fact>]
 let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開ける`` () =
-    // 1 個目の長さ付きキーは読めるが 2 個目が途中で切れている meta 領域
+    // 1個目の長さ付きキーは読めるが 2個目が途中で切れている meta 領域
     let body = [| 0x01uy; 0x61uy |]
 
-    let footer =
+    let footerBody =
         Writer.build
             [
                 Writer.writeBytes (System.Text.Encoding.ASCII.GetBytes "RykDbSST")
-                Writer.uint32LE 1u
+                Writer.uint32LE 3u
                 Writer.int64LE 0L
                 Writer.int64LE 0L
                 Writer.int64LE 0L
@@ -327,12 +348,74 @@ let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開�
                 Writer.uint32LE (Hashing.checksum body)
             ]
 
+    let footerChecksum = Hashing.checksum footerBody
+
+    let footer =
+        Writer.build [ Writer.writeBytes footerBody; Writer.uint32LE footerChecksum ]
+
     let reader = ok (Sstable.openTable (Array.append body footer))
     Assert.Equal<byte array>([||], reader.MinKey)
     Assert.Equal<byte array>([||], reader.MaxKey)
     Assert.Equal<int64>(0L, reader.EntryCount)
     // Bloom なしは「含まれ得る」= true
     Assert.True(Sstable.mayContain reader (intKey 1))
+
+[<Fact>]
+let ``Sstable.openPartial: Footer のチェックサム不一致は CorruptionError`` () =
+    withDir "sst-footer-checksum" (fun dir ->
+        let data = ok (Sstable.build (sstEntries 100) 0.01)
+        let path = System.IO.Path.Combine(dir, "1.sst")
+        System.IO.File.WriteAllBytes(path, data)
+
+        // Footer の indexOff を壊す（Footer チェックサムは直さない）。
+        let bad = Array.copy data
+        let footerStart = bad.Length - Sstable.FooterSize
+        bad.[footerStart + 20] <- bad.[footerStart + 20] ^^^ 0xFFuy
+        System.IO.File.WriteAllBytes(path, bad)
+        expectErrorKind ErrorKind.CorruptionError "部分読みでも Footer の破損を検出する" (Sstable.openPartial path)
+        expectErrorKind ErrorKind.CorruptionError "全体読みでも Footer の破損を検出する" (Sstable.openTable bad))
+
+[<Fact>]
+let ``Sstable.openPartial: 全件・limit・lookup が全読みと一致する`` () =
+    withDir "sst-partial" (fun dir ->
+        let entries = sstEntries 300
+        let path = System.IO.Path.Combine(dir, "1.sst")
+        System.IO.File.WriteAllBytes(path, ok (Sstable.build entries 0.01))
+
+        let partial = ok (Sstable.openPartial path)
+        let all = ok (Sstable.rangeScanPartial partial [||] 0 |> SstScan.toArray)
+        Assert.Equal<int>(entries.Length, all.Length)
+        Assert.Equal<int>(0, Bytes.compare entries.[0].Key all.[0].Key)
+        Assert.Equal<int>(0, Bytes.compare entries.[entries.Length - 1].Key all.[all.Length - 1].Key)
+
+        let limited = ok (Sstable.rangeScanPartial partial [||] 10 |> SstScan.toArray)
+        Assert.Equal<int>(10, limited.Length)
+
+        match ok (Sstable.lookup partial None (intKey 150)) with
+        | Some e -> Assert.Equal<uint64>(151UL, e.SeqNo)
+        | None -> Assert.Fail "lookup が行を見つけられません"
+
+        // 可視性: SeqNo 2 ではキー 150（SeqNo 151）は見えない
+        Assert.True((ok (Sstable.lookup partial (Some 2UL) (intKey 150))).IsNone))
+
+[<Fact>]
+let ``Sstable.openPartial: 壊れたブロックは読み出し時に CorruptionError`` () =
+    withDir "sst-partial-corrupt" (fun dir ->
+        let entries = sstEntries 300
+        let path = System.IO.Path.Combine(dir, "1.sst")
+        System.IO.File.WriteAllBytes(path, ok (Sstable.build entries 0.01))
+
+        // index を読んだ後にブロック 0 の内部を壊す
+        let partial = ok (Sstable.openPartial path)
+        let data = System.IO.File.ReadAllBytes path
+        let block = partial.Index.[0]
+        data.[block.Offset + 2] <- data.[block.Offset + 2] ^^^ 0xFFuy
+        System.IO.File.WriteAllBytes(path, data)
+
+        expectErrorKind
+            ErrorKind.CorruptionError
+            "部分読みでも壊れたブロックを検出する"
+            (Sstable.rangeScanPartial partial [||] 0 |> SstScan.toArray))
 
 [<Fact>]
 let ``Sstable.mayContain: Bloom filter は false negative がない`` () =

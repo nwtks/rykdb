@@ -495,6 +495,17 @@ module internal Hashing =
     let checksum (data: byte array) =
         Array.fold (fun h b -> (h ^^^ uint32 b) * 16777619u) 2166136261u data
 
+    /// 範囲指定の 32bit チェックサム（FNV-1a）。
+    /// SSTable のブロック末尾チェックサムを、コピーを作らずに計算する。
+    let checksumRange (data: byte array) (offset: int) (length: int) =
+        let rec loop (i: int) (h: uint32) =
+            if i >= offset + length then
+                h
+            else
+                loop (i + 1) ((h ^^^ uint32 data.[i]) * 16777619u)
+
+        loop offset 2166136261u
+
     /// ハッシュ値を攪拌する（splitmix64 相当）。
     /// FNV-1a は下位ビットに偏りがちで、Bloom filter のビット分布が悪くなるため。
     let mix (x: uint64) =

@@ -42,9 +42,8 @@ type internal StorageEngine =
 /// 大きな DB でもメモリを圧迫しないよう、値は弱参照で持つ（GC が回収できる）。
 module internal SstReaderCache =
     let private cache =
-        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstReader>>(
+        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstReader>>
             System.StringComparer.Ordinal
-        )
 
     /// ファイルの同一性を表すキー。
     /// 同じ番号のファイルが差し替わった場合はサイズ/mtime が変わるので別キーになる。
@@ -63,6 +62,25 @@ module internal SstReaderCache =
 
     let put (key: string) (reader: SstReader) =
         cache.[key] <- System.WeakReference<SstReader> reader
+
+/// 部分読み用の SSTable リーダー（index / Bloom / meta のみ）のキャッシュ。
+module internal SstPartialCache =
+    let private cache =
+        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstPartial>>
+            System.StringComparer.Ordinal
+
+    let tryGet (key: string) =
+        match cache.TryGetValue key with
+        | true, weak ->
+            match weak.TryGetTarget() with
+            | true, partial -> Some partial
+            | _ ->
+                cache.TryRemove key |> ignore
+                None
+        | _ -> None
+
+    let put (key: string) (partial: SstPartial) =
+        cache.[key] <- System.WeakReference<SstPartial> partial
 
 module internal StorageEngine =
     /// SSTable に書く Bloom filter の誤検出率。
@@ -123,6 +141,21 @@ module internal StorageEngine =
                     SstReaderCache.put key reader
                     Ok reader
 
+    /// 部分読み用の reader を開く（index / Bloom / meta のみ）。
+    let private openPartialSst (engine: StorageEngine) (f: FileMetaData) =
+        let path = FileMetaData.path engine.Dir f.FileNumber
+
+        match protect (fun () -> SstReaderCache.keyOf path (System.IO.FileInfo path)) with
+        | Error e -> Error e
+        | Ok key ->
+            match SstPartialCache.tryGet key with
+            | Some partial -> Ok partial
+            | None ->
+                Sstable.openPartial path
+                >>= fun partial ->
+                    SstPartialCache.put key partial
+                    Ok partial
+
     /// 開いた reader から startKey 以降の全エントリを配列にする。
     /// `[||]` なら先頭から全部。
     /// index の二分探索で startKey より前のブロックは読み飛ばす。
@@ -159,16 +192,24 @@ module internal StorageEngine =
             match files with
             | [] -> ret None
             | f :: rest ->
-                match openSstable engine f with
+                match openPartialSst engine f with
                 | Error e -> Error e
-                | Ok reader ->
-                    if not (Sstable.mayContain reader key) then
-                        probe rest
-                    else
-                        match Sstable.rangeScan reader key 0 |> firstVisible visible key with
-                        | Error e -> Error e
-                        | Ok(Some e) -> ret (Some e)
-                        | Ok None -> probe rest
+                | Ok partial when partial.HasBlockChecksums ->
+                    match Sstable.lookup partial visible key with
+                    | Error e -> Error e
+                    | Ok(Some e) -> ret (Some e)
+                    | Ok None -> probe rest
+                | Ok _ ->
+                    match openSstable engine f with
+                    | Error e -> Error e
+                    | Ok reader ->
+                        if not (Sstable.mayContain reader key) then
+                            probe rest
+                        else
+                            match Sstable.rangeScan reader key 0 |> firstVisible visible key with
+                            | Error e -> Error e
+                            | Ok(Some e) -> ret (Some e)
+                            | Ok None -> probe rest
 
         match Memtable.getVisible engine.Mem key visible with
         | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
@@ -326,10 +367,18 @@ module internal StorageEngine =
             loop i [] list
 
         let openAt (i: int) (f: FileMetaData) (state: MergeSource list) =
-            match openSstable engine f with
+            let startScan =
+                match openPartialSst engine f with
+                | Error e -> Error e
+                | Ok partial when partial.HasBlockChecksums -> Ok(Sstable.rangeScanPartial partial startKey 0)
+                | Ok _ ->
+                    openSstable engine f
+                    |> Result.map (fun reader -> Sstable.rangeScan reader startKey 0)
+
+            match startScan with
             | Error e -> Error e
-            | Ok reader ->
-                match SstScan.next (Sstable.rangeScan reader startKey 0) with
+            | Ok scan ->
+                match SstScan.next scan with
                 | Error e -> Error e
                 | Ok None -> Ok(replaceAt i Drained state)
                 | Ok(Some(e, nxt)) -> Ok(replaceAt i (Opened(e, nxt)) state)
@@ -641,17 +690,8 @@ module internal StorageEngine =
             else
                 Wal.create dir walNumber
 
-        let entriesAt (dir: string) (startKey: byte array) (f: FileMetaData) =
-            readFileBytes dir f.FileNumber
-            >>= Sstable.openTable
-            >>= readEntriesFrom startKey
-
-        let maxSeqNoOnDisk (dir: string) (version: Version) =
-            FileMetaData.foldFiles
-                (entriesAt dir [||])
-                (fun (acc: uint64) entries -> max acc (SstEntry.maxSeqNo entries))
-                0UL
-                (Version.allFiles version)
+        let maxSeqNoOnDisk (version: Version) =
+            Version.allFiles version |> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
 
         let maxFileNumberOnDisk (dir: string) =
             let ssts = sstNumbersOnDisk dir
@@ -687,7 +727,7 @@ module internal StorageEngine =
             do! quarantineOrphans dir version'
             let! walState = openOrCreateWal dir version'
             let! replayed = Wal.read dir walState.FileNumber
-            let! diskMax = maxSeqNoOnDisk dir version'
+            let diskMax = maxSeqNoOnDisk version'
             return buildRecovered version' manifestNumber' walState replayed diskMax
         }
 
