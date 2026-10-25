@@ -373,7 +373,8 @@ let ``RowStore: commit intent が残っていれば再オープンで全 keyspac
         let intent = CommitIntent.publish dir [ b1; b2 ] |> ok
         // 1 keyspace だけ書いたところでクラッシュした状態（intent は残す）
         RowStore.applyBatches 0UL store [ b1 ] |> ok |> ignore
-        let reopened = RowStore.openStore dir |> ok
+        // クラッシュでハンドルを失った状況を模して、ディスクから開き直す。
+        let reopened = RowStore.openStoreTakingOver dir |> ok
 
         Assert.Equal(
             Some 1UL,

@@ -276,16 +276,14 @@ type internal RowStore =
         Lock: obj option
     }
 
-/// 同じ DB を 2つのプロセスが同時に開かないようにする（`.rykdb.lock`）。
+/// 同じ DB を二重に開かないようにする（`.rykdb.lock`）。
 /// <remarks>
-/// 全 keyspace の WAL / MANIFEST はプロセスを跨いだ排他を持たないため、
-/// 2つのプロセスが書くとデータを壊す。
-/// 開くときに root の `.rykdb.lock` を `FileShare.None` で押さえ、
-/// 取れなければ `IoError` で失敗する（fail-fast）。
-/// **同じプロセス内の複数ハンドルはロックを共有する**（台帳のトークンで数える）ので、
-/// 従来どおり `Database.openWith` を何度も呼べる（クラッシュ再現テストもそのまま動く）。
-/// Close で最後のトークンが外れたらファイルロックも解放する。
-/// 全ハンドルを Close しないままプロセスが終了しても、OS がロックを解放する。
+/// **別プロセス**の同時オープンは WAL / MANIFEST を壊すので `FileShare.None` で拒否する。
+/// **同じプロセス**でも既に開いている root は二度開けない。
+/// `Database.openWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
+/// 一方の commit が他方から見えない（古い行を読んでしまう）ため。
+/// クラッシュ再現テストだけは `takeOver = true` で意図的に二重オープンする。
+/// 最後のハンドルを Close するとファイルロックも解放される。
 /// </remarks>
 module internal ProcessLock =
     /// root に置くロックファイル名。
@@ -303,8 +301,9 @@ module internal ProcessLock =
             System.StringComparer.Ordinal
 
     /// ロックを取り、解除に使うトークンを返す。
-    /// 別プロセスが既に開いていれば `IoError`。
-    let acquire (root: string) =
+    /// - 別プロセスが開いている → `IoError`
+    /// - 同じプロセスが既に開いている → `takeOver` でなければ `IoError`
+    let acquire (root: string) (takeOver: bool) =
         gate.Wait()
 
         try
@@ -319,9 +318,11 @@ module internal ProcessLock =
             let token = obj ()
 
             match bucket |> Seq.tryHead with
-            | Some existing ->
+            | Some existing when takeOver ->
                 bucket.[token] <- existing.Value
                 ret token
+            | Some _ ->
+                err (DbError.create ErrorKind.IoError (sprintf "データベース %s は同じプロセスで既に開かれています。Close してから開き直してください" key))
             | None ->
                 let path = System.IO.Path.Combine(key, fileName)
 
@@ -434,8 +435,9 @@ module internal RowStore =
     /// 既存の keyspace ディレクトリはすべて開いておく。
     /// 開かないまま後始末すると、Database.openWith が「SeqNo をどこから採番するか」を知れず、
     /// LastCommitSeqNo = 0 から始まり、既にディスクにある行がすべて「未来」として見えなくなる。
+    /// 同じ root が既にこのプロセスで開かれていれば `IoError`（§ProcessLock）。
     /// </remarks>
-    let openStore (root: string) =
+    let private openStoreCore (takeOver: bool) (root: string) =
         let openDiskEngine (root: string) (keyspace: string) =
             let dir = System.IO.Path.Combine(root, Keyspace.toDirName keyspace)
 
@@ -477,7 +479,7 @@ module internal RowStore =
 
         result {
             do! protect (fun () -> System.IO.Directory.CreateDirectory root |> ignore)
-            let! token = ProcessLock.acquire root
+            let! token = ProcessLock.acquire root takeOver
 
             let! known =
                 protect (fun () ->
@@ -501,6 +503,13 @@ module internal RowStore =
                 ProcessLock.release root token
                 return! Error e
         }
+
+    /// DB を開く。同じ root が既にこのプロセスで開かれていれば `IoError`。
+    let openStore (root: string) = openStoreCore false root
+
+    /// 既に開いているハンドルを「クラッシュで失った」ことにして開き直す（テスト用）。
+    /// 本番経路では使わない（二重に開くと memtable が分かれて古い行を読む）。
+    let internal openStoreTakingOver (root: string) = openStoreCore true root
 
     /// エンジンの開き方を差し替えて、空の RowStore を作る（テスト用）。
     /// ディスクに触れない実装を渡せば、keyspace はすべてメモリ上に作られる。

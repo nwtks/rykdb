@@ -912,7 +912,11 @@ let db4 = db2.Rollback()                           // 破棄
 - **同じ DB を別プロセスから開くことはできない**。
   `Database.openWith` は `<root>/.rykdb.lock` を排他で押さえ、
   取れなければ `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.lock）`）を返す。
-  同一プロセス内の複数ハンドルはロックを共有する。
+- **同じ root を同じプロセスで二度開くこともできない**。
+  2回目の `Database.openWith` は `IoError`
+  （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）を返す。
+  別の `RowStore` ができて memtable が分かれ、一方の commit が他方から見えないため。
+  `Close()` してから開き直すこと。
 - snapshot はトランザクション開始時に固定される
   （repeatable read）。
 - 同一キーへ別トランザクションが未 commit のエントリを持つ場合、後続側は `ConflictError` になる

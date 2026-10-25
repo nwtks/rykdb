@@ -345,8 +345,21 @@ type Database internal (root: string, state: DbState) =
         Database.openWithStore root (RowStore.openStoreWith root openEngine)
 
     /// DB を開く。
+    /// <remarks>
+    /// **同じ root はプロセス内で 1つしか開けない**。2回目は `IoError` を返す
+    /// （別の `RowStore` ができて memtable が分かれ、commit が見えないため）。
+    /// 別プロセスが開いている場合も `IoError`。
+    /// </remarks>
     static member openWith(root: string) =
         result {
             let! store = RowStore.openStore root
+            return! Database.openWithStore root store
+        }
+
+    /// 既に開いているハンドルを「クラッシュで失った」ことにして開き直す（テスト用）。
+    /// 未 commit の transaction / WAL 再生の検証に使う。
+    static member internal openWithTakingOver(root: string) =
+        result {
+            let! store = RowStore.openStoreTakingOver root
             return! Database.openWithStore root store
         }

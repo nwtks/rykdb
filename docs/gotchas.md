@@ -1176,22 +1176,25 @@ DDL だけはプロセス内で排他にする必要がある。
   `Close()` でも解除される。
 - 回帰テスト: `Database: 実行中の transaction があると DDL は ConflictError`。
 
-### 11.16b プロセス間の排他は「ロックファイル + 台帳」で行う
+### 11.16b 二重オープンは「ロック + 台帳」で防ぐ
 
-`FileShare.None` だけでは**同一プロセス内の 2つ目のオープンも失敗する**
-（`flock` は open file description 単位）。
-クラッシュ再現テストのように「開いたまま開き直す」使い方を壊さないため、`ProcessLock` は台帳を持つ。
+`FileShare.None` で他プロセスは防げるが、**同じプロセスの二重オープンは別問題**。
+`Database.openWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
+一方の commit が他方から見えない（**古い行を黙って返す**）。
+そこで `ProcessLock` は台帳（正規化 root → トークン → `FileStream`）を持ち、
+**既にこのプロセスが開いている root の 2回目は `IoError`** にする。
 
-- 台帳: 正規化 root → (トークン → 共有する `FileStream`)。
-  2つ目のオープンは既存ストリームにトークンを足すだけ。
-- `RowStore.close` がトークンを外し、**最後の 1本**が外れたら `Dispose` してロック解放。
-  二重 `Close` は無害（`TryRemove` が 1回しか成功しない）。
+- 失敗を返す方が、黙って古い行を返すより安全。
+- `Close()` でロックを解放（二重 `Close` は無害）。
+- **クラッシュ再現テストは `Database.openWithTakingOver` / `RowStore.openStoreTakingOver`
+  （internal）を使う**。ここだけは意図的に二重オープンし、WAL 再生を検証する。
 - 開く途中で失敗したら（壊れた MANIFEST など）**必ず解放する**。
-  押さえたままだと、同じプロセスからも再オープンできないように見える。
+  押さえたままだと、同じプロセスからも再オープンできない。
 - 注意: `FileShare` の強制力は OS / ファイルシステム依存（同一マシンのローカル FS 前提）。
 - 回帰テスト:
   `Database: 別プロセスが開いている DB は開けない` /
-  `Database: 同じプロセスの複数ハンドルはロックを共有し、最後の Close で外れる`。
+  `Database: 同じ root を二度開くと同じプロセスのエラーになり、Close 後は開ける` /
+  `Database: 明示 transaction があるハンドルは Close でロックを外す`。
 
 ### 11.17 識別子の比較は `SqlName.equal` に一本化する
 
