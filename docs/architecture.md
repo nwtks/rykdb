@@ -1368,7 +1368,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **最終結果は `Op.toArray` で配列化する**（`Plan.runSelect` の戻り値が配列のため）。
 - **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件に限る**（下限のある条件のみ）。
   `>` / `<` / `BETWEEN` / `LIKE` のうち、`LIKE` は索引を要求しない。
-- **`CREATE UNIQUE INDEX` は backfill 中も既存行の重複を検査する**。
+- **`CREATE UNIQUE INDEX` は backfill 後に索引を走査して重複を検査する**（直前の索引値だけ保持）。
 - **DDL はプロセス内で排他**（`RootGate`）。
   `CREATE INDEX` の backfill 中は他の文が待つ。
   同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。

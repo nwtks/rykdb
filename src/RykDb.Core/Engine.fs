@@ -462,6 +462,41 @@ module internal Ddl =
                 })
             current
 
+    /// UNIQUE 索引の索引値が重複していないか確認する。
+    /// 索引キーは「索引値 + 主キー」の順に並ぶので、直前の索引値だけを保持すればよい。
+    let private checkUniqueIndex (store: RowStore) (schema: TableSchema) (idx: IndexSchema) =
+        let positions = idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
+
+        match positions with
+        | Error e -> Error e
+        | Ok positions ->
+            RowStore.scanAt store (Keyspace.index idx.Name) [||] Snapshot.noLimit 0
+            |> Result.bind (fun entries ->
+                use e = entries.GetEnumerator()
+
+                let rec loop (previous: byte array option) =
+                    if not (e.MoveNext()) then
+                        ret ()
+                    else
+                        let _, value = e.Current
+
+                        match value with
+                        | None -> loop previous
+                        | Some row ->
+                            let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
+
+                            if values |> Array.exists SqlValue.isNull then
+                                loop previous
+                            else
+                                let prefix = KeyBuilder.ofValues values
+
+                                match previous with
+                                | Some before when Bytes.compare before prefix = 0 ->
+                                    err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                                | _ -> loop (Some prefix)
+
+                loop None)
+
     /// keyspace の全エントリをチャンク単位で tombstone 消去する。
     let private clearSpaceChunksResult (state: DbState) (space: string) =
         if not (RowStore.keyspaceExists state.Store space) then
@@ -530,31 +565,6 @@ module internal Ddl =
         exclusiveDdl state (fun fresh -> createTableCore fresh c)
 
     let createIndex (state: DbState) (ci: CreateIndex) =
-        let duplicateUniqueValues (schema: TableSchema) (index: IndexSchema) (rows: SqlValue array seq) =
-            let indexColumns =
-                index.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
-
-            match indexColumns with
-            | Error e -> Error e
-            | Ok positions ->
-                rows
-                |> Seq.fold
-                    (fun result row ->
-                        result
-                        >>= fun seen ->
-                            let values = positions |> List.map (fun position -> row.[position])
-
-                            if values |> List.exists SqlValue.isNull then
-                                ret seen
-                            else
-                                let key = KeyBuilder.ofValues values
-
-                                if Set.contains key seen then
-                                    err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" index.Name))
-                                else
-                                    ret (Set.add key seen))
-                    (ret Set.empty)
-
         let backfillIndex (state: DbState) (tableName: string) (idx: IndexSchema) =
             match Catalog.findTable state.Catalog tableName with
             | None -> ret state
@@ -571,17 +581,20 @@ module internal Ddl =
                     let indexKeyFor row = RowKey.indexKey withIndex idx row
 
                     let! cleared = clearSpaceChunksResult state space
-
                     let! rows = Dml.scanByPrimaryKey cleared.Store withIndex Snapshot.noLimit 0
 
-                    if idx.Unique then
-                        let! checkRows = Dml.scanByPrimaryKey cleared.Store withIndex Snapshot.noLimit 0
-                        let! _ = duplicateUniqueValues withIndex idx checkRows
-                        ()
-
-                    return!
+                    let! filled =
                         applyChunks cleared (Seq.chunkBySize BackfillChunkRows rows) (fun txn chunk ->
                             foldOk (fun t row -> ret (Transaction.put t space (indexKeyFor row) row)) txn chunk)
+
+                    if idx.Unique then
+                        match checkUniqueIndex filled.Store withIndex idx with
+                        | Ok() -> return filled
+                        | Error e ->
+                            clearSpaceChunks filled space |> ignore
+                            return! Error e
+                    else
+                        return filled
                 }
 
         let createIndexCore (state: DbState) (ci: CreateIndex) =
