@@ -188,6 +188,21 @@ let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
         Assert.Equal<int64>(31L, asInt rows.[1].[2]))
 
 [<Fact>]
+let ``DML: UPDATE 対象が transaction 上限を超えると CapacityError`` () =
+    withStore "upd-limit" (fun store ->
+        let mgr = seedPeople store (TransactionManager.create ())
+
+        let txn =
+            { Transaction.create 1UL { SeqNo = mgr.LastCommitSeqNo } with
+                LimitBytes = 1L
+            }
+
+        expectErrorKind
+            ErrorKind.CapacityError
+            "UPDATE 上限を超えた対象行を検出できなかった"
+            (DmlOps.update (ctxOf store) peopleSchema txn [ ("age", Expr.Literal(Literal.Int 1L)) ] None))
+
+[<Fact>]
 let ``StatementResult: 表示行はヘッダ・区切り・行を並べる`` () =
     Assert.Equal<string list>([ "(0 rows)" ], StatementResult.empty.ToDisplayLines())
 

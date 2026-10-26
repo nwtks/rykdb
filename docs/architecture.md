@@ -719,6 +719,8 @@ Buffers は概算バイト数を管理し、既定 256MiB を超えると DML �
 巨大 transaction が WAL やメモリを無制限に消費しないための上限。
 DDL のうち `DROP` は一括処理が必要なため上限を外している。
 `CREATE INDEX` の backfill は 8192行ずつのチャンクに分けて commit する。
+複数行 `UPDATE` は最終状態検査のため対象行をメモリに集めるが、
+旧行 + 新行の概算が上限を超えた時点で `CapacityError` にする。
 
 読み取りは lock を取らず（`StorageEngine` が不変だから）、書き込みの直列化はこのモジュールの中だけに閉じている。
 **keyspace 単位の並列性は `RowStore` が持つ** — keyspace が違えば commit も衝突もしない。

@@ -290,22 +290,35 @@ module internal DmlOps =
         let targetSchema = targetSchemaOf schema
 
         let collectUpdates (txn: Transaction) (targets: int list) =
-            let rec go (cur: Op) acc =
+            let rowBytes (row: SqlValue array) =
+                int64 (Entry.approxBytes (Entry.put [||] 0UL row))
+
+            let rec go (cur: Op) acc bytes =
                 match Op.next cur with
                 | Error e -> Error e
                 | Ok None -> Ok(List.rev acc)
                 | Ok(Some(row, next)) ->
                     match matchesWhere targetSchema where row with
                     | Error e -> Error e
-                    | Ok false -> go next acc
+                    | Ok false -> go next acc bytes
                     | Ok true ->
                         match assign targetSchema targets row with
                         | Error e -> Error e
-                        | Ok newRow -> go next ((row, newRow) :: acc)
+                        | Ok newRow ->
+                            let bytes = bytes + rowBytes row + rowBytes newRow
+
+                            if bytes > txn.LimitBytes then
+                                err (
+                                    DbError.capacity (
+                                        sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" txn.LimitBytes
+                                    )
+                                )
+                            else
+                                go next ((row, newRow) :: acc) bytes
 
             result {
                 let! scan = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn 0
-                return! go scan []
+                return! go scan [] 0L
             }
 
         let validateUniqueUpdates (txn: Transaction) (updates: (SqlValue array * SqlValue array) list) =
