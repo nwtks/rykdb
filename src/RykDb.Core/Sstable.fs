@@ -75,19 +75,10 @@ module internal SstEntry =
     /// 1エントリの符号化後のおおよそのバイト数。
     /// compaction の出力をバイト幅で分けるための見積りで、実際の SSTable サイズとは厳密には一致しない。
     let approximateBytes (e: SstEntry) =
-        let valueBytes (v: SqlValue) =
-            match ValueCodec.fixedEncodedBytes v with
-            | Some n -> n
-            | None ->
-                match v with
-                | SqlValue.Text s -> 5 + System.Text.Encoding.UTF8.GetByteCount s
-                | SqlValue.Blob bs -> 5 + bs.Length
-                | _ -> 1
-
         let valueTotal =
             match e.Value with
             | None -> 2
-            | Some vs -> Array.sumBy valueBytes vs + 4
+            | Some vs -> Array.sumBy ValueCodec.approximateBytes vs + 4
 
         e.Key.Length + valueTotal
 
@@ -161,7 +152,7 @@ type internal MergeNode =
 /// 開いたソースの k-way merge。
 /// <remarks>
 /// 値として持ち回れる（1件読むたびに新しい `SstMerge` を返す）。
-/// ヒープは左偏木で、`descend` を明示スタックにして自己再帰を消す（coding-conventions §3）。
+/// ヒープは左偏木で、`descend` を明示スタックにして自己再帰を消す。
 /// 比較は `SstEntry.compare`（キー昇順・同一キーは SeqNo 降順）。
 /// 完全に同じエントリが複数ソースにある場合はソース順で安定させる。
 /// 壊れたブロックは「そのソースの次を読む」時点で Error になる。

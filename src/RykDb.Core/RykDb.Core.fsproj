@@ -10,6 +10,8 @@
     <Compile Include="Errors.fs" />
     <Compile Include="Types.fs" />
     <Compile Include="Serialization.fs" />
+    <Compile Include="Op.fs" />
+    <Compile Include="Spill.fs" />
     <Compile Include="Memtable.fs" />
     <Compile Include="Wal.fs" />
     <Compile Include="BloomFilter.fs" />

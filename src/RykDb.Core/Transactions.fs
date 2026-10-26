@@ -274,7 +274,7 @@ module internal RootKey =
 /// どれか 1本でも生きている間は snapshot を残す必要があるので、
 /// ハンドルの生存トークンを数え、最後の 1本が GC されたら登録を外す。
 /// これが無いと、commit / rollback / Close されずに捨てられたハンドルの登録が残り、
-/// 同じ root の DDL が永久に `ConflictError` になる（architecture §7.8）。
+/// 同じ root の DDL が永久に `ConflictError` になる。
 /// トークンは `obj()` の参照等価。
 /// Core は `mutable` / `ref` を 0件に保つ規約なので、
 /// 連番カウンタではなく参照等価のオブジェクトを鍵にする。
@@ -304,7 +304,7 @@ type internal ActiveRegistration internal (root: string, snapshot: uint64) =
 /// 同じ DB を別ハンドルで開いて長い transaction を走らせている場合も、
 /// その snapshot を考慮しないと compaction がまだ必要な版を捨ててしまう
 /// （`TransactionManager` はハンドル単位のため分からない）。
-/// 複数プロセスからの同時アクセスは非対応（architecture §12.2）なので、プロセス内の表で十分。
+/// 複数プロセスからの同時アクセスは非対応なので、プロセス内の表で十分。
 /// 永続化もしない（再オープン後の transaction は存在しない）。
 /// </remarks>
 module internal ActiveSnapshotRegistry =

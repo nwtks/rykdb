@@ -60,14 +60,14 @@ module internal ExecContext =
 
     /// テーブルを全走査する（主キー昇順 = 挿入順ではないが LSM のキー順）。
     /// limit > 0 なら先頭 limit 件だけをストレージから引く。
+    /// 返り値は遅延の `Op`（1行ずつ引くまでストレージを読まない）。
     let table (ctx: ExecContext) (table: string) (limit: int) =
         result {
             let! schema = schemaOf ctx table
-            let! rows = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible ctx.Txn limit
-            return Op.ofSeq rows
+            return! Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible ctx.Txn limit
         }
 
-    /// 主キーの範囲走査。
+    /// 主キーの範囲走査（遅延の `Op`）。
     let rangeScan
         (ctx: ExecContext)
         (table: string)
@@ -77,14 +77,10 @@ module internal ExecContext =
         =
         result {
             let! schema = schemaOf ctx table
-
-            let! rows =
-                Dml.scanByPrimaryKeyRangeWithTxn ctx.Store schema ctx.Visible ctx.Txn startKey endKey limit
-
-            return Op.ofSeq rows
+            return! Dml.scanByPrimaryKeyRangeWithTxn ctx.Store schema ctx.Visible ctx.Txn startKey endKey limit
         }
 
-    /// 索引で一致する全行を引く。
+    /// 索引で一致する全行を引く（遅延の `Op`）。
     /// 索引は一意とは限らないので、`WHERE indexed_col = v` が 1行になるとは限らない。
     /// `v` を持つ行をすべて返す。
     let byIndex (ctx: ExecContext) (table: string) (indexName: string) (keyValues: SqlValue array) (limit: int) =
@@ -93,14 +89,10 @@ module internal ExecContext =
 
             match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
             | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
-            | Some idx ->
-                let! rows =
-                    Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible ctx.Txn keyValues limit
-
-                return Op.ofSeq rows
+            | Some idx -> return! Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible ctx.Txn keyValues limit
         }
 
-    /// 索引の値が範囲 [lower, upper] に入る行を引く。
+    /// 索引の値が範囲 [lower, upper] に入る行を引く（遅延の `Op`）。
     let byIndexRange
         (ctx: ExecContext)
         (table: string)
@@ -114,11 +106,7 @@ module internal ExecContext =
 
             match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
             | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
-            | Some idx ->
-                let! rows =
-                    Dml.scanByIndexRangeWithTxn ctx.Store schema idx ctx.Visible ctx.Txn lower upper limit
-
-                return Op.ofSeq rows
+            | Some idx -> return! Dml.scanByIndexRangeWithTxn ctx.Store schema idx ctx.Visible ctx.Txn lower upper limit
         }
 
     /// 主キーで 1行を引く。

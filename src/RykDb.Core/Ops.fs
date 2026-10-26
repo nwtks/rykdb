@@ -1,137 +1,14 @@
 namespace RykDb.Core
 
-/// 1列の SqlValue 配列。
-/// メモリ上は配列のまま、回さない。
-type internal Row = SqlValue array
-
-/// 1行取り出す演算子。
-/// Done             = 終わった
-/// Step (row, next) = row を返した。続きは next
-/// Compute f        = f を呼んで 1行取り出す
-///
-/// Compute が「ソースだけを包む 1段」であることが要点。
-/// 変換・フィルタ・結合はすべて「上流の Op を受け取って、`unit -> ...` を返す関数」として書けるので、
-/// ソース側の状態を壊さずに不変のまま合成できる。
-/// Step の next を呼ぶまで次の行は計算されないので、無限長でもメモリは 1行分だけ。
-[<RequireQualifiedAccess>]
-type internal Op =
-    | Done
-    /// 1行と「その次」。
-    /// next は評価されるので長い連鎖を組むには向かない
-    /// （遅延が必要なときは Compute を使う）。
-    | Step of SqlValue array * Op
-    /// 「次に 1行を返す関数」。
-    /// 引数は unit なので遅延評価される。
-    /// ソース側が「まだ計算していない」長い系列を表すときは必ずこれを使う。
-    | Compute of (unit -> Result<(SqlValue array * Op) option, DbError>)
-
-module internal Op =
-    /// 空の演算子。
-    let empty = Op.Done
-
-    /// 1行だけの演算子。
-    let ofRow (row: SqlValue array) = Op.Step(row, Op.Done)
-
-    /// 配列を順に返す演算子。
-    /// 次の行は呼び出すたびに計算する。
-    let ofArray (rows: SqlValue array array) =
-        let rec rowsFrom (i: int) =
-            if i >= rows.Length then
-                Op.Done
-            else
-                Op.Compute(fun () -> ret (Some(rows.[i], rowsFrom (i + 1))))
-
-        rowsFrom 0
-
-    /// seq を順に返す演算子（遅延）。
-    /// 次の行は呼び出すたびに計算する。
-    /// ソース seq は純粋（副作用なし）であることを前提とする。
-    let ofSeq (rows: seq<SqlValue array>) =
-        let e = rows.GetEnumerator()
-
-        let rec rowsFrom () =
-            if e.MoveNext() then
-                Op.Compute(fun () -> ret (Some(e.Current, rowsFrom ())))
-            else
-                (e :> System.IDisposable).Dispose() |> ignore
-                Op.Done
-
-        rowsFrom ()
-
-    /// 1行取り出す。
-    let next (op: Op) =
-        match op with
-        | Op.Done -> ret None
-        | Op.Step(row, nxt) -> ret (Some(row, nxt))
-        | Op.Compute f -> f ()
-
-    /// ソースの次の 1行を引き出して継続に渡す。
-    /// 継続は「行と残りの Op」を受け取り、返した Result をそのまま返す。
-    /// 返した「その行の次」の Op が演算子の残りになる。
-    let pull (src: Op) (cont: SqlValue array -> Op -> Result<(SqlValue array * Op) option, DbError>) =
-        Op.Compute(fun () ->
-            next src
-            >>= function
-                | None -> ret None
-                | Some(row, nxt) -> cont row nxt)
-
-    /// 行を 1つ変換する。
-    /// 失敗したら打切って Error。
-    /// 変換後の行の「次」は map を通した残りにする
-    /// （nxt をそのまま渡すと変換が 1行だけに効き、次から元に戻る）。
-    let rec map (f: SqlValue array -> Result<SqlValue array, DbError>) (src: Op) =
-        pull src (fun row nxt -> f row |> Result.map (fun r -> Some(r, map f nxt)))
-
-    /// 述語で弾く。
-    /// 偽の行は読み飛ばして次へ進む。
-    /// p row >>= function で分岐する
-    /// （if/then/else だと Result の短絡で Some(row, nxt) だけが残ることがある）。
-    let filter (p: SqlValue array -> Result<bool, DbError>) (src: Op) =
-        let rec seekMatch (cur: Op) =
-            pull cur (fun row nxt ->
-                let verdict = p row
-
-                match verdict with
-                | Ok true -> ret (Some(row, seekMatch nxt))
-                | Ok false -> next (seekMatch nxt)
-                | Error e -> err e)
-
-        seekMatch src
-
-    /// 先頭 n 行だけ。
-    /// n <= 0 は 0 行（`LIMIT 0` は 0 行）。
-    /// 「制限なし」は呼び出し側が take を呼ばないことで表す。
-    let rec take (n: int) (src: Op) =
-        if n <= 0 then
-            Op.Done
-        else
-            pull src (fun row nxt -> ret (Some(row, take (n - 1) nxt)))
-
-    /// 先頭 n 行を読み飛ばす。
-    let skip (n: int) (src: Op) =
-        let rec drop (left: int) (cur: Op) =
-            if left <= 0 then
-                cur
-            else
-                pull cur (fun _ nxt -> next (drop (left - 1) nxt))
-
-        drop n src
-
-    /// 全行を配列に materialize する。
-    let toArray (op: Op) =
-        let rows = ResizeArray<SqlValue array>()
-
-        let rec drain (cur: Op) =
-            match next cur with
-            | Error e -> Error e
-            | Ok None -> Ok(rows.ToArray())
-            | Ok(Some(row, nxt)) ->
-                rows.Add row
-                drain nxt
-
-        drain op
-
 module internal Ops =
+    /// DISTINCT が覚えられるユニーク行の概算上限（バイト）。
+    /// 超えたら `CapacityError` で止める（OOM でプロセスごと落とさないため）。
+    let private DistinctBudgetBytes = 256L * 1024L * 1024L
+
+    /// 1行の概算バイト数（メモリ使用量の見積もり用）。
+    let private rowBytes (row: SqlValue array) =
+        row |> Array.sumBy ValueCodec.approximateBytes
+
     /// 述語で弾く。
     let filter (schema: Schema) (src: Op) (predicate: Expr) =
         Op.filter (fun row -> Eval.matches schema row predicate) src
@@ -156,6 +33,23 @@ module internal Ops =
                             | SortDirection.Descending -> -c
 
             compareKeys plan
+
+        let check plan (reps: Map<int, SqlValue>) (row: SqlValue array) =
+            plan
+            |> List.fold
+                (fun (acc: Result<Map<int, SqlValue>, DbError>) (i, _) ->
+                    acc
+                    |> Result.bind (fun m ->
+                        let v = row.[i]
+
+                        if SqlValue.isNull v then
+                            ret m
+                        else
+                            match Map.tryFind i m with
+                            | None -> ret (Map.add i v m)
+                            | Some representative ->
+                                SqlValue.compareValues representative v |> Result.map (fun _ -> m)))
+                (ret reps)
 
         if List.isEmpty keys then
             ret src
@@ -183,33 +77,7 @@ module internal Ops =
 
             result {
                 let! plan = resolved
-                let! rows = Op.toArray src
-
-                let validationError =
-                    if rows.Length <= 1 then
-                        None
-                    else
-                        plan
-                        |> List.tryPick (fun (i, _) ->
-                            let values = rows |> Array.map (fun row -> row.[i])
-
-                            match values |> Array.tryFind (fun v -> not (SqlValue.isNull v)) with
-                            | None -> None
-                            | Some representative ->
-                                values
-                                |> Array.tryPick (fun v ->
-                                    if SqlValue.isNull v then
-                                        None
-                                    else
-                                        match SqlValue.compareValues representative v with
-                                        | Error e -> Some e
-                                        | Ok _ -> None))
-
-                match validationError with
-                | Some e -> return! Error e
-                | None ->
-                    let sorted = Array.sortWith (compareWith plan) rows
-                    return Op.ofArray sorted
+                return! ExtSort.sortRows ExtSort.DefaultBudgetBytes Map.empty (check plan) (compareWith plan) src
             }
 
     /// 重複除去。
@@ -217,17 +85,37 @@ module internal Ops =
     /// 既出のキーを全部覚える必要がある。
     /// 「直前のキーだけ」で比較するのは `DISTINCT` ではなく `DISTINCT ON` にしかならない
     /// （`2, 1, 2` で 2 が 2 回目に出るため、直前比較では除去できない）。
-    ///  Costs O(既出キー数 × 平均キー長)。メモリは全キーに比例する。
-    /// 値が多いテーブルでは使えないが、`SELECT DISTINCT` の素直な実装としてはこれが正しい。
-    let distinct (src: Op) =
-        let rec skipSeen (seen: Set<Row>) (cur: Op) =
-            Op.pull cur (fun row nxt ->
-                if Set.contains row seen then
-                    Op.next (skipSeen seen nxt)
-                else
-                    ret (Some(row, skipSeen (Set.add row seen) nxt)))
+    /// バジェットを指定できる実体は `distinctWithin`。
+    /// <remarks>
+    /// 既出行を `SqlValue array` のまま抱えるとボックス付きオブジェクトが山盛りになるので、
+    /// `ValueCodec` で扁平なバイト列にしてから集合に入れる（同じ値なら同じ列になる）。
+    /// メモリはユニーク行数に比例するが、無制限ではない。
+    /// バジェットを超えると OOM でプロセスごと落とす代わりに `CapacityError` で止める。
+    /// </remarks>
+    let distinctWithin (budgetBytes: int64) (src: Op) =
+        let encode (row: SqlValue array) =
+            ValueCodec.writeValues row Writer.empty |> Writer.toArray
 
-        skipSeen Set.empty src
+        let rec skipSeen (seen: System.Collections.Generic.HashSet<byte array>) (used: int64) (cur: Op) =
+            Op.pull cur (fun row nxt ->
+                let key = encode row
+
+                if seen.Contains key then
+                    Op.next (skipSeen seen used nxt)
+                elif used > budgetBytes then
+                    err (
+                        DbError.capacity (
+                            sprintf "SELECT DISTINCT のユニーク行が多すぎます（概算 %d バイトの上限）。条件で絞るか、集約で代替してください" budgetBytes
+                        )
+                    )
+                else
+                    seen.Add key |> ignore
+                    ret (Some(row, skipSeen seen (used + int64 (rowBytes row)) nxt)))
+
+        skipSeen (System.Collections.Generic.HashSet<byte array> HashIdentity.Structural) 0L src
+
+    /// 重複除去（既定バジェット）。
+    let distinct (src: Op) = distinctWithin DistinctBudgetBytes src
 
     /// 式中に現れる集約呼び出しの一覧（実行順に揃える）。
     let aggCalls (exprs: Expr list) =
@@ -325,37 +213,21 @@ module internal Ops =
     /// GROUP BY + 集約。
     /// groupBy が空でも集約があれば 1グループだけ出す
     /// （`SELECT COUNT(*) FROM 空のテーブル` が 0 ではなく 1行を返すため。SQL の通常の挙動）。
+    /// <remarks>
+    /// 入力行は**抱え込まない**。グループごとの集約値だけを更新していくので、
+    /// メモリは「グループ数 × アクュムレータ」に比例し、入力行数には比例しない
+    /// （従来は全行を `ResizeArray` に保持していた）。
+    /// グループ数にも上限を置き、超過は `CapacityError` で止める。
+    /// 出力順は従来どおり「最初に現れたグループ」の順。
+    /// </remarks>
     let aggregate (schema: Schema) (src: Op) (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
-        let order = ResizeArray<SqlValue array>()
-
-        let table =
-            System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<SqlValue array>>(
-                HashIdentity.Structural: System.Collections.Generic.IEqualityComparer<SqlValue array>
-            )
+        let groupBudget = 4_000_000
 
         let keyOfRow (row: SqlValue array) =
             groupBy
             |> List.map (fun e -> Eval.eval schema row e)
             |> all
             |> Result.map List.toArray
-
-        let rec groupRows (rows: SqlValue array array) (i: int) =
-            if i >= rows.Length then
-                let built = table |> Seq.map (fun kv -> kv.Key, List.ofSeq kv.Value) |> Map.ofSeq
-                Ok(List.ofSeq order, built)
-            else
-                match keyOfRow rows.[i] with
-                | Error e -> Error e
-                | Ok k ->
-                    match table.TryGetValue k with
-                    | true, bucket -> bucket.Add rows.[i]
-                    | _ ->
-                        let bucket = ResizeArray<SqlValue array>()
-                        bucket.Add rows.[i]
-                        table.[k] <- bucket
-                        order.Add k
-
-                    groupRows rows (i + 1)
 
         let emptyAcc (kind: AggFunc) =
             {
@@ -492,55 +364,96 @@ module internal Ops =
             else
                 Eval.eval schema row arg >>= fun v -> addAcc acc (Some v) false distinct
 
-        let oneAgg (members: SqlValue array seq) (spec: AggFunc * bool * bool * Expr) =
-            let f, star, distinct, arg = spec
-            let start = emptyAcc f
+        let newBucket () =
+            aggs |> List.map (fun (f, _, _, _) -> emptyAcc f) |> ResizeArray
 
-            match foldOk (add star distinct arg) start members with
-            | Ok acc -> Ok(finishAcc acc)
-            | Error e -> Error e
-
-        let rowOf (table: Map<SqlValue array, SqlValue array list>) (k: SqlValue array) =
-            match table |> Map.tryFind k with
-            | None -> Ok None
-            | Some members ->
-                if List.isEmpty members then
-                    Ok None
+        let addToBucket (bucket: ResizeArray<Acc>) (row: SqlValue array) =
+            let rec step (i: int) =
+                if i >= aggs.Length then
+                    ret ()
                 else
-                    result {
-                        let first = List.head members
-                        let! vs = groupBy |> List.map (fun e -> Eval.eval schema first e) |> all
-                        let gv = List.toArray vs
-                        let! av = aggs |> List.map (oneAgg members) |> all
-                        return Some(Array.concat [| gv; List.toArray av |])
-                    }
+                    let _, star, distinct, arg = aggs.[i]
 
-        let rec build
-            (table: Map<SqlValue array, SqlValue array list>)
-            (ks: SqlValue array list)
-            (acc: ResizeArray<SqlValue array>)
+                    match add star distinct arg bucket.[i] row with
+                    | Error e -> Error e
+                    | Ok acc ->
+                        bucket.[i] <- acc
+                        step (i + 1)
+
+            step 0
+
+        let rowOf (key: SqlValue array) (bucket: ResizeArray<Acc>) =
+            let av = bucket |> Seq.map finishAcc |> Seq.toArray
+            Array.append key av
+
+        let consume
+            (buckets: System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<Acc>>)
+            (order: ResizeArray<SqlValue array>)
+            (cur: Op)
             =
-            match ks with
-            | [] -> Ok(Op.ofArray (acc.ToArray()))
-            | k :: tail ->
-                match rowOf table k with
+            let rec go (cur: Op) =
+                match Op.next cur with
                 | Error e -> Error e
-                | Ok None -> build table tail acc
-                | Ok(Some r) ->
-                    acc.Add r
-                    build table tail acc
+                | Ok None -> ret ()
+                | Ok(Some(row, nxt)) ->
+                    match keyOfRow row with
+                    | Error e -> Error e
+                    | Ok k ->
+                        match buckets.TryGetValue k with
+                        | true, bucket ->
+                            match addToBucket bucket row with
+                            | Error e -> Error e
+                            | Ok() -> go nxt
+                        | _ ->
+                            if order.Count >= groupBudget then
+                                err (
+                                    DbError.capacity (
+                                        sprintf "GROUP BY のグループ数が多すぎます（上限 %d）。条件で絞るか、サンプリングしてください" groupBudget
+                                    )
+                                )
+                            else
+                                let bucket = newBucket ()
+
+                                match addToBucket bucket row with
+                                | Error e -> Error e
+                                | Ok() ->
+                                    buckets.[k] <- bucket
+                                    order.Add k
+                                    go nxt
+
+            go cur
+
+        let emitGroups
+            (buckets: System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<Acc>>)
+            (order: ResizeArray<SqlValue array>)
+            =
+            let rec from (i: int) =
+                if i >= order.Count then
+                    Op.Done
+                else
+                    Op.Compute(fun () ->
+                        let key = order.[i]
+                        ret (Some(rowOf key buckets.[key], from (i + 1))))
+
+            from 0
+
+        let buckets =
+            System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<Acc>>(
+                HashIdentity.Structural: System.Collections.Generic.IEqualityComparer<SqlValue array>
+            )
+
+        let order = ResizeArray<SqlValue array>()
 
         result {
-            let! rows = Op.toArray src
-            let! order, table = groupRows rows 0
+            do! consume buckets order src
 
-            if List.isEmpty order && List.isEmpty groupBy then
+            if order.Count = 0 && List.isEmpty groupBy then
                 let vals =
                     aggs |> List.map (fun (f, _, _, _) -> finishAcc (emptyAcc f)) |> List.toArray
 
                 return Op.ofArray [| vals |]
             else
-                return! build table order (ResizeArray<SqlValue array>())
+                return emitGroups buckets order
         }
 
     /// nested loop 結合の内側ループ（1つの左行 × 右の全行）を回す共通処理。

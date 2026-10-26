@@ -655,3 +655,15 @@ module internal ValueCodec =
         | SqlValue.Uuid _ -> Some 17
         | SqlValue.Text _
         | SqlValue.Blob _ -> None
+
+    /// 1値の符号化後のおよそのバイト数。
+    /// メモリ使用量の見積もり（ソートのバジェット判定など）に使う。
+    /// SSTable の実サイズとは厳密には一致しない。
+    let approximateBytes (v: SqlValue) =
+        match fixedEncodedBytes v with
+        | Some n -> n
+        | None ->
+            match v with
+            | SqlValue.Text s -> 5 + System.Text.Encoding.UTF8.GetByteCount s
+            | SqlValue.Blob bs -> 5 + bs.Length
+            | _ -> 1

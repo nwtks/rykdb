@@ -50,11 +50,12 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 ## 2. 命令形要素を使わない
 
 `src/RykDb.Core/` では **`mutable` / `while` / `ref` を 0件**に保つ。
-`ResizeArray` / `Dictionary` を使うのは次の 3箇所だけで、いずれもホットパスなので理由をコメントに残す
+`ResizeArray` / `Dictionary` を使うのは次のところだけで、いずれもホットパスなので理由をコメントに残す
 （CLI / Server は対象外）。
 
-- `Executor.Op.toArray` の行の蓄積
-- `Executor.Ops.aggregate` のグループ表
+- `Op.toArray` の行の蓄積
+- `Ops.aggregate` のグループ表（入力行は抱えず、アクュムレータだけ）
+- `ExtSort`（`Spill.fs`）の受け皿（バジェット内に収まる分。超過は一時ファイルへ溢らす）
 - `Database.fs` のクライアント層（応答の組み立て）
 
 | やりたいこと   | 命令形の代わりに使うもの       |

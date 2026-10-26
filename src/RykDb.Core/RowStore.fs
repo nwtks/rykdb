@@ -435,7 +435,7 @@ module internal RowStore =
     /// 既存の keyspace ディレクトリはすべて開いておく。
     /// 開かないまま後始末すると、Database.openWith が「SeqNo をどこから採番するか」を知れず、
     /// LastCommitSeqNo = 0 から始まり、既にディスクにある行がすべて「未来」として見えなくなる。
-    /// 同じ root が既にこのプロセスで開かれていれば `IoError`（§ProcessLock）。
+    /// 同じ root が既にこのプロセスで開かれていれば `IoError`。
     /// </remarks>
     let private openStoreCore (takeOver: bool) (root: string) =
         let openDiskEngine (root: string) (keyspace: string) =
@@ -632,43 +632,60 @@ module internal Dml =
                         ret (Transaction.put removed space newKey newValue))
             txn
 
-    /// store の行に txn の書き込みを重ねる。
-    /// 追加・削除の後もキー昇順を保つ（走査結果の順序を安定させるため）。
+    /// store の行に txn の書き込みを重ねる（ストリーミング）。
+    /// <remarks>
+    /// store の行も txn のバッファも**キー昇順**なので、両者を突き合わせながら 1行ずつ合成できる。
+    /// 従来は「store の全行を配列化 → 差し替え → 追加分を足して再ソート」だったので、
+    /// transaction 中の大テーブル走査が O(テーブル行数) のメモリを使った。
+    /// ここでは store 側は 1行だけ、slot 側は txn のバッファぶんだけしか持たない。
+    /// slot は 1回ずつしか消費されない（store 行と突き合わせたとき、あるいは store が尽きたとき）。
+    /// </remarks>
     let private overlayRows
         (keyOf: SqlValue array -> byte array)
         (slots: (byte array * SqlValue array option) list)
-        (rows: seq<SqlValue array>)
+        (rows: Op)
         =
         if List.isEmpty slots then
             rows
         else
-            let slotMap = Map.ofList slots
-            let keyed = rows |> Seq.map (fun row -> keyOf row, row) |> Seq.toArray
+            let slotArr = slots |> List.sortBy fst |> List.toArray
 
-            let kept =
-                keyed
-                |> Array.choose (fun (key, row) ->
-                    match Map.tryFind key slotMap with
-                    | Some None -> None
-                    | Some(Some value) -> Some(key, value)
-                    | None -> Some(key, row))
+            let rec emitRemaining (i: int) =
+                if i >= slotArr.Length then
+                    Op.Done
+                else
+                    Op.Compute(fun () ->
+                        match slotArr.[i] with
+                        | _, Some v -> ret (Some(v, emitRemaining (i + 1)))
+                        | _, None -> Op.next (emitRemaining (i + 1)))
 
-            let existing = keyed |> Array.map fst |> Set.ofArray
+            let rec merge (cur: Op) (i: int) =
+                Op.Compute(fun () ->
+                    if i >= slotArr.Length then
+                        Op.next cur |> Result.map (Option.map (fun (r, nx) -> r, merge nx i))
+                    else
+                        match Op.next cur with
+                        | Error e -> Error e
+                        | Ok None -> Op.next (emitRemaining i)
+                        | Ok(Some(row, nx)) ->
+                            let rk = keyOf row
+                            let sk, sv = slotArr.[i]
 
-            let added =
-                slots
-                |> List.choose (fun (key, value) ->
-                    match value with
-                    | Some row when not (Set.contains key existing) -> Some(key, row)
-                    | _ -> None)
+                            match Bytes.compare rk sk with
+                            | c when c < 0 ->
+                                match sv with
+                                | Some v -> ret (Some(v, merge cur (i + 1)))
+                                | None -> Op.next (merge cur (i + 1))
+                            | 0 ->
+                                match sv with
+                                | Some v -> ret (Some(v, merge nx (i + 1)))
+                                | None -> Op.next (merge nx (i + 1))
+                            | _ ->
+                                match sv with
+                                | Some v -> ret (Some(v, merge cur (i + 1)))
+                                | None -> Op.next (merge cur (i + 1)))
 
-            Array.append kept (Array.ofList added)
-            |> Array.sortWith (fun (a, _) (b, _) -> Bytes.compare a b)
-            |> Array.map snd
-            |> Seq.ofArray
-
-    let private applyLimit (limit: int) (rows: seq<SqlValue array>) =
-        if limit > 0 then Seq.truncate limit rows else rows
+            merge rows 0
 
     let private storeLimitFor (limit: int) (slots: (byte array * SqlValue array option) list) =
         if limit <= 0 then
@@ -710,6 +727,7 @@ module internal Dml =
         |> Result.map (Seq.map (fun (_, v) -> v |> Option.defaultValue [||]))
 
     /// 主キーで prefix 走査する（txn の書き込みを含む）。
+    /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
     let scanByPrimaryKeyWithTxn
         (store: RowStore)
         (schema: TableSchema)
@@ -720,9 +738,12 @@ module internal Dml =
         let slots = Transaction.slotsOf txn (tableSpace schema)
 
         scanByPrimaryKey store schema visible (storeLimitFor limit slots)
-        |> Result.map (fun rows -> overlayRows (RowKey.primary schema) slots rows |> applyLimit limit)
+        |> Result.map (fun rows ->
+            let overlaid = overlayRows (RowKey.primary schema) slots (Op.ofSeq rows)
+            if limit > 0 then Op.take limit overlaid else overlaid)
 
     /// 主キーの範囲走査（txn の書き込みを含む）。
+    /// 返り値は遅延の `Op`。
     let scanByPrimaryKeyRangeWithTxn
         (store: RowStore)
         (schema: TableSchema)
@@ -747,7 +768,8 @@ module internal Dml =
                     match value with
                     | Some row when inKeyRange lowerBytes upperBytes key -> Some row
                     | _ -> None)
-                |> applyLimit limit)
+                |> Op.ofSeq
+                |> fun op -> if limit > 0 then Op.take limit op else op)
 
         let startBytes = KeyBuilder.ofValues startKey
         let endBytes = endKey |> Option.map KeyBuilder.ofValues
@@ -763,13 +785,12 @@ module internal Dml =
             let filtered =
                 match endBytes with
                 | None -> merged
-                | Some eb ->
-                    merged
-                    |> Seq.filter (fun row -> Bytes.compare (RowKey.primary schema row) eb <= 0)
+                | Some eb -> Op.filter (fun row -> ret (Bytes.compare (RowKey.primary schema row) eb <= 0)) merged
 
-            applyLimit limit filtered)
+            if limit > 0 then Op.take limit filtered else filtered)
 
     /// 索引の値に一致する全行を引く（txn の書き込みを含む）。
+    /// 返り値は遅延の `Op`。
     let scanByIndexPrefixWithTxn
         (store: RowStore)
         (schema: TableSchema)
@@ -791,7 +812,8 @@ module internal Dml =
                 rows
                 |> Seq.takeWhile (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
                 |> Seq.choose snd
-                |> applyLimit limit)
+                |> Op.ofSeq
+                |> fun op -> if limit > 0 then Op.take limit op else op)
 
         let prefix = KeyBuilder.ofValues values
 
@@ -800,9 +822,12 @@ module internal Dml =
             |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
 
         scanIndexPrefix store index visible prefix (storeLimitFor limit slots)
-        |> Result.map (fun rows -> overlayRows (RowKey.indexKey schema index) slots rows |> applyLimit limit)
+        |> Result.map (fun rows ->
+            let overlaid = overlayRows (RowKey.indexKey schema index) slots rows
+            if limit > 0 then Op.take limit overlaid else overlaid)
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
+    /// 返り値は遅延の `Op`。
     let scanByIndexRangeWithTxn
         (store: RowStore)
         (schema: TableSchema)
@@ -826,7 +851,8 @@ module internal Dml =
                 rows
                 |> Seq.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
                 |> Seq.choose snd
-                |> applyLimit limit)
+                |> Op.ofSeq
+                |> fun op -> if limit > 0 then Op.take limit op else op)
 
         let lowerBytes = KeyBuilder.ofValues lower
         let upperBytes = upper |> Option.map KeyBuilder.ofValues
@@ -836,7 +862,9 @@ module internal Dml =
             |> List.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
 
         scanIndexRange store index visible lowerBytes upperBytes (storeLimitFor limit slots)
-        |> Result.map (fun rows -> overlayRows (RowKey.indexKey schema index) slots rows |> applyLimit limit)
+        |> Result.map (fun rows ->
+            let overlaid = overlayRows (RowKey.indexKey schema index) slots rows
+            if limit > 0 then Op.take limit overlaid else overlaid)
 
     /// 1行を transaction に積む（まだ DB には入らない）。
     /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。

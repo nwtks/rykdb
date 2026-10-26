@@ -144,8 +144,23 @@ module internal DmlOps =
         (matched: SqlValue array -> Result<bool, DbError>)
         (onRow: Transaction -> int -> SqlValue array -> Result<Transaction * int, DbError>)
         =
-        Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn 0
-        >>= foldOk (fun (t, c) row -> matched row >>= fun keep -> if keep then onRow t c row else ret (t, c)) (txn, 0)
+        let rec go (cur: Op) (t: Transaction) (c: int) =
+            match Op.next cur with
+            | Error e -> Error e
+            | Ok None -> ret (t, c)
+            | Ok(Some(row, nxt)) ->
+                match matched row with
+                | Error e -> Error e
+                | Ok false -> go nxt t c
+                | Ok true ->
+                    match onRow t c row with
+                    | Error e -> Error e
+                    | Ok(tc, c') -> go nxt tc c'
+
+        result {
+            let! scan = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn 0
+            return! go scan txn 0
+        }
 
     /// gather で埋まった `(列位置, 値)` の対を、列順の行へ戻す。
     /// 埋まっていない位置は fallback に委ねる
@@ -186,16 +201,19 @@ module internal DmlOps =
                 | Ok values ->
                     match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txn values 1 with
                     | Error e -> Error e
-                    | Ok rows ->
-                        if
-                            rows
-                            |> Seq.exists (fun r ->
-                                let existingPk = TableSchema.primaryKeyOf schema r
-                                not (Array.forall2 (=) existingPk pk))
-                        then
-                            err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                        else
-                            check row pk rest
+                    | Ok scan ->
+                        match Op.toArray scan with
+                        | Error e -> Error e
+                        | Ok rows ->
+                            if
+                                rows
+                                |> Array.exists (fun r ->
+                                    let existingPk = TableSchema.primaryKeyOf schema r
+                                    not (Array.forall2 (=) existingPk pk))
+                            then
+                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                            else
+                                check row pk rest
 
         let checkUnique (txn: Transaction) (row: SqlValue array) =
             let pk = TableSchema.primaryKeyOf schema row
@@ -281,16 +299,19 @@ module internal DmlOps =
 
                     match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txnAcc values 1 with
                     | Error e -> Error e
-                    | Ok rows ->
-                        if
-                            rows
-                            |> Seq.exists (fun r ->
-                                let existingPk = TableSchema.primaryKeyOf schema r
-                                not (Array.forall2 (=) existingPk newPk))
-                        then
-                            err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                        else
-                            checkUniqueUpdate txnAcc newRow newPk rest
+                    | Ok scan ->
+                        match Op.toArray scan with
+                        | Error e -> Error e
+                        | Ok rows ->
+                            if
+                                rows
+                                |> Array.exists (fun r ->
+                                    let existingPk = TableSchema.primaryKeyOf schema r
+                                    not (Array.forall2 (=) existingPk newPk))
+                            then
+                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                            else
+                                checkUniqueUpdate txnAcc newRow newPk rest
 
         let targetSchema = targetSchemaOf schema
 

@@ -750,7 +750,7 @@ else
         printfn "  + %s" k
 
     printfn ""
-    printfn "対応方針: 末尾位置に直す（gotchas §2.3 / §8.16）。"
+    printfn "対応方針: 末尾位置に直す。"
     printfn "直せない場合は理由をコメントで残し、内容を確認のうえ --update でベースラインへ追加する。"
     exit 1
 

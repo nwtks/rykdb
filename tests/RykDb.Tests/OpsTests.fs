@@ -169,6 +169,128 @@ let ``sortBy: 複数キーは左から優先`` () =
     Assert.Equal<int64>(20L, asInt rows.[2].[1])
 
 [<Fact>]
+let ``ExtSort: バジェットが小さいと一時ファイルに溢らして整列できる`` () =
+    // 1行 ≈ 数十バイト。バジェット 1 ならほぼ毎行が run として溢れる。
+    let n = 500
+
+    let shuffled =
+        [ 0 .. n - 1 ]
+        |> List.map (fun i -> row [ SqlValue.Int(int64 ((i * 37 + 11) % n)); SqlValue.Int(int64 i) ])
+
+    let cmp (a: SqlValue array) (b: SqlValue array) =
+        match SqlValue.compareValues a.[0] b.[0] with
+        | Ok c -> c
+        | Error _ -> 0
+
+    let sorted =
+        ok (ExtSort.sortRows 1L Map.empty (fun _ _ -> ret Map.empty) cmp (opOfRows shuffled))
+
+    let rows = ok (Op.toArray sorted)
+
+    Assert.Equal<int>(n, rows.Length)
+
+    for i in 1 .. n - 1 do
+        Assert.True(asInt rows.[i - 1].[0] <= asInt rows.[i].[0], $"行 {i} が昇順ではありません")
+
+    // 一時ファイルは残らない（run は尽きた時点で消える）。
+    let leftovers =
+        System.IO.Directory.GetFiles(System.IO.Path.GetTempPath(), "rykdb-sort-" + "*")
+
+    Assert.All(leftovers, fun p -> Assert.Fail($"一時ファイルが残っています: {p}"))
+
+[<Fact>]
+let ``ExtSort: 比較不能な型は呼び出し時に Error`` () =
+    let mixed =
+        opOfRows
+            [
+                row [ SqlValue.Int 1L; SqlValue.Int 1L ]
+                row [ SqlValue.Text "x"; SqlValue.Int 2L ]
+            ]
+
+    let keys =
+        [
+            {
+                Expression = col "a"
+                Direction = SortDirection.Ascending
+            }
+        ]
+
+    expectErrorKind ErrorKind.TypeError "比較不能な型は Error" (Ops.sortBy schema2 mixed keys)
+
+[<Fact>]
+let ``ExtSort: 5 万行を小さなバジェットで溢らしても整列できる`` () =
+    // 1 行ずつ run に溢らしながら 5 万行を流す。
+    // ingest が末尾再帰でなければスタックを積み上がる（数百 run で枯渇する）。
+    let n = 50_000
+
+    let rec make (i: int) : Op =
+        if i >= n then
+            Op.Done
+        else
+            Op.Compute(fun () ->
+                let v = int64 ((i * 7919 + 13) % n)
+                ret (Some(row [ SqlValue.Int v; SqlValue.Int(int64 i) ], make (i + 1))))
+
+    let cmp (a: SqlValue array) (b: SqlValue array) =
+        match SqlValue.compareValues a.[0] b.[0] with
+        | Ok c -> c
+        | Error _ -> 0
+
+    // バジェット 256 バイト → 数百個の run が生まれる。
+    let sorted =
+        ok (ExtSort.sortRows 256L Map.empty (fun _ _ -> ret Map.empty) cmp (make 0))
+
+    let rows = ok (Op.toArray sorted)
+
+    Assert.Equal<int>(n, rows.Length)
+
+    let ascending =
+        rows
+        |> Array.pairwise
+        |> Array.forall (fun (a, b) -> asInt a.[0] <= asInt b.[0])
+
+    Assert.True(ascending, "昇順に並んでいません")
+
+    // 一時ファイルは残らない。
+    let leftovers =
+        System.IO.Directory.GetFiles(System.IO.Path.GetTempPath(), "rykdb-sort-*")
+
+    Assert.Equal<int>(0, leftovers.Length)
+
+[<Fact>]
+let ``distinctWithin: バジェット超過は CapacityError`` () =
+    // 1行 ≈ 数十バイト。バジェット 1 なら 2 行目で超過する。
+    let dup =
+        opOfRows
+            [
+                row [ SqlValue.Int 1L; SqlValue.Int 1L ]
+                row [ SqlValue.Int 2L; SqlValue.Int 2L ]
+                row [ SqlValue.Int 3L; SqlValue.Int 3L ]
+            ]
+
+    // distinctWithin は遅延の Op を返すので、流し込んで初めて CapacityError になる。
+    expectErrorKind ErrorKind.CapacityError "バジェット超過は CapacityError" (Op.toArray (Ops.distinctWithin 1L dup))
+
+[<Fact>]
+let ``集約: 入力行を抱えずにグループごとに集める`` () =
+    // 10 万行を 3 グループに振り、行を全部保持しない実装でも結果が同じであること。
+    let rec make (i: int) : Op =
+        if i >= 100_000 then
+            Op.Done
+        else
+            Op.Compute(fun () ->
+                let grp = int64 (i % 3)
+                ret (Some(row [ SqlValue.Int grp; SqlValue.Int(int64 i) ], make (i + 1))))
+
+    let aggs = [ (AggFunc.Count, true, false, Expr.Literal Literal.Null) ]
+    let rows = ok (Op.toArray (ok (Ops.aggregate schema2 (make 0) [ col "a" ] aggs)))
+
+    Assert.Equal<int>(3, rows.Length)
+    Assert.Equal<int64>(33_334L, asInt rows.[0].[1])
+    Assert.Equal<int64>(33_333L, asInt rows.[1].[1])
+    Assert.Equal<int64>(33_333L, asInt rows.[2].[1])
+
+[<Fact>]
 let ``distinct: 最初に現れた順序を保つ`` () =
     let op: Op =
         Op.ofArray

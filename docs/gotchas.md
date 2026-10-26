@@ -1259,10 +1259,14 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ### 11.23 DISTINCT / GROUP BY のキーは文字列化しない
 
-`Row.keyOf` は `SqlValue array` をそのまま返し、`Set` / `Map` / `HashIdentity.Structural` の構造比較で重複を判定する
-（NULL は NULL 同士で等しい）。
-`COUNT(DISTINCT)` は `Set<SqlValue>`。
-`SqlLiteral` による文字列化は表示専用で、行ごとのホットパスでは使わない。
+- **`SELECT DISTINCT`**: `ValueCodec.writeValues` で行を扁平なバイト列にしてから
+  `HashSet<byte array>` に入れ、重複を判定する（同じ値なら同じ列になる）。
+  `SqlValue array` のまま抱えるとボックス付きオブジェクトが山盛りになるため。
+  メモリは既定 256MiB のバジェットで抑え、超過は `CapacityError`（OOM でプロセスごと落とさない）。
+- **`GROUP BY`**: `HashIdentity.Structural` で `SqlValue array` を構造比較する（NULL は NULL 同士で等しい）。
+  行は抱えず、グループごとのアクュムレータだけを更新する。
+- `COUNT(DISTINCT)` は `Set<SqlValue>`（集約の中で扱う値は少数なので構造比較のまま）。
+- `SqlLiteral` による文字列化は表示専用で、行ごとのホットパスでは使わない。
 
 ### 11.24 limit 付き scan は後続の SSTable を開かない
 
