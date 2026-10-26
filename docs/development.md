@@ -5,6 +5,14 @@ RykDb（**.NET 10 / F# 10**）のビルド・テスト・品質ゲート。
 コーディング規約は [`coding-conventions.md`](coding-conventions.md)、
 実際に踏んだ落とし穴は [`gotchas.md`](gotchas.md) を参照。
 
+## 基本方針
+
+- **クロスプラットフォーム**: 特定の OS に依存しない。
+  パス操作・ファイル I/O・プロセス間排他などは .NET のクロスプラットフォーム API
+  （`System.IO.Path` / `Environment` / `FileShare` 等）を使い、
+  OS 固有のパス区切り・コマンド・API を直接呼ばない。
+  CI は Linux で走るが、Windows / macOS でも同じ挙動を保つこと。
+
 ---
 
 ## 目次

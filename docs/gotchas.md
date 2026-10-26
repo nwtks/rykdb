@@ -1060,18 +1060,38 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
   （src からの `readFirstValue` 呼び出しが無く、テストも単一フィールドのみだったため潜在化していた）。
 - 回帰テスト: `SerializationTests` の `OrderPreserving: 複合キーの先頭フィールドを読める`
 
-### 11.8 keyspace 横断 commit は「先に intent、最後に削除」
+### 11.8 keyspace 横断 commit は「先に publish、最後に resolve」（追記型ジャーナル）
 
 テーブルと索引は別 keyspace・別 WAL。テーブルだけ書けて索引が書けないクラッシュを防ぐため、
-`RowStore.writeBatchesWithSnapshot` は全バッチを `.commit/` の intent に原子的公開してから書き、
-全 keyspace の適用後に intent を削除する。
+`RowStore.writeBatchesWithSnapshot` は `.commit/journal` へ **publish を追記**してから書き、
+全 keyspace の適用後に **resolve を追記**して解決する。
 
+- **`File.Move` / `File.Delete` は使わない**。
+  .NET 標準機能ではディレクトリを fsync できず、
+  rename / delete はディレクトリエントリの編集なので電源故障で消える
+  （クロスプラットフォームを守るため P/Invoke も使わない）。
+  追記だけなら `Flush(true)` でファイルデータを落とせる。
+- ジャーナルはオープン時に `touch` で 1 回だけ作る（ディレクトリを汚すのはこの 1 回だけ）。
+  **切れた尾部があれば切り詰める**。
+  切れたまま追記すると読みが止まり、以後の publish が全部読めなくなる。
+- レコードは `[長さ][ペイロード][CRC]`。
+  尾部の途切れは CRC で検出し「公開未完了」として捨てる。
+  公開完了前に WAL へは書いていないので捨てて安全（architecture §7.5 の成否表）。
 - intent のペイロードは `Entry.encodeBatch`（txnId + 件数 + 各エントリ）を
   `Writer.lengthPrefixed` で包む。`Writer.writeBytes` で包むと
   `Reader.readLengthPrefixed` が先頭 8 バイトを長さと誤認し、`Reader: 8 バイトを読み取れません` になる。
 - 再適用は `filterApplied` が `(key, SeqNo, value)` の完全一致を `GetAt` で確認して読み飛ばす。
   これを Memtable 全体の重複排除にしてはいけない（通常の同一 SeqNo 重複の意味が変わる）。
-- intent 削除の失敗はエラーにする。握り潰して書き込みを続けると、後で同じキーが GC されたあとの再起動で古い intent が再適用され得る。
+- **適用が失敗したら publish は残したままエラーを返す**（握り潰さない）。
+  次回のオープンで冪等に再生する。
+  resolve の失敗もエラーとして上位へ伝える（解決できなくても再生は冪等なので安全側）。
+- 間引きは「未解決ゼロ」のときだけ（256KiB 超）。
+  公開記録を消すと適用前の commit が再生できなくなる。
+- 回帰テスト: `RowStore: commit intent が残っていれば再オープンで全 keyspace を適用する` /
+  `RowStore: 複数 keyspace の commit は intent を追記して公開し、解決する` /
+  `RowStore: 公開の追記が途中で切れた intent は再生しない` /
+  `RowStore: ジャーナルが大きく未解決が無ければ間引かれる` /
+  `RowStore: 未解決の intent が残っている間はジャーナルを間引かない`。
 
 ### 11.9 `ActiveSnapshot = 0` は「全版を残す」
 

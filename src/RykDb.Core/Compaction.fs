@@ -125,10 +125,6 @@ module internal Compaction =
             Level: int
             /// 出力を置くレベル
             OutputLevel: int
-            /// 入力ファイル
-            InputFiles: FileMetaData list
-            /// 出力時に重なり判定に使うファイル（1つ上のレベル）
-            GrandParents: FileMetaData list
         }
 
     /// コンパクション候補を選ぶ。
@@ -151,18 +147,10 @@ module internal Compaction =
         match find 0 with
         | None -> None
         | Some level ->
-            let grandParents =
-                if level + 1 <= Levels.Max then
-                    v.Files.[level + 1] |> Array.toList
-                else
-                    []
-
             Some
                 {
                     Level = level
                     OutputLevel = min (level + 1) Levels.Max
-                    InputFiles = v.Files.[level] |> Array.toList
-                    GrandParents = grandParents
                 }
 
     /// 1回の Leveled compaction を行う（ストリーミング）。

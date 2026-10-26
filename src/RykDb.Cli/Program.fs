@@ -59,7 +59,7 @@ let private piecesOf (input: string) =
 
         buf.Clear() |> ignore
 
-    let rec loop (i: int) (inString: bool) =
+    let rec loop i inString =
         if i >= input.Length then
             flush ()
             pieces.ToArray()
@@ -174,7 +174,7 @@ let private execOne (session: Session) (sql: string) =
             true
 
 let private runRepl (session: Session) =
-    let splitForRun (merged: string) =
+    let splitForRun merged =
         let pieces = piecesOf merged
 
         if Array.isEmpty pieces then
@@ -222,8 +222,8 @@ let private runRepl (session: Session) =
                 buffer <- if Array.isEmpty toKeep then "" else toKeep.[0]
 
 let private runFile (session: Session) (path: string) =
-    let rec runStatements (rest: string list) =
-        match rest with
+    let rec runStatements =
+        function
         | [] -> Ok()
         | stmt :: tail ->
             match session.Run stmt with

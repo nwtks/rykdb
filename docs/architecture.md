@@ -702,9 +702,9 @@ COMMIT
   ├─ TransactionManager.commit → 競合検出 → WriteBatch
   ├─ TransactionManager.activeSnapshot → GC 境界
   └─ RowStore.writeBatchesWithSnapshot
-       ├─ 複数 keyspace なら .commit intent を原子的に公開
+       ├─ 複数 keyspace なら .commit/journal へ intent を追記して公開
        ├─ keyspace ごとに StorageEngine.writeBatch
-       └─ 全 keyspace の適用後に intent を削除
+       └─ 全 keyspace の適用後に resolve を追記して解決
 ```
 
 これにより次の 3つが同時に保証される。
@@ -720,11 +720,37 @@ COMMIT
 
 1 トランザクションがテーブルと索引など複数 keyspace に書く場合、各 WAL は独立しているため、
 「テーブルは書けたが索引は書けていない」中途半端な状態が起こり得る。
-`RowStore.writeBatchesWithSnapshot` は全バッチを `.commit/` 配下の intent ファイルへ
-`Flush(true)` + `File.Move` で原子的に公開してから keyspace ごとに書き、完了後に intent を削除する。
-再オープン時に intent が残っていれば `replayPending` が再適用する。
+`RowStore.writeBatchesWithSnapshot` は `.commit/journal` へ **publish（公開）レコードを追記**してから
+keyspace ごとに書き、完了後に **resolve（解決）レコードを追記**する。
+再オープン時に未解決の publish が残っていれば `replayPending` が再適用する。
 再適用では同じ `(key, SeqNo, value)` を `filterApplied` が読み飛ばすので、物理エントリは重複しない。
 1 keyspace だけの書き込みは WAL 追記自体が原子的なので intent を作らない。
+
+**なぜ rename ではなく追記なのか**（クロスプラットフォームの制約）。
+
+- .NET 標準機能では**ディレクトリを fsync できない**（`FileStream` はディレクトリを開けない）。
+  `File.Move` / `File.Delete` はディレクトリエントリの編集なので、電源故障で消える可能性がある。
+  P/Invoke（`fcntl(F_FULLSYNC)` / `fsync(fd)`）を使わずに耐久性を得るには、
+  **すでにあるファイルへの追記**だけを使うしかない。
+- 追記は `FileStream.Flush(true)` でファイルデータをディスクへ落とせる。
+  ジャーナルはオープン時に `touch` で 1 回だけ作る（ディレクトリを汚すのはこの 1 回だけ）。
+- レコードは `[長さ][ペイロード][CRC]` のフレーム。
+  **書き込みが途中で切れた尾部は CRC で検出し、「公開未完了」として捨てる**。
+  公開完了前に WAL へは 1 バイトも書かないので捨てて安全。
+- 尾部が切れたまま後ろへ追記すると読みが止まるため、
+  `touch` は**有効な末尾までの切り詰め**を行い、以後の追記を可能にする
+  （既存ファイルの長さ変更なのでディレクトリは更新しない）。
+- 間引き（trim）は「未解決ゼロ」のときだけ、既存ファイルの truncate で行う（256KiB 超）。
+  公開記録を消すと適用前の commit が再生できなくなるため。
+
+**成否は一意に決まる**。
+
+| クラッシュ地点         | 結果                                                             |
+| ---------------------- | ---------------------------------------------------------------- |
+| publish 完了前         | フレーム不完整 → 舍てる。WAL にも何も書いていないので **未反映** |
+| publish 完了後・適用中 | 未解決の publish が残る → 再生で **適用済み**（冪等）            |
+| resolve 完了後         | 解決済み → 再生対象外。WAL に書けているので **適用済み**         |
+| resolve 追記に失敗     | エラーとして上位へ伝播（握り潰さない）。次回オープンで再解決     |
 
 `TransactionManager.activeSnapshot` は active な transaction の **最小 snapshot** を返す
 （無ければ `LastCommitSeqNo + 1`）。
@@ -1046,8 +1072,8 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
   未コミットと `Abort` は捨てる。
 - flush / close の後は `rotate` する（旧ファイルを先に全部消してから、新番号で再作成）。
   **削除 → 作成の順**でないと、作ったばかりのファイルが削除対象に入る。
-- 複数 keyspace にまたがる commit は、WAL の前に `.commit` intent を置く（§7.5）。
-  intent は `maxSeq` でソートして再生し、適用後に削除する。
+- 複数 keyspace にまたがる commit は、WAL の前に `.commit/journal` へ publish を**追記**する（§7.5）。
+  適用後に resolve を追記して解決する。再生はジャーナルの順（追記順）で行う。
 
 ### 8.6 Compaction — Leveled + GC
 
@@ -1129,11 +1155,11 @@ SQL 文字列
    ├─ TransactionManager.commit → 競合検出（first-committer-wins）
    ├─ Transaction.toEntries    → WriteBatch
    └─ RowStore.writeBatchesWithSnapshot
-        ├─ 複数 keyspace なら .commit intent を公開（§7.5）
+        ├─ 複数 keyspace なら .commit/journal へ publish を追記（§7.5）
         ├─ keyspace ごとに StorageEngine.writeBatch
         │    ├─ Wal.append (Begin/Batch/Commit)
         │    └─ Memtable.apply
-        └─ intent を削除
+        └─ resolve を追記して解決
 4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.writeAll` が各 keyspace の `WriteBatch` 後に `MaybeFlush` を呼ぶ。memtable が上限未満なら何もしない）
 5. レベルが閾値を超えたら compact（`maybeCompact`）（`maybeFlush` が `flush >>= maybeCompact` で連鎖するため、flush と同時に評価される）
 ```
@@ -1347,6 +1373,14 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **ActiveSnapshot の登録はハンドル単位のリースで解放する**（`RegistrationLease`）。
   commit / rollback / `Close()` / `Dispose()` で即時に外れ、未処理のまま捨てても
   最後のハンドルの GC で外れる（DDL が永久に `ConflictError` にならない）。
-- **keyspace 横断 commit は intent で回復するが、全 WAL 書込後・intent 削除前の crash ではcommit の成否が一意に決まらない**
-  （replay では適用済みになる）。
+- **keyspace 横断 commit は追記型ジャーナル（publish / resolve）で回復し、成否は一意に決まる**
+  （§7.5 の成否表）。
+  publish 完了前は「未反映」、完了後は「適用済み」。
   物理重複は `filterApplied` で防ぐ。
+- **ファイルの作成・削除はディレクトリエントリに依存し、標準機能ではディレクトリを fsync できない**
+  （P/Invoke を使わない方針のため）。
+  intent は追記で回避したが、
+  **新規 WAL / SSTable / MANIFEST ファイルの作成と、`rotate` の削除は電源故障で欠ける可能性が残る**。
+  これは「クラッシュ後の再起動」では再作成・再生成で吸収できるが、「電源故障で直後の再起動」では欠落し得る。
+  完全な耐久にはディレクトリ同期が必要で、それは標準機能の範囲を超える
+  （§12.1 の「採用しなかったもの」に相当する制約）。

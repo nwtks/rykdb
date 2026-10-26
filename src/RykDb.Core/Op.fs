@@ -39,7 +39,7 @@ module internal Op =
     /// 配列を順に返す演算子。
     /// 次の行は呼び出すたびに計算する。
     let ofArray (rows: SqlValue array array) =
-        let rec rowsFrom (i: int) =
+        let rec rowsFrom i =
             if i >= rows.Length then
                 Op.Done
             else
@@ -91,11 +91,9 @@ module internal Op =
     /// p row >>= function で分岐する
     /// （if/then/else だと Result の短絡で Some(row, nxt) だけが残ることがある）。
     let filter (p: SqlValue array -> Result<bool, DbError>) (src: Op) =
-        let rec seekMatch (cur: Op) =
+        let rec seekMatch cur =
             pull cur (fun row nxt ->
-                let verdict = p row
-
-                match verdict with
+                match p row with
                 | Ok true -> ret (Some(row, seekMatch nxt))
                 | Ok false -> next (seekMatch nxt)
                 | Error e -> err e)
@@ -113,7 +111,7 @@ module internal Op =
 
     /// 先頭 n行を読み飛ばす。
     let skip (n: int) (src: Op) =
-        let rec drop (left: int) (cur: Op) =
+        let rec drop left cur =
             if left <= 0 then
                 cur
             else
@@ -125,7 +123,7 @@ module internal Op =
     let toArray (op: Op) =
         let rows = ResizeArray<SqlValue array>()
 
-        let rec drain (cur: Op) =
+        let rec drain cur =
             match next cur with
             | Error e -> Error e
             | Ok None -> Ok(rows.ToArray())
