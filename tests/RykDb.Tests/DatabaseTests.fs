@@ -278,7 +278,7 @@ let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
         let tableDir = System.IO.Path.Combine(dir, Keyspace.toDirName (Keyspace.table "t"))
 
         let newest =
-            System.IO.Directory.GetFiles(tableDir, "*.sst")
+            System.IO.Directory.GetFiles(tableDir, "*" + FileMetaData.sstExtension)
             |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
 
         let bytes = System.IO.File.ReadAllBytes newest
@@ -1379,6 +1379,49 @@ let ``Database: 索引ごと DROP TABLE しても旧索引エントリが復活�
         let db6 = exec db5 "CREATE INDEX ix_g ON t (g)"
         let _, res = ok (db6.Query "SELECT id FROM t WHERE g = 10")
         Assert.Equal<int>(0, res.Rows.Length))
+
+[<Fact>]
+let ``Database: DROP TABLE は索引 keyspace の孤児エントリも消す`` () =
+    withDir "drop-table-stale" (fun dir ->
+        let db0 = ok (Database.openWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10)"
+        let db3 = exec db2 "CREATE INDEX ix_g ON t (g)"
+        ok (db3.Close())
+
+        // 前回の失敗などで索引 keyspace にだけ残った行を追加する。
+        let staleKey =
+            KeyBuilder.ofIndexAndPrimary [| SqlValue.Int 999L |] [| SqlValue.Int 999L |]
+
+        let store = ok (RowStore.openStore dir)
+
+        let store =
+            ok (
+                RowStore.writeBatches
+                    store
+                    [
+                        (Keyspace.index "ix_g",
+                         [| Entry.put staleKey 1000UL [| SqlValue.Int 999L; SqlValue.Int 999L |] |])
+                    ]
+            )
+
+        ok (RowStore.close store)
+
+        let db4 = ok (Database.openWith dir)
+        let db5 = exec db4 "DROP TABLE t"
+        ok (db5.Close())
+
+        let store = ok (RowStore.openStore dir)
+
+        let indexRows =
+            ok (RowStore.scanAt store (Keyspace.index "ix_g") [||] Snapshot.noLimit 0)
+
+        let tableRows =
+            ok (RowStore.scanAt store (Keyspace.table "t") [||] Snapshot.noLimit 0)
+
+        Assert.Empty indexRows
+        Assert.Empty tableRows
+        ok (RowStore.close store))
 
 [<Fact>]
 let ``Database: DROP INDEX 後の同名再作成で旧索引エントリが復活しない`` () =

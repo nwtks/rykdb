@@ -151,8 +151,8 @@ module internal Memtable =
             ApproxBytes = 0
         }
 
-    /// 複数のエントリをまとめて挿入する。
-    let apply (entries: Entry seq) (mem: Memtable) =
+    /// 1エントリを挿入する。
+    let insert (e: Entry) (mem: Memtable) =
         let rec unwind left right stack target =
             match stack with
             | [] -> left, right
@@ -217,13 +217,14 @@ module internal Memtable =
             let p = Entry.priority e
             descend e p [] root
 
-        let insert e mem =
-            {
-                Root = insertNode e mem.Root
-                Count = mem.Count + 1
-                ApproxBytes = mem.ApproxBytes + Entry.approxBytes e
-            }
+        {
+            Root = insertNode e mem.Root
+            Count = mem.Count + 1
+            ApproxBytes = mem.ApproxBytes + Entry.approxBytes e
+        }
 
+    /// 複数のエントリをまとめて挿入する。
+    let apply (entries: Entry seq) (mem: Memtable) =
         Seq.fold (fun mem e -> insert e mem) mem entries
 
     /// キーの最新バージョン（SeqNo が最大のもの）を返す。

@@ -1033,8 +1033,11 @@ L1 以降は「そのレベルの総バイト数 > 上限」の最初のレベ�
 
 ```
 CURRENT           「1行の有効な MANIFEST 番号」
-MANIFEST-000001   追記専用の VersionSet 定義
+MANIFEST-000001   VersionSet の変更履歴（4MiB 超でスナップショットへローテーション）
 ```
+
+`MANIFEST` が 4MiB を超えると、現在の Version 全体を新しい番号の manifest へ書き、
+`CURRENT` を切り替えてから旧ファイルを削除する。起動時に読む履歴の長さを抑えるため。
 
 `CURRENT` の更新は「`CURRENT.tmp` へ書き込んでから `File.Move(上書き)` で置き換える」原子的な書き換え
 （`Manifest.writeCurrent`）。書きかけの `CURRENT` が残らないので、クラッシュ後も
@@ -1071,6 +1074,7 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
   Begin / Commit が中途半端に分かれない。
 - open 時は WAL を 1フレームずつストリーミングで読み（WAL 全体をメモリへ載せない）、
   `committedEntries` 相当の状態機械が「Commit まで到達した Batch」だけを再生する。
+  コミット済み Entry は配列に溜めず、そのまま Memtable へ挿入する。
   未コミットと `Abort` は捨てる。
 - flush / close の後は `rotate` する（旧ファイルを先に全部消してから、新番号で再作成）。
   **削除 → 作成の順**でないと、作ったばかりのファイルが削除対象に入る。
@@ -1220,12 +1224,12 @@ memtable を flush してから WAL を削除する。
 
 各 keyspace ディレクトリの中身:
 
-| ファイル        | 役割                              |
-| --------------- | --------------------------------- |
-| `MANIFEST-%06d` | VersionSet の変更履歴（追記専用） |
-| `CURRENT`       | 有効な MANIFEST 番号（1行）       |
-| `%06d.wal`      | 先行ログ                          |
-| `%06d.sst`      | データファイル                    |
+| ファイル        | 役割                                             |
+| --------------- | ------------------------------------------------ |
+| `MANIFEST-%06d` | VersionSet の変更履歴（4MiB 超でローテーション） |
+| `CURRENT`       | 有効な MANIFEST 番号（1行）                      |
+| `%06d.wal`      | 先行ログ                                         |
+| `%06d.sst`      | データファイル                                   |
 
 ロックファイル（`root/.rykdb.lock`）は 0バイトのまま置かれる。中身は使わない（§7.9）。
 

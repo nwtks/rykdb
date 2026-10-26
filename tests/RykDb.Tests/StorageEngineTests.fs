@@ -144,7 +144,8 @@ let ``StorageEngine.getAt: ファイルが消えていれば IoError`` () =
             let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
             let engine = ok (StorageEngine.flush engine)
             // Version は参照しているのに実ファイルだけ消える（読み取りで気付く）
-            Directory.GetFiles(dir, "*.sst") |> Array.iter (fun p -> File.Delete p)
+            Directory.GetFiles(dir, "*" + FileMetaData.sstExtension)
+            |> Array.iter (fun p -> File.Delete p)
 
             expectErrorKind ErrorKind.IoError "ファイルが無ければ IoError" (StorageEngine.getAt engine None (intKey 1))))
 
@@ -156,7 +157,8 @@ let ``StorageEngine.scanAt: ファイルが消えていれば IoError`` () =
             let engine = ok (StorageEngine.flush engine)
             // Version は参照しているのに実ファイルだけ消える。
             // 開けなかったファイルを「空」と見なすと、Ok のまま行が欠ける。
-            Directory.GetFiles(dir, "*.sst") |> Array.iter (fun p -> File.Delete p)
+            Directory.GetFiles(dir, "*" + FileMetaData.sstExtension)
+            |> Array.iter (fun p -> File.Delete p)
 
             expectErrorKind ErrorKind.IoError "limit 0 の scan は IoError" (StorageEngine.scanAt engine None [||] 0)
             expectErrorKind ErrorKind.IoError "limit ありの scan は IoError" (StorageEngine.scanAt engine None [||] 10)))
@@ -172,7 +174,9 @@ let ``StorageEngine: reader キャッシュ後でもファイル改竄を検出�
             Assert.True((ok (StorageEngine.getAt engine None (intKey 1))).IsSome)
 
             // 同じサイズのままビットを壊し、mtime を確実に進める
-            let path = Directory.GetFiles(dir, "*.sst") |> Array.exactlyOne
+            let path =
+                Directory.GetFiles(dir, "*" + FileMetaData.sstExtension) |> Array.exactlyOne
+
             let bytes = File.ReadAllBytes path
             bytes.[0] <- bytes.[0] ^^^ 0xFFuy
             File.WriteAllBytes(path, bytes)
@@ -575,7 +579,7 @@ let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush �
         let disk = ok (disk.WriteBatch [| Entry.put (intKey 1) 1UL (intRow 1) |])
         let disk = ok (disk.MaybeFlush())
 
-        Assert.NotEmpty(Directory.GetFiles(dir, "*.sst"))
+        Assert.NotEmpty(Directory.GetFiles(dir, "*" + FileMetaData.sstExtension))
         Assert.True((ok (disk.GetAt None (intKey 1))).IsSome))
 
 [<Fact>]
@@ -710,7 +714,7 @@ let ``StorageEngine: 存在しない SSTable は Version から落とされる``
             let engine = ok (StorageEngine.put engine (intKey 1) (intRow 1))
             let _ = ok (StorageEngine.flush engine)
             // flush でできるファイルを消す（クラッシュの模擬）
-            let ssts = Directory.GetFiles(dir, "*.sst")
+            let ssts = Directory.GetFiles(dir, "*" + FileMetaData.sstExtension)
             Assert.NotEmpty ssts
             ssts |> Array.iter (fun p -> File.Delete p)
             ())
@@ -855,7 +859,7 @@ let ``StorageEngine: manifest の途中破損では開かず SSTable を残す``
 
         expectErrorKind ErrorKind.CorruptionError "途中の破損は CorruptionError" (StorageEngine.openDatabase dir)
         // SSTable は削除も退避もされていない
-        Assert.NotEmpty(Directory.GetFiles(dir, "*.sst"))
+        Assert.NotEmpty(Directory.GetFiles(dir, "*" + FileMetaData.sstExtension))
         Assert.False(Directory.Exists(Path.Combine(dir, ".orphans"))))
 
 [<Fact>]

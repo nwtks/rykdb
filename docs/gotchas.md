@@ -1109,7 +1109,9 @@ keyspace のディレクトリ名は名前から決まる（`t:<name>` / `i:<nam
 特に「索引を DROP → 行を DELETE → 同名 CREATE INDEX」の順では、
 DELETE 時に索引 tombstone が書かれないため、backfill 後の索引検索で削除済みの行が復活する。
 
-- `DROP TABLE`: 残りの全行を `Dml.deleteByPrimaryKey`（主キー + 全索引へ tombstone）で消して commit し、その後 `Catalog.removeTable`。
+- `DROP TABLE`: テーブル keyspace と全索引 keyspace の**全エントリ**へ tombstone を書いて commit し、
+  その後 `Catalog.removeTable`
+  （現在行だけでなく孤児エントリも消す）。
 - `DROP INDEX`: 索引 keyspace の全キーへ `Transaction.remove` を書いて commit し、その後 `Catalog.removeIndex`。
 - 順序を逆にすると「カタログに無いのに keyspace は残る」状態で窓が空く。
   tombstone を先に確定させること。

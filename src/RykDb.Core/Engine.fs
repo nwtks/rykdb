@@ -543,7 +543,7 @@ module internal Ddl =
 
     /// DROP TABLE。
     /// 手順:
-    ///   1. 残りの全行を「主キー + 全索引」に tombstone で消す（DML.DELETE と同じ経路）
+    ///   1. テーブル keyspace と全索引 keyspace の全エントリに tombstone を書く
     ///   2. commit してからカタログから定義を外す
     /// カタログを先に外して keyspace を残すと、同名で再 CREATE したときに旧データがそのまま見える
     /// （keyspace は名前由来のディレクトリで再利用される）。
@@ -556,6 +556,10 @@ module internal Ddl =
                 else
                     err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
             | Some defn ->
+                let clearSpace (txn: Transaction) (space: string) =
+                    RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
+                    |> Result.bind (foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn)
+
                 result {
                     let! schema = Catalog.toSchema defn
 
@@ -564,9 +568,12 @@ module internal Ddl =
                             Indexes = Catalog.indexSchemasOf state.Catalog schema.Name
                         }
 
+                    let spaces =
+                        Keyspace.table schema.Name
+                        :: (withIndexes.Indexes |> List.map (fun index -> Keyspace.index index.Name))
+
                     let mgr, txn = TransactionManager.beginTxn state.Manager
-                    let! rows = Dml.scanByPrimaryKey state.Store withIndexes Snapshot.noLimit 0
-                    let! txn2 = foldOk (fun t row -> Dml.deleteRow withIndexes t row) txn rows
+                    let! txn2 = foldOk clearSpace txn spaces
 
                     let! store, mgr2 =
                         DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2

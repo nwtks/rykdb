@@ -1,6 +1,7 @@
 // ===========================================================================
-// Manifest — Version の変更履歴を追記専用ファイルに記録し、
+// Manifest — Version の変更履歴を MANIFEST に追記し、
 // 「いま有効な manifest はどれか」を CURRENT（1行ファイル）で指す。
+// MANIFEST が 4MiB を超えたら Version 全体を新しい manifest へ書き直す。
 //
 // CURRENT は一時ファイルに書いてから原子的にリネームで切り替えるので、
 // クラッシュしても常に有効な manifest を指す。
@@ -12,7 +13,12 @@
 namespace RykDb.Core
 
 module internal Manifest =
-    let private fileName (fileNumber: int64) = sprintf "MANIFEST-%06d" fileNumber
+    /// manifest ファイル名の接頭辞。
+    [<Literal>]
+    let internal manifestPrefix = "MANIFEST-"
+
+    let private fileName (fileNumber: int64) =
+        sprintf "%s%06d" manifestPrefix fileNumber
 
     let private manifestPath (dir: string) (fileNumber: int64) =
         System.IO.Path.Combine(dir, fileName fileNumber)
@@ -22,6 +28,23 @@ module internal Manifest =
 
     let private currentPath (dir: string) =
         System.IO.Path.Combine(dir, currentFileName)
+
+    let private writeCurrent (dir: string) (fileNumber: int64) =
+        protect (fun () ->
+            let tmp = currentPath dir + ".tmp"
+            System.IO.File.WriteAllText(tmp, fileName fileNumber + "\n")
+
+            use fs =
+                new System.IO.FileStream(
+                    tmp,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.Write,
+                    System.IO.FileShare.None
+                )
+
+            fs.Flush true
+            fs.Close()
+            System.IO.File.Move(tmp, currentPath dir, true))
 
     /// ディレクトリを作る（既にあれば何もしない）。
     let ensureDirectory (dir: string) =
@@ -41,9 +64,9 @@ module internal Manifest =
 
                     if text = "" then
                         None
-                    elif text.StartsWith "MANIFEST-" && text.EndsWith ".manifest" then
+                    elif text.StartsWith manifestPrefix && text.EndsWith ".manifest" then
                         Some(System.Int64.Parse(text.Substring(9, text.Length - 9 - ".manifest".Length)))
-                    elif text.StartsWith "MANIFEST-" then
+                    elif text.StartsWith manifestPrefix then
                         Some(System.Int64.Parse(text.Substring 9))
                     else
                         raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
@@ -89,25 +112,8 @@ module internal Manifest =
         let applyAll (edits: VersionEdit list) (initial: Version) =
             List.fold VersionEdit.apply initial edits
 
-        let writeCurrent (dir: string) (fileNumber: int64) =
-            protect (fun () ->
-                let tmp = currentPath dir + ".tmp"
-                System.IO.File.WriteAllText(tmp, fileName fileNumber + "\n")
-
-                use fs =
-                    new System.IO.FileStream(
-                        tmp,
-                        System.IO.FileMode.Open,
-                        System.IO.FileAccess.Write,
-                        System.IO.FileShare.None
-                    )
-
-                fs.Flush true
-                fs.Close()
-                System.IO.File.Move(tmp, currentPath dir, true))
-
         let hasSstFiles (dir: string) =
-            protect (fun () -> System.IO.Directory.GetFiles(dir, "*.sst").Length > 0)
+            protect (fun () -> System.IO.Directory.GetFiles(dir, "*" + FileMetaData.sstExtension).Length > 0)
 
         result {
             let! _ = ensureDirectory dir
@@ -137,6 +143,51 @@ module internal Manifest =
                     return Version.empty, manifestNumber
         }
 
+    /// manifest がこれを超えたら、現在の Version 全体を新しい manifest へ書き直す。
+    [<Literal>]
+    let private MaxManifestBytes = 4L * 1024L * 1024L
+
+    let private parseManifestNumber (path: string) =
+        let name = System.IO.Path.GetFileName path
+
+        if name.StartsWith(manifestPrefix, System.StringComparison.Ordinal) then
+            match System.Int64.TryParse(name.Substring 9) with
+            | true, value -> Some value
+            | _ -> None
+        else
+            None
+
+    let private nextManifestNumber (dir: string) (current: int64) =
+        protect (fun () ->
+            System.IO.Directory.GetFiles(dir, manifestPrefix + "*")
+            |> Array.choose parseManifestNumber
+            |> Array.fold (fun acc number -> max acc number) current
+            |> fun highest -> highest + 1L)
+
+    /// 新しい manifest に Version 全体のスナップショットを書く。
+    let private writeSnapshot (dir: string) (fileNumber: int64) (version: Version) =
+        protect (fun () ->
+            let edit =
+                {
+                    AddedFiles = Version.allFiles version
+                    DeletedFiles = []
+                }
+
+            let bytes = VersionEdit.encode edit
+            let text = System.Convert.ToBase64String bytes + "\n"
+            let data = System.Text.Encoding.UTF8.GetBytes text
+
+            use fs =
+                new System.IO.FileStream(
+                    manifestPath dir fileNumber,
+                    System.IO.FileMode.Create,
+                    System.IO.FileAccess.Write,
+                    System.IO.FileShare.Read
+                )
+
+            fs.Write(data, 0, data.Length)
+            fs.Flush true)
+
     /// .VersionEdit を反映し、Version と次の manifest 番号を返す。
     let logAndApply (dir: string) (manifestNumber: int64) (version: Version) (edit: VersionEdit) =
         let append (dir: string) (fileNumber: int64) (edit: VersionEdit) =
@@ -155,7 +206,7 @@ module internal Manifest =
                 let text = System.Convert.ToBase64String bytes + "\n"
                 let data = System.Text.Encoding.UTF8.GetBytes text
                 fs.Write(data, 0, data.Length)
-                fs.Flush(true))
+                fs.Flush true)
 
         result {
             let! _ = append dir manifestNumber edit
@@ -174,5 +225,22 @@ module internal Manifest =
                 else
                     next
 
-            return bumped, manifestNumber
+            let! size =
+                protect (fun () -> System.IO.FileInfo(manifestPath dir manifestNumber).Length)
+
+            if size < MaxManifestBytes then
+                return bumped, manifestNumber
+            else
+                let! nextNumber = nextManifestNumber dir manifestNumber
+                let! _ = writeSnapshot dir nextNumber bumped
+                let! _ = writeCurrent dir nextNumber
+
+                protect (fun () ->
+                    let old = manifestPath dir manifestNumber
+
+                    if System.IO.File.Exists old then
+                        System.IO.File.Delete old)
+                |> ignore
+
+                return bumped, nextNumber
         }

@@ -34,6 +34,10 @@ type internal WalState =
     }
 
 module internal Wal =
+    /// WAL ファイルの拡張子。
+    [<Literal>]
+    let internal walExtension = ".wal"
+
     [<Literal>]
     let private TagBegin = 0uy
 
@@ -151,7 +155,8 @@ module internal Wal =
         |> List.rev
         |> Array.ofList
 
-    let private fileName (fileNumber: int64) = sprintf "%06d.wal" fileNumber
+    let private fileName (fileNumber: int64) =
+        sprintf "%06d%s" fileNumber walExtension
 
     let path (dir: string) (fileNumber: int64) =
         System.IO.Path.Combine(dir, fileName fileNumber)
@@ -218,6 +223,18 @@ module internal Wal =
                 else
                     decodePayload payload |> Result.map Some
 
+    let private foldFrames (fs: System.IO.FileStream) (initial: 's) (step: 's -> WalRecord -> Result<'s, DbError>) =
+        let rec loop state =
+            match readFrameFrom fs with
+            | Error e -> Error e
+            | Ok None -> Ok state
+            | Ok(Some record) ->
+                match step state record with
+                | Error e -> Error e
+                | Ok next -> loop next
+
+        loop initial
+
     /// WAL ファイルをストリーミングで読み、コミット済みエントリを返す。
     /// 1フレームずつ読むので、WAL 全体をメモリへ載せない。
     let read (dir: string) (fileNumber: int64) =
@@ -235,21 +252,51 @@ module internal Wal =
                             System.IO.FileShare.Read
                         )
 
-                    let rec loop (pending, acc) =
-                        match readFrameFrom fs with
-                        | Error e -> Error e
-                        | Ok None -> Ok(List.rev acc |> Array.ofList)
-                        | Ok(Some record) -> loop (applyCommitted record (pending, acc))
-
-                    loop ([], []))
+                    foldFrames fs ([], []) (fun state record -> ret (applyCommitted record state))
+                    |> Result.map (fun (_, acc) -> List.rev acc |> Array.ofList))
                 |> Result.bind id
             else
                 ret [||]
 
+    /// コミット済みエントリをメモリに溜めず、1件ずつ `step` へ渡して再生する。
+    /// 大きな WAL でもコミット済みエントリの配列を保持しない。
+    let foldCommitted (dir: string) (fileNumber: int64) (initial: 's) (step: 's -> Entry -> 's) =
+        let p = path dir fileNumber
+
+        let applyRecord (pending, state) record =
+            match record with
+            | WalRecord.Begin _ -> pending, state
+            | WalRecord.Batch(txnId, entries) -> (txnId, entries) :: pending, state
+            | WalRecord.Abort txnId -> pending |> List.filter (fun (t, _) -> t <> txnId), state
+            | WalRecord.Commit txnId ->
+                let mine =
+                    pending
+                    |> List.filter (fun (t, _) -> t = txnId)
+                    |> List.collect (fun (_, e) -> Array.toList e)
+                    |> List.rev
+
+                pending |> List.filter (fun (t, _) -> t <> txnId), List.fold step state mine
+
+        protect (fun () ->
+            if not (System.IO.File.Exists p) then
+                ret initial
+            else
+                use fs =
+                    new System.IO.FileStream(
+                        p,
+                        System.IO.FileMode.Open,
+                        System.IO.FileAccess.Read,
+                        System.IO.FileShare.Read
+                    )
+
+                foldFrames fs ([], initial) (fun state record -> ret (applyRecord state record))
+                |> Result.map snd)
+        |> Result.bind id
+
     /// ディレクトリ内の WAL ファイル名（復旧時に孤児を消すのに使う）。
     let walFiles (dir: string) =
         if System.IO.Directory.Exists dir then
-            System.IO.Directory.GetFiles(dir, "*.wal") |> Array.toList
+            System.IO.Directory.GetFiles(dir, "*" + walExtension) |> Array.toList
         else
             []
 

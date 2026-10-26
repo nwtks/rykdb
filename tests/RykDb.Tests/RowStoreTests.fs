@@ -329,7 +329,8 @@ let ``RowStore: keyspace ごとに独立したディレクトリを持つ`` () =
         Assert.True(dirs.Length >= 2)
 
         let hasWal =
-            dirs |> Array.exists (fun d -> Directory.GetFiles(d, "*.wal").Length > 0)
+            dirs
+            |> Array.exists (fun d -> Directory.GetFiles(d, "*" + Wal.walExtension).Length > 0)
 
         Assert.True hasWal)
 

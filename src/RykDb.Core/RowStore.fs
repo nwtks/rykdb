@@ -845,8 +845,8 @@ module internal RowStore =
         match
             protect (fun () ->
                 System.IO.File.Exists(System.IO.Path.Combine(dir, "CURRENT"))
-                || System.IO.Directory.GetFiles(dir, "MANIFEST-*").Length > 0
-                || System.IO.Directory.GetFiles(dir, "*.wal").Length > 0)
+                || System.IO.Directory.GetFiles(dir, Manifest.manifestPrefix + "*").Length > 0
+                || System.IO.Directory.GetFiles(dir, "*" + Wal.walExtension).Length > 0)
         with
         | Ok true -> true
         | _ -> false

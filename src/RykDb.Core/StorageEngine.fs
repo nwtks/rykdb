@@ -515,7 +515,8 @@ module internal StorageEngine =
                 |> Manifest.logAndApply dir manifestNumber version
 
         let sstNumbersOnDisk (dir: string) =
-            System.IO.Directory.GetFiles(dir, "*.sst") |> Array.choose parseNumber
+            System.IO.Directory.GetFiles(dir, "*" + FileMetaData.sstExtension)
+            |> Array.choose parseNumber
 
         let move quarantine (n: int64) =
             let source = FileMetaData.path dir n
@@ -585,10 +586,10 @@ module internal StorageEngine =
             (version: Version)
             (manifestNumber: int64)
             (walState: WalState)
-            (replayed: Entry array)
+            (mem: Memtable)
+            (walMax: uint64)
             (diskMax: uint64)
             =
-            let walMax = Entry.maxSeqNo replayed
             let nextSeqNo = max walMax diskMax + 1UL
 
             let bumped =
@@ -601,7 +602,7 @@ module internal StorageEngine =
                 Version = bumped
                 Wal = walState
                 NextSeqNo = nextSeqNo
-                Mem = Memtable.apply replayed Memtable.empty
+                Mem = mem
             }
 
         result {
@@ -609,9 +610,13 @@ module internal StorageEngine =
             let! version', manifestNumber' = dropMissingFiles dir manifestNumber version
             do! quarantineOrphans dir version'
             let! walState = openOrCreateWal dir version'
-            let! replayed = Wal.read dir walState.FileNumber
+
+            let! mem, walMax =
+                Wal.foldCommitted dir walState.FileNumber (Memtable.empty, 0UL) (fun (mem, maxSeq) entry ->
+                    Memtable.insert entry mem, max maxSeq entry.SeqNo)
+
             let diskMax = maxSeqNoOnDisk version'
-            return buildRecovered version' manifestNumber' walState replayed diskMax
+            return buildRecovered version' manifestNumber' walState mem walMax diskMax
         }
 
     /// データベースを閉じる（memtable を flush してから WAL を消す）。

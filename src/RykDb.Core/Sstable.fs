@@ -1105,6 +1105,10 @@ type internal FileMetaData =
     }
 
 module internal FileMetaData =
+    /// SSTable ファイルの拡張子。
+    [<Literal>]
+    let internal sstExtension = ".sst"
+
     /// キー範囲も件数も未確定の空メタデータ。
     /// デコード途中の「番号とレベルだけ分かった」状態や、「compaction なし」の報告に使う
     /// （フィールドは上書きする）。
@@ -1120,7 +1124,8 @@ module internal FileMetaData =
         }
 
     /// SSTable のファイル名（%06d.sst）。
-    let private fileName (fileNumber: int64) = sprintf "%06d.sst" fileNumber
+    let private fileName (fileNumber: int64) =
+        sprintf "%06d%s" fileNumber sstExtension
 
     /// SSTable のフルパス。
     let path (dir: string) (fileNumber: int64) =

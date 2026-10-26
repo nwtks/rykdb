@@ -172,6 +172,33 @@ let ``Manifest: NextFileNumber は追加したファイル番号より必ず大�
         Assert.Equal(10L, v3.NextFileNumber))
 
 [<Fact>]
+let ``Manifest: 大きくなった manifest はスナップショットへローテーションする`` () =
+    withDir "manifest-rotate" (fun dir ->
+        let v0, mn0 = ok (Manifest.openOrCreate dir)
+
+        // 1レコードで 4MiB を超える編集を作る。
+        let big = Array.create (5 * 1024 * 1024) 1uy
+
+        let file =
+            { FileMetaData.zero with
+                FileNumber = 1L
+                Level = 0
+                Smallest = big
+                Largest = big
+                EntryCount = 1L
+                Size = 1L
+                MaxSeqNo = 1UL
+            }
+
+        let _, mn1 = ok (Manifest.logAndApply dir mn0 v0 (VersionEdit.addFile file))
+        Assert.NotEqual<int64>(mn0, mn1)
+
+        // 新しい manifest を CURRENT が指し、Version 全体が復元できる。
+        let v2, mn2 = ok (Manifest.openOrCreate dir)
+        Assert.Equal<int64>(mn1, mn2)
+        Assert.Equal<int>(1, Version.allFiles v2 |> List.length))
+
+[<Fact>]
 let ``Manifest: NextFileNumber が Int64.MaxValue のとき負に回り込まない`` () =
     withDir "manifest-next-max" (fun dir ->
         let _, mn = ok (Manifest.openOrCreate dir)
