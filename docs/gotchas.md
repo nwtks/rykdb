@@ -1257,7 +1257,7 @@ DDL だけはプロセス内で排他にする必要がある。
 
 `lazyMergeScan` が開けなかったファイルを `Drained`（空）と見なしていたため、
 壊れた SSTable があると `Ok` のまま行が欠けた（静かな誤答）。
-`StorageEngine.scanAt` は `limit` の有無にかかわらず候補ファイルを先に `openSstable` し、
+`StorageEngine.scanAt` は `limit` の有無にかかわらず候補ファイルを先に `openPartialSst` し、
 エラーをそのまま返す。`limit` による遅延オープンは諦めた（正しさを優先）。
 
 ### 11.20 壊れたデータは未捕捉例外にしない
@@ -1276,9 +1276,9 @@ DDL だけはプロセス内で排他にする必要がある。
 - `Engine.contextOf`: `Catalog.toSchema` の失敗を無視せず、文のエラーとして返す。
 - `Ops.sortBy`: 非 NULL の代表値と比較できない値があれば、ソート前にエラーにする。
 
-### 11.22 SSTable の reader キャッシュは「パス + サイズ + mtime」で無効化する
+### 11.22 SSTable の partial reader キャッシュは「パス + サイズ + mtime」で無効化する
 
-`SstReaderCache` はパース済み `SstReader` を弱参照で保持する。
+`SstPartialCache` はパース済み `SstPartial` を弱参照で保持する。
 キーにサイズと mtime を含めないと、同じファイル番号のファイルを差し替えたときに古い内容を返す。
 
 - テストで SSTable を書き換えたら `File.SetLastWriteTimeUtc` で mtime を確実に進める。
@@ -1320,13 +1320,11 @@ v3 の Footer は自身のチェックサム（先頭 80バイト対象）を持
 `SstPartial` は Footer / meta / Bloom / index だけを開き、
 データブロックは必要になったとき `FileStream` で読む。
 読んだブロックは `parseBlock` がチェックサムを検証する。
-全体チェックサムは `openTable`（全体読み）だけが検証する。
 
 - 部分読みで読まなかったブロックの破損は、そのクエリでは検出されない。
 - テストでファイルを書き換えたら mtime を進める（§11.22）。
 - `SstPartial` の `rangeScanPartial` は最大 8ブロックを 1回の open で読み、解析は必要になったときだけ行う。
   `lookup` は 1ブロックだけ読む。
-  大量のブロックを読む全件走査は全体読み（`openTable`）の方が速い。
 
 ### 11.27 結合アルゴリズムの前提
 

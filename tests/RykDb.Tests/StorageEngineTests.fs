@@ -30,8 +30,7 @@ let private pickFirstLevel =
 /// ファイルの Bloom を読み、[lo..hi] の範囲で「含まれないのに偽陽性で通る」キーを探す。
 /// Bloom は決定的なので、同じファイルなら常に同じ結果になる。
 let private findBloomFalsePositive (dir: string) (fileNumber: int64) (lo: int) (hi: int) =
-    let reader =
-        ok (Sstable.openTable (File.ReadAllBytes(FileMetaData.path dir fileNumber)))
+    let reader = ok (Sstable.openPartial (FileMetaData.path dir fileNumber))
 
     [ lo..hi ]
     |> List.tryPick (fun i ->
@@ -40,8 +39,7 @@ let private findBloomFalsePositive (dir: string) (fileNumber: int64) (lo: int) (
 
 /// ファイルの Bloom を読み、[lo..hi] の範囲で「確実に含まれない」と言われるキーを探す。
 let private findBloomMiss (dir: string) (fileNumber: int64) (lo: int) (hi: int) =
-    let reader =
-        ok (Sstable.openTable (File.ReadAllBytes(FileMetaData.path dir fileNumber)))
+    let reader = ok (Sstable.openPartial (FileMetaData.path dir fileNumber))
 
     [ lo..hi ]
     |> List.tryPick (fun i ->
@@ -268,8 +266,7 @@ let ``StorageEngine.getAt: 壊れたブロックは CorruptionError`` () =
                 mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1); Entry.put (intKey 2) 2UL (intRow 2) ]
 
             // ブロック末尾の restart 件数を巨大値にして壊し、チェックサムは合わせ直す
-            let block =
-                (ok (Sstable.openTable (File.ReadAllBytes(FileMetaData.path dir 10L)))).Index.[0]
+            let block = (ok (Sstable.openPartial (FileMetaData.path dir 10L))).Index.[0]
 
             patchSstable dir 10L (fun data ->
                 let at = block.Offset + block.Length - 4
@@ -512,7 +509,7 @@ let ``StorageEngine.getAt / scanAt: 必要なブロックだけを部分読み�
 
             // 2番目のブロックの内部を壊す（全体チェックサムも合わなくなる）。
             let path = FileMetaData.path dir 10L
-            let reader = ok (Sstable.openTable (File.ReadAllBytes path))
+            let reader = ok (Sstable.openPartial path)
             let block = reader.Index.[1]
             let data = File.ReadAllBytes path
             data.[block.Offset + 2] <- data.[block.Offset + 2] ^^^ 0xFFuy

@@ -36,38 +36,16 @@ type internal StorageEngine =
         ActiveSnapshot: uint64
     }
 
-/// パース済み SSTable reader のプロセス内キャッシュ。
-/// SSTable は一度書かれたら内容が変わらない（ファイル番号は単調増加）ので、
-/// パス + サイズ + mtime をキーにすれば安全に再利用できる。
-/// 大きな DB でもメモリを圧迫しないよう、値は弱参照で持つ（GC が回収できる）。
-module internal SstReaderCache =
+/// 部分読み用の SSTable リーダー（index / Bloom / meta のみ）のキャッシュ。
+module internal SstPartialCache =
     let private cache =
-        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstReader>>
+        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstPartial>>
             System.StringComparer.Ordinal
 
     /// ファイルの同一性を表すキー。
     /// 同じ番号のファイルが差し替わった場合はサイズ/mtime が変わるので別キーになる。
     let keyOf (path: string) (info: System.IO.FileInfo) =
         sprintf "%s|%d|%d" path info.Length info.LastWriteTimeUtc.Ticks
-
-    let tryGet (key: string) =
-        match cache.TryGetValue key with
-        | true, weak ->
-            match weak.TryGetTarget() with
-            | true, reader -> Some reader
-            | _ ->
-                cache.TryRemove key |> ignore
-                None
-        | _ -> None
-
-    let put (key: string) (reader: SstReader) =
-        cache.[key] <- System.WeakReference<SstReader> reader
-
-/// 部分読み用の SSTable リーダー（index / Bloom / meta のみ）のキャッシュ。
-module internal SstPartialCache =
-    let private cache =
-        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstPartial>>
-            System.StringComparer.Ordinal
 
     let tryGet (key: string) =
         match cache.TryGetValue key with
@@ -101,38 +79,11 @@ module internal StorageEngine =
         | true, v -> Some v
         | _ -> None
 
-    /// snapshot（visible）から見える版かどうか。
-    /// None なら常に見える。
-    let private isVisible (visible: uint64 option) (e: SstEntry) =
-        match visible with
-        | Some s -> e.SeqNo <= s
-        | None -> true
-
-    /// ファイルを開く（Bloom と index を持つ reader を作る）。
-    /// パース結果は弱参照キャッシュに載せ、同じファイルを何度も読まない。
-    let private openSstable (engine: StorageEngine) (f: FileMetaData) =
-        let readFileBytes (dir: string) (fileNumber: int64) =
-            protect (fun () -> System.IO.File.ReadAllBytes(FileMetaData.path dir fileNumber))
-
-        let path = FileMetaData.path engine.Dir f.FileNumber
-
-        match protect (fun () -> SstReaderCache.keyOf path (System.IO.FileInfo path)) with
-        | Error e -> Error e
-        | Ok key ->
-            match SstReaderCache.tryGet key with
-            | Some reader -> Ok reader
-            | None ->
-                readFileBytes engine.Dir f.FileNumber
-                >>= Sstable.openTable
-                >>= fun reader ->
-                    SstReaderCache.put key reader
-                    Ok reader
-
     /// 部分読み用の reader を開く（index / Bloom / meta のみ）。
     let private openPartialSst (engine: StorageEngine) (f: FileMetaData) =
         let path = FileMetaData.path engine.Dir f.FileNumber
 
-        match protect (fun () -> SstReaderCache.keyOf path (System.IO.FileInfo path)) with
+        match protect (fun () -> SstPartialCache.keyOf path (System.IO.FileInfo path)) with
         | Error e -> Error e
         | Ok key ->
             match SstPartialCache.tryGet key with
@@ -149,44 +100,17 @@ module internal StorageEngine =
     /// これが MVCC の可視性。
     /// None なら制限なし。
     let getAt (engine: StorageEngine) (visible: uint64 option) (key: byte array) =
-        let rec seek (visible: uint64 option) (key: byte array) (cur: SstScan) =
-            match SstScan.next cur with
-            | Error e -> Error e
-            | Ok None -> ret None
-            | Ok(Some(e, nxt)) ->
-                match Bytes.compare e.Key key with
-                | c when c < 0 -> seek visible key nxt
-                | 0 ->
-                    if isVisible visible e then
-                        ret (Some e)
-                    else
-                        seek visible key nxt
-                | _ -> ret None
-
-        let firstVisible (visible: uint64 option) (key: byte array) (scan: SstScan) = seek visible key scan
-
         let rec probe (files: FileMetaData list) =
             match files with
             | [] -> ret None
             | f :: rest ->
                 match openPartialSst engine f with
                 | Error e -> Error e
-                | Ok partial when partial.HasBlockChecksums ->
+                | Ok partial ->
                     match Sstable.lookup partial visible key with
                     | Error e -> Error e
                     | Ok(Some e) -> ret (Some e)
                     | Ok None -> probe rest
-                | Ok _ ->
-                    match openSstable engine f with
-                    | Error e -> Error e
-                    | Ok reader ->
-                        if not (Sstable.mayContain reader key) then
-                            probe rest
-                        else
-                            match Sstable.rangeScan reader key 0 |> firstVisible visible key with
-                            | Error e -> Error e
-                            | Ok(Some e) -> ret (Some e)
-                            | Ok None -> probe rest
 
         match Memtable.getVisible key visible engine.Mem with
         | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
@@ -227,10 +151,7 @@ module internal StorageEngine =
             let startScan =
                 match openPartialSst engine f with
                 | Error e -> Error e
-                | Ok partial when partial.HasBlockChecksums -> Ok(Sstable.rangeScanPartial partial startKey 0)
-                | Ok _ ->
-                    openSstable engine f
-                    |> Result.map (fun reader -> Sstable.rangeScan reader startKey 0)
+                | Ok partial -> Ok(Sstable.rangeScanPartial partial startKey 0)
 
             match startScan with
             | Error e -> Error e
@@ -441,10 +362,7 @@ module internal StorageEngine =
         let scanOf (engine: StorageEngine) (f: FileMetaData) =
             match openPartialSst engine f with
             | Error e -> Error e
-            | Ok partial when partial.HasBlockChecksums -> Ok(Sstable.rangeScanPartial partial [||] 0)
-            | Ok _ ->
-                openSstable engine f
-                |> Result.map (fun reader -> Sstable.rangeScan reader [||] 0)
+            | Ok partial -> Ok(Sstable.rangeScanPartial partial [||] 0)
 
         let buildCompacted (version: Version) (manifestNumber: int64) (result: CompactionResult) =
             let nextNum =

@@ -19,9 +19,8 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
 
 /// 書いた SSTable を開く（compact の openScan と同じ経路）。
 let private openBack (dir: string) (f: FileMetaData) =
-    protect (fun () -> File.ReadAllBytes(FileMetaData.path dir f.FileNumber))
-    >>= Sstable.openTable
-    >>= fun reader -> ret (Sstable.rangeScan reader [||] 0)
+    Sstable.openPartial (FileMetaData.path dir f.FileNumber)
+    >>= fun partial -> ret (Sstable.rangeScanPartial partial [||] 0)
 
 /// 書いた SSTable を読み戻す（検証用）。
 let private readBack (dir: string) (f: FileMetaData) = openBack dir f >>= SstScan.toArray

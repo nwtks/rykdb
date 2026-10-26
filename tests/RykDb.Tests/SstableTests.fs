@@ -13,6 +13,14 @@ let private sstEntries n =
     Array.init n (fun i -> SstEntry.make (intKey i) (uint64 (i + 1)) (Some [| SqlValue.Int(int64 i) |]))
     |> Array.sortWith SstEntry.compare
 
+/// バイト列を一時ファイルに書き、部分読みリーダーを開く。
+let private writeTempSst (data: byte array) =
+    let path =
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), System.Guid.NewGuid().ToString("N") + ".sst")
+
+    System.IO.File.WriteAllBytes(path, data)
+    path
+
 /// Footer 末尾の 4バイト（先頭 FooterSize-4 バイトのチェックサム）を付け直す。
 let private fixFooterChecksum (bytes: byte array) =
     let footerStart = bytes.Length - Sstable.FooterSize
@@ -23,30 +31,9 @@ let private fixFooterChecksum (bytes: byte array) =
     for i in 0..3 do
         bytes.[footerStart + Sstable.FooterSize - 4 + i] <- byte (checksum >>> (8 * i) &&& 0xFFu)
 
-/// ブロック解析の異常系用: 1ブロック分のデータだけを持つ読み取り側を組み立てる。
-let private craftedReader (data: byte array) (offset: int) (length: int) =
-    {
-        Data = data
-        Index =
-            [|
-                {
-                    LastKey = [||]
-                    Offset = offset
-                    Length = length
-                }
-            |]
-        MinKey = [||]
-        MaxKey = [||]
-        Bloom = None
-        EntryCount = 0L
-        MaxSeqNo = 0UL
-        // craftedReader は生のブロックを渡すので、チェックサム検証は行わない。
-        HasBlockChecksums = false
-    }
-
 /// 先頭から全エントリを配列で返す（全件必要ならこちら）。
-let private readEntries (reader: SstReader) =
-    Sstable.rangeScan reader [||] 0 |> SstScan.toArray
+let private readEntries (partial: SstPartial) =
+    Sstable.rangeScanPartial partial [||] 0 |> SstScan.toArray
 
 [<Fact>]
 let ``SstEntry.make / compare: キー昇順・SeqNo 降順`` () =
@@ -186,21 +173,21 @@ let ``SSTable: maxSeqNo が保存・復元される`` () =
         |]
 
     let bytes = ok (Sstable.build entries 0.01)
-    let reader = ok (Sstable.openTable bytes)
+    let reader = ok (Sstable.openPartial (writeTempSst bytes))
     Assert.Equal<uint64>(99UL, reader.MaxSeqNo)
     Assert.Equal<int64>(3L, reader.EntryCount)
 
 [<Fact>]
 let ``SSTable: 空のテーブルは maxSeqNo 0`` () =
     let bytes = ok (Sstable.build [||] 0.01)
-    let reader = ok (Sstable.openTable bytes)
+    let reader = ok (Sstable.openPartial (writeTempSst bytes))
     Assert.Equal<uint64>(0UL, reader.MaxSeqNo)
 
 [<Fact>]
 let ``SSTable: 構築と全件走査の往復`` () =
     let entries = sstEntries 1000
     let data = ok (Sstable.build entries 0.01)
-    let reader = ok (Sstable.openTable data)
+    let reader = ok (Sstable.openPartial (writeTempSst data))
     Assert.Equal<int64>(int64 entries.Length, reader.EntryCount)
 
     let all = ok (readEntries reader) |> Seq.toArray
@@ -218,7 +205,10 @@ let ``SSTable: 構築と全件走査の往復`` () =
 let ``SSTable: 複数ブロックに分割される`` () =
     // EntriesPerBlock = 128 なので 1000 件で 8 ブロック
     let entries = sstEntries 1000
-    let reader = ok (Sstable.openTable (ok (Sstable.build entries 0.01)))
+
+    let reader =
+        ok (Sstable.openPartial (writeTempSst (ok (Sstable.build entries 0.01))))
+
     Assert.Equal(8, reader.Index.Length)
 
     // ブロック境界をまたぐ探索ができること
@@ -227,7 +217,7 @@ let ``SSTable: 複数ブロックに分割される`` () =
 [<Fact>]
 let ``SSTable: 空のテーブル`` () =
     let data = ok (Sstable.build [||] 0.01)
-    let reader = ok (Sstable.openTable data)
+    let reader = ok (Sstable.openPartial (writeTempSst data))
     Assert.Equal<int64>(0L, reader.EntryCount)
     Assert.Equal(0, ok (readEntries reader) |> Seq.length)
 
@@ -260,7 +250,9 @@ let ``SSTable: 全 10型の値を往復できる`` () =
         |> Array.mapi (fun i vs -> SstEntry.make (KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]) 1UL (Some vs))
         |> Array.sortWith SstEntry.compare
 
-    let reader = ok (Sstable.openTable (ok (Sstable.build entries 0.01)))
+    let reader =
+        ok (Sstable.openPartial (writeTempSst (ok (Sstable.build entries 0.01))))
+
     let all = ok (readEntries reader) |> Seq.toArray
 
     for i in 0 .. values.Length - 1 do
@@ -310,7 +302,12 @@ let ``Sstable.openTable: チェックサム不一致は CorruptionError`` () =
     let data = ok (Sstable.build (sstEntries 500) 0.01)
     let corrupted = Array.copy data
     corrupted.[corrupted.Length / 2] <- corrupted.[corrupted.Length / 2] ^^^ 0xFFuy
-    expectErrorKind ErrorKind.CorruptionError "チェックサム不一致はエラーになるはず" (Sstable.openTable corrupted)
+    let partial = ok (Sstable.openPartial (writeTempSst corrupted))
+
+    expectErrorKind
+        ErrorKind.CorruptionError
+        "チェックサム不一致はエラーになるはず"
+        (Sstable.rangeScanPartial partial [||] 0 |> SstScan.toArray)
 
 [<Fact>]
 let ``Sstable.openTable: マジック不一致は CorruptionError`` () =
@@ -319,7 +316,7 @@ let ``Sstable.openTable: マジック不一致は CorruptionError`` () =
     let footerStart = badMagic.Length - Sstable.FooterSize
     badMagic.[footerStart] <- badMagic.[footerStart] ^^^ 0xFFuy
     fixFooterChecksum badMagic
-    expectErrorKind ErrorKind.CorruptionError "マジック不一致はエラーになるはず" (Sstable.openTable badMagic)
+    expectErrorKind ErrorKind.CorruptionError "マジック不一致はエラーになるはず" (Sstable.openPartial (writeTempSst badMagic))
 
 [<Fact>]
 let ``Sstable.openTable: 未対応バージョンは CorruptionError`` () =
@@ -327,7 +324,7 @@ let ``Sstable.openTable: 未対応バージョンは CorruptionError`` () =
     let bad = Array.copy data
     bad.[bad.Length - Sstable.FooterSize + 8] <- 5uy
     fixFooterChecksum bad
-    expectErrorKind ErrorKind.CorruptionError "未対応バージョンはエラーになるはず" (Sstable.openTable bad)
+    expectErrorKind ErrorKind.CorruptionError "未対応バージョンはエラーになるはず" (Sstable.openPartial (writeTempSst bad))
 
 [<Fact>]
 let ``Sstable.openTable: Footer の範囲が不正なら CorruptionError`` () =
@@ -356,27 +353,11 @@ let ``Sstable.openTable: Footer の範囲が不正なら CorruptionError`` () =
         patch bytes
         // Footer のチェックサムを直して、範囲検証まで到達させる。
         fixFooterChecksum bytes
-        expectErrorKind ErrorKind.CorruptionError name (Sstable.openTable bytes)
+        expectErrorKind ErrorKind.CorruptionError name (Sstable.openPartial (writeTempSst bytes))
 
 [<Fact>]
 let ``Sstable.openTable: Footer に満たないデータは CorruptionError`` () =
-    expectErrorKind ErrorKind.CorruptionError "短すぎるデータはエラー" (Sstable.openTable (Array.create 10 0uy))
-
-[<Fact>]
-let ``Sstable.openTable: v3 Footer を読み取れる`` () =
-    let data = ok (Sstable.build (sstEntries 3) 0.01)
-    let footerStartV4 = data.Length - Sstable.FooterSize
-    let legacyFooter = Array.sub data footerStartV4 80
-    legacyFooter.[8] <- 3uy
-
-    let legacyChecksum = Hashing.checksumRange legacyFooter 0 80
-
-    let footer =
-        Writer.build [ Writer.writeBytes legacyFooter; Writer.uint32LE legacyChecksum ]
-
-    let legacyData = Array.concat [ Array.sub data 0 footerStartV4; footer ]
-    let reader = ok (Sstable.openTable legacyData)
-    Assert.Equal<int64>(3L, reader.EntryCount)
+    expectErrorKind ErrorKind.CorruptionError "短すぎるデータはエラー" (Sstable.openPartial (writeTempSst (Array.create 10 0uy)))
 
 [<Fact>]
 let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開ける`` () =
@@ -405,12 +386,10 @@ let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開�
     let footer =
         Writer.build [ Writer.writeBytes footerBody; Writer.uint32LE footerChecksum ]
 
-    let reader = ok (Sstable.openTable (Array.append body footer))
-    Assert.Equal<byte array>([||], reader.MinKey)
-    Assert.Equal<byte array>([||], reader.MaxKey)
-    Assert.Equal<int64>(0L, reader.EntryCount)
-    // Bloom なしは「含まれ得る」= true
-    Assert.True(Sstable.mayContain reader (intKey 1))
+    expectErrorKind
+        ErrorKind.CorruptionError
+        "Meta の破損は CorruptionError"
+        (Sstable.openPartial (writeTempSst (Array.append body footer)))
 
 [<Fact>]
 let ``Sstable.openPartial: Footer のチェックサム不一致は CorruptionError`` () =
@@ -425,7 +404,7 @@ let ``Sstable.openPartial: Footer のチェックサム不一致は CorruptionEr
         bad.[footerStart + 20] <- bad.[footerStart + 20] ^^^ 0xFFuy
         System.IO.File.WriteAllBytes(path, bad)
         expectErrorKind ErrorKind.CorruptionError "部分読みでも Footer の破損を検出する" (Sstable.openPartial path)
-        expectErrorKind ErrorKind.CorruptionError "全体読みでも Footer の破損を検出する" (Sstable.openTable bad))
+        expectErrorKind ErrorKind.CorruptionError "全体読みでも Footer の破損を検出する" (Sstable.openPartial (writeTempSst bad)))
 
 [<Fact>]
 let ``Sstable.openPartial: Bloom メタデータの破損は checksum で検出`` () =
@@ -489,7 +468,10 @@ let ``Sstable.openPartial: 壊れたブロックは読み出し時に Corruption
 [<Fact>]
 let ``Sstable.mayContain: Bloom filter は false negative がない`` () =
     let entries = sstEntries 20_000
-    let reader = ok (Sstable.openTable (ok (Sstable.build entries 0.01)))
+
+    let reader =
+        ok (Sstable.openPartial (writeTempSst (ok (Sstable.build entries 0.01))))
+
     Assert.True reader.Bloom.IsSome
 
     for e in entries do
@@ -500,90 +482,6 @@ let ``Sstable.mayContain: Bloom filter は false negative がない`` () =
     let fp = others |> Array.filter (Sstable.mayContain reader) |> Array.length
     let rate = float fp / float others.Length
     Assert.True(rate <= 0.05, sprintf "誤検出率が高すぎます: %.4f" rate)
-
-[<Fact>]
-let ``SSTable.rangeScan: startKey 以降を limit 件`` () =
-    let reader = ok (Sstable.openTable (ok (Sstable.build (sstEntries 1000) 0.01)))
-    let got = ok (SstScan.toArray (Sstable.rangeScan reader (intKey 500) 10))
-    Assert.Equal(10, got.Length)
-    Assert.True(got.[0].Key = intKey 500)
-    // 終端を超える limit は実数だけ返す
-    Assert.Equal(50, ok (SstScan.toArray (Sstable.rangeScan reader (intKey 950) 100)) |> Array.length)
-
-[<Fact>]
-let ``SSTable.rangeScan: ブロック境界をまたいでも連続する`` () =
-    // EntriesPerBlock = 128 なので 1000件で 8ブロック（境界は 128 の倍数）
-    let reader = ok (Sstable.openTable (ok (Sstable.build (sstEntries 1000) 0.01)))
-    // 境界をまたぐ
-    let got = ok (SstScan.toArray (Sstable.rangeScan reader (intKey 120) 20))
-    Assert.Equal(20, got.Length)
-    Assert.Equal<byte array>(intKey 120, got.[0].Key)
-    Assert.Equal<byte array>(intKey 139, got.[19].Key)
-
-    // 境界ちょうどから
-    let fromBoundary = ok (SstScan.toArray (Sstable.rangeScan reader (intKey 128) 3))
-    Assert.Equal(3, fromBoundary.Length)
-    Assert.Equal<byte array>(intKey 128, fromBoundary.[0].Key)
-    Assert.Equal<byte array>(intKey 130, fromBoundary.[2].Key)
-    // 最後のブロックの途中からは残りだけ
-    Assert.Equal(10, ok (SstScan.toArray (Sstable.rangeScan reader (intKey 990) 0)) |> Array.length)
-    // MaxKey より後ろは空
-    Assert.Empty(ok (SstScan.toArray (Sstable.rangeScan reader (intKey 1000) 0)))
-
-[<Fact>]
-let ``SSTable.rangeScan: 必要なブロックだけ読む`` () =
-    let reader = ok (Sstable.openTable (ok (Sstable.build (sstEntries 200_000) 0.01)))
-    // 走査の確保バイト数を測る（1回走らせて JIT 分を除いてから）
-    let measure (scan: unit -> SstEntry array) =
-        scan () |> ignore
-        let before = GC.GetAllocatedBytesForCurrentThread()
-        let got = scan ()
-        GC.GetAllocatedBytesForCurrentThread() - before, got
-
-    let firstAlloc, first =
-        measure (fun () -> ok (SstScan.toArray (Sstable.rangeScan reader (intKey 0) 1)))
-
-    let allAlloc, all =
-        measure (fun () -> ok (SstScan.toArray (Sstable.rangeScan reader (intKey 0) 0)))
-
-    Assert.Equal(1, first.Length)
-    Assert.Equal<byte array>(intKey 0, first.[0].Key)
-    Assert.Equal(200_000, all.Length)
-
-    // 先頭 1件は 1ブロック（128件）分しか解析しない。
-    // 全件（200,000件）を読み切るのに比べ、2桁以上小さいはず。
-    Assert.True(firstAlloc * 100L < allAlloc, $"先頭  件で {firstAlloc} バイト（全件は {allAlloc} バイト）")
-
-[<Fact>]
-let ``SSTable.rangeScan: 壊れたブロックは Error になる`` () =
-    // ブロックが短すぎる
-    let short = craftedReader (Array.create 4 0uy) 0 4
-    expectErrorKind ErrorKind.CorruptionError "短すぎるブロックはエラー" (SstScan.toArray (Sstable.rangeScan short [||] 0))
-
-    // restart 配列の件数が 0
-    let zeroRestarts = craftedReader (Array.create 8 0uy) 0 8
-
-    expectErrorKind
-        ErrorKind.CorruptionError
-        "restart 件数 0 はエラー"
-        (SstScan.toArray (Sstable.rangeScan zeroRestarts [||] 0))
-
-    // restart 配列が本体より大きい（件数 3 → 16 バイト > 8 バイト）
-    let bigRestarts = craftedReader [| 0uy; 0uy; 0uy; 0uy; 3uy; 0uy; 0uy; 0uy |] 0 8
-
-    expectErrorKind
-        ErrorKind.CorruptionError
-        "restart 配列が大きすぎればエラー"
-        (SstScan.toArray (Sstable.rangeScan bigRestarts [||] 0))
-
-    // エントリの varint が途中で切れる（restart 配列は正常）
-    let truncatedEntry =
-        craftedReader [| 0x80uy; 0uy; 0uy; 0uy; 0uy; 1uy; 0uy; 0uy; 0uy |] 0 9
-
-    expectErrorKind
-        ErrorKind.CorruptionError
-        "途中で切れたエントリはエラー"
-        (SstScan.toArray (Sstable.rangeScan truncatedEntry [||] 0))
 
 [<Fact>]
 let ``FileMetaData.zero: 空メタデータ`` () =

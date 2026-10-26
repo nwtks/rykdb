@@ -963,7 +963,8 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | Bloom filter           | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。読む側は `Sstable.mayContain`                                               |
 | ポイント検索の順路     | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                                    |
 
-ファイルは `Sstable.build` が v4 形式を組み立てる。読み出しは 2通りあり、既存 v3 形式も読み取れる。
+ファイルは `Sstable.build` が v4 形式を組み立てる。
+`StorageEngine` は**部分読みだけ**を使う。
 
 - **部分読み**（`Sstable.openPartial`）: Footer / meta / Bloom / index だけを読み、
   `SstPartial`（パス + インデックス）を返す。データブロックは `rangeScanPartial` /
@@ -972,15 +973,12 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
   `rangeScanPartial` は最大 ** 8ブロック **を 1回の open でまとめて読む
   （バッチ内の不要なブロックは解析・検証しない）。
   `lookup` は 1ブロックだけ読む。
-  ポイント検索と `limit > 0` の走査はこちらを使う。
-- **全体読み**（`Sstable.openTable`）: ファイル全体を読み、Footer の全体チェックサムを検証する。
-  制限なしの走査・compaction・GC はこちらを使う。
 
 v2 の各ブロックは末尾に 4バイトのチェックサム、v3 の Footer は自身のチェックサムを持つ。
 部分読みでも、Footer と実際に読んだブロックの破損は `CorruptionError` として検出できる
 （読まなかったブロック・ファイルは検証されない）。
 
-パース済みの `SstReader` / `SstPartial` は `SstReaderCache` / `SstPartialCache` が**弱参照**で保持する
+パース済みの `SstPartial` は `SstPartialCache` が**弱参照**で保持する
 （キーは「パス + サイズ + mtime」。
 ファイル番号は単調増加で中身は書き換わらないため安全に共有でき、GC が回収できるのでメモリを圧迫しない）。
 同じファイルの 2回目以降の検索・走査は Footer/index の再読み込みを省略できる。
@@ -1005,7 +1003,6 @@ limit に達する前に開封・ブロック解析のエラーがあれば `Err
 走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
 `rangeScan` / `rangeScanPartial` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ
 （ブロックの解析失敗は、そのブロックが必要になった `next` が `Error` を返す）。
-`Sstable.entries`（= 全体読み + `rangeScan` + `SstScan.toArray`）だけが全件を配列に実体化する。
 下限の適用は `Memtable.rangeScan` と同じく「読む側」が担い、merge 後に絞り直さない（§8.1）。
 
 ### 8.3 VersionSet
