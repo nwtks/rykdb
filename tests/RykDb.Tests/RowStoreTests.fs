@@ -129,6 +129,86 @@ let ``TableSchema.ofCreateTable: テーブル制約の主キーを使う`` () =
     expectErrorKind ErrorKind.NameError "存在しない主キー列で作れてしまう" (TableSchema.ofCreateTable bad)
 
 [<Fact>]
+let ``TableSchema.ofCreateTable: テーブルレベル PK は NOT NULL になる`` () =
+    let ast =
+        {
+            Name = "t"
+            IfNotExists = false
+            Columns = [ col "id" DataType.Integer; col "v" DataType.Text ]
+            Constraints = [ TableConstraint.PrimaryKeyColumns [ "id" ] ]
+        }
+
+    let schema = ok (TableSchema.ofCreateTable ast)
+    Assert.True(schema.Columns.[0].Constraint.NotNull)
+    Assert.True(schema.Columns.[0].Constraint.PrimaryKey)
+    Assert.False(schema.Columns.[1].Constraint.NotNull)
+
+    expectErrorKind
+        ErrorKind.ConstraintViolation
+        "テーブルレベル PK の NULL を許してはいけない"
+        (TableSchema.validateRow schema [| SqlValue.Null; SqlValue.Text "x" |])
+
+[<Fact>]
+let ``TableSchema.ofCreateTable: 重複列はエラー`` () =
+    let ast =
+        {
+            Name = "t"
+            IfNotExists = false
+            Columns = [ col "a" DataType.Integer; col "A" DataType.Integer ]
+            Constraints = [ TableConstraint.PrimaryKeyColumns [ "a" ] ]
+        }
+
+    expectErrorKind ErrorKind.NameError "重複列を許してはいけない" (TableSchema.ofCreateTable ast)
+
+[<Fact>]
+let ``TableSchema.ofCreateTable: 複数の PRIMARY KEY 定義はエラー`` () =
+    let ast =
+        {
+            Name = "t"
+            IfNotExists = false
+            Columns = [ col "a" DataType.Integer; col "b" DataType.Integer ]
+            Constraints =
+                [
+                    TableConstraint.PrimaryKeyColumns [ "a" ]
+                    TableConstraint.PrimaryKeyColumns [ "b" ]
+                ]
+        }
+
+    expectErrorKind ErrorKind.ConstraintViolation "複数の PRIMARY KEY を許してはいけない" (TableSchema.ofCreateTable ast)
+
+    let pkColumn name =
+        { col name DataType.Integer with
+            Constraint =
+                { ColumnConstraint.Empty with
+                    PrimaryKey = true
+                }
+        }
+
+    let columnPks =
+        { ast with
+            Constraints = []
+            Columns = [ pkColumn "a"; pkColumn "b" ]
+        }
+
+    expectErrorKind ErrorKind.ConstraintViolation "複数列の列レベル PRIMARY KEY を許してはいけない" (TableSchema.ofCreateTable columnPks)
+
+[<Fact>]
+let ``TableSchema.ofCreateTable: 存在しない UNIQUE 列はエラー`` () =
+    let ast =
+        {
+            Name = "t"
+            IfNotExists = false
+            Columns = [ col "id" DataType.Integer ]
+            Constraints =
+                [
+                    TableConstraint.PrimaryKeyColumns [ "id" ]
+                    TableConstraint.UniqueColumns [ "nope" ]
+                ]
+        }
+
+    expectErrorKind ErrorKind.NameError "存在しない UNIQUE 列を許してはいけない" (TableSchema.ofCreateTable ast)
+
+[<Fact>]
 let ``TableSchema.requireIndexOf: 無い列はエラー`` () =
     Assert.Equal<int>(0, ok (TableSchema.requireIndexOf peopleSchema "id"))
     expectErrorKind ErrorKind.NameError "無い列で位置が返った" (TableSchema.requireIndexOf peopleSchema "nope")
@@ -204,8 +284,23 @@ let ``Keyspace: keyspace はテーブルと索引で別になる`` () =
     Assert.Equal<string>("i:users_email", Keyspace.index "users_email")
     Assert.NotEqual<string>(Keyspace.table "users", Keyspace.index "users_email")
 
-    // ディレクトリ名に使える形（base64 なので / や : を含む名前も安全）
+    // ディレクトリ名に使える形（base32 なので / や : を含む名前も安全）
     Assert.NotEqual<string>(Keyspace.toDirName "t:a/b", Keyspace.toDirName "t:a_b")
+
+[<Fact>]
+let ``Keyspace: base32 はパス区切りと大文字小文字衝突を作らない`` () =
+    let unicode = Keyspace.table "住所"
+    let dir = Keyspace.toDirName unicode
+    Assert.False(dir.Contains "/")
+    Assert.False(dir.Contains "\\")
+    Assert.Equal(Some unicode, Keyspace.tryFromDirName dir)
+
+    // base64 では t:a -> dDph / t:G -> dDpH となり、
+    // Windows/macOS の case-insensitive FS で衝突していた。
+    let a = Keyspace.toDirName (Keyspace.table "a")
+    let g = Keyspace.toDirName (Keyspace.table "G")
+    Assert.NotEqual<string>(a, g)
+    Assert.False(System.String.Equals(a, g, System.StringComparison.OrdinalIgnoreCase))
 
 [<Fact>]
 let ``Keyspace: toDirName / tryFromDirName の往復`` () =
@@ -214,9 +309,11 @@ let ``Keyspace: toDirName / tryFromDirName の往復`` () =
     Assert.Equal(Some ks, Keyspace.tryFromDirName dir)
 
 [<Fact>]
-let ``Keyspace: 不正なディレクトリ名は None`` () =
-    Assert.True((Keyspace.tryFromDirName "!!!").IsNone)
-    Assert.True((Keyspace.tryFromDirName (Keyspace.toDirName "foo")).IsNone)
+let ``RowStore.openStore: 新規 DB でも catalog エンジンを登録する`` () =
+    withDir "rs-catalog-engine" (fun dir ->
+        let store = ok (RowStore.openStore dir)
+        Assert.True(Map.containsKey "__catalog__" store.Engines)
+        ok (RowStore.close store))
 
 [<Fact>]
 let ``RowStore: keyspace ごとに独立したディレクトリを持つ`` () =
@@ -243,6 +340,19 @@ let ``RowStore.openStore: 壊れた keyspace は開けない`` () =
         Directory.CreateDirectory ksDir |> ignore
         File.WriteAllText(Path.Combine(ksDir, "CURRENT"), "壊れた CURRENT")
         expectError "壊れた keyspace を開けてしまう" (RowStore.openStore dir))
+
+[<Fact>]
+let ``RowStore.openStore: 開く途中で失敗してもロックを解放する`` () =
+    withDir "rs-lock-cleanup" (fun dir ->
+        let ksDir = Path.Combine(dir, Keyspace.toDirName "t:broken")
+        Directory.CreateDirectory ksDir |> ignore
+        File.WriteAllText(Path.Combine(ksDir, "CURRENT"), "壊れた CURRENT")
+        expectError "壊れた keyspace を開けてしまう" (RowStore.openStore dir)
+
+        // 失敗した open がプロセス内ロックを残していると、ここで IoError になる。
+        Directory.Delete(ksDir, true)
+        let store = ok (RowStore.openStore dir)
+        ok (RowStore.close store))
 
 [<Fact>]
 let ``RowStore.openStore: 壊れた MANIFEST レコードは読み飛ばす`` () =

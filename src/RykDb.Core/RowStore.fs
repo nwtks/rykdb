@@ -4,7 +4,7 @@
 //   主キー: keyspace "t:<table>"、キーは KeyBuilder.ofValues 主キー列
 //   索引  : keyspace "i:<index>"、キーは KeyBuilder.ofIndexAndPrimary
 //           （末尾に主キーを持たせるので索引値 → 行が一意に決まる）
-//   ディレクトリ: <root>/<base64(keyspace)>/
+//   ディレクトリ: <root>/<base32(keyspace)>/
 //
 // 行は列順の SqlValue 配列。保存時 ValueCodec でバイト列に落とす。
 // ===========================================================================
@@ -34,26 +34,115 @@ type internal TableSchema =
     }
 
 module internal TableSchema =
+    /// 列名の重複を検証する（SQL の識別子は大文字小文字を区別しない）。
+    let private validateColumnNames (columns: ColumnDefinition list) =
+        match columns |> List.map _.Name |> SqlName.duplicate with
+        | Some name -> err (DbError.name (sprintf "列 %s が重複しています" name))
+        | None -> ret ()
+
+    /// PRIMARY KEY の定義を1つだけ取り出す。
+    /// 列レベルとテーブルレベルの両方、複数のテーブル制約はエラーにする。
+    let private primaryKeyNames (c: CreateTable) =
+        let tableConstraints =
+            c.Constraints
+            |> List.choose (fun tc ->
+                match tc with
+                | TableConstraint.PrimaryKeyColumns cols -> Some cols
+                | _ -> None)
+
+        let columnNames =
+            c.Columns |> List.filter _.Constraint.PrimaryKey |> List.map _.Name
+
+        match tableConstraints, columnNames with
+        | [], [] -> err (sprintf "テーブル %s に主キーがありません" c.Name |> DbError.constraintViolation)
+        | [ cols ], [] when cols.IsEmpty -> err (sprintf "テーブル %s の主キー列が空です" c.Name |> DbError.constraintViolation)
+        | [ cols ], [] -> ret cols
+        | [], [ name ] -> ret [ name ]
+        | [], _ ->
+            err (
+                sprintf "テーブル %s の PRIMARY KEY が複数の列に指定されています" c.Name
+                |> DbError.constraintViolation
+            )
+        | _ :: _ :: _, _ ->
+            err (
+                sprintf "テーブル %s の PRIMARY KEY のテーブル制約が複数あります" c.Name
+                |> DbError.constraintViolation
+            )
+        | [ _ ], _ :: _ ->
+            err (
+                sprintf "テーブル %s の PRIMARY KEY が列とテーブルの両方に指定されています" c.Name
+                |> DbError.constraintViolation
+            )
+
+    /// PRIMARY KEY の列が実在し、重複していないことを検証する。
+    let private validatePrimaryKeyColumns (columns: ColumnDefinition list) (names: string list) =
+        match SqlName.duplicate names with
+        | Some name -> err (DbError.name (sprintf "PRIMARY KEY の列 %s が重複しています" name))
+        | None ->
+            names
+            |> List.map (fun name ->
+                match columns |> List.tryFindIndex (fun col -> SqlName.equal col.Name name) with
+                | Some _ -> ret ()
+                | None -> err (DbError.name (sprintf "主キー列 %s が定義されていません" name)))
+            |> all
+            |> Result.map ignore
+
+    /// テーブルレベルの UNIQUE 制約の列が実在し、重複していないことを検証する。
+    let private validateUniqueColumns (columns: ColumnDefinition list) (names: string list) =
+        if List.isEmpty names then
+            err (DbError.constraintViolation "UNIQUE 制約の列が空です")
+        else
+            match SqlName.duplicate names with
+            | Some name -> err (DbError.name (sprintf "UNIQUE 制約の列 %s が重複しています" name))
+            | None ->
+                names
+                |> List.map (fun name ->
+                    match columns |> List.tryFindIndex (fun col -> SqlName.equal col.Name name) with
+                    | Some _ -> ret ()
+                    | None -> err (DbError.name (sprintf "UNIQUE 制約の列 %s が定義されていません" name)))
+                |> all
+                |> Result.map ignore
+
+    /// 主キー列に NOT NULL と PRIMARY KEY を立てる。
+    /// テーブルレベルの PRIMARY KEY でも列定義を自己完結させる。
+    let private markPrimaryKeyColumns (pkNames: string list) (columns: ColumnDefinition list) =
+        columns
+        |> List.map (fun col ->
+            if pkNames |> List.exists (fun name -> SqlName.equal name col.Name) then
+                { col with
+                    Constraint =
+                        { col.Constraint with
+                            NotNull = true
+                            PrimaryKey = true
+                        }
+                }
+            else
+                col)
+
     /// CreateTable の AST からスキーマを作る。
     let ofCreateTable (c: CreateTable) =
-        if c.Columns.IsEmpty then
-            err (sprintf "テーブル %s に列がありません" c.Name |> DbError.constraintViolation)
-        else
-            let fromConstraint =
+        result {
+            do!
+                if c.Columns.IsEmpty then
+                    err (sprintf "テーブル %s に列がありません" c.Name |> DbError.constraintViolation)
+                else
+                    ret ()
+
+            do! validateColumnNames c.Columns
+            let! pkNames = primaryKeyNames c
+            do! validatePrimaryKeyColumns c.Columns pkNames
+
+            let! () =
                 c.Constraints
-                |> List.tryPick (fun tc ->
+                |> List.choose (fun tc ->
                     match tc with
-                    | TableConstraint.PrimaryKeyColumns cols -> Some cols
+                    | TableConstraint.UniqueColumns cols -> Some cols
                     | _ -> None)
+                |> List.map (validateUniqueColumns c.Columns)
+                |> all
+                |> Result.map ignore
 
-            let pkNames =
-                match fromConstraint with
-                | Some cols -> cols
-                | None -> c.Columns |> List.filter _.Constraint.PrimaryKey |> List.map _.Name
-
-            if List.isEmpty pkNames then
-                err (sprintf "テーブル %s に主キーがありません" c.Name |> DbError.constraintViolation)
-            else
+            let! pk =
                 pkNames
                 |> List.map (fun name ->
                     match c.Columns |> List.tryFindIndex (fun col -> SqlName.equal col.Name name) with
@@ -61,13 +150,15 @@ module internal TableSchema =
                     | None -> err (sprintf "主キー列 %s が定義されていません" name |> DbError.name))
                 |> all
                 |> Result.map List.sort
-                |> Result.map (fun pk ->
-                    {
-                        Name = c.Name
-                        Columns = c.Columns
-                        PrimaryKey = pk
-                        Indexes = []
-                    })
+
+            return
+                {
+                    Name = c.Name
+                    Columns = markPrimaryKeyColumns pkNames c.Columns
+                    PrimaryKey = pk
+                    Indexes = []
+                }
+        }
 
     /// NOT NULL 制約と型を検証する。
     let validateRow (schema: TableSchema) (row: SqlValue array) =
@@ -81,7 +172,9 @@ module internal TableSchema =
             |> List.mapi (fun i col -> i, col)
             |> foldOk
                 (fun () (i, col) ->
-                    if row.[i] = SqlValue.Null && col.Constraint.NotNull then
+                    let isPrimaryKey = schema.PrimaryKey |> List.contains i
+
+                    if row.[i] = SqlValue.Null && (col.Constraint.NotNull || isPrimaryKey) then
                         err (
                             sprintf "NOT NULL 制約に違反: %s.%s" schema.Name col.Name
                             |> DbError.constraintViolation
@@ -137,6 +230,76 @@ module internal RowKey =
 
 /// 書き込みの単位。(keyspace, key) -> 値（None は削除）。
 module internal Keyspace =
+    [<Literal>]
+    let MaxNameBytes = 128
+
+    let private base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+    /// UTF-8 バイト列を base32（RFC 4648、パディングなし）にする。
+    let private encodeBase32 (bytes: byte array) =
+        let rec loop (i: int) (buffer: int) (bits: int) (acc: char list) =
+            if bits >= 5 then
+                let shift = bits - 5
+                let value = buffer >>> shift &&& 0x1F
+                loop i (buffer &&& (1 <<< shift) - 1) shift (base32Alphabet.[value] :: acc)
+            elif i < bytes.Length then
+                loop (i + 1) (buffer <<< 8 ||| int bytes.[i]) (bits + 8) acc
+            elif bits > 0 then
+                let value = buffer <<< (5 - bits) &&& 0x1F
+                base32Alphabet.[value] :: acc
+            else
+                acc
+
+        loop 0 0 0 [] |> List.rev |> List.toArray |> System.String
+
+    /// base32 をデコードする。不正な文字・長さ・パディングなら None。
+    let private decodeBase32 (text: string) =
+        let valueOf (c: char) =
+            if c >= 'A' && c <= 'Z' then Some(int c - int 'A')
+            elif c >= 'a' && c <= 'z' then Some(int c - int 'a')
+            elif c >= '2' && c <= '7' then Some(26 + int c - int '2')
+            else None
+
+        let rec loop (i: int) (buffer: int) (bits: int) (acc: byte list) =
+            if i >= text.Length then
+                if bits >= 5 || buffer <> 0 then
+                    None
+                else
+                    Some(List.rev acc |> List.toArray)
+            else
+                match valueOf text.[i] with
+                | None -> None
+                | Some value ->
+                    let buffer = (buffer <<< 5) ||| value
+                    let bits = bits + 5
+
+                    if bits >= 8 then
+                        let shift = bits - 8
+                        let b = (buffer >>> shift) &&& 0xFF
+                        loop (i + 1) (buffer &&& ((1 <<< shift) - 1)) shift (byte b :: acc)
+                    else
+                        loop (i + 1) buffer bits acc
+
+        loop 0 0 0 []
+
+    let private utf8 = System.Text.UTF8Encoding(false, true)
+
+    let private keyspaceOfBytes (bytes: byte array) =
+        try
+            let keyspace = utf8.GetString bytes
+
+            match keyspace with
+            | ks when System.String.IsNullOrEmpty ks -> None
+            | "__catalog__" -> Some keyspace
+            | ks when
+                not (ks.StartsWith("t:", System.StringComparison.Ordinal))
+                && not (ks.StartsWith("i:", System.StringComparison.Ordinal))
+                ->
+                None
+            | ks -> Some ks
+        with _ ->
+            None
+
     /// テーブルの主キー用 keyspace 名。
     let table (name: string) = "t:" + name
 
@@ -144,24 +307,23 @@ module internal Keyspace =
     let index (name: string) = "i:" + name
 
     /// keyspace 名をディレクトリ名に使える形にする。
+    /// base32 は英大文字と数字だけで、`/` や大文字小文字だけの衝突を作らない。
     let toDirName (keyspace: string) =
-        keyspace |> System.Text.Encoding.UTF8.GetBytes |> System.Convert.ToBase64String
+        keyspace |> System.Text.Encoding.UTF8.GetBytes |> encodeBase32
 
     /// ディレクトリ名を keyspace 名に戻す（keyspace 名でなければ `None`）。
     let tryFromDirName (dirName: string) =
-        try
-            let dir =
-                System.Convert.FromBase64String dirName |> System.Text.Encoding.UTF8.GetString
+        dirName |> decodeBase32 |> Option.bind keyspaceOfBytes
 
-            match dir with
-            | ks when
-                System.String.IsNullOrEmpty ks
-                || not (ks.StartsWith "t:") && not (ks.StartsWith "i:")
-                ->
-                None
-            | ks -> Some ks
-        with _ ->
-            None
+    /// テーブル名・索引名の長さを検証する。
+    /// ディレクトリ名（base32）が主要 OS の 255 バイト制限に収まる範囲に制限する。
+    let validateName (kind: string) (name: string) =
+        let bytes = System.Text.Encoding.UTF8.GetByteCount name
+
+        if bytes > MaxNameBytes then
+            err (DbError.name (sprintf "%s名 %s は長すぎます（UTF-8 で %d バイト以下にしてください）" kind name MaxNameBytes))
+        else
+            ret ()
 
 /// keyspace を跨ぐ commit の意思決定ログ（追記型ジャーナル）。
 /// <remarks>
@@ -677,6 +839,26 @@ module internal RowStore =
     let applyBatches (activeSnapshot: uint64) (store: RowStore) (batches: (string * Entry array) list) =
         applyBatchesCore false activeSnapshot store batches
 
+    /// LSM のストアらしいディレクトリか。
+    /// 作成途中の残骸や無関係なディレクトリを keyspace と誤認しないための判定。
+    let private isStoreDir (dir: string) =
+        match
+            protect (fun () ->
+                System.IO.File.Exists(System.IO.Path.Combine(dir, "CURRENT"))
+                || System.IO.Directory.GetFiles(dir, "MANIFEST-*").Length > 0
+                || System.IO.Directory.GetFiles(dir, "*.wal").Length > 0)
+        with
+        | Ok true -> true
+        | _ -> false
+
+    /// ルート直下の keyspace ディレクトリを探す。
+    let private discoverKeyspaces (root: string) =
+        System.IO.Directory.GetDirectories root
+        |> Array.filter isStoreDir
+        |> Array.choose (fun dir -> System.IO.Path.GetFileName dir |> Keyspace.tryFromDirName)
+        |> Array.toList
+        |> List.distinct
+
     /// DB を開く（keyspace は必要に応じて作られる）。
     /// <remarks>
     /// 既存の keyspace ディレクトリはすべて開いておく。
@@ -696,12 +878,15 @@ module internal RowStore =
 
         let openEngine = openDiskEngine root
 
+        let closeEngines (engines: Map<string, IStorageEngine>) =
+            engines |> Map.toList |> List.iter (fun (_, engine) -> engine.Close() |> ignore)
+
         let rec openEngines (rest: string list) (acc: Map<string, IStorageEngine>) =
             match rest with
-            | [] -> ret acc
+            | [] -> Ok acc
             | ks :: tail ->
                 match openEngine ks with
-                | Error err -> Error err
+                | Error err -> Error(err, acc)
                 | Ok e -> openEngines tail (Map.add ks e acc)
 
         let replayPending (store: RowStore) =
@@ -729,12 +914,26 @@ module internal RowStore =
             let! token = ProcessLock.acquire root takeOver
 
             let! known =
-                protect (fun () ->
-                    System.IO.Directory.GetDirectories root
-                    |> Array.choose (fun dir -> System.IO.Path.GetFileName dir |> Keyspace.tryFromDirName)
-                    |> Array.toList)
+                match protect (fun () -> discoverKeyspaces root) with
+                | Ok keyspaces -> ret keyspaces
+                | Error e ->
+                    ProcessLock.release root token
+                    Error e
 
-            let! engines = openEngines known Map.empty
+            let! engines =
+                match openEngines known Map.empty with
+                | Ok opened when Map.containsKey "__catalog__" opened -> ret opened
+                | Ok opened ->
+                    match openEngine "__catalog__" with
+                    | Ok catalogEngine -> ret (Map.add "__catalog__" catalogEngine opened)
+                    | Error e ->
+                        closeEngines opened
+                        ProcessLock.release root token
+                        Error e
+                | Error(e, opened) ->
+                    closeEngines opened
+                    ProcessLock.release root token
+                    Error e
 
             let store =
                 {
@@ -747,6 +946,7 @@ module internal RowStore =
             match replayPending store with
             | Ok ready -> return ready
             | Error e ->
+                closeEngines store.Engines
                 ProcessLock.release root token
                 return! Error e
         }

@@ -129,24 +129,27 @@ module internal Wal =
 
         decodeAt (Cursor.create data) []
 
+    /// 1レコードを「未コミットの Batch」と「コミット済み Entry」の状態へ反映する。
+    let private applyCommitted (record: WalRecord) (pending: (uint64 * Entry array) list, acc: Entry list) =
+        match record with
+        | WalRecord.Begin _ -> pending, acc
+        | WalRecord.Batch(txnId, entries) -> (txnId, entries) :: pending, acc
+        | WalRecord.Abort txnId -> pending |> List.filter (fun (t, _) -> t <> txnId), acc
+        | WalRecord.Commit txnId ->
+            let mine =
+                pending
+                |> List.filter (fun (t, _) -> t = txnId)
+                |> List.collect (fun (_, e) -> Array.toList e)
+                |> List.rev
+
+            pending |> List.filter (fun (t, _) -> t <> txnId), mine @ acc
+
     let committedEntries (records: WalRecord list) =
-        let rec selectCommitted (recs: WalRecord list) (pending: (uint64 * Entry array) list) (acc: Entry list) =
-            match recs with
-            | [] -> List.rev acc |> Array.ofList
-            | WalRecord.Batch(txnId, entries) :: rest -> selectCommitted rest ((txnId, entries) :: pending) acc
-            | WalRecord.Abort txnId :: rest ->
-                selectCommitted rest (pending |> List.filter (fun (t, _) -> t <> txnId)) acc
-            | WalRecord.Commit txnId :: rest ->
-                let mine =
-                    pending
-                    |> List.filter (fun (t, _) -> t = txnId)
-                    |> List.collect (fun (_, e) -> Array.toList e)
-                    |> List.rev
-
-                selectCommitted rest (pending |> List.filter (fun (t, _) -> t <> txnId)) (mine @ acc)
-            | WalRecord.Begin _ :: rest -> selectCommitted rest pending acc
-
-        selectCommitted records [] []
+        records
+        |> List.fold (fun state record -> applyCommitted record state) ([], [])
+        |> snd
+        |> List.rev
+        |> Array.ofList
 
     let private fileName (fileNumber: int64) = sprintf "%06d.wal" fileNumber
 
@@ -176,16 +179,70 @@ module internal Wal =
                 Size = state.Size + bytes.Length
             })
 
-    /// WAL ファイルを読み、コミット済みエントリを返す。
+    /// バッファへ要求サイズまで読む。末尾に達したら読めたバイト数を返す。
+    let private readAtMost (fs: System.IO.FileStream) (buffer: byte array) =
+        let rec loop offset =
+            if offset >= buffer.Length then
+                offset
+            else
+                let read = fs.Read(buffer, offset, buffer.Length - offset)
+
+                if read <= 0 then offset else loop (offset + read)
+
+        loop 0
+
+    /// ストリームから 1フレーム読む。書きかけの末尾は `None`（そこで打ち切り）。
+    let private readFrameFrom (fs: System.IO.FileStream) =
+        let header = Array.zeroCreate<byte> 8
+        let headerBytes = readAtMost fs header
+
+        if headerBytes < header.Length then
+            ret None
+        else
+            let length = uint64 (Bytes.readLE32 header 0)
+            let checksum = Bytes.readLE32 header 4
+            let remaining = fs.Length - fs.Position
+
+            if length > uint64 remaining then
+                ret None
+            elif length > uint64 System.Int32.MaxValue then
+                err (DbError.corruption "Wal: フレーム長が不正です")
+            else
+                let payload = Array.zeroCreate<byte>(int length)
+                let payloadBytes = readAtMost fs payload
+
+                if payloadBytes < payload.Length then
+                    ret None
+                elif Hashing.checksum payload <> checksum then
+                    err (DbError.corruption "Wal: チェックサム不一致")
+                else
+                    decodePayload payload |> Result.map Some
+
+    /// WAL ファイルをストリーミングで読み、コミット済みエントリを返す。
+    /// 1フレームずつ読むので、WAL 全体をメモリへ載せない。
     let read (dir: string) (fileNumber: int64) =
         let p = path dir fileNumber
 
         protect (fun () -> System.IO.File.Exists p)
         >>= fun exists ->
             if exists then
-                protect (fun () -> System.IO.File.ReadAllBytes p)
-                >>= decodeFrames
-                |> Result.map committedEntries
+                protect (fun () ->
+                    use fs =
+                        new System.IO.FileStream(
+                            p,
+                            System.IO.FileMode.Open,
+                            System.IO.FileAccess.Read,
+                            System.IO.FileShare.Read
+                        )
+
+                    let rec loop (pending, acc) =
+                        match readFrameFrom fs with
+                        | Error e -> Error e
+                        | Ok None -> Ok(List.rev acc |> Array.ofList)
+                        | Ok(Some record) -> loop (applyCommitted record (pending, acc))
+
+                    loop ([], []))
+                |> Result.bind id
             else
                 ret [||]
 

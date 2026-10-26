@@ -33,8 +33,9 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 `protect` は `IOException` / `UnauthorizedAccessException` を `IoError`、
 `InvalidDataException` / `FormatException` / `OverflowException` を `CorruptionError` に写す。
 ファイル内容の問題を `InternalError`（バグの兆候）にしないため。
-`try` / `with` は `protect` のほかに `Manifest.readRecord` と `RowStore.tryFromDirName` の 2箇所だけで、
-どちらも `DbError` へ写して例外は外へは出ない。
+`try` / `with` は `protect` のほかに `Manifest.readRecord` と`Keyspace.keyspaceOfBytes` だけで、
+どちらも `DbError` へ写すか `None` に閉じ込め、例外は外へは出さない。
+`try` / `finally` は `CommitIntent` と `ProcessLock` のセマフォ解放にだけ使う。
 
 失敗は `ErrorKind`（`DbError.Kind`）で分類する。
 

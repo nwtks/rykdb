@@ -322,8 +322,11 @@ type Database internal (root: string, state: DbState) =
 
     /// 与えた RowStore で DB を開く。
     static member internal openWithStore (root: string) (store: RowStore) =
-        result {
-            let! catalog = Catalog.load store
+        match Catalog.load store with
+        | Error e ->
+            RowStore.close store |> ignore
+            Error e
+        | Ok catalog ->
             let lastSeq = RowStore.lastSeqNo store
 
             let manager =
@@ -334,7 +337,7 @@ type Database internal (root: string, state: DbState) =
                     NextSeqNo = lastSeq + 1UL
                 }
 
-            return
+            Ok(
                 new Database(
                     root,
                     {
@@ -347,7 +350,7 @@ type Database internal (root: string, state: DbState) =
                         ActiveRegistration = None
                     }
                 )
-        }
+            )
 
     /// エンジンの開き方を差し替えて DB を開く（テスト用）。
     static member internal openWithEngine (root: string) (openEngine: string -> Result<IStorageEngine, DbError>) =

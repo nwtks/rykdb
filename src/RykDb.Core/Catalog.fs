@@ -131,6 +131,14 @@ module internal Catalog =
             Unique = i.Unique
         }
 
+    /// UNIQUE 制約が自動作成する索引の名前。
+    let implicitIndexName (table: string) (ordinal: int) = sprintf "__unique_%s_%d" table ordinal
+
+    /// ユーザーが作成・削除できない予約索引名か。
+    /// 暗黙の UNIQUE 索引を DROP して制約を消せないようにする。
+    let isReservedIndexName (name: string) =
+        name.StartsWith("__unique_", System.StringComparison.OrdinalIgnoreCase)
+
     /// カタログにある索引を実行用の IndexSchema へ落とす。
     let indexSchemasOf (catalog: Catalog) (table: string) =
         indexesOf catalog table |> List.map toIndexSchema

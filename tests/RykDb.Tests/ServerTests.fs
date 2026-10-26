@@ -110,6 +110,26 @@ let ``TCP: loopback で SQL が通る`` () =
         ))
 
 [<Fact>]
+let ``TCP: 0行の SELECT でも列名を返す`` () =
+    withServer (fun client ->
+        okRows (client.Query "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        |> ignore
+
+        let cols, rows = okRows (client.Query "SELECT id, name FROM t WHERE id = 999")
+        Assert.Equal<string list>([ "id"; "name" ], cols)
+        Assert.Empty rows)
+
+[<Fact>]
+let ``TCP: カンマを含む列名も正しく返す`` () =
+    withServer (fun client ->
+        okRows (client.Query "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        okRows (client.Query "INSERT INTO t VALUES (1)") |> ignore
+
+        let cols, rows = okRows (client.Query "SELECT id AS \"a,b\" FROM t")
+        Assert.Equal<string list>([ "a,b" ], cols)
+        Assert.Equal<string list>([ "1" ], rows))
+
+[<Fact>]
 let ``TCP: ライブラリ API と同じ結果が返る`` () =
     // 同じスクリプトを 2 経路で流して結果を突き合わせる。
     let script =

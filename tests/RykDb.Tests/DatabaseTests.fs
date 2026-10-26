@@ -489,6 +489,28 @@ let ``Database: UNIQUE 索引の backfill は重複値を拒否する`` () =
         Assert.Equal<int>(2, found.Rows.Length))
 
 [<Fact>]
+let ``Database: CREATE INDEX は残った索引エントリを消してから backfill する`` () =
+    withDir "create-index-stale" (fun dir ->
+        // 前回の失敗などで索引 keyspace にだけ残った行を用意する。
+        let staleKey =
+            KeyBuilder.ofIndexAndPrimary [| SqlValue.Int 999L |] [| SqlValue.Int 999L |]
+
+        let staleRow = [| SqlValue.Int 999L; SqlValue.Int 999L |]
+        let store = ok (RowStore.openStore dir)
+
+        let store =
+            ok (RowStore.writeBatches store [ (Keyspace.index "ix_a", [| Entry.put staleKey 1UL staleRow |]) ])
+
+        ok (RowStore.close store)
+
+        let db0 = ok (Database.openWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let db2 = exec db1 "CREATE INDEX ix_a ON t (a)"
+        let _, rows = ok (db2.Query "SELECT id FROM t WHERE a = 999")
+        Assert.Empty rows.Rows
+        ok (db2.Close()))
+
+[<Fact>]
 let ``Database: DROP INDEX で索引が消える`` () =
     withDb "ddl9" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
@@ -513,6 +535,124 @@ let ``Database: DROP INDEX IF EXISTS と存在しない索引のエラー`` () =
     withDb "ddl10" (fun db0 ->
         let db1 = exec db0 "DROP INDEX IF EXISTS nothing"
         expectError "存在しない DROP INDEX が OK になっています" (db1.Execute "DROP INDEX nothing"))
+
+[<Fact>]
+let ``Database: 暗黙の UNIQUE 索引は DROP できない`` () =
+    withDb "ddl-implicit-unique" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a@example.com')"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "暗黙の UNIQUE 索引を DROP できてしまう"
+            (db2.Execute "DROP INDEX __unique_t_0")
+
+        // DROP に失敗しても制約は残る
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "暗黙 UNIQUE 索引の DROP 後に制約が消えている"
+            (db2.Execute "INSERT INTO t VALUES (2, 'a@example.com')")
+
+        // 予約名の索引はユーザーが作れない
+        expectErrorKind ErrorKind.NameError "予約された索引名を許してはいけない" (db2.Execute "CREATE INDEX __unique_t_9 ON t (email)"))
+
+[<Fact>]
+let ``Database: UNIQUE 制約は複数の NULL を許す`` () =
+    withDb "unique-null" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
+        let db2 = exec db1 "INSERT INTO u VALUES (1, NULL), (2, NULL)"
+        let _, count = ok (db2.Query "SELECT COUNT(*) FROM u")
+        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0])
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "UNIQUE の非 NULL 重複を許してはいけない"
+            (db2.Execute "INSERT INTO u VALUES (3, 'x'), (4, 'x')"))
+
+[<Fact>]
+let ``Database: 複合 UNIQUE は NULL を含む行を重複扱いしない`` () =
+    withDb "unique-null-composite" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE (a, b))"
+
+        let db2 = exec db1 "INSERT INTO u VALUES (1, NULL, 1), (2, NULL, 2)"
+        let _, count = ok (db2.Query "SELECT COUNT(*) FROM u")
+        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0])
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "複合 UNIQUE の非 NULL 重複を許してはいけない"
+            (db2.Execute "INSERT INTO u VALUES (3, 7, 1), (4, 7, 1)"))
+
+[<Fact>]
+let ``Database: UNIQUE 列の UPDATE でも NULL は重複扱いしない`` () =
+    withDb "unique-null-update" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "UNIQUE 列の UPDATE で非 NULL 重複を許してはいけない"
+            (db2.Execute "UPDATE t SET email = 'x'")
+
+        let db3 = exec db2 "UPDATE t SET email = NULL"
+        let _, count = ok (db3.Query "SELECT COUNT(*) FROM t WHERE email IS NULL")
+        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0]))
+
+[<Fact>]
+let ``Database: UNIQUE 索引の backfill は複数の NULL を許す`` () =
+    withDb "unique-null-backfill" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, NULL), (2, NULL)"
+        let db3 = exec db2 "CREATE UNIQUE INDEX ix_a ON t (a)"
+        let _, count = ok (db3.Query "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0]))
+
+[<Fact>]
+let ``Database: table-level PRIMARY KEY は NULL を拒否する`` () =
+    withDb "table-pk-not-null" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER, v TEXT, PRIMARY KEY (id))"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "table-level PRIMARY KEY の NULL を許してはいけない"
+            (db1.Execute "INSERT INTO t VALUES (NULL, 'x')"))
+
+[<Fact>]
+let ``Database: 重複列・重複 INSERT 列・重複 UPDATE 代入を拒否する`` () =
+    withDb "duplicate-names" (fun db0 ->
+        expectErrorKind
+            ErrorKind.NameError
+            "CREATE TABLE の重複列を許してはいけない"
+            (db0.Execute "CREATE TABLE dup (id INTEGER PRIMARY KEY, a INTEGER, A TEXT)")
+
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+
+        expectErrorKind
+            ErrorKind.NameError
+            "INSERT の重複列を許してはいけない"
+            (db1.Execute "INSERT INTO t (id, a, a) VALUES (1, 2, 3)")
+
+        expectErrorKind ErrorKind.NameError "UPDATE の重複代入を許してはいけない" (db1.Execute "UPDATE t SET a = 1, a = 2")
+
+        expectErrorKind
+            ErrorKind.NameError
+            "CREATE INDEX の重複列を許してはいけない"
+            (db1.Execute "CREATE INDEX ix_dup ON t (a, a)"))
+
+[<Fact>]
+let ``Database: 長すぎるテーブル名・索引名は拒否する`` () =
+    withDb "long-name" (fun db0 ->
+        let name = System.String('a', Keyspace.MaxNameBytes + 1)
+
+        expectErrorKind
+            ErrorKind.NameError
+            "長すぎるテーブル名を許してはいけない"
+            (db0.Execute(sprintf "CREATE TABLE %s (id INTEGER PRIMARY KEY)" name))
+
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+
+        expectErrorKind ErrorKind.NameError "長すぎる索引名を許してはいけない" (db1.Execute(sprintf "CREATE INDEX %s ON t (id)" name)))
 
 [<Fact>]
 let ``Database: DEFAULT 付きの列定義も保存できる`` () =
@@ -1440,6 +1580,52 @@ let ``Database: 閉じて開き直すとデータが残る`` () =
         ok (db3.Close()))
 
 [<Fact>]
+let ``Database: カタログ破損で開くのに失敗してもロックを解放する`` () =
+    withDir "catalog-corrupt-lock" (fun dir ->
+        let db0 = ok (Database.openWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        ok (db1.Close())
+
+        let store = ok (RowStore.openStore dir)
+
+        let store =
+            ok (
+                RowStore.writeBatches
+                    store
+                    [
+                        ("__catalog__",
+                         [|
+                             Entry.put
+                                 (System.Text.Encoding.UTF8.GetBytes "table:broken")
+                                 1000UL
+                                 [| SqlValue.Blob [||] |]
+                         |])
+                    ]
+            )
+
+        ok (RowStore.close store)
+
+        expectError "壊れたカタログを読めてしまう" (Database.openWith dir)
+
+        // 失敗した open がロックを残していると、ここで IoError になる。
+        let store = ok (RowStore.openStore dir)
+        ok (RowStore.close store))
+
+[<Fact>]
+let ``Database: Unicode テーブル名でも再オープン後に読める`` () =
+    withDir "unicode-reopen" (fun dir ->
+        let db0 = ok (Database.openWith dir)
+        let db1 = exec db0 "CREATE TABLE 住所 (id INTEGER PRIMARY KEY, v TEXT)"
+        let db2 = exec db1 "INSERT INTO 住所 VALUES (1, '東京')"
+        ok (db2.Close())
+
+        let db3 = ok (Database.openWith dir)
+        let result = query db3 "SELECT * FROM 住所"
+        Assert.Equal<int>(1, result.Rows.Length)
+        Assert.Equal<string>("東京", asText result.Rows.[0].[1])
+        ok (db3.Close()))
+
+[<Fact>]
 let ``Database: 古いハンドルを Close しても新しいハンドルの commit は失われない`` () =
     withDir "stale-close" (fun dir ->
         let db0 = ok (Database.openWith dir)
@@ -1466,7 +1652,7 @@ let ``E2E: プロセス再起動を模して Disk から復元できる`` () =
 
         // 別ハンドルを「別プロセス」として扱う。
         let reopened = ok (Database.openWith dir)
-        // `TableNames` の並び順は保証されない（keyspace の base64 順）のでソートする。
+        // `TableNames` の並び順は保証されない（keyspace のディレクトリ順）のでソートする。
         Assert.Equal<string list>([ "orders"; "people" ], reopened.TableNames() |> List.sort)
 
         let people = query reopened "SELECT COUNT(*) FROM people"

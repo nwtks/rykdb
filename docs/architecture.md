@@ -605,15 +605,16 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 | `__catalog__` | スキーマ定義             | `table:<名前>` / `index:<名前>`                |
 
 ```
-<root>/<base64(keyspace)>/
+<root>/<base32(keyspace)>/
   MANIFEST-000001     世代ごとの VersionSet 定義
   CURRENT             有効な MANIFEST 番号
   000123.sst          データファイル
   000002.wal          先行ログ
 ```
 
-`base64` にするのは keyspace 名（`t:people`）がそのままではディレクトリ名に使えないためで、
-`t:` / `i:` 以外の接頭辞は keyspace とみなさず無視する。
+`base32`（RFC 4648、パディングなし）にするのは keyspace 名（`t:people`）がそのままでは
+ディレクトリ名に使えないためで、`/` を含まず、大文字小文字だけの衝突も作らない。
+`t:` / `i:` と `__catalog__` 以外の名前は keyspace とみなさず無視する。
 
 **シャーディングの意味:**
 
@@ -1068,7 +1069,8 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 
 - **1トランザクション分（Begin + Batch + Commit）を 1 回の `append` でまとめて書き**、`Flush(true)` でディスクまで落とす。
   Begin / Commit が中途半端に分かれない。
-- open 時は `committedEntries` が「Commit まで到達した Batch」だけを再生する。
+- open 時は WAL を 1フレームずつストリーミングで読み（WAL 全体をメモリへ載せない）、
+  `committedEntries` 相当の状態機械が「Commit まで到達した Batch」だけを再生する。
   未コミットと `Abort` は捨てる。
 - flush / close の後は `rotate` する（旧ファイルを先に全部消してから、新番号で再作成）。
   **削除 → 作成の順**でないと、作ったばかりのファイルが削除対象に入る。
@@ -1173,6 +1175,7 @@ flush / compact は `RowStore` が各 keyspace の `WriteBatch` 後に `IStorage
 ```
 Database.openWith root
   → RowStore.openStore root          既存の keyspace ディレクトリを全部開く
+                                     （新規 DB でも __catalog__ を先に開いて登録する）
   → Catalog.load                     __catalog__ keyspace からスキーマを読む
   → RowStore.lastSeqNo               ディスク上の最大 SeqNo を採る
   （各 keyspace で）StorageEngine.openDatabase dir
@@ -1203,15 +1206,15 @@ memtable を flush してから WAL を削除する。
 
 ```
 <root>/
-├── dDpwZW9wbGU=                 ← base64("t:people")   主キー行
+├── OQ5HAZLPOBWGK            ← base32("t:people")   主キー行
 │   ├── MANIFEST-000001
 │   ├── CURRENT
 │   ├── 000002.wal
 │   ├── 000003.sst
 │   └── 000004.sst
-├── aTppZHhfZGVwdA==             ← base64("i:idx_dept")  索引エントリ
+├── NE5GSZDYL5SGK4DU         ← base32("i:idx_dept")  索引エントリ
 │   └── ...
-└── X19jYXRhbG9nX18=             ← base64("__catalog__")
+└── L5PWGYLUMFWG6Z27L4       ← base32("__catalog__")
     └── ...
 ```
 
@@ -1288,12 +1291,15 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   （`RykDb.Client` が読み取り時に元へ戻す）。
   TEXT に生の改行が入っていても 1応答 = 1行を保つ。
 
-| 応答                                       | 意味                                                    |
-| ------------------------------------------ | ------------------------------------------------------- |
-| `OK <行数>\t<列1>,<列2>,…` + `<値>,<値>` … | 成功（結果が 0行なら `OK <行数>` のみ。DML は常にこれ） |
-| `ERR <メッセージ>`                         | 失敗                                                    |
-| `HALT`                                     | 終了                                                    |
+| 応答                                       | 意味                                                             |
+| ------------------------------------------ | ---------------------------------------------------------------- |
+| `OK <行数>\t<列1>,<列2>,…` + `<値>,<値>` … | 成功（SELECT は0行でも列名を返す。DML は列名なしの `OK <行数>`） |
+| `ERR <メッセージ>`                         | 失敗                                                             |
+| `HALT`                                     | 終了                                                             |
 
+ヘッダーの列名は `Uri.EscapeDataString` でパーセントエンコードする
+（カンマ・改行を含む別名でも区切りが壊れない）。
+`RykDb.Client` は受信時にデコードする。
 値は `SqlLiteral.toSqlLiteral` のまま（引用符つき）で返るので、クライアント側でそのまま SQL の入力に使える設計。
 
 対話例:

@@ -84,6 +84,7 @@ txn            ::= BEGIN | COMMIT | ROLLBACK
 
 **大文字小文字は区別しない**（テーブル名・列名・索引名の比較は `OrdinalIgnoreCase`）。
 英字のみが識別子の開始文字（数字や `_` 始まりの識別子は不可）。
+テーブル名・索引名は **UTF-8 で 128 バイト以下**（超えると `NameError`）。
 
 ### 予約語
 
@@ -676,9 +677,12 @@ INSERT INTO テーブル [ (列 [, 列 …]) ] VALUES (式 [, 式 …]) [, (式 
 ### `UNIQUE` は検査される
 
 `UNIQUE` 制約・`UNIQUE` 索引は重複を検査する。
+ただし `NULL` は「値なし」なので重複とみなさない。
+複合 `UNIQUE` では、対象列のどれか1つでも `NULL` なら検査をスキップする。
 
 ```sql
 INSERT INTO people VALUES (1, 'alice2', 30, 1, 1.0);  -- id=1 が既に存在するのでエラー
+INSERT INTO people (id, email) VALUES (2, NULL), (3, NULL);  -- 複数の NULL は OK
 ```
 
 ### 例
@@ -777,18 +781,23 @@ CREATE TABLE people (
 | 制約          | 場所         | 効果                                                      |
 | ------------- | ------------ | --------------------------------------------------------- |
 | `NOT NULL`    | 列           | **検査される**（`NULL` を入れると `ConstraintViolation`） |
-| `PRIMARY KEY` | 列・テーブル | **必須**。`NOT NULL` も付く                               |
-| `UNIQUE`      | 列・テーブル | 重複を検査する                                            |
+| `PRIMARY KEY` | 列・テーブル | **必須**。1テーブルに1定義だけ。`NOT NULL` も付く         |
+| `UNIQUE`      | 列・テーブル | 重複を検査する（`NULL` は除く）                           |
 | `DEFAULT`     | 列           | `INSERT` で値を省略したときに使われる（定数式のみ）       |
 
 `DEFAULT` はカタログに保存され、DB を再オープンした後も使われる。
 
 - **主キーは省略できない**。
   1つも無いと`テーブル t に主キーがありません` になる。
+- 主キーは1テーブルに1定義だけ。
+  列レベルとテーブルレベルの併用、複数列への列レベル `PRIMARY KEY`、
+  複数のテーブルレベル `PRIMARY KEY` は `ConstraintViolation` になる。
 - 主キーは複数列にできる。
   値は列の宣言順に連結される。
-- `PRIMARY KEY` はテーブル制約が列レベルより優先される。
-- `IF NOT EXISTS` を付けると、既存テーブルなら**何もしずに成功**する。
+- テーブルレベルの `PRIMARY KEY` も、対象列に `NOT NULL` を付ける。
+- 列名の重複（大文字小文字を無視）は `NameError`。
+- テーブルレベルの `UNIQUE` は、存在しない列・重複列を `NameError` で拒否する。
+- `IF NOT EXISTS` を付けると、既存テーブルなら**何もせずに成功**する。
 - `IF NOT EXISTS` と `IF EXISTS` の両方の綴りを受け付ける。
 
 #### 列定義で型を省略する
@@ -811,9 +820,11 @@ CREATE [UNIQUE] INDEX 索引名 ON テーブル (列 [, 列 …]);
   COMMIT / ROLLBACK してから実行する。
   他の文は backfill が終わるまで待つ。
 - 索引は**独立した LSM ツリー**（keyspace `i:<索引名>`）に格納される。
-- `UNIQUE` は重複を検査する。
+- `UNIQUE` は重複を検査する（`NULL` は除く）。
 - 同名の索引が既にあれば `索引 <名前> は既に存在します`。
 - 索引する列が存在しない場合は `テーブル <t> に列 <c> がありません`。
+- 索引列の重複は `NameError`。
+- `__unique_` で始まる索引名は `UNIQUE` 制約用に予約されており、作成できない。
 - `IF NOT EXISTS` は**ない**。
 
 ```sql
@@ -833,6 +844,8 @@ DROP INDEX [IF EXISTS] 索引名;
   （行データは LSM の compaction で再利用されるため即座に解放される）。
   カタログだけを外すと、同名で再作成したときに旧データが復活するため、tombstone を先に確定させる。
 - `DROP INDEX` も索引 keyspace の全エントリに tombstone を書いてから定義を外す。
+- `__unique_` で始まる暗黙の `UNIQUE` 索引は `DROP` できない（`ConstraintViolation`）。
+  制約を消すにはテーブルを再作成する。
 
 ```sql
 DROP TABLE IF EXISTS tmp_data;

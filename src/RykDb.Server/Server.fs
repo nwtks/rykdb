@@ -2,7 +2,8 @@
 // RykDb.Server — プロトコルとサーバ本体。
 // 1接続 = 1クライアント、逐次処理。
 // 改行区切りの 1行テキストを交換し、応答の先頭タグで成否を分ける:
-//   OK <行数>\t<列名,...>   成功(続く行がデータ)
+//   OK <行数>\t<列名,...>   成功(続く行がデータ。SELECT は0行でも列名を返す)
+//   OK <行数>               DML など列を持たない成功
 //   ERR <メッセージ>        失敗
 //   HALT                    終了
 //
@@ -42,12 +43,20 @@ let private escapeLine (s: string) =
     sb.ToString()
 
 let private encode (columns: string array) (rows: SqlValue array array) =
-    if rows.Length = 0 then
-        sprintf "%s %d" OkTag rows.Length
-    else
-        let header =
-            sprintf "%s %d\t%s" OkTag rows.Length (System.String.Join(",", columns))
+    let columnsText =
+        if columns.Length = 0 then
+            None
+        else
+            Some(System.String.Join(",", columns |> Array.map System.Uri.EscapeDataString))
 
+    let header =
+        match columnsText with
+        | None -> sprintf "%s %d" OkTag rows.Length
+        | Some text -> sprintf "%s %d\t%s" OkTag rows.Length text
+
+    if rows.Length = 0 then
+        header
+    else
         let body =
             rows
             |> Array.map (fun r -> r |> Array.map SqlLiteral.toSqlLiteral |> String.concat "," |> escapeLine)

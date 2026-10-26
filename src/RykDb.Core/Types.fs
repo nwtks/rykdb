@@ -76,6 +76,20 @@ module internal SqlName =
     let equal (a: string) (b: string) =
         System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
 
+    /// 大文字小文字を無視して重複する名前を探す。
+    /// 重複があれば最初に見つかった名前を返す。
+    let duplicate (names: string list) =
+        let rec loop (seen: string list) (rest: string list) =
+            match rest with
+            | [] -> None
+            | name :: tail ->
+                if seen |> List.exists (fun s -> equal s name) then
+                    Some name
+                else
+                    loop (name :: seen) tail
+
+        loop [] names
+
 /// SQL の 3値論理。
 /// 比較結果は TRUE / FALSE だけでなく UNKNOWN を持つ。
 [<RequireQualifiedAccess>]

@@ -93,7 +93,8 @@ type RykDbClient(host: string, port: int) =
             | (true, count), columnsText when count >= 0 ->
                 let columns =
                     columnsText
-                    |> Option.map (fun text -> text.Split ',' |> Array.toList)
+                    |> Option.map (fun text ->
+                        text.Split ',' |> Array.map System.Uri.UnescapeDataString |> Array.toList)
                     |> Option.defaultValue []
 
                 readRows columns count []

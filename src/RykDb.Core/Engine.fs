@@ -192,12 +192,13 @@ module internal DmlOps =
             |> all
             |> Result.map (fun positions -> positions |> List.map (fun i -> row.[i]) |> List.toArray)
 
-        let rec check (row: SqlValue array) (pk: SqlValue array) (indexes: IndexSchema list) =
+        let rec check (txn: Transaction) (row: SqlValue array) (pk: SqlValue array) (indexes: IndexSchema list) =
             match indexes with
             | [] -> ret ()
             | idx :: rest ->
                 match indexValues idx row with
                 | Error e -> Error e
+                | Ok values when values |> Array.exists SqlValue.isNull -> check txn row pk rest
                 | Ok values ->
                     match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txn values 1 with
                     | Error e -> Error e
@@ -213,7 +214,7 @@ module internal DmlOps =
                             then
                                 err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
                             else
-                                check row pk rest
+                                check txn row pk rest
 
         let checkUnique (txn: Transaction) (row: SqlValue array) =
             let pk = TableSchema.primaryKeyOf schema row
@@ -221,7 +222,7 @@ module internal DmlOps =
             match Dml.getByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn pk with
             | Error e -> Error e
             | Ok(Some _) -> err (DbError.constraintViolation (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name))
-            | Ok None -> check row pk (schema.Indexes |> List.filter _.Unique)
+            | Ok None -> check txn row pk (schema.Indexes |> List.filter _.Unique)
 
         let buildRow (defaults: SqlValue array) idxs width (values: Expr list) =
             if List.length values <> List.length idxs then
@@ -238,7 +239,10 @@ module internal DmlOps =
             let! idxs =
                 match columns with
                 | None -> schema.Columns |> List.mapi (fun i _ -> i) |> ret
-                | Some names -> names |> List.map (TableSchema.requireIndexOf schema) |> all
+                | Some names ->
+                    match SqlName.duplicate names with
+                    | Some name -> err (DbError.name (sprintf "INSERT の列 %s が重複しています" name))
+                    | None -> names |> List.map (TableSchema.requireIndexOf schema) |> all
 
             let supplied = Set.ofList idxs
 
@@ -297,36 +301,42 @@ module internal DmlOps =
                 | Ok positions ->
                     let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
 
-                    match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txnAcc values 1 with
-                    | Error e -> Error e
-                    | Ok scan ->
-                        match Op.toArray scan with
+                    if values |> Array.exists SqlValue.isNull then
+                        checkUniqueUpdate txnAcc newRow newPk rest
+                    else
+                        match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txnAcc values 1 with
                         | Error e -> Error e
-                        | Ok rows ->
-                            if
-                                rows
-                                |> Array.exists (fun r ->
-                                    let existingPk = TableSchema.primaryKeyOf schema r
-                                    not (Array.forall2 (=) existingPk newPk))
-                            then
-                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                            else
-                                checkUniqueUpdate txnAcc newRow newPk rest
+                        | Ok scan ->
+                            match Op.toArray scan with
+                            | Error e -> Error e
+                            | Ok rows ->
+                                if
+                                    rows
+                                    |> Array.exists (fun r ->
+                                        let existingPk = TableSchema.primaryKeyOf schema r
+                                        not (Array.forall2 (=) existingPk newPk))
+                                then
+                                    err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                                else
+                                    checkUniqueUpdate txnAcc newRow newPk rest
 
         let targetSchema = targetSchemaOf schema
 
-        assignments
-        |> List.map (fun (name, _) -> TableSchema.requireIndexOf schema name)
-        |> all
-        >>= fun targets ->
-            foldRows txn ctx schema (matchesWhere targetSchema where) (fun txnAcc count row ->
-                result {
-                    let! newRow = assign targetSchema targets row
-                    let newPk = TableSchema.primaryKeyOf schema newRow
-                    do! checkUniqueUpdate txnAcc newRow newPk (schema.Indexes |> List.filter _.Unique)
-                    let! t = Dml.updateRow schema txnAcc row newRow
-                    return t, count + 1
-                })
+        match assignments |> List.map fst |> SqlName.duplicate with
+        | Some name -> err (DbError.name (sprintf "UPDATE の列 %s が重複しています" name))
+        | None ->
+            assignments
+            |> List.map (fun (name, _) -> TableSchema.requireIndexOf schema name)
+            |> all
+            >>= fun targets ->
+                foldRows txn ctx schema (matchesWhere targetSchema where) (fun txnAcc count row ->
+                    result {
+                        let! newRow = assign targetSchema targets row
+                        let newPk = TableSchema.primaryKeyOf schema newRow
+                        do! checkUniqueUpdate txnAcc newRow newPk (schema.Indexes |> List.filter _.Unique)
+                        let! t = Dml.updateRow schema txnAcc row newRow
+                        return t, count + 1
+                    })
 
     /// DELETE。
     /// WHERE に合う行を主キー + 全索引に tombstone で消す。
@@ -373,6 +383,7 @@ module internal Ddl =
             | Some _, false -> err (sprintf "テーブル %s は既に存在します" c.Name |> DbError.alreadyExists)
             | None, _ ->
                 result {
+                    do! Keyspace.validateName "テーブル" c.Name
                     let! schema = TableSchema.ofCreateTable c
                     let defn = Catalog.toDefinition schema
 
@@ -390,7 +401,7 @@ module internal Ddl =
                         implicitUniqueCols
                         |> List.mapi (fun i cols ->
                             {
-                                IndexName = sprintf "__unique_%s_%d" c.Name i
+                                IndexName = Catalog.implicitIndexName c.Name i
                                 TableName = c.Name
                                 Columns = cols
                                 Unique = true
@@ -419,13 +430,17 @@ module internal Ddl =
                     (fun result row ->
                         result
                         >>= fun seen ->
-                            let key =
-                                positions |> List.map (fun position -> row.[position]) |> KeyBuilder.ofValues
+                            let values = positions |> List.map (fun position -> row.[position])
 
-                            if Set.contains key seen then
-                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" index.Name))
+                            if values |> List.exists SqlValue.isNull then
+                                ret seen
                             else
-                                ret (Set.add key seen))
+                                let key = KeyBuilder.ofValues values
+
+                                if Set.contains key seen then
+                                    err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" index.Name))
+                                else
+                                    ret (Set.add key seen))
                     (ret Set.empty)
 
         let backfillIndex (state: DbState) (tableName: string) (idx: IndexSchema) =
@@ -449,8 +464,13 @@ module internal Ddl =
                         let! _ = duplicateUniqueValues withIndex idx rows
                         ()
 
+                    let! stale = RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
+
+                    let! cleared =
+                        foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn stale
+
                     let! txn2 =
-                        foldOk (fun t row -> ret (Transaction.put t space (indexKeyFor row) row)) txn rows
+                        foldOk (fun t row -> ret (Transaction.put t space (indexKeyFor row) row)) cleared rows
 
                     let! store, mgr2 =
                         DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
@@ -466,31 +486,58 @@ module internal Ddl =
             match Catalog.findTable state.Catalog ci.Table with
             | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
             | Some tableDef ->
-                match Catalog.findIndex state.Catalog ci.Name with
-                | Some _ -> err (sprintf "索引 %s は既に存在します" ci.Name |> DbError.alreadyExists)
-                | None ->
+                result {
+                    do! Keyspace.validateName "索引" ci.Name
+
+                    do!
+                        if Catalog.isReservedIndexName ci.Name then
+                            err (DbError.name (sprintf "索引名 %s は予約されています" ci.Name))
+                        else
+                            ret ()
+
+                    let! () =
+                        match Catalog.findIndex state.Catalog ci.Name with
+                        | Some _ -> err (sprintf "索引 %s は既に存在します" ci.Name |> DbError.alreadyExists)
+                        | None -> ret ()
+
+                    do!
+                        if List.isEmpty ci.Columns then
+                            err (DbError.constraintViolation (sprintf "索引 %s の列が空です" ci.Name))
+                        else
+                            ret ()
+
+                    let! () =
+                        match SqlName.duplicate ci.Columns with
+                        | Some name -> err (DbError.name (sprintf "索引 %s の列 %s が重複しています" ci.Name name))
+                        | None -> ret ()
+
                     let missing =
                         ci.Columns
                         |> List.filter (fun n ->
                             tableDef.Columns |> List.exists (fun c -> Catalog.eqName n c.Name) |> not)
 
-                    if not (List.isEmpty missing) then
-                        err (
-                            sprintf "テーブル %s に列 %s がありません" ci.Table (System.String.Join(", ", missing))
-                            |> DbError.notFound
-                        )
-                    else
-                        let defn =
-                            {
-                                IndexName = ci.Name
-                                TableName = ci.Table
-                                Columns = ci.Columns
-                                Unique = ci.Unique
-                            }
+                    do!
+                        if not (List.isEmpty missing) then
+                            err (
+                                sprintf "テーブル %s に列 %s がありません" ci.Table (System.String.Join(", ", missing))
+                                |> DbError.notFound
+                            )
+                        else
+                            ret ()
 
-                        let idxSchema = Catalog.toIndexSchema defn
-                        let next = Catalog.addIndex state.Catalog defn
-                        backfillIndex state ci.Table idxSchema >>= fun filled -> saved filled next
+                    let defn =
+                        {
+                            IndexName = ci.Name
+                            TableName = ci.Table
+                            Columns = ci.Columns
+                            Unique = ci.Unique
+                        }
+
+                    let idxSchema = Catalog.toIndexSchema defn
+                    let next = Catalog.addIndex state.Catalog defn
+                    let! filled = backfillIndex state ci.Table idxSchema
+                    return! saved filled next
+                }
 
         exclusiveDdl state (fun fresh -> createIndexCore fresh ci)
 
@@ -547,6 +594,8 @@ module internal Ddl =
                     ret state
                 else
                     err (sprintf "索引 %s が存在しません" name |> DbError.notFound)
+            | Some defn when Catalog.isReservedIndexName defn.IndexName ->
+                err (DbError.constraintViolation (sprintf "索引 %s は UNIQUE 制約用のため DROP できません" defn.IndexName))
             | Some defn ->
                 result {
                     let space = Keyspace.index defn.IndexName

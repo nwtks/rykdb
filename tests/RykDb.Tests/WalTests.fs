@@ -176,6 +176,23 @@ let ``Wal.read: 同じ番号で作り直すと内容を捨ててやり直す`` (
         Assert.Empty(ok (Wal.read dir 1L)))
 
 [<Fact>]
+let ``Wal.read: 書きかけの末尾は無視する`` () =
+    withDir "wal-torn-read" (fun dir ->
+        let w0 = freshWal dir
+        let entries = [| Entry.put (intKey 1) 1UL (intRow 1) |]
+        let w1 = ok (Wal.append w0 dir (commitRecords 1UL entries))
+
+        // ヘッダーだけ書けて payload が無い状態を再現する。
+        use fs =
+            new FileStream(Wal.path dir w1.FileNumber, FileMode.Append, FileAccess.Write, FileShare.Read)
+
+        fs.Write([| 16uy; 0uy; 0uy; 0uy; 0uy; 0uy; 0uy; 0uy |], 0, 8)
+        fs.Flush true
+
+        let recovered = ok (Wal.read dir w1.FileNumber)
+        Assert.Equal(1, recovered.Length))
+
+[<Fact>]
 let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
     let missing =
         Path.Combine(Path.GetTempPath(), "rykdb-wal-missing-" + string System.DateTime.UtcNow.Ticks)

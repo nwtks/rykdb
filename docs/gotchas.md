@@ -977,7 +977,8 @@ FSI は `/tmp/probe.dll` のようなパスをキャッシュする。
 
 ### 10.2 データが本当にディスクに書かれたか確認
 
-keyspace ごとに base64 のディレクトリができる（`t:people` → `dDpwZW9wbGU=`）。
+keyspace ごとに base32 のディレクトリができる
+（`t:people` → `OQ5HAZLPOBWGK`）。
 
 ```fsharp
 System.IO.Directory.GetFiles(dir, "*", System.IO.SearchOption.AllDirectories)
@@ -1186,7 +1187,8 @@ DDL を transaction に載せる設計に変えるまでは、この制約を維
 
 逆順（カタログ → backfill）だと backfill の失敗で「索引はあるが中身が無い」状態が永続化され、
 再オープン後も索引検索が行を取りこぼす。
-`Ddl.createIndex` は索引 keyspace を先に空にしてから backfill し、成功後にカタログへ登録する。
+`Ddl.createIndex` は既存の索引エントリへ tombstone を書いてから backfill し、成功後にカタログへ登録する
+（tombstone と現在行の put は同じ transaction に積む）。
 途中で失敗しても、次回の `CREATE INDEX` が残骸を消してからやり直す。
 
 ### 11.16a DDL（CREATE INDEX など）は `RootGate` で排他にする
