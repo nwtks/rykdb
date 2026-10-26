@@ -679,6 +679,8 @@ INSERT INTO テーブル [ (列 [, 列 …]) ] VALUES (式 [, 式 …]) [, (式 
 `UNIQUE` 制約・`UNIQUE` 索引は重複を検査する。
 ただし `NULL` は「値なし」なので重複とみなさない。
 複合 `UNIQUE` では、対象列のどれか1つでも `NULL` なら検査をスキップする。
+複数行 `UPDATE` の検査は行ごと即時なので、
+同一文内で一意値を交換するような更新は `ConstraintViolation` になる。
 
 ```sql
 INSERT INTO people VALUES (1, 'alice2', 30, 1, 1.0);  -- id=1 が既に存在するのでエラー
@@ -876,6 +878,8 @@ ROLLBACK;        -- 削除を取り消し
 - 識別子（テーブル・列・索引・別名）は**大文字小文字を区別しない**。
 - `COMMIT` はバッファをエンジンへ流す。
 - `ROLLBACK` はバッファを捨てる。
+- 1 transaction の書き込みバッファは概算 256 MiB が上限。
+  超えると `CapacityError` になる（DDL の一括処理は除く）。
 - **DDL（`CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX`）は明示 transaction 中には実行できない**
   （即時反映のため）。
   `COMMIT` または `ROLLBACK` してから実行する。

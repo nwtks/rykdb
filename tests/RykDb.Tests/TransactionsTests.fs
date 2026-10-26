@@ -51,6 +51,28 @@ let ``Transaction.put: 同じ transaction 内の二重書き込みは 1 件に�
     Assert.Equal(1, total)
 
 [<Fact>]
+let ``Transaction: バッファ上限を超えると commit できない`` () =
+    let mgr =
+        { TransactionManager.create () with
+            MaxTransactionBytes = 1L
+        }
+
+    let mgr, txn = TransactionManager.beginTxn mgr
+    let txn = Transaction.put txn "t:x" [| 1uy |] [| SqlValue.Int 1L |]
+    expectErrorKind ErrorKind.CapacityError "上限を超えた transaction を commit できてしまう" (TransactionManager.commit mgr txn)
+
+[<Fact>]
+let ``Transaction: ApproxBytes は値の上書きで減る`` () =
+    let snap = { Snapshot.SeqNo = 0UL }
+    let txn0 = Transaction.create 1UL snap
+
+    let txn1 =
+        Transaction.put txn0 "t:x" [| 1uy |] [| SqlValue.Text(System.String('x', 1000)) |]
+
+    let txn2 = Transaction.put txn1 "t:x" [| 1uy |] [| SqlValue.Text "x" |]
+    Assert.True(txn2.ApproxBytes < txn1.ApproxBytes)
+
+[<Fact>]
 let ``Transaction.conflictKey: keyspace と key を連結`` () =
     let k = Transaction.conflictKey "t:people" (rowKey 1)
     Assert.True(k.StartsWith "t:people:")

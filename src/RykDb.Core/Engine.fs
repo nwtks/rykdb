@@ -456,7 +456,10 @@ module internal Ddl =
                         }
 
                     let space = Keyspace.index idx.Name
-                    let mgr, txn = TransactionManager.beginTxn state.Manager
+
+                    let mgr, txn =
+                        TransactionManager.beginTxnWithLimit System.Int64.MaxValue state.Manager
+
                     let! rows = Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
                     let indexKeyFor row = RowKey.indexKey withIndex idx row
 
@@ -572,7 +575,9 @@ module internal Ddl =
                         Keyspace.table schema.Name
                         :: (withIndexes.Indexes |> List.map (fun index -> Keyspace.index index.Name))
 
-                    let mgr, txn = TransactionManager.beginTxn state.Manager
+                    let mgr, txn =
+                        TransactionManager.beginTxnWithLimit System.Int64.MaxValue state.Manager
+
                     let! txn2 = foldOk clearSpace txn spaces
 
                     let! store, mgr2 =
@@ -606,7 +611,10 @@ module internal Ddl =
             | Some defn ->
                 result {
                     let space = Keyspace.index defn.IndexName
-                    let mgr, txn = TransactionManager.beginTxn state.Manager
+
+                    let mgr, txn =
+                        TransactionManager.beginTxnWithLimit System.Int64.MaxValue state.Manager
+
                     let! entries = RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
 
                     let! txn2 =

@@ -38,16 +38,34 @@ type internal Transaction =
         /// keyspace -> (キー -> 値)。
         /// 同一キーは最後の書き込みが勝つ。
         Buffers: Map<string, Map<byte array, SqlValue array option>>
+        /// バッファの概算バイト数。
+        ApproxBytes: int64
+        /// この transaction が保持できるバッファの上限。
+        LimitBytes: int64
     }
 
 module internal Transaction =
+    /// 既定の transaction バッファ上限（256MiB）。
+    [<Literal>]
+    let DefaultLimitBytes = 256L * 1024L * 1024L
+
     /// 書き込み可能な transaction を作る。
     let create (txnId: TxnId) (snap: Snapshot) =
         {
             TxnId = txnId
             Snapshot = snap
             Buffers = Map.empty
+            ApproxBytes = 0L
+            LimitBytes = DefaultLimitBytes
         }
+
+    let private slotBytes (keyspace: string) (key: byte array) (slot: SqlValue array option) =
+        let entry =
+            match slot with
+            | Some value -> Entry.put key 0UL value
+            | None -> Entry.delete key 0UL
+
+        int64 keyspace.Length + int64 (Entry.approxBytes entry) + 16L
 
     let private setSlot (txn: Transaction) (keyspace: string) (key: byte array) (slot: SqlValue array option) =
         let inner =
@@ -55,9 +73,30 @@ module internal Transaction =
             | Some m -> m
             | None -> Map.empty
 
+        let oldBytes =
+            inner
+            |> Map.tryFind key
+            |> Option.map (slotBytes keyspace key)
+            |> Option.defaultValue 0L
+
         { txn with
             Buffers = Map.add keyspace (Map.add key slot inner) txn.Buffers
+            ApproxBytes = txn.ApproxBytes - oldBytes + slotBytes keyspace key slot
         }
+
+    /// バッファが上限を超えているか。
+    let isOverLimit (txn: Transaction) = txn.ApproxBytes > txn.LimitBytes
+
+    /// 上限超過時のエラー。
+    let overLimitError (txn: Transaction) =
+        DbError.capacity (sprintf "transaction の書き込みバッファが上限（%d バイト）を超えました" txn.LimitBytes)
+
+    /// 上限内なら transaction を返し、超えていれば CapacityError。
+    let checkLimit (txn: Transaction) =
+        if isOverLimit txn then
+            err (overLimitError txn)
+        else
+            ret txn
 
     /// 値を書き込む（バッファに積む）。
     let put (txn: Transaction) (keyspace: string) (key: byte array) (value: SqlValue array) =
@@ -142,6 +181,8 @@ type internal TransactionManager =
         Active: Map<TxnId, TxnRecord>
         /// 最後に commit された SeqNo（=「DB の現在時刻」）
         LastCommitSeqNo: uint64
+        /// 1 transaction のバッファ上限（バイト）。
+        MaxTransactionBytes: int64
     }
 
 module internal TransactionManager =
@@ -152,12 +193,18 @@ module internal TransactionManager =
             LastCommitted = Map.empty
             Active = Map.empty
             LastCommitSeqNo = 0UL
+            MaxTransactionBytes = Transaction.DefaultLimitBytes
         }
 
-    /// 現在の「DB の時刻」で transaction を始める。
-    let beginTxn (mgr: TransactionManager) =
+    /// 指定した上限で transaction を始める。
+    let beginTxnWithLimit (limit: int64) (mgr: TransactionManager) =
         let snap = { Snapshot.SeqNo = mgr.LastCommitSeqNo }
-        let txn = Transaction.create mgr.NextTxnId snap
+
+        let txn =
+            { Transaction.create mgr.NextTxnId snap with
+                LimitBytes = limit
+            }
+
         let record = { Txn = txn; Keys = Set.empty }
 
         let updated =
@@ -167,6 +214,10 @@ module internal TransactionManager =
             }
 
         updated, txn
+
+    /// 現在の「DB の時刻」で transaction を始める。
+    let beginTxn (mgr: TransactionManager) =
+        beginTxnWithLimit mgr.MaxTransactionBytes mgr
 
     /// transaction を破棄する（abort）。
     /// バッファは捨てられるので DB には何も残らない。
@@ -227,6 +278,8 @@ module internal TransactionManager =
 
         if not (Map.containsKey txn.TxnId mgr.Active) then
             err (sprintf "Transaction %d が存在しません" txn.TxnId |> DbError.internalError)
+        elif Transaction.isOverLimit txn then
+            err (Transaction.overLimitError txn)
         else
             let conflicting = findConflicts txn mgr.LastCommitted txn.Snapshot.SeqNo
 

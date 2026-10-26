@@ -714,6 +714,11 @@ COMMIT
 - abort した transaction の書き込みが DB に一切残らない
 - 自分の書き込みを commit 前に読める
 
+Buffers は概算バイト数を管理し、既定 256MiB を超えると DML の行追加時点
+（または commit 時の最終検査）で `CapacityError` を返す。
+巨大 transaction が WAL やメモリを無制限に消費しないための上限。
+DDL（index backfill / DROP）は一括処理が必要なため、この上限を外している。
+
 読み取りは lock を取らず（`StorageEngine` が不変だから）、書き込みの直列化はこのモジュールの中だけに閉じている。
 **keyspace 単位の並列性は `RowStore` が持つ** — keyspace が違えば commit も衝突もしない。
 

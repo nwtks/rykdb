@@ -434,6 +434,18 @@ let ``Dml.insert: NOT NULL 制約違反は弾かれる`` () =
     expectErrorKind ErrorKind.ConstraintViolation "NOT NULL 制約違反を検出できなかった" (Dml.insert schema txn bad)
 
 [<Fact>]
+let ``Dml.insert: transaction 上限を超えると CapacityError`` () =
+    let txn =
+        { Transaction.create 1UL { SeqNo = 0UL } with
+            LimitBytes = 1L
+        }
+
+    expectErrorKind
+        ErrorKind.CapacityError
+        "transaction 上限を超えた INSERT を検出できなかった"
+        (Dml.insert usersSchema txn (rowOf 1 "a@x.com" 1))
+
+[<Fact>]
 let ``Dml.insert: 列数が違う行は弾かれる`` () =
     let mgr = TransactionManager.create ()
     let _, txn = TransactionManager.beginTxn mgr

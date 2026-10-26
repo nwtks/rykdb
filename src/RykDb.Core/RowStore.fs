@@ -1332,7 +1332,8 @@ module internal Dml =
             | _ -> ()
 
             let next = Transaction.put txn tks pk row
-            return! applyIndexChange schema next None (Some row)
+            let! changed = applyIndexChange schema next None (Some row)
+            return! Transaction.checkLimit changed
         }
 
     let private replaceRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) (newRow: SqlValue array) =
@@ -1351,7 +1352,8 @@ module internal Dml =
             let afterMain =
                 Transaction.put txn (tableSpace schema) (RowKey.primary schema newRow) newRow
 
-            return! applyIndexChange schema afterMain (Some oldRow) (Some newRow)
+            let! changed = applyIndexChange schema afterMain (Some oldRow) (Some newRow)
+            return! Transaction.checkLimit changed
         }
 
     /// 主キーで更新する（主キーと全索引に新しい値を書き込む）。
@@ -1389,8 +1391,11 @@ module internal Dml =
         }
 
     let private removeRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) =
-        let next = Transaction.remove txn (tableSpace schema) (RowKey.primary schema oldRow)
-        applyIndexChange schema next (Some oldRow) None
+        result {
+            let next = Transaction.remove txn (tableSpace schema) (RowKey.primary schema oldRow)
+            let! changed = applyIndexChange schema next (Some oldRow) None
+            return! Transaction.checkLimit changed
+        }
 
     /// 主キーで削除する。
     /// 主キーと全索引に tombstone を書く。
