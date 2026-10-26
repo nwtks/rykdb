@@ -436,6 +436,49 @@ module internal Ddl =
             | Some _ -> err (DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください")
             | None -> run state)
 
+    let private BackfillChunkRows = 8192
+
+    let private applyChunks
+        (current: DbState)
+        (chunks: seq<'a>)
+        (apply: Transaction -> 'a -> Result<Transaction, DbError>)
+        =
+        chunks
+        |> foldOk
+            (fun st chunk ->
+                let mgr, txn = TransactionManager.beginTxnWithLimit System.Int64.MaxValue st.Manager
+
+                result {
+                    let! txn2 = apply txn chunk
+
+                    let! store, mgr2 =
+                        DbStateOps.commitToStore st.Root st.ActiveRegistration st.Store mgr txn2
+
+                    return
+                        { st with
+                            Store = store
+                            Manager = mgr2
+                        }
+                })
+            current
+
+    /// keyspace の全エントリをチャンク単位で tombstone 消去する。
+    let private clearSpaceChunksResult (state: DbState) (space: string) =
+        if not (RowStore.keyspaceExists state.Store space) then
+            ret state
+        else
+            match RowStore.scanAt state.Store space [||] Snapshot.noLimit 0 with
+            | Error e -> Error e
+            | Ok stale ->
+                applyChunks state (Seq.chunkBySize BackfillChunkRows stale) (fun txn chunk ->
+                    foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn chunk)
+
+    /// 失敗しても可視性に影響しない後始末用（DROP 後）。
+    let private clearSpaceChunks (state: DbState) (space: string) =
+        match clearSpaceChunksResult state space with
+        | Ok next -> next
+        | Error _ -> state
+
     let createTable (state: DbState) (c: CreateTable) =
         let createTableCore (state: DbState) (c: CreateTable) =
             let existing = Catalog.findTable state.Catalog c.Name
@@ -474,7 +517,14 @@ module internal Ddl =
                     let catalog2 =
                         implicitIndexes |> List.fold (fun cat idx -> Catalog.addIndex cat idx) catalog1
 
-                    return! saved state catalog2
+                    let spaces =
+                        Keyspace.table c.Name
+                        :: (implicitIndexes |> List.map (fun idx -> Keyspace.index idx.IndexName))
+
+                    let! cleaned =
+                        spaces |> foldOk (fun st space -> clearSpaceChunksResult st space) state
+
+                    return! saved cleaned catalog2
                 }
 
         exclusiveDdl state (fun fresh -> createTableCore fresh c)
@@ -505,36 +555,10 @@ module internal Ddl =
                                     ret (Set.add key seen))
                     (ret Set.empty)
 
-        let BackfillChunkRows = 8192
-
         let backfillIndex (state: DbState) (tableName: string) (idx: IndexSchema) =
             match Catalog.findTable state.Catalog tableName with
             | None -> ret state
             | Some defn ->
-                let applyChunks
-                    (current: DbState)
-                    (chunks: seq<'a>)
-                    (apply: Transaction -> 'a -> Result<Transaction, DbError>)
-                    =
-                    chunks
-                    |> foldOk
-                        (fun st chunk ->
-                            let mgr, txn = TransactionManager.beginTxnWithLimit System.Int64.MaxValue st.Manager
-
-                            result {
-                                let! txn2 = apply txn chunk
-
-                                let! store, mgr2 =
-                                    DbStateOps.commitToStore st.Root st.ActiveRegistration st.Store mgr txn2
-
-                                return
-                                    { st with
-                                        Store = store
-                                        Manager = mgr2
-                                    }
-                            })
-                        current
-
                 result {
                     let! schema = Catalog.toSchema defn
 
@@ -546,11 +570,7 @@ module internal Ddl =
                     let space = Keyspace.index idx.Name
                     let indexKeyFor row = RowKey.indexKey withIndex idx row
 
-                    let! cleared =
-                        RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
-                        |> Result.bind (fun stale ->
-                            applyChunks state (Seq.chunkBySize BackfillChunkRows stale) (fun txn chunk ->
-                                foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn chunk))
+                    let! cleared = clearSpaceChunksResult state space
 
                     let! rows = Dml.scanByPrimaryKey cleared.Store withIndex Snapshot.noLimit 0
 
@@ -625,10 +645,9 @@ module internal Ddl =
 
     /// DROP TABLE。
     /// 手順:
-    ///   1. テーブル keyspace と全索引 keyspace の全エントリに tombstone を書く
-    ///   2. commit してからカタログから定義を外す
-    /// カタログを先に外して keyspace を残すと、同名で再 CREATE したときに旧データがそのまま見える
-    /// （keyspace は名前由来のディレクトリで再利用される）。
+    ///   1. 先にカタログから定義を外してテーブルを見えなくする
+    ///   2. テーブルと全索引 keyspace の全エントリをチャンク単位で tombstone 消去する
+    /// 後始末が中断しても、次回の CREATE TABLE が同名 keyspace を空にしてから作る。
     let dropTable (state: DbState) (name: string) (ifExists: bool) =
         let dropTableCore (state: DbState) (name: string) (ifExists: bool) =
             match Catalog.findTable state.Catalog name with
@@ -638,10 +657,6 @@ module internal Ddl =
                 else
                     err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
             | Some defn ->
-                let clearSpace (txn: Transaction) (space: string) =
-                    RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
-                    |> Result.bind (foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn)
-
                 result {
                     let! schema = Catalog.toSchema defn
 
@@ -654,29 +669,16 @@ module internal Ddl =
                         Keyspace.table schema.Name
                         :: (withIndexes.Indexes |> List.map (fun index -> Keyspace.index index.Name))
 
-                    let mgr, txn =
-                        TransactionManager.beginTxnWithLimit System.Int64.MaxValue state.Manager
-
-                    let! txn2 = foldOk clearSpace txn spaces
-
-                    let! store, mgr2 =
-                        DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
-
-                    return!
-                        saved
-                            { state with
-                                Store = store
-                                Manager = mgr2
-                            }
-                            (Catalog.removeTable state.Catalog name)
+                    let! next = saved state (Catalog.removeTable state.Catalog name)
+                    return spaces |> List.fold (fun st space -> clearSpaceChunks st space) next
                 }
 
         exclusiveDdl state (fun fresh -> dropTableCore fresh name ifExists)
 
     /// DROP INDEX。
-    /// 索引 keyspace の全エントリへ tombstone を書いてからカタログから定義を外す。
-    /// 書かないと、消した行の索引エントリが keyspace に残り、
-    /// 同名で CREATE INDEX し直したときに tombstone のない旧エントリが見えてしまう。
+    /// 先にカタログから定義を外して索引を見えなくし、
+    /// その後で索引 keyspace をチャンク単位で tombstone 消去する。
+    /// 後始末が中断しても、次回の CREATE INDEX が同名 keyspace を空にしてから作る。
     let dropIndex (state: DbState) (name: string) (ifExists: bool) =
         let dropIndexCore (state: DbState) (name: string) (ifExists: bool) =
             match Catalog.findIndex state.Catalog name with
@@ -689,26 +691,8 @@ module internal Ddl =
                 err (DbError.constraintViolation (sprintf "索引 %s は UNIQUE 制約用のため DROP できません" defn.IndexName))
             | Some defn ->
                 result {
-                    let space = Keyspace.index defn.IndexName
-
-                    let mgr, txn =
-                        TransactionManager.beginTxnWithLimit System.Int64.MaxValue state.Manager
-
-                    let! entries = RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
-
-                    let! txn2 =
-                        foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn entries
-
-                    let! store, mgr2 =
-                        DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
-
-                    return!
-                        saved
-                            { state with
-                                Store = store
-                                Manager = mgr2
-                            }
-                            (Catalog.removeIndex state.Catalog name)
+                    let! next = saved state (Catalog.removeIndex state.Catalog name)
+                    return clearSpaceChunks next (Keyspace.index defn.IndexName)
                 }
 
         exclusiveDdl state (fun fresh -> dropIndexCore fresh name ifExists)

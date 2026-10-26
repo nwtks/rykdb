@@ -843,10 +843,12 @@ DROP INDEX [IF EXISTS] 索引名;
 ```
 
 - `IF EXISTS` を付けると、存在しなくても**エラーにならない**。
-- `DROP TABLE` はテーブル本体と、その索引 keyspace のエントリに tombstone を書いてからカタログ定義を外す
-  （行データは LSM の compaction で再利用されるため即座に解放される）。
-  カタログだけを外すと、同名で再作成したときに旧データが復活するため、tombstone を先に確定させる。
-- `DROP INDEX` も索引 keyspace の全エントリに tombstone を書いてから定義を外す。
+- `DROP TABLE` は先に定義を外してテーブルを見えなくし、
+  その後でテーブルと全索引 keyspace の全エントリへ tombstone を 8192件ずつ書く。
+  途中で失敗しても、次回の `CREATE TABLE` が同名 keyspace を空にしてから作る。
+- `DROP INDEX` は先に定義を外して索引を見えなくし、
+  その後で索引 keyspace の全エントリへ tombstone を 8192件ずつ書く。
+  途中で失敗しても、次回の `CREATE INDEX` が残骸を消す。
 - `__unique_` で始まる暗黙の `UNIQUE` 索引は `DROP` できない（`ConstraintViolation`）。
   制約を消すにはテーブルを再作成する。
 

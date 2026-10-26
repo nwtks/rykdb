@@ -1101,7 +1101,7 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
 replay 中や境界未設定時は 0 のままにし、通常の commit では
 `TransactionManager.activeSnapshot`（active の最小 snapshot、無ければ `LastCommitSeqNo + 1`）を設定する。
 
-### 11.10 DROP は「keyspace の tombstone → カタログ削除」の順で行う
+### 11.10 DROP は種類ごとに安全な順序で行う
 
 `DROP TABLE` / `DROP INDEX` はカタログから定義を外すだけでは不十分。
 keyspace のディレクトリ名は名前から決まる（`t:<name>` / `i:<name>`）ので、
@@ -1109,12 +1109,16 @@ keyspace のディレクトリ名は名前から決まる（`t:<name>` / `i:<nam
 特に「索引を DROP → 行を DELETE → 同名 CREATE INDEX」の順では、
 DELETE 時に索引 tombstone が書かれないため、backfill 後の索引検索で削除済みの行が復活する。
 
-- `DROP TABLE`: テーブル keyspace と全索引 keyspace の**全エントリ**へ tombstone を書いて commit し、
-  その後 `Catalog.removeTable`
-  （現在行だけでなく孤児エントリも消す）。
-- `DROP INDEX`: 索引 keyspace の全キーへ `Transaction.remove` を書いて commit し、その後 `Catalog.removeIndex`。
-- 順序を逆にすると「カタログに無いのに keyspace は残る」状態で窓が空く。
-  tombstone を先に確定させること。
+- `DROP TABLE`: 先に `Catalog.removeTable` でテーブルを見えなくし、
+  その後でテーブルと全索引 keyspace を 8192エントリずつ tombstone 消去する。
+  途中でクラッシュしてもカタログにテーブルは無く、
+  次回の `CREATE TABLE` が同名の table / 暗黙索引 keyspace を空にしてから作り直す。
+- `DROP INDEX`: 先に `Catalog.removeIndex` で索引を見えなくし、
+  その後で索引 keyspace を 8192エントリずつ tombstone 消去する。
+  途中でクラッシュしてもカタログに索引は無く、
+  次回の `CREATE INDEX` が残骸を消してから作り直す。
+- カタログを先に外すので、後始末の途中でもユーザーには削除済みに見える。
+  残骸は同名の CREATE が必ず掃除する。
 
 ### 11.11 compaction の出力分割は「件数」ではなく「バイト」、かつキーの切れ目で切る
 

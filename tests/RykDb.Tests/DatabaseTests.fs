@@ -510,7 +510,13 @@ let ``Database: 大量行の CREATE INDEX はチャンクで backfill する`` (
 
         let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
         let _, count = ok (db3.Query "SELECT COUNT(*) FROM t WHERE a = 7")
-        Assert.Equal<int64>(900L, asInt count.Rows.[0].[0]))
+        Assert.Equal<int64>(900L, asInt count.Rows.[0].[0])
+
+        // 同様に負荷の高い DROP TABLE もチャンクで後始末できる。
+        let db4 = exec db3 "DROP TABLE t"
+        let db5 = exec db4 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let _, after = ok (db5.Query "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(0L, asInt after.Rows.[0].[0]))
 
 [<Fact>]
 let ``Database: CREATE INDEX は残った索引エントリを消してから backfill する`` () =

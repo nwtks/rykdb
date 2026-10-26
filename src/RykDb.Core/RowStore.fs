@@ -971,6 +971,13 @@ module internal RowStore =
     /// keyspace のエンジン（無ければ作る）。
     let engine (store: RowStore) (keyspace: string) = ensure store keyspace
 
+    /// その keyspace に既にエンジンまたはディレクトリがあるか。
+    /// 空の keyspace を読むためにエンジンを新規作成しないための判定。
+    let keyspaceExists (store: RowStore) (keyspace: string) =
+        Map.containsKey keyspace store.Engines
+        || (not (System.String.IsNullOrEmpty store.Root)
+            && System.IO.Directory.Exists(System.IO.Path.Combine(store.Root, Keyspace.toDirName keyspace)))
+
     /// keyspace ごとに Entry を書き込む。
     /// batches は (keyspace, Entry 配列) の列。
     /// Entry の SeqNo は TransactionManager が採番した値をそのまま使う。

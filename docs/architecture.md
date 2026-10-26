@@ -717,8 +717,9 @@ COMMIT
 Buffers は概算バイト数を管理し、既定 256MiB を超えると DML の行追加時点
 （または commit 時の最終検査）で `CapacityError` を返す。
 巨大 transaction が WAL やメモリを無制限に消費しないための上限。
-DDL のうち `DROP` は一括処理が必要なため上限を外している。
-`CREATE INDEX` の backfill は 8192行ずつのチャンクに分けて commit する。
+DDL 自体は transaction 上限を外すが、`CREATE INDEX` の backfill と
+`DROP TABLE` / `DROP INDEX` の後始末は 8192行ずつのチャンクに分けて commit する。
+`CREATE TABLE` は作成前に同名の table / 暗黙索引 keyspace を空にする。
 複数行 `UPDATE` は最終状態検査のため対象行をメモリに集めるが、
 旧行 + 新行の概算が上限を超えた時点で `CapacityError` にする。
 
