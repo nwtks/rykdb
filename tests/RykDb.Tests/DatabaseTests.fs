@@ -600,6 +600,26 @@ let ``Database: UNIQUE 列の UPDATE でも NULL は重複扱いしない`` () =
         Assert.Equal<int64>(2L, asInt count.Rows.[0].[0]))
 
 [<Fact>]
+let ``Database: UPDATE で UNIQUE 値を交換できる`` () =
+    withDb "unique-update-swap" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
+
+        // 更新対象外の行との衝突は即時エラー
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "更新対象外の UNIQUE 値との衝突を許してはいけない"
+            (db2.Execute "UPDATE t SET email = 'b' WHERE id = 1")
+
+        // 同一文内で入れ替える更新は最終状態が一意なので成功する
+        let db3 = exec db2 "UPDATE t SET email = CASE WHEN id = 1 THEN 'b' ELSE 'a' END"
+        let _, rows = ok (db3.Query "SELECT id, email FROM t ORDER BY id")
+        Assert.Equal<int64>(1L, asInt rows.Rows.[0].[0])
+        Assert.Equal<string>("b", asText rows.Rows.[0].[1])
+        Assert.Equal<int64>(2L, asInt rows.Rows.[1].[0])
+        Assert.Equal<string>("a", asText rows.Rows.[1].[1]))
+
+[<Fact>]
 let ``Database: UNIQUE 索引の backfill は複数の NULL を許す`` () =
     withDb "unique-null-backfill" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"

@@ -679,8 +679,9 @@ INSERT INTO テーブル [ (列 [, 列 …]) ] VALUES (式 [, 式 …]) [, (式 
 `UNIQUE` 制約・`UNIQUE` 索引は重複を検査する。
 ただし `NULL` は「値なし」なので重複とみなさない。
 複合 `UNIQUE` では、対象列のどれか1つでも `NULL` なら検査をスキップする。
-複数行 `UPDATE` の検査は行ごと即時なので、
-同一文内で一意値を交換するような更新は `ConstraintViolation` になる。
+複数行 `UPDATE` は文全体の最終状態で検査する。
+そのため、同一文内で一意値を交換する更新も成功する
+（更新対象外の行との衝突は `ConstraintViolation`）。
 
 ```sql
 INSERT INTO people VALUES (1, 'alice2', 30, 1, 1.0);  -- id=1 が既に存在するのでエラー

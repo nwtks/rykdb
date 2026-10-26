@@ -287,40 +287,87 @@ module internal DmlOps =
             gatherWith (Eval.eval targetSchema row) schema (List.map snd assignments) targets
             |> Result.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
 
-        let rec checkUniqueUpdate
-            (txnAcc: Transaction)
-            (newRow: SqlValue array)
-            (newPk: SqlValue array)
-            (indexes: IndexSchema list)
-            =
-            match indexes with
-            | [] -> ret ()
-            | idx :: rest ->
-                match idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all with
-                | Error e -> Error e
-                | Ok positions ->
-                    let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
-
-                    if values |> Array.exists SqlValue.isNull then
-                        checkUniqueUpdate txnAcc newRow newPk rest
-                    else
-                        match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txnAcc values 1 with
-                        | Error e -> Error e
-                        | Ok scan ->
-                            match Op.toArray scan with
-                            | Error e -> Error e
-                            | Ok rows ->
-                                if
-                                    rows
-                                    |> Array.exists (fun r ->
-                                        let existingPk = TableSchema.primaryKeyOf schema r
-                                        not (Array.forall2 (=) existingPk newPk))
-                                then
-                                    err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                                else
-                                    checkUniqueUpdate txnAcc newRow newPk rest
-
         let targetSchema = targetSchemaOf schema
+
+        let collectUpdates (txn: Transaction) (targets: int list) =
+            let rec go (cur: Op) acc =
+                match Op.next cur with
+                | Error e -> Error e
+                | Ok None -> Ok(List.rev acc)
+                | Ok(Some(row, next)) ->
+                    match matchesWhere targetSchema where row with
+                    | Error e -> Error e
+                    | Ok false -> go next acc
+                    | Ok true ->
+                        match assign targetSchema targets row with
+                        | Error e -> Error e
+                        | Ok newRow -> go next ((row, newRow) :: acc)
+
+            result {
+                let! scan = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn 0
+                return! go scan []
+            }
+
+        let validateUniqueUpdates (txn: Transaction) (updates: (SqlValue array * SqlValue array) list) =
+            let updatedPks =
+                updates
+                |> List.map (fun (_, newRow) -> TableSchema.primaryKeyOf schema newRow)
+                |> Set.ofList
+
+            let checkIndex (idx: IndexSchema) =
+                result {
+                    let! positions = idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
+
+                    let! _ =
+                        updates
+                        |> foldOk
+                            (fun seen (_, newRow) ->
+                                let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
+
+                                if values |> Array.exists SqlValue.isNull then
+                                    ret seen
+                                else
+                                    let key = KeyBuilder.ofValues values
+
+                                    if Set.contains key seen then
+                                        err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                                    else
+                                        result {
+                                            let! scan =
+                                                Dml.scanByIndexPrefixWithTxn
+                                                    ctx.Store
+                                                    schema
+                                                    idx
+                                                    ctx.Visible
+                                                    txn
+                                                    values
+                                                    0
+
+                                            let! rows = Op.toArray scan
+
+                                            if
+                                                rows
+                                                |> Array.exists (fun row ->
+                                                    let existingPk = TableSchema.primaryKeyOf schema row
+                                                    not (Set.contains existingPk updatedPks))
+                                            then
+                                                return!
+                                                    err (
+                                                        DbError.constraintViolation (
+                                                            sprintf "UNIQUE 制約に違反: %s" idx.Name
+                                                        )
+                                                    )
+                                            else
+                                                return Set.add key seen
+                                        })
+                            Set.empty
+
+                    return ()
+                }
+
+            schema.Indexes
+            |> List.filter _.Unique
+            |> foldOk (fun () idx -> checkIndex idx) ()
 
         match assignments |> List.map fst |> SqlName.duplicate with
         | Some name -> err (DbError.name (sprintf "UPDATE の列 %s が重複しています" name))
@@ -329,14 +376,16 @@ module internal DmlOps =
             |> List.map (fun (name, _) -> TableSchema.requireIndexOf schema name)
             |> all
             >>= fun targets ->
-                foldRows txn ctx schema (matchesWhere targetSchema where) (fun txnAcc count row ->
-                    result {
-                        let! newRow = assign targetSchema targets row
-                        let newPk = TableSchema.primaryKeyOf schema newRow
-                        do! checkUniqueUpdate txnAcc newRow newPk (schema.Indexes |> List.filter _.Unique)
-                        let! t = Dml.updateRow schema txnAcc row newRow
-                        return t, count + 1
-                    })
+                result {
+                    let! updates = collectUpdates txn targets
+                    do! validateUniqueUpdates txn updates
+
+                    let! txn2 =
+                        updates
+                        |> foldOk (fun current (oldRow, newRow) -> Dml.updateRow schema current oldRow newRow) txn
+
+                    return txn2, List.length updates
+                }
 
     /// DELETE。
     /// WHERE に合う行を主キー + 全索引に tombstone で消す。
