@@ -707,7 +707,13 @@ replay 中は 0（全版を残す）を使う。
 
 登録は `Database.Begin()`（および `Execute` の暗黙・明示 transaction）で行い、
 commit 成功・rollback・`Close` で解除する。
-登録し忘れ・解除し忘れは「版を余分に残す」側に倒れるので、データを失う方向には働かない。
+1つの登録は同じ transaction の state を持つ**複数のハンドルで共有**される
+（`tx.Execute` のたびに新しいハンドルが返るため）。
+そこで登録はハンドルの生存トークンを数え（`ActiveRegistration`）、
+`Database` がフィールドで持つ `RegistrationLease` が **最後の 1本の GC で自動的に解除**する。
+これにより、commit / rollback / Close されずに捨てられたハンドルでも、
+参照が切れて GC されれば DDL が `ConflictError` のまま止まらない。
+参照が残っている間は「版を余分に残す」側に倒れるので、データを失う方向には働かない。
 トークンは `obj()` の参照等価（Core は `mutable` / `ref` を 0件に保つ規約のため、連番カウンタを使わない）。
 同じ DB を相対パスと絶対パスで開いても同じ束に入るよう `Path.GetFullPath` で正規化する。
 複数プロセスからの同時アクセスは非対応（§12.2）なので、プロセス内の表で十分。
@@ -777,8 +783,10 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 ゲートは root（正規化した絶対パス）単位の `ReaderWriterLockSlim` で、
 同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
 ロックはプロセス内の表に残る（開いた DB の数だけ。数はふつう小さい）。
-**トランザクションを commit / rollback せずに捨てると、その登録が残り DDL が失敗し続ける**ので、
-`Rollback()` か `Close()` で必ず終わらせる。
+**トランザクションを commit / rollback せずに捨てても、ハンドルへの参照が切れて GC されれば登録は外れる**
+（`RegistrationLease` の finalizer。§7.5）。
+ただし GC の時期は不定なので、`Rollback()` / `Close()`（または `use` による `Dispose()`）で確実に終わらせること。
+ハンドルへの参照が残っている間は、その root の DDL は `ConflictError` のまま。
 
 ### 7.9 プロセス間の排他（`.rykdb.lock`）
 
@@ -1115,10 +1123,13 @@ Database.openWith root
 
 ### 9.4 閉じるとき
 
-`Database.Close()` は **全 keyspace の `StorageEngine.close`** を行い、memtable を flush してから WAL を削除する。
+`Database.Close()` は **全 keyspace の `StorageEngine.close`** を行い、
+memtable を flush してから WAL を削除する。
 これを省くと再起動時にデータが読めない。
 不変ハンドルには「閉じた」状態を記録しないため、Close 後のハンドルは破棄する
 （同じハンドルで `Execute` すると WAL が再作成される。二重 Close は安全）。
+`Database` は `IDisposable` なので、`use db = ...` / `Dispose()` でも Close できる
+（§7.5 の登録解除も同じ経路）。
 
 ---
 
@@ -1265,6 +1276,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **DDL はプロセス内で排他**（`RootGate`）。
   `CREATE INDEX` の backfill 中は他の文が待つ。
   同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。
+  登録はハンドルが GC されると外れるが、参照が残っている間は `ConflictError` のまま。
 - **同じ root はプロセス内で 1つしか開けない**（§7.9）。2 回目の `Database.openWith` は `IoError`。
   別プロセスが開いていても `IoError`。
   クラッシュ再現テストだけが `Database.openWithTakingOver` で例外を使う。
@@ -1281,6 +1293,9 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **ActiveSnapshot はプロセス内の全ハンドル分を集約する**（`ActiveSnapshotRegistry`）。
   別ハンドルの長い transaction も GC 境界に反映される。
   他プロセスはそもそも開けない（§7.9）ので、見えない transaction は存在しない。
+- **ActiveSnapshot の登録はハンドル単位のリースで解放する**（`RegistrationLease`）。
+  commit / rollback / `Close()` / `Dispose()` で即時に外れ、未処理のまま捨てても
+  最後のハンドルの GC で外れる（DDL が永久に `ConflictError` にならない）。
 - **keyspace 横断 commit は intent で回復するが、全 WAL 書込後・intent 削除前の crash ではcommit の成否が一意に決まらない**
   （replay では適用済みになる）。
   物理重複は `filterApplied` で防ぐ。

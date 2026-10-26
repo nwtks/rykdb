@@ -1526,6 +1526,65 @@ let ``Database: active transaction は snapshot registry に登録され、commi
         ok (openTx.Close())
         Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone))
 
+/// transaction を開始してハンドルを捨てる（呼び出し側は戻り値しか持たない）。
+/// `NoInlining` は Debug ビルドのローカルがメソッド末尾まで生き残るのを避けるため。
+/// 戻り値は「開始直後は確かに登録されていた」こと。
+[<System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)>]
+let private abandonTransaction (db: Database) =
+    let tx = ok (db.Begin())
+    let registered = (ActiveSnapshotRegistry.oldestExcept None db.Root).IsSome
+    // tx はここを抜けると到達不能になる（finalizer が登録を外せる）。
+    registered && tx.InTransaction
+
+/// finalizer を確実に走らせる。
+let private collectGarbage () =
+    System.GC.Collect()
+    System.GC.WaitForPendingFinalizers()
+    System.GC.Collect()
+
+[<Fact>]
+let ``Database: commit せずに捨てた transaction も GC されれば登録が外れる`` () =
+    withDir "reg-abandon" (fun dir ->
+        let db = ok (Database.openWith dir)
+        let withTable = exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        Assert.True(abandonTransaction withTable)
+
+        collectGarbage ()
+        // 最後のハンドルが消えたので登録が外れる（修正前はここに残り続けた）。
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None withTable.Root).IsNone)
+
+        // 登録が残っていると ConflictError になる DDL が通る。
+        let indexed = exec withTable "CREATE INDEX ix_v ON t (v)"
+        let inserted = exec indexed "INSERT INTO t VALUES (1, 10)"
+        let _, found = ok (inserted.Query "SELECT id FROM t WHERE v = 10")
+        Assert.Equal<int>(1, found.Rows.Length)
+
+        ok (inserted.Close()))
+
+[<Fact>]
+let ``Database: 生きている transaction は GC されても登録が残る`` () =
+    withDir "reg-live-gc" (fun dir ->
+        let db = ok (Database.openWith dir)
+        let tx = ok (db.Begin())
+
+        // tx はこのあと Rollback で使うので GC されない（finalizer は走らない）。
+        collectGarbage ()
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None db.Root).IsSome)
+
+        let rolled = ok (tx.Rollback())
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None db.Root).IsNone)
+        ok (rolled.Close()))
+
+[<Fact>]
+let ``Database: Dispose でも transaction の登録が外れる`` () =
+    withDir "reg-dispose" (fun dir ->
+        let db = ok (Database.openWith dir)
+        let tx = ok (db.Begin())
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None db.Root).IsSome)
+
+        (tx :> System.IDisposable).Dispose()
+        Assert.True((ActiveSnapshotRegistry.oldestExcept None db.Root).IsNone))
+
 [<Fact>]
 let ``Database: 別プロセスが開いている DB は開けない`` () =
     withDir "proc-lock" (fun dir ->
@@ -1561,7 +1620,6 @@ let ``Database: 同じ root を二度開くと同じプロセスのエラーに�
 
         let db1 = ok (Database.openWith dir)
         Assert.False(canLockExternally ())
-
         // 同じ root を二度開くと、memtable が分かれて古い行を読むので拒否する。
         expectErrorKind ErrorKind.IoError "同じ root の二重オープン" (Database.openWith dir)
 
@@ -1575,10 +1633,9 @@ let ``Database: 同じ root を二度開くと同じプロセスのエラーに�
 [<Fact>]
 let ``Database: 明示 transaction があるハンドルは Close でロックを外す`` () =
     withDir "proc-lock-txn" (fun dir ->
-        let lockPath = System.IO.Path.Combine(dir, ".rykdb.lock")
+        let _ = System.IO.Path.Combine(dir, ".rykdb.lock")
         let db = ok (Database.openWith dir)
         let tx = ok (db.Begin())
-
         // 進行中 transaction を持つハンドル（元の db ではない方）を閉じてもロックは外れる。
         ok (tx.Close())
         ok (Database.openWith dir) |> fun d -> ok (d.Close()))

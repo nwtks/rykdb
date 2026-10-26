@@ -1172,9 +1172,13 @@ DDL だけはプロセス内で排他にする必要がある。
 - 同じスレッドで「共有 → 排他」の昇格はできない。
   そのため `Database.Execute` は **DDL 文だけ共有ロックを取らない**（`Ddl` 側が排他を取る）。
 - 結果: トランザクションを `Rollback` / `Commit` せずに捨てると、その登録が残り、
-  **その root の DDL が失敗し続ける**。
-  `Close()` でも解除される。
-- 回帰テスト: `Database: 実行中の transaction があると DDL は ConflictError`。
+  **その root の DDL は `ConflictError` になる**。
+  `Close()` / `Dispose()` で解除され、ハンドルへの参照が切れて GC されても外れる
+  （`RegistrationLease`。§7.5）。GC の時期は不定なので、明示的に終わらせるのが基本。
+- 回帰テスト: `Database: 実行中の transaction があると DDL は ConflictError` /
+  `Database: commit せずに捨てた transaction も GC されれば登録が外れる` /
+  `Database: 生きている transaction は GC されても登録が残る` /
+  `Database: Dispose でも transaction の登録が外れる`。
 
 ### 11.16b 二重オープンは「ロック + 台帳」で防ぐ
 

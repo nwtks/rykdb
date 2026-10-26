@@ -44,10 +44,11 @@ type internal DbState =
         Manager: TransactionManager
         Active: Transaction option
         Pending: Transaction option
-        /// 進行中 transaction の ActiveSnapshot 登録（解除に使うトークン）。
+        /// 進行中 transaction の ActiveSnapshot 登録。
         /// 他のハンドルの compaction が、この snapshot より新しい版だけを残して
         /// 古い版を捨ててしまわないようにするために登録する。
-        ActiveRegistration: obj option
+        /// 同じ transaction の state は複数のハンドルが共有できる（登録側で生存を数える）。
+        ActiveRegistration: ActiveRegistration option
     }
 
 /// Transaction を commit して DbState に反映する共通処理。
@@ -61,7 +62,7 @@ module internal DbStateOps =
     /// 書き込みは `RootGate` の共有ロックを取り、DDL の排他と交差しないようにする。
     let commitToStore
         (root: string)
-        (registration: obj option)
+        (registration: ActiveRegistration option)
         (store: RowStore)
         (mgr: TransactionManager)
         (txn: Transaction)

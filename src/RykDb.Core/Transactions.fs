@@ -267,6 +267,37 @@ module internal RootKey =
             | Ok full -> full
             | Error _ -> root
 
+/// 進行中 transaction の snapshot 登録 1件。
+/// <remarks>
+/// 1つの transaction の state を持つ `Database` ハンドルは複数できる
+/// （`let tx = db.Begin()` のあと、`tx.Execute` のたびに新しいハンドルが返る）。
+/// どれか 1本でも生きている間は snapshot を残す必要があるので、
+/// ハンドルの生存トークンを数え、最後の 1本が GC されたら登録を外す。
+/// これが無いと、commit / rollback / Close されずに捨てられたハンドルの登録が残り、
+/// 同じ root の DDL が永久に `ConflictError` になる（architecture §7.8）。
+/// トークンは `obj()` の参照等価。
+/// Core は `mutable` / `ref` を 0件に保つ規約なので、
+/// 連番カウンタではなく参照等価のオブジェクトを鍵にする。
+/// </remarks>
+type internal ActiveRegistration internal (root: string, snapshot: uint64) =
+    /// 生存しているハンドルのトークン。
+    let handles = System.Collections.Concurrent.ConcurrentDictionary<obj, byte>()
+
+    /// 正規化済みの root。
+    member _.Root = root
+
+    /// ハンドルの生存を登録し、解除に使うトークンを返す。
+    member _.Attach() =
+        let token = obj ()
+        handles.[token] <- 0uy
+        token
+
+    /// ハンドルの解除。
+    /// 戻り値は「これが最後の 1本だった」かどうか。
+    member _.Detach(token: obj) =
+        handles.TryRemove token |> ignore
+        handles.IsEmpty
+
 /// プロセス内で開いている全ハンドルの active transaction の snapshot を集約する。
 /// <remarks>
 /// GC の境界は「最古の active snapshot」なので、
@@ -275,55 +306,53 @@ module internal RootKey =
 /// （`TransactionManager` はハンドル単位のため分からない）。
 /// 複数プロセスからの同時アクセスは非対応（architecture §12.2）なので、プロセス内の表で十分。
 /// 永続化もしない（再オープン後の transaction は存在しない）。
-/// トークンは `obj()` の参照等価。
-/// Core は `mutable` / `ref` を 0件に保つ規約なので、
-/// 連番カウンタではなく参照等価のオブジェクトを鍵にする。
 /// </remarks>
 module internal ActiveSnapshotRegistry =
-    /// 正規化した root -> (登録トークン -> snapshot)。
+    /// 正規化した root -> (登録 -> snapshot)。
     let private byRoot =
         System.Collections.Concurrent.ConcurrentDictionary<
             string,
-            System.Collections.Concurrent.ConcurrentDictionary<obj, uint64>
+            System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>
          >
             System.StringComparer.Ordinal
 
     let private bucket (root: string) =
         byRoot.GetOrAdd(
             RootKey.normalize root,
-            fun _ -> System.Collections.Concurrent.ConcurrentDictionary<obj, uint64>()
+            fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>()
         )
 
-    /// snapshot を登録し、解除に使うトークンを返す。
+    /// snapshot を登録し、解除に使う登録を返す。
     let register (root: string) (snapshot: uint64) =
-        let token = obj ()
-        (bucket root).[token] <- snapshot
-        token
+        let key = RootKey.normalize root
+        let registration = ActiveRegistration(key, snapshot)
+        (bucket key).[registration] <- snapshot
+        registration
 
-    /// 登録を解除する（commit 成功・rollback・Close）。
+    /// 登録を解除する（commit 成功・rollback・Close・最後のハンドルの GC）。
     /// 解除し忘れても「版を余分に残す」側にしか倒れない（安全側）。
-    let unregister (root: string) (token: obj) =
+    let unregister (root: string) (registration: ActiveRegistration) =
         let key = RootKey.normalize root
 
         match byRoot.TryGetValue key with
         | true, inner ->
-            inner.TryRemove token |> ignore
+            inner.TryRemove registration |> ignore
 
             if inner.IsEmpty then
                 byRoot.TryRemove key |> ignore
         | _ -> ()
 
     /// その root で active な snapshot の最小値。
-    /// token に自分の登録を渡すと、これから commit する transaction 自身を除外できる。
-    let oldestExcept (token: obj option) (root: string) =
+    /// registration に自分の登録を渡すと、これから commit する transaction 自身を除外できる。
+    let oldestExcept (self: ActiveRegistration option) (root: string) =
         match byRoot.TryGetValue(RootKey.normalize root) with
         | true, inner ->
             inner
             |> Seq.fold
                 (fun acc pair ->
                     let isSelf =
-                        match token with
-                        | Some t -> System.Object.ReferenceEquals(t, pair.Key)
+                        match self with
+                        | Some registration -> System.Object.ReferenceEquals(registration, pair.Key)
                         | None -> false
 
                     if isSelf then
@@ -335,14 +364,36 @@ module internal ActiveSnapshotRegistry =
                 None
         | _ -> None
 
+/// `Database` ハンドルの生存に結び付いた登録リース。
+/// <remarks>
+/// ハンドルが commit / rollback / Close されずに捨てられても、
+/// GC された時点で（その登録のハンドルが最後の 1本なら）登録を外す。
+/// finalizer が走るのは「そのハンドルがもう使えない」状態なので、
+/// まだ commit できる transaction を誤って解放することはない。
+/// 明示的に終わらせた場合は登録が先に外れているので何もしない（解除は冪等）。
+/// </remarks>
+type internal RegistrationLease(registration: ActiveRegistration) =
+    /// このハンドルの生存トークン。
+    let token = registration.Attach()
+
+    /// このハンドルの登録を外す。
+    /// 最後の 1本なら registry からも消える。二重呼び出しは無害。
+    member _.Release() =
+        if registration.Detach token then
+            ActiveSnapshotRegistry.unregister registration.Root registration
+
+    override this.Finalize() =
+        // finalizer から例外を漏らさない（.NET ではプロセス終了になる）。
+        protect (fun () -> this.Release()) |> ignore
+
 /// 進行中の書き込みと DDL を同じ root 単位で直列化する。
 /// <remarks>
 /// `CREATE INDEX` の backfill は「テーブルを走査して索引エントリを書く」ので、
 /// 途中で別の書き込みが入ると索引に載らない行ができる。
 /// - **DDL**（CREATE INDEX / DROP INDEX / DROP TABLE / CREATE TABLE）は排他ロックを取る。
 /// - **文の実行と commit** は共有ロックを取り、DDL の実行中は待つ。
-/// 明示 transaction はロックを保持しない（DDL と重なった場合は
-/// commit 時にカタログ版の不一致を検出して ConflictError にする。architecture §12.2）。
+/// 明示 transaction はロックを保持しない
+/// （DDL と重なった場合は commit 時にカタログ版の不一致を検出して ConflictError にする。）。
 /// 同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
 /// </remarks>
 module internal RootGate =

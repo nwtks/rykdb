@@ -22,6 +22,14 @@ namespace RykDb.Core
 /// これにより「複数の接続が同じ DB を触る」状況を型で表現できる。
 /// </remarks>
 type Database internal (root: string, state: DbState) =
+    /// このハンドルの生存に紐づく ActiveSnapshot 登録のリース。
+    /// ハンドルが commit / rollback / Close されずに捨てられても、
+    /// 最後の 1本が GC された時点で登録が外れるよう保持しておく
+    /// （放棄された transaction で DDL が永久に ConflictError にならないようにする）。
+    let lease =
+        state.ActiveRegistration
+        |> Option.map (fun registration -> RegistrationLease registration)
+
     /// DB のルートディレクトリ。
     member _.Root = root
 
@@ -32,13 +40,14 @@ type Database internal (root: string, state: DbState) =
     /// 二重 Close は安全（2 回目は何もしない）。
     /// 進行中の transaction は ActiveSnapshot の登録から外す
     /// （閉じたハンドルの transaction はもう読めないため、版を残す理由が無い）。
+    /// Close し忘れても、登録は最後のハンドルが GC された時点で外れる（`RegistrationLease`）。
     /// </remarks>
     member _.Close() =
-        match state.ActiveRegistration with
-        | Some token -> ActiveSnapshotRegistry.unregister root token
-        | None -> ()
-
+        lease |> Option.iter (fun l -> l.Release())
         RowStore.close state.Store
+
+    interface System.IDisposable with
+        member this.Dispose() = this.Close() |> ignore
 
     /// トランザクションを始める。
     /// 明示的な BEGIN。
@@ -64,7 +73,7 @@ type Database internal (root: string, state: DbState) =
                             ActiveRegistration = Some registration
                         }
 
-                    Ok(Database(root, nextState)))
+                    Ok(new Database(root, nextState)))
 
     /// 実行中の transaction があるか。
     member _.InTransaction = state.Active.IsSome
@@ -90,7 +99,7 @@ type Database internal (root: string, state: DbState) =
                 | Some token -> ActiveSnapshotRegistry.unregister root token
                 | None -> ()
 
-                Database(root, nextState))
+                new Database(root, nextState))
 
     /// ROLLBACK。
     /// バッファを捨てる。
@@ -112,7 +121,7 @@ type Database internal (root: string, state: DbState) =
                     ActiveRegistration = None
                 }
 
-            Ok(Database(root, nextState))
+            Ok(new Database(root, nextState))
 
     /// 単一文または複数文を実行する。
     /// <remarks>
@@ -283,7 +292,7 @@ type Database internal (root: string, state: DbState) =
                         Rows = [||]
                     }
 
-            return Database(root, finalState), summary
+            return new Database(root, finalState), summary
         }
 
     /// SELECT 専用の実行。
@@ -326,7 +335,7 @@ type Database internal (root: string, state: DbState) =
                 }
 
             return
-                Database(
+                new Database(
                     root,
                     {
                         Root = root
