@@ -1189,9 +1189,9 @@ DDL を transaction に載せる設計に変えるまでは、この制約を維
 
 逆順（カタログ → backfill）だと backfill の失敗で「索引はあるが中身が無い」状態が永続化され、
 再オープン後も索引検索が行を取りこぼす。
-`Ddl.createIndex` は既存の索引エントリへ tombstone を書いてから backfill し、成功後にカタログへ登録する
-（tombstone と現在行の put は同じ transaction に積む）。
-途中で失敗しても、次回の `CREATE INDEX` が残骸を消してからやり直す。
+`Ddl.createIndex` は既存の索引エントリをチャンク単位で tombstone 消去してから、
+現在行を 8192行ずつ backfill し、成功後にカタログへ登録する。
+途中で失敗しても索引はカタログに載っておらず、次回の `CREATE INDEX` が残骸を消してからやり直す。
 
 ### 11.16a DDL（CREATE INDEX など）は `RootGate` で排他にする
 

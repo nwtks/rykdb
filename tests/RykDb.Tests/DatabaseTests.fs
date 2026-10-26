@@ -489,6 +489,30 @@ let ``Database: UNIQUE 索引の backfill は重複値を拒否する`` () =
         Assert.Equal<int>(2, found.Rows.Length))
 
 [<Fact>]
+let ``Database: 大量行の CREATE INDEX はチャンクで backfill する`` () =
+    withDb "ddl-index-chunks" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+
+        let db2 =
+            [ 1..9 ]
+            |> List.fold
+                (fun db block ->
+                    let start = (block - 1) * 1000 + 1
+                    let end' = block * 1000
+
+                    let values =
+                        [ start..end' ]
+                        |> List.map (fun i -> sprintf "(%d, %d)" i (i % 10))
+                        |> String.concat ","
+
+                    exec db (sprintf "INSERT INTO t VALUES %s" values))
+                db1
+
+        let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
+        let _, count = ok (db3.Query "SELECT COUNT(*) FROM t WHERE a = 7")
+        Assert.Equal<int64>(900L, asInt count.Rows.[0].[0]))
+
+[<Fact>]
 let ``Database: CREATE INDEX は残った索引エントリを消してから backfill する`` () =
     withDir "create-index-stale" (fun dir ->
         // 前回の失敗などで索引 keyspace にだけ残った行を用意する。

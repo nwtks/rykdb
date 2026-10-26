@@ -492,10 +492,36 @@ module internal Ddl =
                                     ret (Set.add key seen))
                     (ret Set.empty)
 
+        let BackfillChunkRows = 8192
+
         let backfillIndex (state: DbState) (tableName: string) (idx: IndexSchema) =
             match Catalog.findTable state.Catalog tableName with
             | None -> ret state
             | Some defn ->
+                let applyChunks
+                    (current: DbState)
+                    (chunks: seq<'a>)
+                    (apply: Transaction -> 'a -> Result<Transaction, DbError>)
+                    =
+                    chunks
+                    |> foldOk
+                        (fun st chunk ->
+                            let mgr, txn = TransactionManager.beginTxnWithLimit System.Int64.MaxValue st.Manager
+
+                            result {
+                                let! txn2 = apply txn chunk
+
+                                let! store, mgr2 =
+                                    DbStateOps.commitToStore st.Root st.ActiveRegistration st.Store mgr txn2
+
+                                return
+                                    { st with
+                                        Store = store
+                                        Manager = mgr2
+                                    }
+                            })
+                        current
+
                 result {
                     let! schema = Catalog.toSchema defn
 
@@ -505,33 +531,24 @@ module internal Ddl =
                         }
 
                     let space = Keyspace.index idx.Name
-
-                    let mgr, txn =
-                        TransactionManager.beginTxnWithLimit System.Int64.MaxValue state.Manager
-
-                    let! rows = Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
                     let indexKeyFor row = RowKey.indexKey withIndex idx row
 
+                    let! cleared =
+                        RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
+                        |> Result.bind (fun stale ->
+                            applyChunks state (Seq.chunkBySize BackfillChunkRows stale) (fun txn chunk ->
+                                foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn chunk))
+
+                    let! rows = Dml.scanByPrimaryKey cleared.Store withIndex Snapshot.noLimit 0
+
                     if idx.Unique then
-                        let! _ = duplicateUniqueValues withIndex idx rows
+                        let! checkRows = Dml.scanByPrimaryKey cleared.Store withIndex Snapshot.noLimit 0
+                        let! _ = duplicateUniqueValues withIndex idx checkRows
                         ()
 
-                    let! stale = RowStore.scanAt state.Store space [||] Snapshot.noLimit 0
-
-                    let! cleared =
-                        foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn stale
-
-                    let! txn2 =
-                        foldOk (fun t row -> ret (Transaction.put t space (indexKeyFor row) row)) cleared rows
-
-                    let! store, mgr2 =
-                        DbStateOps.commitToStore state.Root state.ActiveRegistration state.Store mgr txn2
-
-                    return
-                        { state with
-                            Store = store
-                            Manager = mgr2
-                        }
+                    return!
+                        applyChunks cleared (Seq.chunkBySize BackfillChunkRows rows) (fun txn chunk ->
+                            foldOk (fun t row -> ret (Transaction.put t space (indexKeyFor row) row)) txn chunk)
                 }
 
         let createIndexCore (state: DbState) (ci: CreateIndex) =
