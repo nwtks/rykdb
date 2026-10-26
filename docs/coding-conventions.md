@@ -91,11 +91,14 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
   `tail.` が効かない環境（設定漏れ・JIT 非対応）でも暴走しないための保険。
 - **`result { }` 計算式はループする関数では使わない**。
   `Delay` でクロージャに閉じられるため末尾最適化が効かず、50万トークンで Lexer が `StackOverflow` した実測がある。
-- **左偏ヒープのマージ（`Sstable.mergeSorted` / `StorageEngine.scanAt`）は明示スタックで畳む**。
-  再帰の結果を `makeNode` / `heapNode` の引数にする形は非末尾になる。
+- **左偏ヒープのマージは明示スタックで畳む**（`SstMerge`、`Sstable.fs`）。
+  再帰の結果を `node` の引数にする形は非末尾になる。
   右スパインを `picked` リストへ積み、`List.fold` で組み直せば自己再帰が消える
   （左偏性により右スパインは log オーダーだが、深度保証に頼らず監査を通す）。
-  回帰テストは `SstableTests` の `多数のソースをまとめてマージできる` と `StorageEngineTests` の `多数のファイルをキー昇順にマージする`。
+  ヒープは `SstMerge` に集約し、`StorageEngine.scanAt` と `Compaction` のストリーミング merge が共有する。
+  回帰テストは `SstableTests` の `多数のソースをまとめてマージできる`、
+  `StorageEngineTests` の `多数のファイルをキー昇順にマージする`、
+  `CompactionTests` の `多数の入力ファイルをストリーミングでマージする`。
 - **`[<TailCall>]` は「その関数本体の自己再帰が全部末尾位置」のときだけ付ける**。
   1つでも外れると FS3569 になり、`TreatWarningsAsErrors` のせいでビルドエラーになる。
   構造上末尾にできないものは**付けない理由を呼び出しの直前にコメントで残す**:

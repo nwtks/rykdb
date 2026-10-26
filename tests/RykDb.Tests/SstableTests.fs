@@ -80,43 +80,50 @@ let ``SstEntry.splitInto: n 件ずつに分割`` () =
     Assert.Equal(2, chunks.[1].Length)
     Assert.Equal(1, chunks.[2].Length)
 
-[<Fact>]
-let ``SstEntry.splitIntoBytes: エントリ数ではなく概算バイトで分割`` () =
-    let text = String.replicate 1000 "x"
+/// 配列を遅延スキャンにする（SstMerge の入力）。
+let private scanOfArray (items: SstEntry array) =
+    let rec from (i: int) =
+        if i >= items.Length then
+            SstScan.empty
+        else
+            SstScan.emit items.[i] (fun () -> from (i + 1))
 
-    let items =
-        [| 1; 2; 3 |]
-        |> Array.map (fun i -> SstEntry.make (intKey i) (uint64 i) (Some [| SqlValue.Text text |]))
+    from 0
 
-    // 1件あたり約 1KB。目標 2.5KB なら 2 + 1 に分かれる。
-    let chunks = SstEntry.splitIntoBytes 2500L items
-    Assert.Equal(2, chunks.Length)
-    Assert.Equal(2, chunks.[0].Length)
-    Assert.Equal(1, chunks.[1].Length)
+/// マージを最後まで読む。
+let private drainMerge (merge: SstMerge) =
+    let rec loop (m: SstMerge) (acc: SstEntry list) =
+        match SstMerge.next m with
+        | Error e ->
+            Assert.Fail(sprintf "マージでエラー: %s" (DbError.toDisplayString e))
+            Unchecked.defaultof<SstEntry array>
+        | Ok None -> List.rev acc |> List.toArray
+        | Ok(Some(e, rest)) -> loop rest (e :: acc)
 
-    // 空入力は空。
-    Assert.Empty(SstEntry.splitIntoBytes 2500L [||])
-
-    // 1件だけで目標を超えても、空の塊を作らず 1件ずつ出す。
-    let big =
-        [|
-            SstEntry.make (intKey 1) 1UL (Some [| SqlValue.Text(String.replicate 5000 "y") |])
-        |]
-
-    Assert.Equal(1, (SstEntry.splitIntoBytes 100L big).Length)
+    loop merge []
 
 [<Fact>]
-let ``SstEntry.mergeSorted: ソート済みにマージ`` () =
+let ``SstMerge: ソート済みの列をまとめてマージできる`` () =
     let a = [| SstEntry.make (intKey 1) 1UL None; SstEntry.make (intKey 3) 1UL None |]
     let b = [| SstEntry.make (intKey 2) 1UL None; SstEntry.make (intKey 4) 1UL None |]
-    let merged = SstEntry.mergeSorted [ a; b ]
-    let keys = merged |> Array.map (fun e -> e.Key)
-    // キー昇順
-    for i in 1 .. keys.Length - 1 do
+    let merge = ok (SstMerge.ofScans [| scanOfArray a; scanOfArray b |])
+    let merged = drainMerge merge
+    Assert.Equal<byte array array>([| intKey 1; intKey 2; intKey 3; intKey 4 |], merged |> Array.map _.Key)
+
+    for i in 1 .. merged.Length - 1 do
         Assert.True(SstEntry.compare merged.[i - 1] merged.[i] <= 0)
 
 [<Fact>]
-let ``SstEntry.mergeSorted: 多数のソースをまとめてマージできる`` () =
+let ``SstMerge: 同一キーは SeqNo 降順で、版が欠けない`` () =
+    let a = [| SstEntry.make (intKey 1) 5UL None; SstEntry.make (intKey 1) 1UL None |]
+    let b = [| SstEntry.make (intKey 1) 3UL None |]
+    let merge = ok (SstMerge.ofScans [| scanOfArray a; scanOfArray b |])
+    let merged = drainMerge merge
+
+    Assert.Equal<uint64 list>([ 5UL; 3UL; 1UL ], merged |> Array.map _.SeqNo |> Array.toList)
+
+[<Fact>]
+let ``SstMerge: 多数のソースをまとめてマージできる`` () =
     // 左偏ヒープは右スパインを明示スタックで降りてから組み直す。
     // ソース数を増やし、再帰版と同じ順序・件数になることを固定する。
     let sources =
@@ -127,13 +134,21 @@ let ``SstEntry.mergeSorted: 多数のソースをまとめてマージできる`
                 SstEntry.make (intKey (i * 2 + 128)) 1UL None
             |])
 
-    let merged = SstEntry.mergeSorted sources
+    let merge = ok (SstMerge.ofScans (sources |> List.map scanOfArray |> List.toArray))
+    let merged = drainMerge merge
     let expected = [ 2..2..128 ] @ [ 130..2..256 ]
 
     Assert.Equal(expected.Length, merged.Length)
 
     expected
     |> List.iteri (fun i n -> Assert.True(intKey n = merged.[i].Key, sprintf "位置 %d が %d ではありません" i n))
+
+[<Fact>]
+let ``SstMerge: 空のスキャンは無視され、壊れたスキャンは Error`` () =
+    Assert.True((drainMerge (ok (SstMerge.ofScans [| SstScan.empty |]))).Length = 0)
+
+    let broken = SstScan(fun () -> err (DbError.corruption "壊れたブロック"))
+    expectErrorKind ErrorKind.CorruptionError "壊れたスキャンは Error" (SstMerge.ofScan 0 broken)
 
 [<Fact>]
 let ``SstEntry.maxSeqNo: 最大 SeqNo を返す`` () =

@@ -91,89 +91,6 @@ module internal SstEntry =
 
         e.Key.Length + valueTotal
 
-    /// 配列を「おおよそのバイト幅」で塊に分ける。
-    /// 1塊は必ず 1エントリ以上で、超過する塊は要素が概算バイトを超えない限り targetBytes 以下になる。
-    let splitIntoBytes (targetBytes: int64) (items: SstEntry array) =
-        let rec chunk i segStart segSize acc =
-            if i >= items.Length then
-                if i = segStart then
-                    List.rev acc
-                else
-                    List.rev (Array.sub items segStart (i - segStart) :: acc)
-            elif i > segStart && segSize + int64 (approximateBytes items.[i]) > targetBytes then
-                chunk i i 0L (Array.sub items segStart (i - segStart) :: acc)
-            else
-                chunk (i + 1) segStart (segSize + int64 (approximateBytes items.[i])) acc
-
-        chunk 0 0 0L []
-
-    /// 「キー昇順・同一キーは SeqNo 降順」で並んだ列たちを k-way merge する。
-    type private MergeHead =
-        {
-            Id: int
-            Items: SstEntry array
-            Index: int
-        }
-
-    type private MergeHeap =
-        | Empty
-        | Node of int * MergeHead * MergeHeap * MergeHeap
-
-    let mergeSorted (sources: SstEntry array list) =
-        let compareEntries (a: SstEntry) (b: SstEntry) =
-            match Bytes.compare a.Key b.Key with
-            | 0 -> Operators.compare b.SeqNo a.SeqNo
-            | order -> order
-
-        let compareHead (a: MergeHead) (b: MergeHead) =
-            match compareEntries a.Items.[a.Index] b.Items.[b.Index] with
-            | 0 -> Operators.compare a.Id b.Id
-            | c -> c
-
-        let rank =
-            function
-            | Empty -> 0
-            | Node(r, _, _, _) -> r
-
-        let makeNode head left right =
-            if rank left >= rank right then
-                Node(rank right + 1, head, left, right)
-            else
-                Node(rank left + 1, head, right, left)
-
-        let rec descend (picked: (MergeHead * MergeHeap) list) (a: MergeHeap) (b: MergeHeap) =
-            match a, b with
-            | Empty, heap
-            | heap, Empty -> picked, heap
-            | Node(_, ha, _, _), Node(_, hb, _, _) when compareHead ha hb > 0 -> descend picked b a
-            | Node(_, ha, left, right), _ -> descend ((ha, left) :: picked) right b
-
-        let mergeHeap (first: MergeHeap) (second: MergeHeap) =
-            let picked, rest = descend [] first second
-            List.fold (fun acc (head, left) -> makeNode head left acc) rest picked
-
-        let rec merge (acc: SstEntry list) =
-            function
-            | Empty -> List.rev acc |> Array.ofList
-            | Node(_, h, left, right) ->
-                let e = h.Items.[h.Index]
-                let advanced = { h with Index = h.Index + 1 }
-                let rest = mergeHeap left right
-
-                let nextHeap =
-                    if advanced.Index < advanced.Items.Length then
-                        mergeHeap rest (Node(1, advanced, Empty, Empty))
-                    else
-                        rest
-
-                merge (e :: acc) nextHeap
-
-        sources
-        |> List.mapi (fun i items -> { Id = i; Items = items; Index = 0 })
-        |> List.filter (fun head -> head.Items.Length > 0)
-        |> List.fold (fun heap head -> mergeHeap heap (Node(1, head, Empty, Empty))) Empty
-        |> merge []
-
     /// エントリ列に含まれる SeqNo の最大値（空なら 0）。
     let maxSeqNo (items: SstEntry seq) =
         items |> Seq.fold (fun acc e -> max acc e.SeqNo) 0UL
@@ -224,6 +141,129 @@ module internal SstScan =
             }
 
         pull scan
+
+/// k-way merge の 1ソース。
+/// 先頭を 1件読んだ状態を表す。
+type internal MergeHead =
+    {
+        /// ソースの識別子（完全に同じエントリが複数あるときの順序を安定させる）。
+        Source: int
+        Entry: SstEntry
+        Scan: SstScan
+    }
+
+/// 左偏木のノード。
+/// rank は右スパインの長さ。
+type internal MergeNode =
+    | MergeEmpty
+    | MergeNode of int * MergeHead * MergeNode * MergeNode
+
+/// 開いたソースの k-way merge。
+/// <remarks>
+/// 値として持ち回れる（1件読むたびに新しい `SstMerge` を返す）。
+/// ヒープは左偏木で、`descend` を明示スタックにして自己再帰を消す（coding-conventions §3）。
+/// 比較は `SstEntry.compare`（キー昇順・同一キーは SeqNo 降順）。
+/// 完全に同じエントリが複数ソースにある場合はソース順で安定させる。
+/// 壊れたブロックは「そのソースの次を読む」時点で Error になる。
+/// </remarks>
+type internal SstMerge = private SstMerge of MergeNode
+
+module internal SstMerge =
+    /// 空のマージ（すぐ終端）。
+    let empty = SstMerge MergeEmpty
+
+    let private rank =
+        function
+        | MergeEmpty -> 0
+        | MergeNode(r, _, _, _) -> r
+
+    let private node head left right =
+        if rank left >= rank right then
+            MergeNode(rank right + 1, head, left, right)
+        else
+            MergeNode(rank left + 1, head, right, left)
+
+    let private compareHead (a: MergeHead) (b: MergeHead) =
+        match SstEntry.compare a.Entry b.Entry with
+        | 0 -> compare a.Source b.Source
+        | order -> order
+
+    let private mergeHeaps (first: MergeNode) (second: MergeNode) =
+        let rec descend (picked: (MergeHead * MergeNode) list) (a: MergeNode) (b: MergeNode) =
+            match a, b with
+            | MergeEmpty, heap
+            | heap, MergeEmpty -> picked, heap
+            | MergeNode(_, ha, _, _), MergeNode(_, hb, _, _) when compareHead ha hb > 0 -> descend picked b a
+            | MergeNode(_, ha, left, right), _ -> descend ((ha, left) :: picked) right b
+
+        let picked, rest = descend [] first second
+        List.fold (fun acc (head, left) -> node head left acc) rest picked
+
+    /// 2つのマージをまとめる（どちらも使い切っていない状態）。
+    let union (SstMerge a) (SstMerge b) = SstMerge(mergeHeaps a b)
+
+    /// 先頭を 1件読んだソースを登録する。
+    let insert (source: int) (entry: SstEntry) (scan: SstScan) (SstMerge heap) =
+        let singleton =
+            MergeNode(
+                1,
+                {
+                    Source = source
+                    Entry = entry
+                    Scan = scan
+                },
+                MergeEmpty,
+                MergeEmpty
+            )
+
+        SstMerge(mergeHeaps heap singleton)
+
+    /// スキャンを登録する（先頭を 1件読む。空なら何もしない）。
+    let ofScan (source: int) (scan: SstScan) =
+        match SstScan.next scan with
+        | Error e -> Error e
+        | Ok None -> ret empty
+        | Ok(Some(entry, rest)) -> Ok(insert source entry rest empty)
+
+    /// 複数のスキャンをまとめて登録する。
+    let ofScans (scans: SstScan array) =
+        let rec add (i: int) (merge: SstMerge) =
+            if i >= scans.Length then
+                ret merge
+            else
+                match ofScan i scans.[i] with
+                | Error e -> Error e
+                | Ok more -> add (i + 1) (union merge more)
+
+        add 0 empty
+
+    /// 先頭のエントリ（取り出さない）。空なら None。
+    let top (SstMerge heap) =
+        match heap with
+        | MergeEmpty -> None
+        | MergeNode(_, head, _, _) -> Some head.Entry
+
+    /// 先頭を取り出し、そのソースを 1件進める。
+    /// 進めた先が壊れていれば Error（取り出したエントリは捨てる）。
+    let next (SstMerge heap) =
+        match heap with
+        | MergeEmpty -> ret None
+        | MergeNode(_, head, left, right) ->
+            match SstScan.next head.Scan with
+            | Error e -> Error e
+            | Ok None -> Ok(Some(head.Entry, SstMerge(mergeHeaps left right)))
+            | Ok(Some(entry, rest)) ->
+                let advanced =
+                    {
+                        Source = head.Source
+                        Entry = entry
+                        Scan = rest
+                    }
+
+                let restHeap =
+                    mergeHeaps left (mergeHeaps right (MergeNode(1, advanced, MergeEmpty, MergeEmpty)))
+
+                Ok(Some(head.Entry, SstMerge restHeap))
 
 /// 索引の 1要素。
 /// 各ブロックの位置と長さを張る。

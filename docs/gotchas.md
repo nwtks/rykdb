@@ -346,7 +346,7 @@ let files =
 //   ファイルを選ぶ枝刈り（Largest >= startKey）と、中身の下限は別物。
 //   → Sstable.rangeScan が index を二分探索してstartKey より前のブロックを読み飛ばし、
 //     Memtable.rangeScan は木を途中から降りる。
-let merged = SstEntry.mergeSorted (memSeq :: ordered) |> collapseDuplicates visible
+let merged = SstMerge.ofScans (memScan :: fileScans) |> collapseDuplicates visible
 // memtable も各ファイルも startKey 以降しか返さないので、merge 後の絞り込みは不要
 ```
 
@@ -1093,15 +1093,26 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 - 順序を逆にすると「カタログに無いのに keyspace は残る」状態で窓が空く。
   tombstone を先に確定させること。
 
-### 11.11 compaction の出力分割は「件数」ではなく「バイト」
+### 11.11 compaction の出力分割は「件数」ではなく「バイト」、かつキーの切れ目で切る
 
 `SstEntry.splitInto (MaxInputFiles * 4)` のように **ファイル数の上限をエントリ数として使う**と、
 値の大きさに関係なく 128エントリで分割され、大きい値では 1ファイルが肥大化する。
-出力は `CompactionOptions.OutputFileTargetBytes`（既定 4MiB）と `SstEntry.splitIntoBytes` で分ける。
-`splitIntoBytes` は概算バイト（`SstEntry.approximateBytes`）で切るので、厳密なファイルサイズではない。
-固定長の型の定数は `ValueCodec.fixedEncodedBytes` に集約し、memtable の `Entry.approxBytes` と共有する
-（TEXT / BLOB だけは、memtable が安価な UTF-16 長、SSTable が UTF-8 実バイト数と方針が違う）。
-1エントリが目標を超える場合は、空の塊を作らず 1エントリだけのファイルにする。
+出力は `CompactionOptions.OutputFileTargetBytes`（既定 4MiB）と `SstEntry.approximateBytes` の
+概算バイトで分ける（厳密なファイルサイズではない）。
+
+- **1キー分の版が複数ファイルに跨らない**ように、キーグループの切れ目で切り替える（`Compaction.pump`）。
+  1キー分が目標を超える場合は、そのキーだけで 1ファイルにする（空のファイルは作らない）。
+- 入力は `SstScan`（部分読みリーダー）+ `SstMerge` で 1件ずつ読み、
+  出力中の 1ファイル分だけをメモリに持つ。入力全体は実体化しない。
+- 固定長の型の定数は `ValueCodec.fixedEncodedBytes` に集約し、
+  memtable の `Entry.approxBytes` と共有する
+  （TEXT / BLOB だけは、memtable が安価な UTF-16 長、SSTable が UTF-8 実バイト数と方針が違う）。
+- 途中で読み取りエラーになると、書きかけの出力ファイルが残ることがある。
+  MANIFEST には載らないので、次回オープン時に孤児として `.orphans/` へ退避される（§11.13）。
+- 回帰テスト: `Compaction: 出力はエントリ数ではなく OutputFileTargetBytes ごとに分ける` /
+  `Compaction: 同じキーの版は出力ファイルを跨がない` /
+  `Compaction: 複数ブロックの入力をストリーミングで読み書きできる` /
+  `Compaction: 多数の入力ファイルをストリーミングでマージする`。
 
 ### 11.12 `LastCommitted` は commit のたびに active snapshot 以前を捨てる
 

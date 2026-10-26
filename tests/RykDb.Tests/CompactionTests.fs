@@ -17,11 +17,14 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
     |> FileMetaData.writeSstable dir num level 0.01
     |> ok
 
-/// 書いた SSTable を読み戻す（compact の readFile と同じ経路）。
-let private readBack (dir: string) (f: FileMetaData) =
+/// 書いた SSTable を開く（compact の openScan と同じ経路）。
+let private openBack (dir: string) (f: FileMetaData) =
     protect (fun () -> File.ReadAllBytes(FileMetaData.path dir f.FileNumber))
     >>= Sstable.openTable
-    >>= fun reader -> Sstable.rangeScan reader [||] 0 |> SstScan.toArray
+    >>= fun reader -> ret (Sstable.rangeScan reader [||] 0)
+
+/// 書いた SSTable を読み戻す（検証用）。
+let private readBack (dir: string) (f: FileMetaData) = openBack dir f >>= SstScan.toArray
 
 /// 閾値を全レベル 0 にして「最初の非空レベル」から compaction させる。
 let private pickFirstLevel =
@@ -31,7 +34,7 @@ let private pickFirstLevel =
 
 /// 1回 compact して結果だけ返す。
 let private compactAll (dir: string) (version: Version) (activeSnapshot: uint64) (options: CompactionOptions) =
-    ok (Compaction.compact dir version options activeSnapshot 100L (readBack dir))
+    ok (Compaction.compact dir version options activeSnapshot 100L (openBack dir))
 
 let private entryOf (i: int) =
     Entry.put (intKey i) (uint64 i) (intRow i)
@@ -282,7 +285,7 @@ let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
         let version = Version.addFile f Version.empty
         // 存在しないディレクトリを出力先にする → 書き込みが IoError で失敗する
         let missing = Path.Combine(dir, "missing")
-        let r = Compaction.compact missing version pickFirstLevel 0UL 100L (readBack dir)
+        let r = Compaction.compact missing version pickFirstLevel 0UL 100L (openBack dir)
         expectErrorKind ErrorKind.IoError "書き込み失敗は IoError になる" r
         // 入力ファイルは消さない（削除は呼び出し側の責務）
         Assert.True(File.Exists(FileMetaData.path dir 10L)))
@@ -320,3 +323,99 @@ let ``Compaction: 出力はエントリ数ではなく OutputFileTargetBytes ご
         let counts = result.Added |> List.sortBy _.FileNumber |> List.map _.EntryCount
 
         Assert.Equal<int64 list>([ 2L; 2L; 1L ], counts))
+
+[<Fact>]
+let ``Compaction: 同じキーの版は出力ファイルを跨がない`` () =
+    withDir "comp-key-boundary" (fun dir ->
+        let f =
+            mkSst
+                dir
+                10L
+                1
+                [
+                    Entry.put (intKey 1) 5UL (intRow 5)
+                    Entry.put (intKey 1) 3UL (intRow 3)
+                    Entry.put (intKey 1) 1UL (intRow 1)
+                    Entry.put (intKey 2) 2UL (intRow 2)
+                ]
+
+        let version = Version.addFile f Version.empty
+
+        // 目標 1 バイト → キーが変わるたびにファイルを切り替える。
+        let options =
+            { pickFirstLevel with
+                OutputFileTargetBytes = 1L
+            }
+
+        let result, _ = compactAll dir version 0UL options
+        Assert.Equal(2, result.Added.Length)
+
+        for out in result.Added do
+            let entries = ok (readBack dir out)
+            let keys = entries |> Array.map _.Key |> Array.distinct
+            Assert.Equal(1, keys.Length)
+
+        // GC なしなので 4 版すべてが残る（どのファイルにも欠けない）。
+        let all =
+            result.Added |> List.collect (fun out -> ok (readBack dir out) |> Array.toList)
+
+        Assert.Equal<int>(4, all.Length))
+
+[<Fact>]
+let ``Compaction: 複数ブロックの入力をストリーミングで読み書きできる`` () =
+    withDir "comp-blocks" (fun dir ->
+        // 1 ブロック 128 件なので 400 件は 4 ブロック（部分読みのバッチも跨ぐ）。
+        let entries =
+            [ 0..399 ]
+            |> List.map (fun i -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i))
+
+        let f = mkSst dir 10L 1 entries
+        let version = Version.addFile f Version.empty
+        let result, _ = compactAll dir version 0UL pickFirstLevel
+
+        let out = List.exactlyOne result.Added
+        Assert.Equal(400L, out.EntryCount)
+
+        let read = ok (readBack dir out)
+        Assert.Equal<int>(400, read.Length)
+        Assert.Equal<int>(400, read |> Array.map _.Key |> Array.distinct |> Array.length)
+
+        let ordered =
+            read
+            |> Array.pairwise
+            |> Array.forall (fun (a, b) -> Bytes.compare a.Key b.Key <= 0)
+
+        Assert.True(ordered, "出力がキー昇順ではありません"))
+
+[<Fact>]
+let ``Compaction: 多数の入力ファイルをストリーミングでマージする`` () =
+    withDir "comp-many-files" (fun dir ->
+        let perFile = 300
+
+        let files =
+            [ 0..3 ]
+            |> List.map (fun fi ->
+                let entries =
+                    [ 0 .. perFile - 1 ]
+                    |> List.map (fun i ->
+                        let n = fi * perFile + i
+                        Entry.put (intKey n) (uint64 (n + 1)) (intRow n))
+
+                mkSst dir (int64 (10 + fi)) 0 entries)
+
+        let version = files |> List.fold (fun v f -> Version.addFile f v) Version.empty
+        let result, _ = compactAll dir version 0UL CompactionOptions.defaults
+
+        // L0 が閾値（4）に達したので 1 回で L1 へ。
+        let out = List.exactlyOne result.Added
+        Assert.Equal(int64 (perFile * files.Length), out.EntryCount)
+
+        let read = ok (readBack dir out)
+        Assert.Equal(perFile * files.Length, read.Length)
+
+        let ordered =
+            read
+            |> Array.pairwise
+            |> Array.forall (fun (a, b) -> Bytes.compare a.Key b.Key <= 0)
+
+        Assert.True(ordered, "マージ結果がキー昇順ではありません"))
