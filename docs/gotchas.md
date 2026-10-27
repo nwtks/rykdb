@@ -1109,16 +1109,15 @@ keyspace のディレクトリ名は名前から決まる（`t:<name>` / `i:<nam
 特に「索引を DROP → 行を DELETE → 同名 CREATE INDEX」の順では、
 DELETE 時に索引 tombstone が書かれないため、backfill 後の索引検索で削除済みの行が復活する。
 
-- `DROP TABLE`: 先に `Catalog.removeTable` でテーブルを見えなくし、
-  その後でテーブルと全索引 keyspace を 8192エントリずつ tombstone 消去する。
-  途中でクラッシュしてもカタログにテーブルは無く、
-  次回の `CREATE TABLE` が同名の table / 暗黙索引 keyspace を空にしてから作り直す。
-- `DROP INDEX`: 先に `Catalog.removeIndex` で索引を見えなくし、
-  その後で索引 keyspace を 8192エントリずつ tombstone 消去する。
-  途中でクラッシュしてもカタログに索引は無く、
-  次回の `CREATE INDEX` が残骸を消してから作り直す。
-- カタログを先に外すので、後始末の途中でもユーザーには削除済みに見える。
-  残骸は同名の CREATE が必ず掃除する。
+- `DROP TABLE` / `DROP INDEX` は、カタログ削除の前に後始末対象 keyspace を
+  root の `.drop-cleanup` ジャーナルへ書く。
+- その後でカタログ定義を外し、keyspace を 8192エントリずつ tombstone 消去する。
+- 後始末が成功したらジャーナルを消す。
+  途中で失敗・クラッシュしても、次回 `Database.openWith` がジャーナルを読み、
+  カタログに存在しない keyspace だけを再消去する。
+- カタログに定義が残っている場合（カタログ削除前にクラッシュ）は、
+  DROP 未完了としてジャーナルを捨て、データは消さない。
+- 残骸は同名の `CREATE TABLE` / `CREATE INDEX` も掃除する。
 
 ### 11.11 compaction の出力分割は「件数」ではなく「バイト」、かつキーの切れ目で切る
 

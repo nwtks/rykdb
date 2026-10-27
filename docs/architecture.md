@@ -719,6 +719,8 @@ Buffers は概算バイト数を管理し、既定 256MiB を超えると DML �
 巨大 transaction が WAL やメモリを無制限に消費しないための上限。
 DDL 自体は transaction 上限を外すが、`CREATE INDEX` の backfill と
 `DROP TABLE` / `DROP INDEX` の後始末は 8192行ずつのチャンクに分けて commit する。
+DROP はカタログ削除前に `.drop-cleanup` ジャーナルを書き、後始末が終わったら消す。
+起動時にカタログへ存在しない keyspace だけをジャーナルから再消去する。
 `CREATE TABLE` は作成前に同名の table / 暗黙索引 keyspace を空にする。
 複数行 `UPDATE` は最終状態検査のため対象行をメモリに集めるが、
 旧行 + 新行の概算が上限を超えた時点で `CapacityError` にする。

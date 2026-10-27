@@ -845,10 +845,9 @@ DROP INDEX [IF EXISTS] 索引名;
 - `IF EXISTS` を付けると、存在しなくても**エラーにならない**。
 - `DROP TABLE` は先に定義を外してテーブルを見えなくし、
   その後でテーブルと全索引 keyspace の全エントリへ tombstone を 8192件ずつ書く。
-  途中で失敗しても、次回の `CREATE TABLE` が同名 keyspace を空にしてから作る。
-- `DROP INDEX` は先に定義を外して索引を見えなくし、
-  その後で索引 keyspace の全エントリへ tombstone を 8192件ずつ書く。
-  途中で失敗しても、次回の `CREATE INDEX` が残骸を消す。
+  後始末は `.drop-cleanup` ジャーナルに記録され、失敗時は次回 open 時に再開する。
+- `DROP INDEX` も同様に、定義を外した後の索引 keyspace 消去を
+  `.drop-cleanup` ジャーナル経由で再開できる。
 - `__unique_` で始まる暗黙の `UNIQUE` 索引は `DROP` できない（`ConstraintViolation`）。
   制約を消すにはテーブルを再作成する。
 

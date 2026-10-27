@@ -309,6 +309,15 @@ let ``Keyspace: toDirName / tryFromDirName の往復`` () =
     Assert.Equal(Some ks, Keyspace.tryFromDirName dir)
 
 [<Fact>]
+let ``DropCleanup: 未完了の後始末対象を追加・復元・消去できる`` () =
+    withDir "drop-cleanup-journal" (fun dir ->
+        ok (DropCleanup.write dir [ "t:a" ])
+        ok (DropCleanup.add dir [ "i:b"; "t:a" ])
+        Assert.Equal<string list>([ "t:a"; "i:b" ], ok (DropCleanup.pending dir))
+        ok (DropCleanup.clear dir)
+        Assert.Empty(ok (DropCleanup.pending dir)))
+
+[<Fact>]
 let ``RowStore.openStore: 新規 DB でも catalog エンジンを登録する`` () =
     withDir "rs-catalog-engine" (fun dir ->
         let store = ok (RowStore.openStore dir)

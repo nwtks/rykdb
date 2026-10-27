@@ -15,6 +15,36 @@
 
 namespace RykDb.Core
 
+/// 中断した DROP の keyspace 後始末を open 時に再開する。
+module internal DropCleanupRecovery =
+    let private shouldClean (catalog: Catalog) (space: string) =
+        if space.StartsWith("t:", System.StringComparison.Ordinal) then
+            Catalog.findTable catalog (space.Substring 2) |> Option.isNone
+        elif space.StartsWith("i:", System.StringComparison.Ordinal) then
+            Catalog.findIndex catalog (space.Substring 2) |> Option.isNone
+        else
+            false
+
+    let recover (store: RowStore) (catalog: Catalog) (mgr: TransactionManager) =
+        match DropCleanup.pending store.Root with
+        | Error e -> Error e
+        | Ok spaces ->
+            let rec clear (currentStore, currentMgr) (rest: string list) =
+                match rest with
+                | [] -> ret (currentStore, currentMgr)
+                | space :: tail ->
+                    match RowStore.clearKeyspaceChunks 0UL currentStore currentMgr space with
+                    | Error e -> Error e
+                    | Ok next -> clear next tail
+
+            let targets = spaces |> List.filter (shouldClean catalog)
+
+            match clear (store, mgr) targets with
+            | Error e -> Error e
+            | Ok ready ->
+                DropCleanup.clear store.Root |> ignore
+                ret ready
+
 /// DB のハンドル。
 /// <remarks>
 /// ハンドルは underlying state を不変に持つ。
@@ -327,30 +357,33 @@ type Database internal (root: string, state: DbState) =
             RowStore.close store |> ignore
             Error e
         | Ok catalog ->
-            let lastSeq = RowStore.lastSeqNo store
+            match DropCleanupRecovery.recover store catalog (TransactionManager.create ()) with
+            | Error e ->
+                RowStore.close store |> ignore
+                Error e
+            | Ok(store, manager0) ->
+                let lastSeq = RowStore.lastSeqNo store
 
-            let manager =
-                let fresh = TransactionManager.create ()
-
-                { fresh with
-                    LastCommitSeqNo = lastSeq
-                    NextSeqNo = lastSeq + 1UL
-                }
-
-            Ok(
-                new Database(
-                    root,
-                    {
-                        Root = root
-                        Store = store
-                        Catalog = catalog
-                        Manager = manager
-                        Active = None
-                        Pending = None
-                        ActiveRegistration = None
+                let manager =
+                    { manager0 with
+                        LastCommitSeqNo = lastSeq
+                        NextSeqNo = lastSeq + 1UL
                     }
+
+                Ok(
+                    new Database(
+                        root,
+                        {
+                            Root = root
+                            Store = store
+                            Catalog = catalog
+                            Manager = manager
+                            Active = None
+                            Pending = None
+                            ActiveRegistration = None
+                        }
+                    )
                 )
-            )
 
     /// エンジンの開き方を差し替えて DB を開く（テスト用）。
     static member internal openWithEngine (root: string) (openEngine: string -> Result<IStorageEngine, DbError>) =

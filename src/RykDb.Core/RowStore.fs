@@ -325,6 +325,84 @@ module internal Keyspace =
         else
             ret ()
 
+/// DROP 後の keyspace 後始末を再開するためのジャーナル。
+/// カタログ削除前にこれを書き、後始末が完了したら消す。
+/// 起動時にカタログに存在しない keyspace だけを掃除する。
+module internal DropCleanup =
+    [<Literal>]
+    let private fileName = ".drop-cleanup"
+
+    let private path (root: string) = System.IO.Path.Combine(root, fileName)
+
+    /// 未完了の後始末対象 keyspace を読む。
+    let pending (root: string) =
+        if System.String.IsNullOrEmpty root then
+            ret []
+        else
+            protect (fun () ->
+                let p = path root
+
+                if not (System.IO.File.Exists p) then
+                    []
+                else
+                    System.IO.File.ReadAllLines p
+                    |> Array.filter (fun line -> line.Trim() <> "")
+                    |> Array.map (fun line ->
+                        System.Convert.FromBase64String line |> System.Text.Encoding.UTF8.GetString)
+                    |> Array.toList)
+
+    /// 後始末対象を書く（カタログ削除より前）。
+    let write (root: string) (spaces: string list) =
+        if System.String.IsNullOrEmpty root then
+            ret ()
+        elif List.isEmpty spaces then
+            ret ()
+        else
+            protect (fun () ->
+                let p = path root
+                let tmp = p + ".tmp"
+
+                let text =
+                    spaces
+                    |> List.map (fun space -> System.Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes space))
+                    |> String.concat "\n"
+
+                let data = System.Text.Encoding.UTF8.GetBytes(text + "\n")
+
+                use fs =
+                    new System.IO.FileStream(
+                        tmp,
+                        System.IO.FileMode.Create,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.None
+                    )
+
+                fs.Write(data, 0, data.Length)
+                fs.Flush true
+                fs.Close()
+                System.IO.File.Move(tmp, p, true))
+
+    /// 既存の未完了対象を残したまま、新しい後始末対象を追加する。
+    let add (root: string) (spaces: string list) =
+        match pending root with
+        | Error e -> Error e
+        | Ok existing -> write root (List.distinct (existing @ spaces))
+
+    /// 後始末が完了したらジャーナルを消す。
+    let clear (root: string) =
+        if System.String.IsNullOrEmpty root then
+            ret ()
+        else
+            protect (fun () ->
+                let p = path root
+                let tmp = p + ".tmp"
+
+                if System.IO.File.Exists p then
+                    System.IO.File.Delete p
+
+                if System.IO.File.Exists tmp then
+                    System.IO.File.Delete tmp)
+
 /// keyspace を跨ぐ commit の意思決定ログ（追記型ジャーナル）。
 /// <remarks>
 /// 各 keyspace の WAL は独立しているため、途中でクラッシュすると
@@ -1033,6 +1111,33 @@ module internal RowStore =
     /// keyspace を走査する（制限なし）。
     let scan (store: RowStore) (keyspace: string) (startKey: byte array) (limit: int) =
         scanAt store keyspace startKey None limit
+
+    [<Literal>]
+    let private ClearChunkEntries = 8192
+
+    /// keyspace の全エントリをチャンク単位で tombstone 消去する。
+    /// 起動時の DROP 後始末にも使う。
+    let clearKeyspaceChunks (activeSnapshot: uint64) (store: RowStore) (mgr: TransactionManager) (space: string) =
+        if not (keyspaceExists store space) then
+            ret (store, mgr)
+        else
+            scanAt store space [||] Snapshot.noLimit 0
+            |> Result.bind (fun stale ->
+                stale
+                |> Seq.chunkBySize ClearChunkEntries
+                |> foldOk
+                    (fun (currentStore, currentMgr) chunk ->
+                        let mgr0, txn =
+                            TransactionManager.beginTxnWithLimit System.Int64.MaxValue currentMgr
+
+                        result {
+                            let! txn2 = foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn chunk
+
+                            let! mgr1, _, batches = TransactionManager.commit mgr0 txn2
+                            let! store1 = writeBatchesWithSnapshot activeSnapshot currentStore batches
+                            return store1, mgr1
+                        })
+                    (store, mgr))
 
     /// 全 keyspace の NextSeqNo の最大値 − 1（＝保存済みの SeqNo）。
     let lastSeqNo (store: RowStore) =

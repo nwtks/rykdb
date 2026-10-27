@@ -25,7 +25,6 @@ src/RykDb.Core/Parser.fs|parseExprC/parseExprListElemC/parseExprListToParen/pars
 src/RykDb.Core/RowStore.fs|emitRemaining|emitRemaining|call
 src/RykDb.Core/RowStore.fs|merge|merge|call
 src/RykDb.Core/Spill.fs|emit|emit|call
-src/RykDb.Core/Sstable.fs|fromPos/fromBlock|fromPos|call
 src/RykDb.Core/Sstable.fs|pull|pull|call
 src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|loadBlock|call
 src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|scanEntries|call

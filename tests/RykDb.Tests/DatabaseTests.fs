@@ -1479,6 +1479,41 @@ let ``Database: DROP TABLE は索引 keyspace の孤児エントリも消す`` (
         ok (RowStore.close store))
 
 [<Fact>]
+let ``Database: 中断した DROP の後始末を open 時に再開する`` () =
+    withDir "drop-cleanup-recover" (fun dir ->
+        let db0 = ok (Database.openWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10)"
+        let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
+        ok (db3.Close())
+
+        // カタログ削除直後・keyspace 後始末前にクラッシュした状態を作る。
+        let store = ok (RowStore.openStore dir)
+        let previous = ok (Catalog.load store)
+        let next = Catalog.removeTable previous "t"
+        let store = ok (Catalog.save store previous next)
+        ok (DropCleanup.write store.Root [ Keyspace.table "t"; Keyspace.index "ix_a" ])
+        ok (RowStore.close store)
+
+        // open 時にジャーナルを検出して後始末を再開する。
+        let db4 = ok (Database.openWith dir)
+        Assert.Empty(db4.TableNames())
+        ok (db4.Close())
+
+        let store = ok (RowStore.openStore dir)
+
+        let tableRows =
+            ok (RowStore.scanAt store (Keyspace.table "t") [||] Snapshot.noLimit 0)
+
+        let indexRows =
+            ok (RowStore.scanAt store (Keyspace.index "ix_a") [||] Snapshot.noLimit 0)
+
+        Assert.Empty tableRows
+        Assert.Empty indexRows
+        Assert.Empty(ok (DropCleanup.pending store.Root))
+        ok (RowStore.close store))
+
+[<Fact>]
 let ``Database: DROP INDEX 後の同名再作成で旧索引エントリが復活しない`` () =
     withDb "drop-index-recreate" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"

@@ -682,8 +682,20 @@ module internal Ddl =
                         Keyspace.table schema.Name
                         :: (withIndexes.Indexes |> List.map (fun index -> Keyspace.index index.Name))
 
-                    let! next = saved state (Catalog.removeTable state.Catalog name)
-                    return spaces |> List.fold (fun st space -> clearSpaceChunks st space) next
+                    let! () = DropCleanup.add state.Store.Root spaces
+
+                    let! next =
+                        match saved state (Catalog.removeTable state.Catalog name) with
+                        | Ok next -> ret next
+                        | Error e ->
+                            DropCleanup.clear state.Store.Root |> ignore
+                            Error e
+
+                    match spaces |> foldOk (fun st space -> clearSpaceChunksResult st space) next with
+                    | Ok cleaned ->
+                        DropCleanup.clear state.Store.Root |> ignore
+                        return cleaned
+                    | Error _ -> return next
                 }
 
         exclusiveDdl state (fun fresh -> dropTableCore fresh name ifExists)
@@ -704,8 +716,21 @@ module internal Ddl =
                 err (DbError.constraintViolation (sprintf "索引 %s は UNIQUE 制約用のため DROP できません" defn.IndexName))
             | Some defn ->
                 result {
-                    let! next = saved state (Catalog.removeIndex state.Catalog name)
-                    return clearSpaceChunks next (Keyspace.index defn.IndexName)
+                    let space = Keyspace.index defn.IndexName
+                    let! () = DropCleanup.add state.Store.Root [ space ]
+
+                    let! next =
+                        match saved state (Catalog.removeIndex state.Catalog name) with
+                        | Ok next -> ret next
+                        | Error e ->
+                            DropCleanup.clear state.Store.Root |> ignore
+                            Error e
+
+                    match clearSpaceChunksResult next space with
+                    | Ok cleaned ->
+                        DropCleanup.clear state.Store.Root |> ignore
+                        return cleaned
+                    | Error _ -> return next
                 }
 
         exclusiveDdl state (fun fresh -> dropIndexCore fresh name ifExists)
