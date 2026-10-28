@@ -98,7 +98,7 @@ module internal Entry =
         entries
         |> Array.fold
             (fun w e -> Writer.writeBytes (encodeEntry e) w)
-            (Writer.empty |> Writer.uint64BE txnId |> Writer.varint (uint64 entries.Length))
+            (Writer.Empty |> Writer.uint64BE txnId |> Writer.varint (uint64 entries.Length))
         |> Writer.toArray
 
     let decodeBatch (data: byte array) =
@@ -144,7 +144,7 @@ type internal Memtable =
     }
 
 module internal Memtable =
-    let empty =
+    let Empty =
         {
             Root = None
             Count = 0
@@ -237,23 +237,27 @@ module internal Memtable =
     /// それが同じキーなら可視な最新版になる（探索は対数時間）。
     /// </remarks>
     let getVisible (key: byte array) (visible: uint64 option) (mem: Memtable) =
+        let rec ceiling bound best =
+            function
+            | None -> best
+            | Some r ->
+                let c = Bytes.compare r.Entry.Key key
+
+                if c > 0 then
+                    ceiling bound (Some r) r.Left
+                elif c < 0 then
+                    ceiling bound best r.Right
+                else if r.Entry.SeqNo <= bound then
+                    ceiling bound (Some r) r.Left
+                else
+                    ceiling bound best r.Right
+
         let bound =
             match visible with
             | Some v -> v
             | None -> System.UInt64.MaxValue
 
-        let rec ceiling (node: TNode option) (best: TNode option) =
-            match node with
-            | None -> best
-            | Some r ->
-                let c = Bytes.compare r.Entry.Key key
-
-                if c > 0 then ceiling r.Left (Some r)
-                elif c < 0 then ceiling r.Right best
-                else if r.Entry.SeqNo <= bound then ceiling r.Left (Some r)
-                else ceiling r.Right best
-
-        match ceiling mem.Root None with
+        match ceiling bound None mem.Root with
         | Some r when Bytes.compare r.Entry.Key key = 0 -> Some r.Entry
         | _ -> None
 

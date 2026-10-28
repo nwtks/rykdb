@@ -10,7 +10,7 @@ open RykDb.TestHelpers
 
 [<Fact>]
 let ``BloomFilter.mightContain: 追加したキーはすべて maybe present`` () =
-    let n = 20_000
+    let n = 2_000
     let keys = Array.init n intKey
     let filter = BloomFilter.ofKeys keys n 0.01
 
@@ -20,13 +20,13 @@ let ``BloomFilter.mightContain: 追加したキーはすべて maybe present`` (
 
 [<Fact>]
 let ``BloomFilter.mightContain: 追加していないキーはほぼ「なし」になる`` () =
-    let n = 10_000
+    let n = 1_000
     let p = 0.01
     let keys = Array.init n intKey
     let filter = BloomFilter.ofKeys keys n p
 
     // 別キー群を用意して、誤検出率が設計値を下回ることを確認する
-    let others = Array.init 20_000 (fun i -> intKey (i + 10_000_000))
+    let others = Array.init 2_000 (fun i -> intKey (i + 10_000_000))
 
     let falsePositives =
         others

@@ -11,7 +11,7 @@ namespace RykDb.Core
 type internal Writer = { Chunks: byte array list }
 
 module internal Writer =
-    let empty = { Chunks = [] }
+    let Empty = { Chunks = [] }
 
     let private add (b: byte array) (w: Writer) =
         if b.Length = 0 then w else { Chunks = b :: w.Chunks }
@@ -62,7 +62,7 @@ module internal Writer =
     /// 書き出し手順を左から順に適用して 1本のバイト列にする。
     /// 要素は Writer.varint x のような部分適用で書ける。
     let build (steps: (Writer -> Writer) list) =
-        steps |> List.fold (fun w f -> f w) empty |> toArray
+        steps |> List.fold (fun w f -> f w) Empty |> toArray
 
 /// 読み取り: Cursor
 /// 読み取り位置を値が持つ。
@@ -522,14 +522,14 @@ module internal KeyBuilder =
     /// 値の並びを 1本のキーに符号化する。
     let ofValues (values: SqlValue seq) =
         values
-        |> Seq.fold (fun w v -> OrderPreserving.writeValue v w) Writer.empty
+        |> Seq.fold (fun w v -> OrderPreserving.writeValue v w) Writer.Empty
         |> Writer.toArray
 
     /// 索引キー（索引列 + 主キー列）。
     /// 主キーは行を一意に特定するために末尾へ追加する。
     let ofIndexAndPrimary (indexCols: SqlValue seq) (primaryCols: SqlValue seq) =
         let appendCols = Seq.fold (fun w v -> OrderPreserving.writeValue v w)
-        let withIndex = appendCols Writer.empty indexCols
+        let withIndex = appendCols Writer.Empty indexCols
         appendCols withIndex primaryCols |> Writer.toArray
 
     /// バイト列 key が prefix で始まるか。

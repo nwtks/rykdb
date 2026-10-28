@@ -137,7 +137,7 @@ type Database internal (root: string, state: DbState) =
         match state.Active with
         | None -> err (DbError.internalError "ロールバックする transaction がありません")
         | Some txn ->
-            let mgr = TransactionManager.abort state.Manager txn.TxnId
+            let mgr = TransactionManager.abort txn state.Manager
 
             match state.ActiveRegistration with
             | Some token -> ActiveSnapshotRegistry.unregister root token
@@ -227,7 +227,7 @@ type Database internal (root: string, state: DbState) =
                         results.Add StatementResult.empty
                         runStatements st tail
                     | Some txn ->
-                        let mgr = TransactionManager.abort st.Manager txn.TxnId
+                        let mgr = TransactionManager.abort txn st.Manager
 
                         match st.ActiveRegistration with
                         | Some token -> ActiveSnapshotRegistry.unregister st.Root token

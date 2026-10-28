@@ -20,14 +20,14 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
 /// 書いた SSTable を開く（compact の openScan と同じ経路）。
 let private openBack (dir: string) (f: FileMetaData) =
     Sstable.openPartial (FileMetaData.path dir f.FileNumber)
-    >>= fun partial -> ret (Sstable.rangeScanPartial partial [||] 0)
+    >>= fun partial -> ret (Sstable.rangeScanPartial [||] 0 partial)
 
 /// 書いた SSTable を読み戻す（検証用）。
 let private readBack (dir: string) (f: FileMetaData) = openBack dir f >>= SstScan.toArray
 
 /// 閾値を全レベル 0 にして「最初の非空レベル」から compaction させる。
 let private pickFirstLevel =
-    { CompactionOptions.defaults with
+    { CompactionOptions.Defaults with
         MaxLevelBytes = Array.create Levels.Count 0L
     }
 
@@ -53,7 +53,7 @@ let ``Compaction: 同名キーは最新版と最古 snapshot が見る版を残�
                     Entry.put (intKey 2) 2UL (intRow 2)
                 ]
 
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         let result, _ = compactAll dir version 4UL pickFirstLevel
         // snapshot 4 が見るのは key1 の seq 3（SeqNo <= 4 の最新）。
         // seq 1 だけがどの snapshot からも見えないので落ちる。
@@ -87,7 +87,7 @@ let ``Compaction: snapshot が生きている版は GC しない`` () =
                     Entry.put (intKey 1) 1UL (intRow 1)
                 ]
 
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         // snapshot 2 が見るのは seq 1。落とすとデータ損失になる。
         // seq 5, 3 も将来の snapshot 用に残るので、何も落ちない。
         let result, _ = compactAll dir version 2UL pickFirstLevel
@@ -105,7 +105,7 @@ let ``Compaction: 新しい版があっても active snapshot が見る旧版を
         let f =
             mkSst dir 10L 1 [ Entry.put (intKey 1) 10UL (intRow 10); Entry.put (intKey 1) 5UL (intRow 5) ]
 
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         // snapshot 7 は seq 10 を見ない。seq 5 が唯一の可視版になる。
         let result, _ = compactAll dir version 7UL pickFirstLevel
         Assert.Equal(0, result.DroppedVersions)
@@ -121,7 +121,7 @@ let ``Compaction: active snapshot より古い版だけなら最新版以外を�
         let f =
             mkSst dir 10L 1 [ Entry.put (intKey 1) 5UL (intRow 5); Entry.put (intKey 1) 3UL (intRow 3) ]
 
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         // active が無いときの境界は LastCommitSeqNo + 1。
         // 最新版 5 が境界以下なので、3 はどの snapshot からも見えない。
         let result, _ = compactAll dir version 6UL pickFirstLevel
@@ -135,9 +135,9 @@ let ``Compaction: active snapshot より古い版だけなら最新版以外を�
 let ``Compaction: 閾値を超えないレベルは compaction しない`` () =
     withDir "comp-none" (fun dir ->
         let f = mkSst dir 10L 1 [ entryOf 1 ]
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         // 既定の閾値（L1 = 10MiB）には遠く届かない
-        let result, info = compactAll dir version 0UL CompactionOptions.defaults
+        let result, info = compactAll dir version 0UL CompactionOptions.Defaults
         Assert.Empty result.Added
         Assert.Empty result.Removed
         Assert.Equal(0, result.DroppedVersions)
@@ -151,7 +151,7 @@ let ``Compaction: 上のレベルの重なるファイルも入力に含める``
             mkSst dir 10L 1 [ entryOf 1; entryOf 2; Entry.put (intKey 3) 3UL (intRow 3) ]
         // key3 で f1 と重なる L2 のファイル
         let f2 = mkSst dir 11L 2 [ Entry.put (intKey 3) 33UL (intRow 3); entryOf 4 ]
-        let version = Version.empty |> Version.addFile f1 |> Version.addFile f2
+        let version = Version.Empty |> Version.addFile f1 |> Version.addFile f2
         let result, _ = compactAll dir version 10UL pickFirstLevel
         // 入力は L1 の f1 と、重なる L2 の f2 の両方
         Assert.Equal<int64 list>([ 10L; 11L ], result.Removed |> List.map _.FileNumber)
@@ -177,7 +177,7 @@ let ``Compaction: 重ならない上のレベルファイルは入力に含め�
         let above = mkSst dir 12L 2 [ entryOf 9 ]
 
         let version =
-            Version.empty
+            Version.Empty
             |> Version.addFile f1
             |> Version.addFile below
             |> Version.addFile above
@@ -194,7 +194,7 @@ let ``Compaction: 最下位レベルへの出力では tombstone を落とす`` 
         let f =
             mkSst dir 10L 5 [ Entry.delete (intKey 1) 5UL; Entry.put (intKey 2) 2UL (intRow 2) ]
 
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         // 全レベル閾値 0 → L5 が選ばれ、出力は L6（最下位）
         let result, _ = compactAll dir version 0UL pickFirstLevel
         Assert.Equal(0, result.DroppedVersions)
@@ -213,7 +213,7 @@ let ``Compaction: 途中のレベルへの出力では tombstone を残す`` () 
         let f =
             mkSst dir 10L 1 [ Entry.delete (intKey 1) 5UL; Entry.put (intKey 2) 2UL (intRow 2) ]
 
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         // 出力は L2。まだ下に古い版が残りうるので tombstone は消せない
         let result, _ = compactAll dir version 0UL pickFirstLevel
         Assert.Equal(0, result.DroppedVersions)
@@ -229,7 +229,7 @@ let ``Compaction: 最下位レベルの compaction で tombstone だけなら出
         let f =
             mkSst dir 10L Levels.Max [ Entry.delete (intKey 1) 5UL; Entry.delete (intKey 2) 6UL ]
 
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         // L6 だけが閾値超え → 出力先も L6。tombstone は全部落ちて空になる
         let result, info = compactAll dir version 0UL pickFirstLevel
         Assert.Empty result.Added
@@ -248,14 +248,14 @@ let ``Compaction: L0 のファイル数が閾値に達したら L1 へ compactio
                 for i in 1..3 -> mkSst dir (int64 (10 + i)) 0 [ Entry.put (intKey i) (uint64 i) (intRow i) ]
             ]
 
-        let version = files |> List.fold (fun v f -> Version.addFile f v) Version.empty
-        let before, _ = compactAll dir version 0UL CompactionOptions.defaults
+        let version = files |> List.fold (fun v f -> Version.addFile f v) Version.Empty
+        let before, _ = compactAll dir version 0UL CompactionOptions.Defaults
         Assert.Empty before.Added
-        Assert.Equal(3, Version.filesAt version 0 |> Array.length)
+        Assert.Equal(3, Version.filesAt 0 version |> Array.length)
 
         let fourth = mkSst dir 20L 0 [ Entry.put (intKey 4) 4UL (intRow 4) ]
         let version = Version.addFile fourth version
-        let result, _ = compactAll dir version 0UL CompactionOptions.defaults
+        let result, _ = compactAll dir version 0UL CompactionOptions.Defaults
         Assert.Equal<int64 list>([ 11L; 12L; 13L; 20L ], result.Removed |> List.map _.FileNumber |> List.sort)
         Assert.Equal(1, result.Added.Length)
         Assert.Equal(1, result.Added.[0].Level)
@@ -267,7 +267,7 @@ let ``Compaction: 古い版が残るなら最下位でも tombstone を消さな
         let f =
             mkSst dir 10L Levels.Max [ Entry.delete (intKey 1) 5UL; Entry.put (intKey 1) 3UL (intRow 1) ]
 
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         let result, _ = compactAll dir version 0UL pickFirstLevel
         Assert.Equal(0, result.DroppedVersions)
         Assert.Equal(0, result.DroppedTombstones)
@@ -281,7 +281,7 @@ let ``Compaction: 古い版が残るなら最下位でも tombstone を消さな
 let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
     withDir "comp-write-fail" (fun dir ->
         let f = mkSst dir 10L 1 [ entryOf 1 ]
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         // 存在しないディレクトリを出力先にする → 書き込みが IoError で失敗する
         let missing = Path.Combine(dir, "missing")
         let r = Compaction.compact missing version pickFirstLevel 0UL 100L (openBack dir)
@@ -293,7 +293,7 @@ let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
 let ``Compaction: 入力の読み込みに失敗したらそのエラーを返す`` () =
     withDir "comp-read-fail" (fun dir ->
         let f = fmd 10L 1 1 1
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         let broken (_: FileMetaData) = err (DbError.corruption "壊れた SSTable")
         let r = Compaction.compact dir version pickFirstLevel 0UL 100L broken
         expectErrorKind ErrorKind.CorruptionError "読み込みエラーはそのまま伝播する" r)
@@ -308,7 +308,7 @@ let ``Compaction: 出力はエントリ数ではなく OutputFileTargetBytes ご
             |> List.map (fun i -> Entry.put (intKey i) (uint64 i) [| SqlValue.Text text |])
 
         let f = mkSst dir 10L 1 es
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
 
         // 1エントリ約 2KB。旧実装の「128エントリ」では 1ファイルに収まるが、
         // 目標 5KB なら 2 + 2 + 1 に割れる。
@@ -338,7 +338,7 @@ let ``Compaction: 同じキーの版は出力ファイルを跨がない`` () =
                     Entry.put (intKey 2) 2UL (intRow 2)
                 ]
 
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
 
         // 目標 1 バイト → キーが変わるたびにファイルを切り替える。
         let options =
@@ -369,7 +369,7 @@ let ``Compaction: 複数ブロックの入力をストリーミングで読み�
             |> List.map (fun i -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i))
 
         let f = mkSst dir 10L 1 entries
-        let version = Version.addFile f Version.empty
+        let version = Version.addFile f Version.Empty
         let result, _ = compactAll dir version 0UL pickFirstLevel
 
         let out = List.exactlyOne result.Added
@@ -402,8 +402,8 @@ let ``Compaction: 多数の入力ファイルをストリーミングでマー�
 
                 mkSst dir (int64 (10 + fi)) 0 entries)
 
-        let version = files |> List.fold (fun v f -> Version.addFile f v) Version.empty
-        let result, _ = compactAll dir version 0UL CompactionOptions.defaults
+        let version = files |> List.fold (fun v f -> Version.addFile f v) Version.Empty
+        let result, _ = compactAll dir version 0UL CompactionOptions.Defaults
 
         // L0 が閾値（4）に達したので 1 回で L1 へ。
         let out = List.exactlyOne result.Added

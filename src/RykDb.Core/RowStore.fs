@@ -330,9 +330,9 @@ module internal Keyspace =
 /// 起動時にカタログに存在しない keyspace だけを掃除する。
 module internal DropCleanup =
     [<Literal>]
-    let private fileName = ".drop-cleanup"
+    let private FileName = ".drop-cleanup"
 
-    let private path (root: string) = System.IO.Path.Combine(root, fileName)
+    let private path (root: string) = System.IO.Path.Combine(root, FileName)
 
     /// 未完了の後始末対象 keyspace を読む。
     let pending (root: string) =
@@ -774,13 +774,13 @@ type internal RowStore =
 /// </remarks>
 module internal ProcessLock =
     /// root に置くロックファイル名。
-    let private fileName = ".rykdb.lock"
+    let private FileName = ".rykdb.lock"
 
     /// 台帳の更新だけを直列化する（ロック自体は root ごとに 1本）。
-    let private gate = new System.Threading.SemaphoreSlim(1, 1)
+    let private Gate = new System.Threading.SemaphoreSlim(1, 1)
 
     /// 正規化した root -> (トークン -> プロセス内で共有する FileStream)。
-    let private held =
+    let private Held =
         System.Collections.Concurrent.ConcurrentDictionary<
             string,
             System.Collections.Concurrent.ConcurrentDictionary<obj, System.IO.FileStream>
@@ -791,13 +791,13 @@ module internal ProcessLock =
     /// - 別プロセスが開いている → `IoError`
     /// - 同じプロセスが既に開いている → `takeOver` でなければ `IoError`
     let acquire (root: string) (takeOver: bool) =
-        gate.Wait()
+        Gate.Wait()
 
         try
             let key = RootKey.normalize root
 
             let bucket =
-                held.GetOrAdd(
+                Held.GetOrAdd(
                     key,
                     fun _ -> System.Collections.Concurrent.ConcurrentDictionary<obj, System.IO.FileStream>()
                 )
@@ -811,7 +811,7 @@ module internal ProcessLock =
             | Some _ ->
                 err (DbError.create ErrorKind.IoError (sprintf "データベース %s は同じプロセスで既に開かれています。Close してから開き直してください" key))
             | None ->
-                let path = System.IO.Path.Combine(key, fileName)
+                let path = System.IO.Path.Combine(key, FileName)
 
                 match
                     protect (fun () ->
@@ -826,29 +826,29 @@ module internal ProcessLock =
                     bucket.[token] <- stream
                     ret token
                 | Error _ ->
-                    err (DbError.create ErrorKind.IoError (sprintf "データベース %s は別のプロセスが開いています（%s）" key fileName))
+                    err (DbError.create ErrorKind.IoError (sprintf "データベース %s は別のプロセスが開いています（%s）" key FileName))
         finally
-            gate.Release() |> ignore
+            Gate.Release() |> ignore
 
     /// ロックを解除する（二重解除は無害）。
     /// 同じ root を開いている他トークンが残っていればロックは保持したまま。
     let release (root: string) (token: obj) =
-        gate.Wait()
+        Gate.Wait()
 
         try
             let key = RootKey.normalize root
 
-            match held.TryGetValue key with
+            match Held.TryGetValue key with
             | true, bucket ->
                 match bucket.TryRemove token with
                 | true, stream ->
                     if bucket.IsEmpty then
-                        held.TryRemove key |> ignore
+                        Held.TryRemove key |> ignore
                         protect (fun () -> stream.Dispose()) |> ignore
                 | _ -> ()
             | _ -> ()
         finally
-            gate.Release() |> ignore
+            Gate.Release() |> ignore
 
 module internal RowStore =
     let private ensure (store: RowStore) (keyspace: string) =
@@ -923,8 +923,8 @@ module internal RowStore =
         match
             protect (fun () ->
                 System.IO.File.Exists(System.IO.Path.Combine(dir, "CURRENT"))
-                || System.IO.Directory.GetFiles(dir, Manifest.manifestPrefix + "*").Length > 0
-                || System.IO.Directory.GetFiles(dir, "*" + Wal.walExtension).Length > 0)
+                || System.IO.Directory.GetFiles(dir, Manifest.ManifestPrefix + "*").Length > 0
+                || System.IO.Directory.GetFiles(dir, "*" + Wal.WalExtension).Length > 0)
         with
         | Ok true -> true
         | _ -> false
@@ -1121,19 +1121,18 @@ module internal RowStore =
         if not (keyspaceExists store space) then
             ret (store, mgr)
         else
-            scanAt store space [||] Snapshot.noLimit 0
+            scanAt store space [||] Snapshot.NoLimit 0
             |> Result.bind (fun stale ->
                 stale
                 |> Seq.chunkBySize ClearChunkEntries
                 |> foldOk
                     (fun (currentStore, currentMgr) chunk ->
                         let mgr0, txn =
-                            TransactionManager.beginTxnWithLimit System.Int64.MaxValue currentMgr
+                            TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) currentMgr
 
                         result {
-                            let! txn2 = foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn chunk
-
-                            let! mgr1, _, batches = TransactionManager.commit mgr0 txn2
+                            let! txn2 = foldOk (fun t (key, _) -> ret (Transaction.remove space key t)) txn chunk
+                            let! mgr1, _, batches = TransactionManager.commit txn2 mgr0
                             let! store1 = writeBatchesWithSnapshot activeSnapshot currentStore batches
                             return store1, mgr1
                         })
@@ -1184,17 +1183,17 @@ module internal Dml =
 
                 match oldRow, newRow with
                 | None, None -> ret current
-                | None, Some row -> ret (Transaction.put current space (keyFor row) row)
-                | Some row, None -> ret (Transaction.remove current space (keyFor row))
+                | None, Some row -> ret (Transaction.put space (keyFor row) row current)
+                | Some row, None -> ret (Transaction.remove space (keyFor row) current)
                 | Some oldValue, Some newValue ->
                     let oldKey = keyFor oldValue
                     let newKey = keyFor newValue
 
                     if oldKey = newKey then
-                        ret (Transaction.put current space newKey newValue)
+                        ret (Transaction.put space newKey newValue current)
                     else
-                        let removed = Transaction.remove current space oldKey
-                        ret (Transaction.put removed space newKey newValue))
+                        let removed = Transaction.remove space oldKey current
+                        ret (Transaction.put space newKey newValue removed))
             txn
 
     /// store の行に txn の書き込みを重ねる（ストリーミング）。
@@ -1282,7 +1281,7 @@ module internal Dml =
         let getByPrimaryKey (store: RowStore) (schema: TableSchema) (visible: uint64 option) (key: SqlValue array) =
             RowStore.getAt store (tableSpace schema) (KeyBuilder.ofValues key) visible
 
-        match Transaction.tryFind txn (tableSpace schema) (KeyBuilder.ofValues key) with
+        match Transaction.tryFind (tableSpace schema) (KeyBuilder.ofValues key) txn with
         | Some slot -> ret slot
         | None -> getByPrimaryKey store schema visible key
 
@@ -1300,7 +1299,7 @@ module internal Dml =
         (txn: Transaction)
         (limit: int)
         =
-        let slots = Transaction.slotsOf txn (tableSpace schema)
+        let slots = Transaction.slotsOf (tableSpace schema) txn
 
         scanByPrimaryKey store schema visible (storeLimitFor limit slots)
         |> Result.map (fun rows ->
@@ -1340,7 +1339,7 @@ module internal Dml =
         let endBytes = endKey |> Option.map KeyBuilder.ofValues
 
         let slots =
-            Transaction.slotsOf txn (tableSpace schema)
+            Transaction.slotsOf (tableSpace schema) txn
             |> List.filter (fun (key, _) -> inKeyRange startBytes endBytes key)
 
         scanPrimaryKeyRange store schema visible startBytes endBytes (storeLimitFor limit slots)
@@ -1383,7 +1382,7 @@ module internal Dml =
         let prefix = KeyBuilder.ofValues values
 
         let slots =
-            Transaction.slotsOf txn (indexSpace index)
+            Transaction.slotsOf (indexSpace index) txn
             |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
 
         scanIndexPrefix store index visible prefix (storeLimitFor limit slots)
@@ -1423,7 +1422,7 @@ module internal Dml =
         let upperBytes = upper |> Option.map KeyBuilder.ofValues
 
         let slots =
-            Transaction.slotsOf txn (indexSpace index)
+            Transaction.slotsOf (indexSpace index) txn
             |> List.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
 
         scanIndexRange store index visible lowerBytes upperBytes (storeLimitFor limit slots)
@@ -1439,11 +1438,11 @@ module internal Dml =
             let tks = tableSpace schema
             let pk = RowKey.primary schema row
 
-            match Transaction.tryFind txn tks pk with
+            match Transaction.tryFind tks pk txn with
             | Some(Some _) -> return! err (DbError.constraintViolation (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name))
             | _ -> ()
 
-            let next = Transaction.put txn tks pk row
+            let next = Transaction.put tks pk row txn
             let! changed = applyIndexChange schema next None (Some row)
             return! Transaction.checkLimit changed
         }
@@ -1462,7 +1461,7 @@ module internal Dml =
             do! ensureSamePrimaryKey schema oldRow newRow
 
             let afterMain =
-                Transaction.put txn (tableSpace schema) (RowKey.primary schema newRow) newRow
+                Transaction.put (tableSpace schema) (RowKey.primary schema newRow) newRow txn
 
             let! changed = applyIndexChange schema afterMain (Some oldRow) (Some newRow)
             return! Transaction.checkLimit changed
@@ -1504,7 +1503,7 @@ module internal Dml =
 
     let private removeRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) =
         result {
-            let next = Transaction.remove txn (tableSpace schema) (RowKey.primary schema oldRow)
+            let next = Transaction.remove (tableSpace schema) (RowKey.primary schema oldRow) txn
             let! changed = applyIndexChange schema next (Some oldRow) None
             return! Transaction.checkLimit changed
         }

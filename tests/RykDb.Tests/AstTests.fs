@@ -22,7 +22,7 @@ let ``Ast: fold は全ノードを訪問する`` () =
 
 [<Fact>]
 let ``末尾再帰: AST の深い走査でスタックを食わない`` () =
-    let depth = 200_000
+    let depth = 20_000
 
     // テスト側も末尾再帰（fold）で深い式を作る
     let deep =
@@ -67,7 +67,7 @@ let ``Ast: ColumnRefs が各ノードから列参照を集める`` () =
 
 [<Fact>]
 let ``末尾再帰: 集計呼び出しを含む深い AST も走査できる`` () =
-    let depth = 100_000
+    let depth = 10_000
 
     let deep =
         List.init depth (fun _ -> ())

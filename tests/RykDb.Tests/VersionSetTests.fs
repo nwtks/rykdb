@@ -17,7 +17,7 @@ let private compose (a: VersionEdit) (b: VersionEdit) =
 [<Fact>]
 let ``Version: ファイル追加でレベル構成が変わる`` () =
     let v =
-        Version.empty
+        Version.Empty
         |> Version.addFile (fmd 1L 0 100 199)
         |> Version.addFile (fmd 2L 1 100 199)
         |> Version.addFile (fmd 3L 2 0 99)
@@ -26,18 +26,18 @@ let ``Version: ファイル追加でレベル構成が変わる`` () =
 
 [<Fact>]
 let ``Version: 追加は破壊的でない`` () =
-    let v0 = Version.empty
+    let v0 = Version.Empty
     let v1 = Version.addFile (fmd 1L 0 100 199) v0
     Assert.Equal(0, (Version.levelCounts v0).[0])
     Assert.Equal(1, (Version.levelCounts v1).[0])
     // v0 に後から v1 のファイルは見えない
-    Assert.Empty(Version.filesAt v0 0)
-    Assert.Equal(1, (Version.filesAt v1 0).Length)
+    Assert.Empty(Version.filesAt 0 v0)
+    Assert.Equal(1, (Version.filesAt 0 v1).Length)
 
 [<Fact>]
 let ``Version: 削除でレベル構成が変わる`` () =
     let v =
-        Version.empty
+        Version.Empty
         |> Version.addFile (fmd 1L 0 100 199)
         |> Version.addFile (fmd 2L 1 100 199)
         |> Version.deleteFiles [ fmd 1L 0 100 199 ]
@@ -47,7 +47,7 @@ let ``Version: 削除でレベル構成が変わる`` () =
 [<Fact>]
 let ``Version: ポイントルックアップの候補は新しい順`` () =
     let v =
-        Version.empty
+        Version.Empty
         |> Version.addFile (fmd 1L 0 100 199)
         |> Version.addFile (fmd 2L 0 150 249)
         |> Version.addFile (fmd 3L 1 100 199)
@@ -55,33 +55,32 @@ let ``Version: ポイントルックアップの候補は新しい順`` () =
     // キー 180 は L0 の 2 ファイルと L1 の 1 ファイルの範囲内。
     // 全レベルを「レベル昇順・番号降順」で読む（L1 までしか読まないと取りこぼす）。
     let candidates =
-        Version.filesForPointLookup v (intKey 180) |> List.map (fun f -> f.FileNumber)
+        Version.filesForPointLookup (intKey 180) v |> List.map (fun f -> f.FileNumber)
 
     Assert.Equal<int64 list>([ 2L; 1L; 3L ], candidates)
 
     // キー 210 は L0 のファイル 1（100..199）と L1（100..199）の範囲外
     let only2 =
-        Version.filesForPointLookup v (intKey 210) |> List.map (fun f -> f.FileNumber)
+        Version.filesForPointLookup (intKey 210) v |> List.map (fun f -> f.FileNumber)
 
     Assert.Equal<int64 list>([ 2L ], only2)
 
     // L1 だけにあるキーでも L0 を読み飛ばして見つかる
     let l1Only =
-        Version.empty
+        Version.Empty
         |> Version.addFile (fmd 1L 0 100 199)
         |> Version.addFile (fmd 3L 1 300 399)
-        |> fun v2 -> Version.filesForPointLookup v2 (intKey 350) |> List.map (fun f -> f.FileNumber)
+        |> fun v2 -> Version.filesForPointLookup (intKey 350) v2 |> List.map (fun f -> f.FileNumber)
 
     Assert.Equal<int64 list>([ 3L ], l1Only)
-
     // 範囲外のキーは候補なし
-    Assert.Empty(Version.filesForPointLookup v (intKey 9999))
+    Assert.Empty(Version.filesForPointLookup (intKey 9999) v)
 
 [<Fact>]
 let ``VersionEdit: 変更適用は削除後に追加する`` () =
     let oldFile = fmd 1L 0 100 199
     let replacement = fmd 1L 1 200 299
-    let initial = Version.empty |> Version.addFile oldFile
+    let initial = Version.Empty |> Version.addFile oldFile
 
     let updated =
         VersionEdit.apply
@@ -92,12 +91,12 @@ let ``VersionEdit: 変更適用は削除後に追加する`` () =
             }
 
     Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts updated)
-    Assert.Equal(1L, (Version.filesAt updated 1).[0].FileNumber)
+    Assert.Equal(1L, (Version.filesAt 1 updated).[0].FileNumber)
 
 [<Fact>]
 let ``VersionEdit: レベルが範囲外なら CorruptionError`` () =
     let bad =
-        { (fmd 1L 0 100 199) with
+        { fmd 1L 0 100 199 with
             Level = Levels.Max + 1
         }
 

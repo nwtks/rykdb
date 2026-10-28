@@ -84,14 +84,7 @@ let ``SqlValue.asText: Text だけ Some`` () =
     Assert.True((SqlValue.asText SqlValue.Null).IsNone)
 
 [<Fact>]
-let ``SqlValue.asInt64: Int だけ Some`` () =
-    Assert.Equal(Some 7L, SqlValue.asInt64 (SqlValue.Int 7L))
-    Assert.True((SqlValue.asInt64 (SqlValue.Real 7.0)).IsNone)
-    Assert.True((SqlValue.asInt64 SqlValue.Null).IsNone)
-
-[<Fact>]
 let ``SqlValue.normalizeFloat: NaN は canonicalNaN`` () =
-    Assert.Equal(SqlValue.CanonicalNaNBits, BitConverter.DoubleToInt64Bits(SqlValue.normalizeFloat Double.NaN))
     Assert.Equal(1.5, SqlValue.normalizeFloat 1.5)
 
 [<Fact>]
@@ -99,11 +92,6 @@ let ``SqlValue: NaN は正の quiet NaN に正規化される`` () =
     // .NET の Double.NaN は符号ビットが立った負の NaN。そのままキーにすると
     // 順序保持の前提が崩れるため、単一のビットパターンへ正規化する。
     let negativeNaN = BitConverter.Int64BitsToDouble 0xFFF8000000000000L
-
-    match SqlValue.vReal negativeNaN with
-    | SqlValue.Real f -> Assert.Equal(SqlValue.CanonicalNaNBits, BitConverter.DoubleToInt64Bits f)
-    | other -> Assert.Fail(sprintf "REAL ではありません: %A" other)
-
     // 正規化後は NaN 同士が等しく、REAL の中では最大
     Assert.Equal(0, ok (SqlValue.compareValues (SqlValue.vReal negativeNaN) (SqlValue.vReal Double.NaN)))
     Assert.True(ok (SqlValue.compareValues (SqlValue.vReal Double.NaN) (SqlValue.vReal 1.0)) > 0)

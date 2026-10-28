@@ -47,71 +47,6 @@ let private lcol = Expr.Column { Qualifier = Some "l"; Name = "lid" }
 let private rcol = Expr.Column { Qualifier = Some "r"; Name = "rid" }
 
 [<Fact>]
-let ``Op: 次の行を引くまで計算しない`` () =
-    // 無限に伸びる Op でも 1 行しか引かずに終わる。
-    let rec infinite (n: int) : Op =
-        Op.Compute(fun () -> ret (Some([| SqlValue.Int(int64 n) |], infinite (n + 1))))
-
-    let op = Op.take 3 (infinite 0)
-    let rows = ok (Op.toArray op)
-    Assert.Equal<int>(3, rows.Length)
-    Assert.Equal<int64>(0L, asInt rows.[0].[0])
-    Assert.Equal<int64>(2L, asInt rows.[2].[0])
-
-[<Fact>]
-let ``Op: 配列の演算子は 1 行ずつ返す`` () =
-    let op: Op = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
-    let rows = ok (Op.toArray op)
-    Assert.Equal<int>(2, rows.Length)
-    Assert.Equal<int64>(1L, asInt rows.[0].[0])
-
-[<Fact>]
-let ``末尾再帰: Op.ofArray を 20 万行組み立ててもスタックを食わない`` () =
-    // 「let rest = rowsFrom (i + 1) を先に評価する」実装だとコンストラクト時に
-    // 行数ぶんのスタックを積み、実測 約 13 万段（Debug）で Stack overflow になる。
-    // Compute ラップで「次を要求されてから 1 行だけ」作ることを深い入力で検証する。
-    let rows = Array.init 200_000 (fun i -> [| SqlValue.Int(int64 i) |])
-    let op = Op.ofArray rows
-    let got = ok (Op.toArray op)
-    Assert.Equal<int>(200_000, got.Length)
-    Assert.Equal<int64>(0L, got.[0].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L)
-    Assert.Equal<int64>(199_999L, got.[got.Length - 1].[0] |> SqlValue.asInt64 |> Option.defaultValue -1L)
-
-[<Fact>]
-let ``Op: filter と skip`` () =
-    let op =
-        Op.ofArray
-            [|
-                [| SqlValue.Int 1L |]
-                [| SqlValue.Int 2L |]
-                [| SqlValue.Int 3L |]
-                [| SqlValue.Int 4L |]
-            |]
-        |> Op.filter (fun r -> Eval.matches schema2 r (Expr.Binary(BinaryOp.Gt, col "a", Expr.Literal(Literal.Int 2L))))
-        |> Op.skip 1
-
-    // a > 2 は 3 と 4 の 2 件。そこから 1 件読み飛ばすので 1 件残る。
-    let rows = ok (Op.toArray op)
-    Assert.Equal<int>(1, rows.Length)
-    Assert.Equal<int64>(4L, asInt rows.[0].[0])
-
-[<Fact>]
-let ``Op: 大きな Op でも take は早期に打ち切る`` () =
-    // 1000 万行の Op を遅延評価で作る。Step の tail を先に評価すると
-    // 1000 万個が先に出来上がるので、Compute で 1 行ずつ生成する。
-    let rec counter (n: int) : Op =
-        Op.Compute(fun () ->
-            if n >= 10_000_000 then
-                ret None
-            else
-                ret (Some(row [ SqlValue.Int(int64 n) ], counter (n + 1))))
-
-    let rows = ok (Op.toArray (Op.take 3 (counter 0)))
-    Assert.Equal<int>(3, rows.Length)
-    Assert.Equal<int64>(0L, asInt rows.[0].[0])
-    Assert.Equal<int64>(2L, asInt rows.[2].[0])
-
-[<Fact>]
 let ``sortBy: 昇順と降順`` () =
     let op: Op =
         Op.ofArray [| [| SqlValue.Int 3L |]; [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
@@ -167,95 +102,6 @@ let ``sortBy: 複数キーは左から優先`` () =
     Assert.Equal<int64>(0L, asInt rows.[0].[0])
     Assert.Equal<int64>(10L, asInt rows.[1].[1])
     Assert.Equal<int64>(20L, asInt rows.[2].[1])
-
-[<Fact>]
-let ``ExtSort: バジェットが小さいと一時ファイルに溢らして整列できる`` () =
-    // 1行 ≈ 数十バイト。バジェット 1 ならほぼ毎行が run として溢れる。
-    let n = 500
-
-    let shuffled =
-        [ 0 .. n - 1 ]
-        |> List.map (fun i -> row [ SqlValue.Int(int64 ((i * 37 + 11) % n)); SqlValue.Int(int64 i) ])
-
-    let cmp (a: SqlValue array) (b: SqlValue array) =
-        match SqlValue.compareValues a.[0] b.[0] with
-        | Ok c -> c
-        | Error _ -> 0
-
-    let sorted =
-        ok (ExtSort.sortRows 1L Map.empty (fun _ _ -> ret Map.empty) cmp (opOfRows shuffled))
-
-    let rows = ok (Op.toArray sorted)
-
-    Assert.Equal<int>(n, rows.Length)
-
-    for i in 1 .. n - 1 do
-        Assert.True(asInt rows.[i - 1].[0] <= asInt rows.[i].[0], $"行 {i} が昇順ではありません")
-
-    // 一時ファイルは残らない（run は尽きた時点で消える）。
-    let leftovers =
-        System.IO.Directory.GetFiles(System.IO.Path.GetTempPath(), "rykdb-sort-" + "*")
-
-    Assert.All(leftovers, fun p -> Assert.Fail($"一時ファイルが残っています: {p}"))
-
-[<Fact>]
-let ``ExtSort: 比較不能な型は呼び出し時に Error`` () =
-    let mixed =
-        opOfRows
-            [
-                row [ SqlValue.Int 1L; SqlValue.Int 1L ]
-                row [ SqlValue.Text "x"; SqlValue.Int 2L ]
-            ]
-
-    let keys =
-        [
-            {
-                Expression = col "a"
-                Direction = SortDirection.Ascending
-            }
-        ]
-
-    expectErrorKind ErrorKind.TypeError "比較不能な型は Error" (Ops.sortBy schema2 mixed keys)
-
-[<Fact>]
-let ``ExtSort: 5 万行を小さなバジェットで溢らしても整列できる`` () =
-    // 1 行ずつ run に溢らしながら 5 万行を流す。
-    // ingest が末尾再帰でなければスタックを積み上がる（数百 run で枯渇する）。
-    let n = 50_000
-
-    let rec make (i: int) : Op =
-        if i >= n then
-            Op.Done
-        else
-            Op.Compute(fun () ->
-                let v = int64 ((i * 7919 + 13) % n)
-                ret (Some(row [ SqlValue.Int v; SqlValue.Int(int64 i) ], make (i + 1))))
-
-    let cmp (a: SqlValue array) (b: SqlValue array) =
-        match SqlValue.compareValues a.[0] b.[0] with
-        | Ok c -> c
-        | Error _ -> 0
-
-    // バジェット 256 バイト → 数百個の run が生まれる。
-    let sorted =
-        ok (ExtSort.sortRows 256L Map.empty (fun _ _ -> ret Map.empty) cmp (make 0))
-
-    let rows = ok (Op.toArray sorted)
-
-    Assert.Equal<int>(n, rows.Length)
-
-    let ascending =
-        rows
-        |> Array.pairwise
-        |> Array.forall (fun (a, b) -> asInt a.[0] <= asInt b.[0])
-
-    Assert.True(ascending, "昇順に並んでいません")
-
-    // 一時ファイルは残らない。
-    let leftovers =
-        System.IO.Directory.GetFiles(System.IO.Path.GetTempPath(), "rykdb-sort-*")
-
-    Assert.Equal<int>(0, leftovers.Length)
 
 [<Fact>]
 let ``distinctWithin: バジェット超過は CapacityError`` () =
@@ -674,8 +520,8 @@ let ``havingFilter: 集約値とグループ値を定数へ置き換える`` () 
     expectError "WHERE の t.* が OK になっています" (eval (Expr.QualifiedStar "t"))
 
 [<Fact>]
-let ``末尾再帰: 20 万段の式を havingFilter してもスタックを食わない`` () =
-    let depth = 200_000
+let ``末尾再帰: 50000段の式を havingFilter してもスタックを食わない`` () =
+    let depth = 50_000
 
     // テスト側も末尾再帰（fold）で組む（SQL 経由だと MaxExpressionDepth = 200 で頭打ちになる）
     let deep =

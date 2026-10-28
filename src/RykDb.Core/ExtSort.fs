@@ -21,18 +21,14 @@
 namespace RykDb.Core
 
 /// 行を一時ファイルへ書き出し、そこから遅延読みする。
-module internal Spill =
-    /// 1行の枠: [varint 長][ValueCodec で符号化した値の並び]。
-    let private frame (row: SqlValue array) =
-        let payload = ValueCodec.writeValues row Writer.empty |> Writer.toArray
-        Writer.build [ Writer.varint (uint64 payload.Length); Writer.writeBytes payload ]
-
+module private Spill =
     /// 一時ファイルのプレフィックス（掃除の対象をこれで見分ける）。
-    let private prefix = "rykdb-sort-"
+    [<Literal>]
+    let private Prefix = "rykdb-sort-"
 
-    /// 一時ファイルのパスを作る。
-    let private runPath (stamp: string) (serial: int) =
-        System.IO.Path.Combine(System.IO.Path.GetTempPath(), sprintf "%s%s-%d.run" prefix stamp serial)
+    /// 一時ファイルの拡張子。
+    [<Literal>]
+    let private RunExt = ".run"
 
     /// 24時間を超えて残った run を回収する（途中打ち切りで放置された分）。
     /// 実行中の run は 24時間を超えない前提で、年齢で見分ける。
@@ -43,51 +39,10 @@ module internal Spill =
             if System.IO.Directory.Exists dir then
                 let cutoff = System.DateTime.UtcNow.AddHours -24.0
 
-                System.IO.Directory.GetFiles(dir, prefix + "*.run")
+                System.IO.Directory.GetFiles(dir, Prefix + "*" + RunExt)
                 |> Array.iter (fun p ->
                     if System.IO.FileInfo(p).CreationTimeUtc < cutoff then
                         protect (fun () -> System.IO.File.Delete p) |> ignore))
-        |> ignore
-
-    /// 書き込み口。
-    type Sink = private Sink of System.IO.Stream
-
-    let private openSink (path: string) =
-        protect (fun () ->
-            let fs =
-                new System.IO.FileStream(
-                    path,
-                    System.IO.FileMode.Create,
-                    System.IO.FileAccess.Write,
-                    System.IO.FileShare.None
-                )
-
-            Sink(new System.IO.BufferedStream(fs, 65536) :> System.IO.Stream))
-
-    let private closeSink (sink: Sink) =
-        protect (fun () ->
-            let (Sink s) = sink
-            s.Dispose())
-        |> ignore
-
-    /// 1行を追記する。
-    let writeRow (sink: Sink) (row: SqlValue array) =
-        let (Sink s) = sink
-        let bytes = frame row
-        protect (fun () -> s.Write(bytes, 0, bytes.Length))
-
-    /// 読み込み口。
-    type Source = private Source of System.IO.Stream
-
-    let private openSource (path: string) =
-        protect (fun () ->
-            let fs = System.IO.File.OpenRead path
-            Source(new System.IO.BufferedStream(fs, 65536) :> System.IO.Stream))
-
-    let private closeSource (src: Source) =
-        protect (fun () ->
-            let (Source s) = src
-            s.Dispose())
         |> ignore
 
     /// run ファイルを消す（無ければ何もしない）。
@@ -100,26 +55,77 @@ module internal Spill =
     /// 残っている run を全部消す（エラー経路の後始末）。
     let forget (paths: string list) = paths |> List.iter unlink
 
-    /// run の読み込み状態（先頭 1行を先読みしている）。
-    type RunState =
-        {
-            Path: string
-            Src: Source
-            Head: SqlValue array option
-        }
+    /// 書き込み口。
+    type private Sink = Sink of System.IO.Stream
 
-    /// run を閉じてファイルを消す（尽きた・破棄するとき）。
-    /// ストリームを閉じずにファイルだけ消すとハンドルが洩れるので、必ず一緒に閉じる。
-    let closeRun (state: RunState) =
-        closeSource state.Src
-        unlink state.Path
+    /// run ファイル 1本を作る（受入中の行を整列して書き出す）。
+    let writeRun
+        (stamp: string)
+        (serial: int)
+        (compareRows: SqlValue array -> SqlValue array -> int)
+        (rows: SqlValue array array)
+        =
+        let runPath stamp serial =
+            System.IO.Path.Combine(System.IO.Path.GetTempPath(), sprintf "%s%s-%d%s" Prefix stamp serial RunExt)
 
-    /// 複数の run をまとめて閉じて消す。
-    let closeAll (states: RunState list) = states |> List.iter closeRun
+        let openSink path =
+            protect (fun () ->
+                let fs =
+                    new System.IO.FileStream(
+                        path,
+                        System.IO.FileMode.Create,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.None
+                    )
 
-    /// varint を読む（先頭バイトはすでに読んでいる）。
-    let private readVarintFrom (s: System.IO.Stream) (first: byte) =
-        let rec loop (shift: int) (acc: uint64) (lead: byte) =
+                Sink(new System.IO.BufferedStream(fs, 65536) :> System.IO.Stream))
+
+        let frame row =
+            let payload = ValueCodec.writeValues row Writer.Empty |> Writer.toArray
+            Writer.build [ Writer.varint (uint64 payload.Length); Writer.writeBytes payload ]
+
+        let writeRow sink row =
+            let (Sink s) = sink
+            let bytes = frame row
+            protect (fun () -> s.Write(bytes, 0, bytes.Length))
+
+        let rec writeAll sink (rows: SqlValue array array) i =
+            if i >= rows.Length then
+                ret ()
+            else
+                match writeRow sink rows.[i] with
+                | Error e -> Error e
+                | Ok() -> writeAll sink rows (i + 1)
+
+        let closeSink sink =
+            protect (fun () ->
+                let (Sink s) = sink
+                s.Dispose())
+            |> ignore
+
+        let path = runPath stamp serial
+
+        match openSink path with
+        | Error e -> Error e
+        | Ok sink ->
+            let sorted = Array.sortWith compareRows rows
+
+            match writeAll sink sorted 0 with
+            | Error e ->
+                closeSink sink
+                unlink path
+                Error e
+            | Ok() ->
+                closeSink sink
+                ret path
+
+    /// 読み込み口。
+    type internal Source = Source of System.IO.Stream
+
+    /// 1行読む。
+    /// None は終端。
+    let readRow (src: Source) =
+        let rec loop (s: System.IO.Stream) shift acc lead =
             if shift > 63 then
                 err (DbError.corruption "Spill: varint が長すぎます")
             else
@@ -134,17 +140,13 @@ module internal Spill =
                         if next < 0 then
                             err (DbError.corruption "Spill: run ファイルが途中で終わりました")
                         else
-                            loop (shift + 7) (acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)) (byte next)
+                            loop s (shift + 7) (acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)) (byte next)
                 else
                     ret (acc ||| (uint64 (b &&& 0x7Fuy) <<< shift))
 
-        loop 0 0UL first
+        let readVarintFrom (s: System.IO.Stream) first = loop s 0 0UL first
 
-    /// 指定バイト数をちょうど読む。
-    let private readExactly (s: System.IO.Stream) (n: int) =
-        let buffer = Array.zeroCreate<byte> n
-
-        let rec fill (pos: int) =
+        let rec fill (s: System.IO.Stream) buffer n pos =
             if pos >= n then
                 ret buffer
             else
@@ -153,13 +155,12 @@ module internal Spill =
                 if got <= 0 then
                     err (DbError.corruption "Spill: run ファイルが途中で終わりました")
                 else
-                    fill (pos + got)
+                    fill s buffer n (pos + got)
 
-        fill 0
+        let readExactly (s: System.IO.Stream) n =
+            let buffer = Array.zeroCreate<byte> n
+            fill s buffer n 0
 
-    /// 1行読む。
-    /// None は終端。
-    let readRow (src: Source) =
         let (Source s) = src
 
         protect (fun () ->
@@ -180,39 +181,27 @@ module internal Spill =
                         | Ok(values, _) -> Ok(Some values))
         |> Result.bind id
 
-    /// run ファイル 1本を作る（受入中の行を整列して書き出す）。
-    let writeRun
-        (stamp: string)
-        (serial: int)
-        (compareRows: SqlValue array -> SqlValue array -> int)
-        (rows: SqlValue array array)
-        =
-        let path = runPath stamp serial
+    /// run の読み込み状態（先頭 1行を先読みしている）。
+    type internal RunState =
+        {
+            Path: string
+            Src: Source
+            Head: SqlValue array option
+        }
 
-        match openSink path with
-        | Error e -> Error e
-        | Ok sink ->
-            let sorted = Array.sortWith compareRows rows
-
-            let rec writeAll (i: int) =
-                if i >= sorted.Length then
-                    ret ()
-                else
-                    match writeRow sink sorted.[i] with
-                    | Error e -> Error e
-                    | Ok() -> writeAll (i + 1)
-
-            match writeAll 0 with
-            | Error e ->
-                closeSink sink
-                unlink path
-                Error e
-            | Ok() ->
-                closeSink sink
-                ret path
+    let private closeSource (src: Source) =
+        protect (fun () ->
+            let (Source s) = src
+            s.Dispose())
+        |> ignore
 
     /// run ファイルを開いて先頭 1行を読む。
     let openRun (path: string) =
+        let openSource path =
+            protect (fun () ->
+                let fs = System.IO.File.OpenRead path
+                Source(new System.IO.BufferedStream(fs, 65536) :> System.IO.Stream))
+
         match openSource path with
         | Error e -> Error e
         | Ok src ->
@@ -222,6 +211,15 @@ module internal Spill =
                 unlink path
                 Error e
             | Ok head -> Ok { Path = path; Src = src; Head = head }
+
+    /// run を閉じてファイルを消す（尽きた・破棄するとき）。
+    /// ストリームを閉じずにファイルだけ消すとハンドルが洩れるので、必ず一緒に閉じる。
+    let closeRun (state: RunState) =
+        closeSource state.Src
+        unlink state.Path
+
+    /// 複数の run をまとめて閉じて消す。
+    let closeAll (states: RunState list) = states |> List.iter closeRun
 
 /// 外部マージソート。
 /// <remarks>
@@ -235,18 +233,31 @@ module internal ExtSort =
     /// これ以内に収まるソートは従来どおりメモリだけで完結する。
     let DefaultBudgetBytes = 64L * 1024L * 1024L
 
-    /// 1行の概算バイト数。
-    let private approxRow (row: SqlValue array) =
-        row |> Array.sumBy ValueCodec.approximateBytes
+    /// 入力を整列して返す。
+    /// バジェット内ならメモリ、超過分は run として溢らして外部マージする。
+    let sortRows
+        (budgetBytes: int64)
+        (init: 'S)
+        (check: 'S -> SqlValue array -> Result<'S, DbError>)
+        (compareRows: SqlValue array -> SqlValue array -> int)
+        (src: Op)
+        =
+        let inMemory (rows: ResizeArray<SqlValue array>) =
+            rows.ToArray() |> Array.sortWith compareRows |> Op.ofArray
 
-    /// 整列済みの受け皿を Op として返す。
-    let private inMemory (rows: ResizeArray<SqlValue array>) (compareRows: SqlValue array -> SqlValue array -> int) =
-        rows.ToArray() |> Array.sortWith compareRows |> Op.ofArray
+        let rec openAll rest acc =
+            match rest with
+            | [] -> Ok(List.rev acc)
+            | p :: tail ->
+                match Spill.openRun p with
+                | Error e ->
+                    Spill.closeAll acc
+                    Spill.forget rest
+                    Error e
+                | Ok state -> openAll tail (state :: acc)
 
-    /// run を k-way merge して遅延 Op にする。
-    let private mergeRuns (compareRows: SqlValue array -> SqlValue array -> int) (states: Spill.RunState list) =
-        let rec scan (i: int) (bestIdx: int) (best: SqlValue array option) (xs: Spill.RunState list) =
-            match xs with
+        let rec scan i bestIdx best (states: Spill.RunState list) =
+            match states with
             | [] -> bestIdx
             | s :: tail ->
                 match s.Head with
@@ -256,21 +267,21 @@ module internal ExtSort =
                     | Some b when compareRows h b >= 0 -> scan (i + 1) bestIdx best tail
                     | _ -> scan (i + 1) i (Some h) tail
 
-        let rec splitAt (n: int) (xs: Spill.RunState list) (acc: Spill.RunState list) =
+        let rec splitAt n acc states =
             if n <= 0 then
-                List.rev acc, xs
+                List.rev acc, states
             else
-                match xs with
+                match states with
                 | [] -> List.rev acc, []
-                | h :: tail -> splitAt (n - 1) tail (h :: acc)
+                | h :: tail -> splitAt (n - 1) (h :: acc) tail
 
-        let rec pull (xs: Spill.RunState list) : Result<(SqlValue array * Spill.RunState list) option, DbError> =
-            let idx = scan 0 -1 None xs
+        let rec pull states =
+            let idx = scan 0 -1 None states
 
             if idx < 0 then
                 ret None
             else
-                let before, chosenAndAfter = splitAt idx xs []
+                let before, chosenAndAfter = splitAt idx [] states
 
                 match chosenAndAfter with
                 | [] -> ret None
@@ -289,42 +300,24 @@ module internal ExtSort =
                             let advanced = { chosen with Head = Some nxt }
                             ret (Some(row, before @ advanced :: after))
 
-        let rec emit (xs: Spill.RunState list) =
+        let rec mergeRuns states =
             Op.Compute(fun () ->
-                match pull xs with
+                match pull states with
                 | Error e -> err e
                 | Ok None -> ret None
-                | Ok(Some(row, rest)) -> ret (Some(row, emit rest)))
+                | Ok(Some(row, rest)) -> ret (Some(row, mergeRuns rest)))
 
-        emit states
+        let approxRow row =
+            row |> Array.sumBy ValueCodec.approximateBytes
 
-    /// 入力を整列して返す。
-    /// バジェット内ならメモリ、超過分は run として溢らして外部マージする。
-    let sortRows
-        (budgetBytes: int64)
-        (init: 'S)
-        (check: 'S -> SqlValue array -> Result<'S, DbError>)
-        (compareRows: SqlValue array -> SqlValue array -> int)
-        (src: Op)
-        =
-        Spill.sweepStale ()
-        let stamp = System.Guid.NewGuid().ToString "N"
-
-        let rec ingest
-            (buf: ResizeArray<SqlValue array>)
-            (bufBytes: int64)
-            (written: int)
-            (paths: string list)
-            (state: 'S)
-            (next: Op)
-            =
+        let rec ingest stamp buf bufBytes written paths state next =
             match Op.next next with
             | Error e ->
                 Spill.forget paths
                 Error e
             | Ok None ->
                 if List.isEmpty paths then
-                    ret (inMemory buf compareRows)
+                    ret (inMemory buf)
                 else
                     let all =
                         if buf.Count = 0 then
@@ -338,22 +331,11 @@ module internal ExtSort =
                         Spill.forget paths
                         Error e
                     | Ok runPaths ->
-                        let rec openAll (rest: string list) (acc: Spill.RunState list) =
-                            match rest with
-                            | [] -> Ok(List.rev acc)
-                            | p :: tail ->
-                                match Spill.openRun p with
-                                | Error e ->
-                                    Spill.closeAll acc
-                                    Spill.forget rest
-                                    Error e
-                                | Ok state -> openAll tail (state :: acc)
-
                         match openAll runPaths [] with
                         | Error e ->
                             Spill.forget runPaths
                             Error e
-                        | Ok states -> ret (mergeRuns compareRows states)
+                        | Ok states -> ret (mergeRuns states)
             | Ok(Some(row, tail)) ->
                 match check state row with
                 | Error e ->
@@ -369,9 +351,11 @@ module internal ExtSort =
                             Error e
                         | Ok p ->
                             buf.Clear()
-                            ingest buf 0L (written + 1) (p :: paths) state' (Op.Step(row, tail))
+                            ingest stamp buf 0L (written + 1) (p :: paths) state' (Op.Step(row, tail))
                     else
                         buf.Add row
-                        ingest buf (bufBytes + size) written paths state' tail
+                        ingest stamp buf (bufBytes + size) written paths state' tail
 
-        ingest (ResizeArray<SqlValue array>()) 0L 0 [] init src
+        Spill.sweepStale ()
+        let stamp = System.Guid.NewGuid().ToString "N"
+        ingest stamp (ResizeArray<SqlValue array>()) 0L 0 [] init src

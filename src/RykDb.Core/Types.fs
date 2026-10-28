@@ -231,11 +231,6 @@ module internal SqlValue =
         | SqlValue.Decimal d -> Some d
         | _ -> None
 
-    let asInt64 =
-        function
-        | SqlValue.Int i -> Some i
-        | _ -> None
-
     let asText =
         function
         | SqlValue.Text s -> Some s
@@ -245,7 +240,7 @@ module internal SqlValue =
     /// .NET の Double.NaN は符号ビットが立った負の NaN なので、
     /// そのままキーにすると「負の NaN」とみなされ、順序保持が壊れる。
     [<Literal>]
-    let CanonicalNaNBits = 0x7FF8000000000000L
+    let private CanonicalNaNBits = 0x7FF8000000000000L
 
     let canonicalNaN = System.BitConverter.Int64BitsToDouble CanonicalNaNBits
 

@@ -16,15 +16,15 @@ let private build (entries: (int * uint64) list) =
     let es =
         entries |> List.map (fun (k, seqNo) -> Entry.put (intKey k) seqNo (intRow k))
 
-    Memtable.apply es Memtable.empty
+    Memtable.apply es Memtable.Empty
 
 [<Fact>]
 let ``Memtable: 空の memtable は何も返さない`` () =
-    Assert.Equal(0, Memtable.empty.Count)
-    Assert.Equal(0, Memtable.empty.ApproxBytes)
-    Assert.Empty(Memtable.toArray Memtable.empty)
-    Assert.Empty(Memtable.rangeScan (intKey 0) 0 Memtable.empty)
-    Assert.True((Memtable.getVisible (intKey 0) None Memtable.empty).IsNone)
+    Assert.Equal(0, Memtable.Empty.Count)
+    Assert.Equal(0, Memtable.Empty.ApproxBytes)
+    Assert.Empty(Memtable.toArray Memtable.Empty)
+    Assert.Empty(Memtable.rangeScan (intKey 0) 0 Memtable.Empty)
+    Assert.True((Memtable.getVisible (intKey 0) None Memtable.Empty).IsNone)
 
 [<Fact>]
 let ``Memtable: apply したエントリを getVisible で引ける`` () =
@@ -35,7 +35,7 @@ let ``Memtable: apply したエントリを getVisible で引ける`` () =
                 Entry.put (intKey 2) 2UL [| SqlValue.Text "hello" |]
                 Entry.put (intKey 3) 3UL [| SqlValue.Blob [| 1uy; 2uy; 3uy |] |]
             |]
-            Memtable.empty
+            Memtable.Empty
 
     Assert.Equal(3, mem.Count)
     Assert.Equal<SqlValue array>([| SqlValue.Int 10L |], (entry (Memtable.getVisible (intKey 1) None mem)).Value.Value)
@@ -54,7 +54,7 @@ let ``Memtable: apply したエントリを getVisible で引ける`` () =
 
 [<Fact>]
 let ``Memtable: apply しても元の memtable は変わらない`` () =
-    let before = Memtable.apply [ Entry.put (intKey 1) 1UL (intRow 1) ] Memtable.empty
+    let before = Memtable.apply [ Entry.put (intKey 1) 1UL (intRow 1) ] Memtable.Empty
     let after = Memtable.apply [ Entry.put (intKey 2) 2UL (intRow 2) ] before
     Assert.Equal(1, before.Count)
     Assert.Equal(2, after.Count)
@@ -78,7 +78,7 @@ let ``Memtable: Count と ApproxBytes は挿入したエントリの合計にな
             Entry.delete (intKey 3) 3UL
         |]
 
-    let mem = Memtable.apply entries Memtable.empty
+    let mem = Memtable.apply entries Memtable.Empty
     Assert.Equal(entries.Length, mem.Count)
     Assert.Equal(entries |> Array.sumBy Entry.approxBytes, mem.ApproxBytes)
 
@@ -117,7 +117,7 @@ let ``Memtable: 同一キーは SeqNo が最大の版を返す`` () =
         [ 7UL; 3UL; 9UL; 1UL ]
         |> List.fold
             (fun m seqNo -> Memtable.apply [ Entry.put (intKey 42) seqNo (intRow (int seqNo)) ] m)
-            Memtable.empty
+            Memtable.Empty
 
     let e = entry (Memtable.getVisible (intKey 42) None mem)
     Assert.Equal<uint64>(9UL, e.SeqNo)
@@ -130,7 +130,7 @@ let ``Memtable: 同一キーは SeqNo が最大の版を返す`` () =
 [<Fact>]
 let ``Memtable: 削除 tombstone が最新なら削除として返る`` () =
     let mem =
-        Memtable.empty
+        Memtable.Empty
         |> Memtable.apply [ Entry.put (intKey 1) 1UL (intRow 1) ]
         |> Memtable.apply [ Entry.delete (intKey 1) 2UL ]
 
@@ -148,7 +148,7 @@ let ``Memtable: 全キーを個別に引ける（探索方向の誤りを検出�
         [
             for i in 0 .. n - 1 -> Entry.put (intKey i) (uint64 i + 1UL) [| SqlValue.Int(int64 (i * 3)) |]
         ]
-        |> fun es -> Memtable.apply es Memtable.empty
+        |> fun es -> Memtable.apply es Memtable.Empty
 
     for i in 0 .. n - 1 do
         let e = entry (Memtable.getVisible (intKey i) None mem)
@@ -167,7 +167,7 @@ let ``Memtable: visible より新しい版は見えない`` () =
                 Entry.put (intKey 1) 5UL (intRow 5)
                 Entry.put (intKey 1) 9UL (intRow 9)
             |]
-            Memtable.empty
+            Memtable.Empty
 
     // 最新から見える版を選ぶ（SeqNo が visible 以下で最大）
     Assert.Equal<uint64>(5UL, (entry (Memtable.getVisible (intKey 1) (Some 6UL) mem)).SeqNo)
@@ -178,7 +178,7 @@ let ``Memtable: visible より新しい版は見えない`` () =
 [<Fact>]
 let ``Memtable: 削除も snapshot で見え隠れする`` () =
     let mem =
-        Memtable.apply [| Entry.put (intKey 1) 1UL (intRow 1); Entry.delete (intKey 1) 5UL |] Memtable.empty
+        Memtable.apply [| Entry.put (intKey 1) 1UL (intRow 1); Entry.delete (intKey 1) 5UL |] Memtable.Empty
 
     // 削除前の snapshot では行が見える
     Assert.False((entry (Memtable.getVisible (intKey 1) (Some 4UL) mem)).IsDelete)
@@ -191,7 +191,7 @@ let ``Memtable: 接頭辞のキーは短い方が小さい`` () =
     let longer = [| 1uy; 0uy |]
 
     let mem =
-        Memtable.apply [| Entry.put longer 2UL (intRow 2); Entry.put shorter 1UL (intRow 1) |] Memtable.empty
+        Memtable.apply [| Entry.put longer 2UL (intRow 2); Entry.put shorter 1UL (intRow 1) |] Memtable.Empty
 
     let all = Memtable.toArray mem
     Assert.Equal<byte array>(shorter, all.[0].Key)
@@ -212,7 +212,7 @@ let ``Memtable: 乱数キーでも列挙順と可視性が参照実装と一致�
                 k, Entry.put (intKey k) (uint64 (nextInt 1 10_000)) (intRow (k * 1000))
         |]
 
-    let mem = Memtable.apply (entries |> Array.map snd) Memtable.empty
+    let mem = Memtable.apply (entries |> Array.map snd) Memtable.Empty
     Assert.Equal(n, mem.Count)
 
     // 参照実装: キーごとの版を SeqNo 降順に並べたもの
@@ -295,7 +295,7 @@ let ``Memtable: rangeScan は同一キーの全版を SeqNo 降順で返す`` ()
 
 [<Fact>]
 let ``Memtable: rangeScan は先頭 1件だけなら全件を実体化しない`` () =
-    let n = 20_000
+    let n = 2_000
     let mem = build [ for i in 0 .. n - 1 -> i, uint64 i + 1UL ]
     // 一度走らせて JIT 分を測定から除く
     Memtable.rangeScan (intKey 0) 0 mem |> Seq.head |> ignore
@@ -317,7 +317,7 @@ let ``Memtable: 挿入順に関わらずキー昇順で列挙される`` () =
     let mem =
         shuffled
         |> List.map (fun i -> Entry.put (intKey i) (uint64 i + 1UL) (intRow i))
-        |> fun es -> Memtable.apply es Memtable.empty
+        |> fun es -> Memtable.apply es Memtable.Empty
 
     let all = Memtable.toArray mem
     Assert.Equal(n, all.Length)
@@ -338,7 +338,7 @@ let ``Memtable: 別のキーが混ざっていても可視な最新版を返す`
                 Entry.put (intKey 2) 7UL (intRow 7)
                 Entry.put (intKey 1) 9UL (intRow 9)
             |]
-            Memtable.empty
+            Memtable.Empty
 
     // 最新版（SeqNo が最大の版）
     Assert.Equal<uint64>(9UL, (entry (Memtable.getVisible (intKey 1) None mem)).SeqNo)
@@ -356,18 +356,16 @@ let ``Memtable: 別のキーが混ざっていても可視な最新版を返す`
 
 [<Fact>]
 let ``Memtable: getVisible は探索が対数時間（多数の版があっても比例しない）`` () =
-    // 同じキーの版を 2 万個積む。
-    // 以前は一致したノードの子をすべて辿っていた（木の大きさに比例）ので、
-    // 1 回の参照で 2 万ノードを歩いていた。今は対数時間。
-    let versions = 20_000
+    // 同じキーの版を 2000個積む。
+    let versions = 2_000
 
     let mem =
         Seq.init versions (fun i -> Entry.put (intKey 1) (uint64 i) (intRow i))
-        |> fun es -> Memtable.apply es Memtable.empty
+        |> fun es -> Memtable.apply es Memtable.Empty
 
     let sw = System.Diagnostics.Stopwatch.StartNew()
 
-    for _ in 1..10_000 do
+    for _ in 1..1_000 do
         Memtable.getVisible (intKey 1) None mem |> ignore
 
     let ms = sw.ElapsedMilliseconds

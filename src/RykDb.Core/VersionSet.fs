@@ -23,7 +23,7 @@ type internal Version =
     }
 
 module internal Version =
-    let empty =
+    let Empty =
         {
             Files = Array.create Levels.Count [||]
             SequenceNumber = 0UL
@@ -31,11 +31,11 @@ module internal Version =
         }
 
     /// 指定レベルのファイル列。
-    let filesAt (v: Version) (level: int) = v.Files.[level]
+    let filesAt (level: int) (v: Version) = v.Files.[level]
 
     /// ファイルを追加した新しい Version を返す。
     let addFile (f: FileMetaData) (v: Version) =
-        let levelFiles = filesAt v f.Level
+        let levelFiles = filesAt f.Level v
 
         let merged =
             Array.append [| f |] levelFiles
@@ -58,11 +58,11 @@ module internal Version =
         { v with Files = newFiles }
 
     /// ポイントルックアップで consulted すべきファイル（新しい順）。
-    let filesForPointLookup (v: Version) (key: byte array) =
+    let filesForPointLookup (key: byte array) (v: Version) =
         v.Files
         |> Array.mapi (fun level files -> files |> Array.map (fun f -> level, f))
         |> Array.collect id
-        |> Array.filter (fun (_, f) -> FileMetaData.mightContain f key)
+        |> Array.filter (fun (_, f) -> FileMetaData.mightContain key f)
         |> Array.sortByDescending (fun (level, f) -> struct (-level, f.FileNumber))
         |> Array.map snd
         |> Array.toList
@@ -102,7 +102,7 @@ module internal VersionEdit =
         |> List.fold (fun current file -> Version.addFile file current) afterDelete
 
     let encode (edit: VersionEdit) =
-        let encodeFile (f: FileMetaData) =
+        let encodeFile f =
             Writer.build
                 [
                     Writer.varint (uint64 f.FileNumber)
@@ -114,7 +114,7 @@ module internal VersionEdit =
                     Writer.lengthPrefixed f.Largest
                 ]
 
-        let encodeDeleted (f: FileMetaData) =
+        let encodeDeleted f =
             Writer.build [ Writer.varint (uint64 f.FileNumber); Writer.varint (uint64 f.Level) ]
 
         let steps =
@@ -137,7 +137,7 @@ module internal VersionEdit =
                 else
                     ret (int v, c)
 
-        let decodeFile (c: Cursor) =
+        let decodeFile c =
             result {
                 let! num, c = readFileNumber c
                 let! lvl, c = readLevel c
@@ -160,20 +160,20 @@ module internal VersionEdit =
                     }
             }
 
-        let decodeDeleted (c: Cursor) =
+        let decodeDeleted c =
             result {
                 let! num, c = readFileNumber c
                 let! lvl, c = readLevel c
 
                 return
                     c,
-                    { FileMetaData.zero with
+                    { FileMetaData.Zero with
                         FileNumber = num
                         Level = lvl
                     }
             }
 
-        let step (c: Cursor) =
+        let step c =
             result {
                 let! tag, c = Reader.readVarint c
 
@@ -188,7 +188,7 @@ module internal VersionEdit =
                 return c, file, tag = 1UL
             }
 
-        let rec readFiles (c: Cursor) (added: FileMetaData list) (deleted: FileMetaData list) =
+        let rec readFiles c added deleted =
             if Cursor.atEnd c then
                 ret (List.rev added, List.rev deleted)
             else

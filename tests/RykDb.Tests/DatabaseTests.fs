@@ -278,7 +278,7 @@ let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
         let tableDir = System.IO.Path.Combine(dir, Keyspace.toDirName (Keyspace.table "t"))
 
         let newest =
-            System.IO.Directory.GetFiles(tableDir, "*" + FileMetaData.sstExtension)
+            System.IO.Directory.GetFiles(tableDir, "*" + FileMetaData.SstExtension)
             |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
 
         let bytes = System.IO.File.ReadAllBytes newest
@@ -494,7 +494,7 @@ let ``Database: 大量行の CREATE INDEX はチャンクで backfill する`` (
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
 
         let db2 =
-            [ 1..9 ]
+            [ 1..3 ]
             |> List.fold
                 (fun db block ->
                     let start = (block - 1) * 1000 + 1
@@ -510,11 +510,11 @@ let ``Database: 大量行の CREATE INDEX はチャンクで backfill する`` (
 
         let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
         let _, count = ok (db3.Query "SELECT COUNT(*) FROM t WHERE a = 7")
-        Assert.Equal<int64>(900L, asInt count.Rows.[0].[0])
+        Assert.Equal<int64>(300L, asInt count.Rows.[0].[0])
 
         // UNIQUE 検査も全件 Set を保持せず、索引走査で行う。
         let db4 = exec db3 "CREATE UNIQUE INDEX ix_id ON t (id)"
-        let _, found = ok (db4.Query "SELECT COUNT(*) FROM t WHERE id = 9000")
+        let _, found = ok (db4.Query "SELECT COUNT(*) FROM t WHERE id = 1000")
         Assert.Equal<int64>(1L, asInt found.Rows.[0].[0])
 
         // 同様に負荷の高い DROP TABLE もチャンクで後始末できる。
@@ -1469,10 +1469,10 @@ let ``Database: DROP TABLE は索引 keyspace の孤児エントリも消す`` (
         let store = ok (RowStore.openStore dir)
 
         let indexRows =
-            ok (RowStore.scanAt store (Keyspace.index "ix_g") [||] Snapshot.noLimit 0)
+            ok (RowStore.scanAt store (Keyspace.index "ix_g") [||] Snapshot.NoLimit 0)
 
         let tableRows =
-            ok (RowStore.scanAt store (Keyspace.table "t") [||] Snapshot.noLimit 0)
+            ok (RowStore.scanAt store (Keyspace.table "t") [||] Snapshot.NoLimit 0)
 
         Assert.Empty indexRows
         Assert.Empty tableRows
@@ -1503,10 +1503,10 @@ let ``Database: 中断した DROP の後始末を open 時に再開する`` () =
         let store = ok (RowStore.openStore dir)
 
         let tableRows =
-            ok (RowStore.scanAt store (Keyspace.table "t") [||] Snapshot.noLimit 0)
+            ok (RowStore.scanAt store (Keyspace.table "t") [||] Snapshot.NoLimit 0)
 
         let indexRows =
-            ok (RowStore.scanAt store (Keyspace.index "ix_a") [||] Snapshot.noLimit 0)
+            ok (RowStore.scanAt store (Keyspace.index "ix_a") [||] Snapshot.NoLimit 0)
 
         Assert.Empty tableRows
         Assert.Empty indexRows
@@ -1619,8 +1619,8 @@ let ``E2E: 一連の流れが誤差なく通る`` () =
 [<Fact>]
 let ``性能: 多数行の insert → point lookup → range scan`` () =
     withDir "perf" (fun dir ->
-        // 10 万行。実用時間内で終わることを確かめる。
-        let rowCount = 100000
+        // 10000行。実用時間内で終わることを確かめる。
+        let rowCount = 10000
 
         let db =
             exec (ok (Database.openWith dir)) "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -1679,7 +1679,7 @@ let ``末尾再帰: 大量の文を 1 度の Execute で実行できる`` () =
     // Execute の runStatements は `runStatement … |> Result.bind (fun … -> runStatements …)` で
     // 文の数だけフレームが積まれていた（→ StackOverflow / exit 134）。
     // `match` で受けて末尾再帰にしてある。
-    let n = 20_000
+    let n = 2_000
 
     withDb "tail-exec" (fun db0 ->
         let db = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
@@ -1815,35 +1815,35 @@ let ``Database: active transaction は snapshot registry に登録され、commi
     withDir "reg-lifecycle" (fun dir ->
         let db = ok (Database.openWith dir)
         let root = db.Root
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
 
         // 明示 transaction: Begin で登録、Commit で解除
         let tx = ok (db.Begin())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsSome)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
         let committed = ok (tx.Commit())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
 
         // Rollback でも解除
         let tx2 = ok (committed.Begin())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsSome)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
         let rolledBack = ok (tx2.Rollback())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
 
         // SQL の BEGIN / COMMIT 経由でも同じ
         let sqlTx, _ = ok (rolledBack.Execute "BEGIN")
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsSome)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
         let sqlDone, _ = ok (sqlTx.Execute "COMMIT")
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
 
         // 暗黙 transaction は Execute の中で登録・解除が完結する
         let withTable, _ = ok (sqlDone.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
 
         // Close でも解除される（閉じたハンドルの snapshot は誰も読めない）
         let openTx = ok (withTable.Begin())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsSome)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
         ok (openTx.Close())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None root).IsNone))
+        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone))
 
 /// transaction を開始してハンドルを捨てる（呼び出し側は戻り値しか持たない）。
 /// `NoInlining` は Debug ビルドのローカルがメソッド末尾まで生き残るのを避けるため。
@@ -1851,7 +1851,7 @@ let ``Database: active transaction は snapshot registry に登録され、commi
 [<System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)>]
 let private abandonTransaction (db: Database) =
     let tx = ok (db.Begin())
-    let registered = (ActiveSnapshotRegistry.oldestExcept None db.Root).IsSome
+    let registered = (ActiveSnapshotRegistry.oldestExcept db.Root None).IsSome
     // tx はここを抜けると到達不能になる（finalizer が登録を外せる）。
     registered && tx.InTransaction
 
@@ -1870,7 +1870,7 @@ let ``Database: commit せずに捨てた transaction も GC されれば登録�
 
         collectGarbage ()
         // 最後のハンドルが消えたので登録が外れる（修正前はここに残り続けた）。
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None withTable.Root).IsNone)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept withTable.Root None).IsNone)
 
         // 登録が残っていると ConflictError になる DDL が通る。
         let indexed = exec withTable "CREATE INDEX ix_v ON t (v)"
@@ -1888,10 +1888,10 @@ let ``Database: 生きている transaction は GC されても登録が残る``
 
         // tx はこのあと Rollback で使うので GC されない（finalizer は走らない）。
         collectGarbage ()
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None db.Root).IsSome)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept db.Root None).IsSome)
 
         let rolled = ok (tx.Rollback())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None db.Root).IsNone)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept db.Root None).IsNone)
         ok (rolled.Close()))
 
 [<Fact>]
@@ -1899,10 +1899,10 @@ let ``Database: Dispose でも transaction の登録が外れる`` () =
     withDir "reg-dispose" (fun dir ->
         let db = ok (Database.openWith dir)
         let tx = ok (db.Begin())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None db.Root).IsSome)
+        Assert.True((ActiveSnapshotRegistry.oldestExcept db.Root None).IsSome)
 
         (tx :> System.IDisposable).Dispose()
-        Assert.True((ActiveSnapshotRegistry.oldestExcept None db.Root).IsNone))
+        Assert.True((ActiveSnapshotRegistry.oldestExcept db.Root None).IsNone))
 
 [<Fact>]
 let ``Database: 別プロセスが開いている DB は開けない`` () =

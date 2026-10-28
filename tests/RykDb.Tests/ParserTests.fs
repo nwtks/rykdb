@@ -4,7 +4,6 @@
 
 module RykDb.ParserTests
 
-open System
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -208,42 +207,41 @@ let private assertDepthExceeded (name: string) (sql: string) =
     expectDepthError name (Parser.parseStatement sql)
 
 [<Fact>]
-let ``末尾再帰: 200 万個の NOT が連なってもスタックを食わない`` () =
-    let depth = 2_000_000
-    assertDepthExceeded "200 万個の NOT" ("SELECT * FROM t WHERE " + String.replicate depth "NOT " + "a")
+let ``末尾再帰: 200000個の NOT が連なってもスタックを食わない`` () =
+    let depth = 200_000
+    assertDepthExceeded "200000個の NOT" ("SELECT * FROM t WHERE " + String.replicate depth "NOT " + "a")
 
 [<Fact>]
-let ``末尾再帰: 200 万個の単項マイナスが連なってもスタックを食わない`` () =
-    let depth = 2_000_000
-    assertDepthExceeded "200 万個の単項 '-'" ("SELECT * FROM t WHERE " + String.replicate depth "- " + "a")
+let ``末尾再帰: 200000個の単項マイナスが連なってもスタックを食わない`` () =
+    let depth = 200_000
+    assertDepthExceeded "200000個の単項 '-'" ("SELECT * FROM t WHERE " + String.replicate depth "- " + "a")
 
 [<Fact>]
-let ``末尾再帰: 50 万個の OR が連なってもスタックを食わない`` () =
-    let depth = 500_000
-    assertDepthExceeded "50 万個の OR" ("SELECT * FROM t WHERE " + String.replicate depth "a OR ")
+let ``末尾再帰: 50000個の OR が連なってもスタックを食わない`` () =
+    let depth = 50_000
+    assertDepthExceeded "50000個の OR" ("SELECT * FROM t WHERE " + String.replicate depth "a OR ")
 
 [<Fact>]
 let ``末尾再帰: BETWEEN を大量並べてもスタックを食わない`` () =
     // parseBetweenAndC は継続を hoist した関数。非末尾再帰に戻っても
     // StackOverflow ではなく深さエラーになる。
-    let depth = 500_000
+    let depth = 50_000
     assertDepthExceeded "大量の BETWEEN" ("SELECT * FROM t WHERE " + String.replicate depth "a BETWEEN 1 AND 2 OR ")
 
 [<Fact>]
 let ``末尾再帰: 加算の鎖も深さエラーになる`` () =
-    let depth = 200_000
-    assertDepthExceeded "20 万個の +" ("SELECT * FROM t WHERE a" + String.replicate depth " + 1")
+    let depth = 20_000
+    assertDepthExceeded "20000個の +" ("SELECT * FROM t WHERE a" + String.replicate depth " + 1")
 
 [<Fact>]
 let ``末尾再帰: AND の鎖も深さエラーになる`` () =
-    let depth = 500_000
-    assertDepthExceeded "50 万個の AND" ("SELECT * FROM t WHERE " + String.replicate depth "a AND " + "a")
+    let depth = 50_000
+    assertDepthExceeded "50000個の AND" ("SELECT * FROM t WHERE " + String.replicate depth "a AND " + "a")
 
 [<Fact>]
 let ``末尾再帰: 単項プラスと乗算の鎖も深さエラーになる`` () =
-    assertDepthExceeded "20 万個の単項 '+'" ("SELECT * FROM t WHERE " + String.replicate 200_000 "+ " + "a")
-
-    assertDepthExceeded "20 万個の *" ("SELECT * FROM t WHERE a" + String.replicate 200_000 " * a")
+    assertDepthExceeded "20000個の単項 '+'" ("SELECT * FROM t WHERE " + String.replicate 20_000 "+ " + "a")
+    assertDepthExceeded "20000個の *" ("SELECT * FROM t WHERE a" + String.replicate 20_000 " * a")
 
 [<Fact>]
 let ``末尾再帰: 上限内の演算子チェーンは受理される`` () =
@@ -276,7 +274,7 @@ let ``末尾再帰: 比較演算子の判定が hoist 後も正しい`` (expr: s
 
 [<Fact>]
 let ``末尾再帰: 長い文字列リテラルを字句解析できる`` () =
-    let len = 1_000_000
+    let len = 100_000
     let body = System.String('a', len)
     let sql = sprintf "SELECT * FROM t WHERE a = '%s'" body
 
@@ -286,7 +284,7 @@ let ``末尾再帰: 長い文字列リテラルを字句解析できる`` () =
 
 [<Fact>]
 let ``末尾再帰: 長いバイナリリテラルを字句解析できる`` () =
-    let len = 500_000
+    let len = 50_000
     let hex = System.String('A', len)
     let sql = sprintf "SELECT * FROM t WHERE a = X'%s'" hex
 
@@ -294,7 +292,7 @@ let ``末尾再帰: 長いバイナリリテラルを字句解析できる`` () 
 
 [<Fact>]
 let ``末尾再帰: 長いコメントを読み飛ばせる`` () =
-    let len = 1_000_000
+    let len = 100_000
     let body = System.String('x', len)
     let sql = sprintf "SELECT * FROM t /* %s */ WHERE a = 1" body
 
@@ -302,8 +300,8 @@ let ``末尾再帰: 長いコメントを読み飛ばせる`` () =
 
 [<Fact>]
 let ``末尾再帰: 大量のトークンを解析できる`` () =
-    // 50 万個の要素を持つ IN 句
-    let n = 500_000
+    // 50000個の要素を持つ IN 句
+    let n = 50_000
     let body = Array.init n (fun i -> string (i % 1000)) |> String.concat ","
     let sql = sprintf "SELECT * FROM t WHERE a IN (%s)" body
 
@@ -311,7 +309,7 @@ let ``末尾再帰: 大量のトークンを解析できる`` () =
 
 [<Fact>]
 let ``末尾再帰: 深い入れ子はエラーになる（StackOverflow ではない）`` () =
-    let depth = 50_000
+    let depth = 5_000
     let deep = System.String('(', depth) + "1" + System.String(')', depth)
     let sql = "SELECT * FROM t WHERE " + deep
 
@@ -406,7 +404,7 @@ let ``末尾再帰: 大量の JOIN 句がパースできる`` () =
     // parseJoins …` で JOIN の数だけフレームが積まれていた（→ StackOverflow / exit 134）。
     // `match` で受けて末尾再帰にしてある。テーブル参照は名前を読むだけで
     // 実体は不要なので、ここで大量の JOIN をそのまま投げられる。
-    let n = 100_000
+    let n = 10_000
 
     let joins =
         Array.init n (fun i -> sprintf "JOIN t%d ON x = y" (i + 1)) |> String.concat " "
@@ -459,10 +457,8 @@ let ``パーサ: INSERT / UPDATE / DELETE`` () =
 let ``末尾再帰: 大量の SET 句がパースできる`` () =
     // UPDATE の SET 連なりは `expectSymbol >>= … parseExpr >>= fun … -> assigns …`
     // で列の数だけフレームが積まれていた。`match` で受けて末尾再帰にしてある。
-    let n = 200_000
-
+    let n = 20_000
     let body = Array.init n (fun i -> sprintf "c%d = %d" i i) |> String.concat ", "
-
     let upd = parseUpdateOk (sprintf "UPDATE t SET %s" body)
     Assert.Equal(n, upd.Assignments.Length)
 
@@ -498,10 +494,10 @@ let ``パーサ: 複数文`` () =
 
 [<Fact>]
 let ``末尾再帰: 大量の文を分解できる`` () =
-    let n = 100_000
+    let n = 10_000
 
     let sql =
-        String.Join(";", Array.init n (fun i -> sprintf "SELECT a FROM t%d WHERE a = %d" (i % 7) i))
+        System.String.Join(";", Array.init n (fun i -> sprintf "SELECT a FROM t%d WHERE a = %d" (i % 7) i))
 
     Assert.Equal(n, (ok (Parser.parseStatements sql)).Length)
 

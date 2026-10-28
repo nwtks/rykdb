@@ -40,7 +40,7 @@ let ``Manifest: 変更を反映して再オープンしても復元できる`` (
         Assert.Equal(manifestNumber, manifestNumber2)
         Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts reopened)
         // 復元されたファイルの番号とキー範囲も一致する
-        let restored = (Version.filesAt reopened 1).[0]
+        let restored = (Version.filesAt 1 reopened).[0]
         Assert.Equal(2L, restored.FileNumber)
 
         Assert.Equal<string>(
@@ -180,7 +180,7 @@ let ``Manifest: 大きくなった manifest はスナップショットへロー
         let big = Array.create (5 * 1024 * 1024) 1uy
 
         let file =
-            { FileMetaData.zero with
+            { FileMetaData.Zero with
                 FileNumber = 1L
                 Level = 0
                 Smallest = big
@@ -204,7 +204,7 @@ let ``Manifest: NextFileNumber が Int64.MaxValue のとき負に回り込まな
         let _, mn = ok (Manifest.openOrCreate dir)
 
         let v =
-            { Version.empty with
+            { Version.Empty with
                 NextFileNumber = System.Int64.MaxValue
             }
         // used = MaxValue + 1 は負になるため、据え置き（else 側）になる

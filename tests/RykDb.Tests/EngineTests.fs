@@ -26,11 +26,11 @@ let private peopleSchema: TableSchema =
     }
 
 let private ctxOf (store: RowStore) =
-    ExecContext.create store Snapshot.noLimit
+    ExecContext.create store Snapshot.NoLimit
 
 /// commit して store へ流し込む。引き継いだ TransactionManager を返す。
 let private commitInto (store: RowStore) (mgr: TransactionManager) (txn: Transaction) =
-    let mgr2, _, batches = ok (TransactionManager.commit mgr txn)
+    let mgr2, _, batches = ok (TransactionManager.commit txn mgr)
     ok (RowStore.writeBatches store batches) |> ignore
     mgr2
 
@@ -345,7 +345,7 @@ let ``DbStateOps.commitToStore: 別ハンドルの active snapshot を GC 境界
             }
 
         let mgr, txn = TransactionManager.beginTxn mgr
-        let txn = Transaction.put txn "t:a" (intKey 1) (intRow 1)
+        let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
 
         // 同じ DB を開いた別ハンドルが snapshot 5 で読み始めている状態。
         let other = ActiveSnapshotRegistry.register dir 5UL
@@ -371,7 +371,7 @@ let ``DbStateOps.commitToStore: 自分の登録は GC 境界から除外する``
             }
 
         let mgr, txn = TransactionManager.beginTxn mgr
-        let txn = Transaction.put txn "t:a" (intKey 1) (intRow 1)
+        let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
 
         // 自分（これから commit する transaction）の登録は除外し、他の登録だけを見る。
         let own = ActiveSnapshotRegistry.register dir txn.Snapshot.SeqNo

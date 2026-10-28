@@ -385,7 +385,7 @@ let ``Eval.eval: CASE の空枝と ELSE 無しは NULL`` () =
     Assert.True(SqlValue.isNull (ok (ev [||] (Expr.Case([], None)))))
     // どの WHEN にも当たらず ELSE も無ければ NULL
     let noMatch =
-        Expr.Case([ Expr.Literal(Literal.Bool false), Expr.Literal(Literal.Int 1L) ], None)
+        Expr.Case([ (Expr.Literal(Literal.Bool false), Expr.Literal(Literal.Int 1L)) ], None)
 
     Assert.True(SqlValue.isNull (ok (ev [||] noMatch)))
 

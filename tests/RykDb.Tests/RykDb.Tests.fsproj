@@ -24,10 +24,12 @@
     <Compile Include="AstTests.fs" />
     <Compile Include="LexerTests.fs" />
     <Compile Include="ParserTests.fs" />
+    <Compile Include="OpTests.fs" />
     <Compile Include="RowStoreTests.fs" />
     <Compile Include="CatalogTests.fs" />
     <Compile Include="SchemaTests.fs" />
     <Compile Include="EvalTests.fs" />
+    <Compile Include="ExtSortTests.fs" />
     <Compile Include="OpsTests.fs" />
     <Compile Include="ExecContextTests.fs" />
     <Compile Include="PlannerTests.fs" />

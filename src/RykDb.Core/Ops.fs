@@ -94,7 +94,7 @@ module internal Ops =
     /// </remarks>
     let distinctWithin (budgetBytes: int64) (src: Op) =
         let encode (row: SqlValue array) =
-            ValueCodec.writeValues row Writer.empty |> Writer.toArray
+            ValueCodec.writeValues row Writer.Empty |> Writer.toArray
 
         let rec skipSeen (seen: System.Collections.Generic.HashSet<byte array>) (used: int64) (cur: Op) =
             Op.pull cur (fun row nxt ->

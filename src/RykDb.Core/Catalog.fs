@@ -157,7 +157,7 @@ module internal Catalog =
     //
 
     let private encodeTable (t: TableDefinition) =
-        let w0 = Writer.varint (uint64 t.Columns.Length) Writer.empty
+        let w0 = Writer.varint (uint64 t.Columns.Length) Writer.Empty
 
         let w2 =
             t.Columns
@@ -232,7 +232,7 @@ module internal Catalog =
 
     let private encodeIndex (i: IndexDefinition) =
         let w2 =
-            Writer.empty
+            Writer.Empty
             |> Writer.str i.TableName
             |> Writer.bool i.Unique
             |> Writer.varint (uint64 i.Columns.Length)

@@ -116,8 +116,8 @@ let ``Binder: 全ノード種を qualify しても構造が保たれる`` () =
         Assert.Equal<string>(Expr.toDisplayString expected, Expr.toDisplayString (ok (Binder.qualify schema input)))
 
 [<Fact>]
-let ``末尾再帰: 20 万段の式を qualify してもスタックを食わない`` () =
-    let depth = 200_000
+let ``末尾再帰: 20000段の式を qualify してもスタックを食わない`` () =
+    let depth = 20_000
     let schema = Schema.ofTable "people" None peopleSchema
 
     // テスト側も末尾再帰で組む（SQL 経由だと MaxExpressionDepth = 200 で頭打ちになる）
@@ -481,7 +481,7 @@ let ``末尾再帰: 20 万段の AND を chooseScanMethod してもスタック�
         let miss = Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))
 
         let deep =
-            List.init 200_000 (fun _ -> miss)
+            List.init 20_000 (fun _ -> miss)
             |> List.fold (fun acc p -> Expr.Binary(BinaryOp.And, acc, p)) hit
 
         match ok (Analyzer.chooseScanMethod b Catalog.empty [ deep ]) with

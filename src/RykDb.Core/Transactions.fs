@@ -26,7 +26,7 @@ module internal Snapshot =
     let toVisible (snap: Snapshot) = Some snap.SeqNo
 
     /// 制限なし。
-    let noLimit: uint64 option = None
+    let NoLimit: uint64 option = None
 
 /// 書き込み中の transaction。
 /// commit まで DB から見えない。
@@ -67,7 +67,7 @@ module internal Transaction =
 
         int64 keyspace.Length + int64 (Entry.approxBytes entry) + 16L
 
-    let private setSlot (txn: Transaction) (keyspace: string) (key: byte array) (slot: SqlValue array option) =
+    let private setSlot (keyspace: string) (key: byte array) (slot: SqlValue array option) (txn: Transaction) =
         let inner =
             match Map.tryFind keyspace txn.Buffers with
             | Some m -> m
@@ -84,6 +84,13 @@ module internal Transaction =
             ApproxBytes = txn.ApproxBytes - oldBytes + slotBytes keyspace key slot
         }
 
+    /// 値を書き込む（バッファに積む）。
+    let put (keyspace: string) (key: byte array) (value: SqlValue array) (txn: Transaction) =
+        setSlot keyspace key (Some value) txn
+
+    /// 削除を書き込む（バッファに積む）。
+    let remove (keyspace: string) (key: byte array) (txn: Transaction) = setSlot keyspace key None txn
+
     /// バッファが上限を超えているか。
     let isOverLimit (txn: Transaction) = txn.ApproxBytes > txn.LimitBytes
 
@@ -98,20 +105,13 @@ module internal Transaction =
         else
             ret txn
 
-    /// 値を書き込む（バッファに積む）。
-    let put (txn: Transaction) (keyspace: string) (key: byte array) (value: SqlValue array) =
-        setSlot txn keyspace key (Some value)
-
-    /// 削除を書き込む（バッファに積む）。
-    let remove (txn: Transaction) (keyspace: string) (key: byte array) = setSlot txn keyspace key None
-
     /// txn がこのキーへ書いた内容。
     /// 外側の None は未書き込み、内側の None は削除を表す。
-    let tryFind (txn: Transaction) (keyspace: string) (key: byte array) =
+    let tryFind (keyspace: string) (key: byte array) (txn: Transaction) =
         txn.Buffers |> Map.tryFind keyspace |> Option.bind (Map.tryFind key)
 
     /// txn が keyspace に書いた全スロット。
-    let slotsOf (txn: Transaction) (keyspace: string) =
+    let slotsOf (keyspace: string) (txn: Transaction) =
         txn.Buffers
         |> Map.tryFind keyspace
         |> Option.map Map.toList
@@ -134,8 +134,8 @@ module internal Transaction =
     /// 決定的な順序にするため keyspace 名 → キーの昇順で採番する
     /// （同じ transaction は常に同じ SeqNo 割当になる）。
     let toEntries (nextSeqNo: uint64) (txn: Transaction) =
-        let rec step (items: (byte array * SqlValue array option) list) (seqNo: uint64) (acc: Entry list) =
-            match items with
+        let rec step seqNo acc =
+            function
             | [] -> List.rev acc
             | (k, v) :: tail ->
                 let e =
@@ -143,20 +143,19 @@ module internal Transaction =
                     | Some values -> Entry.put k seqNo values
                     | None -> Entry.delete k seqNo
 
-                step tail (seqNo + 1UL) (e :: acc)
+                step (seqNo + 1UL) (e :: acc) tail
 
-        let rec perKeyspace
-            (spaces: (string * (byte array * SqlValue array option) list) list)
-            (seqNo: uint64)
-            (acc: (string * Entry array) list)
-            =
-            match spaces with
+        let rec perKeyspace seqNo acc =
+            function
             | [] -> List.rev acc, seqNo
             | (ks, entries) :: rest ->
-                let made = step entries seqNo [] |> Array.ofList
-                perKeyspace rest (seqNo + uint64 entries.Length) ((ks, made) :: acc)
+                let made = step seqNo [] entries |> Array.ofList
+                perKeyspace (seqNo + uint64 entries.Length) ((ks, made) :: acc) rest
 
-        perKeyspace (txn.Buffers |> Map.toList |> List.map (fun (ks, m) -> ks, m |> Map.toList)) nextSeqNo []
+        txn.Buffers
+        |> Map.toList
+        |> List.map (fun (ks, m) -> ks, m |> Map.toList)
+        |> perKeyspace nextSeqNo []
 
 /// active な transaction 1件分。
 type internal TxnRecord =
@@ -197,12 +196,12 @@ module internal TransactionManager =
         }
 
     /// 指定した上限で transaction を始める。
-    let beginTxnWithLimit (limit: int64) (mgr: TransactionManager) =
+    let beginTxnWithLimit (limit: int64 option) (mgr: TransactionManager) =
         let snap = { Snapshot.SeqNo = mgr.LastCommitSeqNo }
 
         let txn =
             { Transaction.create mgr.NextTxnId snap with
-                LimitBytes = limit
+                LimitBytes = Option.defaultValue mgr.MaxTransactionBytes limit
             }
 
         let record = { Txn = txn; Keys = Set.empty }
@@ -216,15 +215,7 @@ module internal TransactionManager =
         updated, txn
 
     /// 現在の「DB の時刻」で transaction を始める。
-    let beginTxn (mgr: TransactionManager) =
-        beginTxnWithLimit mgr.MaxTransactionBytes mgr
-
-    /// transaction を破棄する（abort）。
-    /// バッファは捨てられるので DB には何も残らない。
-    let abort (mgr: TransactionManager) (txnId: TxnId) =
-        { mgr with
-            Active = Map.remove txnId mgr.Active
-        }
+    let beginTxn (mgr: TransactionManager) = beginTxnWithLimit None mgr
 
     /// GC の境界になる最古の active snapshot。
     /// active な transaction が無ければ「次の commit で採番される SeqNo」を返す
@@ -252,8 +243,8 @@ module internal TransactionManager =
     ///    「全部の active snapshot 以降に commit された版」以外は捨てられる。
     ///    捨てないと書き込んだ全キーがプロセス寿命の間メモリに残り続ける。
     /// 返り値の Entry 配列を StorageEngine に流し込むと DB に反映される。
-    let commit (mgr: TransactionManager) (txn: Transaction) =
-        let findConflicts (txn: Transaction) (lastCommitted: Map<string, uint64>) (snapSeq: uint64) =
+    let commit (txn: Transaction) (mgr: TransactionManager) =
+        let findConflicts txn lastCommitted snapSeq =
             Transaction.writeKeys txn
             |> Set.toList
             |> List.filter (fun k ->
@@ -261,7 +252,7 @@ module internal TransactionManager =
                 | Some seq -> seq > snapSeq
                 | None -> false)
 
-        let updateLastCommitted (batches: (string * Entry array) list) (lastCommitted: Map<string, uint64>) =
+        let updateLastCommitted lastCommitted (batches: (string * Entry array) list) =
             batches
             |> List.fold
                 (fun acc (ks, entries) ->
@@ -290,7 +281,7 @@ module internal TransactionManager =
                 )
             else
                 let batches, nextSeq = Transaction.toEntries mgr.NextSeqNo txn
-                let committed = updateLastCommitted batches mgr.LastCommitted
+                let committed = updateLastCommitted mgr.LastCommitted batches
                 let commitSeq = nextSeq - 1UL
 
                 let staged =
@@ -309,6 +300,13 @@ module internal TransactionManager =
                     }
 
                 Ok(updated, commitSeq, batches)
+
+    /// transaction を破棄する（abort）。
+    /// バッファは捨てられるので DB には何も残らない。
+    let abort (txn: Transaction) (mgr: TransactionManager) =
+        { mgr with
+            Active = Map.remove txn.TxnId mgr.Active
+        }
 
 /// 同じ DB を指す root 表記の揺れ（相対・絶対・末尾の /）を吸収する。
 module internal RootKey =
@@ -332,7 +330,7 @@ module internal RootKey =
 /// Core は `mutable` / `ref` を 0件に保つ規約なので、
 /// 連番カウンタではなく参照等価のオブジェクトを鍵にする。
 /// </remarks>
-type internal ActiveRegistration internal (root: string, snapshot: uint64) =
+type internal ActiveRegistration internal (root: string) =
     /// 生存しているハンドルのトークン。
     let handles = System.Collections.Concurrent.ConcurrentDictionary<obj, byte>()
 
@@ -362,7 +360,7 @@ type internal ActiveRegistration internal (root: string, snapshot: uint64) =
 /// </remarks>
 module internal ActiveSnapshotRegistry =
     /// 正規化した root -> (登録 -> snapshot)。
-    let private byRoot =
+    let private ByRoot =
         System.Collections.Concurrent.ConcurrentDictionary<
             string,
             System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>
@@ -370,7 +368,7 @@ module internal ActiveSnapshotRegistry =
             System.StringComparer.Ordinal
 
     let private bucket (root: string) =
-        byRoot.GetOrAdd(
+        ByRoot.GetOrAdd(
             RootKey.normalize root,
             fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>()
         )
@@ -378,7 +376,7 @@ module internal ActiveSnapshotRegistry =
     /// snapshot を登録し、解除に使う登録を返す。
     let register (root: string) (snapshot: uint64) =
         let key = RootKey.normalize root
-        let registration = ActiveRegistration(key, snapshot)
+        let registration = ActiveRegistration(key)
         (bucket key).[registration] <- snapshot
         registration
 
@@ -387,18 +385,18 @@ module internal ActiveSnapshotRegistry =
     let unregister (root: string) (registration: ActiveRegistration) =
         let key = RootKey.normalize root
 
-        match byRoot.TryGetValue key with
+        match ByRoot.TryGetValue key with
         | true, inner ->
             inner.TryRemove registration |> ignore
 
             if inner.IsEmpty then
-                byRoot.TryRemove key |> ignore
+                ByRoot.TryRemove key |> ignore
         | _ -> ()
 
     /// その root で active な snapshot の最小値。
     /// registration に自分の登録を渡すと、これから commit する transaction 自身を除外できる。
-    let oldestExcept (self: ActiveRegistration option) (root: string) =
-        match byRoot.TryGetValue(RootKey.normalize root) with
+    let oldestExcept (root: string) (self: ActiveRegistration option) =
+        match ByRoot.TryGetValue(RootKey.normalize root) with
         | true, inner ->
             inner
             |> Seq.fold
@@ -451,12 +449,12 @@ type internal RegistrationLease(registration: ActiveRegistration) =
 /// </remarks>
 module internal RootGate =
     /// 正規化した root -> ゲート。
-    let private gates =
+    let private Gates =
         System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.ReaderWriterLockSlim>
             System.StringComparer.Ordinal
 
     let private gateOf (root: string) =
-        gates.GetOrAdd(
+        Gates.GetOrAdd(
             RootKey.normalize root,
             fun _ -> new System.Threading.ReaderWriterLockSlim(System.Threading.LockRecursionPolicy.SupportsRecursion)
         )

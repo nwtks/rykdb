@@ -56,7 +56,7 @@ let withDir (tag: string) (f: string -> unit) =
 /// テスト用メモリエンジンの keyspace ごとの永続状態。
 /// ディスクの WAL replay 相当で、store を作り直しても内容が見える。
 type private MemoryEngineState() =
-    member val Mem = Memtable.empty with get, set
+    member val Mem = Memtable.Empty with get, set
     member val NextSeqNo = 1UL with get, set
 
 /// テスト用のメモリ StorageEngine。
@@ -104,7 +104,7 @@ type private MemoryStorageEngine(state: MemoryEngineState, mem: Memtable, nextSe
 /// メモリ上の StorageEngine を作る。
 /// 同じ store の中では keyspace ごとに状態を共有する（再オープンで内容が見える）。
 let private newMemoryEngineFactory () =
-    let states = System.Collections.Generic.Dictionary<string, MemoryEngineState>()
+    let states = Collections.Generic.Dictionary<string, MemoryEngineState>()
 
     fun keyspace ->
         match states.TryGetValue keyspace with

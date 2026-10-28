@@ -11,7 +11,7 @@ open RykDb.TestHelpers
 
 [<Fact>]
 let ``Writer: writeByte / readByte の往復`` () =
-    let w = Writer.empty |> Writer.writeByte 42uy |> Writer.toArray
+    let w = Writer.Empty |> Writer.writeByte 42uy |> Writer.toArray
     let c = Cursor.create w
     let b, c2 = ok (Reader.readByte c)
     Assert.Equal(42uy, b)
@@ -20,7 +20,7 @@ let ``Writer: writeByte / readByte の往復`` () =
 [<Fact>]
 let ``Writer: writeBytes / readBytes の往復`` () =
     let bs = [| 1uy; 2uy; 3uy |]
-    let w = Writer.empty |> Writer.writeBytes bs |> Writer.toArray
+    let w = Writer.Empty |> Writer.writeBytes bs |> Writer.toArray
     let c = Cursor.create w
     let got, c2 = ok (Reader.readBytes 3 c)
     Assert.Equal<byte array>(bs, got)
@@ -28,7 +28,7 @@ let ``Writer: writeBytes / readBytes の往復`` () =
 
 [<Fact>]
 let ``Writer: bool / readBool の往復`` () =
-    let w = Writer.empty |> Writer.bool true |> Writer.bool false |> Writer.toArray
+    let w = Writer.Empty |> Writer.bool true |> Writer.bool false |> Writer.toArray
     let c = Cursor.create w
     let b1, c2 = ok (Reader.readBool c)
     let b2, c3 = ok (Reader.readBool c2)
@@ -39,7 +39,7 @@ let ``Writer: bool / readBool の往復`` () =
 [<Fact>]
 let ``Writer: varint の往復`` () =
     for v in [ 0UL; 1UL; 127UL; 128UL; 16383UL; 16384UL; UInt64.MaxValue ] do
-        let w = Writer.empty |> Writer.varint v |> Writer.toArray
+        let w = Writer.Empty |> Writer.varint v |> Writer.toArray
         let c = Cursor.create w
         let got, c2 = ok (Reader.readVarint c)
         Assert.Equal(v, got)
@@ -48,7 +48,7 @@ let ``Writer: varint の往復`` () =
 [<Fact>]
 let ``Writer: int64LE / readInt64LE の往復`` () =
     let v = 0x0123456789ABCDEFL
-    let w = Writer.empty |> Writer.int64LE v |> Writer.toArray
+    let w = Writer.Empty |> Writer.int64LE v |> Writer.toArray
     let c = Cursor.create w
     let got, c2 = ok (Reader.readInt64LE c)
     Assert.Equal(v, got)
@@ -57,7 +57,7 @@ let ``Writer: int64LE / readInt64LE の往復`` () =
 [<Fact>]
 let ``Writer: uint32LE / readUInt32LE の往復`` () =
     let v = 0x89ABCDEFu
-    let w = Writer.empty |> Writer.uint32LE v |> Writer.toArray
+    let w = Writer.Empty |> Writer.uint32LE v |> Writer.toArray
     let c = Cursor.create w
     let got, c2 = ok (Reader.readUInt32LE c)
     Assert.Equal(v, got)
@@ -66,7 +66,7 @@ let ``Writer: uint32LE / readUInt32LE の往復`` () =
 [<Fact>]
 let ``Writer: lengthPrefixed / readLengthPrefixed の往復`` () =
     let bs = [| 9uy; 8uy; 7uy |]
-    let w = Writer.empty |> Writer.lengthPrefixed bs |> Writer.toArray
+    let w = Writer.Empty |> Writer.lengthPrefixed bs |> Writer.toArray
     let c = Cursor.create w
     let got, c2 = ok (Reader.readLengthPrefixed c)
     Assert.Equal<byte array>(bs, got)
@@ -75,7 +75,7 @@ let ``Writer: lengthPrefixed / readLengthPrefixed の往復`` () =
 [<Fact>]
 let ``Writer: str / readStr の往復`` () =
     let s = "hello"
-    let w = Writer.empty |> Writer.str s |> Writer.toArray
+    let w = Writer.Empty |> Writer.str s |> Writer.toArray
     let c = Cursor.create w
     let got, c2 = ok (Reader.readStr c)
     Assert.Equal(s, got)
@@ -132,7 +132,7 @@ let ``Reader: Int32.MaxValue を超える長さ指定は CorruptionError`` () =
 [<Fact>]
 let ``Reader: readItems は n 件読む`` () =
     let w =
-        Writer.empty
+        Writer.Empty
         |> Writer.writeByte 1uy
         |> Writer.writeByte 2uy
         |> Writer.writeByte 3uy
@@ -414,7 +414,7 @@ let ``KeyBuilder.startsWithPrefix: 前缀一致`` () =
 [<Fact>]
 let ``ValueCodec: 全型の往復`` () =
     let values = Array.init 3000 (fun _ -> randomValue ())
-    let w = ValueCodec.writeValues values Writer.empty
+    let w = ValueCodec.writeValues values Writer.Empty
     let got, _ = ok (ValueCodec.readValues (Cursor.create (Writer.toArray w)))
     Assert.Equal(values.Length, got.Length)
 

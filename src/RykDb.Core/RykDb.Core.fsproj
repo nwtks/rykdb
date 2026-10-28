@@ -10,8 +10,6 @@
     <Compile Include="Errors.fs" />
     <Compile Include="Types.fs" />
     <Compile Include="Serialization.fs" />
-    <Compile Include="Op.fs" />
-    <Compile Include="Spill.fs" />
     <Compile Include="Memtable.fs" />
     <Compile Include="Wal.fs" />
     <Compile Include="BloomFilter.fs" />
@@ -24,10 +22,12 @@
     <Compile Include="Ast.fs" />
     <Compile Include="Lexer.fs" />
     <Compile Include="Parser.fs" />
+    <Compile Include="Op.fs" />
     <Compile Include="RowStore.fs" />
     <Compile Include="Catalog.fs" />
     <Compile Include="Schema.fs" />
     <Compile Include="Eval.fs" />
+    <Compile Include="ExtSort.fs" />
     <Compile Include="Ops.fs" />
     <Compile Include="ExecContext.fs" />
     <Compile Include="Planner.fs" />

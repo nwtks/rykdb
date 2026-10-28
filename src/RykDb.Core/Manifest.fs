@@ -15,19 +15,19 @@ namespace RykDb.Core
 module internal Manifest =
     /// manifest ファイル名の接頭辞。
     [<Literal>]
-    let internal manifestPrefix = "MANIFEST-"
+    let ManifestPrefix = "MANIFEST-"
 
     let private fileName (fileNumber: int64) =
-        sprintf "%s%06d" manifestPrefix fileNumber
+        sprintf "%s%06d" ManifestPrefix fileNumber
 
     let private manifestPath (dir: string) (fileNumber: int64) =
         System.IO.Path.Combine(dir, fileName fileNumber)
 
     [<Literal>]
-    let private currentFileName = "CURRENT"
+    let private CurrentFileName = "CURRENT"
 
     let private currentPath (dir: string) =
-        System.IO.Path.Combine(dir, currentFileName)
+        System.IO.Path.Combine(dir, CurrentFileName)
 
     let private writeCurrent (dir: string) (fileNumber: int64) =
         protect (fun () ->
@@ -55,7 +55,7 @@ module internal Manifest =
     /// データベースを開く（新規なら作成する）。
     /// 返り値は (Version, 有効な manifest 番号)。
     let openOrCreate (dir: string) =
-        let readCurrent (dir: string) =
+        let readCurrent dir =
             protect (fun () ->
                 if not (System.IO.File.Exists(currentPath dir)) then
                     None
@@ -64,14 +64,14 @@ module internal Manifest =
 
                     if text = "" then
                         None
-                    elif text.StartsWith manifestPrefix && text.EndsWith ".manifest" then
+                    elif text.StartsWith ManifestPrefix && text.EndsWith ".manifest" then
                         Some(System.Int64.Parse(text.Substring(9, text.Length - 9 - ".manifest".Length)))
-                    elif text.StartsWith manifestPrefix then
+                    elif text.StartsWith ManifestPrefix then
                         Some(System.Int64.Parse(text.Substring 9))
                     else
                         raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
 
-        let readRecord (line: string) =
+        let readRecord line =
             try
                 System.Convert.FromBase64String line |> VersionEdit.decode
             with
@@ -79,7 +79,7 @@ module internal Manifest =
                 err (sprintf "manifest の base64 が不正: %s" e.Message |> DbError.corruption)
             | e -> err (sprintf "manifest のレコードが不正: %s" e.Message |> DbError.corruption)
 
-        let rec decodeLines (lines: string list) (acc: VersionEdit list) =
+        let rec decodeLines (lines: string list) acc =
             match lines with
             | [] -> Ok(List.rev acc, false)
             | line :: rest ->
@@ -99,7 +99,7 @@ module internal Manifest =
             else
                 Error(DbError.corruption (sprintf "有効な manifest が見つかりません: %s" (fileName fileNumber)))
 
-        let readAll (dir: string) (fileNumber: int64) =
+        let readAll dir fileNumber =
             match protect (fun () -> read dir fileNumber) with
             | Error e -> Error e
             | Ok(Error e) -> Error e
@@ -109,11 +109,11 @@ module internal Manifest =
                 decodeLines lines []
                 |> Result.map (fun (edits, truncated) -> edits, truncated, hasContent)
 
-        let applyAll (edits: VersionEdit list) (initial: Version) =
+        let applyAll edits initial =
             List.fold VersionEdit.apply initial edits
 
-        let hasSstFiles (dir: string) =
-            protect (fun () -> System.IO.Directory.GetFiles(dir, "*" + FileMetaData.sstExtension).Length > 0)
+        let hasSstFiles dir =
+            protect (fun () -> System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension).Length > 0)
 
         result {
             let! _ = ensureDirectory dir
@@ -124,7 +124,7 @@ module internal Manifest =
             | Some manifestNumber ->
                 let! decoded = readAll dir manifestNumber
                 let edits, _, hasContent = decoded
-                let version = applyAll edits Version.empty
+                let version = applyAll edits Version.Empty
 
                 if List.isEmpty (Version.allFiles version) && hasContent && hasSsts then
                     return! err (DbError.corruption "manifest が壊れており、SSTable の管理情報を復元できません（SSTable は変更していません）")
@@ -140,57 +140,16 @@ module internal Manifest =
                         protect (fun () -> System.IO.File.WriteAllText(manifestPath dir manifestNumber, ""))
 
                     let! _ = writeCurrent dir manifestNumber
-                    return Version.empty, manifestNumber
+                    return Version.Empty, manifestNumber
         }
 
     /// manifest がこれを超えたら、現在の Version 全体を新しい manifest へ書き直す。
     [<Literal>]
     let private MaxManifestBytes = 4L * 1024L * 1024L
 
-    let private parseManifestNumber (path: string) =
-        let name = System.IO.Path.GetFileName path
-
-        if name.StartsWith(manifestPrefix, System.StringComparison.Ordinal) then
-            match System.Int64.TryParse(name.Substring 9) with
-            | true, value -> Some value
-            | _ -> None
-        else
-            None
-
-    let private nextManifestNumber (dir: string) (current: int64) =
-        protect (fun () ->
-            System.IO.Directory.GetFiles(dir, manifestPrefix + "*")
-            |> Array.choose parseManifestNumber
-            |> Array.fold (fun acc number -> max acc number) current
-            |> fun highest -> highest + 1L)
-
-    /// 新しい manifest に Version 全体のスナップショットを書く。
-    let private writeSnapshot (dir: string) (fileNumber: int64) (version: Version) =
-        protect (fun () ->
-            let edit =
-                {
-                    AddedFiles = Version.allFiles version
-                    DeletedFiles = []
-                }
-
-            let bytes = VersionEdit.encode edit
-            let text = System.Convert.ToBase64String bytes + "\n"
-            let data = System.Text.Encoding.UTF8.GetBytes text
-
-            use fs =
-                new System.IO.FileStream(
-                    manifestPath dir fileNumber,
-                    System.IO.FileMode.Create,
-                    System.IO.FileAccess.Write,
-                    System.IO.FileShare.Read
-                )
-
-            fs.Write(data, 0, data.Length)
-            fs.Flush true)
-
     /// .VersionEdit を反映し、Version と次の manifest 番号を返す。
     let logAndApply (dir: string) (manifestNumber: int64) (version: Version) (edit: VersionEdit) =
-        let append (dir: string) (fileNumber: int64) (edit: VersionEdit) =
+        let append dir fileNumber edit =
             protect (fun () ->
                 let path = manifestPath dir fileNumber
                 let bytes = VersionEdit.encode edit
@@ -205,6 +164,46 @@ module internal Manifest =
 
                 let text = System.Convert.ToBase64String bytes + "\n"
                 let data = System.Text.Encoding.UTF8.GetBytes text
+                fs.Write(data, 0, data.Length)
+                fs.Flush true)
+
+        let parseManifestNumber (path: string) =
+            let name = System.IO.Path.GetFileName path
+
+            if name.StartsWith(ManifestPrefix, System.StringComparison.Ordinal) then
+                match System.Int64.TryParse(name.Substring 9) with
+                | true, value -> Some value
+                | _ -> None
+            else
+                None
+
+        let nextManifestNumber dir current =
+            protect (fun () ->
+                System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")
+                |> Array.choose parseManifestNumber
+                |> Array.fold (fun acc number -> max acc number) current
+                |> fun highest -> highest + 1L)
+
+        let writeSnapshot dir fileNumber version =
+            protect (fun () ->
+                let edit =
+                    {
+                        AddedFiles = Version.allFiles version
+                        DeletedFiles = []
+                    }
+
+                let bytes = VersionEdit.encode edit
+                let text = System.Convert.ToBase64String bytes + "\n"
+                let data = System.Text.Encoding.UTF8.GetBytes text
+
+                use fs =
+                    new System.IO.FileStream(
+                        manifestPath dir fileNumber,
+                        System.IO.FileMode.Create,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.Read
+                    )
+
                 fs.Write(data, 0, data.Length)
                 fs.Flush true)
 

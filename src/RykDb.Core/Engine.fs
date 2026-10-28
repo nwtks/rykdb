@@ -69,12 +69,12 @@ module internal DbStateOps =
         =
         RootGate.withShared root (fun () ->
             result {
-                let! manager, _, batches = TransactionManager.commit mgr txn
+                let! manager, _, batches = TransactionManager.commit txn mgr
 
                 let snapshot =
                     let own = TransactionManager.activeSnapshot manager
 
-                    match ActiveSnapshotRegistry.oldestExcept registration root with
+                    match ActiveSnapshotRegistry.oldestExcept root registration with
                     | Some other -> min own other
                     | None -> own
 
@@ -432,7 +432,7 @@ module internal Ddl =
     /// </remarks>
     let private exclusiveDdl (state: DbState) (run: DbState -> Result<DbState, DbError>) =
         RootGate.withExclusive state.Root (fun () ->
-            match ActiveSnapshotRegistry.oldestExcept state.ActiveRegistration state.Root with
+            match ActiveSnapshotRegistry.oldestExcept state.Root state.ActiveRegistration with
             | Some _ -> err (DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください")
             | None -> run state)
 
@@ -446,7 +446,8 @@ module internal Ddl =
         chunks
         |> foldOk
             (fun st chunk ->
-                let mgr, txn = TransactionManager.beginTxnWithLimit System.Int64.MaxValue st.Manager
+                let mgr, txn =
+                    TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) st.Manager
 
                 result {
                     let! txn2 = apply txn chunk
@@ -470,7 +471,7 @@ module internal Ddl =
         match positions with
         | Error e -> Error e
         | Ok positions ->
-            RowStore.scanAt store (Keyspace.index idx.Name) [||] Snapshot.noLimit 0
+            RowStore.scanAt store (Keyspace.index idx.Name) [||] Snapshot.NoLimit 0
             |> Result.bind (fun entries ->
                 use e = entries.GetEnumerator()
 
@@ -502,11 +503,11 @@ module internal Ddl =
         if not (RowStore.keyspaceExists state.Store space) then
             ret state
         else
-            match RowStore.scanAt state.Store space [||] Snapshot.noLimit 0 with
+            match RowStore.scanAt state.Store space [||] Snapshot.NoLimit 0 with
             | Error e -> Error e
             | Ok stale ->
                 applyChunks state (Seq.chunkBySize BackfillChunkRows stale) (fun txn chunk ->
-                    foldOk (fun t (key, _) -> ret (Transaction.remove t space key)) txn chunk)
+                    foldOk (fun t (key, _) -> ret (Transaction.remove space key t)) txn chunk)
 
     /// 失敗しても可視性に影響しない後始末用（DROP 後）。
     let private clearSpaceChunks (state: DbState) (space: string) =
@@ -581,11 +582,11 @@ module internal Ddl =
                     let indexKeyFor row = RowKey.indexKey withIndex idx row
 
                     let! cleared = clearSpaceChunksResult state space
-                    let! rows = Dml.scanByPrimaryKey cleared.Store withIndex Snapshot.noLimit 0
+                    let! rows = Dml.scanByPrimaryKey cleared.Store withIndex Snapshot.NoLimit 0
 
                     let! filled =
                         applyChunks cleared (Seq.chunkBySize BackfillChunkRows rows) (fun txn chunk ->
-                            foldOk (fun t row -> ret (Transaction.put t space (indexKeyFor row) row)) txn chunk)
+                            foldOk (fun t row -> ret (Transaction.put space (indexKeyFor row) row t)) txn chunk)
 
                     if idx.Unique then
                         match checkUniqueIndex filled.Store withIndex idx with
