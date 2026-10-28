@@ -18,7 +18,7 @@ type internal CompactionOptions =
         MaxLevelBytes: int64 array
         /// L0 のファイル数がこの数以上になったら L0 → L1 の compaction を行う
         L0CompactionTrigger: int
-        /// 1回の compaction で入力するファイル数の上限
+        /// 1回の compaction で seed とするファイル数の目安（重なり閉包により超えうる）
         MaxInputFiles: int
         /// 出力 SSTable ファイルの目標バイト数（概算値で近似するため厳密ではない）
         OutputFileTargetBytes: int64
@@ -93,20 +93,20 @@ module internal Compaction =
         (nextFileNumber: int64)
         (openScan: FileMetaData -> Result<SstScan, DbError>)
         =
-        let pickCompaction v options =
-            let exceeded level =
-                if level = 0 then
-                    let count = v.Files.[0].Length
-                    count > 0 && count >= options.L0CompactionTrigger
-                else
-                    v.Files.[level] |> Array.sumBy _.Size > options.MaxLevelBytes.[level]
+        let exceeded v level =
+            if level = 0 then
+                let count = v.Files.[0].Length
+                count > 0 && count >= options.L0CompactionTrigger
+            else
+                v.Files.[level] |> Array.sumBy _.Size > options.MaxLevelBytes.[level]
 
-            let rec find level =
-                if level > Levels.Max then None
-                elif exceeded level then Some level
-                else find (level + 1)
+        let rec find v level =
+            if level > Levels.Max then None
+            elif exceeded v level then Some level
+            else find v (level + 1)
 
-            match find 0 with
+        let pickCompaction v =
+            match find v 0 with
             | None -> None
             | Some level ->
                 Some
@@ -115,26 +115,48 @@ module internal Compaction =
                         OutputLevel = min (level + 1) Levels.Max
                     }
 
-        let overlapsWith files f =
+        let minKeyOf files =
             files
-            |> List.exists (fun g ->
-                Bytes.compare g.Largest f.Smallest >= 0
-                && Bytes.compare f.Largest g.Smallest >= 0)
+            |> Array.map (fun f -> f.Smallest)
+            |> Array.reduce (fun a b -> if Bytes.compare a b <= 0 then a else b)
+
+        let maxKeyOf files =
+            files
+            |> Array.map (fun f -> f.Largest)
+            |> Array.reduce (fun a b -> if Bytes.compare a b >= 0 then a else b)
+
+        let inRange minKey maxKey f =
+            Bytes.compare f.Largest minKey >= 0 && Bytes.compare f.Smallest maxKey <= 0
+
+        let rec expand current next nextLevel minBound maxBound =
+            let inputs = current |> Array.filter (inRange minBound maxBound)
+            let nextFiles = next |> Array.filter (inRange minBound maxBound)
+            let found = Array.append inputs nextFiles
+            let minKey' = minKeyOf found
+            let maxKey' = maxKeyOf found
+
+            if Bytes.compare minKey' minBound = 0 && Bytes.compare maxKey' maxBound = 0 then
+                inputs |> Array.toList, nextFiles |> Array.toList, nextLevel
+            else
+                expand current next nextLevel minKey' maxKey'
 
         let selectInputs version level maxFiles =
-            let inputs = Version.filesAt level version |> Array.toList |> List.truncate maxFiles
             let nextLevel = level + 1
+            let current = Version.filesAt level version
 
             let next =
                 if nextLevel > Levels.Max then
-                    []
+                    [||]
                 else
                     Version.filesAt nextLevel version
-                    |> Array.toList
-                    |> List.filter (overlapsWith inputs)
-                    |> List.truncate maxFiles
 
-            inputs, next, nextLevel
+            let seed = current |> Array.toList |> List.truncate maxFiles
+
+            match seed with
+            | [] -> [], [], nextLevel
+            | _ ->
+                let seed = Array.ofList seed
+                expand current next nextLevel (minKeyOf seed) (maxKeyOf seed)
 
         let rec openAll files scans =
             match files with
@@ -144,33 +166,33 @@ module internal Compaction =
                 | Error e -> Error e
                 | Ok scan -> openAll rest (scan :: scans)
 
-        let gcGroup activeSnapshot dropTombstones older newest =
-            let rec keepOlder rest kept dropped keptVisible =
-                match rest with
-                | [] -> List.rev kept, dropped
-                | item :: tail ->
-                    if activeSnapshot = 0UL || item.SeqNo > activeSnapshot then
-                        keepOlder tail (item :: kept) dropped keptVisible
-                    elif newest.SeqNo > activeSnapshot && not keptVisible then
-                        keepOlder tail (item :: kept) dropped true
-                    else
-                        keepOlder tail kept (dropped + 1) keptVisible
+        let rec keepOlder newest rest kept dropped keptVisible =
+            match rest with
+            | [] -> List.rev kept, dropped
+            | item :: tail ->
+                if activeSnapshot = 0UL || item.SeqNo > activeSnapshot then
+                    keepOlder newest tail (item :: kept) dropped keptVisible
+                elif newest.SeqNo > activeSnapshot && not keptVisible then
+                    keepOlder newest tail (item :: kept) dropped true
+                else
+                    keepOlder newest tail kept (dropped + 1) keptVisible
 
-            let keptOlder, dropped = keepOlder older [] 0 false
+        let gcGroup dropTombstones older newest =
+            let keptOlder, dropped = keepOlder newest older [] 0 false
             let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty keptOlder)
             let kept = if keepNewest then newest :: keptOlder else keptOlder
             kept, dropped, (if keepNewest then 0 else 1)
 
-        let nextGroup activeSnapshot dropTombstones merge =
-            let rec gather newest m acc =
-                match SstMerge.top m with
-                | Some e when Bytes.compare e.Key newest.Key = 0 ->
-                    match SstMerge.next m with
-                    | Error e -> Error e
-                    | Ok None -> Ok(m, List.rev acc)
-                    | Ok(Some(nxt, rest)) -> gather newest rest (nxt :: acc)
-                | _ -> Ok(m, List.rev acc)
+        let rec gather newest m acc =
+            match SstMerge.top m with
+            | Some e when Bytes.compare e.Key newest.Key = 0 ->
+                match SstMerge.next m with
+                | Error e -> Error e
+                | Ok None -> Ok(m, List.rev acc)
+                | Ok(Some(nxt, rest)) -> gather newest rest (nxt :: acc)
+            | _ -> Ok(m, List.rev acc)
 
+        let nextGroup dropTombstones merge =
             match SstMerge.next merge with
             | Error e -> Error e
             | Ok None -> Ok None
@@ -178,7 +200,7 @@ module internal Compaction =
                 match gather newest afterNewest [] with
                 | Error e -> Error e
                 | Ok(rest, older) ->
-                    let kept, dropped, tombstones = gcGroup activeSnapshot dropTombstones older newest
+                    let kept, dropped, tombstones = gcGroup dropTombstones older newest
                     Ok(Some(kept, dropped, tombstones, rest))
 
         let flushChunk plan chunk fileNumber =
@@ -213,7 +235,7 @@ module internal Compaction =
             droppedVersions
             droppedTombstones
             =
-            match nextGroup activeSnapshot dropTombstones merge with
+            match nextGroup dropTombstones merge with
             | Error e -> Error e
             | Ok None ->
                 flushChunk plan chunk fileNumber
@@ -275,7 +297,7 @@ module internal Compaction =
                 return! pump plan allInputs dropTombstones merge [] 0L nextFileNumber [] 0 0
             }
 
-        match pickCompaction version options with
+        match pickCompaction version with
         | Some plan -> compactPlan plan
         | None ->
             ret (

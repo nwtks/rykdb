@@ -189,6 +189,62 @@ let ``Compaction: 重ならない上のレベルファイルは入力に含め�
         Assert.True(File.Exists(FileMetaData.path dir 12L)))
 
 [<Fact>]
+let ``Compaction: 入力の重なり閉包は入力外の古い版も取り込む`` () =
+    withDir "comp-overlap-closure" (fun dir ->
+        let selected =
+            [ 1..32 ] |> List.map (fun i -> mkSst dir (int64 (10 + i)) 5 [ entryOf i ])
+
+        let excluded = mkSst dir 99L 5 [ Entry.put (intKey 100) 3UL (intRow 100) ]
+
+        let bottom =
+            mkSst dir 200L 6 [ Entry.delete (intKey 1) 5UL; Entry.delete (intKey 100) 5UL ]
+
+        let version =
+            selected @ [ excluded; bottom ]
+            |> List.fold (fun v f -> Version.addFile f v) Version.Empty
+
+        let result, _ = compactAll dir version 6UL pickFirstLevel
+        let removed = result.Removed |> List.map _.FileNumber |> List.sort
+        Assert.Equal<int64 list>([ 11L .. 42L ] @ [ 99L; 200L ] |> List.sort, removed)
+        Assert.Equal(2, result.DroppedVersions)
+        Assert.Equal(2, result.DroppedTombstones)
+
+        let entries =
+            result.Added |> List.collect (fun f -> ok (readBack dir f) |> Array.toList)
+
+        Assert.False(entries |> List.exists (fun e -> Bytes.compare e.Key (intKey 100) = 0), "入力外の古い値が残ると削除済みの行が復活する"))
+
+[<Fact>]
+let ``Compaction: 次レベルの広いファイルに合わせて同レベルの seed を広げる`` () =
+    withDir "comp-overlap-expand" (fun dir ->
+        let left = mkSst dir 10L 1 [ entryOf 1 ]
+        let middle = mkSst dir 11L 1 [ entryOf 5; entryOf 6 ]
+        let right = mkSst dir 12L 1 [ entryOf 10 ]
+        let wide = mkSst dir 20L 2 [ entryOf 1; entryOf 5; entryOf 6; entryOf 10 ]
+
+        let version =
+            Version.Empty
+            |> Version.addFile left
+            |> Version.addFile middle
+            |> Version.addFile right
+            |> Version.addFile wide
+
+        let options =
+            { pickFirstLevel with
+                MaxInputFiles = 1
+            }
+
+        let result, _ = compactAll dir version 0UL options
+        let removed = result.Removed |> List.map _.FileNumber |> List.sort
+        Assert.Equal<int64 list>([ 10L; 11L; 12L; 20L ], removed)
+
+        let entries =
+            result.Added |> List.collect (fun f -> ok (readBack dir f) |> Array.toList)
+
+        for i in [ 1; 5; 6; 10 ] do
+            Assert.True(entries |> List.exists (fun e -> Bytes.compare e.Key (intKey i) = 0), $"key {i} が出力にありません"))
+
+[<Fact>]
 let ``Compaction: 最下位レベルへの出力では tombstone を落とす`` () =
     withDir "comp-bottom" (fun dir ->
         let f =
