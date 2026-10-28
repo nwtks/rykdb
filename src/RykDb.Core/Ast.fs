@@ -239,7 +239,7 @@ module internal Expr =
                 | Expr.Case(_, elseE), _ ->
                     match elseE, List.rev kids with
                     | None, _ -> ret (Expr.Case(toPairs [] kids, None))
-                    | Some _, last :: branchRev -> ret (Expr.Case(toPairs [] (List.rev branchRev), Some last))
+                    | Some _, last :: branchRev -> ret (Expr.Case(List.rev branchRev |> toPairs [], Some last))
                     | Some _, [] -> miss kids
                 | Expr.FuncCall(n, _), xs -> ret (Expr.FuncCall(n, xs))
                 | Expr.AggCall(f, star, _), [ x ] -> ret (Expr.AggCall(f, star, x))
@@ -251,10 +251,10 @@ module internal Expr =
                 let x2 = rewriteLeaf x
 
                 match children x2 with
-                | [] -> rewriteLoop frames (Arrive x2)
+                | [] -> Arrive x2 |> rewriteLoop frames
                 | c :: rest ->
                     let frame = { Parent = x2; Done = []; Rest = rest }
-                    rewriteLoop (frame :: frames) (Visit c)
+                    Visit c |> rewriteLoop (frame :: frames)
             | Arrive v ->
                 match frames with
                 | [] -> ret v
@@ -267,13 +267,13 @@ module internal Expr =
                                 Rest = rest
                             }
 
-                        rewriteLoop (next :: more) (Visit c)
+                        Visit c |> rewriteLoop (next :: more)
                     | [] ->
                         match plugChildren (v :: frame.Done |> List.rev) frame.Parent with
                         | Error er -> Error er
-                        | Ok parent -> rewriteLoop more (Arrive parent)
+                        | Ok parent -> Arrive parent |> rewriteLoop more
 
-        rewriteLoop [] (Visit root)
+        Visit root |> rewriteLoop []
 
     /// 式木を明示スタックで pre-order にたどり、各ノードについて状態を畳み込む。
     /// 走査順は「根 → 子を左から右へ」。
@@ -295,20 +295,19 @@ module internal Expr =
     /// 式中のすべての列参照を列挙する。
     /// 束縛と空き列判定に使う。
     /// 末尾再帰の明示スタック走査（ColumnRefs の既存の挙動を維持）。
-    let columnRefs (e: Expr) =
+    let columnRefs =
         fold
             (fun acc e ->
                 match e with
                 | Expr.Column c -> c :: acc
                 | _ -> acc)
             []
-            e
-        |> List.rev
+        >> List.rev
 
     /// 式に集計呼び出しが含まれるか。
     /// GROUP BY の妥当性判定に使う。
     /// 短絡評価の早期打ち切りは失われるが、結果は論理 OR で同じ。
-    let isAggregate (e: Expr) =
+    let isAggregate =
         fold
             (fun found e ->
                 found
@@ -316,7 +315,6 @@ module internal Expr =
                    | Expr.AggCall _ -> true
                    | _ -> false)
             false
-            e
 
     /// Expr.toDisplayString が使う出力項目。
     /// Sub の closer を先に与えておくことで、式の出力が終わってから

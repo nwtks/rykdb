@@ -8,9 +8,19 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
+
+/// SQL テキストを 1 文として解析する。複数文はエラー。
+let private parseStatement (sql: string) =
+    Parser.parseStatements sql
+    >>= fun stmts ->
+        match stmts with
+        | [ s ] -> ret s
+        | [] -> err (DbError.create ErrorKind.SyntaxError "文がありません")
+        | _ -> err (DbError.create ErrorKind.SyntaxError "複数の文が渡されました（1 文ずつ実行してください）")
+
 /// SQL を 1 文解析し、失敗したらテストを落とす。
 let private parseOneOk (sql: string) =
-    match Parser.parseStatement sql with
+    match parseStatement sql with
     | Ok s -> s
     | Error e ->
         Assert.Fail(sprintf "解析に失敗: %s\nSQL: %s" (DbError.toDisplayString e) sql)
@@ -95,8 +105,7 @@ let private whereTextOf (sql: string) : string =
     | None -> "(なし)"
 
 /// 解析が通ることだけを確かめる（内容は見ない）。
-let private parsesOk (sql: string) =
-    ok (Parser.parseStatement sql) |> ignore
+let private parsesOk (sql: string) = ok (parseStatement sql) |> ignore
 
 /// 深さ超過が StackOverflow ではなく SyntaxError として返ること。
 let private expectDepthError (label: string) (r: Result<Statement, DbError>) =
@@ -204,7 +213,7 @@ let ``パーサ: リテラルとコメント`` () =
 
 /// 深さカウンタで構文エラーになることを確認する（StackOverflow ではない）。
 let private assertDepthExceeded (name: string) (sql: string) =
-    expectDepthError name (Parser.parseStatement sql)
+    expectDepthError name (parseStatement sql)
 
 [<Fact>]
 let ``末尾再帰: 200000個の NOT が連なってもスタックを食わない`` () =
@@ -313,7 +322,7 @@ let ``末尾再帰: 深い入れ子はエラーになる（StackOverflow では�
     let deep = System.String('(', depth) + "1" + System.String(')', depth)
     let sql = "SELECT * FROM t WHERE " + deep
 
-    expectDepthError "深すぎる入れ子" (Parser.parseStatement sql)
+    expectDepthError "深すぎる入れ子" (parseStatement sql)
 
     // 上限内なら通ること
     parsesOk ("SELECT * FROM t WHERE " + System.String('(', 50) + "1" + System.String(')', 50))
@@ -322,7 +331,7 @@ let ``末尾再帰: 深い入れ子はエラーになる（StackOverflow では�
 let ``末尾再帰: CPS にした式構文規則は深さ境界で正確に動く`` () =
     // 継続を呼ぶたびに深さが 1 段戻るので「ちょうど上限」で受理・超過で SyntaxError。
     // WHERE の式が 1 段使うので括弧の入れ子は MaxExpressionDepth - 1 段まで。
-    let maxNest = Parser.MaxExpressionDepth - 1
+    let maxNest = 199
 
     let nest depth =
         System.String('(', depth) + "1" + System.String(')', depth)
@@ -330,7 +339,7 @@ let ``末尾再帰: CPS にした式構文規則は深さ境界で正確に動�
     // 括弧は AST に残らない（( 式 ) は 式 になる）ので中身は定数 1 のはず
     Assert.Equal<string>("1", whereTextOf ("SELECT * FROM t WHERE " + nest maxNest))
 
-    expectDepthError "上限 1 段超過" (Parser.parseStatement ("SELECT * FROM t WHERE " + nest (maxNest + 1)))
+    expectDepthError "上限 1 段超過" (parseStatement ("SELECT * FROM t WHERE " + nest (maxNest + 1)))
 
     // 先に成功しても深さの残骸が残らないこと（exitExpr を忘れると 2 回目で境界を超える）
     for _ in 1..3 do
@@ -519,7 +528,7 @@ let ``パーサ: トランザクション制御`` () =
 
 [<Fact>]
 let ``パーサ: 構文エラーは位置つき DbError`` () =
-    match Parser.parseStatement "SELECT * FROM" with
+    match parseStatement "SELECT * FROM" with
     | Error e ->
         Assert.Equal<ErrorKind>(ErrorKind.SyntaxError, e.Kind)
         Assert.True(e.Position.IsSome)
@@ -619,114 +628,90 @@ let ``パーサ: 別名と並び替え・グループ化の複数指定`` () =
 [<Fact>]
 let ``パーサ: 文法エラーの諸形`` () =
     // 式の括弧閉じ
-    expectErrorKind ErrorKind.SyntaxError ") が無い" (Parser.parseStatement "SELECT (1 FROM t")
+    expectErrorKind ErrorKind.SyntaxError ") が無い" (parseStatement "SELECT (1 FROM t")
     // IN の閉じ括弧
-    expectErrorKind ErrorKind.SyntaxError "IN の ) が無い" (Parser.parseStatement "SELECT * FROM t WHERE a IN (1, 2")
+    expectErrorKind ErrorKind.SyntaxError "IN の ) が無い" (parseStatement "SELECT * FROM t WHERE a IN (1, 2")
     // NOT の後ろ
-    expectErrorKind ErrorKind.SyntaxError "NOT の後ろが不正" (Parser.parseStatement "SELECT * FROM t WHERE a NOT 1")
+    expectErrorKind ErrorKind.SyntaxError "NOT の後ろが不正" (parseStatement "SELECT * FROM t WHERE a NOT 1")
     // BETWEEN の AND
-    expectErrorKind
-        ErrorKind.SyntaxError
-        "BETWEEN の AND が無い"
-        (Parser.parseStatement "SELECT * FROM t WHERE a BETWEEN 1")
+    expectErrorKind ErrorKind.SyntaxError "BETWEEN の AND が無い" (parseStatement "SELECT * FROM t WHERE a BETWEEN 1")
     // CASE
-    expectErrorKind ErrorKind.SyntaxError "CASE の WHEN が無い" (Parser.parseStatement "SELECT CASE END FROM t")
-    expectErrorKind ErrorKind.SyntaxError "CASE の END が無い" (Parser.parseStatement "SELECT CASE WHEN 1 THEN 2 FROM t")
+    expectErrorKind ErrorKind.SyntaxError "CASE の WHEN が無い" (parseStatement "SELECT CASE END FROM t")
+    expectErrorKind ErrorKind.SyntaxError "CASE の END が無い" (parseStatement "SELECT CASE WHEN 1 THEN 2 FROM t")
     // JOIN の ON
-    expectErrorKind ErrorKind.SyntaxError "JOIN の ON が無い" (Parser.parseStatement "SELECT * FROM t JOIN u")
+    expectErrorKind ErrorKind.SyntaxError "JOIN の ON が無い" (parseStatement "SELECT * FROM t JOIN u")
     // ORDER BY / GROUP BY / LIMIT の式
-    expectErrorKind ErrorKind.SyntaxError "ORDER BY の式が無い" (Parser.parseStatement "SELECT * FROM t ORDER BY")
-    expectErrorKind ErrorKind.SyntaxError "GROUP BY の式が無い" (Parser.parseStatement "SELECT * FROM t GROUP BY")
-    expectErrorKind ErrorKind.SyntaxError "LIMIT の式が無い" (Parser.parseStatement "SELECT * FROM t LIMIT")
+    expectErrorKind ErrorKind.SyntaxError "ORDER BY の式が無い" (parseStatement "SELECT * FROM t ORDER BY")
+    expectErrorKind ErrorKind.SyntaxError "GROUP BY の式が無い" (parseStatement "SELECT * FROM t GROUP BY")
+    expectErrorKind ErrorKind.SyntaxError "LIMIT の式が無い" (parseStatement "SELECT * FROM t LIMIT")
     // 関数呼び出しの閉じ括弧
-    expectErrorKind ErrorKind.SyntaxError "関数呼び出しの ) が無い" (Parser.parseStatement "SELECT f(a FROM t")
+    expectErrorKind ErrorKind.SyntaxError "関数呼び出しの ) が無い" (parseStatement "SELECT f(a FROM t")
     // DDL の形
-    expectErrorKind ErrorKind.SyntaxError "未知の型" (Parser.parseStatement "CREATE TABLE t (id NOPE PRIMARY KEY)")
-    expectErrorKind ErrorKind.SyntaxError "型名が無い" (Parser.parseStatement "CREATE TABLE t (id (1) PRIMARY KEY)")
+    expectErrorKind ErrorKind.SyntaxError "未知の型" (parseStatement "CREATE TABLE t (id NOPE PRIMARY KEY)")
+    expectErrorKind ErrorKind.SyntaxError "型名が無い" (parseStatement "CREATE TABLE t (id (1) PRIMARY KEY)")
 
     expectErrorKind
         ErrorKind.SyntaxError
         "NOT の後ろが NULL でない"
-        (Parser.parseStatement "CREATE TABLE t (id INTEGER PRIMARY KEY, v NOT 1)")
+        (parseStatement "CREATE TABLE t (id INTEGER PRIMARY KEY, v NOT 1)")
 
     expectErrorKind
         ErrorKind.SyntaxError
         "DEFAULT の式が無い"
-        (Parser.parseStatement "CREATE TABLE t (id INTEGER PRIMARY KEY, v DEFAULT)")
+        (parseStatement "CREATE TABLE t (id INTEGER PRIMARY KEY, v DEFAULT)")
 
-    expectErrorKind
-        ErrorKind.SyntaxError
-        "テーブル主キーの ( が無い"
-        (Parser.parseStatement "CREATE TABLE t (a INTEGER, PRIMARY KEY a)")
+    expectErrorKind ErrorKind.SyntaxError "テーブル主キーの ( が無い" (parseStatement "CREATE TABLE t (a INTEGER, PRIMARY KEY a)")
 
-    expectErrorKind
-        ErrorKind.SyntaxError
-        "テーブル主キーの KEY が無い"
-        (Parser.parseStatement "CREATE TABLE t (a INTEGER, PRIMARY (a))")
+    expectErrorKind ErrorKind.SyntaxError "テーブル主キーの KEY が無い" (parseStatement "CREATE TABLE t (a INTEGER, PRIMARY (a))")
 
-    expectErrorKind
-        ErrorKind.SyntaxError
-        "主キー列の後に要素が無い"
-        (Parser.parseStatement "CREATE TABLE t (a INTEGER, PRIMARY KEY (a,))")
+    expectErrorKind ErrorKind.SyntaxError "主キー列の後に要素が無い" (parseStatement "CREATE TABLE t (a INTEGER, PRIMARY KEY (a,))")
 
     expectErrorKind
         ErrorKind.SyntaxError
         "列制約の PRIMARY の後に KEY が無い"
-        (Parser.parseStatement "CREATE TABLE t (a INTEGER PRIMARY 1)")
+        (parseStatement "CREATE TABLE t (a INTEGER PRIMARY 1)")
 
     expectErrorKind
         ErrorKind.SyntaxError
         "型引数の式が不正"
-        (Parser.parseStatement "CREATE TABLE t (a INTEGER PRIMARY KEY, v VARCHAR()")
+        (parseStatement "CREATE TABLE t (a INTEGER PRIMARY KEY, v VARCHAR()")
     // 式の細かいエラー
-    expectErrorKind ErrorKind.SyntaxError "関数引数の後続が不正" (Parser.parseStatement "SELECT f(a,) FROM t")
-    expectErrorKind ErrorKind.SyntaxError "IN の ( が無い" (Parser.parseStatement "SELECT * FROM t WHERE a IN 1")
-    expectErrorKind ErrorKind.SyntaxError "IN リストが空" (Parser.parseStatement "SELECT * FROM t WHERE a IN ()")
-    expectErrorKind ErrorKind.SyntaxError "COUNT(*) の ) が無い" (Parser.parseStatement "SELECT COUNT(* FROM t")
-    expectErrorKind ErrorKind.SyntaxError "修飾名の後続が不正" (Parser.parseStatement "SELECT * FROM t WHERE t. = 1")
+    expectErrorKind ErrorKind.SyntaxError "関数引数の後続が不正" (parseStatement "SELECT f(a,) FROM t")
+    expectErrorKind ErrorKind.SyntaxError "IN の ( が無い" (parseStatement "SELECT * FROM t WHERE a IN 1")
+    expectErrorKind ErrorKind.SyntaxError "IN リストが空" (parseStatement "SELECT * FROM t WHERE a IN ()")
+    expectErrorKind ErrorKind.SyntaxError "COUNT(*) の ) が無い" (parseStatement "SELECT COUNT(* FROM t")
+    expectErrorKind ErrorKind.SyntaxError "修飾名の後続が不正" (parseStatement "SELECT * FROM t WHERE t. = 1")
 
     // 選択リストの「t. の後が列名でない」場合は式として読み直す（結果として文法エラー）
-    expectErrorKind ErrorKind.SyntaxError "選択リストの t. が不正" (Parser.parseStatement "SELECT t. FROM t")
+    expectErrorKind ErrorKind.SyntaxError "選択リストの t. が不正" (parseStatement "SELECT t. FROM t")
 
-    expectErrorKind
-        ErrorKind.SyntaxError
-        "IS NOT の後ろが NULL でない"
-        (Parser.parseStatement "SELECT * FROM t WHERE a IS NOT 1")
+    expectErrorKind ErrorKind.SyntaxError "IS NOT の後ろが NULL でない" (parseStatement "SELECT * FROM t WHERE a IS NOT 1")
 
-    expectErrorKind
-        ErrorKind.SyntaxError
-        "CASE WHEN の条件が無い"
-        (Parser.parseStatement "SELECT CASE WHEN THEN 2 END FROM t")
+    expectErrorKind ErrorKind.SyntaxError "CASE WHEN の条件が無い" (parseStatement "SELECT CASE WHEN THEN 2 END FROM t")
 
-    expectErrorKind
-        ErrorKind.SyntaxError
-        "CASE WHEN の THEN が無い"
-        (Parser.parseStatement "SELECT CASE WHEN 1 2 END FROM t")
+    expectErrorKind ErrorKind.SyntaxError "CASE WHEN の THEN が無い" (parseStatement "SELECT CASE WHEN 1 2 END FROM t")
 
-    expectErrorKind
-        ErrorKind.SyntaxError
-        "CASE THEN の結果が無い"
-        (Parser.parseStatement "SELECT CASE WHEN 1 THEN END FROM t")
+    expectErrorKind ErrorKind.SyntaxError "CASE THEN の結果が無い" (parseStatement "SELECT CASE WHEN 1 THEN END FROM t")
 
     expectErrorKind
         ErrorKind.SyntaxError
         "CASE ELSE の後に END が無い"
-        (Parser.parseStatement "SELECT CASE WHEN 1 THEN 2 ELSE 3 FROM t")
+        (parseStatement "SELECT CASE WHEN 1 THEN 2 ELSE 3 FROM t")
     // JOIN の細かいエラー
-    expectErrorKind ErrorKind.SyntaxError "JOIN のテーブルが無い" (Parser.parseStatement "SELECT * FROM t JOIN")
-    expectErrorKind ErrorKind.SyntaxError "JOIN の ON 式が無い" (Parser.parseStatement "SELECT * FROM t JOIN u ON")
+    expectErrorKind ErrorKind.SyntaxError "JOIN のテーブルが無い" (parseStatement "SELECT * FROM t JOIN")
+    expectErrorKind ErrorKind.SyntaxError "JOIN の ON 式が無い" (parseStatement "SELECT * FROM t JOIN u ON")
     // DML の細かいエラー
-    expectErrorKind ErrorKind.SyntaxError "INSERT の行の ( が無い" (Parser.parseStatement "INSERT INTO t VALUES 1")
-    expectErrorKind ErrorKind.SyntaxError "INSERT の行が空" (Parser.parseStatement "INSERT INTO t VALUES ()")
-    expectErrorKind ErrorKind.SyntaxError "INSERT の値の後に要素が無い" (Parser.parseStatement "INSERT INTO t VALUES (1,)")
-    expectErrorKind ErrorKind.SyntaxError "UPDATE の列名が無い" (Parser.parseStatement "UPDATE t SET")
-    expectErrorKind ErrorKind.SyntaxError "UPDATE の = が無い" (Parser.parseStatement "UPDATE t SET a 1")
-    expectErrorKind ErrorKind.SyntaxError "UPDATE の値が無い" (Parser.parseStatement "UPDATE t SET a =")
+    expectErrorKind ErrorKind.SyntaxError "INSERT の行の ( が無い" (parseStatement "INSERT INTO t VALUES 1")
+    expectErrorKind ErrorKind.SyntaxError "INSERT の行が空" (parseStatement "INSERT INTO t VALUES ()")
+    expectErrorKind ErrorKind.SyntaxError "INSERT の値の後に要素が無い" (parseStatement "INSERT INTO t VALUES (1,)")
+    expectErrorKind ErrorKind.SyntaxError "UPDATE の列名が無い" (parseStatement "UPDATE t SET")
+    expectErrorKind ErrorKind.SyntaxError "UPDATE の = が無い" (parseStatement "UPDATE t SET a 1")
+    expectErrorKind ErrorKind.SyntaxError "UPDATE の値が無い" (parseStatement "UPDATE t SET a =")
     // 文の種類
-    expectErrorKind ErrorKind.SyntaxError "CREATE VIEW" (Parser.parseStatement "CREATE VIEW v")
-    expectErrorKind ErrorKind.SyntaxError "DROP VIEW" (Parser.parseStatement "DROP VIEW v")
+    expectErrorKind ErrorKind.SyntaxError "CREATE VIEW" (parseStatement "CREATE VIEW v")
+    expectErrorKind ErrorKind.SyntaxError "DROP VIEW" (parseStatement "DROP VIEW v")
     // 空・複数文
-    expectErrorKind ErrorKind.SyntaxError "空 SQL" (Parser.parseStatement "")
-    expectErrorKind ErrorKind.SyntaxError "複数文" (Parser.parseStatement "SELECT * FROM t; SELECT * FROM t")
+    expectErrorKind ErrorKind.SyntaxError "空 SQL" (parseStatement "")
+    expectErrorKind ErrorKind.SyntaxError "複数文" (parseStatement "SELECT * FROM t; SELECT * FROM t")
 
-    expectErrorKind ErrorKind.SyntaxError "エラーになるべき" (Parser.parseStatement "SELCT * FROM t")
+    expectErrorKind ErrorKind.SyntaxError "エラーになるべき" (parseStatement "SELCT * FROM t")
