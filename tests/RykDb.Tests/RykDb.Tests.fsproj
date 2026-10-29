@@ -32,6 +32,7 @@
     <Compile Include="ExtSortTests.fs" />
     <Compile Include="OpsTests.fs" />
     <Compile Include="ExecContextTests.fs" />
+    <Compile Include="AnalyzerTests.fs" />
     <Compile Include="PlannerTests.fs" />
     <Compile Include="EngineTests.fs" />
     <Compile Include="DatabaseTests.fs" />

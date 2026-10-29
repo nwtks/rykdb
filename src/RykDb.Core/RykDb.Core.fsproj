@@ -30,6 +30,7 @@
     <Compile Include="ExtSort.fs" />
     <Compile Include="Ops.fs" />
     <Compile Include="ExecContext.fs" />
+    <Compile Include="Analyzer.fs" />
     <Compile Include="Planner.fs" />
     <Compile Include="Engine.fs" />
     <Compile Include="Database.fs" />

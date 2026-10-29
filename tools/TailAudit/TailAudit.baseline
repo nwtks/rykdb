@@ -1,5 +1,6 @@
 # RykDb tail 監査ベースライン（dotnet run --project tools/TailAudit -- --update で再生成）
 # 形式: ファイル相対|グループ|呼出先|種別 — 行番号は含めない（行が動いても一致する）
+src/RykDb.Core/Analyzer.fs|estimatedRowsCps|estimatedRowsCps|call
 src/RykDb.Core/ExtSort.fs|mergeRuns|mergeRuns|call
 src/RykDb.Core/Op.fs|drop|drop|call
 src/RykDb.Core/Op.fs|map|map|call
