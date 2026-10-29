@@ -115,7 +115,7 @@ flowchart TB
 | ---------- | ---------------------------------------------------------------------------------- | --------------------------------------------------- |
 | ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                        | §8                                                  |
 | memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                     | §8.1                                                |
-| SSTable    | ブロック + **restart 配列 + 接頭辞共有** + Bloom filter + Footer v4（88 バイト）   | §8.2                                                |
+| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v5（84バイト）                   | §8.2                                                |
 | 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                              | §8.4–8.5                                            |
 | GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                              | §8.6                                                |
 | 並行制御   | **不変ハンドル + MVCC（Snapshot Isolation）** + first-committer-wins。DDL だけ排他 | §7                                                  |
@@ -932,18 +932,19 @@ Treap は根から再構築するのでこの問題は構造的に発生しな�
 [Meta block]        min_key / max_key（長さ付き）
 [Bloom filter]
 [Index block]       ブロックごとに (最終キー, オフセット, 長さ)
-[Footer v4 88 bytes] 各セクションの位置・長さ・エントリ数・全体/メタデータ/Footer チェックサム
+[Footer v5 84bytes] 各セクションの位置・長さ・エントリ数・メタデータ/Footer チェックサム
 ```
 
-各ブロックは LevelDB 風の restart 配列を持つ。
+各ブロックはエントリ列と末尾のチェックサムだけを持つ。
 
 ```
 [entry]*
-[restartOffset:4]...*
-[numRestarts:4]
+[checksum:4]
 
 entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部分][value]
 ```
+
+先頭エントリは `shared = 0`、以降は直前エントリとの共通接頭辞長を `shared` に入れる。
 
 同じ接頭辞を持つ連続エントリは共有して圧縮する。
 可変長キーのため slotted page / overflow ページの仕組みは不要。
@@ -953,19 +954,20 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 
 定数と実装の要点:
 
-| 項目                   | 値・内容                                                                                                                                                       |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ブロックのエントリ数   | `EntriesPerBlock = 128`                                                                                                                                        |
-| restart 間隔           | `RestartInterval = 16`                                                                                                                                         |
-| チェックサム           | **FNV-1a 32bit**（CRC32C ではない。Footer の `checksum` は Footer より前の全バイトを対象）                                                                     |
-| ブロックのチェックサム | v2 以降、各ブロック末尾に 4バイト（ブロック本体 + restart 配列が対象）                                                                                         |
-| Footer のチェックサム  | v3 以降、Footer 先頭 80バイト（本体 + 全体 checksum）を対象。部分読みでも検証する                                                                              |
-| Footer                 | `magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8) bloomOff(8) bloomLen(8) metaOff(8) metaLen(8) entryCount(8) checksum(4) footerChecksum(4)` = 84バイト |
-| `maxSeqNo`             | ファイル内の最大 SeqNo。open 時の NextSeqNo 復元と GC の参考に使う（GC の判定はエントリ単位。§8.6）                                                            |
-| Bloom filter           | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。読む側は `Sstable.mayContain`                                               |
-| ポイント検索の順路     | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                                    |
+| 項目                     | 値・内容                                                                                                                                                               |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ブロックのエントリ数     | `EntriesPerBlock = 128`                                                                                                                                                |
+| チェックサム             | **FNV-1a 32bit**（CRC32C ではない）                                                                                                                                    |
+| ブロックのチェックサム   | 各ブロック末尾に 4バイト（ブロック本体が対象）                                                                                                                         |
+| メタデータのチェックサム | Meta / Bloom / Index の連続した全バイトを `metadataChecksum` で検証する                                                                                                |
+| Footer のチェックサム    | Footer 先頭 80バイト（`magic`〜`metadataChecksum`）を対象。部分読みでも検証する                                                                                        |
+| Footer                   | `magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8) bloomOff(8) bloomLen(8) metaOff(8) metaLen(8) entryCount(8) metadataChecksum(4) footerChecksum(4)` = 84バイト |
+| `maxSeqNo`               | ファイル内の最大 SeqNo。open 時の NextSeqNo 復元と GC の参考に使う（GC の判定はエントリ単位。§8.6）                                                                    |
+| Bloom filter             | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。ビット列は packed（1ビット = 1ビット）。読む側は `Sstable.mayContain`               |
+| ポイント検索の順路       | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                                            |
 
-ファイルは `Sstable.build` が v4 形式を組み立てる。
+ファイルは `Sstable.writeTo` が v5 形式をブロック単位でストリームへ書き出す
+（`Sstable.build` はテスト用に `MemoryStream` 経由で同じ処理を呼ぶ）。
 `StorageEngine` は**部分読みだけ**を使う。
 
 - **部分読み**（`Sstable.openPartial`）: Footer / meta / Bloom / index だけを読み、
@@ -976,9 +978,11 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
   （バッチ内の不要なブロックは解析・検証しない）。
   `lookup` は 1ブロックだけ読む。
 
-v2 の各ブロックは末尾に 4バイトのチェックサム、v3 の Footer は自身のチェックサムを持つ。
+各ブロックは末尾に 4バイトのチェックサムを持ち、
+Footer は `metadataChecksum`（Meta / Bloom / Index）と自身のチェックサムを持つ。
 部分読みでも、Footer と実際に読んだブロックの破損は `CorruptionError` として検出できる
-（読まなかったブロック・ファイルは検証されない）。
+（読まなかったブロックは検証されない）。
+全体チェックサムは部分読みでは検証できないため持たない。
 
 パース済みの `SstPartial` は `SstPartialCache` が**弱参照**で保持する
 （キーは「パス + サイズ + mtime」。
@@ -986,7 +990,8 @@ v2 の各ブロックは末尾に 4バイトのチェックサム、v3 の Foote
 同じファイルの 2回目以降の検索・走査は Footer/index の再読み込みを省略できる。
 （不変 engine は読み取り中に状態を持てないため、キャッシュはモジュール内のサイドテーブル）。
 
-`openDatabase` は `FileMetaData.MaxSeqNo` から NextSeqNo を復元するため、
+`openDatabase` は `FileMetaData.MaxSeqNo` から NextSeqNo を、
+WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
 起動時に SSTable のデータブロックを読まない。
 
 `scanAt` は未オープンのファイルを「返し得る最小キー」の昇順キューに持ち、

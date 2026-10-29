@@ -315,7 +315,7 @@ let ``Sstable.openTable: マジック不一致は CorruptionError`` () =
 let ``Sstable.openTable: 未対応バージョンは CorruptionError`` () =
     let data = ok (Sstable.build 0.01 (sstEntries 3))
     let bad = Array.copy data
-    bad.[bad.Length - Sstable.FooterSize + 8] <- 5uy
+    bad.[bad.Length - Sstable.FooterSize + 8] <- 6uy
     fixFooterChecksum bad
     expectErrorKind ErrorKind.CorruptionError "未対応バージョンはエラーになるはず" (Sstable.openPartial (writeTempSst bad))
 
@@ -361,7 +361,7 @@ let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開�
         Writer.build
             [
                 Writer.writeBytes (System.Text.Encoding.ASCII.GetBytes "RykDbSST")
-                Writer.uint32LE 4u
+                Writer.uint32LE 5u
                 Writer.int64LE 0L
                 Writer.int64LE 0L
                 Writer.int64LE 0L
@@ -370,7 +370,6 @@ let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開�
                 Writer.int64LE 0L
                 Writer.int64LE 2L
                 Writer.int64LE 0L
-                Writer.uint32LE (Hashing.checksum body)
                 Writer.uint32LE (Hashing.checksum [||])
             ]
 

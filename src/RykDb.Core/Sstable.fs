@@ -1,12 +1,10 @@
 // ===========================================================================
 // SSTable — 不変のソート済みファイル。
-// メモリ上に展開した byte[] として扱う。
-// ブロック境界と索引だけを公開し、ファイル I/O とブロックキャッシュは StorageEngine が担う。
+// 構築はブロック単位でストリームへ書き、読み取りは footer / index / Bloom の部分読みだけを行う。
 //
-//   [Block 0]...[Block N-1][Meta][Bloom][Index][Footer 88 bytes]
+//   [Block 0]...[Block N-1][Meta][Bloom][Index][Footer 84 bytes]
 //
-// 各ブロックは LevelDB 風の restart 配列を持ち、同じ接頭辞を持つ連続エントリのキー共有部分を圧縮する
-// （entry 形式は buildBlock のコメント）。
+// 各ブロックは同じ接頭辞を持つ連続エントリのキー共有部分を圧縮する。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -259,7 +257,6 @@ type internal SstPartial =
         Bloom: BloomFilter option
         EntryCount: int64
         MaxSeqNo: uint64
-        HasBlockChecksums: bool
     }
 
 module internal Sstable =
@@ -267,51 +264,46 @@ module internal Sstable =
     [<Literal>]
     let private EntriesPerBlock = 128
 
-    /// restart 配列を挿入する間隔。
-    [<Literal>]
-    let private RestartInterval = 16
-
-    /// restart 配列の 1エントリのバイト数（オフセットと件数はどちらも u32）。
-    [<Literal>]
-    let private RestartEntryBytes = 4
-
     [<Literal>]
     let private Magic = "RykDbSST"
 
     /// 書き出すファイルのバージョン。
-    /// v2 は各ブロックの末尾に 4バイトのチェックサム、
-    /// v3 は Footer 自身のチェックサム、
-    /// v4 は部分読みメタデータのチェックサムを持つ。
-    /// v3 以前は読めない。
+    /// v5 はブロック末尾のチェックサム（restart 配列なし）と、
+    /// 部分読みメタデータ（meta / Bloom / index）のチェックサムを持つ。
+    /// ブロック・メタデータ・Footer のすべてが個別に検証されるため、全体チェックサムは持たない。
+    /// v4 以前は読めない（Footer の長さが違うため openPartial が破損として拒否する）。
     [<Literal>]
-    let private Version = 4
+    let private Version = 5
 
     /// 読み取れる下限バージョン。
     [<Literal>]
-    let private MinReadableVersion = 4
+    let private MinReadableVersion = 5
 
-    /// 最新 Footer の固定長（本体 84 + Footer チェックサム 4）。
+    /// 最新 Footer の固定長（本体 80 + Footer チェックサム 4）。
     [<Literal>]
-    let internal FooterSize = 88
+    let internal FooterSize = 84
 
     /// Footer で footerChecksum がカバーするバイト数（metadataChecksum フィールド込み）。
     [<Literal>]
-    let private FooterChecksumLength = 84
+    let private FooterChecksumLength = 80
 
     // Footer
     //   magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8)
     //   bloomOff(8) bloomLen(8) metaOff(8) metaLen(8) entryCount(8)
-    //   checksum(4) metadataChecksum(4) footerChecksum(4)
-    //   = 8 + 4 + 8 * 8 + 4 + 4 + 4 = 88バイト（FooterSize と一致させる）
-    // footerChecksum は先頭 84バイト（checksum と metadataChecksum を含む）のチェックサム。
+    //   metadataChecksum(4) footerChecksum(4)
+    //   = 8 + 4 + 8 * 8 + 4 + 4 = 84バイト（FooterSize と一致させる）
+    // footerChecksum は先頭 80バイト（metadataChecksum を含む）のチェックサム。
     // 部分読みではこのフッターだけを検証できる。
+    //
+    // 全体 checksum は持たない。データブロックはそれぞれ末尾のチェックサムで守られ、
+    // meta / Bloom / index は metadataChecksum、Footer は footerChecksum で守られる。
+    // 部分読みでは読まなかったブロックを検証できないが、全体 checksum があっても同じだった。
     //
     // maxSeqNo は GC のために必要。
     // 「最古の snapshot から見えない版」の判定に使う
     // （LevelDB の smallestSnapshot と同じ考え方）。
 
     let private encodeFooter
-        (data: byte array)
         (maxSeqNo: uint64)
         (indexOff: int)
         (indexLen: int)
@@ -320,10 +312,8 @@ module internal Sstable =
         (metaOff: int)
         (metaLen: int)
         (entryCount: int)
+        (metadataChecksum: uint32)
         =
-        let metadataChecksum =
-            Hashing.checksumRange data metaOff (indexOff + indexLen - metaOff)
-
         let body =
             Writer.build
                 [
@@ -337,16 +327,11 @@ module internal Sstable =
                     Writer.int64LE (int64 metaOff)
                     Writer.int64LE (int64 metaLen)
                     Writer.int64LE (int64 entryCount)
-                    Writer.uint32LE (Hashing.checksum data)
                     Writer.uint32LE metadataChecksum
                 ]
 
         let footerChecksum = Hashing.checksum body
-
-        let withChecksum =
-            Writer.build [ Writer.writeBytes body; Writer.uint32LE footerChecksum ]
-
-        ret (Array.append data withChecksum)
+        Writer.build [ Writer.writeBytes body; Writer.uint32LE footerChecksum ]
 
     /// footer を decode した情報。
     type private FooterInfo =
@@ -376,10 +361,7 @@ module internal Sstable =
             let! metaOff, c = Reader.readInt64LE c
             let! metaLen, c = Reader.readInt64LE c
             let! entryCount, c = Reader.readInt64LE c
-            let! stored, c = Reader.readUInt32LE c
-
             let! metadataChecksum, c = Reader.readUInt32LE c
-
             let! footerChecksum, _ = Reader.readUInt32LE c
 
             if Hashing.checksumRange footerBytes 0 FooterChecksumLength <> footerChecksum then
@@ -401,7 +383,6 @@ module internal Sstable =
                 else
                     return
                         System.Text.Encoding.ASCII.GetString magicBytes,
-                        int version,
                         {
                             Version = int version
                             MaxSeqNo = uint64 maxSeqNo
@@ -413,13 +394,11 @@ module internal Sstable =
                             MetaLen = int metaLen
                             EntryCount = int entryCount
                             MetadataChecksum = metadataChecksum
-                        },
-                        stored
+                        }
         }
 
-    /// エントリ列から SSTable のバイナリを作る。
-    /// 入力はキー昇順・同一キーは SeqNo 降順に並んでいる必要がある（検証する）。
-    let build (bloomFalsePositiveRate: float) (entries: SstEntry array) =
+    /// 入力がキー昇順・同一キーは SeqNo 降順に並んでいることを検証する。
+    let validate (entries: SstEntry array) =
         let rec unorderedFrom i =
             if i >= entries.Length then
                 false
@@ -428,11 +407,21 @@ module internal Sstable =
             else
                 unorderedFrom (i + 1)
 
+        if entries.Length > 1 && unorderedFrom 1 then
+            err (DbError.internalError "Sstable: エントリがキー順に並んでいません")
+        else
+            ret ()
+
+    /// エントリ列を SSTable v5 として stream に書き出し、書き込んだバイト数を返す。
+    /// 入力の検証は呼び出し側が `validate` で済ませていること。
+    /// ブロックは 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
+    /// I/O 例外は呼び出し側の `protect` が処理する。
+    let writeTo (stream: System.IO.Stream) (bloomFalsePositiveRate: float) (entries: SstEntry array) =
         let sharedPrefix (prev: byte array) (key: byte array) =
             let n = min prev.Length key.Length
 
             let rec sharedLength i =
-                if i >= n then 0
+                if i >= n then n
                 elif prev.[i] = key.[i] then sharedLength (i + 1)
                 else i
 
@@ -453,105 +442,128 @@ module internal Sstable =
                     Writer.writeBytes value
                 ]
 
-        let rec copy (body: byte array array) result i pos =
+        let rec copy (body: byte array array) block i pos =
             if i < body.Length then
                 let b = body.[i]
-                Array.blit b 0 result pos b.Length
-                copy body result (i + 1) (pos + b.Length)
+                Array.blit b 0 block pos b.Length
+                copy body block (i + 1) (pos + b.Length)
 
         let buildBlock items =
             let body = items |> Array.mapi (encodeEntry items)
-            let offsets = body |> Array.scan (fun acc b -> acc + b.Length) 0
+            let bodyLength = body |> Array.sumBy (fun b -> b.Length)
+            let block = Array.zeroCreate<byte>(bodyLength + 4)
+            copy body block 0 0
+            let sum = Hashing.checksumRange block 0 bodyLength
+            block.[bodyLength] <- byte (sum &&& 0xFFu)
+            block.[bodyLength + 1] <- byte (sum >>> 8 &&& 0xFFu)
+            block.[bodyLength + 2] <- byte (sum >>> 16 &&& 0xFFu)
+            block.[bodyLength + 3] <- byte (sum >>> 24 &&& 0xFFu)
+            block
 
-            let restarts =
-                [| 0..RestartInterval .. body.Length - 1 |] |> Array.map (fun i -> offsets.[i])
+        let writeBlock items offset indexEntries =
+            let data = buildBlock items
+            let nextOffset = int64 offset + int64 data.Length
 
-            let restartBytes =
-                Writer.build (
-                    (restarts |> Array.map (fun off -> Writer.uint32LE (uint32 off)) |> Array.toList)
-                    @ [ Writer.uint32LE (uint32 restarts.Length) ]
+            if nextOffset > int64 System.Int32.MaxValue then
+                err (DbError.internalError "Sstable: ファイルが大きすぎます")
+            else
+                stream.Write(data, 0, data.Length)
+
+                ret (
+                    int nextOffset,
+                    {
+                        LastKey = items.[items.Length - 1].Key
+                        Offset = offset
+                        Length = data.Length
+                    }
+                    :: indexEntries
                 )
 
-            let payload = Array.zeroCreate<byte>(offsets.[body.Length] + restartBytes.Length)
-            copy body payload 0 0
-            Array.blit restartBytes 0 payload offsets.[body.Length] restartBytes.Length
-            let sum = Hashing.checksumRange payload 0 payload.Length
-            let withChecksum = Array.zeroCreate<byte>(payload.Length + 4)
-            Array.blit payload 0 withChecksum 0 payload.Length
-            withChecksum.[payload.Length] <- byte (sum &&& 0xFFu)
-            withChecksum.[payload.Length + 1] <- byte (sum >>> 8 &&& 0xFFu)
-            withChecksum.[payload.Length + 2] <- byte (sum >>> 16 &&& 0xFFu)
-            withChecksum.[payload.Length + 3] <- byte (sum >>> 24 &&& 0xFFu)
-            withChecksum
+        let rec writeBlocks (blocks: SstEntry array array) index offset indexEntries =
+            if index >= blocks.Length then
+                ret (offset, List.rev indexEntries)
+            else
+                match writeBlock blocks.[index] offset indexEntries with
+                | Error e -> Error e
+                | Ok(nextOffset, entries') -> writeBlocks blocks (index + 1) nextOffset entries'
 
-        let metaBytesOf entries =
-            match entries with
+        let metaBytesOf =
+            function
             | [||] -> [||]
-            | _ ->
+            | entries ->
                 Writer.build
                     [
                         Writer.lengthPrefixed entries.[0].Key
                         Writer.lengthPrefixed entries.[entries.Length - 1].Key
                     ]
 
-        let bloomBytesOf entries bloomFalsePositiveRate =
-            match entries with
+        let bloomBytesOf bloomFalsePositiveRate =
+            function
             | [||] -> [||]
-            | _ ->
-                BloomFilter.ofKeys
-                    (entries |> Array.collect (fun e -> [| e.Key |]))
-                    entries.Length
-                    bloomFalsePositiveRate
+            | entries ->
+                entries
+                |> Array.map _.Key
+                |> BloomFilter.ofKeys entries.Length bloomFalsePositiveRate
                 |> BloomFilter.serialize
 
-        let indexBytesOf (built: byte array array) (offsets: int array) (blocks: SstEntry array array) =
-            blocks
-            |> Array.mapi (fun i items ->
-                {
-                    LastKey = items.[items.Length - 1].Key
-                    Offset = offsets.[i]
-                    Length = built.[i].Length
-                })
-            |> Array.collect (fun e ->
+        let indexBytesOf =
+            Array.collect (fun e ->
                 [|
                     Writer.lengthPrefixed e.LastKey
                     Writer.int64LE (int64 e.Offset)
                     Writer.int64LE (int64 e.Length)
                 |])
-            |> Array.toList
-            |> Writer.build
+            >> Array.toList
+            >> Writer.build
 
         result {
-            if entries.Length > 1 && unorderedFrom 1 then
-                return! err (DbError.internalError "Sstable: エントリがキー順に並んでいません")
-
-            let maxSeqNo = SstEntry.maxSeqNo entries
             let blocks = SstEntry.splitInto EntriesPerBlock entries |> List.toArray
-            let built = blocks |> Array.map buildBlock
-            let offsets = built |> Array.scan (fun acc b -> acc + b.Length) 0
-            let dataSize = offsets.[built.Length]
+            let! dataSize, indexEntries = writeBlocks blocks 0 0 []
             let metaOff = dataSize
             let metaBytes = metaBytesOf entries
             let bloomOff = metaOff + metaBytes.Length
-            let bloomBytes = bloomBytesOf entries bloomFalsePositiveRate
+            let bloomBytes = bloomBytesOf bloomFalsePositiveRate entries
             let indexOff = bloomOff + bloomBytes.Length
-            let indexBytes = indexBytesOf built offsets blocks
-            let body = Array.concat [| yield! built; metaBytes; bloomBytes; indexBytes |]
+            let indexBytes = indexBytesOf (List.toArray indexEntries)
 
-            let! withFooter =
-                encodeFooter
-                    body
-                    maxSeqNo
-                    indexOff
-                    indexBytes.Length
-                    bloomOff
-                    bloomBytes.Length
-                    metaOff
-                    metaBytes.Length
-                    entries.Length
+            if int64 indexOff + int64 indexBytes.Length > int64 System.Int32.MaxValue then
+                return! err (DbError.internalError "Sstable: ファイルが大きすぎます")
+            else
+                let metadataChecksum =
+                    Hashing.checksumChunks [| metaBytes; bloomBytes; indexBytes |]
 
-            return withFooter
+                stream.Write(metaBytes, 0, metaBytes.Length)
+                stream.Write(bloomBytes, 0, bloomBytes.Length)
+                stream.Write(indexBytes, 0, indexBytes.Length)
+
+                let footer =
+                    encodeFooter
+                        (SstEntry.maxSeqNo entries)
+                        indexOff
+                        indexBytes.Length
+                        bloomOff
+                        bloomBytes.Length
+                        metaOff
+                        metaBytes.Length
+                        entries.Length
+                        metadataChecksum
+
+                stream.Write(footer, 0, footer.Length)
+                return int64 (indexOff + indexBytes.Length + footer.Length)
         }
+
+    /// エントリ列から SSTable のバイナリを作る（テスト・小規模用途）。
+    /// 通常の書き込みは `FileMetaData.writeSstable` がストリームへ直接書く。
+    /// 入力はキー昇順・同一キーは SeqNo 降順に並んでいる必要がある（検証する）。
+    let build (bloomFalsePositiveRate: float) (entries: SstEntry array) =
+        validate entries
+        >>= fun () ->
+            protect (fun () ->
+                use stream = new System.IO.MemoryStream()
+
+                writeTo stream bloomFalsePositiveRate entries
+                |> Result.map (fun _ -> stream.ToArray()))
+            >>= id
 
     /// Cursor から終端まで 1件ずつ読み出して配列にまとめる。
     /// step は「読むたびに変わる状態」（キーの接頭辞共有など）を
@@ -648,9 +660,9 @@ module internal Sstable =
                 err (sprintf "Sstable: 未対応のバージョン %d" info.Version |> DbError.corruption)
             elif
                 footerStart < 0L
-                || int64 info.IndexOff + int64 info.IndexLen > footerStart
-                || int64 info.BloomOff + int64 info.BloomLen > footerStart
-                || int64 info.MetaOff + int64 info.MetaLen > footerStart
+                || int64 info.MetaOff + int64 info.MetaLen <> int64 info.BloomOff
+                || int64 info.BloomOff + int64 info.BloomLen <> int64 info.IndexOff
+                || int64 info.IndexOff + int64 info.IndexLen <> footerStart
             then
                 err (DbError.corruption "Sstable: Footer の範囲が不正です")
             else
@@ -659,10 +671,7 @@ module internal Sstable =
         let parseFooterBytes footerBytes footerStart =
             match readFooterFields footerBytes with
             | Error e -> Error e
-            | Ok(magic, _, info, _) -> validateFooter info magic footerStart
-
-        let metadataChecksum metaBytes bloomBytes indexBytes =
-            Hashing.checksum (Array.concat [| metaBytes; bloomBytes; indexBytes |])
+            | Ok(magic, info) -> validateFooter info magic footerStart
 
         let readAll stream =
             match readFooter stream FooterSize with
@@ -680,7 +689,10 @@ module internal Sstable =
                         let! bloom = readBloomBytes bloomBytes
                         let! indexEntries = parseIndexBytes indexBytes
 
-                        if metadataChecksum metaBytes bloomBytes indexBytes <> footer.MetadataChecksum then
+                        if
+                            Hashing.checksumChunks [| metaBytes; bloomBytes; indexBytes |]
+                            <> footer.MetadataChecksum
+                        then
                             return! err (DbError.corruption "Sstable: 部分読みメタデータのチェックサム不一致")
 
                         return
@@ -692,18 +704,17 @@ module internal Sstable =
                                 Bloom = bloom
                                 EntryCount = int64 footer.EntryCount
                                 MaxSeqNo = footer.MaxSeqNo
-                                HasBlockChecksums = true
                             }
                     }
 
         protect (fun () ->
             use stream = System.IO.File.OpenRead path
             readAll stream)
-        |> Result.bind id
+        >>= id
 
     /// ブロックをエントリ列へ復元する。
-    /// v2 以降は末尾 4バイトのチェックサムを検証する。
-    let private parseBlock (hasChecksum: bool) (data: byte array) =
+    /// 末尾 4バイトのチェックサムを検証する。
+    let private parseBlock (data: byte array) =
         let decodeEntry c (prev: byte array) =
             result {
                 let! shared, c = Reader.readVarint c
@@ -726,33 +737,18 @@ module internal Sstable =
                 return c, SstEntry.make key seqNo value, key
             }
 
-        let parseBlockPayload data n =
-            if n < 2 * RestartEntryBytes then
-                err (DbError.corruption "Sstable: ブロックが短すぎます")
-            else
-                let numRestarts = int (Bytes.readLE32 data (n - RestartEntryBytes))
-
-                if numRestarts <= 0 || numRestarts > n / RestartEntryBytes - 1 then
-                    err (DbError.corruption "Sstable: restart 配列が不正です")
-                else
-                    let restartArraySize = (numRestarts + 1) * RestartEntryBytes
-                    readItems decodeEntry (Cursor.createSlice data 0 (n - restartArraySize)) [||]
-
         let n = data.Length
 
-        if hasChecksum then
-            if n < 4 then
-                err (DbError.corruption "Sstable: ブロックにチェックサムがありません")
-            else
-                let payloadLen = n - 4
-                let stored = Bytes.readLE32 data payloadLen
-
-                if Hashing.checksumRange data 0 payloadLen <> stored then
-                    err (DbError.corruption "Sstable: ブロックのチェックサム不一致")
-                else
-                    parseBlockPayload data payloadLen
+        if n < 4 then
+            err (DbError.corruption "Sstable: ブロックにチェックサムがありません")
         else
-            parseBlockPayload data n
+            let payloadLen = n - 4
+            let stored = Bytes.readLE32 data payloadLen
+
+            if Hashing.checksumRange data 0 payloadLen <> stored then
+                err (DbError.corruption "Sstable: ブロックのチェックサム不一致")
+            else
+                readItems decodeEntry (Cursor.createSlice data 0 payloadLen) [||]
 
     /// 部分読みした reader から startKey 以降を遅延生成する。
     /// ブロックは最大 8個まとめて 1回の open で読み、解析は必要になったときだけ行う。
@@ -792,15 +788,15 @@ module internal Sstable =
             else
                 let data = Array.sub raw relativeOffset ie.Length
 
-                parseBlock partial.HasBlockChecksums data
-                |> Result.bind (fun entries ->
+                parseBlock data
+                >>= fun entries ->
                     if
                         entries.Length = 0
                         || Bytes.compare entries.[entries.Length - 1].Key ie.LastKey <> 0
                     then
                         err (DbError.corruption "Sstable: 索引の LastKey とブロックが一致しません")
                     else
-                        ret entries)
+                        ret entries
 
         let rec scanEntries raw startOffset batchEnd pos count i (entries: SstEntry array) =
             if pos >= entries.Length then
@@ -870,18 +866,18 @@ module internal Sstable =
                 let buffer = Array.zeroCreate<byte> indexEntry.Length
                 stream.ReadExactly(buffer, 0, buffer.Length)
                 buffer)
-            |> Result.bind (parseBlock partial.HasBlockChecksums)
+            >>= parseBlock
 
         let readBlockPartial indexEntry =
             readBlockFromFile partial indexEntry
-            |> Result.bind (fun entries ->
+            >>= fun entries ->
                 if
                     entries.Length = 0
                     || Bytes.compare entries.[entries.Length - 1].Key indexEntry.LastKey <> 0
                 then
                     err (DbError.corruption "Sstable: 索引の LastKey とブロックが一致しません")
                 else
-                    ret entries)
+                    ret entries
 
         let rec find i j =
             function
@@ -959,7 +955,8 @@ module internal FileMetaData =
 
         System.IO.Path.Combine(dir, fileName fileNumber)
 
-    /// エントリ列を SSTable としてビルドし、ファイルに書き、メタデータを返す。
+    /// エントリ列を SSTable としてファイルへストリーム書きし、メタデータを返す。
+    /// ブロックは 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
     /// ビルド・書き出し・メタ算出が 1つの経路を通るので、「書いたバイト数」と Size が食い違うことが無い。
     let writeSstable
         (dir: string)
@@ -983,23 +980,26 @@ module internal FileMetaData =
             if entries.Length = 0 then
                 return! err (DbError.internalError "Sstable: 空のエントリ列は書き出せません")
 
-            let! bytes = Sstable.build bloomFalsePositiveRate entries
+            do! Sstable.validate entries
 
-            let! () =
+            let! size =
                 protect (fun () ->
-                    System.IO.File.WriteAllBytes(path dir fileNumber, bytes)
-
                     use fs =
                         new System.IO.FileStream(
                             path dir fileNumber,
-                            System.IO.FileMode.Open,
+                            System.IO.FileMode.Create,
                             System.IO.FileAccess.Write,
                             System.IO.FileShare.None
                         )
 
-                    fs.Flush true)
+                    match Sstable.writeTo fs bloomFalsePositiveRate entries with
+                    | Error e -> Error e
+                    | Ok size ->
+                        fs.Flush true
+                        Ok size)
+                >>= id
 
-            return ofChunk fileNumber level (int64 bytes.Length) entries
+            return ofChunk fileNumber level size entries
         }
 
     /// このファイルが [key] を持ち得るか（Bloom より粗い判定）。

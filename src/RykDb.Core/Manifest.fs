@@ -51,11 +51,7 @@ module internal Manifest =
     /// checksum は本体全体の FNV-1a（途中の完全な行の破損を検出する）。
     let private encodeRecord (payload: byte array) =
         let frame =
-            Writer.build
-                [
-                    Writer.uint32LE (Hashing.checksum payload)
-                    Writer.writeBytes payload
-                ]
+            Writer.build [ Writer.uint32LE (Hashing.checksum payload); Writer.writeBytes payload ]
 
         System.Convert.ToBase64String frame + "\n"
 
@@ -73,8 +69,7 @@ module internal Manifest =
                 else
                     VersionEdit.decode payload
         with
-        | :? System.FormatException as e ->
-            err (sprintf "manifest の base64 が不正: %s" e.Message |> DbError.corruption)
+        | :? System.FormatException as e -> err (sprintf "manifest の base64 が不正: %s" e.Message |> DbError.corruption)
         | e -> err (sprintf "manifest のレコードが不正: %s" e.Message |> DbError.corruption)
 
     /// ディレクトリを作る（既にあれば何もしない）。
@@ -102,15 +97,15 @@ module internal Manifest =
                     else
                         raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
 
-        let rec decodeLines (lines: string list) acc =
+        let rec decodeLines acc (lines: string list) =
             match lines with
             | [] -> Ok(List.rev acc, false)
             | line :: rest ->
                 if line.Trim() = "" then
-                    decodeLines rest acc
+                    decodeLines acc rest
                 else
                     match decodeRecord line with
-                    | Ok edits -> decodeLines rest (List.rev edits @ acc)
+                    | Ok edits -> decodeLines (List.rev edits @ acc) rest
                     | Error _ when rest |> List.forall (fun l -> l.Trim() = "") -> Ok(List.rev acc, true)
                     | Error e -> Error e
 
@@ -129,7 +124,7 @@ module internal Manifest =
             | Ok(Ok lines) ->
                 let hasContent = lines |> List.exists (fun line -> line.Trim() <> "")
 
-                decodeLines lines []
+                decodeLines [] lines
                 |> Result.map (fun (edits, truncated) -> edits, truncated, hasContent)
 
         let applyAll edits initial =

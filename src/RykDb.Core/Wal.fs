@@ -62,7 +62,7 @@ module internal Wal =
             Writer.build
                 [
                     Writer.writeByte TagBatch
-                    Writer.writeBytes (Entry.encodeBatch txnId entries)
+                    Entry.encodeBatch txnId entries |> Writer.writeBytes
                 ]
 
     let private decodePayload (payload: byte array) =
@@ -100,8 +100,8 @@ module internal Wal =
         let frame (payload: byte array) =
             Writer.build
                 [
-                    Writer.uint32LE (uint32 payload.Length)
-                    Writer.uint32LE (Hashing.checksum payload)
+                    uint32 payload.Length |> Writer.uint32LE
+                    Hashing.checksum payload |> Writer.uint32LE
                     Writer.writeBytes payload
                 ]
 
@@ -127,6 +127,8 @@ module internal Wal =
 
     /// コミット済みエントリをメモリに溜めず、1件ずつ `step` へ渡して再生する。
     /// 大きな WAL でもコミット済みエントリの配列を保持しない。
+    /// 戻り値は `(再生後の状態, WAL に現れた最大 txnId)`。
+    /// 最大 txnId は open 時に NextTxnId を復元し、既存ファイル内での採番の再利用を防ぐために返す。
     let foldCommitted (dir: string) (fileNumber: int64) (step: 's -> Entry -> 's) (initial: 's) =
         let readAtMost (fs: System.IO.FileStream) (buffer: byte array) =
             let rec loop offset =
@@ -176,11 +178,11 @@ module internal Wal =
 
             loop initial
 
-        let applyRecord (pending, state) =
+        let applyRecord (pending, maxTxnId, state) =
             function
-            | WalRecord.Begin _ -> pending, state
-            | WalRecord.Batch(txnId, entries) -> (txnId, entries) :: pending, state
-            | WalRecord.Abort txnId -> pending |> List.filter (fun (t, _) -> t <> txnId), state
+            | WalRecord.Begin txnId -> pending, max maxTxnId txnId, state
+            | WalRecord.Batch(txnId, entries) -> (txnId, entries) :: pending, max maxTxnId txnId, state
+            | WalRecord.Abort txnId -> pending |> List.filter (fun (t, _) -> t <> txnId), max maxTxnId txnId, state
             | WalRecord.Commit txnId ->
                 let mine =
                     pending
@@ -188,13 +190,13 @@ module internal Wal =
                     |> List.collect (fun (_, e) -> Array.toList e)
                     |> List.rev
 
-                pending |> List.filter (fun (t, _) -> t <> txnId), List.fold step state mine
+                pending |> List.filter (fun (t, _) -> t <> txnId), max maxTxnId txnId, List.fold step state mine
 
         let p = path dir fileNumber
 
         protect (fun () ->
             if not (System.IO.File.Exists p) then
-                ret initial
+                ret (initial, 0UL)
             else
                 use fs =
                     new System.IO.FileStream(
@@ -204,9 +206,9 @@ module internal Wal =
                         System.IO.FileShare.Read
                     )
 
-                foldFrames fs (fun state record -> ret (applyRecord state record)) ([], initial)
-                |> Result.map snd)
-        |> Result.bind id
+                foldFrames fs (fun state record -> ret (applyRecord state record)) ([], 0UL, initial)
+                |> Result.map (fun (_, maxTxnId, state) -> state, maxTxnId))
+        >>= id
 
     /// ディレクトリ内の WAL ファイル名（復旧時に孤児を消すのに使う）。
     let walFiles (dir: string) =

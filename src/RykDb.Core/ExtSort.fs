@@ -20,6 +20,20 @@
 
 namespace RykDb.Core
 
+/// 書き込み口。
+type private Sink = Sink of System.IO.Stream
+
+/// 読み込み口。
+type private Source = Source of System.IO.Stream
+
+/// run の読み込み状態（先頭 1行を先読みしている）。
+type private RunState =
+    {
+        Path: string
+        Src: Source
+        Head: SqlValue array option
+    }
+
 /// 行を一時ファイルへ書き出し、そこから遅延読みする。
 module private Spill =
     /// 一時ファイルのプレフィックス（掃除の対象をこれで見分ける）。
@@ -54,9 +68,6 @@ module private Spill =
 
     /// 残っている run を全部消す（エラー経路の後始末）。
     let forget (paths: string list) = paths |> List.iter unlink
-
-    /// 書き込み口。
-    type private Sink = Sink of System.IO.Stream
 
     /// run ファイル 1本を作る（受入中の行を整列して書き出す）。
     let writeRun
@@ -119,9 +130,6 @@ module private Spill =
                 closeSink sink
                 ret path
 
-    /// 読み込み口。
-    type internal Source = Source of System.IO.Stream
-
     /// 1行読む。
     /// None は終端。
     let readRow (src: Source) =
@@ -179,15 +187,7 @@ module private Spill =
                         match ValueCodec.readValues (Cursor.create payload) with
                         | Error e -> Error e
                         | Ok(values, _) -> Ok(Some values))
-        |> Result.bind id
-
-    /// run の読み込み状態（先頭 1行を先読みしている）。
-    type internal RunState =
-        {
-            Path: string
-            Src: Source
-            Head: SqlValue array option
-        }
+        >>= id
 
     let private closeSource (src: Source) =
         protect (fun () ->
@@ -256,7 +256,7 @@ module internal ExtSort =
                     Error e
                 | Ok state -> openAll tail (state :: acc)
 
-        let rec scan i bestIdx best (states: Spill.RunState list) =
+        let rec scan i bestIdx best (states: RunState list) =
             match states with
             | [] -> bestIdx
             | s :: tail ->

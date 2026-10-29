@@ -785,7 +785,7 @@ module internal Optimizer =
                     stmt.GroupBy
                     |> List.map (Alias.substitute schema groupAliases)
                     |> all
-                    |> Result.bind (Binder.qualifyMany schema)
+                    >>= Binder.qualifyMany schema
 
                 let allAggs = selectAggs @ orderAggs
                 let hasAgg = not (List.isEmpty allAggs)

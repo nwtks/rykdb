@@ -41,8 +41,8 @@ let private seedPeople (store: RowStore) (mgr: TransactionManager) =
     let txn, _ =
         ok (
             DmlOps.insert
-                (ctxOf store)
                 peopleSchema
+                (ctxOf store)
                 txn
                 None
                 [
@@ -110,8 +110,8 @@ let ``DML: INSERT は行を追加する`` () =
         let txn, n =
             ok (
                 DmlOps.insert
-                    (ctxOf store)
                     peopleSchema
+                    (ctxOf store)
                     txn
                     (Some [ "id"; "name" ])
                     [ [ Expr.Literal(Literal.Int 1L); Expr.Literal(Literal.String "alice") ] ]
@@ -134,8 +134,8 @@ let ``DML: INSERT は列順を明示できる`` () =
         let txn, _ =
             ok (
                 DmlOps.insert
-                    (ctxOf store)
                     peopleSchema
+                    (ctxOf store)
                     txn
                     (Some [ "name"; "id" ])
                     [ [ Expr.Literal(Literal.String "carol"); Expr.Literal(Literal.Int 7L) ] ]
@@ -155,7 +155,7 @@ let ``DML: INSERT の列数不一致はエラー`` () =
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
         let bad = [ [ Expr.Literal(Literal.Int 1L); Expr.Literal(Literal.String "x") ] ]
-        expectError "列数不一致が OK になっています" (DmlOps.insert (ctxOf store) peopleSchema txn (Some [ "id" ]) bad))
+        expectError "列数不一致が OK になっています" (DmlOps.insert peopleSchema (ctxOf store) txn (Some [ "id" ]) bad))
 
 [<Fact>]
 let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
@@ -171,8 +171,8 @@ let ``DML: UPDATE は WHERE に合う行だけを変える`` () =
         let txn1, n =
             ok (
                 DmlOps.update
-                    ctx
                     peopleSchema
+                    ctx
                     txn1
                     [ ("age", Expr.Binary(BinaryOp.Add, col "age", Expr.Literal(Literal.Int 1L))) ]
                     (Some(Expr.Binary(BinaryOp.Ge, col "age", Expr.Literal(Literal.Int 25L))))
@@ -200,7 +200,7 @@ let ``DML: UPDATE 対象が transaction 上限を超えると CapacityError`` ()
         expectErrorKind
             ErrorKind.CapacityError
             "UPDATE 上限を超えた対象行を検出できなかった"
-            (DmlOps.update (ctxOf store) peopleSchema txn [ ("age", Expr.Literal(Literal.Int 1L)) ] None))
+            (DmlOps.update peopleSchema (ctxOf store) txn [ ("age", Expr.Literal(Literal.Int 1L)) ] None))
 
 [<Fact>]
 let ``StatementResult: 表示行はヘッダ・区切り・行を並べる`` () =
@@ -224,7 +224,7 @@ let ``DML: INSERT の値の評価失敗はエラー`` () =
 
         // 定数式として評価できない列参照
         let bad = [ [ col "nope" ] ]
-        expectError "評価できない式が OK になっています" (DmlOps.insert (ctxOf store) peopleSchema txn (Some [ "id" ]) bad))
+        expectError "評価できない式が OK になっています" (DmlOps.insert peopleSchema (ctxOf store) txn (Some [ "id" ]) bad))
 
 [<Fact>]
 let ``DML: INSERT の型強制失敗はエラー`` () =
@@ -235,7 +235,7 @@ let ``DML: INSERT の型強制失敗はエラー`` () =
 
         // INTEGER 列へ数値でない文字列は強制できない
         let bad = [ [ Expr.Literal(Literal.String "abc") ] ]
-        expectError "型強制できない値が OK になっています" (DmlOps.insert (ctxOf store) peopleSchema txn (Some [ "id" ]) bad))
+        expectError "型強制できない値が OK になっています" (DmlOps.insert peopleSchema (ctxOf store) txn (Some [ "id" ]) bad))
 
 [<Fact>]
 let ``DML: INSERT は DEFAULT で不足列を埋める`` () =
@@ -264,7 +264,7 @@ let ``DML: INSERT は DEFAULT で不足列を埋める`` () =
         let mgr, txn = TransactionManager.beginTxn mgr
 
         let txn, n =
-            ok (DmlOps.insert (ctxOf store) schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
+            ok (DmlOps.insert schema (ctxOf store) txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
 
         Assert.Equal<int>(1, n)
 
@@ -301,7 +301,7 @@ let ``DML: INSERT は評価できない DEFAULT をエラーにする`` () =
         // 値を渡していない列の DEFAULT は評価される。評価エラーは NULL で握り潰さない。
         expectError
             "評価できない DEFAULT はエラー"
-            (DmlOps.insert (ctxOf store) schema txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
+            (DmlOps.insert schema (ctxOf store) txn (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
 
         let rows = ok (Dml.scanByPrimaryKey store schema None 0) |> Seq.toArray
         Assert.Empty rows)
@@ -319,8 +319,8 @@ let ``DML: DELETE は WHERE に合う行を消す`` () =
         let txn2, n =
             ok (
                 DmlOps.delete
-                    ctx
                     peopleSchema
+                    ctx
                     txn2
                     (Some(Expr.Binary(BinaryOp.Eq, col "id", Expr.Literal(Literal.Int 1L))))
             )
@@ -331,55 +331,3 @@ let ``DML: DELETE は WHERE に合う行を消す`` () =
         let rows = ok (Dml.scanByPrimaryKey store peopleSchema None 0) |> Seq.toArray
         Assert.Equal<int>(1, rows.Length)
         Assert.Equal("bob", asText rows.[0].[1]))
-
-[<Fact>]
-let ``DbStateOps.commitToStore: 別ハンドルの active snapshot を GC 境界に使う`` () =
-    withDir "commit-boundary" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-
-        // 既に SeqNo 10 まで commit 済みのハンドル（SeqNo 11 から採番する）。
-        let mgr =
-            { TransactionManager.create () with
-                LastCommitSeqNo = 10UL
-                NextSeqNo = 11UL
-            }
-
-        let mgr, txn = TransactionManager.beginTxn mgr
-        let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
-
-        // 同じ DB を開いた別ハンドルが snapshot 5 で読み始めている状態。
-        let other = ActiveSnapshotRegistry.register dir 5UL
-
-        let committed, _ = ok (DbStateOps.commitToStore dir None store mgr txn)
-        let engine = ok (RowStore.engine committed "t:a")
-
-        // 自ハンドルだけなら 12（LastCommitSeqNo 11 + 1）だが、別ハンドルの 5 が下限になる。
-        Assert.Equal(5UL, engine.ActiveSnapshot)
-
-        ActiveSnapshotRegistry.unregister dir other
-        RowStore.close committed |> ok)
-
-[<Fact>]
-let ``DbStateOps.commitToStore: 自分の登録は GC 境界から除外する`` () =
-    withDir "commit-boundary-self" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-
-        let mgr =
-            { TransactionManager.create () with
-                LastCommitSeqNo = 10UL
-                NextSeqNo = 11UL
-            }
-
-        let mgr, txn = TransactionManager.beginTxn mgr
-        let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
-
-        // 自分（これから commit する transaction）の登録は除外し、他の登録だけを見る。
-        let own = ActiveSnapshotRegistry.register dir txn.Snapshot.SeqNo
-
-        let committed, _ = ok (DbStateOps.commitToStore dir (Some own) store mgr txn)
-        let engine = ok (RowStore.engine committed "t:a")
-
-        Assert.Equal(12UL, engine.ActiveSnapshot)
-
-        ActiveSnapshotRegistry.unregister dir own
-        RowStore.close committed |> ok)

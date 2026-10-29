@@ -27,75 +27,9 @@ type StatementResult =
 
             let body =
                 this.Rows
-                |> Array.map (fun r ->
-                    r
-                    |> Array.map SqlLiteral.toSqlLiteral
-                    |> String.concat ", "
-                    |> fun s -> "  " + s)
+                |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ", " >> fun s -> "  " + s)
 
             header :: System.String('-', header.Length) :: Array.toList body
-
-/// DB の状態。
-type internal DbState =
-    {
-        Root: string
-        Store: RowStore
-        Catalog: Catalog
-        Manager: TransactionManager
-        Active: Transaction option
-        Pending: Transaction option
-        /// 進行中 transaction の ActiveSnapshot 登録。
-        /// 他のハンドルの compaction が、この snapshot より新しい版だけを残して
-        /// 古い版を捨ててしまわないようにするために登録する。
-        /// 同じ transaction の state は複数のハンドルが共有できる（登録側で生存を数える）。
-        ActiveRegistration: ActiveRegistration option
-    }
-
-/// Transaction を commit して DbState に反映する共通処理。
-module internal DbStateOps =
-    /// commit してバッチを Store に書き込む。
-    /// 戻り値は (書き込み後の Store, commit 後の Manager)。
-    /// Active / Pending のような state フィールドの更新は呼び出し側で行う
-    /// （backfillIndex はトランザクションを外さないため触らない）。
-    /// GC 境界は「自ハンドルの active snapshot」と「同じ DB を開いている他ハンドルの active snapshot」の最小値。
-    /// 後者は `ActiveSnapshotRegistry` から集約する（`registration` は自分自身の登録で、除外する）。
-    /// 書き込みは `RootGate` の共有ロックを取り、DDL の排他と交差しないようにする。
-    let commitToStore
-        (root: string)
-        (registration: ActiveRegistration option)
-        (store: RowStore)
-        (mgr: TransactionManager)
-        (txn: Transaction)
-        =
-        RootGate.withShared root (fun () ->
-            result {
-                let! manager, _, batches = TransactionManager.commit txn mgr
-
-                let snapshot =
-                    let own = TransactionManager.activeSnapshot manager
-
-                    match ActiveSnapshotRegistry.oldestExcept root registration with
-                    | Some other -> min own other
-                    | None -> own
-
-                let! next = RowStore.writeBatchesWithSnapshot snapshot store batches
-                return next, manager
-            })
-
-    let commitTransaction (state: DbState) (txn: Transaction) =
-        result {
-            let! store, manager =
-                commitToStore state.Root state.ActiveRegistration state.Store state.Manager txn
-
-            return
-                { state with
-                    Store = store
-                    Manager = manager
-                    Active = None
-                    Pending = None
-                    ActiveRegistration = None
-                }
-        }
 
 // 書き込みは Transaction にバッファされ、commit 時にだけ RowStore へ届く。
 // よって「同じ文の途中で読んだ値」と「書く値」が食い違わない。
@@ -105,8 +39,8 @@ module internal DmlOps =
 
     /// WHERE の述語。
     /// WHERE が無ければ「全部通過」（UPDATE / DELETE で共通）。
-    let private matchesWhere (targetSchema: Schema) (where: Expr option) (row: SqlValue array) =
-        match where with
+    let private matchesWhere (targetSchema: Schema) (row: SqlValue array) =
+        function
         | Some w -> Eval.matches targetSchema row w
         | None -> ret true
 
@@ -119,7 +53,7 @@ module internal DmlOps =
         (values: Expr list)
         (idxs: int list)
         =
-        let rec gather (vs: Expr list) (is_: int list) (acc: (int * SqlValue) list) =
+        let rec gather acc vs is_ =
             match vs, is_ with
             | [], [] -> ret acc
             | v :: rest, i :: restIdx ->
@@ -130,37 +64,10 @@ module internal DmlOps =
 
                     match SqlValue.coerce colDef.DataType value with
                     | Error e -> Error e
-                    | Ok coerced -> gather rest restIdx ((i, coerced) :: acc)
+                    | Ok coerced -> gather ((i, coerced) :: acc) rest restIdx
             | _ -> ret acc
 
-        gather values idxs []
-
-    /// 表を全走査して 1行ずつ処理する UPDATE / DELETE 共通の土台。
-    /// matched が偽の行は件数を変えず先へ進み、 onRow が「(トランザクション, 件数)」を進めた結果を返す。
-    let private foldRows
-        (txn: Transaction)
-        (ctx: ExecContext)
-        (schema: TableSchema)
-        (matched: SqlValue array -> Result<bool, DbError>)
-        (onRow: Transaction -> int -> SqlValue array -> Result<Transaction * int, DbError>)
-        =
-        let rec go (cur: Op) (t: Transaction) (c: int) =
-            match Op.next cur with
-            | Error e -> Error e
-            | Ok None -> ret (t, c)
-            | Ok(Some(row, nxt)) ->
-                match matched row with
-                | Error e -> Error e
-                | Ok false -> go nxt t c
-                | Ok true ->
-                    match onRow t c row with
-                    | Error e -> Error e
-                    | Ok(tc, c') -> go nxt tc c'
-
-        result {
-            let! scan = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn 0
-            return! go scan txn 0
-        }
+        gather [] values idxs
 
     /// gather で埋まった `(列位置, 値)` の対を、列順の行へ戻す。
     /// 埋まっていない位置は fallback に委ねる
@@ -178,13 +85,13 @@ module internal DmlOps =
     /// DEFAULT / NULL の充足と型強制はここで行う。
     /// TableSchema.validateRow が NOT NULL と型を最終確認する。
     let insert
-        (ctx: ExecContext)
         (schema: TableSchema)
+        (ctx: ExecContext)
         (txn: Transaction)
         (columns: string list option)
         (rows: Expr list list)
         =
-        let evalConstant (e: Expr) = Eval.eval Schema.empty [||] e
+        let evalConstant = Eval.eval Schema.empty [||]
 
         let indexValues (index: IndexSchema) (row: SqlValue array) =
             index.Columns
@@ -192,8 +99,8 @@ module internal DmlOps =
             |> all
             |> Result.map (fun positions -> positions |> List.map (fun i -> row.[i]) |> List.toArray)
 
-        let rec check (txn: Transaction) (row: SqlValue array) (pk: SqlValue array) (indexes: IndexSchema list) =
-            match indexes with
+        let rec check txn row pk =
+            function
             | [] -> ret ()
             | idx :: rest ->
                 match indexValues idx row with
@@ -216,7 +123,7 @@ module internal DmlOps =
                             else
                                 check txn row pk rest
 
-        let checkUnique (txn: Transaction) (row: SqlValue array) =
+        let checkUnique txn row =
             let pk = TableSchema.primaryKeyOf schema row
 
             match Dml.getByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn pk with
@@ -224,7 +131,7 @@ module internal DmlOps =
             | Ok(Some _) -> err (DbError.constraintViolation (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name))
             | Ok None -> check txn row pk (schema.Indexes |> List.filter _.Unique)
 
-        let buildRow (defaults: SqlValue array) idxs width (values: Expr list) =
+        let buildRow width idxs (defaults: SqlValue array) values =
             if List.length values <> List.length idxs then
                 Error(
                     DbError.create
@@ -264,7 +171,7 @@ module internal DmlOps =
                 |> foldOk
                     (fun (txnAcc, count) values ->
                         result {
-                            let! row = buildRow defaults idxs schema.Columns.Length values
+                            let! row = buildRow schema.Columns.Length idxs defaults values
                             do! checkUnique txnAcc row
                             let! t = Dml.insert schema txnAcc row
                             return t, count + 1
@@ -277,55 +184,69 @@ module internal DmlOps =
     /// 検索キーは更新前の行の主キー。
     /// 主キー列を書き換えると古い位置の行が残って重複する。
     let update
-        (ctx: ExecContext)
         (schema: TableSchema)
+        (ctx: ExecContext)
         (txn: Transaction)
         (assignments: (string * Expr) list)
         (where: Expr option)
         =
-        let assign (targetSchema: Schema) (targets: int list) (row: SqlValue array) =
+        let assign targetSchema targets row =
             gatherWith (Eval.eval targetSchema row) schema (List.map snd assignments) targets
             |> Result.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
 
         let targetSchema = targetSchemaOf schema
 
-        let collectUpdates (txn: Transaction) (targets: int list) =
-            let rowBytes (row: SqlValue array) =
-                int64 (Entry.approxBytes (Entry.put [||] 0UL row))
+        let rowBytes row =
+            int64 (Entry.approxBytes (Entry.put [||] 0UL row))
 
-            let rec go (cur: Op) acc bytes =
-                match Op.next cur with
+        let rec go targets acc bytes cur =
+            match Op.next cur with
+            | Error e -> Error e
+            | Ok None -> Ok(List.rev acc)
+            | Ok(Some(row, next)) ->
+                match matchesWhere targetSchema row where with
                 | Error e -> Error e
-                | Ok None -> Ok(List.rev acc)
-                | Ok(Some(row, next)) ->
-                    match matchesWhere targetSchema where row with
+                | Ok false -> go targets acc bytes next
+                | Ok true ->
+                    match assign targetSchema targets row with
                     | Error e -> Error e
-                    | Ok false -> go next acc bytes
-                    | Ok true ->
-                        match assign targetSchema targets row with
-                        | Error e -> Error e
-                        | Ok newRow ->
-                            let bytes = bytes + rowBytes row + rowBytes newRow
+                    | Ok newRow ->
+                        let bytes = bytes + rowBytes row + rowBytes newRow
 
-                            if bytes > txn.LimitBytes then
-                                err (
-                                    DbError.capacity (
-                                        sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" txn.LimitBytes
-                                    )
-                                )
-                            else
-                                go next ((row, newRow) :: acc) bytes
+                        if bytes > txn.LimitBytes then
+                            err (DbError.capacity (sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" txn.LimitBytes))
+                        else
+                            go targets ((row, newRow) :: acc) bytes next
 
+        let collectUpdates txn targets =
             result {
                 let! scan = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn 0
-                return! go scan [] 0L
+                return! go targets [] 0L scan
             }
 
-        let validateUniqueUpdates (txn: Transaction) (updates: (SqlValue array * SqlValue array) list) =
+        let validateUniqueUpdates txn updates =
             let updatedPks =
                 updates
                 |> List.map (fun (_, newRow) -> TableSchema.primaryKeyOf schema newRow)
                 |> Set.ofList
+
+            let checkExisting idx seen key values =
+                result {
+                    let! scan =
+                        Dml.scanByIndexPrefixWithTxn ctx.Store schema idx ctx.Visible txn values 0
+
+                    let! rows = Op.toArray scan
+
+                    if
+                        rows
+                        |> Array.exists (fun row ->
+                            let existingPk = TableSchema.primaryKeyOf schema row
+                            not (Set.contains existingPk updatedPks))
+                    then
+                        return! err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                    else
+                        return Set.add key seen
+                }
 
             let checkIndex (idx: IndexSchema) =
                 result {
@@ -345,34 +266,7 @@ module internal DmlOps =
                                     if Set.contains key seen then
                                         err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
                                     else
-                                        result {
-                                            let! scan =
-                                                Dml.scanByIndexPrefixWithTxn
-                                                    ctx.Store
-                                                    schema
-                                                    idx
-                                                    ctx.Visible
-                                                    txn
-                                                    values
-                                                    0
-
-                                            let! rows = Op.toArray scan
-
-                                            if
-                                                rows
-                                                |> Array.exists (fun row ->
-                                                    let existingPk = TableSchema.primaryKeyOf schema row
-                                                    not (Set.contains existingPk updatedPks))
-                                            then
-                                                return!
-                                                    err (
-                                                        DbError.constraintViolation (
-                                                            sprintf "UNIQUE 制約に違反: %s" idx.Name
-                                                        )
-                                                    )
-                                            else
-                                                return Set.add key seen
-                                        })
+                                        checkExisting idx seen key values)
                             Set.empty
 
                     return ()
@@ -402,16 +296,68 @@ module internal DmlOps =
 
     /// DELETE。
     /// WHERE に合う行を主キー + 全索引に tombstone で消す。
-    let delete (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (where: Expr option) =
+    let delete (schema: TableSchema) (ctx: ExecContext) (txn: Transaction) (where: Expr option) =
+        let foldRows schema (ctx: ExecContext) txn matched onRow =
+            let rec go t c cur =
+                match Op.next cur with
+                | Error e -> Error e
+                | Ok None -> ret (t, c)
+                | Ok(Some(row, nxt)) ->
+                    match matched row with
+                    | Error e -> Error e
+                    | Ok false -> go t c nxt
+                    | Ok true ->
+                        match onRow t c row with
+                        | Error e -> Error e
+                        | Ok(tc, c') -> go tc c' nxt
+
+            result {
+                let! scan = Dml.scanByPrimaryKeyWithTxn ctx.Store schema ctx.Visible txn 0
+                return! go txn 0 scan
+            }
+
         let targetSchema = targetSchemaOf schema
 
-        foldRows txn ctx schema (matchesWhere targetSchema where) (fun t count row ->
+        foldRows schema ctx txn (fun row -> matchesWhere targetSchema row where) (fun t count row ->
             Dml.deleteRow schema t row |> Result.map (fun t2 -> t2, count + 1))
+
+/// DB の状態。
+type internal DbState =
+    {
+        Root: string
+        Store: RowStore
+        Catalog: Catalog
+        Manager: TransactionManager
+        Active: Transaction option
+        Pending: Transaction option
+        /// 進行中 transaction の ActiveSnapshot 登録。
+        /// 他のハンドルの compaction が、この snapshot より新しい版だけを残して
+        /// 古い版を捨ててしまわないようにするために登録する。
+        /// 同じ transaction の state は複数のハンドルが共有できる（登録側で生存を数える）。
+        ActiveRegistration: ActiveRegistration option
+    }
+
+/// Transaction を commit して DbState に反映する共通処理。
+module internal DbStateOps =
+    let commitTransaction (txn: Transaction) (state: DbState) =
+        result {
+            let! store, manager =
+                RowStore.commitToStore state.Root state.ActiveRegistration state.Manager txn state.Store
+
+            return
+                { state with
+                    Store = store
+                    Manager = manager
+                    Active = None
+                    Pending = None
+                    ActiveRegistration = None
+                }
+        }
 
 module internal Ddl =
     /// カタログを保存し、保存後の Store と新しい Catalog で state を作り直す。
     /// （CREATE / DROP すべてが使う「保存 → state 更新」の定型）
-    let private saved (state: DbState) (next: Catalog) =
+    let private saved (next: Catalog) (state: DbState) =
         result {
             let! store = Catalog.save state.Store state.Catalog next
 
@@ -430,7 +376,7 @@ module internal Ddl =
     ///   待つと、commit されないまま残った transaction で永久に止まるので失敗側に倒す。
     /// - 新しい transaction の開始と文の実行は排他の間ブロックされる（実行後は新しいカタログを見る）。
     /// </remarks>
-    let private exclusiveDdl (state: DbState) (run: DbState -> Result<DbState, DbError>) =
+    let private exclusiveDdl (run: DbState -> Result<DbState, DbError>) (state: DbState) =
         RootGate.withExclusive state.Root (fun () ->
             match ActiveSnapshotRegistry.oldestExcept state.Root state.ActiveRegistration with
             | Some _ -> err (DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください")
@@ -439,9 +385,9 @@ module internal Ddl =
     let private BackfillChunkRows = 8192
 
     let private applyChunks
-        (current: DbState)
-        (chunks: seq<'a>)
         (apply: Transaction -> 'a -> Result<Transaction, DbError>)
+        (chunks: seq<'a>)
+        (current: DbState)
         =
         chunks
         |> foldOk
@@ -453,7 +399,7 @@ module internal Ddl =
                     let! txn2 = apply txn chunk
 
                     let! store, mgr2 =
-                        DbStateOps.commitToStore st.Root st.ActiveRegistration st.Store mgr txn2
+                        RowStore.commitToStore st.Root st.ActiveRegistration mgr txn2 st.Store
 
                     return
                         { st with
@@ -463,60 +409,21 @@ module internal Ddl =
                 })
             current
 
-    /// UNIQUE 索引の索引値が重複していないか確認する。
-    /// 索引キーは「索引値 + 主キー」の順に並ぶので、直前の索引値だけを保持すればよい。
-    let private checkUniqueIndex (store: RowStore) (schema: TableSchema) (idx: IndexSchema) =
-        let positions = idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
-
-        match positions with
-        | Error e -> Error e
-        | Ok positions ->
-            RowStore.scanAt store (Keyspace.index idx.Name) [||] Snapshot.NoLimit 0
-            |> Result.bind (fun entries ->
-                use e = entries.GetEnumerator()
-
-                let rec loop (previous: byte array option) =
-                    if not (e.MoveNext()) then
-                        ret ()
-                    else
-                        let _, value = e.Current
-
-                        match value with
-                        | None -> loop previous
-                        | Some row ->
-                            let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
-
-                            if values |> Array.exists SqlValue.isNull then
-                                loop previous
-                            else
-                                let prefix = KeyBuilder.ofValues values
-
-                                match previous with
-                                | Some before when Bytes.compare before prefix = 0 ->
-                                    err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                                | _ -> loop (Some prefix)
-
-                loop None)
-
     /// keyspace の全エントリをチャンク単位で tombstone 消去する。
-    let private clearSpaceChunksResult (state: DbState) (space: string) =
+    let private clearSpaceChunksResult (space: string) (state: DbState) =
         if not (RowStore.keyspaceExists state.Store space) then
             ret state
         else
             match RowStore.scanAt state.Store space [||] Snapshot.NoLimit 0 with
             | Error e -> Error e
             | Ok stale ->
-                applyChunks state (Seq.chunkBySize BackfillChunkRows stale) (fun txn chunk ->
-                    foldOk (fun t (key, _) -> ret (Transaction.remove space key t)) txn chunk)
+                applyChunks
+                    (fun txn chunk -> foldOk (fun t (key, _) -> ret (Transaction.remove space key t)) txn chunk)
+                    (Seq.chunkBySize BackfillChunkRows stale)
+                    state
 
-    /// 失敗しても可視性に影響しない後始末用（DROP 後）。
-    let private clearSpaceChunks (state: DbState) (space: string) =
-        match clearSpaceChunksResult state space with
-        | Ok next -> next
-        | Error _ -> state
-
-    let createTable (state: DbState) (c: CreateTable) =
-        let createTableCore (state: DbState) (c: CreateTable) =
+    let createTable (c: CreateTable) (state: DbState) =
+        let createTableCore (c: CreateTable) state =
             let existing = Catalog.findTable state.Catalog c.Name
 
             match existing, c.IfNotExists with
@@ -558,15 +465,99 @@ module internal Ddl =
                         :: (implicitIndexes |> List.map (fun idx -> Keyspace.index idx.IndexName))
 
                     let! cleaned =
-                        spaces |> foldOk (fun st space -> clearSpaceChunksResult st space) state
+                        spaces |> foldOk (fun st space -> clearSpaceChunksResult space st) state
 
-                    return! saved cleaned catalog2
+                    return! saved catalog2 cleaned
                 }
 
-        exclusiveDdl state (fun fresh -> createTableCore fresh c)
+        exclusiveDdl (createTableCore c) state
 
-    let createIndex (state: DbState) (ci: CreateIndex) =
-        let backfillIndex (state: DbState) (tableName: string) (idx: IndexSchema) =
+    /// DROP TABLE。
+    /// 手順:
+    ///   1. 先にカタログから定義を外してテーブルを見えなくする
+    ///   2. テーブルと全索引 keyspace の全エントリをチャンク単位で tombstone 消去する
+    /// 後始末が中断しても、次回の CREATE TABLE が同名 keyspace を空にしてから作る。
+    let dropTable (name: string) (ifExists: bool) (state: DbState) =
+        let dropTableCore name ifExists state =
+            match Catalog.findTable state.Catalog name with
+            | None ->
+                if ifExists then
+                    ret state
+                else
+                    err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
+            | Some defn ->
+                result {
+                    let! schema = Catalog.toSchema defn
+
+                    let withIndexes =
+                        { schema with
+                            Indexes = Catalog.indexSchemasOf state.Catalog schema.Name
+                        }
+
+                    let spaces =
+                        Keyspace.table schema.Name
+                        :: (withIndexes.Indexes |> List.map (fun index -> Keyspace.index index.Name))
+
+                    let! () = DropCleanup.add state.Store.Root spaces
+
+                    let! next =
+                        match saved (Catalog.removeTable state.Catalog name) state with
+                        | Ok next -> ret next
+                        | Error e ->
+                            DropCleanup.clear state.Store.Root |> ignore
+                            Error e
+
+                    match spaces |> foldOk (fun st space -> clearSpaceChunksResult space st) next with
+                    | Ok cleaned ->
+                        DropCleanup.clear state.Store.Root |> ignore
+                        return cleaned
+                    | Error _ -> return next
+                }
+
+        exclusiveDdl (dropTableCore name ifExists) state
+
+    let createIndex (ci: CreateIndex) (state: DbState) =
+        let checkEntries positions (idx: IndexSchema) (entries: seq<byte array * SqlValue array option>) =
+            use e = entries.GetEnumerator()
+
+            let rec loop previous =
+                if not (e.MoveNext()) then
+                    ret ()
+                else
+                    let _, value = e.Current
+
+                    match value with
+                    | None -> loop previous
+                    | Some row ->
+                        let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
+
+                        if values |> Array.exists SqlValue.isNull then
+                            loop previous
+                        else
+                            let prefix = KeyBuilder.ofValues values
+
+                            match previous with
+                            | Some before when Bytes.compare before prefix = 0 ->
+                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                            | _ -> loop (Some prefix)
+
+            loop None
+
+        let checkUniqueIndex schema (idx: IndexSchema) store =
+            let positions = idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
+
+            match positions with
+            | Error e -> Error e
+            | Ok pos ->
+                RowStore.scanAt store (Keyspace.index idx.Name) [||] Snapshot.NoLimit 0
+                >>= checkEntries pos idx
+
+        let clearSpaceChunks space state =
+            match clearSpaceChunksResult space state with
+            | Ok next -> next
+            | Error _ -> state
+
+        let backfillIndex tableName idx state =
             match Catalog.findTable state.Catalog tableName with
             | None -> ret state
             | Some defn ->
@@ -581,24 +572,27 @@ module internal Ddl =
                     let space = Keyspace.index idx.Name
                     let indexKeyFor row = RowKey.indexKey withIndex idx row
 
-                    let! cleared = clearSpaceChunksResult state space
+                    let! cleared = clearSpaceChunksResult space state
                     let! rows = Dml.scanByPrimaryKey cleared.Store withIndex Snapshot.NoLimit 0
 
                     let! filled =
-                        applyChunks cleared (Seq.chunkBySize BackfillChunkRows rows) (fun txn chunk ->
-                            foldOk (fun t row -> ret (Transaction.put space (indexKeyFor row) row t)) txn chunk)
+                        applyChunks
+                            (fun txn chunk ->
+                                foldOk (fun t row -> ret (Transaction.put space (indexKeyFor row) row t)) txn chunk)
+                            (Seq.chunkBySize BackfillChunkRows rows)
+                            cleared
 
                     if idx.Unique then
-                        match checkUniqueIndex filled.Store withIndex idx with
+                        match checkUniqueIndex withIndex idx filled.Store with
                         | Ok() -> return filled
                         | Error e ->
-                            clearSpaceChunks filled space |> ignore
+                            clearSpaceChunks space filled |> ignore
                             return! Error e
                     else
                         return filled
                 }
 
-        let createIndexCore (state: DbState) (ci: CreateIndex) =
+        let createIndexCore ci state =
             match Catalog.findTable state.Catalog ci.Table with
             | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
             | Some tableDef ->
@@ -651,62 +645,18 @@ module internal Ddl =
 
                     let idxSchema = Catalog.toIndexSchema defn
                     let next = Catalog.addIndex state.Catalog defn
-                    let! filled = backfillIndex state ci.Table idxSchema
-                    return! saved filled next
+                    let! filled = backfillIndex ci.Table idxSchema state
+                    return! saved next filled
                 }
 
-        exclusiveDdl state (fun fresh -> createIndexCore fresh ci)
-
-    /// DROP TABLE。
-    /// 手順:
-    ///   1. 先にカタログから定義を外してテーブルを見えなくする
-    ///   2. テーブルと全索引 keyspace の全エントリをチャンク単位で tombstone 消去する
-    /// 後始末が中断しても、次回の CREATE TABLE が同名 keyspace を空にしてから作る。
-    let dropTable (state: DbState) (name: string) (ifExists: bool) =
-        let dropTableCore (state: DbState) (name: string) (ifExists: bool) =
-            match Catalog.findTable state.Catalog name with
-            | None ->
-                if ifExists then
-                    ret state
-                else
-                    err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
-            | Some defn ->
-                result {
-                    let! schema = Catalog.toSchema defn
-
-                    let withIndexes =
-                        { schema with
-                            Indexes = Catalog.indexSchemasOf state.Catalog schema.Name
-                        }
-
-                    let spaces =
-                        Keyspace.table schema.Name
-                        :: (withIndexes.Indexes |> List.map (fun index -> Keyspace.index index.Name))
-
-                    let! () = DropCleanup.add state.Store.Root spaces
-
-                    let! next =
-                        match saved state (Catalog.removeTable state.Catalog name) with
-                        | Ok next -> ret next
-                        | Error e ->
-                            DropCleanup.clear state.Store.Root |> ignore
-                            Error e
-
-                    match spaces |> foldOk (fun st space -> clearSpaceChunksResult st space) next with
-                    | Ok cleaned ->
-                        DropCleanup.clear state.Store.Root |> ignore
-                        return cleaned
-                    | Error _ -> return next
-                }
-
-        exclusiveDdl state (fun fresh -> dropTableCore fresh name ifExists)
+        exclusiveDdl (createIndexCore ci) state
 
     /// DROP INDEX。
     /// 先にカタログから定義を外して索引を見えなくし、
     /// その後で索引 keyspace をチャンク単位で tombstone 消去する。
     /// 後始末が中断しても、次回の CREATE INDEX が同名 keyspace を空にしてから作る。
-    let dropIndex (state: DbState) (name: string) (ifExists: bool) =
-        let dropIndexCore (state: DbState) (name: string) (ifExists: bool) =
+    let dropIndex (name: string) (ifExists: bool) (state: DbState) =
+        let dropIndexCore name ifExists state =
             match Catalog.findIndex state.Catalog name with
             | None ->
                 if ifExists then
@@ -721,23 +671,23 @@ module internal Ddl =
                     let! () = DropCleanup.add state.Store.Root [ space ]
 
                     let! next =
-                        match saved state (Catalog.removeIndex state.Catalog name) with
+                        match saved (Catalog.removeIndex state.Catalog name) state with
                         | Ok next -> ret next
                         | Error e ->
                             DropCleanup.clear state.Store.Root |> ignore
                             Error e
 
-                    match clearSpaceChunksResult next space with
+                    match clearSpaceChunksResult space next with
                     | Ok cleaned ->
                         DropCleanup.clear state.Store.Root |> ignore
                         return cleaned
                     | Error _ -> return next
                 }
 
-        exclusiveDdl state (fun fresh -> dropIndexCore fresh name ifExists)
+        exclusiveDdl (dropIndexCore name ifExists) state
 
 module internal Engine =
-    let runStatement (state: DbState) (txn: Transaction) (stmt: Statement) =
+    let runStatement (state: DbState) (txn: Transaction) =
         let addTable ctx t =
             match Catalog.toSchema t with
             | Ok schema ->
@@ -749,57 +699,13 @@ module internal Engine =
                 ret (ExecContext.withSchema ctx t.Name withIndexes)
             | Error e -> Error e
 
-        let contextOf (state: DbState) (txn: Transaction) =
+        let contextOf state txn =
             let ctx = ExecContext.create state.Store (Snapshot.toVisible txn.Snapshot)
             let ctx = ExecContext.withTransaction ctx txn
             let ctx = ExecContext.withCatalog ctx state.Catalog
-
             state.Catalog.Tables |> foldOk addTable ctx
 
-        let runInsert (ctx: ExecContext) (st: InsertStatement) (txn: Transaction) =
-            ExecContext.schemaOf ctx st.Table.Name
-            >>= fun schema -> DmlOps.insert ctx schema txn st.Columns st.Rows
-
-        let runUpdate (ctx: ExecContext) (st: UpdateStatement) (txn: Transaction) =
-            ExecContext.schemaOf ctx st.Table.Name
-            >>= fun schema -> DmlOps.update ctx schema txn st.Assignments st.Where
-
-        let runDelete (ctx: ExecContext) (st: DeleteStatement) (txn: Transaction) =
-            ExecContext.schemaOf ctx st.Table.Name
-            >>= fun schema -> DmlOps.delete ctx schema txn st.Where
-
-        let runDml
-            (state: DbState)
-            (txn: Transaction)
-            (run: ExecContext -> Transaction -> Result<Transaction * int, DbError>)
-            =
-            result {
-                let! ctx = contextOf state txn
-                let! outcome = run ctx txn
-                let txn2, n = outcome
-
-                return
-                    { state with Pending = Some txn2 },
-                    { StatementResult.empty with
-                        RowsAffected = n
-                    }
-            }
-
-        let noRows (r: Result<DbState, DbError>) =
-            r |> Result.map (fun s -> s, StatementResult.empty)
-
-        let ddl (run: unit -> Result<DbState, DbError>) =
-            if state.Active.IsSome then
-                err (
-                    DbError.create
-                        ErrorKind.SyntaxError
-                        "トランザクション中は DDL（CREATE / DROP）を実行できません。COMMIT または ROLLBACK してから実行してください"
-                )
-            else
-                run ()
-
-        match stmt with
-        | Statement.Select sel ->
+        let runSelect sel =
             contextOf state txn
             >>= fun ctx ->
                 Plan.runSelect ctx sel
@@ -812,13 +718,53 @@ module internal Engine =
                         }
 
                     state, result)
-        | Statement.Insert st -> runDml state txn (fun ctx -> runInsert ctx st)
-        | Statement.Update st -> runDml state txn (fun ctx -> runUpdate ctx st)
-        | Statement.Delete st -> runDml state txn (fun ctx -> runDelete ctx st)
-        | Statement.CreateTable c -> noRows (ddl (fun () -> Ddl.createTable state c))
-        | Statement.DropTable(n, ifE) -> noRows (ddl (fun () -> Ddl.dropTable state n ifE))
-        | Statement.CreateIndex ci -> noRows (ddl (fun () -> Ddl.createIndex state ci))
-        | Statement.DropIndex(n, ifE) -> noRows (ddl (fun () -> Ddl.dropIndex state n ifE))
+
+        let runInsert (st: InsertStatement) ctx txn =
+            ExecContext.schemaOf ctx st.Table.Name
+            >>= fun schema -> DmlOps.insert schema ctx txn st.Columns st.Rows
+
+        let runUpdate (st: UpdateStatement) ctx txn =
+            ExecContext.schemaOf ctx st.Table.Name
+            >>= fun schema -> DmlOps.update schema ctx txn st.Assignments st.Where
+
+        let runDelete (st: DeleteStatement) ctx txn =
+            ExecContext.schemaOf ctx st.Table.Name
+            >>= fun schema -> DmlOps.delete schema ctx txn st.Where
+
+        let runDml run =
+            result {
+                let! ctx = contextOf state txn
+                let! outcome = run ctx txn
+                let txn2, n = outcome
+
+                return
+                    { state with Pending = Some txn2 },
+                    { StatementResult.empty with
+                        RowsAffected = n
+                    }
+            }
+
+        let runDdl run =
+            if state.Active.IsSome then
+                err (
+                    DbError.create
+                        ErrorKind.SyntaxError
+                        "トランザクション中は DDL（CREATE / DROP）を実行できません。COMMIT または ROLLBACK してから実行してください"
+                )
+            else
+                run state
+
+        let noRows = Result.map (fun s -> s, StatementResult.empty)
+
+        function
+        | Statement.Select sel -> runSelect sel
+        | Statement.Insert st -> runInsert st |> runDml
+        | Statement.Update st -> runUpdate st |> runDml
+        | Statement.Delete st -> runDelete st |> runDml
+        | Statement.CreateTable c -> Ddl.createTable c |> runDdl |> noRows
+        | Statement.DropTable(n, ifE) -> Ddl.dropTable n ifE |> runDdl |> noRows
+        | Statement.CreateIndex ci -> Ddl.createIndex ci |> runDdl |> noRows
+        | Statement.DropIndex(n, ifE) -> Ddl.dropIndex n ifE |> runDdl |> noRows
         | Statement.Begin
         | Statement.Commit
-        | Statement.Rollback -> ret (state, StatementResult.empty)
+        | Statement.Rollback -> ret state |> noRows

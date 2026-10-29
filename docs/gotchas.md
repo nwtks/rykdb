@@ -389,11 +389,12 @@ compaction で L1+ に降ろしたデータが一切見つからなくなった�
 Array.mapi (fun level files -> ...)
 ```
 
-### 4.6 `Sstable.FooterSize` の変更は `decodeFooter` と成套で
+### 4.6 `Sstable.FooterSize` の変更は `readFooterFields` と成套で
 
 `MaxSeqNo` を追加したときは `FooterSize` を `72 → 80` に、
 Footer 自身のチェックサムを追加したときは `80 → 84` に変更した。
-**放置するとファイル名の長さがずれて、.footer の読み取りが壊れる**。
+v5 で全体 checksum を削除して `metadataChecksum` を追加したときは `88 → 84` に戻した。
+**放置すると Footer の開始位置がずれて、ファイル全体の読み取りが壊れる**。
 
 ### 4.7 「状態を進めるヘルパー」は進んだ状態も返す（`scanAt` の無限ループ）
 
@@ -1266,10 +1267,12 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ファイル内容から値を復元するコンストラクタは例外を送出し得る。境界で検証して `CorruptionError` にする:
 
-- `Sstable.parseBlock`: `shared > prev.Length` を拒否。restart 件数は `(n / 4) - 1` 以下に制限（加算オーバーフロー防止）。
+- `Sstable.parseBlock`: `shared > prev.Length` を拒否。
+- `Sstable.parseFooterBytes` / `validateFooter`: 未知バージョン、セクションの重なり・隙間・範囲外を拒否。
 - `ValueCodec`: DECIMAL の flags/scale（scale ≤ 28・予約ビット 0）、DATE / TIMESTAMP の範囲。
 - `VersionEdit`: レベルは `0..Levels.Max`。
-- `BloomFilter.deserialize`: ビット数・ハッシュ数 0 を拒否（`% 0` の防止）。
+- `BloomFilter.deserialize`: ビット数・ハッシュ数 0、8 の倍数でないビット数、過大な件数、余分な末尾バイトを拒否
+  （`% 0` と過大確保の防止）。
 
 ### 11.21 `Result` を握り潰さない（DEFAULT / `Begin()` / schema）
 
@@ -1315,10 +1318,13 @@ DDL だけはプロセス内で排他にする必要がある。
 `Filter` / `Sort` / `Aggregate` / `Distinct` / `Join` は行数を変える（または順序を作る）ため、
 ヒントを落として全件走査に戻す。`WHERE` 付きの `LIMIT` は pushdown されない。
 
-### 11.26 部分読みはブロック単位のチェックサムで守る
+### 11.26 部分読みはブロック / メタデータ / Footer のチェックサムで守る
 
-v2 の SSTable は各ブロック末尾に 4バイトのチェックサムを持つ。
-v3 の Footer は自身のチェックサム（先頭 80バイト対象）を持ち、`openPartial` でも検証する。
+v5 の SSTable は各ブロック末尾に 4バイトのチェックサムを持つ。
+Footer は Meta / Bloom / Index の連続領域を守る `metadataChecksum` と、
+自身（先頭 80バイト）を守る `footerChecksum` を持ち、`openPartial` でも検証する。
+全体チェックサムは部分読みでは検証できないため持たない
+（ファイル全体を読む経路も、各ブロックとメタデータの検証で破損を検出する）。
 `SstPartial` は Footer / meta / Bloom / index だけを開き、
 データブロックは必要になったとき `FileStream` で読む。
 読んだブロックは `parseBlock` がチェックサムを検証する。

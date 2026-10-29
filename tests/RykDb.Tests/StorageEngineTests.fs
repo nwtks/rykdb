@@ -21,9 +21,9 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
     |> FileMetaData.writeSstable dir num level 0.01
     |> ok
 
-/// SSTable の本文を書き換え、全体・メタデータ・Footer のチェックサムを合わせ直す。
+/// SSTable の本文を書き換え、メタデータ・Footer のチェックサムを合わせ直す。
 /// 「開けるが中身が壊れたファイル」を作る
-/// （FooterSize = 88、全体 checksum は +76、metadata checksum は +80、Footer checksum は +84）。
+/// （FooterSize = 84、metadata checksum は +76、Footer checksum は +80）。
 let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array -> unit) =
     let path = FileMetaData.path dir fileNumber
     let data = File.ReadAllBytes path
@@ -39,10 +39,6 @@ let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array ->
             data.[footerStart + offset + i] <- byte (value >>> (i * 8) &&& 0xFFu)
 
     patch data
-    let bodyChecksum = Hashing.checksum (Array.sub data 0 footerStart)
-
-    writeU32 76 bodyChecksum
-
     let metadataOffset = int (readI64 52)
     let indexOffset = int (readI64 20)
     let indexLength = int (readI64 28)
@@ -50,7 +46,7 @@ let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array ->
     let metadataChecksum =
         Hashing.checksumRange data metadataOffset (indexOffset + indexLength - metadataOffset)
 
-    writeU32 80 metadataChecksum
+    writeU32 76 metadataChecksum
 
     let footerChecksum =
         Hashing.checksum (Array.sub data footerStart (Sstable.FooterSize - 4))
@@ -66,7 +62,7 @@ let ``StorageEngine.getAt: 壊れたブロックは CorruptionError`` () =
             let f =
                 mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1); Entry.put (intKey 2) 2UL (intRow 2) ]
 
-            // ブロック末尾の restart 件数を巨大値にして壊し、チェックサムは合わせ直す
+            // ブロック末尾のチェックサムを壊す（Footer のチェックサムは合わせ直す）
             let block = (ok (Sstable.openPartial (FileMetaData.path dir 10L))).Index.[0]
 
             patchSstable dir 10L (fun data ->
@@ -230,7 +226,7 @@ let ``StorageEngine.getAt / scanAt: 必要なブロックだけを部分読み�
 
             let f = mkSst dir 10L 0 entries
 
-            // 2番目のブロックの内部を壊す（全体チェックサムも合わなくなる）。
+            // 2番目のブロックの内部を壊す（ブロックのチェックサムも合わなくなる）。
             let path = FileMetaData.path dir 10L
             let reader = ok (Sstable.openPartial path)
             let block = reader.Index.[1]
@@ -251,8 +247,8 @@ let ``StorageEngine.getAt / scanAt: 必要なブロックだけを部分読み�
             // limit 5 はブロック 0 だけで足りる
             let five = ok (StorageEngine.scanAt None 5 [||] engine) |> Seq.toArray
             Assert.Equal<int>(5, five.Length)
-            // 全件走査は全体チェックサムで壊れていることを検出する
-            expectErrorKind ErrorKind.CorruptionError "全件走査は全体チェックサムで検出する" (StorageEngine.scanAt None 0 [||] engine)))
+            // 全件走査は壊れたブロックのチェックサムで検出する
+            expectErrorKind ErrorKind.CorruptionError "全件走査は壊れたブロックを検出する" (StorageEngine.scanAt None 0 [||] engine)))
 
 [<Fact>]
 let ``StorageEngine.maybeFlush: flush 後に compaction が不要なら compactOnce は noop で返す`` () =
@@ -369,6 +365,26 @@ let ``StorageEngine.openDatabase: 最大 SeqNo はファイルの並び順に関
         let engine = ok (StorageEngine.openDatabase dir)
         // 再開後はファイル内の最大 SeqNo（5）の次から書ける
         Assert.Equal(6UL, engine.NextSeqNo))
+
+[<Fact>]
+let ``StorageEngine.openDatabase: NextTxnId は WAL の最大 txnId + 1 から再開する`` () =
+    withDir "re-next-txn" (fun dir ->
+        let engine = ok (StorageEngine.openDatabase dir)
+
+        let engine =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 1) 1UL (intRow 1) |] engine)
+
+        Assert.Equal(2UL, engine.NextTxnId)
+
+        // WAL を再生して採番を巻き戻さない
+        let reopened = ok (StorageEngine.openDatabase dir)
+        Assert.Equal(2UL, reopened.NextTxnId)
+
+        let reopened =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] reopened)
+
+        Assert.Equal(3UL, reopened.NextTxnId)
+        Assert.Equal(3UL, (ok (StorageEngine.openDatabase dir)).NextTxnId))
 
 [<Fact>]
 let ``StorageEngine.openDatabase: 孤児の SSTable は削除せず退避する`` () =

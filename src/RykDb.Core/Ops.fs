@@ -39,7 +39,7 @@ module internal Ops =
             |> List.fold
                 (fun (acc: Result<Map<int, SqlValue>, DbError>) (i, _) ->
                     acc
-                    |> Result.bind (fun m ->
+                    >>= fun m ->
                         let v = row.[i]
 
                         if SqlValue.isNull v then
@@ -47,8 +47,7 @@ module internal Ops =
                         else
                             match Map.tryFind i m with
                             | None -> ret (Map.add i v m)
-                            | Some representative ->
-                                SqlValue.compareValues representative v |> Result.map (fun _ -> m)))
+                            | Some representative -> SqlValue.compareValues representative v |> Result.map (fun _ -> m))
                 (ret reps)
 
         if List.isEmpty keys then
@@ -651,7 +650,7 @@ module internal Ops =
         (lookup: SqlValue array -> Result<Op, DbError>)
         (residual: Expr option)
         =
-        joinProbe leftSchema left rightSchema leftKeys (fun key -> lookup key |> Result.bind Op.toArray) residual false
+        joinProbe leftSchema left rightSchema leftKeys (fun key -> lookup key >>= Op.toArray) residual false
 
     /// LEFT JOIN（インデックス入れ子ループ）。
     let leftJoinIndexed
@@ -662,7 +661,7 @@ module internal Ops =
         (lookup: SqlValue array -> Result<Op, DbError>)
         (residual: Expr option)
         =
-        joinProbe leftSchema left rightSchema leftKeys (fun key -> lookup key |> Result.bind Op.toArray) residual true
+        joinProbe leftSchema left rightSchema leftKeys (fun key -> lookup key >>= Op.toArray) residual true
 
     /// 射影。
     /// `SELECT` の項目順に値を並べる。

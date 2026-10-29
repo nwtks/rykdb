@@ -37,10 +37,12 @@ let ``Wal.foldCommitted: コミット済みだけを順に再生する`` () =
 
         let _ = ok (Wal.append dir records w0)
 
-        let replayed =
-            ok (Wal.foldCommitted dir 1L (fun acc entry -> entry :: acc) []) |> List.rev
+        let replayed, maxTxnId =
+            ok (Wal.foldCommitted dir 1L (fun acc entry -> entry :: acc) [])
 
-        Assert.Equal<uint64 list>([ 1UL; 3UL ], replayed |> List.map _.SeqNo))
+        Assert.Equal<uint64 list>([ 1UL; 3UL ], List.rev replayed |> List.map _.SeqNo)
+        // Abort された txn 2 も含め、WAL に現れた最大 txnId を返す
+        Assert.Equal(3UL, maxTxnId))
 
 [<Fact>]
 let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =

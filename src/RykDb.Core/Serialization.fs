@@ -509,6 +509,19 @@ module internal Hashing =
 
         loop offset 2166136261u
 
+    /// 複数のチャンクを連結したものの 32bit チェックサム（FNV-1a）。
+    /// SSTable のメタデータ（meta / Bloom / index）をコピーせずに検証する。
+    let checksumChunks (chunks: byte array array) =
+        let rec loopChunk chunkIndex i h =
+            if chunkIndex >= chunks.Length then
+                h
+            elif i >= chunks.[chunkIndex].Length then
+                loopChunk (chunkIndex + 1) 0 h
+            else
+                loopChunk chunkIndex (i + 1) ((h ^^^ uint32 chunks.[chunkIndex].[i]) * 16777619u)
+
+        loopChunk 0 0 2166136261u
+
     /// ハッシュ値を攪拌する（splitmix64 相当）。
     /// FNV-1a は下位ビットに偏りがちで、Bloom filter のビット分布が悪くなるため。
     let mix (x: uint64) =

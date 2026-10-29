@@ -14,14 +14,14 @@ type internal Entry =
     member x.IsDelete = x.Value.IsNone
 
 module internal Entry =
-    let put key seqNo (value: SqlValue array) =
+    let put (key: byte array) (seqNo: uint64) (value: SqlValue array) =
         {
             Key = key
             SeqNo = seqNo
             Value = Some value
         }
 
-    let delete key seqNo =
+    let delete (key: byte array) (seqNo: uint64) =
         {
             Key = key
             SeqNo = seqNo
@@ -287,6 +287,3 @@ module internal Memtable =
                     step struct (Visit r.Left :: Emit r.Entry :: Visit r.Right :: rest, count)
 
         Seq.unfold step struct ([ Visit mem.Root ], 0)
-
-    /// キー昇順（同一キーは SeqNo 降順）で全エントリを返す。
-    let toArray (mem: Memtable) = rangeScan [||] 0 mem |> Seq.toArray

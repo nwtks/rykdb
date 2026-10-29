@@ -678,3 +678,55 @@ let ``RowStore: 未解決の intent が残っている間はジャーナルを�
         Assert.Equal(1, unresolvedOf dir)
 
         RowStore.close store2 |> ok)
+
+[<Fact>]
+let ``RowStore.commitToStore: 別ハンドルの active snapshot を GC 境界に使う`` () =
+    withDir "commit-boundary" (fun dir ->
+        let store = ok (RowStore.openStore dir)
+
+        // 既に SeqNo 10 まで commit 済みのハンドル（SeqNo 11 から採番する）。
+        let mgr =
+            { TransactionManager.create () with
+                LastCommitSeqNo = 10UL
+                NextSeqNo = 11UL
+            }
+
+        let mgr, txn = TransactionManager.beginTxn mgr
+        let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
+
+        // 同じ DB を開いた別ハンドルが snapshot 5 で読み始めている状態。
+        let other = ActiveSnapshotRegistry.register dir 5UL
+
+        let committed, _ = ok (RowStore.commitToStore dir None mgr txn store)
+        let engine = ok (RowStore.engine committed "t:a")
+
+        // 自ハンドルだけなら 12（LastCommitSeqNo 11 + 1）だが、別ハンドルの 5 が下限になる。
+        Assert.Equal(5UL, engine.ActiveSnapshot)
+
+        ActiveSnapshotRegistry.unregister dir other
+        RowStore.close committed |> ok)
+
+[<Fact>]
+let ``RowStore.commitToStore: 自分の登録は GC 境界から除外する`` () =
+    withDir "commit-boundary-self" (fun dir ->
+        let store = ok (RowStore.openStore dir)
+
+        let mgr =
+            { TransactionManager.create () with
+                LastCommitSeqNo = 10UL
+                NextSeqNo = 11UL
+            }
+
+        let mgr, txn = TransactionManager.beginTxn mgr
+        let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
+
+        // 自分（これから commit する transaction）の登録は除外し、他の登録だけを見る。
+        let own = ActiveSnapshotRegistry.register dir txn.Snapshot.SeqNo
+
+        let committed, _ = ok (RowStore.commitToStore dir (Some own) mgr txn store)
+        let engine = ok (RowStore.engine committed "t:a")
+
+        Assert.Equal(12UL, engine.ActiveSnapshot)
+
+        ActiveSnapshotRegistry.unregister dir own
+        RowStore.close committed |> ok)

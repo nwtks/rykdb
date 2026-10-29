@@ -123,7 +123,7 @@ type Database internal (root: string, state: DbState) =
         match target with
         | None -> err (DbError.internalError "コミットする transaction がありません")
         | Some txn ->
-            DbStateOps.commitTransaction state txn
+            DbStateOps.commitTransaction txn state
             |> Result.map (fun nextState ->
                 match state.ActiveRegistration with
                 | Some token -> ActiveSnapshotRegistry.unregister root token
@@ -212,7 +212,7 @@ type Database internal (root: string, state: DbState) =
                             results.Add StatementResult.empty
                             runStatements st tail
                         | Some txn ->
-                            match DbStateOps.commitTransaction st txn with
+                            match DbStateOps.commitTransaction txn st with
                             | Error e -> Error e
                             | Ok nextState ->
                                 match st.ActiveRegistration with
@@ -291,7 +291,7 @@ type Database internal (root: string, state: DbState) =
                                     | Some p -> p
                                     | None -> txn
 
-                                let! nextState = DbStateOps.commitTransaction midState toCommit
+                                let! nextState = DbStateOps.commitTransaction toCommit midState
                                 return nextState, result
                             }
 

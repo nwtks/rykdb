@@ -559,7 +559,7 @@ module internal CommitIntent =
                 | Ok(Some frame) -> loop (frame :: acc)
 
             loop [])
-        |> Result.bind id
+        >>= id
 
     /// ジャーナルの追記・間引きを直列化する（root ごとではなくプロセス全体で 1本）。
     /// 書き込みは `RootGate` の共有ロック下で走るので、複数スレッドが同時に commit し得る。
@@ -1122,7 +1122,7 @@ module internal RowStore =
             ret (store, mgr)
         else
             scanAt store space [||] Snapshot.NoLimit 0
-            |> Result.bind (fun stale ->
+            >>= fun stale ->
                 stale
                 |> Seq.chunkBySize ClearChunkEntries
                 |> foldOk
@@ -1136,7 +1136,7 @@ module internal RowStore =
                             let! store1 = writeBatchesWithSnapshot activeSnapshot currentStore batches
                             return store1, mgr1
                         })
-                    (store, mgr))
+                    (store, mgr)
 
     /// 全 keyspace の NextSeqNo の最大値 − 1（＝保存済みの SeqNo）。
     let lastSeqNo (store: RowStore) =
@@ -1154,6 +1154,35 @@ module internal RowStore =
         | None -> ()
 
         outcome
+
+    /// commit してバッチを Store に書き込む。
+    /// 戻り値は (書き込み後の Store, commit 後の Manager)。
+    /// Active / Pending のような state フィールドの更新は呼び出し側で行う
+    /// （backfillIndex はトランザクションを外さないため触らない）。
+    /// GC 境界は「自ハンドルの active snapshot」と「同じ DB を開いている他ハンドルの active snapshot」の最小値。
+    /// 後者は `ActiveSnapshotRegistry` から集約する（`registration` は自分自身の登録で、除外する）。
+    /// 書き込みは `RootGate` の共有ロックを取り、DDL の排他と交差しないようにする。
+    let commitToStore
+        (root: string)
+        (registration: ActiveRegistration option)
+        (mgr: TransactionManager)
+        (txn: Transaction)
+        (store: RowStore)
+        =
+        RootGate.withShared root (fun () ->
+            result {
+                let! manager, _, batches = TransactionManager.commit txn mgr
+
+                let snapshot =
+                    let own = TransactionManager.activeSnapshot manager
+
+                    match ActiveSnapshotRegistry.oldestExcept root registration with
+                    | Some other -> min own other
+                    | None -> own
+
+                let! next = writeBatchesWithSnapshot snapshot store batches
+                return next, manager
+            })
 
 /// DML — スキーマと transaction を使う上位操作。
 /// 1行の書き込みは「主キーの LSM への 1件 + 各索引の LSM への 1件」。
@@ -1467,6 +1496,14 @@ module internal Dml =
             return! Transaction.checkLimit changed
         }
 
+    /// 走査済みの行をそのまま使って更新する（主キー検索をやり直さない）。
+    /// 主キーは変更できない（DELETE + INSERT を使う）。
+    let updateRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) (newRow: SqlValue array) =
+        result {
+            do! TableSchema.validateRow schema newRow
+            return! replaceRow schema txn oldRow newRow
+        }
+
     /// 主キーで更新する（主キーと全索引に新しい値を書き込む）。
     /// 読み手には 1transaction 分の原子的な書き換えとして見える。
     /// 削除してから挿入してはいけない。
@@ -1493,20 +1530,15 @@ module internal Dml =
             | Some oldRow -> return! replaceRow schema txn oldRow newRow
         }
 
-    /// 走査済みの行をそのまま使って更新する（主キー検索をやり直さない）。
-    /// 主キーは変更できない（DELETE + INSERT を使う）。
-    let updateRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) (newRow: SqlValue array) =
-        result {
-            do! TableSchema.validateRow schema newRow
-            return! replaceRow schema txn oldRow newRow
-        }
-
     let private removeRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) =
         result {
             let next = Transaction.remove (tableSpace schema) (RowKey.primary schema oldRow) txn
             let! changed = applyIndexChange schema next (Some oldRow) None
             return! Transaction.checkLimit changed
         }
+
+    /// 走査済みの行をそのまま使って削除する（主キー検索をやり直さない）。
+    let deleteRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) = removeRow schema txn oldRow
 
     /// 主キーで削除する。
     /// 主キーと全索引に tombstone を書く。
@@ -1525,6 +1557,3 @@ module internal Dml =
             | None -> return! err (sprintf "削除する行が見つかりません: %s" schema.Name |> DbError.notFound)
             | Some oldRow -> return! removeRow schema txn oldRow
         }
-
-    /// 走査済みの行をそのまま使って削除する（主キー検索をやり直さない）。
-    let deleteRow (schema: TableSchema) (txn: Transaction) (oldRow: SqlValue array) = removeRow schema txn oldRow

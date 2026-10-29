@@ -22,7 +22,6 @@ let private build (entries: (int * uint64) list) =
 let ``Memtable: 空の memtable は何も返さない`` () =
     Assert.Equal(0, Memtable.Empty.Count)
     Assert.Equal(0, Memtable.Empty.ApproxBytes)
-    Assert.Empty(Memtable.toArray Memtable.Empty)
     Assert.Empty(Memtable.rangeScan (intKey 0) 0 Memtable.Empty)
     Assert.True((Memtable.getVisible (intKey 0) None Memtable.Empty).IsNone)
 
@@ -123,7 +122,11 @@ let ``Memtable: 同一キーは SeqNo が最大の版を返す`` () =
     Assert.Equal<uint64>(9UL, e.SeqNo)
 
     // 同一キーの全版が保持され、SeqNo 降順に並ぶ
-    let versions = Memtable.toArray mem |> Array.filter (fun e -> e.Key = intKey 42)
+    let versions =
+        Memtable.rangeScan [||] 0 mem
+        |> Seq.filter (fun e -> e.Key = intKey 42)
+        |> Seq.toArray
+
     Assert.Equal(4, versions.Length)
     Assert.Equal<uint64 array>([| 9UL; 7UL; 3UL; 1UL |], versions |> Array.map (fun e -> e.SeqNo))
 
@@ -193,7 +196,7 @@ let ``Memtable: 接頭辞のキーは短い方が小さい`` () =
     let mem =
         Memtable.apply [| Entry.put longer 2UL (intRow 2); Entry.put shorter 1UL (intRow 1) |] Memtable.Empty
 
-    let all = Memtable.toArray mem
+    let all = Memtable.rangeScan [||] 0 mem |> Seq.toArray
     Assert.Equal<byte array>(shorter, all.[0].Key)
     Assert.Equal<byte array>(longer, all.[1].Key)
     // 短いキーのポイント検索が長いキーに引きずられない
@@ -222,7 +225,7 @@ let ``Memtable: 乱数キーでも列挙順と可視性が参照実装と一致�
         |> Array.map (fun (_, e) -> e.SeqNo)
         |> Array.sortDescending
 
-    let all = Memtable.toArray mem
+    let all = Memtable.rangeScan [||] 0 mem |> Seq.toArray
     Assert.Equal(n, all.Length)
 
     // 列挙は「キー昇順・同一キーは SeqNo 降順」
@@ -319,7 +322,7 @@ let ``Memtable: 挿入順に関わらずキー昇順で列挙される`` () =
         |> List.map (fun i -> Entry.put (intKey i) (uint64 i + 1UL) (intRow i))
         |> fun es -> Memtable.apply es Memtable.Empty
 
-    let all = Memtable.toArray mem
+    let all = Memtable.rangeScan [||] 0 mem |> Seq.toArray
     Assert.Equal(n, all.Length)
 
     all

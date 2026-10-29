@@ -76,7 +76,7 @@ module internal StorageEngine =
     let private openPartialSst (f: FileMetaData) (engine: StorageEngine) =
         let path = FileMetaData.path engine.Dir f.FileNumber
 
-        match protect (fun () -> SstPartialCache.keyOf path (System.IO.FileInfo path)) with
+        match protect (fun () -> System.IO.FileInfo path |> SstPartialCache.keyOf path) with
         | Error e -> Error e
         | Ok key ->
             match SstPartialCache.tryGet key with
@@ -287,7 +287,7 @@ module internal StorageEngine =
 
         let finishFlush engine version manifestNumber =
             result {
-                let! rotated = rotateWal engine (Wal.rotate engine.Wal)
+                let! rotated = Wal.rotate engine.Wal |> rotateWal engine
 
                 return
                     { rotated with
@@ -307,8 +307,9 @@ module internal StorageEngine =
                 let fileNumber = engine.Version.NextFileNumber
 
                 let! meta =
-                    Memtable.toArray engine.Mem
-                    |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+                    Memtable.rangeScan [||] 0 engine.Mem
+                    |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+                    |> Seq.toArray
                     |> FileMetaData.writeSstable engine.Dir fileNumber 0 BloomFalsePositiveRate
 
                 let! version, manifestNumber =
@@ -471,8 +472,9 @@ module internal StorageEngine =
                 ActiveSnapshot = 0UL
             }
 
-        let buildRecovered version manifestNumber walState mem walMax diskMax =
+        let buildRecovered version manifestNumber walState mem walMax diskMax walMaxTxn =
             let nextSeqNo = max walMax diskMax + 1UL
+            let nextTxnId = walMaxTxn + 1UL
 
             let bumped =
                 { version with
@@ -484,6 +486,7 @@ module internal StorageEngine =
                 Version = bumped
                 Wal = walState
                 NextSeqNo = nextSeqNo
+                NextTxnId = nextTxnId
                 Mem = mem
             }
 
@@ -493,15 +496,16 @@ module internal StorageEngine =
             do! quarantineOrphans dir version'
             let! walState = openOrCreateWal dir version'
 
-            let! mem, walMax =
+            let! replayed =
                 Wal.foldCommitted
                     dir
                     walState.FileNumber
                     (fun (mem, maxSeq) entry -> Memtable.insert entry mem, max maxSeq entry.SeqNo)
                     (Memtable.Empty, 0UL)
 
+            let (mem, walMax), walMaxTxn = replayed
             let diskMax = maxSeqNoOnDisk version'
-            return buildRecovered version' manifestNumber' walState mem walMax diskMax
+            return buildRecovered version' manifestNumber' walState mem walMax diskMax walMaxTxn
         }
 
     /// データベースを閉じる（memtable を flush してから WAL を消す）。
