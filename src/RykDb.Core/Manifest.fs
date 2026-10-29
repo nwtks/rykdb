@@ -5,8 +5,8 @@
 //
 // CURRENT は一時ファイルに書いてから原子的にリネームで切り替えるので、
 // クラッシュしても常に有効な manifest を指す。
-// 各 VersionEdit は長さ付きで包むので、途中で切れた追記も検出できる。
-// 途中のレコードが壊れていれば CorruptionError にして開かない（SSTable を消さない）。
+// 各 VersionEdit は [checksum:u32LE][長さ付き本体] のフレームを base64 1行にして追記する。
+// チェックサムで途中の完全な行の破損も検出し、CorruptionError にして開かない（SSTable を消さない）。
 // 末尾の書きかけ（後ろに有効な行が無い）だけはクラッシュ時の追記とみなして読み飛ばす。
 // ===========================================================================
 
@@ -46,6 +46,37 @@ module internal Manifest =
             fs.Close()
             System.IO.File.Move(tmp, currentPath dir, true))
 
+    /// MANIFEST の 1レコード。
+    /// [checksum:u32LE][VersionEdit 本体] のフレームを base64 にして 1行にする。
+    /// checksum は本体全体の FNV-1a（途中の完全な行の破損を検出する）。
+    let private encodeRecord (payload: byte array) =
+        let frame =
+            Writer.build
+                [
+                    Writer.uint32LE (Hashing.checksum payload)
+                    Writer.writeBytes payload
+                ]
+
+        System.Convert.ToBase64String frame + "\n"
+
+    let private decodeRecord (line: string) =
+        try
+            let frame = System.Convert.FromBase64String line
+
+            if frame.Length < 4 then
+                err (DbError.corruption "manifest のレコードが短すぎます")
+            else
+                let payload = Array.sub frame 4 (frame.Length - 4)
+
+                if Hashing.checksum payload <> Bytes.readLE32 frame 0 then
+                    err (DbError.corruption "manifest のレコードのチェックサム不一致")
+                else
+                    VersionEdit.decode payload
+        with
+        | :? System.FormatException as e ->
+            err (sprintf "manifest の base64 が不正: %s" e.Message |> DbError.corruption)
+        | e -> err (sprintf "manifest のレコードが不正: %s" e.Message |> DbError.corruption)
+
     /// ディレクトリを作る（既にあれば何もしない）。
     let ensureDirectory (dir: string) =
         protect (fun () ->
@@ -71,14 +102,6 @@ module internal Manifest =
                     else
                         raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
 
-        let readRecord line =
-            try
-                System.Convert.FromBase64String line |> VersionEdit.decode
-            with
-            | :? System.FormatException as e ->
-                err (sprintf "manifest の base64 が不正: %s" e.Message |> DbError.corruption)
-            | e -> err (sprintf "manifest のレコードが不正: %s" e.Message |> DbError.corruption)
-
         let rec decodeLines (lines: string list) acc =
             match lines with
             | [] -> Ok(List.rev acc, false)
@@ -86,7 +109,7 @@ module internal Manifest =
                 if line.Trim() = "" then
                     decodeLines rest acc
                 else
-                    match readRecord line with
+                    match decodeRecord line with
                     | Ok edits -> decodeLines rest (List.rev edits @ acc)
                     | Error _ when rest |> List.forall (fun l -> l.Trim() = "") -> Ok(List.rev acc, true)
                     | Error e -> Error e
@@ -152,7 +175,7 @@ module internal Manifest =
         let append dir fileNumber edit =
             protect (fun () ->
                 let path = manifestPath dir fileNumber
-                let bytes = VersionEdit.encode edit
+                let text = encodeRecord (VersionEdit.encode edit)
 
                 use fs =
                     new System.IO.FileStream(
@@ -162,7 +185,6 @@ module internal Manifest =
                         System.IO.FileShare.Read
                     )
 
-                let text = System.Convert.ToBase64String bytes + "\n"
                 let data = System.Text.Encoding.UTF8.GetBytes text
                 fs.Write(data, 0, data.Length)
                 fs.Flush true)
@@ -192,8 +214,7 @@ module internal Manifest =
                         DeletedFiles = []
                     }
 
-                let bytes = VersionEdit.encode edit
-                let text = System.Convert.ToBase64String bytes + "\n"
+                let text = encodeRecord (VersionEdit.encode edit)
                 let data = System.Text.Encoding.UTF8.GetBytes text
 
                 use fs =

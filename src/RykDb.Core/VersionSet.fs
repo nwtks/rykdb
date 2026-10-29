@@ -17,8 +17,6 @@ type internal Version =
     {
         /// [level] が、そのレベルのファイル（キーの昇順に並べる）
         Files: FileMetaData array array
-        /// コンパクションが選ぶために使うApproximateSize
-        SequenceNumber: uint64
         NextFileNumber: int64
     }
 
@@ -26,7 +24,6 @@ module internal Version =
     let Empty =
         {
             Files = Array.create Levels.Count [||]
-            SequenceNumber = 0UL
             NextFileNumber = 1L
         }
 

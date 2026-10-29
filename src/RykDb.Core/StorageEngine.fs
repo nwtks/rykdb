@@ -294,7 +294,6 @@ module internal StorageEngine =
                         Version =
                             { version with
                                 NextFileNumber = version.NextFileNumber + 1L
-                                SequenceNumber = engine.Version.SequenceNumber + 1UL
                             }
                         ManifestNumber = manifestNumber
                         Mem = Memtable.Empty

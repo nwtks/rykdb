@@ -3,7 +3,7 @@
 // メモリ上に展開した byte[] として扱う。
 // ブロック境界と索引だけを公開し、ファイル I/O とブロックキャッシュは StorageEngine が担う。
 //
-//   [Block 0]...[Block N-1][Meta][Bloom][Index][Footer 84 bytes]
+//   [Block 0]...[Block N-1][Meta][Bloom][Index][Footer 88 bytes]
 //
 // 各ブロックは LevelDB 風の restart 配列を持ち、同じ接頭辞を持つ連続エントリのキー共有部分を圧縮する
 // （entry 形式は buildBlock のコメント）。
@@ -116,22 +116,6 @@ module internal SstScan =
             | Ok(Some(e, nxt)) -> drain (e :: acc) nxt
 
         drain [] scan
-
-    /// 残りを遅延シーケンスに変換する。
-    /// エラーが発生した場合はシーケンスが打ち切られる（エラーは呼び出し側で検出できない）。
-    /// 正確なエラー伝播が必要な場合は toArray を使うこと。
-    let toSeq (scan: SstScan) =
-        let rec pull cur =
-            seq {
-                match next cur with
-                | Error _ -> ()
-                | Ok None -> ()
-                | Ok(Some(e, nxt)) ->
-                    yield e
-                    yield! pull nxt
-            }
-
-        pull scan
 
 /// k-way merge の 1ソース。
 /// 先頭を 1件読んだ状態を表す。
@@ -296,11 +280,13 @@ module internal Sstable =
 
     /// 書き出すファイルのバージョン。
     /// v2 は各ブロックの末尾に 4バイトのチェックサム、
-    /// v3 は Footer 自身のチェックサム、v4 は部分読みメタデータのチェックサムを持つ。
+    /// v3 は Footer 自身のチェックサム、
+    /// v4 は部分読みメタデータのチェックサムを持つ。
+    /// v3 以前は読めない。
     [<Literal>]
     let private Version = 4
 
-    /// v4 を読み取る。
+    /// 読み取れる下限バージョン。
     [<Literal>]
     let private MinReadableVersion = 4
 
@@ -308,12 +294,9 @@ module internal Sstable =
     [<Literal>]
     let internal FooterSize = 88
 
+    /// Footer で footerChecksum がカバーするバイト数（metadataChecksum フィールド込み）。
     [<Literal>]
-    let private FooterSizeV3 = 84
-
-    /// v4 Footer で footerChecksum がカバーするバイト数（metadataChecksum フィールド込み）。
-    [<Literal>]
-    let private FooterChecksumLengthV4 = 84
+    let private FooterChecksumLength = 84
 
     // Footer
     //   magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8)
@@ -377,7 +360,7 @@ module internal Sstable =
             MetaOff: int
             MetaLen: int
             EntryCount: int
-            MetadataChecksum: uint32 option
+            MetadataChecksum: uint32
         }
 
     let private readFooterFields (footerBytes: byte array) =
@@ -395,13 +378,11 @@ module internal Sstable =
             let! entryCount, c = Reader.readInt64LE c
             let! stored, c = Reader.readUInt32LE c
 
-            let! metadataChecksum, c =
-                Reader.readUInt32LE c |> Result.map (fun (sum, next) -> Some sum, next)
+            let! metadataChecksum, c = Reader.readUInt32LE c
 
             let! footerChecksum, _ = Reader.readUInt32LE c
-            let checksumLength = FooterChecksumLengthV4
 
-            if Hashing.checksumRange footerBytes 0 checksumLength <> footerChecksum then
+            if Hashing.checksumRange footerBytes 0 FooterChecksumLength <> footerChecksum then
                 return! err (DbError.corruption "Sstable: Footer のチェックサム不一致")
             else
                 let fitsInt (v: int64) =
@@ -684,11 +665,7 @@ module internal Sstable =
             Hashing.checksum (Array.concat [| metaBytes; bloomBytes; indexBytes |])
 
         let readAll stream =
-            let parsed =
-                readFooter stream FooterSize
-                |> Option.orElseWith (fun () -> readFooter stream FooterSizeV3)
-
-            match parsed with
+            match readFooter stream FooterSize with
             | None -> Error(DbError.corruption "Sstable: Footer がありません")
             | Some(footerStart, footerBytes) ->
                 match parseFooterBytes footerBytes footerStart with
@@ -703,10 +680,8 @@ module internal Sstable =
                         let! bloom = readBloomBytes bloomBytes
                         let! indexEntries = parseIndexBytes indexBytes
 
-                        match footer.MetadataChecksum with
-                        | Some expected when metadataChecksum metaBytes bloomBytes indexBytes <> expected ->
+                        if metadataChecksum metaBytes bloomBytes indexBytes <> footer.MetadataChecksum then
                             return! err (DbError.corruption "Sstable: 部分読みメタデータのチェックサム不一致")
-                        | _ -> ()
 
                         return
                             {
@@ -717,7 +692,7 @@ module internal Sstable =
                                 Bloom = bloom
                                 EntryCount = int64 footer.EntryCount
                                 MaxSeqNo = footer.MaxSeqNo
-                                HasBlockChecksums = footer.Version >= 2
+                                HasBlockChecksums = true
                             }
                     }
 

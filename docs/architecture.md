@@ -1046,6 +1046,12 @@ CURRENT           「1行の有効な MANIFEST 番号」
 MANIFEST-000001   VersionSet の変更履歴（4MiB 超でスナップショットへローテーション）
 ```
 
+`MANIFEST` の 1レコードは `[checksum:u32LE][VersionEdit 本体]` のフレームを base64 にした 1行で、
+checksum は本体全体の FNV-1a。
+途中のレコードが base64 としても完全な行でも壊れていれば `CorruptionError` にして開かない
+（SSTable を孤児にしない）。
+**末尾の書きかけ**（後ろに有効な行が無い）だけはクラッシュ時の追記とみなして読み飛ばす。
+
 `MANIFEST` が 4MiB を超えると、現在の Version 全体を新しい番号の manifest へ書き、
 `CURRENT` を切り替えてから旧ファイルを削除する。起動時に読む履歴の長さを抑えるため。
 

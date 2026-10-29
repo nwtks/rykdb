@@ -87,6 +87,24 @@ let ``Manifest: 途中の壊れたレコードは CorruptionError`` () =
         expectErrorKind ErrorKind.CorruptionError "途中の破損は黙って捨てない" (Manifest.openOrCreate dir))
 
 [<Fact>]
+let ``Manifest: 途中のレコードのチェックサム不一致は CorruptionError`` () =
+    withDir "manifest-mid-checksum" (fun dir ->
+        let v0, mn = ok (Manifest.openOrCreate dir)
+        let _ = applyEdit dir mn v0 (VersionEdit.addFile (fmd 1L 0 100 199))
+        let _ = applyEdit dir mn v0 (VersionEdit.addFile (fmd 2L 0 100 199))
+
+        // base64 としては正しいまま中身を 1バイト壊す（bit rot を模擬）。
+        // チェックサムが無いと VersionEdit として偶然デコードされ得る破損。
+        let path = Path.Combine(dir, "MANIFEST-000001")
+        let lines = File.ReadAllLines path
+        let bytes = System.Convert.FromBase64String lines.[0]
+        bytes.[bytes.Length - 1] <- bytes.[bytes.Length - 1] ^^^ 0xFFuy
+        lines.[0] <- System.Convert.ToBase64String bytes
+        File.WriteAllLines(path, lines)
+
+        expectErrorKind ErrorKind.CorruptionError "チェックサムで途中の破損を検出する" (Manifest.openOrCreate dir))
+
+[<Fact>]
 let ``Manifest: 空行は読み飛ばす`` () =
     withDir "manifest-blank-line" (fun dir ->
         let v0, mn = ok (Manifest.openOrCreate dir)
@@ -141,7 +159,7 @@ let ``Manifest: 中身があるのに Version が空なら CorruptionError`` () 
     withDir "manifest-empty-version" (fun dir ->
         ok (Manifest.ensureDirectory dir)
         File.WriteAllText(Path.Combine(dir, "CURRENT"), "MANIFEST-000001\n")
-        // "AAAA" は長さ 0 の VersionEdit としてデコードされ、Version が空になる
+        // "AAAA" は 4バイトで、チェックサムフレームとしても VersionEdit としても不正
         File.WriteAllText(Path.Combine(dir, "MANIFEST-000001"), "AAAA\n")
         File.WriteAllBytes(Path.Combine(dir, "000002.sst"), [| 1uy |])
 

@@ -1161,7 +1161,10 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 - 孤児は削除せず `<keyspace>/.orphans/` へ退避する（`quarantineOrphans`）。
   manifest を読み落としただけのケースでも実体は復元できる。
 - 末尾の書きかけを許容するのは、`logAndApply` の `fs.Write` + `Flush(true)` が途中で切れた場合のため。
+- 各レコードは `[checksum:u32LE][VersionEdit 本体]` のフレーム（FNV-1a）を base64 にした 1行。
+  base64 としては正しいが中身が壊れた行もチェックサムで検出する。
 - 回帰テスト: `Manifest: 途中の壊れたレコードは CorruptionError` /
+  `Manifest: 途中のレコードのチェックサム不一致は CorruptionError` /
   `StorageEngine: manifest の途中破損では開かず SSTable を残す`。
 
 ### 11.14 古い `Database` ハンドルの `Close` は WAL を消さない
