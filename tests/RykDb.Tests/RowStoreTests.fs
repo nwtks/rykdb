@@ -154,6 +154,21 @@ let ``RowStore.openStore: 壊れた keyspace は開けない`` () =
         expectError "壊れた keyspace を開けてしまう" (RowStore.openStore dir))
 
 [<Fact>]
+let ``RowStore.openStore: ロック失敗時は commit journal を触らない`` () =
+    withDir "rs-journal-lock-order" (fun dir ->
+        let store = ok (RowStore.openStore dir)
+        let journal = Path.Combine(dir, ".commit", "journal")
+
+        // 4バイトの長さが MaxFrameBytes を超えるフレーム + 余分なバイト。
+        // touch がロック前に走ると、readFrames の validLen（4）まで切り詰める。
+        let bytes = [| 0xFFuy; 0xFFuy; 0xFFuy; 0xFFuy; 1uy; 2uy; 3uy |]
+        File.WriteAllBytes(journal, bytes)
+        expectErrorKind ErrorKind.IoError "同じ root の二重オープン" (RowStore.openStore dir)
+        Assert.Equal<byte array>(bytes, File.ReadAllBytes journal)
+
+        ok (RowStore.close store))
+
+[<Fact>]
 let ``RowStore.openStore: 開く途中で失敗してもロックを解放する`` () =
     withDir "rs-lock-cleanup" (fun dir ->
         let ksDir = Path.Combine(dir, Keyspace.toDirName "t:broken")

@@ -1430,3 +1430,14 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 
 - `defaultValues` の評価後に `SqlValue.coerce col.DataType` を通す。
 - 回帰テスト: `Database: DEFAULT は列型へ暗黙変換される`。
+
+### 11.34 `CommitIntent.touch` は `ProcessLock` を取ってから呼ぶ
+
+`RowStore.openStore` は以前、`ProcessLock.acquire` より先に `CommitIntent.touch` を呼んでいた。
+別プロセスが `.commit/journal` に publish / resolve を追記している最中に第 2 のプロセスが open すると、
+`touch` の末尾切り詰めが**書き込み中のフレーム**を壊す。
+
+- `Directory.CreateDirectory root` → `ProcessLock.acquire` → `CommitIntent.touch` の順にする。
+- `touch` が失敗したら取得済みのロックを解放する。
+- 回帰テスト: `RowStore.openStore: ロック失敗時は commit journal を触らない`
+  （不正な長さプレフィックスの journal が二重オープン失敗後も残ること）。

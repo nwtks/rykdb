@@ -381,8 +381,14 @@ module internal RowStore =
 
         result {
             do! protect (fun () -> System.IO.Directory.CreateDirectory root |> ignore)
-            do! CommitIntent.touch root
             let! token = ProcessLock.acquire root takeOver
+
+            let! () =
+                match CommitIntent.touch root with
+                | Ok() -> ret ()
+                | Error e ->
+                    ProcessLock.release root token
+                    err e
 
             let! known =
                 match protect (fun () -> discoverKeyspaces root) with
