@@ -1452,3 +1452,14 @@ registry の登録が消えると compaction の GC 境界が上がり、まだ�
 - `register` / `unregister` / `oldestExcept` を 1本の `SemaphoreSlim`（Gate）で直列化する。
 - 回帰テスト: `ActiveSnapshotRegistry: 並行 register/unregister で登録が消えない`
   （登録直後の `oldestExcept` が必ず `Some` になることを並列で確認）。
+
+### 11.36 外部ソートの run は全本同時に open しない
+
+`ExtSort` の最終 k-way merge で全 run を `openRun` すると、
+run の数だけ file descriptor を消費する（大入力で枯渇する）。
+同時に開くのは **32本まで** にし、超える場合は 32本ずつ中間 run にマージしてから最終 merge する
+（multi-pass merge）。
+
+- 中間 run も同じ `[varint 長][ValueCodec]` 形式で、読み終えた入力 run は削除する。
+- 回帰テスト: `ExtSort: 5000行を小さなバジェットで溢らしても整列できる`
+  （数百 run を作り、一時ファイルが残らないことも確認）。

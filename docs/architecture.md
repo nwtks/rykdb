@@ -504,6 +504,8 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 | `GROUP BY`        | 行を抱えずアクュムレータだけ更新（`Ops.aggregate`）                                                    | グループ数 × アクュムレータ（上限 400万グループ）     |
 | `SELECT DISTINCT` | 符号化済みキーの `HashSet`                                                                             | 既定 256MiB。超過は `CapacityError`（OOM で死なない） |
 
+- 同時に開く run は最大 **32本**。run が 32本を超える場合は 32本ずつ中間 run にマージし、
+  最後に 32本以下を k-way merge する（file descriptor の枯渇を防ぐ multi-pass merge）。
 - 一時ファイルは `%TEMP%/rykdb-sort-*` 。run が尽きた時点で消し、途中打ち切りで残ったものは
   次のソート開始時に 24時間を超えたものだけ回収する。
 - ソートは全入力を消費してからでないと 1行も出せないため、`Ops.sortBy` は**呼び出し時に**入力を消化し、

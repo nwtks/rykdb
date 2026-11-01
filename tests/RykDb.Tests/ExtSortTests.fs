@@ -95,6 +95,7 @@ let ``ExtSort: 5000行を小さなバジェットで溢らしても整列でき�
         | Error _ -> 0
 
     // バジェット 256バイト → 数百個の run が生まれる。
+    // run は MaxFanIn（32）を超えるので、中間 run への multi-pass merge も通る。
     let sorted =
         ok (ExtSort.sortRows 256L Map.empty (fun _ _ -> ret Map.empty) cmp (make 0))
 

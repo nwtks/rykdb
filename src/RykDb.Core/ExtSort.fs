@@ -69,6 +69,40 @@ module private Spill =
     /// 残っている run を全部消す（エラー経路の後始末）。
     let forget (paths: string list) = paths |> List.iter unlink
 
+    /// run ファイルのパス。
+    let runPath (stamp: string) (serial: int) =
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), sprintf "%s%s-%d%s" Prefix stamp serial RunExt)
+
+    /// run の書き込み口を開く。
+    let openSink (path: string) =
+        protect (fun () ->
+            let fs =
+                new System.IO.FileStream(
+                    path,
+                    System.IO.FileMode.Create,
+                    System.IO.FileAccess.Write,
+                    System.IO.FileShare.None
+                )
+
+            Sink(new System.IO.BufferedStream(fs, 65536) :> System.IO.Stream))
+
+    /// 書き込み口を閉じる。
+    let closeSink (sink: Sink) =
+        protect (fun () ->
+            let (Sink s) = sink
+            s.Dispose())
+        |> ignore
+
+    let private frameRow (row: SqlValue seq) =
+        let payload = ValueCodec.writeValues row Writer.Empty |> Writer.toArray
+        Writer.build [ Writer.varint (uint64 payload.Length); Writer.writeBytes payload ]
+
+    /// 1行を run へ書き出す。
+    let writeRow (row: SqlValue seq) (sink: Sink) =
+        let (Sink s) = sink
+        let bytes = frameRow row
+        protect (fun () -> s.Write(bytes, 0, bytes.Length))
+
     /// run ファイル 1本を作る（受入中の行を整列して書き出す）。
     let writeRun
         (stamp: string)
@@ -76,43 +110,13 @@ module private Spill =
         (compareRows: SqlValue array -> SqlValue array -> int)
         (rows: SqlValue array array)
         =
-        let runPath stamp serial =
-            System.IO.Path.Combine(System.IO.Path.GetTempPath(), sprintf "%s%s-%d%s" Prefix stamp serial RunExt)
-
-        let openSink path =
-            protect (fun () ->
-                let fs =
-                    new System.IO.FileStream(
-                        path,
-                        System.IO.FileMode.Create,
-                        System.IO.FileAccess.Write,
-                        System.IO.FileShare.None
-                    )
-
-                Sink(new System.IO.BufferedStream(fs, 65536) :> System.IO.Stream))
-
-        let frame row =
-            let payload = ValueCodec.writeValues row Writer.Empty |> Writer.toArray
-            Writer.build [ Writer.varint (uint64 payload.Length); Writer.writeBytes payload ]
-
-        let writeRow sink row =
-            let (Sink s) = sink
-            let bytes = frame row
-            protect (fun () -> s.Write(bytes, 0, bytes.Length))
-
-        let rec writeAll sink (rows: SqlValue array array) i =
+        let rec writeAll (rows: SqlValue array array) i sink =
             if i >= rows.Length then
                 ret ()
             else
-                match writeRow sink rows.[i] with
+                match writeRow rows.[i] sink with
                 | Error e -> err e
-                | Ok() -> writeAll sink rows (i + 1)
-
-        let closeSink sink =
-            protect (fun () ->
-                let (Sink s) = sink
-                s.Dispose())
-            |> ignore
+                | Ok() -> writeAll rows (i + 1) sink
 
         let path = runPath stamp serial
 
@@ -120,7 +124,7 @@ module private Spill =
         >>= fun sink ->
             let sorted = Array.sortWith compareRows rows
 
-            match writeAll sink sorted 0 with
+            match writeAll sorted 0 sink with
             | Error e ->
                 closeSink sink
                 unlink path
@@ -135,23 +139,20 @@ module private Spill =
         let rec loop (s: System.IO.Stream) shift acc lead =
             if shift > 63 then
                 err (DbError.corruption "Spill: varint が長すぎます")
-            else
-                let b = lead
-
-                if b &&& 0x80uy <> 0uy then
-                    if shift >= 63 then
-                        err (DbError.corruption "Spill: varint が長すぎます")
-                    else
-                        let next = s.ReadByte()
-
-                        if next < 0 then
-                            err (DbError.corruption "Spill: run ファイルが途中で終わりました")
-                        else
-                            loop s (shift + 7) (acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)) (byte next)
+            else if lead &&& 0x80uy <> 0uy then
+                if shift >= 63 then
+                    err (DbError.corruption "Spill: varint が長すぎます")
                 else
-                    ret (acc ||| (uint64 (b &&& 0x7Fuy) <<< shift))
+                    let next = s.ReadByte()
 
-        let readVarintFrom (s: System.IO.Stream) first = loop s 0 0UL first
+                    if next < 0 then
+                        err (DbError.corruption "Spill: run ファイルが途中で終わりました")
+                    else
+                        loop s (shift + 7) (acc ||| (uint64 (lead &&& 0x7Fuy) <<< shift)) (byte next)
+            else
+                ret (acc ||| (uint64 (lead &&& 0x7Fuy) <<< shift))
+
+        let readVarintFrom s = loop s 0 0UL
 
         let rec fill (s: System.IO.Stream) buffer n pos =
             if pos >= n then
@@ -164,7 +165,7 @@ module private Spill =
                 else
                     fill s buffer n (pos + got)
 
-        let readExactly (s: System.IO.Stream) n =
+        let readExactly s n =
             let buffer = Array.zeroCreate<byte> n
             fill s buffer n 0
 
@@ -214,7 +215,7 @@ module private Spill =
         unlink state.Path
 
     /// 複数の run をまとめて閉じて消す。
-    let closeAll (states: RunState list) = states |> List.iter closeRun
+    let closeAll = List.iter closeRun
 
 /// 外部マージソート。
 /// <remarks>
@@ -227,6 +228,12 @@ module internal ExtSort =
     /// 受け皿の既定バジェット（概算バイト）。
     /// これ以内に収まるソートは従来どおりメモリだけで完結する。
     let DefaultBudgetBytes = 64L * 1024L * 1024L
+
+    /// 同時に開く run 数の上限。
+    /// run が多い場合は最大 fan-in 本ずつ中間 run にマージし、
+    /// 最後に最大 fan-in 本を k-way merge する（file descriptor の枯渇防止）。
+    [<Literal>]
+    let private MaxFanIn = 32
 
     /// 入力を整列して返す。
     /// バジェット内ならメモリ、超過分は run として溢らして外部マージする。
@@ -251,8 +258,8 @@ module internal ExtSort =
                     err e
                 | Ok state -> openAll tail (state :: acc)
 
-        let rec scan i bestIdx best (states: RunState list) =
-            match states with
+        let rec scan i bestIdx best =
+            function
             | [] -> bestIdx
             | s :: tail ->
                 match s.Head with
@@ -270,10 +277,86 @@ module internal ExtSort =
                 | [] -> List.rev acc, []
                 | h :: tail -> splitAt (n - 1) (h :: acc) tail
 
-        let rec pull states =
+        let rec writeMerged sink states =
             let idx = scan 0 -1 None states
 
             if idx < 0 then
+                Spill.closeAll states
+                ret ()
+            else
+                let before, chosenAndAfter = splitAt idx [] states
+
+                match chosenAndAfter with
+                | [] ->
+                    Spill.closeAll states
+                    ret ()
+                | chosen :: after ->
+                    match chosen.Head with
+                    | None ->
+                        Spill.closeRun chosen
+                        writeMerged sink (before @ after)
+                    | Some row ->
+                        match Spill.writeRow row sink with
+                        | Error e ->
+                            Spill.closeAll (before @ chosenAndAfter)
+                            err e
+                        | Ok() ->
+                            match Spill.readRow chosen.Src with
+                            | Error e ->
+                                Spill.closeAll (before @ chosenAndAfter)
+                                err e
+                            | Ok None ->
+                                Spill.closeRun chosen
+                                writeMerged sink (before @ after)
+                            | Ok(Some nxt) -> writeMerged sink (before @ { chosen with Head = Some nxt } :: after)
+
+        let mergeToRun stamp serial paths =
+            match openAll paths [] with
+            | Error e ->
+                Spill.forget paths
+                err e
+            | Ok states ->
+                let path = Spill.runPath stamp serial
+
+                match Spill.openSink path with
+                | Error e ->
+                    Spill.closeAll states
+                    err e
+                | Ok sink ->
+                    match writeMerged sink states with
+                    | Error e ->
+                        Spill.closeSink sink
+                        Spill.forget [ path ]
+                        err e
+                    | Ok() ->
+                        Spill.closeSink sink
+                        ret path
+
+        let rec reduceRuns stamp nextSerial known paths =
+            if List.length paths <= MaxFanIn then
+                ret paths
+            else
+                paths |> List.chunkBySize MaxFanIn |> combine stamp nextSerial known 0 []
+
+        and combine stamp nextSerial known count outputs =
+            function
+            | [] ->
+                let outputs = List.rev outputs
+                reduceRuns stamp (nextSerial + count) (known @ outputs) outputs
+            | group :: rest ->
+                match mergeToRun stamp (nextSerial + count) group with
+                | Error e ->
+                    Spill.forget (List.concat rest)
+                    Spill.forget known
+                    Spill.forget outputs
+                    err e
+                | Ok path -> combine stamp nextSerial known (count + 1) (path :: outputs) rest
+
+        let pull states =
+            let idx = scan 0 -1 None states
+
+            if idx < 0 then
+                Spill.closeAll states
                 ret None
             else
                 let before, chosenAndAfter = splitAt idx [] states
@@ -302,35 +385,41 @@ module internal ExtSort =
                 | Ok None -> ret None
                 | Ok(Some(row, rest)) -> ret (Some(row, mergeRuns rest)))
 
-        let approxRow row =
-            row |> Array.sumBy ValueCodec.approximateBytes
+        let finish stamp buf written paths =
+            if List.isEmpty paths then
+                ret (inMemory buf)
+            else
+                let all =
+                    if buf.Count = 0 then
+                        ret paths
+                    else
+                        Spill.writeRun stamp written compareRows (buf.ToArray())
+                        |> Result.map (fun p -> paths @ [ p ])
+
+                match all with
+                | Error e ->
+                    Spill.forget paths
+                    err e
+                | Ok runPaths ->
+                    match reduceRuns stamp (written + 1) runPaths runPaths with
+                    | Error e ->
+                        Spill.forget runPaths
+                        err e
+                    | Ok reduced ->
+                        match openAll reduced [] with
+                        | Error e ->
+                            Spill.forget reduced
+                            err e
+                        | Ok states -> ret (mergeRuns states)
+
+        let approxRow = Array.sumBy ValueCodec.approximateBytes
 
         let rec ingest stamp buf bufBytes written paths state next =
             match Op.next next with
             | Error e ->
                 Spill.forget paths
                 err e
-            | Ok None ->
-                if List.isEmpty paths then
-                    ret (inMemory buf)
-                else
-                    let all =
-                        if buf.Count = 0 then
-                            ret paths
-                        else
-                            Spill.writeRun stamp written compareRows (buf.ToArray())
-                            |> Result.map (fun p -> paths @ [ p ])
-
-                    match all with
-                    | Error e ->
-                        Spill.forget paths
-                        err e
-                    | Ok runPaths ->
-                        match openAll runPaths [] with
-                        | Error e ->
-                            Spill.forget runPaths
-                            err e
-                        | Ok states -> ret (mergeRuns states)
+            | Ok None -> finish stamp buf written paths
             | Ok(Some(row, tail)) ->
                 match check state row with
                 | Error e ->
