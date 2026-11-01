@@ -173,13 +173,28 @@ module internal Optimizer =
                 |> Result.map (fun e -> { item with Expression = e }))
             >> all
 
+        let validateStars schema =
+            stmt.Items
+            |> List.tryPick (fun item ->
+                match item.Expression with
+                | Expr.QualifiedStar q when not (Schema.hasQualifier schema q) ->
+                    Some(sprintf "テーブルまたは別名 '%s' が FROM にありません" q |> DbError.name)
+                | _ -> None)
+            |> function
+                | Some e -> err e
+                | None -> ret ()
+
         let evalCount what =
             function
             | Expr.Literal(Literal.Int i) when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
             | Expr.Literal(Literal.Int _) ->
-                DbError.create ErrorKind.SyntaxError (sprintf "%s は 0 以上 %d 以下の整数で指定してください" what System.Int32.MaxValue)
+                sprintf "%s は 0 以上 %d 以下の整数で指定してください" what System.Int32.MaxValue
+                |> DbError.create ErrorKind.SyntaxError
                 |> err
-            | _ -> DbError.create ErrorKind.SyntaxError (sprintf "%s は整数リテラルで指定してください" what) |> err
+            | _ ->
+                sprintf "%s は整数リテラルで指定してください" what
+                |> DbError.create ErrorKind.SyntaxError
+                |> err
 
         let applyLimit stmt tree =
             match stmt.Limit, stmt.Offset with
@@ -206,6 +221,7 @@ module internal Optimizer =
                 return Logical.Values [||]
             else
                 let allSchema = concatSchemas bindings
+                let! () = validateStars allSchema
 
                 let! predicates =
                     match stmt.Where with

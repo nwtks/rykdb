@@ -244,6 +244,15 @@ let ``Database: t.* の大文字小文字は区別しない`` () =
         Assert.Equal<string list>([ "st.id" ], r.Columns |> Array.toList))
 
 [<Fact>]
+let ``Database: FROM に無い t.* は NameError`` () =
+    withDb "star-unknown" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1)"
+        // 一致 0 件の `t.*` を「0列の 1行」で成功させない。
+        expectErrorKind ErrorKind.NameError "未知のテーブル名の t.*" (db2.Execute "SELECT nope.* FROM t")
+        expectErrorKind ErrorKind.NameError "別名を実名で指定した t.*" (db2.Execute "SELECT t.* FROM t AS x"))
+
+[<Fact>]
 let ``Database: LIMIT の非リテラルと負数はエラー`` () =
     withDb "limit-expr" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
@@ -263,6 +272,21 @@ let ``Database: DEFAULT の評価エラーは NULL にしない`` () =
             exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (1 / 0))"
 
         expectError "壊れた DEFAULT はエラーになる" (db1.Execute "INSERT INTO t (id) VALUES (1)"))
+
+[<Fact>]
+let ``Database: DEFAULT は列型へ暗黙変換される`` () =
+    withDb "default-coerce" (fun db0 ->
+        // INTEGER の既定値を TEXT 列へ入れると TEXT に変換される
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT DEFAULT 42)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t (id) VALUES (1)")
+        let _, rows = ok (db2.Execute "SELECT v FROM t")
+        Assert.Equal<string>("42", asText rows.Rows.[0].[0])
+
+        // 変換できない既定値は型エラー（TEXT のまま保存しない）
+        let db3 =
+            exec db2 "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 'oops')"
+
+        expectErrorKind ErrorKind.TypeError "INTEGER 列の変換できない DEFAULT" (db3.Execute "INSERT INTO u (id) VALUES (1)"))
 
 [<Fact>]
 let ``Database: 複合索引の全列等値で行を引ける`` () =
@@ -1017,6 +1041,30 @@ let ``Database: GROUP BY と COUNT`` () =
         Assert.Equal<int64>(1L, asInt res.Rows.[0].[1])
         Assert.Equal<int64>(30L, asInt res.Rows.[1].[0])
         Assert.Equal<int64>(2L, asInt res.Rows.[1].[1]))
+
+[<Fact>]
+let ``Database: GROUP BY の式を SELECT / HAVING でも使える`` () =
+    seeded "group-expr" (fun db ->
+        // age 30, 25, 35 → age/10 は 3, 2, 3 の 2 グループ。
+        let _q, res = execRes db "SELECT age / 10, COUNT(*) FROM people GROUP BY age / 10"
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int64>(3L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(2L, asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(2L, asInt res.Rows.[1].[0])
+        Assert.Equal<int64>(1L, asInt res.Rows.[1].[1])
+
+        // 集約を SELECT に含めなくても、GROUP BY 式を射影できる。
+        let _q2, only = execRes db "SELECT age / 10 FROM people GROUP BY age / 10"
+        Assert.Equal<int>(2, only.Rows.Length)
+        Assert.Equal<int64>(3L, asInt only.Rows.[0].[0])
+        Assert.Equal<int64>(2L, asInt only.Rows.[1].[0])
+
+        // HAVING でも同じ式を参照できる。
+        let _q3, having =
+            execRes db "SELECT age / 10 FROM people GROUP BY age / 10 HAVING age / 10 = 2"
+
+        Assert.Equal<int>(1, having.Rows.Length)
+        Assert.Equal<int64>(2L, asInt having.Rows.[0].[0]))
 
 [<Fact>]
 let ``Database: HAVING でグループを絞る`` () =

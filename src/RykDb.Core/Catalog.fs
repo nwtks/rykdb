@@ -621,6 +621,15 @@ module internal Schema =
             )
         | _ -> None
 
+    /// 指定した修飾子（テーブル名・別名）の列が 1つ以上あるか。
+    /// 存在しない `t.*` を 0列の成功にしないための検証に使う。
+    let hasQualifier (schema: Schema) (qualifier: string) =
+        schema.Columns
+        |> Array.exists (fun c ->
+            match c.Qualifier with
+            | Some q -> SqlName.equal q qualifier
+            | None -> false)
+
     /// 射影後のヘッダ行を作る。
     /// `SELECT *` は入力の列名をそのまま（修飾つき）。
     /// `SELECT id` は式を表示する。別名があればそれを使う。

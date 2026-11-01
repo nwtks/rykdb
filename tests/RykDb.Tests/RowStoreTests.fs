@@ -64,6 +64,26 @@ let private commitInto (store: RowStore) (nextSeq: uint64) (txn: Transaction) =
     let batches = Transaction.toEntries nextSeq txn |> fst
     RowStore.writeBatches batches store |> ok |> ignore
 
+/// Close の呼び出しを記録するだけの engine（RowStore.close のテスト用）。
+type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<string>) =
+    interface IStorageEngine with
+        member _.NextSeqNo = 0UL
+        member _.ActiveSnapshot = 0UL
+        member _.GetAt _ _ = ret None
+        member _.ScanAt _ _ _ = ret (Seq.empty<SstEntry>)
+        member this.WriteBatch _ = ret (this :> IStorageEngine)
+        member this.WithNextSeqNo _ = this :> IStorageEngine
+        member this.WithActiveSnapshot _ = this :> IStorageEngine
+        member this.MaybeFlush() = ret (this :> IStorageEngine)
+
+        member _.Close() =
+            closed.Add name
+
+            if fail then
+                err (DbError.internalError "close failed")
+            else
+                ret ()
+
 [<Fact>]
 let ``Keyspace: table / index の名前`` () =
     Assert.Equal("t:people", Keyspace.table "people")
@@ -145,6 +165,29 @@ let ``RowStore.openStore: 開く途中で失敗してもロックを解放する
         Directory.Delete(ksDir, true)
         let store = ok (RowStore.openStore dir)
         ok (RowStore.close store))
+
+[<Fact>]
+let ``RowStore.close: 途中の engine が失敗しても残りを閉じる`` () =
+    let closed = ResizeArray<string>()
+
+    let store =
+        {
+            Root = ""
+            Engines =
+                Map.ofList
+                    [
+                        "t:a", CloseTrackingEngine("a", true, closed) :> IStorageEngine
+                        "t:b", CloseTrackingEngine("b", false, closed) :> IStorageEngine
+                    ]
+            OpenEngine = fun _ -> err (DbError.internalError "unused")
+            Lock = None
+        }
+
+    let outcome = RowStore.close store
+    expectError "close は失敗を返す" outcome
+    // 最初の engine が失敗しても、後続の engine も Close される。
+    Assert.Contains("a", closed)
+    Assert.Contains("b", closed)
 
 [<Fact>]
 let ``RowStore.openStore: 壊れた MANIFEST レコードは読み飛ばす`` () =

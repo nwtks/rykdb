@@ -9,7 +9,7 @@ src/RykDb.Core/Op.fs|map|map|call
 src/RykDb.Core/Op.fs|rowsFrom|rowsFrom|call
 src/RykDb.Core/Op.fs|seekMatch|seekMatch|call
 src/RykDb.Core/Op.fs|take|take|call
-src/RykDb.Core/Ops.fs|from|from|call
+src/RykDb.Core/Ops.fs|emitGroups|emitGroups|call
 src/RykDb.Core/Ops.fs|joinRows|joinRows|call
 src/RykDb.Core/Ops.fs|loop|loop|call
 src/RykDb.Core/Ops.fs|probe/emit|emit|call

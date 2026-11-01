@@ -399,6 +399,8 @@ HAVING COUNT(*) > 1
 - `AVG` は `SUM / COUNT` を実行時に計算する。
 - `MIN` / `MAX` は文字列・日付・時刻にも使える。
 - `GROUP BY` を書かない `SELECT SUM(x) FROM t` は表全体の 1グループとして集計される。
+- `GROUP BY` の式は `SELECT` 項目 / `HAVING` でも同じ式を書ける
+  （式全体が集約後のスロットへ解決される）。
 - `GROUP BY` / 集約関数を使うときに `SELECT *` は書けない（列を明示する）。
 - 集約も `GROUP BY` も無い `HAVING` は `SyntaxError`。
 - `SUM` / `AVG` は `INTEGER` / `DECIMAL` / `REAL` が混在しても合計を落とさない
@@ -518,6 +520,8 @@ SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
   （`ORDER BY` では「列 'x' が存在しません」になる）。
 - `ORDER BY` のキーは**列の直接参照**に限る
   （`ORDER BY` の式に演算子を書くと「ORDER BY には列の直接参照だけを書けます」になる）。
+- `t.*` の `t` が `FROM` / `JOIN` に存在しない場合は `NameError`
+  （0列の成功にはしない）。
 
 ### 7.4 索引が使われる条件
 
@@ -789,6 +793,8 @@ CREATE TABLE people (
 | `DEFAULT`     | 列           | `INSERT` で値を省略したときに使われる（定数式のみ）       |
 
 `DEFAULT` はカタログに保存され、DB を再オープンした後も使われる。
+`DEFAULT` の値も列の型へ暗黙変換される。
+変換できない既定値は `INSERT` 時に `TypeError` になる。
 
 - **主キーは省略できない**。
   1つも無いと`テーブル t に主キーがありません` になる。

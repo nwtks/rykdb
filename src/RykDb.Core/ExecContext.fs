@@ -243,7 +243,11 @@ module internal DmlOps =
                         ret SqlValue.Null
                     else
                         match col.Constraint.Default with
-                        | Some d -> evalConstant d
+                        | Some d ->
+                            result {
+                                let! value = evalConstant d
+                                return! SqlValue.coerce col.DataType value
+                            }
                         | None -> ret SqlValue.Null)
                 |> all
 

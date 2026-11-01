@@ -18,8 +18,8 @@ module internal Ops =
     /// `*` / `t.*` はORDER BY には書けない。
     let sortBy (schema: Schema) (src: Op) (keys: RykDb.Core.SortKey list) =
         let compareWith plan (a: SqlValue array) (b: SqlValue array) =
-            let rec compareKeys (rest: (int * SortDirection) list) =
-                match rest with
+            let rec compareKeys =
+                function
                 | [] -> 0
                 | (i, dir) :: tail ->
                     match SqlValue.compareValues a.[i] b.[i] with
@@ -34,7 +34,7 @@ module internal Ops =
 
             compareKeys plan
 
-        let check plan (reps: Map<int, SqlValue>) (row: SqlValue array) =
+        let check plan reps (row: SqlValue array) =
             plan
             |> List.fold
                 (fun (acc: Result<Map<int, SqlValue>, DbError>) (i, _) ->
@@ -92,15 +92,17 @@ module internal Ops =
     /// バジェットを超えると OOM でプロセスごと落とす代わりに `CapacityError` で止める。
     /// </remarks>
     let distinctWithin (budgetBytes: int64) (src: Op) =
-        let encode (row: SqlValue array) =
+        let encode row =
             ValueCodec.writeValues row Writer.Empty |> Writer.toArray
 
-        let rec skipSeen (seen: System.Collections.Generic.HashSet<byte array>) (used: int64) (cur: Op) =
+        let seen = System.Collections.Generic.HashSet<byte array> HashIdentity.Structural
+
+        let rec skipSeen used cur =
             Op.pull cur (fun row nxt ->
                 let key = encode row
 
                 if seen.Contains key then
-                    Op.next (skipSeen seen used nxt)
+                    Op.next (skipSeen used nxt)
                 elif used > budgetBytes then
                     err (
                         DbError.capacity (
@@ -109,30 +111,27 @@ module internal Ops =
                     )
                 else
                     seen.Add key |> ignore
-                    ret (Some(row, skipSeen seen (used + int64 (rowBytes row)) nxt)))
+                    ret (Some(row, skipSeen (used + int64 (rowBytes row)) nxt)))
 
-        skipSeen (System.Collections.Generic.HashSet<byte array> HashIdentity.Structural) 0L src
+        skipSeen 0L src
 
     /// 重複除去（既定バジェット）。
     let distinct (src: Op) = distinctWithin DistinctBudgetBytes src
 
     /// 式中に現れる集約呼び出しの一覧（実行順に揃える）。
-    let aggCalls (exprs: Expr list) =
-        let isStarArg (x: Expr) =
-            match x with
+    let aggCalls =
+        let isStarArg =
+            function
             | Expr.Star -> true
             | _ -> false
 
-        let collectAggs (e: Expr) (acc: (AggFunc * bool * bool * Expr) list) =
-            Expr.fold
-                (fun a node ->
-                    match node with
-                    | Expr.AggCall(f, distinct, x) -> (f, isStarArg x, distinct, x) :: a
-                    | _ -> a)
-                acc
-                e
+        let collectAggs =
+            Expr.fold (fun a node ->
+                match node with
+                | Expr.AggCall(f, distinct, x) -> (f, isStarArg x, distinct, x) :: a
+                | _ -> a)
 
-        exprs |> List.fold (fun acc e -> collectAggs e acc) [] |> List.rev
+        List.fold collectAggs [] >> List.rev
 
     /// 集約呼び出しの識別キー（`COUNT(age)` のような表示文字列）。
     let private aggKey (f: AggFunc) (distinct: bool) (arg: Expr) =
@@ -144,16 +143,34 @@ module internal Ops =
     /// 集約後の行のスロット番号表。
     /// GROUP BY 式が先頭に、集約呼び出しがその後に並ぶ（`Ops.aggregate` の出力順）。
     /// 行に依存しないので 1クエリにつき 1回だけ作る。
-    let private aggOffsets (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
+    let private aggOffsets (groupBy: Expr list) =
         let groupSlots =
             groupBy |> List.mapi (fun i e -> Expr.toDisplayString e, i) |> Map.ofList
 
-        let aggSlots =
-            aggs
-            |> List.mapi (fun i (f, _, distinct, arg) -> aggKey f distinct arg, List.length groupBy + i)
-            |> Map.ofList
+        List.mapi (fun i (f, _, distinct, arg) -> aggKey f distinct arg, List.length groupBy + i)
+        >> Map.ofList
+        >> Map.fold (fun acc k v -> Map.add k v acc) groupSlots
 
-        Map.fold (fun acc k v -> Map.add k v acc) groupSlots aggSlots
+    /// 葉（列・リテラル・集約呼び出し）は既存の置換で扱える。
+    /// それ以外の GROUP BY 式（`age + 1` など）だけ、木全体の表示文字列で照合する。
+    let private isLeafExpr =
+        function
+        | Expr.Literal _
+        | Expr.Column _
+        | Expr.Name _
+        | Expr.Star
+        | Expr.QualifiedStar _
+        | Expr.AggCall _ -> true
+        | _ -> false
+
+    /// 木全体を置き換える必要がある GROUP BY 式の表示 -> スロット。
+    /// 空なら `substituteAggs` は表示文字列を作らない
+    /// （深い HAVING 式で O(深さ²) にならないようにするため）。
+    let private wholeGroupOffsets =
+        List.mapi (fun i e -> e, i)
+        >> List.filter (fun (e, _) -> not (isLeafExpr e))
+        >> List.map (fun (e, i) -> Expr.toDisplayString e, i)
+        >> Map.ofList
 
     /// 集約呼び出しの式を、計算済みの値（定数）へ置き換える。
     /// HAVING と SELECT 項目の両方で使う。
@@ -162,37 +179,50 @@ module internal Ops =
     /// （`project` / `havingFilter` は出力 1行ごとに呼ぶため、
     /// ここで作ると行数ぶんだけマップを組み直すことになる）。
     /// 組み立ては `Expr.rewrite`（末尾再帰の評価機）に任せるので、式の深さに依存しない。
-    let private substituteAggs (offsets: Map<string, int>) (e: Expr) (row: SqlValue array) =
+    let private substituteAggs (offsets: Map<string, int>) (wholeOffsets: Map<string, int>) (row: SqlValue array) =
         let slot key =
             match offsets |> Map.tryFind key with
             | Some i when i >= 0 && i < row.Length -> Some(Expr.Literal(Literal.ofValue row.[i]))
             | _ -> None
 
-        let rewriteLeaf (x: Expr) =
-            match x with
-            | Expr.AggCall(f, distinct, arg) ->
-                match slot (aggKey f distinct arg) with
-                | Some l -> l
-                | None -> Expr.Literal Literal.Null
-            | Expr.Literal l -> Expr.Literal l
-            | Expr.Column _ as orig ->
-                match slot (Expr.toDisplayString orig) with
-                | Some l -> l
-                | None -> orig
-            | Expr.Name n as orig ->
-                match slot n with
-                | Some l -> l
-                | None -> orig
-            | other -> other
+        let wholeSlot x =
+            if Map.isEmpty wholeOffsets || isLeafExpr x then
+                None
+            else
+                slot (Expr.toDisplayString x)
 
-        Expr.rewrite rewriteLeaf e
+        let rewriteLeaf x =
+            match wholeSlot x with
+            | Some l -> l
+            | None ->
+                match x with
+                | Expr.AggCall(f, distinct, arg) ->
+                    match slot (aggKey f distinct arg) with
+                    | Some l -> l
+                    | None -> Expr.Literal Literal.Null
+                | Expr.Literal l -> Expr.Literal l
+                | Expr.Column _ as orig ->
+                    match slot (Expr.toDisplayString orig) with
+                    | Some l -> l
+                    | None -> orig
+                | Expr.Name n as orig ->
+                    match slot n with
+                    | Some l -> l
+                    | None -> orig
+                | other -> other
+
+        Expr.rewrite rewriteLeaf
 
     /// HAVING を張る。
     /// 集約後の行は位置のみの意味を持つので Schema.empty で評価する。
     /// offsets はクロージャを 1回作るときにだけ組み立て、行ごとに持ち越さない。
     let havingFilter (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (predicate: Expr) =
         let offsets = aggOffsets groupBy aggs
-        fun row -> substituteAggs offsets predicate row >>= Eval.matches Schema.empty row
+        let wholeOffsets = wholeGroupOffsets groupBy
+
+        fun row ->
+            substituteAggs offsets wholeOffsets row predicate
+            >>= Eval.matches Schema.empty row
 
     /// 集約の 1 項目分の_accumulator。
     /// SUM / AVG は decimal で累積し、最後に型を決める（丸め誤差を避ける）。
@@ -213,8 +243,10 @@ module internal Ops =
     /// groupBy が空でも集約があれば 1グループだけ出す
     /// （`SELECT COUNT(*) FROM 空のテーブル` が 0 ではなく 1行を返すため。SQL の通常の挙動）。
     /// <remarks>
-    /// 入力行は**抱え込まない**。グループごとの集約値だけを更新していくので、
-    /// メモリは「グループ数 × アクュムレータ」に比例し、入力行数には比例しない
+    /// 入力行は**抱え込まない**。
+    /// グループごとの集約値だけを更新していくので、
+    /// メモリは「グループ数 × アクュムレータ」に比例し、
+    /// 入力行数には比例しない
     /// （従来は全行を `ResizeArray` に保持していた）。
     /// グループ数にも上限を置き、超過は `CapacityError` で止める。
     /// 出力順は従来どおり「最初に現れたグループ」の順。
@@ -222,26 +254,13 @@ module internal Ops =
     let aggregate (schema: Schema) (src: Op) (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
         let groupBudget = 4_000_000
 
-        let keyOfRow (row: SqlValue array) =
+        let keyOfRow row =
             groupBy
             |> List.map (fun e -> Eval.eval schema row e)
             |> all
             |> Result.map List.toArray
 
-        let emptyAcc (kind: AggFunc) =
-            {
-                Kind = kind
-                Count = 0L
-                SumDecimal = 0M
-                SawReal = false
-                SumReal = 0.0
-                Min = None
-                Max = None
-                First = None
-                Seen = Set.empty
-            }
-
-        let addDecimal (a: decimal) (b: decimal) =
+        let addDecimal a b =
             let maxD = System.Decimal.MaxValue
             let minD = System.Decimal.MinValue
 
@@ -250,15 +269,8 @@ module internal Ops =
             else
                 ret (a + b)
 
-        let keepExtreme
-            (v: SqlValue)
-            (wins: int -> bool)
-            (bumped: Acc)
-            (current: SqlValue option)
-            (set: Acc -> SqlValue -> Acc)
-            (seen: Set<SqlValue>)
-            =
-            match current with
+        let keepExtreme v wins bumped set seen =
+            function
             | None -> ret (set { bumped with Seen = seen } v)
             | Some cur ->
                 SqlValue.compareValues v cur
@@ -268,7 +280,7 @@ module internal Ops =
                     else
                         { bumped with Seen = seen })
 
-        let addValue (acc: Acc) (bump: Acc) (v: SqlValue) (newSeen: Set<SqlValue>) =
+        let addValue acc bump v newSeen =
             match acc.Kind with
             | AggFunc.Count -> ret { bump with Seen = newSeen }
             | AggFunc.Sum
@@ -305,10 +317,10 @@ module internal Ops =
                         sprintf "%s は数値だけを受け付けますが %s です" acc.Kind.Name (SqlLiteral.toSqlLiteral v)
                         |> DbError.typeError
                     )
-            | AggFunc.Min -> keepExtreme v (fun c -> c < 0) bump acc.Min (fun b x -> { b with Min = Some x }) newSeen
-            | AggFunc.Max -> keepExtreme v (fun c -> c > 0) bump acc.Max (fun b x -> { b with Max = Some x }) newSeen
+            | AggFunc.Min -> keepExtreme v (fun c -> c < 0) bump (fun b x -> { b with Min = Some x }) newSeen acc.Min
+            | AggFunc.Max -> keepExtreme v (fun c -> c > 0) bump (fun b x -> { b with Max = Some x }) newSeen acc.Max
 
-        let addAcc (acc: Acc) (value: SqlValue option) (isStar: bool) (distinct: bool) =
+        let addAcc acc value isStar distinct =
             let alreadySeen =
                 distinct
                 && match value with
@@ -340,7 +352,44 @@ module internal Ops =
                 | None -> ret { acc with Seen = newSeen }
                 | Some v -> addValue acc bump v newSeen
 
-        let finishAcc (acc: Acc) =
+        let add star distinct arg acc row =
+            if star then
+                addAcc acc None true distinct
+            else
+                Eval.eval schema row arg >>= fun v -> addAcc acc (Some v) false distinct
+
+        let addToBucket (bucket: ResizeArray<Acc>) row =
+            let rec step i =
+                if i >= aggs.Length then
+                    ret ()
+                else
+                    let _, star, distinct, arg = aggs.[i]
+
+                    match add star distinct arg bucket.[i] row with
+                    | Error e -> err e
+                    | Ok acc ->
+                        bucket.[i] <- acc
+                        step (i + 1)
+
+            step 0
+
+        let emptyAcc kind =
+            {
+                Kind = kind
+                Count = 0L
+                SumDecimal = 0M
+                SawReal = false
+                SumReal = 0.0
+                Min = None
+                Max = None
+                First = None
+                Seen = Set.empty
+            }
+
+        let newBucket () =
+            aggs |> List.map (fun (f, _, _, _) -> emptyAcc f) |> ResizeArray
+
+        let finishAcc acc =
             match acc.Kind with
             | AggFunc.Count -> SqlValue.Int acc.Count
             | AggFunc.Sum ->
@@ -357,83 +406,9 @@ module internal Ops =
             | AggFunc.Min -> defaultArg acc.Min SqlValue.Null
             | AggFunc.Max -> defaultArg acc.Max SqlValue.Null
 
-        let add (star: bool) (distinct: bool) (arg: Expr) (acc: Acc) (row: SqlValue array) =
-            if star then
-                addAcc acc None true distinct
-            else
-                Eval.eval schema row arg >>= fun v -> addAcc acc (Some v) false distinct
-
-        let newBucket () =
-            aggs |> List.map (fun (f, _, _, _) -> emptyAcc f) |> ResizeArray
-
-        let addToBucket (bucket: ResizeArray<Acc>) (row: SqlValue array) =
-            let rec step (i: int) =
-                if i >= aggs.Length then
-                    ret ()
-                else
-                    let _, star, distinct, arg = aggs.[i]
-
-                    match add star distinct arg bucket.[i] row with
-                    | Error e -> err e
-                    | Ok acc ->
-                        bucket.[i] <- acc
-                        step (i + 1)
-
-            step 0
-
-        let rowOf (key: SqlValue array) (bucket: ResizeArray<Acc>) =
+        let rowOf bucket key =
             let av = bucket |> Seq.map finishAcc |> Seq.toArray
             Array.append key av
-
-        let consume
-            (buckets: System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<Acc>>)
-            (order: ResizeArray<SqlValue array>)
-            (cur: Op)
-            =
-            let rec go (cur: Op) =
-                match Op.next cur with
-                | Error e -> err e
-                | Ok None -> ret ()
-                | Ok(Some(row, nxt)) ->
-                    match keyOfRow row with
-                    | Error e -> err e
-                    | Ok k ->
-                        match buckets.TryGetValue k with
-                        | true, bucket ->
-                            match addToBucket bucket row with
-                            | Error e -> err e
-                            | Ok() -> go nxt
-                        | _ ->
-                            if order.Count >= groupBudget then
-                                err (
-                                    sprintf "GROUP BY のグループ数が多すぎます（上限 %d）。条件で絞るか、サンプリングしてください" groupBudget
-                                    |> DbError.capacity
-                                )
-                            else
-                                let bucket = newBucket ()
-
-                                match addToBucket bucket row with
-                                | Error e -> err e
-                                | Ok() ->
-                                    buckets.[k] <- bucket
-                                    order.Add k
-                                    go nxt
-
-            go cur
-
-        let emitGroups
-            (buckets: System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<Acc>>)
-            (order: ResizeArray<SqlValue array>)
-            =
-            let rec from (i: int) =
-                if i >= order.Count then
-                    Op.Done
-                else
-                    Op.Compute(fun () ->
-                        let key = order.[i]
-                        ret (Some(rowOf key buckets.[key], from (i + 1))))
-
-            from 0
 
         let buckets =
             System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<Acc>>(
@@ -442,8 +417,44 @@ module internal Ops =
 
         let order = ResizeArray<SqlValue array>()
 
+        let rec consume cur =
+            match Op.next cur with
+            | Error e -> err e
+            | Ok None -> ret ()
+            | Ok(Some(row, nxt)) ->
+                match keyOfRow row with
+                | Error e -> err e
+                | Ok k ->
+                    match buckets.TryGetValue k with
+                    | true, bucket ->
+                        match addToBucket bucket row with
+                        | Error e -> err e
+                        | Ok() -> consume nxt
+                    | _ ->
+                        if order.Count >= groupBudget then
+                            sprintf "GROUP BY のグループ数が多すぎます（上限 %d）。条件で絞るか、サンプリングしてください" groupBudget
+                            |> DbError.capacity
+                            |> err
+                        else
+                            let bucket = newBucket ()
+
+                            match addToBucket bucket row with
+                            | Error e -> err e
+                            | Ok() ->
+                                buckets.[k] <- bucket
+                                order.Add k
+                                consume nxt
+
+        let rec emitGroups i =
+            if i >= order.Count then
+                Op.Done
+            else
+                Op.Compute(fun () ->
+                    let key = order.[i]
+                    ret (Some(rowOf buckets.[key] key, emitGroups (i + 1))))
+
         result {
-            do! consume buckets order src
+            do! consume src
 
             if order.Count = 0 && List.isEmpty groupBy then
                 let vals =
@@ -451,7 +462,7 @@ module internal Ops =
 
                 return Op.ofArray [| vals |]
             else
-                return emitGroups buckets order
+                return emitGroups 0
         }
 
     /// nested loop 結合の内側ループ（1つの左行 × 右の全行）を回す共通処理。
@@ -469,16 +480,16 @@ module internal Ops =
         (rightRows: SqlValue array array)
         (lrow: SqlValue array)
         =
-        let joinPred (leftSchema: Schema) (rightSchema: Schema) (on: Expr) (l: SqlValue array) (r: SqlValue array) =
-            Eval.matches (Schema.concat leftSchema rightSchema) (Array.append l r) on
+        let joinPred leftSchema rightSchema l r =
+            Eval.matches (Schema.concat leftSchema rightSchema) (Array.append l r)
 
-        let rec loop (matched: bool) (i: int) =
+        let rec loop matched i =
             if i >= rightRows.Length then
                 onExhausted matched
             else
                 let rrow = rightRows.[i]
 
-                match joinPred leftSchema rightSchema on lrow rrow with
+                match joinPred leftSchema rightSchema lrow rrow on with
                 | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, loop true (i + 1))))
                 | Ok false -> Op.Compute(fun () -> Op.next (loop matched (i + 1)))
                 | Error e -> onError e matched
@@ -489,44 +500,43 @@ module internal Ops =
     /// 右側は内側ループごとに先頭から引き直す。
     /// 一致が無い左行は捨て、ON 句の評価が失敗したらクエリ全体を Error で落とす。
     let innerJoin (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
-        let rec joinRows rightRows (cur: Op) =
+        let rec joinRows cur rightRows =
             Op.pull cur (fun lrow lnext ->
                 Op.next (
                     joinLoop
                         leftSchema
                         rightSchema
                         on
-                        (fun _ -> joinRows rightRows lnext)
+                        (fun _ -> joinRows lnext rightRows)
                         (fun e _ -> Op.Compute(fun () -> err e))
                         rightRows
                         lrow
                 ))
 
-        Op.toArray right |> Result.map (fun rightRows -> joinRows rightRows left)
+        Op.toArray right |> Result.map (joinRows left)
 
     /// LEFT JOIN。
     /// 左の行に右が 1行も無ければ NULL で埋める。
     /// ON 句の評価が失敗したらクエリ全体を Error で落とす。
     let leftJoin (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
-        let rec joinRows rightRows width (cur: Op) =
+        let rec joinRows width cur rightRows =
             Op.pull cur (fun lrow lnext ->
                 let onExhausted matched =
                     if matched then
-                        joinRows rightRows width lnext
+                        joinRows width lnext rightRows
                     else
-                        Op.Step(Array.append lrow (Array.create width SqlValue.Null), joinRows rightRows width lnext)
+                        Op.Step(Array.append lrow (Array.create width SqlValue.Null), joinRows width lnext rightRows)
 
                 let onError e _ = Op.Compute(fun () -> err e)
                 Op.next (joinLoop leftSchema rightSchema on onExhausted onError rightRows lrow))
 
-        Op.toArray right
-        |> Result.map (fun rightRows -> joinRows rightRows rightSchema.Columns.Length left)
+        Op.toArray right |> Result.map (joinRows rightSchema.Columns.Length left)
 
     /// 等値結合のキーが NULL を含むか（SQL では NULL は一致しない）。
-    let private hasNullKey (row: SqlValue array) (indices: int array) =
-        indices |> Array.exists (fun i -> SqlValue.isNull row.[i])
+    let private hasNullKey (row: SqlValue array) =
+        Array.exists (fun i -> SqlValue.isNull row.[i])
 
-    let private keyOf (row: SqlValue array) (indices: int array) = indices |> Array.map (fun i -> row.[i])
+    let private keyOf (row: SqlValue array) = Array.map (fun i -> row.[i])
 
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
     /// lookupRows は左キーから右行の配列を返す（見つからなければ空配列）。
@@ -543,23 +553,17 @@ module internal Ops =
         (residual: Expr option)
         (isLeft: bool)
         =
-        let residualMatches
-            (leftSchema: Schema)
-            (rightSchema: Schema)
-            (residual: Expr option)
-            (lrow: SqlValue array)
-            (rrow: SqlValue array)
-            =
-            match residual with
+        let residualMatches leftSchema rightSchema lrow rrow =
+            function
             | None -> ret true
             | Some p -> Eval.matches (Schema.concat leftSchema rightSchema) (Array.append lrow rrow) p
 
         let rightWidth = rightSchema.Columns.Length
 
-        let padded (lrow: SqlValue array) =
+        let padded lrow =
             Array.append lrow (Array.create rightWidth SqlValue.Null)
 
-        let rec probe (cur: Op) =
+        let rec probe cur =
             Op.pull cur (fun lrow lnext ->
                 if hasNullKey lrow leftKeys then
                     if isLeft then
@@ -571,7 +575,7 @@ module internal Ops =
                     | Error e -> err e
                     | Ok rows -> Op.next (emit lrow lnext rows 0 false))
 
-        and emit (lrow: SqlValue array) (lnext: Op) (rows: SqlValue array array) (i: int) (matched: bool) =
+        and emit lrow lnext rows i matched =
             if i >= rows.Length then
                 if isLeft && not matched then
                     Op.Compute(fun () -> ret (Some(padded lrow, probe lnext)))
@@ -580,7 +584,7 @@ module internal Ops =
             else
                 let rrow = rows.[i]
 
-                match residualMatches leftSchema rightSchema residual lrow rrow with
+                match residualMatches leftSchema rightSchema lrow rrow residual with
                 | Error e -> Op.Compute(fun () -> err e)
                 | Ok false -> Op.Compute(fun () -> Op.next (emit lrow lnext rows (i + 1) matched))
                 | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, emit lrow lnext rows (i + 1) true)))
@@ -669,12 +673,9 @@ module internal Ops =
     /// `SELECT age, COUNT(*) ... GROUP BY age` の `age` を
     /// 「集約後の行の先頭」にある値へ読み替えるために使う。
     let project (schema: Schema) (groupBy: Expr list) (src: Op) (items: SelectItem list) =
-        let sameRef (c: OutputColumn) =
-            let col (qualifier: string option) (name: string) = { Qualifier = qualifier; Name = name }
-            col c.Qualifier c.Name
-
-        let aggCallsOf (items: SelectItem list) =
-            aggCalls (items |> List.map (fun i -> i.Expression))
+        let col qualifier name = { Qualifier = qualifier; Name = name }
+        let sameRef c = col c.Qualifier c.Name
+        let aggCallsOf = List.map _.Expression >> aggCalls
 
         if List.isEmpty items then
             src
@@ -691,16 +692,16 @@ module internal Ops =
                 |> List.collect (fun (_, exprs) -> exprs)
 
             let foundAggs = aggCallsOf items
+            let offsets = aggOffsets groupBy foundAggs
+            let wholeOffsets = wholeGroupOffsets groupBy
 
-            if List.isEmpty foundAggs then
+            if List.isEmpty foundAggs && List.isEmpty groupBy then
                 Op.map (fun row -> allExprs |> List.map (Eval.eval schema row) |> all |> Result.map List.toArray) src
             else
-                let offsets = aggOffsets groupBy foundAggs
-
                 Op.map
                     (fun row ->
                         allExprs
-                        |> List.map (fun e -> substituteAggs offsets e row >>= Eval.eval Schema.empty row)
+                        |> List.map (fun e -> substituteAggs offsets wholeOffsets row e >>= Eval.eval Schema.empty row)
                         |> all
                         |> Result.map List.toArray)
                     src

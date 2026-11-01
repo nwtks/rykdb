@@ -441,8 +441,23 @@ module internal RowStore =
 
     /// 全 keyspace を close し、プロセス間ロックを外す。
     /// ロックの解除は二重 Close でも無害（トークンは一度しか外れない）。
+    /// <remarks>
+    /// 1つの engine の Close が失敗しても残りを閉じる。
+    /// `foldOk` で途中打ち切りにすると、失敗した keyspace より後ろの memtable が flush されず
+    /// WAL も残ったままになる。
+    /// 戻り値は最初のエラー。
+    /// </remarks>
     let close (store: RowStore) =
-        let outcome = store.Engines |> Map.values |> foldOk (fun () e -> e.Close()) ()
+        let outcome =
+            store.Engines
+            |> Map.values
+            |> Seq.fold
+                (fun acc engine ->
+                    match acc, engine.Close() with
+                    | Error e, _ -> Error e
+                    | Ok(), Error e -> Error e
+                    | Ok(), Ok() -> Ok())
+                (Ok())
 
         match store.Lock with
         | Some lease -> lease.ForceRelease()

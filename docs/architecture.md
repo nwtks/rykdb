@@ -1243,6 +1243,9 @@ Database.OpenWith root
 `Database.Close()` は **全 keyspace の `StorageEngine.close`** を行い、
 memtable を flush してから WAL を削除する。
 これを省くと再起動時にデータが読めない。
+1つの keyspace の close が失敗しても残りは閉じる
+（途中で打ち切ると、失敗した engine より後ろの memtable / WAL が後始末されない）。
+戻り値は最初のエラー。
 不変ハンドルには「閉じた」状態を記録しないため、Close 後のハンドルは破棄する
 （同じハンドルで `Execute` すると WAL が再作成される。二重 Close は安全）。
 実際に flush / WAL 削除 / `ProcessLock` 解放を行うのは**最新のハンドル**だけで、

@@ -1398,3 +1398,35 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 `runStatements` が Error を返したら明示的に `unregister` する。
 
 - 回帰テスト: `Database: 複数文 Execute の BEGIN 後エラーで登録を残さない`。
+
+### 11.31 GROUP BY の式は木全体でスロットへ置き換える
+
+`GROUP BY age + 1` の集約結果は「式の値」1列になるが、式の木は `age + 1` のまま残る。
+葉の `t.age` だけをスロットへ置き換えると、
+`SELECT age + 1` が集約後のスキーマに無い `t.age` を参照して `列 't.age' が存在しません` になる。
+
+- `Ops.substituteAggs` は **非葉の式の表示文字列** でもスロットを探し、
+  式全体をリテラルへ置き換える
+  （`project` / `havingFilter` 共通）。
+- `GROUP BY` が葉だけなら表示文字列を作らない。
+  深い HAVING 式で `Expr.toDisplayString` をノードごとに呼ぶと O(深さ²) になる
+  （`末尾再帰: 50000段の式を havingFilter してもスタックを食わない` がハングした）。
+- `project` は GROUP BY があるとき、集約が 0個でも置換経路を通す。
+- 回帰テスト: `Database: GROUP BY の式を SELECT / HAVING でも使える`。
+
+### 11.32 未知の `t.*` は 0列の成功にしない
+
+`Schema.expandStar` は修飾子に一致する列が 0件でも `Some(true, [])` を返す。
+そのままだと `SELECT nope.* FROM t` が「0列・1行」で成功し、列の無い結果を静かに返す。
+`Planner.buildLogical` で `Schema.hasQualifier` を検査し、`NameError` にする。
+
+- 回帰テスト: `Database: FROM に無い t.* は NameError`。
+
+### 11.33 DEFAULT も列型へ強制する
+
+`DmlOps.insert` は指定された値を `SqlValue.coerce` していたが、
+省略列の `DEFAULT` は生の評価結果をそのまま保存していた。
+`INTEGER` 列に `DEFAULT 'oops'` を書くと TEXT のまま格納され、後続の比較が型エラーになる。
+
+- `defaultValues` の評価後に `SqlValue.coerce col.DataType` を通す。
+- 回帰テスト: `Database: DEFAULT は列型へ暗黙変換される`。
