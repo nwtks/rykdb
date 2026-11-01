@@ -10,10 +10,9 @@ open RykDb.TestHelpers
 
 /// テスト用の ExecContext（people と orders を登録済み）。
 let private ctxOf (store: RowStore) =
-    let c0 = ExecContext.create store None
-    let c1 = ExecContext.withSchema c0 "people" peopleSchema
-    let c2 = ExecContext.withSchema c1 "orders" ordersSchema
-    c2
+    ExecContext.create store None
+    |> ExecContext.withSchema "people" peopleSchema
+    |> ExecContext.withSchema "orders" ordersSchema
 
 let private pCol (n: string) =
     Expr.Column { Qualifier = Some "people"; Name = n }
@@ -131,7 +130,7 @@ let ``Analyzer.chooseScanMethod: 等価条件があれば主キー検索にす�
     withStore "an1" (fun store ->
         let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
         let pred = Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Literal(Literal.Int 1L))
-        let m = ok (Analyzer.chooseScanMethod b Catalog.empty [ pred ])
+        let m = ok (Analyzer.chooseScanMethod b Catalog.Empty [ pred ])
 
         match m with
         | ScanMethod.PkLookup values ->
@@ -148,14 +147,14 @@ let ``Analyzer.chooseScanMethod: 等価条件があっても索引が無けれ�
         let pred =
             Expr.Binary(BinaryOp.Eq, pCol "name", Expr.Literal(Literal.String "alice"))
 
-        let m = ok (Analyzer.chooseScanMethod b Catalog.empty [ pred ])
+        let m = ok (Analyzer.chooseScanMethod b Catalog.Empty [ pred ])
         Assert.Equal<ScanMethod>(ScanMethod.SeqScan, m))
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: 索引があれば索引検索にする`` () =
     withStore "an3" (fun store ->
         let ix = Catalog.toIndexDefinition "people" peopleSchema.Indexes.[0]
-        let catalog = ix |> Catalog.addIndex Catalog.empty
+        let catalog = ix |> Catalog.addIndex Catalog.Empty
         let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
         let pred = Expr.Binary(BinaryOp.Eq, pCol "age", Expr.Literal(Literal.Int 30L))
         let m = ok (Analyzer.chooseScanMethod b catalog [ pred ])
@@ -171,7 +170,7 @@ let ``Analyzer.chooseScanMethod: 等価条件が無ければ全走査`` () =
     withStore "an4" (fun store ->
         let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
         let pred = Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))
-        let m = ok (Analyzer.chooseScanMethod b Catalog.empty [ pred ])
+        let m = ok (Analyzer.chooseScanMethod b Catalog.Empty [ pred ])
         Assert.Equal<ScanMethod>(ScanMethod.SeqScan, m))
 
 [<Fact>]
@@ -182,14 +181,14 @@ let ``Analyzer.chooseScanMethod: AND の奥と左右対称の等価条件を探�
         let first = Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))
         let second = Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Literal(Literal.Int 7L))
 
-        match ok (Analyzer.chooseScanMethod b Catalog.empty [ first; second ]) with
+        match ok (Analyzer.chooseScanMethod b Catalog.Empty [ first; second ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(7L, asInt values.[0])
         | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
 
         // 値 = 列 の順（左右対称）でも探せる
         let reversed = Expr.Binary(BinaryOp.Eq, Expr.Literal(Literal.Int 8L), pCol "id")
 
-        match ok (Analyzer.chooseScanMethod b Catalog.empty [ reversed ]) with
+        match ok (Analyzer.chooseScanMethod b Catalog.Empty [ reversed ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(8L, asInt values.[0])
         | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m))
 
@@ -206,7 +205,7 @@ let ``Analyzer.chooseScanMethod: 1 つの conjunct 内の AND も掘れる`` () 
                 Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))
             )
 
-        match ok (Analyzer.chooseScanMethod b Catalog.empty [ leftHit ]) with
+        match ok (Analyzer.chooseScanMethod b Catalog.Empty [ leftHit ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(9L, asInt values.[0])
         | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
 
@@ -218,7 +217,7 @@ let ``Analyzer.chooseScanMethod: 1 つの conjunct 内の AND も掘れる`` () 
                 Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Literal(Literal.Int 10L))
             )
 
-        match ok (Analyzer.chooseScanMethod b Catalog.empty [ rightHit ]) with
+        match ok (Analyzer.chooseScanMethod b Catalog.Empty [ rightHit ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(10L, asInt values.[0])
         | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m))
 
@@ -231,7 +230,7 @@ let ``Analyzer.chooseScanMethod: 負のリテラルは等値条件に使える``
         let negInt =
             Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Unary(UnaryOp.Neg, Expr.Literal(Literal.Int 5L)))
 
-        match ok (Analyzer.chooseScanMethod b Catalog.empty [ negInt ]) with
+        match ok (Analyzer.chooseScanMethod b Catalog.Empty [ negInt ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(-5L, asInt values.[0])
         | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
 
@@ -239,13 +238,13 @@ let ``Analyzer.chooseScanMethod: 負のリテラルは等値条件に使える``
         let negReal =
             Expr.Binary(BinaryOp.Eq, pCol "age", Expr.Unary(UnaryOp.Neg, Expr.Literal(Literal.Real 1.5)))
 
-        Assert.Equal<ScanMethod>(ScanMethod.SeqScan, ok (Analyzer.chooseScanMethod b Catalog.empty [ negReal ]))
+        Assert.Equal<ScanMethod>(ScanMethod.SeqScan, ok (Analyzer.chooseScanMethod b Catalog.Empty [ negReal ]))
 
         // 数値でない単項マイナスは定数とみなさない
         let negText =
             Expr.Binary(BinaryOp.Eq, pCol "id", Expr.Unary(UnaryOp.Neg, Expr.Literal(Literal.String "x")))
 
-        Assert.Equal<ScanMethod>(ScanMethod.SeqScan, ok (Analyzer.chooseScanMethod b Catalog.empty [ negText ])))
+        Assert.Equal<ScanMethod>(ScanMethod.SeqScan, ok (Analyzer.chooseScanMethod b Catalog.Empty [ negText ])))
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: 複合主キーは全列一致のときだけ PkLookup`` () =
@@ -263,7 +262,7 @@ let ``Analyzer.chooseScanMethod: 複合主キーは全列一致のときだけ P
                 Indexes = []
             }
 
-        let ctx = ExecContext.withSchema (ExecContext.create store None) "pairs" schema
+        let ctx = ExecContext.create store None |> ExecContext.withSchema "pairs" schema
         let b = ok (Analyzer.bindTable ctx { Name = "pairs"; Alias = None })
 
         let eq name value =
@@ -280,7 +279,7 @@ let ``Analyzer.chooseScanMethod: 複合主キーは全列一致のときだけ P
         // 列の順序が逆でも主キー順に組み立てる
         let preds = [ eq "b" (Literal.Int 2L); eq "a" (Literal.Int 1L) ]
 
-        match ok (Analyzer.chooseScanMethod b Catalog.empty preds) with
+        match ok (Analyzer.chooseScanMethod b Catalog.Empty preds) with
         | ScanMethod.PkLookup values ->
             Assert.Equal<int>(2, values.Length)
             Assert.Equal<int64>(1L, asInt values.[0])
@@ -288,12 +287,12 @@ let ``Analyzer.chooseScanMethod: 複合主キーは全列一致のときだけ P
         | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
 
         // 部分一致は全走査
-        match ok (Analyzer.chooseScanMethod b Catalog.empty [ eq "a" (Literal.Int 1L) ]) with
+        match ok (Analyzer.chooseScanMethod b Catalog.Empty [ eq "a" (Literal.Int 1L) ]) with
         | ScanMethod.SeqScan -> ()
         | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m)
 
         // キー列の型と違うリテラルは全走査（比較時に型エラーにする）
-        match ok (Analyzer.chooseScanMethod b Catalog.empty [ eq "a" (Literal.String "1") ]) with
+        match ok (Analyzer.chooseScanMethod b Catalog.Empty [ eq "a" (Literal.String "1") ]) with
         | ScanMethod.SeqScan -> ()
         | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m))
 
@@ -315,10 +314,10 @@ let ``Analyzer.chooseScanMethod: 複合索引は前置等値 + 範囲で IndexRa
                     ]
             }
 
-        let ctx = ExecContext.withSchema (ExecContext.create store None) "pairs" schema
+        let ctx = ExecContext.create store None |> ExecContext.withSchema "pairs" schema
         let b = ok (Analyzer.bindTable ctx { Name = "pairs"; Alias = None })
         let ix = Catalog.toIndexDefinition "pairs" schema.Indexes.[0]
-        let catalog = ix |> Catalog.addIndex Catalog.empty
+        let catalog = ix |> Catalog.addIndex Catalog.Empty
 
         let colRef name =
             Expr.Column
@@ -399,10 +398,10 @@ let ``Analyzer.chooseScanMethod: LIKE 'prefix%' は索引の範囲走査にす�
                     ]
             }
 
-        let ctx = ExecContext.withSchema (ExecContext.create store None) "items" schema
+        let ctx = ExecContext.create store None |> ExecContext.withSchema "items" schema
         let b = ok (Analyzer.bindTable ctx { Name = "items"; Alias = None })
         let ix = Catalog.toIndexDefinition "items" schema.Indexes.[0]
-        let catalog = ix |> Catalog.addIndex Catalog.empty
+        let catalog = ix |> Catalog.addIndex Catalog.Empty
 
         let pred =
             Expr.Like(Expr.Column { Qualifier = Some "items"; Name = "s" }, Expr.Literal(Literal.String "ab%"), false)
@@ -430,7 +429,7 @@ let ``Analyzer.chooseScanMethod: 20000段の AND を chooseScanMethod しても�
             List.init 20_000 (fun _ -> miss)
             |> List.fold (fun acc p -> Expr.Binary(BinaryOp.And, acc, p)) hit
 
-        match ok (Analyzer.chooseScanMethod b Catalog.empty [ deep ]) with
+        match ok (Analyzer.chooseScanMethod b Catalog.Empty [ deep ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(42L, asInt values.[0])
         | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m))
 

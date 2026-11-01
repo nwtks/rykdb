@@ -18,32 +18,28 @@ type Session(initial: Database) =
     member _.InTransaction = current.InTransaction
 
     member _.Run(sql: string) =
-        match current.Execute sql with
-        | Ok(next, result) ->
+        current.Execute sql
+        |> Result.map (fun (next, result) ->
             current <- next
-            Ok result
-        | Error e -> Error e
+            result)
 
     member _.Begin() =
-        match current.Begin() with
-        | Ok next ->
+        current.Begin()
+        |> Result.map (fun next ->
             current <- next
-            Ok()
-        | Error e -> Error e
+            ())
 
     member _.Commit() =
-        match current.Commit() with
-        | Ok next ->
+        current.Commit()
+        |> Result.map (fun next ->
             current <- next
-            Ok()
-        | Error e -> Error e
+            ())
 
     member _.Rollback() =
-        match current.Rollback() with
-        | Ok next ->
+        current.Rollback()
+        |> Result.map (fun next ->
             current <- next
-            Ok()
-        | Error e -> Error e
+            ())
 
     member _.Close() = current.Close()
 
@@ -91,7 +87,7 @@ let private piecesOf (input: string) =
 
     loop 0 false
 
-let private splitStatements (input: string) = piecesOf input |> Array.toList
+let private splitStatements = piecesOf >> Array.toList
 
 let private coloredLine (color: System.ConsoleColor) (emit: string -> unit) (line: string) =
     System.Console.ForegroundColor <- color
@@ -237,8 +233,7 @@ let private runFile (session: Session) (path: string) =
     if not (System.IO.File.Exists path) then
         Error(sprintf "ファイル %s がありません" path |> DbError.notFound)
     else
-        let sql = System.IO.File.ReadAllText path
-        runStatements (splitStatements sql)
+        System.IO.File.ReadAllText path |> splitStatements |> runStatements
 
 [<EntryPoint>]
 let main argv =
@@ -268,7 +263,7 @@ let main argv =
         |> Array.tryHead
         |> Option.defaultValue (System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "rykdb-data"))
 
-    match Database.openWith root with
+    match Database.OpenWith root with
     | Error e ->
         printError e
         1

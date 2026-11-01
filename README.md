@@ -60,6 +60,7 @@ db> .exit
 | コマンド                | 説明                                        |
 | ----------------------- | ------------------------------------------- |
 | `.tables`               | テーブル一覧                                |
+| `.begin`                | transaction を開始                          |
 | `.commit` / `.rollback` | 開いている transaction を確定／破棄         |
 | `.help`                 | コマンド一覧                                |
 | `.exit` / `.quit`       | 終了（`Close` して memtable を flush する） |
@@ -93,14 +94,12 @@ let ok =
     | Ok v -> v
     | Error e -> failwith (DbError.toDisplayString e)
 
-let db = ok (Database.openWith "./mydata")
+let db = ok (Database.OpenWith "./mydata")
 
 // Execute は新しい Database と結果のペアを返す。戻り値を持ち替えること。
 let db, _ = ok (db.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
 let db, _ = ok (db.Execute "INSERT INTO t VALUES (1, 10), (2, 20)")
-
-// Query は SELECT 専用（DDL / DML は Execute を使う）。
-let db, result = ok (db.Query "SELECT id, v FROM t ORDER BY id")
+let db, result = ok (db.Execute "SELECT id, v FROM t ORDER BY id")
 printfn "%A" result.Rows          // [|[|Int 1L; Int 10L|]; [|Int 2L; Int 20L|]|]
 printfn "%A" result.Columns       // [|"id"; "v"|]
 printfn "%A" result.RowsAffected  // 2
@@ -123,11 +122,7 @@ Debug ビルド・単一スレッド・10万行（`INTEGER` 主キー 1列 + `IN
 | 全走査（`COUNT(*)`）              | 約 0.8秒              |
 
 Release ビルドではこれより速くなる。
-SSTable は Footer / index / Bloom だけを開き、データブロックは必要になるまで読まない（部分読み）。
-reader はプロセス内で弱参照キャッシュされるため、2回目以降の検索・走査は速い。
-`LIMIT` は単純な全走査ならストレージへ降り、先頭 `OFFSET + LIMIT` 行に必要な SSTable / ブロックだけを読む。
-JOIN は等値条件ならハッシュ結合、左が小さく右に索引があればインデックス入れ子ループを自動選択する。
-Bloom filter の bits/key とレベルファウト比は未調整。
+Bloom filter の bits/key とレベルファンアウト比は未調整。
 
 ---
 

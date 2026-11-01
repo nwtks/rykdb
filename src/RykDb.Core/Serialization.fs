@@ -98,7 +98,7 @@ module internal Reader =
         if Cursor.atEnd c then
             eof "Reader: 読み取り位置が末尾を超えました"
         else
-            Ok(c.Data.[c.Pos], { c with Pos = c.Pos + 1 })
+            ret (c.Data.[c.Pos], { c with Pos = c.Pos + 1 })
 
     let readBytes (count: int) (c: Cursor) =
         if
@@ -110,7 +110,7 @@ module internal Reader =
         then
             eof (sprintf "Reader: %d バイトを読み取れません（残り %d）" count (Cursor.remaining c))
         else
-            Ok(Array.sub c.Data c.Pos count, { c with Pos = c.Pos + count })
+            ret (Array.sub c.Data c.Pos count, { c with Pos = c.Pos + count })
 
     let readBool (c: Cursor) =
         readByte c |> Result.map (fun (b, c) -> b <> 0uy, c)
@@ -122,14 +122,14 @@ module internal Reader =
                 eof "Reader: varint が長すぎます"
             else
                 match readByte c with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(b, c) ->
                     let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
 
                     if b &&& 0x80uy <> 0uy then
                         decode (shift + 7) acc c
                     else
-                        Ok(acc, c)
+                        ret (acc, c)
 
         decode 0 0UL c
 
@@ -152,7 +152,7 @@ module internal Reader =
                 ||| (int64 d.[p + 6] <<< 48)
                 ||| (int64 d.[p + 7] <<< 56)
 
-            Ok(v, { c with Pos = p + 8 })
+            ret (v, { c with Pos = p + 8 })
 
     /// リトルエンディアン 4バイト（符号なし）を読む。
     let readUInt32LE (c: Cursor) =
@@ -168,7 +168,7 @@ module internal Reader =
                 ||| (uint32 d.[p + 2] <<< 16)
                 ||| (uint32 d.[p + 3] <<< 24)
 
-            Ok(v, { c with Pos = p + 4 })
+            ret (v, { c with Pos = p + 4 })
 
     /// ビッグエンディアン 8バイト（符号なし）。
     /// 順序保持された整数の復元。
@@ -180,7 +180,7 @@ module internal Reader =
             let p = c.Pos
 
             let v =
-                (uint64 d.[p] <<< 56)
+                uint64 d.[p] <<< 56
                 ||| (uint64 d.[p + 1] <<< 48)
                 ||| (uint64 d.[p + 2] <<< 40)
                 ||| (uint64 d.[p + 3] <<< 32)
@@ -189,7 +189,7 @@ module internal Reader =
                 ||| (uint64 d.[p + 6] <<< 8)
                 ||| uint64 d.[p + 7]
 
-            Ok(v, { c with Pos = p + 8 })
+            ret (v, { c with Pos = p + 8 })
 
     let readLengthPrefixed (c: Cursor) =
         readVarint c
@@ -212,7 +212,7 @@ module internal Reader =
                 ret (List.rev acc, c)
             else
                 match readOne c with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(v, c') -> readRemaining (rest - 1UL) (v :: acc) c'
 
         readRemaining count [] c
@@ -421,15 +421,15 @@ module internal OrderPreserving =
     let private readValue (c: Cursor) =
         let rec unescape acc c =
             let finish c =
-                Ok(List.rev acc |> List.toArray, { c with Pos = c.Pos - 1 })
+                ret (List.rev acc |> List.toArray, { c with Pos = c.Pos - 1 })
 
             match Reader.readByte c with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(b, c) when b <> Terminator -> unescape (b :: acc) c
             | Ok(_, c) when Cursor.atEnd c -> finish c
             | Ok(_, c) ->
                 match Reader.readByte c with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(EscapeMarker, c) -> unescape (Terminator :: acc) c
                 | Ok(_, _) -> finish c
 

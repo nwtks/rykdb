@@ -127,9 +127,9 @@ let withStore (_tag: string) (f: RowStore -> unit) =
 /// store 側の root は空のまま（commit intent をディスクに書かない）。
 /// </remarks>
 let withDb (_tag: string) (f: Database -> unit) =
-    let root = "mem:" + Guid.NewGuid().ToString("N")
+    let root = "mem:" + Guid.NewGuid().ToString "N"
     let store = RowStore.openStoreWith "" (newMemoryEngineFactory ())
-    let db = ok (Database.openWithStore root store)
+    let db = ok (Database.OpenWithStore root store)
 
     try
         f db
@@ -250,7 +250,7 @@ let exec (db: Database) (sql: string) =
 
 /// 実行して結果だけ返す。
 let query (db: Database) (sql: string) =
-    let _, r = ok (db.Query sql)
+    let _, r = ok (db.Execute sql)
     r
 
 /// `toSqlLiteral` で 1 行を文字列化する（クライアント比較用）。

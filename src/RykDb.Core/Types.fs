@@ -273,46 +273,46 @@ module internal SqlValue =
             if System.Double.IsNaN f || System.Double.IsInfinity f then
                 err (DbError.typeError "NaN や ±Infinity は数値比較できません")
             elif fitsDecimal f && (f = 0.0 || System.Math.Abs f >= DecimalMinMagnitudeAsFloat) then
-                Ok(compare (decimal f) (decimalOf other))
+                ret (compare (decimal f) (decimalOf other))
             else
-                Ok(compare f (floatOf other))
+                ret (compare f (floatOf other))
 
         let compareNumeric a b =
             match a, b with
             | SqlValue.Real fa, SqlValue.Real fb ->
                 if System.Double.IsNaN fa && System.Double.IsNaN fb then
-                    Ok 0
+                    ret 0
                 elif System.Double.IsNaN fa then
-                    Ok 1
+                    ret 1
                 elif System.Double.IsNaN fb then
-                    Ok -1
+                    ret -1
                 else
-                    Ok(compare fa fb)
+                    ret (compare fa fb)
             | SqlValue.Real fa, _ -> compareReal fa b
             | _, SqlValue.Real fb -> compareReal fb a |> Result.map (fun c -> -c)
-            | _ -> Ok(compare (decimalOf a) (decimalOf b))
+            | _ -> ret (compare (decimalOf a) (decimalOf b))
 
         match a, b with
         | SqlValue.Null, _
         | _, SqlValue.Null -> err (DbError.typeError "NULL は比較できません")
         | (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _),
           (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _) -> compareNumeric a b
-        | SqlValue.Bool x, SqlValue.Bool y -> Ok(compare (if x then 1 else 0) (if y then 1 else 0))
-        | SqlValue.Text x, SqlValue.Text y -> Ok(System.StringComparer.Ordinal.Compare(x, y))
-        | SqlValue.Blob x, SqlValue.Blob y -> Ok(Bytes.compare x y)
-        | SqlValue.Uuid x, SqlValue.Uuid y -> Ok(compare x y)
-        | SqlValue.Date x, SqlValue.Date y -> Ok(compare x y)
-        | SqlValue.Timestamp x, SqlValue.Timestamp y -> Ok(System.DateTimeOffset.Compare(x, y))
+        | SqlValue.Bool x, SqlValue.Bool y -> ret (compare (if x then 1 else 0) (if y then 1 else 0))
+        | SqlValue.Text x, SqlValue.Text y -> ret (System.StringComparer.Ordinal.Compare(x, y))
+        | SqlValue.Blob x, SqlValue.Blob y -> ret (Bytes.compare x y)
+        | SqlValue.Uuid x, SqlValue.Uuid y -> ret (compare x y)
+        | SqlValue.Date x, SqlValue.Date y -> ret (compare x y)
+        | SqlValue.Timestamp x, SqlValue.Timestamp y -> ret (System.DateTimeOffset.Compare(x, y))
         | SqlValue.Date x, SqlValue.Timestamp y ->
             let xs =
                 System.DateTimeOffset(x.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
 
-            Ok(System.DateTimeOffset.Compare(xs, y))
+            ret (System.DateTimeOffset.Compare(xs, y))
         | SqlValue.Timestamp x, SqlValue.Date y ->
             let ys =
                 System.DateTimeOffset(y.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
 
-            Ok(System.DateTimeOffset.Compare(x, ys))
+            ret (System.DateTimeOffset.Compare(x, ys))
         | _ ->
             err (
                 sprintf "型 '%s' と '%s' は比較できません" (dataType a |> DataType.toSqlName) (dataType b |> DataType.toSqlName)
@@ -357,38 +357,38 @@ module internal SqlValue =
 
         let asBoolean =
             function
-            | SqlValue.Bool _ as v -> Ok v
-            | SqlValue.Int i when i = 0L -> Ok(SqlValue.Bool false)
-            | SqlValue.Int i when i = 1L -> Ok(SqlValue.Bool true)
-            | SqlValue.Real f when f = 0.0 -> Ok(SqlValue.Bool false)
-            | SqlValue.Real f when f = 1.0 -> Ok(SqlValue.Bool true)
+            | SqlValue.Bool _ as v -> ret v
+            | SqlValue.Int i when i = 0L -> ret (SqlValue.Bool false)
+            | SqlValue.Int i when i = 1L -> ret (SqlValue.Bool true)
+            | SqlValue.Real f when f = 0.0 -> ret (SqlValue.Bool false)
+            | SqlValue.Real f when f = 1.0 -> ret (SqlValue.Bool true)
             | _ -> fail ()
 
         let asInteger =
             function
-            | SqlValue.Int _ as v -> Ok v
-            | SqlValue.Bool b -> (if b then 1L else 0L) |> SqlValue.Int |> Ok
+            | SqlValue.Int _ as v -> ret v
+            | SqlValue.Bool b -> (if b then 1L else 0L) |> SqlValue.Int |> ret
             | SqlValue.Real f when
                 not (System.Double.IsNaN f || System.Double.IsInfinity f)
                 && System.Math.Truncate f = f
                 && f >= Int64MinAsFloat
                 && f < Int64MaxAsFloat
                 ->
-                int64 f |> SqlValue.Int |> Ok
+                int64 f |> SqlValue.Int |> ret
             | SqlValue.Decimal d when
                 System.Decimal.Truncate d = d
                 && d >= decimal System.Int64.MinValue
                 && d <= decimal System.Int64.MaxValue
                 ->
-                int64 d |> SqlValue.Int |> Ok
+                int64 d |> SqlValue.Int |> ret
             | _ -> fail ()
 
         let asReal =
             function
-            | SqlValue.Real _ as v -> Ok v
-            | SqlValue.Int i -> float i |> SqlValue.Real |> Ok
-            | SqlValue.Bool b -> (if b then 1.0 else 0.0) |> SqlValue.Real |> Ok
-            | SqlValue.Decimal d -> float d |> SqlValue.Real |> Ok
+            | SqlValue.Real _ as v -> ret v
+            | SqlValue.Int i -> float i |> SqlValue.Real |> ret
+            | SqlValue.Bool b -> (if b then 1.0 else 0.0) |> SqlValue.Real |> ret
+            | SqlValue.Decimal d -> float d |> SqlValue.Real |> ret
             | _ -> fail ()
 
         let asDecimal v =
@@ -396,16 +396,16 @@ module internal SqlValue =
                 fail ()
             else
                 match v with
-                | SqlValue.Decimal _ -> Ok v
-                | SqlValue.Int i -> decimal i |> SqlValue.Decimal |> Ok
-                | SqlValue.Real f -> decimal f |> SqlValue.Decimal |> Ok
-                | SqlValue.Bool b -> (if b then 1.0M else 0.0M) |> SqlValue.Decimal |> Ok
+                | SqlValue.Decimal _ -> ret v
+                | SqlValue.Int i -> decimal i |> SqlValue.Decimal |> ret
+                | SqlValue.Real f -> decimal f |> SqlValue.Decimal |> ret
+                | SqlValue.Bool b -> (if b then 1.0M else 0.0M) |> SqlValue.Decimal |> ret
                 | _ -> fail ()
 
         let asDate =
             function
-            | SqlValue.Date _ as v -> Ok v
-            | SqlValue.Timestamp t -> System.DateOnly.FromDateTime t.UtcDateTime |> SqlValue.Date |> Ok
+            | SqlValue.Date _ as v -> ret v
+            | SqlValue.Timestamp t -> System.DateOnly.FromDateTime t.UtcDateTime |> SqlValue.Date |> ret
             | SqlValue.Text s ->
                 match
                     System.DateOnly.TryParseExact(
@@ -415,17 +415,17 @@ module internal SqlValue =
                         System.Globalization.DateTimeStyles.None
                     )
                 with
-                | true, d -> d |> SqlValue.Date |> Ok
+                | true, d -> d |> SqlValue.Date |> ret
                 | _ -> fail ()
             | _ -> fail ()
 
         let asTimestamp =
             function
-            | SqlValue.Timestamp _ as v -> Ok v
+            | SqlValue.Timestamp _ as v -> ret v
             | SqlValue.Date d ->
                 System.DateTimeOffset(d.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
                 |> SqlValue.Timestamp
-                |> Ok
+                |> ret
             | SqlValue.Text s ->
                 match
                     System.DateTimeOffset.TryParse(
@@ -435,35 +435,35 @@ module internal SqlValue =
                         ||| System.Globalization.DateTimeStyles.AdjustToUniversal
                     )
                 with
-                | true, t -> t |> SqlValue.Timestamp |> Ok
+                | true, t -> t |> SqlValue.Timestamp |> ret
                 | _ -> fail ()
             | _ -> fail ()
 
         if isNull v then
-            Ok SqlValue.Null
+            ret SqlValue.Null
         else
             match target with
-            | DataType.Null -> Ok SqlValue.Null
+            | DataType.Null -> ret SqlValue.Null
             | DataType.Boolean -> asBoolean v
             | DataType.Integer -> asInteger v
             | DataType.Real -> asReal v
             | DataType.Decimal -> asDecimal v
             | DataType.Text ->
                 match v with
-                | SqlValue.Text _ -> Ok v
-                | _ -> SqlLiteral.toSqlLiteral v |> SqlValue.Text |> Ok
+                | SqlValue.Text _ -> ret v
+                | _ -> SqlLiteral.toSqlLiteral v |> SqlValue.Text |> ret
             | DataType.Blob ->
                 match v with
-                | SqlValue.Blob _ -> Ok v
-                | SqlValue.Text s -> System.Text.Encoding.UTF8.GetBytes s |> SqlValue.Blob |> Ok
+                | SqlValue.Blob _ -> ret v
+                | SqlValue.Text s -> System.Text.Encoding.UTF8.GetBytes s |> SqlValue.Blob |> ret
                 | _ -> fail ()
             | DataType.Date -> asDate v
             | DataType.Timestamp -> asTimestamp v
             | DataType.Uuid ->
                 match v with
-                | SqlValue.Uuid _ -> Ok v
+                | SqlValue.Uuid _ -> ret v
                 | SqlValue.Text s ->
                     match System.Guid.TryParse s with
-                    | true, g -> g |> SqlValue.Uuid |> Ok
+                    | true, g -> g |> SqlValue.Uuid |> ret
                     | _ -> fail ()
                 | _ -> fail ()

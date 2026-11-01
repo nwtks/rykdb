@@ -72,16 +72,16 @@ CPS でのスタック深度とその上限は [`coding-conventions.md`](coding-
 
 xUnit。
 **テスト対象のソースファイルごとに 1ファイル**に分ける
-（`src/RykDb.Core/Executor.fs` → `tests/RykDb.Tests/ExecutorTests.fs`）。
-モジュール名も `module RykDb.ExecutorTests` と対象名に合わせる。
+（`src/RykDb.Core/Dml.fs` → `tests/RykDb.Tests/DmlTests.fs`）。
+モジュール名も `module RykDb.DmlTests` と対象名に合わせる。
 
 ```bash
-dotnet test                                 # 全件
-dotnet test --filter "RykDb.ServerTests"    # Server のみ
+dotnet test                                                    # 全件
+dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"    # Server のみ
 ```
 
 **テスト方針**: `DatabaseTests` / `ServerTests` は「SQL 文字列 → 結果」の通し経路しか検証しない。
-Parser / Planner / Executor / Catalog の連携バグはそこだけで分かる。
+Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだけで分かる。
 
 **書き方**:
 
@@ -90,7 +90,7 @@ Parser / Planner / Executor / Catalog の連携バグはそこだけで分かる
 - 共通ヘルパー（`ok` / `withDir` / `asInt` / 乱数生成）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
   ファイル固有の fixture（スキーマなど）は各ファイルに private で置く。
 - `withStore` / `withDb` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
-  ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Database.openWith` を直接使って検証する。
+  ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Database.OpenWith` を直接使って検証する。
 - 新しいファイルは `.fsproj` の Compile 順（= src のコンパイル順）に追加する。
 - 一時ディレクトリは `Path.GetTempPath()` + `Ticks`。
   `try/finally` で必ず削除する。

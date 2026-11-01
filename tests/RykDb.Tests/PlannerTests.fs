@@ -10,10 +10,9 @@ open RykDb.TestHelpers
 
 /// テスト用の ExecContext（people と orders を登録済み）。
 let private ctxOf (store: RowStore) =
-    let c0 = ExecContext.create store None
-    let c1 = ExecContext.withSchema c0 "people" peopleSchema
-    let c2 = ExecContext.withSchema c1 "orders" ordersSchema
-    c2
+    ExecContext.create store None
+    |> ExecContext.withSchema "people" peopleSchema
+    |> ExecContext.withSchema "orders" ordersSchema
 
 let private pCol (n: string) =
     Expr.Column { Qualifier = Some "people"; Name = n }

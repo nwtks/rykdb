@@ -38,9 +38,10 @@ select         ::= SELECT [DISTINCT] select_item {"," select_item}
                    [ GROUP BY expr {"," expr} ]
                    [ HAVING expr ]
                    [ ORDER BY sort_key {"," sort_key} ]
-                   [ LIMIT expr [ OFFSET expr] ]
+                   [ LIMIT integer ] [ OFFSET integer ]
 
-select_item    ::= "*" | ident "." "*" | expr [AS ident]
+select_item    ::= "*" | ident "." "*" | expr [ [AS] ident ]
+table_ref      ::= ident [ [AS] ident ]
 join_clause    ::= [INNER | LEFT] JOIN table_ref ON expr
 sort_key       ::= expr [ASC | DESC]
 
@@ -54,7 +55,7 @@ ddl            ::= CREATE TABLE [IF NOT EXISTS] ident "(" table_element {"," tab
                 | DROP TABLE  [IF EXISTS] ident
                 | DROP INDEX  [IF EXISTS] ident
 table_element  ::= column_def | PRIMARY KEY "(" column_list ")" | UNIQUE "(" column_list ")"
-column_def     ::= ident data_type [type_args] [column_constraint {column_constraint}]
+column_def     ::= ident [data_type [type_args]] [column_constraint {column_constraint}]
 column_constraint ::= NOT NULL | PRIMARY KEY | UNIQUE | DEFAULT expr
 
 txn            ::= BEGIN | COMMIT | ROLLBACK
@@ -64,7 +65,9 @@ txn            ::= BEGIN | COMMIT | ROLLBACK
 > 詳しくは [12. トランザクション](#12-トランザクション)。
 
 文は `;` で区切れる（末尾の `;` は省略可）。
-`Database.Execute` は複数文を順に実行し、**最後の `SELECT` の結果**を返す。
+`Database.Execute` は複数文を順に実行する。
+`SELECT` が 1 つだけならその結果を返し、複数（または 0 個）なら `RowsAffected` の合計だけを返す
+（`Columns` / `Rows` は空）。
 
 ---
 
@@ -97,7 +100,7 @@ BEGIN   COMMIT  ROLLBACK PRIMARY KEY     UNIQUE  DEFAULT CASE    WHEN
 THEN    ELSE    END      EXISTS  IF      TRUE    FALSE
 ```
 
-`TRUE` / `FALSE` は予約語一覧（`Lexer.keywords`）には無いが、`Keyword` として特別扱いされる。
+`TRUE` / `FALSE` は予約語一覧（`Lexer.Keywords`）には無いが、`Keyword` として特別扱いされる。
 
 ### 記号（演算子・区切り）
 
@@ -191,7 +194,7 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 | `REAL` の `NaN`            | **`REAL` 同士の比較でのみ**最大。`NaN = NaN` は真。`NaN` と `INTEGER` / `DECIMAL` の比較は `TypeError`（§14「演算の注意」） |
 | `TEXT`                     | `StringComparer.Ordinal`（= UTF-8 のバイト順 = コードポイント順）                                                           |
 | `BLOB`                     | バイト列の辞書順（短い方が先）                                                                                              |
-| `DATE` `TIMESTAMP`         | 相互比較可（`DATE` は UTC 午中の `TIMESTAMP` として扱う）                                                                   |
+| `DATE` `TIMESTAMP`         | 相互比較可（`DATE` は UTC 午前 0時の `TIMESTAMP` として扱う）                                                               |
 | `UUID`                     | `Guid` の比較                                                                                                               |
 | `BOOLEAN`                  | `FALSE < TRUE`                                                                                                              |
 
@@ -350,7 +353,7 @@ name LIKE 'a%'       name NOT LIKE 'a%'
 ```
 
 - `BETWEEN` は両端を含む（`1 <= x <= 10`）。
-- `IN` の要素は**リテラル式のリスト**（サブクエリ不可）。
+- `IN` の要素は**式のリスト**（サブクエリ不可）。
 - `LIKE` のワイルドカード:
 
 | 記号 | 意味                     |
@@ -369,14 +372,14 @@ SELECT name FROM people WHERE name LIKE 'a_c';     -- 3文字、2文字目が任
 
 ### 6.5 集約関数
 
-| 関数       | 戻り値                         | 空のグループ | `NULL` の扱い |
-| ---------- | ------------------------------ | ------------ | ------------- |
-| `COUNT(*)` | `INTEGER`                      | `0`          | 数える        |
-| `COUNT(x)` | `INTEGER`                      | `0`          | **数えない**  |
-| `SUM(x)`   | `INTEGER` / `DECIMAL` / `REAL` | `NULL`       | 無視          |
-| `AVG(x)`   | 常に `REAL`                    | `NULL`       | 無視          |
-| `MIN(x)`   | 入力と同じ型                   | `NULL`       | 無視          |
-| `MAX(x)`   | 入力と同じ型                   | `NULL`       | 無視          |
+| 関数       | 戻り値             | 空のグループ | `NULL` の扱い |
+| ---------- | ------------------ | ------------ | ------------- |
+| `COUNT(*)` | `INTEGER`          | `0`          | 数える        |
+| `COUNT(x)` | `INTEGER`          | `0`          | **数えない**  |
+| `SUM(x)`   | `DECIMAL` / `REAL` | `NULL`       | 無視          |
+| `AVG(x)`   | 常に `REAL`        | `NULL`       | 無視          |
+| `MIN(x)`   | 入力と同じ型       | `NULL`       | 無視          |
+| `MAX(x)`   | 入力と同じ型       | `NULL`       | 無視          |
 
 ```sql
 SELECT dept_id,
@@ -393,36 +396,36 @@ HAVING COUNT(*) > 1
 
 補足:
 
-- `SUM` / `AVG` は `SUM / COUNT` を実行時に計算する。
+- `AVG` は `SUM / COUNT` を実行時に計算する。
 - `MIN` / `MAX` は文字列・日付・時刻にも使える。
 - `GROUP BY` を書かない `SELECT SUM(x) FROM t` は表全体の 1グループとして集計される。
 - `GROUP BY` / 集約関数を使うときに `SELECT *` は書けない（列を明示する）。
 - 集約も `GROUP BY` も無い `HAVING` は `SyntaxError`。
-- `SUM` / `AVG` は `INTEGER` / `DECIMAL` / `REAL` が混在しても合計を落とさない（REAL で返る）。
+- `SUM` / `AVG` は `INTEGER` / `DECIMAL` / `REAL` が混在しても合計を落とさない
+  （`REAL` が混在すると `SUM` も `REAL`、それ以外の `SUM` は `DECIMAL`。`AVG` は常に `REAL`）。
   入力が 0行でも 1行を返す（`COUNT(*)` は `0`、`SUM` / `AVG` / `MIN` / `MAX` は `NULL`）。
-- 集約関数のエラーは**伝播する**。
-  文字列列に `SUM` を掛けると `NULL` が返り、エラーにはならない。
+- 集約関数のエラーは**伝播する**。文字列列に `SUM` を掛けると `TypeError` になる。
 - `COUNT(DISTINCT x)` は**重複排除する**。
 
 ### 6.6 スカラー関数
 
 関数名は大文字小文字を区別しない。
 
-| 関数                |   引数 | 戻り値               | `NULL` の扱い    | 備考                                                                 |
-| ------------------- | -----: | -------------------- | ---------------- | -------------------------------------------------------------------- |
+| 関数                |   引数 | 戻り値               | `NULL` の扱い    | 備考                                                                    |
+| ------------------- | -----: | -------------------- | ---------------- | ----------------------------------------------------------------------- |
 | `UPPER(x)`          |      1 | `TEXT`               | 大文字化         |
 | `LOWER(x)`          |      1 | `TEXT`               | 小文字化         |
 | `TRIM(x)`           |      1 | `TEXT`               | 前後の空白を削除 |
-| `LENGTH(x)`         |      1 | `INTEGER`            | `NULL`           | UTF-16 文字数                                                        |
-| `ABS(x)`            |      1 | 入力と同じ数値型     | `NULL`           | 非数値はエラー                                                       |
-| `ROUND(x)`          |      1 | `REAL`               | `NULL`           | 0.5 は 1 へ（四捨五入・`AwayFromZero`）。**`INTEGER` / `REAL` のみ** |
-| `COALESCE(a, b, …)` | 1 以上 | 最初の非 `NULL` の型 | 全滅なら `NULL`  | 引数数は自由                                                         |
+| `LENGTH(x)`         |      1 | `INTEGER`            | `NULL`           | UTF-16 文字数                                                           |
+| `ABS(x)`            |      1 | 入力と同じ数値型     | `NULL`           | 非数値はエラー                                                          |
+| `ROUND(x)`          |      1 | 入力と同じ数値型     | `NULL`           | 0.5 は 1 へ（四捨五入・`AwayFromZero`）。`INTEGER` / `REAL` / `DECIMAL` |
+| `COALESCE(a, b, …)` | 1 以上 | 最初の非 `NULL` の型 | 全滅なら `NULL`  | 引数数は自由                                                            |
 
 - **未知の関数**は `未知のスカラー関数 '…' です`。
 - **引数数が違う**場合は `… 関数は 1個の引数が必要ですが、2個渡されました`。
   ただし空の引数リスト（`LENGTH()`）は関数の前に構文エラーになる。
-- `DECIMAL` 列に `ROUND` を掛けると `ROUND は数値を受け付けますが 100.5 です` になる。
-  `ROUND(x * 1.0)` のように `REAL` に変換してから渡す。
+- `ROUND` は `INTEGER` / `REAL` / `DECIMAL` を受け付け、同じ型を返す。
+  文字列など数値以外を渡すと `ROUND は数値を受け付けますが 'abc' です` になる。
 
 ### 6.7 条件式
 
@@ -460,13 +463,13 @@ SELECT name,
 
 ```sql
 SELECT [DISTINCT] 項目 [, 項目 …]
-  FROM テーブル [AS 別名]
-       [[INNER | LEFT] JOIN テーブル [AS 別名] ON 条件] …
+  FROM テーブル [[AS] 別名]
+       [[INNER | LEFT] JOIN テーブル [[AS] 別名] ON 条件] …
   [WHERE 条件]
   [GROUP BY 式 [, 式 …]]
   [HAVING 条件]
   [ORDER BY 式 [ASC|DESC] [, …]]
-  [LIMIT 整数 [OFFSET 整数]];
+  [LIMIT 整数] [OFFSET 整数];
 ```
 
 - **`FROM` は省略できない**。
@@ -561,11 +564,11 @@ SELECT id FROM t WHERE a = 1;                 -- 前置 1列の等値 → IndexL
 
 `ON` 句に左×右の等値条件がある場合、結合アルゴリズムを自動選択する。
 
-| 条件                                                                          | アルゴリズム             |
-| ----------------------------------------------------------------------------- | ------------------------ |
-| 左が小さい（`LIMIT` / 主キー等値 / `VALUES` で 32行以下）かつ右の結合列に索引 | インデックス入れ子ループ |
-| 左×右の等値条件がある（上記以外）                                             | ハッシュ結合             |
-| 等値条件がない（非等値など）                                                  | 入れ子ループ             |
+| 条件                                                                                    | アルゴリズム             |
+| --------------------------------------------------------------------------------------- | ------------------------ |
+| 左が小さい（`LIMIT` / 主キー等値 / `VALUES` で 32行以下）かつ右が `Scan` で結合列に索引 | インデックス入れ子ループ |
+| 左×右の等値条件がある（上記以外）                                                       | ハッシュ結合             |
+| 等値条件がない（非等値など）                                                            | 入れ子ループ             |
 
 - 等値キーは**列の型が一致する**ときだけ使う。
   型が違うと入れ子ループに落ちる。
@@ -591,7 +594,6 @@ SELECT p.id, d.dname
 
 ソートは外部マージ（`ExtSort`）で並べる。バジェット（既定 64 MiB）に収まる入力はメモリだけで、
 超過分は一時ファイル（`%TEMP%/rykdb-sort-*`）へ溢らしてから k-way merge する。
-並び方は `Array.sortWith`（不安定ソート）相当なので、
 同値な行の順序は保証されない（`ORDER BY` のキーが一意でないとき）。
 
 - ソートは全入力を消費してからでないと 1行も出せないため、比較不能な型があれば**その時点で** `TypeError` になる。
@@ -602,8 +604,7 @@ SELECT p.id, d.dname
 - 値は **0 以上の整数リテラル**（式・負数・範囲外は `SyntaxError`）。
 - 評価は最後に 1回だけ。
   `OFFSET` → `LIMIT` の順で適用される。
-- `LIMIT` だけの形か `LIMIT n OFFSET m` の形だけ書ける
-  （`OFFSET` 単独は不可）。
+- `LIMIT` / `OFFSET` はそれぞれ単独でも書ける（`OFFSET` 単独は `LIMIT` なし扱い）。
 - `LIMIT 0` は「0 行」を返す（スキャン自体を実行しない）。
 - **単純な全走査**（`WHERE` / `ORDER BY` / `GROUP BY` / `DISTINCT` / 結合なし）では、
   `OFFSET + LIMIT` の件数をストレージへ降ろす。
@@ -715,18 +716,17 @@ UPDATE テーブル SET 列 = 式 [, 列 = 式 …] [ WHERE 条件 ];
 
 ### 主キー列は更新できない
 
-主キー列を `SET` するとエラーになる（幽霊行を防ぐため）。
+主キー列を `SET` するとエラーになる（古い主キーの行が残って重複するため）。
 主キーを変えたい場合は `DELETE` + `INSERT` を使う。
 
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT);
 INSERT INTO t VALUES (1,'a'),(2,'b');
-UPDATE t SET id = 100 WHERE id = 1;   -- エラー
+UPDATE t SET id = 100 WHERE id = 1;   -- エラー（何も更新されない）
 
 SELECT id, n FROM t ORDER BY id;
--- 1, 'a'      ← 消えない
+-- 1, 'a'
 -- 2, 'b'
--- 100, 'a'    ← 複製された
 ```
 
 主キーを変えたい用途では `DELETE` + `INSERT` を使う。
@@ -890,8 +890,7 @@ ROLLBACK;        -- 削除を取り消し
 
 ### 暗黙のトランザクション
 
-`Begin()` していない状態の `Execute` / `Query` は、**1文ごとに**暗黙のトランザクションを開始して自動 commit する。
-`Query` は **SELECT 専用**（DDL / DML / `BEGIN` / `COMMIT` / `ROLLBACK` は `SyntaxError`）。
+`Begin()` していない状態の `Execute` は、**1文ごとに**暗黙のトランザクションを開始して自動 commit する。
 任意の SQL を実行するには `Execute` を使う。
 
 ```fsharp
@@ -917,7 +916,7 @@ let ok =
     | Ok v -> v
     | Error e -> failwith (DbError.toDisplayString e)
 
-let db  = ok (Database.openWith "./mydata")
+let db  = ok (Database.OpenWith "./mydata")
 let db1 = ok (db.Begin())                          // 明示トランザクション開始（Result）
 let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 10)")
 let db3 = ok (db2.Commit())                        // 確定
@@ -929,23 +928,22 @@ let db4 = db2.Rollback()                           // 破棄
   戻り値の `Database` を受け取り直さないと書き込みが見えない。
 - 入れ子の `Begin()` は何もしない
   （既にトランザクション中なら `this` を返す）。
-- `Query` は SELECT 専用。DDL / DML / transaction 制御は `Execute` を使う。
 - `Close()` 後のハンドルは破棄する。
   閉じた状態はハンドルに記録されないため同じハンドルを `Execute` すると WAL が再作成される
   （二重 `Close` は安全）。
 - `Database` は `IDisposable`。`use db = ...` / `Dispose()` は `Close()` と同じ経路
   （進行中 transaction の登録も外れる）。
 - **同じ DB を別プロセスから開くことはできない**。
-  `Database.openWith` は `<root>/.rykdb.lock` を排他で押さえ、
+  `Database.OpenWith` は `<root>/.rykdb.lock` を排他で押さえ、
   取れなければ `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.lock）`）を返す。
 - **同じ root を同じプロセスで二度開くこともできない**。
-  2回目の `Database.openWith` は `IoError`
+  2回目の `Database.OpenWith` は `IoError`
   （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）を返す。
   別の `RowStore` ができて memtable が分かれ、一方の commit が他方から見えないため。
   `Close()` してから開き直すこと。
 - snapshot はトランザクション開始時に固定される
   （repeatable read）。
-- 同一キーへ別トランザクションが未 commit のエントリを持つ場合、後続側は `ConflictError` になる
+- 自分の snapshot 取得後に別トランザクションが同じキーを commit していた場合、後続側は `ConflictError` になる
   （first-committer-wins）。
 
 ### CLI のドットコマンド
@@ -989,7 +987,7 @@ db> .rollback
 構文エラーには行番号が付く。
 
 ```
-エラー: FROM が必要ですが見つかりませんでした (位置 3 行)
+エラー: FROM が必要ですが見つかりませんでした (位置 1 行)
 ```
 
 ### よく見るメッセージ（実測）
@@ -998,7 +996,7 @@ db> .rollback
 | ----------------------------------------- | ----------------------------------------------------------- |
 | `SELECT 1;`                               | `FROM が必要ですが見つかりませんでした (位置 1 行)`         |
 | `SELECT * FROM t WHERE id > 1 AND;`       | `式が必要ですが見つかりませんでした (位置 1 行)`            |
-| `SELECT 'abc;`                            | `文字列が閉じられていません (位置 1 行)`                    |
+| `SELECT 'abc;`                            | `unclosed string (位置 1 行)`                               |
 | `SELECT id FROM nosuchtable;`             | `テーブル 'nosuchtable' が存在しません`                     |
 | `SELECT nosuchcol FROM t;`                | `'nosuchcol' は列でも関数でもありません`                    |
 | `CREATE TABLE t (a INTEGER);`             | `テーブル t に主キーがありません`                           |
@@ -1013,7 +1011,7 @@ db> .rollback
 | `SELECT LENGTH(id, n) FROM t;`            | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`    |
 | `SELECT NOSUCHFN(id) FROM t;`             | `未知のスカラー関数 'NOSUCHFN' です`                        |
 | `SELECT active = 1 FROM u;`               | `型 'BOOLEAN' と 'INTEGER' は比較できません`                |
-| `SELECT ROUND(salary) FROM t;`            | `ROUND は数値を受け付けますが 100.5 です`                   |
+| `SELECT ROUND(name) FROM t;`              | `ROUND は数値を受け付けますが 'abc' です`                   |
 
 ---
 

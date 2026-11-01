@@ -87,7 +87,7 @@ let ``テスト: 各テストモジュールが 1 つ以上の Fact を持つ`` 
             | _ -> None)
         |> Array.sort
 
-    Assert.True(modules.Length >= 26, sprintf "テストモジュールが %d 個しか見つかりません" modules.Length)
+    Assert.True(modules.Length >= 31, sprintf "テストモジュールが %d 個しか見つかりません" modules.Length)
 
     for moduleName in modules do
         let count = (namesOf moduleName).Length
@@ -95,16 +95,16 @@ let ``テスト: 各テストモジュールが 1 つ以上の Fact を持つ`` 
 
     // テスト名は Assembly に残るので、カテゴリ名が消えていないか確認する。
     Assert.True(
-        (namesOf "RykDb.DatabaseTests") |> Array.exists (fun n -> n.Contains "E2E"),
+        namesOf "RykDb.DatabaseTests" |> Array.exists (fun n -> n.Contains "E2E"),
         "DatabaseTests に E2E のテストが見つかりません"
     )
 
     Assert.True(
-        (namesOf "RykDb.DatabaseTests") |> Array.exists (fun n -> n.Contains "性能"),
+        namesOf "RykDb.DatabaseTests" |> Array.exists (fun n -> n.Contains "性能"),
         "DatabaseTests に性能のテストが見つかりません"
     )
 
     Assert.True(
-        (namesOf "RykDb.ServerTests") |> Array.exists (fun n -> n.Contains "TCP"),
+        namesOf "RykDb.ServerTests" |> Array.exists (fun n -> n.Contains "TCP"),
         "ServerTests に TCP のテストが見つかりません"
     )

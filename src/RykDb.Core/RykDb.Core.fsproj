@@ -22,16 +22,19 @@
     <Compile Include="Ast.fs" />
     <Compile Include="Lexer.fs" />
     <Compile Include="Parser.fs" />
-    <Compile Include="Op.fs" />
+    <Compile Include="CommitIntent.fs" />
+    <Compile Include="ProcessLock.fs" />
     <Compile Include="RowStore.fs" />
     <Compile Include="Catalog.fs" />
-    <Compile Include="Schema.fs" />
     <Compile Include="Eval.fs" />
+    <Compile Include="Op.fs" />
     <Compile Include="ExtSort.fs" />
     <Compile Include="Ops.fs" />
+    <Compile Include="Dml.fs" />
     <Compile Include="ExecContext.fs" />
     <Compile Include="Analyzer.fs" />
     <Compile Include="Planner.fs" />
+    <Compile Include="DropCleanup.fs" />
     <Compile Include="Engine.fs" />
     <Compile Include="Database.fs" />
   </ItemGroup>

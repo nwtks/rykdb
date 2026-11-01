@@ -1,5 +1,110 @@
 namespace RykDb.Core
 
+/// 1つの SSTable のメタデータ。
+type internal FileMetaData =
+    {
+        FileNumber: int64
+        Level: int
+        /// このファイルが持つ最小キー
+        Smallest: byte array
+        /// このファイルが持つ最大キー
+        Largest: byte array
+        EntryCount: int64
+        /// ファイルサイズ（バイト）
+        Size: int64
+        /// このファイルに含まれる SeqNo の最大値。
+        /// GC の判定に使う：
+        /// 「最古の active snapshot より小さい SeqNo の版はもう誰にも見えないので捨てられる」ために使う。
+        MaxSeqNo: uint64
+    }
+
+module internal FileMetaData =
+    /// SSTable ファイルの拡張子。
+    [<Literal>]
+    let SstExtension = ".sst"
+
+    /// キー範囲も件数も未確定の空メタデータ。
+    /// デコード途中の「番号とレベルだけ分かった」状態や、「compaction なし」の報告に使う
+    /// （フィールドは上書きする）。
+    let Zero =
+        {
+            FileNumber = 0L
+            Level = 0
+            Smallest = [||]
+            Largest = [||]
+            EntryCount = 0L
+            Size = 0L
+            MaxSeqNo = 0UL
+        }
+
+    /// SSTable のフルパス。
+    let path (dir: string) (fileNumber: int64) =
+        let fileName fileNumber =
+            sprintf "%06d%s" fileNumber SstExtension
+
+        System.IO.Path.Combine(dir, fileName fileNumber)
+
+    /// エントリ列を SSTable としてファイルへストリーム書きし、メタデータを返す。
+    /// ブロックは 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
+    /// ビルド・書き出し・メタ算出が 1つの経路を通るので、「書いたバイト数」と Size が食い違うことが無い。
+    let writeSstable
+        (dir: string)
+        (fileNumber: int64)
+        (level: int)
+        (bloomFalsePositiveRate: float)
+        (entries: SstEntry array)
+        =
+        let ofChunk fileNumber level size (entries: SstEntry array) =
+            {
+                FileNumber = fileNumber
+                Level = level
+                Smallest = entries.[0].Key
+                Largest = entries.[entries.Length - 1].Key
+                EntryCount = int64 entries.Length
+                Size = size
+                MaxSeqNo = SstEntry.maxSeqNo entries
+            }
+
+        result {
+            if entries.Length = 0 then
+                return! err (DbError.internalError "Sstable: 空のエントリ列は書き出せません")
+
+            do! Sstable.validate entries
+
+            let! size =
+                protect (fun () ->
+                    use fs =
+                        new System.IO.FileStream(
+                            path dir fileNumber,
+                            System.IO.FileMode.Create,
+                            System.IO.FileAccess.Write,
+                            System.IO.FileShare.None
+                        )
+
+                    Sstable.writeTo fs bloomFalsePositiveRate entries
+                    >>= fun size ->
+                        fs.Flush true
+                        ret size)
+                >>= id
+
+            return ofChunk fileNumber level size entries
+        }
+
+    /// このファイルが [key] を持ち得るか（Bloom より粗い判定）。
+    let mightContain (key: byte array) (f: FileMetaData) =
+        Bytes.compare f.Smallest key <= 0 && Bytes.compare key f.Largest <= 0
+
+    /// ファイルを実際に削除する。
+    let deleteObsolete (dir: string) (files: FileMetaData list) =
+        let deleteFile dir fileNumber =
+            protect (fun () ->
+                let p = path dir fileNumber
+
+                if System.IO.File.Exists p then
+                    System.IO.File.Delete p)
+
+        files |> foldOk (fun () f -> deleteFile dir f.FileNumber) ()
+
 /// LSM のレベル設定。
 module internal Levels =
     /// レベル数。
@@ -190,7 +295,7 @@ module internal VersionEdit =
                 ret (List.rev added, List.rev deleted)
             else
                 match step c with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(c', f, isAdded) ->
                     if isAdded then
                         readFiles c' (f :: added) deleted

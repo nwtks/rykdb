@@ -25,9 +25,6 @@ module internal Snapshot =
     /// この snapshot から見える SeqNo か（Option で「制限なし」を表す）。
     let toVisible (snap: Snapshot) = Some snap.SeqNo
 
-    /// 制限なし。
-    let NoLimit: uint64 option = None
-
 /// 書き込み中の transaction。
 /// commit まで DB から見えない。
 type internal Transaction =
@@ -85,18 +82,18 @@ module internal Transaction =
         }
 
     /// 値を書き込む（バッファに積む）。
-    let put (keyspace: string) (key: byte array) (value: SqlValue array) (txn: Transaction) =
-        setSlot keyspace key (Some value) txn
+    let put (keyspace: string) (key: byte array) (value: SqlValue array) = setSlot keyspace key (Some value)
 
     /// 削除を書き込む（バッファに積む）。
-    let remove (keyspace: string) (key: byte array) (txn: Transaction) = setSlot keyspace key None txn
+    let remove (keyspace: string) (key: byte array) = setSlot keyspace key None
 
     /// バッファが上限を超えているか。
     let isOverLimit (txn: Transaction) = txn.ApproxBytes > txn.LimitBytes
 
     /// 上限超過時のエラー。
     let overLimitError (txn: Transaction) =
-        DbError.capacity (sprintf "transaction の書き込みバッファが上限（%d バイト）を超えました" txn.LimitBytes)
+        sprintf "transaction の書き込みバッファが上限（%d バイト）を超えました" txn.LimitBytes
+        |> DbError.capacity
 
     /// 上限内なら transaction を返し、超えていれば CapacityError。
     let checkLimit (txn: Transaction) =
@@ -126,8 +123,8 @@ module internal Transaction =
     let writeKeys (txn: Transaction) =
         txn.Buffers
         |> Map.toList
-        |> List.collect (fun (ks, m) -> m |> Map.toList |> List.map (fun (k, _) -> conflictKey ks k))
-        |> Set.ofList
+        |> Seq.collect (fun (ks, m) -> m |> Map.keys |> Seq.map (conflictKey ks))
+        |> Set.ofSeq
 
     /// バッファを keyspace ごとに「SeqNo 降順で採番済みの Entry 配列」に変換する。
     /// 採番は nextSeqNo から 1つずつ採番する。
@@ -196,40 +193,43 @@ module internal TransactionManager =
         }
 
     /// 指定した上限で transaction を始める。
-    let beginTxnWithLimit (limit: int64 option) (mgr: TransactionManager) =
-        let snap = { Snapshot.SeqNo = mgr.LastCommitSeqNo }
+    let beginTxnWithLimit (limit: int64 option) (manager: TransactionManager) =
+        let snap =
+            {
+                Snapshot.SeqNo = manager.LastCommitSeqNo
+            }
 
         let txn =
-            { Transaction.create mgr.NextTxnId snap with
-                LimitBytes = Option.defaultValue mgr.MaxTransactionBytes limit
+            { Transaction.create manager.NextTxnId snap with
+                LimitBytes = Option.defaultValue manager.MaxTransactionBytes limit
             }
 
         let record = { Txn = txn; Keys = Set.empty }
 
         let updated =
-            { mgr with
-                NextTxnId = mgr.NextTxnId + 1UL
-                Active = Map.add mgr.NextTxnId record mgr.Active
+            { manager with
+                NextTxnId = manager.NextTxnId + 1UL
+                Active = Map.add manager.NextTxnId record manager.Active
             }
 
         updated, txn
 
     /// 現在の「DB の時刻」で transaction を始める。
-    let beginTxn (mgr: TransactionManager) = beginTxnWithLimit None mgr
+    let beginTxn = beginTxnWithLimit None
 
     /// GC の境界になる最古の active snapshot。
     /// active な transaction が無ければ「次の commit で採番される SeqNo」を返す
     /// （現在の最後の commit までは誰も見ないので、古い版を捨てられる）。
-    let activeSnapshot (mgr: TransactionManager) =
+    let activeSnapshot (manager: TransactionManager) =
         let oldest =
-            mgr.Active
+            manager.Active
             |> Map.fold (fun acc _ record -> min acc record.Txn.Snapshot.SeqNo) System.UInt64.MaxValue
 
         if oldest = System.UInt64.MaxValue then
-            if mgr.LastCommitSeqNo = System.UInt64.MaxValue then
-                mgr.LastCommitSeqNo
+            if manager.LastCommitSeqNo = System.UInt64.MaxValue then
+                manager.LastCommitSeqNo
             else
-                mgr.LastCommitSeqNo + 1UL
+                manager.LastCommitSeqNo + 1UL
         else
             oldest
 
@@ -243,7 +243,7 @@ module internal TransactionManager =
     ///    「全部の active snapshot 以降に commit された版」以外は捨てられる。
     ///    捨てないと書き込んだ全キーがプロセス寿命の間メモリに残り続ける。
     /// 返り値の Entry 配列を StorageEngine に流し込むと DB に反映される。
-    let commit (txn: Transaction) (mgr: TransactionManager) =
+    let commit (txn: Transaction) (manager: TransactionManager) =
         let findConflicts txn lastCommitted snapSeq =
             Transaction.writeKeys txn
             |> Set.toList
@@ -267,12 +267,12 @@ module internal TransactionManager =
                         acc)
                 lastCommitted
 
-        if not (Map.containsKey txn.TxnId mgr.Active) then
+        if not (Map.containsKey txn.TxnId manager.Active) then
             err (sprintf "Transaction %d が存在しません" txn.TxnId |> DbError.internalError)
         elif Transaction.isOverLimit txn then
             err (Transaction.overLimitError txn)
         else
-            let conflicting = findConflicts txn mgr.LastCommitted txn.Snapshot.SeqNo
+            let conflicting = findConflicts txn manager.LastCommitted txn.Snapshot.SeqNo
 
             if not (List.isEmpty conflicting) then
                 err (
@@ -280,13 +280,13 @@ module internal TransactionManager =
                     |> DbError.conflict
                 )
             else
-                let batches, nextSeq = Transaction.toEntries mgr.NextSeqNo txn
-                let committed = updateLastCommitted mgr.LastCommitted batches
+                let batches, nextSeq = Transaction.toEntries manager.NextSeqNo txn
+                let committed = updateLastCommitted manager.LastCommitted batches
                 let commitSeq = nextSeq - 1UL
 
                 let staged =
-                    { mgr with
-                        Active = Map.remove txn.TxnId mgr.Active
+                    { manager with
+                        Active = Map.remove txn.TxnId manager.Active
                     }
 
                 let gcThreshold = activeSnapshot staged
@@ -299,13 +299,13 @@ module internal TransactionManager =
                         LastCommitSeqNo = commitSeq
                     }
 
-                Ok(updated, commitSeq, batches)
+                ret (updated, commitSeq, batches)
 
     /// transaction を破棄する（abort）。
     /// バッファは捨てられるので DB には何も残らない。
-    let abort (txn: Transaction) (mgr: TransactionManager) =
-        { mgr with
-            Active = Map.remove txn.TxnId mgr.Active
+    let abort (txn: Transaction) (manager: TransactionManager) =
+        { manager with
+            Active = Map.remove txn.TxnId manager.Active
         }
 
 /// 同じ DB を指す root 表記の揺れ（相対・絶対・末尾の /）を吸収する。
@@ -376,7 +376,7 @@ module internal ActiveSnapshotRegistry =
     /// snapshot を登録し、解除に使う登録を返す。
     let register (root: string) (snapshot: uint64) =
         let key = RootKey.normalize root
-        let registration = ActiveRegistration(key)
+        let registration = ActiveRegistration key
         (bucket key).[registration] <- snapshot
         registration
 
@@ -395,15 +395,15 @@ module internal ActiveSnapshotRegistry =
 
     /// その root で active な snapshot の最小値。
     /// registration に自分の登録を渡すと、これから commit する transaction 自身を除外できる。
-    let oldestExcept (root: string) (self: ActiveRegistration option) =
+    let oldestExcept (root: string) (registration: ActiveRegistration option) =
         match ByRoot.TryGetValue(RootKey.normalize root) with
         | true, inner ->
             inner
             |> Seq.fold
                 (fun acc pair ->
                     let isSelf =
-                        match self with
-                        | Some registration -> System.Object.ReferenceEquals(registration, pair.Key)
+                        match registration with
+                        | Some reg -> System.Object.ReferenceEquals(reg, pair.Key)
                         | None -> false
 
                     if isSelf then

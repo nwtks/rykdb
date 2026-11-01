@@ -160,10 +160,10 @@ module internal Compaction =
 
         let rec openAll files scans =
             match files with
-            | [] -> Ok(List.rev scans |> List.toArray)
+            | [] -> ret (List.rev scans |> List.toArray)
             | f :: rest ->
                 match openScan f with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok scan -> openAll rest (scan :: scans)
 
         let rec keepOlder newest rest kept dropped keptVisible =
@@ -187,21 +187,20 @@ module internal Compaction =
             match SstMerge.top m with
             | Some e when Bytes.compare e.Key newest.Key = 0 ->
                 match SstMerge.next m with
-                | Error e -> Error e
-                | Ok None -> Ok(m, List.rev acc)
+                | Error e -> err e
+                | Ok None -> ret (m, List.rev acc)
                 | Ok(Some(nxt, rest)) -> gather newest rest (nxt :: acc)
-            | _ -> Ok(m, List.rev acc)
+            | _ -> ret (m, List.rev acc)
 
         let nextGroup dropTombstones merge =
             match SstMerge.next merge with
-            | Error e -> Error e
-            | Ok None -> Ok None
+            | Error e -> err e
+            | Ok None -> ret None
             | Ok(Some(newest, afterNewest)) ->
-                match gather newest afterNewest [] with
-                | Error e -> Error e
-                | Ok(rest, older) ->
+                gather newest afterNewest []
+                >>= fun (rest, older) ->
                     let kept, dropped, tombstones = gcGroup dropTombstones older newest
-                    Ok(Some(kept, dropped, tombstones, rest))
+                    ret (Some(kept, dropped, tombstones, rest))
 
         let flushChunk plan chunk fileNumber =
             match chunk with
@@ -236,7 +235,7 @@ module internal Compaction =
             droppedTombstones
             =
             match nextGroup dropTombstones merge with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok None ->
                 flushChunk plan chunk fileNumber
                 |> Result.map (fun last ->
@@ -255,9 +254,9 @@ module internal Compaction =
                     && chunkBytes + keptBytes > options.OutputFileTargetBytes
                 then
                     match flushChunk plan chunk fileNumber with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok meta ->
-                        let added =
+                        let added' =
                             match meta with
                             | Some m -> m :: added
                             | None -> added
@@ -270,7 +269,7 @@ module internal Compaction =
                             (List.rev kept)
                             keptBytes
                             (fileNumber + 1L)
-                            added
+                            added'
                             (droppedVersions + dropped)
                             (droppedTombstones + tombstones)
                 else

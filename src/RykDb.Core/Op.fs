@@ -125,8 +125,8 @@ module internal Op =
 
         let rec drain cur =
             match next cur with
-            | Error e -> Error e
-            | Ok None -> Ok(rows.ToArray())
+            | Error e -> err e
+            | Ok None -> ret (rows.ToArray())
             | Ok(Some(row, nxt)) ->
                 rows.Add row
                 drain nxt

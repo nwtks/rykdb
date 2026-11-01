@@ -20,12 +20,10 @@ open RykDb.TestHelpers
 /// 完了を待たずに Close すると、サーバが DB を触っている間に削除して落ちる。
 let private withServer (f: RykDbClient -> unit) =
     let dir = newDir "tcp"
-    let db = ok (Database.openWith dir)
-
+    let db = ok (Database.OpenWith dir)
     // port 0 = OS が空いているポートを割り当てる。
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
-
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
     let cts = new CancellationTokenSource()
     let finished = new ManualResetEventSlim false
@@ -44,7 +42,6 @@ let private withServer (f: RykDbClient -> unit) =
     finally
         // 1) 接続を閉じる（サーバの `ReadLine` を解放する）
         client.Close()
-
         // 2) 停止を要請する
         cts.Cancel()
 
@@ -53,7 +50,6 @@ let private withServer (f: RykDbClient -> unit) =
             Assert.Fail "サーバが 10 秒以内に停止しませんでした"
 
         cts.Dispose()
-
         // 4) flush してからディレクトリを消す
         db.Close() |> ignore
 
@@ -79,32 +75,31 @@ let private okRows (r: Reply) =
 let ``TCP: loopback で SQL が通る`` () =
     withServer (fun client ->
         let cols, _ =
-            okRows (client.Query "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            okRows (client.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
 
         Assert.Equal<string list>([], cols)
-        okRows (client.Query "INSERT INTO t VALUES (1, 'a'), (2, 'b')") |> ignore
 
-        let cols, rows = okRows (client.Query "SELECT id, name FROM t ORDER BY id")
-
+        okRows (client.Send "INSERT INTO t VALUES (1, 'a'), (2, 'b')") |> ignore
+        let cols, rows = okRows (client.Send "SELECT id, name FROM t ORDER BY id")
         Assert.Equal<string list>([ "id"; "name" ], cols)
         Assert.Equal<string list>([ "1,'a'"; "2,'b'" ], rows)
 
         // 集約も通る
-        let _, rows = okRows (client.Query "SELECT COUNT(*) FROM t")
+        let _, rows = okRows (client.Send "SELECT COUNT(*) FROM t")
         Assert.Equal<string list>([ "2" ], rows)
 
         // エラーは ERR で返る（HALT しない）
-        match client.Query "SELECT * FROM nope" with
+        match client.Send "SELECT * FROM nope" with
         | Failure m -> Assert.Contains("nope", m)
         | other -> Assert.Fail(sprintf "ERR を期待しましたが: %A" other)
 
         // ping
-        let cols, _ = okRows (client.Query ".ping")
+        let cols, _ = okRows (client.Send ".ping")
         Assert.Equal<string list>([ "pong" ], cols)
 
         // 終了
         Assert.True(
-            match client.Query ".exit" with
+            match client.Send ".exit" with
             | Halt -> true
             | _ -> false
         ))
@@ -112,20 +107,19 @@ let ``TCP: loopback で SQL が通る`` () =
 [<Fact>]
 let ``TCP: 0行の SELECT でも列名を返す`` () =
     withServer (fun client ->
-        okRows (client.Query "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        okRows (client.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
         |> ignore
 
-        let cols, rows = okRows (client.Query "SELECT id, name FROM t WHERE id = 999")
+        let cols, rows = okRows (client.Send "SELECT id, name FROM t WHERE id = 999")
         Assert.Equal<string list>([ "id"; "name" ], cols)
         Assert.Empty rows)
 
 [<Fact>]
 let ``TCP: カンマを含む列名も正しく返す`` () =
     withServer (fun client ->
-        okRows (client.Query "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
-        okRows (client.Query "INSERT INTO t VALUES (1)") |> ignore
-
-        let cols, rows = okRows (client.Query "SELECT id AS \"a,b\" FROM t")
+        okRows (client.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        okRows (client.Send "INSERT INTO t VALUES (1)") |> ignore
+        let cols, rows = okRows (client.Send "SELECT id AS \"a,b\" FROM t")
         Assert.Equal<string list>([ "a,b" ], cols)
         Assert.Equal<string list>([ "1" ], rows))
 
@@ -156,7 +150,7 @@ let ``TCP: ライブラリ API と同じ結果が返る`` () =
                 let next, r = ok (db0.Execute sql)
                 run next tail ((r.Columns |> Array.toList, rowText r) :: acc)
 
-        let db = ok (Database.openWith dir)
+        let db = ok (Database.OpenWith dir)
         let libResults = run db script []
         ok (db.Close())
 
@@ -165,7 +159,7 @@ let ``TCP: ライブラリ API と同じ結果が返る`` () =
             let tcpResults =
                 script
                 |> List.map (fun sql ->
-                    let cols, rows = okRows (client.Query sql)
+                    let cols, rows = okRows (client.Send sql)
                     cols, rows)
 
             Assert.Equal<int>(script.Length, libResults.Length)
@@ -191,11 +185,10 @@ let ``TCP: ライブラリ API と同じ結果が返る`` () =
 let ``TCP: .tables はテーブル名を返す`` () =
     withServer (fun client ->
         // テーブルが無いときは空
-        Assert.Equal<string list>([], fst (okRows (client.Query ".tables")))
+        Assert.Equal<string list>([], fst (okRows (client.Send ".tables")))
 
-        okRows (client.Query "CREATE TABLE zzz (id INTEGER PRIMARY KEY)") |> ignore
-
-        let cols, rows = okRows (client.Query ".tables")
+        okRows (client.Send "CREATE TABLE zzz (id INTEGER PRIMARY KEY)") |> ignore
+        let cols, rows = okRows (client.Send ".tables")
         Assert.Equal<string list>([ "tables" ], cols)
         // 行は SqlLiteral 表記（文字列は引用符つき）で返る
         Assert.Contains("'zzz'", rows))
@@ -203,7 +196,7 @@ let ``TCP: .tables はテーブル名を返す`` () =
 [<Fact>]
 let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` () =
     let dir = newDir "tcp-raw"
-    let db = ok (Database.openWith dir)
+    let db = ok (Database.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -261,7 +254,7 @@ let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` 
 [<Fact>]
 let ``TCP: 突然の切断（RST）でもサーバは生き続ける`` () =
     let dir = newDir "tcp-rst"
-    let db = ok (Database.openWith dir)
+    let db = ok (Database.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -322,7 +315,6 @@ let ``TCP: Client を二度閉じても落ちない`` () =
         // IDisposable 経由も同じ経路
         (client :> System.IDisposable).Dispose())
 
-
 /// 1 接続だけ受けて、行ごとに respond の応答を返す偽サーバでテストする。
 let private withFakeServer (respond: string -> string option) (f: int -> unit) =
     let listener = new TcpListener(IPAddress.Loopback, 0)
@@ -357,7 +349,7 @@ let ``Client: 不正な短い OK は Failure`` () =
     withFakeServer (fun _ -> Some "OK") (fun port ->
         use c = new RykDbClient("127.0.0.1", port)
 
-        match c.Query "x" with
+        match c.Send "x" with
         | Failure _ -> ()
         | other -> Assert.Fail(sprintf "Failure ではない: %A" other))
 
@@ -366,7 +358,7 @@ let ``Client: 不正な件数は Failure`` () =
     withFakeServer (fun _ -> Some "OK abc\tcol") (fun port ->
         use c = new RykDbClient("127.0.0.1", port)
 
-        match c.Query "x" with
+        match c.Send "x" with
         | Failure _ -> ()
         | other -> Assert.Fail(sprintf "Failure ではない: %A" other))
 
@@ -376,7 +368,7 @@ let ``Client: 応答の列と行を読む`` () =
         // IDisposable 経由の Close もここで通る
         use c = new RykDbClient("127.0.0.1", port)
 
-        match c.Query "x" with
+        match c.Send "x" with
         | Rows([ "c1"; "c2" ], [ "1,2"; "3,4" ]) -> ()
         | other -> Assert.Fail(sprintf "行列が一致しない: %A" other))
 
@@ -397,7 +389,7 @@ let ``Client: 接続が RST で切れたら Halt`` () =
     try
         use c = new RykDbClient("127.0.0.1", port)
 
-        match c.Query "x" with
+        match c.Send "x" with
         | Halt -> ()
         | other -> Assert.Fail(sprintf "Halt ではない: %A" other)
     finally
@@ -407,7 +399,7 @@ let ``Client: 接続が RST で切れたら Halt`` () =
 [<Fact>]
 let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコルを壊さない`` () =
     let dir = newDir "tcp-newline"
-    let db = ok (Database.openWith dir)
+    let db = ok (Database.OpenWith dir)
     let db, _ = ok (db.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
 
     let db, _ =
@@ -453,8 +445,7 @@ let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコル
 
         // クライアント API はエスケープを戻すので、ライブラリと同じ値が見える。
         use client = new RykDbClient("127.0.0.1", port)
-        let _, rows = okRows (client.Query "SELECT id, v FROM t ORDER BY id")
-
+        let _, rows = okRows (client.Send "SELECT id, v FROM t ORDER BY id")
         Assert.Equal<string list>([ "1,'a\nb'"; "2,'c\rd'"; "3,'C:\\temp'" ], rows)
     finally
         cts.Cancel()
@@ -471,7 +462,7 @@ let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコル
 [<Fact>]
 let ``TCP: 切断時に open transaction は rollback される`` () =
     let dir = newDir "tcp-rollback"
-    let db = ok (Database.openWith dir)
+    let db = ok (Database.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -508,7 +499,7 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
 
         // 次の接続では rollback 済みで、行は見えない。
         use client = new RykDbClient("127.0.0.1", port)
-        let _, rows = okRows (client.Query "SELECT COUNT(*) FROM t")
+        let _, rows = okRows (client.Send "SELECT COUNT(*) FROM t")
         Assert.Equal<string list>([ "0" ], rows)
     finally
         cts.Cancel()

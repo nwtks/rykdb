@@ -109,7 +109,7 @@ module internal SstScan =
     let toArray (scan: SstScan) =
         let rec drain acc cur =
             match next cur with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok None -> List.rev acc |> Array.ofList |> ret
             | Ok(Some(e, nxt)) -> drain (e :: acc) nxt
 
@@ -192,9 +192,9 @@ module internal SstMerge =
     let ofScans (scans: SstScan array) =
         let ofScan source scan =
             match SstScan.next scan with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok None -> ret Empty
-            | Ok(Some(entry, rest)) -> Ok(insert source entry rest Empty)
+            | Ok(Some(entry, rest)) -> ret (insert source entry rest Empty)
 
         let union (SstMerge a) (SstMerge b) = SstMerge(mergeHeaps a b)
 
@@ -203,7 +203,7 @@ module internal SstMerge =
                 ret merge
             else
                 match ofScan i scans.[i] with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok more -> add (i + 1) (union merge more)
 
         add 0 Empty
@@ -221,8 +221,8 @@ module internal SstMerge =
         | MergeEmpty -> ret None
         | MergeNode(_, head, left, right) ->
             match SstScan.next head.Scan with
-            | Error e -> Error e
-            | Ok None -> Ok(Some(head.Entry, SstMerge(mergeHeaps left right)))
+            | Error e -> err e
+            | Ok None -> ret (Some(head.Entry, SstMerge(mergeHeaps left right)))
             | Ok(Some(entry, rest)) ->
                 let advanced =
                     {
@@ -234,7 +234,7 @@ module internal SstMerge =
                 let restHeap =
                     mergeHeaps left (mergeHeaps right (MergeNode(1, advanced, MergeEmpty, MergeEmpty)))
 
-                Ok(Some(head.Entry, SstMerge restHeap))
+                ret (Some(head.Entry, SstMerge restHeap))
 
 /// 索引の 1要素。
 /// 各ブロックの位置と長さを張る。
@@ -484,7 +484,7 @@ module internal Sstable =
                 ret (offset, List.rev indexEntries)
             else
                 match writeBlock blocks.[index] offset indexEntries with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(nextOffset, entries') -> writeBlocks blocks (index + 1) nextOffset entries'
 
         let metaBytesOf =
@@ -579,7 +579,7 @@ module internal Sstable =
                 ret (List.toArray (List.rev acc))
             else
                 match step c state with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(c', item, state') -> readAll c' state' (item :: acc)
 
         readAll c state []
@@ -669,17 +669,15 @@ module internal Sstable =
                 ret info
 
         let parseFooterBytes footerBytes footerStart =
-            match readFooterFields footerBytes with
-            | Error e -> Error e
-            | Ok(magic, info) -> validateFooter info magic footerStart
+            readFooterFields footerBytes
+            >>= fun (magic, info) -> validateFooter info magic footerStart
 
         let readAll stream =
             match readFooter stream FooterSize with
-            | None -> Error(DbError.corruption "Sstable: Footer がありません")
+            | None -> err (DbError.corruption "Sstable: Footer がありません")
             | Some(footerStart, footerBytes) ->
-                match parseFooterBytes footerBytes footerStart with
-                | Error e -> Error e
-                | Ok footer ->
+                parseFooterBytes footerBytes footerStart
+                >>= fun footer ->
                     let metaBytes = readRegion stream (int64 footer.MetaOff) footer.MetaLen
                     let bloomBytes = readRegion stream (int64 footer.BloomOff) footer.BloomLen
                     let indexBytes = readRegion stream (int64 footer.IndexOff) footer.IndexLen
@@ -816,12 +814,12 @@ module internal Sstable =
             elif i < batchEnd then
                 SstScan(fun () ->
                     match parseRawBlock raw startOffset i with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok entries -> SstScan.next (scanEntries raw startOffset batchEnd 0 count (i + 1) entries))
             else
                 SstScan(fun () ->
                     match readRawBatch i with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok(raw, startOffset, batchEnd) -> SstScan.next (loadBlock raw startOffset batchEnd count i))
 
         let startBlock = search 0 partial.Index.Length
@@ -830,9 +828,8 @@ module internal Sstable =
             SstScan.Empty
         else
             SstScan(fun () ->
-                match readRawBatch startBlock with
-                | Error e -> Error e
-                | Ok(raw, startOffset, batchEnd) -> SstScan.next (loadBlock raw startOffset batchEnd 0 startBlock))
+                readRawBatch startBlock
+                >>= fun (raw, startOffset, batchEnd) -> SstScan.next (loadBlock raw startOffset batchEnd 0 startBlock))
 
     /// 部分読みで 1キーを検索する。
     /// 同一キーの複数版は SeqNo 降順で並ぶので、最初の可視版を返す。
@@ -886,7 +883,7 @@ module internal Sstable =
                     ret None
                 else
                     match readBlockPartial partial.Index.[i] with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok block -> find i 0 (Some block)
             | Some block ->
                 if j >= block.Length then
@@ -910,109 +907,3 @@ module internal Sstable =
             ret None
         else
             find (search 0 partial.Index.Length) 0 None
-
-/// 1つの SSTable のメタデータ。
-type internal FileMetaData =
-    {
-        FileNumber: int64
-        Level: int
-        /// このファイルが持つ最小キー
-        Smallest: byte array
-        /// このファイルが持つ最大キー
-        Largest: byte array
-        EntryCount: int64
-        /// ファイルサイズ（バイト）
-        Size: int64
-        /// このファイルに含まれる SeqNo の最大値。
-        /// GC の判定に使う：
-        /// 「最古の active snapshot より小さい SeqNo の版はもう誰にも見えないので捨てられる」ために使う。
-        MaxSeqNo: uint64
-    }
-
-module internal FileMetaData =
-    /// SSTable ファイルの拡張子。
-    [<Literal>]
-    let SstExtension = ".sst"
-
-    /// キー範囲も件数も未確定の空メタデータ。
-    /// デコード途中の「番号とレベルだけ分かった」状態や、「compaction なし」の報告に使う
-    /// （フィールドは上書きする）。
-    let Zero =
-        {
-            FileNumber = 0L
-            Level = 0
-            Smallest = [||]
-            Largest = [||]
-            EntryCount = 0L
-            Size = 0L
-            MaxSeqNo = 0UL
-        }
-
-    /// SSTable のフルパス。
-    let path (dir: string) (fileNumber: int64) =
-        let fileName fileNumber =
-            sprintf "%06d%s" fileNumber SstExtension
-
-        System.IO.Path.Combine(dir, fileName fileNumber)
-
-    /// エントリ列を SSTable としてファイルへストリーム書きし、メタデータを返す。
-    /// ブロックは 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
-    /// ビルド・書き出し・メタ算出が 1つの経路を通るので、「書いたバイト数」と Size が食い違うことが無い。
-    let writeSstable
-        (dir: string)
-        (fileNumber: int64)
-        (level: int)
-        (bloomFalsePositiveRate: float)
-        (entries: SstEntry array)
-        =
-        let ofChunk fileNumber level size (entries: SstEntry array) =
-            {
-                FileNumber = fileNumber
-                Level = level
-                Smallest = entries.[0].Key
-                Largest = entries.[entries.Length - 1].Key
-                EntryCount = int64 entries.Length
-                Size = size
-                MaxSeqNo = SstEntry.maxSeqNo entries
-            }
-
-        result {
-            if entries.Length = 0 then
-                return! err (DbError.internalError "Sstable: 空のエントリ列は書き出せません")
-
-            do! Sstable.validate entries
-
-            let! size =
-                protect (fun () ->
-                    use fs =
-                        new System.IO.FileStream(
-                            path dir fileNumber,
-                            System.IO.FileMode.Create,
-                            System.IO.FileAccess.Write,
-                            System.IO.FileShare.None
-                        )
-
-                    match Sstable.writeTo fs bloomFalsePositiveRate entries with
-                    | Error e -> Error e
-                    | Ok size ->
-                        fs.Flush true
-                        Ok size)
-                >>= id
-
-            return ofChunk fileNumber level size entries
-        }
-
-    /// このファイルが [key] を持ち得るか（Bloom より粗い判定）。
-    let mightContain (key: byte array) (f: FileMetaData) =
-        Bytes.compare f.Smallest key <= 0 && Bytes.compare key f.Largest <= 0
-
-    /// ファイルを実際に削除する。
-    let deleteObsolete (dir: string) (files: FileMetaData list) =
-        let deleteFile dir fileNumber =
-            protect (fun () ->
-                let p = path dir fileNumber
-
-                if System.IO.File.Exists p then
-                    System.IO.File.Delete p)
-
-        files |> foldOk (fun () f -> deleteFile dir f.FileNumber) ()

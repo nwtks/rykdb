@@ -292,7 +292,7 @@ module internal Optimizer =
     [<TailCall>]
     let rec private run (ctx: ExecContext) (frames: ExecFrame list) (step: ExecStep) =
         let defaultSchema ctx name =
-            match ExecContext.schemaOf ctx name with
+            match ExecContext.schemaOf name ctx with
             | Ok s -> s
             | Error _ ->
                 {
@@ -438,7 +438,7 @@ module internal Optimizer =
             | Logical.Values values -> run ctx frames (ApplyOp(Op.ofRow values))
             | Logical.Scan(name, method) ->
                 match execScan ctx hint name method with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok op -> run ctx frames (ApplyOp op)
             | Logical.Filter(p, child) ->
                 let childSchema = outputOf inSchema child
@@ -480,7 +480,7 @@ module internal Optimizer =
                 | FilterFrame(p, childSchema) -> run ctx rest (ApplyOp(Ops.filter childSchema op p))
                 | AggregateFrame(groupBy, aggs, inSchema) ->
                     match Ops.aggregate inSchema op groupBy aggs with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok aggregated -> run ctx rest (ApplyOp aggregated)
                 | HavingFrame(h, aggs, groupBy) ->
                     let p = Ops.havingFilter groupBy aggs h
@@ -488,7 +488,7 @@ module internal Optimizer =
                 | DistinctFrame -> run ctx rest (ApplyOp(Ops.distinct op))
                 | SortFrame(keys, childSchema) ->
                     match Ops.sortBy childSchema op keys with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok sorted -> run ctx rest (ApplyOp sorted)
                 | LimitFrame(offset, limit) ->
                     let skipped = if offset > 0 then Op.skip offset op else op
@@ -531,7 +531,7 @@ module internal Optimizer =
                     run ctx (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
                 | JoinApplyFrame(frame, leftOp) ->
                     match execJoin leftOp op frame with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok joined -> run ctx rest (ApplyOp joined)
 
     /// 論理代数を Op に落とす。
@@ -556,13 +556,13 @@ module internal Plan =
                 (fun (c, acc) r ->
                     result {
                         let realName = r.Name
-                        let! schema = ExecContext.schemaOf c realName
-                        let c1 = ExecContext.withSchema c realName schema
+                        let! schema = ExecContext.schemaOf realName c
+                        let c1 = ExecContext.withSchema realName schema c
 
                         let c2 =
                             match r.Alias with
                             | None -> c1
-                            | Some a -> ExecContext.withSchema c1 a schema
+                            | Some a -> ExecContext.withSchema a schema c1
 
                         return c2, Schema.concat acc (Schema.ofTable realName r.Alias schema)
                     })

@@ -169,11 +169,11 @@ module internal Wal =
         let foldFrames fs step initial =
             let rec loop state =
                 match readFrameFrom fs with
-                | Error e -> Error e
-                | Ok None -> Ok state
+                | Error e -> err e
+                | Ok None -> ret state
                 | Ok(Some record) ->
                     match step state record with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok next -> loop next
 
             loop initial

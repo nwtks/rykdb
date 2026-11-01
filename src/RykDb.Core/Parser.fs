@@ -75,7 +75,7 @@ module internal Parser =
         if st.Depth >= MaxExpressionDepth then
             err (DbError.syntax (sprintf "式の入れ子が深すぎます（上限 %d）" MaxExpressionDepth) (peekPos st).Line)
         else
-            Ok { st with Depth = st.Depth + 1 }
+            ret { st with Depth = st.Depth + 1 }
 
     /// 式・項の再帰から出るときに深さを 1 減らす。
     let private exitExpr (st: PState) = { st with Depth = st.Depth - 1 }
@@ -131,7 +131,7 @@ module internal Parser =
     let private parseParenIdentList (st: PState) =
         let rec loop acc st =
             match parseIdent st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(c, st) ->
                 if isSymbol "," st then
                     advance st |> loop (c :: acc)
@@ -192,7 +192,7 @@ module internal Parser =
     [<TailCall>]
     let rec private parseExprC<'r> (k: K<'r>) (st: PState) =
         match enterExpr st with
-        | Error e -> Error e
+        | Error e -> err e
         | Ok st -> parseOrC (fun e st -> k e (exitExpr st)) st
 
     and [<TailCall>] private parseExprListElemC<'r>
@@ -205,7 +205,7 @@ module internal Parser =
             advance st |> parseExprListToParen k (e :: acc)
         else
             match expectSymbol ")" st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(_, st) -> k (List.rev (e :: acc)) st
 
     and [<TailCall>] private parseExprListToParen<'r>
@@ -217,13 +217,13 @@ module internal Parser =
 
     and [<TailCall>] private parseCallBodyC<'r> (k: K<'r>) (name: string) (st: PState) =
         match expectSymbol "(" st with
-        | Error e -> Error e
+        | Error e -> err e
         | Ok(_, st) ->
             let upper = name.ToUpperInvariant()
 
             if upper = "COUNT" && isSymbol "*" st then
                 match advance st |> expectSymbol ")" with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(_, st) -> k (Expr.AggCall(AggFunc.Count, false, Expr.Star)) st
             else
                 let distinct = upper = "COUNT" && isKeyword "DISTINCT" st
@@ -245,7 +245,7 @@ module internal Parser =
                 advance st |> advance |> k (Expr.QualifiedStar name)
             else
                 match advance st |> parseIdent with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(c, st) -> k (Expr.Column { Qualifier = Some name; Name = c }) st
         elif isSymbol "(" st then
             parseCallBodyC k name st
@@ -261,7 +261,7 @@ module internal Parser =
             advance st
             |> parseExprC (fun cond st ->
                 match expectKeyword "THEN" st with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(_, st) -> parseExprC (fun res st -> parseCaseBranches k ((cond, res) :: acc) st) st)
         else
             k (List.rev acc) st
@@ -273,16 +273,16 @@ module internal Parser =
             advance st
             |> parseExprC (fun elseE st ->
                 match expectKeyword "END" st with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(_, st) -> k (Expr.Case(bs, Some elseE)) st)
         else
             match expectKeyword "END" st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(_, st) -> k (Expr.Case(bs, None)) st
 
     and [<TailCall>] private parseCaseC<'r> (k: K<'r>) (st: PState) =
         match expectKeyword "CASE" st with
-        | Error e -> Error e
+        | Error e -> err e
         | Ok(_, st) -> parseCaseBranches (parseCaseTailC k) [] st
 
     and [<TailCall>] private parsePrimaryC<'r> (k: K<'r>) (st: PState) =
@@ -300,7 +300,7 @@ module internal Parser =
             advance st
             |> parseExprC (fun e st ->
                 match expectSymbol ")" st with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(_, st) -> k e st)
         | Token.Ident name -> parseNamedPrimaryC k name st
         | Token.QuotedIdent name -> parseNamedPrimaryC k name st
@@ -309,11 +309,11 @@ module internal Parser =
     and [<TailCall>] private parseUnaryC<'r> (k: K<'r>) (st: PState) =
         if isSymbol "-" st then
             match advance st |> enterExpr with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok st -> parseUnaryC (fun e st -> k (Expr.Unary(UnaryOp.Neg, e)) (exitExpr st)) st
         elif isSymbol "+" st then
             match advance st |> enterExpr with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok st -> parseUnaryC (fun e st -> k (Expr.Unary(UnaryOp.Pos, e)) (exitExpr st)) st
         else
             parsePrimaryC k st
@@ -326,7 +326,7 @@ module internal Parser =
                 else BinaryOp.Mod
 
             match advance st |> enterExpr with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok st ->
                 parseUnaryC (fun right st -> parseMultiplicativeLoop k baseDepth (Expr.Binary(op, left, right)) st) st
         else
@@ -343,7 +343,7 @@ module internal Parser =
                 else BinaryOp.Concat
 
             match advance st |> enterExpr with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok st ->
                 parseMultiplicativeC
                     (fun right st -> parseAdditiveLoop k baseDepth (Expr.Binary(op, left, right)) st)
@@ -360,7 +360,7 @@ module internal Parser =
         (st: PState)
         =
         match expectKeyword "AND" st with
-        | Error e -> Error e
+        | Error e -> err e
         | Ok(_, st) -> parseAdditiveC (fun hi st -> k lo hi st) st
 
     and [<TailCall>] private parseBetweenBodyC<'r> (k: Expr -> Expr -> PState -> Result<'r, DbError>) (st: PState) =
@@ -376,7 +376,7 @@ module internal Parser =
             advance st |> parseInListBodyLoop k (e :: acc)
         else
             match expectSymbol ")" st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(_, st) -> k (List.rev (e :: acc)) st
 
     and [<TailCall>] private parseInListBodyLoop<'r>
@@ -388,7 +388,7 @@ module internal Parser =
 
     and [<TailCall>] private parseInListBodyC<'r> (k: Expr list -> PState -> Result<'r, DbError>) (st: PState) =
         match expectSymbol "(" st with
-        | Error e -> Error e
+        | Error e -> err e
         | Ok(_, st) -> parseInListBodyLoop k [] st
 
     and [<TailCall>] private parsePredicateTail<'r> (k: K<'r>) (left: Expr) (st: PState) =
@@ -419,7 +419,7 @@ module internal Parser =
                 let afterNot = eatKeyword "NOT" afterIs
 
                 match expectKeyword "NULL" afterNot with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(_, st) -> k (Expr.IsNull(left, negated)) st
             elif isKeyword "NOT" st then
                 let afterNot = advance st
@@ -451,7 +451,7 @@ module internal Parser =
     and [<TailCall>] private parseNotC<'r> (k: K<'r>) (st: PState) =
         if isKeyword "NOT" st then
             match advance st |> enterExpr with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok st -> parseNotC (fun e st -> k (Expr.Unary(UnaryOp.Not, e)) (exitExpr st)) st
         else
             parsePredicateC k st
@@ -459,7 +459,7 @@ module internal Parser =
     and [<TailCall>] private parseAndLoop<'r> (k: K<'r>) (baseDepth: int) (left: Expr) (st: PState) =
         if isKeyword "AND" st then
             match advance st |> enterExpr with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok st ->
                 parseNotC (fun right st -> parseAndLoop k baseDepth (Expr.Binary(BinaryOp.And, left, right)) st) st
         else
@@ -471,7 +471,7 @@ module internal Parser =
     and [<TailCall>] private parseOrLoop<'r> (k: K<'r>) (baseDepth: int) (left: Expr) (st: PState) =
         if isKeyword "OR" st then
             match advance st |> enterExpr with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok st -> parseAndC (fun right st -> parseOrLoop k baseDepth (Expr.Binary(BinaryOp.Or, left, right)) st) st
         else
             k left { st with Depth = baseDepth }
@@ -549,13 +549,13 @@ module internal Parser =
 
         if isKeyword "JOIN" st then
             match advance st |> parseTableRef with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(tbl, st) ->
                 match expectKeyword "ON" st with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(_, st) ->
                     match parseExprC retE st with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok(on, st) -> parseJoins ({ Kind = kind; Table = tbl; On = on } :: acc) st
         else
             ret (List.rev acc, st)
@@ -569,7 +569,7 @@ module internal Parser =
     let private parseGroupBy (acc: Expr list) (st: PState) =
         let rec loop acc st =
             match parseExprC retE st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(e, st) ->
                 if isSymbol "," st then
                     advance st |> loop (e :: acc)
@@ -590,7 +590,7 @@ module internal Parser =
     let private parseOrderBy (acc: SortKey list) (st: PState) =
         let rec loop acc st =
             match parseExprC retE st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(e, st) ->
                 let dir, st =
                     if isKeyword "DESC" st then
@@ -632,7 +632,7 @@ module internal Parser =
     let private parseSelect (st: PState) =
         let rec items acc st =
             match parseSelectItem st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(it, st) ->
                 if isSymbol "," st then
                     advance st |> items (it :: acc)
@@ -674,7 +674,7 @@ module internal Parser =
     let private parseInsert (st: PState) =
         let rec one acc st =
             match parseExprC retE st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(e, st) ->
                 if isSymbol "," st then
                     advance st |> one (e :: acc)
@@ -683,10 +683,10 @@ module internal Parser =
 
         let rec rows acc st =
             match expectSymbol "(" st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(_, st) ->
                 match one [] st with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(r, st) ->
                     if isSymbol "," st then
                         advance st |> rows (r :: acc)
@@ -721,13 +721,13 @@ module internal Parser =
     let private parseUpdate (st: PState) =
         let rec assigns acc st =
             match parseIdent st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(col, st) ->
                 match expectSymbol "=" st with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(_, st) ->
                     match parseExpr st with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok(e, st) ->
                         if isSymbol "," st then
                             advance st |> assigns ((col, e) :: acc)
@@ -765,7 +765,7 @@ module internal Parser =
     let private parseTypeArguments (st: PState) =
         let rec loop acc st =
             match parseExprC retE st with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(e, st) ->
                 let v =
                     match e with
@@ -791,11 +791,11 @@ module internal Parser =
         let rec loop c st =
             if isKeyword "NOT" st then
                 match advance st |> expectKeyword "NULL" with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(_, st) -> loop { c with NotNull = true } st
             elif isKeyword "PRIMARY" st then
                 match advance st |> expectKeyword "KEY" with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(_, st) ->
                     loop
                         { c with
@@ -807,7 +807,7 @@ module internal Parser =
                 advance st |> loop { c with Unique = true }
             elif isKeyword "DEFAULT" st then
                 match advance st |> parseExprC retE with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(e, st) -> loop { c with Default = Some e } st
             else
                 ret (c, st)
@@ -862,10 +862,10 @@ module internal Parser =
             let next =
                 if isKeyword "PRIMARY" st then
                     match expectKeyword "PRIMARY" st with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok(_, st) ->
                         match expectKeyword "KEY" st with
-                        | Error e -> Error e
+                        | Error e -> err e
                         | Ok(_, st) ->
                             parseParenIdentList st
                             |> Result.map (fun (pkCols, st) ->
@@ -878,7 +878,7 @@ module internal Parser =
                     parseColumnDefinition st |> Result.map (fun (c, st) -> c :: cols, constrs, st)
 
             match next with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(cols, constrs, st) ->
                 if isSymbol "," st then
                     advance st |> body cols constrs
@@ -994,7 +994,7 @@ module internal Parser =
                 ret (List.rev acc)
             else
                 match parseOne st with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(s, st) -> parseAll (s :: acc) st
 
         Lexer.tokenize sql

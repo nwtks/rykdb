@@ -39,8 +39,8 @@ flowchart TB
 
     subgraph EX["実行"]
         EN["Engine.fs<br/>文の実行（Ddl / Engine）"]
-        PL["Planner.fs<br/>束縛 → 論理代数 → Op"]
-        OPS["Ops.fs / Schema.fs<br/>pull 演算子"]
+        PL["Analyzer.fs / Planner.fs<br/>束縛 → 論理代数 → Op"]
+        OPS["Ops.fs / ExecContext.fs<br/>pull 演算子と走査"]
     end
 
     subgraph ROW["行ストア"]
@@ -75,7 +75,6 @@ flowchart TB
     DB --> EN
     DB --> CAT
     DB --> MVCC
-    EN --> PL
     EN --> PL
     EN --> OPS
     PL --> OPS
@@ -131,18 +130,18 @@ flowchart TB
 **上から下への一方向のみ**。
 下位モジュールは上位を知らない。
 
-| 層               | モジュール                                    | 知っている層                         |
-| ---------------- | --------------------------------------------- | ------------------------------------ |
-| インターフェース | `Database.fs` `RykDb.Cli` `RykDb.Server`      | 全部                                 |
-| 実行             | `Engine.fs` `Planner.fs` `Ops.fs` `Schema.fs` | `RowStore` `Catalog` `Transactions`  |
-| 行ストア         | `RowStore.fs` `Catalog.fs`                    | `StorageEngine` `Transactions`       |
-| MVCC             | `Transactions.fs`                             | `Memtable`(`Entry`) `Errors` `Types` |
-| ストレージ       | `StorageEngine.fs` とその下                   | `Errors` `Types` `Serialization`     |
-| フロントエンド   | `Lexer` `Parser` `Ast`                        | `Types` `Errors`                     |
+| 層               | モジュール                                                       | 知っている層                         |
+| ---------------- | ---------------------------------------------------------------- | ------------------------------------ |
+| インターフェース | `Database.fs` `RykDb.Cli` `RykDb.Server`                         | 全部                                 |
+| 実行             | `Engine.fs` `Analyzer.fs` `Planner.fs` `ExecContext.fs` `Ops.fs` | `RowStore` `Catalog` `Transactions`  |
+| 行ストア         | `RowStore.fs` `Dml.fs` `Catalog.fs`                              | `StorageEngine` `Transactions`       |
+| MVCC             | `Transactions.fs`                                                | `Memtable`(`Entry`) `Errors` `Types` |
+| ストレージ       | `StorageEngine.fs` とその下                                      | `Errors` `Types` `Serialization`     |
+| フロントエンド   | `Lexer` `Parser` `Ast`                                           | `Types` `Errors`                     |
 
 > **Transactions と RowStore の依存方向**: `Transactions.fs` は `RowStore` を参照しない。
-> 依存は **`RowStore` → `Transactions` → `Memtable`** の向きで、 `RowStore` の DML ヘルパ（`insert` / `updateByPrimaryKey` / `deleteByPrimaryKey`）が `Transaction` のバッファへ行・索引を積む。
-> commit 時に `TransactionManager.commit` の出力を `RowStore.writeBatchesWithSnapshot` に渡すのは `Database` / `Engine`（§7.5）。
+> 依存は **`Dml` / `RowStore` → `Transactions` → `Memtable`** の向きで、`Dml.fs` の DML ヘルパ（`insert` / `updateRow` / `deleteRow`）が `Transaction` のバッファへ行・索引を積む。
+> commit 時に `TransactionManager.commit` の出力を `RowStore.commitToStore` に渡すのは `Engine`（§7.5）。
 
 ### なぜ不変（immutable）か
 
@@ -156,7 +155,7 @@ flowchart TB
 3. **型のレベルで「更新を忘れる」ミスを防ぐ**。
    ハンドルは `Database` だけ。
 
-ただし `Ops` の集約処理・`Op.toArray` と `Database.fs` のクライアント層だけは `ResizeArray` / `Dictionary` を使う（[`coding-conventions.md`](coding-conventions.md) §2）。
+ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`Op.toArray`、`ExtSort` の受け皿、`Database.fs` のクライアント層などでは `ResizeArray` / `Dictionary` / `HashSet` を使う（[`coding-conventions.md`](coding-conventions.md) §2）。
 
 ---
 
@@ -166,44 +165,47 @@ flowchart TB
 
 ### モジュール一覧（`src/RykDb.Core/`）
 
-| ファイル           | 役割                                                                                       |
-| ------------------ | ------------------------------------------------------------------------------------------ |
-| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）          |
-| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3 値論理）/ `SqlLiteral` / `Bytes`（バイト列比較） |
-| `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`                  |
-| `Op.fs`            | pull 演算子 `Op` / `Row`（`Ops` より先にコンパイル。`Spill` がファイルを遅延読みするため） |
-| `Spill.fs`         | 外部マージソート `ExtSort` と一時ファイル `Spill`（ソートの溢らし・k-way merge）           |
-| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                             |
-| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                     |
-| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                  |
-| `Sstable.fs`       | SSTable の構築・読み取り・k-way merge（ブロック / index / Bloom / Footer）                 |
-| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                  |
-| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                |
-| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                          |
-| `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                      |
-| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                 |
-| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                |
-| `Lexer.fs`         | 手書きトークナイザ（読み位置は値が持つ）                                                   |
-| `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                     |
-| `RowStore.fs`      | keyspace 束と DML ヘルパ（`Transaction` のバッファへ行・索引を積む）                       |
-| `Catalog.fs`       | テーブル・索引定義の永続化                                                                 |
-| `Schema.fs`        | 出力列 `OutputColumn` と演算子の出力スキーマ `Schema`                                      |
-| `Eval.fs`          | スカラー関数 `Scalar` と式評価器 `Eval`                                                    |
-| `Ops.fs`           | 演算子の組み立て `Ops`（フィルタ・ソート・結合・集約・射影・DISTINCT）                     |
-| `ExecContext.fs`   | 実行時文脈 `ExecContext` とテーブル走査（`table` / `byPrimaryKey` / `byIndex`）            |
-| `Engine.fs`        | DML `DmlOps`（INSERT / UPDATE / DELETE）もここに同居（`DmlOps` モジュール）                |
-| `Planner.fs`       | 名前束縛 → 論理代数 → `Op`                                                                 |
-| `Engine.fs`        | 文の実行（`Ddl` / `Engine.runStatement`）                                                  |
-| `Database.fs`      | 公開 API（不変ハンドル・transaction・`StatementResult`）                                   |
+| ファイル           | 役割                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------- |
+| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）           |
+| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3 値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）  |
+| `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`                   |
+| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                              |
+| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                      |
+| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                   |
+| `Sstable.fs`       | SSTable の構築・読み取り・k-way merge（ブロック / index / Bloom / Footer）                  |
+| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                   |
+| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                 |
+| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                           |
+| `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                       |
+| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                  |
+| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                 |
+| `Lexer.fs`         | 手書きトークナイザ（読み位置は値が持つ）                                                    |
+| `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                      |
+| `CommitIntent.fs`  | 複数 keyspace にまたがる commit の意思決定ログ（`CommitIntent`）                            |
+| `ProcessLock.fs`   | プロセス間ロック（`.rykdb.lock`、`ProcessLock`）                                            |
+| `RowStore.fs`      | keyspace 束（`RowStore` 型 + `Keyspace` モジュール）                                        |
+| `Catalog.fs`       | `IndexSchema` / `TableSchema` / `Catalog` と出力 `Schema` / `OutputColumn` の型・モジュール |
+| `Eval.fs`          | スカラー関数 `Scalar` と式評価器 `Eval`                                                     |
+| `Op.fs`            | pull 演算子 `Op` / `Row`（`ExtSort` が `Op` を使うため先にコンパイル）                      |
+| `ExtSort.fs`       | 外部マージソート `ExtSort` と一時ファイル `Spill`（ソートの溢らし・k-way merge）            |
+| `Ops.fs`           | 演算子の組み立て `Ops`（フィルタ・ソート・結合・集約・射影・DISTINCT）                      |
+| `Dml.fs`           | `RowKey` / `Dml`（`Transaction` のバッファへ行・索引を積む DML ヘルパ）                     |
+| `ExecContext.fs`   | 実行時文脈 `ExecContext` と DML `DmlOps`（INSERT / UPDATE / DELETE）                        |
+| `Analyzer.fs`      | `ScanMethod` / `JoinAlgorithm` / `Logical`、`Binder` / `Alias` / `Predicate` / `Analyzer`   |
+| `Planner.fs`       | `Optimizer`（論理代数 → `Op`）と `Plan`（SELECT の実行）                                    |
+| `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                      |
+| `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                |
+| `Database.fs`      | 公開 API（不変ハンドル・transaction）                                                       |
 
 ### F# のコンパイル順
 
 ```
-Errors → Types → Serialization → Op → Spill → Memtable → Wal → BloomFilter
+Errors → Types → Serialization → Memtable → Wal → BloomFilter
        → Sstable → VersionSet → Manifest → Compaction
        → StorageEngine → Transactions → Ast → Lexer → Parser
-       → RowStore → Catalog → Schema → Eval → Ops → ExecContext
-       → Planner → Engine → Database
+       → CommitIntent → ProcessLock → RowStore → Catalog → Eval → Op → ExtSort → Ops
+       → Dml → ExecContext → Analyzer → Planner → DropCleanup → Engine → Database
 ```
 
 F# はファイルを**コンパイル順に評価する**ため、上から下へ一方向の依存になるよう `.fsproj` の `Compile` を手で並べる
@@ -213,13 +215,13 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 ## 3. フロントエンド
 
-`Lexer.fs` → `Parser.fs` → `Ast.fs` → `Planner.fs` という一方向のパイプライン。
+`Lexer.fs` → `Parser.fs` → `Ast.fs` → `Analyzer.fs` → `Planner.fs` という一方向のパイプライン。
 
 ### 3.1 Lexer — 状態スレッドの字句解析
 
 - `LexState` は `{ Index; Line; Column }` の不変レコード。
   **前進すると新しい値を返す**ので mutable なインデックスを持たない。
-- 予約語は `Lexer` の private `keywords` Set、型名は `Parser.typeNames`（`Parser.typeTable` から導出）の Set に分ける
+- 予約語は `Lexer` の private `Keywords` Set、型名は `Parser.TypeNames`（`Parser.TypeTable` から導出）の Set に分ける
   （`INTEGER` などを予約語にすると列名に使えなくなるため）。
 - Blob リテラル `X'0A1B'` の判定は**識別子より前**に置く。
   順序を逆にすると `'ABCD'` が文字列になる。
@@ -241,11 +243,12 @@ CPS・継続の hoist・深さ制限の一般則は [`coding-conventions.md`](co
 `go a @ go b` とすると再帰呼び出しが末尾位置に来ないうえ O(n²) になる。
 `Expr.toDisplayString` も継続の連列表（`PrintStep`）で末尾再帰にしている。
 
-組み立ては `Expr.plugChildren`（`children` の逆変換）が担う。
-自分では再帰せず、評価機 **`Expr.rewrite`**（`Ast.fs`、`[<TailCall>]` 付き）が
-子を 1つずつ加工した列を受け取って式に戻すだけなので、深い式でもスタックを食わない。
-`Expr.rewrite` は葉の書き換え関数を受け取る形で、束縛（`Binder.qualify`）と
-集約後の読み替え（`Ops.substituteAggs`）が共用している。
+組み立ては **`Expr.rewrite`**（`Ast.fs`）が担う。
+葉の書き換え関数（`rewriteLeaf`）を受け取り、
+内部のローカル関数 `plugChildren`（`children` の逆変換）で子を 1つずつ加工した式に戻すので、
+深い式でもスタックを食わない。
+`Expr.rewrite` は束縛（`Binder.qualify`）と、
+集約後の読み替え（`Ops` の内部 `substituteAggs`）が共用している。
 
 ---
 
@@ -317,7 +320,7 @@ flowchart LR
     L --> E["Optimizer.exec<br/>Op の組み立て"]
 ```
 
-パイプラインの実装は `Planner.fs` の 3 段。
+パイプラインの実装は `Analyzer.fs` と `Planner.fs` の 3段。
 
 1. `Analyzer.bindTable` — FROM / JOIN の各テーブルを `TableBinding`（スキーマ + 識別名）にする。
 2. `Optimizer.buildLogical` — 式を `Binder.qualify` で束縛し、`Predicate.splitConjuncts` で WHERE を分解、
@@ -327,14 +330,15 @@ flowchart LR
 #### 束縛（Binder）
 
 - パーサは裸の名前を `Expr.Name` として作る。
-  `Binder.qualify` が**一意に決まる場合だけ**修飾名（`t.age`）へ直し、曖昧なら修飾せず残して実行時に「列 'age' が曖昧です（該当: …）」で落とす。
+  `Binder.qualify` が**一意に決まる場合だけ**修飾名（`t.age`）へ直し、
+  曖昧なら修飾せず残して実行時に「列 'age' が曖昧です（該当: …）」で落とす。
 - `FROM t AS x` の別名は、テーブル名の解決用に実名と別名の両方で `ExecContext.Schemas` に登録される。
   列の修飾子は**別名**（`x.id`）になり、比較は大文字小文字を区別しない。
 - WHERE は `Predicate.splitConjuncts` で AND を平坦化してから扱う。
 
 #### 論理代数の構築（buildLogical）
 
-1. FROM が無ければ `Values`（`SELECT 1` は 1行の定数）。
+1. `FROM` は必須（Parser が要求する。`SELECT 1` は構文エラー）。
 2. WHERE を全テーブル連結のスキーマで束縛 → conjunct へ分解し、先頭テーブルを `buildScan`。
 3. JOIN を FROM の順に**左深く**積む。
    右は `buildScan`（INNER は右ローカルの WHERE を pushdown、LEFT は null 供給側なので JOIN の上へ回す）。
@@ -453,8 +457,8 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 `Compute` は「次に 1行を返す関数」なので、要求されるまで計算しない。
 `Op.ofArray` は 1行ずつ `Compute` を繋ぐので、行数ぶんのスタックを積まない。
 
-一方で、**結合は Op を組み立てる時点で右側を materialize** する
-（入れ子ループのため。下表の「遅延」列を参照）。
+一方で、**入れ子ループ結合とハッシュ結合は Op を組み立てる時点で右側を materialize** する
+（インデックス入れ子ループは左行ごとに右を引く。下表の「遅延」列を参照）。
 ソート・集約・DISTINCT は**入力行を抱えず**、
 それぞれ外部マージ・アクュムレータ・符号化済みキーで処理する（§5.3）。
 
@@ -462,12 +466,14 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 
 | 演算子                                           | 役割                                         |
 | ------------------------------------------------ | -------------------------------------------- |
-| `Op.ofArray` / `ofRow`                           | 材料化済みの行を流す                         |
+| `Op.ofArray` / `ofSeq` / `ofRow`                 | 材料化済み・遅延 seq・1行の源                |
 | `Op.map` / `filter`                              | 1 対 1 / 1 対 0 の変換                       |
 | `Ops.project`                                    | 射影（`*` / `t.*` の展開を含む）             |
 | `Ops.sortBy`                                     | ソート（外部マージ。§5.3）                   |
 | `Op.take` / `Op.skip`                            | LIMIT / OFFSET                               |
 | `Ops.innerJoin` / `leftJoin`                     | 入れ子ループ結合                             |
+| `Ops.innerJoinHash` / `leftJoinHash`             | ハッシュ結合                                 |
+| `Ops.innerJoinIndexed` / `leftJoinIndexed`       | インデックス入れ子ループ                     |
 | `Ops.aggregate`                                  | 集約（`groupBy` 値 + 各集約結果 の行を生成） |
 | `Ops.distinct`                                   | 重複除去                                     |
 | `ExecContext.table` / `byPrimaryKey` / `byIndex` | 走査                                         |
@@ -482,13 +488,15 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 | `Ops.sortBy` / `Ops.aggregate`                 | **Op 構築時**に全入力を消費するが、行は抱えない（§5.3）                     |
 | `Ops.distinct`                                 | 符号化済みキーの `HashSet` を持ち回る（出現順を保持。バジェット上限あり）   |
 | `Ops.innerJoin` / `leftJoin`                   | 右を materialize し、左を 1行ずつ流す入れ子ループ                           |
+| `Ops.innerJoinHash` / `leftJoinHash`           | 右をハッシュ表に materialize する                                           |
+| `Ops.innerJoinIndexed` / `leftJoinIndexed`     | 左行ごとに `ExecContext.byIndex` で右を引く                                 |
 | `ExecContext.*`                                | スキャン結果を `Op` として受け取る（snapshot は生成時に固定）               |
 
 `DISTINCT` は `ValueCodec` で符号化したバイト列をキーにし、
 集約のグルーピングは `SqlValue array` の構造比較（`HashIdentity.Structural`）を使う
 （どちらも「同じ値なら同じキー」。NULL 同士は等しい扱い）。
 
-#### 5.3 メモリを抑える 3つの手段
+### 5.3 メモリを抑える 3つの手段
 
 | 対象              | 手段                                                                                                   | メモリの上限                                          |
 | ----------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- |
@@ -500,7 +508,7 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
   次のソート開始時に 24時間を超えたものだけ回収する。
 - ソートは全入力を消費してからでないと 1行も出せないため、`Ops.sortBy` は**呼び出し時に**入力を消化し、
   比較不能な型などのエラーも呼び出し時に返す（従来の契約と同じ）。
-- なお、**JOIN の右側は依然として materialize する**（入れ子ループのため）。ここは残課題。
+- なお、**JOIN の右側は入れ子ループ / ハッシュ結合では依然として materialize する**。ここは残課題。
 
 #### 演算子の共通規約
 
@@ -512,17 +520,19 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 
 #### 走査（`ExecContext`）
 
-- `ExecContext` は `{ Store; Visible; Schemas; Catalog }`。
+- `ExecContext` は `{ Store; Visible; Schemas; Catalog; Txn }`。
   `Visible`（snapshot の SeqNo）は Op を作るときに 1回だけ決まる。
-- `ExecContext.table` = `Dml.scanByPrimaryKey`（`RowStore.fs` の Dml ヘルパ。主キー順の全走査）。
-  `ExecContext.byPrimaryKey` = `Dml.getByPrimaryKey`（ポイント検索、無ければ空 Op）。
-  `ExecContext.byIndex` = `Dml.scanByIndexPrefix`（索引の prefix 走査。非一意索引でも全行を返す）。
+  `Txn` は read-your-writes のために読み取りへ重ねる transaction。
+- `ExecContext.table` = `Dml.scanByPrimaryKeyWithTxn`（`Dml.fs` の DML ヘルパ。主キー順の全走査）。
+  `ExecContext.byPrimaryKey` = `Dml.getByPrimaryKeyWithTxn`（ポイント検索、無ければ空 Op）。
+  `ExecContext.byIndex` = `Dml.scanByIndexPrefixWithTxn`（索引の prefix 走査。非一意索引でも全行を返す）。
+  `rangeScan` / `byIndexRange` もそれぞれ `Dml.scanByPrimaryKeyRangeWithTxn` / `Dml.scanByIndexRangeWithTxn` を使う。
 - **スキャンは遅延の `Op` として受け取る**（1行ずつ引くまでストレージを読まない）。
   `Optimizer` は `Limit` の件数ヒント（`OFFSET + LIMIT`）を `Project` だけ通して `Scan` へ降ろす。
   `ExecContext.table` / `rangeScan` / `byIndex` / `byIndexRange` はこれを `Dml` → `RowStore` → `StorageEngine.scanAt` まで渡す。
   `Filter` / `Sort` / `Aggregate` / `Distinct` / `Join` は行数を変える（または順序を作る）ためヒントを落とす。
   limit > 0 の `scanAt` は必要なファイルだけを開いて先頭 limit 件を返す（§8.2）。
-- **transaction のバッファ重ね当て（`Dml.overlayRows`）もストリーミング**。
+- **transaction のバッファ重ね当て（`Dml` 内部の `overlayRows`）もストリーミング**。
   store の行と txn のスロットはどちらもキー昇順なので、突き合わせながら 1行ずつ合成する
   （従来は store の全行を配列化してから再ソートしていた）。
 
@@ -536,19 +546,19 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 - `SUM` は数値列なら `DECIMAL`（`REAL` 混在時のみ `REAL`）、`AVG` は常に `REAL` を返す。
   `COUNT(DISTINCT x)` は重複排除する（`Ops.aggregate` の `addAcc` が `distinct` フラグで `Seen` を管理）。
   `SUM` / `AVG` / `MIN` / `MAX` の `DISTINCT` はパーサが受理しない（`COUNT` のみ）。
-- ソート（`Ops.sortBy`）はキーを「列インデックス + 向き」に解決して `Array.sortWith` で並べる。
+- ソート（`Ops.sortBy`）はキーを「列インデックス + 向き」に解決して `ExtSort.sortRows`（外部マージ）で並べる。
   ORDER BY に書けるのは**列の直接参照だけ**（式はエラー）。
   解決は修飾つき（`t.age`）を優先するので、集約後の出力（列名が `SUM(t.age)` になる）でも動く。
 - 射影（`Ops.project`）は `*` / `t.*` を列参照へ展開する。
   入力が集約結果のときは `substituteAggs` で位置に読み替えてから評価する。
 
-#### DML（`DmlOps`）
+#### DML（`DmlOps`、`ExecContext.fs`）
 
 DML は pull 演算子ではなく、`Transaction` を積み上げて件数を返す実行関数（§9.2）。
 
 - `insert` — 列順・`DEFAULT` / `NULL` の充足・`SqlValue.coerce` による型強制を行い、
   行ごとに `Dml.insert` でバッファへ積む（最終確認は `TableSchema.validateRow`）。
-- `update` — 全行をスキャンして WHERE を評価し、代入式は「現在の行」で評価して `Dml.updateByPrimaryKey` へ。
+- `update` — 全行をスキャンして WHERE を評価し、代入式は「現在の行」で評価して `Dml.updateRow` へ。
   **主キー列の書き換えは未対応**（`sql-reference.md` 参照）。
 - `delete` — 全行をスキャンし、WHERE に合う行の**主キー + 全索引に tombstone** を書く。
 
@@ -560,7 +570,7 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 途中で他トランザクションが commit すると、同じクエリの前半と後半で見えるデータが変わる（read committed になり、JOIN が壊れる）から。
 よって `ExecContext.Visible` は Op を作る時点で確定させ、渡された値だけを使う。
 
-### 5.3 式の評価
+### 5.4 式の評価
 
 `Eval` モジュールがスカラー式を 3値論理つきで評価する。
 集約呼び出しはここでは評価せず、`Ops.aggregate` / `Ops.project` が先に計算してから結果を定数として読み替える
@@ -585,8 +595,8 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 - `LIKE` は `%` / `_` の手書き照合（ESCAPE 非対応、大文字小文字は区別。
   バックトラックしない 1パスの照合なので、`%` が多いパターンでも無限ループしない）。
 - スカラー関数は `UPPER` / `LOWER` / `LENGTH` / `ABS` / `COALESCE` / `TRIM` / `ROUND`。
-  未知の関数・引数個数の不一致はエラー（`ROUND` は `INTEGER` / `REAL` のみ対応）。
-- 集約のエラーは握り潰され `NULL` になる（`Ops.aggregate` の `| Error _ -> SqlValue.Null`）。
+  未知の関数・引数個数の不一致はエラー（`ROUND` は `INTEGER` / `REAL` / `DECIMAL` に対応）。
+- 集約のエラーは伝播する（数値以外に `SUM` を掛けると `TypeError`）。
 - `AVG` は `SUM ÷ COUNT` を実行時に計算する（結果は `REAL`）。
 
 ---
@@ -633,8 +643,10 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 カタログは `__catalog__` keyspace に「1キー = 1定義」で保存される。
 
 ```
-[table:lenPrefixed][unique:1][colCount:varint] ...
-[flags]  bit0 = NOT NULL / bit1 = PRIMARY KEY / bit2 = UNIQUE
+テーブル: [colCount:varint] + 列定義 × colCount + [pkCount:varint] + 主キー列名 × pkCount
+列定義:   [name:lenPrefixed][tag:1][flags:1][default:lenPrefixed]
+索引:     [table:lenPrefixed][unique:1][colCount:varint] + 列名 × colCount
+[flags]   bit0 = NOT NULL / bit1 = PRIMARY KEY / bit2 = UNIQUE
 ```
 
 **SQL テキストではなく構造化した定義を保存する**理由は 2つ。
@@ -655,7 +667,8 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 - **注意** `Catalog.toSchema` は `Indexes = []` で埋まる。
   実行系には `Catalog.indexSchemasOf` 経由で載せ直す必要がある（忘れると索引検索が常に SeqScan になる）。
 - **DDL は即時に効く**。
-  `CREATE TABLE` はカタログを書き換えた時点で反映され、暗黙 transaction の開始時にカタログを読み直して直前の DDL を受け取る。
+  `CREATE TABLE` はカタログを書き換えた時点で反映され、DDL が返した新しいハンドルでは次の文から見える。
+  `Begin()` はカタログを読み直す。
 
 ---
 
@@ -679,13 +692,14 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 実装は `StorageEngine.getAt` / `scanAt` に `visible: uint64 option` を渡すだけで、中身を SeqNo フィルタ 1つで絞る。
 永続データ構造 versioning は使わない。
 
-`Snapshot.noLimit`（`uint64 option` の `None`）が「制限なし」を表す。
+`visible = None` が「制限なし」を表す。
 `Some s` のときだけ `SeqNo <= s` で判定し、`None` ならフィルタを省く（§7.2 の `visible`）。
 
 ### 7.3 競合検出
 
 2つの transaction が同じキーに書いたら、**後から commit した方を失敗**させる（first-committer-wins）。
-`LastCommitted : Map<keyspace:key, SeqNo>` を commit 時に更新し、transaction の snapshot より大きい SeqNo の同一キーがあれば `ConflictError` にする。
+`LastCommitted : Map<keyspace:key, SeqNo>` を commit 時に更新し、
+transaction の snapshot より大きい SeqNo の同一キーがあれば `ConflictError` にする。
 
 競合キーの照合は `keyspace + ":" + base64(キー)` の文字列で行う。
 `LastCommitted` はプロセス内の状態で、ディスクには残さない
@@ -702,7 +716,7 @@ BEGIN
 COMMIT
   ├─ TransactionManager.commit → 競合検出 → WriteBatch
   ├─ TransactionManager.activeSnapshot → GC 境界
-  └─ RowStore.writeBatchesWithSnapshot
+  └─ RowStore.commitToStore
        ├─ 複数 keyspace なら .commit/journal へ intent を追記して公開
        ├─ keyspace ごとに StorageEngine.writeBatch
        └─ 全 keyspace の適用後に resolve を追記して解決
@@ -730,9 +744,9 @@ DROP はカタログ削除前に `.drop-cleanup` ジャーナルを書き、後�
 
 ### 7.5 keyspace 横断 commit と ActiveSnapshot
 
-1 トランザクションがテーブルと索引など複数 keyspace に書く場合、各 WAL は独立しているため、
+1トランザクションがテーブルと索引など複数 keyspace に書く場合、各 WAL は独立しているため、
 「テーブルは書けたが索引は書けていない」中途半端な状態が起こり得る。
-`RowStore.writeBatchesWithSnapshot` は `.commit/journal` へ **publish（公開）レコードを追記**してから
+`RowStore.commitToStore` は `.commit/journal` へ **publish（公開）レコードを追記**してから
 keyspace ごとに書き、完了後に **resolve（解決）レコードを追記**する。
 再オープン時に未解決の publish が残っていれば `replayPending` が再適用する。
 再適用では同じ `(key, SeqNo, value)` を `filterApplied` が読み飛ばすので、物理エントリは重複しない。
@@ -745,10 +759,10 @@ keyspace ごとに書き、完了後に **resolve（解決）レコードを追�
   P/Invoke（`fcntl(F_FULLSYNC)` / `fsync(fd)`）を使わずに耐久性を得るには、
   **すでにあるファイルへの追記**だけを使うしかない。
 - 追記は `FileStream.Flush(true)` でファイルデータをディスクへ落とせる。
-  ジャーナルはオープン時に `touch` で 1 回だけ作る（ディレクトリを汚すのはこの 1 回だけ）。
+  ジャーナルはオープン時に `touch` で 1回だけ作る（ディレクトリを汚すのはこの 1回だけ）。
 - レコードは `[長さ][ペイロード][CRC]` のフレーム。
   **書き込みが途中で切れた尾部は CRC で検出し、「公開未完了」として捨てる**。
-  公開完了前に WAL へは 1 バイトも書かないので捨てて安全。
+  公開完了前に WAL へは 1バイトも書かないので捨てて安全。
 - 尾部が切れたまま後ろへ追記すると読みが止まるため、
   `touch` は**有効な末尾までの切り詰め**を行い、以後の追記を可能にする
   （既存ファイルの長さ変更なのでディレクトリは更新しない）。
@@ -783,19 +797,18 @@ commit 成功・rollback・`Close` で解除する。
 参照が残っている間は「版を余分に残す」側に倒れるので、データを失う方向には働かない。
 トークンは `obj()` の参照等価（Core は `mutable` / `ref` を 0件に保つ規約のため、連番カウンタを使わない）。
 同じ DB を相対パスと絶対パスで開いても同じ束に入るよう `Path.GetFullPath` で正規化する。
-複数プロセスからの同時アクセスは非対応（§12.2）なので、プロセス内の表で十分。
+複数プロセスからの同時アクセスは `.rykdb.lock` で拒否する（§7.9）ので、プロセス内の表で十分。
 
-### 7.6 .Database の transaction モデル
+### 7.6 `Database` の transaction モデル
 
-`Execute` は任意の SQL を、`Query` は **SELECT 専用**（それ以外は `SyntaxError`）で実行し、
-暗黙の transaction で自動的に commit する。
+`Execute` は任意の SQL を実行し、暗黙の transaction で自動的に commit する。
 `Begin()` 以降は `Commit()` / `Rollback()` するまで同じ transaction を使う。
 
 > **注意** SQL 文としての `BEGIN` / `COMMIT` / `ROLLBACK` は transaction を制御する（`Database.Execute` の `runStatements` で処理）。
 > `Engine.runStatement` には到達しない。
-> 明示 transaction はライブラリ API の `db.Begin()` / CLI の `.commit` `.rollback` を使う。
+> 明示 transaction はライブラリ API の `db.Begin()` / CLI の `.begin` `.commit` `.rollback` を使う。
 
-### 7.7 同時実行制御 — 半導は値、DDL だけ排他
+### 7.7 同時実行制御 — 並行性は値、DDL だけ排他
 
 通常の書き込み経路に `lock` / `Monitor` / `Interlocked` はない。
 同時実行制御は次の 4層の組み合わせで成り立っている。
@@ -810,7 +823,7 @@ commit 成功・rollback・`Close` で解除する。
 重要な含意は 2つ。
 
 1. **同じ DB（root）は 1本のハンドル系譜を直列に使う**。
-   独立した 2つの `openWith` はできない（§7.9）。
+   独立した 2つの `OpenWith` はできない（§7.9）。
    並行させたいときは **DB を分ける**か、1本のハンドルをキューで直列化する。
    同じハンドルを複数スレッドで `Execute` すると状態はマージされず、**後から書き換えた方だけが残る**。
 2. **commit の直列化は「その経路を単一に通る」という規約**であって、mutex による保護ではない。
@@ -858,19 +871,20 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 ### 7.9 プロセス間の排他（`.rykdb.lock`）
 
 WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つのプロセスが同じ DB を書くと壊れる。
-そこで `RowStore.openStore` は root の **`.rykdb.lock` を `FileShare.None` で開いたまま保持**し（`ProcessLock`、`RowStore.fs`）、
+そこで `RowStore.openStore` は root の **`.rykdb.lock` を `FileShare.None` で開いたまま保持**し
+（`ProcessLock`、`ProcessLock.fs`）、
 開けなければ `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.lock）`）で失敗する。
 
 - **`.rykdb.lock` により、同じ root はプロセス内外で1つしか開けない**。
   - 別プロセスが開いている → `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.lock）`）。
   - 同じプロセスが既に開いている → `IoError`
     （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）。
-    `Database.openWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
+    `Database.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
     一方の commit が他方から見えない（**古い行を黙って返す**）ため、開けない方が安全。
   - これで「同じ root を開いた複数のハンドルが互いに見えない」という不整合は起きない。
     1つのハンドルの中では MVCC の snapshot で一貫性が保たれる。
-- **クラッシュ再現だけは例外的に二重オープンする**: `RowStore.openStoreTakingOver` /
-  `Database.openWithTakingOver`（internal、テスト専用）。
+- **クラッシュ再現だけは例外的に二重オープンする**: `RowStore.openStoreTakingOver` で
+  取得した store を internal の `Database.OpenWithStore` に渡す（テスト専用）。
   ハンドルを失った状況を作って WAL 再生 / 未 commit の切り捨てを検証する。
 - `Close()` でロックを解放する（二重 `Close()` は無害）。
   全ハンドルを Close しないままプロセスが終了しても、OS がロックを解放する。
@@ -882,14 +896,14 @@ WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つの�
 ## 8. ストレージ層
 
 `StorageEngine` が **LSM ツリー 1本**を公開する層。
-`RowStore` は `IStorageEngine`（`NextSeqNo` / `GetAt` / `ScanAt` / `WriteBatch` / `WithNextSeqNo` / `Close`）越しに扱う。
+`RowStore` は `IStorageEngine`（`NextSeqNo` / `ActiveSnapshot` / `GetAt` / `ScanAt` / `WriteBatch` / `WithNextSeqNo` / `WithActiveSnapshot` / `MaybeFlush` / `Close`）越しに扱う。
 テストではこれをメモリ実装に差し替え、ディスク I/O なしで上位層を検証する。
 
-| 既定値                        | 値     |
-| ----------------------------- | ------ |
-| `DefaultMemLimitBytes`        | 64 MiB |
-| `BloomFalsePositiveRate`      | 0.01   |
-| `Levels.Count` / `Levels.Max` | 7 / 6  |
+| 既定値                        | 値    |
+| ----------------------------- | ----- |
+| `DefaultMemLimitBytes`        | 64MiB |
+| `BloomFalsePositiveRate`      | 0.01  |
+| `Levels.Count` / `Levels.Max` | 7 / 6 |
 
 ### 8.1 Memtable — 永続 Treap
 
@@ -963,7 +977,7 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | Footer のチェックサム    | Footer 先頭 80バイト（`magic`〜`metadataChecksum`）を対象。部分読みでも検証する                                                                                        |
 | Footer                   | `magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8) bloomOff(8) bloomLen(8) metaOff(8) metaLen(8) entryCount(8) metadataChecksum(4) footerChecksum(4)` = 84バイト |
 | `maxSeqNo`               | ファイル内の最大 SeqNo。open 時の NextSeqNo 復元と GC の参考に使う（GC の判定はエントリ単位。§8.6）                                                                    |
-| Bloom filter             | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。ビット列は packed（1ビット = 1ビット）。読む側は `Sstable.mayContain`               |
+| Bloom filter             | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。ビット列は packed（1ビット = 1ビット）。読む側は `BloomFilter.mightContain`         |
 | ポイント検索の順路       | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                                            |
 
 ファイルは `Sstable.writeTo` が v5 形式をブロック単位でストリームへ書き出す
@@ -973,8 +987,8 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 - **部分読み**（`Sstable.openPartial`）: Footer / meta / Bloom / index だけを読み、
   `SstPartial`（パス + インデックス）を返す。データブロックは `rangeScanPartial` /
   `lookup` が必要になったときだけ `FileStream` で読む。
-  `openPartial` は Footer/meta/Bloom/index を ** 1回の open ** で読み、
-  `rangeScanPartial` は最大 ** 8ブロック **を 1回の open でまとめて読む
+  `openPartial` は Footer/meta/Bloom/index を **1回の open** で読み、
+  `rangeScanPartial` は最大 **8ブロック**を 1回の open でまとめて読む
   （バッチ内の不要なブロックは解析・検証しない）。
   `lookup` は 1ブロックだけ読む。
 
@@ -1008,7 +1022,7 @@ limit に達する前に開封・ブロック解析のエラーがあれば `Err
 そのため、`limit` で到達しない後続ファイル・ブロックの破損・欠落はそのクエリでは検出されない。
 
 走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
-`rangeScan` / `rangeScanPartial` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ
+`rangeScanPartial` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ
 （ブロックの解析失敗は、そのブロックが必要になった `next` が `Error` を返す）。
 下限の適用は `Memtable.rangeScan` と同じく「読む側」が担い、merge 後に絞り直さない（§8.1）。
 
@@ -1022,26 +1036,26 @@ limit に達する前に開封・ブロック解析のエラーがあれば `Err
 
 `VersionEdit` は Version の変更履歴で、直列化されて MANIFEST に書かれる。
 **`NextFileNumber` は MANIFEST に残らない**
-（`applyAll` は `Version.empty` から作り直すので 1に戻る）。
+（`applyAll` は `Version.Empty` から作り直すので 1に戻る）。
 復旧時には `maxFileNumberOnDisk + 1` で必ず上へ進める必要がある
 （巻き戻すとデータを失う話は [`gotchas.md`](gotchas.md) §4.4 / §11.2）。
 
-レベル構成と容量上限（`CompactionOptions.defaults`）:
+レベル構成と容量上限（`CompactionOptions.Defaults`）:
 
-| レベル | 役割                                   | 容量上限                                    |
-| ------ | -------------------------------------- | ------------------------------------------- |
-| L0     | flush の出力先（キー域の重なりを許す） | 4 ファイル（`L0CompactionTrigger`）         |
-| L1〜L5 | 1 ファイル = 1 キー域                  | 10 MiB / 100 MiB / 1 GiB / 10 GiB / 100 GiB |
-| L6     | 最下位                                 | 1 TiB                                       |
+| レベル | 役割                                   | 容量上限                               |
+| ------ | -------------------------------------- | -------------------------------------- |
+| L0     | flush の出力先（キー域の重なりを許す） | 4ファイル（`L0CompactionTrigger`）     |
+| L1〜L5 | 1ファイル = 1キー域                    | 10MiB / 100MiB / 1GiB / 10GiB / 100GiB |
+| L6     | 最下位                                 | 1TiB                                   |
 
 `pickCompaction` は L0 のファイル数が `L0CompactionTrigger` 以上なら L0 を、
 L1 以降は「そのレベルの総バイト数 > 上限」の最初のレベル L を選び、出力先を L+1 にする。
-実際の入力は `Compaction.selectInputs` が、レベル L の先頭 `MaxInputFiles = 32` ファイルを seed とし、
+実際の入力は `Compaction.compact` 内の `selectInputs` が、レベル L の先頭 `MaxInputFiles = 32` ファイルを seed とし、
 L と L+1 のキー域が重なるファイルを閉包が取れるまで追加して確定する
 （`MaxInputFiles` は seed の目安で、閉包が 32 を超えることがある）。
 これにより出力のキー域は入力外のファイルと重ならず、最下位での tombstone 削除も安全になる。
-出力ファイルは件数ではなく `OutputFileTargetBytes`（既定 4 MiB）を目標に、**キーの切れ目**で分ける
-（`Compaction.pump`。概算バイトなので厳密なサイズではない。1つのキーの版が複数ファイルに跨らない）。
+出力ファイルは件数ではなく `OutputFileTargetBytes`（既定 4MiB）を目標に、**キーの切れ目**で分ける
+（`Compaction.compact` 内の `pump`。概算バイトなので厳密なサイズではない。1つのキーの版が複数ファイルに跨らない）。
 ポイント検索のファイル順は「新しいレベルのほうが先（L0 が最新）、同レベルではファイル番号の降順」（`filesForPointLookup`）。
 
 ### 8.4 Manifest — 唯一 atomic 更新を要するファイル
@@ -1063,12 +1077,14 @@ checksum は本体全体の FNV-1a。
 `CURRENT` の更新は「`CURRENT.tmp` へ書き込んでから `File.Move(上書き)` で置き換える」原子的な書き換え
 （`Manifest.writeCurrent`）。書きかけの `CURRENT` が残らないので、クラッシュ後も
 `CURRENT` は**有効な** manifest 番号のどちらかを指す。
-なお **fsync はしていない**ので、電源断に対しては「rename 済みか否か」までが保証範囲。
+一時ファイルの内容は `Flush(true)` でディスクへ落とすが、**ディレクトリの fsync はしていない**ため、
+電源断に対しては「rename 済みか否か」までが保証範囲。
 
 `Manifest.openOrCreate` が返すのは「**有効な** manifest 番号」で `+1` しない。
 `+1` すると別ファイルを指し、追記先がずれて復旧が空になる。
 
-復旧時は `applyAll` が `Version.empty` から VersionEdit 列を再適用して Version を作り直すため、`NextFileNumber` は 1 に戻る。
+復旧時は `applyAll` が `Version.Empty` から VersionEdit 列を再適用して Version を作り直すため、
+`NextFileNumber` は 1 に戻る。
 `openDatabase` が `maxFileNumberOnDisk + 1` まで進め直すのはこのため（§8.3）。
 
 ### 8.5 WAL — 論理ログ
@@ -1094,7 +1110,7 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 - **1トランザクション分（Begin + Batch + Commit）を 1 回の `append` でまとめて書き**、`Flush(true)` でディスクまで落とす。
   Begin / Commit が中途半端に分かれない。
 - open 時は WAL を 1フレームずつストリーミングで読み（WAL 全体をメモリへ載せない）、
-  `committedEntries` 相当の状態機械が「Commit まで到達した Batch」だけを再生する。
+  `Wal.foldCommitted` が「Commit まで到達した Batch」だけを再生する。
   コミット済み Entry は配列に溜めず、そのまま Memtable へ挿入する。
   未コミットと `Abort` は捨てる。
 - flush / close の後は `rotate` する（旧ファイルを先に全部消してから、新番号で再作成）。
@@ -1111,13 +1127,14 @@ L1〜 … 1ファイル = 1キー域で互いに重ならない（RocksDB/LevelD
 
 1回の compaction:
 
-1. 過剰レベル `L` を選ぶ（`Compaction.pickCompaction`）
+1. 過剰レベル `L` を選ぶ（`Compaction.compact` 内の `pickCompaction`）
 2. `L` の全ファイル + `L+1` でキー域が重なるファイルを**入力**にする
 3. 入力は**ファイル全体を読まず**、部分読みリーダーの `SstScan` でブロック単位に開き、
    `SstMerge` で 1件ずつ k-way merge する（各ファイルは既にソート済みなので O(N log k)）
-4. **同一キーの版を SeqNo が新しい 1件に畳む**
-   （並びは「キー昇順・同一キーは SeqNo 降順」なのでグループ先頭が最新版） → ここに墓碑も落ちる
+4. **同一キーの版を SeqNo が新しい順にまとめる**
+   （並びは「キー昇順・同一キーは SeqNo 降順」なのでグループ先頭が最新版）
 5. **GC**: 最新版と「最古の active snapshot が見る版」を残し、それ以外の古い版を落とす
+   （tombstone は出力が最下位レベルのときだけ落とす）
 6. 出力は**1ファイル分（`OutputFileTargetBytes`）だけをメモリに持ち**、
    キーの切れ目でファイルを切り替える
    （1つのキーの版が複数ファイルに跨らない）
@@ -1164,9 +1181,9 @@ SQL 文字列
   → Lexer.tokenize          トークン列
   → Parser.parseStatements  Statement list
   → Analyzer.bindTable      名前束縛（修飾子を解決）
-  → Planner.buildLogical    論理代数
+  → Optimizer.buildLogical  論理代数
   → 物理化                 走査方法・結合アルゴリズムを決定
-  → Ops / Planner          Op の木
+  → Ops / Optimizer         Op の木
   → Op.toArray              結果行
 ```
 
@@ -1176,19 +1193,19 @@ SQL 文字列
 ### 9.2 書き込み（`INSERT` / `UPDATE` / `DELETE`）
 
 ```
-1. Planner が DML を RowStore の更新に変換
+1. Engine が DmlOps 経由で DML を Transaction の更新に変換
 2. Transaction.Buffers に積む（まだ DB には見えない）
 3. commit 時:
    ├─ TransactionManager.commit → 競合検出（first-committer-wins）
    ├─ Transaction.toEntries    → WriteBatch
-   └─ RowStore.writeBatchesWithSnapshot
+   └─ RowStore.commitToStore（内部の writeBatchesWithSnapshot）
         ├─ 複数 keyspace なら .commit/journal へ publish を追記（§7.5）
         ├─ keyspace ごとに StorageEngine.writeBatch
         │    ├─ Wal.append (Begin/Batch/Commit)
         │    └─ Memtable.apply
         └─ resolve を追記して解決
-4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.writeAll` が各 keyspace の `WriteBatch` 後に `MaybeFlush` を呼ぶ。memtable が上限未満なら何もしない）
-5. レベルが閾値を超えたら compact（`maybeCompact`）（`maybeFlush` が `flush >>= maybeCompact` で連鎖するため、flush と同時に評価される）
+4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.applyBatches` が各 keyspace の `WriteBatch` 後に `MaybeFlush` を呼ぶ。memtable が上限未満なら何もしない）
+5. レベルが閾値を超えたら compact（`compactOnce`）（`maybeFlush` が `flush >>= compactOnce` で連鎖するため、flush と同時に評価される）
 ```
 
 flush / compact は `RowStore` が各 keyspace の `WriteBatch` 後に `IStorageEngine.MaybeFlush` を呼んで実行する
@@ -1198,17 +1215,21 @@ flush / compact は `RowStore` が各 keyspace の `WriteBatch` 後に `IStorage
 ### 9.3 DB を開くとき
 
 ```
-Database.openWith root
-  → RowStore.openStore root          既存の keyspace ディレクトリを全部開く
-                                     （新規 DB でも __catalog__ を先に開いて登録する）
+Database.OpenWith root
+  → RowStore.openStore root          root を作成し、.rykdb.lock を取得
+      ├─ CommitIntent.touch          .commit/journal を開く（末尾の切れを切り詰める）
+      ├─ discoverKeyspaces           既存の keyspace ディレクトリを列挙
+      ├─ StorageEngine.openDatabase  各 keyspace の LSM ツリーを開く
+      │    ├─ Manifest.openOrCreate  CURRENT を読む / なければ作る
+      │    ├─ dropMissingFiles       MANIFEST が参照するファイルが無いなら除去
+      │    ├─ quarantineOrphans      MANIFEST が参照しない SSTable を .orphans/ へ退避
+      │    ├─ Wal.foldCommitted      コミット済みの Batch を memtable へ再生
+      │    └─ NextFileNumber をディスク上の最大番号 + 1 へ進める
+      └─ replayPending               未解決の .commit/journal を再適用
   → Catalog.load                     __catalog__ keyspace からスキーマを読む
+  → TransactionManager.create
+  → DropCleanupRecovery.recover      カタログに無い keyspace の DROP 後始末を再開
   → RowStore.lastSeqNo               ディスク上の最大 SeqNo を採る
-  （各 keyspace で）StorageEngine.openDatabase dir
-      ├─ Manifest.openOrCreate       CURRENT を読む / なければ作る
-      ├─ dropMissingFiles            MANIFEST が参照するファイルが無いなら除去
-      ├─ deleteOrphans               MANIFEST が参照しないファイルを削除
-      ├─ Wal.read                    コミット済みの Batch を memtable へ再生
-      └─ NextFileNumber をディスク上の最大番号 + 1 へ進める
 ```
 
 > **既存の keyspace を全部開いておくこと**。
@@ -1231,12 +1252,17 @@ memtable を flush してから WAL を削除する。
 
 ```
 <root>/
+├── .rykdb.lock              ← プロセス間ロック（0バイト、§7.9）
+├── .commit/
+│   └── journal              ← keyspace 横断 commit の publish / resolve 追記（§7.5）
+├── .drop-cleanup            ← 未完了 DROP の後始末対象（§11.10）
 ├── OQ5HAZLPOBWGK            ← base32("t:people")   主キー行
 │   ├── MANIFEST-000001
 │   ├── CURRENT
 │   ├── 000002.wal
 │   ├── 000003.sst
-│   └── 000004.sst
+│   ├── 000004.sst
+│   └── .orphans/            ← MANIFEST 非参照ファイルの退避先
 ├── NE5GSZDYL5SGK4DU         ← base32("i:idx_dept")  索引エントリ
 │   └── ...
 └── L5PWGYLUMFWG6Z27L4       ← base32("__catalog__")
@@ -1251,6 +1277,7 @@ memtable を flush してから WAL を削除する。
 | `CURRENT`       | 有効な MANIFEST 番号（1行）                      |
 | `%06d.wal`      | 先行ログ                                         |
 | `%06d.sst`      | データファイル                                   |
+| `.orphans/`     | MANIFEST 非参照ファイルの退避先（削除しない）    |
 
 ロックファイル（`root/.rykdb.lock`）は 0バイトのまま置かれる。中身は使わない（§7.9）。
 
@@ -1271,13 +1298,12 @@ let ok =
     | Ok v -> v
     | Error e -> failwith (DbError.toDisplayString e)
 
-let db = ok (Database.openWith "./mydata")
+let db = ok (Database.OpenWith "./mydata")
 
-// Execute / Query は「新しい Database」と結果のペアを返す。戻り値を持ち替えること。
+// Execute は「新しい Database」と結果のペアを返す。戻り値を持ち替えること。
 let db, _ = ok (db.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
 let db, _ = ok (db.Execute "INSERT INTO t VALUES (1, 10), (2, 20)")
-
-let db, result = ok (db.Query "SELECT id, v FROM t ORDER BY id")
+let db, result = ok (db.Execute "SELECT id, v FROM t ORDER BY id")
 result.Rows        // [|[|Int 1L; Int 10L|]; [|Int 2L; Int 20L|]|]
 result.Columns     // [|"id"; "v"|]
 ```
@@ -1292,7 +1318,7 @@ dotnet run --project src/RykDb.Cli -- ./mydata                # 対話モード
 dotnet run --project src/RykDb.Cli -- -f script.sql ./mydata  # スクリプト実行
 ```
 
-対話モードでは `.tables` / `.commit` / `.rollback` / `.help` / `.exit`（`.quit`）が使える。
+対話モードでは `.tables` / `.begin` / `.commit` / `.rollback` / `.help` / `.exit`（`.quit`）が使える。
 エラーは表示するだけで終了しない。
 
 ### 11.3 TCP サーバ
@@ -1305,7 +1331,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 **並行性に関する制約（§7.7 参照）**:
 
-- `serve` の accept ループは **接続を 1 つずつ処理する**
+- `serve` の accept ループは **接続を 1つずつ処理する**
   （接続ごとの `Task` / スレッドは起こさない）。
   1接続内も while で逐次。
 - 各接続は `handleClient` 内で `let mutable current = db` に**初期ハンドルをコピー**して始め、
@@ -1363,20 +1389,20 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 ### 12.2 既知の制約
 
 - **compaction は同期**（バックグラウンドスレッド化していない）。
-  1 回の commit が compaction の完了まで待つ。
+  1回の commit が compaction の完了まで待つ。
   入力はブロック単位で読み、出力も 1ファイル分しかメモリに持たない（§8.6）ので、
   入力サイズに比例したメモリは使わない。
   バックグラウンド化しないのは、`Version` を全ハンドルで共有する可変セルと、
   reader が使っているファイルの参照管理（refcount）が必要になるため（§7.7）。
-- **ストレージ側の `scanAt` はマージ結果を先に全部組み立てる**
+- **ストレージ側の `scanAt` は `limit <= 0` の全件走査ではマージ結果を先に全部組み立てる**
   （`SstScan` 自体は遅延だが、`StorageEngine.scanAt` は merge してから `seq` を返す）。
-  全件走査ではテーブル 1 個分のエントリを一度に持つ。
+  全件走査ではテーブル 1個分のエントリを一度に持つ。
   遅延化すると「壊れたファイルを先に検出する」契約（`StorageEngine.scanAt` の破損検出テスト）が
   列挙時にずれるため、意図的に早めに潰している。
   SQL 側の演算子はこの結果を追加でコピーしない。
 - **ソート・集約・DISTINCT は入力を抱えない**（§5.3）。
   ソートは一時ファイルへ溢らす外部マージ、集約はアクュムレータのみ、DISTINCT は符号化キーの集合。
-  ただし **JOIN の右側は入れ子ループのために materialize する**。
+  ただし **JOIN の右側は入れ子ループ / ハッシュ結合では materialize する**。
 - **最終結果は `Op.toArray` で配列化する**（`Plan.runSelect` の戻り値が配列のため）。
 - **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件に限る**（下限のある条件のみ）。
   `>` / `<` / `BETWEEN` / `LIKE` のうち、`LIKE` は索引を要求しない。
@@ -1385,9 +1411,10 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   `CREATE INDEX` の backfill 中は他の文が待つ。
   同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。
   登録はハンドルが GC されると外れるが、参照が残っている間は `ConflictError` のまま。
-- **同じ root はプロセス内で 1つしか開けない**（§7.9）。2 回目の `Database.openWith` は `IoError`。
+- **同じ root はプロセス内で 1つしか開けない**（§7.9）。
+  2回目の `Database.OpenWith` は `IoError`。
   別プロセスが開いていても `IoError`。
-  クラッシュ再現テストだけが `Database.openWithTakingOver` で例外を使う。
+  クラッシュ再現テストだけが `RowStore.openStoreTakingOver` と `Database.OpenWithStore` で例外的に二重オープンする。
 - **TCP サーバは接続ごとに逐次処理で、ハンドルは接続間で引き継がれる**（§11.3）。
   明示 transaction の途中で切れた場合は rollback してから次の接続へ渡す。
 - **同一 `Database` ハンドルを複数スレッドで使うと書き込みが失われる**（状態はマージされない。§7.7）。

@@ -35,7 +35,8 @@
 
 ## 2. pull 演算子（`Op`）の罠
 
-`Executor.fs` の `Op` は、「残りの計算」を値として持ち回る不変な pull 演算子（Volcano 方式 / イテレータモデル）。
+`Op.fs` の `Op` は、「残りの計算」を値として持ち回る不変な pull 演算子
+（Volcano 方式 / イテレータモデル）。
 
 ```fsharp
 type Op =
@@ -129,13 +130,13 @@ let rec go (cur: Op) : Result<SqlValue array array, DbError> =
 
 教訓: **「再帰 + `>>=`」組み合わせは使わない**。**`match` を書いて末尾位置を保つ**。
 
-### 2.4 `Op.distinct` は「直前の値」比較では書けない
+### 2.4 `Ops.distinct` は「直前の値」比較では書けない
 
 `2, 1, 2` という入力では「直前の `1` と今の `2`」は違うので、重複除去できない。
 
 ```fsharp
 // ❌ 2 が 2回目に出るので除去されない
-// ✅ 既出の値を全部覚える（Set<string> / HashSet）必要がある
+// ✅ 既出の値を全部覚える（符号化キーの HashSet<byte array>）必要がある
 ```
 
 ### 2.5 評価エラーを `Op.empty` で「0 行」にしない
@@ -262,8 +263,8 @@ run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema))
 ラッパも含めて単一の `run` の自己再帰で回すので、
 評価順（left → right → join）を保ったまま末尾再帰になる。
 
-- 回帰テスト: `DatabaseTests` の `Database: 3テーブルの入れ子 JOIN が行を返す` /
-  `末尾再帰: 60段の入れ子 JOIN が正しい行を返す`（深さ方向の累積を検証）
+- 回帰テスト: `DatabaseTests` の `Database: 3 テーブルの入れ子 JOIN が行を返す` /
+  `末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`（深さ方向の累積を検証）
 
 ### 3.6 JOIN の対応付けをテーブル名で探すと自己結合が消える
 
@@ -306,7 +307,7 @@ exec が「右テーブルを除いたスキーマ」を**名前で**引く（§
 ```fsharp
 // ❌ ポイント検索なのに「そのキー以降の全エントリ」を挽いている
 let fromMem =
-    Memtable.rangeScan engine.Mem key 0
+    Memtable.rangeScan key 0 engine.Mem
     |> Seq.map (...)
     |> firstVisible visible key
 ```
@@ -317,15 +318,15 @@ let fromMem =
 ```fsharp
 // ✅ ポイントルックアップ（O(log n)）を使う
 let fromMem =
-    match Memtable.getVisible engine.Mem key visible with
+    match Memtable.getVisible key visible engine.Mem with
     | None -> ret None
     | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
 ```
 
 教訓: **ポイント検索・prefix 検索に `rangeScan` を使わない**。**`getVisible` を使う**。
 
-> `Memtable.rangeScan` は遅延 seq になったため、❌ の形でも「キー以降の全件」は読まない
-> （先頭の一致まで降りて、キーが変わったら止まる）。
+> `Memtable.rangeScan` は遅延 seq なので、❌ の形でも必要な分しか実体化しない
+> （`startKey` 以降を 1件ずつ返す）。
 > それでも `getVisible` のほうが軽い（列挙子も `Result` も作らず、O(log n) で直接引く）ので方針は不変。
 
 ### 4.2 `scanAt` の `startKey` は SSTable に効かない（**再オープン後だけ露見する**）
@@ -344,32 +345,33 @@ let files =
 ```fsharp
 // ✅ 下限は「読む側」が付ける
 //   ファイルを選ぶ枝刈り（Largest >= startKey）と、中身の下限は別物。
-//   → Sstable.rangeScan が index を二分探索してstartKey より前のブロックを読み飛ばし、
+//   → Sstable.rangeScanPartial が index を二分探索して startKey より前のブロックを読み飛ばし、
 //     Memtable.rangeScan は木を途中から降りる。
-let merged = SstMerge.ofScans (memScan :: fileScans) |> collapseDuplicates visible
+let merged = SstMerge.ofScans (memScan :: fileScans)
+// 可視性の判定と同一キーの最新版への畳み込みは、SstMerge から 1件ずつ取り出す
+// 側（StorageEngine.scanAt の isVisible）が行う。
 // memtable も各ファイルも startKey 以降しか返さないので、merge 後の絞り込みは不要
 ```
 
 教訓: **「ファイルを選ぶ枝刈り」と「中身の下限」は別物。両方やる**。
-中身の下限はいま `Memtable.rangeScan` / `Sstable.rangeScan` が持っているので、`scanAt` 側で絞り直さない
+中身の下限はいま `Memtable.rangeScan` / `Sstable.rangeScanPartial` が持っているので、
+`scanAt` 側で絞り直さない
 （絞り直すと、下限が効かなくなった退行に気付けなくなる）。
 
 ### 4.3 prefix 検索は「1件目が答え」ではない
 
 ```fsharp
 // ❌ scanAt の 1件目が別の値であることがある
-RowStore.scanAt store ks prefix visible 0
-|> Result.map (fun rows -> if rows.Length = 0 then None else Some rows.[0])
+RowStore.scanAt ks prefix 0 visible store
+|> Result.map (fun rows -> rows |> Seq.tryHead)
 
 // ✅ 接頭辞一致を検査してから取る
-RowStore.scanAt store ks prefix visible 0
+RowStore.scanAt ks prefix 0 visible store
 |> Result.map (fun rows ->
     rows
-    |> Array.tryFind (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix)
-    |> Option.bind snd)
+    |> Seq.tryFind (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix))
+|> Result.map (Option.bind snd)
 ```
-
-`WHERE name = 'carol'` が `alice` の行を返すrowseのがこれ。
 
 ### 4.4 `Manifest.logAndApply` が `NextFileNumber` を進めていないとデータを消す
 
@@ -414,8 +416,8 @@ let rec prepare heap pending =
 症状は「SSTable だけの keyspace（Close 直後・再オープン直後）を読むと固まる」。
 memtable に 1件でもあると先へ進むため、テストが無いと気づきにくい。
 回帰テストは `StorageEngineTests` の
-`scanAt: memtable が空でも SSTable だけを走査できる` /
-`scanAt: memtable と複数ファイルを混ぜてもキー順と最新版を保つ`。
+`StorageEngine.scanAt: memtable が空でも SSTable だけを走査できる` /
+`StorageEngine.scanAt: 多数のファイルをキー昇順にマージする`。
 
 ---
 
@@ -435,7 +437,7 @@ let nextSeq = engine.NextSeqNo
 ### 5.2 reopen 時に SeqNo を再開しないと「全部未来」で見えない
 
 `RowStore.openStore` が keyspace を**開かず** `Engines = Map.empty` にしていたため、
-`Database.openWith` の `TransactionManager.create ()` が `LastCommitSeqNo = 0` になり、
+`Database.OpenWith` の `TransactionManager.create ()` が `LastCommitSeqNo = 0` になり、
 **ディスク上の行がすべて「未来」** と判定されて **0行**になっていた。
 
 ```fsharp
@@ -481,7 +483,7 @@ let obsolete = Version.allFiles version
   （最古の active snapshot が読むのはこの版）。
   それより古い版だけ捨てる。
 - 最新版が `activeSnapshot` 以下なら、最新版自身が全 snapshot から見えるのでそれより古い版は全て捨てる
-  （`Compaction.gc` の `keepOlder`）。
+  （compaction の GC にある `keepOlder`）。
 - 最下位レベルでも、**同じキーの古い版が残るなら tombstone は消さない**。
   消すと下位の古い値が復活する（`Compaction.gc` は `older.IsEmpty` のときだけ落とす）。
 - **ファイル単位の回収は SeqNo で判定しない**。
@@ -498,10 +500,11 @@ type Transaction =
     }
 ```
 
-`Dml.updateByPrimaryKey` の「delete → put」は**この構造で壊れる**ので、
-「put だけ」（LSM は新しい SeqNo の put が旧 put を隠す）に変更。
+`Dml.updateRow` は「delete → put」ではなく「put だけ」で更新する
+（LSM は新しい SeqNo の put が旧 put を隠す）。
+主キーの変更は禁止し、変更したい場合は DELETE + INSERT を使う。
 
-索引側は「値が変わるときだけ 古い索引キーへ tombstone → 新しい索引キーへ put」。
+索引側は `Dml.applyIndexChange` が「値が変わるときだけ古い索引キーへ tombstone → 新しい索引キーへ put」。
 
 ### 5.5 `TransactionManager.create ()` を 2回呼ぶと SeqNo が衝突する
 
@@ -565,7 +568,7 @@ let found =
 ### 6.2 `Catalog.toSchema` は `Indexes = []` で埋まる
 
 索引を定義しても実行系の `TableSchema.Indexes` に載らないと、
-`Scan.byIndex` が「索引が無い」と言って検索に失敗する。
+`ExecContext.byIndex` が「索引が無い」と言って検索に失敗する。
 
 ```fsharp
 // ✅ contextOf で明示的に載せる
@@ -580,22 +583,28 @@ let withIndexes =
 `CREATE INDEX` 時に中身を写さないと、**その前に `INSERT` した行が検索に出てこない**。
 
 ```fsharp
-// ✅ 既存行を index keyspace に書き込む
-Dml.scanByPrimaryKey state.Store withIndex Snapshot.noLimit 0
-|> Result.bind (fun rows ->
-    rows |> Array.fold (fun acc row ->
-        let key = RowKey.indexKey withIndex idx row
-        Ok(Transaction.put t (Keyspace.index idx.Name) key row)) (ret txn))
+// ✅ 既存行をチャンクごとの transaction で index keyspace に書き込む
+let! rows = Dml.scanByPrimaryKey cleared.Store withIndex 0 None
+
+let! filled =
+    applyChunks
+        (foldOk (fun t row ->
+            ret (Transaction.put (Keyspace.index idx.Name) (RowKey.indexKey withIndex idx row) row t)))
+        (Seq.chunkBySize BackfillChunkRows rows)
+        cleared
 ```
 
-### 6.4 `Dml.getByIndex` は「完全な行」が必要
+`Dml.scanByPrimaryKey` は遅延 `seq` を返すので、
+全行をメモリに載せず `BackfillChunkRows` 単位で transaction を分ける。
 
-`RowKey.indexPrefix` は索引列の位置を `TableSchema.indexOf`（`Option`）で引き、見つからない列は落とす。
-**完全な行**を要求する。
+### 6.4 索引走査は `TableSchema` と `IndexSchema` の両方が要る
+
+`RowKey.indexKey` は索引列の位置を `TableSchema.indexOf`（`Option`）で引き、見つからない列は落とす。
+索引キーには索引列だけでなく主キー列も埋め込むため、`IndexSchema` だけでは完全なキーを作れない。
 
 ```fsharp
-// ✅ 値だけで引くなら専用の関数を使う
-Dml.scanByIndexPrefix store index visible values 0
+// ✅ スキーマ・索引 schema・値・limit・visible・txn を渡す
+Dml.scanByIndexPrefixWithTxn store schema index values limit visible txn
 ```
 
 ---
@@ -713,7 +722,7 @@ let updateTables t ... = ...   // ← member から参照不可
 
 → **検索・更新は module 関数**にする。
 
-### 8.6 `Result.all` は `seq` を要求する
+### 8.6 `all` は `seq` を要求する
 
 リスト・配列はそのまま渡せる。
 空リストリテラルだけは要素型が決まらないので注釈を付ける（FS0030）。
@@ -725,9 +734,6 @@ all [ r1; r2 ]
 // ✅ 空のときは注釈で要素型を決める
 let empty: Result<int list, DbError> = all []
 ```
-
-`Lattice.combine`（Executor.fs）と `Results.combine`（Planner.fs）は同じ処理の三重複だったので、
-`Errors.fs` の `ResultOps.all` へ一本化して削除した。
 
 ### 8.7 `SqlValue` は `:?>` できない（FS0016）
 
@@ -749,10 +755,11 @@ let asInt (v: SqlValue) = match v with | SqlValue.Int n -> n | _ -> 0L
 | Binary(op, a, b) -> ...
 ```
 
-### 8.9 `Array.takeWhile` は「配列を全部見る」
+### 8.9 `Seq.takeWhile` は「先頭から連続」で止まる
 
-`Scan.byIndexPrefix` では「先頭から連続する接頭辞一致」を取りたいので `takeWhile` を使うが、
-**ファイル側の下限が効いていないと 1件も一致しない**（§4.2 を参照）。
+`Dml.scanByIndexPrefixWithTxn` は `RowStore.scanAt` が返す列から
+「先頭から連続する接頭辞一致」だけを `Seq.takeWhile` で取る。
+**ファイル側の下限が効いていないと 1件目で止まり、0件になる**（§4.2 を参照）。
 
 ### 8.10 予約語
 
@@ -765,7 +772,7 @@ let f (base: Schema) = ...
 let f (tree: Logical) = ...
 ```
 
-モジュール名に使えないのもある（`CompactionOptions.default` → `CompactionOptions.defaults`）。
+モジュール名に使えないのもある（`CompactionOptions` の既定値は現在 `CompactionOptions.Defaults`）。
 
 `key` / `base` / `begin` / `new` / `old` / `type` / `value` は**匿名レコードのフィールド名にも使えない**。
 
@@ -872,18 +879,20 @@ let rec readAll n c acc =
 
 **ローカルの `let rec` には `[<TailCall>]` を書けない**（FS0010 → `TreatWarningsAsErrors` でエラー）。
 末尾化したい関数が関数の中にいるなら、機を**モジュールスコープへ引き上げて**必要なものは引数で渡す
-（`Expr.rewriteLoop`（`Ast.fs`）は `rewriteLeaf` を受け取る形で、
-`Binder.qualify` と `Ops.substituteAggs` が共用している）。
+（`Expr.rewrite`（`Ast.fs`）は `rewriteLeaf` を受け取る形で、
+内部の `rewriteLoop` が末尾再帰。`Binder.qualify` と `Ops` の集約読み替えが共用している）。
 
 **要素数に比例する反復は必ず後者にする**（`match` に直せば末尾になる）。
 `>>=` で受けると候補の数・WHEN 節の数だけスタックが積まれる。
-該当は `IN` の候補リストと `CASE` の WHEN 節（`Eval.eval`）で、
-回帰テストは `ExecutorTests` の `末尾再帰: 巨大な IN 候補と WHEN 節を評価できる`。
+該当は `IN` の候補リストと `CASE` の WHEN 節（`Eval.eval`）。
+深い式の回帰テストは `AstTests` の `末尾再帰: AST の深い走査でスタックを食わない` と
+`OpsTests` の `末尾再帰: 50000段の式を havingFilter してもスタックを食わない`。
 カーソルからの数え上げ読み出しは `Reader.readItems`（Serialization.fs）に共通化し、
-`Catalog` / `Wal` が使う。
+`Catalog` / `CommitIntent` / `Memtable` が使う。
 
-**Debug の `Tailcalls` は既定で false**。`dotnet test` / `dotnet run` は Debug なので、
-CPS の相互末尾再帰が `tail.` にならず、50 万個の `IN` リストで `Stack overflow.`（exit 134）になる。
+**Debug の `Tailcalls` は既定で false**。
+`dotnet test` / `dotnet run` は Debug なので、CPS の相互末尾再帰が `tail.` にならず、
+50000個の `IN` リストで `Stack overflow.`（exit 134）になる。
 `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` を消すと再発するので注意。
 
 属性の無い関数（ローカル `let rec` 含む）まで含めた**反復検証**は `dotnet run --project tools/TailAudit`
@@ -967,7 +976,7 @@ let ok r = match r with | Ok v -> v | Error e -> failwithf "%s" (DbError.toDispl
 let dir = "/tmp/probe-db"
 if System.IO.Directory.Exists dir then System.IO.Directory.Delete(dir, true)
 
-let db0 = ok (Database.openWith dir)
+let db0 = ok (Database.OpenWith dir)
 let db1, _ = ok (db0.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
 // ... 1 演算子ずつ確認 ...
 ```
@@ -1065,7 +1074,8 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
 ### 11.8 keyspace 横断 commit は「先に publish、最後に resolve」（追記型ジャーナル）
 
 テーブルと索引は別 keyspace・別 WAL。テーブルだけ書けて索引が書けないクラッシュを防ぐため、
-`RowStore.writeBatchesWithSnapshot` は `.commit/journal` へ **publish を追記**してから書き、
+`RowStore.commitToStore`（内部の `writeBatchesWithSnapshot`）は
+`.commit/journal` へ **publish を追記**してから書き、
 全 keyspace の適用後に **resolve を追記**して解決する。
 
 - **`File.Move` / `File.Delete` は使わない**。
@@ -1114,7 +1124,7 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
   root の `.drop-cleanup` ジャーナルへ書く。
 - その後でカタログ定義を外し、keyspace を 8192エントリずつ tombstone 消去する。
 - 後始末が成功したらジャーナルを消す。
-  途中で失敗・クラッシュしても、次回 `Database.openWith` がジャーナルを読み、
+  途中で失敗・クラッシュしても、次回 `Database.OpenWith` がジャーナルを読み、
   カタログに存在しない keyspace だけを再消去する。
 - カタログに定義が残っている場合（カタログ削除前にクラッシュ）は、
   DROP 未完了としてジャーナルを捨て、データは消さない。
@@ -1155,7 +1165,7 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 
 ### 11.13 MANIFEST が壊れていたら「空の Version」で開かずエラーにする
 
-`Manifest.decodeLines` は**途中**のレコード破損を `CorruptionError` にし、**末尾の書きかけ**だけを読み飛ばす。
+`Manifest.openOrCreate` 内の `decodeLines` は**途中**のレコード破損を `CorruptionError` にし、**末尾の書きかけ**だけを読み飛ばす。
 `CURRENT` の指す manifest が無い場合や、`CURRENT` が無い/空なのに `*.sst` が残っている場合もエラーにする。
 
 - 空の Version を返すと `StorageEngine.openDatabase` が全 SSTable を孤児として扱い、**データが見えなくなる**。
@@ -1166,7 +1176,7 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
   base64 としては正しいが中身が壊れた行もチェックサムで検出する。
 - 回帰テスト: `Manifest: 途中の壊れたレコードは CorruptionError` /
   `Manifest: 途中のレコードのチェックサム不一致は CorruptionError` /
-  `StorageEngine: manifest の途中破損では開かず SSTable を残す`。
+  `Manifest: CURRENT が指す MANIFEST が無ければ CorruptionError`。
 
 ### 11.14 古い `Database` ハンドルの `Close` は WAL を消さない
 
@@ -1225,15 +1235,15 @@ DDL だけはプロセス内で排他にする必要がある。
 ### 11.16b 二重オープンは「ロック + 台帳」で防ぐ
 
 `FileShare.None` で他プロセスは防げるが、**同じプロセスの二重オープンは別問題**。
-`Database.openWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
+`Database.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
 一方の commit が他方から見えない（**古い行を黙って返す**）。
 そこで `ProcessLock` は台帳（正規化 root → トークン → `FileStream`）を持ち、
 **既にこのプロセスが開いている root の 2回目は `IoError`** にする。
 
 - 失敗を返す方が、黙って古い行を返すより安全。
 - `Close()` でロックを解放（二重 `Close` は無害）。
-- **クラッシュ再現テストは `Database.openWithTakingOver` / `RowStore.openStoreTakingOver`
-  （internal）を使う**。ここだけは意図的に二重オープンし、WAL 再生を検証する。
+- **クラッシュ再現テストは `RowStore.openStoreTakingOver` と internal の `Database.OpenWithStore` を使う**。
+  ここだけは意図的に二重オープンし、WAL 再生を検証する。
 - 開く途中で失敗したら（壊れた MANIFEST など）**必ず解放する**。
   押さえたままだと、同じプロセスからも再オープンできない。
 - 注意: `FileShare` の強制力は OS / ファイルシステム依存（同一マシンのローカル FS 前提）。
@@ -1253,15 +1263,16 @@ DDL だけはプロセス内で排他にする必要がある。
 ### 11.18 `LIMIT` / `OFFSET` は 0 以上の整数リテラル
 
 非リテラルを `0` に丸めると `LIMIT 1+0` が **0 行** になる（かつてドキュメントは「制限なし」と書いていた）。
-`Planner.applyLimit` は式・負数・`Int32.MaxValue` 超を `SyntaxError` にする。
-`Limit` ノードの `-1` が「LIMIT なし」、`0` は 0 行。
+`Optimizer.buildLogical` 内の `applyLimit` は式・負数・`Int32.MaxValue` 超を `SyntaxError` にする。
+`Limit` ノードの `limit = -1` が「LIMIT なし」、`0` は 0 行。
 
-### 11.19 走査は候補 SSTable を先に開く
+### 11.19 走査の開封エラーを握り潰さない
 
-`lazyMergeScan` が開けなかったファイルを `Drained`（空）と見なしていたため、
-壊れた SSTable があると `Ok` のまま行が欠けた（静かな誤答）。
-`StorageEngine.scanAt` は `limit` の有無にかかわらず候補ファイルを先に `openPartialSst` し、
-エラーをそのまま返す。`limit` による遅延オープンは諦めた（正しさを優先）。
+以前は開けなかったファイルを空と見なしていたため、壊れた SSTable があると `Ok` のまま行が欠けた（静かな誤答）。
+現在の `StorageEngine.scanAt` は候補ファイルをキー下限順に `prepare` で開き、
+開封・ブロック解析のエラーをその場で返す（§11.24）。
+`limit <= 0` の全件走査は最後まで読むので全ファイルを開いて検出するが、
+`limit > 0` は limit 件で止まるため、到達しない後続ファイルの破損は検出しない。
 
 ### 11.20 壊れたデータは未捕捉例外にしない
 
@@ -1303,7 +1314,7 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ### 11.24 limit 付き scan は後続の SSTable を開かない
 
-`StorageEngine.scanAt` は `limit > 0` のとき `collectLimited` で
+`StorageEngine.scanAt` は `limit > 0` のとき `collectLimitted` で
 **必要になったファイル・ブロックだけ**を開き、`limit` 件に達したら止まる。
 そのため、limit で到達しない後続 SSTable / ブロックの破損・欠落はそのクエリでは検出されない
 （全件走査 / `limit = 0` は全ファイルを開いて検出する）。

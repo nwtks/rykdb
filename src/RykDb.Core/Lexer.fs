@@ -182,7 +182,7 @@ module internal Lexer =
                     let s' = advance input s |> advance input
 
                     match loopBlockComment n 1 s' with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok st -> loop n st
                 else
                     ret s
@@ -224,7 +224,7 @@ module internal Lexer =
                                     yield System.Convert.ToByte(hex.Substring(i * 2, 2), 16)
                             |]
 
-                        Ok(Token.BlobLit bytes, advance input s)
+                        ret (Token.BlobLit bytes, advance input s)
             else
                 sb.Append(input.[s.Index]) |> ignore
                 advance input s |> collectHex n sb
@@ -253,7 +253,7 @@ module internal Lexer =
                     |> advance input
                     |> collectChars input n delim unclosedMsg line sb
                 else
-                    Ok(sb.ToString(), advance input s)
+                    ret (sb.ToString(), advance input s)
             else
                 sb.Append(input.[s.Index]) |> ignore
                 advance input s |> collectChars input n delim unclosedMsg line sb
@@ -284,7 +284,7 @@ module internal Lexer =
                 elif upper = "FALSE" then Token.Keyword "FALSE"
                 else Token.Ident word
 
-            Ok(tok, s')
+            ret (tok, s')
         elif
             System.Char.IsDigit c
             || c = '.' && s.Index + 1 < n && System.Char.IsDigit input.[s.Index + 1]
@@ -326,7 +326,7 @@ module internal Lexer =
                         System.Globalization.CultureInfo.InvariantCulture
                     )
                 with
-                | true, v -> Ok(Token.RealLit v, afterExponent)
+                | true, v -> ret (Token.RealLit v, afterExponent)
                 | _ -> err (DbError.syntax (sprintf "failed to parse real: %s" text) startPos.Line)
             else
                 match
@@ -336,7 +336,7 @@ module internal Lexer =
                         System.Globalization.CultureInfo.InvariantCulture
                     )
                 with
-                | true, v -> Ok(Token.IntLit v, afterExponent)
+                | true, v -> ret (Token.IntLit v, afterExponent)
                 | _ -> err (DbError.syntax (sprintf "failed to parse integer: %s" text) startPos.Line)
         elif c = '\'' then
             collectDelimited input n '\'' "unclosed string" startPos.Line s
@@ -353,20 +353,20 @@ module internal Lexer =
 
             match matched with
             | None -> err (DbError.syntax (sprintf "unexpected character '%c'" c) startPos.Line)
-            | Some sym -> Ok(Token.Symbol sym, advanceN sym.Length s)
+            | Some sym -> ret (Token.Symbol sym, advanceN sym.Length s)
 
     /// SQL テキストをトークン列へ分解する。
     /// 位置と出力は不変で、外側の再帰が値を積み上げる。
     let tokenize (input: string) =
         let rec collectTokens n acc s =
             match skipTrivia input s with
-            | Error e -> Error e
-            | Ok s when s.Index >= n -> Ok(List.rev ({ Token = Token.Eos; Pos = s.Position } :: acc))
+            | Error e -> err e
+            | Ok s when s.Index >= n -> ret (List.rev ({ Token = Token.Eos; Pos = s.Position } :: acc))
             | Ok s ->
                 let startPos = s.Position
 
                 match scanToken input startPos s with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(tok, s') -> collectTokens n ({ Token = tok; Pos = startPos } :: acc) s'
 
         { Index = 0; Line = 1; Column = 1 } |> collectTokens input.Length []

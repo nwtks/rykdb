@@ -76,16 +76,15 @@ module internal StorageEngine =
     let private openPartialSst (f: FileMetaData) (engine: StorageEngine) =
         let path = FileMetaData.path engine.Dir f.FileNumber
 
-        match protect (fun () -> System.IO.FileInfo path |> SstPartialCache.keyOf path) with
-        | Error e -> Error e
-        | Ok key ->
+        protect (fun () -> System.IO.FileInfo path |> SstPartialCache.keyOf path)
+        >>= fun key ->
             match SstPartialCache.tryGet key with
-            | Some partial -> Ok partial
+            | Some partial -> ret partial
             | None ->
                 Sstable.openPartial path
                 >>= fun partial ->
                     SstPartialCache.put key partial
-                    Ok partial
+                    ret partial
 
     /// ポイントルックアップ。
     /// memtable -> L0 -> 各レベルの順に見る。
@@ -93,15 +92,15 @@ module internal StorageEngine =
     /// これが MVCC の可視性。
     /// None なら制限なし。
     let getAt (visible: uint64 option) (key: byte array) (engine: StorageEngine) =
-        let rec probe =
-            function
+        let rec probe files =
+            match files with
             | [] -> ret None
             | f :: rest ->
                 match openPartialSst f engine with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok partial ->
                     match Sstable.lookup key visible partial with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok(Some e) -> ret (Some e)
                     | Ok None -> probe rest
 
@@ -136,28 +135,23 @@ module internal StorageEngine =
                 startKey
 
         let openPending index f merge =
-            let startScan =
-                match openPartialSst f engine with
-                | Error e -> Error e
-                | Ok partial -> Ok(Sstable.rangeScanPartial startKey 0 partial)
-
-            match startScan with
-            | Error e -> Error e
-            | Ok scan ->
+            openPartialSst f engine
+            >>= fun partial -> ret (Sstable.rangeScanPartial startKey 0 partial)
+            >>= fun scan ->
                 match SstScan.next scan with
-                | Error e -> Error e
-                | Ok None -> Ok merge
-                | Ok(Some(e, nxt)) -> Ok(SstMerge.insert index e nxt merge)
+                | Error e -> err e
+                | Ok None -> ret merge
+                | Ok(Some(e, nxt)) -> ret (SstMerge.insert index e nxt merge)
 
         let rec prepare pending merge =
             match pending with
-            | [] -> Ok(merge, [])
+            | [] -> ret (merge, [])
             | (index, bound, f) :: rest ->
                 match SstMerge.top merge with
-                | Some top when Bytes.compare bound top.Key > 0 -> Ok(merge, pending)
+                | Some top when Bytes.compare bound top.Key > 0 -> ret (merge, pending)
                 | _ ->
                     match openPending index f merge with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok merge' -> prepare rest merge'
 
         let isVisible e =
@@ -167,14 +161,14 @@ module internal StorageEngine =
 
         let rec collectLimitted pending emittedKey acc count merge =
             if limit > 0 && count >= limit then
-                Ok(List.rev acc)
+                ret (List.rev acc)
             else
                 match prepare pending merge with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(ready, remaining) ->
                     match SstMerge.next ready with
-                    | Error e -> Error e
-                    | Ok None -> Ok(List.rev acc)
+                    | Error e -> err e
+                    | Ok None -> ret (List.rev acc)
                     | Ok(Some(e, merge')) ->
                         let sameKey =
                             match emittedKey with
@@ -195,11 +189,11 @@ module internal StorageEngine =
 
         let rec collectAll pending emittedKey acc merge =
             match prepare pending merge with
-            | Error e -> Error e
+            | Error e -> err e
             | Ok(ready, remaining) ->
                 match SstMerge.next ready with
-                | Error e -> Error e
-                | Ok None -> Ok(List.rev acc)
+                | Error e -> err e
+                | Ok None -> ret (List.rev acc)
                 | Ok(Some(e, merge')) ->
                     let sameKey =
                         match emittedKey with
@@ -230,15 +224,11 @@ module internal StorageEngine =
             Memtable.rangeScan startKey 0 engine.Mem
             |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
 
-        let initial =
-            match SstScan.next (seqToScan memSeq) with
-            | Error e -> Error e
-            | Ok None -> Ok SstMerge.Empty
-            | Ok(Some(e, nxt)) -> Ok(SstMerge.insert 0 e nxt SstMerge.Empty)
-
-        match initial with
-        | Error e -> Error e
-        | Ok merge -> collect merge
+        match SstScan.next (seqToScan memSeq) with
+        | Error e -> err e
+        | Ok None -> ret SstMerge.Empty
+        | Ok(Some(e, nxt)) -> ret (SstMerge.insert 0 e nxt SstMerge.Empty)
+        >>= fun merge -> collect merge
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、
@@ -330,9 +320,8 @@ module internal StorageEngine =
     /// 入力はファイル全体を読まず、ブロック単位で読む（部分読みリーダー）。
     let private compactOnce (engine: StorageEngine) =
         let scanOf f =
-            match openPartialSst f engine with
-            | Error e -> Error e
-            | Ok partial -> Ok(Sstable.rangeScanPartial [||] 0 partial)
+            openPartialSst f engine
+            >>= fun partial -> ret (Sstable.rangeScanPartial [||] 0 partial)
 
         let buildCompacted version manifestNumber result =
             let nextNum =

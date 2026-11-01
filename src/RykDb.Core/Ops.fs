@@ -70,7 +70,7 @@ module internal Ops =
                         let bare = { Qualifier = None; Name = c.Name }
 
                         match Schema.resolve schema c with
-                        | Ok i -> Ok(i, dir)
+                        | Ok i -> ret (i, dir)
                         | Error _ -> Schema.resolve schema bare |> Result.map (fun i -> i, dir))
                 |> all
 
@@ -374,7 +374,7 @@ module internal Ops =
                     let _, star, distinct, arg = aggs.[i]
 
                     match add star distinct arg bucket.[i] row with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok acc ->
                         bucket.[i] <- acc
                         step (i + 1)
@@ -392,29 +392,28 @@ module internal Ops =
             =
             let rec go (cur: Op) =
                 match Op.next cur with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok None -> ret ()
                 | Ok(Some(row, nxt)) ->
                     match keyOfRow row with
-                    | Error e -> Error e
+                    | Error e -> err e
                     | Ok k ->
                         match buckets.TryGetValue k with
                         | true, bucket ->
                             match addToBucket bucket row with
-                            | Error e -> Error e
+                            | Error e -> err e
                             | Ok() -> go nxt
                         | _ ->
                             if order.Count >= groupBudget then
                                 err (
-                                    DbError.capacity (
-                                        sprintf "GROUP BY のグループ数が多すぎます（上限 %d）。条件で絞るか、サンプリングしてください" groupBudget
-                                    )
+                                    sprintf "GROUP BY のグループ数が多すぎます（上限 %d）。条件で絞るか、サンプリングしてください" groupBudget
+                                    |> DbError.capacity
                                 )
                             else
                                 let bucket = newBucket ()
 
                                 match addToBucket bucket row with
-                                | Error e -> Error e
+                                | Error e -> err e
                                 | Ok() ->
                                     buckets.[k] <- bucket
                                     order.Add k

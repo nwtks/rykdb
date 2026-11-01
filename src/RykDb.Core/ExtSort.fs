@@ -105,7 +105,7 @@ module private Spill =
                 ret ()
             else
                 match writeRow sink rows.[i] with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok() -> writeAll sink rows (i + 1)
 
         let closeSink sink =
@@ -116,16 +116,15 @@ module private Spill =
 
         let path = runPath stamp serial
 
-        match openSink path with
-        | Error e -> Error e
-        | Ok sink ->
+        openSink path
+        >>= fun sink ->
             let sorted = Array.sortWith compareRows rows
 
             match writeAll sink sorted 0 with
             | Error e ->
                 closeSink sink
                 unlink path
-                Error e
+                err e
             | Ok() ->
                 closeSink sink
                 ret path
@@ -175,18 +174,15 @@ module private Spill =
             let first = s.ReadByte()
 
             if first < 0 then
-                Ok None
+                ret None
             else
                 match readVarintFrom s (byte first) with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok len when len > uint64 System.Int32.MaxValue -> err (DbError.corruption "Spill: 行の長さが異常です")
                 | Ok len ->
-                    match readExactly s (int len) with
-                    | Error e -> Error e
-                    | Ok payload ->
-                        match ValueCodec.readValues (Cursor.create payload) with
-                        | Error e -> Error e
-                        | Ok(values, _) -> Ok(Some values))
+                    readExactly s (int len)
+                    >>= (Cursor.create >> ValueCodec.readValues)
+                    >>= fun (values, _) -> ret (Some values))
         >>= id
 
     let private closeSource (src: Source) =
@@ -202,15 +198,14 @@ module private Spill =
                 let fs = System.IO.File.OpenRead path
                 Source(new System.IO.BufferedStream(fs, 65536) :> System.IO.Stream))
 
-        match openSource path with
-        | Error e -> Error e
-        | Ok src ->
+        openSource path
+        >>= fun src ->
             match readRow src with
             | Error e ->
                 closeSource src
                 unlink path
-                Error e
-            | Ok head -> Ok { Path = path; Src = src; Head = head }
+                err e
+            | Ok head -> ret { Path = path; Src = src; Head = head }
 
     /// run を閉じてファイルを消す（尽きた・破棄するとき）。
     /// ストリームを閉じずにファイルだけ消すとハンドルが洩れるので、必ず一緒に閉じる。
@@ -247,13 +242,13 @@ module internal ExtSort =
 
         let rec openAll rest acc =
             match rest with
-            | [] -> Ok(List.rev acc)
+            | [] -> ret (List.rev acc)
             | p :: tail ->
                 match Spill.openRun p with
                 | Error e ->
                     Spill.closeAll acc
                     Spill.forget rest
-                    Error e
+                    err e
                 | Ok state -> openAll tail (state :: acc)
 
         let rec scan i bestIdx best (states: RunState list) =
@@ -292,7 +287,7 @@ module internal ExtSort =
                         match Spill.readRow chosen.Src with
                         | Error e ->
                             Spill.closeAll (before @ chosenAndAfter)
-                            Error e
+                            err e
                         | Ok None ->
                             Spill.closeRun chosen
                             ret (Some(row, before @ after))
@@ -314,7 +309,7 @@ module internal ExtSort =
             match Op.next next with
             | Error e ->
                 Spill.forget paths
-                Error e
+                err e
             | Ok None ->
                 if List.isEmpty paths then
                     ret (inMemory buf)
@@ -329,18 +324,18 @@ module internal ExtSort =
                     match all with
                     | Error e ->
                         Spill.forget paths
-                        Error e
+                        err e
                     | Ok runPaths ->
                         match openAll runPaths [] with
                         | Error e ->
                             Spill.forget runPaths
-                            Error e
+                            err e
                         | Ok states -> ret (mergeRuns states)
             | Ok(Some(row, tail)) ->
                 match check state row with
                 | Error e ->
                     Spill.forget paths
-                    Error e
+                    err e
                 | Ok state' ->
                     let size = int64 (approxRow row)
 
@@ -348,7 +343,7 @@ module internal ExtSort =
                         match Spill.writeRun stamp written compareRows (buf.ToArray()) with
                         | Error e ->
                             Spill.forget paths
-                            Error e
+                            err e
                         | Ok p ->
                             buf.Clear()
                             ingest stamp buf 0L (written + 1) (p :: paths) state' (Op.Step(row, tail))

@@ -265,7 +265,7 @@ module internal Analyzer =
     let bindTable (ctx: ExecContext) (r: TableRef) =
         let realName = r.Name
 
-        ExecContext.schemaOf ctx realName
+        ExecContext.schemaOf realName ctx
         |> Result.map (fun schema ->
             {
                 Ref = r

@@ -24,7 +24,7 @@ module internal Manifest =
         System.IO.Path.Combine(dir, fileName fileNumber)
 
     [<Literal>]
-    let private CurrentFileName = "CURRENT"
+    let CurrentFileName = "CURRENT"
 
     let private currentPath (dir: string) =
         System.IO.Path.Combine(dir, CurrentFileName)
@@ -99,28 +99,28 @@ module internal Manifest =
 
         let rec decodeLines acc (lines: string list) =
             match lines with
-            | [] -> Ok(List.rev acc, false)
+            | [] -> ret (List.rev acc, false)
             | line :: rest ->
                 if line.Trim() = "" then
                     decodeLines acc rest
                 else
                     match decodeRecord line with
                     | Ok edits -> decodeLines (List.rev edits @ acc) rest
-                    | Error _ when rest |> List.forall (fun l -> l.Trim() = "") -> Ok(List.rev acc, true)
-                    | Error e -> Error e
+                    | Error _ when rest |> List.forall (fun l -> l.Trim() = "") -> ret (List.rev acc, true)
+                    | Error e -> err e
 
         let read dir fileNumber =
             let path = manifestPath dir fileNumber
 
             if System.IO.File.Exists path then
-                Ok(System.IO.File.ReadAllLines path |> Array.toList)
+                ret (System.IO.File.ReadAllLines path |> Array.toList)
             else
-                Error(DbError.corruption (sprintf "有効な manifest が見つかりません: %s" (fileName fileNumber)))
+                err (sprintf "有効な manifest が見つかりません: %s" (fileName fileNumber) |> DbError.corruption)
 
         let readAll dir fileNumber =
             match protect (fun () -> read dir fileNumber) with
-            | Error e -> Error e
-            | Ok(Error e) -> Error e
+            | Error e -> err e
+            | Ok(Error e) -> err e
             | Ok(Ok lines) ->
                 let hasContent = lines |> List.exists (fun line -> line.Trim() <> "")
 

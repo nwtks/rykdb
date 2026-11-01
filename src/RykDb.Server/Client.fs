@@ -101,8 +101,6 @@ type RykDbClient(host: string, port: int) =
             | _ -> Failure(sprintf "不正なサーバ応答ヘッダー: %s" h)
         | Some h -> Failure(sprintf "不正なサーバ応答: %s" h)
 
-    member this.Query(sql: string) = this.Send sql
-
     member this.Close() =
         try
             this.Send ".exit" |> ignore

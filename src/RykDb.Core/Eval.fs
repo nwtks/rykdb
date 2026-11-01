@@ -432,10 +432,10 @@ module internal Eval =
             | Expr.Literal l -> step schema row kont (Arrive l.ToSqlValue)
             | Expr.Column c ->
                 match Schema.resolve schema c with
-                | Error er -> Error er
+                | Error er -> err er
                 | Ok i ->
                     match valueAt row i e with
-                    | Error er -> Error er
+                    | Error er -> err er
                     | Ok v -> step schema row kont (Arrive v)
             | Expr.Name n ->
                 let probeRef = { Qualifier = None; Name = n }
@@ -444,7 +444,7 @@ module internal Eval =
                 | Error _ -> err (sprintf "'%s' は列でも関数でもありません" n |> DbError.name)
                 | Ok i ->
                     match valueAt row i (Expr.Column probeRef) with
-                    | Error er -> Error er
+                    | Error er -> err er
                     | Ok v -> step schema row kont (Arrive v)
             | Expr.Star -> err (DbError.create ErrorKind.SyntaxError "WHERE 句に '*' は置けません")
             | Expr.QualifiedStar q -> err (sprintf "'%s.*' はここでは使えません" q |> DbError.name)
@@ -466,7 +466,7 @@ module internal Eval =
                 | a :: tail -> step schema row (KFuncArg(n, [], tail) :: kont) (Descend a)
                 | [] ->
                     match Scalar.applyFunc n [||] with
-                    | Error er -> Error er
+                    | Error er -> err er
                     | Ok v -> step schema row kont (Arrive v)
             | Expr.AggCall(f, _, _) -> err (sprintf "%s は集約なのでここでは評価できません" f.Name |> DbError.name)
         | Arrive v ->
@@ -496,7 +496,7 @@ module internal Eval =
                             | _ -> err (sprintf "'-' は数値に適用できません: %s" (SqlLiteral.toSqlLiteral v) |> DbError.typeError)
 
                 match computed with
-                | Error er -> Error er
+                | Error er -> err er
                 | Ok res -> step schema row rest (Arrive res)
             | KBinaryL(op, b) :: rest ->
                 let short =
@@ -511,11 +511,11 @@ module internal Eval =
             | KBinaryR(op, l) :: rest ->
                 let combined =
                     match op with
-                    | BinaryOp.Add -> arith ArithOp.Add l v
-                    | BinaryOp.Sub -> arith ArithOp.Sub l v
-                    | BinaryOp.Mul -> arith ArithOp.Mul l v
-                    | BinaryOp.Div -> arith ArithOp.Div l v
-                    | BinaryOp.Mod -> arith ArithOp.Mod l v
+                    | BinaryOp.Add -> arith Add l v
+                    | BinaryOp.Sub -> arith Sub l v
+                    | BinaryOp.Mul -> arith Mul l v
+                    | BinaryOp.Div -> arith Div l v
+                    | BinaryOp.Mod -> arith Mod l v
                     | BinaryOp.Concat ->
                         if SqlValue.isNull l || SqlValue.isNull v then
                             ret SqlValue.Null
@@ -540,7 +540,7 @@ module internal Eval =
                     | BinaryOp.Or -> ret (orValue l v)
 
                 match combined with
-                | Error er -> Error er
+                | Error er -> err er
                 | Ok res -> step schema row rest (Arrive res)
             | KIsNull negated :: rest ->
                 let isNull = SqlValue.isNull v
@@ -549,10 +549,10 @@ module internal Eval =
             | KBetweenLo(x, hi, negated) :: rest -> step schema row (KBetweenHi(x, v, negated) :: rest) (Descend hi)
             | KBetweenHi(x, lov, negated) :: rest ->
                 match truthOf "ge" x lov with
-                | Error er -> Error er
+                | Error er -> err er
                 | Ok ge ->
                     match truthOf "le" x v with
-                    | Error er -> Error er
+                    | Error er -> err er
                     | Ok le ->
                         match TruthValue.and2 ge le with
                         | TruthValue.True -> step schema row rest (Arrive(SqlValue.Bool(not negated)))
@@ -564,7 +564,7 @@ module internal Eval =
                 | cand :: tail -> step schema row (KInArg(v, negated, tail, false) :: rest) (Descend cand)
             | KInArg(x, negated, tail, sawUnknown) :: rest ->
                 match truthOf "eq" x v with
-                | Error er -> Error er
+                | Error er -> err er
                 | Ok TruthValue.True -> step schema row rest (Arrive(SqlValue.Bool(not negated)))
                 | Ok tv ->
                     let saw = sawUnknown || tv = TruthValue.Unknown
@@ -597,7 +597,7 @@ module internal Eval =
                 match tail with
                 | [] ->
                     match Scalar.applyFunc n (List.rev acc |> List.toArray) with
-                    | Error er -> Error er
+                    | Error er -> err er
                     | Ok res -> step schema row rest (Arrive res)
                 | a :: more -> step schema row (KFuncArg(n, acc, more) :: rest) (Descend a)
 

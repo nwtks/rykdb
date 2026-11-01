@@ -14,8 +14,63 @@ let private compose (a: VersionEdit) (b: VersionEdit) =
         DeletedFiles = a.DeletedFiles @ b.DeletedFiles
     }
 
+let private sstEntries n =
+    Array.init n (fun i -> SstEntry.make (intKey i) (uint64 (i + 1)) (Some [| SqlValue.Int(int64 i) |]))
+    |> Array.sortWith SstEntry.compare
+
 [<Fact>]
-let ``Version: ファイル追加でレベル構成が変わる`` () =
+let ``FileMetaData.zero: 空メタデータ`` () =
+    Assert.Equal(0L, FileMetaData.Zero.FileNumber)
+    Assert.Equal(0, FileMetaData.Zero.Level)
+    Assert.Equal(0L, FileMetaData.Zero.EntryCount)
+
+[<Fact>]
+let ``FileMetaData.writeSstable: 書き出してメタデータを返す`` () =
+    withDir "fmd-write" (fun dir ->
+        let entries = sstEntries 5
+        let fmd = ok (FileMetaData.writeSstable dir 1L 0 0.01 entries)
+        Assert.Equal(1L, fmd.FileNumber)
+        Assert.Equal(0, fmd.Level)
+        Assert.Equal(5L, fmd.EntryCount)
+        Assert.True(fmd.Size > 0L))
+
+[<Fact>]
+let ``FileMetaData.writeSstable: キー順でない入力はエラー`` () =
+    withDir "fmd-write-bad" (fun dir ->
+        let bad =
+            [|
+                SstEntry.make (intKey 5) 1UL (Some [| SqlValue.Int 5L |])
+                SstEntry.make (intKey 1) 2UL (Some [| SqlValue.Int 1L |])
+            |]
+
+        expectErrorKind ErrorKind.InternalError "キー順でない入力はエラーになるはず" (FileMetaData.writeSstable dir 1L 0 0.01 bad))
+
+[<Fact>]
+let ``FileMetaData.writeSstable: 書き込み失敗は IoError`` () =
+    withDir "fmd-write-io" (fun dir ->
+        let missing = System.IO.Path.Combine(dir, "no-such-dir")
+
+        expectErrorKind
+            ErrorKind.IoError
+            "存在しないディレクトリへの書き込みはエラーになるはず"
+            (FileMetaData.writeSstable missing 1L 0 0.01 (sstEntries 3)))
+
+[<Fact>]
+let ``FileMetaData.mightContain: 範囲内なら true`` () =
+    let f = FileMetaData.Zero
+
+    let f2 =
+        { f with
+            Smallest = [| 1uy |]
+            Largest = [| 5uy |]
+        }
+
+    Assert.True(FileMetaData.mightContain [| 3uy |] f2)
+    Assert.False(FileMetaData.mightContain [| 0uy |] f2)
+    Assert.False(FileMetaData.mightContain [| 9uy |] f2)
+
+[<Fact>]
+let ``Version.addFile: ファイル追加でレベル構成が変わる`` () =
     let v =
         Version.Empty
         |> Version.addFile (fmd 1L 0 100 199)
@@ -25,7 +80,7 @@ let ``Version: ファイル追加でレベル構成が変わる`` () =
     Assert.Equal<int array>([| 1; 1; 1; 0; 0; 0; 0 |], Version.levelCounts v)
 
 [<Fact>]
-let ``Version: 追加は破壊的でない`` () =
+let ``Version.addFile: 追加は破壊的でない`` () =
     let v0 = Version.Empty
     let v1 = Version.addFile (fmd 1L 0 100 199) v0
     Assert.Equal(0, (Version.levelCounts v0).[0])
@@ -35,7 +90,7 @@ let ``Version: 追加は破壊的でない`` () =
     Assert.Equal(1, (Version.filesAt 0 v1).Length)
 
 [<Fact>]
-let ``Version: 削除でレベル構成が変わる`` () =
+let ``Version.deleteFiles: 削除でレベル構成が変わる`` () =
     let v =
         Version.Empty
         |> Version.addFile (fmd 1L 0 100 199)
@@ -45,7 +100,7 @@ let ``Version: 削除でレベル構成が変わる`` () =
     Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts v)
 
 [<Fact>]
-let ``Version: ポイントルックアップの候補は新しい順`` () =
+let ``Version.filesForPointLookup: ポイントルックアップの候補は新しい順`` () =
     let v =
         Version.Empty
         |> Version.addFile (fmd 1L 0 100 199)
@@ -77,7 +132,7 @@ let ``Version: ポイントルックアップの候補は新しい順`` () =
     Assert.Empty(Version.filesForPointLookup (intKey 9999) v)
 
 [<Fact>]
-let ``VersionEdit: 変更適用は削除後に追加する`` () =
+let ``VersionEdit.apply: 変更適用は削除後に追加する`` () =
     let oldFile = fmd 1L 0 100 199
     let replacement = fmd 1L 1 200 299
     let initial = Version.Empty |> Version.addFile oldFile
@@ -94,19 +149,7 @@ let ``VersionEdit: 変更適用は削除後に追加する`` () =
     Assert.Equal(1L, (Version.filesAt 1 updated).[0].FileNumber)
 
 [<Fact>]
-let ``VersionEdit: レベルが範囲外なら CorruptionError`` () =
-    let bad =
-        { fmd 1L 0 100 199 with
-            Level = Levels.Max + 1
-        }
-
-    expectErrorKind
-        ErrorKind.CorruptionError
-        "レベルは 0..Max の範囲内"
-        (VersionEdit.decode (VersionEdit.encode (VersionEdit.addFile bad)))
-
-[<Fact>]
-let ``VersionEdit: エンコードの往復`` () =
+let ``VersionEdit.encode / decode: エンコードの往復`` () =
     let added = fmd 3L 1 300 350
     let deleted = fmd 1L 0 100 199
     let edit = compose (VersionEdit.addFile added) (VersionEdit.deleteFile deleted)
@@ -135,3 +178,15 @@ let ``VersionEdit: エンコードの往復`` () =
         Assert.Equal(deleted.FileNumber, e.DeletedFiles.[0].FileNumber)
         Assert.Equal(deleted.Level, e.DeletedFiles.[0].Level)
     | _ -> Assert.Fail "1レコードに復元されるはず"
+
+[<Fact>]
+let ``VersionEdit.encode / decode: レベルが範囲外なら CorruptionError`` () =
+    let bad =
+        { fmd 1L 0 100 199 with
+            Level = Levels.Max + 1
+        }
+
+    expectErrorKind
+        ErrorKind.CorruptionError
+        "レベルは 0..Max の範囲内"
+        (VersionEdit.decode (VersionEdit.encode (VersionEdit.addFile bad)))

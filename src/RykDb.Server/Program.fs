@@ -48,7 +48,7 @@ let main argv =
         eprintfn "%s" e
         1
     | Ok(port, root) ->
-        match Database.openWith root with
+        match Database.OpenWith root with
         | Error e ->
             eprintfn "DB を開けません: %s" (DbError.toDisplayString e)
             1

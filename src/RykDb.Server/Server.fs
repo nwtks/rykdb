@@ -33,8 +33,7 @@ let private escapeLine (s: string) =
     let sb = System.Text.StringBuilder s.Length
 
     s
-    |> String.iter (fun c ->
-        match c with
+    |> String.iter (function
         | '\\' -> sb.Append "\\\\" |> ignore
         | '\n' -> sb.Append "\\n" |> ignore
         | '\r' -> sb.Append "\\r" |> ignore
@@ -59,11 +58,11 @@ let private encode (columns: string array) (rows: SqlValue array array) =
     else
         let body =
             rows
-            |> Array.map (fun r -> r |> Array.map SqlLiteral.toSqlLiteral |> String.concat "," |> escapeLine)
+            |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat "," >> escapeLine)
 
         System.String.Join("\n", Array.append [| header |] body)
 
-let private handleClient (db: Database) (client: System.Net.Sockets.TcpClient) (onLog: string -> unit) =
+let private handleClient (onLog: string -> unit) (db: Database) (client: System.Net.Sockets.TcpClient) =
     use stream = client.GetStream()
 
     use reader =
@@ -94,14 +93,14 @@ let private handleClient (db: Database) (client: System.Net.Sockets.TcpClient) (
             let sql = line.Trim()
 
             if sql.Length = 0 then
-                running <- send (sprintf "%s 0" OkTag)
+                running <- sprintf "%s 0" OkTag |> send
             else
                 match sql with
                 | ".exit"
                 | ".quit" ->
                     send HaltTag |> ignore
                     running <- false
-                | ".ping" -> running <- send (sprintf "%s 0\tpong" OkTag)
+                | ".ping" -> running <- sprintf "%s 0\tpong" OkTag |> send
                 | ".tables" ->
                     let names = current.TableNames()
 
@@ -109,22 +108,25 @@ let private handleClient (db: Database) (client: System.Net.Sockets.TcpClient) (
                         if List.isEmpty names then
                             sprintf "%s 0" OkTag
                         else
-                            encode [| "tables" |] (names |> List.map (fun n -> [| SqlValue.Text n |]) |> List.toArray)
+                            names
+                            |> List.map (fun n -> [| SqlValue.Text n |])
+                            |> List.toArray
+                            |> encode [| "tables" |]
 
                     running <- send body
                 | _ ->
                     match current.Execute sql with
-                    | Error e -> running <- send (sprintf "%s %s" ErrTag (DbError.toDisplayString e))
+                    | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
                     | Ok(next, result) ->
                         current <- next
-                        running <- send (encode result.Columns result.Rows)
+                        running <- encode result.Columns result.Rows |> send
 
     if current.InTransaction then
         match current.Rollback() with
         | Ok rolledBack -> current <- rolledBack
-        | Error e -> onLog (sprintf "切断時のロールバックに失敗しました: %s" (DbError.toDisplayString e))
+        | Error e -> sprintf "切断時のロールバックに失敗しました: %s" (DbError.toDisplayString e) |> onLog
 
-    onLog "切断されました"
+    "切断されました" |> onLog
     current
 
 let serve
@@ -148,15 +150,15 @@ let serve
             let client = listener.AcceptTcpClient()
             client.ReceiveTimeout <- 30000
             clientId <- clientId + 1
-            onLog (sprintf "[%d] 接続されました" clientId)
+            sprintf "[%d] 接続されました" clientId |> onLog
 
             try
                 let finalDb =
-                    handleClient currentDb client (fun m -> onLog (sprintf "[%d] %s" clientId m))
+                    handleClient (fun m -> sprintf "[%d] %s" clientId m |> onLog) currentDb client
 
                 currentDb <- finalDb
             with ex ->
-                onLog (sprintf "[%d] 例外: %s" clientId ex.Message)
+                sprintf "[%d] 例外: %s" clientId ex.Message |> onLog
 
             try
                 if client.Client.Connected then
@@ -165,7 +167,7 @@ let serve
                 ()
 
             client.Close()
-            onLog (sprintf "[%d] 切断されました" clientId)
+            sprintf "[%d] 切断されました" clientId |> onLog
         with
         | :? System.ObjectDisposedException -> ()
         | :? System.InvalidOperationException when stop.IsCancellationRequested -> ()
@@ -173,7 +175,7 @@ let serve
         | :? System.Net.Sockets.SocketException -> ()
         | ex ->
             if not stop.IsCancellationRequested then
-                onLog (sprintf "接続処理で例外: %s" ex.Message)
+                sprintf "接続処理で例外: %s" ex.Message |> onLog
 
     listener.Stop()
     currentDb.Close() |> ignore

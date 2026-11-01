@@ -270,7 +270,7 @@ module internal Expr =
                         Visit c |> rewriteLoop (next :: more)
                     | [] ->
                         match plugChildren (v :: frame.Done |> List.rev) frame.Parent with
-                        | Error er -> Error er
+                        | Error er -> err er
                         | Ok parent -> Arrive parent |> rewriteLoop more
 
         Visit root |> rewriteLoop []
