@@ -88,30 +88,27 @@ module internal Dml =
                         | _, None -> emitRemaining (i + 1) |> Op.next)
 
             let rec merge cur i =
-                Op.Compute(fun () ->
-                    if i >= slotArr.Length then
-                        Op.next cur |> Result.map (Option.map (fun (r, nx) -> r, merge nx i))
-                    else
+                if i >= slotArr.Length then
+                    cur
+                else
+                    Op.Compute(fun () ->
                         match Op.next cur with
                         | Error e -> err e
                         | Ok None -> emitRemaining i |> Op.next
-                        | Ok(Some(row, nx)) ->
+                        | Ok(Some(row, nxt)) ->
                             let rk = keyOf row
                             let sk, sv = slotArr.[i]
 
                             match Bytes.compare rk sk with
-                            | c when c < 0 ->
-                                match sv with
-                                | Some v -> ret (Some(v, merge cur (i + 1)))
-                                | None -> merge cur (i + 1) |> Op.next
+                            | c when c < 0 -> ret (Some(row, merge nxt i))
                             | 0 ->
                                 match sv with
-                                | Some v -> ret (Some(v, merge nx (i + 1)))
-                                | None -> merge nx (i + 1) |> Op.next
+                                | Some v -> ret (Some(v, merge nxt (i + 1)))
+                                | None -> merge nxt (i + 1) |> Op.next
                             | _ ->
                                 match sv with
-                                | Some v -> ret (Some(v, merge cur (i + 1)))
-                                | None -> merge cur (i + 1) |> Op.next)
+                                | Some v -> ret (Some(v, Op.Step(row, merge nxt (i + 1))))
+                                | None -> ret (Some(row, merge nxt (i + 1))))
 
             merge rows 0
 
@@ -283,7 +280,11 @@ module internal Dml =
             let pk = RowKey.primary schema row
 
             match Transaction.tryFind tks pk txn with
-            | Some(Some _) -> return! err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
+            | Some(Some _) ->
+                return!
+                    sprintf "PRIMARY KEY 制約に違反: %s" schema.Name
+                    |> DbError.constraintViolation
+                    |> err
             | _ -> ()
 
             let next = Transaction.put tks pk row txn
@@ -298,10 +299,9 @@ module internal Dml =
             if Array.forall2 (=) (TableSchema.primaryKeyOf schema oldRow) (TableSchema.primaryKeyOf schema newRow) then
                 ret ()
             else
-                err (
-                    sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
-                    |> DbError.constraintViolation
-                )
+                sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
+                |> DbError.constraintViolation
+                |> err
 
         result {
             do! TableSchema.validateRow schema newRow

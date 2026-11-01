@@ -81,7 +81,7 @@ module internal Binder =
     /// 葉だけを直し、非葉ノードは形を保ったまま子を 1つずつ加工してから
     /// `Expr.plugChildren` で組み直す（`Expr.rewrite` の評価機）。
     /// </remarks>
-    let qualify (schema: Schema) (e: Expr) =
+    let qualify (schema: Schema) =
         let uniqueQualifier (name: string) =
             let lower = name.ToLowerInvariant()
 
@@ -110,24 +110,24 @@ module internal Binder =
                 | None -> x
             | _ -> x
 
-        Expr.rewrite rewriteLeaf e
+        Expr.rewrite rewriteLeaf
 
     /// 複数の式をまとめて修飾名へ。
-    let qualifyMany (schema: Schema) (exprs: Expr list) =
-        exprs |> List.map (fun e -> qualify schema e) |> all
+    let qualifyMany (schema: Schema) =
+        List.map (fun e -> qualify schema e) >> all
 
     /// 式が指定したテーブルの列だけを参照しているか。
     /// 修飾子のない列はどのテーブル由来か特定できないため、false とする
     /// （曖昧な列を誤って pushdown しないため）。
-    let referencesOnly (table: string) (e: Expr) =
+    let referencesOnly (table: string) =
         let lower = table.ToLowerInvariant()
 
-        Expr.columnRefs e
-        |> List.map (fun c ->
+        Expr.columnRefs
+        >> List.map (fun c ->
             match c.Qualifier with
             | Some q -> (q + "." + c.Name).ToLowerInvariant()
             | None -> c.Name.ToLowerInvariant())
-        |> List.forall (fun full ->
+        >> List.forall (fun full ->
             match full.LastIndexOf '.' with
             | -1 -> false
             | i -> full.[0 .. i - 1] = lower)
@@ -135,7 +135,7 @@ module internal Binder =
     /// 修飾子なしの列が、結合後スキーマで複数テーブルにまたがって存在するか。
     /// そのような式はどのテーブルにも pushdown してはいけない
     /// （各テーブルで個別に評価すると、曖昧エラーにならず意味が変わる）。
-    let hasAmbiguousColumn (schema: Schema) (e: Expr) =
+    let hasAmbiguousColumn (schema: Schema) =
         Expr.fold
             (fun acc x ->
                 match x with
@@ -143,8 +143,7 @@ module internal Binder =
                 | Expr.Name n -> n :: acc
                 | _ -> acc)
             []
-            e
-        |> List.exists (fun name ->
+        >> List.exists (fun name ->
             schema.Columns
             |> Array.filter (fun (c: OutputColumn) -> Catalog.eqName c.Name name)
             |> Array.length
@@ -177,8 +176,8 @@ module internal Alias =
             aliases
             |> Map.map (fun _ v -> namesOf v |> List.filter (fun n -> Map.containsKey n aliases))
 
-        let rec searchCycle start visited stack =
-            match stack with
+        let rec searchCycle start visited =
+            function
             | [] -> false
             | n :: rest ->
                 if n = start then
@@ -205,7 +204,7 @@ module internal Alias =
     /// 入力のスキーマに同名の列があれば列を優先する（曖昧を避ける）。
     /// 差し替えた式の中の名前も差し替え対象になる（別名の連鎖を解決する）。
     /// （`Expr.rewrite` はplugChildren の失敗を返すので Result になる）
-    let substitute (schema: Schema) (aliases: Map<string, Expr>) (e: Expr) =
+    let substitute (schema: Schema) (aliases: Map<string, Expr>) =
         let rewriteLeaf x =
             match x with
             | Expr.Name name ->
@@ -217,12 +216,11 @@ module internal Alias =
                 | None -> x
             | _ -> x
 
-        Expr.rewrite rewriteLeaf e
+        Expr.rewrite rewriteLeaf
 
     /// 集計を含む別名は差し替えない表（GROUP BY 用）。
     /// 集計をグループキーにすると意味が壊れるため）。
-    let withoutAggregates (aliases: Map<string, Expr>) =
-        aliases |> Map.filter (fun _ e -> not (Expr.isAggregate e))
+    let withoutAggregates = Map.filter (fun (_: string) e -> not (Expr.isAggregate e))
 
 module internal Predicate =
     /// 未処理の式のスタックを辿って `AND` を平坦化する。
@@ -241,14 +239,11 @@ module internal Predicate =
     let splitConjuncts (e: Expr) = flattenLoop [] [ e ]
 
     /// conjunct を全部 `AND` で繋ぎ直す。
-    let joinConjuncts (parts: Expr list) =
-        match parts with
+    let joinConjuncts =
+        function
         | [] -> None
         | [ x ] -> Some x
         | x :: rest -> Some(List.fold (fun acc p -> Expr.Binary(BinaryOp.And, acc, p)) x rest)
-
-    /// この conjunct は指定テーブルの列だけを参照しているか。
-    let isLocalTo = Binder.referencesOnly
 
 /// 1 つのテーブルが持つスキーマと、その識別名。
 type internal TableBinding =
@@ -441,8 +436,8 @@ module internal Analyzer =
             | _ -> None
         | _ -> None
 
-    let private rangeBounds (tn: string) (colName: string) (predicates: Expr list) =
-        let rec accumulateBounds (tn: string) (colName: string) (lower: SqlValue option) (upper: SqlValue option) =
+    let private rangeBounds (tn: string) (colName: string) =
+        let rec accumulateBounds tn colName lower upper =
             function
             | [] -> lower, upper
             | e :: tail ->
@@ -533,9 +528,7 @@ module internal Analyzer =
                     | _ -> accumulateBounds tn colName lower upper tail
                 | _ -> accumulateBounds tn colName lower upper tail
 
-        predicates
-        |> List.collect Predicate.splitConjuncts
-        |> accumulateBounds tn colName None None
+        List.collect Predicate.splitConjuncts >> accumulateBounds tn colName None None
 
     /// WHERE から等価条件を探して走査方法を決める。
     /// 複合主キー・複合索引は、全列の等値条件が揃ったときだけ Lookup にする。

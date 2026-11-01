@@ -137,6 +137,26 @@ let ``Database: transaction 中の文エラーはそのまま返る`` () =
         expectError "BEGIN 中の存在しないテーブル" (db1.Execute "SELECT * FROM nope"))
 
 [<Fact>]
+let ``Database: 複数文 Execute の BEGIN 後エラーで登録を残さない`` () =
+    withDb "tx-begin-error-cleanup" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+
+        // BEGIN で作られた ActiveSnapshot 登録は、この Execute がエラーになると
+        // どの Database ハンドルにも紐づかない。残ると DDL が永久に ConflictError になる。
+        expectError "BEGIN 後の途中エラー" (db1.Execute "BEGIN; INSERT INTO t VALUES (1, 10); SELECT * FROM nope")
+
+        // 登録が残っていれば CREATE INDEX は ConflictError になる。
+        let db2 = exec db1 "CREATE INDEX ix_v ON t (v)"
+
+        // 途中の INSERT は commit されていない。
+        let _, count = ok (db2.Execute "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(0L, asInt count.Rows.[0].[0])
+
+        let db3, _ = ok (db2.Execute "INSERT INTO t VALUES (2, 20)")
+        let _, found = ok (db3.Execute "SELECT id FROM t WHERE v = 20")
+        Assert.Equal<int>(1, found.Rows.Length))
+
+[<Fact>]
 let ``Database: 明示 transaction 中の DDL はエラーになる`` () =
     withDb "tx-ddl" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -352,6 +372,72 @@ let ``E2E: 明示 transaction 内の書き込みが SELECT に見える`` () =
         let committed = ok (tx6.Commit())
         let _, after = ok (committed.Execute "SELECT id FROM t")
         Assert.Equal<int>(0, after.Rows.Length))
+
+[<Fact>]
+let ``E2E: 既存行がある transaction 内の INSERT は SELECT に全行見える`` () =
+    withDb "tx-overlay-insert" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 10), (3, 30), (5, 50)")
+
+        let tx0 = ok (db2.Begin())
+        let tx1, _ = ok (tx0.Execute "INSERT INTO t VALUES (0, 0), (2, 20), (4, 40)")
+
+        let tx2, rows = ok (tx1.Execute "SELECT id, v FROM t ORDER BY id")
+        Assert.Equal<int64 array>([| 0L; 1L; 2L; 3L; 4L; 5L |], rows.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        let committed = ok (tx2.Commit())
+        let _, after = ok (committed.Execute "SELECT id FROM t ORDER BY id")
+        Assert.Equal<int64 array>([| 0L; 1L; 2L; 3L; 4L; 5L |], after.Rows |> Array.map (fun r -> asInt r.[0])))
+
+[<Fact>]
+let ``E2E: 既存行がある transaction 内の複数 UPDATE が正しい`` () =
+    withDb "tx-overlay-update" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+
+        let tx0 = ok (db2.Begin())
+        let tx1, _ = ok (tx0.Execute "UPDATE t SET v = 100 WHERE id = 1")
+        let tx2, _ = ok (tx1.Execute "UPDATE t SET v = 300 WHERE id = 3")
+
+        let tx3, rows = ok (tx2.Execute "SELECT id, v FROM t ORDER BY id")
+        Assert.Equal<int>(3, rows.Rows.Length)
+        Assert.Equal<int64>(1L, asInt rows.Rows.[0].[0])
+        Assert.Equal<int64>(100L, asInt rows.Rows.[0].[1])
+        Assert.Equal<int64>(2L, asInt rows.Rows.[1].[0])
+        Assert.Equal<int64>(20L, asInt rows.Rows.[1].[1])
+        Assert.Equal<int64>(3L, asInt rows.Rows.[2].[0])
+        Assert.Equal<int64>(300L, asInt rows.Rows.[2].[1])
+
+        let committed = ok (tx3.Commit())
+        let _, after = ok (committed.Execute "SELECT id, v FROM t ORDER BY id")
+        Assert.Equal<int64>(100L, asInt after.Rows.[0].[1])
+        Assert.Equal<int64>(20L, asInt after.Rows.[1].[1])
+        Assert.Equal<int64>(300L, asInt after.Rows.[2].[1]))
+
+[<Fact>]
+let ``E2E: 既存行がある transaction 内の索引検索が書き込みを見る`` () =
+    withDb "tx-overlay-index" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "CREATE INDEX ix_t_v ON t (v)"
+        let db3, _ = ok (db2.Execute "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+
+        let tx0 = ok (db3.Begin())
+        let tx1, _ = ok (tx0.Execute "INSERT INTO t VALUES (4, 40)")
+
+        let tx2, added = ok (tx1.Execute "SELECT id FROM t WHERE v = 40")
+        Assert.Equal<int>(1, added.Rows.Length)
+        Assert.Equal<int64>(4L, asInt added.Rows.[0].[0])
+
+        let tx3, _ = ok (tx2.Execute "DELETE FROM t WHERE id = 2")
+        let tx4, deleted = ok (tx3.Execute "SELECT id FROM t WHERE v = 20")
+        Assert.Equal<int>(0, deleted.Rows.Length)
+
+        let tx5, _ = ok (tx4.Execute "UPDATE t SET v = 35 WHERE id = 3")
+        let tx6, oldKey = ok (tx5.Execute "SELECT id FROM t WHERE v = 30")
+        Assert.Equal<int>(0, oldKey.Rows.Length)
+
+        let _, newKey = ok (tx6.Execute "SELECT id FROM t WHERE v = 35")
+        Assert.Equal<int>(1, newKey.Rows.Length))
 
 [<Fact>]
 let ``E2E: 明示 transaction 内の索引検索が書き込みを見る`` () =
@@ -952,6 +1038,25 @@ let ``Database: HAVING でグループを絞る`` () =
         Assert.Equal<int>(2, res2.Rows.Length)
         Assert.Equal<int64>(30L, asInt res2.Rows.[0].[0])
         Assert.Equal<int64>(35L, asInt res2.Rows.[1].[0]))
+
+[<Fact>]
+let ``Database: HAVING にしか現れない集約でも絞り込める`` () =
+    seeded "sel-having-only" (fun db ->
+        let db2, _r = execRes db "INSERT INTO people VALUES (4,'dave',30)"
+
+        // COUNT(*) は SELECT に含めない（HAVING だけで使う）。
+        let _q, res =
+            execRes db2 "SELECT age FROM people GROUP BY age HAVING COUNT(*) > 1 ORDER BY age"
+
+        Assert.Equal<int>(1, res.Rows.Length)
+        Assert.Equal<int64>(30L, asInt res.Rows.[0].[0])
+
+        // GROUP BY なしでも HAVING の集約を使える。
+        let _q2, grouped = execRes db2 "SELECT 1 FROM people HAVING COUNT(*) > 0"
+        Assert.Equal<int>(1, grouped.Rows.Length)
+
+        let _q3, empty = execRes db2 "SELECT 1 FROM people HAVING COUNT(*) > 100"
+        Assert.Equal<int>(0, empty.Rows.Length))
 
 [<Fact>]
 let ``Database: LIMIT`` () =
@@ -1805,6 +1910,11 @@ let ``Database: 古いハンドルを Close しても新しいハンドルの co
         // db2 は db3 より前の状態。古いハンドルの Close で WAL を消してはいけない。
         ok (db2.Close())
 
+        // 古いハンドルの Close は、生きている db3 のプロセスロックも解放しない。
+        expectErrorKind ErrorKind.IoError "古いハンドルの Close で再オープンできてしまった" (Database.OpenWith dir)
+
+        // 最新ハンドルを閉じれば WAL もロックも解放され、再オープンできる。
+        ok (db3.Close())
         let reopened = ok (Database.OpenWith dir)
         let after = query reopened "SELECT COUNT(*) FROM t"
         Assert.Equal<int64>(2L, asInt after.Rows.[0].[0])
@@ -1992,6 +2102,29 @@ let ``Database: 明示 transaction があるハンドルは Close でロック�
         ok (tx.Close())
         ok (Database.OpenWith dir) |> fun d -> ok (d.Close()))
 
+[<Fact>]
+let ``Database: 古いハンドルの Close は生きている新しいハンドルのロックを解放しない`` () =
+    withDir "old-close-lock" (fun dir ->
+        let db0 = ok (Database.OpenWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 10)")
+        let db3, _ = ok (db2.Execute "INSERT INTO t VALUES (2, 20)")
+
+        // db0 は最新ではない。ここでロックを外すと、db3 が生きているのに
+        // 同じ root を別 store で開けてしまう。
+        ok (db0.Close())
+        expectErrorKind ErrorKind.IoError "古いハンドルの Close でロックが外れてしまった" (Database.OpenWith dir)
+
+        // 新しいハンドルはそのまま使える。
+        let db4, counted = ok (db3.Execute "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(2L, asInt counted.Rows.[0].[0])
+
+        // 最新ハンドルを閉じれば解放される。
+        ok (db4.Close())
+        let reopened = ok (Database.OpenWith dir)
+        let _, after = ok (reopened.Execute "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(2L, asInt after.Rows.[0].[0])
+        ok (reopened.Close()))
 
 [<Fact>]
 let ``Database: 実行中の transaction があると DDL は ConflictError`` () =

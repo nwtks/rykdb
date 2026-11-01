@@ -28,15 +28,14 @@ module internal Optimizer =
                 return bindings
             }
 
-        let concatSchemas bindings =
-            bindings |> List.map Analyzer.schemaOf |> Schema.concatAll
+        let concatSchemas = List.map Analyzer.schemaOf >> Schema.concatAll
 
         let buildScan catalog allSchema b predicates =
             let name = Analyzer.refName b
 
             let local =
                 predicates
-                |> List.filter (fun p -> Predicate.isLocalTo name p && not (Binder.hasAmbiguousColumn allSchema p))
+                |> List.filter (fun p -> Binder.referencesOnly name p && not (Binder.hasAmbiguousColumn allSchema p))
 
             result {
                 let! method = Analyzer.chooseScanMethod b catalog local
@@ -61,7 +60,7 @@ module internal Optimizer =
                 let rightPreds =
                     predicates
                     |> List.filter (fun p ->
-                        Predicate.isLocalTo rightName p && not (Binder.hasAmbiguousColumn allSchema p))
+                        Binder.referencesOnly rightName p && not (Binder.hasAmbiguousColumn allSchema p))
 
                 match j.Kind with
                 | JoinKind.Inner ->
@@ -74,7 +73,7 @@ module internal Optimizer =
 
         let localToAny allSchema bindings p =
             not (Binder.hasAmbiguousColumn allSchema p)
-            && bindings |> List.exists (fun b -> Predicate.isLocalTo (Analyzer.refName b) p)
+            && bindings |> List.exists (fun b -> Binder.referencesOnly (Analyzer.refName b) p)
 
         let applyAggregate schema stmt tree =
             let aliases = Alias.dropCyclic (Alias.ofItems stmt.Items)
@@ -98,16 +97,16 @@ module internal Optimizer =
                 let selectAggs = Ops.aggCalls (qs |> List.take (List.length selectExprs))
                 let orderAggs = orderExprs |> List.map (fun e -> Ops.aggCalls [ e ]) |> List.concat
 
-                let! having =
+                let! having, havingAggs =
                     match stmt.Having with
-                    | None -> ret None
+                    | None -> ret (None, [])
                     | Some h ->
                         result {
                             let! h' = Alias.substitute schema aliases h
                             let! hs = Binder.qualifyMany schema [ h' ]
 
                             match hs with
-                            | [ hv ] -> return Some hv
+                            | [ hv ] -> return Some hv, Ops.aggCalls [ hv ]
                             | _ -> return! err (DbError.internalError "HAVING の修飾に失敗")
                         }
 
@@ -119,7 +118,7 @@ module internal Optimizer =
                     |> all
                     >>= Binder.qualifyMany schema
 
-                let allAggs = selectAggs @ orderAggs
+                let allAggs = selectAggs @ orderAggs @ havingAggs
                 let hasAgg = not (List.isEmpty allAggs)
                 let hasGroupBy = not (List.isEmpty groupBy)
 
@@ -134,10 +133,11 @@ module internal Optimizer =
 
                 if (hasAgg || hasGroupBy) && hasStar then
                     return!
-                        err (DbError.create ErrorKind.SyntaxError "GROUP BY / 集約関数を使うときは SELECT * を書けません（列を明示してください）")
+                        DbError.create ErrorKind.SyntaxError "GROUP BY / 集約関数を使うときは SELECT * を書けません（列を明示してください）"
+                        |> err
                 elif not (hasAgg || hasGroupBy) then
                     match having with
-                    | Some _ -> return! err (DbError.create ErrorKind.SyntaxError "HAVING には GROUP BY か集約関数が必要です")
+                    | Some _ -> return! DbError.create ErrorKind.SyntaxError "HAVING には GROUP BY か集約関数が必要です" |> err
                     | None -> return tree
                 else
                     let aggNode = Logical.Aggregate(groupBy, allAggs, tree)
@@ -177,12 +177,9 @@ module internal Optimizer =
             function
             | Expr.Literal(Literal.Int i) when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
             | Expr.Literal(Literal.Int _) ->
-                err (
-                    DbError.create
-                        ErrorKind.SyntaxError
-                        (sprintf "%s は 0 以上 %d 以下の整数で指定してください" what System.Int32.MaxValue)
-                )
-            | _ -> err (DbError.create ErrorKind.SyntaxError (sprintf "%s は整数リテラルで指定してください" what))
+                DbError.create ErrorKind.SyntaxError (sprintf "%s は 0 以上 %d 以下の整数で指定してください" what System.Int32.MaxValue)
+                |> err
+            | _ -> DbError.create ErrorKind.SyntaxError (sprintf "%s は整数リテラルで指定してください" what) |> err
 
         let applyLimit stmt tree =
             match stmt.Limit, stmt.Offset with
@@ -394,8 +391,8 @@ module internal Optimizer =
                         keys.RightIndices
                         keys.Residual
             | JoinAlgorithm.IndexNestedLoop _ ->
-                err (DbError.internalError "index nested loop は JoinIndexLeftFrame で実行します")
-            | JoinAlgorithm.MergeJoin -> err (DbError.internalError "merge join は未実装です")
+                DbError.internalError "index nested loop は JoinIndexLeftFrame で実行します" |> err
+            | JoinAlgorithm.MergeJoin -> DbError.internalError "merge join は未実装です" |> err
 
         match step with
         | EvalNode(node, inSchema, hint) ->
@@ -541,7 +538,8 @@ module internal Optimizer =
     /// child を実行するときの入力スキーマではない。
     /// ここを間違えると、`SELECT SUM(age) FROM t` で
     /// 集約ノードが「集約後のヘッダ（`SUM(t.age)`）」を入力として受け取るため、
-    /// 引数の `t.age` を評価できず `SUM` が Null になり、 `GROUP BY` も別の列でグループ化してしまう。
+    /// 引数の `t.age` を評価できず `SUM` が Null になり、
+    /// `GROUP BY` も別の列でグループ化してしまう。
     /// childSchema は「そのノードが結果を読む側」だけが使う。
     /// </remarks>
     let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
@@ -550,10 +548,9 @@ module internal Optimizer =
 module internal Plan =
     /// SELECT 文を実行して、結果（列名 + 行）を返す。
     let runSelect (ctx: ExecContext) (stmt: SelectStatement) =
-        let registerAll (sources: TableRef list) =
-            sources
-            |> foldOk
-                (fun (c, acc) r ->
+        let registerAll =
+            foldOk
+                (fun (c, acc) (r: TableRef) ->
                     result {
                         let realName = r.Name
                         let! schema = ExecContext.schemaOf realName c
@@ -580,7 +577,7 @@ module internal Plan =
             |> List.tryFind (fun (_, c) -> c > 1)
 
         match duplicate with
-        | Some(name, _) -> err (sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name)
+        | Some(name, _) -> sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name |> err
         | None ->
             result {
                 let! ctx2, schema = registerAll sources

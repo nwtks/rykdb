@@ -27,6 +27,13 @@ type Database internal (root: string, state: DbState) =
     /// （放棄された transaction で DDL が永久に ConflictError にならないようにする）。
     let lease = state.ActiveRegistration |> Option.map RegistrationLease
 
+    /// このハンドルがプロセスロックの所有者か判定するためのトークン。
+    /// `Execute` / `Begin` / `Commit` は新しいハンドルを返すので、
+    /// 新しいハンドルを作るたびに所有者を置き換える。
+    /// 古いハンドルの Close で、生きている新しいハンドルのロックを外さないため。
+    let storeLeaseToken =
+        state.Store.Lock |> Option.map (fun lockLease -> lockLease.Attach())
+
     /// DB を開く。
     /// <remarks>
     /// 同じ root はプロセス内で 1つしか開けない。2回目は `IoError` を返す
@@ -86,14 +93,18 @@ type Database internal (root: string, state: DbState) =
     /// <remarks>
     /// ハンドルは不変なので「閉じた」状態をこのハンドルには記録しない。
     /// Close 後に同じハンドルで Execute すると WAL が再作成されるため、Close 後は破棄すること。
-    /// 二重 Close は安全（2 回目は何もしない）。
+    /// 二重 Close は安全（2回目は何もしない）。
     /// 進行中の transaction は ActiveSnapshot の登録から外す
     /// （閉じたハンドルの transaction はもう読めないため、版を残す理由が無い）。
     /// Close し忘れても、登録は最後のハンドルが GC された時点で外れる（`RegistrationLease`）。
     /// </remarks>
     member _.Close() =
         lease |> Option.iter _.Release()
-        RowStore.close state.Store
+
+        match state.Store.Lock, storeLeaseToken with
+        | Some lockLease, Some token when lockLease.IsOwner token -> RowStore.close state.Store
+        | Some _, Some _ -> ret ()
+        | _ -> RowStore.close state.Store
 
     interface System.IDisposable with
         member this.Dispose() = this.Close() |> ignore
@@ -167,8 +178,9 @@ type Database internal (root: string, state: DbState) =
     /// 明示的な transaction が無い場合は暗黙の transactionで実行し commit する。
     /// 複数文(`;` 区切り)が渡された場合は順に実行する。
     /// </remarks>
-    member _.Execute(sql: string) =
+    member this.Execute(sql: string) =
         let results = ResizeArray<StatementResult>()
+        let registrations = ResizeArray<ActiveRegistration>()
 
         let rec runStatements st stmts =
             match stmts with
@@ -179,6 +191,9 @@ type Database internal (root: string, state: DbState) =
                     match Engine.executeBegin st with
                     | Error e -> err e
                     | Ok nextState ->
+                        if st.Active.IsNone then
+                            nextState.ActiveRegistration |> Option.iter registrations.Add
+
                         results.Add StatementResult.Empty
                         runStatements nextState tail
                 | Statement.Commit ->
@@ -198,22 +213,35 @@ type Database internal (root: string, state: DbState) =
                         results.Add result
                         runStatements nextState tail
 
+        let finishError e =
+            registrations |> Seq.iter (ActiveSnapshotRegistry.unregister state.Root)
+            err e
+
         result {
             let! stmts = Parser.parseStatements sql
-            let! finalState = runStatements state stmts
 
-            let selects =
-                results |> Seq.filter (fun r -> not (Array.isEmpty r.Columns)) |> Seq.toList
+            match runStatements state stmts with
+            | Error e -> return! finishError e
+            | Ok finalState ->
+                let selects =
+                    results |> Seq.filter (fun r -> not (Array.isEmpty r.Columns)) |> Seq.toList
 
-            let summary =
-                match selects with
-                | [ s ] -> s
-                | _ ->
-                    {
-                        RowsAffected = results |> Seq.sumBy _.RowsAffected
-                        Columns = [||]
-                        Rows = [||]
-                    }
+                let summary =
+                    match selects with
+                    | [ s ] -> s
+                    | _ ->
+                        {
+                            RowsAffected = results |> Seq.sumBy _.RowsAffected
+                            Columns = [||]
+                            Rows = [||]
+                        }
 
-            return new Database(root, finalState), summary
+                let isReadOnly =
+                    stmts
+                    |> List.forall (function
+                        | Statement.Select _ -> true
+                        | _ -> false)
+
+                let next = if isReadOnly then this else new Database(root, finalState)
+                return next, summary
         }

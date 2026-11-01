@@ -1188,7 +1188,14 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 一致する（= 自分が最新の書き手）ときだけ flush と WAL 削除を行う。
 一致しなければ何もしない（データは WAL に残っており、新しいハンドルが flush する）。
 
-- 回帰テスト: `Database: 古いハンドルを Close しても新しいハンドルの commit は失われない`。
+同じ理由で **古いハンドルの `Close()` は `ProcessLock` も解放しない**。
+`Database` は `ProcessLockLease` の所有者トークンを持ち、
+新しいハンドルが作られるたびに所有者が移る。
+所有者（最新）の `Close()` だけが全 keyspace を閉じて `.rykdb.lock` を解放する。
+
+- 回帰テスト:
+  `Database: 古いハンドルを Close しても新しいハンドルの commit は失われない` /
+  `Database: 古いハンドルの Close は生きている新しいハンドルのロックを解放しない`。
 
 ### 11.15 DDL は明示トランザクションに参加しない（ので拒否する）
 
@@ -1241,7 +1248,8 @@ DDL だけはプロセス内で排他にする必要がある。
 **既にこのプロセスが開いている root の 2回目は `IoError`** にする。
 
 - 失敗を返す方が、黙って古い行を返すより安全。
-- `Close()` でロックを解放（二重 `Close` は無害）。
+- **最新ハンドルの `Close()`** でロックを解放（二重 `Close` は無害）。
+  古いハンドルの `Close()` は no-op（`ProcessLockLease` の所有者だけが解放する）。
 - **クラッシュ再現テストは `RowStore.openStoreTakingOver` と internal の `Database.OpenWithStore` を使う**。
   ここだけは意図的に二重オープンし、WAL 再生を検証する。
 - 開く途中で失敗したら（壊れた MANIFEST など）**必ず解放する**。
@@ -1250,7 +1258,8 @@ DDL だけはプロセス内で排他にする必要がある。
 - 回帰テスト:
   `Database: 別プロセスが開いている DB は開けない` /
   `Database: 同じ root を二度開くと同じプロセスのエラーになり、Close 後は開ける` /
-  `Database: 明示 transaction があるハンドルは Close でロックを外す`。
+  `Database: 明示 transaction があるハンドルは Close でロックを外す` /
+  `Database: 古いハンドルの Close は生きている新しいハンドルのロックを解放しない`。
 
 ### 11.17 識別子の比較は `SqlName.equal` に一本化する
 
@@ -1354,3 +1363,38 @@ Footer は Meta / Bloom / Index の連続領域を守る `metadataChecksum` と�
 - インデックス入れ子ループは、右部分木が `Filter` のときは使わない
   （右への WHERE pushdown を落とさないため）。
   `LEFT JOIN` の右側述語は結合後なので `Scan` のまま使える。
+
+### 11.28 `Op` は one-shot — `Op.next cur` の後の `cur` を再利用しない
+
+`Op.ofSeq` は共有の enumerator を進めながら行を返す。
+`Op.next cur` を呼んだ後、返り値の `nxt` ではなく `cur` をもう一度 `Op.next` すると、
+**先頭行ではなく次の行**が返る。
+transaction の overlay（store の行 + txn のスロット）で `cur` を再利用してしまい、
+既存行がある状態の `BEGIN; INSERT/UPDATE; SELECT` が行の欠落・重複・古い値を返していた
+（`Dml.overlayRows`）。
+
+- 正しい形: `match Op.next cur with | Ok(Some(row, nxt)) -> ... merge nxt ...`
+- 回帰テスト: `E2E: 既存行がある transaction 内の INSERT は SELECT に全行見える` /
+  `...複数 UPDATE が正しい` / `...索引検索が書き込みを見る`。
+- store が空の transaction だけを試すと、このバグは出ない。
+
+### 11.29 HAVING の集約は HAVING からも集める
+
+`allAggs` を SELECT / ORDER BY の集約だけから作ると、
+`SELECT age ... GROUP BY age HAVING COUNT(*) > 1` の `COUNT(*)` が集約ノードで計算されず、
+`substituteAggs` が `NULL` に置き換えるため条件が UNKNOWN になり、**静かに 0行**になる。
+
+- `Planner.applyAggregate` は HAVING の式から `Ops.aggCalls` で集約を集め、
+  `allAggs` と `hasAgg` に含める。
+- 回帰テスト: `Database: HAVING にしか現れない集約でも絞り込める`。
+
+### 11.30 複数文 `Execute` の `BEGIN` 後エラーは ActiveSnapshot を解除する
+
+`Database.Execute "BEGIN; ..."` が途中で失敗すると、`Engine.executeBegin` が作った
+`ActiveSnapshot` 登録はどの `Database` ハンドルにも紐づかない
+（`RegistrationLease` が作られない）。
+解除しないと GC でも外れず、その root の DDL が永久に `ConflictError` になる。
+`Database.Execute` は `Statement.Begin` が作った登録を覚え、
+`runStatements` が Error を返したら明示的に `unregister` する。
+
+- 回帰テスト: `Database: 複数文 Execute の BEGIN 後エラーで登録を残さない`。

@@ -105,10 +105,9 @@ module internal Keyspace =
         let bytes = System.Text.Encoding.UTF8.GetByteCount name
 
         if bytes > MaxNameBytes then
-            err (
-                sprintf "%s名 %s は長すぎます（UTF-8 で %d バイト以下にしてください）" kind name MaxNameBytes
-                |> DbError.name
-            )
+            sprintf "%s名 %s は長すぎます（UTF-8 で %d バイト以下にしてください）" kind name MaxNameBytes
+            |> DbError.name
+            |> err
         else
             ret ()
 
@@ -122,9 +121,9 @@ type internal RowStore =
         Engines: Map<string, IStorageEngine>
         /// まだ開いていない keyspace のエンジンを作る
         OpenEngine: string -> Result<IStorageEngine, DbError>
-        /// プロセス間ロックのトークン。
+        /// プロセス間ロックの寿命管理。
         /// メモリ上のテスト用 store は None（ファイルを作らない）。
-        Lock: obj option
+        Lock: ProcessLockLease option
     }
 
 module internal RowStore =
@@ -412,7 +411,7 @@ module internal RowStore =
                     Root = root
                     Engines = engines
                     OpenEngine = openEngine
-                    Lock = Some token
+                    Lock = Some(ProcessLockLease(root, token))
                 }
 
             match replayPending store with
@@ -446,7 +445,7 @@ module internal RowStore =
         let outcome = store.Engines |> Map.values |> foldOk (fun () e -> e.Close()) ()
 
         match store.Lock with
-        | Some token -> ProcessLock.release store.Root token
+        | Some lease -> lease.ForceRelease()
         | None -> ()
 
         outcome

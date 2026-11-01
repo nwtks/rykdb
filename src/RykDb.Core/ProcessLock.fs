@@ -86,3 +86,36 @@ module internal ProcessLock =
             | _ -> ()
         finally
             Gate.Release() |> ignore
+
+/// プロセスロックを保持する 1本分の寿命。
+/// <remarks>
+/// `Database.Execute` / `Begin` / `Commit` は新しいハンドルを返すので、
+/// 同じ `RowStore`（同じロック）を参照するハンドルが複数同時に存在する。
+/// そこで「最後に作られたハンドル」を所有者として覚え、**所有者の Close だけ**が
+/// 実際のプロセスロックを解放する。
+/// 古いハンドルの Close で解放すると、生きている新しいハンドルの足元で
+/// 同じ root を再オープンできてしまい、memtable / WAL が分かれた 2つの store ができる。
+/// 新しいハンドルは `Attach` のたびに所有者を置き換える。
+/// </remarks>
+type internal ProcessLockLease internal (root: string, token: obj) =
+    /// 所有者のトークン。
+    /// ConcurrentDictionary に 1エントリだけ置く。
+    let owner =
+        System.Collections.Concurrent.ConcurrentDictionary<string, obj> System.StringComparer.Ordinal
+
+    /// このハンドルを所有者にする。
+    member _.Attach() =
+        let handle = obj ()
+        owner.["owner"] <- handle
+        handle
+
+    /// このトークンが現在の所有者か。
+    member _.IsOwner(handle: obj) =
+        match owner.TryGetValue "owner" with
+        | true, current -> System.Object.ReferenceEquals(current, handle)
+        | _ -> false
+
+    /// 強制的にロックを解放する（RowStore を直接閉じるテスト・エラー経路用）。
+    member _.ForceRelease() =
+        owner.Clear()
+        ProcessLock.release root token

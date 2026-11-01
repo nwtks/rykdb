@@ -931,6 +931,8 @@ let db4 = db2.Rollback()                           // 破棄
 - `Close()` 後のハンドルは破棄する。
   閉じた状態はハンドルに記録されないため同じハンドルを `Execute` すると WAL が再作成される
   （二重 `Close` は安全）。
+  flush / WAL 削除 / `.rykdb.lock` の解放は**最新のハンドル**の `Close()` で行う。
+  古いハンドルの `Close()` は no-op（生きている新しいハンドルのロックを外さない）。
 - `Database` は `IDisposable`。`use db = ...` / `Dispose()` は `Close()` と同じ経路
   （進行中 transaction の登録も外れる）。
 - **同じ DB を別プロセスから開くことはできない**。

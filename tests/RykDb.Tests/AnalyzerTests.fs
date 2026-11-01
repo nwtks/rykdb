@@ -105,8 +105,8 @@ let ``Predicate.splitConjuncts: AND を平坦化して分割する`` () =
     let parts = Predicate.splitConjuncts e
 
     Assert.Equal<int>(3, parts.Length)
-    Assert.True(Predicate.isLocalTo "people" parts.[0])
-    Assert.True(Predicate.isLocalTo "people" parts.[1])
+    Assert.True(Binder.referencesOnly "people" parts.[0])
+    Assert.True(Binder.referencesOnly "people" parts.[1])
 
 [<Fact>]
 let ``Predicate.joinConjuncts: split した conjunct を AND で戻せる`` () =
@@ -117,13 +117,6 @@ let ``Predicate.joinConjuncts: split した conjunct を AND で戻せる`` () =
     Assert.True(rejoined |> Option.isSome)
     // 分割 → 再結合 で conjunct が 2 個のまま保たれる
     Assert.Equal<int>(2, Predicate.splitConjuncts rejoined.Value |> List.length)
-
-[<Fact>]
-let ``Predicate.isLocalTo: 修飾子なしの列参照は local とみなさない`` () =
-    // 修飾子のない列はどのテーブル由来か特定できないため pushdown しない
-    Assert.False(Predicate.isLocalTo "people" (Expr.Column { Qualifier = None; Name = "x" }))
-    // 列参照を含まない式は true
-    Assert.True(Predicate.isLocalTo "people" (Expr.Literal(Literal.Int 1L)))
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: 等価条件があれば主キー検索にする`` () =
