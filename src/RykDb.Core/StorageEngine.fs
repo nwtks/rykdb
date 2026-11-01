@@ -61,8 +61,31 @@ type internal StorageEngine =
     }
 
 module internal StorageEngine =
-    // writeBatch と close は、同じ immutable handle 系列の WAL 競合を防ぐため直列化する。
-    let private WriteCloseGate = new System.Threading.SemaphoreSlim(1, 1)
+    // writeBatch / maybeFlush / close は、同じ keyspace の WAL / memtable 競合を
+    // 防ぐため直列化する。
+    // 異なる keyspace / DB は並行に進められるよう、ディレクトリ単位の Gate にする
+    // （プロセス全体の 1本にしない）。
+    let private DirGates =
+        System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.SemaphoreSlim>(
+            System.StringComparer.Ordinal
+        )
+
+    let private normalizeDir (dir: string) =
+        match protect (fun () -> System.IO.Path.GetFullPath dir) with
+        | Ok full -> full
+        | Error _ -> dir
+
+    let private dirGate (dir: string) =
+        DirGates.GetOrAdd(normalizeDir dir, fun _ -> new System.Threading.SemaphoreSlim(1, 1))
+
+    let private withDirGate (dir: string) (f: unit -> 'T) =
+        let gate = dirGate dir
+        gate.Wait()
+
+        try
+            f ()
+        finally
+            gate.Release() |> ignore
 
     /// SSTable に書く Bloom filter の誤検出率。
     [<Literal>]
@@ -244,9 +267,7 @@ module internal StorageEngine =
                 NextTxnId = nextTxnId
             }
 
-        WriteCloseGate.Wait()
-
-        try
+        withDirGate engine.Dir (fun () ->
             result {
                 let txnId = engine.NextTxnId
 
@@ -261,9 +282,7 @@ module internal StorageEngine =
                         engine.Wal
 
                 return apply wal txnId
-            }
-        finally
-            WriteCloseGate.Release() |> ignore
+            })
 
     /// memtable を L0 の SSTable にして書き出す。
     /// memtable が空なら何もしない（WAL も切り替えない）。
@@ -366,11 +385,14 @@ module internal StorageEngine =
 
     /// memtable が上限に達していれば flush し、続けて compaction する。
     /// 上限に達していなければ何もしない。
+    /// flush / compaction / WAL rotate は同じ keyspace の writeBatch / close と競合させないため、
+    /// ディレクトリ単位の Gate の内側で行う。
     let maybeFlush (engine: StorageEngine) =
-        if engine.Mem.Count > 0 && engine.Mem.ApproxBytes >= engine.MemLimitBytes then
-            flush engine >>= compactOnce
-        else
-            ret engine
+        withDirGate engine.Dir (fun () ->
+            if engine.Mem.Count > 0 && engine.Mem.ApproxBytes >= engine.MemLimitBytes then
+                flush engine >>= compactOnce
+            else
+                ret engine)
 
     /// データベースを開く（新規なら作る）。
     let openDatabase (dir: string) =
@@ -505,9 +527,7 @@ module internal StorageEngine =
     /// （古い memtable を flush すると新しいハンドルの書き込みを消してしまう）。
     /// </remarks>
     let close (engine: StorageEngine) =
-        WriteCloseGate.Wait()
-
-        try
+        withDirGate engine.Dir (fun () ->
             let isLatestWriter =
                 match protect (fun () -> System.IO.FileInfo(Wal.path engine.Dir engine.Wal.FileNumber).Length) with
                 | Ok size -> size = int64 engine.Wal.Size
@@ -519,9 +539,7 @@ module internal StorageEngine =
                 flush engine
                 |> Result.map (fun e ->
                     Wal.walFiles e.Dir
-                    |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore))
-        finally
-            WriteCloseGate.Release() |> ignore
+                    |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore)))
 
 /// RowStore が使う StorageEngine の操作面。
 /// テストではメモリ実装に差し替えられる。

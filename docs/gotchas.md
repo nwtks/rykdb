@@ -1463,3 +1463,15 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 - 中間 run も同じ `[varint 長][ValueCodec]` 形式で、読み終えた入力 run は削除する。
 - 回帰テスト: `ExtSort: 5000行を小さなバジェットで溢らしても整列できる`
   （数百 run を作り、一時ファイルが残らないことも確認）。
+
+### 11.37 `StorageEngine` の書き込み Gate はディレクトリ単位にする
+
+以前は `WriteCloseGate` というプロセス全体の 1本の `SemaphoreSlim` で
+`writeBatch` / `close` を直列化していた。
+このため、無関係な DB / keyspace の書き込みまで互いに待たされ、
+keyspace シャーディングによる並列性が失われていた。
+
+- `StorageEngine` は `Dir`（正規化した keyspace ディレクトリ）ごとの Gate を持つ。
+- `writeBatch` / `maybeFlush`（flush + compaction）/ `close` を同じ Gate で直列化する。
+- 異なる keyspace / DB は並行。Gate 表はプロセス内で共有し、キーは正規化したパス。
+- Gate 表は開いた keyspace の数だけ残る（プロセス寿命。通常は小さい）。
