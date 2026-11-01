@@ -1441,3 +1441,14 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 - `touch` が失敗したら取得済みのロックを解放する。
 - 回帰テスト: `RowStore.openStore: ロック失敗時は commit journal を触らない`
   （不正な長さプレフィックスの journal が二重オープン失敗後も残ること）。
+
+### 11.35 `ActiveSnapshotRegistry` の bucket 削除と register は競合する
+
+`ConcurrentDictionary.GetOrAdd` で bucket を取ってから登録を追加する間、
+別スレッドの `unregister` が「空になった」と判断して bucket を削除すると、
+追加した登録が削除済みの bucket に入って消える。
+registry の登録が消えると compaction の GC 境界が上がり、まだ必要な版を捨て得る。
+
+- `register` / `unregister` / `oldestExcept` を 1本の `SemaphoreSlim`（Gate）で直列化する。
+- 回帰テスト: `ActiveSnapshotRegistry: 並行 register/unregister で登録が消えない`
+  （登録直後の `oldestExcept` が必ず `Some` になることを並列で確認）。

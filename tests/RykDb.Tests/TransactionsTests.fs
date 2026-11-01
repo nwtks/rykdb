@@ -268,3 +268,21 @@ let ``ActiveSnapshotRegistry: 相対パスと絶対パスは同じ DB として�
 
     ActiveSnapshotRegistry.unregister full token
     Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept rel None)
+
+[<Fact>]
+let ``ActiveSnapshotRegistry: 並行 register/unregister で登録が消えない`` () =
+    let root = freshRoot "reg-race"
+
+    // 登録が bucket に載っている間は oldestExcept が必ず Some を返す。
+    // bucket の GetOrAdd と空 bucket の削除が競合すると None になる。
+    System.Threading.Tasks.Parallel.For(
+        0,
+        5000,
+        fun i ->
+            let registration = ActiveSnapshotRegistry.register root (uint64 i + 1UL)
+            Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
+            ActiveSnapshotRegistry.unregister root registration
+    )
+    |> ignore
+
+    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept root None)

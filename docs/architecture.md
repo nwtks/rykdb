@@ -798,6 +798,8 @@ commit 成功・rollback・`Close` で解除する。
 トークンは `obj()` の参照等価（Core は `mutable` / `ref` を 0件に保つ規約のため、連番カウンタを使わない）。
 同じ DB を相対パスと絶対パスで開いても同じ束に入るよう `Path.GetFullPath` で正規化する。
 複数プロセスからの同時アクセスは `.rykdb.lock` で拒否する（§7.9）ので、プロセス内の表で十分。
+登録・解除・最古値の走査はプロセス内の Gate で直列化する
+（空になった bucket の削除と register の追加が競合して登録が消えるのを防ぐ）。
 
 ### 7.6 `Database` の transaction モデル
 

@@ -367,53 +367,74 @@ module internal ActiveSnapshotRegistry =
          >
             System.StringComparer.Ordinal
 
-    let private bucket (root: string) =
-        ByRoot.GetOrAdd(
-            RootKey.normalize root,
-            fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>()
-        )
+    /// 全操作を直列化する。
+    /// <remarks>
+    /// `register` が bucket を `GetOrAdd` してから登録を追加する前に、
+    /// 別スレッドの `unregister` が空の bucket を削除すると、
+    /// 登録が削除済みの bucket に書かれて消える。
+    /// 登録・解除・最古値の走査を 1本の Gate に通して競合をなくす。
+    /// </remarks>
+    let private Gate = new System.Threading.SemaphoreSlim(1, 1)
+
+    let private withGate (f: unit -> 'T) =
+        Gate.Wait()
+
+        try
+            f ()
+        finally
+            Gate.Release() |> ignore
+
+    /// 正規化済み key の bucket を取る（呼び出しは Gate の内側）。
+    let private bucket (key: string) =
+        ByRoot.GetOrAdd(key, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>())
 
     /// snapshot を登録し、解除に使う登録を返す。
     let register (root: string) (snapshot: uint64) =
         let key = RootKey.normalize root
-        let registration = ActiveRegistration key
-        (bucket key).[registration] <- snapshot
-        registration
+
+        withGate (fun () ->
+            let registration = ActiveRegistration key
+            (bucket key).[registration] <- snapshot
+            registration)
 
     /// 登録を解除する（commit 成功・rollback・Close・最後のハンドルの GC）。
     /// 解除し忘れても「版を余分に残す」側にしか倒れない（安全側）。
     let unregister (root: string) (registration: ActiveRegistration) =
         let key = RootKey.normalize root
 
-        match ByRoot.TryGetValue key with
-        | true, inner ->
-            inner.TryRemove registration |> ignore
+        withGate (fun () ->
+            match ByRoot.TryGetValue key with
+            | true, inner ->
+                inner.TryRemove registration |> ignore
 
-            if inner.IsEmpty then
-                ByRoot.TryRemove key |> ignore
-        | _ -> ()
+                if inner.IsEmpty then
+                    ByRoot.TryRemove key |> ignore
+            | _ -> ())
 
     /// その root で active な snapshot の最小値。
     /// registration に自分の登録を渡すと、これから commit する transaction 自身を除外できる。
     let oldestExcept (root: string) (registration: ActiveRegistration option) =
-        match ByRoot.TryGetValue(RootKey.normalize root) with
-        | true, inner ->
-            inner
-            |> Seq.fold
-                (fun acc pair ->
-                    let isSelf =
-                        match registration with
-                        | Some reg -> System.Object.ReferenceEquals(reg, pair.Key)
-                        | None -> false
+        let key = RootKey.normalize root
 
-                    if isSelf then
-                        acc
-                    else
-                        match acc with
-                        | Some current -> Some(min current pair.Value)
-                        | None -> Some pair.Value)
-                None
-        | _ -> None
+        withGate (fun () ->
+            match ByRoot.TryGetValue key with
+            | true, inner ->
+                inner
+                |> Seq.fold
+                    (fun acc pair ->
+                        let isSelf =
+                            match registration with
+                            | Some reg -> System.Object.ReferenceEquals(reg, pair.Key)
+                            | None -> false
+
+                        if isSelf then
+                            acc
+                        else
+                            match acc with
+                            | Some current -> Some(min current pair.Value)
+                            | None -> Some pair.Value)
+                    None
+            | _ -> None)
 
 /// `Database` ハンドルの生存に結び付いた登録リース。
 /// <remarks>
