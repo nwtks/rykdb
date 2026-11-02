@@ -94,42 +94,90 @@ module internal Ddl =
 
     let private BackfillChunkRows = 8192
 
-    let private applyChunks
-        (apply: Transaction -> 'a -> Result<Transaction, DbError>)
-        (chunks: seq<'a>)
-        (current: DbState)
-        =
-        chunks
-        |> foldOk
-            (fun st chunk ->
-                let mgr, txn =
-                    TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) st.Manager
+    /// 1チャンク分を transaction にして commit する。
+    let private commitChunk (apply: Transaction -> 'a -> Result<Transaction, DbError>) (chunk: 'a list) (st: DbState) =
+        let mgr, txn =
+            TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) st.Manager
 
-                result {
-                    let! txn2 = apply txn chunk
+        result {
+            let! txn2 = foldOk apply txn chunk
 
-                    let! store, mgr2 =
-                        RowStore.commitToStore st.Root st.ActiveRegistration mgr txn2 st.Store
+            let! store, mgr2 =
+                RowStore.commitToStore st.Root st.ActiveRegistration mgr txn2 st.Store
 
-                    return
-                        { st with
-                            Store = store
-                            Manager = mgr2
-                        }
-                })
-            current
+            return
+                { st with
+                    Store = store
+                    Manager = mgr2
+                }
+        }
+
+    /// 走査から `size` 件までを取り出す。
+    let private takeScanChunk =
+        let rec loop acc n scan =
+            if n <= 0 then
+                ret (List.rev acc, scan)
+            else
+                match SstScan.next scan with
+                | Error e -> err e
+                | Ok None -> ret (List.rev acc, SstScan.Empty)
+                | Ok(Some(e, rest)) -> loop (e :: acc) (n - 1) rest
+
+        loop []
+
+    /// Op から `size` 行までを取り出す。
+    let private takeOpChunk =
+        let rec loop acc n op =
+            if n <= 0 then
+                ret (List.rev acc, op)
+            else
+                match Op.next op with
+                | Error e -> err e
+                | Ok None -> ret (List.rev acc, Op.Done)
+                | Ok(Some(row, rest)) -> loop (row :: acc) (n - 1) rest
+
+        loop []
+
+    /// Op をチャンク単位で消費する（全件を実体化しない）。
+    let private applyOpChunks (apply: Transaction -> SqlValue array -> Result<Transaction, DbError>) =
+        let rec loop op st =
+            match takeOpChunk BackfillChunkRows op with
+            | Error e -> err e
+            | Ok([], _) -> ret st
+            | Ok(chunk, rest) ->
+                match commitChunk apply chunk st with
+                | Error e -> err e
+                | Ok st' -> loop rest st'
+
+        loop
 
     /// keyspace の全エントリをチャンク単位で tombstone 消去する。
+    /// <remarks>
+    /// 同じ keyspace を走査しながら書くため、1チャンク書くたびに新しい store で
+    /// `lastKey` から走査し直す。走査中に compaction がファイルを消しても、
+    /// 古いスナップショットのファイルを開き続けない。
+    /// </remarks>
     let private clearSpaceChunksResult (state: DbState) (space: string) =
+        let rec loop st startKey =
+            match RowStore.scan space startKey 0 st.Store with
+            | Error e -> err e
+            | Ok scan ->
+                match takeScanChunk BackfillChunkRows scan with
+                | Error e -> err e
+                | Ok([], _) -> ret st
+                | Ok(chunk, _) ->
+                    let lastKey = (List.last chunk).Key
+
+                    match
+                        commitChunk (fun txn key -> ret (Transaction.remove space key txn)) (chunk |> List.map _.Key) st
+                    with
+                    | Error e -> err e
+                    | Ok st' -> loop st' lastKey
+
         if not (RowStore.keyspaceExists space state.Store) then
             ret state
         else
-            RowStore.scan space [||] 0 state.Store
-            >>= fun stale ->
-                applyChunks
-                    (fun txn chunk -> foldOk (fun t (key, _) -> ret (Transaction.remove space key t)) txn chunk)
-                    (Seq.chunkBySize BackfillChunkRows stale)
-                    state
+            loop state [||]
 
     let createTable (c: CreateTable) (state: DbState) =
         let createTableCore (c: CreateTable) state =
@@ -223,37 +271,35 @@ module internal Ddl =
         dropTableCore name ifExists |> exclusiveDdl state
 
     let createIndex (ci: CreateIndex) (state: DbState) =
-        let checkEntries positions (idx: IndexSchema) (entries: seq<byte array * SqlValue array option>) =
-            use e = entries.GetEnumerator()
+        let rec loop previous positions (idx: IndexSchema) scan =
+            match SstScan.next scan with
+            | Error e -> err e
+            | Ok None -> ret ()
+            | Ok(Some(e, rest)) ->
+                match e.Value with
+                | None -> loop previous positions idx rest
+                | Some row ->
+                    let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
 
-            let rec loop previous =
-                if not (e.MoveNext()) then
-                    ret ()
-                else
-                    let _, value = e.Current
+                    if values |> Array.exists SqlValue.isNull then
+                        loop previous positions idx rest
+                    else
+                        let prefix = KeyBuilder.ofValues values
 
-                    match value with
-                    | None -> loop previous
-                    | Some row ->
-                        let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
+                        match previous with
+                        | Some before when Bytes.compare before prefix = 0 ->
+                            err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                        | _ -> loop (Some prefix) positions idx rest
 
-                        if values |> Array.exists SqlValue.isNull then
-                            loop previous
-                        else
-                            let prefix = KeyBuilder.ofValues values
-
-                            match previous with
-                            | Some before when Bytes.compare before prefix = 0 ->
-                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                            | _ -> loop (Some prefix)
-
-            loop None
+        let checkEntries = loop None
 
         let checkUniqueIndex schema (idx: IndexSchema) store =
             idx.Columns
             |> List.map (TableSchema.requireIndexOf schema)
             |> all
-            >>= fun pos -> RowStore.scan (Keyspace.index idx.Name) [||] 0 store >>= checkEntries pos idx
+            >>= fun pos ->
+                RowStore.scan (Keyspace.index idx.Name) [||] 0 store
+                >>= fun scan -> checkEntries pos idx scan
 
         let clearSpaceChunks state space =
             match clearSpaceChunksResult state space with
@@ -279,9 +325,9 @@ module internal Ddl =
                     let indexKeyFor row = RowKey.indexKey withIndex idx row
 
                     let! filled =
-                        applyChunks
-                            (foldOk (fun t row -> ret (Transaction.put space (indexKeyFor row) row t)))
-                            (Seq.chunkBySize BackfillChunkRows rows)
+                        applyOpChunks
+                            (fun txn row -> ret (Transaction.put space (indexKeyFor row) row txn))
+                            rows
                             cleared
 
                     if idx.Unique then

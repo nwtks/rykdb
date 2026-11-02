@@ -387,14 +387,16 @@ let merged = SstMerge.ofScans (memScan :: fileScans)
 ```fsharp
 // ❌ scanAt の 1件目が別の値であることがある
 RowStore.scanAt ks prefix 0 visible store
-|> Result.map (fun rows -> rows |> Seq.tryHead)
+|> Result.map (fun scan -> SstScan.next scan)
 
 // ✅ 接頭辞一致を検査してから取る
 RowStore.scanAt ks prefix 0 visible store
-|> Result.map (fun rows ->
-    rows
-    |> Seq.tryFind (fun (k, _) -> KeyBuilder.startsWithPrefix k prefix))
-|> Result.map (Option.bind snd)
+|> Result.bind (fun scan ->
+    SstScan.next scan
+    |> Result.map (fun head ->
+        match head with
+        | Some(e, _) when KeyBuilder.startsWithPrefix e.Key prefix -> e.Value
+        | _ -> None))
 ```
 
 ### 4.4 `Manifest.logAndApply` が `NextFileNumber` を進めていないとデータを消す
@@ -611,14 +613,14 @@ let withIndexes =
 let! rows = Dml.scanByPrimaryKey cleared.Store withIndex 0 None
 
 let! filled =
-    applyChunks
-        (foldOk (fun t row ->
-            ret (Transaction.put (Keyspace.index idx.Name) (RowKey.indexKey withIndex idx row) row t)))
-        (Seq.chunkBySize BackfillChunkRows rows)
+    applyOpChunks
+        (fun txn row ->
+            ret (Transaction.put (Keyspace.index idx.Name) (RowKey.indexKey withIndex idx row) row txn))
+        rows
         cleared
 ```
 
-`Dml.scanByPrimaryKey` は遅延 `seq` を返すので、
+`Dml.scanByPrimaryKey` は遅延 `Op` を返すので、
 全行をメモリに載せず `BackfillChunkRows` 単位で transaction を分ける。
 
 ### 6.4 索引走査は `TableSchema` と `IndexSchema` の両方が要る
@@ -779,10 +781,10 @@ let asInt (v: SqlValue) = match v with | SqlValue.Int n -> n | _ -> 0L
 | Binary(op, a, b) -> ...
 ```
 
-### 8.9 `Seq.takeWhile` は「先頭から連続」で止まる
+### 8.9 `take` 述語は「先頭から連続」で止まる
 
-`Dml.scanByIndexPrefixWithTxn` は `RowStore.scanAt` が返す列から
-「先頭から連続する接頭辞一致」だけを `Seq.takeWhile` で取る。
+`Dml.scanByIndexPrefixWithTxn` は `RowStore.scanAt` が返す pull を
+`opOfScan` の `take` 述語（`KeyBuilder.startsWithPrefix`）で読み進め、外れた時点で終端にする。
 **ファイル側の下限が効いていないと 1件目で止まり、0件になる**（§4.2 を参照）。
 
 ### 8.10 予約語
@@ -1302,11 +1304,15 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ### 11.19 走査の開封エラーを握り潰さない
 
-以前は開けなかったファイルを空と見なしていたため、壊れた SSTable があると `Ok` のまま行が欠けた（静かな誤答）。
-現在の `StorageEngine.scanAt` は候補ファイルをキー下限順に `prepare` で開き、
-開封・ブロック解析のエラーをその場で返す（§11.24）。
-`limit <= 0` の全件走査は最後まで読むので全ファイルを開いて検出するが、
+以前は開けなかったファイルを空と見なしていたため、
+壊れた SSTable があると `Ok` のまま行が欠けた（静かな誤答）。
+現在の `StorageEngine.scanAt` は pull（`SstScan`）を返し、
+候補ファイルをキー下限順に必要になった時点で `prepare` で開き、
+開封・ブロック解析のエラーをその `next` が返す（§11.24）。
+全件走査でも必要になったファイルだけを開く（最初に一括では開かない）。
 `limit > 0` は limit 件で止まるため、到達しない後続ファイルの破損は検出しない。
+全件を消費する SQL 演算子（集約・ソート・DISTINCT など）は、
+途中で Error になれば最終結果を返さない。
 
 ### 11.20 壊れたデータは未捕捉例外にしない
 
@@ -1348,14 +1354,14 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ### 11.24 limit 付き scan は後続の SSTable を開かない
 
-`StorageEngine.scanAt` は `limit > 0` のとき `collectLimitted` で
-**必要になったファイル・ブロックだけ**を開き、`limit` 件に達したら止まる。
+`StorageEngine.scanAt` は `limit > 0` のとき、**必要になったファイル・ブロックだけ**を開き、
+`limit` 件に達したら止まる。
 そのため、limit で到達しない後続 SSTable / ブロックの破損・欠落はそのクエリでは検出されない
-（全件走査 / `limit = 0` は全ファイルを開いて検出する）。
+（全件走査でも必要になった時点で検出し、クエリは結果を返さない）。
 これは「先頭 limit 件に寄与しないデータは読まない」という最適化の副作用。
 `openDatabase` は `FileMetaData.MaxSeqNo` を使うため起動時にデータブロックを読まない。
 したがって起動時にも検出されない。
-全件走査（`limit = 0`）で検出する。
+全件を読むクエリ（`limit = 0`）で、そのファイルに到達した時点で検出する。
 
 ### 11.25 LIMIT pushdown は Filter / Sort / Aggregate を越えない
 

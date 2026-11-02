@@ -471,8 +471,13 @@ let ``Database: DROP TABLE は索引 keyspace の孤児エントリも消す`` (
         ok (db5.Close())
 
         let store = ok (RowStore.openStore dir)
-        let indexRows = ok (RowStore.scan (Keyspace.index "ix_g") [||] 0 store)
-        let tableRows = ok (RowStore.scan (Keyspace.table "t") [||] 0 store)
+
+        let indexRows =
+            ok (RowStore.scan (Keyspace.index "ix_g") [||] 0 store) |> SstScan.toArray |> ok
+
+        let tableRows =
+            ok (RowStore.scan (Keyspace.table "t") [||] 0 store) |> SstScan.toArray |> ok
+
         Assert.Empty indexRows
         Assert.Empty tableRows
         ok (RowStore.close store))
@@ -500,8 +505,13 @@ let ``Database: 中断した DROP の後始末を open 時に再開する`` () =
         ok (db4.Close())
 
         let store = ok (RowStore.openStore dir)
-        let tableRows = ok (RowStore.scan (Keyspace.table "t") [||] 0 store)
-        let indexRows = ok (RowStore.scan (Keyspace.index "ix_a") [||] 0 store)
+
+        let tableRows =
+            ok (RowStore.scan (Keyspace.table "t") [||] 0 store) |> SstScan.toArray |> ok
+
+        let indexRows =
+            ok (RowStore.scan (Keyspace.index "ix_a") [||] 0 store) |> SstScan.toArray |> ok
+
         Assert.Empty tableRows
         Assert.Empty indexRows
         Assert.Empty(ok (DropCleanup.pending store.Root))

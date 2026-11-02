@@ -115,6 +115,32 @@ module internal SstScan =
 
         drain [] scan
 
+    /// 条件を満たすエントリだけを返す走査。
+    /// 条件を満たさない間は次のエントリを読み進める（ブロック単位のまま）。
+    let filter (predicate: SstEntry -> bool) (scan: SstScan) =
+        let rec find current =
+            match next current with
+            | Error e -> err e
+            | Ok None -> ret None
+            | Ok(Some(e, rest)) -> if predicate e then ret (Some(e, rest)) else find rest
+
+        SstScan(fun () -> find scan)
+
+    /// 純粋な seq を pull に変換する（テスト用のメモリ実装など）。
+    /// seq の列挙は失敗しない前提（エラーは表現できない）。
+    let ofSeq (items: seq<SstEntry>) =
+        let e = items.GetEnumerator()
+
+        let rec loop () =
+            SstScan(fun () ->
+                if e.MoveNext() then
+                    ret (Some(e.Current, loop ()))
+                else
+                    (e :> System.IDisposable).Dispose() |> ignore
+                    ret None)
+
+        loop ()
+
 /// k-way merge の 1ソース。
 /// 先頭を 1件読んだ状態を表す。
 type internal MergeHead =

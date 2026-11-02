@@ -70,7 +70,7 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
         member _.NextSeqNo = 0UL
         member _.ActiveSnapshot = 0UL
         member _.GetAt _ _ = ret None
-        member _.ScanAt _ _ _ = ret (Seq.empty<SstEntry>)
+        member _.ScanAt _ _ _ = ret SstScan.Empty
         member this.WriteBatch _ = ret (this :> IStorageEngine)
         member this.WithNextSeqNo _ = this :> IStorageEngine
         member this.WithActiveSnapshot _ = this :> IStorageEngine
@@ -269,3 +269,27 @@ let ``RowStore.commitToStore: 自分の登録は GC 境界から除外する`` (
 
         ActiveSnapshotRegistry.unregister dir own
         RowStore.close committed |> ok)
+
+[<Fact>]
+let ``RowStore.clearKeyspaceChunks: チャンクを跨いでも全件を消す`` () =
+    withStore "clear-chunks" (fun store ->
+        let space = Keyspace.table "t"
+
+        // ClearChunkEntries = 8192。2 チャンク目まで進む件数で、
+        // lastKey からの再走査が無限ループしないことを確認する。
+        let entries =
+            [| for i in 0..8200 -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i) |]
+
+        let store = ok (RowStore.writeBatches [ space, entries ] store)
+
+        // 既存エントリより大きい SeqNo から tombstone を採番する（実運用の再オープン相当）。
+        let mgr =
+            { TransactionManager.create () with
+                NextSeqNo = 8202UL
+                LastCommitSeqNo = 8201UL
+            }
+
+        let mgr, _ = TransactionManager.beginTxn mgr
+        let store, _mgr = ok (RowStore.clearKeyspaceChunks mgr space store)
+        let rows = ok (RowStore.scan space [||] 0 store) |> SstScan.toArray |> ok
+        Assert.Empty rows)

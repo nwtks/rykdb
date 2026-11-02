@@ -82,7 +82,9 @@ type private MemoryStorageEngine(state: MemoryEngineState, mem: Memtable, nextSe
                 |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
                 |> Seq.filter (fun e -> e.Value.IsSome)
 
-            (if limit > 0 then Seq.truncate limit entries else entries) |> ret
+            (if limit > 0 then Seq.truncate limit entries else entries)
+            |> SstScan.ofSeq
+            |> ret
 
         member _.WriteBatch entries =
             let nextMem = Memtable.apply entries state.Mem

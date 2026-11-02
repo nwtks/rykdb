@@ -131,11 +131,28 @@ module internal StorageEngine =
         | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
         | None -> Version.filesForPointLookup key engine.Version |> probe
 
+    /// 遅延走査の状態。
+    /// `next` を呼ぶたびに、未オープンのファイルを必要な分だけ開き、
+    /// マージから可視・最新・非 tombstone の 1件を取り出す。
+    type private ScanState =
+        {
+            /// まだ開いていないファイル（最小キー昇順）
+            Pending: (int * byte array * FileMetaData) list
+            /// 現在の k-way merge
+            Merge: SstMerge
+            /// 直前に出力したキー（同じキーの古い版を読み飛ばす）
+            EmittedKey: byte array option
+            /// 出力済みの件数（limit 用。tombstone は数えない）
+            Count: int
+        }
+
     /// 範囲ルックアップ。
-    /// キー昇順で返す（同一キーは 1件だけ）。
+    /// キー昇順の pull（`SstScan`）を返す。
+    /// `SstScan.next` を呼ぶまで SSTable のブロックを読まない。
     /// visible が Some s のときは SeqNo が s 以下の版を返す。
-    /// limit > 0 のときは必要なファイルだけを開いて先頭 limit 件を返す。
-    /// limit <= 0 のときは最後まで読むので全ファイルを開く（破損・欠落はその時点で検出する）。
+    /// limit > 0 のときは limit 件を出力した時点で終端になる。
+    /// 破損・欠落は、そのファイル・ブロックが必要になった `next` が `Error` を返す
+    /// （呼び出し時点では検出しない。全件を読む演算子は最終結果を返す前に必ず Error になる）。
     /// ヒープは 1回だけ組み、以降は「取り出したソースの続きを戻す」だけにする
     /// （行ごとにソース列から作り直すと O(行数 × ファイル数 log ファイル数) になる）。
     /// マージとヒープは `SstMerge`（Sstable.fs）に集約する。
@@ -147,6 +164,7 @@ module internal StorageEngine =
                 if e.MoveNext() then
                     SstScan.emit pull e.Current
                 else
+                    (e :> System.IDisposable).Dispose() |> ignore
                     SstScan.Empty
 
             pull ()
@@ -182,66 +200,56 @@ module internal StorageEngine =
             | Some s -> e.SeqNo <= s
             | None -> true
 
-        let rec collectLimitted pending emittedKey acc count merge =
-            if limit > 0 && count >= limit then
-                ret (List.rev acc)
+        // `next` の再帰は「同じキー / 不可視版の読み飛ばし」と
+        // 「1件返した後の SstScan 継続（ラムダ）」に現れる。
+        // どちらも 1件ごとに継続が戻る型で、スタックは行数に比例しない。
+        // TailAudit は両方を 1 キーにまとめて報告するため baseline に登録する。
+        let rec next (state: ScanState) : Result<(SstEntry * SstScan) option, DbError> =
+            if limit > 0 && state.Count >= limit then
+                ret None
             else
-                match prepare pending merge with
+                match prepare state.Pending state.Merge with
                 | Error e -> err e
                 | Ok(ready, remaining) ->
                     match SstMerge.next ready with
                     | Error e -> err e
-                    | Ok None -> ret (List.rev acc)
+                    | Ok None -> ret None
                     | Ok(Some(e, merge')) ->
+                        let restored =
+                            { state with
+                                Pending = remaining
+                                Merge = merge'
+                            }
+
                         let sameKey =
-                            match emittedKey with
+                            match state.EmittedKey with
                             | Some k -> Bytes.compare k e.Key = 0
                             | None -> false
 
-                        if sameKey || not (isVisible e) then
-                            collectLimitted remaining emittedKey acc count merge'
+                        if sameKey then
+                            next restored
+                        elif not (isVisible e) then
+                            next restored
                         else
                             let appended = e.Value.IsSome
 
-                            collectLimitted
-                                remaining
-                                (Some e.Key)
-                                (if appended then e :: acc else acc)
-                                (if appended then count + 1 else count)
-                                merge'
+                            let advanced =
+                                { restored with
+                                    EmittedKey = Some e.Key
+                                    Count = (if appended then state.Count + 1 else state.Count)
+                                }
 
-        let rec collectAll pending emittedKey acc merge =
-            match prepare pending merge with
-            | Error e -> err e
-            | Ok(ready, remaining) ->
-                match SstMerge.next ready with
-                | Error e -> err e
-                | Ok None -> ret (List.rev acc)
-                | Ok(Some(e, merge')) ->
-                    let sameKey =
-                        match emittedKey with
-                        | Some k -> Bytes.compare k e.Key = 0
-                        | None -> false
+                            if appended then
+                                ret (Some(e, SstScan(fun () -> next advanced)))
+                            else
+                                next advanced
 
-                    if sameKey || not (isVisible e) then
-                        collectAll remaining emittedKey acc merge'
-                    elif e.Value.IsSome then
-                        collectAll remaining (Some e.Key) (e :: acc) merge'
-                    else
-                        collectAll remaining (Some e.Key) acc merge'
-
-        let collect merge =
-            let pendingFiles =
-                Version.allFiles engine.Version
-                |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
-                |> List.map (fun f -> sourceBound startKey f, f)
-                |> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b)
-                |> List.mapi (fun i (bound, f) -> i + 1, bound, f)
-
-            if limit > 0 then
-                collectLimitted pendingFiles None [] 0 merge |> Result.map Seq.ofList
-            else
-                collectAll pendingFiles None [] merge |> Result.map Seq.ofList
+        let pendingFiles =
+            Version.allFiles engine.Version
+            |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
+            |> List.map (fun f -> sourceBound startKey f, f)
+            |> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b)
+            |> List.mapi (fun i (bound, f) -> i + 1, bound, f)
 
         let memSeq =
             Memtable.rangeScan startKey 0 engine.Mem
@@ -249,9 +257,28 @@ module internal StorageEngine =
 
         match SstScan.next (seqToScan memSeq) with
         | Error e -> err e
-        | Ok None -> ret SstMerge.Empty
-        | Ok(Some(e, nxt)) -> ret (SstMerge.insert 0 e nxt SstMerge.Empty)
-        >>= fun merge -> collect merge
+        | Ok None ->
+            ret (
+                SstScan(fun () ->
+                    next
+                        {
+                            Pending = pendingFiles
+                            Merge = SstMerge.Empty
+                            EmittedKey = None
+                            Count = 0
+                        })
+            )
+        | Ok(Some(e, nxt)) ->
+            ret (
+                SstScan(fun () ->
+                    next
+                        {
+                            Pending = pendingFiles
+                            Merge = SstMerge.insert 0 e nxt SstMerge.Empty
+                            EmittedKey = None
+                            Count = 0
+                        })
+            )
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、
@@ -547,7 +574,7 @@ type internal IStorageEngine =
     abstract NextSeqNo: uint64
     abstract ActiveSnapshot: uint64
     abstract GetAt: visible: uint64 option -> key: byte array -> Result<SstEntry option, DbError>
-    abstract ScanAt: visible: uint64 option -> startKey: byte array -> limit: int -> Result<seq<SstEntry>, DbError>
+    abstract ScanAt: visible: uint64 option -> startKey: byte array -> limit: int -> Result<SstScan, DbError>
     abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
     abstract WithNextSeqNo: nextSeqNo: uint64 -> IStorageEngine
     abstract WithActiveSnapshot: snapshot: uint64 -> IStorageEngine

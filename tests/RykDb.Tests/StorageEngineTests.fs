@@ -122,7 +122,7 @@ let ``StorageEngine.scanAt: 多数のファイルをキー昇順にマージす�
                     Version = List.fold (fun v f -> Version.addFile f v) Version.Empty files
                 }
 
-            let got = ok (StorageEngine.scanAt None 0 [||] engine) |> Seq.toArray
+            let got = ok (StorageEngine.scanAt None 0 [||] engine) |> SstScan.toArray |> ok
             let expected = [ 2..2..64 ] @ [ 102..2..164 ]
             Assert.Equal(expected.Length, got.Length)
 
@@ -144,10 +144,46 @@ let ``StorageEngine.scanAt: memtable が空でも SSTable だけを走査でき�
                     Version = Version.Empty |> Version.addFile f
                 }
 
-            let got = ok (StorageEngine.scanAt None 0 [||] engine) |> Seq.toArray
+            let got = ok (StorageEngine.scanAt None 0 [||] engine) |> SstScan.toArray |> ok
             Assert.Equal(2, got.Length)
             Assert.Equal<byte array>(intKey 1, got.[0].Key)
             Assert.Equal<byte array>(intKey 2, got.[1].Key)))
+
+[<Fact>]
+let ``StorageEngine.scanAt: 先頭 1 件だけなら全件を実体化しない`` () =
+    withDir "se-lazy-pull" (fun dir ->
+        withEngine dir (fun engine ->
+            // 2000件 = 16 ブロック。先頭 1件の走査が全ブロックを読まないことを確保量で見る。
+            let entries =
+                [ for i in 0..1999 -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i) ]
+
+            let f = mkSst dir 10L 0 entries
+
+            let engine =
+                { engine with
+                    Version = Version.Empty |> Version.addFile f
+                }
+
+            // SstPartial の読み込みを先に済ませる（計測から index/Bloom の解析を除く）。
+            let all = ok (StorageEngine.scanAt None 0 [||] engine) |> SstScan.toArray |> ok
+
+            Assert.Equal<int>(2000, all.Length)
+
+            let before = System.GC.GetAllocatedBytesForCurrentThread()
+            let first = ok (StorageEngine.scanAt None 1 [||] engine) |> SstScan.toArray |> ok
+            let firstBytes = System.GC.GetAllocatedBytesForCurrentThread() - before
+
+            let fullBefore = System.GC.GetAllocatedBytesForCurrentThread()
+            let full = ok (StorageEngine.scanAt None 0 [||] engine) |> SstScan.toArray |> ok
+            let fullBytes = System.GC.GetAllocatedBytesForCurrentThread() - fullBefore
+
+            Assert.Equal<int>(1, first.Length)
+            Assert.Equal<int>(2000, full.Length)
+
+            Assert.True(
+                firstBytes < fullBytes / 10L,
+                sprintf "先頭 1件の確保 %d バイトが全件 %d バイトに対して大きすぎます" firstBytes fullBytes
+            )))
 
 /// キー 1..2 のファイル（10）とキー 3..4 のファイル（11）を作り、11 のマジックを
 /// 壊す（openTable が失敗する＝開封時に検出される壊れたファイル）。
@@ -173,7 +209,9 @@ let ``StorageEngine.scanAt: limit 1 は後続の壊れたファイルを開か�
                 }
 
             // 先頭 1行はファイル 10 だけで足りる。ファイル 11 の下限はキー 3 なので開かない。
-            let scanned = ok (StorageEngine.scanAt None 1 (intKey 1) engine) |> Seq.toArray
+            let scanned =
+                ok (StorageEngine.scanAt None 1 (intKey 1) engine) |> SstScan.toArray |> ok
+
             Assert.Equal(1, scanned.Length)
             Assert.Equal(0, Bytes.compare scanned.[0].Key (intKey 1))
 
@@ -181,11 +219,11 @@ let ``StorageEngine.scanAt: limit 1 は後続の壊れたファイルを開か�
             expectErrorKind
                 ErrorKind.CorruptionError
                 "必要なファイルの破損は検出する"
-                (StorageEngine.scanAt None 10 (intKey 1) engine)))
+                (ok (StorageEngine.scanAt None 10 (intKey 1) engine) |> SstScan.toArray)))
 
 [<Fact>]
-let ``StorageEngine.scanAt: 制限なしの走査は壊れたファイルを先に検出する`` () =
-    withDir "se-eager-open" (fun dir ->
+let ``StorageEngine.scanAt: 制限なしの走査も読んだ時点で破損を検出する`` () =
+    withDir "se-lazy-open" (fun dir ->
         withEngine dir (fun engine ->
             let f1, f2 = twoFilesWithBrokenSecond dir
 
@@ -194,9 +232,12 @@ let ``StorageEngine.scanAt: 制限なしの走査は壊れたファイルを先�
                     Version = Version.Empty |> Version.addFile f1 |> Version.addFile f2
                 }
 
-            // 制限なしの走査は全ファイルを読むので、開封時に全ファイルを開いて
-            // 壊れたファイルを Result で検出する。
-            expectErrorKind ErrorKind.CorruptionError "制限なしの走査は壊れたファイルを検出する" (StorageEngine.scanAt None 0 [||] engine)))
+            // 走査は pull なので、呼び出し時ではなく列挙が壊れたファイルに
+            // 到達した時点で Result が Error になる。
+            expectErrorKind
+                ErrorKind.CorruptionError
+                "制限なしの走査は壊れたファイルを検出する"
+                (ok (StorageEngine.scanAt None 0 [||] engine) |> SstScan.toArray)))
 
 [<Fact>]
 let ``StorageEngine.scanAt: 欠落ファイルは必要になった時点で検出する`` () =
@@ -211,10 +252,15 @@ let ``StorageEngine.scanAt: 欠落ファイルは必要になった時点で検�
                 }
 
             // limit 1 はファイル 11 を必要としないので、欠落していても先頭 1 行は返せる。
-            let scanned = ok (StorageEngine.scanAt None 1 (intKey 1) engine) |> Seq.toArray
+            let scanned =
+                ok (StorageEngine.scanAt None 1 (intKey 1) engine) |> SstScan.toArray |> ok
+
             Assert.Equal(1, scanned.Length)
             // 全行が必要ならファイル 11 を開こうとして IoError になる。
-            expectErrorKind ErrorKind.IoError "欠落ファイルは必要になれば検出する" (StorageEngine.scanAt None 10 (intKey 1) engine)))
+            expectErrorKind
+                ErrorKind.IoError
+                "欠落ファイルは必要になれば検出する"
+                (ok (StorageEngine.scanAt None 10 (intKey 1) engine) |> SstScan.toArray)))
 
 [<Fact>]
 let ``StorageEngine.getAt / scanAt: 必要なブロックだけを部分読みする`` () =
@@ -245,10 +291,13 @@ let ``StorageEngine.getAt / scanAt: 必要なブロックだけを部分読み�
             // ブロック 1 のキーは壊れている
             expectErrorKind ErrorKind.CorruptionError "必要なブロックの破損は検出する" (StorageEngine.getAt None (intKey 200) engine)
             // limit 5 はブロック 0 だけで足りる
-            let five = ok (StorageEngine.scanAt None 5 [||] engine) |> Seq.toArray
+            let five = ok (StorageEngine.scanAt None 5 [||] engine) |> SstScan.toArray |> ok
             Assert.Equal<int>(5, five.Length)
             // 全件走査は壊れたブロックのチェックサムで検出する
-            expectErrorKind ErrorKind.CorruptionError "全件走査は壊れたブロックを検出する" (StorageEngine.scanAt None 0 [||] engine)))
+            expectErrorKind
+                ErrorKind.CorruptionError
+                "全件走査は壊れたブロックを検出する"
+                (ok (StorageEngine.scanAt None 0 [||] engine) |> SstScan.toArray)))
 
 [<Fact>]
 let ``StorageEngine.maybeFlush: flush 後に compaction が不要なら compactOnce は noop で返す`` () =

@@ -409,12 +409,15 @@ let ``Catalog.load: 未知のキーや不正な値は読み飛ばす`` () =
         let store =
             ok (Catalog.save store Catalog.Empty (Catalog.addTable Catalog.Empty people))
 
-        let raw = ok (RowStore.scan Keyspace.CatalogKeyspace [||] 0 store) |> Seq.toArray
+        let raw =
+            ok (RowStore.scan Keyspace.CatalogKeyspace [||] 0 store)
+            |> SstScan.toArray
+            |> ok
 
         let value =
-            match raw.[0] with
-            | _, Some v -> v
-            | _, None -> failwith "カタログの値がありません"
+            match raw.[0].Value with
+            | Some v -> v
+            | None -> failwith "カタログの値がありません"
 
         // Latin1 は 1 バイト = 1 文字なので、ASCII の定義なら TEXT として往復できる
         let asText =

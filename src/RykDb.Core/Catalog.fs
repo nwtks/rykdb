@@ -551,7 +551,8 @@ module internal Catalog =
                         | None -> decodeRows rows (i + 1) acc
 
         RowStore.scan Keyspace.CatalogKeyspace [||] 0 store
-        >>= fun rows -> decodeRows (Seq.toArray rows) 0 Empty
+        >>= fun rows -> SstScan.toArray rows
+        >>= fun rows -> decodeRows (rows |> Array.map (fun e -> e.Key, e.Value)) 0 Empty
 
 /// 出力の 1列。
 type internal OutputColumn =

@@ -189,7 +189,7 @@ let ``DmlOps.insert: INSERT は行を追加する`` () =
         Assert.Equal<int>(1, n)
 
         commitInto store mgr txn |> ignore
-        let rows = ok (Dml.scanByPrimaryKey store peopleSchema 0 None) |> Seq.toArray
+        let rows = ok (Dml.scanByPrimaryKey store peopleSchema 0 None) |> Op.toArray |> ok
         Assert.Equal<int>(1, rows.Length)
         Assert.Equal("alice", asText rows.[0].[1]))
 
@@ -210,7 +210,7 @@ let ``DmlOps.insert: INSERT は列順を明示できる`` () =
             )
 
         commitInto store mgr txn |> ignore
-        let rows = ok (Dml.scanByPrimaryKey store peopleSchema 0 None) |> Seq.toArray
+        let rows = ok (Dml.scanByPrimaryKey store peopleSchema 0 None) |> Op.toArray |> ok
         Assert.Equal<int64>(7L, asInt rows.[0].[0])
         Assert.Equal("carol", asText rows.[0].[1])
         // 指定されなかった列は NULL
@@ -248,7 +248,7 @@ let ``DmlOps.insert: INSERT は DEFAULT で不足列を埋める`` () =
         Assert.Equal<int>(1, n)
 
         commitInto store mgr txn |> ignore
-        let rows = ok (Dml.scanByPrimaryKey store schema 0 None) |> Seq.toArray
+        let rows = ok (Dml.scanByPrimaryKey store schema 0 None) |> Op.toArray |> ok
         Assert.Equal<int64>(42L, asInt rows.[0].[2]))
 
 [<Fact>]
@@ -282,7 +282,7 @@ let ``DmlOps.insert: INSERT は評価できない DEFAULT をエラーにする`
             "評価できない DEFAULT はエラー"
             (DmlOps.insert (ctxOf store txn) schema (Some [ "id" ]) [ [ Expr.Literal(Literal.Int 1L) ] ])
 
-        let rows = ok (Dml.scanByPrimaryKey store schema 0 None) |> Seq.toArray
+        let rows = ok (Dml.scanByPrimaryKey store schema 0 None) |> Op.toArray |> ok
         Assert.Empty rows)
 
 [<Fact>]
@@ -339,7 +339,7 @@ let ``DmlOps.update: UPDATE は WHERE に合う行だけを変える`` () =
         Assert.Equal<int>(1, n)
 
         commitInto store mgr1 txn1 |> ignore
-        let rows = ok (Dml.scanByPrimaryKey store peopleSchema 0 None) |> Seq.toArray
+        let rows = ok (Dml.scanByPrimaryKey store peopleSchema 0 None) |> Op.toArray |> ok
         // 1 行目は age 20（WHERE に合わないので変更なし）
         Assert.Equal<int64>(20L, asInt rows.[0].[2])
         // 2 行目は 30 -> 31
@@ -378,6 +378,6 @@ let ``DmlOps.delete: DELETE は WHERE に合う行を消す`` () =
         Assert.Equal<int>(1, n)
 
         commitInto store mgr1 txn2 |> ignore
-        let rows = ok (Dml.scanByPrimaryKey store peopleSchema 0 None) |> Seq.toArray
+        let rows = ok (Dml.scanByPrimaryKey store peopleSchema 0 None) |> Op.toArray |> ok
         Assert.Equal<int>(1, rows.Length)
         Assert.Equal("bob", asText rows.[0].[1]))

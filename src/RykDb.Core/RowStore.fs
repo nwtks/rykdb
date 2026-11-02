@@ -266,17 +266,20 @@ module internal RowStore =
             return Option.bind _.Value sst
         }
 
-    /// keyspace を prefix で走査する（主キー/索引の前方一致）。
-    let scanAt (keyspace: string) (startKey: byte array) (limit: int) (visible: uint64 option) (store: RowStore) =
+    /// keyspace を prefix で走査する（生のエントリ。tombstone を含む）。
+    /// 範囲の上限判定は tombstone も見る必要があるため、`Dml` はこちらを使う。
+    /// 1行要求されるまで SSTable のブロックを読まない。
+    let scanAtRaw (keyspace: string) (startKey: byte array) (limit: int) (visible: uint64 option) (store: RowStore) =
         result {
             let! e = ensure keyspace store
-            let! entries = e.ScanAt visible startKey limit
-
-            return
-                entries
-                |> Seq.map (fun sst -> sst.Key, sst.Value)
-                |> Seq.filter (fun (_, v) -> v.IsSome)
+            return! e.ScanAt visible startKey limit
         }
+
+    /// keyspace を prefix で走査する（主キー/索引の前方一致）。
+    /// 返り値は pull（`SstScan`）。tombstone は含まない。
+    let scanAt (keyspace: string) (startKey: byte array) (limit: int) (visible: uint64 option) (store: RowStore) =
+        scanAtRaw keyspace startKey limit visible store
+        |> Result.map (SstScan.filter (fun e -> e.Value.IsSome))
 
     /// keyspace を走査する（制限なし）。
     let scan (keyspace: string) (startKey: byte array) (limit: int) = scanAt keyspace startKey limit None
@@ -290,26 +293,45 @@ module internal RowStore =
 
     /// keyspace の全エントリをチャンク単位で tombstone 消去する。
     /// 起動時の DROP 後始末にも使う。
+    /// 同じ keyspace を走査しながら書くため、1チャンク書くたびに新しい store で
+    /// `lastKey` から走査し直す（走査中に compaction がファイルを消しても安全）。
     let clearKeyspaceChunks (mgr: TransactionManager) (space: string) (store: RowStore) =
+        let rec takeKeys n acc scan =
+            if n <= 0 then
+                ret (List.rev acc, scan)
+            else
+                match SstScan.next scan with
+                | Error e -> err e
+                | Ok None -> ret (List.rev acc, SstScan.Empty)
+                | Ok(Some(e, rest)) -> takeKeys (n - 1) (e.Key :: acc) rest
+
+        let rec loop (currentStore, currentMgr) startKey =
+            match scan space startKey 0 currentStore with
+            | Error e -> err e
+            | Ok stale ->
+                match takeKeys ClearChunkEntries [] stale with
+                | Error e -> err e
+                | Ok([], _) -> ret (currentStore, currentMgr)
+                | Ok(chunk, _) ->
+                    let lastKey = List.last chunk
+
+                    let mgr0, txn =
+                        TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) currentMgr
+
+                    match foldOk (fun t key -> ret (Transaction.remove space key t)) txn chunk with
+                    | Error e -> err e
+                    | Ok txn2 ->
+                        match TransactionManager.commit txn2 mgr0 with
+                        | Error e -> err e
+                        | Ok(mgr1, _, batches) ->
+                            match writeBatches batches currentStore with
+                            | Error e -> err e
+                            | Ok store1 -> loop (store1, mgr1) lastKey
+
         if not (keyspaceExists space store) then
             ret (store, mgr)
         else
-            scan space [||] 0 store
-            >>= fun stale ->
-                stale
-                |> Seq.chunkBySize ClearChunkEntries
-                |> foldOk
-                    (fun (currentStore, currentMgr) chunk ->
-                        let mgr0, txn =
-                            TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) currentMgr
-
-                        result {
-                            let! txn2 = foldOk (fun t (key, _) -> ret (Transaction.remove space key t)) txn chunk
-                            let! mgr1, _, batches = TransactionManager.commit txn2 mgr0
-                            let! store1 = writeBatches batches currentStore
-                            return store1, mgr1
-                        })
-                    (store, mgr)
+            loop (store, mgr) [||]
 
     /// 全 keyspace の NextSeqNo の最大値 − 1（＝保存済みの SeqNo）。
     let lastSeqNo (store: RowStore) =

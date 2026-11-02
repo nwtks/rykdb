@@ -131,6 +131,31 @@ module internal Dml =
            | Some hb -> KeyBuilder.startsWithPrefix key hb
            | None -> false
 
+    /// `SstScan` を `Op` に変換する。
+    /// `take` が false になった時点で走査を打ち切る（キー昇順なので範囲の上限に使える）。
+    /// `RowStore.scanAtRaw` は tombstone を含むので、None は読み飛ばす。
+    let private opOfScan (take: SstEntry -> bool) (scan: SstScan) =
+        let rec emit scan =
+            Op.Compute(fun () ->
+                let rec pull current =
+                    match SstScan.next current with
+                    | Error e -> err e
+                    | Ok None -> ret None
+                    | Ok(Some(e, rest)) ->
+                        if not (take e) then
+                            ret None
+                        else
+                            match e.Value with
+                            | Some row -> ret (Some(row, rest))
+                            | None -> pull rest
+
+                match pull scan with
+                | Error e -> err e
+                | Ok None -> ret None
+                | Ok(Some(row, rest)) -> ret (Some(row, emit rest)))
+
+        emit scan
+
     /// 主キーで既存行を取り出す（txn の書き込みを含む）。
     let getByPrimaryKeyWithTxn
         (store: RowStore)
@@ -147,9 +172,10 @@ module internal Dml =
         | None -> getByPrimaryKey key
 
     /// 主キーで prefix 走査する（キー昇順）。
+    /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
     let scanByPrimaryKey (store: RowStore) (schema: TableSchema) (limit: int) (visible: uint64 option) =
-        RowStore.scanAt (tableSpace schema) [||] limit visible store
-        |> Result.map (Seq.map (fun (_, v) -> v |> Option.defaultValue [||]))
+        RowStore.scanAtRaw (tableSpace schema) [||] limit visible store
+        |> Result.map (opOfScan (fun _ -> true))
 
     /// 主キーで prefix 走査する（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
@@ -164,7 +190,7 @@ module internal Dml =
 
         scanByPrimaryKey store schema (storeLimitFor limit slots) visible
         |> Result.map (fun rows ->
-            let overlaid = overlayRows (RowKey.primary schema) slots (Op.ofSeq rows)
+            let overlaid = overlayRows (RowKey.primary schema) slots rows
             if limit > 0 then Op.take limit overlaid else overlaid)
 
     /// 主キーの範囲走査（txn の書き込みを含む）。
@@ -179,15 +205,10 @@ module internal Dml =
         (txn: Transaction)
         =
         let scanPrimaryKeyRange lowerBytes upperBytes limit =
-            RowStore.scanAt (tableSpace schema) lowerBytes limit visible store
-            |> Result.map (
-                Seq.choose (fun (key, value) ->
-                    match value with
-                    | Some row when inKeyRange lowerBytes upperBytes key -> Some row
-                    | _ -> None)
-                >> Op.ofSeq
-                >> fun op -> if limit > 0 then Op.take limit op else op
-            )
+            RowStore.scanAtRaw (tableSpace schema) lowerBytes limit visible store
+            |> Result.map (fun scan ->
+                let rows = opOfScan (fun e -> inKeyRange lowerBytes upperBytes e.Key) scan
+                if limit > 0 then Op.take limit rows else rows)
 
         let startBytes = KeyBuilder.ofValues startKey
         let endBytes = endKey |> Option.map KeyBuilder.ofValues
@@ -219,13 +240,10 @@ module internal Dml =
         (txn: Transaction)
         =
         let scanIndexPrefix prefix limit =
-            RowStore.scanAt (indexSpace index) prefix limit visible store
-            |> Result.map (
-                Seq.takeWhile (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
-                >> Seq.choose snd
-                >> Op.ofSeq
-                >> fun op -> if limit > 0 then Op.take limit op else op
-            )
+            RowStore.scanAtRaw (indexSpace index) prefix limit visible store
+            |> Result.map (fun scan ->
+                let rows = opOfScan (fun e -> KeyBuilder.startsWithPrefix e.Key prefix) scan
+                if limit > 0 then Op.take limit rows else rows)
 
         let prefix = KeyBuilder.ofValues values
 
@@ -251,13 +269,10 @@ module internal Dml =
         (txn: Transaction)
         =
         let scanIndexRange lowerBytes upperBytes limit =
-            RowStore.scanAt (indexSpace index) lowerBytes limit visible store
-            |> Result.map (
-                Seq.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
-                >> Seq.choose snd
-                >> Op.ofSeq
-                >> fun op -> if limit > 0 then Op.take limit op else op
-            )
+            RowStore.scanAtRaw (indexSpace index) lowerBytes limit visible store
+            |> Result.map (fun scan ->
+                let rows = opOfScan (fun e -> inIndexRange lowerBytes upperBytes e.Key) scan
+                if limit > 0 then Op.take limit rows else rows)
 
         let lowerBytes = KeyBuilder.ofValues lower
         let upperBytes = upper |> Option.map KeyBuilder.ofValues

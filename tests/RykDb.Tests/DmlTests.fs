@@ -85,7 +85,7 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる`` () =
         commitInto store 1UL txn
 
         let rows =
-            Dml.scanByPrimaryKey store usersWithEmailIndex 0 None |> ok |> Seq.toArray
+            Dml.scanByPrimaryKey store usersWithEmailIndex 0 None |> ok |> Op.toArray |> ok
 
         Assert.Equal(3, rows.Length)
 
@@ -107,7 +107,7 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる（limit）`` ()
         commitInto store 1UL txn
 
         let rows =
-            Dml.scanByPrimaryKey store usersWithEmailIndex 2 None |> ok |> Seq.toArray
+            Dml.scanByPrimaryKey store usersWithEmailIndex 2 None |> ok |> Op.toArray |> ok
 
         Assert.Equal(2, rows.Length))
 
