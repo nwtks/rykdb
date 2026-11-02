@@ -49,7 +49,7 @@ let ``Eval.eval: LIKE の % と _`` () =
     let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
 
     let test (pattern: string) (text: string) =
-        let e = Expr.Like(col "s", Expr.Literal(Literal.String pattern), false)
+        let e = Expr.Like(col "s", Expr.Literal(Literal.String pattern), false, None)
 
         match ok (Eval.eval schema [| SqlValue.Text text |] e) with
         | SqlValue.Bool b -> b
@@ -336,7 +336,9 @@ let ``Eval.eval: 連結 || と二項 LIKE`` () =
     Assert.True(SqlValue.isNull (ok (ev [||] (bin BinaryOp.Like Literal.Null (Literal.String "%")))))
     // Expr.Like でも NULL が絡むと NULL
     Assert.True(
-        SqlValue.isNull (ok (ev [||] (Expr.Like(Expr.Literal Literal.Null, Expr.Literal(Literal.String "%"), false))))
+        SqlValue.isNull (
+            ok (ev [||] (Expr.Like(Expr.Literal Literal.Null, Expr.Literal(Literal.String "%"), false, None)))
+        )
     )
 
 [<Fact>]
@@ -428,3 +430,57 @@ let ``Eval.matches: WHERE では UNKNOWN を偽として扱う`` () =
 let ``Eval.matches: WHERE 述語が数値を返したら 0 以外は真`` () =
     Assert.True(ok (Eval.matches schema2 (row2 1L 0L) (Expr.Literal(Literal.Int 1L))))
     Assert.False(ok (Eval.matches schema2 (row2 0L 0L) (Expr.Literal(Literal.Int 0L))))
+
+[<Fact>]
+let ``Scalar.likeMatchWithEscape: エスケープした % _ ! をリテラルにする`` () =
+    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!%b" "a%b"))
+    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!%b" "axb"))
+    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!_b" "a_b"))
+    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!_b" "axb"))
+    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!!b" "a!b"))
+    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!!b" "ab"))
+    expectErrorKind ErrorKind.TypeError "末尾 ESCAPE" (Scalar.likeMatchWithEscape '!' "a!" "a")
+
+[<Fact>]
+let ``Eval.eval: IS TRUE / FALSE / UNKNOWN`` () =
+    let schema = outSchema [ outCol "b" None (Some DataType.Boolean) ]
+    let ev v e = Eval.eval schema [| v |] e
+
+    Assert.Equal(SqlValue.Bool true, ok (ev (SqlValue.Bool true) (Expr.IsTruth(col "b", TruthValue.True, false))))
+    Assert.Equal(SqlValue.Bool false, ok (ev (SqlValue.Bool false) (Expr.IsTruth(col "b", TruthValue.True, false))))
+    Assert.Equal(SqlValue.Bool false, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.True, false))))
+    Assert.Equal(SqlValue.Bool true, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.True, true))))
+
+    Assert.Equal(SqlValue.Bool true, ok (ev (SqlValue.Bool false) (Expr.IsTruth(col "b", TruthValue.False, false))))
+
+    Assert.Equal(SqlValue.Bool true, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.False, true))))
+
+    Assert.Equal(SqlValue.Bool true, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.Unknown, false))))
+
+    Assert.Equal(SqlValue.Bool false, ok (ev (SqlValue.Bool true) (Expr.IsTruth(col "b", TruthValue.Unknown, false))))
+
+    Assert.Equal(SqlValue.Bool false, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.Unknown, true))))
+
+    Assert.Equal(SqlValue.Bool true, ok (ev (SqlValue.Bool false) (Expr.IsTruth(col "b", TruthValue.Unknown, true))))
+
+[<Fact>]
+let ``Eval.eval: CAST は TEXT から数値・BOOLEAN へ変換できる`` () =
+    let ev e = Eval.eval Schema.empty [||] e
+    Assert.Equal(SqlValue.Int 42L, ok (ev (Expr.Cast(Expr.Literal(Literal.String "42"), DataType.Integer))))
+
+    Assert.Equal(SqlValue.Real 1.5, ok (ev (Expr.Cast(Expr.Literal(Literal.String "1.5"), DataType.Real))))
+
+    Assert.Equal(SqlValue.Bool true, ok (ev (Expr.Cast(Expr.Literal(Literal.String "true"), DataType.Boolean))))
+
+    Assert.Equal(SqlValue.Text "42", ok (ev (Expr.Cast(Expr.Literal(Literal.Int 42L), DataType.Text))))
+
+    expectErrorKind
+        ErrorKind.TypeError
+        "CAST の変換失敗"
+        (ev (Expr.Cast(Expr.Literal(Literal.String "x"), DataType.Integer)))
+
+    Assert.True(SqlValue.isNull (ok (ev (Expr.Cast(Expr.Literal Literal.Null, DataType.Integer)))))
+
+[<Fact>]
+let ``Eval.eval: DEFAULT は INSERT 以外でエラー`` () =
+    expectErrorKind ErrorKind.SyntaxError "DEFAULT 単体" (Eval.eval Schema.empty [||] Expr.Default)

@@ -125,7 +125,10 @@ let ``Ast: その他の演算子の表示`` () =
     Assert.Equal<string>("(NOT a)", Expr.toDisplayString (Expr.Unary(UnaryOp.Not, a)))
     Assert.Equal<string>("(- a)", Expr.toDisplayString (Expr.Unary(UnaryOp.Neg, a)))
 
-    Assert.Equal<string>("(a LIKE 'x%')", Expr.toDisplayString (Expr.Like(a, literal (Literal.String "x%"), false)))
+    Assert.Equal<string>(
+        "(a LIKE 'x%')",
+        Expr.toDisplayString (Expr.Like(a, literal (Literal.String "x%"), false, None))
+    )
 
     Assert.Equal<string>("t.*", Expr.toDisplayString (Expr.QualifiedStar "t"))
 

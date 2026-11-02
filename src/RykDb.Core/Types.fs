@@ -345,10 +345,9 @@ module internal SqlValue =
     /// 変換できない場合は型エラーを返す。
     let coerce (target: DataType) (v: SqlValue) =
         let fail () =
-            err (
-                sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
-                |> DbError.typeError
-            )
+            sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
+            |> DbError.typeError
+            |> err
 
         let isDecimalRepresentable =
             function
@@ -467,3 +466,57 @@ module internal SqlValue =
                     | true, g -> g |> SqlValue.Uuid |> ret
                     | _ -> fail ()
                 | _ -> fail ()
+
+    /// CAST 用の明示変換。
+    /// 暗黙変換 (`coerce`) より広く、TEXT から数値・BOOLEAN への変換も行う。
+    let cast (target: DataType) (v: SqlValue) =
+        let fail () =
+            sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
+            |> DbError.typeError
+            |> err
+
+        if isNull v then
+            ret SqlValue.Null
+        else
+            match target, v with
+            | DataType.Null, _ -> ret SqlValue.Null
+            | DataType.Integer, SqlValue.Text s ->
+                match
+                    System.Int64.TryParse(
+                        s,
+                        System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture
+                    )
+                with
+                | true, i -> ret (SqlValue.Int i)
+                | _ -> fail ()
+            | DataType.Real, SqlValue.Text s ->
+                match
+                    System.Double.TryParse(
+                        s,
+                        System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture
+                    )
+                with
+                | true, f -> ret (SqlValue.Real(normalizeFloat f))
+                | _ -> fail ()
+            | DataType.Decimal, SqlValue.Text s ->
+                match
+                    System.Decimal.TryParse(
+                        s,
+                        System.Globalization.NumberStyles.Number,
+                        System.Globalization.CultureInfo.InvariantCulture
+                    )
+                with
+                | true, d -> ret (SqlValue.Decimal d)
+                | _ -> fail ()
+            | DataType.Boolean, SqlValue.Text s ->
+                match s.Trim().ToUpperInvariant() with
+                | "TRUE"
+                | "T"
+                | "1" -> ret (SqlValue.Bool true)
+                | "FALSE"
+                | "F"
+                | "0" -> ret (SqlValue.Bool false)
+                | _ -> fail ()
+            | _ -> coerce target v

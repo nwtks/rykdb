@@ -145,18 +145,26 @@ type internal Expr =
     | Binary of BinaryOp * Expr * Expr
     /// 否定なら isNegative = true
     | IsNull of Expr * bool
+    /// `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN`。
+    /// 第 2 引数は期待する真理値、第 3 引数は否定。
+    | IsTruth of Expr * TruthValue * bool
     /// low / high。
     /// 否定なら isNegative = true
     | Between of Expr * Expr * Expr * bool
     /// 否定なら isNegative = true
     | InList of Expr * Expr list * bool
-    /// 否定なら isNegative = true
-    | Like of Expr * Expr * bool
+    /// 否定なら isNegative = true。
+    /// 第 4 引数は ESCAPE 式。
+    | Like of Expr * Expr * bool * Expr option
     /// (WHEN 式, THEN 式) の並び。
     /// ELSE がないなら None。
     | Case of (Expr * Expr) list * Expr option
     /// スカラー関数呼び出し
     | FuncCall of string * Expr list
+    /// CAST(expr AS type)
+    | Cast of Expr * DataType
+    /// INSERT ... VALUES の DEFAULT
+    | Default
     /// 集計呼び出し。
     /// COUNT(*) は EStar を持つ。
     | AggCall of AggFunc * bool * Expr
@@ -177,11 +185,14 @@ module internal Expr =
         | Expr.Unary(_, x) -> [ x ]
         | Expr.Binary(_, a, b) -> [ a; b ]
         | Expr.IsNull(x, _) -> [ x ]
+        | Expr.IsTruth(x, _, _) -> [ x ]
         | Expr.Between(x, a, b, _) -> [ x; a; b ]
         | Expr.InList(x, xs, _) -> x :: xs
-        | Expr.Like(x, p, _) -> [ x; p ]
+        | Expr.Like(x, p, _, esc) -> x :: p :: Option.toList esc
         | Expr.Case(branches, elseE) -> (branches |> List.collect (fun (w, t) -> [ w; t ])) @ (elseE |> Option.toList)
         | Expr.FuncCall(_, args) -> args
+        | Expr.Cast(x, _) -> [ x ]
+        | Expr.Default -> []
         | Expr.AggCall(_, _, x) -> [ x ]
 
     /// 書き換え待ちの親ノード。
@@ -233,15 +244,19 @@ module internal Expr =
                 | Expr.Unary(op, _), [ x ] -> ret (Expr.Unary(op, x))
                 | Expr.Binary(op, _, _), [ a; b ] -> ret (Expr.Binary(op, a, b))
                 | Expr.IsNull(_, neg), [ x ] -> ret (Expr.IsNull(x, neg))
+                | Expr.IsTruth(_, expected, neg), [ x ] -> ret (Expr.IsTruth(x, expected, neg))
                 | Expr.Between(_, _, _, neg), [ x; lo; hi ] -> ret (Expr.Between(x, lo, hi, neg))
                 | Expr.InList(_, _, neg), x :: xs -> ret (Expr.InList(x, xs, neg))
-                | Expr.Like(_, _, neg), [ x; p ] -> ret (Expr.Like(x, p, neg))
+                | Expr.Like(_, _, neg, None), [ x; p ] -> ret (Expr.Like(x, p, neg, None))
+                | Expr.Like(_, _, neg, Some _), [ x; p; esc ] -> ret (Expr.Like(x, p, neg, Some esc))
                 | Expr.Case(_, elseE), _ ->
                     match elseE, List.rev kids with
                     | None, _ -> ret (Expr.Case(toPairs [] kids, None))
                     | Some _, last :: branchRev -> ret (Expr.Case(List.rev branchRev |> toPairs [], Some last))
                     | Some _, [] -> miss kids
                 | Expr.FuncCall(n, _), xs -> ret (Expr.FuncCall(n, xs))
+                | Expr.Cast(_, dt), [ x ] -> ret (Expr.Cast(x, dt))
+                | Expr.Default, [] -> ret e
                 | Expr.AggCall(f, star, _), [ x ] -> ret (Expr.AggCall(f, star, x))
                 | _ -> miss kids
 
@@ -376,6 +391,17 @@ module internal Expr =
 
                     sub x [ text (if neg then " IS NOT NULL)" else " IS NULL)") ] :: next
                     |> writeSteps
+                | Expr.IsTruth(x, expected, neg) ->
+                    put "("
+
+                    let label =
+                        match expected with
+                        | TruthValue.True -> "TRUE"
+                        | TruthValue.False -> "FALSE"
+                        | TruthValue.Unknown -> "UNKNOWN"
+
+                    let op = if neg then " IS NOT " else " IS "
+                    sub x [ text (op + label + ")") ] :: next |> writeSteps
                 | Expr.Between(x, a, b, neg) ->
                     put "("
 
@@ -393,12 +419,15 @@ module internal Expr =
 
                     sub x [ text (if neg then " NOT IN (" else " IN (") ] :: (items @ next)
                     |> writeSteps
-                | Expr.Like(x, p, neg) ->
+                | Expr.Like(x, p, neg, esc) ->
                     put "("
 
-                    sub x [ text (if neg then " NOT LIKE " else " LIKE ") ]
-                    :: sub p [ text ")" ]
-                    :: next
+                    let closer =
+                        match esc with
+                        | None -> [ text ")" ]
+                        | Some escExpr -> [ text " ESCAPE "; sub escExpr [ text ")" ] ]
+
+                    sub x [ text (if neg then " NOT LIKE " else " LIKE ") ] :: sub p closer :: next
                     |> writeSteps
                 | Expr.Case(branches, elseE) ->
                     put "(CASE "
@@ -422,6 +451,12 @@ module internal Expr =
                         args |> List.mapi (fun i y -> sub y [ text (if i = n' - 1 then ")" else ", ") ])
 
                     items @ next |> writeSteps
+                | Expr.Cast(x, dt) ->
+                    put "CAST("
+                    sub x [ text (" AS " + DataType.toSqlName dt + ")") ] :: next |> writeSteps
+                | Expr.Default ->
+                    put "DEFAULT"
+                    writeSteps next
                 | Expr.AggCall(f, distinct, x) ->
                     put f.Name
                     put "("
@@ -508,6 +543,7 @@ type internal InsertStatement =
     {
         Table: TableRef
         Columns: string list option
+        /// `[ [] ]` は `DEFAULT VALUES`（全列を既定値で埋める）。
         Rows: Expr list list
     }
 
@@ -540,6 +576,7 @@ type internal CreateIndex =
         Table: string
         Columns: string list
         Unique: bool
+        IfNotExists: bool
     }
 
 [<RequireQualifiedAccess; NoComparison; NoEquality>]

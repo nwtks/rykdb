@@ -351,7 +351,9 @@ module internal Ddl =
                     return! saved filled next
                 }
 
-        createIndexCore ci |> exclusiveDdl state
+        match Catalog.findIndex state.Catalog ci.Name with
+        | Some _ when ci.IfNotExists -> ret state
+        | _ -> createIndexCore ci |> exclusiveDdl state
 
     /// DROP INDEX。
     /// 先にカタログから定義を外して索引を見えなくし、

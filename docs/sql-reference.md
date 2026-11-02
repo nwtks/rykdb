@@ -38,33 +38,36 @@ select         ::= SELECT [DISTINCT] select_item {"," select_item}
                    [ GROUP BY expr {"," expr} ]
                    [ HAVING expr ]
                    [ ORDER BY sort_key {"," sort_key} ]
-                   [ LIMIT integer ] [ OFFSET integer ]
+                   [ LIMIT expr ] [ OFFSET expr ]
 
 select_item    ::= "*" | ident "." "*" | expr [ [AS] ident ]
 table_ref      ::= ident [ [AS] ident ]
-join_clause    ::= [INNER | LEFT] JOIN table_ref ON expr
+join_clause    ::= [INNER | LEFT [OUTER]] JOIN table_ref ON expr
 sort_key       ::= expr [ASC | DESC]
 
-insert         ::= INSERT INTO table_ref [ "(" column_list ")" ] VALUES row {"," row}
+insert         ::= INSERT INTO table_ref [ "(" column_list ")" ]
+                   (VALUES row {"," row} | DEFAULT VALUES)
 row            ::= "(" expr {"," expr} ")"
 update         ::= UPDATE table_ref SET assignment {"," assignment} [ WHERE expr ]
 delete         ::= DELETE FROM table_ref [ WHERE expr ]
 
 ddl            ::= CREATE TABLE [IF NOT EXISTS] ident "(" table_element {"," table_element} ")"
-                | CREATE [UNIQUE] INDEX ident ON ident "(" column_list ")"
+                | CREATE [UNIQUE] INDEX [IF NOT EXISTS] ident ON ident "(" column_list ")"
                 | DROP TABLE  [IF EXISTS] ident
                 | DROP INDEX  [IF EXISTS] ident
 table_element  ::= column_def | PRIMARY KEY "(" column_list ")" | UNIQUE "(" column_list ")"
 column_def     ::= ident [data_type [type_args]] [column_constraint {column_constraint}]
 column_constraint ::= NOT NULL | PRIMARY KEY | UNIQUE | DEFAULT expr
 
-txn            ::= BEGIN | COMMIT | ROLLBACK
+txn            ::= BEGIN [TRANSACTION] | START TRANSACTION
+                | COMMIT [WORK | TRANSACTION] | END
+                | ROLLBACK [WORK | TRANSACTION]
 ```
 
 > **注意** `BEGIN` / `COMMIT` / `ROLLBACK` は SQL 文として transaction を制御する（§12）。
 > 詳しくは [12. トランザクション](#12-トランザクション)。
 
-文は `;` で区切れる（末尾の `;` は省略可）。
+文を複数書く場合は `;` で区切る（**区切りなしは `SyntaxError`**。末尾の `;` は省略可）。
 `Database.Execute` は複数文を順に実行する。
 `SELECT` が 1 つだけならその結果を返し、複数（または 0 個）なら `RowsAffected` の合計だけを返す
 （`Columns` / `Rows` は空）。
@@ -266,6 +269,9 @@ SELECT "Order Id" FROM "My Table";      -- 引用識別子
 
 - 修飾なしの列名は `FROM` にあるテーブルの順に探す。
 - 結合句で同じ列名が複数の表にあれば、修飾が必須。
+- `UNION` / `RIGHT` / `FULL` / `CROSS` / `NATURAL` / `OUTER` / `USING` などの未対応の SQL 語は、
+  列名・`SELECT` 項目の別名には使えるが、**裸のテーブル別名**には使えない
+  （`FROM t AS right` のように `AS` を付ける）。
 
 ### `SELECT` 項目の後置演算子
 
@@ -347,6 +353,8 @@ REAL が 1 つでも含まれる  -> REAL
 x = 1        x <> 1       x != 1
 x <  1       x <= 1       x >  1       x >= 1
 x IS NULL    x IS NOT NULL
+x IS TRUE    x IS NOT TRUE    x IS FALSE    x IS NOT FALSE
+x IS UNKNOWN x IS NOT UNKNOWN
 x IN (1, 2, 3)      x NOT IN (1, 2, 3)
 x BETWEEN 1 AND 10   x NOT BETWEEN 1 AND 10
 name LIKE 'a%'       name NOT LIKE 'a%'
@@ -361,13 +369,21 @@ name LIKE 'a%'       name NOT LIKE 'a%'
 | `%`  | 0 文字以上の任意の文字列 |
 | `_`  | ちょうど 1 文字          |
 
-`ESCAPE` 句、`\` によるエスケープ、大文字小文字を区別しないモード（`ILIKE`）は**ない**。
-パターンも被比較も文字列表現（`toDisplayString`）で照合し、引数が `NULL` なら結果は `NULL`。
+- `LIKE ... ESCAPE '文字'` に対応する。エスケープ文字は 1 文字。
+  エスケープ文字の直後の `%` / `_` / エスケープ文字自身はリテラルになる。
+  エスケープ文字がパターンの末尾に来た場合は `TypeError`。
+  `\` を既定のエスケープにする仕組みや、大文字小文字を区別しないモード（`ILIKE`）は**ない**。
+- パターンも被比較も文字列表現（`toDisplayString`）で照合し、引数が `NULL` なら結果は `NULL`。
+- `IS TRUE` / `IS FALSE` / `IS UNKNOWN` は 3値論理の判定。
+  `NULL`（UNKNOWN）は `IS TRUE` / `IS FALSE` とも `FALSE`、`IS UNKNOWN` は `TRUE`。
+  否定形（`IS NOT …`）はその否定。`BOOLEAN` 以外の値は UNKNOWN として扱う
+  （例: `1 IS TRUE` は `FALSE`、`1 IS UNKNOWN` は `TRUE`）。
 
 ```sql
 SELECT name FROM people WHERE name LIKE 'a%';     -- a で始まる
 SELECT name FROM people WHERE name LIKE '_ob';     -- 2文字目が o、3文字目が b
 SELECT name FROM people WHERE name LIKE 'a_c';     -- 3文字、2文字目が任意
+SELECT name FROM people WHERE name LIKE 'a!%' ESCAPE '!';  -- 文字列 'a%'
 ```
 
 ### 6.5 集約関数
@@ -407,7 +423,9 @@ HAVING COUNT(*) > 1
   （`REAL` が混在すると `SUM` も `REAL`、それ以外の `SUM` は `DECIMAL`。`AVG` は常に `REAL`）。
   入力が 0行でも 1行を返す（`COUNT(*)` は `0`、`SUM` / `AVG` / `MIN` / `MAX` は `NULL`）。
 - 集約関数のエラーは**伝播する**。文字列列に `SUM` を掛けると `TypeError` になる。
-- `COUNT(DISTINCT x)` は**重複排除する**。
+- `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` の `DISTINCT` は**重複排除する**
+  （`SUM(DISTINCT x)` など）。
+  `DISTINCT` は 1 引数の集約にだけ書ける。
 
 ### 6.6 スカラー関数
 
@@ -422,12 +440,17 @@ HAVING COUNT(*) > 1
 | `ABS(x)`            |      1 | 入力と同じ数値型     | `NULL`           | 非数値はエラー                                                          |
 | `ROUND(x)`          |      1 | 入力と同じ数値型     | `NULL`           | 0.5 は 1 へ（四捨五入・`AwayFromZero`）。`INTEGER` / `REAL` / `DECIMAL` |
 | `COALESCE(a, b, …)` | 1 以上 | 最初の非 `NULL` の型 | 全滅なら `NULL`  | 引数数は自由                                                            |
+| `CAST(x AS 型)`     |      1 | 変換後の型           | `NULL`           | 明示変換。`TEXT` → 数値 / `BOOLEAN` も可                                |
 
 - **未知の関数**は `未知のスカラー関数 '…' です`。
 - **引数数が違う**場合は `… 関数は 1個の引数が必要ですが、2個渡されました`。
   ただし空の引数リスト（`LENGTH()`）は関数の前に構文エラーになる。
 - `ROUND` は `INTEGER` / `REAL` / `DECIMAL` を受け付け、同じ型を返す。
   文字列など数値以外を渡すと `ROUND は数値を受け付けますが 'abc' です` になる。
+- `CAST` は `expr AS 型` の形で、型引数（`VARCHAR(10)` の `(10)`）は読み飛ばす。
+  `TEXT` から `INTEGER` / `REAL` / `DECIMAL` / `BOOLEAN` への変換は CAST 専用の規則で行う
+  （`CAST('42' AS INTEGER)` は `42`）。
+  変換できない値は `TypeError`。
 
 ### 6.7 条件式
 
@@ -466,17 +489,17 @@ SELECT name,
 ```sql
 SELECT [DISTINCT] 項目 [, 項目 …]
   FROM テーブル [[AS] 別名]
-       [[INNER | LEFT] JOIN テーブル [[AS] 別名] ON 条件] …
+       [[INNER | LEFT [OUTER]] JOIN テーブル [[AS] 別名] ON 条件] …
   [WHERE 条件]
   [GROUP BY 式 [, 式 …]]
   [HAVING 条件]
   [ORDER BY 式 [ASC|DESC] [, …]]
-  [LIMIT 整数] [OFFSET 整数];
+  [LIMIT 定数式] [OFFSET 定数式];
 ```
 
 - **`FROM` は省略できない**。
   `SELECT 1` は `FROM が必要ですが見つかりませんでした` になる。
-- `JOIN` は `INNER JOIN` / `JOIN` / `LEFT JOIN` の 3 種。
+- `JOIN` は `INNER JOIN` / `JOIN` / `LEFT JOIN` / `LEFT OUTER JOIN`。
   `RIGHT` / `FULL` / `CROSS` は**ない**。
 - `ON` は省略できない
   （`CROSS JOIN` の代わりに `ON 1 = 1`）。
@@ -518,8 +541,10 @@ SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
 - 別名の連鎖（別名の別名）も解決する。
 - 別名が自分自身や互いを参照する場合は解決しない
   （`ORDER BY` では「列 'x' が存在しません」になる）。
-- `ORDER BY` のキーは**列の直接参照**に限る
-  （`ORDER BY` の式に演算子を書くと「ORDER BY には列の直接参照だけを書けます」になる）。
+- `ORDER BY` には列参照・式・序数（1 始まり）を書ける。
+  序数は `SELECT` 項目の位置（`ORDER BY 2` は 2 番目の項目）。
+  式は行ごとに評価され、ソート後に元の列だけが残る。
+  集約式（`ORDER BY COUNT(*)` など）は未対応。
 - `t.*` の `t` が `FROM` / `JOIN` に存在しない場合は `NameError`
   （0列の成功にはしない）。
 
@@ -606,7 +631,8 @@ SELECT p.id, d.dname
 
 ### 7.7 `LIMIT` / `OFFSET`
 
-- 値は **0 以上の整数リテラル**（式・負数・範囲外は `SyntaxError`）。
+- 値は **0 以上の定数式**（行ごとの列参照・負数・範囲外はエラー）。
+  `LIMIT 1+0` のような定数式は評価される。
 - 評価は最後に 1回だけ。
   `OFFSET` → `LIMIT` の順で適用される。
 - `LIMIT` / `OFFSET` はそれぞれ単独でも書ける（`OFFSET` 単独は `LIMIT` なし扱い）。
@@ -664,12 +690,16 @@ SELECT dept_id, COUNT(*) AS c, AVG(salary) AS mean
 
 ```sql
 INSERT INTO テーブル [ (列 [, 列 …]) ] VALUES (式 [, 式 …]) [, (式 [, …]) …];
+INSERT INTO テーブル DEFAULT VALUES;
 ```
 
 ### 挙動
 
 - **列リストを省略**すると、テーブル定義の順に値を並べる。
 - **列リストに無い列**は `DEFAULT` を使い、無ければ `NULL` になる。
+- `DEFAULT VALUES` は列リスト無しで全列を既定値で埋める
+  （主キーなどに既定値が無い場合は `NOT NULL` 違反）。
+- `VALUES` の要素に `DEFAULT` を書くと、その列の既定値を使う。
 - **値式は定数のみ**（列参照不可）。
 - 値は列の型へ**暗黙変換**される（[§3](#暗黙の型変換sqlvaluecoerce)）。
 - `NOT NULL` 制約は行ごとに検証される。
@@ -821,7 +851,7 @@ CREATE TABLE t (id INTEGER PRIMARY KEY, name NOT NULL);
 ### 11.2 CREATE INDEX
 
 ```sql
-CREATE [UNIQUE] INDEX 索引名 ON テーブル (列 [, 列 …]);
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] 索引名 ON テーブル (列 [, 列 …]);
 ```
 
 - **既存の行はすべて索引に投入される**（backfill）。
@@ -835,7 +865,7 @@ CREATE [UNIQUE] INDEX 索引名 ON テーブル (列 [, 列 …]);
 - 索引する列が存在しない場合は `テーブル <t> に列 <c> がありません`。
 - 索引列の重複は `NameError`。
 - `__unique_` で始まる索引名は `UNIQUE` 制約用に予約されており、作成できない。
-- `IF NOT EXISTS` は**ない**。
+- `IF NOT EXISTS` を付けると、同名の索引が既にあっても**何もせずに成功**する。
 
 ```sql
 CREATE INDEX idx_dept ON people (dept_id);
@@ -883,6 +913,9 @@ ROLLBACK;        -- 削除を取り消し
 ```
 
 - `BEGIN` は新しい transaction を始める（既に transaction 中なら何もしない）。
+  `BEGIN TRANSACTION` / `START TRANSACTION` も同じ。
+  `COMMIT WORK` / `COMMIT TRANSACTION` / `END` は `COMMIT`、
+  `ROLLBACK WORK` / `ROLLBACK TRANSACTION` は `ROLLBACK` の別綴り。
   ライブラリ API の `Database.Begin()` も `Commit()` / `Rollback()` と同じく `Result` を返す。
 - 識別子（テーブル・列・索引・別名）は**大文字小文字を区別しない**。
 - `COMMIT` はバッファをエンジンへ流す。
@@ -1032,7 +1065,7 @@ db> .rollback
 - CTE（`WITH`）、再帰クエリ
 - ウィンドウ関数（`OVER` / `PARTITION BY` / `ROW_NUMBER` …）
 - `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN` / `USING`
-- 自然結合、`INSERT ... SELECT`
+- 自然結合（`NATURAL JOIN`）、`INSERT ... SELECT`
 - `ALTER TABLE`（列の追加・削除・型変更）
 - `TRUNCATE`
 - `EXPLAIN`、`RETURNING`
@@ -1041,13 +1074,19 @@ db> .rollback
 - 複数プロセスからの同時アクセス
   （2つ目のプロセスは `IoError` で開けない。§12.2「プロセス間ロック」）
 
+未対応の集合演算・JOIN の綴りは、テーブル別名として解釈されず **`SyntaxError`** になる。
+以前は `FROM t UNION SELECT ...` が「別名 + 別文」に分解され、
+エラーにならずに複数文の集計だけが返っていた。
+これらの語を裸のテーブル別名に使うことはできない
+（`AS` を付ければ使える）。
+
 ### 実装上の制約
 
 | 項目                | 内容                                                                                            |
 | ------------------- | ----------------------------------------------------------------------------------------------- |
 | `SELECT` の `FROM`  | **省略不可**。定数だけの SELECT は書けない                                                      |
 | 索引                | 単一列・複合索引の前置等値（1列以上）、複合索引の前置等値 + 次列の範囲、`LIKE 'prefix%'` の範囲 |
-| `LIMIT` / `OFFSET`  | 0 以上の整数リテラルのみ（式・負数はエラー）。`LIMIT 0` は「0 行」                              |
+| `LIMIT` / `OFFSET`  | 0 以上の定数式のみ（行ごとの列参照・負数はエラー）。`LIMIT 0` は「0行」                         |
 | 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                                                          |
 | ソート              | 外部マージ（一時ファイルに溢らす）。バジェット内はメモリのみ                                    |
 | `SELECT DISTINCT`   | 符号化キーの集合。既定 256MiB で上限があり、超過は `CapacityError`                              |
@@ -1055,7 +1094,7 @@ db> .rollback
 | `AVG`               | `SUM / COUNT` を実行時に計算                                                                    |
 | `UPDATE` / `DELETE` | `LIMIT` 相当の句がない                                                                          |
 | DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）                                      |
-| `ORDER BY`          | 同値行の順序は保証しない                                                                        |
+| `ORDER BY`          | 列参照・式・序数（1 始まり）が使える。同値行の順序は保証しない                                  |
 
 ### 演算の注意
 

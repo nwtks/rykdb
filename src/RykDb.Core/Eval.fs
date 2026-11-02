@@ -93,6 +93,66 @@ module internal Scalar =
 
             matchFrom 0 0
 
+    /// ESCAPE 付き LIKE のトークン。
+    type private LikeToken =
+        | LiteralChar of char
+        | AnyOne
+        | AnyMany
+
+    /// ESCAPE を解釈してパターンをトークン列にする。
+    let private likeTokens (escape: char) (pattern: string) =
+        let rec loop i acc =
+            if i >= pattern.Length then
+                ret (List.rev acc)
+            else
+                let c = pattern.[i]
+
+                if c = escape then
+                    if i + 1 >= pattern.Length then
+                        err (DbError.typeError "LIKE の ESCAPE の後に文字がありません")
+                    else
+                        loop (i + 2) (LiteralChar pattern.[i + 1] :: acc)
+                elif c = '%' then
+                    loop (i + 1) (AnyMany :: acc)
+                elif c = '_' then
+                    loop (i + 1) (AnyOne :: acc)
+                else
+                    loop (i + 1) (LiteralChar c :: acc)
+
+        loop 0 []
+
+    /// トークン列によるワイルドカード照合。
+    /// 最後の `%` だけを覚えて戻る貪欲法（指数的なバックトラックをしない）。
+    let private matchLikeTokens (tokens: LikeToken array) (text: string) =
+        let n = text.Length
+        let m = tokens.Length
+
+        let rec skipTrailingStars i =
+            if i < m && tokens.[i] = AnyMany then
+                skipTrailingStars (i + 1)
+            else
+                i
+
+        let rec go ti pi star starTi =
+            if ti >= n then
+                skipTrailingStars pi >= m
+            else
+                match (if pi < m then Some tokens.[pi] else None) with
+                | Some AnyMany -> go ti (pi + 1) (Some pi) ti
+                | Some AnyOne -> go (ti + 1) (pi + 1) star starTi
+                | Some(LiteralChar c) when text.[ti] = c -> go (ti + 1) (pi + 1) star starTi
+                | _ ->
+                    match star with
+                    | Some sp when starTi < n -> go (starTi + 1) (sp + 1) star (starTi + 1)
+                    | _ -> false
+
+        go 0 0 None 0
+
+    /// ESCAPE 付き LIKE。
+    let likeMatchWithEscape (escape: char) (pattern: string) (text: string) =
+        likeTokens escape pattern
+        |> Result.map (fun tokens -> matchLikeTokens (List.toArray tokens) text)
+
     /// スカラー関数。
     /// 未知の関数はエラー。
     let applyFunc (name: string) (args: SqlValue array) =
@@ -392,6 +452,10 @@ module internal Eval =
         /// 単項演算子。
         /// 値が上がってから適用する。
         | KUnary of UnaryOp
+        /// IS [NOT] TRUE / FALSE / UNKNOWN の判定。
+        | KIsTruth of TruthValue * bool
+        /// CAST の変換先。
+        | KCast of DataType
         /// 二項演算子の左辺を評価中。
         /// 上がってから右辺へ進む。
         | KBinaryL of BinaryOp * Expr
@@ -407,8 +471,10 @@ module internal Eval =
         | KInX of Expr list * bool
         /// IN の候補 1件を評価中（左辺の値, 否定, 残りの候補, UNKNOWN を見たか）。
         | KInArg of SqlValue * bool * Expr list * bool
-        | KLikeX of Expr * bool
-        | KLikeP of SqlValue * bool
+        | KLikeX of Expr * bool * Expr option
+        | KLikeP of SqlValue * bool * Expr option
+        /// ESCAPE 式の評価中（左辺, パターン, 否定）。
+        | KLikeE of SqlValue * SqlValue * bool
         /// CASE の WHEN を評価中（当該の WHEN/THEN, 残りの枝, ELSE）。
         | KCaseWhen of (Expr * Expr) * (Expr * Expr) list * Expr option
         /// 関数の引数 1個を評価中（関数名, 確定済みの逆順, 残りの引数）。
@@ -451,9 +517,10 @@ module internal Eval =
             | Expr.Unary(op, x) -> step schema row (KUnary op :: kont) (Descend x)
             | Expr.Binary(op, a, b) -> step schema row (KBinaryL(op, b) :: kont) (Descend a)
             | Expr.IsNull(x, negated) -> step schema row (KIsNull negated :: kont) (Descend x)
+            | Expr.IsTruth(x, expected, negated) -> step schema row (KIsTruth(expected, negated) :: kont) (Descend x)
             | Expr.Between(x, lo, hi, negated) -> step schema row (KBetweenX(lo, hi, negated) :: kont) (Descend x)
             | Expr.InList(x, list, negated) -> step schema row (KInX(list, negated) :: kont) (Descend x)
-            | Expr.Like(x, p, negated) -> step schema row (KLikeX(p, negated) :: kont) (Descend x)
+            | Expr.Like(x, p, negated, esc) -> step schema row (KLikeX(p, negated, esc) :: kont) (Descend x)
             | Expr.Case(branches, elseE) ->
                 match branches with
                 | (w, t) :: tail -> step schema row (KCaseWhen((w, t), tail, elseE) :: kont) (Descend w)
@@ -468,6 +535,8 @@ module internal Eval =
                     match Scalar.applyFunc n [||] with
                     | Error er -> err er
                     | Ok v -> step schema row kont (Arrive v)
+            | Expr.Cast(x, dt) -> step schema row (KCast dt :: kont) (Descend x)
+            | Expr.Default -> err (DbError.create ErrorKind.SyntaxError "DEFAULT は INSERT の VALUES でのみ使えます")
             | Expr.AggCall(f, _, _) -> err (sprintf "%s は集約なのでここでは評価できません" f.Name |> DbError.name)
         | Arrive v ->
             match kont with
@@ -545,6 +614,13 @@ module internal Eval =
             | KIsNull negated :: rest ->
                 let isNull = SqlValue.isNull v
                 step schema row rest (Arrive(SqlValue.Bool(if negated then not isNull else isNull)))
+            | KIsTruth(expected, negated) :: rest ->
+                let result = truthOfValue v = expected
+                step schema row rest (Arrive(SqlValue.Bool(if negated then not result else result)))
+            | KCast dt :: rest ->
+                match SqlValue.cast dt v with
+                | Error er -> err er
+                | Ok res -> step schema row rest (Arrive res)
             | KBetweenX(lo, hi, negated) :: rest -> step schema row (KBetweenLo(v, hi, negated) :: rest) (Descend lo)
             | KBetweenLo(x, hi, negated) :: rest -> step schema row (KBetweenHi(x, v, negated) :: rest) (Descend hi)
             | KBetweenHi(x, lov, negated) :: rest ->
@@ -572,13 +648,33 @@ module internal Eval =
                     match tail with
                     | [] -> step schema row rest (Arrive(if saw then SqlValue.Null else SqlValue.Bool negated))
                     | cand :: more -> step schema row (KInArg(x, negated, more, saw) :: rest) (Descend cand)
-            | KLikeX(p, negated) :: rest -> step schema row (KLikeP(v, negated) :: rest) (Descend p)
-            | KLikeP(x, negated) :: rest ->
+            | KLikeX(p, negated, esc) :: rest -> step schema row (KLikeP(v, negated, esc) :: rest) (Descend p)
+            | KLikeP(x, negated, esc) :: rest ->
                 if SqlValue.isNull x || SqlValue.isNull v then
                     step schema row rest (Arrive SqlValue.Null)
                 else
-                    let m = Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString x)
-                    step schema row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
+                    match esc with
+                    | None ->
+                        let m = Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString x)
+                        step schema row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
+                    | Some escExpr -> step schema row (KLikeE(x, v, negated) :: rest) (Descend escExpr)
+            | KLikeE(x, pattern, negated) :: rest ->
+                if SqlValue.isNull v then
+                    step schema row rest (Arrive SqlValue.Null)
+                else
+                    let escapeText = SqlValue.toDisplayString v
+
+                    if escapeText.Length <> 1 then
+                        err (DbError.typeError "LIKE の ESCAPE は 1 文字で指定してください")
+                    else
+                        match
+                            Scalar.likeMatchWithEscape
+                                escapeText.[0]
+                                (SqlValue.toDisplayString pattern)
+                                (SqlValue.toDisplayString x)
+                        with
+                        | Error er -> err er
+                        | Ok m -> step schema row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
             | KCaseWhen((w, t), tail, elseE) :: rest ->
                 let matched = not (SqlValue.isNull v) && boolOf v
 

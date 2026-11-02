@@ -497,7 +497,7 @@ module internal Analyzer =
                         | Some lv, Some hv -> accumulateBounds tn colName (Some lv) (Some hv) tail
                         | _ -> accumulateBounds tn colName lower upper tail
                     | _ -> accumulateBounds tn colName lower upper tail
-                | Expr.Like(x, p, false) ->
+                | Expr.Like(x, p, false, None) ->
                     match colOf tn x, litOf p with
                     | Some n, Some(SqlValue.Text pattern) when Catalog.eqName n colName ->
                         if

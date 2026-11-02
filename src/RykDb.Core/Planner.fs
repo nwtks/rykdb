@@ -147,16 +147,51 @@ module internal Optimizer =
                     | Some hv -> return Logical.Having(hv, allAggs, groupBy, aggNode)
             }
 
+        let expandItem schema item =
+            match item.Expression with
+            | Expr.Star
+            | Expr.QualifiedStar _ ->
+                match Schema.expandStar schema item.Expression with
+                | Some(_, cols) ->
+                    cols
+                    |> List.map (fun c ->
+                        Expr.Column
+                            {
+                                Qualifier = c.Qualifier
+                                Name = c.Name
+                            })
+                | None -> [ item.Expression ]
+            | e -> [ e ]
+
+        let ordinalExpr outputExprs itemCount =
+            function
+            | Expr.Literal(Literal.Int n) ->
+                let idx = int n - 1
+
+                if n < 1L || idx >= itemCount then
+                    sprintf "ORDER BY の列番号 %d は範囲外です" n
+                    |> DbError.create ErrorKind.SyntaxError
+                    |> err
+                else
+                    match List.tryItem idx outputExprs with
+                    | None -> err (DbError.internalError "ORDER BY の列番号が解決できません")
+                    | Some item -> ret item
+            | e -> ret e
+
         let applySort schema stmt tree =
             if List.isEmpty stmt.OrderBy then
                 ret tree
             else
                 let aliases = Alias.dropCyclic (Alias.ofItems stmt.Items)
+                let outputExprs = stmt.Items |> List.collect (expandItem schema)
+                let itemCount = List.length outputExprs
 
                 result {
                     let! exprs =
                         stmt.OrderBy
-                        |> List.map (fun k -> Alias.substitute schema aliases k.Expression)
+                        |> List.map (fun k ->
+                            ordinalExpr outputExprs itemCount k.Expression
+                            >>= Alias.substitute schema aliases)
                         |> all
 
                     let! qualified = Binder.qualifyMany schema exprs
@@ -187,14 +222,18 @@ module internal Optimizer =
         let evalCount what =
             function
             | Expr.Literal(Literal.Int i) when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
-            | Expr.Literal(Literal.Int _) ->
-                sprintf "%s は 0 以上 %d 以下の整数で指定してください" what System.Int32.MaxValue
-                |> DbError.create ErrorKind.SyntaxError
-                |> err
-            | _ ->
-                sprintf "%s は整数リテラルで指定してください" what
-                |> DbError.create ErrorKind.SyntaxError
-                |> err
+            | e ->
+                Eval.eval Schema.empty [||] e
+                >>= function
+                    | SqlValue.Int i when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
+                    | SqlValue.Int _ ->
+                        sprintf "%s は 0 以上 %d 以下の整数で指定してください" what System.Int32.MaxValue
+                        |> DbError.create ErrorKind.SyntaxError
+                        |> err
+                    | _ ->
+                        sprintf "%s は 0 以上の整数で指定してください" what
+                        |> DbError.create ErrorKind.SyntaxError
+                        |> err
 
         let applyLimit stmt tree =
             match stmt.Limit, stmt.Offset with
@@ -392,18 +431,18 @@ module internal Optimizer =
                     Ops.innerJoinHash
                         frame.LeftSchema
                         left
+                        keys.LeftIndices
                         frame.RightSchema
                         right
-                        keys.LeftIndices
                         keys.RightIndices
                         keys.Residual
                 | JoinKind.Left ->
                     Ops.leftJoinHash
                         frame.LeftSchema
                         left
+                        keys.LeftIndices
                         frame.RightSchema
                         right
-                        keys.LeftIndices
                         keys.RightIndices
                         keys.Residual
             | JoinAlgorithm.IndexNestedLoop _ ->
@@ -490,9 +529,9 @@ module internal Optimizer =
             | [] -> ret op
             | frame :: rest ->
                 match frame with
-                | FilterFrame(p, childSchema) -> run ctx rest (ApplyOp(Ops.filter childSchema op p))
+                | FilterFrame(p, childSchema) -> run ctx rest (ApplyOp(Ops.filter childSchema p op))
                 | AggregateFrame(groupBy, aggs, inSchema) ->
-                    match Ops.aggregate inSchema op groupBy aggs with
+                    match Ops.aggregate inSchema groupBy aggs op with
                     | Error e -> err e
                     | Ok aggregated -> run ctx rest (ApplyOp aggregated)
                 | HavingFrame(h, aggs, groupBy) ->
@@ -500,7 +539,7 @@ module internal Optimizer =
                     run ctx rest (ApplyOp(Op.filter p op))
                 | DistinctFrame -> run ctx rest (ApplyOp(Ops.distinct op))
                 | SortFrame(keys, childSchema) ->
-                    match Ops.sortBy childSchema op keys with
+                    match Ops.sortBy childSchema keys op with
                     | Error e -> err e
                     | Ok sorted -> run ctx rest (ApplyOp sorted)
                 | LimitFrame(offset, limit) ->
@@ -508,7 +547,7 @@ module internal Optimizer =
                     let limited = if limit >= 0 then Op.take limit skipped else skipped
                     run ctx rest (ApplyOp limited)
                 | ProjectFrame(items, childSchema, groupBy) ->
-                    run ctx rest (ApplyOp(Ops.project childSchema groupBy op items))
+                    run ctx rest (ApplyOp(Ops.project childSchema groupBy items op))
                 | JoinIndexLeftFrame frame ->
                     let keys = frame.Keys.Value
 
@@ -526,16 +565,16 @@ module internal Optimizer =
                             Ops.innerJoinIndexed
                                 frame.LeftSchema
                                 op
-                                frame.RightSchema
                                 frame.LeftKeyIndices
+                                frame.RightSchema
                                 lookup
                                 keys.Residual
                         | JoinKind.Left ->
                             Ops.leftJoinIndexed
                                 frame.LeftSchema
                                 op
-                                frame.RightSchema
                                 frame.LeftKeyIndices
+                                frame.RightSchema
                                 lookup
                                 keys.Residual
 

@@ -349,9 +349,11 @@ flowchart LR
 補足:
 
 - **集約の検出**は SELECT 項目と ORDER BY から（`Ops.aggCalls`）。
-  GROUP BY があるか集約呼び出しがあれば `Aggregate` を作り、HAVING があればその上に `Having` を置く。
-- **ORDER BY に書けるのは列の直接参照だけ**（式は実行時にエラー）。
-- **LIMIT / OFFSET は 0 以上の整数リテラルのみ**（式・負数は `SyntaxError`）。
+  GROUP BY があるか集約呼び出しがあれば `Aggregate` を作り、
+  HAVING があればその上に `Having` を置く。
+- **ORDER BY は列参照・式・序数（1 始まり）**が使える。
+  式は行末に評価結果を足してソートし、後で落とす。
+- **LIMIT / OFFSET は 0 以上の定数式**（行ごとの列参照・負数はエラー）。
   `LIMIT` は最外層に置き、`OFFSET` を先、`LIMIT` を後に適用する。
 
 #### 最適化ルール（実装済みの範囲）
@@ -546,10 +548,11 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
   `COUNT(列)` は NULL を数えず、`COUNT(*)` は数える。
   空グループの `SUM` / `AVG` / `MIN` / `MAX` は `NULL`、`COUNT` は 0。
 - `SUM` は数値列なら `DECIMAL`（`REAL` 混在時のみ `REAL`）、`AVG` は常に `REAL` を返す。
-  `COUNT(DISTINCT x)` は重複排除する（`Ops.aggregate` の `addAcc` が `distinct` フラグで `Seen` を管理）。
-  `SUM` / `AVG` / `MIN` / `MAX` の `DISTINCT` はパーサが受理しない（`COUNT` のみ）。
-- ソート（`Ops.sortBy`）はキーを「列インデックス + 向き」に解決して `ExtSort.sortRows`（外部マージ）で並べる。
-  ORDER BY に書けるのは**列の直接参照だけ**（式はエラー）。
+  `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` の `DISTINCT` は重複排除する
+  （`Ops.aggregate` の `addAcc` が `distinct` フラグで `Seen` を管理）。
+- ソート（`Ops.sortBy`）は列参照なら「列インデックス + 向き」に解決して `ExtSort.sortRows`（外部マージ）で並べる。
+  式のキーは行ごとに評価して行末に足し、ソート後に元の列だけを残す。
+  `ORDER BY` の序数（1 始まり）は `Planner.applySort` が `SELECT` 項目の式へ置き換える。
   解決は修飾つき（`t.age`）を優先するので、集約後の出力（列名が `SUM(t.age)` になる）でも動く。
 - 射影（`Ops.project`）は `*` / `t.*` を列参照へ展開する。
   入力が集約結果のときは `substituteAggs` で位置に読み替えてから評価する。

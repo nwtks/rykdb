@@ -73,7 +73,7 @@ let ``ExtSort: 比較不能な型は呼び出し時に Error`` () =
             }
         ]
 
-    expectErrorKind ErrorKind.TypeError "比較不能な型は Error" (Ops.sortBy schema2 mixed keys)
+    expectErrorKind ErrorKind.TypeError "比較不能な型は Error" (Ops.sortBy schema2 keys mixed)
 
 [<Fact>]
 let ``ExtSort: 5000行を小さなバジェットで溢らしても整列できる`` () =

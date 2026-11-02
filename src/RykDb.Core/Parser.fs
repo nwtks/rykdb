@@ -95,6 +95,58 @@ module internal Parser =
         | Token.Keyword x -> x = k
         | _ -> false
 
+    /// 未対応の集合演算。
+    /// これらは予約語ではないため、テーブル別名として飲み込むと
+    /// 後続の SELECT が別の文として実行されてしまう。
+    let private SetOperationWords = Set.ofList [ "UNION"; "INTERSECT"; "EXCEPT" ]
+
+    /// 未対応の JOIN 系の語。
+    /// テーブル別名として飲み込むと、RIGHT JOIN などが INNER JOIN として静かに実行される。
+    let private UnsupportedJoinWords =
+        Set.ofList [ "RIGHT"; "FULL"; "CROSS"; "NATURAL"; "OUTER" ]
+
+    /// テーブル別名として飲み込んではいけない語。
+    let private UnsupportedTableAliasWords =
+        Set.union SetOperationWords UnsupportedJoinWords
+
+    /// 現在位置が指定した識別子（大文字小文字を無視）か。
+    let private isIdentName (name: string) (st: PState) =
+        match peek st with
+        | Token.Ident s -> s.ToUpperInvariant() = name
+        | _ -> false
+
+    /// 指定した識別子があれば消費する（無くてもエラーにしない）。
+    let private eatIdentName (name: string) (st: PState) =
+        if isIdentName name st then advance st else st
+
+    /// 未対応語をテーブル別名として飲み込まないためのメッセージ。
+    let private unsupportedAliasMessage (word: string) =
+        match word with
+        | "UNION"
+        | "INTERSECT"
+        | "EXCEPT" -> sprintf "%s は未対応です（集合演算は未対応。別名にする場合は AS を付けてください）" word
+        | "RIGHT"
+        | "FULL"
+        | "CROSS"
+        | "NATURAL"
+        | "OUTER" -> sprintf "%s は未対応です（INNER JOIN / LEFT JOIN のみ対応。別名にする場合は AS を付けてください）" word
+        | _ -> sprintf "%s は未対応です" word
+
+    /// 集合演算が続いている場合は、別名として飲み込まずに明示エラーにする。
+    let private rejectSetOperation (st: PState) =
+        match peek st with
+        | Token.Ident s when Set.contains (s.ToUpperInvariant()) SetOperationWords ->
+            fail "集合演算（UNION / INTERSECT / EXCEPT）は未対応です" st
+        | _ -> ret ()
+
+    /// JOIN の位置に未対応語が来たら、別名や別の JOIN として解釈せず明示エラーにする。
+    /// テーブルに `AS` で別名を付けた場合（`FROM t AS x RIGHT JOIN u`）もここで拾う。
+    let private rejectUnsupportedClause (st: PState) =
+        match peek st with
+        | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedTableAliasWords ->
+            fail (unsupportedAliasMessage (s.ToUpperInvariant())) st
+        | _ -> ret ()
+
     /// 記号pletsを消費して次の状態を返す。
     /// 消費できなくてもエラーにしない。
     let private eatSymbol (s: string) (st: PState) =
@@ -126,6 +178,21 @@ module internal Parser =
         | Token.QuotedIdent s -> ret (s, advance st)
         | Token.Keyword k when Set.contains k TypeNames -> ret (k.ToLowerInvariant(), advance st)
         | _ -> fail "識別子が必要ですが見つかりませんでした" st
+
+    /// 括弧の対応を取って読み飛ばす（CAST の型引数用）。
+    let private skipParens (st: PState) =
+        let rec loop depth st =
+            if depth = 0 then
+                ret st
+            elif st.Pos >= st.Tokens.Length - 1 then
+                fail "型引数の ')' がありません" st
+            else
+                match peek st with
+                | Token.Symbol "(" -> loop (depth + 1) (advance st)
+                | Token.Symbol ")" -> loop (depth - 1) (advance st)
+                | _ -> loop depth (advance st)
+
+        if isSymbol "(" st then loop 1 (advance st) else ret st
 
     /// 括弧で囲まれた識別子リストを読む。
     let private parseParenIdentList (st: PState) =
@@ -226,7 +293,8 @@ module internal Parser =
                 | Error e -> err e
                 | Ok(_, st) -> k (Expr.AggCall(AggFunc.Count, false, Expr.Star)) st
             else
-                let distinct = upper = "COUNT" && isKeyword "DISTINCT" st
+                let isAgg = (AggFunc.tryParse upper).IsSome
+                let distinct = isAgg && isKeyword "DISTINCT" st
 
                 if distinct then advance st else st
                 |> parseExprListToParen
@@ -236,6 +304,26 @@ module internal Parser =
                             k (Expr.AggCall(agg, distinct, List.head argList)) st
                         | _ -> k (Expr.FuncCall(upper, argList)) st)
                     []
+
+    and [<TailCall>] private parseCastC<'r> (k: K<'r>) (st: PState) =
+        match expectSymbol "(" st with
+        | Error e -> err e
+        | Ok(_, st) ->
+            parseExprC
+                (fun e st ->
+                    match expectKeyword "AS" st with
+                    | Error e -> err e
+                    | Ok(_, st) ->
+                        match parseDataType st with
+                        | Error e -> err e
+                        | Ok(dt, st) ->
+                            match skipParens st with
+                            | Error e -> err e
+                            | Ok st ->
+                                match expectSymbol ")" st with
+                                | Error e -> err e
+                                | Ok(_, st) -> k (Expr.Cast(e, dt)) st)
+                st
 
     and [<TailCall>] private parseNamedPrimaryC<'r> (k: K<'r>) (name: string) (st: PState) =
         let st = advance st
@@ -248,7 +336,10 @@ module internal Parser =
                 | Error e -> err e
                 | Ok(c, st) -> k (Expr.Column { Qualifier = Some name; Name = c }) st
         elif isSymbol "(" st then
-            parseCallBodyC k name st
+            if name.ToUpperInvariant() = "CAST" then
+                parseCastC k st
+            else
+                parseCallBodyC k name st
         else
             k (Expr.Name name) st
 
@@ -294,6 +385,7 @@ module internal Parser =
         | Token.Keyword "NULL" -> advance st |> k (Expr.Literal Literal.Null)
         | Token.Keyword "TRUE" -> advance st |> k (Expr.Literal(Literal.Bool true))
         | Token.Keyword "FALSE" -> advance st |> k (Expr.Literal(Literal.Bool false))
+        | Token.Keyword "DEFAULT" -> advance st |> k Expr.Default
         | Token.Keyword "CASE" -> parseCaseC k st
         | Token.Symbol "*" -> advance st |> k Expr.Star
         | Token.Symbol "(" ->
@@ -391,6 +483,14 @@ module internal Parser =
         | Error e -> err e
         | Ok(_, st) -> parseInListBodyLoop k [] st
 
+    /// LIKE のパターン評価後に ESCAPE を読む継続。
+    and [<TailCall>] private parseLikeEscape<'r> (k: K<'r>) (left: Expr) (pattern: Expr) (negated: bool) (st: PState) =
+        if isIdentName "ESCAPE" st then
+            advance st
+            |> parseAdditiveC (fun esc st -> k (Expr.Like(left, pattern, negated, Some esc)) st)
+        else
+            k (Expr.Like(left, pattern, negated, None)) st
+
     and [<TailCall>] private parsePredicateTail<'r> (k: K<'r>) (left: Expr) (st: PState) =
         let compareOp =
             if isSymbol "=" st then
@@ -418,9 +518,16 @@ module internal Parser =
                 let negated = isKeyword "NOT" afterIs
                 let afterNot = eatKeyword "NOT" afterIs
 
-                match expectKeyword "NULL" afterNot with
-                | Error e -> err e
-                | Ok(_, st) -> k (Expr.IsNull(left, negated)) st
+                if isKeyword "TRUE" afterNot then
+                    advance afterNot |> k (Expr.IsTruth(left, TruthValue.True, negated))
+                elif isKeyword "FALSE" afterNot then
+                    advance afterNot |> k (Expr.IsTruth(left, TruthValue.False, negated))
+                elif isIdentName "UNKNOWN" afterNot then
+                    advance afterNot |> k (Expr.IsTruth(left, TruthValue.Unknown, negated))
+                else
+                    match expectKeyword "NULL" afterNot with
+                    | Error e -> err e
+                    | Ok(_, st) -> k (Expr.IsNull(left, negated)) st
             elif isKeyword "NOT" st then
                 let afterNot = advance st
 
@@ -431,7 +538,8 @@ module internal Parser =
                     advance afterNot
                     |> parseBetweenBodyC (fun lo hi st -> k (Expr.Between(left, lo, hi, true)) st)
                 elif isKeyword "LIKE" afterNot then
-                    advance afterNot |> parseAdditiveC (fun p st -> k (Expr.Like(left, p, true)) st)
+                    advance afterNot
+                    |> parseAdditiveC (fun p st -> parseLikeEscape k left p true st)
                 else
                     fail "NOT の後ろには IN / BETWEEN / LIKE が必要です" afterNot
             elif isKeyword "IN" st then
@@ -441,7 +549,7 @@ module internal Parser =
                 advance st
                 |> parseBetweenBodyC (fun lo hi st -> k (Expr.Between(left, lo, hi, false)) st)
             elif isKeyword "LIKE" st then
-                advance st |> parseAdditiveC (fun p st -> k (Expr.Like(left, p, false)) st)
+                advance st |> parseAdditiveC (fun p st -> parseLikeEscape k left p false st)
             else
                 k left st
 
@@ -492,10 +600,25 @@ module internal Parser =
             | Token.QuotedIdent s -> ret (Some s, advance st)
             | _ -> ret (None, st)
 
+    /// テーブル別名を読む。
+    /// 未対応の SQL 語は裸の別名として飲み込まない（`AS` を付ければ別名として使える）。
+    /// `USING` はここでは消費せず、呼び出し側が JOIN / DELETE の文脈に応じてエラーにする。
+    let private parseTableAlias (st: PState) =
+        if isKeyword "AS" st then
+            advance st |> parseIdent |> Result.map (fun (a, st) -> Some a, st)
+        else
+            match peek st with
+            | Token.Ident s when s.ToUpperInvariant() = "USING" -> ret (None, st)
+            | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedTableAliasWords ->
+                fail (unsupportedAliasMessage (s.ToUpperInvariant())) st
+            | Token.Ident s -> ret (Some s, advance st)
+            | Token.QuotedIdent s -> ret (Some s, advance st)
+            | _ -> ret (None, st)
+
     let private parseTableRef (st: PState) =
         result {
             let! name, st = parseIdent st
-            let! alias, st = parseOptAlias st
+            let! alias, st = parseTableAlias st
             return { Name = name; Alias = alias }, st
         }
 
@@ -542,23 +665,32 @@ module internal Parser =
 
     [<TailCall>]
     let rec private parseJoins (acc: JoinClause list) (st: PState) =
-        let kind, st =
-            if isKeyword "INNER" st then JoinKind.Inner, advance st
-            elif isKeyword "LEFT" st then JoinKind.Left, advance st
-            else JoinKind.Inner, st
+        match rejectUnsupportedClause st with
+        | Error e -> err e
+        | Ok() ->
+            let afterLeft = advance st
+            let afterOuter = eatIdentName "OUTER" afterLeft
 
-        if isKeyword "JOIN" st then
-            match advance st |> parseTableRef with
-            | Error e -> err e
-            | Ok(tbl, st) ->
-                match expectKeyword "ON" st with
+            let kind, st =
+                if isKeyword "INNER" st then JoinKind.Inner, advance st
+                elif isKeyword "LEFT" st then JoinKind.Left, afterOuter
+                else JoinKind.Inner, st
+
+            if isKeyword "JOIN" st then
+                match advance st |> parseTableRef with
                 | Error e -> err e
-                | Ok(_, st) ->
-                    match parseExprC retE st with
-                    | Error e -> err e
-                    | Ok(on, st) -> parseJoins ({ Kind = kind; Table = tbl; On = on } :: acc) st
-        else
-            ret (List.rev acc, st)
+                | Ok(tbl, st) ->
+                    if isIdentName "USING" st then
+                        fail "USING は未対応です（JOIN では ON を使ってください）" st
+                    else
+                        match expectKeyword "ON" st with
+                        | Error e -> err e
+                        | Ok(_, st) ->
+                            match parseExprC retE st with
+                            | Error e -> err e
+                            | Ok(on, st) -> parseJoins ({ Kind = kind; Table = tbl; On = on } :: acc) st
+            else
+                ret (List.rev acc, st)
 
     let private parseWhere (st: PState) =
         if isKeyword "WHERE" st then
@@ -653,6 +785,7 @@ module internal Parser =
             let! orderBy, st = parseOrderBy [] st
             let! limit, offset, st = parseLimitOffset st
             let! _, st = eatOptionalSemicolon st
+            do! rejectSetOperation st
 
             let sel =
                 {
@@ -705,17 +838,33 @@ module internal Parser =
                 else
                     ret (None, st)
 
-            let! _, st = expectKeyword "VALUES" st
-            let! rs, st = rows [] st
-            let! _, st = eatOptionalSemicolon st
+            if isKeyword "DEFAULT" st then
+                match columns with
+                | Some _ -> return! fail "INSERT ... DEFAULT VALUES では列リストを指定できません" st
+                | None ->
+                    let st = advance st
+                    let! _, st = expectKeyword "VALUES" st
+                    let! _, st = eatOptionalSemicolon st
 
-            return
-                {
-                    Table = tbl
-                    Columns = columns
-                    Rows = rs
-                },
-                st
+                    return
+                        {
+                            Table = tbl
+                            Columns = None
+                            Rows = [ [] ]
+                        },
+                        st
+            else
+                let! _, st = expectKeyword "VALUES" st
+                let! rs, st = rows [] st
+                let! _, st = eatOptionalSemicolon st
+
+                return
+                    {
+                        Table = tbl
+                        Columns = columns
+                        Rows = rs
+                    },
+                    st
         }
 
     let private parseUpdate (st: PState) =
@@ -756,6 +905,13 @@ module internal Parser =
             let! _, st = expectKeyword "DELETE" st
             let! _, st = expectKeyword "FROM" st
             let! tbl, st = parseTableRef st
+
+            do!
+                if isIdentName "USING" st then
+                    fail "DELETE ... USING は未対応です" st
+                else
+                    ret ()
+
             let! whereE, st = parseWhere st
             let! _, st = eatOptionalSemicolon st
             return { Table = tbl; Where = whereE }, st
@@ -911,6 +1067,7 @@ module internal Parser =
             let unique = isKeyword "UNIQUE" st
             let st = if unique then advance st else st
             let! _, st = expectKeyword "INDEX" st
+            let! ifNotExists, st = parseIfExists st
             let! name, st = parseIdent st
             let! _, st = expectKeyword "ON" st
             let! tbl, st = parseIdent st
@@ -923,6 +1080,7 @@ module internal Parser =
                     Table = tbl
                     Columns = cols
                     Unique = unique
+                    IfNotExists = ifNotExists
                 },
                 st
         }
@@ -975,16 +1133,37 @@ module internal Parser =
                 fail "DROP TABLE または DROP INDEX を指定してください" st
         | Token.Keyword "BEGIN" ->
             advance st
+            |> eatIdentName "TRANSACTION"
             |> eatOptionalSemicolon
             |> Result.map (fun (_, st) -> Statement.Begin, st)
+        | Token.Ident name when name.ToUpperInvariant() = "START" ->
+            let st = advance st
+
+            if isIdentName "TRANSACTION" st then
+                st
+                |> advance
+                |> eatOptionalSemicolon
+                |> Result.map (fun (_, st) -> Statement.Begin, st)
+            else
+                fail "START TRANSACTION が必要です" st
         | Token.Keyword "COMMIT" ->
+            advance st
+            |> eatIdentName "WORK"
+            |> eatIdentName "TRANSACTION"
+            |> eatOptionalSemicolon
+            |> Result.map (fun (_, st) -> Statement.Commit, st)
+        | Token.Keyword "END" ->
             advance st
             |> eatOptionalSemicolon
             |> Result.map (fun (_, st) -> Statement.Commit, st)
         | Token.Keyword "ROLLBACK" ->
             advance st
+            |> eatIdentName "WORK"
+            |> eatIdentName "TRANSACTION"
             |> eatOptionalSemicolon
             |> Result.map (fun (_, st) -> Statement.Rollback, st)
+        | Token.Ident name when Set.contains (name.ToUpperInvariant()) SetOperationWords ->
+            fail "集合演算（UNION / INTERSECT / EXCEPT）は未対応です" st
         | _ -> fail "文の開始として解釈できません" st
 
     /// SQL テキストを 1 文以上へ分解して AST にする。
@@ -995,7 +1174,14 @@ module internal Parser =
             else
                 match parseOne st with
                 | Error e -> err e
-                | Ok(s, st) -> parseAll (s :: acc) st
+                | Ok(statement, next) ->
+                    let separated =
+                        next.Pos > st.Pos && st.Tokens.[next.Pos - 1].Token = Token.Symbol ";"
+
+                    if next.Pos < st.Tokens.Length - 1 && not separated then
+                        fail "文の区切りには ; が必要です（複数文は ; で区切ってください）" next
+                    else
+                        parseAll (statement :: acc) next
 
         Lexer.tokenize sql
         >>= fun tokens ->

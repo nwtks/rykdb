@@ -6,17 +6,17 @@ module internal Ops =
     let private DistinctBudgetBytes = 256L * 1024L * 1024L
 
     /// 1行の概算バイト数（メモリ使用量の見積もり用）。
-    let private rowBytes (row: SqlValue array) =
-        row |> Array.sumBy ValueCodec.approximateBytes
+    let private rowBytes = Array.sumBy ValueCodec.approximateBytes
 
     /// 述語で弾く。
-    let filter (schema: Schema) (src: Op) (predicate: Expr) =
-        Op.filter (fun row -> Eval.matches schema row predicate) src
+    let filter (schema: Schema) (predicate: Expr) =
+        Op.filter (fun row -> Eval.matches schema row predicate)
 
     /// ソート。
-    /// ORDER BY のキー（列位置と方向）を先に解決してから比較関数へ落とす。
+    /// ORDER BY のキーを列位置へ解決できるならそのまま使い、
+    /// 式が含まれる場合はキーを評価して行末へ足してからソートする。
     /// `*` / `t.*` はORDER BY には書けない。
-    let sortBy (schema: Schema) (src: Op) (keys: RykDb.Core.SortKey list) =
+    let sortBy (schema: Schema) (keys: RykDb.Core.SortKey list) (src: Op) =
         let compareWith plan (a: SqlValue array) (b: SqlValue array) =
             let rec compareKeys =
                 function
@@ -50,48 +50,64 @@ module internal Ops =
                             | Some representative -> SqlValue.compareValues representative v |> Result.map (fun _ -> m))
                 (ret reps)
 
+        let resolveColumn (k: SortKey) =
+            match Schema.tryAsColumnRef k.Expression with
+            | None -> None
+            | Some c ->
+                let bare = { Qualifier = None; Name = c.Name }
+
+                match Schema.resolve schema c with
+                | Ok i -> Some(i, k.Direction)
+                | Error _ ->
+                    match Schema.resolve schema bare with
+                    | Ok i -> Some(i, k.Direction)
+                    | Error _ -> None
+
         if List.isEmpty keys then
             ret src
         else
-            let resolved =
-                keys
-                |> List.map (fun k ->
-                    let sk = k
-                    let expr = sk.Expression
-                    let dir = sk.Direction
+            let columns = keys |> List.map resolveColumn
 
-                    match Schema.tryAsColumnRef expr with
-                    | None ->
-                        err (
-                            sprintf "ORDER BY には列の直接参照だけを書けます（%s）" (Expr.toDisplayString expr)
-                            |> DbError.name
-                        )
-                    | Some c ->
-                        let bare = { Qualifier = None; Name = c.Name }
+            if List.forall Option.isSome columns then
+                let plan = columns |> List.choose id
 
-                        match Schema.resolve schema c with
-                        | Ok i -> ret (i, dir)
-                        | Error _ -> Schema.resolve schema bare |> Result.map (fun i -> i, dir))
-                |> all
+                result {
+                    return! ExtSort.sortRows ExtSort.DefaultBudgetBytes Map.empty (check plan) (compareWith plan) src
+                }
+            else
+                let exprs = keys |> List.map _.Expression
+                let width = schema.Columns.Length
+                let plan = keys |> List.mapi (fun i k -> width + i, k.Direction)
 
-            result {
-                let! plan = resolved
-                return! ExtSort.sortRows ExtSort.DefaultBudgetBytes Map.empty (check plan) (compareWith plan) src
-            }
+                let projected =
+                    Op.map
+                        (fun row ->
+                            exprs
+                            |> List.map (Eval.eval schema row)
+                            |> all
+                            |> Result.map (fun keyValues -> Array.append row (Array.ofList keyValues)))
+                        src
+
+                result {
+                    let! sorted =
+                        ExtSort.sortRows ExtSort.DefaultBudgetBytes Map.empty (check plan) (compareWith plan) projected
+
+                    return Op.map (fun row -> ret (Array.sub row 0 width)) sorted
+                }
 
     /// 重複除去。
     /// 保持する順序は最初に現れた順（SQL の DISTINCT と同じ）。
     /// 既出のキーを全部覚える必要がある。
     /// 「直前のキーだけ」で比較するのは `DISTINCT` ではなく `DISTINCT ON` にしかならない
     /// （`2, 1, 2` で 2 が 2 回目に出るため、直前比較では除去できない）。
-    /// バジェットを指定できる実体は `distinctWithin`。
     /// <remarks>
     /// 既出行を `SqlValue array` のまま抱えるとボックス付きオブジェクトが山盛りになるので、
     /// `ValueCodec` で扁平なバイト列にしてから集合に入れる（同じ値なら同じ列になる）。
     /// メモリはユニーク行数に比例するが、無制限ではない。
     /// バジェットを超えると OOM でプロセスごと落とす代わりに `CapacityError` で止める。
+    /// 既出集合 `seen` は **呼び出しごとに作る**（クエリ間で共有すると 2 回目以降が全行を重複と見なす）。
     /// </remarks>
-    let distinctWithin (budgetBytes: int64) (src: Op) =
+    let distinct (src: Op) =
         let encode row =
             ValueCodec.writeValues row Writer.Empty |> Writer.toArray
 
@@ -103,20 +119,15 @@ module internal Ops =
 
                 if seen.Contains key then
                     Op.next (skipSeen used nxt)
-                elif used > budgetBytes then
-                    err (
-                        DbError.capacity (
-                            sprintf "SELECT DISTINCT のユニーク行が多すぎます（概算 %d バイトの上限）。条件で絞るか、集約で代替してください" budgetBytes
-                        )
-                    )
+                elif used > DistinctBudgetBytes then
+                    sprintf "SELECT DISTINCT のユニーク行が多すぎます（概算 %d バイトの上限）。条件で絞るか、集約で代替してください" DistinctBudgetBytes
+                    |> DbError.capacity
+                    |> err
                 else
                     seen.Add key |> ignore
                     ret (Some(row, skipSeen (used + int64 (rowBytes row)) nxt)))
 
         skipSeen 0L src
-
-    /// 重複除去（既定バジェット）。
-    let distinct (src: Op) = distinctWithin DistinctBudgetBytes src
 
     /// 式中に現れる集約呼び出しの一覧（実行順に揃える）。
     let aggCalls =
@@ -251,7 +262,7 @@ module internal Ops =
     /// グループ数にも上限を置き、超過は `CapacityError` で止める。
     /// 出力順は従来どおり「最初に現れたグループ」の順。
     /// </remarks>
-    let aggregate (schema: Schema) (src: Op) (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
+    let aggregate (schema: Schema) (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (src: Op) =
         let groupBudget = 4_000_000
 
         let keyOfRow row =
@@ -545,13 +556,13 @@ module internal Ops =
     /// TailAudit はラムダ内の呼び出しを非末尾として報告するためベースラインに登録している。
     /// </remarks>
     let private joinProbe
+        (isLeft: bool)
         (leftSchema: Schema)
         (left: Op)
-        (rightSchema: Schema)
         (leftKeys: int array)
+        (rightSchema: Schema)
         (lookupRows: SqlValue array -> Result<SqlValue array array, DbError>)
         (residual: Expr option)
-        (isLeft: bool)
         =
         let residualMatches leftSchema rightSchema lrow rrow =
             function
@@ -618,53 +629,51 @@ module internal Ops =
     let innerJoinHash
         (leftSchema: Schema)
         (left: Op)
+        (leftKeys: int array)
         (rightSchema: Schema)
         (right: Op)
-        (leftKeys: int array)
         (rightKeys: int array)
         (residual: Expr option)
         =
         Op.toArray right
         |> Result.map (fun rightRows ->
             let table = buildHashTable rightRows rightKeys
-            joinProbe leftSchema left rightSchema leftKeys (lookupHash table) residual false)
+            joinProbe false leftSchema left leftKeys rightSchema (lookupHash table) residual)
 
     /// LEFT JOIN（ハッシュ結合）。
     let leftJoinHash
         (leftSchema: Schema)
         (left: Op)
+        (leftKeys: int array)
         (rightSchema: Schema)
         (right: Op)
-        (leftKeys: int array)
         (rightKeys: int array)
         (residual: Expr option)
         =
         Op.toArray right
         |> Result.map (fun rightRows ->
             let table = buildHashTable rightRows rightKeys
-            joinProbe leftSchema left rightSchema leftKeys (lookupHash table) residual true)
+            joinProbe true leftSchema left leftKeys rightSchema (lookupHash table) residual)
 
     /// INNER JOIN（インデックス入れ子ループ）。
     let innerJoinIndexed
         (leftSchema: Schema)
         (left: Op)
-        (rightSchema: Schema)
         (leftKeys: int array)
+        (rightSchema: Schema)
         (lookup: SqlValue array -> Result<Op, DbError>)
-        (residual: Expr option)
         =
-        joinProbe leftSchema left rightSchema leftKeys (fun key -> lookup key >>= Op.toArray) residual false
+        joinProbe false leftSchema left leftKeys rightSchema (fun key -> lookup key >>= Op.toArray)
 
     /// LEFT JOIN（インデックス入れ子ループ）。
     let leftJoinIndexed
         (leftSchema: Schema)
         (left: Op)
-        (rightSchema: Schema)
         (leftKeys: int array)
+        (rightSchema: Schema)
         (lookup: SqlValue array -> Result<Op, DbError>)
-        (residual: Expr option)
         =
-        joinProbe leftSchema left rightSchema leftKeys (fun key -> lookup key >>= Op.toArray) residual true
+        joinProbe true leftSchema left leftKeys rightSchema (fun key -> lookup key >>= Op.toArray)
 
     /// 射影。
     /// `SELECT` の項目順に値を並べる。
@@ -672,7 +681,7 @@ module internal Ops =
     /// `groupBy` は「射影の入力が集約結果」のときの GROUP BY 式。
     /// `SELECT age, COUNT(*) ... GROUP BY age` の `age` を
     /// 「集約後の行の先頭」にある値へ読み替えるために使う。
-    let project (schema: Schema) (groupBy: Expr list) (src: Op) (items: SelectItem list) =
+    let project (schema: Schema) (groupBy: Expr list) (items: SelectItem list) (src: Op) =
         let col qualifier name = { Qualifier = qualifier; Name = name }
         let sameRef c = col c.Qualifier c.Name
         let aggCallsOf = List.map _.Expression >> aggCalls

@@ -207,20 +207,30 @@ let ``Optimizer.buildLogical: 集約と * の併用はエラー`` () =
         expectErrorKind ErrorKind.SyntaxError "集約と * は併用できない" (Optimizer.buildLogical ctx stmt))
 
 [<Fact>]
-let ``Optimizer.buildLogical: 定数でない LIMIT はエラー、OFFSET 単独は制限なし`` () =
+let ``Optimizer.buildLogical: LIMIT の定数式と OFFSET 単独`` () =
     withStore "pl9" (fun store ->
         let ctx = ctxOf store
 
         let plain =
             selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
 
-        // LIMIT が非リテラル → 0 行に丸めずエラー
+        // LIMIT が列参照（定数でない）→ エラー
         let stmt1 =
             { plain with
                 Limit = Some(Expr.Column { Qualifier = None; Name = "nope" })
             }
 
-        expectErrorKind ErrorKind.SyntaxError "LIMIT は整数リテラル" (Optimizer.buildLogical ctx stmt1)
+        expectErrorKind ErrorKind.NameError "LIMIT に列参照は使えない" (Optimizer.buildLogical ctx stmt1)
+
+        // LIMIT の定数式は評価される
+        let stmt3 =
+            { plain with
+                Limit = Some(Expr.Binary(BinaryOp.Add, Expr.Literal(Literal.Int 1L), Expr.Literal(Literal.Int 0L)))
+            }
+
+        match ok (Optimizer.buildLogical ctx stmt3) with
+        | Logical.Limit(0, 1, _) -> ()
+        | other -> Assert.Fail(sprintf "LIMIT 1+0 が 1 になっていない: %A" other)
 
         // OFFSET だけ指定（Limit = None の分岐）→ limit = -1（制限なし）
         let stmt2 =

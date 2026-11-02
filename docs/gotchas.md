@@ -152,6 +152,30 @@ JOIN の ON 句のように行ごとに評価する式が失敗したとき、`O
 | Error e -> Op.Compute(fun () -> err e)
 ```
 
+### 2.6 `Op` を返す関数を「値」にすると状態が全クエリで共有される
+
+F# のモジュールスコープ `let` は起動時に 1回だけ評価される。
+`Ops.distinct` を引数省略の値として書くと、内側の `HashSet`（既出行）も 1個だけ作られ、
+**同じプロセスで 2回目以降の `SELECT DISTINCT` が全行を重複と見なして 0行**になる。
+サーバでは他セッションの行まで混ざり、`HashSet` は非スレッドセーフなので並行時に壊れる。
+
+```fsharp
+// ❌ seen がモジュール初期化時の 1個で固定され、全クエリで共有される
+let distinct =
+    let seen = HashSet<byte array> HashIdentity.Structural
+    let rec skipSeen used cur = ...
+    skipSeen 0L
+// ✅ src を引数に取り、seen を呼び出しごとに作る
+let distinct (src: Op) =
+    let seen = HashSet<byte array> HashIdentity.Structural
+    let rec skipSeen used cur = ...
+    skipSeen 0L src
+```
+
+- 部分適用で「引数だけ残した関数」を作るときは、**可変状態を値をまたいで持たせない**（純粋な関数だけ）。
+- 気付き方: そのテスト単体では緑、他テストと同時実行すると 0行（xUnit の並列実行で顕在化）。
+- 回帰テスト: `Database: DISTINCT を続けて実行しても毎回全行が返る`。
+
 ---
 
 ## 3. `Optimizer.exec` の罠
@@ -1269,11 +1293,12 @@ DDL だけはプロセス内で排他にする必要がある。
 `Types.fs` の `SqlName.equal` をカタログ・スキーマ・実行層で共用する。
 `PRIMARY KEY (ID)` と列 `id` の対応も同じ規則で解決する。
 
-### 11.18 `LIMIT` / `OFFSET` は 0 以上の整数リテラル
+### 11.18 `LIMIT` / `OFFSET` は 0 以上の定数式
 
 非リテラルを `0` に丸めると `LIMIT 1+0` が **0 行** になる（かつてドキュメントは「制限なし」と書いていた）。
-`Optimizer.buildLogical` 内の `applyLimit` は式・負数・`Int32.MaxValue` 超を `SyntaxError` にする。
-`Limit` ノードの `limit = -1` が「LIMIT なし」、`0` は 0 行。
+現在の `Optimizer.buildLogical` 内の `applyLimit` は定数式を `Eval.eval Schema.empty [||]` で評価し、
+行ごとの列参照・負数・`Int32.MaxValue` 超をエラーにする。
+`Limit` ノードの `limit = -1` が「LIMIT なし」、`0` は 0行。
 
 ### 11.19 走査の開封エラーを握り潰さない
 
@@ -1475,3 +1500,50 @@ keyspace シャーディングによる並列性が失われていた。
 - `writeBatch` / `maybeFlush`（flush + compaction）/ `close` を同じ Gate で直列化する。
 - 異なる keyspace / DB は並行。Gate 表はプロセス内で共有し、キーは正規化したパス。
 - Gate 表は開いた keyspace の数だけ残る（プロセス寿命。通常は小さい）。
+
+### 11.38 未対応の SQL 語をテーブル別名として飲み込まない
+
+`UNION` / `INTERSECT` / `EXCEPT` / `RIGHT` / `FULL` / `CROSS` / `NATURAL` / `OUTER` は
+`Lexer.Keywords` に無いため識別子として読まれる。
+以前は `parseOptAlias` がこれをテーブル別名として消費し、次のような静かな誤動作になっていた。
+
+- `SELECT id FROM t UNION SELECT id FROM t` → `FROM t AS UNION` + 別文の SELECT に分解され、
+  `Execute` が `RowsAffected` の合計だけを返す（エラーにならない）。
+- `SELECT u.id FROM t RIGHT JOIN u ON u.id = 1` → `RIGHT` が `t` の別名になり、
+  通常の INNER JOIN として実行される（本来の RIGHT JOIN と結果が違う）。
+
+対策:
+
+- `parseTableAlias` が未対応語を裸のテーブル別名として消費しない（`AS` を付ければ使える）。
+- `parseJoins` が `USING` を明示エラーにする。
+  FROM の直後に残った未対応語（`FROM t AS x RIGHT JOIN ...` など）も明示エラーにする。
+- `parseStatements` は文の区切りに `;` を必須にする。
+- `parseSelect` は句の後ろの `UNION` / `INTERSECT` / `EXCEPT` も明示エラーにする。
+
+回帰テスト:
+
+- `パーサ: 未対応の集合演算は明示エラー`
+- `パーサ: 未対応の JOIN は明示エラー`
+- `パーサ: 複数文は ; で区切る`
+- `Database: UNION はエラーになり 2 文として実行されない`
+- `Database: RIGHT JOIN はエラーになり INNER JOIN として実行されない`
+
+### 11.39 CAST は暗黙変換 (`SqlValue.coerce`) と分ける
+
+`coerce` は INSERT / UPDATE の暗黙変換で、TEXT → INTEGER を受け付けない
+（`INSERT INTO t (int_col) VALUES ('42')` は `TypeError`）。
+`CAST('42' AS INTEGER)` は明示変換なので、`SqlValue.cast` を別に用意し、
+TEXT → 数値 / BOOLEAN を InvariantCulture で解析する。
+数値 → TEXT などは `coerce` に委譲する。
+`coerce` を広げると暗黙変換の仕様が変わってしまうので、両者を混ぜないこと。
+
+回帰テスト: `Eval.eval: CAST は TEXT から数値・BOOLEAN へ変換できる`。
+
+### 11.40 ORDER BY の序数は Planner で解決する
+
+`ORDER BY 1` を式として評価すると「定数 1」のソートになり、静かに no-op になる。
+`Planner.applySort` が 1 始まりの序数を `SELECT` 項目の式へ置き換える。
+範囲外の序数は `SyntaxError`。
+`SELECT *` の序数は `Schema.expandStar` で列へ展開する。
+
+回帰テスト: `Database: ORDER BY の式と序数`。

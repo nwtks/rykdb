@@ -85,7 +85,7 @@ let ``Binder.qualify: 全ノード種を qualify しても構造が保たれる`
             Expr.IsNull(n, false), Expr.IsNull(q, false)
             Expr.Between(n, i1, i2, false), Expr.Between(q, i1, i2, false)
             Expr.InList(n, [ i1; i2 ], true), Expr.InList(q, [ i1; i2 ], true)
-            Expr.Like(n, text, false), Expr.Like(q, text, false)
+            Expr.Like(n, text, false, None), Expr.Like(q, text, false, None)
             Expr.Case([ n, i1; n, i2 ], Some i1), Expr.Case([ q, i1; q, i2 ], Some i1)
             Expr.Case([ (n, i1) ], None), Expr.Case([ (q, i1) ], None)
             Expr.FuncCall("ABS", [ n ]), Expr.FuncCall("ABS", [ q ])
@@ -397,7 +397,12 @@ let ``Analyzer.chooseScanMethod: LIKE 'prefix%' は索引の範囲走査にす�
         let catalog = ix |> Catalog.addIndex Catalog.Empty
 
         let pred =
-            Expr.Like(Expr.Column { Qualifier = Some "items"; Name = "s" }, Expr.Literal(Literal.String "ab%"), false)
+            Expr.Like(
+                Expr.Column { Qualifier = Some "items"; Name = "s" },
+                Expr.Literal(Literal.String "ab%"),
+                false,
+                None
+            )
 
         match ok (Analyzer.chooseScanMethod b catalog [ pred ]) with
         | ScanMethod.IndexRangeScan(name, lower, upper) ->

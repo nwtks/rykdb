@@ -214,15 +214,40 @@ module internal DmlOps =
             | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
             | Ok None -> check txn row pk (schema.Indexes |> List.filter _.Unique)
 
+        let evalDefault i =
+            let col = schema.Columns.[i]
+
+            match col.Constraint.Default with
+            | Some d -> evalConstant d >>= fun value -> SqlValue.coerce col.DataType value
+            | None -> ret SqlValue.Null
+
         let buildRow width idxs (defaults: SqlValue array) values =
             if List.length values <> List.length idxs then
-                err (
-                    DbError.create
-                        ErrorKind.SyntaxError
-                        (sprintf "INSERT の列数(%d)と値の数(%d)が合いません" (List.length idxs) (List.length values))
-                )
+                DbError.create
+                    ErrorKind.SyntaxError
+                    (sprintf "INSERT の列数(%d)と値の数(%d)が合いません" (List.length idxs) (List.length values))
+                |> err
             else
-                gatherWith evalConstant schema values idxs
+                let rec gather acc vs is_ =
+                    match vs, is_ with
+                    | [], [] -> ret acc
+                    | v :: rest, i :: restIdx ->
+                        let evaluated =
+                            match v with
+                            | Expr.Default -> evalDefault i
+                            | _ ->
+                                evalConstant v
+                                >>= fun value -> SqlValue.coerce schema.Columns.[i].DataType value
+
+                        match evaluated with
+                        | Error e -> err e
+                        | Ok coerced -> gather ((i, coerced) :: acc) rest restIdx
+                    | _ ->
+                        sprintf "INSERT の列数(%d)と値の数(%d)が合いません" (List.length idxs) (List.length values)
+                        |> DbError.create ErrorKind.SyntaxError
+                        |> err
+
+                gather [] values idxs
                 |> Result.map (fun filled -> scatter width filled (fun i -> defaults.[i]))
 
         result {
@@ -236,34 +261,40 @@ module internal DmlOps =
 
             let supplied = Set.ofList idxs
 
-            let! defaultValues =
-                schema.Columns
-                |> List.mapi (fun i col ->
-                    if Set.contains i supplied then
-                        ret SqlValue.Null
-                    else
-                        match col.Constraint.Default with
-                        | Some d ->
+            match columns, rows with
+            | None, [ [] ] ->
+                let! row =
+                    schema.Columns
+                    |> List.mapi (fun i _ -> evalDefault i)
+                    |> all
+                    |> Result.map List.toArray
+
+                do! checkUnique ctx.Txn row
+                let! t = Dml.insert ctx.Txn schema row
+                return t, 1
+            | _ ->
+                let! defaultValues =
+                    schema.Columns
+                    |> List.mapi (fun i _ ->
+                        if Set.contains i supplied then
+                            ret SqlValue.Null
+                        else
+                            evalDefault i)
+                    |> all
+
+                let defaults = List.toArray defaultValues
+
+                return!
+                    rows
+                    |> foldOk
+                        (fun (txnAcc, count) values ->
                             result {
-                                let! value = evalConstant d
-                                return! SqlValue.coerce col.DataType value
-                            }
-                        | None -> ret SqlValue.Null)
-                |> all
-
-            let defaults = List.toArray defaultValues
-
-            return!
-                rows
-                |> foldOk
-                    (fun (txnAcc, count) values ->
-                        result {
-                            let! row = buildRow schema.Columns.Length idxs defaults values
-                            do! checkUnique txnAcc row
-                            let! t = Dml.insert txnAcc schema row
-                            return t, count + 1
-                        })
-                    (ctx.Txn, 0)
+                                let! row = buildRow schema.Columns.Length idxs defaults values
+                                do! checkUnique txnAcc row
+                                let! t = Dml.insert txnAcc schema row
+                                return t, count + 1
+                            })
+                        (ctx.Txn, 0)
         }
 
     /// UPDATE。
@@ -295,10 +326,9 @@ module internal DmlOps =
                         let bytes = bytes + rowBytes row + rowBytes newRow
 
                         if bytes > ctx.Txn.LimitBytes then
-                            err (
-                                sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" ctx.Txn.LimitBytes
-                                |> DbError.capacity
-                            )
+                            sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" ctx.Txn.LimitBytes
+                            |> DbError.capacity
+                            |> err
                         else
                             go targets ((row, newRow) :: acc) bytes next
 
