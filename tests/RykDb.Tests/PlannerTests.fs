@@ -370,3 +370,96 @@ let ``Plan.runSelect: FROM なしの SELECT は 1 行の定数を返す`` () =
         Assert.Equal<int>(1, columns.Length)
         Assert.Equal<int>(1, rows.Length)
         Assert.Empty(rows.[0]))
+
+[<Fact>]
+let ``Optimizer.buildLogical: 主キー順の ORDER BY は Sort を作らない`` () =
+    withStore "sort-pk" (fun store ->
+        let ctx =
+            ctxOf store
+            |> ExecContext.withCatalog (Catalog.addTable Catalog.Empty (Catalog.toDefinition peopleSchema))
+
+        let baseStmt =
+            selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
+
+        let stmt =
+            { baseStmt with
+                OrderBy =
+                    [
+                        {
+                            Expression = pCol "id"
+                            Direction = SortDirection.Ascending
+                        }
+                    ]
+            }
+
+        match ok (Optimizer.buildLogical ctx stmt) with
+        | Logical.Project(_, Logical.Scan("people", ScanMethod.SeqScan)) -> ()
+        | other -> Assert.Fail(sprintf "Sort が残っています: %A" other))
+
+[<Fact>]
+let ``Optimizer.buildLogical: 主キー以外・降順の ORDER BY は Sort を作る`` () =
+    withStore "sort-keep" (fun store ->
+        let ctx =
+            ctxOf store
+            |> ExecContext.withCatalog (Catalog.addTable Catalog.Empty (Catalog.toDefinition peopleSchema))
+
+        let baseStmt =
+            selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
+
+        let hasSort (keys: SortKey list) =
+            match ok (Optimizer.buildLogical ctx { baseStmt with OrderBy = keys }) with
+            | Logical.Project(_, Logical.Sort _) -> true
+            | _ -> false
+
+        let key e d = { Expression = e; Direction = d }
+
+        Assert.True(hasSort [ key (pCol "name") SortDirection.Ascending ], "主キー以外の列はソートが必要です")
+
+        Assert.True(hasSort [ key (pCol "id") SortDirection.Descending ], "降順はソートが必要です"))
+
+[<Fact>]
+let ``Optimizer.buildLogical: 複合主キーは全列の昇順なら Sort を作らない`` () =
+    withStore "sort-pk-composite" (fun store ->
+        let composite =
+            { peopleSchema with
+                PrimaryKey = [ 0; 2 ]
+            }
+
+        let ctx =
+            ctxOf store
+            |> ExecContext.withCatalog (Catalog.addTable Catalog.Empty (Catalog.toDefinition composite))
+
+        let baseStmt =
+            selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
+
+        let treeOf (keys: SortKey list) =
+            ok (Optimizer.buildLogical ctx { baseStmt with OrderBy = keys })
+
+        let key e d = { Expression = e; Direction = d }
+
+        // (id, age) は主キーそのもの（順序も定義順）→ ソート不要
+        match
+            treeOf
+                [
+                    key (pCol "id") SortDirection.Ascending
+                    key (pCol "age") SortDirection.Ascending
+                ]
+        with
+        | Logical.Project(_, Logical.Scan("people", ScanMethod.SeqScan)) -> ()
+        | other -> Assert.Fail(sprintf "複合主キーの全列でも Sort が残っています: %A" other)
+
+        // 主キーの先頭 1列だけでは並びが決まらない → ソートが必要
+        match treeOf [ key (pCol "id") SortDirection.Ascending ] with
+        | Logical.Project(_, Logical.Sort _) -> ()
+        | other -> Assert.Fail(sprintf "主キーの一部なのに Sort がありません: %A" other)
+
+        // 主キーの列でも定義順と違えばソートが必要
+        match
+            treeOf
+                [
+                    key (pCol "age") SortDirection.Ascending
+                    key (pCol "id") SortDirection.Ascending
+                ]
+        with
+        | Logical.Project(_, Logical.Sort _) -> ()
+        | other -> Assert.Fail(sprintf "主キーの順序違いなのに Sort がありません: %A" other))

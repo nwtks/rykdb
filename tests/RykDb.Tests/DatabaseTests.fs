@@ -290,6 +290,21 @@ let ``E2E: 明示 transaction 内の索引検索が書き込みを見る`` () =
 // ハンドル API・索引の backfill・DROP の後始末・ストレージ破損
 // ---------------------------------------------------------------------------
 
+/// テーブルの最新 SSTable の先頭バイトを壊し、mtime を進める。
+/// `openDatabase` は MaxSeqNo の復元でデータブロックを読まないため、open 後に呼ぶ。
+let private corruptNewestTableSstable (dir: string) (table: string) =
+    let tableDir =
+        System.IO.Path.Combine(dir, Keyspace.toDirName (Keyspace.table table))
+
+    let newest =
+        System.IO.Directory.GetFiles(tableDir, "*" + FileMetaData.SstExtension)
+        |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
+
+    let bytes = System.IO.File.ReadAllBytes newest
+    bytes.[0] <- bytes.[0] ^^^ 0xFFuy
+    System.IO.File.WriteAllBytes(newest, bytes)
+    System.IO.File.SetLastWriteTimeUtc(newest, System.DateTime.UtcNow.AddSeconds 1.0)
+
 [<Fact>]
 let ``Database: Root はルートディレクトリを返す`` () =
     withDir "rootprop" (fun dir ->
@@ -312,18 +327,7 @@ let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
 
         // openDatabase は MaxSeqNo の復元で全 SSTable を読むため、open 後に壊す。
         let db5 = ok (Database.OpenWith dir)
-
-        // テーブル t の最新 SSTable（キー 3,4）を壊す。
-        let tableDir = System.IO.Path.Combine(dir, Keyspace.toDirName (Keyspace.table "t"))
-
-        let newest =
-            System.IO.Directory.GetFiles(tableDir, "*" + FileMetaData.SstExtension)
-            |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
-
-        let bytes = System.IO.File.ReadAllBytes newest
-        bytes.[0] <- bytes.[0] ^^^ 0xFFuy
-        System.IO.File.WriteAllBytes(newest, bytes)
-        System.IO.File.SetLastWriteTimeUtc(newest, System.DateTime.UtcNow.AddSeconds 1.0)
+        corruptNewestTableSstable dir "t"
 
         // LIMIT 1 は先頭 1行だけなので、キー 3 以降の壊れた SSTable を開かない。
         let _, one = ok (db5.Execute "SELECT id FROM t LIMIT 1")
@@ -332,6 +336,38 @@ let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
 
         // 全行が必要なら壊れた SSTable を開くので CorruptionError。
         expectErrorKind ErrorKind.CorruptionError "LIMIT 10 は壊れた SSTable を開く" (db5.Execute "SELECT id FROM t LIMIT 10")
+
+        ok (db5.Close()))
+
+[<Fact>]
+let ``Database: 主キー順の ORDER BY は Sort を作らず LIMIT がストレージへ降りる`` () =
+    withDir "orderby-pk-pushdown" (fun dir ->
+        let db0 = ok (Database.OpenWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
+        ok (db2.Close())
+
+        let db3 = ok (Database.OpenWith dir)
+        let db4 = exec db3 "INSERT INTO t VALUES (3), (4)"
+        ok (db4.Close())
+
+        let db5 = ok (Database.OpenWith dir)
+        corruptNewestTableSstable dir "t"
+
+        // 主キー昇順の ORDER BY は Sort ノードを作らないので、
+        // LIMIT の件数ヒントが走査まで届き、壊れた SSTable を開かない。
+        let _, one = ok (db5.Execute "SELECT id FROM t ORDER BY id LIMIT 1")
+        Assert.Equal<int64>(1L, asInt one.Rows.[0].[0])
+
+        // 別名越しの ORDER BY も列参照に解決されるので同じ。
+        let _, aliased = ok (db5.Execute "SELECT id AS k FROM t ORDER BY k LIMIT 1")
+        Assert.Equal<int64>(1L, asInt aliased.Rows.[0].[0])
+
+        // 降順は Sort が必要で、ソートは全入力を読むため CorruptionError。
+        expectErrorKind
+            ErrorKind.CorruptionError
+            "ORDER BY id DESC は全件を読む"
+            (db5.Execute "SELECT id FROM t ORDER BY id DESC LIMIT 1")
 
         ok (db5.Close()))
 

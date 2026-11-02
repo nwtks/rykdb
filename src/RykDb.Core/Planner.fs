@@ -5,6 +5,69 @@
 namespace RykDb.Core
 
 module internal Optimizer =
+    /// 走査が主キー順（キー昇順）に結果を返すか。
+    /// `SeqScan` / 主キー等値 / 主キー範囲は主キー順に返る。
+    /// 索引経由の走査は索引順なので対象外（`WHERE` の索引選択で順序が変わる）。
+    let private scansInPrimaryKeyOrder (tree: Logical) =
+        let rec scanOf tree =
+            match tree with
+            | Logical.Filter(_, child) -> scanOf child
+            | Logical.Scan(_, ScanMethod.SeqScan) -> true
+            | Logical.Scan(_, ScanMethod.PkLookup _) -> true
+            | Logical.Scan(_, ScanMethod.RangeScan _) -> true
+            | _ -> false
+
+        scanOf tree
+
+    /// ORDER BY を省略できるか。
+    /// <remarks>
+    /// 単一テーブル・集約なし・DISTINCT なしで、ORDER BY の先頭が
+    /// **主キー全列を定義順・昇順**で並べているなら、走査結果がそのまま順序になる。
+    /// 主キーは一意なので、後続のキーは順序に影響しない。
+    /// 主キーの一部だけ（複合主キーの 1列目だけ）では並びが決まらないので対象外。
+    /// 索引走査（`IndexLookup` / `IndexRangeScan`）は索引順なので対象外。
+    /// </remarks>
+    let private sortIsRedundant
+        (ctx: ExecContext)
+        (stmt: SelectStatement)
+        (schema: Schema)
+        (keys: SortKey list)
+        (tree: Logical)
+        =
+        let primaryKey =
+            match stmt.From with
+            | Some r when List.isEmpty stmt.Joins && not stmt.Distinct ->
+                Catalog.findTable ctx.Catalog r.Name
+                |> Option.bind (fun defn ->
+                    match Catalog.toSchema defn with
+                    | Ok table -> Some table.PrimaryKey
+                    | Error _ -> None)
+            | _ -> None
+
+        let resolved =
+            keys
+            |> List.map (fun k ->
+                match Schema.tryAsColumnRef k.Expression with
+                | Some c ->
+                    match Schema.resolve schema c with
+                    | Ok i -> Some(i, k.Direction)
+                    | Error _ -> None
+                | None -> None)
+
+        match primaryKey with
+        | Some pk when
+            not (List.isEmpty pk)
+            && scansInPrimaryKeyOrder tree
+            && List.length keys >= pk.Length
+            && not (resolved |> List.exists Option.isNone)
+            ->
+            let prefix = resolved |> List.choose id |> List.truncate pk.Length
+
+            (prefix |> List.map fst) = pk
+            && prefix
+               |> List.forall (fun (_, direction) -> direction = SortDirection.Ascending)
+        | _ -> false
+
     /// SELECT 文を論理代数に変換する。
     let buildLogical (ctx: ExecContext) (stmt: SelectStatement) =
         let bindTables ctx stmt =
@@ -199,7 +262,10 @@ module internal Optimizer =
                     let keys =
                         List.map2 (fun e (k: SortKey) -> { k with Expression = e }) qualified stmt.OrderBy
 
-                    return Logical.Sort(keys, tree)
+                    if sortIsRedundant ctx stmt schema keys tree then
+                        return tree
+                    else
+                        return Logical.Sort(keys, tree)
                 }
 
         let qualifyItems schema =

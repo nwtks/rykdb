@@ -1369,6 +1369,14 @@ DDL だけはプロセス内で排他にする必要がある。
 `Filter` / `Sort` / `Aggregate` / `Distinct` / `Join` は行数を変える（または順序を作る）ため、
 ヒントを落として全件走査に戻す。`WHERE` 付きの `LIMIT` は pushdown されない。
 
+**例外は主キー順の `ORDER BY`**。単一テーブル・集約なし・`DISTINCT` なしで、
+`ORDER BY` の先頭が主キー全列（定義順・昇順）なら `Sort` ノードを作らないので、
+`ORDER BY 主キー LIMIT n` のヒントが走査まで降りる（`Planner.sortIsRedundant`）。
+主キーの一部だけ・`DESC`・索引走査になる条件（`WHERE 索引列 = ...` など）・集約・`DISTINCT`・結合では
+従来どおりソートする。
+回帰テストは `Database: 主キー順の ORDER BY は Sort を作らず LIMIT がストレージへ降りる`
+（2本目の SSTable を壊し、`ORDER BY id LIMIT 1` は成功・`ORDER BY id DESC LIMIT 1` は `CorruptionError`）。
+
 ### 11.26 部分読みはブロック / メタデータ / Footer のチェックサムで守る
 
 v5 の SSTable は各ブロック末尾に 4バイトのチェックサムを持つ。

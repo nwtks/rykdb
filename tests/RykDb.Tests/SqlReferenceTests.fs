@@ -616,6 +616,47 @@ let ``SqlReference: ORDER BY が効く`` () =
         Assert.Equal<string>("carol", asText desc.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: 主キー順の ORDER BY は昇順・降順・LIMIT が正しい`` () =
+    // 主キー昇順の ORDER BY は Sort ノードを作らない（走査順がそのまま答え）。
+    withDb "orderby-pk" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (3,'c'),(1,'a'),(4,'d'),(2,'b')")
+
+        let ids sql =
+            let _, res = ok (db2.Execute sql)
+            res.Rows |> Array.map (fun r -> int (asInt r.[0])) |> Array.toList
+
+        Assert.Equal<int list>([ 1; 2; 3; 4 ], ids "SELECT id FROM t ORDER BY id")
+        Assert.Equal<int list>([ 4; 3; 2; 1 ], ids "SELECT id FROM t ORDER BY id DESC")
+        Assert.Equal<int list>([ 1; 2 ], ids "SELECT id FROM t ORDER BY id LIMIT 2")
+        Assert.Equal<int list>([ 2; 3 ], ids "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1")
+        // 別名越しでも列参照に解決される
+        Assert.Equal<int list>([ 1; 2; 3; 4 ], ids "SELECT id AS k FROM t ORDER BY k"))
+
+[<Fact>]
+let ``SqlReference: 複合主キーは全列の昇順で並ぶ`` () =
+    withDb "orderby-pk2" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE c (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))"
+
+        let db2, _ =
+            ok (db1.Execute "INSERT INTO c VALUES (2,2,'x'),(1,5,'y'),(1,2,'z'),(2,1,'w')")
+
+        let _, rows = ok (db2.Execute "SELECT a, b FROM c ORDER BY a, b")
+
+        let pairs =
+            rows.Rows
+            |> Array.map (fun r -> int (asInt r.[0]), int (asInt r.[1]))
+            |> Array.toList
+
+        Assert.Equal<(int * int) list>([ (1, 2); (1, 5); (2, 1); (2, 2) ], pairs)
+
+        // 主キーの先頭 1列だけでは並びが決まらないので、全列の昇順の結果だけを確認する
+        let _, partial = ok (db2.Execute "SELECT a FROM c ORDER BY a")
+
+        Assert.Equal<int list>([ 1; 1; 2; 2 ], partial.Rows |> Array.map (fun r -> int (asInt r.[0])) |> Array.toList))
+
+[<Fact>]
 let ``SqlReference: 別名を ORDER BY で参照できる`` () =
     seeded "sel-alias-order" (fun db ->
         // 別名 a は age を指すので age の順（bob 25 → alice 30 → carol 35）で並ぶ
