@@ -20,3 +20,14 @@ let ``StatementResult: 表示行はヘッダ・区切り・行を並べる`` () 
         }
 
     Assert.Equal<string list>([ "a | b"; "-----"; "  1, 'x'" ], r.ToDisplayLines())
+
+[<Fact>]
+let ``StatementResult: 0行の SELECT でもヘッダと区切りは出る`` () =
+    let r =
+        {
+            RowsAffected = 0
+            Columns = [| "id"; "v" |]
+            Rows = [||]
+        }
+
+    Assert.Equal<string list>([ "id | v"; "------" ], r.ToDisplayLines())

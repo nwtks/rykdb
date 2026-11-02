@@ -75,13 +75,25 @@ xUnit。
 （`src/RykDb.Core/Dml.fs` → `tests/RykDb.Tests/DmlTests.fs`）。
 モジュール名も `module RykDb.DmlTests` と対象名に合わせる。
 
+**例外**: `Database.fs` の通し経路テストは 2ファイルに分かれる。
+[`sql-reference.md`](sql-reference.md) が扱う構文・意味論は `SqlReferenceTests.fs`、
+ハンドル API と内部機構は `DatabaseTests.fs`（役割の分担は下の「テスト方針」）。
+
 ```bash
 dotnet test                                                    # 全件
 dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"    # Server のみ
 ```
 
-**テスト方針**: `DatabaseTests` / `ServerTests` は「SQL 文字列 → 結果」の通し経路しか検証しない。
+**テスト方針**: `DatabaseTests` / `SqlReferenceTests` / `ServerTests` は「SQL 文字列 → 結果」の通し経路しか検証しない。
 Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだけで分かる。
+
+**役割の分担**:
+
+- `SqlReferenceTests` — [`sql-reference.md`](sql-reference.md) の構文・意味論
+  （文・句・式・リテラル・識別子が受理 / 拒否され、評価結果も仕様どおりであること）。
+  テスト名の接頭辞は `SqlReference:`。
+- `DatabaseTests` — ハンドル API と内部機構（MVCC / WAL / プロセスロック /
+  索引の backfill・後始末 / snapshot 登録 / 永続性 / 性能 / 末尾再帰）。
 
 **書き方**:
 
@@ -98,7 +110,8 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
   （リフレクションで数える）。
   F# 10 の FS0842 への対策（[`gotchas.md`](gotchas.md) §9.1）。
   ファイルを増やしたら下限数のアサートも更新する。
-  `DatabaseTests` に `E2E` / `性能`、`ServerTests` に `TCP` のテスト名が残っていることも検査する。
+  `DatabaseTests` に `E2E` / `性能`、`SqlReferenceTests` に `SqlReference:`、
+  `ServerTests` に `TCP` のテスト名が残っていることも検査する。
 
 **乱数生成のテストは退行に注意**（[`gotchas.md`](gotchas.md) §9.6）。
 

@@ -85,11 +85,12 @@ txn            ::= BEGIN [TRANSACTION] | START TRANSACTION
 
 ### 識別子
 
-- 通常: `[A-Za-z_][A-Za-z0-9_]*`
+- 通常: 開始は**文字または `_`**、以降は文字・数字・ `_`
+  （`Char.IsLetter` / `LetterOrDigit`。英字以外の Unicode 文字も識別子として使える）
 - 引用: `"..."`（`""` で `"` をエスケープ）
 
 **大文字小文字は区別しない**（テーブル名・列名・索引名の比較は `OrdinalIgnoreCase`）。
-英字のみが識別子の開始文字（数字や `_` 始まりの識別子は不可）。
+数字から始めることはできない（`1a` は構文エラー。`_u` のように `_` 始まりは使える）。
 テーブル名・索引名は **UTF-8 で 128 バイト以下**（超えると `NameError`）。
 
 ### 予約語
@@ -234,7 +235,7 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 
 ```sql
 INSERT INTO t VALUES (1, 2 + 3);      -- OK（定数式）
-INSERT INTO t VALUES (1, other_col);  -- SyntaxError
+INSERT INTO t VALUES (1, other_col);  -- NameError（'other_col' は列でも関数でもありません）
 ```
 
 ### 出力の表示（`SqlLiteral.toSqlLiteral`）
@@ -1014,7 +1015,7 @@ db> .rollback
 | --------------------- | ------------------------------ | --------------------------------------- |
 | `SyntaxError`         | 文法を満たさない               | `FROM が必要ですが見つかりませんでした` |
 | `NameError`           | 名前解決・関数の失敗           | `テーブル 'x' が存在しません`           |
-| `TypeError`           | 型の不一致・不可能な変換       | `'abc' は 'INTEGER' に変換できません`   |
+| `TypeError`           | 型の不一致・不可能な変換       | `''abc'' は 'INTEGER' に変換できません` |
 | `ConstraintViolation` | `NOT NULL`・主キー欠落・0 除算 | `NOT NULL 制約に違反: t.n`              |
 | `NotFound`            | 存在しないテーブル・索引・行   | `テーブル nosuch が存在しません`        |
 | `AlreadyExists`       | 同名の作成                     | `テーブル t は既に存在します`           |
@@ -1029,16 +1030,16 @@ db> .rollback
 構文エラーには行番号が付く。
 
 ```
-エラー: FROM が必要ですが見つかりませんでした (位置 1 行)
+エラー: FROM が必要ですが見つかりませんでした (位置 1行)
 ```
 
 ### よく見るメッセージ（実測）
 
 | SQL                                       | メッセージ                                                  |
 | ----------------------------------------- | ----------------------------------------------------------- |
-| `SELECT 1;`                               | `FROM が必要ですが見つかりませんでした (位置 1 行)`         |
-| `SELECT * FROM t WHERE id > 1 AND;`       | `式が必要ですが見つかりませんでした (位置 1 行)`            |
-| `SELECT 'abc;`                            | `unclosed string (位置 1 行)`                               |
+| `SELECT 1;`                               | `FROM が必要ですが見つかりませんでした (位置 1行)`          |
+| `SELECT * FROM t WHERE id > 1 AND;`       | `式が必要ですが見つかりませんでした (位置 1行)`             |
+| `SELECT 'abc;`                            | `unclosed string (位置 1行)`                                |
 | `SELECT id FROM nosuchtable;`             | `テーブル 'nosuchtable' が存在しません`                     |
 | `SELECT nosuchcol FROM t;`                | `'nosuchcol' は列でも関数でもありません`                    |
 | `CREATE TABLE t (a INTEGER);`             | `テーブル t に主キーがありません`                           |
@@ -1048,7 +1049,7 @@ db> .rollback
 | `DROP TABLE nosuch;`                      | `テーブル nosuch が存在しません`                            |
 | `INSERT INTO t (id) VALUES (1, 2);`       | `INSERT の列数(1)と値の数(2)が合いません`                   |
 | `INSERT INTO t VALUES (1, NULL, …);`      | `NOT NULL 制約に違反: t.n`                                  |
-| `INSERT INTO t VALUES (5, 'z', 'abc');`   | `'abc' は 'INTEGER' に変換できません`                       |
+| `INSERT INTO t VALUES (5, 'z', 'abc');`   | `''abc'' は 'INTEGER' に変換できません`                     |
 | `SELECT (id) / 0 FROM t;`                 | `0 での除算は定義されていません`                            |
 | `SELECT LENGTH(id, n) FROM t;`            | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`    |
 | `SELECT NOSUCHFN(id) FROM t;`             | `未知のスカラー関数 'NOSUCHFN' です`                        |

@@ -1,8 +1,9 @@
 // ===========================================================================
-// Database.fs のテスト: 公開 API・E2E・性能
+// Database.fs のテスト: ハンドル API・トランザクション機構・永続性・性能
 //
-// 「SQL 文字列 → 結果」の通し経路で Parser / Planner / Executor / Catalog の
-// 連携バグと、クラッシュ・再オープン・性能までを検証する。
+// ライブラリ API（Begin / Commit / Rollback / Close）と、内部機構
+// （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / snapshot 登録）を
+// 検証する。SQL の構文・意味論は SqlReferenceTests.fs にある。
 // ===========================================================================
 
 module RykDb.DatabaseTests
@@ -11,17 +12,6 @@ open System.Diagnostics
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
-
-/// 1 文を実行して「新しい Database」と結果の両方を返す。
-let private execRes (db: Database) (sql: string) = ok (db.Execute sql)
-
-/// REAL を取り出す（集計結果の検証用）。
-let private asReal (v: SqlValue) =
-    match v with
-    | SqlValue.Real f -> f
-    | _ ->
-        Assert.Fail(sprintf "REAL ではありません: %A" v)
-        0.0
 
 /// ライブラリ API で DB を仕込む（E2E で共通）。
 let private seedLibrary (db: Database) =
@@ -40,6 +30,22 @@ let private openWithTakingOver (root: string) =
         let! store = RowStore.openStoreTakingOver root
         return! Database.OpenWithStore root store
     }
+
+/// transaction を開始してハンドルを捨てる（呼び出し側は戻り値しか持たない）。
+/// `NoInlining` は Debug ビルドのローカルがメソッド末尾まで生き残るのを避けるため。
+/// 戻り値は「開始直後は確かに登録されていた」こと。
+[<System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)>]
+let private abandonTransaction (db: Database) =
+    let tx = ok (db.Begin())
+    let registered = (ActiveSnapshotRegistry.oldestExcept db.Root None).IsSome
+    // tx はここを抜けると到達不能になる（finalizer が登録を外せる）。
+    registered && tx.InTransaction
+
+/// finalizer を確実に走らせる。
+let private collectGarbage () =
+    System.GC.Collect()
+    System.GC.WaitForPendingFinalizers()
+    System.GC.Collect()
 
 // ---------------------------------------------------------------------------
 // トランザクション（Begin / Commit / Rollback）
@@ -172,214 +178,6 @@ let ``Database: 明示 transaction 中の DDL はエラーになる`` () =
         let db2 = exec committed "CREATE TABLE u (id INTEGER PRIMARY KEY)"
         Assert.Contains("u", db2.TableNames()))
 
-// ---------------------------------------------------------------------------
-// 静かな誤答を防ぐ（識別子の大小文字・集計・HAVING・LIMIT・DEFAULT）
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``Database: 索引列と主キーの大文字小文字は区別しない`` () =
-    withDb "case-ident" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT)"
-        let db2 = exec db1 "INSERT INTO c VALUES (1, 'a'), (2, 'b')"
-        let db3 = exec db2 "CREATE INDEX ci ON c (V)"
-
-        // 索引キーが正しく作られ、索引経由でも行が見つかる
-        let _, byIndex = ok (db3.Execute "SELECT id FROM c WHERE v = 'b'")
-        Assert.Equal<int>(1, byIndex.Rows.Length)
-        Assert.Equal<int64>(2L, asInt byIndex.Rows.[0].[0])
-
-        // PRIMARY KEY (ID) の表記も通る
-        let db4 = exec db3 "CREATE TABLE p (id INTEGER, v TEXT, PRIMARY KEY (ID))"
-        let _, inserted = ok (db4.Execute "INSERT INTO p VALUES (1, 'x')")
-        Assert.Equal(1, inserted.RowsAffected))
-
-[<Fact>]
-let ``Database: SUM / AVG は型が混在しても値を落とさない`` () =
-    withDb "sum-mixed" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE s (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "INSERT INTO s VALUES (1), (2), (3)"
-
-        // 1 + 1.5 + 1.5 = 4.0（INT と REAL の混在）
-        let _, sum =
-            ok (db2.Execute "SELECT SUM(CASE WHEN id = 1 THEN 1 ELSE 1.5 END) FROM s")
-
-        Assert.Equal(4.0, asReal sum.Rows.[0].[0], 10)
-
-        let _, avg =
-            ok (db2.Execute "SELECT AVG(CASE WHEN id = 1 THEN 1 ELSE 1.5 END) FROM s")
-
-        Assert.Equal(4.0 / 3.0, asReal avg.Rows.[0].[0], 10))
-
-[<Fact>]
-let ``Database: 集約なしの HAVING はエラー`` () =
-    withDb "having-noagg" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
-
-        expectErrorKind
-            ErrorKind.SyntaxError
-            "HAVING には GROUP BY か集約が必要"
-            (db2.Execute "SELECT id FROM t HAVING id = 999"))
-
-[<Fact>]
-let ``Database: GROUP BY と * の併用はエラー`` () =
-    withDb "group-star" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 10), (2, 10)"
-        expectErrorKind ErrorKind.SyntaxError "SELECT * は GROUP BY と併用できない" (db2.Execute "SELECT * FROM t GROUP BY v"))
-
-[<Fact>]
-let ``Database: テーブル名と同じ非修飾名は列として解決しない`` () =
-    withDb "resolve-qual" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE q (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "INSERT INTO q VALUES (1)"
-        expectErrorKind ErrorKind.NameError "テーブル名を列として解決しない" (db2.Execute "SELECT q FROM q"))
-
-[<Fact>]
-let ``Database: t.* の大文字小文字は区別しない`` () =
-    withDb "star-case" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE st (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "INSERT INTO st VALUES (1)"
-        let _, r = ok (db2.Execute "SELECT ST.* FROM st")
-        Assert.Equal<string list>([ "st.id" ], r.Columns |> Array.toList))
-
-[<Fact>]
-let ``Database: FROM に無い t.* は NameError`` () =
-    withDb "star-unknown" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1)"
-        // 一致 0 件の `t.*` を「0列の 1行」で成功させない。
-        expectErrorKind ErrorKind.NameError "未知のテーブル名の t.*" (db2.Execute "SELECT nope.* FROM t")
-        expectErrorKind ErrorKind.NameError "別名を実名で指定した t.*" (db2.Execute "SELECT t.* FROM t AS x"))
-
-[<Fact>]
-let ``Database: LIMIT の定数式と負数`` () =
-    withDb "limit-expr" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1), (2), (3)"
-
-        // 定数式は評価される
-        let _, one = ok (db2.Execute "SELECT id FROM t LIMIT 1+0")
-        Assert.Equal<int>(1, one.Rows.Length)
-
-        let _, offset = ok (db2.Execute "SELECT id FROM t LIMIT 2 OFFSET 1+0")
-        Assert.Equal<int>(2, offset.Rows.Length)
-
-        expectErrorKind ErrorKind.SyntaxError "LIMIT -1 はエラー" (db2.Execute "SELECT id FROM t LIMIT -1")
-        expectError "LIMIT に列参照は使えない" (db2.Execute "SELECT id FROM t LIMIT id")
-
-        // LIMIT 0 は 0 行（従来どおり）
-        let _, none = ok (db2.Execute "SELECT id FROM t LIMIT 0")
-        Assert.Empty none.Rows)
-
-[<Fact>]
-let ``Database: DEFAULT の評価エラーは NULL にしない`` () =
-    withDb "default-error" (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (1 / 0))"
-
-        expectError "壊れた DEFAULT はエラーになる" (db1.Execute "INSERT INTO t (id) VALUES (1)"))
-
-[<Fact>]
-let ``Database: DEFAULT は列型へ暗黙変換される`` () =
-    withDb "default-coerce" (fun db0 ->
-        // INTEGER の既定値を TEXT 列へ入れると TEXT に変換される
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT DEFAULT 42)"
-        let db2, _ = ok (db1.Execute "INSERT INTO t (id) VALUES (1)")
-        let _, rows = ok (db2.Execute "SELECT v FROM t")
-        Assert.Equal<string>("42", asText rows.Rows.[0].[0])
-
-        // 変換できない既定値は型エラー（TEXT のまま保存しない）
-        let db3 =
-            exec db2 "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 'oops')"
-
-        expectErrorKind ErrorKind.TypeError "INTEGER 列の変換できない DEFAULT" (db3.Execute "INSERT INTO u (id) VALUES (1)"))
-
-[<Fact>]
-let ``Database: 複合索引の全列等値で行を引ける`` () =
-    withDb "comp-index-eq" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (a INTEGER, b INTEGER, id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 2, 10), (1, 3, 11), (2, 2, 12)"
-        let db3 = exec db2 "CREATE INDEX ix_ab ON t (a, b)"
-
-        // 索引の backfill 後、全列等値で 1 行だけ返る
-        let _, r = ok (db3.Execute "SELECT id FROM t WHERE a = 1 AND b = 2")
-        Assert.Equal<int>(1, r.Rows.Length)
-        Assert.Equal<int64>(10L, asInt r.Rows.[0].[0])
-
-        // 前置 1列だけでも IndexLookup（結果は同じ）
-        let _, prefix = ok (db3.Execute "SELECT id FROM t WHERE a = 1")
-        Assert.Equal<int>(2, prefix.Rows.Length))
-
-[<Fact>]
-let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
-    withDir "limit-pushdown" (fun dir ->
-        // 2回に分けて Close し、テーブル t の SSTable を 2 個作る。
-        let db0 = ok (Database.OpenWith dir)
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
-        ok (db2.Close())
-
-        let db3 = ok (Database.OpenWith dir)
-        let db4 = exec db3 "INSERT INTO t VALUES (3), (4)"
-        ok (db4.Close())
-
-        // openDatabase は MaxSeqNo の復元で全 SSTable を読むため、open 後に壊す。
-        let db5 = ok (Database.OpenWith dir)
-
-        // テーブル t の最新 SSTable（キー 3,4）を壊す。
-        let tableDir = System.IO.Path.Combine(dir, Keyspace.toDirName (Keyspace.table "t"))
-
-        let newest =
-            System.IO.Directory.GetFiles(tableDir, "*" + FileMetaData.SstExtension)
-            |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
-
-        let bytes = System.IO.File.ReadAllBytes newest
-        bytes.[0] <- bytes.[0] ^^^ 0xFFuy
-        System.IO.File.WriteAllBytes(newest, bytes)
-        System.IO.File.SetLastWriteTimeUtc(newest, System.DateTime.UtcNow.AddSeconds 1.0)
-
-        // LIMIT 1 は先頭 1行だけなので、キー 3 以降の壊れた SSTable を開かない。
-        let _, one = ok (db5.Execute "SELECT id FROM t LIMIT 1")
-        Assert.Equal<int>(1, one.Rows.Length)
-        Assert.Equal<int64>(1L, asInt one.Rows.[0].[0])
-
-        // 全行が必要なら壊れた SSTable を開くので CorruptionError。
-        expectErrorKind ErrorKind.CorruptionError "LIMIT 10 は壊れた SSTable を開く" (db5.Execute "SELECT id FROM t LIMIT 10")
-
-        ok (db5.Close()))
-
-[<Fact>]
-let ``Database: VARCHAR(32) は再オープン後も使える`` () =
-    withDir "varchar-reopen" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(32))"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 'abc')"
-        ok (db2.Close())
-
-        // 型引数はカタログに保存されないが、列型（TEXT）と値はそのまま使える
-        let db3 = ok (Database.OpenWith dir)
-        let _, r = ok (db3.Execute "SELECT v FROM t")
-        Assert.Equal<string>("abc", asText r.Rows.[0].[0])
-        ok (db3.Close()))
-
-[<Fact>]
-let ``Database: SQL の BEGIN / COMMIT / ROLLBACK は受理される（文としては無効）`` () =
-    // docs/sql-reference.md の既知の制限どおり、文としての txn 制御は何もしない。
-    withDb "tx5" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "BEGIN"
-        let db3 = exec db2 "INSERT INTO t VALUES (1)"
-        let db4 = exec db3 "COMMIT"
-        let db5, res = ok (db4.Execute "SELECT id FROM t")
-        Assert.Equal<int>(1, res.Rows.Length)
-        // SQL の BEGIN は session の transaction を作らない
-        Assert.False db5.InTransaction
-
-        let db6 = exec db5 "ROLLBACK"
-        let _, after = ok (db6.Execute "SELECT id FROM t")
-        Assert.Equal<int>(1, after.Rows.Length))
-
 [<Fact>]
 let ``E2E: 明示 transaction 内の書き込みが SELECT に見える`` () =
     withDb "tx6" (fun db0 ->
@@ -488,6 +286,10 @@ let ``E2E: 明示 transaction 内の索引検索が書き込みを見る`` () =
         let _, newKey = ok (tx4.Execute "SELECT id FROM t WHERE v = 8")
         Assert.Equal<int>(1, newKey.Rows.Length))
 
+// ---------------------------------------------------------------------------
+// ハンドル API・索引の backfill・DROP の後始末・ストレージ破損
+// ---------------------------------------------------------------------------
+
 [<Fact>]
 let ``Database: Root はルートディレクトリを返す`` () =
     withDir "rootprop" (fun dir ->
@@ -495,101 +297,43 @@ let ``Database: Root はルートディレクトリを返す`` () =
         Assert.Equal(dir, db.Root)
         ok (db.Close()))
 
-// ---------------------------------------------------------------------------
-// 実行（Execute）: DDL → DML → SELECT → エラー → 回帰 → E2E → 性能 → 末尾再帰
-// ---------------------------------------------------------------------------
-
 [<Fact>]
-let ``Database: CREATE TABLE でテーブルができる`` () =
-    withDb "ddl1" (fun db0 ->
-        let db =
-            exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
+let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
+    withDir "limit-pushdown" (fun dir ->
+        // 2回に分けて Close し、テーブル t の SSTable を 2 個作る。
+        let db0 = ok (Database.OpenWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
+        ok (db2.Close())
 
-        Assert.Equal<string list>([ "people" ], db.TableNames()))
+        let db3 = ok (Database.OpenWith dir)
+        let db4 = exec db3 "INSERT INTO t VALUES (3), (4)"
+        ok (db4.Close())
 
-[<Fact>]
-let ``Database: CREATE TABLE IF NOT EXISTS は 2 回呼んでも OK`` () =
-    withDb "ddl2" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
+        // openDatabase は MaxSeqNo の復元で全 SSTable を読むため、open 後に壊す。
+        let db5 = ok (Database.OpenWith dir)
 
-        let db2 =
-            exec db1 "CREATE TABLE IF NOT EXISTS people (id INTEGER PRIMARY KEY, name TEXT)"
+        // テーブル t の最新 SSTable（キー 3,4）を壊す。
+        let tableDir = System.IO.Path.Combine(dir, Keyspace.toDirName (Keyspace.table "t"))
 
-        Assert.Equal<string list>([ "people" ], db2.TableNames()))
+        let newest =
+            System.IO.Directory.GetFiles(tableDir, "*" + FileMetaData.SstExtension)
+            |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
 
-[<Fact>]
-let ``Database: CREATE TABLE の重複はエラー（IF NOT EXISTS なし）`` () =
-    withDb "ddl3" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
+        let bytes = System.IO.File.ReadAllBytes newest
+        bytes.[0] <- bytes.[0] ^^^ 0xFFuy
+        System.IO.File.WriteAllBytes(newest, bytes)
+        System.IO.File.SetLastWriteTimeUtc(newest, System.DateTime.UtcNow.AddSeconds 1.0)
 
-        expectError
-            "重複した CREATE TABLE が OK になっています"
-            (db1.Execute "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"))
+        // LIMIT 1 は先頭 1行だけなので、キー 3 以降の壊れた SSTable を開かない。
+        let _, one = ok (db5.Execute "SELECT id FROM t LIMIT 1")
+        Assert.Equal<int>(1, one.Rows.Length)
+        Assert.Equal<int64>(1L, asInt one.Rows.[0].[0])
 
-[<Fact>]
-let ``Database: テーブル制約の複合主キー`` () =
-    withDb "ddl6" (fun db0 ->
-        // 主キーをテーブル制約で指定（列制約ではない）
-        let db1 =
-            exec db0 "CREATE TABLE t (a INTEGER, b INTEGER, v INTEGER, PRIMARY KEY (a, b))"
+        // 全行が必要なら壊れた SSTable を開くので CorruptionError。
+        expectErrorKind ErrorKind.CorruptionError "LIMIT 10 は壊れた SSTable を開く" (db5.Execute "SELECT id FROM t LIMIT 10")
 
-        let db2, ins = ok (db1.Execute "INSERT INTO t (a, b) VALUES (1, 2), (1, 3)")
-        Assert.Equal<int>(2, ins.RowsAffected)
-
-        // 同じ a でも b が違えば別の行
-        let _, res = ok (db2.Execute "SELECT a, b FROM t ORDER BY b")
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<int64>(2L, asInt res.Rows.[0].[1])
-        Assert.Equal<int64>(3L, asInt res.Rows.[1].[1]))
-
-[<Fact>]
-let ``E2E: 複合主キーは全列一致で検索でき、部分一致も取りこぼさない`` () =
-    withDb "ddl6-search" (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE t (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))"
-
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 2, 'x'), (1, 3, 'y'), (2, 2, 'z')"
-
-        let _, full = ok (db2.Execute "SELECT v FROM t WHERE a = 1 AND b = 2")
-        Assert.Equal<int>(1, full.Rows.Length)
-        Assert.Equal<string>("x", asText full.Rows.[0].[0])
-
-        let _, partialA = ok (db2.Execute "SELECT v FROM t WHERE a = 1 ORDER BY b")
-        Assert.Equal<string list>([ "x"; "y" ], partialA.Rows |> Array.map (fun r -> asText r.[0]) |> List.ofArray)
-
-        let _, partialB = ok (db2.Execute "SELECT v FROM t WHERE b = 2 ORDER BY a")
-        Assert.Equal<string list>([ "x"; "z" ], partialB.Rows |> Array.map (fun r -> asText r.[0]) |> List.ofArray)
-
-        // 型が違うリテラルは黙って 0 行にせず、比較時に型エラーにする
-        expectErrorKind ErrorKind.TypeError "型不一致の主キー検索" (db2.Execute "SELECT v FROM t WHERE a = '1'"))
-
-[<Fact>]
-let ``Database: DROP TABLE でテーブルが消える`` () =
-    withDb "ddl4" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
-        let db2 = exec db1 "DROP TABLE people"
-        Assert.Empty(db2.TableNames()))
-
-[<Fact>]
-let ``Database: DROP TABLE IF EXISTS は無ければ OK`` () =
-    withDb "ddl5" (fun db0 ->
-        let db1 = exec db0 "DROP TABLE IF EXISTS nothing"
-        Assert.Empty(db1.TableNames()))
-
-[<Fact>]
-let ``Database: 存在しない列の索引はエラー`` () =
-    withDb "ddl7" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
-        expectError "存在しない列の CREATE INDEX が OK になっています" (db1.Execute "CREATE INDEX ix ON people (nope)"))
-
-[<Fact>]
-let ``Database: 存在しないテーブルの索引と索引名の重複はエラー`` () =
-    withDb "ddl8" (fun db0 ->
-        expectError "存在しないテーブルの CREATE INDEX が OK になっています" (db0.Execute "CREATE INDEX ix ON nope (a)")
-
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
-        let db2 = exec db1 "CREATE INDEX ix_a ON t (a)"
-        expectError "同名の CREATE INDEX が OK になっています" (db2.Execute "CREATE INDEX ix_a ON t (a)"))
+        ok (db5.Close()))
 
 [<Fact>]
 let ``Database: UNIQUE 索引の backfill は重複値を拒否する`` () =
@@ -665,115 +409,6 @@ let ``Database: CREATE INDEX は残った索引エントリを消してから ba
         ok (db2.Close()))
 
 [<Fact>]
-let ``Database: DROP INDEX で索引が消える`` () =
-    withDb "ddl9" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
-        let db2, _ = execRes db1 "INSERT INTO t VALUES (1, 10)"
-
-        let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
-        // 索引を使う検索が通る
-        let _, found = ok (db3.Execute "SELECT id FROM t WHERE a = 10")
-        Assert.Equal<int>(1, found.Rows.Length)
-
-        let db4 = exec db3 "DROP INDEX ix_a"
-        let _, after = ok (db4.Execute "SELECT id FROM t WHERE a = 10")
-        Assert.Equal<int>(1, after.Rows.Length)
-
-        // 消えたので同じ名前で作り直せる
-        let db5 = exec db4 "CREATE INDEX ix_a ON t (a)"
-        let _, again = ok (db5.Execute "SELECT id FROM t WHERE a = 10")
-        Assert.Equal<int>(1, again.Rows.Length))
-
-[<Fact>]
-let ``Database: DROP INDEX IF EXISTS と存在しない索引のエラー`` () =
-    withDb "ddl10" (fun db0 ->
-        let db1 = exec db0 "DROP INDEX IF EXISTS nothing"
-        expectError "存在しない DROP INDEX が OK になっています" (db1.Execute "DROP INDEX nothing"))
-
-[<Fact>]
-let ``Database: 暗黙の UNIQUE 索引は DROP できない`` () =
-    withDb "ddl-implicit-unique" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a@example.com')"
-
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "暗黙の UNIQUE 索引を DROP できてしまう"
-            (db2.Execute "DROP INDEX __unique_t_0")
-
-        // DROP に失敗しても制約は残る
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "暗黙 UNIQUE 索引の DROP 後に制約が消えている"
-            (db2.Execute "INSERT INTO t VALUES (2, 'a@example.com')")
-
-        // 予約名の索引はユーザーが作れない
-        expectErrorKind ErrorKind.NameError "予約された索引名を許してはいけない" (db2.Execute "CREATE INDEX __unique_t_9 ON t (email)"))
-
-[<Fact>]
-let ``Database: UNIQUE 制約は複数の NULL を許す`` () =
-    withDb "unique-null" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
-        let db2 = exec db1 "INSERT INTO u VALUES (1, NULL), (2, NULL)"
-        let _, count = ok (db2.Execute "SELECT COUNT(*) FROM u")
-        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0])
-
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "UNIQUE の非 NULL 重複を許してはいけない"
-            (db2.Execute "INSERT INTO u VALUES (3, 'x'), (4, 'x')"))
-
-[<Fact>]
-let ``Database: 複合 UNIQUE は NULL を含む行を重複扱いしない`` () =
-    withDb "unique-null-composite" (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE (a, b))"
-
-        let db2 = exec db1 "INSERT INTO u VALUES (1, NULL, 1), (2, NULL, 2)"
-        let _, count = ok (db2.Execute "SELECT COUNT(*) FROM u")
-        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0])
-
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "複合 UNIQUE の非 NULL 重複を許してはいけない"
-            (db2.Execute "INSERT INTO u VALUES (3, 7, 1), (4, 7, 1)"))
-
-[<Fact>]
-let ``Database: UNIQUE 列の UPDATE でも NULL は重複扱いしない`` () =
-    withDb "unique-null-update" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
-
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "UNIQUE 列の UPDATE で非 NULL 重複を許してはいけない"
-            (db2.Execute "UPDATE t SET email = 'x'")
-
-        let db3 = exec db2 "UPDATE t SET email = NULL"
-        let _, count = ok (db3.Execute "SELECT COUNT(*) FROM t WHERE email IS NULL")
-        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: UPDATE で UNIQUE 値を交換できる`` () =
-    withDb "unique-update-swap" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
-
-        // 更新対象外の行との衝突は即時エラー
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "更新対象外の UNIQUE 値との衝突を許してはいけない"
-            (db2.Execute "UPDATE t SET email = 'b' WHERE id = 1")
-
-        // 同一文内で入れ替える更新は最終状態が一意なので成功する
-        let db3 = exec db2 "UPDATE t SET email = CASE WHEN id = 1 THEN 'b' ELSE 'a' END"
-        let _, rows = ok (db3.Execute "SELECT id, email FROM t ORDER BY id")
-        Assert.Equal<int64>(1L, asInt rows.Rows.[0].[0])
-        Assert.Equal<string>("b", asText rows.Rows.[0].[1])
-        Assert.Equal<int64>(2L, asInt rows.Rows.[1].[0])
-        Assert.Equal<string>("a", asText rows.Rows.[1].[1]))
-
-[<Fact>]
 let ``Database: UNIQUE 索引の backfill は複数の NULL を許す`` () =
     withDb "unique-null-backfill" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
@@ -781,849 +416,6 @@ let ``Database: UNIQUE 索引の backfill は複数の NULL を許す`` () =
         let db3 = exec db2 "CREATE UNIQUE INDEX ix_a ON t (a)"
         let _, count = ok (db3.Execute "SELECT COUNT(*) FROM t")
         Assert.Equal<int64>(2L, asInt count.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: table-level PRIMARY KEY は NULL を拒否する`` () =
-    withDb "table-pk-not-null" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER, v TEXT, PRIMARY KEY (id))"
-
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "table-level PRIMARY KEY の NULL を許してはいけない"
-            (db1.Execute "INSERT INTO t VALUES (NULL, 'x')"))
-
-[<Fact>]
-let ``Database: 重複列・重複 INSERT 列・重複 UPDATE 代入を拒否する`` () =
-    withDb "duplicate-names" (fun db0 ->
-        expectErrorKind
-            ErrorKind.NameError
-            "CREATE TABLE の重複列を許してはいけない"
-            (db0.Execute "CREATE TABLE dup (id INTEGER PRIMARY KEY, a INTEGER, A TEXT)")
-
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
-
-        expectErrorKind
-            ErrorKind.NameError
-            "INSERT の重複列を許してはいけない"
-            (db1.Execute "INSERT INTO t (id, a, a) VALUES (1, 2, 3)")
-
-        expectErrorKind ErrorKind.NameError "UPDATE の重複代入を許してはいけない" (db1.Execute "UPDATE t SET a = 1, a = 2")
-
-        expectErrorKind
-            ErrorKind.NameError
-            "CREATE INDEX の重複列を許してはいけない"
-            (db1.Execute "CREATE INDEX ix_dup ON t (a, a)"))
-
-[<Fact>]
-let ``Database: 長すぎるテーブル名・索引名は拒否する`` () =
-    withDb "long-name" (fun db0 ->
-        let name = System.String('a', 128 + 1)
-
-        expectErrorKind
-            ErrorKind.NameError
-            "長すぎるテーブル名を許してはいけない"
-            (db0.Execute(sprintf "CREATE TABLE %s (id INTEGER PRIMARY KEY)" name))
-
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-
-        expectErrorKind ErrorKind.NameError "長すぎる索引名を許してはいけない" (db1.Execute(sprintf "CREATE INDEX %s ON t (id)" name)))
-
-[<Fact>]
-let ``Database: DEFAULT 付きの列定義も保存できる`` () =
-    withDb "ddl-default" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT DEFAULT 'x')"
-
-        // 保存時に DEFAULT 式が書かれる（再読込後に既定値として使われるかは別問題）
-        let _, rows = ok (db1.Execute "SELECT id, v FROM t")
-        Assert.Empty rows.Rows)
-
-[<Fact>]
-let ``E2E: DEFAULT は再オープン後も既定値として使われる`` () =
-    withDir "default-e2e" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
-
-        let db1 =
-            exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 42, s TEXT DEFAULT 'hi')"
-
-        let db2 = exec db1 "INSERT INTO t (id) VALUES (1)"
-        let _, before = ok (db2.Execute "SELECT v, s FROM t WHERE id = 1")
-        Assert.Equal<int64>(42L, asInt before.Rows.[0].[0])
-        Assert.Equal<string>("hi", asText before.Rows.[0].[1])
-        ok (db2.Close())
-
-        let db3 = ok (Database.OpenWith dir)
-        let _, after = ok (db3.Execute "SELECT v, s FROM t WHERE id = 1")
-        Assert.Equal<int64>(42L, asInt after.Rows.[0].[0])
-        Assert.Equal<string>("hi", asText after.Rows.[0].[1])
-
-        let db4 = exec db3 "INSERT INTO t (id) VALUES (2)"
-        let _, inserted = ok (db4.Execute "SELECT v, s FROM t WHERE id = 2")
-        Assert.Equal<int64>(42L, asInt inserted.Rows.[0].[0])
-        Assert.Equal<string>("hi", asText inserted.Rows.[0].[1])
-        ok (db4.Close()))
-
-[<Fact>]
-let ``E2E: 数値の範囲外は例外ではなくエラーを返す`` () =
-    withDb "numeric-e2e" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL, d DECIMAL)"
-        let db2 = exec db1 "INSERT INTO t (id, v, d) VALUES (1, 1e30, 7.9e28)"
-
-        // REAL は decimal の範囲を超えてもそのまま計算できる
-        let _, big = ok (db2.Execute "SELECT (v * v) FROM t WHERE id = 1")
-
-        match big.Rows.[0].[0] with
-        | SqlValue.Real f -> Assert.True(f > 1e59 && f < 1e61, sprintf "想定外の REAL: %f" f)
-        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
-
-        // 極小の REAL も 0 に丸めない
-        let _, tiny = ok (db2.Execute "SELECT (1e-30 * 1.0) FROM t WHERE id = 1")
-
-        match tiny.Rows.[0].[0] with
-        | SqlValue.Real f -> Assert.True(f > 0.0 && f < 1e-29, sprintf "想定外の REAL: %f" f)
-        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
-
-        let _, sum = ok (db2.Execute "SELECT SUM(v) FROM t")
-
-        match sum.Rows.[0].[0] with
-        | SqlValue.Real f -> Assert.Equal(1e30, f)
-        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
-
-        // 整数・DECIMAL のオーバーフローは DbError になる
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "整数加算のオーバーフロー"
-            (db2.Execute "SELECT 9223372036854775807 + 1 FROM t")
-
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "整数除算のオーバーフロー"
-            (db2.Execute "SELECT (-9223372036854775807 - 1) / -1 FROM t")
-
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "ABS のオーバーフロー"
-            (db2.Execute "SELECT ABS(-9223372036854775807 - 1) FROM t")
-
-        expectErrorKind
-            ErrorKind.ConstraintViolation
-            "DECIMAL 乗算のオーバーフロー"
-            (db2.Execute "SELECT (d * d) FROM t WHERE id = 1")
-
-        // DECIMAL の範囲外の REAL は変換時に型エラー
-        expectErrorKind ErrorKind.TypeError "DECIMAL の範囲外" (db2.Execute "INSERT INTO t (id, d) VALUES (2, 1e30)"))
-
-[<Fact>]
-let ``Database: INSERT した行が SELECT で見える`` () =
-    withDb "dml1" (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
-
-        let db2, ins =
-            ok (db1.Execute "INSERT INTO people VALUES (1, 'alice', 30), (2, 'bob', 25)")
-
-        Assert.Equal<int>(2, ins.RowsAffected)
-
-        let _db1, res = ok (db2.Execute "SELECT id, name FROM people ORDER BY id")
-        Assert.Equal<string array>([| "id"; "name" |], res.Columns)
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0])
-        Assert.Equal<string>("alice", asText res.Rows.[0].[1]))
-
-[<Fact>]
-let ``Database: INSERT は複数 VALUES を 1 文で`` () =
-    withDb "dml2" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
-        let db2, ins = ok (db1.Execute "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
-        Assert.Equal<int>(3, ins.RowsAffected)
-
-        let _db2, res = ok (db2.Execute "SELECT id FROM t")
-        Assert.Equal<int>(3, res.Rows.Length))
-
-[<Fact>]
-let ``Database: UPDATE は WHERE に合う行だけを変える`` () =
-    withDb "dml3" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2, _ = execRes db1 "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)"
-        let db3, upd = ok (db2.Execute "UPDATE t SET v = 99 WHERE id > 1")
-        Assert.Equal<int>(2, upd.RowsAffected)
-
-        let _db3, res = ok (db3.Execute "SELECT id, v FROM t ORDER BY id")
-        Assert.Equal<int64>(10L, asInt res.Rows.[0].[1])
-        Assert.Equal<int64>(99L, asInt res.Rows.[1].[1])
-        Assert.Equal<int64>(99L, asInt res.Rows.[2].[1]))
-
-[<Fact>]
-let ``Database: DELETE は WHERE に合う行を消す`` () =
-    withDb "dml4" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
-        let db3, del = ok (db2.Execute "DELETE FROM t WHERE v >= 20")
-        Assert.Equal<int>(2, del.RowsAffected)
-
-        let _db4, res = ok (db3.Execute "SELECT id FROM t")
-        Assert.Equal<int>(1, res.Rows.Length)
-        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0]))
-
-/// テスト用のテーブルを用意する。
-let private seeded (tag: string) (f: Database -> unit) =
-    withDb tag (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
-
-        let db2, _ =
-            ok (db1.Execute "INSERT INTO people VALUES (1,'alice',30),(2,'bob',25),(3,'carol',35)")
-
-        f db2)
-
-[<Fact>]
-let ``Database: SELECT * は全列を返す`` () =
-    seeded "sel1" (fun db ->
-        let _db5, res = ok (db.Execute "SELECT * FROM people ORDER BY id")
-        Assert.Equal<string array>([| "id"; "name"; "age" |], res.Columns)
-        Assert.Equal<int>(3, res.Rows.Length))
-
-[<Fact>]
-let ``Database: WHERE で絞る`` () =
-    seeded "sel2" (fun db ->
-        let _db6, res =
-            ok (db.Execute "SELECT name FROM people WHERE age > 26 ORDER BY name")
-
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<string>("alice", asText res.Rows.[0].[0])
-        Assert.Equal<string>("carol", asText res.Rows.[1].[0]))
-
-[<Fact>]
-let ``Database: ORDER BY が効く`` () =
-    seeded "sel3" (fun db ->
-        let _, asc = ok (db.Execute "SELECT name FROM people ORDER BY age")
-        Assert.Equal<string>("bob", asText asc.Rows.[0].[0])
-
-        let _, desc = ok (db.Execute "SELECT name FROM people ORDER BY age DESC")
-        Assert.Equal<string>("carol", asText desc.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: 別名を ORDER BY で参照できる`` () =
-    seeded "sel-alias-order" (fun db ->
-        // 別名 a は age を指すので age の順（bob 25 → alice 30 → carol 35）で並ぶ
-        let _, res = ok (db.Execute "SELECT name AS x, age AS a FROM people ORDER BY a")
-        Assert.Equal<int>(3, res.Rows.Length)
-        Assert.Equal<string>("bob", asText res.Rows.[0].[0])
-        Assert.Equal<string>("carol", asText res.Rows.[2].[0]))
-
-[<Fact>]
-let ``Database: 別名を GROUP BY と HAVING で参照できる`` () =
-    seeded "sel-alias-group" (fun db ->
-        let _, res = ok (db.Execute "SELECT age AS a, COUNT(*) FROM people GROUP BY a")
-        Assert.Equal<int>(3, res.Rows.Length)
-
-        // HAVING にも別名を参照できる
-        let _, having = ok (db.Execute "SELECT COUNT(*) AS c FROM people HAVING c > 2")
-        Assert.Equal<int>(1, having.Rows.Length)
-        Assert.Equal<int64>(3L, asInt having.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: 別名より列が優先される`` () =
-    seeded "sel-alias-priority" (fun db ->
-        // age という列があるのに age という別名を付けても、ORDER BY は列を見る
-        // （列の順: bob 25 → alice 30 → carol 35。別名=name なら alice が先）
-        let _, res = ok (db.Execute "SELECT name AS age FROM people ORDER BY age")
-        Assert.Equal<string>("alice", asText res.Rows.[1].[0]))
-
-[<Fact>]
-let ``Database: 別名の循環参照でも止まる`` () =
-    seeded "sel-alias-cycle" (fun db ->
-        // x と y が互いを指す（差し替えで無限ループにしない）
-        expectError "循環参照する別名は参照できない" (db.Execute "SELECT x AS y, y AS x FROM people ORDER BY x"))
-
-[<Fact>]
-let ``Database: GROUP BY と COUNT`` () =
-    seeded "sel4" (fun db ->
-        let db2, _r = execRes db "INSERT INTO people VALUES (4,'dave',30)"
-
-        let _q, res =
-            execRes db2 "SELECT age, COUNT(*) FROM people GROUP BY age ORDER BY age"
-        // age 25, 30(x2), 35 の 3 グループ
-        Assert.Equal<int>(3, res.Rows.Length)
-        Assert.Equal<int64>(25L, asInt res.Rows.[0].[0])
-        Assert.Equal<int64>(1L, asInt res.Rows.[0].[1])
-        Assert.Equal<int64>(30L, asInt res.Rows.[1].[0])
-        Assert.Equal<int64>(2L, asInt res.Rows.[1].[1]))
-
-[<Fact>]
-let ``Database: GROUP BY の式を SELECT / HAVING でも使える`` () =
-    seeded "group-expr" (fun db ->
-        // age 30, 25, 35 → age/10 は 3, 2, 3 の 2 グループ。
-        let _q, res = execRes db "SELECT age / 10, COUNT(*) FROM people GROUP BY age / 10"
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<int64>(3L, asInt res.Rows.[0].[0])
-        Assert.Equal<int64>(2L, asInt res.Rows.[0].[1])
-        Assert.Equal<int64>(2L, asInt res.Rows.[1].[0])
-        Assert.Equal<int64>(1L, asInt res.Rows.[1].[1])
-
-        // 集約を SELECT に含めなくても、GROUP BY 式を射影できる。
-        let _q2, only = execRes db "SELECT age / 10 FROM people GROUP BY age / 10"
-        Assert.Equal<int>(2, only.Rows.Length)
-        Assert.Equal<int64>(3L, asInt only.Rows.[0].[0])
-        Assert.Equal<int64>(2L, asInt only.Rows.[1].[0])
-
-        // HAVING でも同じ式を参照できる。
-        let _q3, having =
-            execRes db "SELECT age / 10 FROM people GROUP BY age / 10 HAVING age / 10 = 2"
-
-        Assert.Equal<int>(1, having.Rows.Length)
-        Assert.Equal<int64>(2L, asInt having.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: HAVING でグループを絞る`` () =
-    seeded "sel-having" (fun db ->
-        let db2, _r = execRes db "INSERT INTO people VALUES (4,'dave',30)"
-
-        // age 30 のグループ（2 人）だけ残る
-        let _q, res =
-            execRes db2 "SELECT age, COUNT(*) FROM people GROUP BY age HAVING COUNT(*) > 1 ORDER BY age"
-
-        Assert.Equal<int>(1, res.Rows.Length)
-        Assert.Equal<int64>(30L, asInt res.Rows.[0].[0])
-        Assert.Equal<int64>(2L, asInt res.Rows.[0].[1])
-
-        // 集約を含まない HAVING も動く（グループ側の値で評価される）
-        let _q2, res2 =
-            execRes db2 "SELECT age FROM people GROUP BY age HAVING age >= 30 ORDER BY age"
-
-        Assert.Equal<int>(2, res2.Rows.Length)
-        Assert.Equal<int64>(30L, asInt res2.Rows.[0].[0])
-        Assert.Equal<int64>(35L, asInt res2.Rows.[1].[0]))
-
-[<Fact>]
-let ``Database: HAVING にしか現れない集約でも絞り込める`` () =
-    seeded "sel-having-only" (fun db ->
-        let db2, _r = execRes db "INSERT INTO people VALUES (4,'dave',30)"
-
-        // COUNT(*) は SELECT に含めない（HAVING だけで使う）。
-        let _q, res =
-            execRes db2 "SELECT age FROM people GROUP BY age HAVING COUNT(*) > 1 ORDER BY age"
-
-        Assert.Equal<int>(1, res.Rows.Length)
-        Assert.Equal<int64>(30L, asInt res.Rows.[0].[0])
-
-        // GROUP BY なしでも HAVING の集約を使える。
-        let _q2, grouped = execRes db2 "SELECT 1 FROM people HAVING COUNT(*) > 0"
-        Assert.Equal<int>(1, grouped.Rows.Length)
-
-        let _q3, empty = execRes db2 "SELECT 1 FROM people HAVING COUNT(*) > 100"
-        Assert.Equal<int>(0, empty.Rows.Length))
-
-[<Fact>]
-let ``Database: LIMIT`` () =
-    seeded "sel5" (fun db ->
-        let _db7, res = ok (db.Execute "SELECT id FROM people ORDER BY id LIMIT 2")
-        Assert.Equal<int>(2, res.Rows.Length))
-
-[<Fact>]
-let ``Database: OFFSET`` () =
-    seeded "sel6" (fun db ->
-        let _db8, res = ok (db.Execute "SELECT id FROM people ORDER BY id LIMIT 5 OFFSET 1")
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<int64>(2L, asInt res.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: DISTINCT`` () =
-    withDb "sel7" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
-        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1,10),(2,20),(3,10),(4,30)")
-        let _db9, res = ok (db2.Execute "SELECT DISTINCT g FROM t ORDER BY g")
-        Assert.Equal<int>(3, res.Rows.Length)
-        Assert.Equal<int64>(10L, asInt res.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: DISTINCT を続けて実行しても毎回全行が返る`` () =
-    // 既出集合をモジュール初期化時に 1個だけ作ると、2回目以降が全行を重複と見なして 0行になる。
-    withDb "sel7b" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
-        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1,10),(2,20),(3,10),(4,30)")
-
-        for _ in 1..3 do
-            let _db, res = ok (db2.Execute "SELECT DISTINCT g FROM t ORDER BY g")
-            Assert.Equal<int>(3, res.Rows.Length)
-            Assert.Equal<int64>(10L, asInt res.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: 別名を付けられる`` () =
-    seeded "sel8" (fun db ->
-        let _db10, res = ok (db.Execute "SELECT name AS n FROM people ORDER BY id LIMIT 1")
-        Assert.Equal<string array>([| "n" |], res.Columns))
-
-[<Fact>]
-let ``Database: 集約関数`` () =
-    seeded "sel9" (fun db ->
-        let _, cnt = ok (db.Execute "SELECT COUNT(*) FROM people")
-        Assert.Equal<int64>(3L, asInt cnt.Rows.[0].[0])
-
-        let _, sum = ok (db.Execute "SELECT SUM(age) FROM people")
-        Assert.True(SqlValue.isNull sum.Rows.[0].[0] |> not)
-
-        let _, mn = ok (db.Execute "SELECT MIN(age), MAX(age) FROM people")
-        Assert.Equal<int64>(25L, asInt mn.Rows.[0].[0])
-        Assert.Equal<int64>(35L, asInt mn.Rows.[0].[1]))
-
-[<Fact>]
-let ``Database: JOIN`` () =
-    withDb "sel10" (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
-
-        let db2, _ = execRes db1 "INSERT INTO people VALUES (1,'alice',30),(2,'bob',25)"
-
-        let db3 =
-            exec db2 "CREATE TABLE orders (oid INTEGER PRIMARY KEY, person_id INTEGER, amount INTEGER)"
-
-        let db4, _ = execRes db3 "INSERT INTO orders VALUES (1,1,100),(2,1,200),(3,2,50)"
-
-        let _, res =
-            ok (
-                db4.Execute
-                    "SELECT people.name, SUM(orders.amount) FROM people JOIN orders ON people.id = orders.person_id GROUP BY people.name ORDER BY people.name"
-            )
-
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<string>("alice", asText res.Rows.[0].[0])
-        Assert.Equal<string>("bob", asText res.Rows.[1].[0]))
-
-[<Fact>]
-let ``Database: 3 テーブルの入れ子 JOIN が行を返す`` () =
-    // exec は左部分木に「全スキーマ」を渡していたため、3 テーブル以上の入れ子
-    // 結合で内側の JOIN が右テーブルの列まで含んだ schema で ON 句を解決し、
-    // 列が見つからずに INNER JOIN が黙って 0 行を返していた。
-    // 左へ下ろすのは「右テーブルを除いたスキーマ」。
-    withDb "join3" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, av INTEGER)"
-        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, bv INTEGER)"
-        let db4, _ = execRes db3 "INSERT INTO a VALUES (1,10),(2,20)"
-        let db5, _ = execRes db4 "INSERT INTO b VALUES (1,100),(2,200)"
-        let db6, _ = execRes db5 "INSERT INTO c VALUES (1,1000),(2,2000)"
-
-        let _, res =
-            ok (db6.Execute "SELECT a.v, b.av, c.bv FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id ORDER BY a.id")
-
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<int64>(10L, asInt res.Rows.[0].[0])
-        Assert.Equal<int64>(100L, asInt res.Rows.[0].[1])
-        Assert.Equal<int64>(1000L, asInt res.Rows.[0].[2])
-        Assert.Equal<int64>(20L, asInt res.Rows.[1].[0])
-        Assert.Equal<int64>(200L, asInt res.Rows.[1].[1])
-        Assert.Equal<int64>(2000L, asInt res.Rows.[1].[2]))
-
-[<Fact>]
-let ``末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`` () =
-    // plan の深さは JOIN の数だけ伸びる（サブクエリ未対応なので Join が唯一の源泉）。
-    // exec は descend（積む側）/ unwind（回す側）で末尾化済みだが、
-    // 左へ下ろす「右テーブルを除いたスキーマ」が段をまたいで正しく累積するかは
-    // 深さ方向で検証する。
-    // 作成は fsync 主導なので段数は 60 に抑える（120 段で 9 秒かかる実測あり）。
-    let n = 60
-
-    withDb "deepjoin" (fun db0 ->
-        let names = Array.init n (fun i -> sprintf "t%d" i)
-
-        let db1 =
-            names
-            |> Array.fold
-                (fun db name -> exec db (sprintf "CREATE TABLE %s (id INTEGER PRIMARY KEY, v INTEGER)" name))
-                db0
-
-        let db2 =
-            names
-            |> Array.mapi (fun i name -> sprintf "INSERT INTO %s VALUES (1,%d),(2,%d)" name i i)
-            |> Array.fold (fun db sql -> exec db sql) db1
-
-        // ON は「1 つ前 のテーブル」と結ぶ（左深いチェーンを作る）。
-        let onClauses =
-            names
-            |> Array.skip 1
-            |> Array.mapi (fun k name -> sprintf "JOIN %s ON %s.id = %s.id" name names.[k] name)
-            |> String.concat " "
-
-        let sql = sprintf "SELECT t0.v, t%d.v FROM t0 %s ORDER BY t0.v" (n - 1) onClauses
-        let _, res = ok (db2.Execute sql)
-        // id = 1 と 2 の 2 行が全段で一致する（エラーで 0 行になっていないこと）。
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<int>(2, res.Columns.Length)
-        Assert.Equal<int64>(0L, asInt res.Rows.[0].[0])
-        Assert.Equal<int64>(int64 (n - 1), asInt res.Rows.[0].[1])
-        Assert.Equal<int64>(0L, asInt res.Rows.[1].[0])
-        Assert.Equal<int64>(int64 (n - 1), asInt res.Rows.[1].[1]))
-
-[<Fact>]
-let ``Database: エイリアスでの自己結合が行を返す`` () =
-    // JOIN の対応付けを RealName で探していたころは、`FROM t AS x JOIN t AS y` が
-    // 先頭の t にヒットして JOIN が丸ごと省略され、
-    // 列インデックスが範囲外（2 列中）になって落ちていた。
-    withDb "selfjoin" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"
-
-        // 右だけを絞り込む WHERE が効くこと（JOIN が本当に組まれていること）。
-        let _, res =
-            ok (db2.Execute "SELECT p.id, q.v FROM t AS p JOIN t AS q ON p.id = q.id WHERE q.v > 15 ORDER BY p.id")
-
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<int64>(2L, asInt res.Rows.[0].[0])
-        Assert.Equal<int64>(20L, asInt res.Rows.[0].[1])
-        Assert.Equal<int64>(3L, asInt res.Rows.[1].[0])
-        Assert.Equal<int64>(30L, asInt res.Rows.[1].[1])
-
-        // 非キーでの自己結合（それぞれ自分自身とだけ一致する）。
-        let _, res2 =
-            ok (db2.Execute "SELECT p.id, q.id FROM t AS p JOIN t AS q ON p.v = q.v ORDER BY p.id")
-
-        Assert.Equal<int>(3, res2.Rows.Length)
-        Assert.Equal<int64>(2L, asInt res2.Rows.[1].[0])
-        Assert.Equal<int64>(2L, asInt res2.Rows.[1].[1])
-
-        // 3 段の自己結合（p / q / r すべて t のエイリアス）。
-        let _, res3 =
-            ok (
-                db2.Execute
-                    "SELECT p.id, q.id, r.v FROM t AS p JOIN t AS q ON p.id = q.id JOIN t AS r ON q.id = r.id WHERE p.v = 30 ORDER BY p.id"
-            )
-
-        Assert.Equal<int>(1, res3.Rows.Length)
-        Assert.Equal<int64>(3L, asInt res3.Rows.[0].[0])
-        Assert.Equal<int64>(3L, asInt res3.Rows.[0].[1])
-        Assert.Equal<int64>(30L, asInt res3.Rows.[0].[2]))
-
-[<Fact>]
-let ``Database: ハッシュ結合（INNER / LEFT / NULL キー）`` () =
-    withDb "joinhash" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
-        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
-        let db3 = exec db2 "INSERT INTO a VALUES (1,10),(2,20),(3,NULL)"
-        let db4 = exec db3 "INSERT INTO b VALUES (1,10),(2,10),(3,30),(4,NULL)"
-
-        // INNER: NULL キーは一致しない（a3 は落ちる）
-        let _, inner =
-            ok (db4.Execute "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id")
-
-        Assert.Equal<int>(2, inner.Rows.Length)
-        Assert.Equal<int64>(1L, asInt inner.Rows.[0].[0])
-        Assert.Equal<int64>(1L, asInt inner.Rows.[0].[1])
-        Assert.Equal<int64>(1L, asInt inner.Rows.[1].[0])
-        Assert.Equal<int64>(2L, asInt inner.Rows.[1].[1])
-
-        // LEFT: 一致しない a2 / a3 は右側 NULL
-        let _, left =
-            ok (db4.Execute "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id, b.id")
-
-        Assert.Equal<int>(4, left.Rows.Length)
-        Assert.True(SqlValue.isNull left.Rows.[2].[1])
-        Assert.True(SqlValue.isNull left.Rows.[3].[1])
-
-        // 残りの ON 句（b.id = 1）はハッシュ結合でも評価される
-        let _, residual =
-            ok (db4.Execute "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND b.id = 1")
-
-        Assert.Equal<int>(1, residual.Rows.Length)
-        Assert.Equal<int64>(1L, asInt residual.Rows.[0].[1]))
-
-[<Fact>]
-let ``Database: インデックス入れ子ループ（右索引 + 左が小さい）`` () =
-    withDb "joinindex" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE depts (id INTEGER PRIMARY KEY, name TEXT)"
-
-        let db2 =
-            exec db1 "CREATE TABLE users (id INTEGER PRIMARY KEY, dept_id INTEGER, name TEXT)"
-
-        let db3 = exec db2 "CREATE INDEX ix_users_dept ON users (dept_id)"
-        let db4 = exec db3 "INSERT INTO depts VALUES (1,'eng'),(2,'sales'),(3,'empty')"
-
-        let db5 =
-            exec db4 "INSERT INTO users VALUES (1,1,'alice'),(2,1,'bob'),(3,2,'carol')"
-
-        // 左は主キー 1 行、右 dept_id に索引 → IndexNestedLoop
-        let _, inner =
-            ok (
-                db5.Execute
-                    "SELECT depts.name, users.name FROM depts JOIN users ON depts.id = users.dept_id WHERE depts.id = 1 ORDER BY users.id"
-            )
-
-        Assert.Equal<int>(2, inner.Rows.Length)
-        Assert.Equal<string>("alice", asText inner.Rows.[0].[1])
-        Assert.Equal<string>("bob", asText inner.Rows.[1].[1])
-
-        // 一致なしの LEFT JOIN は右側 NULL
-        let _, left =
-            ok (
-                db5.Execute
-                    "SELECT depts.name, users.name FROM depts LEFT JOIN users ON depts.id = users.dept_id WHERE depts.id = 3"
-            )
-
-        Assert.Equal<int>(1, left.Rows.Length)
-        Assert.True(SqlValue.isNull left.Rows.[0].[1])
-
-        // 等値キー以外の ON 句も索引結合で評価される
-        let _, residual =
-            ok (
-                db5.Execute
-                    "SELECT users.name FROM depts JOIN users ON depts.id = users.dept_id AND users.name = 'bob' WHERE depts.id = 1"
-            )
-
-        Assert.Equal<int>(1, residual.Rows.Length)
-        Assert.Equal<string>("bob", asText residual.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: JOIN の非修飾で曖昧な列は NameError`` () =
-    // 非修飾 id は p と q の両方にある。各テーブルへ pushdown すると
-    // それぞれ id = 1 で絞ってしまい、曖昧エラーにならず意味が変わる。
-    withDb "joinambig" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20)"
-
-        expectErrorKind
-            ErrorKind.NameError
-            "JOIN の曖昧な非修飾列がエラーになりません"
-            (db2.Execute "SELECT p.id FROM t AS p JOIN t AS q ON p.id = q.id WHERE id = 1"))
-
-[<Fact>]
-let ``Database: テーブル名の重複はエラー（エイリアスが必要）`` () =
-    // 識別名が重複すると exec が名前でスキーマを引けず（両方が消える）、
-    // エラーではなく静かな誤答になるので、名前解決の段階で止める。
-    withDb "dupjoin" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1,10)"
-
-        expectErrorKind
-            ErrorKind.NameError
-            "重複したテーブル名がエラーになりません"
-            (db2.Execute "SELECT t.id FROM t JOIN t ON t.id = t.id"))
-
-[<Fact>]
-let ``Database: JOIN の WHERE は右テーブルと横断述語に効く`` () =
-    withDb "sel11" (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
-
-        let db2, _ =
-            execRes db1 "INSERT INTO people VALUES (1,'alice',30),(2,'bob',25),(3,'carol',40)"
-
-        let db3 =
-            exec db2 "CREATE TABLE orders (oid INTEGER PRIMARY KEY, person_id INTEGER, amount INTEGER)"
-
-        let db4, _ = execRes db3 "INSERT INTO orders VALUES (1,1,100),(2,1,200),(3,2,50)"
-
-        // 右テーブルだけを参照する WHERE（pushdown が rTree に残っていること）
-        let _, rightOnly =
-            ok (
-                db4.Execute
-                    "SELECT people.id FROM people JOIN orders ON people.id = orders.person_id WHERE orders.amount = 100"
-            )
-
-        Assert.Equal<int>(1, rightOnly.Rows.Length)
-        Assert.Equal<int64>(1L, asInt rightOnly.Rows.[0].[0])
-
-        // 非修飾でも一意に決まる列（amount は orders だけ）は従来どおり pushdown できる
-        let _, unqualifiedUnique =
-            ok (
-                db4.Execute
-                    "SELECT people.id FROM people JOIN orders ON people.id = orders.person_id WHERE amount = 100"
-            )
-
-        Assert.Equal<int>(1, unqualifiedUnique.Rows.Length)
-        Assert.Equal<int64>(1L, asInt unqualifiedUnique.Rows.[0].[0])
-
-        // 2 テーブルにまたがる WHERE（ON に無い述語が JOIN 上で評価される）
-        let _, cross =
-            ok (
-                db4.Execute
-                    "SELECT people.id FROM people JOIN orders ON people.id = orders.person_id WHERE people.age * 4 < orders.amount"
-            )
-
-        Assert.Equal<int>(1, cross.Rows.Length)
-        Assert.Equal<int64>(1L, asInt cross.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: LEFT JOIN の WHERE は null 供給側に効く`` () =
-    withDb "sel12" (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
-
-        let db2, _ =
-            execRes db1 "INSERT INTO people VALUES (1,'alice',30),(2,'bob',25),(3,'carol',40)"
-
-        let db3 =
-            exec db2 "CREATE TABLE orders (oid INTEGER PRIMARY KEY, person_id INTEGER, amount INTEGER)"
-
-        let db4, _ = execRes db3 "INSERT INTO orders VALUES (1,1,100),(2,1,200),(3,2,50)"
-
-        // 右への pushdown を入れると全 3 行が NULL 拡張されて 4 行になる
-        let _, isNullRows =
-            ok (
-                db4.Execute
-                    "SELECT people.id FROM people LEFT JOIN orders ON people.id = orders.person_id WHERE orders.amount IS NULL"
-            )
-
-        Assert.Equal<int>(1, isNullRows.Rows.Length)
-        Assert.Equal<int64>(3L, asInt isNullRows.Rows.[0].[0])
-
-        // 右への pushdown を入れると carol まで残って 3 行になる
-        let _, matched =
-            ok (
-                db4.Execute
-                    "SELECT people.id FROM people LEFT JOIN orders ON people.id = orders.person_id WHERE orders.amount = 100"
-            )
-
-        Assert.Equal<int>(1, matched.Rows.Length)
-        Assert.Equal<int64>(1L, asInt matched.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: 複数文を ; で渡せる`` () =
-    withDb "tx3" (fun db0 ->
-        let sql =
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER); "
-            + "INSERT INTO t VALUES (1, 1); "
-            + "INSERT INTO t VALUES (2, 2)"
-
-        let db, _r = execRes db0 sql
-        let _q, res = execRes db "SELECT id FROM t"
-        Assert.Equal<int>(2, res.Rows.Length))
-
-[<Fact>]
-let ``Database: セミコロンなしの複数文はエラー`` () =
-    withDb "p0-separator" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-
-        expectError "セミコロンなしの複数文が OK になっています" (db1.Execute "SELECT id FROM t SELECT id FROM t")
-
-        // `;` があれば従来どおり複数文として実行できる
-        let db2 = exec db1 "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)"
-        let _, res = ok (db2.Execute "SELECT COUNT(*) FROM t")
-        Assert.Equal<int64>(2L, asInt res.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: UNION はエラーになり 2 文として実行されない`` () =
-    withDb "p0-union" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
-
-        expectError "UNION がエラーになっていません" (db2.Execute "SELECT id FROM t UNION SELECT id FROM t")
-
-        // 2 文として実行されていれば RowsAffected の合計などが返るが、ここではエラーになる。
-        let _, res = ok (db2.Execute "SELECT COUNT(*) FROM t")
-        Assert.Equal<int64>(2L, asInt res.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: RIGHT JOIN はエラーになり INNER JOIN として実行されない`` () =
-    withDb "p0-right-join" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY, w TEXT)"
-        let db3 = exec db2 "INSERT INTO t VALUES (1)"
-        let db4 = exec db3 "INSERT INTO u VALUES (1, 'x'), (2, 'y')"
-
-        expectError "RIGHT JOIN がエラーになっていません" (db4.Execute "SELECT u.id FROM t RIGHT JOIN u ON u.id = 1"))
-
-// ---------------------------------------------------------------------------
-// エラー
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``Database: 存在しないテーブルの SELECT はエラー`` () =
-    withDb "err1" (fun db -> expectError "存在しないテーブルの SELECT が OK になっています" (db.Execute "SELECT * FROM nothing"))
-
-[<Fact>]
-let ``Database: 存在しない列の WHERE はエラー`` () =
-    seeded "err2" (fun db ->
-        expectError "存在しない列の WHERE が OK になっています" (db.Execute "SELECT id FROM people WHERE nope = 1"))
-
-[<Fact>]
-let ``Database: 構文エラーはエラー（例外ではない）`` () =
-    withDb "err3" (fun db -> expectError "構文エラーが OK になっています" (db.Execute "SELEC 1"))
-
-[<Fact>]
-let ``Database: NOT NULL 制約違反はエラー`` () =
-    withDb "err4" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)"
-
-        expectError "NOT NULL 違反が OK になっています" (db1.Execute "INSERT INTO t (id) VALUES (1)"))
-
-[<Fact>]
-let ``Database: QueryResult の表示が使える`` () =
-    seeded "disp1" (fun db ->
-        let _db15, res = ok (db.Execute "SELECT id FROM people ORDER BY id LIMIT 1")
-        let lines = res.ToDisplayLines()
-
-        Assert.True(lines |> List.exists (fun l -> l.Contains "id"))
-        Assert.True(lines |> List.exists (fun l -> l.Contains "1")))
-
-[<Fact>]
-let ``Database: CASE WHEN が評価できる`` () =
-    seeded "reg-case" (fun db ->
-        let _, res =
-            ok (db.Execute "SELECT name FROM people WHERE (CASE WHEN age > 26 THEN 1 ELSE 0 END) = 1 ORDER BY name")
-
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<string>("alice", asText res.Rows.[0].[0])
-        Assert.Equal<string>("carol", asText res.Rows.[1].[0]))
-
-[<Fact>]
-let ``Database: CASE WHEN が射影に書ける`` () =
-    seeded "reg-case2" (fun db ->
-        let _, res =
-            ok (
-                db.Execute
-                    "SELECT name AS n, CASE WHEN age > 26 THEN 'old' ELSE 'young' END AS band FROM people ORDER BY id"
-            )
-
-        Assert.Equal<string array>([| "n"; "band" |], res.Columns)
-        Assert.Equal<string>("old", asText res.Rows.[0].[1])
-        Assert.Equal<string>("young", asText res.Rows.[1].[1]))
-
-[<Fact>]
-let ``Database: LIMIT は OFFSET を適用してから取る`` () =
-    seeded "reg-limit" (fun db ->
-        let _, res = ok (db.Execute "SELECT id FROM people ORDER BY id LIMIT 2 OFFSET 1")
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<int64>(2L, asInt res.Rows.[0].[0])
-        Assert.Equal<int64>(3L, asInt res.Rows.[1].[0])
-
-        // DESC でも同じこと。
-        let _, desc =
-            ok (db.Execute "SELECT id FROM people ORDER BY id DESC LIMIT 2 OFFSET 1")
-
-        Assert.Equal<int>(2, desc.Rows.Length)
-        Assert.Equal<int64>(2L, asInt desc.Rows.[0].[0])
-        Assert.Equal<int64>(1L, asInt desc.Rows.[1].[0]))
-
-[<Fact>]
-let ``Database: 索引の等価検索は一致する行をすべて返す`` () =
-    withDb "reg-index" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
-
-        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1,10),(2,20),(3,20),(4,30)")
-
-        let db3 = exec db2 "CREATE INDEX ix_g ON t (g)"
-        let _, res = ok (db3.Execute "SELECT id FROM t WHERE g = 20 ORDER BY id")
-
-        Assert.Equal<int>(2, res.Rows.Length)
-        Assert.Equal<int64>(2L, asInt res.Rows.[0].[0])
-        Assert.Equal<int64>(3L, asInt res.Rows.[1].[0]))
-
-[<Fact>]
-let ``Database: 索引列を更新すると索引も追従する`` () =
-    withDb "reg-index-upd" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
-        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1,10),(2,20)")
-        let db3 = exec db2 "CREATE INDEX ix_g ON t (g)"
-        // 索引キーが変わる更新（古いキーの削除 + 新しいキーの追加）
-        let db4, upd = ok (db3.Execute "UPDATE t SET g = 99 WHERE id = 1")
-        Assert.Equal<int>(1, upd.RowsAffected)
-
-        let _, hit = ok (db4.Execute "SELECT id FROM t WHERE g = 99")
-        Assert.Equal<int>(1, hit.Rows.Length)
-        Assert.Equal<int64>(1L, asInt hit.Rows.[0].[0])
-
-        // 古い索引エントリからは復活しない
-        let _, miss = ok (db4.Execute "SELECT id FROM t WHERE g = 10")
-        Assert.Equal<int>(0, miss.Rows.Length))
 
 [<Fact>]
 let ``Database: DROP TABLE 後の同名再作成で旧データが復活しない`` () =
@@ -1733,20 +525,8 @@ let ``Database: DROP INDEX 後の同名再作成で旧索引エントリが復�
         Assert.Equal<int>(1, alive.Rows.Length)
         Assert.Equal<int64>(2L, asInt alive.Rows.[0].[0]))
 
-[<Fact>]
-let ``Database: 負数の主キー等値検索`` () =
-    withDb "reg-negpk" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (-5, 50), (5, 50)")
-        // 主キー検索（Unary Neg のリテラルから PkLookup が選ばれる）
-        let _, res = ok (db2.Execute "SELECT id, v FROM t WHERE id = -5")
-
-        Assert.Equal<int>(1, res.Rows.Length)
-        Assert.Equal<int64>(-5L, asInt res.Rows.[0].[0])
-        Assert.Equal<int64>(50L, asInt res.Rows.[0].[1]))
-
 // ===========================================================================
-// E2E（通し経路）
+// E2E（通し経路）・性能・末尾再帰
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -1877,6 +657,46 @@ let ``性能: 多数行の insert → point lookup → range scan`` () =
 // ---------------------------------------------------------------------------
 
 [<Fact>]
+let ``末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`` () =
+    // plan の深さは JOIN の数だけ伸びる（サブクエリ未対応なので Join が唯一の源泉）。
+    // exec は descend（積む側）/ unwind（回す側）で末尾化済みだが、
+    // 左へ下ろす「右テーブルを除いたスキーマ」が段をまたいで正しく累積するかは
+    // 深さ方向で検証する。
+    // 作成は fsync 主導なので段数は 60 に抑える（120 段で 9 秒かかる実測あり）。
+    let n = 60
+
+    withDb "deepjoin" (fun db0 ->
+        let names = Array.init n (fun i -> sprintf "t%d" i)
+
+        let db1 =
+            names
+            |> Array.fold
+                (fun db name -> exec db (sprintf "CREATE TABLE %s (id INTEGER PRIMARY KEY, v INTEGER)" name))
+                db0
+
+        let db2 =
+            names
+            |> Array.mapi (fun i name -> sprintf "INSERT INTO %s VALUES (1,%d),(2,%d)" name i i)
+            |> Array.fold (fun db sql -> exec db sql) db1
+
+        // ON は「1 つ前 のテーブル」と結ぶ（左深いチェーンを作る）。
+        let onClauses =
+            names
+            |> Array.skip 1
+            |> Array.mapi (fun k name -> sprintf "JOIN %s ON %s.id = %s.id" name names.[k] name)
+            |> String.concat " "
+
+        let sql = sprintf "SELECT t0.v, t%d.v FROM t0 %s ORDER BY t0.v" (n - 1) onClauses
+        let _, res = ok (db2.Execute sql)
+        // id = 1 と 2 の 2 行が全段で一致する（エラーで 0 行になっていないこと）。
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int>(2, res.Columns.Length)
+        Assert.Equal<int64>(0L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(int64 (n - 1), asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(0L, asInt res.Rows.[1].[0])
+        Assert.Equal<int64>(int64 (n - 1), asInt res.Rows.[1].[1]))
+
+[<Fact>]
 let ``末尾再帰: 大量の文を 1 度の Execute で実行できる`` () =
     // Execute の runStatements は `runStatement … |> Result.bind (fun … -> runStatements …)` で
     // 文の数だけフレームが積まれていた（→ StackOverflow / exit 134）。
@@ -1984,20 +804,6 @@ let ``Database: カタログ破損で開くのに失敗してもロックを解�
         ok (RowStore.close store))
 
 [<Fact>]
-let ``Database: Unicode テーブル名でも再オープン後に読める`` () =
-    withDir "unicode-reopen" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
-        let db1 = exec db0 "CREATE TABLE 住所 (id INTEGER PRIMARY KEY, v TEXT)"
-        let db2 = exec db1 "INSERT INTO 住所 VALUES (1, '東京')"
-        ok (db2.Close())
-
-        let db3 = ok (Database.OpenWith dir)
-        let result = query db3 "SELECT * FROM 住所"
-        Assert.Equal<int>(1, result.Rows.Length)
-        Assert.Equal<string>("東京", asText result.Rows.[0].[1])
-        ok (db3.Close()))
-
-[<Fact>]
 let ``Database: 古いハンドルを Close しても新しいハンドルの commit は失われない`` () =
     withDir "stale-close" (fun dir ->
         let db0 = ok (Database.OpenWith dir)
@@ -2054,6 +860,10 @@ let ``E2E: Close しなくても commit 済みの行は残る`` () =
 
         ok (reopened.Close()))
 
+// ---------------------------------------------------------------------------
+// snapshot registry・プロセスロック・DDL の排他
+// ---------------------------------------------------------------------------
+
 [<Fact>]
 let ``Database: active transaction は snapshot registry に登録され、commit / rollback / Close で外れる`` () =
     withDir "reg-lifecycle" (fun dir ->
@@ -2088,22 +898,6 @@ let ``Database: active transaction は snapshot registry に登録され、commi
         Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
         ok (openTx.Close())
         Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone))
-
-/// transaction を開始してハンドルを捨てる（呼び出し側は戻り値しか持たない）。
-/// `NoInlining` は Debug ビルドのローカルがメソッド末尾まで生き残るのを避けるため。
-/// 戻り値は「開始直後は確かに登録されていた」こと。
-[<System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)>]
-let private abandonTransaction (db: Database) =
-    let tx = ok (db.Begin())
-    let registered = (ActiveSnapshotRegistry.oldestExcept db.Root None).IsSome
-    // tx はここを抜けると到達不能になる（finalizer が登録を外せる）。
-    registered && tx.InTransaction
-
-/// finalizer を確実に走らせる。
-let private collectGarbage () =
-    System.GC.Collect()
-    System.GC.WaitForPendingFinalizers()
-    System.GC.Collect()
 
 [<Fact>]
 let ``Database: commit せずに捨てた transaction も GC されれば登録が外れる`` () =
@@ -2252,138 +1046,3 @@ let ``Database: 実行中の transaction があると DDL は ConflictError`` ()
 
         ok (inserted.Close())
         ok (rolled.Close()))
-
-[<Fact>]
-let ``Database: CREATE INDEX IF NOT EXISTS は既存なら成功する`` () =
-    withDb "p1-index-if" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = exec db1 "CREATE INDEX ix_v ON t (v)"
-        let db3 = exec db2 "CREATE INDEX IF NOT EXISTS ix_v ON t (v)"
-
-        expectError "IF NOT EXISTS なしの重複はエラー" (db3.Execute "CREATE INDEX ix_v ON t (v)")
-
-        let db4 = exec db3 "INSERT INTO t VALUES (1, 10), (2, 20)"
-        let _, found = ok (db4.Execute "SELECT id FROM t WHERE v = 20")
-        Assert.Equal<int>(1, found.Rows.Length))
-
-[<Fact>]
-let ``Database: LEFT OUTER JOIN の OUTER 綴り`` () =
-    withDb "p1-left-outer" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY, w TEXT)"
-        let db3 = exec db2 "INSERT INTO t VALUES (1), (2)"
-        let db4 = exec db3 "INSERT INTO u VALUES (1, 'x')"
-
-        let _, rows =
-            ok (db4.Execute "SELECT t.id, u.w FROM t LEFT OUTER JOIN u ON t.id = u.id ORDER BY t.id")
-
-        Assert.Equal<int>(2, rows.Rows.Length)
-        Assert.Equal<string>("x", asText rows.Rows.[0].[1])
-        Assert.True(SqlValue.isNull rows.Rows.[1].[1]))
-
-[<Fact>]
-let ``Database: BEGIN/START/COMMIT WORK/END`` () =
-    withDb "p1-txn-spellings" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2 = exec db1 "BEGIN TRANSACTION; INSERT INTO t VALUES (1); COMMIT WORK"
-        let db3 = exec db2 "START TRANSACTION; INSERT INTO t VALUES (2); END"
-        let _, count = ok (db3.Execute "SELECT COUNT(*) FROM t")
-        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0]))
-
-[<Fact>]
-let ``Database: 集約 DISTINCT と IS TRUE/FALSE`` () =
-    withDb "p1-distinct-truth" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, b BOOLEAN)"
-
-        let db2 =
-            exec db1 "INSERT INTO t VALUES (1, 10, TRUE), (2, 10, FALSE), (3, 20, NULL)"
-
-        let _, agg =
-            ok (db2.Execute "SELECT SUM(DISTINCT v), AVG(DISTINCT v), MIN(DISTINCT v), MAX(DISTINCT v) FROM t")
-
-        Assert.Equal(SqlValue.Decimal 30M, agg.Rows.[0].[0])
-        Assert.Equal<float>(15.0, asReal agg.Rows.[0].[1])
-        Assert.Equal<int64>(10L, asInt agg.Rows.[0].[2])
-        Assert.Equal<int64>(20L, asInt agg.Rows.[0].[3])
-
-        let _, isTrue = ok (db2.Execute "SELECT id FROM t WHERE b IS TRUE")
-        Assert.Equal<int>(1, isTrue.Rows.Length)
-
-        let _, isFalse = ok (db2.Execute "SELECT id FROM t WHERE b IS FALSE")
-        Assert.Equal<int>(1, isFalse.Rows.Length)
-
-        let _, isUnknown = ok (db2.Execute "SELECT id FROM t WHERE b IS UNKNOWN")
-        Assert.Equal<int>(1, isUnknown.Rows.Length)
-
-        let _, notUnknown =
-            ok (db2.Execute "SELECT id FROM t WHERE b IS NOT UNKNOWN ORDER BY id")
-
-        Assert.Equal<int>(2, notUnknown.Rows.Length)
-
-        let _, notTrue = ok (db2.Execute "SELECT id FROM t WHERE b IS NOT TRUE ORDER BY id")
-        Assert.Equal<int>(2, notTrue.Rows.Length))
-
-[<Fact>]
-let ``Database: LIKE ESCAPE と CAST`` () =
-    withDb "p1-like-cast" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a%b'), (2, 'axb'), (3, 'a_b')"
-
-        let _, likePct = ok (db2.Execute "SELECT id FROM t WHERE s LIKE 'a!%b' ESCAPE '!'")
-        Assert.Equal<int64>(1L, asInt likePct.Rows.[0].[0])
-
-        let _, likeUnderscore =
-            ok (db2.Execute "SELECT id FROM t WHERE s LIKE 'a!_b' ESCAPE '!'")
-
-        Assert.Equal<int64>(3L, asInt likeUnderscore.Rows.[0].[0])
-
-        let _, casted =
-            ok (db2.Execute "SELECT CAST('42' AS INTEGER), CAST(42 AS TEXT) FROM t LIMIT 1")
-
-        Assert.Equal<int64>(42L, asInt casted.Rows.[0].[0])
-        Assert.Equal<string>("42", asText casted.Rows.[0].[1]))
-
-[<Fact>]
-let ``Database: INSERT DEFAULT VALUES と DEFAULT`` () =
-    withDb "p1-default-values" (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT 1, v INTEGER DEFAULT 5, s TEXT)"
-
-        let db2 = exec db1 "INSERT INTO t DEFAULT VALUES"
-        let db3 = exec db2 "INSERT INTO t (id, v) VALUES (2, DEFAULT)"
-        let _, rows = ok (db3.Execute "SELECT id, v, s FROM t ORDER BY id")
-
-        Assert.Equal<int>(2, rows.Rows.Length)
-        Assert.Equal<int64>(1L, asInt rows.Rows.[0].[0])
-        Assert.Equal<int64>(5L, asInt rows.Rows.[0].[1])
-        Assert.True(SqlValue.isNull rows.Rows.[0].[2])
-        Assert.Equal<int64>(2L, asInt rows.Rows.[1].[0])
-        Assert.Equal<int64>(5L, asInt rows.Rows.[1].[1]))
-
-[<Fact>]
-let ``Database: ORDER BY の式と序数`` () =
-    withDb "p1-order-expr" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20)"
-
-        let _, expr = ok (db2.Execute "SELECT id FROM t ORDER BY v + 1")
-        Assert.Equal<int64>(2L, asInt expr.Rows.[0].[0])
-        Assert.Equal<int64>(3L, asInt expr.Rows.[1].[0])
-        Assert.Equal<int64>(1L, asInt expr.Rows.[2].[0])
-
-        let _, ordinal = ok (db2.Execute "SELECT id, v FROM t ORDER BY 2 DESC")
-        Assert.Equal<int64>(1L, asInt ordinal.Rows.[0].[0])
-        Assert.Equal<int64>(3L, asInt ordinal.Rows.[1].[0])
-        Assert.Equal<int64>(2L, asInt ordinal.Rows.[2].[0])
-
-        let _, alias =
-            ok (db2.Execute "SELECT id, v AS k FROM t ORDER BY k + 1 DESC LIMIT 1")
-
-        Assert.Equal<int64>(1L, asInt alias.Rows.[0].[0])
-
-        // `SELECT *` の序数は展開後の列位置
-        let _, starFirst = ok (db2.Execute "SELECT * FROM t ORDER BY 1 DESC")
-        Assert.Equal<int64>(3L, asInt starFirst.Rows.[0].[0])
-
-        let _, starSecond = ok (db2.Execute "SELECT * FROM t ORDER BY 2 ASC")
-        Assert.Equal<int64>(2L, asInt starSecond.Rows.[0].[0]))

@@ -174,7 +174,7 @@ let distinct (src: Op) =
 
 - 部分適用で「引数だけ残した関数」を作るときは、**可変状態を値をまたいで持たせない**（純粋な関数だけ）。
 - 気付き方: そのテスト単体では緑、他テストと同時実行すると 0行（xUnit の並列実行で顕在化）。
-- 回帰テスト: `Database: DISTINCT を続けて実行しても毎回全行が返る`。
+- 回帰テスト: `SqlReference: DISTINCT を続けて実行しても毎回全行が返る`。
 
 ---
 
@@ -257,8 +257,8 @@ match Schema.resolve schema c with
 
 - 修復: `buildLogical` は INNER のみ pushdown、LEFT は top へ回す。
   どのテーブルにも属さない述語も top に置いた。
-- 回帰テスト: `DatabaseTests` の `Database: JOIN の WHERE は右テーブルと横断述語に効く` /
-  `Database: LEFT JOIN の WHERE は null 供給側に効く`
+- 回帰テスト: `SqlReferenceTests` の `SqlReference: JOIN の WHERE は右テーブルと横断述語に効く` /
+  `SqlReference: LEFT JOIN の WHERE は null 供給側に効く`
 
 ### 3.5 入れ子 `Join` に「全スキーマ」を渡すと 3テーブル結合が 0行になる
 
@@ -287,8 +287,8 @@ run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema))
 ラッパも含めて単一の `run` の自己再帰で回すので、
 評価順（left → right → join）を保ったまま末尾再帰になる。
 
-- 回帰テスト: `DatabaseTests` の `Database: 3 テーブルの入れ子 JOIN が行を返す` /
-  `末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`（深さ方向の累積を検証）
+- 回帰テスト: `SqlReferenceTests` の `SqlReference: 3 テーブルの入れ子 JOIN が行を返す` /
+  `DatabaseTests` の `末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`（深さ方向の累積を検証）
 
 ### 3.6 JOIN の対応付けをテーブル名で探すと自己結合が消える
 
@@ -319,8 +319,8 @@ exec が「右テーブルを除いたスキーマ」を**名前で**引く（§
 重複名は区別できず静かな誤答になる。
 自己結合は必ずエイリアスで表す。
 
-- 回帰テスト: `DatabaseTests` の `Database: エイリアスでの自己結合が行を返す` /
-  `Database: テーブル名の重複はエラー（エイリアスが必要）`
+- 回帰テスト: `SqlReferenceTests` の `SqlReference: エイリアスでの自己結合が行を返す` /
+  `SqlReference: テーブル名の重複はエラー（エイリアスが必要）`
 
 ---
 
@@ -1411,7 +1411,7 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 
 - `Planner.applyAggregate` は HAVING の式から `Ops.aggCalls` で集約を集め、
   `allAggs` と `hasAgg` に含める。
-- 回帰テスト: `Database: HAVING にしか現れない集約でも絞り込める`。
+- 回帰テスト: `SqlReference: HAVING にしか現れない集約でも絞り込める`。
 
 ### 11.30 複数文 `Execute` の `BEGIN` 後エラーは ActiveSnapshot を解除する
 
@@ -1437,7 +1437,7 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
   深い HAVING 式で `Expr.toDisplayString` をノードごとに呼ぶと O(深さ²) になる
   （`末尾再帰: 50000段の式を havingFilter してもスタックを食わない` がハングした）。
 - `project` は GROUP BY があるとき、集約が 0個でも置換経路を通す。
-- 回帰テスト: `Database: GROUP BY の式を SELECT / HAVING でも使える`。
+- 回帰テスト: `SqlReference: GROUP BY の式を SELECT / HAVING でも使える`。
 
 ### 11.32 未知の `t.*` は 0列の成功にしない
 
@@ -1445,7 +1445,7 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 そのままだと `SELECT nope.* FROM t` が「0列・1行」で成功し、列の無い結果を静かに返す。
 `Planner.buildLogical` で `Schema.hasQualifier` を検査し、`NameError` にする。
 
-- 回帰テスト: `Database: FROM に無い t.* は NameError`。
+- 回帰テスト: `SqlReference: FROM に無い t.* は NameError`。
 
 ### 11.33 DEFAULT も列型へ強制する
 
@@ -1454,7 +1454,7 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 `INTEGER` 列に `DEFAULT 'oops'` を書くと TEXT のまま格納され、後続の比較が型エラーになる。
 
 - `defaultValues` の評価後に `SqlValue.coerce col.DataType` を通す。
-- 回帰テスト: `Database: DEFAULT は列型へ暗黙変換される`。
+- 回帰テスト: `SqlReference: DEFAULT は列型へ暗黙変換される`。
 
 ### 11.34 `CommitIntent.touch` は `ProcessLock` を取ってから呼ぶ
 
@@ -1525,8 +1525,8 @@ keyspace シャーディングによる並列性が失われていた。
 - `パーサ: 未対応の集合演算は明示エラー`
 - `パーサ: 未対応の JOIN は明示エラー`
 - `パーサ: 複数文は ; で区切る`
-- `Database: UNION はエラーになり 2 文として実行されない`
-- `Database: RIGHT JOIN はエラーになり INNER JOIN として実行されない`
+- `SqlReference: UNION はエラーになり 2 文として実行されない`
+- `SqlReference: RIGHT JOIN はエラーになり INNER JOIN として実行されない`
 
 ### 11.39 CAST は暗黙変換 (`SqlValue.coerce`) と分ける
 
@@ -1546,4 +1546,4 @@ TEXT → 数値 / BOOLEAN を InvariantCulture で解析する。
 範囲外の序数は `SyntaxError`。
 `SELECT *` の序数は `Schema.expandStar` で列へ展開する。
 
-回帰テスト: `Database: ORDER BY の式と序数`。
+回帰テスト: `SqlReference: ORDER BY の式と序数`。

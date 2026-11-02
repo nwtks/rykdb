@@ -38,6 +38,7 @@
     <Compile Include="DropCleanupTests.fs" />
     <Compile Include="EngineTests.fs" />
     <Compile Include="DatabaseTests.fs" />
+    <Compile Include="SqlReferenceTests.fs" />
     <Compile Include="ServerTests.fs" />
     <Compile Include="TestHealthTests.fs" />
   </ItemGroup>
