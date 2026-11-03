@@ -56,16 +56,34 @@ let ``SstEntry.decodeValue: 不明な値タグは CorruptionError`` () =
     expectErrorKind ErrorKind.CorruptionError "不明な値タグはエラー" (SstEntry.decodeValue [| 1uy; 2uy; 0uy |])
 
 [<Fact>]
-let ``SstEntry.splitInto: n 件ずつに分割`` () =
+let ``Sstable.writeTo: 入力の seq は 1 回だけ列挙する`` () =
     let items =
-        [| 1; 2; 3; 4; 5 |]
-        |> Array.map (fun i -> SstEntry.make (intKey i) (uint64 i) (Some [| SqlValue.Int(int64 i) |]))
+        [|
+            for i in 1..5 -> SstEntry.make (intKey i) (uint64 i) (Some [| SqlValue.Int(int64 i) |])
+        |]
 
-    let chunks = SstEntry.splitInto 2 items
-    Assert.Equal(3, chunks.Length)
-    Assert.Equal(2, chunks.[0].Length)
-    Assert.Equal(2, chunks.[1].Length)
-    Assert.Equal(1, chunks.[2].Length)
+    let mutable enumerations = 0
+
+    let once =
+        seq {
+            enumerations <- enumerations + 1
+
+            if enumerations > 1 then
+                failwith "入力が 2回列挙されています"
+
+            yield! items
+        }
+
+    use stream = new System.IO.MemoryStream()
+    let info = ok (Sstable.writeTo stream 0.01 once)
+
+    Assert.Equal(1, enumerations)
+    Assert.Equal<int64>(5L, info.EntryCount)
+    Assert.Equal<byte array>(intKey 1, info.FirstKey)
+    Assert.Equal<byte array>(intKey 5, info.LastKey)
+    Assert.Equal<uint64>(5UL, info.MaxSeqNo)
+    // 書いたバイト数と Size が食い違わない
+    Assert.Equal<int64>(int64 (stream.ToArray().Length), info.Size)
 
 /// 配列を遅延スキャンにする（SstMerge の入力）。
 let private scanOfArray (items: SstEntry array) =
@@ -129,13 +147,6 @@ let ``SstMerge: 多数のソースをまとめてマージできる`` () =
 
     expected
     |> List.iteri (fun i n -> Assert.True(intKey n = merged.[i].Key, sprintf "位置 %d が %d ではありません" i n))
-
-[<Fact>]
-let ``SstEntry.maxSeqNo: 最大 SeqNo を返す`` () =
-    let items =
-        [| SstEntry.make (intKey 1) 3UL None; SstEntry.make (intKey 2) 7UL None |]
-
-    Assert.Equal(7UL, SstEntry.maxSeqNo items)
 
 [<Fact>]
 let ``SstScan.empty: 次は None`` () =

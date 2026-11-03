@@ -206,9 +206,12 @@ module internal Compaction =
             match chunk with
             | [] -> ret None
             | _ ->
-                let entries = chunk |> List.rev |> List.toArray
-
-                FileMetaData.writeSstable dir fileNumber plan.OutputLevel options.BloomFalsePositiveRate entries
+                FileMetaData.writeSstable
+                    dir
+                    fileNumber
+                    plan.OutputLevel
+                    options.BloomFalsePositiveRate
+                    (List.rev chunk)
                 |> Result.map Some
 
         let finish plan allInputs added droppedVersions droppedTombstones =

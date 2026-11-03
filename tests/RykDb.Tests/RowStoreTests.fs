@@ -280,7 +280,7 @@ let ``RowStore.clearKeyspaceChunks: チャンクを跨いでも全件を消す``
         let entries =
             [| for i in 0..8200 -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i) |]
 
-        let store = ok (RowStore.writeBatches [ space, entries ] store)
+        let store = ok (RowStore.writeBatches [ (space, entries) ] store)
 
         // 既存エントリより大きい SeqNo から tombstone を採番する（実運用の再オープン相当）。
         let mgr =

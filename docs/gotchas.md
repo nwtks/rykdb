@@ -1605,3 +1605,45 @@ active な transaction が無ければ境界は `commitSeq + 1` になり、comm
 - 回帰テスト: `Memtable: Count と ApproxBytes は挿入したエントリの合計になる` /
   `ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの概算` /
   `Entry.managedBytes: memtable の保持量は符号化サイズより大きい`。
+
+### 11.43 `Wal.append` はフレーム単位で書き出す（全フレームを連結しない）
+
+Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Write` にすると、
+大きな transaction で「バッチ本体 + 連結コピー + 中間配列」が同時に生じ、ピークが約 2倍になる。
+`Wal.append` は **1フレームずつ `Write` し、最後に `Flush(true)`** する。
+
+- 原子性は「フレームごとの CRC」+「Commit に到達した Batch だけを再生する `foldCommitted`」が守る。
+  途中で落ちても未 commit の Batch は捨てられるので、コミット済みトランザクションが中途半端にならない。
+- 空のレコード列ではファイルを作らない（従来どおり）。
+- 回帰テスト: `WalTests`（フレームの往復）と `DatabaseTests` の WAL 再生・クラッシュ耐性。
+
+### 11.44 JOIN の右側は上限付きで materialize する
+
+入れ子ループ / ハッシュ結合は右側の全行を保持する（設計どおり）。
+無制限だと巨大な右テーブルで OOM し、プロセスごと落ちる。
+`Ops.toArrayWithBudget` が **管理メモリ換算 256MiB** で打ち切り、
+超過は `CapacityError`（`Ops.distinct` / transaction と同じ考え方）。
+
+- インデックス入れ子ループの検索結果（非一意索引の 1キーに大量の行）も同じ上限。
+- ハッシュ結合の表（バケット）は行配列の後に作られ、行配列は表作りの後に捨てられる
+  （ピークは概ね上限の 2倍まで）。
+- `lookupHash` はバケットをそのまま返す（probe ごとの `ToArray` を廃止）。
+- 回帰テスト: `Ops.toArrayWithBudget: 上限を超えると CapacityError`。
+
+### 11.45 `Sstable.writeTo` は入力を 1回だけ列挙する
+
+`writeTo` は `seq` を受け、**1回だけ列挙**してブロック単位で書き出す
+（memtable の flush が全件を `SstEntry` 配列へ実体化しない）。
+キー順の検証・先頭/末尾キー・`maxSeqNo`・Bloom 用のキーは書き出しと同時に集める。
+
+- `FileMetaData.writeSstable` は失敗時（キー順違反・書き込み失敗・空の入力）に
+  **部分ファイルを消してから**エラーを返す（孤児 `.sst` を残さない）。
+- 検証は `writeTo` 内に統合したため、
+  `Sstable.validate` / `SstEntry.splitInto` / `SstEntry.maxSeqNo` は削除
+  （それぞれ `loop` の逐次チェック・1ブロック分のため・書き出し中の集計に置き換え）。
+- 末尾再帰の `loop` は `use`（列挙子の破棄）の後ろにあるが、
+  F# は `use` / `try/finally` の中でも自己再帰を末尾呼び出しにする
+  （300万回の反復で実測済み）。
+- 回帰テスト: `Sstable.writeTo: 入力の seq は 1 回だけ列挙する` /
+  `FileMetaData.writeSstable: キー順でない入力はエラー`
+  （部分ファイルが残らないことを含む）。

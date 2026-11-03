@@ -94,22 +94,33 @@ module internal Wal =
         System.IO.Path.Combine(dir, fileName fileNumber)
 
     /// レコード列を追記する。
-    /// Begin / Batch / Commit をまとめて 1回の書き込みで書き出すので、
-    /// コミット済みトランザクションが中途半端にならない。
+    /// 1レコード（= 1フレーム）ずつ書き出すので、全フレームを 1本の配列に
+    /// 連結しない（大きな transaction でピークが約 2倍にならない）。
+    /// Begin / Batch / Commit がフレーム単位で完結しているので、
+    /// プロセスが途中で落ちてもコミット済みトランザクションが中途半端にならない
+    /// （未 commit の Batch は再生時に捨てられ、書きかけのフレームは CRC で検出される）。
     let append (dir: string) (records: WalRecord list) (state: WalState) =
-        let frame (payload: byte array) =
+        let headerOf (payload: byte array) =
             Writer.build
                 [
                     uint32 payload.Length |> Writer.uint32LE
                     Hashing.checksum payload |> Writer.uint32LE
-                    Writer.writeBytes payload
                 ]
 
-        let bytes =
-            records |> List.map (encodePayload >> frame) |> List.toArray |> Array.concat
+        let rec writeAll (fs: System.IO.FileStream) written =
+            function
+            | [] -> written
+            | record :: rest ->
+                let payload = encodePayload record
+                let header = headerOf payload
+                fs.Write(header, 0, header.Length)
+                fs.Write(payload, 0, payload.Length)
+                writeAll fs (written + header.Length + payload.Length) rest
 
-        protect (fun () ->
-            if bytes.Length > 0 then
+        match records with
+        | [] -> ret state
+        | _ ->
+            protect (fun () ->
                 use fs =
                     new System.IO.FileStream(
                         path dir state.FileNumber,
@@ -118,12 +129,12 @@ module internal Wal =
                         System.IO.FileShare.Read
                     )
 
-                fs.Write(bytes, 0, bytes.Length)
+                let written = writeAll fs 0 records
                 fs.Flush true
 
-            { state with
-                Size = state.Size + bytes.Length
-            })
+                { state with
+                    Size = state.Size + written
+                })
 
     /// コミット済みエントリをメモリに溜めず、1件ずつ `step` へ渡して再生する。
     /// 大きな WAL でもコミット済みエントリの配列を保持しない。

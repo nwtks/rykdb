@@ -110,8 +110,8 @@ module internal Ops =
 
         let seen = System.Collections.Generic.HashSet<byte array> HashIdentity.Structural
 
-        let rec skipSeen used cur =
-            Op.pull cur (fun row nxt ->
+        let rec skipSeen used =
+            Op.pull (fun row nxt ->
                 let key = encode row
 
                 if seen.Contains key then
@@ -473,6 +473,32 @@ module internal Ops =
                 return emitGroups 0
         }
 
+    /// JOIN の右側を保持する上限（管理メモリの概算バイト）。
+    /// 入れ子ループ / ハッシュ結合は右側の全行を保持するので、
+    /// OOM でプロセスごと落とさないための上限を置く
+    /// （DISTINCT / transaction と同じ考え方）。
+    let private JoinBudgetBytes = 256L * 1024L * 1024L
+
+    /// 右側の行を上限付きで materialize する（JOIN が右側の全行を保持するため）。
+    /// 1行の管理メモリに、リストの cons（24 バイト）と最終配列のスロット（8 バイト）を足して見積もる。
+    /// ハッシュ結合は表（バケット）も作るが、行の配列は表を作る後に捨てられる。
+    let private toArrayWithBudget (budget: int64) =
+        let rec go used acc cur =
+            match Op.next cur with
+            | Error e -> err e
+            | Ok None -> ret (List.rev acc |> List.toArray)
+            | Ok(Some(row, nxt)) ->
+                let used = used + int64 (ValueCodec.managedRowBytes row) + 32L
+
+                if used > budget then
+                    sprintf "JOIN の右側の行が多すぎます（概算 %d バイトの上限）。条件で絞るか、インデックスで絞ってください" budget
+                    |> DbError.capacity
+                    |> err
+                else
+                    go used (row :: acc) nxt
+
+        go 0L []
+
     /// nested loop 結合の内側ループ（1つの左行 × 右の全行）を回す共通処理。
     /// onExhausted matched は右を最後まで試し終えたときの Op。
     /// onError error matched は ON 句の評価が失敗したときの Op。
@@ -509,36 +535,44 @@ module internal Ops =
     /// 一致が無い左行は捨て、ON 句の評価が失敗したらクエリ全体を Error で落とす。
     let innerJoin (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
         let rec joinRows cur rightRows =
-            Op.pull cur (fun lrow lnext ->
-                Op.next (
-                    joinLoop
-                        leftSchema
-                        rightSchema
-                        on
-                        (fun _ -> joinRows lnext rightRows)
-                        (fun e _ -> Op.Compute(fun () -> err e))
-                        rightRows
-                        lrow
-                ))
+            Op.pull
+                (fun lrow lnext ->
+                    Op.next (
+                        joinLoop
+                            leftSchema
+                            rightSchema
+                            on
+                            (fun _ -> joinRows lnext rightRows)
+                            (fun e _ -> Op.Compute(fun () -> err e))
+                            rightRows
+                            lrow
+                    ))
+                cur
 
-        Op.toArray right |> Result.map (joinRows left)
+        toArrayWithBudget JoinBudgetBytes right |> Result.map (joinRows left)
 
     /// LEFT JOIN。
     /// 左の行に右が 1行も無ければ NULL で埋める。
     /// ON 句の評価が失敗したらクエリ全体を Error で落とす。
     let leftJoin (leftSchema: Schema) (left: Op) (rightSchema: Schema) (right: Op) (on: Expr) =
         let rec joinRows width cur rightRows =
-            Op.pull cur (fun lrow lnext ->
-                let onExhausted matched =
-                    if matched then
-                        joinRows width lnext rightRows
-                    else
-                        Op.Step(Array.append lrow (Array.create width SqlValue.Null), joinRows width lnext rightRows)
+            Op.pull
+                (fun lrow lnext ->
+                    let onExhausted matched =
+                        if matched then
+                            joinRows width lnext rightRows
+                        else
+                            Op.Step(
+                                Array.append lrow (Array.create width SqlValue.Null),
+                                joinRows width lnext rightRows
+                            )
 
-                let onError e _ = Op.Compute(fun () -> err e)
-                Op.next (joinLoop leftSchema rightSchema on onExhausted onError rightRows lrow))
+                    let onError e _ = Op.Compute(fun () -> err e)
+                    Op.next (joinLoop leftSchema rightSchema on onExhausted onError rightRows lrow))
+                cur
 
-        Op.toArray right |> Result.map (joinRows rightSchema.Columns.Length left)
+        toArrayWithBudget JoinBudgetBytes right
+        |> Result.map (joinRows rightSchema.Columns.Length left)
 
     /// 等値結合のキーが NULL を含むか（SQL では NULL は一致しない）。
     let private hasNullKey (row: SqlValue array) =
@@ -547,7 +581,7 @@ module internal Ops =
     let private keyOf (row: SqlValue array) = Array.map (fun i -> row.[i])
 
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
-    /// lookupRows は左キーから右行の配列を返す（見つからなければ空配列）。
+    /// lookupRows は左キーから右行のリストを返す（見つからなければ空）。
     /// <remarks>
     /// Op.Compute の継続内の相互再帰は「次の行を要求されたとき」に 1段ずつ進むので、スタックは積み上がらない。
     /// TailAudit はラムダ内の呼び出しを非末尾として報告するためベースラインに登録している。
@@ -558,7 +592,7 @@ module internal Ops =
         (left: Op)
         (leftKeys: int array)
         (rightSchema: Schema)
-        (lookupRows: SqlValue array -> Result<SqlValue array array, DbError>)
+        (lookupRows: SqlValue array -> Result<ResizeArray<SqlValue array>, DbError>)
         (residual: Expr option)
         =
         let residualMatches leftSchema rightSchema lrow rrow =
@@ -572,19 +606,21 @@ module internal Ops =
             Array.append lrow (Array.create rightWidth SqlValue.Null)
 
         let rec probe cur =
-            Op.pull cur (fun lrow lnext ->
-                if hasNullKey lrow leftKeys then
-                    if isLeft then
-                        Op.next (Op.Compute(fun () -> ret (Some(padded lrow, probe lnext))))
+            Op.pull
+                (fun lrow lnext ->
+                    if hasNullKey lrow leftKeys then
+                        if isLeft then
+                            Op.next (Op.Compute(fun () -> ret (Some(padded lrow, probe lnext))))
+                        else
+                            Op.next (probe lnext)
                     else
-                        Op.next (probe lnext)
-                else
-                    match lookupRows (keyOf lrow leftKeys) with
-                    | Error e -> err e
-                    | Ok rows -> Op.next (emit lrow lnext rows 0 false))
+                        match lookupRows (keyOf lrow leftKeys) with
+                        | Error e -> err e
+                        | Ok rows -> Op.next (emit lrow lnext rows 0 false))
+                cur
 
         and emit lrow lnext rows i matched =
-            if i >= rows.Length then
+            if i >= rows.Count then
                 if isLeft && not matched then
                     Op.Compute(fun () -> ret (Some(padded lrow, probe lnext)))
                 else
@@ -614,13 +650,18 @@ module internal Ops =
 
         table
 
+    /// 見つからないときの空リスト。
+    /// `joinProbe` は `rows` を読み取り専用でしか使わないので共有してよい
+    /// （モジュールスコープの値は 1回だけ評価される。`Ops.distinct` の教訓参照）。
+    let private emptyRows = ResizeArray<SqlValue array>()
+
     let private lookupHash
         (table: System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<SqlValue array>>)
         (key: SqlValue array)
         =
         match table.TryGetValue key with
-        | true, bucket -> ret (bucket.ToArray())
-        | _ -> ret [||]
+        | true, bucket -> ret bucket
+        | _ -> ret emptyRows
 
     /// INNER JOIN（ハッシュ結合）。右側をハッシュ表にする。
     let innerJoinHash
@@ -632,7 +673,7 @@ module internal Ops =
         (rightKeys: int array)
         (residual: Expr option)
         =
-        Op.toArray right
+        toArrayWithBudget JoinBudgetBytes right
         |> Result.map (fun rightRows ->
             let table = buildHashTable rightRows rightKeys
             joinProbe false leftSchema left leftKeys rightSchema (lookupHash table) residual)
@@ -647,10 +688,16 @@ module internal Ops =
         (rightKeys: int array)
         (residual: Expr option)
         =
-        Op.toArray right
+        toArrayWithBudget JoinBudgetBytes right
         |> Result.map (fun rightRows ->
             let table = buildHashTable rightRows rightKeys
             joinProbe true leftSchema left leftKeys rightSchema (lookupHash table) residual)
+
+    /// インデックス検索の結果を上限付きで materialize して `joinProbe` の形に載せる。
+    /// 非一意索引の prefix 検索は 1キーに大量の行が付き得るため上限を置く。
+    let private lookupBounded (lookup: SqlValue array -> Result<Op, DbError>) (key: SqlValue array) =
+        lookup key
+        >>= fun op -> toArrayWithBudget JoinBudgetBytes op |> Result.map ResizeArray<SqlValue array>
 
     /// INNER JOIN（インデックス入れ子ループ）。
     let innerJoinIndexed
@@ -660,7 +707,7 @@ module internal Ops =
         (rightSchema: Schema)
         (lookup: SqlValue array -> Result<Op, DbError>)
         =
-        joinProbe false leftSchema left leftKeys rightSchema (fun key -> lookup key >>= Op.toArray)
+        joinProbe false leftSchema left leftKeys rightSchema (lookupBounded lookup)
 
     /// LEFT JOIN（インデックス入れ子ループ）。
     let leftJoinIndexed
@@ -670,7 +717,7 @@ module internal Ops =
         (rightSchema: Schema)
         (lookup: SqlValue array -> Result<Op, DbError>)
         =
-        joinProbe true leftSchema left leftKeys rightSchema (fun key -> lookup key >>= Op.toArray)
+        joinProbe true leftSchema left leftKeys rightSchema (lookupBounded lookup)
 
     /// 射影。
     /// `SELECT` の項目順に値を並べる。

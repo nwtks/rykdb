@@ -362,7 +362,6 @@ module internal StorageEngine =
                 let! meta =
                     Memtable.rangeScan [||] 0 engine.Mem
                     |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
-                    |> Seq.toArray
                     |> FileMetaData.writeSstable engine.Dir fileNumber 0 BloomFalsePositiveRate
 
                 let! version, manifestNumber =

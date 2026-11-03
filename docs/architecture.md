@@ -467,6 +467,8 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 
 一方で、**入れ子ループ結合とハッシュ結合は Op を組み立てる時点で右側を materialize** する
 （インデックス入れ子ループは左行ごとに右を引く。下表の「遅延」列を参照）。
+materialize は管理メモリ換算で **256MiB が上限**で、超過は `CapacityError`
+（`Ops.toArrayWithBudget`。インデックス検索の結果も同じ上限）。
 ソート・集約・DISTINCT は**入力行を抱えず**、
 それぞれ外部マージ・アクュムレータ・符号化済みキーで処理する（§5.3）。
 
@@ -511,6 +513,7 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 | `ORDER BY`        | 外部マージソート（`ExtSort`）。バジェット内はメモリ、超過分は一時ファイルの run へ溢らして k-way merge。**主キー全列の昇順（単一テーブル）なら Sort を作らない** | 受け皿 1枚（既定 64MiB）+ run ごとの先頭 1行          |
 | `GROUP BY`        | 行を抱えずアクュムレータだけ更新（`Ops.aggregate`）                                                                                                              | グループ数 × アクュムレータ（上限 400万グループ）     |
 | `SELECT DISTINCT` | 符号化済みキーの `HashSet`                                                                                                                                       | 既定 256MiB。超過は `CapacityError`（OOM で死なない） |
+| `JOIN`            | 右側を materialize（入れ子ループ / ハッシュ結合。インデックス検索の結果も同様）                                                                                  | 256MiB。超過は `CapacityError`                        |
 
 - 上限の判定は**管理メモリの概算**で行う（`ValueCodec.managedRowBytes` / `Entry.managedBytes`）。
   `SqlValue`（参照型の DU）・string（UTF-16）・配列ヘッダ・Treap / Map ノードを含む。
@@ -1009,6 +1012,11 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 
 ファイルは `Sstable.writeTo` が v5 形式をブロック単位でストリームへ書き出す
 （`Sstable.build` はテスト用に `MemoryStream` 経由で同じ処理を呼ぶ）。
+入力は `seq` で **1回だけ列挙**し、
+キー順の検証・先頭/末尾キー・`maxSeqNo`・Bloom 用のキーは書き出しと同時に集める
+（memtable の flush が全件を `SstEntry` 配列にしない）。
+失敗時（キー順違反・書き込み失敗・空の入力）は
+`FileMetaData.writeSstable` が部分ファイルを消してからエラーを返す。
 `StorageEngine` は**部分読みだけ**を使う。
 
 - **部分読み**（`Sstable.openPartial`）: Footer / meta / Bloom / index だけを読み、
@@ -1138,8 +1146,11 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 追記は「最後に完了する」性質があるため、末尾の不完全なフレームは無視できる。
 完全なフレームの破損は末尾の torn write と区別できず、データ欠落を隠すため open を失敗させる。
 
-- **1トランザクション分（Begin + Batch + Commit）を 1 回の `append` でまとめて書き**、`Flush(true)` でディスクまで落とす。
-  Begin / Commit が中途半端に分かれない。
+- **1レコード（フレーム）ずつ書き出して、最後に `Flush(true)`** でディスクまで落とす
+  （全フレームを 1本の配列へ連結しない。大きな transaction でピークが約 2倍にならない）。
+  Begin / Batch / Commit は各フレームが CRC で守られ、
+  未 commit の Batch は再生時に捨てられるので、
+  途中で落ちてもコミット済みトランザクションが中途半端にならない。
 - open 時は WAL を 1フレームずつストリーミングで読み（WAL 全体をメモリへ載せない）、
   `Wal.foldCommitted` が「Commit まで到達した Batch」だけを再生する。
   コミット済み Entry は配列に溜めず、そのまま Memtable へ挿入する。
@@ -1377,6 +1388,11 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - データ行の中のバックスラッシュ・改行・CR は `\\` / `\n` / `\r` にエスケープして返す
   （`RykDb.Client` が読み取り時に元へ戻す）。
   TEXT に生の改行が入っていても 1応答 = 1行を保つ。
+- 応答は **ヘッダ + 行を 1行ずつ書き出す**（`sendRows`）。
+  結果全体を 1本の文字列へ結合しないので、
+  大結果で「行ごとの文字列 + 結合結果」の 2枚分のコピーが要らない。
+  行の書き出し中だけ `AutoFlush` を切り、最後に 1回だけ流す
+  （1行ごとの Flush を避ける）。
 
 | 応答                                       | 意味                                                             |
 | ------------------------------------------ | ---------------------------------------------------------------- |

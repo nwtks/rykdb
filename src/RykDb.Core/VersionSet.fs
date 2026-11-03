@@ -46,49 +46,59 @@ module internal FileMetaData =
 
     /// エントリ列を SSTable としてファイルへストリーム書きし、メタデータを返す。
     /// ブロックは 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
-    /// ビルド・書き出し・メタ算出が 1つの経路を通るので、「書いたバイト数」と Size が食い違うことが無い。
+    /// 入力の `seq` は 1回だけ列挙する
+    /// （memtable の flush が全件を配列にしないため）。
+    /// 失敗時（キー順違反・書き込み失敗・空の入力）は部分ファイルを消してからエラーを返す。
     let writeSstable
         (dir: string)
         (fileNumber: int64)
         (level: int)
         (bloomFalsePositiveRate: float)
-        (entries: SstEntry array)
+        (entries: seq<SstEntry>)
         =
-        let ofChunk fileNumber level size (entries: SstEntry array) =
+        let ofChunk info =
             {
                 FileNumber = fileNumber
                 Level = level
-                Smallest = entries.[0].Key
-                Largest = entries.[entries.Length - 1].Key
-                EntryCount = int64 entries.Length
-                Size = size
-                MaxSeqNo = SstEntry.maxSeqNo entries
+                Smallest = info.FirstKey
+                Largest = info.LastKey
+                EntryCount = info.EntryCount
+                Size = info.Size
+                MaxSeqNo = info.MaxSeqNo
             }
 
-        result {
-            if entries.Length = 0 then
-                return! err (DbError.internalError "Sstable: 空のエントリ列は書き出せません")
+        let target = path dir fileNumber
 
-            do! Sstable.validate entries
+        let deletePartial () =
+            protect (fun () ->
+                if System.IO.File.Exists target then
+                    System.IO.File.Delete target)
+            |> ignore
 
-            let! size =
-                protect (fun () ->
-                    use fs =
-                        new System.IO.FileStream(
-                            path dir fileNumber,
-                            System.IO.FileMode.Create,
-                            System.IO.FileAccess.Write,
-                            System.IO.FileShare.None
-                        )
+        let written =
+            protect (fun () ->
+                use fs =
+                    new System.IO.FileStream(
+                        target,
+                        System.IO.FileMode.Create,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.None
+                    )
 
-                    Sstable.writeTo fs bloomFalsePositiveRate entries
-                    >>= fun size ->
-                        fs.Flush true
-                        ret size)
-                >>= id
+                Sstable.writeTo fs bloomFalsePositiveRate entries
+                >>= fun info ->
+                    fs.Flush true
+                    ret info)
+            >>= id
 
-            return ofChunk fileNumber level size entries
-        }
+        match written with
+        | Error e ->
+            deletePartial ()
+            err e
+        | Ok info when info.EntryCount = 0L ->
+            deletePartial ()
+            err (DbError.internalError "Sstable: 空のエントリ列は書き出せません")
+        | Ok info -> ret (ofChunk info)
 
     /// このファイルが [key] を持ち得るか（Bloom より粗い判定）。
     let mightContain (key: byte array) (f: FileMetaData) =

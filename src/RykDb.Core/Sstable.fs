@@ -59,17 +59,6 @@ module internal SstEntry =
                 return! err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
         }
 
-    /// 配列を n 個ずつの塊に分ける（SSTable のブロック分けに使う）。
-    let splitInto (n: int) (items: 'a array) =
-        let rec chunk acc start =
-            if start >= items.Length then
-                List.rev acc
-            else
-                let len = max 1 (min n (items.Length - start))
-                chunk (Array.sub items start len :: acc) (start + len)
-
-        chunk [] 0
-
     /// 1エントリの符号化後のおおよそのバイト数。
     /// compaction の出力をバイト幅で分けるための見積りで、実際の SSTable サイズとは厳密には一致しない。
     let approximateBytes (e: SstEntry) =
@@ -79,10 +68,6 @@ module internal SstEntry =
             | Some vs -> Array.sumBy ValueCodec.approximateBytes vs + 4
 
         e.Key.Length + valueTotal
-
-    /// エントリ列に含まれる SeqNo の最大値（空なら 0）。
-    let maxSeqNo (items: SstEntry seq) =
-        items |> Seq.fold (fun acc e -> max acc e.SeqNo) 0UL
 
 /// SSTable の遅延走査。
 /// next を呼ぶまでブロックを読まない（読むのは 1個ずつ、読み終えたら次のブロックへ）。
@@ -285,6 +270,21 @@ type internal SstPartial =
         MaxSeqNo: uint64
     }
 
+/// `Sstable.writeTo` の結果。
+/// 入力が `seq` なので、書き出しに成功してから先頭・末尾のキーを数え直せない。
+/// `FileMetaData.writeSstable` がこれを `FileMetaData` に載せる。
+type internal SstWriteInfo =
+    {
+        /// 書き込んだバイト数
+        Size: int64
+        /// 先頭エントリのキー（0 件なら空配列）
+        FirstKey: byte array
+        /// 末尾エントリのキー（0 件なら空配列）
+        LastKey: byte array
+        EntryCount: int64
+        MaxSeqNo: uint64
+    }
+
 module internal Sstable =
     /// 1ブロックあたりのエントリ数。
     [<Literal>]
@@ -423,26 +423,16 @@ module internal Sstable =
                         }
         }
 
-    /// 入力がキー昇順・同一キーは SeqNo 降順に並んでいることを検証する。
-    let validate (entries: SstEntry array) =
-        let rec unorderedFrom i =
-            if i >= entries.Length then
-                false
-            elif SstEntry.compare entries.[i - 1] entries.[i] > 0 then
-                true
-            else
-                unorderedFrom (i + 1)
-
-        if entries.Length > 1 && unorderedFrom 1 then
-            err (DbError.internalError "Sstable: エントリがキー順に並んでいません")
-        else
-            ret ()
-
-    /// エントリ列を SSTable v5 として stream に書き出し、書き込んだバイト数を返す。
-    /// 入力の検証は呼び出し側が `validate` で済ませていること。
+    /// エントリ列を SSTable v5 として stream に書き出し、書き込んだ結果を返す。
+    /// <remarks>
+    /// 入力は `seq` で **1回だけ列挙する**（memtable の flush が全件を配列にしないため）。
+    /// キー順であることの検証は書き込みと同時に行う（失敗時は呼び出し側が部分ファイルを消す）。
     /// ブロックは 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
     /// I/O 例外は呼び出し側の `protect` が処理する。
-    let writeTo (stream: System.IO.Stream) (bloomFalsePositiveRate: float) (entries: SstEntry array) =
+    /// </remarks>
+    let writeTo (stream: System.IO.Stream) (bloomFalsePositiveRate: float) (entries: seq<SstEntry>) =
+        use e = entries.GetEnumerator()
+
         let sharedPrefix (prev: byte array) (key: byte array) =
             let n = min prev.Length key.Length
 
@@ -453,9 +443,8 @@ module internal Sstable =
 
             sharedLength 0
 
-        let encodeEntry (items: SstEntry array) i e =
-            let prev = if i = 0 then [||] else items.[i - 1].Key
-            let shared = sharedPrefix prev e.Key
+        let encodeEntry prevKey e =
+            let shared = sharedPrefix prevKey e.Key
             let tail = e.Key |> Array.skip shared
             let value = SstEntry.encodeValue e
 
@@ -475,7 +464,10 @@ module internal Sstable =
                 copy body block (i + 1) (pos + b.Length)
 
         let buildBlock items =
-            let body = items |> Array.mapi (encodeEntry items)
+            let body =
+                items
+                |> Array.mapi (fun i e -> encodeEntry (if i = 0 then [||] else items.[i - 1].Key) e)
+
             let bodyLength = body |> Array.sumBy (fun b -> b.Length)
             let block = Array.zeroCreate<byte>(bodyLength + 4)
             copy body block 0 0
@@ -495,45 +487,17 @@ module internal Sstable =
             else
                 stream.Write(data, 0, data.Length)
 
-                ret (
-                    int nextOffset,
+                let entry =
                     {
                         LastKey = items.[items.Length - 1].Key
                         Offset = offset
                         Length = data.Length
                     }
-                    :: indexEntries
-                )
 
-        let rec writeBlocks (blocks: SstEntry array array) index offset indexEntries =
-            if index >= blocks.Length then
-                ret (offset, List.rev indexEntries)
-            else
-                match writeBlock blocks.[index] offset indexEntries with
-                | Error e -> err e
-                | Ok(nextOffset, entries') -> writeBlocks blocks (index + 1) nextOffset entries'
-
-        let metaBytesOf =
-            function
-            | [||] -> [||]
-            | entries ->
-                Writer.build
-                    [
-                        Writer.lengthPrefixed entries.[0].Key
-                        Writer.lengthPrefixed entries.[entries.Length - 1].Key
-                    ]
-
-        let bloomBytesOf bloomFalsePositiveRate =
-            function
-            | [||] -> [||]
-            | entries ->
-                entries
-                |> Array.map _.Key
-                |> BloomFilter.ofKeys entries.Length bloomFalsePositiveRate
-                |> BloomFilter.serialize
+                ret (int nextOffset, entry :: indexEntries)
 
         let indexBytesOf =
-            Array.collect (fun e ->
+            Array.collect (fun (e: SstIndexEntry) ->
                 [|
                     Writer.lengthPrefixed e.LastKey
                     Writer.int64LE (int64 e.Offset)
@@ -542,54 +506,123 @@ module internal Sstable =
             >> Array.toList
             >> Writer.build
 
-        result {
-            let blocks = SstEntry.splitInto EntriesPerBlock entries |> List.toArray
-            let! dataSize, indexEntries = writeBlocks blocks 0 0 []
-            let metaOff = dataSize
-            let metaBytes = metaBytesOf entries
-            let bloomOff = metaOff + metaBytes.Length
-            let bloomBytes = bloomBytesOf bloomFalsePositiveRate entries
-            let indexOff = bloomOff + bloomBytes.Length
-            let indexBytes = indexBytesOf (List.toArray indexEntries)
+        let finish
+            firstKey
+            lastKey
+            maxSeqNo
+            count
+            (keys: ResizeArray<byte array>)
+            (block: ResizeArray<SstEntry>)
+            offset
+            indexEntries
+            =
+            (if block.Count = 0 then
+                 ret (offset, indexEntries)
+             else
+                 writeBlock (block.ToArray()) offset indexEntries)
+            >>= fun (dataSize, indexEntries) ->
+                let metaBytes =
+                    match firstKey, lastKey with
+                    | Some first, Some last -> Writer.build [ Writer.lengthPrefixed first; Writer.lengthPrefixed last ]
+                    | _ -> [||]
 
-            if int64 indexOff + int64 indexBytes.Length > int64 System.Int32.MaxValue then
-                return! err (DbError.internalError "Sstable: ファイルが大きすぎます")
+                let bloomOff = dataSize + metaBytes.Length
+
+                let bloomBytes =
+                    if count = 0L then
+                        [||]
+                    else
+                        BloomFilter.ofKeys (int count) bloomFalsePositiveRate (keys.ToArray())
+                        |> BloomFilter.serialize
+
+                let indexOff = bloomOff + bloomBytes.Length
+                let indexBytes = indexBytesOf (List.rev indexEntries |> List.toArray)
+
+                if int64 indexOff + int64 indexBytes.Length > int64 System.Int32.MaxValue then
+                    err (DbError.internalError "Sstable: ファイルが大きすぎます")
+                else
+                    let metadataChecksum =
+                        Hashing.checksumChunks [| metaBytes; bloomBytes; indexBytes |]
+
+                    stream.Write(metaBytes, 0, metaBytes.Length)
+                    stream.Write(bloomBytes, 0, bloomBytes.Length)
+                    stream.Write(indexBytes, 0, indexBytes.Length)
+
+                    let footer =
+                        encodeFooter
+                            maxSeqNo
+                            indexOff
+                            indexBytes.Length
+                            bloomOff
+                            bloomBytes.Length
+                            dataSize
+                            metaBytes.Length
+                            (int count)
+                            metadataChecksum
+
+                    stream.Write(footer, 0, footer.Length)
+
+                    ret
+                        {
+                            Size = int64 (indexOff + indexBytes.Length + footer.Length)
+                            FirstKey = defaultArg firstKey [||]
+                            LastKey = defaultArg lastKey [||]
+                            EntryCount = count
+                            MaxSeqNo = maxSeqNo
+                        }
+
+        let rec loop
+            firstKey
+            lastKey
+            maxSeqNo
+            count
+            (keys: ResizeArray<byte array>)
+            (block: ResizeArray<SstEntry>)
+            offset
+            indexEntries
+            prev
+            =
+            if block.Count >= EntriesPerBlock then
+                match writeBlock (block.ToArray()) offset indexEntries with
+                | Error e -> err e
+                | Ok(nextOffset, indexEntries') ->
+                    loop firstKey lastKey maxSeqNo count keys (ResizeArray<SstEntry>()) nextOffset indexEntries' prev
+            elif e.MoveNext() then
+                let item = e.Current
+
+                match prev with
+                | Some p when SstEntry.compare p item > 0 -> err (DbError.internalError "Sstable: エントリがキー順に並んでいません")
+                | _ ->
+                    keys.Add item.Key
+                    block.Add item
+
+                    loop
+                        (match firstKey with
+                         | None -> Some item.Key
+                         | _ -> firstKey)
+                        (Some item.Key)
+                        (max maxSeqNo item.SeqNo)
+                        (count + 1L)
+                        keys
+                        block
+                        offset
+                        indexEntries
+                        (Some item)
             else
-                let metadataChecksum =
-                    Hashing.checksumChunks [| metaBytes; bloomBytes; indexBytes |]
+                finish firstKey lastKey maxSeqNo count keys block offset indexEntries
 
-                stream.Write(metaBytes, 0, metaBytes.Length)
-                stream.Write(bloomBytes, 0, bloomBytes.Length)
-                stream.Write(indexBytes, 0, indexBytes.Length)
-
-                let footer =
-                    encodeFooter
-                        (SstEntry.maxSeqNo entries)
-                        indexOff
-                        indexBytes.Length
-                        bloomOff
-                        bloomBytes.Length
-                        metaOff
-                        metaBytes.Length
-                        entries.Length
-                        metadataChecksum
-
-                stream.Write(footer, 0, footer.Length)
-                return int64 (indexOff + indexBytes.Length + footer.Length)
-        }
+        loop None None 0UL 0L (ResizeArray<byte array>()) (ResizeArray<SstEntry>()) 0 [] None
 
     /// エントリ列から SSTable のバイナリを作る（テスト・小規模用途）。
     /// 通常の書き込みは `FileMetaData.writeSstable` がストリームへ直接書く。
     /// 入力はキー昇順・同一キーは SeqNo 降順に並んでいる必要がある（検証する）。
     let build (bloomFalsePositiveRate: float) (entries: SstEntry array) =
-        validate entries
-        >>= fun () ->
-            protect (fun () ->
-                use stream = new System.IO.MemoryStream()
+        protect (fun () ->
+            use stream = new System.IO.MemoryStream()
 
-                writeTo stream bloomFalsePositiveRate entries
-                |> Result.map (fun _ -> stream.ToArray()))
-            >>= id
+            writeTo stream bloomFalsePositiveRate entries
+            |> Result.map (fun _ -> stream.ToArray()))
+        >>= id
 
     /// Cursor から終端まで 1件ずつ読み出して配列にまとめる。
     /// step は「読むたびに変わる状態」（キーの接頭辞共有など）を

@@ -41,26 +41,42 @@ let private escapeLine (s: string) =
 
     sb.ToString()
 
-let private encode (columns: string array) (rows: SqlValue array array) =
-    let columnsText =
-        if columns.Length = 0 then
-            None
-        else
-            Some(System.String.Join(",", columns |> Array.map System.Uri.EscapeDataString))
-
+/// 応答を 1行ずつ書き出す。
+/// 結果全体を 1本の文字列へ結合しないので、
+/// 大結果で「行ごとの文字列 + 結合結果」の 2枚分のコピーが要らない。
+/// 戻り値は「書き出せたか」（送信失敗で接続を閉じるため）。
+let private sendRows (writer: System.IO.StreamWriter) (columns: string array) (rows: SqlValue array array) =
     let header =
-        match columnsText with
-        | None -> sprintf "%s %d" OkTag rows.Length
-        | Some text -> sprintf "%s %d\t%s" OkTag rows.Length text
+        if columns.Length = 0 then
+            sprintf "%s %d" OkTag rows.Length
+        else
+            sprintf
+                "%s %d\t%s"
+                OkTag
+                rows.Length
+                (System.String.Join(",", columns |> Array.map System.Uri.EscapeDataString))
 
-    if rows.Length = 0 then
-        header
-    else
-        let body =
-            rows
-            |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat "," >> escapeLine)
+    try
+        writer.AutoFlush <- false
 
-        System.String.Join("\n", Array.append [| header |] body)
+        try
+            writer.WriteLine header
+
+            if rows.Length > 0 then
+                for row in rows do
+                    row
+                    |> Array.map SqlLiteral.toSqlLiteral
+                    |> String.concat ","
+                    |> escapeLine
+                    |> writer.WriteLine
+
+            writer.Flush()
+        finally
+            writer.AutoFlush <- true
+
+        true
+    with _ ->
+        false
 
 let private handleClient (onLog: string -> unit) (db: Database) (client: System.Net.Sockets.TcpClient) =
     use stream = client.GetStream()
@@ -104,22 +120,18 @@ let private handleClient (onLog: string -> unit) (db: Database) (client: System.
                 | ".tables" ->
                     let names = current.TableNames()
 
-                    let body =
-                        if List.isEmpty names then
-                            sprintf "%s 0" OkTag
-                        else
-                            names
-                            |> List.map (fun n -> [| SqlValue.Text n |])
-                            |> List.toArray
-                            |> encode [| "tables" |]
+                    if List.isEmpty names then
+                        running <- send (sprintf "%s 0" OkTag)
+                    else
+                        let rows = names |> List.map (fun n -> [| SqlValue.Text n |]) |> List.toArray
 
-                    running <- send body
+                        running <- sendRows writer [| "tables" |] rows
                 | _ ->
                     match current.Execute sql with
                     | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
                     | Ok(next, result) ->
                         current <- next
-                        running <- encode result.Columns result.Rows |> send
+                        running <- sendRows writer result.Columns result.Rows
 
     if current.InTransaction then
         match current.Rollback() with

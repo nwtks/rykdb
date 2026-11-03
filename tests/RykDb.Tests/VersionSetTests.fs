@@ -43,7 +43,9 @@ let ``FileMetaData.writeSstable: キー順でない入力はエラー`` () =
                 SstEntry.make (intKey 1) 2UL (Some [| SqlValue.Int 1L |])
             |]
 
-        expectErrorKind ErrorKind.InternalError "キー順でない入力はエラーになるはず" (FileMetaData.writeSstable dir 1L 0 0.01 bad))
+        expectErrorKind ErrorKind.InternalError "キー順でない入力はエラーになるはず" (FileMetaData.writeSstable dir 1L 0 0.01 bad)
+        // 失敗時に部分ファイルを残さない（次の open で孤児扱いされるのを防ぐ）
+        Assert.False(System.IO.File.Exists(FileMetaData.path dir 1L)))
 
 [<Fact>]
 let ``FileMetaData.writeSstable: 書き込み失敗は IoError`` () =

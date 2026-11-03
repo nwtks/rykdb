@@ -63,8 +63,8 @@ module internal Op =
         rowsFrom ()
 
     /// 1行取り出す。
-    let next (op: Op) =
-        match op with
+    let next =
+        function
         | Op.Done -> ret None
         | Op.Step(row, nxt) -> ret (Some(row, nxt))
         | Op.Compute f -> f ()
@@ -72,7 +72,7 @@ module internal Op =
     /// ソースの次の 1行を引き出して継続に渡す。
     /// 継続は「行と残りの Op」を受け取り、返した Result をそのまま返す。
     /// 返した「その行の次」の Op が演算子の残りになる。
-    let pull (src: Op) (cont: SqlValue array -> Op -> Result<(SqlValue array * Op) option, DbError>) =
+    let pull (cont: SqlValue array -> Op -> Result<(SqlValue array * Op) option, DbError>) (src: Op) =
         Op.Compute(fun () ->
             next src
             >>= function
@@ -83,22 +83,24 @@ module internal Op =
     /// 失敗したら打切って Error。
     /// 変換後の行の「次」は map を通した残りにする
     /// （nxt をそのまま渡すと変換が 1行だけに効き、次から元に戻る）。
-    let rec map (f: SqlValue array -> Result<SqlValue array, DbError>) (src: Op) =
-        pull src (fun row nxt -> f row |> Result.map (fun r -> Some(r, map f nxt)))
+    let rec map (f: SqlValue array -> Result<SqlValue array, DbError>) =
+        pull (fun row nxt -> f row |> Result.map (fun r -> Some(r, map f nxt)))
 
     /// 述語で弾く。
     /// 偽の行は読み飛ばして次へ進む。
     /// p row >>= function で分岐する
     /// （if/then/else だと Result の短絡で Some(row, nxt) だけが残ることがある）。
-    let filter (p: SqlValue array -> Result<bool, DbError>) (src: Op) =
+    let filter (p: SqlValue array -> Result<bool, DbError>) =
         let rec seekMatch cur =
-            pull cur (fun row nxt ->
-                match p row with
-                | Ok true -> ret (Some(row, seekMatch nxt))
-                | Ok false -> next (seekMatch nxt)
-                | Error e -> err e)
+            pull
+                (fun row nxt ->
+                    match p row with
+                    | Ok true -> ret (Some(row, seekMatch nxt))
+                    | Ok false -> next (seekMatch nxt)
+                    | Error e -> err e)
+                cur
 
-        seekMatch src
+        seekMatch
 
     /// 先頭 n 行だけ。
     /// n <= 0 は 0 行（`LIMIT 0` は 0 行）。
@@ -107,17 +109,17 @@ module internal Op =
         if n <= 0 then
             Op.Done
         else
-            pull src (fun row nxt -> ret (Some(row, take (n - 1) nxt)))
+            pull (fun row nxt -> ret (Some(row, take (n - 1) nxt))) src
 
     /// 先頭 n行を読み飛ばす。
-    let skip (n: int) (src: Op) =
+    let skip =
         let rec drop left cur =
             if left <= 0 then
                 cur
             else
-                pull cur (fun _ nxt -> next (drop (left - 1) nxt))
+                pull (fun _ nxt -> next (drop (left - 1) nxt)) cur
 
-        drop n src
+        drop
 
     /// 全行を配列に materialize する。
     let toArray (op: Op) =
