@@ -1774,24 +1774,197 @@ let ``SqlReference: SQL の BEGIN と ROLLBACK で書き込みを取り消す`` 
         Assert.Equal<int64 array>([| 1L; 3L |], committed.Rows |> Array.map (fun r -> asInt r.[0])))
 
 [<Fact>]
+let ``SqlReference: サブクエリ（スカラー・IN・EXISTS）`` () =
+    withDb "subquery" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"
+
+        // スカラーサブクエリ（SELECT 項目 / WHERE）
+        let _, rows =
+            ok (
+                db2.Execute
+                    "SELECT id, (SELECT MAX(v) FROM t) AS mx FROM t WHERE v > (SELECT AVG(v) FROM t) ORDER BY id"
+            )
+
+        Assert.Equal<int>(1, rows.Rows.Length)
+        Assert.Equal<int64>(3L, asInt rows.Rows.[0].[0])
+        Assert.Equal<int64>(30L, asInt rows.Rows.[0].[1])
+
+        // 0 行のスカラーサブクエリは NULL
+        let _, none =
+            ok (db2.Execute "SELECT id, (SELECT v FROM t WHERE id = 99) AS x FROM t WHERE id = 1")
+
+        Assert.True(SqlValue.isNull none.Rows.[0].[1])
+
+        // IN / NOT IN
+        let _, inRows =
+            ok (db2.Execute "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE v >= 20) ORDER BY id")
+
+        Assert.Equal<int>(2, inRows.Rows.Length)
+        Assert.Equal<int64>(2L, asInt inRows.Rows.[0].[0])
+
+        let _, emptyIn =
+            ok (db2.Execute "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE id = 99)")
+
+        Assert.Equal<int>(0, emptyIn.Rows.Length)
+
+        let _, emptyNotIn =
+            ok (db2.Execute "SELECT id FROM t WHERE id NOT IN (SELECT id FROM t WHERE id = 99) ORDER BY id")
+
+        Assert.Equal<int>(3, emptyNotIn.Rows.Length)
+
+        // NULL を含む IN / NOT IN は UNKNOWN（どちらも 0 行）
+        let _, nullIn = ok (db2.Execute "SELECT id FROM t WHERE id IN (SELECT NULL FROM t)")
+        Assert.Equal<int>(0, nullIn.Rows.Length)
+
+        let _, nullNotIn =
+            ok (db2.Execute "SELECT id FROM t WHERE id NOT IN (SELECT NULL FROM t)")
+
+        Assert.Equal<int>(0, nullNotIn.Rows.Length)
+
+        // EXISTS / NOT EXISTS
+        let _, exists =
+            ok (db2.Execute "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE v > 25) ORDER BY id")
+
+        Assert.Equal<int>(3, exists.Rows.Length)
+
+        let _, notExists =
+            ok (db2.Execute "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM t WHERE v > 25)")
+
+        Assert.Equal<int>(0, notExists.Rows.Length)
+
+        let _, missing =
+            ok (db2.Execute "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE id = 99)")
+
+        Assert.Equal<int>(0, missing.Rows.Length)
+
+        let _, notMissing =
+            ok (db2.Execute "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM t WHERE id = 99)")
+
+        Assert.Equal<int>(3, notMissing.Rows.Length)
+
+        // 入れ子のサブクエリ
+        let _, nested =
+            ok (
+                db2.Execute
+                    "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE v > (SELECT MIN(v) FROM t)) ORDER BY id"
+            )
+
+        Assert.Equal<int>(2, nested.Rows.Length)
+        Assert.Equal<int64>(2L, asInt nested.Rows.[0].[0])
+
+        // HAVING / JOIN の ON でも使える
+        let _, having =
+            ok (db2.Execute "SELECT id FROM t GROUP BY id HAVING id > (SELECT MIN(id) FROM t) ORDER BY id")
+
+        Assert.Equal<int>(2, having.Rows.Length)
+        Assert.Equal<int64>(2L, asInt having.Rows.[0].[0])
+
+        let _, joined =
+            ok (
+                db2.Execute
+                    "SELECT a.id FROM t AS a JOIN t AS b ON a.id = b.id AND EXISTS (SELECT 1 FROM t WHERE v > 25) ORDER BY a.id"
+            )
+
+        Assert.Equal<int>(3, joined.Rows.Length)
+
+        // DML 内のサブクエリ
+        let db3 = exec db2 "UPDATE t SET v = v + (SELECT MIN(v) FROM t) WHERE id = 1"
+        let _, updated = ok (db3.Execute "SELECT v FROM t WHERE id = 1")
+        Assert.Equal<int64>(20L, asInt updated.Rows.[0].[0])
+
+        let db4 = exec db3 "INSERT INTO t VALUES (4, (SELECT MAX(v) FROM t))"
+        let _, inserted = ok (db4.Execute "SELECT v FROM t WHERE id = 4")
+        Assert.Equal<int64>(30L, asInt inserted.Rows.[0].[0])
+
+        let db5 = exec db4 "DELETE FROM t WHERE id IN (SELECT id FROM t WHERE v >= 30)"
+        let _, count = ok (db5.Execute "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: サブクエリの未対応形とエラー`` () =
+    withDb "subquery-errors" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20)"
+
+        // スカラーサブクエリが 2 行以上
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "2 行以上のスカラーサブクエリ"
+            (db2.Execute "SELECT id, (SELECT v FROM t) FROM t")
+
+        // 1 列でないサブクエリ
+        expectErrorKind
+            ErrorKind.TypeError
+            "2 列のスカラーサブクエリ"
+            (db2.Execute "SELECT id, (SELECT id, v FROM t WHERE id = 1) FROM t")
+
+        expectErrorKind
+            ErrorKind.TypeError
+            "2 列の IN サブクエリ"
+            (db2.Execute "SELECT id FROM t WHERE id IN (SELECT id, v FROM t)")
+
+        // 相関サブクエリは未対応（外側の列は解決できない）
+        expectErrorKind
+            ErrorKind.NameError
+            "相関サブクエリ"
+            (db2.Execute "SELECT id FROM t AS o WHERE EXISTS (SELECT 1 FROM t WHERE t.id = o.id)")
+
+        // FROM の派生テーブルは未対応
+        expectErrorKind ErrorKind.SyntaxError "派生テーブル" (db2.Execute "SELECT id FROM (SELECT id FROM t) x"))
+
+[<Fact>]
+let ``SqlReference: 集約結果は DATE の型を保つ`` () =
+    // 集約後の値を Literal に落とすと DATE / TIMESTAMP / UUID が TEXT になり、
+    // 外側の DATE 列と比較できなくなる（サブクエリで顕在化した）。
+    withDb "agg-date" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE d (id INTEGER PRIMARY KEY, dt DATE)"
+        let db2 = exec db1 "INSERT INTO d VALUES (1,'2026-11-03'),(2,'2026-11-04')"
+
+        let _, rows = ok (db2.Execute "SELECT id FROM d WHERE dt = (SELECT MAX(dt) FROM d)")
+
+        Assert.Equal<int>(1, rows.Rows.Length)
+        Assert.Equal<int64>(2L, asInt rows.Rows.[0].[0])
+
+        // GROUP BY のキーも型を保つ
+        let _, grouped =
+            ok (db2.Execute "SELECT dt, COUNT(*) FROM d GROUP BY dt ORDER BY dt")
+
+        match grouped.Rows.[0].[0] with
+        | SqlValue.Date _ -> ()
+        | v -> Assert.Fail(sprintf "DATE ではありません: %A" v))
+
+[<Fact>]
+let ``SqlReference: 深いサブクエリの入れ子（上限内）は実行できる`` () =
+    // `Plan.planSelect` / `resolveSelect` / `resolveExpr` / `resolveLeaf` は相互再帰する。
+    // 深さは式の上限（MaxExpressionDepth = 200。1 段で複数単位を消費する）で頭打ちなので、
+    // 上限内の入れ子はスタックを食わずに実行できることを固定しておく。
+    withDb "subquery-depth" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10)"
+
+        let nested depth =
+            [ 1..depth ]
+            |> List.fold (fun e _ -> sprintf "(SELECT %s FROM t WHERE id = 1)" e) "v"
+
+        let _, rows =
+            ok (db2.Execute(sprintf "SELECT %s AS x FROM t WHERE id = 1" (nested 90)))
+
+        Assert.Equal<int>(1, rows.Rows.Length)
+        Assert.Equal<int64>(10L, asInt rows.Rows.[0].[0])
+
+        // 上限を超えると StackOverflow ではなく SyntaxError
+        expectErrorKind ErrorKind.SyntaxError "深すぎるサブクエリ" (db2.Execute(sprintf "SELECT %s AS x FROM t" (nested 400))))
+
+[<Fact>]
 let ``SqlReference: 未対応の構文は明示的な SyntaxError`` () =
     // §14「構文が未対応のもの」。集合演算と RIGHT / FULL JOIN は ParserTests が担当。
     withDb "unsupported-syntax" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a')"
 
-        // サブクエリ / CTE / ウィンドウ関数
+        // サブクエリ（式の中）は §7.9 で対応。FROM の派生テーブルは未対応のまま。
         expectErrorKind ErrorKind.SyntaxError "FROM のサブクエリ" (db2.Execute "SELECT id FROM (SELECT id FROM t) x")
-
-        expectErrorKind
-            ErrorKind.SyntaxError
-            "IN (SELECT ...)"
-            (db2.Execute "SELECT id FROM t WHERE id IN (SELECT id FROM t)")
-
-        expectErrorKind
-            ErrorKind.SyntaxError
-            "EXISTS (SELECT ...)"
-            (db2.Execute "SELECT id FROM t WHERE EXISTS (SELECT id FROM t)")
 
         expectErrorKind ErrorKind.SyntaxError "WITH 句" (db2.Execute "WITH c AS (SELECT id FROM t) SELECT id FROM c")
 

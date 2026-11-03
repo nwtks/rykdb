@@ -131,6 +131,18 @@ type internal BinaryOp =
         | Or -> "OR"
         | Like -> "LIKE"
 
+[<RequireQualifiedAccess>]
+type internal JoinKind =
+    | Inner
+    | Left
+
+type internal TableRef = { Name: string; Alias: string option }
+
+[<RequireQualifiedAccess>]
+type internal SortDirection =
+    | Ascending
+    | Descending
+
 /// 式。
 /// 束縛後は列参照が解決済みになる。
 [<RequireQualifiedAccess; NoComparison; NoEquality>]
@@ -171,6 +183,128 @@ type internal Expr =
     | Star
     /// `t.*`
     | QualifiedStar of string
+    /// 実行時の値（サブクエリの結果を式へ埋め込むときに使う）。
+    /// リテラルと違い DATE / TIMESTAMP / UUID も型を保ったまま持てる。
+    | Value of SqlValue
+    /// スカラーサブクエリ `(SELECT ...)`。
+    /// 実行計画の段階で 1 つの値へ置き換わる。
+    | Subquery of SelectStatement
+    /// `EXISTS (SELECT ...)`。
+    /// 実行計画の段階で TRUE / FALSE へ置き換わる。
+    | Exists of SelectStatement
+    /// `x [NOT] IN (SELECT ...)`。
+    /// 実行計画の段階で IN の要素リストへ展開される。
+    | InSubquery of Expr * SelectStatement * bool
+
+and internal JoinClause =
+    {
+        Kind: JoinKind
+        Table: TableRef
+        On: Expr
+    }
+
+and internal SortKey =
+    {
+        Expression: Expr
+        Direction: SortDirection
+    }
+
+and internal SelectItem =
+    {
+        Expression: Expr
+        Alias: string option
+    }
+
+and internal ColumnConstraint =
+    {
+        NotNull: bool
+        PrimaryKey: bool
+        Unique: bool
+        Default: Expr option
+    }
+
+    static member Empty =
+        {
+            NotNull = false
+            PrimaryKey = false
+            Unique = false
+            Default = None
+        }
+
+and internal ColumnDefinition =
+    {
+        Name: string
+        DataType: DataType
+        /// 宣言された型引数（`VARCHAR(32)` の 32 など）。
+        /// RykDb は長さ制限に使わないため、カタログには保存しない（再オープン後は空）。
+        TypeArguments: (string * int) list
+        Constraint: ColumnConstraint
+    }
+
+and [<RequireQualifiedAccess>] internal TableConstraint =
+    | PrimaryKeyColumns of string list
+    | UniqueColumns of string list
+
+and internal CreateTable =
+    {
+        Name: string
+        IfNotExists: bool
+        Columns: ColumnDefinition list
+        Constraints: TableConstraint list
+    }
+
+and internal InsertStatement =
+    {
+        Table: TableRef
+        Columns: string list option
+        /// `[ [] ]` は `DEFAULT VALUES`（全列を既定値で埋める）。
+        Rows: Expr list list
+    }
+
+and internal UpdateStatement =
+    {
+        Table: TableRef
+        Assignments: (string * Expr) list
+        Where: Expr option
+    }
+
+and internal DeleteStatement = { Table: TableRef; Where: Expr option }
+
+and internal SelectStatement =
+    {
+        Distinct: bool
+        Items: SelectItem list
+        From: TableRef option
+        Joins: JoinClause list
+        Where: Expr option
+        GroupBy: Expr list
+        Having: Expr option
+        OrderBy: SortKey list
+        Limit: Expr option
+        Offset: Expr option
+    }
+
+and internal CreateIndex =
+    {
+        Name: string
+        Table: string
+        Columns: string list
+        Unique: bool
+        IfNotExists: bool
+    }
+
+and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
+    | Select of SelectStatement
+    | Insert of InsertStatement
+    | Update of UpdateStatement
+    | Delete of DeleteStatement
+    | CreateTable of CreateTable
+    | DropTable of string * bool
+    | CreateIndex of CreateIndex
+    | DropIndex of string * bool
+    | Begin
+    | Commit
+    | Rollback
 
 module internal Expr =
     /// 直接の子式をリストで返す（走査順は左から右）。
@@ -181,13 +315,17 @@ module internal Expr =
         | Expr.Column _
         | Expr.Name _
         | Expr.Star
-        | Expr.QualifiedStar _ -> []
+        | Expr.QualifiedStar _
+        | Expr.Value _
+        | Expr.Subquery _
+        | Expr.Exists _ -> []
         | Expr.Unary(_, x) -> [ x ]
         | Expr.Binary(_, a, b) -> [ a; b ]
         | Expr.IsNull(x, _) -> [ x ]
         | Expr.IsTruth(x, _, _) -> [ x ]
         | Expr.Between(x, a, b, _) -> [ x; a; b ]
         | Expr.InList(x, xs, _) -> x :: xs
+        | Expr.InSubquery(x, _, _) -> [ x ]
         | Expr.Like(x, p, _, esc) -> x :: p :: Option.toList esc
         | Expr.Case(branches, elseE) -> (branches |> List.collect (fun (w, t) -> [ w; t ])) @ (elseE |> Option.toList)
         | Expr.FuncCall(_, args) -> args
@@ -218,13 +356,22 @@ module internal Expr =
         | Visit of Expr
         | Arrive of Expr
 
-    /// 葉の書き換え関数で式を組み直す（末尾再帰。式の深さに依存せずスタックは一定）。
-    let rewrite (rewriteLeaf: Expr -> Expr) (root: Expr) =
+    /// 葉の書き換え関数で式を組み直す（CPS 版）。
+    /// <remarks>
+    /// `rewriteLeaf` は「書き換えた式を受け取る継続」を取る。
+    /// サブクエリの実行のように、葉の書き換えが別の相互再帰を経て値を返す場合でも、
+    /// 継続を末尾で呼ぶ限りスタックは式の深さに依存しない。
+    /// 組み立ては `plugChildren`（`children` の逆変換）に任せる。
+    /// </remarks>
+    let rewriteWithC
+        (rewriteLeaf: Expr -> (Expr -> Result<'r, DbError>) -> Result<'r, DbError>)
+        (k: Expr -> Result<'r, DbError>)
+        (root: Expr)
+        : Result<'r, DbError> =
         let miss kids =
-            err (
-                sprintf "plugChildren: 子の個数が合いません（%d 個）" (List.length kids)
-                |> DbError.internalError
-            )
+            sprintf "plugChildren: 子の個数が合いません（%d 個）" (List.length kids)
+            |> DbError.internalError
+            |> err
 
         let rec toPairs acc =
             function
@@ -241,6 +388,10 @@ module internal Expr =
                 | Expr.Name _, [] -> ret e
                 | Expr.Star, [] -> ret e
                 | Expr.QualifiedStar _, [] -> ret e
+                | Expr.Value _, [] -> ret e
+                | Expr.Subquery _, [] -> ret e
+                | Expr.Exists _, [] -> ret e
+                | Expr.InSubquery(_, sel, neg), [ x ] -> ret (Expr.InSubquery(x, sel, neg))
                 | Expr.Unary(op, _), [ x ] -> ret (Expr.Unary(op, x))
                 | Expr.Binary(op, _, _), [ a; b ] -> ret (Expr.Binary(op, a, b))
                 | Expr.IsNull(_, neg), [ x ] -> ret (Expr.IsNull(x, neg))
@@ -260,19 +411,16 @@ module internal Expr =
                 | Expr.AggCall(f, star, _), [ x ] -> ret (Expr.AggCall(f, star, x))
                 | _ -> miss kids
 
-        let rec rewriteLoop frames =
+        let rec loop (frames: RewriteFrame list) =
             function
             | Visit x ->
-                let x2 = rewriteLeaf x
-
-                match children x2 with
-                | [] -> Arrive x2 |> rewriteLoop frames
-                | c :: rest ->
-                    let frame = { Parent = x2; Done = []; Rest = rest }
-                    Visit c |> rewriteLoop (frame :: frames)
+                rewriteLeaf x (fun x2 ->
+                    match children x2 with
+                    | [] -> loop frames (Arrive x2)
+                    | c :: rest -> loop ({ Parent = x2; Done = []; Rest = rest } :: frames) (Visit c))
             | Arrive v ->
                 match frames with
-                | [] -> ret v
+                | [] -> k v
                 | frame :: more ->
                     match frame.Rest with
                     | c :: rest ->
@@ -282,13 +430,26 @@ module internal Expr =
                                 Rest = rest
                             }
 
-                        Visit c |> rewriteLoop (next :: more)
+                        loop (next :: more) (Visit c)
                     | [] ->
                         match plugChildren (v :: frame.Done |> List.rev) frame.Parent with
                         | Error er -> err er
-                        | Ok parent -> Arrive parent |> rewriteLoop more
+                        | Ok parent -> loop more (Arrive parent)
 
-        Visit root |> rewriteLoop []
+        loop [] (Visit root)
+
+    /// 葉の書き換え関数で式を組み直す（末尾再帰。式の深さに依存せずスタックは一定）。
+    /// 葉の書き換えが失敗する版（束縛・集約の読み替えなど）。
+    let private rewriteWith (rewriteLeaf: Expr -> Result<Expr, DbError>) =
+        rewriteWithC
+            (fun e k ->
+                match rewriteLeaf e with
+                | Error er -> err er
+                | Ok x -> k x)
+            ret
+
+    /// 葉の書き換え関数で式を組み直す。
+    let rewrite (rewriteLeaf: Expr -> Expr) = rewriteWith (rewriteLeaf >> ret)
 
     /// 式木を明示スタックで pre-order にたどり、各ノードについて状態を畳み込む。
     /// 走査順は「根 → 子を左から右へ」。
@@ -465,130 +626,21 @@ module internal Expr =
                         put "DISTINCT "
 
                     sub x [ text ")" ] :: next |> writeSteps
+                | Expr.Value v ->
+                    put (SqlLiteral.toSqlLiteral v)
+                    writeSteps next
+                | Expr.Subquery _ ->
+                    put "(subquery)"
+                    writeSteps next
+                | Expr.Exists _ ->
+                    put "EXISTS (subquery)"
+                    writeSteps next
+                | Expr.InSubquery(x, _, neg) ->
+                    put "("
+
+                    sub x [ text (if neg then " NOT IN (subquery))" else " IN (subquery))") ]
+                    :: next
+                    |> writeSteps
 
         writeSteps [ Sub(e, []) ]
         sb.ToString()
-
-[<RequireQualifiedAccess>]
-type internal JoinKind =
-    | Inner
-    | Left
-
-type internal TableRef = { Name: string; Alias: string option }
-
-type internal JoinClause =
-    {
-        Kind: JoinKind
-        Table: TableRef
-        On: Expr
-    }
-
-[<RequireQualifiedAccess>]
-type internal SortDirection =
-    | Ascending
-    | Descending
-
-type internal SortKey =
-    {
-        Expression: Expr
-        Direction: SortDirection
-    }
-
-type internal SelectItem =
-    {
-        Expression: Expr
-        Alias: string option
-    }
-
-type internal ColumnConstraint =
-    {
-        NotNull: bool
-        PrimaryKey: bool
-        Unique: bool
-        Default: Expr option
-    }
-
-    static member Empty =
-        {
-            NotNull = false
-            PrimaryKey = false
-            Unique = false
-            Default = None
-        }
-
-type internal ColumnDefinition =
-    {
-        Name: string
-        DataType: DataType
-        /// 宣言された型引数（`VARCHAR(32)` の 32 など）。
-        /// RykDb は長さ制限に使わないため、カタログには保存しない（再オープン後は空）。
-        TypeArguments: (string * int) list
-        Constraint: ColumnConstraint
-    }
-
-[<RequireQualifiedAccess>]
-type internal TableConstraint =
-    | PrimaryKeyColumns of string list
-    | UniqueColumns of string list
-
-type internal CreateTable =
-    {
-        Name: string
-        IfNotExists: bool
-        Columns: ColumnDefinition list
-        Constraints: TableConstraint list
-    }
-
-type internal InsertStatement =
-    {
-        Table: TableRef
-        Columns: string list option
-        /// `[ [] ]` は `DEFAULT VALUES`（全列を既定値で埋める）。
-        Rows: Expr list list
-    }
-
-type internal UpdateStatement =
-    {
-        Table: TableRef
-        Assignments: (string * Expr) list
-        Where: Expr option
-    }
-
-type internal DeleteStatement = { Table: TableRef; Where: Expr option }
-
-type internal SelectStatement =
-    {
-        Distinct: bool
-        Items: SelectItem list
-        From: TableRef option
-        Joins: JoinClause list
-        Where: Expr option
-        GroupBy: Expr list
-        Having: Expr option
-        OrderBy: SortKey list
-        Limit: Expr option
-        Offset: Expr option
-    }
-
-type internal CreateIndex =
-    {
-        Name: string
-        Table: string
-        Columns: string list
-        Unique: bool
-        IfNotExists: bool
-    }
-
-[<RequireQualifiedAccess; NoComparison; NoEquality>]
-type internal Statement =
-    | Select of SelectStatement
-    | Insert of InsertStatement
-    | Update of UpdateStatement
-    | Delete of DeleteStatement
-    | CreateTable of CreateTable
-    | DropTable of string * bool
-    | CreateIndex of CreateIndex
-    | DropIndex of string * bool
-    | Begin
-    | Commit
-    | Rollback

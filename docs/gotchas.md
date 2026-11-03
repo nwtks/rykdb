@@ -920,6 +920,7 @@ let rec readAll n c acc =
 `dotnet test` / `dotnet run` は Debug なので、CPS の相互末尾再帰が `tail.` にならず、
 50000個の `IN` リストで `Stack overflow.`（exit 134）になる。
 `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` を消すと再発するので注意。
+`MaxExpressionDepth` はこの前提のための保険（→ §11.48）。
 
 属性の無い関数（ローカル `let rec` 含む）まで含めた**反復検証**は `dotnet run --project tools/TailAudit`
 （既知分は `tools/TailAudit/TailAudit.baseline` と差分を取り、新規があれば exit 1。
@@ -1664,3 +1665,68 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 - 回帰テスト: `Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致するときだけマージ結合` /
   `SqlReference: マージ結合（主キー同士・LEFT・複合キー）` /
   `OpsTests` のマージ結合 5 本（ハッシュ結合との差分比較を含む）。
+
+### 11.47 サブクエリは計画時に定数へ畳み込む（相関は未対応）
+
+`Plan.planSelectC` は `SELECT` の全式（項目 / `ON` / `WHERE` / `GROUP BY` / `HAVING` /
+`ORDER BY` / `LIMIT` / `OFFSET`）からサブクエリを再帰的に探し、
+論理代数を組む前に実行して `Expr.Value` / `Expr.InList` / 真偽値へ置き換える。
+
+- **相関サブクエリは未対応**。
+  `resolveSelectC` は外側のテーブルを登録する前（`registerAll` の前）に走るので、
+  外側の列を参照すると `NameError` になる。
+  外側と同じ実テーブル名が内側の `FROM` にある場合は標準どおり内側が優先される。
+- サブクエリは**クエリごとに 1回**実行される。
+  `IN (SELECT ...)` は結果をすべて保持する
+  （スカラーは最大 2行、`EXISTS` は 1行だけ読む）。
+- ヘッダは解決前の式から作る。
+  解決後から作ると `SELECT (SELECT MAX(v) FROM t) FROM t` の列名が `30` のようになる。
+- 集約後の行（`Ops.substituteAggs`）は `Expr.Value` で値を埋め込む。
+  `Literal.ofValue` は DATE / TIMESTAMP / UUID を TEXT にするため、
+  集約結果（`MAX(dt)` など）と DATE 列の比較が `TypeError` になる。
+- DML は `Engine.runInsert` / `runUpdate` / `runDelete` が `Plan.resolveDmlExpr` で解決する。
+  `CREATE TABLE ... DEFAULT (SELECT ...)` は解決しない（実行時に `SyntaxError`）。
+- Parser は式と SELECT のパーサを同じ `let rec` グループにするため、句の側も CPS にする
+  （`parseSelectStatementC` / `parseSelectItemsC` / `parseJoinsC` / `parseWhereC` / …）。
+  継続をラムダで渡すので FS3569 は通るが、**群の全メンバーに `: Result<'r, DbError>` の戻り型注釈を付ける**
+  （推論に任せると FS0043「'r と 'r0 が一致しない」で群全体が落ち、
+  後続が FS0039「parseExprC は定義されていません」という無関係なエラーになる）。
+  深さは `MaxExpressionDepth` で頭打ち。
+- **Planner のサブクエリ解決（`Plan.planSelectC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC`）も CPS**。
+  式の走査は `Expr.rewriteWithC`（葉の書き換えが継続を取る版）、
+  リスト（項目 / JOIN / GROUP BY / ORDER BY）は `traverseC` が 1件ずつ継続で回す。
+  葉からの `planSelectC` 呼び出しを `>>=` のレシーバに置くとそこでフレームが残るので、
+  `match` / 継続の末尾呼び出しで書く。
+- 回帰テスト: `SqlReference: サブクエリ（スカラー・IN・EXISTS）` /
+  `SqlReference: サブクエリの未対応形とエラー` / `パーサ: サブクエリ（スカラー / IN / EXISTS）` /
+  `末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパースできる`。
+
+### 11.48 `MaxExpressionDepth` は `tail.` 前提の保険（外すとプロセスごと落ちる）
+
+`Parser.MaxExpressionDepth = 200` は **SQL の意味上の制限ではない**。
+「CPS の相互再帰が `tail.` にならない環境で、StackOverflow を起こさない」ための保険。
+`enterExpr` は式の入口・単項演算子・二項演算子の右辺ごとに深さを 1 消費するので、
+演算子の連鎖・`NOT` の連鎖・括弧・サブクエリの入れ子がすべてここで頭打ちになる。
+
+実測（2026-11-04、`SELECT * FROM t WHERE a = (v + 1 + …)`）:
+
+| ビルド                            | 10,000 連鎖                                        | 備考                 |
+| --------------------------------- | -------------------------------------------------- | -------------------- |
+| `Tailcalls=true`（既定）          | 上限を 2,000,000 にすると**成功**（0.64s / 52MiB） | スタックは積まれない |
+| `dotnet build -p:Tailcalls=false` | **StackOverflow（exit 134）**                      | プロセス即死         |
+| `Tailcalls=false` + 上限 200      | `式の入れ子が深すぎます（上限 200）`（exit 1）     | 安全に失敗する       |
+
+- 上限を 2,000,000 にして実測すると、1,000,000 演算子でも成功するが **11.7s / 635MiB** かかる。
+  深さに比例して AST と継続クロージャをヒープに持つため、**入力長 O(n) のメモリに上限がなくなる**
+  （1,000 段の入れ子サブクエリも 0.83s / 50MiB で通る）。
+- .NET の `StackOverflowException` は**捕捉できない**。
+  RykDb はホストプロセス内で動く組込み DB なので、ここが破れると**クエリ 1 本でアプリが落ちる**。
+- したがって**削除しない**。緩めるなら 10,000 程度
+  （実測 100k で 112MiB なので 10k は数十 MiB 級）。
+  削除するなら `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` を**テストで固定**し、
+  `tail.` が消えたら CI が落ちるようにすること。
+- `Planner` のサブクエリ解決は CPS なのでこの上限に依存しない
+  （残る依存は Parser の再帰だけ）。
+- 回帰テスト: `ParserTests` の `末尾再帰: CPS にした式構文規則は深さ境界で正確に動く` /
+  `末尾再帰: 深い入れ子はエラーになる（StackOverflow ではない）` /
+  `末尾再帰: 深いサブクエリの入れ子もエラーになる（StackOverflow ではない）`。

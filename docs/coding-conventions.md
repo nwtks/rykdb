@@ -86,10 +86,14 @@ Debug でも F# に `tail.` プレフィックスを出させる
 - **継続は名前付きの `and` グループメンバーへ hoist** する（属性付き関数でラムダを書くと FS3569 が出る）。
 - **`Parser` の式グループでは `IN` 候補リスト・`CASE` の `WHEN` 節・関数引数リストを CPS にし、`parseExprC` の呼び出しを継続位置（末尾）へ移す**。
   回帰テストは `ParserTests` の `末尾再帰: 大量のトークンを解析できる`（50000個の `IN` リスト）。
-- **CPS ループが兄弟関数を部分適用して `parseExprC` へ渡すときは戻り型を明示する**
-  （`parseExprListToParen` / `parseInListBodyLoop` の `: Result<'r, DbError> =`）。
+- **CPS グループの全メンバーに `: Result<'r, DbError>` の戻り型を明示する**
+  （`parseExprListToParen` / `parseInListBodyLoop` / SELECT 句の `parseSelectItemsC` / `Plan` の `resolveExprC` など）。
   型引数 `<'r>` だけだと、群内の相互参照経由で戻り値の型が別の推論変数 'r0 になり
-  FS0043「'r と 'r0 が一致しない」で群全体が型検査に失敗する。
+  FS0043「'r と 'r0 が一致しない」で**群全体が型検査に失敗する**
+  （失敗すると後続の `parseExprC` 参照が FS0039「定義されていません」になり、原因が分かりにくい）。
+- **「葉の書き換えが別の再帰を経る」式走査は `Expr.rewriteWithC`（継続を取る版）を使う**。
+  `Plan` のサブクエリ解決（`resolveExprC` → `resolveLeafC` → `planSelectC` → …）がこれ。
+  `Expr.rewriteWith` はその糖で、失敗を返す葉の書き換え（束縛・集約の読み替え）に使う。
 - **hoist した継続を値として渡す呼び出しは TailAudit の引数位置判定で非末尾として残る**
   （`parseExprC (parseExprListElemC k acc) st`・`parseCaseBranches (parseCaseTailC k) [] st`）。
   部分適用は関数値を作るだけで、実呼び出しは呼ばれた側（`parseExprC` など）の末尾位置なのでフレームは積まれない。

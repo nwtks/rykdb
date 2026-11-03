@@ -164,6 +164,7 @@ module internal Ops =
     let private isLeafExpr =
         function
         | Expr.Literal _
+        | Expr.Value _
         | Expr.Column _
         | Expr.Name _
         | Expr.Star
@@ -190,7 +191,7 @@ module internal Ops =
     let private substituteAggs (offsets: Map<string, int>) (wholeOffsets: Map<string, int>) (row: SqlValue array) =
         let slot key =
             match offsets |> Map.tryFind key with
-            | Some i when i >= 0 && i < row.Length -> Some(Expr.Literal(Literal.ofValue row.[i]))
+            | Some i when i >= 0 && i < row.Length -> Some(Expr.Value row.[i])
             | _ -> None
 
         let wholeSlot x =

@@ -529,6 +529,45 @@ let ``パーサ: 未対応の JOIN は明示エラー`` () =
     expectErrorKind ErrorKind.SyntaxError "USING" (parseStatement "SELECT * FROM t JOIN u USING (id)")
 
 [<Fact>]
+let ``パーサ: サブクエリ（スカラー / IN / EXISTS）`` () =
+    parseOneOk "SELECT (SELECT MAX(v) FROM t) FROM t" |> ignore
+    parseOneOk "SELECT id FROM t WHERE id IN (SELECT id FROM t)" |> ignore
+    parseOneOk "SELECT id FROM t WHERE id NOT IN (SELECT id FROM t)" |> ignore
+    parseOneOk "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t)" |> ignore
+    parseOneOk "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM t)" |> ignore
+    parseOneOk "SELECT id FROM t WHERE id = (SELECT MAX(id) FROM t)" |> ignore
+
+    parseOneOk "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE v > (SELECT MIN(v) FROM t))"
+    |> ignore
+
+    // 派生テーブル（FROM のサブクエリ）は未対応
+    expectErrorKind ErrorKind.SyntaxError "派生テーブル" (parseStatement "SELECT id FROM (SELECT id FROM t) x")
+
+    // EXISTS の後ろには括弧付きのサブクエリが必要
+    expectErrorKind ErrorKind.SyntaxError "EXISTS の引数" (parseStatement "SELECT id FROM t WHERE EXISTS id")
+
+    // サブクエリでも FROM は必須
+    expectErrorKind ErrorKind.SyntaxError "サブクエリの FROM 省略" (parseStatement "SELECT id FROM t WHERE EXISTS (SELECT 1)")
+
+[<Fact>]
+let ``パーサ: サブクエリの AST 形`` () =
+    match parseOneOk "SELECT id FROM t WHERE id IN (SELECT id FROM t)" with
+    | Statement.Select {
+                           Where = Some(Expr.InSubquery(Expr.Name "id", _, false))
+                       } -> ()
+    | _ -> Assert.Fail "InSubquery ではありません"
+
+    match parseOneOk "SELECT (SELECT MAX(v) FROM t) FROM t" with
+    | Statement.Select {
+                           Items = [ { Expression = Expr.Subquery _ } ]
+                       } -> ()
+    | _ -> Assert.Fail "スカラーサブクエリではありません"
+
+    match parseOneOk "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t)" with
+    | Statement.Select { Where = Some(Expr.Exists _) } -> ()
+    | _ -> Assert.Fail "EXISTS ではありません"
+
+[<Fact>]
 let ``パーサ: DELETE ... USING は明示エラー`` () =
     expectErrorKind ErrorKind.SyntaxError "DELETE USING" (parseStatement "DELETE FROM t USING u")
 
@@ -796,6 +835,19 @@ let ``末尾再帰: 深い入れ子はエラーになる（StackOverflow では�
     parsesOk ("SELECT * FROM t WHERE " + System.String('(', 50) + "1" + System.String(')', 50))
 
 [<Fact>]
+let ``末尾再帰: 深いサブクエリの入れ子もエラーになる（StackOverflow ではない）`` () =
+    // サブクエリは式のパーサ（CPS）と SELECT のパーサが相互再帰するので、
+    // ここが破れるとスタックを食う。深さは MaxExpressionDepth で頭打ちになる。
+    let nested depth =
+        [ 1..depth ]
+        |> List.fold (fun e _ -> sprintf "(SELECT %s FROM t WHERE id = 1)" e) "v"
+
+    expectDepthError "深すぎるサブクエリ" (parseStatement (sprintf "SELECT %s AS x FROM t" (nested 400)))
+
+    // 上限内なら通る（1 段あたり複数の深さ単位を消費するので 50 段で十分余裕がある）
+    parsesOk (sprintf "SELECT %s AS x FROM t" (nested 50))
+
+[<Fact>]
 let ``末尾再帰: 200000個の NOT が連なってもスタックを食わない`` () =
     let depth = 200_000
     assertDepthExceeded "200000個の NOT" ("SELECT * FROM t WHERE " + String.replicate depth "NOT " + "a")
@@ -839,6 +891,21 @@ let ``末尾再帰: 大量の SET 句がパースできる`` () =
     let body = Array.init n (fun i -> sprintf "c%d = %d" i i) |> String.concat ", "
     let upd = parseUpdateOk (sprintf "UPDATE t SET %s" body)
     Assert.Equal(n, upd.Assignments.Length)
+
+[<Fact>]
+let ``末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパースできる`` () =
+    // サブクエリ対応で SELECT の各句を式と同じ CPS グループへ入れた。
+    // 句のリスト（項目 / GROUP BY / ORDER BY）の走査も継続の中で次の項目へ進むので、
+    // 継続呼び出しが末尾になっていないと項目数だけフレームが積まれる。
+    let n = 20_000
+    let items = Array.init n (fun i -> sprintf "c%d" i) |> String.concat ", "
+    Assert.Equal(n, (parseSelectOk (sprintf "SELECT %s FROM t" items)).Items.Length)
+
+    let sel =
+        parseSelectOk (sprintf "SELECT c0 FROM t GROUP BY %s ORDER BY %s" items items)
+
+    Assert.Equal(n, sel.GroupBy.Length)
+    Assert.Equal(n, sel.OrderBy.Length)
 
 [<Fact>]
 let ``末尾再帰: 加算の鎖も深さエラーになる`` () =

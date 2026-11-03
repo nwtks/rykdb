@@ -241,6 +241,46 @@ module internal Parser =
     // 「異常な入力を早期に検知し、既定より読みやすいエラーにする」目的で残す。
     // -----------------------------------------------------------------------
 
+    let private parseOptAlias (st: PState) =
+        if isKeyword "AS" st then
+            advance st |> parseIdent |> Result.map (fun (a, st) -> Some a, st)
+        else
+            match peek st with
+            | Token.Ident s -> ret (Some s, advance st)
+            | Token.QuotedIdent s -> ret (Some s, advance st)
+            | _ -> ret (None, st)
+
+    /// テーブル別名を読む。
+    /// 未対応の SQL 語は裸の別名として飲み込まない（`AS` を付ければ別名として使える）。
+    /// `USING` はここでは消費せず、呼び出し側が JOIN / DELETE の文脈に応じてエラーにする。
+    let private parseTableAlias (st: PState) =
+        if isKeyword "AS" st then
+            advance st |> parseIdent |> Result.map (fun (a, st) -> Some a, st)
+        else
+            match peek st with
+            | Token.Ident s when s.ToUpperInvariant() = "USING" -> ret (None, st)
+            | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedTableAliasWords ->
+                fail (unsupportedAliasMessage (s.ToUpperInvariant())) st
+            | Token.Ident s -> ret (Some s, advance st)
+            | Token.QuotedIdent s -> ret (Some s, advance st)
+            | _ -> ret (None, st)
+
+    let private parseTableRef (st: PState) =
+        match peek st with
+        | Token.Symbol "(" -> fail "FROM のサブクエリ（派生テーブル）は未対応です" st
+        | _ ->
+            result {
+                let! name, st = parseIdent st
+                let! alias, st = parseTableAlias st
+                return { Name = name; Alias = alias }, st
+            }
+
+    /// 現在位置が `識別子 . *` の形かどうかを返す。
+    let private isDotStar (st: PState) =
+        st.Pos + 2 < st.Tokens.Length
+        && st.Tokens.[st.Pos + 1].Token = Token.Symbol "."
+        && st.Tokens.[st.Pos + 2].Token = Token.Symbol "*"
+
     /// 継続。
     /// 「式を 1つ読んだ後に残りをする」。
     /// 戻り値の型 'r は呼び出し側ごとに違うので（式だけ / (Expr*Expr) list / Expr option …）
@@ -256,6 +296,12 @@ module internal Parser =
     /// 構文規則は mutually recursive なので、そのままでは必ず非末尾再帰になる。
     /// 継続（continuation）を渡して「式を 1つ読んだときに、残りを k に渡す」形にすることで、
     /// 相互再帰そのものが末尾再帰になる。
+    /// <remarks>
+    /// サブクエリで SELECT のパーサと相互再帰するため、
+    /// SELECT の各句（parseSelectItemC / parseJoinsC / parseWhereC / …）も CPS にし、
+    /// グループ内の相互呼び出しをすべて末尾位置に置く。
+    /// 句の継続（k）はラムダで渡すが、FS3569 はラムダ末尾を許容する。
+    /// </remarks>
     [<TailCall>]
     let rec private parseExprC<'r> (k: K<'r>) (st: PState) =
         match enterExpr st with
@@ -388,12 +434,40 @@ module internal Parser =
         | Token.Keyword "DEFAULT" -> advance st |> k Expr.Default
         | Token.Keyword "CASE" -> parseCaseC k st
         | Token.Symbol "*" -> advance st |> k Expr.Star
-        | Token.Symbol "(" ->
-            advance st
-            |> parseExprC (fun e st ->
-                match expectSymbol ")" st with
+        | Token.Keyword "EXISTS" ->
+            match advance st |> expectSymbol "(" with
+            | Error e -> err e
+            | Ok(_, afterParen) ->
+                match enterExpr afterParen with
                 | Error e -> err e
-                | Ok(_, st) -> k e st)
+                | Ok afterParen ->
+                    let cont: SelectStatement -> PState -> Result<'r, DbError> =
+                        fun sel st ->
+                            match expectSymbol ")" st with
+                            | Error e -> err e
+                            | Ok(_, st) -> k (Expr.Exists sel) (exitExpr st)
+
+                    parseSelectStatementC cont afterParen: Result<'r, DbError>
+        | Token.Symbol "(" ->
+            let afterParen = advance st
+
+            if isKeyword "SELECT" afterParen then
+                match enterExpr afterParen with
+                | Error e -> err e
+                | Ok afterParen ->
+                    let cont: SelectStatement -> PState -> Result<'r, DbError> =
+                        fun sel st ->
+                            match expectSymbol ")" st with
+                            | Error e -> err e
+                            | Ok(_, st) -> k (Expr.Subquery sel) (exitExpr st)
+
+                    parseSelectStatementC cont afterParen: Result<'r, DbError>
+            else
+                afterParen
+                |> parseExprC (fun e st ->
+                    match expectSymbol ")" st with
+                    | Error e -> err e
+                    | Ok(_, st) -> k e st)
         | Token.Ident name -> parseNamedPrimaryC k name st
         | Token.QuotedIdent name -> parseNamedPrimaryC k name st
         | _ -> fail "式が必要ですが見つかりませんでした" st
@@ -478,10 +552,24 @@ module internal Parser =
         : Result<'r, DbError> =
         parseExprC (parseInListBodyElemC k acc) st
 
-    and [<TailCall>] private parseInListBodyC<'r> (k: Expr list -> PState -> Result<'r, DbError>) (st: PState) =
+    /// IN の右辺。`(SELECT ...)` ならサブクエリ、そうでなければ式のリスト。
+    and [<TailCall>] private parseInBodyC<'r> (negated: bool) (left: Expr) (k: K<'r>) (st: PState) =
         match expectSymbol "(" st with
         | Error e -> err e
-        | Ok(_, st) -> parseInListBodyLoop k [] st
+        | Ok(_, afterParen) ->
+            if isKeyword "SELECT" afterParen then
+                match enterExpr afterParen with
+                | Error e -> err e
+                | Ok afterParen ->
+                    let cont: SelectStatement -> PState -> Result<'r, DbError> =
+                        fun sel st ->
+                            match expectSymbol ")" st with
+                            | Error e -> err e
+                            | Ok(_, st) -> k (Expr.InSubquery(left, sel, negated)) (exitExpr st)
+
+                    parseSelectStatementC cont afterParen: Result<'r, DbError>
+            else
+                parseInListBodyLoop (fun xs st -> k (Expr.InList(left, xs, negated)) st) [] afterParen
 
     /// LIKE のパターン評価後に ESCAPE を読む継続。
     and [<TailCall>] private parseLikeEscape<'r> (k: K<'r>) (left: Expr) (pattern: Expr) (negated: bool) (st: PState) =
@@ -532,8 +620,7 @@ module internal Parser =
                 let afterNot = advance st
 
                 if isKeyword "IN" afterNot then
-                    advance afterNot
-                    |> parseInListBodyC (fun xs st -> k (Expr.InList(left, xs, true)) st)
+                    advance afterNot |> parseInBodyC true left k
                 elif isKeyword "BETWEEN" afterNot then
                     advance afterNot
                     |> parseBetweenBodyC (fun lo hi st -> k (Expr.Between(left, lo, hi, true)) st)
@@ -543,8 +630,7 @@ module internal Parser =
                 else
                     fail "NOT の後ろには IN / BETWEEN / LIKE が必要です" afterNot
             elif isKeyword "IN" st then
-                advance st
-                |> parseInListBodyC (fun xs st -> k (Expr.InList(left, xs, false)) st)
+                advance st |> parseInBodyC false left k
             elif isKeyword "BETWEEN" st then
                 advance st
                 |> parseBetweenBodyC (fun lo hi st -> k (Expr.Between(left, lo, hi, false)) st)
@@ -587,50 +673,12 @@ module internal Parser =
     and [<TailCall>] private parseOrC<'r> (k: K<'r>) (st: PState) : Result<'r, DbError> =
         parseAndC (fun left st -> parseOrLoop k st.Depth left st) st
 
-    /// 式を 1 つ読んで返す（継続版 parseExprC の糖）。
-    /// 文レベルの構文規則から使う。
-    let private parseExpr (st: PState) = parseExprC retE st
-
-    let private parseOptAlias (st: PState) =
-        if isKeyword "AS" st then
-            advance st |> parseIdent |> Result.map (fun (a, st) -> Some a, st)
-        else
-            match peek st with
-            | Token.Ident s -> ret (Some s, advance st)
-            | Token.QuotedIdent s -> ret (Some s, advance st)
-            | _ -> ret (None, st)
-
-    /// テーブル別名を読む。
-    /// 未対応の SQL 語は裸の別名として飲み込まない（`AS` を付ければ別名として使える）。
-    /// `USING` はここでは消費せず、呼び出し側が JOIN / DELETE の文脈に応じてエラーにする。
-    let private parseTableAlias (st: PState) =
-        if isKeyword "AS" st then
-            advance st |> parseIdent |> Result.map (fun (a, st) -> Some a, st)
-        else
-            match peek st with
-            | Token.Ident s when s.ToUpperInvariant() = "USING" -> ret (None, st)
-            | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedTableAliasWords ->
-                fail (unsupportedAliasMessage (s.ToUpperInvariant())) st
-            | Token.Ident s -> ret (Some s, advance st)
-            | Token.QuotedIdent s -> ret (Some s, advance st)
-            | _ -> ret (None, st)
-
-    let private parseTableRef (st: PState) =
-        result {
-            let! name, st = parseIdent st
-            let! alias, st = parseTableAlias st
-            return { Name = name; Alias = alias }, st
-        }
-
-    /// 現在位置が `識別子 . *` の形かどうかを返す。
-    let private isDotStar (st: PState) =
-        st.Pos + 2 < st.Tokens.Length
-        && st.Tokens.[st.Pos + 1].Token = Token.Symbol "."
-        && st.Tokens.[st.Pos + 2].Token = Token.Symbol "*"
-
-    let private parseSelectItem (st: PState) =
+    and [<TailCall>] private parseSelectItemC<'r>
+        (k: SelectItem -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
         if isSymbol "*" st then
-            ret ({ Expression = Expr.Star; Alias = None }, advance st)
+            k { Expression = Expr.Star; Alias = None } (advance st)
         elif isDotStar st then
             let name =
                 match peek st with
@@ -638,33 +686,38 @@ module internal Parser =
                 | Token.QuotedIdent s -> s
                 | _ -> ""
 
-            let st = st |> advance |> advance |> advance
-
-            ret (
+            k
                 {
                     Expression = Expr.QualifiedStar name
                     Alias = None
-                },
-                st
-            )
-        else
-            match peek st with
-            | Token.Ident _
-            | Token.QuotedIdent _ ->
-                parseExprC
-                    (fun (e: Expr) (st: PState) ->
-                        parseOptAlias st
-                        |> Result.map (fun (alias, st) -> { Expression = e; Alias = alias }, st))
-                    st
-            | _ ->
-                result {
-                    let! e, st = parseExprC retE st
-                    let! alias, st = parseOptAlias st
-                    return { Expression = e; Alias = alias }, st
                 }
+                (st |> advance |> advance |> advance)
+        else
+            parseExprC
+                (fun e st ->
+                    match parseOptAlias st with
+                    | Error er -> err er
+                    | Ok(alias, st) -> k { Expression = e; Alias = alias } st)
+                st
 
-    [<TailCall>]
-    let rec private parseJoins (acc: JoinClause list) (st: PState) =
+    and [<TailCall>] private parseSelectItemsC<'r>
+        (acc: SelectItem list)
+        (k: SelectItem list -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
+        parseSelectItemC
+            (fun item st ->
+                if isSymbol "," st then
+                    advance st |> parseSelectItemsC (item :: acc) k
+                else
+                    k (List.rev (item :: acc)) st)
+            st
+
+    and [<TailCall>] private parseJoinsC<'r>
+        (acc: JoinClause list)
+        (k: JoinClause list -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
         match rejectUnsupportedClause st with
         | Error e -> err e
         | Ok() ->
@@ -686,44 +739,60 @@ module internal Parser =
                         match expectKeyword "ON" st with
                         | Error e -> err e
                         | Ok(_, st) ->
-                            match parseExprC retE st with
-                            | Error e -> err e
-                            | Ok(on, st) -> parseJoins ({ Kind = kind; Table = tbl; On = on } :: acc) st
+                            parseExprC (fun on st -> parseJoinsC ({ Kind = kind; Table = tbl; On = on } :: acc) k st) st
             else
-                ret (List.rev acc, st)
+                k (List.rev acc) st
 
-    let private parseWhere (st: PState) =
+    and [<TailCall>] private parseWhereC<'r>
+        (k: Expr option -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
         if isKeyword "WHERE" st then
-            advance st |> parseExprC (fun e st -> ret (Some e, st))
+            advance st |> parseExprC (fun e st -> k (Some e) st)
         else
-            ret (None, st)
+            k None st
 
-    let private parseGroupBy (acc: Expr list) (st: PState) =
-        let rec loop acc st =
-            match parseExprC retE st with
-            | Error e -> err e
-            | Ok(e, st) ->
+    and [<TailCall>] private parseGroupByItemsC<'r>
+        (acc: Expr list)
+        (k: Expr list -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
+        parseExprC
+            (fun e st ->
                 if isSymbol "," st then
-                    advance st |> loop (e :: acc)
+                    advance st |> parseGroupByItemsC (e :: acc) k
                 else
-                    ret (List.rev (e :: acc), st)
+                    k (List.rev (e :: acc)) st)
+            st
 
+    and [<TailCall>] private parseGroupByC<'r>
+        (acc: Expr list)
+        (k: Expr list -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
         if isKeyword "GROUP" st then
-            advance st |> expectKeyword "BY" >>= fun (_, st) -> loop acc st
-        else
-            ret (acc, st)
-
-    let private parseHaving (st: PState) =
-        if isKeyword "HAVING" st then
-            advance st |> parseExprC (fun e st -> ret (Some e, st))
-        else
-            ret (None, st)
-
-    let private parseOrderBy (acc: SortKey list) (st: PState) =
-        let rec loop acc st =
-            match parseExprC retE st with
+            match advance st |> expectKeyword "BY" with
             | Error e -> err e
-            | Ok(e, st) ->
+            | Ok(_, st) -> parseGroupByItemsC acc k st
+        else
+            k acc st
+
+    and [<TailCall>] private parseHavingC<'r>
+        (k: Expr option -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
+        if isKeyword "HAVING" st then
+            advance st |> parseExprC (fun e st -> k (Some e) st)
+        else
+            k None st
+
+    and [<TailCall>] private parseOrderByItemsC<'r>
+        (acc: SortKey list)
+        (k: SortKey list -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
+        parseExprC
+            (fun e st ->
                 let dir, st =
                     if isKeyword "DESC" st then
                         SortDirection.Descending, advance st
@@ -735,72 +804,114 @@ module internal Parser =
                 let key = { Expression = e; Direction = dir }
 
                 if isSymbol "," st then
-                    advance st |> loop (key :: acc)
+                    advance st |> parseOrderByItemsC (key :: acc) k
                 else
-                    ret (List.rev (key :: acc), st)
+                    k (List.rev (key :: acc)) st)
+            st
 
+    and [<TailCall>] private parseOrderByC<'r>
+        (acc: SortKey list)
+        (k: SortKey list -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
         if isKeyword "ORDER" st then
-            advance st |> expectKeyword "BY" >>= fun (_, st) -> loop acc st
-        else
-            ret (acc, st)
-
-    let private parseLimitOffset (st: PState) =
-        result {
-            let! limit, st =
-                if isKeyword "LIMIT" st then
-                    advance st |> parseExprC (fun e st -> ret (Some e, st))
-                else
-                    ret (None, st)
-
-            let! offset, st =
-                if isKeyword "OFFSET" st then
-                    advance st |> parseExprC (fun e st -> ret (Some e, st))
-                else
-                    ret (None, st)
-
-            return limit, offset, st
-        }
-
-    let private parseSelect (st: PState) =
-        let rec items acc st =
-            match parseSelectItem st with
+            match advance st |> expectKeyword "BY" with
             | Error e -> err e
-            | Ok(it, st) ->
-                if isSymbol "," st then
-                    advance st |> items (it :: acc)
-                else
-                    ret (List.rev (it :: acc), st)
+            | Ok(_, st) -> parseOrderByItemsC acc k st
+        else
+            k acc st
 
-        result {
-            let! _, st = expectKeyword "SELECT" st
+    and [<TailCall>] private parseLimitOffsetC<'r>
+        (k: (Expr option * Expr option) -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
+        if isKeyword "LIMIT" st then
+            advance st
+            |> parseExprC (fun limit st ->
+                if isKeyword "OFFSET" st then
+                    advance st |> parseExprC (fun offset st -> k (Some limit, Some offset) st)
+                else
+                    k (Some limit, None) st)
+        elif isKeyword "OFFSET" st then
+            advance st |> parseExprC (fun offset st -> k (None, Some offset) st)
+        else
+            k (None, None) st
+
+    and [<TailCall>] private parseSelectStatementC<'r>
+        (k: SelectStatement -> PState -> Result<'r, DbError>)
+        (st: PState)
+        : Result<'r, DbError> =
+        match expectKeyword "SELECT" st with
+        | Error e -> err e
+        | Ok(_, st) ->
             let distinct = isKeyword "DISTINCT" st
             let st = if distinct then advance st else st
-            let! its, st = items [] st
-            let! _, st = expectKeyword "FROM" st
-            let! fromRef, st = parseTableRef st
-            let! joins, st = parseJoins [] st
-            let! whereE, st = parseWhere st
-            let! groupBy, st = parseGroupBy [] st
-            let! having, st = parseHaving st
-            let! orderBy, st = parseOrderBy [] st
-            let! limit, offset, st = parseLimitOffset st
+
+            parseSelectItemsC
+                []
+                (fun items st ->
+                    match expectKeyword "FROM" st with
+                    | Error e -> err e
+                    | Ok(_, st) ->
+                        match parseTableRef st with
+                        | Error e -> err e
+                        | Ok(fromRef, st) ->
+                            parseJoinsC
+                                []
+                                (fun joins st ->
+                                    parseWhereC
+                                        (fun whereE st ->
+                                            parseGroupByC
+                                                []
+                                                (fun groupBy st ->
+                                                    parseHavingC
+                                                        (fun having st ->
+                                                            parseOrderByC
+                                                                []
+                                                                (fun orderBy st ->
+                                                                    parseLimitOffsetC
+                                                                        (fun (limit, offset) st ->
+                                                                            match rejectSetOperation st with
+                                                                            | Error e -> err e
+                                                                            | Ok() ->
+                                                                                let sel =
+                                                                                    {
+                                                                                        Distinct = distinct
+                                                                                        Items = items
+                                                                                        From = Some fromRef
+                                                                                        Joins = joins
+                                                                                        Where = whereE
+                                                                                        GroupBy = groupBy
+                                                                                        Having = having
+                                                                                        OrderBy = orderBy
+                                                                                        Limit = limit
+                                                                                        Offset = offset
+                                                                                    }
+
+                                                                                k sel st)
+                                                                        st)
+                                                                st)
+                                                        st)
+                                                st)
+                                        st)
+                                st)
+                st
+
+    /// 式を 1 つ読んで返す（継続版 parseExprC の糖）。
+    /// 文レベルの構文規則から使う。
+    let private parseExpr = parseExprC retE
+
+    /// SELECT 文を読む（継続版 parseSelectStatementC の糖）。
+    let private parseSelectStatement =
+        parseSelectStatementC (fun sel st -> ret (sel, st))
+
+    /// WHERE 句を読む（継続版 parseWhereC の糖）。
+    let private parseWhere = parseWhereC (fun whereE st -> ret (whereE, st))
+
+    let private parseSelect (st: PState) =
+        result {
+            let! sel, st = parseSelectStatement st
             let! _, st = eatOptionalSemicolon st
-            do! rejectSetOperation st
-
-            let sel =
-                {
-                    Distinct = distinct
-                    Items = its
-                    From = Some fromRef
-                    Joins = joins
-                    Where = whereE
-                    GroupBy = groupBy
-                    Having = having
-                    OrderBy = orderBy
-                    Limit = limit
-                    Offset = offset
-                }
-
             return Statement.Select sel, st
         }
 

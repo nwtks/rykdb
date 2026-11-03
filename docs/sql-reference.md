@@ -362,7 +362,8 @@ name LIKE 'a%'       name NOT LIKE 'a%'
 ```
 
 - `BETWEEN` は両端を含む（`1 <= x <= 10`）。
-- `IN` の要素は**式のリスト**（サブクエリ不可）。
+- `IN` の要素は**式のリスト**。`x IN (SELECT ...)` も使える（§7.9）。
+- `EXISTS (SELECT ...)` / `NOT EXISTS (SELECT ...)` も使える（§7.9）。
 - `LIKE` のワイルドカード:
 
 | 記号 | 意味                     |
@@ -500,6 +501,8 @@ SELECT [DISTINCT] 項目 [, 項目 …]
 
 - **`FROM` は省略できない**。
   `SELECT 1` は `FROM が必要ですが見つかりませんでした` になる。
+- 条件・式の中にはサブクエリを書ける（§7.9）。
+  `FROM` の派生テーブル（`FROM (SELECT ...) AS x`）は未対応。
 - `JOIN` は `INNER JOIN` / `JOIN` / `LEFT JOIN` / `LEFT OUTER JOIN`。
   `RIGHT` / `FULL` / `CROSS` は**ない**。
 - `ON` は省略できない
@@ -701,6 +704,43 @@ SELECT dept_id, COUNT(*) AS c, AVG(salary) AS mean
 --        2 | 2 | 135
 ```
 
+### 7.9 サブクエリ
+
+式の中に `SELECT` を書ける。**相関サブクエリ（外側の列の参照）は未対応**。
+
+| 形                                     | 結果                                                                  |
+| -------------------------------------- | --------------------------------------------------------------------- |
+| `(SELECT ...)`                         | スカラー値。1列だけ・0 行なら `NULL`・2行以上は `ConstraintViolation` |
+| `x [NOT] IN (SELECT ...)`              | 1列の値を `IN` の要素として評価（`NULL` の 3値論理もそのまま）        |
+| `EXISTS (SELECT ...)` / `NOT EXISTS …` | 1行以上なら `TRUE`（列数は問わない）                                  |
+
+```sql
+SELECT id, (SELECT MAX(v) FROM t) AS mx FROM t;
+
+SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t);
+
+SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE v >= 20);
+
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE v > 25);
+```
+
+- サブクエリは**外側のクエリを実行する前に 1 回だけ**実行され、結果は定数へ置き換わる
+  （`IN` は要素のリストへ展開する）。同じ文の中のサブクエリは同じスナップショットを見る。
+- 列数が 1 でないサブクエリは `TypeError`。
+- `INSERT ... VALUES` / `UPDATE ... SET` / `UPDATE`・`DELETE` の `WHERE` でも使える。
+- `LIMIT` / `OFFSET` にも書ける（定数へ解決される）。
+- 外側の列を参照する（相関）サブクエリは `NameError` になる。
+- サブクエリでも **`FROM` は必須**（`EXISTS (SELECT 1)` は書けない。
+  `EXISTS (SELECT 1 FROM t)` のようにテーブルを指定する）。
+- `FROM (SELECT ...) AS x`（派生テーブル）は未対応（`SyntaxError`）。
+- `CREATE TABLE ... DEFAULT (SELECT ...)` は未対応（INSERT 時に `SyntaxError`）。
+- スカラーサブクエリは最大 2行、`EXISTS` は 1行だけを読む。
+  `IN (SELECT ...)` は結果をすべて保持する
+  （管理メモリ換算 256MiB の上限。超過は `CapacityError`）。
+- サブクエリの入れ子も**式の深さ上限（200）に含まれる**。
+  1 段で複数の深さ単位を消費するため、実測では 90段は実行でき、
+  150段は `式の入れ子が深すぎます` になる（StackOverflow にはならない）。
+
 ---
 
 ## 8. INSERT
@@ -717,7 +757,7 @@ INSERT INTO テーブル DEFAULT VALUES;
 - `DEFAULT VALUES` は列リスト無しで全列を既定値で埋める
   （主キーなどに既定値が無い場合は `NOT NULL` 違反）。
 - `VALUES` の要素に `DEFAULT` を書くと、その列の既定値を使う。
-- **値式は定数のみ**（列参照不可）。
+- **値式は定数のみ**（列参照不可）。サブクエリは使える（§7.9）。
 - 値は列の型へ**暗黙変換**される（[§3](#暗黙の型変換sqlvaluecoerce)）。
 - `NOT NULL` 制約は行ごとに検証される。
 - **1つの `INSERT` は 1トランザクション**（途中で失敗したら何も残らない）。
@@ -761,6 +801,7 @@ UPDATE テーブル SET 列 = 式 [, 列 = 式 …] [ WHERE 条件 ];
 ### 挙動
 
 - 複数列を同時に更新できる。式は**更新前の行**に対して評価される。
+  サブクエリは使えるが、外側の行の列は参照できない（§7.9）。
 - `WHERE` を省略すると全行が対象。
 - 条件に合う行すべてが更新される（`LIMIT` 相当の句がない）。
 - 影響行数は `StatementResult.RowsAffected` に入る。
@@ -1051,26 +1092,29 @@ db> .rollback
 
 ### よく見るメッセージ（実測）
 
-| SQL                                       | メッセージ                                                  |
-| ----------------------------------------- | ----------------------------------------------------------- |
-| `SELECT 1;`                               | `FROM が必要ですが見つかりませんでした (位置 1行)`          |
-| `SELECT * FROM t WHERE id > 1 AND;`       | `式が必要ですが見つかりませんでした (位置 1行)`             |
-| `SELECT 'abc;`                            | `unclosed string (位置 1行)`                                |
-| `SELECT id FROM nosuchtable;`             | `テーブル 'nosuchtable' が存在しません`                     |
-| `SELECT nosuchcol FROM t;`                | `'nosuchcol' は列でも関数でもありません`                    |
-| `CREATE TABLE t (a INTEGER);`             | `テーブル t に主キーがありません`                           |
-| `CREATE TABLE t (...);`（重複）           | `テーブル t は既に存在します`                               |
-| `CREATE INDEX ix ON t (nosuchcol);`       | `テーブル t に列 nosuchcol がありません`                    |
-| `SELECT id FROM t JOIN t ON t.id = t.id;` | `テーブル t が重複しています（エイリアスを付けてください）` |
-| `DROP TABLE nosuch;`                      | `テーブル nosuch が存在しません`                            |
-| `INSERT INTO t (id) VALUES (1, 2);`       | `INSERT の列数(1)と値の数(2)が合いません`                   |
-| `INSERT INTO t VALUES (1, NULL, …);`      | `NOT NULL 制約に違反: t.n`                                  |
-| `INSERT INTO t VALUES (5, 'z', 'abc');`   | `''abc'' は 'INTEGER' に変換できません`                     |
-| `SELECT (id) / 0 FROM t;`                 | `0 での除算は定義されていません`                            |
-| `SELECT LENGTH(id, n) FROM t;`            | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`    |
-| `SELECT NOSUCHFN(id) FROM t;`             | `未知のスカラー関数 'NOSUCHFN' です`                        |
-| `SELECT active = 1 FROM u;`               | `型 'BOOLEAN' と 'INTEGER' は比較できません`                |
-| `SELECT ROUND(name) FROM t;`              | `ROUND は数値を受け付けますが 'abc' です`                   |
+| SQL                                        | メッセージ                                                  |
+| ------------------------------------------ | ----------------------------------------------------------- |
+| `SELECT 1;`                                | `FROM が必要ですが見つかりませんでした (位置 1行)`          |
+| `SELECT * FROM t WHERE id > 1 AND;`        | `式が必要ですが見つかりませんでした (位置 1行)`             |
+| `SELECT 'abc;`                             | `unclosed string (位置 1行)`                                |
+| `SELECT id FROM nosuchtable;`              | `テーブル 'nosuchtable' が存在しません`                     |
+| `SELECT nosuchcol FROM t;`                 | `'nosuchcol' は列でも関数でもありません`                    |
+| `CREATE TABLE t (a INTEGER);`              | `テーブル t に主キーがありません`                           |
+| `CREATE TABLE t (...);`（重複）            | `テーブル t は既に存在します`                               |
+| `CREATE INDEX ix ON t (nosuchcol);`        | `テーブル t に列 nosuchcol がありません`                    |
+| `SELECT id FROM t JOIN t ON t.id = t.id;`  | `テーブル t が重複しています（エイリアスを付けてください）` |
+| `DROP TABLE nosuch;`                       | `テーブル nosuch が存在しません`                            |
+| `INSERT INTO t (id) VALUES (1, 2);`        | `INSERT の列数(1)と値の数(2)が合いません`                   |
+| `INSERT INTO t VALUES (1, NULL, …);`       | `NOT NULL 制約に違反: t.n`                                  |
+| `INSERT INTO t VALUES (5, 'z', 'abc');`    | `''abc'' は 'INTEGER' に変換できません`                     |
+| `SELECT (id) / 0 FROM t;`                  | `0 での除算は定義されていません`                            |
+| `SELECT LENGTH(id, n) FROM t;`             | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`    |
+| `SELECT NOSUCHFN(id) FROM t;`              | `未知のスカラー関数 'NOSUCHFN' です`                        |
+| `SELECT active = 1 FROM u;`                | `型 'BOOLEAN' と 'INTEGER' は比較できません`                |
+| `SELECT ROUND(name) FROM t;`               | `ROUND は数値を受け付けますが 'abc' です`                   |
+| `SELECT id, (SELECT id, v FROM t) FROM t;` | `サブクエリは 1 列だけを返す必要があります（2 列）`         |
+| `SELECT id, (SELECT v FROM t) FROM t;`     | `スカラーサブクエリが 2 行以上を返しました`                 |
+| `SELECT id FROM (SELECT id FROM t) x;`     | `FROM のサブクエリ（派生テーブル）は未対応です (位置 1行)`  |
 
 ---
 
@@ -1078,7 +1122,9 @@ db> .rollback
 
 ### 構文が未対応のもの
 
-- サブクエリ、`UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`
+- **相関サブクエリ**（外側の列を参照するサブクエリ）
+- **FROM の派生テーブル**（`FROM (SELECT ...) AS x`）
+- `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`
 - CTE（`WITH`）、再帰クエリ
 - ウィンドウ関数（`OVER` / `PARTITION BY` / `ROW_NUMBER` …）
 - `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN` / `USING`

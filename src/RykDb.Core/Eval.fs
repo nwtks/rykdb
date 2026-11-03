@@ -496,6 +496,10 @@ module internal Eval =
         | Descend e ->
             match e with
             | Expr.Literal l -> step schema row kont (Arrive l.ToSqlValue)
+            | Expr.Value v -> step schema row kont (Arrive v)
+            | Expr.Subquery _
+            | Expr.Exists _
+            | Expr.InSubquery _ -> err (DbError.create ErrorKind.SyntaxError "サブクエリはここでは使えません")
             | Expr.Column c ->
                 match Schema.resolve schema c with
                 | Error er -> err er

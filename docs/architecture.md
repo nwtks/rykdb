@@ -234,6 +234,24 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 引数を継続に変えて末尾化する。
 CPS・継続の hoist・深さ制限の一般則は [`coding-conventions.md`](coding-conventions.md) §3 を参照。
 
+サブクエリは式の中に `SELECT` が現れるため、式のパーサと SELECT のパーサ
+（`parseSelectStatementC` / `parseSelectItemC` / `parseJoinsC` / `parseWhereC` / …）は
+**同じ `let rec` グループ**の CPS 関数にする。
+
+- 句を読む関数もすべて継続（`k: 'T -> PState -> Result<'r, DbError>`）を受け取り、
+  次の句を呼ぶところをその継続に渡す。
+  したがってグループ内の呼び出しはすべて末尾位置になり、
+  `parseExprC` の `[<TailCall>]` を保ったままサブクエリを解析できる。
+- 継続はラムダで渡す（`parseExprC (fun on st -> parseJoinsC acc k st) st`）。
+  FS3569 はラムダ末尾を許容するので追加の hoist は要らないが、
+  TailAudit はラムダ内を保守的に非末尾と数える（ベースラインで追認）。
+- サブクエリの式は `enterExpr` で深さを数え、`MaxExpressionDepth` で頭打ちにする。
+- **グループの全メンバーに `: Result<'r, DbError>` の戻り型注釈を付ける**。
+  推論に任せると群内の相互参照で戻り値が別の変数 `'r0` になり FS0043 で群全体が落ちる。
+
+回帰テスト: `末尾再帰: 大量の JOIN 句がパースできる` /
+`末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパースできる`。
+
 ### 3.3 Ast
 
 判別可能共用体 `Expr` / `Statement`。
@@ -249,6 +267,12 @@ CPS・継続の hoist・深さ制限の一般則は [`coding-conventions.md`](co
 深い式でもスタックを食わない。
 `Expr.rewrite` は束縛（`Binder.qualify`）と、
 集約後の読み替え（`Ops` の内部 `substituteAggs`）が共用している。
+結果を返す書き換えは `Expr.rewriteWith`（失敗する葉の書き換え）を使う。
+
+サブクエリは `Expr.Subquery` / `Expr.Exists` / `Expr.InSubquery` として持つ。
+外側の束縛・集約の走査がサブクエリの内部へ入らないよう、
+`Subquery` / `Exists` の子は空、`InSubquery` の子は左辺だけにしている。
+実行計画時に `Plan` がこれらを `Expr.Value` / `Expr.InList` / 真偽値へ置き換える（§5）。
 
 ---
 
@@ -326,6 +350,32 @@ flowchart LR
 2. `Optimizer.buildLogical` — 式を `Binder.qualify` で束縛し、`Predicate.splitConjuncts` で WHERE を分解、
    `Analyzer.chooseScanMethod` で走査方法を決めて論理代数を組む。
 3. `Optimizer.exec` — 論理代数を `Op` に落とす（`execScan` / `execJoin` など）。
+
+#### サブクエリの解決（`Plan.planSelectC`）
+
+式の中のサブクエリは、論理代数を組む前に **1回だけ実行して定数へ置き換える**。
+`Plan.planSelectC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` が相互再帰し、
+サブクエリも同じ `ExecContext`（同じ snapshot / transaction）で実行する。
+
+- `(SELECT ...)` — 1列だけ。
+  0行なら `NULL`、1行なら `Expr.Value`、2行以上は `ConstraintViolation`。
+- `IN (SELECT ...)` — 1列の値を `Expr.InList` へ展開する
+  （`NULL` の 3値論理は `Eval` がそのまま扱う）。
+- `EXISTS (SELECT ...)` — `Op.next` を 1回だけ呼んで真偽値にする。
+- 相関参照は外側のテーブルを登録しないため `NameError`（未対応）。
+- `FROM (SELECT ...) AS x`（派生テーブル）は Parser が `SyntaxError` にする。
+- ヘッダだけは解決前の式から作る（解決後は値になり列名が `30` のようになってしまうため）。
+- DML の値式・`WHERE` は `Engine` が `Plan.resolveDmlExpr` で同様に解決する。
+
+この相互再帰は **CPS**（継続を引数で受け取り、末尾で呼ぶ）にしてある。
+式の走査は `Expr.rewriteWithC`（葉の書き換えが継続を取る版）が明示スタックで回し、
+葉（サブクエリ）の解決が終わったら継続を末尾で呼ぶので、
+入れ子段数に依存せずスタックは積み上がらない（`Expr.rewriteWith` はその糖）。
+リスト（項目 / JOIN / GROUP BY / ORDER BY）は `traverseC` が 1件ずつ継続で回す。
+サブクエリの入れ子は Parser の `MaxExpressionDepth`
+（1段で複数単位を消費する。実測: 90段は実行でき、150段は `式の入れ子が深すぎます`）でも頭打ちになる。
+回帰テスト: `SqlReference: 深いサブクエリの入れ子（上限内）は実行できる` /
+`末尾再帰: 深いサブクエリの入れ子もエラーになる（StackOverflow ではない）`。
 
 #### 束縛（Binder）
 

@@ -693,44 +693,204 @@ module internal Optimizer =
         run ctx [] (EvalNode(tree, schema, None))
 
 module internal Plan =
+    /// IN サブクエリの結果を保持する上限（管理メモリの概算バイト）。
+    /// `Ops` の JOIN と同じ考え方で、OOM ではなく `CapacityError` で止める。
+    let private SubqueryBudgetBytes = 256L * 1024L * 1024L
+
+    /// IN サブクエリの行を上限付きで集める。
+    let private collectSubqueryRows =
+        let rec go used acc cur =
+            match Op.next cur with
+            | Error e -> err e
+            | Ok None -> ret (List.rev acc |> List.toArray)
+            | Ok(Some(row, nxt)) ->
+                let used = used + int64 (ValueCodec.managedRowBytes row) + 32L
+
+                if used > SubqueryBudgetBytes then
+                    sprintf "IN サブクエリの結果が多すぎます（概算 %d バイトの上限）" SubqueryBudgetBytes
+                    |> DbError.capacity
+                    |> err
+                else
+                    go used (row :: acc) nxt
+
+        go 0L []
+
+    /// CPS のリスト走査。
+    /// 1件ずつ `f` に渡し、書き換え結果を積み直して最後に継続 `k` へ渡す。
+    /// 継続呼び出しが末尾になるので、リスト長に依存せずスタックは積み上がらない。
+    [<TailCall>]
+    let rec private traverseC
+        (f: 'a -> ('a -> Result<'r, DbError>) -> Result<'r, DbError>)
+        (pending: 'a list)
+        (acc: 'a list)
+        (k: 'a list -> Result<'r, DbError>)
+        : Result<'r, DbError> =
+        match pending with
+        | [] -> k (List.rev acc)
+        | x :: rest -> f x (fun x2 -> traverseC f rest (x2 :: acc) k)
+
+    /// サブクエリを解決してから論理木を組む（CPS）。
+    /// <remarks>
+    /// `planSelectC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` は相互再帰する。
+    /// どれも「残りの処理」を継続として受け取り、末尾で呼ぶので、
+    /// サブクエリの入れ子段数に依存せずスタックは積み上がらない
+    /// （Parser の式・SELECT と同じ方針）。
+    /// </remarks>
+    [<TailCall>]
+    let rec private planSelectC
+        (k: (string array * Op) -> Result<'r, DbError>)
+        (ctx: ExecContext)
+        (stmt: SelectStatement)
+        : Result<'r, DbError> =
+        // ヘッダはサブクエリ解決前の式から作る
+        // （解決後は値になるので、列名が `30` のようになってしまう）。
+        let originalItems = stmt.Items
+
+        let finish resolved =
+            let registerAll =
+                foldOk
+                    (fun (c, acc) (r: TableRef) ->
+                        result {
+                            let realName = r.Name
+                            let! schema = ExecContext.schemaOf realName c
+                            let c1 = ExecContext.withSchema realName schema c
+
+                            let c2 =
+                                match r.Alias with
+                                | None -> c1
+                                | Some a -> ExecContext.withSchema a schema c1
+
+                            return c2, Schema.concat acc (Schema.ofTable realName r.Alias schema)
+                        })
+                    (ctx, Schema.empty)
+
+            let sources =
+                (match resolved.From with
+                 | None -> []
+                 | Some r -> [ r ])
+                @ (resolved.Joins |> List.map _.Table)
+
+            let duplicate =
+                sources
+                |> List.countBy (fun r -> defaultArg r.Alias r.Name)
+                |> List.tryFind (fun (_, c) -> c > 1)
+
+            match duplicate with
+            | Some(name, _) -> sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name |> err
+            | None ->
+                registerAll sources
+                >>= fun (ctx2, schema) ->
+                    Optimizer.buildLogical ctx2 resolved
+                    >>= fun tree ->
+                        Optimizer.exec ctx2 tree schema
+                        >>= fun op -> k (Schema.projectHeader schema originalItems, op)
+
+        resolveSelectC finish ctx stmt
+
+    /// 文の各フィールドを継続の連鎖で解決する。
+    /// フィールドの数は固定なので、この関数自身は再帰しない。
+    and [<TailCall>] private resolveSelectC
+        (k: SelectStatement -> Result<'r, DbError>)
+        (ctx: ExecContext)
+        (stmt: SelectStatement)
+        : Result<'r, DbError> =
+        let resolveOpt v cont =
+            match v with
+            | None -> cont None
+            | Some e -> resolveExprC (fun e2 -> cont (Some e2)) ctx e
+
+        let resolveItems =
+            traverseC (fun (item: SelectItem) cont ->
+                resolveExprC (fun e -> cont { item with Expression = e }) ctx item.Expression)
+
+        let resolveJoins =
+            traverseC (fun j cont -> resolveExprC (fun e -> cont { j with On = e }) ctx j.On)
+
+        let resolveSorts =
+            traverseC (fun (s: SortKey) cont -> resolveExprC (fun e -> cont { s with Expression = e }) ctx s.Expression)
+
+        let resolveExprs = traverseC (fun e cont -> resolveExprC cont ctx e)
+
+        let finish items joins whereE groupBy having orderBy limit offset =
+            k
+                { stmt with
+                    Items = items
+                    Joins = joins
+                    Where = whereE
+                    GroupBy = groupBy
+                    Having = having
+                    OrderBy = orderBy
+                    Limit = limit
+                    Offset = offset
+                }
+
+        resolveItems stmt.Items [] (fun items ->
+            resolveJoins stmt.Joins [] (fun joins ->
+                resolveOpt stmt.Where (fun whereE ->
+                    resolveExprs stmt.GroupBy [] (fun groupBy ->
+                        resolveOpt stmt.Having (fun having ->
+                            resolveSorts stmt.OrderBy [] (fun orderBy ->
+                                resolveOpt stmt.Limit (fun limit ->
+                                    resolveOpt stmt.Offset (fun offset ->
+                                        finish items joins whereE groupBy having orderBy limit offset))))))))
+
+    /// 式の中のサブクエリを解決する（CPS）。
+    and private resolveExprC (k: Expr -> Result<'r, DbError>) (ctx: ExecContext) (e: Expr) : Result<'r, DbError> =
+        Expr.rewriteWithC (resolveLeafC ctx) k e
+
+    /// 式の葉にあるサブクエリを実行して、値・リテラル・IN リストへ置き換える（CPS）。
+    /// `Expr.rewriteWithC` に渡すので、引数は `ctx -> 式 -> 継続` の順。
+    and [<TailCall>] private resolveLeafC
+        (ctx: ExecContext)
+        (e: Expr)
+        (k: Expr -> Result<'r, DbError>)
+        : Result<'r, DbError> =
+        let singleColumnMessage count =
+            sprintf "サブクエリは 1 列だけを返す必要があります（%d 列）" count |> DbError.typeError
+
+        match e with
+        | Expr.Subquery sel ->
+            planSelectC
+                (fun (header, op) ->
+                    if header.Length <> 1 then
+                        err (singleColumnMessage header.Length)
+                    else
+                        match Op.next op with
+                        | Error er -> err er
+                        | Ok None -> k (Expr.Literal Literal.Null)
+                        | Ok(Some(row, rest)) ->
+                            match Op.next rest with
+                            | Error er -> err er
+                            | Ok None -> k (Expr.Value row.[0])
+                            | Ok(Some _) -> DbError.constraintViolation "スカラーサブクエリが 2 行以上を返しました" |> err)
+                ctx
+                sel
+        | Expr.Exists sel ->
+            planSelectC
+                (fun (_, op) ->
+                    match Op.next op with
+                    | Error er -> err er
+                    | Ok found -> k (Expr.Literal(Literal.Bool found.IsSome)))
+                ctx
+                sel
+        | Expr.InSubquery(left, sel, negated) ->
+            planSelectC
+                (fun (header, op) ->
+                    if header.Length <> 1 then
+                        err (singleColumnMessage header.Length)
+                    else
+                        match collectSubqueryRows op with
+                        | Error er -> err er
+                        | Ok rows ->
+                            let values = rows |> Array.map (fun row -> Expr.Value row.[0]) |> Array.toList
+                            k (Expr.InList(left, values, negated)))
+                ctx
+                sel
+        | other -> k other
+
+    /// DML（INSERT / UPDATE / DELETE）の式に含まれるサブクエリを解決する。
+    let resolveDmlExpr = resolveExprC ret
+
     /// SELECT 文を実行して、結果（列名 + 行）を返す。
-    let runSelect (ctx: ExecContext) (stmt: SelectStatement) =
-        let registerAll =
-            foldOk
-                (fun (c, acc) (r: TableRef) ->
-                    result {
-                        let realName = r.Name
-                        let! schema = ExecContext.schemaOf realName c
-                        let c1 = ExecContext.withSchema realName schema c
-
-                        let c2 =
-                            match r.Alias with
-                            | None -> c1
-                            | Some a -> ExecContext.withSchema a schema c1
-
-                        return c2, Schema.concat acc (Schema.ofTable realName r.Alias schema)
-                    })
-                (ctx, Schema.empty)
-
-        let sources =
-            (match stmt.From with
-             | None -> []
-             | Some r -> [ r ])
-            @ (stmt.Joins |> List.map _.Table)
-
-        let duplicate =
-            sources
-            |> List.countBy (fun r -> defaultArg r.Alias r.Name)
-            |> List.tryFind (fun (_, c) -> c > 1)
-
-        match duplicate with
-        | Some(name, _) -> sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name |> err
-        | None ->
-            result {
-                let! ctx2, schema = registerAll sources
-                let! tree = Optimizer.buildLogical ctx2 stmt
-                let! op = Optimizer.exec ctx2 tree schema
-                let! rows = Op.toArray op
-                let header = Schema.projectHeader schema stmt.Items
-                return header, rows
-            }
+    let runSelect =
+        planSelectC (fun (header, op) -> Op.toArray op |> Result.map (fun rows -> header, rows))

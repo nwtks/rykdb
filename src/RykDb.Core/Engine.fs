@@ -467,17 +467,40 @@ module internal Engine =
                     Rows = rows
                 })
 
+    let private resolveWhere (ctx: ExecContext) =
+        function
+        | None -> ret None
+        | Some e -> Plan.resolveDmlExpr ctx e |> Result.map Some
+
     let private runInsert (stmt: InsertStatement) (ctx: ExecContext) =
-        ExecContext.schemaOf stmt.Table.Name ctx
-        >>= fun schema -> DmlOps.insert ctx schema stmt.Columns stmt.Rows
+        result {
+            let! rows =
+                stmt.Rows
+                |> List.map (fun row -> row |> List.map (Plan.resolveDmlExpr ctx) |> all)
+                |> all
+
+            let! schema = ExecContext.schemaOf stmt.Table.Name ctx
+            return! DmlOps.insert ctx schema stmt.Columns rows
+        }
 
     let private runUpdate (stmt: UpdateStatement) (ctx: ExecContext) =
-        ExecContext.schemaOf stmt.Table.Name ctx
-        >>= fun schema -> DmlOps.update ctx schema stmt.Assignments stmt.Where
+        result {
+            let! assignments =
+                stmt.Assignments
+                |> List.map (fun (name, e) -> Plan.resolveDmlExpr ctx e |> Result.map (fun e2 -> name, e2))
+                |> all
+
+            let! whereE = resolveWhere ctx stmt.Where
+            let! schema = ExecContext.schemaOf stmt.Table.Name ctx
+            return! DmlOps.update ctx schema assignments whereE
+        }
 
     let private runDelete (stmt: DeleteStatement) (ctx: ExecContext) =
-        ExecContext.schemaOf stmt.Table.Name ctx
-        >>= fun schema -> DmlOps.delete ctx schema stmt.Where
+        result {
+            let! whereE = resolveWhere ctx stmt.Where
+            let! schema = ExecContext.schemaOf stmt.Table.Name ctx
+            return! DmlOps.delete ctx schema whereE
+        }
 
     let private runDml (state: DbState) (txn: Transaction) (run: ExecContext -> Result<(Transaction * int), DbError>) =
         result {
