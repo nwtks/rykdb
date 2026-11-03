@@ -1339,6 +1339,9 @@ DDL だけはプロセス内で排他にする必要がある。
 
 - テストで SSTable を書き換えたら `File.SetLastWriteTimeUtc` で mtime を確実に進める。
 - キャッシュは弱参照なので、メモリが逼迫すれば GC が回収する（LRU ではない）。
+- キーはファイル世代ごとに増えるため、`put` がキー数 512 ごとに死んだ弱参照（GC 済み）を辞書から外す。
+  生きた参照は実行中の走査が使うので残す。
+  回帰テストは `SstPartialCache: 掃除は死んだ弱参照だけを外し、生きた参照は残す`。
 - 欠落ファイルはキー計算（`FileInfo.Length`）の時点で IoError になる。
 
 ### 11.23 DISTINCT / GROUP BY のキーは文字列化しない
@@ -1561,3 +1564,25 @@ TEXT → 数値 / BOOLEAN を InvariantCulture で解析する。
 `SELECT *` の序数は `Schema.expandStar` で列へ展開する。
 
 回帰テスト: `SqlReference: ORDER BY の式と序数`。
+
+### 11.41 `LastCommitted` の掃除は「この commit を反映した後」の境界で行う
+
+`TransactionManager.commit` の GC 境界を更新前の `LastCommitSeqNo` で計算すると、
+`activeSnapshot` が「前回 commit の SeqNo + 1」を返すため、
+**今 commit した全キーが次の commit まで `LastCommitted` に残る**
+（100k 行の commit で約 10.7 MiB。次の commit で解放されていた）。
+
+```fsharp
+// ❌ 更新前の LastCommitSeqNo（= 前回の commit の SeqNo）が境界になる
+let gcThreshold = activeSnapshot staged
+// ✅ この commit の SeqNo を反映した状態で境界を求める
+let gcThreshold = activeSnapshot { staged with LastCommitSeqNo = commitSeq }
+```
+
+active な transaction が無ければ境界は `commitSeq + 1` になり、commit 直後に空へ戻る。
+生きている transaction がある間は「最古の active snapshot」が境界なので、必要な版は残る。
+
+`LastCommitted` が空のときは `findConflicts` が即 `[]` を返す
+（全書き込みキーの `Set<string>`（base64 文字列）を作らない）。
+回帰テスト: `TransactionManager.commit: active が無ければ commit 直後に LastCommitted を捨てる` /
+`TransactionManager.commit: 古い snapshot の transaction が居る間は掃除しない`。

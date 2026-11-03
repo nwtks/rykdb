@@ -175,18 +175,27 @@ let ``TransactionManager.activeSnapshot: 最古の active snapshot を返す`` (
     Assert.Equal<uint64>(System.UInt64.MaxValue, TransactionManager.activeSnapshot saturated)
 
 [<Fact>]
-let ``TransactionManager.commit: active が無くなれば LastCommitted も掃除する`` () =
+let ``TransactionManager.commit: active が無ければ commit 直後に LastCommitted を捨てる`` () =
     let mgr = TransactionManager.create ()
     let mgr, t1 = TransactionManager.beginTxn mgr
     let t1 = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] t1
-    let mgr, _, _ = TransactionManager.commit t1 mgr |> ok
+    let mgr, seq1, _ = TransactionManager.commit t1 mgr |> ok
 
-    // commit 直後は自分の版が残る
-    Assert.Equal<int>(1, mgr.LastCommitted.Count)
+    // 衝突し得る active な transaction が居ないので、commit 直後に捨てられる
+    // （以前は次の commit まで残り、100k 行の commit で ~10 MiB 保持していた）。
+    Assert.Equal<int>(0, mgr.LastCommitted.Count)
+    Assert.Equal<uint64>(seq1, mgr.LastCommitSeqNo)
 
-    // active の無い状態で次の commit が来たら、もう衝突判定に使わないので捨てられる
+    // 次の commit でも空のまま
     let mgr, t2 = TransactionManager.beginTxn mgr
     let mgr, _, _ = TransactionManager.commit t2 mgr |> ok
+    Assert.Equal<int>(0, mgr.LastCommitted.Count)
+
+    // commit 済みキーへの後続の書き込みは競合しない（snapshot が commit 後）
+    let mgr, t3 = TransactionManager.beginTxn mgr
+    let t3 = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 2L |] t3
+    let mgr, seq3, _ = TransactionManager.commit t3 mgr |> ok
+    Assert.True(seq3 > seq1)
     Assert.Equal<int>(0, mgr.LastCommitted.Count)
 
 [<Fact>]

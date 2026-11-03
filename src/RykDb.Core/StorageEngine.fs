@@ -14,6 +14,12 @@ module private SstPartialCache =
         System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstPartial>>
             System.StringComparer.Ordinal
 
+    /// キー数がこの倍数になるたびに、死んだ弱参照を掃除する。
+    /// キーは「ファイルごと」に増える（flush / compaction でファイルが作り直される）ため、
+    /// 掃除しないと辞書のキー文字列だけがプロセス寿命で溜まり続ける。
+    [<Literal>]
+    let private SweepEvery = 512
+
     /// ファイルの同一性を表すキー。
     /// 同じ番号のファイルが差し替わった場合はサイズ/mtime が変わるので別キーになる。
     let keyOf (path: string) (info: System.IO.FileInfo) =
@@ -29,8 +35,19 @@ module private SstPartialCache =
                 None
         | _ -> None
 
+    /// 死んだ弱参照（対象の `SstPartial` が GC されたエントリ）を辞書から外す。
+    /// 生きた参照は、実行中の走査が使っている可能性があるので残す。
+    let private sweep () =
+        for kv in Cache do
+            match kv.Value.TryGetTarget() with
+            | true, _ -> ()
+            | _ -> Cache.TryRemove kv.Key |> ignore
+
     let put (key: string) (partial: SstPartial) =
         Cache.[key] <- System.WeakReference<SstPartial> partial
+
+        if Cache.Count % SweepEvery = 0 then
+            sweep ()
 
 /// StorageEngine の不変状態。
 /// すべての操作は新しい状態を返す。

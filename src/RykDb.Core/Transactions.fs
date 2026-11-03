@@ -170,8 +170,10 @@ type internal TransactionManager =
         /// 次に採番する TxnId
         NextTxnId: TxnId
         /// commit 済みの transaction が最後に書いた (keyspace:キー) -> SeqNo。
-        /// commit のたびに `activeSnapshot` より古い版を捨てるので、
-        /// サイズは「最古の active snapshot 以降に書かれたキー」に収まって無限成長しない。
+        /// 衝突判定に要るのは「最古の active snapshot より後の版」だけなので、
+        /// commit のたびにそれより前の版を捨てる。
+        /// active な transaction が無ければ commit 直後に空になる
+        /// （次の commit を待たない）。
         LastCommitted: Map<string, uint64>
         /// アクティブな transaction
         Active: Map<TxnId, TxnRecord>
@@ -237,20 +239,24 @@ module internal TransactionManager =
     /// 1. write-write 競合を検査する。
     ///    「transaction の snapshot より後に、衝突する key が commit 済み」であれば衝突。
     /// 2. 問題なければ SeqNo を採番して LastCommitted を更新する。
-    /// 3. LastCommitted のうち SeqNo < activeSnapshot の版を掃除する。
+    /// 3. この commit を反映した後の `activeSnapshot` を境界に LastCommitted を掃除する。
     ///    衝突判定は「commit が transaction の snapshot より後」でしか起こらない
-    ///    （未来の snapshot は現在の LastCommitSeqNo 以上）なので、
+    ///    （未来の snapshot は現在の LastCommitSeqNo 以上）ので、
     ///    「全部の active snapshot 以降に commit された版」以外は捨てられる。
-    ///    捨てないと書き込んだ全キーがプロセス寿命の間メモリに残り続ける。
+    ///    active な transaction が無ければ、今 commit した版も直後に捨てられる。
+    ///    捨てないと書き込んだ全キーが次の commit まで（あるいはプロセス寿命の間）メモリに残る。
     /// 返り値の Entry 配列を StorageEngine に流し込むと DB に反映される。
     let commit (txn: Transaction) (manager: TransactionManager) =
         let findConflicts txn lastCommitted snapSeq =
-            Transaction.writeKeys txn
-            |> Set.toList
-            |> List.filter (fun k ->
-                match lastCommitted |> Map.tryFind k with
-                | Some seq -> seq > snapSeq
-                | None -> false)
+            if Map.isEmpty lastCommitted then
+                []
+            else
+                Transaction.writeKeys txn
+                |> Set.toList
+                |> List.filter (fun k ->
+                    match lastCommitted |> Map.tryFind k with
+                    | Some seq -> seq > snapSeq
+                    | None -> false)
 
         let updateLastCommitted lastCommitted (batches: (string * Entry array) list) =
             batches
@@ -281,7 +287,6 @@ module internal TransactionManager =
                 )
             else
                 let batches, nextSeq = Transaction.toEntries manager.NextSeqNo txn
-                let committed = updateLastCommitted manager.LastCommitted batches
                 let commitSeq = nextSeq - 1UL
 
                 let staged =
@@ -289,8 +294,18 @@ module internal TransactionManager =
                         Active = Map.remove txn.TxnId manager.Active
                     }
 
-                let gcThreshold = activeSnapshot staged
-                let lastCommitted = committed |> Map.filter (fun _ seq -> seq >= gcThreshold)
+                let gcThreshold =
+                    activeSnapshot
+                        { staged with
+                            LastCommitSeqNo = commitSeq
+                        }
+
+                let lastCommitted =
+                    if gcThreshold > commitSeq then
+                        Map.empty
+                    else
+                        updateLastCommitted manager.LastCommitted batches
+                        |> Map.filter (fun _ seq -> seq >= gcThreshold)
 
                 let updated =
                     { staged with

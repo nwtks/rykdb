@@ -717,8 +717,11 @@ transaction の snapshot より大きい SeqNo の同一キーがあれば `Conf
 競合キーの照合は `keyspace + ":" + base64(キー)` の文字列で行う。
 `LastCommitted` はプロセス内の状態で、ディスクには残さない
 （commit 済みのデータは再起動後も WAL / SSTable から読める）。
-commit のたびに、その transaction を `Active` から外した後の `activeSnapshot` を境界として`SeqNo < 境界` の版を捨てる
+commit のたびに、その transaction を `Active` から外し、
+**この commit の SeqNo を反映した後**の `activeSnapshot` を境界として `SeqNo < 境界` の版を捨てる
 （生きている transaction の衝突判定に要る版だけ残す）。
+active な transaction が無ければ境界は `commitSeq + 1` になり、commit 直後に空へ戻る
+（`LastCommitted` が空なら `findConflicts` は全書き込みキーの `Set` を作らずに即 `[]` を返す）。
 
 ### 7.4 書き込みは commit 時にしかエンジンへ届かない
 
@@ -1023,6 +1026,9 @@ Footer は `metadataChecksum`（Meta / Bloom / Index）と自身のチェック�
 ファイル番号は単調増加で中身は書き換わらないため安全に共有でき、GC が回収できるのでメモリを圧迫しない）。
 同じファイルの 2回目以降の検索・走査は Footer/index の再読み込みを省略できる。
 （不変 engine は読み取り中に状態を持てないため、キャッシュはモジュール内のサイドテーブル）。
+キーはファイル世代ごとに増える（flush / compaction で SSTable が作り直される）ため、
+`put` がキー数 512 ごとに**死んだ弱参照だけ**を掃除する
+（生きた参照は実行中の走査が使うので残す）。
 
 `openDatabase` は `FileMetaData.MaxSeqNo` から NextSeqNo を、
 WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
