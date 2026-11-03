@@ -420,6 +420,11 @@ module internal Optimizer =
                     Indexes = []
                 }
 
+        let tableOf (name: string) =
+            match ExecContext.schemaOf name ctx with
+            | Ok s -> Some s
+            | Error _ -> None
+
         let execScan ctx hint name method =
             match hint with
             | Some 0 -> ret Op.empty
@@ -513,7 +518,28 @@ module internal Optimizer =
                         keys.Residual
             | JoinAlgorithm.IndexNestedLoop _ ->
                 DbError.internalError "index nested loop は JoinIndexLeftFrame で実行します" |> err
-            | JoinAlgorithm.MergeJoin -> DbError.internalError "merge join は未実装です" |> err
+            | JoinAlgorithm.MergeJoin ->
+                let keys = frame.Keys.Value
+
+                match frame.Kind with
+                | JoinKind.Inner ->
+                    Ops.innerJoinMerge
+                        frame.LeftSchema
+                        left
+                        keys.LeftIndices
+                        frame.RightSchema
+                        right
+                        keys.RightIndices
+                        keys.Residual
+                | JoinKind.Left ->
+                    Ops.leftJoinMerge
+                        frame.LeftSchema
+                        left
+                        keys.LeftIndices
+                        frame.RightSchema
+                        right
+                        keys.RightIndices
+                        keys.Residual
 
         match step with
         | EvalNode(node, inSchema, hint) ->
@@ -534,7 +560,7 @@ module internal Optimizer =
                     }
 
                 let algorithm, keys, leftKeyIndices =
-                    Analyzer.chooseJoinAlgorithm leftSchema rightSchema rightTable lTree rTree on
+                    Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema rightTable lTree rTree on
 
                 let frame =
                     {

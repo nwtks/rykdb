@@ -275,11 +275,77 @@ module internal Analyzer =
     let schemaOf (b: TableBinding) =
         Schema.ofTable b.RealName b.Ref.Alias b.Schema
 
+    /// 走査結果が昇順で並ぶ列名（主キー / 索引の列）。
+    /// 単一行しか返さない走査は空リスト（任意の順序でよい）。
+    /// 並び順が保証されない木は None。
+    /// <remarks>
+    /// マージ結合は「両入力が結合キーで昇順」の場合にだけ使える。
+    /// LSM の走査はキーのバイト順 = 主キー / 索引列の SQL 順なので、
+    /// 主キー走査・索引走査はこの並びを返す。`Filter` / `Limit` は順序を変えない。
+    /// </remarks>
+    let private scanOrder (tableOf: string -> TableSchema option) =
+        let primaryKeyOrder t =
+            match TableSchema.primaryKeyColumns t |> Array.toList with
+            | [] -> None
+            | keys -> Some keys
+
+        let rec go =
+            function
+            | Logical.Scan(name, ScanMethod.SeqScan)
+            | Logical.Scan(name, ScanMethod.RangeScan _) -> tableOf name |> Option.bind primaryKeyOrder
+            | Logical.Scan(name, ScanMethod.IndexLookup(indexName, _))
+            | Logical.Scan(name, ScanMethod.IndexRangeScan(indexName, _, _)) ->
+                tableOf name
+                |> Option.bind (fun (t: TableSchema) ->
+                    t.Indexes
+                    |> List.tryFind (fun (i: IndexSchema) -> Catalog.eqName i.Name indexName)
+                    |> Option.map (fun i -> i.Columns))
+            | Logical.Scan(_, ScanMethod.PkLookup _) -> Some []
+            | Logical.Filter(_, child)
+            | Logical.Limit(_, _, child) -> go child
+            | Logical.Values _ -> Some []
+            | _ -> None
+
+        go
+
+    /// 結合キーを走査順に並べ替える。
+    /// 走査順の先頭 `indices.Length` 列がちょうど結合キーであれば、
+    /// その順のキー位置と列名を返す。
+    /// （キーでない列がキーの間に挟まると、その走査はキー順にならないので None）
+    let private alignJoinKeys (schema: Schema) (indices: int array) =
+        let rec pick used acc =
+            function
+            | [] -> Some(List.rev acc)
+            | n :: rest ->
+                let hit =
+                    indices
+                    |> Array.indexed
+                    |> Array.tryFind (fun (_, i) ->
+                        not (List.contains i used) && SqlName.equal schema.Columns.[i].Name n)
+
+                match hit with
+                | Some(_, i) -> pick (i :: used) (i :: acc) rest
+                | None -> None
+
+        let reorder = pick [] [] >> Option.map List.toArray
+
+        function
+        | None -> None
+        | Some [] -> Some(indices, [])
+        | Some names ->
+            if indices.Length > List.length names then
+                None
+            else
+                let prefix = List.truncate indices.Length names
+                reorder prefix |> Option.map (fun reordered -> reordered, prefix)
+
     /// 結合アルゴリズムを選ぶ。
     /// - 等値キーなし: 入れ子ループ
     /// - 左が小さい（上限 32行）かつ右に使える索引: インデックス入れ子ループ
+    /// - 両入力が結合キー順に走査できる: マージ結合
     /// - それ以外の等値結合: ハッシュ結合
     let chooseJoinAlgorithm
+        (tableOf: string -> TableSchema option)
         (leftSchema: Schema)
         (rightSchema: Schema)
         (rightTable: TableSchema)
@@ -408,6 +474,45 @@ module internal Analyzer =
 
         let estimatedRows = estimatedRowsCps id
 
+        let mergeJoinKeys keys =
+            let leftOrder = scanOrder tableOf leftTree
+            let rightOrder = scanOrder tableOf rightTree
+
+            match
+                alignJoinKeys leftSchema keys.LeftIndices leftOrder,
+                alignJoinKeys rightSchema keys.RightIndices rightOrder
+            with
+            | Some(leftKeys, leftNames), Some(rightKeys, rightNames) ->
+                let targetNames = if List.isEmpty leftNames then rightNames else leftNames
+
+                let leftAligned =
+                    if List.isEmpty leftNames then
+                        alignJoinKeys leftSchema keys.LeftIndices (Some targetNames) |> Option.map fst
+                    else
+                        Some leftKeys
+
+                let rightAligned =
+                    if List.isEmpty rightNames then
+                        alignJoinKeys rightSchema keys.RightIndices (Some targetNames) |> Option.map fst
+                    else
+                        Some rightKeys
+
+                let sameOrder =
+                    List.isEmpty leftNames
+                    || List.isEmpty rightNames
+                    || List.length leftNames = List.length rightNames
+                       && List.forall2 (fun a b -> SqlName.equal a b) leftNames rightNames
+
+                match leftAligned, rightAligned with
+                | Some lk, Some rk when sameOrder ->
+                    Some
+                        { keys with
+                            LeftIndices = lk
+                            RightIndices = rk
+                        }
+                | _ -> None
+            | _ -> None
+
         match joinKeys on with
         | None -> JoinAlgorithm.NestedLoop, None, None
         | Some keys ->
@@ -419,7 +524,10 @@ module internal Analyzer =
             match index with
             | Some(indexName, leftIndices) when estimatedRows leftTree <= 32 ->
                 JoinAlgorithm.IndexNestedLoop indexName, Some keys, Some leftIndices
-            | _ -> JoinAlgorithm.HashJoin, Some keys, None
+            | _ ->
+                match mergeJoinKeys keys with
+                | Some aligned -> JoinAlgorithm.MergeJoin, Some aligned, None
+                | None -> JoinAlgorithm.HashJoin, Some keys, None
 
     let private colOf (tn: string) =
         function

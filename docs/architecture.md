@@ -417,13 +417,23 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
    左部分木の見積りが 32 行以下（`Limit` / 主キー等値 / `VALUES`）で、
    右テーブルに結合キー全列を満たす索引があり、右部分木が `Scan` のとき。
    右は左行ごとに `ExecContext.byIndex` で引く。
-2. **ハッシュ結合**（`HashJoin`）:
+2. **マージ結合**（`MergeJoin`）:
+   等値キーがあり、左右の走査が**結合キー順**のとき。
+   `Analyzer.scanOrder` が `SeqScan` / `RangeScan`（主キー列）、
+   `IndexLookup` / `IndexRangeScan`（索引列）を昇順と判定し、
+   `Filter` / `Limit` は順序を変えないので透過する。
+   結合キーがその**先頭 |keys| 列**と一致するときだけ使う
+   （キーでない列が間に挟まる走査はキー順にならない）。
+   `ON` の等値条件の順が走査順と違っても、等値は対称なので走査順に並べ替えてよい。
+   両側が 1行（`PkLookup` / `Values`）なら任意の順序でよい。
+   右側を materialize せず、両側を 1行ずつ流す（`Ops.innerJoinMerge` / `leftJoinMerge`）。
+3. **ハッシュ結合**（`HashJoin`）:
    等値キーがあり、上記以外。右側を `Dictionary<SqlValue array, ...>` のハッシュ表にする。
-3. **入れ子ループ**（`NestedLoop`）:
+4. **入れ子ループ**（`NestedLoop`）:
    等値キーがない（非等値・複合条件）。
 
 - キー列の型が一致する等値条件だけをキーにする（型不一致は入れ子ループ）。
-- NULL キーは一致しない（ハッシュ/索引とも）。
+- NULL キーは一致しない（ハッシュ/索引/マージとも）。
 - 等値キー以外の `ON` 句（residual）は結合時に評価する。
 - インデックス入れ子ループは右部分木が `Filter` のときは使わない
   （右への WHERE pushdown を落とさないため）。
@@ -437,6 +447,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
   右を「右テーブル 1つだけのスキーマ」で実行し、
   戦略に応じて `Ops.innerJoin` / `Ops.leftJoin`（入れ子ループ）、
   `Ops.innerJoinHash` / `Ops.leftJoinHash`（ハッシュ）、
+  `Ops.innerJoinMerge` / `Ops.leftJoinMerge`（マージ）、
   `Ops.innerJoinIndexed` / `Ops.leftJoinIndexed`（インデックス）へ振り分ける
   （ON は左行 + 右行で評価）。
 - `Filter` / `Sort` / `Project` は子の**出力スキーマ**（`outputOf`）を求めてから掛ける。
@@ -467,6 +478,8 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 
 一方で、**入れ子ループ結合とハッシュ結合は Op を組み立てる時点で右側を materialize** する
 （インデックス入れ子ループは左行ごとに右を引く。下表の「遅延」列を参照）。
+**マージ結合は右側を materialize せず、両側を 1行ずつ流す**
+（同じキーの行のグループだけを保持する）。
 materialize は管理メモリ換算で **256MiB が上限**で、超過は `CapacityError`
 （`Ops.toArrayWithBudget`。インデックス検索の結果も同じ上限）。
 ソート・集約・DISTINCT は**入力行を抱えず**、
@@ -483,6 +496,7 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 | `Op.take` / `Op.skip`                            | LIMIT / OFFSET                               |
 | `Ops.innerJoin` / `leftJoin`                     | 入れ子ループ結合                             |
 | `Ops.innerJoinHash` / `leftJoinHash`             | ハッシュ結合                                 |
+| `Ops.innerJoinMerge` / `leftJoinMerge`           | マージ結合                                   |
 | `Ops.innerJoinIndexed` / `leftJoinIndexed`       | インデックス入れ子ループ                     |
 | `Ops.aggregate`                                  | 集約（`groupBy` 値 + 各集約結果 の行を生成） |
 | `Ops.distinct`                                   | 重複除去                                     |
@@ -490,17 +504,18 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 
 遅延の持ち方が演算子ごとに違う。
 
-| 演算子                                         | 遅延                                                                        |
-| ---------------------------------------------- | --------------------------------------------------------------------------- |
-| `Op.ofArray` / `ofRow`                         | `ofArray` は `Compute` で 1行ずつ（組み立て時に全行分のスタックを積まない） |
-| `Op.map` / `Op.filter` / `Op.take` / `Op.skip` | `Compute`。LIMIT / WHERE の早期打ち切りが効く                               |
-| `Ops.project`                                  | `Compute`（1行ずつ）                                                        |
-| `Ops.sortBy` / `Ops.aggregate`                 | **Op 構築時**に全入力を消費するが、行は抱えない（§5.3）                     |
-| `Ops.distinct`                                 | 符号化済みキーの `HashSet` を持ち回る（出現順を保持。バジェット上限あり）   |
-| `Ops.innerJoin` / `leftJoin`                   | 右を materialize し、左を 1行ずつ流す入れ子ループ                           |
-| `Ops.innerJoinHash` / `leftJoinHash`           | 右をハッシュ表に materialize する                                           |
-| `Ops.innerJoinIndexed` / `leftJoinIndexed`     | 左行ごとに `ExecContext.byIndex` で右を引く                                 |
-| `ExecContext.*`                                | スキャン結果を `Op` として受け取る（snapshot は生成時に固定）               |
+| 演算子                                         | 遅延                                                                          |
+| ---------------------------------------------- | ----------------------------------------------------------------------------- |
+| `Op.ofArray` / `ofRow`                         | `ofArray` は `Compute` で 1行ずつ（組み立て時に全行分のスタックを積まない）   |
+| `Op.map` / `Op.filter` / `Op.take` / `Op.skip` | `Compute`。LIMIT / WHERE の早期打ち切りが効く                                 |
+| `Ops.project`                                  | `Compute`（1行ずつ）                                                          |
+| `Ops.sortBy` / `Ops.aggregate`                 | **Op 構築時**に全入力を消費するが、行は抱えない（§5.3）                       |
+| `Ops.distinct`                                 | 符号化済みキーの `HashSet` を持ち回る（出現順を保持。バジェット上限あり）     |
+| `Ops.innerJoin` / `leftJoin`                   | 右を materialize し、左を 1行ずつ流す入れ子ループ                             |
+| `Ops.innerJoinHash` / `leftJoinHash`           | 右をハッシュ表に materialize する                                             |
+| `Ops.innerJoinMerge` / `leftJoinMerge`         | 両側を 1行ずつ流す（同じキーの行のグループだけを保持。右の materialize なし） |
+| `Ops.innerJoinIndexed` / `leftJoinIndexed`     | 左行ごとに `ExecContext.byIndex` で右を引く                                   |
+| `ExecContext.*`                                | スキャン結果を `Op` として受け取る（snapshot は生成時に固定）                 |
 
 `DISTINCT` は `ValueCodec` で符号化したバイト列をキーにし、
 集約のグルーピングは `SqlValue array` の構造比較（`HashIdentity.Structural`）を使う
@@ -508,12 +523,12 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 
 ### 5.3 メモリを抑える 3つの手段
 
-| 対象              | 手段                                                                                                                                                             | メモリの上限                                          |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `ORDER BY`        | 外部マージソート（`ExtSort`）。バジェット内はメモリ、超過分は一時ファイルの run へ溢らして k-way merge。**主キー全列の昇順（単一テーブル）なら Sort を作らない** | 受け皿 1枚（既定 64MiB）+ run ごとの先頭 1行          |
-| `GROUP BY`        | 行を抱えずアクュムレータだけ更新（`Ops.aggregate`）                                                                                                              | グループ数 × アクュムレータ（上限 400万グループ）     |
-| `SELECT DISTINCT` | 符号化済みキーの `HashSet`                                                                                                                                       | 既定 256MiB。超過は `CapacityError`（OOM で死なない） |
-| `JOIN`            | 右側を materialize（入れ子ループ / ハッシュ結合。インデックス検索の結果も同様）                                                                                  | 256MiB。超過は `CapacityError`                        |
+| 対象              | 手段                                                                                                                                                             | メモリの上限                                                       |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `ORDER BY`        | 外部マージソート（`ExtSort`）。バジェット内はメモリ、超過分は一時ファイルの run へ溢らして k-way merge。**主キー全列の昇順（単一テーブル）なら Sort を作らない** | 受け皿 1枚（既定 64MiB）+ run ごとの先頭 1行                       |
+| `GROUP BY`        | 行を抱えずアクュムレータだけ更新（`Ops.aggregate`）                                                                                                              | グループ数 × アクュムレータ（上限 400万グループ）                  |
+| `SELECT DISTINCT` | 符号化済みキーの `HashSet`                                                                                                                                       | 既定 256MiB。超過は `CapacityError`（OOM で死なない）              |
+| `JOIN`            | 右側を materialize（入れ子ループ / ハッシュ結合。インデックス検索の結果も同様）。マージ結合は両側を流し、同じキーの行だけ保持                                    | 256MiB（右側 1つ、または 1キーのグループ）。超過は `CapacityError` |
 
 - 上限の判定は**管理メモリの概算**で行う（`ValueCodec.managedRowBytes` / `Entry.managedBytes`）。
   `SqlValue`（参照型の DU）・string（UTF-16）・配列ヘッダ・Treap / Map ノードを含む。
@@ -525,7 +540,8 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
   次のソート開始時に 24時間を超えたものだけ回収する。
 - ソートは全入力を消費してからでないと 1行も出せないため、`Ops.sortBy` は**呼び出し時に**入力を消化し、
   比較不能な型などのエラーも呼び出し時に返す（従来の契約と同じ）。
-- なお、**JOIN の右側は入れ子ループ / ハッシュ結合では依然として materialize する**。ここは残課題。
+- なお、**JOIN の右側を materialize するのは入れ子ループ / ハッシュ結合とインデックス検索**。
+  両入力がキー順に走査できる等値結合はマージ結合でストリーミングする。
 
 #### 演算子の共通規約
 
@@ -1453,7 +1469,8 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   （`LIMIT` で到達しない後続の破損は従来どおり検出しない）。
 - **ソート・集約・DISTINCT は入力を抱えない**（§5.3）。
   ソートは一時ファイルへ溢らす外部マージ、集約はアクュムレータのみ、DISTINCT は符号化キーの集合。
-  ただし **JOIN の右側は入れ子ループ / ハッシュ結合では materialize する**。
+  ただし **JOIN の右側は入れ子ループ / ハッシュ結合では materialize する**
+  （両入力がキー順に走査できる等値結合はマージ結合で流す）。
 - **最終結果は `Op.toArray` で配列化する**（`Plan.runSelect` の戻り値が配列のため）。
 - **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件に限る**（下限のある条件のみ）。
   `>` / `<` / `BETWEEN` / `LIKE` のうち、`LIKE` は索引を要求しない。
@@ -1474,7 +1491,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   並行させたいときは DB を分けるか、1本のハンドルをキューで直列化する。
 - **MVCC の版は compaction まで圧縮・再利用されない**
   （GC は最古の active snapshot から見えない版を捨てる。ファイル単位では判定しない）。
-- 結合アルゴリズムは `ON` の等値キーと左の見積りで自動選択する（§5.1）。
+- 結合アルゴリズムは `ON` の等値キー・左の見積り・**両入力の走査順**で自動選択する（§5.1）。
   等値キーでも列型が違う場合は入れ子ループになる。
 - **明示 transaction の状態はプロセス内のみ**（`Database` ハンドルが持つ `Manager`）。
   未コミットの書き込みは WAL に残っていても再生されない。

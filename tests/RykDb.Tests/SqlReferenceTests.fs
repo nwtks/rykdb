@@ -942,6 +942,86 @@ let ``SqlReference: ハッシュ結合（INNER / LEFT / NULL キー）`` () =
         Assert.Equal<int64>(1L, asInt residual.Rows.[0].[1]))
 
 [<Fact>]
+let ``SqlReference: マージ結合（主キー同士・LEFT・複合キー）`` () =
+    withDb "joinmerge" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE m1 (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "CREATE TABLE m2 (id INTEGER PRIMARY KEY, w INTEGER)"
+        let db3 = exec db2 "INSERT INTO m1 VALUES (1,10),(2,20),(4,40)"
+        let db4 = exec db3 "INSERT INTO m2 VALUES (2,200),(3,300),(4,400)"
+
+        // 両方が主キー id の走査 → マージ結合
+        let _, inner =
+            ok (db4.Execute "SELECT m1.id, m1.v, m2.w FROM m1 JOIN m2 ON m1.id = m2.id ORDER BY m1.id")
+
+        Assert.Equal<int>(2, inner.Rows.Length)
+        Assert.Equal<int64>(2L, asInt inner.Rows.[0].[0])
+        Assert.Equal<int64>(200L, asInt inner.Rows.[0].[2])
+        Assert.Equal<int64>(4L, asInt inner.Rows.[1].[0])
+        Assert.Equal<int64>(400L, asInt inner.Rows.[1].[2])
+
+        // LEFT: 一致しない 1 は右側 NULL
+        let _, left =
+            ok (db4.Execute "SELECT m1.id, m2.w FROM m1 LEFT JOIN m2 ON m1.id = m2.id ORDER BY m1.id")
+
+        Assert.Equal<int>(3, left.Rows.Length)
+        Assert.True(SqlValue.isNull left.Rows.[0].[1])
+        Assert.Equal<int64>(200L, asInt left.Rows.[1].[1])
+        Assert.Equal<int64>(400L, asInt left.Rows.[2].[1])
+
+        // ON の残り条件で一致が消えた左行も NULL 拡張する
+        let _, leftResidual =
+            ok (db4.Execute "SELECT m1.id, m2.w FROM m1 LEFT JOIN m2 ON m1.id = m2.id AND m2.w > 250 ORDER BY m1.id")
+
+        Assert.Equal<int>(3, leftResidual.Rows.Length)
+        Assert.True(SqlValue.isNull leftResidual.Rows.[0].[1])
+        Assert.True(SqlValue.isNull leftResidual.Rows.[1].[1])
+        Assert.Equal<int64>(400L, asInt leftResidual.Rows.[2].[1])
+
+        // 複合主キー: ON の順が逆でも主キー順に並べ替えてマージ結合にする
+        let c1 =
+            exec db4 "CREATE TABLE c1 (a INTEGER, b INTEGER, v INTEGER, PRIMARY KEY (a, b))"
+
+        let c2 =
+            exec c1 "CREATE TABLE c2 (a INTEGER, b INTEGER, w INTEGER, PRIMARY KEY (a, b))"
+
+        let c3 = exec c2 "INSERT INTO c1 VALUES (1,1,10),(1,2,20),(2,1,30)"
+        let c4 = exec c3 "INSERT INTO c2 VALUES (1,2,200),(2,1,300),(2,2,400)"
+
+        let _, composite =
+            ok (
+                c4.Execute
+                    "SELECT c1.a, c1.b, c1.v, c2.w FROM c1 JOIN c2 ON c1.b = c2.b AND c1.a = c2.a ORDER BY c1.a, c1.b"
+            )
+
+        Assert.Equal<int>(2, composite.Rows.Length)
+        Assert.Equal<int64>(1L, asInt composite.Rows.[0].[0])
+        Assert.Equal<int64>(2L, asInt composite.Rows.[0].[1])
+        Assert.Equal<int64>(200L, asInt composite.Rows.[0].[3])
+        Assert.Equal<int64>(2L, asInt composite.Rows.[1].[0])
+        Assert.Equal<int64>(1L, asInt composite.Rows.[1].[1])
+        Assert.Equal<int64>(300L, asInt composite.Rows.[1].[3])
+
+        // 重複キー: 両方の k に索引があり、範囲条件で k 順の索引走査 → マージ結合
+        let d1 = exec c4 "CREATE TABLE d1 (id INTEGER PRIMARY KEY, k INTEGER)"
+        let d2 = exec d1 "CREATE TABLE d2 (id INTEGER PRIMARY KEY, k INTEGER)"
+        let d3 = exec d2 "CREATE INDEX ix_d1_k ON d1 (k)"
+        let d4 = exec d3 "CREATE INDEX ix_d2_k ON d2 (k)"
+        let d5 = exec d4 "INSERT INTO d1 VALUES (1,10),(2,20),(3,20)"
+        let d6 = exec d5 "INSERT INTO d2 VALUES (1,20),(2,30)"
+
+        let _, duplicates =
+            ok (
+                d6.Execute
+                    "SELECT d1.id, d2.id FROM d1 JOIN d2 ON d1.k = d2.k WHERE d1.k >= 0 AND d2.k >= 0 ORDER BY d1.id, d2.id"
+            )
+
+        Assert.Equal<int>(2, duplicates.Rows.Length)
+        Assert.Equal<int64>(2L, asInt duplicates.Rows.[0].[0])
+        Assert.Equal<int64>(1L, asInt duplicates.Rows.[0].[1])
+        Assert.Equal<int64>(3L, asInt duplicates.Rows.[1].[0])
+        Assert.Equal<int64>(1L, asInt duplicates.Rows.[1].[1]))
+
+[<Fact>]
 let ``SqlReference: インデックス入れ子ループ（右索引 + 左が小さい）`` () =
     withDb "joinindex" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE depts (id INTEGER PRIMARY KEY, name TEXT)"

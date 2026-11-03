@@ -580,6 +580,13 @@ module internal Ops =
 
     let private keyOf (row: SqlValue array) = Array.map (fun i -> row.[i])
 
+    /// 等値キー以外の ON 句（residual）を評価する。
+    /// 結合後の行（左 + 右）を一時配列に連結してから評価する。
+    let private residualMatches leftSchema rightSchema lrow rrow =
+        function
+        | None -> ret true
+        | Some p -> Eval.matches (Schema.concat leftSchema rightSchema) (Array.append lrow rrow) p
+
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
     /// lookupRows は左キーから右行のリストを返す（見つからなければ空）。
     /// <remarks>
@@ -595,11 +602,6 @@ module internal Ops =
         (lookupRows: SqlValue array -> Result<ResizeArray<SqlValue array>, DbError>)
         (residual: Expr option)
         =
-        let residualMatches leftSchema rightSchema lrow rrow =
-            function
-            | None -> ret true
-            | Some p -> Eval.matches (Schema.concat leftSchema rightSchema) (Array.append lrow rrow) p
-
         let rightWidth = rightSchema.Columns.Length
 
         let padded lrow =
@@ -692,6 +694,216 @@ module internal Ops =
         |> Result.map (fun rightRows ->
             let table = buildHashTable rightRows rightKeys
             joinProbe true leftSchema left leftKeys rightSchema (lookupHash table) residual)
+
+    /// マージ結合の入力側の状態。
+    /// `MergeStart` はまだ 1行も取り出していない入力、`MergeAt` は現在行と続き。
+    type private MergeSide =
+        | MergeStart of Op
+        | MergeAt of SqlValue array * Op
+        | MergeDone
+
+    /// 次の 1行を先読みした状態にする。
+    let private pullMergeSide (side: MergeSide) =
+        let fromOp op =
+            match Op.next op with
+            | Error e -> err e
+            | Ok None -> ret MergeDone
+            | Ok(Some(row, rest)) -> ret (MergeAt(row, rest))
+
+        match side with
+        | MergeStart op
+        | MergeAt(_, op) -> fromOp op
+        | MergeDone -> ret MergeDone
+
+    /// まだ 1行も取り出していなければ、先頭行を先読みする。
+    let private ensureMergeSide (side: MergeSide) =
+        match side with
+        | MergeStart _ -> pullMergeSide side
+        | _ -> ret side
+
+    /// 結合キーの比較（NULL は呼び出し側で除く）。
+    let rec private compareKeyVectors (i: int) (a: SqlValue array) (b: SqlValue array) =
+        if i >= a.Length then
+            ret 0
+        else
+            match SqlValue.compareValues a.[i] b.[i] with
+            | Error e -> err e
+            | Ok 0 -> compareKeyVectors (i + 1) a b
+            | Ok c -> ret c
+
+    /// 等値キーの行をまとめて取り出す（入力はキー昇順）。
+    /// 返り値は (グループの行, グループの次の行を含む状態)。
+    /// 1グループのメモリは `JoinBudgetBytes` で制限する。
+    let private takeMergeGroup (keys: int array) (side: MergeSide) =
+        match side with
+        | MergeStart _
+        | MergeDone -> ret ([||], side)
+        | MergeAt(first, _) ->
+            let groupKey = keyOf first keys
+
+            let rec go used acc current =
+                match pullMergeSide current with
+                | Error e -> err e
+                | Ok MergeDone -> ret (List.rev acc |> List.toArray, MergeDone)
+                | Ok(MergeStart _) -> DbError.internalError "merge join: 入力状態が不正です" |> err
+                | Ok(MergeAt(row, _) as next) ->
+                    match compareKeyVectors 0 (keyOf row keys) groupKey with
+                    | Error e -> err e
+                    | Ok 0 ->
+                        let used = used + int64 (ValueCodec.managedRowBytes row) + 32L
+
+                        if used > JoinBudgetBytes then
+                            sprintf "JOIN の同じキーの行が多すぎます（概算 %d バイトの上限）" JoinBudgetBytes
+                            |> DbError.capacity
+                            |> err
+                        else
+                            go used (row :: acc) next
+                    | Ok _ -> ret (List.rev acc |> List.toArray, next)
+
+            let firstBytes = int64 (ValueCodec.managedRowBytes first) + 32L
+
+            if firstBytes > JoinBudgetBytes then
+                sprintf "JOIN の同じキーの行が多すぎます（概算 %d バイトの上限）" JoinBudgetBytes
+                |> DbError.capacity
+                |> err
+            else
+                go firstBytes [ first ] side
+
+    /// マージ結合。両入力は結合キーで昇順に並んでいる必要がある
+    /// （`Analyzer.chooseJoinAlgorithm` が走査の並び順を確認して選ぶ）。
+    /// 右側を materialize せず、両側を 1行ずつ流す。
+    /// <remarks>
+    /// `Op.Compute` の継続内で `loop` / `emitGroup` を呼ぶので、TailAudit はラムダ内の
+    /// 呼び出しを非末尾として報告する（`joinProbe` の `probe/emit` と同じ、1行ごとに 1段だけ進む）。
+    /// </remarks>
+    let private mergeJoin
+        (isLeft: bool)
+        (leftSchema: Schema)
+        (left: Op)
+        (leftKeys: int array)
+        (rightSchema: Schema)
+        (right: Op)
+        (rightKeys: int array)
+        (residual: Expr option)
+        =
+        let rightWidth = rightSchema.Columns.Length
+
+        let padded lrow =
+            Array.append lrow (Array.create rightWidth SqlValue.Null)
+
+        let rec loop lside rside =
+            match lside, rside with
+            | MergeStart _, _ ->
+                Op.Compute(fun () ->
+                    match ensureMergeSide lside with
+                    | Error e -> err e
+                    | Ok lnext -> Op.next (loop lnext rside))
+            | _, MergeStart _ ->
+                Op.Compute(fun () ->
+                    match ensureMergeSide rside with
+                    | Error e -> err e
+                    | Ok rnext -> Op.next (loop lside rnext))
+            | MergeDone, _ -> Op.empty
+            | _, MergeDone ->
+                if not isLeft then
+                    Op.empty
+                else
+                    match lside with
+                    | MergeAt(lrow, _) ->
+                        Op.Compute(fun () ->
+                            match pullMergeSide lside with
+                            | Error e -> err e
+                            | Ok lnext -> ret (Some(padded lrow, loop lnext MergeDone)))
+                    | _ -> Op.empty
+            | MergeAt(lrow, _), MergeAt(rrow, _) ->
+                if hasNullKey lrow leftKeys then
+                    Op.Compute(fun () ->
+                        match pullMergeSide lside with
+                        | Error e -> err e
+                        | Ok lnext ->
+                            if isLeft then
+                                ret (Some(padded lrow, loop lnext rside))
+                            else
+                                Op.next (loop lnext rside))
+                elif hasNullKey rrow rightKeys then
+                    Op.Compute(fun () ->
+                        match pullMergeSide rside with
+                        | Error e -> err e
+                        | Ok rnext -> Op.next (loop lside rnext))
+                else
+                    match compareKeyVectors 0 (keyOf lrow leftKeys) (keyOf rrow rightKeys) with
+                    | Error e -> Op.Compute(fun () -> err e)
+                    | Ok c when c < 0 ->
+                        Op.Compute(fun () ->
+                            match pullMergeSide lside with
+                            | Error e -> err e
+                            | Ok lnext ->
+                                if isLeft then
+                                    ret (Some(padded lrow, loop lnext rside))
+                                else
+                                    Op.next (loop lnext rside))
+                    | Ok c when c > 0 ->
+                        Op.Compute(fun () ->
+                            match pullMergeSide rside with
+                            | Error e -> err e
+                            | Ok rnext -> Op.next (loop lside rnext))
+                    | Ok _ ->
+                        match takeMergeGroup leftKeys lside with
+                        | Error e -> Op.Compute(fun () -> err e)
+                        | Ok(lgroup, lnext) ->
+                            match takeMergeGroup rightKeys rside with
+                            | Error e -> Op.Compute(fun () -> err e)
+                            | Ok(rgroup, rnext) -> emitGroup lgroup rgroup lnext rnext 0 0 false
+
+        and emitGroup lgroup rgroup lnext rnext i j matchedThisRow =
+            if i >= lgroup.Length then
+                loop lnext rnext
+            elif j >= rgroup.Length then
+                if isLeft && not matchedThisRow then
+                    Op.Compute(fun () ->
+                        ret (Some(padded lgroup.[i], emitGroup lgroup rgroup lnext rnext (i + 1) 0 false)))
+                else
+                    emitGroup lgroup rgroup lnext rnext (i + 1) 0 false
+            else
+                let lrow = lgroup.[i]
+                let rrow = rgroup.[j]
+
+                match residualMatches leftSchema rightSchema lrow rrow residual with
+                | Error e -> Op.Compute(fun () -> err e)
+                | Ok false ->
+                    Op.Compute(fun () -> Op.next (emitGroup lgroup rgroup lnext rnext i (j + 1) matchedThisRow))
+                | Ok true ->
+                    Op.Compute(fun () ->
+                        ret (Some(Array.append lrow rrow, emitGroup lgroup rgroup lnext rnext i (j + 1) true)))
+
+        Op.Compute(fun () -> Op.next (loop (MergeStart left) (MergeStart right)))
+
+    /// INNER JOIN（マージ結合）。両入力は結合キーで昇順であること。
+    /// 右側を materialize しないので、右が大きなテーブルでもメモリはキー重複分だけで済む。
+    let innerJoinMerge
+        (leftSchema: Schema)
+        (left: Op)
+        (leftKeys: int array)
+        (rightSchema: Schema)
+        (right: Op)
+        (rightKeys: int array)
+        (residual: Expr option)
+        =
+        mergeJoin false leftSchema left leftKeys rightSchema right rightKeys residual
+        |> ret
+
+    /// LEFT JOIN（マージ結合）。両入力は結合キーで昇順であること。
+    let leftJoinMerge
+        (leftSchema: Schema)
+        (left: Op)
+        (leftKeys: int array)
+        (rightSchema: Schema)
+        (right: Op)
+        (rightKeys: int array)
+        (residual: Expr option)
+        =
+        mergeJoin true leftSchema left leftKeys rightSchema right rightKeys residual
+        |> ret
 
     /// インデックス検索の結果を上限付きで materialize して `joinProbe` の形に載せる。
     /// 非一意索引の prefix 検索は 1キーに大量の行が付き得るため上限を置く。

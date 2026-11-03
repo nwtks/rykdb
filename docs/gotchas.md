@@ -1617,7 +1617,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 - 空のレコード列ではファイルを作らない（従来どおり）。
 - 回帰テスト: `WalTests`（フレームの往復）と `DatabaseTests` の WAL 再生・クラッシュ耐性。
 
-### 11.44 JOIN の右側は上限付きで materialize する
+### 11.44 JOIN が保持する行は上限付きにする
 
 入れ子ループ / ハッシュ結合は右側の全行を保持する（設計どおり）。
 無制限だと巨大な右テーブルで OOM し、プロセスごと落ちる。
@@ -1625,6 +1625,8 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 超過は `CapacityError`（`Ops.distinct` / transaction と同じ考え方）。
 
 - インデックス入れ子ループの検索結果（非一意索引の 1キーに大量の行）も同じ上限。
+- マージ結合は右側を丸ごと持たないが、**同じキーの行のグループ**（左右それぞれ）を保持する。
+  1キーに大量の行が付く場合は `takeMergeGroup` が 1グループ 256MiB で打ち切る。
 - ハッシュ結合の表（バケット）は行配列の後に作られ、行配列は表作りの後に捨てられる
   （ピークは概ね上限の 2倍まで）。
 - `lookupHash` はバケットをそのまま返す（probe ごとの `ToArray` を廃止）。
@@ -1647,3 +1649,18 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 - 回帰テスト: `Sstable.writeTo: 入力の seq は 1 回だけ列挙する` /
   `FileMetaData.writeSstable: キー順でない入力はエラー`
   （部分ファイルが残らないことを含む）。
+
+### 11.46 マージ結合は「走査が結合キー順」のときだけ選ぶ
+
+`Analyzer.chooseJoinAlgorithm` は `Logical` の走査から昇順の列を求める（`scanOrder`）。
+`SeqScan` / `RangeScan` は主キー列、`IndexLookup` / `IndexRangeScan` は索引列、
+`Filter` / `Limit` は透過、`PkLookup` / `Values` は単一行（任意の順序）。
+
+- 結合キーが走査順の**先頭 |keys| 列**と一致するときだけマージ結合にする。
+  キーでない列がキーの間に挟まる走査（PK `(a,b)` に対するキー `{a,c}` など）は
+  全体としてキー順にならないので使わない。
+- 左右のキー順が違う場合（左 PK `(a,b)` / 右 PK `(b,a)` で `{a,b}` を結合）も使わない。
+- `ON` の記述順は自由。等値は対称なので、走査順にキーを並べ替えてよい。
+- 回帰テスト: `Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致するときだけマージ結合` /
+  `SqlReference: マージ結合（主キー同士・LEFT・複合キー）` /
+  `OpsTests` のマージ結合 5 本（ハッシュ結合との差分比較を含む）。
