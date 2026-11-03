@@ -622,7 +622,8 @@ SELECT p.id, d.dname
 
 ### 7.6 `ORDER BY` の安定性
 
-ソートは外部マージ（`ExtSort`）で並べる。バジェット（既定 64 MiB）に収まる入力はメモリだけで、
+ソートは外部マージ（`ExtSort`）で並べる。
+バジェット（管理メモリの概算。既定 64MiB）に収まる入力はメモリだけで、
 超過分は一時ファイル（`%TEMP%/rykdb-sort-*`）へ溢らしてから k-way merge する。
 同時に開く run は最大 32本で、それを超える場合は中間 run へ multi-pass merge する。
 同値な行の順序は保証されない（`ORDER BY` のキーが一意でないとき）。
@@ -928,7 +929,7 @@ ROLLBACK;        -- 削除を取り消し
 - 識別子（テーブル・列・索引・別名）は**大文字小文字を区別しない**。
 - `COMMIT` はバッファをエンジンへ流す。
 - `ROLLBACK` はバッファを捨てる。
-- 1 transaction の書き込みバッファは概算 256 MiB が上限。
+- 1 transaction の書き込みバッファは管理メモリの概算 256MiB が上限。
   超えると `CapacityError` になる（DDL の一括処理は除く）。
 - **DDL（`CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX`）は明示 transaction 中には実行できない**
   （即時反映のため）。

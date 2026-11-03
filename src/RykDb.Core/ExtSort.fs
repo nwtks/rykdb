@@ -225,7 +225,7 @@ module private Spill =
 /// 比較不能な型などを早い段階で Error にする（状態は値として持ち回る）。
 /// </remarks>
 module internal ExtSort =
-    /// 受け皿の既定バジェット（概算バイト）。
+    /// 受け皿の既定バジェット（管理メモリの概算バイト）。
     /// これ以内に収まるソートは従来どおりメモリだけで完結する。
     let DefaultBudgetBytes = 64L * 1024L * 1024L
 
@@ -412,8 +412,6 @@ module internal ExtSort =
                             err e
                         | Ok states -> ret (mergeRuns states)
 
-        let approxRow = Array.sumBy ValueCodec.approximateBytes
-
         let rec ingest stamp buf bufBytes written paths state next =
             match Op.next next with
             | Error e ->
@@ -426,7 +424,7 @@ module internal ExtSort =
                     Spill.forget paths
                     err e
                 | Ok state' ->
-                    let size = int64 (approxRow row)
+                    let size = int64 (ValueCodec.managedRowBytes row)
 
                     if buf.Count > 0 && bufBytes + size > budgetBytes then
                         match Spill.writeRun stamp written compareRows (buf.ToArray()) with

@@ -28,7 +28,9 @@ module internal Entry =
             Value = None
         }
 
-    let approxBytes (e: Entry) =
+    /// エントリの符号化後のおよそのバイト数（SSTable との整合確認用）。
+    /// メモリ上限の判定には `managedBytes` を使う。
+    let encodedBytes (e: Entry) =
         let valueBytes v =
             match ValueCodec.fixedEncodedBytes v with
             | Some n -> n
@@ -44,6 +46,20 @@ module internal Entry =
             |> Option.defaultValue 2
 
         e.Key.Length + 8 + payload
+
+    /// memtable が 1エントリを保持するのに要するヒープ上の概算サイズ。
+    /// <remarks>
+    /// Treap ノード（48）+ Entry（40）+ `option Some`（24）+ キー配列（24 + 長さ）
+    /// + 行配列と値（`ValueCodec.managedRowBytes`）。
+    /// 64bit の .NET を前提にした概算で、`SstEntry.approximateBytes`（ファイルサイズ）とは別物。
+    /// </remarks>
+    let managedBytes (e: Entry) =
+        let rowBytes =
+            match e.Value with
+            | Some values -> ValueCodec.managedRowBytes values
+            | None -> 0
+
+        112 + 24 + e.Key.Length + rowBytes
 
     /// エントリ列に含まれる SeqNo の最大値（空なら 0）。
     let maxSeqNo (entries: Entry seq) =
@@ -139,7 +155,7 @@ type internal Memtable =
     {
         Root: TNode option
         Count: int
-        /// メモリ上限判定用の概算サイズ
+        /// メモリ上限判定用の概算サイズ（管理メモリ。Treap ノード・Entry・行配列・値を含む）
         ApproxBytes: int
     }
 
@@ -220,7 +236,7 @@ module internal Memtable =
         {
             Root = insertNode e mem.Root
             Count = mem.Count + 1
-            ApproxBytes = mem.ApproxBytes + Entry.approxBytes e
+            ApproxBytes = mem.ApproxBytes + Entry.managedBytes e
         }
 
     /// 複数のエントリをまとめて挿入する。

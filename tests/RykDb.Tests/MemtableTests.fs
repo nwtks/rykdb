@@ -79,7 +79,7 @@ let ``Memtable: Count と ApproxBytes は挿入したエントリの合計にな
 
     let mem = Memtable.apply entries Memtable.Empty
     Assert.Equal(entries.Length, mem.Count)
-    Assert.Equal(entries |> Array.sumBy Entry.approxBytes, mem.ApproxBytes)
+    Assert.Equal(entries |> Array.sumBy Entry.managedBytes, mem.ApproxBytes)
 
     // 空への apply は何も変えない
     let same = Memtable.apply [] mem
@@ -105,7 +105,7 @@ let ``Memtable / SSTable の概算は固定長の値で同じ定数を使う`` (
     // Entry 側の overhead は「キー + SeqNo 8 + 値の個数 2」、
     // SstEntry 側は「キー + 値の個数 4」。固定長なら差は常に 6 になる。
     for v in values do
-        let a = Entry.approxBytes (Entry.put key 1UL [| v |])
+        let a = Entry.encodedBytes (Entry.put key 1UL [| v |])
         let b = SstEntry.approximateBytes (SstEntry.make key 1UL (Some [| v |]))
         Assert.Equal(6, a - b)
 

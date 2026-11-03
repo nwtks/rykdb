@@ -512,6 +512,10 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 | `GROUP BY`        | 行を抱えずアクュムレータだけ更新（`Ops.aggregate`）                                                                                                              | グループ数 × アクュムレータ（上限 400万グループ）     |
 | `SELECT DISTINCT` | 符号化済みキーの `HashSet`                                                                                                                                       | 既定 256MiB。超過は `CapacityError`（OOM で死なない） |
 
+- 上限の判定は**管理メモリの概算**で行う（`ValueCodec.managedRowBytes` / `Entry.managedBytes`）。
+  `SqlValue`（参照型の DU）・string（UTF-16）・配列ヘッダ・Treap / Map ノードを含む。
+  `ValueCodec.approximateBytes` / `SstEntry.approximateBytes` は**符号化サイズ**
+  （SSTable のファイルサイズ見積り）で、メモリの判定には使わない。
 - 同時に開く run は最大 **32本**。run が 32本を超える場合は 32本ずつ中間 run にマージし、
   最後に 32本以下を k-way merge する（file descriptor の枯渇を防ぐ multi-pass merge）。
 - 一時ファイルは `%TEMP%/rykdb-sort-*` 。run が尽きた時点で消し、途中打ち切りで残ったものは
@@ -744,8 +748,8 @@ COMMIT
 - abort した transaction の書き込みが DB に一切残らない
 - 自分の書き込みを commit 前に読める
 
-Buffers は概算バイト数を管理し、既定 256MiB を超えると DML の行追加時点
-（または commit 時の最終検査）で `CapacityError` を返す。
+Buffers は**管理メモリの概算**（`Transaction.slotBytes`。キー配列・行配列・各値を含む）を管理し、
+既定 256MiB を超えると DML の行追加時点（または commit 時の最終検査）で `CapacityError` を返す。
 巨大 transaction が WAL やメモリを無制限に消費しないための上限。
 DDL 自体は transaction 上限を外すが、`CREATE INDEX` の backfill と
 `DROP TABLE` / `DROP INDEX` の後始末は 8192行ずつのチャンクに分けて commit する。
@@ -922,11 +926,11 @@ WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つの�
 `RowStore` は `IStorageEngine`（`NextSeqNo` / `ActiveSnapshot` / `GetAt` / `ScanAt` / `WriteBatch` / `WithNextSeqNo` / `WithActiveSnapshot` / `MaybeFlush` / `Close`）越しに扱う。
 テストではこれをメモリ実装に差し替え、ディスク I/O なしで上位層を検証する。
 
-| 既定値                        | 値    |
-| ----------------------------- | ----- |
-| `DefaultMemLimitBytes`        | 64MiB |
-| `BloomFalsePositiveRate`      | 0.01  |
-| `Levels.Count` / `Levels.Max` | 7 / 6 |
+| 既定値                        | 値                        |
+| ----------------------------- | ------------------------- |
+| `DefaultMemLimitBytes`        | 64MiB（管理メモリの概算） |
+| `BloomFalsePositiveRate`      | 0.01                      |
+| `Levels.Count` / `Levels.Max` | 7 / 6                     |
 
 ### 8.1 Memtable — 永続 Treap
 

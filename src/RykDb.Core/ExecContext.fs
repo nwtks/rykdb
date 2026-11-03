@@ -306,10 +306,9 @@ module internal DmlOps =
             gatherWith (Eval.eval targetSchema row) schema (List.map snd assignments) targets
             |> Result.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
 
-        let targetSchema = targetSchemaOf schema
+        let rowBytes row = int64 (ValueCodec.managedRowBytes row)
 
-        let rowBytes row =
-            int64 (Entry.approxBytes (Entry.put [||] 0UL row))
+        let targetSchema = targetSchemaOf schema
 
         let rec go targets acc bytes cur =
             match Op.next cur with
@@ -323,7 +322,7 @@ module internal DmlOps =
                     match assign targetSchema targets row with
                     | Error e -> err e
                     | Ok newRow ->
-                        let bytes = bytes + rowBytes row + rowBytes newRow
+                        let bytes = bytes + rowBytes row + rowBytes newRow + 24L
 
                         if bytes > ctx.Txn.LimitBytes then
                             sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" ctx.Txn.LimitBytes

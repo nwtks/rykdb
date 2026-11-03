@@ -557,10 +557,10 @@ module internal KeyBuilder =
 /// 行ペイロード用のコンパクト符号化。
 /// キーと異なり、行値には順序保持が不要なので varint で詰めて小さくする。
 module internal ValueCodec =
-    let private writeValue (v: SqlValue) (w: Writer) =
+    let private writeValue (w: Writer) =
         let tagged tag = w |> Writer.writeByte (byte tag)
 
-        match v with
+        function
         | SqlValue.Null -> tagged 0uy
         | SqlValue.Bool b -> tagged 1uy |> Writer.bool b
         | SqlValue.Int i -> tagged 2uy |> Writer.int64LE i
@@ -641,7 +641,7 @@ module internal ValueCodec =
     let writeValues (values: SqlValue seq) (w: Writer) =
         let arr = Seq.toArray values
         let withCount = w |> Writer.varint (uint64 arr.Length)
-        Array.fold (fun w v -> writeValue v w) withCount arr
+        Array.fold writeValue withCount arr
 
     let readValues (c: Cursor) =
         result {
@@ -656,8 +656,8 @@ module internal ValueCodec =
 
     /// 固定長の値の符号化サイズ（型タグ込み）。
     /// TEXT / BLOB は長さ依存なので `None`。
-    let fixedEncodedBytes (v: SqlValue) =
-        match v with
+    let fixedEncodedBytes =
+        function
         | SqlValue.Null -> Some 1
         | SqlValue.Bool _ -> Some 2
         | SqlValue.Int _ -> Some 9
@@ -669,9 +669,11 @@ module internal ValueCodec =
         | SqlValue.Text _
         | SqlValue.Blob _ -> None
 
-    /// 1値の符号化後のおよそのバイト数。
-    /// メモリ使用量の見積もり（ソートのバジェット判定など）に使う。
-    /// SSTable の実サイズとは厳密には一致しない。
+    /// 1値の符号化後のおよそのバイト数（SSTable のファイルサイズ見積り）。
+    /// 実際のファイルサイズとは厳密には一致しない。
+    /// **メモリ上限の判定には使わない**
+    /// （参照型の `SqlValue`・string・配列ヘッダを含まないため）。
+    /// メモリの見積りは `managedBytes` / `managedRowBytes` を使う。
     let approximateBytes (v: SqlValue) =
         match fixedEncodedBytes v with
         | Some n -> n
@@ -680,3 +682,29 @@ module internal ValueCodec =
             | SqlValue.Text s -> 5 + System.Text.Encoding.UTF8.GetByteCount s
             | SqlValue.Blob bs -> 5 + bs.Length
             | _ -> 1
+
+    /// 値 1つのヒープ上の概算サイズ（メモリ上限の判定用）。
+    /// <remarks>
+    /// `SqlValue` は参照型の DU なので、
+    /// 1値ごとにオブジェクト ヘッダ（16 バイト）とペイロードを持つ。
+    /// TEXT は `SqlValue` 本体（24）+ string（24 + UTF-16 で 2 バイト/文字）、
+    /// BLOB は `SqlValue` 本体（24）+ byte 配列（24 + 長さ）。
+    /// 64bit の .NET を前提にした概算で、厳密なサイズではない。
+    /// </remarks>
+    let managedBytes =
+        function
+        | SqlValue.Null -> 0
+        | SqlValue.Text s -> 48 + 2 * s.Length
+        | SqlValue.Blob b -> 48 + b.Length
+        | SqlValue.Decimal _
+        | SqlValue.Timestamp _
+        | SqlValue.Uuid _ -> 32
+        | SqlValue.Bool _
+        | SqlValue.Int _
+        | SqlValue.Real _
+        | SqlValue.Date _ -> 24
+
+    /// 1行（`SqlValue array`）のヒープ上の概算サイズ。
+    /// 配列ヘッダ（24）+ スロット（8 × 列数）+ 各値（`managedBytes`）。
+    let managedRowBytes (row: SqlValue array) =
+        24 + 8 * row.Length + (row |> Array.sumBy managedBytes)

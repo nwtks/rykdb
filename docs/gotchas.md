@@ -1586,3 +1586,22 @@ active な transaction が無ければ境界は `commitSeq + 1` になり、comm
 （全書き込みキーの `Set<string>`（base64 文字列）を作らない）。
 回帰テスト: `TransactionManager.commit: active が無ければ commit 直後に LastCommitted を捨てる` /
 `TransactionManager.commit: 古い snapshot の transaction が居る間は掃除しない`。
+
+### 11.42 メモリ上限は「符号化サイズ」ではなく「管理メモリ」で見積もる
+
+`ValueCodec.approximateBytes` / `SstEntry.approximateBytes` は SSTable の**ファイルサイズ**見積りで、
+型タグとペイロードしか数えない
+（参照型の `SqlValue` オブジェクト・string の UTF-16・配列ヘッダ・Treap / Map ノードを含まない）。
+これをメモリ上限の判定に使うと、`MemLimitBytes = 64MiB` でも memtable が実測 450MiB 程度まで膨らんだ
+（20万行・2列で符号化 13.4MiB に対して実測 96.8MiB、約 7倍）。
+
+- メモリ判定は `ValueCodec.managedBytes`（値 1個）・`managedRowBytes`（行配列）・
+  `Entry.managedBytes`（Treap ノード + Entry + option + キー配列 + 行）・
+  `Transaction.slotBytes`（Map スロット）を使う。
+- ファイルサイズの見積り（compaction の出力分割）は `ValueCodec.approximateBytes` /
+  `SstEntry.approximateBytes` のまま変えない。
+- 実測（2列・TEXT 48文字）: 20,000行で実測 7.8MiB / 見積り 6.7MiB（約 1.2倍）。
+  200,000行では 64MiB を超えて commit 中に flush され、memtable の保持はほぼ 0 になった。
+- 回帰テスト: `Memtable: Count と ApproxBytes は挿入したエントリの合計になる` /
+  `ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの概算` /
+  `Entry.managedBytes: memtable の保持量は符号化サイズより大きい`。

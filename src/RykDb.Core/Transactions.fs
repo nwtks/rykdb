@@ -56,13 +56,16 @@ module internal Transaction =
             LimitBytes = DefaultLimitBytes
         }
 
+    /// transaction のバッファ 1スロット（Map ノード・キー配列・行・値を含む）の
+    /// ヒープ上の概算サイズ。
+    /// `Entry.managedBytes` は Treap ノードの分も数えるので使わない（バッファは Map）。
     let private slotBytes (keyspace: string) (key: byte array) (slot: SqlValue array option) =
-        let entry =
+        let rowBytes =
             match slot with
-            | Some value -> Entry.put key 0UL value
-            | None -> Entry.delete key 0UL
+            | Some values -> ValueCodec.managedRowBytes values
+            | None -> 0
 
-        int64 keyspace.Length + int64 (Entry.approxBytes entry) + 16L
+        int64 keyspace.Length + 48L + 24L + int64 key.Length + int64 rowBytes
 
     let private setSlot (keyspace: string) (key: byte array) (slot: SqlValue array option) (txn: Transaction) =
         let inner =

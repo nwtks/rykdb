@@ -439,3 +439,38 @@ let ``ValueCodec: 不明な型タグは CorruptionError`` () =
 let ``ValueCodec: 要素数が大きすぎると CorruptionError`` () =
     let bytes = Writer.build [ Writer.varint (uint64 Int32.MaxValue + 1UL) ]
     expectErrorKind ErrorKind.CorruptionError "要素数が大きすぎる場合はエラー" (ValueCodec.readValues (Cursor.create bytes))
+
+[<Fact>]
+let ``ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの概算`` () =
+    // 符号化サイズ（ファイルサイズ見積り）より大きい（SqlValue 本体 + string/配列）
+    let short = SqlValue.Text "abc"
+    let long = SqlValue.Text(System.String('x', 300))
+
+    Assert.True(ValueCodec.managedBytes short > ValueCodec.approximateBytes short)
+    Assert.Equal(48 + 2 * 300, ValueCodec.managedBytes long)
+    Assert.True(ValueCodec.managedBytes long > ValueCodec.managedBytes short)
+
+    // 固定長は 24 バイト（NULL は共有インスタンスなので 0）
+    Assert.Equal(24, ValueCodec.managedBytes (SqlValue.Int 42L))
+    Assert.Equal(32, ValueCodec.managedBytes (SqlValue.Decimal 1.5M))
+    Assert.Equal(0, ValueCodec.managedBytes SqlValue.Null)
+
+    // 行は配列ヘッダ 24 + スロット 8 × 列数 + 各値
+    let row = [| SqlValue.Int 1L; SqlValue.Null |]
+    Assert.Equal(24 + 8 * 2 + 24, ValueCodec.managedRowBytes row)
+
+[<Fact>]
+let ``Entry.managedBytes: memtable の保持量は符号化サイズより大きい`` () =
+    let key = [| 1uy; 2uy |]
+    let entry = Entry.put key 1UL [| SqlValue.Int 1L; SqlValue.Text "abcdef" |]
+
+    // Treap ノード + Entry + option + キー配列 + 行配列 + 値を含む
+    Assert.True(Entry.managedBytes entry > Entry.encodedBytes entry)
+
+    // 同じ行でも値が長いほど大きい
+    let longer = Entry.put key 1UL [| SqlValue.Int 1L; SqlValue.Text "abcdefghij" |]
+    Assert.True(Entry.managedBytes longer > Entry.managedBytes entry)
+
+    // tombstone は行を持たない（差分は行配列 + 値の分だけ減る）
+    let tombstone = Entry.delete key 1UL
+    Assert.True(Entry.managedBytes tombstone < Entry.managedBytes entry)

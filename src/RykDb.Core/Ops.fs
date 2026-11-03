@@ -5,9 +5,6 @@ module internal Ops =
     /// 超えたら `CapacityError` で止める（OOM でプロセスごと落とさないため）。
     let private DistinctBudgetBytes = 256L * 1024L * 1024L
 
-    /// 1行の概算バイト数（メモリ使用量の見積もり用）。
-    let private rowBytes = Array.sumBy ValueCodec.approximateBytes
-
     /// 述語で弾く。
     let filter (schema: Schema) (predicate: Expr) =
         Op.filter (fun row -> Eval.matches schema row predicate)
@@ -125,7 +122,7 @@ module internal Ops =
                     |> err
                 else
                     seen.Add key |> ignore
-                    ret (Some(row, skipSeen (used + int64 (rowBytes row)) nxt)))
+                    ret (Some(row, skipSeen (used + int64 (ValueCodec.managedRowBytes row)) nxt)))
 
         skipSeen 0L src
 
