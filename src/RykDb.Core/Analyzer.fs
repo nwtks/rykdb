@@ -72,6 +72,31 @@ type internal Logical =
     | Limit of int * int * Logical
     /// 定数 1行（FROM を省略した `SELECT 1` などの入力）
     | Values of SqlValue array
+    /// FROM / JOIN のサブクエリ（派生テーブル）。
+    /// 内側の論理木を自前の入力スキーマ・実行文脈で 1回だけ実行する。
+    | Derived of PlannedQuery
+
+/// 派生テーブル（FROM / JOIN のサブクエリ）の計画結果。
+/// 計画時には実行せず、外側のオペレータ木がこのノードに到達した時点で実行する。
+/// <remarks>
+/// `Input` と `Context` を別に持つのは、内側 SELECT が外側と違う入力スキーマ
+/// （FROM のテーブル構成）と、内側の別名スキーマを登録した文脈で走るため。
+/// 外側の ctx で内側を実行すると、内側のテーブル別名を引けない。
+/// </remarks>
+and internal PlannedQuery =
+    {
+        /// 外側から参照するときの出力スキーマ。
+        /// 列名は参照名（`SELECT t.id` なら `id`）、派生テーブルでは別名で修飾済み。
+        Output: Schema
+        /// 結果表示用のスキーマ（列名は式の表示名）。
+        Header: Schema
+        /// 内側 SELECT の入力スキーマ
+        Input: Schema
+        /// 内側 SELECT を実行する文脈（外側と同じ snapshot / transaction）
+        Context: ExecContext
+        /// 内側 SELECT の論理木
+        Tree: Logical
+    }
 
 module internal Binder =
     /// 修飾子無しの列名を「修飾名」にする。
@@ -348,7 +373,7 @@ module internal Analyzer =
         (tableOf: string -> TableSchema option)
         (leftSchema: Schema)
         (rightSchema: Schema)
-        (rightTable: TableSchema)
+        (rightTable: TableSchema option)
         (leftTree: Logical)
         (rightTree: Logical)
         (on: Expr)
@@ -517,8 +542,8 @@ module internal Analyzer =
         | None -> JoinAlgorithm.NestedLoop, None, None
         | Some keys ->
             let index =
-                match rightTree with
-                | Logical.Scan(_, _) -> rightIndexForJoin rightSchema rightTable keys
+                match rightTree, rightTable with
+                | Logical.Scan(_, _), Some table -> rightIndexForJoin rightSchema table keys
                 | _ -> None
 
             match index with

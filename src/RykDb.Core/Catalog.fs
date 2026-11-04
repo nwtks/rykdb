@@ -631,35 +631,6 @@ module internal Schema =
             | Some q -> SqlName.equal q qualifier
             | None -> false)
 
-    /// 射影後のヘッダ行を作る。
-    /// `SELECT *` は入力の列名をそのまま（修飾つき）。
-    /// `SELECT id` は式を表示する。別名があればそれを使う。
-    /// 入力スキーマのヘッダを返すと `SELECT id` が `people.id` になるので、
-    /// 射影後の名前を組み立て直す必要がある。
-    /// <remarks>
-    /// `*` は修飾なしの `c.Name`、`t.*` は修飾つきの `c.Display` で出す（元の挙動）。
-    /// </remarks>
-    let projectHeader (schema: Schema) (items: SelectItem list) =
-        let header (schema: Schema) =
-            schema.Columns |> Array.map (fun c -> c.Display)
-
-        match items with
-        | [] -> header schema
-        | _ ->
-            items
-            |> List.collect (fun item ->
-                match expandStar schema item.Expression with
-                | Some(qualified, columns) ->
-                    if qualified then
-                        columns |> List.map (fun c -> c.Display)
-                    else
-                        columns |> List.map (fun c -> c.Name)
-                | None ->
-                    match item.Alias with
-                    | Some a -> [ a ]
-                    | None -> [ Expr.toDisplayString item.Expression ])
-            |> List.toArray
-
     /// 式を「列の直接参照」に読み替える。
     /// Column はそのまま。修飾子なしの裸の名前（Name）も列として扱う
     /// （パーサが WHERE / ORDER BY の裸の名前を Name にするため）。
@@ -722,3 +693,71 @@ module internal Schema =
                 sprintf "列 '%s' が曖昧です（該当: %s）" r.Display (many |> List.map string |> String.concat ", ")
                 |> DbError.name
             )
+
+    /// 射影後の列（名前・修飾子・型）を作る。
+    /// `SELECT *` は入力の列名をそのまま、`t.*` は修飾つきの表示名にする（元の挙動）。
+    /// `SELECT id` は式を表示し、別名があればそれを使う。
+    /// <remarks>
+    /// 入力スキーマのヘッダをそのまま返すと `SELECT id` が `people.id` になるので、
+    /// 射影後の名前を組み立て直す必要がある。
+    /// 型は「直接の列参照」だけ引き継ぐ（式の型推論はしない）。
+    /// 派生テーブル（FROM のサブクエリ）の列型が None だとハッシュ結合のキーにできないため、
+    /// `SELECT id, v AS x FROM t` や `SELECT *` のような形では型を残す。
+    /// </remarks>
+    let private projectedColumns (useDisplayName: bool) (schema: Schema) =
+        let referenced e =
+            match tryAsColumnRef e with
+            | Some c ->
+                match resolve schema c with
+                | Ok i -> Some schema.Columns.[i]
+                | Error _ -> None
+            | None -> None
+
+        let column name e =
+            {
+                Name = name
+                Qualifier = None
+                DataType = referenced e |> Option.bind (fun c -> c.DataType)
+            }
+
+        function
+        | [] -> schema.Columns
+        | items ->
+            items
+            |> List.collect (fun item ->
+                match expandStar schema item.Expression with
+                | Some(qualified, columns) ->
+                    columns
+                    |> List.map (fun c ->
+                        {
+                            Name = if qualified then c.Display else c.Name
+                            Qualifier = None
+                            DataType = c.DataType
+                        })
+                | None ->
+                    match item.Alias with
+                    | Some a -> [ column a item.Expression ]
+                    | None ->
+                        match if useDisplayName then None else referenced item.Expression with
+                        | Some c ->
+                            [
+                                {
+                                    Name = c.Name
+                                    Qualifier = None
+                                    DataType = c.DataType
+                                }
+                            ]
+                        | None -> [ column (Expr.toDisplayString item.Expression) item.Expression ])
+            |> List.toArray
+
+    /// 射影後の列（結果表示用の名前）。
+    let projectColumns = projectedColumns true
+
+    /// 射影後の列（参照用の名前）。
+    /// `SELECT t.id` の列名を `t.id` ではなく `id` にする。
+    /// 派生テーブルの列名に使う（外側から `x.id` で引けるようにするため）。
+    let referenceColumns = projectedColumns false
+
+    /// 射影後のヘッダ行を作る（結果表示用の列名）。
+    let projectHeader (schema: Schema) =
+        projectColumns schema >> Array.map (fun c -> c.Display)

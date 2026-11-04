@@ -25,7 +25,7 @@ let private selectOf (items: SelectItem list) (from: TableRef option) (joins: Jo
     {
         Distinct = false
         Items = items
-        From = from
+        From = Option.map TableSource.Named from
         Joins = joins
         Where = w
         GroupBy = []
@@ -84,7 +84,7 @@ let ``Optimizer.buildLogical: JOIN があれば LJoin が作られる`` () =
                 [
                     {
                         Kind = JoinKind.Inner
-                        Table = { Name = "orders"; Alias = None }
+                        Table = TableSource.Named { Name = "orders"; Alias = None }
                         On = Expr.Binary(BinaryOp.Eq, pCol "id", oCol "person_id")
                     }
                 ]
@@ -98,6 +98,44 @@ let ``Optimizer.buildLogical: JOIN があれば LJoin が作られる`` () =
             Assert.Equal<string>("people", leftName)
             Assert.Equal<string>("orders", rightName)
         | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+
+[<Fact>]
+let ``Optimizer.buildLogical: FROM のサブクエリは Logical.Derived になる`` () =
+    withStore "pl-derived" (fun store ->
+        let ctx = ctxOf store
+
+        let plan =
+            {
+                Output =
+                    {
+                        Columns =
+                            [|
+                                {
+                                    Name = "id"
+                                    Qualifier = Some "x"
+                                    DataType = Some DataType.Integer
+                                }
+                            |]
+                        Tables = [ "x" ]
+                    }
+                Header = Schema.empty
+                Input = Schema.ofTable "people" None peopleSchema
+                Context = ctx
+                Tree = Logical.Scan("people", ScanMethod.SeqScan)
+            }
+
+        let stmt =
+            { selectOf [ { Expression = Expr.Star; Alias = None } ] None [] None with
+                From = Some(TableSource.Named { Name = "x"; Alias = None })
+            }
+
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt (Map.ofList [ ("x", plan) ]))
+
+        match tree with
+        | Logical.Project(_, Logical.Derived p) ->
+            Assert.Equal<string>("id", p.Output.Columns.[0].Name)
+            Assert.Equal<string option>(Some "x", p.Output.Columns.[0].Qualifier)
+        | other -> Assert.Fail(sprintf "Derived ではない: %A" other))
 
 [<Fact>]
 let ``Optimizer.buildLogical: GROUP BY があれば LAggregate が作られる`` () =
@@ -220,7 +258,7 @@ let ``Optimizer.buildLogical: FROM なしの * と JOIN はエラー`` () =
                 [
                     {
                         Kind = JoinKind.Inner
-                        Table = { Name = "people"; Alias = None }
+                        Table = TableSource.Named { Name = "people"; Alias = None }
                         On = Expr.Literal(Literal.Bool true)
                     }
                 ]

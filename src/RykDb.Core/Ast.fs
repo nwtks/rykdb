@@ -199,7 +199,7 @@ type internal Expr =
 and internal JoinClause =
     {
         Kind: JoinKind
-        Table: TableRef
+        Table: TableSource
         On: Expr
     }
 
@@ -274,7 +274,7 @@ and internal SelectStatement =
     {
         Distinct: bool
         Items: SelectItem list
-        From: TableRef option
+        From: TableSource option
         Joins: JoinClause list
         Where: Expr option
         GroupBy: Expr list
@@ -283,6 +283,15 @@ and internal SelectStatement =
         Limit: Expr option
         Offset: Expr option
     }
+
+/// FROM / JOIN の入力。
+/// `Derived` は `FROM (SELECT ...) AS x` の派生テーブル。
+/// 計画時に内側の SELECT を論理木へ落とし、実行時に必要になったら 1回だけ走らせる。
+and [<RequireQualifiedAccess>] internal TableSource =
+    /// 実テーブル（別名つき）。
+    | Named of TableRef
+    /// 派生テーブル。別名は必須（列修飾と JOIN のスキーマ特定に使う）。
+    | Derived of SelectStatement * alias: string
 
 and internal CreateIndex =
     {

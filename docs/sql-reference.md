@@ -490,13 +490,15 @@ SELECT name,
 
 ```sql
 SELECT [DISTINCT] 項目 [, 項目 …]
-  [FROM テーブル [[AS] 別名]
-       [[INNER | LEFT [OUTER]] JOIN テーブル [[AS] 別名] ON 条件] …]
+  [FROM 入力 [[AS] 別名]
+       [[INNER | LEFT [OUTER]] JOIN 入力 [[AS] 別名] ON 条件] …]
   [WHERE 条件]
   [GROUP BY 式 [, 式 …]]
   [HAVING 条件]
   [ORDER BY 式 [ASC|DESC] [, …]]
   [LIMIT 定数式] [OFFSET 定数式];
+
+-- 入力 := テーブル | (SELECT ...)   ← 派生テーブル（別名必須。§7.10）
 ```
 
 - **`FROM` は省略できる**。入力は 1行 0列になる。
@@ -507,7 +509,7 @@ SELECT [DISTINCT] 項目 [, 項目 …]
   `FROM` が無いときは `*` / `t.*` を書けない（展開する列が無い）。
   `JOIN` には `FROM` が必要。
 - 条件・式の中にはサブクエリを書ける（§7.9）。
-  `FROM` の派生テーブル（`FROM (SELECT ...) AS x`）は未対応。
+  `FROM` / `JOIN` には派生テーブル（`FROM (SELECT ...) AS x`、別名必須）も書ける（§7.10）。
 - `JOIN` は `INNER JOIN` / `JOIN` / `LEFT JOIN` / `LEFT OUTER JOIN`。
   `RIGHT` / `FULL` / `CROSS` は**ない**。
 - `ON` は省略できない
@@ -736,7 +738,7 @@ SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE v > 25);
 - `LIMIT` / `OFFSET` にも書ける（定数へ解決される）。
 - 外側の列を参照する（相関）サブクエリは `NameError` になる。
 - サブクエリでも `FROM` を省略できる（`EXISTS (SELECT 1)` は常に真）。
-- `FROM (SELECT ...) AS x`（派生テーブル）は未対応（`SyntaxError`）。
+- `FROM (SELECT ...) AS x`（派生テーブル）は §7.10。
 - `CREATE TABLE ... DEFAULT (SELECT ...)` は未対応（INSERT 時に `SyntaxError`）。
 - スカラーサブクエリは最大 2行、`EXISTS` は 1行だけを読む。
   `IN (SELECT ...)` は結果をすべて保持する
@@ -744,6 +746,38 @@ SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE v > 25);
 - サブクエリの入れ子も**式の深さ上限（200）に含まれる**。
   1 段で複数の深さ単位を消費するため、実測では 90段は実行でき、
   150段は `式の入れ子が深すぎます` になる（StackOverflow にはならない）。
+
+---
+
+### 7.10 派生テーブル（FROM / JOIN のサブクエリ）
+
+`FROM` と `JOIN` にはサブクエリを書ける。**別名は必須**。
+
+```sql
+SELECT x.id, x.v
+FROM (SELECT id, v FROM t WHERE v >= 20) AS x
+WHERE x.v < 100;
+
+SELECT t.id, d.w
+FROM t JOIN (SELECT id, w FROM u) AS d ON d.id = t.id;
+```
+
+- 内側の SELECT は通常の SELECT と同じ
+  （`WHERE` / `GROUP BY` / `ORDER BY` / `LIMIT` など）。
+- 列は**別名で修飾**して参照する（`x.col`）。
+  `SELECT *` / `x.*` も使える。
+- 派生テーブルの列名は内側の射影から決まる
+  （`SELECT id AS k` なら `k`、`SELECT t.id` なら `id`。結果ヘッダの表示名 `t.id` とは別）。
+  別名を付けずに式を書いた場合は表示名（`v * 2` など）になる。
+- 型は**直接の列参照だけ**引き継ぐ（`SELECT id` / `SELECT id AS k` / `SELECT *`）。
+  式・集約・CAST の列は型が分からないため、その列での等値結合は入れ子ループになる（結果は正しい）。
+- **実行は外側のクエリが必要としたとき**。
+  計画時に結果を作らない。
+  内側のテーブル解決は計画時なので、存在しないテーブルは実行前に `NameError`。
+- 相関（LATERAL）は未対応。
+  内側から外側の列・別名は参照できない（`NameError`）。
+- `AS x(a, b)` の列別名リストは未対応。
+- カンマ結合（`FROM t, u`）は未対応。
 
 ---
 
@@ -1130,7 +1164,7 @@ db> .rollback
 | `SELECT ROUND(name) FROM t;`               | `ROUND は数値を受け付けますが 'abc' です`                                 |
 | `SELECT id, (SELECT id, v FROM t) FROM t;` | `サブクエリは 1 列だけを返す必要があります（2 列）`                       |
 | `SELECT id, (SELECT v FROM t) FROM t;`     | `スカラーサブクエリが 2 行以上を返しました`                               |
-| `SELECT id FROM (SELECT id FROM t) x;`     | `FROM のサブクエリ（派生テーブル）は未対応です (位置 1行)`                |
+| `SELECT id FROM (SELECT id FROM t);`       | `サブクエリ（派生テーブル）には別名が必要です（例: AS x） (位置 1行)`     |
 | `SAVEPOINT s;`                             | `文の開始として解釈できません (位置 1行)`                                 |
 | `UPDATE t SET v = 1 FROM u;`               | `文の区切りには ; が必要です（複数文は ; で区切ってください） (位置 1行)` |
 
@@ -1143,13 +1177,13 @@ db> .rollback
 
 ### 構文が未対応のもの
 
-- **相関サブクエリ**（外側の列を参照するサブクエリ）
-- **FROM の派生テーブル**（`FROM (SELECT ...) AS x`）
+- **相関サブクエリ**（外側の列を参照するサブクエリ。派生テーブルも相関不可）
 - `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`
 - CTE（`WITH`）、再帰クエリ
 - ウィンドウ関数（`OVER` / `PARTITION BY` / `ROW_NUMBER` …）
 - `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN` / `USING`
-- 自然結合（`NATURAL JOIN`）、`INSERT ... SELECT`
+- 自然結合（`NATURAL JOIN`）
+- `INSERT ... SELECT`
 - カンマ結合（`FROM a, b`）
 - `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）
 - `UPDATE ... FROM` / `UPDATE ... LIMIT` / `DELETE ... LIMIT`
@@ -1159,7 +1193,8 @@ db> .rollback
   読み取り専用トランザクション（分離レベルは Snapshot Isolation 固定）
 - `ALTER TABLE`（列の追加・削除・型変更）
 - `TRUNCATE`
-- `EXPLAIN`、`RETURNING`
+- `EXPLAIN`
+- `RETURNING`
 - `CREATE TABLE ... DEFAULT (SELECT ...)`（構文は受理されるが INSERT 時に `SyntaxError`。§7.9）
 - ユーザ定義関数・トリガー・ビュー・ストアドプロシージャ
 - パーティショニング、圧縮、暗号化
@@ -1185,7 +1220,7 @@ db> .rollback
 | `GROUP BY`          | 行を抱えず集約。グループ数の上限は 400万                                                                                            |
 | `AVG`               | `SUM / COUNT` を実行時に計算                                                                                                        |
 | `UPDATE` / `DELETE` | `FROM` / `USING` / `LIMIT` 相当の句がない                                                                                           |
-| DML の別名          | `UPDATE t AS x` / `DELETE FROM t x` はパースできるが、`WHERE x.id` は `NameError`（対象行が無ければ 0 行）。列は実名で修飾する      |
+| DML の別名          | `UPDATE t AS x` / `DELETE FROM t x` はパースできるが、`WHERE x.id` は `NameError`（対象行が無ければ 0行）。列は実名で修飾する       |
 | トランザクション    | 分離レベルは Snapshot Isolation 固定。`SAVEPOINT` と読み取り専用トランザクションは未対応（§12）                                     |
 | DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）                                                                          |
 | `ORDER BY`          | 列参照・式・序数（1 始まり）が使える。同値行の順序は保証しない                                                                      |

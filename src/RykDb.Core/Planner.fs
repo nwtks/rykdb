@@ -36,7 +36,7 @@ module internal Optimizer =
         =
         let primaryKey =
             match stmt.From with
-            | Some r when List.isEmpty stmt.Joins && not stmt.Distinct ->
+            | Some(TableSource.Named r) when List.isEmpty stmt.Joins && not stmt.Distinct ->
                 Catalog.findTable ctx.Catalog r.Name
                 |> Option.bind (fun defn ->
                     match Catalog.toSchema defn with
@@ -63,19 +63,44 @@ module internal Optimizer =
             ->
             let prefix = resolved |> List.choose id |> List.truncate pk.Length
 
-            (prefix |> List.map fst) = pk
+            prefix |> List.map fst = pk
             && prefix
                |> List.forall (fun (_, direction) -> direction = SortDirection.Ascending)
         | _ -> false
 
+    /// FROM / JOIN の束縛。実テーブルと派生テーブル（FROM のサブクエリ）を区別する。
+    type private SourceBinding =
+        | Base of TableBinding
+        | DerivedSource of TableRef * PlannedQuery
+
+    /// 束縛の参照名（別名があれば別名）。
+    let private bindingName =
+        function
+        | Base b -> Analyzer.refName b
+        | DerivedSource(r, _) -> r.Name
+
+    /// 束縛の出力スキーマ。
+    let private bindingSchema =
+        function
+        | Base b -> Analyzer.schemaOf b
+        | DerivedSource(_, plan) -> plan.Output
+
     /// SELECT 文を論理代数に変換する。
-    let buildLogical (ctx: ExecContext) (stmt: SelectStatement) =
-        let bindTables ctx stmt =
+    /// `derived` は計画済みの派生テーブル（別名の小文字 -> 計画）。
+    let buildLogicalWith (ctx: ExecContext) (stmt: SelectStatement) (derived: Map<string, PlannedQuery>) =
+        let bindSource (r: TableRef) =
+            match derived |> Map.tryFind (r.Name.ToLowerInvariant()) with
+            | Some plan -> ret (DerivedSource(r, plan))
+            | None -> Analyzer.bindTable ctx r |> Result.map Base
+
+        let bindTables stmt =
             result {
                 let! baseBindings =
                     match stmt.From with
                     | None -> ret []
-                    | Some r -> Analyzer.bindTable ctx r |> Result.map (fun b -> [ b ])
+                    | Some(TableSource.Named r) -> bindSource r |> Result.map (fun b -> [ b ])
+                    | Some(TableSource.Derived(_, alias)) ->
+                        bindSource { Name = alias; Alias = None } |> Result.map (fun b -> [ b ])
 
                 let! bindings =
                     stmt.Joins
@@ -83,7 +108,12 @@ module internal Optimizer =
                         (fun acc j ->
                             result {
                                 let! bs = acc
-                                let! b = Analyzer.bindTable ctx j.Table
+
+                                let! b =
+                                    match j.Table with
+                                    | TableSource.Named r -> bindSource r
+                                    | TableSource.Derived(_, alias) -> bindSource { Name = alias; Alias = None }
+
                                 return bs @ [ b ]
                             })
                         (ret baseBindings)
@@ -91,34 +121,38 @@ module internal Optimizer =
                 return bindings
             }
 
-        let concatSchemas = List.map Analyzer.schemaOf >> Schema.concatAll
+        let concatSchemas = List.map bindingSchema >> Schema.concatAll
 
         let buildScan catalog allSchema b predicates =
-            let name = Analyzer.refName b
+            let name = bindingName b
 
             let local =
                 predicates
                 |> List.filter (fun p -> Binder.referencesOnly name p && not (Binder.hasAmbiguousColumn allSchema p))
 
-            result {
-                let! method = Analyzer.chooseScanMethod b catalog local
-                let scan = Logical.Scan(name, method)
-
+            let withPredicates node =
                 match Predicate.joinConjuncts local with
-                | None -> return scan
-                | Some p -> return Logical.Filter(p, scan)
-            }
+                | None -> ret node
+                | Some p -> ret (Logical.Filter(p, node))
 
-        let joinStep (bindings: TableBinding list) predicates accState (i, j) =
+            match b with
+            | DerivedSource(_, plan) -> withPredicates (Logical.Derived plan)
+            | Base tb ->
+                result {
+                    let! method = Analyzer.chooseScanMethod tb catalog local
+                    return! withPredicates (Logical.Scan(name, method))
+                }
+
+        let joinStep (bindings: SourceBinding list) predicates accState (i, j) =
             result {
                 let! acc, topPreds = accState
                 let idx = i + 1
                 let right = bindings.[idx]
                 let leftSchema = bindings |> List.take idx |> concatSchemas
                 let allSchema = concatSchemas bindings
-                let onSchema = Schema.concat leftSchema (Analyzer.schemaOf right)
+                let onSchema = Schema.concat leftSchema (bindingSchema right)
                 let! on = Binder.qualify onSchema j.On
-                let rightName = Analyzer.refName right
+                let rightName = bindingName right
 
                 let rightPreds =
                     predicates
@@ -136,7 +170,7 @@ module internal Optimizer =
 
         let localToAny allSchema bindings p =
             not (Binder.hasAmbiguousColumn allSchema p)
-            && bindings |> List.exists (fun b -> Binder.referencesOnly (Analyzer.refName b) p)
+            && bindings |> List.exists (fun b -> Binder.referencesOnly (bindingName b) p)
 
         let applyAggregate schema stmt tree =
             let aliases = Alias.dropCyclic (Alias.ofItems stmt.Items)
@@ -322,7 +356,7 @@ module internal Optimizer =
                 }
 
         result {
-            let! bindings = bindTables ctx stmt
+            let! bindings = bindTables stmt
 
             if stmt.From.IsNone && not (List.isEmpty stmt.Joins) then
                 return! DbError.create ErrorKind.SyntaxError "JOIN には FROM が必要です" |> err
@@ -367,6 +401,9 @@ module internal Optimizer =
                 return! applyLimit stmt deduped
         }
 
+    /// 派生テーブル無しの SELECT 文を論理代数に変換する。
+    let buildLogical (ctx: ExecContext) (stmt: SelectStatement) = buildLogicalWith ctx stmt Map.empty
+
     /// Join の結合待ち情報。
     /// 右部分木の Op は左部分木を評価した後に作る
     /// （評価順を left → right → join に保つため）。
@@ -396,6 +433,8 @@ module internal Optimizer =
         | SortFrame of SortKey list * Schema
         | LimitFrame of int * int
         | ProjectFrame of SelectItem list * Schema * Expr list
+        /// 派生テーブルの内側を評価し終えた。外側の実行文脈へ戻す。
+        | DerivedFrame of ExecContext
         /// 左部分木を評価し終えた Join。次に右部分木を評価する。
         | JoinRightFrame of JoinFrame
         /// 左部分木を評価し終えた Index Nested Loop。右部分木は評価しない。
@@ -480,6 +519,7 @@ module internal Optimizer =
                 { Schema.empty with
                     Columns = Array.append (List.toArray gv) (List.toArray av)
                 }
+            | Logical.Derived plan -> plan.Output
             | _ -> inSchema
 
         let groupByOf tree =
@@ -550,9 +590,6 @@ module internal Optimizer =
         | EvalNode(node, inSchema, hint) ->
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
-                let rightTable = defaultSchema ctx name
-                let rightSchema = Schema.ofTable name None rightTable
-
                 let leftSchema =
                     { inSchema with
                         Columns =
@@ -563,6 +600,13 @@ module internal Optimizer =
                                 | None -> true)
                         Tables = inSchema.Tables |> List.filter (fun t -> not (Catalog.eqName t name))
                     }
+
+                let rightSchema, rightTable =
+                    match stripWrappers rTree with
+                    | Logical.Derived plan -> plan.Output, None
+                    | _ ->
+                        let table = defaultSchema ctx name
+                        Schema.ofTable name None table, Some table
 
                 let algorithm, keys, leftKeyIndices =
                     Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema rightTable lTree rTree on
@@ -585,6 +629,8 @@ module internal Optimizer =
                     run ctx (JoinIndexLeftFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
                 | _ -> run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
             | Logical.Values values -> run ctx frames (ApplyOp(Op.ofRow values))
+            | Logical.Derived plan ->
+                run plan.Context (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None))
             | Logical.Scan(name, method) ->
                 match execScan ctx hint name method with
                 | Error e -> err e
@@ -626,6 +672,7 @@ module internal Optimizer =
             | [] -> ret op
             | frame :: rest ->
                 match frame with
+                | DerivedFrame outer -> run outer rest (ApplyOp op)
                 | FilterFrame(p, childSchema) -> run ctx rest (ApplyOp(Ops.filter childSchema p op))
                 | AggregateFrame(groupBy, aggs, inSchema) ->
                     match Ops.aggregate inSchema groupBy aggs op with
@@ -734,63 +781,164 @@ module internal Plan =
         | [] -> k (List.rev acc)
         | x :: rest -> f x (fun x2 -> traverseC f rest (x2 :: acc) k)
 
-    /// サブクエリを解決してから論理木を組む（CPS）。
-    /// <remarks>
-    /// `planSelectC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` は相互再帰する。
-    /// どれも「残りの処理」を継続として受け取り、末尾で呼ぶので、
-    /// サブクエリの入れ子段数に依存せずスタックは積み上がらない
-    /// （Parser の式・SELECT と同じ方針）。
-    /// </remarks>
+    /// FROM / JOIN の入力を `TableRef` に読み替える。
+    /// `resolveSourcesC` が派生テーブルを実テーブル参照（別名）へ書き換えるので、
+    /// ここに来る `Derived` は解決漏れ。
+    let private sourceRef =
+        function
+        | TableSource.Named r -> r
+        | TableSource.Derived(_, alias) -> { Name = alias; Alias = None }
+
+    /// 派生テーブルの出力スキーマへ別名の修飾を付ける。
+    let private withQualifier (alias: string) (schema: Schema) =
+        {
+            Columns = schema.Columns |> Array.map (fun c -> { c with Qualifier = Some alias })
+            Tables = [ alias ]
+        }
+
+    /// 文の入力（FROM / JOIN）を実テーブルとして登録する。
+    /// 派生テーブルはスキーマだけを連結する（カタログにも ctx.Schemas にも登録しない）。
+    let private registerSources (ctx: ExecContext) (derived: Map<string, PlannedQuery>) =
+        foldOk
+            (fun (c, acc) (r: TableRef) ->
+                match derived |> Map.tryFind (r.Name.ToLowerInvariant()) with
+                | Some plan -> ret (c, Schema.concat acc plan.Output)
+                | None ->
+                    result {
+                        let realName = r.Name
+                        let! schema = ExecContext.schemaOf realName c
+                        let c1 = ExecContext.withSchema realName schema c
+
+                        let c2 =
+                            match r.Alias with
+                            | None -> c1
+                            | Some a -> ExecContext.withSchema a schema c1
+
+                        return c2, Schema.concat acc (Schema.ofTable realName r.Alias schema)
+                    })
+            (ctx, Schema.empty)
+
+    /// FROM / JOIN の派生テーブルを計画する（CPS、実行はしない）。
+    /// AST の `Derived` は実テーブル参照（別名）へ書き換え、
+    /// 計画結果は別名の小文字をキーにした Map で返す。
     [<TailCall>]
-    let rec private planSelectC
-        (k: (string array * Op) -> Result<'r, DbError>)
+    let rec private resolveSourcesC
+        (k: SelectStatement -> Map<string, PlannedQuery> -> Result<'r, DbError>)
         (ctx: ExecContext)
         (stmt: SelectStatement)
         : Result<'r, DbError> =
-        // ヘッダはサブクエリ解決前の式から作る
-        // （解決後は値になるので、列名が `30` のようになってしまう）。
+        let sources = (stmt.From |> Option.toList) @ (stmt.Joins |> List.map _.Table)
+
+        let rec go pending done' plans =
+            match pending with
+            | [] ->
+                let rewritten = List.rev done'
+
+                let fromSource, joinSources =
+                    if Option.isSome stmt.From then
+                        match rewritten with
+                        | first :: rest -> Some first, rest
+                        | [] -> None, []
+                    else
+                        None, rewritten
+
+                let joins =
+                    List.map2 (fun (j: JoinClause) t -> { j with Table = t }) stmt.Joins joinSources
+
+                k
+                    { stmt with
+                        From = fromSource
+                        Joins = joins
+                    }
+                    plans
+            | TableSource.Named r :: rest -> go rest (TableSource.Named r :: done') plans
+            | TableSource.Derived(sel, alias) :: rest ->
+                planCoreC
+                    (fun plan ->
+                        let plan =
+                            { plan with
+                                Output = withQualifier alias plan.Output
+                            }
+
+                        go
+                            rest
+                            (TableSource.Named { Name = alias; Alias = None } :: done')
+                            (Map.add (alias.ToLowerInvariant()) plan plans))
+                    ctx
+                    sel
+
+        go sources [] Map.empty
+
+    /// SELECT を計画する（CPS）。実行はしない。
+    /// 派生テーブルはここで再帰的に計画され、実行は外側のオペレータ木が要求したときになる。
+    and [<TailCall>] private planCoreC
+        (k: PlannedQuery -> Result<'r, DbError>)
+        (ctx: ExecContext)
+        (stmt: SelectStatement)
+        : Result<'r, DbError> =
         let originalItems = stmt.Items
 
-        let finish resolved =
-            let registerAll =
-                foldOk
-                    (fun (c, acc) (r: TableRef) ->
-                        result {
-                            let realName = r.Name
-                            let! schema = ExecContext.schemaOf realName c
-                            let c1 = ExecContext.withSchema realName schema c
+        resolveSourcesC
+            (fun rewritten derived ->
+                resolveSelectC
+                    (fun resolved ->
+                        let sources =
+                            (match resolved.From with
+                             | None -> []
+                             | Some r -> [ sourceRef r ])
+                            @ (resolved.Joins |> List.map (fun j -> sourceRef j.Table))
 
-                            let c2 =
-                                match r.Alias with
-                                | None -> c1
-                                | Some a -> ExecContext.withSchema a schema c1
+                        let duplicate =
+                            sources
+                            |> List.countBy (fun r -> defaultArg r.Alias r.Name)
+                            |> List.tryFind (fun (_, c) -> c > 1)
 
-                            return c2, Schema.concat acc (Schema.ofTable realName r.Alias schema)
-                        })
-                    (ctx, Schema.empty)
+                        match duplicate with
+                        | Some(name, _) -> sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name |> err
+                        | None ->
+                            registerSources ctx derived sources
+                            >>= fun (ctx2, inputSchema) ->
+                                Optimizer.buildLogicalWith ctx2 resolved derived
+                                >>= fun tree ->
+                                    k
+                                        {
+                                            Output =
+                                                {
+                                                    Columns = Schema.referenceColumns inputSchema originalItems
+                                                    Tables = []
+                                                }
+                                            Header =
+                                                {
+                                                    Columns = Schema.projectColumns inputSchema originalItems
+                                                    Tables = []
+                                                }
+                                            Input = inputSchema
+                                            Context = ctx2
+                                            Tree = tree
+                                        })
+                    ctx
+                    rewritten)
+            ctx
+            stmt
 
-            let sources =
-                (match resolved.From with
-                 | None -> []
-                 | Some r -> [ r ])
-                @ (resolved.Joins |> List.map _.Table)
-
-            let duplicate =
-                sources
-                |> List.countBy (fun r -> defaultArg r.Alias r.Name)
-                |> List.tryFind (fun (_, c) -> c > 1)
-
-            match duplicate with
-            | Some(name, _) -> sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name |> err
-            | None ->
-                registerAll sources
-                >>= fun (ctx2, schema) ->
-                    Optimizer.buildLogical ctx2 resolved
-                    >>= fun tree ->
-                        Optimizer.exec ctx2 tree schema
-                        >>= fun op -> k (Schema.projectHeader schema originalItems, op)
-
-        resolveSelectC finish ctx stmt
+    /// サブクエリを解決してから論理木を組んで実行する（CPS）。
+    /// <remarks>
+    /// `planCoreC` / `resolveSourcesC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` は相互再帰する。
+    /// どれも「残りの処理」を継続として受け取り、末尾で呼ぶので、
+    /// サブクエリ・派生テーブルの入れ子段数に依存せずスタックは積み上がらない
+    /// （Parser の式・SELECT と同じ方針）。
+    /// </remarks>
+    and [<TailCall>] private planSelectC
+        (k: (Schema * Op) -> Result<'r, DbError>)
+        (ctx: ExecContext)
+        (stmt: SelectStatement)
+        : Result<'r, DbError> =
+        planCoreC
+            (fun plan ->
+                Optimizer.exec plan.Context plan.Tree plan.Input
+                >>= fun op -> k (plan.Header, op))
+            ctx
+            stmt
 
     /// 文の各フィールドを継続の連鎖で解決する。
     /// フィールドの数は固定なので、この関数自身は再帰しない。
@@ -856,9 +1004,9 @@ module internal Plan =
         match e with
         | Expr.Subquery sel ->
             planSelectC
-                (fun (header, op) ->
-                    if header.Length <> 1 then
-                        err (singleColumnMessage header.Length)
+                (fun (schema, op) ->
+                    if schema.Columns.Length <> 1 then
+                        err (singleColumnMessage schema.Columns.Length)
                     else
                         match Op.next op with
                         | Error er -> err er
@@ -880,9 +1028,9 @@ module internal Plan =
                 sel
         | Expr.InSubquery(left, sel, negated) ->
             planSelectC
-                (fun (header, op) ->
-                    if header.Length <> 1 then
-                        err (singleColumnMessage header.Length)
+                (fun (schema, op) ->
+                    if schema.Columns.Length <> 1 then
+                        err (singleColumnMessage schema.Columns.Length)
                     else
                         match collectSubqueryRows op with
                         | Error er -> err er
@@ -898,4 +1046,6 @@ module internal Plan =
 
     /// SELECT 文を実行して、結果（列名 + 行）を返す。
     let runSelect =
-        planSelectC (fun (header, op) -> Op.toArray op |> Result.map (fun rows -> header, rows))
+        planSelectC (fun (schema, op) ->
+            Op.toArray op
+            |> Result.map (fun rows -> schema.Columns |> Array.map (fun c -> c.Name), rows))

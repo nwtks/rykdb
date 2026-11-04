@@ -475,7 +475,7 @@ let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば Inde
         | "r" -> Some rightTable
         | _ -> None
 
-    match Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema rightTable leftSmall rightScan on with
+    match Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema (Some rightTable) leftSmall rightScan on with
     | JoinAlgorithm.IndexNestedLoop name, _, Some lefts ->
         Assert.Equal<string>("ix_r_a", name)
         Assert.Equal<int array>([| 0 |], lefts)
@@ -487,7 +487,7 @@ let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば Inde
             tableOf
             leftSchema
             rightSchema
-            rightTable
+            (Some rightTable)
             (Logical.Scan("l", ScanMethod.SeqScan))
             rightScan
             on
@@ -505,9 +505,59 @@ let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば Inde
             Expr.Column { Qualifier = Some "r"; Name = "a" }
         )
 
-    match Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema rightTable leftSmall rightScan nonEqui with
+    match Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema (Some rightTable) leftSmall rightScan nonEqui with
     | JoinAlgorithm.NestedLoop, _, _ -> ()
     | other -> Assert.Fail(sprintf "NestedLoop ではありません: %A" other)
+
+[<Fact>]
+let ``Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`` () =
+    let leftTable =
+        {
+            Name = "l"
+            Columns = [ col "a" DataType.Integer ]
+            PrimaryKey = [ 0 ]
+            Indexes = []
+        }
+
+    let rightTable =
+        {
+            Name = "r"
+            Columns = [ col "a" DataType.Integer ]
+            PrimaryKey = [ 0 ]
+            Indexes =
+                [
+                    {
+                        Name = "ix_r_a"
+                        Columns = [ "a" ]
+                        Unique = false
+                    }
+                ]
+        }
+
+    let leftSchema = Schema.ofTable "l" None leftTable
+    let rightSchema = Schema.ofTable "r" None rightTable
+
+    let on =
+        Expr.Binary(
+            BinaryOp.Eq,
+            Expr.Column { Qualifier = Some "l"; Name = "a" },
+            Expr.Column { Qualifier = Some "r"; Name = "a" }
+        )
+
+    let leftSmall = Logical.Limit(0, 1, Logical.Scan("l", ScanMethod.SeqScan))
+    let rightScan = Logical.Scan("r", ScanMethod.SeqScan)
+
+    let tableOf (name: string) =
+        match name with
+        | "l" -> Some leftTable
+        | "r" -> Some rightTable
+        | _ -> None
+
+    // 派生テーブルはカタログの索引を持たない（rightTable = None）。
+    // 索引が使える形でもインデックス入れ子ループにはしない。
+    match Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema None leftSmall rightScan on with
+    | JoinAlgorithm.IndexNestedLoop _, _, _ -> Assert.Fail "IndexNestedLoop を選んではいけない"
+    | _ -> ()
 
 [<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致するときだけマージ結合`` () =
@@ -555,7 +605,9 @@ let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致�
     // ON の順が主キーと逆でも、走査順 (a, b) に並べ替えてマージ結合にする
     let onReversed = Expr.Binary(BinaryOp.And, eq "l" "b" "r" "b", eq "l" "a" "r" "a")
 
-    match Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema rightTable leftTree rightTree onReversed with
+    match
+        Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema (Some rightTable) leftTree rightTree onReversed
+    with
     | JoinAlgorithm.MergeJoin, Some keys, _ ->
         Assert.Equal<int array>([| 0; 1 |], keys.LeftIndices)
         Assert.Equal<int array>([| 0; 1 |], keys.RightIndices)
@@ -563,7 +615,14 @@ let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致�
 
     // 主キーの 2 列目だけの等値は走査順の先頭と一致しないのでハッシュ結合
     match
-        Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema rightTable leftTree rightTree (eq "l" "b" "r" "b")
+        Analyzer.chooseJoinAlgorithm
+            tableOf
+            leftSchema
+            rightSchema
+            (Some rightTable)
+            leftTree
+            rightTree
+            (eq "l" "b" "r" "b")
     with
     | JoinAlgorithm.HashJoin, _, _ -> ()
     | other -> Assert.Fail(sprintf "HashJoin ではありません: %A" other)
@@ -582,7 +641,7 @@ let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致�
             (fun n -> if n = "r" then Some rightReversed else Some leftTable)
             leftSchema
             rightSchema
-            rightReversed
+            (Some rightReversed)
             leftTree
             rightTree
             (Expr.Binary(BinaryOp.And, eq "l" "a" "r" "a", eq "l" "b" "r" "b"))

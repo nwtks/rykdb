@@ -363,7 +363,7 @@ flowchart LR
   （`NULL` の 3値論理は `Eval` がそのまま扱う）。
 - `EXISTS (SELECT ...)` — `Op.next` を 1回だけ呼んで真偽値にする。
 - 相関参照は外側のテーブルを登録しないため `NameError`（未対応）。
-- `FROM (SELECT ...) AS x`（派生テーブル）は Parser が `SyntaxError` にする。
+- `FROM (SELECT ...) AS x`（派生テーブル）は「派生テーブル（FROM / JOIN のサブクエリ）」を参照。
 - ヘッダだけは解決前の式から作る（解決後は値になり列名が `30` のようになってしまうため）。
 - DML の値式・`WHERE` は `Engine` が `Plan.resolveDmlExpr` で同様に解決する。
 
@@ -376,6 +376,33 @@ flowchart LR
 （1段で複数単位を消費する。実測: 90段は実行でき、150段は `式の入れ子が深すぎます`）でも頭打ちになる。
 回帰テスト: `SqlReference: 深いサブクエリの入れ子（上限内）は実行できる` /
 `末尾再帰: 深いサブクエリの入れ子もエラーになる（StackOverflow ではない）`。
+
+#### 派生テーブル（FROM / JOIN のサブクエリ）
+
+`FROM (SELECT ...) AS x` は**計画と実行を分ける**。
+計画時に結果を作らない。
+
+- Parser は `TableSource.Derived(SelectStatement, alias)` を作る（**別名必須**）。
+- `Plan.resolveSourcesC` が FROM / JOIN の `Derived` を `Plan.planCoreC` で計画する。
+  `planCoreC` は論理木までで止め、`PlannedQuery`（`Output` / `Header` / `Input` / `Context` / `Tree`）を返す。
+  AST は実テーブル参照（別名）へ書き換え、
+  計画結果は別名をキーにした Map で `Optimizer.buildLogicalWith` へ渡す。
+- `Optimizer.buildLogicalWith` は派生の束縛を `Logical.Derived` にする。
+  WHERE は内側へ押し下げず、派生ノードの上に `Filter` を付ける
+  （集約 / DISTINCT / LIMIT を跨ぐと意味が変わるため）。
+- `Optimizer.run` は `Logical.Derived` に来たら、
+  計画が持つ入力スキーマと `ExecContext` で内側の木を評価し、
+  `DerivedFrame` で外側の文脈へ戻す。
+  内側のテーブル別名は内側の ctx にしか無いため、文脈の切り替えが必要。
+- `Output`（参照名 + 別名修飾）と `Header`（表示名）は別に持つ。
+  `SELECT t.id` の列名を `id` にして、外側から `x.id` で引けるようにするため
+  （`Schema.referenceColumns`）。
+- 型は直接の列参照だけ引き継ぐ。
+  型が無い列はハッシュ / マージ結合のキーにならず入れ子ループになる。
+- `Logical.Derived` は `scanOrder` で `None` に落ちるためマージ結合には選ばれない。
+
+回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
+`Optimizer.buildLogical: FROM のサブクエリは Logical.Derived になる`。
 
 #### 束縛（Binder）
 

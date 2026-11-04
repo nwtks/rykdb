@@ -1748,3 +1748,29 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
   `let rec … and` 群に `parseSelectTailC` として足すこと（ラムダ内から呼ぶのは従来どおり可）。
 - 回帰テスト: `SqlReference: FROM を省略した SELECT は定数 1 行を返す` /
   `パーサ: FROM を省略した SELECT`。
+
+### 11.50 派生テーブルは「計画」と「実行」を分ける（`planCoreC` / `Logical.Derived`）
+
+`FROM (SELECT ...) AS x` は **計画時に実行しない**。
+`Plan.planSelectC` を `planCoreC`（論理木まで）と実行に分け、
+派生は `PlannedQuery { Output; Header; Input; Context; Tree }` として持ち回る。
+
+- `Plan.resolveSourcesC` が AST の `TableSource.Derived` を `TableSource.Named`（別名）へ書き換え、
+  別名の小文字をキーにした Map を `Optimizer.buildLogicalWith` に渡す。
+  書き換え後に `From` / `Joins[].Table` に `Derived` が残っていたら解決漏れ。
+- `Logical.Derived` の実行は `Optimizer.run` の `DerivedFrame`。
+  内側の木は **内側の `ExecContext`**（内側のテーブル別名を登録したもの）で走らせる。
+  外側の ctx で走らせると `FROM people p` の `p` を引けない。
+- 派生の列名は参照名（`SELECT t.id` → `id`）で持つ（`Schema.referenceColumns`）。
+  表示名のままだと入れ子の派生で `y.v` ではなく `y."x.v"` になる。
+- 述語は内側へ押し下げない（集約 / DISTINCT / LIMIT を跨ぐと意味が変わる）。
+  派生ノードの上に `Filter` を付ける。
+- `Logical.Derived` は `scanOrder` で `None` に落ちるのでマージ結合にはならない。
+  型が `None` の派生列は等値キーにもならない（入れ子ループになるが結果は正しい）。
+- 再帰：`planCoreC` / `resolveSourcesC` は CPS だが、
+  `planCoreC` を呼ぶ継続はラムダ内なので TailAudit のベースラインに載る
+  （深さは Parser の `MaxExpressionDepth` で頭打ち）。
+- 回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
+  `パーサ: サブクエリ（スカラー / IN / EXISTS）` /
+  `Optimizer.buildLogical: FROM のサブクエリは Logical.Derived になる` /
+  `Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`。

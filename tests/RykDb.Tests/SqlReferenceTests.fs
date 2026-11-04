@@ -1976,8 +1976,14 @@ let ``SqlReference: サブクエリの未対応形とエラー`` () =
             "相関サブクエリ"
             (db2.Execute "SELECT id FROM t AS o WHERE EXISTS (SELECT 1 FROM t WHERE t.id = o.id)")
 
-        // FROM の派生テーブルは未対応
-        expectErrorKind ErrorKind.SyntaxError "派生テーブル" (db2.Execute "SELECT id FROM (SELECT id FROM t) x"))
+        // 派生テーブルは §7.10 で対応。別名が無いと SyntaxError。
+        expectErrorKind ErrorKind.SyntaxError "派生テーブルの別名" (db2.Execute "SELECT id FROM (SELECT id FROM t)")
+
+        // 派生テーブルは相関できない（内側から外側の別名は見えない）
+        expectErrorKind
+            ErrorKind.NameError
+            "相関派生テーブル"
+            (db2.Execute "SELECT id FROM t AS o JOIN (SELECT o.id AS x FROM t) AS d ON d.x = o.id"))
 
 [<Fact>]
 let ``SqlReference: 集約結果は DATE の型を保つ`` () =
@@ -2023,15 +2029,144 @@ let ``SqlReference: 深いサブクエリの入れ子（上限内）は実行で
         expectErrorKind ErrorKind.SyntaxError "深すぎるサブクエリ" (db2.Execute(sprintf "SELECT %s AS x FROM t" (nested 400))))
 
 [<Fact>]
+let ``SqlReference: 派生テーブル（FROM / JOIN）`` () =
+    withDb "derived" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"
+        let db3 = exec db2 "CREATE TABLE u (id INTEGER PRIMARY KEY, w INTEGER)"
+        let db4 = exec db3 "INSERT INTO u VALUES (2,200),(3,300),(4,400)"
+
+        // FROM の派生テーブル。列は別名で修飾できる。
+        let _, rows =
+            ok (db4.Execute "SELECT x.id, x.v FROM (SELECT id, v FROM t WHERE v >= 20) AS x ORDER BY x.id")
+
+        Assert.Equal<int>(2, rows.Rows.Length)
+        Assert.Equal<int64>(2L, asInt rows.Rows.[0].[0])
+        Assert.Equal<int64>(20L, asInt rows.Rows.[0].[1])
+
+        // 列別名と * 展開（ヘッダは派生列の名前）
+        let _, all =
+            ok (db4.Execute "SELECT * FROM (SELECT id AS k, v * 2 AS d FROM t) x ORDER BY k")
+
+        Assert.Equal<string array>([| "k"; "d" |], all.Columns)
+        Assert.Equal<int>(3, all.Rows.Length)
+        Assert.Equal<int64>(60L, asInt all.Rows.[2].[1])
+
+        // 外側 WHERE は派生列を参照できる
+        let _, filtered =
+            ok (db4.Execute "SELECT x.v FROM (SELECT * FROM t) x WHERE x.v > 10 ORDER BY x.v")
+
+        Assert.Equal<int>(2, filtered.Rows.Length)
+
+        // 内側の ORDER BY / LIMIT が先に効く
+        let _, limited =
+            ok (db4.Execute "SELECT x.v FROM (SELECT v FROM t ORDER BY v DESC LIMIT 2) x ORDER BY x.v")
+
+        Assert.Equal<int>(2, limited.Rows.Length)
+        Assert.Equal<int64>(20L, asInt limited.Rows.[0].[0])
+        Assert.Equal<int64>(30L, asInt limited.Rows.[1].[0])
+
+        // JOIN の右側（INNER / LEFT）
+        let _, joined =
+            ok (
+                db4.Execute
+                    "SELECT t.id, d.w FROM t JOIN (SELECT id, w FROM u WHERE w >= 300) AS d ON d.id = t.id ORDER BY t.id"
+            )
+
+        Assert.Equal<int>(1, joined.Rows.Length)
+        Assert.Equal<int64>(3L, asInt joined.Rows.[0].[0])
+        Assert.Equal<int64>(300L, asInt joined.Rows.[0].[1])
+
+        let _, leftJoined =
+            ok (
+                db4.Execute "SELECT t.id, d.w FROM t LEFT JOIN (SELECT id, w FROM u) AS d ON d.id = t.id ORDER BY t.id"
+            )
+
+        Assert.Equal<int>(3, leftJoined.Rows.Length)
+        Assert.True(SqlValue.isNull leftJoined.Rows.[0].[1])
+        Assert.Equal<int64>(300L, asInt leftJoined.Rows.[2].[1])
+
+        // 派生が左（FROM）で実テーブルと結合する
+        let _, joinedLeft =
+            ok (
+                db4.Execute
+                    "SELECT d.id, u.w FROM (SELECT id FROM t WHERE id >= 2) AS d JOIN u ON u.id = d.id ORDER BY d.id"
+            )
+
+        Assert.Equal<int>(2, joinedLeft.Rows.Length)
+
+        // 派生が左の LEFT JOIN（右が NULL になる行を含む）
+        let _, outerLeft =
+            ok (db4.Execute "SELECT d.id, u.w FROM (SELECT id FROM t) AS d LEFT JOIN u ON u.id = d.id ORDER BY d.id")
+
+        Assert.Equal<int>(3, outerLeft.Rows.Length)
+        Assert.True(SqlValue.isNull outerLeft.Rows.[0].[1])
+        Assert.Equal<int64>(300L, asInt outerLeft.Rows.[2].[1])
+
+        // 派生同士の結合
+        let _, bothDerived =
+            ok (
+                db4.Execute
+                    "SELECT a.id FROM (SELECT id FROM t) AS a JOIN (SELECT id FROM u) AS b ON b.id = a.id ORDER BY a.id"
+            )
+
+        Assert.Equal<int>(2, bothDerived.Rows.Length)
+
+        // 集約を含む派生 / 外側の集約 / 集約結果への WHERE
+        let _, counted =
+            ok (db4.Execute "SELECT COUNT(*) FROM (SELECT id, SUM(w) AS s FROM u GROUP BY id) x")
+
+        Assert.Equal<int64>(3L, asInt counted.Rows.[0].[0])
+
+        let _, aggFiltered =
+            ok (
+                db4.Execute
+                    "SELECT x.s FROM (SELECT id, SUM(w) AS s FROM u GROUP BY id) x WHERE x.s >= 300 ORDER BY x.s"
+            )
+
+        Assert.Equal<int>(2, aggFiltered.Rows.Length)
+
+        // 入れ子の派生
+        let _, nested =
+            ok (db4.Execute "SELECT y.v FROM (SELECT x.v FROM (SELECT v FROM t) x WHERE x.v >= 20) y ORDER BY y.v")
+
+        Assert.Equal<int>(2, nested.Rows.Length)
+
+        // 派生内の式サブクエリ
+        let _, withSub =
+            ok (
+                db4.Execute
+                    "SELECT x.id FROM (SELECT id FROM t WHERE v > (SELECT MIN(w) - 190 FROM u)) x ORDER BY x.id"
+            )
+
+        Assert.Equal<int>(2, withSub.Rows.Length)
+
+        // 修飾付きスター
+        let _, qualified =
+            ok (db4.Execute "SELECT x.* FROM (SELECT id, v FROM t) x ORDER BY x.id")
+
+        Assert.Equal<int>(3, qualified.Rows.Length)
+
+        // 内側のテーブル解決は計画時（未存在なら NameError）
+        expectErrorKind ErrorKind.NameError "派生内の未存在テーブル" (db4.Execute "SELECT * FROM (SELECT id FROM missing) x")
+
+        // 別名の重複
+        expectErrorKind
+            ErrorKind.NameError
+            "派生テーブルの別名重複"
+            (db4.Execute "SELECT * FROM t JOIN (SELECT id FROM u) AS t ON t.id = t.id")
+
+        // 自己参照（相関は未対応なので内側から外側の別名は見えない）
+        expectErrorKind ErrorKind.NameError "派生テーブルの自己参照" (db4.Execute "SELECT * FROM (SELECT * FROM x) x"))
+
+[<Fact>]
 let ``SqlReference: 未対応の構文は明示的な SyntaxError`` () =
     // §14「構文が未対応のもの」。集合演算と RIGHT / FULL JOIN は ParserTests が担当。
     withDb "unsupported-syntax" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a')"
 
-        // サブクエリ（式の中）は §7.9 で対応。FROM の派生テーブルは未対応のまま。
-        expectErrorKind ErrorKind.SyntaxError "FROM のサブクエリ" (db2.Execute "SELECT id FROM (SELECT id FROM t) x")
-
+        // サブクエリ（式の中）は §7.9、FROM の派生テーブルは §7.10 で対応済み。
         expectErrorKind ErrorKind.SyntaxError "WITH 句" (db2.Execute "WITH c AS (SELECT id FROM t) SELECT id FROM c")
 
         expectErrorKind
@@ -2085,6 +2220,8 @@ let ``SqlReference: よく見るエラーメッセージは sql-reference §13 �
         expectMessage "LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました" "SELECT LENGTH(id, num) FROM t" db2
 
         expectMessage "未知のスカラー関数 'NOSUCHFN' です" "SELECT NOSUCHFN(id) FROM t" db2
+
+        expectMessage "サブクエリ（派生テーブル）には別名が必要です（例: AS x）" "SELECT id FROM (SELECT id FROM t)" db2
         expectMessage "型 'BOOLEAN' と 'INTEGER' は比較できません" "SELECT active = 1 FROM t" db2
         expectMessage "ROUND は数値を受け付けますが" "SELECT ROUND(n) FROM t" db2
 

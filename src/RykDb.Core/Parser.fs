@@ -266,7 +266,7 @@ module internal Parser =
 
     let private parseTableRef (st: PState) =
         match peek st with
-        | Token.Symbol "(" -> fail "FROM のサブクエリ（派生テーブル）は未対応です" st
+        | Token.Symbol "(" -> fail "INSERT / UPDATE / DELETE の対象テーブルにサブクエリは使えません" st
         | _ ->
             result {
                 let! name, st = parseIdent st
@@ -712,6 +712,39 @@ module internal Parser =
                     k (List.rev (item :: acc)) st)
             st
 
+    /// FROM / JOIN の入力を読む（CPS）。
+    /// `(` の次が SELECT なら派生テーブル（`FROM (SELECT ...) AS x`）。
+    /// 派生テーブルには別名を必須にしている（列修飾と JOIN のスキーマ特定に使うため）。
+    /// 内側の SELECT は式の入れ子として深さを数える。
+    and private parseSourceC<'r> (k: TableSource -> PState -> Result<'r, DbError>) (st: PState) : Result<'r, DbError> =
+        match peek st with
+        | Token.Symbol "(" ->
+            let afterParen = advance st
+
+            if isKeyword "SELECT" afterParen then
+                match enterExpr afterParen with
+                | Error e -> err e
+                | Ok started ->
+                    parseSelectStatementC
+                        (fun sel st ->
+                            match expectSymbol ")" st with
+                            | Error e -> err e
+                            | Ok(_, st) ->
+                                match parseTableAlias st with
+                                | Error e -> err e
+                                | Ok(Some alias, st) -> k (TableSource.Derived(sel, alias)) (exitExpr st)
+                                | Ok(None, st) -> fail "サブクエリ（派生テーブル）には別名が必要です（例: AS x）" st)
+                        started
+            else
+                fail "FROM の括弧の中には SELECT を書いてください" afterParen
+        | _ ->
+            match parseIdent st with
+            | Error e -> err e
+            | Ok(name, st) ->
+                match parseTableAlias st with
+                | Error e -> err e
+                | Ok(alias, st) -> k (TableSource.Named { Name = name; Alias = alias }) st
+
     and [<TailCall>] private parseJoinsC<'r>
         (acc: JoinClause list)
         (k: JoinClause list -> PState -> Result<'r, DbError>)
@@ -729,16 +762,18 @@ module internal Parser =
                 else JoinKind.Inner, st
 
             if isKeyword "JOIN" st then
-                match advance st |> parseTableRef with
-                | Error e -> err e
-                | Ok(tbl, st) ->
-                    if isIdentName "USING" st then
-                        fail "USING は未対応です（JOIN では ON を使ってください）" st
-                    else
-                        match expectKeyword "ON" st with
-                        | Error e -> err e
-                        | Ok(_, st) ->
-                            parseExprC (fun on st -> parseJoinsC ({ Kind = kind; Table = tbl; On = on } :: acc) k st) st
+                parseSourceC
+                    (fun tbl st ->
+                        if isIdentName "USING" st then
+                            fail "USING は未対応です（JOIN では ON を使ってください）" st
+                        else
+                            match expectKeyword "ON" st with
+                            | Error e -> err e
+                            | Ok(_, st) ->
+                                parseExprC
+                                    (fun on st -> parseJoinsC ({ Kind = kind; Table = tbl; On = on } :: acc) k st)
+                                    st)
+                    (advance st)
             else
                 k (List.rev acc) st
 
@@ -842,7 +877,7 @@ module internal Parser =
         (k: SelectStatement -> PState -> Result<'r, DbError>)
         (distinct: bool)
         (items: SelectItem list)
-        (fromRef: TableRef option)
+        (fromRef: TableSource option)
         (st: PState)
         : Result<'r, DbError> =
         parseJoinsC
@@ -899,9 +934,9 @@ module internal Parser =
                 []
                 (fun items st ->
                     if isKeyword "FROM" st then
-                        match advance st |> parseTableRef with
-                        | Error e -> err e
-                        | Ok(fromRef, st) -> parseSelectTailC k distinct items (Some fromRef) st
+                        parseSourceC
+                            (fun fromRef st -> parseSelectTailC k distinct items (Some fromRef) st)
+                            (advance st)
                     elif isKeyword "JOIN" st || isKeyword "INNER" st || isKeyword "LEFT" st then
                         fail "JOIN には FROM が必要です" st
                     else

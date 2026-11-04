@@ -42,6 +42,12 @@ let private parseSelectOk (sql: string) : SelectStatement =
         | _ -> None)
         sql
 
+/// FROM の実テーブル参照（派生テーブルや FROM なしは None）。
+let private fromTable (sel: SelectStatement) =
+    match sel.From with
+    | Some(TableSource.Named r) -> Some r
+    | _ -> None
+
 let private parseInsertOk (sql: string) : InsertStatement =
     expectVariant
         "INSERT"
@@ -216,9 +222,9 @@ let ``パーサ: JOIN`` () =
 let ``パーサ: SELECT 各種`` () =
     let sel = parseSelectOk "SELECT * FROM users"
 
-    Assert.Equal("users", (sel.From |> Option.map (fun t -> t.Name) |> Option.defaultValue ""))
+    Assert.Equal("users", (fromTable sel |> Option.map (fun t -> t.Name) |> Option.defaultValue ""))
     Assert.Equal(1, sel.Items.Length)
-    Assert.Empty(sel.Joins)
+    Assert.Empty sel.Joins
 
     let sel2 =
         parseSelectOk
@@ -332,7 +338,7 @@ let ``パーサ: 引用した識別子`` () =
     Assert.Equal<string array>([| "id"; "va lue" |], ct.Columns |> List.map _.Name |> List.toArray)
 
     let sel = parseSelectOk "SELECT \"p\".*, \"p\".\"id\" FROM people AS \"p\""
-    Assert.Equal(Some "p", sel.From |> Option.bind (fun t -> t.Alias))
+    Assert.Equal(Some "p", fromTable sel |> Option.bind (fun t -> t.Alias))
 
     match sel.Items.[0].Expression with
     | Expr.QualifiedStar q -> Assert.Equal("p", q)
@@ -392,11 +398,11 @@ let ``パーサ: 別名と並び替え・グループ化の複数指定`` () =
     // AS なしの別名
     let sel = parseSelectOk "SELECT * FROM t x"
 
-    Assert.Equal(Some "x", sel.From |> Option.bind (fun t -> t.Alias))
+    Assert.Equal(Some "x", fromTable sel |> Option.bind (fun t -> t.Alias))
 
     // AS なしの引用した別名
     let sel2 = parseSelectOk "SELECT * FROM t \"x\""
-    Assert.Equal(Some "x", sel2.From |> Option.bind (fun t -> t.Alias))
+    Assert.Equal(Some "x", fromTable sel2 |> Option.bind (fun t -> t.Alias))
 
     // GROUP BY / ORDER BY のカンマ区切り
     let sel3 = parseSelectOk "SELECT a, COUNT(*) FROM t GROUP BY a, b ORDER BY a, b"
@@ -540,8 +546,26 @@ let ``パーサ: サブクエリ（スカラー / IN / EXISTS）`` () =
     parseOneOk "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE v > (SELECT MIN(v) FROM t))"
     |> ignore
 
-    // 派生テーブル（FROM のサブクエリ）は未対応
-    expectErrorKind ErrorKind.SyntaxError "派生テーブル" (parseStatement "SELECT id FROM (SELECT id FROM t) x")
+    // 派生テーブル（FROM のサブクエリ）
+    let derived = parseSelectOk "SELECT id FROM (SELECT id FROM t) x"
+
+    match derived.From with
+    | Some(TableSource.Derived(inner, alias)) ->
+        Assert.Equal("x", alias)
+        Assert.Equal<int>(1, inner.Items.Length)
+    | other -> Assert.Fail(sprintf "派生テーブルではない: %A" other)
+
+    parseOneOk "SELECT id FROM (SELECT id FROM t) AS x JOIN u ON u.id = x.id"
+    |> ignore
+
+    parseOneOk "SELECT id FROM t JOIN (SELECT id FROM u) AS y ON y.id = t.id"
+    |> ignore
+
+    // 派生テーブルには別名が必要
+    expectErrorKind ErrorKind.SyntaxError "派生テーブルの別名" (parseStatement "SELECT id FROM (SELECT id FROM t)")
+
+    // 括弧の中には SELECT だけを書ける
+    expectErrorKind ErrorKind.SyntaxError "FROM の括弧" (parseStatement "SELECT id FROM (t)")
 
     // EXISTS の後ろには括弧付きのサブクエリが必要
     expectErrorKind ErrorKind.SyntaxError "EXISTS の引数" (parseStatement "SELECT id FROM t WHERE EXISTS id")
