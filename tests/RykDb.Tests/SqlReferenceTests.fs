@@ -1437,6 +1437,15 @@ let ``SqlReference: LIKE ESCAPE と CAST`` () =
         Assert.Equal<string>("42", asText casted.Rows.[0].[1]))
 
 [<Fact>]
+let ``SqlReference: LENGTH はサロゲートペアを 1文字として数える`` () =
+    withDb "p1-length-surrogate" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a\U0001F600b')"
+        let _, rows = ok (db2.Execute "SELECT LENGTH(s) FROM t")
+
+        Assert.Equal<int64>(3L, asInt rows.Rows.[0].[0]))
+
+[<Fact>]
 let ``SqlReference: INSERT DEFAULT VALUES と DEFAULT`` () =
     withDb "p1-default-values" (fun db0 ->
         let db1 =

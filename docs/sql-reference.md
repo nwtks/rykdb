@@ -438,7 +438,7 @@ HAVING COUNT(*) > 1
 | `UPPER(x)`          |      1 | `TEXT`               | 大文字化         |
 | `LOWER(x)`          |      1 | `TEXT`               | 小文字化         |
 | `TRIM(x)`           |      1 | `TEXT`               | 前後の空白を削除 |
-| `LENGTH(x)`         |      1 | `INTEGER`            | `NULL`           | UTF-16 文字数                                                           |
+| `LENGTH(x)`         |      1 | `INTEGER`            | `NULL`           | Unicode コードポイント数（サロゲートペアは 1文字）                      |
 | `ABS(x)`            |      1 | 入力と同じ数値型     | `NULL`           | 非数値はエラー                                                          |
 | `ROUND(x)`          |      1 | 入力と同じ数値型     | `NULL`           | 0.5 は 1 へ（四捨五入・`AwayFromZero`）。`INTEGER` / `REAL` / `DECIMAL` |
 | `COALESCE(a, b, …)` | 1 以上 | 最初の非 `NULL` の型 | 全滅なら `NULL`  | 引数数は自由                                                            |

@@ -153,6 +153,24 @@ module internal Scalar =
         likeTokens escape pattern
         |> Result.map (fun tokens -> matchLikeTokens (List.toArray tokens) text)
 
+    /// Unicode のコードポイント数を数える。
+    /// `string.Length` は UTF-16 の code unit 数なので、
+    /// サロゲートペア（BMP 外の文字）を 1文字として数える。
+    let private charLength (s: string) =
+        let rec loop i n =
+            if i >= s.Length then
+                n
+            elif
+                System.Char.IsHighSurrogate s.[i]
+                && i + 1 < s.Length
+                && System.Char.IsLowSurrogate s.[i + 1]
+            then
+                loop (i + 2) (n + 1)
+            else
+                loop (i + 1) (n + 1)
+
+        loop 0 0
+
     /// スカラー関数。
     /// 未知の関数はエラー。
     let applyFunc (name: string) (args: SqlValue array) =
@@ -193,7 +211,7 @@ module internal Scalar =
                     ret SqlValue.Null
                 else
                     let t = asStr args.[0]
-                    ret (SqlValue.Int(int64 t.Length))
+                    ret (SqlValue.Int(int64 (charLength t)))
         | "ABS" ->
             arity 1
             >>= fun () ->

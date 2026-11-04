@@ -103,6 +103,11 @@ let ``Eval.eval: スカラー関数の LOWER / LENGTH / COALESCE`` () =
     | SqlValue.Int n -> Assert.Equal(7L, n)
     | v -> Assert.Fail(sprintf "LENGTH が整数ではありません: %A" v)
 
+    // サロゲートペアは 1文字として数える（UTF-16 の code unit では 4）
+    match call "LENGTH" [ Expr.Literal(Literal.String "a\U0001F600b") ] with
+    | SqlValue.Int n -> Assert.Equal(3L, n)
+    | v -> Assert.Fail(sprintf "LENGTH が整数ではありません: %A" v)
+
     // NULL は NULL のまま伝播する
     Assert.Equal(SqlValue.Null, call "LENGTH" [ Expr.Literal Literal.Null ])
 
