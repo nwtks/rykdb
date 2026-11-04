@@ -679,7 +679,9 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 - 算術は NULL を伝播する。`0` による除算・剰余は `ConstraintViolation` エラー。
 - 型決定: `INTEGER` x `INTEGER` → `INTEGER`、`DECIMAL` x `DECIMAL` → `DECIMAL`、片方が `REAL` なら `REAL`。
 - `||`（`Concat`）は両辺の表示文字列を連結する（NULL は NULL）。
-- `LIKE` は `%` / `_` の手書き照合（ESCAPE 非対応、大文字小文字は区別。
+- `LIKE` は `%` / `_` の手書き照合
+  （大文字小文字は区別。`LIKE ... ESCAPE '文字'` に対応し、エスケープ文字は 1文字。
+  エスケープ文字の直後の `%` / `_` / 自身はリテラルになり、末尾のエスケープは `TypeError`。
   バックトラックしない 1パスの照合なので、`%` が多いパターンでも無限ループしない）。
 - スカラー関数は `UPPER` / `LOWER` / `LENGTH` / `ABS` / `COALESCE` / `TRIM` / `ROUND`。
   未知の関数・引数個数の不一致はエラー（`ROUND` は `INTEGER` / `REAL` / `DECIMAL` に対応）。
@@ -1532,6 +1534,10 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   `CREATE INDEX` の backfill 中は他の文が待つ。
   同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。
   登録はハンドルが GC されると外れるが、参照が残っている間は `ConflictError` のまま。
+- **トランザクションの分離レベルは Snapshot Isolation（repeatable read）固定**。
+  分離レベルの指定（`BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...`）、
+  `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`、読み取り専用トランザクションは未対応
+  （`sql-reference.md` §12/§14）。
 - **同じ root はプロセス内で 1つしか開けない**（§7.9）。
   2回目の `Database.OpenWith` は `IoError`。
   別プロセスが開いていても `IoError`。

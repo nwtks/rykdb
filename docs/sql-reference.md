@@ -272,6 +272,7 @@ SELECT "Order Id" FROM "My Table";      -- 引用識別子
 - `UNION` / `RIGHT` / `FULL` / `CROSS` / `NATURAL` / `OUTER` / `USING` などの未対応の SQL 語は、
   列名・`SELECT` 項目の別名には使えるが、**裸のテーブル別名**には使えない
   （`FROM t AS right` のように `AS` を付ける）。
+  `JOIN ... USING (...)` は明示的な `SyntaxError` になる（§14）。
 
 ### `SELECT` 項目の後置演算子
 
@@ -761,6 +762,7 @@ INSERT INTO テーブル DEFAULT VALUES;
   （主キーなどに既定値が無い場合は `NOT NULL` 違反）。
 - `VALUES` の要素に `DEFAULT` を書くと、その列の既定値を使う。
 - **値式は定数のみ**（列参照不可）。サブクエリは使える（§7.9）。
+- `INSERT ... SELECT` と `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）は未対応（§14）。
 - 値は列の型へ**暗黙変換**される（[§3](#暗黙の型変換sqlvaluecoerce)）。
 - `NOT NULL` 制約は行ごとに検証される。
 - **1つの `INSERT` は 1トランザクション**（途中で失敗したら何も残らない）。
@@ -807,12 +809,16 @@ UPDATE テーブル SET 列 = 式 [, 列 = 式 …] [ WHERE 条件 ];
   サブクエリは使えるが、外側の行の列は参照できない（§7.9）。
 - `WHERE` を省略すると全行が対象。
 - 条件に合う行すべてが更新される（`LIMIT` 相当の句がない）。
+- `UPDATE ... FROM` と `UPDATE ... LIMIT` は未対応（§14）。
+- テーブル別名は `SET` / `WHERE` の列解決に使われない。
+  `UPDATE t AS x ... WHERE x.id = 1` は `NameError` になる（対象行が 1行も無ければ 0行のまま）。
+  `t.id` のように実名で修飾する。
 - 影響行数は `StatementResult.RowsAffected` に入る。
 - 索引があるテーブルでは、更新のたびにすべての索引のエントリが書き直される。
 
 ### 主キー列は更新できない
 
-主キー列を `SET` するとエラーになる（古い主キーの行が残って重複するため）。
+主キー列を `SET` すると `ConstraintViolation` になる（古い主キーの行が残って重複するため）。
 主キーを変えたい場合は `DELETE` + `INSERT` を使う。
 
 ```sql
@@ -842,6 +848,9 @@ DELETE FROM テーブル [ WHERE 条件 ];
 
 - `WHERE` を省略すると全行を削除する。
 - 削除は主キーと**すべての索引**に墓碑（tombstone）を書く。
+- `DELETE ... USING` と `DELETE ... LIMIT` は未対応（§14）。
+- テーブル別名は `WHERE` の列解決に使われない（`t.id` のように実名で修飾する）。
+  対象行が 1 行も無ければ 0 行のままエラーにならない。
 - 影響行数は `StatementResult.RowsAffected` に入る。
 - 条件に合う行が 0件でもエラーにはならない（0行になる）。
 
@@ -1046,6 +1055,9 @@ let db4 = db2.Rollback()                           // 破棄
   `Close()` してから開き直すこと。
 - snapshot はトランザクション開始時に固定される
   （repeatable read）。
+- 分離レベルは Snapshot Isolation（repeatable read）で固定。
+  `BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...` による指定は未対応。
+- `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` と読み取り専用トランザクションは未対応（§14）。
 - 自分の snapshot 取得後に別トランザクションが同じキーを commit していた場合、後続側は `ConflictError` になる
   （first-committer-wins）。
 
@@ -1095,30 +1107,35 @@ db> .rollback
 
 ### よく見るメッセージ（実測）
 
-| SQL                                        | メッセージ                                                       |
-| ------------------------------------------ | ---------------------------------------------------------------- |
-| `SELECT 1 JOIN t ON 1 = 1;`                | `JOIN には FROM が必要です (位置 1行)`                           |
-| `SELECT *;`                                | `FROM のない SELECT では * を使えません（列を明示してください）` |
-| `SELECT * FROM t WHERE id > 1 AND;`        | `式が必要ですが見つかりませんでした (位置 1行)`                  |
-| `SELECT 'abc;`                             | `unclosed string (位置 1行)`                                     |
-| `SELECT id FROM nosuchtable;`              | `テーブル 'nosuchtable' が存在しません`                          |
-| `SELECT nosuchcol FROM t;`                 | `'nosuchcol' は列でも関数でもありません`                         |
-| `CREATE TABLE t (a INTEGER);`              | `テーブル t に主キーがありません`                                |
-| `CREATE TABLE t (...);`（重複）            | `テーブル t は既に存在します`                                    |
-| `CREATE INDEX ix ON t (nosuchcol);`        | `テーブル t に列 nosuchcol がありません`                         |
-| `SELECT id FROM t JOIN t ON t.id = t.id;`  | `テーブル t が重複しています（エイリアスを付けてください）`      |
-| `DROP TABLE nosuch;`                       | `テーブル nosuch が存在しません`                                 |
-| `INSERT INTO t (id) VALUES (1, 2);`        | `INSERT の列数(1)と値の数(2)が合いません`                        |
-| `INSERT INTO t VALUES (1, NULL, …);`       | `NOT NULL 制約に違反: t.n`                                       |
-| `INSERT INTO t VALUES (5, 'z', 'abc');`    | `''abc'' は 'INTEGER' に変換できません`                          |
-| `SELECT (id) / 0 FROM t;`                  | `0 での除算は定義されていません`                                 |
-| `SELECT LENGTH(id, n) FROM t;`             | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`         |
-| `SELECT NOSUCHFN(id) FROM t;`              | `未知のスカラー関数 'NOSUCHFN' です`                             |
-| `SELECT active = 1 FROM u;`                | `型 'BOOLEAN' と 'INTEGER' は比較できません`                     |
-| `SELECT ROUND(name) FROM t;`               | `ROUND は数値を受け付けますが 'abc' です`                        |
-| `SELECT id, (SELECT id, v FROM t) FROM t;` | `サブクエリは 1 列だけを返す必要があります（2 列）`              |
-| `SELECT id, (SELECT v FROM t) FROM t;`     | `スカラーサブクエリが 2 行以上を返しました`                      |
-| `SELECT id FROM (SELECT id FROM t) x;`     | `FROM のサブクエリ（派生テーブル）は未対応です (位置 1行)`       |
+| SQL                                        | メッセージ                                                                |
+| ------------------------------------------ | ------------------------------------------------------------------------- |
+| `SELECT 1 JOIN t ON 1 = 1;`                | `JOIN には FROM が必要です (位置 1行)`                                    |
+| `SELECT *;`                                | `FROM のない SELECT では * を使えません（列を明示してください）`          |
+| `SELECT * FROM t WHERE id > 1 AND;`        | `式が必要ですが見つかりませんでした (位置 1行)`                           |
+| `SELECT 'abc;`                             | `unclosed string (位置 1行)`                                              |
+| `SELECT id FROM nosuchtable;`              | `テーブル 'nosuchtable' が存在しません`                                   |
+| `SELECT nosuchcol FROM t;`                 | `'nosuchcol' は列でも関数でもありません`                                  |
+| `CREATE TABLE t (a INTEGER);`              | `テーブル t に主キーがありません`                                         |
+| `CREATE TABLE t (...);`（重複）            | `テーブル t は既に存在します`                                             |
+| `CREATE INDEX ix ON t (nosuchcol);`        | `テーブル t に列 nosuchcol がありません`                                  |
+| `SELECT id FROM t JOIN t ON t.id = t.id;`  | `テーブル t が重複しています（エイリアスを付けてください）`               |
+| `DROP TABLE nosuch;`                       | `テーブル nosuch が存在しません`                                          |
+| `INSERT INTO t (id) VALUES (1, 2);`        | `INSERT の列数(1)と値の数(2)が合いません`                                 |
+| `INSERT INTO t VALUES (1, NULL, …);`       | `NOT NULL 制約に違反: t.n`                                                |
+| `INSERT INTO t VALUES (5, 'z', 'abc');`    | `''abc'' は 'INTEGER' に変換できません`                                   |
+| `SELECT (id) / 0 FROM t;`                  | `0 での除算は定義されていません`                                          |
+| `SELECT LENGTH(id, n) FROM t;`             | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`                  |
+| `SELECT NOSUCHFN(id) FROM t;`              | `未知のスカラー関数 'NOSUCHFN' です`                                      |
+| `SELECT active = 1 FROM u;`                | `型 'BOOLEAN' と 'INTEGER' は比較できません`                              |
+| `SELECT ROUND(name) FROM t;`               | `ROUND は数値を受け付けますが 'abc' です`                                 |
+| `SELECT id, (SELECT id, v FROM t) FROM t;` | `サブクエリは 1 列だけを返す必要があります（2 列）`                       |
+| `SELECT id, (SELECT v FROM t) FROM t;`     | `スカラーサブクエリが 2 行以上を返しました`                               |
+| `SELECT id FROM (SELECT id FROM t) x;`     | `FROM のサブクエリ（派生テーブル）は未対応です (位置 1行)`                |
+| `SAVEPOINT s;`                             | `文の開始として解釈できません (位置 1行)`                                 |
+| `UPDATE t SET v = 1 FROM u;`               | `文の区切りには ; が必要です（複数文は ; で区切ってください） (位置 1行)` |
+
+未対応の後置句（`DELETE ... LIMIT`、`ON CONFLICT`、ウィンドウ関数の `OVER (...)` など）は
+専用のメッセージにならず、`;` 区切りのエラーとして報告される（§14）。
 
 ---
 
@@ -1133,9 +1150,17 @@ db> .rollback
 - ウィンドウ関数（`OVER` / `PARTITION BY` / `ROW_NUMBER` …）
 - `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN` / `USING`
 - 自然結合（`NATURAL JOIN`）、`INSERT ... SELECT`
+- カンマ結合（`FROM a, b`）
+- `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）
+- `UPDATE ... FROM` / `UPDATE ... LIMIT` / `DELETE ... LIMIT`
+- `DELETE ... USING`（明示 `SyntaxError`）
+- `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`
+- 分離レベルの指定（`BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...`）と
+  読み取り専用トランザクション（分離レベルは Snapshot Isolation 固定）
 - `ALTER TABLE`（列の追加・削除・型変更）
 - `TRUNCATE`
 - `EXPLAIN`、`RETURNING`
+- `CREATE TABLE ... DEFAULT (SELECT ...)`（構文は受理されるが INSERT 時に `SyntaxError`。§7.9）
 - ユーザ定義関数・トリガー・ビュー・ストアドプロシージャ
 - パーティショニング、圧縮、暗号化
 - 複数プロセスからの同時アクセス
@@ -1159,7 +1184,9 @@ db> .rollback
 | `JOIN`              | 入れ子ループ / ハッシュ結合は右側を、マージ結合は同じキーの行だけを保持。管理メモリ換算 256MiB で上限があり、超過は `CapacityError` |
 | `GROUP BY`          | 行を抱えず集約。グループ数の上限は 400万                                                                                            |
 | `AVG`               | `SUM / COUNT` を実行時に計算                                                                                                        |
-| `UPDATE` / `DELETE` | `LIMIT` 相当の句がない                                                                                                              |
+| `UPDATE` / `DELETE` | `FROM` / `USING` / `LIMIT` 相当の句がない                                                                                           |
+| DML の別名          | `UPDATE t AS x` / `DELETE FROM t x` はパースできるが、`WHERE x.id` は `NameError`（対象行が無ければ 0 行）。列は実名で修飾する      |
+| トランザクション    | 分離レベルは Snapshot Isolation 固定。`SAVEPOINT` と読み取り専用トランザクションは未対応（§12）                                     |
 | DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）                                                                          |
 | `ORDER BY`          | 列参照・式・序数（1 始まり）が使える。同値行の順序は保証しない                                                                      |
 

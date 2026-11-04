@@ -300,7 +300,8 @@ module internal DmlOps =
     /// UPDATE。
     /// assignments の右辺は現在行で評価する。
     /// 検索キーは更新前の行の主キー。
-    /// 主キー列を書き換えると古い位置の行が残って重複する。
+    /// 主キー列の変更は `Dml.updateRow` が ConstraintViolation で拒否する
+    /// （DELETE + INSERT を使う）。
     let update (ctx: ExecContext) (schema: TableSchema) (assignments: (string * Expr) list) (where: Expr option) =
         let assign targetSchema targets row =
             gatherWith (Eval.eval targetSchema row) schema (List.map snd assignments) targets
