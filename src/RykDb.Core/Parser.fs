@@ -837,6 +837,55 @@ module internal Parser =
         else
             k (None, None) st
 
+    /// FROM（省略可）より後ろの句を読む。
+    /// FROM を省略した SELECT の入力は 1行 0列になる。
+    and [<TailCall>] private parseSelectTailC<'r>
+        (k: SelectStatement -> PState -> Result<'r, DbError>)
+        (distinct: bool)
+        (items: SelectItem list)
+        (fromRef: TableRef option)
+        (st: PState)
+        : Result<'r, DbError> =
+        parseJoinsC
+            []
+            (fun joins st ->
+                parseWhereC
+                    (fun whereE st ->
+                        parseGroupByC
+                            []
+                            (fun groupBy st ->
+                                parseHavingC
+                                    (fun having st ->
+                                        parseOrderByC
+                                            []
+                                            (fun orderBy st ->
+                                                parseLimitOffsetC
+                                                    (fun (limit, offset) st ->
+                                                        match rejectSetOperation st with
+                                                        | Error e -> err e
+                                                        | Ok() ->
+                                                            let sel =
+                                                                {
+                                                                    Distinct = distinct
+                                                                    Items = items
+                                                                    From = fromRef
+                                                                    Joins = joins
+                                                                    Where = whereE
+                                                                    GroupBy = groupBy
+                                                                    Having = having
+                                                                    OrderBy = orderBy
+                                                                    Limit = limit
+                                                                    Offset = offset
+                                                                }
+
+                                                            k sel st)
+                                                    st)
+                                            st)
+                                    st)
+                            st)
+                    st)
+            st
+
     and [<TailCall>] private parseSelectStatementC<'r>
         (k: SelectStatement -> PState -> Result<'r, DbError>)
         (st: PState)
@@ -850,51 +899,14 @@ module internal Parser =
             parseSelectItemsC
                 []
                 (fun items st ->
-                    match expectKeyword "FROM" st with
-                    | Error e -> err e
-                    | Ok(_, st) ->
-                        match parseTableRef st with
+                    if isKeyword "FROM" st then
+                        match advance st |> parseTableRef with
                         | Error e -> err e
-                        | Ok(fromRef, st) ->
-                            parseJoinsC
-                                []
-                                (fun joins st ->
-                                    parseWhereC
-                                        (fun whereE st ->
-                                            parseGroupByC
-                                                []
-                                                (fun groupBy st ->
-                                                    parseHavingC
-                                                        (fun having st ->
-                                                            parseOrderByC
-                                                                []
-                                                                (fun orderBy st ->
-                                                                    parseLimitOffsetC
-                                                                        (fun (limit, offset) st ->
-                                                                            match rejectSetOperation st with
-                                                                            | Error e -> err e
-                                                                            | Ok() ->
-                                                                                let sel =
-                                                                                    {
-                                                                                        Distinct = distinct
-                                                                                        Items = items
-                                                                                        From = Some fromRef
-                                                                                        Joins = joins
-                                                                                        Where = whereE
-                                                                                        GroupBy = groupBy
-                                                                                        Having = having
-                                                                                        OrderBy = orderBy
-                                                                                        Limit = limit
-                                                                                        Offset = offset
-                                                                                    }
-
-                                                                                k sel st)
-                                                                        st)
-                                                                st)
-                                                        st)
-                                                st)
-                                        st)
-                                st)
+                        | Ok(fromRef, st) -> parseSelectTailC k distinct items (Some fromRef) st
+                    elif isKeyword "JOIN" st || isKeyword "INNER" st || isKeyword "LEFT" st then
+                        fail "JOIN には FROM が必要です" st
+                    else
+                        parseSelectTailC k distinct items None st)
                 st
 
     /// 式を 1 つ読んで返す（継続版 parseExprC の糖）。

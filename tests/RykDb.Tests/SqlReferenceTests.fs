@@ -1528,6 +1528,54 @@ let ``SqlReference: SELECT が 1 つだけなら結果を返し、複数なら�
         Assert.Equal<int>(2, none.RowsAffected))
 
 [<Fact>]
+let ``SqlReference: FROM を省略した SELECT は定数 1 行を返す`` () =
+    // §7.1: FROM は省略できる。入力は 1 行 0 列で、式だけを評価する。
+    withDb "select-no-from" (fun db0 ->
+        let _, one = ok (db0.Execute "SELECT 1")
+        Assert.Equal<string array>([| "1" |], one.Columns)
+        Assert.Equal<int>(1, one.Rows.Length)
+        Assert.Equal<int64>(1L, asInt one.Rows.[0].[0])
+
+        // 別名はヘッダに使われる
+        let _, expr = ok (db0.Execute "SELECT 1 + 2 AS three, 'x' AS s")
+        Assert.Equal<string array>([| "three"; "s" |], expr.Columns)
+        Assert.Equal<int64>(3L, asInt expr.Rows.[0].[0])
+
+        match expr.Rows.[0].[1] with
+        | SqlValue.Text s -> Assert.Equal("x", s)
+        | v -> Assert.Fail(sprintf "TEXT ではありません: %A" v)
+
+        // WHERE は 1 行に対して効く（偽なら 0 行）
+        let _, filtered = ok (db0.Execute "SELECT 1 WHERE 1 = 2")
+        Assert.Empty filtered.Rows
+
+        // DISTINCT / LIMIT も効く
+        let _, distinct = ok (db0.Execute "SELECT DISTINCT 1")
+        Assert.Equal<int>(1, distinct.Rows.Length)
+
+        let _, limited = ok (db0.Execute "SELECT 1 LIMIT 0")
+        Assert.Empty limited.Rows
+
+        // 集約は 1 行 0 列の入力を 1 行にまとめる
+        let _, counted = ok (db0.Execute "SELECT COUNT(*)")
+        Assert.Equal<int64>(1L, asInt counted.Rows.[0].[0])
+
+        // サブクエリでも FROM を省略できる
+        let _, sub = ok (db0.Execute "SELECT EXISTS (SELECT 1), (SELECT 2)")
+        Assert.Equal<int>(1, sub.Rows.Length)
+
+        match sub.Rows.[0].[0], sub.Rows.[0].[1] with
+        | SqlValue.Bool b, SqlValue.Int n ->
+            Assert.True b
+            Assert.Equal(2L, n)
+        | a, b -> Assert.Fail(sprintf "想定外の値: %A / %A" a b)
+
+        // 展開する列が無いので * / t.* はエラー
+        expectErrorKind ErrorKind.SyntaxError "FROM なしの *" (db0.Execute "SELECT *")
+        expectErrorKind ErrorKind.NameError "FROM なしの t.*" (db0.Execute "SELECT t.*")
+        expectErrorKind ErrorKind.SyntaxError "FROM なしの JOIN" (db0.Execute "SELECT 1 JOIN t ON 1 = 1"))
+
+[<Fact>]
 let ``SqlReference: 数字から始まる識別子は受け付けない`` () =
     // §2: 数字から始められない。`_` 始まりは使える。
     withDb "ident-start" (fun db0 ->
@@ -1995,7 +2043,8 @@ let ``SqlReference: よく見るエラーメッセージは sql-reference §13 �
 
         let db2 = exec db1 "INSERT INTO t (id, n, num, active) VALUES (1, 'a', 10, TRUE)"
 
-        expectMessage "FROM が必要ですが見つかりませんでした" "SELECT 1;" db2
+        expectMessage "JOIN には FROM が必要です" "SELECT 1 JOIN t ON 1 = 1" db2
+        expectMessage "FROM のない SELECT では * を使えません" "SELECT *" db2
         expectMessage "式が必要ですが見つかりませんでした" "SELECT id FROM t WHERE id > 1 AND;" db2
         expectMessage "unclosed string" "SELECT 'abc;" db2
         expectMessage "テーブル 'nosuchtable' が存在しません" "SELECT * FROM nosuchtable" db2

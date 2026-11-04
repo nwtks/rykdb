@@ -546,8 +546,43 @@ let ``パーサ: サブクエリ（スカラー / IN / EXISTS）`` () =
     // EXISTS の後ろには括弧付きのサブクエリが必要
     expectErrorKind ErrorKind.SyntaxError "EXISTS の引数" (parseStatement "SELECT id FROM t WHERE EXISTS id")
 
-    // サブクエリでも FROM は必須
-    expectErrorKind ErrorKind.SyntaxError "サブクエリの FROM 省略" (parseStatement "SELECT id FROM t WHERE EXISTS (SELECT 1)")
+    // サブクエリでも FROM は省略できる（`EXISTS (SELECT 1)` は常に真）
+    parseOneOk "SELECT id FROM t WHERE EXISTS (SELECT 1)" |> ignore
+
+[<Fact>]
+let ``パーサ: FROM を省略した SELECT`` () =
+    // FROM なし: From = None / Joins は空
+    let sel = parseSelectOk "SELECT 1"
+    Assert.True sel.From.IsNone
+    Assert.Empty sel.Joins
+    Assert.Empty sel.GroupBy
+    Assert.True sel.Where.IsNone
+
+    // 式・別名・WHERE / ORDER BY / LIMIT も書ける
+    let sel2 =
+        parseSelectOk "SELECT 1 + 2 AS x, 'a' WHERE 1 = 1 ORDER BY x LIMIT 1 OFFSET 0"
+
+    Assert.True sel2.From.IsNone
+    Assert.Equal<int>(2, sel2.Items.Length)
+    Assert.True sel2.Where.IsSome
+    Assert.Equal<int>(1, sel2.OrderBy.Length)
+
+    // サブクエリの AST でも From = None になる
+    let exists =
+        match parseSelectOk "SELECT id FROM t WHERE EXISTS (SELECT 1)" with
+        | {
+              Where = Some(Expr.Exists { From = None })
+          } -> true
+        | _ -> false
+
+    Assert.True exists
+
+    // JOIN には FROM が必要
+    expectErrorKind ErrorKind.SyntaxError "FROM なしの JOIN" (parseStatement "SELECT 1 JOIN t ON 1 = 1")
+
+    expectErrorKind ErrorKind.SyntaxError "FROM なしの INNER JOIN" (parseStatement "SELECT 1 INNER JOIN t ON 1 = 1")
+
+    expectErrorKind ErrorKind.SyntaxError "FROM なしの LEFT JOIN" (parseStatement "SELECT 1 LEFT JOIN t ON 1 = 1")
 
 [<Fact>]
 let ``パーサ: サブクエリの AST 形`` () =

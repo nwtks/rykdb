@@ -278,6 +278,8 @@ module internal Optimizer =
             stmt.Items
             |> List.tryPick (fun item ->
                 match item.Expression with
+                | Expr.Star when Array.isEmpty schema.Columns ->
+                    Some(DbError.create ErrorKind.SyntaxError "FROM のない SELECT では * を使えません（列を明示してください）")
                 | Expr.QualifiedStar q when not (Schema.hasQualifier schema q) ->
                     Some(sprintf "テーブルまたは別名 '%s' が FROM にありません" q |> DbError.name)
                 | _ -> None)
@@ -322,8 +324,8 @@ module internal Optimizer =
         result {
             let! bindings = bindTables ctx stmt
 
-            if List.isEmpty bindings then
-                return Logical.Values [||]
+            if stmt.From.IsNone && not (List.isEmpty stmt.Joins) then
+                return! DbError.create ErrorKind.SyntaxError "JOIN には FROM が必要です" |> err
             else
                 let allSchema = concatSchemas bindings
                 let! () = validateStars allSchema
@@ -333,8 +335,11 @@ module internal Optimizer =
                     | None -> ret []
                     | Some w -> Binder.qualify allSchema w |> Result.map Predicate.splitConjuncts
 
-                let head = List.head bindings
-                let! firstTree = buildScan ctx.Catalog allSchema head predicates
+                let! firstTree =
+                    match List.tryHead bindings with
+                    | Some head -> buildScan ctx.Catalog allSchema head predicates
+                    | None -> ret (Logical.Values [||])
+
                 let initial = ret (firstTree, [])
 
                 let! joined, topPreds =

@@ -32,8 +32,7 @@ RykDb が受け付ける SQL 文法の一覧。
 statement      ::= select | insert | update | delete | ddl | txn
 
 select         ::= SELECT [DISTINCT] select_item {"," select_item}
-                   FROM table_ref
-                   { join_clause }
+                   [ FROM table_ref { join_clause } ]
                    [ WHERE expr ]
                    [ GROUP BY expr {"," expr} ]
                    [ HAVING expr ]
@@ -490,8 +489,8 @@ SELECT name,
 
 ```sql
 SELECT [DISTINCT] 項目 [, 項目 …]
-  FROM テーブル [[AS] 別名]
-       [[INNER | LEFT [OUTER]] JOIN テーブル [[AS] 別名] ON 条件] …
+  [FROM テーブル [[AS] 別名]
+       [[INNER | LEFT [OUTER]] JOIN テーブル [[AS] 別名] ON 条件] …]
   [WHERE 条件]
   [GROUP BY 式 [, 式 …]]
   [HAVING 条件]
@@ -499,8 +498,13 @@ SELECT [DISTINCT] 項目 [, 項目 …]
   [LIMIT 定数式] [OFFSET 定数式];
 ```
 
-- **`FROM` は省略できない**。
-  `SELECT 1` は `FROM が必要ですが見つかりませんでした` になる。
+- **`FROM` は省略できる**。入力は 1行 0列になる。
+  `SELECT 1` / `SELECT 1 + 2 AS x` は 1行 1列（列名は式の表示か別名）を返し、
+  `WHERE` / `ORDER BY` / `LIMIT` はその 1行に適用される。
+  集約は 1行を入力として集計する（`SELECT COUNT(*)` は 1、
+  `SELECT COUNT(*) WHERE 1 = 2` は 0）。
+  `FROM` が無いときは `*` / `t.*` を書けない（展開する列が無い）。
+  `JOIN` には `FROM` が必要。
 - 条件・式の中にはサブクエリを書ける（§7.9）。
   `FROM` の派生テーブル（`FROM (SELECT ...) AS x`）は未対応。
 - `JOIN` は `INNER JOIN` / `JOIN` / `LEFT JOIN` / `LEFT OUTER JOIN`。
@@ -730,8 +734,7 @@ SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE v > 25);
 - `INSERT ... VALUES` / `UPDATE ... SET` / `UPDATE`・`DELETE` の `WHERE` でも使える。
 - `LIMIT` / `OFFSET` にも書ける（定数へ解決される）。
 - 外側の列を参照する（相関）サブクエリは `NameError` になる。
-- サブクエリでも **`FROM` は必須**（`EXISTS (SELECT 1)` は書けない。
-  `EXISTS (SELECT 1 FROM t)` のようにテーブルを指定する）。
+- サブクエリでも `FROM` を省略できる（`EXISTS (SELECT 1)` は常に真）。
 - `FROM (SELECT ...) AS x`（派生テーブル）は未対応（`SyntaxError`）。
 - `CREATE TABLE ... DEFAULT (SELECT ...)` は未対応（INSERT 時に `SyntaxError`）。
 - スカラーサブクエリは最大 2行、`EXISTS` は 1行だけを読む。
@@ -1070,7 +1073,7 @@ db> .rollback
 
 | 分類                  | 意味                           | 例                                      |
 | --------------------- | ------------------------------ | --------------------------------------- |
-| `SyntaxError`         | 文法を満たさない               | `FROM が必要ですが見つかりませんでした` |
+| `SyntaxError`         | 文法を満たさない               | `JOIN には FROM が必要です`             |
 | `NameError`           | 名前解決・関数の失敗           | `テーブル 'x' が存在しません`           |
 | `TypeError`           | 型の不一致・不可能な変換       | `''abc'' は 'INTEGER' に変換できません` |
 | `ConstraintViolation` | `NOT NULL`・主キー欠落・0 除算 | `NOT NULL 制約に違反: t.n`              |
@@ -1087,34 +1090,35 @@ db> .rollback
 構文エラーには行番号が付く。
 
 ```
-エラー: FROM が必要ですが見つかりませんでした (位置 1行)
+エラー: JOIN には FROM が必要です (位置 1行)
 ```
 
 ### よく見るメッセージ（実測）
 
-| SQL                                        | メッセージ                                                  |
-| ------------------------------------------ | ----------------------------------------------------------- |
-| `SELECT 1;`                                | `FROM が必要ですが見つかりませんでした (位置 1行)`          |
-| `SELECT * FROM t WHERE id > 1 AND;`        | `式が必要ですが見つかりませんでした (位置 1行)`             |
-| `SELECT 'abc;`                             | `unclosed string (位置 1行)`                                |
-| `SELECT id FROM nosuchtable;`              | `テーブル 'nosuchtable' が存在しません`                     |
-| `SELECT nosuchcol FROM t;`                 | `'nosuchcol' は列でも関数でもありません`                    |
-| `CREATE TABLE t (a INTEGER);`              | `テーブル t に主キーがありません`                           |
-| `CREATE TABLE t (...);`（重複）            | `テーブル t は既に存在します`                               |
-| `CREATE INDEX ix ON t (nosuchcol);`        | `テーブル t に列 nosuchcol がありません`                    |
-| `SELECT id FROM t JOIN t ON t.id = t.id;`  | `テーブル t が重複しています（エイリアスを付けてください）` |
-| `DROP TABLE nosuch;`                       | `テーブル nosuch が存在しません`                            |
-| `INSERT INTO t (id) VALUES (1, 2);`        | `INSERT の列数(1)と値の数(2)が合いません`                   |
-| `INSERT INTO t VALUES (1, NULL, …);`       | `NOT NULL 制約に違反: t.n`                                  |
-| `INSERT INTO t VALUES (5, 'z', 'abc');`    | `''abc'' は 'INTEGER' に変換できません`                     |
-| `SELECT (id) / 0 FROM t;`                  | `0 での除算は定義されていません`                            |
-| `SELECT LENGTH(id, n) FROM t;`             | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`    |
-| `SELECT NOSUCHFN(id) FROM t;`              | `未知のスカラー関数 'NOSUCHFN' です`                        |
-| `SELECT active = 1 FROM u;`                | `型 'BOOLEAN' と 'INTEGER' は比較できません`                |
-| `SELECT ROUND(name) FROM t;`               | `ROUND は数値を受け付けますが 'abc' です`                   |
-| `SELECT id, (SELECT id, v FROM t) FROM t;` | `サブクエリは 1 列だけを返す必要があります（2 列）`         |
-| `SELECT id, (SELECT v FROM t) FROM t;`     | `スカラーサブクエリが 2 行以上を返しました`                 |
-| `SELECT id FROM (SELECT id FROM t) x;`     | `FROM のサブクエリ（派生テーブル）は未対応です (位置 1行)`  |
+| SQL                                        | メッセージ                                                       |
+| ------------------------------------------ | ---------------------------------------------------------------- |
+| `SELECT 1 JOIN t ON 1 = 1;`                | `JOIN には FROM が必要です (位置 1行)`                           |
+| `SELECT *;`                                | `FROM のない SELECT では * を使えません（列を明示してください）` |
+| `SELECT * FROM t WHERE id > 1 AND;`        | `式が必要ですが見つかりませんでした (位置 1行)`                  |
+| `SELECT 'abc;`                             | `unclosed string (位置 1行)`                                     |
+| `SELECT id FROM nosuchtable;`              | `テーブル 'nosuchtable' が存在しません`                          |
+| `SELECT nosuchcol FROM t;`                 | `'nosuchcol' は列でも関数でもありません`                         |
+| `CREATE TABLE t (a INTEGER);`              | `テーブル t に主キーがありません`                                |
+| `CREATE TABLE t (...);`（重複）            | `テーブル t は既に存在します`                                    |
+| `CREATE INDEX ix ON t (nosuchcol);`        | `テーブル t に列 nosuchcol がありません`                         |
+| `SELECT id FROM t JOIN t ON t.id = t.id;`  | `テーブル t が重複しています（エイリアスを付けてください）`      |
+| `DROP TABLE nosuch;`                       | `テーブル nosuch が存在しません`                                 |
+| `INSERT INTO t (id) VALUES (1, 2);`        | `INSERT の列数(1)と値の数(2)が合いません`                        |
+| `INSERT INTO t VALUES (1, NULL, …);`       | `NOT NULL 制約に違反: t.n`                                       |
+| `INSERT INTO t VALUES (5, 'z', 'abc');`    | `''abc'' は 'INTEGER' に変換できません`                          |
+| `SELECT (id) / 0 FROM t;`                  | `0 での除算は定義されていません`                                 |
+| `SELECT LENGTH(id, n) FROM t;`             | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`         |
+| `SELECT NOSUCHFN(id) FROM t;`              | `未知のスカラー関数 'NOSUCHFN' です`                             |
+| `SELECT active = 1 FROM u;`                | `型 'BOOLEAN' と 'INTEGER' は比較できません`                     |
+| `SELECT ROUND(name) FROM t;`               | `ROUND は数値を受け付けますが 'abc' です`                        |
+| `SELECT id, (SELECT id, v FROM t) FROM t;` | `サブクエリは 1 列だけを返す必要があります（2 列）`              |
+| `SELECT id, (SELECT v FROM t) FROM t;`     | `スカラーサブクエリが 2 行以上を返しました`                      |
+| `SELECT id FROM (SELECT id FROM t) x;`     | `FROM のサブクエリ（派生テーブル）は未対応です (位置 1行)`       |
 
 ---
 
@@ -1147,7 +1151,6 @@ db> .rollback
 
 | 項目                | 内容                                                                                                                                |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `SELECT` の `FROM`  | **省略不可**。定数だけの SELECT は書けない                                                                                          |
 | 索引                | 単一列・複合索引の前置等値（1列以上）、複合索引の前置等値 + 次列の範囲、`LIKE 'prefix%'` の範囲                                     |
 | `LIMIT` / `OFFSET`  | 0 以上の定数式のみ（行ごとの列参照・負数はエラー）。`LIMIT 0` は「0行」                                                             |
 | 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                                                                                              |

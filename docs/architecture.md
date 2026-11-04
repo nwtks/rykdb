@@ -388,7 +388,8 @@ flowchart LR
 
 #### 論理代数の構築（buildLogical）
 
-1. `FROM` は必須（Parser が要求する。`SELECT 1` は構文エラー）。
+1. `FROM` は省略できる（入力は 1行 0列の `Logical.Values`）。
+   `JOIN` には `FROM` が必要で、Parser が `JOIN には FROM が必要です` にする。
 2. WHERE を全テーブル連結のスキーマで束縛 → conjunct へ分解し、先頭テーブルを `buildScan`。
 3. JOIN を FROM の順に**左深く**積む。
    右は `buildScan`（INNER は右ローカルの WHERE を pushdown、LEFT は null 供給側なので JOIN の上へ回す）。
@@ -464,7 +465,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
 `Optimizer` は `ON` 句から左×右の等値キーを取り出し、次の順で選ぶ。
 
 1. **インデックス入れ子ループ**（`JoinAlgorithm.IndexNestedLoop`）:
-   左部分木の見積りが 32 行以下（`Limit` / 主キー等値 / `VALUES`）で、
+   左部分木の見積りが 32行以下（`Limit` / 主キー等値 / `Values` = FROM 省略の 1行）で、
    右テーブルに結合キー全列を満たす索引があり、右部分木が `Scan` のとき。
    右は左行ごとに `ExecContext.byIndex` で引く。
 2. **マージ結合**（`MergeJoin`）:

@@ -70,7 +70,7 @@ type internal Logical =
     | Sort of SortKey list * Logical
     /// 読み飛ばし + 制限
     | Limit of int * int * Logical
-    /// 定数（式のみhaving するクエリ `SELECT 1` など）
+    /// 定数 1行（FROM を省略した `SELECT 1` などの入力）
     | Values of SqlValue array
 
 module internal Binder =

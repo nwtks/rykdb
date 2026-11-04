@@ -175,15 +175,58 @@ let ``Optimizer.buildLogical: LIMIT / OFFSET は LLimit になる`` () =
         | _ -> Assert.Fail(sprintf "LIMIT が木の中心でない: %A" tree))
 
 [<Fact>]
-let ``Optimizer.buildLogical: FROM が無ければ LValues になる`` () =
+let ``Optimizer.buildLogical: FROM が無ければ Values（1 行 0 列）が入力になる`` () =
     withStore "pl7" (fun store ->
         let ctx = ctxOf store
-        let stmt = selectOf [ { Expression = Expr.Star; Alias = None } ] None [] None
+
+        let stmt =
+            selectOf
+                [
+                    {
+                        Expression = Expr.Literal(Literal.Int 1L)
+                        Alias = None
+                    }
+                ]
+                None
+                []
+                None
+
         let tree = ok (Optimizer.buildLogical ctx stmt)
 
+        // 入力は Logical.Values（1 行 0 列）で、その上に射影が載る
         match tree with
-        | Logical.Values _ -> ()
-        | _ -> Assert.Fail(sprintf "FROM なしなのに LValues でない: %A" tree))
+        | Logical.Project(_, Logical.Values _) -> ()
+        | _ -> Assert.Fail(sprintf "FROM なしの入力が Values でない: %A" tree))
+
+[<Fact>]
+let ``Optimizer.buildLogical: FROM なしの * と JOIN はエラー`` () =
+    withStore "pl7b" (fun store ->
+        let ctx = ctxOf store
+
+        // * は展開する列が無いのでエラー（0 列 1 行の成功にしない）
+        let star = selectOf [ { Expression = Expr.Star; Alias = None } ] None [] None
+        expectErrorKind ErrorKind.SyntaxError "FROM なしの *" (Optimizer.buildLogical ctx star)
+
+        // JOIN には FROM が必要
+        let join =
+            selectOf
+                [
+                    {
+                        Expression = Expr.Literal(Literal.Int 1L)
+                        Alias = None
+                    }
+                ]
+                None
+                [
+                    {
+                        Kind = JoinKind.Inner
+                        Table = { Name = "people"; Alias = None }
+                        On = Expr.Literal(Literal.Bool true)
+                    }
+                ]
+                None
+
+        expectErrorKind ErrorKind.SyntaxError "FROM なしの JOIN" (Optimizer.buildLogical ctx join))
 
 [<Fact>]
 let ``Optimizer.buildLogical: 集約と * の併用はエラー`` () =
@@ -366,10 +409,11 @@ let ``Plan.runSelect: FROM なしの SELECT は 1 行の定数を返す`` () =
                 None
 
         let columns, rows = ok (Plan.runSelect ctx stmt)
-        // FROM なしは現状 Project を挟まず 1 行 0 列を返す（Parser からは到達しない）
-        Assert.Equal<int>(1, columns.Length)
+        // FROM なしの入力は 1 行 0 列で、射影が定数を 1 列にする
+        Assert.Equal<string array>([| "1" |], columns)
         Assert.Equal<int>(1, rows.Length)
-        Assert.Empty(rows.[0]))
+        Assert.Equal<int>(1, rows.[0].Length)
+        Assert.Equal<int64>(1L, asInt rows.[0].[0]))
 
 [<Fact>]
 let ``Optimizer.buildLogical: 主キー順の ORDER BY は Sort を作らない`` () =

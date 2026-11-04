@@ -1730,3 +1730,21 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 - 回帰テスト: `ParserTests` の `末尾再帰: CPS にした式構文規則は深さ境界で正確に動く` /
   `末尾再帰: 深い入れ子はエラーになる（StackOverflow ではない）` /
   `末尾再帰: 深いサブクエリの入れ子もエラーになる（StackOverflow ではない）`。
+
+### 11.49 FROM を省略した SELECT は「1 行 0 列」を入力にする
+
+`SELECT 1` / `SELECT 1 + 2 AS x` のような FROM なしの SELECT は、
+Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列）を入力にする。
+`WHERE` / 集約 / `ORDER BY` / 射影 / `DISTINCT` / `LIMIT` はその 1行にそのまま被せる。
+
+- `SELECT COUNT(*)` は **1**（`WHERE` で 0行にすれば 0）、
+  `SELECT 1 WHERE 1 = 2` は **0行**。
+- `FROM` の無い `JOIN` は Parser が `JOIN には FROM が必要です` にする。
+- **`*` / `t.*` はエラーにする**（`FROM のない SELECT では * を使えません` / `NameError`）。
+  許すと 0列 1行の「成功」になり、ヘッダと行の列数がずれる
+  （§11.32 の `SELECT nope.*` と同じ型の静かな誤答）。
+- ⚠️ 句を読む処理をローカル関数 `let parseAfterFrom …` に切り出すと **FS3569** で落ちる。
+  CPS 群のメンバーへの呼び出しがローカル関数の中では末尾と見なされないため。
+  `let rec … and` 群に `parseSelectTailC` として足すこと（ラムダ内から呼ぶのは従来どおり可）。
+- 回帰テスト: `SqlReference: FROM を省略した SELECT は定数 1 行を返す` /
+  `パーサ: FROM を省略した SELECT`。
