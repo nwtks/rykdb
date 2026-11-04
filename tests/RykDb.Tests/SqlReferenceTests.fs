@@ -1589,12 +1589,12 @@ let ``SqlReference: 数字から始まる識別子は受け付けない`` () =
 [<Fact>]
 let ``SqlReference: 型の別綴りはすべて受理される`` () =
     // §3: BOOLEAN / BOOL, INTEGER / INT / BIGINT, REAL / DOUBLE, DECIMAL / NUMERIC,
-    // TEXT / VARCHAR / CHAR, DATE, TIMESTAMP / DATETIME, UUID。
+    // TEXT / VARCHAR, DATE, TIMESTAMP / DATETIME, UUID。
     withDb "type-aliases" (fun db0 ->
         let db1 =
             exec
                 db0
-                "CREATE TABLE ty (id INTEGER PRIMARY KEY, a BOOL, b INT, c BIGINT, d DOUBLE, e NUMERIC, f CHAR(3), g DATETIME, h UUID, i BLOB, j DATE)"
+                "CREATE TABLE ty (id INTEGER PRIMARY KEY, a BOOL, b INT, c BIGINT, d DOUBLE, e NUMERIC, f VARCHAR(3), g DATETIME, h UUID, i BLOB, j DATE)"
 
         Assert.Equal<string list>([ "ty" ], db1.TableNames())
 
@@ -1610,13 +1610,22 @@ let ``SqlReference: 型の別綴りはすべて受理される`` () =
         Assert.Equal<DataType>(DataType.Uuid, SqlValue.dataType rows.Rows.[0].[2]))
 
 [<Fact>]
-let ``SqlReference: CHAR(1) は値を切り詰めない`` () =
+let ``SqlReference: VARCHAR(1) は値を切り詰めない`` () =
     // §3: 型引数は読み取られるだけで、切り詰めも検証も行わない。
-    withDb "char-no-truncate" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s CHAR(1))"
+    withDb "varchar-no-truncate" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s VARCHAR(1))"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'abcdefghij')"
         let _, rows = ok (db2.Execute "SELECT s FROM t")
         Assert.Equal<string>("abcdefghij", asText rows.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: CHAR は型名として受け付けない`` () =
+    // §3: TEXT の別綴りは VARCHAR のみ。CHAR は削除済み。
+    withDb "char-removed" (fun db0 ->
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "CHAR は未知の型"
+            (db0.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, c CHAR(3))"))
 
 [<Fact>]
 let ``SqlReference: INSERT の値式は列参照を含められない`` () =

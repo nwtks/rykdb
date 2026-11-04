@@ -155,7 +155,7 @@ X'0A1B'       -- 大文字の 16進のみ。バイト数は偶数
 | `INTEGER`   | `INTEGER` `INT` `BIGINT` | 64 bit 符号付き整数    | `42`                           |
 | `REAL`      | `REAL` `DOUBLE`          | IEEE 754 double        | `1.5`                          |
 | `DECIMAL`   | `DECIMAL` `NUMERIC`      | 固定小数点数           | `150.25`                       |
-| `TEXT`      | `TEXT` `VARCHAR` `CHAR`  | UTF-16 文字列          | `'abc'`                        |
+| `TEXT`      | `TEXT` `VARCHAR`         | UTF-16 文字列          | `'abc'`                        |
 | `BLOB`      | `BLOB`                   | バイト列               | `X'0A1B'`                      |
 | `DATE`      | `DATE`                   | 日付（UTC）            | `2024-01-15`                   |
 | `TIMESTAMP` | `TIMESTAMP` `DATETIME`   | UTC オフセット付き時刻 | `2024-01-15T10:30:00.0000000Z` |
@@ -164,7 +164,7 @@ X'0A1B'       -- 大文字の 16進のみ。バイト数は偶数
 ### 型引数
 
 `VARCHAR(32)` の `(32)` は**読み取られるだけ**で、切り詰めも検証も行わない。
-`CHAR(1)` に 100 文字を入れても保存される。
+`VARCHAR(1)` に 100 文字を入れても保存される。
 
 ### 暗黙の型変換（`SqlValue.coerce`）
 
