@@ -8,7 +8,6 @@
 
 module RykDb.DatabaseTests
 
-open System.Diagnostics
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -146,14 +145,12 @@ let ``Database: transaction 中の文エラーはそのまま返る`` () =
 let ``Database: 複数文 Execute の BEGIN 後エラーで登録を残さない`` () =
     withDb "tx-begin-error-cleanup" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-
         // BEGIN で作られた ActiveSnapshot 登録は、この Execute がエラーになると
         // どの Database ハンドルにも紐づかない。残ると DDL が永久に ConflictError になる。
         expectError "BEGIN 後の途中エラー" (db1.Execute "BEGIN; INSERT INTO t VALUES (1, 10); SELECT * FROM nope")
 
         // 登録が残っていれば CREATE INDEX は ConflictError になる。
         let db2 = exec db1 "CREATE INDEX ix_v ON t (v)"
-
         // 途中の INSERT は commit されていない。
         let _, count = ok (db2.Execute "SELECT COUNT(*) FROM t")
         Assert.Equal<int64>(0L, asInt count.Rows.[0].[0])
@@ -167,7 +164,6 @@ let ``Database: 明示 transaction 中の DDL はエラーになる`` () =
     withDb "tx-ddl" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let tx = ok (db1.Begin())
-
         // DDL は自動 commit されて ROLLBACK で戻らないので、明示的に拒否する
         expectError "BEGIN 中の CREATE TABLE" (tx.Execute "CREATE TABLE u (id INTEGER PRIMARY KEY)")
         expectError "BEGIN 中の CREATE INDEX" (tx.Execute "CREATE INDEX ix ON t (v)")
@@ -210,7 +206,6 @@ let ``E2E: 既存行がある transaction 内の INSERT は SELECT に全行見�
 
         let tx0 = ok (db2.Begin())
         let tx1, _ = ok (tx0.Execute "INSERT INTO t VALUES (0, 0), (2, 20), (4, 40)")
-
         let tx2, rows = ok (tx1.Execute "SELECT id, v FROM t ORDER BY id")
         Assert.Equal<int64 array>([| 0L; 1L; 2L; 3L; 4L; 5L |], rows.Rows |> Array.map (fun r -> asInt r.[0]))
 
@@ -252,7 +247,6 @@ let ``E2E: 既存行がある transaction 内の索引検索が書き込みを�
 
         let tx0 = ok (db3.Begin())
         let tx1, _ = ok (tx0.Execute "INSERT INTO t VALUES (4, 40)")
-
         let tx2, added = ok (tx1.Execute "SELECT id FROM t WHERE v = 40")
         Assert.Equal<int>(1, added.Rows.Length)
         Assert.Equal<int64>(4L, asInt added.Rows.[0].[0])
@@ -275,7 +269,6 @@ let ``E2E: 明示 transaction 内の索引検索が書き込みを見る`` () =
         let db2 = exec db1 "CREATE INDEX ix_t_v ON t (v)"
         let tx0 = ok (db2.Begin())
         let tx1, _ = ok (tx0.Execute "INSERT INTO t VALUES (1, 7)")
-
         let tx2, found = ok (tx1.Execute "SELECT id FROM t WHERE v = 7")
         Assert.Equal<int>(1, found.Rows.Length)
 
@@ -290,14 +283,11 @@ let ``E2E: 明示 transaction 内の索引検索が書き込みを見る`` () =
 // ハンドル API・索引の backfill・DROP の後始末・ストレージ破損
 // ---------------------------------------------------------------------------
 
-/// テーブルの最新 SSTable の先頭バイトを壊し、mtime を進める。
+/// 最新 SSTable の先頭バイトを壊し、mtime を進める。
 /// `openDatabase` は MaxSeqNo の復元でデータブロックを読まないため、open 後に呼ぶ。
-let private corruptNewestTableSstable (dir: string) (table: string) =
-    let tableDir =
-        System.IO.Path.Combine(dir, Keyspace.toDirName (Keyspace.table table))
-
+let private corruptNewestTableSstable (dir: string) =
     let newest =
-        System.IO.Directory.GetFiles(tableDir, "*" + FileMetaData.SstExtension)
+        System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
         |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
 
     let bytes = System.IO.File.ReadAllBytes newest
@@ -327,7 +317,7 @@ let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
 
         // openDatabase は MaxSeqNo の復元で全 SSTable を読むため、open 後に壊す。
         let db5 = ok (Database.OpenWith dir)
-        corruptNewestTableSstable dir "t"
+        corruptNewestTableSstable dir
 
         // LIMIT 1 は先頭 1行だけなので、キー 3 以降の壊れた SSTable を開かない。
         let _, one = ok (db5.Execute "SELECT id FROM t LIMIT 1")
@@ -352,7 +342,7 @@ let ``Database: 主キー順の ORDER BY は Sort を作らず LIMIT がスト�
         ok (db4.Close())
 
         let db5 = ok (Database.OpenWith dir)
-        corruptNewestTableSstable dir "t"
+        corruptNewestTableSstable dir
 
         // 主キー昇順の ORDER BY は Sort ノードを作らないので、
         // LIMIT の件数ヒントが走査まで届き、壊れた SSTable を開かない。
@@ -654,7 +644,7 @@ let ``性能: 多数行の insert → point lookup → range scan`` () =
             exec (ok (Database.OpenWith dir)) "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
 
         // 複数行 INSERT をまとめて流す。
-        let sw = Stopwatch.StartNew()
+        let sw = System.Diagnostics.Stopwatch.StartNew()
         let mutable current = db
 
         let mutable i = 1
@@ -673,7 +663,7 @@ let ``性能: 多数行の insert → point lookup → range scan`` () =
         let insertMs = sw.ElapsedMilliseconds
 
         // point lookup（主キー）
-        let sw2 = Stopwatch.StartNew()
+        let sw2 = System.Diagnostics.Stopwatch.StartNew()
         let mutable probe = 0L
 
         for id in [ 1..500 ] do
@@ -685,7 +675,7 @@ let ``性能: 多数行の insert → point lookup → range scan`` () =
         let lookupMs = sw2.ElapsedMilliseconds
 
         // range scan（集計で全行を走らせる）
-        let sw3 = Stopwatch.StartNew()
+        let sw3 = System.Diagnostics.Stopwatch.StartNew()
         let count = query current "SELECT COUNT(*) FROM t"
         let scanMs = sw3.ElapsedMilliseconds
         Assert.Equal<int64>(int64 rowCount, asInt count.Rows.[0].[0])
@@ -969,7 +959,6 @@ let ``Database: 生きている transaction は GC されても登録が残る``
     withDir "reg-live-gc" (fun dir ->
         let db = ok (Database.OpenWith dir)
         let tx = ok (db.Begin())
-
         // tx はこのあと Rollback で使うので GC されない（finalizer は走らない）。
         collectGarbage ()
         Assert.True((ActiveSnapshotRegistry.oldestExcept db.Root None).IsSome)

@@ -44,13 +44,13 @@ flowchart TB
     end
 
     subgraph ROW["行ストア"]
-        RS["RowStore.fs<br/>keyspace ごとの LSM ツリー"]
+        RS["RowStore.fs<br/>単一 LSM + keyspace 接頭辞"]
         CAT["Catalog.fs<br/>スキーマ定義の永続化"]
     end
 
     MVCC["Transactions.fs<br/>SeqNo 採番・snapshot・衝突検出"]
 
-    subgraph ST["ストレージ（keyspace 1 本 = LSM ツリー 1 本）"]
+    subgraph ST["ストレージ（1 DB = LSM ツリー 1本）"]
         SE["StorageEngine.fs"]
         MEM["Memtable.fs<br/>永続 Treap"]
         SST["Sstable.fs"]
@@ -103,10 +103,15 @@ flowchart TB
 
 1. **不変性** — `StorageEngine` / `Version` / `Memtable` / `Catalog` などはすべて値。
    更新は「新しい値を返す」。読み取りはロックを取らず、snapshot は自然に固定される。
-2. **失敗は値** — 例外を制御フローに使わず、すべて `Result<'T, DbError>` で返す（[`coding-conventions.md`](coding-conventions.md) §1）。
-3. **keyspace シャーディング** — テーブル・索引・カタログは、それぞれ独立した LSM ツリーに保存する。この分離により、別々の単位として処理できる（§6.1）。
-4. **バイト順 = SQL 比較順** — キーのエンコーディングが順序保持であることが、LSM の merge・索引・走査すべての前提（§4.2）。
-5. **末尾再帰 / 明示スタック** — 要素数に比例する処理はスタックを積まない形で書く（[`coding-conventions.md`](coding-conventions.md) §3）。
+2. **失敗は値** — 例外を制御フローに使わず、すべて `Result<'T, DbError>` で返す
+   （[`coding-conventions.md`](coding-conventions.md) §1）。
+3. **keyspace の接頭辞分離** — テーブル・索引・カタログは論理 keyspace で分け、
+   物理キーの接頭辞として 1本の LSM ツリーに載せる。
+   複数 keyspace への書き込みも 1回の WAL バッチで原子的に commit する（§6.1）。
+4. **バイト順 = SQL 比較順** — キーのエンコーディングが順序保持であることが、
+   LSM の merge・索引・走査すべての前提（§4.2）。
+5. **末尾再帰 / 明示スタック** — 要素数に比例する処理はスタックを積まない形で書く
+   （[`coding-conventions.md`](coding-conventions.md) §3）。
 
 ### 採用している手法（サマリ）
 
@@ -140,7 +145,8 @@ flowchart TB
 | フロントエンド   | `Lexer` `Parser` `Ast`                                           | `Types` `Errors`                     |
 
 > **Transactions と RowStore の依存方向**: `Transactions.fs` は `RowStore` を参照しない。
-> 依存は **`Dml` / `RowStore` → `Transactions` → `Memtable`** の向きで、`Dml.fs` の DML ヘルパ（`insert` / `updateRow` / `deleteRow`）が `Transaction` のバッファへ行・索引を積む。
+> 依存は **`Dml` / `RowStore` → `Transactions` → `Memtable`** の向きで、
+> `Dml.fs` の DML ヘルパ（`insert` / `updateRow` / `deleteRow`）が `Transaction` のバッファへ行・索引を積む。
 > commit 時に `TransactionManager.commit` の出力を `RowStore.commitToStore` に渡すのは `Engine`（§7.5）。
 
 ### なぜ不変（immutable）か
@@ -155,13 +161,16 @@ flowchart TB
 3. **更新の書き忘れを型で防ぐ**。
    外部に公開するハンドルは `Database` だけ。
 
-ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`Op.toArray`、`ExtSort` の受け皿、`Database.fs` のクライアント層などでは `ResizeArray` / `Dictionary` / `HashSet` を使う（[`coding-conventions.md`](coding-conventions.md) §2）。
+ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`Op.toArray`、`ExtSort` の受け皿、
+`Database.fs` のクライアント層などでは `ResizeArray` / `Dictionary` / `HashSet` を使う
+（[`coding-conventions.md`](coding-conventions.md) §2）。
 
 ---
 
 ## 2. プロジェクト構成
 
-`Directory.Build.props` は全プロジェクトに共通の設定を流す（`TreatWarningsAsErrors` などのゲートは [`development.md`](development.md) §1）。
+`Directory.Build.props` は全プロジェクトに共通の設定を流す
+（`TreatWarningsAsErrors` などのゲートは [`development.md`](development.md) §1）。
 
 ### モジュール一覧（`src/RykDb.Core/`）
 
@@ -182,9 +191,8 @@ flowchart TB
 | `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                 |
 | `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                        |
 | `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                      |
-| `CommitIntent.fs`  | 複数 keyspace にまたがる commit の意思決定ログ（`CommitIntent`）                            |
 | `ProcessLock.fs`   | プロセス間ロック（`.rykdb.lock`、`ProcessLock`）                                            |
-| `RowStore.fs`      | keyspace 束（`RowStore` 型 + `Keyspace` モジュール）                                        |
+| `RowStore.fs`      | 単一 LSM と keyspace 接頭辞（`RowStore` 型 + `Keyspace` モジュール）                        |
 | `Catalog.fs`       | `IndexSchema` / `TableSchema` / `Catalog` と出力 `Schema` / `OutputColumn` の型・モジュール |
 | `Eval.fs`          | スカラー関数 `Scalar` と式評価器 `Eval`                                                     |
 | `Op.fs`            | pull 演算子 `Op` / `Row`（`ExtSort` が `Op` を使うため先にコンパイル）                      |
@@ -204,7 +212,7 @@ flowchart TB
 Errors → Types → Serialization → Memtable → Wal → BloomFilter
        → Sstable → VersionSet → Manifest → Compaction
        → StorageEngine → Transactions → Ast → Lexer → Parser
-       → CommitIntent → ProcessLock → RowStore → Catalog → Eval → Op → ExtSort → Ops
+       → ProcessLock → RowStore → Catalog → Eval → Op → ExtSort → Ops
        → Dml → ExecContext → Analyzer → Planner → DropCleanup → Engine → Database
 ```
 
@@ -329,7 +337,8 @@ escape の正しさをバイト列で確認した例（フィールド `["ab", "
               位置 4: 0x50 < 0xFF なので前者が小さい -> "ab" < "ab\0" で正しい
 ```
 
-`Serialization.fs` は書き込み用の `Writer`（不変のチャンク列）と読み込み用の `Cursor`（読み取り位置を値として保持する）、ハッシュ（FNV-1a + splitmix64）を持つ。
+`Serialization.fs` は書き込み用の `Writer`（不変のチャンク列）と読み込み用の `Cursor`（読み取り位置を値として保持する）、
+ハッシュ（FNV-1a + splitmix64）を持つ。
 
 ---
 
@@ -719,40 +728,40 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 
 ## 6. 行ストア層
 
-### 6.1 keyspace シャーディング
+### 6.1 keyspace の接頭辞分離
 
-1つのテーブルは「主キーの LSM ツリー」+「索引ごとの LSM ツリー」で構成される。
-それぞれが**独立したディレクトリ・独立した WAL・独立した memtable** を持つ。
+テーブル・索引・カタログは**論理 keyspace** で分けるが、物理的には DB ごとに **1本の LSM ツリー**に載せる。
+物理キーは `[varint(keyspace の UTF-8 長)][keyspace][論理キー]` で、keyspace はキーの前方一致する接頭辞になる。
 
-| keyspace      | 中身                     | キー                                           |
+| keyspace      | 中身                     | 論理キー                                       |
 | ------------- | ------------------------ | ---------------------------------------------- |
 | `t:<table>`   | テーブルの行（主キー順） | `KeyBuilder.ofValues 主キー列`                 |
 | `i:<index>`   | 索引エントリ             | `KeyBuilder.ofIndexAndPrimary 索引列 主キー列` |
 | `__catalog__` | スキーマ定義             | `table:<名前>` / `index:<名前>`                |
 
 ```
-<root>/<base32(keyspace)>/
-  MANIFEST-000001     世代ごとの VersionSet 定義
-  CURRENT             有効な MANIFEST 番号
-  000123.sst          データファイル
-  000002.wal          先行ログ
+<root>/
+  .rykdb.format      単一 LSM レイアウトのマーカー
+  MANIFEST-000001    世代ごとの VersionSet 定義（DB 全体で 1本）
+  CURRENT            有効な MANIFEST 番号
+  000123.sst         データファイル（全 keyspace を含む）
+  000002.wal         先行ログ（全 keyspace を含む）
 ```
 
-`base32`（RFC 4648、パディングなし）にするのは keyspace 名（`t:people`）がそのままでは
-ディレクトリ名に使えないためで、`/` を含まず、大文字小文字だけの衝突も作らない。
-`t:` / `i:` と `__catalog__` 以外の名前は keyspace とみなさず無視する。
+長さを先頭に置くため、`t:a` と `t:ab` のように前方一致する keyspace 名でもキーは混ざらない。
+走査は接頭辞の境界で停止し、返すキーから接頭辞を外すので、`Dml` からは従来どおり論理キーだけが見える。
 
-**シャーディングの意味:**
+**この方式の意味:**
 
-- テーブル間の書き込みは完全に並列（ツリーが別だから lock が衝突しない）
-- 各ツリーが独立に flush / compaction できる
-- 1つのテーブルが壊れても他に影響しない
-- Bloom filter による独立な枝刈り
+- 複数 keyspace（テーブル + 索引 + カタログ）への書き込みが **1回の WAL バッチ**で原子化される
+- WAL / memtable / compaction / Bloom filter が DB 全体で 1組になり、テーブル数に比例する固定費が消える
+- keyspace ごとの prefix 走査は保たれ、論理キーの分離も維持される
+- テーブル単位の障害隔離はない（1本の LSM が壊れれば DB 全体が影響を受ける）
 
 ### 6.2 行の削除
 
 削除は **主キー + 全索引に墓碑（tombstone）** を書く
-（keyspace を分けた代償として必要な処理。書き忘れると何が起きるかは [`gotchas.md`](gotchas.md) §11.3）。
+（論理 keyspace を分けた代償として必要な処理。書き忘れると何が起きるかは [`gotchas.md`](gotchas.md) §11.3）。
 
 ### 6.3 Catalog
 
@@ -836,9 +845,9 @@ COMMIT
   ├─ TransactionManager.commit → 競合検出 → WriteBatch
   ├─ TransactionManager.activeSnapshot → GC 境界
   └─ RowStore.commitToStore
-       ├─ 複数 keyspace なら .commit/journal へ intent を追記して公開
-       ├─ keyspace ごとに StorageEngine.writeBatch
-       └─ 全 keyspace の適用後に resolve を追記して解決
+       └─ 全 keyspace のエントリを接頭辞付きで 1本の StorageEngine.writeBatch へ
+            ├─ Wal.append (Begin/Batch/Commit)
+            └─ Memtable.apply
 ```
 
 これにより次の 3つが同時に保証される。
@@ -859,43 +868,21 @@ DROP はカタログ削除前に `.drop-cleanup` ジャーナルを書き、後�
 旧行 + 新行の概算が上限を超えた時点で `CapacityError` にする。
 
 読み取りは lock を取らず（`StorageEngine` が不変だから）、書き込みの直列化はこのモジュールの中だけに閉じている。
-**keyspace 単位の並列性は `RowStore` が持つ** — keyspace が違えば commit も衝突もしない。
+論理 keyspace が違えば MVCC の競合キーも別だが、物理ツリーと WAL は DB 全体で共有する。
 
-### 7.5 keyspace 横断 commit と ActiveSnapshot
+### 7.5 commit の原子性と ActiveSnapshot
 
-1トランザクションがテーブルと索引など複数 keyspace に書く場合、各 WAL は独立しているため、
-「テーブルは書けたが索引は書けていない」中途半端な状態が起こり得る。
-`RowStore.commitToStore` は `.commit/journal` へ **publish（公開）レコードを追記**してから
-keyspace ごとに書き、完了後に **resolve（解決）レコードを追記**する。
-再オープン時に未解決の publish が残っていれば `replayPending` が再適用する。
-再適用では同じ `(key, SeqNo, value)` を `filterApplied` が読み飛ばすので、物理エントリは重複しない。
-1 keyspace だけの書き込みは WAL 追記自体が原子的なので intent を作らない。
+物理ツリーが 1本なので、1トランザクションがテーブル・索引・カタログのどれに書いても、
+`RowStore.commitToStore` は全エントリを接頭辞付きの **1つの `Entry array`** にまとめ、
+`StorageEngine.writeBatch` へ 1回だけ渡す。
+WAL には `Begin / Batch / Commit` が 1回の `Wal.append` で書かれるため、
+「テーブルは書けたが索引は書けていない」状態は発生しない。
 
-**なぜ rename ではなく追記なのか**（クロスプラットフォームの制約）。
-
-- .NET 標準機能では**ディレクトリを fsync できない**（`FileStream` はディレクトリを開けない）。
-  `File.Move` / `File.Delete` はディレクトリエントリの編集なので、電源故障で消える可能性がある。
-  P/Invoke（`fcntl(F_FULLSYNC)` / `fsync(fd)`）を使わずに耐久性を得るには、
-  **すでにあるファイルへの追記**だけを使うしかない。
-- 追記は `FileStream.Flush(true)` でファイルデータをディスクへ落とせる。
-  ジャーナルはオープン時に `touch` で 1回だけ作る（ディレクトリを汚すのはこの 1回だけ）。
-- レコードは `[長さ][ペイロード][CRC]` のフレーム。
-  **書き込みが途中で切れた尾部は CRC で検出し、「公開未完了」として捨てる**。
-  公開完了前に WAL へは 1バイトも書かないので捨てて安全。
-- 尾部が切れたまま後ろへ追記すると読みが止まるため、
-  `touch` は**有効な末尾までの切り詰め**を行い、以後の追記を可能にする
-  （既存ファイルの長さ変更なのでディレクトリは更新しない）。
-- 間引き（trim）は「未解決ゼロ」のときだけ、既存ファイルの truncate で行う（256KiB 超）。
-  公開記録を消すと適用前の commit が再生できなくなるため。
-
-**成否は一意に決まる**。
-
-| クラッシュ地点         | 結果                                                                 |
-| ---------------------- | -------------------------------------------------------------------- |
-| publish 完了前         | フレームが不完全 → 破棄する。WAL にも何も書いていないので **未反映** |
-| publish 完了後・適用中 | 未解決の publish が残る → 再生で **適用済み**（冪等）                |
-| resolve 完了後         | 解決済み → 再生対象外。WAL に書けているので **適用済み**             |
-| resolve 追記に失敗     | エラーとして上位へ伝播（握り潰さない）。次回オープンで再解決         |
+WAL 追記が成功した時点を commit point とする。
+その後の memtable flush が失敗しても、WAL に commit 済みバッチが残っているため
+`RowStore` はエラーにせず memtable を保持したまま成功を返す
+（ここで `Error` を返すと `TransactionManager` が進まず、同じ SeqNo の再利用で
+commit 済みデータと食い違う）。flush の失敗自体は次の `Close` などで再試行する。
 
 `TransactionManager.activeSnapshot` は active な transaction の **最小 snapshot** を返す
 （無ければ `LastCommitSeqNo + 1`）。
@@ -934,12 +921,12 @@ commit 成功・rollback・`Close` で解除する。
 通常の書き込み経路に `lock` / `Monitor` / `Interlocked` はない。
 同時実行制御は次の 4層の組み合わせで成り立っている。
 
-| 層                         | 役割                           | 詳細                                                                                                                                                                                        |
-| -------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. 不変レコード            | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                     |
-| 2. `Database` ハンドル     | **書き込みの直列化の単位**     | `Execute` は新しい `Database` を返す。上位層では返されたハンドルを引き継ぐことで処理を直列化する。`StorageEngine` 内部の WAL / flush / close は keyspace ディレクトリ単位の Gate で保護する |
-| 3. MVCC + 競合検査         | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                             |
-| 4. keyspace シャーディング | **並列性の供給源**             | `t:` / `i:` / `__catalog__` は独立ツリー。lock-free 構造を採用しなくてよい理由（§6.1, §12.1）                                                                                               |
+| 層                     | 役割                           | 詳細                                                                                                                                                                                  |
+| ---------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. 不変レコード        | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                               |
+| 2. `Database` ハンドル | **書き込みの直列化の単位**     | `Execute` は新しい `Database` を返す。上位層では返されたハンドルを引き継ぐことで処理を直列化する。`StorageEngine` 内部の WAL / flush / close は DB ディレクトリ単位の Gate で保護する |
+| 3. MVCC + 競合検査     | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                       |
+| 4. keyspace 接頭辞     | **論理的な分離**               | `t:` / `i:` / `__catalog__` は 1本の LSM 上で接頭辞により分離される。物理ツリーは共有するため、テーブル間の並列性は提供しない（§6.1）                                                 |
 
 重要な含意は 2つ。
 
@@ -954,8 +941,8 @@ commit 成功・rollback・`Close` で解除する。
 
 - **compaction は同期**（バックグラウンドスレッドなし）なので、reader とファイル削除を争わない（§12.2）
 - **WAL は `FileMode.Append, FileShare.Read`** のみ（`Wal.fs`）。
-  `writeBatch` / `maybeFlush` / `close` は keyspace のディレクトリ単位の Gate で直列化する。
-  異なる keyspace / DB の書き込みは並行に進められる（Gate 表はプロセス内で共有）。
+  `writeBatch` / `maybeFlush` / `close` は DB のディレクトリ単位の Gate で直列化する。
+  異なる DB の書き込みは並行に進められる（Gate 表はプロセス内で共有）。
   **プロセス全体の 1本の Gate にしない**（無関係な DB まで待たせない）。
 - **TCP サーバは完全逐次** — `AcceptTcpClient` → 1接続を処理 → 次の accept（§11.3）
 - **プロセス間は `.rykdb.lock` で排他**する（root 直下、`FileShare.None`。§7.9）
@@ -1022,7 +1009,8 @@ WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つの�
 ## 8. ストレージ層
 
 `StorageEngine` が **LSM ツリー 1本**を公開する層。
-`RowStore` は `IStorageEngine`（`NextSeqNo` / `ActiveSnapshot` / `GetAt` / `ScanAt` / `WriteBatch` / `WithNextSeqNo` / `WithActiveSnapshot` / `MaybeFlush` / `Close`）越しに扱う。
+`RowStore` は `IStorageEngine`（`NextSeqNo` / `ActiveSnapshot` / `GetAt` / `ScanAt` /
+`WriteBatch` / `WithNextSeqNo` / `WithActiveSnapshot` / `MaybeFlush` / `Close`）越しに扱う。
 テストではこれをメモリ実装に差し替え、ディスク I/O なしで上位層を検証する。
 
 | 既定値                        | 値                        |
@@ -1253,8 +1241,8 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
   未コミットと `Abort` は捨てる。
 - flush / close の後は `rotate` する（旧ファイルを先に全部消してから、新番号で再作成）。
   **削除 → 作成の順**でないと、作ったばかりのファイルが削除対象に入る。
-- 複数 keyspace にまたがる commit は、WAL の前に `.commit/journal` へ publish を**追記**する（§7.5）。
-  適用後に resolve を追記して解決する。再生はジャーナルの順（追記順）で行う。
+- 複数 keyspace にまたがる commit も、全エントリを 1つの WAL バッチに入れる（§7.5）。
+  途中で落ちても `Wal.foldCommitted` は Commit まで到達したバッチだけを再生する。
 
 ### 8.6 Compaction — Leveled + GC
 
@@ -1298,7 +1286,7 @@ GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判
 | tombstone                              | 出力が最下位レベル（`DropTombstonesBelowLevel = Levels.Max`）に達したときだけ捨てる |
 
 ファイル単位の回収は「**Version が参照していないファイル**」だけ。
-（`quarantineOrphans`: MANIFEST 反映前にクラッシュして残ったファイルは削除せず、`<keyspace>/.orphans/` へ退避する。
+（`quarantineOrphans`: MANIFEST 反映前にクラッシュして残ったファイルは削除せず、`<root>/.orphans/` へ退避する。
 MANIFEST の読み落としで消してしまう事故を避けるため）。
 `FileMetaData.MaxSeqNo` は書き込み時に記録し、open 時の NextSeqNo 復元と GC の参考に使う
 （削除の根拠にはしない）。
@@ -1337,51 +1325,41 @@ SQL 文字列
    ├─ TransactionManager.commit → 競合検出（first-committer-wins）
    ├─ Transaction.toEntries    → WriteBatch
    └─ RowStore.commitToStore（内部の writeBatchesWithSnapshot）
-        ├─ 複数 keyspace なら .commit/journal へ publish を追記（§7.5）
-        ├─ keyspace ごとに StorageEngine.writeBatch
-        │    ├─ Wal.append (Begin/Batch/Commit)
-        │    └─ Memtable.apply
-        └─ resolve を追記して解決
-4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.applyBatches` が各 keyspace の `WriteBatch` 後に `MaybeFlush` を呼ぶ。memtable が上限未満なら何もしない）
+        └─ 全 keyspace のエントリを接頭辞付きで 1回の StorageEngine.writeBatch へ
+             ├─ Wal.append (Begin/Batch/Commit)
+             └─ Memtable.apply
+4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.applyBatches` が `WriteBatch` 後に `MaybeFlush` を呼ぶ。memtable が上限未満なら何もしない）
 5. レベルが閾値を超えたら compact（`compactOnce`）（`maybeFlush` が `flush >>= compactOnce` で連鎖するため、flush と同時に評価される）
 ```
 
-flush / compact は `RowStore` が各 keyspace の `WriteBatch` 後に `IStorageEngine.MaybeFlush` を呼んで実行する
+flush / compact は `RowStore` が `WriteBatch` 後に `IStorageEngine.MaybeFlush` を呼んで実行する
 （memtable が上限未満なら何もしない）。
-また、各 `WriteBatch` の前に `TransactionManager.activeSnapshot` を `IStorageEngine.ActiveSnapshot` へ設定する。
+また、`WriteBatch` の前に `TransactionManager.activeSnapshot` を `IStorageEngine.ActiveSnapshot` へ設定する。
 
 ### 9.3 DB を開くとき
 
 ```
 Database.OpenWith root
   → RowStore.openStore root          root を作成し、.rykdb.lock を取得
-      ├─ CommitIntent.touch          .commit/journal を開く（末尾の切れを切り詰める）
-      ├─ discoverKeyspaces           既存の keyspace ディレクトリを列挙
-      ├─ StorageEngine.openDatabase  各 keyspace の LSM ツリーを開く
-      │    ├─ Manifest.openOrCreate  CURRENT を読む / なければ作る
-      │    ├─ dropMissingFiles       MANIFEST が参照するファイルが無いなら除去
-      │    ├─ quarantineOrphans      MANIFEST が参照しない SSTable を .orphans/ へ退避
-      │    ├─ Wal.foldCommitted      コミット済みの Batch を memtable へ再生
-      │    └─ NextFileNumber をディスク上の最大番号 + 1 へ進める
-      └─ replayPending               未解決の .commit/journal を再適用
-  → Catalog.load                     __catalog__ keyspace からスキーマを読む
+      ├─ ensureFormat                .rykdb.format を検証 / 新規作成
+      └─ StorageEngine.openDatabase  ルート直下の LSM ツリーを開く
+           ├─ Manifest.openOrCreate  CURRENT を読む / なければ作る
+           ├─ dropMissingFiles       MANIFEST が参照するファイルが無いなら除去
+           ├─ quarantineOrphans      MANIFEST が参照しない SSTable を .orphans/ へ退避
+           ├─ Wal.foldCommitted      コミット済みの Batch を memtable へ再生
+           └─ NextFileNumber をディスク上の最大番号 + 1 へ進める
+  → Catalog.load                     __catalog__ 接頭辞からスキーマを読む
   → TransactionManager.create
   → DropCleanupRecovery.recover      カタログに無い keyspace の DROP 後始末を再開
   → RowStore.lastSeqNo               ディスク上の最大 SeqNo を採る
 ```
 
-> **既存の keyspace を全部開いておくこと**。
-> 開かないまま後始末すると `LastCommitSeqNo = 0` から始まり、reopen 直後に 0 行になる
-> （症状と修正の詳細は [`gotchas.md`](gotchas.md) §5.2）。
-
 ### 9.4 閉じるとき
 
-`Database.Close()` は **全 keyspace の `StorageEngine.close`** を行い、
+`Database.Close()` は `StorageEngine.close` を行い、
 memtable を flush してから WAL を削除する。
 これを省くと、再起動後にデータが読めなくなる。
-1つの keyspace の close が失敗しても残りは閉じる
-（途中で打ち切ると、失敗した engine より後ろの memtable / WAL が後始末されない）。
-戻り値は最初のエラー。
+戻り値は close のエラー。
 不変ハンドルには「閉じた」状態を記録しないため、Close 後のハンドルは破棄する
 （同じハンドルで `Execute` すると WAL が再作成される。二重 Close は安全）。
 実際に flush / WAL 削除 / `ProcessLock` 解放を行うのは**最新のハンドル**だけで、
@@ -1396,23 +1374,15 @@ memtable を flush してから WAL を削除する。
 ```
 <root>/
 ├── .rykdb.lock              ← プロセス間ロック（0バイト、§7.9）
-├── .commit/
-│   └── journal              ← keyspace 横断 commit の publish / resolve 追記（§7.5）
+├── .rykdb.format            ← 単一 LSM レイアウトのマーカー
 ├── .drop-cleanup            ← 未完了 DROP の後始末対象（§11.10）
-├── OQ5HAZLPOBWGK            ← base32("t:people")   主キー行
-│   ├── MANIFEST-000001
-│   ├── CURRENT
-│   ├── 000002.wal
-│   ├── 000003.sst
-│   ├── 000004.sst
-│   └── .orphans/            ← MANIFEST 非参照ファイルの退避先
-├── NE5GSZDYL5SGK4DU         ← base32("i:idx_dept")  索引エントリ
-│   └── ...
-└── L5PWGYLUMFWG6Z27L4       ← base32("__catalog__")
-    └── ...
+├── MANIFEST-000001          ← VersionSet の変更履歴（DB 全体）
+├── CURRENT                  ← 有効な MANIFEST 番号（1行）
+├── 000002.wal               ← 先行ログ（全 keyspace を含む）
+├── 000003.sst               ← データファイル（全 keyspace を含む）
+├── 000004.sst
+└── .orphans/                ← MANIFEST 非参照ファイルの退避先
 ```
-
-各 keyspace ディレクトリの中身:
 
 | ファイル        | 役割                                             |
 | --------------- | ------------------------------------------------ |
@@ -1420,6 +1390,7 @@ memtable を flush してから WAL を削除する。
 | `CURRENT`       | 有効な MANIFEST 番号（1行）                      |
 | `%06d.wal`      | 先行ログ                                         |
 | `%06d.sst`      | データファイル                                   |
+| `.rykdb.format` | 現在のキー配置（`rykdb-prefixed-v1`）            |
 | `.orphans/`     | MANIFEST 非参照ファイルの退避先（削除しない）    |
 
 ロックファイル（`root/.rykdb.lock`）は 0バイトのまま置かれる。中身は使わない（§7.9）。
@@ -1526,13 +1497,13 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 ### 12.1 採用しなかったもの
 
-| もの                  | 理由                                                    |
-| --------------------- | ------------------------------------------------------- |
-| B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針 |
-| 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）             |
-| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                            |
-| ブロック圧縮 / 暗号化 | スコープ外                                              |
-| lock-free データ構造  | keyspace シャーディングで十分（§7.4）                   |
+| もの                  | 理由                                                          |
+| --------------------- | ------------------------------------------------------------- |
+| B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針       |
+| 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）                   |
+| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                                  |
+| ブロック圧縮 / 暗号化 | スコープ外                                                    |
+| lock-free データ構造  | 書き込みを 1 本のハンドル系譜に直列化する規約で足りる（§7.7） |
 
 ### 12.2 既知の制約
 
@@ -1585,13 +1556,11 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **ActiveSnapshot の登録はハンドル単位のリースで解放する**（`RegistrationLease`）。
   commit / rollback / `Close()` / `Dispose()` で即時に外れ、未処理のまま捨てても
   最後のハンドルの GC で外れる（DDL が永久に `ConflictError` にならない）。
-- **keyspace 横断 commit は追記型ジャーナル（publish / resolve）で回復し、成否は一意に決まる**
-  （§7.5 の成否表）。
-  publish 完了前は「未反映」、完了後は「適用済み」。
-  物理重複は `filterApplied` で防ぐ。
+- **複数 keyspace への commit は 1回の WAL バッチで原子化される**（§7.5）。
+  `Commit` まで到達したバッチだけが再生され、途中で切れたバッチは未反映として捨てられる。
 - **ファイルの作成・削除はディレクトリエントリに依存し、標準機能ではディレクトリを fsync できない**
   （P/Invoke を使わない方針のため）。
-  intent は追記で回避したが、
+  複数 keyspace の commit は 1回の WAL バッチで原子化したが、
   **新規 WAL / SSTable / MANIFEST ファイルの作成と、`rotate` の削除は電源故障で欠ける可能性が残る**。
   プロセスのクラッシュ後の再起動であれば再作成・再生成で吸収できるが、電源故障の直後に再起動すると欠落しうる。
   完全な耐久にはディレクトリ同期が必要で、それは標準機能の範囲を超える

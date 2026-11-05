@@ -4,9 +4,6 @@
 
 module internal RykDb.TestHelpers
 
-open System
-open System.IO
-open System.Text
 open Xunit
 open RykDb.Core
 
@@ -35,9 +32,9 @@ let okOr defaultValue (r: Result<'T, DbError>) : 'T =
 /// 一意な一時ディレクトリを作る。
 let newDir (tag: string) =
     let dir =
-        Path.Combine(Path.GetTempPath(), sprintf "rykdb-%s-%d" tag DateTime.Now.Ticks)
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), sprintf "rykdb-%s-%d" tag System.DateTime.Now.Ticks)
 
-    Directory.CreateDirectory dir |> ignore
+    System.IO.Directory.CreateDirectory dir |> ignore
     dir
 
 /// 一時ディレクトリ内でテストを実行し、最後に削除する。
@@ -47,9 +44,9 @@ let withDir (tag: string) (f: string -> unit) =
     try
         f dir
     finally
-        if Directory.Exists dir then
+        if System.IO.Directory.Exists dir then
             try
-                Directory.Delete(dir, true)
+                System.IO.Directory.Delete(dir, true)
             with _ ->
                 ()
 
@@ -61,19 +58,19 @@ type private MemoryEngineState() =
 
 /// テスト用のメモリ StorageEngine。
 /// ディスク I/O をせず、memtable だけで getAt / scanAt / writeBatch を実装する。
-type private MemoryStorageEngine(state: MemoryEngineState, mem: Memtable, nextSeqNo: uint64) =
+type private MemoryStorageEngine(state: MemoryEngineState) =
     interface IStorageEngine with
-        member _.NextSeqNo = nextSeqNo
+        member _.NextSeqNo = state.NextSeqNo
         member _.ActiveSnapshot = 0UL
 
         member _.GetAt visible key =
-            Memtable.getVisible key visible mem
+            Memtable.getVisible key visible state.Mem
             |> Option.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
             |> ret
 
         member _.ScanAt visible startKey limit =
             let entries =
-                Memtable.rangeScan startKey 0 mem
+                Memtable.rangeScan startKey 0 state.Mem
                 |> Seq.filter (fun e ->
                     match visible with
                     | Some v -> e.SeqNo <= v
@@ -89,36 +86,28 @@ type private MemoryStorageEngine(state: MemoryEngineState, mem: Memtable, nextSe
         member _.WriteBatch entries =
             let nextMem = Memtable.apply entries state.Mem
             state.Mem <- nextMem
-            MemoryStorageEngine(state, nextMem, nextSeqNo) :> IStorageEngine |> ret
+            MemoryStorageEngine state :> IStorageEngine |> ret
 
         member _.WithNextSeqNo next =
             state.NextSeqNo <- max state.NextSeqNo next
-            MemoryStorageEngine(state, mem, next) :> IStorageEngine
+            MemoryStorageEngine state :> IStorageEngine
 
         member _.WithActiveSnapshot _ =
-            MemoryStorageEngine(state, mem, nextSeqNo) :> IStorageEngine
+            MemoryStorageEngine state :> IStorageEngine
 
         member _.MaybeFlush() =
-            MemoryStorageEngine(state, mem, nextSeqNo) :> IStorageEngine |> ret
+            MemoryStorageEngine state :> IStorageEngine |> ret
 
         member _.Close() = ret ()
 
 /// メモリ上の StorageEngine を作る。
-/// 同じ store の中では keyspace ごとに状態を共有する（再オープンで内容が見える）。
-let private newMemoryEngineFactory () =
-    let states = Collections.Generic.Dictionary<string, MemoryEngineState>()
-
-    fun keyspace ->
-        match states.TryGetValue keyspace with
-        | true, state -> ret (MemoryStorageEngine(state, state.Mem, state.NextSeqNo) :> IStorageEngine)
-        | _ ->
-            let state = MemoryEngineState()
-            states.[keyspace] <- state
-            ret (MemoryStorageEngine(state, state.Mem, state.NextSeqNo) :> IStorageEngine)
+let private newMemoryEngine () =
+    let state = MemoryEngineState()
+    MemoryStorageEngine state :> IStorageEngine
 
 /// メモリ上の RowStore を渡す（ディスク I/O なし）。
 let withStore (_tag: string) (f: RowStore -> unit) =
-    f (RowStore.openStoreWith "" (newMemoryEngineFactory ()))
+    f (RowStore.openStoreWith "" (newMemoryEngine ()))
 
 /// メモリ上の DB を開いてテストし、最後に閉じる（ディスク I/O なし）。
 /// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で差し替える。
@@ -129,8 +118,8 @@ let withStore (_tag: string) (f: RowStore -> unit) =
 /// store 側の root は空のまま（commit intent をディスクに書かない）。
 /// </remarks>
 let withDb (_tag: string) (f: Database -> unit) =
-    let root = "mem:" + Guid.NewGuid().ToString "N"
-    let store = RowStore.openStoreWith "" (newMemoryEngineFactory ())
+    let root = "mem:" + System.Guid.NewGuid().ToString "N"
+    let store = RowStore.openStoreWith "" (newMemoryEngine ())
     let db = ok (Database.OpenWithStore root store)
 
     try
@@ -266,7 +255,7 @@ let rowText (r: StatementResult) =
 // ---------------------------------------------------------------------------
 
 /// Random はモジュールスコープに 1 つだけ置く（決定的・mutable 不使用）。
-let private rng = Random 20261004
+let private rng = System.Random 20261004
 let private rnd () = rng
 
 let nextInt (lo: int) (hi: int) = rnd().Next(lo, hi)
@@ -276,7 +265,7 @@ let nextInt (lo: int) (hi: int) = rnd().Next(lo, hi)
 let randomText () =
     let r = rnd ()
     let len = r.Next(0, 14)
-    let sb = StringBuilder()
+    let sb = System.Text.StringBuilder()
 
     for _ in 1..len do
         match r.Next(0, 9) with
@@ -304,9 +293,9 @@ let randomValue () =
     | 5 -> SqlValue.Text(randomText ())
     | 6 -> SqlValue.Blob(Array.init (r.Next(0, 8)) (fun _ -> byte (r.Next(0, 256))))
     // DateOnly.FromDayNumber は 0..DateOnly.MaxValue.DayNumber のみ受け付ける
-    | 7 -> SqlValue.Date(DateOnly.FromDayNumber(r.Next(0, 3_650_000)))
-    | 8 -> SqlValue.Timestamp(DateTimeOffset(DateTime(r.Next(0, 2_000_000_000), DateTimeKind.Utc)))
-    | _ -> SqlValue.Uuid(Guid(Array.init 16 (fun _ -> byte (r.Next(0, 256)))))
+    | 7 -> SqlValue.Date(System.DateOnly.FromDayNumber(r.Next(0, 3_650_000)))
+    | 8 -> SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(r.Next(0, 2_000_000_000), System.DateTimeKind.Utc)))
+    | _ -> SqlValue.Uuid(System.Guid(Array.init 16 (fun _ -> byte (r.Next(0, 256)))))
 
 /// テスト用の全順序。型順位 → 同一型内は SQL 比較。
 let compareForSort (a: SqlValue) (b: SqlValue) =

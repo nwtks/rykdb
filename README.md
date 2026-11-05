@@ -2,7 +2,7 @@
 
 **.NET 10 / F# 10** で書かれた、**LSM-Tree ストレージ + MVCC + WAL** を備えた組込み RDBMS。
 
-テーブル本体も索引も、B-Tree ではなく keyspace 単位の **LSM ツリー** で保持する。
+テーブル本体も索引も、B-Tree ではなく DB ごとの単一 **LSM ツリー** に keyspace 接頭辞付きで保持する。
 ライブラリ API・SQL REPL・TCP サーバの3つのインターフェースを提供する。
 
 ---

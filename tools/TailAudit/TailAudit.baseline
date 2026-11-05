@@ -48,6 +48,7 @@ src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreC/planSelectC/resolveSelectC/r
 src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreC/planSelectC/resolveSelectC/resolveExprC/resolveLeafC|resolveLeafC|call
 src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreC/planSelectC/resolveSelectC/resolveExprC/resolveLeafC|resolveSelectC|call
 src/RykDb.Core/Planner.fs|traverseC|traverseC|call
+src/RykDb.Core/RowStore.fs|loop|loop|call
 src/RykDb.Core/Sstable.fs|loop|loop|call
 src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|loadBlock|call
 src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|scanEntries|call

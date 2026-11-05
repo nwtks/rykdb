@@ -1,6 +1,5 @@
 module RykDb.RowStoreTests
 
-open System.IO
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -62,7 +61,7 @@ let private rowOf (id: int) (email: string) (age: int) =
 /// transaction のバッファを DB に流し込む。
 let private commitInto (store: RowStore) (nextSeq: uint64) (txn: Transaction) =
     let batches = Transaction.toEntries nextSeq txn |> fst
-    RowStore.writeBatches batches store |> ok |> ignore
+    RowStore.writeBatches batches store |> ok
 
 /// Close の呼び出しを記録するだけの engine（RowStore.close のテスト用）。
 type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<string>) =
@@ -90,133 +89,85 @@ let ``Keyspace: table / index の名前`` () =
     Assert.Equal("i:ix_people_age", Keyspace.index "ix_people_age")
 
 [<Fact>]
-let ``Keyspace: keyspace はテーブルと索引で別になる`` () =
-    Assert.Equal<string>("t:users", Keyspace.table "users")
-    Assert.Equal<string>("i:users_email", Keyspace.index "users_email")
-    Assert.NotEqual<string>(Keyspace.table "users", Keyspace.index "users_email")
-
-    // ディレクトリ名に使える形（base32 なので / や : を含む名前も安全）
-    Assert.NotEqual<string>(Keyspace.toDirName "t:a/b", Keyspace.toDirName "t:a_b")
-
-[<Fact>]
-let ``Keyspace: base32 はパス区切りと大文字小文字衝突を作らない`` () =
-    let unicode = Keyspace.table "住所"
-    let dir = Keyspace.toDirName unicode
-    Assert.False(dir.Contains "/")
-    Assert.False(dir.Contains "\\")
-    Assert.Equal(Some unicode, Keyspace.tryFromDirName dir)
-
-    // base64 では t:a -> dDph / t:G -> dDpH となり、
-    // Windows/macOS の case-insensitive FS で衝突していた。
-    let a = Keyspace.toDirName (Keyspace.table "a")
-    let g = Keyspace.toDirName (Keyspace.table "G")
-    Assert.NotEqual<string>(a, g)
-    Assert.False(System.String.Equals(a, g, System.StringComparison.OrdinalIgnoreCase))
-
-[<Fact>]
-let ``Keyspace: toDirName / tryFromDirName の往復`` () =
-    let ks = "t:people"
-    let dir = Keyspace.toDirName ks
-    Assert.Equal(Some ks, Keyspace.tryFromDirName dir)
-
-[<Fact>]
-let ``RowStore.openStore: 新規 DB でも catalog エンジンを登録する`` () =
-    withDir "rs-catalog-engine" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-        Assert.True(Map.containsKey Keyspace.CatalogKeyspace store.Engines)
-        ok (RowStore.close store))
-
-[<Fact>]
-let ``RowStore: keyspace ごとに独立したディレクトリを持つ`` () =
+let ``RowStore: keyspace は 1 本の LSM の接頭辞で分離される`` () =
     withDir "rs7" (fun dir ->
         let store = RowStore.openStore dir |> ok
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
         let txn = Dml.insert txn usersWithEmailIndex (rowOf 1 "a@x.com" 1) |> ok
-        commitInto store 1UL txn
+        let store = commitInto store 1UL txn
+        // keyspace ごとのディレクトリは作られない。
+        Assert.Empty(System.IO.Directory.GetDirectories dir)
 
-        // 主キーのツリーと索引のツリーで別のディレクトリができている
-        let dirs = Directory.GetDirectories dir
-        Assert.True(dirs.Length >= 2)
+        let tableRows =
+            ok (RowStore.scan (Keyspace.table "users") [||] 0 store)
+            |> SstScan.toArray
+            |> ok
 
-        let hasWal =
-            dirs
-            |> Array.exists (fun d -> Directory.GetFiles(d, "*" + Wal.WalExtension).Length > 0)
+        let indexRows =
+            ok (RowStore.scan (Keyspace.index "users_email") [||] 0 store)
+            |> SstScan.toArray
+            |> ok
 
-        Assert.True hasWal)
-
-[<Fact>]
-let ``RowStore.openStore: 壊れた keyspace は開けない`` () =
-    withDir "rs-corrupt" (fun dir ->
-        let ksDir = Path.Combine(dir, Keyspace.toDirName "t:broken")
-        Directory.CreateDirectory ksDir |> ignore
-        File.WriteAllText(Path.Combine(ksDir, "CURRENT"), "壊れた CURRENT")
-        expectError "壊れた keyspace を開けてしまう" (RowStore.openStore dir))
-
-[<Fact>]
-let ``RowStore.openStore: ロック失敗時は commit journal を触らない`` () =
-    withDir "rs-journal-lock-order" (fun dir ->
-        let store = ok (RowStore.openStore dir)
-        let journal = Path.Combine(dir, ".commit", "journal")
-
-        // 4バイトの長さが MaxFrameBytes を超えるフレーム + 余分なバイト。
-        // touch がロック前に走ると、readFrames の validLen（4）まで切り詰める。
-        let bytes = [| 0xFFuy; 0xFFuy; 0xFFuy; 0xFFuy; 1uy; 2uy; 3uy |]
-        File.WriteAllBytes(journal, bytes)
-        expectErrorKind ErrorKind.IoError "同じ root の二重オープン" (RowStore.openStore dir)
-        Assert.Equal<byte array>(bytes, File.ReadAllBytes journal)
+        Assert.Single tableRows |> ignore
+        Assert.Single indexRows |> ignore
+        Assert.Equal<byte array>(intKey 1, tableRows.[0].Key)
 
         ok (RowStore.close store))
 
 [<Fact>]
-let ``RowStore.openStore: 開く途中で失敗してもロックを解放する`` () =
-    withDir "rs-lock-cleanup" (fun dir ->
-        let ksDir = Path.Combine(dir, Keyspace.toDirName "t:broken")
-        Directory.CreateDirectory ksDir |> ignore
-        File.WriteAllText(Path.Combine(ksDir, "CURRENT"), "壊れた CURRENT")
-        expectError "壊れた keyspace を開けてしまう" (RowStore.openStore dir)
+let ``RowStore: 前方一致する keyspace 名でもキーが混ざらない`` () =
+    withStore "rs-prefix-boundary" (fun store ->
+        let spaceA = Keyspace.table "a"
+        let spaceB = Keyspace.table "ab"
 
-        // 失敗した open がプロセス内ロックを残していると、ここで IoError になる。
-        Directory.Delete(ksDir, true)
+        let store =
+            ok (
+                RowStore.writeBatches
+                    [
+                        spaceA, [| Entry.put (intKey 1) 1UL (intRow 1) |]
+                        spaceB, [| Entry.put (intKey 1) 2UL (intRow 2) |]
+                    ]
+                    store
+            )
+
+        let rowsA = ok (RowStore.scan spaceA [||] 0 store) |> SstScan.toArray |> ok
+        let rowsB = ok (RowStore.scan spaceB [||] 0 store) |> SstScan.toArray |> ok
+        Assert.Equal(1, rowsA.Length)
+        Assert.Equal(1, rowsB.Length)
+        Assert.Equal(Some(intRow 1), rowsA.[0].Value)
+        Assert.Equal(Some(intRow 2), rowsB.[0].Value))
+
+[<Fact>]
+let ``RowStore: 複数 keyspace の書き込みは 1 回の WAL バッチで回復する`` () =
+    withDir "rs-atomic-wal" (fun dir ->
         let store = ok (RowStore.openStore dir)
+        let b1 = "t:a", [| Entry.put (intKey 1) 1UL (intRow 1) |]
+        let b2 = "t:b", [| Entry.put (intKey 2) 2UL (intRow 2) |]
+        ok (RowStore.writeBatches [ b1; b2 ] store) |> ignore
+
+        // close せずに開き直す（WAL だけが残ったクラッシュ状態）。
+        let reopened = ok (RowStore.openStoreTakingOver dir)
+        Assert.Equal(Some(intRow 1), ok (RowStore.getAt "t:a" (intKey 1) None reopened))
+        Assert.Equal(Some(intRow 2), ok (RowStore.getAt "t:b" (intKey 2) None reopened))
+
+        ok (RowStore.close reopened)
         ok (RowStore.close store))
 
 [<Fact>]
-let ``RowStore.close: 途中の engine が失敗しても残りを閉じる`` () =
+let ``RowStore.close: engine の失敗を返してロックを解放する`` () =
     let closed = ResizeArray<string>()
 
     let store =
         {
             Root = ""
-            Engines =
-                Map.ofList
-                    [
-                        "t:a", CloseTrackingEngine("a", true, closed) :> IStorageEngine
-                        "t:b", CloseTrackingEngine("b", false, closed) :> IStorageEngine
-                    ]
-            OpenEngine = fun _ -> err (DbError.internalError "unused")
+            Engine = CloseTrackingEngine("a", true, closed) :> IStorageEngine
             Lock = None
         }
 
     let outcome = RowStore.close store
     expectError "close は失敗を返す" outcome
-    // 最初の engine が失敗しても、後続の engine も Close される。
     Assert.Contains("a", closed)
-    Assert.Contains("b", closed)
-
-[<Fact>]
-let ``RowStore.openStore: 壊れた MANIFEST レコードは読み飛ばす`` () =
-    withDir "rs-manifest" (fun dir ->
-        // ルートの keyspace 開設時（openStore では subdirectory のみ走査）に読ませる
-        let ksDir = Path.Combine(dir, Keyspace.toDirName "t:manifest")
-        Directory.CreateDirectory ksDir |> ignore
-        File.WriteAllText(Path.Combine(ksDir, "CURRENT"), "MANIFEST-000001")
-        // base64 としては正しいが、中身が VersionEdit として壊れている
-        File.WriteAllText(Path.Combine(ksDir, "MANIFEST-000001"), "AA==")
-        // レコード単位で捨てて先へ進む（開けるが、その前後も読める）
-        ok (RowStore.openStore dir) |> ignore)
-
-/// ジャーナルの未解決件数。
 
 [<Fact>]
 let ``RowStore.commitToStore: 別ハンドルの active snapshot を GC 境界に使う`` () =
@@ -235,10 +186,8 @@ let ``RowStore.commitToStore: 別ハンドルの active snapshot を GC 境界�
 
         // 同じ DB を開いた別ハンドルが snapshot 5 で読み始めている状態。
         let other = ActiveSnapshotRegistry.register dir 5UL
-
         let committed, _ = ok (RowStore.commitToStore dir None mgr txn store)
-        let engine = ok (RowStore.ensure "t:a" committed)
-
+        let engine = ok (RowStore.ensure committed)
         // 自ハンドルだけなら 12（LastCommitSeqNo 11 + 1）だが、別ハンドルの 5 が下限になる。
         Assert.Equal(5UL, engine.ActiveSnapshot)
 
@@ -261,10 +210,8 @@ let ``RowStore.commitToStore: 自分の登録は GC 境界から除外する`` (
 
         // 自分（これから commit する transaction）の登録は除外し、他の登録だけを見る。
         let own = ActiveSnapshotRegistry.register dir txn.Snapshot.SeqNo
-
         let committed, _ = ok (RowStore.commitToStore dir (Some own) mgr txn store)
-        let engine = ok (RowStore.ensure "t:a" committed)
-
+        let engine = ok (RowStore.ensure committed)
         Assert.Equal(12UL, engine.ActiveSnapshot)
 
         ActiveSnapshotRegistry.unregister dir own

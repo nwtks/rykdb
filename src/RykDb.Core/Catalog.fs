@@ -489,7 +489,7 @@ module internal Catalog =
             |> List.filter (fun k -> not (wanted |> List.exists (fun w -> bytesEqual k w)))
 
         result {
-            let! e = RowStore.ensure Keyspace.CatalogKeyspace store
+            let! e = RowStore.ensure store
             let seq0 = e.NextSeqNo
             let tableBatches, seq1 = numberList tableBatch catalog.Tables seq0 []
             let indexBatches, seq2 = numberList indexBatch catalog.Indexes seq1 []

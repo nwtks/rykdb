@@ -87,7 +87,7 @@ let ``テスト: 各テストモジュールが 1つ以上の Fact を持つ`` (
             | _ -> None)
         |> Array.sort
 
-    Assert.True(modules.Length >= 32, sprintf "テストモジュールが %d個しか見つかりません" modules.Length)
+    Assert.True(modules.Length >= 31, sprintf "テストモジュールが %d個しか見つかりません" modules.Length)
 
     for moduleName in modules do
         let count = (namesOf moduleName).Length

@@ -89,7 +89,7 @@ type Database internal (root: string, state: DbState) =
     /// テーブル一覧を返す。
     member _.TableNames() = state.Catalog.Tables |> List.map _.Name
 
-    /// DB を閉じる（全 keyspace の memtable を flush し、WAL を削除する）。
+    /// DB を閉じる（memtable を flush し、WAL を削除する）。
     /// <remarks>
     /// ハンドルは不変なので「閉じた」状態をこのハンドルには記録しない。
     /// Close 後に同じハンドルで Execute すると WAL が再作成されるため、Close 後は破棄すること。

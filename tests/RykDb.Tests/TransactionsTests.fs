@@ -133,7 +133,7 @@ let ``TransactionManager.commit: 同じキーを 2 つの transaction が書く�
 
 [<Fact>]
 let ``TransactionManager.commit: 別 keyspace の同じキーは衝突しない`` () =
-    // keyspace シャーディングの設計意図：別ツリーなら衝突しない
+    // 論理 keyspace が違えば物理キーも接頭辞で分かれるので衝突しない
     let mgr = TransactionManager.create ()
     let mgr, t1 = TransactionManager.beginTxn mgr
     let t1 = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] t1
@@ -180,7 +180,6 @@ let ``TransactionManager.commit: active が無ければ commit 直後に LastCom
     let mgr, t1 = TransactionManager.beginTxn mgr
     let t1 = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] t1
     let mgr, seq1, _ = TransactionManager.commit t1 mgr |> ok
-
     // 衝突し得る active な transaction が居ないので、commit 直後に捨てられる
     Assert.Equal<int>(0, mgr.LastCommitted.Count)
     Assert.Equal<uint64>(seq1, mgr.LastCommitSeqNo)
@@ -204,7 +203,6 @@ let ``TransactionManager.commit: 古い snapshot の transaction が居る間は
     let mgr, t = TransactionManager.beginTxn mgr
     let w = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] t
     let mgr, _, _ = TransactionManager.commit w mgr |> ok
-
     // old (snapshot 0) が生きている間は、衝突検出のために版を残す
     Assert.True(mgr.LastCommitted.ContainsKey(Transaction.conflictKey "t:x" [| 1uy |]))
 
@@ -218,7 +216,6 @@ let ``TransactionManager.commit: abort 済み transaction の commit はエラ�
     let mgr = TransactionManager.create ()
     let mgr, txn = TransactionManager.beginTxn mgr
     let mgr = TransactionManager.abort txn mgr
-
     // Active から消えているので内部エラーになる
     expectErrorKind ErrorKind.InternalError "abort 済みの commit" (TransactionManager.commit txn mgr)
 
@@ -232,9 +229,7 @@ let ``ActiveSnapshotRegistry: root ごとに最古の active snapshot を返す`
 
     let first = ActiveSnapshotRegistry.register root 10UL
     let second = ActiveSnapshotRegistry.register root 7UL
-
     Assert.Equal<uint64 option>(Some 7UL, ActiveSnapshotRegistry.oldestExcept root None)
-
     // 自分自身の登録は除外できる（これから commit する transaction）
     Assert.Equal<uint64 option>(Some 10UL, ActiveSnapshotRegistry.oldestExcept root (Some second))
 
@@ -251,22 +246,18 @@ let ``ActiveSnapshotRegistry: 別 root は混ざらない`` () =
 
     let a = ActiveSnapshotRegistry.register root 5UL
     let b = ActiveSnapshotRegistry.register other 3UL
-
     Assert.Equal<uint64 option>(Some 5UL, ActiveSnapshotRegistry.oldestExcept root None)
     Assert.Equal<uint64 option>(Some 3UL, ActiveSnapshotRegistry.oldestExcept other None)
 
     ActiveSnapshotRegistry.unregister root a
     ActiveSnapshotRegistry.unregister other b
-
     Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept root None)
     Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept other None)
 
 [<Fact>]
 let ``ActiveSnapshotRegistry: 相対パスと絶対パスは同じ DB として扱う`` () =
     let rel = "./" + System.IO.Path.GetFileName(freshRoot "reg-path")
-
     let token = ActiveSnapshotRegistry.register rel 4UL
-
     // GetFullPath で正規化するので、同じ DB を別表記で開いても同じ束になる
     let full = System.IO.Path.GetFullPath rel
 

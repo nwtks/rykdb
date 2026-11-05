@@ -22,7 +22,6 @@
     <Compile Include="Ast.fs" />
     <Compile Include="Lexer.fs" />
     <Compile Include="Parser.fs" />
-    <Compile Include="CommitIntent.fs" />
     <Compile Include="ProcessLock.fs" />
     <Compile Include="RowStore.fs" />
     <Compile Include="Catalog.fs" />

@@ -462,32 +462,15 @@ let nextSeq = engine.NextSeqNo
 
 ### 5.2 reopen 時に SeqNo を再開しないと「全部未来」で見えない
 
-`RowStore.openStore` が keyspace を**開かず** `Engines = Map.empty` にしていたため、
-`Database.OpenWith` の `TransactionManager.create ()` が `LastCommitSeqNo = 0` になり、
-**ディスク上の行がすべて「未来」** と判定されて **0行**になっていた。
+`StorageEngine.openDatabase` はディスク上の最大 SeqNo から `NextSeqNo` を復元する。
+`RowStore.lastSeqNo` を通して `TransactionManager` の `LastCommitSeqNo` を初期化しないと、
+**ディスク上の行がすべて「未来」** と判定されて **0行**になる。
 
 ```fsharp
-// ✅ 既存 keyspace を全部開いて、SeqNo を再開する
-let openStore (root: string) : Result<RowStore, DbError> =
-    protect (fun () -> Directory.CreateDirectory(root) |> ignore)
-    |> Result.bind (fun () ->
-        let known =
-            Directory.GetDirectories(root)
-            |> Array.choose (fun dir ->
-                let name = Path.GetFileName dir
-                match Keyspace.tryFromDirName name with
-                | Some ks -> Some(ks, dir)
-                | None -> None)
-        // ... 全ての StorageEngine.openDatabase を engines に積む ...)
-    // ...
-
 // ✅ 開いた engine から SeqNo を復元する
-let lastSeqNo (store: RowStore) : uint64 =
-    store.Engines
-    |> Map.toList
-    |> List.fold
-        (fun acc (_, (e, _)) -> max acc (if e.NextSeqNo = 0UL then 0UL else e.NextSeqNo - 1UL))
-        0UL
+let lastSeqNo (store: RowStore) =
+    let next = store.Engine.NextSeqNo
+    if next = 0UL then 0UL else next - 1UL
 ```
 
 ### 5.3 GC の SeqNo 判定は「snapshot が小さいほどまだ読まれている」
@@ -605,8 +588,8 @@ let withIndexes =
 
 ### 6.3 `CREATE INDEX` に backfill が無いと過去行が見つからない
 
-索引は**別の keyspace**（`i:<name>`）に持つので、
-`CREATE INDEX` 時に中身を写さないと、**その前に `INSERT` した行が検索に出てこない**。
+索引は**別の論理 keyspace**（`i:<name>`）に持つので、`CREATE INDEX` 時に中身を写さないと、
+**その前に `INSERT` した行が検索に出てこない**。
 
 ```fsharp
 // ✅ 既存行をチャンクごとの transaction で index keyspace に書き込む
@@ -914,7 +897,7 @@ let rec readAll n c acc =
 深い式の回帰テストは `AstTests` の `末尾再帰: AST の深い走査でスタックを食わない` と
 `OpsTests` の `末尾再帰: 50000段の式を havingFilter してもスタックを食わない`。
 カーソルからの数え上げ読み出しは `Reader.readItems`（Serialization.fs）に共通化し、
-`Catalog` / `CommitIntent` / `Memtable` が使う。
+`Catalog` / `Memtable` が使う。
 
 **Debug の `Tailcalls` は既定で false**。
 `dotnet test` / `dotnet run` は Debug なので、CPS の相互末尾再帰が `tail.` にならず、
@@ -1014,8 +997,8 @@ FSI は `/tmp/probe.dll` のようなパスをキャッシュする。
 
 ### 10.2 データが本当にディスクに書かれたか確認
 
-keyspace ごとに base32 のディレクトリができる
-（`t:people` → `OQ5HAZLPOBWGK`）。
+全 keyspace がルート直下の 1本の LSM に入る
+（`t:people` の行は `[長さ]["t:people"][主キー]` という物理キーになる）。
 
 ```fsharp
 System.IO.Directory.GetFiles(dir, "*", System.IO.SearchOption.AllDirectories)
@@ -1060,7 +1043,7 @@ FSharp.Core の `Array.take` は `Seq.take` 相当で、要素数が足りない
 
 ### 11.3 削除は主キー + 全索引に墓碑を書く
 
-keyspace を分けている代償として、削除は主キー側に加えて**全索引にもtombstone を書き込む**。
+論理 keyspace を分けている代償として、削除は主キー側に加えて**全索引にもtombstone を書き込む**。
 索引側を忘れると、索引経由の検索で**削除済みの行が復活する**。
 
 ### 11.4 MANIFEST を先に、ファイル削除を後にする
@@ -1098,39 +1081,23 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
   （src からの `readFirstValue` 呼び出しが無く、テストも単一フィールドのみだったため潜在化していた）。
 - 回帰テスト: `SerializationTests` の `OrderPreserving: 複合キーの先頭フィールドを読める`
 
-### 11.8 keyspace 横断 commit は「先に publish、最後に resolve」（追記型ジャーナル）
+### 11.8 keyspace 横断 commit は 1回の WAL バッチにする
 
-テーブルと索引は別 keyspace・別 WAL。テーブルだけ書けて索引が書けないクラッシュを防ぐため、
+テーブルと索引は論理 keyspace が別だが、物理ツリーと WAL は DB 全体で 1本。
 `RowStore.commitToStore`（内部の `writeBatchesWithSnapshot`）は
-`.commit/journal` へ **publish を追記**してから書き、
-全 keyspace の適用後に **resolve を追記**して解決する。
+全 keyspace のエントリに接頭辞を付けて **1つの `Entry array`** にまとめ、
+`StorageEngine.writeBatch` を 1回だけ呼ぶ。
+WAL には `Begin / Batch / Commit` が 1回の `Wal.append` で書かれるため、
+「テーブルだけ書けて索引が書けない」状態は発生しない。
 
-- **`File.Move` / `File.Delete` は使わない**。
-  .NET 標準機能ではディレクトリを fsync できず、
-  rename / delete はディレクトリエントリの編集なので電源故障で消える
-  （クロスプラットフォームを守るため P/Invoke も使わない）。
-  追記だけなら `Flush(true)` でファイルデータを落とせる。
-- ジャーナルはオープン時に `touch` で 1 回だけ作る（ディレクトリを汚すのはこの 1 回だけ）。
-  **切れた尾部があれば切り詰める**。
-  切れたまま追記すると読みが止まり、以後の publish が全部読めなくなる。
-- レコードは `[長さ][ペイロード][CRC]`。
-  尾部の途切れは CRC で検出し「公開未完了」として捨てる。
-  公開完了前に WAL へは書いていないので捨てて安全（architecture §7.5 の成否表）。
-- intent のペイロードは `Entry.encodeBatch`（txnId + 件数 + 各エントリ）を
-  `Writer.lengthPrefixed` で包む。`Writer.writeBytes` で包むと
-  `Reader.readLengthPrefixed` が先頭 8 バイトを長さと誤認し、`Reader: 8 バイトを読み取れません` になる。
-- 再適用は `filterApplied` が `(key, SeqNo, value)` の完全一致を `GetAt` で確認して読み飛ばす。
-  これを Memtable 全体の重複排除にしてはいけない（通常の同一 SeqNo 重複の意味が変わる）。
-- **適用が失敗したら publish は残したままエラーを返す**（握り潰さない）。
-  次回のオープンで冪等に再生する。
-  resolve の失敗もエラーとして上位へ伝える（解決できなくても再生は冪等なので安全側）。
-- 間引きは「未解決ゼロ」のときだけ（256KiB 超）。
-  公開記録を消すと適用前の commit が再生できなくなる。
-- 回帰テスト: `RowStore: commit intent が残っていれば再オープンで全 keyspace を適用する` /
-  `RowStore: 複数 keyspace の commit は intent を追記して公開し、解決する` /
-  `RowStore: 公開の追記が途中で切れた intent は再生しない` /
-  `RowStore: ジャーナルが大きく未解決が無ければ間引かれる` /
-  `RowStore: 未解決の intent が残っている間はジャーナルを間引かない`。
+- **WAL 追記の成功を commit point にする**。
+  その後の memtable flush 失敗で `Error` を返してはいけない。
+  呼び出し側が `TransactionManager` を進めず、同じ SeqNo を再利用してコミット済み WAL と食い違う。
+- flush に失敗しても `WriteBatch` が返した memtable は保持し、成功を返す。
+  次の commit / `Close` で flush を再試行する。
+- 旧 `.commit/journal` の publish / resolve は削除した。
+  再適用用の `filterApplied` も不要（WAL の Commit レコードが原子性を保証する）。
+- 回帰テスト: `RowStore: 複数 keyspace の書き込みは 1 回の WAL バッチで回復する`。
 
 ### 11.9 `ActiveSnapshot = 0` は「全版を残す」
 
@@ -1142,7 +1109,7 @@ replay 中や境界未設定時は 0 のままにし、通常の commit では
 ### 11.10 DROP は種類ごとに安全な順序で行う
 
 `DROP TABLE` / `DROP INDEX` はカタログから定義を外すだけでは不十分。
-keyspace のディレクトリ名は名前から決まる（`t:<name>` / `i:<name>`）ので、
+論理 keyspace の接頭辞は名前から決まる（`t:<name>` / `i:<name>`）ので、
 残骸があるまま同名で再作成すると**旧データや旧索引エントリが見える**。
 特に「索引を DROP → 行を DELETE → 同名 CREATE INDEX」の順では、
 DELETE 時に索引 tombstone が書かれないため、backfill 後の索引検索で削除済みの行が復活する。
@@ -1192,11 +1159,12 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 
 ### 11.13 MANIFEST が壊れていたら「空の Version」で開かずエラーにする
 
-`Manifest.openOrCreate` 内の `decodeLines` は**途中**のレコード破損を `CorruptionError` にし、**末尾の書きかけ**だけを読み飛ばす。
+`Manifest.openOrCreate` 内の `decodeLines` は**途中**のレコード破損を `CorruptionError` にし、
+**末尾の書きかけ**だけを読み飛ばす。
 `CURRENT` の指す manifest が無い場合や、`CURRENT` が無い/空なのに `*.sst` が残っている場合もエラーにする。
 
 - 空の Version を返すと `StorageEngine.openDatabase` が全 SSTable を孤児として扱い、**データが見えなくなる**。
-- 孤児は削除せず `<keyspace>/.orphans/` へ退避する（`quarantineOrphans`）。
+- 孤児は削除せず `<root>/.orphans/` へ退避する（`quarantineOrphans`）。
   manifest を読み落としただけのケースでも実体は復元できる。
 - 末尾の書きかけを許容するのは、`logAndApply` の `fs.Write` + `Flush(true)` が途中で切れた場合のため。
 - 各レコードは `[checksum:u32LE][VersionEdit 本体]` のフレーム（FNV-1a）を base64 にした 1行。
@@ -1218,7 +1186,7 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 同じ理由で **古いハンドルの `Close()` は `ProcessLock` も解放しない**。
 `Database` は `ProcessLockLease` の所有者トークンを持ち、
 新しいハンドルが作られるたびに所有者が移る。
-所有者（最新）の `Close()` だけが全 keyspace を閉じて `.rykdb.lock` を解放する。
+所有者（最新）の `Close()` だけが LSM を閉じて `.rykdb.lock` を解放する。
 
 - 回帰テスト:
   `Database: 古いハンドルを Close しても新しいハンドルの commit は失われない` /
@@ -1474,16 +1442,15 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 - `defaultValues` の評価後に `SqlValue.coerce col.DataType` を通す。
 - 回帰テスト: `SqlReference: DEFAULT は列型へ暗黙変換される`。
 
-### 11.34 `CommitIntent.touch` は `ProcessLock` を取ってから呼ぶ
+### 11.34 format マーカーの検証は `ProcessLock` を取ってから行う
 
-`RowStore.openStore` は以前、`ProcessLock.acquire` より先に `CommitIntent.touch` を呼んでいた。
-別プロセスが `.commit/journal` に publish / resolve を追記している最中に第 2 のプロセスが open すると、
-`touch` の末尾切り詰めが**書き込み中のフレーム**を壊す。
+`RowStore.openStore` は `ProcessLock.acquire` の後に `.rykdb.format` を検証 / 作成する。
+ロック前に書くと、同じ root を開こうとした第2のプロセスが
+使用中の DB のマーカーを変更してしまう。
 
-- `Directory.CreateDirectory root` → `ProcessLock.acquire` → `CommitIntent.touch` の順にする。
-- `touch` が失敗したら取得済みのロックを解放する。
-- 回帰テスト: `RowStore.openStore: ロック失敗時は commit journal を触らない`
-  （不正な長さプレフィックスの journal が二重オープン失敗後も残ること）。
+- `Directory.CreateDirectory root` → `ProcessLock.acquire` → `ensureFormat` の順にする。
+- `ensureFormat` が失敗したら取得済みのロックを解放する。
+- 回帰テスト: `RowStore.openStore: ロック失敗時は format マーカーを書き換えない`。
 
 ### 11.35 `ActiveSnapshotRegistry` の bucket 削除と register は競合する
 
@@ -1511,13 +1478,12 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 
 以前は `WriteCloseGate` というプロセス全体の 1本の `SemaphoreSlim` で
 `writeBatch` / `close` を直列化していた。
-このため、無関係な DB / keyspace の書き込みまで互いに待たされ、
-keyspace シャーディングによる並列性が失われていた。
+このため、無関係な DB の書き込みまで互いに待たされていた。
 
-- `StorageEngine` は `Dir`（正規化した keyspace ディレクトリ）ごとの Gate を持つ。
+- `StorageEngine` は `Dir`（正規化した DB ディレクトリ）ごとの Gate を持つ。
 - `writeBatch` / `maybeFlush`（flush + compaction）/ `close` を同じ Gate で直列化する。
-- 異なる keyspace / DB は並行。Gate 表はプロセス内で共有し、キーは正規化したパス。
-- Gate 表は開いた keyspace の数だけ残る（プロセス寿命。通常は小さい）。
+- 異なる DB は並行。Gate 表はプロセス内で共有し、キーは正規化したパス。
+- Gate 表は開いた DB の数だけ残る（プロセス寿命。通常は小さい）。
 
 ### 11.38 未対応の SQL 語をテーブル別名として飲み込まない
 

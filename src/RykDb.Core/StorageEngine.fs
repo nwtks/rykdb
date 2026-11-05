@@ -1,5 +1,5 @@
 // ===========================================================================
-// StorageEngine — LSM ツリーを 1本公開する層（keyspace 1本 = ここが 1本）。
+// StorageEngine — LSM ツリーを 1本公開する層（1 DB = ここが 1本）。
 //
 // 探索は「memtable -> L0（新しい順）-> 各レベル（新しい順）」の順。
 // 各ステップで Bloom filter と VersionSet の key range で枝刈りする。
@@ -78,9 +78,9 @@ type internal StorageEngine =
     }
 
 module internal StorageEngine =
-    // writeBatch / maybeFlush / close は、同じ keyspace の WAL / memtable 競合を
+    // writeBatch / maybeFlush / close は、同じ DB の WAL / memtable 競合を
     // 防ぐため直列化する。
-    // 異なる keyspace / DB は並行に進められるよう、ディレクトリ単位の Gate にする
+    // 異なる DB は並行に進められるよう、ディレクトリ単位の Gate にする
     // （プロセス全体の 1本にしない）。
     let private DirGates =
         System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.SemaphoreSlim>(

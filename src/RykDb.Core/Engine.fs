@@ -174,10 +174,7 @@ module internal Ddl =
                     | Error e -> err e
                     | Ok st' -> loop st' lastKey
 
-        if not (RowStore.keyspaceExists space state.Store) then
-            ret state
-        else
-            loop state [||]
+        loop state [||]
 
     let createTable (c: CreateTable) (state: DbState) =
         let createTableCore (c: CreateTable) state =

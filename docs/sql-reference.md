@@ -963,7 +963,7 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] 索引名 ON テーブル (列 [, 列 …]
   同じ DB で実行中の transaction があれば `ConflictError`（`実行中の transaction があります。…`）を返すので、
   COMMIT / ROLLBACK してから実行する。
   他の文は backfill が終わるまで待つ。
-- 索引は**独立した LSM ツリー**（keyspace `i:<索引名>`）に格納される。
+- 索引は論理 keyspace `i:<索引名>` に格納される（物理的には DB の単一 LSM 上で接頭辞分離）。
 - `UNIQUE` は重複を検査する（`NULL` は除く）。
 - 同名の索引が既にあれば `索引 <名前> は既に存在します`。
 - 索引する列が存在しない場合は `テーブル <t> に列 <c> がありません`。
@@ -985,9 +985,9 @@ DROP INDEX [IF EXISTS] 索引名;
 
 - `IF EXISTS` を付けると、存在しなくても**エラーにならない**。
 - `DROP TABLE` は先に定義を外してテーブルを見えなくし、
-  その後でテーブルと全索引 keyspace の全エントリへ tombstone を 8192件ずつ書く。
+  その後でテーブルと全索引の論理 keyspace の全エントリへ tombstone を 8192件ずつ書く。
   後始末は `.drop-cleanup` ジャーナルに記録され、失敗時は次回 open 時に再開する。
-- `DROP INDEX` も同様に、定義を外した後の索引 keyspace 消去を
+- `DROP INDEX` も同様に、定義を外した後の索引 keyspace の消去を
   `.drop-cleanup` ジャーナル経由で再開できる。
 - `__unique_` で始まる暗黙の `UNIQUE` 索引は `DROP` できない（`ConstraintViolation`）。
   制約を消すにはテーブルを再作成する。

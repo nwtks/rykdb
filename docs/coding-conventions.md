@@ -36,7 +36,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 `try` / `with` は `protect` のほか、`Lexer` / `Types` の数値・リテラル変換、
 `Serialization` の文字列・バイト境界、`Manifest.decodeRecord`、`Keyspace.keyspaceOfBytes` で使い、
 いずれも `DbError` に変換するか `None` として扱い、例外を外へ出さない。
-`try` / `finally` は `CommitIntent` / `ProcessLock` / `StorageEngine` / `Transactions` の解放処理に使う。
+`try` / `finally` は `ProcessLock` / `StorageEngine` / `Transactions` の解放処理に使う。
 
 失敗は `ErrorKind`（`DbError.Kind`）で分類する。
 
@@ -124,7 +124,7 @@ Debug ビルドでも F# に `tail.` プレフィックスを出させる
     `SstScan.emit` にもある。
   - 逆に**要素数に比例する反復は `match` に直して末尾再帰にする**
     （`IN` の候補リストと `CASE` の WHEN 節。`eval ... >>= fun` だと候補の数だけスタックが積まれる）。
-    カーソルから件数分を読み出す処理（`Catalog` の列定義・名前、`CommitIntent` のバッチ、`Memtable` のエントリ）は
+    カーソルから件数分を読み出す処理（`Catalog` の列定義・名前、`Memtable` のエントリ）は
     `Reader.readItems`（Serialization.fs）に集約し、`match` の末尾再帰で回す。
   - WHERE の AND を平坦化する `Predicate.flattenLoop` は明示スタック（`Expr list`）で末尾再帰にする
     （`[<TailCall>]` 付き。ローカルの `let rec` には属性を付けられないので、モジュールスコープに置いている）。

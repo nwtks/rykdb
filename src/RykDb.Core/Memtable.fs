@@ -3,7 +3,7 @@ namespace RykDb.Core
 /// memtable の 1エントリ。
 type internal Entry =
     {
-        /// keyspace ごとに符号化済みのユーザ指定キー
+        /// 論理 keyspace の接頭辞を含む物理キー
         Key: byte array
         /// 書き込みの論理時計。大きいほど新しい
         SeqNo: uint64

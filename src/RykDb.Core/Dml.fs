@@ -20,8 +20,9 @@ module internal RowKey =
         KeyBuilder.ofIndexAndPrimary (indexValues schema index row) (TableSchema.primaryKeyOf schema row)
 
 /// DML — スキーマと transaction を使う上位操作。
-/// 1行の書き込みは「主キーの LSM への 1件 + 各索引の LSM への 1件」。
-/// これらは異なる keyspace なので並列に commit できる。
+/// 1行の書き込みは「主キーへの 1件 + 各索引への 1件」。
+/// これらは論理 keyspace が違うだけで物理的には同じ LSM に入り、
+/// 1回の WAL バッチで原子的に commit される。
 /// 削除は主キー + 全索引に tombstone を書く
 /// （書き漏らすと索引経由で消えた行が復活する）。
 module internal Dml =
@@ -133,7 +134,7 @@ module internal Dml =
 
     /// `SstScan` を `Op` に変換する。
     /// `take` が false になった時点で走査を打ち切る（キー昇順なので範囲の上限に使える）。
-    /// `RowStore.scanAtRaw` は tombstone を含むので、None は読み飛ばす。
+    /// `RowStore.scanAtRaw` の None（削除済み）は読み飛ばす。
     let private opOfScan (take: SstEntry -> bool) (scan: SstScan) =
         let rec emit scan =
             Op.Compute(fun () ->
