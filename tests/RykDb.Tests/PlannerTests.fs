@@ -446,8 +446,9 @@ let ``Plan.runSelect: FROM なしの SELECT は 1 行の定数を返す`` () =
                 []
                 None
 
-        let columns, rows = ok (Plan.runSelect ctx stmt)
-        // FROM なしの入力は 1 行 0 列で、射影が定数を 1 列にする
+        let columns, op = ok (Plan.runSelect ctx stmt)
+        let rows = ok (Op.toArray op)
+        // FROM なしの入力は 1行 0列で、射影が定数を 1列にする
         Assert.Equal<string array>([| "1" |], columns)
         Assert.Equal<int>(1, rows.Length)
         Assert.Equal<int>(1, rows.[0].Length)

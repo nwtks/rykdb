@@ -1043,8 +1043,7 @@ module internal Plan =
     /// DML（INSERT / UPDATE / DELETE）の式に含まれるサブクエリを解決する。
     let resolveDmlExpr = resolveExprC ret
 
-    /// SELECT 文を実行して、結果（列名 + 行）を返す。
+    /// SELECT 文を計画・実行して、結果（列名 + 未消費の Op）を返す。
+    /// 行の配列化は呼び出し側（Engine）で行う。
     let runSelect =
-        planSelectC (fun (schema, op) ->
-            Op.toArray op
-            |> Result.map (fun rows -> schema.Columns |> Array.map (fun c -> c.Name), rows))
+        planSelectC (fun (schema, op) -> ret (schema.Columns |> Array.map (fun c -> c.Name), op))

@@ -456,13 +456,15 @@ module internal Engine =
         contextOf state txn
         >>= fun ctx ->
             Plan.runSelect ctx stmt
-            |> Result.map (fun (columns, rows) ->
-                state,
-                {
-                    RowsAffected = rows.Length
-                    Columns = columns
-                    Rows = rows
-                })
+            >>= fun (columns, op) ->
+                Op.toArray op
+                |> Result.map (fun rows ->
+                    state,
+                    {
+                        RowsAffected = rows.Length
+                        Columns = columns
+                        Rows = rows
+                    })
 
     let private resolveWhere (ctx: ExecContext) =
         function

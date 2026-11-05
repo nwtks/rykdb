@@ -543,7 +543,8 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
 - `Having` は集約後の行を**位置で読み替えて**から評価する（`Ops.havingFilter`）。
 - `Limit` は `Op.skip`（OFFSET）→ `Op.take`（LIMIT）の順。
   `limit = -1` が「LIMIT なし」、`limit = 0` は 0 行。
-- 最後に `Plan.runSelect` が `Op.toArray` で行を集め、
+- 最後に `Engine.runSelect` が `Op.toArray` で行を集め
+  （`Plan.runSelect` は列名と未消費の `Op` を返すだけ）、
   ヘッダは `Schema.projectHeader`（別名優先、`*` は列名）で組み立てる。
   `*` / `t.*` の列展開は `Schema.expandStar` に一本化している
   （ヘッダと射影の式が同じ列を共有するため）。
@@ -1312,7 +1313,7 @@ SQL 文字列
   → Optimizer.buildLogical  論理代数
   → 物理化                 走査方法・結合アルゴリズムを決定
   → Ops / Optimizer         Op の木
-  → Op.toArray              結果行
+  → Engine.runSelect        Op.toArray で結果行
 ```
 
 走査の探索順は **memtable → L0（新しい順）→ 各レベル（新しい順）**。
@@ -1385,14 +1386,14 @@ memtable を flush してから WAL を削除する。
 └── .orphans/                ← MANIFEST 非参照ファイルの退避先
 ```
 
-| ファイル        | 役割                                             |
-| --------------- | ------------------------------------------------ |
-| `MANIFEST-%06d` | VersionSet の変更履歴（4MiB 超でローテーション） |
-| `CURRENT`       | 有効な MANIFEST 番号（1行）                      |
-| `%06d.wal`      | 先行ログ                                         |
-| `%06d.sst`      | データファイル                                   |
+| ファイル        | 役割                                                            |
+| --------------- | --------------------------------------------------------------- |
+| `MANIFEST-%06d` | VersionSet の変更履歴（4MiB 超でローテーション）                |
+| `CURRENT`       | 有効な MANIFEST 番号（1行）                                     |
+| `%06d.wal`      | 先行ログ                                                        |
+| `%06d.sst`      | データファイル                                                  |
 | `.rykdb.format` | 現在のキー配置（`rykdb-prefixed-v1`、プロセス間ロックを兼ねる） |
-| `.orphans/`     | MANIFEST 非参照ファイルの退避先（削除しない）    |
+| `.orphans/`     | MANIFEST 非参照ファイルの退避先（削除しない）                   |
 
 `.rykdb.format` は開いている間 `FileShare.None` で保持され、プロセス間ロックを兼ねる（§7.9）。
 
@@ -1523,7 +1524,8 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   ソートは一時ファイルへ退避する外部マージ、集約はアキュムレータのみ、DISTINCT は符号化キーの集合。
   ただし **JOIN の右側は入れ子ループ / ハッシュ結合では実体化する**
   （両入力がキー順に走査できる等値結合はマージ結合で流す）。
-- **最終結果は `Op.toArray` で配列化する**（`Plan.runSelect` の戻り値が配列のため）。
+- **最終結果は `Op.toArray` で配列化する**
+  （`Engine.runSelect` が行う。`Plan.runSelect` の戻り値は列名と未消費の `Op`）。
 - **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件に限る**（下限のある条件のみ）。
   `>` / `<` / `BETWEEN` / `LIKE` のうち、`LIKE` は索引を要求しない。
 - **ORDER BY のソート省略は単一テーブル・主キー全列の昇順だけ**。
