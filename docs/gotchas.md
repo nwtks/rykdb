@@ -1186,7 +1186,7 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 同じ理由で **古いハンドルの `Close()` は `ProcessLock` も解放しない**。
 `Database` は `ProcessLockLease` の所有者トークンを持ち、
 新しいハンドルが作られるたびに所有者が移る。
-所有者（最新）の `Close()` だけが LSM を閉じて `.rykdb.lock` を解放する。
+所有者（最新）の `Close()` だけが LSM を閉じて `.rykdb.format` を解放する。
 
 - 回帰テスト:
   `Database: 古いハンドルを Close しても新しいハンドルの commit は失われない` /
@@ -1442,15 +1442,19 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 - `defaultValues` の評価後に `SqlValue.coerce col.DataType` を通す。
 - 回帰テスト: `SqlReference: DEFAULT は列型へ暗黙変換される`。
 
-### 11.34 format マーカーの検証は `ProcessLock` を取ってから行う
+### 11.34 format マーカーの検証は排他を取ってから行う
 
-`RowStore.openStore` は `ProcessLock.acquire` の後に `.rykdb.format` を検証 / 作成する。
+`RowStore.openStore` は `.rykdb.format` を `ProcessLock.acquire` で `FileShare.None` のまま開き、
+そのストリームを検証 / 新規作成に使う（ロックファイルを別に作らない）。
 ロック前に書くと、同じ root を開こうとした第2のプロセスが
 使用中の DB のマーカーを変更してしまう。
 
 - `Directory.CreateDirectory root` → `ProcessLock.acquire` → `ensureFormat` の順にする。
+- `ensureFormat` は `ProcessLock.acquire` が返したストリームを使う（開き直すと自分のロックに弾かれる）。
 - `ensureFormat` が失敗したら取得済みのロックを解放する。
-- 回帰テスト: `RowStore.openStore: ロック失敗時は format マーカーを書き換えない`。
+- 回帰テスト:
+  `RowStore.openStore: ロック失敗時は format マーカーを書き換えない` /
+  `RowStore: format マーカーがプロセス間ロックを兼ねる`。
 
 ### 11.35 `ActiveSnapshotRegistry` の bucket 削除と register は競合する
 

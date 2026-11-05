@@ -58,10 +58,7 @@ module internal RowStore =
     [<Literal>]
     let private ClearChunkEntries = 8192
 
-    /// レイアウトの format マーカー。
-    [<Literal>]
-    let private FormatFileName = ".rykdb.format"
-
+    /// レイアウトの format マーカーのバージョン。
     [<Literal>]
     let private FormatVersion = "rykdb-prefixed-v1"
 
@@ -216,26 +213,36 @@ module internal RowStore =
         let next = store.Engine.NextSeqNo
         if next = 0UL then 0UL else next - 1UL
 
-    let private formatPath (root: string) =
-        System.IO.Path.Combine(root, FormatFileName)
-
-    /// format マーカーを検証し、新規なら作る。
-    let private ensureFormat (root: string) =
-        let path = formatPath root
-
+    /// format マーカーを検証し、新規なら書く。
+    /// ファイルは `ProcessLock` が `FileShare.None` で開いたままのストリームを使う
+    /// （開き直すと自分のロックに弾かれる）。
+    let private ensureFormat (root: string) (format: System.IO.FileStream) =
         result {
-            let! exists = protect (fun () -> System.IO.File.Exists path)
+            let! text =
+                protect (fun () ->
+                    format.Position <- 0L
+                    use buffer = new System.IO.MemoryStream()
+                    format.CopyTo buffer
+                    System.Text.Encoding.UTF8.GetString(buffer.ToArray()).Trim())
 
-            if exists then
-                let! text = protect (fun () -> System.IO.File.ReadAllText path)
-
-                if text.Trim() = FormatVersion then
-                    return ()
-                else
-                    return! err (sprintf "データベース %s の format が不正です（%s）" root FormatFileName |> DbError.corruption)
-            else
-                do! protect (fun () -> System.IO.File.WriteAllText(path, FormatVersion + "\n"))
+            if text = FormatVersion then
                 return ()
+            elif text = "" then
+                do!
+                    protect (fun () ->
+                        let bytes = System.Text.Encoding.UTF8.GetBytes(FormatVersion + "\n")
+                        format.Position <- 0L
+                        format.SetLength 0L
+                        format.Write(bytes, 0, bytes.Length)
+                        format.Flush(true))
+
+                return ()
+            else
+                return!
+                    err (
+                        sprintf "データベース %s の format が不正です（%s）" root ProcessLock.FormatFileName
+                        |> DbError.corruption
+                    )
         }
 
     /// DB を開く（新規ならルート直下に 1本の LSM を作る）。
@@ -243,10 +250,10 @@ module internal RowStore =
     let private openStoreCore (takeOver: bool) (root: string) =
         result {
             do! protect (fun () -> System.IO.Directory.CreateDirectory root |> ignore)
-            let! token = ProcessLock.acquire root takeOver
+            let! token, format = ProcessLock.acquire root takeOver
 
             let! () =
-                match ensureFormat root with
+                match ensureFormat root format with
                 | Ok() -> ret ()
                 | Error e ->
                     ProcessLock.release root token

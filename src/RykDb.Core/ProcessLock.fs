@@ -1,8 +1,9 @@
 namespace RykDb.Core
 
-/// 同じ DB を二重に開かないようにする（`.rykdb.lock`）。
+/// 同じ DB を二重に開かないようにする（`.rykdb.format`）。
 /// <remarks>
 /// **別プロセス**の同時オープンは WAL / MANIFEST を壊すので `FileShare.None` で拒否する。
+/// 排他のための専用ファイルは作らず、レイアウトの format マーカーを開いたままロックを兼ねる。
 /// **同じプロセス**でも既に開いている root は二度開けない。
 /// `Database.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
 /// 一方の commit が他方から見えない（古い行を読んでしまう）ため。
@@ -10,8 +11,9 @@ namespace RykDb.Core
 /// 最後のハンドルを Close するとファイルロックも解放される。
 /// </remarks>
 module internal ProcessLock =
-    /// root に置くロックファイル名。
-    let private FileName = ".rykdb.lock"
+    /// root に置く format マーカー名。
+    /// 開いたまま保持して、レイアウト検証とプロセス間ロックを兼ねる。
+    let FormatFileName = ".rykdb.format"
 
     /// 台帳の更新だけを直列化する（ロック自体は root ごとに 1本）。
     let private Gate = new System.Threading.SemaphoreSlim(1, 1)
@@ -24,7 +26,7 @@ module internal ProcessLock =
          >
             System.StringComparer.Ordinal
 
-    /// ロックを取り、解除に使うトークンを返す。
+    /// ロックを取り、解除に使うトークンと、開いたままの format ファイルを返す。
     /// - 別プロセスが開いている → `IoError`
     /// - 同じプロセスが既に開いている → `takeOver` でなければ `IoError`
     let acquire (root: string) (takeOver: bool) =
@@ -44,11 +46,11 @@ module internal ProcessLock =
             match bucket |> Seq.tryHead with
             | Some existing when takeOver ->
                 bucket.[token] <- existing.Value
-                ret token
+                ret (token, existing.Value)
             | Some _ ->
                 err (DbError.create ErrorKind.IoError (sprintf "データベース %s は同じプロセスで既に開かれています。Close してから開き直してください" key))
             | None ->
-                let path = System.IO.Path.Combine(key, FileName)
+                let path = System.IO.Path.Combine(key, FormatFileName)
 
                 match
                     protect (fun () ->
@@ -61,9 +63,9 @@ module internal ProcessLock =
                 with
                 | Ok stream ->
                     bucket.[token] <- stream
-                    ret token
+                    ret (token, stream)
                 | Error _ ->
-                    err (DbError.create ErrorKind.IoError (sprintf "データベース %s は別のプロセスが開いています（%s）" key FileName))
+                    err (DbError.create ErrorKind.IoError (sprintf "データベース %s は別のプロセスが開いています（%s）" key FormatFileName))
         finally
             Gate.Release() |> ignore
 

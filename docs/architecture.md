@@ -177,7 +177,7 @@ flowchart TB
 | ファイル           | 役割                                                                                        |
 | ------------------ | ------------------------------------------------------------------------------------------- |
 | `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）           |
-| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3 値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）  |
+| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）   |
 | `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`                   |
 | `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                              |
 | `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                      |
@@ -191,7 +191,7 @@ flowchart TB
 | `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                 |
 | `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                        |
 | `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                      |
-| `ProcessLock.fs`   | プロセス間ロック（`.rykdb.lock`、`ProcessLock`）                                            |
+| `ProcessLock.fs`   | プロセス間ロック（`.rykdb.format` を排他で保持、`ProcessLock`）                             |
 | `RowStore.fs`      | 単一 LSM と keyspace 接頭辞（`RowStore` 型 + `Keyspace` モジュール）                        |
 | `Catalog.fs`       | `IndexSchema` / `TableSchema` / `Catalog` と出力 `Schema` / `OutputColumn` の型・モジュール |
 | `Eval.fs`          | スカラー関数 `Scalar` と式評価器 `Eval`                                                     |
@@ -438,7 +438,7 @@ flowchart LR
 - **集約の検出**は SELECT 項目と ORDER BY から（`Ops.aggCalls`）。
   GROUP BY があるか集約呼び出しがあれば `Aggregate` を作り、
   HAVING があればその上に `Having` を置く。
-- **ORDER BY は列参照・式・序数（1 始まり）**が使える。
+- **ORDER BY は列参照・式・序数（1 始まり）** が使える。
   式は行末に評価結果を加えてソートし、ソート後に評価結果を取り除く。
 - **主キー順の ORDER BY は Sort を作らない**。
   単一テーブル・集約なし・DISTINCT なしで、ORDER BY の先頭が主キー全列を定義順・昇順で並べているなら、
@@ -741,7 +741,7 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 
 ```
 <root>/
-  .rykdb.format      単一 LSM レイアウトのマーカー
+  .rykdb.format      単一 LSM レイアウトのマーカー（プロセス間ロックを兼ねる）
   MANIFEST-000001    世代ごとの VersionSet 定義（DB 全体で 1本）
   CURRENT            有効な MANIFEST 番号
   000123.sst         データファイル（全 keyspace を含む）
@@ -903,7 +903,7 @@ commit 成功・rollback・`Close` で解除する。
 参照が残っている間は「版を余分に残す」側に倒れるので、データを失う方向には働かない。
 トークンは `obj()` の参照等価（Core は `mutable` / `ref` を 0件に保つ規約のため、連番カウンタを使わない）。
 同じ DB を相対パスと絶対パスで開いても同じ束に入るよう `Path.GetFullPath` で正規化する。
-複数プロセスからの同時アクセスは `.rykdb.lock` で拒否する（§7.9）ので、プロセス内の表で十分。
+複数プロセスからの同時アクセスは `.rykdb.format` の排他で拒否する（§7.9）ので、プロセス内の表で十分。
 登録・解除・最古値の走査はプロセス内の Gate で直列化する
 （空になった bucket の削除と register の追加が競合して登録が消えるのを防ぐ）。
 
@@ -945,7 +945,7 @@ commit 成功・rollback・`Close` で解除する。
   異なる DB の書き込みは並行に進められる（Gate 表はプロセス内で共有）。
   **プロセス全体の 1本の Gate にしない**（無関係な DB まで待たせない）。
 - **TCP サーバは完全逐次** — `AcceptTcpClient` → 1接続を処理 → 次の accept（§11.3）
-- **プロセス間は `.rykdb.lock` で排他**する（root 直下、`FileShare.None`。§7.9）
+- **プロセス間は `.rykdb.format` で排他**する（root 直下、`FileShare.None`。§7.9）
 
 ### 7.8 DDL の排他（`RootGate`）
 
@@ -979,15 +979,17 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 ただし GC の時期は不定なので、`Rollback()` / `Close()`（または `use` による `Dispose()`）で確実に終わらせること。
 ハンドルへの参照が残っている間は、その root の DDL は `ConflictError` のまま。
 
-### 7.9 プロセス間の排他（`.rykdb.lock`）
+### 7.9 プロセス間の排他（`.rykdb.format`）
 
 WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つのプロセスが同じ DB を書くと壊れる。
-そこで `RowStore.openStore` は root の **`.rykdb.lock` を `FileShare.None` で開いたまま保持**し
-（`ProcessLock`、`ProcessLock.fs`）、
-開けなければ `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.lock）`）で失敗する。
+そこで `RowStore.openStore` は root の **`.rykdb.format` を `FileShare.None` で開いたまま保持**し
+（`ProcessLock`、`ProcessLock.fs`）、排他のための専用ファイルを作らずに
+レイアウトの検証とプロセス間ロックを兼ねる。
+開けなければ `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.format）`）で失敗する。
+`ensureFormat` はこの開いたストリームを読み書きする（別 fd で開き直すと自分のロックに弾かれる）。
 
-- **`.rykdb.lock` により、同じ root はプロセス内外で1つしか開けない**。
-  - 別プロセスが開いている → `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.lock）`）。
+- **`.rykdb.format` の排他により、同じ root はプロセス内外で1つしか開けない**。
+  - 別プロセスが開いている → `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.format）`）。
   - 同じプロセスが既に開いている → `IoError`
     （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）。
     `Database.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
@@ -1340,8 +1342,8 @@ flush / compact は `RowStore` が `WriteBatch` 後に `IStorageEngine.MaybeFlus
 
 ```
 Database.OpenWith root
-  → RowStore.openStore root          root を作成し、.rykdb.lock を取得
-      ├─ ensureFormat                .rykdb.format を検証 / 新規作成
+  → RowStore.openStore root          root を作成し、.rykdb.format を排他で開く
+      ├─ ensureFormat                開いた .rykdb.format を検証 / 新規作成
       └─ StorageEngine.openDatabase  ルート直下の LSM ツリーを開く
            ├─ Manifest.openOrCreate  CURRENT を読む / なければ作る
            ├─ dropMissingFiles       MANIFEST が参照するファイルが無いなら除去
@@ -1373,8 +1375,7 @@ memtable を flush してから WAL を削除する。
 
 ```
 <root>/
-├── .rykdb.lock              ← プロセス間ロック（0バイト、§7.9）
-├── .rykdb.format            ← 単一 LSM レイアウトのマーカー
+├── .rykdb.format            ← レイアウトのマーカー（プロセス間ロックを兼ねる、§7.9）
 ├── .drop-cleanup            ← 未完了 DROP の後始末対象（§11.10）
 ├── MANIFEST-000001          ← VersionSet の変更履歴（DB 全体）
 ├── CURRENT                  ← 有効な MANIFEST 番号（1行）
@@ -1390,10 +1391,10 @@ memtable を flush してから WAL を削除する。
 | `CURRENT`       | 有効な MANIFEST 番号（1行）                      |
 | `%06d.wal`      | 先行ログ                                         |
 | `%06d.sst`      | データファイル                                   |
-| `.rykdb.format` | 現在のキー配置（`rykdb-prefixed-v1`）            |
+| `.rykdb.format` | 現在のキー配置（`rykdb-prefixed-v1`、プロセス間ロックを兼ねる） |
 | `.orphans/`     | MANIFEST 非参照ファイルの退避先（削除しない）    |
 
-ロックファイル（`root/.rykdb.lock`）は 0バイトのまま置かれる。中身は使わない（§7.9）。
+`.rykdb.format` は開いている間 `FileShare.None` で保持され、プロセス間ロックを兼ねる（§7.9）。
 
 ---
 

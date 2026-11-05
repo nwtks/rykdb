@@ -116,6 +116,53 @@ let ``RowStore: keyspace は 1 本の LSM の接頭辞で分離される`` () =
         ok (RowStore.close store))
 
 [<Fact>]
+let ``RowStore: format マーカーがプロセス間ロックを兼ねる`` () =
+    withDir "rs-format-lock" (fun dir ->
+        let formatPath = System.IO.Path.Combine(dir, ".rykdb.format")
+
+        let canLockExternally () =
+            try
+                use fs =
+                    new System.IO.FileStream(
+                        formatPath,
+                        System.IO.FileMode.Open,
+                        System.IO.FileAccess.ReadWrite,
+                        System.IO.FileShare.None
+                    )
+
+                true
+            with :? System.IO.IOException ->
+                false
+
+        let store = ok (RowStore.openStore dir)
+        Assert.True(System.IO.File.Exists formatPath)
+        Assert.False(System.IO.File.Exists(System.IO.Path.Combine(dir, ".rykdb.lock")))
+        Assert.False(canLockExternally ())
+
+        ok (RowStore.close store)
+        Assert.True(canLockExternally ())
+        Assert.Equal("rykdb-prefixed-v1", System.IO.File.ReadAllText(formatPath).Trim()))
+
+[<Fact>]
+let ``RowStore.openStore: ロック失敗時は format マーカーを書き換えない`` () =
+    withDir "rs-format-lock-fail" (fun dir ->
+        let formatPath = System.IO.Path.Combine(dir, ".rykdb.format")
+        System.IO.File.WriteAllText(formatPath, "keep-me\n")
+
+        do
+            use _held =
+                new System.IO.FileStream(
+                    formatPath,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.ReadWrite,
+                    System.IO.FileShare.None
+                )
+
+            expectErrorKind ErrorKind.IoError "ロック中の DB を開けてしまった" (RowStore.openStore dir)
+
+        Assert.Equal("keep-me", System.IO.File.ReadAllText(formatPath).Trim()))
+
+[<Fact>]
 let ``RowStore: 前方一致する keyspace 名でもキーが混ざらない`` () =
     withStore "rs-prefix-boundary" (fun store ->
         let spaceA = Keyspace.table "a"

@@ -983,7 +983,7 @@ let ``Database: 別プロセスが開いている DB は開けない`` () =
         // 別プロセスが `FileShare.None` でロックを押さえている状態（同一プロセスの別 fd でも同じ扱い）。
         use _held =
             new System.IO.FileStream(
-                System.IO.Path.Combine(dir, ".rykdb.lock"),
+                System.IO.Path.Combine(dir, ".rykdb.format"),
                 System.IO.FileMode.OpenOrCreate,
                 System.IO.FileAccess.ReadWrite,
                 System.IO.FileShare.None
@@ -994,7 +994,7 @@ let ``Database: 別プロセスが開いている DB は開けない`` () =
 [<Fact>]
 let ``Database: 同じ root を二度開くと同じプロセスのエラーになり、Close 後は開ける`` () =
     withDir "proc-lock-share" (fun dir ->
-        let lockPath = System.IO.Path.Combine(dir, ".rykdb.lock")
+        let lockPath = System.IO.Path.Combine(dir, ".rykdb.format")
 
         let canLockExternally () =
             try
@@ -1025,7 +1025,6 @@ let ``Database: 同じ root を二度開くと同じプロセスのエラーに�
 [<Fact>]
 let ``Database: 明示 transaction があるハンドルは Close でロックを外す`` () =
     withDir "proc-lock-txn" (fun dir ->
-        let _ = System.IO.Path.Combine(dir, ".rykdb.lock")
         let db = ok (Database.OpenWith dir)
         let tx = ok (db.Begin())
         // 進行中 transaction を持つハンドル（元の db ではない方）を閉じてもロックは外れる。
