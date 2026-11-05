@@ -2,21 +2,18 @@ namespace RykDb.Core
 
 /// keyspace を跨ぐ commit の意思決定ログ（追記型ジャーナル）。
 /// <remarks>
-/// 各 keyspace の WAL は独立しているため、途中でクラッシュすると
-/// 「テーブルは書けたが索引が書けていない」状態になりうる。
-/// そこで `.commit/journal` へ **公開（publish）** と **解決（resolve）** を 1レコードずつ追記する。
-/// - 公開は「すでにあるファイルへの追記 + `Flush(true)`」だけで、
-///   **ディレクトリエントリを更新しない**。
-///   .NET 標準機能ではディレクトリを fsync できない（クロスプラットフォームを守るため P/Invoke は使わない）ので、
-///   rename / delete に頼らない設計にする。
-///   ジャーナルはオープン時に必ず作っておく（`touch`）ため、
-///   公開のたびにディレクトリが汚れることもない。
-/// - レコードは `[長さ][ペイロード][チェックサム]` のフレーム。
-///   書き込みが途中で切れた尾部はチェックサムで検出し、**未公開として捨てる**
-///   （公開の完了前に WAL へは 1 バイトも書かないので、捨てて安全）。
-/// - 適用が終わったら resolve を追記する。解決済みの公開は再生対象から外れる。
-/// - 再生は冪等（`applyBatchesCore idempotent = true`）。
-///   resolve に失敗して公開が残っても、次回の再生では適用済みのエントリを読み飛ばすだけ。
+/// keyspace ごとに WAL が分かれているため、複数の keyspace へ書き込む途中でクラッシュすると、
+/// テーブルだけ更新されて索引が更新されない状態になりうる。
+/// この不整合を回復するため、`.commit/journal` に適用開始（publish）と適用完了（resolve）を記録する。
+/// - publish は既存ファイルへの追記と `Flush(true)` で永続化する。ディレクトリエントリは更新しない。
+///   .NET 標準機能ではディレクトリを fsync できず、クロスプラットフォーム方針により P/Invoke も使わないため、
+///   rename や delete に依存しない。ジャーナルはオープン時に作成しておくので、publish ごとの新規作成もない。
+/// - レコードは `[長さ][ペイロード][チェックサム]` のフレームである。
+///   追記が途中で終わった末尾はチェックサムで検出し、未公開として破棄する。
+///   publish の書き込みが完了するまで WAL には書き込まないため、この末尾は安全に捨てられる。
+/// - WAL への適用が終わったら resolve を追記する。resolve 済みの publish は再生しない。
+/// - WAL への再適用は冪等である（`applyBatchesCore idempotent = true`）。
+///   resolve の追記に失敗して publish が残っても、再起動後の適用では既に書かれた項目を読み飛ばす。
 /// </remarks>
 module internal CommitIntent =
     /// ジャーナルをこれ以上伸ばさない閾値（バイト）。
@@ -162,7 +159,7 @@ module internal CommitIntent =
     /// 書き込みは `RootGate` の共有ロック下で走るので、複数スレッドが同時に commit し得る。
     let private Gate = new System.Threading.SemaphoreSlim(1, 1)
 
-    /// フレームを 1つ追記してディスクへ落とす。
+    /// フレームを 1つ追記してディスクへ書き込む。
     let private appendFrame (root: string) (payload: byte array) =
         let frame = frameBytes payload
         Gate.Wait()

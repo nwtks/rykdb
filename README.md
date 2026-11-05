@@ -2,8 +2,8 @@
 
 **.NET 10 / F# 10** で書かれた、**LSM-Tree ストレージ + MVCC + WAL** を備えた組込み RDBMS。
 
-テーブル本体も索引も **B-Tree ではなく LSM ツリー（keyspace 単位）** で保持する。
-ライブラリ API・SQL REPL・TCP サーバの 3つのインターフェースを持つ。
+テーブル本体も索引も、B-Tree ではなく keyspace 単位の **LSM ツリー** で保持する。
+ライブラリ API・SQL REPL・TCP サーバの3つのインターフェースを提供する。
 
 ---
 
@@ -55,13 +55,13 @@ db> .tables
 db> .exit
 ```
 
-- dot コマンド:
+- ドットコマンド:
 
 | コマンド                | 説明                                        |
 | ----------------------- | ------------------------------------------- |
 | `.tables`               | テーブル一覧                                |
 | `.begin`                | transaction を開始                          |
-| `.commit` / `.rollback` | 開いている transaction を確定／破棄         |
+| `.commit` / `.rollback` | 開いている transaction を確定／ロールバック |
 | `.help`                 | コマンド一覧                                |
 | `.exit` / `.quit`       | 終了（`Close` して memtable を flush する） |
 
@@ -88,7 +88,7 @@ Ctrl+C で終了します。
 ```fsharp
 open RykDb.Core
 
-// Result から中身を取り出す例示用のヘルパー。
+// Result から値を取り出すための説明用ヘルパー。
 let ok =
     function
     | Ok v -> v
@@ -96,7 +96,7 @@ let ok =
 
 let db = ok (Database.OpenWith "./mydata")
 
-// Execute は新しい Database と結果のペアを返す。戻り値を持ち替えること。
+// Execute は新しい Database と結果のペアを返すので、以降は返された db を使う。
 let db, _ = ok (db.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
 let db, _ = ok (db.Execute "INSERT INTO t VALUES (1, 10), (2, 20)")
 let db, result = ok (db.Execute "SELECT id, v FROM t ORDER BY id")
@@ -121,8 +121,8 @@ Debug ビルド・単一スレッド・10万行（`INTEGER` 主キー 1列 + `IN
 | ポイント検索 200回                | 約 0.06秒（0.3ms/回） |
 | 全走査（`COUNT(*)`）              | 約 0.8秒              |
 
-Release ビルドではこれより速くなる。
-Bloom filter の bits/key とレベルファンアウト比は未調整。
+Release ビルドではさらに速くなる。
+Bloom filter のキーあたりのビット数と、LSM のレベル間の容量比は未調整である。
 
 ---
 
@@ -135,4 +135,4 @@ Bloom filter の bits/key とレベルファンアウト比は未調整。
 | [`development.md`](docs/development.md)               | ビルド・テスト・品質ゲート                                |
 | [`sql-reference.md`](docs/sql-reference.md)           | 対応 SQL の文法一覧・型・関数・エラー・既知の制限         |
 | [`gotchas.md`](docs/gotchas.md)                       | 実際に踏んだ落とし穴と対策                                |
-| [`AGENTS.md`](AGENTS.md)                              | 作業指針（各ドキュメントへの案内）                        |
+| [`AGENTS.md`](AGENTS.md)                              | 開発指針（各ドキュメントへの案内）                        |

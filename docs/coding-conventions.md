@@ -9,7 +9,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 ## 目次
 
 1. [例外を使わない](#1-例外を使わない)
-2. [命令形要素を使わない](#2-命令形要素を使わない)
+2. [命令型の構文・機能を使わない](#2-命令型の構文機能を使わない)
 3. [末尾再帰を前提にする](#3-末尾再帰を前提にする)
 4. [予約語に注意](#4-予約語に注意)
 
@@ -21,7 +21,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 失敗は必ず `Result<'T, DbError>` として返す。
 `exception` 定義は **0件**。
 
-`Errors.fs` の `[<AutoOpen>] module ResultOps` が合成に必要なものを全部揃える。
+合成に必要な関数は `Errors.fs` の `[<AutoOpen>] module ResultOps` にまとめている。
 
 | 提供                       | 用途                                                 |
 | -------------------------- | ---------------------------------------------------- |
@@ -31,11 +31,11 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 | `protect`                  | .NET I/O API 境界の例外捕捉（`try`/`with` の主経路） |
 
 `protect` は `IOException` / `UnauthorizedAccessException` を `IoError`、
-`InvalidDataException` / `FormatException` / `OverflowException` を `CorruptionError` に写す。
-ファイル内容の問題を `InternalError`（バグの兆候）にしないため。
+`InvalidDataException` / `FormatException` / `OverflowException` を `CorruptionError` に変換する。
+ファイル内容の不整合を `InternalError`（バグの兆候）として扱わないため。
 `try` / `with` は `protect` のほか、`Lexer` / `Types` の数値・リテラル変換、
 `Serialization` の文字列・バイト境界、`Manifest.decodeRecord`、`Keyspace.keyspaceOfBytes` で使い、
-いずれも `DbError` へ写すか `None` に閉じ込め、例外は外へは出さない。
+いずれも `DbError` に変換するか `None` として扱い、例外を外へ出さない。
 `try` / `finally` は `CommitIntent` / `ProcessLock` / `StorageEngine` / `Transactions` の解放処理に使う。
 
 失敗は `ErrorKind`（`DbError.Kind`）で分類する。
@@ -49,41 +49,45 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 | `ConflictError`                                      | MVCC の write-write 競合                 |
 | `IoError` / `InternalError`                          | I/O 失敗 / 内部不整合（バグの兆候）      |
 
-## 2. 命令形要素を使わない
+## 2. 命令型の構文・機能を使わない
 
 `src/RykDb.Core/` では **`mutable` / `while` / `ref` を 0件**に保つ。
-`ResizeArray` / `Dictionary` / `HashSet` を使うのは次のところだけ（CLI / Server は対象外）。
-いずれもホットパスまたは同時実行の台帳なので、理由をコメントに残す。
+`ResizeArray` / `Dictionary` / `HashSet` を使うのは次の場所に限る（CLI / Server は対象外）。
+いずれもホットパスか同時実行の台帳であり、使う理由はコメントに残す。
 
 - `Op.toArray` の行の蓄積
-- `Ops.aggregate` のグループ表（入力行は抱えず、アクュムレータだけ）
+- `Ops.aggregate` のグループ表（入力行は抱えず、アキュムレータだけ）
 - `Ops.distinct` の符号化済みキー集合（`HashSet<byte array>`）
 - `Ops.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
-- `ExtSort` の受け皿（バジェット内に収まる分。超過は一時ファイルへ溢らす）
+- `ExtSort` の受け皿（バジェット内に収まる分。超過分は一時ファイルへ退避する）
 - `Database.fs` のクライアント層（応答の組み立て）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
 
-| やりたいこと   | 命令形の代わりに使うもの       |
-| -------------- | ------------------------------ |
-| 書き込み       | `Writer` = 不変のチャンク列    |
-| 読み取り       | `Cursor` = 読み位置を値に持つ  |
-| パーサの状態   | `PState`（読み位置は値が持つ） |
-| 走査・畳み込み | `Result` を返す末尾再帰        |
-| 平衡木の再構築 | 明示スタック（`list` を積む）  |
+| やりたいこと   | 命令形の代わりに使うもの                   |
+| -------------- | ------------------------------------------ |
+| 書き込み       | `Writer` = 不変のチャンク列                |
+| 読み取り       | `Cursor` = 読み取り位置を値として保持する  |
+| パーサの状態   | `PState`（読み取り位置を値として保持する） |
+| 走査・畳み込み | `Result` を返す末尾再帰                    |
+| 平衡木の再構築 | 明示スタック（`list` を積む）              |
 
 ## 3. 末尾再帰を前提にする
 
+末尾呼び出しとは、関数が最後の処理として別の関数を呼ぶ形である。
+呼び出し元のスタックを残さずに済むため、要素数の多い処理では再帰呼び出しを末尾に置く。
+
 `Directory.Build.props` で `<Tailcalls>true</Tailcalls>` を設定し、
-Debug でも F# に `tail.` プレフィックスを出させる
-（Debug の既定は `Tailcalls=false`、Release は既定で true）。
-`tail.` は JIT が尊重するが、JIT の自己再帰ループ化だけに頼ると相互再帰やクロージャ経由の呼び出しは 1フレーム残る。
-そのため CPS の継続呼び出しも、この設定で実際の末尾呼び出しにする。
-`[<TailCall>]` は構文上の末尾性を検査するだけで、codegen を切り替えない。
+Debug ビルドでも F# に `tail.` プレフィックスを出させる
+（Debug の既定は `Tailcalls=false`、Release の既定は `true`）。JIT は `tail.` を尊重する。
+ただし、JIT の自己再帰ループ化だけでは、相互再帰やクロージャ経由の呼び出しでスタックが残る。
+この設定により、CPS の継続呼び出しも実際の末尾呼び出しにする。
+`[<TailCall>]` は構文上の末尾性を検査する属性であり、コード生成方法は切り替えない。
 
 採用した手法は次のとおり。
 
 - **構文規則は CPS（継続渡し）** — 引数を「読むもの」ではなく「読んだ後どうするか」に変える。
-- **継続は名前付きの `and` グループメンバーへ hoist** する（属性付き関数でラムダを書くと FS3569 が出る）。
+- **継続は名前付きの `and` グループメンバーへ hoist** する
+  （属性付き関数でラムダを書くと FS3569 が出る）。
 - **`Parser` の式グループでは `IN` 候補リスト・`CASE` の `WHEN` 節・関数引数リストを CPS にし、`parseExprC` の呼び出しを継続位置（末尾）へ移す**。
   回帰テストは `ParserTests` の `末尾再帰: 大量のトークンを解析できる`（50000個の `IN` リスト）。
 - **CPS グループの全メンバーに `: Result<'r, DbError>` の戻り型を明示する**
@@ -94,14 +98,14 @@ Debug でも F# に `tail.` プレフィックスを出させる
 - **「葉の書き換えが別の再帰を経る」式走査は `Expr.rewriteWithC`（継続を取る版）を使う**。
   `Plan` のサブクエリ解決（`resolveExprC` → `resolveLeafC` → `planSelectC` → …）がこれ。
   `Expr.rewriteWith` はその糖で、失敗を返す葉の書き換え（束縛・集約の読み替え）に使う。
-- **hoist した継続を値として渡す呼び出しは TailAudit の引数位置判定で非末尾として残る**
+- **継続を値として渡す呼び出しは、TailAudit の引数位置の判定では非末尾と判定される**
   （`parseExprC (parseExprListElemC k acc) st`・`parseCaseBranches (parseCaseTailC k) [] st`）。
   部分適用は関数値を作るだけで、実呼び出しは呼ばれた側（`parseExprC` など）の末尾位置なのでフレームは積まれない。
   ベースラインで追認する（TailAudit の `[lambda]` 判定と同じ保守側の扱い）。
 - **実行時のスタック増加は `PState.Depth` で数えて `MaxExpressionDepth = 200` で止める**。
   `tail.` が効かない環境（設定漏れ・JIT 非対応）でも暴走しないための保険。
 - **`result { }` 計算式はループする関数では使わない**。
-  `Delay` でクロージャに閉じられるため末尾最適化が効かず、500000トークンで Lexer が `StackOverflow` した実測がある。
+  `Delay` でクロージャに包まれるため末尾最適化が効かず、500000トークンで Lexer が `StackOverflow` した実測がある。
 - **左偏ヒープのマージは明示スタックで畳む**（`SstMerge`、`Sstable.fs`）。
   再帰の結果を `node` の引数にする形は非末尾になる。
   右スパインを `picked` リストへ積み、`List.fold` で組み直せば自己再帰が消える
@@ -113,35 +117,33 @@ Debug でも F# に `tail.` プレフィックスを出させる
 - **`[<TailCall>]` は「その関数本体の自己再帰が全部末尾位置」のときだけ付ける**。
   1つでも外れると FS3569 になり、`TreatWarningsAsErrors` のせいでビルドエラーになる。
   構造上末尾にできないものは**付けない理由を呼び出しの直前にコメントで残す**:
-  - `Op.map` / `Op.take` — 再帰が `Compute` の中身の中にある。
-    次の 1行を取りに来たときに 1段だけ評価されるのでフレームは積み上がらない。
-    同じ型が `Sstable.rangeScanPartial` の `scanEntries` / `loadBlock`
+  - `Op.map` / `Op.take` — 再帰が `Compute` の中にある。
+    次の 1行を取り出すときに 1段ずつ評価されるので、フレームは積み上がらない。
+    同じパターンが `Sstable.rangeScanPartial` の `scanEntries` / `loadBlock`
     （ブロック読みを `SstScan.next` まで遅らせるため、続きの組み立てがラムダ内に入る）と
     `SstScan.emit` にもある。
   - 逆に**要素数に比例する反復は `match` に直して末尾再帰にする**
     （`IN` の候補リストと `CASE` の WHEN 節。`eval ... >>= fun` だと候補の数だけスタックが積まれる）。
-    カーソルからの数え上げ読み出し（`Catalog` の列定義・名前、`CommitIntent` のバッチ、 `Memtable` のエントリ）は
-    `Reader.readItems`（Serialization.fs）に集約し、 `match` の末尾再帰で回す。
-  - WHERE の AND を平坦化する `Predicate.flattenLoop` は明示スタック（`Expr list`）で
-    末尾再帰にする（`[<TailCall>]` 付き。
-    ローカルの `let rec` には属性を付けられないためモジュールスコープ）。
+    カーソルから件数分を読み出す処理（`Catalog` の列定義・名前、`CommitIntent` のバッチ、`Memtable` のエントリ）は
+    `Reader.readItems`（Serialization.fs）に集約し、`match` の末尾再帰で回す。
+  - WHERE の AND を平坦化する `Predicate.flattenLoop` は明示スタック（`Expr list`）で末尾再帰にする
+    （`[<TailCall>]` 付き。ローカルの `let rec` には属性を付けられないので、モジュールスコープに置いている）。
     深い AND を `Analyzer.chooseScanMethod` に渡す経路も
     `AnalyzerTests` の `Analyzer.chooseScanMethod: 20000段の AND を chooseScanMethod してもスタックを食わない` で検証する。
-  - これをさらに進めて **`Eval.eval` は継続を値（`Kont`）として持つ評価機 `Eval.step`** にする
+    さらに進めて **`Eval.eval` は継続を値（`Kont`）として持つ評価機 `Eval.step`** にする
     （`[<TailCall>]` 付き。CPS だが継続はラムダではなくタグ付きの値）。
-    再帰は `step` の自己再帰だけなので全末尾位置になり、
-    式の深さ・`IN` の候補数に依存せずスタックは一定（継続はヒープのリストに積む）。
+    再帰は `step` の自己再帰だけなので全末尾位置になり、式の深さ・`IN` の候補数に依存せずスタックは一定
+    （継続はヒープのリストに積む）。
   - `Optimizer.exec` も同じ方式。
     論理木の評価を `ExecFrame`（継続）と `ExecStep`（`EvalNode` / `ApplyOp`）に分け、
     `run` の自己再帰だけにまとめる（`[<TailCall>]` 付き）。
     ラッパ（`Filter` / `Aggregate` / `Having` / `Distinct` / `Sort` / `Limit` / `Project`）と
-    `Join` の左右評価をすべて `ExecFrame list` に積むので、
-    継続はヒープ、スタックは論理木の深さに依存しない。
+    `Join` の左右評価をすべて `ExecFrame list` に積むので、継続はヒープ、スタックは論理木の深さに依存しない。
     `Join` は左 → 右 → 結合の順を `JoinRightFrame` / `JoinApplyFrame` で保つ。
   - 式の走査・組み立ては**評価機 `Expr.rewrite`（`Ast.fs`）を共用**する。
     葉の書き換え関数（`rewriteLeaf`）だけを受け取り、
     非葉ノードは `RewriteFrame`（`Parent` / `Done` / `Rest`）に積んで、
-    上がてきた子を内部のローカル関数 `plugChildren`（`Expr.children` の逆変換）で組み直す。
+    上がってきた子を内部のローカル関数 `plugChildren`（`Expr.children` の逆変換）で組み直す。
     `rewrite` 内の `rewriteLoop` の自己再帰だけなので、式の深さに依存せずスタックは一定。
     使うのは束縛の `Binder.qualify` と、集約後の読み替え（`Ops` の内部 `substituteAggs`）
     （`AggCall` のように子を持つノードを丸ごと定数へ置き換えるのも `rewriteLeaf` で表現できる）。

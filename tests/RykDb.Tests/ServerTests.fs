@@ -146,7 +146,7 @@ let ``TCP: ライブラリ API と同じ結果が返る`` () =
             match rest with
             | [] -> List.rev acc
             | sql :: tail ->
-                // `Execute` は新しい `Database` を返すので持ち替える。
+                // `Execute` は新しい `Database` を返すので差し替える。
                 let next, r = ok (db0.Execute sql)
                 run next tail ((r.Columns |> Array.toList, rowText r) :: acc)
 

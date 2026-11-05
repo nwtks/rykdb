@@ -82,7 +82,6 @@ let ``末尾再帰: 集計呼び出しを含む深い AST も走査できる`` (
 
 [<Fact>]
 let ``Ast: InList と Case の表示が壊れない（回帰）`` () =
-    // 以前は要素の区切りが壊れて "(a IN (, 1, 2))" のように出力されていた
     let inList =
         Expr.InList(name "a", [ literal (Literal.Int 1L); literal (Literal.Int 2L) ], false)
 
@@ -92,7 +91,6 @@ let ``Ast: InList と Case の表示が壊れない（回帰）`` () =
     let one = Expr.InList(name "a", [ literal (Literal.Int 1L) ], true)
     Assert.Equal<string>("(a NOT IN (1))", Expr.toDisplayString one)
 
-    // 以前は WHEN / THEN / ELSE / END が出力されていなかった
     let caseE =
         Expr.Case(
             [ name "a", literal (Literal.Int 1L); name "b", literal (Literal.Int 2L) ],

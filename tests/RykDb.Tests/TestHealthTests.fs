@@ -29,9 +29,9 @@ let ``テストデータ: 乱数生成器が実際に多様な値を返す`` () 
         |> Array.map (fun v -> (v |> SqlValue.dataType |> DataType.toSqlName) + ":" + SqlLiteral.toSqlLiteral v)
         |> Set.ofArray
 
-    Assert.True(distinct.Count > 20, sprintf "乱数データが退行しています（相異なる値が %d 種類しかない）" distinct.Count)
+    Assert.True(distinct.Count > 20, sprintf "乱数データが退行しています（相異なる値が %d種類しかない）" distinct.Count)
 
-    // 10 種すべての型が生成されていること（偏った生成器を検出する）
+    // 10種すべての型が生成されていること（偏った生成器を検出する）
     let typesCovered =
         samples
         |> Array.map (fun v -> v |> SqlValue.dataType |> DataType.toSqlName)
@@ -53,7 +53,7 @@ let ``テストデータ: 乱数生成器が実際に多様な値を返す`` () 
         Assert.True(Set.contains t typesCovered, sprintf "型 %s が生成されていません" t)
 
 // ---------------------------------------------------------------------------
-// 「テストが 1 つも走っていない」検出（FS0842 対策）
+// 「テストが 1つも走っていない」検出（FS0842 対策）
 // ---------------------------------------------------------------------------
 
 /// このテストファイルが読み込まれていることの目印。
@@ -64,9 +64,9 @@ type TestsMarker = class end
 type ProgramMarker = class end
 
 [<Fact>]
-let ``テスト: 各テストモジュールが 1 つ以上の Fact を持つ`` () =
+let ``テスト: 各テストモジュールが 1つ以上の Fact を持つ`` () =
     // FS0842（[<Fact>] が関数でない let 束縛に付いて黙って無視される）を検知する。
-    // モジュール単位で Fact が 0 件なら「全部緑だが 1 件も走っていない」。
+    // モジュール単位で Fact が 0件なら「全部緑だが 1件も走っていない」。
     let asm = typeof<TestsMarker>.Assembly
 
     let facts =
@@ -87,11 +87,11 @@ let ``テスト: 各テストモジュールが 1 つ以上の Fact を持つ`` 
             | _ -> None)
         |> Array.sort
 
-    Assert.True(modules.Length >= 32, sprintf "テストモジュールが %d 個しか見つかりません" modules.Length)
+    Assert.True(modules.Length >= 32, sprintf "テストモジュールが %d個しか見つかりません" modules.Length)
 
     for moduleName in modules do
         let count = (namesOf moduleName).Length
-        Assert.True(count >= 1, sprintf "%s の Fact が 0 件（FS0842 の疑い）" moduleName)
+        Assert.True(count >= 1, sprintf "%s の Fact が 0件（FS0842 の疑い）" moduleName)
 
     // テスト名は Assembly に残るので、カテゴリ名が消えていないか確認する。
     Assert.True(

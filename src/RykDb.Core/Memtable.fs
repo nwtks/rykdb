@@ -247,10 +247,10 @@ module internal Memtable =
     /// 同一キーの版は SeqNo 降順に並ぶので、最初に拾ったものが最新。
     /// ポイントルックアップ（MVCC の可視性つき）。
     /// <remarks>
-    /// 同じキーの版は木の中で連続して並ぶ（キーの昇順・同一キーは SeqNo 降順）。
-    /// 可視な版（SeqNo が visible 以下）は複合キー順では後ろにあるので、
-    /// 「(キー, visible) 以上の最小のノード」を探す（ceiling 探索）。
-    /// それが同じキーなら可視な最新版になる（探索は対数時間）。
+    /// 木ではキーを昇順、同じキーの版を SeqNo 降順に並べる。
+    /// `visible` 以下の SeqNo を持つ版のうち、同じキーで最も新しい版を返す。
+    /// 木の順序に合わせて `(キー, visible)` 以上で最小のノードを探し、
+    /// 見つかったノードのキーが一致すれば、その版が可視な最新版である（探索は対数時間）。
     /// </remarks>
     let getVisible (key: byte array) (visible: uint64 option) (mem: Memtable) =
         let rec ceiling bound best =

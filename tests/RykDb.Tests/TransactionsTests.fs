@@ -182,7 +182,6 @@ let ``TransactionManager.commit: active が無ければ commit 直後に LastCom
     let mgr, seq1, _ = TransactionManager.commit t1 mgr |> ok
 
     // 衝突し得る active な transaction が居ないので、commit 直後に捨てられる
-    // （以前は次の commit まで残り、100k 行の commit で ~10 MiB 保持していた）。
     Assert.Equal<int>(0, mgr.LastCommitted.Count)
     Assert.Equal<uint64>(seq1, mgr.LastCommitSeqNo)
 

@@ -172,11 +172,10 @@ type internal TransactionManager =
         NextSeqNo: uint64
         /// 次に採番する TxnId
         NextTxnId: TxnId
-        /// commit 済みの transaction が最後に書いた (keyspace:キー) -> SeqNo。
-        /// 衝突判定に要るのは「最古の active snapshot より後の版」だけなので、
-        /// commit のたびにそれより前の版を捨てる。
-        /// active な transaction が無ければ commit 直後に空になる
-        /// （次の commit を待たない）。
+        /// commit 済み transaction が最後に書いた (keyspace:キー) -> SeqNo。
+        /// 競合判定では、active transaction の snapshot より後に書かれた版だけを参照する。
+        /// そのため、最古の active snapshot より前の履歴は commit ごとに削除できる。
+        /// active transaction がなければ履歴は不要なので、commit 直後に空になる。
         LastCommitted: Map<string, uint64>
         /// アクティブな transaction
         Active: Map<TxnId, TxnRecord>
@@ -239,16 +238,13 @@ module internal TransactionManager =
             oldest
 
     /// commit する。
-    /// 1. write-write 競合を検査する。
-    ///    「transaction の snapshot より後に、衝突する key が commit 済み」であれば衝突。
-    /// 2. 問題なければ SeqNo を採番して LastCommitted を更新する。
-    /// 3. この commit を反映した後の `activeSnapshot` を境界に LastCommitted を掃除する。
-    ///    衝突判定は「commit が transaction の snapshot より後」でしか起こらない
-    ///    （未来の snapshot は現在の LastCommitSeqNo 以上）ので、
-    ///    「全部の active snapshot 以降に commit された版」以外は捨てられる。
-    ///    active な transaction が無ければ、今 commit した版も直後に捨てられる。
-    ///    捨てないと書き込んだ全キーが次の commit まで（あるいはプロセス寿命の間）メモリに残る。
-    /// 返り値の Entry 配列を StorageEngine に流し込むと DB に反映される。
+    /// 1. transaction 開始時の snapshot より後に、同じキーへの commit があれば競合とする。
+    /// 2. 競合がなければ SeqNo を割り当て、今回の書き込みを `LastCommitted` に記録する。
+    /// 3. active transaction のうち最も古い snapshot を境界に、不要になった履歴を削除する。
+    ///    各 transaction が競合を検出するには、自分の snapshot より後の履歴だけあればよい。
+    ///    active transaction がなければ、今回の履歴も不要なので直ちに削除する。
+    ///    履歴を残し続けると、書き込まれたすべてのキーがメモリに蓄積する。
+    /// 返り値の Entry 配列を StorageEngine に渡すと、書き込みが DB に反映される。
     let commit (txn: Transaction) (manager: TransactionManager) =
         let findConflicts txn lastCommitted snapSeq =
             if Map.isEmpty lastCommitted then
@@ -338,12 +334,11 @@ module internal RootKey =
 
 /// 進行中 transaction の snapshot 登録 1件。
 /// <remarks>
-/// 1つの transaction の state を持つ `Database` ハンドルは複数できる
-/// （`let tx = db.Begin()` のあと、`tx.Execute` のたびに新しいハンドルが返る）。
-/// どれか 1本でも生きている間は snapshot を残す必要があるので、
-/// ハンドルの生存トークンを数え、最後の 1本が GC されたら登録を外す。
-/// これが無いと、commit / rollback / Close されずに捨てられたハンドルの登録が残り、
-/// 同じ root の DDL が永久に `ConflictError` になる。
+/// 1つの transaction から複数の `Database` ハンドルが作られる。
+/// たとえば `Begin()` や `Execute` は新しいハンドルを返す。
+/// ハンドルが1つでも残っていれば transaction は利用中なので、その snapshot の登録を維持する。
+/// ハンドルごとに生存トークンを付け、最後のトークンが GC で回収されたときに登録を解除する。
+/// 登録を解除しないと、使われていない snapshot が残り、同じ root の DDL が `ConflictError` で拒否され続ける。
 /// トークンは `obj()` の参照等価。
 /// Core は `mutable` / `ref` を 0件に保つ規約なので、
 /// 連番カウンタではなく参照等価のオブジェクトを鍵にする。

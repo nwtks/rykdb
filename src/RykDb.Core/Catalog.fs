@@ -206,7 +206,7 @@ type internal TableDefinition =
     {
         Name: string
         Columns: ColumnDefinition list
-        /// 主キーになる列名（位置ではなく名前で持つ。DDL 変更に強い）
+        /// 主キーになる列名（位置ではなく名前を保持する。DDL 変更に強い）
         PrimaryKeyColumns: string list
     }
 
@@ -328,7 +328,7 @@ module internal Catalog =
     let isReservedIndexName (name: string) =
         name.StartsWith("__unique_", System.StringComparison.OrdinalIgnoreCase)
 
-    /// カタログにある索引を実行用の IndexSchema へ落とす。
+    /// カタログにある索引を実行用の IndexSchema に変換する。
     let indexSchemasOf (catalog: Catalog) (table: string) =
         indexesOf catalog table |> List.map toIndexSchema
 

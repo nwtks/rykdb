@@ -121,7 +121,7 @@ let withStore (_tag: string) (f: RowStore -> unit) =
     f (RowStore.openStoreWith "" (newMemoryEngineFactory ()))
 
 /// メモリ上の DB を開いてテストし、最後に閉じる（ディスク I/O なし）。
-/// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で持ち替える。
+/// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で差し替える。
 /// <remarks>
 /// root はテストごとに一意にする。root はプロセス内の `RootGate` /
 /// `ActiveSnapshotRegistry` のキーなので、空文字を共有すると
@@ -245,7 +245,7 @@ let asText (v: SqlValue) =
         Assert.Fail(sprintf "TEXT ではありません: %A" v)
         ""
 
-/// `Database.Execute` の戻り値を「新しいハンドル」に持ち替える。
+/// `Database.Execute` の戻り値を「新しいハンドル」に差し替える。
 let exec (db: Database) (sql: string) =
     let next, _ = ok (db.Execute sql)
     next

@@ -9,7 +9,7 @@
 open RykDb.Core
 
 /// データベースを「開いた状態」で保持する参照。
-/// Database.Execute は新しい Database を返すので、以降は必ず戻り値のものを持ち替える。
+/// Database.Execute は新しい Database を返すので、以降は必ず戻り値のものに差し替える。
 type Session(initial: Database) =
     let mutable current = initial
 

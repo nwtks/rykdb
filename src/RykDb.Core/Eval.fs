@@ -371,11 +371,11 @@ module internal Eval =
         else
             liftNumeric op a b
 
-    /// 比較演算子を適用して 3値論理へ落とす。
+    /// 比較演算子を適用して 3値論理に変換する。
     /// <remarks>
     /// compare（SqlValue を返す文脈）と truthOf（TruthValue を返す文脈）は
     /// NULL 判定と演算子の表だけが違うので、両方ここへ寄せる。
-    /// 未知の演算子名は Unknown = False 側へ落とす（SQL では到達しない）。
+    /// 未知の演算子名は Unknown = False 側へ寄せる（SQL では到達しない）。
     /// </remarks>
     let private applyComparison (opName: string) (c: int) =
         let tf b =
@@ -390,7 +390,7 @@ module internal Eval =
         | "ge" -> tf (c >= 0)
         | _ -> TruthValue.Unknown
 
-    /// 比較を 3値論理に落とす。
+    /// 比較を 3値論理に変換する。
     let private compare (opName: string) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
             ret SqlValue.Null
@@ -435,7 +435,7 @@ module internal Eval =
         else
             ret row.[i]
 
-    /// SqlValue を 3値へ落とす。
+    /// SqlValue を 3値に変換する。
     /// BOOL はそのまま、NULL と BOOL 以外は UNKNOWN。
     let private truthOfValue (v: SqlValue) =
         if SqlValue.isNull v then

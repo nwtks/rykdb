@@ -1,8 +1,8 @@
 # SQL リファレンス
 
 RykDb が受け付ける SQL 文法の一覧。
-**実装ソースから機械的に抜き出した「実際に通る範囲」** を記載する。
-標準 SQL と食い違う部分は［制限］印を付けて明示する。
+実装を確認して得た **実際に受理される範囲** を記載する。
+標準 SQL と異なる部分は［制限］印を付けて示す。
 
 ---
 
@@ -103,7 +103,7 @@ BEGIN   COMMIT  ROLLBACK PRIMARY KEY     UNIQUE  DEFAULT CASE    WHEN
 THEN    ELSE    END      EXISTS  IF      TRUE    FALSE
 ```
 
-`TRUE` / `FALSE` は予約語一覧（`Lexer.Keywords`）には無いが、`Keyword` として特別扱いされる。
+`TRUE` / `FALSE` は上の一覧（`Lexer.Keywords`）には含まれないが、字句解析で特別に扱われる。
 
 ### 記号（演算子・区切り）
 
@@ -121,7 +121,7 @@ THEN    ELSE    END      EXISTS  IF      TRUE    FALSE
 | 実数（小数部か指数部あり） | `1.5` `.5` `1e3` `1.5E-3` | `REAL`    |
 
 **`DECIMAL` のリテラルはない**。 `1.5` は `REAL`。
-厳密な小数を入れたい場合は文字列リテラルで渡し、列の型で変換させる（§3）。
+厳密な小数を入力する場合は文字列リテラルで渡し、列の型に応じて変換する（§3）。
 
 ### 文字列リテラル
 
@@ -142,7 +142,7 @@ X'0A1B'       -- 大文字の 16進のみ。バイト数は偶数
 
 入れ子深度は **200** を超えない（`Parser.MaxExpressionDepth`）。
 `a + b + c + ...` を 1000個並べると構文エラーになる。
-構文規則は相互再帰なので実行時にフレームが 1 段ぶん積み上がるため、深さで検出して打ち切る。
+構文解析は相互再帰で行うため、スタックを使い切らないよう深さが上限を超えたら打ち切る。
 
 ---
 
@@ -166,9 +166,9 @@ X'0A1B'       -- 大文字の 16進のみ。バイト数は偶数
 `VARCHAR(32)` の `(32)` は**読み取られるだけ**で、切り詰めも検証も行わない。
 `VARCHAR(1)` に 100 文字を入れても保存される。
 
-### 暗黙の型変換（`SqlValue.coerce`）
+### 値を列の型へ自動変換する（`SqlValue.coerce`）
 
-`INSERT` / `UPDATE` で値を書き込むとき、列の型へ次の変換をかける。
+`INSERT` / `UPDATE` では、値を列の型に合わせて自動変換する。
 変換できない場合は `TypeError` になる。
 
 | 目標型      | 受け付ける値                                                            |
@@ -193,7 +193,7 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 
 | 種別                       | 規則                                                                                                                        |
 | -------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `INTEGER` `REAL` `DECIMAL` | 3種とも `decimal` に寄せて比較                                                                                              |
+| `INTEGER` `REAL` `DECIMAL` | 3種とも `decimal` 型に変換して比較                                                                                          |
 | `REAL` の `NaN`            | **`REAL` 同士の比較でのみ**最大。`NaN = NaN` は真。`NaN` と `INTEGER` / `DECIMAL` の比較は `TypeError`（§14「演算の注意」） |
 | `TEXT`                     | `StringComparer.Ordinal`（= UTF-8 のバイト順 = コードポイント順）                                                           |
 | `BLOB`                     | バイト列の辞書順（短い方が先）                                                                                              |
@@ -205,7 +205,7 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 `active = 1`（`BOOLEAN` と `INTEGER`）はエラーになる。
 
 - 数値 3種の比較順位: `INTEGER` = `REAL` = `DECIMAL` < `DATE` < `TIMESTAMP` < `TEXT` < `BLOB` < `UUID`
-- `NULL` は比較できない。SQL の 3値論理（[§6.2](#62-3値論理)）として扱われる。
+- `NULL` との比較は 3値論理（[§6.2](#62-3値論理)）に従い、結果は `UNKNOWN` になる。
 
 ---
 
@@ -226,7 +226,7 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 | UUID     | `'0f8fad5b-…'`                                  |
 
 **リテラルには `DECIMAL`・`DATE`・`TIMESTAMP`・`UUID` の書式がない**。
-これらは文字列リテラルで書き、列の型で変換させる。
+これらは文字列リテラルで記述し、列の型に応じて変換する。
 
 ### `INSERT` の値式は定数のみ
 
@@ -274,9 +274,9 @@ SELECT "Order Id" FROM "My Table";      -- 引用識別子
   （`FROM t AS right` のように `AS` を付ける）。
   `JOIN ... USING (...)` は明示的な `SyntaxError` になる（§14）。
 
-### `SELECT` 項目の後置演算子
+### `SELECT` 項目の式
 
-`SELECT` の項目は式として解析されるので、裸の識別子・関数呼び出しの後に演算子を書ける。
+`SELECT` の項目は式として解析されるため、列名や関数呼び出しの後ろにも演算子を続けて書ける。
 
 ```sql
 SELECT name || 'x' FROM t;          -- OK
@@ -375,7 +375,7 @@ name LIKE 'a%'       name NOT LIKE 'a%'
   エスケープ文字の直後の `%` / `_` / エスケープ文字自身はリテラルになる。
   エスケープ文字がパターンの末尾に来た場合は `TypeError`。
   `\` を既定のエスケープにする仕組みや、大文字小文字を区別しないモード（`ILIKE`）は**ない**。
-- パターンも被比較も文字列表現（`toDisplayString`）で照合し、引数が `NULL` なら結果は `NULL`。
+- パターンも対象の値も文字列表現（`toDisplayString`）に変換して照合する。どちらかが `NULL` なら結果は `NULL`。
 - `IS TRUE` / `IS FALSE` / `IS UNKNOWN` は 3値論理の判定。
   `NULL`（UNKNOWN）は `IS TRUE` / `IS FALSE` とも `FALSE`、`IS UNKNOWN` は `TRUE`。
   否定形（`IS NOT …`）はその否定。`BOOLEAN` 以外の値は UNKNOWN として扱う
@@ -561,7 +561,7 @@ SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
 
 ### 7.4 索引が使われる条件
 
-`WHERE` に**列 = 定数**（＝リテラル、または負の数値リテラル）の等価述語が `AND` で連結されているとき、それらをまとめて評価する。
+`WHERE` に**列 = 定数**（リテラル、または負の数値リテラル）の条件が `AND` で連結されていれば、条件をまとめて索引の検索に使う。
 `LIKE 'prefix%'`（`%` が末尾のみ・`_` なし）は**範囲条件として索引に降ろす**。
 
 | 条件                                                                   | 走査方法         |
@@ -572,6 +572,8 @@ SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
 | 単一列の主キーに下限のある範囲条件 (`>`, `>=`, `BETWEEN`, `LIKE 'x%'`) | `RangeScan`      |
 | 索引（**複合可**）の範囲条件。ただし範囲列より前の全列に `= 定数`      | `IndexRangeScan` |
 | それ以外                                                               | `SeqScan`        |
+
+複合索引では、先頭列から順に条件が必要になる。たとえば索引 `(a, b)` なら、`a = 1 AND b > 2` は範囲走査に使えるが、`b > 2` だけでは使えない。
 
 主キー・索引は値のバイト列表現で引くため、列の宣言型とリテラルの型が一致するときだけ使う。
 型が違うリテラルは全走査に落ち、比較時に `TypeError` になる。
@@ -592,10 +594,10 @@ SELECT id FROM t WHERE a = 1;                 -- 前置 1列の等値 → IndexL
 制限:
 
 - **範囲走査は下限のある条件のみ**。`<` / `<=` だけの条件は全走査になる。
-- **索引の等値一致（`IndexLookup`）は、索引の先頭から連続する `= 定数` が 1列以上あるとき**
+- **索引の等値検索（`IndexLookup`）は、索引の先頭から続く列に `= 定数` が 1つ以上あるとき**
   （全列でなくてもよい）。
   範囲条件がその次の列にある場合は、より多くの列を絞れる `IndexRangeScan` を優先する。
-  複合索引の範囲は「前置列すべてが `=`、その次の 1列が範囲」の形で使う。
+  複合索引の範囲検索は「範囲列より前の列すべてが `=`、その次の 1列が範囲条件」という形で使う。
 - `LIKE` は **`%` が末尾のみ・`_` なし**のときだけ範囲に変換する。
   `LIKE '%x'` や `LIKE 'a_b%'` は全走査 + 後段の `Filter`。
 - 型が一致しないリテラルは全走査に落ちる（比較時に `TypeError`）。
@@ -642,7 +644,7 @@ SELECT p.id, d.dname
 
 ソートは外部マージ（`ExtSort`）で並べる。
 バジェット（管理メモリの概算。既定 64MiB）に収まる入力はメモリだけで、
-超過分は一時ファイル（`%TEMP%/rykdb-sort-*`）へ溢らしてから k-way merge する。
+超過分は一時ファイル（`%TEMP%/rykdb-sort-*`）へ退避してから k-way merge する。
 同時に開く run は最大 32本で、それを超える場合は中間 run へ multi-pass merge する。
 同値な行の順序は保証されない（`ORDER BY` のキーが一意でないとき）。
 
@@ -797,7 +799,7 @@ INSERT INTO テーブル DEFAULT VALUES;
 - `VALUES` の要素に `DEFAULT` を書くと、その列の既定値を使う。
 - **値式は定数のみ**（列参照不可）。サブクエリは使える（§7.9）。
 - `INSERT ... SELECT` と `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）は未対応（§14）。
-- 値は列の型へ**暗黙変換**される（[§3](#暗黙の型変換sqlvaluecoerce)）。
+- 値は列の型へ**自動変換**される（[§3](#値を列の型へ自動変換するsqlvaluecoerce)）。
 - `NOT NULL` 制約は行ごとに検証される。
 - **1つの `INSERT` は 1トランザクション**（途中で失敗したら何も残らない）。
 
@@ -853,7 +855,7 @@ UPDATE テーブル SET 列 = 式 [, 列 = 式 …] [ WHERE 条件 ];
 ### 主キー列は更新できない
 
 主キー列を `SET` すると `ConstraintViolation` になる（古い主キーの行が残って重複するため）。
-主キーを変えたい場合は `DELETE` + `INSERT` を使う。
+主キーを変更するには、`DELETE` + `INSERT` を使う。
 
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT);
@@ -864,8 +866,6 @@ SELECT id, n FROM t ORDER BY id;
 -- 1, 'a'
 -- 2, 'b'
 ```
-
-主キーを変えたい用途では `DELETE` + `INSERT` を使う。
 
 ```sql
 UPDATE people SET age = age + 1 WHERE id = 1;
@@ -932,7 +932,7 @@ CREATE TABLE people (
 変換できない既定値は `INSERT` 時に `TypeError` になる。
 
 - **主キーは省略できない**。
-  1つも無いと`テーブル t に主キーがありません` になる。
+  1つもない場合は `テーブル t に主キーがありません` になる。
 - 主キーは1テーブルに1定義だけ。
   列レベルとテーブルレベルの併用、複数列への列レベル `PRIMARY KEY`、
   複数のテーブルレベル `PRIMARY KEY` は `ConstraintViolation` になる。
@@ -1038,7 +1038,7 @@ ROLLBACK;        -- 削除を取り消し
 任意の SQL を実行するには `Execute` を使う。
 
 ```fsharp
-// ok は Result の中身を取り出す例示用ヘルパー。
+// Result から値を取り出すための説明用ヘルパー。
 let ok =
     function
     | Ok v -> v
@@ -1054,7 +1054,7 @@ let db, _ = ok (db.Execute "INSERT INTO t VALUES (1, 10)")   // 1 文 = 1 commit
 ```fsharp
 open RykDb.Core
 
-// ok は Result の中身を取り出す例示用ヘルパー。
+// Result から値を取り出すための説明用ヘルパー。
 let ok =
     function
     | Ok v -> v
@@ -1087,13 +1087,12 @@ let db4 = db2.Rollback()                           // 破棄
   （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）を返す。
   別の `RowStore` ができて memtable が分かれ、一方の commit が他方から見えないため。
   `Close()` してから開き直すこと。
-- snapshot はトランザクション開始時に固定される
-  （repeatable read）。
-- 分離レベルは Snapshot Isolation（repeatable read）で固定。
+- トランザクション中の読み取りは、開始時点の snapshot（データの見える範囲）に固定される。
+  そのため、同じトランザクションから同じ行を読み直しても、他のトランザクションの後続 commit は見えない（repeatable read）。
+- 分離レベルは Snapshot Isolation（スナップショット分離）で固定。
   `BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...` による指定は未対応。
 - `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` と読み取り専用トランザクションは未対応（§14）。
-- 自分の snapshot 取得後に別トランザクションが同じキーを commit していた場合、後続側は `ConflictError` になる
-  （first-committer-wins）。
+- snapshot 取得後に別のトランザクションが同じキーを先に commit していた場合、後から commit する側は `ConflictError` になる（先に commit した側が勝つ）。
 
 ### CLI のドットコマンド
 
@@ -1202,10 +1201,7 @@ db> .rollback
   （2つ目のプロセスは `IoError` で開けない。§12.2「プロセス間ロック」）
 
 未対応の集合演算・JOIN の綴りは、テーブル別名として解釈されず **`SyntaxError`** になる。
-以前は `FROM t UNION SELECT ...` が「別名 + 別文」に分解され、
-エラーにならずに複数文の集計だけが返っていた。
-これらの語を裸のテーブル別名に使うことはできない
-（`AS` を付ければ使える）。
+これらの語を裸のテーブル別名に使うことはできない（`AS` を付ければ使える）。
 
 ### 実装上の制約
 
@@ -1214,7 +1210,7 @@ db> .rollback
 | 索引                | 単一列・複合索引の前置等値（1列以上）、複合索引の前置等値 + 次列の範囲、`LIKE 'prefix%'` の範囲                                     |
 | `LIMIT` / `OFFSET`  | 0 以上の定数式のみ（行ごとの列参照・負数はエラー）。`LIMIT 0` は「0行」                                                             |
 | 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                                                                                              |
-| ソート              | 外部マージ（一時ファイルに溢らす）。バジェット内はメモリのみ                                                                        |
+| ソート              | 外部マージ（一時ファイルへ退避）。バジェット内はメモリのみ                                                                          |
 | `SELECT DISTINCT`   | 符号化キーの集合。既定 256MiB で上限があり、超過は `CapacityError`                                                                  |
 | `JOIN`              | 入れ子ループ / ハッシュ結合は右側を、マージ結合は同じキーの行だけを保持。管理メモリ換算 256MiB で上限があり、超過は `CapacityError` |
 | `GROUP BY`          | 行を抱えず集約。グループ数の上限は 400万                                                                                            |

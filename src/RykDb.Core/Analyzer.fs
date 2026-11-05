@@ -2,9 +2,8 @@
 // Analyzer — 名前束縛 → 論理代数の補助。
 //
 //   1. 名前束縛（bind）: 裸の列名を修飾名（`t.id`）に解決し、出力 Schema を作る
-//   2. 論理代数（buildLogical）: Scan / Filter / Project / Join /
-//      Aggregate / Sort / Limit に落とす。そのテーブルだけを参照する
-//      WHERE の conjunct は Scan の直下へ落とし、走査方法もここで選ぶ
+//   2. 論理代数（buildLogical）: Scan / Filter / Project / Join / Aggregate / Sort / Limit に変換する。
+//      そのテーブルだけを参照する WHERE の conjunct は Scan の直下へ落とし、走査方法もここで選ぶ
 //
 // 評価順は 集約 → 並び替え → 射影 → DISTINCT → LIMIT で固定。
 // ===========================================================================

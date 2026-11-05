@@ -18,7 +18,7 @@ namespace RykDb.Core
 /// <remarks>
 /// ハンドルは underlying state を不変に持つ。
 /// 書き込みは新しい state を返すので、ハンドル自体は変更されない。
-/// これにより「複数の接続が同じ DB を触る」状況を型で表現できる。
+/// これにより「複数の接続が同じ DB を利用する」状況を型で表現できる。
 /// </remarks>
 type Database internal (root: string, state: DbState) =
     /// このハンドルの生存に紐づく ActiveSnapshot 登録のリース。

@@ -38,30 +38,33 @@ dotnet fantomas src/ tests/   # 整形
 | `TreatWarningsAsErrors` | **有効**                          |
 | `LangVersion`           | `10.0`                            |
 | `WarningLevel`          | `3`                               |
-| Core の命令形要素       | `mutable` / `while` / `ref` = 0件 |
+| Core の命令型構文・機能 | `mutable` / `while` / `ref` = 0件 |
 
 > **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
 > （[`gotchas.md`](gotchas.md) §10.4）。
 
-> **dotnet build / dotnet test を並行して走らせない**
-> （幻影エラーの詳細は [`gotchas.md`](gotchas.md) §9.4）。
+> **dotnet build / dotnet test を並行して実行しない**
+> （並行実行時に発生する見かけ上のエラーについては [`gotchas.md`](gotchas.md) §9.4 を参照）。
 
 ## 2. tail call 監査
 
-再帰が末尾位置から外れるとスタックオーバーフローに直結するため、3層で検出する。
+再帰呼び出しの後に処理が残る形（非末尾再帰）は、入力が大きいとスタックオーバーフローを起こす。
+これを次の 3 層で検出する。
 
-1. **ビルド** — `[<TailCall>]` 属性付き関数の非末尾再帰を FS3569 として検出（`TreatWarningsAsErrors` によりエラー）。
-2. **TailAudit** — `dotnet run --project tools/TailAudit` が構文木を走査し、属性の無い 関数（ローカル `let rec` を含む）の非末尾再帰を検出。
-   既知分は `tools/TailAudit/TailAudit.baseline` と差分し、**新規があれば exit 1**。
+1. **ビルド** — `[<TailCall>]` 属性付き関数の非末尾再帰を FS3569 として検出
+   （`TreatWarningsAsErrors` によりエラー）。
+2. **TailAudit** — `dotnet run --project tools/TailAudit` が構文木を調べ、
+   属性のない関数（ローカル `let rec` を含む）の非末尾再帰を検出する。
+   検出結果を `tools/TailAudit/TailAudit.baseline` と比較し、**新しい項目があれば exit 1**。
    （ベースラインは `dotnet run --project tools/TailAudit -- --update` で生成する。
    **未生成なら全件を新規とみなして exit 1 になる**ので、内容を確認のうえ生成しておく。）
    - 非末尾は**「ラムダ内 / 直接」の内訳**を表示する。
-     ラムダ内 = `Compute` / `pull` 継続・CPS 継続（深度は 1行ごと / `MaxExpressionDepth` で頭打ち）。
+     ラムダ内 = `Compute` / `pull` 継続・CPS 継続（深度は 1行ごと、`MaxExpressionDepth` を上限とする）。
      直接 = 監査部・引数など「結果を消費してから」型（**本来の末尾化候補**）。
      ベースラインのキーには含めない（内訳が変わっても差分化しないため）。
    - pipe の**関数側**は末尾として数える（`x |> f a` = `f a x`）。
      値側は非末尾のまま。
-3. **テスト** — スタック深度の実測（`末尾再帰:` 系テスト）。
+3. **テスト** — `末尾再帰:` 系テストで、実際のスタック使用量を確認する。
 
 `[<TailCall>]` は構文上の検査にすぎない。
 `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` により Debug でも実際の `tail.` を出力する。
@@ -71,7 +74,7 @@ CPS でのスタック深度とその上限は [`coding-conventions.md`](coding-
 ## 3. テスト構成
 
 xUnit。
-**テスト対象のソースファイルごとに 1ファイル**に分ける
+**テスト対象のソースファイルごとに、対応するテストファイルを 1つ設ける**
 （`src/RykDb.Core/Dml.fs` → `tests/RykDb.Tests/DmlTests.fs`）。
 モジュール名も `module RykDb.DmlTests` と対象名に合わせる。
 
@@ -98,7 +101,7 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 **書き方**:
 
 - 1テスト = 1関数。
-  `let ``説明`` () = ...` の**関数形**（FS0842: 関数でないと黙って無視される）。
+  `let ``説明`` () = ...` の**関数形**（FS0842: 関数でない場合、テストとして認識されず無視される）。
 - 共通ヘルパー（`ok` / `withDir` / `asInt` / 乱数生成）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
   ファイル固有の fixture（スキーマなど）は各ファイルに private で置く。
 - `withStore` / `withDb` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
@@ -106,7 +109,7 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 - 新しいファイルは `.fsproj` の Compile 順（= src のコンパイル順）に追加する。
 - 一時ディレクトリは `Path.GetTempPath()` + `Ticks`。
   `try/finally` で必ず削除する。
-- `TestHealthTests.fs` に**「Fact が 0 件のテストモジュールが無い」ことを検出するテスト**がある
+- `TestHealthTests.fs` に**「Fact が 0件のテストモジュールが無い」ことを検出するテスト**がある
   （リフレクションで数える）。
   F# 10 の FS0842 への対策（[`gotchas.md`](gotchas.md) §9.1）。
   ファイルを増やしたら下限数のアサートも更新する。

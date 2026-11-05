@@ -89,13 +89,11 @@ module internal ProcessLock =
 
 /// プロセスロックを保持する 1本分の寿命。
 /// <remarks>
-/// `Database.Execute` / `Begin` / `Commit` は新しいハンドルを返すので、
-/// 同じ `RowStore`（同じロック）を参照するハンドルが複数同時に存在する。
-/// そこで「最後に作られたハンドル」を所有者として覚え、**所有者の Close だけ**が
-/// 実際のプロセスロックを解放する。
-/// 古いハンドルの Close で解放すると、生きている新しいハンドルの足元で
-/// 同じ root を再オープンできてしまい、memtable / WAL が分かれた 2つの store ができる。
-/// 新しいハンドルは `Attach` のたびに所有者を置き換える。
+/// `Database.Execute` / `Begin` / `Commit` は新しいハンドルを返す。
+/// そのため、同じ `RowStore` とロックを共有するハンドルが同時に存在しうる。
+/// `Attach` のたびに最新のハンドルを所有者として記録し、所有者の `Close` だけが実際のロックを解放する。
+/// 古いハンドルから解放できると、新しいハンドルが使用中なのに同じ root を再オープンできてしまう。
+/// その結果、memtable と WAL が分かれた別々の store ができる。
 /// </remarks>
 type internal ProcessLockLease internal (root: string, token: obj) =
     /// 所有者のトークン。

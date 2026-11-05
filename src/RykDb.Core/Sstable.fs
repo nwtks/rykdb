@@ -70,10 +70,9 @@ module internal SstEntry =
         e.Key.Length + valueTotal
 
 /// SSTable の遅延走査。
-/// next を呼ぶまでブロックを読まない（読むのは 1個ずつ、読み終えたら次のブロックへ）。
-/// ブロックの解析に失敗したら、その時点の next が Error を返して打ち切る
-/// （ファイル全体のチェックサムは openTable が既に見ているので、
-/// ここまで来て parse が落ちるのは掴んでいるファイルが壊れている場合だけ）。
+/// `next` を呼ぶまでデータブロックを読まず、呼び出しごとに必要なブロックを1つずつ読む。
+/// ブロックのチェックサムや内容の検証に失敗した場合は、そのブロックを読む `next` が `Error` を返す。
+/// `openTable` は footer やメタデータを検証するが、まだ読んでいないデータブロックは検証しない。
 type internal SstScan = SstScan of (unit -> Result<(SstEntry * SstScan) option, DbError>)
 
 module internal SstScan =

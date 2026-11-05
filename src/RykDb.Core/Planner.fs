@@ -21,11 +21,10 @@ module internal Optimizer =
 
     /// ORDER BY を省略できるか。
     /// <remarks>
-    /// 単一テーブル・集約なし・DISTINCT なしで、ORDER BY の先頭が
-    /// **主キー全列を定義順・昇順**で並べているなら、走査結果がそのまま順序になる。
-    /// 主キーは一意なので、後続のキーは順序に影響しない。
-    /// 主キーの一部だけ（複合主キーの 1列目だけ）では並びが決まらないので対象外。
-    /// 索引走査（`IndexLookup` / `IndexRangeScan`）は索引順なので対象外。
+    /// 単一テーブルを主キー順に走査し、集約・DISTINCT・JOIN がない場合に判定する。
+    /// `ORDER BY` の先頭が主キー全列を定義順・昇順で含むなら、走査結果はすでに必要な順序である。
+    /// 主キーは一意なので、その後ろにある `ORDER BY` 項目は順序を変えない。
+    /// 複合主キーの一部だけでは全行の順序が決まらず、索引走査も主キー順を保証しないため対象外。
     /// </remarks>
     let private sortIsRedundant
         (ctx: ExecContext)
@@ -730,7 +729,7 @@ module internal Optimizer =
                     | Error e -> err e
                     | Ok joined -> run ctx rest (ApplyOp joined)
 
-    /// 論理代数を Op に落とす。
+    /// 論理代数を Op に変換する。
     /// <remarks>
     /// 下へ渡すスキーマは常に「入力スキーマ」schema のまま。
     /// outputOf child schema は「child の出力スキーマ」であって、
