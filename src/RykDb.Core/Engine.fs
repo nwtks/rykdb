@@ -466,10 +466,10 @@ module internal Engine =
                         Rows = rows
                     })
 
-    let private resolveWhere (ctx: ExecContext) =
+    let private resolveWhere (target: Schema) (ctx: ExecContext) =
         function
         | None -> ret None
-        | Some e -> Plan.resolveDmlExpr ctx e |> Result.map Some
+        | Some e -> Plan.resolveDmlExprWith target ctx e |> Result.map Some
 
     let private runInsert (stmt: InsertStatement) (ctx: ExecContext) =
         result {
@@ -484,20 +484,23 @@ module internal Engine =
 
     let private runUpdate (stmt: UpdateStatement) (ctx: ExecContext) =
         result {
+            let! schema = ExecContext.schemaOf stmt.Table.Name ctx
+            let target = Schema.ofTable schema.Name None schema
+
             let! assignments =
                 stmt.Assignments
-                |> List.map (fun (name, e) -> Plan.resolveDmlExpr ctx e |> Result.map (fun e2 -> name, e2))
+                |> List.map (fun (name, e) -> Plan.resolveDmlExprWith target ctx e |> Result.map (fun e2 -> name, e2))
                 |> all
 
-            let! whereE = resolveWhere ctx stmt.Where
-            let! schema = ExecContext.schemaOf stmt.Table.Name ctx
+            let! whereE = resolveWhere target ctx stmt.Where
             return! DmlOps.update ctx schema assignments whereE
         }
 
     let private runDelete (stmt: DeleteStatement) (ctx: ExecContext) =
         result {
-            let! whereE = resolveWhere ctx stmt.Where
             let! schema = ExecContext.schemaOf stmt.Table.Name ctx
+            let target = Schema.ofTable schema.Name None schema
+            let! whereE = resolveWhere target ctx stmt.Where
             return! DmlOps.delete ctx schema whereE
         }
 

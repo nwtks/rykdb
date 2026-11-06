@@ -1636,25 +1636,36 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
   `SqlReference: マージ結合（主キー同士・LEFT・複合キー）` /
   `OpsTests` のマージ結合 5 本（ハッシュ結合との差分比較を含む）。
 
-### 11.47 サブクエリは計画時に定数へ畳み込む（相関は未対応）
+### 11.47 サブクエリは計画時に定数へ畳み込む（相関は実行時に外側行ごと）
 
-`Plan.planSelectC` は `SELECT` の全式（項目 / `ON` / `WHERE` / `GROUP BY` / `HAVING` /
+`Plan.planSelectCWith` は `SELECT` の全式（項目 / `ON` / `WHERE` / `GROUP BY` / `HAVING` /
 `ORDER BY` / `LIMIT` / `OFFSET`）からサブクエリを再帰的に探し、
-論理代数を組む前に実行して `Expr.Value` / `Expr.InList` / 真偽値へ置き換える。
+**非相関**なら論理代数を組む前に実行して `Expr.Value` / `Expr.InList` / 真偽値へ置き換える。
 
-- **相関サブクエリは未対応**。
-  `resolveSelectC` は外側のテーブルを登録する前（`registerAll` の前）に走るので、
-  外側の列を参照すると `NameError` になる。
+- **相関サブクエリは実行時評価**。
+  `resolveSelectC` は外側クエリの入力スキーマをスコープ列として受け取り、
+  内側で解決できない列参照が外側スコープに一致すれば相関と判定して
+  `Expr.CorrelatedSubquery`（`Run` と `Depths`）へ置き換える。
+  実行時は外側行の値で参照を置換し、`runSubquery` が内側を再計画・実行する。
   外側と同じ実テーブル名が内側の `FROM` にある場合は標準どおり内側が優先される。
-- サブクエリは**クエリごとに 1回**実行される。
+- `Depths` は外側スコープの深さ（1 = 直近）。
+  入れ子の相関は深さ 2以上だけを外側クエリの相関として引き継ぐ。
+- **相関参照を含む述語は押し下げない**。
+  子スコープ（1テーブルの走査）の行で評価すると外側列の位置が変わる。
+  `Expr.hasCorrelated` で `buildScan` / `rightPreds` / `localToAny` から除外する。
+- 集約後の行を読む位置（集約クエリの `SELECT` / `HAVING` / `ORDER BY`）と
+  `LIMIT` / `OFFSET` は外側行を持たないので `SyntaxError`。
+- 非相関サブクエリは**クエリごとに 1回**実行される。
   `IN (SELECT ...)` は結果をすべて保持する
   （スカラーは最大 2行、`EXISTS` は 1行だけ読む）。
+  相関サブクエリは外側行ごとに実行される（外側行数 × 内側走査）。
 - ヘッダは解決前の式から作る。
   解決後から作ると `SELECT (SELECT MAX(v) FROM t) FROM t` の列名が `30` のようになる。
 - 集約後の行（`Ops.substituteAggs`）は `Expr.Value` で値を埋め込む。
   `Literal.ofValue` は DATE / TIMESTAMP / UUID を TEXT にするため、
   集約結果（`MAX(dt)` など）と DATE 列の比較が `TypeError` になる。
-- DML は `Engine.runInsert` / `runUpdate` / `runDelete` が `Plan.resolveDmlExpr` で解決する。
+- DML は `Engine.runInsert` / `runUpdate` / `runDelete` が `Plan.resolveDmlExprWith` で解決する
+  （UPDATE / DELETE は対象行のスキーマを渡すので外側行を参照できる）。
   `CREATE TABLE ... DEFAULT (SELECT ...)` は解決しない（実行時に `SyntaxError`）。
 - Parser は式と SELECT のパーサを同じ `let rec` グループにするため、句の側も CPS にする
   （`parseSelectStatementC` / `parseSelectItemsC` / `parseJoinsC` / `parseWhereC` / …）。
@@ -1662,12 +1673,19 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
   （推論に任せると FS0043「'r と 'r0 が一致しない」で群全体が落ち、
   後続が FS0039「parseExprC は定義されていません」という無関係なエラーになる）。
   深さは `MaxExpressionDepth` で頭打ち。
-- **Planner のサブクエリ解決（`Plan.planSelectC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC`）も CPS**。
+- **Planner のサブクエリ解決（`Plan.planSelectCWith` / `resolveSelectC` / `resolveExprC` / `resolveLeafC`）も CPS**。
   式の走査は `Expr.rewriteWithC`（葉の書き換えが継続を取る版）、
   リスト（項目 / JOIN / GROUP BY / ORDER BY）は `traverseC` が 1件ずつ継続で回す。
   葉からの `planSelectC` 呼び出しを `>>=` のレシーバに置くとそこでフレームが残るので、
   `match` / 継続の末尾呼び出しで書く。
+- **相関の再実行は計画関数の型を具体化しない**。
+  `planCoreCWith` / `planSelectCWith` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` は相互再帰グループなので、
+  `resolveLeafC` の中で `planSelectCWith ... ret` のように具体型の継続を渡すと、
+  グループの `'r` が `Schema * Op` に固定されて他の呼び出し（DML の式解決など）が型エラーになる。
+  外側行ごとの実行は `runSubquery`（グループの外の `let rec`）に切り出し、
+  グループ内へは関数引数 `runner` として渡す。
 - 回帰テスト: `SqlReference: サブクエリ（スカラー・IN・EXISTS）` /
+  `SqlReference: 相関サブクエリ` / `SqlReference: 相関サブクエリの未対応形` /
   `SqlReference: サブクエリの未対応形とエラー` / `パーサ: サブクエリ（スカラー / IN / EXISTS）` /
   `末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパースできる`。
 
@@ -1719,10 +1737,10 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
 - 回帰テスト: `SqlReference: FROM を省略した SELECT は定数 1 行を返す` /
   `パーサ: FROM を省略した SELECT`。
 
-### 11.50 派生テーブルは「計画」と「実行」を分ける（`planCoreC` / `Logical.Derived`）
+### 11.50 派生テーブルは「計画」と「実行」を分ける（`planCoreCWith` / `Logical.Derived`）
 
 `FROM (SELECT ...) AS x` は **計画時に実行しない**。
-`Plan.planSelectC` を `planCoreC`（論理木まで）と実行に分け、
+`Plan.planSelectCWith` を `planCoreCWith`（論理木まで）と実行に分け、
 派生は `PlannedQuery { Output; Header; Input; Context; Tree }` として持ち回る。
 
 - `Plan.resolveSourcesC` が AST の `TableSource.Derived` を `TableSource.Named`（別名）へ書き換え、
@@ -1737,8 +1755,8 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
   派生ノードの上に `Filter` を付ける。
 - `Logical.Derived` は `scanOrder` で `None` に落ちるのでマージ結合にはならない。
   型が `None` の派生列は等値キーにもならない（入れ子ループになるが結果は正しい）。
-- 再帰：`planCoreC` / `resolveSourcesC` は CPS だが、
-  `planCoreC` を呼ぶ継続はラムダ内なので TailAudit のベースラインに載る
+- 再帰：`planCoreCWith` / `resolveSourcesC` は CPS だが、
+  `planCoreCWith` を呼ぶ継続はラムダ内なので TailAudit のベースラインに載る
   （深さは Parser の `MaxExpressionDepth` で頭打ち）。
 - 回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
   `パーサ: サブクエリ（スカラー / IN / EXISTS）` /

@@ -715,7 +715,8 @@ SELECT dept_id, COUNT(*) AS c, AVG(salary) AS mean
 
 ### 7.9 サブクエリ
 
-式の中に `SELECT` を書ける。**相関サブクエリ（外側の列の参照）は未対応**。
+式の中に `SELECT` を書ける。
+外側の列を参照する**相関サブクエリ**も書ける（制限あり）。
 
 | 形                                     | 結果                                                                  |
 | -------------------------------------- | --------------------------------------------------------------------- |
@@ -731,20 +732,37 @@ SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t);
 SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE v >= 20);
 
 SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE v > 25);
+
+-- 相関サブクエリ: 外側の行ごとに評価される
+SELECT d.name, (SELECT MAX(e.salary) FROM emp AS e WHERE e.dept = d.name) AS mx
+FROM dept AS d;
+
+SELECT e.id FROM emp AS e
+WHERE EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > e.salary);
 ```
 
-- サブクエリは**外側のクエリを実行する前に 1 回だけ**実行され、結果は定数へ置き換わる
-  （`IN` は要素のリストへ展開する）。同じ文の中のサブクエリは同じスナップショットを見る。
+- 外側の列は、内側のスコープで解決できない場合だけ外側へフォールバックする
+  （内側に同じ名前の列・テーブルがある場合は内側が優先）。
+- **非相関**サブクエリは外側のクエリを実行する前に 1回だけ実行され、結果は定数へ置き換わる
+  （`IN` は要素のリストへ展開する）。
+  同じ文の中のサブクエリは同じスナップショットを見る。
+- **相関**サブクエリは外側の行ごとに実行される。
 - 列数が 1 でないサブクエリは `TypeError`。
+- 相関サブクエリは `WHERE` / `JOIN` の `ON` / 集約を使わない `SELECT` 項目 /
+  `ORDER BY` / `UPDATE ... SET` / `UPDATE`・`DELETE` の `WHERE` で使える。
+- 次では相関サブクエリを使えない（`SyntaxError`）。
+  集約クエリ（`GROUP BY` または集約関数）の `SELECT` / `HAVING` / `ORDER BY`、
+  `LIMIT` / `OFFSET`。派生テーブル（LATERAL）も相関できない（`NameError`）。
 - `INSERT ... VALUES` / `UPDATE ... SET` / `UPDATE`・`DELETE` の `WHERE` でも使える。
-- `LIMIT` / `OFFSET` にも書ける（定数へ解決される）。
-- 外側の列を参照する（相関）サブクエリは `NameError` になる。
+- `LIMIT` / `OFFSET` にも書ける（非相関のみ。定数へ解決される）。
 - サブクエリでも `FROM` を省略できる（`EXISTS (SELECT 1)` は常に真）。
 - `FROM (SELECT ...) AS x`（派生テーブル）は §7.10。
 - `CREATE TABLE ... DEFAULT (SELECT ...)` は未対応（INSERT 時に `SyntaxError`）。
-- スカラーサブクエリは最大 2行、`EXISTS` は 1行だけを読む。
+- スカラーサブクエリは最大 2行、`EXISTS` は 1行だけを読む（非相関）。
   `IN (SELECT ...)` は結果をすべて保持する
   （管理メモリ換算 256MiB の上限。超過は `CapacityError`）。
+- 相関サブクエリは外側行ごとに内側を計画・実行するため、
+  **外側行数 × 内側の走査コスト**がかかる。
 - サブクエリの入れ子も**式の深さ上限（200）に含まれる**。
   1 段で複数の深さ単位を消費するため、実測では 90段は実行でき、
   150段は `式の入れ子が深すぎます` になる（StackOverflow にはならない）。
@@ -1140,32 +1158,34 @@ db> .rollback
 
 ### よく見るメッセージ（実測）
 
-| SQL                                        | メッセージ                                                                |
-| ------------------------------------------ | ------------------------------------------------------------------------- |
-| `SELECT 1 JOIN t ON 1 = 1;`                | `JOIN には FROM が必要です (位置 1行)`                                    |
-| `SELECT *;`                                | `FROM のない SELECT では * を使えません（列を明示してください）`          |
-| `SELECT * FROM t WHERE id > 1 AND;`        | `式が必要ですが見つかりませんでした (位置 1行)`                           |
-| `SELECT 'abc;`                             | `unclosed string (位置 1行)`                                              |
-| `SELECT id FROM nosuchtable;`              | `テーブル 'nosuchtable' が存在しません`                                   |
-| `SELECT nosuchcol FROM t;`                 | `'nosuchcol' は列でも関数でもありません`                                  |
-| `CREATE TABLE t (a INTEGER);`              | `テーブル t に主キーがありません`                                         |
-| `CREATE TABLE t (...);`（重複）            | `テーブル t は既に存在します`                                             |
-| `CREATE INDEX ix ON t (nosuchcol);`        | `テーブル t に列 nosuchcol がありません`                                  |
-| `SELECT id FROM t JOIN t ON t.id = t.id;`  | `テーブル t が重複しています（エイリアスを付けてください）`               |
-| `DROP TABLE nosuch;`                       | `テーブル nosuch が存在しません`                                          |
-| `INSERT INTO t (id) VALUES (1, 2);`        | `INSERT の列数(1)と値の数(2)が合いません`                                 |
-| `INSERT INTO t VALUES (1, NULL, …);`       | `NOT NULL 制約に違反: t.n`                                                |
-| `INSERT INTO t VALUES (5, 'z', 'abc');`    | `''abc'' は 'INTEGER' に変換できません`                                   |
-| `SELECT (id) / 0 FROM t;`                  | `0 での除算は定義されていません`                                          |
-| `SELECT LENGTH(id, n) FROM t;`             | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`                  |
-| `SELECT NOSUCHFN(id) FROM t;`              | `未知のスカラー関数 'NOSUCHFN' です`                                      |
-| `SELECT active = 1 FROM u;`                | `型 'BOOLEAN' と 'INTEGER' は比較できません`                              |
-| `SELECT ROUND(name) FROM t;`               | `ROUND は数値を受け付けますが 'abc' です`                                 |
-| `SELECT id, (SELECT id, v FROM t) FROM t;` | `サブクエリは 1 列だけを返す必要があります（2 列）`                       |
-| `SELECT id, (SELECT v FROM t) FROM t;`     | `スカラーサブクエリが 2 行以上を返しました`                               |
-| `SELECT id FROM (SELECT id FROM t);`       | `サブクエリ（派生テーブル）には別名が必要です（例: AS x） (位置 1行)`     |
-| `SAVEPOINT s;`                             | `文の開始として解釈できません (位置 1行)`                                 |
-| `UPDATE t SET v = 1 FROM u;`               | `文の区切りには ; が必要です（複数文は ; で区切ってください） (位置 1行)` |
+| SQL                                                                               | メッセージ                                                                                    |
+| --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `SELECT 1 JOIN t ON 1 = 1;`                                                       | `JOIN には FROM が必要です (位置 1行)`                                                        |
+| `SELECT *;`                                                                       | `FROM のない SELECT では * を使えません（列を明示してください）`                              |
+| `SELECT * FROM t WHERE id > 1 AND;`                                               | `式が必要ですが見つかりませんでした (位置 1行)`                                               |
+| `SELECT 'abc;`                                                                    | `unclosed string (位置 1行)`                                                                  |
+| `SELECT id FROM nosuchtable;`                                                     | `テーブル 'nosuchtable' が存在しません`                                                       |
+| `SELECT nosuchcol FROM t;`                                                        | `'nosuchcol' は列でも関数でもありません`                                                      |
+| `CREATE TABLE t (a INTEGER);`                                                     | `テーブル t に主キーがありません`                                                             |
+| `CREATE TABLE t (...);`（重複）                                                   | `テーブル t は既に存在します`                                                                 |
+| `CREATE INDEX ix ON t (nosuchcol);`                                               | `テーブル t に列 nosuchcol がありません`                                                      |
+| `SELECT id FROM t JOIN t ON t.id = t.id;`                                         | `テーブル t が重複しています（エイリアスを付けてください）`                                   |
+| `DROP TABLE nosuch;`                                                              | `テーブル nosuch が存在しません`                                                              |
+| `INSERT INTO t (id) VALUES (1, 2);`                                               | `INSERT の列数(1)と値の数(2)が合いません`                                                     |
+| `INSERT INTO t VALUES (1, NULL, …);`                                              | `NOT NULL 制約に違反: t.n`                                                                    |
+| `INSERT INTO t VALUES (5, 'z', 'abc');`                                           | `''abc'' は 'INTEGER' に変換できません`                                                       |
+| `SELECT (id) / 0 FROM t;`                                                         | `0 での除算は定義されていません`                                                              |
+| `SELECT LENGTH(id, n) FROM t;`                                                    | `LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました`                                      |
+| `SELECT NOSUCHFN(id) FROM t;`                                                     | `未知のスカラー関数 'NOSUCHFN' です`                                                          |
+| `SELECT active = 1 FROM u;`                                                       | `型 'BOOLEAN' と 'INTEGER' は比較できません`                                                  |
+| `SELECT ROUND(name) FROM t;`                                                      | `ROUND は数値を受け付けますが 'abc' です`                                                     |
+| `SELECT id, (SELECT id, v FROM t) FROM t;`                                        | `サブクエリは 1 列だけを返す必要があります（2 列）`                                           |
+| `SELECT id, (SELECT v FROM t) FROM t;`                                            | `スカラーサブクエリが 2 行以上を返しました`                                                   |
+| `SELECT id FROM t AS o LIMIT (SELECT o.id FROM t AS x);`                          | `LIMIT に相関サブクエリは使えません`                                                          |
+| `SELECT (SELECT MAX(x.v) FROM t AS x WHERE x.v = o.v) FROM t AS o GROUP BY o.id;` | `GROUP BY / 集約関数を使うクエリの SELECT / HAVING / ORDER BY では相関サブクエリを使えません` |
+| `SELECT id FROM (SELECT id FROM t);`                                              | `サブクエリ（派生テーブル）には別名が必要です（例: AS x） (位置 1行)`                         |
+| `SAVEPOINT s;`                                                                    | `文の開始として解釈できません (位置 1行)`                                                     |
+| `UPDATE t SET v = 1 FROM u;`                                                      | `文の区切りには ; が必要です（複数文は ; で区切ってください） (位置 1行)`                     |
 
 未対応の後置句（`DELETE ... LIMIT`、`ON CONFLICT`、ウィンドウ関数の `OVER (...)` など）は
 専用のメッセージにならず、`;` 区切りのエラーとして報告される（§14）。
@@ -1176,7 +1196,8 @@ db> .rollback
 
 ### 構文が未対応のもの
 
-- **相関サブクエリ**（外側の列を参照するサブクエリ。派生テーブルも相関不可）
+- **相関派生テーブル（LATERAL）**（`FROM (SELECT ... 外側の列 ...) AS x` は `NameError`）。
+  式の中の相関サブクエリは §7.9。
 - `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`
 - CTE（`WITH`）、再帰クエリ
 - ウィンドウ関数（`OVER` / `PARTITION BY` / `ROW_NUMBER` …）

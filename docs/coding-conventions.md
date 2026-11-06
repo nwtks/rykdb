@@ -96,7 +96,7 @@ Debug ビルドでも F# に `tail.` プレフィックスを出させる
   FS0043「'r と 'r0 が一致しない」で**群全体が型検査に失敗する**
   （失敗すると後続の `parseExprC` 参照が FS0039「定義されていません」になり、原因が分かりにくい）。
 - **「葉の書き換えが別の再帰を経る」式走査は `Expr.rewriteWithC`（継続を取る版）を使う**。
-  `Plan` のサブクエリ解決（`resolveExprC` → `resolveLeafC` → `planSelectC` → …）がこれ。
+  `Plan` のサブクエリ解決（`resolveExprC` → `resolveLeafC` → `planSelectCWith` → …）がこれ。
   `Expr.rewriteWith` はその糖で、失敗を返す葉の書き換え（束縛・集約の読み替え）に使う。
 - **継続を値として渡す呼び出しは、TailAudit の引数位置の判定では非末尾と判定される**
   （`parseExprC (parseExprListElemC k acc) st`・`parseCaseBranches (parseCaseTailC k) [] st`）。
@@ -122,6 +122,10 @@ Debug ビルドでも F# に `tail.` プレフィックスを出させる
     同じパターンが `Sstable.rangeScanPartial` の `scanEntries` / `loadBlock`
     （ブロック読みを `SstScan.next` まで遅らせるため、続きの組み立てがラムダ内に入る）と
     `SstScan.emit` にもある。
+  - `Plan.runSubquery` — 相関サブクエリの再計画用に自分自身を runner として渡す。
+    実際の呼び出しは `Run` の末尾位置（`Result.bind` の継続）で起きるが、
+    TailAudit は関数値を引数として渡す形を `bare` として非末尾に数えるため、
+    `StorageEngine.scanAt` の `pull` と同様にベースラインで追認する。
   - 逆に**要素数に比例する反復は `match` に直して末尾再帰にする**
     （`IN` の候補リストと `CASE` の WHEN 節。`eval ... >>= fun` だと候補の数だけスタックが積まれる）。
     カーソルから件数分を読み出す処理（`Catalog` の列定義・名前、`Memtable` のエントリ）は

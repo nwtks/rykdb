@@ -127,7 +127,10 @@ module internal Optimizer =
 
             let local =
                 predicates
-                |> List.filter (fun p -> Binder.referencesOnly name p && not (Binder.hasAmbiguousColumn allSchema p))
+                |> List.filter (fun p ->
+                    Binder.referencesOnly name p
+                    && not (Binder.hasAmbiguousColumn allSchema p)
+                    && not (Expr.hasCorrelated p))
 
             let withPredicates node =
                 match Predicate.joinConjuncts local with
@@ -156,7 +159,9 @@ module internal Optimizer =
                 let rightPreds =
                     predicates
                     |> List.filter (fun p ->
-                        Binder.referencesOnly rightName p && not (Binder.hasAmbiguousColumn allSchema p))
+                        Binder.referencesOnly rightName p
+                        && not (Binder.hasAmbiguousColumn allSchema p)
+                        && not (Expr.hasCorrelated p))
 
                 match j.Kind with
                 | JoinKind.Inner ->
@@ -168,7 +173,8 @@ module internal Optimizer =
             }
 
         let localToAny allSchema bindings p =
-            not (Binder.hasAmbiguousColumn allSchema p)
+            not (Expr.hasCorrelated p)
+            && not (Binder.hasAmbiguousColumn allSchema p)
             && bindings |> List.exists (fun b -> Binder.referencesOnly (bindingName b) p)
 
         let applyAggregate schema stmt tree =
@@ -227,9 +233,22 @@ module internal Optimizer =
                            | Expr.QualifiedStar _ -> true
                            | _ -> false)
 
-                if (hasAgg || hasGroupBy) && hasStar then
+                let correlatedInOutput =
+                    selectExprs |> List.exists Expr.hasCorrelated
+                    || orderExprs |> List.exists Expr.hasCorrelated
+                    || match having with
+                       | Some h -> Expr.hasCorrelated h
+                       | None -> false
+
+                if (hasAgg || hasGroupBy) && correlatedInOutput then
                     return!
-                        DbError.create ErrorKind.SyntaxError "GROUP BY / 集約関数を使うときは SELECT * を書けません（列を明示してください）"
+                        "GROUP BY / 集約関数を使うクエリの SELECT / HAVING / ORDER BY では相関サブクエリを使えません"
+                        |> DbError.create ErrorKind.SyntaxError
+                        |> err
+                elif (hasAgg || hasGroupBy) && hasStar then
+                    return!
+                        "GROUP BY / 集約関数を使うときは SELECT * を書けません（列を明示してください）"
+                        |> DbError.create ErrorKind.SyntaxError
                         |> err
                 elif not (hasAgg || hasGroupBy) then
                     match having with
@@ -323,6 +342,8 @@ module internal Optimizer =
         let evalCount what =
             function
             | Expr.Literal(Literal.Int i) when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
+            | e when Expr.hasCorrelated e ->
+                sprintf "%s に相関サブクエリは使えません" what |> DbError.create ErrorKind.SyntaxError |> err
             | e ->
                 Eval.eval Schema.empty [||] e
                 >>= function
@@ -766,6 +787,169 @@ module internal Plan =
 
         go 0L []
 
+    /// 相関サブクエリの外側スコープ。
+    /// 先頭が直近の外側（式を含むクエリの入力）で、後ろへ行くほど外側。
+    type private OuterScope =
+        {
+            Schema: Schema
+            /// 実行時に行が確定していないスコープ（計画中のクエリ自身）は None。
+            Row: SqlValue array option
+        }
+
+    /// 修飾子が内側スコープのテーブルを指しているか。
+    /// 内側に同名のテーブルがあるなら、列が無くても外側へはフォールバックしない（SQL のスコープ規則）。
+    let private shadowedByInner (inner: Schema) (r: ColumnRef) =
+        match r.Qualifier with
+        | None -> false
+        | Some q -> inner.Tables |> List.exists (Catalog.eqName q)
+
+    /// 内側で解決できず、外側スコープに一致する列参照の位置（0 = 直近）を返す。
+    let private outerScopeIndex (inner: Schema) (scopes: OuterScope list) (r: ColumnRef) =
+        if Schema.resolve inner r |> Result.isOk || shadowedByInner inner r then
+            None
+        else
+            let rec go i =
+                function
+                | [] -> None
+                | s :: rest ->
+                    match Schema.resolve s.Schema r with
+                    | Ok _ -> Some i
+                    | Error _ -> go (i + 1) rest
+
+            go 0 scopes
+
+    /// 論理木が直接参照する式を列挙する。
+    /// 派生テーブルの内側は別スコープなので含めない。
+    let private treeExprs (tree: Logical) =
+        let childrenOf =
+            function
+            | Logical.Filter(e, child) -> [ e ], [ child ]
+            | Logical.Project(items, child) -> items |> List.map _.Expression, [ child ]
+            | Logical.Join(_, _, on, left, right) -> [ on ], [ left; right ]
+            | Logical.Aggregate(groupBy, aggs, child) -> groupBy @ (aggs |> List.map (fun (_, _, _, e) -> e)), [ child ]
+            | Logical.Having(h, aggs, groupBy, child) ->
+                h :: (aggs |> List.map (fun (_, _, _, e) -> e)) @ groupBy, [ child ]
+            | Logical.Distinct child -> [], [ child ]
+            | Logical.Sort(keys, child) -> keys |> List.map _.Expression, [ child ]
+            | Logical.Limit(_, _, child) -> [], [ child ]
+            | Logical.Scan _
+            | Logical.Values _
+            | Logical.Derived _ -> [], []
+
+        let rec go acc pending =
+            match pending with
+            | [] -> List.rev acc
+            | t :: rest ->
+                let exprs, kids = childrenOf t
+                go (List.rev exprs @ acc) (kids @ rest)
+
+        go [] [ tree ]
+
+    /// 論理木が相関している外側スコープの位置（0 = 直近の外側）を集める。
+    /// 入れ子の相関サブクエリは、その `Depths` のうち深さ 2 以上
+    /// （このクエリより外側への依存）だけを引き継ぐ。
+    let private outerRefs (inner: Schema) (scopes: OuterScope list) =
+        let addExpr =
+            Expr.fold (fun acc ->
+                function
+                | Expr.Column c ->
+                    match outerScopeIndex inner scopes c with
+                    | Some i -> i :: acc
+                    | None -> acc
+                | Expr.Name n ->
+                    match outerScopeIndex inner scopes { Qualifier = None; Name = n } with
+                    | Some i -> i :: acc
+                    | None -> acc
+                | Expr.CorrelatedSubquery c ->
+                    c.Depths
+                    |> List.filter (fun d -> d >= 2)
+                    |> List.fold (fun acc d -> d - 2 :: acc) acc
+                | _ -> acc)
+
+        treeExprs >> List.fold addExpr [] >> List.distinct
+
+    /// 外側参照を外側行の値へ置き換える（内側スコープが優先）。
+    /// 解決できない参照はそのまま残し、評価時の `NameError` に委ねる。
+    let private substituteOuter (inner: Schema) (scopes: OuterScope list) =
+        let subst r =
+            if Schema.resolve inner r |> Result.isOk || shadowedByInner inner r then
+                None
+            else
+                let rec go =
+                    function
+                    | [] -> None
+                    | s :: rest ->
+                        match Schema.resolve s.Schema r with
+                        | Ok i ->
+                            match s.Row with
+                            | Some row when i >= 0 && i < row.Length -> Some(Expr.Value row.[i])
+                            | _ -> None
+                        | Error _ -> go rest
+
+                go scopes
+
+        Expr.rewrite (fun x ->
+            match x with
+            | Expr.Column c -> defaultArg (subst c) x
+            | Expr.Name n -> defaultArg (subst { Qualifier = None; Name = n }) x
+            | _ -> x)
+
+    /// 文の各式に外側参照の置換を適用する。
+    /// 入れ子のサブクエリ（`Subquery` / `Exists`）の内部には入らない
+    /// （そのスコープは実行時に別途解決する）。
+    let private substituteStatement (inner: Schema) (scopes: OuterScope list) (stmt: SelectStatement) =
+        let sub = substituteOuter inner scopes
+
+        let subOpt =
+            function
+            | None -> ret None
+            | Some e -> sub e |> Result.map Some
+
+        result {
+            let! items =
+                stmt.Items
+                |> List.map (fun i -> sub i.Expression |> Result.map (fun e -> { i with Expression = e }))
+                |> all
+
+            let! joins =
+                stmt.Joins
+                |> List.map (fun j -> sub j.On |> Result.map (fun e -> { j with On = e }))
+                |> all
+
+            let! whereE = subOpt stmt.Where
+            let! groupBy = stmt.GroupBy |> List.map sub |> all
+            let! having = subOpt stmt.Having
+
+            let! orderBy =
+                stmt.OrderBy
+                |> List.map (fun k -> sub k.Expression |> Result.map (fun e -> { k with Expression = e }))
+                |> all
+
+            let! limit = subOpt stmt.Limit
+            let! offset = subOpt stmt.Offset
+
+            return
+                { stmt with
+                    Items = items
+                    Joins = joins
+                    Where = whereE
+                    GroupBy = groupBy
+                    Having = having
+                    OrderBy = orderBy
+                    Limit = limit
+                    Offset = offset
+                }
+        }
+
+    /// 現在のクエリの行を先頭に差し込んだスコープ列。
+    let private withCurrentRow (row: SqlValue array) =
+        function
+        | s :: rest -> { s with Row = Some row } :: rest
+        | [] -> []
+
+    /// 相関サブクエリの依存深さ（1 = 直近の外側行）。
+    let private depthsOf = List.map ((+) 1) >> List.sort
+
     /// CPS のリスト走査。
     /// 1件ずつ `f` に渡し、書き換え結果を積み直して最後に継続 `k` へ渡す。
     /// 継続呼び出しが末尾になるので、リスト長に依存せずスタックは積み上がらない。
@@ -822,6 +1006,7 @@ module internal Plan =
     /// 計画結果は別名の小文字をキーにした Map で返す。
     [<TailCall>]
     let rec private resolveSourcesC
+        (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
         (k: SelectStatement -> Map<string, PlannedQuery> -> Result<'r, DbError>)
         (ctx: ExecContext)
         (stmt: SelectStatement)
@@ -852,7 +1037,9 @@ module internal Plan =
                     plans
             | TableSource.Named r :: rest -> go rest (TableSource.Named r :: done') plans
             | TableSource.Derived(sel, alias) :: rest ->
-                planCoreC
+                planCoreCWith
+                    runner
+                    []
                     (fun plan ->
                         let plan =
                             { plan with
@@ -868,9 +1055,12 @@ module internal Plan =
 
         go sources [] Map.empty
 
-    /// SELECT を計画する（CPS）。実行はしない。
-    /// 派生テーブルはここで再帰的に計画され、実行は外側のオペレータ木が要求したときになる。
-    and [<TailCall>] private planCoreC
+    /// 外側スコープ付きで SELECT を計画する（CPS）。実行はしない。
+    /// `outer` は「この SELECT の外側」のスコープ列（先頭が直近）。
+    /// `runner` は相関サブクエリを外側行ごとに再計画・実行する関数。
+    and [<TailCall>] private planCoreCWith
+        (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
+        (outer: OuterScope list)
         (k: PlannedQuery -> Result<'r, DbError>)
         (ctx: ExecContext)
         (stmt: SelectStatement)
@@ -878,25 +1068,30 @@ module internal Plan =
         let originalItems = stmt.Items
 
         resolveSourcesC
+            runner
             (fun rewritten derived ->
-                resolveSelectC
-                    (fun resolved ->
-                        let sources =
-                            (match resolved.From with
-                             | None -> []
-                             | Some r -> [ sourceRef r ])
-                            @ (resolved.Joins |> List.map (fun j -> sourceRef j.Table))
+                let sources =
+                    (match rewritten.From with
+                     | None -> []
+                     | Some r -> [ sourceRef r ])
+                    @ (rewritten.Joins |> List.map (fun j -> sourceRef j.Table))
 
-                        let duplicate =
-                            sources
-                            |> List.countBy (fun r -> defaultArg r.Alias r.Name)
-                            |> List.tryFind (fun (_, c) -> c > 1)
+                let duplicate =
+                    sources
+                    |> List.countBy (fun r -> defaultArg r.Alias r.Name)
+                    |> List.tryFind (fun (_, c) -> c > 1)
 
-                        match duplicate with
-                        | Some(name, _) -> sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name |> err
-                        | None ->
-                            registerSources ctx derived sources
-                            >>= fun (ctx2, inputSchema) ->
+                match duplicate with
+                | Some(name, _) -> sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name |> err
+                | None ->
+                    registerSources ctx derived sources
+                    >>= fun (ctx2, inputSchema) ->
+                        let scopes = { Schema = inputSchema; Row = None } :: outer
+
+                        resolveSelectC
+                            runner
+                            scopes
+                            (fun resolved ->
                                 Optimizer.buildLogicalWith ctx2 resolved derived
                                 >>= fun tree ->
                                     k
@@ -915,33 +1110,24 @@ module internal Plan =
                                             Context = ctx2
                                             Tree = tree
                                         })
-                    ctx
-                    rewritten)
+                            ctx
+                            rewritten)
             ctx
             stmt
 
     /// サブクエリを解決してから論理木を組んで実行する（CPS）。
+    /// 文の各フィールドを継続の連鎖で解決する。
+    /// フィールドの数は固定なので、この関数自身は再帰しない。
+    /// `scopes` の先頭はこのクエリの入力スキーマ（行は実行時に確定するので None）。
     /// <remarks>
-    /// `planCoreC` / `resolveSourcesC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` は相互再帰する。
+    /// `planCoreCWith` / `resolveSourcesC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` は相互再帰する。
     /// どれも「残りの処理」を継続として受け取り、末尾で呼ぶので、
     /// サブクエリ・派生テーブルの入れ子段数に依存せずスタックは積み上がらない
     /// （Parser の式・SELECT と同じ方針）。
     /// </remarks>
-    and [<TailCall>] private planSelectC
-        (k: (Schema * Op) -> Result<'r, DbError>)
-        (ctx: ExecContext)
-        (stmt: SelectStatement)
-        : Result<'r, DbError> =
-        planCoreC
-            (fun plan ->
-                Optimizer.exec plan.Context plan.Tree plan.Input
-                >>= fun op -> k (plan.Header, op))
-            ctx
-            stmt
-
-    /// 文の各フィールドを継続の連鎖で解決する。
-    /// フィールドの数は固定なので、この関数自身は再帰しない。
     and [<TailCall>] private resolveSelectC
+        (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
+        (scopes: OuterScope list)
         (k: SelectStatement -> Result<'r, DbError>)
         (ctx: ExecContext)
         (stmt: SelectStatement)
@@ -949,19 +1135,20 @@ module internal Plan =
         let resolveOpt v cont =
             match v with
             | None -> cont None
-            | Some e -> resolveExprC (fun e2 -> cont (Some e2)) ctx e
+            | Some e -> resolveExprC runner scopes (fun e2 -> cont (Some e2)) ctx e
 
         let resolveItems =
             traverseC (fun (item: SelectItem) cont ->
-                resolveExprC (fun e -> cont { item with Expression = e }) ctx item.Expression)
+                resolveExprC runner scopes (fun e -> cont { item with Expression = e }) ctx item.Expression)
 
         let resolveJoins =
-            traverseC (fun j cont -> resolveExprC (fun e -> cont { j with On = e }) ctx j.On)
+            traverseC (fun j cont -> resolveExprC runner scopes (fun e -> cont { j with On = e }) ctx j.On)
 
         let resolveSorts =
-            traverseC (fun (s: SortKey) cont -> resolveExprC (fun e -> cont { s with Expression = e }) ctx s.Expression)
+            traverseC (fun (s: SortKey) cont ->
+                resolveExprC runner scopes (fun e -> cont { s with Expression = e }) ctx s.Expression)
 
-        let resolveExprs = traverseC (fun e cont -> resolveExprC cont ctx e)
+        let resolveExprs = traverseC (fun e cont -> resolveExprC runner scopes cont ctx e)
 
         let finish items joins whereE groupBy having orderBy limit offset =
             k
@@ -987,61 +1174,182 @@ module internal Plan =
                                         finish items joins whereE groupBy having orderBy limit offset))))))))
 
     /// 式の中のサブクエリを解決する（CPS）。
-    and private resolveExprC (k: Expr -> Result<'r, DbError>) (ctx: ExecContext) (e: Expr) : Result<'r, DbError> =
-        Expr.rewriteWithC (resolveLeafC ctx) k e
+    and private resolveExprC
+        (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
+        (scopes: OuterScope list)
+        (k: Expr -> Result<'r, DbError>)
+        (ctx: ExecContext)
+        (e: Expr)
+        : Result<'r, DbError> =
+        Expr.rewriteWithC (resolveLeafC runner scopes ctx) k e
 
-    /// 式の葉にあるサブクエリを実行して、値・リテラル・IN リストへ置き換える（CPS）。
-    /// `Expr.rewriteWithC` に渡すので、引数は `ctx -> 式 -> 継続` の順。
+    /// 式の葉にあるサブクエリを解決して、値・リテラル・IN リストへ置き換える（CPS）。
+    /// 外側の行を参照する（相関）サブクエリは、実行時に外側行を受け取る
+    /// `CorrelatedSubquery` へ置き換える。
+    /// `Expr.rewriteWithC` に渡すので、引数は `runner -> scopes -> ctx -> 式 -> 継続` の順。
     and [<TailCall>] private resolveLeafC
+        (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
+        (scopes: OuterScope list)
         (ctx: ExecContext)
         (e: Expr)
         (k: Expr -> Result<'r, DbError>)
         : Result<'r, DbError> =
         let singleColumnMessage count =
-            sprintf "サブクエリは 1 列だけを返す必要があります（%d 列）" count |> DbError.typeError
+            sprintf "サブクエリは 1列だけを返す必要があります（%d 列）" count |> DbError.typeError
+
+        let twoRowsMessage = "スカラーサブクエリが 2行以上を返しました"
 
         match e with
         | Expr.Subquery sel ->
-            planSelectC
-                (fun (schema, op) ->
-                    if schema.Columns.Length <> 1 then
-                        err (singleColumnMessage schema.Columns.Length)
+            planCoreCWith
+                runner
+                scopes
+                (fun plan ->
+                    if plan.Header.Columns.Length <> 1 then
+                        err (singleColumnMessage plan.Header.Columns.Length)
                     else
-                        match Op.next op with
-                        | Error er -> err er
-                        | Ok None -> k (Expr.Literal Literal.Null)
-                        | Ok(Some(row, rest)) ->
-                            match Op.next rest with
-                            | Error er -> err er
-                            | Ok None -> k (Expr.Value row.[0])
-                            | Ok(Some _) -> DbError.constraintViolation "スカラーサブクエリが 2 行以上を返しました" |> err)
+                        match outerRefs plan.Input scopes plan.Tree with
+                        | [] ->
+                            Optimizer.exec plan.Context plan.Tree plan.Input
+                            |> Result.bind (fun op ->
+                                match Op.next op with
+                                | Error er -> err er
+                                | Ok None -> k (Expr.Literal Literal.Null)
+                                | Ok(Some(row, rest)) ->
+                                    match Op.next rest with
+                                    | Error er -> err er
+                                    | Ok None -> k (Expr.Value row.[0])
+                                    | Ok(Some _) -> DbError.constraintViolation twoRowsMessage |> err)
+                        | refs ->
+                            let run row =
+                                let withRow = withCurrentRow row scopes
+
+                                substituteStatement plan.Input withRow sel
+                                |> Result.bind (runner withRow ctx)
+                                |> Result.bind (fun (_, op) ->
+                                    match Op.next op with
+                                    | Error er -> err er
+                                    | Ok None -> ret SqlValue.Null
+                                    | Ok(Some(r, rest)) ->
+                                        match Op.next rest with
+                                        | Error er -> err er
+                                        | Ok None -> ret r.[0]
+                                        | Ok(Some _) -> DbError.constraintViolation twoRowsMessage |> err)
+
+                            k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx
                 sel
         | Expr.Exists sel ->
-            planSelectC
-                (fun (_, op) ->
-                    match Op.next op with
-                    | Error er -> err er
-                    | Ok found -> k (Expr.Literal(Literal.Bool found.IsSome)))
+            planCoreCWith
+                runner
+                scopes
+                (fun plan ->
+                    match outerRefs plan.Input scopes plan.Tree with
+                    | [] ->
+                        Optimizer.exec plan.Context plan.Tree plan.Input
+                        |> Result.bind (fun op ->
+                            match Op.next op with
+                            | Error er -> err er
+                            | Ok found -> k (Expr.Literal(Literal.Bool found.IsSome)))
+                    | refs ->
+                        let run row =
+                            let withRow = withCurrentRow row scopes
+
+                            substituteStatement plan.Input withRow sel
+                            |> Result.bind (runner withRow ctx)
+                            |> Result.bind (fun (_, op) ->
+                                match Op.next op with
+                                | Error er -> err er
+                                | Ok found -> ret (SqlValue.Bool found.IsSome))
+
+                        k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx
                 sel
         | Expr.InSubquery(left, sel, negated) ->
-            planSelectC
-                (fun (schema, op) ->
-                    if schema.Columns.Length <> 1 then
-                        err (singleColumnMessage schema.Columns.Length)
+            planCoreCWith
+                runner
+                scopes
+                (fun plan ->
+                    if plan.Header.Columns.Length <> 1 then
+                        err (singleColumnMessage plan.Header.Columns.Length)
                     else
-                        match collectSubqueryRows op with
-                        | Error er -> err er
-                        | Ok rows ->
-                            let values = rows |> Array.map (fun row -> Expr.Value row.[0]) |> Array.toList
-                            k (Expr.InList(left, values, negated)))
+                        match outerRefs plan.Input scopes plan.Tree with
+                        | [] ->
+                            Optimizer.exec plan.Context plan.Tree plan.Input
+                            |> Result.bind (fun op ->
+                                match collectSubqueryRows op with
+                                | Error er -> err er
+                                | Ok rows ->
+                                    let values = rows |> Array.map (fun row -> Expr.Value row.[0]) |> Array.toList
+                                    k (Expr.InList(left, values, negated)))
+                        | refs ->
+                            let currentSchema =
+                                match scopes with
+                                | s :: _ -> s.Schema
+                                | [] -> Schema.empty
+
+                            let run row =
+                                let withRow = withCurrentRow row scopes
+
+                                substituteStatement plan.Input withRow sel
+                                |> Result.bind (runner withRow ctx)
+                                |> Result.bind (fun (_, op) ->
+                                    collectSubqueryRows op
+                                    |> Result.bind (fun rows ->
+                                        let values = rows |> Array.map (fun r -> Expr.Value r.[0]) |> Array.toList
+                                        Eval.eval currentSchema row (Expr.InList(left, values, negated))))
+
+                            k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx
                 sel
         | other -> k other
 
+    /// サブクエリを解決してから論理木を組んで実行する（CPS）。
+    let private planSelectCWith
+        (outer: OuterScope list)
+        (k: (Schema * Op) -> Result<'r, DbError>)
+        (ctx: ExecContext)
+        (stmt: SelectStatement)
+        (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
+        : Result<'r, DbError> =
+        planCoreCWith
+            runner
+            outer
+            (fun plan ->
+                Optimizer.exec plan.Context plan.Tree plan.Input
+                >>= fun op -> k (plan.Header, op))
+            ctx
+            stmt
+
+    /// 相関サブクエリを外側行ごとに再計画して実行する。
+    /// 外側参照を値へ置換した文を渡すので、ここから先は通常のサブクエリ解決と同じ経路を通る。
+    /// <remarks>
+    /// 入れ子の相関サブクエリも同じ手順で実行するため、自分自身を runner として
+    /// planner に渡す必要があり `let rec` にしている。
+    /// 実際の再帰呼び出しは `Run` の末尾位置（`Result.bind` の継続）で起きるので、
+    /// 外側行が増えてもフレームは積み上がらない。
+    /// TailAudit は「関数値を引数として渡す形」を保守的に非末尾（`bare`）と数えるため、
+    /// ベースラインに 1 件だけ登録している（`StorageEngine.scanAt` の `pull` と同じ既知パターン）。
+    /// </remarks>
+    let rec private runSubquery
+        (outer: OuterScope list)
+        (ctx: ExecContext)
+        (stmt: SelectStatement)
+        : Result<Schema * Op, DbError> =
+        runSubquery |> planSelectCWith outer ret ctx stmt
+
     /// DML（INSERT / UPDATE / DELETE）の式に含まれるサブクエリを解決する。
-    let resolveDmlExpr = resolveExprC ret
+    /// `schema` は行ごとに評価するときの対象行のスキーマ
+    /// （INSERT のように行がない文は `Schema.empty`）。
+    let resolveDmlExprWith (schema: Schema) (ctx: ExecContext) =
+        resolveExprC runSubquery [ { Schema = schema; Row = None } ] ret ctx
+
+    /// DML の式に含まれるサブクエリを解決する（対象行のスキーマなし）。
+    let resolveDmlExpr = resolveDmlExprWith Schema.empty
+
+    /// 外側スコープなしで SELECT を計画・実行する（CPS）。
+    let private planSelectC (k: (Schema * Op) -> Result<'r, DbError>) (ctx: ExecContext) (stmt: SelectStatement) =
+        runSubquery |> planSelectCWith [] k ctx stmt
 
     /// SELECT 文を計画・実行して、結果（列名 + 未消費の Op）を返す。
     /// 行の配列化は呼び出し側（Engine）で行う。

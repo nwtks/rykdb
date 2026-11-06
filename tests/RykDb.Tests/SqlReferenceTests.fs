@@ -1919,6 +1919,10 @@ let ``SqlReference: サブクエリ（スカラー・IN・EXISTS）`` () =
         Assert.Equal<int>(2, nested.Rows.Length)
         Assert.Equal<int64>(2L, asInt nested.Rows.[0].[0])
 
+        // LIMIT / OFFSET の非相関サブクエリは定数へ解決される
+        let _, limited = ok (db2.Execute "SELECT id FROM t ORDER BY id LIMIT (SELECT 2)")
+        Assert.Equal<int>(2, limited.Rows.Length)
+
         // HAVING / JOIN の ON でも使える
         let _, having =
             ok (db2.Execute "SELECT id FROM t GROUP BY id HAVING id > (SELECT MIN(id) FROM t) ORDER BY id")
@@ -1948,6 +1952,162 @@ let ``SqlReference: サブクエリ（スカラー・IN・EXISTS）`` () =
         Assert.Equal<int64>(2L, asInt count.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: 相関サブクエリ`` () =
+    withDb "correlated" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept TEXT, salary INTEGER)"
+
+        let db2 = exec db1 "CREATE TABLE dept (name TEXT PRIMARY KEY, budget INTEGER)"
+        let db3 = exec db2 "INSERT INTO emp VALUES (1,'a',10),(2,'a',20),(3,'b',30)"
+        let db4 = exec db3 "INSERT INTO dept VALUES ('a',0),('b',100)"
+
+        // EXISTS（外側の列を参照）
+        let _, exists =
+            ok (
+                db4.Execute
+                    "SELECT e.id FROM emp AS e WHERE EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > 25) ORDER BY e.id"
+            )
+
+        Assert.Equal<int64 array>([| 3L |], exists.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        // スカラー（外側の値ごとに集約）
+        let _, scalar =
+            ok (
+                db4.Execute
+                    "SELECT d.name, (SELECT MAX(e.salary) FROM emp AS e WHERE e.dept = d.name) AS mx FROM dept AS d ORDER BY d.name"
+            )
+
+        Assert.Equal<int>(2, scalar.Rows.Length)
+        Assert.Equal<string>("a", asText scalar.Rows.[0].[0])
+        Assert.Equal<int64>(20L, asInt scalar.Rows.[0].[1])
+        Assert.Equal<string>("b", asText scalar.Rows.[1].[0])
+        Assert.Equal<int64>(30L, asInt scalar.Rows.[1].[1])
+
+        // IN（外側の行ごとに対象が変わる）
+        let _, inRows =
+            ok (
+                db4.Execute
+                    "SELECT e.id FROM emp AS e WHERE e.salary + 10 IN (SELECT x.salary FROM emp AS x WHERE x.dept = e.dept) ORDER BY e.id"
+            )
+
+        Assert.Equal<int64 array>([| 1L |], inRows.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        // 相関 IN でも NULL は UNKNOWN（どちらも 0 行）
+        let _, nullIn =
+            ok (db4.Execute "SELECT e.id FROM emp AS e WHERE e.id IN (SELECT NULL WHERE e.id = e.id)")
+
+        Assert.Equal<int>(0, nullIn.Rows.Length)
+
+        // 集約クエリの WHERE では相関を使える（集約後ではないため）
+        let _, grouped =
+            ok (
+                db4.Execute
+                    "SELECT dept, COUNT(*) FROM emp AS e WHERE EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > 15) GROUP BY dept ORDER BY dept"
+            )
+
+        Assert.Equal<int>(2, grouped.Rows.Length)
+        Assert.Equal<int64>(2L, asInt grouped.Rows.[0].[1])
+        Assert.Equal<int64>(1L, asInt grouped.Rows.[1].[1])
+
+        // NOT EXISTS（外側の列を参照）
+        let _, notExists =
+            ok (
+                db4.Execute
+                    "SELECT e.id FROM emp AS e WHERE NOT EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > 25) ORDER BY e.id"
+            )
+
+        Assert.Equal<int64 array>([| 1L; 2L |], notExists.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        // 修飾子なしの外側列（内側に無い列は外側へフォールバックする）
+        let _, unqualified =
+            ok (
+                db4.Execute
+                    "SELECT e.id FROM emp AS e WHERE EXISTS (SELECT 1 FROM dept AS d WHERE d.name <> 'x' AND salary > 15) ORDER BY e.id"
+            )
+
+        Assert.Equal<int64 array>([| 2L; 3L |], unqualified.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        // 押し下げ禁止: 相関参照が JOIN の 2 番目のテーブルを指す
+        let _, joined =
+            ok (
+                db4.Execute
+                    "SELECT a.id FROM emp AS a JOIN dept AS b ON b.name = a.dept WHERE EXISTS (SELECT 1 FROM emp AS c WHERE c.salary > b.budget) ORDER BY a.id"
+            )
+
+        Assert.Equal<int64 array>([| 1L; 2L |], joined.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        // 入れ子（内側がさらに内側の外側を参照）
+        let _, nested =
+            ok (
+                db4.Execute
+                    "SELECT d.name FROM dept AS d WHERE EXISTS (SELECT 1 FROM emp AS e WHERE e.dept = d.name AND EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > 25)) ORDER BY d.name"
+            )
+
+        Assert.Equal<string array>([| "b" |], nested.Rows |> Array.map (fun r -> asText r.[0]))
+
+        // 入れ子（内側が 2段上の外側を直接参照）
+        let _, grandparent =
+            ok (
+                db4.Execute
+                    "SELECT d.name FROM dept AS d WHERE EXISTS (SELECT 1 FROM emp AS e WHERE e.dept = d.name AND EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = d.name AND x.salary > 25)) ORDER BY d.name"
+            )
+
+        Assert.Equal<string array>([| "b" |], grandparent.Rows |> Array.map (fun r -> asText r.[0]))
+
+        // ORDER BY でも使える
+        let _, ordered =
+            ok (db4.Execute "SELECT e.id FROM emp AS e ORDER BY (SELECT x.salary FROM emp AS x WHERE x.id = e.id)")
+
+        Assert.Equal<int64 array>([| 1L; 2L; 3L |], ordered.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        // UPDATE の外側の行を参照する
+        let db5 =
+            exec db4 "UPDATE emp SET salary = salary + (SELECT COUNT(*) FROM emp AS x WHERE x.dept = emp.dept)"
+
+        let _, updated = ok (db5.Execute "SELECT id, salary FROM emp ORDER BY id")
+        Assert.Equal<int64>(12L, asInt updated.Rows.[0].[1])
+        Assert.Equal<int64>(22L, asInt updated.Rows.[1].[1])
+        Assert.Equal<int64>(31L, asInt updated.Rows.[2].[1])
+
+        // DELETE の外側の行を参照する
+        let db6 =
+            exec db5 "DELETE FROM emp WHERE salary < (SELECT AVG(x.salary) FROM emp AS x WHERE x.dept = emp.dept)"
+
+        let _, remaining = ok (db6.Execute "SELECT id FROM emp ORDER BY id")
+        Assert.Equal<int64 array>([| 2L; 3L |], remaining.Rows |> Array.map (fun r -> asInt r.[0])))
+
+[<Fact>]
+let ``SqlReference: 相関サブクエリの未対応形`` () =
+    withDb "correlated-errors" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20)"
+
+        // LIMIT / OFFSET は外側の行を持たない
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "LIMIT の相関サブクエリ"
+            (db2.Execute "SELECT id FROM t AS o LIMIT (SELECT o.id FROM t AS x)")
+
+        // 集約後の SELECT / HAVING / ORDER BY も外側の行を持たない
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "集約クエリの SELECT の相関サブクエリ"
+            (db2.Execute "SELECT (SELECT MAX(x.v) FROM t AS x WHERE x.v = o.v) FROM t AS o GROUP BY o.id")
+
+        // 相関スカラーが外側行ごとに 2 行以上を返す
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "相関スカラーが 2 行以上"
+            (db2.Execute "SELECT (SELECT x.v FROM t AS x WHERE x.id >= o.id) FROM t AS o")
+
+        // 後から JOIN するテーブルを ON から参照すると NameError（範囲外アクセスにしない）
+        expectErrorKind
+            ErrorKind.NameError
+            "後続 JOIN の相関参照"
+            (db2.Execute
+                "SELECT a.id FROM t AS a JOIN t AS b ON EXISTS (SELECT 1 FROM t AS x WHERE x.id = d.id) JOIN t AS d ON d.id = a.id"))
+
+[<Fact>]
 let ``SqlReference: サブクエリの未対応形とエラー`` () =
     withDb "subquery-errors" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -1969,12 +2129,6 @@ let ``SqlReference: サブクエリの未対応形とエラー`` () =
             ErrorKind.TypeError
             "2 列の IN サブクエリ"
             (db2.Execute "SELECT id FROM t WHERE id IN (SELECT id, v FROM t)")
-
-        // 相関サブクエリは未対応（外側の列は解決できない）
-        expectErrorKind
-            ErrorKind.NameError
-            "相関サブクエリ"
-            (db2.Execute "SELECT id FROM t AS o WHERE EXISTS (SELECT 1 FROM t WHERE t.id = o.id)")
 
         // 派生テーブルは §7.10 で対応。別名が無いと SyntaxError。
         expectErrorKind ErrorKind.SyntaxError "派生テーブルの別名" (db2.Execute "SELECT id FROM (SELECT id FROM t)")

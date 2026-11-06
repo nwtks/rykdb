@@ -143,6 +143,17 @@ type internal SortDirection =
     | Ascending
     | Descending
 
+/// 相関サブクエリの実行時評価器。
+/// 外側の行を受け取り、外側参照をその行の値で束縛して実行した結果を返す。
+type internal CorrelatedSubquery =
+    {
+        /// 外側の行（深さ 1）を受け取ってサブクエリの結果を返す。
+        Run: SqlValue array -> Result<SqlValue, DbError>
+        /// 依存する外側スコープの深さ（1 = 直近の外側行、2 = その外側 …）。
+        /// 式を含むクエリより外側への依存だけを、そのクエリの相関として数える。
+        Depths: int list
+    }
+
 /// 式。
 /// 束縛後は列参照が解決済みになる。
 [<RequireQualifiedAccess; NoComparison; NoEquality>]
@@ -195,6 +206,10 @@ type internal Expr =
     /// `x [NOT] IN (SELECT ...)`。
     /// 実行計画の段階で IN の要素リストへ展開される。
     | InSubquery of Expr * SelectStatement * bool
+    /// 相関サブクエリの実行時評価器。
+    /// 計画時に外側参照を検出したときだけ現れる
+    /// （外側参照のないサブクエリは計画時に値へ置換される）。
+    | CorrelatedSubquery of CorrelatedSubquery
 
 and internal JoinClause =
     {
@@ -327,7 +342,8 @@ module internal Expr =
         | Expr.QualifiedStar _
         | Expr.Value _
         | Expr.Subquery _
-        | Expr.Exists _ -> []
+        | Expr.Exists _
+        | Expr.CorrelatedSubquery _ -> []
         | Expr.Unary(_, x) -> [ x ]
         | Expr.Binary(_, a, b) -> [ a; b ]
         | Expr.IsNull(x, _) -> [ x ]
@@ -400,6 +416,7 @@ module internal Expr =
                 | Expr.Value _, [] -> ret e
                 | Expr.Subquery _, [] -> ret e
                 | Expr.Exists _, [] -> ret e
+                | Expr.CorrelatedSubquery _, [] -> ret e
                 | Expr.InSubquery(_, sel, neg), [ x ] -> ret (Expr.InSubquery(x, sel, neg))
                 | Expr.Unary(op, _), [ x ] -> ret (Expr.Unary(op, x))
                 | Expr.Binary(op, _, _), [ a; b ] -> ret (Expr.Binary(op, a, b))
@@ -498,6 +515,17 @@ module internal Expr =
                 found
                 || match e with
                    | Expr.AggCall _ -> true
+                   | _ -> false)
+            false
+
+    /// 式に相関サブクエリが含まれるか。
+    /// WHERE の押し下げや、行の形が変わる位置での拒否判定に使う。
+    let hasCorrelated =
+        fold
+            (fun found e ->
+                found
+                || match e with
+                   | Expr.CorrelatedSubquery _ -> true
                    | _ -> false)
             false
 
@@ -643,6 +671,9 @@ module internal Expr =
                     writeSteps next
                 | Expr.Exists _ ->
                     put "EXISTS (subquery)"
+                    writeSteps next
+                | Expr.CorrelatedSubquery _ ->
+                    put "(subquery)"
                     writeSteps next
                 | Expr.InSubquery(x, _, neg) ->
                     put "("

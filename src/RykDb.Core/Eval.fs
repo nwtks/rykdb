@@ -518,6 +518,10 @@ module internal Eval =
             | Expr.Subquery _
             | Expr.Exists _
             | Expr.InSubquery _ -> err (DbError.create ErrorKind.SyntaxError "サブクエリはここでは使えません")
+            | Expr.CorrelatedSubquery c ->
+                match c.Run row with
+                | Error er -> err er
+                | Ok v -> step schema row kont (Arrive v)
             | Expr.Column c ->
                 match Schema.resolve schema c with
                 | Error er -> err er

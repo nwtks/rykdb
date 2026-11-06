@@ -43,10 +43,11 @@ src/RykDb.Core/Parser.fs|parseExprC/parseExprListElemC/parseExprListToParen/pars
 src/RykDb.Core/Parser.fs|parseExprC/parseExprListElemC/parseExprListToParen/parseCallBodyC/parseCastC/parseNamedPrimaryC/parseCaseBranches/parseCaseTailC/parseCaseC/parsePrimaryC/parseUnaryC/parseMultiplicativeLoop/parseMultiplicativeC/parseAdditiveLoop/parseAdditiveC/parseBetweenAndC/parseBetweenBodyC/parseInListBodyElemC/parseInListBodyLoop/parseInBodyC/parseLikeEscape/parsePredicateTail/parsePredicateC/parseNotC/parseAndLoop/parseAndC/parseOrLoop/parseOrC/parseSelectItemC/parseSelectItemsC/parseSourceC/parseJoinsC/parseWhereC/parseGroupByItemsC/parseGroupByC/parseHavingC/parseOrderByItemsC/parseOrderByC/parseLimitOffsetC/parseSelectTailC/parseSelectStatementC|parseSourceC|call
 src/RykDb.Core/Parser.fs|parseExprC/parseExprListElemC/parseExprListToParen/parseCallBodyC/parseCastC/parseNamedPrimaryC/parseCaseBranches/parseCaseTailC/parseCaseC/parsePrimaryC/parseUnaryC/parseMultiplicativeLoop/parseMultiplicativeC/parseAdditiveLoop/parseAdditiveC/parseBetweenAndC/parseBetweenBodyC/parseInListBodyElemC/parseInListBodyLoop/parseInBodyC/parseLikeEscape/parsePredicateTail/parsePredicateC/parseNotC/parseAndLoop/parseAndC/parseOrLoop/parseOrC/parseSelectItemC/parseSelectItemsC/parseSourceC/parseJoinsC/parseWhereC/parseGroupByItemsC/parseGroupByC/parseHavingC/parseOrderByItemsC/parseOrderByC/parseLimitOffsetC/parseSelectTailC/parseSelectStatementC|parseWhereC|call
 src/RykDb.Core/Planner.fs|go|go|call
-src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreC/planSelectC/resolveSelectC/resolveExprC/resolveLeafC|planCoreC|call
-src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreC/planSelectC/resolveSelectC/resolveExprC/resolveLeafC|resolveExprC|call
-src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreC/planSelectC/resolveSelectC/resolveExprC/resolveLeafC|resolveLeafC|call
-src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreC/planSelectC/resolveSelectC/resolveExprC/resolveLeafC|resolveSelectC|call
+src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreCWith/resolveSelectC/resolveExprC/resolveLeafC|planCoreCWith|call
+src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreCWith/resolveSelectC/resolveExprC/resolveLeafC|resolveExprC|call
+src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreCWith/resolveSelectC/resolveExprC/resolveLeafC|resolveLeafC|call
+src/RykDb.Core/Planner.fs|resolveSourcesC/planCoreCWith/resolveSelectC/resolveExprC/resolveLeafC|resolveSelectC|call
+src/RykDb.Core/Planner.fs|runSubquery|runSubquery|bare
 src/RykDb.Core/Planner.fs|traverseC|traverseC|call
 src/RykDb.Core/RowStore.fs|loop|loop|call
 src/RykDb.Core/Sstable.fs|loop|loop|call

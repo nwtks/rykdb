@@ -362,7 +362,7 @@ flowchart LR
 
 #### サブクエリの解決（`Plan.planSelectC`）
 
-式の中のサブクエリは、論理代数を組む前に **1回だけ実行して定数へ置き換える**。
+式の中のサブクエリは、原則として論理代数を組む前に **1回だけ実行して定数へ置き換える**。
 `Plan.planSelectC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` が相互再帰し、
 サブクエリも同じ `ExecContext`（同じ snapshot / transaction）で実行する。
 
@@ -371,19 +371,36 @@ flowchart LR
 - `IN (SELECT ...)` — 1列の値を `Expr.InList` へ展開する
   （`NULL` の 3値論理は `Eval` がそのまま扱う）。
 - `EXISTS (SELECT ...)` — `Op.next` を 1回だけ呼んで真偽値にする。
-- 相関参照は外側のテーブルを登録しないため `NameError`（未対応）。
+- **相関サブクエリ**（外側の列を参照するもの）は、外側行を受け取る
+  `Expr.CorrelatedSubquery`（`Run : SqlValue array -> Result<SqlValue, DbError>`）へ置き換える。
+  外側クエリの入力スキーマをスコープ列として `resolveSelectC` まで引き回し、
+  内側で解決できない列参照が外側スコープに一致したら相関と判定する
+  （内側に同名のテーブルがある場合は標準どおり内側が優先）。
+  実行時は外側の行の値で参照を `Expr.Value` へ置換し、
+  内側の SELECT を外側行ごとに再計画・実行する（`runSubquery`）。
+- 相関サブクエリの `Depths` は依存する外側スコープの深さ（1 = 直近）を持ち、
+  入れ子の相関を外側クエリの相関として引き継ぐ。
+- 相関参照を含む述語は **WHERE の押し下げ対象から外す**
+  （子スコープの行で評価すると列位置が変わるため。`Expr.hasCorrelated` で判定）。
+- 集約後の行を読む位置（集約クエリの `SELECT` / `HAVING` / `ORDER BY`）と
+  `LIMIT` / `OFFSET` は外側行を持たないため、相関サブクエリを置くと `SyntaxError`。
+  派生テーブル（LATERAL）も未対応。
 - FROM / JOIN のサブクエリ（派生テーブル）は次の「派生テーブル」節で扱う。
 - ヘッダだけは解決前の式から作る（解決後は値になり列名が `30` のようになってしまうため）。
-- DML の値式・`WHERE` は `Engine` が `Plan.resolveDmlExpr` で同様に解決する。
+- DML の値式・`WHERE` は `Engine` が `Plan.resolveDmlExprWith` で同様に解決する
+  （UPDATE / DELETE は対象行のスキーマを渡すので、外側行を参照できる）。
 
 この相互再帰は **CPS**（継続を引数で受け取り、末尾で呼ぶ）にしてある。
 式の走査は `Expr.rewriteWithC`（葉の書き換えが継続を取る版）が明示スタックで回し、
 葉（サブクエリ）の解決が終わったら継続を末尾で呼ぶので、
 入れ子段数に依存せずスタックは積み上がらない（`Expr.rewriteWith` はその糖）。
 リスト（項目 / JOIN / GROUP BY / ORDER BY）は `traverseC` が 1件ずつ継続で回す。
+相関サブクエリの再実行は `planSelectCWith` に渡す `runSubquery`（外側行ごとの計画・実行）が担う。
 サブクエリの入れ子は Parser の `MaxExpressionDepth`
 （1段で複数単位を消費する。実測: 90段は実行でき、150段は `式の入れ子が深すぎます`）によっても制限される。
-回帰テスト: `SqlReference: 深いサブクエリの入れ子（上限内）は実行できる` /
+回帰テスト: `SqlReference: 相関サブクエリ` /
+`SqlReference: 相関サブクエリの未対応形` /
+`SqlReference: 深いサブクエリの入れ子（上限内）は実行できる` /
 `末尾再帰: 深いサブクエリの入れ子もエラーになる（StackOverflow ではない）`。
 
 #### 派生テーブル（FROM / JOIN のサブクエリ）
@@ -392,8 +409,8 @@ flowchart LR
 計画時に結果を作らない。
 
 - Parser は `TableSource.Derived(SelectStatement, alias)` を作る（**別名必須**）。
-- `Plan.resolveSourcesC` が FROM / JOIN の `Derived` を `Plan.planCoreC` で計画する。
-  `planCoreC` は論理木までで止め、`PlannedQuery`（`Output` / `Header` / `Input` / `Context` / `Tree`）を返す。
+- `Plan.resolveSourcesC` が FROM / JOIN の `Derived` を `Plan.planCoreCWith` で計画する。
+  `planCoreCWith` は論理木までで止め、`PlannedQuery`（`Output` / `Header` / `Input` / `Context` / `Tree`）を返す。
   AST は実テーブル参照（別名）へ書き換え、
   計画結果は別名をキーにした Map で `Optimizer.buildLogicalWith` へ渡す。
 - `Optimizer.buildLogicalWith` は派生の束縛を `Logical.Derived` にする。
@@ -1526,6 +1543,9 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   （両入力がキー順に走査できる等値結合はマージ結合で流す）。
 - **最終結果は `Op.toArray` で配列化する**
   （`Engine.runSelect` が行う。`Plan.runSelect` の戻り値は列名と未消費の `Op`）。
+- **相関サブクエリは外側行ごとに内側を再計画・実行する**（入れ子ループ）。
+  外側行数 × 内側の走査コストがかかる。
+  集約後の `SELECT` / `HAVING` / `ORDER BY`、`LIMIT` / `OFFSET`、派生テーブル（LATERAL）では使えない。
 - **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件に限る**（下限のある条件のみ）。
   `>` / `<` / `BETWEEN` / `LIKE` のうち、`LIKE` は索引を要求しない。
 - **ORDER BY のソート省略は単一テーブル・主キー全列の昇順だけ**。
