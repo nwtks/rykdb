@@ -177,14 +177,13 @@ module internal Optimizer =
             && not (Binder.hasAmbiguousColumn allSchema p)
             && bindings |> List.exists (fun b -> Binder.referencesOnly (bindingName b) p)
 
-        let applyAggregate schema stmt tree =
+        let aggregateTree schema stmt tree =
             let aliases = Alias.dropCyclic (Alias.ofItems stmt.Items)
 
             let selectExprs =
                 stmt.Items
                 |> List.map (fun item -> item.Expression)
-                |> List.filter (fun e ->
-                    match e with
+                |> List.filter (function
                     | Expr.Star -> false
                     | Expr.QualifiedStar _ -> false
                     | _ -> true)
@@ -252,7 +251,7 @@ module internal Optimizer =
                         |> err
                 elif not (hasAgg || hasGroupBy) then
                     match having with
-                    | Some _ -> return! DbError.create ErrorKind.SyntaxError "HAVING には GROUP BY か集約関数が必要です" |> err
+                    | Some _ -> return! "HAVING には GROUP BY か集約関数が必要です" |> DbError.create ErrorKind.SyntaxError |> err
                     | None -> return tree
                 else
                     let aggNode = Logical.Aggregate(groupBy, allAggs, tree)
@@ -261,6 +260,18 @@ module internal Optimizer =
                     | None -> return aggNode
                     | Some hv -> return Logical.Having(hv, allAggs, groupBy, aggNode)
             }
+
+        let applyAggregate schema stmt tree =
+            let hasAggregateOrGroup =
+                not (List.isEmpty stmt.GroupBy)
+                || stmt.Having.IsSome
+                || stmt.Items |> List.exists (fun item -> Expr.isAggregate item.Expression)
+                || stmt.OrderBy |> List.exists (fun k -> Expr.isAggregate k.Expression)
+
+            if not hasAggregateOrGroup then
+                ret tree
+            else
+                aggregateTree schema stmt tree
 
         let expandItem schema item =
             match item.Expression with
@@ -1011,8 +1022,6 @@ module internal Plan =
         (ctx: ExecContext)
         (stmt: SelectStatement)
         : Result<'r, DbError> =
-        let sources = (stmt.From |> Option.toList) @ (stmt.Joins |> List.map _.Table)
-
         let rec go pending done' plans =
             match pending with
             | [] ->
@@ -1053,7 +1062,21 @@ module internal Plan =
                     ctx
                     sel
 
-        go sources [] Map.empty
+        let hasDerived =
+            (match stmt.From with
+             | Some(TableSource.Derived _) -> true
+             | _ -> false)
+            || (stmt.Joins
+                |> List.exists (fun j ->
+                    match j.Table with
+                    | TableSource.Derived _ -> true
+                    | _ -> false))
+
+        if not hasDerived then
+            k stmt Map.empty
+        else
+            let sources = (stmt.From |> Option.toList) @ (stmt.Joins |> List.map _.Table)
+            go sources [] Map.empty
 
     /// 外側スコープ付きで SELECT を計画する（CPS）。実行はしない。
     /// `outer` は「この SELECT の外側」のスコープ列（先頭が直近）。
@@ -1163,15 +1186,28 @@ module internal Plan =
                     Offset = offset
                 }
 
-        resolveItems stmt.Items [] (fun items ->
-            resolveJoins stmt.Joins [] (fun joins ->
-                resolveOpt stmt.Where (fun whereE ->
-                    resolveExprs stmt.GroupBy [] (fun groupBy ->
-                        resolveOpt stmt.Having (fun having ->
-                            resolveSorts stmt.OrderBy [] (fun orderBy ->
-                                resolveOpt stmt.Limit (fun limit ->
-                                    resolveOpt stmt.Offset (fun offset ->
-                                        finish items joins whereE groupBy having orderBy limit offset))))))))
+        let hasSubquery =
+            (stmt.Items |> List.exists (fun item -> Expr.hasSubquery item.Expression))
+            || (stmt.Joins |> List.exists (fun j -> Expr.hasSubquery j.On))
+            || (stmt.Where |> Option.exists Expr.hasSubquery)
+            || (stmt.GroupBy |> List.exists Expr.hasSubquery)
+            || (stmt.Having |> Option.exists Expr.hasSubquery)
+            || (stmt.OrderBy |> List.exists (fun k -> Expr.hasSubquery k.Expression))
+            || (stmt.Limit |> Option.exists Expr.hasSubquery)
+            || (stmt.Offset |> Option.exists Expr.hasSubquery)
+
+        if not hasSubquery then
+            k stmt
+        else
+            resolveItems stmt.Items [] (fun items ->
+                resolveJoins stmt.Joins [] (fun joins ->
+                    resolveOpt stmt.Where (fun whereE ->
+                        resolveExprs stmt.GroupBy [] (fun groupBy ->
+                            resolveOpt stmt.Having (fun having ->
+                                resolveSorts stmt.OrderBy [] (fun orderBy ->
+                                    resolveOpt stmt.Limit (fun limit ->
+                                        resolveOpt stmt.Offset (fun offset ->
+                                            finish items joins whereE groupBy having orderBy limit offset))))))))
 
     /// 式の中のサブクエリを解決する（CPS）。
     and private resolveExprC
@@ -1181,7 +1217,10 @@ module internal Plan =
         (ctx: ExecContext)
         (e: Expr)
         : Result<'r, DbError> =
-        Expr.rewriteWithC (resolveLeafC runner scopes ctx) k e
+        if Expr.hasSubquery e then
+            Expr.rewriteWithC (resolveLeafC runner scopes ctx) k e
+        else
+            k e
 
     /// 式の葉にあるサブクエリを解決して、値・リテラル・IN リストへ置き換える（CPS）。
     /// 外側の行を参照する（相関）サブクエリは、実行時に外側行を受け取る

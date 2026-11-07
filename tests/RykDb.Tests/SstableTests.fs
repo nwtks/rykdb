@@ -168,6 +168,27 @@ let ``SstScan.toArray: empty は空配列`` () =
     Assert.Equal(0, arr.Length)
 
 [<Fact>]
+let ``SstScan.filter: 述語を満たすエントリだけ返す`` () =
+    let entries = sstEntries 20
+    let scan = SstScan.ofSeq entries |> SstScan.filter (fun e -> e.SeqNo % 2UL = 0UL)
+    let got = ok (SstScan.toArray scan)
+    let expected = entries |> Array.filter (fun e -> e.SeqNo % 2UL = 0UL)
+    Assert.Equal<SstEntry array>(expected, got)
+
+[<Fact>]
+let ``SstScan.filter: 入れ子のフィルタは両方適用される`` () =
+    let entries = sstEntries 30
+
+    let scan =
+        SstScan.ofSeq entries
+        |> SstScan.filter (fun e -> e.SeqNo >= 5UL)
+        |> SstScan.filter (fun e -> e.SeqNo < 15UL)
+
+    let got = ok (SstScan.toArray scan)
+    let expected = entries |> Array.filter (fun e -> e.SeqNo >= 5UL && e.SeqNo < 15UL)
+    Assert.Equal<SstEntry array>(expected, got)
+
+[<Fact>]
 let ``SSTable: maxSeqNo が保存・復元される`` () =
     let entries =
         [|

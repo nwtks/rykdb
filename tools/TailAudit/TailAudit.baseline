@@ -53,5 +53,5 @@ src/RykDb.Core/RowStore.fs|loop|loop|call
 src/RykDb.Core/Sstable.fs|loop|loop|call
 src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|loadBlock|call
 src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|scanEntries|call
-src/RykDb.Core/StorageEngine.fs|next|next|call
 src/RykDb.Core/StorageEngine.fs|pull|pull|bare
+src/RykDb.Core/StorageEngine.fs|stepObj|stepObj|bare

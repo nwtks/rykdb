@@ -182,13 +182,13 @@ module internal DmlOps =
             |> all
             |> Result.map (fun positions -> positions |> List.map (fun i -> row.[i]) |> List.toArray)
 
-        let rec check txn row pk indexes =
-            match indexes with
-            | [] -> ret ()
+        let rec check txn row pk pkBytes =
+            function
+            | [] -> ret pkBytes
             | idx :: rest ->
                 match indexValues idx row with
                 | Error e -> err e
-                | Ok values when values |> Array.exists SqlValue.isNull -> check txn row pk rest
+                | Ok values when values |> Array.exists SqlValue.isNull -> check txn row pk pkBytes rest
                 | Ok values ->
                     match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx values 1 ctx.Visible txn with
                     | Error e -> err e
@@ -204,15 +204,16 @@ module internal DmlOps =
                             then
                                 err (sprintf "UNIQUE 制約に違反: %s" idx.Name |> DbError.constraintViolation)
                             else
-                                check txn row pk rest
+                                check txn row pk pkBytes rest
 
         let checkUnique txn row =
             let pk = TableSchema.primaryKeyOf schema row
+            let pkBytes = KeyBuilder.ofValues pk
 
-            match Dml.getByPrimaryKeyWithTxn ctx.Store schema pk ctx.Visible txn with
+            match Dml.getByPrimaryKeyBytesWithTxn ctx.Store schema pkBytes ctx.Visible txn with
             | Error e -> err e
             | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
-            | Ok None -> check txn row pk (schema.Indexes |> List.filter _.Unique)
+            | Ok None -> check txn row pk pkBytes (schema.Indexes |> List.filter _.Unique)
 
         let evalDefault i =
             let col = schema.Columns.[i]
@@ -269,8 +270,8 @@ module internal DmlOps =
                     |> all
                     |> Result.map List.toArray
 
-                do! checkUnique ctx.Txn row
-                let! t = Dml.insert ctx.Txn schema row
+                let! pkBytes = checkUnique ctx.Txn row
+                let! t = Dml.insertWithKey pkBytes ctx.Txn schema row
                 return t, 1
             | _ ->
                 let! defaultValues =
@@ -290,8 +291,8 @@ module internal DmlOps =
                         (fun (txnAcc, count) values ->
                             result {
                                 let! row = buildRow schema.Columns.Length idxs defaults values
-                                do! checkUnique txnAcc row
-                                let! t = Dml.insert txnAcc schema row
+                                let! pkBytes = checkUnique txnAcc row
+                                let! t = Dml.insertWithKey pkBytes txnAcc schema row
                                 return t, count + 1
                             })
                         (ctx.Txn, 0)

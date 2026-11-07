@@ -140,10 +140,13 @@ module internal Dml =
             Op.Compute(fun () ->
                 let rec pull current =
                     match SstScan.next current with
-                    | Error e -> err e
+                    | Error e ->
+                        SstScan.dispose current
+                        err e
                     | Ok None -> ret None
                     | Ok(Some(e, rest)) ->
                         if not (take e) then
+                            SstScan.dispose rest
                             ret None
                         else
                             match e.Value with
@@ -157,20 +160,21 @@ module internal Dml =
 
         emit scan
 
-    /// 主キーで既存行を取り出す（txn の書き込みを含む）。
-    let getByPrimaryKeyWithTxn
+    /// 符号化済みの主キーで既存行を取り出す（txn の書き込みを含む）。
+    let getByPrimaryKeyBytesWithTxn
         (store: RowStore)
         (schema: TableSchema)
-        (key: SqlValue array)
+        (key: byte array)
         (visible: uint64 option)
         (txn: Transaction)
         =
-        let getByPrimaryKey key =
-            RowStore.getAt (tableSpace schema) (KeyBuilder.ofValues key) visible store
-
-        match Transaction.tryFind (tableSpace schema) (KeyBuilder.ofValues key) txn with
+        match Transaction.tryFind (tableSpace schema) key txn with
         | Some slot -> ret slot
-        | None -> getByPrimaryKey key
+        | None -> RowStore.getAt (tableSpace schema) key visible store
+
+    /// 主キーで既存行を取り出す（txn の書き込みを含む）。
+    let getByPrimaryKeyWithTxn (store: RowStore) (schema: TableSchema) (key: SqlValue array) =
+        getByPrimaryKeyBytesWithTxn store schema (KeyBuilder.ofValues key)
 
     /// 主キーで prefix 走査する（キー昇順）。
     /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
@@ -289,24 +293,37 @@ module internal Dml =
 
     /// 1行を transaction に積む（まだ DB には入らない）。
     /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。
-    let insert (txn: Transaction) (schema: TableSchema) (row: SqlValue array) =
+    let private insertCore
+        (checkPrimaryKey: bool)
+        (key: byte array)
+        (txn: Transaction)
+        (schema: TableSchema)
+        (row: SqlValue array)
+        =
         result {
             do! TableSchema.validateRow schema row
             let tks = tableSpace schema
-            let pk = RowKey.primary schema row
 
-            match Transaction.tryFind tks pk txn with
-            | Some(Some _) ->
-                return!
-                    sprintf "PRIMARY KEY 制約に違反: %s" schema.Name
-                    |> DbError.constraintViolation
-                    |> err
-            | _ -> ()
+            if checkPrimaryKey then
+                match Transaction.tryFind tks key txn with
+                | Some(Some _) ->
+                    return!
+                        sprintf "PRIMARY KEY 制約に違反: %s" schema.Name
+                        |> DbError.constraintViolation
+                        |> err
+                | _ -> ()
 
-            let next = Transaction.put tks pk row txn
+            let next = Transaction.put tks key row txn
             let! changed = applyIndexChange next schema None (Some row)
             return! Transaction.checkLimit changed
         }
+
+    let insert (txn: Transaction) (schema: TableSchema) (row: SqlValue array) =
+        insertCore true (RowKey.primary schema row) txn schema row
+
+    /// 主キーの存在確認と符号化を済ませた行を積む。
+    /// `DmlOps.insert` が制約検査で作ったキーをそのまま使い、二重の検索・符号化を避ける。
+    let insertWithKey = insertCore false
 
     /// 走査済みの行をそのまま使って更新する（主キー検索をやり直さない）。
     /// 主キーは変更できない（DELETE + INSERT を使う）。

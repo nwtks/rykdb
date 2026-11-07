@@ -699,7 +699,7 @@ module internal Parser =
                     | Ok(alias, st) -> k { Expression = e; Alias = alias } st)
                 st
 
-    and [<TailCall>] private parseSelectItemsC<'r>
+    and private parseSelectItemsC<'r>
         (acc: SelectItem list)
         (k: SelectItem list -> PState -> Result<'r, DbError>)
         (st: PState)
@@ -786,7 +786,7 @@ module internal Parser =
         else
             k None st
 
-    and [<TailCall>] private parseGroupByItemsC<'r>
+    and private parseGroupByItemsC<'r>
         (acc: Expr list)
         (k: Expr list -> PState -> Result<'r, DbError>)
         (st: PState)
@@ -820,7 +820,7 @@ module internal Parser =
         else
             k None st
 
-    and [<TailCall>] private parseOrderByItemsC<'r>
+    and private parseOrderByItemsC<'r>
         (acc: SortKey list)
         (k: SortKey list -> PState -> Result<'r, DbError>)
         (st: PState)
@@ -855,7 +855,7 @@ module internal Parser =
         else
             k acc st
 
-    and [<TailCall>] private parseLimitOffsetC<'r>
+    and private parseLimitOffsetC<'r>
         (k: (Expr option * Expr option) -> PState -> Result<'r, DbError>)
         (st: PState)
         : Result<'r, DbError> =
@@ -962,8 +962,35 @@ module internal Parser =
         }
 
     let private parseInsert (st: PState) =
+        let simpleLiteral st =
+            let nextEnds =
+                st.Pos + 1 < st.Tokens.Length
+                && match st.Tokens.[st.Pos + 1].Token with
+                   | Token.Symbol ","
+                   | Token.Symbol ")" -> true
+                   | _ -> false
+
+            if not nextEnds then
+                None
+            else
+                match peek st with
+                | Token.IntLit v -> Some(Expr.Literal(Literal.Int v), advance st)
+                | Token.RealLit v -> Some(Expr.Literal(Literal.Real v), advance st)
+                | Token.StringLit v -> Some(Expr.Literal(Literal.String v), advance st)
+                | Token.BlobLit v -> Some(Expr.Literal(Literal.Blob v), advance st)
+                | Token.Keyword "NULL" -> Some(Expr.Literal Literal.Null, advance st)
+                | Token.Keyword "TRUE" -> Some(Expr.Literal(Literal.Bool true), advance st)
+                | Token.Keyword "FALSE" -> Some(Expr.Literal(Literal.Bool false), advance st)
+                | Token.Keyword "DEFAULT" -> Some(Expr.Default, advance st)
+                | _ -> None
+
         let rec one acc st =
-            match parseExprC retE st with
+            let parsed =
+                match simpleLiteral st with
+                | Some e -> Ok e
+                | None -> parseExprC retE st
+
+            match parsed with
             | Error e -> err e
             | Ok(e, st) ->
                 if isSymbol "," st then

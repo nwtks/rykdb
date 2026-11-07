@@ -177,11 +177,17 @@ module internal Compaction =
                 else
                     keepOlder newest tail kept (dropped + 1) keptVisible
 
-        let gcGroup dropTombstones older newest =
-            let keptOlder, dropped = keepOlder newest older [] 0 false
-            let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty keptOlder)
-            let kept = if keepNewest then newest :: keptOlder else keptOlder
-            kept, dropped, (if keepNewest then 0 else 1)
+        let gcGroup dropTombstones older (newest: SstEntry) =
+            match older with
+            | [] ->
+                let keepNewest = not (newest.IsDelete && dropTombstones)
+                (if keepNewest then [ newest ] else []), 0, (if keepNewest then 0 else 1)
+            | _ when activeSnapshot = 0UL -> newest :: older, 0, 0
+            | _ ->
+                let keptOlder, dropped = keepOlder newest older [] 0 false
+                let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty keptOlder)
+                let kept = if keepNewest then newest :: keptOlder else keptOlder
+                kept, dropped, (if keepNewest then 0 else 1)
 
         let rec gather newest m acc =
             match SstMerge.top m with
@@ -250,7 +256,7 @@ module internal Compaction =
                     finish plan allInputs added droppedVersions droppedTombstones)
             | Ok(Some(kept, dropped, tombstones, rest)) ->
                 let keptBytes = kept |> List.sumBy (fun e -> int64 (SstEntry.approximateBytes e))
-                let chunk' = List.rev kept @ chunk
+                let chunk' = List.fold (fun acc item -> item :: acc) chunk kept
 
                 if
                     not (List.isEmpty chunk)

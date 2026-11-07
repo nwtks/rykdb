@@ -82,7 +82,9 @@ module internal FileMetaData =
                         target,
                         System.IO.FileMode.Create,
                         System.IO.FileAccess.Write,
-                        System.IO.FileShare.None
+                        System.IO.FileShare.None,
+                        64 * 1024,
+                        System.IO.FileOptions.SequentialScan
                     )
 
                 Sstable.writeTo fs bloomFalsePositiveRate entries

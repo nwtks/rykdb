@@ -529,6 +529,20 @@ module internal Expr =
                    | _ -> false)
             false
 
+    /// 式に未解決のサブクエリが含まれるか。
+    /// 含まれない式はサブクエリ解決で書き換える必要がないため、
+    /// 計画時の AST 再構築を省略する判定に使う。
+    let hasSubquery =
+        fold
+            (fun found e ->
+                found
+                || match e with
+                   | Expr.Subquery _
+                   | Expr.Exists _
+                   | Expr.InSubquery _ -> true
+                   | _ -> false)
+            false
+
     /// Expr.toDisplayString が使う出力項目。
     /// Sub の closer を先に与えておくことで、式の出力が終わってから
     /// 閉じ括弧などを出力する順序を、末尾再帰のまま表現できる。

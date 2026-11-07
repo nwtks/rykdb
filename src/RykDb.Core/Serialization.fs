@@ -4,65 +4,125 @@ namespace RykDb.Core
 // decimal の再構築はこの形が唯一素直なので範囲を限定して抑制する。
 #nowarn "760"
 
+/// Writer のチャンク。
+/// 1バイト・固定長整数を配列にせず値のまま保持し、
+/// 最後の `toArray` で 1本の配列へ書き込む。
+type internal WriterChunk =
+    | Bytes of byte array
+    | Slice of byte array * int * int
+    | Byte of byte
+    | UInt64LE of uint64
+    | UInt64BE of uint64
+    | UInt32LE of uint32
+    | Varint of uint64
+
 /// 書き出し: Writer
 /// 可変バッファではなく「不変のチャンク列」で表現する。
 /// 追加操作は新しい Writer を返すので、途中で失敗しても中途半端な状態は残らない。
 /// 最後に一度だけ配列へ平坦化する。
-type internal Writer = { Chunks: byte array list }
+type internal Writer = { Chunks: WriterChunk list }
 
 module internal Writer =
     let Empty = { Chunks = [] }
 
-    let private add (b: byte array) (w: Writer) =
-        if b.Length = 0 then w else { Chunks = b :: w.Chunks }
+    let private add (chunk: WriterChunk) (w: Writer) = { Chunks = chunk :: w.Chunks }
 
-    let writeByte (b: byte) (w: Writer) = add [| b |] w
+    let writeByte (b: byte) (w: Writer) = add (Byte b) w
 
     /// バイト列を追加する。並びは保たれる。
-    let writeBytes (bs: byte array) (w: Writer) = add bs w
+    let writeBytes (bs: byte array) (w: Writer) =
+        if bs.Length = 0 then w else add (Bytes bs) w
 
-    let bool (v: bool) (w: Writer) = add [| if v then 1uy else 0uy |] w
+    let bool (v: bool) = add (Byte(if v then 1uy else 0uy))
 
     /// 符号なし LEB128（順序保持ではない）。
-    let varint (v: uint64) (w: Writer) =
-        let rec emit x acc =
-            if x >= 0x80UL then
-                emit (x >>> 7) (byte (x &&& 0x7FUL ||| 0x80UL) :: acc)
-            else
-                add (byte x :: acc |> List.rev |> List.toArray) w
-
-        emit v []
+    let varint (v: uint64) = add (Varint v)
 
     /// リトルエンディアン 8バイト。
-    let int64LE (v: int64) (w: Writer) =
-        add (Array.init 8 (fun i -> byte (v >>> 8 * i &&& 0xFFL))) w
+    let int64LE (v: int64) = add (UInt64LE(uint64 v))
 
     /// リトルエンディアン 4バイト（符号なし）。
     /// WAL のフレームヘッダや SSTable の Footer など固定長フィールド用。
-    let uint32LE (v: uint32) (w: Writer) =
-        add (Array.init 4 (fun i -> byte (v >>> 8 * i &&& 0xFFu))) w
+    let uint32LE (v: uint32) = add (UInt32LE v)
 
     /// ビッグエンディアン 8バイト（符号なし）。
     /// 順序保持符号化で使う。
-    let uint64BE (v: uint64) (w: Writer) =
-        add (Array.init 8 (fun i -> byte (v >>> 8 * (7 - i) &&& 0xFFUL))) w
+    let uint64BE (v: uint64) = add (UInt64BE v)
 
     /// 長さ付きバイト列（varint 長 + 実体）。
-    let lengthPrefixed (bs: byte array) (w: Writer) =
-        w |> varint (uint64 bs.Length) |> writeBytes bs
+    let lengthPrefixed (bs: byte array) =
+        varint (uint64 bs.Length) >> writeBytes bs
 
     /// UTF-8 文字列を長さ付きで追加する。
-    let str (s: string) (w: Writer) =
-        lengthPrefixed (System.Text.Encoding.UTF8.GetBytes s) w
+    let str (s: string) =
+        lengthPrefixed (System.Text.Encoding.UTF8.GetBytes s)
+
+    let rec writeVarintTo (out: byte array) (pos: int) (v: uint64) =
+        if v >= 0x80UL then
+            out.[pos] <- byte (v &&& 0x7FUL ||| 0x80UL)
+            writeVarintTo out (pos + 1) (v >>> 7)
+        else
+            out.[pos] <- byte v
+            pos + 1
+
+    let varintLength (v: uint64) =
+        let rec loop bytes value =
+            if value < 0x80UL then
+                bytes + 1
+            else
+                loop (bytes + 1) (value >>> 7)
+
+        loop 0 v
+
+    let private chunkLength =
+        function
+        | Bytes bs -> bs.Length
+        | Slice(_, _, length) -> length
+        | Byte _ -> 1
+        | UInt64LE _
+        | UInt64BE _ -> 8
+        | UInt32LE _ -> 4
+        | Varint v -> varintLength v
+
+    /// 平坦化後のバイト長。
+    let private length (w: Writer) = w.Chunks |> List.sumBy chunkLength
+
+    let private writeChunk (out: byte array) (pos: int) =
+        function
+        | Bytes bs -> Array.blit bs 0 out pos bs.Length
+        | Slice(bs, offset, length) -> Array.blit bs offset out pos length
+        | Byte b -> out.[pos] <- b
+        | UInt64LE v ->
+            for i in 0..7 do
+                out.[pos + i] <- byte (v >>> 8 * i &&& 0xFFUL)
+        | UInt64BE v ->
+            for i in 0..7 do
+                out.[pos + i] <- byte (v >>> 8 * (7 - i) &&& 0xFFUL)
+        | UInt32LE v ->
+            for i in 0..3 do
+                out.[pos + i] <- byte (v >>> 8 * i &&& 0xFFu)
+        | Varint v -> writeVarintTo out pos v |> ignore
 
     /// 全チャンクを 1本のバイト列に平坦化する。
+    /// チャンク列は逆順（先頭が最後の書き込み）なので、
+    /// 出力配列の末尾から埋めて `List.rev` を不要にする。
     let toArray (w: Writer) =
-        w.Chunks |> List.rev |> List.toArray |> Array.concat
+        let total = length w
+        let out = Array.zeroCreate<byte> total
+
+        let rec fill pos chunks =
+            match chunks with
+            | [] -> out
+            | chunk :: rest ->
+                let next = pos - chunkLength chunk
+                writeChunk out next chunk
+                fill next rest
+
+        fill total w.Chunks
 
     /// 書き出し手順を左から順に適用して 1本のバイト列にする。
     /// 要素は Writer.varint x のような部分適用で書ける。
-    let build (steps: (Writer -> Writer) list) =
-        steps |> List.fold (fun w f -> f w) Empty |> toArray
+    let build = List.fold (fun w f -> f w) Empty >> toArray
 
 /// 読み取り: Cursor
 /// 読み取り位置を値が持つ。
@@ -112,26 +172,59 @@ module internal Reader =
         else
             ret (Array.sub c.Data c.Pos count, { c with Pos = c.Pos + count })
 
-    let readBool (c: Cursor) =
-        readByte c |> Result.map (fun (b, c) -> b <> 0uy, c)
+    let readBool = readByte >> Result.map (fun (b, c) -> b <> 0uy, c)
+
+    /// 呼び出し側の配列へ読み取る（読み取り用の配列を確保しない）。
+    let copyBytesInto (dest: byte array) (destOffset: int) (count: int) (c: Cursor) =
+        if
+            count < 0
+            || destOffset < 0
+            || destOffset > dest.Length - count
+            || c.Pos < 0
+            || c.End < c.Pos
+            || c.End > c.Data.Length
+            || count > c.End - c.Pos
+        then
+            eof (sprintf "Reader: %d バイトを読み取れません（残り %d）" count (Cursor.remaining c))
+        else
+            Array.blit c.Data c.Pos dest destOffset count
+            ret { c with Pos = c.Pos + count }
+
+    /// 読み飛ばす（配列を確保しない）。
+    /// 値を使わないブロック走査で、不要なエントリの値コピーを避けるために使う。
+    let skipBytes (count: int) (c: Cursor) =
+        if
+            count < 0
+            || c.Pos < 0
+            || c.End < c.Pos
+            || c.End > c.Data.Length
+            || count > c.End - c.Pos
+        then
+            eof (sprintf "Reader: %d バイトを読み飛ばせません（残り %d）" count (Cursor.remaining c))
+        else
+            ret { c with Pos = c.Pos + count }
 
     /// 符号なし LEB128 を読む。
-    let readVarint (c: Cursor) =
-        let rec decode shift acc c =
-            if shift > 63 then
-                eof "Reader: varint が長すぎます"
+    let private readVarintV =
+        let rec decode shift acc (c: Cursor) =
+            if shift > 63 || c.Pos >= c.End then
+                ValueNone
             else
-                match readByte c with
-                | Error e -> err e
-                | Ok(b, c) ->
-                    let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
+                let b = c.Data.[c.Pos]
+                let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
+                let next = { c with Pos = c.Pos + 1 }
 
-                    if b &&& 0x80uy <> 0uy then
-                        decode (shift + 7) acc c
-                    else
-                        ret (acc, c)
+                if b &&& 0x80uy <> 0uy then
+                    decode (shift + 7) acc next
+                else
+                    ValueSome struct (acc, next)
 
-        decode 0 0UL c
+        decode 0 0UL
+
+    let readVarint (c: Cursor) =
+        match readVarintV c with
+        | ValueSome struct (v, c) -> ret (v, c)
+        | ValueNone -> eof "Reader: varint が不正です（長すぎるか末尾を超えました）"
 
     /// リトルエンディアン 8バイト。
     /// 値ごとに配列を作らない（行のデコードで最も呼ばれる）。
@@ -576,7 +669,7 @@ module internal ValueCodec =
         | SqlValue.Timestamp t -> tagged 8uy |> Writer.int64LE t.UtcTicks
         | SqlValue.Uuid g -> tagged 9uy |> Writer.writeBytes (g.ToByteArray())
 
-    let private readValue (c: Cursor) =
+    let private readValueSlow (c: Cursor) =
         result {
             let! tag, c = Reader.readByte c
 
@@ -643,15 +736,113 @@ module internal ValueCodec =
         let withCount = w |> Writer.varint (uint64 arr.Length)
         Array.fold writeValue withCount arr
 
+    let private writeInt64LETo (out: byte array) (pos: int) (v: int64) =
+        let u = uint64 v
+
+        for i in 0..7 do
+            out.[pos + i] <- byte (u >>> 8 * i &&& 0xFFUL)
+
+        pos + 8
+
+    /// 1値を出力配列へ直接書く。次の位置を返す。
+    let private writeValueTo (out: byte array) (pos: int) =
+        function
+        | SqlValue.Null ->
+            out.[pos] <- 0uy
+            pos + 1
+        | SqlValue.Bool b ->
+            out.[pos] <- 1uy
+            out.[pos + 1] <- if b then 1uy else 0uy
+            pos + 2
+        | SqlValue.Int i ->
+            out.[pos] <- 2uy
+            writeInt64LETo out (pos + 1) i
+        | SqlValue.Real f ->
+            out.[pos] <- 3uy
+            writeInt64LETo out (pos + 1) (System.BitConverter.DoubleToInt64Bits f)
+        | SqlValue.Decimal d ->
+            out.[pos] <- 4uy
+
+            System.Decimal.GetBits d
+            |> Array.fold (fun p b -> writeInt64LETo out p (int64 b)) (pos + 1)
+        | SqlValue.Text s ->
+            let bytes = System.Text.Encoding.UTF8.GetBytes s
+            out.[pos] <- 5uy
+            let p = Writer.writeVarintTo out (pos + 1) (uint64 bytes.Length)
+            Array.blit bytes 0 out p bytes.Length
+            p + bytes.Length
+        | SqlValue.Blob bs ->
+            out.[pos] <- 6uy
+            let p = Writer.writeVarintTo out (pos + 1) (uint64 bs.Length)
+            Array.blit bs 0 out p bs.Length
+            p + bs.Length
+        | SqlValue.Date d ->
+            out.[pos] <- 7uy
+            writeInt64LETo out (pos + 1) (d.ToDateTime(System.TimeOnly.MinValue).Ticks)
+        | SqlValue.Timestamp t ->
+            out.[pos] <- 8uy
+            writeInt64LETo out (pos + 1) t.UtcTicks
+        | SqlValue.Uuid g ->
+            let bytes = g.ToByteArray()
+            out.[pos] <- 9uy
+            Array.blit bytes 0 out (pos + 1) 16
+            pos + 17
+
+    /// 値の並びを出力配列へ直接書く。次の位置を返す。
+    let writeValuesTo (out: byte array) (pos: int) (values: SqlValue array) =
+        let pos = Writer.writeVarintTo out pos (uint64 values.Length)
+        Array.fold (fun p v -> writeValueTo out p v) pos values
+
+    let private readInt (c: Cursor) =
+        if c.Pos + 8 < c.End && c.Data.[c.Pos] = 2uy then
+            let d = c.Data
+            let p = c.Pos + 1
+
+            let v =
+                int64 d.[p]
+                ||| (int64 d.[p + 1] <<< 8)
+                ||| (int64 d.[p + 2] <<< 16)
+                ||| (int64 d.[p + 3] <<< 24)
+                ||| (int64 d.[p + 4] <<< 32)
+                ||| (int64 d.[p + 5] <<< 40)
+                ||| (int64 d.[p + 6] <<< 48)
+                ||| (int64 d.[p + 7] <<< 56)
+
+            ValueSome struct (SqlValue.Int v, { c with Pos = p + 8 })
+        else
+            ValueNone
+
+    let private readValue (c: Cursor) =
+        match readInt c with
+        | ValueSome struct (v, c) -> ret (v, c)
+        | ValueNone -> readValueSlow c
+
     let readValues (c: Cursor) =
         result {
             let! n, c = Reader.readVarint c
 
             if n > uint64 System.Int32.MaxValue then
-                return! err (sprintf "ValueCodec: 要素数が大きすぎます (%d)" n |> DbError.corruption)
+                return! sprintf "ValueCodec: 要素数が大きすぎます (%d)" n |> DbError.corruption |> err
+            else
+                let count = int n
+                let values = Array.zeroCreate<SqlValue> count
 
-            let! items, c = Reader.readItems readValue n c
-            return List.toArray items, c
+                let rec fill i c =
+                    if i >= count then
+                        ret (values, c)
+                    else
+                        match readInt c with
+                        | ValueSome struct (v, c') ->
+                            values.[i] <- v
+                            fill (i + 1) c'
+                        | ValueNone ->
+                            match readValue c with
+                            | Error e -> err e
+                            | Ok(v, c') ->
+                                values.[i] <- v
+                                fill (i + 1) c'
+
+                return! fill 0 c
         }
 
     /// 固定長の値の符号化サイズ（型タグ込み）。
@@ -668,6 +859,21 @@ module internal ValueCodec =
         | SqlValue.Uuid _ -> Some 17
         | SqlValue.Text _
         | SqlValue.Blob _ -> None
+
+    /// 1値の符号化後の正確なバイト数。
+    let private encodedValueLength =
+        function
+        | SqlValue.Text s ->
+            1
+            + Writer.varintLength (uint64 (System.Text.Encoding.UTF8.GetByteCount s))
+            + System.Text.Encoding.UTF8.GetByteCount s
+        | SqlValue.Blob bs -> 1 + Writer.varintLength (uint64 bs.Length) + bs.Length
+        | v -> fixedEncodedBytes v |> Option.defaultValue 1
+
+    /// 値の並びの符号化後の正確なバイト数。
+    let encodedValuesLength (values: SqlValue array) =
+        Writer.varintLength (uint64 values.Length)
+        + Array.sumBy encodedValueLength values
 
     /// 1値の符号化後のおよそのバイト数（SSTable のファイルサイズ見積り）。
     /// 実際のファイルサイズとは厳密には一致しない。

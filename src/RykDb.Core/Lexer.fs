@@ -109,30 +109,6 @@ module internal Lexer =
                 "IF"
             ]
 
-    /// 記号・演算子。
-    /// 長的なものを先に試す。
-    let private Symbols =
-        [
-            "<>"
-            "!="
-            "<="
-            ">="
-            "||"
-            "="
-            "<"
-            ">"
-            "+"
-            "-"
-            "*"
-            "/"
-            "%"
-            ";"
-            ","
-            "."
-            "("
-            ")"
-        ]
-
     let private advance (input: string) (s: LexState) =
         if s.Index < input.Length && input.[s.Index] = '\n' then
             {
@@ -188,6 +164,26 @@ module internal Lexer =
                     ret s
 
         loop input.Length s
+
+    /// 先頭文字ごとの記号候補（長いものを先に置く）。
+    let private symbolsFor =
+        function
+        | '<' -> [| "<>"; "<="; "<" |]
+        | '>' -> [| ">="; ">" |]
+        | '=' -> [| "=" |]
+        | '!' -> [| "!=" |]
+        | '|' -> [| "||" |]
+        | '+' -> [| "+" |]
+        | '-' -> [| "-" |]
+        | '*' -> [| "*" |]
+        | '/' -> [| "/" |]
+        | '%' -> [| "%" |]
+        | ';' -> [| ";" |]
+        | ',' -> [| "," |]
+        | '.' -> [| "." |]
+        | '(' -> [| "(" |]
+        | ')' -> [| ")" |]
+        | _ -> [||]
 
     /// 1トークンを読む。
     /// 読み後は次の位置を返す。
@@ -345,13 +341,23 @@ module internal Lexer =
             collectDelimited input n '"' "unclosed quoted identifier" startPos.Line s
             |> Result.map (fun (v, s') -> Token.QuotedIdent v, s')
         else
-            let matched =
-                Symbols
-                |> List.tryFind (fun sym ->
-                    s.Index + sym.Length <= n
-                    && System.String.CompareOrdinal(input, s.Index, sym, 0, sym.Length) = 0)
+            let candidates = symbolsFor c
 
-            match matched with
+            let rec trySymbol i =
+                if i >= candidates.Length then
+                    None
+                else
+                    let sym = candidates.[i]
+
+                    if
+                        s.Index + sym.Length <= n
+                        && System.String.CompareOrdinal(input, s.Index, sym, 0, sym.Length) = 0
+                    then
+                        Some sym
+                    else
+                        trySymbol (i + 1)
+
+            match trySymbol 0 with
             | None -> err (DbError.syntax (sprintf "unexpected character '%c'" c) startPos.Line)
             | Some sym -> ret (Token.Symbol sym, advanceN sym.Length s)
 

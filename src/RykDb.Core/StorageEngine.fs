@@ -217,11 +217,12 @@ module internal StorageEngine =
             | Some s -> e.SeqNo <= s
             | None -> true
 
-        // `next` の再帰は「同じキー / 不可視版の読み飛ばし」と
-        // 「1件返した後の SstScan 継続（ラムダ）」に現れる。
-        // どちらも 1件ごとに継続が戻る型で、スタックは行数に比例しない。
-        // TailAudit は両方を 1 キーにまとめて報告するため baseline に登録する。
-        let rec next (state: ScanState) : Result<(SstEntry * SstScan) option, DbError> =
+        let closeState (stateObj: obj) =
+            SstMerge.dispose (stateObj :?> ScanState).Merge
+
+        let rec stepObj (stateObj: obj) =
+            let state = stateObj :?> ScanState
+
             if limit > 0 && state.Count >= limit then
                 ret None
             else
@@ -232,34 +233,34 @@ module internal StorageEngine =
                     | Error e -> err e
                     | Ok None -> ret None
                     | Ok(Some(e, merge')) ->
-                        let restored =
-                            { state with
-                                Pending = remaining
-                                Merge = merge'
-                            }
-
                         let sameKey =
                             match state.EmittedKey with
                             | Some k -> Bytes.compare k e.Key = 0
                             | None -> false
 
-                        if sameKey then
-                            next restored
-                        elif not (isVisible e) then
-                            next restored
+                        if sameKey || not (isVisible e) then
+                            let nextState =
+                                { state with
+                                    Pending = remaining
+                                    Merge = merge'
+                                }
+
+                            stepObj (box nextState)
                         else
                             let appended = e.Value.IsSome
 
                             let advanced =
-                                { restored with
+                                { state with
+                                    Pending = remaining
+                                    Merge = merge'
                                     EmittedKey = Some e.Key
-                                    Count = (if appended then state.Count + 1 else state.Count)
+                                    Count = if appended then state.Count + 1 else state.Count
                                 }
 
                             if appended then
-                                ret (Some(e, SstScan(fun () -> next advanced)))
+                                Some(e, StateScan(box advanced, stepObj, closeState)) |> ret
                             else
-                                next advanced
+                                stepObj (box advanced)
 
         let pendingFiles =
             Version.allFiles engine.Version
@@ -275,27 +276,31 @@ module internal StorageEngine =
         match SstScan.next (seqToScan memSeq) with
         | Error e -> err e
         | Ok None ->
-            ret (
-                SstScan(fun () ->
-                    next
-                        {
-                            Pending = pendingFiles
-                            Merge = SstMerge.Empty
-                            EmittedKey = None
-                            Count = 0
-                        })
+            StateScan(
+                box
+                    {
+                        Pending = pendingFiles
+                        Merge = SstMerge.Empty
+                        EmittedKey = None
+                        Count = 0
+                    },
+                stepObj,
+                closeState
             )
+            |> ret
         | Ok(Some(e, nxt)) ->
-            ret (
-                SstScan(fun () ->
-                    next
-                        {
-                            Pending = pendingFiles
-                            Merge = SstMerge.insert 0 e nxt SstMerge.Empty
-                            EmittedKey = None
-                            Count = 0
-                        })
+            StateScan(
+                box
+                    {
+                        Pending = pendingFiles
+                        Merge = SstMerge.insert 0 e nxt SstMerge.Empty
+                        EmittedKey = None
+                        Count = 0
+                    },
+                stepObj,
+                closeState
             )
+            |> ret
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、

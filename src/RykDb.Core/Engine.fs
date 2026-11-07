@@ -552,6 +552,11 @@ module internal Engine =
             let mgr, txn = TransactionManager.beginTxn state.Manager
             let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
 
+            let isReadOnly =
+                match stmt with
+                | Statement.Select _ -> true
+                | _ -> false
+
             let run () =
                 result {
                     let startState =
@@ -561,9 +566,13 @@ module internal Engine =
                         }
 
                     let! midState, result = runStatement startState txn stmt
-                    let toCommit = midState.Pending |> Option.defaultValue txn
-                    let! nextState = DbStateOps.commitTransaction toCommit midState
-                    return nextState, result
+
+                    if isReadOnly then
+                        return state, result
+                    else
+                        let toCommit = midState.Pending |> Option.defaultValue txn
+                        let! nextState = DbStateOps.commitTransaction toCommit midState
+                        return nextState, result
                 }
 
             let finish r =

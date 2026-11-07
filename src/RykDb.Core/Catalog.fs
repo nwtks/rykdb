@@ -593,10 +593,22 @@ module internal Schema =
 
     /// 横連結（JOIN 用）。
     let concat (schema: Schema) (other: Schema) =
-        {
-            Columns = Array.append schema.Columns other.Columns
-            Tables = schema.Tables @ other.Tables
-        }
+        if Array.isEmpty schema.Columns then
+            if List.isEmpty schema.Tables then
+                other
+            else
+                { other with
+                    Tables = schema.Tables @ other.Tables
+                }
+        elif Array.isEmpty other.Columns then
+            { schema with
+                Tables = schema.Tables @ other.Tables
+            }
+        else
+            {
+                Columns = Array.append schema.Columns other.Columns
+                Tables = schema.Tables @ other.Tables
+            }
 
     /// スキーマ列を左から連結する（FROM / JOIN の出力スキーマ組み立て）。
     let concatAll (schemas: Schema list) =
