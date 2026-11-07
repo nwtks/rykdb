@@ -20,7 +20,7 @@ open RykDb.TestHelpers
 /// 完了を待たずに Close すると、サーバが DB を触っている間に削除して落ちる。
 let private withServer (f: RykDbClient -> unit) =
     let dir = newDir "tcp"
-    let db = ok (Database.OpenWith dir)
+    let session = ok (Session.OpenWith dir)
     // port 0 = OS が空いているポートを割り当てる。
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
@@ -30,7 +30,7 @@ let private withServer (f: RykDbClient -> unit) =
 
     Task.Run(fun () ->
         try
-            serve db listener cts.Token (fun _ -> ())
+            serve session listener cts.Token (fun _ -> ())
         finally
             finished.Set())
     |> ignore
@@ -51,7 +51,7 @@ let private withServer (f: RykDbClient -> unit) =
 
         cts.Dispose()
         // 4) flush してからディレクトリを消す
-        db.Close() |> ignore
+        session.Close() |> ignore
 
         if Directory.Exists dir then
             try
@@ -139,20 +139,19 @@ let ``TCP: ライブラリ API と同じ結果が返る`` () =
     // --- ライブラリ API ---
     withDir "cmp-lib" (fun dir ->
         let rec run
-            (db0: Database)
+            (session: Session)
             (rest: string list)
             (acc: (string list * string list) list)
             : (string list * string list) list =
             match rest with
             | [] -> List.rev acc
             | sql :: tail ->
-                // `Execute` は新しい `Database` を返すので差し替える。
-                let next, r = ok (db0.Execute sql)
-                run next tail ((r.Columns |> Array.toList, rowText r) :: acc)
+                let r = ok (session.Execute sql)
+                run session tail ((r.Columns |> Array.toList, rowText r) :: acc)
 
-        let db = ok (Database.OpenWith dir)
-        let libResults = run db script []
-        ok (db.Close())
+        let session = ok (Session.OpenWith dir)
+        let libResults = run session script []
+        ok (session.Close())
 
         // --- TCP ---
         withServer (fun client ->
@@ -196,7 +195,7 @@ let ``TCP: .tables はテーブル名を返す`` () =
 [<Fact>]
 let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` () =
     let dir = newDir "tcp-raw"
-    let db = ok (Database.OpenWith dir)
+    let session = ok (Session.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -205,7 +204,7 @@ let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` 
 
     Task.Run(fun () ->
         try
-            serve db listener cts.Token (fun _ -> ())
+            serve session listener cts.Token (fun _ -> ())
         finally
             finished.Set())
     |> ignore
@@ -243,7 +242,7 @@ let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` 
         cts.Cancel()
         finished.Wait 10000 |> ignore
         cts.Dispose()
-        db.Close() |> ignore
+        session.Close() |> ignore
 
         if Directory.Exists dir then
             try
@@ -254,7 +253,7 @@ let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` 
 [<Fact>]
 let ``TCP: 突然の切断（RST）でもサーバは生き続ける`` () =
     let dir = newDir "tcp-rst"
-    let db = ok (Database.OpenWith dir)
+    let session = ok (Session.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -263,7 +262,7 @@ let ``TCP: 突然の切断（RST）でもサーバは生き続ける`` () =
 
     Task.Run(fun () ->
         try
-            serve db listener cts.Token (fun _ -> ())
+            serve session listener cts.Token (fun _ -> ())
         finally
             finished.Set())
     |> ignore
@@ -298,7 +297,7 @@ let ``TCP: 突然の切断（RST）でもサーバは生き続ける`` () =
         cts.Cancel()
         finished.Wait 10000 |> ignore
         cts.Dispose()
-        db.Close() |> ignore
+        session.Close() |> ignore
 
         if Directory.Exists dir then
             try
@@ -399,11 +398,11 @@ let ``Client: 接続が RST で切れたら Halt`` () =
 [<Fact>]
 let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコルを壊さない`` () =
     let dir = newDir "tcp-newline"
-    let db = ok (Database.OpenWith dir)
-    let db, _ = ok (db.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    let session = ok (Session.OpenWith dir)
+    ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
 
-    let db, _ =
-        ok (db.Execute "INSERT INTO t VALUES (1, 'a\nb'), (2, 'c\rd'), (3, 'C:\\temp')")
+    ok (session.Execute "INSERT INTO t VALUES (1, 'a\nb'), (2, 'c\rd'), (3, 'C:\\temp')")
+    |> ignore
 
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
@@ -413,7 +412,7 @@ let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコル
 
     Task.Run(fun () ->
         try
-            serve db listener cts.Token (fun _ -> ())
+            serve session listener cts.Token (fun _ -> ())
         finally
             finished.Set())
     |> ignore
@@ -451,7 +450,7 @@ let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコル
         cts.Cancel()
         finished.Wait 10000 |> ignore
         cts.Dispose()
-        db.Close() |> ignore
+        session.Close() |> ignore
 
         if Directory.Exists dir then
             try
@@ -462,7 +461,7 @@ let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコル
 [<Fact>]
 let ``TCP: 切断時に open transaction は rollback される`` () =
     let dir = newDir "tcp-rollback"
-    let db = ok (Database.OpenWith dir)
+    let session = ok (Session.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -471,7 +470,7 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
 
     Task.Run(fun () ->
         try
-            serve db listener cts.Token (fun _ -> ())
+            serve session listener cts.Token (fun _ -> ())
         finally
             finished.Set())
     |> ignore
@@ -505,7 +504,7 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
         cts.Cancel()
         finished.Wait 10000 |> ignore
         cts.Dispose()
-        db.Close() |> ignore
+        session.Close() |> ignore
 
         if Directory.Exists dir then
             try

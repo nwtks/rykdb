@@ -67,7 +67,7 @@ txn            ::= BEGIN [TRANSACTION] | START TRANSACTION
 > 詳しくは [12. トランザクション](#12-トランザクション)。
 
 文を複数書く場合は `;` で区切る（**区切りなしは `SyntaxError`**。末尾の `;` は省略可）。
-`Database.Execute` は複数文を順に実行する。
+`Session.Execute` は複数文を順に実行する。
 `SELECT` が 1 つだけならその結果を返し、複数（または 0 個）なら `RowsAffected` の合計だけを返す
 （`Columns` / `Rows` は空）。
 
@@ -1038,7 +1038,7 @@ ROLLBACK;        -- 削除を取り消し
   `BEGIN TRANSACTION` / `START TRANSACTION` も同じ。
   `COMMIT WORK` / `COMMIT TRANSACTION` / `END` は `COMMIT`、
   `ROLLBACK WORK` / `ROLLBACK TRANSACTION` は `ROLLBACK` の別綴り。
-  ライブラリ API の `Database.Begin()` も `Commit()` / `Rollback()` と同じく `Result` を返す。
+  ライブラリ API の `Session.Begin()` も `Commit()` / `Rollback()` と同じく `Result` を返す。
 - 識別子（テーブル・列・索引・別名）は**大文字小文字を区別しない**。
 - `COMMIT` はバッファをエンジンへ流す。
 - `ROLLBACK` はバッファを捨てる。
@@ -1047,8 +1047,9 @@ ROLLBACK;        -- 削除を取り消し
 - **DDL（`CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX`）は明示 transaction 中には実行できない**
   （即時反映のため）。
   `COMMIT` または `ROLLBACK` してから実行する。
-- 1 つの `Execute` / スクリプト内で複数文を `;` 区切りで渡した場合、`BEGIN` 以降は同じ transaction で実行される。
-- ライブラリ API の `Database.Begin()` / `Commit()` / `Rollback()` と等価。
+- 1 つの `Session.Execute` / スクリプト内で複数文を `;` 区切りで渡した場合、
+  `BEGIN` 以降は同じ transaction で実行される。
+- ライブラリ API の `Session.Begin()` / `Commit()` / `Rollback()` と等価。
 
 ### 暗黙のトランザクション
 
@@ -1062,10 +1063,12 @@ let ok =
     | Ok v -> v
     | Error e -> failwith (DbError.toDisplayString e)
 
-let db, _ = ok (db.Execute "INSERT INTO t VALUES (1, 10)")   // 1 文 = 1 commit
+let session = ok (Session.OpenWith "./mydata")
+ok (session.Execute "INSERT INTO t VALUES (1, 10)")   // 1 文 = 1 commit
+ok (session.Close())
 ```
 
-`Execute` に `;` 区切りで複数文を渡した場合も、`BEGIN` を張っていない限り 1文ごとに commit される。
+`Session.Execute` に `;` 区切りで複数文を渡した場合も、`BEGIN` を張っていない限り 1文ごとに commit される。
 
 ### 明示的なトランザクション（ライブラリ API）
 
@@ -1078,33 +1081,37 @@ let ok =
     | Ok v -> v
     | Error e -> failwith (DbError.toDisplayString e)
 
-let db  = ok (Database.OpenWith "./mydata")
-let db1 = ok (db.Begin())                          // 明示トランザクション開始（Result）
-let db2, _ = ok (db1.Execute "INSERT INTO t VALUES (1, 10)")
-let db3 = ok (db2.Commit())                        // 確定
-// または
-let db4 = db2.Rollback()                           // 破棄
+let session = ok (Session.OpenWith "./mydata")
+// 明示トランザクション開始（Result）。
+ok (session.Begin())
+ok (session.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+ok (session.Commit())                              // 確定
+// 破棄する場合は Commit() の代わりに:
+// ok (session.Rollback())
+ok (session.Close())
 ```
 
-- ハンドルは**不変**。
-  戻り値の `Database` を受け取り直さないと書き込みが見えない。
-- 入れ子の `Begin()` は何もしない
-  （既にトランザクション中なら `this` を返す）。
-- `Close()` 後のハンドルは破棄する。
-  閉じた状態はハンドルに記録されないため同じハンドルを `Execute` すると WAL が再作成される
-  （二重 `Close` は安全）。
-  flush / WAL 削除 / `.rykdb.format` の解放は**最新のハンドル**の `Close()` で行う。
-  古いハンドルの `Close()` は no-op（生きている新しいハンドルのロックを外さない）。
-- `Database` は `IDisposable`。`use db = ...` / `Dispose()` は `Close()` と同じ経路
+- `Session` が現在の状態を保持するため、`Execute` の戻り値を次の操作へ引き継ぐ必要はない。
+- 入れ子の `Begin()` は何もしない（既にトランザクション中なら成功する）。
+- `Close()` 後の `Session` は使えない。
+  `Execute` / `TableNames` / `Begin` / `Commit` / `Rollback` は `InternalError` を返す。
+  進行中の transaction は `Close()` 時に rollback される（二重 `Close` は安全）。
+- `Session` は `IDisposable`。`use session = ...` / `Dispose()` は `Close()` と同じ経路
   （進行中 transaction の登録も外れる）。
 - **同じ DB を別プロセスから開くことはできない**。
-  `Database.OpenWith` は `<root>/.rykdb.format` を排他で押さえ、
+  `Session.OpenWith` は `<root>/.rykdb.format` を排他で押さえ、
   取れなければ `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.format）`）を返す。
 - **同じ root を同じプロセスで二度開くこともできない**。
-  2回目の `Database.OpenWith` は `IoError`
+  2回目の `Session.OpenWith` は `IoError`
   （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）を返す。
   別の `RowStore` ができて memtable が分かれ、一方の commit が他方から見えないため。
   `Close()` してから開き直すこと。
+- 同一 `Session` への複数スレッドからの呼び出しは内部で直列化される。
+  ただし transaction の境界は呼び出し側が決めるため、複数スレッドで 1つの transaction を共有しないこと。
+- 複数文を 1 回の `Session.Execute` に渡したとき、途中の文がエラーになっても
+  それ以前に成功した文は確定済みのまま残る。
+  `BEGIN` が成功した後にエラーになった場合は transaction が開いたままになるので、
+  必要に応じて `Rollback()` する。
 - トランザクション中の読み取りは、開始時点の snapshot（データの見える範囲）に固定される。
   そのため、同じトランザクションから同じ行を読み直しても、他のトランザクションの後続 commit は見えない（repeatable read）。
 - 分離レベルは Snapshot Isolation（スナップショット分離）で固定。

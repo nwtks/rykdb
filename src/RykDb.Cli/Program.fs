@@ -8,41 +8,6 @@
 
 open RykDb.Core
 
-/// データベースを「開いた状態」で保持する参照。
-/// Database.Execute は新しい Database を返すので、以降は必ず戻り値のものに差し替える。
-type Session(initial: Database) =
-    let mutable current = initial
-
-    member _.Db = current
-
-    member _.InTransaction = current.InTransaction
-
-    member _.Run(sql: string) =
-        current.Execute sql
-        |> Result.map (fun (next, result) ->
-            current <- next
-            result)
-
-    member _.Begin() =
-        current.Begin()
-        |> Result.map (fun next ->
-            current <- next
-            ())
-
-    member _.Commit() =
-        current.Commit()
-        |> Result.map (fun next ->
-            current <- next
-            ())
-
-    member _.Rollback() =
-        current.Rollback()
-        |> Result.map (fun next ->
-            current <- next
-            ())
-
-    member _.Close() = current.Close()
-
 let private piecesOf (input: string) =
     let pieces = ResizeArray<string>()
     let buf = System.Text.StringBuilder()
@@ -117,12 +82,13 @@ let private dotCommand (session: Session) (line: string) =
         printfn "それ以外は SQL として実行します(`;` で即実行)。"
         true
     | [| ".tables" |] ->
-        let names = session.Db.TableNames()
-
-        if List.isEmpty names then
-            printfn "(テーブルはありません)"
-        else
-            names |> List.iter (fun n -> printfn "  %s" n)
+        match session.TableNames() with
+        | Error e -> printError e
+        | Ok names ->
+            if List.isEmpty names then
+                printfn "(テーブルはありません)"
+            else
+                names |> List.iter (fun n -> printfn "  %s" n)
 
         true
     | [| ".begin" |] ->
@@ -161,7 +127,7 @@ let private execOne (session: Session) (sql: string) =
     elif trimmed.StartsWith "." then
         dotCommand session trimmed
     else
-        match session.Run trimmed with
+        match session.Execute trimmed with
         | Ok r ->
             printResult r
             true
@@ -222,7 +188,7 @@ let private runFile (session: Session) (path: string) =
         function
         | [] -> Ok()
         | stmt :: tail ->
-            match session.Run stmt with
+            match session.Execute stmt with
             | Ok r ->
                 printResult r
                 runStatements tail
@@ -263,13 +229,11 @@ let main argv =
         |> Array.tryHead
         |> Option.defaultValue (System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "rykdb-data"))
 
-    match Database.OpenWith root with
+    match Session.OpenWith root with
     | Error e ->
         printError e
         1
-    | Ok db ->
-        let session = Session db
-
+    | Ok session ->
         let outcome =
             try
                 match fileIndex with

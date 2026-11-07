@@ -94,19 +94,19 @@ let ok =
     | Ok v -> v
     | Error e -> failwith (DbError.toDisplayString e)
 
-let db = ok (Database.OpenWith "./mydata")
+let session = ok (Session.OpenWith "./mydata")
 
-// Execute は新しい Database と結果のペアを返すので、以降は返された db を使う。
-let db, _ = ok (db.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
-let db, _ = ok (db.Execute "INSERT INTO t VALUES (1, 10), (2, 20)")
-let db, result = ok (db.Execute "SELECT id, v FROM t ORDER BY id")
+ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+|> ignore
+ok (session.Execute "INSERT INTO t VALUES (1, 10), (2, 20)") |> ignore
+let result = ok (session.Execute "SELECT id, v FROM t ORDER BY id")
 printfn "%A" result.Rows          // [|[|Int 1L; Int 10L|]; [|Int 2L; Int 20L|]|]
 printfn "%A" result.Columns       // [|"id"; "v"|]
 printfn "%A" result.RowsAffected  // 2
 
-result.ToDisplayLines()          // [ "id | v"; "------"; "  1, 10"; "  2, 20" ]
-db.TableNames()                  // [ "t" ]
-ok (db.Close())
+result.ToDisplayLines()           // [ "id | v"; "------"; "  1, 10"; "  2, 20" ]
+ok (session.TableNames())         // [ "t" ]
+ok (session.Close())
 ```
 
 ---

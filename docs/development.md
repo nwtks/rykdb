@@ -38,7 +38,7 @@ dotnet fantomas src/ tests/   # 整形
 | `TreatWarningsAsErrors` | **有効**                          |
 | `LangVersion`           | `10.0`                            |
 | `WarningLevel`          | `3`                               |
-| Core の命令型構文・機能 | `mutable` / `while` / `ref` = 0件 |
+| Core の命令型構文・機能 | `mutable` / `while` / `ref` = 0件（例外: 公開セッション層 `Session.fs`） |
 
 > **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
 > （[`gotchas.md`](gotchas.md) §10.4）。
@@ -79,6 +79,7 @@ xUnit。
 モジュール名も `module RykDb.DmlTests` と対象名に合わせる。
 
 **例外**: `Database.fs` の通し経路テストは 2ファイルに分かれる。
+`Session.fs` の公開 API は `SessionTests.fs` で検証する。
 [`sql-reference.md`](sql-reference.md) が扱う構文・意味論は `SqlReferenceTests.fs`、
 ハンドル API と内部機構は `DatabaseTests.fs`（役割の分担は下の「テスト方針」）。
 

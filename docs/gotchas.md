@@ -527,16 +527,19 @@ let (mgr, txn) = TransactionManager.beginTxn mgr
 let (mgr, txn2) = TransactionManager.beginTxn mgr
 ```
 
-### 5.6 `Database.Execute` は新しい `Database` を返す
+### 5.6 公開 API では `Session` を使う（`Database.Execute` は internal）
 
-ハンドルは**不変**。
+`Database` は internal の不変ハンドルで、`Execute` は新しいハンドルを返す。
+公開 API の `Session` は現在のハンドルを保持し、各文の成功後に差し替えるため、
+利用者が戻り値を引き継ぐ必要はない。
 
 ```fsharp
-// ❌ 書き込みが失われる
-db.Execute "INSERT ..." |> ignore
+// ✅ Session が状態を進める
+ok (session.Execute "INSERT ...")
 
-// ✅ 返されたハンドルを引き継ぐ
-let db2, _ = db.Execute "INSERT ..."
+// Database を直接使うのは internal のテストだけ。
+// Execute は Statement を 1つ受け取り、次のハンドルを返す。
+let db2, _ = db.Execute stmt
 ```
 
 ---
@@ -986,8 +989,8 @@ let ok r = match r with | Ok v -> v | Error e -> failwithf "%s" (DbError.toDispl
 let dir = "/tmp/probe-db"
 if System.IO.Directory.Exists dir then System.IO.Directory.Delete(dir, true)
 
-let db0 = ok (Database.OpenWith dir)
-let db1, _ = ok (db0.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
+let session = ok (Session.OpenWith dir)
+ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
 // ... 1 演算子ずつ確認 ...
 ```
 
@@ -1118,7 +1121,7 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
   root の `.drop-cleanup` ジャーナルへ書く。
 - その後でカタログ定義を外し、keyspace を 8192エントリずつ tombstone 消去する。
 - 後始末が成功したらジャーナルを消す。
-  途中で失敗・クラッシュしても、次回 `Database.OpenWith` がジャーナルを読み、
+  途中で失敗・クラッシュしても、次回 `Session.OpenWith` がジャーナルを読み、
   カタログに存在しない keyspace だけを再消去する。
 - カタログに定義が残っている場合（カタログ削除前にクラッシュ）は、
   DROP 未完了としてジャーナルを捨て、データは消さない。
@@ -1173,7 +1176,10 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
   `Manifest: 途中のレコードのチェックサム不一致は CorruptionError` /
   `Manifest: CURRENT が指す MANIFEST が無ければ CorruptionError`。
 
-### 11.14 古い `Database` ハンドルの `Close` は WAL を消さない
+### 11.14 古い `Database` ハンドルの `Close` は WAL を消さない（internal の話）
+
+公開 API の `Session` は常に最新のハンドルを保持するため、この問題は起きない。
+以下は internal の `Database.Execute` を直接使うテストの注意。
 
 ハンドルは不変で、`Execute` は新しいハンドルを返す。
 古いハンドルも `Close` を呼べるが、そのまま flush / WAL 削除をすると
@@ -1237,7 +1243,7 @@ DDL だけはプロセス内で排他にする必要がある。
 ### 11.16b 二重オープンは「ロック + 台帳」で防ぐ
 
 `FileShare.None` で他プロセスは防げるが、**同じプロセスの二重オープンは別問題**。
-`Database.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
+`Session.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
 一方の commit が他方から見えない（**古い行を黙って返す**）。
 そこで `ProcessLock` は台帳（正規化 root → トークン → `FileStream`）を持ち、
 **既にこのプロセスが開いている root の 2回目は `IoError`** にする。
@@ -1399,16 +1405,16 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
   `allAggs` と `hasAgg` に含める。
 - 回帰テスト: `SqlReference: HAVING にしか現れない集約でも絞り込める`。
 
-### 11.30 複数文 `Execute` の `BEGIN` 後エラーは ActiveSnapshot を解除する
+### 11.30 `BEGIN` 後のエラーでは transaction が開いたままになる
 
-`Database.Execute "BEGIN; ..."` が途中で失敗すると、`Engine.executeBegin` が作った
-`ActiveSnapshot` 登録はどの `Database` ハンドルにも紐づかない
-（`RegistrationLease` が作られない）。
-解除しないと GC でも外れず、その root の DDL が永久に `ConflictError` になる。
-`Database.Execute` は `Statement.Begin` が作った登録を覚え、
-`runStatements` が Error を返したら明示的に `unregister` する。
+`Session.Execute` は 1文ずつ実行し、成功するたびに現在のハンドルを更新する。
+`BEGIN` が成功した後に後続の文が失敗した場合、Session は transaction を開いたまま保持する
+（それ以前に成功した文の状態も保持する）。
+呼び出し側が `Rollback()` するか `Close()` するまで transaction は続く。
+`Close()` は進行中 transaction を rollback してから閉じ、ActiveSnapshot 登録も解除する。
 
-- 回帰テスト: `Database: 複数文 Execute の BEGIN 後エラーで登録を残さない`。
+- 回帰テスト: `Session: 複数文の BEGIN 後エラーは transaction を開いたままにする` /
+  `Session: Close は開いた transaction を rollback する`。
 
 ### 11.31 GROUP BY の式は木全体でスロットへ置き換える
 

@@ -36,6 +36,7 @@
     <Compile Include="DropCleanup.fs" />
     <Compile Include="Engine.fs" />
     <Compile Include="Database.fs" />
+    <Compile Include="Session.fs" />
   </ItemGroup>
 
   <ItemGroup>

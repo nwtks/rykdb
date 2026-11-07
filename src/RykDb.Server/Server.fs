@@ -78,7 +78,7 @@ let private sendRows (writer: System.IO.StreamWriter) (columns: string array) (r
     with _ ->
         false
 
-let private handleClient (onLog: string -> unit) (db: Database) (client: System.Net.Sockets.TcpClient) =
+let private handleClient (onLog: string -> unit) (session: Session) (client: System.Net.Sockets.TcpClient) =
     use stream = client.GetStream()
 
     use reader =
@@ -97,7 +97,6 @@ let private handleClient (onLog: string -> unit) (db: Database) (client: System.
         with _ ->
             false
 
-    let mutable current = db
     let mutable running = true
 
     while running do
@@ -118,31 +117,28 @@ let private handleClient (onLog: string -> unit) (db: Database) (client: System.
                     running <- false
                 | ".ping" -> running <- sprintf "%s 0\tpong" OkTag |> send
                 | ".tables" ->
-                    let names = current.TableNames()
-
-                    if List.isEmpty names then
-                        running <- send (sprintf "%s 0" OkTag)
-                    else
-                        let rows = names |> List.map (fun n -> [| SqlValue.Text n |]) |> List.toArray
-
-                        running <- sendRows writer [| "tables" |] rows
-                | _ ->
-                    match current.Execute sql with
+                    match session.TableNames() with
                     | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
-                    | Ok(next, result) ->
-                        current <- next
-                        running <- sendRows writer result.Columns result.Rows
+                    | Ok names ->
+                        if List.isEmpty names then
+                            running <- send (sprintf "%s 0" OkTag)
+                        else
+                            let rows = names |> List.map (fun n -> [| SqlValue.Text n |]) |> List.toArray
+                            running <- sendRows writer [| "tables" |] rows
+                | _ ->
+                    match session.Execute sql with
+                    | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
+                    | Ok result -> running <- sendRows writer result.Columns result.Rows
 
-    if current.InTransaction then
-        match current.Rollback() with
-        | Ok rolledBack -> current <- rolledBack
+    if session.InTransaction then
+        match session.Rollback() with
+        | Ok() -> ()
         | Error e -> sprintf "切断時のロールバックに失敗しました: %s" (DbError.toDisplayString e) |> onLog
 
     "切断されました" |> onLog
-    current
 
 let serve
-    (db: Database)
+    (session: Session)
     (listener: System.Net.Sockets.TcpListener)
     (stop: System.Threading.CancellationToken)
     (onLog: string -> unit)
@@ -155,7 +151,6 @@ let serve
                 ())
 
     let mutable clientId = 0
-    let mutable currentDb = db
 
     while not stop.IsCancellationRequested do
         try
@@ -165,10 +160,7 @@ let serve
             sprintf "[%d] 接続されました" clientId |> onLog
 
             try
-                let finalDb =
-                    handleClient (fun m -> sprintf "[%d] %s" clientId m |> onLog) currentDb client
-
-                currentDb <- finalDb
+                handleClient (fun m -> sprintf "[%d] %s" clientId m |> onLog) session client
             with ex ->
                 sprintf "[%d] 例外: %s" clientId ex.Message |> onLog
 
@@ -190,4 +182,4 @@ let serve
                 sprintf "接続処理で例外: %s" ex.Message |> onLog
 
     listener.Stop()
-    currentDb.Close() |> ignore
+    session.Close() |> ignore

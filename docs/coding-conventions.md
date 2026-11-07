@@ -52,6 +52,13 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 ## 2. 命令型の構文・機能を使わない
 
 `src/RykDb.Core/` では **`mutable` / `while` / `ref` を 0件**に保つ。
+例外は公開セッション層の `Session.fs` だけで、次を意図的に使う。
+
+- `let mutable current` / `let mutable closed`: 現在の `Database` ハンドルと Close 状態を保持する。
+- `lock gate`: 同一 `Session` への `Execute` / `Begin` / `Commit` / `Rollback` を直列化する。
+
+これらは `Session` の内部に閉じ込め、`Database` を internal にして外部へ漏らさない。
+
 `ResizeArray` / `Dictionary` / `HashSet` を使うのは次の場所に限る（CLI / Server は対象外）。
 いずれもホットパスか同時実行の台帳であり、使う理由はコメントに残す。
 

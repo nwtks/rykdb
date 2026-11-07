@@ -1,12 +1,11 @@
 // ===========================================================================
-// Database — 公開エントリポイント。
-// ライブラリ利用者・CLI・TCP サーバはこの層だけを見る。
+// Database — 内部ハンドル。
 //
 //   let db = Database.OpenWith root
-//   let db, r = db.Execute "INSERT ..."
+//   let db, r = db.Execute stmt
 //   db.Begin() / db.Commit() / db.Rollback() / db.Close()
 //
-// * Execute は暗黙の transaction で実行し自動 commit。
+// * Execute は 1文を実行し、暗黙の transaction なら自動 commit。
 //   Begin 以降は Commit / Rollback まで同じ transaction。
 //   snapshot は transaction 開始時に固定(repeatable read)。
 // * DDL は即時反映（カタログを書き換えた時点で見える）。
@@ -14,13 +13,14 @@
 
 namespace RykDb.Core
 
-/// DB のハンドル。
+/// DB の不変ハンドル。
 /// <remarks>
 /// ハンドルは underlying state を不変に持つ。
 /// 書き込みは新しい state を返すので、ハンドル自体は変更されない。
-/// これにより「複数の接続が同じ DB を利用する」状況を型で表現できる。
+/// 戻り値を捨てると状態が古くなるため、この型は公開しない。
+/// 公開 API の `Session` が常に最新ハンドルを保持する。
 /// </remarks>
-type Database internal (root: string, state: DbState) =
+type internal Database(root: string, state: DbState) =
     /// このハンドルの生存に紐づく ActiveSnapshot 登録のリース。
     /// ハンドルが commit / rollback / Close されずに捨てられても、
     /// 最後の 1本が GC された時点で登録が外れるよう保持しておく
@@ -171,77 +171,30 @@ type Database internal (root: string, state: DbState) =
             )
             |> ret
 
-    /// 単一文または複数文を実行する。
+    /// 1文だけ実行して、次のハンドルと結果を返す。
     /// <remarks>
     /// 戻り値の Database を次の呼び出しに渡すこと。
     /// ハンドルは不変なので、戻り値を捨てると DDL / DML の結果が見えない。
-    /// 明示的な transaction が無い場合は暗黙の transactionで実行し commit する。
-    /// 複数文(`;` 区切り)が渡された場合は順に実行する。
+    /// 明示的な transaction が無い場合は暗黙の transaction で実行し commit する。
+    /// 複数文を実行する場合は、公開 API の `Session.Execute` を使う。
     /// </remarks>
-    member this.Execute(sql: string) =
-        let results = ResizeArray<StatementResult>()
-        let registrations = ResizeArray<ActiveRegistration>()
+    member internal this.Execute(stmt: Statement) =
+        let nextOf nextState =
+            if obj.ReferenceEquals(nextState, state) then
+                this
+            else
+                new Database(root, nextState)
 
-        let rec runStatements st stmts =
-            match stmts with
-            | [] -> ret st
-            | stmt :: tail ->
-                match stmt with
-                | Statement.Begin ->
-                    match Engine.executeBegin st with
-                    | Error e -> err e
-                    | Ok nextState ->
-                        if st.Active.IsNone then
-                            nextState.ActiveRegistration |> Option.iter registrations.Add
-
-                        results.Add StatementResult.Empty
-                        runStatements nextState tail
-                | Statement.Commit ->
-                    match Engine.executeCommit st with
-                    | Error e -> err e
-                    | Ok nextState ->
-                        results.Add StatementResult.Empty
-                        runStatements nextState tail
-                | Statement.Rollback ->
-                    let nextState = Engine.executeRollback st
-                    results.Add StatementResult.Empty
-                    runStatements nextState tail
-                | _ ->
-                    match Engine.executeStatement st stmt with
-                    | Error e -> err e
-                    | Ok(nextState, result) ->
-                        results.Add result
-                        runStatements nextState tail
-
-        let finishError e =
-            registrations |> Seq.iter (ActiveSnapshotRegistry.unregister state.Root)
-            err e
-
-        result {
-            let! stmts = Parser.parseStatements sql
-
-            match runStatements state stmts with
-            | Error e -> return! finishError e
-            | Ok finalState ->
-                let selects =
-                    results |> Seq.filter (fun r -> not (Array.isEmpty r.Columns)) |> Seq.toList
-
-                let summary =
-                    match selects with
-                    | [ s ] -> s
-                    | _ ->
-                        {
-                            RowsAffected = results |> Seq.sumBy _.RowsAffected
-                            Columns = [||]
-                            Rows = [||]
-                        }
-
-                let isReadOnly =
-                    stmts
-                    |> List.forall (function
-                        | Statement.Select _ -> true
-                        | _ -> false)
-
-                let next = if isReadOnly then this else new Database(root, finalState)
-                return next, summary
-        }
+        match stmt with
+        | Statement.Begin ->
+            Engine.executeBegin state
+            |> Result.map (fun nextState -> nextOf nextState, StatementResult.Empty)
+        | Statement.Commit ->
+            Engine.executeCommit state
+            |> Result.map (fun nextState -> nextOf nextState, StatementResult.Empty)
+        | Statement.Rollback ->
+            let nextState = Engine.executeRollback state
+            ret (nextOf nextState, StatementResult.Empty)
+        | _ ->
+            Engine.executeStatement state stmt
+            |> Result.map (fun (nextState, result) -> nextOf nextState, result)

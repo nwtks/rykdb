@@ -234,15 +234,27 @@ let asText (v: SqlValue) =
         Assert.Fail(sprintf "TEXT ではありません: %A" v)
         ""
 
-/// `Database.Execute` の戻り値を「新しいハンドル」に差し替える。
+/// テスト用に SQL を 1文へ解析して `Database.Execute` へ渡す。
+/// 複数文は公開 API の `Session.Execute` で扱う。
+let execSql (db: Database) (sql: string) : Result<Database * StatementResult, DbError> =
+    match Parser.parseStatements sql with
+    | Error e -> Error e
+    | Ok [] -> Ok(db, StatementResult.Empty)
+    | Ok [ stmt ] -> db.Execute stmt
+    | Ok _ -> failwithf "テストヘルパー execSql は 1文だけ受け付けます: %s" sql
+
+/// `execSql` の戻り値を「新しいハンドル」に差し替える。
 let exec (db: Database) (sql: string) =
-    let next, _ = ok (db.Execute sql)
+    let next, _ = ok (execSql db sql)
     next
 
 /// 実行して結果だけ返す。
 let query (db: Database) (sql: string) =
-    let _, r = ok (db.Execute sql)
+    let _, r = ok (execSql db sql)
     r
+
+/// 1 文を実行して「新しい Database」と結果の両方を返す。
+let execRes (db: Database) (sql: string) = ok (execSql db sql)
 
 /// `toSqlLiteral` で 1 行を文字列化する（クライアント比較用）。
 let rowText (r: StatementResult) =

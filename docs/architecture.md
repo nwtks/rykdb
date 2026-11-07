@@ -35,7 +35,9 @@ flowchart TB
         LIB["F# ライブラリ利用者"]
     end
 
-    DB["Database.fs<br/>不変ハンドル・暗黙/明示 transaction"]
+    SESS["Session.fs<br/>公開 API・現在ハンドルの保持"]
+    DB["Database.fs<br/>internal の不変ハンドル"]
+    SESS --> DB
 
     subgraph EX["実行"]
         EN["Engine.fs<br/>文の実行（Ddl / Engine）"]
@@ -69,9 +71,9 @@ flowchart TB
         E["Errors.fs"]
     end
 
-    CLI --> DB
-    SRV --> DB
-    LIB --> DB
+    CLI --> SESS
+    SRV --> SESS
+    LIB --> SESS
     DB --> EN
     DB --> CAT
     DB --> MVCC
@@ -115,20 +117,20 @@ flowchart TB
 
 ### 採用している手法（サマリ）
 
-| 領域       | 手法・アルゴリズム                                                                 | 詳細                                                |
-| ---------- | ---------------------------------------------------------------------------------- | --------------------------------------------------- |
-| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                        | §8                                                  |
-| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                     | §8.1                                                |
-| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v5（84バイト）                   | §8.2                                                |
-| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                              | §8.4–8.5                                            |
-| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                              | §8.6                                                |
-| 並行制御   | **不変ハンドル + MVCC（Snapshot Isolation）** + first-committer-wins。DDL だけ排他 | §7                                                  |
-| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                             | §4                                                  |
-| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                          | §6                                                  |
-| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                        | §5.2                                                |
-| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                      | §3                                                  |
-| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                | [`coding-conventions.md`](coding-conventions.md) §1 |
-| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                  | §4.2, §8.1                                          |
+| 領域       | 手法・アルゴリズム                                                                     | 詳細                                                |
+| ---------- | -------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                            | §8                                                  |
+| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                         | §8.1                                                |
+| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v5（84バイト）                       | §8.2                                                |
+| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                  | §8.4–8.5                                            |
+| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                  | §8.6                                                |
+| 並行制御   | **Session で直列化 + MVCC（Snapshot Isolation）** + first-committer-wins。DDL だけ排他 | §7                                                  |
+| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                                 | §4                                                  |
+| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                              | §6                                                  |
+| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                            | §5.2                                                |
+| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                          | §3                                                  |
+| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                    | [`coding-conventions.md`](coding-conventions.md) §1 |
+| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                      | §4.2, §8.1                                          |
 
 ### 依存の向き
 
@@ -137,7 +139,7 @@ flowchart TB
 
 | 層               | モジュール                                                       | 知っている層                         |
 | ---------------- | ---------------------------------------------------------------- | ------------------------------------ |
-| インターフェース | `Database.fs` `RykDb.Cli` `RykDb.Server`                         | 全部                                 |
+| インターフェース | `Session.fs` `RykDb.Cli` `RykDb.Server`                          | 全部                                 |
 | 実行             | `Engine.fs` `Analyzer.fs` `Planner.fs` `ExecContext.fs` `Ops.fs` | `RowStore` `Catalog` `Transactions`  |
 | 行ストア         | `RowStore.fs` `Dml.fs` `Catalog.fs`                              | `StorageEngine` `Transactions`       |
 | MVCC             | `Transactions.fs`                                                | `Memtable`(`Entry`) `Errors` `Types` |
@@ -159,7 +161,8 @@ flowchart TB
 2. **MVCC の snapshot が自然に固定される**。
    読み取り中に状態が書き換わらない。
 3. **更新の書き忘れを型で防ぐ**。
-   外部に公開するハンドルは `Database` だけ。
+   外部に公開するのは `Session` だけで、不変ハンドル `Database` は internal に閉じる。
+   `Session` が現在のハンドルを保持するため、利用者が差し替えを忘れることはない。
 
 ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`Op.toArray`、`ExtSort` の受け皿、
 `Database.fs` のクライアント層などでは `ResizeArray` / `Dictionary` / `HashSet` を使う
@@ -204,7 +207,8 @@ flowchart TB
 | `Planner.fs`       | `Optimizer`（論理代数 → `Op`）と `Plan`（SELECT の実行）                                    |
 | `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                      |
 | `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                |
-| `Database.fs`      | 公開 API（不変ハンドル・transaction）                                                       |
+| `Database.fs`      | internal の不変ハンドル `Database`（transaction・状態遷移）                                 |
+| `Session.fs`       | 公開 API `Session`（`Database` をカプセル化し、呼び出しを直列化）                           |
 
 ### F# のコンパイル順
 
@@ -213,7 +217,7 @@ Errors → Types → Serialization → Memtable → Wal → BloomFilter
        → Sstable → VersionSet → Manifest → Compaction
        → StorageEngine → Transactions → Ast → Lexer → Parser
        → ProcessLock → RowStore → Catalog → Eval → Op → ExtSort → Ops
-       → Dml → ExecContext → Analyzer → Planner → DropCleanup → Engine → Database
+       → Dml → ExecContext → Analyzer → Planner → DropCleanup → Engine → Database → Session
 ```
 
 F# はファイルを**コンパイル順に評価する**ため、上から下へ一方向の依存になるよう `.fsproj` の `Compile` を手で並べる
@@ -925,35 +929,43 @@ commit 成功・rollback・`Close` で解除する。
 登録・解除・最古値の走査はプロセス内の Gate で直列化する
 （空になった bucket の削除と register の追加が競合して登録が消えるのを防ぐ）。
 
-### 7.6 `Database` の transaction モデル
+### 7.6 `Session` の transaction モデル
 
-`Execute` は任意の SQL を実行し、暗黙の transaction で自動的に commit する。
+`Session.Execute` は任意の SQL を実行し、暗黙の transaction で自動的に commit する。
 `Begin()` 以降は `Commit()` / `Rollback()` するまで同じ transaction を使う。
 
-> **注意** SQL 文としての `BEGIN` / `COMMIT` / `ROLLBACK` は transaction を制御する（`Database.Execute` の `runStatements` で処理）。
+> **注意** SQL 文としての `BEGIN` / `COMMIT` / `ROLLBACK` は transaction を制御する
+> （`Session.Execute` が 1文ずつ `Database.Execute` へ渡す）。
 > `Engine.runStatement` には到達しない。
-> 明示 transaction はライブラリ API の `db.Begin()` / CLI の `.begin` `.commit` `.rollback` を使う。
+> 明示 transaction はライブラリ API の `session.Begin()` / CLI の `.begin` `.commit` `.rollback` を使う。
 
-### 7.7 同時実行制御 — 並行性は値、DDL だけ排他
+`Session` は内部に現在の `Database` ハンドルを 1本だけ保持し、`lock` で呼び出しを直列化する。
+`Database` は internal なので、利用者が古いハンドルを使い回したり、`Execute` の戻り値を無視したりする経路はない。
+複数文を 1回の `Execute` に渡した場合も 1文ずつ実行し、各文が成功するたびに現在のハンドルを更新する。
+そのため途中の文が失敗しても、それ以前に成功した文の状態（と `BEGIN` 後の開いた transaction）は失われない。
 
-通常の書き込み経路に `lock` / `Monitor` / `Interlocked` はない。
+### 7.7 同時実行制御 — 並行性は値、公開 API は Session で直列化、DDL だけ排他
+
+`Session` 層を除く通常の書き込み経路に `lock` / `Monitor` / `Interlocked` はない。
 同時実行制御は次の 4層の組み合わせで成り立っている。
 
-| 層                     | 役割                           | 詳細                                                                                                                                                                                  |
-| ---------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. 不変レコード        | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                               |
-| 2. `Database` ハンドル | **書き込みの直列化の単位**     | `Execute` は新しい `Database` を返す。上位層では返されたハンドルを引き継ぐことで処理を直列化する。`StorageEngine` 内部の WAL / flush / close は DB ディレクトリ単位の Gate で保護する |
-| 3. MVCC + 競合検査     | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                       |
-| 4. keyspace 接頭辞     | **論理的な分離**               | `t:` / `i:` / `__catalog__` は 1本の LSM 上で接頭辞により分離される。物理ツリーは共有するため、テーブル間の並列性は提供しない（§6.1）                                                 |
+| 層                 | 役割                           | 詳細                                                                                                                                                                                                     |
+| ------------------ | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. 不変レコード    | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                                  |
+| 2. `Session`       | **公開 API の直列化の単位**    | `Session` が `lock` で `Execute` / `Begin` / `Commit` / `Rollback` を直列化し、現在の `Database` ハンドルを保持する。`StorageEngine` 内部の WAL / flush / close は DB ディレクトリ単位の Gate で保護する |
+| 3. MVCC + 競合検査 | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                                          |
+| 4. keyspace 接頭辞 | **論理的な分離**               | `t:` / `i:` / `__catalog__` は 1本の LSM 上で接頭辞により分離される。物理ツリーは共有するため、テーブル間の並列性は提供しない（§6.1）                                                                    |
 
 重要な含意は 2つ。
 
-1. **同じ DB（root）は 1本のハンドル系譜を直列に使う**。
+1. **同じ DB（root）は 1本の `Session` 系譜を直列に使う**。
    独立した 2つの `OpenWith` はできない（§7.9）。
-   並行させたいときは **DB を分ける**か、1本のハンドルをキューで直列化する。
-   同じハンドルを複数スレッドで `Execute` しても状態はマージされず、**後から更新した側の状態だけが残る**。
-2. **commit の直列化は「その経路を単一に通る」という規約**であって、mutex による保護ではない。
-   ハンドルの受け渡し規約が破られた場合に保護されるものはない、と理解する。
+   並行させたいときは **DB を分ける**か、1本の `Session` をキューで直列化する。
+   同一 `Session` への複数スレッドからの呼び出しは `lock` で直列化される。
+   ただし transaction の境界は呼び出し側が決めるため、複数スレッドで 1つの transaction を共有しないこと。
+2. **commit の直列化は「その経路を単一に通る」という規約**であり、
+   `Session` の `lock` は公開 API の呼び出しを守るが、
+   internal の `Database` を直接使うテストでは規約が前提になる。
 
 外周はすべて逐次処理。
 
@@ -1010,7 +1022,7 @@ WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つの�
   - 別プロセスが開いている → `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.format）`）。
   - 同じプロセスが既に開いている → `IoError`
     （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）。
-    `Database.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
+    `Session.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
     一方の commit が他方から見えず、**古い行をエラーなく返す**おそれがあるため、開けない方が安全。
   - これで「同じ root を開いた複数のハンドルが互いに見えない」という不整合は起きない。
     1つのハンドルの中では MVCC の snapshot で一貫性が保たれる。
@@ -1359,7 +1371,8 @@ flush / compact は `RowStore` が `WriteBatch` 後に `IStorageEngine.MaybeFlus
 ### 9.3 DB を開くとき
 
 ```
-Database.OpenWith root
+Session.OpenWith root
+  → Database.OpenWith root           internal の不変ハンドルを作る
   → RowStore.openStore root          root を作成し、.rykdb.format を排他で開く
       ├─ ensureFormat                開いた .rykdb.format を検証 / 新規作成
       └─ StorageEngine.openDatabase  ルート直下の LSM ツリーを開く
@@ -1376,15 +1389,17 @@ Database.OpenWith root
 
 ### 9.4 閉じるとき
 
+`Session.Close()` は進行中の transaction を rollback してから、
+内部の `Database.Close()` を呼ぶ。
 `Database.Close()` は `StorageEngine.close` を行い、
 memtable を flush してから WAL を削除する。
 これを省くと、再起動後にデータが読めなくなる。
 戻り値は close のエラー。
-不変ハンドルには「閉じた」状態を記録しないため、Close 後のハンドルは破棄する
-（同じハンドルで `Execute` すると WAL が再作成される。二重 Close は安全）。
-実際に flush / WAL 削除 / `ProcessLock` 解放を行うのは**最新のハンドル**だけで、
+`Session` は「閉じた」状態を記録するため、Close 後の `Execute` / `TableNames` /
+`Begin` / `Commit` / `Rollback` は `InternalError` を返す（二重 Close は安全）。
+実際に flush / WAL 削除 / `ProcessLock` 解放を行うのは**最新の internal ハンドル**だけで、
 古いハンドルの `Close()` は no-op（§7.9）。
-`Database` は `IDisposable` なので、`use db = ...` / `Dispose()` でも Close できる
+`Session` は `IDisposable` なので、`use session = ...` / `Dispose()` でも Close できる
 （§7.5 の登録解除も同じ経路）。
 
 ---
@@ -1418,7 +1433,8 @@ memtable を flush してから WAL を削除する。
 
 ## 11. インターフェース層
 
-3つのインターフェースが**すべて `Database.fs` だけ**を見る。
+3つのインターフェースが**すべて `Session.fs` だけ**を見る。
+`Database` は internal で、`Session` の内部実装に閉じている。
 
 ### 11.1 ライブラリ API
 
@@ -1431,18 +1447,19 @@ let ok =
     | Ok v -> v
     | Error e -> failwith (DbError.toDisplayString e)
 
-let db = ok (Database.OpenWith "./mydata")
+let session = ok (Session.OpenWith "./mydata")
 
-// Execute は新しい Database と結果のペアを返す。戻り値のハンドルを次の操作に使うこと。
-let db, _ = ok (db.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
-let db, _ = ok (db.Execute "INSERT INTO t VALUES (1, 10), (2, 20)")
-let db, result = ok (db.Execute "SELECT id, v FROM t ORDER BY id")
+ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+|> ignore
+ok (session.Execute "INSERT INTO t VALUES (1, 10), (2, 20)") |> ignore
+let result = ok (session.Execute "SELECT id, v FROM t ORDER BY id")
 result.Rows        // [|[|Int 1L; Int 10L|]; [|Int 2L; Int 20L|]|]
 result.Columns     // [|"id"; "v"|]
+ok (session.Close())
 ```
 
-> **重要**: ハンドルは**不変**なので、書き込むたびに新しいハンドルへ差し替える必要がある。
-> 差し替えを忘れると書き込みが失われる。
+> **重要**: 公開 API は `Session` だけ。
+> `Database` は internal の不変ハンドルで、`Session` が各文の成功後に現在のハンドルを更新する。
 
 ### 11.2 CLI REPL
 
@@ -1467,10 +1484,10 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - `serve` の accept ループは **接続を 1つずつ処理する**
   （接続ごとの `Task` / スレッドは作らない）。
   1接続内も while で逐次。
-- 各接続は `handleClient` 内で `let mutable current = db` に**初期ハンドルをコピー**して始め、
-  実行のたびに `current <- next` として、返されたハンドルを引き継ぐ。
-- 接続終了時のハンドルは `serve` の `currentDb` へ引き継がれ、次の接続はその状態から始まる。
-  明示 transaction が残っている場合は、切断時に `Rollback()` してから引き継ぐ。
+- `serve` は 1つの `Session` を保持し、接続ごとに `handleClient` へ渡す。
+- `Session` が現在のハンドルを保持するため、
+  接続ごとの `mutable current` や `serve` 側の `currentDb` への引き継ぎは不要。
+- 明示 transaction が残っている場合は、切断時に `Rollback()` してから次の接続へ渡す。
 - データ行の中のバックスラッシュ・改行・CR は `\\` / `\n` / `\r` にエスケープして返す
   （`RykDb.Client` が読み取り時に元へ戻す）。
   TEXT に生の改行が入っていても 1応答 = 1行を保つ。
@@ -1516,13 +1533,13 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 ### 12.1 採用しなかったもの
 
-| もの                  | 理由                                                          |
-| --------------------- | ------------------------------------------------------------- |
-| B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針       |
-| 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）                   |
-| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                                  |
-| ブロック圧縮 / 暗号化 | スコープ外                                                    |
-| lock-free データ構造  | 書き込みを 1 本のハンドル系譜に直列化する規約で足りる（§7.7） |
+| もの                  | 理由                                                                            |
+| --------------------- | ------------------------------------------------------------------------------- |
+| B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針                         |
+| 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）                                     |
+| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                                                    |
+| ブロック圧縮 / 暗号化 | スコープ外                                                                      |
+| lock-free データ構造  | 公開 API を 1 本の `Session` の `lock` で直列化し、内部は不変値で足りる（§7.7） |
 
 ### 12.2 既知の制約
 
@@ -1560,18 +1577,18 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`、読み取り専用トランザクションは未対応
   （`sql-reference.md` §12/§14）。
 - **同じ root はプロセス内で 1つしか開けない**（§7.9）。
-  2回目の `Database.OpenWith` は `IoError`。
+  2回目の `Session.OpenWith` は `IoError`。
   別プロセスが開いていても `IoError`。
   クラッシュ再現テストに限り、`RowStore.openStoreTakingOver` と `Database.OpenWithStore` で例外的に二重に開く。
-- **TCP サーバは接続ごとに逐次処理で、ハンドルは接続間で引き継がれる**（§11.3）。
+- **TCP サーバは接続ごとに逐次処理で、`Session` は接続間で引き継がれる**（§11.3）。
   明示 transaction の途中で切れた場合は rollback してから次の接続へ渡す。
-- **同一 `Database` ハンドルを複数スレッドで使うと書き込みが失われる**（状態はマージされない。§7.7）。
-  並行させたいときは DB を分けるか、1本のハンドルをキューで直列化する。
+- **同一 `Session` を複数スレッドで使うと呼び出しは `lock` で直列化される**（§7.7）。
+  ただし 1つの transaction を複数スレッドで共有しないこと。並行性を上げたいときは DB を分ける。
 - **MVCC の古い版は compaction まで回収されない**
   （GC は最古の active snapshot から見えない版を捨てる。ファイル単位では判定しない）。
 - 結合アルゴリズムは `ON` の等値キー・左の見積り・**両入力の走査順**で自動選択する（§5.1）。
   等値キーでも列型が違う場合は入れ子ループになる。
-- **明示 transaction の状態はプロセス内のみ**（`Database` ハンドルが持つ `Manager`）。
+- **明示 transaction の状態はプロセス内のみ**（`Session` が保持する `Database` の `Manager`）。
   未コミットの書き込みは WAL に残っていても再生されない。
 - **ActiveSnapshot はプロセス内のすべてのハンドル分をまとめて扱う**（`ActiveSnapshotRegistry`）。
   別ハンドルの長い transaction も GC 境界に反映される。
