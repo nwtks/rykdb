@@ -5,14 +5,6 @@ RykDb（**.NET 10 / F# 10**）のビルド・テスト・品質ゲート。
 コーディング規約は [`coding-conventions.md`](coding-conventions.md)、
 実際に踏んだ落とし穴は [`gotchas.md`](gotchas.md) を参照。
 
-## 基本方針
-
-- **クロスプラットフォーム**: 特定の OS に依存しない。
-  パス操作・ファイル I/O・プロセス間排他などは .NET のクロスプラットフォーム API
-  （`System.IO.Path` / `Environment` / `FileShare` 等）を使い、
-  OS 固有のパス区切り・コマンド・API を直接呼ばない。
-  CI は Linux で走るが、Windows / macOS でも同じ挙動を保つこと。
-
 ---
 
 ## 目次
@@ -38,7 +30,7 @@ dotnet fantomas src/ tests/   # 整形
 | `TreatWarningsAsErrors` | **有効**                          |
 | `LangVersion`           | `10.0`                            |
 | `WarningLevel`          | `3`                               |
-| Core の命令型構文・機能 | `mutable` / `while` / `ref` = 0件（例外: 公開セッション層 `Session.fs`） |
+| Core の命令型構文・機能 | `mutable` / `while` / `ref` = 0件 |
 
 > **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
 > （[`gotchas.md`](gotchas.md) §10.4）。
@@ -96,13 +88,14 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 - `SqlReferenceTests` — [`sql-reference.md`](sql-reference.md) の構文・意味論
   （文・句・式・リテラル・識別子が受理 / 拒否され、評価結果も仕様どおりであること）。
   テスト名の接頭辞は `SqlReference:`。
-- `DatabaseTests` — ハンドル API と内部機構（MVCC / WAL / プロセスロック /
-  索引の backfill・後始末 / snapshot 登録 / 永続性 / 性能 / 末尾再帰）。
+- `DatabaseTests` — ハンドル API と内部機構
+  （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / snapshot 登録 / 永続性 / 性能 / 末尾再帰）。
 
 **書き方**:
 
 - 1テスト = 1関数。
-  `let ``説明`` () = ...` の**関数形**（FS0842: 関数でない場合、テストとして認識されず無視される）。
+  `let ``説明`` () = ...` の**関数形**
+  （FS0842: 関数でない場合、テストとして認識されず無視される）。
 - 共通ヘルパー（`ok` / `withDir` / `asInt` / 乱数生成）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
   ファイル固有の fixture（スキーマなど）は各ファイルに private で置く。
 - `withStore` / `withDb` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。

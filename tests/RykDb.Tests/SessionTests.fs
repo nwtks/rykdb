@@ -7,6 +7,7 @@
 
 module RykDb.SessionTests
 
+open System.Threading
 open System.Threading.Tasks
 open Xunit
 open RykDb.Core
@@ -20,6 +21,91 @@ let private withSession (tag: string) (f: Session -> unit) =
             f session
         finally
             session.Close() |> ignore)
+
+/// 走査と書き込みを任意のタイミングで止めるためのゲート。
+/// 並行性テストで「読み取りが書き込み中に進む」ことを決定的に確かめる。
+type private EngineGates() =
+    let scanGate = new ManualResetEventSlim(true)
+    let writeGate = new ManualResetEventSlim(true)
+
+    member val ScanEntered = new ManualResetEventSlim(false)
+    member val WriteEntered = new ManualResetEventSlim(false)
+
+    member this.BlockScans() =
+        this.ScanEntered.Reset()
+        scanGate.Reset()
+
+    member _.ResumeScans() = scanGate.Set()
+
+    member this.BlockWrites() =
+        this.WriteEntered.Reset()
+        writeGate.Reset()
+
+    member _.ResumeWrites() = writeGate.Set()
+    member _.WaitScan() = scanGate.Wait()
+    member _.WaitWrite() = writeGate.Wait()
+
+/// 内側のエンジンに委譲しつつ、ScanAt / WriteBatch だけゲートで止める。
+type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
+    interface IStorageEngine with
+        member _.NextSeqNo = inner.NextSeqNo
+        member _.ActiveSnapshot = inner.ActiveSnapshot
+        member _.HostState = inner.HostState
+        member _.GetAt visible key = inner.GetAt visible key
+
+        member _.ScanAt visible startKey limit =
+            gates.ScanEntered.Set()
+            gates.WaitScan()
+            inner.ScanAt visible startKey limit
+
+        member _.WriteBatch entries =
+            gates.WriteEntered.Set()
+            gates.WaitWrite()
+
+            inner.WriteBatch entries
+            |> Result.map (fun next -> GatedEngine(gates, next) :> IStorageEngine)
+
+        member _.WithNextSeqNo next =
+            GatedEngine(gates, inner.WithNextSeqNo next) :> IStorageEngine
+
+        member _.WithActiveSnapshot snapshot =
+            GatedEngine(gates, inner.WithActiveSnapshot snapshot) :> IStorageEngine
+
+        member _.WithHostState state =
+            GatedEngine(gates, inner.WithHostState state) :> IStorageEngine
+
+        member _.FlushIfNeeded allocate =
+            inner.FlushIfNeeded allocate
+            |> Result.map (fun (next, flushed) -> GatedEngine(gates, next) :> IStorageEngine, flushed)
+
+        member _.MaybeFlush() =
+            inner.MaybeFlush()
+            |> Result.map (fun next -> GatedEngine(gates, next) :> IStorageEngine)
+
+        member _.Close() = inner.Close()
+
+/// ゲート付きメモリエンジンの上に Session を組み立ててテストする。
+/// `Session` の internal ctor と `Database.OpenWithStore` を使う。
+let private withGatedSession (_tag: string) (f: Session -> EngineGates -> unit) =
+    let gates = EngineGates()
+    let root = "mem:" + System.Guid.NewGuid().ToString "N"
+
+    let store = openStoreWith "" (GatedEngine(gates, memoryEngine ()) :> IStorageEngine)
+
+    let db = ok (Database.OpenWithStore root store)
+    let session = new Session(root, db)
+
+    try
+        f session gates
+    finally
+        gates.ResumeScans()
+        gates.ResumeWrites()
+        session.Close() |> ignore
+
+/// ブロックして待つ処理は専用スレッドで動かす。
+/// スレッドプールが他のテストで飽和していても開始が遅れない。
+let private startDedicated (f: unit -> 'T) =
+    Task.Factory.StartNew(f, TaskCreationOptions.LongRunning)
 
 [<Fact>]
 let ``Session: ハンドルなしで連続実行できる`` () =
@@ -193,6 +279,124 @@ let ``Session: 同一 Session を複数スレッドで使っても書き込み�
 
         let count = ok (session.Execute "SELECT COUNT(*) FROM t")
         Assert.Equal<int64>(int64 rowCount, asInt count.Rows.[0].[0]))
+
+[<Fact>]
+let ``Session: 読み取りは実行中の書き込みを待たない`` () =
+    withGatedSession "session-read-during-write" (fun session gates ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1)") |> ignore
+        gates.BlockWrites()
+
+        let writer =
+            startDedicated (fun () -> session.Execute "INSERT INTO t VALUES (2)" |> ok |> ignore)
+
+        Assert.True(gates.WriteEntered.Wait 5000, "書き込みが始まりません")
+
+        // 書き込みが WriteBatch で止まっている間に SELECT が完了する。
+        let selected = ok (session.Execute "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(1L, asInt selected.Rows.[0].[0])
+
+        gates.ResumeWrites()
+        Assert.True(writer.Wait 10000, "書き込みが完了しません")
+
+        let after = ok (session.Execute "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(2L, asInt after.Rows.[0].[0]))
+
+[<Fact>]
+let ``Session: 書き込みは実行中の読み取りを待たない`` () =
+    withGatedSession "session-write-during-read" (fun session gates ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1)") |> ignore
+        gates.BlockScans()
+
+        let reader = startDedicated (fun () -> session.Execute "SELECT COUNT(*) FROM t")
+        Assert.True(gates.ScanEntered.Wait 5000, "読み取りが始まりません")
+
+        let inserted = ok (session.Execute "INSERT INTO t VALUES (2)")
+        Assert.Equal<int>(1, inserted.RowsAffected)
+
+        gates.ResumeScans()
+        Assert.True(reader.Wait 10000, "読み取りが完了しません")
+
+        // 読み取りはスナップショットなので、開始後に commit された行は見えない。
+        match reader.Result with
+        | Ok selected -> Assert.Equal<int64>(1L, asInt selected.Rows.[0].[0])
+        | Error e -> Assert.Fail(sprintf "読み取りが失敗しました: %s" (DbError.toDisplayString e)))
+
+[<Fact>]
+let ``Session: Close は実行中の読み取りの完了を待つ`` () =
+    withGatedSession "session-close-drain" (fun session gates ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1)") |> ignore
+        gates.BlockScans()
+
+        let reader = startDedicated (fun () -> session.Execute "SELECT COUNT(*) FROM t")
+        Assert.True(gates.ScanEntered.Wait 5000, "読み取りが始まりません")
+
+        let closing = startDedicated (fun () -> session.Close())
+        Thread.Sleep 200
+        Assert.False(closing.IsCompleted, "Close が実行中の読み取りを待っていません")
+
+        gates.ResumeScans()
+        Assert.True(reader.Wait 10000, "読み取りが完了しません")
+        Assert.True(closing.Wait 10000, "Close が完了しません")
+
+        match reader.Result with
+        | Ok selected -> Assert.Equal<int64>(1L, asInt selected.Rows.[0].[0])
+        | Error e -> Assert.Fail(sprintf "読み取りが失敗しました: %s" (DbError.toDisplayString e))
+
+        expectErrorKind ErrorKind.InternalError "Close 後の Execute が成功しました" (session.Execute "SELECT 1"))
+
+[<Fact>]
+let ``Session: 並行読み取りは commit 済みの一貫した snapshot を見る`` () =
+    withSession "session-parallel-read" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+
+        let batchSize = 10
+        let batches = 20
+
+        let writer =
+            Task.Run(fun () ->
+                for b in 1..batches do
+                    let values =
+                        [ 1..batchSize ]
+                        |> List.map (fun i -> sprintf "(%d)" ((b - 1) * batchSize + i))
+                        |> String.concat ", "
+
+                    ok (session.Execute(sprintf "INSERT INTO t VALUES %s" values)) |> ignore)
+
+        let readers =
+            [ 1..4 ]
+            |> List.map (fun _ ->
+                Task.Run(fun () ->
+                    for _ in 1..20 do
+                        let count = ok (session.Execute "SELECT COUNT(*) FROM t")
+                        let n = asInt count.Rows.[0].[0]
+
+                        Assert.True(n % int64 batchSize = 0L, sprintf "commit 途中の batch が見えています: %d 行" n)))
+
+        Task.WaitAll(Array.append [| writer |] (List.toArray readers))
+
+        let finalCount = ok (session.Execute "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(int64 (batchSize * batches), asInt finalCount.Rows.[0].[0]))
+
+[<Fact>]
+let ``Session: ExecuteTracked は transaction の遷移を返す`` () =
+    withSession "session-tracked" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        let change (r: Result<StatementResult * SessionTransactionChange, DbError>) = r |> ok |> snd
+        Assert.Equal(SessionTransactionChange.NoChange, change (session.ExecuteTracked "SELECT 1"))
+        Assert.Equal(SessionTransactionChange.Started, change (session.ExecuteTracked "BEGIN"))
+        Assert.Equal(SessionTransactionChange.NoChange, change (session.ExecuteTracked "INSERT INTO t VALUES (1)"))
+        Assert.Equal(SessionTransactionChange.Ended, change (session.ExecuteTracked "ROLLBACK"))
+        Assert.Equal(SessionTransactionChange.NoChange, change (session.ExecuteTracked "SELECT 1"))
+
+        Assert.Equal(
+            SessionTransactionChange.Started,
+            change (session.ExecuteTracked "BEGIN; INSERT INTO t VALUES (2)")
+        )
+
+        Assert.Equal(SessionTransactionChange.Ended, change (session.ExecuteTracked "COMMIT")))
 
 [<Fact>]
 let ``Session: 空 SQL は 0 行の結果を返す`` () =

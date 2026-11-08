@@ -98,7 +98,7 @@ module internal RowStore =
     let writeBatchesWithSnapshot (activeSnapshot: uint64) (batches: (string * Entry array) list) (store: RowStore) =
         let flushAndPublish (bumped: IStorageEngine) (host: EngineHost) =
             host.WithInstallGate(fun () ->
-                let state = host.Current()
+                let state = host.Current
                 let hinted = bumped.WithHostState state
 
                 hinted.FlushIfNeeded host.AllocateFileNumber
@@ -413,7 +413,7 @@ module internal RowStore =
             | None -> store.Engine
             | Some host ->
                 host.Shutdown()
-                store.Engine.WithHostState(host.Current())
+                store.Engine.WithHostState host.Current
 
         let outcome = engine.Close()
 

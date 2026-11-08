@@ -1808,14 +1808,20 @@ merge 中に foreground の flush や新しい transaction が入り得る。
 - 読み取りは Session 呼び出し単位で Version 全ファイルを pin する。
   worker は入力の実ファイルを即削除せず、retired にして refcount が 0 になってから消す。
   `SstScan` 自体には pin を配線していないため、早期終了で FileStream が残る既存問題は別。
-- close は cancel → signal → worker join → flush → WAL 削除 → ProcessLock 解放。
+- close は cancel → **無条件の signal** → worker join → flush → WAL 削除 → ProcessLock 解放。
   worker が install 中でも join が完了してから WAL を消す。
+  Pending ビットが立っていても、worker が既に signal を消費して Pending を消す前かもしれない。
+  この状態で release を省略すると cancel 後の `signal.Wait()` から永久に戻らず、close がハングする
+  （`SessionTests` の短命な open/close で実際に発生した）。
 - **破棄したあとは GC 境界を下げて publish する**。
   境界を戻さないと、次のサイクルも同じ判定で破棄し続けて前進しない
   （古い transaction が開いている間、compaction が終わらない）。
-- **pin は「文ごと」に取る**。
-  `Session.Execute` で複数文を 1回の lease で囲むと、
-  途中の文の flush で Version が進んだあとの文が pin 外のファイルを読む。
+- **pin は「実際に読むハンドルの Version」に対して取る**。
+  書き込みを含む `Session.Execute` バッチで複数文を 1回の lease で囲むと、
+  途中の文の flush で Version が進んだあとの文が pin 外のファイルを読む
+  （書き込みバッチは文ごとに pin する）。
+  読み取りバッチは SELECT が state を変えないのでハンドルが変わらない。
+  入口で 1回 pin してバッチ全体をそのハンドルで実行してよい（§11.53 と同じ条件）。
 - **Idle 判定は単一の状態で行う**。
   busy と pending を別々に持つと、 worker が pending を消してから busy を立てる間や、
   2つを別々に読む間に `IsIdle` が true を返し、
@@ -1823,6 +1829,9 @@ merge 中に foreground の flush や新しい transaction が入り得る。
   `EngineHost` は `Idle` / `Busy` / `Pending` を 1つの CAS セルで持つ。
   `Signal` の wake 要否は pending を立てる**前**の値で判断する
   （更新後の値を見ると release が漏れて worker が起動せず、テストがハングする）。
+  **Shutdown だけは例外**で、Pending の有無に関係なく `signal.Release()` する。
+  Pending は「signal 未消費」を意味しない（worker が permit を消費した直後、
+  Pending を消す前に close が割り込むと、Pending あり・permit なしになる）ため。
 - **worker の開始はリカバリ後**。
   `Database.OpenWithStore` のカタログ読込と DROP 後始末が終わってから `RowStore.startBackground` を呼ぶ。
   先に動かすと、リカバリの走査中に入力ファイルが retired / 削除され得る。
@@ -1835,3 +1844,63 @@ merge 中に foreground の flush や新しい transaction が入り得る。
   `background compaction: Close しなくても install 済みの行は再オープンで残る` /
   `background compaction: flush と install が競合してもファイル番号が重複しない` /
   `background compaction: DB を開いた時点で未 compaction の L0 を解消する`。
+
+### 11.53 Session の並行読み取りは「捕捉と pin を同じ短いロックで」行う
+
+並行読み取りを入れるときの落とし穴。
+
+❌ `let db = current` をロックで取ってから、ロックを外して `db.AcquireSnapshot()`。
+捕捉したハンドルの snapshot seq は古いのに、pin する Version は新しい。
+間に commit + flush + compaction が入ると、古い snapshot に必要な版が GC され、
+「その時点では見えていた行」が読めなくなる
+（`RowStore.acquireSnapshot` は host の最新 Version でハンドルを作り直すため）。
+
+✅ `stateGate` の下で `current.AcquireSnapshot()` まで行い、`(db, lease)` を取ってからロックを外す。
+pin した Version とハンドルの snapshot seq が一致する。
+
+❌ 読み取りで `current <- next` を書き戻す。
+読み取りは state を変えないので不要なうえ、実行中の書き込みのハンドルを古いもので上書きする競合になる。
+
+✅ 読み取りはハンドルをローカルにスレッドして終わり。
+`current` には触らない。
+
+❌ `Close` が `readers` を待たずに store を閉じる。
+実行中の読み取りが close 後の engine / WAL を触る。
+
+✅ `closed <- true` の後に `readers = 0` まで `Monitor.Wait` してから rollback + close。
+
+回帰テスト: `Session: 読み取りは実行中の書き込みを待たない` /
+`Session: 書き込みは実行中の読み取りを待たない` /
+`Session: Close は実行中の読み取りの完了を待つ` /
+`Session: 並行読み取りは commit 済みの一貫した snapshot を見る`。
+
+### 11.54 TCP サーバの切断 rollback は「transaction を開始した接続」だけ
+
+❌ 切断時に `if session.InTransaction then Rollback()`。
+複数接続が Session を共有すると、関係ない接続の切断で他の transaction が消える。
+
+✅ `Session.ExecuteTracked` の `SessionTransactionChange`（`Started` / `Ended`）で所有権を追い、
+所有接続の切断時だけ rollback する。
+
+回帰テスト: `TCP: 他接続の切断は transaction を rollback しない` /
+`TCP: 接続中の接続があっても新しい接続を受け付ける`。
+
+### 11.55 background compaction の worker は専用スレッドで起動する
+
+❌ `EngineHost.Start()` を `Task.Factory.StartNew` の既定スケジューラ（=`Task.Run`）で起動する。
+worker は `signal.Wait()` でブロックし続ける長寿命タスクなので、
+スレッドプールが混雑していると `WaitingToRun` のままキューに積まり、
+書き込みは L0 に揃っても compaction がいつまでも始まらない。
+
+✅ `TaskCreationOptions.LongRunning` で専用スレッドを起こす。
+スレッドプールの可用性に依存しない。
+
+- 起動が遅れているときの診断は `EngineHost.Activity` と `EngineHost.WorkerStatus`。
+  `WorkerStatus = WaitingToRun` かつ `Activity = Pending` なら未スケジュールが原因で、
+  `ThreadPool.PendingWorkItemCount` を見るとプールの枯渇が分かる。
+  `L0=4`（トリガ条件は満たされている）なのに compaction が動かない、という切り分けになる。
+- `LongRunning` のスレッドは background thread なので、
+  store を閉じ忘れた worker が残っていてもプロセス終了は妨げない。
+
+回帰テスト: `background compaction: 開始後に古い snapshot が現れたら境界を下げてやり直す`
+（`started.Wait 5000` が false になると「compaction が開始されません」で落ちる）。

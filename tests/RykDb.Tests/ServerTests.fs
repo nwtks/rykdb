@@ -511,3 +511,164 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
                 Directory.Delete(dir, true)
             with _ ->
                 ()
+
+/// 複数接続のテスト用: サーバを起動し、割り当てられたポートを渡す。
+let private withTestServer (tag: string) (f: int -> unit) =
+    let dir = newDir tag
+    let session = ok (Session.OpenWith dir)
+    let listener = new TcpListener(IPAddress.Loopback, 0)
+    listener.Start()
+    let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+    let cts = new CancellationTokenSource()
+    let finished = new ManualResetEventSlim false
+
+    // accept でブロックするので専用スレッドで動かす（他のテストのプール飽和に影響されない）。
+    Task.Factory.StartNew(
+        (fun () ->
+            try
+                serve session listener cts.Token (fun _ -> ())
+            finally
+                finished.Set()),
+        TaskCreationOptions.LongRunning
+    )
+    |> ignore
+
+    try
+        f port
+    finally
+        cts.Cancel()
+
+        if not (finished.Wait 10000) then
+            Assert.Fail "サーバが 10 秒以内に停止しませんでした"
+
+        cts.Dispose()
+        session.Close() |> ignore
+
+        if Directory.Exists dir then
+            try
+                Directory.Delete(dir, true)
+            with _ ->
+                ()
+
+[<Fact>]
+let ``TCP: 接続中の接続があっても新しい接続を受け付ける`` () =
+    withTestServer "tcp-concurrent-accept" (fun port ->
+        // A は接続したまま何も送らない。逐次 accept の実装では B が処理されずここで止まる。
+        use rawA = new TcpClient("127.0.0.1", port)
+        rawA.ReceiveTimeout <- 10000
+        let streamA = rawA.GetStream()
+
+        use readerA =
+            new StreamReader(streamA, System.Text.Encoding.UTF8, false, 1024, true)
+
+        use writerA = new StreamWriter(streamA, System.Text.Encoding.UTF8, 1024, true)
+        writerA.AutoFlush <- true
+
+        // A が接続中のまま B が接続して応答を得る。
+        use clientB = new RykDbClient("127.0.0.1", port)
+        let cols, _ = okRows (clientB.Send ".ping")
+        Assert.Equal<string list>([ "pong" ], cols)
+
+        // A もそのまま使える。
+        writerA.WriteLine ".ping"
+        Assert.Equal<string>("OK 0\tpong", readerA.ReadLine()))
+
+[<Fact>]
+let ``TCP: 2 接続から並行に SELECT できる`` () =
+    withTestServer "tcp-parallel-select" (fun port ->
+        use clientA = new RykDbClient("127.0.0.1", port)
+        okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        okRows (clientA.Send "INSERT INTO t VALUES (1), (2), (3)") |> ignore
+        use clientB = new RykDbClient("127.0.0.1", port)
+
+        let reads =
+            [ clientA; clientB ]
+            |> List.map (fun client ->
+                Task.Run(fun () ->
+                    for _ in 1..20 do
+                        let _, rows = okRows (client.Send "SELECT COUNT(*) FROM t")
+                        Assert.Equal<string list>([ "3" ], rows)))
+
+        Task.WaitAll(List.toArray reads))
+
+[<Fact>]
+let ``TCP: 他接続の切断は transaction を rollback しない`` () =
+    withTestServer "tcp-txn-owner" (fun port ->
+        use clientA = new RykDbClient("127.0.0.1", port)
+        okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        okRows (clientA.Send "BEGIN") |> ignore
+        okRows (clientA.Send "INSERT INTO t VALUES (1)") |> ignore
+
+        // B は接続してすぐ切る（切断時に他接続の transaction を巻き戻さない）。
+        do
+            use clientB = new RykDbClient("127.0.0.1", port)
+
+            Assert.True(
+                match clientB.Send ".exit" with
+                | Halt -> true
+                | _ -> false
+            )
+
+        // A の transaction は生きている。
+        let _, rows = okRows (clientA.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "1" ], rows)
+
+        okRows (clientA.Send "ROLLBACK") |> ignore
+        let _, after = okRows (clientA.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "0" ], after))
+
+[<Fact>]
+let ``TCP: transaction は Session 共有として他接続からも見える`` () =
+    withTestServer "tcp-txn-shared" (fun port ->
+        use clientA = new RykDbClient("127.0.0.1", port)
+        okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        okRows (clientA.Send "BEGIN") |> ignore
+        okRows (clientA.Send "INSERT INTO t VALUES (1)") |> ignore
+
+        // Session は 1 論理接続なので、B の読み取りも A の transaction を見る。
+        use clientB = new RykDbClient("127.0.0.1", port)
+        let _, rows = okRows (clientB.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "1" ], rows)
+        okRows (clientA.Send "ROLLBACK") |> ignore)
+
+[<Fact>]
+let ``TCP: 接続中でも serve は停止できる`` () =
+    let dir = newDir "tcp-stop-active"
+    let session = ok (Session.OpenWith dir)
+    let listener = new TcpListener(IPAddress.Loopback, 0)
+    listener.Start()
+    let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+    let cts = new CancellationTokenSource()
+    let finished = new ManualResetEventSlim false
+
+    Task.Run(fun () ->
+        try
+            serve session listener cts.Token (fun _ -> ())
+        finally
+            finished.Set())
+    |> ignore
+
+    try
+        use raw = new TcpClient("127.0.0.1", port)
+        raw.ReceiveTimeout <- 10000
+        let stream = raw.GetStream()
+        use writer = new StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
+        writer.AutoFlush <- true
+        writer.WriteLine ".ping"
+        use reader = new StreamReader(stream, System.Text.Encoding.UTF8, false, 1024, true)
+        Assert.Equal<string>("OK 0\tpong", reader.ReadLine())
+
+        // 接続を開いたまま停止を要求する。
+        cts.Cancel()
+        Assert.True(finished.Wait 10000, "接続中に serve が停止できませんでした")
+    finally
+        cts.Cancel()
+        finished.Wait 5000 |> ignore
+        cts.Dispose()
+        session.Close() |> ignore
+
+        if Directory.Exists dir then
+            try
+                Directory.Delete(dir, true)
+            with _ ->
+                ()

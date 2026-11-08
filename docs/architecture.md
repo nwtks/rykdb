@@ -123,21 +123,21 @@ flowchart TB
 
 ### 採用している手法（サマリ）
 
-| 領域       | 手法・アルゴリズム                                                                      | 詳細                                                |
-| ---------- | --------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                             | §8                                                  |
-| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                          | §8.1                                                |
-| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v5（84バイト）                        | §8.2                                                |
-| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                   | §8.4–8.5                                            |
-| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                   | §8.6                                                |
-| 並行制御   | **Session で直列化 + MVCC（Snapshot Isolation）** + first-committer-wins。DDL だけ排他  | §7                                                  |
-| compaction | **background worker**（`Session.OpenWith`）。MANIFEST 追記と採番は installGate で直列化 | §8.6–8.7                                            |
-| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                                  | §4                                                  |
-| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                               | §6                                                  |
-| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                             | §5.2                                                |
-| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                           | §3                                                  |
-| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                     | [`coding-conventions.md`](coding-conventions.md) §1 |
-| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                       | §4.2, §8.1                                          |
+| 領域       | 手法・アルゴリズム                                                                                        | 詳細                                                |
+| ---------- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                                               | §8                                                  |
+| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                                            | §8.1                                                |
+| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v5（84バイト）                                          | §8.2                                                |
+| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                                     | §8.4–8.5                                            |
+| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                                     | §8.6                                                |
+| 並行制御   | **Session で読み取り並行・書き込み直列** + MVCC（Snapshot Isolation）+ first-committer-wins。DDL だけ排他 | §7                                                  |
+| compaction | **background worker**（`Session.OpenWith`）。MANIFEST 追記と採番は installGate で直列化                   | §8.6–8.7                                            |
+| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                                                    | §4                                                  |
+| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                                                 | §6                                                  |
+| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                                               | §5.2                                                |
+| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                                             | §3                                                  |
+| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                                       | [`coding-conventions.md`](coding-conventions.md) §1 |
+| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                                         | §4.2, §8.1                                          |
 
 ### 依存の向き
 
@@ -957,25 +957,31 @@ commit 成功・rollback・`Close` で解除する。
 複数文を 1回の `Execute` に渡した場合も 1文ずつ実行し、各文が成功するたびに現在のハンドルを更新する。
 そのため途中の文が失敗しても、それ以前に成功した文の状態（と `BEGIN` 後の開いた transaction）は失われない。
 
-### 7.7 同時実行制御 — 並行性は値、公開 API は Session で直列化、DDL だけ排他
+### 7.7 同時実行制御 — 並行性は値、Session は読み取り並行・書き込み直列、DDL だけ排他
 
-`Session` 層を除く通常の書き込み経路に `lock` / `Monitor` / `Interlocked` はない。
+`Session` 層を除く通常の読み書き経路に `lock` / `Monitor` / `Interlocked` はない。
 同時実行制御は次の 4層の組み合わせで成り立っている。
 
-| 層                 | 役割                           | 詳細                                                                                                                                                                                                     |
-| ------------------ | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. 不変レコード    | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                                  |
-| 2. `Session`       | **公開 API の直列化の単位**    | `Session` が `lock` で `Execute` / `Begin` / `Commit` / `Rollback` を直列化し、現在の `Database` ハンドルを保持する。`StorageEngine` 内部の WAL / flush / close は DB ディレクトリ単位の Gate で保護する |
-| 3. MVCC + 競合検査 | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                                          |
-| 4. keyspace 接頭辞 | **論理的な分離**               | `t:` / `i:` / `__catalog__` は 1本の LSM 上で接頭辞により分離される。物理ツリーは共有するため、テーブル間の並列性は提供しない（§6.1）                                                                    |
+| 層                 | 役割                           | 詳細                                                                                                                                                                                                                                                                                                                                     |
+| ------------------ | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. 不変レコード    | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                                                                                                                                                                  |
+| 2. `Session`       | **公開 API の並行性の単位**    | SELECT のみの `Execute` は `stateGate`（入口・出口の短い区間）だけで複数スレッド／複数接続から並行実行できる。書き込み・`Begin` / `Commit` / `Rollback`・`Close` は `writeGate` で直列化し、現在の `Database` ハンドルは `stateGate` の下で更新する。`StorageEngine` 内部の WAL / flush / close は DB ディレクトリ単位の Gate で保護する |
+| 3. MVCC + 競合検査 | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                                                                                                                                                                          |
+| 4. keyspace 接頭辞 | **論理的な分離**               | `t:` / `i:` / `__catalog__` は 1本の LSM 上で接頭辞により分離される。物理ツリーは共有するため、テーブル間の並列性は提供しない（§6.1）                                                                                                                                                                                                    |
 
 重要な含意は 2つ。
 
-1. **同じ DB（root）は 1本の `Session` 系譜を直列に使う**。
+1. **同じ DB（root）は 1本の `Session` で共有する**。
    独立した 2つの `OpenWith` はできない（§7.9）。
-   並行させたいときは **DB を分ける**か、1本の `Session` をキューで直列化する。
-   同一 `Session` への複数スレッドからの呼び出しは `lock` で直列化される。
-   ただし transaction の境界は呼び出し側が決めるため、複数スレッドで 1つの transaction を共有しないこと。
+   複数スレッド／複数接続で 1本の `Session` を共有でき、
+   **SELECT だけのバッチは並行実行**、書き込み・transaction 操作・`Close` は直列化される。
+   読み取りは呼び出し入口でハンドル捕捉と `AcquireSnapshot`（Version 全ファイルの pin）を**同じ短いロック区間で**行い、
+   実行中はロックを取らない（MVCC スナップショット読み）。
+   捕捉と pin を分けると、間に commit + flush + compaction が入ったとき
+   古い snapshot に必要な版が GC され得るので分けない。
+   `Close` は実行中の読み取りが終わるのを待ってから閉じる。
+   transaction は Session 全体で 1つ。複数接続で共有すると未 commit の行も見えるので、
+   複数スレッドで 1つの transaction を共有しないこと。
 2. **commit の直列化は「その経路を単一に通る」という規約**であり、
    `Session` の `lock` は公開 API の呼び出しを守るが、
    internal の `Database` を直接使うテストでは規約が前提になる。
@@ -990,7 +996,8 @@ commit 成功・rollback・`Close` で解除する。
   `writeBatch` / `maybeFlush` / `close` は DB のディレクトリ単位の Gate で直列化する。
   異なる DB の書き込みは並行に進められる（Gate 表はプロセス内で共有）。
   **プロセス全体の 1本の Gate にしない**（無関係な DB まで待たせない）。
-- **TCP サーバは完全逐次** — `AcceptTcpClient` → 1接続を処理 → 次の accept（§11.3）
+- **TCP サーバは接続ごとに Task** — accept ごとに `handleClient` を起動し、1つの `Session` を共有する（§11.3）。
+  読み取りは接続間で並行、書き込みは Session 内で直列。
 - **プロセス間は `.rykdb.format` で排他**する（root 直下、`FileShare.None`。§7.9）
 
 ### 7.8 DDL の排他（`RootGate`）
@@ -1391,7 +1398,7 @@ L0 が増えて読み取りのコスト（read amplification）と引き換え�
 - worker の起動はカタログ読込と DROP 後始末の後（`RowStore.startBackground`）。
   先に動かすとリカバリの走査中に入力ファイルが消え得る。
 - flush / compaction の失敗は commit を失敗させない（§9.2 / gotchas §11.51）。
-- close は cancel → worker join → engine refresh → flush → WAL 削除 → ProcessLock 解放の順。
+- close は cancel → worker 起床（無条件 signal）→ worker join → engine refresh → flush → WAL 削除 → ProcessLock 解放の順。
   出力ファイル境界で `shouldStop` を確認するため、進行中の merge は途中で止められる。
 - クラッシュ復旧の不変条件は同期版と同じ
   （出力 SST を fsync → MANIFEST → 入力 retire → 実削除、未参照ファイルは `.orphans/` へ退避）。
@@ -1562,17 +1569,26 @@ dotnet run --project src/RykDb.Cli -- -f script.sql ./mydata  # スクリプト�
 dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 ```
 
-1接続 = 1クライアント、逐次処理。1行のテキストを 1行ずつ交換する。
+1接続 = 1クライアント。
+接続ごとに `Task` を起動して並行に処理する。
+1行のテキストを 1行ずつ交換する。
 
-**並行性に関する制約（§7.7 参照）**:
+**並行性（§7.7 参照）**:
 
-- `serve` の accept ループは **接続を 1つずつ処理する**
-  （接続ごとの `Task` / スレッドは作らない）。
-  1接続内も while で逐次。
-- `serve` は 1つの `Session` を保持し、接続ごとに `handleClient` へ渡す。
-- `Session` が現在のハンドルを保持するため、
-  接続ごとの `mutable current` や `serve` 側の `currentDb` への引き継ぎは不要。
-- 明示 transaction が残っている場合は、切断時に `Rollback()` してから次の接続へ渡す。
+- accept ループは接続ごとに `Task` を起動する。
+  接続内の文は while で逐次。
+- `serve` は 1つの `Session` を全接続で共有する。
+  SELECT だけの文は接続間で並行実行され、書き込み・transaction 操作は Session 内で直列化される。
+- 明示 transaction は Session 全体で 1つ。
+  開始した接続が所有者になり、**切断時に rollback するのは所有者だけ**
+  （他接続の transaction を巻き戻さない）。
+  所有権は `Session.ExecuteTracked` の `SessionTransactionChange` で判定する。
+- 他の接続が transaction 中でも、その接続の文は同じ transaction に参加する
+  （1 Session = 1 論理接続の意味論）。
+  transaction は接続を跨ぐので、必要ならクライアント側で transaction を使う接続を 1本に限る。
+- 停止時は listener を止め、接続中のクライアントを閉じて `ReadLine` を解放し、
+  ハンドラの完了を待ってから `Session.Close()` する
+  （`Session.Close` は実行中の読み取りの drain も行う）。
 - データ行の中のバックスラッシュ・改行・CR は `\\` / `\n` / `\r` にエスケープして返す
   （`RykDb.Client` が読み取り時に元へ戻す）。
   TEXT に生の改行が入っていても 1応答 = 1行を保つ。
@@ -1618,13 +1634,13 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 ### 12.1 採用しなかったもの
 
-| もの                  | 理由                                                                            |
-| --------------------- | ------------------------------------------------------------------------------- |
-| B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針                         |
-| 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）                                     |
-| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                                                    |
-| ブロック圧縮 / 暗号化 | スコープ外                                                                      |
-| lock-free データ構造  | 公開 API を 1 本の `Session` の `lock` で直列化し、内部は不変値で足りる（§7.7） |
+| もの                  | 理由                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------- |
+| B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針                                           |
+| 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）                                                       |
+| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                                                                      |
+| ブロック圧縮 / 暗号化 | スコープ外                                                                                        |
+| lock-free データ構造  | 公開 API は 1 本の `Session` で読み取りを並行・書き込みを直列に扱い、内部は不変値で足りる（§7.7） |
 
 ### 12.2 既知の制約
 
@@ -1658,6 +1674,9 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **DDL はプロセス内で排他**（`RootGate`）。
   `CREATE INDEX` の backfill 中は他の文が待つ。
   同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。
+- **並行読み取りは Session 内の SELECT に限る**。
+  明示 transaction 中の読み取りは直列化される（read-your-writes を保つため）。
+  1つの `Session` を複数接続で共有すると transaction も共有される（§11.3）。
   登録はハンドルの GC で外れるが、参照が残っている間は `ConflictError` が続く。
 - **トランザクションの分離レベルは Snapshot Isolation（repeatable read）固定**。
   分離レベルの指定（`BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...`）、
@@ -1667,10 +1686,12 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   2回目の `Session.OpenWith` は `IoError`。
   別プロセスが開いていても `IoError`。
   クラッシュ再現テストに限り、`RowStore.openStoreTakingOver` と `Database.OpenWithStore` で例外的に二重に開く。
-- **TCP サーバは接続ごとに逐次処理で、`Session` は接続間で引き継がれる**（§11.3）。
-  明示 transaction の途中で切れた場合は rollback してから次の接続へ渡す。
-- **同一 `Session` を複数スレッドで使うと呼び出しは `lock` で直列化される**（§7.7）。
-  ただし 1つの transaction を複数スレッドで共有しないこと。並行性を上げたいときは DB を分ける。
+- **TCP サーバは接続ごとに `Task` で並行処理し、`Session` は接続間で共有される**（§11.3）。
+  SELECT は接続間で並行、書き込みは Session 内で直列。
+  明示 transaction の所有権は開始した接続にあり、切断時 rollback は所有者だけが行う。
+- **同一 `Session` を複数スレッドで使うと、SELECT だけの呼び出しは並行、その他は直列化される**（§7.7）。
+  ただし 1つの transaction を複数スレッドで共有しないこと。
+  書き込みを本気で並列化したいときは DB を分ける。
 - **MVCC の古い版は compaction まで回収されない**
   （GC は最古の active snapshot から見えない版を捨てる。ファイル単位では判定しない）。
 - 結合アルゴリズムは `ON` の等値キー・左の見積り・**両入力の走査順**で自動選択する（§5.1）。

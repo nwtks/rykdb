@@ -1,6 +1,7 @@
 // ===========================================================================
 // RykDb.Server — プロトコルとサーバ本体。
-// 1接続 = 1クライアント、逐次処理。
+// 1接続 = 1クライアント。接続ごとに Task を起動して並行に処理する。
+// 複数接続は 1つの Session を共有する（SELECT は並行、書き込みは Session 内で直列）。
 // 改行区切りの 1行テキストを交換し、応答の先頭タグで成否を分ける:
 //   OK <行数>\t<列名,...>   成功(続く行がデータ。SELECT は0行でも列名を返す)
 //   OK <行数>               DML など列を持たない成功
@@ -89,6 +90,19 @@ let private handleClient (onLog: string -> unit) (session: Session) (client: Sys
 
     writer.AutoFlush <- true
 
+    let mutable ownsTransaction = false
+
+    let runSql sql =
+        match session.ExecuteTracked sql with
+        | Error e -> Error e
+        | Ok(result, change) ->
+            match change with
+            | SessionTransactionChange.Started -> ownsTransaction <- true
+            | SessionTransactionChange.Ended -> ownsTransaction <- false
+            | SessionTransactionChange.NoChange -> ()
+
+            Ok result
+
     let send (line: string) =
         try
             writer.WriteLine line
@@ -126,16 +140,14 @@ let private handleClient (onLog: string -> unit) (session: Session) (client: Sys
                             let rows = names |> List.map (fun n -> [| SqlValue.Text n |]) |> List.toArray
                             running <- sendRows writer [| "tables" |] rows
                 | _ ->
-                    match session.Execute sql with
+                    match runSql sql with
                     | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
                     | Ok result -> running <- sendRows writer result.Columns result.Rows
 
-    if session.InTransaction then
+    if ownsTransaction && session.InTransaction then
         match session.Rollback() with
         | Ok() -> ()
         | Error e -> sprintf "切断時のロールバックに失敗しました: %s" (DbError.toDisplayString e) |> onLog
-
-    "切断されました" |> onLog
 
 let serve
     (session: Session)
@@ -150,28 +162,45 @@ let serve
             with _ ->
                 ())
 
+    let clients =
+        System.Collections.Concurrent.ConcurrentDictionary<int, System.Net.Sockets.TcpClient>()
+
+    let handlers =
+        System.Collections.Concurrent.ConcurrentDictionary<int, System.Threading.Tasks.Task>()
+
+    let handleConnection clientId client =
+        try
+            handleClient (fun m -> sprintf "[%d] %s" clientId m |> onLog) session client
+        with ex ->
+            sprintf "[%d] 例外: %s" clientId ex.Message |> onLog
+
+        try
+            if client.Client.Connected then
+                client.Client.Shutdown System.Net.Sockets.SocketShutdown.Send
+        with _ ->
+            ()
+
+        client.Close()
+        clients.TryRemove clientId |> ignore
+        handlers.TryRemove clientId |> ignore
+        sprintf "[%d] 切断されました" clientId |> onLog
+
     let mutable clientId = 0
+    let idGate = obj ()
 
     while not stop.IsCancellationRequested do
         try
             let client = listener.AcceptTcpClient()
             client.ReceiveTimeout <- 30000
-            clientId <- clientId + 1
-            sprintf "[%d] 接続されました" clientId |> onLog
 
-            try
-                handleClient (fun m -> sprintf "[%d] %s" clientId m |> onLog) session client
-            with ex ->
-                sprintf "[%d] 例外: %s" clientId ex.Message |> onLog
+            let cid =
+                lock idGate (fun () ->
+                    clientId <- clientId + 1
+                    clientId)
 
-            try
-                if client.Client.Connected then
-                    client.Client.Shutdown System.Net.Sockets.SocketShutdown.Send
-            with _ ->
-                ()
-
-            client.Close()
-            sprintf "[%d] 切断されました" clientId |> onLog
+            clients.[cid] <- client
+            sprintf "[%d] 接続されました" cid |> onLog
+            handlers.[cid] <- System.Threading.Tasks.Task.Run(fun () -> handleConnection cid client)
         with
         | :? System.ObjectDisposedException -> ()
         | :? System.InvalidOperationException when stop.IsCancellationRequested -> ()
@@ -182,4 +211,16 @@ let serve
                 sprintf "接続処理で例外: %s" ex.Message |> onLog
 
     listener.Stop()
+
+    for client in clients.Values do
+        try
+            client.Close()
+        with _ ->
+            ()
+
+    let pending = handlers.Values |> Seq.toArray
+
+    if pending.Length > 0 then
+        System.Threading.Tasks.Task.WaitAll(pending, 10000) |> ignore
+
     session.Close() |> ignore

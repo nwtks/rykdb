@@ -113,8 +113,8 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
 
         member _.Close() = ret ()
 
-/// メモリ上の StorageEngine を作る。
-let private newMemoryEngine () =
+/// メモリ上の StorageEngine を作る（`Session` を直接組み立てるテストにも使う）。
+let memoryEngine () =
     let state = MemoryEngineState()
     MemoryStorageEngine state :> IStorageEngine
 
@@ -130,8 +130,7 @@ let openStoreWith (root: string) (engine: IStorageEngine) =
     }
 
 /// メモリ上の RowStore を渡す（ディスク I/O なし）。
-let withStore (_tag: string) (f: RowStore -> unit) =
-    f (openStoreWith "" (newMemoryEngine ()))
+let withStore (_tag: string) (f: RowStore -> unit) = f (openStoreWith "" (memoryEngine ()))
 
 /// メモリ上の DB を開いてテストし、最後に閉じる（ディスク I/O なし）。
 /// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で差し替える。
@@ -143,7 +142,7 @@ let withStore (_tag: string) (f: RowStore -> unit) =
 /// </remarks>
 let withDb (_tag: string) (f: Database -> unit) =
     let root = "mem:" + System.Guid.NewGuid().ToString "N"
-    let store = openStoreWith "" (newMemoryEngine ())
+    let store = openStoreWith "" (memoryEngine ())
     let db = ok (Database.OpenWithStore root store)
 
     try

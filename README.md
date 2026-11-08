@@ -83,6 +83,11 @@ DB: ./mydata
 Ctrl+C で終了します。
 ```
 
+複数のクライアントが同時に接続でき、SELECT は接続間で並行に実行される
+（書き込みと transaction 操作は 1つの Session 内で直列化される）。
+明示 transaction は Session 全体で 1つなので、transaction を使う接続は 1 本に限ること
+（他接続の切断で勝手に rollback されないよう、切断 rollback は開始した接続だけが行う）。
+
 ### ライブラリ API
 
 ```fsharp
@@ -106,6 +111,8 @@ printfn "%A" result.RowsAffected  // 2
 
 result.ToDisplayLines()           // [ "id | v"; "------"; "  1, 10"; "  2, 20" ]
 ok (session.TableNames())         // [ "t" ]
+
+// SELECT だけの Execute は複数スレッドから並行に呼べる（書き込みは直列化される）。
 ok (session.Close())
 ```
 

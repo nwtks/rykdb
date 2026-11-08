@@ -1106,8 +1106,15 @@ ok (session.Close())
   （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）を返す。
   別の `RowStore` ができて memtable が分かれ、一方の commit が他方から見えないため。
   `Close()` してから開き直すこと。
-- 同一 `Session` への複数スレッドからの呼び出しは内部で直列化される。
-  ただし transaction の境界は呼び出し側が決めるため、複数スレッドで 1つの transaction を共有しないこと。
+- SELECT だけの `Execute`（1文でも複数文でも、すべて `SELECT`）は複数スレッド・複数接続から並行実行できる。
+  書き込み・`BEGIN` / `COMMIT` / `ROLLBACK`・`Close` は直列化される。
+- 読み取りは呼び出し開始時点のスナップショットで実行され、実行中の書き込みを待たない。
+  逆に書き込みも実行中の読み取りを待たない（`Close` だけは読み取りの完了を待つ）。
+- 実行中の transaction がある間は、読み取りも含めて直列化される（read-your-writes を保つため）。
+  transaction の境界は呼び出し側が決めるため、複数スレッドで 1つの transaction を共有しないこと。
+- `ExecuteTracked` は実行結果に加えて、
+  その呼び出しで transaction が始まった / 終わった / 変わらない（`SessionTransactionChange`）を返す。
+  サーバが接続ごとの transaction 所有権を判定するために使う。
 - 複数文を 1 回の `Session.Execute` に渡したとき、途中の文がエラーになっても
   それ以前に成功した文は確定済みのまま残る。
   `BEGIN` が成功した後にエラーになった場合は transaction が開いたままになるので、

@@ -42,7 +42,7 @@ let private refresh (store: RowStore) =
     match store.Host with
     | None -> store
     | Some host ->
-        let state = host.Current()
+        let state = host.Current
 
         { store with
             Engine = store.Engine.WithHostState state
@@ -61,7 +61,7 @@ let ``background compaction: flush 後に L0 が background で compaction さ�
                 current <- writeOne current i
 
             waitIdle host
-            let state = host.Current()
+            let state = host.Current
             Assert.True((Version.filesAt 0 state.Version).Length < 4)
             Assert.True((Version.filesAt 1 state.Version).Length > 0)
 
@@ -132,7 +132,7 @@ let ``background compaction: 読み取り中のファイルは削除されず、
 
             // compaction で実際に Version から外れたファイルだけを対象にする。
             let stillReferenced =
-                Version.allFiles (host.Current()).Version |> List.map _.FileNumber |> Set.ofList
+                Version.allFiles host.Current.Version |> List.map _.FileNumber |> Set.ofList
 
             let retired = pinned |> List.filter (fun n -> not (Set.contains n stillReferenced))
             Assert.NotEmpty retired
@@ -204,6 +204,33 @@ let ``background compaction: close は進行中の compaction を停止して再
             RowStore.close store |> ignore)
 
 [<Fact>]
+let ``background compaction: Pending が残った状態でも close が完了する`` () =
+    withDir "bg-close-pending" (fun dir ->
+        let store = openBackground dir 1 None
+        let host = store.Host |> Option.get
+        waitIdle host
+
+        // worker が signal を消費した直後に Pending だけが残った状態を再現する。
+        // close が Pending を見て起床を省略すると、worker join が永久に待つ。
+        let field =
+            typeof<EngineHost>
+                .GetField(
+                    "activity",
+                    System.Reflection.BindingFlags.Instance
+                    ||| System.Reflection.BindingFlags.NonPublic
+                )
+
+        let activity =
+            field.GetValue host :?> System.Collections.Concurrent.ConcurrentDictionary<string, int>
+
+        activity.["activity"] <- 2
+
+        let closing =
+            System.Threading.Tasks.Task.Run(fun () -> RowStore.close store |> ignore)
+
+        Assert.True(closing.Wait 10000, "Pending が残っていると close が完了しません"))
+
+[<Fact>]
 let ``background compaction: 開始後に古い snapshot が現れたら境界を下げてやり直す`` () =
     withDir "bg-gc-boundary" (fun dir ->
         let started = new ManualResetEventSlim false
@@ -239,15 +266,27 @@ let ``background compaction: 開始後に古い snapshot が現れたら境界�
                             current
                     )
 
-            Assert.True(started.Wait 5000, "compaction が開始されません")
+            let diag () =
+                let st = host.Current
+
+                sprintf
+                    "compaction が開始されません (pending=%d threads=%d L0=%d L1=%d gen=%d err=%A)"
+                    System.Threading.ThreadPool.PendingWorkItemCount
+                    System.Threading.ThreadPool.ThreadCount
+                    (Version.filesAt 0 st.Version).Length
+                    (Version.filesAt 1 st.Version).Length
+                    st.Generation
+                    st.LastCompactionError
+
+            Assert.True(started.Wait 5000, diag ())
 
             // compaction の開始後に、より古い snapshot（2）の transaction が現れる。
             let registration = ActiveSnapshotRegistry.register dir 2UL
             release.Set()
             waitIdle host
             // 開始時の境界 6 で作った出力は破棄され、境界 2 でやり直して install される。
-            Assert.Equal(2UL, host.Current().ActiveSnapshot)
-            Assert.True((Version.filesAt 0 (host.Current()).Version).Length < 4)
+            Assert.Equal(2UL, host.Current.ActiveSnapshot)
+            Assert.True((Version.filesAt 0 host.Current.Version).Length < 4)
 
             let refreshed = refresh current
 
@@ -309,7 +348,7 @@ let ``background compaction: flush と install が競合してもファイル番
                 current <- writeOne current i
 
             waitIdle host
-            let state = host.Current()
+            let state = host.Current
             let files = Version.allFiles state.Version
             Assert.Equal(files.Length, (files |> List.map _.FileNumber |> List.distinct).Length)
 
@@ -364,7 +403,7 @@ let ``background compaction: DB を開いた時点で未 compaction の L0 を�
         try
             let host = reopened.Host |> Option.get
             waitIdle host
-            Assert.True((Version.filesAt 0 (host.Current()).Version).Length < 4)
-            Assert.True((Version.filesAt 1 (host.Current()).Version).Length > 0)
+            Assert.True((Version.filesAt 0 host.Current.Version).Length < 4)
+            Assert.True((Version.filesAt 1 host.Current.Version).Length > 0)
         finally
             RowStore.close reopened |> ignore)

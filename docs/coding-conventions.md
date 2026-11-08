@@ -12,6 +12,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 2. [命令型の構文・機能を使わない](#2-命令型の構文機能を使わない)
 3. [末尾再帰を前提にする](#3-末尾再帰を前提にする)
 4. [予約語に注意](#4-予約語に注意)
+5. [クロスプラットフォームにする](#5-クロスプラットフォームにする)
 
 ---
 
@@ -54,8 +55,12 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 `src/RykDb.Core/` では **`mutable` / `while` / `ref` を 0件**に保つ。
 例外は公開セッション層の `Session.fs` だけで、次を意図的に使う。
 
-- `let mutable current` / `let mutable closed`: 現在の `Database` ハンドルと Close 状態を保持する。
-- `lock gate`: 同一 `Session` への `Execute` / `Begin` / `Commit` / `Rollback` を直列化する。
+- `let mutable current` / `let mutable closed` / `let mutable readers`:
+  現在の `Database` ハンドル、Close 状態、実行中の読み取り数を保持する。
+- `lock stateGate`: `current` / `closed` / `readers` を保護する短いロック。
+  読み取りは入口・出口でしか取らない。
+- `lock writeGate`: `Execute`（書き込みを含むバッチ）/ `Begin` / `Commit` / `Rollback` / `Close` を直列化する。
+- `Monitor.Wait` / `PulseAll`: `Close` が実行中の読み取りの完了を待つために使う。
 
 これらは `Session` の内部に閉じ込め、`Database` を internal にして外部へ漏らさない。
 
@@ -85,7 +90,8 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 
 `Directory.Build.props` で `<Tailcalls>true</Tailcalls>` を設定し、
 Debug ビルドでも F# に `tail.` プレフィックスを出させる
-（Debug の既定は `Tailcalls=false`、Release の既定は `true`）。JIT は `tail.` を尊重する。
+（Debug の既定は `Tailcalls=false`、Release の既定は `true`）。
+JIT は `tail.` を尊重する。
 ただし、JIT の自己再帰ループ化だけでは、相互再帰やクロージャ経由の呼び出しでスタックが残る。
 この設定により、CPS の継続呼び出しも実際の末尾呼び出しにする。
 `[<TailCall>]` は構文上の末尾性を検査する属性であり、コード生成方法は切り替えない。
@@ -127,8 +133,7 @@ Debug ビルドでも F# に `tail.` プレフィックスを出させる
   - `Op.map` / `Op.take` — 再帰が `Compute` の中にある。
     次の 1行を取り出すときに 1段ずつ評価されるので、フレームは積み上がらない。
     同じパターンが `Sstable.rangeScanPartial` の `scanEntries` / `loadBlock`
-    （ブロック読みを `SstScan.next` まで遅らせるため、続きの組み立てがラムダ内に入る）と
-    `SstScan.emit` にもある。
+    （ブロック読みを `SstScan.next` まで遅らせるため、続きの組み立てがラムダ内に入る）と `SstScan.emit` にもある。
   - `Plan.runSubquery` — 相関サブクエリの再計画用に自分自身を runner として渡す。
     実際の呼び出しは `Run` の末尾位置（`Result.bind` の継続）で起きるが、
     TailAudit は関数値を引数として渡す形を `bare` として非末尾に数えるため、
@@ -166,3 +171,11 @@ Debug ビルドでも F# に `tail.` プレフィックスを出させる
 `key` / `base` / `begin` / `new` / `old` / `type` / `value` は F# の予約語で、
 匿名レコードのフィールド名にも使えない。
 衝突例と回避策は [`gotchas.md`](gotchas.md) §8.10 を参照。
+
+## 5. クロスプラットフォームにする
+
+特定の OS に依存しない。
+パス操作・ファイル I/O・プロセス間排他などは .NET のクロスプラットフォーム API
+（`System.IO.Path` / `Environment` / `FileShare` 等）を使い、
+OS 固有のパス区切り・コマンド・API を直接呼ばない。
+CI は Linux で走るが、Windows / macOS でも同じ挙動を保つこと。

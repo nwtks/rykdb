@@ -306,7 +306,7 @@ type internal EngineHost
         let rec loop () =
             let current = activity.[activityKey]
 
-            if (current &&& Pending) <> 0 then
+            if current &&& Pending <> 0 then
                 true
             elif activity.TryUpdate(activityKey, current ||| Pending, current) then
                 false
@@ -320,7 +320,7 @@ type internal EngineHost
             signal.Release() |> ignore
 
     let finishWork () =
-        updateActivity (fun current -> if (current &&& Pending) <> 0 then Pending else Idle)
+        updateActivity (fun current -> if current &&& Pending <> 0 then Pending else Idle)
         |> ignore
 
     let loop () =
@@ -330,7 +330,7 @@ type internal EngineHost
             if cancel.IsCancellationRequested then
                 ()
             else
-                updateActivity (fun current -> (current ||| Busy) &&& ~~~Pending) |> ignore
+                updateActivity (fun current -> current ||| Busy &&& ~~~Pending) |> ignore
 
                 try
                     runCycle 4
@@ -347,7 +347,7 @@ type internal EngineHost
         step ()
 
     /// 現在の状態。
-    member _.Current() = stateCell.[stateKey]
+    member _.Current = stateCell.[stateKey]
 
     /// install / MANIFEST 追記を直列化する。
     member _.WithInstallGate(f: unit -> 'T) = withGate f
@@ -375,14 +375,24 @@ type internal EngineHost
 
     member _.Signal() = signalWork ()
 
+    /// worker を起動する。長時間ブロックして回り続ける専用スレッドにする
+    /// （スレッドプールだと混雑時に `WaitingToRun` のまま compaction が開始されないことがある）。
     member _.Start() =
         if not (worker.ContainsKey "worker") then
-            worker.TryAdd("worker", System.Threading.Tasks.Task.Run loop) |> ignore
+            let task =
+                System.Threading.Tasks.Task.Factory.StartNew(
+                    loop,
+                    System.Threading.CancellationToken.None,
+                    System.Threading.Tasks.TaskCreationOptions.LongRunning,
+                    System.Threading.Tasks.TaskScheduler.Default
+                )
+
+            worker.TryAdd("worker", task) |> ignore
 
     member _.Shutdown() =
         if stopped.TryAdd("stopped", ()) then
             cancel.Cancel()
-            signalWork ()
+            signal.Release() |> ignore
 
             match worker.TryGetValue "worker" with
             | true, task ->
