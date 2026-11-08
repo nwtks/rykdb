@@ -1813,8 +1813,16 @@ merge 中に foreground の flush や新しい transaction が入り得る。
 - **破棄したあとは GC 境界を下げて publish する**。
   境界を戻さないと、次のサイクルも同じ判定で破棄し続けて前進しない
   （古い transaction が開いている間、compaction が終わらない）。
-- **pin は「文ごと」に取る**。`Session.Execute` で複数文を 1回の lease で囲むと、
+- **pin は「文ごと」に取る**。
+  `Session.Execute` で複数文を 1回の lease で囲むと、
   途中の文の flush で Version が進んだあとの文が pin 外のファイルを読む。
+- **Idle 判定は単一の状態で行う**。
+  busy と pending を別々に持つと、 worker が pending を消してから busy を立てる間や、
+  2つを別々に読む間に `IsIdle` が true を返し、
+  `waitIdle` が compaction 完了前に進んでテストが flaky になる。
+  `EngineHost` は `Idle` / `Busy` / `Pending` を 1つの CAS セルで持つ。
+  `Signal` の wake 要否は pending を立てる**前**の値で判断する
+  （更新後の値を見ると release が漏れて worker が起動せず、テストがハングする）。
 - **worker の開始はリカバリ後**。
   `Database.OpenWithStore` のカタログ読込と DROP 後始末が終わってから `RowStore.startBackground` を呼ぶ。
   先に動かすと、リカバリの走査中に入力ファイルが retired / 削除され得る。

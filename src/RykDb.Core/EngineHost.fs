@@ -28,6 +28,16 @@ type internal EngineHost
     ) =
     let stateKey = "current"
     let numberKey = "n"
+    let activityKey = "activity"
+
+    [<Literal>]
+    let Idle = 0
+
+    [<Literal>]
+    let Busy = 1
+
+    [<Literal>]
+    let Pending = 2
 
     let stateCell =
         System.Collections.Concurrent.ConcurrentDictionary<string, HostState>()
@@ -42,15 +52,17 @@ type internal EngineHost
     let fileRefs =
         System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>()
 
-    let installGate = new System.Threading.SemaphoreSlim(1, 1)
-    let cancel = new System.Threading.CancellationTokenSource()
-    let signal = new System.Threading.SemaphoreSlim(0, System.Int32.MaxValue)
-    let pending = System.Collections.Concurrent.ConcurrentDictionary<string, unit>()
-    let busy = System.Collections.Concurrent.ConcurrentDictionary<string, unit>()
-    let stopped = System.Collections.Concurrent.ConcurrentDictionary<string, unit>()
+    let activity = System.Collections.Concurrent.ConcurrentDictionary<string, int>()
+    do activity.[activityKey] <- Idle
 
     let worker =
         System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.Tasks.Task>()
+
+    let stopped = System.Collections.Concurrent.ConcurrentDictionary<string, unit>()
+
+    let installGate = new System.Threading.SemaphoreSlim(1, 1)
+    let cancel = new System.Threading.CancellationTokenSource()
+    let signal = new System.Threading.SemaphoreSlim(0, System.Int32.MaxValue)
 
     let tryDeleteFile (fileNumber: int64) =
         match
@@ -276,6 +288,41 @@ type internal EngineHost
                     if not cancel.IsCancellationRequested then
                         runCycle (remaining - 1)
 
+    let updateActivity (update: int -> int) =
+        let rec loop () =
+            let current = activity.[activityKey]
+            let next = update current
+
+            if next = current then
+                current
+            elif activity.TryUpdate(activityKey, next, current) then
+                next
+            else
+                loop ()
+
+        loop ()
+
+    let markPending () =
+        let rec loop () =
+            let current = activity.[activityKey]
+
+            if (current &&& Pending) <> 0 then
+                true
+            elif activity.TryUpdate(activityKey, current ||| Pending, current) then
+                false
+            else
+                loop ()
+
+        loop ()
+
+    let signalWork () =
+        if not (markPending ()) && signal.CurrentCount = 0 then
+            signal.Release() |> ignore
+
+    let finishWork () =
+        updateActivity (fun current -> if (current &&& Pending) <> 0 then Pending else Idle)
+        |> ignore
+
     let loop () =
         let rec step () =
             signal.Wait()
@@ -283,8 +330,7 @@ type internal EngineHost
             if cancel.IsCancellationRequested then
                 ()
             else
-                pending.TryRemove "pending" |> ignore
-                busy.TryAdd("busy", ()) |> ignore
+                updateActivity (fun current -> (current ||| Busy) &&& ~~~Pending) |> ignore
 
                 try
                     runCycle 4
@@ -295,7 +341,7 @@ type internal EngineHost
                         })
                     |> ignore
 
-                busy.TryRemove "busy" |> ignore
+                finishWork ()
                 step ()
 
         step ()
@@ -325,13 +371,9 @@ type internal EngineHost
                     sweep ()
             })
 
-    member _.IsIdle = not (busy.ContainsKey "busy") && not (pending.ContainsKey "pending")
+    member _.IsIdle = activity.[activityKey] = Idle
 
-    member _.Signal() =
-        pending.TryAdd("pending", ()) |> ignore
-
-        if signal.CurrentCount = 0 then
-            signal.Release() |> ignore
+    member _.Signal() = signalWork ()
 
     member _.Start() =
         if not (worker.ContainsKey "worker") then
@@ -340,10 +382,7 @@ type internal EngineHost
     member _.Shutdown() =
         if stopped.TryAdd("stopped", ()) then
             cancel.Cancel()
-            pending.TryAdd("pending", ()) |> ignore
-
-            if signal.CurrentCount = 0 then
-                signal.Release() |> ignore
+            signalWork ()
 
             match worker.TryGetValue "worker" with
             | true, task ->
