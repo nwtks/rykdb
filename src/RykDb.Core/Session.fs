@@ -42,9 +42,9 @@ type Session internal (root: string, initial: Database) =
                 Rows = [||]
             }
 
-    /// DB を開く。
+    /// DB を開く（background compaction 有効）。
     static member OpenWith(root: string) =
-        Database.OpenWith root |> Result.map (fun db -> new Session(root, db))
+        Database.OpenWithBackground root |> Result.map (fun db -> new Session(root, db))
 
     /// DB のルートディレクトリ。
     member _.Root = root
@@ -56,9 +56,9 @@ type Session internal (root: string, initial: Database) =
     member _.TableNames() =
         lock gate (fun () ->
             if closed then
-                Error(closedError ())
+                err (closedError ())
             else
-                Ok(current.TableNames()))
+                ret (current.TableNames()))
 
     /// 単一文または複数文を実行する。
     /// <remarks>
@@ -68,29 +68,39 @@ type Session internal (root: string, initial: Database) =
     /// 必要に応じて `Rollback()` すること。
     /// </remarks>
     member _.Execute(sql: string) =
-        let rec run acc =
+        let rec run (db: Database) acc =
             function
-            | [] -> Ok(List.rev acc)
+            | [] -> ret (db, List.rev acc)
             | stmt :: tail ->
-                match current.Execute stmt with
-                | Error e -> Error e
+                let db, lease = db.AcquireSnapshot()
+                use _lease = lease
+
+                match db.Execute stmt with
+                | Error e -> err e
                 | Ok(next, result) ->
                     current <- next
-                    run (result :: acc) tail
+                    run next (result :: acc) tail
 
         lock gate (fun () ->
             if closed then
-                Error(closedError ())
+                err (closedError ())
             else
-                Parser.parseStatements sql >>= run [] |> Result.map summarize)
+                Parser.parseStatements sql
+                >>= run current []
+                >>= fun (finalDb, results) ->
+                    current <- finalDb
+                    ret (summarize results))
 
     /// トランザクションを始める。
     member _.Begin() =
         lock gate (fun () ->
             if closed then
-                Error(closedError ())
+                err (closedError ())
             else
-                current.Begin()
+                let db, lease = current.AcquireSnapshot()
+                use _lease = lease
+
+                db.Begin()
                 |> Result.map (fun next ->
                     current <- next
                     ()))
@@ -99,9 +109,12 @@ type Session internal (root: string, initial: Database) =
     member _.Commit() =
         lock gate (fun () ->
             if closed then
-                Error(closedError ())
+                err (closedError ())
             else
-                current.Commit()
+                let db, lease = current.AcquireSnapshot()
+                use _lease = lease
+
+                db.Commit()
                 |> Result.map (fun next ->
                     current <- next
                     ()))
@@ -110,9 +123,12 @@ type Session internal (root: string, initial: Database) =
     member _.Rollback() =
         lock gate (fun () ->
             if closed then
-                Error(closedError ())
+                err (closedError ())
             else
-                current.Rollback()
+                let db, lease = current.AcquireSnapshot()
+                use _lease = lease
+
+                db.Rollback()
                 |> Result.map (fun next ->
                     current <- next
                     ()))
@@ -125,7 +141,7 @@ type Session internal (root: string, initial: Database) =
     member _.Close() =
         lock gate (fun () ->
             if closed then
-                Ok()
+                ret ()
             else
                 closed <- true
 
@@ -142,7 +158,7 @@ type Session internal (root: string, initial: Database) =
                 let closeResult = current.Close()
 
                 match rollbackError with
-                | Some e -> Error e
+                | Some e -> err e
                 | None -> closeResult)
 
     interface System.IDisposable with

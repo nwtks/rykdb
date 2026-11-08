@@ -344,7 +344,7 @@ let ``StorageEngine.maybeFlush: 4 本目の L0 で compactOnce が L0→L1 compa
             Assert.False(File.Exists(FileMetaData.path dir 12L))))
 
 [<Fact>]
-let ``StorageEngine.maybeFlush: L0 に壊れたファイルがあると compactOnce が Error を返す`` () =
+let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engine を返す`` () =
     withDir "se-mf-err" (fun dir ->
         withEngine dir (fun engine ->
             let f1 = mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1) ]
@@ -370,7 +370,16 @@ let ``StorageEngine.maybeFlush: L0 に壊れたファイルがあると compactO
             let engine =
                 ok (StorageEngine.writeBatch [| Entry.put (intKey 4) 4UL (intRow 4) |] engine)
 
-            expectError "壊れた入力は Error" (StorageEngine.maybeFlush engine)))
+            let after = ok (StorageEngine.maybeFlush engine)
+            // flush は成功している（memtable は空、L0 に 4 本）
+            Assert.Equal(0, after.Mem.Count)
+            Assert.Equal(4, (Version.filesAt 0 after.Version).Length)
+            // compaction の失敗は診断として残る
+            Assert.True(after.LastCompactionError.IsSome)
+            // 入力ファイルは削除されない
+            Assert.True(File.Exists(FileMetaData.path dir 10L))
+            Assert.True(File.Exists(FileMetaData.path dir 11L))
+            Assert.True(File.Exists(FileMetaData.path dir 12L))))
 
 [<Fact>]
 let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush する`` () =

@@ -1768,3 +1768,62 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
   `パーサ: サブクエリ（スカラー / IN / EXISTS）` /
   `Optimizer.buildLogical: FROM のサブクエリは Logical.Derived になる` /
   `Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`。
+
+### 11.51 `maybeFlush` は WAL commit 後に Error を返さない（compaction 失敗で flush を巻き戻さない）
+
+`maybeFlush` を `flush engine >>= compactOnce` にすると、
+flush 成功・compaction 失敗のときに `Error` が返り、
+`RowStore` は **pre-flush の engine** を保持してしまう。
+一方、ディスクでは flush の SSTable が MANIFEST に載り、WAL は rotate 済み。
+この状態で次の write は古い WAL 番号へ追記し、再起動時の復旧は最大番号の WAL しか読まないため、
+**commit 済みの行が失われ得る**。
+
+- ❌ `match flush engine with Error e -> e | Ok flushed -> compactOnce flushed`
+  （compaction のエラーが flush の結果を巻き戻す）
+- ✅ flush 失敗: pre-flush の engine を `Ok` で返す（memtable を残して次回再試行）。
+  flush 成功・compaction 失敗: **flush 後の engine** を `Ok` で返し、
+  `LastCompactionError = Some e` を記録する。
+- WAL への書き込みが成功した時点で commit は成立している。
+  ここで `Error` を返すと、呼び出し側が SeqNo を再利用し得る（§11.8）。
+  `RowStore.writeBatchesWithSnapshot` の `MaybeFlush` エラー握り潰しはこのための保険として残す。
+- 回帰テスト: `StorageEngine.maybeFlush: compaction が失敗しても flush 後の engine を返す` /
+  `RowStore: compaction 失敗後も flush 結果を保持し、再起動で commit を失わない`。
+
+### 11.52 background compaction は install 時に Version / GC 境界 / 採番を再検証する
+
+background compaction の worker は、開始時の `Version` と `ActiveSnapshot` をそのまま
+MANIFEST に書いてはいけない。
+merge 中に foreground の flush や新しい transaction が入り得る。
+
+- ❌ 開始時の Version に `AddedFiles` / `DeletedFiles` を適用して MANIFEST に書く。
+  flush で追加されたファイルを巻き戻したり、
+  開始後に登録された古い snapshot が見る版を削除したりする。
+- ✅ install は **installGate** の下で現在の `HostState` を再読する。
+  1. `Removed` の全ファイルが現在の Version に存在するか。
+  2. 現在の最古 snapshot（`ActiveSnapshotRegistry.oldestExcept` と
+     `HostState.ActiveSnapshot` の小さい方）が開始時より古くなっていないか。
+     どちらかが不成立なら **出力を削除して再試行**する。
+- ファイル番号は `EngineHost` の CAS 採番だけを使う。
+  flush も worker も `Manifest.logAndApply` を同じ installGate の内側で呼ぶ。
+- 読み取りは Session 呼び出し単位で Version 全ファイルを pin する。
+  worker は入力の実ファイルを即削除せず、retired にして refcount が 0 になってから消す。
+  `SstScan` 自体には pin を配線していないため、早期終了で FileStream が残る既存問題は別。
+- close は cancel → signal → worker join → flush → WAL 削除 → ProcessLock 解放。
+  worker が install 中でも join が完了してから WAL を消す。
+- **破棄したあとは GC 境界を下げて publish する**。
+  境界を戻さないと、次のサイクルも同じ判定で破棄し続けて前進しない
+  （古い transaction が開いている間、compaction が終わらない）。
+- **pin は「文ごと」に取る**。`Session.Execute` で複数文を 1回の lease で囲むと、
+  途中の文の flush で Version が進んだあとの文が pin 外のファイルを読む。
+- **worker の開始はリカバリ後**。
+  `Database.OpenWithStore` のカタログ読込と DROP 後始末が終わってから `RowStore.startBackground` を呼ぶ。
+  先に動かすと、リカバリの走査中に入力ファイルが retired / 削除され得る。
+- 回帰テスト: `background compaction: flush 後に L0 がbackgroundで compaction される` /
+  `background compaction: compaction 中でも次の write が返る` /
+  `background compaction: 読み取り中のファイルは削除されず、lease 解放後に削除される` /
+  `background compaction: close は進行中の compaction を停止して再オープンできる` /
+  `background compaction: install 後に再オープンしても行が残る` /
+  `background compaction: 開始後に古い snapshot が現れたら境界を下げてやり直す` /
+  `background compaction: Close しなくても install 済みの行は再オープンで残る` /
+  `background compaction: flush と install が競合してもファイル番号が重複しない` /
+  `background compaction: DB を開いた時点で未 compaction の L0 を解消する`。

@@ -21,10 +21,10 @@
     <Compile Include="ManifestTests.fs" />
     <Compile Include="CompactionTests.fs" />
     <Compile Include="StorageEngineTests.fs" />
-    <Compile Include="TransactionsTests.fs" />
     <Compile Include="AstTests.fs" />
     <Compile Include="LexerTests.fs" />
     <Compile Include="ParserTests.fs" />
+    <Compile Include="TransactionsTests.fs" />
     <Compile Include="RowStoreTests.fs" />
     <Compile Include="CatalogTests.fs" />
     <Compile Include="EvalTests.fs" />
@@ -40,6 +40,7 @@
     <Compile Include="DatabaseTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="SqlReferenceTests.fs" />
+    <Compile Include="BackgroundCompactionTests.fs" />
     <Compile Include="ServerTests.fs" />
     <Compile Include="TestHealthTests.fs" />
   </ItemGroup>

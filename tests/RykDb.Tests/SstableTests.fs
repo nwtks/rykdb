@@ -488,3 +488,72 @@ let ``Sstable.openPartial: 壊れたブロックは読み出し時に Corruption
             ErrorKind.CorruptionError
             "部分読みでも壊れたブロックを検出する"
             (Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray))
+
+[<Fact>]
+let ``Sstable.openPartial: 索引の範囲外は読み出し時に CorruptionError`` () =
+    withDir "sst-partial-index-range" (fun dir ->
+        let path = System.IO.Path.Combine(dir, "1.sst")
+        let bytes = Array.copy (ok (Sstable.build 0.01 (sstEntries 300)))
+        let footerStart = bytes.Length - Sstable.FooterSize
+
+        let readI64 (off: int) =
+            let mutable v = 0L
+
+            for i in 0..7 do
+                v <- v ||| (int64 bytes.[off + i] <<< (8 * i))
+
+            v
+
+        let writeI64 (off: int) (v: int64) =
+            for i in 0..7 do
+                bytes.[off + i] <- byte (v >>> (8 * i) &&& 0xFFL)
+
+        let writeU32 (off: int) (v: uint32) =
+            for i in 0..3 do
+                bytes.[off + i] <- byte (v >>> (8 * i) &&& 0xFFu)
+
+        let readVarint (pos: int) =
+            let rec go shift acc p =
+                let b = int bytes.[p]
+                let acc = acc ||| ((b &&& 0x7F) <<< shift)
+
+                if b &&& 0x80 = 0 then
+                    acc, p + 1
+                else
+                    go (shift + 7) acc (p + 1)
+
+            go 0 0 pos
+
+        let indexOff = int (readI64 (footerStart + 20))
+        let indexLen = int (readI64 (footerStart + 28))
+
+        // 先頭エントリ（長さ付き LastKey + Offset + Length）を飛ばし、2 個目の Offset を範囲外へ書き換える。
+        let keyLen0, afterLen0 = readVarint indexOff
+        let secondEntry = afterLen0 + keyLen0 + 16
+        let keyLen1, afterLen1 = readVarint secondEntry
+        writeI64 (afterLen1 + keyLen1) 1_000_000_000L
+
+        // 索引を書き換えたので metadataChecksum と footerChecksum を付け直す。
+        let metaOff = int (readI64 (footerStart + 52))
+        let metaLen = int (readI64 (footerStart + 60))
+        let bloomOff = int (readI64 (footerStart + 36))
+        let bloomLen = int (readI64 (footerStart + 44))
+
+        let metadataChecksum =
+            Hashing.checksumChunks
+                [|
+                    Array.sub bytes metaOff metaLen
+                    Array.sub bytes bloomOff bloomLen
+                    Array.sub bytes indexOff indexLen
+                |]
+
+        writeU32 (footerStart + 76) metadataChecksum
+        fixFooterChecksum bytes
+        System.IO.File.WriteAllBytes(path, bytes)
+
+        let partial = ok (Sstable.openPartial path)
+
+        expectErrorKind
+            ErrorKind.CorruptionError
+            "索引の範囲外でも例外にせず CorruptionError を返す"
+            (Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray))

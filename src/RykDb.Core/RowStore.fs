@@ -1,5 +1,5 @@
 // ===========================================================================
-// RowStore — テーブル・索引・カタログを 1 本の LSM ツリーへ載せる層。
+// RowStore — テーブル・索引・カタログを 1本の LSM ツリーへ載せる層。
 //
 //   論理 keyspace: "t:<table>" / "i:<index>" / "__catalog__"
 //   物理キー     : [varint(keyspace の UTF-8 長)][keyspace][論理キー]
@@ -42,6 +42,32 @@ module internal Keyspace =
         else
             ret ()
 
+/// RowStore の開き方。
+/// `BackgroundCompaction = false` は従来の同期 compaction。
+type internal RowStoreOptions =
+    {
+        BackgroundCompaction: bool
+        MemLimitBytes: int option
+        /// テスト用: compaction の設定を差し替える。
+        Compaction: CompactionOptions option
+        /// テスト用: compaction が入力ファイルを開く直前に呼ばれる。
+        ScanHook: (FileMetaData -> unit) option
+    }
+
+module internal RowStoreOptions =
+    let Default =
+        {
+            BackgroundCompaction = false
+            MemLimitBytes = None
+            Compaction = None
+            ScanHook = None
+        }
+
+    let Background =
+        { Default with
+            BackgroundCompaction = true
+        }
+
 /// 1本の LSM ツリーと、その論理 keyspace を束ねたもの。
 /// エンジンを差し替えられるので、テストではディスクに触れない実装を使える。
 [<NoEquality; NoComparison>]
@@ -52,6 +78,8 @@ type internal RowStore =
         /// プロセス間ロックの寿命管理。
         /// メモリ上のテスト用 store は None（ファイルを作らない）。
         Lock: ProcessLockLease option
+        /// background compaction の共有状態。同期実装では None。
+        Host: EngineHost option
     }
 
 module internal RowStore =
@@ -68,6 +96,26 @@ module internal RowStore =
     /// Entry を論理 keyspace の接頭辞付きで書き込む。
     /// 複数 keyspace の書き込みも同じ WAL バッチに入るため、途中で分断されない。
     let writeBatchesWithSnapshot (activeSnapshot: uint64) (batches: (string * Entry array) list) (store: RowStore) =
+        let flushAndPublish (bumped: IStorageEngine) (host: EngineHost) =
+            host.WithInstallGate(fun () ->
+                let state = host.Current()
+                let hinted = bumped.WithHostState state
+
+                hinted.FlushIfNeeded host.AllocateFileNumber
+                |> Result.map (fun (flushed, didFlush) ->
+                    let flushedState = flushed.HostState
+
+                    host.Publish(fun current ->
+                        { current with
+                            Version = flushedState.Version
+                            ManifestNumber = flushedState.ManifestNumber
+                            ActiveSnapshot = activeSnapshot
+                            LastCompactionError = flushedState.LastCompactionError
+                        })
+                    |> ignore
+
+                    flushed, didFlush))
+
         let physicalEntries =
             batches
             |> List.collect (fun (keyspace, entries) ->
@@ -90,9 +138,26 @@ module internal RowStore =
                 let maxSeq = Entry.maxSeqNo physicalEntries
                 let bumped = updated.WithNextSeqNo(max updated.NextSeqNo (maxSeq + 1UL))
 
-                match bumped.MaybeFlush() with
-                | Ok flushed -> ret { store with Engine = flushed }
-                | Error _ -> ret { store with Engine = bumped }
+                match store.Host with
+                | None ->
+                    match bumped.MaybeFlush() with
+                    | Ok flushed -> ret { store with Engine = flushed }
+                    | Error _ -> ret { store with Engine = bumped }
+                | Some host ->
+                    match flushAndPublish bumped host with
+                    | Ok(flushed, didFlush) ->
+                        if didFlush then
+                            host.Signal()
+
+                        ret { store with Engine = flushed }
+                    | Error _ ->
+                        host.Publish(fun current ->
+                            { current with
+                                ActiveSnapshot = activeSnapshot
+                            })
+                        |> ignore
+
+                        ret { store with Engine = bumped }
 
     /// GC 境界を指定しない書き込み（カタログ・索引 backfill・テスト用）。
     let writeBatches = writeBatchesWithSnapshot 0UL
@@ -247,7 +312,7 @@ module internal RowStore =
 
     /// DB を開く（新規ならルート直下に 1本の LSM を作る）。
     /// 同じ root が既にこのプロセスで開かれていれば `IoError`。
-    let private openStoreCore (takeOver: bool) (root: string) =
+    let private openStoreCore (takeOver: bool) (options: RowStoreOptions) (root: string) =
         result {
             do! protect (fun () -> System.IO.Directory.CreateDirectory root |> ignore)
             let! token, format = ProcessLock.acquire root takeOver
@@ -260,40 +325,97 @@ module internal RowStore =
                     err e
 
             let! engine =
-                match StorageEngine.openDatabase root with
-                | Ok engine -> ret (DiskStorageEngine engine :> IStorageEngine)
+                match StorageEngine.openDatabaseWith options.MemLimitBytes root with
+                | Ok engine -> ret engine
                 | Error e ->
                     ProcessLock.release root token
                     err e
 
+            let engine =
+                match options.Compaction with
+                | Some compaction -> { engine with Compaction = compaction }
+                | None -> engine
+
+            let host =
+                if options.BackgroundCompaction then
+                    new EngineHost(
+                        root,
+                        HostState.initial engine.Version engine.ManifestNumber,
+                        engine.Compaction,
+                        (fun () -> ActiveSnapshotRegistry.oldestExcept root None),
+                        (fun f -> StorageEngine.openScan root f),
+                        options.ScanHook
+                    )
+                    |> Some
+                else
+                    None
+
             return
                 {
                     Root = root
-                    Engine = engine
+                    Engine = DiskStorageEngine engine :> IStorageEngine
                     Lock = Some(ProcessLockLease(root, token))
+                    Host = host
                 }
         }
 
     /// DB を開く。同じ root が既にこのプロセスで開かれていれば `IoError`。
-    let openStore = openStoreCore false
+    /// 既定は同期 compaction。
+    let openStore = openStoreCore false RowStoreOptions.Default
+
+    /// background compaction を有効にして開く。
+    let openStoreWithBackground = openStoreCore false RowStoreOptions.Background
 
     /// 既に開いているハンドルを「クラッシュで失った」ことにして開き直す（テスト用）。
     /// 本番経路では使わない（二重に開くと memtable が分かれて古い行を読む）。
-    let internal openStoreTakingOver = openStoreCore true
+    let internal openStoreTakingOver = openStoreCore true RowStoreOptions.Default
 
-    /// エンジンを差し替えて、空の RowStore を作る（テスト用）。
-    /// ディスクに触れないメモリ実装を渡せば、全 keyspace が 1本の LSM に載る。
-    let internal openStoreWith (root: string) (engine: IStorageEngine) =
-        {
-            Root = root
-            Engine = engine
-            Lock = None
-        }
+    /// background worker を開始する。
+    /// オープン直後のカタログ読込・DROP 後始末が終わってから呼ぶ
+    /// （worker が先に動くと、リカバリの走査中にファイルが消え得る）。
+    let startBackground (store: RowStore) =
+        match store.Host with
+        | Some host ->
+            host.Start()
+            host.Signal()
+        | None -> ()
+
+    /// テスト用: オプションを指定して開く。
+    /// Database を介さないため、ここでbackground worker を開始する。
+    let internal openStoreWithOptions (options: RowStoreOptions) (root: string) =
+        openStoreCore false options root
+        |> Result.map (fun store ->
+            startBackground store
+            store)
+
+    /// 呼び出し単位のスナップショットを取る。
+    /// 返した IDisposable を dispose するまで、この Version のファイルは削除されない。
+    let acquireSnapshot (store: RowStore) =
+        match store.Host with
+        | None ->
+            store,
+            { new System.IDisposable with
+                member _.Dispose() = ()
+            }
+        | Some host ->
+            let state, lease = host.AcquireCall()
+
+            { store with
+                Engine = store.Engine.WithHostState state
+            },
+            lease
 
     /// LSM を close し、プロセス間ロックを外す。
     /// ロックの解除は二重 Close でも無害（トークンは一度しか外れない）。
     let close (store: RowStore) =
-        let outcome = store.Engine.Close()
+        let engine =
+            match store.Host with
+            | None -> store.Engine
+            | Some host ->
+                host.Shutdown()
+                store.Engine.WithHostState(host.Current())
+
+        let outcome = engine.Close()
 
         match store.Lock with
         | Some lease -> lease.ForceRelease()

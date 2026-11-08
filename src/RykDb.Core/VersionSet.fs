@@ -326,3 +326,26 @@ module internal VersionEdit =
                     }
                 ]
         }
+
+/// MANIFEST に反映済みの現在状態（background compaction が共有する）。
+type internal HostState =
+    {
+        Version: Version
+        ManifestNumber: int64
+        /// commit 時に更新される GC 境界。0 は「全版を残す」。
+        ActiveSnapshot: uint64
+        /// 直近の compaction の失敗（成功したら None）。
+        LastCompactionError: DbError option
+        /// publish のたびに増える世代番号。
+        Generation: int64
+    }
+
+module internal HostState =
+    let initial (version: Version) (manifestNumber: int64) =
+        {
+            Version = version
+            ManifestNumber = manifestNumber
+            ActiveSnapshot = 0UL
+            LastCompactionError = None
+            Generation = 0L
+        }

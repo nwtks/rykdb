@@ -75,6 +75,9 @@ type internal StorageEngine =
         /// GC は「これより新しい版」と「これ以下の最新 1版」を残す（Compaction.gc）。
         /// 0 は「全版を残す」。
         ActiveSnapshot: uint64
+        /// 直近の compaction の失敗（成功したら None）。
+        /// flush は成功しているため、失敗しても engine は flush 後の状態を保つ。
+        LastCompactionError: DbError option
     }
 
 module internal StorageEngine =
@@ -113,8 +116,8 @@ module internal StorageEngine =
     let private DefaultMemLimitBytes = 64 * 1024 * 1024
 
     /// 部分読み用の reader を開く（index / Bloom / meta のみ）。
-    let private openPartialSst (f: FileMetaData) (engine: StorageEngine) =
-        let path = FileMetaData.path engine.Dir f.FileNumber
+    let private openPartialSstIn (dir: string) (f: FileMetaData) =
+        let path = FileMetaData.path dir f.FileNumber
 
         protect (fun () -> System.IO.FileInfo path |> SstPartialCache.keyOf path)
         >>= fun key ->
@@ -125,6 +128,14 @@ module internal StorageEngine =
                 >>= fun partial ->
                     SstPartialCache.put key partial
                     ret partial
+
+    let private openPartialSst (f: FileMetaData) (engine: StorageEngine) = openPartialSstIn engine.Dir f
+
+    /// バックグラウンド compaction 用の走査。
+    /// ファイルの先頭から全件を遅延して読む。
+    let openScan (dir: string) (f: FileMetaData) =
+        openPartialSstIn dir f
+        >>= fun partial -> ret (Sstable.rangeScanPartial [||] 0 partial)
 
     /// ポイントルックアップ。
     /// memtable -> L0 -> 各レベルの順に見る。
@@ -376,6 +387,34 @@ module internal StorageEngine =
                 return! finishFlush engine version manifestNumber
         }
 
+    /// memtable が上限に達していれば flush し、続けて compaction する。
+    /// 上限に達していなければ何もしない。
+    /// flush / compaction / WAL rotate は同じ keyspace の writeBatch / close と競合させないため、
+    /// ディレクトリ単位の Gate の内側で行う。
+    /// WAL への書き込みが成功した時点で commit は成立しているため、
+    /// flush / compaction の失敗を Error にしない（呼び出し側が SeqNo を再利用し得る）。
+    /// flush 失敗時は memtable を残して次の write で再試行し、
+    /// compaction 失敗時は flush 後の engine に LastCompactionError を記録して返す。
+    /// 上限に達していれば flush だけを行う（compaction はしない）。
+    /// background compaction の有効時は RowStore がこちらを呼び、MANIFEST 反映後に worker を起こす。
+    /// 戻り値の bool は「実際に flush したか」。
+    let flushIfNeededWith (allocateFileNumber: unit -> int64) (engine: StorageEngine) =
+        withDirGate engine.Dir (fun () ->
+            if engine.Mem.Count > 0 && engine.Mem.ApproxBytes >= engine.MemLimitBytes then
+                let fileNumber = allocateFileNumber ()
+
+                let engine =
+                    { engine with
+                        Version =
+                            { engine.Version with
+                                NextFileNumber = fileNumber
+                            }
+                    }
+
+                flush engine |> Result.map (fun flushed -> flushed, true)
+            else
+                ret (engine, false))
+
     /// 1 回の Leveled compaction を行う。
     /// 手順:
     ///   1. 対象レベルExceeded しているファイルを選ぶ
@@ -431,19 +470,30 @@ module internal StorageEngine =
                 return buildCompacted version manifestNumber compactionResult
         }
 
-    /// memtable が上限に達していれば flush し、続けて compaction する。
-    /// 上限に達していなければ何もしない。
-    /// flush / compaction / WAL rotate は同じ keyspace の writeBatch / close と競合させないため、
-    /// ディレクトリ単位の Gate の内側で行う。
+    /// memtable が上限に達していれば flush し、続けて compaction する（同期版）。
     let maybeFlush (engine: StorageEngine) =
         withDirGate engine.Dir (fun () ->
             if engine.Mem.Count > 0 && engine.Mem.ApproxBytes >= engine.MemLimitBytes then
-                flush engine >>= compactOnce
+                match flush engine with
+                | Error _ -> ret engine
+                | Ok flushed ->
+                    match compactOnce flushed with
+                    | Ok compacted ->
+                        ret
+                            { compacted with
+                                LastCompactionError = None
+                            }
+                    | Error e ->
+                        ret
+                            { flushed with
+                                LastCompactionError = Some e
+                            }
             else
                 ret engine)
 
     /// データベースを開く（新規なら作る）。
-    let openDatabase (dir: string) =
+    /// [memLimitBytes] を指定すると memtable の上限を差し替える。
+    let openDatabaseWith (memLimitBytes: int option) (dir: string) =
         let dropMissingFiles dir manifestNumber version =
             let missing =
                 Version.allFiles version
@@ -529,6 +579,7 @@ module internal StorageEngine =
                 MemLimitBytes = DefaultMemLimitBytes
                 Compaction = CompactionOptions.Defaults
                 ActiveSnapshot = 0UL
+                LastCompactionError = None
             }
 
         let buildRecovered version manifestNumber walState mem walMax diskMax walMaxTxn =
@@ -564,8 +615,17 @@ module internal StorageEngine =
 
             let (mem, walMax), walMaxTxn = replayed
             let diskMax = maxSeqNoOnDisk version'
-            return buildRecovered version' manifestNumber' walState mem walMax diskMax walMaxTxn
+
+            let engine =
+                buildRecovered version' manifestNumber' walState mem walMax diskMax walMaxTxn
+
+            return
+                match memLimitBytes with
+                | Some limit -> { engine with MemLimitBytes = limit }
+                | None -> engine
         }
+
+    let openDatabase (dir: string) = openDatabaseWith None dir
 
     /// データベースを閉じる（memtable を flush してから WAL を消す）。
     /// <remarks>
@@ -594,11 +654,17 @@ module internal StorageEngine =
 type internal IStorageEngine =
     abstract NextSeqNo: uint64
     abstract ActiveSnapshot: uint64
+    /// MANIFEST に反映済みの状態（background compaction が共有する）。
+    abstract HostState: HostState
     abstract GetAt: visible: uint64 option -> key: byte array -> Result<SstEntry option, DbError>
     abstract ScanAt: visible: uint64 option -> startKey: byte array -> limit: int -> Result<SstScan, DbError>
     abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
     abstract WithNextSeqNo: nextSeqNo: uint64 -> IStorageEngine
     abstract WithActiveSnapshot: snapshot: uint64 -> IStorageEngine
+    abstract WithHostState: state: HostState -> IStorageEngine
+    /// 上限超過時は flush だけを行う（compaction はしない）。
+    /// 戻り値の bool は「実際に flush したか」。
+    abstract FlushIfNeeded: allocateFileNumber: (unit -> int64) -> Result<IStorageEngine * bool, DbError>
     abstract MaybeFlush: unit -> Result<IStorageEngine, DbError>
     abstract Close: unit -> Result<unit, DbError>
 
@@ -607,6 +673,16 @@ type internal DiskStorageEngine(engine: StorageEngine) =
     interface IStorageEngine with
         member _.NextSeqNo = engine.NextSeqNo
         member _.ActiveSnapshot = engine.ActiveSnapshot
+
+        member _.HostState =
+            {
+                Version = engine.Version
+                ManifestNumber = engine.ManifestNumber
+                ActiveSnapshot = engine.ActiveSnapshot
+                LastCompactionError = engine.LastCompactionError
+                Generation = 0L
+            }
+
         member _.GetAt visible key = StorageEngine.getAt visible key engine
 
         member _.ScanAt visible startKey limit =
@@ -625,6 +701,20 @@ type internal DiskStorageEngine(engine: StorageEngine) =
                     ActiveSnapshot = snapshot
                 }
             :> IStorageEngine
+
+        member _.WithHostState state =
+            DiskStorageEngine
+                { engine with
+                    Version = state.Version
+                    ManifestNumber = state.ManifestNumber
+                    ActiveSnapshot = state.ActiveSnapshot
+                    LastCompactionError = state.LastCompactionError
+                }
+            :> IStorageEngine
+
+        member _.FlushIfNeeded allocateFileNumber =
+            StorageEngine.flushIfNeededWith allocateFileNumber engine
+            |> Result.map (fun (next, flushed) -> DiskStorageEngine next :> IStorageEngine, flushed)
 
         member _.MaybeFlush() =
             StorageEngine.maybeFlush engine

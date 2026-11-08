@@ -63,6 +63,15 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
         member _.NextSeqNo = state.NextSeqNo
         member _.ActiveSnapshot = 0UL
 
+        member _.HostState =
+            {
+                Version = Version.Empty
+                ManifestNumber = 0L
+                ActiveSnapshot = 0UL
+                LastCompactionError = None
+                Generation = 0L
+            }
+
         member _.GetAt visible key =
             Memtable.getVisible key visible state.Mem
             |> Option.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
@@ -95,6 +104,10 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
         member _.WithActiveSnapshot _ =
             MemoryStorageEngine state :> IStorageEngine
 
+        member this.WithHostState _ = this :> IStorageEngine
+
+        member this.FlushIfNeeded _ = ret (this :> IStorageEngine, false)
+
         member _.MaybeFlush() =
             MemoryStorageEngine state :> IStorageEngine |> ret
 
@@ -105,9 +118,20 @@ let private newMemoryEngine () =
     let state = MemoryEngineState()
     MemoryStorageEngine state :> IStorageEngine
 
+
+/// エンジンを差し替えて、空の RowStore を作る（テスト用）。
+/// ディスクに触れないメモリ実装を渡せば、全 keyspace が 1本の LSM に載る。
+let openStoreWith (root: string) (engine: IStorageEngine) =
+    {
+        Root = root
+        Engine = engine
+        Lock = None
+        Host = None
+    }
+
 /// メモリ上の RowStore を渡す（ディスク I/O なし）。
 let withStore (_tag: string) (f: RowStore -> unit) =
-    f (RowStore.openStoreWith "" (newMemoryEngine ()))
+    f (openStoreWith "" (newMemoryEngine ()))
 
 /// メモリ上の DB を開いてテストし、最後に閉じる（ディスク I/O なし）。
 /// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で差し替える。
@@ -119,7 +143,7 @@ let withStore (_tag: string) (f: RowStore -> unit) =
 /// </remarks>
 let withDb (_tag: string) (f: Database -> unit) =
     let root = "mem:" + System.Guid.NewGuid().ToString "N"
-    let store = RowStore.openStoreWith "" (newMemoryEngine ())
+    let store = openStoreWith "" (newMemoryEngine ())
     let db = ok (Database.OpenWithStore root store)
 
     try

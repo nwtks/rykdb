@@ -50,6 +50,8 @@ flowchart TB
         CAT["Catalog.fs<br/>スキーマ定義の永続化"]
     end
 
+    HOST["EngineHost.fs<br/>background compaction の共有状態<br/>Version 採番・refcount・worker"]
+
     MVCC["Transactions.fs<br/>SeqNo 採番・snapshot・衝突検出"]
 
     subgraph ST["ストレージ（1 DB = LSM ツリー 1本）"]
@@ -84,6 +86,10 @@ flowchart TB
     OPS --> MVCC
     RS --> SE
     RS --> MVCC
+    RS --> HOST
+    HOST --> SE
+    HOST --> CO
+    HOST --> MF
     SE --> MEM
     SE --> SST
     SE --> VS
@@ -117,34 +123,35 @@ flowchart TB
 
 ### 採用している手法（サマリ）
 
-| 領域       | 手法・アルゴリズム                                                                     | 詳細                                                |
-| ---------- | -------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                            | §8                                                  |
-| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                         | §8.1                                                |
-| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v5（84バイト）                       | §8.2                                                |
-| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                  | §8.4–8.5                                            |
-| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                  | §8.6                                                |
-| 並行制御   | **Session で直列化 + MVCC（Snapshot Isolation）** + first-committer-wins。DDL だけ排他 | §7                                                  |
-| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                                 | §4                                                  |
-| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                              | §6                                                  |
-| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                            | §5.2                                                |
-| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                          | §3                                                  |
-| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                    | [`coding-conventions.md`](coding-conventions.md) §1 |
-| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                      | §4.2, §8.1                                          |
+| 領域       | 手法・アルゴリズム                                                                      | 詳細                                                |
+| ---------- | --------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                             | §8                                                  |
+| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                          | §8.1                                                |
+| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v5（84バイト）                        | §8.2                                                |
+| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                   | §8.4–8.5                                            |
+| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                   | §8.6                                                |
+| 並行制御   | **Session で直列化 + MVCC（Snapshot Isolation）** + first-committer-wins。DDL だけ排他  | §7                                                  |
+| compaction | **background worker**（`Session.OpenWith`）。MANIFEST 追記と採番は installGate で直列化 | §8.6–8.7                                            |
+| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                                  | §4                                                  |
+| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                               | §6                                                  |
+| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                             | §5.2                                                |
+| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                           | §3                                                  |
+| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                     | [`coding-conventions.md`](coding-conventions.md) §1 |
+| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                       | §4.2, §8.1                                          |
 
 ### 依存の向き
 
 **上から下への一方向のみ**。
 下位モジュールは上位を知らない。
 
-| 層               | モジュール                                                       | 知っている層                         |
-| ---------------- | ---------------------------------------------------------------- | ------------------------------------ |
-| インターフェース | `Session.fs` `RykDb.Cli` `RykDb.Server`                          | 全部                                 |
-| 実行             | `Engine.fs` `Analyzer.fs` `Planner.fs` `ExecContext.fs` `Ops.fs` | `RowStore` `Catalog` `Transactions`  |
-| 行ストア         | `RowStore.fs` `Dml.fs` `Catalog.fs`                              | `StorageEngine` `Transactions`       |
-| MVCC             | `Transactions.fs`                                                | `Memtable`(`Entry`) `Errors` `Types` |
-| ストレージ       | `StorageEngine.fs` とその下                                      | `Errors` `Types` `Serialization`     |
-| フロントエンド   | `Lexer` `Parser` `Ast`                                           | `Types` `Errors`                     |
+| 層               | モジュール                                                       | 知っている層                                           |
+| ---------------- | ---------------------------------------------------------------- | ------------------------------------------------------ |
+| インターフェース | `Session.fs` `RykDb.Cli` `RykDb.Server`                          | 全部                                                   |
+| 実行             | `Engine.fs` `Analyzer.fs` `Planner.fs` `ExecContext.fs` `Ops.fs` | `RowStore` `Catalog` `Transactions`                    |
+| 行ストア         | `RowStore.fs` `Dml.fs` `Catalog.fs` `EngineHost.fs`              | `StorageEngine` `Compaction` `Manifest` `Transactions` |
+| MVCC             | `Transactions.fs`                                                | `Memtable`(`Entry`) `Errors` `Types`                   |
+| ストレージ       | `StorageEngine.fs` とその下                                      | `Errors` `Types` `Serialization`                       |
+| フロントエンド   | `Lexer` `Parser` `Ast`                                           | `Types` `Errors`                                       |
 
 > **Transactions と RowStore の依存方向**: `Transactions.fs` は `RowStore` を参照しない。
 > 依存は **`Dml` / `RowStore` → `Transactions` → `Memtable`** の向きで、
@@ -168,6 +175,11 @@ flowchart TB
 `Database.fs` のクライアント層などでは `ResizeArray` / `Dictionary` / `HashSet` を使う
 （[`coding-conventions.md`](coding-conventions.md) §2）。
 
+`EngineHost.fs` は「不変の `StorageEngine` の外側にある共有状態」で、
+`ConcurrentDictionary` の CAS と `SemaphoreSlim` だけで Version の公開とファイルの refcount を管理する
+（`mutable` / `while` / `ref` は使わない）。
+`StorageEngine` は host を知らず、host 参照を持つのは `RowStore` だけ（§8.7）。
+
 ---
 
 ## 2. プロジェクト構成
@@ -190,10 +202,11 @@ flowchart TB
 | `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                 |
 | `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                           |
 | `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                       |
-| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                  |
 | `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                 |
 | `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                        |
 | `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                      |
+| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                  |
+| `EngineHost.fs`    | background compaction の共有状態（Version / 採番 / ファイル refcount / worker / install）   |
 | `ProcessLock.fs`   | プロセス間ロック（`.rykdb.format` を排他で保持、`ProcessLock`）                             |
 | `RowStore.fs`      | 単一 LSM と keyspace 接頭辞（`RowStore` 型 + `Keyspace` モジュール）                        |
 | `Catalog.fs`       | `IndexSchema` / `TableSchema` / `Catalog` と出力 `Schema` / `OutputColumn` の型・モジュール |
@@ -215,7 +228,7 @@ flowchart TB
 ```
 Errors → Types → Serialization → Memtable → Wal → BloomFilter
        → Sstable → VersionSet → Manifest → Compaction
-       → StorageEngine → Transactions → Ast → Lexer → Parser
+       → StorageEngine → Ast → Lexer → Parser → Transactions → EngineHost
        → ProcessLock → RowStore → Catalog → Eval → Op → ExtSort → Ops
        → Dml → ExecContext → Analyzer → Planner → DropCleanup → Engine → Database → Session
 ```
@@ -969,7 +982,10 @@ commit 成功・rollback・`Close` で解除する。
 
 外周はすべて逐次処理。
 
-- **compaction は同期**（バックグラウンドスレッドなし）なので、reader とファイル削除を争わない（§12.2）
+- **compaction は `Session.OpenWith` では background worker、`Database.OpenWith` では同期**（§8.6 / §12.2）。
+  worker は merge を gate の外で行い、
+  install（MANIFEST 追記・Version 公開）だけを `EngineHost` の installGate で直列化する。
+  reader は Session 呼び出し単位で Version 全ファイルを pin する。
 - **WAL は `FileMode.Append, FileShare.Read`** のみ（`Wal.fs`）。
   `writeBatch` / `maybeFlush` / `close` は DB のディレクトリ単位の Gate で直列化する。
   異なる DB の書き込みは並行に進められる（Gate 表はプロセス内で共有）。
@@ -1328,6 +1344,71 @@ MANIFEST の読み落としで消してしまう事故を避けるため）。
 **MANIFEST を先に、ファイル削除を後にする**のが重要。
 （逆順にするとデータを失う経緯は [`gotchas.md`](gotchas.md) §11.4）。
 
+**compaction の失敗は flush を取り消さない**。
+`maybeFlush` は flush 成功後に compaction が失敗してもflush 後の engine を返し、
+`LastCompactionError` に診断を残す（次回の flush 時に再試行される）。
+WAL への書き込みが成功した時点で commit は成立しているため、ここで `Error` を返してはならない
+（呼び出し側が SeqNo を再利用し得る。gotchas §11.51）。
+
+### 8.7 background compaction（`EngineHost.fs`）
+
+`Session.OpenWith` で開いた DB は、flush 後の compaction を 1本の worker で行う。
+`Database.OpenWith` は従来どおり同期 compaction（内部 API とテスト用）。
+
+**なぜバックグラウンド化するか**。
+flush + compaction を含む書き込みは、compaction の分だけ commit のテールレイテンシが伸びる。
+Debug・単一スレッド・20万行（1,000行ずつ、memtable 上限 256KiB）の実測:
+
+| compaction | commit p50/p95/max ms | idle ms |  L0/L1/L2 |
+| ---------- | --------------------: | ------: | --------: |
+| 同期       |    8.4 / 45.8 / 188.7 |       0 | 0 / 5 / 9 |
+| background |     8.8 / 17.1 / 36.6 |   1,284 | 0 / 1 / 4 |
+
+`Compaction.compact` 単体では 10万行 約 0.74秒、100万行 約 7.5秒かかる。
+バックグラウンド化で p95 は約 6割、max は約 8割減る（p50 は host の gate 分でわずかに増える）。
+worker は同じディスク / CPU を使うため合計時間は減らないが、**ユーザースレッドが待たなくなる**ことが目的。
+compaction を一切しない対照は p95 2.6ms / max 7.1ms だが、
+L0 が増えて読み取りのコスト（read amplification）と引き換えになる。
+
+**構成**
+
+- `EngineHost` が MANIFEST に反映済みの `HostState`（Version / ManifestNumber /
+  NextFileNumber / ActiveSnapshot / LastCompactionError / Generation）を
+  `ConcurrentDictionary` の単一セル + `TryUpdate` の末尾再帰 CAS で保持する。
+- **MANIFEST 追記とファイル番号採番は installGate で直列化**する。
+  flush も worker install も同じ gate の内側で `Manifest.logAndApply` を呼ぶ。
+  番号は host の単調カウンタから確保する（flush と compaction で衝突させない）。
+- **読み取りは Session 呼び出し単位で Version 全ファイルを pin** する
+  （複数文の `Execute` は**文ごと**に取り直す。途中の flush で Version が進むため）。
+  worker は install 後に入力を retired にし、refcount が 0 になったものだけを削除する。
+  `SstPartial` / `SstScan` 自体には pin を配線していない。
+- install 時は現在 Version を再読し、
+  (1) 入力がまだ Version に存在するか、
+  (2) 開始時より古い snapshot が登録されていないか
+  を確認する。
+  不成立なら出力を削除し、**GC 境界を下げて publish したうえで**再試行する
+  （境界を戻さないと同じ判定で破棄し続ける）。
+- worker の起動はカタログ読込と DROP 後始末の後（`RowStore.startBackground`）。
+  先に動かすとリカバリの走査中に入力ファイルが消え得る。
+- flush / compaction の失敗は commit を失敗させない（§9.2 / gotchas §11.51）。
+- close は cancel → worker join → engine refresh → flush → WAL 削除 → ProcessLock 解放の順。
+  出力ファイル境界で `shouldStop` を確認するため、進行中の merge は途中で止められる。
+- クラッシュ復旧の不変条件は同期版と同じ
+  （出力 SST を fsync → MANIFEST → 入力 retire → 実削除、未参照ファイルは `.orphans/` へ退避）。
+
+**残る制約**
+
+- Session 呼び出しごとに Version 全ファイルを pin するため、ファイル数 O(n) のコストがある。
+  L0 が多数ある場合は Version 単位 refcount への移行を検討する。
+- worker は 1 DB 1本で、周期実行（タイマー）はしない。
+  トリガは DB オープン時と flush 後。
+- キャンセルは出力ファイル境界でのみ確認する。
+  巨大な 1 出力や長いブロック読み取り中は close が待つ。
+- `LastCompactionError` は internal。
+  必要なら Session に診断 API を追加する。
+- `Op.take` の早期終了による `SstScan` / FileStream リークは既存問題
+  （粗い pin のため安全性には影響しない）。
+
 ---
 
 ## 9. データフロー
@@ -1361,7 +1442,11 @@ SQL 文字列
              ├─ Wal.append (Begin/Batch/Commit)
              └─ Memtable.apply
 4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.applyBatches` が `WriteBatch` 後に `MaybeFlush` を呼ぶ。memtable が上限未満なら何もしない）
-5. レベルが閾値を超えたら compact（`compactOnce`）（`maybeFlush` が `flush >>= compactOnce` で連鎖するため、flush と同時に評価される）
+5. レベルが閾値を超えたら compact する。
+   `Session.OpenWith` では flush 後に `EngineHost.Signal` で background worker を起こし、
+   `Database.OpenWith` では `maybeFlush` が同期的に `compactOnce` を呼ぶ。
+   flush / compaction の失敗は commit を失敗させない
+   （memtable を残して次回再試行するか、flush 後の engine に `LastCompactionError` を記録する。gotchas §11.51）
 ```
 
 flush / compact は `RowStore` が `WriteBatch` 後に `IStorageEngine.MaybeFlush` を呼んで実行する
@@ -1543,12 +1628,14 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 ### 12.2 既知の制約
 
-- **compaction は同期**（バックグラウンドスレッド化していない）。
-  1回の commit が compaction の完了まで待つ。
+- **background compaction は 1 DB 1本の worker**（§8.6）。
+  `Session.OpenWith` では flush 後の compaction を worker が行い、commit は compaction を待たない。
+  `Database.OpenWith` は従来どおり同期 compaction。
+  読み取りは Session 呼び出し単位で Version 全ファイルを pin し、
+  worker は retired かつ refcount 0 のファイルだけを削除する。
+  周期実行（タイマー）はせず、トリガは DB オープン時と flush 後。
   入力はブロック単位で読み、出力も 1ファイル分しかメモリに持たない（§8.6）ので、
   入力サイズに比例するメモリは使わない。
-  バックグラウンド化しないのは、全ハンドルで共有する可変な `Version` と、
-  reader が使っているファイルの参照管理（refcount）が必要になるため（§7.7）。
 - **`scanAt` は pull（`SstScan`）を返し、1行ごとに必要なブロックだけを読む**。
   呼び出し時点では SSTable を開かず、破損・欠落はそのファイルが必要になった時点の `next` で返る。
   全件走査でも結果を溜めないため、テーブル全体のエントリを一度に持つことはない。

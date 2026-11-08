@@ -34,13 +34,20 @@ type internal Database(root: string, state: DbState) =
     let storeLeaseToken =
         state.Store.Lock |> Option.map (fun lockLease -> lockLease.Attach())
 
-    /// DB を開く。
+    /// background compaction を有効にして開く。
     /// <remarks>
     /// 同じ root はプロセス内で 1つしか開けない。2回目は `IoError` を返す
     /// （別の `RowStore` ができて memtable が分かれ、commit が見えないため）。
     /// 別プロセスが開いている場合も `IoError`。
     /// </remarks>
-    static member OpenWith(root: string) =
+    static member OpenWithBackground(root: string) =
+        result {
+            let! store = RowStore.openStoreWithBackground root
+            return! Database.OpenWithStore root store
+        }
+
+    /// background compaction を無効にして開く。
+    static member internal OpenWith(root: string) =
         result {
             let! store = RowStore.openStore root
             return! Database.OpenWithStore root store
@@ -66,6 +73,8 @@ type internal Database(root: string, state: DbState) =
                         NextSeqNo = lastSeq + 1UL
                     }
 
+                RowStore.startBackground store
+
                 new Database(
                     root,
                     {
@@ -85,6 +94,17 @@ type internal Database(root: string, state: DbState) =
 
     /// 実行中の transaction があるか。
     member _.InTransaction = state.Active.IsSome
+
+    /// 呼び出し単位のスナップショットを取る。
+    /// background compaction が有効なら、返した lease を dispose するまで
+    /// この Version のファイルは削除されない。
+    member this.AcquireSnapshot() =
+        let store, lease = RowStore.acquireSnapshot state.Store
+
+        if obj.ReferenceEquals(store, state.Store) then
+            this, lease
+        else
+            new Database(root, { state with Store = store }), lease
 
     /// テーブル一覧を返す。
     member _.TableNames() = state.Catalog.Tables |> List.map _.Name
@@ -178,7 +198,7 @@ type internal Database(root: string, state: DbState) =
     /// 明示的な transaction が無い場合は暗黙の transaction で実行し commit する。
     /// 複数文を実行する場合は、公開 API の `Session.Execute` を使う。
     /// </remarks>
-    member internal this.Execute(stmt: Statement) =
+    member this.Execute(stmt: Statement) =
         let nextOf nextState =
             if obj.ReferenceEquals(nextState, state) then
                 this

@@ -68,11 +68,23 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
     interface IStorageEngine with
         member _.NextSeqNo = 0UL
         member _.ActiveSnapshot = 0UL
+
+        member _.HostState =
+            {
+                Version = Version.Empty
+                ManifestNumber = 0L
+                ActiveSnapshot = 0UL
+                LastCompactionError = None
+                Generation = 0L
+            }
+
         member _.GetAt _ _ = ret None
         member _.ScanAt _ _ _ = ret SstScan.Empty
         member this.WriteBatch _ = ret (this :> IStorageEngine)
         member this.WithNextSeqNo _ = this :> IStorageEngine
         member this.WithActiveSnapshot _ = this :> IStorageEngine
+        member this.WithHostState _ = this :> IStorageEngine
+        member this.FlushIfNeeded _ = ret (this :> IStorageEngine, false)
         member this.MaybeFlush() = ret (this :> IStorageEngine)
 
         member _.Close() =
@@ -87,6 +99,53 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
 let ``Keyspace: table / index の名前`` () =
     Assert.Equal("t:people", Keyspace.table "people")
     Assert.Equal("i:ix_people_age", Keyspace.index "ix_people_age")
+
+[<Fact>]
+let ``RowStore: compaction 失敗後も flush 結果を保持し、再起動で commit を失わない`` () =
+    withDir "rowstore-compaction-fail" (fun dir ->
+        let engine = ok (StorageEngine.openDatabase dir)
+
+        let mk (num: int64) (key: int) =
+            [| Entry.put (intKey key) (uint64 key) (intRow key) |]
+            |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+            |> fun entries -> FileMetaData.writeSstable dir num 0 0.01 entries
+            |> ok
+
+        let f1 = mk 10L 1
+        let f2 = mk 11L 2
+        let f3 = mk 12L 3
+
+        // f2 を開けるが壊れたファイルにする（データブロックのチェックサム不一致）
+        let path = FileMetaData.path dir 11L
+        let data = System.IO.File.ReadAllBytes path
+        data.[0] <- data.[0] ^^^ 0xFFuy
+        System.IO.File.WriteAllBytes(path, data)
+
+        let version =
+            Version.Empty |> Version.addFile f1 |> Version.addFile f2 |> Version.addFile f3
+
+        let engine =
+            { engine with
+                Version = { version with NextFileNumber = 100L }
+                MemLimitBytes = 1
+            }
+
+        let store = openStoreWith dir (DiskStorageEngine engine :> IStorageEngine)
+
+        // 1 回目の write で flush + compaction が走り、compaction は f2 で失敗する。
+        let store =
+            ok (RowStore.writeBatches [ ("t", [| Entry.put (intKey 5) 5UL (intRow 5) |]) ] store)
+
+        // 2 回目の write は flush 済みの新しい WAL に載る。
+        ok (RowStore.writeBatches [ ("t", [| Entry.put (intKey 6) 6UL (intRow 6) |]) ] store)
+        |> ignore
+
+        // クラッシュ相当: 同じディレクトリを開き直す。
+        let reopened = ok (StorageEngine.openDatabase dir)
+        let key5 = Keyspace.prefixedKey "t" (intKey 5)
+        let key6 = Keyspace.prefixedKey "t" (intKey 6)
+        Assert.True((ok (StorageEngine.getAt None key5 reopened)).IsSome)
+        Assert.True((ok (StorageEngine.getAt None key6 reopened)).IsSome))
 
 [<Fact>]
 let ``RowStore: keyspace は 1 本の LSM の接頭辞で分離される`` () =
@@ -210,6 +269,7 @@ let ``RowStore.close: engine の失敗を返してロックを解放する`` () 
             Root = ""
             Engine = CloseTrackingEngine("a", true, closed) :> IStorageEngine
             Lock = None
+            Host = None
         }
 
     let outcome = RowStore.close store
