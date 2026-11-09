@@ -496,6 +496,14 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
         finally
             raw.Dispose()
 
+        // 切断の検知と rollback はサーバ側で非同期に進む。
+        // 次の SELECT が rollback より先に writeGate を取ると未 commit の行が見えるため、
+        // rollback 完了を待ってから照会する。
+        Assert.True(
+            SpinWait.SpinUntil((fun () -> not session.InTransaction), 10000),
+            "切断時の rollback が 10 秒以内に完了しませんでした"
+        )
+
         // 次の接続では rollback 済みで、行は見えない。
         use client = new RykDbClient("127.0.0.1", port)
         let _, rows = okRows (client.Send "SELECT COUNT(*) FROM t")

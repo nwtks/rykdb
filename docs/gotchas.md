@@ -1904,3 +1904,14 @@ worker は `signal.Wait()` でブロックし続ける長寿命タスクなの�
 
 回帰テスト: `background compaction: 開始後に古い snapshot が現れたら境界を下げてやり直す`
 （`started.Wait 5000` が false になると「compaction が開始されません」で落ちる）。
+
+### 11.56 TCP の切断 rollback 完了を待たずに次の接続から照会すると flaky
+
+❌ クライアントを切った直後に別の接続から `SELECT` する。
+切断（EOF）の検知と rollback はサーバの接続タスクで非同期に進むため、
+先に届いた `SELECT` が rollback より先に `writeGate` を取ると、未 commit の行が見える
+（テストでは期待 `0` に対して `1` が返り、`Collections differ` になる）。
+
+✅ テストでは `SpinWait.SpinUntil((fun () -> not session.InTransaction), 10000)` で rollback 完了を待つ。
+
+回帰テスト: `TCP: 切断時に open transaction は rollback される`。
