@@ -195,7 +195,7 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 | -------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `INTEGER` `REAL` `DECIMAL` | 3種とも `decimal` 型に変換して比較                                                                                          |
 | `REAL` の `NaN`            | **`REAL` 同士の比較でのみ**最大。`NaN = NaN` は真。`NaN` と `INTEGER` / `DECIMAL` の比較は `TypeError`（§14「演算の注意」） |
-| `TEXT`                     | `StringComparer.Ordinal`（= UTF-8 のバイト順 = コードポイント順）                                                           |
+| `TEXT`                     | UTF-8 の符号化順（= Unicode コードポイント順）                                                                              |
 | `BLOB`                     | バイト列の辞書順（短い方が先）                                                                                              |
 | `DATE` `TIMESTAMP`         | 相互比較可（`DATE` は UTC 午前 0時の `TIMESTAMP` として扱う）                                                               |
 | `UUID`                     | `Guid` の比較                                                                                                               |
@@ -203,6 +203,11 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 
 **異なる型の組み合わせは比較できない**（`TypeError`）。
 `active = 1`（`BOOLEAN` と `INTEGER`）はエラーになる。
+
+`TEXT` の比較順はキー符号化（UTF-8 バイト列）と同じになる。
+.NET の `StringComparer.Ordinal` は UTF-16 コード単位順で、
+補助文字（サロゲートペア）と `U+E000`..`U+FFFF` の間で UTF-8 の順序と逆転するため使わない。
+例: `U+FF21`（全角 A）< `U+1F600`（絵文字）。
 
 - 数値 3種の比較順位: `INTEGER` = `REAL` = `DECIMAL` < `DATE` < `TIMESTAMP` < `TEXT` < `BLOB` < `UUID`
 - `NULL` との比較は 3値論理（[§6.2](#62-3値論理)）に従い、結果は `UNKNOWN` になる。
@@ -648,7 +653,9 @@ SELECT p.id, d.dname
 同時に開く run は最大 32本で、それを超える場合は中間 run へ multi-pass merge する。
 同値な行の順序は保証されない（`ORDER BY` のキーが一意でないとき）。
 
-- ソートは全入力を消費してからでないと 1行も出せないため、比較不能な型があれば**その時点で** `TypeError` になる。
+- **`NULL` は最小**として扱う（`ASC` では先頭、`DESC` では末尾）。
+  `NULLS FIRST` / `NULLS LAST` は未対応。
+- ソートは全入力を消費してからでないと 1行も出せないため、`NULL` 以外で比較不能な型があれば**その時点で** `TypeError` になる。
 - 一時ファイルは run が尽いた時点で消える。途中打ち切りで残ったものは次回のソート時に回収する。
 - **主キー順の `ORDER BY` はソートを省略する**。
   単一テーブル・集約なし・`DISTINCT` なしで、
@@ -1254,7 +1261,7 @@ db> .rollback
 | DML の別名          | `UPDATE t AS x` / `DELETE FROM t x` はパースできるが、`WHERE x.id` は `NameError`（対象行が無ければ 0行）。列は実名で修飾する       |
 | トランザクション    | 分離レベルは Snapshot Isolation 固定。`SAVEPOINT` と読み取り専用トランザクションは未対応（§12）                                     |
 | DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）                                                                          |
-| `ORDER BY`          | 列参照・式・序数（1 始まり）が使える。同値行の順序は保証しない                                                                      |
+| `ORDER BY`          | 列参照・式・序数（1 始まり）が使える。`NULL` は最小（`ASC` 先頭 / `DESC` 末尾）。同値行の順序は保証しない                           |
 
 ### 演算の注意
 
@@ -1264,6 +1271,8 @@ db> .rollback
 - `REAL` の `NaN` は `REAL` 同士の比較でのみ特別扱いされる（`NaN` が最大、`NaN = NaN` は真）。
   `NaN` と `INTEGER` / `DECIMAL` を比較すると `TypeError`（`NaN や ±Infinity は数値比較できません`）になる。
   `NaN` / `±Infinity` は `DECIMAL` に変換できない。
+- `REAL` の `-0.0` は `+0.0` と同じ値として扱う。
+  主キー・`UNIQUE` 索引でも同じキーになり、保存時には `+0.0` に正規化される。
 
 ---
 

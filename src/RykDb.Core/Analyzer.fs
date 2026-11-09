@@ -564,7 +564,7 @@ module internal Analyzer =
         | Expr.Unary(UnaryOp.Neg, Expr.Literal l) ->
             match l.ToSqlValue with
             | SqlValue.Int i -> Some(SqlValue.Int -i)
-            | SqlValue.Real f -> Some(SqlValue.Real -f)
+            | SqlValue.Real f -> Some(SqlValue.vReal -f)
             | _ -> None
         | _ -> None
 

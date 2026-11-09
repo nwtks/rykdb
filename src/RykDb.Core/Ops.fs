@@ -19,7 +19,7 @@ module internal Ops =
                 function
                 | [] -> 0
                 | (i, dir) :: tail ->
-                    match SqlValue.compareValues a.[i] b.[i] with
+                    match SqlValue.compareValuesForSort a.[i] b.[i] with
                     | Error _ -> compareKeys tail
                     | Ok c ->
                         if c = 0 then

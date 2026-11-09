@@ -76,6 +76,44 @@ let ``sortBy: 昇順と降順`` () =
     Assert.Equal<int64>(3L, asInt rows2.[0].[0])
 
 [<Fact>]
+let ``sortBy: NULL は昇順で先頭、降順で末尾`` () =
+    let op =
+        opOfRows
+            [
+                row [ SqlValue.Int 3L; SqlValue.Int 0L ]
+                row [ SqlValue.Null; SqlValue.Int 0L ]
+                row [ SqlValue.Int 1L; SqlValue.Int 0L ]
+                row [ SqlValue.Null; SqlValue.Int 0L ]
+                row [ SqlValue.Int 2L; SqlValue.Int 0L ]
+            ]
+
+    let ascKey =
+        [
+            {
+                Expression = col "a"
+                Direction = SortDirection.Ascending
+            }
+        ]
+
+    let rows = ok (Op.toArray (ok (Ops.sortBy schema2 ascKey op)))
+    Assert.True(SqlValue.isNull rows.[0].[0])
+    Assert.True(SqlValue.isNull rows.[1].[0])
+    Assert.Equal<int64 list>([ 1L; 2L; 3L ], [ for r in 2..4 -> asInt rows.[r].[0] ])
+
+    let descKey =
+        [
+            {
+                Expression = col "a"
+                Direction = SortDirection.Descending
+            }
+        ]
+
+    let rowsDesc = ok (Op.toArray (ok (Ops.sortBy schema2 descKey op)))
+    Assert.Equal<int64 list>([ 3L; 2L; 1L ], [ for r in 0..2 -> asInt rowsDesc.[r].[0] ])
+    Assert.True(SqlValue.isNull rowsDesc.[3].[0])
+    Assert.True(SqlValue.isNull rowsDesc.[4].[0])
+
+[<Fact>]
 let ``sortBy: 複数キーは左から優先`` () =
     let op =
         opOfRows

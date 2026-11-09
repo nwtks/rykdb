@@ -551,7 +551,7 @@ module internal OrderPreserving =
                 return! finish (SqlValue.Int v) c
             | Tag.Real ->
                 let! m, c = Reader.readUint64BE c
-                return! finish (unmapDouble (int64 m) |> SqlValue.normalizeFloat |> SqlValue.Real) c
+                return! finish (unmapDouble (int64 m) |> SqlValue.vReal) c
             | Tag.Decimal ->
                 let! v, c = readOrderedDecimal c
                 return! finish (SqlValue.Decimal v) c
@@ -650,6 +650,11 @@ module internal KeyBuilder =
 /// 行ペイロード用のコンパクト符号化。
 /// キーと異なり、行値には順序保持が不要なので varint で詰めて小さくする。
 module internal ValueCodec =
+    /// 小数の負のゼロ (-0.0M) を +0.0M に正規化する。
+    /// compareValues は両者を等しいと扱うため、
+    /// DISTINCT などの符号化でも同じビット列にして重複と見なす。
+    let private normalizeDecimal (d: decimal) = if d = 0M then 0M else d
+
     let private writeValue (w: Writer) =
         let tagged tag = w |> Writer.writeByte (byte tag)
 
@@ -657,12 +662,13 @@ module internal ValueCodec =
         | SqlValue.Null -> tagged 0uy
         | SqlValue.Bool b -> tagged 1uy |> Writer.bool b
         | SqlValue.Int i -> tagged 2uy |> Writer.int64LE i
-        | SqlValue.Real f -> tagged 3uy |> Writer.int64LE (System.BitConverter.DoubleToInt64Bits f)
+        | SqlValue.Real f ->
+            tagged 3uy
+            |> Writer.int64LE (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits)
         | SqlValue.Decimal d ->
-            let withTag = tagged 4uy
-
-            System.Decimal.GetBits d
-            |> Array.fold (fun w b -> w |> Writer.int64LE (int64 b)) withTag
+            normalizeDecimal d
+            |> System.Decimal.GetBits
+            |> Array.fold (fun w b -> w |> Writer.int64LE (int64 b)) (tagged 4uy)
         | SqlValue.Text s -> tagged 5uy |> Writer.str s
         | SqlValue.Blob bs -> tagged 6uy |> Writer.lengthPrefixed bs
         | SqlValue.Date d -> tagged 7uy |> Writer.int64LE (d.ToDateTime(System.TimeOnly.MinValue).Ticks)
@@ -759,11 +765,12 @@ module internal ValueCodec =
             writeInt64LETo out (pos + 1) i
         | SqlValue.Real f ->
             out.[pos] <- 3uy
-            writeInt64LETo out (pos + 1) (System.BitConverter.DoubleToInt64Bits f)
+            writeInt64LETo out (pos + 1) (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits)
         | SqlValue.Decimal d ->
             out.[pos] <- 4uy
 
-            System.Decimal.GetBits d
+            normalizeDecimal d
+            |> System.Decimal.GetBits
             |> Array.fold (fun p b -> writeInt64LETo out p (int64 b)) (pos + 1)
         | SqlValue.Text s ->
             let bytes = System.Text.Encoding.UTF8.GetBytes s

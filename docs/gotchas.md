@@ -1915,3 +1915,52 @@ worker は `signal.Wait()` でブロックし続ける長寿命タスクなの�
 ✅ テストでは `SpinWait.SpinUntil((fun () -> not session.InTransaction), 10000)` で rollback 完了を待つ。
 
 回帰テスト: `TCP: 切断時に open transaction は rollback される`。
+
+### 11.57 ORDER BY の比較関数は全順序にする（NULL を「等しい」にしない）
+
+❌ `Ops.sortBy` の `compareWith` で、
+`SqlValue.compareValues` の `Error`（NULL 比較）を 0 に落とす。
+NULL がすべての値と等しい関係になり、推移律が壊れる。
+`Array.sortWith` や外部マージの k-way merge は全順序を前提にするため、
+NULL を含む列を `ORDER BY` すると**非 NULL の値が未ソートのまま**返る。
+
+✅ `SqlValue.compareValuesForSort` を使い、NULL を最小として全順序にする
+（`ASC` 先頭 / `DESC` 末尾、SQLite 互換）。
+`WHERE` などの 3値論理は `compareValues` のまま（NULL との比較は `UNKNOWN`）。
+`Ops.sortBy` の `check` は NULL を代表値にしない
+（NULL は型不一致の判定に使わず、非 NULL 同士だけを比較する）。
+
+回帰テスト: `SqlValue.compareValuesForSort: NULL は最小` /
+`sortBy: NULL は昇順で先頭、降順で末尾` /
+`SqlReference: ORDER BY は NULL を昇順で先頭、降順で末尾に置く`。
+
+### 11.58 TEXT の比較は UTF-8 の符号化順に合わせる
+
+❌ `StringComparer.Ordinal` で `TEXT` を比較する。
+Ordinal は UTF-16 コード単位順であり、UTF-8 の符号化順と逆転する範囲がある
+（例: `U+FF21`（全角 A）と `U+1F600`（絵文字））。
+キーの符号化は UTF-8 なので、SQL の比較とキー順が食い違い、
+`ORDER BY` のソート省略（主キー順）・主キー/索引の range scan で行を取りこぼす。
+
+✅ `SqlValue.compareText` で Unicode コードポイント順に比較する。
+UTF-8 はコードポイント順にバイト列が増えるため、キー符号化の順序と一致する。
+不正なサロゲートは `Encoding.UTF8` と同じく `U+FFFD` として扱う。
+
+回帰テスト: `SqlValue.compareValues: TEXT は UTF-8 の符号化順で比較する` /
+`SqlReference: TEXT の比較は UTF-8 の符号化順に一致する`。
+
+### 11.59 REAL の -0.0 はキー・DISTINCT でも +0.0 に正規化する
+
+❌ 比較だけ `-0.0 = +0.0` とし、符号化は `DoubleToInt64Bits` の生ビットを書く。
+主キー/`UNIQUE` 索引では別キーになり、両方 INSERT できる。
+`SELECT x FROM r WHERE x = 0.0` が 1行でも、`(x + 0.0) = 0.0` では 2行になる。
+
+✅ `SqlValue.normalizeFloat` で `-0.0` を `+0.0` に正規化し、
+`vReal` 経由の生成（リテラル・単項マイナス・算術・`CAST`・範囲定数）と
+`ValueCodec` の符号化で同じビット列にする。
+DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
+
+回帰テスト: `SqlValue.normalizeFloat: -0.0 は +0.0 に正規化される` /
+`KeyBuilder.ofValues: REAL の -0.0 は +0.0 と同じキー` /
+`ValueCodec: 負のゼロは正のゼロと同じ符号化` /
+`SqlReference: REAL の -0.0 は +0.0 と同じ主キー`。

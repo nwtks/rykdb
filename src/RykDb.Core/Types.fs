@@ -244,13 +244,55 @@ module internal SqlValue =
 
     let canonicalNaN = System.BitConverter.Int64BitsToDouble CanonicalNaNBits
 
-    /// NaN を単一のビットパターンに正規化する。
-    /// キー符号化の順序を一意にし、「NaN は他のすべての数値より大きい」という
-    /// SQL 比較の規則と矛盾しないようにする。
+    /// 浮動小数点数を単一のビットパターンに正規化する。
+    /// - NaN は単一のビットパターンに揃える（キー符号化の順序を一意にする）。
+    /// - -0.0 は +0.0 に揃える（compareValues が両者を等しいと扱うため、
+    ///   キーや DISTINCT の符号化でも同じ値にする）。
     let normalizeFloat (f: float) =
-        if System.Double.IsNaN f then canonicalNaN else f
+        if System.Double.IsNaN f then canonicalNaN
+        elif f = 0.0 then 0.0
+        else f
 
     let vReal = normalizeFloat >> SqlValue.Real
+
+    /// TEXT を UTF-8 の符号化順（Unicode コードポイント順）で比較する。
+    /// .NET の StringComparer.Ordinal は UTF-16 コード単位順であり、
+    /// 補助文字（サロゲートペア）と U+E000..U+FFFF の間で UTF-8 の順序と逆転する。
+    /// キーの符号化は UTF-8 バイト列なので、SQL の比較も同じ順序に合わせる。
+    /// 不正なサロゲートは Encoding.UTF8 と同じく U+FFFD として扱う。
+    let compareText (x: string) (y: string) =
+        let codePointAt (s: string) i =
+            let c = s.[i]
+
+            if
+                System.Char.IsHighSurrogate c
+                && i + 1 < s.Length
+                && System.Char.IsLowSurrogate s.[i + 1]
+            then
+                System.Char.ConvertToUtf32(c, s.[i + 1]), i + 2
+            elif System.Char.IsSurrogate c then
+                0xFFFD, i + 1
+            else
+                int c, i + 1
+
+        let rec loop i j =
+            if i >= x.Length then
+                if j >= y.Length then 0 else -1
+            elif j >= y.Length then
+                1
+            else
+                let cx = x.[i]
+                let cy = y.[j]
+
+                if cx = cy && not (System.Char.IsSurrogate cx) then
+                    loop (i + 1) (j + 1)
+                else
+                    let px, nextX = codePointAt x i
+                    let py, nextY = codePointAt y j
+                    let c = compare px py
+                    if c <> 0 then c else loop nextX nextY
+
+        loop 0 0
 
     /// 値どうしの比較。
     /// NULL は比較不能として例外を投げる。
@@ -298,7 +340,7 @@ module internal SqlValue =
         | (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _),
           (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _) -> compareNumeric a b
         | SqlValue.Bool x, SqlValue.Bool y -> ret (compare (if x then 1 else 0) (if y then 1 else 0))
-        | SqlValue.Text x, SqlValue.Text y -> ret (System.StringComparer.Ordinal.Compare(x, y))
+        | SqlValue.Text x, SqlValue.Text y -> ret (compareText x y)
         | SqlValue.Blob x, SqlValue.Blob y -> ret (Bytes.compare x y)
         | SqlValue.Uuid x, SqlValue.Uuid y -> ret (compare x y)
         | SqlValue.Date x, SqlValue.Date y -> ret (compare x y)
@@ -318,6 +360,17 @@ module internal SqlValue =
                 sprintf "型 '%s' と '%s' は比較できません" (dataType a |> DataType.toSqlName) (dataType b |> DataType.toSqlName)
                 |> DbError.typeError
             )
+
+    /// ORDER BY 用の全順序比較。
+    /// NULL は他のすべての値より小さいものとして扱う（ASC の先頭、DESC の末尾）。
+    /// SQL の 3値論理では NULL は比較不能だが、ソートには全順序が必要なのでここだけ規則を分ける。
+    /// NULL 以外の型が比較不能な場合は compareValues と同じエラーを返す。
+    let compareValuesForSort (a: SqlValue) (b: SqlValue) =
+        match a, b with
+        | SqlValue.Null, SqlValue.Null -> ret 0
+        | SqlValue.Null, _ -> ret -1
+        | _, SqlValue.Null -> ret 1
+        | _ -> compareValues a b
 
     /// 関数・制約メッセージ用の簡潔な表示（SQL リテラルではなく）。
     let toDisplayString =
@@ -384,10 +437,10 @@ module internal SqlValue =
 
         let asReal =
             function
-            | SqlValue.Real _ as v -> ret v
-            | SqlValue.Int i -> float i |> SqlValue.Real |> ret
-            | SqlValue.Bool b -> (if b then 1.0 else 0.0) |> SqlValue.Real |> ret
-            | SqlValue.Decimal d -> float d |> SqlValue.Real |> ret
+            | SqlValue.Real f -> ret (vReal f)
+            | SqlValue.Int i -> float i |> vReal |> ret
+            | SqlValue.Bool b -> (if b then 1.0 else 0.0) |> vReal |> ret
+            | SqlValue.Decimal d -> float d |> vReal |> ret
             | _ -> fail ()
 
         let asDecimal v =
@@ -498,7 +551,7 @@ module internal SqlValue =
                         System.Globalization.CultureInfo.InvariantCulture
                     )
                 with
-                | true, f -> ret (SqlValue.Real(normalizeFloat f))
+                | true, f -> ret (vReal f)
                 | _ -> fail ()
             | DataType.Decimal, SqlValue.Text s ->
                 match

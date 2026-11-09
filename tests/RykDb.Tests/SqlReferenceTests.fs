@@ -654,6 +654,132 @@ let ``SqlReference: 複合主キーは全列の昇順で並ぶ`` () =
         Assert.Equal<int list>([ 1; 1; 2; 2 ], partial.Rows |> Array.map (fun r -> int (asInt r.[0])) |> Array.toList))
 
 [<Fact>]
+let ``SqlReference: ORDER BY は NULL を昇順で先頭、降順で末尾に置く`` () =
+    withDb "orderby-null" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)"
+
+        let db2, _ =
+            ok (execSql db1 "INSERT INTO t VALUES (1,NULL),(2,30),(3,NULL),(4,10),(5,20)")
+
+        let ids sql =
+            let _, res = ok (execSql db2 sql)
+            res.Rows |> Array.map (fun r -> int (asInt r.[0])) |> Array.toList
+
+        Assert.Equal<int list>([ 1; 3; 4; 5; 2 ], ids "SELECT id FROM t ORDER BY x, id")
+        Assert.Equal<int list>([ 2; 5; 4; 1; 3 ], ids "SELECT id FROM t ORDER BY x DESC, id")
+
+        // 単一キーでも NULL 以外が昇順であること。
+        let _, res = ok (execSql db2 "SELECT x FROM t ORDER BY x")
+        let nulls = res.Rows |> Array.filter (fun r -> SqlValue.isNull r.[0])
+
+        let nonNull =
+            res.Rows
+            |> Array.choose (fun r ->
+                match r.[0] with
+                | SqlValue.Int i -> Some i
+                | _ -> None)
+
+        Assert.Equal<int>(2, nulls.Length)
+        Assert.Equal<int64 list>([ 10L; 20L; 30L ], nonNull |> Array.toList))
+
+[<Fact>]
+let ``SqlReference: TEXT の比較は UTF-8 の符号化順に一致する`` () =
+    withDb "text-utf8-order" (fun db0 ->
+        // UTF-16 のコード単位順では絵文字が全角 A より小さいが、
+        // UTF-8 の符号化順（コードポイント順）では全角 A のほうが小さい。
+        let fullwidthA = "\uFF21"
+        let emoji = "\U0001F600"
+
+        let db1 = exec db0 "CREATE TABLE t (id TEXT PRIMARY KEY)"
+
+        let db2, _ =
+            ok (execSql db1 (sprintf "INSERT INTO t VALUES ('%s'), ('%s')" fullwidthA emoji))
+
+        let textIds sql =
+            let _, res = ok (execSql db2 sql)
+            res.Rows |> Array.map (fun r -> asText r.[0]) |> Array.toList
+
+        // 主キー走査順（ソート省略）と式ソートの結果が一致する。
+        Assert.Equal<string list>([ fullwidthA; emoji ], textIds "SELECT id FROM t ORDER BY id")
+
+        Assert.Equal<string list>([ fullwidthA; emoji ], textIds "SELECT id FROM t ORDER BY id || ''")
+
+        // 主キーの範囲走査でも比較順が符号化順と一致する。
+        Assert.Equal<string list>(
+            [ emoji ],
+            textIds (sprintf "SELECT id FROM t WHERE id > '%s' ORDER BY id" fullwidthA)
+        )
+
+        Assert.Equal<string list>(
+            [ fullwidthA; emoji ],
+            textIds (sprintf "SELECT id FROM t WHERE id BETWEEN '%s' AND '%s' ORDER BY id" fullwidthA emoji)
+        )
+
+        // 下限と上限が逆の BETWEEN は空。
+        Assert.Equal<string list>(
+            [],
+            textIds (sprintf "SELECT id FROM t WHERE id BETWEEN '%s' AND '%s'" emoji fullwidthA)
+        )
+
+        // 索引走査でも同じ。比較順がずれると、索引の範囲に含まれる行を
+        // フィルタで落としてしまう。
+        let db3 = exec db2 "CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT)"
+
+        let db4, _ =
+            ok (execSql db3 (sprintf "INSERT INTO u VALUES (1,'%s'),(2,'%s')" fullwidthA emoji))
+
+        let db5 = exec db4 "CREATE INDEX us ON u (s)"
+
+        let intIds sql =
+            let _, res = ok (execSql db5 sql)
+            res.Rows |> Array.map (fun r -> asInt r.[0]) |> Array.toList
+
+        Assert.Equal<int64 list>([ 2L ], intIds (sprintf "SELECT id FROM u WHERE s > '%s' ORDER BY id" fullwidthA))
+
+        Assert.Equal<int64 list>(
+            [ 1L; 2L ],
+            intIds (sprintf "SELECT id FROM u WHERE s BETWEEN '%s' AND '%s' ORDER BY id" fullwidthA emoji)
+        )
+
+        let _, sorted = ok (execSql db5 "SELECT s FROM u ORDER BY s")
+
+        Assert.Equal<string list>(
+            [ fullwidthA; emoji ],
+            sorted.Rows |> Array.map (fun r -> asText r.[0]) |> Array.toList
+        ))
+
+[<Fact>]
+let ``SqlReference: REAL の -0.0 は +0.0 と同じ主キー`` () =
+    withDb "real-negative-zero" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE r (x REAL PRIMARY KEY, v TEXT)"
+        let db2 = exec db1 "INSERT INTO r VALUES (0.0, 'a')"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "REAL の -0.0 が +0.0 と別の主キーになっています"
+            (execSql db2 "INSERT INTO r VALUES (-0.0, 'b')")
+
+        let _, res = ok (execSql db2 "SELECT x FROM r")
+        Assert.Equal<int>(1, res.Rows.Length)
+
+        match res.Rows.[0].[0] with
+        | SqlValue.Real f -> Assert.Equal(0L, System.BitConverter.DoubleToInt64Bits f)
+        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+
+        let _, byValue = ok (execSql db2 "SELECT x FROM r WHERE x = -0.0")
+        Assert.Equal<int>(1, byValue.Rows.Length)
+
+        // UNIQUE 索引も同じキーで重複を検出する。
+        let db3 = exec db2 "CREATE TABLE u (id INTEGER PRIMARY KEY, x REAL)"
+        let db4 = exec db3 "CREATE UNIQUE INDEX ux ON u (x)"
+        let db5 = exec db4 "INSERT INTO u VALUES (1, 0.0)"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "UNIQUE 索引で -0.0 と +0.0 が別の値になっています"
+            (execSql db5 "INSERT INTO u VALUES (2, -0.0)"))
+
+[<Fact>]
 let ``SqlReference: 別名を ORDER BY で参照できる`` () =
     seeded "sel-alias-order" (fun db ->
         // 別名 a は age を指すので age の順（bob 25 → alice 30 → carol 35）で並ぶ

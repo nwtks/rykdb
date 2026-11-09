@@ -222,7 +222,7 @@ module internal Scalar =
                     | SqlValue.Int i when i = System.Int64.MinValue ->
                         err (DbError.constraintViolation "ABS の結果が範囲を超えました")
                     | SqlValue.Int i -> ret (SqlValue.Int(abs i))
-                    | SqlValue.Real f -> ret (SqlValue.Real(abs f))
+                    | SqlValue.Real f -> ret (SqlValue.vReal (abs f))
                     | SqlValue.Decimal d -> ret (SqlValue.Decimal(abs d))
                     | other ->
                         err (
@@ -249,7 +249,7 @@ module internal Scalar =
             >>= fun () ->
                 match args.[0] with
                 | SqlValue.Int i -> ret (SqlValue.Int i)
-                | SqlValue.Real f -> ret (SqlValue.Real(System.Math.Round(f, System.MidpointRounding.AwayFromZero)))
+                | SqlValue.Real f -> ret (System.Math.Round(f, System.MidpointRounding.AwayFromZero) |> SqlValue.vReal)
                 | SqlValue.Decimal d ->
                     ret (SqlValue.Decimal(System.Math.Round(d, System.MidpointRounding.AwayFromZero)))
                 | SqlValue.Null -> ret SqlValue.Null
@@ -332,7 +332,7 @@ module internal Eval =
             | Div -> a / b
             | Mod -> a % b
 
-        ret (SqlValue.Real r)
+        ret (SqlValue.vReal r)
 
     let private decimalOf (v: SqlValue) =
         match v with
@@ -586,7 +586,7 @@ module internal Eval =
                             | SqlValue.Int i when i = System.Int64.MinValue ->
                                 err (DbError.constraintViolation "符号反転の結果が範囲を超えました")
                             | SqlValue.Int i -> ret (SqlValue.Int -i)
-                            | SqlValue.Real f -> ret (SqlValue.Real -f)
+                            | SqlValue.Real f -> ret (SqlValue.vReal -f)
                             | SqlValue.Decimal d -> ret (SqlValue.Decimal -d)
                             | _ -> err (sprintf "'-' は数値に適用できません: %s" (SqlLiteral.toSqlLiteral v) |> DbError.typeError)
 

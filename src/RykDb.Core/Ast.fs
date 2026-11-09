@@ -20,7 +20,7 @@ type internal Literal =
         | Null -> SqlValue.Null
         | Bool b -> SqlValue.Bool b
         | Int i -> SqlValue.Int i
-        | Real f -> SqlValue.Real f
+        | Real f -> SqlValue.vReal f
         | Decimal d -> SqlValue.Decimal d
         | String s -> SqlValue.Text s
         | Blob b -> SqlValue.Blob b

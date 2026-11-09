@@ -398,6 +398,13 @@ let ``KeyBuilder.ofValues: 値を符号化する`` () =
     Assert.True(k.Length > 0)
 
 [<Fact>]
+let ``KeyBuilder.ofValues: REAL の -0.0 は +0.0 と同じキー`` () =
+    let negativeZero = BitConverter.Int64BitsToDouble 0x8000000000000000L
+    let positive = KeyBuilder.ofValues [ SqlValue.vReal 0.0 ]
+    let negative = KeyBuilder.ofValues [ SqlValue.Real negativeZero ]
+    Assert.Equal<byte array>(positive, negative)
+
+[<Fact>]
 let ``KeyBuilder.ofIndexAndPrimary: 索引列 + 主キー列`` () =
     let k = KeyBuilder.ofIndexAndPrimary [ SqlValue.Int 20L ] [ SqlValue.Int 7L ]
     let prefix = KeyBuilder.ofValues [ SqlValue.Int 20L ]
@@ -429,6 +436,29 @@ let ``ValueCodec: 全型の往復`` () =
             | _ -> a = b
 
         Assert.True(same, sprintf "往復に失敗: %s" (SqlLiteral.toSqlLiteral a))
+
+[<Fact>]
+let ``ValueCodec: 負のゼロは正のゼロと同じ符号化`` () =
+    let negativeZero = BitConverter.Int64BitsToDouble 0x8000000000000000L
+
+    let positive =
+        ValueCodec.writeValues [ SqlValue.vReal 0.0; SqlValue.Decimal 0M ] Writer.Empty
+        |> Writer.toArray
+
+    let negative =
+        ValueCodec.writeValues [ SqlValue.Real negativeZero; SqlValue.Decimal(-0.0M) ] Writer.Empty
+        |> Writer.toArray
+
+    Assert.Equal<byte array>(positive, negative)
+
+    let got, _ = ok (ValueCodec.readValues (Cursor.create negative))
+
+    match got with
+    | [| SqlValue.Real f; SqlValue.Decimal d |] ->
+        let bits = Decimal.GetBits d
+        Assert.Equal(0L, BitConverter.DoubleToInt64Bits f)
+        Assert.Equal(0u, uint32 bits.[3] &&& 0x80000000u)
+    | other -> Assert.Fail(sprintf "往復結果が想定外: %A" other)
 
 [<Fact>]
 let ``ValueCodec: 不明な型タグは CorruptionError`` () =

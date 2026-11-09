@@ -88,6 +88,16 @@ let ``SqlValue.normalizeFloat: NaN は canonicalNaN`` () =
     Assert.Equal(1.5, SqlValue.normalizeFloat 1.5)
 
 [<Fact>]
+let ``SqlValue.normalizeFloat: -0.0 は +0.0 に正規化される`` () =
+    let negativeZero = BitConverter.Int64BitsToDouble 0x8000000000000000L
+    Assert.Equal(0L, BitConverter.DoubleToInt64Bits(SqlValue.normalizeFloat negativeZero))
+    Assert.Equal(0L, BitConverter.DoubleToInt64Bits(SqlValue.normalizeFloat 0.0))
+
+    match SqlValue.vReal negativeZero with
+    | SqlValue.Real f -> Assert.Equal(0L, BitConverter.DoubleToInt64Bits f)
+    | other -> Assert.Fail(sprintf "vReal が REAL ではありません: %A" other)
+
+[<Fact>]
 let ``SqlValue: NaN は正の quiet NaN に正規化される`` () =
     // .NET の Double.NaN は符号ビットが立った負の NaN。そのままキーにすると
     // 順序保持の前提が崩れるため、単一のビットパターンへ正規化する。
@@ -134,6 +144,55 @@ let ``SqlValue.compareValues: 同型どうしは順序どおり`` () =
     let g1 = Guid "11111111-1111-1111-1111-111111111111"
     let g2 = Guid "22222222-2222-2222-2222-222222222222"
     Assert.True(ok (SqlValue.compareValues (SqlValue.Uuid g1) (SqlValue.Uuid g2)) < 0)
+
+[<Fact>]
+let ``SqlValue.compareValues: TEXT は UTF-8 の符号化順で比較する`` () =
+    // U+FF21（全角 A）と U+1F600（絵文字）。UTF-16 のコード単位順では
+    // 絵文字（サロゲート 0xD83D）が全角 A（0xFF21）より小さいが、
+    // UTF-8 の符号化順（＝コードポイント順）では全角 A のほうが小さい。
+    let fullwidthA = "\uFF21"
+    let emoji = "\U0001F600"
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Text fullwidthA) (SqlValue.Text emoji)) < 0)
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Text emoji) (SqlValue.Text fullwidthA)) > 0)
+
+    // 比較結果はキー符号化（UTF-8 バイト列）の順序と一致する。
+    let samples =
+        [
+            ""
+            "a"
+            "ab"
+            "A"
+            "z"
+            fullwidthA
+            "\uE000"
+            "\uFFFF"
+            emoji
+            "\U0001F601"
+            "a" + emoji
+            "\uD800"
+        ]
+
+    for x in samples do
+        for y in samples do
+            let expected =
+                Bytes.compare (System.Text.Encoding.UTF8.GetBytes x) (System.Text.Encoding.UTF8.GetBytes y)
+                |> sign
+
+            let actual = ok (SqlValue.compareValues (SqlValue.Text x) (SqlValue.Text y)) |> sign
+
+            Assert.Equal<int>(expected, actual)
+
+[<Fact>]
+let ``SqlValue.compareValuesForSort: NULL は最小`` () =
+    let nullV = SqlValue.Null
+    let one = SqlValue.Int 1L
+    Assert.Equal(0, ok (SqlValue.compareValuesForSort nullV nullV))
+    Assert.Equal(-1, ok (SqlValue.compareValuesForSort nullV one))
+    Assert.Equal(1, ok (SqlValue.compareValuesForSort one nullV))
+    Assert.True(ok (SqlValue.compareValuesForSort one (SqlValue.Int 2L)) < 0)
+
+    // NULL 以外の比較不能な型は compareValues と同じくエラー
+    expectErrorKind ErrorKind.TypeError "INT と TEXT は比較できない" (SqlValue.compareValuesForSort one (SqlValue.Text "1"))
 
 [<Fact>]
 let ``SqlValue.compareValues: 数値 3種と日時は相互に比較できる`` () =
