@@ -221,7 +221,7 @@ flowchart TB
 | `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                      |
 | `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                |
 | `Database.fs`      | internal の不変ハンドル `Database`（transaction・状態遷移）                                 |
-| `Session.fs`       | 公開 API `Session`（`Database` をカプセル化し、呼び出しを直列化）                           |
+| `Session.fs`       | 公開 API `Session`（`Database` をカプセル化。読み取りは並行、書き込みは直列化）             |
 
 ### F# のコンパイル順
 
@@ -996,10 +996,14 @@ commit 成功・rollback・`Close` で解除する。
   worker は merge を gate の外で行い、
   install（MANIFEST 追記・Version 公開）だけを `EngineHost` の installGate で直列化する。
   reader は Session 呼び出し単位で Version 全ファイルを pin する。
-- **WAL は `FileMode.Append, FileShare.Read`** のみ（`Wal.fs`）。
+- **WAL は `FileMode.Append, FileShare.ReadWrite`**（`Wal.fs`）。
   `writeBatch` / `maybeFlush` / `close` は DB のディレクトリ単位の Gate で直列化する。
   異なる DB の書き込みは並行に進められる（Gate 表はプロセス内で共有）。
   **プロセス全体の 1本の Gate にしない**（無関係な DB まで待たせない）。
+- **commit の fsync は Session のグループコミットでまとめる**（§8.5）。
+  `writeGate` の内側では WAL 追記と位置の登録だけを行い、
+  fsync の待機は `writeGate` の外で行う。複数の commit が待っていれば、
+  先頭の待機者が登録済みの最大 WAL 位置まで 1回 fsync し、全員を起こす。
 - **TCP サーバは接続ごとに Task** — accept ごとに `handleClient` を起動し、1つの `Session` を共有する（§11.3）。
   読み取りは接続間で並行、書き込みは Session 内で直列。
 - **プロセス間は `.rykdb.format` で排他**する（root 直下、`FileShare.None`。§7.9）
@@ -1294,6 +1298,15 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
   Begin / Batch / Commit は各フレームが checksum（FNV-1a）で守られ、
   未 commit の Batch は再生時に捨てられるので、
   途中で落ちてもコミット済みトランザクションが中途半端にならない。
+- **Session 経由の commit は `Flush(false)` で追記し、fsync をグループ化する**。
+  `Session` は `writeGate` を解放してから、
+  登録済みの最大 WAL 位置まで `Wal.sync` で 1回だけ `Flush(true)` する。
+  WAL の rotate / close は削除前に旧位置を fsync する。
+  fsync に失敗した Session は以後の操作を `IO` エラーにし、
+  待機中の commit にも同じエラーを返す。
+- deferred 追記は WAL への書き込み直後に memtable を公開するため、
+  fsync 完了前の commit が並行 SELECT から見えることがある。
+  commit の完了（`Execute` / `Commit` の戻り）は fsync 後まで返さない。
 - open 時は WAL を 1フレームずつストリーミングで読み（WAL 全体をメモリへ載せない）、
   `Wal.foldCommitted` が「Commit まで到達した Batch」だけを再生する。
   コミット済み Entry は配列に溜めず、そのまま Memtable へ挿入する。
@@ -1402,7 +1415,7 @@ L0 が増えて読み取りのコスト（read amplification）と引き換え�
 - worker の起動はカタログ読込と DROP 後始末の後（`RowStore.startBackground`）。
   先に動かすとリカバリの走査中に入力ファイルが消え得る。
 - flush / compaction の失敗は commit を失敗させない（§9.2 / gotchas §11.51）。
-- close は cancel → worker 起床（無条件 signal）→ worker join → engine refresh → flush → WAL 削除 → ProcessLock 解放の順。
+- close は cancel → worker 起床（無条件 signal）→ worker join → engine refresh → flush → WAL fsync → WAL 削除 → ProcessLock 解放の順。
   出力ファイル境界で `shouldStop` を確認するため、進行中の merge は途中で止められる。
 - クラッシュ復旧の不変条件は同期版と同じ
   （出力 SST を fsync → MANIFEST → 入力 retire → 実削除、未参照ファイルは `.orphans/` へ退避）。
@@ -1485,10 +1498,13 @@ Session.OpenWith root
 
 ### 9.4 閉じるとき
 
-`Session.Close()` は進行中の transaction を rollback してから、
-内部の `Database.Close()` を呼ぶ。
+`Session.Close()` は進行中の transaction を rollback する前に、
+現在の WAL 位置まで fsync する
+（グループコミットの待機を drain する）。
+その後、内部の `Database.Close()` を呼ぶ。
 `Database.Close()` は `StorageEngine.close` を行い、
 memtable を flush してから WAL を削除する。
+`StorageEngine.close` も WAL 削除前に現在位置を fsync する。
 これを省くと、再起動後にデータが読めなくなる。
 戻り値は close のエラー。
 `Session` は「閉じた」状態を記録するため、Close 後の `Execute` / `TableNames` /

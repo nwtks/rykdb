@@ -95,7 +95,12 @@ module internal RowStore =
 
     /// Entry を論理 keyspace の接頭辞付きで書き込む。
     /// 複数 keyspace の書き込みも同じ WAL バッチに入るため、途中で分断されない。
-    let writeBatchesWithSnapshot (activeSnapshot: uint64) (batches: (string * Entry array) list) (store: RowStore) =
+    let writeBatchesWithSnapshotWith
+        (deferDurability: bool)
+        (activeSnapshot: uint64)
+        (batches: (string * Entry array) list)
+        (store: RowStore)
+        =
         let flushAndPublish (bumped: IStorageEngine) (host: EngineHost) =
             host.WithInstallGate(fun () ->
                 let state = host.Current
@@ -132,7 +137,13 @@ module internal RowStore =
         else
             let engine = store.Engine.WithActiveSnapshot activeSnapshot
 
-            match engine.WriteBatch physicalEntries with
+            let written =
+                if deferDurability then
+                    engine.WriteBatchDeferred physicalEntries
+                else
+                    engine.WriteBatch physicalEntries
+
+            match written with
             | Error e -> err e
             | Ok updated ->
                 let maxSeq = Entry.maxSeqNo physicalEntries
@@ -159,6 +170,9 @@ module internal RowStore =
 
                         ret { store with Engine = bumped }
 
+    /// GC 境界を指定して書き込み、fsync まで行う。
+    let writeBatchesWithSnapshot = writeBatchesWithSnapshotWith false
+
     /// GC 境界を指定しない書き込み（カタログ・索引 backfill・テスト用）。
     let writeBatches = writeBatchesWithSnapshot 0UL
 
@@ -169,7 +183,8 @@ module internal RowStore =
     /// GC 境界は「自ハンドルの active snapshot」と「同じ DB を開いている他ハンドルの active snapshot」の最小値。
     /// 後者は `ActiveSnapshotRegistry` から集約する（`registration` は自分自身の登録で、除外する）。
     /// 書き込みは `RootGate` の共有ロックを取り、DDL の排他と交差しないようにする。
-    let commitToStore
+    let commitToStoreWith
+        (deferDurability: bool)
         (root: string)
         (registration: ActiveRegistration option)
         (mgr: TransactionManager)
@@ -187,9 +202,11 @@ module internal RowStore =
                     | Some other -> min own other
                     | None -> own
 
-                let! next = writeBatchesWithSnapshot snapshot batches store
+                let! next = writeBatchesWithSnapshotWith deferDurability snapshot batches store
                 return next, manager
             })
+
+    let commitToStore = commitToStoreWith false
 
     /// keyspace から読む（SeqNo 制限つき）。
     let getAt (keyspace: string) (key: byte array) (visible: uint64 option) (store: RowStore) =

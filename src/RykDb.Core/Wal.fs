@@ -94,12 +94,12 @@ module internal Wal =
         System.IO.Path.Combine(dir, fileName fileNumber)
 
     /// レコード列を追記する。
-    /// 1レコード（= 1フレーム）ずつ書き出すので、全フレームを 1本の配列に
-    /// 連結しない（大きな transaction でピークが約 2倍にならない）。
+    /// 1レコード（= 1フレーム）ずつ書き出すので、全フレームを 1本の配列に連結しない
+    /// （大きな transaction でピークが約 2倍にならない）。
     /// Begin / Batch / Commit がフレーム単位で完結しているので、
     /// プロセスが途中で落ちてもコミット済みトランザクションが中途半端にならない
     /// （未 commit の Batch は再生時に捨てられ、書きかけのフレームは CRC で検出される）。
-    let append (dir: string) (records: WalRecord list) (state: WalState) =
+    let private appendCore (sync: bool) (dir: string) (records: WalRecord list) (state: WalState) =
         let headerOf (payload: byte array) =
             Writer.build
                 [
@@ -126,15 +126,46 @@ module internal Wal =
                         path dir state.FileNumber,
                         System.IO.FileMode.Append,
                         System.IO.FileAccess.Write,
-                        System.IO.FileShare.Read
+                        System.IO.FileShare.ReadWrite
                     )
 
                 let written = writeAll fs 0 records
-                fs.Flush true
+                fs.Flush sync
 
                 { state with
                     Size = state.Size + written
                 })
+
+    /// レコード列を追記して fsync まで行う。
+    let append = appendCore true
+
+    /// レコード列を追記するが fsync は呼び出し側に任せる。
+    /// Session のグループコミットで、複数の commit を 1回の fsync にまとめるために使う。
+    let appendDeferred = appendCore false
+
+    /// WAL の現在位置まで fsync する。
+    /// rotate で古い WAL が削除済みの場合は、削除前に同期済みなので成功として扱う。
+    let sync (dir: string) (state: WalState) =
+        let walPath = path dir state.FileNumber
+
+        let syncCore () =
+            protect (fun () ->
+                use fs =
+                    new System.IO.FileStream(
+                        walPath,
+                        System.IO.FileMode.Open,
+                        System.IO.FileAccess.ReadWrite,
+                        System.IO.FileShare.ReadWrite
+                    )
+
+                fs.Flush true)
+
+        if not (System.IO.File.Exists walPath) then
+            ret ()
+        else
+            match syncCore () with
+            | Error _ when not (System.IO.File.Exists walPath) -> ret ()
+            | result -> result
 
     /// コミット済みエントリをメモリに溜めず、1件ずつ `step` へ渡して再生する。
     /// 大きな WAL でもコミット済みエントリの配列を保持しない。

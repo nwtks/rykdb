@@ -314,9 +314,9 @@ module internal StorageEngine =
             |> ret
 
     /// 書き込みバッチ。
-    /// まず WAL（Begin/Batch/Commit を 1 回の書き込みで）へ、
+    /// まず WAL（Begin/Batch/Commit を 1回の書き込みで）へ、
     /// それから memtable へ反映する。
-    let writeBatch (entries: Entry array) (engine: StorageEngine) =
+    let private writeBatchCore (sync: bool) (entries: Entry array) (engine: StorageEngine) =
         let apply wal txnId =
             let mem = Memtable.apply entries engine.Mem
             let nextTxnId = txnId + 1UL
@@ -331,24 +331,33 @@ module internal StorageEngine =
             result {
                 let txnId = engine.NextTxnId
 
+                let records =
+                    [
+                        WalRecord.Begin txnId
+                        WalRecord.Batch(txnId, entries)
+                        WalRecord.Commit txnId
+                    ]
+
                 let! wal =
-                    Wal.append
-                        engine.Dir
-                        [
-                            WalRecord.Begin txnId
-                            WalRecord.Batch(txnId, entries)
-                            WalRecord.Commit txnId
-                        ]
-                        engine.Wal
+                    if sync then
+                        Wal.append engine.Dir records engine.Wal
+                    else
+                        Wal.appendDeferred engine.Dir records engine.Wal
 
                 return apply wal txnId
             })
+
+    let writeBatch = writeBatchCore true
+
+    /// WAL への追記だけ行い、fsync は Session のグループコミットに任せる。
+    let writeBatchDeferred = writeBatchCore false
 
     /// memtable を L0 の SSTable にして書き出す。
     /// memtable が空なら何もしない（WAL も切り替えない）。
     let private flush (engine: StorageEngine) =
         let rotateWal engine (next: WalState) =
             result {
+                do! Wal.sync engine.Dir engine.Wal
                 do! protect (fun () -> Wal.walFiles engine.Dir |> List.iter System.IO.File.Delete |> ignore)
                 let! _ = Wal.create engine.Dir next.FileNumber
                 return { engine with Wal = next }
@@ -644,10 +653,15 @@ module internal StorageEngine =
             if not isLatestWriter then
                 ret ()
             else
-                flush engine
-                |> Result.map (fun e ->
-                    Wal.walFiles e.Dir
-                    |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore)))
+                result {
+                    let! flushed = flush engine
+                    do! Wal.sync flushed.Dir flushed.Wal
+
+                    Wal.walFiles flushed.Dir
+                    |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore)
+
+                    return ()
+                })
 
 /// RowStore が使う StorageEngine の操作面。
 /// テストではメモリ実装に差し替えられる。
@@ -656,9 +670,13 @@ type internal IStorageEngine =
     abstract ActiveSnapshot: uint64
     /// MANIFEST に反映済みの状態（background compaction が共有する）。
     abstract HostState: HostState
+    /// 現在の WAL 位置。メモリエンジンは None。
+    abstract WalState: WalState option
     abstract GetAt: visible: uint64 option -> key: byte array -> Result<SstEntry option, DbError>
     abstract ScanAt: visible: uint64 option -> startKey: byte array -> limit: int -> Result<SstScan, DbError>
     abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
+    /// WAL 追記のみ行い、fsync は呼び出し側に任せる。
+    abstract WriteBatchDeferred: entries: Entry array -> Result<IStorageEngine, DbError>
     abstract WithNextSeqNo: nextSeqNo: uint64 -> IStorageEngine
     abstract WithActiveSnapshot: snapshot: uint64 -> IStorageEngine
     abstract WithHostState: state: HostState -> IStorageEngine
@@ -683,6 +701,8 @@ type internal DiskStorageEngine(engine: StorageEngine) =
                 Generation = 0L
             }
 
+        member _.WalState = Some engine.Wal
+
         member _.GetAt visible key = StorageEngine.getAt visible key engine
 
         member _.ScanAt visible startKey limit =
@@ -690,6 +710,10 @@ type internal DiskStorageEngine(engine: StorageEngine) =
 
         member _.WriteBatch entries =
             StorageEngine.writeBatch entries engine
+            |> Result.map (fun next -> DiskStorageEngine next :> IStorageEngine)
+
+        member _.WriteBatchDeferred entries =
+            StorageEngine.writeBatchDeferred entries engine
             |> Result.map (fun next -> DiskStorageEngine next :> IStorageEngine)
 
         member _.WithNextSeqNo nextSeqNo =

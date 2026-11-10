@@ -45,6 +45,8 @@ type internal DbState =
         /// 古い版を捨ててしまわないようにするために登録する。
         /// 同じ transaction の state は複数のハンドルが共有できる（登録側で生存を数える）。
         ActiveRegistration: ActiveRegistration option
+        /// WAL の fsync を Session のグループコミットに任せるか。
+        DeferDurability: bool
     }
 
 /// Transaction を commit して DbState に反映する共通処理。
@@ -52,7 +54,13 @@ module internal DbStateOps =
     let commitTransaction (txn: Transaction) (state: DbState) =
         result {
             let! store, manager =
-                RowStore.commitToStore state.Root state.ActiveRegistration state.Manager txn state.Store
+                RowStore.commitToStoreWith
+                    state.DeferDurability
+                    state.Root
+                    state.ActiveRegistration
+                    state.Manager
+                    txn
+                    state.Store
 
             return
                 { state with
@@ -103,7 +111,7 @@ module internal Ddl =
             let! txn2 = foldOk apply txn chunk
 
             let! store, mgr2 =
-                RowStore.commitToStore st.Root st.ActiveRegistration mgr txn2 st.Store
+                RowStore.commitToStoreWith st.DeferDurability st.Root st.ActiveRegistration mgr txn2 st.Store
 
             return
                 { st with

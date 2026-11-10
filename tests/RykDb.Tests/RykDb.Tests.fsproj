@@ -40,6 +40,8 @@
     <Compile Include="DatabaseTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="SqlReferenceTests.fs" />
+    <Compile Include="OrderingPropertyTests.fs" />
+    <Compile Include="DurabilityTests.fs" />
     <Compile Include="BackgroundCompactionTests.fs" />
     <Compile Include="ServerTests.fs" />
     <Compile Include="TestHealthTests.fs" />

@@ -1964,3 +1964,24 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 `KeyBuilder.ofValues: REAL の -0.0 は +0.0 と同じキー` /
 `ValueCodec: 負のゼロは正のゼロと同じ符号化` /
 `SqlReference: REAL の -0.0 は +0.0 と同じ主キー`。
+
+### 11.60 グループコミットの fsync 失敗は Session 全体を fatal にする
+
+❌ リーダーの `Wal.sync` が失敗したとき、その待機者だけにエラーを返し、
+ほかの待機者を古い同期位置のまま待たせる（または成功扱いにする）。
+同じ WAL に対する後続の commit も成功したように見え、耐久性の保証が崩れる。
+
+✅ `CommitDurability` が失敗を保持し、
+待機中の全員と以後の `Execute` / `Commit` に同じエラーを返す。
+`Close` は現在位置を同期してから閉じるが、
+同期に失敗した場合は WAL を削除せずエラーを返す。
+`writeGate` の外で fsync を待つため、待機中の別 commit が WAL に追記できる。
+その場合、リーダーは登録済みの最大位置まで同期し、1回の fsync でまとめる。
+
+- deferred 追記した commit は fsync 前に memtable / `Database` ハンドルへ公開される。
+  並行 SELECT が未耐久の commit を見る可能性があるが、
+  commit の完了を返すのは fsync 後なので、クライアントへの応答は失われない。
+
+回帰テスト: `CommitDurability: 複数登録を 1回の fsync にまとめる` /
+`CommitDurability: fsync 失敗を全待機者に伝播し、再試行しない` /
+`CommitDurability: 同時待機でも fsync は 1回だけ`。

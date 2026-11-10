@@ -51,6 +51,7 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
         member _.NextSeqNo = inner.NextSeqNo
         member _.ActiveSnapshot = inner.ActiveSnapshot
         member _.HostState = inner.HostState
+        member _.WalState = inner.WalState
         member _.GetAt visible key = inner.GetAt visible key
 
         member _.ScanAt visible startKey limit =
@@ -63,6 +64,13 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
             gates.WaitWrite()
 
             inner.WriteBatch entries
+            |> Result.map (fun next -> GatedEngine(gates, next) :> IStorageEngine)
+
+        member _.WriteBatchDeferred entries =
+            gates.WriteEntered.Set()
+            gates.WaitWrite()
+
+            inner.WriteBatchDeferred entries
             |> Result.map (fun next -> GatedEngine(gates, next) :> IStorageEngine)
 
         member _.WithNextSeqNo next =

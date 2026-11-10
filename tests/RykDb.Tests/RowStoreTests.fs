@@ -78,9 +78,11 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
                 Generation = 0L
             }
 
+        member _.WalState = None
         member _.GetAt _ _ = ret None
         member _.ScanAt _ _ _ = ret SstScan.Empty
         member this.WriteBatch _ = ret (this :> IStorageEngine)
+        member this.WriteBatchDeferred _ = ret (this :> IStorageEngine)
         member this.WithNextSeqNo _ = this :> IStorageEngine
         member this.WithActiveSnapshot _ = this :> IStorageEngine
         member this.WithHostState _ = this :> IStorageEngine

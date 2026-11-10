@@ -30,6 +30,88 @@ type SessionTransactionChange =
     /// この実行で transaction が終わった（COMMIT / ROLLBACK）。
     | Ended
 
+[<RequireQualifiedAccess>]
+type private SyncStep =
+    | SyncWait
+    | SyncDone
+    | SyncLead of WalState
+    | SyncFail of DbError
+
+/// 複数の commit の WAL 位置をまとめ、リーダーが 1回だけ fsync する。
+/// 先に登録された位置を後から登録された位置が包含する場合、後者だけを同期すればよい。
+type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
+    let gate = obj ()
+    let mutable syncedFile = 0L
+    let mutable syncedSize = 0
+    let mutable pending: WalState option = None
+    let mutable syncing = false
+    let mutable failure: DbError option = None
+
+    let covers (pos: WalState) =
+        pos.FileNumber < syncedFile
+        || pos.FileNumber = syncedFile && pos.Size <= syncedSize
+
+    let later (a: WalState) (b: WalState) =
+        if (a.FileNumber, a.Size) >= (b.FileNumber, b.Size) then
+            a
+        else
+            b
+
+    /// 失敗していればそのエラーを返す。
+    member _.Failure = lock gate (fun () -> failure)
+
+    /// 同期対象の位置を登録する。
+    member _.Register(pos: WalState) =
+        lock gate (fun () ->
+            pending <-
+                match pending with
+                | Some current -> Some(later current pos)
+                | None -> Some pos)
+
+    /// 指定位置まで同期済みになるまで待つ。
+    /// 最初の待機者がリーダーとなり、登録済みの最大位置まで同期する。
+    member _.Await(pos: WalState) =
+        let rec loop () =
+            let step =
+                lock gate (fun () ->
+                    match failure with
+                    | Some e -> SyncStep.SyncFail e
+                    | None when covers pos -> SyncStep.SyncDone
+                    | None when not syncing ->
+                        syncing <- true
+
+                        let target =
+                            match pending with
+                            | Some current -> later current pos
+                            | None -> pos
+
+                        SyncStep.SyncLead target
+                    | None ->
+                        System.Threading.Monitor.Wait gate |> ignore
+                        SyncStep.SyncWait)
+
+            match step with
+            | SyncStep.SyncDone -> ret ()
+            | SyncStep.SyncFail e -> err e
+            | SyncStep.SyncWait -> loop ()
+            | SyncStep.SyncLead target ->
+                let result = sync target
+
+                lock gate (fun () ->
+                    match result with
+                    | Ok() ->
+                        if (target.FileNumber, target.Size) > (syncedFile, syncedSize) then
+                            syncedFile <- target.FileNumber
+                            syncedSize <- target.Size
+                    | Error e -> failure <- Some e
+
+                    syncing <- false
+                    System.Threading.Monitor.PulseAll gate)
+
+                result
+
+        loop ()
+
 /// データベースへのセッション。
 /// <remarks>
 /// `Database` の不変ハンドルを内部に隠し、常に最新の状態を保持する。
@@ -38,12 +120,14 @@ type SessionTransactionChange =
 /// 実行中の transaction がある間は、読み取りも含めて直列化される
 /// （read-your-writes とスナップショットの一貫性を保つため）。
 /// </remarks>
-type Session internal (root: string, initial: Database) =
+type Session internal (root: string, initialDb: Database) =
     // current / closed / readers を保護する短いロック。
     // 読み取りは入口と出口でしか取らないので、実行中の書き込みに待たされない。
     let stateGate = obj ()
     // 書き込み・transaction 操作・Close を直列化するロック。
     let writeGate = obj ()
+    let initial = initialDb.WithDeferredDurability()
+    let durability = CommitDurability(fun pos -> Wal.sync root pos)
     let mutable current = initial
     let mutable closed = false
     let mutable readers = 0
@@ -73,38 +157,53 @@ type Session internal (root: string, initial: Database) =
 
     /// 排他経路。
     /// 書き込み・transaction 操作を直列化して実行する。
+    /// WAL 位置の登録までは writeGate 内で行い、fsync の待機は writeGate の外で行う。
     let runExclusive (statements: Statement list) =
-        lock writeGate (fun () ->
-            match currentHandle () with
-            | None -> err (closedError ())
-            | Some db ->
-                let wasInTransaction = db.InTransaction
+        let outcome, position =
+            lock writeGate (fun () ->
+                match currentHandle () with
+                | None -> err (closedError ()), None
+                | Some db ->
+                    let wasInTransaction = db.InTransaction
 
-                let rec run (db: Database) acc =
-                    function
-                    | [] -> ret (db, List.rev acc)
-                    | stmt :: tail ->
-                        let db, lease = db.AcquireSnapshot()
-                        use _lease = lease
+                    let rec run (db: Database) acc =
+                        function
+                        | [] -> ret (db, List.rev acc)
+                        | stmt :: tail ->
+                            let db, lease = db.AcquireSnapshot()
+                            use _lease = lease
 
-                        match db.Execute stmt with
-                        | Error e -> err e
-                        | Ok(next, result) ->
-                            publish next
-                            run next (result :: acc) tail
+                            match db.Execute stmt with
+                            | Error e -> err e
+                            | Ok(next, result) ->
+                                publish next
+                                run next (result :: acc) tail
 
-                match run db [] statements with
-                | Error e -> err e
-                | Ok(finalDb, results) ->
-                    publish finalDb
+                    let outcome, position =
+                        match run db [] statements with
+                        | Error e ->
+                            let pos = currentHandle () |> Option.bind (fun d -> d.WalPosition)
+                            Error e, pos
+                        | Ok(finalDb, results) ->
+                            publish finalDb
 
-                    let change =
-                        match wasInTransaction, finalDb.InTransaction with
-                        | false, true -> SessionTransactionChange.Started
-                        | true, false -> SessionTransactionChange.Ended
-                        | _ -> SessionTransactionChange.NoChange
+                            let change =
+                                match wasInTransaction, finalDb.InTransaction with
+                                | false, true -> SessionTransactionChange.Started
+                                | true, false -> SessionTransactionChange.Ended
+                                | _ -> SessionTransactionChange.NoChange
 
-                    ret (summarize results, change))
+                            ret (summarize results, change), finalDb.WalPosition
+
+                    position |> Option.iter durability.Register
+                    outcome, position)
+
+        match position with
+        | Some pos ->
+            match durability.Await pos with
+            | Error e -> err e
+            | Ok() -> outcome
+        | None -> outcome
 
     /// 読み取りの入口。
     /// closed ならエラー、transaction 中なら None（排他経路へ）。
@@ -165,25 +264,46 @@ type Session internal (root: string, initial: Database) =
         if lock stateGate (fun () -> closed) then
             err (closedError ())
         else
-            match Parser.parseStatements sql with
-            | Error e -> err e
-            | Ok statements when isReadOnlyBatch statements -> runRead statements
-            | Ok statements -> runExclusive statements
+            match durability.Failure with
+            | Some e -> err e
+            | None ->
+                match Parser.parseStatements sql with
+                | Error e -> err e
+                | Ok statements when isReadOnlyBatch statements -> runRead statements
+                | Ok statements -> runExclusive statements
 
     /// transaction 操作（BEGIN / COMMIT / ROLLBACK）の共通経路。
     /// 排他ロックの下でスナップショットを取り、適用後のハンドルを公開する。
     let runTransaction (operation: Database -> Result<Database, DbError>) =
-        lock writeGate (fun () ->
-            match currentHandle () with
-            | None -> err (closedError ())
-            | Some db ->
-                let db, lease = db.AcquireSnapshot()
-                use _lease = lease
+        match durability.Failure with
+        | Some e -> err e
+        | None ->
+            let outcome, position =
+                lock writeGate (fun () ->
+                    match currentHandle () with
+                    | None -> err (closedError ()), None
+                    | Some db ->
+                        let db, lease = db.AcquireSnapshot()
+                        use _lease = lease
 
-                operation db
-                |> Result.map (fun next ->
-                    publish next
-                    ()))
+                        let outcome, position =
+                            match operation db with
+                            | Error e ->
+                                let pos = currentHandle () |> Option.bind (fun d -> d.WalPosition)
+                                Error e, pos
+                            | Ok next ->
+                                publish next
+                                Ok(), next.WalPosition
+
+                        position |> Option.iter durability.Register
+                        outcome, position)
+
+            match position with
+            | Some pos ->
+                match durability.Await pos with
+                | Error e -> err e
+                | Ok() -> outcome
+            | None -> outcome
 
     /// DB を開く（background compaction 有効）。
     static member OpenWith(root: string) =
@@ -252,6 +372,16 @@ type Session internal (root: string, initial: Database) =
                     while readers > 0 do
                         System.Threading.Monitor.Wait stateGate |> ignore)
 
+                let syncError =
+                    match db.WalPosition with
+                    | Some pos ->
+                        durability.Register pos
+
+                        match durability.Await pos with
+                        | Error e -> Some e
+                        | Ok() -> None
+                    | None -> None
+
                 let rollbackError, closeTarget =
                     if db.InTransaction then
                         match db.Rollback() with
@@ -262,9 +392,10 @@ type Session internal (root: string, initial: Database) =
 
                 let closeResult = closeTarget.Close()
 
-                match rollbackError with
-                | Some e -> err e
-                | None -> closeResult)
+                match syncError, rollbackError with
+                | Some e, _ -> err e
+                | None, Some e -> err e
+                | None, None -> closeResult)
 
     interface System.IDisposable with
         member this.Dispose() = this.Close() |> ignore

@@ -85,6 +85,7 @@ type internal Database(root: string, state: DbState) =
                         Active = None
                         Pending = None
                         ActiveRegistration = None
+                        DeferDurability = false
                     }
                 )
                 |> ret
@@ -94,6 +95,13 @@ type internal Database(root: string, state: DbState) =
 
     /// 実行中の transaction があるか。
     member _.InTransaction = state.Active.IsSome
+
+    /// 現在の WAL 位置（メモリエンジンは None）。
+    member _.WalPosition = state.Store.Engine.WalState
+
+    /// WAL の fsync を Session のグループコミットに任せるハンドルを返す。
+    member _.WithDeferredDurability() =
+        new Database(root, { state with DeferDurability = true })
 
     /// 呼び出し単位のスナップショットを取る。
     /// background compaction が有効なら、返した lease を dispose するまで

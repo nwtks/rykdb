@@ -72,6 +72,8 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
                 Generation = 0L
             }
 
+        member _.WalState = None
+
         member _.GetAt visible key =
             Memtable.getVisible key visible state.Mem
             |> Option.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
@@ -93,6 +95,11 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
             |> ret
 
         member _.WriteBatch entries =
+            let nextMem = Memtable.apply entries state.Mem
+            state.Mem <- nextMem
+            MemoryStorageEngine state :> IStorageEngine |> ret
+
+        member _.WriteBatchDeferred entries =
             let nextMem = Memtable.apply entries state.Mem
             state.Mem <- nextMem
             MemoryStorageEngine state :> IStorageEngine |> ret
