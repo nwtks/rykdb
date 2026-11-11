@@ -42,6 +42,16 @@ let ``Op: 配列の演算子は 1行ずつ返す`` () =
     Assert.Equal<int64>(1L, asInt rows.[0].[0])
 
 [<Fact>]
+let ``Op.toArray: 呼び出しごとに独立した配列を返す`` () =
+    // 部分適用した toArray が ResizeArray を共有すると、2回目に前回の行が混ざる。
+    let op = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
+    let first = ok (Op.toArray op)
+    let second = ok (Op.toArray op)
+    Assert.Equal<int>(2, first.Length)
+    Assert.Equal<int>(2, second.Length)
+    Assert.NotSame(first, second)
+
+[<Fact>]
 let ``末尾再帰: Op.ofArray を 200000行組み立ててもスタックを食わない`` () =
     // 「let rest = rowsFrom (i + 1) を先に評価する」実装だとコンストラクト時に
     // 行数ぶんのスタックを積み、実測 約 130000段（Debug）で Stack overflow になる。
@@ -84,3 +94,22 @@ let ``Op: 大きな Op でも take は早期に打ち切る`` () =
     Assert.Equal<int>(3, rows.Length)
     Assert.Equal<int64>(0L, asInt rows.[0].[0])
     Assert.Equal<int64>(2L, asInt rows.[2].[0])
+
+[<Fact>]
+let ``Op.toArrayLimited: 行数上限ちょうどは成功し、1行超過は CapacityError`` () =
+    let op =
+        Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |]; [| SqlValue.Int 3L |] |]
+
+    let rows = ok (Op.toArrayLimited 3L System.Int64.MaxValue op)
+    Assert.Equal<int>(3, rows.Length)
+    expectErrorKind ErrorKind.CapacityError "行数上限を超えたら CapacityError" (Op.toArrayLimited 2L System.Int64.MaxValue op)
+
+[<Fact>]
+let ``Op.toArrayLimited: バイト上限ちょうどは成功し、1バイト超過は CapacityError`` () =
+    let source = [| [| SqlValue.Int 1L; SqlValue.Text "abc" |] |]
+    let rowBytes = int64 (ValueCodec.managedRowBytes source.[0])
+    Assert.True(rowBytes > 0L)
+    let op = Op.ofArray source
+    let rows = ok (Op.toArrayLimited 1L rowBytes op)
+    Assert.Equal<int>(1, rows.Length)
+    expectErrorKind ErrorKind.CapacityError "バイト上限を超えたら CapacityError" (Op.toArrayLimited 1L (rowBytes - 1L) op)

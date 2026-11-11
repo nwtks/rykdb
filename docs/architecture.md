@@ -21,7 +21,7 @@ SQL の対応範囲は [`sql-reference.md`](sql-reference.md)、
 9. [データフロー](#9-データフロー)
 10. [ファイルレイアウト](#10-ファイルレイアウト)
 11. [インターフェース層](#11-インターフェース層)
-12. [設計上の制約](#12-設計上の制約)
+12. [設計判断と既知の制約](#12-設計判断と既知の制約)
 
 ---
 
@@ -581,7 +581,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
 - `Having` は集約後の行を**位置で読み替えて**から評価する（`Ops.havingFilter`）。
 - `Limit` は `Op.skip`（OFFSET）→ `Op.take`（LIMIT）の順。
   `limit = -1` が「LIMIT なし」、`limit = 0` は 0 行。
-- 最後に `Engine.runSelect` が `Op.toArray` で行を集め
+- 最後に `Engine.runSelect` が `Op.toArrayLimited` で行を集め
   （`Plan.runSelect` は列名と未消費の `Op` を返すだけ）、
   ヘッダは `Schema.projectHeader`（別名優先、`*` は列名）で組み立てる。
   `*` / `t.*` の列展開は `Schema.expandStar` に一本化している
@@ -668,6 +668,9 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
   比較不能な型などのエラーも呼び出し時に返す（従来の契約と同じ）。
 - なお、**JOIN の右側を materialize するのは入れ子ループ / ハッシュ結合とインデックス検索**。
   両入力がキー順に走査できる等値結合はマージ結合でストリーミングする。
+- **最終結果**（`Engine.runSelect`）は `Op.toArrayLimited` で materialize する。
+  `Session` 経由の既定は **100万行 / 256MiB**（管理メモリ概算）で、超えたら `CapacityError` を返す。
+  上限は `SessionOptions` で変更でき、複数 SELECT を含む `Execute` では呼び出し全体で累積判定する。
 
 #### 演算子の共通規約
 
@@ -1026,6 +1029,7 @@ DDL は次を順に行う。
 2. `ActiveSnapshotRegistry` を見て、**同じ root で実行中の transaction があれば `ConflictError`** を返す。
    待たないのは、commit されないまま残った transaction で DDL が永久に止まらないため。
 3. 既存索引エントリの tombstone → 8192行ずつ backfill を commit → カタログ保存。
+   `CREATE UNIQUE INDEX` は backfill 後に索引を走査して重複を検査する（直前の索引値だけ保持）。
 
 排他を持っている間は新しい文と `Begin()` がブロックされるので、
 DDL の後に始まる transaction は必ず**新しいカタログ**を読む。
@@ -1207,6 +1211,12 @@ WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
 全件走査でも、破損したファイル・ブロックに到達した `next` が `Error` を返し、
 集約・ソート・DISTINCT など全件を消費する SQL 演算子は最終結果を返さずエラーになる。
 
+クエリ中に開いたスキャンは `ScanScope` に登録し、
+`Engine.runSelect` / `runDml` が `finally` で `DisposeAll` する。
+登録は `RowStore.scanAtRaw` が `StorageEngine.scanAt` の直後に行う。
+`RowStore.scanWithinPrefix` のような `SstScan(fun () -> ...)` ラッパーは `Dispose` を伝播しないため、
+外側で包むだけでは早期終了時にファイルを閉じられない。
+
 走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
 `rangeScanPartial` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ
 （ブロックの解析失敗は、そのブロックが必要になった `next` が `Error` を返す）。
@@ -1342,7 +1352,7 @@ L1〜 … 1ファイル = 1キー域で互いに重ならない（RocksDB/LevelD
 **入力全体のサイズには比例しない**。
 入力はファイル単位で開くため、同時に開くスキャナの数は入力ファイル数と同じになる（通常は初期選択の `MaxInputFiles` 以下だが、キー域の重なりを閉包として追加すると超えうる）。
 途中で読み取りエラーになると書きかけの出力ファイルが残るが、
-MANIFEST に載らないので孤児として退避される（§12.2 / gotchas §11.11）。
+MANIFEST に載らないので孤児として退避される（gotchas §11.11）。
 
 GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判定は**しない**
 （snapshot S の読み手は `SeqNo <= S` の版を見るので、**SeqNo が小さい版こそ**まだ読まれ得る）。
@@ -1430,8 +1440,8 @@ L0 が増えて読み取りのコスト（read amplification）と引き換え�
   巨大な 1 出力や長いブロック読み取り中は close が待つ。
 - `LastCompactionError` は internal。
   必要なら Session に診断 API を追加する。
-- `Op.take` の早期終了による `SstScan` / FileStream リークは既存問題
-  （粗い pin のため安全性には影響しない）。
+- `Op.take` の早期終了による `SstScan` / FileStream リークは `ScanScope` で解消済み
+  （`Engine.runSelect` / `runDml` の `finally` が `DisposeAll`。§8.2）。
 
 ---
 
@@ -1447,7 +1457,7 @@ SQL 文字列
   → Optimizer.buildLogical  論理代数
   → 物理化                 走査方法・結合アルゴリズムを決定
   → Ops / Optimizer         Op の木
-  → Engine.runSelect        Op.toArray で結果行
+  → Engine.runSelect        Op.toArrayLimited で結果行
 ```
 
 走査の探索順は **memtable → L0（新しい順）→ 各レベル（新しい順）**。
@@ -1559,6 +1569,8 @@ let ok =
     | Ok v -> v
     | Error e -> failwith (DbError.toDisplayString e)
 
+// 既定の SELECT 結果上限は 100万行 / 256MiB。
+// 変更する場合は Session.OpenWith(path, options) に SessionOptions を渡す。
 let session = ok (Session.OpenWith "./mydata")
 
 ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -1567,6 +1579,21 @@ ok (session.Execute "INSERT INTO t VALUES (1, 10), (2, 20)") |> ignore
 let result = ok (session.Execute "SELECT id, v FROM t ORDER BY id")
 result.Rows        // [|[|Int 1L; Int 10L|]; [|Int 2L; Int 20L|]|]
 result.Columns     // [|"id"; "v"|]
+
+// 単一 SELECT を materialize せずに読む場合は TryOpenReader を使う。
+// 複数文・非 SELECT・transaction 中は None が返るので Execute にフォールバックする。
+match ok (session.TryOpenReader "SELECT id, v FROM t ORDER BY id") with
+| Some reader ->
+    use reader = reader
+    let rec loop () =
+        match ok (reader.TryRead()) with
+        | None -> ()
+        | Some row ->
+            printfn "%A" row
+            loop ()
+    loop ()
+| None -> ()
+
 ok (session.Close())
 ```
 
@@ -1582,6 +1609,8 @@ dotnet run --project src/RykDb.Cli -- -f script.sql ./mydata  # スクリプト�
 
 対話モードでは `.tables` / `.begin` / `.commit` / `.rollback` / `.help` / `.exit`（`.quit`）が使える。
 エラーは表示するだけで終了しない。
+通常の SELECT は `Session.TryOpenReader` で 1行ずつ表示するため、結果セット全体をメモリに materialize しない
+（`SessionOptions` の結果上限も適用されない）。
 
 ### 11.3 TCP サーバ
 
@@ -1617,17 +1646,26 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   大結果でも「行ごとの文字列」と「結合結果」の二重のメモリを持たずに済む。
   行の書き出し中だけ `AutoFlush` を切り、最後に 1回だけ流す
   （1行ごとの Flush を避ける）。
+- `.stream <SQL>` は単一 SELECT を `Session.TryOpenReader` で開き、
+  `STREAM` ヘッダ + 行 + `END` を 1行ずつ返す（`sendStream`）。
+  materialize しないため `SessionOptions` の結果上限を適用しない。
+  複数文・非 SELECT・transaction 中などは通常の `OK` / `ERR` にフォールバックする。
 
-| 応答                                       | 意味                                                             |
-| ------------------------------------------ | ---------------------------------------------------------------- |
-| `OK <行数>\t<列1>,<列2>,…` + `<値>,<値>` … | 成功（SELECT は0行でも列名を返す。DML は列名なしの `OK <行数>`） |
-| `ERR <メッセージ>`                         | 失敗                                                             |
-| `HALT`                                     | 終了                                                             |
+| 応答                                            | 意味                                                             |
+| ----------------------------------------------- | ---------------------------------------------------------------- |
+| `OK <行数>\t<列1>,<列2>,…` + `<値>,<値>` …      | 成功（SELECT は0行でも列名を返す。DML は列名なしの `OK <行数>`） |
+| `STREAM\t<列1>,<列2>,…` + `<値>,<値>` … + `END` | `.stream` のストリーミング SELECT（ヘッダと行の後に `END`）      |
+| `ERR <メッセージ>`                              | 失敗（STREAM の途中でも最終行として返る）                        |
+| `HALT`                                          | 終了                                                             |
 
 ヘッダーの列名は `Uri.EscapeDataString` でパーセントエンコードする
 （カンマ・改行を含む別名でも区切りが壊れない）。
 `RykDb.Client` は受信時にデコードする。
 値は `SqlLiteral.toSqlLiteral` の形（引用符つき）のまま返すので、クライアント側でそのまま SQL の入力に使える。
+
+`RykDb.Client` の `SendStream(sql, onRow)` は `.stream` を要求し、行を蓄積せずにコールバックへ渡す。
+成功時は `Streamed(columns, rowCount)`、`OK` フォールバックの DML は `Affected rowsAffected` を返す。
+`Send` は `OK` / `STREAM` の両方を読み、STREAM は `Rows` に materialize する。
 
 対話例:
 
@@ -1639,65 +1677,85 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 > .tables
 < OK 1\ttables
 < 't'
+> .stream SELECT id, name FROM t ORDER BY id
+< STREAM\tid,name
+< 1,'alice'
+< 2,'bob'
+< END
 > .exit
 < HALT
 ```
 
-セッションコマンド: `.exit` / `.quit` / `.ping` / `.tables`
+セッションコマンド: `.exit` / `.quit` / `.ping` / `.tables` / `.stream <SQL>`
 
 `Server.fs` は `serve` のみを公開している（`handleClient` は `private`）。
 テストは `Program.fs` ではなく `Server.serve` を直接呼べる。
 
 ---
 
-## 12. 設計上の制約
+## 12. 設計判断と既知の制約
+
+この章は、利用者が受け入れる必要のある制約と、その背景にある設計判断をまとめる。
+機能・保証・実装の詳細は各節に譲る。
 
 ### 12.1 採用しなかったもの
 
-| もの                  | 理由                                                                                              |
-| --------------------- | ------------------------------------------------------------------------------------------------- |
-| B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針                                           |
-| 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）                                                       |
-| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                                                                      |
-| ブロック圧縮 / 暗号化 | スコープ外                                                                                        |
-| lock-free データ構造  | 公開 API は 1 本の `Session` で読み取りを並行・書き込みを直列に扱い、内部は不変値で足りる（§7.7） |
+| もの                  | 理由                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------ |
+| B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針                                          |
+| 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）                                                      |
+| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                                                                     |
+| ブロック圧縮 / 暗号化 | スコープ外                                                                                       |
+| lock-free データ構造  | 公開 API は 1本の `Session` で読み取りを並行・書き込みを直列に扱い、内部は不変値で足りる（§7.7） |
 
 ### 12.2 既知の制約
 
-- **background compaction は 1 DB 1本の worker**（§8.6）。
-  `Session.OpenWith` では flush 後の compaction を worker が行い、commit は compaction を待たない。
-  `Database.OpenWith` は従来どおり同期 compaction。
-  読み取りは Session 呼び出し単位で Version 全ファイルを pin し、
-  worker は retired かつ refcount 0 のファイルだけを削除する。
-  周期実行（タイマー）はせず、トリガは DB オープン時と flush 後。
-  入力はブロック単位で読み、出力も 1ファイル分しかメモリに持たない（§8.6）ので、
-  入力サイズに比例するメモリは使わない。
-- **`scanAt` は pull（`SstScan`）を返し、1行ごとに必要なブロックだけを読む**。
-  呼び出し時点では SSTable を開かず、破損・欠落はそのファイルが必要になった時点の `next` で返る。
-  全件走査でも結果を溜めないため、テーブル全体のエントリを一度に持つことはない。
-  エラーの検出時点は列挙に移ったが、全件を消費する SQL 演算子は最終結果を返す前に必ずエラーになる
-  （`LIMIT` で到達しない後続の破損は従来どおり検出しない）。
-- **ソート・集約・DISTINCT は入力全体を保持しない**（§5.3）。
-  ソートは一時ファイルへ退避する外部マージ、集約はアキュムレータのみ、DISTINCT は符号化キーの集合。
-  ただし **JOIN の右側は入れ子ループ / ハッシュ結合では実体化する**
-  （両入力がキー順に走査できる等値結合はマージ結合で流す）。
-- **最終結果は `Op.toArray` で配列化する**
-  （`Engine.runSelect` が行う。`Plan.runSelect` の戻り値は列名と未消費の `Op`）。
-- **相関サブクエリは外側行ごとに内側を再計画・実行する**（入れ子ループ）。
+#### 12.2.1 性能・資源
+
+- **background compaction は 1 DB 1本の worker**（§8.7）。
+  周期実行（タイマー）はせず、トリガは DB オープン時と flush 後だけ。
+  commit は compaction の完了を待たないため、書き込みが続くと L0 が増えて読み取りコストが上がる。
+  close 時のキャンセルは出力ファイル境界でのみ確認するため、巨大な出力や長いブロック読み取り中は待つ。
+- **Version 全ファイルの pin は Session 呼び出しごとに O(ファイル数)**（§8.7）。
+- **JOIN の右側は materialize する**（入れ子ループ / ハッシュ結合）。
+  インデックス入れ子ループも左行ごとの検索結果を materialize する。
+  管理メモリ 256MiB を超えると `CapacityError`（§5.3）。
+- **相関サブクエリは外側行ごとに内側を再計画・実行する**。
   外側行数 × 内側の走査コストがかかる。
   集約後の `SELECT` / `HAVING` / `ORDER BY`、`LIMIT` / `OFFSET`、派生テーブル（LATERAL）では使えない。
-- **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件に限る**（下限のある条件のみ）。
-  `>` / `<` / `BETWEEN` / `LIKE` のうち、`LIKE` は索引を要求しない。
+- **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件（下限あり）に限る**。
+  `LIKE` は索引を要求しない（§5.1）。
 - **ORDER BY のソート省略は単一テーブル・主キー全列の昇順だけ**。
-  主キーの一部だけ・降順・索引走査になる条件・集約・`DISTINCT`・結合では全件をソートする。
-- **`CREATE UNIQUE INDEX` は backfill 後に索引を走査して重複を検査する**（直前の索引値だけ保持）。
+  それ以外は全件ソートする（§5.1）。
+- **結合順序は FROM に書かれた順**で、選択性による並べ替えはしない（§5.1）。
+- **MVCC の古い版は compaction まで回収されない**。
+  同じ DB のいずれかのハンドルに長い transaction があると GC 境界が進まず、古い版が残り続ける（§7.5 / §8.6）。
+
+#### 12.2.2 読み取り・破損検出
+
+- **`scanAt` は遅延読みのため、`LIMIT` で到達しない後続ファイルの破損・欠落は検出しない**（§8.2）。
+- **全体チェックサムは持たない**。
+  Footer と実際に読んだブロックだけを検証し、読まなかったブロックは検証されない（§8.2）。
+- **最終結果は配列化する**ため、結果セット全体がメモリに載る
+  （`Engine.runSelect` の `Op.toArrayLimited`）。
+  `Session` 経由の既定上限は 100万行 / 256MiB で、超えたら部分結果を返さず `CapacityError`。
+  `SessionOptions` で変更でき、複数 SELECT を含む `Execute` では累積で判定する。
+- **`Session.TryOpenReader` は materialize しない**ため、上記の結果上限を適用しない。
+  単一 SELECT のみを対象とし、読み取り中の snapshot 登録と走査は
+  終端・エラー・`RowReader.Dispose` のいずれかで解放する。
+  クライアントが途中で読むのをやめる場合は必ず `Dispose` する。
+
+#### 12.2.3 並行性・トランザクション
+
 - **DDL はプロセス内で排他**（`RootGate`）。
   `CREATE INDEX` の backfill 中は他の文が待つ。
   同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。
 - **並行読み取りは Session 内の SELECT に限る**。
   明示 transaction 中の読み取りは直列化される（read-your-writes を保つため）。
-  1つの `Session` を複数接続で共有すると transaction も共有される（§11.3）。
-  登録はハンドルの GC で外れるが、参照が残っている間は `ConflictError` が続く。
+- **1つの `Session` を複数接続で共有すると transaction も共有される**（§11.3）。
+  切断時に rollback するのは transaction を開始した接続だけ。
+- **同一 `Session` を複数スレッドで使うと、SELECT だけの呼び出しは並行、その他は直列化される**（§7.7）。
+  1つの transaction を複数スレッドで共有しないこと。
 - **トランザクションの分離レベルは Snapshot Isolation（repeatable read）固定**。
   分離レベルの指定（`BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...`）、
   `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`、読み取り専用トランザクションは未対応
@@ -1706,30 +1764,15 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   2回目の `Session.OpenWith` は `IoError`。
   別プロセスが開いていても `IoError`。
   クラッシュ再現テストに限り、`RowStore.openStoreTakingOver` と `Database.OpenWithStore` で例外的に二重に開く。
-- **TCP サーバは接続ごとに `Task` で並行処理し、`Session` は接続間で共有される**（§11.3）。
-  SELECT は接続間で並行、書き込みは Session 内で直列。
-  明示 transaction の所有権は開始した接続にあり、切断時 rollback は所有者だけが行う。
-- **同一 `Session` を複数スレッドで使うと、SELECT だけの呼び出しは並行、その他は直列化される**（§7.7）。
-  ただし 1つの transaction を複数スレッドで共有しないこと。
-  書き込みを本気で並列化したいときは DB を分ける。
-- **MVCC の古い版は compaction まで回収されない**
-  （GC は最古の active snapshot から見えない版を捨てる。ファイル単位では判定しない）。
-- 結合アルゴリズムは `ON` の等値キー・左の見積り・**両入力の走査順**で自動選択する（§5.1）。
-  等値キーでも列型が違う場合は入れ子ループになる。
+- **commit / rollback / `Close()` されずに参照が残った transaction は、GC されるまでその root の DDL を `ConflictError` にする**（§7.8）。
 - **明示 transaction の状態はプロセス内のみ**（`Session` が保持する `Database` の `Manager`）。
   未コミットの書き込みは WAL に残っていても再生されない。
-- **ActiveSnapshot はプロセス内のすべてのハンドル分をまとめて扱う**（`ActiveSnapshotRegistry`）。
-  別ハンドルの長い transaction も GC 境界に反映される。
-  他プロセスはそもそも開けない（§7.9）ので、見えない transaction は存在しない。
-- **ActiveSnapshot の登録はハンドル単位のリースで解放する**（`RegistrationLease`）。
-  commit / rollback / `Close()` / `Dispose()` で即時に外れ、未処理のまま捨てても
-  最後のハンドルの GC で外れる（DDL が永久に `ConflictError` にならない）。
-- **複数 keyspace への commit は 1回の WAL バッチで原子化される**（§7.5）。
-  `Commit` まで到達したバッチだけが再生され、途中で切れたバッチは未反映として捨てられる。
+
+#### 12.2.4 耐久性
+
 - **ファイルの作成・削除はディレクトリエントリに依存し、標準機能ではディレクトリを fsync できない**
   （P/Invoke を使わない方針のため）。
   複数 keyspace の commit は 1回の WAL バッチで原子化したが、
   **新規 WAL / SSTable / MANIFEST ファイルの作成と、`rotate` の削除は電源故障で欠ける可能性が残る**。
   プロセスのクラッシュ後の再起動であれば再作成・再生成で吸収できるが、電源故障の直後に再起動すると欠落しうる。
-  完全な耐久にはディレクトリ同期が必要で、それは標準機能の範囲を超える
-  （§12.1 の「採用しなかったもの」に相当する制約）。
+  完全な耐久にはディレクトリ同期が必要で、それは標準機能の範囲を超える。

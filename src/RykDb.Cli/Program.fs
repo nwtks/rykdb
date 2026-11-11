@@ -65,6 +65,23 @@ let private printError (e: DbError) =
 let private printResult (r: StatementResult) =
     r.ToDisplayLines() |> List.iter (printfn "%s")
 
+/// `RowReader` を materialize せずに表示する。
+/// `StatementResult.ToDisplayLines()` と同じ形式（ヘッダ・区切り・2スペース字下げ）にする。
+let private printReader (reader: RowReader) =
+    let header = System.String.Join(" | ", reader.Columns)
+    printfn "%s" header
+    printfn "%s" (System.String('-', header.Length))
+
+    let rec loop () =
+        match reader.TryRead() with
+        | Error e -> printError e
+        | Ok None -> ()
+        | Ok(Some row) ->
+            row |> Array.map SqlLiteral.toSqlLiteral |> String.concat ", " |> printfn "  %s"
+            loop ()
+
+    loop ()
+
 let private dotCommand (session: Session) (line: string) =
     let parts = line.Split(' ', System.StringSplitOptions.RemoveEmptyEntries)
 
@@ -127,10 +144,19 @@ let private execOne (session: Session) (sql: string) =
     elif trimmed.StartsWith "." then
         dotCommand session trimmed
     else
-        match session.Execute trimmed with
-        | Ok r ->
-            printResult r
+        match session.TryOpenReader trimmed with
+        | Ok(Some reader) ->
+            use reader = reader
+            printReader reader
             true
+        | Ok None ->
+            match session.Execute trimmed with
+            | Ok r ->
+                printResult r
+                true
+            | Error e ->
+                printError e
+                true
         | Error e ->
             printError e
             true

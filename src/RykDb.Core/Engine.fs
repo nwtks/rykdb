@@ -31,6 +31,28 @@ type StatementResult =
 
             header :: System.String('-', header.Length) :: Array.toList body
 
+/// SELECT 結果の上限。
+/// `Int64.MaxValue` は無制限。0 は 1行も許さない。
+type internal ResultLimits = { MaxRows: int64; MaxBytes: int64 }
+
+module internal ResultLimits =
+    let Unlimited =
+        {
+            MaxRows = System.Int64.MaxValue
+            MaxBytes = System.Int64.MaxValue
+        }
+
+/// ストリーミング SELECT の実行状態。
+/// `Session.RowReader` が保持し、読み終わるか破棄されるまで snapshot 登録と走査の破棄を遅延させる。
+type internal SelectStream =
+    {
+        Columns: string array
+        Op: Op
+        Scope: ScanScope
+        /// `Scope` の破棄と snapshot 登録の解除。複数回呼んでも安全。
+        Cleanup: unit -> unit
+    }
+
 /// DB の状態。
 type internal DbState =
     {
@@ -460,19 +482,62 @@ module internal Engine =
 
         state.Catalog.Tables |> foldOk (addTable state) ctx
 
-    let private runSelect (state: DbState) (txn: Transaction) (stmt: SelectStatement) =
+    let private runSelect (limits: ResultLimits) (state: DbState) (txn: Transaction) (stmt: SelectStatement) =
         contextOf state txn
         >>= fun ctx ->
-            Plan.runSelect ctx stmt
-            >>= fun (columns, op) ->
-                Op.toArray op
-                |> Result.map (fun rows ->
-                    state,
-                    {
-                        RowsAffected = rows.Length
-                        Columns = columns
-                        Rows = rows
-                    })
+            try
+                Plan.runSelect ctx stmt
+                >>= fun (columns, op) ->
+                    Op.toArrayLimited limits.MaxRows limits.MaxBytes op
+                    |> Result.map (fun rows ->
+                        state,
+                        {
+                            RowsAffected = rows.Length
+                            Columns = columns
+                            Rows = rows
+                        })
+            finally
+                ctx.Scope.DisposeAll()
+
+    /// SELECT を materialize せずにストリーミング用の Op として開く。
+    /// 呼び出し側は返された `Cleanup` を必ず呼び、snapshot 登録と走査を解放する。
+    let openSelect (state: DbState) (stmt: SelectStatement) =
+        if state.Active.IsSome then
+            err (DbError.internalError "transaction 中の SELECT は RowReader で開けません")
+        else
+            let mgr, txn = TransactionManager.beginTxn state.Manager
+            let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
+
+            let startState =
+                { state with
+                    Manager = mgr
+                    ActiveRegistration = Some registration
+                }
+
+            let run () =
+                match contextOf startState txn with
+                | Error e ->
+                    ActiveSnapshotRegistry.unregister state.Root registration
+                    err e
+                | Ok ctx ->
+                    match Plan.runSelect ctx stmt with
+                    | Error e ->
+                        ctx.Scope.DisposeAll()
+                        ActiveSnapshotRegistry.unregister state.Root registration
+                        err e
+                    | Ok(columns, op) ->
+                        ret
+                            {
+                                Columns = columns
+                                Op = op
+                                Scope = ctx.Scope
+                                Cleanup =
+                                    fun () ->
+                                        ctx.Scope.DisposeAll()
+                                        ActiveSnapshotRegistry.unregister state.Root registration
+                            }
+
+            RootGate.withShared state.Root run
 
     let private resolveWhere (target: Schema) (ctx: ExecContext) =
         function
@@ -513,17 +578,21 @@ module internal Engine =
         }
 
     let private runDml (state: DbState) (txn: Transaction) (run: ExecContext -> Result<(Transaction * int), DbError>) =
-        result {
-            let! ctx = contextOf state txn
-            let! outcome = run ctx
-            let txn2, n = outcome
+        contextOf state txn
+        >>= fun ctx ->
+            try
+                result {
+                    let! outcome = run ctx
+                    let txn2, n = outcome
 
-            return
-                { state with Pending = Some txn2 },
-                { StatementResult.Empty with
-                    RowsAffected = n
+                    return
+                        { state with Pending = Some txn2 },
+                        { StatementResult.Empty with
+                            RowsAffected = n
+                        }
                 }
-        }
+            finally
+                ctx.Scope.DisposeAll()
 
     let private runDdl (state: DbState) (run: DbState -> Result<'a, DbError>) =
         if state.Active.IsSome then
@@ -537,9 +606,9 @@ module internal Engine =
 
     let private noRows = Result.map (fun s -> s, StatementResult.Empty)
 
-    let private runStatement (state: DbState) (txn: Transaction) =
+    let private runStatement (limits: ResultLimits) (state: DbState) (txn: Transaction) =
         function
-        | Statement.Select stmt -> runSelect state txn stmt
+        | Statement.Select stmt -> runSelect limits state txn stmt
         | Statement.Insert stmt -> runInsert stmt |> runDml state txn
         | Statement.Update stmt -> runUpdate stmt |> runDml state txn
         | Statement.Delete stmt -> runDelete stmt |> runDml state txn
@@ -551,11 +620,11 @@ module internal Engine =
         | Statement.Commit
         | Statement.Rollback -> ret state |> noRows
 
-    let executeStatement (state: DbState) (stmt: Statement) =
+    let executeStatementWithLimits (limits: ResultLimits) (state: DbState) (stmt: Statement) =
         match state.Active with
         | Some activeTxn ->
             let running = state.Pending |> Option.defaultValue activeTxn
-            runStatement state running stmt
+            runStatement limits state running stmt
         | None ->
             let mgr, txn = TransactionManager.beginTxn state.Manager
             let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
@@ -573,7 +642,7 @@ module internal Engine =
                             ActiveRegistration = Some registration
                         }
 
-                    let! midState, result = runStatement startState txn stmt
+                    let! midState, result = runStatement limits startState txn stmt
 
                     if isReadOnly then
                         return state, result
@@ -596,6 +665,8 @@ module internal Engine =
                 | _ -> false
 
             (if isDdl then run () else RootGate.withShared state.Root run) |> finish
+
+    let executeStatement = executeStatementWithLimits ResultLimits.Unlimited
 
     let executeBegin (state: DbState) =
         match state.Active with

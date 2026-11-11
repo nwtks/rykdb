@@ -16,6 +16,9 @@ type internal ExecContext =
         /// 読み取りに重ねる transaction のバッファ。
         /// read-your-writes を実現する。
         Txn: Transaction
+        /// このクエリで開いた走査の台帳。
+        /// 早期終了・エラーでも Engine が DisposeAll する。
+        Scope: ScanScope
     }
 
 module internal ExecContext =
@@ -26,6 +29,7 @@ module internal ExecContext =
             Schemas = Map.empty
             Catalog = Catalog.Empty
             Txn = Transaction.create 0UL { SeqNo = 0UL }
+            Scope = ScanScope()
         }
 
     /// スキーマを登録する（別名つきで）。
@@ -64,7 +68,7 @@ module internal ExecContext =
     let table (ctx: ExecContext) (table: string) (limit: int) =
         result {
             let! schema = schemaOf table ctx
-            return! Dml.scanByPrimaryKeyWithTxn ctx.Store schema limit ctx.Visible ctx.Txn
+            return! Dml.scanByPrimaryKeyWithTxn ctx.Store schema limit ctx.Visible (Some ctx.Scope) ctx.Txn
         }
 
     /// 主キーの範囲走査（遅延の `Op`）。
@@ -77,7 +81,17 @@ module internal ExecContext =
         =
         result {
             let! schema = schemaOf table ctx
-            return! Dml.scanByPrimaryKeyRangeWithTxn ctx.Store schema startKey endKey limit ctx.Visible ctx.Txn
+
+            return!
+                Dml.scanByPrimaryKeyRangeWithTxn
+                    ctx.Store
+                    schema
+                    startKey
+                    endKey
+                    limit
+                    ctx.Visible
+                    (Some ctx.Scope)
+                    ctx.Txn
         }
 
     /// 索引で一致する全行を引く（遅延の `Op`）。
@@ -89,7 +103,17 @@ module internal ExecContext =
 
             match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
             | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
-            | Some idx -> return! Dml.scanByIndexPrefixWithTxn ctx.Store schema idx keyValues limit ctx.Visible ctx.Txn
+            | Some idx ->
+                return!
+                    Dml.scanByIndexPrefixWithTxn
+                        ctx.Store
+                        schema
+                        idx
+                        keyValues
+                        limit
+                        ctx.Visible
+                        (Some ctx.Scope)
+                        ctx.Txn
         }
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く（遅延の `Op`）。
@@ -106,7 +130,18 @@ module internal ExecContext =
 
             match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
             | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
-            | Some idx -> return! Dml.scanByIndexRangeWithTxn ctx.Store schema idx lower upper limit ctx.Visible ctx.Txn
+            | Some idx ->
+                return!
+                    Dml.scanByIndexRangeWithTxn
+                        ctx.Store
+                        schema
+                        idx
+                        lower
+                        upper
+                        limit
+                        ctx.Visible
+                        (Some ctx.Scope)
+                        ctx.Txn
         }
 
     /// 主キーで 1行を引く。
@@ -190,7 +225,9 @@ module internal DmlOps =
                 | Error e -> err e
                 | Ok values when values |> Array.exists SqlValue.isNull -> check txn row pk pkBytes rest
                 | Ok values ->
-                    match Dml.scanByIndexPrefixWithTxn ctx.Store schema idx values 1 ctx.Visible txn with
+                    match
+                        Dml.scanByIndexPrefixWithTxn ctx.Store schema idx values 1 ctx.Visible (Some ctx.Scope) txn
+                    with
                     | Error e -> err e
                     | Ok scan ->
                         match Op.toArray scan with
@@ -335,7 +372,9 @@ module internal DmlOps =
 
         let collectUpdates txn targets =
             result {
-                let! scan = Dml.scanByPrimaryKeyWithTxn ctx.Store schema 0 ctx.Visible txn
+                let! scan =
+                    Dml.scanByPrimaryKeyWithTxn ctx.Store schema 0 ctx.Visible (Some ctx.Scope) txn
+
                 return! go targets [] 0L scan
             }
 
@@ -348,7 +387,7 @@ module internal DmlOps =
             let checkExisting idx seen key values =
                 result {
                     let! scan =
-                        Dml.scanByIndexPrefixWithTxn ctx.Store schema idx values 0 ctx.Visible txn
+                        Dml.scanByIndexPrefixWithTxn ctx.Store schema idx values 0 ctx.Visible (Some ctx.Scope) txn
 
                     let! rows = Op.toArray scan
 
@@ -427,7 +466,9 @@ module internal DmlOps =
                         | Ok(tc, c') -> go tc c' nxt
 
             result {
-                let! scan = Dml.scanByPrimaryKeyWithTxn ctx.Store schema 0 ctx.Visible ctx.Txn
+                let! scan =
+                    Dml.scanByPrimaryKeyWithTxn ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn
+
                 return! go ctx.Txn 0 scan
             }
 

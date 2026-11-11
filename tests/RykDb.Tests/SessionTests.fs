@@ -101,7 +101,7 @@ let private withGatedSession (_tag: string) (f: Session -> EngineGates -> unit) 
     let store = openStoreWith "" (GatedEngine(gates, memoryEngine ()) :> IStorageEngine)
 
     let db = ok (Database.OpenWithStore root store)
-    let session = new Session(root, db)
+    let session = new Session(root, db, SessionOptions.Default)
 
     try
         f session gates
@@ -237,19 +237,13 @@ let ``Session: Close 後の呼び出しはエラーになる`` () =
     withDir "session-close" (fun dir ->
         let session = ok (Session.OpenWith dir)
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
-
         ok (session.Close())
-
         expectErrorKind ErrorKind.InternalError "Close 後の Execute が成功しました" (session.Execute "SELECT 1")
-
         expectErrorKind ErrorKind.InternalError "Close 後の Begin が成功しました" (session.Begin())
-
         expectErrorKind ErrorKind.InternalError "Close 後の Commit が成功しました" (session.Commit())
-
         expectErrorKind ErrorKind.InternalError "Close 後の Rollback が成功しました" (session.Rollback())
-
         expectErrorKind ErrorKind.InternalError "Close 後の TableNames が成功しました" (session.TableNames())
-
+        expectErrorKind ErrorKind.InternalError "Close 後の TryOpenReader が成功しました" (session.TryOpenReader "SELECT 1")
         Assert.False session.InTransaction
         // 二重 Close は安全。
         ok (session.Close()))
@@ -419,3 +413,203 @@ let ``Session: Database 型は公開されていない`` () =
     let dbType = typeof<Session>.Assembly.GetType "RykDb.Core.Database"
     Assert.NotNull dbType
     Assert.False dbType.IsPublic
+
+let private withSessionOptions options (tag: string) (f: Session -> unit) =
+    withDir tag (fun dir ->
+        let session = ok (Session.OpenWith(dir, options))
+
+        try
+            f session
+        finally
+            session.Close() |> ignore)
+
+[<Fact>]
+let ``SessionOptions: 行数上限を超える SELECT は CapacityError`` () =
+    let options =
+        { SessionOptions.Default with
+            MaxResultRows = 2L
+            MaxResultBytes = System.Int64.MaxValue
+        }
+
+    withSessionOptions options "session-row-limit" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+
+        ok (session.Execute "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)")
+        |> ignore
+
+        expectErrorKind ErrorKind.CapacityError "行数上限を超えたら CapacityError" (session.Execute "SELECT * FROM t")
+
+        // INSERT は行数上限の対象外。
+        ok (session.Execute "INSERT INTO t VALUES (4)") |> ignore)
+
+[<Fact>]
+let ``SessionOptions: 複数 SELECT は累積で上限を判定する`` () =
+    let options =
+        { SessionOptions.Default with
+            MaxResultRows = 3L
+            MaxResultBytes = System.Int64.MaxValue
+        }
+
+    withSessionOptions options "session-cumulative-limit" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+
+        ok (session.Execute "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)")
+        |> ignore
+
+        // 合計 3行までは成功する。
+        let rows = ok (session.Execute "SELECT * FROM t LIMIT 1; SELECT * FROM t LIMIT 2")
+        Assert.Equal<int>(3, rows.RowsAffected)
+
+        // 2文目で累積上限を超える。
+        expectErrorKind
+            ErrorKind.CapacityError
+            "累積上限を超えたら CapacityError"
+            (session.Execute "SELECT * FROM t; SELECT * FROM t"))
+
+[<Fact>]
+let ``SessionOptions: 0 行上限でも 0 行の SELECT は成功する`` () =
+    let options =
+        { SessionOptions.Default with
+            MaxResultRows = 0L
+            MaxResultBytes = 0L
+        }
+
+    withSessionOptions options "session-zero-limit" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        let empty = ok (session.Execute "SELECT * FROM t")
+        Assert.Empty empty.Rows
+        expectErrorKind ErrorKind.CapacityError "1行でも上限超過" (session.Execute "SELECT 1"))
+
+[<Fact>]
+let ``SessionOptions: 負の上限は開くときに CapacityError`` () =
+    let dir = newDir "session-invalid-options"
+
+    try
+        let options =
+            { SessionOptions.Default with
+                MaxResultRows = -1L
+            }
+
+        expectErrorKind ErrorKind.CapacityError "負の行数上限はエラー" (Session.OpenWith(dir, options))
+    finally
+        System.IO.Directory.Delete(dir, true)
+
+let private drainReader (reader: RowReader) =
+    let rec loop acc =
+        match ok (reader.TryRead()) with
+        | None -> List.rev acc
+        | Some row -> loop (row :: acc)
+
+    loop []
+
+[<Fact>]
+let ``RowReader: 単一 SELECT を1行ずつ読める`` () =
+    withSession "session-reader-basic" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
+
+        ok (session.Execute "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        |> ignore
+
+        match ok (session.TryOpenReader "SELECT id, v FROM t ORDER BY id") with
+        | None -> Assert.Fail "単一 SELECT が RowReader になりませんでした"
+        | Some reader ->
+            use reader = reader
+            Assert.Equal<string array>([| "id"; "v" |], reader.Columns)
+            Assert.Equal<int64>(0L, reader.RowsRead)
+
+            let rows = drainReader reader
+            Assert.Equal<int>(3, rows.Length)
+            Assert.Equal<int64>(1L, asInt rows.[0].[0])
+            Assert.Equal("a", asText rows.[0].[1])
+            Assert.Equal<int64>(3L, asInt rows.[2].[0])
+            Assert.Equal<int64>(3L, reader.RowsRead)
+
+            // 終端後は再度読んでも None。
+            match ok (reader.TryRead()) with
+            | None -> ()
+            | Some _ -> Assert.Fail "終端後の TryRead が行を返しました")
+
+[<Fact>]
+let ``RowReader: 対象外の SQL は Ok None を返す`` () =
+    withSession "session-reader-none" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+
+        let empty = ok (session.TryOpenReader "")
+        Assert.True(Option.isNone empty)
+
+        let multiple = ok (session.TryOpenReader "SELECT 1; SELECT 2")
+        Assert.True(Option.isNone multiple)
+
+        let write = ok (session.TryOpenReader "INSERT INTO t VALUES (1)")
+        Assert.True(Option.isNone write)
+        expectErrorKind ErrorKind.SyntaxError "構文エラーは返す" (session.TryOpenReader "SELECT")
+
+        ok (session.Begin())
+        let inTransaction = ok (session.TryOpenReader "SELECT 1")
+        Assert.True(Option.isNone inTransaction)
+        ok (session.Rollback()))
+
+[<Fact>]
+let ``RowReader: SessionOptions の結果上限を適用しない`` () =
+    let options =
+        { SessionOptions.Default with
+            MaxResultRows = 1L
+            MaxResultBytes = 1L
+        }
+
+    withSessionOptions options "session-reader-no-limit" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1), (2), (3)") |> ignore
+
+        match ok (session.TryOpenReader "SELECT id FROM t ORDER BY id") with
+        | None -> Assert.Fail "単一 SELECT が RowReader になりませんでした"
+        | Some reader ->
+            use reader = reader
+            let rows = drainReader reader
+            Assert.Equal<int>(3, rows.Length)
+
+        // 通常の Execute には上限が効く。
+        expectErrorKind ErrorKind.CapacityError "Execute には上限が効く" (session.Execute "SELECT id FROM t"))
+
+[<Fact>]
+let ``RowReader: 読み取り中に commit しても開始時 snapshot を見る`` () =
+    withSession "session-reader-snapshot" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1), (2)") |> ignore
+
+        match ok (session.TryOpenReader "SELECT id FROM t ORDER BY id") with
+        | None -> Assert.Fail "単一 SELECT が RowReader になりませんでした"
+        | Some reader ->
+            use reader = reader
+
+            match ok (reader.TryRead()) with
+            | Some row -> Assert.Equal<int64>(1L, asInt row.[0])
+            | None -> Assert.Fail "1行目が読めませんでした"
+
+            ok (session.Execute "INSERT INTO t VALUES (3)") |> ignore
+
+            let rest = drainReader reader
+            Assert.Equal<int>(1, rest.Length)
+            Assert.Equal<int64>(2L, asInt rest.[0].[0])
+
+        // 読み終わった後は new snapshot で 3 が見える。
+        let after = ok (session.Execute "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(3L, asInt after.Rows.[0].[0]))
+
+[<Fact>]
+let ``RowReader: Dispose すると Close が待たずに完了できる`` () =
+    withDir "session-reader-close" (fun dir ->
+        let session = ok (Session.OpenWith dir)
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1), (2)") |> ignore
+
+        match ok (session.TryOpenReader "SELECT id FROM t ORDER BY id") with
+        | None -> Assert.Fail "単一 SELECT が RowReader になりませんでした"
+        | Some reader ->
+            let closing = startDedicated (fun () -> session.Close())
+            Thread.Sleep 200
+            Assert.False(closing.IsCompleted, "Close が開いている RowReader を待っていません")
+
+            (reader :> System.IDisposable).Dispose()
+            Assert.True(closing.Wait 10000, "RowReader の Dispose 後に Close が完了しません")
+            expectErrorKind ErrorKind.InternalError "Dispose 後の TryRead" (reader.TryRead()))

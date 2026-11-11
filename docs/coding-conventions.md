@@ -57,6 +57,9 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 
 - `let mutable current` / `let mutable closed` / `let mutable readers`:
   現在の `Database` ハンドル、Close 状態、実行中の読み取り数を保持する。
+- `RowReader` の `current` / `rowsRead` / `closed` / `exhausted`:
+  ストリーミング SELECT の読み取り位置と解放状態を保持する。
+  `Session.fs` 内に閉じる。
 - `lock stateGate`: `current` / `closed` / `readers` を保護する短いロック。
   読み取りは入口・出口でしか取らない。
 - `lock writeGate`: `Execute`（書き込みを含むバッチ）/ `Begin` / `Commit` / `Rollback` / `Close` を直列化する。

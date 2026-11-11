@@ -121,16 +121,34 @@ module internal Op =
 
         drop
 
-    /// 全行を配列に materialize する。
-    let toArray (op: Op) =
+    /// 全行を上限つきで配列に materialize する。
+    /// 上限を超えたら `CapacityError` を返し、部分結果は返さない。
+    let toArrayLimited (maxRows: int64) (maxBytes: int64) (op: Op) =
         let rows = ResizeArray<SqlValue array>()
 
-        let rec drain cur =
+        let tooLarge () =
+            DbError.capacity (
+                sprintf "SELECT 結果が上限を超えました（上限: %d 行 / %d バイト）。LIMIT を付けるか、SessionOptions で上限を変更してください" maxRows maxBytes
+            )
+            |> err
+
+        let rec drain count bytes cur =
             match next cur with
             | Error e -> err e
             | Ok None -> ret (rows.ToArray())
             | Ok(Some(row, nxt)) ->
-                rows.Add row
-                drain nxt
+                if count >= maxRows then
+                    tooLarge ()
+                else
+                    let rowBytes = int64 (ValueCodec.managedRowBytes row)
 
-        drain op
+                    if rowBytes > maxBytes - bytes then
+                        tooLarge ()
+                    else
+                        rows.Add row
+                        drain (count + 1L) (bytes + rowBytes) nxt
+
+        drain 0L 0L op
+
+    /// 全行を配列に materialize する（無制限）。
+    let toArray = toArrayLimited System.Int64.MaxValue System.Int64.MaxValue

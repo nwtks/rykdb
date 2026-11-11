@@ -178,9 +178,18 @@ module internal Dml =
 
     /// 主キーで prefix 走査する（キー昇順）。
     /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
-    let scanByPrimaryKey (store: RowStore) (schema: TableSchema) (limit: int) (visible: uint64 option) =
-        RowStore.scanAtRaw (tableSpace schema) [||] limit visible store
+    let private scanByPrimaryKeyScoped
+        (scope: ScanScope option)
+        (store: RowStore)
+        (schema: TableSchema)
+        (limit: int)
+        (visible: uint64 option)
+        =
+        RowStore.scanAtRaw (tableSpace schema) [||] limit visible scope store
         |> Result.map (opOfScan (fun _ -> true))
+
+    /// 主キーで prefix 走査する（キー昇順、スコープなし）。
+    let scanByPrimaryKey = scanByPrimaryKeyScoped None
 
     /// 主キーで prefix 走査する（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
@@ -189,11 +198,12 @@ module internal Dml =
         (schema: TableSchema)
         (limit: int)
         (visible: uint64 option)
+        (scope: ScanScope option)
         (txn: Transaction)
         =
         let slots = Transaction.slotsOf (tableSpace schema) txn
 
-        scanByPrimaryKey store schema (storeLimitFor limit slots) visible
+        scanByPrimaryKeyScoped scope store schema (storeLimitFor limit slots) visible
         |> Result.map (fun rows ->
             let overlaid = overlayRows (RowKey.primary schema) slots rows
             if limit > 0 then Op.take limit overlaid else overlaid)
@@ -207,10 +217,11 @@ module internal Dml =
         (endKey: SqlValue array option)
         (limit: int)
         (visible: uint64 option)
+        (scope: ScanScope option)
         (txn: Transaction)
         =
         let scanPrimaryKeyRange lowerBytes upperBytes limit =
-            RowStore.scanAtRaw (tableSpace schema) lowerBytes limit visible store
+            RowStore.scanAtRaw (tableSpace schema) lowerBytes limit visible scope store
             |> Result.map (fun scan ->
                 let rows = opOfScan (fun e -> inKeyRange lowerBytes upperBytes e.Key) scan
                 if limit > 0 then Op.take limit rows else rows)
@@ -242,10 +253,11 @@ module internal Dml =
         (values: SqlValue array)
         (limit: int)
         (visible: uint64 option)
+        (scope: ScanScope option)
         (txn: Transaction)
         =
         let scanIndexPrefix prefix limit =
-            RowStore.scanAtRaw (indexSpace index) prefix limit visible store
+            RowStore.scanAtRaw (indexSpace index) prefix limit visible scope store
             |> Result.map (fun scan ->
                 let rows = opOfScan (fun e -> KeyBuilder.startsWithPrefix e.Key prefix) scan
                 if limit > 0 then Op.take limit rows else rows)
@@ -271,10 +283,11 @@ module internal Dml =
         (upper: SqlValue array option)
         (limit: int)
         (visible: uint64 option)
+        (scope: ScanScope option)
         (txn: Transaction)
         =
         let scanIndexRange lowerBytes upperBytes limit =
-            RowStore.scanAtRaw (indexSpace index) lowerBytes limit visible store
+            RowStore.scanAtRaw (indexSpace index) lowerBytes limit visible scope store
             |> Result.map (fun scan ->
                 let rows = opOfScan (fun e -> inIndexRange lowerBytes upperBytes e.Key) scan
                 if limit > 0 then Op.take limit rows else rows)

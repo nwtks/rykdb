@@ -30,6 +30,96 @@ type SessionTransactionChange =
     /// この実行で transaction が終わった（COMMIT / ROLLBACK）。
     | Ended
 
+/// Session の結果上限。
+/// materialize する SELECT 結果に適用する。
+type SessionOptions =
+    {
+        /// 1回の Execute で保持する SELECT 行数の上限。
+        MaxResultRows: int64
+        /// 1回の Execute で保持する SELECT 行のメモリ概算上限。
+        MaxResultBytes: int64
+    }
+
+    /// 既定値（100万行 / 256MiB）。
+    static member Default =
+        {
+            MaxResultRows = 1_000_000L
+            MaxResultBytes = 256L * 1024L * 1024L
+        }
+
+    /// 上限なし（既存の Database API と同じ挙動）。
+    static member Unlimited =
+        {
+            MaxResultRows = System.Int64.MaxValue
+            MaxResultBytes = System.Int64.MaxValue
+        }
+
+    static member internal Validate(options: SessionOptions) =
+        if options.MaxResultRows < 0L then
+            DbError.capacity "MaxResultRows は 0 以上でなければなりません" |> err
+        elif options.MaxResultBytes < 0L then
+            DbError.capacity "MaxResultBytes は 0 以上でなければなりません" |> err
+        else
+            ret ()
+
+type private ResultBudget = { RowsLeft: int64; BytesLeft: int64 }
+
+/// SELECT 結果を1行ずつ読むリーダー。
+/// <remarks>
+/// `Session.TryOpenReader` が返す。
+/// 読み終わるか `Dispose` するまで snapshot と走査リソースを保持する。
+/// 1つのインスタンスを複数スレッドから同時に使ってはならない。
+/// </remarks>
+type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
+    let mutable current = op
+    let mutable rowsRead = 0L
+    let mutable closed = false
+    let mutable exhausted = false
+
+    let releaseResources () =
+        if not closed then
+            closed <- true
+            release ()
+
+    /// 列名。
+    member _.Columns = columns
+
+    /// これまでに返した行数。
+    member _.RowsRead = rowsRead
+
+    /// 次の行を読む。
+    /// 終端では `Ok None` を返し、リソースを自動で解放する。
+    /// 明示的に `Dispose` した後に呼ぶとエラーになる。
+    member _.TryRead() =
+        if exhausted then
+            ret None
+        elif closed then
+            err (DbError.internalError "RowReader は閉じられています")
+        else
+            match Op.next current with
+            | Error e ->
+                releaseResources ()
+                err e
+            | Ok None ->
+                exhausted <- true
+                releaseResources ()
+                ret None
+            | Ok(Some(row, nxt)) ->
+                current <- nxt
+                rowsRead <- rowsRead + 1L
+                ret (Some row)
+
+    override this.Finalize() =
+        try
+            releaseResources ()
+        with _ ->
+            ()
+
+    interface System.IDisposable with
+        member this.Dispose() =
+            releaseResources ()
+            System.GC.SuppressFinalize this
+
 [<RequireQualifiedAccess>]
 type private SyncStep =
     | SyncWait
@@ -120,7 +210,7 @@ type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
 /// 実行中の transaction がある間は、読み取りも含めて直列化される
 /// （read-your-writes とスナップショットの一貫性を保つため）。
 /// </remarks>
-type Session internal (root: string, initialDb: Database) =
+type Session internal (root: string, initialDb: Database, options: SessionOptions) =
     // current / closed / readers を保護する短いロック。
     // 読み取りは入口と出口でしか取らないので、実行中の書き込みに待たされない。
     let stateGate = obj ()
@@ -131,6 +221,36 @@ type Session internal (root: string, initialDb: Database) =
     let mutable current = initial
     let mutable closed = false
     let mutable readers = 0
+
+    let limits =
+        {
+            MaxRows = options.MaxResultRows
+            MaxBytes = options.MaxResultBytes
+        }
+
+    let initialBudget =
+        {
+            RowsLeft = limits.MaxRows
+            BytesLeft = limits.MaxBytes
+        }
+
+    let limitsOfBudget (budget: ResultBudget) =
+        {
+            MaxRows = max 0L budget.RowsLeft
+            MaxBytes = max 0L budget.BytesLeft
+        }
+
+    let consumeBudget (result: StatementResult) (budget: ResultBudget) =
+        if Array.isEmpty result.Columns then
+            budget
+        else
+            let rows = int64 result.Rows.Length
+            let bytes = result.Rows |> Array.sumBy (ValueCodec.managedRowBytes >> int64)
+
+            {
+                RowsLeft = max 0L (budget.RowsLeft - rows)
+                BytesLeft = max 0L (budget.BytesLeft - bytes)
+            }
 
     let closedError () =
         DbError.internalError "Session は閉じられています"
@@ -166,21 +286,21 @@ type Session internal (root: string, initialDb: Database) =
                 | Some db ->
                     let wasInTransaction = db.InTransaction
 
-                    let rec run (db: Database) acc =
+                    let rec run (db: Database) budget acc =
                         function
                         | [] -> ret (db, List.rev acc)
                         | stmt :: tail ->
                             let db, lease = db.AcquireSnapshot()
                             use _lease = lease
 
-                            match db.Execute stmt with
+                            match db.ExecuteWithLimits(limitsOfBudget budget, stmt) with
                             | Error e -> err e
                             | Ok(next, result) ->
                                 publish next
-                                run next (result :: acc) tail
+                                run next (consumeBudget result budget) (result :: acc) tail
 
                     let outcome, position =
-                        match run db [] statements with
+                        match run db initialBudget [] statements with
                         | Error e ->
                             let pos = currentHandle () |> Option.bind (fun d -> d.WalPosition)
                             Error e, pos
@@ -239,15 +359,15 @@ type Session internal (root: string, initialDb: Database) =
         | Ok None -> runExclusive statements
         | Ok(Some(db, lease)) ->
             try
-                let rec run (db: Database) acc =
+                let rec run (db: Database) budget acc =
                     function
                     | [] -> ret (List.rev acc)
                     | stmt :: tail ->
-                        match db.Execute stmt with
+                        match db.ExecuteWithLimits(limitsOfBudget budget, stmt) with
                         | Error e -> err e
-                        | Ok(next, result) -> run next (result :: acc) tail
+                        | Ok(next, result) -> run next (consumeBudget result budget) (result :: acc) tail
 
-                match run db [] statements with
+                match run db initialBudget [] statements with
                 | Error e -> err e
                 | Ok results -> ret (summarize results, SessionTransactionChange.NoChange)
             finally
@@ -305,9 +425,17 @@ type Session internal (root: string, initialDb: Database) =
                 | Ok() -> outcome
             | None -> outcome
 
-    /// DB を開く（background compaction 有効）。
+    /// DB を開く（background compaction 有効、既定の上限）。
     static member OpenWith(root: string) =
-        Database.OpenWithBackground root |> Result.map (fun db -> new Session(root, db))
+        Session.OpenWith(root, SessionOptions.Default)
+
+    /// DB を開く（background compaction 有効、指定した上限）。
+    static member OpenWith(root: string, options: SessionOptions) =
+        match SessionOptions.Validate options with
+        | Error e -> err e
+        | Ok() ->
+            Database.OpenWithBackground root
+            |> Result.map (fun db -> new Session(root, db, options))
 
     /// DB のルートディレクトリ。
     member _.Root = root
@@ -322,6 +450,44 @@ type Session internal (root: string, initialDb: Database) =
                 err (closedError ())
             else
                 ret (current.TableNames()))
+
+    /// 単一の SELECT を materialize せずにストリーミング用に開く。
+    /// <remarks>
+    /// 対象は「文が1つだけで、それが SELECT」の場合のみ。
+    /// それ以外（複数文・非 SELECT・空 SQL・transaction 中）は `Ok None` を返すので、
+    /// 呼び出し側は `Execute` にフォールバックする。
+    /// 結果は `SessionOptions` の `MaxResultRows` / `MaxResultBytes` で制限しない
+    /// （保持せずに1行ずつ返すため）。
+    /// 必要なら SQL の `LIMIT` を使う。
+    /// 返した `RowReader` は使い終わったら `Dispose` すること。
+    /// </remarks>
+    member _.TryOpenReader(sql: string) =
+        if lock stateGate (fun () -> closed) then
+            err (closedError ())
+        else
+            match durability.Failure with
+            | Some e -> err e
+            | None ->
+                match Parser.parseStatements sql with
+                | Error e -> err e
+                | Ok [ Statement.Select stmt ] ->
+                    match tryEnterRead () with
+                    | Error e -> err e
+                    | Ok None -> ret None
+                    | Ok(Some(db, lease)) ->
+                        match db.OpenSelect stmt with
+                        | Error e ->
+                            exitRead lease
+                            err e
+                        | Ok stream ->
+                            let release () =
+                                try
+                                    stream.Cleanup()
+                                finally
+                                    exitRead lease
+
+                            ret (Some(new RowReader(stream.Columns, stream.Op, release)))
+                | Ok _ -> ret None
 
     /// 単一文または複数文を実行する。
     /// <remarks>

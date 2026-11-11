@@ -87,6 +87,8 @@ Ctrl+C で終了します。
 （書き込みと transaction 操作は 1つの Session 内で直列化される）。
 明示 transaction は Session 全体で 1つなので、transaction を使う接続は 1 本に限ること
 （他接続の切断で勝手に rollback されないよう、切断 rollback は開始した接続だけが行う）。
+大きな SELECT は `.stream <SQL>` で `STREAM` 応答（`END` 終端）を要求でき、
+`RykDb.Client.SendStream` で行ごとに受け取れる。
 
 ### ライブラリ API
 
@@ -111,6 +113,15 @@ printfn "%A" result.RowsAffected  // 2
 
 result.ToDisplayLines()           // [ "id | v"; "------"; "  1, 10"; "  2, 20" ]
 ok (session.TableNames())         // [ "t" ]
+
+// 単一 SELECT を1行ずつ読む場合は TryOpenReader を使う（結果上限の対象外）。
+// 複数文・非 SELECT・transaction 中は None が返る。
+match ok (session.TryOpenReader "SELECT id, v FROM t ORDER BY id") with
+| Some reader ->
+    use reader = reader
+    // reader.TryRead() が Ok(Some row) / Ok None / Error を返す。
+    ()
+| None -> ()
 
 // SELECT だけの Execute は複数スレッドから並行に呼べる（書き込みは直列化される）。
 ok (session.Close())

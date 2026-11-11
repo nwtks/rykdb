@@ -64,6 +64,8 @@ let private withServer (f: RykDbClient -> unit) =
 let private okRows (r: Reply) =
     match r with
     | Rows(cols, rows) -> cols, rows
+    | Affected _ -> [], []
+    | Streamed(cols, _) -> cols, []
     | Failure m ->
         Assert.Fail(sprintf "サーバがエラーを返しました: %s" m)
         [], []
@@ -79,7 +81,10 @@ let ``TCP: loopback で SQL が通る`` () =
 
         Assert.Equal<string list>([], cols)
 
-        okRows (client.Send "INSERT INTO t VALUES (1, 'a'), (2, 'b')") |> ignore
+        match client.Send "INSERT INTO t VALUES (1, 'a'), (2, 'b')" with
+        | Affected 2 -> ()
+        | other -> Assert.Fail(sprintf "INSERT の影響行数が一致しません: %A" other)
+
         let cols, rows = okRows (client.Send "SELECT id, name FROM t ORDER BY id")
         Assert.Equal<string list>([ "id"; "name" ], cols)
         Assert.Equal<string list>([ "1,'a'"; "2,'b'" ], rows)
@@ -492,7 +497,7 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
             Assert.Equal<string>("OK 0", reader.ReadLine())
 
             writer.WriteLine "INSERT INTO t VALUES (1)"
-            Assert.Equal<string>("OK 0", reader.ReadLine())
+            Assert.Equal<string>("OK 1", reader.ReadLine())
         finally
             raw.Dispose()
 
@@ -521,9 +526,9 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
                 ()
 
 /// 複数接続のテスト用: サーバを起動し、割り当てられたポートを渡す。
-let private withTestServer (tag: string) (f: int -> unit) =
+let private withTestServerOptions (options: SessionOptions) (tag: string) (f: int -> unit) =
     let dir = newDir tag
-    let session = ok (Session.OpenWith dir)
+    let session = ok (Session.OpenWith(dir, options))
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -557,6 +562,9 @@ let private withTestServer (tag: string) (f: int -> unit) =
                 Directory.Delete(dir, true)
             with _ ->
                 ()
+
+let private withTestServer (tag: string) (f: int -> unit) =
+    withTestServerOptions SessionOptions.Default tag f
 
 [<Fact>]
 let ``TCP: 接続中の接続があっても新しい接続を受け付ける`` () =
@@ -680,3 +688,126 @@ let ``TCP: 接続中でも serve は停止できる`` () =
                 Directory.Delete(dir, true)
             with _ ->
                 ()
+
+[<Fact>]
+let ``TCP: .stream は STREAM ヘッダ・行・END を返す`` () =
+    withTestServer "tcp-stream-raw" (fun port ->
+        use setup = new RykDbClient("127.0.0.1", port)
+        okRows (setup.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
+        okRows (setup.Send "INSERT INTO t VALUES (1, 'a'), (2, 'b')") |> ignore
+
+        use raw = new TcpClient("127.0.0.1", port)
+        raw.ReceiveTimeout <- 10000
+        let stream = raw.GetStream()
+        use writer = new StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
+        use reader = new StreamReader(stream, System.Text.Encoding.UTF8, false, 1024, true)
+        writer.AutoFlush <- true
+
+        writer.WriteLine ".stream SELECT id, v FROM t ORDER BY id"
+        Assert.Equal<string>("STREAM\tid,v", reader.ReadLine())
+        Assert.Equal<string>("1,'a'", reader.ReadLine())
+        Assert.Equal<string>("2,'b'", reader.ReadLine())
+        Assert.Equal<string>("END", reader.ReadLine())
+
+        // 0行でもヘッダと END を返す。
+        writer.WriteLine ".stream SELECT id FROM t WHERE id = 999"
+        Assert.Equal<string>("STREAM\tid", reader.ReadLine())
+        Assert.Equal<string>("END", reader.ReadLine())
+
+        // SELECT 以外は通常の OK にフォールバックする。
+        writer.WriteLine ".stream INSERT INTO t VALUES (3, 'c')"
+        Assert.Equal<string>("OK 1", reader.ReadLine())
+
+        // ストリーム後も同じ接続で次の要求を送れる。
+        writer.WriteLine ".ping"
+        Assert.Equal<string>("OK 0\tpong", reader.ReadLine()))
+
+[<Fact>]
+let ``TCP: Client.SendStream は行を蓄積せずに受け取る`` () =
+    withServer (fun client ->
+        okRows (client.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
+        okRows (client.Send "INSERT INTO t VALUES (1, 'a'), (2, 'b')") |> ignore
+
+        let rows = ResizeArray<string>()
+
+        match client.SendStream("SELECT id, v FROM t ORDER BY id", rows.Add) with
+        | Streamed([ "id"; "v" ], 2) -> ()
+        | other -> Assert.Fail(sprintf "STREAM の結果が一致しません: %A" other)
+
+        Assert.Equal<string list>([ "1,'a'"; "2,'b'" ], List.ofSeq rows)
+
+        // ストリーム後も同じ接続で次の要求を送れる。
+        let _, counts = okRows (client.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "2" ], counts)
+
+        // 対象外は OK フォールバックとして読む。DML は RowsAffected を返す。
+        let fallbackRows = ResizeArray<string>()
+
+        match client.SendStream("INSERT INTO t VALUES (3, 'c')", fallbackRows.Add) with
+        | Affected 1 -> ()
+        | other -> Assert.Fail(sprintf "OK フォールバックの結果が一致しません: %A" other)
+
+        Assert.Empty fallbackRows)
+
+[<Fact>]
+let ``Client: SendStream は STREAM・OK・途中 ERR を読む`` () =
+    withFakeServer
+        (fun line ->
+            if line.StartsWith(".stream STREAM", System.StringComparison.Ordinal) then
+                Some "STREAM\tc1,c2\n1,2\n3,4\nEND"
+            elif line.StartsWith(".stream FALLBACK", System.StringComparison.Ordinal) then
+                Some "OK 1\tc\n1"
+            else
+                Some "STREAM\tc\n1\nERR boom")
+        (fun port ->
+            use c = new RykDbClient("127.0.0.1", port)
+            let rows = ResizeArray<string>()
+
+            match c.SendStream("STREAM", rows.Add) with
+            | Streamed([ "c1"; "c2" ], 2) -> ()
+            | other -> Assert.Fail(sprintf "STREAM の結果が一致しません: %A" other)
+
+            Assert.Equal<string list>([ "1,2"; "3,4" ], List.ofSeq rows)
+
+            let fallbackRows = ResizeArray<string>()
+
+            match c.SendStream("FALLBACK", fallbackRows.Add) with
+            | Streamed([ "c" ], 1) -> ()
+            | other -> Assert.Fail(sprintf "OK フォールバックの結果が一致しません: %A" other)
+
+            Assert.Equal<string list>([ "1" ], List.ofSeq fallbackRows)
+
+            let partialRows = ResizeArray<string>()
+
+            match c.SendStream("ERROR", partialRows.Add) with
+            | Failure m -> Assert.Equal("boom", m)
+            | other -> Assert.Fail(sprintf "途中の ERR が Failure ではありません: %A" other)
+
+            Assert.Equal<string list>([ "1" ], List.ofSeq partialRows))
+
+[<Fact>]
+let ``TCP: .stream は SessionOptions の結果上限を適用しない`` () =
+    let options =
+        { SessionOptions.Default with
+            MaxResultRows = 1L
+            MaxResultBytes = 1L
+        }
+
+    withTestServerOptions options "tcp-stream-limit" (fun port ->
+        use client = new RykDbClient("127.0.0.1", port)
+        okRows (client.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        okRows (client.Send "INSERT INTO t VALUES (1), (2), (3)") |> ignore
+
+        // 通常の SELECT は上限で失敗する。
+        match client.Send "SELECT id FROM t ORDER BY id" with
+        | Failure m -> Assert.Contains("上限", m)
+        | other -> Assert.Fail(sprintf "通常 SELECT が上限エラーになりません: %A" other)
+
+        // .stream は materialize しないので 3 行すべて読める。
+        let rows = ResizeArray<string>()
+
+        match client.SendStream("SELECT id FROM t ORDER BY id", rows.Add) with
+        | Streamed([ "id" ], 3) -> ()
+        | other -> Assert.Fail(sprintf "STREAM の結果が一致しません: %A" other)
+
+        Assert.Equal<string list>([ "1"; "2"; "3" ], List.ofSeq rows))

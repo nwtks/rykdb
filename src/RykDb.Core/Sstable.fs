@@ -147,6 +147,32 @@ module internal SstEntry =
 
         e.Key.Length + valueTotal
 
+/// 1回のクエリで開いた走査の台帳。
+/// 消費者が早期終了しても `DisposeAll` で最新の continuation を閉じられるようにする。
+/// 同じキーには最新の走査だけを保持する（古い continuation は同じファイルハンドルを共有する）。
+type internal ScanScope() =
+    let active =
+        System.Collections.Concurrent.ConcurrentDictionary<obj, System.IDisposable>()
+
+    /// 走査を登録する。同じキーの古い登録は、より新しい continuation で置き換える。
+    member _.Register(key: obj, resource: System.IDisposable) = active.[key] <- resource
+
+    /// 登録を外して Dispose する。未登録なら何もしない。
+    member _.Release(key: obj) =
+        match active.TryRemove key with
+        | true, resource -> resource.Dispose()
+        | _ -> ()
+
+    /// 登録されている走査をすべて Dispose する。
+    member _.DisposeAll() =
+        for entry in active do
+            match active.TryRemove entry.Key with
+            | true, resource -> resource.Dispose()
+            | _ -> ()
+
+    /// テスト用: 登録されている走査の数。
+    member _.ActiveCount = active.Count
+
 /// SSTable の遅延走査。
 /// `next` を呼ぶまでデータブロックを読まず、呼び出しごとに必要なブロックを1つずつ読む。
 /// ブロックのチェックサムや内容の検証に失敗した場合は、そのブロックを読む `next` が `Error` を返す。
@@ -167,6 +193,8 @@ type internal SstScan =
     | StateScan of obj * (obj -> Result<(SstEntry * SstScan) option, DbError>) * (obj -> unit)
     /// 下流 scan と述語を保持する filter。早期終了時に下流を Dispose できる。
     | FilterScan of SstScan * (SstEntry -> bool)
+    /// ScanScope に登録された走査。next のたびに最新の continuation を登録し直す。
+    | ScopedScan of SstScan * ScanScope * obj
 
     interface System.IDisposable with
         member this.Dispose() =
@@ -174,75 +202,95 @@ type internal SstScan =
             | ArrayScan(_, _, _, _, _, close) -> close ()
             | FilterScan(inner, _) -> (inner :> System.IDisposable).Dispose()
             | StateScan(state, _, close) -> close state
-            | _ -> ()
+            | ScopedScan(_, scope, key) -> scope.Release key
+            | SstScan _ -> ()
 
 module internal SstScan =
     /// 終端（これ以上要素は無い）。
     let Empty = SstScan(fun () -> ret None)
 
+    /// 台帳から登録を外して閉じる。
+    let private releaseScope =
+        function
+        | Some(scope: ScanScope, key: obj) -> scope.Release key
+        | None -> ()
+
+    /// 残りの走査を台帳の最新版へ差し替える。
+    let private finishScoped (scope: (ScanScope * obj) option) (e: SstEntry) (scan: SstScan) =
+        match scope with
+        | None -> ret (Some(e, scan))
+        | Some(scope, key) ->
+            scope.Register(key, scan :> System.IDisposable)
+            ret (Some(e, ScopedScan(scan, scope, key)))
+
     /// 次の 1件。
     /// None は終端。
     /// フィルタの継続は述語リストとして持ち、すべての再帰呼び出しを末尾に置く。
     [<TailCall>]
-    let rec private nextWithFilters (filters: (SstEntry -> bool) list) =
+    let rec private nextWithFilters (filters: (SstEntry -> bool) list) (scope: (ScanScope * obj) option) =
         function
-        | FilterScan(inner, predicate) -> nextWithFilters (predicate :: filters) inner
-        | SstScan step -> continueWith filters (step ())
+        | FilterScan(inner, predicate) -> nextWithFilters (predicate :: filters) scope inner
+        | SstScan step -> continueWith filters scope (step ())
         | ArrayScan(entries, pos, count, limit, loadNext, close) ->
             if limit > 0 && count >= limit then
                 close ()
+                releaseScope scope
                 ret None
             elif pos < entries.Length then
                 continueWith
                     filters
+                    scope
                     (ret (Some(entries.[pos], ArrayScan(entries, pos + 1, count + 1, limit, loadNext, close))))
             else
-                continueWith filters (loadNext count)
-        | StateScan(state, step, close) ->
-            match step state with
-            | Ok None ->
-                close state
-                ret None
-            | Error e ->
-                close state
-                err e
-            | Ok(Some(e, rest)) -> continueWith filters (ret (Some(e, rest)))
+                continueWith filters scope (loadNext count)
+        | StateScan(state, step, _) -> continueWith filters scope (step state)
+        | ScopedScan(inner, scanScope, key) -> nextWithFilters filters (Some(scanScope, key)) inner
 
     /// 下流 scan の結果に、積んだ述語を順に適用する。
     /// すべて通れば、残りの走査にも同じ述語を付け直して返す。
-    and [<TailCall>] private continueWith (filters: (SstEntry -> bool) list) =
+    and [<TailCall>] private continueWith (filters: (SstEntry -> bool) list) (scope: (ScanScope * obj) option) =
         function
-        | Error e -> err e
-        | Ok None -> ret None
+        | Error e ->
+            releaseScope scope
+            err e
+        | Ok None ->
+            releaseScope scope
+            ret None
         | Ok(Some(e, rest)) ->
             match filters with
-            | [] -> ret (Some(e, rest))
-            | _ -> applyFilters filters filters e rest
+            | [] -> finishScoped scope e rest
+            | _ -> applyFilters filters filters scope e rest
 
     /// 継続として積んだ述語を先頭から試す。
     /// 満たさなければ下流 scan の続きへ末尾再帰する。
     and [<TailCall>] private applyFilters
         (allFilters: (SstEntry -> bool) list)
         (remaining: (SstEntry -> bool) list)
+        (scope: (ScanScope * obj) option)
         (e: SstEntry)
         (scan: SstScan)
         =
         match remaining with
         | [] ->
-            let rest =
-                List.fold (fun scan predicate -> FilterScan(scan, predicate)) scan allFilters
-
-            ret (Some(e, rest))
+            List.fold (fun scan predicate -> FilterScan(scan, predicate)) scan allFilters
+            |> finishScoped scope e
         | predicate :: tail ->
             if predicate e then
-                applyFilters allFilters tail e scan
+                applyFilters allFilters tail scope e scan
             else
-                nextWithFilters allFilters scan
+                nextWithFilters allFilters scope scan
 
-    let next = nextWithFilters []
+    let next = nextWithFilters [] None
 
     /// 明示的に資源を解放する（終端・エラー後の呼び出しも安全）。
     let dispose (scan: SstScan) = (scan :> System.IDisposable).Dispose()
+
+    /// 走査を ScanScope に登録する。
+    /// 途中で消費者が止まっても、ScanScope.DisposeAll が最新の continuation を閉じる。
+    let scoped (scope: ScanScope) (scan: SstScan) =
+        let key = obj ()
+        scope.Register(key, scan :> System.IDisposable)
+        ScopedScan(scan, scope, key)
 
     /// 1件を返す走査。
     /// 続き（rest）は次を要求されるまで組み立てない

@@ -557,3 +557,29 @@ let ``Sstable.openPartial: 索引の範囲外は読み出し時に CorruptionErr
             ErrorKind.CorruptionError
             "索引の範囲外でも例外にせず CorruptionError を返す"
             (Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray))
+
+[<Fact>]
+let ``ScanScope: 早期終了しても登録した走査を閉じられる`` () =
+    let entries = sstEntries 3
+    let mutable closed = false
+    let close () = closed <- true
+    let loadNext (_: int) = ret None
+    let scan = SstScan.ArrayScan(entries, 0, 0, 0, loadNext, close)
+    let scope = ScanScope()
+    let scoped = SstScan.filter (fun _ -> true) (SstScan.scoped scope scan)
+    Assert.Equal(1, scope.ActiveCount)
+    Assert.True((ok (SstScan.next scoped)).IsSome)
+    Assert.Equal(1, scope.ActiveCount)
+    scope.DisposeAll()
+    Assert.Equal(0, scope.ActiveCount)
+    Assert.True closed
+    SstScan.dispose scoped
+
+[<Fact>]
+let ``ScanScope: 最後まで読むと登録が外れる`` () =
+    let entries = sstEntries 2
+    let scope = ScanScope()
+    let scoped = SstScan.scoped scope (SstScan.ofSeq entries)
+    let got = ok (SstScan.toArray scoped)
+    Assert.Equal<int>(2, got.Length)
+    Assert.Equal(0, scope.ActiveCount)

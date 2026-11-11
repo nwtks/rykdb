@@ -1807,7 +1807,8 @@ merge 中に foreground の flush や新しい transaction が入り得る。
   flush も worker も `Manifest.logAndApply` を同じ installGate の内側で呼ぶ。
 - 読み取りは Session 呼び出し単位で Version 全ファイルを pin する。
   worker は入力の実ファイルを即削除せず、retired にして refcount が 0 になってから消す。
-  `SstScan` 自体には pin を配線していないため、早期終了で FileStream が残る既存問題は別。
+  `SstScan` 自体には pin を配線していない（snapshot の粗い pin で安全性を保つ）。
+  早期終了時の FileStream は `ScanScope` が `Engine` の `finally` で破棄する（§11.61）。
 - close は cancel → **無条件の signal** → worker join → flush → WAL 削除 → ProcessLock 解放。
   worker が install 中でも join が完了してから WAL を消す。
   Pending ビットが立っていても、worker が既に signal を消費して Pending を消す前かもしれない。
@@ -1985,3 +1986,50 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 回帰テスト: `CommitDurability: 複数登録を 1回の fsync にまとめる` /
 `CommitDurability: fsync 失敗を全待機者に伝播し、再試行しない` /
 `CommitDurability: 同時待機でも fsync は 1回だけ`。
+
+### 11.61 スキャン破棄はラッパーではなく発生源で台帳に登録する
+
+❌ `RowStore.scanAtRaw` が返した `SstScan` を外側から `SstScan.filter` などで包み、
+その `Dispose` だけに頼る。
+`RowStore.scanWithinPrefix` は `SstScan(fun () -> ...)` で包むが、
+この形は下流の `Dispose` を伝播しないため、`LIMIT` や結果上限で早期終了すると `FileStream` が残る
+（`SstScan.toArray` の最後まで読む経路だけは閉じられる）。
+
+✅ `StorageEngine.scanAt` の直後（`RowStore.scanAtRaw`）で
+`SstScan.scoped scope scan` として `ScanScope` に登録する。
+`ScopedScan` は `next` のたびに最新の continuation を同じキーで登録し直し、
+終端・エラー・`Dispose` で登録を外して閉じる。
+`Engine.runSelect` / `runDml` は `finally` で `ScanScope.DisposeAll()` を呼ぶので、
+どの経路で止まっても開いた走査が残らない。
+
+- continuation の差し替え時に古い登録を Dispose しない。
+  同じファイルハンドルを共有しており、最新の continuation を閉じれば足りる。
+- 回帰テスト: `SstableTests: ScanScope: 早期終了しても登録した走査を閉じられる` /
+  `SstableTests: ScanScope: 最後まで読むと登録が外れる` /
+  `RowStoreTests: RowStore.scanAtRaw: scope 指定時はラッパー越しでも走査を台帳に登録する`。
+
+### 11.62 RowReader は終端・Dispose で snapshot と走査を解放する
+
+❌ `Session.TryOpenReader` が返した `RowReader` を途中で捨てる。
+読み取り中の snapshot 登録と `ScanScope` が残り、`Session.Close` が readers の完了を待ち続ける
+（finalizer が動くまで待つため、実質的に停止する）。
+
+✅ 列挙を最後まで読む（終端で自動解放）か、`use` / `Dispose` で明示的に解放する。
+`RowReader.TryRead` は終端・エラーでも解放するが、途中で読むのをやめる場合は自動では解放されない。
+`Session.TryOpenReader` は単一 SELECT のみを対象とし、
+結果セットを保持しないため `SessionOptions` の `MaxResultRows` / `MaxResultBytes` を適用しない。
+
+### 11.63 STREAM の END と DML の OK 件数を取り違えない
+
+❌ `OK <n>` の `n` を常にデータ行数とみなす。
+列名の無い `OK <n>` は DML / DDL の `RowsAffected` であり、データ行は続かない。
+`n` 行を読もうとすると次の応答まで読み進めて接続がずれる。
+
+✅ 列名がある `OK` だけ `n` 行のデータを読む。
+`RykDb.Client` は列なしを `Affected n` として返す。
+
+❌ `.stream` の `STREAM` ヘッダだけ読んで `END` を消費せず、次の SQL を送る。
+残りの行が次の応答として読まれ、プロトコルがずれる。
+
+✅ `RykDb.Client.SendStream` のように `END` または途中の `ERR` まで読み切る。
+途中で読むのをやめる低レベル実装では、接続を閉じるか `END` まで drain する。

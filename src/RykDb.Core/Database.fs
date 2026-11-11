@@ -199,6 +199,14 @@ type internal Database(root: string, state: DbState) =
             )
             |> ret
 
+    /// SELECT を materialize せずにストリーミング用の状態として開く。
+    /// 呼び出し側は `SelectStream.Cleanup` を必ず呼ぶ。
+    member _.OpenSelect(stmt: SelectStatement) =
+        if state.Active.IsSome then
+            err (DbError.internalError "transaction 中の SELECT は RowReader で開けません")
+        else
+            Engine.openSelect state stmt
+
     /// 1文だけ実行して、次のハンドルと結果を返す。
     /// <remarks>
     /// 戻り値の Database を次の呼び出しに渡すこと。
@@ -207,6 +215,10 @@ type internal Database(root: string, state: DbState) =
     /// 複数文を実行する場合は、公開 API の `Session.Execute` を使う。
     /// </remarks>
     member this.Execute(stmt: Statement) =
+        this.ExecuteWithLimits(ResultLimits.Unlimited, stmt)
+
+    /// 1文だけ実行し、SELECT 結果には limits を適用する。
+    member this.ExecuteWithLimits(limits: ResultLimits, stmt: Statement) =
         let nextOf nextState =
             if obj.ReferenceEquals(nextState, state) then
                 this
@@ -224,5 +236,5 @@ type internal Database(root: string, state: DbState) =
             let nextState = Engine.executeRollback state
             ret (nextOf nextState, StatementResult.Empty)
         | _ ->
-            Engine.executeStatement state stmt
+            Engine.executeStatementWithLimits limits state stmt
             |> Result.map (fun (nextState, result) -> nextOf nextState, result)

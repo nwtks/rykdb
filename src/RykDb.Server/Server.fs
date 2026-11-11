@@ -5,8 +5,13 @@
 // 改行区切りの 1行テキストを交換し、応答の先頭タグで成否を分ける:
 //   OK <行数>\t<列名,...>   成功(続く行がデータ。SELECT は0行でも列名を返す)
 //   OK <行数>               DML など列を持たない成功
+//   STREAM\t<列名,...>      ストリーミング SELECT のヘッダ(続く行がデータ、END で終端)
+//   END                     STREAM の終端
 //   ERR <メッセージ>        失敗
 //   HALT                    終了
+//
+// `.stream <SQL>` は単一 SELECT を materialize せずに STREAM で返す。
+// 対象外（複数文・非 SELECT・transaction 中など）は通常の OK / ERR にフォールバックする。
 //
 // データ行の中のバックスラッシュ・改行・CR は `\\` / `\n` / `\r` にエスケープする
 // （TEXT に生の改行が入っていても 1応答 = 1行を保つ）。
@@ -28,6 +33,12 @@ let ErrTag = "ERR"
 [<Literal>]
 let HaltTag = "HALT"
 
+[<Literal>]
+let StreamTag = "STREAM"
+
+[<Literal>]
+let EndTag = "END"
+
 /// 応答の 1データ行をプロトコルに載せられる形にする。
 /// バックスラッシュ・改行・CR をエスケープする（クライアント側で元へ戻す）。
 let private escapeLine (s: string) =
@@ -42,20 +53,25 @@ let private escapeLine (s: string) =
 
     sb.ToString()
 
+let private encodedColumns (columns: string array) =
+    columns |> Array.map System.Uri.EscapeDataString |> String.concat ","
+
+/// 列名がある場合だけタブ + 列名を付ける（既存の OK ヘッダーと同じ形）。
+let private columnsSuffix (columns: string array) =
+    if columns.Length = 0 then
+        ""
+    else
+        "\t" + encodedColumns columns
+
+let private rowLine =
+    Array.map SqlLiteral.toSqlLiteral >> String.concat "," >> escapeLine
+
 /// 応答を 1行ずつ書き出す。
 /// 結果全体を 1本の文字列へ結合しないので、
 /// 大結果で「行ごとの文字列 + 結合結果」の 2枚分のコピーが要らない。
 /// 戻り値は「書き出せたか」（送信失敗で接続を閉じるため）。
 let private sendRows (writer: System.IO.StreamWriter) (columns: string array) (rows: SqlValue array array) =
-    let header =
-        if columns.Length = 0 then
-            sprintf "%s %d" OkTag rows.Length
-        else
-            sprintf
-                "%s %d\t%s"
-                OkTag
-                rows.Length
-                (System.String.Join(",", columns |> Array.map System.Uri.EscapeDataString))
+    let header = sprintf "%s %d%s" OkTag rows.Length (columnsSuffix columns)
 
     try
         writer.AutoFlush <- false
@@ -65,11 +81,7 @@ let private sendRows (writer: System.IO.StreamWriter) (columns: string array) (r
 
             if rows.Length > 0 then
                 for row in rows do
-                    row
-                    |> Array.map SqlLiteral.toSqlLiteral
-                    |> String.concat ","
-                    |> escapeLine
-                    |> writer.WriteLine
+                    rowLine row |> writer.WriteLine
 
             writer.Flush()
         finally
@@ -111,6 +123,34 @@ let private handleClient (onLog: string -> unit) (session: Session) (client: Sys
         with _ ->
             false
 
+    let sendResult result =
+        if Array.isEmpty result.Columns then
+            sprintf "%s %d" OkTag result.RowsAffected |> send
+        else
+            sendRows writer result.Columns result.Rows
+
+    let sendStream sql =
+        match session.TryOpenReader sql with
+        | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
+        | Ok None ->
+            match runSql sql with
+            | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
+            | Ok result -> sendResult result
+        | Ok(Some rowReader) ->
+            use rowReader = rowReader
+            let header = sprintf "%s%s" StreamTag (columnsSuffix rowReader.Columns)
+
+            if not (send header) then
+                false
+            else
+                let rec loop () =
+                    match rowReader.TryRead() with
+                    | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
+                    | Ok None -> send EndTag
+                    | Ok(Some row) -> if send (rowLine row) then loop () else false
+
+                loop ()
+
     let mutable running = true
 
     while running do
@@ -139,10 +179,13 @@ let private handleClient (onLog: string -> unit) (session: Session) (client: Sys
                         else
                             let rows = names |> List.map (fun n -> [| SqlValue.Text n |]) |> List.toArray
                             running <- sendRows writer [| "tables" |] rows
+                | ".stream" -> running <- sprintf "%s .stream には SQL が必要です" ErrTag |> send
+                | _ when sql.StartsWith(".stream ", System.StringComparison.Ordinal) ->
+                    running <- sendStream (sql.Substring(".stream ".Length).Trim())
                 | _ ->
                     match runSql sql with
                     | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
-                    | Ok result -> running <- sendRows writer result.Columns result.Rows
+                    | Ok result -> running <- sendResult result
 
     if ownsTransaction && session.InTransaction then
         match session.Rollback() with
