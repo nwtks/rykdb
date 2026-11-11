@@ -8,51 +8,7 @@
 
 open RykDb.Core
 
-let private piecesOf (input: string) =
-    let pieces = ResizeArray<string>()
-    let buf = System.Text.StringBuilder()
-
-    let flush () =
-        let text = buf.ToString().Trim()
-
-        if not (System.String.IsNullOrWhiteSpace text) then
-            pieces.Add text
-
-        buf.Clear() |> ignore
-
-    let rec loop i inString =
-        if i >= input.Length then
-            flush ()
-            pieces.ToArray()
-        else
-            let c = input.[i]
-
-            if inString then
-                buf.Append c |> ignore
-
-                if c = '\'' then
-                    if i + 1 < input.Length && input.[i + 1] = '\'' then
-                        buf.Append '\'' |> ignore
-                        loop (i + 2) true
-                    else
-                        loop (i + 1) false
-                else
-                    loop (i + 1) true
-            else
-                match c with
-                | '\'' ->
-                    buf.Append c |> ignore
-                    loop (i + 1) true
-                | ';' ->
-                    flush ()
-                    loop (i + 1) false
-                | _ ->
-                    buf.Append c |> ignore
-                    loop (i + 1) false
-
-    loop 0 false
-
-let private splitStatements = piecesOf >> Array.toList
+open RykDb.Cli
 
 let private coloredLine (color: System.ConsoleColor) (emit: string -> unit) (line: string) =
     System.Console.ForegroundColor <- color
@@ -61,26 +17,6 @@ let private coloredLine (color: System.ConsoleColor) (emit: string -> unit) (lin
 
 let private printError (e: DbError) =
     coloredLine System.ConsoleColor.Red (fun m -> eprintfn "エラー: %s" m) (DbError.toDisplayString e)
-
-let private printResult (r: StatementResult) =
-    r.ToDisplayLines() |> List.iter (printfn "%s")
-
-/// `RowReader` を materialize せずに表示する。
-/// `StatementResult.ToDisplayLines()` と同じ形式（ヘッダ・区切り・2スペース字下げ）にする。
-let private printReader (reader: RowReader) =
-    let header = System.String.Join(" | ", reader.Columns)
-    printfn "%s" header
-    printfn "%s" (System.String('-', header.Length))
-
-    let rec loop () =
-        match reader.TryRead() with
-        | Error e -> printError e
-        | Ok None -> ()
-        | Ok(Some row) ->
-            row |> Array.map SqlLiteral.toSqlLiteral |> String.concat ", " |> printfn "  %s"
-            loop ()
-
-    loop ()
 
 let private dotCommand (session: Session) (line: string) =
     let parts = line.Split(' ', System.StringSplitOptions.RemoveEmptyEntries)
@@ -144,19 +80,8 @@ let private execOne (session: Session) (sql: string) =
     elif trimmed.StartsWith "." then
         dotCommand session trimmed
     else
-        match session.TryOpenReader trimmed with
-        | Ok(Some reader) ->
-            use reader = reader
-            printReader reader
-            true
-        | Ok None ->
-            match session.Execute trimmed with
-            | Ok r ->
-                printResult r
-                true
-            | Error e ->
-                printError e
-                true
+        match executeSql System.Console.Out session trimmed with
+        | Ok() -> true
         | Error e ->
             printError e
             true
@@ -210,22 +135,16 @@ let private runRepl (session: Session) =
                 buffer <- if Array.isEmpty toKeep then "" else toKeep.[0]
 
 let private runFile (session: Session) (path: string) =
-    let rec runStatements =
-        function
-        | [] -> Ok()
-        | stmt :: tail ->
-            match session.Execute stmt with
-            | Ok r ->
-                printResult r
-                runStatements tail
-            | Error e ->
-                printError e
-                Error e
-
     if not (System.IO.File.Exists path) then
         Error(sprintf "ファイル %s がありません" path |> DbError.notFound)
     else
-        System.IO.File.ReadAllText path |> splitStatements |> runStatements
+        let sql = System.IO.File.ReadAllText path
+
+        match runScript System.Console.Out session sql with
+        | Ok() -> Ok()
+        | Error e ->
+            printError e
+            Error e
 
 [<EntryPoint>]
 let main argv =

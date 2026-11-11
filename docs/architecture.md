@@ -1609,8 +1609,10 @@ dotnet run --project src/RykDb.Cli -- -f script.sql ./mydata  # スクリプト�
 
 対話モードでは `.tables` / `.begin` / `.commit` / `.rollback` / `.help` / `.exit`（`.quit`）が使える。
 エラーは表示するだけで終了しない。
-通常の SELECT は `Session.TryOpenReader` で 1行ずつ表示するため、結果セット全体をメモリに materialize しない
+REPL / ファイル実行の通常の SELECT は `Session.TryOpenReader` で 1行ずつ表示するため、
+結果セット全体をメモリに materialize しない
 （`SessionOptions` の結果上限も適用されない）。
+ファイル実行は最初のエラーで停止する。
 
 ### 11.3 TCP サーバ
 

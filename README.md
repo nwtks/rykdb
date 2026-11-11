@@ -71,6 +71,8 @@ db> .exit
 dotnet run --project src/RykDb.Cli -- -f schema.sql ./mydata
 ```
 
+スクリプト実行の SELECT も結果セットを保持せず 1行ずつ表示し、最初のエラーで停止する。
+
 ### TCP サーバを起動
 
 ```bash

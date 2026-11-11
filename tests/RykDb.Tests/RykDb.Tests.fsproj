@@ -44,6 +44,7 @@
     <Compile Include="DurabilityTests.fs" />
     <Compile Include="BackgroundCompactionTests.fs" />
     <Compile Include="ServerTests.fs" />
+    <Compile Include="CliTests.fs" />
     <Compile Include="TestHealthTests.fs" />
   </ItemGroup>
 
@@ -57,6 +58,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\RykDb.Core\RykDb.Core.fsproj" />
     <ProjectReference Include="..\..\src\RykDb.Server\RykDb.Server.fsproj" />
+    <ProjectReference Include="..\..\src\RykDb.Cli\RykDb.Cli.fsproj" />
   </ItemGroup>
 
 </Project>
