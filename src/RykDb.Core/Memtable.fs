@@ -28,25 +28,6 @@ module internal Entry =
             Value = None
         }
 
-    /// エントリの符号化後のおよそのバイト数（SSTable との整合確認用）。
-    /// メモリ上限の判定には `managedBytes` を使う。
-    let encodedBytes (e: Entry) =
-        let valueBytes v =
-            match ValueCodec.fixedEncodedBytes v with
-            | Some n -> n
-            | None ->
-                match v with
-                | SqlValue.Text s -> s.Length + 2
-                | SqlValue.Blob b -> b.Length + 2
-                | _ -> 1
-
-        let payload =
-            e.Value
-            |> Option.map (fun vs -> 2 + (vs |> Array.sumBy valueBytes))
-            |> Option.defaultValue 2
-
-        e.Key.Length + 8 + payload
-
     /// memtable が 1エントリを保持するのに要するヒープ上の概算サイズ。
     /// <remarks>
     /// Treap ノード（48）+ Entry（40）+ `option Some`（24）+ キー配列（24 + 長さ）

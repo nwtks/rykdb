@@ -274,8 +274,7 @@ let ``DmlOps.insert: INSERT は評価できない DEFAULT をエラーにする`
         }
 
     withStore "ins-default-bad" (fun store ->
-        let mgr = TransactionManager.create ()
-        let mgr, txn = TransactionManager.beginTxn mgr
+        let _, txn = TransactionManager.beginTxn (TransactionManager.create ())
 
         // 値を渡していない列の DEFAULT は評価される。評価エラーは NULL で握り潰さない。
         expectError

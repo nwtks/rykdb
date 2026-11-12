@@ -701,7 +701,7 @@ module internal Eval =
                         with
                         | Error er -> err er
                         | Ok m -> step schema row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
-            | KCaseWhen((w, t), tail, elseE) :: rest ->
+            | KCaseWhen((_, t), tail, elseE) :: rest ->
                 let matched = not (SqlValue.isNull v) && boolOf v
 
                 if matched then

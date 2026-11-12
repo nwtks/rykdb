@@ -432,9 +432,6 @@ module internal Optimizer =
                 return! applyLimit stmt deduped
         }
 
-    /// 派生テーブル無しの SELECT 文を論理代数に変換する。
-    let buildLogical (ctx: ExecContext) (stmt: SelectStatement) = buildLogicalWith ctx stmt Map.empty
-
     /// Join の結合待ち情報。
     /// 右部分木の Op は左部分木を評価した後に作る
     /// （評価順を left → right → join に保つため）。

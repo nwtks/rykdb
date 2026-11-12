@@ -634,8 +634,6 @@ module internal StorageEngine =
                 | None -> engine
         }
 
-    let openDatabase (dir: string) = openDatabaseWith None dir
-
     /// データベースを閉じる（memtable を flush してから WAL を消す）。
     /// <remarks>
     /// ハンドルは不変なので、古いハンドルでも `Close` を呼べる。

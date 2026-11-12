@@ -36,21 +36,21 @@ let private selectOf (items: SelectItem list) (from: TableRef option) (joins: Jo
     }
 
 [<Fact>]
-let ``Optimizer.buildLogical: 単純な SELECT は Scan + Project になる`` () =
+let ``Optimizer.buildLogicalWith: 単純な SELECT は Scan + Project になる`` () =
     withStore "pl1" (fun store ->
         let ctx = ctxOf store
 
         let stmt =
             selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
 
-        let tree = ok (Optimizer.buildLogical ctx stmt)
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
 
         match tree with
         | Logical.Project(_, Logical.Scan(name, ScanMethod.SeqScan)) -> Assert.Equal<string>("people", name)
         | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
 
 [<Fact>]
-let ``Optimizer.buildLogical: WHERE があれば Scan の直下に Filter が付く`` () =
+let ``Optimizer.buildLogicalWith: WHERE があれば Scan の直下に Filter が付く`` () =
     withStore "pl2" (fun store ->
         let ctx = ctxOf store
 
@@ -61,7 +61,7 @@ let ``Optimizer.buildLogical: WHERE があれば Scan の直下に Filter が付
                 []
                 (Some(Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))))
 
-        let tree = ok (Optimizer.buildLogical ctx stmt)
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
 
         match tree with
         | Logical.Project(_, Logical.Filter(_, Logical.Scan(name, method))) ->
@@ -73,7 +73,7 @@ let ``Optimizer.buildLogical: WHERE があれば Scan の直下に Filter が付
         | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
 
 [<Fact>]
-let ``Optimizer.buildLogical: JOIN があれば LJoin が作られる`` () =
+let ``Optimizer.buildLogicalWith: JOIN があれば LJoin が作られる`` () =
     withStore "pl3" (fun store ->
         let ctx = ctxOf store
 
@@ -90,7 +90,7 @@ let ``Optimizer.buildLogical: JOIN があれば LJoin が作られる`` () =
                 ]
                 None
 
-        let tree = ok (Optimizer.buildLogical ctx stmt)
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
 
         // LJoin の第 2 引数は右テーブル名、第 4 引数は左の木。
         match tree with
@@ -100,7 +100,7 @@ let ``Optimizer.buildLogical: JOIN があれば LJoin が作られる`` () =
         | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
 
 [<Fact>]
-let ``Optimizer.buildLogical: FROM のサブクエリは Logical.Derived になる`` () =
+let ``Optimizer.buildLogicalWith: FROM のサブクエリは Logical.Derived になる`` () =
     withStore "pl-derived" (fun store ->
         let ctx = ctxOf store
 
@@ -138,7 +138,7 @@ let ``Optimizer.buildLogical: FROM のサブクエリは Logical.Derived にな�
         | other -> Assert.Fail(sprintf "Derived ではない: %A" other))
 
 [<Fact>]
-let ``Optimizer.buildLogical: GROUP BY があれば LAggregate が作られる`` () =
+let ``Optimizer.buildLogicalWith: GROUP BY があれば LAggregate が作られる`` () =
     withStore "pl4" (fun store ->
         let ctx = ctxOf store
 
@@ -149,7 +149,7 @@ let ``Optimizer.buildLogical: GROUP BY があれば LAggregate が作られる``
                     Alias = None
                 }
                 {
-                    Expression = Expr.AggCall(AggFunc.Count, true, Expr.Literal(Literal.Null))
+                    Expression = Expr.AggCall(AggFunc.Count, true, Expr.Literal Literal.Null)
                     Alias = None
                 }
             ]
@@ -157,7 +157,7 @@ let ``Optimizer.buildLogical: GROUP BY があれば LAggregate が作られる``
         let plain = selectOf items (Some { Name = "people"; Alias = None }) [] None
         let stmt = { plain with GroupBy = [ pCol "age" ] }
 
-        let tree = ok (Optimizer.buildLogical ctx stmt)
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
 
         match tree with
         | Logical.Project(_, Logical.Aggregate(groupBy, aggs, _)) ->
@@ -166,7 +166,7 @@ let ``Optimizer.buildLogical: GROUP BY があれば LAggregate が作られる``
         | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
 
 [<Fact>]
-let ``Optimizer.buildLogical: 集約がなければ LAggregate は作られない`` () =
+let ``Optimizer.buildLogicalWith: 集約がなければ LAggregate は作られない`` () =
     withStore "pl5" (fun store ->
         let ctx = ctxOf store
 
@@ -182,14 +182,14 @@ let ``Optimizer.buildLogical: 集約がなければ LAggregate は作られな�
                 []
                 None
 
-        let tree = ok (Optimizer.buildLogical ctx stmt)
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
 
         match tree with
         | Logical.Project(_, Logical.Scan(_, _)) -> ()
         | _ -> Assert.Fail(sprintf "集約が無いのに集約がある: %A" tree))
 
 [<Fact>]
-let ``Optimizer.buildLogical: LIMIT / OFFSET は LLimit になる`` () =
+let ``Optimizer.buildLogicalWith: LIMIT / OFFSET は LLimit になる`` () =
     withStore "pl6" (fun store ->
         let ctx = ctxOf store
 
@@ -202,7 +202,7 @@ let ``Optimizer.buildLogical: LIMIT / OFFSET は LLimit になる`` () =
                 Offset = Some(Expr.Literal(Literal.Int 5L))
             }
 
-        let tree = ok (Optimizer.buildLogical ctx stmt)
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
 
         // 評価順は「射影 → DISTINCT → ORDER BY → LIMIT」なので LIMIT は
         // 射影の外側に出る。DISTINCT を先に置くと (id, g) の組で重複排除される。
@@ -213,7 +213,7 @@ let ``Optimizer.buildLogical: LIMIT / OFFSET は LLimit になる`` () =
         | _ -> Assert.Fail(sprintf "LIMIT が木の中心でない: %A" tree))
 
 [<Fact>]
-let ``Optimizer.buildLogical: FROM が無ければ Values（1 行 0 列）が入力になる`` () =
+let ``Optimizer.buildLogicalWith: FROM が無ければ Values（1 行 0 列）が入力になる`` () =
     withStore "pl7" (fun store ->
         let ctx = ctxOf store
 
@@ -229,7 +229,7 @@ let ``Optimizer.buildLogical: FROM が無ければ Values（1 行 0 列）が入
                 []
                 None
 
-        let tree = ok (Optimizer.buildLogical ctx stmt)
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
 
         // 入力は Logical.Values（1 行 0 列）で、その上に射影が載る
         match tree with
@@ -237,13 +237,13 @@ let ``Optimizer.buildLogical: FROM が無ければ Values（1 行 0 列）が入
         | _ -> Assert.Fail(sprintf "FROM なしの入力が Values でない: %A" tree))
 
 [<Fact>]
-let ``Optimizer.buildLogical: FROM なしの * と JOIN はエラー`` () =
+let ``Optimizer.buildLogicalWith: FROM なしの * と JOIN はエラー`` () =
     withStore "pl7b" (fun store ->
         let ctx = ctxOf store
 
         // * は展開する列が無いのでエラー（0 列 1 行の成功にしない）
         let star = selectOf [ { Expression = Expr.Star; Alias = None } ] None [] None
-        expectErrorKind ErrorKind.SyntaxError "FROM なしの *" (Optimizer.buildLogical ctx star)
+        expectErrorKind ErrorKind.SyntaxError "FROM なしの *" (Optimizer.buildLogicalWith ctx star Map.empty)
 
         // JOIN には FROM が必要
         let join =
@@ -264,10 +264,10 @@ let ``Optimizer.buildLogical: FROM なしの * と JOIN はエラー`` () =
                 ]
                 None
 
-        expectErrorKind ErrorKind.SyntaxError "FROM なしの JOIN" (Optimizer.buildLogical ctx join))
+        expectErrorKind ErrorKind.SyntaxError "FROM なしの JOIN" (Optimizer.buildLogicalWith ctx join Map.empty))
 
 [<Fact>]
-let ``Optimizer.buildLogical: 集約と * の併用はエラー`` () =
+let ``Optimizer.buildLogicalWith: 集約と * の併用はエラー`` () =
     withStore "pl8" (fun store ->
         let ctx = ctxOf store
 
@@ -278,17 +278,17 @@ let ``Optimizer.buildLogical: 集約と * の併用はエラー`` () =
                     Alias = None
                 }
                 {
-                    Expression = Expr.AggCall(AggFunc.Count, true, Expr.Literal(Literal.Null))
+                    Expression = Expr.AggCall(AggFunc.Count, true, Expr.Literal Literal.Null)
                     Alias = None
                 }
             ]
 
         let stmt = selectOf items (Some { Name = "people"; Alias = None }) [] None
         // ヘッダは入力スキーマ、行は集約出力スキーマで作られるため、併用すると列数が食い違う。
-        expectErrorKind ErrorKind.SyntaxError "集約と * は併用できない" (Optimizer.buildLogical ctx stmt))
+        expectErrorKind ErrorKind.SyntaxError "集約と * は併用できない" (Optimizer.buildLogicalWith ctx stmt Map.empty))
 
 [<Fact>]
-let ``Optimizer.buildLogical: LIMIT の定数式と OFFSET 単独`` () =
+let ``Optimizer.buildLogicalWith: LIMIT の定数式と OFFSET 単独`` () =
     withStore "pl9" (fun store ->
         let ctx = ctxOf store
 
@@ -301,7 +301,7 @@ let ``Optimizer.buildLogical: LIMIT の定数式と OFFSET 単独`` () =
                 Limit = Some(Expr.Column { Qualifier = None; Name = "nope" })
             }
 
-        expectErrorKind ErrorKind.NameError "LIMIT に列参照は使えない" (Optimizer.buildLogical ctx stmt1)
+        expectErrorKind ErrorKind.NameError "LIMIT に列参照は使えない" (Optimizer.buildLogicalWith ctx stmt1 Map.empty)
 
         // LIMIT の定数式は評価される
         let stmt3 =
@@ -309,7 +309,7 @@ let ``Optimizer.buildLogical: LIMIT の定数式と OFFSET 単独`` () =
                 Limit = Some(Expr.Binary(BinaryOp.Add, Expr.Literal(Literal.Int 1L), Expr.Literal(Literal.Int 0L)))
             }
 
-        match ok (Optimizer.buildLogical ctx stmt3) with
+        match ok (Optimizer.buildLogicalWith ctx stmt3 Map.empty) with
         | Logical.Limit(0, 1, _) -> ()
         | other -> Assert.Fail(sprintf "LIMIT 1+0 が 1 になっていない: %A" other)
 
@@ -319,7 +319,7 @@ let ``Optimizer.buildLogical: LIMIT の定数式と OFFSET 単独`` () =
                 Offset = Some(Expr.Literal(Literal.Int 3L))
             }
 
-        match ok (Optimizer.buildLogical ctx stmt2) with
+        match ok (Optimizer.buildLogicalWith ctx stmt2 Map.empty) with
         | Logical.Limit(3, -1, _) -> ()
         | other -> Assert.Fail(sprintf "OFFSET が 3 になっていない: %A" other))
 
@@ -455,7 +455,7 @@ let ``Plan.runSelect: FROM なしの SELECT は 1 行の定数を返す`` () =
         Assert.Equal<int64>(1L, asInt rows.[0].[0]))
 
 [<Fact>]
-let ``Optimizer.buildLogical: 主キー順の ORDER BY は Sort を作らない`` () =
+let ``Optimizer.buildLogicalWith: 主キー順の ORDER BY は Sort を作らない`` () =
     withStore "sort-pk" (fun store ->
         let ctx =
             ctxOf store
@@ -475,12 +475,12 @@ let ``Optimizer.buildLogical: 主キー順の ORDER BY は Sort を作らない`
                     ]
             }
 
-        match ok (Optimizer.buildLogical ctx stmt) with
+        match ok (Optimizer.buildLogicalWith ctx stmt Map.empty) with
         | Logical.Project(_, Logical.Scan("people", ScanMethod.SeqScan)) -> ()
         | other -> Assert.Fail(sprintf "Sort が残っています: %A" other))
 
 [<Fact>]
-let ``Optimizer.buildLogical: 主キー以外・降順の ORDER BY は Sort を作る`` () =
+let ``Optimizer.buildLogicalWith: 主キー以外・降順の ORDER BY は Sort を作る`` () =
     withStore "sort-keep" (fun store ->
         let ctx =
             ctxOf store
@@ -490,7 +490,7 @@ let ``Optimizer.buildLogical: 主キー以外・降順の ORDER BY は Sort を�
             selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
 
         let hasSort (keys: SortKey list) =
-            match ok (Optimizer.buildLogical ctx { baseStmt with OrderBy = keys }) with
+            match ok (Optimizer.buildLogicalWith ctx { baseStmt with OrderBy = keys } Map.empty) with
             | Logical.Project(_, Logical.Sort _) -> true
             | _ -> false
 
@@ -501,7 +501,7 @@ let ``Optimizer.buildLogical: 主キー以外・降順の ORDER BY は Sort を�
         Assert.True(hasSort [ key (pCol "id") SortDirection.Descending ], "降順はソートが必要です"))
 
 [<Fact>]
-let ``Optimizer.buildLogical: 複合主キーは全列の昇順なら Sort を作らない`` () =
+let ``Optimizer.buildLogicalWith: 複合主キーは全列の昇順なら Sort を作らない`` () =
     withStore "sort-pk-composite" (fun store ->
         let composite =
             { peopleSchema with
@@ -516,7 +516,7 @@ let ``Optimizer.buildLogical: 複合主キーは全列の昇順なら Sort を�
             selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
 
         let treeOf (keys: SortKey list) =
-            ok (Optimizer.buildLogical ctx { baseStmt with OrderBy = keys })
+            ok (Optimizer.buildLogicalWith ctx { baseStmt with OrderBy = keys } Map.empty)
 
         let key e d = { Expression = e; Direction = d }
 

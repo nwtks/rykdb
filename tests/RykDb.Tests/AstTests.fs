@@ -131,31 +131,10 @@ let ``Ast: その他の演算子の表示`` () =
     Assert.Equal<string>("t.*", Expr.toDisplayString (Expr.QualifiedStar "t"))
 
 [<Fact>]
-let ``Ast: Literal と SqlValue の相互変換`` () =
-    // BLOB リテラル → SqlValue
+let ``Ast: BLOB リテラルは SqlValue へ変換できる`` () =
     match (Literal.Blob [| 1uy; 2uy |]).ToSqlValue with
     | SqlValue.Blob b -> Assert.Equal<byte array>([| 1uy; 2uy |], b)
     | v -> Assert.Fail(sprintf "BLOB が Blob になりません: %A" v)
-
-    // SqlValue → リテラル表示（DDL 再構築用）。全ケースがリテラルへ落ちる。
-    let cases: (SqlValue * Literal) list =
-        [
-            SqlValue.Null, Literal.Null
-            SqlValue.Bool true, Literal.Bool true
-            SqlValue.Int 3L, Literal.Int 3L
-            SqlValue.Real 1.5, Literal.Real 1.5
-            SqlValue.Decimal 2.5M, Literal.Decimal 2.5M
-            SqlValue.Text "x", Literal.String "x"
-            SqlValue.Blob [| 7uy |], Literal.Blob [| 7uy |]
-            SqlValue.Date(System.DateOnly(2026, 10, 18)), Literal.String "2026-10-18"
-            SqlValue.Timestamp(System.DateTimeOffset(2026, 10, 18, 1, 2, 3, System.TimeSpan.Zero)),
-            Literal.String "2026-10-18T01:02:03.0000000Z"
-            SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-000000000001"),
-            Literal.String "00000000-0000-0000-0000-000000000001"
-        ]
-
-    for v, expected in cases do
-        Assert.Equal(expected, Literal.ofValue v)
 
 [<Fact>]
 let ``Ast: AggFunc と BinaryOp の表示名`` () =

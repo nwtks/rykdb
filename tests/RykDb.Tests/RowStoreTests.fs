@@ -105,7 +105,7 @@ let ``Keyspace: table / index の名前`` () =
 [<Fact>]
 let ``RowStore: compaction 失敗後も flush 結果を保持し、再起動で commit を失わない`` () =
     withDir "rowstore-compaction-fail" (fun dir ->
-        let engine = ok (StorageEngine.openDatabase dir)
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
 
         let mk (num: int64) (key: int) =
             [| Entry.put (intKey key) (uint64 key) (intRow key) |]
@@ -143,7 +143,7 @@ let ``RowStore: compaction 失敗後も flush 結果を保持し、再起動で 
         |> ignore
 
         // クラッシュ相当: 同じディレクトリを開き直す。
-        let reopened = ok (StorageEngine.openDatabase dir)
+        let reopened = ok (StorageEngine.openDatabaseWith None dir)
         let key5 = Keyspace.prefixedKey "t" (intKey 5)
         let key6 = Keyspace.prefixedKey "t" (intKey 6)
         Assert.True((ok (StorageEngine.getAt None key5 reopened)).IsSome)
@@ -155,7 +155,12 @@ let ``RowStore: keyspace は 1 本の LSM の接頭辞で分離される`` () =
         let store = RowStore.openStore dir |> ok
         let mgr = TransactionManager.create ()
         let _, txn = TransactionManager.beginTxn mgr
-        let txn = Dml.insert txn usersWithEmailIndex (rowOf 1 "a@x.com" 1) |> ok
+        let row = rowOf 1 "a@x.com" 1
+
+        let txn =
+            Dml.insertWithKey (RowKey.primary usersWithEmailIndex row) txn usersWithEmailIndex row
+            |> ok
+
         let store = commitInto store 1UL txn
         // keyspace ごとのディレクトリは作られない。
         Assert.Empty(System.IO.Directory.GetDirectories dir)
@@ -295,7 +300,7 @@ let ``RowStore.commitToStore: 別ハンドルの active snapshot を GC 境界�
 
         // 同じ DB を開いた別ハンドルが snapshot 5 で読み始めている状態。
         let other = ActiveSnapshotRegistry.register dir 5UL
-        let committed, _ = ok (RowStore.commitToStore dir None mgr txn store)
+        let committed, _ = ok (RowStore.commitToStoreWith false dir None mgr txn store)
         let engine = ok (RowStore.ensure committed)
         // 自ハンドルだけなら 12（LastCommitSeqNo 11 + 1）だが、別ハンドルの 5 が下限になる。
         Assert.Equal(5UL, engine.ActiveSnapshot)
@@ -319,7 +324,10 @@ let ``RowStore.commitToStore: 自分の登録は GC 境界から除外する`` (
 
         // 自分（これから commit する transaction）の登録は除外し、他の登録だけを見る。
         let own = ActiveSnapshotRegistry.register dir txn.Snapshot.SeqNo
-        let committed, _ = ok (RowStore.commitToStore dir (Some own) mgr txn store)
+
+        let committed, _ =
+            ok (RowStore.commitToStoreWith false dir (Some own) mgr txn store)
+
         let engine = ok (RowStore.ensure committed)
         Assert.Equal(12UL, engine.ActiveSnapshot)
 

@@ -666,8 +666,6 @@ module internal Engine =
 
             (if isDdl then run () else RootGate.withShared state.Root run) |> finish
 
-    let executeStatement = executeStatementWithLimits ResultLimits.Unlimited
-
     let executeBegin (state: DbState) =
         match state.Active with
         | Some _ -> ret state

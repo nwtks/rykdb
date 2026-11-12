@@ -103,9 +103,6 @@ type internal Database(root: string, state: DbState, ownsStore: bool) =
     /// 実行中の transaction があるか。
     member _.InTransaction = state.Active.IsSome
 
-    /// 現在の WAL 位置（メモリエンジンは None）。
-    member _.WalPosition = state.Store.Engine.WalState
-
     /// WAL の fsync を `Session` のグループコミットに任せる状態を返す。
     /// ハンドルを作らないので ProcessLock の所有者は変わらない。
     member _.StateWithDeferredDurability = { state with DeferDurability = true }
@@ -199,14 +196,6 @@ type internal Database(root: string, state: DbState, ownsStore: bool) =
                 ownsStore
             )
             |> ret
-
-    /// SELECT を materialize せずにストリーミング用の状態として開く。
-    /// 呼び出し側は `SelectStream.Cleanup` を必ず呼ぶ。
-    member _.OpenSelect(stmt: SelectStatement) =
-        if state.Active.IsSome then
-            err (DbError.internalError "transaction 中の SELECT は RowReader で開けません")
-        else
-            Engine.openSelect state stmt
 
     /// 1文だけ実行して、次のハンドルと結果を返す。
     /// <remarks>

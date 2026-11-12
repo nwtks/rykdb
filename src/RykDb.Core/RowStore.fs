@@ -206,8 +206,6 @@ module internal RowStore =
                 return next, manager
             })
 
-    let commitToStore = commitToStoreWith false
-
     /// keyspace から読む（SeqNo 制限つき）。
     let getAt (keyspace: string) (key: byte array) (visible: uint64 option) (store: RowStore) =
         result {

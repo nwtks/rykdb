@@ -47,21 +47,6 @@ module internal Op =
 
         rowsFrom 0
 
-    /// seq を順に返す演算子（遅延）。
-    /// 次の行は呼び出すたびに計算する。
-    /// ソース seq は純粋（副作用なし）であることを前提とする。
-    let ofSeq (rows: seq<SqlValue array>) =
-        let e = rows.GetEnumerator()
-
-        let rec rowsFrom () =
-            if e.MoveNext() then
-                Op.Compute(fun () -> ret (Some(e.Current, rowsFrom ())))
-            else
-                (e :> System.IDisposable).Dispose() |> ignore
-                Op.Done
-
-        rowsFrom ()
-
     /// 1行取り出す。
     let next =
         function

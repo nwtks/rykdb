@@ -137,17 +137,3 @@ let ``Lexer: バイナリリテラルの異常系はエラー`` () =
     bad "X'12" // 閉じていない
     bad "X'123'" // 桁数が奇数
     bad "X'0G'" // 16 進でない文字
-
-[<Fact>]
-let ``Lexer: TokenItem.Describe が全トークン種別を説明する`` () =
-    let d (sql: string) = (tokens sql).[0].Describe
-
-    Assert.Equal("identifier a", d "a")
-    Assert.Equal("quoted identifier c", d "\"c\"")
-    Assert.Equal("keyword SELECT", d "SELECT")
-    Assert.Equal("integer 42", d "42")
-    Assert.Equal("real 3.14", d "3.14")
-    Assert.Equal("string", d "'x'")
-    Assert.Equal("binary", d "X'AB'")
-    Assert.Equal("symbol +", d "+")
-    Assert.Equal("end of statement", d "")

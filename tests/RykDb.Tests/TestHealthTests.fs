@@ -60,9 +60,6 @@ let ``テストデータ: 乱数生成器が実際に多様な値を返す`` () 
 [<System.Runtime.CompilerServices.CompilerGenerated>]
 type TestsMarker = class end
 
-/// Assembly に残るテスト名を確認するためのマーカー。
-type ProgramMarker = class end
-
 [<Fact>]
 let ``テスト: 各テストモジュールが 1つ以上の Fact を持つ`` () =
     // FS0842（[<Fact>] が関数でない let 束縛に付いて黙って無視される）を検知する。

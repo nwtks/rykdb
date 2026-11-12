@@ -235,7 +235,7 @@ match Schema.resolve schema c with
 
 ### 3.4 `Join` の右部分木を捨てると WHERE が消える
 
-`buildLogical` は WHERE を各スキャンの直下へ pushdown して右部分木に持たせる。
+`buildLogicalWith` は WHERE を各スキャンの直下へ pushdown して右部分木に持たせる。
 なのに `exec` は `execScan ctx name method` を呼んで **`rTree` を捨てていた**:
 
 - 右テーブルだけを参照する `WHERE b.v = 100` が効かなくなり、**全行**が返る
@@ -255,14 +255,14 @@ match Schema.resolve schema c with
 入力側へ適用すると NULL 拡張行を残すかどうかの判断が変わるため、JOIN の上で評価する必要がある。
 `WHERE b.v IS NULL`（未一致行だけ残す）は、入力側へ先に適用すると**全行**が残ってしまう。
 
-- 修正: `buildLogical` は INNER だけ pushdown し、LEFT の WHERE は top（JOIN の上）に置く。
+- 修正: `buildLogicalWith` は INNER だけ pushdown し、LEFT の WHERE は top（JOIN の上）に置く。
   どのテーブルにも属さない述語も top に置く。
 - 回帰テスト: `SqlReferenceTests` の `SqlReference: JOIN の WHERE は右テーブルと横断述語に効く` /
   `SqlReference: LEFT JOIN の WHERE は null 供給側に効く`
 
 ### 3.5 入れ子 `Join` に「全スキーマ」を渡すと 3テーブル結合が 0行になる
 
-`buildLogical` は `List.fold` で `Join(Join(a, b), c)` と**左深い木**を組む。
+`buildLogicalWith` は `List.fold` で `Join(Join(a, b), c)` と**左深い木**を組む。
 `exec` が左部分木へ `schema`（全テーブル分）をそのまま渡していたので、
 内側の JOIN は「自分と左のテーブル」ではなく「全テーブル」のスキーマで `ON` 句を解決してしまう。
 
@@ -292,7 +292,7 @@ run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema))
 
 ### 3.6 JOIN の対応付けをテーブル名で探すと自己結合が消える
 
-`buildLogical` は `bindings |> List.findIndex (fun b -> b.RealName = j.Table.Name)` で
+`buildLogicalWith` は `bindings |> List.findIndex (fun b -> b.RealName = j.Table.Name)` で
 「その JOIN 句がどのバインディングか」を探していた。
 `FROM t AS x JOIN t AS y`（自己結合）だと**両方 `RealName = "t"`** なので先頭にヒットし、
 `| idx when idx = 0 -> …` で **JOIN が丸ごと省略**される。
@@ -462,7 +462,7 @@ let nextSeq = engine.NextSeqNo
 
 ### 5.2 reopen 時に SeqNo を再開しないと「全部未来」で見えない
 
-`StorageEngine.openDatabase` はディスク上の最大 SeqNo から `NextSeqNo` を復元する。
+`StorageEngine.openDatabaseWith` はディスク上の最大 SeqNo から `NextSeqNo` を復元する。
 `RowStore.lastSeqNo` を通して `TransactionManager` の `LastCommitSeqNo` を初期化しないと、
 **ディスク上の行がすべて「未来」** と判定されて **0行**になる。
 
@@ -1072,23 +1072,21 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
 - `Double.NaN` は .NET では符号ビットが立っている。
   正の quiet NaN に正規化しないとキー順が壊れる（`SqlValue.normalizeFloat`）。
 
-### 11.7 エスケープ付きフィールドの終端処理は「ピーク分」を戻す
+### 11.7 キー復号を戻すなら「ピーク分」を戻す（現在は削除済み）
 
 `TEXT` / `BLOB` のペイロードは `0x00` を `0x00 0xFF` に escape し、フィールド終端に素の `0x00` を置く。
-デコードは終端 `0x00` の**次を 1 バイトピーク**して、`0xFF` なら escape の続き、
+復号する場合は終端 `0x00` の**次を 1 バイトピーク**して、`0xFF` なら escape の続き、
 それ以外なら「ここがフィールド終端で、ピークしたバイトは次フィールドの先頭」と判定する。
 このときカーソルを**終端バイトを指す位置**（ピーク分を戻す）にしないと、
-`readFirstValue` の終端検証が次フィールドのタグを読んで `終端が不正 (0xXX)` で失敗する。
+終端検証が次フィールドのタグを読んで `終端が不正 (0xXX)` で失敗する。
 
-- 症状: 複合キー（後続フィールドあり）の先頭が `TEXT` / `BLOB` のとき、先頭フィールドの読み取りが失敗する。
-  単一フィールドのキーでは終端が末尾に来て `Cursor.atEnd` の分岐だけを通るため露見しない
-  （src からの `readFirstValue` 呼び出しが無く、テストも単一フィールドのみだったため潜在化していた）。
-- 回帰テスト: `SerializationTests` の `OrderPreserving: 複合キーの先頭フィールドを読める`
+- キー復号（`OrderPreserving.readFirstValue`）は本体から使われず、テスト専用だったため削除した。
+  再導入する場合は、複合キーの先頭フィールドを読む回帰テストを必ず追加する。
 
 ### 11.8 keyspace 横断 commit は 1回の WAL バッチにする
 
 テーブルと索引は論理 keyspace が別だが、物理ツリーと WAL は DB 全体で 1本。
-`RowStore.commitToStore`（内部の `writeBatchesWithSnapshot`）は
+`RowStore.commitToStoreWith`（内部の `writeBatchesWithSnapshot`）は
 全 keyspace のエントリに接頭辞を付けて **1つの `Entry array`** にまとめ、
 `StorageEngine.writeBatch` を 1回だけ呼ぶ。
 WAL には `Begin / Batch / Commit` が 1回の `Wal.append` で書かれるため、
@@ -1167,7 +1165,7 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 **末尾の書きかけ**だけを読み飛ばす。
 `CURRENT` の指す manifest が無い場合や、`CURRENT` が無い/空なのに `*.sst` が残っている場合もエラーにする。
 
-- 空の Version を返すと `StorageEngine.openDatabase` が全 SSTable を孤児として扱い、**データが見えなくなる**。
+- 空の Version を返すと `StorageEngine.openDatabaseWith` が全 SSTable を孤児として扱い、**データが見えなくなる**。
 - 孤児は削除せず `<root>/.orphans/` へ退避する（`quarantineOrphans`）。
   manifest を読み落としただけのケースでも実体は復元できる。
 - 末尾の書きかけを許容するのは、`logAndApply` の `fs.Write` + `Flush(true)` が途中で切れた場合のため。
@@ -1274,7 +1272,7 @@ DDL だけはプロセス内で排他にする必要がある。
 ### 11.18 `LIMIT` / `OFFSET` は 0 以上の定数式
 
 非リテラルを `0` に丸めると `LIMIT 1+0` が **0 行** になる（かつてドキュメントは「制限なし」と書いていた）。
-現在の `Optimizer.buildLogical` 内の `applyLimit` は定数式を `Eval.eval Schema.empty [||]` で評価し、
+現在の `Optimizer.buildLogicalWith` 内の `applyLimit` は定数式を `Eval.eval Schema.empty [||]` で評価し、
 行ごとの列参照・負数・`Int32.MaxValue` 超をエラーにする。
 `Limit` ノードの `limit = -1` が「LIMIT なし」、`0` は 0行。
 
@@ -1317,7 +1315,9 @@ DDL だけはプロセス内で排他にする必要がある。
 - キャッシュは弱参照なので、メモリが逼迫すれば GC が回収する（LRU ではない）。
 - キーはファイル世代ごとに増えるため、`put` がキー数 512 ごとに死んだ弱参照（GC 済み）を辞書から外す。
   生きた参照は実行中の走査が使うので残す。
-  回帰テストは `SstPartialCache: 掃除は死んだ弱参照だけを外し、生きた参照は残す`。
+  ファイル差し替え後の再読み込みは
+  `StorageEngine.getAt / scanAt: 必要なブロックだけを部分読みする` で確認する
+  （弱参照の掃除自体の専用テストは無い）。
 - 欠落ファイルはキー計算（`FileInfo.Length`）の時点で IoError になる。
 
 ### 11.23 DISTINCT / GROUP BY のキーは文字列化しない
@@ -1338,7 +1338,7 @@ DDL だけはプロセス内で排他にする必要がある。
 そのため、limit で到達しない後続 SSTable / ブロックの破損・欠落はそのクエリでは検出されない
 （全件走査でも必要になった時点で検出し、クエリは結果を返さない）。
 これは「先頭 limit 件に寄与しないデータは読まない」という最適化の副作用。
-`openDatabase` は `FileMetaData.MaxSeqNo` を使うため起動時にデータブロックを読まない。
+`StorageEngine.openDatabaseWith` は `FileMetaData.MaxSeqNo` を使うため起動時にデータブロックを読まない。
 したがって起動時にも検出されない。
 全件を読むクエリ（`limit = 0`）で、そのファイルに到達した時点で検出する。
 
@@ -1384,7 +1384,7 @@ Footer は Meta / Bloom / Index の連続領域を守る `metadataChecksum` と�
 
 ### 11.28 `Op` は one-shot — `Op.next cur` の後の `cur` を再利用しない
 
-`Op.ofSeq` は共有の enumerator を進めながら行を返す。
+`Op` は one-shot な値で、行を 1つ進めると次の状態 `nxt` が返る。
 `Op.next cur` を呼んだ後、返り値の `nxt` ではなく `cur` をもう一度 `Op.next` すると、
 **先頭行ではなく次の行**が返る。
 transaction の overlay（store の行 + txn のスロット）で `cur` を再利用してしまい、
@@ -1436,7 +1436,7 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 
 `Schema.expandStar` は修飾子に一致する列が 0件でも `Some(true, [])` を返す。
 そのままだと `SELECT nope.* FROM t` が「0列・1行」で成功し、列の無い結果を静かに返す。
-`Planner.buildLogical` で `Schema.hasQualifier` を検査し、`NameError` にする。
+`Planner.buildLogicalWith` で `Schema.hasQualifier` を検査し、`NameError` にする。
 
 - 回帰テスト: `SqlReference: FROM に無い t.* は NameError`。
 
@@ -1581,8 +1581,7 @@ active な transaction が無ければ境界は `commitSeq + 1` になり、comm
 - 実測（2列・TEXT 48文字）: 20,000行で実測 7.8MiB / 見積り 6.7MiB（約 1.2倍）。
   200,000行では 64MiB を超えて commit 中に flush され、memtable の保持はほぼ 0 になった。
 - 回帰テスト: `Memtable: Count と ApproxBytes は挿入したエントリの合計になる` /
-  `ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの概算` /
-  `Entry.managedBytes: memtable の保持量は符号化サイズより大きい`。
+  `ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの概算`。
 
 ### 11.43 `Wal.append` はフレーム単位で書き出す（全フレームを連結しない）
 
@@ -1608,7 +1607,6 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 - ハッシュ結合の表（バケット）は行配列の後に作られ、行配列は表作りの後に捨てられる
   （ピークは概ね上限の 2倍まで）。
 - `lookupHash` はバケットをそのまま返す（probe ごとの `ToArray` を廃止）。
-- 回帰テスト: `Ops.toArrayWithBudget: 上限を超えると CapacityError`。
 
 ### 11.45 `Sstable.writeTo` は入力を 1回だけ列挙する
 
@@ -1669,8 +1667,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 - ヘッダは解決前の式から作る。
   解決後から作ると `SELECT (SELECT MAX(v) FROM t) FROM t` の列名が `30` のようになる。
 - 集約後の行（`Ops.substituteAggs`）は `Expr.Value` で値を埋め込む。
-  `Literal.ofValue` は DATE / TIMESTAMP / UUID を TEXT にするため、
-  集約結果（`MAX(dt)` など）と DATE 列の比較が `TypeError` になる。
+  DATE / TIMESTAMP / UUID を TEXT に変換すると比較が `TypeError` になるため、リテラル化しない。
 - DML は `Engine.runInsert` / `runUpdate` / `runDelete` が `Plan.resolveDmlExprWith` で解決する
   （UPDATE / DELETE は対象行のスキーマを渡すので外側行を参照できる）。
   `CREATE TABLE ... DEFAULT (SELECT ...)` は解決しない（実行時に `SyntaxError`）。
@@ -1837,7 +1834,7 @@ merge 中に foreground の flush や新しい transaction が入り得る。
 - **worker の開始はリカバリ後**。
   `Database.OpenWithStore` のカタログ読込と DROP 後始末が終わってから `RowStore.startBackground` を呼ぶ。
   先に動かすと、リカバリの走査中に入力ファイルが retired / 削除され得る。
-- 回帰テスト: `background compaction: flush 後に L0 がbackgroundで compaction される` /
+- 回帰テスト: `background compaction: flush 後に L0 が background で compaction される` /
   `background compaction: compaction 中でも次の write が返る` /
   `background compaction: 読み取り中のファイルは削除されず、lease 解放後に削除される` /
   `background compaction: close は進行中の compaction を停止して再オープンできる` /
@@ -1899,10 +1896,10 @@ worker は `signal.Wait()` でブロックし続ける長寿命タスクなの�
 ✅ `TaskCreationOptions.LongRunning` で専用スレッドを起こす。
 スレッドプールの可用性に依存しない。
 
-- 起動が遅れているときの診断は `EngineHost.Activity` と `EngineHost.WorkerStatus`。
-  `WorkerStatus = WaitingToRun` かつ `Activity = Pending` なら未スケジュールが原因で、
-  `ThreadPool.PendingWorkItemCount` を見るとプールの枯渇が分かる。
-  `L0=4`（トリガ条件は満たされている）なのに compaction が動かない、という切り分けになる。
+- 現在の診断は `EngineHost.IsIdle` と `EngineHost.Current.LastCompactionError`。
+  `L0=4`（トリガ条件は満たされている）なのに compaction が動かない場合は、
+  worker が signal を処理中か、失敗が `LastCompactionError` に記録されているかを確認する。
+  `LongRunning` 化後は、スレッドプール枯渇による `WaitingToRun` は原因にならない。
 - `LongRunning` のスレッドは background thread なので、
   store を閉じ忘れた worker が残っていてもプロセス終了は妨げない。
 

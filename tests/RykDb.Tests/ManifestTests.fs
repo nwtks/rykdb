@@ -22,7 +22,7 @@ let ``Manifest: 新規作成と CURRENT の内容`` () =
     withDir "manifest-new" (fun dir ->
         let version, manifestNumber = ok (Manifest.openOrCreate dir)
         Assert.Equal(1L, manifestNumber)
-        Assert.Equal<int array>([| 0; 0; 0; 0; 0; 0; 0 |], Version.levelCounts version))
+        Assert.Equal<int array>([| 0; 0; 0; 0; 0; 0; 0 |], levelCounts version))
 
 [<Fact>]
 let ``Manifest: 変更を反映して再オープンしても復元できる`` () =
@@ -30,15 +30,24 @@ let ``Manifest: 変更を反映して再オープンしても復元できる`` (
         let v0, manifestNumber = ok (Manifest.openOrCreate dir)
         let v1 = applyEdit dir manifestNumber v0 (VersionEdit.addFile (fmd 1L 0 100 199))
         let v2 = applyEdit dir manifestNumber v1 (VersionEdit.addFile (fmd 2L 1 100 199))
-        let v3 = applyEdit dir manifestNumber v2 (VersionEdit.deleteFile (fmd 1L 0 100 199))
+
+        let v3 =
+            applyEdit
+                dir
+                manifestNumber
+                v2
+                {
+                    AddedFiles = []
+                    DeletedFiles = [ fmd 1L 0 100 199 ]
+                }
         // v2 はまだ L0 に file1 がある。v3 で削除されている
-        Assert.Equal<int array>([| 1; 1; 0; 0; 0; 0; 0 |], Version.levelCounts v2)
-        Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts v3)
+        Assert.Equal<int array>([| 1; 1; 0; 0; 0; 0; 0 |], levelCounts v2)
+        Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], levelCounts v3)
 
         // 再オープンで同じ Version に戻る
         let reopened, manifestNumber2 = ok (Manifest.openOrCreate dir)
         Assert.Equal(manifestNumber, manifestNumber2)
-        Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts reopened)
+        Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], levelCounts reopened)
         // 復元されたファイルの番号とキー範囲も一致する
         let restored = (Version.filesAt 1 reopened).[0]
         Assert.Equal(2L, restored.FileNumber)
@@ -58,7 +67,7 @@ let ``Manifest: 同じ CURRENT をもう一度開いても状態は変わらな�
         let v1, mn1 = ok (Manifest.openOrCreate dir)
         Assert.Equal(mn0, mn1)
         Assert.Empty(Version.allFiles v1)
-        Assert.Equal<int array>(Version.levelCounts v0, Version.levelCounts v1))
+        Assert.Equal<int array>(levelCounts v0, levelCounts v1))
 
 [<Fact>]
 let ``Manifest: 末尾の書きかけレコードは読み飛ばす`` () =
@@ -70,7 +79,7 @@ let ``Manifest: 末尾の書きかけレコードは読み飛ばす`` () =
 
         // 末尾だけなので読み飛ばし、1 件目までの状態が残る
         let reopened, _ = ok (Manifest.openOrCreate dir)
-        Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], Version.levelCounts reopened))
+        Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], levelCounts reopened))
 
 [<Fact>]
 let ``Manifest: 途中の壊れたレコードは CorruptionError`` () =
@@ -113,7 +122,7 @@ let ``Manifest: 空行は読み飛ばす`` () =
         File.AppendAllText(Path.Combine(dir, "MANIFEST-000001"), "\n")
 
         let reopened, _ = ok (Manifest.openOrCreate dir)
-        Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], Version.levelCounts reopened))
+        Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], levelCounts reopened))
 
 [<Fact>]
 let ``Manifest: 空の CURRENT は新規作成として扱う`` () =

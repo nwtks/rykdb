@@ -25,21 +25,6 @@ type internal Literal =
         | String s -> SqlValue.Text s
         | Blob b -> SqlValue.Blob b
 
-module internal Literal =
-    /// 実行時値からリテラル表示へ（DDL 再構築とエラー表示に使う）。
-    let ofValue =
-        function
-        | SqlValue.Null -> Literal.Null
-        | SqlValue.Bool b -> Literal.Bool b
-        | SqlValue.Int i -> Literal.Int i
-        | SqlValue.Real f -> Literal.Real f
-        | SqlValue.Decimal d -> Literal.Decimal d
-        | SqlValue.Text s -> Literal.String s
-        | SqlValue.Blob b -> Literal.Blob b
-        | SqlValue.Date d -> Literal.String(d.ToString "yyyy-MM-dd")
-        | SqlValue.Timestamp t -> Literal.String(t.UtcDateTime.ToString "yyyy-MM-ddTHH:mm:ss.fffffffZ")
-        | SqlValue.Uuid g -> Literal.String(g.ToString "D")
-
 /// 列参照。
 /// 修飾子の有無を区別したまま保持し、束縛時に解決する。
 type internal ColumnRef =

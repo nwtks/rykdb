@@ -157,8 +157,8 @@ flowchart TB
 
 > **Transactions と RowStore の依存方向**: `Transactions.fs` は `RowStore` を参照しない。
 > 依存は **`Dml` / `RowStore` → `Transactions` → `Memtable`** の向きで、
-> `Dml.fs` の DML ヘルパ（`insert` / `updateRow` / `deleteRow`）が `Transaction` のバッファへ行・索引を積む。
-> commit 時に `TransactionManager.commit` の出力を `RowStore.commitToStore` に渡すのは `Engine`（§7.5）。
+> `Dml.fs` の DML ヘルパ（`insertWithKey` / `updateRow` / `deleteRow`）が `Transaction` のバッファへ行・索引を積む。
+> commit 時に `TransactionManager.commit` の出力を `RowStore.commitToStoreWith` に渡すのは `Engine`（§7.5）。
 
 ### なぜ不変（immutable）か
 
@@ -374,14 +374,14 @@ escape の正しさをバイト列で確認した例（フィールド `["ab", "
 ```mermaid
 flowchart LR
     AST["SelectStatement"] --> B["Analyzer.bindTable<br/>名前束縛"]
-    B --> L["buildLogical<br/>論理代数（走査方法もここで決定）"]
+    B --> L["buildLogicalWith<br/>論理代数（走査方法もここで決定）"]
     L --> E["Optimizer.exec<br/>Op の組み立て"]
 ```
 
 パイプラインの実装は `Analyzer.fs` と `Planner.fs` の 3段。
 
 1. `Analyzer.bindTable` — FROM / JOIN の各テーブルを `TableBinding`（スキーマ + 識別名）にする。
-2. `Optimizer.buildLogical` — 式を `Binder.qualify` で束縛し、`Predicate.splitConjuncts` で WHERE を分解、
+2. `Optimizer.buildLogicalWith` — 式を `Binder.qualify` で束縛し、`Predicate.splitConjuncts` で WHERE を分解、
    `Analyzer.chooseScanMethod` で走査方法を決めて論理代数を組む。
 3. `Optimizer.exec` — 論理代数を `Op` に変換する（`execScan` / `execJoin` など）。
 
@@ -464,7 +464,7 @@ flowchart LR
   列の修飾子は**別名**（`x.id`）になり、比較は大文字小文字を区別しない。
 - WHERE は `Predicate.splitConjuncts` で AND を平坦化してから扱う。
 
-#### 論理代数の構築（buildLogical）
+#### 論理代数の構築（buildLogicalWith）
 
 1. `FROM` は省略できる（入力は 1行 0列の `Logical.Values`）。
    `JOIN` には `FROM` が必要で、Parser が `JOIN には FROM が必要です` にする。
@@ -587,7 +587,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
   `limit = -1` が「LIMIT なし」、`limit = 0` は 0 行。
 - 最後に `Engine.runSelect` が `Op.toArrayLimited` で行を集め
   （`Plan.runSelect` は列名と未消費の `Op` を返すだけ）、
-  ヘッダは `Schema.projectHeader`（別名優先、`*` は列名）で組み立てる。
+  ヘッダは `Schema.projectColumns`（別名優先、`*` は列名）で組み立てる。
   `*` / `t.*` の列展開は `Schema.expandStar` に一本化している
   （ヘッダと射影の式が同じ列を共有するため）。
   `*` は修飾なしの列名、`t.*` は修飾つきの表示名で出す。
@@ -619,7 +619,7 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 
 | 演算子                                           | 役割                                         |
 | ------------------------------------------------ | -------------------------------------------- |
-| `Op.ofArray` / `ofSeq` / `ofRow`                 | 材料化済み・遅延 seq・1行の源                |
+| `Op.ofArray` / `Op.ofRow`                       | 材料化済み・1行の源                          |
 | `Op.map` / `filter`                              | 1 対 1 / 1 対 0 の変換                       |
 | `Ops.project`                                    | 射影（`*` / `t.*` の展開を含む）             |
 | `Ops.sortBy`                                     | ソート（外部マージ。§5.3）                   |
@@ -726,7 +726,7 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 DML は pull 演算子ではなく、`Transaction` を積み上げて件数を返す実行関数（§9.2）。
 
 - `insert` — 列順・`DEFAULT` / `NULL` の充足・`SqlValue.coerce` による型強制を行い、
-  行ごとに `Dml.insert` でバッファへ積む（最終確認は `TableSchema.validateRow`）。
+  行ごとに `Dml.insertWithKey` でバッファへ積む（最終確認は `TableSchema.validateRow`）。
 - `update` — 全行をスキャンして WHERE を評価し、代入式は「現在の行」で評価して `Dml.updateRow` へ。
   **主キー列の書き換えは未対応**（`sql-reference.md` 参照）。
 - `delete` — 全行をスキャンし、WHERE に合う行の**主キー + 全索引に tombstone** を書く。
@@ -890,7 +890,7 @@ BEGIN
 COMMIT
   ├─ TransactionManager.commit → 競合検出 → WriteBatch
   ├─ TransactionManager.activeSnapshot → GC 境界
-  └─ RowStore.commitToStore
+  └─ RowStore.commitToStoreWith
        └─ 全 keyspace のエントリを接頭辞付きで 1本の StorageEngine.writeBatch へ
             ├─ Wal.append (Begin/Batch/Commit)
             └─ Memtable.apply
@@ -919,7 +919,7 @@ DROP はカタログ削除前に `.drop-cleanup` ジャーナルを書き、後�
 ### 7.5 commit の原子性と ActiveSnapshot
 
 物理ツリーが 1本なので、1トランザクションがテーブル・索引・カタログのどれに書いても、
-`RowStore.commitToStore` は全エントリを接頭辞付きの **1つの `Entry array`** にまとめ、
+`RowStore.commitToStoreWith` は全エントリを接頭辞付きの **1つの `Entry array`** にまとめ、
 `StorageEngine.writeBatch` へ 1回だけ渡す。
 WAL には `Begin / Batch / Commit` が 1回の `Wal.append` で書かれるため、
 「テーブルは書けたが索引は書けていない」状態は発生しない。
@@ -1181,7 +1181,7 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | ポイント検索の順路       | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                                            |
 
 ファイルは `Sstable.writeTo` が v5 形式をブロック単位でストリームへ書き出す
-（`Sstable.build` はテスト用に `MemoryStream` 経由で同じ処理を呼ぶ）。
+（テストの `buildSstable` は `MemoryStream` 経由で同じ処理を呼ぶ）。
 入力は `seq` で **1回だけ列挙**し、
 キー順の検証・先頭/末尾キー・`maxSeqNo`・Bloom 用のキーは書き出しと同時に集める
 （memtable の flush が全件を `SstEntry` 配列にしない）。
@@ -1212,7 +1212,7 @@ Footer は `metadataChecksum`（Meta / Bloom / Index）と自身のチェック�
 `put` がキー数 512 ごとに**死んだ弱参照だけ**を掃除する
 （生きた参照は実行中の走査が使うので残す）。
 
-`openDatabase` は `FileMetaData.MaxSeqNo` から NextSeqNo を、
+`StorageEngine.openDatabaseWith` は `FileMetaData.MaxSeqNo` から NextSeqNo を、
 WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
 起動時に SSTable のデータブロックを読まない。
 
@@ -1300,7 +1300,7 @@ checksum は本体全体の FNV-1a。
 
 復旧時は `applyAll` が `Version.Empty` から VersionEdit 列を再適用して Version を作り直すため、
 `NextFileNumber` は 1 に戻る。
-`openDatabase` が `maxFileNumberOnDisk + 1` まで進め直すのはこのため（§8.3）。
+`StorageEngine.openDatabaseWith` が `maxFileNumberOnDisk + 1` まで進め直すのはこのため（§8.3）。
 
 ### 8.5 WAL — 論理ログ
 
@@ -1473,7 +1473,7 @@ SQL 文字列
   → Lexer.tokenize          トークン列
   → Parser.parseStatements  Statement list
   → Analyzer.bindTable      名前束縛（修飾子を解決）
-  → Optimizer.buildLogical  論理代数
+  → Optimizer.buildLogicalWith  論理代数
   → 物理化                 走査方法・結合アルゴリズムを決定
   → Ops / Optimizer         Op の木
   → Engine.runSelect        Op.toArrayLimited で結果行
@@ -1490,11 +1490,11 @@ SQL 文字列
 3. commit 時:
    ├─ TransactionManager.commit → 競合検出（first-committer-wins）
    ├─ Transaction.toEntries    → WriteBatch
-   └─ RowStore.commitToStore（内部の writeBatchesWithSnapshot）
+   └─ RowStore.commitToStoreWith（内部の writeBatchesWithSnapshot）
         └─ 全 keyspace のエントリを接頭辞付きで 1回の StorageEngine.writeBatch へ
              ├─ Wal.append (Begin/Batch/Commit)
              └─ Memtable.apply
-4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.applyBatches` が `WriteBatch` 後に `MaybeFlush` を呼ぶ。memtable が上限未満なら何もしない）
+4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.writeBatchesWithSnapshotWith` が `WriteBatch` 後に `MaybeFlush`（background 有効時は `FlushIfNeeded`）を呼ぶ。memtable が上限未満なら何もしない）
 5. レベルが閾値を超えたら compact する。
    `Session.OpenWith` では flush 後に `EngineHost.Signal` で background worker を起こし、
    `Database.OpenWith` では `maybeFlush` が同期的に `compactOnce` を呼ぶ。
@@ -1510,10 +1510,10 @@ flush / compact は `RowStore` が `WriteBatch` 後に `IStorageEngine.MaybeFlus
 
 ```
 Session.OpenWith root
-  → Database.OpenWith root           internal の不変ハンドルを作る
-  → RowStore.openStore root          root を作成し、.rykdb.format を排他で開く
+  → Database.OpenWithBackground root  background compaction 有効の internal ハンドルを作る
+  → RowStore.openStoreWithBackground root  root を作成し、.rykdb.format を排他で開く
       ├─ ensureFormat                開いた .rykdb.format を検証 / 新規作成
-      └─ StorageEngine.openDatabase  ルート直下の LSM ツリーを開く
+      └─ StorageEngine.openDatabaseWith  ルート直下の LSM ツリーを開く
            ├─ Manifest.openOrCreate  CURRENT を読む / なければ作る
            ├─ dropMissingFiles       MANIFEST が参照するファイルが無いなら除去
            ├─ quarantineOrphans      MANIFEST が参照しない SSTable を .orphans/ へ退避
@@ -1523,7 +1523,10 @@ Session.OpenWith root
   → TransactionManager.create
   → DropCleanupRecovery.recover      カタログに無い keyspace の DROP 後始末を再開
   → RowStore.lastSeqNo               ディスク上の最大 SeqNo を採る
+  → RowStore.startBackground         compaction worker を開始する
 ```
+
+テスト・内部用の `Database.OpenWith` は `RowStore.openStore` を使う同期 compaction 版である（§8.7）。
 
 ### 9.4 閉じるとき
 

@@ -52,7 +52,7 @@ let piecesOf (input: string) =
 
     loop 0 false
 
-let splitStatements = piecesOf >> Array.toList
+let private splitStatements = piecesOf >> Array.toList
 
 let private writeResult (out: TextWriter) (r: StatementResult) =
     r.ToDisplayLines() |> List.iter out.WriteLine

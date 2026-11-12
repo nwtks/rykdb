@@ -79,14 +79,14 @@ let ``Version.addFile: ファイル追加でレベル構成が変わる`` () =
         |> Version.addFile (fmd 2L 1 100 199)
         |> Version.addFile (fmd 3L 2 0 99)
 
-    Assert.Equal<int array>([| 1; 1; 1; 0; 0; 0; 0 |], Version.levelCounts v)
+    Assert.Equal<int array>([| 1; 1; 1; 0; 0; 0; 0 |], levelCounts v)
 
 [<Fact>]
 let ``Version.addFile: 追加は破壊的でない`` () =
     let v0 = Version.Empty
     let v1 = Version.addFile (fmd 1L 0 100 199) v0
-    Assert.Equal(0, (Version.levelCounts v0).[0])
-    Assert.Equal(1, (Version.levelCounts v1).[0])
+    Assert.Equal(0, (levelCounts v0).[0])
+    Assert.Equal(1, (levelCounts v1).[0])
     // v0 に後から v1 のファイルは見えない
     Assert.Empty(Version.filesAt 0 v0)
     Assert.Equal(1, (Version.filesAt 0 v1).Length)
@@ -99,7 +99,7 @@ let ``Version.deleteFiles: 削除でレベル構成が変わる`` () =
         |> Version.addFile (fmd 2L 1 100 199)
         |> Version.deleteFiles [ fmd 1L 0 100 199 ]
 
-    Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts v)
+    Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], levelCounts v)
 
 [<Fact>]
 let ``Version.filesForPointLookup: ポイントルックアップの候補は新しい順`` () =
@@ -147,14 +147,21 @@ let ``VersionEdit.apply: 変更適用は削除後に追加する`` () =
                 DeletedFiles = [ oldFile ]
             }
 
-    Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], Version.levelCounts updated)
+    Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], levelCounts updated)
     Assert.Equal(1L, (Version.filesAt 1 updated).[0].FileNumber)
 
 [<Fact>]
 let ``VersionEdit.encode / decode: エンコードの往復`` () =
     let added = fmd 3L 1 300 350
     let deleted = fmd 1L 0 100 199
-    let edit = compose (VersionEdit.addFile added) (VersionEdit.deleteFile deleted)
+
+    let edit =
+        compose
+            (VersionEdit.addFile added)
+            {
+                AddedFiles = []
+                DeletedFiles = [ deleted ]
+            }
 
     match ok (VersionEdit.decode (VersionEdit.encode edit)) with
     | [ e ] ->

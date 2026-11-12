@@ -303,15 +303,6 @@ module internal Catalog =
                 Indexes = []
             })
 
-    /// IndexSchema を永続化形にする。
-    let toIndexDefinition (table: string) (index: IndexSchema) =
-        {
-            IndexName = index.Name
-            TableName = table
-            Columns = index.Columns
-            Unique = index.Unique
-        }
-
     /// 永続化形を IndexSchema に戻す。
     let toIndexSchema (i: IndexDefinition) =
         {
@@ -617,7 +608,7 @@ module internal Schema =
     /// `*` / `t.*` が表す出力列を展開する。
     /// どちらもなければ None。
     /// <remarks>
-    /// ヘッダ行（projectHeader）と射影の式（Ops.project）が同じ列を共有する。
+    /// ヘッダ行（projectColumns）と射影の式（Ops.project）が同じ列を共有する。
     /// どちらかが先に変わると `SELECT *` の列数とヘッダがずれる（実際にずれた）。
     /// Expr は `[<NoComparison>]` なので「どちらの star だったか」は別のフラグで返す
     /// （qualified = `t.*` なら true）。
@@ -769,7 +760,3 @@ module internal Schema =
     /// `SELECT t.id` の列名を `t.id` ではなく `id` にする。
     /// 派生テーブルの列名に使う（外側から `x.id` で引けるようにするため）。
     let referenceColumns = projectedColumns false
-
-    /// 射影後のヘッダ行を作る（結果表示用の列名）。
-    let projectHeader (schema: Schema) =
-        projectColumns schema >> Array.map (fun c -> c.Display)

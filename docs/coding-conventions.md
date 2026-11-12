@@ -60,7 +60,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `Session` の `let mutable local` / `let mutable closed` / `let mutable readers`:
   接続ローカルの transaction 状態、Close 状態、実行中の読み取り数を保持する。
 - `SessionPool` の `let mutable closed`: 新しい接続を受け付けるかを保持する。
-- `RowReader` の `current` / `rowsRead` / `closed` / `exhausted`:
+- `RowReader` の `current` / `closed` / `exhausted`:
   ストリーミング SELECT の読み取り位置と解放状態を保持する。
   `Session.fs` 内に閉じる。
 - `lock stateGate`: `committed` / `closed` / `readers` を保護する短いロック。

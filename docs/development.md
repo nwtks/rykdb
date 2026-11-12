@@ -96,8 +96,8 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 - 1テスト = 1関数。
   `let ``説明`` () = ...` の**関数形**
   （FS0842: 関数でない場合、テストとして認識されず無視される）。
-- 共通ヘルパー（`ok` / `withDir` / `asInt` / 乱数生成）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
-  ファイル固有の fixture（スキーマなど）は各ファイルに private で置く。
+- 共通ヘルパー（`ok` / `withDir` / `asInt` / 乱数生成 / `buildSstable` / `scanOfEntries` / `levelCounts` / `indexDefinition`）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
+  ファイル固有のヘルパー・fixture（スキーマ、`DmlTests` の `insertRow` など）は各ファイルに private で置く。
 - `withStore` / `withDb` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
   ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Database.OpenWith` を直接使って検証する。
 - 新しいファイルは `.fsproj` の Compile 順（= src のコンパイル順）に追加する。

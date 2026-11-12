@@ -47,13 +47,6 @@ type SessionOptions =
             MaxResultBytes = 256L * 1024L * 1024L
         }
 
-    /// 上限なし（既存の Database API と同じ挙動）。
-    static member Unlimited =
-        {
-            MaxResultRows = System.Int64.MaxValue
-            MaxResultBytes = System.Int64.MaxValue
-        }
-
     static member internal Validate(options: SessionOptions) =
         if options.MaxResultRows < 0L then
             DbError.capacity "MaxResultRows は 0 以上でなければなりません" |> err
@@ -72,7 +65,6 @@ type private ResultBudget = { RowsLeft: int64; BytesLeft: int64 }
 /// </remarks>
 type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
     let mutable current = op
-    let mutable rowsRead = 0L
     let mutable closed = false
     let mutable exhausted = false
 
@@ -83,9 +75,6 @@ type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
 
     /// 列名。
     member _.Columns = columns
-
-    /// これまでに返した行数。
-    member _.RowsRead = rowsRead
 
     /// 次の行を読む。
     /// 終端では `Ok None` を返し、リソースを自動で解放する。
@@ -106,7 +95,6 @@ type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
                 ret None
             | Ok(Some(row, nxt)) ->
                 current <- nxt
-                rowsRead <- rowsRead + 1L
                 ret (Some row)
 
     override this.Finalize() =
@@ -302,9 +290,6 @@ type internal DatabaseHost(root: string, owner: Database) =
             | Error e -> err e
             | Ok() -> outcome
         | None -> outcome
-
-    /// DB のルートディレクトリ。
-    member _.Root = root
 
     /// 現在の committed state。
     member _.Committed = lock stateGate (fun () -> committed)

@@ -50,6 +50,20 @@ let withDir (tag: string) (f: string -> unit) =
             with _ ->
                 ()
 
+/// 純粋な seq を SstScan に変換する。
+let scanOfEntries (items: seq<SstEntry>) =
+    let e = items.GetEnumerator()
+
+    let rec loop () =
+        SstScan(fun () ->
+            if e.MoveNext() then
+                ret (Some(e.Current, loop ()))
+            else
+                (e :> System.IDisposable).Dispose() |> ignore
+                ret None)
+
+    loop ()
+
 /// テスト用メモリエンジンの keyspace ごとの永続状態。
 /// ディスクの WAL replay 相当で、store を作り直しても内容が見える。
 type private MemoryEngineState() =
@@ -91,7 +105,7 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
                 |> Seq.filter (fun e -> e.Value.IsSome)
 
             (if limit > 0 then Seq.truncate limit entries else entries)
-            |> SstScan.ofSeq
+            |> scanOfEntries
             |> ret
 
         member _.WriteBatch entries =
@@ -395,3 +409,27 @@ let fmd (num: int64) (level: int) (lo: int) (hi: int) : FileMetaData =
         Size = int64 (hi - lo + 1) * 100L
         MaxSeqNo = uint64 (hi + 1)
     }
+
+/// レベルごとのファイル数。
+let levelCounts (v: Version) = v.Files |> Array.map Array.length
+
+/// IndexSchema を永続化形にする。
+let indexDefinition (table: string) (index: IndexSchema) : IndexDefinition =
+    {
+        IndexName = index.Name
+        TableName = table
+        Columns = index.Columns
+        Unique = index.Unique
+    }
+
+/// エントリ列から SSTable のバイナリを作る。
+let buildSstable (bloomFalsePositiveRate: float) (entries: SstEntry array) =
+    let build () =
+        use stream = new System.IO.MemoryStream()
+
+        Sstable.writeTo stream bloomFalsePositiveRate entries
+        |> Result.map (fun _ -> stream.ToArray())
+
+    match protect build with
+    | Ok result -> result
+    | Error e -> Error e

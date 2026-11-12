@@ -126,7 +126,7 @@ let private handleClientSession (onLog: string -> unit) (session: Session) (clie
             | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
             | Ok result -> sendResult result
         | Ok(Some rowReader) ->
-            use rowReader = rowReader
+            use _ = rowReader
             let header = sprintf "%s%s" StreamTag (columnsSuffix rowReader.Columns)
 
             if not (send header) then

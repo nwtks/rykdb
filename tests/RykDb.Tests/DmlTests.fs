@@ -58,6 +58,10 @@ let private usersWithEmailIndex =
 let private rowOf (id: int) (email: string) (age: int) =
     [| SqlValue.Int(int64 id); SqlValue.Text email; SqlValue.Int(int64 age) |]
 
+/// 主キーを計算して 1行を transaction に積む。
+let private insertRow (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
+    Dml.insertWithKey (RowKey.primary schema row) txn schema row
+
 /// transaction のバッファを DB に流し込む。
 let private commitInto (store: RowStore) (nextSeq: uint64) (txn: Transaction) =
     let batches = Transaction.toEntries nextSeq txn |> fst
@@ -79,7 +83,7 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる`` () =
         let txn =
             [ 1; 2; 3 ]
             |> List.fold
-                (fun t i -> Dml.insert t usersWithEmailIndex (rowOf i (sprintf "u%d@example.com" i) i) |> ok)
+                (fun t i -> insertRow usersWithEmailIndex t (rowOf i (sprintf "u%d@example.com" i) i) |> ok)
                 txn
 
         commitInto store 1UL txn
@@ -101,7 +105,7 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる（limit）`` ()
         let txn =
             [ 1; 2; 3; 4 ]
             |> List.fold
-                (fun t i -> Dml.insert t usersWithEmailIndex (rowOf i (sprintf "u%d@example.com" i) i) |> ok)
+                (fun t i -> insertRow usersWithEmailIndex t (rowOf i (sprintf "u%d@example.com" i) i) |> ok)
                 txn
 
         commitInto store 1UL txn
@@ -112,7 +116,7 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる（limit）`` ()
         Assert.Equal(2, rows.Length))
 
 [<Fact>]
-let ``Dml.insert: NOT NULL 制約違反は弾かれる`` () =
+let ``Dml.insertWithKey: NOT NULL 制約違反は弾かれる`` () =
     let notNull =
         { ColumnConstraint.Empty with
             NotNull = true
@@ -134,10 +138,10 @@ let ``Dml.insert: NOT NULL 制約違反は弾かれる`` () =
     let _, txn = TransactionManager.beginTxn mgr
     // email が NULL
     let bad = [| SqlValue.Int 1L; SqlValue.Null; SqlValue.Int 20L |]
-    expectErrorKind ErrorKind.ConstraintViolation "NOT NULL 制約違反を検出できなかった" (Dml.insert txn schema bad)
+    expectErrorKind ErrorKind.ConstraintViolation "NOT NULL 制約違反を検出できなかった" (insertRow schema txn bad)
 
 [<Fact>]
-let ``Dml.insert: transaction 上限を超えると CapacityError`` () =
+let ``Dml.insertWithKey: transaction 上限を超えると CapacityError`` () =
     let txn =
         { Transaction.create 1UL { SeqNo = 0UL } with
             LimitBytes = 1L
@@ -146,14 +150,14 @@ let ``Dml.insert: transaction 上限を超えると CapacityError`` () =
     expectErrorKind
         ErrorKind.CapacityError
         "transaction 上限を超えた INSERT を検出できなかった"
-        (Dml.insert txn usersSchema (rowOf 1 "a@x.com" 1))
+        (insertRow usersSchema txn (rowOf 1 "a@x.com" 1))
 
 [<Fact>]
-let ``Dml.insert: 列数が違う行は弾かれる`` () =
+let ``Dml.insertWithKey: 列数が違う行は弾かれる`` () =
     let mgr = TransactionManager.create ()
     let _, txn = TransactionManager.beginTxn mgr
 
     expectErrorKind
         ErrorKind.ConstraintViolation
         "列数不一致を検出できなかった"
-        (Dml.insert txn usersWithEmailIndex [| SqlValue.Int 1L |])
+        (insertRow usersWithEmailIndex txn [| SqlValue.Int 1L |])

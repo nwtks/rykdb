@@ -329,7 +329,7 @@ let ``Catalog.removeIndex: removeIndex は指定した索引だけ消す`` () =
 let ``Catalog: 保存したカタログを読み込める`` () =
     withStore "cat1" (fun store ->
         let people = Catalog.toDefinition peopleSchema
-        let ix = Catalog.toIndexDefinition "people" peopleSchema.Indexes.[0]
+        let ix = indexDefinition "people" peopleSchema.Indexes.[0]
 
         let c =
             people |> Catalog.addTable Catalog.Empty |> fun c -> ix |> Catalog.addIndex c
@@ -514,20 +514,24 @@ let ``Schema.expandStar: t.* は修飾一致のみ`` () =
     | other -> Assert.Fail(sprintf "expandStar t.* が想定外: %A" other)
 
 [<Fact>]
-let ``Schema.projectHeader: * は入力列名`` () =
+let ``Schema.projectColumns: * は入力列名`` () =
     let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
-    let h = Schema.projectHeader s [ { Expression = Expr.Star; Alias = None } ]
+
+    let h =
+        Schema.projectColumns s [ { Expression = Expr.Star; Alias = None } ]
+        |> Array.map (fun c -> c.Display)
+
     Assert.Equal<string array>([| "id" |], h)
 
 [<Fact>]
-let ``Schema.projectHeader: 空なら入力ヘッダ / t.* は修飾つき`` () =
+let ``Schema.projectColumns: 空なら入力ヘッダ / t.* は修飾つき`` () =
     let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
     // 射影が空なら入力スキーマのヘッダをそのまま返す
-    Assert.Equal<string array>([| "t.id" |], Schema.projectHeader s [])
+    Assert.Equal<string array>([| "t.id" |], Schema.projectColumns s [] |> Array.map (fun c -> c.Display))
 
     // t.* は修飾つきの表示名で出す
     let h =
-        Schema.projectHeader
+        Schema.projectColumns
             s
             [
                 {
@@ -535,6 +539,7 @@ let ``Schema.projectHeader: 空なら入力ヘッダ / t.* は修飾つき`` () 
                     Alias = None
                 }
             ]
+        |> Array.map (fun c -> c.Display)
 
     Assert.Equal<string array>([| "t.id" |], h)
 

@@ -153,75 +153,6 @@ let ``Reader: readItems は readOne のエラーを伝播する`` () =
         "要素の読み取りエラーは伝播する"
         (Reader.readItems Reader.readByte 1UL (Cursor.create [||]))
 
-[<Fact>]
-let ``OrderPreserving: 全型の往復`` () =
-    let values = Array.init 4000 (fun _ -> randomValue ())
-
-    for v in values do
-        let key = keyOf v
-        let decoded, _ = ok (OrderPreserving.readFirstValue key)
-
-        let expected =
-            match v, decoded with
-            | SqlValue.Real a, SqlValue.Real b -> if Double.IsNaN a then Double.IsNaN b else a = b
-            | SqlValue.Blob a, SqlValue.Blob b -> a = b
-            | SqlValue.Timestamp a, SqlValue.Timestamp b -> a.UtcTicks = b.UtcTicks
-            | a, b -> a = b
-
-        Assert.True(expected, sprintf "往復に失敗: %s -> %s" (SqlLiteral.toSqlLiteral v) (SqlLiteral.toSqlLiteral decoded))
-
-[<Fact>]
-let ``OrderPreserving: 複合キーの先頭フィールドを読める`` () =
-    // TEXT の終端 0x00 の直後に次フィールド（INT のタグ）が続くケース
-    let v, _ =
-        ok (OrderPreserving.readFirstValue (keyOfTuple [| SqlValue.Text "a"; SqlValue.Int 7L |]))
-
-    Assert.Equal(SqlValue.Text "a", v)
-
-    // escape された 0x00 を含む BLOB でも同じ経路を通る
-    let v2, _ =
-        ok (OrderPreserving.readFirstValue (keyOfTuple [| SqlValue.Blob [| 0uy; 1uy |]; SqlValue.Int 7L |]))
-
-    match v2 with
-    | SqlValue.Blob b -> Assert.Equal<byte array>([| 0uy; 1uy |], b)
-    | other -> Assert.Fail(sprintf "BLOB ではありません: %A" other)
-
-[<Fact>]
-let ``OrderPreserving: Decimal 0 は往復できる`` () =
-    let v, _ = ok (OrderPreserving.readFirstValue (keyOf (SqlValue.Decimal 0M)))
-    Assert.Equal(SqlValue.Decimal 0M, v)
-
-[<Fact>]
-let ``OrderPreserving: 復元できない DECIMAL は CorruptionError`` () =
-    // DECIMAL タグ + 符号=正・指数=30・桁=29 個の 9 → 9.99...×10^29 となり decimal の範囲を超える
-    let bytes =
-        Array.concat
-            [
-                [| 0x22uy; 0x01uy |]
-                Writer.build [ Writer.uint64BE 0x800000000000001EUL ]
-                Array.create 29 9uy
-                [| 0x00uy |]
-            ]
-
-    expectErrorKind ErrorKind.CorruptionError "範囲外の DECIMAL はエラー" (OrderPreserving.readFirstValue bytes)
-
-[<Fact>]
-let ``OrderPreserving: 終端バイトが不正なら CorruptionError`` () =
-    // INT の 8 バイトの後に終端 0x00 ではなく 0x01 が続く
-    let bytes =
-        Writer.build [ Writer.writeByte 0x20uy; Writer.uint64BE 0UL; Writer.writeByte 0x01uy ]
-
-    expectErrorKind ErrorKind.CorruptionError "終端が不正ならエラー" (OrderPreserving.readFirstValue bytes)
-
-[<Fact>]
-let ``OrderPreserving: 終端の無い TEXT は CorruptionError`` () =
-    let bytes = [| 0x50uy; 0x61uy |]
-    expectErrorKind ErrorKind.CorruptionError "終端の無い TEXT はエラー" (OrderPreserving.readFirstValue bytes)
-
-[<Fact>]
-let ``OrderPreserving: 不明な型タグは CorruptionError`` () =
-    expectErrorKind ErrorKind.CorruptionError "不明な型タグはエラー" (OrderPreserving.readFirstValue [| 0x01uy |])
-
 // ---------------------------------------------------------------------------
 // ★ 最重要: バイト順 == SQL 比較順
 // ---------------------------------------------------------------------------
@@ -490,12 +421,9 @@ let ``ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの�
     Assert.Equal(24 + 8 * 2 + 24, ValueCodec.managedRowBytes row)
 
 [<Fact>]
-let ``Entry.managedBytes: memtable の保持量は符号化サイズより大きい`` () =
+let ``Entry.managedBytes: 値が長いほど保持量が大きい`` () =
     let key = [| 1uy; 2uy |]
     let entry = Entry.put key 1UL [| SqlValue.Int 1L; SqlValue.Text "abcdef" |]
-
-    // Treap ノード + Entry + option + キー配列 + 行配列 + 値を含む
-    Assert.True(Entry.managedBytes entry > Entry.encodedBytes entry)
 
     // 同じ行でも値が長いほど大きい
     let longer = Entry.put key 1UL [| SqlValue.Int 1L; SqlValue.Text "abcdefghij" |]

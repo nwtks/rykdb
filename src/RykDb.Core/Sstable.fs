@@ -35,19 +35,6 @@ module internal SstEntry =
         | 0 -> compare b.SeqNo a.SeqNo
         | c -> c
 
-    /// 値部分（SeqNo + 種別 + 行値）を Writer のまま返す。
-    let private encodeValueWriter (e: SstEntry) =
-        let tag, values =
-            e.Value |> Option.map (fun vs -> 1uy, vs) |> Option.defaultValue (0uy, [||])
-
-        Writer.Empty
-        |> Writer.varint e.SeqNo
-        |> Writer.writeByte tag
-        |> ValueCodec.writeValues values
-
-    /// 値部分（SeqNo + 種別 + 行値）を符号化する。
-    let encodeValue = encodeValueWriter >> Writer.toArray
-
     /// 値部分の正確な符号化長。
     let encodedValueLength (e: SstEntry) =
         let seqLength = Writer.varintLength e.SeqNo
@@ -314,21 +301,6 @@ module internal SstScan =
     /// 条件を満たすエントリだけを返す走査。
     /// 条件を満たさない間は次のエントリを読み進める（ブロック単位のまま）。
     let filter (predicate: SstEntry -> bool) (scan: SstScan) = FilterScan(scan, predicate)
-
-    /// 純粋な seq を pull に変換する（テスト用のメモリ実装など）。
-    /// seq の列挙は失敗しない前提（エラーは表現できない）。
-    let ofSeq (items: seq<SstEntry>) =
-        let e = items.GetEnumerator()
-
-        let rec loop () =
-            SstScan(fun () ->
-                if e.MoveNext() then
-                    ret (Some(e.Current, loop ()))
-                else
-                    (e :> System.IDisposable).Dispose() |> ignore
-                    ret None)
-
-        loop ()
 
 /// k-way merge の 1ソース。
 /// 先頭を 1件読んだ状態を表す。
@@ -895,17 +867,6 @@ module internal Sstable =
                 finish firstKey lastKey maxSeqNo count keys block offset indexEntries
 
         loop None None 0UL 0L (ResizeArray<byte array>()) (ResizeArray<SstEntry>()) 0 [] None
-
-    /// エントリ列から SSTable のバイナリを作る（テスト・小規模用途）。
-    /// 通常の書き込みは `FileMetaData.writeSstable` がストリームへ直接書く。
-    /// 入力はキー昇順・同一キーは SeqNo 降順に並んでいる必要がある（検証する）。
-    let build (bloomFalsePositiveRate: float) (entries: SstEntry array) =
-        protect (fun () ->
-            use stream = new System.IO.MemoryStream()
-
-            writeTo stream bloomFalsePositiveRate entries
-            |> Result.map (fun _ -> stream.ToArray()))
-        >>= id
 
     /// Cursor から終端まで 1件ずつ読み出して配列にまとめる。
     /// step は「読むたびに変わる状態」（キーの接頭辞共有など）を

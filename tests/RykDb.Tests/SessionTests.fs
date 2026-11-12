@@ -495,14 +495,12 @@ let ``RowReader: 単一 SELECT を1行ずつ読める`` () =
         | Some reader ->
             use reader = reader
             Assert.Equal<string array>([| "id"; "v" |], reader.Columns)
-            Assert.Equal<int64>(0L, reader.RowsRead)
 
             let rows = drainReader reader
             Assert.Equal<int>(3, rows.Length)
             Assert.Equal<int64>(1L, asInt rows.[0].[0])
             Assert.Equal("a", asText rows.[0].[1])
             Assert.Equal<int64>(3L, asInt rows.[2].[0])
-            Assert.Equal<int64>(3L, reader.RowsRead)
 
             // 終端後は再度読んでも None。
             match ok (reader.TryRead()) with

@@ -347,8 +347,6 @@ module internal OrderPreserving =
     /// この書き方が正しく効くのは double（指数部に余裕がある）だけ。
     let private mapInt64 (v: int64) = uint64 v + 0x8000000000000000UL
 
-    let private unmapInt64 (m: uint64) = int64 (m - 0x8000000000000000UL)
-
     /// double の順序を int64 の順序に写像する（IEEE-754 のビット表現を前提）。
     let private mapDouble (v: float) =
         let bits = System.BitConverter.DoubleToInt64Bits v
@@ -358,14 +356,7 @@ module internal OrderPreserving =
         else
             bits ||| System.Int64.MinValue
 
-    let private unmapDouble (v: int64) =
-        let bits = if v < 0L then v ^^^ System.Int64.MinValue else ~~~v
-        System.BitConverter.Int64BitsToDouble bits
-
     let private writeOrderedInt64 (v: int64) (w: Writer) = w |> Writer.uint64BE (mapInt64 v)
-
-    let private readOrderedInt64 (c: Cursor) =
-        Reader.readUint64BE c |> Result.map (fun (m, c) -> unmapInt64 m, c)
 
     /// decimal の有効桁数の上限。
     [<Literal>]
@@ -421,45 +412,6 @@ module internal OrderPreserving =
         |> writeOrderedInt64 exponentValue
         |> Writer.writeBytes digitBytes
 
-    let private readOrderedDecimal (c: Cursor) =
-        let restoreDecimal negative raw digitBytes =
-            let stored = unmapInt64 raw
-            let exponent = if negative then -stored else stored
-
-            let digits =
-                digitBytes
-                |> Array.map (fun b -> if negative then 9uy - b else b)
-                |> Array.map (fun b -> char (int (b + 0x30uy)))
-                |> System.String
-
-            let text = sprintf "%sE%d" digits (exponent - int64 DecimalMaxDigits)
-
-            match
-                System.Decimal.TryParse(
-                    text,
-                    System.Globalization.NumberStyles.Float,
-                    System.Globalization.CultureInfo.InvariantCulture
-                )
-            with
-            | true, d when not negative -> ret d
-            | true, d -> ret -d
-            | _ -> err (sprintf "OrderPreserving: decimal を復元できません: %s" text |> DbError.corruption)
-
-        result {
-            let! sign, c = Reader.readByte c
-            let! raw, c = Reader.readUint64BE c
-            let! digitBytes, c = Reader.readBytes DecimalMaxDigits c
-            let isZero = digitBytes |> Array.forall (fun b -> b = 0uy)
-
-            let! value =
-                if isZero then
-                    ret 0M
-                else
-                    restoreDecimal (sign = 0uy) raw digitBytes
-
-            return value, c
-        }
-
     let private guidToOrderedBytes (g: System.Guid) =
         let s = g.ToString("N", System.Globalization.CultureInfo.InvariantCulture)
 
@@ -467,16 +419,6 @@ module internal OrderPreserving =
             for i in 0..15 do
                 yield System.Convert.ToByte(s.Substring(i * 2, 2), 16)
         |]
-
-    let private orderedBytesToGuid (bs: byte array) =
-        let sb = System.Text.StringBuilder 32
-
-        bs
-        |> Array.iter (fun b ->
-            sb.Append(b.ToString("X2", System.Globalization.CultureInfo.InvariantCulture))
-            |> ignore)
-
-        System.Guid.ParseExact(sb.ToString(), "N")
 
     /// 値をキーへ追加する（型タグ + escape 済みペイロード + 終端）。
     let writeValue (v: SqlValue) (w: Writer) =
@@ -508,74 +450,6 @@ module internal OrderPreserving =
         | SqlValue.Text s -> writeEscapedPayload (System.Text.Encoding.UTF8.GetBytes s) (tagged Tag.Text)
         | SqlValue.Blob bs -> writeEscapedPayload bs (tagged Tag.Blob)
         | SqlValue.Uuid g -> tagged Tag.Uuid |> Writer.writeBytes (guidToOrderedBytes g) |> terminate
-
-    /// キーに書き込んだ 1フィールドを読む。
-    /// escape を解き、フィールド終端まで消費して値を返す。
-    let private readValue (c: Cursor) =
-        let rec unescape acc c =
-            let finish c =
-                ret (List.rev acc |> List.toArray, { c with Pos = c.Pos - 1 })
-
-            match Reader.readByte c with
-            | Error e -> err e
-            | Ok(b, c) when b <> Terminator -> unescape (b :: acc) c
-            | Ok(_, c) when Cursor.atEnd c -> finish c
-            | Ok(_, c) ->
-                match Reader.readByte c with
-                | Error e -> err e
-                | Ok(EscapeMarker, c) -> unescape (Terminator :: acc) c
-                | Ok(_, _) -> finish c
-
-        let readEscapedPayload c = unescape [] c
-
-        let finish v c =
-            result {
-                let! t, _ = Reader.readByte c
-
-                if t <> Terminator then
-                    return! err (sprintf "OrderPreserving: 終端が不正 (0x%02X)" t |> DbError.corruption)
-                else
-                    return v, c
-            }
-
-        result {
-            let! tag, c = Reader.readByte c
-
-            match LanguagePrimitives.EnumOfValue<byte, Tag> tag with
-            | Tag.Null -> return! finish SqlValue.Null c
-            | Tag.Bool ->
-                let! v, c = Reader.readBool c
-                return! finish (SqlValue.Bool v) c
-            | Tag.Int ->
-                let! v, c = readOrderedInt64 c
-                return! finish (SqlValue.Int v) c
-            | Tag.Real ->
-                let! m, c = Reader.readUint64BE c
-                return! finish (unmapDouble (int64 m) |> SqlValue.vReal) c
-            | Tag.Decimal ->
-                let! v, c = readOrderedDecimal c
-                return! finish (SqlValue.Decimal v) c
-            | Tag.Date ->
-                let! days, c = readOrderedInt64 c
-                return! finish (int days |> System.DateOnly.FromDayNumber |> SqlValue.Date) c
-            | Tag.Timestamp ->
-                let! ticks, c = readOrderedInt64 c
-                return! finish (System.DateTimeOffset(ticks, System.TimeSpan.Zero) |> SqlValue.Timestamp) c
-            | Tag.Text ->
-                let! bytes, c = readEscapedPayload c
-                return! finish (System.Text.Encoding.UTF8.GetString bytes |> SqlValue.Text) c
-            | Tag.Blob ->
-                let! bytes, c = readEscapedPayload c
-                return! finish (SqlValue.Blob bytes) c
-            | Tag.Uuid ->
-                let! bs, c = Reader.readBytes 16 c
-                return! finish (orderedBytesToGuid bs |> SqlValue.Uuid) c
-            | _ -> return! err (sprintf "OrderPreserving: 不明な型タグ 0x%02X" tag |> DbError.corruption)
-        }
-
-    /// キーから 1フィールドだけを読む（返り値は値と読み取り後の位置）。
-    let readFirstValue (key: byte array) =
-        Cursor.create key |> readValue |> Result.map (fun (v, c) -> v, c.Pos)
 
 module internal Hashing =
     /// バイト列の 64bit ハッシュ（FNV-1a）。

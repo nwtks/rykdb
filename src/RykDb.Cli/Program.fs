@@ -161,16 +161,13 @@ let main argv =
         | Some i -> Some(i + 1)
         | None -> None
 
-    let positional =
+    let root =
         argv
         |> Array.mapi (fun i a -> i, a)
         |> Array.choose (fun (i, a) ->
             if skipIndex = Some i then None
             elif a = "-f" || a = "--file" || a.StartsWith "-" then None
             else Some a)
-
-    let root =
-        positional
         |> Array.tryHead
         |> Option.defaultValue (System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "rykdb-data"))
 

@@ -185,9 +185,6 @@ module internal Version =
     let allFiles (v: Version) =
         v.Files |> Array.collect id |> Array.toList
 
-    /// レベルごとのファイル数。
-    let levelCounts (v: Version) = v.Files |> Array.map Array.length
-
 /// 1回のバージョン変更。
 type internal VersionEdit =
     {
@@ -200,12 +197,6 @@ module internal VersionEdit =
         {
             AddedFiles = [ f ]
             DeletedFiles = []
-        }
-
-    let deleteFile f =
-        {
-            AddedFiles = []
-            DeletedFiles = [ f ]
         }
 
     /// VersionEdit のファイル変更を適用する（削除してから追加）。

@@ -17,23 +17,7 @@ type internal Token =
     | Symbol of string
     | Eos
 
-type internal TokenItem =
-    {
-        Token: Token
-        Pos: Position
-    }
-
-    member x.Describe =
-        match x.Token with
-        | Token.Ident s -> sprintf "identifier %s" s
-        | Token.QuotedIdent s -> sprintf "quoted identifier %s" s
-        | Token.Keyword s -> sprintf "keyword %s" s
-        | Token.IntLit v -> sprintf "integer %d" v
-        | Token.RealLit v -> sprintf "real %g" v
-        | Token.StringLit _ -> "string"
-        | Token.BlobLit _ -> "binary"
-        | Token.Symbol s -> sprintf "symbol %s" s
-        | Token.Eos -> "end of statement"
+type internal TokenItem = { Token: Token; Pos: Position }
 
 /// 字句解析器の位置。
 /// 値は不変で、前進すると新しい位置を返す。

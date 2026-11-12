@@ -10,7 +10,7 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 let private withEngine (dir: string) (f: StorageEngine -> unit) =
-    let engine = ok (StorageEngine.openDatabase dir)
+    let engine = ok (StorageEngine.openDatabaseWith None dir)
     f engine
 
 /// 与えたエントリ列を SSTable として書き、メタデータを返す。
@@ -27,7 +27,6 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
 let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array -> unit) =
     let path = FileMetaData.path dir fileNumber
     let data = File.ReadAllBytes path
-
     let footerStart = data.Length - Sstable.FooterSize
 
     let readI64 offset =
@@ -166,17 +165,14 @@ let ``StorageEngine.scanAt: 先頭 1 件だけなら全件を実体化しない`
 
             // SstPartial の読み込みを先に済ませる（計測から index/Bloom の解析を除く）。
             let all = ok (StorageEngine.scanAt None 0 [||] engine) |> SstScan.toArray |> ok
-
             Assert.Equal<int>(2000, all.Length)
 
             let before = System.GC.GetAllocatedBytesForCurrentThread()
             let first = ok (StorageEngine.scanAt None 1 [||] engine) |> SstScan.toArray |> ok
             let firstBytes = System.GC.GetAllocatedBytesForCurrentThread() - before
-
             let fullBefore = System.GC.GetAllocatedBytesForCurrentThread()
             let full = ok (StorageEngine.scanAt None 0 [||] engine) |> SstScan.toArray |> ok
             let fullBytes = System.GC.GetAllocatedBytesForCurrentThread() - fullBefore
-
             Assert.Equal<int>(1, first.Length)
             Assert.Equal<int>(2000, full.Length)
 
@@ -375,7 +371,7 @@ let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engin
             Assert.Equal(0, after.Mem.Count)
             Assert.Equal(4, (Version.filesAt 0 after.Version).Length)
             // compaction の失敗は診断として残る
-            Assert.True(after.LastCompactionError.IsSome)
+            Assert.True after.LastCompactionError.IsSome
             // 入力ファイルは削除されない
             Assert.True(File.Exists(FileMetaData.path dir 10L))
             Assert.True(File.Exists(FileMetaData.path dir 11L))
@@ -384,11 +380,10 @@ let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engin
 [<Fact>]
 let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush する`` () =
     withDir "se-disk-flush" (fun dir ->
-        let engine = ok (StorageEngine.openDatabase dir)
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
         let disk = DiskStorageEngine { engine with MemLimitBytes = 1 } :> IStorageEngine
         let disk = ok (disk.WriteBatch [| Entry.put (intKey 1) 1UL (intRow 1) |])
         let disk = ok (disk.MaybeFlush())
-
         Assert.NotEmpty(Directory.GetFiles(dir, "*" + FileMetaData.SstExtension))
         Assert.True((ok (disk.GetAt None (intKey 1))).IsSome))
 
@@ -403,8 +398,7 @@ let ``StorageEngine.openDatabase: 実ファイルが消えていても NextFileN
             ok (Manifest.logAndApply dir 1L Version.Empty (VersionEdit.addFile (fmd 1L 0 1 1)))
 
         let _ = ok (Wal.create dir 0L)
-
-        let engine = ok (StorageEngine.openDatabase dir)
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
         // 消えたファイルの削除で NextFileNumber は 2 に進み、0 番の WAL があっても巻き戻らない
         Assert.Equal(2L, engine.Version.NextFileNumber)
         Assert.Empty(Version.allFiles engine.Version))
@@ -419,15 +413,14 @@ let ``StorageEngine.openDatabase: 最大 SeqNo はファイルの並び順に関
         let fB = mkSst dir 11L 0 [ Entry.put (intKey 2) 3UL (intRow 2) ]
         let v1, m1 = ok (Manifest.logAndApply dir 1L Version.Empty (VersionEdit.addFile fA))
         let _ = ok (Manifest.logAndApply dir m1 v1 (VersionEdit.addFile fB))
-
-        let engine = ok (StorageEngine.openDatabase dir)
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
         // 再開後はファイル内の最大 SeqNo（5）の次から書ける
         Assert.Equal(6UL, engine.NextSeqNo))
 
 [<Fact>]
 let ``StorageEngine.openDatabase: NextTxnId は WAL の最大 txnId + 1 から再開する`` () =
     withDir "re-next-txn" (fun dir ->
-        let engine = ok (StorageEngine.openDatabase dir)
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
 
         let engine =
             ok (StorageEngine.writeBatch [| Entry.put (intKey 1) 1UL (intRow 1) |] engine)
@@ -435,14 +428,14 @@ let ``StorageEngine.openDatabase: NextTxnId は WAL の最大 txnId + 1 から�
         Assert.Equal(2UL, engine.NextTxnId)
 
         // WAL を再生して採番を巻き戻さない
-        let reopened = ok (StorageEngine.openDatabase dir)
+        let reopened = ok (StorageEngine.openDatabaseWith None dir)
         Assert.Equal(2UL, reopened.NextTxnId)
 
         let reopened =
             ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] reopened)
 
         Assert.Equal(3UL, reopened.NextTxnId)
-        Assert.Equal(3UL, (ok (StorageEngine.openDatabase dir)).NextTxnId))
+        Assert.Equal(3UL, (ok (StorageEngine.openDatabaseWith None dir)).NextTxnId))
 
 [<Fact>]
 let ``StorageEngine.openDatabase: 孤児の SSTable は削除せず退避する`` () =
