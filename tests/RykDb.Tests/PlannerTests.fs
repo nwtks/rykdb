@@ -546,3 +546,147 @@ let ``Plan.runSelect: FROM なしの SELECT は 1 行の定数を返す`` () =
         Assert.Equal<int>(1, rows.Length)
         Assert.Equal<int>(1, rows.[0].Length)
         Assert.Equal<int64>(1L, asInt rows.[0].[0]))
+
+// ---------------------------------------------------------------------------
+// 結合述語の昇格と INNER の結合順
+// ---------------------------------------------------------------------------
+
+/// xtra を登録した文脈（people / orders に加えて 3つ目のテーブル）。
+let private ctxWithExtra (store: RowStore) =
+    ctxOf store |> ExecContext.withSchema "xtra" peopleSchema
+
+let private xCol (n: string) =
+    Expr.Column { Qualifier = Some "xtra"; Name = n }
+
+let private eq a b = Expr.Binary(BinaryOp.Eq, a, b)
+
+[<Fact>]
+let ``Optimizer.buildLogicalWith: WHERE の結合述語は INNER の ON へ昇格する`` () =
+    withStore "pl-promote" (fun store ->
+        let ctx = ctxOf store
+
+        // ON には何も書かず、結合キーを WHERE に書く
+        let stmt =
+            selectOf
+                [ { Expression = Expr.Star; Alias = None } ]
+                (Some { Name = "people"; Alias = None })
+                [
+                    {
+                        Kind = JoinKind.Inner
+                        Table = TableSource.Named { Name = "orders"; Alias = None }
+                        On = Expr.Literal(Literal.Bool true)
+                    }
+                ]
+                (Some(eq (pCol "id") (oCol "person_id")))
+
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
+
+        // 結合の上に Filter が残らず、ON に述語が入る
+        match tree with
+        | Logical.Project(_, Logical.Join(JoinKind.Inner, "orders", on, _, _)) ->
+            Assert.Contains("person_id", Expr.toDisplayString on)
+        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+
+[<Fact>]
+let ``Optimizer.buildLogicalWith: INNER の結合順は選択性の高いテーブルを先に積む`` () =
+    withStore "pl-order" (fun store ->
+        let ctx = ctxWithExtra store
+
+        // orders は全走査、xtra は主キー等値（1行）なので xtra を先に結合する
+        let stmt =
+            selectOf
+                [ { Expression = Expr.Star; Alias = None } ]
+                (Some { Name = "people"; Alias = None })
+                [
+                    {
+                        Kind = JoinKind.Inner
+                        Table = TableSource.Named { Name = "orders"; Alias = None }
+                        On = eq (pCol "id") (oCol "person_id")
+                    }
+                    {
+                        Kind = JoinKind.Inner
+                        Table = TableSource.Named { Name = "xtra"; Alias = None }
+                        On = eq (pCol "id") (xCol "id")
+                    }
+                ]
+                (Some(eq (xCol "id") (Expr.Literal(Literal.Int 1L))))
+
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
+
+        match tree with
+        | Logical.Project(_, Logical.Join(JoinKind.Inner, right, _, left, _)) ->
+            // 外側（最後）が orders、内側に xtra が入る
+            Assert.Equal<string>("orders", right)
+
+            match left with
+            | Logical.Join(JoinKind.Inner, inner, _, Logical.Scan(first, _), _) ->
+                Assert.Equal<string>("xtra", inner)
+                Assert.Equal<string>("people", first)
+            | _ -> Assert.Fail(sprintf "想定外の左部分木: %A" left)
+        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+
+[<Fact>]
+let ``Optimizer.buildLogicalWith: LEFT JOIN は結合順の境界になる`` () =
+    withStore "pl-left-order" (fun store ->
+        let ctx = ctxWithExtra store
+
+        // LEFT の右（orders）は動かさず、後続の INNER（xtra）だけを積む
+        let stmt =
+            selectOf
+                [ { Expression = Expr.Star; Alias = None } ]
+                (Some { Name = "people"; Alias = None })
+                [
+                    {
+                        Kind = JoinKind.Left
+                        Table = TableSource.Named { Name = "orders"; Alias = None }
+                        On = eq (pCol "id") (oCol "person_id")
+                    }
+                    {
+                        Kind = JoinKind.Inner
+                        Table = TableSource.Named { Name = "xtra"; Alias = None }
+                        On = eq (pCol "id") (xCol "id")
+                    }
+                ]
+                (Some(eq (xCol "id") (Expr.Literal(Literal.Int 1L))))
+
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
+
+        match tree with
+        | Logical.Project(_, Logical.Join(JoinKind.Inner, "xtra", _, left, _)) ->
+            match left with
+            | Logical.Join(JoinKind.Left, "orders", _, Logical.Scan(first, _), _) ->
+                Assert.Equal<string>("people", first)
+            | _ -> Assert.Fail(sprintf "想定外の左部分木: %A" left)
+        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+
+[<Fact>]
+let ``Optimizer.buildLogicalWith: INNER の後に続く LEFT JOIN も積まれる`` () =
+    withStore "pl-inner-then-left" (fun store ->
+        let ctx = ctxWithExtra store
+
+        // INNER 区間のあとに LEFT が続く。区間の処理で残りを落とすと
+        // city 相当のテーブルが計画から消え、列が見つからなくなる。
+        let stmt =
+            selectOf
+                [ { Expression = Expr.Star; Alias = None } ]
+                (Some { Name = "people"; Alias = None })
+                [
+                    {
+                        Kind = JoinKind.Inner
+                        Table = TableSource.Named { Name = "orders"; Alias = None }
+                        On = eq (pCol "id") (oCol "person_id")
+                    }
+                    {
+                        Kind = JoinKind.Left
+                        Table = TableSource.Named { Name = "xtra"; Alias = None }
+                        On = eq (pCol "id") (xCol "id")
+                    }
+                ]
+                None
+
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
+
+        match tree with
+        | Logical.Project(_, Logical.Join(JoinKind.Left, "xtra", _, Logical.Join(JoinKind.Inner, "orders", _, _, _), _)) ->
+            ()
+        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))

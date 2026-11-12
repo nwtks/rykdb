@@ -2098,3 +2098,27 @@ BEGIN / COMMIT / ROLLBACK と暗黙 transaction の DML / DDL は `DatabaseHost.
 `SessionPool.CreateSession` のセッションは自分の transaction を rollback して登録を外すだけ。
 DB を閉じるのは `SessionPool.Close`。
 `Session.Close` は実行中の読み取り（`readers`）を drain してから閉じる。
+
+### 11.67 結合順を並べ替えるときは「右テーブルを除いたスキーマ」を左へ渡してはいけない
+
+❌ `Optimizer.exec` の `Join` で、左部分木の入力を `inSchema` から右テーブルの列を取り除いて作る。
+
+```fsharp
+let leftSchema = { inSchema with Columns = inSchema.Columns |> Array.filter (fun c -> c.Qualifier <> Some name) }
+```
+
+`FROM a JOIN b ON ... JOIN c ON ...` のように右が常に「それまでの末尾」なら
+`左 = inSchema - 右` は実際の行の並びと一致する。
+**結合順を並べ替えると一致しない**。
+たとえば `a ⋈ c` を先に作ると左の行は `(a, c)` の順に並ぶが、
+`inSchema - b` は `(a, c)` ではなく元の `inSchema` の順を保つため、
+`Ops.innerJoinHash` などが列位置を取り違え、値が別の列から読まれる
+（60 段 JOIN のテストで「59 を期待して 1 が返る」形で顕在化した）。
+
+✅ `outputOf inSchema lTree` で**左部分木が実際に出力するレイアウト**を求めて渡す。
+`outputOf` は左スパインを末尾再帰で降り、右スキーマを下から連結する
+（`Join` の出力 = 左のレイアウト + 右のレイアウト）。
+`Aggregate` も同じ理由で `outputOf inSchema child` を `AggregateFrame` に渡す。
+
+回帰テスト: `Database: 60 段の入れ子 JOIN が正しい行を返す` /
+`SqlReference: 結合順が並べ替えられても結果は同じ`。

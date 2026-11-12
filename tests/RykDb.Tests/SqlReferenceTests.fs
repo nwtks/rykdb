@@ -2493,3 +2493,95 @@ let ``SqlReference: よく見るエラーメッセージは sql-reference §13 �
         // 失敗した INSERT は何も残っていない
         let _, rows = ok (execSql db2 "SELECT COUNT(*) FROM t")
         Assert.Equal<int64>(1L, asInt rows.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: WHERE に書いた結合述語は ON と同じ結果になる`` () =
+    // 複数テーブルを参照する WHERE の述語は INNER の ON へ昇格する
+    // （INNER では ON と WHERE は同値。昇格しないと結合キーに使えず入れ子ループになる）。
+    withDb "join-promote" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db3, _ = execRes db2 "INSERT INTO a VALUES (1,10),(2,20),(3,10)"
+        let db4, _ = execRes db3 "INSERT INTO b VALUES (1,10),(2,30),(3,10)"
+
+        let _, onForm =
+            ok (execSql db4 "SELECT a.id, b.id FROM a JOIN b ON a.id > b.id AND a.g = b.g ORDER BY a.id, b.id")
+
+        let _, whereForm =
+            ok (execSql db4 "SELECT a.id, b.id FROM a JOIN b ON a.id > b.id WHERE a.g = b.g ORDER BY a.id, b.id")
+
+        Assert.Equal<int>(1, onForm.Rows.Length)
+        Assert.Equal<int>(onForm.Rows.Length, whereForm.Rows.Length)
+
+        for i in 0 .. onForm.Rows.Length - 1 do
+            Assert.Equal<int64>(asInt onForm.Rows.[i].[0], asInt whereForm.Rows.[i].[0])
+            Assert.Equal<int64>(asInt onForm.Rows.[i].[1], asInt whereForm.Rows.[i].[1]))
+
+[<Fact>]
+let ``SqlReference: 結合順が並べ替えられても結果は同じ`` () =
+    // c の主キー等値で c が先に結合される（FROM に書いた順とは違う計画になる）。
+    withDb "join-order" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, av INTEGER)"
+        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, bv INTEGER)"
+        let db4, _ = execRes db3 "INSERT INTO a VALUES (1,10),(2,20)"
+        let db5, _ = execRes db4 "INSERT INTO b VALUES (1,10),(2,20)"
+        let db6, _ = execRes db5 "INSERT INTO c VALUES (1,10),(2,99)"
+
+        let _, reordered =
+            ok (execSql db6 "SELECT a.v, b.av, c.bv FROM a JOIN b ON a.id = b.id JOIN c ON a.id = c.id WHERE c.id = 1")
+
+        let _, fromOrder =
+            ok (execSql db6 "SELECT a.v, b.av, c.bv FROM c JOIN a ON a.id = c.id JOIN b ON a.id = b.id WHERE c.id = 1")
+
+        Assert.Equal<int>(1, reordered.Rows.Length)
+        Assert.Equal<int>(fromOrder.Rows.Length, reordered.Rows.Length)
+        Assert.Equal<int64>(10L, asInt reordered.Rows.[0].[0])
+        Assert.Equal<int64>(10L, asInt reordered.Rows.[0].[1])
+        Assert.Equal<int64>(10L, asInt reordered.Rows.[0].[2]))
+
+[<Fact>]
+let ``SqlReference: 並べ替えても LEFT JOIN の NULL 拡張は変わらない`` () =
+    withDb "join-order-left" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE l (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "CREATE TABLE r (id INTEGER PRIMARY KEY, lv INTEGER)"
+        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, rv INTEGER)"
+        let db4, _ = execRes db3 "INSERT INTO l VALUES (1,10),(2,20)"
+        let db5, _ = execRes db4 "INSERT INTO r VALUES (1,10)"
+        let db6, _ = execRes db5 "INSERT INTO c VALUES (1,7),(2,8)"
+
+        // LEFT の右（r）に一致しない l.id=2 は NULL 拡張されたまま残る
+        let _, res =
+            ok (execSql db6 "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id = r.id JOIN c ON l.id = c.id ORDER BY l.id")
+
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(2L, asInt res.Rows.[1].[0])
+        Assert.Equal<SqlValue>(SqlValue.Null, res.Rows.[1].[1]))
+
+[<Fact>]
+let ``SqlReference: JOIN の後に続く LEFT JOIN も実行される`` () =
+    withDb "join-inner-then-left" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE e (id INTEGER PRIMARY KEY, d INTEGER)"
+        let db2 = exec db1 "CREATE TABLE d (id INTEGER PRIMARY KEY, c INTEGER)"
+        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY)"
+        let db4, _ = execRes db3 "INSERT INTO e VALUES (1,1),(2,2),(3,9)"
+        let db5, _ = execRes db4 "INSERT INTO d VALUES (1,10),(2,20)"
+        let db6, _ = execRes db5 "INSERT INTO c VALUES (10)"
+
+        // e.id=3 は d に無いので INNER で落ち、d.id=2 は c に無いので NULL 拡張される
+        let _, res =
+            ok (
+                execSql
+                    db6
+                    "SELECT e.id, d.id, c.id FROM e JOIN d ON e.d = d.id LEFT JOIN c ON d.c = c.id ORDER BY e.id"
+            )
+
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(10L, asInt res.Rows.[0].[2])
+        Assert.Equal<int64>(2L, asInt res.Rows.[1].[0])
+        Assert.Equal<int64>(2L, asInt res.Rows.[1].[1])
+        Assert.Equal<SqlValue>(SqlValue.Null, res.Rows.[1].[2]))
