@@ -44,7 +44,6 @@ let ``ExtSort: バジェットが小さいと一時ファイルに溢らして�
         ok (ExtSort.sortRows 1L Map.empty (fun _ _ -> ret Map.empty) cmp (opOfRows shuffled))
 
     let rows = ok (Op.toArray sorted)
-
     Assert.Equal<int>(n, rows.Length)
 
     for i in 1 .. n - 1 do
@@ -54,7 +53,7 @@ let ``ExtSort: バジェットが小さいと一時ファイルに溢らして�
     let leftovers =
         System.IO.Directory.GetFiles(System.IO.Path.GetTempPath(), "rykdb-sort-" + "*")
 
-    Assert.All(leftovers, fun p -> Assert.Fail($"一時ファイルが残っています: {p}"))
+    Assert.All(leftovers, fun p -> Assert.Fail $"一時ファイルが残っています: {p}")
 
 [<Fact>]
 let ``ExtSort: 比較不能な型は呼び出し時に Error`` () =
@@ -83,9 +82,9 @@ let ``ExtSort: 5000行を小さなバジェットで溢らしても整列でき�
 
     let rec make (i: int) : Op =
         if i >= n then
-            Op.Done
+            Op.Empty
         else
-            Op.Compute(fun () ->
+            Op.compute (fun () ->
                 let v = int64 ((i * 7919 + 13) % n)
                 ret (Some(row [ SqlValue.Int v; SqlValue.Int(int64 i) ], make (i + 1))))
 
@@ -100,7 +99,6 @@ let ``ExtSort: 5000行を小さなバジェットで溢らしても整列でき�
         ok (ExtSort.sortRows 256L Map.empty (fun _ _ -> ret Map.empty) cmp (make 0))
 
     let rows = ok (Op.toArray sorted)
-
     Assert.Equal<int>(n, rows.Length)
 
     let ascending =

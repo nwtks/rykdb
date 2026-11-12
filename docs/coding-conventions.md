@@ -31,6 +31,9 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 | `result { ... }`           | `DbResultBuilder` による計算式                       |
 | `protect`                  | .NET I/O API 境界の例外捕捉（`try`/`with` の主経路） |
 
+`all` と `foldOk` は**最初の `Error` で打ち切り**、残りの項目は評価しない。
+複数の `Error` があっても返るのは最初の 1つ。
+
 `protect` は `IOException` / `UnauthorizedAccessException` を `IoError`、
 `InvalidDataException` / `FormatException` / `OverflowException` を `CorruptionError` に変換する。
 ファイル内容の不整合を `InternalError`（バグの兆候）として扱わないため。
@@ -90,13 +93,14 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `Compaction` の作業ディレクトリ別カウンタ（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
 
-| やりたいこと   | 命令形の代わりに使うもの                   |
-| -------------- | ------------------------------------------ |
-| 書き込み       | `Writer` = 不変のチャンク列                |
-| 読み取り       | `Cursor` = 読み取り位置を値として保持する  |
-| パーサの状態   | `PState`（読み取り位置を値として保持する） |
-| 走査・畳み込み | `Result` を返す末尾再帰                    |
-| 平衡木の再構築 | 明示スタック（`list` を積む）              |
+| やりたいこと   | 命令形の代わりに使うもの                                                       |
+| -------------- | ------------------------------------------------------------------------------ |
+| 書き込み       | `Writer` = 不変のチャンク列                                                    |
+| 読み取り       | `Cursor` = 読み取り位置を値として保持する                                      |
+| パーサの状態   | `PState`（読み取り位置を値として保持する）                                     |
+| 走査・畳み込み | `Result` を返す末尾再帰                                                        |
+| 平衡木の再構築 | 明示スタック（`list` を積む）                                                  |
+| 遅延列挙       | `Op`（one-shot。構築は `Op.compute` / `Op.emit`、消費は `Op.next` の継続だけ） |
 
 ## 3. 末尾再帰を前提にする
 

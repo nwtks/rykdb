@@ -131,18 +131,21 @@ module internal ResultOps =
 
     let inline err (e: DbError) = Error e
 
-    /// Result の列を全て Ok になるまで畳み込む。
-    /// 1つでも Error があればそれを返す。
+    /// Result の列を左から畳み込み、全て Ok なら値のリストを返す。
+    /// 最初の Error で打ち切り、残りの項目は列挙しない（`foldOk` と同じ規則）。
+    /// 複数の Error があっても返るのは最初の 1つ。
+    /// `seq` は 1回だけ列挙するので、1回限りの列挙子でも渡せる。
     let all (rs: Result<'a, DbError> seq) =
-        rs
-        |> Seq.fold
-            (fun acc r ->
-                match acc, r with
-                | Error e, _
-                | _, Error e -> Error e
-                | Ok acc, Ok v -> Ok(v :: acc))
-            (ret [])
-        |> Result.map List.rev
+        let rec gather (e: System.Collections.Generic.IEnumerator<Result<'a, DbError>>) (acc: 'a list) =
+            if not (e.MoveNext()) then
+                ret (List.rev acc)
+            else
+                match e.Current with
+                | Error e -> Error e
+                | Ok v -> gather e (v :: acc)
+
+        use e = rs.GetEnumerator()
+        gather e []
 
     /// 状態を受け取り Result を返す step で列を左から畳み込む Result 版 fold。
     /// 最初の Error で打ち切り、残りの項目は評価しない。

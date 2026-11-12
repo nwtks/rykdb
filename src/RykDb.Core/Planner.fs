@@ -848,7 +848,7 @@ module internal Optimizer =
 
         let execScan ctx name method =
             function
-            | Some 0 -> ret Op.empty
+            | Some 0 -> ret Op.Empty
             | hint ->
                 let limit = defaultArg hint 0
 

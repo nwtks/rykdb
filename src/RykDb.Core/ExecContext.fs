@@ -151,7 +151,7 @@ module internal ExecContext =
             let! row = Dml.getByPrimaryKeyWithTxn ctx.Store schema key ctx.Visible ctx.Txn
 
             match row with
-            | None -> return Op.empty
+            | None -> return Op.Empty
             | Some r -> return Op.ofRow r
         }
 

@@ -306,9 +306,9 @@ let ``集約: 入力行を抱えずにグループごとに集める`` () =
     // 10 万行を 3 グループに振り、行を全部保持しない実装でも結果が同じであること。
     let rec make (i: int) : Op =
         if i >= 100_000 then
-            Op.Done
+            Op.Empty
         else
-            Op.Compute(fun () ->
+            Op.compute (fun () ->
                 let grp = int64 (i % 3)
                 ret (Some(row [ SqlValue.Int grp; SqlValue.Int(int64 i) ], make (i + 1))))
 
@@ -361,7 +361,7 @@ let ``集約: 行が 0 でも COUNT(*) は 1行を返す`` () =
     let rows =
         ok (
             Op.toArray (
-                ok (Ops.aggregate schema2 [] [ (AggFunc.Count, true, false, Expr.Literal(Literal.Null)) ] Op.Done)
+                ok (Ops.aggregate schema2 [] [ (AggFunc.Count, true, false, Expr.Literal Literal.Null) ] Op.Empty)
             )
         )
 
@@ -684,7 +684,7 @@ let ``結合: インデックス入れ子ループ（INNER / LEFT）`` () =
         match key with
         | [| SqlValue.Int 2L |] -> Ok(Op.ofArray [| [| SqlValue.Int 2L |] |])
         | [| SqlValue.Int 3L |] -> Ok(Op.ofArray [| [| SqlValue.Int 3L |] |])
-        | _ -> Ok Op.empty
+        | _ -> Ok Op.Empty
 
     let inner =
         ok (Op.toArray (Ops.innerJoinIndexed leftSchema left [| 0 |] rightSchema lookup None))

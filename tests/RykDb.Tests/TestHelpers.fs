@@ -29,6 +29,18 @@ let okOr defaultValue (r: Result<'T, DbError>) : 'T =
     | Ok v -> v
     | Error _ -> defaultValue
 
+/// テスト専用: 同じ Op 値を 2 回 `Op.next` すると失敗させる包み。
+/// `Op` の one-shot 不変条件（元の値を再利用せず、返された継続だけを使う）を機械的に検査する。
+let oneShot (label: string) (op: Op) =
+    let used = ref false
+
+    Op.compute (fun () ->
+        if used.Value then
+            failwithf "Op を 2 回消費しました: %s" label
+
+        used.Value <- true
+        Op.next op)
+
 /// 一意な一時ディレクトリを作る。
 let newDir (tag: string) =
     let dir =

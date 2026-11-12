@@ -81,9 +81,9 @@ module internal Dml =
 
             let rec emitRemaining i =
                 if i >= slotArr.Length then
-                    Op.Done
+                    Op.Empty
                 else
-                    Op.Compute(fun () ->
+                    Op.compute (fun () ->
                         match slotArr.[i] with
                         | _, Some v -> ret (Some(v, emitRemaining (i + 1)))
                         | _, None -> emitRemaining (i + 1) |> Op.next)
@@ -92,7 +92,7 @@ module internal Dml =
                 if i >= slotArr.Length then
                     cur
                 else
-                    Op.Compute(fun () ->
+                    Op.compute (fun () ->
                         match Op.next cur with
                         | Error e -> err e
                         | Ok None -> emitRemaining i |> Op.next
@@ -108,7 +108,7 @@ module internal Dml =
                                 | None -> merge nxt (i + 1) |> Op.next
                             | _ ->
                                 match sv with
-                                | Some v -> ret (Some(v, Op.Step(row, merge nxt (i + 1))))
+                                | Some v -> ret (Some(v, Op.emit row (merge nxt (i + 1))))
                                 | None -> ret (Some(row, merge nxt (i + 1))))
 
             merge rows 0
@@ -137,7 +137,7 @@ module internal Dml =
     /// `RowStore.scanAtRaw` の None（削除済み）は読み飛ばす。
     let private opOfScan (take: SstEntry -> bool) (scan: SstScan) =
         let rec emit scan =
-            Op.Compute(fun () ->
+            Op.compute (fun () ->
                 let rec pull current =
                     match SstScan.next current with
                     | Error e ->

@@ -455,9 +455,9 @@ module internal Ops =
 
         let rec emitGroups i =
             if i >= order.Count then
-                Op.Done
+                Op.Empty
             else
-                Op.Compute(fun () ->
+                Op.compute (fun () ->
                     let key = order.[i]
                     ret (Some(rowOf buckets.[key] key, emitGroups (i + 1))))
 
@@ -524,8 +524,8 @@ module internal Ops =
                 let rrow = rightRows.[i]
 
                 match joinPred leftSchema rightSchema lrow rrow on with
-                | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, loop true (i + 1))))
-                | Ok false -> Op.Compute(fun () -> Op.next (loop matched (i + 1)))
+                | Ok true -> Op.compute (fun () -> ret (Some(Array.append lrow rrow, loop true (i + 1))))
+                | Ok false -> Op.compute (fun () -> Op.next (loop matched (i + 1)))
                 | Error e -> onError e matched
 
         loop false 0
@@ -543,7 +543,7 @@ module internal Ops =
                             rightSchema
                             on
                             (fun _ -> joinRows lnext rightRows)
-                            (fun e _ -> Op.Compute(fun () -> err e))
+                            (fun e _ -> Op.compute (fun () -> err e))
                             rightRows
                             lrow
                     ))
@@ -562,12 +562,11 @@ module internal Ops =
                         if matched then
                             joinRows width lnext rightRows
                         else
-                            Op.Step(
-                                Array.append lrow (Array.create width SqlValue.Null),
-                                joinRows width lnext rightRows
-                            )
+                            Op.emit
+                                (Array.append lrow (Array.create width SqlValue.Null))
+                                (joinRows width lnext rightRows)
 
-                    let onError e _ = Op.Compute(fun () -> err e)
+                    let onError e _ = Op.compute (fun () -> err e)
                     Op.next (joinLoop leftSchema rightSchema on onExhausted onError rightRows lrow))
                 cur
 
@@ -590,7 +589,7 @@ module internal Ops =
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
     /// lookupRows は左キーから右行のリストを返す（見つからなければ空）。
     /// <remarks>
-    /// Op.Compute の継続内の相互再帰は「次の行を要求されたとき」に 1段ずつ進むので、スタックは積み上がらない。
+    /// Op.compute の継続内の相互再帰は「次の行を要求されたとき」に 1段ずつ進むので、スタックは積み上がらない。
     /// TailAudit はラムダ内の呼び出しを非末尾として報告するためベースラインに登録している。
     /// </remarks>
     let private joinProbe
@@ -612,7 +611,7 @@ module internal Ops =
                 (fun lrow lnext ->
                     if hasNullKey lrow leftKeys then
                         if isLeft then
-                            Op.next (Op.Compute(fun () -> ret (Some(padded lrow, probe lnext))))
+                            Op.next (Op.compute (fun () -> ret (Some(padded lrow, probe lnext))))
                         else
                             Op.next (probe lnext)
                     else
@@ -624,16 +623,17 @@ module internal Ops =
         and emit lrow lnext rows i matched =
             if i >= rows.Count then
                 if isLeft && not matched then
-                    Op.Compute(fun () -> ret (Some(padded lrow, probe lnext)))
+                    Op.compute (fun () -> ret (Some(padded lrow, probe lnext)))
                 else
                     probe lnext
             else
                 let rrow = rows.[i]
 
                 match residualMatches leftSchema rightSchema lrow rrow residual with
-                | Error e -> Op.Compute(fun () -> err e)
-                | Ok false -> Op.Compute(fun () -> Op.next (emit lrow lnext rows (i + 1) matched))
-                | Ok true -> Op.Compute(fun () -> ret (Some(Array.append lrow rrow, emit lrow lnext rows (i + 1) true)))
+                | Error e -> Op.compute (fun () -> err e)
+                | Ok false -> Op.compute (fun () -> Op.next (emit lrow lnext rows (i + 1) matched))
+                | Ok true ->
+                    Op.compute (fun () -> ret (Some(Array.append lrow rrow, emit lrow lnext rows (i + 1) true)))
 
         probe left
 
@@ -773,7 +773,7 @@ module internal Ops =
     /// （`Analyzer.chooseJoinAlgorithm` が走査の並び順を確認して選ぶ）。
     /// 右側を materialize せず、両側を 1行ずつ流す。
     /// <remarks>
-    /// `Op.Compute` の継続内で `loop` / `emitGroup` を呼ぶので、TailAudit はラムダ内の
+    /// `Op.compute` の継続内で `loop` / `emitGroup` を呼ぶので、TailAudit はラムダ内の
     /// 呼び出しを非末尾として報告する（`joinProbe` の `probe/emit` と同じ、1行ごとに 1段だけ進む）。
     /// </remarks>
     let private mergeJoin
@@ -794,30 +794,30 @@ module internal Ops =
         let rec loop lside rside =
             match lside, rside with
             | MergeStart _, _ ->
-                Op.Compute(fun () ->
+                Op.compute (fun () ->
                     match ensureMergeSide lside with
                     | Error e -> err e
                     | Ok lnext -> Op.next (loop lnext rside))
             | _, MergeStart _ ->
-                Op.Compute(fun () ->
+                Op.compute (fun () ->
                     match ensureMergeSide rside with
                     | Error e -> err e
                     | Ok rnext -> Op.next (loop lside rnext))
-            | MergeDone, _ -> Op.empty
+            | MergeDone, _ -> Op.Empty
             | _, MergeDone ->
                 if not isLeft then
-                    Op.empty
+                    Op.Empty
                 else
                     match lside with
                     | MergeAt(lrow, _) ->
-                        Op.Compute(fun () ->
+                        Op.compute (fun () ->
                             match pullMergeSide lside with
                             | Error e -> err e
                             | Ok lnext -> ret (Some(padded lrow, loop lnext MergeDone)))
-                    | _ -> Op.empty
+                    | _ -> Op.Empty
             | MergeAt(lrow, _), MergeAt(rrow, _) ->
                 if hasNullKey lrow leftKeys then
-                    Op.Compute(fun () ->
+                    Op.compute (fun () ->
                         match pullMergeSide lside with
                         | Error e -> err e
                         | Ok lnext ->
@@ -826,15 +826,15 @@ module internal Ops =
                             else
                                 Op.next (loop lnext rside))
                 elif hasNullKey rrow rightKeys then
-                    Op.Compute(fun () ->
+                    Op.compute (fun () ->
                         match pullMergeSide rside with
                         | Error e -> err e
                         | Ok rnext -> Op.next (loop lside rnext))
                 else
                     match compareKeyVectors 0 (keyOf lrow leftKeys) (keyOf rrow rightKeys) with
-                    | Error e -> Op.Compute(fun () -> err e)
+                    | Error e -> Op.compute (fun () -> err e)
                     | Ok c when c < 0 ->
-                        Op.Compute(fun () ->
+                        Op.compute (fun () ->
                             match pullMergeSide lside with
                             | Error e -> err e
                             | Ok lnext ->
@@ -843,16 +843,16 @@ module internal Ops =
                                 else
                                     Op.next (loop lnext rside))
                     | Ok c when c > 0 ->
-                        Op.Compute(fun () ->
+                        Op.compute (fun () ->
                             match pullMergeSide rside with
                             | Error e -> err e
                             | Ok rnext -> Op.next (loop lside rnext))
                     | Ok _ ->
                         match takeMergeGroup leftKeys lside with
-                        | Error e -> Op.Compute(fun () -> err e)
+                        | Error e -> Op.compute (fun () -> err e)
                         | Ok(lgroup, lnext) ->
                             match takeMergeGroup rightKeys rside with
-                            | Error e -> Op.Compute(fun () -> err e)
+                            | Error e -> Op.compute (fun () -> err e)
                             | Ok(rgroup, rnext) -> emitGroup lgroup rgroup lnext rnext 0 0 false
 
         and emitGroup lgroup rgroup lnext rnext i j matchedThisRow =
@@ -860,7 +860,7 @@ module internal Ops =
                 loop lnext rnext
             elif j >= rgroup.Length then
                 if isLeft && not matchedThisRow then
-                    Op.Compute(fun () ->
+                    Op.compute (fun () ->
                         ret (Some(padded lgroup.[i], emitGroup lgroup rgroup lnext rnext (i + 1) 0 false)))
                 else
                     emitGroup lgroup rgroup lnext rnext (i + 1) 0 false
@@ -869,14 +869,14 @@ module internal Ops =
                 let rrow = rgroup.[j]
 
                 match residualMatches leftSchema rightSchema lrow rrow residual with
-                | Error e -> Op.Compute(fun () -> err e)
+                | Error e -> Op.compute (fun () -> err e)
                 | Ok false ->
-                    Op.Compute(fun () -> Op.next (emitGroup lgroup rgroup lnext rnext i (j + 1) matchedThisRow))
+                    Op.compute (fun () -> Op.next (emitGroup lgroup rgroup lnext rnext i (j + 1) matchedThisRow))
                 | Ok true ->
-                    Op.Compute(fun () ->
+                    Op.compute (fun () ->
                         ret (Some(Array.append lrow rrow, emitGroup lgroup rgroup lnext rnext i (j + 1) true)))
 
-        Op.Compute(fun () -> Op.next (loop (MergeStart left) (MergeStart right)))
+        Op.compute (fun () -> Op.next (loop (MergeStart left) (MergeStart right)))
 
     /// INNER JOIN（マージ結合）。両入力は結合キーで昇順であること。
     /// 右側を materialize しないので、右が大きなテーブルでもメモリはキー重複分だけで済む。

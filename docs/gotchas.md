@@ -749,6 +749,10 @@ all [ r1; r2 ]
 let empty: Result<int list, DbError> = all []
 ```
 
+**意味論**: `all` は `foldOk` と同じく**最初の `Error` で打ち切り**、残りの項目は列挙しない。
+複数の `Error` があっても返るのは最初の 1つ。
+1回限りの `seq`（列挙子）を渡しても、二重に列挙されることはない。
+
 ### 8.7 `SqlValue` は `:?>` できない（FS0016）
 
 proper subtype がないので型テストできない。
@@ -1410,12 +1414,17 @@ Footer は Meta / Bloom / Index の連続領域を守る `metadataChecksum` と�
 
 `Op` は one-shot な値で、行を 1つ進めると次の状態 `nxt` が返る。
 `Op.next cur` を呼んだ後、返り値の `nxt` ではなく `cur` をもう一度 `Op.next` すると、
-**先頭行ではなく次の行**が返る。
+**先頭行ではなく次の行**が返る
+（状態を持つソースでは行が飛ぶ・重複する。純粋な `Op.ofArray` では同じ先頭行が再び返る）。
 transaction の overlay（store の行 + txn のスロット）で `cur` を再利用してしまい、
 既存行がある状態の `BEGIN; INSERT/UPDATE; SELECT` が行の欠落・重複・古い値を返していた
 （`Dml.overlayRows`）。
 
 - 正しい形: `match Op.next cur with | Ok(Some(row, nxt)) -> ... merge nxt ...`
+- **構築は `Op.empty` / `Op.ofRow` / `Op.emit` / `Op.compute` / `Op.ofArray` に限る**。
+  `Op.Done` / `Op.Step` / `Op.Compute` を直接書かない
+  （`OpTests` の `構築はスマートコンストラクタに限る` がソースを検査する）。
+- テストでは `TestHelpers.oneShot` でソースを包むと、2 回目の `next` を検出できる。
 - 回帰テスト: `E2E: 既存行がある transaction 内の INSERT は SELECT に全行見える` /
   `...複数 UPDATE が正しい` / `...索引検索が書き込みを見る`。
 - store が空の transaction だけを試すと、このバグは出ない。

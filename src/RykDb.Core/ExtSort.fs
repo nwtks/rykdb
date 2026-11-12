@@ -379,7 +379,7 @@ module internal ExtSort =
                             ret (Some(row, before @ advanced :: after))
 
         let rec mergeRuns states =
-            Op.Compute(fun () ->
+            Op.compute (fun () ->
                 match pull states with
                 | Error e -> err e
                 | Ok None -> ret None
@@ -433,7 +433,7 @@ module internal ExtSort =
                             err e
                         | Ok p ->
                             buf.Clear()
-                            ingest stamp buf 0L (written + 1) (p :: paths) state' (Op.Step(row, tail))
+                            ingest stamp buf 0L (written + 1) (p :: paths) state' (Op.emit row tail)
                     else
                         buf.Add row
                         ingest stamp buf (bufBytes + size) written paths state' tail

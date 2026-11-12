@@ -17,12 +17,21 @@ namespace RykDb.Core
 /// メモリ上は配列のまま、回さない。
 type internal Row = SqlValue array
 
+/// 1行取り出す pull 演算子。
+/// <remarks>
+/// **one-shot**: 値は 1回だけ消費する。
+/// `next` が返した継続（組の 2番目）だけを次の行に使い、
+/// 元の `Op` をもう一度 `next` してはいけない
+/// （`Step` は同じ行を再び返し、`Compute` は継続を巻き戻す）。
+/// 構築は `empty` / `ofRow` / `emit` / `compute` / `ofArray` に限る
+/// （`OpTests` が直接ケースを使っていないことを検査する）。
+/// </remarks>
 [<RequireQualifiedAccess>]
 type internal Op =
     | Done
     /// 1行と「その次」。
     /// next は評価されるので長い連鎖を組むには向かない
-    /// （遅延が必要なときは Compute を使う）。
+    /// （遅延が必要なときは compute を使う）。
     | Step of SqlValue array * Op
     /// 「次に 1行を返す関数」。
     /// 引数は unit なので遅延評価される。
@@ -31,19 +40,28 @@ type internal Op =
 
 module internal Op =
     /// 空の演算子。
-    let empty = Op.Done
+    let Empty = Op.Done
 
     /// 1行だけの演算子。
     let ofRow (row: SqlValue array) = Op.Step(row, Op.Done)
+
+    /// 1行と「その次」を返す。
+    /// `nxt` には `next` が返した継続をそのまま渡す（one-shot）。
+    let emit (row: SqlValue array) (nxt: Op) = Op.Step(row, nxt)
+
+    /// 「次に 1行を返す関数」から演算子を作る。
+    /// 関数は 1回だけ呼ばれる想定（one-shot）。
+    /// 返す組の 2番目には、その行の続きを入れる。
+    let compute (f: unit -> Result<(SqlValue array * Op) option, DbError>) = Op.Compute f
 
     /// 配列を順に返す演算子。
     /// 次の行は呼び出すたびに計算する。
     let ofArray (rows: SqlValue array array) =
         let rec rowsFrom i =
             if i >= rows.Length then
-                Op.Done
+                Empty
             else
-                Op.Compute(fun () -> ret (Some(rows.[i], rowsFrom (i + 1))))
+                compute (fun () -> ret (Some(rows.[i], rowsFrom (i + 1))))
 
         rowsFrom 0
 
@@ -58,7 +76,7 @@ module internal Op =
     /// 継続は「行と残りの Op」を受け取り、返した Result をそのまま返す。
     /// 返した「その行の次」の Op が演算子の残りになる。
     let pull (cont: SqlValue array -> Op -> Result<(SqlValue array * Op) option, DbError>) (src: Op) =
-        Op.Compute(fun () ->
+        compute (fun () ->
             next src
             >>= function
                 | None -> ret None
@@ -92,7 +110,7 @@ module internal Op =
     /// 「制限なし」は呼び出し側が take を呼ばないこと表す。
     let rec take (n: int) (src: Op) =
         if n <= 0 then
-            Op.Done
+            Empty
         else
             pull (fun row nxt -> ret (Some(row, take (n - 1) nxt))) src
 

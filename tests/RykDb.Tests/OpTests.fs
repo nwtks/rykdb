@@ -26,7 +26,7 @@ let private col (name: string) =
 let ``Op: 次の行を引くまで計算しない`` () =
     // 無限に伸びる Op でも 1行しか引かずに終わる。
     let rec infinite (n: int) : Op =
-        Op.Compute(fun () -> ret (Some([| SqlValue.Int(int64 n) |], infinite (n + 1))))
+        Op.compute (fun () -> ret (Some([| SqlValue.Int(int64 n) |], infinite (n + 1))))
 
     let op = Op.take 3 (infinite 0)
     let rows = ok (Op.toArray op)
@@ -40,6 +40,68 @@ let ``Op: 配列の演算子は 1行ずつ返す`` () =
     let rows = ok (Op.toArray op)
     Assert.Equal<int>(2, rows.Length)
     Assert.Equal<int64>(1L, asInt rows.[0].[0])
+
+[<Fact>]
+let ``Op: emit / empty / ofRow は 1行ずつ返す`` () =
+    let op = Op.emit (row [ SqlValue.Int 7L ]) (Op.ofRow (row [ SqlValue.Int 8L ]))
+    let rows = ok (Op.toArray op)
+    Assert.Equal<int>(2, rows.Length)
+    Assert.Equal<int64>(7L, asInt rows.[0].[0])
+    Assert.Equal<int64>(8L, asInt rows.[1].[0])
+
+[<Fact>]
+let ``Op: 純粋なソースでも同じ値を 2 回 next すると先頭行が再び返る（継続を使う理由）`` () =
+    let src = Op.ofArray [| row [ SqlValue.Int 1L ]; row [ SqlValue.Int 2L ] |]
+    let first = ok (Op.next src)
+    let again = ok (Op.next src)
+
+    match first, again with
+    | Some(f, nxt), Some(a, _) ->
+        // 同じ値を 2 回 next すると先頭行が再び返る（one-shot 違反）。
+        Assert.Equal<SqlValue array>(f, a)
+        // 継続を使えば残りは 1行だけ。
+        Assert.Equal<int>(1, (ok (Op.toArray nxt)).Length)
+    | _ -> Assert.Fail "2 行あるはず"
+
+[<Fact>]
+let ``Op: one-shot ガードは同じ値の 2 回目の next を検出する`` () =
+    let op = oneShot "guard" (Op.ofRow (row [ SqlValue.Int 1L ]))
+    ok (Op.next op) |> ignore
+
+    let mutable detected = false
+
+    try
+        Op.next op |> ignore
+    with _ ->
+        detected <- true
+
+    Assert.True detected
+
+[<Fact>]
+let ``Op: 構築はスマートコンストラクタに限る（直接ケースを使わない）`` () =
+    // F# の private は名前空間レベルではアセンブリ内にしか効かないため、
+    // 「Op.fs 以外で Op.Done / Op.Step / Op.Compute を書かない」ことをソースで検査する。
+    let sourceDir =
+        System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "..", "..", "src", "RykDb.Core"))
+
+    let offenders =
+        System.IO.Directory.GetFiles(sourceDir, "*.fs")
+        |> Array.filter (fun path -> System.IO.Path.GetFileName path <> "Op.fs")
+        |> Array.collect (fun path ->
+            System.IO.File.ReadAllLines path
+            |> Array.indexed
+            |> Array.choose (fun (i, line) ->
+                let code =
+                    match line.IndexOf "//" with
+                    | -1 -> line
+                    | c -> line.Substring(0, c)
+
+                if [ "Op.Done"; "Op.Step"; "Op.Compute" ] |> List.exists code.Contains then
+                    Some(sprintf "%s:%d: %s" (System.IO.Path.GetFileName path) (i + 1) (line.Trim()))
+                else
+                    None))
+
+    Assert.True(Array.isEmpty offenders, "Op の生ケースが残っています:\n" + String.concat "\n" offenders)
 
 [<Fact>]
 let ``末尾再帰: Op.ofArray を 200000行組み立ててもスタックを食わない`` () =
@@ -70,11 +132,38 @@ let ``Op: filter と skip`` () =
     Assert.Equal<int64>(4L, asInt rows.[0].[0])
 
 [<Fact>]
+let ``Op: map / filter / take / skip は入力を 1 回だけ消費する`` () =
+    let source =
+        oneShot "source" (Op.ofArray [| row [ SqlValue.Int 1L ]; row [ SqlValue.Int 2L ]; row [ SqlValue.Int 3L ] |])
+
+    let mapped = oneShot "map" (Op.map (fun r -> ret r) source)
+
+    let filtered =
+        oneShot "filter" (Op.filter (fun r -> ret (asInt r.[0] >= 2L)) mapped)
+
+    let skipped = oneShot "skip" (Op.skip 1 filtered)
+    let op = oneShot "take" (Op.take 1 skipped)
+    let rows = ok (Op.toArray op)
+    Assert.Equal<int>(1, rows.Length)
+    Assert.Equal<int64>(3L, asInt rows.[0].[0])
+
+[<Fact>]
+let ``Op: pull はソースを 1 回だけ消費する`` () =
+    let src =
+        oneShot "pull" (Op.ofArray [| row [ SqlValue.Int 1L ]; row [ SqlValue.Int 2L ] |])
+
+    let out = Op.pull (fun r nxt -> ret (Some(r, nxt))) src
+    let rows = ok (Op.toArray out)
+    Assert.Equal<int>(2, rows.Length)
+    Assert.Equal<int64>(1L, asInt rows.[0].[0])
+    Assert.Equal<int64>(2L, asInt rows.[1].[0])
+
+[<Fact>]
 let ``Op: 大きな Op でも take は早期に打ち切る`` () =
     // 1000000行の Op を遅延評価で作る。Step の tail を先に評価すると
     // 1000000個が先に出来上がるので、Compute で 1行ずつ生成する。
     let rec counter n =
-        Op.Compute(fun () ->
+        Op.compute (fun () ->
             if n >= 1_000_000 then
                 ret None
             else

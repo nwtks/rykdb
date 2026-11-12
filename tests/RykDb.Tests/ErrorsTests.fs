@@ -129,6 +129,38 @@ let ``ResultOps.all: 1 つでも Error なら Error`` () =
     | Ok _ -> Assert.Fail "Error が伝播すべき"
 
 [<Fact>]
+let ``ResultOps.all: 最初の Error を返す`` () =
+    let r = all [ err (DbError.notFound "first"); err (DbError.typeError "second") ]
+
+    match r with
+    | Error e ->
+        Assert.Equal(ErrorKind.NotFound, e.Kind)
+        Assert.Equal("first", e.Message)
+    | Ok _ -> Assert.Fail "Error が伝播すべき"
+
+[<Fact>]
+let ``ResultOps.all: 最初の Error で列挙を打ち切る`` () =
+    let mutable seen = 0
+
+    let items =
+        seq {
+            seen <- seen + 1
+            yield ret 1
+            seen <- seen + 1
+            yield err (DbError.notFound "first")
+            seen <- seen + 1
+            yield err (DbError.typeError "second")
+            seen <- seen + 1
+            yield ret 2
+        }
+
+    match all items with
+    | Error e -> Assert.Equal(ErrorKind.NotFound, e.Kind)
+    | Ok _ -> Assert.Fail "Error が伝播すべき"
+
+    Assert.Equal(2, seen)
+
+[<Fact>]
 let ``ResultOps.foldOk`` () =
     let r = foldOk (fun s (x: int) -> ret (s + x)) 0 [ 1; 2; 3 ]
     Assert.Equal(Ok 6, r)
