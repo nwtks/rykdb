@@ -1,7 +1,9 @@
 // ===========================================================================
 // RykDb.Server — プロトコルとサーバ本体。
-// 1接続 = 1クライアント。接続ごとに Task を起動して並行に処理する。
-// 複数接続は 1つの Session を共有する（SELECT は並行、書き込みは Session 内で直列）。
+// 1接続 = 1クライアント。接続ごとに Task と Session を起動して並行に処理する。
+// 各 Session は独立した transaction を持ち、
+//commit の採番・競合検出・WAL・memtable は SessionPool（DatabaseHost）が全接続で共有する。
+// 明示 transaction は接続ごとに独立し、切断時はその接続の transaction だけを rollback する。
 // 改行区切りの 1行テキストを交換し、応答の先頭タグで成否を分ける:
 //   OK <行数>\t<列名,...>   成功(続く行がデータ。SELECT は0行でも列名を返す)
 //   OK <行数>               DML など列を持たない成功
@@ -91,7 +93,7 @@ let private sendRows (writer: System.IO.StreamWriter) (columns: string array) (r
     with _ ->
         false
 
-let private handleClient (onLog: string -> unit) (session: Session) (client: System.Net.Sockets.TcpClient) =
+let private handleClientSession (onLog: string -> unit) (session: Session) (client: System.Net.Sockets.TcpClient) =
     use stream = client.GetStream()
 
     use reader =
@@ -101,19 +103,6 @@ let private handleClient (onLog: string -> unit) (session: Session) (client: Sys
         new System.IO.StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
 
     writer.AutoFlush <- true
-
-    let mutable ownsTransaction = false
-
-    let runSql sql =
-        match session.ExecuteTracked sql with
-        | Error e -> Error e
-        | Ok(result, change) ->
-            match change with
-            | SessionTransactionChange.Started -> ownsTransaction <- true
-            | SessionTransactionChange.Ended -> ownsTransaction <- false
-            | SessionTransactionChange.NoChange -> ()
-
-            Ok result
 
     let send (line: string) =
         try
@@ -133,7 +122,7 @@ let private handleClient (onLog: string -> unit) (session: Session) (client: Sys
         match session.TryOpenReader sql with
         | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
         | Ok None ->
-            match runSql sql with
+            match session.Execute sql with
             | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
             | Ok result -> sendResult result
         | Ok(Some rowReader) ->
@@ -183,17 +172,34 @@ let private handleClient (onLog: string -> unit) (session: Session) (client: Sys
                 | _ when sql.StartsWith(".stream ", System.StringComparison.Ordinal) ->
                     running <- sendStream (sql.Substring(".stream ".Length).Trim())
                 | _ ->
-                    match runSql sql with
+                    match session.Execute sql with
                     | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
                     | Ok result -> running <- sendResult result
 
-    if ownsTransaction && session.InTransaction then
+    if session.InTransaction then
         match session.Rollback() with
         | Ok() -> ()
-        | Error e -> sprintf "切断時のロールバックに失敗しました: %s" (DbError.toDisplayString e) |> onLog
+        | Error e -> sprintf "接続終了時のロールバックに失敗しました: %s" (DbError.toDisplayString e) |> onLog
+
+/// 接続ごとに独立した Session を発行して処理する。
+/// <remarks>
+/// Session は 1接続 = 1論理接続なので、未 commit の transaction は接続ごとに閉じ込められる。
+/// 切断時は `Session.Close` がその接続の transaction を rollback するので、
+/// 他接続の transaction を巻き戻すことはない。
+/// </remarks>
+let private handleClient (onLog: string -> unit) (pool: SessionPool) (client: System.Net.Sockets.TcpClient) =
+    match pool.CreateSession() with
+    | Error e -> sprintf "接続用の Session を作れません: %s" (DbError.toDisplayString e) |> onLog
+    | Ok session ->
+        try
+            handleClientSession onLog session client
+        finally
+            match session.Close() with
+            | Ok() -> ()
+            | Error e -> sprintf "接続の後始末に失敗しました: %s" (DbError.toDisplayString e) |> onLog
 
 let serve
-    (session: Session)
+    (pool: SessionPool)
     (listener: System.Net.Sockets.TcpListener)
     (stop: System.Threading.CancellationToken)
     (onLog: string -> unit)
@@ -213,7 +219,7 @@ let serve
 
     let handleConnection clientId client =
         try
-            handleClient (fun m -> sprintf "[%d] %s" clientId m |> onLog) session client
+            handleClient (fun m -> sprintf "[%d] %s" clientId m |> onLog) pool client
         with ex ->
             sprintf "[%d] 例外: %s" clientId ex.Message |> onLog
 
@@ -266,4 +272,4 @@ let serve
     if pending.Length > 0 then
         System.Threading.Tasks.Task.WaitAll(pending, 10000) |> ignore
 
-    session.Close() |> ignore
+    pool.Close() |> ignore

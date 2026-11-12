@@ -35,9 +35,11 @@ flowchart TB
         LIB["F# ライブラリ利用者"]
     end
 
-    SESS["Session.fs<br/>公開 API・現在ハンドルの保持"]
+    SESS["Session.fs<br/>Session（1接続）/ SessionPool"]
+    HOST["Session.fs<br/>DatabaseHost<br/>共有 committed state・採番・fsync"]
     DB["Database.fs<br/>internal の不変ハンドル"]
-    SESS --> DB
+    SESS --> HOST
+    HOST --> DB
 
     subgraph EX["実行"]
         EN["Engine.fs<br/>文の実行（Ddl / Engine）"]
@@ -168,8 +170,10 @@ flowchart TB
 2. **MVCC の snapshot が自然に固定される**。
    読み取り中に状態が書き換わらない。
 3. **更新の書き忘れを型で防ぐ**。
-   外部に公開するのは `Session` だけで、不変ハンドル `Database` は internal に閉じる。
-   `Session` が現在のハンドルを保持するため、利用者が差し替えを忘れることはない。
+   外部に公開するのは `Session` / `SessionPool` だけで、不変ハンドル `Database` は internal に閉じる。
+   接続ローカルの transaction 状態は `Session` が持ち、
+   committed な状態は `DatabaseHost` が唯一の持ち主として差し替えるので、
+   利用者が更新を忘れる経路はない。
 
 ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`Op.toArray`、`ExtSort` の受け皿、
 `Database.fs` のクライアント層などでは `ResizeArray` / `Dictionary` / `HashSet` を使う
@@ -189,39 +193,39 @@ flowchart TB
 
 ### モジュール一覧（`src/RykDb.Core/`）
 
-| ファイル           | 役割                                                                                        |
-| ------------------ | ------------------------------------------------------------------------------------------- |
-| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）           |
-| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）   |
-| `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`                   |
-| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                              |
-| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                      |
-| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                   |
-| `Sstable.fs`       | SSTable の構築・読み取り・k-way merge（ブロック / index / Bloom / Footer）                  |
-| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                   |
-| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                 |
-| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                           |
-| `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                       |
-| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                 |
-| `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                        |
-| `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                      |
-| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                  |
-| `EngineHost.fs`    | background compaction の共有状態（Version / 採番 / ファイル refcount / worker / install）   |
-| `ProcessLock.fs`   | プロセス間ロック（`.rykdb.format` を排他で保持、`ProcessLock`）                             |
-| `RowStore.fs`      | 単一 LSM と keyspace 接頭辞（`RowStore` 型 + `Keyspace` モジュール）                        |
-| `Catalog.fs`       | `IndexSchema` / `TableSchema` / `Catalog` と出力 `Schema` / `OutputColumn` の型・モジュール |
-| `Eval.fs`          | スカラー関数 `Scalar` と式評価器 `Eval`                                                     |
-| `Op.fs`            | pull 演算子 `Op` / `Row`（`ExtSort` が `Op` を使うため先にコンパイル）                      |
-| `ExtSort.fs`       | 外部マージソート `ExtSort` と一時ファイル `Spill`（ソートの溢らし・k-way merge）            |
-| `Ops.fs`           | 演算子の組み立て `Ops`（フィルタ・ソート・結合・集約・射影・DISTINCT）                      |
-| `Dml.fs`           | `RowKey` / `Dml`（`Transaction` のバッファへ行・索引を積む DML ヘルパ）                     |
-| `ExecContext.fs`   | 実行時文脈 `ExecContext` と DML `DmlOps`（INSERT / UPDATE / DELETE）                        |
-| `Analyzer.fs`      | `ScanMethod` / `JoinAlgorithm` / `Logical`、`Binder` / `Alias` / `Predicate` / `Analyzer`   |
-| `Planner.fs`       | `Optimizer`（論理代数 → `Op`）と `Plan`（SELECT の実行）                                    |
-| `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                      |
-| `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                |
-| `Database.fs`      | internal の不変ハンドル `Database`（transaction・状態遷移）                                 |
-| `Session.fs`       | 公開 API `Session`（`Database` をカプセル化。読み取りは並行、書き込みは直列化）             |
+| ファイル           | 役割                                                                                                                     |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）                                        |
+| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）                                |
+| `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`                                                |
+| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                                                           |
+| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                                                   |
+| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                                                |
+| `Sstable.fs`       | SSTable の構築・読み取り・k-way merge（ブロック / index / Bloom / Footer）                                               |
+| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                                                |
+| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                                              |
+| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                                                        |
+| `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                                                    |
+| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                                              |
+| `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                                                     |
+| `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                                                   |
+| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                                               |
+| `EngineHost.fs`    | background compaction の共有状態（Version / 採番 / ファイル refcount / worker / install）                                |
+| `ProcessLock.fs`   | プロセス間ロック（`.rykdb.format` を排他で保持、`ProcessLock`）                                                          |
+| `RowStore.fs`      | 単一 LSM と keyspace 接頭辞（`RowStore` 型 + `Keyspace` モジュール）                                                     |
+| `Catalog.fs`       | `IndexSchema` / `TableSchema` / `Catalog` と出力 `Schema` / `OutputColumn` の型・モジュール                              |
+| `Eval.fs`          | スカラー関数 `Scalar` と式評価器 `Eval`                                                                                  |
+| `Op.fs`            | pull 演算子 `Op` / `Row`（`ExtSort` が `Op` を使うため先にコンパイル）                                                   |
+| `ExtSort.fs`       | 外部マージソート `ExtSort` と一時ファイル `Spill`（ソートの溢らし・k-way merge）                                         |
+| `Ops.fs`           | 演算子の組み立て `Ops`（フィルタ・ソート・結合・集約・射影・DISTINCT）                                                   |
+| `Dml.fs`           | `RowKey` / `Dml`（`Transaction` のバッファへ行・索引を積む DML ヘルパ）                                                  |
+| `ExecContext.fs`   | 実行時文脈 `ExecContext` と DML `DmlOps`（INSERT / UPDATE / DELETE）                                                     |
+| `Analyzer.fs`      | `ScanMethod` / `JoinAlgorithm` / `Logical`、`Binder` / `Alias` / `Predicate` / `Analyzer`                                |
+| `Planner.fs`       | `Optimizer`（論理代数 → `Op`）と `Plan`（SELECT の実行）                                                                 |
+| `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                                                   |
+| `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                                             |
+| `Database.fs`      | internal の不変ハンドル `Database`（transaction・状態遷移）                                                              |
+| `Session.fs`       | 公開 API `Session` / `SessionPool` と `DatabaseHost`（接続ごとの transaction・読み取りは並行、書き込みはホストで直列化） |
 
 ### F# のコンパイル順
 
@@ -934,8 +938,8 @@ commit 時の GC 境界は両者の最小値で、これが各 `StorageEngine.Ac
 compaction の GC は「この SeqNo より古い版」だけを捨てる。
 replay 中は 0（全版を残す）を使う。
 
-登録は `Database.Begin()`（および `Execute` の暗黙・明示 transaction）で行い、
-commit 成功・rollback・`Close` で解除する。
+登録は `DatabaseHost.Begin` / 接続の暗黙 transaction（`Engine.executeStatementWithLimits`）で行い、
+commit 成功・rollback・`Session.Close` で解除する。
 1つの登録は同じ transaction の state を持つ**複数のハンドルで共有**される
 （`tx.Execute` のたびに新しいハンドルが返るため）。
 そこで登録はハンドルの生存トークンを数え（`ActiveRegistration`）、
@@ -949,46 +953,60 @@ commit 成功・rollback・`Close` で解除する。
 登録・解除・最古値の走査はプロセス内の Gate で直列化する
 （空になった bucket の削除と register の追加が競合して登録が消えるのを防ぐ）。
 
-### 7.6 `Session` の transaction モデル
+### 7.6 `Session` の transaction モデル（接続ごとに独立）
 
 `Session.Execute` は任意の SQL を実行し、暗黙の transaction で自動的に commit する。
 `Begin()` 以降は `Commit()` / `Rollback()` するまで同じ transaction を使う。
 
-> **注意** SQL 文としての `BEGIN` / `COMMIT` / `ROLLBACK` は transaction を制御する
-> （`Session.Execute` が 1文ずつ `Database.Execute` へ渡す）。
-> `Engine.runStatement` には到達しない。
-> 明示 transaction はライブラリ API の `session.Begin()` / CLI の `.begin` `.commit` `.rollback` を使う。
+> **注意** SQL 文としての `BEGIN` / `COMMIT` / `ROLLBACK` も transaction を制御する
+> （`Session` が `Statement.Begin` / `Commit` / `Rollback` を `DatabaseHost` へ渡す）。
+> 明示 transaction はライブラリ API の `session.Begin()` / CLI の `.begin` `.commit` `.rollback` と同じ経路。
 
-`Session` は内部に現在の `Database` ハンドルを 1本だけ保持し、`lock` で呼び出しを直列化する。
-`Database` は internal なので、利用者が古いハンドルを使い回したり、`Execute` の戻り値を無視したりする経路はない。
-複数文を 1回の `Execute` に渡した場合も 1文ずつ実行し、各文が成功するたびに現在のハンドルを更新する。
-そのため途中の文が失敗しても、それ以前に成功した文の状態（と `BEGIN` 後の開いた transaction）は失われない。
+**`Session` は 1接続 = 1論理接続**。同じ DB を共有する複数の `Session` は `SessionPool` が発行する。
+接続ローカルの状態（`Active` / `Pending` / `ActiveRegistration`）は `SessionState` に置き、
+committed な Store / Catalog / Manager は `DatabaseHost` が全接続で共有する。
+
+- **BEGIN**: 共有の `TransactionManager` で採番し、`Active` に加える。
+- **COMMIT / ROLLBACK**: 共有の Manager に対して競合検出・採番・abort を行う。
+- **文の実行**: 毎回「最新の committed state」に接続ローカルの transaction を重ねて実行する（rebase）。
+  `Snapshot.SeqNo` は BEGIN 時に固定されるので、Store を最新にしても可視性は repeatable read のまま。
+- **暗黙 transaction の DML / DDL**: 実行結果の committed 部分を `DatabaseHost` に publish する。
+- 複数文を 1回の `Execute` に渡した場合も 1文ずつ実行し、成功するたびに接続ローカルの状態を更新する。
+  途中の文が失敗しても、それ以前に成功した文（と `BEGIN` 後の開いた transaction）は失われない。
+
+読み取り（`SELECT` だけのバッチ）は `DatabaseHost` から committed state と Version pin を受け取り、
+ロックなしで実行する（§7.7）。`RowReader`（`TryOpenReader`）も同じ経路。
+
+`Session.Close` は自分の transaction を rollback してから接続を閉じる。
+DB 全体を閉じるのは所有者（`Session.OpenWith` の `Session`、または `SessionPool.Close`）だけ。
 
 ### 7.7 同時実行制御 — 並行性は値、Session は読み取り並行・書き込み直列、DDL だけ排他
 
 `Session` 層を除く通常の読み書き経路に `lock` / `Monitor` / `Interlocked` はない。
 同時実行制御は次の 4層の組み合わせで成り立っている。
 
-| 層                 | 役割                           | 詳細                                                                                                                                                                                                                                                                                                                                     |
-| ------------------ | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. 不変レコード    | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                                                                                                                                                                  |
-| 2. `Session`       | **公開 API の並行性の単位**    | SELECT のみの `Execute` は `stateGate`（入口・出口の短い区間）だけで複数スレッド／複数接続から並行実行できる。書き込み・`Begin` / `Commit` / `Rollback`・`Close` は `writeGate` で直列化し、現在の `Database` ハンドルは `stateGate` の下で更新する。`StorageEngine` 内部の WAL / flush / close は DB ディレクトリ単位の Gate で保護する |
-| 3. MVCC + 競合検査 | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                                                                                                                                                                          |
-| 4. keyspace 接頭辞 | **論理的な分離**               | `t:` / `i:` / `__catalog__` は 1本の LSM 上で接頭辞により分離される。物理ツリーは共有するため、テーブル間の並列性は提供しない（§6.1）                                                                                                                                                                                                    |
+| 層                 | 役割                           | 詳細                                                                                                                                                                                                                                                                                    |
+| ------------------ | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. 不変レコード    | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                                                                                                                 |
+| 2. `Session`       | **公開 API の並行性の単位**    | 接続ごとに独立した `Session` が transaction を持ち、SELECT だけの `Execute` は `stateGate`（入口・出口の短い区間）だけで並行実行できる。書き込み・`Begin` / `Commit` / `Rollback`・`Close` は接続内で `writeGate` 直列化し、DB 全体の書き込みは `DatabaseHost.writeGate` で直列化する。 |
+| 3. MVCC + 競合検査 | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                                                                                                                         |
+| 4. keyspace 接頭辞 | **論理的な分離**               | `t:` / `i:` / `__catalog__` は 1本の LSM 上で接頭辞により分離される。物理ツリーは共有するため、テーブル間の並列性は提供しない（§6.1）                                                                                                                                                   |
 
 重要な含意は 2つ。
 
-1. **同じ DB（root）は 1本の `Session` で共有する**。
+1. **同じ DB（root）は 1つの `SessionPool` で共有する**。
    独立した 2つの `OpenWith` はできない（§7.9）。
-   複数スレッド／複数接続で 1本の `Session` を共有でき、
-   **SELECT だけのバッチは並行実行**、書き込み・transaction 操作・`Close` は直列化される。
-   読み取りは呼び出し入口でハンドル捕捉と `AcquireSnapshot`（Version 全ファイルの pin）を**同じ短いロック区間で**行い、
+   `SessionPool.CreateSession` が接続ごとの `Session` を発行し、
+   **SELECT だけのバッチは接続間で並行実行**、DB 全体の書き込み・transaction 操作は
+   `DatabaseHost.writeGate` で直列化される。
+   明示 transaction は接続ごとに独立し、他接続の未 commit は見えない。
+   読み取りは呼び出し入口で committed state の捕捉と `AcquireSnapshot`（Version 全ファイルの pin）を
+   **同じ短いロック区間で**行い、
    実行中はロックを取らない（MVCC スナップショット読み）。
    捕捉と pin を分けると、間に commit + flush + compaction が入ったとき
    古い snapshot に必要な版が GC され得るので分けない。
-   `Close` は実行中の読み取りが終わるのを待ってから閉じる。
-   transaction は Session 全体で 1つ。複数接続で共有すると未 commit の行も見えるので、
-   複数スレッドで 1つの transaction を共有しないこと。
+   `Session.Close` は自分の読み取りの完了を待ってから閉じる。
+   複数スレッドで 1つの transaction を共有しないこと（transaction は接続単位）。
 2. **commit の直列化は「その経路を単一に通る」という規約**であり、
    `Session` の `lock` は公開 API の呼び出しを守るが、
    internal の `Database` を直接使うテストでは規約が前提になる。
@@ -1007,8 +1025,9 @@ commit 成功・rollback・`Close` で解除する。
   `writeGate` の内側では WAL 追記と位置の登録だけを行い、
   fsync の待機は `writeGate` の外で行う。複数の commit が待っていれば、
   先頭の待機者が登録済みの最大 WAL 位置まで 1回 fsync し、全員を起こす。
-- **TCP サーバは接続ごとに Task** — accept ごとに `handleClient` を起動し、1つの `Session` を共有する（§11.3）。
-  読み取りは接続間で並行、書き込みは Session 内で直列。
+- **TCP サーバは接続ごとに Task と `Session`** — accept ごとに `handleClient` を起動し、
+  `SessionPool.CreateSession` で得た接続専用の `Session` を使う（§11.3）。
+  読み取りは接続間で並行、書き込みは `DatabaseHost.writeGate` で直列。
 - **プロセス間は `.rykdb.format` で排他**する（root 直下、`FileShare.None`。§7.9）
 
 ### 7.8 DDL の排他（`RootGate`）
@@ -1017,11 +1036,11 @@ commit 成功・rollback・`Close` で解除する。
 途中に他の書き込みが入ると**索引に載らない行**ができる（または消えた行のエントリが残る）。
 そこで **DDL だけはプロセス内で排他**にする（`RootGate`、`Transactions.fs`）。
 
-| 操作                                    | ゲート                               |
-| --------------------------------------- | ------------------------------------ |
-| DDL（CREATE / DROP TABLE / INDEX）      | **排他**（`RootGate.withExclusive`） |
-| 文の実行と commit（暗黙 transaction）   | 共有（`RootGate.withShared`）        |
-| `Database.Begin()` の登録とカタログ読込 | 共有（短時間だけ保持）               |
+| 操作                                      | ゲート                               |
+| ----------------------------------------- | ------------------------------------ |
+| DDL（CREATE / DROP TABLE / INDEX）        | **排他**（`RootGate.withExclusive`） |
+| 文の実行と commit（暗黙 transaction）     | 共有（`RootGate.withShared`）        |
+| `DatabaseHost.Begin` の登録とカタログ読込 | 共有（短時間だけ保持）               |
 
 DDL は次を順に行う。
 
@@ -1597,8 +1616,9 @@ match ok (session.TryOpenReader "SELECT id, v FROM t ORDER BY id") with
 ok (session.Close())
 ```
 
-> **重要**: 公開 API は `Session` だけ。
-> `Database` は internal の不変ハンドルで、`Session` が各文の成功後に現在のハンドルを更新する。
+> **重要**: 公開 API は `Session`（接続）と `SessionPool`（接続の供給）だけ。
+> `Database` は internal の不変ハンドルで、committed な状態は `DatabaseHost` が保持し、
+> `Session` は実行のたびに「最新の committed state + 接続ローカルの transaction」を作って使う（§7.6）。
 
 ### 11.2 CLI REPL
 
@@ -1628,17 +1648,15 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 - accept ループは接続ごとに `Task` を起動する。
   接続内の文は while で逐次。
-- `serve` は 1つの `Session` を全接続で共有する。
-  SELECT だけの文は接続間で並行実行され、書き込み・transaction 操作は Session 内で直列化される。
-- 明示 transaction は Session 全体で 1つ。
-  開始した接続が所有者になり、**切断時に rollback するのは所有者だけ**
+- `serve` は 1つの `SessionPool` を全接続で共有し、接続ごとに `CreateSession` で専用の `Session` を作る。
+  SELECT だけの文は接続間で並行実行され、DB 全体の書き込みは `DatabaseHost` で直列化される。
+- **明示 transaction は接続ごとに独立**している。
+  他接続の未 commit の行は見えず、commit した行だけが見える。
+  切断時は `Session.Close` がその接続の transaction だけを rollback する
   （他接続の transaction を巻き戻さない）。
-  所有権は `Session.ExecuteTracked` の `SessionTransactionChange` で判定する。
-- 他の接続が transaction 中でも、その接続の文は同じ transaction に参加する
-  （1 Session = 1 論理接続の意味論）。
-  transaction は接続を跨ぐので、必要ならクライアント側で transaction を使う接続を 1本に限る。
+- transaction 中でも他接続は書き込みできる（暗黙 transaction は独立）。
 - 停止時は listener を止め、接続中のクライアントを閉じて `ReadLine` を解放し、
-  ハンドラの完了を待ってから `Session.Close()` する
+  ハンドラの完了を待って（各ハンドラが自分の `Session.Close` を呼ぶ）から `SessionPool.Close()` する
   （`Session.Close` は実行中の読み取りの drain も行う）。
 - データ行の中のバックスラッシュ・改行・CR は `\\` / `\n` / `\r` にエスケープして返す
   （`RykDb.Client` が読み取り時に元へ戻す）。
@@ -1752,12 +1770,13 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **DDL はプロセス内で排他**（`RootGate`）。
   `CREATE INDEX` の backfill 中は他の文が待つ。
   同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。
-- **並行読み取りは Session 内の SELECT に限る**。
-  明示 transaction 中の読み取りは直列化される（read-your-writes を保つため）。
-- **1つの `Session` を複数接続で共有すると transaction も共有される**（§11.3）。
-  切断時に rollback するのは transaction を開始した接続だけ。
+- **接続ごとに `Session` を作る**（`SessionPool.CreateSession`。§7.6 / §11.3）。
+  明示 transaction は接続ごとに独立し、他接続の未 commit は見えない。
+  切断時はその接続の transaction だけが rollback される。
 - **同一 `Session` を複数スレッドで使うと、SELECT だけの呼び出しは並行、その他は直列化される**（§7.7）。
   1つの transaction を複数スレッドで共有しないこと。
+- **他接続が transaction 中でも、書き込みは `DatabaseHost.writeGate` で直列化されて進む**（§7.6）。
+  長い transaction が他接続の書き込みを止めることはないが、DDL は §7.8 のとおり `ConflictError` になる。
 - **トランザクションの分離レベルは Snapshot Isolation（repeatable read）固定**。
   分離レベルの指定（`BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...`）、
   `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`、読み取り専用トランザクションは未対応

@@ -97,11 +97,9 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
 let private withGatedSession (_tag: string) (f: Session -> EngineGates -> unit) =
     let gates = EngineGates()
     let root = "mem:" + System.Guid.NewGuid().ToString "N"
-
     let store = openStoreWith "" (GatedEngine(gates, memoryEngine ()) :> IStorageEngine)
-
     let db = ok (Database.OpenWithStore root store)
-    let session = new Session(root, db, SessionOptions.Default)
+    let session = Session.OpenWith(root, SessionOptions.Default, db)
 
     try
         f session gates
@@ -383,24 +381,6 @@ let ``Session: 並行読み取りは commit 済みの一貫した snapshot を�
         Assert.Equal<int64>(int64 (batchSize * batches), asInt finalCount.Rows.[0].[0]))
 
 [<Fact>]
-let ``Session: ExecuteTracked は transaction の遷移を返す`` () =
-    withSession "session-tracked" (fun session ->
-        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
-        let change (r: Result<StatementResult * SessionTransactionChange, DbError>) = r |> ok |> snd
-        Assert.Equal(SessionTransactionChange.NoChange, change (session.ExecuteTracked "SELECT 1"))
-        Assert.Equal(SessionTransactionChange.Started, change (session.ExecuteTracked "BEGIN"))
-        Assert.Equal(SessionTransactionChange.NoChange, change (session.ExecuteTracked "INSERT INTO t VALUES (1)"))
-        Assert.Equal(SessionTransactionChange.Ended, change (session.ExecuteTracked "ROLLBACK"))
-        Assert.Equal(SessionTransactionChange.NoChange, change (session.ExecuteTracked "SELECT 1"))
-
-        Assert.Equal(
-            SessionTransactionChange.Started,
-            change (session.ExecuteTracked "BEGIN; INSERT INTO t VALUES (2)")
-        )
-
-        Assert.Equal(SessionTransactionChange.Ended, change (session.ExecuteTracked "COMMIT")))
-
-[<Fact>]
 let ``Session: 空 SQL は 0 行の結果を返す`` () =
     withSession "session-empty" (fun session ->
         let result = ok (session.Execute "")
@@ -613,3 +593,188 @@ let ``RowReader: Dispose すると Close が待たずに完了できる`` () =
             (reader :> System.IDisposable).Dispose()
             Assert.True(closing.Wait 10000, "RowReader の Dispose 後に Close が完了しません")
             expectErrorKind ErrorKind.InternalError "Dispose 後の TryRead" (reader.TryRead()))
+
+// ---------------------------------------------------------------------------
+// SessionPool: 同一 DB を共有する複数接続
+// ---------------------------------------------------------------------------
+
+let private withPool (tag: string) (f: SessionPool -> unit) =
+    withDir tag (fun dir ->
+        let pool = ok (SessionPool.OpenWith dir)
+
+        try
+            f pool
+        finally
+            pool.Close() |> ignore)
+
+/// 1行 1列の INTEGER を取り出す。
+let private scalar (session: Session) (sql: string) =
+    let result = ok (session.Execute sql)
+    asInt result.Rows.[0].[0]
+
+[<Fact>]
+let ``SessionPool: 接続ごとに transaction が独立している`` () =
+    withPool "pool-isolation" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+            ok (a.Begin()) |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1)") |> ignore
+
+            // A の未 commit は B から見えない。A 自身には見える（read-your-writes）。
+            Assert.Equal(0L, scalar b "SELECT COUNT(*) FROM t")
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t")
+
+            ok (a.Commit()) |> ignore
+            Assert.Equal(1L, scalar b "SELECT COUNT(*) FROM t")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: 明示 transaction は開始時の snapshot を見る`` () =
+    withPool "pool-repeatable" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1)") |> ignore
+
+            ok (a.Begin()) |> ignore
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t")
+
+            // A の transaction 中に B が commit しても、A は開始時の snapshot を見る。
+            ok (b.Execute "INSERT INTO t VALUES (2)") |> ignore
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t")
+
+            ok (a.Rollback()) |> ignore
+            Assert.Equal(2L, scalar a "SELECT COUNT(*) FROM t")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: 接続間で write-write 競合を検出する`` () =
+    withPool "pool-conflict" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)") |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+
+            ok (a.Begin()) |> ignore
+            ok (b.Begin()) |> ignore
+            ok (a.Execute "UPDATE t SET v = 11 WHERE id = 1") |> ignore
+            ok (b.Execute "UPDATE t SET v = 12 WHERE id = 1") |> ignore
+
+            ok (a.Commit()) |> ignore
+            expectErrorKind ErrorKind.ConflictError "後から commit した側" (b.Commit())
+            ok (b.Rollback()) |> ignore
+
+            Assert.Equal(11L, scalar a "SELECT v FROM t WHERE id = 1")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: 長い transaction 中でも他接続は commit できる`` () =
+    withPool "pool-concurrent" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+            ok (a.Begin()) |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1)") |> ignore
+
+            // A が transaction を開いたままでも、B の暗黙 transaction は通る。
+            ok (b.Execute "INSERT INTO t VALUES (2)") |> ignore
+
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t")
+
+            ok (a.Commit()) |> ignore
+            Assert.Equal(2L, scalar a "SELECT COUNT(*) FROM t")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: 接続を閉じるとその transaction だけ rollback される`` () =
+    withDir "pool-close-rollback" (fun dir ->
+        let pool = ok (SessionPool.OpenWith dir)
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (a.Begin()) |> ignore
+        ok (a.Execute "INSERT INTO t VALUES (1)") |> ignore
+
+        ok (b.Begin()) |> ignore
+        ok (b.Execute "INSERT INTO t VALUES (2)") |> ignore
+
+        // A だけ閉じる。A の行は rollback され、B の transaction は残る。
+        ok (a.Close())
+        ok (b.Execute "INSERT INTO t VALUES (3)") |> ignore
+        ok (b.Commit()) |> ignore
+        Assert.Equal(2L, scalar b "SELECT COUNT(*) FROM t")
+        ok (b.Close())
+        ok (pool.Close())
+
+        // 再オープンしても A の行は残っていない。
+        let reopened = ok (Session.OpenWith dir)
+
+        try
+            Assert.Equal(2L, scalar reopened "SELECT COUNT(*) FROM t")
+        finally
+            reopened.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: transaction 中の DDL は他接続で ConflictError`` () =
+    withPool "pool-ddl" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+            ok (a.Begin()) |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1)") |> ignore
+
+            expectErrorKind ErrorKind.ConflictError "DDL は ConflictError" (b.Execute "CREATE INDEX ix ON t (id)")
+
+            ok (a.Commit()) |> ignore
+            ok (b.Execute "CREATE INDEX ix ON t (id)") |> ignore
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: DDL の結果は他接続の次の文から見える`` () =
+    withPool "pool-ddl-visible" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+
+            // B は開いたままでも、次の文では新しいカタログを見る。
+            ok (b.Execute "INSERT INTO t VALUES (1)") |> ignore
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: 閉じた後の操作はエラーになる`` () =
+    withDir "pool-closed" (fun dir ->
+        let pool = ok (SessionPool.OpenWith dir)
+        let session = ok (pool.CreateSession())
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (pool.Close())
+
+        expectErrorKind ErrorKind.InternalError "Close 後の Execute" (session.Execute "SELECT 1")
+        expectErrorKind ErrorKind.InternalError "閉じた pool の CreateSession" (pool.CreateSession())
+        session.Close() |> ignore)

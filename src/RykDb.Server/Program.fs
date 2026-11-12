@@ -48,11 +48,11 @@ let main argv =
         eprintfn "%s" e
         1
     | Ok(port, root) ->
-        match Session.OpenWith root with
+        match SessionPool.OpenWith root with
         | Error e ->
             eprintfn "DB を開けません: %s" (DbError.toDisplayString e)
             1
-        | Ok session ->
+        | Ok pool ->
             let listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Any, port)
             let mutable started = false
 
@@ -79,11 +79,11 @@ let main argv =
                     cts.Cancel())
 
                 try
-                    serve session listener cts.Token (fun m ->
+                    serve pool listener cts.Token (fun m ->
                         printfn "%s" m
                         System.Console.Out.Flush())
                 finally
-                    session.Close() |> ignore
+                    pool.Close() |> ignore
 
                 printfn "停止しました。"
                 0

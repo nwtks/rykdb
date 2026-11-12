@@ -20,7 +20,8 @@ open RykDb.TestHelpers
 /// 完了を待たずに Close すると、サーバが DB を触っている間に削除して落ちる。
 let private withServer (f: RykDbClient -> unit) =
     let dir = newDir "tcp"
-    let session = ok (Session.OpenWith dir)
+    // 接続ごとに独立した Session を発行するプール。1つのサーバがこれを共有する。
+    let session: SessionPool = ok (SessionPool.OpenWith dir)
     // port 0 = OS が空いているポートを割り当てる。
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
@@ -200,7 +201,7 @@ let ``TCP: .tables はテーブル名を返す`` () =
 [<Fact>]
 let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` () =
     let dir = newDir "tcp-raw"
-    let session = ok (Session.OpenWith dir)
+    let session: SessionPool = ok (SessionPool.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -258,7 +259,7 @@ let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` 
 [<Fact>]
 let ``TCP: 突然の切断（RST）でもサーバは生き続ける`` () =
     let dir = newDir "tcp-rst"
-    let session = ok (Session.OpenWith dir)
+    let session: SessionPool = ok (SessionPool.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -412,11 +413,17 @@ let ``Client: 接続が RST で切れたら Halt`` () =
 [<Fact>]
 let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコルを壊さない`` () =
     let dir = newDir "tcp-newline"
-    let session = ok (Session.OpenWith dir)
-    ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
+    let session: SessionPool = ok (SessionPool.OpenWith dir)
 
-    ok (session.Execute "INSERT INTO t VALUES (1, 'a\nb'), (2, 'c\rd'), (3, 'C:\\temp')")
-    |> ignore
+    // 事前データは 1 接続で入れて閉じる（DB はプールが保持したまま）。
+    do
+        let setup = ok (session.CreateSession())
+        ok (setup.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
+
+        ok (setup.Execute "INSERT INTO t VALUES (1, 'a\nb'), (2, 'c\rd'), (3, 'C:\\temp')")
+        |> ignore
+
+        ok (setup.Close())
 
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
@@ -475,7 +482,7 @@ let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコル
 [<Fact>]
 let ``TCP: 切断時に open transaction は rollback される`` () =
     let dir = newDir "tcp-rollback"
-    let session = ok (Session.OpenWith dir)
+    let session: SessionPool = ok (SessionPool.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -511,17 +518,18 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
             raw.Dispose()
 
         // 切断の検知と rollback はサーバ側で非同期に進む。
-        // 次の SELECT が rollback より先に writeGate を取ると未 commit の行が見えるため、
-        // rollback 完了を待ってから照会する。
-        Assert.True(
-            SpinWait.SpinUntil((fun () -> not session.InTransaction), 10000),
-            "切断時の rollback が 10 秒以内に完了しませんでした"
-        )
-
-        // 次の接続では rollback 済みで、行は見えない。
+        // その接続の rollback が終わるまで、新規接続からは行が見えないままになる。
         use client = new RykDbClient("127.0.0.1", port)
-        let _, rows = okRows (client.Send "SELECT COUNT(*) FROM t")
-        Assert.Equal<string list>([ "0" ], rows)
+
+        let rolledBack =
+            SpinWait.SpinUntil(
+                (fun () ->
+                    let _, rows = okRows (client.Send "SELECT COUNT(*) FROM t")
+                    rows = [ "0" ]),
+                10000
+            )
+
+        Assert.True(rolledBack, "切断時の rollback が 10 秒以内に完了しませんでした")
     finally
         cts.Cancel()
         finished.Wait 10000 |> ignore
@@ -537,7 +545,7 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
 /// 複数接続のテスト用: サーバを起動し、割り当てられたポートを渡す。
 let private withTestServerOptions (options: SessionOptions) (tag: string) (f: int -> unit) =
     let dir = newDir tag
-    let session = ok (Session.OpenWith(dir, options))
+    let session: SessionPool = ok (SessionPool.OpenWith(dir, options))
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -643,23 +651,125 @@ let ``TCP: 他接続の切断は transaction を rollback しない`` () =
         Assert.Equal<string list>([ "0" ], after))
 
 [<Fact>]
-let ``TCP: transaction は Session 共有として他接続からも見える`` () =
-    withTestServer "tcp-txn-shared" (fun port ->
+let ``TCP: 各接続の transaction は独立している`` () =
+    withTestServer "tcp-txn-isolated" (fun port ->
         use clientA = new RykDbClient("127.0.0.1", port)
         okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
         okRows (clientA.Send "BEGIN") |> ignore
         okRows (clientA.Send "INSERT INTO t VALUES (1)") |> ignore
 
-        // Session は 1 論理接続なので、B の読み取りも A の transaction を見る。
+        // A の未 commit の行は B からは見えない（接続ごとに transaction が独立）。
         use clientB = new RykDbClient("127.0.0.1", port)
-        let _, rows = okRows (clientB.Send "SELECT COUNT(*) FROM t")
-        Assert.Equal<string list>([ "1" ], rows)
-        okRows (clientA.Send "ROLLBACK") |> ignore)
+        let _, hidden = okRows (clientB.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "0" ], hidden)
+
+        // A 自身には見える（read-your-writes）。
+        let _, own = okRows (clientA.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "1" ], own)
+
+        // A が COMMIT すると B からも見える。
+        okRows (clientA.Send "COMMIT") |> ignore
+        let _, visible = okRows (clientB.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "1" ], visible))
+
+[<Fact>]
+let ``TCP: 明示 transaction は開始時の snapshot を見る（repeatable read）`` () =
+    withTestServer "tcp-txn-repeatable" (fun port ->
+        use setup = new RykDbClient("127.0.0.1", port)
+        okRows (setup.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        okRows (setup.Send "INSERT INTO t VALUES (1)") |> ignore
+
+        use clientA = new RykDbClient("127.0.0.1", port)
+        okRows (clientA.Send "BEGIN") |> ignore
+        let _, before = okRows (clientA.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "1" ], before)
+
+        // A の transaction 中に B が commit しても、A は開始時の snapshot を見る。
+        use clientB = new RykDbClient("127.0.0.1", port)
+        okRows (clientB.Send "INSERT INTO t VALUES (2)") |> ignore
+
+        let _, after = okRows (clientA.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "1" ], after)
+
+        okRows (clientA.Send "ROLLBACK") |> ignore
+
+        // transaction の外では新しい snapshot が見える。
+        let _, fresh = okRows (clientA.Send "SELECT COUNT(*) FROM t")
+        Assert.Equal<string list>([ "2" ], fresh))
+
+[<Fact>]
+let ``TCP: 他接続の transaction 中でも書き込みできる`` () =
+    withTestServer "tcp-txn-concurrent-write" (fun port ->
+        use clientA = new RykDbClient("127.0.0.1", port)
+        okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        okRows (clientA.Send "BEGIN") |> ignore
+        okRows (clientA.Send "INSERT INTO t VALUES (1)") |> ignore
+
+        // A が transaction を開いたままでも、B の暗黙 transaction は commit できる。
+        use clientB = new RykDbClient("127.0.0.1", port)
+        okRows (clientB.Send "INSERT INTO t VALUES (2)") |> ignore
+
+        // A は自分の行だけを見る。
+        let _, mine = okRows (clientA.Send "SELECT id FROM t ORDER BY id")
+        Assert.Equal<string list>([ "1" ], mine)
+
+        okRows (clientA.Send "COMMIT") |> ignore
+
+        let _, all = okRows (clientA.Send "SELECT id FROM t ORDER BY id")
+        Assert.Equal<string list>([ "1"; "2" ], all))
+
+[<Fact>]
+let ``TCP: 接続間で write-write 競合を検出する`` () =
+    withTestServer "tcp-txn-conflict" (fun port ->
+        use setup = new RykDbClient("127.0.0.1", port)
+
+        okRows (setup.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        |> ignore
+
+        okRows (setup.Send "INSERT INTO t VALUES (1, 10)") |> ignore
+
+        use clientA = new RykDbClient("127.0.0.1", port)
+        use clientB = new RykDbClient("127.0.0.1", port)
+        okRows (clientA.Send "BEGIN") |> ignore
+        okRows (clientB.Send "BEGIN") |> ignore
+        okRows (clientA.Send "UPDATE t SET v = 11 WHERE id = 1") |> ignore
+        okRows (clientB.Send "UPDATE t SET v = 12 WHERE id = 1") |> ignore
+
+        // 先に commit した方が勝ち、後から commit した方は ConflictError。
+        okRows (clientA.Send "COMMIT") |> ignore
+
+        match clientB.Send "COMMIT" with
+        | Failure m -> Assert.Contains("競合", m)
+        | other -> Assert.Fail(sprintf "競合エラーを期待しましたが: %A" other)
+
+        okRows (clientB.Send "ROLLBACK") |> ignore
+
+        let _, rows = okRows (clientA.Send "SELECT v FROM t WHERE id = 1")
+        Assert.Equal<string list>([ "11" ], rows))
+
+[<Fact>]
+let ``TCP: transaction 中の DDL は他接続で ConflictError になる`` () =
+    withTestServer "tcp-txn-ddl" (fun port ->
+        use clientA = new RykDbClient("127.0.0.1", port)
+        okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        okRows (clientA.Send "BEGIN") |> ignore
+        okRows (clientA.Send "INSERT INTO t VALUES (1)") |> ignore
+
+        use clientB = new RykDbClient("127.0.0.1", port)
+
+        match clientB.Send "CREATE INDEX ix ON t (id)" with
+        | Failure m -> Assert.Contains("transaction", m)
+        | other -> Assert.Fail(sprintf "ConflictError を期待しましたが: %A" other)
+
+        okRows (clientA.Send "COMMIT") |> ignore
+
+        // transaction が終われば DDL は通る。
+        okRows (clientB.Send "CREATE INDEX ix ON t (id)") |> ignore)
 
 [<Fact>]
 let ``TCP: 接続中でも serve は停止できる`` () =
     let dir = newDir "tcp-stop-active"
-    let session = ok (Session.OpenWith dir)
+    let session: SessionPool = ok (SessionPool.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
     listener.Start()
     let port = (listener.LocalEndpoint :?> IPEndPoint).Port

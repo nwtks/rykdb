@@ -530,7 +530,8 @@ let (mgr, txn2) = TransactionManager.beginTxn mgr
 ### 5.6 公開 API では `Session` を使う（`Database.Execute` は internal）
 
 `Database` は internal の不変ハンドルで、`Execute` は新しいハンドルを返す。
-公開 API の `Session` は現在のハンドルを保持し、各文の成功後に差し替えるため、
+公開 API の `Session` は接続ローカルの transaction 状態（`SessionState`）を持ち、
+各文の成功後にそこだけを進める（committed な状態は `DatabaseHost` が管理する）ため、
 利用者が戻り値を引き継ぐ必要はない。
 
 ```fsharp
@@ -1178,7 +1179,7 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 
 ### 11.14 古い `Database` ハンドルの `Close` は WAL を消さない（internal の話）
 
-公開 API の `Session` は常に最新のハンドルを保持するため、この問題は起きない。
+公開 API の `Session` は `DatabaseHost` が持つ committed state を共有するため、この問題は起きない。
 以下は internal の `Database.Execute` を直接使うテストの注意。
 
 ハンドルは不変で、`Execute` は新しいハンドルを返す。
@@ -1407,7 +1408,7 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 
 ### 11.30 `BEGIN` 後のエラーでは transaction が開いたままになる
 
-`Session.Execute` は 1文ずつ実行し、成功するたびに現在のハンドルを更新する。
+`Session.Execute` は 1文ずつ実行し、成功するたびに接続ローカルの状態を更新する。
 `BEGIN` が成功した後に後続の文が失敗した場合、Session は transaction を開いたまま保持する
 （それ以前に成功した文の状態も保持する）。
 呼び出し側が `Rollback()` するか `Close()` するまで transaction は続く。
@@ -1875,16 +1876,18 @@ pin した Version とハンドルの snapshot seq が一致する。
 `Session: Close は実行中の読み取りの完了を待つ` /
 `Session: 並行読み取りは commit 済みの一貫した snapshot を見る`。
 
-### 11.54 TCP サーバの切断 rollback は「transaction を開始した接続」だけ
+### 11.54 TCP サーバの切断 rollback は「その接続の transaction」だけ
 
-❌ 切断時に `if session.InTransaction then Rollback()`。
+❌ 切断時に `if session.InTransaction then Rollback()` をサーバ全体の Session に対して行う。
 複数接続が Session を共有すると、関係ない接続の切断で他の transaction が消える。
 
-✅ `Session.ExecuteTracked` の `SessionTransactionChange`（`Started` / `Ended`）で所有権を追い、
-所有接続の切断時だけ rollback する。
+✅ **接続ごとに独立した `Session` を持たせる**（`SessionPool.CreateSession`）。
+各接続の `Session.Close` が自分の transaction だけを rollback するので、
+所有権をサーバ側で追う必要がない（§11.64）。
 
 回帰テスト: `TCP: 他接続の切断は transaction を rollback しない` /
-`TCP: 接続中の接続があっても新しい接続を受け付ける`。
+`TCP: 接続中の接続があっても新しい接続を受け付ける` /
+`SessionPool: 接続を閉じるとその transaction だけ rollback される`。
 
 ### 11.55 background compaction の worker は専用スレッドで起動する
 
@@ -2033,3 +2036,44 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 
 ✅ `RykDb.Client.SendStream` のように `END` または途中の `ERR` まで読み切る。
 途中で読むのをやめる低レベル実装では、接続を閉じるか `END` まで drain する。
+
+### 11.64 接続ごとの transaction は「接続ローカルの状態 + 共有 Manager の rebase」
+
+❌ 接続の `Database` ハンドルをそのまま `Commit()` する。
+ハンドルは BEGIN 時点の `TransactionManager`（`NextSeqNo` / `LastCommitted` / `Active`）を持っているので、
+他接続の commit を知らないまま採番・競合判定してしまう
+（SeqNo の衝突・write-write 競合の見逃し・commit の取りこぼし）。
+ハンドルの `Store` も古いため、他接続の commit が memtable に載っていない。
+
+✅ 文を実行するたびに **最新の committed state に接続ローカルの transaction を重ねる**（`SessionState.apply`）。
+`Active` / `Pending` / `ActiveRegistration` だけをローカルに持ち、
+`Store` / `Catalog` / `Manager` は `DatabaseHost` の最新値を使う。
+可視性は `Transaction.Snapshot.SeqNo` で決まるので、Store を最新にしても repeatable read は崩れない。
+BEGIN / COMMIT / ROLLBACK と暗黙 transaction の DML / DDL は `DatabaseHost.writeGate` の下で行い、
+結果の committed 部分だけを publish する。
+回帰テスト: `SessionPool: 明示 transaction は開始時の snapshot を見る` /
+`SessionPool: 接続間で write-write 競合を検出する`。
+
+### 11.65 共有ストア用の `Database` ハンドルは ProcessLock の所有者を奪ってはいけない
+
+❌ 接続ごとに `new Database(root, state)` を作る。
+コンストラクタが `ProcessLockLease.Attach()` で所有者トークンを置き換えるため、
+最後に作ったハンドルだけが所有者になる。
+ホストが `Close` しても「所有者ではない」と判定されて no-op になり、DB が閉じられない
+（WAL が削除されず、次の `OpenWith` も `IoError` になる）。
+
+✅ 共有ストア用のハンドルは `ownsStore = false` で作り、所有者にならない。
+所有者は `Database.OpenWithBackground` が作った 1本だけで、
+`DatabaseHost.Close` が `owner.WithState(最新状態).Close()` で閉じる。
+回帰テスト: `SessionPool: 接続を閉じるとその transaction だけ rollback される`（再オープンで確認）。
+
+### 11.66 接続の Close は DB を閉じない（所有者だけが閉じる）
+
+❌ `Session.Close` が常に `RowStore.close` を呼ぶ。
+接続が 1本切れただけで DB 全体が閉じ、他の接続が動かなくなる。
+
+✅ `Session` は `ownsHost` を持つ。
+`Session.OpenWith` のセッションだけが DB を閉じ、
+`SessionPool.CreateSession` のセッションは自分の transaction を rollback して登録を外すだけ。
+DB を閉じるのは `SessionPool.Close`。
+`Session.Close` は実行中の読み取り（`readers`）を drain してから閉じる。

@@ -55,17 +55,22 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 `src/RykDb.Core/` では **`mutable` / `while` / `ref` を 0件**に保つ。
 例外は公開セッション層の `Session.fs` だけで、次を意図的に使う。
 
-- `let mutable current` / `let mutable closed` / `let mutable readers`:
-  現在の `Database` ハンドル、Close 状態、実行中の読み取り数を保持する。
+- `DatabaseHost` の `let mutable committed` / `let mutable closed`:
+  全接続で共有する committed な `DbState` と Close 状態。
+- `Session` の `let mutable local` / `let mutable closed` / `let mutable readers`:
+  接続ローカルの transaction 状態、Close 状態、実行中の読み取り数を保持する。
+- `SessionPool` の `let mutable closed`: 新しい接続を受け付けるかを保持する。
 - `RowReader` の `current` / `rowsRead` / `closed` / `exhausted`:
   ストリーミング SELECT の読み取り位置と解放状態を保持する。
   `Session.fs` 内に閉じる。
-- `lock stateGate`: `current` / `closed` / `readers` を保護する短いロック。
+- `lock stateGate`: `committed` / `closed` / `readers` を保護する短いロック。
   読み取りは入口・出口でしか取らない。
 - `lock writeGate`: `Execute`（書き込みを含むバッチ）/ `Begin` / `Commit` / `Rollback` / `Close` を直列化する。
-- `Monitor.Wait` / `PulseAll`: `Close` が実行中の読み取りの完了を待つために使う。
+  `DatabaseHost.writeGate` は DB 全体、`Session.writeGate` は接続内を守る。
+- `Monitor.Wait` / `PulseAll`: `Session.Close` が実行中の読み取りの完了を待つために使う。
 
-これらは `Session` の内部に閉じ込め、`Database` を internal にして外部へ漏らさない。
+これらは `Session` / `SessionPool` / `DatabaseHost` の内部に閉じ込め、
+`Database` を internal にして外部へ漏らさない。
 
 `ResizeArray` / `Dictionary` / `HashSet` を使うのは次の場所に限る（CLI / Server は対象外）。
 いずれもホットパスか同時実行の台帳であり、使う理由はコメントに残す。

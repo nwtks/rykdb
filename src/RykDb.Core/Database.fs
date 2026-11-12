@@ -20,7 +20,7 @@ namespace RykDb.Core
 /// 戻り値を捨てると状態が古くなるため、この型は公開しない。
 /// 公開 API の `Session` が常に最新ハンドルを保持する。
 /// </remarks>
-type internal Database(root: string, state: DbState) =
+type internal Database(root: string, state: DbState, ownsStore: bool) =
     /// このハンドルの生存に紐づく ActiveSnapshot 登録のリース。
     /// ハンドルが commit / rollback / Close されずに捨てられても、
     /// 最後の 1本が GC された時点で登録が外れるよう保持しておく
@@ -31,8 +31,14 @@ type internal Database(root: string, state: DbState) =
     /// `Execute` / `Begin` / `Commit` は新しいハンドルを返すので、
     /// 新しいハンドルを作るたびに所有者を置き換える。
     /// 古いハンドルの Close で、生きている新しいハンドルのロックを外さないため。
+    /// 共有ストア用のハンドル（`ownsStore = false`）は **所有者にならない**。
+    /// 接続ごとの `Session` が作るハンドルが、DB 全体のロック所有者を奪わないようにするため
+    /// （所有者を奪うと、最後に Close すべきホストが no-op になり DB が閉じられなくなる）。
     let storeLeaseToken =
-        state.Store.Lock |> Option.map (fun lockLease -> lockLease.Attach())
+        if ownsStore then
+            state.Store.Lock |> Option.map (fun lockLease -> lockLease.Attach())
+        else
+            None
 
     /// background compaction を有効にして開く。
     /// <remarks>
@@ -86,7 +92,8 @@ type internal Database(root: string, state: DbState) =
                         Pending = None
                         ActiveRegistration = None
                         DeferDurability = false
-                    }
+                    },
+                    true
                 )
                 |> ret
 
@@ -99,20 +106,12 @@ type internal Database(root: string, state: DbState) =
     /// 現在の WAL 位置（メモリエンジンは None）。
     member _.WalPosition = state.Store.Engine.WalState
 
-    /// WAL の fsync を Session のグループコミットに任せるハンドルを返す。
-    member _.WithDeferredDurability() =
-        new Database(root, { state with DeferDurability = true })
+    /// WAL の fsync を `Session` のグループコミットに任せる状態を返す。
+    /// ハンドルを作らないので ProcessLock の所有者は変わらない。
+    member _.StateWithDeferredDurability = { state with DeferDurability = true }
 
-    /// 呼び出し単位のスナップショットを取る。
-    /// background compaction が有効なら、返した lease を dispose するまで
-    /// この Version のファイルは削除されない。
-    member this.AcquireSnapshot() =
-        let store, lease = RowStore.acquireSnapshot state.Store
-
-        if obj.ReferenceEquals(store, state.Store) then
-            this, lease
-        else
-            new Database(root, { state with Store = store }), lease
+    /// 状態だけ差し替えたハンドルを返す。ストアの所有権は引き継ぐ。
+    member _.WithState(next: DbState) = new Database(root, next, ownsStore)
 
     /// テーブル一覧を返す。
     member _.TableNames() = state.Catalog.Tables |> List.map _.Name
@@ -160,7 +159,8 @@ type internal Database(root: string, state: DbState) =
                             Active = Some txn
                             Catalog = fresh
                             ActiveRegistration = Some registration
-                        }
+                        },
+                        ownsStore
                     )
                     |> ret)
 
@@ -177,7 +177,7 @@ type internal Database(root: string, state: DbState) =
             DbStateOps.commitTransaction txn state
             |> Result.map (fun nextState ->
                 state.ActiveRegistration |> Option.iter (ActiveSnapshotRegistry.unregister root)
-                new Database(root, nextState))
+                new Database(root, nextState, ownsStore))
 
     /// ROLLBACK。
     /// バッファを捨てる。
@@ -195,7 +195,8 @@ type internal Database(root: string, state: DbState) =
                     Active = None
                     Pending = None
                     ActiveRegistration = None
-                }
+                },
+                ownsStore
             )
             |> ret
 
@@ -223,7 +224,7 @@ type internal Database(root: string, state: DbState) =
             if obj.ReferenceEquals(nextState, state) then
                 this
             else
-                new Database(root, nextState)
+                new Database(root, nextState, ownsStore)
 
         match stmt with
         | Statement.Begin ->

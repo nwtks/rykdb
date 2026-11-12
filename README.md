@@ -85,10 +85,10 @@ DB: ./mydata
 Ctrl+C で終了します。
 ```
 
-複数のクライアントが同時に接続でき、SELECT は接続間で並行に実行される
-（書き込みと transaction 操作は 1つの Session 内で直列化される）。
-明示 transaction は Session 全体で 1つなので、transaction を使う接続は 1 本に限ること
-（他接続の切断で勝手に rollback されないよう、切断 rollback は開始した接続だけが行う）。
+複数のクライアントが同時に接続でき、SELECT は接続間で並行に実行される。
+**明示 transaction（`BEGIN` / `COMMIT` / `ROLLBACK`）は接続ごとに独立**しており、
+他接続の未 commit の行は見えず、切断時はその接続の transaction だけが rollback される。
+commit の採番・競合検出（first-committer-wins）・WAL・memtable は全接続で共有される。
 大きな SELECT は `.stream <SQL>` で `STREAM` 応答（`END` 終端）を要求でき、
 `RykDb.Client.SendStream` で行ごとに受け取れる。
 

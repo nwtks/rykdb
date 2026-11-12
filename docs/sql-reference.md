@@ -1112,16 +1112,21 @@ ok (session.Close())
   2回目の `Session.OpenWith` は `IoError`
   （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）を返す。
   別の `RowStore` ができて memtable が分かれ、一方の commit が他方から見えないため。
-  `Close()` してから開き直すこと。
-- SELECT だけの `Execute`（1文でも複数文でも、すべて `SELECT`）は複数スレッド・複数接続から並行実行できる。
-  書き込み・`BEGIN` / `COMMIT` / `ROLLBACK`・`Close` は直列化される。
+  同じ DB を複数接続で使う場合は、`Session.OpenWith` を繰り返さずに
+  **`SessionPool.OpenWith` + `pool.CreateSession()`** を使う（1 DB = 1 プール）。
+- **明示 transaction は接続（`Session`）ごとに独立している**。
+  同じプールから作った別の `Session` からは、他方の未 commit の行は見えない。
+  切断時はその `Session` の transaction だけが rollback される。
+- SELECT だけの `Execute`（1文でも複数文でも、すべて `SELECT`）は、
+  複数スレッド・複数接続から並行実行できる。
+  書き込み・`BEGIN` / `COMMIT` / `ROLLBACK`・`Close` は DB 全体で直列化される。
 - 読み取りは呼び出し開始時点のスナップショットで実行され、実行中の書き込みを待たない。
   逆に書き込みも実行中の読み取りを待たない（`Close` だけは読み取りの完了を待つ）。
-- 実行中の transaction がある間は、読み取りも含めて直列化される（read-your-writes を保つため）。
+- 実行中の transaction がある間は、その接続の読み取りも直列化される（read-your-writes を保つため）。
   transaction の境界は呼び出し側が決めるため、複数スレッドで 1つの transaction を共有しないこと。
 - `ExecuteTracked` は実行結果に加えて、
   その呼び出しで transaction が始まった / 終わった / 変わらない（`SessionTransactionChange`）を返す。
-  サーバが接続ごとの transaction 所有権を判定するために使う。
+  サーバが接続ごとの transaction 遷移を記録するために使う。
 - 複数文を 1 回の `Session.Execute` に渡したとき、途中の文がエラーになっても
   それ以前に成功した文は確定済みのまま残る。
   `BEGIN` が成功した後にエラーになった場合は transaction が開いたままになるので、
