@@ -25,12 +25,12 @@ dotnet tool restore           # fantomas インストール
 dotnet fantomas src/ tests/   # 整形
 ```
 
-| ゲート                  | 設定                              |
-| ----------------------- | --------------------------------- |
-| `TreatWarningsAsErrors` | **有効**                          |
-| `LangVersion`           | `10.0`                            |
-| `WarningLevel`          | `3`                               |
-| Core の命令型構文・機能 | `mutable` / `while` / `ref` = 0件 |
+| ゲート                  | 設定                                             |
+| ----------------------- | ------------------------------------------------ |
+| `TreatWarningsAsErrors` | **有効**                                         |
+| `LangVersion`           | `10.0`                                           |
+| `WarningLevel`          | `3`                                              |
+| Core の命令型構文・機能 | `mutable` / `while` / `ref` は `Session.fs` のみ |
 
 > **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
 > （[`gotchas.md`](gotchas.md) §10.4）。
@@ -72,6 +72,9 @@ xUnit。
 
 **例外**: `Database.fs` の通し経路テストは 2ファイルに分かれる。
 `Session.fs` の公開 API は `SessionTests.fs` で検証する。
+`ProcessLock.fs` / `EngineHost.fs` は専用ファイルを持たず、
+`RowStoreTests` / `BackgroundCompactionTests` / `DatabaseTests` で間接的に検証する。
+`DurabilityTests` / `OrderingPropertyTests` は横断的な性質テスト、`CliTests` は CLI 全体のテスト。
 [`sql-reference.md`](sql-reference.md) が扱う構文・意味論は `SqlReferenceTests.fs`、
 ハンドル API と内部機構は `DatabaseTests.fs`（役割の分担は下の「テスト方針」）。
 
@@ -107,8 +110,18 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
   （リフレクションで数える）。
   F# 10 の FS0842 への対策（[`gotchas.md`](gotchas.md) §9.1）。
   ファイルを増やしたら下限数のアサートも更新する。
-  `DatabaseTests` に `E2E` / `性能`、`SqlReferenceTests` に `SqlReference:`、
-  `ServerTests` に `TCP` のテスト名が残っていることも検査する。
+  `DatabaseTests` に `E2E` / `性能`、`ServerTests` に `TCP` のテスト名が残っていることも検査する。
+
+**並び順**:
+
+- テストは**テスト対象（`src/RykDb.Core/*.fs`）の定義順**に合わせて並べる。
+  対象ファイルで関数 A → B → C の順に定義されていれば、
+  テストファイルも A のテスト → B のテスト → C のテストの順にする。
+- 同一関数のテストは **正常系 → 特殊状況（境界値・空入力・NULL・並行実行など）→ 異常系（エラー）** の順に並べる。
+- ヘルパー定義はテストブロックの間に置かず、**先頭にまとめる**。
+  テストを並べ替えたときに参照順が壊れるのを防ぐ。
+- 例外: `SqlReferenceTests` は `sql-reference.md` の節順に従う（ソースの定義順ではない）。
+  `DatabaseTests` / `ServerTests` / `CliTests` は利用者から見た操作・プロトコルの流れを優先する。
 
 **乱数生成のテストは退行に注意**（[`gotchas.md`](gotchas.md) §9.6）。
 

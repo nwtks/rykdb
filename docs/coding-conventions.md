@@ -34,10 +34,11 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 `protect` は `IOException` / `UnauthorizedAccessException` を `IoError`、
 `InvalidDataException` / `FormatException` / `OverflowException` を `CorruptionError` に変換する。
 ファイル内容の不整合を `InternalError`（バグの兆候）として扱わないため。
-`try` / `with` は `protect` のほか、`Lexer` / `Types` の数値・リテラル変換、
-`Serialization` の文字列・バイト境界、`Manifest.decodeRecord`、`Keyspace.keyspaceOfBytes` で使い、
-いずれも `DbError` に変換するか `None` として扱い、例外を外へ出さない。
-`try` / `finally` は `ProcessLock` / `StorageEngine` / `Transactions` の解放処理に使う。
+`try` / `with` は `protect` のほか、`Manifest.decodeRecord`（base64 の解析）と
+`RowReader` の解放処理（`Session.fs`）で使い、
+いずれも `DbError` に変換するか例外を飲み込んで、外へ出さない。
+`try` / `finally` は `Engine` / `EngineHost` / `Sstable` / `Session` /
+`ProcessLock` / `StorageEngine` / `Transactions` の解放処理に使う。
 
 失敗は `ErrorKind`（`DbError.Kind`）で分類する。
 
@@ -63,7 +64,10 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `RowReader` の `current` / `closed` / `exhausted`:
   ストリーミング SELECT の読み取り位置と解放状態を保持する。
   `Session.fs` 内に閉じる。
-- `lock stateGate`: `committed` / `closed` / `readers` を保護する短いロック。
+- `CommitDurability` の `syncedFile` / `syncedSize` / `pending` / `syncing` / `failure`:
+  WAL の fsync 位置と進行状態（グループコミットの待機・失敗の共有）を保持する。
+- `lock stateGate`: `Session` の `local` / `closed` / `readers` と
+  `DatabaseHost` の `committed` / `closed` を保護する短いロック。
   読み取りは入口・出口でしか取らない。
 - `lock writeGate`: `Execute`（書き込みを含むバッチ）/ `Begin` / `Commit` / `Rollback` / `Close` を直列化する。
   `DatabaseHost.writeGate` は DB 全体、`Session.writeGate` は接続内を守る。
@@ -72,7 +76,8 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 これらは `Session` / `SessionPool` / `DatabaseHost` の内部に閉じ込め、
 `Database` を internal にして外部へ漏らさない。
 
-`ResizeArray` / `Dictionary` / `HashSet` を使うのは次の場所に限る（CLI / Server は対象外）。
+`ResizeArray` / `Dictionary` / `HashSet` / `ConcurrentDictionary` を使うのは次の場所に限る
+（CLI / Server は対象外）。
 いずれもホットパスか同時実行の台帳であり、使う理由はコメントに残す。
 
 - `Op.toArray` の行の蓄積
@@ -80,7 +85,9 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `Ops.distinct` の符号化済みキー集合（`HashSet<byte array>`）
 - `Ops.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
 - `ExtSort` の受け皿（バジェット内に収まる分。超過分は一時ファイルへ退避する）
-- `Database.fs` のクライアント層（応答の組み立て）
+- `Sstable` のブロック構築（`ResizeArray`）と partial reader / scan scope のキャッシュ（`ConcurrentDictionary`）
+- `EngineHost` の host state / ファイル refcount / 採番（`ConcurrentDictionary`）
+- `Compaction` の作業ディレクトリ別カウンタ（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
 
 | やりたいこと   | 命令形の代わりに使うもの                   |
@@ -132,9 +139,9 @@ JIT は `tail.` を尊重する。
   右スパインを `picked` リストへ積み、`List.fold` で組み直せば自己再帰が消える
   （左偏性により右スパインは log オーダーだが、深度保証に頼らず監査を通す）。
   ヒープは `SstMerge` に集約し、`StorageEngine.scanAt` と `Compaction` のストリーミング merge が共有する。
-  回帰テストは `SstableTests` の `多数のソースをまとめてマージできる`、
-  `StorageEngineTests` の `多数のファイルをキー昇順にマージする`、
-  `CompactionTests` の `多数の入力ファイルをストリーミングでマージする`。
+  回帰テストは `SstableTests` の `SstMerge: 多数のソースをまとめてマージできる`、
+  `StorageEngineTests` の `StorageEngine.scanAt: 多数のファイルをキー昇順にマージする`、
+  `CompactionTests` の `Compaction: 多数の入力ファイルをストリーミングでマージする`。
 - **`[<TailCall>]` は「その関数本体の自己再帰が全部末尾位置」のときだけ付ける**。
   1つでも外れると FS3569 になり、`TreatWarningsAsErrors` のせいでビルドエラーになる。
   構造上末尾にできないものは**付けない理由を呼び出しの直前にコメントで残す**:
@@ -168,7 +175,7 @@ JIT は `tail.` を尊重する。
     葉の書き換え関数（`rewriteLeaf`）だけを受け取り、
     非葉ノードは `RewriteFrame`（`Parent` / `Done` / `Rest`）に積んで、
     上がってきた子を内部のローカル関数 `plugChildren`（`Expr.children` の逆変換）で組み直す。
-    `rewrite` 内の `rewriteLoop` の自己再帰だけなので、式の深さに依存せずスタックは一定。
+    `rewrite` 内のローカル関数 `loop` の自己再帰だけなので、式の深さに依存せずスタックは一定。
     使うのは束縛の `Binder.qualify` と、集約後の読み替え（`Ops` の内部 `substituteAggs`）
     （`AggCall` のように子を持つノードを丸ごと定数へ置き換えるのも `rewriteLeaf` で表現できる）。
     検証は `AnalyzerTests` の `Binder.qualify: 全ノード種を qualify しても構造が保たれる` と

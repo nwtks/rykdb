@@ -360,7 +360,7 @@ let ``Database: UNIQUE 索引の backfill は重複値を拒否する`` () =
         Assert.Equal<int>(2, found.Rows.Length))
 
 [<Fact>]
-let ``Database: 大量行の CREATE INDEX はチャンクで backfill する`` () =
+let ``Database: 大量行で CREATE INDEX・UNIQUE INDEX・DROP TABLE が正しく通る`` () =
     withDb "ddl-index-chunks" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
 

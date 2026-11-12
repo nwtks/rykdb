@@ -26,6 +26,24 @@ let ``Memtable: 空の memtable は何も返さない`` () =
     Assert.True((Memtable.getVisible (intKey 0) None Memtable.Empty).IsNone)
 
 [<Fact>]
+let ``Memtable: Count と ApproxBytes は挿入したエントリの合計になる`` () =
+    let entries =
+        [|
+            Entry.put (intKey 1) 1UL [| SqlValue.Int 10L |]
+            Entry.put (intKey 2) 2UL [| SqlValue.Text "abcdef" |]
+            Entry.delete (intKey 3) 3UL
+        |]
+
+    let mem = Memtable.apply entries Memtable.Empty
+    Assert.Equal(entries.Length, mem.Count)
+    Assert.Equal(entries |> Array.sumBy Entry.managedBytes, mem.ApproxBytes)
+
+    // 空への apply は何も変えない
+    let same = Memtable.apply [] mem
+    Assert.Equal(mem.Count, same.Count)
+    Assert.Equal(mem.ApproxBytes, same.ApproxBytes)
+
+[<Fact>]
 let ``Memtable: apply したエントリを getVisible で引ける`` () =
     let mem =
         Memtable.apply
@@ -67,24 +85,6 @@ let ``Memtable: apply しても元の memtable は変わらない`` () =
     )
 
     Assert.Equal<SqlValue array>([| SqlValue.Int 1L |], (entry (Memtable.getVisible (intKey 1) None after)).Value.Value)
-
-[<Fact>]
-let ``Memtable: Count と ApproxBytes は挿入したエントリの合計になる`` () =
-    let entries =
-        [|
-            Entry.put (intKey 1) 1UL [| SqlValue.Int 10L |]
-            Entry.put (intKey 2) 2UL [| SqlValue.Text "abcdef" |]
-            Entry.delete (intKey 3) 3UL
-        |]
-
-    let mem = Memtable.apply entries Memtable.Empty
-    Assert.Equal(entries.Length, mem.Count)
-    Assert.Equal(entries |> Array.sumBy Entry.managedBytes, mem.ApproxBytes)
-
-    // 空への apply は何も変えない
-    let same = Memtable.apply [] mem
-    Assert.Equal(mem.Count, same.Count)
-    Assert.Equal(mem.ApproxBytes, same.ApproxBytes)
 
 [<Fact>]
 let ``Memtable: 同一キーは SeqNo が最大の版を返す`` () =
@@ -181,6 +181,34 @@ let ``Memtable: 接頭辞のキーは短い方が小さい`` () =
     Assert.Equal<uint64>(2UL, (entry (Memtable.getVisible longer None mem)).SeqNo)
 
 [<Fact>]
+let ``Memtable: 別のキーが混ざっていても可視な最新版を返す`` () =
+    // 同じキーの版が連続して並ぶ保証はない（Treap の形は挿入順で変わる）。
+    let mem =
+        Memtable.apply
+            [|
+                Entry.put (intKey 1) 1UL (intRow 1)
+                Entry.put (intKey 2) 2UL (intRow 2)
+                Entry.put (intKey 1) 5UL (intRow 5)
+                Entry.put (intKey 2) 7UL (intRow 7)
+                Entry.put (intKey 1) 9UL (intRow 9)
+            |]
+            Memtable.Empty
+
+    // 最新版（SeqNo が最大の版）
+    Assert.Equal<uint64>(9UL, (entry (Memtable.getVisible (intKey 1) None mem)).SeqNo)
+    Assert.Equal<uint64>(7UL, (entry (Memtable.getVisible (intKey 2) None mem)).SeqNo)
+
+    // snapshot で切ると、その時点で最新の版
+    Assert.Equal<uint64>(5UL, (entry (Memtable.getVisible (intKey 1) (Some 6UL) mem)).SeqNo)
+    Assert.Equal<uint64>(2UL, (entry (Memtable.getVisible (intKey 2) (Some 6UL) mem)).SeqNo)
+    Assert.Equal<uint64>(1UL, (entry (Memtable.getVisible (intKey 1) (Some 1UL) mem)).SeqNo)
+
+    // どの版も見えない / 存在しないキー
+    Assert.True((Memtable.getVisible (intKey 1) (Some 0UL) mem).IsNone)
+    Assert.True((Memtable.getVisible (intKey 99) None mem).IsNone)
+    Assert.True((Memtable.getVisible (intKey 99) (Some 100UL) mem).IsNone)
+
+[<Fact>]
 let ``Memtable: 乱数キーでも列挙順と可視性が参照実装と一致する`` () =
     let n = 600
 
@@ -239,6 +267,24 @@ let ``Memtable: 乱数キーでも列挙順と可視性が参照実装と一致�
 
     // 存在しないキーは None
     Assert.True((Memtable.getVisible (intKey 100) None mem).IsNone)
+
+[<Fact>]
+let ``Memtable: getVisible は探索が対数時間（多数の版があっても比例しない）`` () =
+    // 同じキーの版を 2000個積む。
+    let versions = 2_000
+
+    let mem =
+        Seq.init versions (fun i -> Entry.put (intKey 1) (uint64 i) (intRow i))
+        |> fun es -> Memtable.apply es Memtable.Empty
+
+    let sw = System.Diagnostics.Stopwatch.StartNew()
+
+    for _ in 1..1_000 do
+        Memtable.getVisible (intKey 1) None mem |> ignore
+
+    let ms = sw.ElapsedMilliseconds
+    // 「実用時間内」の緩い基準（探索が木の大きさに比例していないこと）。
+    Assert.True(ms < 2000L, sprintf "getVisible が遅すぎます: %d ms" ms)
 
 [<Fact>]
 let ``Memtable: rangeScan は startKey 以降を limit 件返す`` () =
@@ -305,49 +351,3 @@ let ``Memtable: 挿入順に関わらずキー昇順で列挙される`` () =
     all
     |> Array.pairwise
     |> Array.iter (fun (a, b) -> Assert.True(compareKeyBytes a.Key b.Key < 0, "キー昇順になっていない"))
-
-[<Fact>]
-let ``Memtable: 別のキーが混ざっていても可視な最新版を返す`` () =
-    // 同じキーの版が連続して並ぶ保証はない（Treap の形は挿入順で変わる）。
-    let mem =
-        Memtable.apply
-            [|
-                Entry.put (intKey 1) 1UL (intRow 1)
-                Entry.put (intKey 2) 2UL (intRow 2)
-                Entry.put (intKey 1) 5UL (intRow 5)
-                Entry.put (intKey 2) 7UL (intRow 7)
-                Entry.put (intKey 1) 9UL (intRow 9)
-            |]
-            Memtable.Empty
-
-    // 最新版（SeqNo が最大の版）
-    Assert.Equal<uint64>(9UL, (entry (Memtable.getVisible (intKey 1) None mem)).SeqNo)
-    Assert.Equal<uint64>(7UL, (entry (Memtable.getVisible (intKey 2) None mem)).SeqNo)
-
-    // snapshot で切ると、その時点で最新の版
-    Assert.Equal<uint64>(5UL, (entry (Memtable.getVisible (intKey 1) (Some 6UL) mem)).SeqNo)
-    Assert.Equal<uint64>(2UL, (entry (Memtable.getVisible (intKey 2) (Some 6UL) mem)).SeqNo)
-    Assert.Equal<uint64>(1UL, (entry (Memtable.getVisible (intKey 1) (Some 1UL) mem)).SeqNo)
-
-    // どの版も見えない / 存在しないキー
-    Assert.True((Memtable.getVisible (intKey 1) (Some 0UL) mem).IsNone)
-    Assert.True((Memtable.getVisible (intKey 99) None mem).IsNone)
-    Assert.True((Memtable.getVisible (intKey 99) (Some 100UL) mem).IsNone)
-
-[<Fact>]
-let ``Memtable: getVisible は探索が対数時間（多数の版があっても比例しない）`` () =
-    // 同じキーの版を 2000個積む。
-    let versions = 2_000
-
-    let mem =
-        Seq.init versions (fun i -> Entry.put (intKey 1) (uint64 i) (intRow i))
-        |> fun es -> Memtable.apply es Memtable.Empty
-
-    let sw = System.Diagnostics.Stopwatch.StartNew()
-
-    for _ in 1..1_000 do
-        Memtable.getVisible (intKey 1) None mem |> ignore
-
-    let ms = sw.ElapsedMilliseconds
-    // 「実用時間内」の緩い基準（探索が木の大きさに比例していないこと）。
-    Assert.True(ms < 2000L, sprintf "getVisible が遅すぎます: %d ms" ms)

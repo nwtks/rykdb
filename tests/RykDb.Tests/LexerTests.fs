@@ -29,21 +29,14 @@ let ``Lexer: 行コメントとブロックコメントを読み飛ばす`` () =
     Assert.Equal<Token list>([ Token.IntLit 1L; Token.Symbol "+"; Token.IntLit 2L; Token.Eos ], ks)
 
 [<Fact>]
-let ``Lexer: 閉じないブロックコメントはエラー`` () =
-    match Lexer.tokenize "1 /* unclosed" with
-    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
-    | Ok _ -> Assert.Fail "エラーになるべき"
+let ``Lexer: 入れ子のブロックコメントを読み飛ばす`` () =
+    let ks = kinds "/* a /* b */ c */ 1"
+    Assert.Equal<Token list>([ Token.IntLit 1L; Token.Eos ], ks)
 
 [<Fact>]
 let ``Lexer: 引用識別子`` () =
     let ks = kinds "\"col\""
     Assert.Equal<Token list>([ Token.QuotedIdent "col"; Token.Eos ], ks)
-
-[<Fact>]
-let ``Lexer: 閉じない文字列はエラー`` () =
-    match Lexer.tokenize "'unclosed" with
-    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
-    | Ok _ -> Assert.Fail "エラーになるべき"
 
 [<Fact>]
 let ``Lexer: 識別子と予約語`` () =
@@ -87,26 +80,6 @@ let ``Lexer: バイナリリテラル`` () =
     | other -> Assert.Fail(sprintf "BlobLit ではない: %A" other)
 
 [<Fact>]
-let ``Lexer: 予期しない文字はエラー`` () =
-    match Lexer.tokenize "@" with
-    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
-    | Ok _ -> Assert.Fail "エラーになるべき"
-
-[<Fact>]
-let ``Lexer: 空入力は Eof のみ`` () =
-    let ts = tokens ""
-    Assert.Equal(1, ts.Length)
-
-    match ts.Head.Token with
-    | Token.Eos -> ()
-    | other -> Assert.Fail(sprintf "Eof ではない: %A" other)
-
-[<Fact>]
-let ``Lexer: 入れ子のブロックコメントを読み飛ばす`` () =
-    let ks = kinds "/* a /* b */ c */ 1"
-    Assert.Equal<Token list>([ Token.IntLit 1L; Token.Eos ], ks)
-
-[<Fact>]
 let ``Lexer: 実数の指数表記`` () =
     let ks = kinds "1e5 1.5E+3 1.5e-3"
 
@@ -119,6 +92,33 @@ let ``Lexer: 実数の指数表記`` () =
         ],
         ks
     )
+
+[<Fact>]
+let ``Lexer: 空入力は Eof のみ`` () =
+    let ts = tokens ""
+    Assert.Equal(1, ts.Length)
+
+    match ts.Head.Token with
+    | Token.Eos -> ()
+    | other -> Assert.Fail(sprintf "Eof ではない: %A" other)
+
+[<Fact>]
+let ``Lexer: 閉じないブロックコメントはエラー`` () =
+    match Lexer.tokenize "1 /* unclosed" with
+    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
+    | Ok _ -> Assert.Fail "エラーになるべき"
+
+[<Fact>]
+let ``Lexer: 閉じない文字列はエラー`` () =
+    match Lexer.tokenize "'unclosed" with
+    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
+    | Ok _ -> Assert.Fail "エラーになるべき"
+
+[<Fact>]
+let ``Lexer: 予期しない文字はエラー`` () =
+    match Lexer.tokenize "@" with
+    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
+    | Ok _ -> Assert.Fail "エラーになるべき"
 
 [<Fact>]
 let ``Lexer: 大きすぎる整数はエラー`` () =

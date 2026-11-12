@@ -334,27 +334,6 @@ let ``Compaction: 古い版が残るなら最下位でも tombstone を消さな
         Assert.Equal<uint64>(3UL, entries.[1].SeqNo))
 
 [<Fact>]
-let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
-    withDir "comp-write-fail" (fun dir ->
-        let f = mkSst dir 10L 1 [ entryOf 1 ]
-        let version = Version.addFile f Version.Empty
-        // 存在しないディレクトリを出力先にする → 書き込みが IoError で失敗する
-        let missing = Path.Combine(dir, "missing")
-        let r = Compaction.compact missing version pickFirstLevel 0UL 100L (openBack dir)
-        expectErrorKind ErrorKind.IoError "書き込み失敗は IoError になる" r
-        // 入力ファイルは消さない（削除は呼び出し側の責務）
-        Assert.True(File.Exists(FileMetaData.path dir 10L)))
-
-[<Fact>]
-let ``Compaction: 入力の読み込みに失敗したらそのエラーを返す`` () =
-    withDir "comp-read-fail" (fun dir ->
-        let f = fmd 10L 1 1 1
-        let version = Version.addFile f Version.Empty
-        let broken (_: FileMetaData) = err (DbError.corruption "壊れた SSTable")
-        let r = Compaction.compact dir version pickFirstLevel 0UL 100L broken
-        expectErrorKind ErrorKind.CorruptionError "読み込みエラーはそのまま伝播する" r)
-
-[<Fact>]
 let ``Compaction: 出力はエントリ数ではなく OutputFileTargetBytes ごとに分ける`` () =
     withDir "comp-split-bytes" (fun dir ->
         let text = String.replicate 2000 "x"
@@ -474,3 +453,24 @@ let ``Compaction: 多数の入力ファイルをストリーミングでマー�
             |> Array.forall (fun (a, b) -> Bytes.compare a.Key b.Key <= 0)
 
         Assert.True(ordered, "マージ結果がキー昇順ではありません"))
+
+[<Fact>]
+let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
+    withDir "comp-write-fail" (fun dir ->
+        let f = mkSst dir 10L 1 [ entryOf 1 ]
+        let version = Version.addFile f Version.Empty
+        // 存在しないディレクトリを出力先にする → 書き込みが IoError で失敗する
+        let missing = Path.Combine(dir, "missing")
+        let r = Compaction.compact missing version pickFirstLevel 0UL 100L (openBack dir)
+        expectErrorKind ErrorKind.IoError "書き込み失敗は IoError になる" r
+        // 入力ファイルは消さない（削除は呼び出し側の責務）
+        Assert.True(File.Exists(FileMetaData.path dir 10L)))
+
+[<Fact>]
+let ``Compaction: 入力の読み込みに失敗したらそのエラーを返す`` () =
+    withDir "comp-read-fail" (fun dir ->
+        let f = fmd 10L 1 1 1
+        let version = Version.addFile f Version.Empty
+        let broken (_: FileMetaData) = err (DbError.corruption "壊れた SSTable")
+        let r = Compaction.compact dir version pickFirstLevel 0UL 100L broken
+        expectErrorKind ErrorKind.CorruptionError "読み込みエラーはそのまま伝播する" r)

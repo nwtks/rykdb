@@ -51,36 +51,6 @@ let ``TableSchema: スキーマを AST から作れる`` () =
     Assert.Equal<int option>(None, TableSchema.indexOf usersSchema "nope")
 
 [<Fact>]
-let ``TableSchema.ofCreateTable: 主キー無し・列無しのテーブルはエラー`` () =
-    let noCols =
-        {
-            Name = "t"
-            IfNotExists = false
-            Columns = []
-            Constraints = []
-        }
-
-    expectErrorKind ErrorKind.ConstraintViolation "列無しのテーブルを許してはいけない" (TableSchema.ofCreateTable noCols)
-
-    let noPk =
-        {
-            Name = "t"
-            IfNotExists = false
-            Columns =
-                [
-                    {
-                        Name = "a"
-                        DataType = DataType.Integer
-                        TypeArguments = []
-                        Constraint = ColumnConstraint.Empty
-                    }
-                ]
-            Constraints = []
-        }
-
-    expectErrorKind ErrorKind.ConstraintViolation "主キー無しのテーブルを許してはいけない" (TableSchema.ofCreateTable noPk)
-
-[<Fact>]
 let ``TableSchema.ofCreateTable: テーブル制約の主キーを使う`` () =
     let ast =
         {
@@ -121,6 +91,36 @@ let ``TableSchema.ofCreateTable: テーブルレベル PK は NOT NULL になる
         ErrorKind.ConstraintViolation
         "テーブルレベル PK の NULL を許してはいけない"
         (TableSchema.validateRow schema [| SqlValue.Null; SqlValue.Text "x" |])
+
+[<Fact>]
+let ``TableSchema.ofCreateTable: 主キー無し・列無しのテーブルはエラー`` () =
+    let noCols =
+        {
+            Name = "t"
+            IfNotExists = false
+            Columns = []
+            Constraints = []
+        }
+
+    expectErrorKind ErrorKind.ConstraintViolation "列無しのテーブルを許してはいけない" (TableSchema.ofCreateTable noCols)
+
+    let noPk =
+        {
+            Name = "t"
+            IfNotExists = false
+            Columns =
+                [
+                    {
+                        Name = "a"
+                        DataType = DataType.Integer
+                        TypeArguments = []
+                        Constraint = ColumnConstraint.Empty
+                    }
+                ]
+            Constraints = []
+        }
+
+    expectErrorKind ErrorKind.ConstraintViolation "主キー無しのテーブルを許してはいけない" (TableSchema.ofCreateTable noPk)
 
 [<Fact>]
 let ``TableSchema.ofCreateTable: 重複列はエラー`` () =
@@ -183,9 +183,13 @@ let ``TableSchema.ofCreateTable: 存在しない UNIQUE 列はエラー`` () =
     expectErrorKind ErrorKind.NameError "存在しない UNIQUE 列を許してはいけない" (TableSchema.ofCreateTable ast)
 
 [<Fact>]
-let ``TableSchema.requireIndexOf: 無い列はエラー`` () =
-    Assert.Equal<int>(0, ok (TableSchema.requireIndexOf peopleSchema "id"))
-    expectErrorKind ErrorKind.NameError "無い列で位置が返った" (TableSchema.requireIndexOf peopleSchema "nope")
+let ``TableSchema.validateRow: 正常行は Ok`` () =
+    let schema = peopleSchema
+    let row = [| SqlValue.Int 7L; SqlValue.Text "alice"; SqlValue.Int 20L |]
+
+    match TableSchema.validateRow schema row with
+    | Ok _ -> ()
+    | Error e -> Assert.Fail(DbError.toDisplayString e)
 
 [<Fact>]
 let ``TableSchema.validateRow: 列数不一致はエラー`` () =
@@ -206,21 +210,17 @@ let ``TableSchema.validateRow: NOT NULL 違反はエラー`` () =
     | Ok _ -> Assert.Fail "NOT NULL 違反はエラーになるべき"
 
 [<Fact>]
-let ``TableSchema.validateRow: 正常行は Ok`` () =
-    let schema = peopleSchema
-    let row = [| SqlValue.Int 7L; SqlValue.Text "alice"; SqlValue.Int 20L |]
-
-    match TableSchema.validateRow schema row with
-    | Ok _ -> ()
-    | Error e -> Assert.Fail(DbError.toDisplayString e)
-
-[<Fact>]
 let ``TableSchema.primaryKeyOf: 主キー列を取り出す`` () =
     let schema = peopleSchema
     let row = [| SqlValue.Int 7L; SqlValue.Text "alice"; SqlValue.Int 20L |]
     let pk = TableSchema.primaryKeyOf schema row
     Assert.Equal<int>(1, pk.Length)
     Assert.Equal(SqlValue.Int 7L, pk.[0])
+
+[<Fact>]
+let ``TableSchema.requireIndexOf: 無い列はエラー`` () =
+    Assert.Equal<int>(0, ok (TableSchema.requireIndexOf peopleSchema "id"))
+    expectErrorKind ErrorKind.NameError "無い列で位置が返った" (TableSchema.requireIndexOf peopleSchema "nope")
 
 [<Fact>]
 let ``Catalog.addTable: 空のカタログにテーブルを追加・検索・削除`` () =
@@ -233,25 +233,6 @@ let ``Catalog.addTable: 空のカタログにテーブルを追加・検索・�
 
     let c2 = Catalog.removeTable c1 "people"
     Assert.Empty c2.Tables
-
-[<Fact>]
-let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
-    withStore "cat3" (fun store ->
-        let ix =
-            {
-                IndexName = "ix_x"
-                TableName = "t"
-                Columns = [ "a"; "b" ]
-                Unique = true
-            }
-
-        let c = ix |> Catalog.addIndex Catalog.Empty
-        let store = ok (Catalog.save store Catalog.Empty c)
-        let loaded = ok (Catalog.load store)
-        Assert.Empty loaded.Tables
-        Assert.Single loaded.Indexes |> ignore
-        Assert.Equal<string list>([ "a"; "b" ], loaded.Indexes.[0].Columns)
-        Assert.True(loaded.Indexes.[0].Unique))
 
 [<Fact>]
 let ``Catalog.removeTable: 削除した定義は再読込時に消える`` () =
@@ -274,29 +255,23 @@ let ``Catalog.removeTable: 削除した定義は再読込時に消える`` () =
         Assert.True(Catalog.findTable loaded "people" |> Option.isNone))
 
 [<Fact>]
-let ``Catalog.toSchema: TableSchema を定義に変換して戻すと元に戻る`` () =
-    let defn = Catalog.toDefinition peopleSchema
-    Assert.Equal<string>("people", defn.Name)
-    Assert.Equal<int>(3, defn.Columns.Length)
+let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
+    withStore "cat3" (fun store ->
+        let ix =
+            {
+                IndexName = "ix_x"
+                TableName = "t"
+                Columns = [ "a"; "b" ]
+                Unique = true
+            }
 
-    let back = ok (Catalog.toSchema defn)
-    Assert.Equal<string>("people", back.Name)
-    Assert.Equal<int>(3, back.Columns.Length)
-    Assert.Equal<int>([| 0 |], back.PrimaryKey)
-    // NOT NULL / PRIMARY KEY が保存されているか
-    Assert.True(back.Columns.[0].Constraint.NotNull)
-    Assert.True(back.Columns.[0].Constraint.PrimaryKey)
-
-[<Fact>]
-let ``Catalog.toSchema: 主キー列が存在しない場合はエラー`` () =
-    let bad =
-        {
-            Name = "broken"
-            Columns = [ col "a" DataType.Integer ]
-            PrimaryKeyColumns = [ "nope" ]
-        }
-
-    expectError "存在しない主キー列で復元できました" (Catalog.toSchema bad)
+        let c = ix |> Catalog.addIndex Catalog.Empty
+        let store = ok (Catalog.save store Catalog.Empty c)
+        let loaded = ok (Catalog.load store)
+        Assert.Empty loaded.Tables
+        Assert.Single loaded.Indexes |> ignore
+        Assert.Equal<string list>([ "a"; "b" ], loaded.Indexes.[0].Columns)
+        Assert.True(loaded.Indexes.[0].Unique))
 
 [<Fact>]
 let ``Catalog.removeIndex: removeIndex は指定した索引だけ消す`` () =
@@ -324,6 +299,31 @@ let ``Catalog.removeIndex: removeIndex は指定した索引だけ消す`` () =
 
     Assert.True(Catalog.findIndex c "ix_a" |> Option.isNone)
     Assert.True(Catalog.findIndex c "ix_b" |> Option.isSome)
+
+[<Fact>]
+let ``Catalog.toSchema: TableSchema を定義に変換して戻すと元に戻る`` () =
+    let defn = Catalog.toDefinition peopleSchema
+    Assert.Equal<string>("people", defn.Name)
+    Assert.Equal<int>(3, defn.Columns.Length)
+
+    let back = ok (Catalog.toSchema defn)
+    Assert.Equal<string>("people", back.Name)
+    Assert.Equal<int>(3, back.Columns.Length)
+    Assert.Equal<int>([| 0 |], back.PrimaryKey)
+    // NOT NULL / PRIMARY KEY が保存されているか
+    Assert.True(back.Columns.[0].Constraint.NotNull)
+    Assert.True(back.Columns.[0].Constraint.PrimaryKey)
+
+[<Fact>]
+let ``Catalog.toSchema: 主キー列が存在しない場合はエラー`` () =
+    let bad =
+        {
+            Name = "broken"
+            Columns = [ col "a" DataType.Integer ]
+            PrimaryKeyColumns = [ "nope" ]
+        }
+
+    expectError "存在しない主キー列で復元できました" (Catalog.toSchema bad)
 
 [<Fact>]
 let ``Catalog: 保存したカタログを読み込める`` () =
@@ -514,36 +514,6 @@ let ``Schema.expandStar: t.* は修飾一致のみ`` () =
     | other -> Assert.Fail(sprintf "expandStar t.* が想定外: %A" other)
 
 [<Fact>]
-let ``Schema.projectColumns: * は入力列名`` () =
-    let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
-
-    let h =
-        Schema.projectColumns s [ { Expression = Expr.Star; Alias = None } ]
-        |> Array.map (fun c -> c.Display)
-
-    Assert.Equal<string array>([| "id" |], h)
-
-[<Fact>]
-let ``Schema.projectColumns: 空なら入力ヘッダ / t.* は修飾つき`` () =
-    let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
-    // 射影が空なら入力スキーマのヘッダをそのまま返す
-    Assert.Equal<string array>([| "t.id" |], Schema.projectColumns s [] |> Array.map (fun c -> c.Display))
-
-    // t.* は修飾つきの表示名で出す
-    let h =
-        Schema.projectColumns
-            s
-            [
-                {
-                    Expression = Expr.QualifiedStar "t"
-                    Alias = None
-                }
-            ]
-        |> Array.map (fun c -> c.Display)
-
-    Assert.Equal<string array>([| "t.id" |], h)
-
-[<Fact>]
 let ``Schema.tryAsColumnRef: Column / Name を列参照に`` () =
     match Schema.tryAsColumnRef (Expr.Column { Qualifier = Some "t"; Name = "id" }) with
     | Some c -> Assert.Equal("id", c.Name)
@@ -575,3 +545,33 @@ let ``Schema.resolve: 修飾子の無い列名が曖昧ならエラー`` () =
 
     // 修飾子付きなら解決できる
     Assert.Equal(1, ok (Schema.resolve schema { Qualifier = Some "b"; Name = "id" }))
+
+[<Fact>]
+let ``Schema.projectColumns: * は入力列名`` () =
+    let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
+
+    let h =
+        Schema.projectColumns s [ { Expression = Expr.Star; Alias = None } ]
+        |> Array.map (fun c -> c.Display)
+
+    Assert.Equal<string array>([| "id" |], h)
+
+[<Fact>]
+let ``Schema.projectColumns: 空なら入力ヘッダ / t.* は修飾つき`` () =
+    let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
+    // 射影が空なら入力スキーマのヘッダをそのまま返す
+    Assert.Equal<string array>([| "t.id" |], Schema.projectColumns s [] |> Array.map (fun c -> c.Display))
+
+    // t.* は修飾つきの表示名で出す
+    let h =
+        Schema.projectColumns
+            s
+            [
+                {
+                    Expression = Expr.QualifiedStar "t"
+                    Alias = None
+                }
+            ]
+        |> Array.map (fun c -> c.Display)
+
+    Assert.Equal<string array>([| "t.id" |], h)

@@ -371,7 +371,7 @@ let files =
 //   ファイルを選ぶ枝刈り（Largest >= startKey）と、中身の下限は別物。
 //   → Sstable.rangeScanPartial が index を二分探索して startKey より前のブロックを読み飛ばし、
 //     Memtable.rangeScan は木を途中から降りる。
-let merged = SstMerge.ofScans (memScan :: fileScans)
+let merged = SstMerge.ofScans (Array.append [| memScan |] fileScans)
 // 可視性の判定と同一キーの最新版への畳み込みは、SstMerge から 1件ずつ取り出す
 // 側（StorageEngine.scanAt の isVisible）が行う。
 // memtable も各ファイルも startKey 以降しか返さないので、merge 後の絞り込みは不要
@@ -892,8 +892,8 @@ let rec readAll n c acc =
 
 **ローカルの `let rec` には `[<TailCall>]` を書けない**（FS0010 → `TreatWarningsAsErrors` でエラー）。
 末尾化したい関数が別の関数の中にあるなら、その関数を**モジュールスコープへ引き上げ**、必要なものは引数で渡す
-（`Expr.rewrite`（`Ast.fs`）は `rewriteLeaf` を受け取る形で、
-内部の `rewriteLoop` が末尾再帰。`Binder.qualify` と `Ops` の集約読み替えが共用している）。
+（`Expr.rewrite`（`Ast.fs`）は `rewriteLeaf` を受け取る形で、内部のローカル関数 `loop` が末尾再帰。
+`Binder.qualify` と `Ops` の集約読み替えが共用している）。
 
 **要素数に比例する反復は必ず後者にする**（`match` に直せば末尾になる）。
 `>>=` で受けると候補の数・WHEN 節の数だけスタックが積まれる。
@@ -2031,7 +2031,7 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 ❌ `.stream` の `STREAM` ヘッダだけ読んで `END` を消費せず、次の SQL を送る。
 残りの行が次の応答として読まれ、プロトコルがずれる。
 
-✅ `RykDb.Client.SendStream` のように `END` または途中の `ERR` まで読み切る。
+✅ `RykDb.Client` の `RykDbClient.SendStream` のように `END` または途中の `ERR` まで読み切る。
 途中で読むのをやめる低レベル実装では、接続を閉じるか `END` まで drain する。
 
 ### 11.64 接続ごとの transaction は「接続ローカルの状態 + 共有 Manager の rebase」
@@ -2043,7 +2043,7 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 ハンドルの `Store` も古いため、他接続の commit が memtable に載っていない。
 
 ✅ 文を実行するたびに **最新の committed state に接続ローカルの transaction を重ねる**（`SessionState.apply`）。
-`Active` / `Pending` / `ActiveRegistration` だけをローカルに持ち、
+`Catalog` / `Active` / `Pending` / `Registration` だけをローカルに持ち、
 `Store` / `Catalog` / `Manager` は `DatabaseHost` の最新値を使う。
 可視性は `Transaction.Snapshot.SeqNo` で決まるので、Store を最新にしても repeatable read は崩れない。
 BEGIN / COMMIT / ROLLBACK と暗黙 transaction の DML / DDL は `DatabaseHost.writeGate` の下で行い、

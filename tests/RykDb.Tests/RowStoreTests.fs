@@ -268,7 +268,7 @@ let ``RowStore: 複数 keyspace の書き込みは 1 回の WAL バッチで回�
         ok (RowStore.close store))
 
 [<Fact>]
-let ``RowStore.close: engine の失敗を返してロックを解放する`` () =
+let ``RowStore.close: engine の失敗を返して Close を呼ぶ`` () =
     let closed = ResizeArray<string>()
 
     let store =

@@ -35,48 +35,6 @@ let private fixFooterChecksum (bytes: byte array) =
 let private readEntries (partial: SstPartial) =
     Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray
 
-[<Fact>]
-let ``SstEntry.make / compare: キー昇順・SeqNo 降順`` () =
-    let a = SstEntry.make (intKey 1) 1UL (Some [| SqlValue.Int 1L |])
-    let b = SstEntry.make (intKey 1) 2UL (Some [| SqlValue.Int 1L |])
-    // 同キーは SeqNo 降順（大きい方が先）
-    Assert.True(SstEntry.compare b a < 0 || SstEntry.compare b a = 0)
-
-[<Fact>]
-let ``SstEntry.decodeValue: 不明な値タグは CorruptionError`` () =
-    // SeqNo=1・タグ=2（0/1 以外）・要素数=0
-    expectErrorKind ErrorKind.CorruptionError "不明な値タグはエラー" (SstEntry.decodeValue [| 1uy; 2uy; 0uy |])
-
-[<Fact>]
-let ``Sstable.writeTo: 入力の seq は 1 回だけ列挙する`` () =
-    let items =
-        [|
-            for i in 1..5 -> SstEntry.make (intKey i) (uint64 i) (Some [| SqlValue.Int(int64 i) |])
-        |]
-
-    let mutable enumerations = 0
-
-    let once =
-        seq {
-            enumerations <- enumerations + 1
-
-            if enumerations > 1 then
-                failwith "入力が 2回列挙されています"
-
-            yield! items
-        }
-
-    use stream = new System.IO.MemoryStream()
-    let info = ok (Sstable.writeTo stream 0.01 once)
-
-    Assert.Equal(1, enumerations)
-    Assert.Equal<int64>(5L, info.EntryCount)
-    Assert.Equal<byte array>(intKey 1, info.FirstKey)
-    Assert.Equal<byte array>(intKey 5, info.LastKey)
-    Assert.Equal<uint64>(5UL, info.MaxSeqNo)
-    // 書いたバイト数と Size が食い違わない
-    Assert.Equal<int64>(int64 (stream.ToArray().Length), info.Size)
-
 /// 配列を遅延スキャンにする（SstMerge の入力）。
 let private scanOfArray (items: SstEntry array) =
     let rec from (i: int) =
@@ -98,6 +56,58 @@ let private drainMerge (merge: SstMerge) =
         | Ok(Some(e, rest)) -> loop rest (e :: acc)
 
     loop merge []
+
+[<Fact>]
+let ``SstEntry.make / compare: 同キーは SeqNo 降順`` () =
+    let a = SstEntry.make (intKey 1) 1UL (Some [| SqlValue.Int 1L |])
+    let b = SstEntry.make (intKey 1) 2UL (Some [| SqlValue.Int 1L |])
+    // 同キーは SeqNo 降順（大きい方が先）
+    Assert.True(SstEntry.compare b a < 0 || SstEntry.compare b a = 0)
+
+[<Fact>]
+let ``SstEntry.decodeValue: 不明な値タグは CorruptionError`` () =
+    // SeqNo=1・タグ=2（0/1 以外）・要素数=0
+    expectErrorKind ErrorKind.CorruptionError "不明な値タグはエラー" (SstEntry.decodeValue [| 1uy; 2uy; 0uy |])
+
+[<Fact>]
+let ``SstScan.empty: 次は None`` () =
+    match SstScan.next SstScan.Empty with
+    | Ok None -> ()
+    | other -> Assert.Fail(sprintf "empty は None を返すべき: %A" other)
+
+[<Fact>]
+let ``SstScan.emit: 1件ずつ取り出せる`` () =
+    let e = SstEntry.make (intKey 1) 1UL (Some [| SqlValue.Int 1L |])
+    let scan = SstScan.emit (fun () -> SstScan.Empty) e
+    let arr = ok (SstScan.toArray scan)
+    Assert.Equal(1, arr.Length)
+    Assert.Equal(e, arr.[0])
+
+[<Fact>]
+let ``SstScan.toArray: empty は空配列`` () =
+    let arr = ok (SstScan.toArray SstScan.Empty)
+    Assert.Equal(0, arr.Length)
+
+[<Fact>]
+let ``SstScan.filter: 述語を満たすエントリだけ返す`` () =
+    let entries = sstEntries 20
+    let scan = scanOfEntries entries |> SstScan.filter (fun e -> e.SeqNo % 2UL = 0UL)
+    let got = ok (SstScan.toArray scan)
+    let expected = entries |> Array.filter (fun e -> e.SeqNo % 2UL = 0UL)
+    Assert.Equal<SstEntry array>(expected, got)
+
+[<Fact>]
+let ``SstScan.filter: 入れ子のフィルタは両方適用される`` () =
+    let entries = sstEntries 30
+
+    let scan =
+        scanOfEntries entries
+        |> SstScan.filter (fun e -> e.SeqNo >= 5UL)
+        |> SstScan.filter (fun e -> e.SeqNo < 15UL)
+
+    let got = ok (SstScan.toArray scan)
+    let expected = entries |> Array.filter (fun e -> e.SeqNo >= 5UL && e.SeqNo < 15UL)
+    Assert.Equal<SstEntry array>(expected, got)
 
 [<Fact>]
 let ``SstMerge: ソート済みの列をまとめてマージできる`` () =
@@ -141,64 +151,34 @@ let ``SstMerge: 多数のソースをまとめてマージできる`` () =
     |> List.iteri (fun i n -> Assert.True(intKey n = merged.[i].Key, sprintf "位置 %d が %d ではありません" i n))
 
 [<Fact>]
-let ``SstScan.empty: 次は None`` () =
-    match SstScan.next SstScan.Empty with
-    | Ok None -> ()
-    | other -> Assert.Fail(sprintf "empty は None を返すべき: %A" other)
-
-[<Fact>]
-let ``SstScan.emit: 1件ずつ取り出せる`` () =
-    let e = SstEntry.make (intKey 1) 1UL (Some [| SqlValue.Int 1L |])
-    let scan = SstScan.emit (fun () -> SstScan.Empty) e
-    let arr = ok (SstScan.toArray scan)
-    Assert.Equal(1, arr.Length)
-    Assert.Equal(e, arr.[0])
-
-[<Fact>]
-let ``SstScan.toArray: empty は空配列`` () =
-    let arr = ok (SstScan.toArray SstScan.Empty)
-    Assert.Equal(0, arr.Length)
-
-[<Fact>]
-let ``SstScan.filter: 述語を満たすエントリだけ返す`` () =
-    let entries = sstEntries 20
-    let scan = scanOfEntries entries |> SstScan.filter (fun e -> e.SeqNo % 2UL = 0UL)
-    let got = ok (SstScan.toArray scan)
-    let expected = entries |> Array.filter (fun e -> e.SeqNo % 2UL = 0UL)
-    Assert.Equal<SstEntry array>(expected, got)
-
-[<Fact>]
-let ``SstScan.filter: 入れ子のフィルタは両方適用される`` () =
-    let entries = sstEntries 30
-
-    let scan =
-        scanOfEntries entries
-        |> SstScan.filter (fun e -> e.SeqNo >= 5UL)
-        |> SstScan.filter (fun e -> e.SeqNo < 15UL)
-
-    let got = ok (SstScan.toArray scan)
-    let expected = entries |> Array.filter (fun e -> e.SeqNo >= 5UL && e.SeqNo < 15UL)
-    Assert.Equal<SstEntry array>(expected, got)
-
-[<Fact>]
-let ``SSTable: maxSeqNo が保存・復元される`` () =
-    let entries =
+let ``Sstable.writeTo: 入力の seq は 1 回だけ列挙する`` () =
+    let items =
         [|
-            SstEntry.make (intKey 1) 7UL (Some [| SqlValue.Int 1L |])
-            SstEntry.make (intKey 2) 99UL (Some [| SqlValue.Int 2L |])
-            SstEntry.make (intKey 3) 42UL (Some [| SqlValue.Int 3L |])
+            for i in 1..5 -> SstEntry.make (intKey i) (uint64 i) (Some [| SqlValue.Int(int64 i) |])
         |]
 
-    let bytes = ok (buildSstable 0.01 entries)
-    let reader = ok (Sstable.openPartial (writeTempSst bytes))
-    Assert.Equal<uint64>(99UL, reader.MaxSeqNo)
-    Assert.Equal<int64>(3L, reader.EntryCount)
+    let mutable enumerations = 0
 
-[<Fact>]
-let ``SSTable: 空のテーブルは maxSeqNo 0`` () =
-    let bytes = ok (buildSstable 0.01 [||])
-    let reader = ok (Sstable.openPartial (writeTempSst bytes))
-    Assert.Equal<uint64>(0UL, reader.MaxSeqNo)
+    let once =
+        seq {
+            enumerations <- enumerations + 1
+
+            if enumerations > 1 then
+                failwith "入力が 2回列挙されています"
+
+            yield! items
+        }
+
+    use stream = new System.IO.MemoryStream()
+    let info = ok (Sstable.writeTo stream 0.01 once)
+
+    Assert.Equal(1, enumerations)
+    Assert.Equal<int64>(5L, info.EntryCount)
+    Assert.Equal<byte array>(intKey 1, info.FirstKey)
+    Assert.Equal<byte array>(intKey 5, info.LastKey)
+    Assert.Equal<uint64>(5UL, info.MaxSeqNo)
+    // 書いたバイト数と Size が食い違わない
+    Assert.Equal<int64>(int64 (stream.ToArray().Length), info.Size)
 
 [<Fact>]
 let ``SSTable: 構築と全件走査の往復`` () =
@@ -230,13 +210,6 @@ let ``SSTable: 複数ブロックに分割される`` () =
 
     // ブロック境界をまたぐ探索ができること
     Assert.Equal<int64>(int64 entries.Length, reader.EntryCount)
-
-[<Fact>]
-let ``SSTable: 空のテーブル`` () =
-    let data = ok (buildSstable 0.01 [||])
-    let reader = ok (Sstable.openPartial (writeTempSst data))
-    Assert.Equal<int64>(0L, reader.EntryCount)
-    Assert.Equal(0, ok (readEntries reader) |> Seq.length)
 
 [<Fact>]
 let ``SSTable: 全 10型の値を往復できる`` () =
@@ -280,69 +253,34 @@ let ``SSTable: 全 10型の値を往復できる`` () =
             Assert.Equal<string>(SqlLiteral.toSqlLiteral values.[i].[j], SqlLiteral.toSqlLiteral got.[j])
 
 [<Fact>]
-let ``Sstable.openTable: チェックサム不一致は CorruptionError`` () =
-    let data = ok (buildSstable 0.01 (sstEntries 500))
-    let corrupted = Array.copy data
-    corrupted.[corrupted.Length / 2] <- corrupted.[corrupted.Length / 2] ^^^ 0xFFuy
-    let partial = ok (Sstable.openPartial (writeTempSst corrupted))
+let ``SSTable: maxSeqNo が保存・復元される`` () =
+    let entries =
+        [|
+            SstEntry.make (intKey 1) 7UL (Some [| SqlValue.Int 1L |])
+            SstEntry.make (intKey 2) 99UL (Some [| SqlValue.Int 2L |])
+            SstEntry.make (intKey 3) 42UL (Some [| SqlValue.Int 3L |])
+        |]
 
-    expectErrorKind
-        ErrorKind.CorruptionError
-        "チェックサム不一致はエラーになるはず"
-        (Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray)
-
-[<Fact>]
-let ``Sstable.openTable: マジック不一致は CorruptionError`` () =
-    let data = ok (buildSstable 0.01 (sstEntries 500))
-    let badMagic = Array.copy data
-    let footerStart = badMagic.Length - Sstable.FooterSize
-    badMagic.[footerStart] <- badMagic.[footerStart] ^^^ 0xFFuy
-    fixFooterChecksum badMagic
-    expectErrorKind ErrorKind.CorruptionError "マジック不一致はエラーになるはず" (Sstable.openPartial (writeTempSst badMagic))
+    let bytes = ok (buildSstable 0.01 entries)
+    let reader = ok (Sstable.openPartial (writeTempSst bytes))
+    Assert.Equal<uint64>(99UL, reader.MaxSeqNo)
+    Assert.Equal<int64>(3L, reader.EntryCount)
 
 [<Fact>]
-let ``Sstable.openTable: 未対応バージョンは CorruptionError`` () =
-    let data = ok (buildSstable 0.01 (sstEntries 3))
-    let bad = Array.copy data
-    bad.[bad.Length - Sstable.FooterSize + 8] <- 6uy
-    fixFooterChecksum bad
-    expectErrorKind ErrorKind.CorruptionError "未対応バージョンはエラーになるはず" (Sstable.openPartial (writeTempSst bad))
+let ``SSTable: 空のテーブルは maxSeqNo 0`` () =
+    let bytes = ok (buildSstable 0.01 [||])
+    let reader = ok (Sstable.openPartial (writeTempSst bytes))
+    Assert.Equal<uint64>(0UL, reader.MaxSeqNo)
 
 [<Fact>]
-let ``Sstable.openTable: Footer の範囲が不正なら CorruptionError`` () =
-    let baseBytes = ok (buildSstable 0.01 (sstEntries 3))
-    let footerStart = baseBytes.Length - Sstable.FooterSize
-
-    let writeI64 (bytes: byte array) (off: int) (v: int64) =
-        for i in 0..7 do
-            bytes.[off + i] <- byte (v >>> 8 * i &&& 0xFFL)
-
-    let cases: (string * (byte array -> unit)) list =
-        [
-            "IndexOff 負", (fun b -> writeI64 b (footerStart + 20) -1L)
-            "IndexLen 負", (fun b -> writeI64 b (footerStart + 28) -1L)
-            "Index 範囲外", (fun b -> writeI64 b (footerStart + 28) (int64 footerStart))
-            "BloomOff 負", (fun b -> writeI64 b (footerStart + 36) -1L)
-            "BloomLen 負", (fun b -> writeI64 b (footerStart + 44) -1L)
-            "Bloom 範囲外", (fun b -> writeI64 b (footerStart + 44) (int64 footerStart))
-            "MetaOff 負", (fun b -> writeI64 b (footerStart + 52) -1L)
-            "MetaLen 負", (fun b -> writeI64 b (footerStart + 60) -1L)
-            "Meta 範囲外", (fun b -> writeI64 b (footerStart + 60) (int64 footerStart))
-        ]
-
-    for name, patch in cases do
-        let bytes = Array.copy baseBytes
-        patch bytes
-        // Footer のチェックサムを直して、範囲検証まで到達させる。
-        fixFooterChecksum bytes
-        expectErrorKind ErrorKind.CorruptionError name (Sstable.openPartial (writeTempSst bytes))
+let ``SSTable: 空のテーブル`` () =
+    let data = ok (buildSstable 0.01 [||])
+    let reader = ok (Sstable.openPartial (writeTempSst data))
+    Assert.Equal<int64>(0L, reader.EntryCount)
+    Assert.Equal(0, ok (readEntries reader) |> Seq.length)
 
 [<Fact>]
-let ``Sstable.openTable: Footer に満たないデータは CorruptionError`` () =
-    expectErrorKind ErrorKind.CorruptionError "短すぎるデータはエラー" (Sstable.openPartial (writeTempSst (Array.create 10 0uy)))
-
-[<Fact>]
-let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開ける`` () =
+let ``Sstable.openPartial: Meta が壊れていれば CorruptionError`` () =
     // 1個目の長さ付きキーは読めるが 2個目が途中で切れている meta 領域
     let body = [| 0x01uy; 0x61uy |]
 
@@ -371,6 +309,91 @@ let ``Sstable.openTable: Meta が壊れていても MinKey/MaxKey は空で開�
         ErrorKind.CorruptionError
         "Meta の破損は CorruptionError"
         (Sstable.openPartial (writeTempSst (Array.append body footer)))
+
+[<Fact>]
+let ``Sstable.openPartial: チェックサム不一致は読み出し時に CorruptionError`` () =
+    let data = ok (buildSstable 0.01 (sstEntries 500))
+    let corrupted = Array.copy data
+    corrupted.[corrupted.Length / 2] <- corrupted.[corrupted.Length / 2] ^^^ 0xFFuy
+    let partial = ok (Sstable.openPartial (writeTempSst corrupted))
+
+    expectErrorKind
+        ErrorKind.CorruptionError
+        "チェックサム不一致はエラーになるはず"
+        (Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray)
+
+[<Fact>]
+let ``Sstable.openPartial: マジック不一致は CorruptionError`` () =
+    let data = ok (buildSstable 0.01 (sstEntries 500))
+    let badMagic = Array.copy data
+    let footerStart = badMagic.Length - Sstable.FooterSize
+    badMagic.[footerStart] <- badMagic.[footerStart] ^^^ 0xFFuy
+    fixFooterChecksum badMagic
+    expectErrorKind ErrorKind.CorruptionError "マジック不一致はエラーになるはず" (Sstable.openPartial (writeTempSst badMagic))
+
+[<Fact>]
+let ``Sstable.openPartial: 未対応バージョンは CorruptionError`` () =
+    let data = ok (buildSstable 0.01 (sstEntries 3))
+    let bad = Array.copy data
+    bad.[bad.Length - Sstable.FooterSize + 8] <- 6uy
+    fixFooterChecksum bad
+    expectErrorKind ErrorKind.CorruptionError "未対応バージョンはエラーになるはず" (Sstable.openPartial (writeTempSst bad))
+
+[<Fact>]
+let ``Sstable.openPartial: Footer の範囲が不正なら CorruptionError`` () =
+    let baseBytes = ok (buildSstable 0.01 (sstEntries 3))
+    let footerStart = baseBytes.Length - Sstable.FooterSize
+
+    let writeI64 (bytes: byte array) (off: int) (v: int64) =
+        for i in 0..7 do
+            bytes.[off + i] <- byte (v >>> 8 * i &&& 0xFFL)
+
+    let cases: (string * (byte array -> unit)) list =
+        [
+            "IndexOff 負", (fun b -> writeI64 b (footerStart + 20) -1L)
+            "IndexLen 負", (fun b -> writeI64 b (footerStart + 28) -1L)
+            "Index 範囲外", (fun b -> writeI64 b (footerStart + 28) (int64 footerStart))
+            "BloomOff 負", (fun b -> writeI64 b (footerStart + 36) -1L)
+            "BloomLen 負", (fun b -> writeI64 b (footerStart + 44) -1L)
+            "Bloom 範囲外", (fun b -> writeI64 b (footerStart + 44) (int64 footerStart))
+            "MetaOff 負", (fun b -> writeI64 b (footerStart + 52) -1L)
+            "MetaLen 負", (fun b -> writeI64 b (footerStart + 60) -1L)
+            "Meta 範囲外", (fun b -> writeI64 b (footerStart + 60) (int64 footerStart))
+        ]
+
+    for name, patch in cases do
+        let bytes = Array.copy baseBytes
+        patch bytes
+        // Footer のチェックサムを直して、範囲検証まで到達させる。
+        fixFooterChecksum bytes
+        expectErrorKind ErrorKind.CorruptionError name (Sstable.openPartial (writeTempSst bytes))
+
+[<Fact>]
+let ``Sstable.openPartial: Footer に満たないデータは CorruptionError`` () =
+    expectErrorKind ErrorKind.CorruptionError "短すぎるデータはエラー" (Sstable.openPartial (writeTempSst (Array.create 10 0uy)))
+
+[<Fact>]
+let ``Sstable.openPartial: 全件・limit・lookup が全読みと一致する`` () =
+    withDir "sst-partial" (fun dir ->
+        let entries = sstEntries 300
+        let path = System.IO.Path.Combine(dir, "1.sst")
+        System.IO.File.WriteAllBytes(path, ok (buildSstable 0.01 entries))
+
+        let partial = ok (Sstable.openPartial path)
+        let all = ok (Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray)
+        Assert.Equal<int>(entries.Length, all.Length)
+        Assert.Equal<int>(0, Bytes.compare entries.[0].Key all.[0].Key)
+        Assert.Equal<int>(0, Bytes.compare entries.[entries.Length - 1].Key all.[all.Length - 1].Key)
+
+        let limited = ok (Sstable.rangeScanPartial [||] 10 partial |> SstScan.toArray)
+        Assert.Equal<int>(10, limited.Length)
+
+        match ok (Sstable.lookup (intKey 150) None partial) with
+        | Some e -> Assert.Equal<uint64>(151UL, e.SeqNo)
+        | None -> Assert.Fail "lookup が行を見つけられません"
+
+        // 可視性: SeqNo 2 ではキー 150（SeqNo 151）は見えない
+        Assert.True((ok (Sstable.lookup (intKey 150) (Some 2UL) partial)).IsNone))
 
 [<Fact>]
 let ``Sstable.openPartial: Footer のチェックサム不一致は CorruptionError`` () =
@@ -403,29 +426,6 @@ let ``Sstable.openPartial: Bloom メタデータの破損は checksum で検出`
         System.IO.File.WriteAllBytes(path, data)
 
         expectErrorKind ErrorKind.CorruptionError "部分読みで Bloom の改変を見逃さない" (Sstable.openPartial path))
-
-[<Fact>]
-let ``Sstable.openPartial: 全件・limit・lookup が全読みと一致する`` () =
-    withDir "sst-partial" (fun dir ->
-        let entries = sstEntries 300
-        let path = System.IO.Path.Combine(dir, "1.sst")
-        System.IO.File.WriteAllBytes(path, ok (buildSstable 0.01 entries))
-
-        let partial = ok (Sstable.openPartial path)
-        let all = ok (Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray)
-        Assert.Equal<int>(entries.Length, all.Length)
-        Assert.Equal<int>(0, Bytes.compare entries.[0].Key all.[0].Key)
-        Assert.Equal<int>(0, Bytes.compare entries.[entries.Length - 1].Key all.[all.Length - 1].Key)
-
-        let limited = ok (Sstable.rangeScanPartial [||] 10 partial |> SstScan.toArray)
-        Assert.Equal<int>(10, limited.Length)
-
-        match ok (Sstable.lookup (intKey 150) None partial) with
-        | Some e -> Assert.Equal<uint64>(151UL, e.SeqNo)
-        | None -> Assert.Fail "lookup が行を見つけられません"
-
-        // 可視性: SeqNo 2 ではキー 150（SeqNo 151）は見えない
-        Assert.True((ok (Sstable.lookup (intKey 150) (Some 2UL) partial)).IsNone))
 
 [<Fact>]
 let ``Sstable.openPartial: 壊れたブロックは読み出し時に CorruptionError`` () =

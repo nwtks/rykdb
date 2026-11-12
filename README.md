@@ -90,7 +90,7 @@ Ctrl+C で終了します。
 他接続の未 commit の行は見えず、切断時はその接続の transaction だけが rollback される。
 commit の採番・競合検出（first-committer-wins）・WAL・memtable は全接続で共有される。
 大きな SELECT は `.stream <SQL>` で `STREAM` 応答（`END` 終端）を要求でき、
-`RykDb.Client.SendStream` で行ごとに受け取れる。
+`RykDb.Client` のクライアント型 `RykDbClient` の `SendStream` で行ごとに受け取れる。
 
 ### ライブラリ API
 

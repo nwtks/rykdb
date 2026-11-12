@@ -61,30 +61,13 @@ let ``SqlValue: asNumeric は NaN と無限大を拒否する`` () =
     Assert.True((SqlValue.asNumeric SqlValue.Null).IsNone)
 
 [<Fact>]
-let ``SqlValue.compareValues: decimal 範囲外と極小の REAL も比較できる`` () =
-    // 範囲外の REAL は float 比較へ落ち、例外を出さない
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Real 1e30) (SqlValue.Decimal 1M)) > 0)
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.Real 1e30)) < 0)
-    // 極小の REAL は 0 と同じにせず、符号と相対順序を保つ
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Real 1e-30) (SqlValue.Int 0L)) > 0)
-
-    Assert.True(
-        ok (SqlValue.compareValues (SqlValue.Decimal 0.0000000000000000000000000001M) (SqlValue.Real 1e-30)) > 0
-    )
-    // NaN / Infinity と Int・Decimal の比較は従来どおり型エラー
-    expectErrorKind
-        ErrorKind.TypeError
-        "Infinity と INTEGER"
-        (SqlValue.compareValues (SqlValue.Real Double.PositiveInfinity) (SqlValue.Int 1L))
-
-[<Fact>]
 let ``SqlValue.asText: Text だけ Some`` () =
     Assert.Equal(Some "hi", SqlValue.asText (SqlValue.Text "hi"))
     Assert.True((SqlValue.asText (SqlValue.Int 1L)).IsNone)
     Assert.True((SqlValue.asText SqlValue.Null).IsNone)
 
 [<Fact>]
-let ``SqlValue.normalizeFloat: NaN は canonicalNaN`` () =
+let ``SqlValue.normalizeFloat: NaN 以外はそのまま返す`` () =
     Assert.Equal(1.5, SqlValue.normalizeFloat 1.5)
 
 [<Fact>]
@@ -98,38 +81,13 @@ let ``SqlValue.normalizeFloat: -0.0 は +0.0 に正規化される`` () =
     | other -> Assert.Fail(sprintf "vReal が REAL ではありません: %A" other)
 
 [<Fact>]
-let ``SqlValue: NaN は正の quiet NaN に正規化される`` () =
+let ``SqlValue.compareValues: NaN 同士は等しく NaN は1.0より大きい`` () =
     // .NET の Double.NaN は符号ビットが立った負の NaN。そのままキーにすると
     // 順序保持の前提が崩れるため、単一のビットパターンへ正規化する。
     let negativeNaN = BitConverter.Int64BitsToDouble 0xFFF8000000000000L
     // 正規化後は NaN 同士が等しく、REAL の中では最大
     Assert.Equal(0, ok (SqlValue.compareValues (SqlValue.vReal negativeNaN) (SqlValue.vReal Double.NaN)))
     Assert.True(ok (SqlValue.compareValues (SqlValue.vReal Double.NaN) (SqlValue.vReal 1.0)) > 0)
-
-[<Fact>]
-let ``SqlValue.compareValues: NaN は NaN と等しく、他の数値より大きい`` () =
-    let nan = SqlValue.vReal Double.NaN
-    let one = SqlValue.vReal 1.0
-    Assert.Equal(0, SqlValue.compareValues nan nan |> okOr 1)
-    Assert.True(SqlValue.compareValues nan one |> okOr 0 > 0)
-    Assert.True(SqlValue.compareValues one nan |> okOr 0 < 0)
-
-[<Fact>]
-let ``SqlValue.compareValues: 比較できない型の組み合わせは typeError`` () =
-    expectErrorKind ErrorKind.TypeError "型エラーになるはず" (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.Text "1"))
-    expectErrorKind ErrorKind.TypeError "型エラーになるはず" (SqlValue.compareValues (SqlValue.Bool true) (SqlValue.Int 1L))
-
-[<Fact>]
-let ``SqlValue.compareValues: NaN と他型の数値は typeError`` () =
-    expectErrorKind
-        ErrorKind.TypeError
-        "NaN と INT は比較できない"
-        (SqlValue.compareValues (SqlValue.vReal Double.NaN) (SqlValue.Int 1L))
-
-    expectErrorKind
-        ErrorKind.TypeError
-        "INT と NaN は比較できない"
-        (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.vReal Double.NaN))
 
 [<Fact>]
 let ``SqlValue.compareValues: 同型どうしは順序どおり`` () =
@@ -144,6 +102,25 @@ let ``SqlValue.compareValues: 同型どうしは順序どおり`` () =
     let g1 = Guid "11111111-1111-1111-1111-111111111111"
     let g2 = Guid "22222222-2222-2222-2222-222222222222"
     Assert.True(ok (SqlValue.compareValues (SqlValue.Uuid g1) (SqlValue.Uuid g2)) < 0)
+
+[<Fact>]
+let ``SqlValue.compareValues: 数値 3種と日時は相互に比較できる`` () =
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.Int 2L)) < 0)
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Int 2L) (SqlValue.Real 2.5)) < 0)
+    Assert.Equal(0, ok (SqlValue.compareValues (SqlValue.Real 3.0) (SqlValue.Decimal 3M)))
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Decimal 1M) (SqlValue.Int 2L)) < 0)
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Decimal 2M) (SqlValue.Decimal 1M)) > 0)
+
+    // 同じ REAL どうしは数値順
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Real 1.5) (SqlValue.Real 2.5)) < 0)
+
+    // DATE は UTC 午夜の TIMESTAMP として比較する（両方向）
+    let d = DateOnly(2026, 1, 2)
+    let t = DateTimeOffset(DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc))
+    Assert.Equal(0, ok (SqlValue.compareValues (SqlValue.Date d) (SqlValue.Timestamp t)))
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Date d) (SqlValue.Timestamp(t.AddDays 1.0))) < 0)
+    Assert.Equal(0, ok (SqlValue.compareValues (SqlValue.Timestamp t) (SqlValue.Date d)))
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Timestamp(t.AddDays 1.0)) (SqlValue.Date d)) > 0)
 
 [<Fact>]
 let ``SqlValue.compareValues: TEXT は UTF-8 の符号化順で比較する`` () =
@@ -183,6 +160,48 @@ let ``SqlValue.compareValues: TEXT は UTF-8 の符号化順で比較する`` ()
             Assert.Equal<int>(expected, actual)
 
 [<Fact>]
+let ``SqlValue.compareValues: decimal 範囲外と極小の REAL も比較できる`` () =
+    // 範囲外の REAL は float 比較へ落ち、例外を出さない
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Real 1e30) (SqlValue.Decimal 1M)) > 0)
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.Real 1e30)) < 0)
+    // 極小の REAL は 0 と同じにせず、符号と相対順序を保つ
+    Assert.True(ok (SqlValue.compareValues (SqlValue.Real 1e-30) (SqlValue.Int 0L)) > 0)
+
+    Assert.True(
+        ok (SqlValue.compareValues (SqlValue.Decimal 0.0000000000000000000000000001M) (SqlValue.Real 1e-30)) > 0
+    )
+    // NaN / Infinity と Int・Decimal の比較は従来どおり型エラー
+    expectErrorKind
+        ErrorKind.TypeError
+        "Infinity と INTEGER"
+        (SqlValue.compareValues (SqlValue.Real Double.PositiveInfinity) (SqlValue.Int 1L))
+
+[<Fact>]
+let ``SqlValue.compareValues: NaN は NaN と等しく、他の数値より大きい`` () =
+    let nan = SqlValue.vReal Double.NaN
+    let one = SqlValue.vReal 1.0
+    Assert.Equal(0, SqlValue.compareValues nan nan |> okOr 1)
+    Assert.True(SqlValue.compareValues nan one |> okOr 0 > 0)
+    Assert.True(SqlValue.compareValues one nan |> okOr 0 < 0)
+
+[<Fact>]
+let ``SqlValue.compareValues: 比較できない型の組み合わせは typeError`` () =
+    expectErrorKind ErrorKind.TypeError "型エラーになるはず" (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.Text "1"))
+    expectErrorKind ErrorKind.TypeError "型エラーになるはず" (SqlValue.compareValues (SqlValue.Bool true) (SqlValue.Int 1L))
+
+[<Fact>]
+let ``SqlValue.compareValues: NaN と他型の数値は typeError`` () =
+    expectErrorKind
+        ErrorKind.TypeError
+        "NaN と INT は比較できない"
+        (SqlValue.compareValues (SqlValue.vReal Double.NaN) (SqlValue.Int 1L))
+
+    expectErrorKind
+        ErrorKind.TypeError
+        "INT と NaN は比較できない"
+        (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.vReal Double.NaN))
+
+[<Fact>]
 let ``SqlValue.compareValuesForSort: NULL は最小`` () =
     let nullV = SqlValue.Null
     let one = SqlValue.Int 1L
@@ -193,25 +212,6 @@ let ``SqlValue.compareValuesForSort: NULL は最小`` () =
 
     // NULL 以外の比較不能な型は compareValues と同じくエラー
     expectErrorKind ErrorKind.TypeError "INT と TEXT は比較できない" (SqlValue.compareValuesForSort one (SqlValue.Text "1"))
-
-[<Fact>]
-let ``SqlValue.compareValues: 数値 3種と日時は相互に比較できる`` () =
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Int 1L) (SqlValue.Int 2L)) < 0)
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Int 2L) (SqlValue.Real 2.5)) < 0)
-    Assert.Equal(0, ok (SqlValue.compareValues (SqlValue.Real 3.0) (SqlValue.Decimal 3M)))
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Decimal 1M) (SqlValue.Int 2L)) < 0)
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Decimal 2M) (SqlValue.Decimal 1M)) > 0)
-
-    // 同じ REAL どうしは数値順
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Real 1.5) (SqlValue.Real 2.5)) < 0)
-
-    // DATE は UTC 午夜の TIMESTAMP として比較する（両方向）
-    let d = DateOnly(2026, 1, 2)
-    let t = DateTimeOffset(DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc))
-    Assert.Equal(0, ok (SqlValue.compareValues (SqlValue.Date d) (SqlValue.Timestamp t)))
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Date d) (SqlValue.Timestamp(t.AddDays 1.0))) < 0)
-    Assert.Equal(0, ok (SqlValue.compareValues (SqlValue.Timestamp t) (SqlValue.Date d)))
-    Assert.True(ok (SqlValue.compareValues (SqlValue.Timestamp(t.AddDays 1.0)) (SqlValue.Date d)) > 0)
 
 [<Fact>]
 let ``SqlValue.toDisplayString: 各型`` () =
@@ -252,10 +252,6 @@ let ``SqlValue.coerce: Real は数値と真偽値を受ける`` () =
     Assert.Equal(SqlValue.Real 0.0, ok (SqlValue.coerce DataType.Real (SqlValue.Bool false)))
     Assert.Equal(SqlValue.Real 2.5, ok (SqlValue.coerce DataType.Real (SqlValue.Decimal 2.5M)))
     expectErrorKind ErrorKind.TypeError "文字列は型エラー" (SqlValue.coerce DataType.Real (SqlValue.Text "1.0"))
-
-[<Fact>]
-let ``SqlValue.coerce: 不変換は typeError`` () =
-    expectErrorKind ErrorKind.TypeError "型エラーになるはず" (SqlValue.coerce DataType.Integer (SqlValue.Text "x"))
 
 [<Fact>]
 let ``SqlValue.coerce: Boolean は 0/1 と真偽値だけ受ける`` () =
@@ -353,3 +349,7 @@ let ``SqlValue.coerce: NULL はどの型へも NULL のまま`` () =
     Assert.Equal(SqlValue.Null, ok (SqlValue.coerce DataType.Integer SqlValue.Null))
     Assert.Equal(SqlValue.Null, ok (SqlValue.coerce DataType.Text SqlValue.Null))
     Assert.Equal(SqlValue.Null, ok (SqlValue.coerce DataType.Null (SqlValue.Int 1L)))
+
+[<Fact>]
+let ``SqlValue.coerce: 不変換は typeError`` () =
+    expectErrorKind ErrorKind.TypeError "型エラーになるはず" (SqlValue.coerce DataType.Integer (SqlValue.Text "x"))

@@ -525,10 +525,12 @@ SELECT [DISTINCT] 項目 [, 項目 …]
 ### 7.2 評価順
 
 ```
-FROM → JOIN → WHERE → GROUP BY → HAVING → 集約 → ORDER BY → 射影 → DISTINCT → LIMIT
+FROM → JOIN → WHERE → GROUP BY → 集約 → HAVING → ORDER BY → 射影 → DISTINCT → LIMIT
 ```
 
-`LIMIT` は最後に適用される（pushdown されない）。
+`LIMIT` は最後に適用される。
+ただし `WHERE` / `GROUP BY` / `DISTINCT` / 結合のない単純な全走査では、
+件数ヒント（`OFFSET + LIMIT`）をストレージへ降ろす（§7.7）。
 
 ### 7.3 結果の列名
 
@@ -867,7 +869,8 @@ UPDATE テーブル SET 列 = 式 [, 列 = 式 …] [ WHERE 条件 ];
 ### 挙動
 
 - 複数列を同時に更新できる。式は**更新前の行**に対して評価される。
-  サブクエリは使えるが、外側の行の列は参照できない（§7.9）。
+  サブクエリは使える。
+  外側の行の列も参照できる（相関サブクエリ。§7.9）。
 - `WHERE` を省略すると全行が対象。
 - 条件に合う行すべてが更新される（`LIMIT` 相当の句がない）。
 - `UPDATE ... FROM` と `UPDATE ... LIMIT` は未対応（§14）。
@@ -1124,9 +1127,8 @@ ok (session.Close())
   逆に書き込みも実行中の読み取りを待たない（`Close` だけは読み取りの完了を待つ）。
 - 実行中の transaction がある間は、その接続の読み取りも直列化される（read-your-writes を保つため）。
   transaction の境界は呼び出し側が決めるため、複数スレッドで 1つの transaction を共有しないこと。
-- `ExecuteTracked` は実行結果に加えて、
-  その呼び出しで transaction が始まった / 終わった / 変わらない（`SessionTransactionChange`）を返す。
-  サーバが接続ごとの transaction 遷移を記録するために使う。
+- サーバは接続ごとに独立した `Session` を作るため、transaction の所有権を別途台帳で追う必要はない。
+  切断時は `Session.Close` がその接続の transaction を rollback する。
 - 複数文を 1 回の `Session.Execute` に渡したとき、途中の文がエラーになっても
   それ以前に成功した文は確定済みのまま残る。
   `BEGIN` が成功した後にエラーになった場合は transaction が開いたままになるので、
@@ -1140,11 +1142,14 @@ ok (session.Close())
 
 ### CLI のドットコマンド
 
-| コマンド    | 効果                             |
-| ----------- | -------------------------------- |
-| `.begin`    | transaction を開始               |
-| `.commit`   | 開いているトランザクションを確定 |
-| `.rollback` | 開いているトランザクションを破棄 |
+| コマンド          | 効果                                        |
+| ----------------- | ------------------------------------------- |
+| `.help`           | コマンド一覧                                |
+| `.tables`         | テーブル一覧                                |
+| `.begin`          | transaction を開始                          |
+| `.commit`         | 開いているトランザクションを確定            |
+| `.rollback`       | 開いているトランザクションを破棄            |
+| `.exit` / `.quit` | 終了（`Close` して memtable を flush する） |
 
 ```
 db> .begin
@@ -1244,8 +1249,7 @@ db> .rollback
 - `CREATE TABLE ... DEFAULT (SELECT ...)`（構文は受理されるが INSERT 時に `SyntaxError`。§7.9）
 - ユーザ定義関数・トリガー・ビュー・ストアドプロシージャ
 - パーティショニング、圧縮、暗号化
-- 複数プロセスからの同時アクセス
-  （2つ目のプロセスは `IoError` で開けない。§7.9）
+- 複数プロセスからの同時アクセス（2つ目のプロセスは `IoError` で開けない。§12）
 
 未対応の集合演算・JOIN の綴りは、テーブル別名として解釈されず **`SyntaxError`** になる。
 これらの語を裸のテーブル別名に使うことはできない（`AS` を付ければ使える）。

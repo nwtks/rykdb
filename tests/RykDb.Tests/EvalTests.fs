@@ -45,6 +45,16 @@ let ``Scalar.likeMatch: LIKE の空パターンと % 走査の境界`` () =
     Assert.False(Scalar.likeMatch "a%b" "xa")
 
 [<Fact>]
+let ``Scalar.likeMatchWithEscape: エスケープした % _ ! をリテラルにする`` () =
+    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!%b" "a%b"))
+    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!%b" "axb"))
+    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!_b" "a_b"))
+    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!_b" "axb"))
+    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!!b" "a!b"))
+    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!!b" "ab"))
+    expectErrorKind ErrorKind.TypeError "末尾 ESCAPE" (Scalar.likeMatchWithEscape '!' "a!" "a")
+
+[<Fact>]
 let ``Eval.eval: LIKE の % と _`` () =
     let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
 
@@ -218,7 +228,7 @@ let ``Eval.eval: AND / OR は右辺の FALSE / TRUE も 3 値論理どおり`` (
     | v -> Assert.Fail(sprintf "NULL AND FALSE が FALSE になりません: %A" v)
 
 [<Fact>]
-let ``Eval.eval: BETWEEN と IN は NULL を正しく扱う`` () =
+let ``Eval.eval: BETWEEN の範囲判定と NOT IN の一致判定`` () =
     let r = [| SqlValue.Int 5L; SqlValue.Int 1L |]
 
     // 5 BETWEEN 1 AND 10 = TRUE
@@ -425,28 +435,6 @@ let ``Eval.eval: AND / OR は非 BOOL を UNKNOWN として扱う`` () =
     Assert.True(SqlValue.isNull (ok (ev r2 (Expr.Binary(BinaryOp.And, col "a", col "b")))))
 
 [<Fact>]
-let ``Eval.matches: WHERE では UNKNOWN を偽として扱う`` () =
-    let r = [| SqlValue.Null; SqlValue.Int 1L |]
-    let pred = Expr.Binary(BinaryOp.Gt, col "a", col "b")
-    // UNKNOWN なので偽
-    Assert.False(ok (Eval.matches schema2 r pred))
-
-[<Fact>]
-let ``Eval.matches: WHERE 述語が数値を返したら 0 以外は真`` () =
-    Assert.True(ok (Eval.matches schema2 (row2 1L 0L) (Expr.Literal(Literal.Int 1L))))
-    Assert.False(ok (Eval.matches schema2 (row2 0L 0L) (Expr.Literal(Literal.Int 0L))))
-
-[<Fact>]
-let ``Scalar.likeMatchWithEscape: エスケープした % _ ! をリテラルにする`` () =
-    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!%b" "a%b"))
-    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!%b" "axb"))
-    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!_b" "a_b"))
-    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!_b" "axb"))
-    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!!b" "a!b"))
-    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!!b" "ab"))
-    expectErrorKind ErrorKind.TypeError "末尾 ESCAPE" (Scalar.likeMatchWithEscape '!' "a!" "a")
-
-[<Fact>]
 let ``Eval.eval: IS TRUE / FALSE / UNKNOWN`` () =
     let schema = outSchema [ outCol "b" None (Some DataType.Boolean) ]
     let ev v e = Eval.eval schema [| v |] e
@@ -489,3 +477,15 @@ let ``Eval.eval: CAST は TEXT から数値・BOOLEAN へ変換できる`` () =
 [<Fact>]
 let ``Eval.eval: DEFAULT は INSERT 以外でエラー`` () =
     expectErrorKind ErrorKind.SyntaxError "DEFAULT 単体" (Eval.eval Schema.empty [||] Expr.Default)
+
+[<Fact>]
+let ``Eval.matches: WHERE では UNKNOWN を偽として扱う`` () =
+    let r = [| SqlValue.Null; SqlValue.Int 1L |]
+    let pred = Expr.Binary(BinaryOp.Gt, col "a", col "b")
+    // UNKNOWN なので偽
+    Assert.False(ok (Eval.matches schema2 r pred))
+
+[<Fact>]
+let ``Eval.matches: WHERE 述語が数値を返したら 0 以外は真`` () =
+    Assert.True(ok (Eval.matches schema2 (row2 1L 0L) (Expr.Literal(Literal.Int 1L))))
+    Assert.False(ok (Eval.matches schema2 (row2 0L 0L) (Expr.Literal(Literal.Int 0L))))
