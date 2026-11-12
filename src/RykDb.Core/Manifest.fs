@@ -48,7 +48,7 @@ module internal Manifest =
 
     /// MANIFEST の 1レコード。
     /// [checksum:u32LE][VersionEdit 本体] のフレームを base64 にして 1行にする。
-    /// checksum は本体全体の FNV-1a（途中の完全な行の破損を検出する）。
+    /// checksum は本体全体の CRC32C（途中の完全な行の破損を検出する）。
     let private encodeRecord (payload: byte array) =
         let frame =
             Writer.build [ Writer.uint32LE (Hashing.checksum payload); Writer.writeBytes payload ]

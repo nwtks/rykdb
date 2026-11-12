@@ -518,16 +518,16 @@ module internal Sstable =
     let private Magic = "RykDbSST"
 
     /// 書き出すファイルのバージョン。
-    /// v5 はブロック末尾のチェックサム（restart 配列なし）と、
-    /// 部分読みメタデータ（meta / Bloom / index）のチェックサムを持つ。
-    /// ブロック・メタデータ・Footer のすべてが個別に検証されるため、全体チェックサムは持たない。
-    /// v4 以前は読めない（Footer の長さが違うため openPartial が破損として拒否する）。
+    /// v6 はチェックサムを CRC32C に変更した版（v5 以前は FNV-1a）。
+    /// ブロック末尾・メタデータ（meta / Bloom / index）・Footer をそれぞれ検証し、
+    /// 全体チェックサムは持たない（部分読みでは読まなかったブロックは検証されない）。
+    /// v5 以前はチェックサムが一致しないため読めない。
     [<Literal>]
-    let private Version = 5
+    let private Version = 6
 
     /// 読み取れる下限バージョン。
     [<Literal>]
-    let private MinReadableVersion = 5
+    let private MinReadableVersion = 6
 
     /// 最新 Footer の固定長（本体 80 + Footer チェックサム 4）。
     [<Literal>]
@@ -669,7 +669,7 @@ module internal Sstable =
                         }
         }
 
-    /// エントリ列を SSTable v5 として stream に書き出し、書き込んだ結果を返す。
+    /// エントリ列を SSTable v6 として stream に書き出し、書き込んだ結果を返す。
     /// <remarks>
     /// 入力は `seq` で **1回だけ列挙する**（memtable の flush が全件を配列にしないため）。
     /// キー順であることの検証は書き込みと同時に行う（失敗時は呼び出し側が部分ファイルを消す）。

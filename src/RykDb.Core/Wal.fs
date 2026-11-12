@@ -4,7 +4,7 @@
 //   Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 // を並べ、open 時に先頭から走査して memtable へ再生する。
 //
-//   1レコード: [payloadLength:u32LE][checksum:u32LE][payload]
+//   1レコード: [payloadLength:u32LE][checksum:u32LE(CRC32C)][payload]
 //
 // 長さ・チェックサムが合わないレコードは書きかけ（torn write）として打ち切る。
 // 追記は「最後に完了する」性質があるので、壊れたレコードの後ろは読まなくてよい。

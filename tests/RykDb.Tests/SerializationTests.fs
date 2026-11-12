@@ -318,6 +318,41 @@ let ``順序保持: escape により接頭辞一致が意味論と一致する``
 
     Assert.Equal<int>(expected.Length, matched.Length)
 
+// ---------------------------------------------------------------------------
+// Hashing（CRC32C）
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``Hashing.checksum: CRC32C の既知解`` () =
+    // CRC-32C（Castagnoli）の標準チェック値
+    Assert.Equal(0xE3069283u, Hashing.checksum (System.Text.Encoding.ASCII.GetBytes "123456789"))
+    Assert.Equal(0u, Hashing.checksum [||])
+
+[<Fact>]
+let ``Hashing.checksum: 1 ビットの破損で値が変わる`` () =
+    let data = Array.init 256 (fun i -> byte i)
+
+    for pos in [ 0; 7; 8; 63; 127; 255 ] do
+        let corrupted = Array.copy data
+        corrupted.[pos] <- corrupted.[pos] ^^^ 0x01uy
+        Assert.NotEqual<uint32>(Hashing.checksum data, Hashing.checksum corrupted)
+
+[<Fact>]
+let ``Hashing.checksumRange: 全長の checksum と一致する`` () =
+    let data = Array.init 1000 (fun i -> byte (i * 31))
+
+    for offset in [ 0; 1; 3; 7; 8; 9; 500 ] do
+        for length in [ 0; 1; 7; 8; 9; 64; 1000 - offset ] do
+            Assert.Equal(Hashing.checksum (Array.sub data offset length), Hashing.checksumRange data offset length)
+
+[<Fact>]
+let ``Hashing.checksumChunks: 連結した入力と同じ値になる`` () =
+    let data = Array.init 100 (fun i -> byte (i * 17))
+    let chunks = [| Array.sub data 0 3; Array.sub data 3 5; Array.sub data 8 92 |]
+    Assert.Equal(Hashing.checksum data, Hashing.checksumChunks chunks)
+    Assert.Equal(Hashing.checksum [||], Hashing.checksumChunks [||])
+    Assert.Equal(Hashing.checksum [||], Hashing.checksumChunks [| [||]; [||] |])
+
 [<Fact>]
 let ``KeyBuilder.ofValues: 空列は空キー`` () =
     let k = KeyBuilder.ofValues []

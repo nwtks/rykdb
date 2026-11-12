@@ -460,34 +460,89 @@ module internal Hashing =
         let prime = 1099511628211UL
         Array.fold (fun h b -> (h ^^^ uint64 b) * prime) offsetBasis bs
 
-    /// バイト列の 32bit チェックサム（FNV-1a）。
-    /// WAL のフレームと SSTable の Footer の破損検出に使う。
-    let checksum (data: byte array) =
-        Array.fold (fun h b -> (h ^^^ uint32 b) * 16777619u) 2166136261u data
+    // ---- CRC32C（Castagnoli）----
+    // 生成多項式の反射表現は 0x82F63B78。
+    // WAL のフレーム、MANIFEST のレコード、SSTable のブロック / メタデータ / Footer の破損検出に使う
+    // （FNV-1a は分布用途の hashBytes にのみ残す）。
+    // slicing-by-8 で 1回に 8バイト進める。
 
-    /// 範囲指定の 32bit チェックサム（FNV-1a）。
+    let private crcTable0 =
+        let rec step n c =
+            if n = 0 then
+                c
+            elif c &&& 1u <> 0u then
+                step (n - 1) ((c >>> 1) ^^^ 0x82F63B78u)
+            else
+                step (n - 1) (c >>> 1)
+
+        Array.init 256 (fun i -> step 8 (uint32 i))
+
+    /// slicing-by-8 用の 8テーブル。`Tables.[k].[i]` は k バイト後ろの寄与。
+    let private crcTables =
+        let next (prev: uint32 array) =
+            Array.init 256 (fun i -> (prev.[i] >>> 8) ^^^ crcTable0.[int (prev.[i] &&& 0xFFu)])
+
+        let rec build n acc =
+            if n = 0 then
+                acc |> List.rev |> Array.ofList
+            else
+                build (n - 1) (next (List.head acc) :: acc)
+
+        build 7 [ crcTable0 ]
+
+    /// 初期値と最終反転（CRC32C の標準パラメータ）。
+    [<Literal>]
+    let private CrcInitial = 0xFFFFFFFFu
+
+    [<Literal>]
+    let private CrcFinalXor = 0xFFFFFFFFu
+
+    /// 範囲 [offset, offset + length) を 1つの連続入力として CRC を進める。
+    /// チャンクをまたぐ場合は前のチャンクの戻り値をそのまま渡す。
+    let private crcUpdate (crc: uint32) (data: byte array) (offset: int) (length: int) =
+        let finish = offset + length
+
+        let rec loop i crc =
+            if i + 8 <= finish then
+                let v =
+                    System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(System.ReadOnlySpan<byte>(data, i, 8))
+                    ^^^ uint64 crc
+
+                crcTables.[7].[int (v &&& 0xFFUL)]
+                ^^^ crcTables.[6].[int (v >>> 8 &&& 0xFFUL)]
+                ^^^ crcTables.[5].[int (v >>> 16 &&& 0xFFUL)]
+                ^^^ crcTables.[4].[int (v >>> 24 &&& 0xFFUL)]
+                ^^^ crcTables.[3].[int (v >>> 32 &&& 0xFFUL)]
+                ^^^ crcTables.[2].[int (v >>> 40 &&& 0xFFUL)]
+                ^^^ crcTables.[1].[int (v >>> 48 &&& 0xFFUL)]
+                ^^^ crcTables.[0].[int (v >>> 56 &&& 0xFFUL)]
+                |> loop (i + 8)
+            elif i < finish then
+                loop (i + 1) (crcTables.[0].[int (crc ^^^ uint32 data.[i] &&& 0xFFu)] ^^^ (crc >>> 8))
+            else
+                crc
+
+        loop offset crc
+
+    /// バイト列の 32bit チェックサム（CRC32C / Castagnoli）。
+    let checksum (data: byte array) =
+        CrcFinalXor ^^^ crcUpdate CrcInitial data 0 data.Length
+
+    /// 範囲指定の 32bit チェックサム（CRC32C）。
     /// SSTable のブロック末尾チェックサムを、コピーを作らずに計算する。
     let checksumRange (data: byte array) (offset: int) (length: int) =
-        let rec loop i h =
-            if i >= offset + length then
-                h
-            else
-                loop (i + 1) ((h ^^^ uint32 data.[i]) * 16777619u)
+        CrcFinalXor ^^^ crcUpdate CrcInitial data offset length
 
-        loop offset 2166136261u
-
-    /// 複数のチャンクを連結したものの 32bit チェックサム（FNV-1a）。
+    /// 複数のチャンクを連結したものの 32bit チェックサム（CRC32C）。
     /// SSTable のメタデータ（meta / Bloom / index）をコピーせずに検証する。
     let checksumChunks (chunks: byte array array) =
-        let rec loopChunk chunkIndex i h =
-            if chunkIndex >= chunks.Length then
-                h
-            elif i >= chunks.[chunkIndex].Length then
-                loopChunk (chunkIndex + 1) 0 h
+        let rec loop i crc =
+            if i >= chunks.Length then
+                crc
             else
-                loopChunk chunkIndex (i + 1) ((h ^^^ uint32 chunks.[chunkIndex].[i]) * 16777619u)
+                loop (i + 1) (crcUpdate crc chunks.[i] 0 chunks.[i].Length)
 
-        loopChunk 0 0 2166136261u
+        CrcFinalXor ^^^ loop 0 CrcInitial
 
     /// ハッシュ値を攪拌する（splitmix64 相当）。
     /// FNV-1a は下位ビットに偏りがちで、Bloom filter のビット分布が悪くなるため。

@@ -422,6 +422,7 @@ Array.mapi (fun level files -> ...)
 `MaxSeqNo` を追加したときは `FooterSize` を `72 → 80` に、
 Footer 自身のチェックサムを追加したときは `80 → 84` に変更した。
 v5 で全体 checksum を削除して `metadataChecksum` を追加したときは `88 → 84` に戻した。
+v6 でチェックサムを FNV-1a から CRC32C に変更した（Footer の長さは 84 のまま）。
 **放置すると Footer の開始位置がずれて、ファイル全体の読み取りが壊れる**。
 
 ### 4.7 「状態を進めるヘルパー」は進んだ状態も返す（`scanAt` の無限ループ）
@@ -1192,7 +1193,7 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 - 孤児は削除せず `<root>/.orphans/` へ退避する（`quarantineOrphans`）。
   manifest を読み落としただけのケースでも実体は復元できる。
 - 末尾の書きかけを許容するのは、`logAndApply` の `fs.Write` + `Flush(true)` が途中で切れた場合のため。
-- 各レコードは `[checksum:u32LE][VersionEdit 本体]` のフレーム（FNV-1a）を base64 にした 1行。
+- 各レコードは `[checksum:u32LE][VersionEdit 本体]` のフレーム（CRC32C）を base64 にした 1行。
   base64 としては正しいが中身が壊れた行もチェックサムで検出する。
 - 回帰テスト: `Manifest: 途中の壊れたレコードは CorruptionError` /
   `Manifest: 途中のレコードのチェックサム不一致は CorruptionError` /
@@ -1381,7 +1382,7 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ### 11.26 部分読みはブロック / メタデータ / Footer のチェックサムで守る
 
-v5 の SSTable は各ブロック末尾に 4バイトのチェックサムを持つ。
+v6 の SSTable は各ブロック末尾に 4バイトの CRC32C チェックサムを持つ。
 Footer は Meta / Bloom / Index の連続領域を守る `metadataChecksum` と、
 自身（先頭 80バイト）を守る `footerChecksum` を持ち、`openPartial` でも検証する。
 全体チェックサムは部分読みでは検証できないため持たない

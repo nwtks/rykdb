@@ -288,7 +288,7 @@ let ``Sstable.openPartial: Meta が壊れていれば CorruptionError`` () =
         Writer.build
             [
                 Writer.writeBytes (System.Text.Encoding.ASCII.GetBytes "RykDbSST")
-                Writer.uint32LE 5u
+                Writer.uint32LE 6u
                 Writer.int64LE 0L
                 Writer.int64LE 0L
                 Writer.int64LE 0L
@@ -335,7 +335,7 @@ let ``Sstable.openPartial: マジック不一致は CorruptionError`` () =
 let ``Sstable.openPartial: 未対応バージョンは CorruptionError`` () =
     let data = ok (buildSstable 0.01 (sstEntries 3))
     let bad = Array.copy data
-    bad.[bad.Length - Sstable.FooterSize + 8] <- 6uy
+    bad.[bad.Length - Sstable.FooterSize + 8] <- 7uy
     fixFooterChecksum bad
     expectErrorKind ErrorKind.CorruptionError "未対応バージョンはエラーになるはず" (Sstable.openPartial (writeTempSst bad))
 

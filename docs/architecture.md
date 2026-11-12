@@ -129,7 +129,7 @@ flowchart TB
 | ---------- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
 | ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                                               | §8                                                  |
 | memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                                            | §8.1                                                |
-| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v5（84バイト）                                          | §8.2                                                |
+| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v6（84バイト）                                          | §8.2                                                |
 | 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                                     | §8.4–8.5                                            |
 | GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                                     | §8.6                                                |
 | 並行制御   | **Session で読み取り並行・書き込み直列** + MVCC（Snapshot Isolation）+ first-committer-wins。DDL だけ排他 | §7                                                  |
@@ -1153,7 +1153,7 @@ Treap は根から再構築するのでこの問題は構造的に発生しな�
 [Meta block]        min_key / max_key（長さ付き）
 [Bloom filter]
 [Index block]       ブロックごとに (最終キー, オフセット, 長さ)
-[Footer v5 84bytes] 各セクションの位置・長さ・エントリ数・メタデータ/Footer チェックサム
+[Footer v6 84bytes] 各セクションの位置・長さ・エントリ数・メタデータ/Footer チェックサム
 ```
 
 各ブロックはエントリ列と末尾のチェックサムだけを持つ。
@@ -1178,7 +1178,7 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | 項目                     | 値・内容                                                                                                                                                               |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | ブロックのエントリ数     | `EntriesPerBlock = 128`                                                                                                                                                |
-| チェックサム             | **FNV-1a 32bit**（CRC32C ではない）                                                                                                                                    |
+| チェックサム             | **CRC32C**（Castagnoli、slicing-by-8）                                                                                                                                 |
 | ブロックのチェックサム   | 各ブロック末尾に 4バイト（ブロック本体が対象）                                                                                                                         |
 | メタデータのチェックサム | Meta / Bloom / Index の連続した全バイトを `metadataChecksum` で検証する                                                                                                |
 | Footer のチェックサム    | Footer 先頭 80バイト（`magic`〜`metadataChecksum`）を対象。部分読みでも検証する                                                                                        |
@@ -1187,7 +1187,7 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | Bloom filter             | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。ビット列は packed（1ビット = 1ビット）。読む側は `BloomFilter.mightContain`         |
 | ポイント検索の順路       | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                                            |
 
-ファイルは `Sstable.writeTo` が v5 形式をブロック単位でストリームへ書き出す
+ファイルは `Sstable.writeTo` が v6 形式をブロック単位でストリームへ書き出す
 （テストの `buildSstable` は `MemoryStream` 経由で同じ処理を呼ぶ）。
 入力は `seq` で **1回だけ列挙**し、
 キー順の検証・先頭/末尾キー・`maxSeqNo`・Bloom 用のキーは書き出しと同時に集める
@@ -1288,7 +1288,7 @@ MANIFEST-000001   VersionSet の変更履歴（4MiB 超でスナップショッ�
 ```
 
 `MANIFEST` の 1レコードは `[checksum:u32LE][VersionEdit 本体]` のフレームを base64 にした 1行で、
-checksum は本体全体の FNV-1a。
+checksum は本体全体の CRC32C。
 途中のレコードが、base64 として完全な行であっても壊れていれば `CorruptionError` にして開かない
 （SSTable を孤児にしないため）。
 **末尾の書きかけ**（後ろに有効な行が無い）だけはクラッシュ時の追記とみなして読み飛ばす。
@@ -1320,7 +1320,7 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 1レコードのファイルレイアウト:
 
 ```
-[payloadLength:u32LE][checksum:u32LE(FNV-1a)][payload]
+[payloadLength:u32LE][checksum:u32LE(CRC32C)][payload]
 ```
 
 - ヘッダー／payload が末尾で不完全 → 書きかけ（torn write）なので打ち切る
@@ -1331,7 +1331,7 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 
 - **1レコード（フレーム）ずつ書き出し、最後に `Flush(true)` でディスクへ反映する**
   （全フレームを 1本の配列へ連結しない。大きな transaction でピークが約 2倍にならない）。
-  Begin / Batch / Commit は各フレームが checksum（FNV-1a）で守られ、
+  Begin / Batch / Commit は各フレームが checksum（CRC32C）で守られ、
   未 commit の Batch は再生時に捨てられるので、
   途中で落ちてもコミット済みトランザクションが中途半端にならない。
 - **Session 経由の commit は `Flush(false)` で追記し、fsync をグループ化する**。
