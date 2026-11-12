@@ -157,14 +157,6 @@ module internal Transaction =
         |> List.map (fun (ks, m) -> ks, m |> Map.toList)
         |> perKeyspace nextSeqNo []
 
-/// active な transaction 1件分。
-type internal TxnRecord =
-    {
-        Txn: Transaction
-        /// 書き込み済みの key 集合（keyspace:キー の文字列）
-        Keys: Set<string>
-    }
-
 /// transaction を管理し、commit order の一意性と write-write 競合を保証する。
 type internal TransactionManager =
     {
@@ -177,8 +169,9 @@ type internal TransactionManager =
         /// そのため、最古の active snapshot より前の履歴は commit ごとに削除できる。
         /// active transaction がなければ履歴は不要なので、commit 直後に空になる。
         LastCommitted: Map<string, uint64>
-        /// アクティブな transaction
-        Active: Map<TxnId, TxnRecord>
+        /// アクティブな transaction（TxnId -> 開始時の状態）。
+        /// 書き込みは `Transaction` 側の不変更新で行い、ここには開始時の値を置く。
+        Active: Map<TxnId, Transaction>
         /// 最後に commit された SeqNo（=「DB の現在時刻」）
         LastCommitSeqNo: uint64
         /// 1 transaction のバッファ上限（バイト）。
@@ -208,12 +201,10 @@ module internal TransactionManager =
                 LimitBytes = Option.defaultValue manager.MaxTransactionBytes limit
             }
 
-        let record = { Txn = txn; Keys = Set.empty }
-
         let updated =
             { manager with
                 NextTxnId = manager.NextTxnId + 1UL
-                Active = Map.add manager.NextTxnId record manager.Active
+                Active = Map.add manager.NextTxnId txn manager.Active
             }
 
         updated, txn
@@ -227,7 +218,7 @@ module internal TransactionManager =
     let activeSnapshot (manager: TransactionManager) =
         let oldest =
             manager.Active
-            |> Map.fold (fun acc _ record -> min acc record.Txn.Snapshot.SeqNo) System.UInt64.MaxValue
+            |> Map.fold (fun acc _ txn -> min acc txn.Snapshot.SeqNo) System.UInt64.MaxValue
 
         if oldest = System.UInt64.MaxValue then
             if manager.LastCommitSeqNo = System.UInt64.MaxValue then

@@ -494,7 +494,7 @@ module internal Engine =
                         {
                             RowsAffected = rows.Length
                             Columns = columns
-                            Rows = rows
+                            Rows = rows |> Array.map SqlValue.copyRow
                         })
             finally
                 ctx.Scope.DisposeAll()

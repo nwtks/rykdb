@@ -153,6 +153,7 @@ Bloom filter のキーあたりのビット数と、LSM のレベル間の容量
 | [`architecture.md`](docs/architecture.md)             | 内部設計（レイヤ構成・実行モデル・LSM・MVCC・既知の制約） |
 | [`coding-conventions.md`](docs/coding-conventions.md) | コーディング規約（例外・不変・末尾再帰）                  |
 | [`development.md`](docs/development.md)               | ビルド・テスト・品質ゲート                                |
+| [`invariants.md`](docs/invariants.md)                 | 型で守れない不変条件の一覧と担保方法                      |
 | [`sql-reference.md`](docs/sql-reference.md)           | 対応 SQL の文法一覧・型・関数・エラー・既知の制限         |
 | [`gotchas.md`](docs/gotchas.md)                       | 実際に踏んだ落とし穴と対策                                |
 | [`AGENTS.md`](AGENTS.md)                              | 開発指針（各ドキュメントへの案内）                        |

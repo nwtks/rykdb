@@ -47,10 +47,9 @@ module internal Entry =
         entries |> Seq.fold (fun acc e -> max acc e.SeqNo) 0UL
 
     /// キーの昇順、同一キーは SeqNo の降順（新しい版が先）。
+    /// 定義は `KeyOrder.compare` に 1つだけ置く。
     let compareKeys (a: Entry) (b: Entry) =
-        match Bytes.compare a.Key b.Key with
-        | 0 -> compare b.SeqNo a.SeqNo
-        | c -> c
+        KeyOrder.compare a.Key a.SeqNo b.Key b.SeqNo
 
     let priority (e: Entry) =
         let h = Hashing.hashBytes e.Key

@@ -203,3 +203,49 @@ let ``順序保持プロパティ: 複合キーのペアでキー順とタプル
                 comparison
                 keyComparison
         )
+
+[<Fact>]
+let ``順序保持プロパティ: Entry と SstEntry の並びが一致する`` () =
+    let random = Random 20261111
+
+    let makeEntry key seqNo =
+        Entry.put key seqNo [| SqlValue.Int(int64 seqNo) |]
+
+    for _ in 1..2000 do
+        let keyA = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 100)) ]
+        let keyB = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 100)) ]
+        let seqA = uint64 (random.Next 10)
+        let seqB = uint64 (random.Next 10)
+
+        let eA = makeEntry keyA seqA
+        let eB = makeEntry keyB seqB
+        let sA = SstEntry.make keyA seqA (Some [| SqlValue.Int(int64 seqA) |])
+        let sB = SstEntry.make keyB seqB (Some [| SqlValue.Int(int64 seqB) |])
+
+        Assert.Equal(sign (Entry.compareKeys eA eB), sign (SstEntry.compare sA sB))
+
+[<Fact>]
+let ``順序保持プロパティ: KeyOrder は反対称で推移的`` () =
+    let random = Random 20261112
+
+    let randomPair () =
+        let key = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 50)) ]
+        key, uint64 (random.Next 5)
+
+    for _ in 1..1000 do
+        let ka, sa = randomPair ()
+        let kb, sb = randomPair ()
+        let ab = sign (KeyOrder.compare ka sa kb sb)
+        let ba = sign (KeyOrder.compare kb sb ka sa)
+        Assert.Equal(-ab, ba)
+
+    for _ in 1..1000 do
+        let ka, sa = randomPair ()
+        let kb, sb = randomPair ()
+        let kc, sc = randomPair ()
+        let ab = sign (KeyOrder.compare ka sa kb sb)
+        let bc = sign (KeyOrder.compare kb sb kc sc)
+        let ac = sign (KeyOrder.compare ka sa kc sc)
+
+        if ab <= 0 && bc <= 0 then
+            Assert.True(ac <= 0, "KeyOrder の推移性が壊れています")

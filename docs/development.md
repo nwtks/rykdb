@@ -130,4 +130,5 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 - [ ] `dotnet build -t:Rebuild` が 0 error / 0 warning
 - [ ] `dotnet test` が全緑（逐次実行）
 - [ ] `dotnet run --project tools/TailAudit` が exit 0（新規の非末尾再帰なし。追認は内容確認のうえ `-- --update`）
+- [ ] 不変条件を追加・変更したら [`invariants.md`](invariants.md) と対応するテストを更新
 - [ ] `docs/gotchas.md` に**同じ原因の再発**があれば追記

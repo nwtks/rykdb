@@ -30,10 +30,9 @@ module internal SstEntry =
 
     /// 並び。
     /// キー昇順・同一キーは SeqNo 降順（新しい版が先）。
+    /// 定義は `KeyOrder.compare` に 1つだけ置く。
     let compare (a: SstEntry) (b: SstEntry) =
-        match Bytes.compare a.Key b.Key with
-        | 0 -> compare b.SeqNo a.SeqNo
-        | c -> c
+        KeyOrder.compare a.Key a.SeqNo b.Key b.SeqNo
 
     /// 値部分の正確な符号化長。
     let encodedValueLength (e: SstEntry) =

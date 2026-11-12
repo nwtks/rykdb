@@ -20,6 +20,49 @@ let private snapshot (mgr: TransactionManager) : Snapshot =
 
 let private activeCount (mgr: TransactionManager) = mgr.Active.Count
 
+let private validate (m: TransactionManager) =
+    let fail msg =
+        err (DbError.internalError ("TransactionManager: " + msg))
+
+    result {
+        do!
+            if m.NextSeqNo > m.LastCommitSeqNo then
+                ret ()
+            else
+                fail "NextSeqNo が LastCommitSeqNo 以下"
+
+        do! if m.NextTxnId > 0UL then ret () else fail "NextTxnId が 0"
+
+        do!
+            if m.Active |> Map.forall (fun id txn -> txn.TxnId = id && id < m.NextTxnId) then
+                ret ()
+            else
+                fail "Active の TxnId が不整合"
+
+        do!
+            if m.Active |> Map.forall (fun _ txn -> txn.Snapshot.SeqNo <= m.LastCommitSeqNo) then
+                ret ()
+            else
+                fail "Active の snapshot が LastCommitSeqNo より未来"
+
+        do!
+            if
+                m.LastCommitted
+                |> Map.forall (fun _ seq -> seq > 0UL && seq <= m.LastCommitSeqNo)
+            then
+                ret ()
+            else
+                fail "LastCommitted の SeqNo が範囲外"
+
+        do!
+            if m.LastCommitted |> Map.forall (fun _ seq -> seq < m.NextSeqNo) then
+                ret ()
+            else
+                fail "NextSeqNo が LastCommitted 以下"
+
+        return ()
+    }
+
 [<Fact>]
 let ``Transaction.create: 空の transaction`` () =
     let snap = { Snapshot.SeqNo = 0UL }
@@ -101,6 +144,81 @@ let ``TransactionManager.abort: abort は何も残さない`` () =
     let mgr = TransactionManager.abort txn mgr
     Assert.Equal(0, activeCount mgr)
     Assert.Equal<uint64>(0UL, currentSeqNo mgr)
+
+[<Fact>]
+let ``TransactionManager.validate: 初期状態は妥当`` () =
+    ok (validate (TransactionManager.create ())) |> ignore
+
+[<Fact>]
+let ``TransactionManager.validate: NextSeqNo の逆転を検出`` () =
+    let mgr =
+        { TransactionManager.create () with
+            NextSeqNo = 1UL
+            LastCommitSeqNo = 1UL
+        }
+
+    expectErrorKind ErrorKind.InternalError "NextSeqNo の逆転を検出するはず" (validate mgr)
+
+[<Fact>]
+let ``TransactionManager.validate: Active の snapshot が未来なら検出`` () =
+    let mgr, txn = TransactionManager.beginTxn (TransactionManager.create ())
+
+    let broken =
+        { mgr with
+            Active =
+                Map.add
+                    txn.TxnId
+                    { txn with
+                        Snapshot =
+                            {
+                                Snapshot.SeqNo = mgr.LastCommitSeqNo + 1UL
+                            }
+                    }
+                    mgr.Active
+        }
+
+    expectErrorKind ErrorKind.InternalError "Active の snapshot が未来を検出するはず" (validate broken)
+
+[<Fact>]
+let ``TransactionManager.validate: LastCommitted の範囲外を検出`` () =
+    let mgr =
+        { TransactionManager.create () with
+            LastCommitted = Map.ofList [ ("k", 1UL) ]
+        }
+
+    expectErrorKind ErrorKind.InternalError "LastCommitted の範囲外を検出するはず" (validate mgr)
+
+[<Fact>]
+let ``TransactionManager.validate: begin/put/commit/abort を繰り返しても不変条件を保つ`` () =
+    let random = System.Random 20261111
+    let mutable mgr = TransactionManager.create ()
+    let mutable active: Transaction list = []
+
+    for _ in 1..200 do
+        match random.Next 3 with
+        | 0 ->
+            let next, txn = TransactionManager.beginTxn mgr
+            mgr <- next
+            active <- txn :: active
+        | 1 ->
+            match active with
+            | txn :: rest ->
+                let txn =
+                    Transaction.put "t:x" [| byte (random.Next 4) |] [| SqlValue.Int(int64 (random.Next 100)) |] txn
+
+                active <- txn :: rest
+            | [] -> ()
+        | _ ->
+            match active with
+            | txn :: rest ->
+                match TransactionManager.commit txn mgr with
+                | Ok(next, _, _) -> mgr <- next
+                | Error _ -> mgr <- TransactionManager.abort txn mgr
+
+                active <- rest
+            | [] -> ()
+
+        ok (validate mgr) |> ignore
 
 [<Fact>]
 let ``TransactionManager.commit: commit 済み SeqNo を表す`` () =

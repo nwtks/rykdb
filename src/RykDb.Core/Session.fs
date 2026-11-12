@@ -95,9 +95,9 @@ type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
                 ret None
             | Ok(Some(row, nxt)) ->
                 current <- nxt
-                ret (Some row)
+                ret (Some(SqlValue.copyRow row))
 
-    override this.Finalize() =
+    override _.Finalize() =
         try
             releaseResources ()
         with _ ->
@@ -446,9 +446,7 @@ type internal DatabaseHost(root: string, owner: Database) =
                     let mgr =
                         state.Manager.Active
                         |> Map.toList
-                        |> List.fold
-                            (fun (m: TransactionManager) (_, record) -> TransactionManager.abort record.Txn m)
-                            state.Manager
+                        |> List.fold (fun m (_, txn) -> TransactionManager.abort txn m) state.Manager
 
                     { state with
                         Manager = mgr

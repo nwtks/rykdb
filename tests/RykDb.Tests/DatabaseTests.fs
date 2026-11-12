@@ -1049,3 +1049,25 @@ let ``Database: 実行中の transaction があると DDL は ConflictError`` ()
 
         ok (inserted.Close())
         ok (rolled.Close()))
+
+[<Fact>]
+let ``Database: 返した行を書き換えても DB の内容は変わらない`` () =
+    withDb "row-alias" (fun db0 ->
+        let db = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)"
+        let db = exec db "INSERT INTO t VALUES (1, X'0102')"
+        let result = query db "SELECT id, v FROM t"
+        Assert.Equal<int>(1, result.Rows.Length)
+
+        // 返された行配列と Blob の byte[] を書き換える。
+        result.Rows.[0].[0] <- SqlValue.Int 99L
+
+        match result.Rows.[0].[1] with
+        | SqlValue.Blob bytes -> bytes.[0] <- 0xFFuy
+        | _ -> Assert.Fail "BLOB ではありません"
+
+        let again = query db "SELECT id, v FROM t"
+        Assert.Equal<int64>(1L, asInt again.Rows.[0].[0])
+
+        match again.Rows.[0].[1] with
+        | SqlValue.Blob bytes -> Assert.Equal<byte>(1uy, bytes.[0])
+        | _ -> Assert.Fail "BLOB ではありません")

@@ -69,6 +69,15 @@ module internal Bytes =
         let at i = uint32 data.[offset + i]
         at 0 ||| (at 1 <<< 8) ||| (at 2 <<< 16) ||| (at 3 <<< 24)
 
+/// エントリの並び順（キー昇順・同一キーは SeqNo 降順）の**唯一の定義**。
+/// memtable の `Entry` と SSTable の `SstEntry` は必ずこれを経由する
+/// （2実装になると片方だけ壊れる。`OrderingPropertyTests` が一致を検査する）。
+module internal KeyOrder =
+    let compare (keyA: byte array) (seqA: uint64) (keyB: byte array) (seqB: uint64) =
+        match Bytes.compare keyA keyB with
+        | 0 -> compare seqB seqA
+        | c -> c
+
 /// SQL の識別子比較。
 /// テーブル名・列名・索引名・別名は大文字小文字を区別しない。
 /// スキーマ・カタログ・実行層で同じ規則を使うため、ここに 1つだけ置く。
@@ -202,6 +211,15 @@ module internal SqlValue =
         function
         | SqlValue.Null -> true
         | _ -> false
+
+    /// 行を結果として返すときに DB 内部の配列と切り離す。
+    /// `StatementResult.Rows` や `RowReader` はこれを経由する。
+    /// 配列をそのまま返すと、呼び出し側の書き換えが memtable / SSTable の内容を壊す。
+    /// Blob の byte[] も複製する。
+    let copyRow =
+        Array.map (function
+            | SqlValue.Blob b -> SqlValue.Blob(Array.copy b)
+            | other -> other)
 
     /// REAL を decimal へ変換できる絶対値の上限。
     /// System.Decimal の最大値（約 7.9228e28）より少し小さい安全側の値。
