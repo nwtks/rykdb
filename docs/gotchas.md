@@ -975,6 +975,29 @@ let withDir tag f =
 
 モジュールスコープに `Random` を 1つ置き、「テストデータ: 乱数生成器が実際に多様な値を返す」で明示的にアサートする。
 
+### 9.7 TailAudit は SDK の**パッチ更新**でビルドできなくなる（FCS API の変化）
+
+TailAudit は FCS を `$(MSBuildBinPath)/FSharp/FSharp.Compiler.Service.dll` から参照するため、
+**SDK のパッチ更新で FCS の AST 型が変わるとビルドが落ちる**。
+2026-11 の 10.0.404（FCS 43.12 → 43.13）で実際に発生した:
+
+- `FSharpParsingOptions.StrictIndentation` が廃止 → FS0039
+- レコード式のフィールドが `SynExprRecordField` → `SynExprRecordFieldOrSpread`（`Field` / `Spread`）に包まれ、
+  `SynExprRecordField` 自体も 5 引数 → 4 引数に → FS0001 / FS0019 / FS0025
+
+`dotnet-version: "10.0.x"` のようなパッチを許す指定では防げない
+（`ubuntu-latest` のイメージが新しいパッチに追従した時点で CI だけ落ちる）。
+対策は**型の形に依存しない書き方**:
+
+- `FSharpParsingOptions` はレコードリテラルを書かず
+  `checker.GetParsingOptionsFromCommandLineArgs` で作る。
+- レコード式のフィールド式は `SynExprRecordField` を直接パターンマッチせず、
+  共用体 / レコード / 列を反射でたどって `SynExpr` を集める（`containedExprs`）。
+
+SDK を上げたら `dotnet build tools/TailAudit/TailAudit.fsproj -t:Rebuild` を必ず流すこと
+（TailAudit は `RykDb.slnx` に含まれないので、`dotnet build -t:Rebuild` では検出できない）。
+CI の失敗が `tools/TailAudit/Program.fs` の FCS 型エラーなら、まずログの `dotnet --version` を見る。
+
 ---
 
 ## 10. デバッグ手法

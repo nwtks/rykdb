@@ -12,6 +12,8 @@
       FCS は NuGet ではなく SDK 同梱品を参照する。
       $(MSBuildBinPath) は「ビルドに使っている sdk/<ver>/」を指すので、
       インストール場所・SDK バージョンに依存せず、fsi/fsc と同じコンパイラで必ず一致する。
+      ただし FCS の API はサービスリリースでも変わる（10.0.404 で 43.12 → 43.13）ため、
+      Program.fs 側は 43.12 / 43.13 のどちらでもビルドできるよう形に依存しない書き方をしている。
     -->
     <Reference Include="FSharp.Compiler.Service">
       <HintPath>$(MSBuildBinPath)/FSharp/FSharp.Compiler.Service.dll</HintPath>

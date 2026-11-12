@@ -20,6 +20,11 @@
 // FCS は NuGet ではなく SDK 同梱品を参照する
 // （HintPath = `$(MSBuildBinPath)/FSharp/FSharp.Compiler.Service.dll`）。
 // インストール場所・SDK バージョンに依存せず、ビルド中の SDK と必ず一致する。
+//
+// ただし FCS の AST / オプション型はサービスリリースでも変わる
+// （10.0.404 の FCS 43.13 で StrictIndentation 廃止・レコード式フィールドが
+// SynExprRecordFieldOrSpread 化）ため、形に依存する箇所はコマンドライン解析と反射で吸収し、
+// 43.12（10.0.403）と 43.13（10.0.404）の両方でビルドできるようにしている。
 // ===========================================================================
 
 open System
@@ -32,27 +37,15 @@ open Microsoft.FSharp.Reflection
 
 let checker = FSharpChecker.Create()
 
+/// パース用オプション。
+/// FCS はサービスリリースでもレコードの形が変わる
+/// （10.0.404 の FCS 43.13 で StrictIndentation が廃止）ため、
+/// レコードリテラルを書かずコマンドライン解析から得る。
 let mkOpts (path: string) =
-    {
-        SourceFiles = [| path |]
-        ApplyLineDirectives = false
-        ConditionalDefines = []
-        DiagnosticOptions =
-            {
-                WarnLevel = 3
-                GlobalWarnAsError = false
-                WarnOff = []
-                WarnOn = []
-                WarnAsError = []
-                WarnAsWarn = []
-                WarnScopeData = None
-            }
-        LangVersionText = "default"
-        IsInteractive = false
-        StrictIndentation = None
-        CompilingFSharpCore = false
-        IsExe = true
-    }
+    let opts, _diagnostics =
+        checker.GetParsingOptionsFromCommandLineArgs [ "--target:exe"; "--warn:3"; path ]
+
+    opts
 
 // ---------------------------------------------------------------------------
 // 状態（fsx トップレベルの mutable はクロージャから見える）
@@ -235,6 +228,46 @@ let hit (fn: string) (r: range) (tail: bool) (bare: bool) (targets: Set<string>)
                     }
 
 // ---------------------------------------------------------------------------
+// 値の中にある SynExpr を反射で集める。
+// FCS 43.12 のレコード式フィールドは SynExprRecordField（レコード型）だが、
+// FCS 43.13 では SynExprRecordFieldOrSpread（Field / Spread の共用体）に包まれ、
+// SynExprRecordField 自体のフィールドも減っている。
+// 型の形に依存しないよう、レコード / 共用体 / 列をたどって SynExpr だけを拾う。
+// ---------------------------------------------------------------------------
+let rec containedExprs (value: obj) : SynExpr list =
+    match value with
+    | null -> []
+    | :? string -> []
+    | :? SynExpr as e -> [ e ]
+    | :? Collections.IEnumerable as items ->
+        [
+            for item in Seq.cast<obj> items do
+                yield! containedExprs item
+        ]
+    | _ ->
+        let t = value.GetType()
+
+        if FSharpType.IsUnion t then
+            let _, fields = FSharpValue.GetUnionFields(value, t)
+
+            [
+                for f in fields do
+                    yield! containedExprs f
+            ]
+        elif FSharpType.IsRecord t then
+            [
+                for f in FSharpValue.GetRecordFields value do
+                    yield! containedExprs f
+            ]
+        elif FSharpType.IsTuple t then
+            [
+                for f in FSharpValue.GetTupleFields value do
+                    yield! containedExprs f
+            ]
+        else
+            []
+
+// ---------------------------------------------------------------------------
 // 本体走査。collectPhase=true では rec グループ収集のみ、
 // false では targets（現在解析中のグループ名集合）への呼び出しを記録する。
 // ---------------------------------------------------------------------------
@@ -349,12 +382,12 @@ let rec walk (targets: Set<string>) (shadow: Set<string>) (tail: bool) (e: SynEx
             w shadow false x
     | SynExpr.ArrayOrListComputed(_, inner, _) -> w shadow false inner
     | SynExpr.Record(_, _, fields, _) ->
+        // フィールド値・スプレッドは末尾位置ではない。
+        // 43.12 は SynExprRecordField、43.13 は SynExprRecordFieldOrSpread なので、
+        // 具体形に依存せずフィールド内の SynExpr を反射で取り出して走査する。
         for f in fields do
-            match f with
-            | SynExprRecordField(_, _, eOpt, _, _) ->
-                match eOpt with
-                | Some x -> w shadow false x
-                | None -> ()
+            for x in containedExprs (box f) do
+                w shadow false x
     | SynExpr.DotGet(inner, _, _, _) -> w shadow false inner
     | SynExpr.DotSet(_, _, rhs, _) -> w shadow false rhs
     | SynExpr.Set(_, rhs, _) -> w shadow false rhs
