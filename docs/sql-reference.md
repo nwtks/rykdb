@@ -47,7 +47,7 @@ join_clause    ::= [INNER | LEFT [OUTER]] JOIN table_ref ON expr
 sort_key       ::= expr [ASC | DESC]
 
 insert         ::= INSERT INTO table_ref [ "(" column_list ")" ]
-                   (VALUES row {"," row} | DEFAULT VALUES)
+                   (VALUES row {"," row} | DEFAULT VALUES | select)
 row            ::= "(" expr {"," expr} ")"
 update         ::= UPDATE table_ref SET assignment {"," assignment} [ WHERE expr ]
 delete         ::= DELETE FROM table_ref [ WHERE expr ]
@@ -245,6 +245,8 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 INSERT INTO t VALUES (1, 2 + 3);      -- OK（定数式）
 INSERT INTO t VALUES (1, other_col);  -- NameError（'other_col' は列でも関数でもありません）
 ```
+
+列や別テーブルの値を使いたい場合は `INSERT ... SELECT` を使う（§8）。
 
 ### 出力の表示（`SqlLiteral.toSqlLiteral`）
 
@@ -875,6 +877,7 @@ Project(t.id)
 ```sql
 INSERT INTO テーブル [ (列 [, 列 …]) ] VALUES (式 [, 式 …]) [, (式 [, …]) …];
 INSERT INTO テーブル DEFAULT VALUES;
+INSERT INTO テーブル [ (列 [, 列 …]) ] SELECT ...;
 ```
 
 ### 挙動
@@ -885,7 +888,7 @@ INSERT INTO テーブル DEFAULT VALUES;
   （主キーなどに既定値が無い場合は `NOT NULL` 違反）。
 - `VALUES` の要素に `DEFAULT` を書くと、その列の既定値を使う。
 - **値式は定数のみ**（列参照不可）。サブクエリは使える（§7.9）。
-- `INSERT ... SELECT` と `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）は未対応（§14）。
+- `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）は未対応（§14）。
 - 値は列の型へ**自動変換**される（[§3](#値を列の型へ自動変換するsqlvaluecoerce)）。
 - `NOT NULL` 制約は行ごとに検証される。
 - **1つの `INSERT` は 1トランザクション**（途中で失敗したら何も残らない）。
@@ -907,6 +910,28 @@ INSERT INTO テーブル DEFAULT VALUES;
 ```sql
 INSERT INTO people VALUES (1, 'alice2', 30, 1, 1.0);  -- id=1 が既に存在するのでエラー
 INSERT INTO people (id, email) VALUES (2, NULL), (3, NULL);  -- 複数の NULL は OK
+```
+
+### `INSERT ... SELECT`
+
+`INSERT INTO テーブル [ (列 …) ] SELECT ...` は、選択結果の行をまとめて挿入する。
+
+- 選択結果の列数は、列リスト（省略時はテーブル定義の列数）と一致している必要がある
+  （不一致は `INSERT の列数(n)と値の数(m)が合いません`）。
+- 値は列の型へ自動変換される。列リストに無い列は `DEFAULT`（無ければ `NULL`）で埋まる。
+- `WHERE` / `JOIN` / 集約 / `ORDER BY` / `LIMIT` など SELECT の句はそのまま使える
+  （式サブクエリ・派生テーブルも §7.9 / §7.10 の範囲で使える）。
+- 選択は**文の開始時点の snapshot** を読む。
+  `INSERT INTO t SELECT * FROM t` は増殖せず、開始時点の行を 1回だけ複製する。
+- 主キー重複・`UNIQUE` 違反・`NOT NULL` 違反は通常の `INSERT` と同じ（文全体が取り消される）。
+
+```sql
+INSERT INTO people (id, name)
+SELECT id + 100, UPPER(name) FROM people WHERE age >= 30;
+
+-- 別テーブルへの集約結果の格納
+CREATE TABLE stats (name TEXT PRIMARY KEY, total DECIMAL);
+INSERT INTO stats (name, total) SELECT name, SUM(salary) FROM people GROUP BY name;
 ```
 
 ### 例
@@ -1294,7 +1319,6 @@ db> .rollback
 - ウィンドウ関数（`OVER` / `PARTITION BY` / `ROW_NUMBER` …）
 - `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN` / `USING`
 - 自然結合（`NATURAL JOIN`）
-- `INSERT ... SELECT`
 - カンマ結合（`FROM a, b`）
 - `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）
 - `UPDATE ... FROM` / `UPDATE ... LIMIT` / `DELETE ... LIMIT`

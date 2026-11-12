@@ -1034,9 +1034,20 @@ module internal Parser =
                         {
                             Table = tbl
                             Columns = None
-                            Rows = [ [] ]
+                            Source = InsertSource.Values [ [] ]
                         },
                         st
+            elif isKeyword "SELECT" st then
+                let! sel, st = parseSelectStatement st
+                let! _, st = eatOptionalSemicolon st
+
+                return
+                    {
+                        Table = tbl
+                        Columns = columns
+                        Source = InsertSource.Select sel
+                    },
+                    st
             else
                 let! _, st = expectKeyword "VALUES" st
                 let! rs, st = rows [] st
@@ -1046,7 +1057,7 @@ module internal Parser =
                     {
                         Table = tbl
                         Columns = columns
-                        Rows = rs
+                        Source = InsertSource.Values rs
                     },
                     st
         }

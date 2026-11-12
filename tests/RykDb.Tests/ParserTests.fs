@@ -242,7 +242,11 @@ let ``パーサ: SELECT 各種`` () =
 [<Fact>]
 let ``パーサ: INSERT / UPDATE / DELETE`` () =
     let ins = parseInsertOk "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')"
-    Assert.Equal(2, ins.Rows.Length)
+
+    match ins.Source with
+    | InsertSource.Values rows -> Assert.Equal(2, rows.Length)
+    | other -> Assert.Fail(sprintf "VALUES ではない: %A" other)
+
     Assert.Equal<string list option>(Some [ "a"; "b" ], ins.Columns)
 
     let ins2 = parseInsertOk "INSERT INTO t VALUES (1)"
@@ -254,6 +258,27 @@ let ``パーサ: INSERT / UPDATE / DELETE`` () =
 
     let del = parseDeleteOk "DELETE FROM t WHERE id = 1"
     Assert.True del.Where.IsSome
+
+[<Fact>]
+let ``パーサ: INSERT ... SELECT`` () =
+    let ins = parseInsertOk "INSERT INTO t (a, b) SELECT x, y FROM u WHERE x > 0"
+    Assert.Equal<string list option>(Some [ "a"; "b" ], ins.Columns)
+
+    match ins.Source with
+    | InsertSource.Select sel ->
+        Assert.Equal(2, sel.Items.Length)
+        Assert.True sel.Where.IsSome
+    | other -> Assert.Fail(sprintf "SELECT ではない: %A" other)
+
+    // 列リストなし・ORDER BY / LIMIT 付き
+    let ins2 = parseInsertOk "INSERT INTO t SELECT * FROM u ORDER BY x LIMIT 2"
+    Assert.True ins2.Columns.IsNone
+
+    match ins2.Source with
+    | InsertSource.Select sel ->
+        Assert.Equal(1, sel.OrderBy.Length)
+        Assert.True sel.Limit.IsSome
+    | other -> Assert.Fail(sprintf "SELECT ではない: %A" other)
 
 [<Fact>]
 let ``パーサ: CREATE TABLE / INDEX / DROP`` () =
@@ -721,14 +746,15 @@ let ``パーサ: CAST と DEFAULT`` () =
 
     match parseOneOk "INSERT INTO t DEFAULT VALUES" with
     | Statement.Insert ins ->
-        Assert.Equal<int>(1, ins.Rows.Length)
-        Assert.Equal<int>(0, List.length ins.Rows.[0])
+        match ins.Source with
+        | InsertSource.Values [ [] ] -> ()
+        | other -> Assert.Fail(sprintf "DEFAULT VALUES ではない: %A" other)
     | other -> Assert.Fail(sprintf "INSERT ではない: %A" other)
 
     match parseOneOk "INSERT INTO t VALUES (1, DEFAULT)" with
     | Statement.Insert ins ->
-        match ins.Rows with
-        | [ [ _; Expr.Default ] ] -> ()
+        match ins.Source with
+        | InsertSource.Values [ [ _; Expr.Default ] ] -> ()
         | other -> Assert.Fail(sprintf "DEFAULT ではない: %A" other)
     | other -> Assert.Fail(sprintf "INSERT ではない: %A" other)
 

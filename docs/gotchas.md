@@ -2122,3 +2122,20 @@ let leftSchema = { inSchema with Columns = inSchema.Columns |> Array.filter (fun
 
 回帰テスト: `Database: 60 段の入れ子 JOIN が正しい行を返す` /
 `SqlReference: 結合順が並べ替えられても結果は同じ`。
+
+### 11.68 `INSERT ... SELECT` の選択は「文の開始時点の Op」で読む
+
+❌ 選択結果を読みながら同じ transaction へ積み、走査がその transaction を参照する。
+
+`Dml.scanByPrimaryKeyWithTxn` は transaction のバッファを `overlayRows` で重ねる。
+`INSERT INTO t SELECT * FROM t` の走査が自分の書き込みを見ると**終わらない**
+（1行挿入するたびに次の行が現れる）。
+
+✅ 挿入を始める前に `Plan.runSelect ctx sel` を呼び、返った `Op` を使う。
+`Op` は計画時点の snapshot と transaction（`ctx.Txn`）を握っているので、
+その後の挿入（新しい `Transaction` 値）は走査から見えない。
+`DmlOps.insertSelect` は `ctx.Txn` から積み上げを始め、
+制約検査だけは積み上げ中の transaction を見る（同一文内の主キー / UNIQUE 重複を検出する）。
+
+回帰テスト: `SqlReference: INSERT ... SELECT は選択結果を挿入する`
+（自分のテーブルから選んでも行数が倍になるだけで止まる）。

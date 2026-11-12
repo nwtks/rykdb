@@ -177,8 +177,8 @@ module internal DmlOps =
         (values: Expr list)
         (idxs: int list)
         =
-        let rec gather acc vs is_ =
-            match vs, is_ with
+        let rec gather acc vs ixs =
+            match vs, ixs with
             | [], [] -> ret acc
             | v :: rest, i :: restIdx ->
                 match evalOne v with
@@ -204,26 +204,77 @@ module internal DmlOps =
             | Some v -> v
             | None -> fallback i)
 
-    /// INSERT。
-    /// columns が None ならテーブル定義の順に並べる。
-    /// DEFAULT / NULL の充足と型強制はここで行う。
-    /// TableSchema.validateRow が NOT NULL と型を最終確認する。
-    let insert (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (rows: Expr list list) =
-        let evalConstant = Eval.eval Schema.empty [||]
+    /// 列リストを列位置へ解決する。
+    /// 列リストが無ければテーブル定義の順に並べる。
+    let private insertTargets (schema: TableSchema) =
+        function
+        | None -> schema.Columns |> List.mapi (fun i _ -> i) |> ret
+        | Some names ->
+            match SqlName.duplicate names with
+            | Some name -> err (DbError.name (sprintf "INSERT の列 %s が重複しています" name))
+            | None -> names |> List.map (TableSchema.requireIndexOf schema) |> all
 
-        let indexValues (index: IndexSchema) (row: SqlValue array) =
-            index.Columns
-            |> List.map (TableSchema.requireIndexOf schema)
-            |> all
-            |> Result.map (fun positions -> positions |> List.map (fun i -> row.[i]) |> List.toArray)
+    /// 列の既定値（DEFAULT が無ければ NULL）。
+    let private evalDefaultValue (schema: TableSchema) (i: int) =
+        let col = schema.Columns.[i]
 
-        let rec check txn row pk pkBytes =
+        match col.Constraint.Default with
+        | Some d ->
+            Eval.eval Schema.empty [||] d
+            >>= fun value -> SqlValue.coerce col.DataType value
+        | None -> ret SqlValue.Null
+
+    /// 省略された列を埋める既定値の並び。
+    /// 値が指定された列の位置は `assembleRow` が上書きするので NULL を置く。
+    /// 指定された列の DEFAULT を評価しないのは、壊れた DEFAULT を持つ列へ明示値を入れる
+    /// ときにエラーにしないため（gotchas §11.21）。
+    let private defaultValuesOf (schema: TableSchema) (supplied: Set<int>) =
+        schema.Columns
+        |> List.mapi (fun i _ ->
+            if Set.contains i supplied then
+                ret SqlValue.Null
+            else
+                evalDefaultValue schema i)
+        |> all
+        |> Result.map List.toArray
+
+    /// 提供された値（`idxs` の順）を列の型へ強制し、省略列を `defaults` で埋めて列順の行にする。
+    let private assembleRow (schema: TableSchema) (idxs: int list) (defaults: SqlValue array) (values: SqlValue array) =
+        let widthMismatch () =
+            sprintf "INSERT の列数(%d)と値の数(%d)が合いません" (List.length idxs) values.Length
+            |> DbError.create ErrorKind.SyntaxError
+
+        let rec gather acc vs ixs =
+            match vs, ixs with
+            | [], [] -> ret acc
+            | v :: rest, i :: restIdx ->
+                match SqlValue.coerce schema.Columns.[i].DataType v with
+                | Error e -> err e
+                | Ok coerced -> gather ((i, coerced) :: acc) rest restIdx
+            | _ -> err (widthMismatch ())
+
+        if values.Length <> List.length idxs then
+            err (widthMismatch ())
+        else
+            gather [] (List.ofArray values) idxs
+            |> Result.map (fun filled -> scatter schema.Columns.Length filled (fun i -> defaults.[i]))
+
+    /// 索引列の値を取り出す（索引列は CREATE INDEX で検証済み）。
+    let private indexValuesOf (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
+        index.Columns
+        |> List.map (TableSchema.requireIndexOf schema)
+        |> all
+        |> Result.map (fun positions -> positions |> List.map (fun i -> row.[i]) |> List.toArray)
+
+    /// 主キーと UNIQUE 索引の重複を検査し、確定した主キーのバイト列を返す。
+    let private checkUnique (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
+        let rec check pk pkBytes =
             function
             | [] -> ret pkBytes
             | idx :: rest ->
-                match indexValues idx row with
+                match indexValuesOf schema idx row with
                 | Error e -> err e
-                | Ok values when values |> Array.exists SqlValue.isNull -> check txn row pk pkBytes rest
+                | Ok values when values |> Array.exists SqlValue.isNull -> check pk pkBytes rest
                 | Ok values ->
                     match
                         Dml.scanByIndexPrefixWithTxn ctx.Store schema idx values 1 ctx.Visible (Some ctx.Scope) txn
@@ -241,98 +292,104 @@ module internal DmlOps =
                             then
                                 err (sprintf "UNIQUE 制約に違反: %s" idx.Name |> DbError.constraintViolation)
                             else
-                                check txn row pk pkBytes rest
+                                check pk pkBytes rest
 
-        let checkUnique txn row =
-            let pk = TableSchema.primaryKeyOf schema row
-            let pkBytes = KeyBuilder.ofValues pk
+        let pk = TableSchema.primaryKeyOf schema row
+        let pkBytes = KeyBuilder.ofValues pk
 
-            match Dml.getByPrimaryKeyBytesWithTxn ctx.Store schema pkBytes ctx.Visible txn with
-            | Error e -> err e
-            | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
-            | Ok None -> check txn row pk pkBytes (schema.Indexes |> List.filter _.Unique)
+        match Dml.getByPrimaryKeyBytesWithTxn ctx.Store schema pkBytes ctx.Visible txn with
+        | Error e -> err e
+        | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
+        | Ok None -> check pk pkBytes (schema.Indexes |> List.filter _.Unique)
 
-        let evalDefault i =
-            let col = schema.Columns.[i]
+    /// 1行を制約検査して transaction へ積む。
+    let private insertRow (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
+        checkUnique ctx schema txn row
+        >>= fun pkBytes -> Dml.insertWithKey pkBytes txn schema row
 
-            match col.Constraint.Default with
-            | Some d -> evalConstant d >>= fun value -> SqlValue.coerce col.DataType value
-            | None -> ret SqlValue.Null
+    /// INSERT。
+    /// columns が None ならテーブル定義の順に並べる。
+    /// DEFAULT / NULL の充足と型強制はここで行う。
+    /// TableSchema.validateRow が NOT NULL と型を最終確認する。
+    let insert (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (rows: Expr list list) =
+        let evalConstant = Eval.eval Schema.empty [||]
 
-        let buildRow width idxs (defaults: SqlValue array) values =
+        let widthMismatch expected provided =
+            sprintf "INSERT の列数(%d)と値の数(%d)が合いません" expected provided
+            |> DbError.create ErrorKind.SyntaxError
+
+        let evalValues idxs values =
+            let rec gather acc vs ixs =
+                match vs, ixs with
+                | [], [] -> ret (List.rev acc |> List.toArray)
+                | v :: rest, i :: restIdx ->
+                    let evaluated =
+                        match v with
+                        | Expr.Default -> evalDefaultValue schema i
+                        | _ -> evalConstant v
+
+                    match evaluated with
+                    | Error e -> err e
+                    | Ok value -> gather (value :: acc) rest restIdx
+                | _ -> err (widthMismatch (List.length idxs) (List.length values))
+
             if List.length values <> List.length idxs then
-                DbError.create
-                    ErrorKind.SyntaxError
-                    (sprintf "INSERT の列数(%d)と値の数(%d)が合いません" (List.length idxs) (List.length values))
-                |> err
+                err (widthMismatch (List.length idxs) (List.length values))
             else
-                let rec gather acc vs is_ =
-                    match vs, is_ with
-                    | [], [] -> ret acc
-                    | v :: rest, i :: restIdx ->
-                        let evaluated =
-                            match v with
-                            | Expr.Default -> evalDefault i
-                            | _ ->
-                                evalConstant v
-                                >>= fun value -> SqlValue.coerce schema.Columns.[i].DataType value
-
-                        match evaluated with
-                        | Error e -> err e
-                        | Ok coerced -> gather ((i, coerced) :: acc) rest restIdx
-                    | _ ->
-                        sprintf "INSERT の列数(%d)と値の数(%d)が合いません" (List.length idxs) (List.length values)
-                        |> DbError.create ErrorKind.SyntaxError
-                        |> err
-
                 gather [] values idxs
-                |> Result.map (fun filled -> scatter width filled (fun i -> defaults.[i]))
 
         result {
-            let! idxs =
-                match columns with
-                | None -> schema.Columns |> List.mapi (fun i _ -> i) |> ret
-                | Some names ->
-                    match SqlName.duplicate names with
-                    | Some name -> err (DbError.name (sprintf "INSERT の列 %s が重複しています" name))
-                    | None -> names |> List.map (TableSchema.requireIndexOf schema) |> all
-
-            let supplied = Set.ofList idxs
+            let! idxs = insertTargets schema columns
 
             match columns, rows with
             | None, [ [] ] ->
                 let! row =
                     schema.Columns
-                    |> List.mapi (fun i _ -> evalDefault i)
+                    |> List.mapi (fun i _ -> evalDefaultValue schema i)
                     |> all
                     |> Result.map List.toArray
 
-                let! pkBytes = checkUnique ctx.Txn row
-                let! t = Dml.insertWithKey pkBytes ctx.Txn schema row
-                return t, 1
+                let! txn = insertRow ctx schema ctx.Txn row
+                return txn, 1
             | _ ->
-                let! defaultValues =
-                    schema.Columns
-                    |> List.mapi (fun i _ ->
-                        if Set.contains i supplied then
-                            ret SqlValue.Null
-                        else
-                            evalDefault i)
-                    |> all
-
-                let defaults = List.toArray defaultValues
+                let! defaults = defaultValuesOf schema (Set.ofList idxs)
 
                 return!
                     rows
                     |> foldOk
                         (fun (txnAcc, count) values ->
                             result {
-                                let! row = buildRow schema.Columns.Length idxs defaults values
-                                let! pkBytes = checkUnique txnAcc row
-                                let! t = Dml.insertWithKey pkBytes txnAcc schema row
-                                return t, count + 1
+                                let! provided = evalValues idxs values
+                                let! row = assembleRow schema idxs defaults provided
+                                let! txnAcc2 = insertRow ctx schema txnAcc row
+                                return txnAcc2, count + 1
                             })
                         (ctx.Txn, 0)
+        }
+
+    /// INSERT ... SELECT。
+    /// 選択結果の行（値）を 1行ずつ挿入する。
+    /// 述語・結合・集約は `Plan.runSelect` が済ませているので、
+    /// ここでは列の対応付け・型強制・制約検査だけを行う。
+    /// 選択結果の `Op` は計画時点の snapshot と transaction を握っているため、
+    /// 挿入した行を読み返して増え続けることはない（`INSERT INTO t SELECT * FROM t` も止まる）。
+    let insertSelect (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (source: Op) =
+        let rec go idxs defaults txn count cur =
+            match Op.next cur with
+            | Error e -> err e
+            | Ok None -> ret (txn, count)
+            | Ok(Some(row, nxt)) ->
+                match assembleRow schema idxs defaults row with
+                | Error e -> err e
+                | Ok values ->
+                    match insertRow ctx schema txn values with
+                    | Error e -> err e
+                    | Ok next -> go idxs defaults next (count + 1) nxt
+
+        result {
+            let! idxs = insertTargets schema columns
+            let! defaults = defaultValuesOf schema (Set.ofList idxs)
+            return! go idxs defaults ctx.Txn 0 source
         }
 
     /// UPDATE。

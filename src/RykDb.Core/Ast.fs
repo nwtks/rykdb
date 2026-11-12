@@ -253,12 +253,19 @@ and internal CreateTable =
         Constraints: TableConstraint list
     }
 
+/// `INSERT` の入力。
+and [<RequireQualifiedAccess>] internal InsertSource =
+    /// `VALUES (...), (...)`。`[ [] ]` は `DEFAULT VALUES`（全列を既定値で埋める）。
+    | Values of Expr list list
+    /// `INSERT INTO t SELECT ...`。
+    /// 選択結果の行を 1行ずつ挿入する（実行時に計画・評価する）。
+    | Select of SelectStatement
+
 and internal InsertStatement =
     {
         Table: TableRef
         Columns: string list option
-        /// `[ [] ]` は `DEFAULT VALUES`（全列を既定値で埋める）。
-        Rows: Expr list list
+        Source: InsertSource
     }
 
 and internal UpdateStatement =

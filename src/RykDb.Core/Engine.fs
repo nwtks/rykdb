@@ -565,13 +565,24 @@ module internal Engine =
 
     let private runInsert (stmt: InsertStatement) (ctx: ExecContext) =
         result {
-            let! rows =
-                stmt.Rows
-                |> List.map (fun row -> row |> List.map (Plan.resolveDmlExpr ctx) |> all)
-                |> all
-
             let! schema = ExecContext.schemaOf stmt.Table.Name ctx
-            return! DmlOps.insert ctx schema stmt.Columns rows
+
+            return!
+                match stmt.Source with
+                | InsertSource.Values rows ->
+                    result {
+                        let! resolved =
+                            rows
+                            |> List.map (fun row -> row |> List.map (Plan.resolveDmlExpr ctx) |> all)
+                            |> all
+
+                        return! DmlOps.insert ctx schema stmt.Columns resolved
+                    }
+                | InsertSource.Select sel ->
+                    result {
+                        let! _, op = Plan.runSelect ctx sel
+                        return! DmlOps.insertSelect ctx schema stmt.Columns op
+                    }
         }
 
     let private runUpdate (stmt: UpdateStatement) (ctx: ExecContext) =

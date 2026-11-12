@@ -759,6 +759,10 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 
 - `insert` — 列順・`DEFAULT` / `NULL` の充足・`SqlValue.coerce` による型強制を行い、
   行ごとに `Dml.insertWithKey` でバッファへ積む（最終確認は `TableSchema.validateRow`）。
+- `insertSelect` — `INSERT ... SELECT`。
+  選択結果は `Plan.runSelect` が `Op` として返し、行ごとに `insert` と同じ列対応・制約検査を通す。
+  `Op` は計画時点の snapshot と transaction を握るため、挿入した行を読み返して増殖しない
+  （`INSERT INTO t SELECT * FROM t` も止まる）。
 - `update` — 全行をスキャンして WHERE を評価し、代入式は「現在の行」で評価して `Dml.updateRow` へ。
   **主キー列の書き換えは未対応**（`sql-reference.md` 参照）。
 - `delete` — 全行をスキャンし、WHERE に合う行の**主キー + 全索引に tombstone** を書く。

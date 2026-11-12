@@ -551,6 +551,77 @@ let ``SqlReference: INSERT は複数 VALUES を 1 文で`` () =
         Assert.Equal<int>(3, res.Rows.Length))
 
 [<Fact>]
+let ``SqlReference: INSERT ... SELECT は選択結果を挿入する`` () =
+    withDb "insert-select" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT, n INTEGER)"
+
+        let db2 = exec db1 "INSERT INTO src VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)"
+
+        let db3 =
+            exec db2 "CREATE TABLE dst (id INTEGER PRIMARY KEY, v TEXT, n INTEGER DEFAULT 0)"
+
+        // 列リストあり・式・WHERE・ORDER BY・UPPER。列リストに無い n は DEFAULT で埋まる。
+        let db4, ins =
+            ok (execSql db3 "INSERT INTO dst (id, v) SELECT n + 100, UPPER(v) FROM src WHERE id <= 2 ORDER BY id")
+
+        Assert.Equal<int>(2, ins.RowsAffected)
+
+        let _db4, rows = ok (execSql db4 "SELECT id, v, n FROM dst ORDER BY id")
+        Assert.Equal<int>(2, rows.Rows.Length)
+        Assert.Equal<int64>(110L, asInt rows.Rows.[0].[0])
+        Assert.Equal<string>("A", asText rows.Rows.[0].[1])
+        Assert.Equal<int64>(0L, asInt rows.Rows.[0].[2])
+        Assert.Equal<int64>(120L, asInt rows.Rows.[1].[0])
+
+        // FROM なしの SELECT も挿入できる
+        let db5, one = ok (execSql db4 "INSERT INTO dst (id, v) SELECT 500, 'x'")
+        Assert.Equal<int>(1, one.RowsAffected)
+
+        // 自分自身から選ぶ（文の開始時点の snapshot を読み、増え続けない）
+        let db6, copied =
+            ok (execSql db5 "INSERT INTO src SELECT id + 10, v || '2', n FROM src")
+
+        Assert.Equal<int>(3, copied.RowsAffected)
+
+        let _, count = ok (execSql db6 "SELECT COUNT(*) FROM src")
+        Assert.Equal<int64>(6L, asInt count.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: INSERT ... SELECT の制約違反は文全体を取り消す`` () =
+    withDb "insert-select-errors" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL, n INTEGER DEFAULT 0)"
+
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a', 10)"
+
+        let countOf db =
+            ok (execSql db "SELECT COUNT(*) FROM t") |> snd |> fun r -> asInt r.Rows.[0].[0]
+
+        // 主キー重複
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "INSERT ... SELECT の主キー重複"
+            (execSql db2 "INSERT INTO t (id) SELECT 1")
+
+        Assert.Equal<int64>(1L, countOf db2)
+
+        // NOT NULL 違反（DEFAULT の無い列を NULL にしてしまう）
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "INSERT ... SELECT の NOT NULL 違反"
+            (execSql db2 "INSERT INTO t (id) SELECT 2")
+
+        Assert.Equal<int64>(1L, countOf db2)
+
+        // 列数の不一致
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "INSERT ... SELECT の列数不一致"
+            (execSql db2 "INSERT INTO t (id) SELECT id, v FROM t")
+
+        Assert.Equal<int64>(1L, countOf db2))
+
+[<Fact>]
 let ``SqlReference: UPDATE は WHERE に合う行だけを変える`` () =
     withDb "dml3" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -2543,7 +2614,6 @@ let ``SqlReference: 未対応の構文は明示的な SyntaxError`` () =
         expectErrorKind ErrorKind.SyntaxError "TRUNCATE" (execSql db2 "TRUNCATE TABLE t")
 
         // DML の未対応形
-        expectErrorKind ErrorKind.SyntaxError "INSERT ... SELECT" (execSql db2 "INSERT INTO t SELECT 2, 'c'")
         expectErrorKind ErrorKind.SyntaxError "RETURNING" (execSql db2 "DELETE FROM t RETURNING id")
 
         // どれも文が実行されていないこと
