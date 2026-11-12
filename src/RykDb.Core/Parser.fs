@@ -1320,6 +1320,17 @@ module internal Parser =
             |> eatIdentName "TRANSACTION"
             |> eatOptionalSemicolon
             |> Result.map (fun (_, st) -> Statement.Begin, st)
+        | Token.Ident name when name.ToUpperInvariant() = "EXPLAIN" ->
+            let st = advance st
+
+            match peek st with
+            | Token.Keyword "SELECT" ->
+                result {
+                    let! sel, st = parseSelectStatement st
+                    let! _, st = eatOptionalSemicolon st
+                    return Statement.Explain sel, st
+                }
+            | _ -> fail "EXPLAIN は SELECT 文だけに対応しています" st
         | Token.Ident name when name.ToUpperInvariant() = "START" ->
             let st = advance st
 

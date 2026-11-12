@@ -304,6 +304,8 @@ and internal CreateIndex =
 
 and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
     | Select of SelectStatement
+    /// `EXPLAIN SELECT ...`。実行はせず、論理計画（走査方法・結合アルゴリズム）を返す。
+    | Explain of SelectStatement
     | Insert of InsertStatement
     | Update of UpdateStatement
     | Delete of DeleteStatement

@@ -674,6 +674,18 @@ let ``パーサ: トランザクションの別綴り`` () =
     | other -> Assert.Fail(sprintf "END ではない: %A" other)
 
 [<Fact>]
+let ``パーサ: EXPLAIN は SELECT を包む`` () =
+    match parseOneOk "EXPLAIN SELECT id FROM t WHERE id = 1;" with
+    | Statement.Explain sel ->
+        Assert.Single<SelectItem> sel.Items |> ignore
+        Assert.True sel.Where.IsSome
+    | other -> Assert.Fail(sprintf "EXPLAIN ではない: %A" other)
+
+    // 未対応の文・欠落は明示的な SyntaxError
+    expectErrorKind ErrorKind.SyntaxError "EXPLAIN の後に SELECT 以外" (parseStatement "EXPLAIN INSERT INTO t VALUES (1)")
+    expectErrorKind ErrorKind.SyntaxError "EXPLAIN だけ" (parseStatement "EXPLAIN")
+
+[<Fact>]
 let ``パーサ: IS TRUE / FALSE / UNKNOWN と LIKE ESCAPE`` () =
     match whereOf "SELECT * FROM t WHERE a IS TRUE" with
     | Expr.IsTruth(_, TruthValue.True, false) -> ()

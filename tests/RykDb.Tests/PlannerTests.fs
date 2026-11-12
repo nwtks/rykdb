@@ -50,6 +50,55 @@ let ``Optimizer.buildLogicalWith: 単純な SELECT は Scan + Project になる`
         | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
 
 [<Fact>]
+let ``Optimizer.explain: 論理木を 1行 1ノードで表示する`` () =
+    withStore "pl-explain" (fun store ->
+        let ctx = ctxOf store
+
+        let stmt =
+            selectOf
+                [ { Expression = Expr.Star; Alias = None } ]
+                (Some { Name = "people"; Alias = None })
+                []
+                (Some(Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))))
+
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
+
+        Assert.Equal<string list>(
+            [ "Project(*)"; "  Filter((people.age > 30))"; "    Scan(people, SeqScan)" ],
+            Optimizer.explain ctx tree Schema.empty
+        ))
+
+[<Fact>]
+let ``Optimizer.explain: 結合アルゴリズムも表示する`` () =
+    withStore "pl-explain-join" (fun store ->
+        let ctx = ctxOf store
+
+        let stmt =
+            selectOf
+                [ { Expression = Expr.Star; Alias = None } ]
+                (Some { Name = "people"; Alias = None })
+                [
+                    {
+                        Kind = JoinKind.Inner
+                        Table = TableSource.Named { Name = "orders"; Alias = None }
+                        On = Expr.Binary(BinaryOp.Eq, pCol "id", oCol "person_id")
+                    }
+                ]
+                None
+
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
+
+        Assert.Equal<string list>(
+            [
+                "Project(*)"
+                "  Join(INNER, HashJoin, right=orders, on=(people.id = orders.person_id))"
+                "    Scan(people, SeqScan)"
+                "    Scan(orders, SeqScan)"
+            ],
+            Optimizer.explain ctx tree Schema.empty
+        ))
+
+[<Fact>]
 let ``Optimizer.buildLogicalWith: WHERE があれば Scan の直下に Filter が付く`` () =
     withStore "pl2" (fun store ->
         let ctx = ctxOf store

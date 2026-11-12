@@ -499,6 +499,25 @@ module internal Engine =
             finally
                 ctx.Scope.DisposeAll()
 
+    /// EXPLAIN: 実行計画を組み立て、木を 1行 1ノードの文字列にして返す。
+    /// クエリ本体は実行しない（ただしサブクエリは計画時に評価される。Planner の計画経路と同じ）。
+    let private runExplain (state: DbState) (txn: Transaction) (stmt: SelectStatement) =
+        contextOf state txn
+        >>= fun ctx ->
+            try
+                Plan.explainSelect ctx stmt
+                |> Result.map (fun plan ->
+                    let lines = Optimizer.explain plan.Context plan.Tree plan.Input
+
+                    state,
+                    {
+                        RowsAffected = lines.Length
+                        Columns = [| "plan" |]
+                        Rows = lines |> List.map (fun line -> [| SqlValue.Text line |]) |> Array.ofList
+                    })
+            finally
+                ctx.Scope.DisposeAll()
+
     /// SELECT を materialize せずにストリーミング用の Op として開く。
     /// 呼び出し側は返された `Cleanup` を必ず呼び、snapshot 登録と走査を解放する。
     let openSelect (state: DbState) (stmt: SelectStatement) =
@@ -609,6 +628,7 @@ module internal Engine =
     let private runStatement (limits: ResultLimits) (state: DbState) (txn: Transaction) =
         function
         | Statement.Select stmt -> runSelect limits state txn stmt
+        | Statement.Explain stmt -> runExplain state txn stmt
         | Statement.Insert stmt -> runInsert stmt |> runDml state txn
         | Statement.Update stmt -> runUpdate stmt |> runDml state txn
         | Statement.Delete stmt -> runDelete stmt |> runDml state txn
@@ -631,7 +651,8 @@ module internal Engine =
 
             let isReadOnly =
                 match stmt with
-                | Statement.Select _ -> true
+                | Statement.Select _
+                | Statement.Explain _ -> true
                 | _ -> false
 
             let run () =

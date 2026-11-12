@@ -2425,6 +2425,105 @@ let ``SqlReference: 派生テーブル（FROM / JOIN）`` () =
         expectErrorKind ErrorKind.NameError "派生テーブルの自己参照" (execSql db4 "SELECT * FROM (SELECT * FROM x) x"))
 
 [<Fact>]
+let ``SqlReference: EXPLAIN は実行せずに計画を返す`` () =
+    withDb "explain" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+        let db3 = exec db2 "CREATE INDEX ix ON t (v)"
+
+        let planOf sql =
+            let _, r = ok (execSql db3 sql)
+            Assert.Equal<string list>([ "plan" ], r.Columns |> Array.toList)
+            r.Rows |> Array.map (fun row -> asText row.[0]) |> Array.toList
+
+        // 主キー等値 → PkLookup
+        Assert.Equal<string list>(
+            [ "Project(*)"; "  Filter((t.id = 2))"; "    Scan(t, PkLookup(2))" ],
+            planOf "EXPLAIN SELECT * FROM t WHERE id = 2"
+        )
+
+        // 索引の等値 → IndexLookup（述語は再検査のため残る）
+        Assert.Equal<string list>(
+            [
+                "Project(t.id)"
+                "  Filter((t.v = 'a'))"
+                "    Scan(t, IndexLookup(ix, 'a'))"
+            ],
+            planOf "EXPLAIN SELECT id FROM t WHERE v = 'a'"
+        )
+
+        // 前方一致 → IndexRangeScan
+        Assert.Equal<string list>(
+            [
+                "Project(*)"
+                "  Filter((t.v LIKE 'a%'))"
+                "    Scan(t, IndexRangeScan(ix, 'a'..'b'))"
+            ],
+            planOf "EXPLAIN SELECT * FROM t WHERE v LIKE 'a%'"
+        )
+
+        // 集約・DISTINCT・ORDER BY / LIMIT の適用順
+        Assert.Equal<string list>(
+            [
+                "Project(t.v, COUNT(*))"
+                "  Aggregate(group by [t.v], aggregates [COUNT(*)])"
+                "    Scan(t, SeqScan)"
+            ],
+            planOf "EXPLAIN SELECT v, COUNT(*) FROM t GROUP BY v"
+        )
+
+        Assert.Equal<string list>(
+            [ "Distinct"; "  Project(t.v)"; "    Scan(t, SeqScan)" ],
+            planOf "EXPLAIN SELECT DISTINCT v FROM t"
+        )
+
+        Assert.Equal<string list>(
+            [
+                "Limit(offset=0, count=2)"
+                "  Project(t.id)"
+                "    Sort(t.id DESC)"
+                "      Scan(t, SeqScan)"
+            ],
+            planOf "EXPLAIN SELECT id FROM t ORDER BY id DESC LIMIT 2"
+        )
+
+        // 主キーの範囲 → RangeScan
+        Assert.Equal<string list>(
+            [ "Project(*)"; "  Filter((t.id > 1))"; "    Scan(t, RangeScan(1..*))" ],
+            planOf "EXPLAIN SELECT * FROM t WHERE id > 1"
+        )
+
+        // FROM なしと派生テーブル
+        Assert.Equal<string list>([ "Project(1)"; "  Values" ], planOf "EXPLAIN SELECT 1")
+
+        Assert.Equal<string list>(
+            [
+                "Project(x.id)"
+                "  Derived"
+                "    Project(t.id)"
+                "      Filter((t.id = 1))"
+                "        Scan(t, PkLookup(1))"
+            ],
+            planOf "EXPLAIN SELECT x.id FROM (SELECT id FROM t WHERE id = 1) AS x"
+        )
+
+        // 派生テーブル内の結合も、内側の文脈でアルゴリズムが決まる
+        Assert.Equal<string list>(
+            [
+                "Project(x.id)"
+                "  Derived"
+                "    Project(a.id)"
+                "      Join(INNER, MergeJoin, right=b, on=(a.id = b.id))"
+                "        Scan(a, SeqScan)"
+                "        Scan(b, SeqScan)"
+            ],
+            planOf "EXPLAIN SELECT x.id FROM (SELECT a.id FROM t AS a JOIN t AS b ON a.id = b.id) AS x"
+        )
+
+        // EXPLAIN は SELECT だけ
+        expectErrorKind ErrorKind.SyntaxError "EXPLAIN は SELECT のみ" (execSql db3 "EXPLAIN DELETE FROM t"))
+
+[<Fact>]
 let ``SqlReference: 未対応の構文は明示的な SyntaxError`` () =
     // §14「構文が未対応のもの」。集合演算と RIGHT / FULL JOIN は ParserTests が担当。
     withDb "unsupported-syntax" (fun db0 ->
@@ -2442,7 +2541,6 @@ let ``SqlReference: 未対応の構文は明示的な SyntaxError`` () =
         // DDL / 実行計画
         expectErrorKind ErrorKind.SyntaxError "ALTER TABLE" (execSql db2 "ALTER TABLE t ADD COLUMN z INTEGER")
         expectErrorKind ErrorKind.SyntaxError "TRUNCATE" (execSql db2 "TRUNCATE TABLE t")
-        expectErrorKind ErrorKind.SyntaxError "EXPLAIN" (execSql db2 "EXPLAIN SELECT * FROM t")
 
         // DML の未対応形
         expectErrorKind ErrorKind.SyntaxError "INSERT ... SELECT" (execSql db2 "INSERT INTO t SELECT 2, 'c'")

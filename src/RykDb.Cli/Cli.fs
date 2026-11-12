@@ -54,8 +54,30 @@ let piecesOf (input: string) =
 
 let private splitStatements = piecesOf >> Array.toList
 
+/// EXPLAIN の結果か（単一の TEXT 列 `plan`）。
+/// 計画行は人間向けのテキストなので、TEXT の引用符を付けずに表示する。
+let private isPlanResult (r: StatementResult) =
+    r.Columns.Length = 1
+    && r.Columns.[0] = "plan"
+    && r.Rows
+       |> Array.forall (fun row ->
+           row.Length = 1
+           && match row.[0] with
+              | SqlValue.Text _ -> true
+              | _ -> false)
+
 let private writeResult (out: TextWriter) (r: StatementResult) =
-    r.ToDisplayLines() |> List.iter out.WriteLine
+    if isPlanResult r then
+        let header = r.Columns.[0]
+        out.WriteLine header
+        out.WriteLine(System.String('-', header.Length))
+
+        for row in r.Rows do
+            match row.[0] with
+            | SqlValue.Text line -> out.WriteLine("  " + line)
+            | other -> out.WriteLine("  " + SqlLiteral.toSqlLiteral other)
+    else
+        r.ToDisplayLines() |> List.iter out.WriteLine
 
 /// `RowReader` を materialize せずに表示する。
 /// `StatementResult.ToDisplayLines()` と同じ形式（ヘッダ・区切り・2スペース字下げ）にする。

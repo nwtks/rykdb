@@ -735,30 +735,121 @@ module internal Optimizer =
         | EvalNode of Logical * Schema * int option
         | ApplyOp of Op
 
+    /// テーブルスキーマの既定値（未登録なら空）。
+    let private defaultSchema (ctx: ExecContext) (name: string) =
+        match ExecContext.schemaOf name ctx with
+        | Ok s -> s
+        | Error _ ->
+            {
+                Name = name
+                Columns = []
+                PrimaryKey = []
+                Indexes = []
+            }
+
+    let private tableOf (ctx: ExecContext) (name: string) =
+        match ExecContext.schemaOf name ctx with
+        | Ok s -> Some s
+        | Error _ -> None
+
+    /// 実行に影響しないラッパを剥がす。
+    [<TailCall>]
+    let rec private stripWrappers =
+        function
+        | Logical.Sort(_, child) -> stripWrappers child
+        | Logical.Limit(_, _, child) -> stripWrappers child
+        | Logical.Distinct child -> stripWrappers child
+        | Logical.Having(_, _, _, child) -> stripWrappers child
+        | Logical.Filter(_, child) -> stripWrappers child
+        | Logical.Project(_, child) -> stripWrappers child
+        | other -> other
+
+    let private rightSchemaOf (ctx: ExecContext) (name: string) (right: Logical) =
+        match stripWrappers right with
+        | Logical.Derived plan -> plan.Output
+        | _ -> Schema.ofTable name None (defaultSchema ctx name)
+
+    /// 左スパインを降りて、下端のノードと右側のスキーマを集める。
+    [<TailCall>]
+    let rec private spine (ctx: ExecContext) (acc: Schema list) (tree: Logical) =
+        match stripWrappers tree with
+        | Logical.Join(_, name, _, left, right) -> spine ctx (rightSchemaOf ctx name right :: acc) left
+        | other -> other, acc
+
+    let private aggregateSchema (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
+        let column name =
+            {
+                Name = name
+                Qualifier = None
+                DataType = None
+            }
+
+        let groupColumns = groupBy |> List.map (Expr.toDisplayString >> column)
+
+        let aggColumns =
+            aggs
+            |> List.map (fun (f, star, _, arg) ->
+                let suffix = if star then "*" else Expr.toDisplayString arg
+                column (sprintf "%s(%s)" f.Name suffix))
+
+        { Schema.empty with
+            Columns = Array.append (List.toArray groupColumns) (List.toArray aggColumns)
+        }
+
+    let private outputOf (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
+        let leaf, rights = spine ctx [] tree
+
+        let baseSchema =
+            match leaf with
+            | Logical.Aggregate(groupBy, aggs, _) -> aggregateSchema groupBy aggs
+            | Logical.Derived plan -> plan.Output
+            | Logical.Scan(name, _) -> Schema.ofTable name None (defaultSchema ctx name)
+            | Logical.Values _ -> Schema.empty
+            | _ -> inSchema
+
+        List.fold Schema.concat baseSchema rights
+
+    let private groupByOf (tree: Logical) =
+        match stripWrappers tree with
+        | Logical.Aggregate(groupBy, _, _) -> groupBy
+        | _ -> []
+
     /// 論理木を 1ノードずつ処理する。
     /// 継続は ExecFrame list に積むので、ラッパの深さに依存せずスタックは一定。
     [<TailCall>]
     let rec private run (ctx: ExecContext) (frames: ExecFrame list) (step: ExecStep) =
-        let defaultSchema ctx name =
-            match ExecContext.schemaOf name ctx with
-            | Ok s -> s
-            | Error _ ->
+        let buildJoinFrame inSchema kind name on left right =
+            let leftSchema = outputOf ctx inSchema left
+
+            let rightSchema, rightTable =
+                match stripWrappers right with
+                | Logical.Derived plan -> plan.Output, None
+                | _ ->
+                    let table = defaultSchema ctx name
+                    Schema.ofTable name None table, Some table
+
+            let algorithm, keys, leftKeyIndices =
+                Analyzer.chooseJoinAlgorithm (tableOf ctx) leftSchema rightSchema rightTable left right on
+
+            let frame: JoinFrame =
                 {
-                    Name = name
-                    Columns = []
-                    PrimaryKey = []
-                    Indexes = []
+                    Kind = kind
+                    Right = right
+                    On = on
+                    LeftSchema = leftSchema
+                    RightSchema = rightSchema
+                    RightName = name
+                    Algorithm = algorithm
+                    Keys = keys
+                    LeftKeyIndices = defaultArg leftKeyIndices [||]
                 }
 
-        let tableOf name =
-            match ExecContext.schemaOf name ctx with
-            | Ok s -> Some s
-            | Error _ -> None
+            frame, leftSchema
 
-        let execScan ctx hint name method =
-            match hint with
+        let execScan ctx name method =
+            function
             | Some 0 -> ret Op.empty
-            | _ ->
+            | hint ->
                 let limit = defaultArg hint 0
 
                 match method with
@@ -769,71 +860,45 @@ module internal Optimizer =
                 | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
                     ExecContext.byIndexRange ctx name indexName lower upper limit
 
-        let rec stripWrappers =
-            function
-            | Logical.Sort(_, child) -> stripWrappers child
-            | Logical.Limit(_, _, child) -> stripWrappers child
-            | Logical.Distinct child -> stripWrappers child
-            | Logical.Having(_, _, _, child) -> stripWrappers child
-            | Logical.Filter(_, child) -> stripWrappers child
-            | Logical.Project(_, child) -> stripWrappers child
-            | other -> other
-
-        let rightSchemaOf name right =
-            match stripWrappers right with
-            | Logical.Derived plan -> plan.Output
-            | _ -> Schema.ofTable name None (defaultSchema ctx name)
-
-        let rec spine acc t =
-            match stripWrappers t with
-            | Logical.Join(_, name, _, left, right) -> spine (rightSchemaOf name right :: acc) left
-            | other -> other, acc
-
-        let aggregateSchema groupBy (aggs: (AggFunc * bool * bool * Expr) list) =
-            let column name =
-                {
-                    Name = name
-                    Qualifier = None
-                    DataType = None
-                }
-
-            let groupColumns = groupBy |> List.map (Expr.toDisplayString >> column)
-
-            let aggColumns =
-                aggs
-                |> List.map (fun (f, star, _, arg) ->
-                    let suffix = if star then "*" else Expr.toDisplayString arg
-                    column (sprintf "%s(%s)" f.Name suffix))
-
-            { Schema.empty with
-                Columns = Array.append (List.toArray groupColumns) (List.toArray aggColumns)
-            }
-
-        let outputOf inSchema tree =
-            let leaf, rights = spine [] tree
-
-            let baseSchema =
-                match leaf with
-                | Logical.Aggregate(groupBy, aggs, _) -> aggregateSchema groupBy aggs
-                | Logical.Derived plan -> plan.Output
-                | Logical.Scan(name, _) -> Schema.ofTable name None (defaultSchema ctx name)
-                | Logical.Values _ -> Schema.empty
-                | _ -> inSchema
-
-            List.fold Schema.concat baseSchema rights
-
-        let groupByOf tree =
-            match stripWrappers tree with
-            | Logical.Aggregate(groupBy, _, _) -> groupBy
-            | _ -> []
-
         let addClamp a b =
             if a > System.Int32.MaxValue - b then
                 System.Int32.MaxValue
             else
                 a + b
 
-        let execJoin left right frame =
+        let childLimitHint offset count hint =
+            if count = 0 then
+                Some 0
+            else
+                match count with
+                | c when c >= 0 ->
+                    let inner = addClamp offset c
+
+                    Some(
+                        match hint with
+                        | Some h -> min h inner
+                        | None -> inner
+                    )
+                | _ -> hint |> Option.map (fun h -> addClamp offset h)
+
+        let execIndexJoin frame left =
+            let keys = frame.Keys.Value
+
+            let indexName =
+                match frame.Algorithm with
+                | JoinAlgorithm.IndexNestedLoop indexName -> indexName
+                | _ -> ""
+
+            let lookup keyValues =
+                ExecContext.byIndex ctx frame.RightName indexName keyValues 0
+
+            match frame.Kind with
+            | JoinKind.Inner ->
+                Ops.innerJoinIndexed frame.LeftSchema left frame.LeftKeyIndices frame.RightSchema lookup keys.Residual
+            | JoinKind.Left ->
+                Ops.leftJoinIndexed frame.LeftSchema left frame.LeftKeyIndices frame.RightSchema lookup keys.Residual
+
+        let execJoin frame left right =
             match frame.Algorithm with
             | JoinAlgorithm.NestedLoop ->
                 match frame.Kind with
@@ -890,32 +955,9 @@ module internal Optimizer =
         | EvalNode(node, inSchema, hint) ->
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
-                let leftSchema = outputOf inSchema lTree
+                let frame, leftSchema = buildJoinFrame inSchema kind name on lTree rTree
 
-                let rightSchema, rightTable =
-                    match stripWrappers rTree with
-                    | Logical.Derived plan -> plan.Output, None
-                    | _ ->
-                        let table = defaultSchema ctx name
-                        Schema.ofTable name None table, Some table
-
-                let algorithm, keys, leftKeyIndices =
-                    Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema rightTable lTree rTree on
-
-                let frame =
-                    {
-                        Kind = kind
-                        Right = rTree
-                        On = on
-                        LeftSchema = leftSchema
-                        RightSchema = rightSchema
-                        RightName = name
-                        Algorithm = algorithm
-                        Keys = keys
-                        LeftKeyIndices = defaultArg leftKeyIndices [||]
-                    }
-
-                match algorithm with
+                match frame.Algorithm with
                 | JoinAlgorithm.IndexNestedLoop _ ->
                     run ctx (JoinIndexLeftFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
                 | _ -> run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
@@ -923,40 +965,26 @@ module internal Optimizer =
             | Logical.Derived plan ->
                 run plan.Context (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None))
             | Logical.Scan(name, method) ->
-                match execScan ctx hint name method with
+                match execScan ctx name method hint with
                 | Error e -> err e
                 | Ok op -> run ctx frames (ApplyOp op)
             | Logical.Filter(p, child) ->
-                let childSchema = outputOf inSchema child
+                let childSchema = outputOf ctx inSchema child
                 run ctx (FilterFrame(p, childSchema) :: frames) (EvalNode(child, inSchema, None))
             | Logical.Aggregate(groupBy, aggs, child) ->
-                let childSchema = outputOf inSchema child
+                let childSchema = outputOf ctx inSchema child
                 run ctx (AggregateFrame(groupBy, aggs, childSchema) :: frames) (EvalNode(child, inSchema, None))
             | Logical.Having(h, aggs, groupBy, child) ->
                 run ctx (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema, None))
             | Logical.Distinct child -> run ctx (DistinctFrame :: frames) (EvalNode(child, inSchema, None))
             | Logical.Sort(keys, child) ->
-                let childSchema = outputOf inSchema child
+                let childSchema = outputOf ctx inSchema child
                 run ctx (SortFrame(keys, childSchema) :: frames) (EvalNode(child, inSchema, None))
             | Logical.Limit(offset, limit, child) ->
-                let childHint =
-                    if limit = 0 then
-                        Some 0
-                    else
-                        match limit with
-                        | l when l >= 0 ->
-                            let inner = addClamp offset l
-
-                            Some(
-                                match hint with
-                                | Some h -> min h inner
-                                | None -> inner
-                            )
-                        | _ -> hint |> Option.map (fun h -> addClamp offset h)
-
+                let childHint = childLimitHint offset limit hint
                 run ctx (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema, childHint))
             | Logical.Project(items, child) ->
-                let childSchema = outputOf inSchema child
+                let childSchema = outputOf ctx inSchema child
                 let groupBy = groupByOf child
                 run ctx (ProjectFrame(items, childSchema, groupBy) :: frames) (EvalNode(child, inSchema, hint))
         | ApplyOp op ->
@@ -984,41 +1012,11 @@ module internal Optimizer =
                     run ctx rest (ApplyOp limited)
                 | ProjectFrame(items, childSchema, groupBy) ->
                     run ctx rest (ApplyOp(Ops.project childSchema groupBy items op))
-                | JoinIndexLeftFrame frame ->
-                    let keys = frame.Keys.Value
-
-                    let indexName =
-                        match frame.Algorithm with
-                        | JoinAlgorithm.IndexNestedLoop indexName -> indexName
-                        | _ -> ""
-
-                    let lookup keyValues =
-                        ExecContext.byIndex ctx frame.RightName indexName keyValues 0
-
-                    let joined =
-                        match frame.Kind with
-                        | JoinKind.Inner ->
-                            Ops.innerJoinIndexed
-                                frame.LeftSchema
-                                op
-                                frame.LeftKeyIndices
-                                frame.RightSchema
-                                lookup
-                                keys.Residual
-                        | JoinKind.Left ->
-                            Ops.leftJoinIndexed
-                                frame.LeftSchema
-                                op
-                                frame.LeftKeyIndices
-                                frame.RightSchema
-                                lookup
-                                keys.Residual
-
-                    run ctx rest (ApplyOp joined)
+                | JoinIndexLeftFrame frame -> run ctx rest (ApplyOp(execIndexJoin frame op))
                 | JoinRightFrame frame ->
                     run ctx (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
                 | JoinApplyFrame(frame, leftOp) ->
-                    match execJoin leftOp op frame with
+                    match execJoin frame leftOp op with
                     | Error e -> err e
                     | Ok joined -> run ctx rest (ApplyOp joined)
 
@@ -1035,6 +1033,157 @@ module internal Optimizer =
     /// </remarks>
     let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
         run ctx [] (EvalNode(tree, schema, None))
+
+    /// EXPLAIN の作業項目。
+    type private ExplainItem =
+        {
+            Indent: int
+            Tree: Logical
+            Schema: Schema
+            /// このノードを実行するときの文脈
+            /// （派生テーブルの内側は別の文脈を持つ）。
+            Context: ExecContext
+        }
+
+    /// 論理木を EXPLAIN 用の行にする（実行しない）。
+    /// `exec` と同じ規則で走査方法・結合アルゴリズムを選び、木を深さ優先で並べる。
+    let explain (ctx: ExecContext) (tree: Logical) (schema: Schema) =
+        let childItem indent tree schema context =
+            {
+                Indent = indent
+                Tree = tree
+                Schema = schema
+                Context = context
+            }
+
+        let childOf item tree schema =
+            childItem (item.Indent + 1) tree schema item.Context
+
+        let valueText = SqlLiteral.toSqlLiteral
+
+        let valuesText = Array.map valueText >> String.concat ", "
+
+        let itemText item =
+            let expression = Expr.toDisplayString item.Expression
+
+            match item.Alias with
+            | Some alias -> sprintf "%s AS %s" expression alias
+            | None -> expression
+
+        let rangeText lower upper =
+            let upper = upper |> Option.map valuesText |> Option.defaultValue "*"
+            sprintf "%s..%s" (valuesText lower) upper
+
+        let scanText name =
+            function
+            | ScanMethod.SeqScan -> sprintf "%s, SeqScan" name
+            | ScanMethod.PkLookup values -> sprintf "%s, PkLookup(%s)" name (valuesText values)
+            | ScanMethod.IndexLookup(index, values) -> sprintf "%s, IndexLookup(%s, %s)" name index (valuesText values)
+            | ScanMethod.RangeScan(_, lower, upper) -> sprintf "%s, RangeScan(%s)" name (rangeText lower upper)
+            | ScanMethod.IndexRangeScan(index, lower, upper) ->
+                sprintf "%s, IndexRangeScan(%s, %s)" name index (rangeText lower upper)
+
+        let algorithmText =
+            function
+            | JoinAlgorithm.NestedLoop -> "NestedLoop"
+            | JoinAlgorithm.HashJoin -> "HashJoin"
+            | JoinAlgorithm.MergeJoin -> "MergeJoin"
+            | JoinAlgorithm.IndexNestedLoop index -> sprintf "IndexNestedLoop(%s)" index
+
+        let joinKindText =
+            function
+            | JoinKind.Inner -> "INNER"
+            | JoinKind.Left -> "LEFT"
+
+        let aggText (f: AggFunc, star, distinct, arg) =
+            let body = if star then "*" else Expr.toDisplayString arg
+            sprintf "%s(%s%s)" f.Name (if distinct then "DISTINCT " else "") body
+
+        let sortText k =
+            let direction =
+                match k.Direction with
+                | SortDirection.Ascending -> "ASC"
+                | SortDirection.Descending -> "DESC"
+
+            sprintf "%s %s" (Expr.toDisplayString k.Expression) direction
+
+        let describe item =
+            match item.Tree with
+            | Logical.Scan(name, method) -> sprintf "Scan(%s)" (scanText name method), []
+            | Logical.Values values ->
+                if Array.isEmpty values then
+                    "Values", []
+                else
+                    sprintf "Values(%s)" (valuesText values), []
+            | Logical.Filter(predicate, child) ->
+                sprintf "Filter(%s)" (Expr.toDisplayString predicate), [ childOf item child item.Schema ]
+            | Logical.Project(items, child) ->
+                let text = items |> List.map itemText |> String.concat ", "
+                sprintf "Project(%s)" text, [ childOf item child item.Schema ]
+            | Logical.Join(kind, name, on, left, right) ->
+                let leftSchema = outputOf item.Context item.Schema left
+
+                let rightSchema, rightTable =
+                    match stripWrappers right with
+                    | Logical.Derived plan -> plan.Output, None
+                    | _ ->
+                        let table = defaultSchema item.Context name
+                        Schema.ofTable name None table, Some table
+
+                let algorithm, _, _ =
+                    Analyzer.chooseJoinAlgorithm (tableOf item.Context) leftSchema rightSchema rightTable left right on
+
+                let text =
+                    sprintf
+                        "Join(%s, %s, right=%s, on=%s)"
+                        (joinKindText kind)
+                        (algorithmText algorithm)
+                        name
+                        (Expr.toDisplayString on)
+
+                text, [ childOf item left leftSchema; childOf item right rightSchema ]
+            | Logical.Aggregate(groupBy, aggs, child) ->
+                let text =
+                    sprintf
+                        "Aggregate(group by [%s], aggregates [%s])"
+                        (groupBy |> List.map Expr.toDisplayString |> String.concat ", ")
+                        (aggs |> List.map aggText |> String.concat ", ")
+
+                text, [ childOf item child item.Schema ]
+            | Logical.Having(predicate, _, _, child) ->
+                sprintf "Having(%s)" (Expr.toDisplayString predicate), [ childOf item child item.Schema ]
+            | Logical.Distinct child -> "Distinct", [ childOf item child item.Schema ]
+            | Logical.Sort(keys, child) ->
+                let text = keys |> List.map sortText |> String.concat ", "
+                sprintf "Sort(%s)" text, [ childOf item child item.Schema ]
+            | Logical.Limit(offset, limit, child) ->
+                let text =
+                    if limit >= 0 then
+                        sprintf "Limit(offset=%d, count=%d)" offset limit
+                    else
+                        sprintf "Limit(offset=%d)" offset
+
+                text, [ childOf item child item.Schema ]
+            | Logical.Derived plan -> "Derived", [ childItem (item.Indent + 1) plan.Tree plan.Input plan.Context ]
+
+        let rec emit acc =
+            function
+            | [] -> List.rev acc
+            | item :: rest ->
+                let text, children = describe item
+                let line = String.replicate item.Indent "  " + text
+                emit (line :: acc) (children @ rest)
+
+        emit
+            []
+            [
+                {
+                    Indent = 0
+                    Tree = tree
+                    Schema = schema
+                    Context = ctx
+                }
+            ]
 
 module internal Plan =
     /// IN サブクエリの結果を保持する上限（管理メモリの概算バイト）。
@@ -1655,3 +1804,9 @@ module internal Plan =
     /// 行の配列化は呼び出し側（Engine）で行う。
     let runSelect =
         planSelectC (fun (schema, op) -> ret (schema.Columns |> Array.map (fun c -> c.Name), op))
+
+    /// EXPLAIN 用に SELECT の論理計画だけを組み立てる（実行はしない）。
+    /// サブクエリは計画時に解決するため、実際に評価されるものがある
+    /// （通常の SELECT と同じ計画経路を通る）。
+    let explainSelect (ctx: ExecContext) (stmt: SelectStatement) =
+        planCoreCWith runSubquery [] ret ctx stmt

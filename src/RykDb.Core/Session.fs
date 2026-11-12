@@ -623,7 +623,8 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// SELECT だけのバッチか。
     let isReadOnlyBatch =
         List.forall (function
-            | Statement.Select _ -> true
+            | Statement.Select _
+            | Statement.Explain _ -> true
             | _ -> false)
 
     /// 単一文または複数文を実行し、transaction の遷移も返す。

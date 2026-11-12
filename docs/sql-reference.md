@@ -29,7 +29,9 @@ RykDb が受け付ける SQL 文法の一覧。
 ## 1. 文の一覧
 
 ```ebnf
-statement      ::= select | insert | update | delete | ddl | txn
+statement      ::= select | explain | insert | update | delete | ddl | txn
+
+explain        ::= EXPLAIN select
 
 select         ::= SELECT [DISTINCT] select_item {"," select_item}
                    [ FROM table_ref { join_clause } ]
@@ -65,6 +67,8 @@ txn            ::= BEGIN [TRANSACTION] | START TRANSACTION
 
 > **注意** `BEGIN` / `COMMIT` / `ROLLBACK` は SQL 文として transaction を制御する（§12）。
 > 詳しくは [12. トランザクション](#12-トランザクション)。
+>
+> `EXPLAIN` は `SELECT` だけに書ける（実行計画の表示。§7.11）。
 
 文を複数書く場合は `;` で区切る（**区切りなしは `SyntaxError`**。末尾の `;` は省略可）。
 `Session.Execute` は複数文を順に実行する。
@@ -819,6 +823,53 @@ FROM t JOIN (SELECT id, w FROM u) AS d ON d.id = t.id;
 
 ---
 
+### 7.11 EXPLAIN
+
+```sql
+EXPLAIN SELECT ...;
+```
+
+`SELECT` の実行計画を表示する。
+**クエリ本体は実行しない**
+（ただしサブクエリは通常の計画と同じく計画時に評価される。§7.9）。
+
+結果は 1列 `plan` で、木の各ノードが 1行になる。
+深さは 2 スペースで字下げする。
+走査方法・結合アルゴリズムは実際の実行と同じ規則で選ばれる（§7.4 / §7.5）。
+
+```sql
+EXPLAIN SELECT id FROM t WHERE id = 2;
+```
+
+```text
+plan
+----
+Project(t.id)
+  Filter((t.id = 2))
+    Scan(t, PkLookup(2))
+```
+
+ノードの表記:
+
+| ノード                                        | 内容                                                                                                                |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `Scan(表, 走査方法)`                          | `SeqScan` / `PkLookup(値)` / `IndexLookup(索引, 値)` / `RangeScan(下限..上限)` / `IndexRangeScan(索引, 下限..上限)` |
+| `Filter(条件)`                                | 述語。索引・主キーで絞っても再検査として残る                                                                        |
+| `Project(項目)`                               | 射影（`*` は展開前の表記）                                                                                          |
+| `Join(種類, アルゴリズム, right=表, on=条件)` | 種類は `INNER` / `LEFT`、アルゴリズムは `NestedLoop` / `HashJoin` / `MergeJoin` / `IndexNestedLoop(索引)`           |
+| `Aggregate(group by [...], aggregates [...])` | 集約                                                                                                                |
+| `Having(条件)`                                | 集約後の述語                                                                                                        |
+| `Distinct`                                    | 重複除去                                                                                                            |
+| `Sort(式 ASC, ...)`                           | 並び替え                                                                                                            |
+| `Limit(offset=N, count=M)`                    | `count` は無制限なら省略                                                                                            |
+| `Values`                                      | `FROM` なしの入力（1行 0列）                                                                                        |
+| `Derived`                                     | 派生テーブル。内側の計画を子に持つ                                                                                  |
+
+`EXPLAIN` は `SELECT` だけを受け付ける
+（それ以外は `SyntaxError`）。
+
+---
+
 ## 8. INSERT
 
 ```sql
@@ -1253,7 +1304,6 @@ db> .rollback
   読み取り専用トランザクション（分離レベルは Snapshot Isolation 固定）
 - `ALTER TABLE`（列の追加・削除・型変更）
 - `TRUNCATE`
-- `EXPLAIN`
 - `RETURNING`
 - `CREATE TABLE ... DEFAULT (SELECT ...)`（構文は受理されるが INSERT 時に `SyntaxError`。§7.9）
 - ユーザ定義関数・トリガー・ビュー・ストアドプロシージャ
