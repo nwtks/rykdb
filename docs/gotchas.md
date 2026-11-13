@@ -1074,6 +1074,19 @@ SDK を上げたら `dotnet build tools/TailAudit/TailAudit.fsproj -t:Rebuild` �
 （TailAudit は `RykDb.slnx` に含まれないので、`dotnet build -t:Rebuild` では検出できない）。
 CI の失敗が `tools/TailAudit/Program.fs` の FCS 型エラーなら、まずログの `dotnet --version` を見る。
 
+### 9.8 ソース検査テストは「一度は落ちること」を確かめる
+
+禁止を検査するテストは、違反が 0件だと**常に緑**になる。
+正しく動いていない（条件が噛み合っていない）ことも分からない、**空振りのガード**である。
+
+- ✅ 設計時に一度、禁止に該当するコードを紛れ込ませて**必ず落ちる**ことを確認する
+  （INV-12 の `Cursor: レコード更新は Serialization.fs の中だけ` は、
+  `Sstable.fs` を一時的に `{ c with Pos = ... }` へ戻して失敗を確認してから校正した）。
+- ✅ 許可リストには**理由**をコメントに残す
+  （例: `Serialization.fs` は Cursor の所有者、`Parser.fs` の `{ st with Pos` は `PState` という別レコード）。
+- ✅ 検査対象は `src/` のみにする。
+  テストは防衛チェック用に不正値を直接作ることがある。
+
 ---
 
 ## 10. デバッグ手法

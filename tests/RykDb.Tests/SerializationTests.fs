@@ -9,6 +9,27 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
+/// 不変条件 `0 <= Pos <= End <= Data.Length` の検査。
+/// <remarks>
+/// 本番経路では呼ばない。テストで各操作の後に呼ぶ。
+/// `create` / `createSlice` が構築時にこれを満たし、
+/// 各読み取りが `Pos < End` を確認してから進むので帰納的に保たれる。
+/// </remarks>
+let private validate (c: Cursor) =
+    if c.Pos < 0 then
+        sprintf "Cursor: Pos が負です（Pos=%d）" c.Pos |> DbError.internalError |> err
+    elif c.End < c.Pos then
+        sprintf "Cursor: End が Pos より小さい（Pos=%d End=%d）" c.Pos c.End
+        |> DbError.internalError
+        |> err
+    elif c.End > c.Data.Length then
+        sprintf "Cursor: End が配列長を超える（End=%d / %d バイト）" c.End c.Data.Length
+        |> DbError.internalError
+        |> err
+    else
+        ret ()
+
+
 [<Fact>]
 let ``Writer: writeByte / readByte の往復`` () =
     let w = Writer.Empty |> Writer.writeByte 42uy |> Writer.toArray
@@ -87,13 +108,72 @@ let ``Writer: build はステップを左から適用する`` () =
     Assert.Equal<byte array>([| 1uy; 2uy |], w)
 
 [<Fact>]
+let ``Writer: 多数のチャンクを積んでも書き込み順に並ぶ`` () =
+    // `Chunks` は逆順に積まれる。`toArray` の末尾からの埋め戻しが崩れると
+    // バイト列が反転・混在するので、チャンク種を混ぜて順序を固定する。
+    let steps =
+        [
+            for i in 0..63 ->
+                match i % 4 with
+                | 0 -> Writer.writeByte (byte i)
+                | 1 -> Writer.varint (uint64 i) // 0..63 は 1 バイト
+                | 2 -> Writer.uint32LE (uint32 i)
+                | _ -> Writer.writeBytes [| byte i; byte (i + 1) |]
+        ]
+
+    let expected =
+        [
+            for i in 0..63 ->
+                match i % 4 with
+                | 0 -> [| byte i |]
+                | 1 -> [| byte i |]
+                | 2 -> [| byte i; 0uy; 0uy; 0uy |] // リトルエンディアンは下位バイトが先頭
+                | _ -> [| byte i; byte (i + 1) |]
+        ]
+        |> Array.concat
+
+    Assert.Equal<byte array>(expected, Writer.build steps)
+
+[<Fact>]
+let ``Writer: レコード構築は Serialization.fs の中だけ`` () =
+    // `Chunks` は逆順で保持する規約。外でレコードを組むと順序が反転して静かに壊れる。
+    // `clearKeyspaceChunks` / `checksumChunks` のような名前と衝突しないよう `Chunks =` で見る。
+    let sourceDir =
+        System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "..", "..", "src", "RykDb.Core"))
+
+    let offenders =
+        System.IO.Directory.GetFiles(sourceDir, "*.fs")
+        |> Array.filter (fun path -> System.IO.Path.GetFileName path <> "Serialization.fs")
+        |> Array.collect (fun path ->
+            System.IO.File.ReadAllLines path
+            |> Array.indexed
+            |> Array.choose (fun (i, line) ->
+                let code =
+                    match line.IndexOf "//" with
+                    | -1 -> line
+                    | c -> line.Substring(0, c)
+
+                if code.Contains "Chunks =" then
+                    Some(sprintf "%s:%d: %s" (System.IO.Path.GetFileName path) (i + 1) (line.Trim()))
+                else
+                    None))
+
+    Assert.True(
+        Array.isEmpty offenders,
+        "Writer のレコード構築が Serialization.fs の外にあります（Writer.Empty と各 write 関数を使うこと）:\n"
+        + String.concat "\n" offenders
+    )
+
+[<Fact>]
 let ``Cursor: createSlice は範囲を切り出す`` () =
     let data = [| 0uy; 1uy; 2uy; 3uy; 4uy |]
-    let c = Cursor.createSlice data 1 3
+    let c = ok (Cursor.createSlice data 1 3)
+    ok (validate c)
     Assert.Equal(3, Cursor.remaining c)
     let b, c2 = ok (Reader.readByte c)
     Assert.Equal(1uy, b)
     Assert.Equal(2, Cursor.remaining c2)
+    ok (validate c2)
 
 [<Fact>]
 let ``Cursor: atEnd は位置が終端に達したら true`` () =
@@ -101,6 +181,79 @@ let ``Cursor: atEnd は位置が終端に達したら true`` () =
     let _, c2 = ok (Reader.readByte c)
     Assert.True(Cursor.atEnd c2)
     Assert.False(Cursor.atEnd c)
+
+[<Fact>]
+let ``Cursor: createSlice は範囲外を CorruptionError`` () =
+    let data = [| 0uy; 1uy; 2uy |]
+    expectErrorKind ErrorKind.CorruptionError "offset が負" (Cursor.createSlice data -1 2)
+    expectErrorKind ErrorKind.CorruptionError "length が負" (Cursor.createSlice data 0 -1)
+    expectErrorKind ErrorKind.CorruptionError "offset+length が配列長を超える" (Cursor.createSlice data 1 3)
+    expectErrorKind ErrorKind.CorruptionError "offset が配列長を超える" (Cursor.createSlice data 4 0)
+    // 判定は data.Length - length で行うので、巨大な length でもオーバーフローで通らない。
+    expectErrorKind ErrorKind.CorruptionError "巨大な length がオーバーフロー回避できない" (Cursor.createSlice data 0 Int32.MaxValue)
+
+[<Fact>]
+let ``Cursor: create / createSlice / 読み取りは不変条件 0 <= Pos <= End <= Data.Length を保つ`` () =
+    let data = Array.init 64 (fun i -> byte i)
+
+    let assertValid (label: string) (c: Cursor) =
+        match validate c with
+        | Error e -> Assert.Fail(sprintf "%s: %s" label (DbError.toDisplayString e))
+        | Ok() -> ()
+
+    // 読み進めるたびに不変条件が壊れないこと（各読み取りは Pos < End を見てから進む）。
+    let rec drain (label: string) (c: Cursor) =
+        assertValid label c
+
+        if not (Cursor.atEnd c) then
+            match Reader.readByte c with
+            | Error e -> Assert.Fail(sprintf "%s: %s" label (DbError.toDisplayString e))
+            | Ok(_, nxt) -> drain label nxt
+
+    assertValid "create" (Cursor.create data)
+
+    for offset in [ 0; 1; 7; 32; 63; 64 ] do
+        for length in [ 0; 1; 7; 32; 64 ] do
+            if offset + length <= data.Length then
+                let label = sprintf "slice offset=%d length=%d" offset length
+                let c = ok (Cursor.createSlice data offset length)
+                assertValid label c
+                drain label c
+
+[<Fact>]
+let ``Cursor: レコード更新は Serialization.fs の中だけ`` () =
+    // Cursor のレコード更新は `Cursor.advance`（Serialization.fs）だけ。
+    // Parser.fs の `{ st with Pos = ... }` は PState（Tokens / Pos / Depth）なので許可する。
+    // テストは防衛チェック用に不正な Cursor を直接作ることがあるので対象外。
+    let sourceDir =
+        System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "..", "..", "src", "RykDb.Core"))
+
+    let isAllowed (file: string) (code: string) =
+        file = "Serialization.fs" || file = "Parser.fs" && code.Contains "{ st with Pos"
+
+    let offenders =
+        System.IO.Directory.GetFiles(sourceDir, "*.fs")
+        |> Array.collect (fun path ->
+            let file = System.IO.Path.GetFileName path
+
+            System.IO.File.ReadAllLines path
+            |> Array.indexed
+            |> Array.choose (fun (i, line) ->
+                let code =
+                    match line.IndexOf "//" with
+                    | -1 -> line
+                    | c -> line.Substring(0, c)
+
+                if code.Contains "with Pos" && not (isAllowed file code) then
+                    Some(sprintf "%s:%d: %s" file (i + 1) (line.Trim()))
+                else
+                    None))
+
+    Assert.True(
+        Array.isEmpty offenders,
+        "Cursor のレコード更新が許可外のファイルにあります（Cursor.advance を使うこと）:\n"
+        + String.concat "\n" offenders
+    )
 
 [<Fact>]
 let ``Reader: 負のバイト数は CorruptionError`` () =

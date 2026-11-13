@@ -20,6 +20,12 @@ type internal WriterChunk =
 /// 可変バッファではなく「不変のチャンク列」で表現する。
 /// 追加操作は新しい Writer を返すので、途中で失敗しても中途半端な状態は残らない。
 /// 最後に一度だけ配列へ平坦化する。
+/// <remarks>
+/// **`Chunks` は逆順**（先頭が最後に書いたチャンク）で保持する。
+/// `add` が先頭へ積み、`toArray` が出力配列の末尾から埋めるので `List.rev` が不要になる。
+/// 外でレコードを組むと順序が反転して**静かに**壊れるので、
+/// 構築はこのファイルの `Empty` / `add` にだけ閉じる（ソース検査がある）。
+/// </remarks>
 type internal Writer = { Chunks: WriterChunk list }
 
 module internal Writer =
@@ -140,13 +146,33 @@ module internal Cursor =
         }
 
     /// 配列の一部だけを読み取るカーソル。
-    /// 範囲外は読み取り時に CorruptionError になる。
+    /// <remarks>
+    /// **範囲を検証してから作る**。
+    /// 検証せずに作ると `Pos` / `End` が `Data.Length` を超え、
+    /// `Reader.readByte` が `IndexOutOfRangeException` を投げる
+    /// （壊れた SSTable を `CorruptionError` ではなく未処理例外で拒否してしまう）。
+    /// 範囲外は `CorruptionError`。
+    /// 判定は `data.Length - length` で行うので、`length` が巨大でもオーバーフローしない。
+    /// </remarks>
     let createSlice (data: byte array) (offset: int) (length: int) =
-        {
-            Data = data
-            Pos = offset
-            End = offset + length
-        }
+        if offset < 0 || length < 0 || offset > data.Length - length then
+            sprintf "Cursor: スライス範囲が不正です（offset=%d length=%d / 配列 %d バイト）" offset length data.Length
+            |> DbError.corruption
+            |> err
+        else
+            ret
+                {
+                    Data = data
+                    Pos = offset
+                    End = offset + length
+                }
+
+    /// 読み取り位置を進める。
+    /// <remarks>
+    /// 範囲の検証は呼び出し側（`Pos < End` の確認）が行う。
+    /// **Cursor のレコード更新はこの関数と `Serialization.fs` の中にだけ置く**。
+    /// </remarks>
+    let advance (n: int) (c: Cursor) = { c with Pos = c.Pos + n }
 
     let inline remaining (c: Cursor) = c.End - c.Pos
     let inline atEnd (c: Cursor) = c.Pos >= c.End

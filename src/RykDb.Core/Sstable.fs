@@ -63,7 +63,7 @@ module internal SstEntry =
             else
                 let b = c.Data.[c.Pos]
                 let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
-                let next = { c with Pos = c.Pos + 1 }
+                let next = Cursor.advance 1 c
 
                 if b &&& 0x80uy <> 0uy then
                     loop (shift + 7) acc next
@@ -80,7 +80,7 @@ module internal SstEntry =
                 err (DbError.corruption "Sstable: 値タグがありません")
             else
                 let tag = c.Data.[c.Pos]
-                ret (seqNo, tag, { c with Pos = c.Pos + 1 })
+                ret (seqNo, tag, Cursor.advance 1 c)
 
     let private decodePayload (seqNo: uint64) (tag: byte) (c: Cursor) =
         result {
@@ -107,14 +107,16 @@ module internal SstEntry =
         then
             err (DbError.corruption "Sstable: 値の範囲が不正です")
         else
-            let payload = Cursor.createSlice c.Data c.Pos length
-            let next = { c with Pos = c.Pos + length }
+            let next = Cursor.advance length c
 
-            match decodeHeader payload with
+            match Cursor.createSlice c.Data c.Pos length with
             | Error e -> err e
-            | Ok(seqNo, tag, c) ->
-                decodePayload seqNo tag c
-                |> Result.map (fun (seqNo, value) -> seqNo, value, next)
+            | Ok payload ->
+                match decodeHeader payload with
+                | Error e -> err e
+                | Ok(seqNo, tag, c) ->
+                    decodePayload seqNo tag c
+                    |> Result.map (fun (seqNo, value) -> seqNo, value, next)
 
     /// 値部分を復元する。
     /// キーは呼び出し側が付ける。
@@ -1116,7 +1118,9 @@ module internal Sstable =
             if Hashing.checksumRange data payloadStart payloadLen <> stored then
                 err (DbError.corruption "Sstable: ブロックのチェックサム不一致")
             else
-                readItems decodeEntry (Cursor.createSlice data payloadStart payloadLen) [||]
+                match Cursor.createSlice data payloadStart payloadLen with
+                | Error e -> err e
+                | Ok payload -> readItems decodeEntry payload [||]
 
     /// 部分読みした reader から startKey 以降を遅延生成する。
     /// ブロックは最大 8個まとめて 1回の open で読み、解析は必要になったときだけ行う。
@@ -1281,9 +1285,9 @@ module internal Sstable =
                                         then
                                             err (DbError.corruption "Sstable: 値長が不正です")
                                         else
-                                            match
-                                                Reader.readVarint (Cursor.createSlice data valueOffset valueLength)
-                                            with
+                                            let slice = Cursor.createSlice data valueOffset valueLength
+
+                                            match slice >>= Reader.readVarint with
                                             | Error e -> err e
                                             | Ok(seqNo, _) ->
                                                 match Reader.skipBytes valueLength c4 with
@@ -1309,7 +1313,9 @@ module internal Sstable =
             if Hashing.checksumRange data 0 payloadLen <> stored then
                 err (DbError.corruption "Sstable: ブロックのチェックサム不一致")
             else
-                Cursor.createSlice data 0 payloadLen |> loop payloadLen [||] [] [] [] []
+                match Cursor.createSlice data 0 payloadLen with
+                | Error e -> err e
+                | Ok slice -> loop payloadLen [||] [] [] [] [] slice
 
     let private lookupCached
         (block: CachedSstBlock)
