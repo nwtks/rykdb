@@ -474,3 +474,58 @@ let ``Compaction: 入力の読み込みに失敗したらそのエラーを返�
         let broken (_: FileMetaData) = err (DbError.corruption "壊れた SSTable")
         let r = Compaction.compact dir version pickFirstLevel 0UL 100L broken
         expectErrorKind ErrorKind.CorruptionError "読み込みエラーはそのまま伝播する" r)
+
+/// snapshot 以下で最も新しい版の値（tombstone は None）。
+let private visibleValue (entries: SstEntry list) (snapshot: uint64) =
+    entries
+    |> List.filter (fun e -> e.SeqNo <= snapshot)
+    |> List.sortByDescending (fun e -> e.SeqNo)
+    |> List.tryHead
+    |> Option.bind (fun e -> e.Value)
+
+let private showValue =
+    function
+    | None -> "None"
+    | Some(v: SqlValue array) -> v |> Array.map SqlLiteral.toSqlLiteral |> String.concat ","
+
+[<Fact>]
+let ``Compaction.gcGroup: 任意の snapshot で可視行が変わらない`` () =
+    let random = System.Random 20261113
+
+    for _ in 1..300 do
+        let n = random.Next(1, 8)
+
+        let entries =
+            [
+                for seqNo in 1..n ->
+                    SstEntry.make
+                        (intKey 1)
+                        (uint64 seqNo)
+                        (if random.Next 3 = 0 then
+                             None
+                         else
+                             Some [| SqlValue.Int(int64 seqNo) |])
+            ]
+            |> List.sortWith (fun a b -> compare b.SeqNo a.SeqNo)
+
+        let newest = List.head entries
+        let older = List.tail entries
+        let activeSnapshot = uint64 (random.Next(0, n + 2))
+        let dropTombstones = random.Next 2 = 0
+
+        let kept, dropped, tombstones =
+            Compaction.gcGroup activeSnapshot dropTombstones older newest
+
+        // 件数の会計が合う（入力の全版が「残す / 捨てる / tombstone を捨てる」のどれか）。
+        Assert.Equal<int>(entries.Length, kept.Length + dropped + tombstones)
+        // 残った版は入力の部分集合で、SeqNo が重複しない。
+        Assert.Equal<int>(kept.Length, (kept |> List.map _.SeqNo |> List.distinct).Length)
+
+        Assert.True(
+            kept
+            |> List.forall (fun e -> entries |> List.exists (fun x -> x.SeqNo = e.SeqNo))
+        )
+
+        // activeSnapshot 以降のどの snapshot でも可視行が一致する。
+        for snapshot in activeSnapshot .. uint64 n + 1UL do
+            Assert.Equal<string>(showValue (visibleValue entries snapshot), showValue (visibleValue kept snapshot))

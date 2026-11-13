@@ -237,3 +237,57 @@ let ``Manifest: NextFileNumber が Int64.MaxValue のとき負に回り込まな
         // used = MaxValue + 1 は負になるため、据え置き（else 側）になる
         let next = applyEdit dir mn v (VersionEdit.addFile (fmd 1L 0 0 9))
         Assert.Equal<int64>(System.Int64.MaxValue, next.NextFileNumber))
+
+[<Fact>]
+let ``VersionEdit: ランダムな編集を encode/decode しても同じ`` () =
+    let random = System.Random 20261114
+
+    for _ in 1..200 do
+        let added =
+            [
+                for i in 1 .. random.Next(0, 6) do
+                    let lo = random.Next 1000
+                    let hi = lo + random.Next 100
+                    fmd (int64 i) (random.Next Levels.Count) lo hi
+            ]
+
+        let deleted =
+            [
+                for _ in 1 .. random.Next(0, 4) ->
+                    { FileMetaData.Zero with
+                        FileNumber = int64 (random.Next(1, 20))
+                        Level = random.Next Levels.Count
+                    }
+            ]
+
+        let edit =
+            {
+                AddedFiles = added
+                DeletedFiles = deleted
+            }
+
+        let decoded = ok (VersionEdit.decode (VersionEdit.encode edit))
+        Assert.Equal<int>(1, decoded.Length)
+        Assert.Equal<byte array>(VersionEdit.encode edit, VersionEdit.encode decoded.Head)
+
+[<Fact>]
+let ``Manifest: ランダムな VersionEdit を追記して再オープンしても同じファイル集合`` () =
+    withDir "manifest-roundtrip-random" (fun dir ->
+        let v0, mn0 = ok (Manifest.openOrCreate dir)
+        let random = System.Random 20261115
+        let mutable v = v0
+        let mutable mn = mn0
+        let mutable expected = []
+
+        for _ in 1..50 do
+            let lo = random.Next 1000
+            let f = fmd v.NextFileNumber (random.Next Levels.Count) lo (lo + random.Next 100)
+            v <- applyEdit dir mn v (VersionEdit.addFile f)
+            expected <- f :: expected
+
+        let v2, _ = ok (Manifest.openOrCreate dir)
+
+        let numbersOf (files: FileMetaData list) =
+            files |> List.map _.FileNumber |> List.sort
+
+        Assert.Equal<int64 list>(numbersOf expected, numbersOf (Version.allFiles v2)))

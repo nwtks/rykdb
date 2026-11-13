@@ -1527,16 +1527,18 @@ module internal Plan =
                             (fun resolved ->
                                 Optimizer.buildLogicalWith ctx2 resolved derived
                                 >>= fun tree ->
+                                    let projection = SelectProjection.create inputSchema originalItems
+
                                     k
                                         {
                                             Output =
                                                 {
-                                                    Columns = Schema.referenceColumns inputSchema originalItems
+                                                    Columns = projection.ReferenceHeader
                                                     Tables = []
                                                 }
                                             Header =
                                                 {
-                                                    Columns = Schema.projectColumns inputSchema originalItems
+                                                    Columns = projection.DisplayHeader
                                                     Tables = []
                                                 }
                                             Input = inputSchema

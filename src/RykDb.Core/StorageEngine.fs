@@ -269,7 +269,7 @@ module internal StorageEngine =
                                 }
 
                             if appended then
-                                Some(e, StateScan(box advanced, stepObj, closeState)) |> ret
+                                Some(e, SstScan.ofState (box advanced) stepObj closeState) |> ret
                             else
                                 stepObj (box advanced)
 
@@ -287,30 +287,28 @@ module internal StorageEngine =
         match SstScan.next (seqToScan memSeq) with
         | Error e -> err e
         | Ok None ->
-            StateScan(
-                box
+            SstScan.ofState
+                (box
                     {
                         Pending = pendingFiles
                         Merge = SstMerge.Empty
                         EmittedKey = None
                         Count = 0
-                    },
-                stepObj,
+                    })
+                stepObj
                 closeState
-            )
             |> ret
         | Ok(Some(e, nxt)) ->
-            StateScan(
-                box
+            SstScan.ofState
+                (box
                     {
                         Pending = pendingFiles
                         Merge = SstMerge.insert 0 e nxt SstMerge.Empty
                         EmittedKey = None
                         Count = 0
-                    },
-                stepObj,
+                    })
+                stepObj
                 closeState
-            )
             |> ret
 
     /// 書き込みバッチ。

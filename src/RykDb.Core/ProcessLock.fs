@@ -89,6 +89,12 @@ module internal ProcessLock =
         finally
             Gate.Release() |> ignore
 
+/// プロセスロックの所有権ハンドル。
+/// `obj` のまま持ち回らず、この型で「誰が所有者か」を表す。
+[<Sealed>]
+type internal ProcessLockHandle internal (token: obj) =
+    member internal _.Token = token
+
 /// プロセスロックを保持する 1本分の寿命。
 /// <remarks>
 /// `Database.Execute` / `Begin` / `Commit` は新しいハンドルを返す。
@@ -105,14 +111,14 @@ type internal ProcessLockLease internal (root: string, token: obj) =
 
     /// このハンドルを所有者にする。
     member _.Attach() =
-        let handle = obj ()
-        owner.["owner"] <- handle
+        let handle = ProcessLockHandle(obj ())
+        owner.["owner"] <- handle.Token
         handle
 
-    /// このトークンが現在の所有者か。
-    member _.IsOwner(handle: obj) =
+    /// このハンドルが現在の所有者か。
+    member _.IsOwner(handle: ProcessLockHandle) =
         match owner.TryGetValue "owner" with
-        | true, current -> System.Object.ReferenceEquals(current, handle)
+        | true, current -> System.Object.ReferenceEquals(current, handle.Token)
         | _ -> false
 
     /// 強制的にロックを解放する（RowStore を直接閉じるテスト・エラー経路用）。

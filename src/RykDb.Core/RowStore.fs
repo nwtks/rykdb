@@ -225,9 +225,9 @@ module internal RowStore =
                     ret None
                 else
                     let key = Array.sub e.Key prefix.Length (e.Key.Length - prefix.Length)
-                    ret (Some({ e with Key = key }, SstScan(fun () -> loop rest)))
+                    ret (Some({ e with Key = key }, SstScan.ofStep (fun () -> loop rest)))
 
-        SstScan(fun () -> loop scan)
+        SstScan.ofStep (fun () -> loop scan)
 
     /// keyspace を prefix で走査する（最新エントリ。値の filter はしない）。
     /// 返すキーは接頭辞を外した論理キー。1行要求されるまで SSTable のブロックを読まない。
@@ -328,7 +328,7 @@ module internal RowStore =
                         format.Position <- 0L
                         format.SetLength 0L
                         format.Write(bytes, 0, bytes.Length)
-                        format.Flush(true))
+                        format.Flush true)
 
                 return ()
             else
@@ -345,19 +345,20 @@ module internal RowStore =
         result {
             do! protect (fun () -> System.IO.Directory.CreateDirectory root |> ignore)
             let! token, format = ProcessLock.acquire root takeOver
+            let lease = ProcessLockLease(root, token)
 
             let! () =
                 match ensureFormat root format with
                 | Ok() -> ret ()
                 | Error e ->
-                    ProcessLock.release root token
+                    lease.ForceRelease()
                     err e
 
             let! engine =
                 match StorageEngine.openDatabaseWith options.MemLimitBytes root with
                 | Ok engine -> ret engine
                 | Error e ->
-                    ProcessLock.release root token
+                    lease.ForceRelease()
                     err e
 
             let engine =
@@ -383,7 +384,7 @@ module internal RowStore =
                 {
                     Root = root
                     Engine = DiskStorageEngine engine :> IStorageEngine
-                    Lock = Some(ProcessLockLease(root, token))
+                    Lock = Some lease
                     Host = host
                 }
         }

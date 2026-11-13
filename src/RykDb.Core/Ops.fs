@@ -938,25 +938,14 @@ module internal Ops =
     /// `SELECT age, COUNT(*) ... GROUP BY age` の `age` を
     /// 「集約後の行の先頭」にある値へ読み替えるために使う。
     let project (schema: Schema) (groupBy: Expr list) (items: SelectItem list) (src: Op) =
-        let col qualifier name = { Qualifier = qualifier; Name = name }
-        let sameRef c = col c.Qualifier c.Name
         let aggCallsOf = List.map _.Expression >> aggCalls
 
         if List.isEmpty items then
             src
         else
-            let allExprs =
-                items
-                |> List.map (fun item ->
-                    let exprs =
-                        match Schema.expandStar schema item.Expression with
-                        | Some(_, columns) -> columns |> List.map (fun c -> sameRef c |> Expr.Column)
-                        | None -> [ item.Expression ]
-
-                    item, exprs)
-                |> List.collect (fun (_, exprs) -> exprs)
-
-            let foundAggs = aggCallsOf items
+            let projection = SelectProjection.create schema items
+            let allExprs = projection.Expressions
+            let foundAggs = aggCallsOf projection.SelectItems
             let offsets = aggOffsets groupBy foundAggs
             let wholeOffsets = wholeGroupOffsets groupBy
 

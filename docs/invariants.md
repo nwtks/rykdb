@@ -1,6 +1,6 @@
 # 不変条件レジストリ
 
-RykDb の「型では守れない不変条件」を 1 箇所に集約する。
+RykDb の「型では守れない不変条件」を 1箇所に集約する。
 F# の型システムでは表現できないため、
 **スマートコンストラクタ / `validate` / プロパティテスト / ソース検査 / 実行時検証** を組み合わせて守る。
 
@@ -11,7 +11,7 @@ F# の型システムでは表現できないため、
 
 ## 使い方
 
-- 新しい不変条件を導入したら、この表に 1 行追加する。
+- 新しい不変条件を導入したら、この表に 1行追加する。
 - 「担保」列は必ず具体的な関数・テスト名・ツールを書く（コメントだけにしない）。
 - 不変条件を変更したら、対応するテストも同時に更新する。
 - 本番経路で検出できるものは `Result` で返す。
@@ -30,30 +30,37 @@ F# の型システムでは表現できないため、
 
 ## 一覧
 
-| ID     | 不変条件                                               | 担保                                                        | 状態                                 |
-| ------ | ------------------------------------------------------ | ----------------------------------------------------------- | ------------------------------------ |
-| INV-01 | `Op` / `SstScan` は one-shot                           | `Op.emit` / `Op.compute`、`TestHelpers.oneShot`、`OpTests`  | `Op` 完了 / `SstScan` は `ScanScope` |
-| INV-02 | 返した行は DB 内部と独立                               | `SqlValue.copyRow`、`Engine.runSelect`、`RowReader.TryRead` | ✅ 完了                              |
-| INV-03 | キー順の定義は 1つ                                     | `KeyOrder.compare`、`Entry.compareKeys`、`SstEntry.compare` | ✅ 完了                              |
-| INV-04 | `FileNumber` と `SeqNo` を混ぜない                     | （未対策）units of measure / newtype                        | 計画                                 |
-| INV-05 | `TransactionManager` の SeqNo / Active / LastCommitted | `TransactionManager.validate`                               | ✅ 完了                              |
-| INV-06 | `Version` のレベル・番号・範囲                         | `Version.validate`                                          | ✅ 完了                              |
-| INV-07 | compaction GC は可視集合を保存                         | `Compaction.gc` の個別テスト                                | 拡張予定                             |
-| INV-08 | MANIFEST は追記専用・番号は単調                        | `Manifest` の個別テスト                                     | 拡張予定                             |
-| INV-09 | WAL は commit 済み prefix だけ再生                     | `Wal` の個別テスト                                          | 拡張予定                             |
-| INV-10 | keyspace 接頭辞が混ざらない                            | `Keyspace.prefixedKey` と個別テスト                         | 拡張予定                             |
-| INV-11 | ヘッダ長 = 行幅 = 射影長                               | `Schema.expandStar` の共有                                  | 拡張予定                             |
-| INV-12 | `Cursor` は `0 <= Pos <= End <= Data.Length`           | `Cursor.createSlice` の検証                                 | 拡張予定                             |
-| INV-13 | `BloomFilter.bitCount` は 8 の倍数                     | 個別テスト                                                  | 拡張予定                             |
-| INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`       | 個別テスト                                                  | 拡張予定                             |
-| INV-15 | `RowReader` は Open / Exhausted / Closed のいずれか    | `closed` / `exhausted` の bool 2つ                          | 拡張予定                             |
-| INV-16 | `Session` のロック規約                                 | `stateGate` / `writeGate` とコメント                        | 拡張予定                             |
-| INV-17 | lease の所有権                                         | `ProcessLockLease` / `RegistrationLease`                    | 拡張予定                             |
-| INV-18 | `Expr.children` / `plugChildren` の arity              | `Ast` の個別テスト                                          | 拡張予定                             |
+| ID     | 不変条件                                               | 担保                                                                                                                      | 状態     |
+| ------ | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- | -------- |
+| INV-01 | `Op` / `SstScan` は one-shot                           | `Op.emit` / `Op.compute`、`TestHelpers.oneShot`、`SstScan.ofStep` / `ofArray` / `ofState`、`SstScan.withScan`、ソース検査 | ✅ 完了  |
+| INV-02 | 返した行は DB 内部と独立                               | `SqlValue.copyRow`、`Engine.runSelect`、`RowReader.TryRead`                                                               | ✅ 完了  |
+| INV-03 | キー順の定義は 1つ                                     | `KeyOrder.compare`、`Entry.compareKeys`、`SstEntry.compare`                                                               | ✅ 完了  |
+| INV-04 | `FileNumber` と `SeqNo` を混ぜない                     | （未対策）units of measure / newtype                                                                                      | 計画     |
+| INV-05 | `TransactionManager` の SeqNo / Active / LastCommitted | `TransactionManager.validate`                                                                                             | ✅ 完了  |
+| INV-06 | `Version` のレベル・番号・範囲                         | `Version.validate`                                                                                                        | ✅ 完了  |
+| INV-07 | compaction GC は可視集合を保存                         | `Compaction.gcGroup` と可視性プロパティテスト                                                                             | ✅ 完了  |
+| INV-08 | MANIFEST は追記専用・番号は単調                        | `VersionEdit` encode/decode + 再オープンのプロパティテスト                                                                | ✅ 完了  |
+| INV-09 | WAL は commit 済み prefix だけ再生                     | `Wal.foldCommitted` の全切断位置テスト                                                                                    | ✅ 完了  |
+| INV-10 | keyspace 接頭辞が混ざらない                            | `Keyspace.prefixedKey` と個別テスト                                                                                       | 拡張予定 |
+| INV-11 | ヘッダ長 = 行幅 = 射影長                               | `SelectProjection.create`（式・表示ヘッダ・参照ヘッダを一度に構築）                                                       | ✅ 完了  |
+| INV-12 | `Cursor` は `0 <= Pos <= End <= Data.Length`           | `Cursor.createSlice` の検証                                                                                               | 拡張予定 |
+| INV-13 | `BloomFilter.bitCount` は 8 の倍数                     | 個別テスト                                                                                                                | 拡張予定 |
+| INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`       | 個別テスト                                                                                                                | 拡張予定 |
+| INV-15 | `RowReader` は Open / Exhausted / Closed のいずれか    | `closed` / `exhausted` の bool 2つ                                                                                        | 拡張予定 |
+| INV-16 | `Session` のロック規約                                 | `stateGate` / `writeGate` とコメント                                                                                      | 拡張予定 |
+| INV-17 | lease の所有権                                         | `ProcessLockHandle` / `ProcessLockLease` / `RegistrationLease`                                                            | ✅ 完了  |
+| INV-18 | `Expr.children` / `plugChildren` の arity              | `Ast` の個別テスト                                                                                                        | 拡張予定 |
 
----
+### INV-01 SstScan
 
-## P0 の詳細
+- 構築は `SstScan.ofStep` / `ofArray` / `ofState` / `ofFilter` / `ofScoped` に限定する。
+- `SstScan.withScan` は開いた走査を使い、成功・失敗のどちらでも `Dispose` する。
+- テスト専用の `oneShotScan` が、同じ `SstScan` 値の 2回目の `next` を検出する。
+- 回帰テスト:
+  - `SstScan: 構築はスマートコンストラクタに限る`（ソース検査）
+  - `SstScan.withScan: 成功・失敗のどちらでも Dispose する`
+  - `SstScan: one-shot ガードは同じ値の 2回目の next を検出する`
+  - `SstScan: filter / toArray はソースを 1回だけ消費する`
 
 ### INV-02 返した行は DB 内部と独立
 
@@ -113,13 +120,51 @@ F# の型システムでは表現できないため、
   - `Version.validate: レベルと格納位置の不一致を検出`
   - `Version.validate: L0 の追加・削除を繰り返しても不変条件を保つ`
 
+### INV-07 Compaction GC
+
+- `Compaction.gcGroup`（純粋関数）が唯一の GC 判定。
+- 回帰テスト: `Compaction.gcGroup: 任意の snapshot で可視行が変わらない`。
+  ランダムな版・snapshot・tombstone 設定で、件数の会計、SeqNo の一意性、
+  `activeSnapshot` 以降の全 snapshot の可視行が不変であることを検査する。
+
+### INV-08 MANIFEST
+
+- `VersionEdit.encode` / `decode` の round-trip。
+- `Manifest.logAndApply` で追記した編集を `Manifest.openOrCreate` で再読込しても同じファイル集合になる。
+- 回帰テスト:
+  - `VersionEdit: ランダムな編集を encode/decode しても同じ`
+  - `Manifest: ランダムな VersionEdit を追記して再オープンしても同じファイル集合`
+- 補足: `VersionEdit.apply` は `NextFileNumber` を進めない。再オープン時の採番は
+  `StorageEngine` がディスク上の最大番号から再構築する。
+
+### INV-09 WAL
+
+- `Wal.foldCommitted` は任意のバイト位置で切っても、commit 済みトランザクションの prefix だけを再生する。
+- 回帰テスト: `Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だけ再生する`。
+
+### INV-11 ヘッダと行幅
+
+- `SelectProjection.create` が `*` / `t.*` の展開を 1回だけ行い、
+  `Expressions`（行の値）と `DisplayHeader` / `ReferenceHeader`（ヘッダ）を同時に作る。
+- `Ops.project` と `Plan.runSelect` は同じ `SelectProjection` を使う。
+- 回帰テスト:
+  - `SelectProjection: ヘッダと式の列数が一致する`
+  - `SelectProjection: 項目が空なら入力スキーマをそのまま使う`
+
+### INV-17 lease
+
+- `ProcessLockHandle` が所有権ハンドルを表し、`IsOwner` はこの型だけを受け取る。
+- `RowStore` のエラー経路も `ProcessLockLease.ForceRelease` を使う。
+  `ProcessLock.release` の呼び出しは lease 内だけ。
+- 回帰テスト: 既存のプロセスロック / 古いハンドルの Close テスト。
+
 ---
 
 ## 既知の穴（次の候補）
 
-- `SstScan` の one-shot は `ScanScope` と `Dispose` に依存している。スマートコンストラクタ化は未実施。
 - `FileNumber` / `SeqNo` は素の数値。units of measure / newtype 化は未実施。
 - `Cursor` / `Writer` / `Entry` / `SstEntry` の record リテラルは直接構築できる（ソース検査なし）。
-- `Compaction.gc` / WAL 切断 / MANIFEST round-trip のプロパティテストは未実施。
-- `Schema` のヘッダと行幅は `expandStar` の共有で守っているが、`Projection` 型にはなっていない。
-- `RowReader` の状態は `closed` / `exhausted` の bool 2 つで、状態 DU にはなっていない。
+- `RowReader` の状態は `closed` / `exhausted` の bool 2つで、状態 DU にはなっていない。
+- `Session` / `EngineHost` の並行操作をランダムに組み合わせるストレステストは未実施。
+- `BloomFilter.bitCount` / `Memtable.ApproxBytes` の会計は個別テストのみ。
+- 内部 API（`Memtable` / `Transaction` / `SstEntry`）のキー・行の所有権はコメント契約のまま。

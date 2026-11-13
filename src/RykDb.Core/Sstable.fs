@@ -192,8 +192,32 @@ type internal SstScan =
             | SstScan _ -> ()
 
 module internal SstScan =
+    /// ステップ関数から走査を作る。
+    let ofStep (step: unit -> Result<(SstEntry * SstScan) option, DbError>) = SstScan step
+
+    /// 配列走査を作る。
+    let ofArray
+        (entries: SstEntry array)
+        (pos: int)
+        (count: int)
+        (limit: int)
+        (loadNext: int -> Result<(SstEntry * SstScan) option, DbError>)
+        (close: unit -> unit)
+        =
+        ArrayScan(entries, pos, count, limit, loadNext, close)
+
+    /// 状態付き走査を作る。
+    let ofState (state: obj) (step: obj -> Result<(SstEntry * SstScan) option, DbError>) (close: obj -> unit) =
+        StateScan(state, step, close)
+
+    /// filter 走査を作る。
+    let ofFilter (predicate: SstEntry -> bool) (scan: SstScan) = FilterScan(scan, predicate)
+
+    /// スコープ登録された走査を作る。
+    let ofScoped (scan: SstScan) (scope: ScanScope) (key: obj) = ScopedScan(scan, scope, key)
+
     /// 終端（これ以上要素は無い）。
-    let Empty = SstScan(fun () -> ret None)
+    let Empty = ofStep (fun () -> ret None)
 
     /// 台帳から登録を外して閉じる。
     let private releaseScope =
@@ -207,7 +231,7 @@ module internal SstScan =
         | None -> ret (Some(e, scan))
         | Some(scope, key) ->
             scope.Register(key, scan :> System.IDisposable)
-            ret (Some(e, ScopedScan(scan, scope, key)))
+            ret (Some(e, ofScoped scan scope key))
 
     /// 次の 1件。
     /// None は終端。
@@ -226,7 +250,7 @@ module internal SstScan =
                 continueWith
                     filters
                     scope
-                    (ret (Some(entries.[pos], ArrayScan(entries, pos + 1, count + 1, limit, loadNext, close))))
+                    (ret (Some(entries.[pos], ofArray entries (pos + 1) (count + 1) limit loadNext close)))
             else
                 continueWith filters scope (loadNext count)
         | StateScan(state, step, _) -> continueWith filters scope (step state)
@@ -258,7 +282,7 @@ module internal SstScan =
         =
         match remaining with
         | [] ->
-            List.fold (fun scan predicate -> FilterScan(scan, predicate)) scan allFilters
+            List.fold (fun scan predicate -> ofFilter predicate scan) scan allFilters
             |> finishScoped scope e
         | predicate :: tail ->
             if predicate e then
@@ -271,18 +295,26 @@ module internal SstScan =
     /// 明示的に資源を解放する（終端・エラー後の呼び出しも安全）。
     let dispose (scan: SstScan) = (scan :> System.IDisposable).Dispose()
 
+    /// 走査を使い、成功・失敗・例外のいずれでも Dispose する。
+    /// 開いた走査を全件読み切る用途で使う。
+    let withScan (scan: SstScan) (f: SstScan -> Result<'a, DbError>) =
+        try
+            f scan
+        finally
+            dispose scan
+
     /// 走査を ScanScope に登録する。
     /// 途中で消費者が止まっても、ScanScope.DisposeAll が最新の continuation を閉じる。
     let scoped (scope: ScanScope) (scan: SstScan) =
         let key = obj ()
         scope.Register(key, scan :> System.IDisposable)
-        ScopedScan(scan, scope, key)
+        ofScoped scan scope key
 
     /// 1件を返す走査。
     /// 続き（rest）は次を要求されるまで組み立てない
     /// （ここで組み立てると 1回の next がブロック全体を辿ってしまい、遅延にならない）。
     let emit (rest: unit -> SstScan) (e: SstEntry) =
-        SstScan(fun () -> Some(e, rest ()) |> ret)
+        ofStep (fun () -> Some(e, rest ()) |> ret)
 
     /// 残りを配列に畳む（壊れたブロックに当たったらその場で Error）。
     let toArray (scan: SstScan) =
@@ -292,14 +324,11 @@ module internal SstScan =
             | Ok None -> List.rev acc |> Array.ofList |> ret
             | Ok(Some(e, nxt)) -> drain (e :: acc) nxt
 
-        try
-            drain [] scan
-        finally
-            dispose scan
+        withScan scan (drain [])
 
     /// 条件を満たすエントリだけを返す走査。
     /// 条件を満たさない間は次のエントリを読み進める（ブロック単位のまま）。
-    let filter (predicate: SstEntry -> bool) (scan: SstScan) = FilterScan(scan, predicate)
+    let filter (predicate: SstEntry -> bool) (scan: SstScan) = ofFilter predicate scan
 
 /// k-way merge の 1ソース。
 /// 先頭を 1件読んだ状態を表す。
@@ -1157,30 +1186,29 @@ module internal Sstable =
                 close ()
                 SstScan.Empty
             elif Bytes.compare entries.[pos].Key startKey < 0 then
-                SstScan(fun () -> SstScan.next (scanEntries raw startOffset batchEnd (pos + 1) count i entries))
+                SstScan.ofStep (fun () -> SstScan.next (scanEntries raw startOffset batchEnd (pos + 1) count i entries))
             else
-                ArrayScan(
-                    entries,
-                    pos,
-                    count,
-                    limit,
-                    (fun nextCount -> SstScan.next (loadBlock raw startOffset batchEnd nextCount i)),
+                SstScan.ofArray
+                    entries
+                    pos
+                    count
+                    limit
+                    (fun nextCount -> SstScan.next (loadBlock raw startOffset batchEnd nextCount i))
                     close
-                )
 
         and loadBlock raw startOffset batchEnd count i =
             if i >= partial.Index.Length || limit > 0 && count >= limit then
                 close ()
                 SstScan.Empty
             elif i < batchEnd then
-                SstScan(fun () ->
+                SstScan.ofStep (fun () ->
                     match parseRawBlock raw startOffset i with
                     | Error e ->
                         close ()
                         err e
                     | Ok entries -> SstScan.next (scanEntries raw startOffset batchEnd 0 count (i + 1) entries))
             else
-                SstScan(fun () ->
+                SstScan.ofStep (fun () ->
                     match readRawBatch i with
                     | Error e ->
                         close ()
@@ -1193,7 +1221,7 @@ module internal Sstable =
             close ()
             SstScan.Empty
         else
-            SstScan(fun () ->
+            SstScan.ofStep (fun () ->
                 match readRawBatch startBlock with
                 | Error e ->
                     close ()

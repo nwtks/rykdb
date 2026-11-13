@@ -707,7 +707,7 @@ module internal Schema =
     /// 派生テーブル（FROM のサブクエリ）の列型が None だとハッシュ結合のキーにできないため、
     /// `SELECT id, v AS x FROM t` や `SELECT *` のような形では型を残す。
     /// </remarks>
-    let private projectedColumns (useDisplayName: bool) (schema: Schema) =
+    let internal projectedColumns (useDisplayName: bool) (schema: Schema) =
         let referenced e =
             match tryAsColumnRef e with
             | Some c ->
@@ -760,3 +760,41 @@ module internal Schema =
     /// `SELECT t.id` の列名を `t.id` ではなく `id` にする。
     /// 派生テーブルの列名に使う（外側から `x.id` で引けるようにするため）。
     let referenceColumns = projectedColumns false
+
+/// SELECT の射影（出力式とヘッダ）を 1回の展開でまとめたもの。
+/// `Ops.project`（行の値）と `Plan` のヘッダが同じ展開を共有し、
+/// 「ヘッダの列数と行の幅がずれる」不変条件違反を防ぐ。
+type internal SelectProjection =
+    {
+        SelectItems: SelectItem list
+        /// `*` / `t.*` を展開した後の出力式（出力列と同じ順・同じ数）。
+        Expressions: Expr list
+        /// 結果表示用のヘッダ（`SELECT id` → `id`）。
+        DisplayHeader: OutputColumn array
+        /// 参照用のヘッダ（`SELECT t.id` → `id`）。派生テーブル用。
+        ReferenceHeader: OutputColumn array
+    }
+
+module internal SelectProjection =
+    let private expressionsOf (schema: Schema) =
+        List.collect (fun item ->
+            match Schema.expandStar schema item.Expression with
+            | Some(_, columns) ->
+                columns
+                |> List.map (fun c ->
+                    Expr.Column
+                        {
+                            Qualifier = c.Qualifier
+                            Name = c.Name
+                        })
+            | None -> [ item.Expression ])
+
+    /// 射影を組み立てる。
+    /// 空の `items` は「入力スキーマをそのまま出力」を表す。
+    let create (schema: Schema) (items: SelectItem list) =
+        {
+            SelectItems = items
+            Expressions = expressionsOf schema items
+            DisplayHeader = Schema.projectedColumns true schema items
+            ReferenceHeader = Schema.projectedColumns false schema items
+        }

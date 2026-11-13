@@ -77,6 +77,33 @@ module internal Compaction =
             OutputLevel: int
         }
 
+    /// 同一キーの版グループを GC する（純粋関数）。
+    /// `older` は `newest` より古い版（SeqNo 降順）。
+    /// 戻り値は (残す版, 捨てた版数, 捨てた tombstone 数)。
+    /// `activeSnapshot = 0` は「制限なし」を表す。
+    let internal gcGroup (activeSnapshot: uint64) (dropTombstones: bool) (older: SstEntry list) (newest: SstEntry) =
+        let rec keepOlder kept dropped keptVisible rest =
+            match rest with
+            | [] -> List.rev kept, dropped
+            | item :: tail ->
+                if activeSnapshot = 0UL || item.SeqNo > activeSnapshot then
+                    keepOlder (item :: kept) dropped keptVisible tail
+                elif newest.SeqNo > activeSnapshot && not keptVisible then
+                    keepOlder (item :: kept) dropped true tail
+                else
+                    keepOlder kept (dropped + 1) keptVisible tail
+
+        match older with
+        | [] ->
+            let keepNewest = not (newest.IsDelete && dropTombstones)
+            (if keepNewest then [ newest ] else []), 0, (if keepNewest then 0 else 1)
+        | _ when activeSnapshot = 0UL -> newest :: older, 0, 0
+        | _ ->
+            let keptOlder, dropped = keepOlder [] 0 false older
+            let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty keptOlder)
+            let kept = if keepNewest then newest :: keptOlder else keptOlder
+            kept, dropped, (if keepNewest then 0 else 1)
+
     /// 1回の Leveled compaction を行う（ストリーミング）。
     /// <remarks>
     /// 入力は全読みしない。各ファイルを `SstScan` で開き、`SstMerge` で 1件ずつマージしながら
@@ -190,29 +217,6 @@ module internal Compaction =
                 scans |> Array.iter SstScan.dispose
                 err e
 
-        let rec keepOlder newest rest kept dropped keptVisible =
-            match rest with
-            | [] -> List.rev kept, dropped
-            | item :: tail ->
-                if activeSnapshot = 0UL || item.SeqNo > activeSnapshot then
-                    keepOlder newest tail (item :: kept) dropped keptVisible
-                elif newest.SeqNo > activeSnapshot && not keptVisible then
-                    keepOlder newest tail (item :: kept) dropped true
-                else
-                    keepOlder newest tail kept (dropped + 1) keptVisible
-
-        let gcGroup dropTombstones older (newest: SstEntry) =
-            match older with
-            | [] ->
-                let keepNewest = not (newest.IsDelete && dropTombstones)
-                (if keepNewest then [ newest ] else []), 0, (if keepNewest then 0 else 1)
-            | _ when activeSnapshot = 0UL -> newest :: older, 0, 0
-            | _ ->
-                let keptOlder, dropped = keepOlder newest older [] 0 false
-                let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty keptOlder)
-                let kept = if keepNewest then newest :: keptOlder else keptOlder
-                kept, dropped, (if keepNewest then 0 else 1)
-
         let rec gather newest m acc =
             match SstMerge.top m with
             | Some e when Bytes.compare e.Key newest.Key = 0 ->
@@ -229,7 +233,7 @@ module internal Compaction =
             | Ok(Some(newest, afterNewest)) ->
                 gather newest afterNewest []
                 >>= fun (rest, older) ->
-                    let kept, dropped, tombstones = gcGroup dropTombstones older newest
+                    let kept, dropped, tombstones = gcGroup activeSnapshot dropTombstones older newest
                     ret (Some(kept, dropped, tombstones, rest))
 
         let flushChunk plan chunk fileNumber =

@@ -521,7 +521,7 @@ let ``ScanScope: 早期終了しても登録した走査を閉じられる`` () 
     let mutable closed = false
     let close () = closed <- true
     let loadNext (_: int) = ret None
-    let scan = SstScan.ArrayScan(entries, 0, 0, 0, loadNext, close)
+    let scan = SstScan.ofArray entries 0 0 0 loadNext close
     let scope = ScanScope()
     let scoped = SstScan.filter (fun _ -> true) (SstScan.scoped scope scan)
     Assert.Equal(1, scope.ActiveCount)
@@ -540,3 +540,77 @@ let ``ScanScope: 最後まで読むと登録が外れる`` () =
     let got = ok (SstScan.toArray scoped)
     Assert.Equal<int>(2, got.Length)
     Assert.Equal(0, scope.ActiveCount)
+
+[<Fact>]
+let ``SstScan: 構築はスマートコンストラクタに限る`` () =
+    let sourceDir =
+        System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "..", "..", "src", "RykDb.Core"))
+
+    let offenders =
+        System.IO.Directory.GetFiles(sourceDir, "*.fs")
+        |> Array.filter (fun path -> System.IO.Path.GetFileName path <> "Sstable.fs")
+        |> Array.collect (fun path ->
+            System.IO.File.ReadAllLines path
+            |> Array.indexed
+            |> Array.choose (fun (i, line) ->
+                let code =
+                    match line.IndexOf "//" with
+                    | -1 -> line
+                    | c -> line.Substring(0, c)
+
+                let patterns =
+                    [ "SstScan("; "ArrayScan("; "StateScan("; "FilterScan("; "ScopedScan(" ]
+
+                if patterns |> List.exists code.Contains then
+                    Some(sprintf "%s:%d: %s" (System.IO.Path.GetFileName path) (i + 1) (line.Trim()))
+                else
+                    None))
+
+    Assert.True(Array.isEmpty offenders, "SstScan の生ケースが残っています:\n" + String.concat "\n" offenders)
+
+[<Fact>]
+let ``SstScan.withScan: 成功・失敗のどちらでも Dispose する`` () =
+    let closed = ref 0
+
+    let make () =
+        SstScan.ofState () (fun (_: obj) -> ret None) (fun (_: obj) -> closed.Value <- closed.Value + 1)
+
+    let okResult = SstScan.withScan (make ()) (fun _ -> ret 42)
+    Assert.Equal<int>(42, ok okResult)
+
+    let errResult = SstScan.withScan (make ()) (fun _ -> err (DbError.notFound "x"))
+    expectErrorKind ErrorKind.NotFound "withScan はエラーを伝播するはず" errResult
+    Assert.Equal<int>(2, closed.Value)
+
+/// テスト専用: 同じ SstScan 値を 2 回 `SstScan.next` すると失敗させる。
+/// `SstScan` の one-shot 不変条件（元の値を再利用せず、返された継続だけを使う）を機械的に検査する。
+let private oneShotScan (label: string) (scan: SstScan) =
+    let used = ref false
+
+    SstScan.ofStep (fun () ->
+        if used.Value then
+            failwithf "SstScan を 2 回消費しました: %s" label
+
+        used.Value <- true
+        SstScan.next scan)
+
+[<Fact>]
+let ``SstScan: one-shot ガードは同じ値の 2 回目の next を検出する`` () =
+    let scan = oneShotScan "guard" (scanOfEntries (sstEntries 1))
+    Assert.True((ok (SstScan.next scan)).IsSome)
+
+    let mutable detected = false
+
+    try
+        SstScan.next scan |> ignore
+    with _ ->
+        detected <- true
+
+    Assert.True detected
+
+[<Fact>]
+let ``SstScan: filter / toArray はソースを 1 回だけ消費する`` () =
+    let source = oneShotScan "filter" (scanOfEntries (sstEntries 3))
+    let filtered = SstScan.filter (fun _ -> true) source
+    let got = ok (SstScan.toArray filtered)
+    Assert.Equal<int>(3, got.Length)

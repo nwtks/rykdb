@@ -50,3 +50,49 @@ let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
         System.IO.Path.Combine(System.IO.Path.GetTempPath(), "rykdb-wal-missing-" + string System.DateTime.UtcNow.Ticks)
 
     Assert.Empty(Wal.walFiles missing)
+
+[<Fact>]
+let ``Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だけ再生する`` () =
+    withDir "wal-truncate" (fun dir ->
+        let w0 = freshWal dir
+        let random = System.Random 20261116
+
+        let records =
+            [
+                for txnId in 1UL .. 20UL do
+                    let committed = random.Next 2 = 0
+
+                    yield WalRecord.Begin txnId
+
+                    for i in 1 .. random.Next(0, 3) do
+                        let key = intKey (int txnId * 10 + i)
+                        let entry = Entry.put key (txnId * 10UL + uint64 i) (intRow (int txnId * 10 + i))
+                        yield WalRecord.Batch(txnId, [| entry |])
+
+                    yield
+                        if committed then
+                            WalRecord.Commit txnId
+                        else
+                            WalRecord.Abort txnId
+            ]
+
+        let _ = ok (Wal.append dir records w0)
+        let path = Wal.path dir 1L
+        let bytes = System.IO.File.ReadAllBytes path
+
+        let replay () =
+            let entries, _ = ok (Wal.foldCommitted dir 1L (fun acc entry -> entry :: acc) [])
+            List.rev entries
+
+        let expected = replay ()
+
+        for length in 0 .. bytes.Length do
+            let truncated = if length = 0 then [||] else bytes.[0 .. length - 1]
+
+            System.IO.File.WriteAllBytes(path, truncated)
+            let actual = replay ()
+
+            Assert.True(
+                actual.Length <= expected.Length && List.take actual.Length expected = actual,
+                sprintf "切断位置 %d で commit 済み prefix 以外が再生された" length
+            ))

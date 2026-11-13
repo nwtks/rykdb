@@ -67,7 +67,7 @@ let scanOfEntries (items: seq<SstEntry>) =
     let e = items.GetEnumerator()
 
     let rec loop () =
-        SstScan(fun () ->
+        SstScan.ofStep (fun () ->
             if e.MoveNext() then
                 ret (Some(e.Current, loop ()))
             else

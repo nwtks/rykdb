@@ -930,6 +930,18 @@ DU は `type` 宣言（モジュールスコープのものは `private` 可）�
 - ❌ ローカル `let tryPrefix prefix = ...` の中で `Encoding.UTF8.GetBytes prefix` を
   引数注釈なしのままだと FS0041（オーバーロード解決が決められない）。`let p: byte array = ...` と注釈する。
 
+### 8.18 レコードのフィールド名が既存型と衝突すると型推論が壊れる（FS3566）
+
+`Projection = { Items: ... }` のようなレコードを追加すると、
+`{ stmt with Items = ... }` の `stmt` が `SelectStatement` ではなく `Projection` と推論され、
+`FS3566 Multiple type matches were found` と
+`FS0039 ... does not define ... 'OrderBy'` が連鎖する。
+
+- ✅ フィールド名を `SelectItems` にして、既存の `Items` と衝突させない。
+- ✅ 型名も用途が分かる `SelectProjection` にする。
+- 判断基準: 既存で広く使われているフィールド名（`Items` / `Name` / `Type` など）を
+  新しいレコードに付けない。
+
 ---
 
 ## 9. テスト・ビルドの罠
