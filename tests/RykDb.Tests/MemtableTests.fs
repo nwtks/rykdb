@@ -38,6 +38,27 @@ let ``Memtable: Count と ApproxBytes は挿入したエントリの合計にな
     Assert.Equal(entries.Length, mem.Count)
     Assert.Equal(entries |> Array.sumBy Entry.managedBytes, mem.ApproxBytes)
 
+[<Fact>]
+let ``Memtable: 挿入したキー配列を後から書き換えても木は保たれる`` () =
+    let key = intKey 5
+    let mem = Memtable.insert (Entry.put key 1UL (intRow 5)) Memtable.Empty
+    // 挿入後に呼び出し側がキー配列を書き換える（所有権を越えた変更）。
+    key.[0] <- 0xFFuy
+
+    match Memtable.getVisible (intKey 5) None mem with
+    | Some e -> Assert.Equal<int64>(5L, asInt e.Value.Value.[0])
+    | None -> Assert.Fail "挿入したキーが引けなくなった（キー配列の変更で木が壊れた）"
+
+[<Fact>]
+let ``Memtable: 挿入した行配列を後から書き換えても値は変わらない`` () =
+    let row = [| SqlValue.Int 5L |]
+    let mem = Memtable.insert (Entry.put (intKey 5) 1UL row) Memtable.Empty
+    row.[0] <- SqlValue.Int 999L
+
+    match Memtable.getVisible (intKey 5) None mem with
+    | Some e -> Assert.Equal<int64>(5L, asInt e.Value.Value.[0])
+    | None -> Assert.Fail "挿入したキーが引けない"
+
     // 空への apply は何も変えない
     let same = Memtable.apply [] mem
     Assert.Equal(mem.Count, same.Count)

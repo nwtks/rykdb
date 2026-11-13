@@ -13,6 +13,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 3. [末尾再帰を前提にする](#3-末尾再帰を前提にする)
 4. [予約語に注意](#4-予約語に注意)
 5. [クロスプラットフォームにする](#5-クロスプラットフォームにする)
+6. [意味の違う番号と所有権を守る](#6-意味の違う番号と所有権を守る)
 
 ---
 
@@ -198,3 +199,20 @@ JIT は `tail.` を尊重する。
 （`System.IO.Path` / `Environment` / `FileShare` 等）を使い、
 OS 固有のパス区切り・コマンド・API を直接呼ばない。
 CI は Linux で走るが、Windows / macOS でも同じ挙動を保つこと。
+
+## 6. 意味の違う番号と所有権を守る
+
+一覧と根拠は [`invariants.md`](invariants.md)、実際の書き方は [`gotchas.md`](gotchas.md) を参照。
+
+- **同じ素の型で意味が違う番号は単位で分ける**（INV-04）。
+  `FileNumber` ↔ `ManifestNumber` は `manifestNo`、`SeqNo` ↔ `TxnId` は `txnId`。
+  両側ではなく**片側だけ**付ければ対は区別できる。
+  単位と型略記は `Types.fs` に置く（`Wal.fs` より前のコンパイル順が必要）。
+  直列化の境界でだけ `uint64 x` / `LanguagePrimitives.Int64WithMeasure` で外す。
+- **保持する側は渡された配列を複製してから保持する**（INV-19）。
+  `Memtable.insert` は `Entry.takeOwnership`、`Transaction.put` / `remove` は `setSlot` が複製。
+  逆に `SstEntry` は読み取り専用のビューなので複製しない。
+  出口の行も `SqlValue.copyRow` で切り離す（INV-02）。
+- **状態は bool で表現せず状態 DU にする**（INV-15）。
+  2つの bool は「両方 true」と「判定の順序への依存」を許す。
+  1回だけの副作用（リソース解放）は遷移関数に閉じ込める。

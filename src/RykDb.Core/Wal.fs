@@ -13,16 +13,19 @@
 namespace RykDb.Core
 
 /// WAL に記録する論理レコード。
+/// transaction 番号は単位 `txnId` を持つ
+/// （`SeqNo` の素の `uint64` と取り違えないため）。
+/// バイト列への直列化は `encodePayload` / `decodePayload` でだけ行う。
 [<RequireQualifiedAccess>]
 type internal WalRecord =
     /// トランザクション開始
-    | Begin of uint64
+    | Begin of TxnId
     /// 書き込みバッチ（keyspace ごとに 1本）
-    | Batch of uint64 * Entry array
+    | Batch of TxnId * Entry array
     /// コミット（このトランザクションの Batch が有効になる）
-    | Commit of uint64
+    | Commit of TxnId
     /// 中断（このトランザクションの Batch は捨てる）
-    | Abort of uint64
+    | Abort of TxnId
 
 /// WAL の現在位置。
 type internal WalState =
@@ -52,7 +55,7 @@ module internal Wal =
 
     let private encodePayload (r: WalRecord) =
         let txnRecord tag txnId =
-            Writer.build [ Writer.writeByte tag; Writer.uint64BE txnId ]
+            Writer.build [ Writer.writeByte tag; Writer.uint64BE (uint64 txnId) ]
 
         match r with
         | WalRecord.Begin txnId -> txnRecord TagBegin txnId
@@ -72,14 +75,14 @@ module internal Wal =
 
             match tag with
             | TagBegin ->
-                let! txnId, _ = Reader.readUint64BE c
-                return WalRecord.Begin txnId
+                let! raw, _ = Reader.readUint64BE c
+                return WalRecord.Begin(LanguagePrimitives.UInt64WithMeasure<txnId> raw)
             | TagCommit ->
-                let! txnId, _ = Reader.readUint64BE c
-                return WalRecord.Commit txnId
+                let! raw, _ = Reader.readUint64BE c
+                return WalRecord.Commit(LanguagePrimitives.UInt64WithMeasure<txnId> raw)
             | TagAbort ->
-                let! txnId, _ = Reader.readUint64BE c
-                return WalRecord.Abort txnId
+                let! raw, _ = Reader.readUint64BE c
+                return WalRecord.Abort(LanguagePrimitives.UInt64WithMeasure<txnId> raw)
             | TagBatch ->
                 let! bs, _ = Reader.readBytes (Cursor.remaining c) c
                 let! txnId, entries = Entry.decodeBatch bs
@@ -238,7 +241,7 @@ module internal Wal =
 
         protect (fun () ->
             if not (System.IO.File.Exists p) then
-                ret (initial, 0UL)
+                ret (initial, 0UL<txnId>)
             else
                 use fs =
                     new System.IO.FileStream(
@@ -248,7 +251,7 @@ module internal Wal =
                         System.IO.FileShare.Read
                     )
 
-                foldFrames fs (fun state record -> ret (applyRecord state record)) ([], 0UL, initial)
+                foldFrames fs (fun state record -> ret (applyRecord state record)) ([], 0UL<txnId>, initial)
                 |> Result.map (fun (_, maxTxnId, state) -> state, maxTxnId))
         >>= id
 

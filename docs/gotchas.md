@@ -942,6 +942,33 @@ DU は `type` 宣言（モジュールスコープのものは `private` 可）�
 - 判断基準: 既存で広く使われているフィールド名（`Items` / `Name` / `Type` など）を
   新しいレコードに付けない。
 
+### 8.19 単位（units of measure）で番号を取り違えない（INV-04）
+
+`type TxnId = uint64` のような**型略記は安全性が 0**。
+`NextSeqNo: uint64` へ `manager.NextTxnId` を代入してもコンパイルが通る
+（2つは同じレコードで隣接していた）。
+
+```fsharp
+// Types.fs（Memtable / Wal より前にコンパイルされる位置）
+[<Measure>] type manifestNo
+[<Measure>] type txnId
+type internal TxnId = uint64<txnId>   // 略記もここに置く
+```
+
+- ✅ **片側だけ単位を付ける**（`ManifestNumber` ↔ `FileNumber`、`TxnId` ↔ `SeqNo`）。
+  片側だけでも対は区別できる。全サイトを触らずに済む。
+- ✅ 使えるもの: `sprintf "%d"` / `max` / `min` / `compare` / `=` / `Map` / `Set` / `Array.sort`。
+- ❌ **単位付きリテラルは明示**: `1UL` → `1UL<txnId>`、`1L` → `1L<manifestNo>`。
+- ❌ **素の値と単位付きの加減算は通らない**。
+  パース・ファイル名読み込みの境界で `LanguagePrimitives.Int64WithMeasure<manifestNo>` /
+  `LanguagePrimitives.UInt64WithMeasure<txnId>` を使う。
+- ❌ **単位付きの範囲**（`1UL<txnId> .. 20UL<txnId>`）は範囲演算子側が素の型を求めて失敗。
+  素の整数ループにしてから変換する。
+- ⚠️ **略記は使うファイルより前のコンパイル順に置く**。
+  `TxnId` を `Transactions.fs` に置いていたと `Wal.fs` から見えず、
+  `Types.fs`（measure のすぐ隣）へ移した。
+- 実行時は単位が消えるのでコストは 0。
+
 ---
 
 ## 9. テスト・ビルドの罠
@@ -2160,3 +2187,34 @@ let leftSchema = { inSchema with Columns = inSchema.Columns |> Array.filter (fun
 
 回帰テスト: `SqlReference: INSERT ... SELECT は選択結果を挿入する`
 （自分のテーブルから選んでも行数が倍になるだけで止まる）。
+
+### 11.69 格納する側はキー・行を複製しないと配列の変更で壊れる（INV-19）
+
+❌ `Transaction.put` / `Memtable.insert` が渡された配列をそのまま保持する。
+
+Treap の探索と `Map<byte array, _>` の順序は**配列の中身**に依存する。
+呼び出し側が保持した配列を後から書き換えると、
+木 / バッファが壊れて「挿入したキーが引けない」「値が変わる」が起きる。
+F# に線形型が無いので、所有権をコメント契約にせず**複製して取り込む**。
+
+```fsharp
+// ✅ Entry.takeOwnership（キー + 行。Blob の byte[] も複製）
+let insert (given: Entry) (mem: Memtable) =
+    let e = Entry.takeOwnership given
+    ...
+
+// ✅ Transaction.setSlot の入口
+let key = Array.copy givenKey
+let slot = givenSlot |> Option.map SqlValue.copyRow
+```
+
+- 保持する側（memtable / transaction バッファ）だけが複製する。
+  素の配列を返す側（`SstEntry` は読み取り専用のビュー）は対象外。
+- 出口の `SqlValue.copyRow`（INV-02）と入口が同じヘルパーを共有する。
+- コストは 1行あたり約 0.4µs（20万行の実測、全体の約 0.7%）。
+
+回帰テスト（修正前に実際に失敗することを確認済み）:
+
+- `Memtable: 挿入したキー配列を後から書き換えても木は保たれる`
+- `Memtable: 挿入した行配列を後から書き換えても値は変わらない`
+- `Transaction: put したキー・行配列を後から書き換えてもバッファは保たれる`

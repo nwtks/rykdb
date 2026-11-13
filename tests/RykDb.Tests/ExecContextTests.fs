@@ -350,7 +350,7 @@ let ``DmlOps.update: UPDATE 対象が transaction 上限を超えると Capacity
         let mgr = seedPeople store (TransactionManager.create ())
 
         let txn =
-            { Transaction.create 1UL { SeqNo = mgr.LastCommitSeqNo } with
+            { Transaction.create 1UL<txnId> { SeqNo = mgr.LastCommitSeqNo } with
                 LimitBytes = 1L
             }
 

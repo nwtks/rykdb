@@ -143,7 +143,7 @@ let ``Dml.insertWithKey: NOT NULL 制約違反は弾かれる`` () =
 [<Fact>]
 let ``Dml.insertWithKey: transaction 上限を超えると CapacityError`` () =
     let txn =
-        { Transaction.create 1UL { SeqNo = 0UL } with
+        { Transaction.create 1UL<txnId> { SeqNo = 0UL } with
             LimitBytes = 1L
         }
 

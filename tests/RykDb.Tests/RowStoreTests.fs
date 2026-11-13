@@ -72,7 +72,7 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
         member _.HostState =
             {
                 Version = Version.Empty
-                ManifestNumber = 0L
+                ManifestNumber = 0L<manifestNo>
                 ActiveSnapshot = 0UL
                 LastCompactionError = None
                 Generation = 0L

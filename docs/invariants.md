@@ -30,26 +30,27 @@ F# の型システムでは表現できないため、
 
 ## 一覧
 
-| ID     | 不変条件                                               | 担保                                                                                                                      | 状態     |
-| ------ | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- | -------- |
-| INV-01 | `Op` / `SstScan` は one-shot                           | `Op.emit` / `Op.compute`、`TestHelpers.oneShot`、`SstScan.ofStep` / `ofArray` / `ofState`、`SstScan.withScan`、ソース検査 | ✅ 完了  |
-| INV-02 | 返した行は DB 内部と独立                               | `SqlValue.copyRow`、`Engine.runSelect`、`RowReader.TryRead`                                                               | ✅ 完了  |
-| INV-03 | キー順の定義は 1つ                                     | `KeyOrder.compare`、`Entry.compareKeys`、`SstEntry.compare`                                                               | ✅ 完了  |
-| INV-04 | `FileNumber` と `SeqNo` を混ぜない                     | （未対策）units of measure / newtype                                                                                      | 計画     |
-| INV-05 | `TransactionManager` の SeqNo / Active / LastCommitted | `TransactionManager.validate`                                                                                             | ✅ 完了  |
-| INV-06 | `Version` のレベル・番号・範囲                         | `Version.validate`                                                                                                        | ✅ 完了  |
-| INV-07 | compaction GC は可視集合を保存                         | `Compaction.gcGroup` と可視性プロパティテスト                                                                             | ✅ 完了  |
-| INV-08 | MANIFEST は追記専用・番号は単調                        | `VersionEdit` encode/decode + 再オープンのプロパティテスト                                                                | ✅ 完了  |
-| INV-09 | WAL は commit 済み prefix だけ再生                     | `Wal.foldCommitted` の全切断位置テスト                                                                                    | ✅ 完了  |
-| INV-10 | keyspace 接頭辞が混ざらない                            | `Keyspace.prefixedKey` と個別テスト                                                                                       | 拡張予定 |
-| INV-11 | ヘッダ長 = 行幅 = 射影長                               | `SelectProjection.create`（式・表示ヘッダ・参照ヘッダを一度に構築）                                                       | ✅ 完了  |
-| INV-12 | `Cursor` は `0 <= Pos <= End <= Data.Length`           | `Cursor.createSlice` の検証                                                                                               | 拡張予定 |
-| INV-13 | `BloomFilter.bitCount` は 8 の倍数                     | 個別テスト                                                                                                                | 拡張予定 |
-| INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`       | 個別テスト                                                                                                                | 拡張予定 |
-| INV-15 | `RowReader` は Open / Exhausted / Closed のいずれか    | `closed` / `exhausted` の bool 2つ                                                                                        | 拡張予定 |
-| INV-16 | `Session` のロック規約                                 | `stateGate` / `writeGate` とコメント                                                                                      | 拡張予定 |
-| INV-17 | lease の所有権                                         | `ProcessLockHandle` / `ProcessLockLease` / `RegistrationLease`                                                            | ✅ 完了  |
-| INV-18 | `Expr.children` / `plugChildren` の arity              | `Ast` の個別テスト                                                                                                        | 拡張予定 |
+| ID     | 不変条件                                                | 担保                                                                                                                      | 状態     |
+| ------ | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | -------- |
+| INV-01 | `Op` / `SstScan` は one-shot                            | `Op.emit` / `Op.compute`、`TestHelpers.oneShot`、`SstScan.ofStep` / `ofArray` / `ofState`、`SstScan.withScan`、ソース検査 | ✅ 完了  |
+| INV-02 | 返した行は DB 内部と独立                                | `SqlValue.copyRow`、`Engine.runSelect`、`RowReader.TryRead`                                                               | ✅ 完了  |
+| INV-03 | キー順の定義は 1つ                                      | `KeyOrder.compare`、`Entry.compareKeys`、`SstEntry.compare`                                                               | ✅ 完了  |
+| INV-04 | 意味の違う番号（manifest / file / seq / txn）を混ぜない | 単位 `manifestNo` / `txnId`（同型ペアの片側だけに付与）                                                                   | ✅ 完了  |
+| INV-05 | `TransactionManager` の SeqNo / Active / LastCommitted  | `TransactionManager.validate`                                                                                             | ✅ 完了  |
+| INV-06 | `Version` のレベル・番号・範囲                          | `Version.validate`                                                                                                        | ✅ 完了  |
+| INV-07 | compaction GC は可視集合を保存                          | `Compaction.gcGroup` と可視性プロパティテスト                                                                             | ✅ 完了  |
+| INV-08 | MANIFEST は追記専用・番号は単調                         | `VersionEdit` encode/decode + 再オープンのプロパティテスト                                                                | ✅ 完了  |
+| INV-09 | WAL は commit 済み prefix だけ再生                      | `Wal.foldCommitted` の全切断位置テスト                                                                                    | ✅ 完了  |
+| INV-10 | keyspace 接頭辞が混ざらない                             | `Keyspace.prefixedKey` と個別テスト                                                                                       | 拡張予定 |
+| INV-11 | ヘッダ長 = 行幅 = 射影長                                | `SelectProjection.create`（式・表示ヘッダ・参照ヘッダを一度に構築）                                                       | ✅ 完了  |
+| INV-12 | `Cursor` は `0 <= Pos <= End <= Data.Length`            | `Cursor.createSlice` の検証                                                                                               | 拡張予定 |
+| INV-13 | `BloomFilter.bitCount` は 8 の倍数                      | 個別テスト                                                                                                                | 拡張予定 |
+| INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`        | 個別テスト                                                                                                                | 拡張予定 |
+| INV-15 | `RowReader` は Reading / Exhausted / Closed のいずれか  | `RowReaderState`（状態 DU に置き換え、`releaseTo` が遷移と 1回解放を担当）                                                | ✅ 完了  |
+| INV-16 | `Session` のロック規約                                  | `stateGate` / `writeGate` とコメント                                                                                      | 拡張予定 |
+| INV-17 | lease の所有権                                          | `ProcessLockHandle` / `ProcessLockLease` / `RegistrationLease`                                                            | ✅ 完了  |
+| INV-18 | `Expr.children` / `plugChildren` の arity               | `Ast` の個別テスト                                                                                                        | 拡張予定 |
+| INV-19 | 保持する側はキー・行の所有権を複製で取り込む            | `Entry.takeOwnership` / `Transaction.setSlot` の複製と回帰テスト                                                          | ✅ 完了  |
 
 ### INV-01 SstScan
 
@@ -83,6 +84,42 @@ F# の型システムでは表現できないため、
 - 回帰テスト:
   - `順序保持プロパティ: Entry と SstEntry の並びが一致する`
   - `順序保持プロパティ: KeyOrder は反対称で推移的`
+
+### INV-04 意味の違う番号
+
+- **単位は `Types.fs` に集約**（`Memtable` / `Wal` より前のコンパイル順で使うため）。
+  `TxnId` の型略記もここに置く（`Transactions.fs` に置くと `Wal.fs` から見えない）。
+
+  ```fsharp
+  [<Measure>] type manifestNo
+  [<Measure>] type txnId
+  type internal TxnId = uint64<txnId>
+  ```
+
+- **同型で紛れやすい組の片側だけに単位を付ける**。
+  片側だけでも対は区別できる（`int64<manifestNo>` と `int64` は互いに代入できない）。
+
+  | 素の型   | 意味 A（素のまま）              | 意味 B（単位付き）              |
+  | -------- | ------------------------------- | ------------------------------- |
+  | `int64`  | `FileNumber` / `NextFileNumber` | `ManifestNumber` (`manifestNo`) |
+  | `uint64` | `SeqNo` / `ActiveSnapshot`      | `TxnId` (`txnId`)               |
+
+  `FileNumber`（int64）と `SeqNo`（uint64）は元々別型なので混ざらない。
+  実際に危なかったのは**同じ素の型どうし**の 2組。
+
+- **単位は直列化の境界でだけ外す**。
+  WAL / ファイル名は素のバイト列なので、書き出しで `uint64 txnId`、
+  読み込みで `LanguagePrimitives.Int64WithMeasure` / `UInt64WithMeasure` を使う
+  （parse, don't validate）。
+- `sprintf "%d"` / `max` / `compare` / `Map` / `Set` は単位付きのまま使える。
+  使えないのは**単位が付いたリテラル**と**素との加減算**だけ
+  （`1UL` → `1UL<txnId>`、`LanguagePrimitives.UInt64WithMeasure`）。
+- 実際に効いた箇所（ともにビルド時に FS0001）:
+  - `Manifest.logAndApply dir 1L` ← `1L` は file number 扱いで拒否された
+  - `StorageEngine.NextTxnId = 1UL` ← `NextSeqNo`（素の uint64）との取り違えを拒否
+- 単位は実行時に消えるのでコストは 0。
+  `Manifest` / `StorageEngine` / `VersionSet` / `Transactions` / `Wal` / `ExecContext`
+  と対応テストが対象。
 
 ### INV-05 TransactionManager
 
@@ -151,6 +188,20 @@ F# の型システムでは表現できないため、
   - `SelectProjection: ヘッダと式の列数が一致する`
   - `SelectProjection: 項目が空なら入力スキーマをそのまま使う`
 
+### INV-15 RowReader の状態
+
+- 宣言: `Reading` / `Exhausted` / `Closed` のいずれか 1 つ。
+- 理由: 以前は `closed` / `exhausted` の bool 2 つで、
+  「終端後」と「Dispose 後」の区別が**判定の順序に依存**し、
+  両方が true になる状態も作れた。
+- 担保:
+  - `RowReaderState`（`Reading of Op` を含む private DU）が単一の状態。
+  - `releaseTo next` が「`Reading` のときだけ `release ()` を呼んで遷移する」ので、
+    `release` は 1 回しか呼ばれないことも型ではなく遷移で保たれる。
+  - `Exhausted` と `Closed` はどちらも解放済みで、`TryRead` の結果だけが違う。
+- 回帰テスト: 既存の `RowReader: 終端後の TryRead` / `Dispose 後の TryRead` /
+  `Dispose すると Close が待たずに完了できる`。
+
 ### INV-17 lease
 
 - `ProcessLockHandle` が所有権ハンドルを表し、`IsOwner` はこの型だけを受け取る。
@@ -158,13 +209,36 @@ F# の型システムでは表現できないため、
   `ProcessLock.release` の呼び出しは lease 内だけ。
 - 回帰テスト: 既存のプロセスロック / 古いハンドルの Close テスト。
 
+### INV-19 保持する側の所有権
+
+- 宣言: **保持する側**（memtable の Treap / transaction のバッファ）は、
+  渡されたキー・行を複製してから保持する。
+  呼び出し側が後から配列を書き換えても格納内容と順序は変わらない。
+- 理由: Treap の探索と `Map<byte array, _>` の順序は**配列の中身**に依存する。
+  所有権を渡したのに複製しないと、後からの書き換えで木 / バッファが壊れる
+  （F# に線形型が無いので、コメント契約ではなく複製で保つ）。
+- 担保:
+  - `Entry.takeOwnership`（キー + 行。Blob の `byte[]` も複製）— `Memtable.insert` が呼ぶ。
+  - `Transaction.setSlot` — `put` / `remove` の入口で複製。
+  - `SqlValue.copyRow` は INV-02（出口）と INV-19（入口）で共有。
+- 回帰テスト（**修正前に実際に失敗することを確認済み**）:
+  - `Memtable: 挿入したキー配列を後から書き換えても木は保たれる`
+  - `Memtable: 挿入した行配列を後から書き換えても値は変わらない`
+  - `Transaction: put したキー・行配列を後から書き換えてもバッファは保たれる`
+- コスト: キー + 行の複製で 1行あたり約 0.4µs（20万行の実測）。
+  50k行 INSERT の全体（5.7秒）に対し約 0.7%。正しさを優先して採用。
+- **`SstEntry` は複製しない**（読み取り専用のビュー）。
+  走査で得たエントリは保持せず、出力は `SqlValue.copyRow` を通る。
+  所有するのはデコード元と memtable。
+
 ---
 
 ## 既知の穴（次の候補）
 
-- `FileNumber` / `SeqNo` は素の数値。units of measure / newtype 化は未実施。
+- `FileMetaData.FileNumber` と `Version.NextFileNumber` は素の `int64` のまま
+  （同じ意味なので統一不要。単位は意味が違う数値にだけ付ける）。
 - `Cursor` / `Writer` / `Entry` / `SstEntry` の record リテラルは直接構築できる（ソース検査なし）。
-- `RowReader` の状態は `closed` / `exhausted` の bool 2つで、状態 DU にはなっていない。
 - `Session` / `EngineHost` の並行操作をランダムに組み合わせるストレステストは未実施。
 - `BloomFilter.bitCount` / `Memtable.ApproxBytes` の会計は個別テストのみ。
-- 内部 API（`Memtable` / `Transaction` / `SstEntry`）のキー・行の所有権はコメント契約のまま。
+- INV-19 は 2回所持するため、commit 経路（`Transaction.put` → `Memtable.insert`）は行を 2回複製する。
+  単純な重複排除には「複製済みを渡す」経路（線形型）が必要で、現状はコストを許容している。

@@ -1,5 +1,21 @@
 namespace RykDb.Core
 
+/// 意味の違う数値を取り違えないための単位。
+/// 素の `int64` / `uint64` 同士は取り違えてもコンパイルが通る。
+/// そこで**同型で紛れやすい組の片側だけ**に単位を付ける:
+/// - `manifestNo` — MANIFEST 番号（`FileNumber` / `NextFileNumber` は素の `int64` のまま）
+/// - `txnId` — transaction 番号（`NextSeqNo` は素の `uint64` のまま）
+/// 片側だけでも対が区別できる（`int64<manifestNo>` と `int64` は代入できない）。
+[<Measure>]
+type manifestNo
+
+[<Measure>]
+type txnId
+
+/// transaction の識別子。
+/// 単位 `txnId` を持つ。
+type internal TxnId = uint64<txnId>
+
 /// 実行時の値。
 /// NULL は他のすべての型と区別できる特別なケースとして持つ。
 [<RequireQualifiedAccess>]

@@ -56,7 +56,8 @@ type internal StorageEngine =
         /// データベースのディレクトリ
         Dir: string
         /// 有効な manifest 番号
-        ManifestNumber: int64
+        /// （単位 `manifestNo`。SSTable のファイル番号とは取り違えない）。
+        ManifestNumber: int64<manifestNo>
         /// 現在の LSM 形状
         Version: Version
         /// 書き込み先 memtable
@@ -66,7 +67,7 @@ type internal StorageEngine =
         /// 次に採番する seqNo
         NextSeqNo: uint64
         /// 次に採番する txnId
-        NextTxnId: uint64
+        NextTxnId: TxnId
         /// memtable のメモリ上限（超えたら flush する）
         MemLimitBytes: int
         /// コンパクションの設定
@@ -86,9 +87,8 @@ module internal StorageEngine =
     // 異なる DB は並行に進められるよう、ディレクトリ単位の Gate にする
     // （プロセス全体の 1本にしない）。
     let private DirGates =
-        System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.SemaphoreSlim>(
+        System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.SemaphoreSlim>
             System.StringComparer.Ordinal
-        )
 
     let private normalizeDir (dir: string) =
         match protect (fun () -> System.IO.Path.GetFullPath dir) with
@@ -317,7 +317,7 @@ module internal StorageEngine =
     let private writeBatchCore (sync: bool) (entries: Entry array) (engine: StorageEngine) =
         let apply wal txnId =
             let mem = Memtable.apply entries engine.Mem
-            let nextTxnId = txnId + 1UL
+            let nextTxnId = txnId + 1UL<txnId>
 
             { engine with
                 Wal = wal
@@ -577,12 +577,12 @@ module internal StorageEngine =
         let emptyEngine dir =
             {
                 Dir = dir
-                ManifestNumber = 1L
+                ManifestNumber = 1L<manifestNo>
                 Version = Version.Empty
                 Mem = Memtable.Empty
                 Wal = { FileNumber = 1L; Size = 0 }
                 NextSeqNo = 1UL
-                NextTxnId = 1UL
+                NextTxnId = 1UL<txnId>
                 MemLimitBytes = DefaultMemLimitBytes
                 Compaction = CompactionOptions.Defaults
                 ActiveSnapshot = 0UL
@@ -591,7 +591,7 @@ module internal StorageEngine =
 
         let buildRecovered version manifestNumber walState mem walMax diskMax walMaxTxn =
             let nextSeqNo = max walMax diskMax + 1UL
-            let nextTxnId = walMaxTxn + 1UL
+            let nextTxnId = walMaxTxn + 1UL<txnId>
 
             let bumped =
                 { version with

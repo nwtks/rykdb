@@ -10,7 +10,7 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 /// logAndApply して新しい Version を返す（失敗はテストを落とす）。
-let private applyEdit (dir: string) (manifestNumber: int64) (version: Version) (edit: VersionEdit) =
+let private applyEdit (dir: string) (manifestNumber: int64<manifestNo>) (version: Version) (edit: VersionEdit) =
     match Manifest.logAndApply dir manifestNumber version edit with
     | Ok(next, _) -> next
     | Error e ->
@@ -21,7 +21,7 @@ let private applyEdit (dir: string) (manifestNumber: int64) (version: Version) (
 let ``Manifest: 新規作成と CURRENT の内容`` () =
     withDir "manifest-new" (fun dir ->
         let version, manifestNumber = ok (Manifest.openOrCreate dir)
-        Assert.Equal(1L, manifestNumber)
+        Assert.Equal<int64<manifestNo>>(1L<manifestNo>, manifestNumber)
         Assert.Equal<int array>([| 0; 0; 0; 0; 0; 0; 0 |], levelCounts version))
 
 [<Fact>]
@@ -46,7 +46,7 @@ let ``Manifest: 変更を反映して再オープンしても復元できる`` (
 
         // 再オープンで同じ Version に戻る
         let reopened, manifestNumber2 = ok (Manifest.openOrCreate dir)
-        Assert.Equal(manifestNumber, manifestNumber2)
+        Assert.Equal<int64<manifestNo>>(manifestNumber, manifestNumber2)
         Assert.Equal<int array>([| 0; 1; 0; 0; 0; 0; 0 |], levelCounts reopened)
         // 復元されたファイルの番号とキー範囲も一致する
         let restored = (Version.filesAt 1 reopened).[0]
@@ -131,7 +131,7 @@ let ``Manifest: 空の CURRENT は新規作成として扱う`` () =
         File.WriteAllText(Path.Combine(dir, "CURRENT"), "\n")
 
         let version, manifestNumber = ok (Manifest.openOrCreate dir)
-        Assert.Equal(1L, manifestNumber)
+        Assert.Equal<int64<manifestNo>>(1L<manifestNo>, manifestNumber)
         Assert.Empty(Version.allFiles version))
 
 [<Fact>]
@@ -143,7 +143,7 @@ let ``Manifest: CURRENT の .manifest 付き表記は番号として読む`` () 
         File.WriteAllText(Path.Combine(dir, "MANIFEST-000007"), "")
 
         let version, manifestNumber = ok (Manifest.openOrCreate dir)
-        Assert.Equal(7L, manifestNumber)
+        Assert.Equal<int64<manifestNo>>(7L<manifestNo>, manifestNumber)
         Assert.Empty(Version.allFiles version))
 
 [<Fact>]
@@ -218,11 +218,11 @@ let ``Manifest: 大きくなった manifest はスナップショットへロー
             }
 
         let _, mn1 = ok (Manifest.logAndApply dir mn0 v0 (VersionEdit.addFile file))
-        Assert.NotEqual<int64>(mn0, mn1)
+        Assert.NotEqual<int64<manifestNo>>(mn0, mn1)
 
         // 新しい manifest を CURRENT が指し、Version 全体が復元できる。
         let v2, mn2 = ok (Manifest.openOrCreate dir)
-        Assert.Equal<int64>(mn1, mn2)
+        Assert.Equal<int64<manifestNo>>(mn1, mn2)
         Assert.Equal<int>(1, Version.allFiles v2 |> List.length))
 
 [<Fact>]

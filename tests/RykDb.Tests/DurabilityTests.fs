@@ -17,7 +17,7 @@ let private pos (fileNumber: int64) (size: int) : WalState =
 let ``Wal: deferred append の位置を fsync でき、削除済みファイルは同期済み扱い`` () =
     withDir "wal-deferred-sync" (fun dir ->
         let state = ok (Wal.create dir 1L)
-        let state = ok (Wal.appendDeferred dir [ WalRecord.Commit 1UL ] state)
+        let state = ok (Wal.appendDeferred dir [ WalRecord.Commit 1UL<txnId> ] state)
         Assert.True(state.Size > 0)
         ok (Wal.sync dir state)
         Assert.True(System.IO.File.Exists(Wal.path dir 1L))

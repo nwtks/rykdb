@@ -28,7 +28,7 @@ module internal ExecContext =
             Visible = visible
             Schemas = Map.empty
             Catalog = Catalog.Empty
-            Txn = Transaction.create 0UL { SeqNo = 0UL }
+            Txn = Transaction.create 0UL<txnId> { SeqNo = 0UL }
             Scope = ScanScope()
         }
 

@@ -57,6 +57,20 @@ type SessionOptions =
 
 type private ResultBudget = { RowsLeft: int64; BytesLeft: int64 }
 
+/// `RowReader` の読み取り状態。
+/// <remarks>
+/// 「読んでいる / 読み終えた / 閉じた」を 1つの値で表す。
+/// `Reading` だけが走査と snapshot を保持している（他 2状態は解放済み）。
+/// </remarks>
+[<NoEquality; NoComparison>]
+type private RowReaderState =
+    /// 読み取り中。
+    | Reading of Op
+    /// 読み取りを終えた（リソースは解放済み）。
+    | Exhausted
+    /// `Dispose` / 読み取りエラーでリソースを解放した。
+    | Closed
+
 /// SELECT 結果を1行ずつ読むリーダー。
 /// <remarks>
 /// `Session.TryOpenReader` が返す。
@@ -64,14 +78,18 @@ type private ResultBudget = { RowsLeft: int64; BytesLeft: int64 }
 /// 1つのインスタンスを複数スレッドから同時に使ってはならない。
 /// </remarks>
 type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
-    let mutable current = op
-    let mutable closed = false
-    let mutable exhausted = false
+    let mutable state = Reading op
 
-    let releaseResources () =
-        if not closed then
-            closed <- true
+    /// リソースを解放して次の状態にする。
+    /// `Reading` 以外（既に解放済み）なら何もしないので、
+    /// `release` は 1回しか呼ばれない。
+    let releaseTo next =
+        match state with
+        | Reading _ ->
+            state <- next
             release ()
+        | Exhausted
+        | Closed -> ()
 
     /// 列名。
     member _.Columns = columns
@@ -80,32 +98,30 @@ type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
     /// 終端では `Ok None` を返し、リソースを自動で解放する。
     /// 明示的に `Dispose` した後に呼ぶとエラーになる。
     member _.TryRead() =
-        if exhausted then
-            ret None
-        elif closed then
-            err (DbError.internalError "RowReader は閉じられています")
-        else
+        match state with
+        | Exhausted -> ret None
+        | Closed -> err (DbError.internalError "RowReader は閉じられています")
+        | Reading current ->
             match Op.next current with
             | Error e ->
-                releaseResources ()
+                releaseTo Closed
                 err e
             | Ok None ->
-                exhausted <- true
-                releaseResources ()
+                releaseTo Exhausted
                 ret None
             | Ok(Some(row, nxt)) ->
-                current <- nxt
+                state <- Reading nxt
                 ret (Some(SqlValue.copyRow row))
 
     override _.Finalize() =
         try
-            releaseResources ()
+            releaseTo Closed
         with _ ->
             ()
 
     interface System.IDisposable with
         member this.Dispose() =
-            releaseResources ()
+            releaseTo Closed
             System.GC.SuppressFinalize this
 
 [<RequireQualifiedAccess>]

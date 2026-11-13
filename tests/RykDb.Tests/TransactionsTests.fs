@@ -31,7 +31,11 @@ let private validate (m: TransactionManager) =
             else
                 fail "NextSeqNo が LastCommitSeqNo 以下"
 
-        do! if m.NextTxnId > 0UL then ret () else fail "NextTxnId が 0"
+        do!
+            if m.NextTxnId > 0UL<txnId> then
+                ret ()
+            else
+                fail "NextTxnId が 0"
 
         do!
             if m.Active |> Map.forall (fun id txn -> txn.TxnId = id && id < m.NextTxnId) then
@@ -66,15 +70,15 @@ let private validate (m: TransactionManager) =
 [<Fact>]
 let ``Transaction.create: 空の transaction`` () =
     let snap = { Snapshot.SeqNo = 0UL }
-    let txn = Transaction.create 1UL snap
-    Assert.Equal(1UL, txn.TxnId)
+    let txn = Transaction.create 1UL<txnId> snap
+    Assert.Equal<uint64<txnId>>(1UL<txnId>, txn.TxnId)
     Assert.Equal(0UL, txn.Snapshot.SeqNo)
     Assert.True(Map.isEmpty txn.Buffers)
 
 [<Fact>]
 let ``Transaction.put / remove: Writes に反映される`` () =
     let snap = { Snapshot.SeqNo = 0UL }
-    let txn0 = Transaction.create 1UL snap
+    let txn0 = Transaction.create 1UL<txnId> snap
     let txn1 = Transaction.put "t:people" (rowKey 1) [| SqlValue.Int 1L |] txn0
     Assert.True(Map.containsKey "t:people" txn1.Buffers)
 
@@ -105,9 +109,26 @@ let ``Transaction: バッファ上限を超えると commit できない`` () =
     expectErrorKind ErrorKind.CapacityError "上限を超えた transaction を commit できてしまう" (TransactionManager.commit txn mgr)
 
 [<Fact>]
+let ``Transaction: put したキー・行配列を後から書き換えてもバッファは保たれる`` () =
+    let key = rowKey 1
+    let row = [| SqlValue.Int 1L |]
+
+    let txn =
+        Transaction.put "t:x" key row (Transaction.create 1UL<txnId> (snapshot (TransactionManager.create ())))
+
+    // put の後に呼び出し側が配列を書き換える（所有権を越えた変更）。
+    key.[0] <- 0xFFuy
+    row.[0] <- SqlValue.Int 999L
+
+    match Transaction.tryFind "t:x" (rowKey 1) txn with
+    | Some(Some v) -> Assert.Equal<int64>(1L, asInt v.[0])
+    | Some None -> Assert.Fail "put した行が tombstone になった"
+    | None -> Assert.Fail "put したキーが見つからない（バッファが壊れた）"
+
+[<Fact>]
 let ``Transaction: ApproxBytes は値の上書きで減る`` () =
     let snap = { Snapshot.SeqNo = 0UL }
-    let txn0 = Transaction.create 1UL snap
+    let txn0 = Transaction.create 1UL<txnId> snap
 
     let txn1 =
         Transaction.put "t:x" [| 1uy |] [| SqlValue.Text(System.String('x', 1000)) |] txn0
@@ -123,7 +144,7 @@ let ``Transaction.conflictKey: keyspace と key を連結`` () =
 [<Fact>]
 let ``Transaction.writeKeys: 書き込みキーを返す`` () =
     let snap = { Snapshot.SeqNo = 0UL }
-    let txn0 = Transaction.create 1UL snap
+    let txn0 = Transaction.create 1UL<txnId> snap
     let txn1 = Transaction.put "t:people" (rowKey 1) [| SqlValue.Int 1L |] txn0
     let keys = Transaction.writeKeys txn1
     Assert.Equal(1, keys.Count)

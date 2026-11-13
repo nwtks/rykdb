@@ -394,7 +394,7 @@ let ``StorageEngine.openDatabase: 実ファイルが消えていても NextFileN
         let _ = ok (Manifest.openOrCreate dir)
 
         let _ =
-            ok (Manifest.logAndApply dir 1L Version.Empty (VersionEdit.addFile (fmd 1L 0 1 1)))
+            ok (Manifest.logAndApply dir 1L<manifestNo> Version.Empty (VersionEdit.addFile (fmd 1L 0 1 1)))
 
         let _ = ok (Wal.create dir 0L)
         let engine = ok (StorageEngine.openDatabaseWith None dir)
@@ -410,7 +410,10 @@ let ``StorageEngine.openDatabase: 最大 SeqNo はファイルの並び順に関
         // SeqNo が「後のファイルで小さくなる」並び（キー順では fA → fB）
         let fA = mkSst dir 10L 0 [ Entry.put (intKey 1) 5UL (intRow 1) ]
         let fB = mkSst dir 11L 0 [ Entry.put (intKey 2) 3UL (intRow 2) ]
-        let v1, m1 = ok (Manifest.logAndApply dir 1L Version.Empty (VersionEdit.addFile fA))
+
+        let v1, m1 =
+            ok (Manifest.logAndApply dir 1L<manifestNo> Version.Empty (VersionEdit.addFile fA))
+
         let _ = ok (Manifest.logAndApply dir m1 v1 (VersionEdit.addFile fB))
         let engine = ok (StorageEngine.openDatabaseWith None dir)
         // 再開後はファイル内の最大 SeqNo（5）の次から書ける
@@ -424,17 +427,17 @@ let ``StorageEngine.openDatabase: NextTxnId は WAL の最大 txnId + 1 から�
         let engine =
             ok (StorageEngine.writeBatch [| Entry.put (intKey 1) 1UL (intRow 1) |] engine)
 
-        Assert.Equal(2UL, engine.NextTxnId)
+        Assert.Equal<uint64<txnId>>(2UL<txnId>, engine.NextTxnId)
 
         // WAL を再生して採番を巻き戻さない
         let reopened = ok (StorageEngine.openDatabaseWith None dir)
-        Assert.Equal(2UL, reopened.NextTxnId)
+        Assert.Equal<uint64<txnId>>(2UL<txnId>, reopened.NextTxnId)
 
         let reopened =
             ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] reopened)
 
-        Assert.Equal(3UL, reopened.NextTxnId)
-        Assert.Equal(3UL, (ok (StorageEngine.openDatabaseWith None dir)).NextTxnId))
+        Assert.Equal<uint64<txnId>>(3UL<txnId>, reopened.NextTxnId)
+        Assert.Equal<uint64<txnId>>(3UL<txnId>, (ok (StorageEngine.openDatabaseWith None dir)).NextTxnId))
 
 [<Fact>]
 let ``StorageEngine.openDatabase: 孤児の SSTable は削除せず退避する`` () =

@@ -17,11 +17,11 @@ module internal Manifest =
     [<Literal>]
     let ManifestPrefix = "MANIFEST-"
 
-    let private fileName (fileNumber: int64) =
-        sprintf "%s%06d" ManifestPrefix fileNumber
+    let private fileName (manifestNumber: int64<manifestNo>) =
+        sprintf "%s%06d" ManifestPrefix manifestNumber
 
-    let private manifestPath (dir: string) (fileNumber: int64) =
-        System.IO.Path.Combine(dir, fileName fileNumber)
+    let private manifestPath (dir: string) (manifestNumber: int64<manifestNo>) =
+        System.IO.Path.Combine(dir, fileName manifestNumber)
 
     [<Literal>]
     let CurrentFileName = "CURRENT"
@@ -29,10 +29,10 @@ module internal Manifest =
     let private currentPath (dir: string) =
         System.IO.Path.Combine(dir, CurrentFileName)
 
-    let private writeCurrent (dir: string) (fileNumber: int64) =
+    let private writeCurrent (dir: string) (manifestNumber: int64<manifestNo>) =
         protect (fun () ->
             let tmp = currentPath dir + ".tmp"
-            System.IO.File.WriteAllText(tmp, fileName fileNumber + "\n")
+            System.IO.File.WriteAllText(tmp, fileName manifestNumber + "\n")
 
             use fs =
                 new System.IO.FileStream(
@@ -91,9 +91,15 @@ module internal Manifest =
                     if text = "" then
                         None
                     elif text.StartsWith ManifestPrefix && text.EndsWith ".manifest" then
-                        Some(System.Int64.Parse(text.Substring(9, text.Length - 9 - ".manifest".Length)))
+                        text.Substring(9, text.Length - 9 - ".manifest".Length)
+                        |> System.Int64.Parse
+                        |> LanguagePrimitives.Int64WithMeasure<manifestNo>
+                        |> Some
                     elif text.StartsWith ManifestPrefix then
-                        Some(System.Int64.Parse(text.Substring 9))
+                        text.Substring 9
+                        |> System.Int64.Parse
+                        |> LanguagePrimitives.Int64WithMeasure<manifestNo>
+                        |> Some
                     else
                         raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
 
@@ -109,16 +115,18 @@ module internal Manifest =
                     | Error _ when rest |> List.forall (fun l -> l.Trim() = "") -> ret (List.rev acc, true)
                     | Error e -> err e
 
-        let read dir fileNumber =
-            let path = manifestPath dir fileNumber
+        let read dir manifestNumber =
+            let path = manifestPath dir manifestNumber
 
             if System.IO.File.Exists path then
                 ret (System.IO.File.ReadAllLines path |> Array.toList)
             else
-                err (sprintf "有効な manifest が見つかりません: %s" (fileName fileNumber) |> DbError.corruption)
+                sprintf "有効な manifest が見つかりません: %s" (fileName manifestNumber)
+                |> DbError.corruption
+                |> err
 
-        let readAll dir fileNumber =
-            match protect (fun () -> read dir fileNumber) with
+        let readAll dir manifestNumber =
+            match protect (fun () -> read dir manifestNumber) with
             | Error e -> err e
             | Ok(Error e) -> err e
             | Ok(Ok lines) ->
@@ -152,7 +160,7 @@ module internal Manifest =
                 if hasSsts then
                     return! err (DbError.corruption "CURRENT が無いのに SSTable が残っています（データ損失の恐れ）")
                 else
-                    let manifestNumber = 1L
+                    let manifestNumber = 1L<manifestNo>
 
                     let! _ =
                         protect (fun () -> System.IO.File.WriteAllText(manifestPath dir manifestNumber, ""))
@@ -166,10 +174,15 @@ module internal Manifest =
     let private MaxManifestBytes = 4L * 1024L * 1024L
 
     /// .VersionEdit を反映し、Version と次の manifest 番号を返す。
-    let logAndApply (dir: string) (manifestNumber: int64) (version: Version) (edit: VersionEdit) =
-        let append dir fileNumber edit =
+    /// <remarks>
+    /// `manifestNumber` は単位 `manifestNo` を持つ。
+    /// この関数は `version.NextFileNumber`（SSTable のファイル番号・素の `int64`）も扱うので、
+    /// 2つの番号を取り違えるとコンパイルが通らない。
+    /// </remarks>
+    let logAndApply (dir: string) (manifestNumber: int64<manifestNo>) (version: Version) (edit: VersionEdit) =
+        let append dir manifestNumber edit =
             protect (fun () ->
-                let path = manifestPath dir fileNumber
+                let path = manifestPath dir manifestNumber
                 let text = encodeRecord (VersionEdit.encode edit)
 
                 use fs =
@@ -189,7 +202,7 @@ module internal Manifest =
 
             if name.StartsWith(ManifestPrefix, System.StringComparison.Ordinal) then
                 match System.Int64.TryParse(name.Substring 9) with
-                | true, value -> Some value
+                | true, value -> Some(LanguagePrimitives.Int64WithMeasure<manifestNo> value)
                 | _ -> None
             else
                 None
@@ -199,9 +212,9 @@ module internal Manifest =
                 System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")
                 |> Array.choose parseManifestNumber
                 |> Array.fold (fun acc number -> max acc number) current
-                |> fun highest -> highest + 1L)
+                |> fun highest -> highest + 1L<manifestNo>)
 
-        let writeSnapshot dir fileNumber version =
+        let writeSnapshot dir manifestNumber version =
             protect (fun () ->
                 let edit =
                     {
@@ -214,7 +227,7 @@ module internal Manifest =
 
                 use fs =
                     new System.IO.FileStream(
-                        manifestPath dir fileNumber,
+                        manifestPath dir manifestNumber,
                         System.IO.FileMode.Create,
                         System.IO.FileAccess.Write,
                         System.IO.FileShare.Read

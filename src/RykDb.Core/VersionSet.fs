@@ -318,11 +318,14 @@ module internal VersionEdit =
                 ]
         }
 
-/// MANIFEST に反映済みの現在状態（background compaction が共有する）。
+/// MANIFEST に反映済みの現在状態
+/// （background compaction が共有する）。
 type internal HostState =
     {
         Version: Version
-        ManifestNumber: int64
+        /// 有効な manifest 番号
+        /// （SSTable のファイル番号とは単位が違う）。
+        ManifestNumber: int64<manifestNo>
         /// commit 時に更新される GC 境界。0 は「全版を残す」。
         ActiveSnapshot: uint64
         /// 直近の compaction の失敗（成功したら None）。
@@ -332,7 +335,7 @@ type internal HostState =
     }
 
 module internal HostState =
-    let initial (version: Version) (manifestNumber: int64) =
+    let initial (version: Version) (manifestNumber: int64<manifestNo>) =
         {
             Version = version
             ManifestNumber = manifestNumber

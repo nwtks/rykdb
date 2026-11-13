@@ -55,6 +55,18 @@ module internal Entry =
         let h = Hashing.hashBytes e.Key
         Hashing.mix (h ^^^ e.SeqNo * 0x9E3779B97F4A7C15UL) |> Hashing.mix
 
+    /// 所有権を移す: キーと行を複製する。
+    /// <remarks>
+    /// Treap の探索と `KeyOrder.compare` は配列の**中身**に依存するので、
+    /// 挿入後に呼び出し側が書き換えると木が壊れる。
+    /// 保持する側（memtable / transaction バッファ）がこれを呼ぶ。
+    /// </remarks>
+    let takeOwnership (given: Entry) =
+        { given with
+            Key = Array.copy given.Key
+            Value = given.Value |> Option.map SqlValue.copyRow
+        }
+
     let private encodeEntry (e: Entry) =
         let body =
             Writer.build
@@ -90,11 +102,13 @@ module internal Entry =
                 }
         }
 
-    let encodeBatch (txnId: uint64) (entries: Entry array) =
+    let encodeBatch (txnId: TxnId) (entries: Entry array) =
         entries
         |> Array.fold
             (fun w e -> Writer.writeBytes (encodeEntry e) w)
-            (Writer.Empty |> Writer.uint64BE txnId |> Writer.varint (uint64 entries.Length))
+            (Writer.Empty
+             |> Writer.uint64BE (uint64 txnId)
+             |> Writer.varint (uint64 entries.Length))
         |> Writer.toArray
 
     let decodeBatch (data: byte array) =
@@ -107,14 +121,14 @@ module internal Entry =
 
         result {
             let c = Cursor.create data
-            let! txnId, c = Reader.readUint64BE c
+            let! rawTxnId, c = Reader.readUint64BE c
             let! count, c = Reader.readVarint c
 
             if count > uint64 System.Int32.MaxValue then
                 return! err (sprintf "Wal: バッチのエントリ数が大きすぎます (%d)" count |> DbError.corruption)
             else
                 let! items, _ = Reader.readItems readOne count c
-                return txnId, List.toArray items
+                return LanguagePrimitives.UInt64WithMeasure<txnId> rawTxnId, List.toArray items
         }
 
 /// 永続 Treap。
@@ -148,7 +162,11 @@ module internal Memtable =
         }
 
     /// 1エントリを挿入する。
-    let insert (e: Entry) (mem: Memtable) =
+    /// <remarks>
+    /// 保持する側なので `Entry.takeOwnership` でキーと行を複製する
+    /// （呼び出し側が後から配列を書き換えても木が壊れないようにする）。
+    /// </remarks>
+    let insert (given: Entry) (mem: Memtable) =
         let rec unwind left right stack target =
             match stack with
             | [] -> left, right
@@ -212,6 +230,8 @@ module internal Memtable =
         let insertNode e root =
             let p = Entry.priority e
             descend e p [] root
+
+        let e = Entry.takeOwnership given
 
         {
             Root = insertNode e mem.Root

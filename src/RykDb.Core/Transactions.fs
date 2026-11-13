@@ -14,9 +14,6 @@
 
 namespace RykDb.Core
 
-/// transaction の識別子。
-type internal TxnId = uint64
-
 /// 読み取りの可視性境界。
 /// これより大きい SeqNo の書き込みは見えない。
 type internal Snapshot = { SeqNo: uint64 }
@@ -67,7 +64,21 @@ module internal Transaction =
 
         int64 keyspace.Length + 48L + 24L + int64 key.Length + int64 rowBytes
 
-    let private setSlot (keyspace: string) (key: byte array) (slot: SqlValue array option) (txn: Transaction) =
+    /// <remarks>
+    /// **所有権を移す**:
+    /// キーは Map の順序の根拠、行は read-your-writes が返す値なので、
+    /// 呼び出し側が後から配列を書き換えるとバッファが壊れる。
+    /// そこでここで複製する。
+    /// </remarks>
+    let private setSlot
+        (keyspace: string)
+        (givenKey: byte array)
+        (givenSlot: SqlValue array option)
+        (txn: Transaction)
+        =
+        let key = Array.copy givenKey
+        let slot = givenSlot |> Option.map SqlValue.copyRow
+
         let inner =
             match Map.tryFind keyspace txn.Buffers with
             | Some m -> m
@@ -182,7 +193,7 @@ module internal TransactionManager =
     let create () =
         {
             NextSeqNo = 1UL
-            NextTxnId = 1UL
+            NextTxnId = 1UL<txnId>
             LastCommitted = Map.empty
             Active = Map.empty
             LastCommitSeqNo = 0UL
@@ -203,7 +214,7 @@ module internal TransactionManager =
 
         let updated =
             { manager with
-                NextTxnId = manager.NextTxnId + 1UL
+                NextTxnId = manager.NextTxnId + 1UL<txnId>
                 Active = Map.add manager.NextTxnId txn manager.Active
             }
 

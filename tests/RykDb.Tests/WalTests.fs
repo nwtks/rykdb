@@ -24,15 +24,15 @@ let ``Wal.foldCommitted: コミット済みだけを順に再生する`` () =
 
         let records =
             [
-                WalRecord.Begin 1UL
-                WalRecord.Batch(1UL, [| e1 |])
-                WalRecord.Commit 1UL
-                WalRecord.Begin 2UL
-                WalRecord.Batch(2UL, [| e2 |])
-                WalRecord.Abort 2UL
-                WalRecord.Begin 3UL
-                WalRecord.Batch(3UL, [| e3 |])
-                WalRecord.Commit 3UL
+                WalRecord.Begin 1UL<txnId>
+                WalRecord.Batch(1UL<txnId>, [| e1 |])
+                WalRecord.Commit 1UL<txnId>
+                WalRecord.Begin 2UL<txnId>
+                WalRecord.Batch(2UL<txnId>, [| e2 |])
+                WalRecord.Abort 2UL<txnId>
+                WalRecord.Begin 3UL<txnId>
+                WalRecord.Batch(3UL<txnId>, [| e3 |])
+                WalRecord.Commit 3UL<txnId>
             ]
 
         let _ = ok (Wal.append dir records w0)
@@ -42,7 +42,7 @@ let ``Wal.foldCommitted: コミット済みだけを順に再生する`` () =
 
         Assert.Equal<uint64 list>([ 1UL; 3UL ], List.rev replayed |> List.map _.SeqNo)
         // Abort された txn 2 も含め、WAL に現れた最大 txnId を返す
-        Assert.Equal(3UL, maxTxnId))
+        Assert.Equal(3UL<txnId>, maxTxnId))
 
 [<Fact>]
 let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
@@ -59,21 +59,22 @@ let ``Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だ
 
         let records =
             [
-                for txnId in 1UL .. 20UL do
+                for i in 1..20 do
+                    // 生の連番 → 単位付き transaction 番号（言語境界の変換）。
+                    let txn = LanguagePrimitives.UInt64WithMeasure<txnId>(uint64 i)
                     let committed = random.Next 2 = 0
+                    yield WalRecord.Begin txn
 
-                    yield WalRecord.Begin txnId
-
-                    for i in 1 .. random.Next(0, 3) do
-                        let key = intKey (int txnId * 10 + i)
-                        let entry = Entry.put key (txnId * 10UL + uint64 i) (intRow (int txnId * 10 + i))
-                        yield WalRecord.Batch(txnId, [| entry |])
+                    for j in 1 .. random.Next(0, 3) do
+                        let key = intKey (i * 10 + j)
+                        let entry = Entry.put key (uint64 i * 10UL + uint64 j) (intRow (i * 10 + j))
+                        yield WalRecord.Batch(txn, [| entry |])
 
                     yield
                         if committed then
-                            WalRecord.Commit txnId
+                            WalRecord.Commit txn
                         else
-                            WalRecord.Abort txnId
+                            WalRecord.Abort txn
             ]
 
         let _ = ok (Wal.append dir records w0)
