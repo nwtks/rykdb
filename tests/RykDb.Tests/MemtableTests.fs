@@ -39,6 +39,56 @@ let ``Memtable: Count と ApproxBytes は挿入したエントリの合計にな
     Assert.Equal(entries |> Array.sumBy Entry.managedBytes, mem.ApproxBytes)
 
 [<Fact>]
+let ``Memtable: ランダム挿入でも Count と ApproxBytes は合計と一致する`` () =
+    let random = System.Random 20261117
+
+    // 重複キー・tombstone・BLOB・可変長 TEXT を混ぜて 400回挿入する。
+    let entries =
+        List.init 400 (fun i ->
+            let key = intKey (random.Next 60)
+
+            if random.Next 4 = 0 then
+                Entry.delete key (uint64 (i + 1))
+            else
+                let row =
+                    if random.Next 3 = 0 then
+                        [|
+                            SqlValue.Blob [| byte i |]
+                            SqlValue.Text(System.String(char (65 + random.Next 26), random.Next 40))
+                        |]
+                    else
+                        [| SqlValue.Int(int64 i) |]
+
+                Entry.put key (uint64 (i + 1)) row)
+
+    let mem = entries |> List.fold (fun m e -> Memtable.insert e m) Memtable.Empty
+    // 重複キーでも版ごとに加算されるので件数は挿入回数に一致する。
+    Assert.Equal<int>(List.length entries, mem.Count)
+    Assert.Equal<int>(List.sumBy Entry.managedBytes entries, mem.ApproxBytes)
+
+    // 挿入順を変えても合計は変わらない（会計が順序に依存しないこと）。
+    let reordered = List.rev entries
+    let mem2 = reordered |> List.fold (fun m e -> Memtable.insert e m) Memtable.Empty
+    Assert.Equal<int>(mem.ApproxBytes, mem2.ApproxBytes)
+
+    // 挿入後に呼び出し側が配列を書き換えても、保持している値と会計は変わらない。
+    let key = intKey 999
+    let row = [| SqlValue.Text(System.String('z', 100)) |]
+    let mem3 = Memtable.insert (Entry.put key 1UL row) Memtable.Empty
+    key.[0] <- 0uy
+    row.[0] <- SqlValue.Int 0L
+
+    match Memtable.getVisible (intKey 999) None mem3 with
+    | Some stored ->
+        match stored.Value with
+        | Some v ->
+            Assert.Equal<int>(100, (asText v.[0]).Length)
+            // 格納された内容と会計が一致したまま（複製されていないとここでずれる）。
+            Assert.Equal<int>(Entry.managedBytes stored, mem3.ApproxBytes)
+        | None -> Assert.Fail "格納された行が tombstone になった"
+    | None -> Assert.Fail "挿入したキーが引けない"
+
+[<Fact>]
 let ``Memtable: 挿入したキー配列を後から書き換えても木は保たれる`` () =
     let key = intKey 5
     let mem = Memtable.insert (Entry.put key 1UL (intRow 5)) Memtable.Empty

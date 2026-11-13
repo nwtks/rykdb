@@ -14,6 +14,117 @@ let private name n = Expr.Name n
 let private unary op e = Expr.Unary(op, e)
 let private binary op a b = Expr.Binary(op, a, b)
 
+/// サブクエリを含むノードのための空の SELECT。
+let private emptySelect =
+    {
+        Distinct = false
+        Items = [ { Expression = Expr.Star; Alias = None } ]
+        From = None
+        Joins = []
+        Where = None
+        GroupBy = []
+        Having = None
+        OrderBy = []
+        Limit = None
+        Offset = None
+    }
+
+/// `children` / `plugChildren` の arity 検査に使う全ノード種のサンプル。
+/// <remarks>
+/// `Expr` のケースを増やしたらここにも足す
+/// （ここに無いノードは arity のずれを検出できない）。
+/// </remarks>
+let private allNodeKinds =
+    let l = literal (Literal.Int 1L)
+    let l2 = literal (Literal.Int 2L)
+    let text = literal (Literal.String "a%")
+    let col = column (Some "t") "id"
+    let bare = name "n"
+
+    [
+        // 子を持たないノード
+        l
+        col
+        bare
+        Expr.Star
+        Expr.QualifiedStar "t"
+        Expr.Value(SqlValue.Int 1L)
+        Expr.Subquery emptySelect
+        Expr.Exists emptySelect
+        Expr.CorrelatedSubquery
+            {
+                Run = fun _ -> ret SqlValue.Null
+                Depths = [ 1 ]
+            }
+        Expr.Default
+        // 子を 1つ持つノード
+        unary UnaryOp.Neg col
+        Expr.IsNull(col, false)
+        Expr.IsNull(col, true)
+        Expr.IsTruth(col, TruthValue.Unknown, false)
+        Expr.Cast(col, DataType.Text)
+        Expr.AggCall(AggFunc.Sum, false, col)
+        Expr.AggCall(AggFunc.Count, true, Expr.Star)
+        Expr.InSubquery(col, emptySelect, false)
+        // 子を 2つ持つノード
+        binary BinaryOp.Add col l
+        Expr.Like(col, text, false, None)
+        // 子を可変数持つノード
+        Expr.Between(col, l, l2, false)
+        Expr.InList(col, [ l; l2 ], true)
+        Expr.InList(col, [], false)
+        Expr.FuncCall("COALESCE", [ col; l; l2 ])
+        Expr.FuncCall("ABS", [ col ])
+        // ELSE あり（子の個数が奇数になる）
+        Expr.Case([ col, l; bare, l2 ], Some text)
+        // ELSE なし（子の個数が偶数になる）
+        Expr.Case([ col, l; bare, l2 ], None)
+        Expr.Case([], Some text)
+        // ESCAPE あり（子が 3 つになる）
+        Expr.Like(col, text, true, Some(literal (Literal.String "\\")))
+    ]
+
+[<Fact>]
+let ``Ast: plugChildren は children と同じ順・同じ内容で復元する（全ノード種）`` () =
+    for e in allNodeKinds do
+        let kids = Expr.children e
+        let rebuilt = ok (Expr.plugChildren kids e)
+        Assert.Equal<string>(Expr.toDisplayString e, Expr.toDisplayString rebuilt)
+        Assert.Equal<int>(kids.Length, (Expr.children rebuilt).Length)
+
+[<Fact>]
+let ``Ast: plugChildren は子を渡した順にそのまま入れる`` () =
+    for e in allNodeKinds do
+        let n = (Expr.children e).Length
+        let markers = List.init n (fun i -> literal (Literal.Int(int64 i)))
+        let rebuilt = ok (Expr.plugChildren markers e)
+        let after = Expr.children rebuilt
+        Assert.Equal<int>(n, after.Length)
+
+        for i, child in List.indexed after do
+            match child with
+            | Expr.Literal(Literal.Int v) ->
+                Assert.True((v = int64 i), sprintf "子が入れ替わっている: 期待 %d だが %d（%s）" i v (Expr.toDisplayString e))
+            | other -> Assert.Fail(sprintf "子がマーカーでない: %s" (Expr.toDisplayString other))
+
+[<Fact>]
+let ``Ast: plugChildren は arity が children と合わないと InternalError`` () =
+    let marker = literal (Literal.Int 99L)
+
+    for e in allNodeKinds do
+        let n = (Expr.children e).Length
+
+        expectErrorKind
+            ErrorKind.InternalError
+            "1 つ多く渡しても arity のずれを検出できる"
+            (Expr.plugChildren (List.replicate (n + 1) marker) e)
+
+        if n > 0 then
+            expectErrorKind
+                ErrorKind.InternalError
+                "1 つ少なく渡しても arity のずれを検出できる"
+                (Expr.plugChildren (List.replicate (n - 1) marker) e)
+
 [<Fact>]
 let ``Ast: fold は全ノードを訪問する`` () =
     let e = Expr.Binary(BinaryOp.Add, Expr.Name "a", Expr.Name "b")

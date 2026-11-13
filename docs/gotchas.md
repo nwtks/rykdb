@@ -815,6 +815,20 @@ let pickMaxFrom gs = pickMax (gs + 1) gs ge
 let pickMaxFrom gs = pickMaxIdx (gs + 1) gs ge
 ```
 
+同種に **match パターンの変数が外側の `let` を隠す**場合がある。
+
+```fsharp
+// ❌ IsTruth のフィールド名 expected が外側の int を隠す
+let expected = List.length (children e)
+match e, kids with
+| Expr.IsTruth(_, expected, neg), [ x ] -> ...   // ここでは TruthValue
+// ✅ 外側の名前を変える
+let expectedChildren = List.length (children e)
+```
+
+隠れた側を参照しても型が合わなければエラーになるが、**まだ参照していない間は無言**。
+命名で避けるのが確実。
+
 ### 8.12 `op_GreaterGreaterEquals` の連鎖で末尾再帰が壊れる
 
 `Result` のbind を `>>=` で重ねると F# の末尾呼び出し最適化が効かない。
@@ -968,6 +982,24 @@ type internal TxnId = uint64<txnId>   // 略記もここに置く
   `TxnId` を `Transactions.fs` に置いていたと `Wal.fs` から見えず、
   `Types.fs`（measure のすぐ隣）へ移した。
 - 実行時は単位が消えるのでコストは 0。
+
+### 8.20 `f(x = y, msg)` は名前付き引数として解釈される（FS0691）
+
+```fsharp
+// ❌ `v = int64 i` が名前付き引数と解釈され FS0691「Named arguments must appear after all other arguments」
+Assert.True(
+    v = int64 i,
+    sprintf "子が入れ替わっている: %d" i
+)
+// ✅ 比較式を二重括弧で囲む
+Assert.True(
+    (v = int64 i),
+    sprintf "子が入れ替わっている: %d" i
+)
+```
+
+`f(a = b)` の形は F# の名前付き引数構文になる。
+比較代入の `=` だけが該当し、`>=` / `<=` / `<>` は対象外。
 
 ---
 

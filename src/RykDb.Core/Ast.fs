@@ -327,7 +327,7 @@ and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
 module internal Expr =
     /// 直接の子式をリストで返す（走査順は左から右）。
     /// 再帰は呼び出し側が行う。
-    let private children =
+    let internal children =
         function
         | Expr.Literal _
         | Expr.Column _
@@ -351,6 +351,58 @@ module internal Expr =
         | Expr.Cast(x, _) -> [ x ]
         | Expr.Default -> []
         | Expr.AggCall(_, _, x) -> [ x ]
+
+    /// `children` の逆変換。子の列を親ノードへ戻して式を組み直す。
+    /// 自分では再帰しない（再帰は `rewriteWithC` / `rewrite` が行う）。
+    /// <remarks>
+    /// 子の個数が `children` と食い違うと `InternalError` で返す
+    /// （arity がずれるとここが最初に落ちる。`AstTests` が全ノード種で検査する）。
+    /// </remarks>
+    let internal plugChildren (kids: Expr list) (e: Expr) =
+        let rec toPairs acc =
+            function
+            | w :: t :: tail -> toPairs ((w, t) :: acc) tail
+            | _ -> List.rev acc
+
+        let expectedChildren = List.length (children e)
+
+        let miss () =
+            sprintf "plugChildren: 子の個数が合いません（%d 個 / 期待 %d 個）" (List.length kids) expectedChildren
+            |> DbError.internalError
+            |> err
+
+        if List.length kids <> expectedChildren then
+            miss ()
+        else
+            match e, kids with
+            | Expr.Literal _, [] -> ret e
+            | Expr.Column _, [] -> ret e
+            | Expr.Name _, [] -> ret e
+            | Expr.Star, [] -> ret e
+            | Expr.QualifiedStar _, [] -> ret e
+            | Expr.Value _, [] -> ret e
+            | Expr.Subquery _, [] -> ret e
+            | Expr.Exists _, [] -> ret e
+            | Expr.CorrelatedSubquery _, [] -> ret e
+            | Expr.InSubquery(_, sel, neg), [ x ] -> ret (Expr.InSubquery(x, sel, neg))
+            | Expr.Unary(op, _), [ x ] -> ret (Expr.Unary(op, x))
+            | Expr.Binary(op, _, _), [ a; b ] -> ret (Expr.Binary(op, a, b))
+            | Expr.IsNull(_, neg), [ x ] -> ret (Expr.IsNull(x, neg))
+            | Expr.IsTruth(_, expected, neg), [ x ] -> ret (Expr.IsTruth(x, expected, neg))
+            | Expr.Between(_, _, _, neg), [ x; lo; hi ] -> ret (Expr.Between(x, lo, hi, neg))
+            | Expr.InList(_, _, neg), x :: xs -> ret (Expr.InList(x, xs, neg))
+            | Expr.Like(_, _, neg, None), [ x; p ] -> ret (Expr.Like(x, p, neg, None))
+            | Expr.Like(_, _, neg, Some _), [ x; p; esc ] -> ret (Expr.Like(x, p, neg, Some esc))
+            | Expr.Case(_, elseE), _ ->
+                match elseE, List.rev kids with
+                | None, _ -> ret (Expr.Case(toPairs [] kids, None))
+                | Some _, last :: branchRev -> ret (Expr.Case(List.rev branchRev |> toPairs [], Some last))
+                | Some _, [] -> miss ()
+            | Expr.FuncCall(n, _), xs -> ret (Expr.FuncCall(n, xs))
+            | Expr.Cast(_, dt), [ x ] -> ret (Expr.Cast(x, dt))
+            | Expr.Default, [] -> ret e
+            | Expr.AggCall(f, star, _), [ x ] -> ret (Expr.AggCall(f, star, x))
+            | _ -> miss ()
 
     /// 書き換え待ちの親ノード。
     /// 子を 1つずつ加工してから `plugChildren` で組み立てる。
@@ -387,50 +439,6 @@ module internal Expr =
         (k: Expr -> Result<'r, DbError>)
         (root: Expr)
         : Result<'r, DbError> =
-        let miss kids =
-            sprintf "plugChildren: 子の個数が合いません（%d 個）" (List.length kids)
-            |> DbError.internalError
-            |> err
-
-        let rec toPairs acc =
-            function
-            | w :: t :: tail -> toPairs ((w, t) :: acc) tail
-            | _ -> List.rev acc
-
-        let plugChildren kids e =
-            if List.length kids <> List.length (children e) then
-                miss kids
-            else
-                match e, kids with
-                | Expr.Literal _, [] -> ret e
-                | Expr.Column _, [] -> ret e
-                | Expr.Name _, [] -> ret e
-                | Expr.Star, [] -> ret e
-                | Expr.QualifiedStar _, [] -> ret e
-                | Expr.Value _, [] -> ret e
-                | Expr.Subquery _, [] -> ret e
-                | Expr.Exists _, [] -> ret e
-                | Expr.CorrelatedSubquery _, [] -> ret e
-                | Expr.InSubquery(_, sel, neg), [ x ] -> ret (Expr.InSubquery(x, sel, neg))
-                | Expr.Unary(op, _), [ x ] -> ret (Expr.Unary(op, x))
-                | Expr.Binary(op, _, _), [ a; b ] -> ret (Expr.Binary(op, a, b))
-                | Expr.IsNull(_, neg), [ x ] -> ret (Expr.IsNull(x, neg))
-                | Expr.IsTruth(_, expected, neg), [ x ] -> ret (Expr.IsTruth(x, expected, neg))
-                | Expr.Between(_, _, _, neg), [ x; lo; hi ] -> ret (Expr.Between(x, lo, hi, neg))
-                | Expr.InList(_, _, neg), x :: xs -> ret (Expr.InList(x, xs, neg))
-                | Expr.Like(_, _, neg, None), [ x; p ] -> ret (Expr.Like(x, p, neg, None))
-                | Expr.Like(_, _, neg, Some _), [ x; p; esc ] -> ret (Expr.Like(x, p, neg, Some esc))
-                | Expr.Case(_, elseE), _ ->
-                    match elseE, List.rev kids with
-                    | None, _ -> ret (Expr.Case(toPairs [] kids, None))
-                    | Some _, last :: branchRev -> ret (Expr.Case(List.rev branchRev |> toPairs [], Some last))
-                    | Some _, [] -> miss kids
-                | Expr.FuncCall(n, _), xs -> ret (Expr.FuncCall(n, xs))
-                | Expr.Cast(_, dt), [ x ] -> ret (Expr.Cast(x, dt))
-                | Expr.Default, [] -> ret e
-                | Expr.AggCall(f, star, _), [ x ] -> ret (Expr.AggCall(f, star, x))
-                | _ -> miss kids
-
         let rec loop (frames: RewriteFrame list) =
             function
             | Visit x ->

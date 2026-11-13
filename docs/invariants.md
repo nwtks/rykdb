@@ -41,16 +41,22 @@ F# の型システムでは表現できないため、
 | INV-07 | compaction GC は可視集合を保存                          | `Compaction.gcGroup` と可視性プロパティテスト                                                                             | ✅ 完了  |
 | INV-08 | MANIFEST は追記専用・番号は単調                         | `VersionEdit` encode/decode + 再オープンのプロパティテスト                                                                | ✅ 完了  |
 | INV-09 | WAL は commit 済み prefix だけ再生                      | `Wal.foldCommitted` の全切断位置テスト                                                                                    | ✅ 完了  |
-| INV-10 | keyspace 接頭辞が混ざらない                             | `Keyspace.prefixedKey` と個別テスト                                                                                       | 拡張予定 |
+| INV-10 | keyspace 接頭辞が混ざらない                             | `Keyspace.prefixedKey` の往復・非相互接頭辞テスト、`RowStore` のキー分離テスト                                            | ✅ 完了  |
 | INV-11 | ヘッダ長 = 行幅 = 射影長                                | `SelectProjection.create`（式・表示ヘッダ・参照ヘッダを一度に構築）                                                       | ✅ 完了  |
 | INV-12 | `Cursor` は `0 <= Pos <= End <= Data.Length`            | `Cursor.createSlice` の検証                                                                                               | 拡張予定 |
-| INV-13 | `BloomFilter.bitCount` は 8 の倍数                      | 個別テスト                                                                                                                | 拡張予定 |
-| INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`        | 個別テスト                                                                                                                | 拡張予定 |
+| INV-13 | `BloomFilter.bitCount` は 8 の倍数                      | 築く側 `bitsFor` が 8 単位に丸める + 読む側 `deserialize` の拒否 + パラメータ網羅テスト                                   | ✅ 完了  |
+| INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`        | `Memtable.insert` の会計とランダム挿入・順序独立性のプロパティテスト                                                      | ✅ 完了  |
 | INV-15 | `RowReader` は Reading / Exhausted / Closed のいずれか  | `RowReaderState`（状態 DU に置き換え、`releaseTo` が遷移と 1回解放を担当）                                                | ✅ 完了  |
-| INV-16 | `Session` のロック規約                                  | `stateGate` / `writeGate` とコメント                                                                                      | 拡張予定 |
+| INV-16 | `Session` のロック規約                                  | `stateGate` / `writeGate` の設計 + `SessionTests` の並行テスト 6 本                                                       | ✅ 完了  |
 | INV-17 | lease の所有権                                          | `ProcessLockHandle` / `ProcessLockLease` / `RegistrationLease`                                                            | ✅ 完了  |
-| INV-18 | `Expr.children` / `plugChildren` の arity               | `Ast` の個別テスト                                                                                                        | 拡張予定 |
+| INV-18 | `Expr.children` / `plugChildren` の arity               | `Expr.plugChildren`（モジュールレベルへ引き上げ）+ `AstTests` の全ノード種テスト                                          | ✅ 完了  |
 | INV-19 | 保持する側はキー・行の所有権を複製で取り込む            | `Entry.takeOwnership` / `Transaction.setSlot` の複製と回帰テスト                                                          | ✅ 完了  |
+
+---
+
+## 不変条件の詳細
+
+ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 
 ### INV-01 SstScan
 
@@ -179,6 +185,17 @@ F# の型システムでは表現できないため、
 - `Wal.foldCommitted` は任意のバイト位置で切っても、commit 済みトランザクションの prefix だけを再生する。
 - 回帰テスト: `Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だけ再生する`。
 
+### INV-10 keyspace 接頭辞
+
+- 宣言: `Keyspace.prefixedKey ks key` を `Keyspace.prefix ks` で外すと元のキーに戻り、
+  別 keyspace の物理キーは**自分の接頭辞だけ**が一致する。
+- 理由: `RowStore.scanWithinPrefix` は `Array.sub` で接頭辞を外す。
+  エスケープを持たないので、**長さフィールド（varint）だけが混入を防ぐ**。
+- 回帰テスト: `Keyspace: prefixedKey は接頭辞を外すと元のキーに戻る`
+  （空キー / NUL / 0xFF を含むキー × 6種の keyspace、varint が 2バイトになる長い名前、
+  全ペアでの非相互接頭辞一致）。
+- 通し経路は `RowStore: 前方一致する keyspace 名でもキーが混ざらない` が担保。
+
 ### INV-11 ヘッダと行幅
 
 - `SelectProjection.create` が `*` / `t.*` の展開を 1回だけ行い、
@@ -187,6 +204,28 @@ F# の型システムでは表現できないため、
 - 回帰テスト:
   - `SelectProjection: ヘッダと式の列数が一致する`
   - `SelectProjection: 項目が空なら入力スキーマをそのまま使う`
+
+### INV-13 BloomFilter のビット数
+
+- 宣言: `BitCount % 8 = 0` かつ `Bits.Length = BitCount / 8`。
+- 理由: `positionAt` は `% BitCount` で 0 以下を作るが、`Bits.Length = BitCount / 8` なので
+  `BitCount` が 8 の倍数でないと `Bits.[pos / 8]` が範囲外を指す
+  （`firstAndStep` のコメントが根拠）。
+- 担保: 築く側 `bitsFor` が 8 単位に丸める / 読む側 `deserialize` が `% 8 <> 0` を
+  `CorruptionError` で拒否する。
+- 回帰テスト:
+  - `BloomFilter.ofKeys: ビット数は必ず 8 の倍数でビット配列と一致する`
+    （`expectedCount = -3..10_000` × 誤検出率 4 種を網羅し、築く側・往復側・false negative の 3 点）
+  - `BloomFilter.deserialize: ビット数が 8 の倍数でないデータは CorruptionError`
+
+### INV-14 ApproxBytes の会計
+
+- 宣言: `Memtable.ApproxBytes = Σ Entry.managedBytes`（挿入順に依存しない）。
+- 担保: `Memtable.insert` が `Entry.managedBytes` を足す。
+  `Entry.takeOwnership` の複製でもサイズが変わらないことまで含めて検査する。
+- 回帰テスト: `Memtable: ランダム挿入でも Count と ApproxBytes は合計と一致する`
+  （重複キー・tombstone・BLOB・可変長 TEXT を 400回、順序反転での一致、
+  挿入後の配列書き換えでも格納内容と会計が一致）。
 
 ### INV-15 RowReader の状態
 
@@ -202,12 +241,47 @@ F# の型システムでは表現できないため、
 - 回帰テスト: 既存の `RowReader: 終端後の TryRead` / `Dispose 後の TryRead` /
   `Dispose すると Close が待たずに完了できる`。
 
+### INV-16 Session のロック規約
+
+- 宣言:
+  - `stateGate` は committed / closed / readers のみを守る（短いロック）。
+  - `writeGate` は書き込み・BEGIN / COMMIT / ROLLBACK・DDL・Close を直列化する。
+  - SELECT のみのバッチは `writeGate` を取らず、`AcquireReadSnapshot` で並行する。
+- 担保（`SessionTests`）:
+  - `Session: 読み取りは実行中の書き込みを待たない`
+  - `Session: 書き込みは実行中の読み取りを待たない`
+  - `Session: Close は実行中の読み取りの完了を待つ`
+  - `Session: 並行読み取りは commit 済みの一貫した snapshot を見る`
+  - `Session: 同一 Session を複数スレッドで使っても書き込みが消えない`
+  - **`Session: BEGIN は writeGate を取るので実行中の書き込みを待ち、SELECT は待たない`**
+    （transaction 制御が `writeGate` に入る側を初めて直接検査）
+- ランダムに操作を組み合わせるストレステストは未実施（既知の穴）。
+
 ### INV-17 lease
 
 - `ProcessLockHandle` が所有権ハンドルを表し、`IsOwner` はこの型だけを受け取る。
 - `RowStore` のエラー経路も `ProcessLockLease.ForceRelease` を使う。
   `ProcessLock.release` の呼び出しは lease 内だけ。
 - 回帰テスト: 既存のプロセスロック / 古いハンドルの Close テスト。
+
+### INV-18 children / plugChildren の arity
+
+- 宣言: `Expr.plugChildren (Expr.children e) e` が同じ式を復元し、
+  子の個数が合わなければ `InternalError` で返る。
+- 理由: `children`（列挙）と `plugChildren`（組み立て）は別々の match なので、
+  ノードを追加したときに片方だけ更新すると arity がずれる
+  （`Case` の ELSE 取りこぼしは実際に発生したバグ）。
+- 担保:
+  - `children` を `internal` に、`plugChildren` を `rewriteWithC` の中から
+    `Expr` モジュールレベルへ引き上げて**隣接させ、直接テスト可能**にした
+    （以前は private / ローカル `let` で外部から検査できなかった）。
+  - `AstTests.allNodeKinds`（29 サンプル: 葉 / 1..3 子 / 可変子 / CASE の ELSE 有無 /
+    LIKE の ESCAPE 有無 / サブクエリを含む型）で 3点を検査:
+    - `Ast: plugChildren は children と同じ順・同じ内容で復元する（全ノード種）`
+    - `Ast: plugChildren は子を渡した順にそのまま入れる`
+    - `Ast: plugChildren は arity が children と合わないと InternalError`
+- **新しい `Expr` ケースを足したら `AstTests.allNodeKinds` にも足す**
+  （ここに無いノードは arity のずれを検出できない）。
 
 ### INV-19 保持する側の所有権
 
@@ -233,12 +307,12 @@ F# の型システムでは表現できないため、
 
 ---
 
-## 既知の穴（次の候補）
+## 既知の未対応（次の候補）
 
 - `FileMetaData.FileNumber` と `Version.NextFileNumber` は素の `int64` のまま
   （同じ意味なので統一不要。単位は意味が違う数値にだけ付ける）。
 - `Cursor` / `Writer` / `Entry` / `SstEntry` の record リテラルは直接構築できる（ソース検査なし）。
-- `Session` / `EngineHost` の並行操作をランダムに組み合わせるストレステストは未実施。
-- `BloomFilter.bitCount` / `Memtable.ApproxBytes` の会計は個別テストのみ。
+- `EngineHost` の並行操作（CAS / refcount / retire）をランダムに組み合わせるストレステストは未実施
+  （`Session` 側は INV-16 の 6本で担保済み）。
 - INV-19 は 2回所持するため、commit 経路（`Transaction.put` → `Memtable.insert`）は行を 2回複製する。
   単純な重複排除には「複製済みを渡す」経路（線形型）が必要で、現状はコストを許容している。

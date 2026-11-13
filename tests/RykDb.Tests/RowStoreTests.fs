@@ -103,6 +103,49 @@ let ``Keyspace: table / index の名前`` () =
     Assert.Equal("i:ix_people_age", Keyspace.index "ix_people_age")
 
 [<Fact>]
+let ``Keyspace: prefixedKey は接頭辞を外すと元のキーに戻る`` () =
+    let keyspaces =
+        [
+            "t:a"
+            "t:ab"
+            "i:x"
+            Keyspace.CatalogKeyspace
+            // NUL を含む keyspace（エスケープしないのでバイト列にそのまま入る）
+            "t:" + string (char 0) + "q"
+            // 長さフィールドが varint 2 バイトになる（1 バイト前提の検証を防ぐ）
+            "t:" + System.String('x', 130)
+        ]
+
+    let keys =
+        [
+            [||]
+            [| 0uy |]
+            [| 0uy; 0uy |]
+            [| 255uy |]
+            [| 1uy; 2uy; 3uy |]
+            [| 0uy; 255uy; 0uy |]
+        ]
+
+    for keyspace in keyspaces do
+        let prefix = Keyspace.prefix keyspace
+
+        for key in keys do
+            let physical = Keyspace.prefixedKey keyspace key
+            Assert.True(KeyBuilder.startsWithPrefix physical prefix, sprintf "%s の物理キーに自分の接頭辞が付いていない" keyspace)
+            Assert.Equal<byte array>(key, Array.sub physical prefix.Length (physical.Length - prefix.Length))
+
+    // 別 keyspace の物理キーは自分の接頭辞だけが一致する（キーが混ざらないことの根拠）。
+    for a in keyspaces do
+        for b in keyspaces do
+            if a <> b then
+                let physical = Keyspace.prefixedKey b (intKey 1)
+
+                Assert.False(
+                    KeyBuilder.startsWithPrefix physical (Keyspace.prefix a),
+                    sprintf "%s の物理キーが %s の範囲に入り込む" b a
+                )
+
+[<Fact>]
 let ``RowStore: compaction 失敗後も flush 結果を保持し、再起動で commit を失わない`` () =
     withDir "rowstore-compaction-fail" (fun dir ->
         let engine = ok (StorageEngine.openDatabaseWith None dir)

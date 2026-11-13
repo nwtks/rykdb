@@ -303,6 +303,34 @@ let ``Session: 読み取りは実行中の書き込みを待たない`` () =
         Assert.Equal<int64>(2L, asInt after.Rows.[0].[0]))
 
 [<Fact>]
+let ``Session: BEGIN は writeGate を取るので実行中の書き込みを待ち、SELECT は待たない`` () =
+    // transaction 制御（BEGIN / COMMIT / ROLLBACK / DDL）は writeGate の下で走るので、
+    // 走査中（WriteBatch 停止中）に開始すると待つ。SELECT のみのバッチは writeGate を取らない。
+    withGatedSession "session-begin-during-write" (fun session gates ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1)") |> ignore
+        gates.BlockWrites()
+
+        let writer =
+            startDedicated (fun () -> session.Execute "INSERT INTO t VALUES (2)" |> ok |> ignore)
+
+        Assert.True(gates.WriteEntered.Wait 5000, "書き込みが始まりません")
+
+        // writeGate を握っている間は BEGIN は完了しない。
+        let begun = startDedicated (fun () -> session.Begin() |> ok |> ignore)
+        Assert.False(begun.Wait 300, "BEGIN が writeGate を待たずに進んだ")
+
+        // SELECT のみは writeGate を取らないので、書き込み中でも進む。
+        let selected = ok (session.Execute "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(1L, asInt selected.Rows.[0].[0])
+
+        gates.ResumeWrites()
+        Assert.True(writer.Wait 10000, "書き込みが完了しません")
+        Assert.True(begun.Wait 10000, "BEGIN が完了しません")
+
+        ok (session.Rollback()))
+
+[<Fact>]
 let ``Session: 書き込みは実行中の読み取りを待たない`` () =
     withGatedSession "session-write-during-read" (fun session gates ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore

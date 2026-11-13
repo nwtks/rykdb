@@ -46,6 +46,34 @@ let ``BloomFilter.mightContain: 空のフィルタは何も含まない`` () =
         Assert.False(BloomFilter.mightContain filter h, "空のフィルタが値を含んでいる")
 
 [<Fact>]
+let ``BloomFilter.ofKeys: ビット数は必ず 8 の倍数でビット配列と一致する`` () =
+    // bitCount が 8 の倍数でないと `positionAt` が bits の範囲外を指す
+    // （firstAndStep のコメントが根拠）。築く側・往復側の両方で検査する。
+    for expectedCount in [ -3; 0; 1; 2; 7; 100; 1_000; 10_000 ] do
+        for rate in [ 0.01; 0.25; 0.5; 0.9 ] do
+            let keys = Array.init (max 0 expectedCount) intKey
+            let filter = BloomFilter.ofKeys expectedCount rate keys
+
+            let label =
+                sprintf "count=%d rate=%.2f bitCount=%d" expectedCount rate filter.BitCount
+
+            Assert.True((filter.BitCount % 8 = 0), "ビット数が 8 の倍数でない: " + label)
+            Assert.Equal<int>(filter.BitCount / 8, filter.Bits.Length)
+            Assert.True(filter.HashCount >= 1, "ハッシュ数が 0: " + label)
+
+            // 位置がビット配列の範囲外に出なければ false negative も出ない。
+            for k in keys do
+                Assert.True(
+                    BloomFilter.mightContain filter (Hashing.hashBytes k |> Hashing.mix),
+                    "false negative: " + label
+                )
+
+            let restored = ok (BloomFilter.deserialize (BloomFilter.serialize filter))
+            Assert.Equal<int>(filter.BitCount, restored.BitCount)
+            Assert.Equal<int>(filter.Bits.Length, restored.Bits.Length)
+            Assert.Equal<int>(filter.HashCount, restored.HashCount)
+
+[<Fact>]
 let ``BloomFilter.serialize: 直列化の往復`` () =
     let keys = Array.init 5_000 intKey
     let filter = BloomFilter.ofKeys 5_000 0.01 keys
