@@ -123,15 +123,6 @@ let ``ExecContext.schemaOf: 未登録は NameError`` () =
         | Ok _ -> Assert.Fail "NameError になるべき")
 
 [<Fact>]
-let ``ExecContext.tableValues: 登録スキーマで全走査`` () =
-    withStore "ec-table" (fun store ->
-        let c0 = ExecContext.create store None
-        let c1 = ExecContext.withSchema "people" peopleSchema c0
-        let op = ok (ExecContext.tableValues c1 "people" 0 true)
-        let rows = ok (Op.toArray op)
-        Assert.Equal(0, rows.Length))
-
-[<Fact>]
 let ``ExecContext.byIndexValues: 空の store は空の Op`` () =
     withStore "ec-byindex-empty" (fun store ->
         let c0 = ExecContext.create store None

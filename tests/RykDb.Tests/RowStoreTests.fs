@@ -81,6 +81,7 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
         member _.WalState = None
         member _.GetAt _ _ = ret None
         member _.ScanAtValues _ _ _ _ = ret SstScan.Empty
+        member _.ScanAtMasked _ _ _ _ = ret SstScan.Empty
         member this.WriteBatch _ = ret (this :> IStorageEngine)
         member this.WriteBatchDeferred _ = ret (this :> IStorageEngine)
         member this.WithNextSeqNo _ = this :> IStorageEngine
@@ -453,23 +454,3 @@ let ``RowStore.clearKeyspaceChunks: チャンクを跨いでも全件を消す``
         let store, _mgr = ok (RowStore.clearKeyspaceChunks mgr space store)
         let rows = ok (RowStore.scan space [||] 0 store) |> SstScan.toArray |> ok
         Assert.Empty rows)
-
-[<Fact>]
-let ``RowStore.scanAtRawValues: scope 指定時はラッパー越しでも走査を台帳に登録する`` () =
-    withStore "scan-scope" (fun store ->
-        let space = Keyspace.table "t"
-
-        let entries =
-            [| for i in 0..2 -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i) |]
-
-        let store = ok (RowStore.writeBatches [ (space, entries) ] store)
-        let scope = ScanScope()
-        // scanWithinPrefix は SstScan(fun ...) で包むため Dispose を伝播しない。
-        // 登録が発生源（scanAtRaw）で行われていることを ActiveCount で確認する。
-        let scan = ok (RowStore.scanAtRawValues space [||] 0 None (Some scope) true store)
-        Assert.Equal(1, scope.ActiveCount)
-        Assert.True((ok (SstScan.next scan)).IsSome)
-        Assert.Equal(1, scope.ActiveCount)
-
-        scope.DisposeAll()
-        Assert.Equal(0, scope.ActiveCount))

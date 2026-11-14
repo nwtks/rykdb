@@ -150,6 +150,21 @@ module internal Dml =
            | Some hb -> KeyBuilder.startsWithPrefix key hb
            | None -> false
 
+    /// マスクに列を足したコピーを返す（共有しているマスクを書き換えない）。
+    let private widenMask (mask: bool array) (indices: int seq) =
+        let copy = Array.copy mask
+
+        for i in indices do
+            if i >= 0 && i < copy.Length then
+                copy.[i] <- true
+
+        copy
+
+    /// 索引を構成する列の位置。
+    let private indexColumnIndices (schema: TableSchema) (index: IndexSchema) =
+        index.Columns
+        |> List.choose (fun name -> schema.Columns |> List.tryFindIndex (fun c -> Catalog.eqName c.Name name))
+
     /// `SstScan` を `Op` に変換する。
     /// `take` が false になった時点で走査を打ち切る（キー昇順なので範囲の上限に使える）。
     /// `RowStore.scanAtRaw` の None（削除済み）は読み飛ばす。
@@ -157,7 +172,7 @@ module internal Dml =
         let rowOf (value: SqlValue array option) =
             match value with
             | Some row when row.Length = width -> row
-            | Some row when row.Length = 0 -> Array.create width SqlValue.Null
+            | Some row when row.Length = 0 -> Array.create width SqlValue.Unloaded
             | Some row -> row
             | None -> [||]
 
@@ -203,43 +218,59 @@ module internal Dml =
 
     /// 主キーで prefix 走査する（キー昇順）。
     /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
-    let private scanByPrimaryKeyScopedValues
+    let private scanByPrimaryKeyScopedMask
         (scope: ScanScope option)
         (store: RowStore)
         (schema: TableSchema)
         (limit: int)
         (visible: uint64 option)
-        (needsValues: bool)
+        (mask: bool array)
         =
-        RowStore.scanAtRawValues (tableSpace schema) [||] limit visible scope needsValues store
+        RowStore.scanAtRawMasked (tableSpace schema) [||] limit visible scope mask store
         |> Result.map (opOfScan schema.Columns.Length (fun _ -> true))
 
     /// 主キーで prefix 走査する（キー昇順、スコープなし・全列）。
     let scanByPrimaryKey store schema limit visible =
-        scanByPrimaryKeyScopedValues None store schema limit visible true
+        scanByPrimaryKeyScopedMask None store schema limit visible (Array.create schema.Columns.Length true)
 
     /// 主キーで prefix 走査する（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
-    let scanByPrimaryKeyWithTxnValues
+    let scanByPrimaryKeyWithTxnMask
         (store: RowStore)
         (schema: TableSchema)
         (limit: int)
         (visible: uint64 option)
         (scope: ScanScope option)
         (txn: Transaction)
-        (needsValues: bool)
+        (mask: bool array)
         =
         let slots = Transaction.slotsOf (tableSpace schema) txn
-        let needsValues' = needsValues || not (List.isEmpty slots)
+        // overlay は主キーを読むので、書き込みがあるときは主キー列を足す。
+        let mask =
+            if List.isEmpty slots then
+                mask
+            else
+                widenMask mask schema.PrimaryKey
 
-        scanByPrimaryKeyScopedValues scope store schema (storeLimitFor limit slots) visible needsValues'
+        scanByPrimaryKeyScopedMask scope store schema (storeLimitFor limit slots) visible mask
         |> Result.map (fun rows ->
             let overlaid = overlayRows (RowKey.primary schema) slots rows
             if limit > 0 then Op.take limit overlaid else overlaid)
 
+    /// 主キーで prefix 走査する（txn の書き込みを含む・bool 互換）。
+    let scanByPrimaryKeyWithTxnValues store schema limit visible scope txn needsValues =
+        scanByPrimaryKeyWithTxnMask
+            store
+            schema
+            limit
+            visible
+            scope
+            txn
+            (Array.create schema.Columns.Length needsValues)
+
     /// 主キーの範囲走査（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`。
-    let scanByPrimaryKeyRangeWithTxnValues
+    let scanByPrimaryKeyRangeWithTxnMask
         (store: RowStore)
         (schema: TableSchema)
         (startKey: SqlValue array)
@@ -248,7 +279,7 @@ module internal Dml =
         (visible: uint64 option)
         (scope: ScanScope option)
         (txn: Transaction)
-        (needsValues: bool)
+        (mask: bool array)
         =
         let startBytes = KeyBuilder.ofValues startKey
         let endBytes = endKey |> Option.map KeyBuilder.ofValues
@@ -257,10 +288,15 @@ module internal Dml =
             Transaction.slotsOf (tableSpace schema) txn
             |> List.filter (fun (key, _) -> inKeyRange startBytes endBytes key)
 
-        let needsValues' = needsValues || endBytes.IsSome || not (List.isEmpty slots)
+        // endKey の最終フィルタと overlay は主キーを読む。
+        let mask =
+            if endBytes.IsNone && List.isEmpty slots then
+                mask
+            else
+                widenMask mask schema.PrimaryKey
 
         let scanPrimaryKeyRange lowerBytes upperBytes limit =
-            RowStore.scanAtRawValues (tableSpace schema) lowerBytes limit visible scope needsValues' store
+            RowStore.scanAtRawMasked (tableSpace schema) lowerBytes limit visible scope mask store
             |> Result.map (fun scan ->
                 let rows =
                     opOfScan schema.Columns.Length (fun e -> inKeyRange lowerBytes upperBytes e.Key) scan
@@ -280,7 +316,7 @@ module internal Dml =
 
     /// 索引の値に一致する全行を引く（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`。
-    let scanByIndexPrefixWithTxnValues
+    let scanByIndexPrefixWithTxnMask
         (store: RowStore)
         (schema: TableSchema)
         (index: IndexSchema)
@@ -289,7 +325,7 @@ module internal Dml =
         (visible: uint64 option)
         (scope: ScanScope option)
         (txn: Transaction)
-        (needsValues: bool)
+        (mask: bool array)
         =
         let prefix = KeyBuilder.ofValues values
 
@@ -297,10 +333,15 @@ module internal Dml =
             Transaction.slotsOf (indexSpace index) txn
             |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
 
-        let needsValues' = needsValues || not (List.isEmpty slots)
+        // overlay は索引キーと主キーを読む。
+        let mask =
+            if List.isEmpty slots then
+                mask
+            else
+                widenMask mask (Seq.append (indexColumnIndices schema index) schema.PrimaryKey)
 
         let scanIndexPrefix prefix limit =
-            RowStore.scanAtRawValues (indexSpace index) prefix limit visible scope needsValues' store
+            RowStore.scanAtRawMasked (indexSpace index) prefix limit visible scope mask store
             |> Result.map (fun scan ->
                 let rows =
                     opOfScan schema.Columns.Length (fun e -> KeyBuilder.startsWithPrefix e.Key prefix) scan
@@ -312,9 +353,22 @@ module internal Dml =
             let overlaid = overlayRows (RowKey.indexKey schema index) slots rows
             if limit > 0 then Op.take limit overlaid else overlaid)
 
+    /// 索引の値に一致する全行を引く（txn の書き込みを含む・bool 互換）。
+    let scanByIndexPrefixWithTxnValues store schema index values limit visible scope txn needsValues =
+        scanByIndexPrefixWithTxnMask
+            store
+            schema
+            index
+            values
+            limit
+            visible
+            scope
+            txn
+            (Array.create schema.Columns.Length needsValues)
+
     /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`。
-    let scanByIndexRangeWithTxnValues
+    let scanByIndexRangeWithTxnMask
         (store: RowStore)
         (schema: TableSchema)
         (index: IndexSchema)
@@ -324,7 +378,7 @@ module internal Dml =
         (visible: uint64 option)
         (scope: ScanScope option)
         (txn: Transaction)
-        (needsValues: bool)
+        (mask: bool array)
         =
         let lowerBytes = KeyBuilder.ofValues lower
         let upperBytes = upper |> Option.map KeyBuilder.ofValues
@@ -333,10 +387,14 @@ module internal Dml =
             Transaction.slotsOf (indexSpace index) txn
             |> List.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
 
-        let needsValues' = needsValues || not (List.isEmpty slots)
+        let mask =
+            if List.isEmpty slots then
+                mask
+            else
+                widenMask mask (Seq.append (indexColumnIndices schema index) schema.PrimaryKey)
 
         let scanIndexRange lowerBytes upperBytes limit =
-            RowStore.scanAtRawValues (indexSpace index) lowerBytes limit visible scope needsValues' store
+            RowStore.scanAtRawMasked (indexSpace index) lowerBytes limit visible scope mask store
             |> Result.map (fun scan ->
                 let rows =
                     opOfScan schema.Columns.Length (fun e -> inIndexRange lowerBytes upperBytes e.Key) scan

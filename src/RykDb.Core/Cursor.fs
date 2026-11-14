@@ -59,3 +59,17 @@ module internal Cursor =
 
     /// 読み取り終端（排他的）。
     let endPos (c: Cursor) = c.End
+
+    /// 先頭から `length` バイトを切り出し、切り出したカーソルと残りのカーソルを返す。
+    /// <remarks>
+    /// 値の本体と後続を分ける用途で使う。
+    /// 範囲外は `CorruptionError`（`createSlice` と同じ判定）。
+    /// </remarks>
+    let splitAt (length: int) (c: Cursor) =
+        if length < 0 || length > remaining c then
+            sprintf "Cursor: %d バイトを切り出せません（残り %d バイト）" length (remaining c)
+            |> DbError.corruption
+            |> err
+        else
+            createSlice (data c) (pos c) length
+            |> Result.map (fun taken -> taken, advance length c)

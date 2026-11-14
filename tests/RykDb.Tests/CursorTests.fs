@@ -45,6 +45,32 @@ let ``Cursor: createSlice は範囲を切り出す`` () =
     ok (validate c2)
 
 [<Fact>]
+let ``Cursor: splitAt は先頭を切り出し、残りを返す`` () =
+    let data = [| 0uy; 1uy; 2uy; 3uy; 4uy |]
+    let c = ok (Cursor.createSlice data 1 4)
+    let head, tail = ok (Cursor.splitAt 2 c)
+    ok (validate head)
+    ok (validate tail)
+    Assert.Equal(2, Cursor.remaining head)
+    Assert.Equal(2, Cursor.remaining tail)
+    Assert.Equal(1uy, fst (ok (Reader.readByte head)))
+    Assert.Equal(3uy, fst (ok (Reader.readByte tail)))
+
+    // 0 件の切り出しと、残り全部の切り出しも許す。
+    let empty, all = ok (Cursor.splitAt 0 c)
+    Assert.True(Cursor.atEnd empty)
+    Assert.Equal(4, Cursor.remaining all)
+    let all2, empty2 = ok (Cursor.splitAt 4 c)
+    Assert.Equal(4, Cursor.remaining all2)
+    Assert.True(Cursor.atEnd empty2)
+
+[<Fact>]
+let ``Cursor: splitAt は範囲外を CorruptionError`` () =
+    let c = Cursor.create [| 0uy; 1uy; 2uy |]
+    expectErrorKind ErrorKind.CorruptionError "length が負" (Cursor.splitAt -1 c)
+    expectErrorKind ErrorKind.CorruptionError "length が残りを超える" (Cursor.splitAt 4 c)
+
+[<Fact>]
 let ``Cursor: atEnd は位置が終端に達したら true`` () =
     let c = Cursor.create [| 1uy |]
     let _, c2 = ok (Reader.readByte c)

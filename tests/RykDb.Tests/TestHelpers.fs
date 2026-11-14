@@ -127,6 +127,37 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
             |> scanOfEntries
             |> ret
 
+        member _.ScanAtMasked visible startKey limit mask =
+            let entries =
+                Memtable.rangeScan startKey 0 state.Mem
+                |> Seq.filter (fun e ->
+                    match visible with
+                    | Some v -> e.SeqNo <= v
+                    | None -> true)
+                |> Seq.distinctBy (fun e -> e.Key)
+                |> Seq.map (fun e ->
+                    let value =
+                        match e.Value with
+                        | None -> None
+                        | Some _ when mask.Length = 0 -> Some(Array.empty<SqlValue>)
+                        | Some row ->
+                            Some(
+                                Array.mapi
+                                    (fun i v ->
+                                        if i < mask.Length && not mask.[i] then
+                                            SqlValue.Unloaded
+                                        else
+                                            v)
+                                    row
+                            )
+
+                    SstEntry.make e.Key e.SeqNo value)
+                |> Seq.filter (fun e -> e.Value.IsSome)
+
+            (if limit > 0 then Seq.truncate limit entries else entries)
+            |> scanOfEntries
+            |> ret
+
         member _.WriteBatch entries =
             let nextMem = Memtable.apply entries state.Mem
             state.Mem <- nextMem

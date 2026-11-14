@@ -303,6 +303,7 @@ module internal OrderPreserving =
         | SqlValue.Text s -> writeEscapedPayload (System.Text.Encoding.UTF8.GetBytes s) (tagged Tag.Text)
         | SqlValue.Blob bs -> writeEscapedPayload bs (tagged Tag.Blob)
         | SqlValue.Uuid g -> tagged Tag.Uuid |> Writer.writeBytes (guidToOrderedBytes g) |> terminate
+        | SqlValue.Unloaded -> invalidOp "SqlValue.Unloaded は符号化できません"
 
 module internal Hashing =
     /// バイト列の 64bit ハッシュ（FNV-1a）。
@@ -456,6 +457,7 @@ module internal ValueCodec =
         | SqlValue.Date d -> tagged 7uy |> Writer.int64LE (d.ToDateTime(System.TimeOnly.MinValue).Ticks)
         | SqlValue.Timestamp t -> tagged 8uy |> Writer.int64LE t.UtcTicks
         | SqlValue.Uuid g -> tagged 9uy |> Writer.writeBytes (g.ToByteArray())
+        | SqlValue.Unloaded -> invalidOp "SqlValue.Unloaded は符号化できません"
 
     let private readValueSlow (c: Cursor) =
         result {
@@ -576,6 +578,7 @@ module internal ValueCodec =
             out.[pos] <- 9uy
             Array.blit bytes 0 out (pos + 1) 16
             pos + 17
+        | SqlValue.Unloaded -> invalidOp "SqlValue.Unloaded は符号化できません"
 
     /// 値の並びを出力配列へ直接書く。次の位置を返す。
     let writeValuesTo (out: byte array) (pos: int) (values: SqlValue array) =
@@ -636,6 +639,66 @@ module internal ValueCodec =
                 return! fill 0 c
         }
 
+    /// 長さ付きの値を読み飛ばす（マスク復号用）。
+    let private skipLengthPrefixed (c: Cursor) =
+        Reader.readVarint c
+        >>= fun (n, c) ->
+            if n > uint64 System.Int32.MaxValue || n > uint64 (Cursor.remaining c) then
+                err (DbError.corruption "ValueCodec: 値の長さが不正です")
+            else
+                ret (Cursor.advance (int n) c)
+
+    /// 1値を読み飛ばす（マスク復号用）。
+    let private skipValue (c: Cursor) =
+        Reader.readByte c
+        >>= fun (tag, c) ->
+            match tag with
+            | 0uy -> ret c
+            | 1uy -> ret (Cursor.advance 1 c)
+            | 2uy
+            | 3uy
+            | 7uy
+            | 8uy -> ret (Cursor.advance 8 c)
+            | 4uy -> ret (Cursor.advance 32 c)
+            | 5uy
+            | 6uy -> skipLengthPrefixed c
+            | 9uy -> ret (Cursor.advance 16 c)
+            | _ -> err (sprintf "ValueCodec: 不明な型タグ %d" (int tag) |> DbError.corruption)
+
+    /// 列マスクに従って値の並びを復号する。
+    /// `mask.[i] = false` の列は `SqlValue.Unloaded` を置き、読み飛ばす。
+    let readValuesMasked (mask: bool array) (c: Cursor) =
+        result {
+            let! n, c = Reader.readVarint c
+
+            if n > uint64 System.Int32.MaxValue then
+                return! sprintf "ValueCodec: 要素数が大きすぎます (%d)" n |> DbError.corruption |> err
+            else
+                let count = int n
+                let values = Array.create count SqlValue.Unloaded
+
+                let rec fill i c =
+                    if i >= count then
+                        ret (values, c)
+                    else if i < mask.Length && not mask.[i] then
+                        match skipValue c with
+                        | Error e -> err e
+                        | Ok c' -> fill (i + 1) c'
+                    else
+                        match readInt c with
+                        | ValueSome struct (v, c') ->
+                            values.[i] <- v
+                            fill (i + 1) c'
+                        | ValueNone ->
+                            match readValue c with
+                            | Error e -> err e
+                            | Ok(v, c') ->
+                                values.[i] <- v
+                                fill (i + 1) c'
+
+                return! fill 0 c
+        }
+
     /// 固定長の値の符号化サイズ（型タグ込み）。
     /// TEXT / BLOB は長さ依存なので `None`。
     let fixedEncodedBytes =
@@ -648,6 +711,7 @@ module internal ValueCodec =
         | SqlValue.Date _ -> Some 9
         | SqlValue.Timestamp _ -> Some 9
         | SqlValue.Uuid _ -> Some 17
+        | SqlValue.Unloaded -> Some 0
         | SqlValue.Text _
         | SqlValue.Blob _ -> None
 
@@ -700,6 +764,7 @@ module internal ValueCodec =
         | SqlValue.Int _
         | SqlValue.Real _
         | SqlValue.Date _ -> 24
+        | SqlValue.Unloaded -> 0
 
     /// 1行（`SqlValue array`）のヒープ上の概算サイズ。
     /// 配列ヘッダ（24）+ スロット（8 × 列数）+ 各値（`managedBytes`）。

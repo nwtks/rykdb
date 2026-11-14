@@ -97,8 +97,28 @@ let ``SSTable: raw スキャンは復号なしで同じ値・削除タグを返�
         Assert.Equal<byte array>(d.Key, r.Key)
         Assert.Equal<uint64>(d.SeqNo, r.SeqNo)
         Assert.Equal<bool>(d.IsDelete, r.IsDelete)
-        Assert.True(r.RawValue.IsSome)
+        Assert.True r.RawValue.IsSome
         Assert.Equal<SqlValue array option>(d.Value, ok (SstEntry.decoded r))
+
+[<Fact>]
+let ``SSTable: 列マスクで必要な列だけ復号する`` () =
+    let entries =
+        [|
+            SstEntry.make (intKey 1) 1UL (Some [| SqlValue.Int 10L; SqlValue.Text "skip-me"; SqlValue.Int 30L |])
+        |]
+
+    let reader =
+        ok (Sstable.openPartial (writeTempSst (ok (buildSstable 0.01 entries))))
+
+    let masked =
+        Sstable.rangeScanPartialMasked [| true; false; true |] [||] 0 reader
+        |> SstScan.toArray
+        |> ok
+
+    let values = masked.[0].Value.Value
+    Assert.Equal<SqlValue>(SqlValue.Int 10L, values.[0])
+    Assert.Equal<SqlValue>(SqlValue.Unloaded, values.[1])
+    Assert.Equal<SqlValue>(SqlValue.Int 30L, values.[2])
 
 [<Fact>]
 let ``SSTable: 複数ブロックに分割される`` () =

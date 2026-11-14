@@ -613,6 +613,7 @@ module internal Sstable =
         | DecodeValues
         | RawValues
         | SkipValues
+        | MaskValues of bool array
 
     /// バッファ内の範囲にある 1ブロックをエントリ列へ復元する。
     /// 末尾 4バイトのチェックサムを検証する。
@@ -651,6 +652,9 @@ module internal Sstable =
                                     >>= fun (seqNo, raw, c) -> ret (c, SstEntry.makeRaw key seqNo raw, key)
                                 | SkipValues ->
                                     SstEntry.decodeSkippedValueAt c (int valueLen)
+                                    >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
+                                | MaskValues mask ->
+                                    SstEntry.decodeMaskedValueAt mask c (int valueLen)
                                     >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
             }
 
@@ -789,6 +793,10 @@ module internal Sstable =
     /// 値を復号せず、空の行だけを返す（列が不要なクエリ用）。
     let rangeScanPartialSkipped (startKey: byte array) (limit: int) (partial: SstPartial) =
         rangeScanPartialWith SkipValues startKey limit partial
+
+    /// 列マスクに従って必要な列だけ復号する。
+    let rangeScanPartialMasked (mask: bool array) (startKey: byte array) (limit: int) (partial: SstPartial) =
+        rangeScanPartialWith (MaskValues mask) startKey limit partial
 
     /// 値を復号しながら走査する（通常のクエリ・検証用）。
     let rangeScanPartial (startKey: byte array) (limit: int) (partial: SstPartial) =

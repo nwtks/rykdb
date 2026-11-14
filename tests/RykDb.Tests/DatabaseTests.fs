@@ -85,7 +85,30 @@ let ``Database: 値を使わない射影・集約は空の行でも件数を返�
         Assert.Equal<int64>(2L, asInt derivedAll.Rows.[0].[0])
 
         let _, derivedA = ok (execSql db "SELECT COUNT(*) FROM (SELECT a FROM t) AS x")
-        Assert.Equal<int64>(2L, asInt derivedA.Rows.[0].[0]))
+        Assert.Equal<int64>(2L, asInt derivedA.Rows.[0].[0])
+
+        // 部分列の復号: 選択していない b は読まない。
+        let dbIx = exec db "CREATE INDEX idx_t_a ON t (a)"
+        let _, selected = ok (execSql dbIx "SELECT a FROM t ORDER BY id")
+        Assert.Equal<int64 array>([| 10L; 20L |], selected.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        // 索引スキャンでも必要な列だけ復号する。
+        let _, byA = ok (execSql dbIx "SELECT b FROM t WHERE a = 20")
+        Assert.Equal<string>("y", asText byA.Rows.[0].[0])
+
+        // SELECT * は全列を要求する。
+        let _, star = ok (execSql dbIx "SELECT * FROM t WHERE id = 1")
+        Assert.Equal<string>("x", asText star.Rows.[0].[2])
+
+        // transaction overlay は主キーを必要とするため、空マスクでも主キーを足す。
+        let tx = ok (dbIx.Begin())
+        let tx, _ = ok (execSql tx "UPDATE t SET b = 'z' WHERE id = 1")
+        let _, countTx = ok (execSql tx "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(2L, asInt countTx.Rows.[0].[0])
+
+        let _, bTx = ok (execSql tx "SELECT b FROM t WHERE id = 1")
+        Assert.Equal<string>("z", asText bTx.Rows.[0].[0])
+        ok (tx.Rollback()) |> ignore)
 
 [<Fact>]
 let ``Database: BEGIN/COMMIT でまとめて反映される`` () =

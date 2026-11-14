@@ -813,16 +813,21 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 - 残る割当の主なものは `Kont` のオブジェクト / リストセル、`Result` の `Ok`、 `SqlValue`（参照型 DU）。
   この削減はスタック再利用や式評価の fast path として別途扱う。
 
-**列が必要ないスキャン**
+**列が必要ないスキャンと列マスク復号**
 
-`Optimizer.scanNeedsValues` が出力列の必要集合を後方伝播し、
-Scan で空なら `StorageEngine.ScanAtValues ... needsValues = false` を渡す。
+`Optimizer.scanNeedsMasks` が出力列の必要集合を後方伝播し、
+各 `Logical.Scan` の `bool array`（列マスク）を求める。
+Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**する。
 
-- 対象は `COUNT(*)`、`SELECT 1 FROM t`、定数述語の `WHERE` など。
-- 空マスクの行は値を復号せず、`Dml.opOfScan` がスキーマ幅の `NULL` で埋める
-  （ソートなどが行の幅を前提にできるようにするため）。
-- 現状は **空か非空か** だけを使う。非空なら全列を復号する
-  （列単位の部分復号は次の段階）。
+- `COUNT(*)` や `SELECT 1 FROM t` は全列 false のマスクになり、値本体を読まない。
+- 部分マスクでは `ValueCodec.readValuesMasked` が必要な列だけ `SqlValue` を作り、
+  不要列は型タグと長さを見て読み飛ばす。
+- 不要列には `SqlValue.Unloaded` を置く。
+  これは実際の NULL ではない。
+  `compareValues` は内部エラー、出力の符号化は `invalidOp` になる。
+- 空マスクの行を `[||]` にせず、スキーマ幅で埋める
+  （`ORDER BY 1` などが行の幅を前提にするため）。
+- overlay（transaction の書き込み）は主キーを、索引スキャンは索引列 + 主キーをマスクに足す。
 - `Ops.project` は必要な出力項目だけを評価するのではなく **すべての出力式** を評価する。
   そのため Project は使わない項目の参照列も要求する（Derived の内側も同じ）。
 

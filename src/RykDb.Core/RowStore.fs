@@ -236,9 +236,10 @@ module internal RowStore =
         SstScan.ofStepWithClose (fun () -> loop scan) (fun () -> SstScan.dispose scan)
 
     /// keyspace を prefix で走査する（最新エントリ。値の filter はしない）。
-    /// 返すキーは接頭辞を外した論理キー。1行要求されるまで SSTable のブロックを読まない。
+    /// 返すキーは接頭辞を外した論理キー。
+    /// 1行要求されるまで SSTable のブロックを読まない。
     /// scope が指定されたら、返す走査を台帳に登録して早期終了時にも閉じられるようにする。
-    let scanAtRawValues
+    let private scanAtRawValues
         (keyspace: string)
         (startKey: byte array)
         (limit: int)
@@ -254,6 +255,32 @@ module internal RowStore =
 
             let! scan =
                 e.ScanAtValues visible (Keyspace.prefixedKey keyspace startKey) limit needsValues
+
+            let scoped =
+                match scope with
+                | Some scope -> SstScan.scoped scope scan
+                | None -> scan
+
+            return scanWithinPrefix prefix scoped
+        }
+
+    /// keyspace を列マスク付きで走査する（必要な列だけ復号する）。
+    let scanAtRawMasked
+        (keyspace: string)
+        (startKey: byte array)
+        (limit: int)
+        (visible: uint64 option)
+        (scope: ScanScope option)
+        (mask: bool array)
+        (store: RowStore)
+        =
+        let prefix = Keyspace.prefix keyspace
+
+        result {
+            let! e = ensure store
+
+            let! scan =
+                e.ScanAtMasked visible (Keyspace.prefixedKey keyspace startKey) limit mask
 
             let scoped =
                 match scope with

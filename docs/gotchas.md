@@ -2502,21 +2502,24 @@ type private Step =
 - 計測（`tools/RykDb.Bench --class compaction --quick`、L0 4ファイル・10万件）:
   復号あり 424ms / 380MB → raw **296ms / 302MB**。
 
-### 11.74 値不要スキャンの空行は NULL でパディングする
+### 11.74 列マスク復号の `SqlValue.Unloaded` は実際の NULL ではない
 
-`COUNT(*)` や `SELECT 1 FROM t` のように列を 1つも必要としないスキャンは、
-`StorageEngine.ScanAtValues ... needsValues = false` で値を復号しない。
-しかし **行の要素数は 0 にしない**。
+列マスク復号では、不要な列に `SqlValue.Unloaded` を置く。
+これは「復号していない」ことを表す内部値であり、SQL の `NULL` ではない。
 
-- `Dml.opOfScan` がスキーマ幅の `NULL` で埋める。
-  `ORDER BY 1` のソートや、行の幅を前提にする演算子が壊れないようにするため。
-- 埋めた `NULL` は「未ロード」の意味であり、実際の NULL ではない。
-  スキャン後にその列を読む演算子があってはいけない
-  （`scanNeedsValues` の解析が前提。Project は使わない項目も評価するので全式の参照列を要求する）。
-- 空行を `[||]` のまま流すと、ソートのキー位置（スキーマ幅 + 式）がずれて
-  `IndexOutOfRangeException` になる。実際に踏んだので回帰テストを置いている。
-- 回帰テスト: `Database: 値を使わない射影・集約は空の行でも件数を返す`
-  （定数述語・DISTINCT・ORDER BY・GROUP BY・派生テーブルを含む）。
-- 計測（10万行）: `CountStar` 約 381MB → **315MB**、
-  `SelectConstant` **329MB**、`CountConstantWhere` **351MB**。
-  非空マスクはまだ全列復号のため、`FilterSeqScan` は変化しない。
+- 空マスク（`COUNT(*)` / `SELECT 1 FROM t`）でも **行の要素数は 0 にしない**。
+  スキーマ幅で `Unloaded` を並べる（`ORDER BY 1` のソートキー位置がずれないようにする）。
+- `Unloaded` を比較・ソート・DISTINCT・符号化に渡してはいけない。
+  `compareValues` は内部エラー、`ValueCodec` の書き込みは `invalidOp` になる。
+- `Dml.opOfScan` は空の行を `Unloaded` でパディングする。
+  `NULL` で埋めない（誤って読んだときに静かに NULL 扱いにならないようにするため）。
+- `Optimizer.scanNeedsMasks` の解析が前提。
+  `Ops.project` は使わない項目も評価するので、Project は全出力式の参照列を要求する。
+  派生テーブルの内側も同じ。
+- overlay（書き込み中）は主キー、索引スキャンは索引列 + 主キーをマスクに足す。
+- 回帰テスト: `SSTable: 列マスクで必要な列だけ復号する`、
+  `Database: 値を使わない射影・集約は空の行でも件数を返す`
+  （部分列・索引・transaction overlay・DISTINCT・ORDER BY・GROUP BY・派生テーブルを含む）。
+- 計測（10万行）: `CountStar` 約 381MB → **316MB**、
+  `SelectConstant` **331MB**、`CountConstantWhere` **351MB**、
+  部分列の `FilterSeqScan` 約 388MB → **363MB**。

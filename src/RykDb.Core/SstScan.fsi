@@ -25,10 +25,11 @@ module internal SstEntry =
     val compare: SstEntry -> SstEntry -> int
     val encodedValueLength: SstEntry -> int
     val writeValueTo: byte array -> int -> SstEntry -> int
-    val decodeValueAt: Cursor -> int -> Result<uint64 * SqlValue array option * Cursor, DbError>
-    val decodeRawValueAt: Cursor -> int -> Result<uint64 * RawSstValue * Cursor, DbError>
-    val decodeSkippedValueAt: Cursor -> int -> Result<uint64 * SqlValue array option * Cursor, DbError>
     val decodeValue: byte array -> Result<uint64 * SqlValue array option, DbError>
+    val decodeValueAt: Cursor -> int -> Result<uint64 * SqlValue array option * Cursor, DbError>
+    val decodeSkippedValueAt: Cursor -> int -> Result<uint64 * SqlValue array option * Cursor, DbError>
+    val decodeMaskedValueAt: bool array -> Cursor -> int -> Result<uint64 * SqlValue array option * Cursor, DbError>
+    val decodeRawValueAt: Cursor -> int -> Result<uint64 * RawSstValue * Cursor, DbError>
     val decoded: SstEntry -> Result<SqlValue array option, DbError>
     val approximateBytes: SstEntry -> int
 

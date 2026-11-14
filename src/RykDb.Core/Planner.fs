@@ -809,10 +809,9 @@ module internal Optimizer =
 
         List.fold Schema.concat baseSchema rights
 
-    /// 出力列の必要集合を後方伝播し、各 Scan が行の値を作る必要があるかを求める。
-    /// 現在は「必要列が空かどうか」だけを使う（列単位の復号スキップは後続）。
+    /// 出力列の必要集合を後方伝播し、各 Scan の列マスクを求める。
     /// `Logical` は参照等価の `obj` キーで覚える（構造比較はできない）。
-    let private scanNeedsValues (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
+    let private scanNeedsMasks (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
         let allColumns schema =
             if schema.Columns.Length = 0 then
                 Set.empty
@@ -851,11 +850,13 @@ module internal Optimizer =
         let refsOfAll schema exprs =
             exprs |> List.fold (fun acc e -> Set.union acc (refsOf schema e)) Set.empty
 
-        let needs = System.Collections.Generic.Dictionary<obj, bool> HashIdentity.Reference
+        let needs =
+            System.Collections.Generic.Dictionary<obj, bool array> HashIdentity.Reference
 
         let rec go nodeCtx nodeInput (needed: Set<int>) =
             function
-            | Logical.Scan _ as node -> needs.[box node] <- not needed.IsEmpty
+            | Logical.Scan _ as node ->
+                needs.[box node] <- Array.init nodeInput.Columns.Length (fun i -> Set.contains i needed)
             | Logical.Filter(p, child) ->
                 let childSchema = outputOf nodeCtx nodeInput child
                 go nodeCtx nodeInput (Set.union needed (refsOf childSchema p)) child
@@ -946,10 +947,10 @@ module internal Optimizer =
             frame, leftSchema
 
         let execScan node ctx name method =
-            let needsValues =
+            let mask =
                 match ctx.ScanNeeds.TryGetValue(box node) with
-                | true, needed -> needed
-                | _ -> true
+                | true, mask -> mask
+                | _ -> Array.create 0 true
 
             function
             | Some 0 -> ret Op.Empty
@@ -957,14 +958,14 @@ module internal Optimizer =
                 let limit = defaultArg hint 0
 
                 match method with
-                | ScanMethod.SeqScan -> ExecContext.tableValues ctx name limit needsValues
+                | ScanMethod.SeqScan -> ExecContext.tableMasked ctx name limit mask
                 | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
                 | ScanMethod.IndexLookup(indexName, values) ->
-                    ExecContext.byIndexValues ctx name indexName values limit needsValues
+                    ExecContext.byIndexMasked ctx name indexName values limit mask
                 | ScanMethod.RangeScan(_, startKey, endKey) ->
-                    ExecContext.rangeScanValues ctx name startKey endKey limit needsValues
+                    ExecContext.rangeScanMasked ctx name startKey endKey limit mask
                 | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
-                    ExecContext.byIndexRangeValues ctx name indexName lower upper limit needsValues
+                    ExecContext.byIndexRangeMasked ctx name indexName lower upper limit mask
 
         let addClamp a b =
             if a > System.Int32.MaxValue - b then
@@ -1145,7 +1146,7 @@ module internal Optimizer =
     let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
         let ctx =
             { ctx with
-                ScanNeeds = scanNeedsValues ctx schema tree
+                ScanNeeds = scanNeedsMasks ctx schema tree
             }
 
         run ctx [] (EvalNode(tree, schema, None))

@@ -32,3 +32,7 @@ module internal Cursor =
 
     /// 読み取り終端（排他的）。
     val endPos: Cursor -> int
+
+    /// 先頭から `length` バイトを切り出し、切り出したカーソルと残りのカーソルを返す。
+    /// 範囲外は `CorruptionError`。
+    val splitAt: int -> Cursor -> Result<Cursor * Cursor, DbError>

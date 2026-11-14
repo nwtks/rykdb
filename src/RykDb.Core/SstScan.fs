@@ -127,24 +127,6 @@ module internal SstEntry =
                 return! err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
         }
 
-    /// 値部分をカーソルから直接復元する。
-    /// `length` バイトを消費した次のカーソルも返す。
-    /// 値の一時配列を作らずにブロックを読み進められる。
-    let decodeValueAt (c: Cursor) (length: int) =
-        let d = Cursor.data c
-        let p = Cursor.pos c
-        let e = Cursor.endPos c
-
-        if length < 0 || p < 0 || e < p || e > d.Length || length > e - p then
-            err (DbError.corruption "Sstable: 値の範囲が不正です")
-        else
-            Cursor.createSlice d p length
-            >>= decodeHeader
-            >>= fun (seqNo, tag, c) -> decodePayload seqNo tag c
-            |> Result.map (fun (seqNo, value) ->
-                let next = Cursor.advance length c
-                seqNo, value, next)
-
     /// 値部分を復元する。
     /// キーは呼び出し側が付ける。
     let decodeValue (data: byte array) =
@@ -152,58 +134,67 @@ module internal SstEntry =
         |> decodeHeader
         >>= fun (seqNo, tag, c) -> decodePayload seqNo tag c
 
+    /// 値部分をカーソルから直接復元する。
+    /// `length` バイトを消費した次のカーソルも返す。
+    /// 値の一時配列を作らずにブロックを読み進められる。
+    let decodeValueAt (c: Cursor) (length: int) =
+        Cursor.splitAt length c
+        >>= fun (value, rest) ->
+            decodeHeader value
+            >>= fun (seqNo, tag, payload) -> decodePayload seqNo tag payload
+            |> Result.map (fun (seqNo, decoded) -> seqNo, decoded, rest)
+
     /// 値を復号せず、削除タグだけ見て空の行を返す。
     /// 列が 1つも不要なクエリ（COUNT(*) など）用。
     /// `length` バイトを消費した次のカーソルも返す。
     let decodeSkippedValueAt (c: Cursor) (length: int) =
-        let d = Cursor.data c
-        let p = Cursor.pos c
-        let e = Cursor.endPos c
-
-        if length < 0 || p < 0 || e < p || e > d.Length || length > e - p then
-            err (DbError.corruption "Sstable: 値の範囲が不正です")
-        else
-            match Cursor.createSlice d p length >>= decodeHeader with
+        Cursor.splitAt length c
+        >>= fun (value, rest) ->
+            match decodeHeader value with
             | Error er -> err er
-            | Ok(seqNo, tag, _) ->
-                if tag = 0uy then
-                    ret (seqNo, None, Cursor.advance length c)
-                elif tag = 1uy then
-                    ret (seqNo, Some(Array.empty<SqlValue>), Cursor.advance length c)
+            | Ok(seqNo, 0uy, _) -> ret (seqNo, None, rest)
+            | Ok(seqNo, 1uy, _) -> ret (seqNo, Some Array.empty<SqlValue>, rest)
+            | Ok(_, tag, _) -> err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
+
+    /// 列マスクに従って値を復号する。
+    /// `mask` が false の列は `SqlValue.Unloaded` を置き、値本体を読み飛ばす。
+    let decodeMaskedValueAt (mask: bool array) (c: Cursor) (length: int) =
+        Cursor.splitAt length c
+        >>= fun (value, rest) ->
+            match decodeHeader value with
+            | Error er -> err er
+            | Ok(seqNo, 0uy, _) -> ret (seqNo, None, rest)
+            | Ok(seqNo, 1uy, payload) ->
+                if mask.Length = 0 || Array.forall (fun needed -> not needed) mask then
+                    ret (seqNo, Some(Array.create mask.Length SqlValue.Unloaded), rest)
                 else
-                    err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
+                    ValueCodec.readValuesMasked mask payload
+                    |> Result.map (fun (values, _) -> seqNo, Some values, rest)
+            | Ok(_, tag, _) -> err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
 
     /// 符号化された値の位置を返す（復号しない）。
     /// `length` バイトを消費した次のカーソルも返す。
     let decodeRawValueAt (c: Cursor) (length: int) =
-        let d = Cursor.data c
-        let p = Cursor.pos c
-        let e = Cursor.endPos c
-
-        if length < 0 || p < 0 || e < p || e > d.Length || length > e - p then
-            err (DbError.corruption "Sstable: 値の範囲が不正です")
-        else
-            match Cursor.createSlice d p length >>= decodeHeader with
+        Cursor.splitAt length c
+        >>= fun (value, rest) ->
+            match decodeHeader value with
             | Error er -> err er
-            | Ok(seqNo, tag, afterTag) ->
+            | Ok(seqNo, tag, payload) ->
                 if tag <> 0uy && tag <> 1uy then
                     err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
                 else
-                    let rawStart = Cursor.pos afterTag - 1
-                    let rawLength = length - (rawStart - p)
+                    // タグから値の終端までが raw スライス（書き出しはタグ込み）。
+                    let rawStart = Cursor.pos payload - 1
 
-                    if rawLength < 1 then
-                        err (DbError.corruption "Sstable: 値の範囲が不正です")
-                    else
-                        ret (
-                            seqNo,
-                            {
-                                Buffer = d
-                                Offset = rawStart
-                                Length = rawLength
-                            },
-                            Cursor.advance length c
-                        )
+                    ret (
+                        seqNo,
+                        {
+                            Buffer = Cursor.data value
+                            Offset = rawStart
+                            Length = Cursor.endPos value - rawStart
+                        },
+                        rest
+                    )
 
     /// 符号化された値を復号する（復号済みならそのまま）。
     let decoded (e: SstEntry) =

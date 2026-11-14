@@ -30,6 +30,8 @@ type SqlValue =
     | Timestamp of System.DateTimeOffset
     | Decimal of decimal
     | Uuid of System.Guid
+    /// 列が必要ないスキャンで復号を省略した値。読み取り側へ漏れてはいけない。
+    | Unloaded
 
 [<RequireQualifiedAccess>]
 module SqlLiteral =
@@ -66,6 +68,7 @@ module SqlLiteral =
             t.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ", System.Globalization.CultureInfo.InvariantCulture)
         | SqlValue.Decimal d -> d.ToString System.Globalization.CultureInfo.InvariantCulture
         | SqlValue.Uuid g -> g.ToString("D", System.Globalization.CultureInfo.InvariantCulture)
+        | SqlValue.Unloaded -> "<unloaded>"
 
 /// バイト列のユーティリティ。
 module internal Bytes =
@@ -231,6 +234,7 @@ module internal SqlValue =
         | SqlValue.Timestamp _ -> DataType.Timestamp
         | SqlValue.Decimal _ -> DataType.Decimal
         | SqlValue.Uuid _ -> DataType.Uuid
+        | SqlValue.Unloaded -> DataType.Null
 
     let isNull =
         function
@@ -378,6 +382,8 @@ module internal SqlValue =
             | _ -> ret (compare (decimalOf a) (decimalOf b))
 
         match a, b with
+        | SqlValue.Unloaded, _
+        | _, SqlValue.Unloaded -> err (DbError.internalError "復号していない列を比較しようとしました")
         | SqlValue.Null, _
         | _, SqlValue.Null -> err (DbError.typeError "NULL は比較できません")
         | (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _),
@@ -429,6 +435,7 @@ module internal SqlValue =
             t.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ", System.Globalization.CultureInfo.InvariantCulture)
         | SqlValue.Decimal d -> d.ToString System.Globalization.CultureInfo.InvariantCulture
         | SqlValue.Uuid g -> g.ToString("D", System.Globalization.CultureInfo.InvariantCulture)
+        | SqlValue.Unloaded -> "<unloaded>"
 
     [<Literal>]
     let private Int64MinAsFloat = -9223372036854775808.0

@@ -185,11 +185,11 @@ module internal StorageEngine =
     /// ヒープは 1回だけ組み、以降は「取り出したソースの続きを戻す」だけにする
     /// （行ごとにソース列から作り直すと O(行数 × ファイル数 log ファイル数) になる）。
     /// マージとヒープは `SstMerge`（Sstable.fs）に集約する。
-    let scanAtValues
+    let private scanAtWith
         (visible: uint64 option)
         (limit: int)
         (startKey: byte array)
-        (needsValues: bool)
+        (maskOpt: bool array option)
         (engine: StorageEngine)
         =
         let seqToScan (rows: SstEntry seq) =
@@ -213,10 +213,10 @@ module internal StorageEngine =
         let openPending index f merge =
             openPartialSst f engine
             >>= fun partial ->
-                if needsValues then
-                    Sstable.rangeScanPartial startKey 0 partial
-                else
-                    Sstable.rangeScanPartialSkipped startKey 0 partial
+                match maskOpt with
+                | None -> Sstable.rangeScanPartial startKey 0 partial
+                | Some mask when mask.Length = 0 -> Sstable.rangeScanPartialSkipped startKey 0 partial
+                | Some mask -> Sstable.rangeScanPartialMasked mask startKey 0 partial
                 |> ret
                 >>= fun scan ->
                     match SstScan.next scan with
@@ -315,6 +315,14 @@ module internal StorageEngine =
                 stepObj
                 closeState
             |> ret
+
+    /// 範囲ルックアップ（値は復号する）。
+    let scanAtValues visible limit startKey needsValues engine =
+        scanAtWith visible limit startKey (if needsValues then None else Some [||]) engine
+
+    /// 範囲ルックアップ（列マスクに従って必要な列だけ復号する）。
+    let scanAtMasked visible limit startKey (mask: bool array) engine =
+        scanAtWith visible limit startKey (Some mask) engine
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1回の書き込みで）へ、
@@ -685,6 +693,10 @@ type internal IStorageEngine =
     abstract ScanAtValues:
         visible: uint64 option -> startKey: byte array -> limit: int -> needsValues: bool -> Result<SstScan, DbError>
 
+    /// 列マスクに従って必要な列だけ復号する。
+    abstract ScanAtMasked:
+        visible: uint64 option -> startKey: byte array -> limit: int -> mask: bool array -> Result<SstScan, DbError>
+
     abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
     /// WAL 追記のみ行い、fsync は呼び出し側に任せる。
     abstract WriteBatchDeferred: entries: Entry array -> Result<IStorageEngine, DbError>
@@ -718,6 +730,9 @@ type internal DiskStorageEngine(engine: StorageEngine) =
 
         member _.ScanAtValues visible startKey limit needsValues =
             StorageEngine.scanAtValues visible limit startKey needsValues engine
+
+        member _.ScanAtMasked visible startKey limit mask =
+            StorageEngine.scanAtMasked visible limit startKey mask engine
 
         member _.WriteBatch entries =
             StorageEngine.writeBatch entries engine
