@@ -210,6 +210,15 @@ module internal DataType =
         | DataType.Uuid -> "UUID"
 
 module internal SqlValue =
+    /// 共有済みの Bool 値。
+    /// 比較・IS NULL・3値論理の結果は true / false の 2種類しかないので、
+    /// 行ごとの評価で新しい DU を作らない。
+    let TrueValue = SqlValue.Bool true
+    let FalseValue = SqlValue.Bool false
+
+    /// bool を共有済みの SqlValue.Bool へ変換する。
+    let inline ofBool b = if b then TrueValue else FalseValue
+
     let dataType =
         function
         | SqlValue.Null -> DataType.Null
@@ -444,10 +453,10 @@ module internal SqlValue =
         let asBoolean =
             function
             | SqlValue.Bool _ as v -> ret v
-            | SqlValue.Int i when i = 0L -> ret (SqlValue.Bool false)
-            | SqlValue.Int i when i = 1L -> ret (SqlValue.Bool true)
-            | SqlValue.Real f when f = 0.0 -> ret (SqlValue.Bool false)
-            | SqlValue.Real f when f = 1.0 -> ret (SqlValue.Bool true)
+            | SqlValue.Int i when i = 0L -> ret FalseValue
+            | SqlValue.Int i when i = 1L -> ret TrueValue
+            | SqlValue.Real f when f = 0.0 -> ret FalseValue
+            | SqlValue.Real f when f = 1.0 -> ret TrueValue
             | _ -> fail ()
 
         let asInteger =
@@ -601,9 +610,9 @@ module internal SqlValue =
                 match s.Trim().ToUpperInvariant() with
                 | "TRUE"
                 | "T"
-                | "1" -> ret (SqlValue.Bool true)
+                | "1" -> ret TrueValue
                 | "FALSE"
                 | "F"
-                | "0" -> ret (SqlValue.Bool false)
+                | "0" -> ret FalseValue
                 | _ -> fail ()
             | _ -> coerce target v

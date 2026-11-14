@@ -207,3 +207,60 @@ type CompactionBenchmarks() =
 
         if not (List.isEmpty files) then
             FileMetaData.deleteObsolete dir files |> Check.ok |> ignore
+
+/// 式評価器のマイクロベンチ。
+/// DB を使わず、`Eval` の Kont / Step などの割当だけを見る。
+[<MemoryDiagnoser>]
+type EvalBenchmarks() =
+    let outCol name =
+        {
+            Name = name
+            Qualifier = Some "t"
+            DataType = Some DataType.Integer
+        }
+
+    let schema =
+        {
+            Columns = [| outCol "a"; outCol "b" |]
+            Tables = [ "t" ]
+        }
+
+    let resolver = Eval.resolver schema
+    let row = [| SqlValue.Int 500L; SqlValue.Int 10L |]
+
+    let col name =
+        Expr.Column { Qualifier = Some "t"; Name = name }
+
+    // a = b + 1000（二項 2 つ + 列 2 つ + リテラル 1 つ）
+    let binary =
+        Expr.Binary(BinaryOp.Eq, col "a", Expr.Binary(BinaryOp.Add, col "b", Expr.Literal(Literal.Int 1000L)))
+
+    // a < 1000 AND (b = 10 OR b IS NULL)
+    let complex =
+        Expr.Binary(
+            BinaryOp.And,
+            Expr.Binary(BinaryOp.Lt, col "a", Expr.Literal(Literal.Int 1000L)),
+            Expr.Binary(
+                BinaryOp.Or,
+                Expr.Binary(BinaryOp.Eq, col "b", Expr.Literal(Literal.Int 10L)),
+                Expr.IsNull(col "b", false)
+            )
+        )
+
+    [<Benchmark>]
+    member _.MatchesLiteral() =
+        Eval.matchesWith resolver row (Expr.Literal(Literal.Int 1L))
+        |> Check.ok
+        |> ignore
+
+    [<Benchmark>]
+    member _.MatchesColumn() =
+        Eval.matchesWith resolver row (col "a") |> Check.ok |> ignore
+
+    [<Benchmark>]
+    member _.MatchesBinary() =
+        Eval.matchesWith resolver row binary |> Check.ok |> ignore
+
+    [<Benchmark>]
+    member _.MatchesComplex() =
+        Eval.matchesWith resolver row complex |> Check.ok |> ignore

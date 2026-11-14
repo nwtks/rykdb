@@ -2450,3 +2450,34 @@ Op.filter (fun row -> Eval.matchesWith resolve row predicate)
 - 実測（`tools/RykDb.Bench` の `FilterSeqScan`、10万行）:
   導入前 約 520MB → 導入後 約 400MB の割当。
   残りは SSTable の値デコードが支配的（値の遅延デコードは別の改善）。
+
+### 11.72 式評価機の `Step` は struct、`Kont` は参照 DU、Bool は共有する
+
+`Eval.step` の状態 `Step` は呼び出しごとに作り捨てるだけなので、
+`[<Struct>]` にするとヒープ割当が消える。
+一方、継続 `Kont` を `[<Struct>]` にすると **逆効果** になる。
+
+```fsharp
+// ✅ Step は struct。ケースごとにフィールド名を付ける（FS3585 回避）
+[<Struct>]
+type private Step =
+    | Descend of expr: Expr
+    | Arrive of value: SqlValue
+
+// ❌ Kont を struct にすると Kont list のセルが大きくなり、割当が約 2 倍
+```
+
+- `SqlValue.Bool` は true / false の 2種類しかないので、
+  `SqlValue.TrueValue` / `FalseValue` / `ofBool` で共有する。
+- 実測（`tools/RykDb.Bench --class eval --quick`、式あたりの割当）:
+  - `a = b + 1000`: Step 参照 808B → Step struct **568B** → Bool 共有 **544B**
+  - `a < 1000 AND (b = 10 OR b IS NULL)`: 1120B → **736B** → **592B**
+  - `Kont` も struct にすると 568B → **1144B**（+101%）
+- エンドツーエンド（`NestedLoopNoMatch`、400万回の ON 評価）:
+  P0-2 直後 3.37GB → Step struct 2.43GB → Step + Bool 共有 **2.34GB**。
+- `SqlValue` 全体を struct DU にするのは、
+  行配列（`SqlValue array`）の 1スロットが 8B → 24〜32B に増え、
+  NULL 共有の利点も失うため、ベンチで測るまで採用しない。
+- 残る割当は `Kont` のオブジェクト / リストセル、`Result` の `Ok`、`SqlValue`。
+  次に削るなら、オペレータごとに再利用する配列スタックか、浅い式の直接評価 fast path が候補
+  （どちらもスタック安全性と再入の設計が必要）。

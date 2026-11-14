@@ -19,7 +19,7 @@ type internal Literal =
     member this.ToSqlValue =
         match this with
         | Null -> SqlValue.Null
-        | Bool b -> SqlValue.Bool b
+        | Bool b -> SqlValue.ofBool b
         | Int i -> SqlValue.Int i
         | Real f -> SqlValue.vReal f
         | Decimal d -> SqlValue.Decimal d

@@ -151,6 +151,7 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 ```bash
 dotnet run -c Release --project tools/RykDb.Bench                    # 全シナリオ
 dotnet run -c Release --project tools/RykDb.Bench -- --class query  # クエリ系のみ
+dotnet run -c Release --project tools/RykDb.Bench -- --class eval   # 式評価器のみ
 dotnet run -c Release --project tools/RykDb.Bench -- --quick        # 短いジョブ
 dotnet run -c Release --project tools/RykDb.Bench -- --dry          # 1 回だけ実行して検証
 ```
@@ -160,6 +161,7 @@ dotnet run -c Release --project tools/RykDb.Bench -- --dry          # 1 回だ�
 - シナリオ:
   - `PointLookup` / `CountStar` / `RangeScan` / `FilterSeqScan` / `Insert100Rows`
   - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
+  - `MatchesLiteral` / `MatchesColumn` / `MatchesBinary` / `MatchesComplex` — DB を使わない式評価器のマイクロベンチ
   - `CompactL0` — L0 の 4ファイル（各 25,000件）を 1回 compaction する
 - クエリ系は `Database.OpenWith`（同期 compaction）で開き、
   シード後に一度 Close して memtable を SSTable へ flush してから測る

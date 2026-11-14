@@ -34,9 +34,10 @@ type private Options =
     }
 
 let private usage () =
-    printfn "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|compaction] [--quick|--dry]"
+    printfn "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|compaction|eval] [--quick|--dry]"
     printfn "  --class query       クエリ系のみ"
     printfn "  --class compaction  compaction のみ"
+    printfn "  --class eval        式評価器のマイクロベンチのみ"
     printfn "  --quick             短いジョブ（既定より速いが精度は低い）"
     printfn "  --dry               1回だけ実行して設定を検証する"
 
@@ -72,9 +73,10 @@ let main argv =
     match options.Class with
     | None
     | Some "query"
-    | Some "compaction" -> ()
+    | Some "compaction"
+    | Some "eval" -> ()
     | Some other ->
-        eprintfn "不明な --class です: %s（query または compaction）" other
+        eprintfn "不明な --class です: %s（query / compaction / eval）" other
         exit 2
 
     let job =
@@ -105,6 +107,12 @@ let main argv =
         | Some "compaction" -> true
         | _ -> false
 
+    let runEval =
+        match options.Class with
+        | None
+        | Some "eval" -> true
+        | _ -> false
+
     printfn "RykDb benchmarks（CI ではビルドのみ。実行は手元で -c Release）"
 
     if runQuery then
@@ -112,5 +120,8 @@ let main argv =
 
     if runCompaction then
         BenchmarkRunner.Run<CompactionBenchmarks> config |> ignore
+
+    if runEval then
+        BenchmarkRunner.Run<EvalBenchmarks> config |> ignore
 
     0

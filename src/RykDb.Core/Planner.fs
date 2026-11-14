@@ -1711,7 +1711,7 @@ module internal Plan =
                             |> Result.bind (fun (_, op) ->
                                 match Op.next op with
                                 | Error er -> err er
-                                | Ok found -> ret (SqlValue.Bool found.IsSome))
+                                | Ok found -> ret (SqlValue.ofBool found.IsSome))
 
                         k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx

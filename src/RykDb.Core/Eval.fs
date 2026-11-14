@@ -406,10 +406,7 @@ module internal Eval =
             ret SqlValue.Null
         else
             SqlValue.compareValues a b
-            |> Result.map (fun c ->
-                match applyComparison opName c with
-                | TruthValue.True -> SqlValue.Bool true
-                | _ -> SqlValue.Bool false)
+            |> Result.map (fun c -> SqlValue.ofBool (applyComparison opName c = TruthValue.True))
 
     /// WHERE 用に TruthValue で判定する（UNKNOWN は偽）。
     let private truthOf (opName: string) (a: SqlValue) (b: SqlValue) =
@@ -464,8 +461,8 @@ module internal Eval =
     /// 3値の判定結果を SqlValue へ戻す（UNKNOWN は NULL）。
     let private ofTruth (t: TruthValue) =
         match t with
-        | TruthValue.True -> SqlValue.Bool true
-        | TruthValue.False -> SqlValue.Bool false
+        | TruthValue.True -> SqlValue.TrueValue
+        | TruthValue.False -> SqlValue.FalseValue
         | TruthValue.Unknown -> SqlValue.Null
 
     /// AND の 3値結合（両辺は既に評価済み）。
@@ -516,9 +513,11 @@ module internal Eval =
 
     /// 評価機の状態。
     /// 式を 1つ降りるか（Descend）、値が上がってきたか（Arrive）。
+    /// ヒープに載せない（呼び出しごとに新しい値を作るだけなので struct で足りる）。
+    [<Struct>]
     type private Step =
-        | Descend of Expr
-        | Arrive of SqlValue
+        | Descend of expr: Expr
+        | Arrive of value: SqlValue
 
     /// 式評価機。
     /// 降りる／上がるを継続スタック Kont でつなぐ（CPS）。
@@ -592,7 +591,7 @@ module internal Eval =
                             if SqlValue.isNull v then
                                 SqlValue.Null
                             else
-                                SqlValue.Bool(not (boolOf v))
+                                SqlValue.ofBool (not (boolOf v))
                         )
                     | UnaryOp.Pos -> ret v
                     | UnaryOp.Neg ->
@@ -613,8 +612,8 @@ module internal Eval =
             | KBinaryL(op, b) :: rest ->
                 let short =
                     match op with
-                    | BinaryOp.And when v = SqlValue.Bool false -> Some(SqlValue.Bool false)
-                    | BinaryOp.Or when v = SqlValue.Bool true -> Some(SqlValue.Bool true)
+                    | BinaryOp.And when v = SqlValue.FalseValue -> Some SqlValue.FalseValue
+                    | BinaryOp.Or when v = SqlValue.TrueValue -> Some SqlValue.TrueValue
                     | _ -> None
 
                 match short with
@@ -638,7 +637,7 @@ module internal Eval =
                             ret SqlValue.Null
                         else
                             ret (
-                                SqlValue.Bool(
+                                SqlValue.ofBool (
                                     Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString l)
                                 )
                             )
@@ -656,10 +655,10 @@ module internal Eval =
                 | Ok res -> step resolve row rest (Arrive res)
             | KIsNull negated :: rest ->
                 let isNull = SqlValue.isNull v
-                step resolve row rest (Arrive(SqlValue.Bool(if negated then not isNull else isNull)))
+                step resolve row rest (Arrive(SqlValue.ofBool (if negated then not isNull else isNull)))
             | KIsTruth(expected, negated) :: rest ->
                 let result = truthOfValue v = expected
-                step resolve row rest (Arrive(SqlValue.Bool(if negated then not result else result)))
+                step resolve row rest (Arrive(SqlValue.ofBool (if negated then not result else result)))
             | KCast dt :: rest ->
                 match SqlValue.cast dt v with
                 | Error er -> err er
@@ -674,22 +673,22 @@ module internal Eval =
                     | Error er -> err er
                     | Ok le ->
                         match TruthValue.and2 ge le with
-                        | TruthValue.True -> step resolve row rest (Arrive(SqlValue.Bool(not negated)))
-                        | TruthValue.False -> step resolve row rest (Arrive(SqlValue.Bool negated))
+                        | TruthValue.True -> step resolve row rest (Arrive(SqlValue.ofBool (not negated)))
+                        | TruthValue.False -> step resolve row rest (Arrive(SqlValue.ofBool negated))
                         | TruthValue.Unknown -> step resolve row rest (Arrive SqlValue.Null)
             | KInX(list, negated) :: rest ->
                 match list with
-                | [] -> step resolve row rest (Arrive(SqlValue.Bool negated))
+                | [] -> step resolve row rest (Arrive(SqlValue.ofBool negated))
                 | cand :: tail -> step resolve row (KInArg(v, negated, tail, false) :: rest) (Descend cand)
             | KInArg(x, negated, tail, sawUnknown) :: rest ->
                 match truthOf "eq" x v with
                 | Error er -> err er
-                | Ok TruthValue.True -> step resolve row rest (Arrive(SqlValue.Bool(not negated)))
+                | Ok TruthValue.True -> step resolve row rest (Arrive(SqlValue.ofBool (not negated)))
                 | Ok tv ->
                     let saw = sawUnknown || tv = TruthValue.Unknown
 
                     match tail with
-                    | [] -> step resolve row rest (Arrive(if saw then SqlValue.Null else SqlValue.Bool negated))
+                    | [] -> step resolve row rest (Arrive(if saw then SqlValue.Null else SqlValue.ofBool negated))
                     | cand :: more -> step resolve row (KInArg(x, negated, more, saw) :: rest) (Descend cand)
             | KLikeX(p, negated, esc) :: rest -> step resolve row (KLikeP(v, negated, esc) :: rest) (Descend p)
             | KLikeP(x, negated, esc) :: rest ->
@@ -699,7 +698,7 @@ module internal Eval =
                     match esc with
                     | None ->
                         let m = Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString x)
-                        step resolve row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
+                        step resolve row rest (Arrive(SqlValue.ofBool (if negated then not m else m)))
                     | Some escExpr -> step resolve row (KLikeE(x, v, negated) :: rest) (Descend escExpr)
             | KLikeE(x, pattern, negated) :: rest ->
                 if SqlValue.isNull v then
@@ -717,7 +716,7 @@ module internal Eval =
                                 (SqlValue.toDisplayString x)
                         with
                         | Error er -> err er
-                        | Ok m -> step resolve row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
+                        | Ok m -> step resolve row rest (Arrive(SqlValue.ofBool (if negated then not m else m)))
             | KCaseWhen((_, t), tail, elseE) :: rest ->
                 let matched = not (SqlValue.isNull v) && boolOf v
 

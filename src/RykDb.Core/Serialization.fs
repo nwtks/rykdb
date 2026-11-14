@@ -465,7 +465,7 @@ module internal ValueCodec =
             | 0uy -> return SqlValue.Null, c
             | 1uy ->
                 let! v, c = Reader.readBool c
-                return SqlValue.Bool v, c
+                return SqlValue.ofBool v, c
             | 2uy ->
                 let! v, c = Reader.readInt64LE c
                 return SqlValue.Int v, c

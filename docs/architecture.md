@@ -801,6 +801,18 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 同じ式を行ごとに評価しても線形探索と候補リストの割当を繰り返さない。
 `Schema` が変わるところ（JOIN の出力、集約後など）では新しい resolver を作る。
 
+**評価機のメモリ**
+
+- 評価機の状態 `Step`（`Descend` / `Arrive`）は **struct DU**。
+  呼び出しごとに新しい値を作るだけなので、ヒープ割当をなくせる。
+- 継続 `Kont` は **参照 DU のまま**。
+  `Kont list` のセルに大きな struct を載せるとセルが大きくなり、パターンマッチのコピーも増える。
+  実測では式あたりの割当が 568B → 1144B に悪化した。
+- `SqlValue.Bool` は true / false の 2種類しかないので
+  `SqlValue.TrueValue` / `FalseValue` / `ofBool` で共有する。
+- 残る割当の主なものは `Kont` のオブジェクト / リストセル、`Result` の `Ok`、 `SqlValue`（参照型 DU）。
+  この削減はスタック再利用や式評価の fast path として別途扱う。
+
 **3値論理と NULL**
 
 - 比較はオペランドに NULL があると `NULL`（UNKNOWN）を返す。
