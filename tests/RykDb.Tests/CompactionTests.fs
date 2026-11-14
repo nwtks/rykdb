@@ -17,10 +17,15 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
     |> FileMetaData.writeSstable dir num level 0.01
     |> ok
 
-/// 書いた SSTable を開く（compact の openScan と同じ経路）。
+/// 書いた SSTable を開く（検証用。値は復号する）。
 let private openBack (dir: string) (f: FileMetaData) =
     Sstable.openPartial (FileMetaData.path dir f.FileNumber)
     >>= fun partial -> ret (Sstable.rangeScanPartial [||] 0 partial)
+
+/// compaction の入力用。値は復号せずスライスのまま渡す。
+let private openBackRaw (dir: string) (f: FileMetaData) =
+    Sstable.openPartial (FileMetaData.path dir f.FileNumber)
+    >>= fun partial -> ret (Sstable.rangeScanPartialRaw [||] 0 partial)
 
 /// 書いた SSTable を読み戻す（検証用）。
 let private readBack (dir: string) (f: FileMetaData) = openBack dir f >>= SstScan.toArray
@@ -33,7 +38,7 @@ let private pickFirstLevel =
 
 /// 1回 compact して結果だけ返す。
 let private compactAll (dir: string) (version: Version) (activeSnapshot: uint64) (options: CompactionOptions) =
-    ok (Compaction.compact dir version options activeSnapshot 100L (openBack dir))
+    ok (Compaction.compact dir version options activeSnapshot 100L (openBackRaw dir))
 
 let private entryOf (i: int) =
     Entry.put (intKey i) (uint64 i) (intRow i)
@@ -461,7 +466,7 @@ let ``Compaction: 出力の書き込みに失敗したら Error を返す`` () =
         let version = Version.addFile f Version.Empty
         // 存在しないディレクトリを出力先にする → 書き込みが IoError で失敗する
         let missing = Path.Combine(dir, "missing")
-        let r = Compaction.compact missing version pickFirstLevel 0UL 100L (openBack dir)
+        let r = Compaction.compact missing version pickFirstLevel 0UL 100L (openBackRaw dir)
         expectErrorKind ErrorKind.IoError "書き込み失敗は IoError になる" r
         // 入力ファイルは消さない（削除は呼び出し側の責務）
         Assert.True(File.Exists(FileMetaData.path dir 10L)))

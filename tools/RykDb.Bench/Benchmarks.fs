@@ -159,7 +159,7 @@ type CompactionBenchmarks() =
     member private _.OpenScan(f: FileMetaData) =
         match Sstable.openPartial (FileMetaData.path dir f.FileNumber) with
         | Error e -> Error e
-        | Ok partial -> Ok(Sstable.rangeScanPartial [||] 0 partial)
+        | Ok partial -> Ok(Sstable.rangeScanPartialRaw [||] 0 partial)
 
     [<GlobalSetup>]
     member _.Setup() =

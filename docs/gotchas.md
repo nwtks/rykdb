@@ -2481,3 +2481,23 @@ type private Step =
 - 残る割当は `Kont` のオブジェクト / リストセル、`Result` の `Ok`、`SqlValue`。
   次に削るなら、オペレータごとに再利用する配列スタックか、浅い式の直接評価 fast path が候補
   （どちらもスタック安全性と再入の設計が必要）。
+
+### 11.73 compaction の raw 値スライスはブロックバッファを参照する
+
+`Sstable.rangeScanPartialRaw` は値を復号せず、
+`RawSstValue`（`Buffer` / `Offset` / `Length`）としてブロックバッファの一部を指す。
+
+- `SstEntry` は `Value`（復号済み）と `RawValue`（符号化スライス）の**どちらか一方**を持つ。
+  削除判定は必ず `SstEntry.IsDelete`（`Value.IsNone` を直接見ない）。
+- スライスを持つ間はバッファを書き換えない。
+  現在の実装はブロックバッファを読み込み後に変更しないので安全だが、
+  バッファを再利用する最適化を入れると過去のエントリが壊れる。
+- 削除タグ（0/1）は raw 解析時に検証する。
+  値本体の長さ・型の検証は復号時まで遅れる
+  （ブロック CRC は読み込み時に検証済み）。
+- compaction の出力は `SstEntry.writeValueTo` が raw バイト列をそのままコピーする。
+  `encodedValueLength` / `approximateBytes` も raw 長を使う。
+- 回帰テスト: `Sstable: raw スキャンは復号なしで同じ値・削除タグを返す`、
+  `CompactionTests` は `openBackRaw` で raw 経路を通す。
+- 計測（`tools/RykDb.Bench --class compaction --quick`、L0 4ファイル・10万件）:
+  復号あり 424ms / 380MB → raw **296ms / 302MB**。

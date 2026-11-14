@@ -1277,6 +1277,13 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
   `rangeScanPartial` は最大 **8ブロック**を 1回の open でまとめて読む
   （バッチ内の不要なブロックは解析・検証しない）。
   `lookup` は 1ブロックだけ読む。
+- **compaction は `rangeScanPartialRaw`**: 値を復号せず、
+  ブロックバッファへの `RawSstValue`（削除タグ + 値本体のスライス）として渡す。
+  compaction はキー・SeqNo・削除タグしか見ないので、
+  GC と出力書き込みは符号化バイト列のコピーで済む。
+  値の復号は通常のクエリ（`rangeScanPartial`）だけが行う。
+  スライスはブロックバッファを参照するため、走査中はバッファが保持される
+  （バッチごとに新しい配列を読むので書き換えは起きない）。
 
 各ブロックは末尾に 4バイトのチェックサムを持ち、
 Footer は `metadataChecksum`（Meta / Bloom / Index）と自身のチェックサムを持つ。

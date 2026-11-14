@@ -133,9 +133,10 @@ module internal StorageEngine =
 
     /// バックグラウンド compaction 用の走査。
     /// ファイルの先頭から全件を遅延して読む。
+    /// compaction はキー・SeqNo・削除タグしか見ないので、値は復号せずスライスのまま渡す。
     let openScan (dir: string) (f: FileMetaData) =
         openPartialSstIn dir f
-        >>= fun partial -> ret (Sstable.rangeScanPartial [||] 0 partial)
+        >>= fun partial -> ret (Sstable.rangeScanPartialRaw [||] 0 partial)
 
     /// ポイントルックアップ。
     /// memtable -> L0 -> 各レベルの順に見る。
@@ -430,7 +431,7 @@ module internal StorageEngine =
     let private compactOnce (engine: StorageEngine) =
         let scanOf f =
             openPartialSst f engine
-            >>= fun partial -> ret (Sstable.rangeScanPartial [||] 0 partial)
+            >>= fun partial -> ret (Sstable.rangeScanPartialRaw [||] 0 partial)
 
         let buildCompacted version manifestNumber result =
             let nextNum =

@@ -609,7 +609,7 @@ module internal Sstable =
 
     /// バッファ内の範囲にある 1ブロックをエントリ列へ復元する。
     /// 末尾 4バイトのチェックサムを検証する。
-    let private parseBlockAt (data: byte array) (offset: int) (length: int) =
+    let private parseBlockAt (decodeValues: bool) (data: byte array) (offset: int) (length: int) =
         let decodeEntry c (prev: byte array) =
             result {
                 let! shared, c = Reader.readVarint c
@@ -635,8 +635,12 @@ module internal Sstable =
                         return!
                             Reader.copyBytesInto key sharedLength tailLength c
                             >>= fun c ->
-                                SstEntry.decodeValueAt c (int valueLen)
-                                >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
+                                if decodeValues then
+                                    SstEntry.decodeValueAt c (int valueLen)
+                                    >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
+                                else
+                                    SstEntry.decodeRawValueAt c (int valueLen)
+                                    >>= fun (seqNo, raw, c) -> ret (c, SstEntry.makeRaw key seqNo raw, key)
             }
 
         if offset < 0 || length < 4 || offset > data.Length - length then
@@ -655,7 +659,8 @@ module internal Sstable =
 
     /// 部分読みした reader から startKey 以降を遅延生成する。
     /// ブロックは最大 8個まとめて 1回の open で読み、解析は必要になったときだけ行う。
-    let rangeScanPartial (startKey: byte array) (limit: int) (partial: SstPartial) =
+    /// `decodeValues = false` は compaction 用で、値を復号せずスライスだけを保持する。
+    let private rangeScanPartialWith (decodeValues: bool) (startKey: byte array) (limit: int) (partial: SstPartial) =
         let rec search lo hi =
             if lo >= hi then
                 lo
@@ -704,7 +709,7 @@ module internal Sstable =
             if relativeOffset < 0 || ie.Length < 0 || relativeOffset > raw.Length - ie.Length then
                 err (DbError.corruption "Sstable: 索引範囲が読み込みブロックの範囲外です")
             else
-                parseBlockAt raw relativeOffset ie.Length
+                parseBlockAt decodeValues raw relativeOffset ie.Length
                 >>= fun entries ->
                     if
                         entries.Length = 0
@@ -764,6 +769,14 @@ module internal Sstable =
                     close ()
                     err e
                 | Ok(raw, startOffset, batchEnd) -> SstScan.next (loadBlock raw startOffset batchEnd 0 startBlock))
+
+    /// 値を復号せずに走査する（compaction 用）。
+    let rangeScanPartialRaw (startKey: byte array) (limit: int) (partial: SstPartial) =
+        rangeScanPartialWith false startKey limit partial
+
+    /// 値を復号しながら走査する（通常のクエリ・検証用）。
+    let rangeScanPartial (startKey: byte array) (limit: int) (partial: SstPartial) =
+        rangeScanPartialWith true startKey limit partial
 
     /// ブロック内のキー・SeqNo・値の位置をキャッシュする。
     /// 点検索のたびにキー復元と値の読み飛ばしを繰り返さないため。

@@ -8,16 +8,31 @@
 
 namespace RykDb.Core
 
+/// SSTable ブロック内の符号化された値の位置。
+/// `Buffer.[Offset]` が削除タグ（0 = tombstone / 1 = 値）で、続きが値本体。
+/// ブロックのバッファを参照するので、スライスを持つ間はバッファが GC されない。
+type internal RawSstValue =
+    {
+        Buffer: byte array
+        Offset: int
+        Length: int
+    }
+
 /// SSTable の 1エントリ。
 type internal SstEntry =
     {
         Key: byte array
         SeqNo: uint64
-        /// None が削除 tombstone
+        /// None が削除 tombstone（復号済みの値）
         Value: SqlValue array option
+        /// 符号化されたままの値（compaction 用。`Value` とどちらか一方だけが有効）
+        RawValue: RawSstValue option
     }
 
-    member this.IsDelete = this.Value.IsNone
+    member this.IsDelete =
+        match this.RawValue with
+        | Some raw -> raw.Length > 0 && raw.Buffer.[raw.Offset] = 0uy
+        | None -> this.Value.IsNone
 
 module internal SstEntry =
     let make key seqNo value =
@@ -25,6 +40,16 @@ module internal SstEntry =
             Key = key
             SeqNo = seqNo
             Value = value
+            RawValue = None
+        }
+
+    /// 復号せずに値スライスを保持するエントリ（compaction 用）。
+    let makeRaw key seqNo raw =
+        {
+            Key = key
+            SeqNo = seqNo
+            Value = None
+            RawValue = Some raw
         }
 
     /// 並び。
@@ -37,24 +62,32 @@ module internal SstEntry =
     let encodedValueLength (e: SstEntry) =
         let seqLength = Writer.varintLength e.SeqNo
 
-        match e.Value with
-        | None -> seqLength + 2
-        | Some values -> seqLength + 1 + ValueCodec.encodedValuesLength values
+        match e.RawValue with
+        | Some raw -> seqLength + raw.Length
+        | None ->
+            match e.Value with
+            | None -> seqLength + 2
+            | Some values -> seqLength + 1 + ValueCodec.encodedValuesLength values
 
     /// 値部分を出力配列へ直接書く。
     /// 次の位置を返す。
     let writeValueTo (out: byte array) (pos: int) (e: SstEntry) =
         let pos = Writer.writeVarintTo out pos e.SeqNo
 
-        match e.Value with
+        match e.RawValue with
+        | Some raw ->
+            Array.blit raw.Buffer raw.Offset out pos raw.Length
+            pos + raw.Length
         | None ->
-            out.[pos] <- 0uy
-            let pos = pos + 1
-            out.[pos] <- 0uy
-            pos + 1
-        | Some values ->
-            out.[pos] <- 1uy
-            ValueCodec.writeValuesTo out (pos + 1) values
+            match e.Value with
+            | None ->
+                out.[pos] <- 0uy
+                let pos = pos + 1
+                out.[pos] <- 0uy
+                pos + 1
+            | Some values ->
+                out.[pos] <- 1uy
+                ValueCodec.writeValuesTo out (pos + 1) values
 
     let private readSeqNo =
         let rec loop shift acc c =
@@ -119,13 +152,66 @@ module internal SstEntry =
         |> decodeHeader
         >>= fun (seqNo, tag, c) -> decodePayload seqNo tag c
 
+    /// 符号化された値の位置を返す（復号しない）。
+    /// `length` バイトを消費した次のカーソルも返す。
+    let decodeRawValueAt (c: Cursor) (length: int) =
+        let d = Cursor.data c
+        let p = Cursor.pos c
+        let e = Cursor.endPos c
+
+        if length < 0 || p < 0 || e < p || e > d.Length || length > e - p then
+            err (DbError.corruption "Sstable: 値の範囲が不正です")
+        else
+            match Cursor.createSlice d p length >>= decodeHeader with
+            | Error er -> err er
+            | Ok(seqNo, tag, afterTag) ->
+                if tag <> 0uy && tag <> 1uy then
+                    err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
+                else
+                    let rawStart = Cursor.pos afterTag - 1
+                    let rawLength = length - (rawStart - p)
+
+                    if rawLength < 1 then
+                        err (DbError.corruption "Sstable: 値の範囲が不正です")
+                    else
+                        ret (
+                            seqNo,
+                            {
+                                Buffer = d
+                                Offset = rawStart
+                                Length = rawLength
+                            },
+                            Cursor.advance length c
+                        )
+
+    /// 符号化された値を復号する（復号済みならそのまま）。
+    let decoded (e: SstEntry) =
+        match e.RawValue with
+        | None -> ret e.Value
+        | Some raw ->
+            if raw.Length < 1 || raw.Offset < 0 || raw.Offset > raw.Buffer.Length - raw.Length then
+                err (DbError.corruption "Sstable: 値スライスが不正です")
+            else
+                let tag = raw.Buffer.[raw.Offset]
+
+                if tag = 0uy then
+                    ret None
+                elif tag = 1uy then
+                    Cursor.createSlice raw.Buffer (raw.Offset + 1) (raw.Length - 1)
+                    >>= fun c -> ValueCodec.readValues c |> Result.map (fun (values, _) -> Some values)
+                else
+                    err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
+
     /// 1エントリの符号化後のおおよそのバイト数。
     /// compaction の出力をバイト幅で分けるための見積りで、実際の SSTable サイズとは厳密には一致しない。
     let approximateBytes (e: SstEntry) =
         let valueTotal =
-            match e.Value with
-            | None -> 2
-            | Some vs -> Array.sumBy ValueCodec.approximateBytes vs + 4
+            match e.RawValue with
+            | Some raw -> Writer.varintLength e.SeqNo + raw.Length
+            | None ->
+                match e.Value with
+                | None -> 2
+                | Some vs -> Array.sumBy ValueCodec.approximateBytes vs + 4
 
         e.Key.Length + valueTotal
 

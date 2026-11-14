@@ -80,6 +80,27 @@ let ``SSTable: 構築と全件走査の往復`` () =
         )
 
 [<Fact>]
+let ``SSTable: raw スキャンは復号なしで同じ値・削除タグを返す`` () =
+    let entries =
+        Array.append (sstEntries 300) [| SstEntry.make (intKey 10_000) 1UL None |]
+
+    let reader =
+        ok (Sstable.openPartial (writeTempSst (ok (buildSstable 0.01 entries))))
+
+    let decoded = ok (readEntries reader)
+    let raw = ok (Sstable.rangeScanPartialRaw [||] 0 reader |> SstScan.toArray)
+    Assert.Equal(decoded.Length, raw.Length)
+
+    for i in 0 .. decoded.Length - 1 do
+        let d = decoded.[i]
+        let r = raw.[i]
+        Assert.Equal<byte array>(d.Key, r.Key)
+        Assert.Equal<uint64>(d.SeqNo, r.SeqNo)
+        Assert.Equal<bool>(d.IsDelete, r.IsDelete)
+        Assert.True(r.RawValue.IsSome)
+        Assert.Equal<SqlValue array option>(d.Value, ok (SstEntry.decoded r))
+
+[<Fact>]
 let ``SSTable: 複数ブロックに分割される`` () =
     // EntriesPerBlock = 128 なので 1000 件で 8 ブロック
     let entries = sstEntries 1000
