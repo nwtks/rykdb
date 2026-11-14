@@ -61,18 +61,21 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 
 ### INV-01 SstScan
 
-- 構築は `SstScan.ofStep` / `ofArray` / `ofState` / `ofFilter` / `ofScoped` に限定する。
+- 構築は `SstScan.ofStep` / `ofStepWithClose` / `ofArray` / `ofState` / `ofFilter` / `ofScoped` に限定する。
 - `SstScan.withScan` は開いた走査を使い、成功・失敗のどちらでも `Dispose` する。
+- ファイルを開いたままの step 走査は `ofStepWithClose` で作る（`Dispose` で閉じる）。
+  途中で捨てられた走査がハンドルを残すと、Windows では rename / 削除が共有違反で失敗する。
 - テスト専用の `oneShotScan` が、同じ `SstScan` 値の 2回目の `next` を検出する。
 - `Op` のケース（`Done` / `Step` / `Compute`）は **`Op.fsi` で隠す**。
   構築は `Op.Empty` / `ofRow` / `emit` / `compute` / `ofArray` に限られ、
   他ファイルからの生ケース構築は**コンパイルエラー**になる。
 - `SstScan` のケースも **`SstScan.fsi` で隠す**。
-  構築は `ofStep` / `ofArray` / `ofState` / `ofFilter` / `ofScoped` に限る。
+  構築は `ofStep` / `ofStepWithClose` / `ofArray` / `ofState` / `ofFilter` / `ofScoped` に限る。
 - 回帰テスト:
   - `SstScan.withScan: 成功・失敗のどちらでも Dispose する`
   - `SstScan: one-shot ガードは同じ値の 2回目の next を検出する`
   - `SstScan: filter / toArray はソースを 1回だけ消費する`
+  - `RowStore: compaction 失敗で中断した走査は入力 SSTable のハンドルを残さない`
 
 ### INV-02 返した行は DB 内部と独立
 

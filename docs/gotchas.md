@@ -1199,6 +1199,26 @@ grep -h -A1 '"resolved": "10.1.404"' src/*/packages.lock.json tests/*/packages.l
 cat ~/.nuget/packages/fsharp.core/10.1.404/.nupkg.metadata   # source が api.nuget.org になること
 ```
 
+### 9.11 `SstScan` の step 走査に後始末が無いと Windows でファイルを消せない
+
+```text
+Result が Error でした: The process cannot access the file because it is being used by another process. [IOException]
+```
+
+- 症状: **Windows だけ** `RowStore: compaction 失敗後も flush 結果を保持し、再起動で commit を失わない` が落ちる。
+  失敗位置は再オープン時の孤児退避（`openDatabaseWith` → `.orphans` への `File.Move`）。
+- 原因: compaction が壊れた入力（チェックサム不一致）で中断すると、他の入力の走査が途中で捨てられる。
+  旧 `SstScan.ofStep` は **`Dispose` を持たない**ため `SstScan.dispose` が no-op になり、
+  `FileStream`（`FileShare.Read`）が GC まで残る。
+  Linux は開いたままで `unlink` / `rename` できるので `File.Move` が成功し、Windows だけ共有違反になる。
+- 対策: ファイルを所有する step 走査は `SstScan.ofStepWithClose step close` で作る
+  （`Sstable.rangeScanPartial` / `RowStore.scanWithinPrefix`）。
+  `SstMerge.next` が途中で `Error` になった場合も、残りのソースを閉じる。
+- 検出: Linux でも `FileShare` は flock で強制される
+  （`FileShare.Read` のハンドルがあると `FileShare.None` のオープンが `IOException` になる）。
+  テスト `RowStore: compaction 失敗で中断した走査は入力 SSTable のハンドルを残さない` が
+  Windows の共有違反と同じ条件を Linux で検査する。
+
 ---
 
 ## 10. デバッグ手法

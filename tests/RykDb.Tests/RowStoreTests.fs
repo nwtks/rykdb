@@ -193,6 +193,59 @@ let ``RowStore: compaction 失敗後も flush 結果を保持し、再起動で 
         Assert.True((ok (StorageEngine.getAt None key6 reopened)).IsSome))
 
 [<Fact>]
+let ``RowStore: compaction 失敗で中断した走査は入力 SSTable のハンドルを残さない`` () =
+    withDir "rowstore-compaction-handles" (fun dir ->
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
+
+        let mk (num: int64) (key: int) =
+            [| Entry.put (intKey key) (uint64 key) (intRow key) |]
+            |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+            |> fun entries -> FileMetaData.writeSstable dir num 0 0.01 entries
+            |> ok
+
+        let f1 = mk 10L 1
+        let f2 = mk 11L 2
+        let f3 = mk 12L 3
+
+        // f2 を開けるが壊れたファイルにする（データブロックのチェックサム不一致）。
+        let path = FileMetaData.path dir 11L
+        let data = System.IO.File.ReadAllBytes path
+        data.[0] <- data.[0] ^^^ 0xFFuy
+        System.IO.File.WriteAllBytes(path, data)
+
+        let version =
+            Version.Empty |> Version.addFile f1 |> Version.addFile f2 |> Version.addFile f3
+
+        let engine =
+            { engine with
+                Version = { version with NextFileNumber = 100L }
+                MemLimitBytes = 1
+            }
+
+        let store = openStoreWith dir (DiskStorageEngine engine :> IStorageEngine)
+
+        // flush 後の compaction は f2 で失敗し、他の入力の走査は途中で捨てられる。
+        let store =
+            ok (RowStore.writeBatches [ ("t", [| Entry.put (intKey 5) 5UL (intRow 5) |]) ] store)
+
+        Assert.True store.Engine.HostState.LastCompactionError.IsSome
+
+        // 捨てた走査がハンドルを残していると共有違反になる。
+        // Linux は開いたままでも削除・rename できるため、この検査が無いと Windows だけで露見する。
+        for num in [ 10L; 11L; 12L ] do
+            use _ =
+                new System.IO.FileStream(
+                    FileMetaData.path dir num,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.ReadWrite,
+                    System.IO.FileShare.None
+                )
+
+            ()
+
+        RowStore.close store |> ignore)
+
+[<Fact>]
 let ``RowStore: keyspace は 1 本の LSM の接頭辞で分離される`` () =
     withDir "rs7" (fun dir ->
         let store = RowStore.openStore dir |> ok

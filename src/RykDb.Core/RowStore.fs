@@ -215,6 +215,7 @@ module internal RowStore =
         }
 
     /// 接頭辞の境界で走査を止め、返すキーから接頭辞を外す。
+    /// 途中で捨てられても下流の走査（SSTable のファイルハンドル）を閉じられるようにする。
     let private scanWithinPrefix (prefix: byte array) (scan: SstScan) =
         let rec loop current =
             match SstScan.next current with
@@ -225,9 +226,14 @@ module internal RowStore =
                     ret None
                 else
                     let key = Array.sub e.Key prefix.Length (e.Key.Length - prefix.Length)
-                    ret (Some({ e with Key = key }, SstScan.ofStep (fun () -> loop rest)))
 
-        SstScan.ofStep (fun () -> loop scan)
+                    Some(
+                        { e with Key = key },
+                        SstScan.ofStepWithClose (fun () -> loop rest) (fun () -> SstScan.dispose rest)
+                    )
+                    |> ret
+
+        SstScan.ofStepWithClose (fun () -> loop scan) (fun () -> SstScan.dispose scan)
 
     /// keyspace を prefix で走査する（最新エントリ。値の filter はしない）。
     /// 返すキーは接頭辞を外した論理キー。1行要求されるまで SSTable のブロックを読まない。

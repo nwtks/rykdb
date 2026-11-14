@@ -37,7 +37,9 @@ type internal SstScan =
     interface System.IDisposable
 
 module internal SstScan =
+    val Empty: SstScan
     val ofStep: (unit -> Result<(SstEntry * SstScan) option, DbError>) -> SstScan
+    val ofStepWithClose: (unit -> Result<(SstEntry * SstScan) option, DbError>) -> (unit -> unit) -> SstScan
 
     val ofArray:
         SstEntry array ->
@@ -51,7 +53,6 @@ module internal SstScan =
     val ofState<'s> : 's -> ('s -> Result<(SstEntry * SstScan) option, DbError>) -> ('s -> unit) -> SstScan
     val ofFilter: (SstEntry -> bool) -> SstScan -> SstScan
     val ofScoped: SstScan -> ScanScope -> obj -> SstScan
-    val Empty: SstScan
     val next: (SstScan -> Result<(SstEntry * SstScan) option, DbError>)
     val dispose: SstScan -> unit
     val withScan: SstScan -> (SstScan -> Result<'a, DbError>) -> Result<'a, DbError>

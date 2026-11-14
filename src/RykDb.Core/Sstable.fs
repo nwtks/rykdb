@@ -714,6 +714,8 @@ module internal Sstable =
                     else
                         ret entries
 
+        let stepScan (step: unit -> Result<(SstEntry * SstScan) option, DbError>) = SstScan.ofStepWithClose step close
+
         let rec scanEntries raw startOffset batchEnd pos count i (entries: SstEntry array) =
             if pos >= entries.Length then
                 loadBlock raw startOffset batchEnd count i
@@ -721,7 +723,7 @@ module internal Sstable =
                 close ()
                 SstScan.Empty
             elif Bytes.compare entries.[pos].Key startKey < 0 then
-                SstScan.ofStep (fun () -> SstScan.next (scanEntries raw startOffset batchEnd (pos + 1) count i entries))
+                stepScan (fun () -> SstScan.next (scanEntries raw startOffset batchEnd (pos + 1) count i entries))
             else
                 SstScan.ofArray
                     entries
@@ -736,14 +738,14 @@ module internal Sstable =
                 close ()
                 SstScan.Empty
             elif i < batchEnd then
-                SstScan.ofStep (fun () ->
+                stepScan (fun () ->
                     match parseRawBlock raw startOffset i with
                     | Error e ->
                         close ()
                         err e
                     | Ok entries -> SstScan.next (scanEntries raw startOffset batchEnd 0 count (i + 1) entries))
             else
-                SstScan.ofStep (fun () ->
+                stepScan (fun () ->
                     match readRawBatch i with
                     | Error e ->
                         close ()
@@ -756,7 +758,7 @@ module internal Sstable =
             close ()
             SstScan.Empty
         else
-            SstScan.ofStep (fun () ->
+            stepScan (fun () ->
                 match readRawBatch startBlock with
                 | Error e ->
                     close ()

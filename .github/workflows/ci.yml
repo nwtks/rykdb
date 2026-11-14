@@ -44,12 +44,11 @@ jobs:
 
       - name: Test (Windows / macOS)
         if: runner.os != 'Linux'
-        continue-on-error: true
         run: dotnet test --no-build --blame-hang --blame-hang-timeout 120s
 
       - name: Upload coverage
         if: ${{ always() && runner.os == 'Linux' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: tests/**/coverage.cobertura.xml

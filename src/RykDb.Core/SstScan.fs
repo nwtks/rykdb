@@ -162,7 +162,8 @@ type internal ScanScope() =
 /// ブロックのチェックサムや内容の検証に失敗した場合は、そのブロックを読む `next` が `Error` を返す。
 /// `openTable` は footer やメタデータを検証するが、まだ読んでいないデータブロックは検証しない。
 type internal SstScan =
-    | SstScan of (unit -> Result<(SstEntry * SstScan) option, DbError>)
+    /// ステップ関数と、途中で捨てられたときの後始末（ファイルを持つ走査だけが使う）。
+    | SstScan of (unit -> Result<(SstEntry * SstScan) option, DbError>) * (unit -> unit)
     /// 配列内の次の 1件を返す状態。
     /// 1件ごとにクロージャを作らず、位置だけを進める。
     | ArrayScan of
@@ -187,11 +188,16 @@ type internal SstScan =
             | FilterScan(inner, _) -> (inner :> System.IDisposable).Dispose()
             | StateScan(state, _, close) -> close state
             | ScopedScan(_, scope, key) -> scope.Release key
-            | SstScan _ -> ()
+            | SstScan(_, close) -> close ()
 
 module internal SstScan =
-    /// ステップ関数から走査を作る。
-    let ofStep (step: unit -> Result<(SstEntry * SstScan) option, DbError>) = SstScan step
+    /// ステップ関数から走査を作る（資源は持たない）。
+    let ofStep (step: unit -> Result<(SstEntry * SstScan) option, DbError>) = SstScan(step, ignore)
+
+    /// ファイルなど資源を持つステップ走査を作る。
+    /// `Dispose` で `close` を呼ぶので、途中で捨ててもハンドルが残らない。
+    let ofStepWithClose (step: unit -> Result<(SstEntry * SstScan) option, DbError>) (close: unit -> unit) =
+        SstScan(step, close)
 
     /// 配列走査を作る。
     let ofArray
@@ -240,7 +246,7 @@ module internal SstScan =
     let rec private nextWithFilters (filters: (SstEntry -> bool) list) (scope: (ScanScope * obj) option) =
         function
         | FilterScan(inner, predicate) -> nextWithFilters (predicate :: filters) scope inner
-        | SstScan step -> continueWith filters scope (step ())
+        | SstScan(step, _) -> continueWith filters scope (step ())
         | ArrayScan(entries, pos, count, limit, loadNext, close) ->
             if limit > 0 && count >= limit then
                 close ()
@@ -435,6 +441,18 @@ module internal SstMerge =
 
         add 0 Empty
 
+    /// ヒープが持つソースをすべて閉じる。
+    let dispose (SstMerge heap) =
+        let rec disposeNode =
+            function
+            | [] -> ()
+            | MergeEmpty :: rest -> disposeNode rest
+            | MergeNode(_, head, left, right) :: rest ->
+                SstScan.dispose head.Scan
+                disposeNode (left :: right :: rest)
+
+        disposeNode [ heap ]
+
     /// 先頭のエントリ（取り出さない）。
     /// 空なら None。
     let top (SstMerge heap) =
@@ -444,12 +462,15 @@ module internal SstMerge =
 
     /// 先頭を取り出し、そのソースを 1件進める。
     /// 進めた先が壊れていれば Error（取り出したエントリは捨てる）。
+    /// ヒープはもう使えないので、残りのソースも閉じる。
     let next (SstMerge heap) =
         match heap with
         | MergeEmpty -> ret None
         | MergeNode(_, head, left, right) ->
             match SstScan.next head.Scan with
-            | Error e -> err e
+            | Error e ->
+                dispose (SstMerge heap)
+                err e
             | Ok None -> ret (Some(head.Entry, SstMerge(mergeHeaps left right)))
             | Ok(Some(entry, rest)) ->
                 let advanced =
@@ -461,14 +482,3 @@ module internal SstMerge =
 
                 let restHeap = mergeHeaps left right |> push advanced
                 ret (Some(head.Entry, SstMerge restHeap))
-
-    let dispose (SstMerge heap) =
-        let rec disposeNode =
-            function
-            | [] -> ()
-            | MergeEmpty :: rest -> disposeNode rest
-            | MergeNode(_, head, left, right) :: rest ->
-                SstScan.dispose head.Scan
-                disposeNode (left :: right :: rest)
-
-        disposeNode [ heap ]
