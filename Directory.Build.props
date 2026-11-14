@@ -6,8 +6,9 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <WarningLevel>3</WarningLevel>
-    <Tailcalls>true</Tailcalls>
     <OtherFlags>--warnon:1182</OtherFlags>
+    <Tailcalls>true</Tailcalls>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <DisableImplicitLibraryPacksFolder>true</DisableImplicitLibraryPacksFolder>
   </PropertyGroup>
 </Project>

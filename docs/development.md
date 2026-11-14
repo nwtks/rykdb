@@ -32,6 +32,14 @@ dotnet test -p:CollectCoverage=true -p:Threshold=90 -p:ThresholdType=line -p:Thr
 依存は `global.json` で SDK を、`packages.lock.json` でパッケージ版を固定する。
 パッケージを追加・更新したときは `dotnet restore` で lock ファイルを更新してコミットする。
 
+`FSharp.Core` は SDK 同梱の `library-packs` ではなく nuget.org から復元する
+（`Directory.Build.props` の `DisableImplicitLibraryPacksFolder`）。
+同じバージョン番号でも SDK のビルドごとに中身が異なり、
+`--locked-mode` が NU1403（contentHash 不一致）で落ちるため
+（[`gotchas.md`](gotchas.md) §9.10）。
+lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>/` を消してから
+`dotnet restore --force-evaluate` を実行する。
+
 | ゲート                  | 設定                                             |
 | ----------------------- | ------------------------------------------------ |
 | `TreatWarningsAsErrors` | **有効**                                         |

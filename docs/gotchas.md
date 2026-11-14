@@ -1159,6 +1159,46 @@ Supported file patterns: packages.lock.json
 `cache-dependency-path` は `@actions/glob` の `hashFiles` にそのまま渡るので、glob を受け付ける。
 パターンが 1件も一致しないと `Some specified paths were not resolved, unable to cache dependencies.` で落ちる。
 
+### 9.10 `--locked-mode` が NU1403（FSharp.Core の contentHash 不一致）で落ちる
+
+```text
+error NU1403: Package content hash validation failed for FSharp.Core.10.1.404.
+The package is different than the last restore.
+```
+
+`Microsoft.FSharp.NetSdk.targets` は SDK 同梱の `<SDK>/FSharp/library-packs` を NuGet ソースとして追加する
+（`RestoreAdditionalProjectSources`）。
+このフォルダの `FSharp.Core.10.1.404.nupkg` は **nuget.org の同名・同バージョンのパッケージと中身が違う**
+（同じコミット表記でも別ビルド。実測では 2026-10-30 の 10 分違いのビルドで、
+`FSharp.Core.dll` のバイト列・`.signature.p7s`・`FSharp.Core.xml` のサイズが異なっていた）。
+
+`contentHash` は「その nupkg の中身」のハッシュなので、
+環境ごとに library-packs（Linux 開発機・ubuntu ランナー）と nuget.org（Windows ランナー）の
+どちらが選ばれるかで lock ファイルと一致しなくなる。
+`--locked-mode` では即エラーになる。
+
+対策は library-packs を無効化して復元元を nuget.org に固定すること（`Directory.Build.props`）。
+
+```xml
+<DisableImplicitLibraryPacksFolder>true</DisableImplicitLibraryPacksFolder>
+```
+
+無効化したうえで `dotnet restore --force-evaluate` を実行し、
+lock ファイルの `contentHash` を nuget.org の値へ更新する。
+ただし `~/.nuget/packages/fsharp.core/<ver>/` に library-packs 由来のパッケージが残っていると
+**古いハッシュのまま再評価される**ので、先にそのフォルダを消す。
+
+```bash
+rm -rf ~/.nuget/packages/fsharp.core/10.1.404
+dotnet restore --force-evaluate
+# TailAudit はソリューション外なので個別に
+dotnet restore tools/TailAudit/TailAudit.fsproj --force-evaluate
+
+grep -h -A1 '"resolved": "10.1.404"' src/*/packages.lock.json tests/*/packages.lock.json tools/*/packages.lock.json \
+  | grep contentHash | sort -u          # 1種類だけになること
+cat ~/.nuget/packages/fsharp.core/10.1.404/.nupkg.metadata   # source が api.nuget.org になること
+```
+
 ---
 
 ## 10. デバッグ手法
