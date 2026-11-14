@@ -60,18 +60,19 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 `src/RykDb.Core/` では **`mutable` / `while` / `ref` を 0件**に保つ。
 例外は公開セッション層の `Session.fs` だけで、次を意図的に使う。
 
-- `DatabaseHost` の `let mutable committed` / `let mutable closed`:
-  全接続で共有する committed な `DbState` と Close 状態。
-- `Session` の `let mutable local` / `let mutable closed` / `let mutable readers`:
-  接続ローカルの transaction 状態、Close 状態、実行中の読み取り数を保持する。
-- `SessionPool` の `let mutable closed`: 新しい接続を受け付けるかを保持する。
-- `RowReader` の `current` / `closed` / `exhausted`:
-  ストリーミング SELECT の読み取り位置と解放状態を保持する。
+- `DatabaseHost` の `let mutable lifecycle`（`HostLifecycle` = `Running` / `Closed`）:
+  全接続で共有する committed な `DbState` と Close 状態を 1つの状態 DU で持つ。
+- `Session` の `let mutable local`（`LocalSession` = `Open` / `Closed`）と
+  `let mutable readers`: 接続ローカルの transaction 状態と Close 状態を状態 DU で、
+  実行中の読み取り数だけをカウンタで保持する。
+- `SessionPool` の `let mutable lifecycle`（`PoolLifecycle` = `Open` / `Closed`）:
+  新しい接続を受け付けるかを状態 DU で保持する。
+- `RowReader` の `let mutable state`（`RowReaderState` = `Reading` / `Exhausted` / `Closed`）:
+  ストリーミング SELECT の読み取り位置と解放状態を状態 DU で保持する。
   `Session.fs` 内に閉じる。
-- `CommitDurability` の `syncedFile` / `syncedSize` / `pending` / `syncing` / `failure`:
-  WAL の fsync 位置と進行状態（グループコミットの待機・失敗の共有）を保持する。
-- `lock stateGate`: `Session` の `local` / `closed` / `readers` と
-  `DatabaseHost` の `committed` / `closed` を保護する短いロック。
+- `CommitDurability` の `let mutable state`（`SyncState` = `Idle` / `Leading` / `Failed`）:
+  WAL の fsync 位置・登録位置と進行状態（グループコミットの待機・失敗の共有）を 状態 DU で保持する。
+- `lock stateGate`: `Session` の `local` / `readers` と `DatabaseHost` の `lifecycle` を保護する短いロック。
   読み取りは入口・出口でしか取らない。
 - `lock writeGate`: `Execute`（書き込みを含むバッチ）/ `Begin` / `Commit` / `Rollback` / `Close` を直列化する。
   `DatabaseHost.writeGate` は DB 全体、`Session.writeGate` は接続内を守る。

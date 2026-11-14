@@ -131,19 +131,31 @@ type private SyncStep =
     | SyncLead of WalState
     | SyncFail of DbError
 
+/// グループコミットの進行状態。
+/// <remarks>
+/// `gate` の内側だけで遷移する。
+/// 「同期中なのに失敗している」のような組み合わせを作れないよう、
+/// 同期済み・登録済みの位置も同じ DU にまとめる。
+/// </remarks>
+[<RequireQualifiedAccess>]
+type private SyncState =
+    /// 誰も fsync していない。`synced` は到達済みの位置、`pending` は登録済みの最大位置。
+    | Idle of WalState option * WalState option
+    /// 先頭の待機者が `target` まで fsync している。
+    | Leading of WalState option * WalState * WalState option
+    /// fsync に失敗した（以後の全待機者に同じエラーを返す）。
+    | Failed of DbError
+
 /// 複数の commit の WAL 位置をまとめ、リーダーが 1回だけ fsync する。
 /// 先に登録された位置を後から登録された位置が包含する場合、後者だけを同期すればよい。
 type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
     let gate = obj ()
-    let mutable syncedFile = 0L
-    let mutable syncedSize = 0
-    let mutable pending: WalState option = None
-    let mutable syncing = false
-    let mutable failure: DbError option = None
+    let mutable state = SyncState.Idle(None, None)
 
     let covers (pos: WalState) =
-        pos.FileNumber < syncedFile
-        || pos.FileNumber = syncedFile && pos.Size <= syncedSize
+        function
+        | Some(current: WalState) -> (current.FileNumber, current.Size) >= (pos.FileNumber, pos.Size)
+        | None -> false
 
     let later (a: WalState) (b: WalState) =
         if (a.FileNumber, a.Size) >= (b.FileNumber, b.Size) then
@@ -151,22 +163,27 @@ type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
         else
             b
 
+    let laterPending (pos: WalState) =
+        function
+        | Some current -> later current pos
+        | None -> pos
+
+    let laterSynced (target: WalState) =
+        function
+        | Some current -> later current target
+        | None -> target
+
     let rec awaitLoop (pos: WalState) =
         let step =
             lock gate (fun () ->
-                match failure with
-                | Some e -> SyncStep.SyncFail e
-                | None when covers pos -> SyncStep.SyncDone
-                | None when not syncing ->
-                    syncing <- true
-
-                    let target =
-                        match pending with
-                        | Some current -> later current pos
-                        | None -> pos
-
+                match state with
+                | SyncState.Failed e -> SyncStep.SyncFail e
+                | SyncState.Idle(synced, _) when covers pos synced -> SyncStep.SyncDone
+                | SyncState.Idle(synced, pending) ->
+                    let target = laterPending pos pending
+                    state <- SyncState.Leading(synced, target, pending)
                     SyncStep.SyncLead target
-                | None ->
+                | SyncState.Leading _ ->
                     System.Threading.Monitor.Wait gate |> ignore
                     SyncStep.SyncWait)
 
@@ -178,28 +195,35 @@ type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
             let result = sync target
 
             lock gate (fun () ->
-                match result with
-                | Ok() ->
-                    if (target.FileNumber, target.Size) > (syncedFile, syncedSize) then
-                        syncedFile <- target.FileNumber
-                        syncedSize <- target.Size
-                | Error e -> failure <- Some e
+                state <-
+                    match result with
+                    | Ok() ->
+                        match state with
+                        | SyncState.Leading(synced, _, pending) ->
+                            SyncState.Idle(Some(laterSynced target synced), pending)
+                        | current -> current
+                    | Error e -> SyncState.Failed e
 
-                syncing <- false
                 System.Threading.Monitor.PulseAll gate)
 
             result
 
     /// 失敗していればそのエラーを返す。
-    member _.Failure = lock gate (fun () -> failure)
+    member _.Failure =
+        lock gate (fun () ->
+            match state with
+            | SyncState.Failed e -> Some e
+            | SyncState.Idle _
+            | SyncState.Leading _ -> None)
 
     /// 同期対象の位置を登録する。
     member _.Register(pos: WalState) =
         lock gate (fun () ->
-            pending <-
-                match pending with
-                | Some current -> Some(later current pos)
-                | None -> Some pos)
+            match state with
+            | SyncState.Idle(synced, pending) -> state <- SyncState.Idle(synced, Some(laterPending pos pending))
+            | SyncState.Leading(synced, target, pending) ->
+                state <- SyncState.Leading(synced, target, Some(laterPending pos pending))
+            | SyncState.Failed _ -> ())
 
     /// 指定位置まで同期済みになるまで待つ。
     /// 最初の待機者がリーダーとなり、登録済みの最大位置まで同期する。
@@ -257,6 +281,16 @@ module internal SessionState =
                 ActiveRegistration = local.Registration
             }
 
+/// `DatabaseHost` のライフサイクル。
+/// <remarks>
+/// `Closed` は終端で、`Close` を実行するときに最後の state を読めるよう `DbState` を保持する。
+/// 「閉じたか」と committed state を別々の mutable にすると、Close 後の publish を作れてしまう。
+/// </remarks>
+[<RequireQualifiedAccess>]
+type private HostLifecycle =
+    | Running of DbState
+    | Closed of DbState
+
 /// 同一 DB を共有する複数の `Session`（接続）のコミット状態。
 /// <remarks>
 /// 1つの `RowStore` と `TransactionManager` を全接続で共有し、
@@ -268,20 +302,22 @@ module internal SessionState =
 /// - 閉じるのは所有者だけ（`SessionPool.Close` / 単独の `Session.Close`）。
 /// </remarks>
 type internal DatabaseHost(root: string, owner: Database) =
-    // committed / closed を保護する短いロック。
+    // ライフサイクル（committed state と Close 状態）を保護する短いロック。
     let stateGate = obj ()
     // 書き込み・transaction 操作・Close を直列化するロック。
     let writeGate = obj ()
     let durability = CommitDurability(fun pos -> Wal.sync root pos)
     // committed state は常に Active / Pending / ActiveRegistration を持たない。
-    let mutable committed = owner.StateWithDeferredDurability
-    let mutable closed = false
+    let mutable lifecycle = HostLifecycle.Running owner.StateWithDeferredDurability
 
-    let snapshot () =
-        lock stateGate (fun () -> committed, closed)
+    let snapshot () = lock stateGate (fun () -> lifecycle)
 
+    /// Close 後は何もしない（呼び出しはすべて writeGate の内側で Closed を確認済み）。
     let publish (state: DbState) =
-        lock stateGate (fun () -> committed <- state)
+        lock stateGate (fun () ->
+            match lifecycle with
+            | HostLifecycle.Running _ -> lifecycle <- HostLifecycle.Running state
+            | HostLifecycle.Closed _ -> ())
 
     let closedError () = DbError.internalError "データベースは閉じられています"
 
@@ -290,11 +326,9 @@ type internal DatabaseHost(root: string, owner: Database) =
     let serialized (run: DbState -> Result<DbState * 'a, DbError>) =
         let outcome, position =
             lock writeGate (fun () ->
-                let current, wasClosed = snapshot ()
-
-                if wasClosed then
-                    Error(closedError ()), None
-                else
+                match snapshot () with
+                | HostLifecycle.Closed _ -> Error(closedError ()), None
+                | HostLifecycle.Running current ->
                     match run current with
                     | Error e -> Error e, current.Store.Engine.WalState
                     | Ok(next, value) -> Ok value, next.Store.Engine.WalState)
@@ -306,19 +340,21 @@ type internal DatabaseHost(root: string, owner: Database) =
             | Ok() -> outcome
         | None -> outcome
 
-    /// 現在の committed state。
-    member _.Committed = lock stateGate (fun () -> committed)
+    /// 現在の committed state（Close 後は最後の state）。
+    member _.Committed =
+        lock stateGate (fun () ->
+            match lifecycle with
+            | HostLifecycle.Running state
+            | HostLifecycle.Closed state -> state)
 
     /// 永続化（WAL の fsync）の失敗。失敗後は全接続がエラーを返す。
     member _.DurabilityFailure = durability.Failure
 
     /// 読み取り用の committed state と、GC から守る lease を返す。
     member _.AcquireReadSnapshot() =
-        let state, wasClosed = snapshot ()
-
-        if wasClosed then
-            err (closedError ())
-        else
+        match snapshot () with
+        | HostLifecycle.Closed _ -> err (closedError ())
+        | HostLifecycle.Running state ->
             let store, lease = RowStore.acquireSnapshot state.Store
 
             let readState =
@@ -433,12 +469,10 @@ type internal DatabaseHost(root: string, owner: Database) =
     member _.Close() =
         let captured =
             lock writeGate (fun () ->
-                let current, wasClosed = snapshot ()
-
-                if wasClosed then
-                    None
-                else
-                    closed <- true
+                match snapshot () with
+                | HostLifecycle.Closed _ -> None
+                | HostLifecycle.Running current ->
+                    lock stateGate (fun () -> lifecycle <- HostLifecycle.Closed current)
                     Some current)
 
         match captured with
@@ -476,6 +510,17 @@ type internal DatabaseHost(root: string, owner: Database) =
             | Some e -> err e
             | None -> closeResult
 
+/// `Session` の接続ローカル状態。
+/// <remarks>
+/// `Closed` は終端で、以後の操作はすべてエラーになる。
+/// 「閉じたか」と `SessionState` を別々に持つと、閉じた後も `local` を読めてしまう。
+/// 実行中の読み取り数（`readers`）はカウンタなので `Session` 側で別に持つ。
+/// </remarks>
+[<RequireQualifiedAccess>]
+type private LocalSession =
+    | Open of SessionState
+    | Closed
+
 /// データベースへのセッション（1接続）。
 /// <remarks>
 /// 実際のコミット状態（Store / Catalog / Manager）は `DatabaseHost` が共有し、
@@ -486,13 +531,12 @@ type internal DatabaseHost(root: string, owner: Database) =
 /// （read-your-writes とスナップショットの一貫性を保つため）。
 /// </remarks>
 type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bool) =
-    // local / closed / readers を保護する短いロック。
+    // local / readers を保護する短いロック。
     // 読み取りは入口と出口でしか取らないので、実行中の書き込みに待たされない。
     let stateGate = obj ()
     // 書き込み・transaction 操作・Close を接続内で直列化するロック。
     let writeGate = obj ()
-    let mutable local = SessionState.none
-    let mutable closed = false
+    let mutable local = LocalSession.Open SessionState.none
     let mutable readers = 0
 
     let limits =
@@ -528,6 +572,18 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     let closedError () =
         DbError.internalError "Session は閉じられています"
 
+    let isClosed () =
+        lock stateGate (fun () ->
+            match local with
+            | LocalSession.Closed -> true
+            | LocalSession.Open _ -> false)
+
+    let inTransaction () =
+        lock stateGate (fun () ->
+            match local with
+            | LocalSession.Closed -> false
+            | LocalSession.Open state -> SessionState.inTransaction state)
+
     let summarize (results: StatementResult list) =
         let selects = results |> List.filter (fun r -> not (Array.isEmpty r.Columns))
 
@@ -545,11 +601,9 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// WAL の fsync 待ちは host が writeGate の外で行う。
     let runExclusive (statements: Statement list) =
         lock writeGate (fun () ->
-            let start = lock stateGate (fun () -> if closed then None else Some local)
-
-            match start with
-            | None -> err (closedError ())
-            | Some start ->
+            match lock stateGate (fun () -> local) with
+            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Open start ->
                 let wasInTransaction = SessionState.inTransaction start
 
                 let rec run budget acc state =
@@ -567,13 +621,13 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                         match outcome with
                         | Error e -> err e
                         | Ok(next, result) ->
-                            lock stateGate (fun () -> local <- next)
+                            lock stateGate (fun () -> local <- LocalSession.Open next)
                             run (consumeBudget result budget) (result :: acc) next tail
 
                 match run initialBudget [] start statements with
                 | Error e -> err e
                 | Ok results ->
-                    let nowInTransaction = lock stateGate (fun () -> SessionState.inTransaction local)
+                    let nowInTransaction = inTransaction ()
 
                     let change =
                         match wasInTransaction, nowInTransaction with
@@ -589,11 +643,10 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// （間に commit + flush + compaction が入ると、古い snapshot に必要な版が消え得るため）。
     let tryEnterRead () =
         lock stateGate (fun () ->
-            if closed then
-                Error(closedError ())
-            elif SessionState.inTransaction local then
-                Ok None
-            else
+            match local with
+            | LocalSession.Closed -> Error(closedError ())
+            | LocalSession.Open state when SessionState.inTransaction state -> Ok None
+            | LocalSession.Open _ ->
                 match host.AcquireReadSnapshot() with
                 | Error e -> Error e
                 | Ok(readState, lease) ->
@@ -642,7 +695,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
 
     /// 単一文または複数文を実行し、transaction の遷移も返す。
     let executeCore (sql: string) =
-        if lock stateGate (fun () -> closed) then
+        if isClosed () then
             err (closedError ())
         else
             match host.DurabilityFailure with
@@ -670,16 +723,14 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
         new Session(DatabaseHost(root, db), options, true)
 
     /// 実行中の transaction があるか。
-    member _.InTransaction =
-        lock stateGate (fun () -> not closed && SessionState.inTransaction local)
+    member _.InTransaction = inTransaction ()
 
     /// テーブル一覧を返す。
     member _.TableNames() =
         lock stateGate (fun () ->
-            if closed then
-                err (closedError ())
-            else
-                ret (host.Committed.Catalog.Tables |> List.map _.Name))
+            match local with
+            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Open _ -> ret (host.Committed.Catalog.Tables |> List.map _.Name))
 
     /// 単一の SELECT を materialize せずにストリーミング用に開く。
     /// <remarks>
@@ -692,7 +743,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// 返した `RowReader` は使い終わったら `Dispose` すること。
     /// </remarks>
     member _.TryOpenReader(sql: string) =
-        if lock stateGate (fun () -> closed) then
+        if isClosed () then
             err (closedError ())
         else
             match host.DurabilityFailure with
@@ -732,32 +783,32 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// トランザクションを始める。
     member _.Begin() =
         lock writeGate (fun () ->
-            match lock stateGate (fun () -> if closed then None else Some local) with
-            | None -> err (closedError ())
-            | Some state ->
+            match lock stateGate (fun () -> local) with
+            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Open state ->
                 match host.Begin state with
                 | Error e -> err e
                 | Ok next ->
-                    lock stateGate (fun () -> local <- next)
+                    lock stateGate (fun () -> local <- LocalSession.Open next)
                     ret ())
 
     /// COMMIT。
     member _.Commit() =
         lock writeGate (fun () ->
-            match lock stateGate (fun () -> if closed then None else Some local) with
-            | None -> err (closedError ())
-            | Some state ->
+            match lock stateGate (fun () -> local) with
+            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Open state ->
                 host.Commit state
-                |> Result.map (fun (next, _) -> lock stateGate (fun () -> local <- next)))
+                |> Result.map (fun (next, _) -> lock stateGate (fun () -> local <- LocalSession.Open next)))
 
     /// ROLLBACK。
     member _.Rollback() =
         lock writeGate (fun () ->
-            match lock stateGate (fun () -> if closed then None else Some local) with
-            | None -> err (closedError ())
-            | Some state ->
+            match lock stateGate (fun () -> local) with
+            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Open state ->
                 host.Rollback state
-                |> Result.map (fun (next, _) -> lock stateGate (fun () -> local <- next)))
+                |> Result.map (fun (next, _) -> lock stateGate (fun () -> local <- LocalSession.Open next)))
 
     /// このセッションを閉じる。
     /// <remarks>
@@ -772,11 +823,11 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
         lock writeGate (fun () ->
             let captured =
                 lock stateGate (fun () ->
-                    if closed then
-                        None
-                    else
-                        closed <- true
-                        Some local)
+                    match local with
+                    | LocalSession.Closed -> None
+                    | LocalSession.Open state ->
+                        local <- LocalSession.Closed
+                        Some state)
 
             match captured with
             | None -> ret ()
@@ -801,6 +852,12 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     interface System.IDisposable with
         member this.Dispose() = this.Close() |> ignore
 
+/// `SessionPool` が新しい接続を受け付けるか。
+[<RequireQualifiedAccess>]
+type private PoolLifecycle =
+    | Open
+    | Closed
+
 /// 同一 DB を共有する複数の `Session`（接続）を発行する。
 /// <remarks>
 /// 各 `Session` は独立した transaction を持ち、
@@ -810,7 +867,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
 /// </remarks>
 type SessionPool internal (host: DatabaseHost, options: SessionOptions) =
     let gate = obj ()
-    let mutable closed = false
+    let mutable lifecycle = PoolLifecycle.Open
 
     /// DB を開く（既定の上限）。
     static member OpenWith(root: string) =
@@ -827,19 +884,18 @@ type SessionPool internal (host: DatabaseHost, options: SessionOptions) =
     /// 接続用の Session を作る。使い終わったら `Session.Close` する。
     member _.CreateSession() =
         lock gate (fun () ->
-            if closed then
-                err (DbError.internalError "SessionPool は閉じられています")
-            else
-                ret (new Session(host, options, false)))
+            match lifecycle with
+            | PoolLifecycle.Closed -> err (DbError.internalError "SessionPool は閉じられています")
+            | PoolLifecycle.Open -> ret (new Session(host, options, false)))
 
     /// DB 全体を閉じる（接続中の Session は以後エラーになる）。
     member _.Close() =
         let shouldClose =
             lock gate (fun () ->
-                if closed then
-                    false
-                else
-                    closed <- true
+                match lifecycle with
+                | PoolLifecycle.Closed -> false
+                | PoolLifecycle.Open ->
+                    lifecycle <- PoolLifecycle.Closed
                     true)
 
         if shouldClose then host.Close() else ret ()
