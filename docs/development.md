@@ -23,13 +23,22 @@ dotnet build -t:Rebuild       # ビルド
 dotnet test                   # テスト
 dotnet tool restore           # fantomas インストール
 dotnet fantomas src/ tests/   # 整形
+
+# CI と同じゲート（coverage 90% 必須）
+dotnet restore --locked-mode
+dotnet test -p:CollectCoverage=true -p:Threshold=90 -p:ThresholdType=line -p:ThresholdStat=total
 ```
+
+依存は `global.json` で SDK を、`packages.lock.json` でパッケージ版を固定する。
+パッケージを追加・更新したときは `dotnet restore` で lock ファイルを更新してコミットする。
 
 | ゲート                  | 設定                                             |
 | ----------------------- | ------------------------------------------------ |
 | `TreatWarningsAsErrors` | **有効**                                         |
 | `LangVersion`           | `10.0`                                           |
 | `WarningLevel`          | `3`                                              |
+| `OtherFlags`            | `--warnon:1182`（未使用ローカル変数もエラー）    |
+| 依存の再現性            | `global.json`（SDK） / `packages.lock.json`      |
 | Core の命令型構文・機能 | `mutable` / `while` / `ref` は `Session.fs` のみ |
 
 > **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
@@ -131,4 +140,5 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 - [ ] `dotnet test` が全緑（逐次実行）
 - [ ] `dotnet run --project tools/TailAudit` が exit 0（新規の非末尾再帰なし。追認は内容確認のうえ `-- --update`）
 - [ ] 不変条件を追加・変更したら [`invariants.md`](invariants.md) と対応するテストを更新
+- [ ] 構築に不変条件がある型は `.fsi` で表現を隠したか（`[<Struct>]` レコードは不可。[`gotchas.md`](gotchas.md) §8.21）
 - [ ] `docs/gotchas.md` に**同じ原因の再発**があれば追記

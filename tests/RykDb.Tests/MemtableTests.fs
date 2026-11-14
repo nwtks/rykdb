@@ -11,6 +11,10 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
+/// 全件走査で件数を数える。
+let private countOf (mem: Memtable) =
+    Memtable.rangeScan [||] 0 mem |> Seq.length
+
 /// (キー番号, SeqNo) の並びから memtable を作る。
 let private build (entries: (int * uint64) list) =
     let es =
@@ -20,13 +24,14 @@ let private build (entries: (int * uint64) list) =
 
 [<Fact>]
 let ``Memtable: 空の memtable は何も返さない`` () =
-    Assert.Equal(0, Memtable.Empty.Count)
-    Assert.Equal(0, Memtable.Empty.ApproxBytes)
+    Assert.Equal(0, countOf Memtable.Empty)
+    Assert.True(Memtable.isEmpty Memtable.Empty)
+    Assert.Equal(0, Memtable.approxBytes Memtable.Empty)
     Assert.Empty(Memtable.rangeScan (intKey 0) 0 Memtable.Empty)
     Assert.True((Memtable.getVisible (intKey 0) None Memtable.Empty).IsNone)
 
 [<Fact>]
-let ``Memtable: Count と ApproxBytes は挿入したエントリの合計になる`` () =
+let ``Memtable: 件数と ApproxBytes は挿入したエントリの合計になる`` () =
     let entries =
         [|
             Entry.put (intKey 1) 1UL [| SqlValue.Int 10L |]
@@ -35,11 +40,11 @@ let ``Memtable: Count と ApproxBytes は挿入したエントリの合計にな
         |]
 
     let mem = Memtable.apply entries Memtable.Empty
-    Assert.Equal(entries.Length, mem.Count)
-    Assert.Equal(entries |> Array.sumBy Entry.managedBytes, mem.ApproxBytes)
+    Assert.Equal(entries.Length, countOf mem)
+    Assert.Equal(entries |> Array.sumBy Entry.managedBytes, Memtable.approxBytes mem)
 
 [<Fact>]
-let ``Memtable: ランダム挿入でも Count と ApproxBytes は合計と一致する`` () =
+let ``Memtable: ランダム挿入でも件数と ApproxBytes は合計と一致する`` () =
     let random = System.Random 20261117
 
     // 重複キー・tombstone・BLOB・可変長 TEXT を混ぜて 400回挿入する。
@@ -63,13 +68,13 @@ let ``Memtable: ランダム挿入でも Count と ApproxBytes は合計と一�
 
     let mem = entries |> List.fold (fun m e -> Memtable.insert e m) Memtable.Empty
     // 重複キーでも版ごとに加算されるので件数は挿入回数に一致する。
-    Assert.Equal<int>(List.length entries, mem.Count)
-    Assert.Equal<int>(List.sumBy Entry.managedBytes entries, mem.ApproxBytes)
+    Assert.Equal<int>(List.length entries, countOf mem)
+    Assert.Equal<int>(List.sumBy Entry.managedBytes entries, Memtable.approxBytes mem)
 
     // 挿入順を変えても合計は変わらない（会計が順序に依存しないこと）。
     let reordered = List.rev entries
     let mem2 = reordered |> List.fold (fun m e -> Memtable.insert e m) Memtable.Empty
-    Assert.Equal<int>(mem.ApproxBytes, mem2.ApproxBytes)
+    Assert.Equal<int>(Memtable.approxBytes mem, Memtable.approxBytes mem2)
 
     // 挿入後に呼び出し側が配列を書き換えても、保持している値と会計は変わらない。
     let key = intKey 999
@@ -84,7 +89,7 @@ let ``Memtable: ランダム挿入でも Count と ApproxBytes は合計と一�
         | Some v ->
             Assert.Equal<int>(100, (asText v.[0]).Length)
             // 格納された内容と会計が一致したまま（複製されていないとここでずれる）。
-            Assert.Equal<int>(Entry.managedBytes stored, mem3.ApproxBytes)
+            Assert.Equal<int>(Entry.managedBytes stored, Memtable.approxBytes mem3)
         | None -> Assert.Fail "格納された行が tombstone になった"
     | None -> Assert.Fail "挿入したキーが引けない"
 
@@ -111,8 +116,8 @@ let ``Memtable: 挿入した行配列を後から書き換えても値は変わ�
 
     // 空への apply は何も変えない
     let same = Memtable.apply [] mem
-    Assert.Equal(mem.Count, same.Count)
-    Assert.Equal(mem.ApproxBytes, same.ApproxBytes)
+    Assert.Equal(countOf mem, countOf same)
+    Assert.Equal(Memtable.approxBytes mem, Memtable.approxBytes same)
 
 [<Fact>]
 let ``Memtable: apply したエントリを getVisible で引ける`` () =
@@ -125,7 +130,7 @@ let ``Memtable: apply したエントリを getVisible で引ける`` () =
             |]
             Memtable.Empty
 
-    Assert.Equal(3, mem.Count)
+    Assert.Equal(3, countOf mem)
     Assert.Equal<SqlValue array>([| SqlValue.Int 10L |], (entry (Memtable.getVisible (intKey 1) None mem)).Value.Value)
 
     Assert.Equal<SqlValue array>(
@@ -144,8 +149,9 @@ let ``Memtable: apply したエントリを getVisible で引ける`` () =
 let ``Memtable: apply しても元の memtable は変わらない`` () =
     let before = Memtable.apply [ Entry.put (intKey 1) 1UL (intRow 1) ] Memtable.Empty
     let after = Memtable.apply [ Entry.put (intKey 2) 2UL (intRow 2) ] before
-    Assert.Equal(1, before.Count)
-    Assert.Equal(2, after.Count)
+    Assert.False(Memtable.isEmpty before)
+    Assert.Equal(1, countOf before)
+    Assert.Equal(2, countOf after)
     // before から見ると追加したキーは見えない
     Assert.True((Memtable.getVisible (intKey 2) None before).IsNone)
     Assert.True((Memtable.getVisible (intKey 2) None after).IsSome)
@@ -189,7 +195,7 @@ let ``Memtable: 削除 tombstone が最新なら削除として返る`` () =
     Assert.True e.IsDelete
     Assert.Equal<uint64>(2UL, e.SeqNo)
     // tombstone も 1 版として残る（コンパクションまで消さない）
-    Assert.Equal(2, mem.Count)
+    Assert.Equal(2, countOf mem)
 
 [<Fact>]
 let ``Memtable: 全キーを個別に引ける（探索方向の誤りを検出する）`` () =
@@ -292,7 +298,7 @@ let ``Memtable: 乱数キーでも列挙順と可視性が参照実装と一致�
         |]
 
     let mem = Memtable.apply (entries |> Array.map snd) Memtable.Empty
-    Assert.Equal(n, mem.Count)
+    Assert.Equal(n, countOf mem)
 
     // 参照実装: キーごとの版を SeqNo 降順に並べたもの
     let expectedSeqNos (k: int) =

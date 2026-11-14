@@ -1,157 +1,126 @@
 namespace RykDb.Core
 
 module internal Scalar =
-    /// LIKE のパターン照合。`%` は任意の文字列、`_` は 1 文字。
-    /// 正規表現に落とさずに手で照合する（LIKE の方言差を吸収するため）。
-    /// バックトラックしない。
-    /// `%` で後戻りする実装は、進捗しないステップがあると無限ループしうる。
-    /// ここでは「区間と隙間を左から 1通りだけ試す」素直な走査にする。
-    /// 計算量は O(区間数 × テキスト長)。無限ループしないことが最優先。
-    let likeMatch (pattern: string) (text: string) =
-        let p = pattern.ToCharArray()
-        let t = text.ToCharArray()
-        let m = p.Length
-        let n = t.Length
-
-        if m = 0 then
-            n = 0
-        else
-            let segStarts = Array.zeroCreate<int> m
-            let segLengths = Array.zeroCreate<int> m
-
-            let rec collect (i: int) (count: int) (start: int) =
-                if i >= m then
-                    if start >= 0 then
-                        segStarts.[count] <- start
-                        segLengths.[count] <- i - start
-                        count + 1
-                    else
-                        count
-                elif p.[i] = '%' then
-                    if start >= 0 then
-                        segStarts.[count] <- start
-                        segLengths.[count] <- i - start
-                        collect (i + 1) (count + 1) -1
-                    else
-                        collect (i + 1) count -1
-                else
-                    collect (i + 1) count (if start >= 0 then start else i)
-
-            let matchSegment (start: int) (len: int) (ti: int) =
-                let rec loop (k: int) (pos: int) =
-                    if k >= len then
-                        pos
-                    elif pos >= n then
-                        -1
-                    elif p.[start + k] = '_' || p.[start + k] = t.[pos] then
-                        loop (k + 1) (pos + 1)
-                    else
-                        -1
-
-                loop 0 ti
-
-            let count = collect 0 0 -1
-            let anchoredEnd = p.[m - 1] <> '%'
-
-            let rec matchFrom (idx: int) (pos: int) =
-                if idx >= count then
-                    not anchoredEnd || pos = n
-                else
-                    let start = segStarts.[idx]
-                    let len = segLengths.[idx]
-                    let isLast = idx = count - 1
-                    let freeBefore = if idx = 0 then p.[0] = '%' else true
-
-                    if isLast && anchoredEnd && not freeBefore then
-                        matchSegment start len pos = n
-                    elif isLast && anchoredEnd then
-                        let rec scan (k: int) =
-                            if k + len > n then
-                                false
-                            else
-                                match matchSegment start len k with
-                                | -1 -> scan (k + 1)
-                                | r -> r = n
-
-                        scan pos
-                    elif freeBefore then
-                        let rec scan (k: int) =
-                            if k + len > n then
-                                -1
-                            else
-                                match matchSegment start len k with
-                                | -1 -> scan (k + 1)
-                                | r -> r
-
-                        match scan pos with
-                        | -1 -> false
-                        | next -> matchFrom (idx + 1) next
-                    else
-                        match matchSegment start len pos with
-                        | -1 -> false
-                        | r -> matchFrom (idx + 1) r
-
-            matchFrom 0 0
-
-    /// ESCAPE 付き LIKE のトークン。
+    /// LIKE のトークン。
     type private LikeToken =
         | LiteralChar of char
         | AnyOne
         | AnyMany
 
+    /// コンパイル済みの LIKE パターン。
+    /// パターンは行ごとに変わらないので、1回だけトークン列にして再利用する。
+    type private LikePattern = { Tokens: LikeToken array }
+
     /// ESCAPE を解釈してパターンをトークン列にする。
-    let private likeTokens (escape: char) (pattern: string) =
+    /// ESCAPE の後に文字が無ければ TypeError。
+    let private compileTokens (escape: char option) (pattern: string) =
         let rec loop i acc =
             if i >= pattern.Length then
-                ret (List.rev acc)
+                ret
+                    {
+                        Tokens = List.rev acc |> List.toArray
+                    }
             else
-                let c = pattern.[i]
-
-                if c = escape then
+                match escape with
+                | Some e when pattern.[i] = e ->
                     if i + 1 >= pattern.Length then
                         err (DbError.typeError "LIKE の ESCAPE の後に文字がありません")
                     else
                         loop (i + 2) (LiteralChar pattern.[i + 1] :: acc)
-                elif c = '%' then
-                    loop (i + 1) (AnyMany :: acc)
-                elif c = '_' then
-                    loop (i + 1) (AnyOne :: acc)
-                else
-                    loop (i + 1) (LiteralChar c :: acc)
+                | _ ->
+                    match pattern.[i] with
+                    | '%' -> loop (i + 1) (AnyMany :: acc)
+                    | '_' -> loop (i + 1) (AnyOne :: acc)
+                    | c -> loop (i + 1) (LiteralChar c :: acc)
 
         loop 0 []
 
+    /// ESCAPE なしを表すキャッシュキー。
+    [<Literal>]
+    let private NoEscape = -1
+
+    /// キャッシュするパターン数の上限。
+    /// 列パターン（行ごとに違う文字列）で辞書が単調に増えないようにする。
+    [<Literal>]
+    let private MaxCachedLikePatterns = 1024
+
+    /// コンパイル済みパターンのキャッシュ。
+    /// キーは struct なので、ヒット時に行ごとの割当は発生しない。
+    let private likeCache =
+        System.Collections.Concurrent.ConcurrentDictionary<struct (int * string), Result<LikePattern, DbError>>()
+
+    /// キャッシュミス時のコンパイル。
+    /// 呼び出しごとにデリゲートを作らないよう、モジュールスコープに 1個だけ置く。
+    let private compileEntry =
+        System.Func<struct (int * string), Result<LikePattern, DbError>>(fun (struct (code, p)) ->
+            let escape = if code < 0 then None else Some(char code)
+            compileTokens escape p)
+
+    /// パターンをコンパイルする（キャッシュ経由）。
+    let private compileLike (escapeCode: int) (pattern: string) =
+        if likeCache.Count >= MaxCachedLikePatterns then
+            likeCache.Clear()
+
+        likeCache.GetOrAdd(struct (escapeCode, pattern), compileEntry)
+
+    /// 末尾の連続する `%` を読み飛ばす。
+    [<TailCall>]
+    let rec private skipTrailingStars (tokens: LikeToken array) (i: int) =
+        if i < tokens.Length && tokens.[i] = AnyMany then
+            skipTrailingStars tokens (i + 1)
+        else
+            i
+
     /// トークン列によるワイルドカード照合。
     /// 最後の `%` だけを覚えて戻る貪欲法（指数的なバックトラックをしない）。
-    let private matchLikeTokens (tokens: LikeToken array) (text: string) =
+    /// `%` の位置は int（-1 = なし）で持つ。option は行ごとに割り当てるため使わない。
+    /// span はローカル関数に捕捉できないため、ループはモジュールスコープに置く。
+    [<TailCall>]
+    let rec private goLike
+        (tokens: LikeToken array)
+        (text: System.ReadOnlySpan<char>)
+        (ti: int)
+        (pi: int)
+        (star: int)
+        (starTi: int)
+        =
         let n = text.Length
         let m = tokens.Length
 
-        let rec skipTrailingStars i =
-            if i < m && tokens.[i] = AnyMany then
-                skipTrailingStars (i + 1)
+        if ti >= n then
+            skipTrailingStars tokens pi >= m
+        elif pi >= m then
+            if star >= 0 && starTi < n then
+                goLike tokens text (starTi + 1) (star + 1) star (starTi + 1)
             else
-                i
+                false
+        else
+            match tokens.[pi] with
+            | AnyMany -> goLike tokens text ti (pi + 1) pi ti
+            | AnyOne -> goLike tokens text (ti + 1) (pi + 1) star starTi
+            | LiteralChar c when text.[ti] = c -> goLike tokens text (ti + 1) (pi + 1) star starTi
+            | _ ->
+                if star >= 0 && starTi < n then
+                    goLike tokens text (starTi + 1) (star + 1) star (starTi + 1)
+                else
+                    false
 
-        let rec go ti pi star starTi =
-            if ti >= n then
-                skipTrailingStars pi >= m
-            else
-                match (if pi < m then Some tokens.[pi] else None) with
-                | Some AnyMany -> go ti (pi + 1) (Some pi) ti
-                | Some AnyOne -> go (ti + 1) (pi + 1) star starTi
-                | Some(LiteralChar c) when text.[ti] = c -> go (ti + 1) (pi + 1) star starTi
-                | _ ->
-                    match star with
-                    | Some sp when starTi < n -> go (starTi + 1) (sp + 1) star (starTi + 1)
-                    | _ -> false
+    let private matchLikeTokens (tokens: LikeToken array) (text: System.ReadOnlySpan<char>) =
+        goLike tokens text 0 0 -1 0
 
-        go 0 0 None 0
+    /// LIKE のパターン照合。`%` は任意の文字列、`_` は 1文字。
+    /// 正規表現に落とさずに手で照合する（LIKE の方言差を吸収するため）。
+    /// パターンはキャッシュしたトークン列を使う（行ごとに解析しない）。
+    /// バックトラックは 1 段だけ（無限ループしないことが最優先）。
+    let likeMatch (pattern: string) (text: string) =
+        match compileLike NoEscape pattern with
+        | Ok compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text)
+        | Error _ -> false
 
     /// ESCAPE 付き LIKE。
     let likeMatchWithEscape (escape: char) (pattern: string) (text: string) =
-        likeTokens escape pattern
-        |> Result.map (fun tokens -> matchLikeTokens (List.toArray tokens) text)
+        compileLike (int escape) pattern
+        |> Result.map (fun compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
 
     /// Unicode のコードポイント数を数える。
     /// `string.Length` は UTF-16 の code unit 数なので、

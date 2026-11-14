@@ -377,7 +377,7 @@ let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engin
 
             let after = ok (StorageEngine.maybeFlush engine)
             // flush は成功している（memtable は空、L0 に 4 本）
-            Assert.Equal(0, after.Mem.Count)
+            Assert.True(Memtable.isEmpty after.Mem)
             Assert.Equal(4, (Version.filesAt 0 after.Version).Length)
             // compaction の失敗は診断として残る
             Assert.True after.LastCompactionError.IsSome

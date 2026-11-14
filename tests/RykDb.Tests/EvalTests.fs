@@ -54,6 +54,88 @@ let ``Scalar.likeMatchWithEscape: エスケープした % _ ! をリテラルに
     Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!!b" "ab"))
     expectErrorKind ErrorKind.TypeError "末尾 ESCAPE" (Scalar.likeMatchWithEscape '!' "a!" "a")
 
+/// テスト用の独立オラクル: LIKE パターンを正規表現へ変換する。
+/// 本体は正規表現を使わない（方言差を吸収するため）ので、テスト側だけで照合する。
+let private likeToRegex (escape: char option) (pattern: string) =
+    let rec loop i acc =
+        if i >= pattern.Length then
+            List.rev acc
+        else
+            match escape with
+            | Some e when pattern.[i] = e && i + 1 < pattern.Length ->
+                loop (i + 2) (System.Text.RegularExpressions.Regex.Escape(string pattern.[i + 1]) :: acc)
+            | _ ->
+                match pattern.[i] with
+                | '%' -> loop (i + 1) (".*" :: acc)
+                | '_' -> loop (i + 1) ("." :: acc)
+                | c -> loop (i + 1) (System.Text.RegularExpressions.Regex.Escape(string c) :: acc)
+
+    let body = loop 0 [] |> String.concat ""
+    System.Text.RegularExpressions.Regex("\\A" + body + "\\z", System.Text.RegularExpressions.RegexOptions.Singleline)
+
+[<Fact>]
+let ``Scalar.likeMatch: 正規表現オラクルと一致する（ランダム）`` () =
+    let rng = System.Random 20261118
+
+    let randomFrom (alphabet: char array) (maxLen: int) =
+        let len = rng.Next(maxLen + 1)
+        System.String(Array.init len (fun _ -> alphabet.[rng.Next alphabet.Length]))
+
+    let patternAlphabet = [| 'a'; 'b'; '%'; '_' |]
+    let textAlphabet = [| 'a'; 'b'; 'c' |]
+
+    for _ in 1..2000 do
+        let pattern = randomFrom patternAlphabet 6
+        let text = randomFrom textAlphabet 8
+        let expected = (likeToRegex None pattern).IsMatch text
+        Assert.Equal(expected, Scalar.likeMatch pattern text)
+
+    // ESCAPE 付き。末尾が ESCAPE のパターンは TypeError なので生成対象から外す。
+    let escAlphabet = [| 'a'; 'b'; '%'; '_'; '!' |]
+    let escTextAlphabet = [| 'a'; 'b'; 'c'; '!'; '%'; '_' |]
+
+    let trailingEscapes (pattern: string) =
+        let rec count i n =
+            if i >= 0 && pattern.[i] = '!' then
+                count (i - 1) (n + 1)
+            else
+                n
+
+        count (pattern.Length - 1) 0
+
+    for _ in 1..2000 do
+        let pattern = randomFrom escAlphabet 6
+        let text = randomFrom escTextAlphabet 8
+
+        if trailingEscapes pattern % 2 = 0 then
+            let expected = (likeToRegex (Some '!') pattern).IsMatch text
+            Assert.Equal(expected, ok (Scalar.likeMatchWithEscape '!' pattern text))
+
+[<Fact>]
+let ``Scalar.likeMatch: 同じパターンは行ごとに配列を確保しない`` () =
+    // 初回だけコンパイルし、以降はキャッシュしたトークン列で照合する。
+    let pattern = "a%b%c"
+    let text = "aXXbYYc"
+    Assert.True(Scalar.likeMatch pattern text)
+
+    let before = System.GC.GetAllocatedBytesForCurrentThread()
+
+    let rec loop i matched =
+        if i >= 1000 then
+            matched
+        else
+            loop
+                (i + 1)
+                (if Scalar.likeMatch pattern text then
+                     matched + 1
+                 else
+                     matched)
+
+    let matched = loop 0 0
+    let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(1000, matched)
+    Assert.True(allocated < 10_000L, sprintf "1000 回で %d バイト確保しました" allocated)
+
 [<Fact>]
 let ``Eval.eval: LIKE の % と _`` () =
     let schema = outSchema [ outCol "s" None (Some DataType.Text) ]

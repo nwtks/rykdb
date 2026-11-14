@@ -12,10 +12,13 @@
     <Compile Include="TestHelpers.fs" />
     <Compile Include="ErrorsTests.fs" />
     <Compile Include="TypesTests.fs" />
+    <Compile Include="WriterTests.fs" />
+    <Compile Include="CursorTests.fs" />
     <Compile Include="SerializationTests.fs" />
     <Compile Include="MemtableTests.fs" />
     <Compile Include="WalTests.fs" />
     <Compile Include="BloomFilterTests.fs" />
+    <Compile Include="SstScanTests.fs" />
     <Compile Include="SstableTests.fs" />
     <Compile Include="VersionSetTests.fs" />
     <Compile Include="ManifestTests.fs" />
@@ -49,10 +52,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.*" />
-    <PackageReference Include="xunit.v3" Version="3.*" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="3.*" />
-    <PackageReference Include="coverlet.msbuild" Version="10.*" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageReference Include="coverlet.msbuild" Version="10.1.0" />
   </ItemGroup>
 
   <ItemGroup>

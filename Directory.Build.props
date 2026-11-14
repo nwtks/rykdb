@@ -7,5 +7,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <WarningLevel>3</WarningLevel>
     <Tailcalls>true</Tailcalls>
+    <OtherFlags>--warnon:1182</OtherFlags>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 </Project>

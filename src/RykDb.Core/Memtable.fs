@@ -11,7 +11,7 @@ type internal Entry =
         Value: SqlValue array option
     }
 
-    member x.IsDelete = x.Value.IsNone
+    member this.IsDelete = this.Value.IsNone
 
 module internal Entry =
     let put (key: byte array) (seqNo: uint64) (value: SqlValue array) =
@@ -303,3 +303,9 @@ module internal Memtable =
                     step struct (Visit r.Left :: Emit r.Entry :: Visit r.Right :: rest, count)
 
         Seq.unfold step struct ([ Visit mem.Root ], 0)
+
+    /// エントリを 1つも持たないか。
+    let isEmpty (mem: Memtable) = mem.Count = 0
+
+    /// 保持しているエントリの管理メモリ概算。
+    let approxBytes (mem: Memtable) = mem.ApproxBytes

@@ -24,6 +24,15 @@ let ``Lexer: 位置情報が付く`` () =
     Assert.Equal(2, ts.[1].Pos.Line)
 
 [<Fact>]
+let ``Lexer: 位置情報は行と列を持つ`` () =
+    let ts = tokens "ab cd\nef"
+    // 1行目: "ab" は 1列目、"cd" は 4列目
+    Assert.Equal((1, 1), (ts.[0].Pos.Line, ts.[0].Pos.Column))
+    Assert.Equal((1, 4), (ts.[1].Pos.Line, ts.[1].Pos.Column))
+    // 2行目は 1列目から
+    Assert.Equal((2, 1), (ts.[2].Pos.Line, ts.[2].Pos.Column))
+
+[<Fact>]
 let ``Lexer: 行コメントとブロックコメントを読み飛ばす`` () =
     let ks = kinds "1 -- comment\n + /* block */ 2"
     Assert.Equal<Token list>([ Token.IntLit 1L; Token.Symbol "+"; Token.IntLit 2L; Token.Eos ], ks)

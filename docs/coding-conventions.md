@@ -93,6 +93,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `EngineHost` の host state / ファイル refcount / 採番（`ConcurrentDictionary`）
 - `Compaction` の作業ディレクトリ別カウンタ（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
+- `Eval` の LIKE パターンキャッシュ（コンパイル済みトークン列を `(escape, pattern)` ごとに再利用）
 
 | やりたいこと   | 命令形の代わりに使うもの                                                       |
 | -------------- | ------------------------------------------------------------------------------ |
@@ -144,7 +145,7 @@ JIT は `tail.` を尊重する。
   右スパインを `picked` リストへ積み、`List.fold` で組み直せば自己再帰が消える
   （左偏性により右スパインは log オーダーだが、深度保証に頼らず監査を通す）。
   ヒープは `SstMerge` に集約し、`StorageEngine.scanAt` と `Compaction` のストリーミング merge が共有する。
-  回帰テストは `SstableTests` の `SstMerge: 多数のソースをまとめてマージできる`、
+  回帰テストは `SstScanTests` の `SstMerge: 多数のソースをまとめてマージできる`、
   `StorageEngineTests` の `StorageEngine.scanAt: 多数のファイルをキー昇順にマージする`、
   `CompactionTests` の `Compaction: 多数の入力ファイルをストリーミングでマージする`。
 - **`[<TailCall>]` は「その関数本体の自己再帰が全部末尾位置」のときだけ付ける**。

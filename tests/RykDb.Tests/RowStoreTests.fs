@@ -410,7 +410,6 @@ let ``RowStore.scanAtRaw: scope 指定時はラッパー越しでも走査を台
             [| for i in 0..2 -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i) |]
 
         let store = ok (RowStore.writeBatches [ (space, entries) ] store)
-
         let scope = ScanScope()
         // scanWithinPrefix は SstScan(fun ...) で包むため Dispose を伝播しない。
         // 登録が発生源（scanAtRaw）で行われていることを ActiveCount で確認する。

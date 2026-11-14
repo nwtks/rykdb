@@ -2,6 +2,7 @@ namespace RykDb.Core
 
 /// SQL テキスト中の位置。
 /// エラー報告に使う。
+[<Struct>]
 type internal Position = { Offset: int; Line: int; Column: int }
 
 /// リテラル。
@@ -33,10 +34,10 @@ type internal ColumnRef =
         Name: string
     }
 
-    member x.Display =
-        match x.Qualifier with
-        | Some q -> sprintf "%s.%s" q x.Name
-        | None -> x.Name
+    member this.Display =
+        match this.Qualifier with
+        | Some q -> sprintf "%s.%s" q this.Name
+        | None -> this.Name
 
 /// 集計関数。
 [<RequireQualifiedAccess>]
@@ -47,8 +48,8 @@ type internal AggFunc =
     | Min
     | Max
 
-    member x.Name =
-        match x with
+    member this.Name =
+        match this with
         | Count -> "COUNT"
         | Sum -> "SUM"
         | Avg -> "AVG"
@@ -74,8 +75,8 @@ type internal UnaryOp =
     /// 論理否定
     | Not
 
-    member x.Display =
-        match x with
+    member this.Display =
+        match this with
         | Neg -> "-"
         | Pos -> "+"
         | Not -> "NOT"
@@ -98,8 +99,8 @@ type internal BinaryOp =
     | Or
     | Like
 
-    member x.Display =
-        match x with
+    member this.Display =
+        match this with
         | Add -> "+"
         | Sub -> "-"
         | Mul -> "*"

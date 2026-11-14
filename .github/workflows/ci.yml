@@ -8,7 +8,11 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
@@ -16,18 +20,41 @@ jobs:
         uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "10.0.x"
+          cache: true
 
       - name: Restore tools
         run: dotnet tool restore
 
-      - name: Build
-        run: dotnet build -t:Rebuild
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
 
-      - name: Test
-        run: dotnet test --no-build
+      - name: Build
+        run: dotnet build -t:Rebuild --no-restore
+
+      - name: Test (Linux, coverage threshold)
+        if: runner.os == 'Linux'
+        run: >
+          dotnet test --no-build
+          --blame-hang --blame-hang-timeout 120s
+          -p:CollectCoverage=true
+          -p:Threshold=90
+          -p:ThresholdType=line
+          -p:ThresholdStat=total
+
+      - name: Test (Windows / macOS)
+        if: runner.os != 'Linux'
+        continue-on-error: true
+        run: dotnet test --no-build --blame-hang --blame-hang-timeout 120s
+
+      - name: Upload coverage
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: tests/**/coverage.cobertura.xml
 
       - name: Fantomas check
-        run: dotnet fantomas --check src/ tests/
+        run: dotnet fantomas --check src/ tests/ tools/
 
       - name: TailAudit
         run: dotnet run --project tools/TailAudit

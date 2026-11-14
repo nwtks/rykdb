@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "FSharp.Core": {
+        "type": "Direct",
+        "requested": "[10.1.404, )",
+        "resolved": "10.1.404",
+        "contentHash": "51Fz4i5uPGlR3GrtH30sQOYXfcn743BFEPwUd/Qyds0Z9ikxWFxm4eAORatio3aB/BMPzJUxPyHF0ZvKhyHZwQ=="
+      },
+      "rykdb.core": {
+        "type": "Project",
+        "dependencies": {
+          "FSharp.Core": "[10.1.404, )"
+        }
+      }
+    }
+  }
+}

@@ -9,10 +9,17 @@
   <ItemGroup>
     <Compile Include="Errors.fs" />
     <Compile Include="Types.fs" />
+    <Compile Include="Writer.fsi" />
+    <Compile Include="Writer.fs" />
+    <Compile Include="Cursor.fsi" />
+    <Compile Include="Cursor.fs" />
     <Compile Include="Serialization.fs" />
+    <Compile Include="Memtable.fsi" />
     <Compile Include="Memtable.fs" />
     <Compile Include="Wal.fs" />
     <Compile Include="BloomFilter.fs" />
+    <Compile Include="SstScan.fsi" />
+    <Compile Include="SstScan.fs" />
     <Compile Include="Sstable.fs" />
     <Compile Include="VersionSet.fs" />
     <Compile Include="Manifest.fs" />
@@ -27,6 +34,7 @@
     <Compile Include="RowStore.fs" />
     <Compile Include="Catalog.fs" />
     <Compile Include="Eval.fs" />
+    <Compile Include="Op.fsi" />
     <Compile Include="Op.fs" />
     <Compile Include="ExtSort.fs" />
     <Compile Include="Ops.fs" />
@@ -37,6 +45,7 @@
     <Compile Include="DropCleanup.fs" />
     <Compile Include="Engine.fs" />
     <Compile Include="Database.fs" />
+    <Compile Include="Session.fsi" />
     <Compile Include="Session.fs" />
   </ItemGroup>
 

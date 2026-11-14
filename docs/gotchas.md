@@ -1001,6 +1001,51 @@ Assert.True(
 `f(a = b)` の形は F# の名前付き引数構文になる。
 比較代入の `=` だけが該当し、`>=` / `<=` / `<>` は対象外。
 
+### 8.21 `private` はアセンブリ内の他ファイルには効かない（`.fsi` で隠す）
+
+行レベルの `private` で DU のケースを隠したつもりでも、同じアセンブリの他ファイルからは見える。
+
+```fsharp
+// Op.fs
+[<RequireQualifiedAccess>]
+type internal Op =
+    | Done
+    | Step of SqlValue array * Op
+    | Compute of (unit -> Result<(SqlValue array * Op) option, DbError>)
+// ❌ どちらのファイルからも Op.Done / Op.Step が書けてしまう
+```
+
+✅ **シグネチャファイル（`.fsi`）でケースを書かなければ、実装ファイル以外から構築・パターンマッチできない**。
+
+```fsharp
+// Op.fsi（Op.fs の直前に .fsproj へ並べる）
+type internal Op
+
+module internal Op =
+    val Empty: Op
+    val next: Op -> Result<(SqlValue array * Op) option, DbError>
+```
+
+- 効く範囲は `src` の他ファイルだけでなく、`InternalsVisibleTo` 先のテストにも及ぶ。
+- ⚠️ 実装が**計算済みの関数値**（部分適用）のときは戻り値を括弧で囲む。
+  囲まないと FS0034「arities in the signature and implementation differ」になる。
+
+```fsharp
+val skip: (int -> Op -> Op)          // ✅ 実装が let skip = ... の関数値
+val toArray: Op -> Result<...>      // ✅ 実装が関数定義
+```
+
+- `type X = private { ... }` を `.fsi` に書くと、
+  **別アセンブリからは構築できないが、同一アセンブリの他ファイルからは構築できる**。
+  src 内の不変条件には不十分で、表現を完全に隠す `type X` が必要。
+- 不透明化した record のフィールドは `member` で公開できない（FS0193 / FS0938）。
+  読み取りは **関数**（`val approxBytes: X -> int` など）で公開する（例: `Memtable.fsi`）。
+- ⚠️ `[<Struct>]` レコードは表現を隠せない（FS0927「kind ... does not match」/ FS0300）。
+  struct 型は `.fsi` の適用対象から外す（`BloomFilter` が該当）。
+- `IDisposable` を実装する型を不透明にするときは、シグネチャに
+  `interface System.IDisposable` を書き、型の種別を `[<Sealed>]`（DU） / `[<Class>]`（通常クラス）で示す
+  （FS0050 / FS0938 / FS0297）。
+
 ---
 
 ## 9. テスト・ビルドの罠
@@ -1074,18 +1119,20 @@ SDK を上げたら `dotnet build tools/TailAudit/TailAudit.fsproj -t:Rebuild` �
 （TailAudit は `RykDb.slnx` に含まれないので、`dotnet build -t:Rebuild` では検出できない）。
 CI の失敗が `tools/TailAudit/Program.fs` の FCS 型エラーなら、まずログの `dotnet --version` を見る。
 
-### 9.8 ソース検査テストは「一度は落ちること」を確かめる
+### 9.8 禁止を検査するガードは「一度は落ちること」を確かめる
 
-禁止を検査するテストは、違反が 0件だと**常に緑**になる。
+禁止を検査するテストやシグネチャは、違反が 0件だと**常に緑**になる。
 正しく動いていない（条件が噛み合っていない）ことも分からない、**空振りのガード**である。
 
-- ✅ 設計時に一度、禁止に該当するコードを紛れ込ませて**必ず落ちる**ことを確認する
-  （INV-12 の `Cursor: レコード更新は Serialization.fs の中だけ` は、
-  `Sstable.fs` を一時的に `{ c with Pos = ... }` へ戻して失敗を確認してから校正した）。
-- ✅ 許可リストには**理由**をコメントに残す
-  （例: `Serialization.fs` は Cursor の所有者、`Parser.fs` の `{ st with Pos` は `PState` という別レコード）。
-- ✅ 検査対象は `src/` のみにする。
-  テストは防衛チェック用に不正値を直接作ることがある。
+- ✅ 設計時に一度、禁止に該当するコードを紛れ込ませて**必ず落ちる**ことを確認する。
+  `.fsi` を追加したときは、外から生ケース・レコードを書いて **FS0039** になることを実測する
+  （`Op.fsi` / `Writer.fsi` / `SstScan.fsi` / `Cursor.fsi` / `Memtable.fsi` で実施）。
+- ✅ 旧 INV-12 のソース検査（`Cursor: レコード更新は Serialization.fs の中だけ`）は、
+  `Sstable.fs` を一時的に `{ c with Pos = ... }` へ戻して失敗を確認してから校正した。
+  現在は `Cursor.fsi` のコンパイル時検査に置き換えて削除済み。
+- ✅ ソース検査を残す場合は、許可リストの**理由**をコメントに残し、検査対象を `src/` のみにする。
+- ✅ `.fsi` 化で「不正な値を作って試すテスト」が書けなくなったら、そのテストは削除してよい
+  （不変条件が構築時に保証されるため。例: `Reader` の範囲外 Cursor テスト）。
 
 ---
 
@@ -1697,7 +1744,7 @@ active な transaction が無ければ境界は `commitSeq + 1` になり、comm
   `SstEntry.approximateBytes` のまま変えない。
 - 実測（2列・TEXT 48文字）: 20,000行で実測 7.8MiB / 見積り 6.7MiB（約 1.2倍）。
   200,000行では 64MiB を超えて commit 中に flush され、memtable の保持はほぼ 0 になった。
-- 回帰テスト: `Memtable: Count と ApproxBytes は挿入したエントリの合計になる` /
+- 回帰テスト: `Memtable: 件数と ApproxBytes は挿入したエントリの合計になる` /
   `ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの概算`。
 
 ### 11.43 `Wal.append` はフレーム単位で書き出す（全フレームを連結しない）
@@ -2121,8 +2168,8 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 
 - continuation の差し替え時に古い登録を Dispose しない。
   同じファイルハンドルを共有しており、最新の continuation を閉じれば足りる。
-- 回帰テスト: `SstableTests: ScanScope: 早期終了しても登録した走査を閉じられる` /
-  `SstableTests: ScanScope: 最後まで読むと登録が外れる` /
+- 回帰テスト: `SstScanTests: ScanScope: 早期終了しても登録した走査を閉じられる` /
+  `SstScanTests: ScanScope: 最後まで読むと登録が外れる` /
   `RowStoreTests: RowStore.scanAtRaw: scope 指定時はラッパー越しでも走査を台帳に登録する`。
 
 ### 11.62 RowReader は終端・Dispose で snapshot と走査を解放する

@@ -78,32 +78,6 @@ let ``Op: one-shot ガードは同じ値の 2 回目の next を検出する`` (
     Assert.True detected
 
 [<Fact>]
-let ``Op: 構築はスマートコンストラクタに限る（直接ケースを使わない）`` () =
-    // F# の private は名前空間レベルではアセンブリ内にしか効かないため、
-    // 「Op.fs 以外で Op.Done / Op.Step / Op.Compute を書かない」ことをソースで検査する。
-    let sourceDir =
-        System.IO.Path.GetFullPath(System.IO.Path.Combine(__SOURCE_DIRECTORY__, "..", "..", "src", "RykDb.Core"))
-
-    let offenders =
-        System.IO.Directory.GetFiles(sourceDir, "*.fs")
-        |> Array.filter (fun path -> System.IO.Path.GetFileName path <> "Op.fs")
-        |> Array.collect (fun path ->
-            System.IO.File.ReadAllLines path
-            |> Array.indexed
-            |> Array.choose (fun (i, line) ->
-                let code =
-                    match line.IndexOf "//" with
-                    | -1 -> line
-                    | c -> line.Substring(0, c)
-
-                if [ "Op.Done"; "Op.Step"; "Op.Compute" ] |> List.exists code.Contains then
-                    Some(sprintf "%s:%d: %s" (System.IO.Path.GetFileName path) (i + 1) (line.Trim()))
-                else
-                    None))
-
-    Assert.True(Array.isEmpty offenders, "Op の生ケースが残っています:\n" + String.concat "\n" offenders)
-
-[<Fact>]
 let ``末尾再帰: Op.ofArray を 200000行組み立ててもスタックを食わない`` () =
     // 「let rest = rowsFrom (i + 1) を先に評価する」実装だとコンストラクト時に
     // 行数ぶんのスタックを積み、実測 約 130000段（Debug）で Stack overflow になる。

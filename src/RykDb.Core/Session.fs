@@ -151,6 +151,45 @@ type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
         else
             b
 
+    let rec awaitLoop (pos: WalState) =
+        let step =
+            lock gate (fun () ->
+                match failure with
+                | Some e -> SyncStep.SyncFail e
+                | None when covers pos -> SyncStep.SyncDone
+                | None when not syncing ->
+                    syncing <- true
+
+                    let target =
+                        match pending with
+                        | Some current -> later current pos
+                        | None -> pos
+
+                    SyncStep.SyncLead target
+                | None ->
+                    System.Threading.Monitor.Wait gate |> ignore
+                    SyncStep.SyncWait)
+
+        match step with
+        | SyncStep.SyncDone -> ret ()
+        | SyncStep.SyncFail e -> err e
+        | SyncStep.SyncWait -> awaitLoop pos
+        | SyncStep.SyncLead target ->
+            let result = sync target
+
+            lock gate (fun () ->
+                match result with
+                | Ok() ->
+                    if (target.FileNumber, target.Size) > (syncedFile, syncedSize) then
+                        syncedFile <- target.FileNumber
+                        syncedSize <- target.Size
+                | Error e -> failure <- Some e
+
+                syncing <- false
+                System.Threading.Monitor.PulseAll gate)
+
+            result
+
     /// 失敗していればそのエラーを返す。
     member _.Failure = lock gate (fun () -> failure)
 
@@ -164,47 +203,7 @@ type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
 
     /// 指定位置まで同期済みになるまで待つ。
     /// 最初の待機者がリーダーとなり、登録済みの最大位置まで同期する。
-    member _.Await(pos: WalState) =
-        let rec loop () =
-            let step =
-                lock gate (fun () ->
-                    match failure with
-                    | Some e -> SyncStep.SyncFail e
-                    | None when covers pos -> SyncStep.SyncDone
-                    | None when not syncing ->
-                        syncing <- true
-
-                        let target =
-                            match pending with
-                            | Some current -> later current pos
-                            | None -> pos
-
-                        SyncStep.SyncLead target
-                    | None ->
-                        System.Threading.Monitor.Wait gate |> ignore
-                        SyncStep.SyncWait)
-
-            match step with
-            | SyncStep.SyncDone -> ret ()
-            | SyncStep.SyncFail e -> err e
-            | SyncStep.SyncWait -> loop ()
-            | SyncStep.SyncLead target ->
-                let result = sync target
-
-                lock gate (fun () ->
-                    match result with
-                    | Ok() ->
-                        if (target.FileNumber, target.Size) > (syncedFile, syncedSize) then
-                            syncedFile <- target.FileNumber
-                            syncedSize <- target.Size
-                    | Error e -> failure <- Some e
-
-                    syncing <- false
-                    System.Threading.Monitor.PulseAll gate)
-
-                result
-
-        loop ()
+    member _.Await(pos: WalState) = awaitLoop pos
 
 /// 接続ローカルの transaction 状態。
 /// <remarks>
@@ -288,7 +287,7 @@ type internal DatabaseHost(root: string, owner: Database) =
 
     /// writeGate の内側で実行し、WAL の fsync を gate の外で待つ。
     /// `run` は「実行後の共有状態」と値も返す（読み取りだけなら入力をそのまま返す）。
-    member private this.Serialized(run: DbState -> Result<DbState * 'a, DbError>) =
+    let serialized (run: DbState -> Result<DbState * 'a, DbError>) =
         let outcome, position =
             lock writeGate (fun () ->
                 let current, wasClosed = snapshot ()
@@ -331,7 +330,7 @@ type internal DatabaseHost(root: string, owner: Database) =
             ret (readState, lease)
 
     /// 明示 transaction を始める（接続ローカルの状態を返す）。
-    member this.Begin(local: SessionState) =
+    member _.Begin(local: SessionState) =
         if SessionState.inTransaction local then
             ret local
         else
@@ -358,14 +357,14 @@ type internal DatabaseHost(root: string, owner: Database) =
 
                         ret (next, (nextLocal, StatementResult.Empty)))
 
-            this.Serialized run |> Result.map fst
+            serialized run |> Result.map fst
 
     /// COMMIT。接続の transaction を共有の Manager で確定する。
-    member this.Commit(local: SessionState) =
+    member _.Commit(local: SessionState) =
         match local.Active with
         | None -> err (DbError.internalError "コミットする transaction がありません")
         | Some _ ->
-            this.Serialized(fun current ->
+            serialized (fun current ->
                 let state = SessionState.apply local current
 
                 match Engine.executeCommit state with
@@ -382,11 +381,11 @@ type internal DatabaseHost(root: string, owner: Database) =
                     ret (committed, (SessionState.ofState committed, StatementResult.Empty)))
 
     /// ROLLBACK。接続の transaction を捨てる。
-    member this.Rollback(local: SessionState) =
+    member _.Rollback(local: SessionState) =
         match local.Active with
         | None -> err (DbError.internalError "ロールバックする transaction がありません")
         | Some _ ->
-            this.Serialized(fun current ->
+            serialized (fun current ->
                 let state = SessionState.apply local current
                 let next = Engine.executeRollback state
 
@@ -401,8 +400,8 @@ type internal DatabaseHost(root: string, owner: Database) =
                 ret (committed, (SessionState.ofState committed, StatementResult.Empty)))
 
     /// transaction 以外の文（SELECT / DML / DDL）を実行する。
-    member this.ExecuteNonTransaction (local: SessionState) (limits: ResultLimits) (stmt: Statement) =
-        this.Serialized(fun current ->
+    member _.ExecuteNonTransaction (local: SessionState) (limits: ResultLimits) (stmt: Statement) =
+        serialized (fun current ->
             let state = SessionState.apply local current
 
             match Engine.executeStatementWithLimits limits state stmt with

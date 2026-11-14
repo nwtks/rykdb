@@ -228,12 +228,9 @@ module internal StorageEngine =
             | Some s -> e.SeqNo <= s
             | None -> true
 
-        let closeState (stateObj: obj) =
-            SstMerge.dispose (stateObj :?> ScanState).Merge
+        let closeState state = SstMerge.dispose state.Merge
 
-        let rec stepObj (stateObj: obj) =
-            let state = stateObj :?> ScanState
-
+        let rec stepObj state =
             if limit > 0 && state.Count >= limit then
                 ret None
             else
@@ -250,13 +247,11 @@ module internal StorageEngine =
                             | None -> false
 
                         if sameKey || not (isVisible e) then
-                            let nextState =
-                                { state with
-                                    Pending = remaining
-                                    Merge = merge'
-                                }
-
-                            stepObj (box nextState)
+                            { state with
+                                Pending = remaining
+                                Merge = merge'
+                            }
+                            |> stepObj
                         else
                             let appended = e.Value.IsSome
 
@@ -269,9 +264,9 @@ module internal StorageEngine =
                                 }
 
                             if appended then
-                                Some(e, SstScan.ofState (box advanced) stepObj closeState) |> ret
+                                Some(e, SstScan.ofState advanced stepObj closeState) |> ret
                             else
-                                stepObj (box advanced)
+                                stepObj advanced
 
         let pendingFiles =
             Version.allFiles engine.Version
@@ -288,25 +283,23 @@ module internal StorageEngine =
         | Error e -> err e
         | Ok None ->
             SstScan.ofState
-                (box
-                    {
-                        Pending = pendingFiles
-                        Merge = SstMerge.Empty
-                        EmittedKey = None
-                        Count = 0
-                    })
+                {
+                    Pending = pendingFiles
+                    Merge = SstMerge.Empty
+                    EmittedKey = None
+                    Count = 0
+                }
                 stepObj
                 closeState
             |> ret
         | Ok(Some(e, nxt)) ->
             SstScan.ofState
-                (box
-                    {
-                        Pending = pendingFiles
-                        Merge = SstMerge.insert 0 e nxt SstMerge.Empty
-                        EmittedKey = None
-                        Count = 0
-                    })
+                {
+                    Pending = pendingFiles
+                    Merge = SstMerge.insert 0 e nxt SstMerge.Empty
+                    EmittedKey = None
+                    Count = 0
+                }
                 stepObj
                 closeState
             |> ret
@@ -377,7 +370,7 @@ module internal StorageEngine =
             }
 
         result {
-            if engine.Mem.Count = 0 then
+            if Memtable.isEmpty engine.Mem then
                 return engine
             else
                 let fileNumber = engine.Version.NextFileNumber
@@ -407,7 +400,10 @@ module internal StorageEngine =
     /// 戻り値の bool は「実際に flush したか」。
     let flushIfNeededWith (allocateFileNumber: unit -> int64) (engine: StorageEngine) =
         withDirGate engine.Dir (fun () ->
-            if engine.Mem.Count > 0 && engine.Mem.ApproxBytes >= engine.MemLimitBytes then
+            if
+                not (Memtable.isEmpty engine.Mem)
+                && Memtable.approxBytes engine.Mem >= engine.MemLimitBytes
+            then
                 let fileNumber = allocateFileNumber ()
 
                 let engine =
@@ -480,7 +476,10 @@ module internal StorageEngine =
     /// memtable が上限に達していれば flush し、続けて compaction する（同期版）。
     let maybeFlush (engine: StorageEngine) =
         withDirGate engine.Dir (fun () ->
-            if engine.Mem.Count > 0 && engine.Mem.ApproxBytes >= engine.MemLimitBytes then
+            if
+                not (Memtable.isEmpty engine.Mem)
+                && Memtable.approxBytes engine.Mem >= engine.MemLimitBytes
+            then
                 match flush engine with
                 | Error _ -> ret engine
                 | Ok flushed ->

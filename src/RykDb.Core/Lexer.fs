@@ -17,6 +17,7 @@ type internal Token =
     | Symbol of string
     | Eos
 
+[<Struct>]
 type internal TokenItem = { Token: Token; Pos: Position }
 
 /// 字句解析器の位置。
@@ -29,11 +30,11 @@ type internal LexState =
         Column: int
     }
 
-    member s.Position =
+    member this.Position =
         {
-            Offset = s.Index
-            Line = s.Line
-            Column = s.Column
+            Offset = this.Index
+            Line = this.Line
+            Column = this.Column
         }
 
 module internal Lexer =

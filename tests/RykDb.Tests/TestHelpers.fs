@@ -409,6 +409,12 @@ let intKey (i: int) =
 /// Memtable / StorageEngine / WAL の `valOf` にあたる（Executor の `intArr` も同義）。
 let intRow (i: int) = [| SqlValue.Int(int64 i) |]
 
+/// SSTable 用の連番エントリ（キー昇順・同一キーなし。SeqNo は 1..n）。
+/// `SstScanTests` と `SstableTests` の両方で使う。
+let sstEntries (n: int) =
+    Array.init n (fun i -> SstEntry.make (intKey i) (uint64 (i + 1)) (Some(intRow i)))
+    |> Array.sortWith SstEntry.compare
+
 /// FileMetaData のテスト用ビルダー（キー lo..hi の連番区間）。
 /// ManifestTests と VersionSetTests に同一実装が 2 ファイル分あった。
 let fmd (num: int64) (level: int) (lo: int) (hi: int) : FileMetaData =
