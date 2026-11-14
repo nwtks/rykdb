@@ -1134,6 +1134,31 @@ CI の失敗が `tools/TailAudit/Program.fs` の FCS 型エラーなら、まず
 - ✅ `.fsi` 化で「不正な値を作って試すテスト」が書けなくなったら、そのテストは削除してよい
   （不変条件が構築時に保証されるため。例: `Reader` の範囲外 Cursor テスト）。
 
+### 9.9 `actions/setup-dotnet` の `cache: true` はリポジトリ直下の lock ファイルしか探さない
+
+```text
+Error: Dependencies lock file is not found in /home/runner/work/<repo>/<repo>.
+Supported file patterns: packages.lock.json
+```
+
+`cache-dependency-path` を指定しないと、`setup-dotnet` は `GITHUB_WORKSPACE` 直下を
+`readdir` して `packages.lock.json` を探すだけ（`src/cache-restore.ts` の `findLockFile`）。
+本リポジトリの lock ファイルは `src/` / `tests/` / `tools/` の各プロジェクト配下に分散しているため
+1件も見つからず、**「Setup .NET」ステップで CI が即死**する（`dotnet restore` まで到達しない）。
+
+対策は glob を明示すること:
+
+```yaml
+- uses: actions/setup-dotnet@v6
+  with:
+    dotnet-version: "10.0.x"
+    cache: true
+    cache-dependency-path: "**/packages.lock.json"
+```
+
+`cache-dependency-path` は `@actions/glob` の `hashFiles` にそのまま渡るので、glob を受け付ける。
+パターンが 1件も一致しないと `Some specified paths were not resolved, unable to cache dependencies.` で落ちる。
+
 ---
 
 ## 10. デバッグ手法
