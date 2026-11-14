@@ -2429,3 +2429,24 @@ B: COMMIT 成功              -- ← 重複したまま
 - `SessionPool: 接続間で UNIQUE の同時 INSERT を検出する`
 - `SessionPool: 接続間で UNIQUE の同時 UPDATE を検出する`
 - `TransactionManager.commit: UNIQUE の論理予約が競合する`
+
+### 11.71 行ごとの式評価では `Eval.resolver` を使い回す
+
+`Eval.matches` / `Eval.eval` は呼び出しごとに `ColumnResolver` を作る簡易版で、
+行ごとに使うと `Schema.resolve` の線形探索と候補リストの割当が毎行発生する。
+
+```fsharp
+// ❌ 行ごとに resolver を捨てる（従来と同じコスト）
+Op.filter (fun row -> Eval.matches schema row predicate)
+
+// ✅ 1オペレータ分だけ作って使い回す
+let resolve = Eval.resolver schema
+Op.filter (fun row -> Eval.matchesWith resolve row predicate)
+```
+
+- `Schema` が変わるところ（JOIN の出力、集約後の `Schema.empty`）では新しい resolver を作る。
+- resolver はスキーマごとの `Dictionary` なので、複数スレッドで共有しない
+  （`Op` は one-shot なので通常は問題ない）。
+- 実測（`tools/RykDb.Bench` の `FilterSeqScan`、10万行）:
+  導入前 約 520MB → 導入後 約 400MB の割当。
+  残りは SSTable の値デコードが支配的（値の遅延デコードは別の改善）。

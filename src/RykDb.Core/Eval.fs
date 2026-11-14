@@ -1,5 +1,32 @@
 namespace RykDb.Core
 
+/// 列参照の解決を 1オペレータ（1クエリ）分だけメモ化する。
+/// <remarks>
+/// 同じ式を行ごとに評価するとき、`Schema.resolve` の線形探索と
+/// 候補リスト（`int list`）の割当を繰り返さないために使う。
+/// `Schema` が変わるところ（JOIN の出力、集約後など）では新しい resolver を作る。
+/// 1つの resolver は複数スレッドから同時に使わないこと（`Op` は one-shot）。
+/// </remarks>
+[<NoEquality; NoComparison>]
+type internal ColumnResolver =
+    private
+        {
+            Schema: Schema
+            Cache: System.Collections.Generic.Dictionary<struct (string option * string), Result<int, DbError>>
+        }
+
+    /// 列参照を列位置へ解決する。
+    /// 同じ参照は 1回しか `Schema.resolve` を呼ばない。
+    member this.Resolve(r: ColumnRef) =
+        let key = struct (r.Qualifier, r.Name)
+
+        match this.Cache.TryGetValue key with
+        | true, result -> result
+        | _ ->
+            let result = Schema.resolve this.Schema r
+            this.Cache.[key] <- result
+            result
+
 module internal Scalar =
     /// LIKE のトークン。
     type private LikeToken =
@@ -477,60 +504,61 @@ module internal Eval =
     /// 降りる／上がるを継続スタック Kont でつなぐ（CPS）。
     /// 再帰はこの関数の自己再帰だけなので全部末尾位置になり、
     /// 式の深さ・IN の候補数に依存せずスタックは一定（継続はヒープのリストに積む）。
+    /// `resolve` は列解決のキャッシュ付き resolver（`Eval.resolver` で作る）。
     [<TailCall>]
-    let rec private step (schema: Schema) (row: SqlValue array) (kont: Kont list) (st: Step) =
+    let rec private step (resolve: ColumnResolver) (row: SqlValue array) (kont: Kont list) (st: Step) =
         match st with
         | Descend e ->
             match e with
-            | Expr.Literal l -> step schema row kont (Arrive l.ToSqlValue)
-            | Expr.Value v -> step schema row kont (Arrive v)
+            | Expr.Literal l -> step resolve row kont (Arrive l.ToSqlValue)
+            | Expr.Value v -> step resolve row kont (Arrive v)
             | Expr.Subquery _
             | Expr.Exists _
             | Expr.InSubquery _ -> err (DbError.create ErrorKind.SyntaxError "サブクエリはここでは使えません")
             | Expr.CorrelatedSubquery c ->
                 match c.Run row with
                 | Error er -> err er
-                | Ok v -> step schema row kont (Arrive v)
+                | Ok v -> step resolve row kont (Arrive v)
             | Expr.Column c ->
-                match Schema.resolve schema c with
+                match resolve.Resolve c with
                 | Error er -> err er
                 | Ok i ->
                     match valueAt row i e with
                     | Error er -> err er
-                    | Ok v -> step schema row kont (Arrive v)
+                    | Ok v -> step resolve row kont (Arrive v)
             | Expr.Name n ->
                 let probeRef = { Qualifier = None; Name = n }
 
-                match Schema.resolve schema probeRef with
+                match resolve.Resolve probeRef with
                 | Error _ -> err (sprintf "'%s' は列でも関数でもありません" n |> DbError.name)
                 | Ok i ->
                     match valueAt row i (Expr.Column probeRef) with
                     | Error er -> err er
-                    | Ok v -> step schema row kont (Arrive v)
+                    | Ok v -> step resolve row kont (Arrive v)
             | Expr.Star -> err (DbError.create ErrorKind.SyntaxError "WHERE 句に '*' は置けません")
             | Expr.QualifiedStar q -> err (sprintf "'%s.*' はここでは使えません" q |> DbError.name)
-            | Expr.Unary(op, x) -> step schema row (KUnary op :: kont) (Descend x)
-            | Expr.Binary(op, a, b) -> step schema row (KBinaryL(op, b) :: kont) (Descend a)
-            | Expr.IsNull(x, negated) -> step schema row (KIsNull negated :: kont) (Descend x)
-            | Expr.IsTruth(x, expected, negated) -> step schema row (KIsTruth(expected, negated) :: kont) (Descend x)
-            | Expr.Between(x, lo, hi, negated) -> step schema row (KBetweenX(lo, hi, negated) :: kont) (Descend x)
-            | Expr.InList(x, list, negated) -> step schema row (KInX(list, negated) :: kont) (Descend x)
-            | Expr.Like(x, p, negated, esc) -> step schema row (KLikeX(p, negated, esc) :: kont) (Descend x)
+            | Expr.Unary(op, x) -> step resolve row (KUnary op :: kont) (Descend x)
+            | Expr.Binary(op, a, b) -> step resolve row (KBinaryL(op, b) :: kont) (Descend a)
+            | Expr.IsNull(x, negated) -> step resolve row (KIsNull negated :: kont) (Descend x)
+            | Expr.IsTruth(x, expected, negated) -> step resolve row (KIsTruth(expected, negated) :: kont) (Descend x)
+            | Expr.Between(x, lo, hi, negated) -> step resolve row (KBetweenX(lo, hi, negated) :: kont) (Descend x)
+            | Expr.InList(x, list, negated) -> step resolve row (KInX(list, negated) :: kont) (Descend x)
+            | Expr.Like(x, p, negated, esc) -> step resolve row (KLikeX(p, negated, esc) :: kont) (Descend x)
             | Expr.Case(branches, elseE) ->
                 match branches with
-                | (w, t) :: tail -> step schema row (KCaseWhen((w, t), tail, elseE) :: kont) (Descend w)
+                | (w, t) :: tail -> step resolve row (KCaseWhen((w, t), tail, elseE) :: kont) (Descend w)
                 | [] ->
                     match elseE with
-                    | Some rest -> step schema row kont (Descend rest)
-                    | None -> step schema row kont (Arrive SqlValue.Null)
+                    | Some rest -> step resolve row kont (Descend rest)
+                    | None -> step resolve row kont (Arrive SqlValue.Null)
             | Expr.FuncCall(n, args) ->
                 match args with
-                | a :: tail -> step schema row (KFuncArg(n, [], tail) :: kont) (Descend a)
+                | a :: tail -> step resolve row (KFuncArg(n, [], tail) :: kont) (Descend a)
                 | [] ->
                     match Scalar.applyFunc n [||] with
                     | Error er -> err er
-                    | Ok v -> step schema row kont (Arrive v)
-            | Expr.Cast(x, dt) -> step schema row (KCast dt :: kont) (Descend x)
+                    | Ok v -> step resolve row kont (Arrive v)
+            | Expr.Cast(x, dt) -> step resolve row (KCast dt :: kont) (Descend x)
             | Expr.Default -> err (DbError.create ErrorKind.SyntaxError "DEFAULT は INSERT の VALUES でのみ使えます")
             | Expr.AggCall(f, _, _) -> err (sprintf "%s は集約なのでここでは評価できません" f.Name |> DbError.name)
         | Arrive v ->
@@ -561,7 +589,7 @@ module internal Eval =
 
                 match computed with
                 | Error er -> err er
-                | Ok res -> step schema row rest (Arrive res)
+                | Ok res -> step resolve row rest (Arrive res)
             | KBinaryL(op, b) :: rest ->
                 let short =
                     match op with
@@ -570,8 +598,8 @@ module internal Eval =
                     | _ -> None
 
                 match short with
-                | Some res -> step schema row rest (Arrive res)
-                | None -> step schema row (KBinaryR(op, v) :: rest) (Descend b)
+                | Some res -> step resolve row rest (Arrive res)
+                | None -> step resolve row (KBinaryR(op, v) :: rest) (Descend b)
             | KBinaryR(op, l) :: rest ->
                 let combined =
                     match op with
@@ -605,19 +633,19 @@ module internal Eval =
 
                 match combined with
                 | Error er -> err er
-                | Ok res -> step schema row rest (Arrive res)
+                | Ok res -> step resolve row rest (Arrive res)
             | KIsNull negated :: rest ->
                 let isNull = SqlValue.isNull v
-                step schema row rest (Arrive(SqlValue.Bool(if negated then not isNull else isNull)))
+                step resolve row rest (Arrive(SqlValue.Bool(if negated then not isNull else isNull)))
             | KIsTruth(expected, negated) :: rest ->
                 let result = truthOfValue v = expected
-                step schema row rest (Arrive(SqlValue.Bool(if negated then not result else result)))
+                step resolve row rest (Arrive(SqlValue.Bool(if negated then not result else result)))
             | KCast dt :: rest ->
                 match SqlValue.cast dt v with
                 | Error er -> err er
-                | Ok res -> step schema row rest (Arrive res)
-            | KBetweenX(lo, hi, negated) :: rest -> step schema row (KBetweenLo(v, hi, negated) :: rest) (Descend lo)
-            | KBetweenLo(x, hi, negated) :: rest -> step schema row (KBetweenHi(x, v, negated) :: rest) (Descend hi)
+                | Ok res -> step resolve row rest (Arrive res)
+            | KBetweenX(lo, hi, negated) :: rest -> step resolve row (KBetweenLo(v, hi, negated) :: rest) (Descend lo)
+            | KBetweenLo(x, hi, negated) :: rest -> step resolve row (KBetweenHi(x, v, negated) :: rest) (Descend hi)
             | KBetweenHi(x, lov, negated) :: rest ->
                 match truthOf "ge" x lov with
                 | Error er -> err er
@@ -626,36 +654,36 @@ module internal Eval =
                     | Error er -> err er
                     | Ok le ->
                         match TruthValue.and2 ge le with
-                        | TruthValue.True -> step schema row rest (Arrive(SqlValue.Bool(not negated)))
-                        | TruthValue.False -> step schema row rest (Arrive(SqlValue.Bool negated))
-                        | TruthValue.Unknown -> step schema row rest (Arrive SqlValue.Null)
+                        | TruthValue.True -> step resolve row rest (Arrive(SqlValue.Bool(not negated)))
+                        | TruthValue.False -> step resolve row rest (Arrive(SqlValue.Bool negated))
+                        | TruthValue.Unknown -> step resolve row rest (Arrive SqlValue.Null)
             | KInX(list, negated) :: rest ->
                 match list with
-                | [] -> step schema row rest (Arrive(SqlValue.Bool negated))
-                | cand :: tail -> step schema row (KInArg(v, negated, tail, false) :: rest) (Descend cand)
+                | [] -> step resolve row rest (Arrive(SqlValue.Bool negated))
+                | cand :: tail -> step resolve row (KInArg(v, negated, tail, false) :: rest) (Descend cand)
             | KInArg(x, negated, tail, sawUnknown) :: rest ->
                 match truthOf "eq" x v with
                 | Error er -> err er
-                | Ok TruthValue.True -> step schema row rest (Arrive(SqlValue.Bool(not negated)))
+                | Ok TruthValue.True -> step resolve row rest (Arrive(SqlValue.Bool(not negated)))
                 | Ok tv ->
                     let saw = sawUnknown || tv = TruthValue.Unknown
 
                     match tail with
-                    | [] -> step schema row rest (Arrive(if saw then SqlValue.Null else SqlValue.Bool negated))
-                    | cand :: more -> step schema row (KInArg(x, negated, more, saw) :: rest) (Descend cand)
-            | KLikeX(p, negated, esc) :: rest -> step schema row (KLikeP(v, negated, esc) :: rest) (Descend p)
+                    | [] -> step resolve row rest (Arrive(if saw then SqlValue.Null else SqlValue.Bool negated))
+                    | cand :: more -> step resolve row (KInArg(x, negated, more, saw) :: rest) (Descend cand)
+            | KLikeX(p, negated, esc) :: rest -> step resolve row (KLikeP(v, negated, esc) :: rest) (Descend p)
             | KLikeP(x, negated, esc) :: rest ->
                 if SqlValue.isNull x || SqlValue.isNull v then
-                    step schema row rest (Arrive SqlValue.Null)
+                    step resolve row rest (Arrive SqlValue.Null)
                 else
                     match esc with
                     | None ->
                         let m = Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString x)
-                        step schema row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
-                    | Some escExpr -> step schema row (KLikeE(x, v, negated) :: rest) (Descend escExpr)
+                        step resolve row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
+                    | Some escExpr -> step resolve row (KLikeE(x, v, negated) :: rest) (Descend escExpr)
             | KLikeE(x, pattern, negated) :: rest ->
                 if SqlValue.isNull v then
-                    step schema row rest (Arrive SqlValue.Null)
+                    step resolve row rest (Arrive SqlValue.Null)
                 else
                     let escapeText = SqlValue.toDisplayString v
 
@@ -669,19 +697,19 @@ module internal Eval =
                                 (SqlValue.toDisplayString x)
                         with
                         | Error er -> err er
-                        | Ok m -> step schema row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
+                        | Ok m -> step resolve row rest (Arrive(SqlValue.Bool(if negated then not m else m)))
             | KCaseWhen((_, t), tail, elseE) :: rest ->
                 let matched = not (SqlValue.isNull v) && boolOf v
 
                 if matched then
-                    step schema row rest (Descend t)
+                    step resolve row rest (Descend t)
                 else
                     match tail with
-                    | (w2, t2) :: more -> step schema row (KCaseWhen((w2, t2), more, elseE) :: rest) (Descend w2)
+                    | (w2, t2) :: more -> step resolve row (KCaseWhen((w2, t2), more, elseE) :: rest) (Descend w2)
                     | [] ->
                         match elseE with
-                        | Some rest2 -> step schema row rest (Descend rest2)
-                        | None -> step schema row rest (Arrive SqlValue.Null)
+                        | Some rest2 -> step resolve row rest (Descend rest2)
+                        | None -> step resolve row rest (Arrive SqlValue.Null)
             | KFuncArg(n, doneRev, tail) :: rest ->
                 let acc = v :: doneRev
 
@@ -689,18 +717,30 @@ module internal Eval =
                 | [] ->
                     match Scalar.applyFunc n (List.rev acc |> List.toArray) with
                     | Error er -> err er
-                    | Ok res -> step schema row rest (Arrive res)
-                | a :: more -> step schema row (KFuncArg(n, acc, more) :: rest) (Descend a)
+                    | Ok res -> step resolve row rest (Arrive res)
+                | a :: more -> step resolve row (KFuncArg(n, acc, more) :: rest) (Descend a)
 
-    /// 式を評価する。
+    /// 列参照の解決をスキーマ単位でメモ化した resolver を作る。
+    /// 同じスキーマで行ごとに評価するときは、こちらを 1回だけ作って使い回す。
+    let resolver (schema: Schema) =
+        {
+            Schema = schema
+            Cache = System.Collections.Generic.Dictionary<struct (string option * string), Result<int, DbError>>()
+        }
+
+    /// メモ化済み resolver で式を評価する。
     /// 集約呼び出しはここでエラーになる。
     /// 評価機 step を空の継続スタックで始める（末尾再帰のまま深さ・候補数に依存しない）。
-    let eval (schema: Schema) (row: SqlValue array) (e: Expr) = step schema row [] (Descend e)
+    let evalWith (resolve: ColumnResolver) (row: SqlValue array) (e: Expr) = step resolve row [] (Descend e)
+
+    /// 式を評価する（resolver を都度作る簡易版）。
+    /// 行ごとに呼ぶホットパスでは `evalWith` に resolver を渡すこと。
+    let eval = resolver >> evalWith
 
     /// WHERE の判定。
     /// UNKNOWN は偽（SQL 標準）。
-    let matches (schema: Schema) (row: SqlValue array) (predicate: Expr) =
-        eval schema row predicate
+    let matchesWith (resolve: ColumnResolver) (row: SqlValue array) (predicate: Expr) =
+        evalWith resolve row predicate
         |> Result.map (fun v ->
             match v with
             | SqlValue.Bool b -> b

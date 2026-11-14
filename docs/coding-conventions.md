@@ -95,6 +95,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `Compaction` の作業ディレクトリ別カウンタ（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
 - `Eval` の LIKE パターンキャッシュ（コンパイル済みトークン列を `(escape, pattern)` ごとに再利用）
+- `Eval.resolver` の列解決キャッシュ（1オペレータ = 1スキーマ。行ごとの `Schema.resolve` を繰り返さない）
 
 | やりたいこと   | 命令形の代わりに使うもの                                                       |
 | -------------- | ------------------------------------------------------------------------------ |

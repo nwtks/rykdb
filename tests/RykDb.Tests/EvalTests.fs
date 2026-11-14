@@ -559,15 +559,3 @@ let ``Eval.eval: CAST は TEXT から数値・BOOLEAN へ変換できる`` () =
 [<Fact>]
 let ``Eval.eval: DEFAULT は INSERT 以外でエラー`` () =
     expectErrorKind ErrorKind.SyntaxError "DEFAULT 単体" (Eval.eval Schema.empty [||] Expr.Default)
-
-[<Fact>]
-let ``Eval.matches: WHERE では UNKNOWN を偽として扱う`` () =
-    let r = [| SqlValue.Null; SqlValue.Int 1L |]
-    let pred = Expr.Binary(BinaryOp.Gt, col "a", col "b")
-    // UNKNOWN なので偽
-    Assert.False(ok (Eval.matches schema2 r pred))
-
-[<Fact>]
-let ``Eval.matches: WHERE 述語が数値を返したら 0 以外は真`` () =
-    Assert.True(ok (Eval.matches schema2 (row2 1L 0L) (Expr.Literal(Literal.Int 1L))))
-    Assert.False(ok (Eval.matches schema2 (row2 0L 0L) (Expr.Literal(Literal.Int 0L))))

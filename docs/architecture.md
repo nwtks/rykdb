@@ -781,6 +781,14 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 集約呼び出しはここでは評価せず、`Ops.aggregate` / `Ops.project` が先に計算してから結果を定数として読み替える
 （`Ops.substituteAggs`）。
 
+**列参照の解決**
+
+`Eval.step` は列参照を `Schema.resolve` で直接解決せず、
+`Eval.resolver` が作る `ColumnRef -> 列位置` のメモ化済み resolver を使う。
+オペレータ（WHERE / JOIN / 射影 / 集約 / ORDER BY / DML）ごとに 1個作り、
+同じ式を行ごとに評価しても線形探索と候補リストの割当を繰り返さない。
+`Schema` が変わるところ（JOIN の出力、集約後など）では新しい resolver を作る。
+
 **3値論理と NULL**
 
 - 比較はオペランドに NULL があると `NULL`（UNKNOWN）を返す。

@@ -7,13 +7,16 @@ module internal Ops =
 
     /// 述語で弾く。
     let filter (schema: Schema) (predicate: Expr) =
-        Op.filter (fun row -> Eval.matches schema row predicate)
+        let resolve = Eval.resolver schema
+        Op.filter (fun row -> Eval.matchesWith resolve row predicate)
 
     /// ソート。
     /// ORDER BY のキーを列位置へ解決できるならそのまま使い、
     /// 式が含まれる場合はキーを評価して行末へ足してからソートする。
     /// `*` / `t.*` はORDER BY には書けない。
     let sortBy (schema: Schema) (keys: RykDb.Core.SortKey list) (src: Op) =
+        let resolve = Eval.resolver schema
+
         let compareWith plan (a: SqlValue array) (b: SqlValue array) =
             let rec compareKeys =
                 function
@@ -53,10 +56,10 @@ module internal Ops =
             | Some c ->
                 let bare = { Qualifier = None; Name = c.Name }
 
-                match Schema.resolve schema c with
+                match resolve.Resolve c with
                 | Ok i -> Some(i, k.Direction)
                 | Error _ ->
-                    match Schema.resolve schema bare with
+                    match resolve.Resolve bare with
                     | Ok i -> Some(i, k.Direction)
                     | Error _ -> None
 
@@ -80,7 +83,7 @@ module internal Ops =
                     Op.map
                         (fun row ->
                             exprs
-                            |> List.map (Eval.eval schema row)
+                            |> List.map (Eval.evalWith resolve row)
                             |> all
                             |> Result.map (fun keyValues -> Array.append row (Array.ofList keyValues)))
                         src
@@ -227,10 +230,11 @@ module internal Ops =
     let havingFilter (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (predicate: Expr) =
         let offsets = aggOffsets groupBy aggs
         let wholeOffsets = wholeGroupOffsets groupBy
+        let resolve = Eval.resolver Schema.empty
 
         fun row ->
             substituteAggs offsets wholeOffsets row predicate
-            >>= Eval.matches Schema.empty row
+            >>= Eval.matchesWith resolve row
 
     /// 集約の 1 項目分の_accumulator。
     /// SUM / AVG は decimal で累積し、最後に型を決める（丸め誤差を避ける）。
@@ -261,10 +265,11 @@ module internal Ops =
     /// </remarks>
     let aggregate (schema: Schema) (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (src: Op) =
         let groupBudget = 4_000_000
+        let resolve = Eval.resolver schema
 
         let keyOfRow row =
             groupBy
-            |> List.map (fun e -> Eval.eval schema row e)
+            |> List.map (fun e -> Eval.evalWith resolve row e)
             |> all
             |> Result.map List.toArray
 
@@ -364,7 +369,7 @@ module internal Ops =
             if star then
                 addAcc acc None true distinct
             else
-                Eval.eval schema row arg >>= fun v -> addAcc acc (Some v) false distinct
+                Eval.evalWith resolve row arg >>= fun v -> addAcc acc (Some v) false distinct
 
         let addToBucket (bucket: ResizeArray<Acc>) row =
             let rec step i =
@@ -514,8 +519,10 @@ module internal Ops =
         (rightRows: SqlValue array array)
         (lrow: SqlValue array)
         =
-        let joinPred leftSchema rightSchema l r =
-            Eval.matches (Schema.concat leftSchema rightSchema) (Array.append l r)
+        let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
+
+        let joinPred l r =
+            Eval.matchesWith resolve (Array.append l r)
 
         let rec loop matched i =
             if i >= rightRows.Length then
@@ -523,7 +530,7 @@ module internal Ops =
             else
                 let rrow = rightRows.[i]
 
-                match joinPred leftSchema rightSchema lrow rrow on with
+                match joinPred lrow rrow on with
                 | Ok true -> Op.compute (fun () -> ret (Some(Array.append lrow rrow, loop true (i + 1))))
                 | Ok false -> Op.compute (fun () -> Op.next (loop matched (i + 1)))
                 | Error e -> onError e matched
@@ -581,10 +588,10 @@ module internal Ops =
 
     /// 等値キー以外の ON 句（residual）を評価する。
     /// 結合後の行（左 + 右）を一時配列に連結してから評価する。
-    let private residualMatches leftSchema rightSchema lrow rrow =
+    let private residualMatches resolve lrow rrow =
         function
         | None -> ret true
-        | Some p -> Eval.matches (Schema.concat leftSchema rightSchema) (Array.append lrow rrow) p
+        | Some p -> Eval.matchesWith resolve (Array.append lrow rrow) p
 
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
     /// lookupRows は左キーから右行のリストを返す（見つからなければ空）。
@@ -602,6 +609,7 @@ module internal Ops =
         (residual: Expr option)
         =
         let rightWidth = rightSchema.Columns.Length
+        let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
 
         let padded lrow =
             Array.append lrow (Array.create rightWidth SqlValue.Null)
@@ -629,7 +637,7 @@ module internal Ops =
             else
                 let rrow = rows.[i]
 
-                match residualMatches leftSchema rightSchema lrow rrow residual with
+                match residualMatches resolve lrow rrow residual with
                 | Error e -> Op.compute (fun () -> err e)
                 | Ok false -> Op.compute (fun () -> Op.next (emit lrow lnext rows (i + 1) matched))
                 | Ok true ->
@@ -787,6 +795,7 @@ module internal Ops =
         (residual: Expr option)
         =
         let rightWidth = rightSchema.Columns.Length
+        let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
 
         let padded lrow =
             Array.append lrow (Array.create rightWidth SqlValue.Null)
@@ -868,7 +877,7 @@ module internal Ops =
                 let lrow = lgroup.[i]
                 let rrow = rgroup.[j]
 
-                match residualMatches leftSchema rightSchema lrow rrow residual with
+                match residualMatches resolve lrow rrow residual with
                 | Error e -> Op.compute (fun () -> err e)
                 | Ok false ->
                     Op.compute (fun () -> Op.next (emitGroup lgroup rgroup lnext rnext i (j + 1) matchedThisRow))
@@ -948,14 +957,24 @@ module internal Ops =
             let foundAggs = aggCallsOf projection.SelectItems
             let offsets = aggOffsets groupBy foundAggs
             let wholeOffsets = wholeGroupOffsets groupBy
+            let resolve = Eval.resolver schema
 
             if List.isEmpty foundAggs && List.isEmpty groupBy then
-                Op.map (fun row -> allExprs |> List.map (Eval.eval schema row) |> all |> Result.map List.toArray) src
-            else
                 Op.map
                     (fun row ->
                         allExprs
-                        |> List.map (fun e -> substituteAggs offsets wholeOffsets row e >>= Eval.eval Schema.empty row)
+                        |> List.map (Eval.evalWith resolve row)
+                        |> all
+                        |> Result.map List.toArray)
+                    src
+            else
+                let resolveAgg = Eval.resolver Schema.empty
+
+                Op.map
+                    (fun row ->
+                        allExprs
+                        |> List.map (fun e ->
+                            substituteAggs offsets wholeOffsets row e >>= Eval.evalWith resolveAgg row)
                         |> all
                         |> Result.map List.toArray)
                     src

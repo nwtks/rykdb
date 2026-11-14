@@ -22,6 +22,8 @@ let private row (values: SqlValue list) = List.toArray values
 let private col (name: string) =
     Expr.Column { Qualifier = None; Name = name }
 
+let private matches = Eval.resolver >> Eval.matchesWith
+
 [<Fact>]
 let ``Op: 次の行を引くまで計算しない`` () =
     // 無限に伸びる Op でも 1行しか引かずに終わる。
@@ -97,7 +99,7 @@ let ``Op: filter と skip`` () =
                 [| SqlValue.Int 3L |]
                 [| SqlValue.Int 4L |]
             |]
-        |> Op.filter (fun r -> Eval.matches schema2 r (Expr.Binary(BinaryOp.Gt, col "a", Expr.Literal(Literal.Int 2L))))
+        |> Op.filter (fun r -> matches schema2 r (Expr.Binary(BinaryOp.Gt, col "a", Expr.Literal(Literal.Int 2L))))
         |> Op.skip 1
 
     // a > 2 は 3 と 4 の 2件。そこから 1件読み飛ばすので 1件残る。

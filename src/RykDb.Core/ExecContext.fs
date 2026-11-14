@@ -163,9 +163,9 @@ module internal DmlOps =
 
     /// WHERE の述語。
     /// WHERE が無ければ「全部通過」（UPDATE / DELETE で共通）。
-    let private matchesWhere (targetSchema: Schema) (row: SqlValue array) =
+    let private matchesWhere (resolve: ColumnResolver) (row: SqlValue array) =
         function
-        | Some w -> Eval.matches targetSchema row w
+        | Some w -> Eval.matchesWith resolve row w
         | None -> ret true
 
     /// 値式を列位置に対応付け、型強制して (位置, 値) のリストにする。
@@ -398,24 +398,25 @@ module internal DmlOps =
     /// 主キー列の変更は `Dml.updateRow` が ConstraintViolation で拒否する
     /// （DELETE + INSERT を使う）。
     let update (ctx: ExecContext) (schema: TableSchema) (assignments: (string * Expr) list) (where: Expr option) =
-        let assign targetSchema targets row =
-            gatherWith (Eval.eval targetSchema row) schema (List.map snd assignments) targets
+        let targetSchema = targetSchemaOf schema
+        let resolve = Eval.resolver targetSchema
+
+        let assign targets row =
+            gatherWith (Eval.evalWith resolve row) schema (List.map snd assignments) targets
             |> Result.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
 
         let rowBytes row = int64 (ValueCodec.managedRowBytes row)
-
-        let targetSchema = targetSchemaOf schema
 
         let rec go targets acc bytes cur =
             match Op.next cur with
             | Error e -> err e
             | Ok None -> ret (List.rev acc)
             | Ok(Some(row, next)) ->
-                match matchesWhere targetSchema row where with
+                match matchesWhere resolve row where with
                 | Error e -> err e
                 | Ok false -> go targets acc bytes next
                 | Ok true ->
-                    match assign targetSchema targets row with
+                    match assign targets row with
                     | Error e -> err e
                     | Ok newRow ->
                         let bytes = bytes + rowBytes row + rowBytes newRow + 24L
@@ -530,6 +531,7 @@ module internal DmlOps =
             }
 
         let targetSchema = targetSchemaOf schema
+        let resolve = Eval.resolver targetSchema
 
-        foldRows ctx schema (fun row -> matchesWhere targetSchema row where) (fun t count row ->
+        foldRows ctx schema (fun row -> matchesWhere resolve row where) (fun t count row ->
             Dml.deleteRow t schema row |> Result.map (fun t2 -> t2, count + 1))

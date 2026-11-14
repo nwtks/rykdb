@@ -1739,6 +1739,8 @@ module internal Plan =
                                 | s :: _ -> s.Schema
                                 | [] -> Schema.empty
 
+                            let resolve = Eval.resolver currentSchema
+
                             let run row =
                                 let withRow = withCurrentRow row scopes
 
@@ -1748,7 +1750,7 @@ module internal Plan =
                                     collectSubqueryRows op
                                     |> Result.bind (fun rows ->
                                         let values = rows |> Array.map (fun r -> Expr.Value r.[0]) |> Array.toList
-                                        Eval.eval currentSchema row (Expr.InList(left, values, negated))))
+                                        Eval.evalWith resolve row (Expr.InList(left, values, negated))))
 
                             k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx
