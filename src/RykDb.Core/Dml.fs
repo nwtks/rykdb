@@ -4,7 +4,7 @@ module internal RowKey =
     /// 索引の列値を取り出す。
     /// 索引列は CREATE INDEX で検証済み。
     /// 万一欠けている場合は、その列を落とす（防御）。
-    let private indexValues (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
+    let indexValues (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
         index.Columns
         |> List.choose (fun name ->
             match TableSchema.indexOf schema name with
@@ -32,6 +32,17 @@ module internal Dml =
     /// 索引 schema を登録する。
     let private indexSpace (index: IndexSchema) = Keyspace.index index.Name
 
+    let private reserveUniqueValues (txn: Transaction) (schema: TableSchema) (index: IndexSchema) =
+        function
+        | None -> txn
+        | Some values ->
+            let keyValues = RowKey.indexValues schema index values
+
+            if keyValues |> List.exists SqlValue.isNull then
+                txn
+            else
+                Transaction.reserveUnique index.Name (KeyBuilder.ofValues keyValues) txn
+
     /// 旧行と新行の差分を索引へ反映する。
     /// 同じ索引キーなら上書きだけ行い、キーが変わった場合だけ旧キーを削除する。
     let private applyIndexChange
@@ -43,21 +54,28 @@ module internal Dml =
         schema.Indexes
         |> foldOk
             (fun current index ->
+                let current' =
+                    if index.Unique then
+                        let afterOld = reserveUniqueValues current schema index oldRow
+                        reserveUniqueValues afterOld schema index newRow
+                    else
+                        current
+
                 let keyFor row = RowKey.indexKey schema index row
                 let space = indexSpace index
 
                 match oldRow, newRow with
-                | None, None -> ret current
-                | None, Some row -> ret (Transaction.put space (keyFor row) row current)
-                | Some row, None -> ret (Transaction.remove space (keyFor row) current)
+                | None, None -> ret current'
+                | None, Some row -> ret (Transaction.put space (keyFor row) row current')
+                | Some row, None -> ret (Transaction.remove space (keyFor row) current')
                 | Some oldValue, Some newValue ->
                     let oldKey = keyFor oldValue
                     let newKey = keyFor newValue
 
                     if oldKey = newKey then
-                        ret (Transaction.put space newKey newValue current)
+                        ret (Transaction.put space newKey newValue current')
                     else
-                        let removed = Transaction.remove space oldKey current
+                        let removed = Transaction.remove space oldKey current'
                         ret (Transaction.put space newKey newValue removed))
             txn
 

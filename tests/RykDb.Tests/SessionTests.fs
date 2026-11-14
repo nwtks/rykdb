@@ -707,6 +707,106 @@ let ``SessionPool: 接続間で write-write 競合を検出する`` () =
             b.Close() |> ignore)
 
 [<Fact>]
+let ``SessionPool: 接続間で UNIQUE の同時 INSERT を検出する`` () =
+    withPool "pool-unique-insert" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            |> ignore
+
+            ok (a.Begin()) |> ignore
+            ok (b.Begin()) |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1, 'x@example.com')") |> ignore
+            ok (b.Execute "INSERT INTO t VALUES (2, 'x@example.com')") |> ignore
+
+            ok (a.Commit()) |> ignore
+            expectErrorKind ErrorKind.ConflictError "後から commit した UNIQUE INSERT" (b.Commit())
+            ok (b.Rollback()) |> ignore
+
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t")
+
+            expectErrorKind
+                ErrorKind.ConstraintViolation
+                "commit 後の再実行は UNIQUE 違反になる"
+                (b.Execute "INSERT INTO t VALUES (2, 'x@example.com')")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: 接続間で UNIQUE の同時 UPDATE を検出する`` () =
+    withPool "pool-unique-update" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            |> ignore
+
+            ok (a.Execute "INSERT INTO t VALUES (1, 'a'), (2, 'b')") |> ignore
+            ok (a.Begin()) |> ignore
+            ok (b.Begin()) |> ignore
+            ok (a.Execute "UPDATE t SET email = 'c' WHERE id = 1") |> ignore
+            ok (b.Execute "UPDATE t SET email = 'c' WHERE id = 2") |> ignore
+
+            ok (a.Commit()) |> ignore
+            expectErrorKind ErrorKind.ConflictError "後から commit した UNIQUE UPDATE" (b.Commit())
+            ok (b.Rollback()) |> ignore
+
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t WHERE email = 'c'")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: UNIQUE の NULL は接続間でも重複できる`` () =
+    withPool "pool-unique-null" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            |> ignore
+
+            ok (a.Begin()) |> ignore
+            ok (b.Begin()) |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1, NULL)") |> ignore
+            ok (b.Execute "INSERT INTO t VALUES (2, NULL)") |> ignore
+
+            ok (a.Commit()) |> ignore
+            ok (b.Commit()) |> ignore
+
+            Assert.Equal(2L, scalar a "SELECT COUNT(*) FROM t")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: rollback した UNIQUE の予約は残らない`` () =
+    withPool "pool-unique-rollback" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            |> ignore
+
+            ok (a.Begin()) |> ignore
+            ok (b.Begin()) |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1, 'x@example.com')") |> ignore
+            ok (b.Execute "INSERT INTO t VALUES (2, 'x@example.com')") |> ignore
+
+            ok (a.Rollback()) |> ignore
+            ok (b.Commit()) |> ignore
+
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
 let ``SessionPool: 長い transaction 中でも他接続は commit できる`` () =
     withPool "pool-concurrent" (fun pool ->
         let a = ok (pool.CreateSession())

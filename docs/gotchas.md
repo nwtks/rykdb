@@ -2395,3 +2395,37 @@ let slot = givenSlot |> Option.map SqlValue.copyRow
 - `Memtable: 挿入したキー配列を後から書き換えても木は保たれる`
 - `Memtable: 挿入した行配列を後から書き換えても値は変わらない`
 - `Transaction: put したキー・行配列を後から書き換えてもバッファは保たれる`
+
+### 11.70 UNIQUE の物理キーだけでは同時実行の重複を防げない（INV-21）
+
+❌ 索引キーが「索引値 + 主キー」だからといって、
+同じ UNIQUE 値の同時 INSERT が first-committer-wins で衝突すると考える。
+
+索引キーは主キーが違えば別物になる。
+`checkUnique` は transaction の snapshot しか見ないため、
+両方の transaction が commit まで進んでしまう。
+
+```text
+A: INSERT id=1, email='x'   -- snapshot に 'x' は無い
+B: INSERT id=2, email='x'   -- snapshot に 'x' は無い
+A: COMMIT 成功
+B: COMMIT 成功              -- ← 重複したまま
+```
+
+✅ transaction に `@unique:<索引名>:<base64(索引値)>` の論理予約キーを持たせ、
+`writeKeys` に含めて commit 時の競合検出へ渡す。
+
+- 予約は物理キーではない。
+  `LastCommitted` に commit SeqNo で登録するだけで、WAL / SSTable には書かない。
+  再起動後に active transaction は無いので永続化不要。
+- `NULL` を含む UNIQUE 値は予約しない（既存の UNIQUE 検査と同じ）。
+- 物理エントリが無い予約だけの commit でも SeqNo を進める
+  （後続の snapshot が予約の SeqNo を正しく跨げるようにする）。
+- `CREATE UNIQUE INDEX` の backfill は DDL 排他で active transaction を拒否するため、
+  予約キーの backfill は不要。
+
+回帰テスト:
+
+- `SessionPool: 接続間で UNIQUE の同時 INSERT を検出する`
+- `SessionPool: 接続間で UNIQUE の同時 UPDATE を検出する`
+- `TransactionManager.commit: UNIQUE の論理予約が競合する`

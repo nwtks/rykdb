@@ -909,22 +909,31 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 transaction の snapshot より大きい SeqNo の同一キーがあれば `ConflictError` にする。
 
 競合キーの照合は `keyspace + ":" + base64(キー)` の文字列で行う。
-`LastCommitted` はプロセス内の状態で、ディスクには残さない
+UNIQUE 索引は物理キーが「索引値 + 主キー」なので、
+主キーが違うと同じ UNIQUE 値でも物理キーが衝突しない。
+そこで transaction は Reservations : Set<string>`に`@unique:<索引名>:<base64(索引値)>`の **論理予約キー**を持ち、
+`Transaction.writeKeys` で物理キーと和集合にして first-committer-wins の対象にする。
+予約は物理エントリを書かず、commit 時に commit SeqNo で`LastCommitted`へ登録する。
+`NULL`を含む UNIQUE 値は予約しない。
+物理エントリの無い予約だけの commit でも SeqNo を進める。
+予約キーは DDL の backfill 対象外（DDL は active transaction を拒否する）。
+`LastCommitted`はプロセス内の状態で、ディスクには残さない
 （commit 済みのデータは再起動後も WAL / SSTable から読める）。
-commit のたびに、その transaction を `Active` から外し、
-**この commit の SeqNo を反映した後**の `activeSnapshot` を境界として `SeqNo < 境界` の版を捨てる
+commit のたびに、その transaction を`Active` から外し、
+**この commit の SeqNo を反映した後**の`activeSnapshot`を境界として`SeqNo < 境界`の版を捨てる
 （生きている transaction の衝突判定に要る版だけ残す）。
-active な transaction が無ければ境界は `commitSeq + 1` になり、commit 直後に空へ戻る
-（`LastCommitted` が空なら `findConflicts` は全書き込みキーの `Set` を作らずに即 `[]` を返す）。
+active な transaction が無ければ境界は`commitSeq + 1` になり、commit 直後に空へ戻る
+（`LastCommitted`が空なら`findConflicts`は全書き込みキーの`Set`を作らずに即`[]` を返す）。
 
 ### 7.4 書き込みは commit 時にしかエンジンへ届かない
 
 ```
 BEGIN
   ├─ Transaction.Buffers : Map<keyspace, Map<key, SqlValue array option>>
+  ├─ Transaction.Reservations : Set<UNIQUE の論理予約キー>
   └─ （読みはバッファを見る → read-your-writes）
 COMMIT
-  ├─ TransactionManager.commit → 競合検出 → WriteBatch
+  ├─ TransactionManager.commit → 競合検出（Buffers + Reservations） → WriteBatch
   ├─ TransactionManager.activeSnapshot → GC 境界
   └─ RowStore.commitToStoreWith
        └─ 全 keyspace のエントリを接頭辞付きで 1本の StorageEngine.writeBatch へ

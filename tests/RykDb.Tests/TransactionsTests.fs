@@ -150,6 +150,26 @@ let ``Transaction.writeKeys: 書き込みキーを返す`` () =
     Assert.Equal(1, keys.Count)
 
 [<Fact>]
+let ``Transaction.reserveUnique: 同じ索引値の予約は 1 件にまとまる`` () =
+    let txn0 = Transaction.create 1UL<txnId> { Snapshot.SeqNo = 0UL }
+    let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |]
+    let txn1 = Transaction.reserveUnique "idx_email" key txn0
+    let txn2 = Transaction.reserveUnique "idx_email" key txn1
+    Assert.Equal(1, txn2.Reservations.Count)
+    Assert.Equal(txn1.ApproxBytes, txn2.ApproxBytes)
+
+[<Fact>]
+let ``TransactionManager.commit: UNIQUE の論理予約が競合する`` () =
+    let mgr0 = TransactionManager.create ()
+    let mgr1, txnA = TransactionManager.beginTxn mgr0
+    let mgr2, txnB = TransactionManager.beginTxn mgr1
+    let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |]
+    let txnA = Transaction.reserveUnique "idx_email" key txnA
+    let txnB = Transaction.reserveUnique "idx_email" key txnB
+    let mgr3, _, _ = ok (TransactionManager.commit txnA mgr2)
+    expectErrorKind ErrorKind.ConflictError "UNIQUE 予約の競合を検出できない" (TransactionManager.commit txnB mgr3)
+
+[<Fact>]
 let ``Transaction: read-only な transaction は keys が空`` () =
     let mgr = TransactionManager.create ()
     let _, txn = TransactionManager.beginTxn mgr

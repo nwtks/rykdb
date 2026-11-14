@@ -907,6 +907,10 @@ INSERT INTO テーブル [ (列 [, 列 …]) ] SELECT ...;
 そのため、同一文内で一意値を交換する更新も成功する
 （更新対象外の行との衝突は `ConstraintViolation`）。
 
+同時実行では、別々の transaction が同じ UNIQUE 値（別々の主キー）を書いた場合、
+先に commit した transaction が成功し、後から commit した側は `ConflictError` になる。
+`NULL` は予約対象外なので、複数の transaction が同時に `NULL` を挿入できる。
+
 ```sql
 INSERT INTO people VALUES (1, 'alice2', 30, 1, 1.0);  -- id=1 が既に存在するのでエラー
 INSERT INTO people (id, email) VALUES (2, NULL), (3, NULL);  -- 複数の NULL は OK

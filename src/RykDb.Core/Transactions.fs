@@ -34,6 +34,8 @@ type internal Transaction =
         Buffers: Map<string, Map<byte array, SqlValue array option>>
         /// バッファの概算バイト数。
         ApproxBytes: int64
+        /// UNIQUE 索引値の論理予約キー。物理エントリは書かない。
+        Reservations: Set<string>
         /// この transaction が保持できるバッファの上限。
         LimitBytes: int64
     }
@@ -43,6 +45,9 @@ module internal Transaction =
     [<Literal>]
     let DefaultLimitBytes = 256L * 1024L * 1024L
 
+    [<Literal>]
+    let private ReservationKeyspacePrefix = "@unique:"
+
     /// 書き込み可能な transaction を作る。
     let create (txnId: TxnId) (snap: Snapshot) =
         {
@@ -50,6 +55,7 @@ module internal Transaction =
             Snapshot = snap
             Buffers = Map.empty
             ApproxBytes = 0L
+            Reservations = Set.empty
             LimitBytes = DefaultLimitBytes
         }
 
@@ -133,12 +139,31 @@ module internal Transaction =
     let conflictKey (keyspace: string) (key: byte array) =
         keyspace + ":" + System.Convert.ToBase64String key
 
+    /// UNIQUE 索引値の論理予約キー。
+    let private uniqueReservationKey (indexName: string) (key: byte array) =
+        conflictKey (ReservationKeyspacePrefix + indexName) key
+
+    /// UNIQUE 索引値の予約を記録する。
+    let reserveUnique (indexName: string) (key: byte array) (txn: Transaction) =
+        let reservation = uniqueReservationKey indexName key
+
+        if Set.contains reservation txn.Reservations then
+            txn
+        else
+            { txn with
+                Reservations = Set.add reservation txn.Reservations
+                ApproxBytes = txn.ApproxBytes + int64 reservation.Length * 2L + 48L
+            }
+
     /// 競合検出用に「(keyspace, キー)」を文字列 1本に畳んだ集合。
     let writeKeys (txn: Transaction) =
-        txn.Buffers
-        |> Map.toList
-        |> Seq.collect (fun (ks, m) -> m |> Map.keys |> Seq.map (conflictKey ks))
-        |> Set.ofSeq
+        let physical =
+            txn.Buffers
+            |> Map.toList
+            |> Seq.collect (fun (ks, m) -> m |> Map.keys |> Seq.map (conflictKey ks))
+            |> Set.ofSeq
+
+        Set.union physical txn.Reservations
 
     /// バッファを keyspace ごとに「SeqNo 降順で採番済みの Entry 配列」に変換する。
     /// 採番は nextSeqNo から 1つずつ採番する。
@@ -259,20 +284,29 @@ module internal TransactionManager =
                     | Some seq -> seq > snapSeq
                     | None -> false)
 
-        let updateLastCommitted lastCommitted (batches: (string * Entry array) list) =
-            batches
-            |> List.fold
-                (fun acc (ks, entries) ->
-                    entries
-                    |> Array.fold
-                        (fun acc e ->
-                            let k = Transaction.conflictKey ks e.Key
+        let updateLastCommitted lastCommitted (batches: (string * Entry array) list) commitSeq =
+            let physical =
+                batches
+                |> List.fold
+                    (fun acc (ks, entries) ->
+                        entries
+                        |> Array.fold
+                            (fun acc e ->
+                                let k = Transaction.conflictKey ks e.Key
 
-                            match acc |> Map.tryFind k with
-                            | Some old when old >= e.SeqNo -> acc
-                            | _ -> Map.add k e.SeqNo acc)
-                        acc)
-                lastCommitted
+                                match acc |> Map.tryFind k with
+                                | Some old when old >= e.SeqNo -> acc
+                                | _ -> Map.add k e.SeqNo acc)
+                            acc)
+                    lastCommitted
+
+            txn.Reservations
+            |> Set.fold
+                (fun acc k ->
+                    match acc |> Map.tryFind k with
+                    | Some old when old >= commitSeq -> acc
+                    | _ -> Map.add k commitSeq acc)
+                physical
 
         if not (Map.containsKey txn.TxnId manager.Active) then
             err (sprintf "Transaction %d が存在しません" txn.TxnId |> DbError.internalError)
@@ -287,8 +321,15 @@ module internal TransactionManager =
                     |> DbError.conflict
                 )
             else
-                let batches, nextSeq = Transaction.toEntries manager.NextSeqNo txn
-                let commitSeq = nextSeq - 1UL
+                let batches, allocatedNext = Transaction.toEntries manager.NextSeqNo txn
+
+                let commitSeq =
+                    if Set.isEmpty txn.Reservations then
+                        allocatedNext - 1UL
+                    else
+                        max (allocatedNext - 1UL) (manager.LastCommitSeqNo + 1UL)
+
+                let nextSeq = commitSeq + 1UL
 
                 let staged =
                     { manager with
@@ -305,7 +346,7 @@ module internal TransactionManager =
                     if gcThreshold > commitSeq then
                         Map.empty
                     else
-                        updateLastCommitted manager.LastCommitted batches
+                        updateLastCommitted manager.LastCommitted batches commitSeq
                         |> Map.filter (fun _ seq -> seq >= gcThreshold)
 
                 let updated =

@@ -52,6 +52,7 @@ F# の型システムでは表現できないため、
 | INV-18 | `Expr.children` / `plugChildren` の arity               | `Expr.plugChildren`（モジュールレベルへ引き上げ）+ `AstTests` の全ノード種テスト                                                                                                      | ✅ 完了 |
 | INV-19 | 保持する側はキー・行の所有権を複製で取り込む            | `Entry.takeOwnership` / `Transaction.setSlot` の複製と回帰テスト                                                                                                                      | ✅ 完了 |
 | INV-20 | `Writer.Chunks` は逆順（先頭が最新の書き込み）          | `Writer.fsi`（ケース非公開、構築は `Empty` / 各 write 関数に限定）+ 順序プロパティテスト                                                                                              | ✅ 完了 |
+| INV-21 | UNIQUE の予約は commit まで競合検出に残る               | `Transaction.reserveUnique` / `writeKeys` / `TransactionManager.commit` + `TransactionsTests` / `SessionTests` の同時実行テスト                                                       | ✅ 完了 |
 
 ---
 
@@ -346,6 +347,31 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `Writer: 多数のチャンクを積んでも書き込み順に並ぶ`
     （`writeByte` / `varint` / `uint32LE` / `writeBytes` を混ぜた 64 チャンクを
     期待バイト列と完全一致で比較。末尾からの埋め戻しが崩れると落ちる）
+
+### INV-21 UNIQUE の論理予約
+
+- 宣言: UNIQUE 索引の値は、transaction が commit するまで
+  「その索引値に対応する論理予約キー」を保持し、競合検出の対象にする。
+- 理由: 索引の物理キーは「索引値 + 主キー」なので、主キーが違えば同一 UNIQUE 値でも物理キーが衝突しない。
+  snapshot だけの `checkUnique` では、同時に開始した 2つの transaction が同じ UNIQUE 値を書く競合を防げない。
+- 担保:
+  - `Transaction.reserveUnique` が `@unique:<索引名>:<base64(索引値)>` を
+    `Reservations : Set<string>` に記録する（同じ値は 1件にまとめる）。
+  - `Transaction.writeKeys` が物理書き込みキーと `Reservations` の和集合を返す。
+  - `TransactionManager.commit` が `writeKeys` で first-committer-wins を判定し、
+    commit した予約を commit SeqNo で `LastCommitted` に登録する。
+  - 物理エントリの無い予約だけの commit でも SeqNo を進める。
+  - `NULL` を含む UNIQUE 値は予約しない（既存の UNIQUE 検査と同じ）。
+  - 予約は物理キーではないため、`CREATE UNIQUE INDEX` の backfill は不要。
+    DDL は排他（`RootGate`）で active transaction を拒否する。
+- 回帰テスト:
+  - `Transaction.reserveUnique: 同じ索引値の予約は 1 件にまとまる`
+  - `TransactionManager.commit: UNIQUE の論理予約が競合する`
+  - `TransactionManager.commit: UNIQUE の論理予約は active transaction が無くなると GC される`
+  - `SessionPool: 接続間で UNIQUE の同時 INSERT を検出する`
+  - `SessionPool: 接続間で UNIQUE の同時 UPDATE を検出する`
+  - `SessionPool: UNIQUE の NULL は接続間でも重複できる`
+  - `SessionPool: rollback した UNIQUE の予約は残らない`
 
 ---
 
