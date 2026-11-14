@@ -504,6 +504,14 @@ module internal Ops =
 
         go 0L []
 
+    /// 行の末尾に NULL を足した新しい行を作る。
+    /// `Array.create` + `Array.append` の 2回の割当を避ける。
+    let private padWithNulls (row: SqlValue array) (width: int) =
+        let combined = Array.zeroCreate<SqlValue>(row.Length + width)
+        Array.blit row 0 combined 0 row.Length
+        Array.fill combined row.Length width SqlValue.Null
+        combined
+
     /// nested loop 結合の内側ループ（1つの左行 × 右の全行）を回す共通処理。
     /// onExhausted matched は右を最後まで試し終えたときの Op。
     /// onError error matched は ON 句の評価が失敗したときの Op。
@@ -520,20 +528,23 @@ module internal Ops =
         (lrow: SqlValue array)
         =
         let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
+        let joinPred l r = Eval.matchesJoined resolve l r
 
-        let joinPred l r =
-            Eval.matchesWith resolve (Array.append l r)
-
+        // 1回の Op.next で「一致するまで右を進める」。
+        // 候補ごとに Op.compute を作らないので、一致しない行が多い結合で割当が増えない。
         let rec loop matched i =
-            if i >= rightRows.Length then
-                onExhausted matched
+            Op.compute (fun () -> advance matched i)
+
+        and advance matched j =
+            if j >= rightRows.Length then
+                Op.next (onExhausted matched)
             else
-                let rrow = rightRows.[i]
+                let rrow = rightRows.[j]
 
                 match joinPred lrow rrow on with
-                | Ok true -> Op.compute (fun () -> ret (Some(Array.append lrow rrow, loop true (i + 1))))
-                | Ok false -> Op.compute (fun () -> Op.next (loop matched (i + 1)))
-                | Error e -> onError e matched
+                | Ok true -> ret (Some(Array.append lrow rrow, loop true (j + 1)))
+                | Ok false -> advance matched (j + 1)
+                | Error e -> Op.next (onError e matched)
 
         loop false 0
 
@@ -569,9 +580,7 @@ module internal Ops =
                         if matched then
                             joinRows width lnext rightRows
                         else
-                            Op.emit
-                                (Array.append lrow (Array.create width SqlValue.Null))
-                                (joinRows width lnext rightRows)
+                            Op.emit (padWithNulls lrow width) (joinRows width lnext rightRows)
 
                     let onError e _ = Op.compute (fun () -> err e)
                     Op.next (joinLoop leftSchema rightSchema on onExhausted onError rightRows lrow))
@@ -587,11 +596,11 @@ module internal Ops =
     let private keyOf (row: SqlValue array) = Array.map (fun i -> row.[i])
 
     /// 等値キー以外の ON 句（residual）を評価する。
-    /// 結合後の行（左 + 右）を一時配列に連結してから評価する。
+    /// 左右の行を連結せずに評価する。
     let private residualMatches resolve lrow rrow =
         function
         | None -> ret true
-        | Some p -> Eval.matchesWith resolve (Array.append lrow rrow) p
+        | Some p -> Eval.matchesJoined resolve lrow rrow p
 
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
     /// lookupRows は左キーから右行のリストを返す（見つからなければ空）。
@@ -610,9 +619,7 @@ module internal Ops =
         =
         let rightWidth = rightSchema.Columns.Length
         let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
-
-        let padded lrow =
-            Array.append lrow (Array.create rightWidth SqlValue.Null)
+        let padded lrow = padWithNulls lrow rightWidth
 
         let rec probe cur =
             Op.pull
@@ -730,13 +737,21 @@ module internal Ops =
         | _ -> ret side
 
     /// 結合キーの比較（NULL は呼び出し側で除く）。
-    let rec private compareKeyVectors (i: int) (a: SqlValue array) (b: SqlValue array) =
-        if i >= a.Length then
+    /// キー配列を作らずに、行とキー列位置から直接比較する。
+    [<TailCall>]
+    let rec private compareKeyVectors
+        (i: int)
+        (leftKeys: int array)
+        (left: SqlValue array)
+        (rightKeys: int array)
+        (right: SqlValue array)
+        =
+        if i >= leftKeys.Length then
             ret 0
         else
-            match SqlValue.compareValues a.[i] b.[i] with
+            match SqlValue.compareValues left.[leftKeys.[i]] right.[rightKeys.[i]] with
             | Error e -> err e
-            | Ok 0 -> compareKeyVectors (i + 1) a b
+            | Ok 0 -> compareKeyVectors (i + 1) leftKeys left rightKeys right
             | Ok c -> ret c
 
     /// 等値キーの行をまとめて取り出す（入力はキー昇順）。
@@ -747,15 +762,13 @@ module internal Ops =
         | MergeStart _
         | MergeDone -> ret ([||], side)
         | MergeAt(first, _) ->
-            let groupKey = keyOf first keys
-
             let rec go used acc current =
                 match pullMergeSide current with
                 | Error e -> err e
                 | Ok MergeDone -> ret (List.rev acc |> List.toArray, MergeDone)
                 | Ok(MergeStart _) -> DbError.internalError "merge join: 入力状態が不正です" |> err
                 | Ok(MergeAt(row, _) as next) ->
-                    match compareKeyVectors 0 (keyOf row keys) groupKey with
+                    match compareKeyVectors 0 keys first keys row with
                     | Error e -> err e
                     | Ok 0 ->
                         let used = used + int64 (ValueCodec.managedRowBytes row) + 32L
@@ -796,9 +809,7 @@ module internal Ops =
         =
         let rightWidth = rightSchema.Columns.Length
         let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
-
-        let padded lrow =
-            Array.append lrow (Array.create rightWidth SqlValue.Null)
+        let padded lrow = padWithNulls lrow rightWidth
 
         let rec loop lside rside =
             match lside, rside with
@@ -840,7 +851,7 @@ module internal Ops =
                         | Error e -> err e
                         | Ok rnext -> Op.next (loop lside rnext))
                 else
-                    match compareKeyVectors 0 (keyOf lrow leftKeys) (keyOf rrow rightKeys) with
+                    match compareKeyVectors 0 leftKeys lrow rightKeys rrow with
                     | Error e -> Op.compute (fun () -> err e)
                     | Ok c when c < 0 ->
                         Op.compute (fun () ->

@@ -256,6 +256,20 @@ module internal Scalar =
                     )
         | _ -> err (sprintf "未知のスカラー関数 '%s' です" name |> DbError.name)
 
+/// 評価対象の行。
+/// JOIN の ON 句では左右の行を連結せずに参照する（構造体なのでヒープ割当なし）。
+[<Struct>]
+type private RowView =
+    | Single of SqlValue array
+    | Joined of SqlValue array * SqlValue array
+
+    /// 相関サブクエリの runner へ渡す実際の行。
+    /// JOIN の ON 句で相関サブクエリがある場合だけ連結する（通常は分配なし）。
+    member this.ToArray() =
+        match this with
+        | Single row -> row
+        | Joined(l, r) -> Array.append l r
+
 /// スカラー式の評価器。
 /// 集約を含まない式だけを扱う（集約は Eval に組めない）。
 /// NULL の伝播と 3値論理は SQL 標準に合わせる。
@@ -422,14 +436,20 @@ module internal Eval =
         | _ -> "eq"
 
     /// 行の範囲外アクセスを安全なエラーにする。
-    let private valueAt (row: SqlValue array) (i: int) (e: Expr) =
-        if i < 0 || i >= row.Length then
-            err (
-                sprintf "列インデックス %d が範囲外です（%d 列中）: %s" i row.Length (Expr.toDisplayString e)
-                |> DbError.internalError
-            )
+    let private valueAt (row: RowView) (i: int) (e: Expr) =
+        let length =
+            match row with
+            | Single r -> r.Length
+            | Joined(l, r) -> l.Length + r.Length
+
+        if i < 0 || i >= length then
+            sprintf "列インデックス %d が範囲外です（%d 列中）: %s" i length (Expr.toDisplayString e)
+            |> DbError.internalError
+            |> err
         else
-            ret row.[i]
+            match row with
+            | Single r -> ret r.[i]
+            | Joined(l, r) -> if i < l.Length then ret l.[i] else ret r.[i - l.Length]
 
     /// SqlValue を 3値に変換する。
     /// BOOL はそのまま、NULL と BOOL 以外は UNKNOWN。
@@ -506,7 +526,7 @@ module internal Eval =
     /// 式の深さ・IN の候補数に依存せずスタックは一定（継続はヒープのリストに積む）。
     /// `resolve` は列解決のキャッシュ付き resolver（`Eval.resolver` で作る）。
     [<TailCall>]
-    let rec private step (resolve: ColumnResolver) (row: SqlValue array) (kont: Kont list) (st: Step) =
+    let rec private step (resolve: ColumnResolver) (row: RowView) (kont: Kont list) (st: Step) =
         match st with
         | Descend e ->
             match e with
@@ -516,7 +536,7 @@ module internal Eval =
             | Expr.Exists _
             | Expr.InSubquery _ -> err (DbError.create ErrorKind.SyntaxError "サブクエリはここでは使えません")
             | Expr.CorrelatedSubquery c ->
-                match c.Run row with
+                match c.Run(row.ToArray()) with
                 | Error er -> err er
                 | Ok v -> step resolve row kont (Arrive v)
             | Expr.Column c ->
@@ -731,19 +751,28 @@ module internal Eval =
     /// メモ化済み resolver で式を評価する。
     /// 集約呼び出しはここでエラーになる。
     /// 評価機 step を空の継続スタックで始める（末尾再帰のまま深さ・候補数に依存しない）。
-    let evalWith (resolve: ColumnResolver) (row: SqlValue array) (e: Expr) = step resolve row [] (Descend e)
+    let evalWith (resolve: ColumnResolver) (row: SqlValue array) (e: Expr) =
+        step resolve (Single row) [] (Descend e)
 
     /// 式を評価する（resolver を都度作る簡易版）。
     /// 行ごとに呼ぶホットパスでは `evalWith` に resolver を渡すこと。
     let eval = resolver >> evalWith
 
-    /// WHERE の判定。
-    /// UNKNOWN は偽（SQL 標準）。
-    let matchesWith (resolve: ColumnResolver) (row: SqlValue array) (predicate: Expr) =
-        evalWith resolve row predicate
-        |> Result.map (fun v ->
-            match v with
+    /// 評価結果を WHERE の真偽へ変換する（UNKNOWN は偽）。
+    let private asMatch =
+        Result.map (function
             | SqlValue.Bool b -> b
             | SqlValue.Null -> false
             | SqlValue.Int i -> i <> 0L
             | _ -> false)
+
+    /// WHERE の判定。
+    /// UNKNOWN は偽（SQL 標準）。
+    let matchesWith (resolve: ColumnResolver) (row: SqlValue array) (predicate: Expr) =
+        evalWith resolve row predicate |> asMatch
+
+    /// JOIN の ON 句（および residual）の判定。
+    /// 左右の行を連結せずに、左の列の後ろに右の列が並んでいるものとして評価する。
+    /// resolver は `Schema.concat leftSchema rightSchema` に対応するものを使う。
+    let matchesJoined (resolve: ColumnResolver) (left: SqlValue array) (right: SqlValue array) (predicate: Expr) =
+        step resolve (Joined(left, right)) [] (Descend predicate) |> asMatch

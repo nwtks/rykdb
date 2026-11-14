@@ -13,9 +13,10 @@ src/RykDb.Core/Op.fs|seekMatch|seekMatch|call
 src/RykDb.Core/Op.fs|take|take|call
 src/RykDb.Core/Ops.fs|emitGroups|emitGroups|call
 src/RykDb.Core/Ops.fs|joinRows|joinRows|call
+src/RykDb.Core/Ops.fs|loop/advance|advance|call
+src/RykDb.Core/Ops.fs|loop/advance|loop|call
 src/RykDb.Core/Ops.fs|loop/emitGroup|emitGroup|call
 src/RykDb.Core/Ops.fs|loop/emitGroup|loop|call
-src/RykDb.Core/Ops.fs|loop|loop|call
 src/RykDb.Core/Ops.fs|probe/emit|emit|call
 src/RykDb.Core/Ops.fs|probe/emit|probe|call
 src/RykDb.Core/Ops.fs|skipSeen|skipSeen|call

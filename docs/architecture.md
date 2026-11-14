@@ -682,6 +682,18 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 集約のグルーピングは `SqlValue array` の構造比較（`HashIdentity.Structural`）を使う
 （どちらも「同じ値なら同じキー」。NULL 同士は等しい扱い）。
 
+**JOIN 内側の割当**
+
+- ON 句と residual は `Eval.matchesJoined` で評価する。
+  左右の行を `Array.append` で連結せず、左の列の後ろに右の列が並んでいるものとして列位置を読む。
+  行を連結するのは **出力する行だけ**。
+- LEFT JOIN の NULL 埋めは `Ops.padWithNulls` で 1回の配列確保にまとめる
+  （`Array.create` + `Array.append` の 2回確保をしない）。
+- マージ結合のキー比較は `compareKeyVectors` がキー列の位置から直接比較する
+  （比較のたびにキー配列を作らない）。
+- 入れ子ループは「一致するまで右を進める」ループを 1つの `Op.compute` の中に置く。
+  一致しない候補ごとに `Op.compute` のクロージャを作らない。
+
 ### 5.3 メモリを抑える 3つの手段
 
 | 対象              | 手段                                                                                                                                                             | メモリの上限                                                       |

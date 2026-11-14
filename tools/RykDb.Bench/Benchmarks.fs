@@ -55,6 +55,12 @@ type QueryBenchmarks() =
     let rangeSql = "SELECT COUNT(*) FROM t WHERE id BETWEEN 1000 AND 1999"
     let filterSql = "SELECT COUNT(*) FROM t WHERE a < 50"
     let joinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id"
+    let mergeJoinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id"
+
+    let residualJoinSql =
+        "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id AND a.v + b.v > 190"
+    // 結果は 0行。ON 句だけを 200 × 20,000回評価する（出力行の割当を除く）。
+    let nestedLoopSql = "SELECT COUNT(*) FROM c JOIN b ON c.v = b.v + 1000"
 
     let insertSql =
         let values = [ for i in 0..99 -> sprintf "(%d, 'payload')" i ] |> String.concat ", "
@@ -84,10 +90,10 @@ type QueryBenchmarks() =
 
         // 10万行。a は 0..999 を繰り返し、b は 48文字程度の TEXT。
         this.Seed("t", 10_000, 99_999, fun i -> sprintf "(%d, %d, '%s')" i (i % 1000) (BenchText.ofInt i))
-        // 3テーブル JOIN 用に 2万行ずつ。c は 20行。
+        // JOIN 用に 2万行ずつ。c は 200行（非等値の入れ子ループを 400万回にする）。
         this.Seed("a", 5_000, 19_999, fun i -> sprintf "(%d, %d)" i (i % 100))
         this.Seed("b", 5_000, 19_999, fun i -> sprintf "(%d, %d)" i (i % 100))
-        this.Seed("c", 20, 19, fun i -> sprintf "(%d, %d)" i i)
+        this.Seed("c", 200, 199, fun i -> sprintf "(%d, %d)" i i)
 
         // memtable を SSTable へ flush し、ディスク走査を測れる状態にする。
         session.Close() |> Check.ok |> ignore
@@ -122,9 +128,21 @@ type QueryBenchmarks() =
     [<Benchmark>]
     member this.FilterSeqScan() = this.Exec filterSql
 
-    /// 3 テーブル JOIN（主キー同士の等値結合）。
+    /// 3テーブル JOIN（主キー同士の等値結合）。
     [<Benchmark>]
     member this.Join3Tables() = this.Exec joinSql
+
+    /// 2テーブルの等値結合（主キー順の走査なのでマージ結合になる）。
+    [<Benchmark>]
+    member this.MergeJoin2Tables() = this.Exec mergeJoinSql
+
+    /// 等値キー + residual の結合（左右の行を連結せずに ON を評価する経路）。
+    [<Benchmark>]
+    member this.JoinWithResidual() = this.Exec residualJoinSql
+
+    /// 非等値の入れ子ループ（結果 0行）。ON 句の評価だけを測る。
+    [<Benchmark>]
+    member this.NestedLoopNoMatch() = this.Exec nestedLoopSql
 
     /// 100行の INSERT + ROLLBACK（parse / plan / 制約検査 / transaction バッファ）。
     [<Benchmark>]
