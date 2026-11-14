@@ -828,6 +828,17 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
 - 空マスクの行を `[||]` にせず、スキーマ幅で埋める
   （`ORDER BY 1` などが行の幅を前提にするため）。
 - overlay（transaction の書き込み）は主キーを、索引スキャンは索引列 + 主キーをマスクに足す。
+- 点検索も `Sstable.lookupMasked` でマスク復号する。
+  `lookupCached` は値スライスをコピーせず `SstEntry.decodeMaskedValueAt` に渡す。
+- 制約検査の存在確認（`DmlOps.checkUnique`）は全列 false のマスク、
+  UNIQUE 索引の重複検査は主キー列だけのマスクを使う。
+- `RowStore.scan` は全列。キーだけなら `scanKeys`、索引列だけなら `scanAtRawMasked` を使う。
+  Catalog の読み込みは値が必要で全列、keyspace の削除は `scanKeys`、
+  CREATE INDEX の重複検査は `scanAtRawMasked` + 索引列マスク。
+- DML の本体スキャンは `DELETE` が WHERE 参照列 + 主キー + 全索引列のマスク、
+  `UPDATE` は未変更列も含む新しい行を書き戻すため全列。
+- 最終結果の境界（`Engine.runSelect`）と `RowReader.TryRead` は
+  `SqlValue.ensureLoaded` で `Unloaded` の漏洩を `InternalError` にする。
 - `Ops.project` は必要な出力項目だけを評価するのではなく **すべての出力式** を評価する。
   そのため Project は使わない項目の参照列も要求する（Derived の内側も同じ）。
 

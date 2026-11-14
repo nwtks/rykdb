@@ -79,7 +79,7 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
             }
 
         member _.WalState = None
-        member _.GetAt _ _ = ret None
+        member _.GetAtMasked _ _ _ = ret None
         member _.ScanAtValues _ _ _ _ = ret SstScan.Empty
         member _.ScanAtMasked _ _ _ _ = ret SstScan.Empty
         member this.WriteBatch _ = ret (this :> IStorageEngine)
@@ -190,8 +190,8 @@ let ``RowStore: compaction 失敗後も flush 結果を保持し、再起動で 
         let reopened = ok (StorageEngine.openDatabaseWith None dir)
         let key5 = Keyspace.prefixedKey "t" (intKey 5)
         let key6 = Keyspace.prefixedKey "t" (intKey 6)
-        Assert.True((ok (StorageEngine.getAt None key5 reopened)).IsSome)
-        Assert.True((ok (StorageEngine.getAt None key6 reopened)).IsSome))
+        Assert.True((ok (StorageEngine.getAtMasked None key5 [||] reopened)).IsSome)
+        Assert.True((ok (StorageEngine.getAtMasked None key6 [||] reopened)).IsSome))
 
 [<Fact>]
 let ``RowStore: compaction 失敗で中断した走査は入力 SSTable のハンドルを残さない`` () =
@@ -279,6 +279,34 @@ let ``RowStore: keyspace は 1 本の LSM の接頭辞で分離される`` () =
         ok (RowStore.close store))
 
 [<Fact>]
+let ``RowStore.scanKeys: 値を復号せずキーだけ返す`` () =
+    withDir "rs-scan-keys" (fun dir ->
+        let store = RowStore.openStore dir |> ok
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+        let row = rowOf 1 "a@x.com" 1
+
+        let txn =
+            Dml.insertWithKey (RowKey.primary usersWithEmailIndex row) txn usersWithEmailIndex row
+            |> ok
+
+        let store = commitInto store 1UL txn
+
+        let rows =
+            ok (RowStore.scanKeys (Keyspace.table "users") [||] 0 store)
+            |> SstScan.toArray
+            |> ok
+
+        Assert.Single rows |> ignore
+        Assert.Equal<byte array>(intKey 1, rows.[0].Key)
+
+        match rows.[0].Value with
+        | Some values -> Assert.Empty values
+        | None -> failwith "scanKeys が tombstone を返しました"
+
+        ok (RowStore.close store))
+
+[<Fact>]
 let ``RowStore: format マーカーがプロセス間ロックを兼ねる`` () =
     withDir "rs-format-lock" (fun dir ->
         let formatPath = System.IO.Path.Combine(dir, ".rykdb.format")
@@ -358,8 +386,8 @@ let ``RowStore: 複数 keyspace の書き込みは 1 回の WAL バッチで回�
 
         // close せずに開き直す（WAL だけが残ったクラッシュ状態）。
         let reopened = ok (RowStore.openStoreTakingOver dir)
-        Assert.Equal(Some(intRow 1), ok (RowStore.getAt "t:a" (intKey 1) None reopened))
-        Assert.Equal(Some(intRow 2), ok (RowStore.getAt "t:b" (intKey 2) None reopened))
+        Assert.Equal(Some(intRow 1), ok (RowStore.getAtMasked "t:a" (intKey 1) None [| true |] reopened))
+        Assert.Equal(Some(intRow 2), ok (RowStore.getAtMasked "t:b" (intKey 2) None [| true |] reopened))
 
         ok (RowStore.close reopened)
         ok (RowStore.close store))

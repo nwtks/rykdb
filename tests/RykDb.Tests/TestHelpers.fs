@@ -100,9 +100,11 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
 
         member _.WalState = None
 
-        member _.GetAt visible key =
+        member _.GetAtMasked visible key mask =
             Memtable.getVisible key visible state.Mem
-            |> Option.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+            |> Option.map (fun e ->
+                let value = e.Value |> Option.map (SqlValue.maskRow mask)
+                SstEntry.make e.Key e.SeqNo value)
             |> ret
 
         member _.ScanAtValues visible startKey limit needsValues =

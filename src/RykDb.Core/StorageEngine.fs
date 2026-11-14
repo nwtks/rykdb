@@ -138,12 +138,8 @@ module internal StorageEngine =
         openPartialSstIn dir f
         >>= fun partial -> ret (Sstable.rangeScanPartialRaw [||] 0 partial)
 
-    /// ポイントルックアップ。
-    /// memtable -> L0 -> 各レベルの順に見る。
-    /// visible が Some s のときは SeqNo が s 以下の最新版を返す。
-    /// これが MVCC の可視性。
-    /// None なら制限なし。
-    let getAt (visible: uint64 option) (key: byte array) (engine: StorageEngine) =
+    /// 列マスク付きのポイントルックアップ。
+    let getAtMasked (visible: uint64 option) (key: byte array) (mask: bool array) (engine: StorageEngine) =
         let rec probe files =
             match files with
             | [] -> ret None
@@ -151,13 +147,15 @@ module internal StorageEngine =
                 match openPartialSst f engine with
                 | Error e -> err e
                 | Ok partial ->
-                    match Sstable.lookup key visible partial with
+                    match Sstable.lookupMasked mask key visible partial with
                     | Error e -> err e
                     | Ok(Some e) -> ret (Some e)
                     | Ok None -> probe rest
 
         match Memtable.getVisible key visible engine.Mem with
-        | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
+        | Some e ->
+            let value = e.Value |> Option.map (SqlValue.maskRow mask)
+            ret (Some(SstEntry.make e.Key e.SeqNo value))
         | None -> Version.filesForPointLookup key engine.Version |> probe
 
     /// 遅延走査の状態。
@@ -289,7 +287,13 @@ module internal StorageEngine =
 
         let memSeq =
             Memtable.rangeScan startKey 0 engine.Mem
-            |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+            |> Seq.map (fun e ->
+                let value =
+                    match maskOpt with
+                    | None -> e.Value
+                    | Some mask -> e.Value |> Option.map (SqlValue.maskRow mask)
+
+                SstEntry.make e.Key e.SeqNo value)
 
         match SstScan.next (seqToScan memSeq) with
         | Error e -> err e
@@ -687,7 +691,10 @@ type internal IStorageEngine =
     abstract HostState: HostState
     /// 現在の WAL 位置。メモリエンジンは None。
     abstract WalState: WalState option
-    abstract GetAt: visible: uint64 option -> key: byte array -> Result<SstEntry option, DbError>
+
+    /// 列マスクに従って必要な列だけ復号して 1行を引く。
+    abstract GetAtMasked:
+        visible: uint64 option -> key: byte array -> mask: bool array -> Result<SstEntry option, DbError>
 
     /// 行の値が必要ないときは `needsValues = false`（値を作らず空の行を返す）。
     abstract ScanAtValues:
@@ -726,7 +733,8 @@ type internal DiskStorageEngine(engine: StorageEngine) =
 
         member _.WalState = Some engine.Wal
 
-        member _.GetAt visible key = StorageEngine.getAt visible key engine
+        member _.GetAtMasked visible key mask =
+            StorageEngine.getAtMasked visible key mask engine
 
         member _.ScanAtValues visible startKey limit needsValues =
             StorageEngine.scanAtValues visible limit startKey needsValues engine

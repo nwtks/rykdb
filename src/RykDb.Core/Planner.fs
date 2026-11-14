@@ -959,7 +959,7 @@ module internal Optimizer =
 
                 match method with
                 | ScanMethod.SeqScan -> ExecContext.tableMasked ctx name limit mask
-                | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
+                | ScanMethod.PkLookup values -> ExecContext.byPrimaryKeyMasked ctx name values mask
                 | ScanMethod.IndexLookup(indexName, values) ->
                     ExecContext.byIndexMasked ctx name indexName values limit mask
                 | ScanMethod.RangeScan(_, startKey, endKey) ->
@@ -996,8 +996,16 @@ module internal Optimizer =
                 | JoinAlgorithm.IndexNestedLoop indexName -> indexName
                 | _ -> ""
 
+            let rightMask =
+                match frame.Right with
+                | Logical.Scan _ as scan ->
+                    match ctx.ScanNeeds.TryGetValue(box scan) with
+                    | true, mask -> mask
+                    | _ -> Array.create frame.RightSchema.Columns.Length true
+                | _ -> Array.create frame.RightSchema.Columns.Length true
+
             let lookup keyValues =
-                ExecContext.byIndexValues ctx frame.RightName indexName keyValues 0 true
+                ExecContext.byIndexMasked ctx frame.RightName indexName keyValues 0 rightMask
 
             match frame.Kind with
             | JoinKind.Inner ->

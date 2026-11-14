@@ -2513,13 +2513,32 @@ type private Step =
   `compareValues` は内部エラー、`ValueCodec` の書き込みは `invalidOp` になる。
 - `Dml.opOfScan` は空の行を `Unloaded` でパディングする。
   `NULL` で埋めない（誤って読んだときに静かに NULL 扱いにならないようにするため）。
+- 最終結果の境界（`Engine.runSelect`）と `RowReader.TryRead` は
+  `SqlValue.ensureLoaded` で `Unloaded` を検査する。
+  ここに来る前に `InternalError` になるのが正しく、出力の `invalidOp` まで持ち越してはいけない。
+- 点検索は `Sstable.lookupMasked` / `GetAtMasked` / `getByPrimaryKeyWithTxnMask` を使う。
+  transaction slot の行にも `SqlValue.maskRow` を適用する。
+- 存在確認だけなら全列 false マスクを使う（例: `DmlOps.checkUnique` の主キー重複）。
+  UNIQUE 索引の重複検査は主キー列だけを復号する。
+  行の値が必要ないのに `getByPrimaryKeyBytesWithTxn` で全列を復号しない。
+- `RowStore.scan` は全列のまま（Catalog のように値が必要な用途）。
+  キーだけなら `scanKeys`、索引列だけなら `scanAtRawMasked` を使う。
+  keyspace 削除は `scanKeys`、CREATE INDEX の重複検査は索引列マスク。
+  memtable 行にも `StorageEngine.scanAtWith` で `maskRow` を適用する
+  （ファイルだけスキップして memtable が全列のままにならないようにする）。
+- DML の本体スキャン:
+  - `DELETE` は **WHERE 参照列 + 主キー + 全索引列** のマスクで足りる。
+  - `UPDATE` は未変更列も含む新しい行を書き戻すため **全列** が必要。
+    `UPDATE` の UNIQUE 検査スキャンは主キー列だけで足りる。
 - `Optimizer.scanNeedsMasks` の解析が前提。
   `Ops.project` は使わない項目も評価するので、Project は全出力式の参照列を要求する。
   派生テーブルの内側も同じ。
 - overlay（書き込み中）は主キー、索引スキャンは索引列 + 主キーをマスクに足す。
 - 回帰テスト: `SSTable: 列マスクで必要な列だけ復号する`、
+  `SSTable: lookupMasked は必要な列だけ復号する`、
+  `SqlValue.ensureLoaded: Unloaded は結果境界でエラー`、
   `Database: 値を使わない射影・集約は空の行でも件数を返す`
-  （部分列・索引・transaction overlay・DISTINCT・ORDER BY・GROUP BY・派生テーブルを含む）。
+  （部分列・点検索・索引・transaction overlay・DISTINCT・ORDER BY・GROUP BY・派生テーブルを含む）。
 - 計測（10万行）: `CountStar` 約 381MB → **316MB**、
   `SelectConstant` **331MB**、`CountConstantWhere` **351MB**、
   部分列の `FilterSeqScan` 約 388MB → **363MB**。

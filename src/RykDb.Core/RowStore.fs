@@ -206,11 +206,11 @@ module internal RowStore =
                 return next, manager
             })
 
-    /// keyspace から読む（SeqNo 制限つき）。
-    let getAt (keyspace: string) (key: byte array) (visible: uint64 option) (store: RowStore) =
+    /// keyspace から列マスク付きで読む（SeqNo 制限つき）。
+    let getAtMasked (keyspace: string) (key: byte array) (visible: uint64 option) (mask: bool array) (store: RowStore) =
         result {
             let! e = ensure store
-            let! sst = e.GetAt visible (Keyspace.prefixedKey keyspace key)
+            let! sst = e.GetAtMasked visible (Keyspace.prefixedKey keyspace key) mask
             return Option.bind _.Value sst
         }
 
@@ -290,9 +290,15 @@ module internal RowStore =
             return scanWithinPrefix prefix scoped
         }
 
-    /// keyspace を走査する（制限なし）。
+    /// keyspace を走査する（制限なし・全列）。
     let scan (keyspace: string) (startKey: byte array) (limit: int) (store: RowStore) =
         scanAtRawValues keyspace startKey limit None None true store
+        |> Result.map (SstScan.filter (fun e -> e.Value.IsSome))
+
+    /// keyspace をキーだけ走査する（値は復号しない）。
+    /// 削除・後始末など、キーしか使わない処理向け。
+    let scanKeys (keyspace: string) (startKey: byte array) (limit: int) (store: RowStore) =
+        scanAtRawMasked keyspace startKey limit None None [||] store
         |> Result.map (SstScan.filter (fun e -> e.Value.IsSome))
 
     /// keyspace の全エントリをチャンク単位で tombstone 消去する。
@@ -310,7 +316,7 @@ module internal RowStore =
                 | Ok(Some(e, rest)) -> takeKeys (n - 1) (e.Key :: acc) rest
 
         let rec loop (currentStore, currentMgr) startKey =
-            match scan space startKey 0 currentStore with
+            match scanKeys space startKey 0 currentStore with
             | Error e -> err e
             | Ok stale ->
                 match takeKeys ClearChunkEntries [] stale with

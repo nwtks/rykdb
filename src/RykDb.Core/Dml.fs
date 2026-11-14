@@ -200,21 +200,29 @@ module internal Dml =
 
         emit scan
 
-    /// 符号化済みの主キーで既存行を取り出す（txn の書き込みを含む）。
-    let getByPrimaryKeyBytesWithTxn
+    /// 符号化済みの主キーで既存行を列マスク付きで取り出す。
+    let getByPrimaryKeyBytesWithTxnMask
         (store: RowStore)
         (schema: TableSchema)
         (key: byte array)
         (visible: uint64 option)
         (txn: Transaction)
+        (mask: bool array)
         =
         match Transaction.tryFind (tableSpace schema) key txn with
-        | Some slot -> ret slot
-        | None -> RowStore.getAt (tableSpace schema) key visible store
+        | Some slot -> ret (slot |> Option.map (SqlValue.maskRow mask))
+        | None -> RowStore.getAtMasked (tableSpace schema) key visible mask store
 
-    /// 主キーで既存行を取り出す（txn の書き込みを含む）。
-    let getByPrimaryKeyWithTxn (store: RowStore) (schema: TableSchema) (key: SqlValue array) =
-        getByPrimaryKeyBytesWithTxn store schema (KeyBuilder.ofValues key)
+    /// 主キーで既存行を列マスク付きで取り出す。
+    let getByPrimaryKeyWithTxnMask
+        (store: RowStore)
+        (schema: TableSchema)
+        (key: SqlValue array)
+        (visible: uint64 option)
+        (txn: Transaction)
+        (mask: bool array)
+        =
+        getByPrimaryKeyBytesWithTxnMask store schema (KeyBuilder.ofValues key) visible txn mask
 
     /// 主キーで prefix 走査する（キー昇順）。
     /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
@@ -288,7 +296,6 @@ module internal Dml =
             Transaction.slotsOf (tableSpace schema) txn
             |> List.filter (fun (key, _) -> inKeyRange startBytes endBytes key)
 
-        // endKey の最終フィルタと overlay は主キーを読む。
         let mask =
             if endBytes.IsNone && List.isEmpty slots then
                 mask
@@ -333,7 +340,6 @@ module internal Dml =
             Transaction.slotsOf (indexSpace index) txn
             |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
 
-        // overlay は索引キーと主キーを読む。
         let mask =
             if List.isEmpty slots then
                 mask
@@ -352,19 +358,6 @@ module internal Dml =
         |> Result.map (fun rows ->
             let overlaid = overlayRows (RowKey.indexKey schema index) slots rows
             if limit > 0 then Op.take limit overlaid else overlaid)
-
-    /// 索引の値に一致する全行を引く（txn の書き込みを含む・bool 互換）。
-    let scanByIndexPrefixWithTxnValues store schema index values limit visible scope txn needsValues =
-        scanByIndexPrefixWithTxnMask
-            store
-            schema
-            index
-            values
-            limit
-            visible
-            scope
-            txn
-            (Array.create schema.Columns.Length needsValues)
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`。

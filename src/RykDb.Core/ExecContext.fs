@@ -99,36 +99,6 @@ module internal ExecContext =
                     mask
         }
 
-    /// 索引で一致する全行を引く（遅延の `Op`）。
-    /// 索引は一意とは限らないので、`WHERE indexed_col = v` が 1行になるとは限らない。
-    /// `v` を持つ行をすべて返す。
-    let byIndexValues
-        (ctx: ExecContext)
-        (table: string)
-        (indexName: string)
-        (keyValues: SqlValue array)
-        (limit: int)
-        (needsValues: bool)
-        =
-        result {
-            let! schema = schemaOf table ctx
-
-            match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
-            | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
-            | Some idx ->
-                return!
-                    Dml.scanByIndexPrefixWithTxnValues
-                        ctx.Store
-                        schema
-                        idx
-                        keyValues
-                        limit
-                        ctx.Visible
-                        (Some ctx.Scope)
-                        ctx.Txn
-                        needsValues
-        }
-
     /// 索引で一致する全行を引く（列マスク付き）。
     let byIndexMasked
         (ctx: ExecContext)
@@ -187,11 +157,13 @@ module internal ExecContext =
                         mask
         }
 
-    /// 主キーで 1行を引く。
-    let byPrimaryKey (ctx: ExecContext) (table: string) (key: SqlValue array) =
+    /// 主キーで 1行を列マスク付きで引く。
+    let byPrimaryKeyMasked (ctx: ExecContext) (table: string) (key: SqlValue array) (mask: bool array) =
         result {
             let! schema = schemaOf table ctx
-            let! row = Dml.getByPrimaryKeyWithTxn ctx.Store schema key ctx.Visible ctx.Txn
+
+            let! row =
+                Dml.getByPrimaryKeyWithTxnMask ctx.Store schema key ctx.Visible ctx.Txn mask
 
             match row with
             | None -> return Op.Empty
@@ -311,6 +283,11 @@ module internal DmlOps =
 
     /// 主キーと UNIQUE 索引の重複を検査し、確定した主キーのバイト列を返す。
     let private checkUnique (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
+        let existsMask = Array.create schema.Columns.Length false
+
+        let pkMask =
+            Array.init schema.Columns.Length (fun i -> List.contains i schema.PrimaryKey)
+
         let rec check pk pkBytes =
             function
             | [] -> ret pkBytes
@@ -320,7 +297,7 @@ module internal DmlOps =
                 | Ok values when values |> Array.exists SqlValue.isNull -> check pk pkBytes rest
                 | Ok values ->
                     match
-                        Dml.scanByIndexPrefixWithTxnValues
+                        Dml.scanByIndexPrefixWithTxnMask
                             ctx.Store
                             schema
                             idx
@@ -329,7 +306,7 @@ module internal DmlOps =
                             ctx.Visible
                             (Some ctx.Scope)
                             txn
-                            true
+                            pkMask
                     with
                     | Error e -> err e
                     | Ok scan ->
@@ -349,7 +326,7 @@ module internal DmlOps =
         let pk = TableSchema.primaryKeyOf schema row
         let pkBytes = KeyBuilder.ofValues pk
 
-        match Dml.getByPrimaryKeyBytesWithTxn ctx.Store schema pkBytes ctx.Visible txn with
+        match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes ctx.Visible txn existsMask with
         | Error e -> err e
         | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
         | Ok None -> check pk pkBytes (schema.Indexes |> List.filter _.Unique)
@@ -494,10 +471,13 @@ module internal DmlOps =
                 |> List.map (fun (_, newRow) -> TableSchema.primaryKeyOf schema newRow)
                 |> Set.ofList
 
+            let pkMask =
+                Array.init schema.Columns.Length (fun i -> List.contains i schema.PrimaryKey)
+
             let checkExisting idx seen key values =
                 result {
                     let! scan =
-                        Dml.scanByIndexPrefixWithTxnValues
+                        Dml.scanByIndexPrefixWithTxnMask
                             ctx.Store
                             schema
                             idx
@@ -506,7 +486,7 @@ module internal DmlOps =
                             ctx.Visible
                             (Some ctx.Scope)
                             txn
-                            true
+                            pkMask
 
                     let! rows = Op.toArray scan
 
@@ -570,6 +550,57 @@ module internal DmlOps =
     /// DELETE。
     /// WHERE に合う行を主キー + 全索引に tombstone で消す。
     let delete (ctx: ExecContext) (schema: TableSchema) (where: Expr option) =
+        let targetSchema = targetSchemaOf schema
+        let resolve = Eval.resolver targetSchema
+
+        let deleteMask =
+            let width = schema.Columns.Length
+            let allColumns = Array.create width true
+            let mask = Array.create width false
+
+            for i in schema.PrimaryKey do
+                if i >= 0 && i < width then
+                    mask.[i] <- true
+
+            for idx in schema.Indexes do
+                for name in idx.Columns do
+                    match TableSchema.indexOf schema name with
+                    | Some i when i >= 0 && i < width -> mask.[i] <- true
+                    | _ -> ()
+
+            match where with
+            | None -> mask
+            | Some w when Expr.hasAnySubquery w -> allColumns
+            | Some w ->
+                let refs =
+                    Expr.fold
+                        (fun acc x ->
+                            match x with
+                            | Expr.Column c -> c :: acc
+                            | Expr.Name n -> { Qualifier = None; Name = n } :: acc
+                            | _ -> acc)
+                        []
+                        w
+
+                let resolved =
+                    refs
+                    |> List.map (fun r ->
+                        match Schema.resolve targetSchema r with
+                        | Ok i -> Some i
+                        | Error _ ->
+                            match Schema.resolve targetSchema { Qualifier = None; Name = r.Name } with
+                            | Ok i -> Some i
+                            | Error _ -> None)
+
+                if List.exists Option.isNone resolved then
+                    allColumns
+                else
+                    for i in resolved |> List.choose id do
+                        if i >= 0 && i < width then
+                            mask.[i] <- true
+
+                    mask
+
         let foldRows ctx schema matched onRow =
             let rec go t c cur =
                 match Op.next cur with
@@ -586,13 +617,10 @@ module internal DmlOps =
 
             result {
                 let! scan =
-                    Dml.scanByPrimaryKeyWithTxnValues ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn true
+                    Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn deleteMask
 
                 return! go ctx.Txn 0 scan
             }
-
-        let targetSchema = targetSchemaOf schema
-        let resolve = Eval.resolver targetSchema
 
         foldRows ctx schema (fun row -> matchesWhere resolve row where) (fun t count row ->
             Dml.deleteRow t schema row |> Result.map (fun t2 -> t2, count + 1))

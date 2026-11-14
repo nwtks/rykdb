@@ -23,6 +23,15 @@ let ``TruthValue: AND/OR`` () =
     Assert.Equal(TruthValue.False, TruthValue.or2 TruthValue.False TruthValue.False)
 
 [<Fact>]
+let ``SqlValue.ensureLoaded: Unloaded は結果境界でエラー`` () =
+    Assert.Equal<SqlValue array>([| SqlValue.Int 1L |], ok (SqlValue.ensureLoaded [| SqlValue.Int 1L |]))
+
+    expectErrorKind
+        ErrorKind.InternalError
+        "Unloaded が結果に漏れている"
+        (SqlValue.ensureLoaded [| SqlValue.Int 1L; SqlValue.Unloaded |])
+
+[<Fact>]
 let ``DataType: 型タグの往復と未知タグの扱い`` () =
     let all =
         [

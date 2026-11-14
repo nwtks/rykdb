@@ -123,46 +123,6 @@ let ``ExecContext.schemaOf: 未登録は NameError`` () =
         | Ok _ -> Assert.Fail "NameError になるべき")
 
 [<Fact>]
-let ``ExecContext.byIndexValues: 空の store は空の Op`` () =
-    withStore "ec-byindex-empty" (fun store ->
-        let c0 = ExecContext.create store None
-        let c1 = ExecContext.withSchema "people" TestHelpers.peopleSchema c0
-
-        let op =
-            ok (ExecContext.byIndexValues c1 "people" "ix_people_age" [| SqlValue.Int 1L |] 0 true)
-
-        let rows = ok (Op.toArray op)
-        Assert.Equal(0, rows.Length))
-
-[<Fact>]
-let ``ExecContext.byIndexValues: 未登録テーブルは NameError`` () =
-    withStore "ec-byindex-miss-table" (fun store ->
-        let c0 = ExecContext.create store None
-
-        match ExecContext.byIndexValues c0 "nope" "ix" [| SqlValue.Int 1L |] 0 true with
-        | Error e -> Assert.Equal(ErrorKind.NameError, e.Kind)
-        | Ok _ -> Assert.Fail "NameError になるべき")
-
-[<Fact>]
-let ``ExecContext.byIndexValues: 未登録索引は NameError`` () =
-    withStore "ec-byindex-miss-idx" (fun store ->
-        let c0 = ExecContext.create store None
-        let c1 = ExecContext.withSchema "people" peopleSchema c0
-
-        match ExecContext.byIndexValues c1 "people" "nope" [| SqlValue.Int 1L |] 0 true with
-        | Error e -> Assert.Equal(ErrorKind.NameError, e.Kind)
-        | Ok _ -> Assert.Fail "NameError になるべき")
-
-[<Fact>]
-let ``ExecContext.byPrimaryKey: 存在しない行は empty`` () =
-    withStore "ec-bypk" (fun store ->
-        let c0 = ExecContext.create store None
-        let c1 = ExecContext.withSchema "people" peopleSchema c0
-        let op = ok (ExecContext.byPrimaryKey c1 "people" [| SqlValue.Int 99L |])
-        let rows = ok (Op.toArray op)
-        Assert.Equal(0, rows.Length))
-
-[<Fact>]
 let ``DmlOps.insert: INSERT は行を追加する`` () =
     withStore "ins" (fun store ->
         let mgr = TransactionManager.create ()

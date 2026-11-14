@@ -52,7 +52,7 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
         member _.ActiveSnapshot = inner.ActiveSnapshot
         member _.HostState = inner.HostState
         member _.WalState = inner.WalState
-        member _.GetAt visible key = inner.GetAt visible key
+        member _.GetAtMasked visible key mask = inner.GetAtMasked visible key mask
 
         member _.ScanAtValues visible startKey limit needsValues =
             gates.ScanEntered.Set()

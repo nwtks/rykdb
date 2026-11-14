@@ -887,7 +887,8 @@ module internal Sstable =
                 | Error e -> err e
                 | Ok slice -> loop payloadLen [||] [] [] [] [] slice
 
-    let private lookupCached
+    let private lookupCachedWith
+        (maskOpt: bool array option)
         (block: CachedSstBlock)
         (key: byte array)
         (visible: uint64 option)
@@ -919,18 +920,35 @@ module internal Sstable =
                     if not isVisible then
                         findVisible (i + 1)
                     else
-                        let valueBytes = Array.sub block.Raw block.ValueOffsets.[i] block.ValueLengths.[i]
+                        let offset = block.ValueOffsets.[i]
+                        let length = block.ValueLengths.[i]
 
-                        match SstEntry.decodeValue valueBytes with
-                        | Error e -> err e
-                        | Ok(seqNo, value) -> ret (Some(SstEntry.make block.Keys.[i] seqNo value))
+                        match maskOpt with
+                        | None ->
+                            let valueBytes = Array.sub block.Raw offset length
+
+                            match SstEntry.decodeValue valueBytes with
+                            | Error e -> err e
+                            | Ok(seqNo, value) -> ret (Some(SstEntry.make block.Keys.[i] seqNo value))
+                        | Some mask ->
+                            match Cursor.createSlice block.Raw offset length with
+                            | Error e -> err e
+                            | Ok c ->
+                                match SstEntry.decodeMaskedValueAt mask c length with
+                                | Error e -> err e
+                                | Ok(seqNo, value, _) -> ret (Some(SstEntry.make block.Keys.[i] seqNo value))
 
             findVisible (lowerBound 0 block.Keys.Length)
 
     /// 部分読みで 1キーを検索する。
     /// 同一キーの複数版は SeqNo 降順で並ぶので、最初の可視版を返す。
     /// 可視版がブロック末尾まで無い場合は、次のブロックに古い版が続く可能性があるため読み進める。
-    let lookup (key: byte array) (visible: uint64 option) (partial: SstPartial) =
+    let private lookupWith
+        (maskOpt: bool array option)
+        (key: byte array)
+        (visible: uint64 option)
+        (partial: SstPartial)
+        =
         let mayContainPartial key partial =
             match partial.Bloom with
             | None -> true
@@ -957,7 +975,7 @@ module internal Sstable =
 
         let lookupEntry indexEntry =
             match tryGetCachedBlock partial indexEntry with
-            | Some block -> lookupCached block key visible indexEntry
+            | Some block -> lookupCachedWith maskOpt block key visible indexEntry
             | None ->
                 match readBlock indexEntry with
                 | Error e -> err e
@@ -966,7 +984,7 @@ module internal Sstable =
                     | Error e -> err e
                     | Ok block ->
                         putCachedBlock partial indexEntry block
-                        lookupCached block key visible indexEntry
+                        lookupCachedWith maskOpt block key visible indexEntry
 
         let rec find i =
             if i >= partial.Index.Length then
@@ -987,3 +1005,7 @@ module internal Sstable =
             ret None
         else
             find (search 0 partial.Index.Length)
+
+    /// 列マスクに従って必要な列だけ復号して 1キーを検索する。
+    let lookupMasked mask key visible partial =
+        lookupWith (Some mask) key visible partial

@@ -189,7 +189,7 @@ module internal Ddl =
     /// </remarks>
     let private clearSpaceChunksResult (state: DbState) (space: string) =
         let rec loop st startKey =
-            match RowStore.scan space startKey 0 st.Store with
+            match RowStore.scanKeys space startKey 0 st.Store with
             | Error e -> err e
             | Ok scan ->
                 match takeScanChunk BackfillChunkRows scan with
@@ -325,7 +325,9 @@ module internal Ddl =
             |> List.map (TableSchema.requireIndexOf schema)
             |> all
             >>= fun pos ->
-                RowStore.scan (Keyspace.index idx.Name) [||] 0 store
+                let mask = Array.init schema.Columns.Length (fun i -> List.contains i pos)
+
+                RowStore.scanAtRawMasked (Keyspace.index idx.Name) [||] 0 None None mask store
                 >>= fun scan -> checkEntries pos idx scan
 
         let clearSpaceChunks state space =
@@ -489,13 +491,16 @@ module internal Engine =
                 Plan.runSelect ctx stmt
                 >>= fun (columns, op) ->
                     Op.toArrayLimited limits.MaxRows limits.MaxBytes op
-                    |> Result.map (fun rows ->
-                        state,
-                        {
-                            RowsAffected = rows.Length
-                            Columns = columns
-                            Rows = rows |> Array.map SqlValue.copyRow
-                        })
+                    >>= (Array.map SqlValue.ensureLoaded
+                         >> Array.toList
+                         >> all
+                         >> Result.map (fun checkedRows ->
+                             state,
+                             {
+                                 RowsAffected = checkedRows.Length
+                                 Columns = columns
+                                 Rows = checkedRows |> List.toArray |> Array.map SqlValue.copyRow
+                             }))
             finally
                 ctx.Scope.DisposeAll()
 

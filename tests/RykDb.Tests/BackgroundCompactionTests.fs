@@ -66,7 +66,7 @@ let ``background compaction: flush 後に L0 が background で compaction さ�
             Assert.True((Version.filesAt 1 state.Version).Length > 0)
 
             let refreshed = refresh current
-            Assert.True((ok (RowStore.getAt "t" (intKey 1) None refreshed)).IsSome)
+            Assert.True((ok (RowStore.getAtMasked "t" (intKey 1) None [||] refreshed)).IsSome)
         finally
             RowStore.close store |> ignore)
 
@@ -165,7 +165,7 @@ let ``background compaction: install 後に再オープンしても行が残る`
             let refreshed = refresh reopened
 
             for i in 1..4 do
-                Assert.True((ok (RowStore.getAt "t" (intKey i) None refreshed)).IsSome)
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] refreshed)).IsSome)
 
             ok (RowStore.close reopened) |> ignore
         finally
@@ -197,7 +197,7 @@ let ``background compaction: close は進行中の compaction を停止して再
             Assert.True(closing.Wait 10000, "close が完了しません")
 
             let reopened = ok (RowStore.openStore dir)
-            Assert.True((ok (RowStore.getAt "t" (intKey 1) None reopened)).IsSome)
+            Assert.True((ok (RowStore.getAtMasked "t" (intKey 1) None [||] reopened)).IsSome)
             ok (RowStore.close reopened) |> ignore
         finally
             release.Set()
@@ -291,7 +291,7 @@ let ``background compaction: 開始後に古い snapshot が現れたら境界�
             let refreshed = refresh current
 
             for i in 1..4 do
-                Assert.True((ok (RowStore.getAt "t" (intKey i) None refreshed)).IsSome)
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] refreshed)).IsSome)
 
             ActiveSnapshotRegistry.unregister dir registration
         finally
@@ -322,7 +322,7 @@ let ``background compaction: Close しなくても install 済みの行は再オ
             let reopened = ok (RowStore.openStoreTakingOver dir)
 
             for i in 1..10 do
-                Assert.True((ok (RowStore.getAt "t" (intKey i) None reopened)).IsSome)
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] reopened)).IsSome)
 
             ok (RowStore.close reopened) |> ignore
         finally
@@ -358,7 +358,7 @@ let ``background compaction: flush と install が競合してもファイル番
             let refreshed = refresh current
 
             for i in 1..60 do
-                Assert.True((ok (RowStore.getAt "t" (intKey i) None refreshed)).IsSome)
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] refreshed)).IsSome)
         finally
             RowStore.close store |> ignore)
 

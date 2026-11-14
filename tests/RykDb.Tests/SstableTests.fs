@@ -121,6 +121,23 @@ let ``SSTable: 列マスクで必要な列だけ復号する`` () =
     Assert.Equal<SqlValue>(SqlValue.Int 30L, values.[2])
 
 [<Fact>]
+let ``SSTable: lookupMasked は必要な列だけ復号する`` () =
+    let entries =
+        [|
+            SstEntry.make (intKey 1) 1UL (Some [| SqlValue.Int 10L; SqlValue.Text "skip-me"; SqlValue.Int 30L |])
+        |]
+
+    let reader =
+        ok (Sstable.openPartial (writeTempSst (ok (buildSstable 0.01 entries))))
+
+    let found = ok (Sstable.lookupMasked [| true; false; true |] (intKey 1) None reader)
+    Assert.True found.IsSome
+    let values = found.Value.Value.Value
+    Assert.Equal<SqlValue>(SqlValue.Int 10L, values.[0])
+    Assert.Equal<SqlValue>(SqlValue.Unloaded, values.[1])
+    Assert.Equal<SqlValue>(SqlValue.Int 30L, values.[2])
+
+[<Fact>]
 let ``SSTable: 複数ブロックに分割される`` () =
     // EntriesPerBlock = 128 なので 1000 件で 8 ブロック
     let entries = sstEntries 1000
@@ -310,12 +327,12 @@ let ``Sstable.openPartial: 全件・limit・lookup が全読みと一致する``
         let limited = ok (Sstable.rangeScanPartial [||] 10 partial |> SstScan.toArray)
         Assert.Equal<int>(10, limited.Length)
 
-        match ok (Sstable.lookup (intKey 150) None partial) with
+        match ok (Sstable.lookupMasked [||] (intKey 150) None partial) with
         | Some e -> Assert.Equal<uint64>(151UL, e.SeqNo)
         | None -> Assert.Fail "lookup が行を見つけられません"
 
         // 可視性: SeqNo 2 ではキー 150（SeqNo 151）は見えない
-        Assert.True((ok (Sstable.lookup (intKey 150) (Some 2UL) partial)).IsNone))
+        Assert.True((ok (Sstable.lookupMasked [||] (intKey 150) (Some 2UL) partial)).IsNone))
 
 [<Fact>]
 let ``Sstable.openPartial: Footer のチェックサム不一致は CorruptionError`` () =

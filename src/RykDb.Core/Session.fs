@@ -110,8 +110,13 @@ type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
                 releaseTo Exhausted
                 ret None
             | Ok(Some(row, nxt)) ->
-                state <- Reading nxt
-                ret (Some(SqlValue.copyRow row))
+                match SqlValue.ensureLoaded row with
+                | Error e ->
+                    releaseTo Closed
+                    err e
+                | Ok loaded ->
+                    state <- Reading nxt
+                    ret (Some(SqlValue.copyRow loaded))
 
     override _.Finalize() =
         try

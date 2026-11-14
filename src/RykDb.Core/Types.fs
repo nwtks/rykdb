@@ -250,6 +250,35 @@ module internal SqlValue =
             | SqlValue.Blob b -> SqlValue.Blob(Array.copy b)
             | other -> other)
 
+    /// 行の不要列を `Unloaded` に置き換える（復号済みの行にマスクを適用する）。
+    let maskRow (mask: bool array) (row: SqlValue array) =
+        if mask.Length = 0 then
+            [||]
+        elif row.Length = 0 then
+            Array.create mask.Length SqlValue.Unloaded
+        else
+            Array.mapi
+                (fun i v ->
+                    if i < mask.Length && not mask.[i] then
+                        SqlValue.Unloaded
+                    else
+                        v)
+                row
+
+    /// 列マスクのプレースホルダが結果に漏れていないか検査する。
+    /// 最終結果・RowReader・STREAM の境界で呼ぶ。
+    let ensureLoaded (row: SqlValue array) =
+        if
+            row
+            |> Array.exists (fun v ->
+                match v with
+                | SqlValue.Unloaded -> true
+                | _ -> false)
+        then
+            err (DbError.internalError "復号していない列がクエリ結果に含まれています")
+        else
+            ret row
+
     /// REAL を decimal へ変換できる絶対値の上限。
     /// System.Decimal の最大値（約 7.9228e28）より少し小さい安全側の値。
     [<Literal>]
