@@ -607,9 +607,16 @@ module internal Sstable =
             Array.blit tail 0 key sharedLength tail.Length
             key
 
+    /// ブロック内の値をどう扱うか。
+    /// Decode は通常のクエリ、Raw は compaction、Skip は列が不要なクエリ。
+    type private ValueMode =
+        | DecodeValues
+        | RawValues
+        | SkipValues
+
     /// バッファ内の範囲にある 1ブロックをエントリ列へ復元する。
     /// 末尾 4バイトのチェックサムを検証する。
-    let private parseBlockAt (decodeValues: bool) (data: byte array) (offset: int) (length: int) =
+    let private parseBlockAt (mode: ValueMode) (data: byte array) (offset: int) (length: int) =
         let decodeEntry c (prev: byte array) =
             result {
                 let! shared, c = Reader.readVarint c
@@ -635,12 +642,16 @@ module internal Sstable =
                         return!
                             Reader.copyBytesInto key sharedLength tailLength c
                             >>= fun c ->
-                                if decodeValues then
+                                match mode with
+                                | DecodeValues ->
                                     SstEntry.decodeValueAt c (int valueLen)
                                     >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
-                                else
+                                | RawValues ->
                                     SstEntry.decodeRawValueAt c (int valueLen)
                                     >>= fun (seqNo, raw, c) -> ret (c, SstEntry.makeRaw key seqNo raw, key)
+                                | SkipValues ->
+                                    SstEntry.decodeSkippedValueAt c (int valueLen)
+                                    >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
             }
 
         if offset < 0 || length < 4 || offset > data.Length - length then
@@ -659,8 +670,9 @@ module internal Sstable =
 
     /// 部分読みした reader から startKey 以降を遅延生成する。
     /// ブロックは最大 8個まとめて 1回の open で読み、解析は必要になったときだけ行う。
-    /// `decodeValues = false` は compaction 用で、値を復号せずスライスだけを保持する。
-    let private rangeScanPartialWith (decodeValues: bool) (startKey: byte array) (limit: int) (partial: SstPartial) =
+    /// `RawValues` は compaction 用で値を復号せずスライスだけを保持し、
+    /// `SkipValues` は値が不要なクエリ用で空の行を返す。
+    let private rangeScanPartialWith (mode: ValueMode) (startKey: byte array) (limit: int) (partial: SstPartial) =
         let rec search lo hi =
             if lo >= hi then
                 lo
@@ -709,7 +721,7 @@ module internal Sstable =
             if relativeOffset < 0 || ie.Length < 0 || relativeOffset > raw.Length - ie.Length then
                 err (DbError.corruption "Sstable: 索引範囲が読み込みブロックの範囲外です")
             else
-                parseBlockAt decodeValues raw relativeOffset ie.Length
+                parseBlockAt mode raw relativeOffset ie.Length
                 >>= fun entries ->
                     if
                         entries.Length = 0
@@ -772,11 +784,15 @@ module internal Sstable =
 
     /// 値を復号せずに走査する（compaction 用）。
     let rangeScanPartialRaw (startKey: byte array) (limit: int) (partial: SstPartial) =
-        rangeScanPartialWith false startKey limit partial
+        rangeScanPartialWith RawValues startKey limit partial
+
+    /// 値を復号せず、空の行だけを返す（列が不要なクエリ用）。
+    let rangeScanPartialSkipped (startKey: byte array) (limit: int) (partial: SstPartial) =
+        rangeScanPartialWith SkipValues startKey limit partial
 
     /// 値を復号しながら走査する（通常のクエリ・検証用）。
     let rangeScanPartial (startKey: byte array) (limit: int) (partial: SstPartial) =
-        rangeScanPartialWith true startKey limit partial
+        rangeScanPartialWith DecodeValues startKey limit partial
 
     /// ブロック内のキー・SeqNo・値の位置をキャッシュする。
     /// 点検索のたびにキー復元と値の読み飛ばしを繰り返さないため。

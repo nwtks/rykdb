@@ -809,6 +809,105 @@ module internal Optimizer =
 
         List.fold Schema.concat baseSchema rights
 
+    /// 出力列の必要集合を後方伝播し、各 Scan が行の値を作る必要があるかを求める。
+    /// 現在は「必要列が空かどうか」だけを使う（列単位の復号スキップは後続）。
+    /// `Logical` は参照等価の `obj` キーで覚える（構造比較はできない）。
+    let private scanNeedsValues (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
+        let allColumns schema =
+            if schema.Columns.Length = 0 then
+                Set.empty
+            else
+                Set.ofSeq [ 0 .. schema.Columns.Length - 1 ]
+
+        let resolveRef schema r =
+            match Schema.resolve schema r with
+            | Ok i -> Some i
+            | Error _ ->
+                match Schema.resolve schema { Qualifier = None; Name = r.Name } with
+                | Ok i -> Some i
+                | Error _ -> None
+
+        let refsOf schema e =
+            if Expr.hasAnySubquery e then
+                allColumns schema
+            else
+                let refs =
+                    Expr.fold
+                        (fun acc x ->
+                            match x with
+                            | Expr.Column c -> c :: acc
+                            | Expr.Name n -> { Qualifier = None; Name = n } :: acc
+                            | _ -> acc)
+                        []
+                        e
+
+                let resolved = refs |> List.map (resolveRef schema)
+
+                if List.exists Option.isNone resolved then
+                    allColumns schema
+                else
+                    resolved |> List.choose id |> Set.ofList
+
+        let refsOfAll schema exprs =
+            exprs |> List.fold (fun acc e -> Set.union acc (refsOf schema e)) Set.empty
+
+        let needs = System.Collections.Generic.Dictionary<obj, bool> HashIdentity.Reference
+
+        let rec go nodeCtx nodeInput (needed: Set<int>) =
+            function
+            | Logical.Scan _ as node -> needs.[box node] <- not needed.IsEmpty
+            | Logical.Filter(p, child) ->
+                let childSchema = outputOf nodeCtx nodeInput child
+                go nodeCtx nodeInput (Set.union needed (refsOf childSchema p)) child
+            | Logical.Project(items, child) ->
+                let childSchema = outputOf nodeCtx nodeInput child
+                let projection = SelectProjection.create childSchema items
+                go nodeCtx nodeInput (refsOfAll childSchema projection.Expressions) child
+            | Logical.Sort(keys, child) ->
+                let childSchema = outputOf nodeCtx nodeInput child
+                let keyExprs = keys |> List.map _.Expression
+                go nodeCtx nodeInput (Set.union needed (refsOfAll childSchema keyExprs)) child
+            | Logical.Aggregate(groupBy, aggs, child) ->
+                let childSchema = outputOf nodeCtx nodeInput child
+
+                let exprs =
+                    groupBy
+                    @ (aggs
+                       |> List.filter (fun (_, star, _, _) -> not star)
+                       |> List.map (fun (_, _, _, arg) -> arg))
+
+                go nodeCtx nodeInput (refsOfAll childSchema exprs) child
+            | Logical.Having(h, aggs, groupBy, child) ->
+                let aggSchema = aggregateSchema groupBy aggs
+                go nodeCtx nodeInput (Set.union needed (refsOf aggSchema h)) child
+            | Logical.Distinct child ->
+                let childSchema = outputOf nodeCtx nodeInput child
+                go nodeCtx nodeInput (allColumns childSchema) child
+            | Logical.Limit(_, _, child) -> go nodeCtx nodeInput needed child
+            | Logical.Join(_, _, on, left, right) ->
+                let leftSchema = outputOf nodeCtx nodeInput left
+                let rightSchema = outputOf nodeCtx nodeInput right
+                let joined = Schema.concat leftSchema rightSchema
+                let withOn = Set.union needed (refsOf joined on)
+                let leftWidth = leftSchema.Columns.Length
+                let leftNeeded = withOn |> Set.filter (fun i -> i < leftWidth)
+
+                let rightNeeded =
+                    withOn
+                    |> Set.filter (fun i -> i >= leftWidth)
+                    |> Set.map (fun i -> i - leftWidth)
+
+                go nodeCtx nodeInput leftNeeded left
+                go nodeCtx nodeInput rightNeeded right
+            | Logical.Derived plan ->
+                let innerOutput = outputOf plan.Context plan.Input plan.Tree
+                let innerNeeded = needed |> Set.filter (fun i -> i < innerOutput.Columns.Length)
+                go plan.Context plan.Input innerNeeded plan.Tree
+            | Logical.Values _ -> ()
+
+        go ctx inSchema (allColumns (outputOf ctx inSchema tree)) tree
+        needs
+
     let private groupByOf (tree: Logical) =
         match stripWrappers tree with
         | Logical.Aggregate(groupBy, _, _) -> groupBy
@@ -846,19 +945,26 @@ module internal Optimizer =
 
             frame, leftSchema
 
-        let execScan ctx name method =
+        let execScan node ctx name method =
+            let needsValues =
+                match ctx.ScanNeeds.TryGetValue(box node) with
+                | true, needed -> needed
+                | _ -> true
+
             function
             | Some 0 -> ret Op.Empty
             | hint ->
                 let limit = defaultArg hint 0
 
                 match method with
-                | ScanMethod.SeqScan -> ExecContext.table ctx name limit
+                | ScanMethod.SeqScan -> ExecContext.tableValues ctx name limit needsValues
                 | ScanMethod.PkLookup values -> ExecContext.byPrimaryKey ctx name values
-                | ScanMethod.IndexLookup(indexName, values) -> ExecContext.byIndex ctx name indexName values limit
-                | ScanMethod.RangeScan(_, startKey, endKey) -> ExecContext.rangeScan ctx name startKey endKey limit
+                | ScanMethod.IndexLookup(indexName, values) ->
+                    ExecContext.byIndexValues ctx name indexName values limit needsValues
+                | ScanMethod.RangeScan(_, startKey, endKey) ->
+                    ExecContext.rangeScanValues ctx name startKey endKey limit needsValues
                 | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
-                    ExecContext.byIndexRange ctx name indexName lower upper limit
+                    ExecContext.byIndexRangeValues ctx name indexName lower upper limit needsValues
 
         let addClamp a b =
             if a > System.Int32.MaxValue - b then
@@ -890,7 +996,7 @@ module internal Optimizer =
                 | _ -> ""
 
             let lookup keyValues =
-                ExecContext.byIndex ctx frame.RightName indexName keyValues 0
+                ExecContext.byIndexValues ctx frame.RightName indexName keyValues 0 true
 
             match frame.Kind with
             | JoinKind.Inner ->
@@ -963,9 +1069,14 @@ module internal Optimizer =
                 | _ -> run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
             | Logical.Values values -> run ctx frames (ApplyOp(Op.ofRow values))
             | Logical.Derived plan ->
-                run plan.Context (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None))
-            | Logical.Scan(name, method) ->
-                match execScan ctx name method hint with
+                let innerCtx =
+                    { plan.Context with
+                        ScanNeeds = ctx.ScanNeeds
+                    }
+
+                run innerCtx (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None))
+            | Logical.Scan(name, method) as node ->
+                match execScan node ctx name method hint with
                 | Error e -> err e
                 | Ok op -> run ctx frames (ApplyOp op)
             | Logical.Filter(p, child) ->
@@ -1032,6 +1143,11 @@ module internal Optimizer =
     /// childSchema は「そのノードが結果を読む側」だけが使う。
     /// </remarks>
     let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
+        let ctx =
+            { ctx with
+                ScanNeeds = scanNeedsValues ctx schema tree
+            }
+
         run ctx [] (EvalNode(tree, schema, None))
 
     /// EXPLAIN の作業項目。

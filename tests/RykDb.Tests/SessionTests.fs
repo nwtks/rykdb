@@ -54,10 +54,10 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
         member _.WalState = inner.WalState
         member _.GetAt visible key = inner.GetAt visible key
 
-        member _.ScanAt visible startKey limit =
+        member _.ScanAtValues visible startKey limit needsValues =
             gates.ScanEntered.Set()
             gates.WaitScan()
-            inner.ScanAt visible startKey limit
+            inner.ScanAtValues visible startKey limit needsValues
 
         member _.WriteBatch entries =
             gates.WriteEntered.Set()

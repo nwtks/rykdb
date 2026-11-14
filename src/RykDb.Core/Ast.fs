@@ -532,6 +532,20 @@ module internal Expr =
                    | _ -> false)
             false
 
+    /// 式にサブクエリ（相関・非相関）が含まれるか。
+    /// 列マスクの解析では、外側参照を列挙できないため保守的に全列を必要とする。
+    let hasAnySubquery =
+        fold
+            (fun found e ->
+                found
+                || match e with
+                   | Expr.Subquery _
+                   | Expr.Exists _
+                   | Expr.InSubquery _
+                   | Expr.CorrelatedSubquery _ -> true
+                   | _ -> false)
+            false
+
     /// 式に未解決のサブクエリが含まれるか。
     /// 含まれない式はサブクエリ解決で書き換える必要がないため、
     /// 計画時の AST 再構築を省略する判定に使う。

@@ -185,7 +185,13 @@ module internal StorageEngine =
     /// ヒープは 1回だけ組み、以降は「取り出したソースの続きを戻す」だけにする
     /// （行ごとにソース列から作り直すと O(行数 × ファイル数 log ファイル数) になる）。
     /// マージとヒープは `SstMerge`（Sstable.fs）に集約する。
-    let scanAt (visible: uint64 option) (limit: int) (startKey: byte array) (engine: StorageEngine) =
+    let scanAtValues
+        (visible: uint64 option)
+        (limit: int)
+        (startKey: byte array)
+        (needsValues: bool)
+        (engine: StorageEngine)
+        =
         let seqToScan (rows: SstEntry seq) =
             let e = rows.GetEnumerator()
 
@@ -206,12 +212,17 @@ module internal StorageEngine =
 
         let openPending index f merge =
             openPartialSst f engine
-            >>= fun partial -> ret (Sstable.rangeScanPartial startKey 0 partial)
-            >>= fun scan ->
-                match SstScan.next scan with
-                | Error e -> err e
-                | Ok None -> ret merge
-                | Ok(Some(e, nxt)) -> ret (SstMerge.insert index e nxt merge)
+            >>= fun partial ->
+                if needsValues then
+                    Sstable.rangeScanPartial startKey 0 partial
+                else
+                    Sstable.rangeScanPartialSkipped startKey 0 partial
+                |> ret
+                >>= fun scan ->
+                    match SstScan.next scan with
+                    | Error e -> err e
+                    | Ok None -> ret merge
+                    | Ok(Some(e, nxt)) -> ret (SstMerge.insert index e nxt merge)
 
         let rec prepare pending merge =
             match pending with
@@ -669,7 +680,11 @@ type internal IStorageEngine =
     /// 現在の WAL 位置。メモリエンジンは None。
     abstract WalState: WalState option
     abstract GetAt: visible: uint64 option -> key: byte array -> Result<SstEntry option, DbError>
-    abstract ScanAt: visible: uint64 option -> startKey: byte array -> limit: int -> Result<SstScan, DbError>
+
+    /// 行の値が必要ないときは `needsValues = false`（値を作らず空の行を返す）。
+    abstract ScanAtValues:
+        visible: uint64 option -> startKey: byte array -> limit: int -> needsValues: bool -> Result<SstScan, DbError>
+
     abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
     /// WAL 追記のみ行い、fsync は呼び出し側に任せる。
     abstract WriteBatchDeferred: entries: Entry array -> Result<IStorageEngine, DbError>
@@ -701,8 +716,8 @@ type internal DiskStorageEngine(engine: StorageEngine) =
 
         member _.GetAt visible key = StorageEngine.getAt visible key engine
 
-        member _.ScanAt visible startKey limit =
-            StorageEngine.scanAt visible limit startKey engine
+        member _.ScanAtValues visible startKey limit needsValues =
+            StorageEngine.scanAtValues visible limit startKey needsValues engine
 
         member _.WriteBatch entries =
             StorageEngine.writeBatch entries engine

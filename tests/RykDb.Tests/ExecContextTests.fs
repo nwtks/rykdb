@@ -123,42 +123,42 @@ let ``ExecContext.schemaOf: 未登録は NameError`` () =
         | Ok _ -> Assert.Fail "NameError になるべき")
 
 [<Fact>]
-let ``ExecContext.table: 登録スキーマで全走査`` () =
+let ``ExecContext.tableValues: 登録スキーマで全走査`` () =
     withStore "ec-table" (fun store ->
         let c0 = ExecContext.create store None
         let c1 = ExecContext.withSchema "people" peopleSchema c0
-        let op = ok (ExecContext.table c1 "people" 0)
+        let op = ok (ExecContext.tableValues c1 "people" 0 true)
         let rows = ok (Op.toArray op)
         Assert.Equal(0, rows.Length))
 
 [<Fact>]
-let ``ExecContext.byIndex: 空の store は空の Op`` () =
+let ``ExecContext.byIndexValues: 空の store は空の Op`` () =
     withStore "ec-byindex-empty" (fun store ->
         let c0 = ExecContext.create store None
         let c1 = ExecContext.withSchema "people" TestHelpers.peopleSchema c0
 
         let op =
-            ok (ExecContext.byIndex c1 "people" "ix_people_age" [| SqlValue.Int 1L |] 0)
+            ok (ExecContext.byIndexValues c1 "people" "ix_people_age" [| SqlValue.Int 1L |] 0 true)
 
         let rows = ok (Op.toArray op)
         Assert.Equal(0, rows.Length))
 
 [<Fact>]
-let ``ExecContext.byIndex: 未登録テーブルは NameError`` () =
+let ``ExecContext.byIndexValues: 未登録テーブルは NameError`` () =
     withStore "ec-byindex-miss-table" (fun store ->
         let c0 = ExecContext.create store None
 
-        match ExecContext.byIndex c0 "nope" "ix" [| SqlValue.Int 1L |] 0 with
+        match ExecContext.byIndexValues c0 "nope" "ix" [| SqlValue.Int 1L |] 0 true with
         | Error e -> Assert.Equal(ErrorKind.NameError, e.Kind)
         | Ok _ -> Assert.Fail "NameError になるべき")
 
 [<Fact>]
-let ``ExecContext.byIndex: 未登録索引は NameError`` () =
+let ``ExecContext.byIndexValues: 未登録索引は NameError`` () =
     withStore "ec-byindex-miss-idx" (fun store ->
         let c0 = ExecContext.create store None
         let c1 = ExecContext.withSchema "people" peopleSchema c0
 
-        match ExecContext.byIndex c1 "people" "nope" [| SqlValue.Int 1L |] 0 with
+        match ExecContext.byIndexValues c1 "people" "nope" [| SqlValue.Int 1L |] 0 true with
         | Error e -> Assert.Equal(ErrorKind.NameError, e.Kind)
         | Ok _ -> Assert.Fail "NameError になるべき")
 

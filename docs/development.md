@@ -159,7 +159,7 @@ dotnet run -c Release --project tools/RykDb.Bench -- --dry          # 1 回だ�
 - **CI ではビルドのみ**（`dotnet build -t:Rebuild` に含まれる）。実行は手元で行う。
 - 結果は `BenchmarkDotNet.Artifacts/`（実行時のカレントディレクトリ）に残る。git 対象外。
 - シナリオ:
-  - `PointLookup` / `CountStar` / `RangeScan` / `FilterSeqScan` / `Insert100Rows`
+  - `PointLookup` / `CountStar` / `RangeScan` / `FilterSeqScan` / `SelectConstant` / `CountConstantWhere` / `Insert100Rows`
   - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
   - `MatchesLiteral` / `MatchesColumn` / `MatchesBinary` / `MatchesComplex` — DB を使わない式評価器のマイクロベンチ
   - `CompactL0` — L0 の 4ファイル（各 25,000件）を 1回 compaction する

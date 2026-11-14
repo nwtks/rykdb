@@ -2501,3 +2501,22 @@ type private Step =
   `CompactionTests` は `openBackRaw` で raw 経路を通す。
 - 計測（`tools/RykDb.Bench --class compaction --quick`、L0 4ファイル・10万件）:
   復号あり 424ms / 380MB → raw **296ms / 302MB**。
+
+### 11.74 値不要スキャンの空行は NULL でパディングする
+
+`COUNT(*)` や `SELECT 1 FROM t` のように列を 1つも必要としないスキャンは、
+`StorageEngine.ScanAtValues ... needsValues = false` で値を復号しない。
+しかし **行の要素数は 0 にしない**。
+
+- `Dml.opOfScan` がスキーマ幅の `NULL` で埋める。
+  `ORDER BY 1` のソートや、行の幅を前提にする演算子が壊れないようにするため。
+- 埋めた `NULL` は「未ロード」の意味であり、実際の NULL ではない。
+  スキャン後にその列を読む演算子があってはいけない
+  （`scanNeedsValues` の解析が前提。Project は使わない項目も評価するので全式の参照列を要求する）。
+- 空行を `[||]` のまま流すと、ソートのキー位置（スキーマ幅 + 式）がずれて
+  `IndexOutOfRangeException` になる。実際に踏んだので回帰テストを置いている。
+- 回帰テスト: `Database: 値を使わない射影・集約は空の行でも件数を返す`
+  （定数述語・DISTINCT・ORDER BY・GROUP BY・派生テーブルを含む）。
+- 計測（10万行）: `CountStar` 約 381MB → **315MB**、
+  `SelectConstant` **329MB**、`CountConstantWhere` **351MB**。
+  非空マスクはまだ全列復号のため、`FilterSeqScan` は変化しない。

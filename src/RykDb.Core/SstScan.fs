@@ -152,6 +152,27 @@ module internal SstEntry =
         |> decodeHeader
         >>= fun (seqNo, tag, c) -> decodePayload seqNo tag c
 
+    /// 値を復号せず、削除タグだけ見て空の行を返す。
+    /// 列が 1つも不要なクエリ（COUNT(*) など）用。
+    /// `length` バイトを消費した次のカーソルも返す。
+    let decodeSkippedValueAt (c: Cursor) (length: int) =
+        let d = Cursor.data c
+        let p = Cursor.pos c
+        let e = Cursor.endPos c
+
+        if length < 0 || p < 0 || e < p || e > d.Length || length > e - p then
+            err (DbError.corruption "Sstable: 値の範囲が不正です")
+        else
+            match Cursor.createSlice d p length >>= decodeHeader with
+            | Error er -> err er
+            | Ok(seqNo, tag, _) ->
+                if tag = 0uy then
+                    ret (seqNo, None, Cursor.advance length c)
+                elif tag = 1uy then
+                    ret (seqNo, Some(Array.empty<SqlValue>), Cursor.advance length c)
+                else
+                    err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
+
     /// 符号化された値の位置を返す（復号しない）。
     /// `length` バイトを消費した次のカーソルも返す。
     let decodeRawValueAt (c: Cursor) (length: int) =

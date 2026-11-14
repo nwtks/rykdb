@@ -813,6 +813,19 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 - 残る割当の主なものは `Kont` のオブジェクト / リストセル、`Result` の `Ok`、 `SqlValue`（参照型 DU）。
   この削減はスタック再利用や式評価の fast path として別途扱う。
 
+**列が必要ないスキャン**
+
+`Optimizer.scanNeedsValues` が出力列の必要集合を後方伝播し、
+Scan で空なら `StorageEngine.ScanAtValues ... needsValues = false` を渡す。
+
+- 対象は `COUNT(*)`、`SELECT 1 FROM t`、定数述語の `WHERE` など。
+- 空マスクの行は値を復号せず、`Dml.opOfScan` がスキーマ幅の `NULL` で埋める
+  （ソートなどが行の幅を前提にできるようにするため）。
+- 現状は **空か非空か** だけを使う。非空なら全列を復号する
+  （列単位の部分復号は次の段階）。
+- `Ops.project` は必要な出力項目だけを評価するのではなく **すべての出力式** を評価する。
+  そのため Project は使わない項目の参照列も要求する（Derived の内側も同じ）。
+
 **3値論理と NULL**
 
 - 比較はオペランドに NULL があると `NULL`（UNKNOWN）を返す。

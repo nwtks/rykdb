@@ -105,7 +105,7 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
             |> Option.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
             |> ret
 
-        member _.ScanAt visible startKey limit =
+        member _.ScanAtValues visible startKey limit needsValues =
             let entries =
                 Memtable.rangeScan startKey 0 state.Mem
                 |> Seq.filter (fun e ->
@@ -113,7 +113,14 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
                     | Some v -> e.SeqNo <= v
                     | None -> true)
                 |> Seq.distinctBy (fun e -> e.Key)
-                |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+                |> Seq.map (fun e ->
+                    let value =
+                        if needsValues || e.Value.IsNone then
+                            e.Value
+                        else
+                            Some(Array.empty<SqlValue>)
+
+                    SstEntry.make e.Key e.SeqNo value)
                 |> Seq.filter (fun e -> e.Value.IsSome)
 
             (if limit > 0 then Seq.truncate limit entries else entries)

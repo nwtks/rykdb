@@ -51,6 +51,43 @@ let private collectGarbage () =
 // ---------------------------------------------------------------------------
 
 [<Fact>]
+let ``Database: 値を使わない射影・集約は空の行でも件数を返す`` () =
+    withDb "empty-row-pruning" (fun db0 ->
+        let db =
+            db0
+            |> fun d -> exec d "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
+            |> fun d -> exec d "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')"
+
+        let _, count = ok (execSql db "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0])
+
+        let _, constants = ok (execSql db "SELECT 1 FROM t")
+        Assert.Equal<int>(2, constants.Rows.Length)
+        Assert.Equal<int64>(1L, asInt constants.Rows.[0].[0])
+
+        // 述語が定数なら列を読まない。
+        let _, filtered = ok (execSql db "SELECT COUNT(*) FROM t WHERE 1 = 1")
+        Assert.Equal<int64>(2L, asInt filtered.Rows.[0].[0])
+
+        let _, distinct = ok (execSql db "SELECT DISTINCT 1 FROM t")
+        Assert.Equal<int>(1, distinct.Rows.Length)
+
+        let _, ordered = ok (execSql db "SELECT 1 FROM t ORDER BY 1")
+        Assert.Equal<int>(2, ordered.Rows.Length)
+
+        let _, grouped = ok (execSql db "SELECT COUNT(*) FROM t GROUP BY 1")
+        Assert.Equal<int>(1, grouped.Rows.Length)
+        Assert.Equal<int64>(2L, asInt grouped.Rows.[0].[0])
+
+        // 派生テーブルでは内側の射影が列を評価するため、外側が値を不要でも
+        // 内側の必要列を空にしてはいけない。
+        let _, derivedAll = ok (execSql db "SELECT COUNT(*) FROM (SELECT * FROM t) AS x")
+        Assert.Equal<int64>(2L, asInt derivedAll.Rows.[0].[0])
+
+        let _, derivedA = ok (execSql db "SELECT COUNT(*) FROM (SELECT a FROM t) AS x")
+        Assert.Equal<int64>(2L, asInt derivedA.Rows.[0].[0]))
+
+[<Fact>]
 let ``Database: BEGIN/COMMIT でまとめて反映される`` () =
     withDb "tx1" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"

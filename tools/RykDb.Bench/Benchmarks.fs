@@ -54,6 +54,8 @@ type QueryBenchmarks() =
     let countSql = "SELECT COUNT(*) FROM t"
     let rangeSql = "SELECT COUNT(*) FROM t WHERE id BETWEEN 1000 AND 1999"
     let filterSql = "SELECT COUNT(*) FROM t WHERE a < 50"
+    let constantSql = "SELECT 1 FROM t"
+    let constantCountSql = "SELECT COUNT(*) FROM t WHERE 1 = 1"
     let joinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id"
     let mergeJoinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id"
 
@@ -127,6 +129,14 @@ type QueryBenchmarks() =
     /// 索引の無い列の全走査（SeqScan + Filter）。
     [<Benchmark>]
     member this.FilterSeqScan() = this.Exec filterSql
+
+    /// 定数射影（行の値を一切読まない）。
+    [<Benchmark>]
+    member this.SelectConstant() = this.Exec constantSql
+
+    /// 定数述語の COUNT(*)（行の値を一切読まない）。
+    [<Benchmark>]
+    member this.CountConstantWhere() = this.Exec constantCountSql
 
     /// 3テーブル JOIN（主キー同士の等値結合）。
     [<Benchmark>]
