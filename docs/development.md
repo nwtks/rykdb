@@ -12,7 +12,8 @@ RykDb（**.NET 10 / F# 10**）のビルド・テスト・品質ゲート。
 1. [ビルドと品質ゲート](#1-ビルドと品質ゲート)
 2. [tail call 監査](#2-tail-call-監査)
 3. [テスト構成](#3-テスト構成)
-4. [変更後のチェックリスト](#4-変更後のチェックリスト)
+4. [性能ベンチ](#4-性能ベンチ)
+5. [変更後のチェックリスト](#5-変更後のチェックリスト)
 
 ---
 
@@ -142,11 +143,35 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 
 **乱数生成のテストは退行に注意**（[`gotchas.md`](gotchas.md) §9.6）。
 
-## 4. 変更後のチェックリスト
+## 4. 性能ベンチ
+
+性能に影響する変更は `tools/RykDb.Bench` で前後を測る。
+数値はマシン依存なので、**同じマシンでの前後比較**にだけ使う。
+
+```bash
+dotnet run -c Release --project tools/RykDb.Bench                    # 全シナリオ
+dotnet run -c Release --project tools/RykDb.Bench -- --class query  # クエリ系のみ
+dotnet run -c Release --project tools/RykDb.Bench -- --quick        # 短いジョブ
+dotnet run -c Release --project tools/RykDb.Bench -- --dry          # 1 回だけ実行して検証
+```
+
+- **CI ではビルドのみ**（`dotnet build -t:Rebuild` に含まれる）。実行は手元で行う。
+- 結果は `BenchmarkDotNet.Artifacts/`（実行時のカレントディレクトリ）に残る。git 対象外。
+- シナリオ:
+  - `PointLookup` / `CountStar` / `RangeScan` / `FilterSeqScan` / `Join3Tables` / `Insert100Rows`
+  - `CompactL0` — L0 の 4ファイル（各 25,000件）を 1回 compaction する
+- クエリ系は `Database.OpenWith`（同期 compaction）で開き、
+  シード後に一度 Close して memtable を SSTable へ flush してから測る
+  （背景 compaction のタイミングで揺れないようにする）。
+- compaction の出力削除は測定の外側（`IterationCleanup`）で行う。
+- 変更前後で `--quick` の結果が大きく変わったら、`--dry` で正しさを確認してから通常ジョブで再測する。
+
+## 5. 変更後のチェックリスト
 
 - [ ] `dotnet build -t:Rebuild` が 0 error / 0 warning
 - [ ] `dotnet test` が全緑（逐次実行）
 - [ ] `dotnet run --project tools/TailAudit` が exit 0（新規の非末尾再帰なし。追認は内容確認のうえ `-- --update`）
 - [ ] 不変条件を追加・変更したら [`invariants.md`](invariants.md) と対応するテストを更新
 - [ ] 構築に不変条件がある型は `.fsi` で表現を隠したか（`[<Struct>]` レコードは不可。[`gotchas.md`](gotchas.md) §8.21）
+- [ ] 性能に影響する変更は `tools/RykDb.Bench` で前後を測ったか（測れない場合は理由を記録）
 - [ ] `docs/gotchas.md` に**同じ原因の再発**があれば追記

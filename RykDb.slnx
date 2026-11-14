@@ -7,4 +7,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/RykDb.Tests/RykDb.Tests.fsproj" />
   </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/RykDb.Bench/RykDb.Bench.fsproj" />
+  </Folder>
 </Solution>

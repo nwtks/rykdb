@@ -51,6 +51,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="RykDb.Tests" />
+    <InternalsVisibleTo Include="RykDb.Bench" />
   </ItemGroup>
 
 </Project>

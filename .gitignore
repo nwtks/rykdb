@@ -49,6 +49,9 @@ coverage.*
 # MSBuild Binary and Structured Log
 *.binlog
 
+# BenchmarkDotNet artifacts
+BenchmarkDotNet.Artifacts/
+
 # MSTest test Results
 [Tt]est[Rr]esult*/
 [Bb]uild[Ll]og.*
