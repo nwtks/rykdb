@@ -11,13 +11,22 @@ module internal RowKey =
             | Some i -> Some row.[i]
             | None -> None)
 
+    /// 主キーの LSM へ入れるキー（内部ホットパス用）。
+    let primaryV (schema: TableSchema) (row: SqlValue array) =
+        KeyBuilder.ofValues (TableSchema.primaryKeyOf schema row) |> DbResult.ofResult
+
     /// 主キーの LSM へ入れるキー。
     let primary (schema: TableSchema) (row: SqlValue array) =
-        KeyBuilder.ofValues (TableSchema.primaryKeyOf schema row)
+        primaryV schema row |> DbResult.toResult
+
+    /// 索引の LSM へ入れるキー（索引列 + 主キー列、内部ホットパス用）。
+    let indexKeyV (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
+        KeyBuilder.ofIndexAndPrimary (indexValues schema index row) (TableSchema.primaryKeyOf schema row)
+        |> DbResult.ofResult
 
     /// 索引の LSM へ入れるキー（索引列 + 主キー列）。
     let indexKey (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
-        KeyBuilder.ofIndexAndPrimary (indexValues schema index row) (TableSchema.primaryKeyOf schema row)
+        indexKeyV schema index row |> DbResult.toResult
 
 /// DML — スキーマと transaction を使う上位操作。
 /// 1行の書き込みは「主キーへの 1件 + 各索引への 1件」。
@@ -96,7 +105,7 @@ module internal Dml =
     /// slot は 1回ずつしか消費されない（store 行と突き合わせたとき、あるいは store が尽きたとき）。
     /// </remarks>
     let private overlayRows
-        (keyOf: SqlValue array -> Result<byte array, DbError>)
+        (keyOf: SqlValue array -> DbResult<byte array>)
         (slots: (byte array * SqlValue array option) list)
         (rows: Op)
         =
@@ -111,8 +120,8 @@ module internal Dml =
                 else
                     Op.compute (fun () ->
                         match slotArr.[i] with
-                        | _, Some v -> ret (Some(v, emitRemaining (i + 1)))
-                        | _, None -> emitRemaining (i + 1) |> Op.next)
+                        | _, Some v -> OpStep.OpRow(v, emitRemaining (i + 1))
+                        | _, None -> Op.next (emitRemaining (i + 1)))
 
             let rec merge cur i =
                 if i >= slotArr.Length then
@@ -120,24 +129,24 @@ module internal Dml =
                 else
                     Op.compute (fun () ->
                         match Op.next cur with
-                        | Error e -> err e
-                        | Ok None -> emitRemaining i |> Op.next
-                        | Ok(Some(row, nxt)) ->
+                        | OpStep.OpError e -> OpStep.OpError e
+                        | OpStep.OpDone -> Op.next (emitRemaining i)
+                        | OpStep.OpRow(row, nxt) ->
                             let sk, sv = slotArr.[i]
 
                             match keyOf row with
-                            | Error e -> err e
-                            | Ok rk ->
+                            | DbErr e -> OpStep.OpError e
+                            | DbOk rk ->
                                 match Bytes.compare rk sk with
-                                | c when c < 0 -> ret (Some(row, merge nxt i))
+                                | c when c < 0 -> OpStep.OpRow(row, merge nxt i)
                                 | 0 ->
                                     match sv with
-                                    | Some v -> ret (Some(v, merge nxt (i + 1)))
-                                    | None -> merge nxt (i + 1) |> Op.next
+                                    | Some v -> OpStep.OpRow(v, merge nxt (i + 1))
+                                    | None -> Op.next (merge nxt (i + 1))
                                 | _ ->
                                     match sv with
-                                    | Some v -> ret (Some(v, Op.emit row (merge nxt (i + 1))))
-                                    | None -> ret (Some(row, merge nxt (i + 1))))
+                                    | Some v -> OpStep.OpRow(v, Op.emit row (merge nxt (i + 1)))
+                                    | None -> OpStep.OpRow(row, merge nxt (i + 1)))
 
             merge rows 0
 
@@ -192,21 +201,18 @@ module internal Dml =
                     match SstScan.next current with
                     | Error e ->
                         SstScan.dispose current
-                        err e
-                    | Ok None -> ret None
+                        OpStep.OpError e
+                    | Ok None -> OpStep.OpDone
                     | Ok(Some(e, rest)) ->
                         if not (take e) then
                             SstScan.dispose rest
-                            ret None
+                            OpStep.OpDone
                         else
                             match e.Value with
-                            | Some row -> ret (Some(rowOf (Some row), rest))
+                            | Some row -> OpStep.OpRow(rowOf (Some row), emit rest)
                             | None -> pull rest
 
-                match pull scan with
-                | Error e -> err e
-                | Ok None -> ret None
-                | Ok(Some(row, rest)) -> ret (Some(row, emit rest)))
+                pull scan)
 
         emit scan
 
@@ -273,7 +279,7 @@ module internal Dml =
 
         scanByPrimaryKeyScopedMask scope store schema (storeLimitFor limit slots) visible mask
         |> Result.map (fun rows ->
-            let overlaid = overlayRows (RowKey.primary schema) slots rows
+            let overlaid = overlayRows (RowKey.primaryV schema) slots rows
             if limit > 0 then Op.take limit overlaid else overlaid)
 
     /// 主キーで prefix 走査する（txn の書き込みを含む・bool 互換）。
@@ -323,14 +329,17 @@ module internal Dml =
                     if limit > 0 then Op.take limit rows else rows)
 
             let! rows = scanPrimaryKeyRange startBytes endBytes (storeLimitFor limit slots)
-            let merged = overlayRows (RowKey.primary schema) slots rows
+            let merged = overlayRows (RowKey.primaryV schema) slots rows
 
             let filtered =
                 match endBytes with
                 | None -> merged
                 | Some eb ->
                     Op.filter
-                        (fun row -> RowKey.primary schema row |> Result.map (fun key -> Bytes.compare key eb <= 0))
+                        (fun row ->
+                            match RowKey.primaryV schema row with
+                            | DbErr e -> DbErr e
+                            | DbOk key -> DbOk(Bytes.compare key eb <= 0))
                         merged
 
             if limit > 0 then
@@ -374,7 +383,7 @@ module internal Dml =
                     if limit > 0 then Op.take limit rows else rows)
 
             let! rows = scanIndexPrefix prefix (storeLimitFor limit slots)
-            let overlaid = overlayRows (RowKey.indexKey schema index) slots rows
+            let overlaid = overlayRows (RowKey.indexKeyV schema index) slots rows
 
             if limit > 0 then
                 return Op.take limit overlaid
@@ -419,7 +428,7 @@ module internal Dml =
                     if limit > 0 then Op.take limit rows else rows)
 
             let! rows = scanIndexRange lowerBytes upperBytes (storeLimitFor limit slots)
-            let overlaid = overlayRows (RowKey.indexKey schema index) slots rows
+            let overlaid = overlayRows (RowKey.indexKeyV schema index) slots rows
 
             if limit > 0 then
                 return Op.take limit overlaid
@@ -443,7 +452,7 @@ module internal Dml =
     let updateRow (txn: Transaction) (schema: TableSchema) (oldRow: SqlValue array) (newRow: SqlValue array) =
         let ensureSamePrimaryKey schema oldRow newRow =
             if Array.forall2 (=) (TableSchema.primaryKeyOf schema oldRow) (TableSchema.primaryKeyOf schema newRow) then
-                ret ()
+                OkUnit
             else
                 sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
                 |> DbError.constraintViolation

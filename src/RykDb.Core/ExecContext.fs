@@ -180,31 +180,31 @@ module internal DmlOps =
     /// WHERE が無ければ「全部通過」（UPDATE / DELETE で共通）。
     let private matchesWhere (resolve: ColumnResolver) (row: SqlValue array) =
         function
-        | Some w -> Eval.matchesWith resolve row w
-        | None -> ret true
+        | Some w -> Eval.matchesWithV resolve row w
+        | None -> DbOk true
 
     /// 値式を列位置に対応付け、型強制して (位置, 値) のリストにする。
     /// UPDATE の現在行を使った評価を受け取る
     /// （INSERT は `evalValues` → `assembleRow` の別経路）。
     let private gatherWith
-        (evalOne: Expr -> Result<SqlValue, DbError>)
+        (evalOne: Expr -> DbResult<SqlValue>)
         (schema: TableSchema)
         (values: Expr list)
         (idxs: int list)
         =
         let rec gather acc vs ixs =
             match vs, ixs with
-            | [], [] -> ret acc
+            | [], [] -> DbOk acc
             | v :: rest, i :: restIdx ->
                 match evalOne v with
-                | Error e -> err e
-                | Ok value ->
+                | DbErr e -> DbErr e
+                | DbOk value ->
                     let colDef = schema.Columns.[i]
 
                     match SqlValue.coerce colDef.DataType value with
-                    | Error e -> err e
+                    | Error e -> DbErr e
                     | Ok coerced -> gather ((i, coerced) :: acc) rest restIdx
-            | _ -> ret acc
+            | _ -> DbOk acc
 
         gather [] values idxs
 
@@ -407,9 +407,9 @@ module internal DmlOps =
     let insertSelect (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (source: Op) =
         let rec go idxs defaults txn count cur =
             match Op.next cur with
-            | Error e -> err e
-            | Ok None -> ret (txn, count)
-            | Ok(Some(row, nxt)) ->
+            | OpStep.OpError e -> err e
+            | OpStep.OpDone -> ret (txn, count)
+            | OpStep.OpRow(row, nxt) ->
                 match assembleRow schema idxs defaults row with
                 | Error e -> err e
                 | Ok values ->
@@ -431,25 +431,26 @@ module internal DmlOps =
     let update (ctx: ExecContext) (schema: TableSchema) (assignments: (string * Expr) list) (where: Expr option) =
         let targetSchema = targetSchemaOf schema
         let resolve = Eval.resolver targetSchema
+        let assignExprs = List.map snd assignments
 
         let assign targets row =
-            gatherWith (Eval.evalWith resolve row) schema (List.map snd assignments) targets
-            |> Result.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
+            gatherWith (Eval.evalWithV resolve row) schema assignExprs targets
+            |> DbResult.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
 
         let rowBytes row = int64 (ValueCodec.managedRowBytes row)
 
         let rec go targets acc bytes cur =
             match Op.next cur with
-            | Error e -> err e
-            | Ok None -> ret (List.rev acc)
-            | Ok(Some(row, next)) ->
+            | OpStep.OpError e -> err e
+            | OpStep.OpDone -> ret (List.rev acc)
+            | OpStep.OpRow(row, next) ->
                 match matchesWhere resolve row where with
-                | Error e -> err e
-                | Ok false -> go targets acc bytes next
-                | Ok true ->
+                | DbErr e -> err e
+                | DbOk false -> go targets acc bytes next
+                | DbOk true ->
                     match assign targets row with
-                    | Error e -> err e
-                    | Ok newRow ->
+                    | DbErr e -> err e
+                    | DbOk newRow ->
                         let bytes = bytes + rowBytes row + rowBytes newRow + 24L
 
                         if bytes > ctx.Txn.LimitBytes then
@@ -607,13 +608,13 @@ module internal DmlOps =
         let foldRows ctx schema matched onRow =
             let rec go t c cur =
                 match Op.next cur with
-                | Error e -> err e
-                | Ok None -> ret (t, c)
-                | Ok(Some(row, nxt)) ->
+                | OpStep.OpError e -> err e
+                | OpStep.OpDone -> ret (t, c)
+                | OpStep.OpRow(row, nxt) ->
                     match matched row with
-                    | Error e -> err e
-                    | Ok false -> go t c nxt
-                    | Ok true ->
+                    | DbErr e -> err e
+                    | DbOk false -> go t c nxt
+                    | DbOk true ->
                         match onRow t c row with
                         | Error e -> err e
                         | Ok(tc, c') -> go tc c' nxt

@@ -8,7 +8,7 @@ module internal Ops =
     /// 述語で弾く。
     let filter (schema: Schema) (predicate: Expr) =
         let resolve = Eval.resolver schema
-        Op.filter (fun row -> Eval.matchesWith resolve row predicate)
+        Op.filter (fun row -> Eval.matchesWithV resolve row predicate)
 
     /// ソート。
     /// ORDER BY のキーを列位置へ解決できるならそのまま使い、
@@ -22,9 +22,9 @@ module internal Ops =
                 function
                 | [] -> 0
                 | (i, dir) :: tail ->
-                    match SqlValue.compareValuesForSort a.[i] b.[i] with
-                    | Error _ -> compareKeys tail
-                    | Ok c ->
+                    match SqlValue.compareValuesForSortV a.[i] b.[i] with
+                    | DbErr _ -> compareKeys tail
+                    | DbOk c ->
                         if c = 0 then
                             compareKeys tail
                         else
@@ -35,20 +35,23 @@ module internal Ops =
             compareKeys plan
 
         let check plan reps (row: SqlValue array) =
-            plan
-            |> List.fold
-                (fun (acc: Result<Map<int, SqlValue>, DbError>) (i, _) ->
-                    acc
-                    >>= fun m ->
-                        let v = row.[i]
+            let rec loop acc =
+                function
+                | [] -> DbOk acc
+                | (i, _) :: tail ->
+                    let v = row.[i]
 
-                        if SqlValue.isNull v then
-                            ret m
-                        else
-                            match Map.tryFind i m with
-                            | None -> ret (Map.add i v m)
-                            | Some representative -> SqlValue.compareValues representative v |> Result.map (fun _ -> m))
-                (ret reps)
+                    if SqlValue.isNull v then
+                        loop acc tail
+                    else
+                        match Map.tryFind i acc with
+                        | None -> loop (Map.add i v acc) tail
+                        | Some representative ->
+                            match SqlValue.compareValuesV representative v with
+                            | DbErr e -> DbErr e
+                            | DbOk _ -> loop acc tail
+
+            loop reps plan
 
         let resolveColumn (k: SortKey) =
             match Schema.tryAsColumnRef k.Expression with
@@ -82,17 +85,26 @@ module internal Ops =
                 let projected =
                     Op.map
                         (fun row ->
-                            exprs
-                            |> List.map (Eval.evalWith resolve row)
-                            |> all
-                            |> Result.map (fun keyValues -> Array.append row (Array.ofList keyValues)))
+                            let keyValues = Array.zeroCreate<SqlValue> exprs.Length
+
+                            let rec fill i =
+                                function
+                                | [] -> DbOk(Array.append row keyValues)
+                                | e :: tail ->
+                                    match Eval.evalWithV resolve row e with
+                                    | DbErr er -> DbErr er
+                                    | DbOk v ->
+                                        keyValues.[i] <- v
+                                        fill (i + 1) tail
+
+                            fill 0 exprs)
                         src
 
                 result {
                     let! sorted =
                         ExtSort.sortRows ExtSort.DefaultBudgetBytes Map.empty (check plan) (compareWith plan) projected
 
-                    return Op.map (fun row -> ret (Array.sub row 0 width)) sorted
+                    return Op.map (fun row -> DbOk(Array.sub row 0 width)) sorted
                 }
 
     /// 重複除去。
@@ -108,24 +120,26 @@ module internal Ops =
     /// </remarks>
     let distinct (src: Op) =
         let encode row =
-            ValueCodec.writeValues row Writer.Empty |> Result.map Writer.toArray
+            match ValueCodec.writeValues row Writer.Empty with
+            | Error e -> DbErr e
+            | Ok w -> DbOk(Writer.toArray w)
 
         let seen = System.Collections.Generic.HashSet<byte array> HashIdentity.Structural
 
         let rec skipSeen used =
             Op.pull (fun row nxt ->
                 match encode row with
-                | Error e -> err e
-                | Ok key ->
+                | DbErr e -> OpStep.OpError e
+                | DbOk key ->
                     if seen.Contains key then
                         Op.next (skipSeen used nxt)
                     elif used > DistinctBudgetBytes then
                         sprintf "SELECT DISTINCT のユニーク行が多すぎます（概算 %d バイトの上限）。条件で絞るか、集約で代替してください" DistinctBudgetBytes
                         |> DbError.capacity
-                        |> err
+                        |> OpStep.OpError
                     else
                         seen.Add key |> ignore
-                        ret (Some(row, skipSeen (used + int64 (ValueCodec.managedRowBytes row)) nxt)))
+                        OpStep.OpRow(row, skipSeen (used + int64 (ValueCodec.managedRowBytes row)) nxt))
 
         skipSeen 0L src
 
@@ -234,8 +248,9 @@ module internal Ops =
         let resolve = Eval.resolver Schema.empty
 
         fun row ->
-            substituteAggs offsets wholeOffsets row predicate
-            >>= Eval.matchesWith resolve row
+            match substituteAggs offsets wholeOffsets row predicate with
+            | Error e -> DbErr e
+            | Ok p -> Eval.matchesWithV resolve row p
 
     /// 集約の 1 項目分のアキュムレータ。
     /// SUM / AVG は REAL が現れるまでは decimal、現れた後は double で累積し、最後に型を決める
@@ -270,39 +285,37 @@ module internal Ops =
         let resolve = Eval.resolver schema
 
         let keyOfRow row =
-            groupBy
-            |> List.map (fun e -> Eval.evalWith resolve row e)
-            |> all
-            |> Result.map List.toArray
+            let keys = Array.zeroCreate<SqlValue> groupBy.Length
+
+            let rec fill i =
+                function
+                | [] -> DbOk keys
+                | e :: tail ->
+                    match Eval.evalWithV resolve row e with
+                    | DbErr er -> DbErr er
+                    | DbOk v ->
+                        keys.[i] <- v
+                        fill (i + 1) tail
+
+            fill 0 groupBy
 
         let addDecimal a b =
             let maxD = System.Decimal.MaxValue
             let minD = System.Decimal.MinValue
 
             if a > 0M && b > 0M && a > maxD - b || a < 0M && b < 0M && a < minD - b then
-                err (DbError.constraintViolation "SUM の結果が DECIMAL の範囲を超えました")
+                DbErr(DbError.constraintViolation "SUM の結果が DECIMAL の範囲を超えました")
             else
-                ret (a + b)
-
-        let keepExtreme v wins bumped set seen =
-            function
-            | None -> ret (set { bumped with Seen = seen } v)
-            | Some cur ->
-                SqlValue.compareValues v cur
-                |> Result.map (fun c ->
-                    if wins c then
-                        set { bumped with Seen = seen } v
-                    else
-                        { bumped with Seen = seen })
+                DbOk(a + b)
 
         let addValue acc bump v newSeen =
             match acc.Kind with
-            | AggFunc.Count -> ret { bump with Seen = newSeen }
+            | AggFunc.Count -> DbOk { bump with Seen = newSeen }
             | AggFunc.Sum
             | AggFunc.Avg ->
                 match v with
                 | SqlValue.Real f ->
-                    ret
+                    DbOk
                         { bump with
                             SawReal = true
                             SumReal = acc.SumReal + float acc.SumDecimal + f
@@ -314,26 +327,50 @@ module internal Ops =
                     match SqlValue.asNumeric v with
                     | Some d ->
                         if acc.SawReal then
-                            ret
+                            DbOk
                                 { bump with
                                     SumReal = acc.SumReal + float d
                                     Seen = newSeen
                                 }
                         else
                             addDecimal acc.SumDecimal d
-                            |> Result.map (fun sum ->
+                            |> DbResult.map (fun sum ->
                                 { bump with
                                     SumDecimal = sum
                                     Seen = newSeen
                                 })
-                    | None -> err (DbError.internalError "数値の変換に失敗しました（内部不整合）")
+                    | None -> DbErr(DbError.internalError "数値の変換に失敗しました（内部不整合）")
                 | _ ->
-                    err (
+                    DbErr(
                         sprintf "%s は数値だけを受け付けますが %s です" acc.Kind.Name (SqlLiteral.toSqlLiteral v)
                         |> DbError.typeError
                     )
-            | AggFunc.Min -> keepExtreme v (fun c -> c < 0) bump (fun b x -> { b with Min = Some x }) newSeen acc.Min
-            | AggFunc.Max -> keepExtreme v (fun c -> c > 0) bump (fun b x -> { b with Max = Some x }) newSeen acc.Max
+            | AggFunc.Min ->
+                let updated = { bump with Seen = newSeen }
+
+                match acc.Min with
+                | None -> DbOk { updated with Min = Some v }
+                | Some cur ->
+                    match SqlValue.compareValuesV v cur with
+                    | DbErr e -> DbErr e
+                    | DbOk c ->
+                        if c < 0 then
+                            DbOk { updated with Min = Some v }
+                        else
+                            DbOk updated
+            | AggFunc.Max ->
+                let updated = { bump with Seen = newSeen }
+
+                match acc.Max with
+                | None -> DbOk { updated with Max = Some v }
+                | Some cur ->
+                    match SqlValue.compareValuesV v cur with
+                    | DbErr e -> DbErr e
+                    | DbOk c ->
+                        if c > 0 then
+                            DbOk { updated with Max = Some v }
+                        else
+                            DbOk updated
 
         let addAcc acc value isStar distinct =
             let alreadySeen =
@@ -343,7 +380,7 @@ module internal Ops =
                    | _ -> false
 
             if alreadySeen then
-                ret acc
+                DbOk acc
             else
                 let counted =
                     if isStar then
@@ -364,25 +401,27 @@ module internal Ops =
                         acc.Seen
 
                 match counted with
-                | None -> ret { acc with Seen = newSeen }
+                | None -> DbOk { acc with Seen = newSeen }
                 | Some v -> addValue acc bump v newSeen
 
         let add star distinct arg acc row =
             if star then
                 addAcc acc None true distinct
             else
-                Eval.evalWith resolve row arg >>= fun v -> addAcc acc (Some v) false distinct
+                match Eval.evalWithV resolve row arg with
+                | DbErr e -> DbErr e
+                | DbOk v -> addAcc acc (Some v) false distinct
 
         let addToBucket (bucket: ResizeArray<Acc>) row =
             let rec step i =
                 if i >= aggs.Length then
-                    ret ()
+                    DbOk()
                 else
                     let _, star, distinct, arg = aggs.[i]
 
                     match add star distinct arg bucket.[i] row with
-                    | Error e -> err e
-                    | Ok acc ->
+                    | DbErr e -> DbErr e
+                    | DbOk acc ->
                         bucket.[i] <- acc
                         step (i + 1)
 
@@ -434,17 +473,17 @@ module internal Ops =
 
         let rec consume cur =
             match Op.next cur with
-            | Error e -> err e
-            | Ok None -> ret ()
-            | Ok(Some(row, nxt)) ->
+            | OpStep.OpError e -> err e
+            | OpStep.OpDone -> ret ()
+            | OpStep.OpRow(row, nxt) ->
                 match keyOfRow row with
-                | Error e -> err e
-                | Ok k ->
+                | DbErr e -> err e
+                | DbOk k ->
                     match buckets.TryGetValue k with
                     | true, bucket ->
                         match addToBucket bucket row with
-                        | Error e -> err e
-                        | Ok() -> consume nxt
+                        | DbErr e -> err e
+                        | DbOk() -> consume nxt
                     | _ ->
                         if order.Count >= groupBudget then
                             sprintf "GROUP BY のグループ数が多すぎます（上限 %d）。条件で絞るか、サンプリングしてください" groupBudget
@@ -454,8 +493,8 @@ module internal Ops =
                             let bucket = newBucket ()
 
                             match addToBucket bucket row with
-                            | Error e -> err e
-                            | Ok() ->
+                            | DbErr e -> err e
+                            | DbOk() ->
                                 buckets.[k] <- bucket
                                 order.Add k
                                 consume nxt
@@ -466,7 +505,7 @@ module internal Ops =
             else
                 Op.compute (fun () ->
                     let key = order.[i]
-                    ret (Some(rowOf buckets.[key] key, emitGroups (i + 1))))
+                    OpStep.OpRow(rowOf buckets.[key] key, emitGroups (i + 1)))
 
         result {
             do! consume src
@@ -492,9 +531,9 @@ module internal Ops =
     let private toArrayWithBudget (budget: int64) =
         let rec go used acc cur =
             match Op.next cur with
-            | Error e -> err e
-            | Ok None -> ret (List.rev acc |> List.toArray)
-            | Ok(Some(row, nxt)) ->
+            | OpStep.OpError e -> err e
+            | OpStep.OpDone -> ret (List.rev acc |> List.toArray)
+            | OpStep.OpRow(row, nxt) ->
                 let used = used + int64 (ValueCodec.managedRowBytes row) + 32L
 
                 if used > budget then
@@ -530,7 +569,7 @@ module internal Ops =
         (lrow: SqlValue array)
         =
         let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
-        let joinPred l r = Eval.matchesJoined resolve l r
+        let joinPred l r = Eval.matchesJoinedV resolve l r
 
         // 1回の Op.next で「一致するまで右を進める」。
         // 候補ごとに Op.compute を作らないので、一致しない行が多い結合で割当が増えない。
@@ -544,9 +583,9 @@ module internal Ops =
                 let rrow = rightRows.[j]
 
                 match joinPred lrow rrow on with
-                | Ok true -> ret (Some(Array.append lrow rrow, loop true (j + 1)))
-                | Ok false -> advance matched (j + 1)
-                | Error e -> Op.next (onError e matched)
+                | DbOk true -> OpStep.OpRow(Array.append lrow rrow, loop true (j + 1))
+                | DbOk false -> advance matched (j + 1)
+                | DbErr e -> Op.next (onError e matched)
 
         loop false 0
 
@@ -563,7 +602,7 @@ module internal Ops =
                             rightSchema
                             on
                             (fun _ -> joinRows lnext rightRows)
-                            (fun e _ -> Op.compute (fun () -> err e))
+                            (fun e _ -> Op.compute (fun () -> OpStep.OpError e))
                             rightRows
                             lrow
                     ))
@@ -584,7 +623,7 @@ module internal Ops =
                         else
                             Op.emit (padWithNulls lrow width) (joinRows width lnext rightRows)
 
-                    let onError e _ = Op.compute (fun () -> err e)
+                    let onError e _ = Op.compute (fun () -> OpStep.OpError e)
                     Op.next (joinLoop leftSchema rightSchema on onExhausted onError rightRows lrow))
                 cur
 
@@ -601,8 +640,8 @@ module internal Ops =
     /// 左右の行を連結せずに評価する。
     let private residualMatches resolve lrow rrow =
         function
-        | None -> ret true
-        | Some p -> Eval.matchesJoined resolve lrow rrow p
+        | None -> DbOk true
+        | Some p -> Eval.matchesJoinedV resolve lrow rrow p
 
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
     /// lookupRows は左キーから右行のリストを返す（見つからなければ空）。
@@ -628,29 +667,29 @@ module internal Ops =
                 (fun lrow lnext ->
                     if hasNullKey lrow leftKeys then
                         if isLeft then
-                            Op.next (Op.compute (fun () -> ret (Some(padded lrow, probe lnext))))
+                            OpStep.OpRow(padded lrow, probe lnext)
                         else
                             Op.next (probe lnext)
                     else
                         match lookupRows (keyOf lrow leftKeys) with
-                        | Error e -> err e
+                        | Error e -> OpStep.OpError e
                         | Ok rows -> Op.next (emit lrow lnext rows 0 false))
                 cur
 
         and emit lrow lnext rows i matched =
             if i >= rows.Count then
                 if isLeft && not matched then
-                    Op.compute (fun () -> ret (Some(padded lrow, probe lnext)))
+                    Op.compute (fun () -> OpStep.OpRow(padded lrow, probe lnext))
                 else
                     probe lnext
             else
                 let rrow = rows.[i]
 
                 match residualMatches resolve lrow rrow residual with
-                | Error e -> Op.compute (fun () -> err e)
-                | Ok false -> Op.compute (fun () -> Op.next (emit lrow lnext rows (i + 1) matched))
-                | Ok true ->
-                    Op.compute (fun () -> ret (Some(Array.append lrow rrow, emit lrow lnext rows (i + 1) true)))
+                | DbErr e -> Op.compute (fun () -> OpStep.OpError e)
+                | DbOk false -> Op.compute (fun () -> Op.next (emit lrow lnext rows (i + 1) matched))
+                | DbOk true ->
+                    Op.compute (fun () -> OpStep.OpRow(Array.append lrow rrow, emit lrow lnext rows (i + 1) true))
 
         probe left
 
@@ -723,20 +762,20 @@ module internal Ops =
     let private pullMergeSide (side: MergeSide) =
         let fromOp op =
             match Op.next op with
-            | Error e -> err e
-            | Ok None -> ret MergeDone
-            | Ok(Some(row, rest)) -> ret (MergeAt(row, rest))
+            | OpStep.OpError e -> DbErr e
+            | OpStep.OpDone -> DbOk MergeDone
+            | OpStep.OpRow(row, rest) -> DbOk(MergeAt(row, rest))
 
         match side with
         | MergeStart op
         | MergeAt(_, op) -> fromOp op
-        | MergeDone -> ret MergeDone
+        | MergeDone -> DbOk MergeDone
 
     /// まだ 1行も取り出していなければ、先頭行を先読みする。
     let private ensureMergeSide (side: MergeSide) =
         match side with
         | MergeStart _ -> pullMergeSide side
-        | _ -> ret side
+        | _ -> DbOk side
 
     /// 結合キーの比較（NULL は呼び出し側で除く）。
     /// キー配列を作らずに、行とキー列位置から直接比較する。
@@ -749,12 +788,12 @@ module internal Ops =
         (right: SqlValue array)
         =
         if i >= leftKeys.Length then
-            ret 0
+            DbOk 0
         else
-            match SqlValue.compareValues left.[leftKeys.[i]] right.[rightKeys.[i]] with
-            | Error e -> err e
-            | Ok 0 -> compareKeyVectors (i + 1) leftKeys left rightKeys right
-            | Ok c -> ret c
+            match SqlValue.compareValuesV left.[leftKeys.[i]] right.[rightKeys.[i]] with
+            | DbErr e -> DbErr e
+            | DbOk 0 -> compareKeyVectors (i + 1) leftKeys left rightKeys right
+            | DbOk c -> DbOk c
 
     /// 等値キーの行をまとめて取り出す（入力はキー昇順）。
     /// 返り値は (グループの行, グループの次の行を含む状態)。
@@ -766,13 +805,13 @@ module internal Ops =
         | MergeAt(first, _) ->
             let rec go used acc current =
                 match pullMergeSide current with
-                | Error e -> err e
-                | Ok MergeDone -> ret (List.rev acc |> List.toArray, MergeDone)
-                | Ok(MergeStart _) -> DbError.internalError "merge join: 入力状態が不正です" |> err
-                | Ok(MergeAt(row, _) as next) ->
+                | DbErr e -> err e
+                | DbOk MergeDone -> ret (List.rev acc |> List.toArray, MergeDone)
+                | DbOk(MergeStart _) -> DbError.internalError "merge join: 入力状態が不正です" |> err
+                | DbOk(MergeAt(row, _) as next) ->
                     match compareKeyVectors 0 keys first keys row with
-                    | Error e -> err e
-                    | Ok 0 ->
+                    | DbErr e -> err e
+                    | DbOk 0 ->
                         let used = used + int64 (ValueCodec.managedRowBytes row) + 32L
 
                         if used > JoinBudgetBytes then
@@ -781,7 +820,7 @@ module internal Ops =
                             |> err
                         else
                             go used (row :: acc) next
-                    | Ok _ -> ret (List.rev acc |> List.toArray, next)
+                    | DbOk _ -> ret (List.rev acc |> List.toArray, next)
 
             let firstBytes = int64 (ValueCodec.managedRowBytes first) + 32L
 
@@ -818,13 +857,13 @@ module internal Ops =
             | MergeStart _, _ ->
                 Op.compute (fun () ->
                     match ensureMergeSide lside with
-                    | Error e -> err e
-                    | Ok lnext -> Op.next (loop lnext rside))
+                    | DbErr e -> OpStep.OpError e
+                    | DbOk lnext -> Op.next (loop lnext rside))
             | _, MergeStart _ ->
                 Op.compute (fun () ->
                     match ensureMergeSide rside with
-                    | Error e -> err e
-                    | Ok rnext -> Op.next (loop lside rnext))
+                    | DbErr e -> OpStep.OpError e
+                    | DbOk rnext -> Op.next (loop lside rnext))
             | MergeDone, _ -> Op.Empty
             | _, MergeDone ->
                 if not isLeft then
@@ -834,47 +873,47 @@ module internal Ops =
                     | MergeAt(lrow, _) ->
                         Op.compute (fun () ->
                             match pullMergeSide lside with
-                            | Error e -> err e
-                            | Ok lnext -> ret (Some(padded lrow, loop lnext MergeDone)))
+                            | DbErr e -> OpStep.OpError e
+                            | DbOk lnext -> OpStep.OpRow(padded lrow, loop lnext MergeDone))
                     | _ -> Op.Empty
             | MergeAt(lrow, _), MergeAt(rrow, _) ->
                 if hasNullKey lrow leftKeys then
                     Op.compute (fun () ->
                         match pullMergeSide lside with
-                        | Error e -> err e
-                        | Ok lnext ->
+                        | DbErr e -> OpStep.OpError e
+                        | DbOk lnext ->
                             if isLeft then
-                                ret (Some(padded lrow, loop lnext rside))
+                                OpStep.OpRow(padded lrow, loop lnext rside)
                             else
                                 Op.next (loop lnext rside))
                 elif hasNullKey rrow rightKeys then
                     Op.compute (fun () ->
                         match pullMergeSide rside with
-                        | Error e -> err e
-                        | Ok rnext -> Op.next (loop lside rnext))
+                        | DbErr e -> OpStep.OpError e
+                        | DbOk rnext -> Op.next (loop lside rnext))
                 else
                     match compareKeyVectors 0 leftKeys lrow rightKeys rrow with
-                    | Error e -> Op.compute (fun () -> err e)
-                    | Ok c when c < 0 ->
+                    | DbErr e -> Op.compute (fun () -> OpStep.OpError e)
+                    | DbOk c when c < 0 ->
                         Op.compute (fun () ->
                             match pullMergeSide lside with
-                            | Error e -> err e
-                            | Ok lnext ->
+                            | DbErr e -> OpStep.OpError e
+                            | DbOk lnext ->
                                 if isLeft then
-                                    ret (Some(padded lrow, loop lnext rside))
+                                    OpStep.OpRow(padded lrow, loop lnext rside)
                                 else
                                     Op.next (loop lnext rside))
-                    | Ok c when c > 0 ->
+                    | DbOk c when c > 0 ->
                         Op.compute (fun () ->
                             match pullMergeSide rside with
-                            | Error e -> err e
-                            | Ok rnext -> Op.next (loop lside rnext))
-                    | Ok _ ->
+                            | DbErr e -> OpStep.OpError e
+                            | DbOk rnext -> Op.next (loop lside rnext))
+                    | DbOk _ ->
                         match takeMergeGroup leftKeys lside with
-                        | Error e -> Op.compute (fun () -> err e)
+                        | Error e -> Op.compute (fun () -> OpStep.OpError e)
                         | Ok(lgroup, lnext) ->
                             match takeMergeGroup rightKeys rside with
-                            | Error e -> Op.compute (fun () -> err e)
+                            | Error e -> Op.compute (fun () -> OpStep.OpError e)
                             | Ok(rgroup, rnext) -> emitGroup lgroup rgroup lnext rnext 0 0 false
 
         and emitGroup lgroup rgroup lnext rnext i j matchedThisRow =
@@ -883,22 +922,22 @@ module internal Ops =
             elif j >= rgroup.Length then
                 if isLeft && not matchedThisRow then
                     Op.compute (fun () ->
-                        ret (Some(padded lgroup.[i], emitGroup lgroup rgroup lnext rnext (i + 1) 0 false)))
+                        OpStep.OpRow(padded lgroup.[i], emitGroup lgroup rgroup lnext rnext (i + 1) 0 false))
                 else
-                    emitGroup lgroup rgroup lnext rnext (i + 1) 0 false
+                    Op.compute (fun () -> Op.next (emitGroup lgroup rgroup lnext rnext (i + 1) 0 false))
             else
                 let lrow = lgroup.[i]
                 let rrow = rgroup.[j]
 
                 match residualMatches resolve lrow rrow residual with
-                | Error e -> Op.compute (fun () -> err e)
-                | Ok false ->
+                | DbErr e -> Op.compute (fun () -> OpStep.OpError e)
+                | DbOk false ->
                     Op.compute (fun () -> Op.next (emitGroup lgroup rgroup lnext rnext i (j + 1) matchedThisRow))
-                | Ok true ->
+                | DbOk true ->
                     Op.compute (fun () ->
-                        ret (Some(Array.append lrow rrow, emitGroup lgroup rgroup lnext rnext i (j + 1) true)))
+                        OpStep.OpRow(Array.append lrow rrow, emitGroup lgroup rgroup lnext rnext i (j + 1) true))
 
-        Op.compute (fun () -> Op.next (loop (MergeStart left) (MergeStart right)))
+        loop (MergeStart left) (MergeStart right)
 
     /// INNER JOIN（マージ結合）。両入力は結合キーで昇順であること。
     /// 右側を materialize しないので、右が大きなテーブルでもメモリはキー重複分だけで済む。
@@ -972,22 +1011,42 @@ module internal Ops =
             let wholeOffsets = wholeGroupOffsets groupBy
             let resolve = Eval.resolver schema
 
+            let evalItems row (exprs: Expr list) =
+                let values = Array.zeroCreate<SqlValue> exprs.Length
+
+                let rec fill i =
+                    function
+                    | [] -> DbOk values
+                    | e :: tail ->
+                        match Eval.evalWithV resolve row e with
+                        | DbErr er -> DbErr er
+                        | DbOk v ->
+                            values.[i] <- v
+                            fill (i + 1) tail
+
+                fill 0 exprs
+
             if List.isEmpty foundAggs && List.isEmpty groupBy then
-                Op.map
-                    (fun row ->
-                        allExprs
-                        |> List.map (Eval.evalWith resolve row)
-                        |> all
-                        |> Result.map List.toArray)
-                    src
+                Op.map (fun row -> evalItems row allExprs) src
             else
                 let resolveAgg = Eval.resolver Schema.empty
 
                 Op.map
                     (fun row ->
-                        allExprs
-                        |> List.map (fun e ->
-                            substituteAggs offsets wholeOffsets row e >>= Eval.evalWith resolveAgg row)
-                        |> all
-                        |> Result.map List.toArray)
+                        let values = Array.zeroCreate<SqlValue> allExprs.Length
+
+                        let rec fill i =
+                            function
+                            | [] -> DbOk values
+                            | e :: tail ->
+                                match substituteAggs offsets wholeOffsets row e with
+                                | Error er -> DbErr er
+                                | Ok e ->
+                                    match Eval.evalWithV resolveAgg row e with
+                                    | DbErr er -> DbErr er
+                                    | DbOk v ->
+                                        values.[i] <- v
+                                        fill (i + 1) tail
+
+                        fill 0 allExprs)
                     src

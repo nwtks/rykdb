@@ -36,12 +36,12 @@ let ``ExtSort.sortRows: バジェットが小さいと一時ファイルに溢�
         |> List.map (fun i -> row [ SqlValue.Int(int64 ((i * 37 + 11) % n)); SqlValue.Int(int64 i) ])
 
     let cmp (a: SqlValue array) (b: SqlValue array) =
-        match SqlValue.compareValues a.[0] b.[0] with
+        match compareValues a.[0] b.[0] with
         | Ok c -> c
         | Error _ -> 0
 
     let sorted =
-        ok (ExtSort.sortRows 1L Map.empty (fun _ _ -> ret Map.empty) cmp (opOfRows shuffled))
+        ok (ExtSort.sortRows 1L Map.empty (fun _ _ -> DbOk Map.empty) cmp (opOfRows shuffled))
 
     let rows = ok (Op.toArray sorted)
     Assert.Equal<int>(n, rows.Length)
@@ -67,17 +67,17 @@ let ``ExtSort.sortRows: 50000行を小さなバジェットで溢らしても整
         else
             Op.compute (fun () ->
                 let v = int64 ((i * 7919 + 13) % n)
-                ret (Some(row [ SqlValue.Int v; SqlValue.Int(int64 i) ], make (i + 1))))
+                OpStep.OpRow(row [ SqlValue.Int v; SqlValue.Int(int64 i) ], make (i + 1)))
 
     let cmp (a: SqlValue array) (b: SqlValue array) =
-        match SqlValue.compareValues a.[0] b.[0] with
+        match compareValues a.[0] b.[0] with
         | Ok c -> c
         | Error _ -> 0
 
     // バジェット 256バイト → 数百個の run が生まれる。
     // run は MaxFanIn（32）を超えるので、中間 run への multi-pass merge も通る。
     let sorted =
-        ok (ExtSort.sortRows 256L Map.empty (fun _ _ -> ret Map.empty) cmp (make 0))
+        ok (ExtSort.sortRows 256L Map.empty (fun _ _ -> DbOk Map.empty) cmp (make 0))
 
     let rows = ok (Op.toArray sorted)
     Assert.Equal<int>(n, rows.Length)

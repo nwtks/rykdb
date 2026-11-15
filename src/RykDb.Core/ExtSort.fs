@@ -243,7 +243,7 @@ module internal ExtSort =
     let sortRows
         (budgetBytes: int64)
         (init: 'S)
-        (check: 'S -> SqlValue array -> Result<'S, DbError>)
+        (check: 'S -> SqlValue array -> DbResult<'S>)
         (compareRows: SqlValue array -> SqlValue array -> int)
         (src: Op)
         =
@@ -384,9 +384,9 @@ module internal ExtSort =
         let rec mergeRuns states =
             Op.compute (fun () ->
                 match pull states with
-                | Error e -> err e
-                | Ok None -> ret None
-                | Ok(Some(row, rest)) -> ret (Some(row, mergeRuns rest)))
+                | Error e -> OpStep.OpError e
+                | Ok None -> OpStep.OpDone
+                | Ok(Some(row, rest)) -> OpStep.OpRow(row, mergeRuns rest))
 
         let finish stamp buf written paths =
             if List.isEmpty paths then
@@ -417,16 +417,16 @@ module internal ExtSort =
 
         let rec ingest stamp buf bufBytes written paths state next =
             match Op.next next with
-            | Error e ->
+            | OpStep.OpError e ->
                 Spill.forget paths
                 err e
-            | Ok None -> finish stamp buf written paths
-            | Ok(Some(row, tail)) ->
+            | OpStep.OpDone -> finish stamp buf written paths
+            | OpStep.OpRow(row, tail) ->
                 match check state row with
-                | Error e ->
+                | DbErr e ->
                     Spill.forget paths
                     err e
-                | Ok state' ->
+                | DbOk state' ->
                     let size = int64 (ValueCodec.managedRowBytes row)
 
                     if buf.Count > 0 && bufBytes + size > budgetBytes then

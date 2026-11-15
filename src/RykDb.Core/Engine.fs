@@ -162,9 +162,9 @@ module internal Ddl =
                 ret (List.rev acc, op)
             else
                 match Op.next op with
-                | Error e -> err e
-                | Ok None -> ret (List.rev acc, Op.Empty)
-                | Ok(Some(row, rest)) -> loop (row :: acc) (n - 1) rest
+                | OpStep.OpError e -> err e
+                | OpStep.OpDone -> ret (List.rev acc, Op.Empty)
+                | OpStep.OpRow(row, rest) -> loop (row :: acc) (n - 1) rest
 
         loop []
 

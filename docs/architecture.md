@@ -846,8 +846,20 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
   実測では式あたりの割当が 568B → 1144B に悪化した。
 - `SqlValue.Bool` は true / false の 2種類しかないので
   `SqlValue.TrueValue` / `FalseValue` / `ofBool` で共有する。
-- 残る割当の主なものは `Kont` のオブジェクト / リストセル、`Result` の `Ok`、 `SqlValue`（参照型 DU）。
-  この削減はスタック再利用や式評価の fast path として別途扱う。
+- 評価機の内部結果は `[<Struct>] DbResult<'T>`（`DbOk` / `DbErr`）。
+  FSharp.Core の `Result` は参照 DU で、成功パスでも `Ok` を 1個確保する。
+  `Eval.step` / `valueAt` / `compare` / `truthOf` と `SqlValue.compareValuesV` は `DbResult` を返し、
+  公開 API の境界（`Database` / `Session` / `Op.toArrayLimited`）で `Result` に戻す。
+  `Eval.evalWith` / `matchesWith` / `matchesJoined` は境界用のラッパー。
+- pull 層の 1行は `[<Struct>] OpStep`（`OpDone` / `OpError` / `OpRow`）。
+  `Op.next` は `Result<(row * Op) option, _>` を返さないので、 `Ok` + `Some` + tuple を確保しない。
+  `Op.map` / `Op.filter` のコールバックも `DbResult`。
+  `Op` のケースは `.fsi` で隠したまま、`OpStep` のケースだけ公開する。
+- 残る割当の主なものは `Kont` のオブジェクト / リストセル、`SqlValue`（参照型 DU）、
+  `Op.compute` のクロージャ（`map` / `filter` / JOIN の 1行ごと）。
+  `Result` の `Ok` は、Release の式評価のように JIT がスタック割当・除去できる文脈では割当計測に出ない
+  （`EvalBenchmarks` は不変）。
+  実際に効くのは `Op` のデリゲート境界を越える `Ok` / `Some` / tuple（`OpBenchmarks`）。
 
 **列が必要ないスキャンと列マスク復号**
 

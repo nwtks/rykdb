@@ -88,6 +88,39 @@ module DbError =
         | None, Some d -> sprintf "%s [%s]" e.Message d
         | None, None -> e.Message
 
+/// 成功値の割当を避けるための内部専用 Result。
+/// <remarks>
+/// FSharp.Core の `Result` は参照 DU なので、成功パスでも `Ok` を 1個確保する。
+/// 行ごと・値ごとに評価するホットパスではこの struct 版を使い、
+/// 公開 API の境界（`Database` / `Session` / `Op.toArrayLimited`）で `Result` に戻す。
+/// ケースは struct DU のためフィールド名を付ける（FS3585）。
+/// `Unchecked.defaultof` で作らないこと（tag 0 = `DbOk` の既定値になる）。
+/// コレクションの要素にしないこと（セルが大きくなり、コピーも増える）。
+/// </remarks>
+[<Struct>]
+type internal DbResult<'T> =
+    | DbOk of value: 'T
+    | DbErr of error: DbError
+
+[<RequireQualifiedAccess>]
+module internal DbResult =
+    /// 公開境界の `Result` へ戻す。
+    let inline toResult (r: DbResult<'T>) =
+        match r with
+        | DbOk v -> Ok v
+        | DbErr e -> Error e
+
+    /// 公開境界の `Result` から内部表現へ変換する（成功値の確保は増えない）。
+    let inline ofResult (r: Result<'T, DbError>) =
+        match r with
+        | Ok v -> DbOk v
+        | Error e -> DbErr e
+
+    let inline map (f: 'T -> 'U) (r: DbResult<'T>) =
+        match r with
+        | DbOk v -> DbOk(f v)
+        | DbErr e -> DbErr e
+
 /// Result<'T, DbError> の計算式ビルダ。
 /// let! で失敗の伝播、return! で早期脱出ができる。
 type internal DbResultBuilder() =
@@ -130,6 +163,13 @@ module internal ResultOps =
     let inline ret (x: 'a) = Ok x
 
     let inline err (e: DbError) = Error e
+
+    /// 共有の成功値。
+    /// `Result` は参照 DU なので `Ok()` / `Ok true` / `Ok false` を書くとそのたびに確保する。
+    /// 行ごと・値ごとに返す箇所ではこの定数を使う。
+    let OkUnit: Result<unit, DbError> = Ok()
+    let OkTrue: Result<bool, DbError> = Ok true
+    let OkFalse: Result<bool, DbError> = Ok false
 
     /// Result の列を左から畳み込み、全て Ok なら値のリストを返す。
     /// 最初の Error で打ち切り、残りの項目は列挙しない（`foldOk` と同じ規則）。

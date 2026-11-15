@@ -37,11 +37,12 @@ type private Options =
 
 let private usage () =
     printfn
-        "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|compaction|eval] [--quick|--dry] [--filter <pattern>]"
+        "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|compaction|eval|op] [--quick|--dry] [--filter <pattern>]"
 
     printfn "  --class query       クエリ系のみ"
     printfn "  --class compaction  compaction のみ"
     printfn "  --class eval        式評価器のマイクロベンチのみ"
+    printfn "  --class op          Op（pull 演算子）のマイクロベンチのみ"
     printfn "  --quick             短いジョブ（既定より速いが精度は低い）"
     printfn "  --dry               1回だけ実行して設定を検証する"
     printfn "  --filter <pattern>  シナリオ名で絞る（例: *QueryBenchmarks.PointLookup）"
@@ -91,9 +92,10 @@ let main argv =
     | None
     | Some "query"
     | Some "compaction"
-    | Some "eval" -> ()
+    | Some "eval"
+    | Some "op" -> ()
     | Some other ->
-        eprintfn "不明な --class です: %s（query / compaction / eval）" other
+        eprintfn "不明な --class です: %s（query / compaction / eval / op）" other
         exit 2
 
     let job =
@@ -130,6 +132,12 @@ let main argv =
         | Some "eval" -> true
         | _ -> false
 
+    let runOp =
+        match options.Class with
+        | None
+        | Some "op" -> true
+        | _ -> false
+
     printfn "RykDb benchmarks（CI ではビルドのみ。実行は手元で -c Release）"
 
     // `--filter` は BenchmarkDotNet の引数としてそのまま渡す。
@@ -147,5 +155,8 @@ let main argv =
 
     if runEval then
         BenchmarkRunner.Run<EvalBenchmarks>(config, filterArgs) |> ignore
+
+    if runOp then
+        BenchmarkRunner.Run<OpBenchmarks>(config, filterArgs) |> ignore
 
     0

@@ -360,6 +360,8 @@ type EvalBenchmarks() =
 
     let resolver = Eval.resolver schema
     let row = [| SqlValue.Int 500L; SqlValue.Int 10L |]
+    let compareA = SqlValue.Int 1L
+    let compareB = SqlValue.Int 2L
 
     let col name =
         Expr.Column { Qualifier = Some "t"; Name = name }
@@ -381,19 +383,83 @@ type EvalBenchmarks() =
         )
 
     [<Benchmark>]
-    member _.MatchesLiteral() =
-        Eval.matchesWith resolver row (Expr.Literal(Literal.Int 1L))
+    member _.MatchesLiteralV() =
+        Eval.matchesWithV resolver row (Expr.Literal(Literal.Int 1L)) |> ignore
+
+    [<Benchmark>]
+    member _.MatchesColumnV() =
+        Eval.matchesWithV resolver row (col "a") |> ignore
+
+    [<Benchmark>]
+    member _.MatchesBinaryV() =
+        Eval.matchesWithV resolver row binary |> ignore
+
+    [<Benchmark>]
+    member _.MatchesComplexV() =
+        Eval.matchesWithV resolver row complex |> ignore
+
+    [<Benchmark>]
+    member _.MatchesComplexJoinedV() =
+        Eval.matchesJoinedV resolver row row complex |> ignore
+
+    [<Benchmark>]
+    member _.CompareValuesV() =
+        match SqlValue.compareValuesV compareA compareB with
+        | DbOk _ -> ()
+        | DbErr _ -> failwith "比較できませんでした"
+
+/// Op（Volcano pull）のマイクロベンチ。
+/// DB を使わず、pull 層（`Op.next` / `Op.pull` / `map` / `filter` / `skip` / `take`）の割当を見る。
+[<MemoryDiagnoser>]
+type OpBenchmarks() =
+    /// 1行 2列（a, b）。フィルタは a、変換は b を使う。
+    let rows =
+        Array.init 10_000 (fun i -> [| SqlValue.Int(int64 i); SqlValue.Int(int64 (i % 100)) |])
+
+    /// a >= 5000 だけ通す。
+    let predicate (r: SqlValue array) =
+        DbOk(
+            match r.[0] with
+            | SqlValue.Int v -> v >= 5000L
+            | _ -> false
+        )
+
+    /// b を +1 する（新しい行を作る）。
+    let mapper (r: SqlValue array) =
+        DbOk
+            [|
+                r.[0]
+                SqlValue.Int(
+                    match r.[1] with
+                    | SqlValue.Int v -> v + 1L
+                    | _ -> 0L
+                )
+            |]
+
+    /// 1行だけの Step。`next` の呼び出しコストだけを見る（Step は純粋なので再利用してよい）。
+    let step = Op.emit [| SqlValue.Int 1L |] Op.Empty
+
+    /// 材料化だけ（`ofArray` → `toArray`）。
+    [<Benchmark>]
+    member _.OpMaterialize() =
+        Op.ofArray rows |> Op.toArray |> Check.ok |> ignore
+
+    /// filter → map → skip → take のパイプライン（10,000行のうち 1,000行を出す）。
+    [<Benchmark>]
+    member _.OpFilterMapTake() =
+        Op.ofArray rows
+        |> Op.filter predicate
+        |> Op.map mapper
+        |> Op.skip 100
+        |> Op.take 1000
+        |> Op.toArray
         |> Check.ok
         |> ignore
 
+    /// `Step` から 1行引く。`next` の `Ok` / `Some` / tuple の割当を見る。
     [<Benchmark>]
-    member _.MatchesColumn() =
-        Eval.matchesWith resolver row (col "a") |> Check.ok |> ignore
-
-    [<Benchmark>]
-    member _.MatchesBinary() =
-        Eval.matchesWith resolver row binary |> Check.ok |> ignore
-
-    [<Benchmark>]
-    member _.MatchesComplex() =
-        Eval.matchesWith resolver row complex |> Check.ok |> ignore
+    member _.NextStep() =
+        match Op.next step with
+        | OpStep.OpRow _ -> ()
+        | OpStep.OpDone -> failwith "行が返りませんでした"
+        | OpStep.OpError e -> failwith (DbError.toDisplayString e)

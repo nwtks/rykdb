@@ -9,6 +9,12 @@ namespace RykDb.Core
 /// </remarks>
 type internal Op
 
+[<Struct; NoEquality; NoComparison; RequireQualifiedAccess>]
+type internal OpStep =
+    | OpDone
+    | OpError of error: DbError
+    | OpRow of row: SqlValue array * next: Op
+
 module internal Op =
     /// 空の演算子。
     val Empty: Op
@@ -17,17 +23,17 @@ module internal Op =
     /// 1行と「その次」を返す。
     val emit: SqlValue array -> Op -> Op
     /// 「次に 1行を返す関数」から演算子を作る。
-    val compute: (unit -> Result<(SqlValue array * Op) option, DbError>) -> Op
+    val compute: (unit -> OpStep) -> Op
     /// 配列を順に返す演算子。
     val ofArray: SqlValue array array -> Op
     /// 1行取り出す。
-    val next: Op -> Result<(SqlValue array * Op) option, DbError>
+    val next: Op -> OpStep
     /// ソースの次の 1行を引き出して継続に渡す。
-    val pull: (SqlValue array -> Op -> Result<(SqlValue array * Op) option, DbError>) -> Op -> Op
+    val pull: (SqlValue array -> Op -> OpStep) -> Op -> Op
     /// 行を 1つ変換する。
-    val map: (SqlValue array -> Result<SqlValue array, DbError>) -> (Op -> Op)
+    val map: (SqlValue array -> DbResult<SqlValue array>) -> (Op -> Op)
     /// 述語で弾く。
-    val filter: (SqlValue array -> Result<bool, DbError>) -> (Op -> Op)
+    val filter: (SqlValue array -> DbResult<bool>) -> (Op -> Op)
     /// 先頭 n 行だけ。
     val take: int -> Op -> Op
     /// 先頭 n 行を読み飛ばす。

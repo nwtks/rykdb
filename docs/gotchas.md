@@ -2557,3 +2557,51 @@ type private Step =
 - 計測（10万行）: `CountStar` 約 381MB → **316MB**、
   `SelectConstant` **331MB**、`CountConstantWhere` **351MB**、
   部分列の `FilterSeqScan` 約 388MB → **363MB**。
+
+### 11.75 `Result` の `Ok` は参照型 — ホットパスは `DbResult` / `OpStep`
+
+FSharp.Core の `Result` は参照 DU なので、成功パスでも `Ok` を 1個確保する。
+Core のホットパスでは次の 2 つを使い、公開 API の境界で `Result` に戻す。
+
+- `[<Struct>] DbResult<'T> = DbOk of value | DbErr of error`（`Errors.fs`）。
+  `Eval.step` / `valueAt` / `compare` / `truthOf`、`SqlValue.compareValuesV`、
+  `Op.map` / `Op.filter` のコールバックが使う。
+- `[<Struct>] OpStep = OpDone | OpError | OpRow of row * next`（`Op.fs`）。
+  `Op.next` / `Op.compute` / `Op.pull` は `Result<(row * Op) option, _>` を返さない。
+
+罠:
+
+- struct DU のケースには**フィールド名を付ける**（FS3585）。
+  `Unchecked.defaultof` で作らない（tag 0 = `DbOk` の既定値になる）。
+  コレクションの要素にしない（セルが太る）。
+- `.fsi` では `Op` はケース非公開のまま、`OpStep` は**ケースを公開**する（他ファイルが照合する）。
+  相互再帰の `and` グループにし、`Op` が関数を含むため `[<NoEquality; NoComparison>]` を付ける。
+- **`Op.emit` の第 2 引数は即時評価される**。
+  行ループの継続を `Op.emit row (loop ...)` で繋ぐと、次の行を作る `loop` がその場で走り、
+  `StackOverflow` になる（merge join で実際に踏んだ）。
+  `Op.compute (fun () -> OpStep.OpRow(row, next))` で遅延する。
+- `DbResult` を `|> ignore` すると Debug で箱化することがある（`compareValuesV` の実測 64B/call）。
+  Release のベンチでは 0B。
+  **割当の回帰テストは Eval / Op の 0B が取れる箇所に置く**
+  （`Eval.matchesWithV` と `Op.next` は Debug でも 0B）。
+- `Result.map` を外すだけでは足りない。
+  `compareValuesV` のローカル関数や
+  `DbResult.map (fun c -> ...)` は**呼び出しごとにクロージャ**を確保するので、
+  ヘルパーはモジュール直下へ出し、`match` に展開する。
+
+実測（同一マシン、`--quick`）:
+
+- Op: `OpMaterialize` 1,462,508 → **902,508B**（-38%）、
+  `OpFilterMapTake` 1,630,520 → **1,109,720B**（-32%）、`NextStep` 56 → **0B**。
+- Query: `CountStar` 318,515 → **300,547KB**（-5.6%）、
+  `SelectConstant` 345,535 → **314,284KB**（-9.0%）、
+  `CountConstantWhere` 352,118 → **328,680KB**（-6.7%）、
+  `RangeScan` 5,017 → **4,727KB**（-5.8%）、
+  `FilterSeqScan` 360,151 → **348,588KB**（-3.2%）、
+  `MergeJoin2Tables` 127,124 → **122,147KB**（-3.9%）。
+- `EvalBenchmarks` と `NestedLoopNoMatch` はほぼ不変。
+  Release の JIT が式評価の `Ok` をスタック割当・除去するため、割当計測に出ない
+  （残るのは `Kont` / リストセル / `SqlValue`）。
+- 残りの大きな割当は `SstScan.next` / `StorageEngine.scanAtWith` / `Sstable.parseBlockAt` の
+  `Ok` + `Some` + tuple。
+  スキャン系をさらに削るならこの層（Phase D）。

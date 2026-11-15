@@ -120,7 +120,7 @@ let private label (a: SqlValue) (b: SqlValue) =
     sprintf "a=[%s] b=[%s]" (String.concat ", " (render [| a |])) (String.concat ", " (render [| b |]))
 
 let private assertSameTypeOrder (a: SqlValue) (b: SqlValue) =
-    let comparison = ok (SqlValue.compareValues a b)
+    let comparison = ok (compareValues a b)
     let keyA = keyOf a
     let keyB = keyOf b
     let keyComparison = compareKeyBytes keyA keyB

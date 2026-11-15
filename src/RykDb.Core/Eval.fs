@@ -223,7 +223,7 @@ module internal Scalar =
 
         let arity (n: int) =
             if args.Length = n then
-                ret ()
+                OkUnit
             else
                 err (sprintf "%s 関数は %d個の引数が必要ですが、%d個渡されました" upper n args.Length |> DbError.name)
 
@@ -331,7 +331,7 @@ module internal Eval =
         | Mod
 
     let private overflowError () =
-        err (DbError.constraintViolation "数値演算の結果が表現可能な範囲を超えました")
+        DbErr(DbError.constraintViolation "数値演算の結果が表現可能な範囲を超えました")
 
     let private intArith (op: ArithOp) (a: int64) (b: int64) =
         let x = System.Numerics.BigInteger a
@@ -351,7 +351,7 @@ module internal Eval =
         then
             overflowError ()
         else
-            ret (SqlValue.Int(int64 r))
+            DbOk(SqlValue.Int(int64 r))
 
     let private decimalArith (op: ArithOp) (a: decimal) (b: decimal) =
         let maxD = System.Decimal.MaxValue
@@ -360,11 +360,11 @@ module internal Eval =
         match op with
         | Add when a > 0M && b > 0M && a > maxD - b -> overflowError ()
         | Add when a < 0M && b < 0M && a < minD - b -> overflowError ()
-        | Add -> ret (SqlValue.Decimal(a + b))
+        | Add -> DbOk(SqlValue.Decimal(a + b))
         | Sub when a < 0M && b > 0M && a < minD + b -> overflowError ()
         | Sub when a > 0M && b < 0M && a > maxD + b -> overflowError ()
-        | Sub -> ret (SqlValue.Decimal(a - b))
-        | Mul when a = 0M || b = 0M -> ret (SqlValue.Decimal 0M)
+        | Sub -> DbOk(SqlValue.Decimal(a - b))
+        | Mul when a = 0M || b = 0M -> DbOk(SqlValue.Decimal 0M)
         | Mul ->
             let aa = abs a
             let bb = abs b
@@ -373,14 +373,14 @@ module internal Eval =
             if overflows then
                 overflowError ()
             else
-                ret (SqlValue.Decimal(a * b))
+                DbOk(SqlValue.Decimal(a * b))
         | Div when abs b < 1M ->
             if abs a > maxD * abs b then
                 overflowError ()
             else
-                ret (SqlValue.Decimal(a / b))
-        | Div -> ret (SqlValue.Decimal(a / b))
-        | Mod -> ret (SqlValue.Decimal(a % b))
+                DbOk(SqlValue.Decimal(a / b))
+        | Div -> DbOk(SqlValue.Decimal(a / b))
+        | Mod -> DbOk(SqlValue.Decimal(a % b))
 
     let private realArith (op: ArithOp) (a: float) (b: float) =
         let r =
@@ -391,7 +391,7 @@ module internal Eval =
             | Div -> a / b
             | Mod -> a % b
 
-        ret (SqlValue.vReal r)
+        DbOk(SqlValue.vReal r)
 
     let private decimalOf (v: SqlValue) =
         match v with
@@ -420,13 +420,13 @@ module internal Eval =
             decimalArith op (decimalOf a) (decimalOf b)
         | (SqlValue.Int _ | SqlValue.Decimal _ | SqlValue.Real _),
           (SqlValue.Int _ | SqlValue.Decimal _ | SqlValue.Real _) -> realArith op (floatOf a) (floatOf b)
-        | _ -> ret SqlValue.Null
+        | _ -> DbOk SqlValue.Null
 
     let private arith (op: ArithOp) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
-            ret SqlValue.Null
+            DbOk SqlValue.Null
         elif (op = Div || op = Mod) && isZero b then
-            err (DbError.constraintViolation "0 での除算は定義されていません")
+            DbErr(DbError.constraintViolation "0 での除算は定義されていません")
         else
             liftNumeric op a b
 
@@ -452,17 +452,20 @@ module internal Eval =
     /// 比較を 3値論理に変換する。
     let private compare (opName: string) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
-            ret SqlValue.Null
+            DbOk SqlValue.Null
         else
-            SqlValue.compareValues a b
-            |> Result.map (fun c -> SqlValue.ofBool (applyComparison opName c = TruthValue.True))
+            match SqlValue.compareValuesV a b with
+            | DbErr e -> DbErr e
+            | DbOk c -> DbOk(SqlValue.ofBool (applyComparison opName c = TruthValue.True))
 
     /// WHERE 用に TruthValue で判定する（UNKNOWN は偽）。
     let private truthOf (opName: string) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
-            ret TruthValue.Unknown
+            DbOk TruthValue.Unknown
         else
-            SqlValue.compareValues a b |> Result.map (fun c -> applyComparison opName c)
+            match SqlValue.compareValuesV a b with
+            | DbErr e -> DbErr e
+            | DbOk c -> DbOk(applyComparison opName c)
 
     /// 2値（真偽を直接返す）の文脈用。
     /// NULL は False。
@@ -491,11 +494,11 @@ module internal Eval =
         if i < 0 || i >= length then
             sprintf "列インデックス %d が範囲外です（%d 列中）: %s" i length (Expr.toDisplayString e)
             |> DbError.internalError
-            |> err
+            |> DbErr
         else
             match row with
-            | Single r -> ret r.[i]
-            | Joined(l, r) -> if i < l.Length then ret l.[i] else ret r.[i - l.Length]
+            | Single r -> DbOk r.[i]
+            | Joined(l, r) -> if i < l.Length then DbOk l.[i] else DbOk r.[i - l.Length]
 
     /// SqlValue を 3値に変換する。
     /// BOOL はそのまま、NULL と BOOL 以外は UNKNOWN。
@@ -582,29 +585,29 @@ module internal Eval =
             | Expr.Value v -> step resolve row kont (Arrive v)
             | Expr.Subquery _
             | Expr.Exists _
-            | Expr.InSubquery _ -> err (DbError.create ErrorKind.SyntaxError "サブクエリはここでは使えません")
+            | Expr.InSubquery _ -> DbErr(DbError.create ErrorKind.SyntaxError "サブクエリはここでは使えません")
             | Expr.CorrelatedSubquery c ->
                 match c.Run(row.ToArray()) with
-                | Error er -> err er
+                | Error er -> DbErr er
                 | Ok v -> step resolve row kont (Arrive v)
             | Expr.Column c ->
                 match resolve.Resolve c with
-                | Error er -> err er
+                | Error er -> DbErr er
                 | Ok i ->
                     match valueAt row i e with
-                    | Error er -> err er
-                    | Ok v -> step resolve row kont (Arrive v)
+                    | DbErr er -> DbErr er
+                    | DbOk v -> step resolve row kont (Arrive v)
             | Expr.Name n ->
                 let probeRef = { Qualifier = None; Name = n }
 
                 match resolve.Resolve probeRef with
-                | Error _ -> err (sprintf "'%s' は列でも関数でもありません" n |> DbError.name)
+                | Error _ -> DbErr(sprintf "'%s' は列でも関数でもありません" n |> DbError.name)
                 | Ok i ->
-                    match valueAt row i (Expr.Column probeRef) with
-                    | Error er -> err er
-                    | Ok v -> step resolve row kont (Arrive v)
-            | Expr.Star -> err (DbError.create ErrorKind.SyntaxError "WHERE 句に '*' は置けません")
-            | Expr.QualifiedStar q -> err (sprintf "'%s.*' はここでは使えません" q |> DbError.name)
+                    match valueAt row i e with
+                    | DbErr er -> DbErr er
+                    | DbOk v -> step resolve row kont (Arrive v)
+            | Expr.Star -> DbErr(DbError.create ErrorKind.SyntaxError "WHERE 句に '*' は置けません")
+            | Expr.QualifiedStar q -> DbErr(sprintf "'%s.*' はここでは使えません" q |> DbError.name)
             | Expr.Unary(op, x) -> step resolve row (KUnary op :: kont) (Descend x)
             | Expr.Binary(op, a, b) -> step resolve row (KBinaryL(op, b) :: kont) (Descend a)
             | Expr.IsNull(x, negated) -> step resolve row (KIsNull negated :: kont) (Descend x)
@@ -624,40 +627,40 @@ module internal Eval =
                 | a :: tail -> step resolve row (KFuncArg(n, [], tail) :: kont) (Descend a)
                 | [] ->
                     match Scalar.applyFunc n [||] with
-                    | Error er -> err er
+                    | Error er -> DbErr er
                     | Ok v -> step resolve row kont (Arrive v)
             | Expr.Cast(x, dt) -> step resolve row (KCast dt :: kont) (Descend x)
-            | Expr.Default -> err (DbError.create ErrorKind.SyntaxError "DEFAULT は INSERT の VALUES でのみ使えます")
-            | Expr.AggCall(f, _, _) -> err (sprintf "%s は集約なのでここでは評価できません" f.Name |> DbError.name)
+            | Expr.Default -> DbErr(DbError.create ErrorKind.SyntaxError "DEFAULT は INSERT の VALUES でのみ使えます")
+            | Expr.AggCall(f, _, _) -> DbErr(sprintf "%s は集約なのでここでは評価できません" f.Name |> DbError.name)
         | Arrive v ->
             match kont with
-            | [] -> ret v
+            | [] -> DbOk v
             | KUnary op :: rest ->
                 let computed =
                     match op with
                     | UnaryOp.Not ->
-                        ret (
+                        DbOk(
                             if SqlValue.isNull v then
                                 SqlValue.Null
                             else
                                 SqlValue.ofBool (not (boolOf v))
                         )
-                    | UnaryOp.Pos -> ret v
+                    | UnaryOp.Pos -> DbOk v
                     | UnaryOp.Neg ->
                         if SqlValue.isNull v then
-                            ret SqlValue.Null
+                            DbOk SqlValue.Null
                         else
                             match v with
                             | SqlValue.Int i when i = System.Int64.MinValue ->
-                                err (DbError.constraintViolation "符号反転の結果が範囲を超えました")
-                            | SqlValue.Int i -> ret (SqlValue.Int -i)
-                            | SqlValue.Real f -> ret (SqlValue.vReal -f)
-                            | SqlValue.Decimal d -> ret (SqlValue.Decimal -d)
-                            | _ -> err (sprintf "'-' は数値に適用できません: %s" (SqlLiteral.toSqlLiteral v) |> DbError.typeError)
+                                DbErr(DbError.constraintViolation "符号反転の結果が範囲を超えました")
+                            | SqlValue.Int i -> DbOk(SqlValue.Int -i)
+                            | SqlValue.Real f -> DbOk(SqlValue.vReal -f)
+                            | SqlValue.Decimal d -> DbOk(SqlValue.Decimal -d)
+                            | _ -> DbErr(sprintf "'-' は数値に適用できません: %s" (SqlLiteral.toSqlLiteral v) |> DbError.typeError)
 
                 match computed with
-                | Error er -> err er
-                | Ok res -> step resolve row rest (Arrive res)
+                | DbErr er -> DbErr er
+                | DbOk res -> step resolve row rest (Arrive res)
             | KBinaryL(op, b) :: rest ->
                 let short =
                     match op with
@@ -678,14 +681,14 @@ module internal Eval =
                     | BinaryOp.Mod -> arith Mod l v
                     | BinaryOp.Concat ->
                         if SqlValue.isNull l || SqlValue.isNull v then
-                            ret SqlValue.Null
+                            DbOk SqlValue.Null
                         else
-                            ret (SqlValue.Text(SqlValue.toDisplayString l + SqlValue.toDisplayString v))
+                            DbOk(SqlValue.Text(SqlValue.toDisplayString l + SqlValue.toDisplayString v))
                     | BinaryOp.Like ->
                         if SqlValue.isNull l || SqlValue.isNull v then
-                            ret SqlValue.Null
+                            DbOk SqlValue.Null
                         else
-                            ret (
+                            DbOk(
                                 SqlValue.ofBool (
                                     Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString l)
                                 )
@@ -696,12 +699,12 @@ module internal Eval =
                     | BinaryOp.Le
                     | BinaryOp.Gt
                     | BinaryOp.Ge -> compare (nameOf op) l v
-                    | BinaryOp.And -> ret (andValue l v)
-                    | BinaryOp.Or -> ret (orValue l v)
+                    | BinaryOp.And -> DbOk(andValue l v)
+                    | BinaryOp.Or -> DbOk(orValue l v)
 
                 match combined with
-                | Error er -> err er
-                | Ok res -> step resolve row rest (Arrive res)
+                | DbErr er -> DbErr er
+                | DbOk res -> step resolve row rest (Arrive res)
             | KIsNull negated :: rest ->
                 let isNull = SqlValue.isNull v
                 step resolve row rest (Arrive(SqlValue.ofBool (if negated then not isNull else isNull)))
@@ -710,17 +713,17 @@ module internal Eval =
                 step resolve row rest (Arrive(SqlValue.ofBool (if negated then not result else result)))
             | KCast dt :: rest ->
                 match SqlValue.cast dt v with
-                | Error er -> err er
+                | Error er -> DbErr er
                 | Ok res -> step resolve row rest (Arrive res)
             | KBetweenX(lo, hi, negated) :: rest -> step resolve row (KBetweenLo(v, hi, negated) :: rest) (Descend lo)
             | KBetweenLo(x, hi, negated) :: rest -> step resolve row (KBetweenHi(x, v, negated) :: rest) (Descend hi)
             | KBetweenHi(x, lov, negated) :: rest ->
                 match truthOf "ge" x lov with
-                | Error er -> err er
-                | Ok ge ->
+                | DbErr er -> DbErr er
+                | DbOk ge ->
                     match truthOf "le" x v with
-                    | Error er -> err er
-                    | Ok le ->
+                    | DbErr er -> DbErr er
+                    | DbOk le ->
                         match TruthValue.and2 ge le with
                         | TruthValue.True -> step resolve row rest (Arrive(SqlValue.ofBool (not negated)))
                         | TruthValue.False -> step resolve row rest (Arrive(SqlValue.ofBool negated))
@@ -731,9 +734,9 @@ module internal Eval =
                 | cand :: tail -> step resolve row (KInArg(v, negated, tail, false) :: rest) (Descend cand)
             | KInArg(x, negated, tail, sawUnknown) :: rest ->
                 match truthOf "eq" x v with
-                | Error er -> err er
-                | Ok TruthValue.True -> step resolve row rest (Arrive(SqlValue.ofBool (not negated)))
-                | Ok tv ->
+                | DbErr er -> DbErr er
+                | DbOk TruthValue.True -> step resolve row rest (Arrive(SqlValue.ofBool (not negated)))
+                | DbOk tv ->
                     let saw = sawUnknown || tv = TruthValue.Unknown
 
                     match tail with
@@ -754,7 +757,7 @@ module internal Eval =
                     step resolve row rest (Arrive SqlValue.Null)
                 else
                     match Scalar.escapeCodePoint (SqlValue.toDisplayString v) with
-                    | Error er -> err er
+                    | Error er -> DbErr er
                     | Ok escape ->
                         match
                             Scalar.likeMatchWithEscape
@@ -762,7 +765,7 @@ module internal Eval =
                                 (SqlValue.toDisplayString pattern)
                                 (SqlValue.toDisplayString x)
                         with
-                        | Error er -> err er
+                        | Error er -> DbErr er
                         | Ok m -> step resolve row rest (Arrive(SqlValue.ofBool (if negated then not m else m)))
             | KCaseWhen((_, t), tail, elseE) :: rest ->
                 let matched = not (SqlValue.isNull v) && boolOf v
@@ -782,7 +785,7 @@ module internal Eval =
                 match tail with
                 | [] ->
                     match Scalar.applyFunc n (List.rev acc |> List.toArray) with
-                    | Error er -> err er
+                    | Error er -> DbErr er
                     | Ok res -> step resolve row rest (Arrive res)
                 | a :: more -> step resolve row (KFuncArg(n, acc, more) :: rest) (Descend a)
 
@@ -794,31 +797,40 @@ module internal Eval =
             Cache = System.Collections.Generic.Dictionary<struct (string option * string), Result<int, DbError>>()
         }
 
-    /// メモ化済み resolver で式を評価する。
+    /// メモ化済み resolver で式を評価する（内部ホットパス用）。
     /// 集約呼び出しはここでエラーになる。
     /// 評価機 step を空の継続スタックで始める（末尾再帰のまま深さ・候補数に依存しない）。
-    let evalWith (resolve: ColumnResolver) (row: SqlValue array) (e: Expr) =
+    let evalWithV (resolve: ColumnResolver) (row: SqlValue array) (e: Expr) : DbResult<SqlValue> =
         step resolve (Single row) [] (Descend e)
 
+    /// メモ化済み resolver で式を評価する（公開境界用）。
+    let evalWith (resolve: ColumnResolver) (row: SqlValue array) (e: Expr) =
+        evalWithV resolve row e |> DbResult.toResult
+
     /// 式を評価する（resolver を都度作る簡易版）。
-    /// 行ごとに呼ぶホットパスでは `evalWith` に resolver を渡すこと。
+    /// 行ごとに呼ぶホットパスでは `evalWithV` に resolver を渡すこと。
     let eval = resolver >> evalWith
 
     /// 評価結果を WHERE の真偽へ変換する（UNKNOWN は偽）。
-    let private asMatch =
-        Result.map (function
-            | SqlValue.Bool b -> b
-            | SqlValue.Null -> false
-            | SqlValue.Int i -> i <> 0L
-            | _ -> false)
+    let private asMatchV (r: DbResult<SqlValue>) : DbResult<bool> =
+        match r with
+        | DbErr e -> DbErr e
+        | DbOk v ->
+            DbOk(
+                match v with
+                | SqlValue.Bool b -> b
+                | SqlValue.Null -> false
+                | SqlValue.Int i -> i <> 0L
+                | _ -> false
+            )
 
-    /// WHERE の判定。
+    /// WHERE の判定（内部ホットパス用）。
     /// UNKNOWN は偽（SQL 標準）。
-    let matchesWith (resolve: ColumnResolver) (row: SqlValue array) (predicate: Expr) =
-        evalWith resolve row predicate |> asMatch
+    let matchesWithV (resolve: ColumnResolver) (row: SqlValue array) (predicate: Expr) =
+        evalWithV resolve row predicate |> asMatchV
 
-    /// JOIN の ON 句（および residual）の判定。
+    /// JOIN の ON 句（および residual）の判定（内部ホットパス用）。
     /// 左右の行を連結せずに、左の列の後ろに右の列が並んでいるものとして評価する。
     /// resolver は `Schema.concat leftSchema rightSchema` に対応するものを使う。
-    let matchesJoined (resolve: ColumnResolver) (left: SqlValue array) (right: SqlValue array) (predicate: Expr) =
-        step resolve (Joined(left, right)) [] (Descend predicate) |> asMatch
+    let matchesJoinedV (resolve: ColumnResolver) (left: SqlValue array) (right: SqlValue array) (predicate: Expr) =
+        step resolve (Joined(left, right)) [] (Descend predicate) |> asMatchV

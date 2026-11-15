@@ -159,6 +159,7 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 dotnet run -c Release --project tools/RykDb.Bench                    # 全シナリオ
 dotnet run -c Release --project tools/RykDb.Bench -- --class query  # クエリ系のみ
 dotnet run -c Release --project tools/RykDb.Bench -- --class eval   # 式評価器のみ
+dotnet run -c Release --project tools/RykDb.Bench -- --class op     # Op（pull 層）のみ
 dotnet run -c Release --project tools/RykDb.Bench -- --quick        # 短いジョブ
 dotnet run -c Release --project tools/RykDb.Bench -- --dry          # 1 回だけ実行して検証
 # シナリオを絞る（BenchmarkDotNet の --filter。複数指定は OR）
@@ -177,7 +178,14 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
   - `Insert100Rows` / `Insert10kRows`（2,000行 × 5文を 1 transaction で流して ROLLBACK）
   - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
   - `MatchesLiteral` / `MatchesColumn` / `MatchesBinary` / `MatchesComplex` — DB を使わない式評価器のマイクロベンチ
+  - `MatchesComplexV` / `MatchesComplexJoined` / `MatchesComplexJoinedV` — `DbResult` 版と `Result` 版、JOIN の ON 句
+  - `CompareValuesV` — `SqlValue.compareValuesV` の割当
+  - `OpMaterialize` / `OpFilterMapTake` / `NextStep` — DB を使わない pull 層（`Op.ofArray` / `filter` / `map` / `skip` / `take` / `Op.next`）のマイクロベンチ
   - `CompactL0` — L0 の 4ファイル（各 25,000件）を 1回 compaction する
+- **割当の見方**: `EvalBenchmarks` の `Allocated` は `Result` の `Ok` を反映しない。
+  Release の JIT が式評価の `Ok` をスタック割当・除去するためで、`DbResult` 化の前後でも 592B のまま。
+  `Result` の割当を見るのは `OpBenchmarks` とクエリ系（`CountStar` / `FilterSeqScan` / JOIN）。
+  `gotchas.md` §11.75 に実測値を置いている。
 - **性能スモーク（10,000行 INSERT → 500回の point lookup → `COUNT(*)`）はベンチで確認する**。
   実時間の上限で落とすテストは置かない（マシン依存のため。回帰はベンチの前後比較で見る）。
 - クエリ系は `Database.OpenWith`（同期 compaction）で開き、

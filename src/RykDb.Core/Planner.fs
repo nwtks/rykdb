@@ -1319,9 +1319,9 @@ module internal Plan =
     let private collectSubqueryRows =
         let rec go used acc cur =
             match Op.next cur with
-            | Error e -> err e
-            | Ok None -> ret (List.rev acc |> List.toArray)
-            | Ok(Some(row, nxt)) ->
+            | OpStep.OpError e -> err e
+            | OpStep.OpDone -> ret (List.rev acc |> List.toArray)
+            | OpStep.OpRow(row, nxt) ->
                 let used = used + int64 (ValueCodec.managedRowBytes row) + 32L
 
                 if used > SubqueryBudgetBytes then
@@ -1789,13 +1789,13 @@ module internal Plan =
                             Optimizer.exec plan.Context plan.Tree plan.Input
                             |> Result.bind (fun op ->
                                 match Op.next op with
-                                | Error er -> err er
-                                | Ok None -> k (Expr.Literal Literal.Null)
-                                | Ok(Some(row, rest)) ->
+                                | OpStep.OpError er -> err er
+                                | OpStep.OpDone -> k (Expr.Literal Literal.Null)
+                                | OpStep.OpRow(row, rest) ->
                                     match Op.next rest with
-                                    | Error er -> err er
-                                    | Ok None -> k (Expr.Value row.[0])
-                                    | Ok(Some _) -> DbError.constraintViolation twoRowsMessage |> err)
+                                    | OpStep.OpError er -> err er
+                                    | OpStep.OpDone -> k (Expr.Value row.[0])
+                                    | OpStep.OpRow _ -> DbError.constraintViolation twoRowsMessage |> err)
                         | refs ->
                             let run row =
                                 let withRow = withCurrentRow row scopes
@@ -1804,13 +1804,13 @@ module internal Plan =
                                 |> Result.bind (runner withRow ctx)
                                 |> Result.bind (fun (_, op) ->
                                     match Op.next op with
-                                    | Error er -> err er
-                                    | Ok None -> ret SqlValue.Null
-                                    | Ok(Some(r, rest)) ->
+                                    | OpStep.OpError er -> err er
+                                    | OpStep.OpDone -> ret SqlValue.Null
+                                    | OpStep.OpRow(r, rest) ->
                                         match Op.next rest with
-                                        | Error er -> err er
-                                        | Ok None -> ret r.[0]
-                                        | Ok(Some _) -> DbError.constraintViolation twoRowsMessage |> err)
+                                        | OpStep.OpError er -> err er
+                                        | OpStep.OpDone -> ret r.[0]
+                                        | OpStep.OpRow _ -> DbError.constraintViolation twoRowsMessage |> err)
 
                             k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx
@@ -1825,8 +1825,9 @@ module internal Plan =
                         Optimizer.exec plan.Context plan.Tree plan.Input
                         |> Result.bind (fun op ->
                             match Op.next op with
-                            | Error er -> err er
-                            | Ok found -> k (Expr.Literal(Literal.Bool found.IsSome)))
+                            | OpStep.OpError er -> err er
+                            | OpStep.OpDone -> k (Expr.Literal(Literal.Bool false))
+                            | OpStep.OpRow _ -> k (Expr.Literal(Literal.Bool true)))
                     | refs ->
                         let run row =
                             let withRow = withCurrentRow row scopes
@@ -1835,8 +1836,9 @@ module internal Plan =
                             |> Result.bind (runner withRow ctx)
                             |> Result.bind (fun (_, op) ->
                                 match Op.next op with
-                                | Error er -> err er
-                                | Ok found -> ret (SqlValue.ofBool found.IsSome))
+                                | OpStep.OpError er -> err er
+                                | OpStep.OpDone -> ret (SqlValue.ofBool false)
+                                | OpStep.OpRow _ -> ret (SqlValue.ofBool true))
 
                         k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx

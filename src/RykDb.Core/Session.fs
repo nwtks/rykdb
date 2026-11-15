@@ -88,13 +88,13 @@ type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
         | Closed -> err (DbError.internalError "RowReader は閉じられています")
         | Reading current ->
             match Op.next current with
-            | Error e ->
+            | OpStep.OpError e ->
                 releaseTo Closed
                 err e
-            | Ok None ->
+            | OpStep.OpDone ->
                 releaseTo Exhausted
                 ret None
-            | Ok(Some(row, nxt)) ->
+            | OpStep.OpRow(row, nxt) ->
                 match SqlValue.ensureLoaded row with
                 | Error e ->
                     releaseTo Closed

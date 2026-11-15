@@ -22,13 +22,13 @@ let private row (values: SqlValue list) = List.toArray values
 let private col (name: string) =
     Expr.Column { Qualifier = None; Name = name }
 
-let private matches = Eval.resolver >> Eval.matchesWith
+let private matches = Eval.resolver >> Eval.matchesWithV
 
 [<Fact>]
 let ``Op: 次の行を引くまで計算しない`` () =
     // 無限に伸びる Op でも 1行しか引かずに終わる。
     let rec infinite (n: int) : Op =
-        Op.compute (fun () -> ret (Some([| SqlValue.Int(int64 n) |], infinite (n + 1))))
+        Op.compute (fun () -> OpStep.OpRow([| SqlValue.Int(int64 n) |], infinite (n + 1)))
 
     let op = Op.take 3 (infinite 0)
     let rows = ok (Op.toArray op)
@@ -54,11 +54,11 @@ let ``Op: emit / empty / ofRow は 1行ずつ返す`` () =
 [<Fact>]
 let ``Op: 純粋なソースでも同じ値を 2 回 next すると先頭行が再び返る（継続を使う理由）`` () =
     let src = Op.ofArray [| row [ SqlValue.Int 1L ]; row [ SqlValue.Int 2L ] |]
-    let first = ok (Op.next src)
-    let again = ok (Op.next src)
+    let first = Op.next src
+    let again = Op.next src
 
     match first, again with
-    | Some(f, nxt), Some(a, _) ->
+    | OpStep.OpRow(f, nxt), OpStep.OpRow(a, _) ->
         // 同じ値を 2 回 next すると先頭行が再び返る（one-shot 違反）。
         Assert.Equal<SqlValue array>(f, a)
         // 継続を使えば残りは 1行だけ。
@@ -68,7 +68,7 @@ let ``Op: 純粋なソースでも同じ値を 2 回 next すると先頭行が�
 [<Fact>]
 let ``Op: one-shot ガードは同じ値の 2 回目の next を検出する`` () =
     let op = oneShot "guard" (Op.ofRow (row [ SqlValue.Int 1L ]))
-    ok (Op.next op) |> ignore
+    Op.next op |> ignore
 
     let mutable detected = false
 
@@ -112,10 +112,10 @@ let ``Op: map / filter / take / skip は入力を 1 回だけ消費する`` () =
     let source =
         oneShot "source" (Op.ofArray [| row [ SqlValue.Int 1L ]; row [ SqlValue.Int 2L ]; row [ SqlValue.Int 3L ] |])
 
-    let mapped = oneShot "map" (Op.map (fun r -> ret r) source)
+    let mapped = oneShot "map" (Op.map (fun r -> DbOk r) source)
 
     let filtered =
-        oneShot "filter" (Op.filter (fun r -> ret (asInt r.[0] >= 2L)) mapped)
+        oneShot "filter" (Op.filter (fun r -> DbOk(asInt r.[0] >= 2L)) mapped)
 
     let skipped = oneShot "skip" (Op.skip 1 filtered)
     let op = oneShot "take" (Op.take 1 skipped)
@@ -128,7 +128,7 @@ let ``Op: pull はソースを 1 回だけ消費する`` () =
     let src =
         oneShot "pull" (Op.ofArray [| row [ SqlValue.Int 1L ]; row [ SqlValue.Int 2L ] |])
 
-    let out = Op.pull (fun r nxt -> ret (Some(r, nxt))) src
+    let out = Op.pull (fun r nxt -> OpStep.OpRow(r, nxt)) src
     let rows = ok (Op.toArray out)
     Assert.Equal<int>(2, rows.Length)
     Assert.Equal<int64>(1L, asInt rows.[0].[0])
@@ -141,9 +141,9 @@ let ``Op: 大きな Op でも take は早期に打ち切る`` () =
     let rec counter n =
         Op.compute (fun () ->
             if n >= 1_000_000 then
-                ret None
+                OpStep.OpDone
             else
-                ret (Some(row [ SqlValue.Int(int64 n) ], counter (n + 1))))
+                OpStep.OpRow(row [ SqlValue.Int(int64 n) ], counter (n + 1)))
 
     let rows = ok (Op.toArray (Op.take 3 (counter 0)))
     Assert.Equal<int>(3, rows.Length)
@@ -178,3 +178,26 @@ let ``Op.toArray: 呼び出しごとに独立した配列を返す`` () =
     Assert.Equal<int>(2, first.Length)
     Assert.Equal<int>(2, second.Length)
     Assert.NotSame(first, second)
+
+[<Fact>]
+let ``Op.next: Step からの取得で Ok / Some / tuple を確保しない`` () =
+    let op = Op.emit (row [ SqlValue.Int 1L ]) Op.Empty
+
+    // Step は純粋なので、同じ値を繰り返し引いても副作用はない（測定専用）。
+    match Op.next op with
+    | OpStep.OpRow(r, _) -> Assert.Equal<int64>(1L, asInt r.[0])
+    | _ -> Assert.Fail "行が返りませんでした"
+
+    let before = System.GC.GetAllocatedBytesForCurrentThread()
+
+    let rec loop i =
+        if i >= 1000 then
+            ()
+        else
+            match Op.next op with
+            | OpStep.OpRow _ -> loop (i + 1)
+            | _ -> Assert.Fail "行が返りませんでした"
+
+    loop 0
+    let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.True(allocated < 1_000L, sprintf "1000 回で %d バイト確保しました" allocated)

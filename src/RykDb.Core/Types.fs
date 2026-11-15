@@ -165,7 +165,7 @@ module internal DataType =
     /// SQL の照合順序における型の順位。
     /// 異なる型を並べ替えるときの決定的なタイブレークに使う。
     /// 数値 3種は互いに数値比較されるので、ここでは型タグの符号で決めてよい。
-    let rank =
+    let internal rank =
         function
         | DataType.Null -> 0
         | DataType.Boolean -> 1
@@ -336,7 +336,7 @@ module internal SqlValue =
     /// 補助文字（サロゲートペア）と U+E000..U+FFFF の間で UTF-8 の順序と逆転する。
     /// キーの符号化は UTF-8 バイト列なので、SQL の比較も同じ順序に合わせる。
     /// 不正なサロゲートは Encoding.UTF8 と同じく U+FFFD として扱う。
-    let compareText (x: string) (y: string) =
+    let private compareText (x: string) (y: string) =
         let codePointAt (s: string) i =
             let c = s.[i]
 
@@ -370,86 +370,100 @@ module internal SqlValue =
 
         loop 0 0
 
-    /// 値どうしの比較。
+    let private decimalOfValue =
+        function
+        | SqlValue.Int i -> decimal i
+        | SqlValue.Decimal d -> d
+        | _ -> 0M
+
+    let private floatOfValue =
+        function
+        | SqlValue.Int i -> float i
+        | SqlValue.Decimal d -> float d
+        | SqlValue.Real f -> f
+        | _ -> 0.0
+
+    let private compareFloat (x: float) (y: float) =
+        if x < y then -1
+        elif x > y then 1
+        else 0
+
+    let private compareRealValue (f: float) (other: SqlValue) =
+        if System.Double.IsNaN f || System.Double.IsInfinity f then
+            DbErr(DbError.typeError "NaN や ±Infinity は数値比較できません")
+        elif fitsDecimal f && (f = 0.0 || System.Math.Abs f >= DecimalMinMagnitudeAsFloat) then
+            DbOk(System.Decimal.Compare(decimal f, decimalOfValue other))
+        else
+            DbOk(compareFloat f (floatOfValue other))
+
+    let private negateInt (c: int) = -c
+
+    let private compareNumericValue (a: SqlValue) (b: SqlValue) =
+        match a, b with
+        | SqlValue.Real fa, SqlValue.Real fb ->
+            if System.Double.IsNaN fa && System.Double.IsNaN fb then
+                DbOk 0
+            elif System.Double.IsNaN fa then
+                DbOk 1
+            elif System.Double.IsNaN fb then
+                DbOk -1
+            else
+                DbOk(compareFloat fa fb)
+        | SqlValue.Real fa, _ -> compareRealValue fa b
+        | _, SqlValue.Real fb -> compareRealValue fb a |> DbResult.map negateInt
+        | _ -> DbOk(System.Decimal.Compare(decimalOfValue a, decimalOfValue b))
+
+    /// 値どうしの比較（内部ホットパス用）。
+    /// 成功値を struct で返すので、行ごとの比較で `Ok` を確保しない。
+    /// ローカル関数は毎回クロージャを確保するため、ヘルパーはモジュール直下に置く。
     /// NULL は比較不能として `DbError.typeError` を返す。
     /// NaN は NaN と等しく、Real 同士では他のすべての値より大きいものとして扱う
     /// （Int / Decimal との比較は型エラー）。
-    let compareValues (a: SqlValue) (b: SqlValue) =
-        let decimalOf =
-            function
-            | SqlValue.Int i -> decimal i
-            | SqlValue.Decimal d -> d
-            | _ -> 0M
-
-        let floatOf =
-            function
-            | SqlValue.Int i -> float i
-            | SqlValue.Decimal d -> float d
-            | SqlValue.Real f -> f
-            | _ -> 0.0
-
-        let compareReal f other =
-            if System.Double.IsNaN f || System.Double.IsInfinity f then
-                err (DbError.typeError "NaN や ±Infinity は数値比較できません")
-            elif fitsDecimal f && (f = 0.0 || System.Math.Abs f >= DecimalMinMagnitudeAsFloat) then
-                ret (compare (decimal f) (decimalOf other))
-            else
-                ret (compare f (floatOf other))
-
-        let compareNumeric a b =
-            match a, b with
-            | SqlValue.Real fa, SqlValue.Real fb ->
-                if System.Double.IsNaN fa && System.Double.IsNaN fb then
-                    ret 0
-                elif System.Double.IsNaN fa then
-                    ret 1
-                elif System.Double.IsNaN fb then
-                    ret -1
-                else
-                    ret (compare fa fb)
-            | SqlValue.Real fa, _ -> compareReal fa b
-            | _, SqlValue.Real fb -> compareReal fb a |> Result.map (fun c -> -c)
-            | _ -> ret (compare (decimalOf a) (decimalOf b))
-
+    let compareValuesV (a: SqlValue) (b: SqlValue) =
         match a, b with
         | SqlValue.Unloaded, _
-        | _, SqlValue.Unloaded -> err (DbError.internalError "復号していない列を比較しようとしました")
+        | _, SqlValue.Unloaded -> DbErr(DbError.internalError "復号していない列を比較しようとしました")
         | SqlValue.Null, _
-        | _, SqlValue.Null -> err (DbError.typeError "NULL は比較できません")
+        | _, SqlValue.Null -> DbErr(DbError.typeError "NULL は比較できません")
         | (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _),
-          (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _) -> compareNumeric a b
-        | SqlValue.Bool x, SqlValue.Bool y -> ret (compare (if x then 1 else 0) (if y then 1 else 0))
-        | SqlValue.Text x, SqlValue.Text y -> ret (compareText x y)
-        | SqlValue.Blob x, SqlValue.Blob y -> ret (Bytes.compare x y)
-        | SqlValue.Uuid x, SqlValue.Uuid y -> ret (compare x y)
-        | SqlValue.Date x, SqlValue.Date y -> ret (compare x y)
-        | SqlValue.Timestamp x, SqlValue.Timestamp y -> ret (System.DateTimeOffset.Compare(x, y))
+          (SqlValue.Int _ | SqlValue.Real _ | SqlValue.Decimal _) -> compareNumericValue a b
+        | SqlValue.Bool x, SqlValue.Bool y ->
+            DbOk(
+                if x = y then 0
+                elif x then 1
+                else -1
+            )
+        | SqlValue.Text x, SqlValue.Text y -> DbOk(compareText x y)
+        | SqlValue.Blob x, SqlValue.Blob y -> DbOk(Bytes.compare x y)
+        | SqlValue.Uuid x, SqlValue.Uuid y -> DbOk(x.CompareTo y)
+        | SqlValue.Date x, SqlValue.Date y -> DbOk(x.CompareTo y)
+        | SqlValue.Timestamp x, SqlValue.Timestamp y -> DbOk(System.DateTimeOffset.Compare(x, y))
         | SqlValue.Date x, SqlValue.Timestamp y ->
             let xs =
                 System.DateTimeOffset(x.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
 
-            ret (System.DateTimeOffset.Compare(xs, y))
+            DbOk(System.DateTimeOffset.Compare(xs, y))
         | SqlValue.Timestamp x, SqlValue.Date y ->
             let ys =
                 System.DateTimeOffset(y.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
 
-            ret (System.DateTimeOffset.Compare(x, ys))
+            DbOk(System.DateTimeOffset.Compare(x, ys))
         | _ ->
-            err (
+            DbErr(
                 sprintf "型 '%s' と '%s' は比較できません" (dataType a |> DataType.toSqlName) (dataType b |> DataType.toSqlName)
                 |> DbError.typeError
             )
 
-    /// ORDER BY 用の全順序比較。
+    /// ORDER BY 用の全順序比較（内部ホットパス用）。
     /// NULL は他のすべての値より小さいものとして扱う（ASC の先頭、DESC の末尾）。
     /// SQL の 3値論理では NULL は比較不能だが、ソートには全順序が必要なのでここだけ規則を分ける。
     /// NULL 以外の型が比較不能な場合は compareValues と同じエラーを返す。
-    let compareValuesForSort (a: SqlValue) (b: SqlValue) =
+    let compareValuesForSortV (a: SqlValue) (b: SqlValue) =
         match a, b with
-        | SqlValue.Null, SqlValue.Null -> ret 0
-        | SqlValue.Null, _ -> ret -1
-        | _, SqlValue.Null -> ret 1
-        | _ -> compareValues a b
+        | SqlValue.Null, SqlValue.Null -> DbOk 0
+        | SqlValue.Null, _ -> DbOk -1
+        | _, SqlValue.Null -> DbOk 1
+        | _ -> compareValuesV a b
 
     /// 関数・制約メッセージ用の簡潔な表示（SQL リテラルではなく）。
     let toDisplayString =

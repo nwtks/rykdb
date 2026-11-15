@@ -97,14 +97,15 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `Eval` の LIKE パターンキャッシュ（コンパイル済みトークン列を `(escape, pattern)` ごとに再利用）
 - `Eval.resolver` の列解決キャッシュ（1オペレータ = 1スキーマ。行ごとの `Schema.resolve` を繰り返さない）
 
-| やりたいこと   | 命令形の代わりに使うもの                                                       |
-| -------------- | ------------------------------------------------------------------------------ |
-| 書き込み       | `Writer` = 不変のチャンク列                                                    |
-| 読み取り       | `Cursor` = 読み取り位置を値として保持する                                      |
-| パーサの状態   | `PState`（読み取り位置を値として保持する）                                     |
-| 走査・畳み込み | `Result` を返す末尾再帰                                                        |
-| 平衡木の再構築 | 明示スタック（`list` を積む）                                                  |
-| 遅延列挙       | `Op`（one-shot。構築は `Op.compute` / `Op.emit`、消費は `Op.next` の継続だけ） |
+| やりたいこと       | 命令形の代わりに使うもの                                                        |
+| ------------------ | ------------------------------------------------------------------------------- |
+| 書き込み           | `Writer` = 不変のチャンク列                                                     |
+| 読み取り           | `Cursor` = 読み取り位置を値として保持する                                       |
+| パーサの状態       | `PState`（読み取り位置を値として保持する）                                      |
+| 走査・畳み込み     | `Result` を返す末尾再帰                                                         |
+| ホットパスの成功値 | `DbResult<'T>`（`DbOk` / `DbErr`）。公開境界で `Result` に変換する              |
+| 平衡木の再構築     | 明示スタック（`list` を積む）                                                   |
+| 遅延列挙           | `Op`（one-shot。構築は `Op.compute` / `Op.emit`、消費は `Op.next` の `OpStep`） |
 
 ## 3. 末尾再帰を前提にする
 
@@ -191,6 +192,14 @@ JIT は `tail.` を尊重する。
     （`[<TailCall>]` 付き。CPS だが継続はラムダではなくタグ付きの値）。
     再帰は `step` の自己再帰だけなので全末尾位置になり、式の深さ・`IN` の候補数に依存せずスタックは一定
     （継続はヒープのリストに積む）。
+    成功値は `[<Struct>] DbResult<'T>`（`DbOk` / `DbErr`）で返し、
+    `Eval.evalWith` / `matchesWith` / `matchesJoined` のような公開境界のラッパーだけが `Result` に戻す。
+    `Result` の `Ok` は参照 DU なので、行ごとの評価で確保しない
+    （[`gotchas.md`](gotchas.md) §11.75）。
+  - pull 層も同じ考え方で、`Op.next` は `[<Struct>] OpStep`（`OpDone` / `OpError` / `OpRow`）を返す。
+    `Op.map` / `Op.filter` のコールバックは `DbResult` を返す。
+    **`Op.emit` は第 2 引数を即時評価する**ので、行ループの継続を `Op.emit` で繋がない
+    （`Op.compute (fun () -> OpStep.OpRow(row, next))` で遅延する。§11.75 の StackOverflow 例）。
   - `Optimizer.exec` も同じ方式。
     論理木の評価を `ExecFrame`（継続）と `ExecStep`（`EvalNode` / `ApplyOp`）に分け、
     `run` の自己再帰だけにまとめる（`[<TailCall>]` 付き）。

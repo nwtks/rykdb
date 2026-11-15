@@ -29,6 +29,20 @@ let okOr defaultValue (r: Result<'T, DbError>) : 'T =
     | Ok v -> v
     | Error _ -> defaultValue
 
+/// DbResult の成功値を取り出す。Err ならテストを失敗させる。
+let okV (r: DbResult<'T>) : 'T =
+    match r with
+    | DbOk v -> v
+    | DbErr e ->
+        Assert.Fail(sprintf "DbResult が Error でした: %s" (DbError.toDisplayString e))
+        Unchecked.defaultof<'T>
+
+/// DbResult が Error であることを確認する。
+let expectErrorV message (r: DbResult<'T>) =
+    match r with
+    | DbErr _ -> ()
+    | DbOk _ -> Assert.Fail message
+
 /// テスト専用: 同じ Op 値を 2 回 `Op.next` すると失敗させる包み。
 /// `Op` の one-shot 不変条件（元の値を再利用せず、返された継続だけを使う）を機械的に検査する。
 let oneShot (label: string) (op: Op) =
@@ -405,6 +419,11 @@ let randomValue () =
     | 8 -> SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(r.Next(0, 2_000_000_000), System.DateTimeKind.Utc)))
     | _ -> SqlValue.Uuid(System.Guid(Array.init 16 (fun _ -> byte (r.Next(0, 256)))))
 
+
+/// 値どうしの比較。
+let compareValues (a: SqlValue) (b: SqlValue) =
+    SqlValue.compareValuesV a b |> DbResult.toResult
+
 /// テスト用の全順序。型順位 → 同一型内は SQL 比較。
 let compareForSort (a: SqlValue) (b: SqlValue) =
     let ra = a |> SqlValue.dataType |> DataType.rank
@@ -413,7 +432,7 @@ let compareForSort (a: SqlValue) (b: SqlValue) =
     if ra <> rb then
         compare ra rb
     else
-        match SqlValue.compareValues a b with
+        match compareValues a b with
         | Ok c -> c
         | Error _ -> 0
 

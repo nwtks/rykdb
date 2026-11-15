@@ -37,7 +37,12 @@ type internal Op =
     /// 「次に 1行を返す関数」。
     /// 引数は unit なので遅延評価される。
     /// ソース側が「まだ計算していない」長い系列を表すときは必ずこれを使う。
-    | Compute of (unit -> Result<(SqlValue array * Op) option, DbError>)
+    | Compute of (unit -> OpStep)
+
+and [<Struct; NoEquality; NoComparison; RequireQualifiedAccess>] internal OpStep =
+    | OpDone
+    | OpError of error: DbError
+    | OpRow of row: SqlValue array * next: Op
 
 module internal Op =
     /// 空の演算子。
@@ -52,8 +57,8 @@ module internal Op =
 
     /// 「次に 1行を返す関数」から演算子を作る。
     /// 関数は 1回だけ呼ばれる想定（one-shot）。
-    /// 返す組の 2番目には、その行の続きを入れる。
-    let compute (f: unit -> Result<(SqlValue array * Op) option, DbError>) = Op.Compute f
+    /// 返す値は `OpStep`（成功値は構造体なので `Ok` を確保しない）。
+    let compute (f: unit -> OpStep) = Op.Compute f
 
     /// 配列を順に返す演算子。
     /// 次の行は呼び出すたびに計算する。
@@ -62,46 +67,47 @@ module internal Op =
             if i >= rows.Length then
                 Empty
             else
-                compute (fun () -> ret (Some(rows.[i], rowsFrom (i + 1))))
+                compute (fun () -> OpStep.OpRow(rows.[i], rowsFrom (i + 1)))
 
         rowsFrom 0
 
     /// 1行取り出す。
     let next =
         function
-        | Op.Done -> ret None
-        | Op.Step(row, nxt) -> ret (Some(row, nxt))
+        | Op.Done -> OpStep.OpDone
+        | Op.Step(row, nxt) -> OpStep.OpRow(row, nxt)
         | Op.Compute f -> f ()
 
     /// ソースの次の 1行を引き出して継続に渡す。
-    /// 継続は「行と残りの Op」を受け取り、返した Result をそのまま返す。
+    /// 継続は「行と残りの Op」を受け取り、返した `OpStep` をそのまま返す。
     /// 返した「その行の次」の Op が演算子の残りになる。
-    let pull (cont: SqlValue array -> Op -> Result<(SqlValue array * Op) option, DbError>) (src: Op) =
+    let pull (cont: SqlValue array -> Op -> OpStep) (src: Op) =
         compute (fun () ->
-            next src
-            >>= function
-                | None -> ret None
-                | Some(row, nxt) -> cont row nxt)
+            match next src with
+            | OpStep.OpDone -> OpStep.OpDone
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpRow(row, nxt) -> cont row nxt)
 
     /// 行を 1つ変換する。
     /// 失敗したら打切って Error。
     /// 変換後の行の「次」は map を通した残りにする
     /// （nxt をそのまま渡すと変換が 1行だけに効き、次から元に戻る）。
-    let rec map (f: SqlValue array -> Result<SqlValue array, DbError>) =
-        pull (fun row nxt -> f row |> Result.map (fun r -> Some(r, map f nxt)))
+    let rec map (f: SqlValue array -> DbResult<SqlValue array>) =
+        pull (fun row nxt ->
+            match f row with
+            | DbErr e -> OpStep.OpError e
+            | DbOk r -> OpStep.OpRow(r, map f nxt))
 
     /// 述語で弾く。
     /// 偽の行は読み飛ばして次へ進む。
-    /// p row >>= function で分岐する
-    /// （if/then/else だと Result の短絡で Some(row, nxt) だけが残ることがある）。
-    let filter (p: SqlValue array -> Result<bool, DbError>) =
+    let filter (p: SqlValue array -> DbResult<bool>) =
         let rec seekMatch cur =
             pull
                 (fun row nxt ->
                     match p row with
-                    | Ok true -> ret (Some(row, seekMatch nxt))
-                    | Ok false -> next (seekMatch nxt)
-                    | Error e -> err e)
+                    | DbOk true -> OpStep.OpRow(row, seekMatch nxt)
+                    | DbOk false -> next (seekMatch nxt)
+                    | DbErr e -> OpStep.OpError e)
                 cur
 
         seekMatch
@@ -113,7 +119,7 @@ module internal Op =
         if n <= 0 then
             Empty
         else
-            pull (fun row nxt -> ret (Some(row, take (n - 1) nxt))) src
+            pull (fun row nxt -> OpStep.OpRow(row, take (n - 1) nxt)) src
 
     /// 先頭 n行を読み飛ばす。
     let skip =
@@ -138,9 +144,9 @@ module internal Op =
 
         let rec drain count bytes cur =
             match next cur with
-            | Error e -> err e
-            | Ok None -> ret (rows.ToArray())
-            | Ok(Some(row, nxt)) ->
+            | OpStep.OpError e -> err e
+            | OpStep.OpDone -> ret (rows.ToArray())
+            | OpStep.OpRow(row, nxt) ->
                 if count >= maxRows then
                     tooLarge ()
                 else

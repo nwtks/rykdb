@@ -131,6 +131,26 @@ let ``Scalar.likeMatch: 同じパターンは行ごとに配列を確保しな�
     Assert.True(allocated < 10_000L, sprintf "1000 回で %d バイト確保しました" allocated)
 
 [<Fact>]
+let ``Eval.matchesWithV: リテラル述語は 1000 回でも結果を確保しない`` () =
+    let resolver = Eval.resolver schema2
+    let predicate = Expr.Literal(Literal.Bool true)
+    let row = row2 1L 2L
+    Assert.True(okV (Eval.matchesWithV resolver row predicate))
+
+    let before = System.GC.GetAllocatedBytesForCurrentThread()
+
+    let rec loop i =
+        if i >= 1000 then
+            ()
+        else
+            Eval.matchesWithV resolver row predicate |> ignore
+            loop (i + 1)
+
+    loop 0
+    let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.True(allocated < 1_000L, sprintf "1000 回で %d バイト確保しました" allocated)
+
+[<Fact>]
 let ``Scalar.likeMatchWithEscape: エスケープした % _ ! をリテラルにする`` () =
     Assert.True(ok (likeEsc '!' "a!%b" "a%b"))
     Assert.False(ok (likeEsc '!' "a!%b" "axb"))

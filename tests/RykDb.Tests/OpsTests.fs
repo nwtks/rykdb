@@ -261,30 +261,32 @@ let ``havingFilter: 集約値とグループ値を定数へ置き換える`` () 
 
     // 集約値（COUNT(*)）
     Assert.True(
-        ok (
+        okV (
             eval (Expr.Binary(BinaryOp.Gt, Expr.AggCall(AggFunc.Count, false, Expr.Star), Expr.Literal(Literal.Int 2L)))
         )
     )
 
     // グループ値（列 → 先頭の値）
-    Assert.True(ok (eval (Expr.Binary(BinaryOp.Eq, col "a", Expr.Literal(Literal.Int 7L)))))
+    Assert.True(okV (eval (Expr.Binary(BinaryOp.Eq, col "a", Expr.Literal(Literal.Int 7L)))))
     // 定数はそのまま
-    Assert.True(ok (eval (Expr.Literal(Literal.Bool true))))
+    Assert.True(okV (eval (Expr.Literal(Literal.Bool true))))
     // Name でも集約キーに一致すれば置き換える
-    Assert.True(ok (eval (Expr.Binary(BinaryOp.Eq, Expr.Name "COUNT(*)", Expr.Literal(Literal.Int 3L)))))
+    Assert.True(okV (eval (Expr.Binary(BinaryOp.Eq, Expr.Name "COUNT(*)", Expr.Literal(Literal.Int 3L)))))
     // 子を持つ式は再帰的に置き換える
-    Assert.True(ok (eval (Expr.Binary(BinaryOp.And, Expr.Literal(Literal.Bool true), Expr.Literal(Literal.Bool true)))))
+    Assert.True(
+        okV (eval (Expr.Binary(BinaryOp.And, Expr.Literal(Literal.Bool true), Expr.Literal(Literal.Bool true))))
+    )
     // 集約リストに無い集約は NULL になる（比較は UNKNOWN → 偽）
     Assert.False(
-        ok (eval (Expr.Binary(BinaryOp.Eq, Expr.AggCall(AggFunc.Min, false, col "b"), Expr.Literal(Literal.Int 99L))))
+        okV (eval (Expr.Binary(BinaryOp.Eq, Expr.AggCall(AggFunc.Min, false, col "b"), Expr.Literal(Literal.Int 99L))))
     )
 
     // 集約でもグループ値でもない Name / 列は置き換えられない（評価時にエラー）
-    expectError "未知の Name が OK になっています" (eval (Expr.Name "zz"))
-    expectError "未知の列が OK になっています" (eval (col "zz"))
+    expectErrorV "未知の Name が OK になっています" (eval (Expr.Name "zz"))
+    expectErrorV "未知の列が OK になっています" (eval (col "zz"))
     // スターは置き換えず、そのまま評価エラーになる
-    expectError "WHERE の * が OK になっています" (eval Expr.Star)
-    expectError "WHERE の t.* が OK になっています" (eval (Expr.QualifiedStar "t"))
+    expectErrorV "WHERE の * が OK になっています" (eval Expr.Star)
+    expectErrorV "WHERE の t.* が OK になっています" (eval (Expr.QualifiedStar "t"))
 
 [<Fact>]
 let ``末尾再帰: 50000段の式を havingFilter してもスタックを食わない`` () =
@@ -299,7 +301,7 @@ let ``末尾再帰: 50000段の式を havingFilter してもスタックを食�
     let aggs = [ (AggFunc.Count, true, false, Expr.Star) ]
     // 行 = [a; COUNT(*)]
     let r = [| SqlValue.Int 7L; SqlValue.Int 3L |]
-    Assert.True(ok (Ops.havingFilter groupBy aggs deep r))
+    Assert.True(okV (Ops.havingFilter groupBy aggs deep r))
 
 [<Fact>]
 let ``集約: 入力行を抱えずにグループごとに集める`` () =
@@ -310,7 +312,7 @@ let ``集約: 入力行を抱えずにグループごとに集める`` () =
         else
             Op.compute (fun () ->
                 let grp = int64 (i % 3)
-                ret (Some(row [ SqlValue.Int grp; SqlValue.Int(int64 i) ], make (i + 1))))
+                OpStep.OpRow(row [ SqlValue.Int grp; SqlValue.Int(int64 i) ], make (i + 1)))
 
     let aggs = [ (AggFunc.Count, true, false, Expr.Literal Literal.Null) ]
     let rows = ok (Op.toArray (ok (Ops.aggregate schema2 [ col "a" ] aggs (make 0))))
