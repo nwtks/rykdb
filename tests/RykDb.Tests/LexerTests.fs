@@ -152,3 +152,97 @@ let ``Lexer: バイナリリテラルの異常系はエラー`` () =
     bad "X'12" // 閉じていない
     bad "X'123'" // 桁数が奇数
     bad "X'0G'" // 16 進でない文字
+
+[<Fact>]
+let ``Lexer: 文字列リテラルの二重区切りを 1 つに畳む`` () =
+    let ks = kinds "'' 'it''s' 'a''''b'"
+
+    Assert.Equal<Token list>(
+        [
+            Token.StringLit ""
+            Token.StringLit "it's"
+            Token.StringLit "a''b"
+            Token.Eos
+        ],
+        ks
+    )
+
+[<Fact>]
+let ``Lexer: 引用識別子の二重区切りを 1 つに畳む`` () =
+    let ks = kinds "\"a\"\"b\" \"\"\"\""
+    Assert.Equal<Token list>([ Token.QuotedIdent "a\"b"; Token.QuotedIdent "\""; Token.Eos ], ks)
+
+[<Fact>]
+let ``Lexer: 予約語は大文字小文字を無視して判定する`` () =
+    let ks = kinds "select SeLeCt true FALSE TrUe"
+
+    Assert.Equal<Token list>(
+        [
+            Token.Keyword "SELECT"
+            Token.Keyword "SELECT"
+            Token.Keyword "TRUE"
+            Token.Keyword "FALSE"
+            Token.Keyword "TRUE"
+            Token.Eos
+        ],
+        ks
+    )
+
+[<Fact>]
+let ``Lexer: 非 ASCII の識別子は Ident として読む`` () =
+    // 予約語は ASCII だけ。非 ASCII を含む語は（大文字化しても予約語にならない限り）Ident。
+    let ks = kinds "café"
+    Assert.Equal<Token list>([ Token.Ident "café"; Token.Eos ], ks)
+
+[<Fact>]
+let ``Lexer: バイナリリテラルは空・小文字・混在した 16 進を受け付ける`` () =
+    match kinds "X'' x'abCd'" with
+    | [ Token.BlobLit empty; Token.BlobLit bytes; Token.Eos ] ->
+        Assert.Empty empty
+        Assert.Equal<byte array>([| 0xABuy; 0xCDuy |], bytes)
+    | other -> Assert.Fail(sprintf "BlobLit ではない: %A" other)
+
+[<Fact>]
+let ``Lexer: 識別子に数字とアンダースコアを含められる`` () =
+    let ks = kinds "a1_b _x"
+    Assert.Equal<Token list>([ Token.Ident "a1_b"; Token.Ident "_x"; Token.Eos ], ks)
+
+[<Fact>]
+let ``Lexer: 比較・論理演算子の記号を 1 トークンで読む`` () =
+    let ks = kinds "<> <= >= != || < > ="
+
+    Assert.Equal<Token list>(
+        [
+            Token.Symbol "<>"
+            Token.Symbol "<="
+            Token.Symbol ">="
+            Token.Symbol "!="
+            Token.Symbol "||"
+            Token.Symbol "<"
+            Token.Symbol ">"
+            Token.Symbol "="
+            Token.Eos
+        ],
+        ks
+    )
+
+[<Fact>]
+let ``Lexer: 単独の ! と | はエラー`` () =
+    let bad (sql: string) =
+        match Lexer.tokenize sql with
+        | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
+        | Ok _ -> Assert.Fail(sprintf "エラーになるべき: %s" sql)
+
+    bad "!"
+    bad "|"
+
+[<Fact>]
+let ``Lexer: 閉じない引用識別子はエラー`` () =
+    match Lexer.tokenize "\"unclosed" with
+    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
+    | Ok _ -> Assert.Fail "エラーになるべき"
+
+[<Fact>]
+let ``Lexer: 複数行の文字列の後の位置は行を進める`` () =
+    let ts = tokens "'a\nb' 1"
+    Assert.Equal((2, 4), (ts.[1].Pos.Line, ts.[1].Pos.Column))

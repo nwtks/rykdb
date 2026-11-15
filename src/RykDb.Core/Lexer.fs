@@ -40,59 +40,80 @@ type internal LexState =
 module internal Lexer =
     /// 予約語の一覧。
     /// パーサはここで定義した綴りだけを受け付ける。
-    let private Keywords =
-        Set.ofList
-            [
-                "SELECT"
-                "FROM"
-                "WHERE"
-                "INSERT"
-                "INTO"
-                "VALUES"
-                "UPDATE"
-                "SET"
-                "DELETE"
-                "CREATE"
-                "TABLE"
-                "INDEX"
-                "DROP"
-                "ON"
-                "AND"
-                "OR"
-                "NOT"
-                "NULL"
-                "IS"
-                "IN"
-                "BETWEEN"
-                "LIKE"
-                "GROUP"
-                "BY"
-                "HAVING"
-                "ORDER"
-                "ASC"
-                "DESC"
-                "LIMIT"
-                "OFFSET"
-                "JOIN"
-                "INNER"
-                "LEFT"
-                "AS"
-                "DISTINCT"
-                "BEGIN"
-                "COMMIT"
-                "ROLLBACK"
-                "PRIMARY"
-                "KEY"
-                "UNIQUE"
-                "DEFAULT"
-                "CASE"
-                "WHEN"
-                "THEN"
-                "ELSE"
-                "END"
-                "EXISTS"
-                "IF"
-            ]
+    /// TRUE / FALSE も Keyword として字句解析する（パーサ側で真偽値リテラル扱い）。
+    let private KeywordSpellings =
+        [
+            "SELECT"
+            "FROM"
+            "WHERE"
+            "INSERT"
+            "INTO"
+            "VALUES"
+            "UPDATE"
+            "SET"
+            "DELETE"
+            "CREATE"
+            "TABLE"
+            "INDEX"
+            "DROP"
+            "ON"
+            "AND"
+            "OR"
+            "NOT"
+            "NULL"
+            "IS"
+            "IN"
+            "BETWEEN"
+            "LIKE"
+            "GROUP"
+            "BY"
+            "HAVING"
+            "ORDER"
+            "ASC"
+            "DESC"
+            "LIMIT"
+            "OFFSET"
+            "JOIN"
+            "INNER"
+            "LEFT"
+            "AS"
+            "DISTINCT"
+            "BEGIN"
+            "COMMIT"
+            "ROLLBACK"
+            "PRIMARY"
+            "KEY"
+            "UNIQUE"
+            "DEFAULT"
+            "CASE"
+            "WHEN"
+            "THEN"
+            "ELSE"
+            "END"
+            "EXISTS"
+            "IF"
+            "TRUE"
+            "FALSE"
+        ]
+
+    /// 綴り → 正規化した綴り（大文字）の表。
+    /// 大文字小文字を無視して引き、識別子ごとの ToUpperInvariant を避ける。
+    let private makeKeywordMap (comparer: System.StringComparer) =
+        let pairs =
+            KeywordSpellings
+            |> List.map (fun k -> System.Collections.Generic.KeyValuePair(k, k))
+            |> Array.ofList
+
+        System.Collections.Frozen.FrozenDictionary.Create<string, string>(
+            comparer,
+            System.ReadOnlySpan<System.Collections.Generic.KeyValuePair<string, string>> pairs
+        )
+
+    let private Keywords = makeKeywordMap System.StringComparer.OrdinalIgnoreCase
+
+    /// 非 ASCII を含む識別子は従来どおり ToUpperInvariant してから引く
+    /// （ſ のような文字の大文字化で予約語に一致する挙動を保つ）。
+    let private KeywordsUpper = makeKeywordMap System.StringComparer.Ordinal
 
     let private advance (input: string) (s: LexState) =
         if s.Index < input.Length && input.[s.Index] = '\n' then
@@ -108,174 +129,190 @@ module internal Lexer =
                 Column = s.Column + 1
             }
 
+    /// 改行を含まないと分かっている範囲をまとめて進める。
+    let private advanceBy (count: int) (s: LexState) =
+        {
+            Index = s.Index + count
+            Line = s.Line
+            Column = s.Column + count
+        }
+
     /// 空白とコメントを読み飛ばす。
     /// 入れ子のブロックコメントに対応。
-    let private skipTrivia (input: string) (s: LexState) =
-        let rec skipLine n s =
-            if s.Index < n && input.[s.Index] <> '\n' then
-                advance input s |> skipLine n
-            else
-                s
+    [<TailCall>]
+    let rec private skipLine (input: string) (n: int) (s: LexState) =
+        if s.Index < n && input.[s.Index] <> '\n' then
+            skipLine input n (advance input s)
+        else
+            s
 
-        let rec loopBlockComment n depth s =
-            if depth <= 0 then
+    [<TailCall>]
+    let rec private skipBlockComment (input: string) (n: int) (depth: int) (s: LexState) =
+        if depth <= 0 then
+            ret s
+        elif s.Index >= n then
+            err (DbError.syntax "unclosed comment" s.Line)
+        elif s.Index + 1 < n && input.[s.Index] = '/' && input.[s.Index + 1] = '*' then
+            skipBlockComment input n (depth + 1) (advance input (advance input s))
+        elif s.Index + 1 < n && input.[s.Index] = '*' && input.[s.Index + 1] = '/' then
+            skipBlockComment input n (depth - 1) (advance input (advance input s))
+        else
+            skipBlockComment input n depth (advance input s)
+
+    [<TailCall>]
+    let rec private skipTriviaLoop (input: string) (n: int) (s: LexState) =
+        if s.Index >= n then
+            ret s
+        else
+            let c = input.[s.Index]
+
+            if c = ' ' || c = '\t' || c = '\r' || c = '\n' then
+                skipTriviaLoop input n (advance input s)
+            elif c = '-' && s.Index + 1 < n && input.[s.Index + 1] = '-' then
+                skipTriviaLoop input n (skipLine input n s)
+            elif c = '/' && s.Index + 1 < n && input.[s.Index + 1] = '*' then
+                let s' = advance input (advance input s)
+
+                match skipBlockComment input n 1 s' with
+                | Error e -> err e
+                | Ok st -> skipTriviaLoop input n st
+            else
                 ret s
-            elif s.Index >= n then
-                err (DbError.syntax "unclosed comment" s.Line)
-            elif s.Index + 1 < n && input.[s.Index] = '/' && input.[s.Index + 1] = '*' then
-                advance input s |> advance input |> loopBlockComment n (depth + 1)
-            elif s.Index + 1 < n && input.[s.Index] = '*' && input.[s.Index + 1] = '/' then
-                advance input s |> advance input |> loopBlockComment n (depth - 1)
+
+    let private skipTrivia (input: string) = skipTriviaLoop input input.Length
+
+    let private isIdentStart (c: char) = System.Char.IsLetter c || c = '_'
+
+    let private isIdentPart (c: char) =
+        System.Char.IsLetterOrDigit c || c = '_'
+
+    let private hexDigitValue (c: char) =
+        if c >= '0' && c <= '9' then int c - int '0'
+        elif c >= 'a' && c <= 'f' then int c - int 'a' + 10
+        elif c >= 'A' && c <= 'F' then int c - int 'A' + 10
+        else -1
+
+    /// 予約語は ASCII だけなので、非 ASCII を含む識別子は低速経路に回す。
+    [<TailCall>]
+    let rec private isAscii (s: string) (i: int) =
+        if i >= s.Length then true
+        elif System.Char.IsAscii s.[i] then isAscii s (i + 1)
+        else false
+
+    /// 識別子の終端（最初の識別子でない文字）を返す。
+    [<TailCall>]
+    let rec private scanIdentEnd (input: string) (n: int) (i: int) =
+        if i < n && isIdentPart input.[i] then
+            scanIdentEnd input n (i + 1)
+        else
+            i
+
+    /// 数字の連なりを読む。
+    [<TailCall>]
+    let rec private scanDigits (input: string) (n: int) (s: LexState) =
+        if s.Index < n && System.Char.IsDigit input.[s.Index] then
+            scanDigits input n (advanceBy 1 s)
+        else
+            s
+
+    /// 区切り文字まで走査する。
+    /// 二重区切りはエスケープとして読み飛ばし、二重区切りがあったかを返す。
+    [<TailCall>]
+    let rec private scanDelimitedLoop (input: string) (n: int) (delim: char) (s: LexState) (sawDouble: bool) =
+        if s.Index >= n then
+            None
+        elif input.[s.Index] = delim then
+            if s.Index + 1 < n && input.[s.Index + 1] = delim then
+                scanDelimitedLoop input n delim (advance input (advance input s)) true
             else
-                advance input s |> loopBlockComment n depth
+                Some(s, sawDouble)
+        else
+            scanDelimitedLoop input n delim (advance input s) sawDouble
 
-        let rec loop n s =
-            if s.Index >= n then
-                ret s
-            else
-                let c = input.[s.Index]
+    let private scanDelimited (input: string) (n: int) (delim: char) (start: LexState) =
+        scanDelimitedLoop input n delim (advance input start) false
 
-                if c = ' ' || c = '\t' || c = '\r' || c = '\n' then
-                    advance input s |> loop n
-                elif c = '-' && s.Index + 1 < n && input.[s.Index + 1] = '-' then
-                    skipLine n s |> loop n
-                elif c = '/' && s.Index + 1 < n && input.[s.Index + 1] = '*' then
-                    let s' = advance input s |> advance input
+    /// バイナリリテラルの閉じ引用符を探す。
+    [<TailCall>]
+    let rec private findQuoteEnd (input: string) (n: int) (i: int) =
+        if i >= n then -1
+        elif input.[i] = '\'' then i
+        else findQuoteEnd input n (i + 1)
 
-                    match loopBlockComment n 1 s' with
-                    | Error e -> err e
-                    | Ok st -> loop n st
+    /// 区切り文字列を読み、二重区切りを 1つに畳む。
+    let private collectDelimited
+        (input: string)
+        (n: int)
+        (delim: char)
+        (unclosedMsg: string)
+        (line: int)
+        (start: LexState)
+        =
+        match scanDelimited input n delim start with
+        | None -> err (DbError.syntax unclosedMsg line)
+        | Some(closeState, sawDouble) ->
+            let raw = input.Substring(start.Index + 1, closeState.Index - start.Index - 1)
+
+            let value =
+                if sawDouble then
+                    let one = string delim
+                    raw.Replace(one + one, one)
                 else
-                    ret s
+                    raw
 
-        loop input.Length s
-
-    /// 先頭文字ごとの記号候補（長いものを先に置く）。
-    let private symbolsFor =
-        function
-        | '<' -> [| "<>"; "<="; "<" |]
-        | '>' -> [| ">="; ">" |]
-        | '=' -> [| "=" |]
-        | '!' -> [| "!=" |]
-        | '|' -> [| "||" |]
-        | '+' -> [| "+" |]
-        | '-' -> [| "-" |]
-        | '*' -> [| "*" |]
-        | '/' -> [| "/" |]
-        | '%' -> [| "%" |]
-        | ';' -> [| ";" |]
-        | ',' -> [| "," |]
-        | '.' -> [| "." |]
-        | '(' -> [| "(" |]
-        | ')' -> [| ")" |]
-        | _ -> [||]
+            ret (value, advance input closeState)
 
     /// 1トークンを読む。
     /// 読み後は次の位置を返す。
-    let private scanToken (input: string) (startPos: Position) (s: LexState) =
-        let isIdentStart c = System.Char.IsLetter c || c = '_'
-
-        let isIdentPart c =
-            System.Char.IsLetterOrDigit c || c = '_'
-
-        let hexValue c =
-            if c >= '0' && c <= '9' then int c - int '0'
-            elif c >= 'a' && c <= 'f' then int c - int 'a' + 10
-            elif c >= 'A' && c <= 'F' then int c - int 'A' + 10
-            else -1
-
-        let rec collectHex n (sb: System.Text.StringBuilder) s =
-            if s.Index >= n then
-                err (DbError.syntax "unclosed binary literal" startPos.Line)
-            elif input.[s.Index] = '\'' then
-                let hex = sb.ToString()
-
-                if hex.Length % 2 <> 0 then
-                    err (DbError.syntax "binary literal has odd length" startPos.Line)
-                else
-                    let nonHex = hex |> Seq.exists (fun ch -> hexValue ch < 0)
-
-                    if nonHex then
-                        let msg = sprintf "binary literal contains non-hex character: %s" hex
-                        err (DbError.syntax msg startPos.Line)
-                    else
-                        let bytes =
-                            [|
-                                for i in 0 .. hex.Length / 2 - 1 do
-                                    yield System.Convert.ToByte(hex.Substring(i * 2, 2), 16)
-                            |]
-
-                        ret (Token.BlobLit bytes, advance input s)
-            else
-                sb.Append(input.[s.Index]) |> ignore
-                advance input s |> collectHex n sb
-
-        let rec collect n (sb: System.Text.StringBuilder) s =
-            if s.Index < n && isIdentPart input.[s.Index] then
-                sb.Append(input.[s.Index]) |> ignore
-                advance input s |> collect n sb
-            else
-                sb.ToString(), s
-
-        let rec digits n st =
-            if st.Index < n && System.Char.IsDigit input.[st.Index] then
-                advance input st |> digits n
-            else
-                st
-
-        let rec collectChars (input: string) n delim unclosedMsg line (sb: System.Text.StringBuilder) s =
-            if s.Index >= n then
-                err (DbError.syntax unclosedMsg line)
-            elif input.[s.Index] = delim then
-                if s.Index + 1 < n && input.[s.Index + 1] = delim then
-                    sb.Append delim |> ignore
-
-                    advance input s
-                    |> advance input
-                    |> collectChars input n delim unclosedMsg line sb
-                else
-                    ret (sb.ToString(), advance input s)
-            else
-                sb.Append(input.[s.Index]) |> ignore
-                advance input s |> collectChars input n delim unclosedMsg line sb
-
-        let collectDelimited input n delim unclosedMsg line start =
-            advance input start
-            |> collectChars input n delim unclosedMsg line (System.Text.StringBuilder())
-
-        let rec advanceN count st =
-            if count = 0 then
-                st
-            else
-                advance input st |> advanceN (count - 1)
-
-        let n = input.Length
+    let private scanToken (input: string) (n: int) (startPos: Position) (s: LexState) =
         let c = input.[s.Index]
 
         if (c = 'x' || c = 'X') && s.Index + 1 < n && input.[s.Index + 1] = '\'' then
-            let s' = advance input s |> advance input
-            collectHex n (System.Text.StringBuilder()) s'
+            let contentStart = s.Index + 2
+            let closeIdx = findQuoteEnd input n contentStart
+
+            if closeIdx < 0 then
+                err (DbError.syntax "unclosed binary literal" startPos.Line)
+            else
+                let digitCount = closeIdx - contentStart
+
+                if digitCount % 2 <> 0 then
+                    err (DbError.syntax "binary literal has odd length" startPos.Line)
+                else
+                    let values =
+                        Array.init (digitCount / 2) (fun k ->
+                            hexDigitValue input.[contentStart + 2 * k] <<< 4
+                            ||| hexDigitValue input.[contentStart + 2 * k + 1])
+
+                    if Array.exists (fun v -> v < 0) values then
+                        let hex = input.Substring(contentStart, digitCount)
+                        let msg = sprintf "binary literal contains non-hex character: %s" hex
+                        err (DbError.syntax msg startPos.Line)
+                    else
+                        ret (Token.BlobLit(Array.map byte values), advanceBy (digitCount + 3) s)
         elif isIdentStart c then
-            let word, s' = collect n (System.Text.StringBuilder()) s
-            let upper = word.ToUpperInvariant()
+            let endIdx = scanIdentEnd input n (s.Index + 1)
+            let word = input.Substring(s.Index, endIdx - s.Index)
+            let s' = advanceBy (endIdx - s.Index) s
 
-            let tok =
-                if Set.contains upper Keywords then Token.Keyword upper
-                elif upper = "TRUE" then Token.Keyword "TRUE"
-                elif upper = "FALSE" then Token.Keyword "FALSE"
-                else Token.Ident word
-
-            ret (tok, s')
+            if isAscii word 0 then
+                match Keywords.TryGetValue word with
+                | true, kw -> ret (Token.Keyword kw, s')
+                | _ -> ret (Token.Ident word, s')
+            else
+                match KeywordsUpper.TryGetValue(word.ToUpperInvariant()) with
+                | true, kw -> ret (Token.Keyword kw, s')
+                | _ -> ret (Token.Ident word, s')
         elif
             System.Char.IsDigit c
             || c = '.' && s.Index + 1 < n && System.Char.IsDigit input.[s.Index + 1]
         then
-            let afterInt = digits n s
+            let afterInt = scanDigits input n s
             let hasFraction = afterInt.Index < n && input.[afterInt.Index] = '.'
 
             let afterFraction =
                 if hasFraction then
-                    advance input afterInt |> digits n
+                    advance input afterInt |> scanDigits input n
                 else
                     afterInt
 
@@ -293,7 +330,7 @@ module internal Lexer =
                         else
                             afterE
 
-                    digits n afterSign
+                    scanDigits input n afterSign
                 else
                     afterFraction
 
@@ -326,38 +363,42 @@ module internal Lexer =
             collectDelimited input n '"' "unclosed quoted identifier" startPos.Line s
             |> Result.map (fun (v, s') -> Token.QuotedIdent v, s')
         else
-            let candidates = symbolsFor c
+            let next = if s.Index + 1 < n then input.[s.Index + 1] else '\000'
 
-            let rec trySymbol i =
-                if i >= candidates.Length then
-                    None
-                else
-                    let sym = candidates.[i]
+            match c with
+            | '<' when next = '>' -> ret (Token.Symbol "<>", advanceBy 2 s)
+            | '<' when next = '=' -> ret (Token.Symbol "<=", advanceBy 2 s)
+            | '<' -> ret (Token.Symbol "<", advanceBy 1 s)
+            | '>' when next = '=' -> ret (Token.Symbol ">=", advanceBy 2 s)
+            | '>' -> ret (Token.Symbol ">", advanceBy 1 s)
+            | '=' -> ret (Token.Symbol "=", advanceBy 1 s)
+            | '!' when next = '=' -> ret (Token.Symbol "!=", advanceBy 2 s)
+            | '|' when next = '|' -> ret (Token.Symbol "||", advanceBy 2 s)
+            | '+' -> ret (Token.Symbol "+", advanceBy 1 s)
+            | '-' -> ret (Token.Symbol "-", advanceBy 1 s)
+            | '*' -> ret (Token.Symbol "*", advanceBy 1 s)
+            | '/' -> ret (Token.Symbol "/", advanceBy 1 s)
+            | '%' -> ret (Token.Symbol "%", advanceBy 1 s)
+            | ';' -> ret (Token.Symbol ";", advanceBy 1 s)
+            | ',' -> ret (Token.Symbol ",", advanceBy 1 s)
+            | '.' -> ret (Token.Symbol ".", advanceBy 1 s)
+            | '(' -> ret (Token.Symbol "(", advanceBy 1 s)
+            | ')' -> ret (Token.Symbol ")", advanceBy 1 s)
+            | _ -> err (DbError.syntax (sprintf "unexpected character '%c'" c) startPos.Line)
 
-                    if
-                        s.Index + sym.Length <= n
-                        && System.String.CompareOrdinal(input, s.Index, sym, 0, sym.Length) = 0
-                    then
-                        Some sym
-                    else
-                        trySymbol (i + 1)
+    [<TailCall>]
+    let rec private collectTokens (input: string) (n: int) (acc: TokenItem list) (s: LexState) =
+        match skipTrivia input s with
+        | Error e -> err e
+        | Ok s when s.Index >= n -> ret (List.rev ({ Token = Token.Eos; Pos = s.Position } :: acc))
+        | Ok s ->
+            let startPos = s.Position
 
-            match trySymbol 0 with
-            | None -> err (DbError.syntax (sprintf "unexpected character '%c'" c) startPos.Line)
-            | Some sym -> ret (Token.Symbol sym, advanceN sym.Length s)
+            match scanToken input n startPos s with
+            | Error e -> err e
+            | Ok(tok, s') -> collectTokens input n ({ Token = tok; Pos = startPos } :: acc) s'
 
     /// SQL テキストをトークン列へ分解する。
     /// 位置と出力は不変で、外側の再帰が値を積み上げる。
     let tokenize (input: string) =
-        let rec collectTokens n acc s =
-            match skipTrivia input s with
-            | Error e -> err e
-            | Ok s when s.Index >= n -> ret (List.rev ({ Token = Token.Eos; Pos = s.Position } :: acc))
-            | Ok s ->
-                let startPos = s.Position
-
-                match scanToken input startPos s with
-                | Error e -> err e
-                | Ok(tok, s') -> collectTokens n ({ Token = tok; Pos = startPos } :: acc) s'
-
-        { Index = 0; Line = 1; Column = 1 } |> collectTokens input.Length []
+        { Index = 0; Line = 1; Column = 1 } |> collectTokens input input.Length []

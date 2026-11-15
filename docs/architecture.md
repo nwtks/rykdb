@@ -255,12 +255,30 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 - `LexState` は `{ Index; Line; Column }` の不変レコード。
   **前進すると新しい値を返す**ので mutable なインデックスを持たない。
-- 予約語は `Lexer` の private `Keywords` Set にだけ置く。
+  `Position` と `TokenItem` も `[<Struct>]` で、トークンごとのヒープ確保を避ける。
+- 予約語は `Lexer` の private `KeywordSpellings` にだけ置き、
+  `FrozenDictionary<string, string>`（`OrdinalIgnoreCase`）で引く。
+  識別子ごとの `ToUpperInvariant` と `Set.contains` を避けるため。
+  非 ASCII を含む識別子は `ToUpperInvariant` してから `Ordinal` の表を引く互換経路に回す
+  （InvariantGlobalization の有無で大文字化の結果が変わるため、旧実装と同じ規則を保つ）。
   型名（`INTEGER` など）は**予約語にしない**（列名に使えるようにするため）。
   Lexer は型名を `Ident` として返し、`Parser` の `TypeTable` が型の位置で解釈する。
+- 識別子・数値・文字列・引用識別子・バイナリは、終端を走査してから `Substring` で切り出す。
+  `StringBuilder` をトークンごとに作らない。
+  二重区切り（`''` / `""`）は `String.Replace` で 1つに畳む。
+  記号は先頭文字の `match` で直接判定する。
+  改行を含まない範囲の前進は `advanceBy` でまとめる。
+- 走査の再帰（`skipTriviaLoop` / `scanIdentEnd` / `scanDigits` / `scanDelimitedGo` /
+  `findQuoteEnd`）はモジュールレベルの `let rec` に hoist し、`[<TailCall>]` を付ける。
+  ローカル関数のままだとトークンごとにクロージャを確保する。
 - Blob リテラル `X'0A1B'` の判定は**識別子より前**に置く。
   順序を逆にすると `'ABCD'` が文字列になる。
 - コメントは `--`（行末）と `/* … */`（**入れ子可**）。
+- 回帰テスト: `Lexer: 文字列リテラルの二重区切りを 1 つに畳む` /
+  `Lexer: 引用識別子の二重区切りを 1 つに畳む` /
+  `Lexer: 予約語は大文字小文字を無視して判定する` /
+  `Lexer: バイナリリテラルは空・小文字・混在した 16 進を受け付ける` /
+  `Lexer: 複数行の文字列の後の位置は行を進める`。
 
 ### 3.2 Parser — 再帰下降 + Pratt の式（CPS）
 
