@@ -504,7 +504,7 @@ let buildSstable (bloomFalsePositiveRate: float) (entries: SstEntry array) =
     let build () =
         use stream = new System.IO.MemoryStream()
 
-        Sstable.writeTo stream bloomFalsePositiveRate entries
+        SstableFormat.writeTo stream bloomFalsePositiveRate entries
         |> Result.map (fun _ -> stream.ToArray())
 
     match protect build with

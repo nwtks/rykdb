@@ -36,20 +36,20 @@ flowchart TB
     end
 
     SESS["Session.fs<br/>Session（1接続）/ SessionPool"]
-    HOST["Session.fs<br/>DatabaseHost<br/>共有 committed state・採番・fsync"]
+    HOST["SessionHost.fs<br/>DatabaseHost<br/>共有 committed state・採番・fsync"]
     DB["Database.fs<br/>internal の不変ハンドル"]
     SESS --> HOST
     HOST --> DB
 
     subgraph EX["実行"]
         EN["Engine.fs<br/>文の実行（Ddl / Engine）"]
-        PL["Analyzer.fs / Planner.fs<br/>束縛 → 論理代数 → Op"]
-        OPS["Ops.fs / ExecContext.fs<br/>pull 演算子と走査"]
+        PL["Binder.fs / Analyzer.fs<br/>PlanBuilder / Optimizer / Plan<br/>束縛 → 論理代数 → Op"]
+        OPS["Ops.fs / OpsJoin.fs / ExecContext.fs<br/>pull 演算子と走査"]
     end
 
     subgraph ROW["行ストア"]
         RS["RowStore.fs<br/>単一 LSM + keyspace 接頭辞"]
-        CAT["Catalog.fs<br/>スキーマ定義の永続化"]
+        CAT["TableSchema.fs / Catalog.fs<br/>スキーマ定義の永続化"]
     end
 
     EHOST["EngineHost.fs<br/>background compaction の共有状態<br/>Version 採番・refcount・worker"]
@@ -59,7 +59,7 @@ flowchart TB
     subgraph ST["ストレージ（1 DB = LSM ツリー 1本）"]
         SE["StorageEngine.fs"]
         MEM["Memtable.fs<br/>永続 Treap"]
-        SST["Sstable.fs"]
+        SST["Sstable.fs / SstableFormat.fs"]
         VS["VersionSet.fs"]
         MF["Manifest.fs"]
         CO["Compaction.fs"]
@@ -68,7 +68,7 @@ flowchart TB
     end
 
     subgraph FE["フロントエンド"]
-        P["Parser.fs"]
+        P["ParserExpr.fs / Parser.fs"]
         L["Lexer.fs"]
         A["Ast.fs"]
         T["Types.fs"]
@@ -146,14 +146,14 @@ flowchart TB
 **上から下への一方向のみ**。
 下位モジュールは上位を知らない。
 
-| 層               | モジュール                                                       | 知っている層                                           |
-| ---------------- | ---------------------------------------------------------------- | ------------------------------------------------------ |
-| インターフェース | `Session.fs` `RykDb.Cli` `RykDb.Server`                          | 全部                                                   |
-| 実行             | `Engine.fs` `Analyzer.fs` `Planner.fs` `ExecContext.fs` `Ops.fs` | `RowStore` `Catalog` `Transactions`                    |
-| 行ストア         | `RowStore.fs` `Dml.fs` `Catalog.fs` `EngineHost.fs`              | `StorageEngine` `Compaction` `Manifest` `Transactions` |
-| MVCC             | `Transactions.fs`                                                | `Memtable`(`Entry`) `Errors` `Types`                   |
-| ストレージ       | `StorageEngine.fs` とその下                                      | `Errors` `Types` `Serialization`                       |
-| フロントエンド   | `Lexer` `Parser` `Ast`                                           | `Types` `Errors`                                       |
+| 層               | モジュール                                                                                    | 知っている層                                           |
+| ---------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| インターフェース | `Session.fs` `RykDb.Cli` `RykDb.Server`                                                       | 全部                                                   |
+| 実行             | `Engine.fs` `Analyzer.fs` `PlanBuilder.fs` `Optimizer.fs` `Plan.fs` `ExecContext.fs` `Ops.fs` | `RowStore` `Catalog` `Transactions`                    |
+| 行ストア         | `RowStore.fs` `Dml.fs` `Catalog.fs` `EngineHost.fs`                                           | `StorageEngine` `Compaction` `Manifest` `Transactions` |
+| MVCC             | `Transactions.fs`                                                                             | `Memtable`(`Entry`) `Errors` `Types`                   |
+| ストレージ       | `StorageEngine.fs` とその下                                                                   | `Errors` `Types` `Serialization`                       |
+| フロントエンド   | `Lexer` `Parser` `Ast`                                                                        | `Types` `Errors`                                       |
 
 > **Transactions と RowStore の依存方向**: `Transactions.fs` は `RowStore` を参照しない。
 > 依存は **`Dml` / `RowStore` → `Transactions` → `Memtable`** の向きで、
@@ -195,51 +195,62 @@ flowchart TB
 
 ### モジュール一覧（`src/RykDb.Core/`）
 
-| ファイル           | 役割                                                                                                                     |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）                                        |
-| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）                                |
-| `Writer.fs`        | 不変のチャンク書き込み `Writer`                                                                                          |
-| `Cursor.fs`        | 読み取り位置を値として保持する `Cursor`                                                                                  |
-| `Serialization.fs` | 順序保持エンコーディング / `Reader` / `OrderPreserving` / `KeyBuilder` / `ValueCodec` / `Hashing`                        |
-| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                                                           |
-| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                                                   |
-| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                                                |
-| `SstScan.fs`       | SSTable / メモリの遅延走査 `SstScan` とマージ `SstMerge`（`ScanScope`）                                                  |
-| `Sstable.fs`       | SSTable の構築・読み取り・k-way merge（ブロック / index / Bloom / Footer）                                               |
-| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                                                |
-| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                                              |
-| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                                                        |
-| `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                                                    |
-| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                                              |
-| `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                                                     |
-| `Parser.fs`        | 再帰下降 + Pratt（precedence climbing）の式パーサ（CPS でスタック一定）                                                  |
-| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                                               |
-| `EngineHost.fs`    | background compaction の共有状態（Version / 採番 / ファイル refcount / worker / install）                                |
-| `ProcessLock.fs`   | プロセス間ロック（`.rykdb.format` を排他で保持、`ProcessLock`）                                                          |
-| `RowStore.fs`      | 単一 LSM と keyspace 接頭辞（`RowStore` 型 + `Keyspace` モジュール）                                                     |
-| `Catalog.fs`       | `IndexSchema` / `TableSchema` / `Catalog` と出力 `Schema` / `OutputColumn` の型・モジュール                              |
-| `Eval.fs`          | スカラー関数 `Scalar` と式評価器 `Eval`                                                                                  |
-| `Op.fs`            | pull 演算子 `Op` / `Row`（`ExtSort` が `Op` を使うため先にコンパイル）                                                   |
-| `ExtSort.fs`       | 外部マージソート `ExtSort` と一時ファイル `Spill`（ソートの溢らし・k-way merge）                                         |
-| `Ops.fs`           | 演算子の組み立て `Ops`（フィルタ・ソート・結合・集約・射影・DISTINCT）                                                   |
-| `Dml.fs`           | `RowKey` / `Dml`（`Transaction` のバッファへ行・索引を積む DML ヘルパ）                                                  |
-| `ExecContext.fs`   | 実行時文脈 `ExecContext` と DML `DmlOps`（INSERT / UPDATE / DELETE）                                                     |
-| `Analyzer.fs`      | `ScanMethod` / `JoinAlgorithm` / `Logical`、`Binder` / `Alias` / `Predicate` / `Analyzer`                                |
-| `Planner.fs`       | `Optimizer`（論理代数 → `Op`）と `Plan`（SELECT の実行）                                                                 |
-| `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                                                   |
-| `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                                             |
-| `Database.fs`      | internal の不変ハンドル `Database`（transaction・状態遷移）                                                              |
-| `Session.fs`       | 公開 API `Session` / `SessionPool` と `DatabaseHost`（接続ごとの transaction・読み取りは並行、書き込みはホストで直列化） |
+| ファイル           | 役割                                                                                                                 |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）                                    |
+| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）                            |
+| `Writer.fs`        | 不変のチャンク書き込み `Writer`                                                                                      |
+| `Cursor.fs`        | 読み取り位置を値として保持する `Cursor`                                                                              |
+| `Serialization.fs` | 順序保持エンコーディング / `Reader` / `OrderPreserving` / `KeyBuilder` / `ValueCodec` / `Hashing`                    |
+| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                                                       |
+| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                                               |
+| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                                            |
+| `SstScan.fs`       | SSTable / メモリの遅延走査 `SstScan` とマージ `SstMerge`（`ScanScope`）                                              |
+| `SstableFormat.fs` | SSTable の形式・Footer・ブロックキャッシュ・書き出し（`writeTo` / v6 / Bloom / index）                               |
+| `Sstable.fs`       | SSTable の部分読み・走査・点検索（`openPartial` / `rangeScanPartial*` / `lookupMasked`）                             |
+| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                                            |
+| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                                          |
+| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                                                    |
+| `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                                                |
+| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                                          |
+| `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                                                 |
+| `ParserExpr.fs`    | 字句の読み進め・式（Pratt / precedence climbing）・SELECT の構文規則（CPS でスタック一定）                           |
+| `Parser.fs`        | 文（INSERT / UPDATE / DELETE / DDL / トランザクション）の構文規則と公開 API `parseStatements`                        |
+| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                                           |
+| `EngineHost.fs`    | background compaction の共有状態（Version / 採番 / ファイル refcount / worker / install）                            |
+| `ProcessLock.fs`   | プロセス間ロック（`.rykdb.format` を排他で保持、`ProcessLock`）                                                      |
+| `RowStore.fs`      | 単一 LSM と keyspace 接頭辞（`RowStore` 型 + `Keyspace` モジュール）                                                 |
+| `TableSchema.fs`   | `IndexSchema` / `TableSchema`（テーブル定義の検証・主キー解決）                                                      |
+| `Catalog.fs`       | `Catalog` と出力 `Schema` / `OutputColumn` / `SelectProjection` の型・モジュール                                     |
+| `Scalar.fs`        | スカラー関数 `Scalar`（LIKE 照合・スカラー関数）                                                                     |
+| `Eval.fs`          | 式評価器 `Eval`（算術・3値論理・CASE・CAST）                                                                         |
+| `Op.fs`            | pull 演算子 `Op` / `Row`（`ExtSort` が `Op` を使うため先にコンパイル）                                               |
+| `ExtSort.fs`       | 外部マージソート `ExtSort` と一時ファイル `Spill`（ソートの溢らし・k-way merge）                                     |
+| `OpsJoin.fs`       | 結合の実装 `OpsJoin`（nested loop / ハッシュ / マージ / インデックス）                                               |
+| `Ops.fs`           | 演算子の組み立て `Ops`（フィルタ・ソート・集約・射影・DISTINCT。結合は `OpsJoin` に委譲）                            |
+| `Dml.fs`           | `RowKey` / `Dml`（`Transaction` のバッファへ行・索引を積む DML ヘルパ）                                              |
+| `ExecContext.fs`   | 実行時文脈 `ExecContext` と DML `DmlOps`（INSERT / UPDATE / DELETE）                                                 |
+| `Binder.fs`        | 名前束縛 `Binder` / 別名 `Alias` / 述語の分解 `Predicate`                                                            |
+| `Analyzer.fs`      | `ScanMethod` / `JoinAlgorithm` / `Logical` と `Analyzer`（走査方法・結合アルゴリズムの選択）                         |
+| `PlanBuilder.fs`   | `PlanBuilder`（SELECT の論理代数の組み立て）                                                                         |
+| `Optimizer.fs`     | `Optimizer`（論理代数 → `Op` の実行と `explain`）                                                                    |
+| `Plan.fs`          | `Plan`（サブクエリ解決・派生テーブル・`runSelect` / `explainSelect`）                                                |
+| `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                                               |
+| `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                                         |
+| `Database.fs`      | internal の不変ハンドル `Database`（transaction・状態遷移）                                                          |
+| `SessionHost.fs`   | `DatabaseHost` と `CommitDurability`（共有 committed state・採番・fsync のグループコミット）                         |
+| `Session.fs`       | 公開 API `Session` / `SessionPool` / `RowReader`（接続ごとの transaction・読み取りは並行、書き込みはホストで直列化） |
 
 ### F# のコンパイル順
 
 ```
 Errors → Types → Writer → Cursor → Serialization → Memtable → Wal → BloomFilter
-       → SstScan → Sstable → VersionSet → Manifest → Compaction
-       → StorageEngine → Ast → Lexer → Parser → Transactions → EngineHost
-       → ProcessLock → RowStore → Catalog → Eval → Op → ExtSort → Ops
-       → Dml → ExecContext → Analyzer → Planner → DropCleanup → Engine → Database → Session
+       → SstScan → SstableFormat → Sstable → VersionSet → Manifest → Compaction
+       → StorageEngine → Ast → Lexer → ParserExpr → Parser → Transactions → EngineHost
+       → ProcessLock → RowStore → TableSchema → Catalog → Scalar → Eval → Op
+       → ExtSort → OpsJoin → Ops → Dml → ExecContext → Binder → Analyzer
+       → PlanBuilder → Optimizer → Plan → DropCleanup → Engine → Database
+       → SessionHost → Session
 ```
 
 F# はファイルを**コンパイル順に評価する**ため、上から下へ一方向の依存になるよう `.fsproj` の `Compile` を手で並べる
@@ -249,7 +260,7 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 ## 3. フロントエンド
 
-`Ast.fs`（式・文の型）→ `Lexer.fs` → `Parser.fs` → `Analyzer.fs` → `Planner.fs` という一方向のパイプライン。
+`Ast.fs`（式・文の型）→ `Lexer.fs` → `ParserExpr.fs` → `Parser.fs` → `Binder.fs` → `Analyzer.fs` → `PlanBuilder.fs` → `Optimizer.fs` → `Plan.fs` という一方向のパイプライン。
 
 ### 3.1 Lexer — 状態スレッドの字句解析
 
@@ -411,10 +422,10 @@ flowchart LR
     L --> E["Optimizer.exec<br/>Op の組み立て"]
 ```
 
-パイプラインの実装は `Analyzer.fs` と `Planner.fs` の 3段。
+パイプラインの実装は `Binder.fs` / `Analyzer.fs` と `PlanBuilder.fs` / `Optimizer.fs` / `Plan.fs` の 3段。
 
 1. `Analyzer.bindTable` — FROM / JOIN の各テーブルを `TableBinding`（スキーマ + 識別名）にする。
-2. `Optimizer.buildLogicalWith` — 式を `Binder.qualify` で束縛し、`Predicate.splitConjuncts` で WHERE を分解、
+2. `PlanBuilder.buildLogicalWith` — 式を `Binder.qualify` で束縛し、`Predicate.splitConjuncts` で WHERE を分解、
    `Analyzer.chooseScanMethod` で走査方法を決めて論理代数を組む。
 3. `Optimizer.exec` — 論理代数を `Op` に変換する（`execScan` / `execJoin` など）。
 
@@ -469,8 +480,8 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
 - `Plan.resolveSourcesC` が FROM / JOIN の `Derived` を `Plan.planCoreCWith` で計画する。
   `planCoreCWith` は論理木までで止め、`PlannedQuery`（`Output` / `Header` / `Input` / `Context` / `Tree`）を返す。
   AST は実テーブル参照（別名）へ書き換え、
-  計画結果は別名をキーにした Map で `Optimizer.buildLogicalWith` へ渡す。
-- `Optimizer.buildLogicalWith` は派生の束縛を `Logical.Derived` にする。
+  計画結果は別名をキーにした Map で `PlanBuilder.buildLogicalWith` へ渡す。
+- `PlanBuilder.buildLogicalWith` は派生の束縛を `Logical.Derived` にする。
   WHERE は内側へ押し下げず、派生ノードの上に `Filter` を付ける
   （集約 / DISTINCT / LIMIT を跨ぐと意味が変わるため）。
 - `Optimizer.run` は `Logical.Derived` に来たら、
@@ -485,7 +496,7 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
 - `Logical.Derived` は `scanOrder` で `None` に落ちるためマージ結合には選ばれない。
 
 回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
-`Optimizer.buildLogicalWith: FROM のサブクエリは Logical.Derived になる`。
+`PlanBuilder.buildLogicalWith: FROM のサブクエリは Logical.Derived になる`。
 
 #### 束縛（Binder）
 
@@ -609,7 +620,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
 #### 結合順序
 
 統計（行数・NDV）を持たないため、走査方法から決めた**粗い行数見積りだけを使う貪欲法**で決める
-（`Optimizer.buildLogicalWith`）。
+（`PlanBuilder.buildLogicalWith`）。
 
 1. `FROM` の先頭テーブルは固定する（左部分木の起点）。
 2. `LEFT` は境界。JOIN の並びを `LEFT` で区切り、**INNER の連続区間の中だけ**を並べ替える。
@@ -1341,7 +1352,7 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 | Bloom filter             | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。ビット列は packed（1ビット = 1ビット）。読む側は `BloomFilter.mightContain`            |
 | ポイント検索の順路       | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロック（可視版がブロック末尾に無い場合は同じキーが続く次のブロックも読む。`next` を呼ぶまでブロックを読まない） |
 
-ファイルは `Sstable.writeTo` が v6 形式をブロック単位でストリームへ書き出す
+ファイルは `SstableFormat.writeTo` が v6 形式をブロック単位でストリームへ書き出す
 （テストの `buildSstable` は `MemoryStream` 経由で同じ処理を呼ぶ）。
 入力は `seq` で **1回だけ列挙**し、
 キー順の検証・先頭/末尾キー・`maxSeqNo`・Bloom 用のキーは書き出しと同時に集める
@@ -1651,7 +1662,7 @@ SQL 文字列
   → Lexer.tokenize          トークン列
   → Parser.parseStatements  Statement list
   → Analyzer.bindTable      名前束縛（修飾子を解決）
-  → Optimizer.buildLogicalWith  論理代数
+  → PlanBuilder.buildLogicalWith  論理代数
   → 物理化                 走査方法・結合アルゴリズムを決定
   → Ops / Optimizer         Op の木
   → Engine.runSelect        Op.toArrayLimited で結果行

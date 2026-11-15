@@ -87,7 +87,7 @@ module internal FileMetaData =
                         System.IO.FileOptions.SequentialScan
                     )
 
-                Sstable.writeTo fs bloomFalsePositiveRate entries
+                SstableFormat.writeTo fs bloomFalsePositiveRate entries
                 >>= fun info ->
                     fs.Flush true
                     ret info)

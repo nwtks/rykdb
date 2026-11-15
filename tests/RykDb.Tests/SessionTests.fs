@@ -883,3 +883,29 @@ let ``SessionPool: 閉じた後の操作はエラーになる`` () =
         expectErrorKind ErrorKind.InternalError "Close 後の Execute" (session.Execute "SELECT 1")
         expectErrorKind ErrorKind.InternalError "閉じた pool の CreateSession" (pool.CreateSession())
         session.Close() |> ignore)
+
+[<Fact>]
+let ``Session: 並行 commit を Close して再オープンしても読める`` () =
+    withDir "session-group-commit" (fun dir ->
+        let session = ok (Session.OpenWith dir)
+
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        |> ignore
+
+        let tasks =
+            [|
+                for i in 1..16 do
+                    Task.Run(fun () -> session.Execute(sprintf "INSERT INTO t VALUES (%d, %d)" i i))
+            |]
+
+        Task.WaitAll(tasks |> Array.map (fun t -> t :> Task))
+        tasks |> Array.iter (fun t -> ok t.Result |> ignore)
+        ok (session.Close())
+
+        let reopened = ok (Session.OpenWith dir)
+
+        try
+            let selected = ok (reopened.Execute "SELECT id FROM t ORDER BY id")
+            Assert.Equal<int>(16, selected.Rows.Length)
+        finally
+            reopened.Close() |> ignore)

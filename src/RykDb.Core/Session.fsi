@@ -21,17 +21,6 @@ type RowReader =
     member TryRead: unit -> Result<SqlValue array option, DbError>
     interface System.IDisposable
 
-/// fsync のグループコミット（テスト用に internal 公開）。
-[<Class>]
-type internal CommitDurability =
-    new: sync: (WalState -> Result<unit, DbError>) -> CommitDurability
-    /// 記録済みの失敗。
-    member Failure: DbError option
-    /// 同期対象の WAL 位置を登録する。
-    member Register: pos: WalState -> unit
-    /// その位置まで同期されるのを待つ。
-    member Await: pos: WalState -> Result<unit, DbError>
-
 /// 1接続のセッション。
 [<Class>]
 type Session =

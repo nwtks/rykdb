@@ -92,7 +92,7 @@ xUnit。
 モジュール名も `module RykDb.DmlTests` と対象名に合わせる。
 
 **例外**: `Database.fs` の通し経路テストは 2ファイルに分かれる。
-`Session.fs` の公開 API は `SessionTests.fs` で検証する。
+`Session.fs` の公開 API は `SessionTests.fs`、`SessionHost.fs` は `SessionHostTests.fs` で検証する。
 `ProcessLock.fs` / `EngineHost.fs` は専用ファイルを持たず、
 `RowStoreTests` / `BackgroundCompactionTests` / `DatabaseTests` で間接的に検証する。
 `DurabilityTests` / `OrderingPropertyTests` は横断的な性質テスト、`CliTests` は CLI 全体のテスト。

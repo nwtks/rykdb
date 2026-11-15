@@ -1,8 +1,8 @@
 // ===========================================================================
-// グループコミットのテスト: 複数 commit の fsync 統合と失敗伝播。
+// SessionHost.fs のテスト: グループコミット（CommitDurability）の fsync 統合
 // ===========================================================================
 
-module RykDb.DurabilityTests
+module RykDb.SessionHostTests
 
 open System.Threading
 open System.Threading.Tasks
@@ -12,16 +12,6 @@ open RykDb.TestHelpers
 
 let private pos (fileNumber: int64) (size: int) : WalState =
     { FileNumber = fileNumber; Size = size }
-
-[<Fact>]
-let ``Wal: deferred append の位置を fsync でき、削除済みファイルは同期済み扱い`` () =
-    withDir "wal-deferred-sync" (fun dir ->
-        let state = ok (Wal.create dir 1L)
-        let state = ok (Wal.appendDeferred dir [ WalRecord.Commit 1UL<txnId> ] state)
-        Assert.True(state.Size > 0)
-        ok (Wal.sync dir state)
-        Assert.True(System.IO.File.Exists(Wal.path dir 1L))
-        ok (Wal.sync dir { state with FileNumber = 999L }))
 
 [<Fact>]
 let ``CommitDurability: 複数登録を 1回の fsync にまとめる`` () =
@@ -96,29 +86,3 @@ let ``CommitDurability: 同時待機でも fsync は 1回だけ`` () =
     Task.WaitAll(tasks |> Array.map (fun t -> t :> Task))
     tasks |> Array.iter (fun t -> ok t.Result)
     Assert.Equal(1, syncs)
-
-[<Fact>]
-let ``Session: 並行 commit を Close して再オープンしても読める`` () =
-    withDir "session-group-commit" (fun dir ->
-        let session = ok (Session.OpenWith dir)
-
-        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
-        |> ignore
-
-        let tasks =
-            [|
-                for i in 1..16 do
-                    Task.Run(fun () -> session.Execute(sprintf "INSERT INTO t VALUES (%d, %d)" i i))
-            |]
-
-        Task.WaitAll(tasks |> Array.map (fun t -> t :> Task))
-        tasks |> Array.iter (fun t -> ok t.Result |> ignore)
-        ok (session.Close())
-
-        let reopened = ok (Session.OpenWith dir)
-
-        try
-            let selected = ok (reopened.Execute "SELECT id FROM t ORDER BY id")
-            Assert.Equal<int>(16, selected.Rows.Length)
-        finally
-            reopened.Close() |> ignore)

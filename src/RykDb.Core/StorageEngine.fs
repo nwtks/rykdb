@@ -182,7 +182,7 @@ module internal StorageEngine =
     /// （呼び出し時点では検出しない。全件を読む演算子は最終結果を返す前に必ず Error になる）。
     /// ヒープは 1回だけ組み、以降は「取り出したソースの続きを戻す」だけにする
     /// （行ごとにソース列から作り直すと O(行数 × ファイル数 log ファイル数) になる）。
-    /// マージとヒープは `SstMerge`（Sstable.fs）に集約する。
+    /// マージとヒープは `SstMerge`（SstScan.fs）に集約する。
     let private scanAtWith
         (visible: uint64 option)
         (limit: int)

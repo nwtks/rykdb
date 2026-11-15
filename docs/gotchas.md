@@ -1520,8 +1520,8 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ### 11.18 `LIMIT` / `OFFSET` は 0 以上の定数式
 
-非リテラルを `0` に丸めると `LIMIT 1+0` が **0 行** になる（かつてドキュメントは「制限なし」と書いていた）。
-現在の `Optimizer.buildLogicalWith` 内の `applyLimit` は定数式を `Eval.eval Schema.empty [||]` で評価し、
+非リテラルを `0` に丸めると `LIMIT 1+0` が **0行** になる（かつてドキュメントは「制限なし」と書いていた）。
+現在の `PlanBuilder.buildLogicalWith` 内の `applyLimit` は定数式を `Eval.eval Schema.empty [||]` で評価し、
 行ごとの列参照・負数・`Int32.MaxValue` 超をエラーにする。
 `Limit` ノードの `limit = -1` が「LIMIT なし」、`0` は 0行。
 
@@ -1778,12 +1778,12 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 
 回帰テスト:
 
-- `パーサ: 未対応の集合演算は明示エラー`
-- `パーサ: 未対応の JOIN は明示エラー`
-- `パーサ: JOIN の種類だけで JOIN が無い入力はエラー`
-- `パーサ: 列別名が集合演算を飲み込まない`
-- `パーサ: DML のテーブル別名は明示エラー`
-- `パーサ: 複数文は ; で区切る`
+- `Parser: 未対応の集合演算は明示エラー`
+- `Parser: 未対応の JOIN は明示エラー`
+- `Parser: JOIN の種類だけで JOIN が無い入力はエラー`
+- `Parser: 列別名が集合演算を飲み込まない`
+- `Parser: DML のテーブル別名は明示エラー`
+- `Parser: 複数文は ; で区切る`
 - `SqlReference: UNION はエラーになり 2 文として実行されない`
 - `SqlReference: RIGHT JOIN はエラーになり INNER JOIN として実行されない`
 
@@ -1872,7 +1872,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
   （ピークは概ね上限の 2倍まで）。
 - `lookupHash` はバケットをそのまま返す（probe ごとの `ToArray` を廃止）。
 
-### 11.45 `Sstable.writeTo` は入力を 1回だけ列挙する
+### 11.45 `SstableFormat.writeTo` は入力を 1回だけ列挙する
 
 `writeTo` は `seq` を受け、**1回だけ列挙**してブロック単位で書き出す
 （memtable の flush が全件を `SstEntry` 配列へ実体化しない）。
@@ -1886,7 +1886,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 - 末尾再帰の `loop` は `use`（列挙子の破棄）の後ろにあるが、
   F# は `use` / `try/finally` の中でも自己再帰を末尾呼び出しにする
   （300万回の反復で実測済み）。
-- 回帰テスト: `Sstable.writeTo: 入力の seq は 1 回だけ列挙する` /
+- 回帰テスト: `SstableFormat.writeTo: 入力の seq は 1 回だけ列挙する` /
   `FileMetaData.writeSstable: キー順でない入力はエラー`
   （部分ファイルが残らないことを含む）。
 
@@ -1954,7 +1954,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
   グループ内へは関数引数 `runner` として渡す。
 - 回帰テスト: `SqlReference: サブクエリ（スカラー・IN・EXISTS）` /
   `SqlReference: 相関サブクエリ` / `SqlReference: 相関サブクエリの未対応形` /
-  `SqlReference: サブクエリの未対応形とエラー` / `パーサ: サブクエリ（スカラー / IN / EXISTS）` /
+  `SqlReference: サブクエリの未対応形とエラー` / `Parser: サブクエリ（スカラー / IN / EXISTS）` /
   `末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパースできる`。
 
 ### 11.48 Parser の深さ上限は撤廃（CPS でスタック一定）
@@ -1995,7 +1995,7 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
 - `SELECT` の句も継続を取る CPS（`parseJoinsC` / `parseWhereC` / `parseSelectTailC` …）。
   句の追加は `parseSelectTailC` の継続の連鎖に 1段足す。
 - 回帰テスト: `SqlReference: FROM を省略した SELECT は定数 1 行を返す` /
-  `パーサ: FROM を省略した SELECT`。
+  `Parser: FROM を省略した SELECT`。
 
 ### 11.50 派生テーブルは「計画」と「実行」を分ける（`planCoreCWith` / `Logical.Derived`）
 
@@ -2004,7 +2004,7 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
 派生は `PlannedQuery { Output; Header; Input; Context; Tree }` として持ち回る。
 
 - `Plan.resolveSourcesC` が AST の `TableSource.Derived` を `TableSource.Named`（別名）へ書き換え、
-  別名の小文字をキーにした Map を `Optimizer.buildLogicalWith` に渡す。
+  別名の小文字をキーにした Map を `PlanBuilder.buildLogicalWith` に渡す。
   書き換え後に `From` / `Joins[].Table` に `Derived` が残っていたら解決漏れ。
 - `Logical.Derived` の実行は `Optimizer.run` の `DerivedFrame`。
   内側の木は **内側の `ExecContext`**（内側のテーブル別名を登録したもの）で走らせる。
@@ -2019,8 +2019,8 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
   `planCoreCWith` を呼ぶ継続はラムダ内なので TailAudit のベースラインに載る
   （Parser も CPS なので深さ上限はない）。
 - 回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
-  `パーサ: サブクエリ（スカラー / IN / EXISTS）` /
-  `Optimizer.buildLogicalWith: FROM のサブクエリは Logical.Derived になる` /
+  `Parser: サブクエリ（スカラー / IN / EXISTS）` /
+  `PlanBuilder.buildLogicalWith: FROM のサブクエリは Logical.Derived になる` /
   `Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`。
 
 ### 11.51 `maybeFlush` は WAL commit 後に Error を返さない（compaction 失敗で flush を巻き戻さない）

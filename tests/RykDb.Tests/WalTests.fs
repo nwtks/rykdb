@@ -97,3 +97,13 @@ let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
         System.IO.Path.Combine(System.IO.Path.GetTempPath(), "rykdb-wal-missing-" + string System.DateTime.UtcNow.Ticks)
 
     Assert.Empty(Wal.walFiles missing)
+
+[<Fact>]
+let ``Wal: deferred append の位置を fsync でき、削除済みファイルは同期済み扱い`` () =
+    withDir "wal-deferred-sync" (fun dir ->
+        let state = ok (Wal.create dir 1L)
+        let state = ok (Wal.appendDeferred dir [ WalRecord.Commit 1UL<txnId> ] state)
+        Assert.True(state.Size > 0)
+        ok (Wal.sync dir state)
+        Assert.True(System.IO.File.Exists(Wal.path dir 1L))
+        ok (Wal.sync dir { state with FileNumber = 999L }))

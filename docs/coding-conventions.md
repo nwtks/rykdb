@@ -58,9 +58,9 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 ## 2. 命令型の構文・機能を使わない
 
 `src/RykDb.Core/` では **`mutable` / `while` / `ref` を 0件**に保つ。
-例外は公開セッション層の `Session.fs` だけで、次を意図的に使う。
+例外は公開セッション層（`Session.fs` / `SessionHost.fs`）だけで、次を意図的に使う。
 
-- `DatabaseHost` の `let mutable lifecycle`（`HostLifecycle` = `Running` / `Closed`）:
+- `DatabaseHost` の `let mutable lifecycle`（`HostLifecycle` = `Running` / `Closed`、`SessionHost.fs`）:
   全接続で共有する committed な `DbState` と Close 状態を 1つの状態 DU で持つ。
 - `Session` の `let mutable local`（`LocalSession` = `Open` / `Closed`）と
   `let mutable readers`: 接続ローカルの transaction 状態と Close 状態を状態 DU で、
@@ -88,13 +88,13 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `Op.toArray` の行の蓄積
 - `Ops.aggregate` のグループ表（入力行は抱えず、アキュムレータだけ）
 - `Ops.distinct` の符号化済みキー集合（`HashSet<byte array>`）
-- `Ops.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
+- `OpsJoin.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
 - `ExtSort` の受け皿（バジェット内に収まる分。超過分は一時ファイルへ退避する）
-- `Sstable` のブロック構築（`ResizeArray`）と partial reader / scan scope のキャッシュ（`ConcurrentDictionary`）
+- `SstableFormat` のブロック構築（`ResizeArray`）と `Sstable` の partial reader / scan scope のキャッシュ（`ConcurrentDictionary`）
 - `EngineHost` の host state / ファイル refcount / 採番（`ConcurrentDictionary`）
 - `Compaction` の作業ディレクトリ別カウンタ（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
-- `Eval` の LIKE パターンキャッシュ（コンパイル済みトークン列を `(escape, pattern)` ごとに再利用）
+- `Scalar` の LIKE パターンキャッシュ（コンパイル済みトークン列を `(escape, pattern)` ごとに再利用）
 - `Eval.resolver` の列解決キャッシュ（1オペレータ = 1スキーマ。行ごとの `Schema.resolve` を繰り返さない）
 
 | やりたいこと       | 命令形の代わりに使うもの                                                        |
