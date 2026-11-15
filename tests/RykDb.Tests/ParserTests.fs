@@ -1,5 +1,5 @@
 ﻿// ===========================================================================
-// Parser.fs（文法・演算子優先順位・深さ制限・CPS 化した式構文規則）
+// Parser.fs（文法・演算子優先順位・CPS の式構文規則・深さ無制限）
 // ===========================================================================
 
 module RykDb.ParserTests
@@ -112,14 +112,6 @@ let private whereTextOf (sql: string) : string =
 
 /// 解析が通ることだけを確かめる（内容は見ない）。
 let private parsesOk (sql: string) = ok (parseStatement sql) |> ignore
-
-/// 深さ超過が StackOverflow ではなく SyntaxError として返ること。
-let private expectDepthError (label: string) (r: Result<Statement, DbError>) =
-    match r with
-    | Error e ->
-        Assert.Equal<ErrorKind>(ErrorKind.SyntaxError, e.Kind)
-        Assert.Contains("深すぎます", e.Message)
-    | Ok _ -> Assert.Fail(label + " は深すぎるのでエラーになるはず")
 
 /// 同じ WHERE を 5 回分けて、その表示がすべて一致すること（継続の再入性）。
 let private repeatedWhere (sql: string) =
@@ -371,7 +363,7 @@ let ``パーサ: 引用した識別子`` () =
 
 [<Fact>]
 let ``パーサ: 型名は識別子にも使える`` () =
-    // 型名はキーワードとして字句解析されるが、識別子の位置では名前として受け付ける
+    // 型名は予約語ではなく Ident として字句解析されるので、識別子の位置でそのまま使える
     let ct =
         parseCreateTableOk "CREATE TABLE t (id INTEGER PRIMARY KEY, text TEXT, integer INTEGER)"
 
@@ -637,6 +629,66 @@ let ``パーサ: サブクエリの AST 形`` () =
     | _ -> Assert.Fail "EXISTS ではありません"
 
 [<Fact>]
+let ``パーサ: JOIN の種類だけで JOIN が無い入力はエラー`` () =
+    // 以前は LEFT / INNER を消費して以降の句を読み、JOIN を黙って捨てていた
+    // （`FROM t LEFT WHERE ...` が「LEFT JOIN なし」として静かに通っていた）。
+    expectErrorKind ErrorKind.SyntaxError "FROM の後の LEFT" (parseStatement "SELECT * FROM t LEFT")
+    expectErrorKind ErrorKind.SyntaxError "FROM の後の INNER" (parseStatement "SELECT * FROM t INNER")
+    expectErrorKind ErrorKind.SyntaxError "FROM の後の LEFT OUTER" (parseStatement "SELECT * FROM t LEFT OUTER")
+    expectErrorKind ErrorKind.SyntaxError "LEFT の後の WHERE" (parseStatement "SELECT * FROM t LEFT WHERE 1 = 1")
+    expectErrorKind ErrorKind.SyntaxError "INNER の後の ORDER BY" (parseStatement "SELECT * FROM t INNER ORDER BY 1")
+
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "既存 JOIN の後の LEFT"
+        (parseStatement "SELECT * FROM t JOIN u ON 1 = 1 LEFT WHERE 1 = 1")
+
+[<Fact>]
+let ``パーサ: 列別名が集合演算を飲み込まない`` () =
+    // 以前は SELECT 項目の別名が UNION を消費し、後続の SELECT が別の文として扱われていた
+    expectErrorKind ErrorKind.SyntaxError "UNION" (parseStatement "SELECT 1 UNION SELECT 2")
+    expectErrorKind ErrorKind.SyntaxError "UNION ALL" (parseStatement "SELECT 1 UNION ALL SELECT 2")
+
+    // AS を付ければ別名として使える
+    let sel = parseSelectOk "SELECT a AS union FROM t"
+    Assert.Equal<string option>(Some "union", sel.Items.[0].Alias)
+
+[<Fact>]
+let ``パーサ: DML のテーブル別名は明示エラー`` () =
+    // 別名は列解決に使われないため、受理して黙って無視するのをやめた
+    expectErrorKind ErrorKind.SyntaxError "UPDATE の別名" (parseStatement "UPDATE t AS x SET a = 1")
+    expectErrorKind ErrorKind.SyntaxError "DELETE の別名" (parseStatement "DELETE FROM t AS x")
+    expectErrorKind ErrorKind.SyntaxError "INSERT の別名" (parseStatement "INSERT INTO t AS x VALUES (1)")
+
+[<Fact>]
+let ``パーサ: NULL.* を QualifiedStar にしない`` () =
+    // 以前は `NULL` の後ろの `.*` を読んで `QualifiedStar ""` を作っていた
+    expectErrorKind ErrorKind.SyntaxError "NULL.*" (parseStatement "SELECT NULL.* FROM t")
+
+[<Fact>]
+let ``式: 述語は 1 つの式に 1 回だけ`` () =
+    // 比較・述語は非結合。連続して書いたら括弧を要求する。
+    expectErrorKind ErrorKind.SyntaxError "= の連続" (parseStatement "SELECT * FROM t WHERE a = b = c")
+    expectErrorKind ErrorKind.SyntaxError "IS NULL の後の =" (parseStatement "SELECT * FROM t WHERE a IS NULL = 1")
+    expectErrorKind ErrorKind.SyntaxError "BETWEEN の後の =" (parseStatement "SELECT * FROM t WHERE a BETWEEN 1 AND 2 = 3")
+    expectErrorKind ErrorKind.SyntaxError "述語の後の *" (parseStatement "SELECT * FROM t WHERE a IS NULL * 2")
+    // 括弧で囲めば述語の結果を比較できる
+    parsesOk "SELECT * FROM t WHERE (a = b) = c"
+
+[<Fact>]
+let ``式: NOT は述語の前置に置けない`` () =
+    // 比較の右辺は加算以上なので、前置 NOT（結合強度 30）は入れない
+    expectErrorKind ErrorKind.SyntaxError "= の右の NOT" (parseStatement "SELECT * FROM t WHERE a = NOT b")
+    expectErrorKind ErrorKind.SyntaxError "NOT の後の比較" (parseStatement "SELECT * FROM t WHERE a NOT = 1")
+
+[<Fact>]
+let ``式: 不正な修飾子はその場でエラー`` () =
+    // 識別子以外の後ろの `.` は修飾子として認めない
+    expectErrorKind ErrorKind.SyntaxError "式の後ろの ." (parseStatement "SELECT (a + b) . c FROM t")
+    // 正しい修飾子は従来どおり
+    parsesOk "SELECT a.b, a + b.c FROM t WHERE a.b = 1"
+
+[<Fact>]
 let ``パーサ: DELETE ... USING は明示エラー`` () =
     expectErrorKind ErrorKind.SyntaxError "DELETE USING" (parseStatement "DELETE FROM t USING u")
 
@@ -655,6 +707,8 @@ let ``パーサ: 未対応語でも列名と明示 AS の別名には使える``
 
     // 裸のテーブル別名には使えない（AS を付ける）
     expectErrorKind ErrorKind.SyntaxError "裸の RIGHT 別名" (parseStatement "SELECT a FROM t right")
+    // 裸の列別名にも使えない（集合演算を飲み込まないため）
+    expectErrorKind ErrorKind.SyntaxError "裸の RIGHT 列別名" (parseStatement "SELECT a right FROM t")
 
 [<Fact>]
 let ``パーサ: CREATE INDEX IF NOT EXISTS`` () =
@@ -783,9 +837,11 @@ let ``パーサ: 集約関数の DISTINCT`` () =
     | Expr.AggCall(AggFunc.Max, true, _) -> ()
     | other -> Assert.Fail(sprintf "MAX DISTINCT ではない: %A" other)
 
-/// 深さカウンタで構文エラーになることを確認する（StackOverflow ではない）。
-let private assertDepthExceeded (name: string) (sql: string) =
-    expectDepthError name (parseStatement sql)
+/// 深さ上限は設けない。深い入力も構文エラーにならず、StackOverflow もしないことを確かめる。
+let private assertDeepParse (name: string) (sql: string) =
+    match parseStatement sql with
+    | Ok _ -> ()
+    | Error e -> Assert.Fail(sprintf "%s は解析できるはず: %s" name (DbError.toDisplayString e))
 
 [<Theory>]
 // CPS 化した各経路をなぞる。継続の戻り値の型が多様（Expr / (Expr*Expr) list /
@@ -853,21 +909,12 @@ let ``末尾再帰: 比較演算子の判定が hoist 後も正しい`` (expr: s
     Assert.Equal<string>(expected, whereTextOf ("SELECT * FROM t WHERE " + expr))
 
 [<Fact>]
-let ``末尾再帰: CPS にした式構文規則は深さ境界で正確に動く`` () =
-    // 継続を呼ぶたびに深さが 1 段戻るので「ちょうど上限」で受理・超過で SyntaxError。
-    // WHERE の式が 1 段使うので括弧の入れ子は MaxExpressionDepth - 1 段まで。
-    let maxNest = 199
-
-    let nest depth =
-        System.String('(', depth) + "1" + System.String(')', depth)
-
-    // 括弧は AST に残らない（( 式 ) は 式 になる）ので中身は定数 1 のはず
-    Assert.Equal<string>("1", whereTextOf ("SELECT * FROM t WHERE " + nest maxNest))
-    expectDepthError "上限 1 段超過" (parseStatement ("SELECT * FROM t WHERE " + nest (maxNest + 1)))
-
-    // 先に成功しても深さの残骸が残らないこと（exitExpr を忘れると 2 回目で境界を超える）
-    for _ in 1..3 do
-        parsesOk ("SELECT * FROM t WHERE " + nest maxNest)
+let ``末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない`` () =
+    // MaxExpressionDepth = 1000000 を仮に置いても届かない深さ。
+    // 括弧は AST に残らないので、中身は定数 1 になる。
+    let depth = 1_000_000
+    let nest = System.String('(', depth) + "1" + System.String(')', depth)
+    Assert.Equal<string>("1", whereTextOf ("SELECT * FROM t WHERE " + nest))
 
 [<Fact>]
 let ``末尾再帰: 長い文字列リテラルを字句解析できる`` () =
@@ -902,54 +949,46 @@ let ``末尾再帰: 大量のトークンを解析できる`` () =
     parsesOk sql
 
 [<Fact>]
-let ``末尾再帰: 深い入れ子はエラーになる（StackOverflow ではない）`` () =
+let ``末尾再帰: 5000段の深い入れ子も解析できる`` () =
     let depth = 5_000
     let deep = System.String('(', depth) + "1" + System.String(')', depth)
-    let sql = "SELECT * FROM t WHERE " + deep
-    expectDepthError "深すぎる入れ子" (parseStatement sql)
-    // 上限内なら通ること
-    parsesOk ("SELECT * FROM t WHERE " + System.String('(', 50) + "1" + System.String(')', 50))
+    parsesOk ("SELECT * FROM t WHERE " + deep)
 
 [<Fact>]
-let ``末尾再帰: 深いサブクエリの入れ子もエラーになる（StackOverflow ではない）`` () =
-    // サブクエリは式のパーサ（CPS）と SELECT のパーサが相互再帰するので、
-    // ここが破れるとスタックを食う。深さは MaxExpressionDepth で頭打ちになる。
+let ``末尾再帰: 5000段の深いサブクエリの入れ子も解析できる`` () =
+    // サブクエリは式のパーサと SELECT のパーサが相互再帰する。
+    // 継続がヒープに積まれるので、深さに比例してスタックは積み上がらない。
     let nested depth =
         [ 1..depth ]
         |> List.fold (fun e _ -> sprintf "(SELECT %s FROM t WHERE id = 1)" e) "v"
 
-    expectDepthError "深すぎるサブクエリ" (parseStatement (sprintf "SELECT %s AS x FROM t" (nested 400)))
-    // 上限内なら通る（1 段あたり複数の深さ単位を消費するので 50 段で十分余裕がある）
-    parsesOk (sprintf "SELECT %s AS x FROM t" (nested 50))
+    parsesOk (sprintf "SELECT %s AS x FROM t" (nested 5_000))
 
 [<Fact>]
 let ``末尾再帰: 200000個の NOT が連なってもスタックを食わない`` () =
     let depth = 200_000
-    assertDepthExceeded "200000個の NOT" ("SELECT * FROM t WHERE " + String.replicate depth "NOT " + "a")
+    assertDeepParse "200000個の NOT" ("SELECT * FROM t WHERE " + String.replicate depth "NOT " + "a")
 
 [<Fact>]
 let ``末尾再帰: 200000個の単項マイナスが連なってもスタックを食わない`` () =
     let depth = 200_000
-    assertDepthExceeded "200000個の単項 '-'" ("SELECT * FROM t WHERE " + String.replicate depth "- " + "a")
+    assertDeepParse "200000個の単項 '-'" ("SELECT * FROM t WHERE " + String.replicate depth "- " + "a")
 
 [<Fact>]
 let ``末尾再帰: 50000個の OR が連なってもスタックを食わない`` () =
     let depth = 50_000
-    assertDepthExceeded "50000個の OR" ("SELECT * FROM t WHERE " + String.replicate depth "a OR ")
+    assertDeepParse "50000個の OR" ("SELECT * FROM t WHERE " + String.replicate depth "a OR " + "a")
 
 [<Fact>]
 let ``末尾再帰: BETWEEN を大量並べてもスタックを食わない`` () =
-    // parseBetweenAndC は継続を hoist した関数。非末尾再帰に戻っても
-    // StackOverflow ではなく深さエラーになる。
     let depth = 50_000
-    assertDepthExceeded "大量の BETWEEN" ("SELECT * FROM t WHERE " + String.replicate depth "a BETWEEN 1 AND 2 OR ")
+
+    assertDeepParse "大量の BETWEEN" ("SELECT * FROM t WHERE " + String.replicate depth "a BETWEEN 1 AND 2 OR " + "a")
 
 [<Fact>]
 let ``末尾再帰: 大量の JOIN 句がパースできる`` () =
-    // parseJoins は `parseTableRef >>= … expectKeyword >>= … parseExprC >>= fun … ->
-    // parseJoins …` で JOIN の数だけフレームが積まれていた（→ StackOverflow / exit 134）。
-    // `match` で受けて末尾再帰にしてある。テーブル参照は名前を読むだけで
-    // 実体は不要なので、ここで大量の JOIN をそのまま投げられる。
+    // JOIN の走査は継続の中で次の JOIN へ進む。
+    // 継続呼び出しが末尾になっていないと JOIN の数だけフレームが積まれる。
     let n = 10_000
 
     let joins =
@@ -960,8 +999,6 @@ let ``末尾再帰: 大量の JOIN 句がパースできる`` () =
 
 [<Fact>]
 let ``末尾再帰: 大量の SET 句がパースできる`` () =
-    // UPDATE の SET 連なりは `expectSymbol >>= … parseExpr >>= fun … -> assigns …`
-    // で列の数だけフレームが積まれていた。`match` で受けて末尾再帰にしてある。
     let n = 20_000
     let body = Array.init n (fun i -> sprintf "c%d = %d" i i) |> String.concat ", "
     let upd = parseUpdateOk (sprintf "UPDATE t SET %s" body)
@@ -983,23 +1020,22 @@ let ``末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパース�
     Assert.Equal(n, sel.OrderBy.Length)
 
 [<Fact>]
-let ``末尾再帰: 加算の鎖も深さエラーになる`` () =
+let ``末尾再帰: 20000個の加算の鎖もスタックを食わない`` () =
     let depth = 20_000
-    assertDepthExceeded "20000個の +" ("SELECT * FROM t WHERE a" + String.replicate depth " + 1")
+    assertDeepParse "20000個の +" ("SELECT * FROM t WHERE a" + String.replicate depth " + 1")
 
 [<Fact>]
-let ``末尾再帰: AND の鎖も深さエラーになる`` () =
+let ``末尾再帰: 50000個の AND の鎖もスタックを食わない`` () =
     let depth = 50_000
-    assertDepthExceeded "50000個の AND" ("SELECT * FROM t WHERE " + String.replicate depth "a AND " + "a")
+    assertDeepParse "50000個の AND" ("SELECT * FROM t WHERE " + String.replicate depth "a AND " + "a")
 
 [<Fact>]
-let ``末尾再帰: 単項プラスと乗算の鎖も深さエラーになる`` () =
-    assertDepthExceeded "20000個の単項 '+'" ("SELECT * FROM t WHERE " + String.replicate 20_000 "+ " + "a")
-    assertDepthExceeded "20000個の *" ("SELECT * FROM t WHERE a" + String.replicate 20_000 " * a")
+let ``末尾再帰: 20000個の単項プラスと乗算の鎖もスタックを食わない`` () =
+    assertDeepParse "20000個の単項 '+'" ("SELECT * FROM t WHERE " + String.replicate 20_000 "+ " + "a")
+    assertDeepParse "20000個の *" ("SELECT * FROM t WHERE a" + String.replicate 20_000 " * a")
 
 [<Fact>]
-let ``末尾再帰: 上限内の演算子チェーンは受理される`` () =
-    // 深さカウンタの加減を忘れると 2 回目で境界を超えてしまう。
+let ``末尾再帰: 演算子チェーンを繰り返し解析できる`` () =
     let sql = "SELECT * FROM t WHERE " + String.replicate 100 "a OR " + "b"
 
     for _ in 1..3 do

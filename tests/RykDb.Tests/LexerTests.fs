@@ -103,6 +103,12 @@ let ``Lexer: 実数の指数表記`` () =
     )
 
 [<Fact>]
+let ``Lexer: 型名は予約語にしない`` () =
+    // 型名は Ident として字句解析され、列名・テーブル名にも使える
+    let ks = kinds "INTEGER TEXT"
+    Assert.Equal<Token list>([ Token.Ident "INTEGER"; Token.Ident "TEXT"; Token.Eos ], ks)
+
+[<Fact>]
 let ``Lexer: 空入力は Eof のみ`` () =
     let ts = tokens ""
     Assert.Equal(1, ts.Length)

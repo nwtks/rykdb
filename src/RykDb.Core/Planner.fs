@@ -1601,11 +1601,11 @@ module internal Plan =
             (match stmt.From with
              | Some(TableSource.Derived _) -> true
              | _ -> false)
-            || (stmt.Joins
-                |> List.exists (fun j ->
-                    match j.Table with
-                    | TableSource.Derived _ -> true
-                    | _ -> false))
+            || stmt.Joins
+               |> List.exists (fun j ->
+                   match j.Table with
+                   | TableSource.Derived _ -> true
+                   | _ -> false)
 
         if not hasDerived then
             k stmt Map.empty
@@ -1724,14 +1724,14 @@ module internal Plan =
                 }
 
         let hasSubquery =
-            (stmt.Items |> List.exists (fun item -> Expr.hasSubquery item.Expression))
-            || (stmt.Joins |> List.exists (fun j -> Expr.hasSubquery j.On))
-            || (stmt.Where |> Option.exists Expr.hasSubquery)
-            || (stmt.GroupBy |> List.exists Expr.hasSubquery)
-            || (stmt.Having |> Option.exists Expr.hasSubquery)
-            || (stmt.OrderBy |> List.exists (fun k -> Expr.hasSubquery k.Expression))
-            || (stmt.Limit |> Option.exists Expr.hasSubquery)
-            || (stmt.Offset |> Option.exists Expr.hasSubquery)
+            stmt.Items |> List.exists (fun item -> Expr.hasSubquery item.Expression)
+            || stmt.Joins |> List.exists (fun j -> Expr.hasSubquery j.On)
+            || stmt.Where |> Option.exists Expr.hasSubquery
+            || stmt.GroupBy |> List.exists Expr.hasSubquery
+            || stmt.Having |> Option.exists Expr.hasSubquery
+            || stmt.OrderBy |> List.exists (fun k -> Expr.hasSubquery k.Expression)
+            || stmt.Limit |> Option.exists Expr.hasSubquery
+            || stmt.Offset |> Option.exists Expr.hasSubquery
 
         if not hasSubquery then
             k stmt

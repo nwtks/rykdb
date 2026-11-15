@@ -290,7 +290,7 @@ let ``havingFilter: 集約値とグループ値を定数へ置き換える`` () 
 let ``末尾再帰: 50000段の式を havingFilter してもスタックを食わない`` () =
     let depth = 50_000
 
-    // テスト側も末尾再帰（fold）で組む（SQL 経由だと MaxExpressionDepth = 200 で頭打ちになる）
+    // テスト側も末尾再帰（fold）で組む（SQL 経由でも解析できるが、ここでは AST を直接組む）
     let deep =
         List.init depth (fun _ -> Expr.Literal(Literal.Bool true))
         |> List.fold (fun acc e -> Expr.Binary(BinaryOp.And, acc, e)) (Expr.Literal(Literal.Bool true))

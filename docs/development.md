@@ -69,7 +69,9 @@ lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>
    （ベースラインは `dotnet run --project tools/TailAudit -- --update` で生成する。
    **未生成なら全件を新規とみなして exit 1 になる**ので、内容を確認のうえ生成しておく。）
    - 非末尾は**「ラムダ内 / 直接」の内訳**を表示する。
-     ラムダ内 = `Compute` / `pull` 継続・CPS 継続（深度は 1行ごと、`MaxExpressionDepth` を上限とする）。
+     ラムダ内 = `Compute` / `pull` 継続・CPS 継続（Planner・Parser）・Pratt の右辺降下。
+     Parser の CPS は継続呼び出しが `bare`（関数値呼び出し）として非末尾に数えられるが、
+     実行時は `tail.` で末尾呼び出しになるためベースラインで追認する。
      直接 = 監査部・引数など「結果を消費してから」型（**本来の末尾化候補**）。
      ベースラインのキーには含めない（内訳が変わっても差分化しないため）。
    - pipe の**関数側**は末尾として数える（`x |> f a` = `f a x`）。
@@ -78,8 +80,9 @@ lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>
 
 `[<TailCall>]` は構文上の検査にすぎない。
 `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` により Debug でも実際の `tail.` を出力する。
-この設定を外すと CPS の相互再帰がテストでスタックオーバーフローする（[`gotchas.md`](gotchas.md) §8.16）。
-CPS でのスタック深度とその上限は [`coding-conventions.md`](coding-conventions.md) §3 を参照。
+この設定を外すと CPS（Planner のサブクエリ解決）や式の再帰がテストでスタックオーバーフローする
+（[`gotchas.md`](gotchas.md) §8.16）。
+式・サブクエリに深さ上限はない（[`coding-conventions.md`](coding-conventions.md) §3）。
 
 ## 3. テスト構成
 

@@ -176,7 +176,7 @@ module internal Scalar =
             if args.Length = n then
                 ret ()
             else
-                err (sprintf "%s 関数は %d 個の引数が必要ですが、%d 個渡されました" upper n args.Length |> DbError.name)
+                err (sprintf "%s 関数は %d個の引数が必要ですが、%d個渡されました" upper n args.Length |> DbError.name)
 
         let asStr (v: SqlValue) =
             match SqlValue.asText v with

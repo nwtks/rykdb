@@ -137,7 +137,7 @@ flowchart TB
 | キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                                                    | §4                                                  |
 | 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                                                 | §6                                                  |
 | 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                                               | §5.2                                                |
-| 構文解析   | 手書き Lexer + 再帰下降 Parser（式規則は **CPS** で末尾再帰）                                             | §3                                                  |
+| 構文解析   | 手書き Lexer + 再帰下降 Parser（式は Pratt / precedence climbing）                                        | §3                                                  |
 | エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                                       | [`coding-conventions.md`](coding-conventions.md) §1 |
 | ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                                         | §4.2, §8.1                                          |
 
@@ -210,7 +210,7 @@ flowchart TB
 | `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                                                    |
 | `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                                              |
 | `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                                                     |
-| `Parser.fs`        | CPS 化した再帰下降パーサ（`MaxExpressionDepth = 200`）                                                                   |
+| `Parser.fs`        | 再帰下降 + Pratt（precedence climbing）の式パーサ（CPS でスタック一定）                                                  |
 | `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                                               |
 | `EngineHost.fs`    | background compaction の共有状態（Version / 採番 / ファイル refcount / worker / install）                                |
 | `ProcessLock.fs`   | プロセス間ロック（`.rykdb.format` を排他で保持、`ProcessLock`）                                                          |
@@ -252,36 +252,45 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 - `LexState` は `{ Index; Line; Column }` の不変レコード。
   **前進すると新しい値を返す**ので mutable なインデックスを持たない。
-- 予約語は `Lexer` の private `Keywords` Set、型名は `Parser.TypeNames`（`Parser.TypeTable` から導出）の Set に分ける
-  （`INTEGER` などを予約語にすると列名に使えなくなるため）。
+- 予約語は `Lexer` の private `Keywords` Set にだけ置く。
+  型名（`INTEGER` など）は**予約語にしない**（列名に使えるようにするため）。
+  Lexer は型名を `Ident` として返し、`Parser` の `TypeTable` が型の位置で解釈する。
 - Blob リテラル `X'0A1B'` の判定は**識別子より前**に置く。
   順序を逆にすると `'ABCD'` が文字列になる。
 - コメントは `--`（行末）と `/* … */`（**入れ子可**）。
 
-### 3.2 Parser — CPS 化した再帰下降
+### 3.2 Parser — 再帰下降 + Pratt の式（CPS）
 
-式の構文規則は互いを呼び合う（`parseExpr → parseOr → parseAnd → … → parsePrimary`）。
-普通の再帰下降では、呼び出し後にも処理が残るため、相互再帰が非末尾再帰になる。
-そこで「解析後に行う処理」を継続として引数に渡し、再帰呼び出しを末尾に置く。
-CPS・継続の hoist・深さ制限の一般則は [`coding-conventions.md`](coding-conventions.md) §3 を参照。
+文・句・式リストのうち、式と SELECT は継続（CPS）を取る再帰下降で読む
+（DML 文は値を返す通常の関数）。
+式の優先順位は **Pratt（precedence climbing）** で処理する。
+継続は `Expr * PState -> Result<'r, DbError>` のような関数として引数で渡し、
+**必ず末尾位置で呼ぶ**。
+継続はヒープに積まれるので、式・サブクエリの入れ子段数に依存せずスタックは一定になる。
+**深さ上限は設けない**。
 
-サブクエリは式の中に `SELECT` が現れるため、式のパーサと SELECT のパーサ
-（`parseSelectStatementC` / `parseSelectItemC` / `parseJoinsC` / `parseWhereC` / …）は
-**同じ `let rec` グループ**の CPS 関数にする。
+- 中置演算子は `parseExprLoopC` が左からループで読み、右辺だけを結合強度で再帰させる。
+  左結合の右辺は `lbp + 1`、比較・述語の右辺は `PredicateRightBp = 50`（加算以上）で読む。
+- 比較・IS・IN・BETWEEN・LIKE は**非結合**。
+  `a = b = c` や `a IS NULL = 1` はその場で `SyntaxError` になる（括弧で囲めば通る）。
+- 前置は `NOT`（30）と単項 `+ -`（70）。
+  `a = NOT b` は右辺の最低結合強度が 50 なので拒否される。
+- サブクエリ（`(SELECT ...)` / `EXISTS` / `IN`）は式のパーサと SELECT のパーサが
+  **同じ `let rec` グループ**で相互再帰する。
+  どちらも継続を末尾で呼ぶので深さに比例しない。
+- CPS 群には `[<TailCall>]` を付けない。
+  継続（ラムダ）の中から同じ群の関数を呼ぶ形があり、
+  FS3569 が「末尾でない」と判定するため。
+  `Directory.Build.props` の `Tailcalls=true` と深い入れ子の回帰テストで実行時の末尾呼び出しを担保する。
+- `*` / `t.*` は別名を取らない。
+  `NULL.*` のような識別子以外の修飾子は `'.' の後ろには列名か '*' が必要です` で拒否する。
 
-- 句を読む関数もすべて継続（`k: 'T -> PState -> Result<'r, DbError>`）を受け取り、
-  次の句を呼ぶところをその継続に渡す。
-  したがってグループ内の呼び出しはすべて末尾位置になり、
-  `parseExprC` の `[<TailCall>]` を保ったままサブクエリを解析できる。
-- 継続はラムダで渡す（`parseExprC (fun on st -> parseJoinsC acc k st) st`）。
-  FS3569 はラムダ末尾を許容するので追加の hoist は要らないが、
-  TailAudit はラムダ内を保守的に非末尾と数える（ベースラインで追認）。
-- サブクエリの式は `enterExpr` で深さを数え、`MaxExpressionDepth` を上限とする。
-- **グループの全メンバーに `: Result<'r, DbError>` の戻り型注釈を付ける**。
-  推論に任せると、グループ内の相互参照で戻り値の型が別の型変数 `'r0` になり、FS0043 でグループ全体が型検査に失敗する。
-
-回帰テスト: `末尾再帰: 大量の JOIN 句がパースできる` /
-`末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパースできる`。
+回帰テスト: `末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない` /
+`末尾再帰: 5000段の深いサブクエリの入れ子も解析できる` /
+`末尾再帰: 200000個の NOT が連なってもスタックを食わない` /
+`末尾再帰: 大量の JOIN 句がパースできる` /
+`末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパースできる` /
+`式: 述語は 1 つの式に 1 回だけ` / `式: NOT は述語の前置に置けない`。
 
 ### 3.3 Ast
 
@@ -423,12 +432,11 @@ flowchart LR
 入れ子段数に依存せずスタックは積み上がらない（`Expr.rewriteWith` はその糖）。
 リスト（項目 / JOIN / GROUP BY / ORDER BY）は `traverseC` が 1件ずつ継続で回す。
 相関サブクエリの再実行は `planSelectCWith` に渡す `runSubquery`（外側行ごとの計画・実行）が担う。
-サブクエリの入れ子は Parser の `MaxExpressionDepth`
-（1段で複数単位を消費する。実測: 90段は実行でき、150段は `式の入れ子が深すぎます`）によっても制限される。
+Parser も同じ CPS なので、サブクエリの入れ子段数に上限はない。
 回帰テスト: `SqlReference: 相関サブクエリ` /
 `SqlReference: 相関サブクエリの未対応形` /
-`SqlReference: 深いサブクエリの入れ子（上限内）は実行できる` /
-`末尾再帰: 深いサブクエリの入れ子もエラーになる（StackOverflow ではない）`。
+`SqlReference: 深いサブクエリの入れ子も実行できる` /
+`末尾再帰: 5000段の深いサブクエリの入れ子も解析できる`。
 
 #### 派生テーブル（FROM / JOIN のサブクエリ）
 

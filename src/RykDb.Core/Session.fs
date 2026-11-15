@@ -17,19 +17,6 @@
 
 namespace RykDb.Core
 
-/// `Execute` の前後で transaction の状態がどう変わったか。
-/// <remarks>
-/// サーバが接続ごとの transaction 所有権を判定するために使う。
-/// </remarks>
-[<RequireQualifiedAccess>]
-type SessionTransactionChange =
-    /// transaction の状態は変わっていない。
-    | NoChange
-    /// この実行で transaction が始まった。
-    | Started
-    /// この実行で transaction が終わった（COMMIT / ROLLBACK）。
-    | Ended
-
 /// Session の結果上限。
 /// materialize する SELECT 結果に適用する。
 type SessionOptions =
@@ -54,8 +41,6 @@ type SessionOptions =
             DbError.capacity "MaxResultBytes は 0 以上でなければなりません" |> err
         else
             ret ()
-
-type private ResultBudget = { RowsLeft: int64; BytesLeft: int64 }
 
 /// `RowReader` の読み取り状態。
 /// <remarks>
@@ -514,6 +499,21 @@ type internal DatabaseHost(root: string, owner: Database) =
             match syncError with
             | Some e -> err e
             | None -> closeResult
+
+type private ResultBudget = { RowsLeft: int64; BytesLeft: int64 }
+
+/// `Execute` の前後で transaction の状態がどう変わったか。
+/// <remarks>
+/// サーバが接続ごとの transaction 所有権を判定するために使う。
+/// </remarks>
+[<RequireQualifiedAccess>]
+type private SessionTransactionChange =
+    /// transaction の状態は変わっていない。
+    | NoChange
+    /// この実行で transaction が始まった。
+    | Started
+    /// この実行で transaction が終わった（COMMIT / ROLLBACK）。
+    | Ended
 
 /// `Session` の接続ローカル状態。
 /// <remarks>

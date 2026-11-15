@@ -3,28 +3,15 @@ namespace RykDb.Core
 /// パーサの状態。
 /// 読み取り位置は値が持つので mutable は使わない。
 /// すべての構文規則は (値, 次の状態) を返す純粋な関数になる。
-type private PState =
-    {
-        Tokens: TokenItem array
-        Pos: int
-        /// 式・項の入れ子の深さ。
-        /// スタックを食う量に上限を課す。
-        /// CPS では継続が呼ばれるまで呼び出し元が戻らないので、
-        /// 括弧だけでなく演算子 1 つにつき 1 段ぶんフレームが積まれる。
-        /// そこで「式 1つの入口」と「二項演算子の右辺」の両方で深さを数える。
-        /// 上限を超えたらスタックを食って Overflow する前に構文エラーにする
-        /// （SQLite の SQLITE_MAX_EXPR_DEPTH と同じ考え方）。
-        Depth: int
-    }
+type private PState = { Tokens: TokenItem array; Pos: int }
 
 /// SQL 文を AST に変換する再帰下降パーサ。
 /// 失敗はすべて Result<'T, DbError> として返し、例外は送らない。
-/// Errors.fs の result { ... } 計算式で状態と値をまとめて束縛する。
+/// 式と SELECT の構文規則は CPS（継続を引数で渡す）で書き、継続は必ず末尾位置で呼ぶ。
+/// これにより式・サブクエリの入れ子段数を入力で決めてもスタックオーバーフローしない
+/// （深さ上限は設けない）。
+/// 実値型の小さな構文規則は Errors.fs の result { ... } で状態を束縛する。
 module internal Parser =
-    /// 式・項の入れ子上限。
-    [<Literal>]
-    let private MaxExpressionDepth = 200
-
     /// 型名の綴り → DataType の表。綴りを増やすときはここだけ直す
     /// （型名セットと parseDataType の両方がこの表から導出される）。
     let private TypeTable =
@@ -47,10 +34,6 @@ module internal Parser =
             "UUID", DataType.Uuid
         ]
 
-    /// 型名として認識される綴り。
-    /// 予約語扱いにはしない。
-    let private TypeNames = TypeTable |> List.map fst |> Set.ofList
-
     /// 綴り（大文字）から DataType へ。
     /// 未知なら None。
     let private dataTypeOfName (name: string) =
@@ -67,17 +50,6 @@ module internal Parser =
             { st with Pos = st.Pos + 1 }
         else
             st
-
-    /// 式・項の再帰に入るときに深さを 1 増やし、上限を超えたら構文エラーにする。
-    /// 戻り値は「深さを増やした状態」か「Error」。
-    let private enterExpr (st: PState) =
-        if st.Depth >= MaxExpressionDepth then
-            err (DbError.syntax (sprintf "式の入れ子が深すぎます（上限 %d）" MaxExpressionDepth) (peekPos st).Line)
-        else
-            ret { st with Depth = st.Depth + 1 }
-
-    /// 式・項の再帰から出るときに深さを 1 減らす。
-    let private exitExpr (st: PState) = { st with Depth = st.Depth - 1 }
 
     /// 現在位置を添えた構文エラーを返す。
     /// 送出はしない。
@@ -170,12 +142,11 @@ module internal Parser =
     let private eatOptionalSemicolon (st: PState) = ret ((), eatSymbol ";" st)
 
     /// 識別子を読む。
-    /// 型名など予約でないキーワードも受け付ける。
+    /// 型名（INTEGER など）は予約語ではなく Ident として字句解析されるので、ここでそのまま通る。
     let private parseIdent (st: PState) =
         match peek st with
         | Token.Ident s -> ret (s, advance st)
         | Token.QuotedIdent s -> ret (s, advance st)
-        | Token.Keyword k when Set.contains k TypeNames -> ret (k.ToLowerInvariant(), advance st)
         | _ -> fail "識別子が必要ですが見つかりませんでした" st
 
     /// 括弧の対応を取って読み飛ばす（CAST の型引数用）。
@@ -212,39 +183,22 @@ module internal Parser =
             match dataTypeOfName (s.ToUpperInvariant()) with
             | Some dt -> ret (dt, advance st)
             | None -> fail (sprintf "未知の型 '%s'" s) st
-        | Token.Keyword k when Set.contains k TypeNames ->
-            match dataTypeOfName k with
-            | Some dt -> ret (dt, advance st)
-            | None -> fail (sprintf "未知の型 '%s'" k) st
         | _ -> fail "型名が必要です" st
 
     // -----------------------------------------------------------------------
-    // 式（優先順位の低いものから順に並べる）
-    //   OR
-    //   AND
-    //   NOT
-    //   比較 / IS NULL / IN / BETWEEN / LIKE
-    //   + - ||
-    //   * / %
-    //   単項 -
-    //   primary
-    //
-    // このグループだけは 継続渡し（CPS） で書く。
-    // 再帰下降構文規則は定義上お互いを呼び合う
-    // （parsePrimary → parseExpr → parseOr → ... → parsePrimary）ので、
-    // 普通の再帰下降構文では相互再帰が末尾再帰にならない。
-    // 引数を「読むもの」ではなく 「読んだ後どうするか（継続）」 にすると、
-    // すべての呼び出しが `k 結果 状態` を返す形になり末尾再帰になる。
-    // これにより、入れ子段数に比例するスタック消費が消える。
-    // ただし入れ子上限 MaxExpressionDepth は
-    // 「異常な入力を早期に検知し、既定より読みやすいエラーにする」目的で残す。
+    // 別名・対象テーブル・選択項目の補助関数。
+    // 式の本体は Pratt（precedence climbing）で読む（下の節）。
     // -----------------------------------------------------------------------
 
+    /// 列の別名を読む。
+    /// 未対応の SQL 語（UNION / RIGHT など）は裸の別名として飲み込まない
+    /// （後続の SELECT が別の文として実行されるのを防ぐ。`AS` を付ければ別名にできる）。
     let private parseOptAlias (st: PState) =
         if isKeyword "AS" st then
             advance st |> parseIdent |> Result.map (fun (a, st) -> Some a, st)
         else
             match peek st with
+            | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedTableAliasWords -> ret (None, st)
             | Token.Ident s -> ret (Some s, advance st)
             | Token.QuotedIdent s -> ret (Some s, advance st)
             | _ -> ret (None, st)
@@ -264,70 +218,371 @@ module internal Parser =
             | Token.QuotedIdent s -> ret (Some s, advance st)
             | _ -> ret (None, st)
 
+    /// INSERT / UPDATE / DELETE の対象テーブル。
+    /// 別名は受理しない（列解決に使われず、`WHERE x.id` だけが NameError になる
+    /// 中途半端な状態を避けるため、パース時点で明示エラーにする）。
     let private parseTableRef (st: PState) =
         match peek st with
         | Token.Symbol "(" -> fail "INSERT / UPDATE / DELETE の対象テーブルにサブクエリは使えません" st
         | _ ->
-            result {
-                let! name, st = parseIdent st
-                let! alias, st = parseTableAlias st
-                return { Name = name; Alias = alias }, st
-            }
+            match parseIdent st with
+            | Error e -> err e
+            | Ok(name, st) ->
+                match parseTableAlias st with
+                | Error e -> err e
+                | Ok(None, st) -> ret ({ Name = name; Alias = None }, st)
+                | Ok(Some _, st) -> fail "INSERT / UPDATE / DELETE の対象テーブルに別名は使えません（別名を外してください）" st
 
     /// 現在位置が `識別子 . *` の形かどうかを返す。
+    /// 先頭が識別子でない `NULL.*` などを誤って `QualifiedStar ""` にしないよう、字句も検証する。
     let private isDotStar (st: PState) =
         st.Pos + 2 < st.Tokens.Length
+        && (match st.Tokens.[st.Pos].Token with
+            | Token.Ident _
+            | Token.QuotedIdent _ -> true
+            | _ -> false)
         && st.Tokens.[st.Pos + 1].Token = Token.Symbol "."
         && st.Tokens.[st.Pos + 2].Token = Token.Symbol "*"
 
-    /// 継続。
-    /// 「式を 1つ読んだ後に残りをする」。
-    /// 戻り値の型 'r は呼び出し側ごとに違うので（式だけ / (Expr*Expr) list / Expr option …）
-    /// .generic にしてある。
-    type private K<'r> = Expr -> PState -> Result<'r, DbError>
+    // -----------------------------------------------------------------------
+    // 式（Pratt / precedence climbing）
+    //
+    // 優先順位（低い → 高い）:
+    //   OR 10
+    //   AND 20
+    //   NOT（前置）30
+    //   比較 / IS / IN / BETWEEN / LIKE 40（非結合）
+    //   + - || 50
+    //   * / % 60
+    //   単項 + -（前置）70
+    //   primary
+    //
+    // 中置演算子はループで左から読み、右辺だけを結合強度で再帰させる。
+    // 左結合の右辺は lbp + 1、比較・述語の右辺は 50（加算以上）で読む。
+    // 述語は非結合なので、1つの式に 2つ目の述語が来たらエラーにする。
+    //
+    // 再帰はすべて「継続を引数で受け、末尾で呼ぶ」形にする。
+    // 継続はヒープに積まれるので、括弧・前置演算子・CASE・関数呼び出し・
+    // サブクエリの入れ子段数に依存せずスタックは一定になる。
+    // 深さ上限（MaxExpressionDepth）は設けない。
+    // -----------------------------------------------------------------------
 
-    /// 終端の継続（読んだ式をそのまま返す）。
-    let private retE (e: Expr) (st: PState) = ret (e, st)
+    [<Literal>]
+    let private OrBp = 10
 
-    /// 式再帰の唯一の入口。
-    /// 深さを管理して、深い入れ子をスタックではなくエラーにする。
-    /// 継続が呼ばれるのは「式の読み終え時」なので、その時点で深さを戻す。
-    /// 構文規則は mutually recursive なので、そのままでは必ず非末尾再帰になる。
-    /// 継続（continuation）を渡して「式を 1つ読んだときに、残りを k に渡す」形にすることで、
-    /// 相互再帰そのものが末尾再帰になる。
-    /// <remarks>
-    /// サブクエリで SELECT のパーサと相互再帰するため、
-    /// SELECT の各句（parseSelectItemC / parseJoinsC / parseWhereC / …）も CPS にし、
-    /// グループ内の相互呼び出しをすべて末尾位置に置く。
-    /// 句の継続（k）はラムダで渡すが、FS3569 はラムダ末尾を許容する。
-    /// </remarks>
+    [<Literal>]
+    let private AndBp = 20
+
+    [<Literal>]
+    let private NotPrefixBp = 30
+
+    [<Literal>]
+    let private CompareBp = 40
+
+    /// 比較・述語の右辺を読む最低結合強度。
+    /// 加算（50）以上を受けるので `a = b + c` は比較の右辺に入り、
+    /// `a = b IS NULL` の IS は右辺に入らない。
+    [<Literal>]
+    let private PredicateRightBp = 50
+
+    [<Literal>]
+    let private AddBp = 50
+
+    [<Literal>]
+    let private MulBp = 60
+
+    [<Literal>]
+    let private UnaryBp = 70
+
+    /// 中置演算子の種類。
+    [<RequireQualifiedAccess>]
+    type private InfixKind =
+        /// 左結合の二項演算子
+        | Binary of BinaryOp
+        /// 比較（非結合）
+        | Compare of BinaryOp
+        /// IS [NOT] NULL / TRUE / FALSE / UNKNOWN
+        | IsPredicate
+        /// [NOT] IN
+        | InPredicate of bool
+        /// [NOT] BETWEEN
+        | BetweenPredicate of bool
+        /// [NOT] LIKE
+        | LikePredicate of bool
+        /// NOT の後ろが IN / BETWEEN / LIKE でない
+        | BadNot
+
+    /// 現在位置が中置演算子なら (左の結合強度, 種類) を返す。
+    /// NOT は後ろの字句を見て否定の述語かを決める。
+    let private infixAt (st: PState) =
+        match peek st with
+        | Token.Keyword "OR" -> Some(OrBp, InfixKind.Binary BinaryOp.Or)
+        | Token.Keyword "AND" -> Some(AndBp, InfixKind.Binary BinaryOp.And)
+        | Token.Symbol "=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Eq)
+        | Token.Symbol "<>" -> Some(CompareBp, InfixKind.Compare BinaryOp.Ne)
+        | Token.Symbol "!=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Ne)
+        | Token.Symbol "<=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Le)
+        | Token.Symbol ">=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Ge)
+        | Token.Symbol "<" -> Some(CompareBp, InfixKind.Compare BinaryOp.Lt)
+        | Token.Symbol ">" -> Some(CompareBp, InfixKind.Compare BinaryOp.Gt)
+        | Token.Symbol "+" -> Some(AddBp, InfixKind.Binary BinaryOp.Add)
+        | Token.Symbol "-" -> Some(AddBp, InfixKind.Binary BinaryOp.Sub)
+        | Token.Symbol "||" -> Some(AddBp, InfixKind.Binary BinaryOp.Concat)
+        | Token.Symbol "*" -> Some(MulBp, InfixKind.Binary BinaryOp.Mul)
+        | Token.Symbol "/" -> Some(MulBp, InfixKind.Binary BinaryOp.Div)
+        | Token.Symbol "%" -> Some(MulBp, InfixKind.Binary BinaryOp.Mod)
+        | Token.Keyword "IS" -> Some(CompareBp, InfixKind.IsPredicate)
+        | Token.Keyword "IN" -> Some(CompareBp, InfixKind.InPredicate false)
+        | Token.Keyword "BETWEEN" -> Some(CompareBp, InfixKind.BetweenPredicate false)
+        | Token.Keyword "LIKE" -> Some(CompareBp, InfixKind.LikePredicate false)
+        | Token.Keyword "NOT" ->
+            let next =
+                if st.Pos + 1 < st.Tokens.Length then
+                    st.Tokens.[st.Pos + 1].Token
+                else
+                    Token.Eos
+
+            match next with
+            | Token.Keyword "IN" -> Some(CompareBp, InfixKind.InPredicate true)
+            | Token.Keyword "BETWEEN" -> Some(CompareBp, InfixKind.BetweenPredicate true)
+            | Token.Keyword "LIKE" -> Some(CompareBp, InfixKind.LikePredicate true)
+            | _ -> Some(CompareBp, InfixKind.BadNot)
+        | _ -> None
+
+    /// 式を 1つ読み、継続へ渡す。
+    /// 継続は「残りの解析」を表す関数で、必ず末尾位置で呼ぶ。
+    /// これにより式・サブクエリの入れ子段数に依存せずスタックは積み上がらない。
+    /// 実行時の末尾呼び出しは Directory.Build.props の Tailcalls=true と
+    /// 深い入れ子の回帰テストで担保する。
     [<TailCall>]
-    let rec private parseExprC<'r> (k: K<'r>) (st: PState) =
-        match enterExpr st with
-        | Error e -> err e
-        | Ok st -> parseOrC (fun e st -> k e (exitExpr st)) st
+    let rec private parseExprC (st: PState) (k: Expr * PState -> Result<'r, DbError>) : Result<'r, DbError> =
+        parseExprBpC 0 st k
 
-    and [<TailCall>] private parseExprListElemC<'r>
-        (k: Expr list -> PState -> Result<'r, DbError>)
-        (acc: Expr list)
-        (e: Expr)
+    /// 結合強度 minBp 以上の式を読む。
+    and [<TailCall>] private parseExprBpC (minBp: int) (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
+        parsePrefixC minBp st (fun (left, st) -> parseExprLoopC minBp false left st k)
+
+    /// 中置演算子のループ。
+    /// 右辺を読むときは継続を 1つ積み、読み終えたら自分自身か継続を末尾で呼ぶ。
+    and private parseExprLoopC
+        (minBp: int)
+        (seenPredicate: bool)
+        (left: Expr)
         (st: PState)
+        (k: Expr * PState -> Result<'r, DbError>)
         =
-        if isSymbol "," st then
-            advance st |> parseExprListToParen k (e :: acc)
-        else
-            match expectSymbol ")" st with
-            | Error e -> err e
-            | Ok(_, st) -> k (List.rev (e :: acc)) st
+        match peek st with
+        | Token.Symbol "." -> fail "'.' の後ろには列名か '*' が必要です（修飾子は識別子にだけ付けられます）" st
+        | _ ->
+            match infixAt st with
+            | Some(lbp, kind) when lbp >= minBp ->
+                if seenPredicate && lbp >= CompareBp then
+                    fail "比較・述語は 1つの式に 1回だけ書けます（括弧で囲んでください）" st
+                else
+                    match kind with
+                    | InfixKind.Binary op ->
+                        parseExprBpC (lbp + 1) (advance st) (fun (right, st) ->
+                            parseExprLoopC minBp false (Expr.Binary(op, left, right)) st k)
+                    | InfixKind.Compare op ->
+                        parseExprBpC PredicateRightBp (advance st) (fun (right, st) ->
+                            parseExprLoopC minBp true (Expr.Binary(op, left, right)) st k)
+                    | InfixKind.IsPredicate ->
+                        let afterIs = advance st
+                        let negated = isKeyword "NOT" afterIs
+                        let afterNot = eatKeyword "NOT" afterIs
 
-    and [<TailCall>] private parseExprListToParen<'r>
-        (k: Expr list -> PState -> Result<'r, DbError>)
-        (acc: Expr list)
+                        if isKeyword "TRUE" afterNot then
+                            parseExprLoopC
+                                minBp
+                                true
+                                (Expr.IsTruth(left, TruthValue.True, negated))
+                                (advance afterNot)
+                                k
+                        elif isKeyword "FALSE" afterNot then
+                            parseExprLoopC
+                                minBp
+                                true
+                                (Expr.IsTruth(left, TruthValue.False, negated))
+                                (advance afterNot)
+                                k
+                        elif isIdentName "UNKNOWN" afterNot then
+                            parseExprLoopC
+                                minBp
+                                true
+                                (Expr.IsTruth(left, TruthValue.Unknown, negated))
+                                (advance afterNot)
+                                k
+                        else
+                            match expectKeyword "NULL" afterNot with
+                            | Error e -> err e
+                            | Ok(_, st) -> parseExprLoopC minBp true (Expr.IsNull(left, negated)) st k
+                    | InfixKind.InPredicate negated ->
+                        let atIn = if negated then advance st else st
+
+                        match expectKeyword "IN" atIn with
+                        | Error e -> err e
+                        | Ok(_, st) ->
+                            parseInPredicateBodyC left negated st (fun (expr, st) ->
+                                parseExprLoopC minBp true expr st k)
+                    | InfixKind.BetweenPredicate negated ->
+                        let atBetween = if negated then advance st else st
+
+                        match expectKeyword "BETWEEN" atBetween with
+                        | Error e -> err e
+                        | Ok(_, st) ->
+                            parseExprBpC PredicateRightBp st (fun (lo, st) ->
+                                match expectKeyword "AND" st with
+                                | Error e -> err e
+                                | Ok(_, st) ->
+                                    parseExprBpC PredicateRightBp st (fun (hi, st) ->
+                                        parseExprLoopC minBp true (Expr.Between(left, lo, hi, negated)) st k))
+                    | InfixKind.LikePredicate negated ->
+                        let atLike = if negated then advance st else st
+
+                        match expectKeyword "LIKE" atLike with
+                        | Error e -> err e
+                        | Ok(_, st) ->
+                            parseExprBpC PredicateRightBp st (fun (pattern, st) ->
+                                if isIdentName "ESCAPE" st then
+                                    parseExprBpC PredicateRightBp (advance st) (fun (escape, st) ->
+                                        parseExprLoopC
+                                            minBp
+                                            true
+                                            (Expr.Like(left, pattern, negated, Some escape))
+                                            st
+                                            k)
+                                else
+                                    parseExprLoopC minBp true (Expr.Like(left, pattern, negated, None)) st k)
+                    | InfixKind.BadNot -> fail "NOT の後ろには IN / BETWEEN / LIKE が必要です" (advance st)
+            | _ -> k (left, st)
+
+    /// 前置演算子（NOT / 単項 - +）と primary。
+    and [<TailCall>] private parsePrefixC (minBp: int) (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
+        match peek st with
+        | Token.Keyword "NOT" when NotPrefixBp >= minBp ->
+            parseExprBpC NotPrefixBp (advance st) (fun (operand, st) -> k (Expr.Unary(UnaryOp.Not, operand), st))
+        | Token.Symbol "-" when UnaryBp >= minBp ->
+            parseExprBpC UnaryBp (advance st) (fun (operand, st) -> k (Expr.Unary(UnaryOp.Neg, operand), st))
+        | Token.Symbol "+" when UnaryBp >= minBp ->
+            parseExprBpC UnaryBp (advance st) (fun (operand, st) -> k (Expr.Unary(UnaryOp.Pos, operand), st))
+        | _ -> parsePrimaryC st k
+
+    and [<TailCall>] private parsePrimaryC (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
+        match peek st with
+        | Token.IntLit v -> k (Expr.Literal(Literal.Int v), advance st)
+        | Token.RealLit v -> k (Expr.Literal(Literal.Real v), advance st)
+        | Token.StringLit s -> k (Expr.Literal(Literal.String s), advance st)
+        | Token.BlobLit b -> k (Expr.Literal(Literal.Blob b), advance st)
+        | Token.Keyword "NULL" -> k (Expr.Literal Literal.Null, advance st)
+        | Token.Keyword "TRUE" -> k (Expr.Literal(Literal.Bool true), advance st)
+        | Token.Keyword "FALSE" -> k (Expr.Literal(Literal.Bool false), advance st)
+        | Token.Keyword "DEFAULT" -> k (Expr.Default, advance st)
+        | Token.Keyword "CASE" -> parseCaseC st k
+        | Token.Symbol "*" -> k (Expr.Star, advance st)
+        | Token.Keyword "EXISTS" -> parseExistsC st k
+        | Token.Symbol "(" -> parseParenExprC st k
+        | Token.Ident name -> parseNamedPrimaryC name st k
+        | Token.QuotedIdent name -> parseNamedPrimaryC name st k
+        | _ -> fail "式が必要ですが見つかりませんでした" st
+
+    /// CASE 式。
+    and private parseCaseC (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
+        match expectKeyword "CASE" st with
+        | Error e -> err e
+        | Ok(_, st) ->
+            parseCaseBranchesC [] st (fun (branches, st) ->
+                if List.isEmpty branches then
+                    fail "CASE には WHEN 句が必要です" st
+                elif isKeyword "ELSE" st then
+                    parseExprC (advance st) (fun (elseE, st) ->
+                        match expectKeyword "END" st with
+                        | Error e -> err e
+                        | Ok(_, st) -> k (Expr.Case(branches, Some elseE), st))
+                else
+                    match expectKeyword "END" st with
+                    | Error e -> err e
+                    | Ok(_, st) -> k (Expr.Case(branches, None), st))
+
+    and [<TailCall>] private parseCaseBranchesC
+        (acc: (Expr * Expr) list)
         (st: PState)
-        : Result<'r, DbError> =
-        parseExprC (parseExprListElemC k acc) st
+        (k: (Expr * Expr) list * PState -> Result<'r, DbError>)
+        =
+        if isKeyword "WHEN" st then
+            parseExprC (advance st) (fun (cond, st) ->
+                match expectKeyword "THEN" st with
+                | Error e -> err e
+                | Ok(_, st) -> parseExprC st (fun (res, st) -> parseCaseBranchesC ((cond, res) :: acc) st k))
+        else
+            k (List.rev acc, st)
 
-    and [<TailCall>] private parseCallBodyC<'r> (k: K<'r>) (name: string) (st: PState) =
+    /// EXISTS (SELECT ...)
+    and [<TailCall>] private parseExistsC (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
+        match advance st |> expectSymbol "(" with
+        | Error e -> err e
+        | Ok(_, afterParen) ->
+            parseSelectStatementC afterParen (fun (sel, st) ->
+                match expectSymbol ")" st with
+                | Error e -> err e
+                | Ok(_, st) -> k (Expr.Exists sel, st))
+
+    /// 括弧付きの式、またはスカラーサブクエリ `(SELECT ...)`。
+    and [<TailCall>] private parseParenExprC (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
+        let afterParen = advance st
+
+        if isKeyword "SELECT" afterParen then
+            parseSelectStatementC afterParen (fun (sel, st) ->
+                match expectSymbol ")" st with
+                | Error e -> err e
+                | Ok(_, st) -> k (Expr.Subquery sel, st))
+        else
+            parseExprC afterParen (fun (e, st) ->
+                match expectSymbol ")" st with
+                | Error e -> err e
+                | Ok(_, st) -> k (e, st))
+
+    /// 識別子の後ろ（列参照 / t.* / 関数呼び出し / CAST）。
+    and [<TailCall>] private parseNamedPrimaryC (name: string) (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
+        let st = advance st
+
+        if isSymbol "." st then
+            let afterDot = advance st
+
+            if isSymbol "*" afterDot then
+                k (Expr.QualifiedStar name, advance afterDot)
+            else
+                match parseIdent afterDot with
+                | Error e -> err e
+                | Ok(c, st) -> k (Expr.Column { Qualifier = Some name; Name = c }, st)
+        elif isSymbol "(" st then
+            if name.ToUpperInvariant() = "CAST" then
+                parseCastExprC st k
+            else
+                parseCallBodyC name st k
+        else
+            k (Expr.Name name, st)
+
+    /// CAST(expr AS 型[型引数])。
+    and [<TailCall>] private parseCastExprC (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
+        match expectSymbol "(" st with
+        | Error e -> err e
+        | Ok(_, st) ->
+            parseExprC st (fun (e, st) ->
+                match expectKeyword "AS" st with
+                | Error e -> err e
+                | Ok(_, st) ->
+                    match parseDataType st with
+                    | Error e -> err e
+                    | Ok(dt, st) ->
+                        match skipParens st with
+                        | Error e -> err e
+                        | Ok st ->
+                            match expectSymbol ")" st with
+                            | Error e -> err e
+                            | Ok(_, st) -> k (Expr.Cast(e, dt), st))
+
+    /// 関数呼び出し（集約の DISTINCT と COUNT(*) を含む）。
+    and [<TailCall>] private parseCallBodyC (name: string) (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
         match expectSymbol "(" st with
         | Error e -> err e
         | Ok(_, st) ->
@@ -336,405 +591,116 @@ module internal Parser =
             if upper = "COUNT" && isSymbol "*" st then
                 match advance st |> expectSymbol ")" with
                 | Error e -> err e
-                | Ok(_, st) -> k (Expr.AggCall(AggFunc.Count, false, Expr.Star)) st
+                | Ok(_, st) -> k (Expr.AggCall(AggFunc.Count, false, Expr.Star), st)
             else
                 let isAgg = (AggFunc.tryParse upper).IsSome
                 let distinct = isAgg && isKeyword "DISTINCT" st
+                let st = if distinct then advance st else st
 
-                if distinct then advance st else st
-                |> parseExprListToParen
-                    (fun argList st ->
-                        match AggFunc.tryParse upper with
-                        | Some agg when List.length argList = 1 ->
-                            k (Expr.AggCall(agg, distinct, List.head argList)) st
-                        | _ -> k (Expr.FuncCall(upper, argList)) st)
-                    []
+                parseExprListC st (fun (argList, st) ->
+                    match AggFunc.tryParse upper with
+                    | Some agg when List.length argList = 1 -> k (Expr.AggCall(agg, distinct, List.head argList), st)
+                    | _ -> k (Expr.FuncCall(upper, argList), st))
 
-    and [<TailCall>] private parseCastC<'r> (k: K<'r>) (st: PState) =
-        match expectSymbol "(" st with
-        | Error e -> err e
-        | Ok(_, st) ->
-            parseExprC
-                (fun e st ->
-                    match expectKeyword "AS" st with
-                    | Error e -> err e
-                    | Ok(_, st) ->
-                        match parseDataType st with
-                        | Error e -> err e
-                        | Ok(dt, st) ->
-                            match skipParens st with
-                            | Error e -> err e
-                            | Ok st ->
-                                match expectSymbol ")" st with
-                                | Error e -> err e
-                                | Ok(_, st) -> k (Expr.Cast(e, dt)) st)
-                st
-
-    and [<TailCall>] private parseNamedPrimaryC<'r> (k: K<'r>) (name: string) (st: PState) =
-        let st = advance st
-
-        if isSymbol "." st then
-            if advance st |> isSymbol "*" then
-                advance st |> advance |> k (Expr.QualifiedStar name)
+    and private parseExprListLoop (acc: Expr list) (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =
+        parseExprC st (fun (e, st) ->
+            if isSymbol "," st then
+                parseExprListLoop (e :: acc) (advance st) k
             else
-                match advance st |> parseIdent with
+                match expectSymbol ")" st with
                 | Error e -> err e
-                | Ok(c, st) -> k (Expr.Column { Qualifier = Some name; Name = c }) st
-        elif isSymbol "(" st then
-            if name.ToUpperInvariant() = "CAST" then
-                parseCastC k st
-            else
-                parseCallBodyC k name st
-        else
-            k (Expr.Name name) st
+                | Ok(_, st) -> k (List.rev (e :: acc), st))
 
-    and [<TailCall>] private parseCaseBranches<'r>
-        (k: (Expr * Expr) list -> PState -> Result<'r, DbError>)
-        (acc: (Expr * Expr) list)
+    /// `(` の後ろの式を `,` 区切りで読み、`)` まで消費する。
+    and [<TailCall>] private parseExprListC (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =
+        parseExprListLoop [] st k
+
+    /// IN の右辺（`(SELECT ...)` か式のリスト）を読み、`)` まで消費する。
+    and [<TailCall>] private parseInPredicateBodyC
+        (left: Expr)
+        (negated: bool)
         (st: PState)
+        (k: Expr * PState -> Result<'r, DbError>)
         =
-        if isKeyword "WHEN" st then
-            advance st
-            |> parseExprC (fun cond st ->
-                match expectKeyword "THEN" st with
-                | Error e -> err e
-                | Ok(_, st) -> parseExprC (fun res st -> parseCaseBranches k ((cond, res) :: acc) st) st)
-        else
-            k (List.rev acc) st
-
-    and [<TailCall>] private parseCaseTailC<'r> (k: K<'r>) (bs: (Expr * Expr) list) (st: PState) =
-        if List.isEmpty bs then
-            fail "CASE には WHEN 句が必要です" st
-        elif isKeyword "ELSE" st then
-            advance st
-            |> parseExprC (fun elseE st ->
-                match expectKeyword "END" st with
-                | Error e -> err e
-                | Ok(_, st) -> k (Expr.Case(bs, Some elseE)) st)
-        else
-            match expectKeyword "END" st with
-            | Error e -> err e
-            | Ok(_, st) -> k (Expr.Case(bs, None)) st
-
-    and [<TailCall>] private parseCaseC<'r> (k: K<'r>) (st: PState) =
-        match expectKeyword "CASE" st with
-        | Error e -> err e
-        | Ok(_, st) -> parseCaseBranches (parseCaseTailC k) [] st
-
-    and [<TailCall>] private parsePrimaryC<'r> (k: K<'r>) (st: PState) =
-        match peek st with
-        | Token.IntLit v -> advance st |> k (Expr.Literal(Literal.Int v))
-        | Token.RealLit v -> advance st |> k (Expr.Literal(Literal.Real v))
-        | Token.StringLit s -> advance st |> k (Expr.Literal(Literal.String s))
-        | Token.BlobLit b -> advance st |> k (Expr.Literal(Literal.Blob b))
-        | Token.Keyword "NULL" -> advance st |> k (Expr.Literal Literal.Null)
-        | Token.Keyword "TRUE" -> advance st |> k (Expr.Literal(Literal.Bool true))
-        | Token.Keyword "FALSE" -> advance st |> k (Expr.Literal(Literal.Bool false))
-        | Token.Keyword "DEFAULT" -> advance st |> k Expr.Default
-        | Token.Keyword "CASE" -> parseCaseC k st
-        | Token.Symbol "*" -> advance st |> k Expr.Star
-        | Token.Keyword "EXISTS" ->
-            match advance st |> expectSymbol "(" with
-            | Error e -> err e
-            | Ok(_, afterParen) ->
-                match enterExpr afterParen with
-                | Error e -> err e
-                | Ok afterParen ->
-                    let cont: SelectStatement -> PState -> Result<'r, DbError> =
-                        fun sel st ->
-                            match expectSymbol ")" st with
-                            | Error e -> err e
-                            | Ok(_, st) -> k (Expr.Exists sel) (exitExpr st)
-
-                    parseSelectStatementC cont afterParen: Result<'r, DbError>
-        | Token.Symbol "(" ->
-            let afterParen = advance st
-
-            if isKeyword "SELECT" afterParen then
-                match enterExpr afterParen with
-                | Error e -> err e
-                | Ok afterParen ->
-                    let cont: SelectStatement -> PState -> Result<'r, DbError> =
-                        fun sel st ->
-                            match expectSymbol ")" st with
-                            | Error e -> err e
-                            | Ok(_, st) -> k (Expr.Subquery sel) (exitExpr st)
-
-                    parseSelectStatementC cont afterParen: Result<'r, DbError>
-            else
-                afterParen
-                |> parseExprC (fun e st ->
-                    match expectSymbol ")" st with
-                    | Error e -> err e
-                    | Ok(_, st) -> k e st)
-        | Token.Ident name -> parseNamedPrimaryC k name st
-        | Token.QuotedIdent name -> parseNamedPrimaryC k name st
-        | _ -> fail "式が必要ですが見つかりませんでした" st
-
-    and [<TailCall>] private parseUnaryC<'r> (k: K<'r>) (st: PState) =
-        if isSymbol "-" st then
-            match advance st |> enterExpr with
-            | Error e -> err e
-            | Ok st -> parseUnaryC (fun e st -> k (Expr.Unary(UnaryOp.Neg, e)) (exitExpr st)) st
-        elif isSymbol "+" st then
-            match advance st |> enterExpr with
-            | Error e -> err e
-            | Ok st -> parseUnaryC (fun e st -> k (Expr.Unary(UnaryOp.Pos, e)) (exitExpr st)) st
-        else
-            parsePrimaryC k st
-
-    and [<TailCall>] private parseMultiplicativeLoop<'r> (k: K<'r>) (baseDepth: int) (left: Expr) (st: PState) =
-        if isSymbol "*" st || isSymbol "/" st || isSymbol "%" st then
-            let op =
-                if isSymbol "*" st then BinaryOp.Mul
-                elif isSymbol "/" st then BinaryOp.Div
-                else BinaryOp.Mod
-
-            match advance st |> enterExpr with
-            | Error e -> err e
-            | Ok st ->
-                parseUnaryC (fun right st -> parseMultiplicativeLoop k baseDepth (Expr.Binary(op, left, right)) st) st
-        else
-            k left { st with Depth = baseDepth }
-
-    and [<TailCall>] private parseMultiplicativeC<'r> (k: K<'r>) (st: PState) =
-        parseUnaryC (fun first st -> parseMultiplicativeLoop k st.Depth first st) st
-
-    and [<TailCall>] private parseAdditiveLoop<'r> (k: K<'r>) (baseDepth: int) (left: Expr) (st: PState) =
-        if isSymbol "+" st || isSymbol "-" st || isSymbol "||" st then
-            let op =
-                if isSymbol "+" st then BinaryOp.Add
-                elif isSymbol "-" st then BinaryOp.Sub
-                else BinaryOp.Concat
-
-            match advance st |> enterExpr with
-            | Error e -> err e
-            | Ok st ->
-                parseMultiplicativeC
-                    (fun right st -> parseAdditiveLoop k baseDepth (Expr.Binary(op, left, right)) st)
-                    st
-        else
-            k left { st with Depth = baseDepth }
-
-    and [<TailCall>] private parseAdditiveC<'r> (k: K<'r>) (st: PState) =
-        parseMultiplicativeC (fun first st -> parseAdditiveLoop k st.Depth first st) st
-
-    and [<TailCall>] private parseBetweenAndC<'r>
-        (k: Expr -> Expr -> PState -> Result<'r, DbError>)
-        (lo: Expr)
-        (st: PState)
-        =
-        match expectKeyword "AND" st with
-        | Error e -> err e
-        | Ok(_, st) -> parseAdditiveC (fun hi st -> k lo hi st) st
-
-    and [<TailCall>] private parseBetweenBodyC<'r> (k: Expr -> Expr -> PState -> Result<'r, DbError>) (st: PState) =
-        parseAdditiveC (parseBetweenAndC k) st
-
-    and [<TailCall>] private parseInListBodyElemC<'r>
-        (k: Expr list -> PState -> Result<'r, DbError>)
-        (acc: Expr list)
-        (e: Expr)
-        (st: PState)
-        =
-        if isSymbol "," st then
-            advance st |> parseInListBodyLoop k (e :: acc)
-        else
-            match expectSymbol ")" st with
-            | Error e -> err e
-            | Ok(_, st) -> k (List.rev (e :: acc)) st
-
-    and [<TailCall>] private parseInListBodyLoop<'r>
-        (k: Expr list -> PState -> Result<'r, DbError>)
-        (acc: Expr list)
-        (st: PState)
-        : Result<'r, DbError> =
-        parseExprC (parseInListBodyElemC k acc) st
-
-    /// IN の右辺。`(SELECT ...)` ならサブクエリ、そうでなければ式のリスト。
-    and [<TailCall>] private parseInBodyC<'r> (negated: bool) (left: Expr) (k: K<'r>) (st: PState) =
         match expectSymbol "(" st with
         | Error e -> err e
         | Ok(_, afterParen) ->
             if isKeyword "SELECT" afterParen then
-                match enterExpr afterParen with
-                | Error e -> err e
-                | Ok afterParen ->
-                    let cont: SelectStatement -> PState -> Result<'r, DbError> =
-                        fun sel st ->
-                            match expectSymbol ")" st with
-                            | Error e -> err e
-                            | Ok(_, st) -> k (Expr.InSubquery(left, sel, negated)) (exitExpr st)
-
-                    parseSelectStatementC cont afterParen: Result<'r, DbError>
-            else
-                parseInListBodyLoop (fun xs st -> k (Expr.InList(left, xs, negated)) st) [] afterParen
-
-    /// LIKE のパターン評価後に ESCAPE を読む継続。
-    and [<TailCall>] private parseLikeEscape<'r> (k: K<'r>) (left: Expr) (pattern: Expr) (negated: bool) (st: PState) =
-        if isIdentName "ESCAPE" st then
-            advance st
-            |> parseAdditiveC (fun esc st -> k (Expr.Like(left, pattern, negated, Some esc)) st)
-        else
-            k (Expr.Like(left, pattern, negated, None)) st
-
-    and [<TailCall>] private parsePredicateTail<'r> (k: K<'r>) (left: Expr) (st: PState) =
-        let compareOp =
-            if isSymbol "=" st then
-                Some BinaryOp.Eq
-            elif isSymbol "<>" st || isSymbol "!=" st then
-                Some BinaryOp.Ne
-            elif isSymbol "<=" st then
-                Some BinaryOp.Le
-            elif isSymbol ">=" st then
-                Some BinaryOp.Ge
-            elif isSymbol "<" st then
-                Some BinaryOp.Lt
-            elif isSymbol ">" st then
-                Some BinaryOp.Gt
-            else
-                None
-
-        match compareOp with
-        | Some op ->
-            advance st
-            |> parseAdditiveC (fun right st -> k (Expr.Binary(op, left, right)) st)
-        | None ->
-            if isKeyword "IS" st then
-                let afterIs = advance st
-                let negated = isKeyword "NOT" afterIs
-                let afterNot = eatKeyword "NOT" afterIs
-
-                if isKeyword "TRUE" afterNot then
-                    advance afterNot |> k (Expr.IsTruth(left, TruthValue.True, negated))
-                elif isKeyword "FALSE" afterNot then
-                    advance afterNot |> k (Expr.IsTruth(left, TruthValue.False, negated))
-                elif isIdentName "UNKNOWN" afterNot then
-                    advance afterNot |> k (Expr.IsTruth(left, TruthValue.Unknown, negated))
-                else
-                    match expectKeyword "NULL" afterNot with
+                parseSelectStatementC afterParen (fun (sel, st) ->
+                    match expectSymbol ")" st with
                     | Error e -> err e
-                    | Ok(_, st) -> k (Expr.IsNull(left, negated)) st
-            elif isKeyword "NOT" st then
-                let afterNot = advance st
-
-                if isKeyword "IN" afterNot then
-                    advance afterNot |> parseInBodyC true left k
-                elif isKeyword "BETWEEN" afterNot then
-                    advance afterNot
-                    |> parseBetweenBodyC (fun lo hi st -> k (Expr.Between(left, lo, hi, true)) st)
-                elif isKeyword "LIKE" afterNot then
-                    advance afterNot
-                    |> parseAdditiveC (fun p st -> parseLikeEscape k left p true st)
-                else
-                    fail "NOT の後ろには IN / BETWEEN / LIKE が必要です" afterNot
-            elif isKeyword "IN" st then
-                advance st |> parseInBodyC false left k
-            elif isKeyword "BETWEEN" st then
-                advance st
-                |> parseBetweenBodyC (fun lo hi st -> k (Expr.Between(left, lo, hi, false)) st)
-            elif isKeyword "LIKE" st then
-                advance st |> parseAdditiveC (fun p st -> parseLikeEscape k left p false st)
+                    | Ok(_, st) -> k (Expr.InSubquery(left, sel, negated), st))
             else
-                k left st
+                parseExprListC afterParen (fun (xs, st) -> k (Expr.InList(left, xs, negated), st))
 
-    and [<TailCall>] private parsePredicateC<'r> (k: K<'r>) (st: PState) =
-        parseAdditiveC (parsePredicateTail k) st
+    and [<TailCall>] private parseSelectStatementC (st: PState) (k: SelectStatement * PState -> Result<'r, DbError>) =
+        match expectKeyword "SELECT" st with
+        | Error e -> err e
+        | Ok(_, st) ->
+            let distinct = isKeyword "DISTINCT" st
+            let st = if distinct then advance st else st
 
-    and [<TailCall>] private parseNotC<'r> (k: K<'r>) (st: PState) =
-        if isKeyword "NOT" st then
-            match advance st |> enterExpr with
-            | Error e -> err e
-            | Ok st -> parseNotC (fun e st -> k (Expr.Unary(UnaryOp.Not, e)) (exitExpr st)) st
-        else
-            parsePredicateC k st
+            parseSelectItemsC st (fun (items, st) ->
+                if isKeyword "FROM" st then
+                    parseSourceC (advance st) (fun (fromRef, st) ->
+                        parseSelectTailC distinct items (Some fromRef) st k)
+                elif isKeyword "JOIN" st || isKeyword "INNER" st || isKeyword "LEFT" st then
+                    fail "JOIN には FROM が必要です" st
+                else
+                    parseSelectTailC distinct items None st k)
 
-    and [<TailCall>] private parseAndLoop<'r> (k: K<'r>) (baseDepth: int) (left: Expr) (st: PState) =
-        if isKeyword "AND" st then
-            match advance st |> enterExpr with
-            | Error e -> err e
-            | Ok st ->
-                parseNotC (fun right st -> parseAndLoop k baseDepth (Expr.Binary(BinaryOp.And, left, right)) st) st
-        else
-            k left { st with Depth = baseDepth }
-
-    and [<TailCall>] private parseAndC<'r> (k: K<'r>) (st: PState) =
-        parseNotC (fun left st -> parseAndLoop k st.Depth left st) st
-
-    and [<TailCall>] private parseOrLoop<'r> (k: K<'r>) (baseDepth: int) (left: Expr) (st: PState) =
-        if isKeyword "OR" st then
-            match advance st |> enterExpr with
-            | Error e -> err e
-            | Ok st -> parseAndC (fun right st -> parseOrLoop k baseDepth (Expr.Binary(BinaryOp.Or, left, right)) st) st
-        else
-            k left { st with Depth = baseDepth }
-
-    and [<TailCall>] private parseOrC<'r> (k: K<'r>) (st: PState) : Result<'r, DbError> =
-        parseAndC (fun left st -> parseOrLoop k st.Depth left st) st
-
-    and [<TailCall>] private parseSelectItemC<'r>
-        (k: SelectItem -> PState -> Result<'r, DbError>)
+    and private parseSelectItemsLoop
+        (acc: SelectItem list)
         (st: PState)
-        : Result<'r, DbError> =
-        if isSymbol "*" st then
-            k { Expression = Expr.Star; Alias = None } (advance st)
-        elif isDotStar st then
-            let name =
-                match peek st with
-                | Token.Ident s
-                | Token.QuotedIdent s -> s
-                | _ -> ""
+        (k: SelectItem list * PState -> Result<'r, DbError>)
+        =
+        parseSelectItemC st (fun (item, st) ->
+            if isSymbol "," st then
+                parseSelectItemsLoop (item :: acc) (advance st) k
+            else
+                k (List.rev (item :: acc), st))
 
-            k
+    /// SELECT の項目リスト（カンマ区切り、1個以上）。
+    and [<TailCall>] private parseSelectItemsC (st: PState) (k: SelectItem list * PState -> Result<'r, DbError>) =
+        parseSelectItemsLoop [] st k
+
+    /// SELECT の 1項目。
+    /// `*` / `t.*` は別名を取らない（`SELECT * x` を別名として飲み込まない）。
+    and [<TailCall>] private parseSelectItemC (st: PState) (k: SelectItem * PState -> Result<'r, DbError>) =
+        match peek st with
+        | Token.Symbol "*" -> k ({ Expression = Expr.Star; Alias = None }, advance st)
+        | Token.Ident name
+        | Token.QuotedIdent name when isDotStar st ->
+            k (
                 {
                     Expression = Expr.QualifiedStar name
                     Alias = None
-                }
-                (st |> advance |> advance |> advance)
-        else
-            parseExprC
-                (fun e st ->
-                    match parseOptAlias st with
-                    | Error er -> err er
-                    | Ok(alias, st) -> k { Expression = e; Alias = alias } st)
-                st
+                },
+                st |> advance |> advance |> advance
+            )
+        | _ ->
+            parseExprC st (fun (e, st) ->
+                match parseOptAlias st with
+                | Error e -> err e
+                | Ok(alias, st) -> k ({ Expression = e; Alias = alias }, st))
 
-    and private parseSelectItemsC<'r>
-        (acc: SelectItem list)
-        (k: SelectItem list -> PState -> Result<'r, DbError>)
-        (st: PState)
-        : Result<'r, DbError> =
-        parseSelectItemC
-            (fun item st ->
-                if isSymbol "," st then
-                    advance st |> parseSelectItemsC (item :: acc) k
-                else
-                    k (List.rev (item :: acc)) st)
-            st
-
-    /// FROM / JOIN の入力を読む（CPS）。
+    /// FROM / JOIN の入力を読む。
     /// `(` の次が SELECT なら派生テーブル（`FROM (SELECT ...) AS x`）。
     /// 派生テーブルには別名を必須にしている（列修飾と JOIN のスキーマ特定に使うため）。
-    /// 内側の SELECT は式の入れ子として深さを数える。
-    and private parseSourceC<'r> (k: TableSource -> PState -> Result<'r, DbError>) (st: PState) : Result<'r, DbError> =
+    and private parseSourceC (st: PState) (k: TableSource * PState -> Result<'r, DbError>) =
         match peek st with
         | Token.Symbol "(" ->
             let afterParen = advance st
 
             if isKeyword "SELECT" afterParen then
-                match enterExpr afterParen with
-                | Error e -> err e
-                | Ok started ->
-                    parseSelectStatementC
-                        (fun sel st ->
-                            match expectSymbol ")" st with
-                            | Error e -> err e
-                            | Ok(_, st) ->
-                                match parseTableAlias st with
-                                | Error e -> err e
-                                | Ok(Some alias, st) -> k (TableSource.Derived(sel, alias)) (exitExpr st)
-                                | Ok(None, st) -> fail "サブクエリ（派生テーブル）には別名が必要です（例: AS x）" st)
-                        started
+                parseSelectStatementC afterParen (fun (sel, st) ->
+                    match expectSymbol ")" st with
+                    | Error e -> err e
+                    | Ok(_, st) ->
+                        match parseTableAlias st with
+                        | Error e -> err e
+                        | Ok(Some alias, st) -> k (TableSource.Derived(sel, alias), st)
+                        | Ok(None, st) -> fail "サブクエリ（派生テーブル）には別名が必要です（例: AS x）" st)
             else
                 fail "FROM の括弧の中には SELECT を書いてください" afterParen
         | _ ->
@@ -743,220 +709,182 @@ module internal Parser =
             | Ok(name, st) ->
                 match parseTableAlias st with
                 | Error e -> err e
-                | Ok(alias, st) -> k (TableSource.Named { Name = name; Alias = alias }) st
+                | Ok(alias, st) -> k (TableSource.Named { Name = name; Alias = alias }, st)
 
-    and [<TailCall>] private parseJoinsC<'r>
-        (acc: JoinClause list)
-        (k: JoinClause list -> PState -> Result<'r, DbError>)
+    /// FROM（省略可）より後ろの句を順に読む。
+    /// FROM を省略した SELECT の入力は 1行 0列になる。
+    and [<TailCall>] private parseSelectTailC
+        (distinct: bool)
+        (items: SelectItem list)
+        (fromRef: TableSource option)
         (st: PState)
-        : Result<'r, DbError> =
+        (k: SelectStatement * PState -> Result<'r, DbError>)
+        =
+        parseJoinsC st (fun (joins, st) ->
+            parseWhereC st (fun (whereE, st) ->
+                parseGroupByC st (fun (groupBy, st) ->
+                    parseHavingC st (fun (having, st) ->
+                        parseOrderByC st (fun (orderBy, st) ->
+                            parseLimitOffsetC st (fun ((limit, offset), st) ->
+                                match rejectSetOperation st with
+                                | Error e -> err e
+                                | Ok() ->
+                                    k (
+                                        {
+                                            Distinct = distinct
+                                            Items = items
+                                            From = fromRef
+                                            Joins = joins
+                                            Where = whereE
+                                            GroupBy = groupBy
+                                            Having = having
+                                            OrderBy = orderBy
+                                            Limit = limit
+                                            Offset = offset
+                                        },
+                                        st
+                                    )))))))
+
+    and private parseJoinsLoop
+        (acc: JoinClause list)
+        (st: PState)
+        (k: JoinClause list * PState -> Result<'r, DbError>)
+        =
         match rejectUnsupportedClause st with
         | Error e -> err e
         | Ok() ->
-            let afterLeft = advance st
-            let afterOuter = eatIdentName "OUTER" afterLeft
+            let parsedKind = parseJoinKind st
 
-            let kind, st =
-                if isKeyword "INNER" st then JoinKind.Inner, advance st
-                elif isKeyword "LEFT" st then JoinKind.Left, afterOuter
-                else JoinKind.Inner, st
+            let kindAnswer =
+                if isKeyword "JOIN" st then
+                    Ok(JoinKind.Inner, st)
+                else
+                    match parsedKind with
+                    | Some(kind, afterKind) ->
+                        if isKeyword "JOIN" afterKind then
+                            Ok(kind, afterKind)
+                        else
+                            fail "LEFT / INNER の後ろには JOIN が必要です" afterKind
+                    | None -> Ok(JoinKind.Inner, st)
 
-            if isKeyword "JOIN" st then
-                parseSourceC
-                    (fun tbl st ->
+            match kindAnswer with
+            | Error e -> err e
+            | Ok(kind, atJoin) ->
+                if isKeyword "JOIN" atJoin then
+                    parseSourceC (advance atJoin) (fun (tbl, st) ->
                         if isIdentName "USING" st then
                             fail "USING は未対応です（JOIN では ON を使ってください）" st
                         else
                             match expectKeyword "ON" st with
                             | Error e -> err e
                             | Ok(_, st) ->
-                                parseExprC
-                                    (fun on st -> parseJoinsC ({ Kind = kind; Table = tbl; On = on } :: acc) k st)
-                                    st)
-                    (advance st)
-            else
-                k (List.rev acc) st
-
-    and [<TailCall>] private parseWhereC<'r>
-        (k: Expr option -> PState -> Result<'r, DbError>)
-        (st: PState)
-        : Result<'r, DbError> =
-        if isKeyword "WHERE" st then
-            advance st |> parseExprC (fun e st -> k (Some e) st)
-        else
-            k None st
-
-    and private parseGroupByItemsC<'r>
-        (acc: Expr list)
-        (k: Expr list -> PState -> Result<'r, DbError>)
-        (st: PState)
-        : Result<'r, DbError> =
-        parseExprC
-            (fun e st ->
-                if isSymbol "," st then
-                    advance st |> parseGroupByItemsC (e :: acc) k
+                                parseExprC st (fun (on, st) ->
+                                    parseJoinsLoop ({ Kind = kind; Table = tbl; On = on } :: acc) st k))
                 else
-                    k (List.rev (e :: acc)) st)
-            st
+                    k (List.rev acc, st)
 
-    and [<TailCall>] private parseGroupByC<'r>
-        (acc: Expr list)
-        (k: Expr list -> PState -> Result<'r, DbError>)
-        (st: PState)
-        : Result<'r, DbError> =
+    /// JOIN 句の並び（0個以上）。
+    /// 種類だけ書いて JOIN が続かない入力は黙って捨てずにエラーにする
+    /// （`FROM t LEFT WHERE ...` が LEFT JOIN なしとして静かに通っていた）。
+    and [<TailCall>] private parseJoinsC (st: PState) (k: JoinClause list * PState -> Result<'r, DbError>) =
+        parseJoinsLoop [] st k
+
+    /// JOIN の種類（INNER / LEFT [OUTER]）を読む。
+    /// 語を消費した後の状態と種類を返す。
+    /// どちらの語も無ければ None。
+    and [<TailCall>] private parseJoinKind (st: PState) =
+        if isKeyword "INNER" st then
+            Some(JoinKind.Inner, advance st)
+        elif isKeyword "LEFT" st then
+            Some(JoinKind.Left, advance st |> eatIdentName "OUTER")
+        else
+            None
+
+    and [<TailCall>] private parseWhereC (st: PState) (k: Expr option * PState -> Result<'r, DbError>) =
+        if isKeyword "WHERE" st then
+            parseExprC (advance st) (fun (e, st) -> k (Some e, st))
+        else
+            k (None, st)
+
+    and [<TailCall>] private parseGroupByC (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =
         if isKeyword "GROUP" st then
             match advance st |> expectKeyword "BY" with
             | Error e -> err e
-            | Ok(_, st) -> parseGroupByItemsC acc k st
+            | Ok(_, st) -> parseGroupByItemsC st k
         else
-            k acc st
+            k ([], st)
 
-    and [<TailCall>] private parseHavingC<'r>
-        (k: Expr option -> PState -> Result<'r, DbError>)
-        (st: PState)
-        : Result<'r, DbError> =
+    and private parseGroupByItemsLoop (acc: Expr list) (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =
+        parseExprC st (fun (e, st) ->
+            if isSymbol "," st then
+                parseGroupByItemsLoop (e :: acc) (advance st) k
+            else
+                k (List.rev (e :: acc), st))
+
+    and [<TailCall>] private parseGroupByItemsC (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =
+        parseGroupByItemsLoop [] st k
+
+    and [<TailCall>] private parseHavingC (st: PState) (k: Expr option * PState -> Result<'r, DbError>) =
         if isKeyword "HAVING" st then
-            advance st |> parseExprC (fun e st -> k (Some e) st)
+            parseExprC (advance st) (fun (e, st) -> k (Some e, st))
         else
-            k None st
+            k (None, st)
 
-    and private parseOrderByItemsC<'r>
-        (acc: SortKey list)
-        (k: SortKey list -> PState -> Result<'r, DbError>)
-        (st: PState)
-        : Result<'r, DbError> =
-        parseExprC
-            (fun e st ->
-                let dir, st =
-                    if isKeyword "DESC" st then
-                        SortDirection.Descending, advance st
-                    elif isKeyword "ASC" st then
-                        SortDirection.Ascending, advance st
-                    else
-                        SortDirection.Ascending, st
-
-                let key = { Expression = e; Direction = dir }
-
-                if isSymbol "," st then
-                    advance st |> parseOrderByItemsC (key :: acc) k
-                else
-                    k (List.rev (key :: acc)) st)
-            st
-
-    and [<TailCall>] private parseOrderByC<'r>
-        (acc: SortKey list)
-        (k: SortKey list -> PState -> Result<'r, DbError>)
-        (st: PState)
-        : Result<'r, DbError> =
+    and [<TailCall>] private parseOrderByC (st: PState) (k: SortKey list * PState -> Result<'r, DbError>) =
         if isKeyword "ORDER" st then
             match advance st |> expectKeyword "BY" with
             | Error e -> err e
-            | Ok(_, st) -> parseOrderByItemsC acc k st
+            | Ok(_, st) -> parseOrderByItemsC st k
         else
-            k acc st
+            k ([], st)
 
-    and private parseLimitOffsetC<'r>
-        (k: (Expr option * Expr option) -> PState -> Result<'r, DbError>)
+    and private parseOrderByItemsLoop
+        (acc: SortKey list)
         (st: PState)
-        : Result<'r, DbError> =
-        if isKeyword "LIMIT" st then
-            advance st
-            |> parseExprC (fun limit st ->
-                if isKeyword "OFFSET" st then
-                    advance st |> parseExprC (fun offset st -> k (Some limit, Some offset) st)
+        (k: SortKey list * PState -> Result<'r, DbError>)
+        =
+        parseExprC st (fun (e, st) ->
+            let dir, st =
+                if isKeyword "DESC" st then
+                    SortDirection.Descending, advance st
+                elif isKeyword "ASC" st then
+                    SortDirection.Ascending, advance st
                 else
-                    k (Some limit, None) st)
+                    SortDirection.Ascending, st
+
+            let key = { Expression = e; Direction = dir }
+
+            if isSymbol "," st then
+                parseOrderByItemsLoop (key :: acc) (advance st) k
+            else
+                k (List.rev (key :: acc), st))
+
+    and [<TailCall>] private parseOrderByItemsC (st: PState) (k: SortKey list * PState -> Result<'r, DbError>) =
+        parseOrderByItemsLoop [] st k
+
+    and private parseLimitOffsetC (st: PState) (k: (Expr option * Expr option) * PState -> Result<'r, DbError>) =
+        if isKeyword "LIMIT" st then
+            parseExprC (advance st) (fun (limit, st) ->
+                if isKeyword "OFFSET" st then
+                    parseExprC (advance st) (fun (offset, st) -> k ((Some limit, Some offset), st))
+                else
+                    k ((Some limit, None), st))
         elif isKeyword "OFFSET" st then
-            advance st |> parseExprC (fun offset st -> k (None, Some offset) st)
+            parseExprC (advance st) (fun (offset, st) -> k ((None, Some offset), st))
         else
-            k (None, None) st
+            k ((None, None), st)
 
-    /// FROM（省略可）より後ろの句を読む。
-    /// FROM を省略した SELECT の入力は 1行 0列になる。
-    and [<TailCall>] private parseSelectTailC<'r>
-        (k: SelectStatement -> PState -> Result<'r, DbError>)
-        (distinct: bool)
-        (items: SelectItem list)
-        (fromRef: TableSource option)
-        (st: PState)
-        : Result<'r, DbError> =
-        parseJoinsC
-            []
-            (fun joins st ->
-                parseWhereC
-                    (fun whereE st ->
-                        parseGroupByC
-                            []
-                            (fun groupBy st ->
-                                parseHavingC
-                                    (fun having st ->
-                                        parseOrderByC
-                                            []
-                                            (fun orderBy st ->
-                                                parseLimitOffsetC
-                                                    (fun (limit, offset) st ->
-                                                        match rejectSetOperation st with
-                                                        | Error e -> err e
-                                                        | Ok() ->
-                                                            let sel =
-                                                                {
-                                                                    Distinct = distinct
-                                                                    Items = items
-                                                                    From = fromRef
-                                                                    Joins = joins
-                                                                    Where = whereE
-                                                                    GroupBy = groupBy
-                                                                    Having = having
-                                                                    OrderBy = orderBy
-                                                                    Limit = limit
-                                                                    Offset = offset
-                                                                }
+    /// CPS の構文規則を、値をそのまま返す形で呼ぶ入口。
+    /// DML・文の列挙など、呼び出しの入れ子が入力サイズに比例しない箇所で使う。
+    let private parseExprValue (st: PState) = parseExprC st ret
 
-                                                            k sel st)
-                                                    st)
-                                            st)
-                                    st)
-                            st)
-                    st)
-            st
+    let private parseWhereValue (st: PState) = parseWhereC st ret
 
-    and [<TailCall>] private parseSelectStatementC<'r>
-        (k: SelectStatement -> PState -> Result<'r, DbError>)
-        (st: PState)
-        : Result<'r, DbError> =
-        match expectKeyword "SELECT" st with
-        | Error e -> err e
-        | Ok(_, st) ->
-            let distinct = isKeyword "DISTINCT" st
-            let st = if distinct then advance st else st
-
-            parseSelectItemsC
-                []
-                (fun items st ->
-                    if isKeyword "FROM" st then
-                        parseSourceC
-                            (fun fromRef st -> parseSelectTailC k distinct items (Some fromRef) st)
-                            (advance st)
-                    elif isKeyword "JOIN" st || isKeyword "INNER" st || isKeyword "LEFT" st then
-                        fail "JOIN には FROM が必要です" st
-                    else
-                        parseSelectTailC k distinct items None st)
-                st
-
-    /// 式を 1 つ読んで返す（継続版 parseExprC の糖）。
-    /// 文レベルの構文規則から使う。
-    let private parseExpr = parseExprC retE
-
-    /// SELECT 文を読む（継続版 parseSelectStatementC の糖）。
-    let private parseSelectStatement =
-        parseSelectStatementC (fun sel st -> ret (sel, st))
-
-    /// WHERE 句を読む（継続版 parseWhereC の糖）。
-    let private parseWhere = parseWhereC (fun whereE st -> ret (whereE, st))
+    let private parseSelectStatementValue (st: PState) = parseSelectStatementC st ret
 
     let private parseSelect (st: PState) =
         result {
-            let! sel, st = parseSelectStatement st
+            let! sel, st = parseSelectStatementValue st
             let! _, st = eatOptionalSemicolon st
             return Statement.Select sel, st
         }
@@ -988,7 +916,7 @@ module internal Parser =
             let parsed =
                 match simpleLiteral st with
                 | Some e -> Ok e
-                | None -> parseExprC retE st
+                | None -> parseExprValue st
 
             match parsed with
             | Error e -> err e
@@ -1038,7 +966,7 @@ module internal Parser =
                         },
                         st
             elif isKeyword "SELECT" st then
-                let! sel, st = parseSelectStatement st
+                let! sel, st = parseSelectStatementValue st
                 let! _, st = eatOptionalSemicolon st
 
                 return
@@ -1070,7 +998,7 @@ module internal Parser =
                 match expectSymbol "=" st with
                 | Error e -> err e
                 | Ok(_, st) ->
-                    match parseExpr st with
+                    match parseExprValue st with
                     | Error e -> err e
                     | Ok(e, st) ->
                         if isSymbol "," st then
@@ -1083,7 +1011,7 @@ module internal Parser =
             let! tbl, st = parseTableRef st
             let! _, st = expectKeyword "SET" st
             let! asg, st = assigns [] st
-            let! whereE, st = parseWhere st
+            let! whereE, st = parseWhereValue st
             let! _, st = eatOptionalSemicolon st
 
             return
@@ -1107,7 +1035,7 @@ module internal Parser =
                 else
                     ret ()
 
-            let! whereE, st = parseWhere st
+            let! whereE, st = parseWhereValue st
             let! _, st = eatOptionalSemicolon st
             return { Table = tbl; Where = whereE }, st
         }
@@ -1115,7 +1043,7 @@ module internal Parser =
     /// VARCHAR(32) のような型引数を読む。
     let private parseTypeArguments (st: PState) =
         let rec loop acc st =
-            match parseExprC retE st with
+            match parseExprValue st with
             | Error e -> err e
             | Ok(e, st) ->
                 let v =
@@ -1157,7 +1085,7 @@ module internal Parser =
             elif isKeyword "UNIQUE" st then
                 advance st |> loop { c with Unique = true }
             elif isKeyword "DEFAULT" st then
-                match advance st |> parseExprC retE with
+                match advance st |> parseExprValue with
                 | Error e -> err e
                 | Ok(e, st) -> loop { c with Default = Some e } st
             else
@@ -1197,9 +1125,8 @@ module internal Parser =
         }
 
     /// `IF [NOT] EXISTS` を読む。
-    /// `NOT` は省略形（`IF EXISTS`）にも許可される SQL 実装があるため、
-    /// あれば消費する。消費しないと `CREATE TABLE IF NOT EXISTS` が
-    /// `EXISTS が必要` で落ちる。
+    /// `NOT` は省略形（`IF EXISTS`）にも許可される SQL 実装があるため、あれば消費する。
+    /// 消費しないと `CREATE TABLE IF NOT EXISTS` が `EXISTS が必要` で落ちる。
     let private parseIfExists (st: PState) =
         if isKeyword "IF" st then
             let st1 = advance st
@@ -1337,7 +1264,7 @@ module internal Parser =
             match peek st with
             | Token.Keyword "SELECT" ->
                 result {
-                    let! sel, st = parseSelectStatement st
+                    let! sel, st = parseSelectStatementValue st
                     let! _, st = eatOptionalSemicolon st
                     return Statement.Explain sel, st
                 }
@@ -1372,7 +1299,7 @@ module internal Parser =
             fail "集合演算（UNION / INTERSECT / EXCEPT）は未対応です" st
         | _ -> fail "文の開始として解釈できません" st
 
-    /// SQL テキストを 1 文以上へ分解して AST にする。
+    /// SQL テキストを 1文以上へ分解して AST にする。
     let parseStatements (sql: string) =
         let rec parseAll acc st =
             if st.Pos >= st.Tokens.Length - 1 then
@@ -1396,10 +1323,9 @@ module internal Parser =
                 {
                     Tokens = Array.ofList tokens
                     Pos = 0
-                    Depth = 0
                 }
 
-    /// SQL テキストを 1 つの式として解析する。
+    /// SQL テキストを 1つの式として解析する。
     /// DEFAULT の永続化文字列を復元するために使う。
     let parseExpression (sql: string) =
         result {
@@ -1409,10 +1335,9 @@ module internal Parser =
                 {
                     Tokens = Array.ofList tokens
                     Pos = 0
-                    Depth = 0
                 }
 
-            let! e, st = parseExpr st
+            let! e, st = parseExprValue st
 
             if st.Pos >= st.Tokens.Length - 1 then
                 return e

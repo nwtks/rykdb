@@ -2338,10 +2338,10 @@ let ``SqlReference: 集約結果は DATE の型を保つ`` () =
         | v -> Assert.Fail(sprintf "DATE ではありません: %A" v))
 
 [<Fact>]
-let ``SqlReference: 深いサブクエリの入れ子（上限内）は実行できる`` () =
-    // `Plan.planSelect` / `resolveSelect` / `resolveExpr` / `resolveLeaf` は相互再帰する。
-    // 深さは式の上限（MaxExpressionDepth = 200。1 段で複数単位を消費する）で頭打ちなので、
-    // 上限内の入れ子はスタックを食わずに実行できることを固定しておく。
+let ``SqlReference: 深いサブクエリの入れ子も実行できる`` () =
+    // `Plan.planSelect` / `resolveSelect` / `resolveExpr` / `resolveLeaf` は相互再帰するが、
+    // 継続を末尾で呼ぶので入れ子段数に依存せずスタックは一定。
+    // Parser 側も CPS なので、式・サブクエリの深さ上限はない。
     withDb "subquery-depth" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10)"
@@ -2351,13 +2351,10 @@ let ``SqlReference: 深いサブクエリの入れ子（上限内）は実行で
             |> List.fold (fun e _ -> sprintf "(SELECT %s FROM t WHERE id = 1)" e) "v"
 
         let _, rows =
-            ok (execSql db2 (sprintf "SELECT %s AS x FROM t WHERE id = 1" (nested 90)))
+            ok (execSql db2 (sprintf "SELECT %s AS x FROM t WHERE id = 1" (nested 4000)))
 
         Assert.Equal<int>(1, rows.Rows.Length)
-        Assert.Equal<int64>(10L, asInt rows.Rows.[0].[0])
-
-        // 上限を超えると StackOverflow ではなく SyntaxError
-        expectErrorKind ErrorKind.SyntaxError "深すぎるサブクエリ" (execSql db2 (sprintf "SELECT %s AS x FROM t" (nested 400))))
+        Assert.Equal<int64>(10L, asInt rows.Rows.[0].[0]))
 
 [<Fact>]
 let ``SqlReference: 派生テーブル（FROM / JOIN）`` () =
@@ -2637,23 +2634,15 @@ let ``SqlReference: よく見るエラーメッセージは sql-reference §13 �
         expectMessage "'nosuchcol' は列でも関数でもありません" "SELECT nosuchcol FROM t" db2
         expectMessage "テーブル nopk に主キーがありません" "CREATE TABLE nopk (a INTEGER)" db2
         expectMessage "テーブル t は既に存在します" "CREATE TABLE t (id INTEGER PRIMARY KEY)" db2
-
         expectMessage "テーブル t に列 nosuchcol がありません" "CREATE INDEX ix ON t (nosuchcol)" db2
-
         expectMessage "テーブル t が重複しています（エイリアスを付けてください）" "SELECT id FROM t JOIN t ON t.id = t.id" db2
-
         expectMessage "テーブル nosuch が存在しません" "DROP TABLE nosuch" db2
         expectMessage "INSERT の列数(1)と値の数(2)が合いません" "INSERT INTO t (id) VALUES (1, 2)" db2
         expectMessage "NOT NULL 制約に違反: t.n" "INSERT INTO t (id) VALUES (2)" db2
-
         expectMessage "''abc'' は 'INTEGER' に変換できません" "INSERT INTO t (id, n, num) VALUES (5, 'z', 'abc')" db2
-
         expectMessage "0 での除算は定義されていません" "SELECT (id) / 0 FROM t" db2
-
-        expectMessage "LENGTH 関数は 1 個の引数が必要ですが、2 個渡されました" "SELECT LENGTH(id, num) FROM t" db2
-
+        expectMessage "LENGTH 関数は 1個の引数が必要ですが、2個渡されました" "SELECT LENGTH(id, num) FROM t" db2
         expectMessage "未知のスカラー関数 'NOSUCHFN' です" "SELECT NOSUCHFN(id) FROM t" db2
-
         expectMessage "サブクエリ（派生テーブル）には別名が必要です（例: AS x）" "SELECT id FROM (SELECT id FROM t)" db2
         expectMessage "型 'BOOLEAN' と 'INTEGER' は比較できません" "SELECT active = 1 FROM t" db2
         expectMessage "ROUND は数値を受け付けますが" "SELECT ROUND(n) FROM t" db2

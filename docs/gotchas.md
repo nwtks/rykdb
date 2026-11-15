@@ -899,7 +899,7 @@ exec ctx child schema |> Result.map (fun op -> Ops.sortBy schema op keys)
 
 // ✅ 属性を外して理由をコメントで残す
 // [<TailCall>] を付けない理由: 子の Result を消費するため末尾にならず FS3569 になる。
-// 深さは論理木の深さ（式は MaxExpressionDepth = 200）で頭打ちになる。
+// 論理木の深さは入力の式の深さに比例する（Parser の式・サブクエリは CPS で深さ上限なし）。
 exec ctx child schema |> Result.map (fun op -> Ops.sortBy schema op keys)
 
 // ✅ あるいは「積む側」と「回す側」に分けて本当に末尾再帰にする
@@ -926,7 +926,7 @@ let rec readAll n c acc =
 `dotnet test` / `dotnet run` は Debug なので、CPS の相互末尾再帰が `tail.` にならず、
 50000個の `IN` リストで `Stack overflow.`（exit 134）になる。
 `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` を消すと再発するので注意。
-`MaxExpressionDepth` はこの前提のための保険（→ §11.48）。
+Parser の式・サブクエリは CPS で深さ上限を持たない（→ §11.48）。
 
 属性の無い関数（ローカル `let rec` 含む）まで含めた**反復検証**は `dotnet run --project tools/TailAudit`
 （既知分は `tools/TailAudit/TailAudit.baseline` と差分を取り、新規があれば exit 1。
@@ -1759,8 +1759,14 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 対策:
 
 - `parseTableAlias` が未対応語を裸のテーブル別名として消費しない（`AS` を付ければ使える）。
+- `parseOptAlias`（列の別名）も未対応語を裸の別名として消費しない
+  （`SELECT 1 UNION SELECT 2` の `UNION` が列別名になり、後続の SELECT が別の文として実行されていた）。
 - `parseJoins` が `USING` を明示エラーにする。
   FROM の直後に残った未対応語（`FROM t AS x RIGHT JOIN ...` など）も明示エラーにする。
+- `JOIN` の種類（`LEFT` / `INNER`）だけ書いて `JOIN` が続かない入力は明示エラーにする
+  （`FROM t LEFT WHERE ...` が「LEFT JOIN なし」として静かに通っていた）。
+- DML の対象テーブルの別名（`UPDATE t AS x`）は、列解決に使われず `WHERE x.id` だけが
+  `NameError` になる中途半端な状態を避けるため、パース時に `SyntaxError` にする。
 - `parseStatements` は文の区切りに `;` を必須にする。
 - `parseSelect` は句の後ろの `UNION` / `INTERSECT` / `EXCEPT` も明示エラーにする。
 
@@ -1768,6 +1774,9 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 
 - `パーサ: 未対応の集合演算は明示エラー`
 - `パーサ: 未対応の JOIN は明示エラー`
+- `パーサ: JOIN の種類だけで JOIN が無い入力はエラー`
+- `パーサ: 列別名が集合演算を飲み込まない`
+- `パーサ: DML のテーブル別名は明示エラー`
 - `パーサ: 複数文は ; で区切る`
 - `SqlReference: UNION はエラーになり 2 文として実行されない`
 - `SqlReference: RIGHT JOIN はエラーになり INNER JOIN として実行されない`
@@ -1920,12 +1929,12 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 - DML は `Engine.runInsert` / `runUpdate` / `runDelete` が `Plan.resolveDmlExprWith` で解決する
   （UPDATE / DELETE は対象行のスキーマを渡すので外側行を参照できる）。
   `CREATE TABLE ... DEFAULT (SELECT ...)` は解決しない（実行時に `SyntaxError`）。
-- Parser は式と SELECT のパーサを同じ `let rec` グループにするため、句の側も CPS にする
-  （`parseSelectStatementC` / `parseSelectItemsC` / `parseJoinsC` / `parseWhereC` / …）。
-  継続をラムダで渡すので FS3569 は通るが、**群の全メンバーに `: Result<'r, DbError>` の戻り型注釈を付ける**
-  （推論に任せると FS0043「'r と 'r0 が一致しない」で群全体が落ち、
-  後続が FS0039「parseExprC は定義されていません」という無関係なエラーになる）。
-  深さは `MaxExpressionDepth` で頭打ち。
+- Parser の式は **Pratt（precedence climbing）** で、中置演算子はループ、右辺だけを結合強度で再帰させる
+  （`parseExprBpC` / `parseExprLoopC`）。
+  比較・述語（`IS` / `IN` / `BETWEEN` / `LIKE`）は非結合なので、
+  `a = b = c` や `a IS NULL = 1` はその場でエラーになる（括弧で囲めば通る）。
+  サブクエリのため式と SELECT のパーサは同じ `let rec` グループにあり、**CPS** で書く。
+  継続はヒープに積まれ、深さ上限はない（§11.48）。
 - **Planner のサブクエリ解決（`Plan.planSelectCWith` / `resolveSelectC` / `resolveExprC` / `resolveLeafC`）も CPS**。
   式の走査は `Expr.rewriteWithC`（葉の書き換えが継続を取る版）、
   リスト（項目 / JOIN / GROUP BY / ORDER BY）は `traverseC` が 1件ずつ継続で回す。
@@ -1942,37 +1951,30 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
   `SqlReference: サブクエリの未対応形とエラー` / `パーサ: サブクエリ（スカラー / IN / EXISTS）` /
   `末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパースできる`。
 
-### 11.48 `MaxExpressionDepth` は `tail.` 前提の保険（外すとプロセスごと落ちる）
+### 11.48 Parser の深さ上限は撤廃（CPS でスタック一定）
 
-`Parser.MaxExpressionDepth = 200` は **SQL の意味上の制限ではない**。
-CPS の相互再帰が末尾呼び出し（`tail.`）にならない環境でも StackOverflow を起こさないための保険。
-`enterExpr` は式の入口・単項演算子・二項演算子の右辺ごとに深さを 1 消費するので、
-演算子の連鎖・`NOT` の連鎖・括弧・サブクエリの入れ子がすべてここで頭打ちになる。
+以前は `Parser.MaxExpressionDepth = 200` で式の再帰に上限を課していた。
+現在は式・SELECT の構文規則を **CPS**（継続を引数で受け、末尾で呼ぶ）にしたので、
+深さ上限は設けていない。
 
-実測（2026-11-04、`SELECT * FROM t WHERE a = (v + 1 + …)`）:
+- 継続は関数値としてヒープに積まれ、呼び出しは必ず末尾位置になる。
+  `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` により Debug でも `tail.` が出るので、
+  括弧・前置演算子・CASE・関数呼び出し・サブクエリの入れ子段数に依存せずスタックは一定。
+- CPS 群に `[<TailCall>]` は付けない。
+  継続ラムダの中から同じ群の関数を呼ぶ形があり、FS3569 が非末尾と判定するため。
+  代わりに深い入力の回帰テストで実行時の末尾呼び出しを固定する。
+- メモリは深さに比例する（AST と継続をヒープに持つ）。
+  入力長 O(n) のコストはかかるが、`StackOverflowException` は**捕捉できない**ため、
+  ホストプロセスを巻き込まないことを優先する。
+- `Tailcalls=false` にすると継続呼び出しが末尾にならず、深い入力でプロセスごと落ちる。
+  設定を外さないこと（§8.16）。
+- 回帰テスト: `ParserTests` の
+  `末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない` /
+  `末尾再帰: 5000段の深いサブクエリの入れ子も解析できる` /
+  `末尾再帰: 200000個の NOT が連なってもスタックを食わない` /
+  `SqlReferenceTests` の `SqlReference: 深いサブクエリの入れ子も実行できる`。
 
-| ビルド                            | 10,000 連鎖                                        | 備考                 |
-| --------------------------------- | -------------------------------------------------- | -------------------- |
-| `Tailcalls=true`（既定）          | 上限を 2,000,000 にすると**成功**（0.64s / 52MiB） | スタックは積まれない |
-| `dotnet build -p:Tailcalls=false` | **StackOverflow（exit 134）**                      | プロセス即死         |
-| `Tailcalls=false` + 上限 200      | `式の入れ子が深すぎます（上限 200）`（exit 1）     | 安全に失敗する       |
-
-- 上限を 2,000,000 にして実測すると、1,000,000 演算子でも成功するが **11.7s / 635MiB** かかる。
-  深さに比例して AST と継続クロージャをヒープに持つため、**入力長 O(n) のメモリに上限がなくなる**
-  （1,000 段の入れ子サブクエリも 0.83s / 50MiB で通る）。
-- .NET の `StackOverflowException` は**捕捉できない**。
-  RykDb はホストプロセス内で動く組込み DB なので、ここが破れると**クエリ 1 本でアプリが落ちる**。
-- したがって**削除しない**。緩めるなら 10,000 程度
-  （実測 100k で 112MiB なので 10k は数十 MiB 級）。
-  削除するなら `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` を**テストで固定**し、
-  `tail.` が消えたら CI が落ちるようにすること。
-- `Planner` のサブクエリ解決は CPS なのでこの上限に依存しない
-  （残る依存は Parser の再帰だけ）。
-- 回帰テスト: `ParserTests` の `末尾再帰: CPS にした式構文規則は深さ境界で正確に動く` /
-  `末尾再帰: 深い入れ子はエラーになる（StackOverflow ではない）` /
-  `末尾再帰: 深いサブクエリの入れ子もエラーになる（StackOverflow ではない）`。
-
-### 11.49 FROM を省略した SELECT は「1 行 0 列」を入力にする
+### 11.49 FROM を省略した SELECT は「1行 0列」を入力にする
 
 `SELECT 1` / `SELECT 1 + 2 AS x` のような FROM なしの SELECT は、
 Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列）を入力にする。
@@ -1984,9 +1986,8 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
 - **`*` / `t.*` はエラーにする**（`FROM のない SELECT では * を使えません` / `NameError`）。
   許すと 0列 1行の「成功」になり、ヘッダと行の列数がずれる
   （§11.32 の `SELECT nope.*` と同じ型の静かな誤答）。
-- ⚠️ 句を読む処理をローカル関数 `let parseAfterFrom …` に切り出すと **FS3569** で落ちる。
-  CPS 群のメンバーへの呼び出しがローカル関数の中では末尾と見なされないため。
-  `let rec … and` 群に `parseSelectTailC` として足すこと（ラムダ内から呼ぶのは従来どおり可）。
+- `SELECT` の句も継続を取る CPS（`parseJoinsC` / `parseWhereC` / `parseSelectTailC` …）。
+  句の追加は `parseSelectTailC` の継続の連鎖に 1段足す。
 - 回帰テスト: `SqlReference: FROM を省略した SELECT は定数 1 行を返す` /
   `パーサ: FROM を省略した SELECT`。
 
@@ -2008,9 +2009,9 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
   派生ノードの上に `Filter` を付ける。
 - `Logical.Derived` は `scanOrder` で `None` に落ちるのでマージ結合にはならない。
   型が `None` の派生列は等値キーにもならない（入れ子ループになるが結果は正しい）。
-- 再帰：`planCoreCWith` / `resolveSourcesC` は CPS だが、
+- 再帰：`planCoreCWith` / `resolveSourcesC` は CPS で、
   `planCoreCWith` を呼ぶ継続はラムダ内なので TailAudit のベースラインに載る
-  （深さは Parser の `MaxExpressionDepth` で頭打ち）。
+  （Parser も CPS なので深さ上限はない）。
 - 回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
   `パーサ: サブクエリ（スカラー / IN / EXISTS）` /
   `Optimizer.buildLogical: FROM のサブクエリは Logical.Derived になる` /

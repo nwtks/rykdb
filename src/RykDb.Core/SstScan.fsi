@@ -1,12 +1,7 @@
 namespace RykDb.Core
 
 /// ブロック内の符号化された値の位置（削除タグ + 値本体）。
-type internal RawSstValue =
-    {
-        Buffer: byte array
-        Offset: int
-        Length: int
-    }
+type internal RawSstValue
 
 /// SSTable の 1エントリ。
 type internal SstEntry =

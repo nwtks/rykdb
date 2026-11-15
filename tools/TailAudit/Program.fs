@@ -714,7 +714,7 @@ printfn
     inLambdaNonTail
     (nonTail.Length - inLambdaNonTail)
 
-printfn "  区分: ラムダ内 = Compute/pull 継続・CPS 継続（深度は 1 行ごと / MaxExpressionDepth で頭打ち）"
+printfn "  区分: ラムダ内 = Compute/pull 継続・CPS 継続（Parser の式・SELECT を含む）"
 
 printfn "        直接 = 監査部・引数など「結果を消費してから」型（本来の末尾化候補）"
 
