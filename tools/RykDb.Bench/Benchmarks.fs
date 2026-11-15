@@ -68,6 +68,23 @@ type QueryBenchmarks() =
         let values = [ for i in 0..99 -> sprintf "(%d, 'payload')" i ] |> String.concat ", "
         sprintf "BEGIN; INSERT INTO ins VALUES %s; ROLLBACK;" values
 
+    /// 10,000行を 2,000行ずつ 5文に分けた INSERT（1 transaction で流して ROLLBACK する）。
+    let insert10kStatements =
+        [|
+            for block in 0..4 ->
+                let start = block * 2_000
+                let stop = start + 1_999
+
+                let values =
+                    [ for i in start..stop -> sprintf "(%d, 'payload')" i ] |> String.concat ", "
+
+                sprintf "INSERT INTO ins VALUES %s" values
+        |]
+
+    /// 主キーのポイント検索 500回分（SQL の組み立て時間を測定に含めない）。
+    let lookup500Sql =
+        Array.init 500 (fun i -> sprintf "SELECT b FROM t WHERE id = %d" (i + 1))
+
     member private _.Exec(sql: string) =
         session.Execute sql |> Check.ok |> ignore
 
@@ -157,6 +174,27 @@ type QueryBenchmarks() =
     /// 100行の INSERT + ROLLBACK（parse / plan / 制約検査 / transaction バッファ）。
     [<Benchmark>]
     member this.Insert100Rows() = this.Exec insertSql
+
+    /// 10,000行の INSERT（2,000行 × 5文）+ ROLLBACK。
+    [<Benchmark>]
+    member this.Insert10kRows() =
+        this.Exec "BEGIN"
+
+        for sql in insert10kStatements do
+            this.Exec sql
+
+        this.Exec "ROLLBACK"
+
+    /// 主キーのポイント検索を 500回連続で行う。
+    [<Benchmark>]
+    member _.PointLookup500() =
+        let mutable rows = 0L
+
+        for sql in lookup500Sql do
+            let r = session.Execute sql |> Check.ok
+            rows <- rows + int64 r.Rows.Length
+
+        rows
 
 /// compaction のベンチマーク。
 /// L0 に 4ファイル（各 25,000件）を作り、1回の L0 → L1 compaction を測る。

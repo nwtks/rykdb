@@ -45,13 +45,6 @@ let ``Wal.foldCommitted: コミット済みだけを順に再生する`` () =
         Assert.Equal(3UL<txnId>, maxTxnId))
 
 [<Fact>]
-let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
-    let missing =
-        System.IO.Path.Combine(System.IO.Path.GetTempPath(), "rykdb-wal-missing-" + string System.DateTime.UtcNow.Ticks)
-
-    Assert.Empty(Wal.walFiles missing)
-
-[<Fact>]
 let ``Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だけ再生する`` () =
     withDir "wal-truncate" (fun dir ->
         let w0 = freshWal dir
@@ -97,3 +90,10 @@ let ``Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だ
                 actual.Length <= expected.Length && List.take actual.Length expected = actual,
                 sprintf "切断位置 %d で commit 済み prefix 以外が再生された" length
             ))
+
+[<Fact>]
+let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
+    let missing =
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), "rykdb-wal-missing-" + string System.DateTime.UtcNow.Ticks)
+
+    Assert.Empty(Wal.walFiles missing)

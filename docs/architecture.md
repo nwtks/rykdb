@@ -199,10 +199,13 @@ flowchart TB
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）                                        |
 | `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）                                |
-| `Serialization.fs` | 順序保持エンコーディング / `Writer` / `Cursor` / `KeyBuilder` / `Hashing`                                                |
+| `Writer.fs`        | 不変のチャンク書き込み `Writer`                                                                                          |
+| `Cursor.fs`        | 読み取り位置を値として保持する `Cursor`                                                                                  |
+| `Serialization.fs` | 順序保持エンコーディング / `Reader` / `OrderPreserving` / `KeyBuilder` / `ValueCodec` / `Hashing`                        |
 | `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                                                           |
 | `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                                                   |
 | `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                                                |
+| `SstScan.fs`       | SSTable / メモリの遅延走査 `SstScan` とマージ `SstMerge`（`ScanScope`）                                                  |
 | `Sstable.fs`       | SSTable の構築・読み取り・k-way merge（ブロック / index / Bloom / Footer）                                               |
 | `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                                                |
 | `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                                              |
@@ -232,8 +235,8 @@ flowchart TB
 ### F# のコンパイル順
 
 ```
-Errors → Types → Serialization → Memtable → Wal → BloomFilter
-       → Sstable → VersionSet → Manifest → Compaction
+Errors → Types → Writer → Cursor → Serialization → Memtable → Wal → BloomFilter
+       → SstScan → Sstable → VersionSet → Manifest → Compaction
        → StorageEngine → Ast → Lexer → Parser → Transactions → EngineHost
        → ProcessLock → RowStore → Catalog → Eval → Op → ExtSort → Ops
        → Dml → ExecContext → Analyzer → Planner → DropCleanup → Engine → Database → Session
@@ -246,7 +249,7 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 ## 3. フロントエンド
 
-`Lexer.fs` → `Parser.fs` → `Ast.fs` → `Analyzer.fs` → `Planner.fs` という一方向のパイプライン。
+`Ast.fs`（式・文の型）→ `Lexer.fs` → `Parser.fs` → `Analyzer.fs` → `Planner.fs` という一方向のパイプライン。
 
 ### 3.1 Lexer — 状態スレッドの字句解析
 
@@ -278,9 +281,10 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 - サブクエリ（`(SELECT ...)` / `EXISTS` / `IN`）は式のパーサと SELECT のパーサが
   **同じ `let rec` グループ**で相互再帰する。
   どちらも継続を末尾で呼ぶので深さに比例しない。
-- CPS 群には `[<TailCall>]` を付けない。
-  継続（ラムダ）の中から同じ群の関数を呼ぶ形があり、
-  FS3569 が「末尾でない」と判定するため。
+- CPS 群でも自己再帰がすべて末尾位置の関数には `[<TailCall>]` を付ける
+  （`parseExprC` / `parseExprBpC` / `parsePrefixC` など）。
+  `parseExprLoopC` は継続（ラムダ）の中から同じ群の関数を呼ぶ形があり、
+  FS3569 が「末尾でない」と判定するため付けない。
   `Directory.Build.props` の `Tailcalls=true` と深い入れ子の回帰テストで実行時の末尾呼び出しを担保する。
 - `*` / `t.*` は別名を取らない。
   `NULL.*` のような識別子以外の修飾子は `'.' の後ろには列名か '*' が必要です` で拒否する。
@@ -463,7 +467,7 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
 - `Logical.Derived` は `scanOrder` で `None` に落ちるためマージ結合には選ばれない。
 
 回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
-`Optimizer.buildLogical: FROM のサブクエリは Logical.Derived になる`。
+`Optimizer.buildLogicalWith: FROM のサブクエリは Logical.Derived になる`。
 
 #### 束縛（Binder）
 
@@ -561,7 +565,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
 1. **インデックス入れ子ループ**（`JoinAlgorithm.IndexNestedLoop`）:
    左部分木の見積りが 32行以下（`Limit` / 主キー等値 / `Values` = FROM 省略の 1行）で、
    右テーブルに結合キー全列を満たす索引があり、右部分木が `Scan` のとき。
-   右は左行ごとに `ExecContext.byIndex` で引く。
+   右は左行ごとに `ExecContext.byIndexMasked` で引く。
 2. **マージ結合**（`MergeJoin`）:
    等値キーがあり、左右の走査が**結合キー順**のとき。
    `Analyzer.scanOrder` が `SeqScan` / `RangeScan`（主キー列）、
@@ -608,7 +612,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
 
 #### 論理代数 → Op（`Optimizer.exec`）
 
-- `Scan` は `execScan` が `ScanMethod` に応じて `ExecContext.table` / `ExecContext.byPrimaryKey` / `ExecContext.byIndex` へ振り分ける。
+- `Scan` は `execScan` が `ScanMethod` に応じて `ExecContext.tableMasked` / `ExecContext.byPrimaryKeyMasked` / `ExecContext.byIndexMasked` へ振り分ける。
 - `Join` は左を「**左部分木が実際に出力するレイアウト**」（`outputOf`）、
   右を「右テーブル 1つだけのスキーマ」で実行し、
   戦略に応じて `Ops.innerJoin` / `Ops.leftJoin`（入れ子ループ）、
@@ -656,20 +660,20 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 
 `Ops` モジュールの演算子は以下のとおり。
 
-| 演算子                                           | 役割                                         |
-| ------------------------------------------------ | -------------------------------------------- |
-| `Op.ofArray` / `Op.ofRow`                        | 材料化済み・1行の源                          |
-| `Op.map` / `filter`                              | 1 対 1 / 1 対 0 の変換                       |
-| `Ops.project`                                    | 射影（`*` / `t.*` の展開を含む）             |
-| `Ops.sortBy`                                     | ソート（外部マージ。§5.3）                   |
-| `Op.take` / `Op.skip`                            | LIMIT / OFFSET                               |
-| `Ops.innerJoin` / `leftJoin`                     | 入れ子ループ結合                             |
-| `Ops.innerJoinHash` / `leftJoinHash`             | ハッシュ結合                                 |
-| `Ops.innerJoinMerge` / `leftJoinMerge`           | マージ結合                                   |
-| `Ops.innerJoinIndexed` / `leftJoinIndexed`       | インデックス入れ子ループ                     |
-| `Ops.aggregate`                                  | 集約（`groupBy` 値 + 各集約結果 の行を生成） |
-| `Ops.distinct`                                   | 重複除去                                     |
-| `ExecContext.table` / `byPrimaryKey` / `byIndex` | 走査                                         |
+| 演算子                                                             | 役割                                         |
+| ------------------------------------------------------------------ | -------------------------------------------- |
+| `Op.ofArray` / `Op.ofRow`                                          | 材料化済み・1行の源                          |
+| `Op.map` / `filter`                                                | 1 対 1 / 1 対 0 の変換                       |
+| `Ops.project`                                                      | 射影（`*` / `t.*` の展開を含む）             |
+| `Ops.sortBy`                                                       | ソート（外部マージ。§5.3）                   |
+| `Op.take` / `Op.skip`                                              | LIMIT / OFFSET                               |
+| `Ops.innerJoin` / `leftJoin`                                       | 入れ子ループ結合                             |
+| `Ops.innerJoinHash` / `leftJoinHash`                               | ハッシュ結合                                 |
+| `Ops.innerJoinMerge` / `leftJoinMerge`                             | マージ結合                                   |
+| `Ops.innerJoinIndexed` / `leftJoinIndexed`                         | インデックス入れ子ループ                     |
+| `Ops.aggregate`                                                    | 集約（`groupBy` 値 + 各集約結果 の行を生成） |
+| `Ops.distinct`                                                     | 重複除去                                     |
+| `ExecContext.tableMasked` / `byPrimaryKeyMasked` / `byIndexMasked` | 走査（列マスク付き）                         |
 
 遅延の持ち方が演算子ごとに違う。
 
@@ -683,7 +687,7 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 | `Ops.innerJoin` / `leftJoin`                   | 右を materialize し、左を 1行ずつ流す入れ子ループ                             |
 | `Ops.innerJoinHash` / `leftJoinHash`           | 右をハッシュ表に materialize する                                             |
 | `Ops.innerJoinMerge` / `leftJoinMerge`         | 両側を 1行ずつ流す（同じキーの行のグループだけを保持。右の materialize なし） |
-| `Ops.innerJoinIndexed` / `leftJoinIndexed`     | 左行ごとに `ExecContext.byIndex` で右を引く                                   |
+| `Ops.innerJoinIndexed` / `leftJoinIndexed`     | 左行ごとに `ExecContext.byIndexMasked` で右を引く                             |
 | `ExecContext.*`                                | スキャン結果を `Op` として受け取る（snapshot は生成時に固定）                 |
 
 `DISTINCT` は `ValueCodec` で符号化したバイト列をキーにし、
@@ -741,24 +745,30 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
   `Visible`（snapshot の SeqNo）は Op を作るときに 1回だけ決まる。
   `Txn` は read-your-writes のために読み取りに適用する transaction。
   `Scope` はクエリ中に開いた走査の台帳で、早期終了・エラーでも `Engine` が `DisposeAll` する。
-- `ExecContext.table` = `Dml.scanByPrimaryKeyWithTxn`（`Dml.fs` の DML ヘルパ。主キー順の全走査）。
-  `ExecContext.byPrimaryKey` = `Dml.getByPrimaryKeyWithTxn`（ポイント検索、無ければ空 Op）。
-  `ExecContext.byIndex` = `Dml.scanByIndexPrefixWithTxn`（索引の prefix 走査。非一意索引でも全行を返す）。
-  `rangeScan` / `byIndexRange` もそれぞれ `Dml.scanByPrimaryKeyRangeWithTxn` / `Dml.scanByIndexRangeWithTxn` を使う。
+- `ExecContext.tableMasked` = `Dml.scanByPrimaryKeyWithTxnMask`
+  （値不要時は `scanByPrimaryKeyWithTxnValues`。`Dml.fs` の DML ヘルパ。主キー順の全走査）。
+  `ExecContext.byPrimaryKeyMasked` = `Dml.getByPrimaryKeyWithTxnMask`
+  （ポイント検索、無ければ空 Op）。
+  `ExecContext.byIndexMasked` = `Dml.scanByIndexPrefixWithTxnMask`
+  （索引の prefix 走査。非一意索引でも全行を返す）。
+  `rangeScanMasked` / `byIndexRangeMasked` もそれぞれ `Dml.scanByPrimaryKeyRangeWithTxnMask` / `Dml.scanByIndexRangeWithTxnMask` を使う。
 - **スキャンは遅延の `Op` として受け取る**（1行ずつ引くまでストレージを読まない）。
   `Optimizer` は `Limit` の件数ヒント（`OFFSET + LIMIT`）を `Project` だけ通して `Scan` へ降ろす。
-  `ExecContext.table` / `rangeScan` / `byIndex` / `byIndexRange` はこれを `Dml` → `RowStore` → `StorageEngine.scanAt` まで渡す。
-  `Filter` / `Sort` / `Aggregate` / `Distinct` / `Join` は行数を変える（または順序を作る）ため、ヒントを下位へ伝播させない。
+  `ExecContext.tableMasked` / `rangeScanMasked` / `byIndexMasked` / `byIndexRangeMasked` は
+  これを `Dml` → `RowStore` → `StorageEngine.scanAtValues` / `scanAtMasked`（内部は `scanAtWith`）まで渡す。
+  `Filter` / `Sort` / `Aggregate` / `Distinct` / `Join` は行数を変える（または順序を作る）ため、
+  ヒントを下位へ伝播させない。
   ただし `ORDER BY` が主キー全列の昇順で走査が主キー順のときは `Sort` ノード自体を作らないので、
   `ORDER BY 主キー LIMIT n` もヒントが降りる（上の「主キー順 ORDER BY」）。
-  limit > 0 の `scanAt` は必要なファイルだけを開いて先頭 limit 件を返す（§8.2）。
+  limit > 0 の `scanAtValues` / `scanAtMasked` は必要なファイルだけを開いて先頭 limit 件を返す（§8.2）。
 - **transaction のバッファ重ね当て（`Dml` 内部の `overlayRows`）もストリーミング**。
   store の行と txn のスロットはどちらもキー昇順なので、突き合わせながら 1行ずつ合成する
   （従来は store の全行を配列化してから再ソートしていた）。
 
 #### 集約・ソート・射影の内部
 
-- 集約（`Ops.aggregate`）は全行を読み、グループキー → 行リストの表を作って**最初に現れた順**に 1行ずつ返す。
+- 集約（`Ops.aggregate`）は全行を読み、グループキー → アキュムレータの表を作って**最初に現れた順**に 1行ずつ返す
+  （入力行は保持しない）。
   出力は「GROUP BY の値 + 各集約の結果」の並び。
 - `SUM` / `AVG` は `decimal` で累積する（`REAL` 混在時は `double`）。
   `COUNT(列)` は NULL を数えず、`COUNT(*)` は数える。
@@ -854,7 +864,7 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
 
 - 比較はオペランドに NULL があると `NULL`（UNKNOWN）を返す。
   `AND` は左が `FALSE` なら右を評価せず `FALSE`、`OR` は左が `TRUE` なら右を評価せず `TRUE`（短絡評価）。
-- `WHERE` / `HAVING` は UNKNOWN を**偽**として扱う（`Eval.matches`）。
+- `WHERE` / `HAVING` は UNKNOWN を**偽**として扱う（`Eval.matchesWith`）。
 - `BETWEEN` は `>=` と `<=` の AND として 3値論理で評価する。
 - `IN` は「一致する要素があれば TRUE、
   一致せず NULL（UNKNOWN）を 1 つでも見れば UNKNOWN、それ以外は FALSE」。
@@ -867,8 +877,8 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
 - 型決定: `INTEGER` x `INTEGER` → `INTEGER`、`DECIMAL` x `DECIMAL` → `DECIMAL`、片方が `REAL` なら `REAL`。
 - `||`（`Concat`）は両辺の表示文字列を連結する（NULL は NULL）。
 - `LIKE` は `%` / `_` の手書き照合
-  （大文字小文字は区別。`LIKE ... ESCAPE '文字'` に対応し、エスケープ文字は 1文字。
-  エスケープ文字の直後の `%` / `_` / 自身はリテラルになり、末尾のエスケープは `TypeError`。
+  （大文字小文字は区別。`_` と `ESCAPE` の文字は Unicode コードポイント 1個で、サロゲートペアも 1文字。
+  `LIKE ... ESCAPE '文字'` に対応し、エスケープ文字の直後の `%` / `_` / 自身はリテラルになり、末尾のエスケープは `TypeError`。
   バックトラックしない 1パスの照合なので、`%` が多いパターンでも無限ループしない）。
 - スカラー関数は `UPPER` / `LOWER` / `LENGTH` / `ABS` / `COALESCE` / `TRIM` / `ROUND`。
   未知の関数・引数個数の不一致はエラー（`ROUND` は `INTEGER` / `REAL` / `DECIMAL` に対応）。
@@ -965,7 +975,8 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
 
 > snapshot とは「SeqNo が S 以下の書き込みだけ見える」こと。
 
-実装では `StorageEngine.getAt` / `scanAt` に `visible: uint64 option` を渡し、SeqNo フィルタ 1つで絞り込む。
+実装では `StorageEngine.getAtMasked` / `scanAtWith` に `visible: uint64 option` を渡し、
+SeqNo フィルタ 1つで絞り込む。
 永続データ構造の versioning は使わない。
 
 `visible = None` が「制限なし」を表す。
@@ -1174,9 +1185,10 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 ゲートは root（正規化した絶対パス）単位の `ReaderWriterLockSlim` で、
 同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
 ロックはプロセス内の表に残る（開いた DB の数だけ。数はふつう小さい）。
-**トランザクションを commit / rollback せずに捨てても、ハンドルへの参照が切れて GC されれば登録は外れる**
+**internal の `Database` ハンドル経由の登録は、参照が切れて GC されれば外れる**
 （`RegistrationLease` の finalizer。§7.5）。
-ただし GC の時期は不定なので、`Rollback()` / `Close()`（または `use` による `Dispose()`）で確実に終わらせること。
+公開 `Session` の登録は `SessionState.Registration` が保持するだけで finalizer が無いため、
+`Session` を捨てる前に `Rollback()` / `Close()`（または `use` による `Dispose()`）で確実に終わらせること。
 ハンドルへの参照が残っている間は、その root の DDL は `ConflictError` のまま。
 
 ### 7.9 プロセス間の排他（`.rykdb.format`）
@@ -1212,9 +1224,9 @@ WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つの�
 
 `StorageEngine` が **LSM ツリー 1本**を公開する層。
 `RowStore` は `IStorageEngine`（`NextSeqNo` / `ActiveSnapshot` / `HostState` /
-`WalState` / `GetAt` / `ScanAt` / `WriteBatch` / `WriteBatchDeferred` /
-`WithNextSeqNo` / `WithActiveSnapshot` / `WithHostState` / `FlushIfNeeded` /
-`MaybeFlush` / `Close`）越しに扱う。
+`WalState` / `GetAtMasked` / `ScanAtValues` / `ScanAtMasked` / `WriteBatch` /
+`WriteBatchDeferred` / `WithNextSeqNo` / `WithActiveSnapshot` / `WithHostState` /
+`FlushIfNeeded` / `MaybeFlush` / `Close`）越しに扱う。
 テストではこれをメモリ実装に差し替え、ディスク I/O なしで上位層を検証する。
 
 | 既定値                        | 値                        |
@@ -1286,17 +1298,17 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 
 定数と実装の要点:
 
-| 項目                     | 値・内容                                                                                                                                                               |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ブロックのエントリ数     | `EntriesPerBlock = 128`                                                                                                                                                |
-| チェックサム             | **CRC32C**（Castagnoli、slicing-by-8）                                                                                                                                 |
-| ブロックのチェックサム   | 各ブロック末尾に 4バイト（ブロック本体が対象）                                                                                                                         |
-| メタデータのチェックサム | Meta / Bloom / Index の連続した全バイトを `metadataChecksum` で検証する                                                                                                |
-| Footer のチェックサム    | Footer 先頭 80バイト（`magic`〜`metadataChecksum`）を対象。部分読みでも検証する                                                                                        |
-| Footer                   | `magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8) bloomOff(8) bloomLen(8) metaOff(8) metaLen(8) entryCount(8) metadataChecksum(4) footerChecksum(4)` = 84バイト |
-| `maxSeqNo`               | ファイル内の最大 SeqNo。open 時の NextSeqNo 復元と GC の参考に使う（GC の判定はエントリ単位。§8.6）                                                                    |
-| Bloom filter             | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。ビット列は packed（1ビット = 1ビット）。読む側は `BloomFilter.mightContain`         |
-| ポイント検索の順路       | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロックだけ（`next` を呼ぶまでブロックを読まない）                                                            |
+| 項目                     | 値・内容                                                                                                                                                                  |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ブロックのエントリ数     | `EntriesPerBlock = 128`                                                                                                                                                   |
+| チェックサム             | **CRC32C**（Castagnoli、slicing-by-8）                                                                                                                                    |
+| ブロックのチェックサム   | 各ブロック末尾に 4バイト（ブロック本体が対象）                                                                                                                            |
+| メタデータのチェックサム | Meta / Bloom / Index の連続した全バイトを `metadataChecksum` で検証する                                                                                                   |
+| Footer のチェックサム    | Footer 先頭 80バイト（`magic`〜`metadataChecksum`）を対象。部分読みでも検証する                                                                                           |
+| Footer                   | `magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8) bloomOff(8) bloomLen(8) metaOff(8) metaLen(8) entryCount(8) metadataChecksum(4) footerChecksum(4)` = 84バイト    |
+| `maxSeqNo`               | ファイル内の最大 SeqNo。open 時の NextSeqNo 復元に使う（GC の判定はエントリ単位。§8.6）                                                                                   |
+| Bloom filter             | 件数と誤検出率から m と k を決める double hashing（`h1 + i × step`、step は奇数）。ビット列は packed（1ビット = 1ビット）。読む側は `BloomFilter.mightContain`            |
+| ポイント検索の順路       | Bloom filter → index block（`LastKey` の二分探索）→ 該当ブロック（可視版がブロック末尾に無い場合は同じキーが続く次のブロックも読む。`next` を呼ぶまでブロックを読まない） |
 
 ファイルは `Sstable.writeTo` が v6 形式をブロック単位でストリームへ書き出す
 （テストの `buildSstable` は `MemoryStream` 経由で同じ処理を呼ぶ）。
@@ -1313,7 +1325,8 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
   `openPartial` は Footer/meta/Bloom/index を **1回の open** で読み、
   `rangeScanPartial` は最大 **8ブロック**を 1回の open でまとめて読む
   （バッチ内の不要なブロックは解析・検証しない）。
-  `lookup` は 1ブロックだけ読む。
+  `lookup` は通常は該当ブロック 1個だけを読むが、同じキーの可視版がブロック末尾に無い場合は、
+  同じキーの古い版が続く次のブロックも読む。
 - **compaction は `rangeScanPartialRaw`**: 値を復号せず、
   ブロックバッファへの `RawSstValue`（削除タグ + 値本体のスライス）として渡す。
   compaction はキー・SeqNo・削除タグしか見ないので、
@@ -1341,13 +1354,13 @@ Footer は `metadataChecksum`（Meta / Bloom / Index）と自身のチェック�
 WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
 起動時に SSTable のデータブロックを読まない。
 
-`scanAt` は未オープンのファイルを「返し得る最小キー」の昇順キューに持ち、
+`scanAtValues` / `scanAtMasked`（内部は `scanAtWith`）は未オープンのファイルを「返し得る最小キー」の昇順キューに持ち、
 ヒープの最小キー以下になった時点で 1ファイルずつ開く（部分読み）。
 開く順序を守らないとキー順が崩れるため、`limit` の有無にかかわらず必要になったら必ず開く。
 ヒープは最初に 1回だけ組み、以降は「取り出したソースの続きを積み直す」だけなので、
 1行あたりのコストは O(log ファイル数)（行ごとにソース列から作り直さない）。
 
-`scanAt` の戻り値は **`SstScan`（`next` を呼ぶまでブロックを 1個も読まない pull）**。
+`scanAtValues` / `scanAtMasked` の戻り値は **`SstScan`（`next` を呼ぶまでブロックを 1個も読まない pull）**。
 `limit > 0` は可視・最新・非 tombstone のエントリを `limit` 件出力した時点で終端になる
 （未オープンのファイルの下限は最後に返したキーより大きいので、先頭 `limit` 件には寄与しない）。
 `limit <= 0`（全件走査）も同じ pull で、必要になったファイル・ブロックだけを順に開く。
@@ -1357,9 +1370,10 @@ WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
 
 クエリ中に開いたスキャンは `ScanScope` に登録し、
 `Engine.runSelect` / `runDml` が `finally` で `DisposeAll` する。
-登録は `RowStore.scanAtRaw` が `StorageEngine.scanAt` の直後に行う。
-`RowStore.scanWithinPrefix` のような `SstScan(fun () -> ...)` ラッパーは `Dispose` を伝播しないため、
-外側で包むだけでは早期終了時にファイルを閉じられない。
+登録は `RowStore.scanAtRawValues` / `scanAtRawMasked` が `StorageEngine.ScanAtValues` / `ScanAtMasked` の直後に `SstScan.scoped` で行う。
+`RowStore.scanWithinPrefix` は `SstScan.ofStepWithClose` で包み、`Dispose` を下流の走査へ伝播する
+（回帰テストは `SstScanTests: ScanScope: 早期終了しても登録した走査を閉じられる` /
+`SstScanTests: ScanScope: 最後まで読むと登録が外れる`）。
 
 走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
 `rangeScanPartial` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ
@@ -1390,12 +1404,14 @@ WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
 
 `pickCompaction` は L0 のファイル数が `L0CompactionTrigger` 以上なら L0 を、
 L1 以降は「そのレベルの総バイト数 > 上限」の最初のレベル L を選び、出力先を L+1 にする。
-実際の入力は `Compaction.compact` 内の `selectInputs` が、レベル L の先頭 `MaxInputFiles = 32` ファイルを seed とし、
+実際の入力は `Compaction.compactWith` 内の `selectInputs` が、
+レベル L の先頭 `MaxInputFiles = 32` ファイルを seed とし、
 L と L+1 のキー域が重なるファイルを閉包が取れるまで追加して確定する
 （`MaxInputFiles` は seed の目安で、閉包が 32 を超えることがある）。
 これにより出力のキー域は入力外のファイルと重ならず、最下位での tombstone 削除も安全になる。
 出力ファイルは件数ではなく `OutputFileTargetBytes`（既定 4MiB）を目標に、**キーの切れ目**で分ける
-（`Compaction.compact` 内の `pump`。概算バイトなので厳密なサイズではない。1つのキーの版が複数ファイルに跨らない）。
+（`Compaction.compactWith` 内の `pump`。
+概算バイトなので厳密なサイズではない。1つのキーの版が複数ファイルに跨らない）。
 ポイント検索のファイル順は「新しいレベルのほうが先（L0 が最新）、同レベルではファイル番号の降順」（`filesForPointLookup`）。
 
 ### 8.4 Manifest — 唯一 atomic 更新を要するファイル
@@ -1479,7 +1495,7 @@ L1〜 … 1ファイル = 1キー域で互いに重ならない（RocksDB/LevelD
 
 1回の compaction:
 
-1. 過剰レベル `L` を選ぶ（`Compaction.compact` 内の `pickCompaction`）
+1. 過剰レベル `L` を選ぶ（`Compaction.compactWith` 内の `pickCompaction`）
 2. `L` の先頭から最大 `MaxInputFiles`（32）件を種にし、
    `L` と `L+1` でキー域が重なるファイルを閉包で追加して**入力**にする
    （`L` に 32件を超えるファイルがある場合、種にするのは先頭 32件）
@@ -1497,8 +1513,10 @@ L1〜 … 1ファイル = 1キー域で互いに重ならない（RocksDB/LevelD
 メモリ使用量は「ファイルごとの現在のブロック（部分読みは最大 8ブロックずつ）+ 現在の出力ファイル 1本」に比例し、
 **入力全体のサイズには比例しない**。
 入力はファイル単位で開くため、同時に開くスキャナの数は入力ファイル数と同じになる（通常は初期選択の `MaxInputFiles` 以下だが、キー域の重なりを閉包として追加すると超えうる）。
-途中で読み取りエラーになると書きかけの出力ファイルが残るが、
-MANIFEST に載らないので孤児として退避される（gotchas §11.13）。
+途中で読み取り・書き込みエラーになると、それまでに作った出力ファイルは
+`Compaction.compactWith` 内の `pump` が `deleteOutputs` で削除する。
+プロセスがクラッシュした場合などに残った出力だけが MANIFEST に載らず、
+次回オープン時に孤児として `.orphans/` へ退避される（gotchas §11.13）。
 
 GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判定は**しない**
 （snapshot S の読み手は `SeqNo <= S` の版を見るので、**SeqNo が小さい版こそ**まだ読まれ得る）。
@@ -1516,8 +1534,8 @@ GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判
 ファイル単位の回収は「**Version が参照していないファイル**」だけ。
 （`quarantineOrphans`: MANIFEST 反映前にクラッシュして残ったファイルは削除せず、`<root>/.orphans/` へ退避する。
 MANIFEST の読み落としで消してしまう事故を避けるため）。
-`FileMetaData.MaxSeqNo` は書き込み時に記録し、open 時の NextSeqNo 復元と GC の参考に使う
-（削除の根拠にはしない）。
+`FileMetaData.MaxSeqNo` は書き込み時に記録し、open 時の NextSeqNo 復元に使う
+（GC の判定はエントリ単位で行い、ファイル単位の SeqNo では削除しない）。
 
 > **`VACUUM` は不要**。スペース回収はコンパクション時の自動 GC が行う。
 
@@ -1552,9 +1570,10 @@ L0 が増えて読み取りのコスト（read amplification）と引き換え�
 
 **構成**
 
-- `EngineHost` が MANIFEST に反映済みの `HostState`（Version / ManifestNumber /
-  NextFileNumber / ActiveSnapshot / LastCompactionError / Generation）を
-  `ConcurrentDictionary` の単一セル + `TryUpdate` の末尾再帰 CAS で保持する。
+- `EngineHost` が MANIFEST に反映済みの `HostState`
+  （`Version` / `ManifestNumber` / `ActiveSnapshot` / `LastCompactionError` / `Generation`。
+  ファイル番号は `Version.NextFileNumber`）
+  を `ConcurrentDictionary` の単一セル + `TryUpdate` の末尾再帰 CAS で保持する。
 - **MANIFEST 追記と install は installGate で直列化**する。
   flush も worker install も同じ gate の内側で `Manifest.logAndApply` を呼ぶ。
   ファイル番号は host の `ConcurrentDictionary` カウンタを `TryUpdate` の CAS で進めて確保する
@@ -1746,7 +1765,7 @@ ok (session.Close())
 ```
 
 > **重要**: 接続の入口として公開するのは `Session`（1接続）と `SessionPool`（接続の供給）。
-> 公開型にはこのほか `SessionOptions` / `RowReader` / `SessionTransactionChange` がある。
+> 公開型にはこのほか `SessionOptions` / `RowReader` がある。
 > `Database` は internal の不変ハンドルで、committed な状態は `DatabaseHost` が保持し、
 > `Session` は実行のたびに「最新の committed state + 接続ローカルの transaction」を作って使う（§7.6）。
 
@@ -1891,7 +1910,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 #### 12.2.2 読み取り・破損検出
 
-- **`scanAt` は遅延読みのため、`LIMIT` で到達しない後続ファイルの破損・欠落は検出しない**（§8.2）。
+- **`scanAtValues` / `scanAtMasked` は遅延読みのため、`LIMIT` で到達しない後続ファイルの破損・欠落は検出しない**（§8.2）。
 - **全体チェックサムは持たない**。
   Footer と実際に読んだブロックだけを検証し、読まなかったブロックは検証されない（§8.2）。
 - **最終結果は配列化する**ため、結果セット全体がメモリに載る
@@ -1923,7 +1942,8 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   2回目の `Session.OpenWith` は `IoError`。
   別プロセスが開いていても `IoError`。
   クラッシュ再現テストに限り、`RowStore.openStoreTakingOver` と `Database.OpenWithStore` で例外的に二重に開く。
-- **commit / rollback / `Close()` されずに参照が残った transaction は、GC されるまでその root の DDL を `ConflictError` にする**（§7.8）。
+- **internal の `Database` ハンドル経由の transaction は、commit / rollback / `Close()` されずに参照が切れて GC されるまでその root の DDL を `ConflictError` にする**（§7.8）。
+  公開 `Session` の登録は finalizer が無いため、`Rollback()` / `Close()` で確実に終わらせること。
 - **明示 transaction の状態はプロセス内のみ**。
   共有の `TransactionManager` は `DatabaseHost` が、
   接続ローカルの `Active` / `Pending` / `Registration` は各 `Session` が保持する。

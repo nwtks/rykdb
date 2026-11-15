@@ -371,8 +371,9 @@ module internal SqlValue =
         loop 0 0
 
     /// 値どうしの比較。
-    /// NULL は比較不能として例外を投げる。
-    /// NaN は NaN と等しく、かつ他のすべての数値より大きいものとして扱う。
+    /// NULL は比較不能として `DbError.typeError` を返す。
+    /// NaN は NaN と等しく、Real 同士では他のすべての値より大きいものとして扱う
+    /// （Int / Decimal との比較は型エラー）。
     let compareValues (a: SqlValue) (b: SqlValue) =
         let decimalOf =
             function

@@ -499,7 +499,7 @@ module internal Expr =
 
     /// 式中のすべての列参照を列挙する。
     /// 束縛と空き列判定に使う。
-    /// 末尾再帰の明示スタック走査（ColumnRefs の既存の挙動を維持）。
+    /// 末尾再帰の明示スタック走査（`Expr.columnRefs` の既存の挙動を維持）。
     let columnRefs =
         fold
             (fun acc e ->

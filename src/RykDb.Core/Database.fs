@@ -31,8 +31,9 @@ type internal Database(root: string, state: DbState, ownsStore: bool) =
     /// `Execute` / `Begin` / `Commit` は新しいハンドルを返すので、
     /// 新しいハンドルを作るたびに所有者を置き換える。
     /// 古いハンドルの Close で、生きている新しいハンドルのロックを外さないため。
-    /// 共有ストア用のハンドル（`ownsStore = false`）は **所有者にならない**。
-    /// 接続ごとの `Session` が作るハンドルが、DB 全体のロック所有者を奪わないようにするため
+    /// `ownsStore = false` のハンドルは **所有者にならない**。
+    /// ただし現在の生成箇所はすべて `true` で、
+    /// 接続ごとの共有は`Session` の `ownsHost = false` で行う
     /// （所有者を奪うと、最後に Close すべきホストが no-op になり DB が閉じられなくなる）。
     let storeLeaseToken =
         if ownsStore then

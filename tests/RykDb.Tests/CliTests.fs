@@ -4,7 +4,6 @@
 
 module RykDb.CliTests
 
-open System.IO
 open Xunit
 open RykDb.Core
 open RykDb.Cli
@@ -14,10 +13,10 @@ let private lines (text: string) =
     text.Replace("\r\n", "\n").TrimEnd('\n').Split '\n' |> Array.toList
 
 [<Fact>]
-let ``Cli: ファイル実行の SELECT を逐次表示する`` () =
+let ``CLI: ファイル実行の SELECT を逐次表示する`` () =
     withDir "cli-file-stream" (fun dir ->
         use session = ok (Session.OpenWith dir)
-        use out = new StringWriter()
+        use out = new System.IO.StringWriter()
 
         let script =
             """
@@ -36,7 +35,7 @@ SELECT id, v FROM t ORDER BY id;
         ))
 
 [<Fact>]
-let ``Cli: ファイル実行の SELECT は SessionOptions の結果上限を適用しない`` () =
+let ``CLI: ファイル実行の SELECT は SessionOptions の結果上限を適用しない`` () =
     let options =
         { SessionOptions.Default with
             MaxResultRows = 1L
@@ -45,7 +44,7 @@ let ``Cli: ファイル実行の SELECT は SessionOptions の結果上限を適
 
     withDir "cli-file-stream-limit" (fun dir ->
         use session = ok (Session.OpenWith(dir, options))
-        use out = new StringWriter()
+        use out = new System.IO.StringWriter()
 
         let script =
             """
@@ -61,10 +60,10 @@ SELECT id FROM t ORDER BY id;
         Assert.Equal<string list>([ "(0 rows)"; "(3 rows)"; "id"; "--"; "  1"; "  2"; "  3" ], lines (out.ToString())))
 
 [<Fact>]
-let ``Cli: SELECT の途中エラーで停止し、後続の文を実行しない`` () =
+let ``CLI: SELECT の途中エラーで停止し、後続の文を実行しない`` () =
     withDir "cli-file-stream-error" (fun dir ->
         use session = ok (Session.OpenWith dir)
-        use out = new StringWriter()
+        use out = new System.IO.StringWriter()
 
         let script =
             """

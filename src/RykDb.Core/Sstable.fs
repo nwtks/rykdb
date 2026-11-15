@@ -128,13 +128,15 @@ module internal Sstable =
     // footerChecksum は先頭 80バイト（metadataChecksum を含む）のチェックサム。
     // 部分読みではこのフッターだけを検証できる。
     //
-    // 全体 checksum は持たない。データブロックはそれぞれ末尾のチェックサムで守られ、
-    // meta / Bloom / index は metadataChecksum、Footer は footerChecksum で守られる。
+    // 全体 checksum は持たない。
+    // データブロックはそれぞれ末尾のチェックサムで守られ、
+    // meta / Bloom / index は metadataChecksum、
+    // Footer は footerChecksum で守られる。
     // 部分読みでは読まなかったブロックを検証できないが、全体 checksum があっても同じだった。
     //
-    // maxSeqNo は GC のために必要。
-    // 「最古の snapshot から見えない版」の判定に使う
-    // （LevelDB の smallestSnapshot と同じ考え方）。
+    // maxSeqNo は起動時の NextSeqNo 復元のために必要。
+    // ファイル内の最大 SeqNo を保存する
+    //（GC は版ごとの SeqNo と active snapshot で判定する）。
 
     let private encodeFooter
         (maxSeqNo: uint64)

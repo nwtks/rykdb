@@ -1906,8 +1906,6 @@ module internal Plan =
     /// planner に渡す必要があり `let rec` にしている。
     /// 実際の再帰呼び出しは `Run` の末尾位置（`Result.bind` の継続）で起きるので、
     /// 外側行が増えてもフレームは積み上がらない。
-    /// TailAudit は「関数値を引数として渡す形」を保守的に非末尾（`bare`）と数えるため、
-    /// ベースラインに 1 件だけ登録している（`StorageEngine.scanAt` の `pull` と同じ既知パターン）。
     /// </remarks>
     let rec private runSubquery
         (outer: OuterScope list)

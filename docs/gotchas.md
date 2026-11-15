@@ -353,7 +353,7 @@ let fromMem =
 > （`startKey` 以降を 1件ずつ返す）。
 > それでも `getVisible` のほうが軽い（列挙子も `Result` も作らず、O(log n) で直接引く）ので方針は不変。
 
-### 4.2 `scanAt` の `startKey` が SSTable に効いていない（**再オープン後にだけ表面化する**）
+### 4.2 `scanAtWith` の `startKey` が SSTable に効いていない（**再オープン後にだけ表面化する**）
 
 ```fsharp
 // ❌ 枝刈りだけして、中身は全件 merge している
@@ -373,24 +373,24 @@ let files =
 //     Memtable.rangeScan は木を途中から降りる。
 let merged = SstMerge.ofScans (Array.append [| memScan |] fileScans)
 // 可視性の判定と同一キーの最新版への畳み込みは、SstMerge から 1件ずつ取り出す
-// 側（StorageEngine.scanAt の isVisible）が行う。
+// 側（StorageEngine.scanAtWith の isVisible）が行う。
 // memtable も各ファイルも startKey 以降しか返さないので、merge 後の絞り込みは不要
 ```
 
 教訓: **「ファイルを選ぶ枝刈り」と「中身の下限」は別物。両方が必要**。
 中身の下限はいま `Memtable.rangeScan` / `Sstable.rangeScanPartial` が持っているので、
-`scanAt` 側で絞り直さない
+`scanAtWith` 側で絞り直さない
 （絞り直すと、下限が効かなくなった退行に気付けなくなる）。
 
 ### 4.3 prefix 検索では先頭の 1件が答えとは限らない
 
 ```fsharp
-// ❌ scanAt の先頭が接頭辞と一致しないことがある
-RowStore.scanAt ks prefix 0 visible store
+// ❌ 走査の先頭が接頭辞と一致しないことがある
+RowStore.scanAtRawValues ks prefix 0 visible None true store
 |> Result.map (fun scan -> SstScan.next scan)
 
 // ✅ 接頭辞が一致するか確かめてから取り出す
-RowStore.scanAt ks prefix 0 visible store
+RowStore.scanAtRawValues ks prefix 0 visible None true store
 |> Result.bind (fun scan ->
     SstScan.next scan
     |> Result.map (fun head ->
@@ -413,7 +413,7 @@ compaction で L1+ に降ろしたデータが一切見つからなくなった�
 
 ```fsharp
 // ❌ L0 しか見ていない
-// ✅ 全レベルを走査し (level, fileNumber) の降順で並べる
+// ✅ 全レベルを走査し、L0 を先頭にレベル昇順（`-level` の降順）、同レベルはファイル番号の降順で並べる
 Array.mapi (fun level files -> ...)
 ```
 
@@ -425,9 +425,9 @@ v5 で全体 checksum を削除して `metadataChecksum` を追加したとき�
 v6 でチェックサムを FNV-1a から CRC32C に変更した（Footer の長さは 84 のまま）。
 **放置すると Footer の開始位置がずれて、ファイル全体の読み取りが壊れる**。
 
-### 4.7 「状態を進めるヘルパー」は進んだ状態も返す（`scanAt` の無限ループ）
+### 4.7 「状態を進めるヘルパー」は進んだ状態も返す（`scanAtWith` の無限ループ）
 
-`scanAt` の k-way merge は、ヒープと「まだ開いていないファイル一覧（pending）」を持ち回る。
+`scanAtWith` の k-way merge は、ヒープと「まだ開いていないファイル一覧（pending）」を持ち回る。
 `prepare` がファイルを開いてヒープへ積むとき、**pending の残りも返さないと、
 呼び出し側は毎行同じファイルを開き直し、同じ先頭エントリを積み続けて終わらない**。
 
@@ -443,8 +443,8 @@ let rec prepare heap pending =
 症状は「SSTable だけの keyspace（Close 直後・再オープン直後）を読むと固まる」。
 memtable に 1件でもあると先へ進むため、テストが無いと気づきにくい。
 回帰テストは `StorageEngineTests` の
-`StorageEngine.scanAt: memtable が空でも SSTable だけを走査できる` /
-`StorageEngine.scanAt: 多数のファイルをキー昇順にマージする`。
+`StorageEngine.scanAtMasked: memtable が空でも SSTable だけを走査できる` /
+`StorageEngine.scanAtValues: 多数のファイルをキー昇順にマージする`。
 
 ---
 
@@ -495,7 +495,8 @@ let obsolete = Version.allFiles version
 - 最新版が `activeSnapshot` 以下なら、最新版自身が全 snapshot から見えるのでそれより古い版は全て捨てる
   （compaction の GC にある `keepOlder`）。
 - 最下位レベルでも、**同じキーの古い版が残るなら tombstone は消さない**。
-  消すと下位の古い値が復活する（`Compaction.gc` は `older.IsEmpty` のときだけ削除する）。
+  消すと下位の古い値が復活する
+  （`Compaction.gcGroup` は `dropTombstones` が真で、GC 後に残す古い版が無い（`keptOlder` が空）ときだけ tombstone を捨てる）。
 - **ファイル単位の回収は SeqNo で判定しない**。
   LevelDB と同じ「Version が参照していないファイル」だけ
   （`quarantineOrphans` が `.orphans/` へ退避する。削除はしない）。
@@ -582,7 +583,7 @@ let found =
 ### 6.2 `Catalog.toSchema` は `Indexes = []` で埋まる
 
 索引を定義しても実行系の `TableSchema.Indexes` に載らないと、
-`ExecContext.byIndex` が「索引が無い」と言って検索に失敗する。
+`ExecContext.byIndexMasked` / `byIndexRangeMasked` が「索引が無い」と言って検索に失敗する。
 
 ```fsharp
 // ✅ contextOf で明示的に載せる
@@ -618,7 +619,7 @@ let! filled =
 
 ```fsharp
 // ✅ スキーマ・索引 schema・値・limit・visible・txn を渡す
-Dml.scanByIndexPrefixWithTxn store schema index values limit visible txn
+Dml.scanByIndexPrefixWithTxnMask store schema index values limit visible scope txn mask
 ```
 
 ---
@@ -775,7 +776,7 @@ let asInt (v: SqlValue) = match v with | SqlValue.Int n -> n | _ -> 0L
 
 ### 8.9 `take` 述語は「先頭から連続」で止まる
 
-`Dml.scanByIndexPrefixWithTxn` は `RowStore.scanAt` が返す pull を
+`Dml.scanByIndexPrefixWithTxnMask` は `RowStore.scanAtRawMasked` が返す pull を
 `opOfScan` の `take` 述語（`KeyBuilder.startsWithPrefix`）で読み進め、外れた時点で終端にする。
 **ファイル側の下限が効いていないと 1件目で止まり、0件になる**（§4.2 を参照）。
 
@@ -1330,7 +1331,7 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
 ### 11.8 keyspace 横断 commit は 1回の WAL バッチにする
 
 テーブルと索引は論理 keyspace が別だが、物理ツリーと WAL は DB 全体で 1本。
-`RowStore.commitToStoreWith`（内部の `writeBatchesWithSnapshot`）は
+`RowStore.commitToStoreWith`（内部の `writeBatchesWithSnapshotWith`）は
 全 keyspace のエントリに接頭辞を付けて **1つの `Entry array`** にまとめ、
 `StorageEngine.writeBatch` を 1回だけ呼ぶ。
 WAL には `Begin / Batch / Commit` が 1回の `Wal.append` で書かれるため、
@@ -1347,7 +1348,7 @@ WAL には `Begin / Batch / Commit` が 1回の `Wal.append` で書かれるた�
 
 ### 11.9 `ActiveSnapshot = 0` は「全版を残す」
 
-`Compaction.gc` は `ActiveSnapshot = 0` を「全版を残す」として扱う。
+`Compaction.gcGroup` は `ActiveSnapshot = 0` を「全版を残す」として扱う。
 0 を「最新版だけ残す」と解釈すると replay 中や境界未設定時に履歴を失う。
 replay 中や境界未設定時は 0 のままにし、通常の commit では
 `TransactionManager.activeSnapshot`（active の最小 snapshot、無ければ `LastCommitSeqNo + 1`）を設定する。
@@ -1377,15 +1378,19 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
 出力は `CompactionOptions.OutputFileTargetBytes`（既定 4MiB）と `SstEntry.approximateBytes` の
 概算バイトで分ける（厳密なファイルサイズではない）。
 
-- **1キー分の版が複数ファイルに跨らない**ように、キーグループの切れ目で切り替える（`Compaction.pump`）。
+- **1キー分の版が複数ファイルに跨らない**ように、キーグループの切れ目で切り替える
+  （`Compaction.compactWith` 内の `pump`）。
   1キー分が目標を超える場合は、そのキーだけで 1ファイルにする（空のファイルは作らない）。
 - 入力は `SstScan`（部分読みリーダー）+ `SstMerge` で 1件ずつ読み、
   出力中の 1ファイル分だけをメモリに持つ。入力全体は実体化しない。
 - 固定長の型の定数は `ValueCodec.fixedEncodedBytes` に集約し、
-  memtable の `Entry.approxBytes` と共有する
+  SSTable のファイルサイズ見積り（`ValueCodec.approximateBytes` / `SstEntry.approximateBytes`）と共有する。
+  memtable のメモリ見積りは `Entry.managedBytes`（`ValueCodec.managedBytes` / `managedRowBytes`）を使う
   （TEXT / BLOB だけは、memtable が安価な UTF-16 長、SSTable が UTF-8 実バイト数と方針が違う）。
-- 途中で読み取りエラーになると、書きかけの出力ファイルが残ることがある。
-  MANIFEST には載らないので、次回オープン時に孤児として `.orphans/` へ退避される（§11.13）。
+- 途中で読み取り・書き込みエラーになると、それまでに作った出力ファイルは
+  `Compaction.compactWith` 内の `pump` が `deleteOutputs` で削除する。
+  プロセスがクラッシュした場合などに残った出力だけが
+  MANIFEST に載らず、次回オープン時に孤児として `.orphans/` へ退避される（§11.13）。
 - 回帰テスト: `Compaction: 出力はエントリ数ではなく OutputFileTargetBytes ごとに分ける` /
   `Compaction: 同じキーの版は出力ファイルを跨がない` /
   `Compaction: 複数ブロックの入力をストリーミングで読み書きできる` /
@@ -1524,7 +1529,7 @@ DDL だけはプロセス内で排他にする必要がある。
 
 以前は開けなかったファイルを空と見なしていたため、
 壊れた SSTable があると `Ok` のまま行が欠けた（静かな誤答）。
-現在の `StorageEngine.scanAt` は pull（`SstScan`）を返し、
+現在の `StorageEngine.scanAtValues` / `scanAtMasked` は pull（`SstScan`）を返し、
 候補ファイルをキー下限順に必要になった時点で `prepare` で開き、
 開封・ブロック解析のエラーをその `next` が返す（§11.24）。
 全件走査でも必要になったファイルだけを開く（最初に一括では開かない）。
@@ -1536,7 +1541,7 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ファイル内容から値を復元するコンストラクタは例外を送出し得る。境界で検証して `CorruptionError` にする:
 
-- `Sstable.parseBlock`: `shared > prev.Length` を拒否。
+- `Sstable.parseBlockAt`: `shared > prev.Length` を拒否。
 - `Sstable.parseFooterBytes` / `validateFooter`: 未知バージョン、セクションの重なり・隙間・範囲外を拒否。
 - `ValueCodec`: DECIMAL の flags/scale（scale ≤ 28・予約ビット 0）、DATE / TIMESTAMP の範囲。
 - `VersionEdit`: レベルは `0..Levels.Max`。
@@ -1560,7 +1565,7 @@ DDL だけはプロセス内で排他にする必要がある。
 - キーはファイル世代ごとに増えるため、`put` がキー数 512 ごとに死んだ弱参照（GC 済み）を辞書から外す。
   生きた参照は実行中の走査が使うので残す。
   ファイル差し替え後の再読み込みは
-  `StorageEngine.getAt / scanAt: 必要なブロックだけを部分読みする` で確認する
+  `StorageEngine.getAtMasked / scanAtMasked: 必要なブロックだけを部分読みする` で確認する
   （弱参照の掃除自体の専用テストは無い）。
 - 欠落ファイルはキー計算（`FileInfo.Length`）の時点で IoError になる。
 
@@ -1577,8 +1582,8 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ### 11.24 limit 付き scan は後続の SSTable を開かない
 
-`StorageEngine.scanAt` は `limit > 0` のとき、**必要になったファイル・ブロックだけ**を開き、
-`limit` 件に達したら止まる。
+`StorageEngine.scanAtValues` / `scanAtMasked` は `limit > 0` のとき、
+**必要になったファイル・ブロックだけ**を開き、`limit` 件に達したら止まる。
 そのため、limit で到達しない後続 SSTable / ブロックの破損・欠落はそのクエリでは検出されない
 （全件走査でも必要になった時点で検出し、クエリは結果を返さない）。
 これは「先頭 limit 件に寄与しないデータは読まない」という最適化の副作用。
@@ -1609,12 +1614,13 @@ Footer は Meta / Bloom / Index の連続領域を守る `metadataChecksum` と�
 （ファイル全体を読む経路も、各ブロックとメタデータの検証で破損を検出する）。
 `SstPartial` は Footer / meta / Bloom / index だけを開き、
 データブロックは必要になったとき `FileStream` で読む。
-読んだブロックは `parseBlock` がチェックサムを検証する。
+読んだブロックは `parseBlockAt` がチェックサムを検証する。
 
 - 部分読みで読まなかったブロックの破損は、そのクエリでは検出されない。
 - テストでファイルを書き換えたら mtime を進める（§11.22）。
 - `SstPartial` の `rangeScanPartial` は最大 8ブロックを 1回の open で読み、解析は必要になったときだけ行う。
-  `lookup` は 1ブロックだけ読む。
+  `lookup` は通常は該当ブロック 1個だけを読むが、同じキーの可視版がブロック末尾に無い場合は、
+  同じキーの古い版が続く次のブロックも読む。
 
 ### 11.27 結合アルゴリズムの前提
 
@@ -2014,7 +2020,7 @@ Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列�
   （Parser も CPS なので深さ上限はない）。
 - 回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
   `パーサ: サブクエリ（スカラー / IN / EXISTS）` /
-  `Optimizer.buildLogical: FROM のサブクエリは Logical.Derived になる` /
+  `Optimizer.buildLogicalWith: FROM のサブクエリは Logical.Derived になる` /
   `Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`。
 
 ### 11.51 `maybeFlush` は WAL commit 後に Error を返さない（compaction 失敗で flush を巻き戻さない）
@@ -2033,7 +2039,7 @@ flush 成功・compaction 失敗のときに `Error` が返り、
   `LastCompactionError = Some e` を記録する。
 - WAL への書き込みが成功した時点で commit は成立している。
   ここで `Error` を返すと、呼び出し側が SeqNo を再利用し得る（§11.8）。
-  `RowStore.writeBatchesWithSnapshot` の `MaybeFlush` エラー握り潰しはこのための保険として残す。
+  `RowStore.writeBatchesWithSnapshotWith` の `MaybeFlush` エラー握り潰しはこのための保険として残す。
 - 回帰テスト: `StorageEngine.maybeFlush: compaction が失敗しても flush 後の engine を返す` /
   `RowStore: compaction 失敗後も flush 結果を保持し、再起動で commit を失わない`。
 
@@ -2065,11 +2071,10 @@ merge 中に foreground の flush や新しい transaction が入り得る。
 - **破棄したあとは GC 境界を下げて publish する**。
   境界を戻さないと、次のサイクルも同じ判定で破棄し続けて前進しない
   （古い transaction が開いている間、compaction が終わらない）。
-- **pin は「実際に読むハンドルの Version」に対して取る**。
-  書き込みを含む `Session.Execute` バッチで複数文を 1回の lease で囲むと、
-  途中の文の flush で Version が進んだあとの文が pin 外のファイルを読む
-  （書き込みバッチは文ごとに pin する）。
-  読み取りバッチは SELECT が state を変えないのでハンドルが変わらない。
+- **Version 全ファイルの pin を取るのは読み取りバッチだけ**（`Session.runRead` の `AcquireReadSnapshot`）。
+  書き込みを含むバッチは pin を取らず、`DatabaseHost.writeGate` の下で 1文ずつ実行する
+  （`Session.runExclusive`）。
+  読み取りバッチは SELECT が state を変えないのでハンドルが変わらず、
   入口で 1回 pin してバッチ全体をそのハンドルで実行してよい（§11.53 と同じ条件）。
 - **Idle 判定は単一の状態で行う**。
   busy と pending を別々に持つと、 worker が pending を消してから busy を立てる間や、
@@ -2239,13 +2244,13 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 
 ### 11.61 スキャン破棄はラッパーではなく発生源で台帳に登録する
 
-❌ `RowStore.scanAtRaw` が返した `SstScan` を外側から `SstScan.filter` などで包み、
-その `Dispose` だけに頼る。
-`RowStore.scanWithinPrefix` は `SstScan(fun () -> ...)` で包むが、
-この形は下流の `Dispose` を伝播しないため、`LIMIT` や結果上限で早期終了すると `FileStream` が残る
+❌ `RowStore.scanAtRawValues` / `scanAtRawMasked` が返した `SstScan` を外側から
+`SstScan.filter` などで包み、その `Dispose` だけに頼る。
+`RowStore.scanWithinPrefix` は `SstScan.ofStepWithClose` で包み、
+下流の `Dispose` を `rest` へ伝播するが、外側のラッパーが `Dispose` を呼ばなければ `FileStream` が残る
 （`SstScan.toArray` の最後まで読む経路だけは閉じられる）。
 
-✅ `StorageEngine.scanAt` の直後（`RowStore.scanAtRaw`）で
+✅ `StorageEngine.ScanAtValues` / `ScanAtMasked` の直後（`RowStore.scanAtRawValues` / `scanAtRawMasked`）で
 `SstScan.scoped scope scan` として `ScanScope` に登録する。
 `ScopedScan` は `next` のたびに最新の continuation を同じキーで登録し直し、
 終端・エラー・`Dispose` で登録を外して閉じる。
@@ -2255,8 +2260,7 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 - continuation の差し替え時に古い登録を Dispose しない。
   同じファイルハンドルを共有しており、最新の continuation を閉じれば足りる。
 - 回帰テスト: `SstScanTests: ScanScope: 早期終了しても登録した走査を閉じられる` /
-  `SstScanTests: ScanScope: 最後まで読むと登録が外れる` /
-  `RowStoreTests: RowStore.scanAtRaw: scope 指定時はラッパー越しでも走査を台帳に登録する`。
+  `SstScanTests: ScanScope: 最後まで読むと登録が外れる`。
 
 ### 11.62 RowReader は終端・Dispose で snapshot と走査を解放する
 
@@ -2294,7 +2298,9 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 
 ✅ 文を実行するたびに **最新の committed state に接続ローカルの transaction を重ねる**（`SessionState.apply`）。
 `Catalog` / `Active` / `Pending` / `Registration` だけをローカルに持ち、
-`Store` / `Catalog` / `Manager` は `DatabaseHost` の最新値を使う。
+`Store` / `Manager` は `DatabaseHost` の最新値を使い、
+`Catalog` は BEGIN 時点の接続ローカル値（`SessionState.Catalog`）を使う
+（transaction 中は DDL できないので変化しない）。
 可視性は `Transaction.Snapshot.SeqNo` で決まるので、Store を最新にしても repeatable read は崩れない。
 BEGIN / COMMIT / ROLLBACK と暗黙 transaction の DML / DDL は `DatabaseHost.writeGate` の下で行い、
 結果の committed 部分だけを publish する。
@@ -2309,9 +2315,11 @@ BEGIN / COMMIT / ROLLBACK と暗黙 transaction の DML / DDL は `DatabaseHost.
 ホストが `Close` しても「所有者ではない」と判定されて no-op になり、DB が閉じられない
 （WAL が削除されず、次の `OpenWith` も `IoError` になる）。
 
-✅ 共有ストア用のハンドルは `ownsStore = false` で作り、所有者にならない。
+✅ 共有ストア用の接続は `Session(host, options, ownsHost = false)` で作り、
+`Session.Close` は `host.Close()` を呼ばない。
 所有者は `Database.OpenWithBackground` が作った 1本だけで、
-`DatabaseHost.Close` が `owner.WithState(最新状態).Close()` で閉じる。
+`DatabaseHost.Close` が `owner.WithState(最新状態).Close()` で閉じる
+（`Database` は `ownsStore = false` では生成されない）。
 回帰テスト: `SessionPool: 接続を閉じるとその transaction だけ rollback される`（再オープンで確認）。
 
 ### 11.66 接続の Close は DB を閉じない（所有者だけが閉じる）
@@ -2353,7 +2361,8 @@ let leftSchema = { inSchema with Columns = inSchema.Columns |> Array.filter (fun
 
 ❌ 選択結果を読みながら同じ transaction へ積み、走査がその transaction を参照する。
 
-`Dml.scanByPrimaryKeyWithTxn` は transaction のバッファを `overlayRows` で重ねる。
+`Dml.scanByPrimaryKeyWithTxnMask`（または `scanByPrimaryKeyWithTxnValues`）は
+transaction のバッファを `overlayRows` で重ねる。
 `INSERT INTO t SELECT * FROM t` の走査が自分の書き込みを見ると**終わらない**
 （1行挿入するたびに次の行が現れる）。
 
@@ -2433,12 +2442,13 @@ B: COMMIT 成功              -- ← 重複したまま
 
 ### 11.71 行ごとの式評価では `Eval.resolver` を使い回す
 
-`Eval.matches` / `Eval.eval` は呼び出しごとに `ColumnResolver` を作る簡易版で、
+`Eval.eval` は呼び出しごとに `ColumnResolver` を作る簡易版で、
 行ごとに使うと `Schema.resolve` の線形探索と候補リストの割当が毎行発生する。
+`Eval.matches` という簡易版は無く、行ごとの述語評価は `Eval.matchesWith resolve row predicate` を使う。
 
 ```fsharp
 // ❌ 行ごとに resolver を捨てる（従来と同じコスト）
-Op.filter (fun row -> Eval.matches schema row predicate)
+Op.filter (fun row -> Eval.eval schema row predicate)
 
 // ✅ 1オペレータ分だけ作って使い回す
 let resolve = Eval.resolver schema

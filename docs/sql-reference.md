@@ -46,8 +46,8 @@ table_ref      ::= ident [ [AS] ident ]
 join_clause    ::= [INNER | LEFT [OUTER]] JOIN table_ref ON expr
 sort_key       ::= expr [ASC | DESC]
 
-insert         ::= INSERT INTO table_ref [ "(" column_list ")" ]
-                   (VALUES row {"," row} | DEFAULT VALUES | select)
+insert         ::= INSERT INTO table_ref ( DEFAULT VALUES
+                   | [ "(" column_list ")" ] (VALUES row {"," row} | select) )
 row            ::= "(" expr {"," expr} ")"
 update         ::= UPDATE table_ref SET assignment {"," assignment} [ WHERE expr ]
 delete         ::= DELETE FROM table_ref [ WHERE expr ]
@@ -57,7 +57,8 @@ ddl            ::= CREATE TABLE [IF NOT EXISTS] ident "(" table_element {"," tab
                 | DROP TABLE  [IF EXISTS] ident
                 | DROP INDEX  [IF EXISTS] ident
 table_element  ::= column_def | PRIMARY KEY "(" column_list ")" | UNIQUE "(" column_list ")"
-column_def     ::= ident [data_type [type_args]] [column_constraint {column_constraint}]
+column_def     ::= ident (data_type [type_args] [column_constraint {column_constraint}]
+                         | column_constraint {column_constraint})
 column_constraint ::= NOT NULL | PRIMARY KEY | UNIQUE | DEFAULT expr
 
 txn            ::= BEGIN [TRANSACTION] | START TRANSACTION
@@ -72,8 +73,8 @@ txn            ::= BEGIN [TRANSACTION] | START TRANSACTION
 
 文を複数書く場合は `;` で区切る（**区切りなしは `SyntaxError`**。末尾の `;` は省略可）。
 `Session.Execute` は複数文を順に実行する。
-`SELECT` が 1 つだけならその結果を返し、複数（または 0 個）なら `RowsAffected` の合計だけを返す
-（`Columns` / `Rows` は空）。
+結果を返す文（`SELECT` / `EXPLAIN`）が 1つだけならその結果を返し、複数（または 0個）なら
+`RowsAffected` の合計だけを返す（`Columns` / `Rows` は空）。
 
 ---
 
@@ -137,10 +138,24 @@ THEN    ELSE    END      EXISTS  IF      TRUE    FALSE
 ### バイナリリテラル
 
 ```sql
-X'0A1B'       -- 大文字の 16進のみ。バイト数は偶数
+X'0A1B'       -- 16進は大文字・小文字どちらでもよい（接頭辞も x / X）。バイト数は偶数
+X'0a1b'
 ```
 
 奇数長・16進以外の文字が含まれる場合は構文エラーになる。
+
+### 文字の単位
+
+SQL が「1文字」として数える単位は **Unicode コードポイント**。
+.NET の `string.Length` が数える UTF-16 コード単位ではない。
+
+- `LENGTH` の文字数
+- `LIKE` の `_`（1 コードポイントに一致）
+- `LIKE ... ESCAPE '文字'` のエスケープ文字（1 コードポイントで指定）
+
+サロゲートペア（絵文字など BMP 外の文字）は 1文字として数える。
+結合文字（基底文字 + 結合マーク）はコードポイントごとに数えるため、
+見た目の 1文字が複数になることがある。
 
 ### 式の入れ子
 
@@ -178,17 +193,17 @@ X'0A1B'       -- 大文字の 16進のみ。バイト数は偶数
 `INSERT` / `UPDATE` では、値を列の型に合わせて自動変換する。
 変換できない場合は `TypeError` になる。
 
-| 目標型      | 受け付ける値                                                            |
-| ----------- | ----------------------------------------------------------------------- |
-| `INTEGER`   | `INTEGER` / `BOOLEAN`(0,1) / 小数部が 0 の `REAL`・`DECIMAL`            |
-| `REAL`      | `REAL` / `INTEGER` / `BOOLEAN` / `DECIMAL`                              |
-| `DECIMAL`   | `DECIMAL` / `INTEGER` / `REAL` / `BOOLEAN`（`NaN`・`±Infinity` は不可） |
-| `BOOLEAN`   | `BOOLEAN` / 0・1 の `INTEGER`・`REAL`                                   |
-| `TEXT`      | **すべて**（`SqlLiteral.toSqlLiteral` の文字列表現になる）              |
-| `BLOB`      | `BLOB` / `TEXT`（UTF-8 エンコード）                                     |
-| `DATE`      | `DATE` / `TIMESTAMP` / `yyyy-MM-dd` 形式の `TEXT`                       |
-| `TIMESTAMP` | `TIMESTAMP` / `DATE` / `DateTimeOffset` が解析できる `TEXT`             |
-| `UUID`      | `UUID` / `Guid.TryParse` が通る `TEXT`                                  |
+| 目標型      | 受け付ける値                                                                           |
+| ----------- | -------------------------------------------------------------------------------------- |
+| `INTEGER`   | `INTEGER` / `BOOLEAN`(0,1) / 小数部が 0 かつ int64 範囲内の `REAL`・`DECIMAL`          |
+| `REAL`      | `REAL` / `INTEGER` / `BOOLEAN` / `DECIMAL`                                             |
+| `DECIMAL`   | `DECIMAL` / `INTEGER` / `REAL` / `BOOLEAN`（`NaN`・`±Infinity`・decimal 範囲外は不可） |
+| `BOOLEAN`   | `BOOLEAN` / 0・1 の `INTEGER`・`REAL`                                                  |
+| `TEXT`      | **すべて**（`SqlLiteral.toSqlLiteral` の文字列表現になる）                             |
+| `BLOB`      | `BLOB` / `TEXT`（UTF-8 エンコード）                                                    |
+| `DATE`      | `DATE` / `TIMESTAMP` / `yyyy-MM-dd` 形式の `TEXT`                                      |
+| `TIMESTAMP` | `TIMESTAMP` / `DATE` / `DateTimeOffset` が解析できる `TEXT`                            |
+| `UUID`      | `UUID` / `Guid.TryParse` が通る `TEXT`                                                 |
 
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, hired DATE, uid UUID);
@@ -198,17 +213,17 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 
 ### 値の比較
 
-| 種別                       | 規則                                                                                                                        |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `INTEGER` `REAL` `DECIMAL` | 3種とも `decimal` 型に変換して比較                                                                                          |
-| `REAL` の `NaN`            | **`REAL` 同士の比較でのみ**最大。`NaN = NaN` は真。`NaN` と `INTEGER` / `DECIMAL` の比較は `TypeError`（§14「演算の注意」） |
-| `TEXT`                     | UTF-8 の符号化順（= Unicode コードポイント順）                                                                              |
-| `BLOB`                     | バイト列の辞書順（短い方が先）                                                                                              |
-| `DATE` `TIMESTAMP`         | 相互比較可（`DATE` は UTC 午前 0時の `TIMESTAMP` として扱う）                                                               |
-| `UUID`                     | `Guid` の比較                                                                                                               |
-| `BOOLEAN`                  | `FALSE < TRUE`                                                                                                              |
+| 種別                       | 規則                                                                                                                                                                                              |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `INTEGER` `REAL` `DECIMAL` | `INTEGER` / `DECIMAL` は decimal で比較。`REAL` 同士は float（`NaN` は最大、`NaN = NaN` は真）。`REAL` と `INTEGER` / `DECIMAL` は decimal で表せる範囲なら decimal、範囲外・`1e-28` 未満は float |
+| `REAL` の `NaN`            | **`REAL` 同士の比較でのみ**最大。`NaN = NaN` は真。`NaN` と `INTEGER` / `DECIMAL` の比較は `TypeError`（§14「演算の注意」）                                                                       |
+| `TEXT`                     | UTF-8 の符号化順（= Unicode コードポイント順）                                                                                                                                                    |
+| `BLOB`                     | バイト列の辞書順（短い方が先）                                                                                                                                                                    |
+| `DATE` `TIMESTAMP`         | 相互比較可（`DATE` は UTC 午前 0時の `TIMESTAMP` として扱う）                                                                                                                                     |
+| `UUID`                     | `Guid` の比較                                                                                                                                                                                     |
+| `BOOLEAN`                  | `FALSE < TRUE`                                                                                                                                                                                    |
 
-**異なる型の組み合わせは比較できない**（`TypeError`）。
+**上記以外の型の組み合わせは比較できない**（`TypeError`）。
 `active = 1`（`BOOLEAN` と `INTEGER`）はエラーになる。
 
 `TEXT` の比較順はキー符号化（UTF-8 バイト列）と同じになる。
@@ -269,6 +284,7 @@ INSERT INTO t VALUES (1, other_col);  -- NameError（'other_col' は列でも関
 CLI は 1行目に列名、2行目に区切り（列名と同じ文字数の `-`）、3行目以降に `  値, 値, …` を出す。
 0 行の `SELECT` でもヘッダの 2行だけは出る。
 `SELECT` 以外は `(N rows)` の 1行だけ。
+ただし `EXPLAIN` は `plan` 列のヘッダ・区切りと計画行（引用符なし）を表示する。
 
 ---
 
@@ -283,9 +299,11 @@ SELECT "Order Id" FROM "My Table";      -- 引用識別子
 
 - 修飾なしの列名は `FROM` にあるテーブルの順に探す。
 - 結合句で同じ列名が複数の表にあれば、修飾が必須。
-- `UNION` / `RIGHT` / `FULL` / `CROSS` / `NATURAL` / `OUTER` / `USING` などの未対応の SQL 語は、
+- `UNION` / `RIGHT` / `FULL` / `CROSS` / `NATURAL` / `OUTER` などの未対応の SQL 語は、
   列名には使えるが、**裸の別名（テーブル・列）**には使えない
   （`FROM t AS right` / `SELECT a AS union` のように `AS` を付ける）。
+  `USING` はテーブル別名には使えないが、列の裸の別名としては受理される
+  （`SELECT 1 USING` の列名は `USING`）。
   `JOIN ... USING (...)` は明示的な `SyntaxError` になる（§14）。
 
 ### `SELECT` 項目の式
@@ -380,12 +398,13 @@ name LIKE 'a%'       name NOT LIKE 'a%'
 - `EXISTS (SELECT ...)` / `NOT EXISTS (SELECT ...)` も使える（§7.9）。
 - `LIKE` のワイルドカード:
 
-| 記号 | 意味                     |
-| ---- | ------------------------ |
-| `%`  | 0 文字以上の任意の文字列 |
-| `_`  | ちょうど 1 文字          |
+| 記号 | 意味                                               |
+| ---- | -------------------------------------------------- |
+| `%`  | 0文字以上の任意の文字列                            |
+| `_`  | Unicode コードポイント 1個（サロゲートペアも 1個） |
 
-- `LIKE ... ESCAPE '文字'` に対応する。エスケープ文字は 1 文字。
+- `_` は `LENGTH` と同じ数え方で、サロゲートペア（絵文字など BMP 外の文字）も 1文字として一致する。
+- `LIKE ... ESCAPE '文字'` に対応する。エスケープ文字は Unicode コードポイント 1個（サロゲートペアも 1文字）。
   エスケープ文字の直後の `%` / `_` / エスケープ文字自身はリテラルになる。
   エスケープ文字がパターンの末尾に来た場合は `TypeError`。
   `\` を既定のエスケープにする仕組みや、大文字小文字を区別しないモード（`ILIKE`）は**ない**。
@@ -491,10 +510,12 @@ SELECT name,
 ### 6.8 関数呼び出し
 
 ```
-関数名 "(" [expr {"," expr}] ")"
+関数名 "(" expr {"," expr} ")"
 ```
 
-引数は 0個以上。集約関数以外は無制限に呼び出せる。
+引数は 1個以上。
+`COUNT(*)` だけが特別に引数なしの形として受理される。
+空の引数リスト（`LENGTH()` / `COALESCE()`）は構文エラー。
 
 ---
 
@@ -580,19 +601,22 @@ SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
 `WHERE` に**列 = 定数**（リテラル、または負の数値リテラル）の条件が `AND` で連結されていれば、条件をまとめて索引の検索に使う。
 `LIKE 'prefix%'`（`%` が末尾のみ・`_` なし）は**範囲条件として索引に降ろす**。
 
-| 条件                                                                   | 走査方法         |
-| ---------------------------------------------------------------------- | ---------------- |
-| 主キーの全列 `= 定数`                                                  | `PkLookup`       |
-| 主キーの一部の列 `= 定数`                                              | `SeqScan`        |
-| 索引の**先頭から連続する** `= 定数`（1列以上）                         | `IndexLookup`    |
-| 単一列の主キーに下限のある範囲条件 (`>`, `>=`, `BETWEEN`, `LIKE 'x%'`) | `RangeScan`      |
-| 索引（**複合可**）の範囲条件。ただし範囲列より前の全列に `= 定数`      | `IndexRangeScan` |
-| それ以外                                                               | `SeqScan`        |
+| 条件                                                                   | 走査方法                                                  |
+| ---------------------------------------------------------------------- | --------------------------------------------------------- |
+| 主キーの全列 `= 定数`                                                  | `PkLookup`                                                |
+| 主キーの一部の列 `= 定数`                                              | `SeqScan`（その列を先頭に含む索引があれば `IndexLookup`） |
+| 索引の**先頭から連続する** `= 定数`（1列以上）                         | `IndexLookup`                                             |
+| 単一列の主キーに下限のある範囲条件 (`>`, `>=`, `BETWEEN`, `LIKE 'x%'`) | `RangeScan`                                               |
+| 索引（**複合可**）の範囲条件。ただし範囲列より前の全列に `= 定数`      | `IndexRangeScan`                                          |
+| それ以外                                                               | `SeqScan`                                                 |
 
 複合索引では、先頭列から順に条件が必要になる。たとえば索引 `(a, b)` なら、`a = 1 AND b > 2` は範囲走査に使えるが、`b > 2` だけでは使えない。
 
 主キー・索引は値のバイト列表現で引くため、列の宣言型とリテラルの型が一致するときだけ使う。
-型が違うリテラルは全走査に落ち、比較時に `TypeError` になる。
+型が違うリテラルでは索引・主キー検索を使わず全走査になる。
+比較は数値3種（`INTEGER` / `REAL` / `DECIMAL`）や `DATE` / `TIMESTAMP` なら型をまたいで成功するため、
+`TypeError` になるのは `BOOLEAN` と `INTEGER` など比較不能な組み合わせだけ
+（例: `INTEGER` 列 = `1.0` は一致する）。
 
 ```sql
 CREATE INDEX idx_dept ON people (dept_id);
@@ -616,7 +640,8 @@ SELECT id FROM t WHERE a = 1;                 -- 前置 1列の等値 → IndexL
   複合索引の範囲検索は「範囲列より前の列すべてが `=`、その次の 1列が範囲条件」という形で使う。
 - `LIKE` は **`%` が末尾のみ・`_` なし**のときだけ範囲に変換する。
   `LIKE '%x'` や `LIKE 'a_b%'` は全走査 + 後段の `Filter`。
-- 型が一致しないリテラルは全走査に落ちる（比較時に `TypeError`）。
+- 型が一致しないリテラルは全走査に落ちる
+  （比較自体は数値3種や `DATE` / `TIMESTAMP` なら成功する）。
 
 ### 7.5 結合アルゴリズム
 
@@ -643,12 +668,14 @@ SELECT id FROM t WHERE a = 1;                 -- 前置 1列の等値 → IndexL
 - **結合順序は自動で決まる**。
   `FROM` の先頭テーブルと `LEFT JOIN` の位置は動かさず、連続する `INNER JOIN` の中だけを
   「結合述語で繋がっているか」「行数の見積りが小さいか」「`FROM` に先に書かれたか」の順で並べ替える。
-  行数の見積りは統計ではなく走査方法だけで決める
-  （主キー等値 1 / 索引等値 2 / 範囲走査 100 / 全走査 1000）。
+  行数の見積りは統計ではなく走査方法と押し下げた `Filter` の段数で決める
+  （基本値は主キー等値 1 / 索引等値 2 / 範囲走査 100 / 全走査 1000。`Filter` 1段ごとに 0.1倍し、最小 1）。
   統計に基づく選択性の推定はしないため、同じ見積りのテーブルは `FROM` の順のままになる。
 - **複数テーブルを参照する `WHERE` の述語は、参照先が揃った `INNER JOIN` の `ON` へ昇格する**
   （`INNER` では `ON` と `WHERE` は同値なので、結合キーとして使える）。
-  `LEFT JOIN` の右（`NULL` 供給側）を参照する述語は昇格せず、結合の後で評価する。
+  `LEFT JOIN` の右（`NULL` 供給側）だけを参照する述語は昇格せず、結合の後で評価する。
+  ただし後続の `INNER JOIN` の表も参照する述語は、参照先が揃った `INNER JOIN` の `ON` へ昇格する
+  （`INNER` なので結果は同じ）。
   そのため `ON a.k = b.k` と `WHERE a.k = b.k` は同じ実行計画になる。
 - `LEFT JOIN` は右側の一致がない場合に `NULL` を補う。
 - `ON` 句の評価が失敗した場合（型エラーなど）は、黙って行を落とさず**クエリ全体がエラー**になる。
@@ -973,12 +1000,14 @@ UPDATE テーブル SET 列 = 式 [, 列 = 式 …] [ WHERE 条件 ];
 
 ### 主キー列は更新できない
 
-主キー列を `SET` すると `ConstraintViolation` になる（古い主キーの行が残って重複するため）。
+主キーの値を変更すると `ConstraintViolation` になる（古い主キーの行が残って重複するため）。
+同じ値への `SET`（`SET id = id` など）は成功する。
 主キーを変更するには、`DELETE` + `INSERT` を使う。
 
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT);
 INSERT INTO t VALUES (1,'a'),(2,'b');
+UPDATE t SET id = id;                 -- OK（値は変わらない）
 UPDATE t SET id = 100 WHERE id = 1;   -- エラー（何も更新されない）
 
 SELECT id, n FROM t ORDER BY id;
@@ -1078,8 +1107,9 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] 索引名 ON テーブル (列 [, 列 …]
 
 - **既存の行はすべて索引に投入される**（backfill）。
 - backfill は **プロセス内で排他**。
-  同じ DB で実行中の transaction があれば `ConflictError`（`実行中の transaction があります。…`）を返すので、
-  COMMIT / ROLLBACK してから実行する。
+  他の接続が transaction 中なら `ConflictError`（`実行中の transaction があります。…`）を返す。
+  自接続が明示 transaction 中なら `SyntaxError`（`トランザクション中は DDL…`）で拒否される。
+  どちらも COMMIT / ROLLBACK してから実行する。
   他の文は backfill が終わるまで待つ。
 - 索引は論理 keyspace `i:<索引名>` に格納される（物理的には DB の単一 LSM 上で接頭辞分離）。
 - `UNIQUE` は重複を検査する（`NULL` は除く）。
@@ -1271,7 +1301,10 @@ db> .rollback
 
 ### 表示形式
 
-構文エラーには行番号が付く。
+字句・構文解析器が返す文法エラーには行番号が付く。
+Planner / ExecContext / Eval が返す `SyntaxError`
+（例: FROM なしの `*`、集約と `SELECT *` の併用、`LIMIT` の相関サブクエリ）
+には付かないことがある。
 
 ```
 エラー: JOIN には FROM が必要です (位置 1行)
@@ -1346,6 +1379,7 @@ db> .rollback
 
 未対応の集合演算・JOIN の綴りは、テーブル別名・列別名として解釈されず **`SyntaxError`** になる。
 これらの語を裸の別名に使うことはできない（`AS` を付ければ使える）。
+ただし `USING` はテーブル別名では拒否されるが、列の裸の別名としては受理される。
 
 ### 実装上の制約
 
@@ -1374,7 +1408,7 @@ db> .rollback
 - `DATE` と `TIMESTAMP` は相互比較できるが、`DATE` は UTC 午前 0時として扱われる。
 - `REAL` の `NaN` は `REAL` 同士の比較でのみ特別扱いされる（`NaN` が最大、`NaN = NaN` は真）。
   `NaN` と `INTEGER` / `DECIMAL` を比較すると `TypeError`（`NaN や ±Infinity は数値比較できません`）になる。
-  `NaN` / `±Infinity` は `DECIMAL` に変換できない。
+  `NaN` / `±Infinity` に加えて decimal の範囲外（絶対値 約 7.9e28 超）も `DECIMAL` に変換できない。
 - `REAL` の `-0.0` は `+0.0` と同じ値として扱う。
   主キー・`UNIQUE` 索引でも同じキーになり、保存時には `+0.0` に正規化される。
 

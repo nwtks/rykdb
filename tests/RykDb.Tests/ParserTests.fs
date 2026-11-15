@@ -117,6 +117,12 @@ let private parsesOk (sql: string) = ok (parseStatement sql) |> ignore
 let private repeatedWhere (sql: string) =
     [ 1..5 ] |> List.map (fun _ -> whereTextOf sql) |> List.distinct
 
+/// 深さ上限は設けない。深い入力も構文エラーにならず、StackOverflow もしないことを確かめる。
+let private assertDeepParse (name: string) (sql: string) =
+    match parseStatement sql with
+    | Ok _ -> ()
+    | Error e -> Assert.Fail(sprintf "%s は解析できるはず: %s" name (DbError.toDisplayString e))
+
 [<Fact>]
 let ``パーサ: 演算子優先順位`` () =
     // * が + より優先される（(a + (b * c)) = 1 になるはず。a + (b * (c = 1)) ではない）
@@ -137,6 +143,29 @@ let ``パーサ: BETWEEN は後続の AND を飲み込まない`` () =
     match whereOf "SELECT * FROM t WHERE a BETWEEN 1 AND 10 AND b = 2" with
     | Expr.Binary(BinaryOp.And, Expr.Between _, _) -> ()
     | other -> Assert.Fail(sprintf "BETWEEN が正しく結合されていない: %s" (Expr.toDisplayString other))
+
+[<Fact>]
+let ``式: 述語は 1 つの式に 1 回だけ`` () =
+    // 比較・述語は非結合。連続して書いたら括弧を要求する。
+    expectErrorKind ErrorKind.SyntaxError "= の連続" (parseStatement "SELECT * FROM t WHERE a = b = c")
+    expectErrorKind ErrorKind.SyntaxError "IS NULL の後の =" (parseStatement "SELECT * FROM t WHERE a IS NULL = 1")
+    expectErrorKind ErrorKind.SyntaxError "BETWEEN の後の =" (parseStatement "SELECT * FROM t WHERE a BETWEEN 1 AND 2 = 3")
+    expectErrorKind ErrorKind.SyntaxError "述語の後の *" (parseStatement "SELECT * FROM t WHERE a IS NULL * 2")
+    // 括弧で囲めば述語の結果を比較できる
+    parsesOk "SELECT * FROM t WHERE (a = b) = c"
+
+[<Fact>]
+let ``式: NOT は述語の前置に置けない`` () =
+    // 比較の右辺は加算以上なので、前置 NOT（結合強度 30）は入れない
+    expectErrorKind ErrorKind.SyntaxError "= の右の NOT" (parseStatement "SELECT * FROM t WHERE a = NOT b")
+    expectErrorKind ErrorKind.SyntaxError "NOT の後の比較" (parseStatement "SELECT * FROM t WHERE a NOT = 1")
+
+[<Fact>]
+let ``式: 不正な修飾子はその場でエラー`` () =
+    // 識別子以外の後ろの `.` は修飾子として認めない
+    expectErrorKind ErrorKind.SyntaxError "式の後ろの ." (parseStatement "SELECT (a + b) . c FROM t")
+    // 正しい修飾子は従来どおり
+    parsesOk "SELECT a.b, a + b.c FROM t WHERE a.b = 1"
 
 [<Fact>]
 let ``パーサ: IS NULL / IN / LIKE / NOT`` () =
@@ -165,6 +194,32 @@ let ``パーサ: IS NULL / IN / LIKE / NOT`` () =
     | _ -> Assert.Fail "NOT ではない"
 
 [<Fact>]
+let ``パーサ: IS TRUE / FALSE / UNKNOWN と LIKE ESCAPE`` () =
+    match whereOf "SELECT * FROM t WHERE a IS TRUE" with
+    | Expr.IsTruth(_, TruthValue.True, false) -> ()
+    | other -> Assert.Fail(sprintf "IS TRUE ではない: %A" other)
+
+    match whereOf "SELECT * FROM t WHERE a IS NOT FALSE" with
+    | Expr.IsTruth(_, TruthValue.False, true) -> ()
+    | other -> Assert.Fail(sprintf "IS NOT FALSE ではない: %A" other)
+
+    match whereOf "SELECT * FROM t WHERE a IS UNKNOWN" with
+    | Expr.IsTruth(_, TruthValue.Unknown, false) -> ()
+    | other -> Assert.Fail(sprintf "IS UNKNOWN ではない: %A" other)
+
+    match whereOf "SELECT * FROM t WHERE a IS NOT UNKNOWN" with
+    | Expr.IsTruth(_, TruthValue.Unknown, true) -> ()
+    | other -> Assert.Fail(sprintf "IS NOT UNKNOWN ではない: %A" other)
+
+    match whereOf "SELECT * FROM t WHERE a LIKE 'x!%' ESCAPE '!'" with
+    | Expr.Like(_, _, false, Some _) -> ()
+    | other -> Assert.Fail(sprintf "LIKE ESCAPE ではない: %A" other)
+
+    match whereOf "SELECT * FROM t WHERE a NOT LIKE 'x!_' ESCAPE '!'" with
+    | Expr.Like(_, _, true, Some _) -> ()
+    | other -> Assert.Fail(sprintf "NOT LIKE ESCAPE ではない: %A" other)
+
+[<Fact>]
 let ``パーサ: CASE と関数`` () =
     match (parseSelectOk "SELECT CASE WHEN a = 1 THEN 'one' ELSE 'other' END FROM t").Items.[0].Expression with
     | Expr.Case(_, Some _) -> ()
@@ -178,6 +233,53 @@ let ``パーサ: CASE と関数`` () =
 
     Assert.True(sel2.Items.[0].Expression |> Expr.isAggregate)
     Assert.True(sel2.Items.[1].Expression |> Expr.isAggregate)
+
+[<Fact>]
+let ``パーサ: CAST と DEFAULT`` () =
+    match (parseSelectOk "SELECT CAST(a AS INTEGER) FROM t").Items with
+    | [ {
+            Expression = Expr.Cast(_, DataType.Integer)
+        } ] -> ()
+    | other -> Assert.Fail(sprintf "CAST ではない: %A" other)
+
+    match parseOneOk "INSERT INTO t DEFAULT VALUES" with
+    | Statement.Insert ins ->
+        match ins.Source with
+        | InsertSource.Values [ [] ] -> ()
+        | other -> Assert.Fail(sprintf "DEFAULT VALUES ではない: %A" other)
+    | other -> Assert.Fail(sprintf "INSERT ではない: %A" other)
+
+    match parseOneOk "INSERT INTO t VALUES (1, DEFAULT)" with
+    | Statement.Insert ins ->
+        match ins.Source with
+        | InsertSource.Values [ [ _; Expr.Default ] ] -> ()
+        | other -> Assert.Fail(sprintf "DEFAULT ではない: %A" other)
+    | other -> Assert.Fail(sprintf "INSERT ではない: %A" other)
+
+[<Fact>]
+let ``パーサ: 集約関数の DISTINCT`` () =
+    let item (sql: string) =
+        match (parseSelectOk sql).Items with
+        | [ it ] -> it.Expression
+        | other ->
+            Assert.Fail(sprintf "項目数が違う: %A" other)
+            Unchecked.defaultof<Expr>
+
+    match item "SELECT SUM(DISTINCT a) FROM t" with
+    | Expr.AggCall(AggFunc.Sum, true, _) -> ()
+    | other -> Assert.Fail(sprintf "SUM DISTINCT ではない: %A" other)
+
+    match item "SELECT AVG(DISTINCT a) FROM t" with
+    | Expr.AggCall(AggFunc.Avg, true, _) -> ()
+    | other -> Assert.Fail(sprintf "AVG DISTINCT ではない: %A" other)
+
+    match item "SELECT MIN(DISTINCT a) FROM t" with
+    | Expr.AggCall(AggFunc.Min, true, _) -> ()
+    | other -> Assert.Fail(sprintf "MIN DISTINCT ではない: %A" other)
+
+    match item "SELECT MAX(DISTINCT a) FROM t" with
+    | Expr.AggCall(AggFunc.Max, true, _) -> ()
+    | other -> Assert.Fail(sprintf "MAX DISTINCT ではない: %A" other)
 
 [<Fact>]
 let ``パーサ: リテラルとコメント`` () =
@@ -211,6 +313,18 @@ let ``パーサ: JOIN`` () =
     Assert.Equal<JoinKind>(JoinKind.Left, sel.Joins.[1].Kind)
 
 [<Fact>]
+let ``パーサ: LEFT OUTER JOIN`` () =
+    match parseOneOk "SELECT * FROM t LEFT OUTER JOIN u ON t.id = u.id" with
+    | Statement.Select sel ->
+        match sel.Joins with
+        | [ j ] ->
+            match j.Kind with
+            | JoinKind.Left -> ()
+            | _ -> Assert.Fail("LEFT JOIN ではない")
+        | other -> Assert.Fail(sprintf "JOIN の数が違う: %A" other)
+    | other -> Assert.Fail(sprintf "SELECT ではない: %A" other)
+
+[<Fact>]
 let ``パーサ: SELECT 各種`` () =
     let sel = parseSelectOk "SELECT * FROM users"
 
@@ -230,6 +344,18 @@ let ``パーサ: SELECT 各種`` () =
     Assert.Equal<SortDirection>(SortDirection.Descending, sel2.OrderBy.[0].Direction)
     Assert.True sel2.Limit.IsSome
     Assert.True sel2.Offset.IsSome
+
+[<Fact>]
+let ``パーサ: EXPLAIN は SELECT を包む`` () =
+    match parseOneOk "EXPLAIN SELECT id FROM t WHERE id = 1;" with
+    | Statement.Explain sel ->
+        Assert.Single<SelectItem> sel.Items |> ignore
+        Assert.True sel.Where.IsSome
+    | other -> Assert.Fail(sprintf "EXPLAIN ではない: %A" other)
+
+    // 未対応の文・欠落は明示的な SyntaxError
+    expectErrorKind ErrorKind.SyntaxError "EXPLAIN の後に SELECT 以外" (parseStatement "EXPLAIN INSERT INTO t VALUES (1)")
+    expectErrorKind ErrorKind.SyntaxError "EXPLAIN だけ" (parseStatement "EXPLAIN")
 
 [<Fact>]
 let ``パーサ: INSERT / UPDATE / DELETE`` () =
@@ -273,6 +399,13 @@ let ``パーサ: INSERT ... SELECT`` () =
     | other -> Assert.Fail(sprintf "SELECT ではない: %A" other)
 
 [<Fact>]
+let ``パーサ: DML のテーブル別名は明示エラー`` () =
+    // 別名は列解決に使われないため、受理して黙って無視するのをやめた
+    expectErrorKind ErrorKind.SyntaxError "UPDATE の別名" (parseStatement "UPDATE t AS x SET a = 1")
+    expectErrorKind ErrorKind.SyntaxError "DELETE の別名" (parseStatement "DELETE FROM t AS x")
+    expectErrorKind ErrorKind.SyntaxError "INSERT の別名" (parseStatement "INSERT INTO t AS x VALUES (1)")
+
+[<Fact>]
 let ``パーサ: CREATE TABLE / INDEX / DROP`` () =
     let ct =
         parseCreateTableOk
@@ -297,10 +430,24 @@ let ``パーサ: CREATE TABLE / INDEX / DROP`` () =
     Assert.True ifEx
 
 [<Fact>]
+let ``パーサ: CREATE INDEX IF NOT EXISTS`` () =
+    match parseOneOk "CREATE INDEX IF NOT EXISTS ix ON t (a)" with
+    | Statement.CreateIndex ci ->
+        Assert.True ci.IfNotExists
+        Assert.Equal<string>("ix", ci.Name)
+    | other -> Assert.Fail(sprintf "CREATE INDEX ではない: %A" other)
+
+[<Fact>]
 let ``パーサ: 複数文`` () =
     match ok (Parser.parseStatements "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);") with
     | [ Statement.CreateTable _; Statement.Insert _ ] -> ()
     | other -> Assert.Fail(sprintf "想定外の文列: %A" other)
+
+[<Fact>]
+let ``パーサ: 複数文は ; で区切る`` () =
+    expectErrorKind ErrorKind.SyntaxError "区切りなし" (parseStatement "SELECT a FROM t SELECT a FROM t")
+
+    Assert.Equal<int>(2, (ok (Parser.parseStatements "SELECT a FROM t; SELECT a FROM t")).Length)
 
 [<Fact>]
 let ``末尾再帰: 大量の文を分解できる`` () =
@@ -326,6 +473,28 @@ let ``パーサ: トランザクション制御`` () =
     match parseOneOk "ROLLBACK" with
     | Statement.Rollback -> ()
     | other -> Assert.Fail(sprintf "ROLLBACK ではない: %A" other)
+
+[<Fact>]
+let ``パーサ: トランザクションの別綴り`` () =
+    (match parseOneOk "BEGIN TRANSACTION" with
+     | Statement.Begin -> ()
+     | other -> Assert.Fail(sprintf "BEGIN ではない: %A" other))
+
+    (match parseOneOk "START TRANSACTION" with
+     | Statement.Begin -> ()
+     | other -> Assert.Fail(sprintf "START ではない: %A" other))
+
+    (match parseOneOk "COMMIT WORK" with
+     | Statement.Commit -> ()
+     | other -> Assert.Fail(sprintf "COMMIT ではない: %A" other))
+
+    (match parseOneOk "ROLLBACK TRANSACTION" with
+     | Statement.Rollback -> ()
+     | other -> Assert.Fail(sprintf "ROLLBACK ではない: %A" other))
+
+    match parseOneOk "END" with
+    | Statement.Commit -> ()
+    | other -> Assert.Fail(sprintf "END ではない: %A" other)
 
 [<Fact>]
 let ``パーサ: 構文エラーは位置つき DbError`` () =
@@ -360,6 +529,11 @@ let ``パーサ: 引用した識別子`` () =
     match sel.Items.[0].Expression with
     | Expr.QualifiedStar q -> Assert.Equal("p", q)
     | other -> Assert.Fail(sprintf "QualifiedStar ではない: %A" other)
+
+[<Fact>]
+let ``パーサ: NULL.* を QualifiedStar にしない`` () =
+    // 以前は `NULL` の後ろの `.*` を読んで `QualifiedStar ""` を作っていた
+    expectErrorKind ErrorKind.SyntaxError "NULL.*" (parseStatement "SELECT NULL.* FROM t")
 
 [<Fact>]
 let ``パーサ: 型名は識別子にも使える`` () =
@@ -524,6 +698,16 @@ let ``パーサ: 未対応の集合演算は明示エラー`` () =
         (parseStatement "SELECT a FROM t WHERE a = 1 UNION SELECT a FROM t")
 
 [<Fact>]
+let ``パーサ: 列別名が集合演算を飲み込まない`` () =
+    // 以前は SELECT 項目の別名が UNION を消費し、後続の SELECT が別の文として扱われていた
+    expectErrorKind ErrorKind.SyntaxError "UNION" (parseStatement "SELECT 1 UNION SELECT 2")
+    expectErrorKind ErrorKind.SyntaxError "UNION ALL" (parseStatement "SELECT 1 UNION ALL SELECT 2")
+
+    // AS を付ければ別名として使える
+    let sel = parseSelectOk "SELECT a AS union FROM t"
+    Assert.Equal<string option>(Some "union", sel.Items.[0].Alias)
+
+[<Fact>]
 let ``パーサ: 未対応の JOIN は明示エラー`` () =
     expectErrorKind ErrorKind.SyntaxError "RIGHT JOIN" (parseStatement "SELECT * FROM t RIGHT JOIN u ON t.id = u.id")
 
@@ -537,6 +721,37 @@ let ``パーサ: 未対応の JOIN は明示エラー`` () =
     expectErrorKind ErrorKind.SyntaxError "CROSS JOIN" (parseStatement "SELECT * FROM t CROSS JOIN u")
     expectErrorKind ErrorKind.SyntaxError "NATURAL JOIN" (parseStatement "SELECT * FROM t NATURAL JOIN u")
     expectErrorKind ErrorKind.SyntaxError "USING" (parseStatement "SELECT * FROM t JOIN u USING (id)")
+
+[<Fact>]
+let ``パーサ: JOIN の種類だけで JOIN が無い入力はエラー`` () =
+    // 以前は LEFT / INNER を消費して以降の句を読み、JOIN を黙って捨てていた
+    // （`FROM t LEFT WHERE ...` が「LEFT JOIN なし」として静かに通っていた）。
+    expectErrorKind ErrorKind.SyntaxError "FROM の後の LEFT" (parseStatement "SELECT * FROM t LEFT")
+    expectErrorKind ErrorKind.SyntaxError "FROM の後の INNER" (parseStatement "SELECT * FROM t INNER")
+    expectErrorKind ErrorKind.SyntaxError "FROM の後の LEFT OUTER" (parseStatement "SELECT * FROM t LEFT OUTER")
+    expectErrorKind ErrorKind.SyntaxError "LEFT の後の WHERE" (parseStatement "SELECT * FROM t LEFT WHERE 1 = 1")
+    expectErrorKind ErrorKind.SyntaxError "INNER の後の ORDER BY" (parseStatement "SELECT * FROM t INNER ORDER BY 1")
+
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "既存 JOIN の後の LEFT"
+        (parseStatement "SELECT * FROM t JOIN u ON 1 = 1 LEFT WHERE 1 = 1")
+
+[<Fact>]
+let ``パーサ: 未対応語でも列名と明示 AS の別名には使える`` () =
+    parseOneOk "SELECT right FROM t" |> ignore
+    parseOneOk "SELECT a AS union FROM t" |> ignore
+    parseOneOk "SELECT a FROM t AS union" |> ignore
+    parseOneOk "CREATE TABLE x (right INTEGER PRIMARY KEY)" |> ignore
+
+    // 裸のテーブル別名には使えない（AS を付ける）
+    expectErrorKind ErrorKind.SyntaxError "裸の RIGHT 別名" (parseStatement "SELECT a FROM t right")
+    // 裸の列別名にも使えない（集合演算を飲み込まないため）
+    expectErrorKind ErrorKind.SyntaxError "裸の RIGHT 列別名" (parseStatement "SELECT a right FROM t")
+
+[<Fact>]
+let ``パーサ: DELETE ... USING は明示エラー`` () =
+    expectErrorKind ErrorKind.SyntaxError "DELETE USING" (parseStatement "DELETE FROM t USING u")
 
 [<Fact>]
 let ``パーサ: サブクエリ（スカラー / IN / EXISTS）`` () =
@@ -627,221 +842,6 @@ let ``パーサ: サブクエリの AST 形`` () =
     match parseOneOk "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t)" with
     | Statement.Select { Where = Some(Expr.Exists _) } -> ()
     | _ -> Assert.Fail "EXISTS ではありません"
-
-[<Fact>]
-let ``パーサ: JOIN の種類だけで JOIN が無い入力はエラー`` () =
-    // 以前は LEFT / INNER を消費して以降の句を読み、JOIN を黙って捨てていた
-    // （`FROM t LEFT WHERE ...` が「LEFT JOIN なし」として静かに通っていた）。
-    expectErrorKind ErrorKind.SyntaxError "FROM の後の LEFT" (parseStatement "SELECT * FROM t LEFT")
-    expectErrorKind ErrorKind.SyntaxError "FROM の後の INNER" (parseStatement "SELECT * FROM t INNER")
-    expectErrorKind ErrorKind.SyntaxError "FROM の後の LEFT OUTER" (parseStatement "SELECT * FROM t LEFT OUTER")
-    expectErrorKind ErrorKind.SyntaxError "LEFT の後の WHERE" (parseStatement "SELECT * FROM t LEFT WHERE 1 = 1")
-    expectErrorKind ErrorKind.SyntaxError "INNER の後の ORDER BY" (parseStatement "SELECT * FROM t INNER ORDER BY 1")
-
-    expectErrorKind
-        ErrorKind.SyntaxError
-        "既存 JOIN の後の LEFT"
-        (parseStatement "SELECT * FROM t JOIN u ON 1 = 1 LEFT WHERE 1 = 1")
-
-[<Fact>]
-let ``パーサ: 列別名が集合演算を飲み込まない`` () =
-    // 以前は SELECT 項目の別名が UNION を消費し、後続の SELECT が別の文として扱われていた
-    expectErrorKind ErrorKind.SyntaxError "UNION" (parseStatement "SELECT 1 UNION SELECT 2")
-    expectErrorKind ErrorKind.SyntaxError "UNION ALL" (parseStatement "SELECT 1 UNION ALL SELECT 2")
-
-    // AS を付ければ別名として使える
-    let sel = parseSelectOk "SELECT a AS union FROM t"
-    Assert.Equal<string option>(Some "union", sel.Items.[0].Alias)
-
-[<Fact>]
-let ``パーサ: DML のテーブル別名は明示エラー`` () =
-    // 別名は列解決に使われないため、受理して黙って無視するのをやめた
-    expectErrorKind ErrorKind.SyntaxError "UPDATE の別名" (parseStatement "UPDATE t AS x SET a = 1")
-    expectErrorKind ErrorKind.SyntaxError "DELETE の別名" (parseStatement "DELETE FROM t AS x")
-    expectErrorKind ErrorKind.SyntaxError "INSERT の別名" (parseStatement "INSERT INTO t AS x VALUES (1)")
-
-[<Fact>]
-let ``パーサ: NULL.* を QualifiedStar にしない`` () =
-    // 以前は `NULL` の後ろの `.*` を読んで `QualifiedStar ""` を作っていた
-    expectErrorKind ErrorKind.SyntaxError "NULL.*" (parseStatement "SELECT NULL.* FROM t")
-
-[<Fact>]
-let ``式: 述語は 1 つの式に 1 回だけ`` () =
-    // 比較・述語は非結合。連続して書いたら括弧を要求する。
-    expectErrorKind ErrorKind.SyntaxError "= の連続" (parseStatement "SELECT * FROM t WHERE a = b = c")
-    expectErrorKind ErrorKind.SyntaxError "IS NULL の後の =" (parseStatement "SELECT * FROM t WHERE a IS NULL = 1")
-    expectErrorKind ErrorKind.SyntaxError "BETWEEN の後の =" (parseStatement "SELECT * FROM t WHERE a BETWEEN 1 AND 2 = 3")
-    expectErrorKind ErrorKind.SyntaxError "述語の後の *" (parseStatement "SELECT * FROM t WHERE a IS NULL * 2")
-    // 括弧で囲めば述語の結果を比較できる
-    parsesOk "SELECT * FROM t WHERE (a = b) = c"
-
-[<Fact>]
-let ``式: NOT は述語の前置に置けない`` () =
-    // 比較の右辺は加算以上なので、前置 NOT（結合強度 30）は入れない
-    expectErrorKind ErrorKind.SyntaxError "= の右の NOT" (parseStatement "SELECT * FROM t WHERE a = NOT b")
-    expectErrorKind ErrorKind.SyntaxError "NOT の後の比較" (parseStatement "SELECT * FROM t WHERE a NOT = 1")
-
-[<Fact>]
-let ``式: 不正な修飾子はその場でエラー`` () =
-    // 識別子以外の後ろの `.` は修飾子として認めない
-    expectErrorKind ErrorKind.SyntaxError "式の後ろの ." (parseStatement "SELECT (a + b) . c FROM t")
-    // 正しい修飾子は従来どおり
-    parsesOk "SELECT a.b, a + b.c FROM t WHERE a.b = 1"
-
-[<Fact>]
-let ``パーサ: DELETE ... USING は明示エラー`` () =
-    expectErrorKind ErrorKind.SyntaxError "DELETE USING" (parseStatement "DELETE FROM t USING u")
-
-[<Fact>]
-let ``パーサ: 複数文は ; で区切る`` () =
-    expectErrorKind ErrorKind.SyntaxError "区切りなし" (parseStatement "SELECT a FROM t SELECT a FROM t")
-
-    Assert.Equal<int>(2, (ok (Parser.parseStatements "SELECT a FROM t; SELECT a FROM t")).Length)
-
-[<Fact>]
-let ``パーサ: 未対応語でも列名と明示 AS の別名には使える`` () =
-    parseOneOk "SELECT right FROM t" |> ignore
-    parseOneOk "SELECT a AS union FROM t" |> ignore
-    parseOneOk "SELECT a FROM t AS union" |> ignore
-    parseOneOk "CREATE TABLE x (right INTEGER PRIMARY KEY)" |> ignore
-
-    // 裸のテーブル別名には使えない（AS を付ける）
-    expectErrorKind ErrorKind.SyntaxError "裸の RIGHT 別名" (parseStatement "SELECT a FROM t right")
-    // 裸の列別名にも使えない（集合演算を飲み込まないため）
-    expectErrorKind ErrorKind.SyntaxError "裸の RIGHT 列別名" (parseStatement "SELECT a right FROM t")
-
-[<Fact>]
-let ``パーサ: CREATE INDEX IF NOT EXISTS`` () =
-    match parseOneOk "CREATE INDEX IF NOT EXISTS ix ON t (a)" with
-    | Statement.CreateIndex ci ->
-        Assert.True ci.IfNotExists
-        Assert.Equal<string>("ix", ci.Name)
-    | other -> Assert.Fail(sprintf "CREATE INDEX ではない: %A" other)
-
-[<Fact>]
-let ``パーサ: LEFT OUTER JOIN`` () =
-    match parseOneOk "SELECT * FROM t LEFT OUTER JOIN u ON t.id = u.id" with
-    | Statement.Select sel ->
-        match sel.Joins with
-        | [ j ] ->
-            match j.Kind with
-            | JoinKind.Left -> ()
-            | _ -> Assert.Fail("LEFT JOIN ではない")
-        | other -> Assert.Fail(sprintf "JOIN の数が違う: %A" other)
-    | other -> Assert.Fail(sprintf "SELECT ではない: %A" other)
-
-[<Fact>]
-let ``パーサ: トランザクションの別綴り`` () =
-    (match parseOneOk "BEGIN TRANSACTION" with
-     | Statement.Begin -> ()
-     | other -> Assert.Fail(sprintf "BEGIN ではない: %A" other))
-
-    (match parseOneOk "START TRANSACTION" with
-     | Statement.Begin -> ()
-     | other -> Assert.Fail(sprintf "START ではない: %A" other))
-
-    (match parseOneOk "COMMIT WORK" with
-     | Statement.Commit -> ()
-     | other -> Assert.Fail(sprintf "COMMIT ではない: %A" other))
-
-    (match parseOneOk "ROLLBACK TRANSACTION" with
-     | Statement.Rollback -> ()
-     | other -> Assert.Fail(sprintf "ROLLBACK ではない: %A" other))
-
-    match parseOneOk "END" with
-    | Statement.Commit -> ()
-    | other -> Assert.Fail(sprintf "END ではない: %A" other)
-
-[<Fact>]
-let ``パーサ: EXPLAIN は SELECT を包む`` () =
-    match parseOneOk "EXPLAIN SELECT id FROM t WHERE id = 1;" with
-    | Statement.Explain sel ->
-        Assert.Single<SelectItem> sel.Items |> ignore
-        Assert.True sel.Where.IsSome
-    | other -> Assert.Fail(sprintf "EXPLAIN ではない: %A" other)
-
-    // 未対応の文・欠落は明示的な SyntaxError
-    expectErrorKind ErrorKind.SyntaxError "EXPLAIN の後に SELECT 以外" (parseStatement "EXPLAIN INSERT INTO t VALUES (1)")
-    expectErrorKind ErrorKind.SyntaxError "EXPLAIN だけ" (parseStatement "EXPLAIN")
-
-[<Fact>]
-let ``パーサ: IS TRUE / FALSE / UNKNOWN と LIKE ESCAPE`` () =
-    match whereOf "SELECT * FROM t WHERE a IS TRUE" with
-    | Expr.IsTruth(_, TruthValue.True, false) -> ()
-    | other -> Assert.Fail(sprintf "IS TRUE ではない: %A" other)
-
-    match whereOf "SELECT * FROM t WHERE a IS NOT FALSE" with
-    | Expr.IsTruth(_, TruthValue.False, true) -> ()
-    | other -> Assert.Fail(sprintf "IS NOT FALSE ではない: %A" other)
-
-    match whereOf "SELECT * FROM t WHERE a IS UNKNOWN" with
-    | Expr.IsTruth(_, TruthValue.Unknown, false) -> ()
-    | other -> Assert.Fail(sprintf "IS UNKNOWN ではない: %A" other)
-
-    match whereOf "SELECT * FROM t WHERE a IS NOT UNKNOWN" with
-    | Expr.IsTruth(_, TruthValue.Unknown, true) -> ()
-    | other -> Assert.Fail(sprintf "IS NOT UNKNOWN ではない: %A" other)
-
-    match whereOf "SELECT * FROM t WHERE a LIKE 'x!%' ESCAPE '!'" with
-    | Expr.Like(_, _, false, Some _) -> ()
-    | other -> Assert.Fail(sprintf "LIKE ESCAPE ではない: %A" other)
-
-    match whereOf "SELECT * FROM t WHERE a NOT LIKE 'x!_' ESCAPE '!'" with
-    | Expr.Like(_, _, true, Some _) -> ()
-    | other -> Assert.Fail(sprintf "NOT LIKE ESCAPE ではない: %A" other)
-
-[<Fact>]
-let ``パーサ: CAST と DEFAULT`` () =
-    match (parseSelectOk "SELECT CAST(a AS INTEGER) FROM t").Items with
-    | [ {
-            Expression = Expr.Cast(_, DataType.Integer)
-        } ] -> ()
-    | other -> Assert.Fail(sprintf "CAST ではない: %A" other)
-
-    match parseOneOk "INSERT INTO t DEFAULT VALUES" with
-    | Statement.Insert ins ->
-        match ins.Source with
-        | InsertSource.Values [ [] ] -> ()
-        | other -> Assert.Fail(sprintf "DEFAULT VALUES ではない: %A" other)
-    | other -> Assert.Fail(sprintf "INSERT ではない: %A" other)
-
-    match parseOneOk "INSERT INTO t VALUES (1, DEFAULT)" with
-    | Statement.Insert ins ->
-        match ins.Source with
-        | InsertSource.Values [ [ _; Expr.Default ] ] -> ()
-        | other -> Assert.Fail(sprintf "DEFAULT ではない: %A" other)
-    | other -> Assert.Fail(sprintf "INSERT ではない: %A" other)
-
-[<Fact>]
-let ``パーサ: 集約関数の DISTINCT`` () =
-    let item (sql: string) =
-        match (parseSelectOk sql).Items with
-        | [ it ] -> it.Expression
-        | other ->
-            Assert.Fail(sprintf "項目数が違う: %A" other)
-            Unchecked.defaultof<Expr>
-
-    match item "SELECT SUM(DISTINCT a) FROM t" with
-    | Expr.AggCall(AggFunc.Sum, true, _) -> ()
-    | other -> Assert.Fail(sprintf "SUM DISTINCT ではない: %A" other)
-
-    match item "SELECT AVG(DISTINCT a) FROM t" with
-    | Expr.AggCall(AggFunc.Avg, true, _) -> ()
-    | other -> Assert.Fail(sprintf "AVG DISTINCT ではない: %A" other)
-
-    match item "SELECT MIN(DISTINCT a) FROM t" with
-    | Expr.AggCall(AggFunc.Min, true, _) -> ()
-    | other -> Assert.Fail(sprintf "MIN DISTINCT ではない: %A" other)
-
-    match item "SELECT MAX(DISTINCT a) FROM t" with
-    | Expr.AggCall(AggFunc.Max, true, _) -> ()
-    | other -> Assert.Fail(sprintf "MAX DISTINCT ではない: %A" other)
-
-/// 深さ上限は設けない。深い入力も構文エラーにならず、StackOverflow もしないことを確かめる。
-let private assertDeepParse (name: string) (sql: string) =
-    match parseStatement sql with
-    | Ok _ -> ()
-    | Error e -> Assert.Fail(sprintf "%s は解析できるはず: %s" name (DbError.toDisplayString e))
 
 [<Theory>]
 // CPS 化した各経路をなぞる。継続の戻り値の型が多様（Expr / (Expr*Expr) list /

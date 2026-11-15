@@ -74,8 +74,78 @@ let private okRows (r: Reply) =
         Assert.Fail "サーバが HALT を返しました"
         [], []
 
+/// 1 接続だけ受けて、行ごとに respond の応答を返す偽サーバでテストする。
+let private withFakeServer (respond: string -> string option) (f: int -> unit) =
+    let listener = new TcpListener(IPAddress.Loopback, 0)
+    listener.Start()
+    let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+
+    let task =
+        Task.Run(fun () ->
+            use c = listener.AcceptTcpClient()
+            use stream = c.GetStream()
+            use r = new StreamReader(stream, System.Text.Encoding.UTF8, false, 1024, true)
+            use w = new StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
+            w.AutoFlush <- true
+
+            let mutable line = r.ReadLine()
+
+            while not (isNull line) do
+                match respond line with
+                | Some resp -> w.WriteLine resp
+                | None -> ()
+
+                line <- r.ReadLine())
+
+    try
+        f port
+    finally
+        listener.Stop()
+        task.Wait 5000 |> ignore
+
+/// 複数接続のテスト用: サーバを起動し、割り当てられたポートを渡す。
+let private withTestServerOptions (options: SessionOptions) (tag: string) (f: int -> unit) =
+    let dir = newDir tag
+    let session: SessionPool = ok (SessionPool.OpenWith(dir, options))
+    let listener = new TcpListener(IPAddress.Loopback, 0)
+    listener.Start()
+    let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+    let cts = new CancellationTokenSource()
+    let finished = new ManualResetEventSlim false
+
+    // accept でブロックするので専用スレッドで動かす（他のテストのプール飽和に影響されない）。
+    Task.Factory.StartNew(
+        (fun () ->
+            try
+                serve session listener cts.Token (fun _ -> ())
+            finally
+                finished.Set()),
+        TaskCreationOptions.LongRunning
+    )
+    |> ignore
+
+    try
+        f port
+    finally
+        cts.Cancel()
+
+        if not (finished.Wait 10000) then
+            Assert.Fail "サーバが 10 秒以内に停止しませんでした"
+
+        cts.Dispose()
+        session.Close() |> ignore
+
+        if Directory.Exists dir then
+            try
+                Directory.Delete(dir, true)
+            with _ ->
+                ()
+
+let private withTestServer (tag: string) (f: int -> unit) =
+    withTestServerOptions SessionOptions.Default tag f
+
 [<Fact>]
-let ``TCP: loopback で SQL が通る`` () =
+let ``Server: loopback で SQL が通る`` () =
     withServer (fun client ->
         let cols, _ =
             okRows (client.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
@@ -111,7 +181,7 @@ let ``TCP: loopback で SQL が通る`` () =
         ))
 
 [<Fact>]
-let ``TCP: 0行の SELECT でも列名を返す`` () =
+let ``Server: 0行の SELECT でも列名を返す`` () =
     withServer (fun client ->
         okRows (client.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
         |> ignore
@@ -121,7 +191,7 @@ let ``TCP: 0行の SELECT でも列名を返す`` () =
         Assert.Empty rows)
 
 [<Fact>]
-let ``TCP: カンマを含む列名も正しく返す`` () =
+let ``Server: カンマを含む列名も正しく返す`` () =
     withServer (fun client ->
         okRows (client.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
         okRows (client.Send "INSERT INTO t VALUES (1)") |> ignore
@@ -130,7 +200,7 @@ let ``TCP: カンマを含む列名も正しく返す`` () =
         Assert.Equal<string list>([ "1" ], rows))
 
 [<Fact>]
-let ``TCP: ライブラリ API と同じ結果が返る`` () =
+let ``Server: ライブラリ API と同じ結果が返る`` () =
     // 同じスクリプトを 2 経路で流して結果を突き合わせる。
     let script =
         [
@@ -159,7 +229,7 @@ let ``TCP: ライブラリ API と同じ結果が返る`` () =
         let libResults = run session script []
         ok (session.Close())
 
-        // --- TCP ---
+        // --- Server ---
         withServer (fun client ->
             let tcpResults =
                 script
@@ -187,7 +257,7 @@ let ``TCP: ライブラリ API と同じ結果が返る`` () =
             Assert.Equal<int>(script.Length, tcpResults.Length)))
 
 [<Fact>]
-let ``TCP: .tables はテーブル名を返す`` () =
+let ``Server: .tables はテーブル名を返す`` () =
     withServer (fun client ->
         // テーブルが無いときは空
         Assert.Equal<string list>([], fst (okRows (client.Send ".tables")))
@@ -199,7 +269,7 @@ let ``TCP: .tables はテーブル名を返す`` () =
         Assert.Contains("'zzz'", rows))
 
 [<Fact>]
-let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` () =
+let ``Server: 空行は空応答になり、切断後も接続を受け付ける`` () =
     let dir = newDir "tcp-raw"
     let session: SessionPool = ok (SessionPool.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
@@ -257,7 +327,7 @@ let ``TCP: 空行は空応答になり、切断後も接続を受け付ける`` 
                 ()
 
 [<Fact>]
-let ``TCP: 突然の切断（RST）でもサーバは生き続ける`` () =
+let ``Server: 突然の切断（RST）でもサーバは生き続ける`` () =
     let dir = newDir "tcp-rst"
     let session: SessionPool = ok (SessionPool.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
@@ -312,42 +382,13 @@ let ``TCP: 突然の切断（RST）でもサーバは生き続ける`` () =
                 ()
 
 [<Fact>]
-let ``TCP: Client を二度閉じても落ちない`` () =
+let ``Server: Client を二度閉じても落ちない`` () =
     withServer (fun client ->
         client.Close()
         // 2 回目は送信に失敗するが握りつぶす
         client.Close()
         // IDisposable 経由も同じ経路
         (client :> System.IDisposable).Dispose())
-
-/// 1 接続だけ受けて、行ごとに respond の応答を返す偽サーバでテストする。
-let private withFakeServer (respond: string -> string option) (f: int -> unit) =
-    let listener = new TcpListener(IPAddress.Loopback, 0)
-    listener.Start()
-    let port = (listener.LocalEndpoint :?> IPEndPoint).Port
-
-    let task =
-        Task.Run(fun () ->
-            use c = listener.AcceptTcpClient()
-            use stream = c.GetStream()
-            use r = new StreamReader(stream, System.Text.Encoding.UTF8, false, 1024, true)
-            use w = new StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
-            w.AutoFlush <- true
-
-            let mutable line = r.ReadLine()
-
-            while not (isNull line) do
-                match respond line with
-                | Some resp -> w.WriteLine resp
-                | None -> ()
-
-                line <- r.ReadLine())
-
-    try
-        f port
-    finally
-        listener.Stop()
-        task.Wait 5000 |> ignore
 
 [<Fact>]
 let ``Client: 不正な短い OK は Failure`` () =
@@ -411,7 +452,7 @@ let ``Client: 接続が RST で切れたら Halt`` () =
         task.Wait 5000 |> ignore
 
 [<Fact>]
-let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコルを壊さない`` () =
+let ``Server: TEXT の改行・CR・バックスラッシュが 1行プロトコルを壊さない`` () =
     let dir = newDir "tcp-newline"
     let session: SessionPool = ok (SessionPool.OpenWith dir)
 
@@ -480,7 +521,7 @@ let ``TCP: TEXT の改行・CR・バックスラッシュが 1行プロトコル
                 ()
 
 [<Fact>]
-let ``TCP: 切断時に open transaction は rollback される`` () =
+let ``Server: 切断時に open transaction は rollback される`` () =
     let dir = newDir "tcp-rollback"
     let session: SessionPool = ok (SessionPool.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
@@ -542,49 +583,8 @@ let ``TCP: 切断時に open transaction は rollback される`` () =
             with _ ->
                 ()
 
-/// 複数接続のテスト用: サーバを起動し、割り当てられたポートを渡す。
-let private withTestServerOptions (options: SessionOptions) (tag: string) (f: int -> unit) =
-    let dir = newDir tag
-    let session: SessionPool = ok (SessionPool.OpenWith(dir, options))
-    let listener = new TcpListener(IPAddress.Loopback, 0)
-    listener.Start()
-    let port = (listener.LocalEndpoint :?> IPEndPoint).Port
-    let cts = new CancellationTokenSource()
-    let finished = new ManualResetEventSlim false
-
-    // accept でブロックするので専用スレッドで動かす（他のテストのプール飽和に影響されない）。
-    Task.Factory.StartNew(
-        (fun () ->
-            try
-                serve session listener cts.Token (fun _ -> ())
-            finally
-                finished.Set()),
-        TaskCreationOptions.LongRunning
-    )
-    |> ignore
-
-    try
-        f port
-    finally
-        cts.Cancel()
-
-        if not (finished.Wait 10000) then
-            Assert.Fail "サーバが 10 秒以内に停止しませんでした"
-
-        cts.Dispose()
-        session.Close() |> ignore
-
-        if Directory.Exists dir then
-            try
-                Directory.Delete(dir, true)
-            with _ ->
-                ()
-
-let private withTestServer (tag: string) (f: int -> unit) =
-    withTestServerOptions SessionOptions.Default tag f
-
 [<Fact>]
-let ``TCP: 接続中の接続があっても新しい接続を受け付ける`` () =
+let ``Server: 接続中の接続があっても新しい接続を受け付ける`` () =
     withTestServer "tcp-concurrent-accept" (fun port ->
         // A は接続したまま何も送らない。逐次 accept の実装では B が処理されずここで止まる。
         use rawA = new TcpClient("127.0.0.1", port)
@@ -607,7 +607,7 @@ let ``TCP: 接続中の接続があっても新しい接続を受け付ける`` 
         Assert.Equal<string>("OK 0\tpong", readerA.ReadLine()))
 
 [<Fact>]
-let ``TCP: 2 接続から並行に SELECT できる`` () =
+let ``Server: 2 接続から並行に SELECT できる`` () =
     withTestServer "tcp-parallel-select" (fun port ->
         use clientA = new RykDbClient("127.0.0.1", port)
         okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
@@ -625,7 +625,7 @@ let ``TCP: 2 接続から並行に SELECT できる`` () =
         Task.WaitAll(List.toArray reads))
 
 [<Fact>]
-let ``TCP: 他接続の切断は transaction を rollback しない`` () =
+let ``Server: 他接続の切断は transaction を rollback しない`` () =
     withTestServer "tcp-txn-owner" (fun port ->
         use clientA = new RykDbClient("127.0.0.1", port)
         okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
@@ -651,7 +651,7 @@ let ``TCP: 他接続の切断は transaction を rollback しない`` () =
         Assert.Equal<string list>([ "0" ], after))
 
 [<Fact>]
-let ``TCP: 各接続の transaction は独立している`` () =
+let ``Server: 各接続の transaction は独立している`` () =
     withTestServer "tcp-txn-isolated" (fun port ->
         use clientA = new RykDbClient("127.0.0.1", port)
         okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
@@ -673,7 +673,7 @@ let ``TCP: 各接続の transaction は独立している`` () =
         Assert.Equal<string list>([ "1" ], visible))
 
 [<Fact>]
-let ``TCP: 明示 transaction は開始時の snapshot を見る（repeatable read）`` () =
+let ``Server: 明示 transaction は開始時の snapshot を見る（repeatable read）`` () =
     withTestServer "tcp-txn-repeatable" (fun port ->
         use setup = new RykDbClient("127.0.0.1", port)
         okRows (setup.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
@@ -698,7 +698,7 @@ let ``TCP: 明示 transaction は開始時の snapshot を見る（repeatable re
         Assert.Equal<string list>([ "2" ], fresh))
 
 [<Fact>]
-let ``TCP: 他接続の transaction 中でも書き込みできる`` () =
+let ``Server: 他接続の transaction 中でも書き込みできる`` () =
     withTestServer "tcp-txn-concurrent-write" (fun port ->
         use clientA = new RykDbClient("127.0.0.1", port)
         okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
@@ -719,7 +719,7 @@ let ``TCP: 他接続の transaction 中でも書き込みできる`` () =
         Assert.Equal<string list>([ "1"; "2" ], all))
 
 [<Fact>]
-let ``TCP: 接続間で write-write 競合を検出する`` () =
+let ``Server: 接続間で write-write 競合を検出する`` () =
     withTestServer "tcp-txn-conflict" (fun port ->
         use setup = new RykDbClient("127.0.0.1", port)
 
@@ -748,7 +748,7 @@ let ``TCP: 接続間で write-write 競合を検出する`` () =
         Assert.Equal<string list>([ "11" ], rows))
 
 [<Fact>]
-let ``TCP: transaction 中の DDL は他接続で ConflictError になる`` () =
+let ``Server: transaction 中の DDL は他接続で ConflictError になる`` () =
     withTestServer "tcp-txn-ddl" (fun port ->
         use clientA = new RykDbClient("127.0.0.1", port)
         okRows (clientA.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
@@ -767,7 +767,7 @@ let ``TCP: transaction 中の DDL は他接続で ConflictError になる`` () =
         okRows (clientB.Send "CREATE INDEX ix ON t (id)") |> ignore)
 
 [<Fact>]
-let ``TCP: 接続中でも serve は停止できる`` () =
+let ``Server: 接続中でも serve は停止できる`` () =
     let dir = newDir "tcp-stop-active"
     let session: SessionPool = ok (SessionPool.OpenWith dir)
     let listener = new TcpListener(IPAddress.Loopback, 0)
@@ -809,7 +809,7 @@ let ``TCP: 接続中でも serve は停止できる`` () =
                 ()
 
 [<Fact>]
-let ``TCP: .stream は STREAM ヘッダ・行・END を返す`` () =
+let ``Server: .stream は STREAM ヘッダ・行・END を返す`` () =
     withTestServer "tcp-stream-raw" (fun port ->
         use setup = new RykDbClient("127.0.0.1", port)
         okRows (setup.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
@@ -853,7 +853,7 @@ let ``TCP: .stream は STREAM ヘッダ・行・END を返す`` () =
         Assert.Equal<string>("OK 0\tpong", reader.ReadLine()))
 
 [<Fact>]
-let ``TCP: Client.SendStream は行を蓄積せずに受け取る`` () =
+let ``Server: Client.SendStream は行を蓄積せずに受け取る`` () =
     withServer (fun client ->
         okRows (client.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
         okRows (client.Send "INSERT INTO t VALUES (1, 'a'), (2, 'b')") |> ignore
@@ -916,7 +916,7 @@ let ``Client: SendStream は STREAM・OK・途中 ERR を読む`` () =
             Assert.Equal<string list>([ "1" ], List.ofSeq partialRows))
 
 [<Fact>]
-let ``TCP: .stream は SessionOptions の結果上限を適用しない`` () =
+let ``Server: .stream は SessionOptions の結果上限を適用しない`` () =
     let options =
         { SessionOptions.Default with
             MaxResultRows = 1L
@@ -943,7 +943,7 @@ let ``TCP: .stream は SessionOptions の結果上限を適用しない`` () =
         Assert.Equal<string list>([ "1"; "2"; "3" ], List.ofSeq rows))
 
 [<Fact>]
-let ``TCP: STREAM の途中エラーは ERR を返し接続を維持する`` () =
+let ``Server: STREAM の途中エラーは ERR を返し接続を維持する`` () =
     withTestServer "tcp-stream-mid-error" (fun port ->
         use setup = new RykDbClient("127.0.0.1", port)
         okRows (setup.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
@@ -972,7 +972,7 @@ let ``TCP: STREAM の途中エラーは ERR を返し接続を維持する`` () 
         Assert.Equal<string>("OK 0\tpong", reader.ReadLine()))
 
 [<Fact>]
-let ``TCP: STREAM 中に切断してもサーバは次の接続を受け付ける`` () =
+let ``Server: STREAM 中に切断してもサーバは次の接続を受け付ける`` () =
     withTestServer "tcp-stream-disconnect" (fun port ->
         use setup = new RykDbClient("127.0.0.1", port)
         okRows (setup.Send "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
@@ -1014,7 +1014,7 @@ let ``TCP: STREAM 中に切断してもサーバは次の接続を受け付け�
         Assert.Equal<string list>([ "1"; "2"; "3" ], List.ofSeq rows))
 
 [<Fact>]
-let ``TCP: transaction 中の .stream SELECT は OK にフォールバックする`` () =
+let ``Server: transaction 中の .stream SELECT は OK にフォールバックする`` () =
     withTestServer "tcp-stream-transaction" (fun port ->
         use setup = new RykDbClient("127.0.0.1", port)
         okRows (setup.Send "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore

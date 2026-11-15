@@ -74,7 +74,7 @@ let ``BloomFilter.ofKeys: ビット数は必ず 8 の倍数でビット配列と
             Assert.Equal<int>(filter.HashCount, restored.HashCount)
 
 [<Fact>]
-let ``BloomFilter.serialize: 直列化の往復`` () =
+let ``BloomFilter.serialize / deserialize: 直列化の往復`` () =
     let keys = Array.init 5_000 intKey
     let filter = BloomFilter.ofKeys 5_000 0.01 keys
     let restored = ok (BloomFilter.deserialize (BloomFilter.serialize filter))
@@ -86,7 +86,7 @@ let ``BloomFilter.serialize: 直列化の往復`` () =
         Assert.True(BloomFilter.mightContain restored (Hashing.hashBytes k |> Hashing.mix))
 
 [<Fact>]
-let ``BloomFilter.serialize: 直列化は決定的で、往復後も同じバイト列になる`` () =
+let ``BloomFilter.serialize / deserialize: 直列化は決定的で、往復後も同じバイト列になる`` () =
     let keys = Array.init 500 intKey
     let a = BloomFilter.serialize (BloomFilter.ofKeys 500 0.01 keys)
     let b = BloomFilter.serialize (BloomFilter.ofKeys 500 0.01 keys)

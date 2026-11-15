@@ -5,7 +5,8 @@ namespace RykDb.Core
 /// すべての構文規則は (値, 次の状態) を返す純粋な関数になる。
 type private PState = { Tokens: TokenItem array; Pos: int }
 
-/// SQL 文を AST に変換する再帰下降パーサ。
+/// SQL 文を AST に変換するパーサ
+/// （文は再帰下降、式は Pratt / precedence climbing と CPS）。
 /// 失敗はすべて Result<'T, DbError> として返し、例外は送らない。
 /// 式と SELECT の構文規則は CPS（継続を引数で渡す）で書き、継続は必ず末尾位置で呼ぶ。
 /// これにより式・サブクエリの入れ子段数を入力で決めてもスタックオーバーフローしない
@@ -13,7 +14,7 @@ type private PState = { Tokens: TokenItem array; Pos: int }
 /// 実値型の小さな構文規則は Errors.fs の result { ... } で状態を束縛する。
 module internal Parser =
     /// 型名の綴り → DataType の表。綴りを増やすときはここだけ直す
-    /// （型名セットと parseDataType の両方がこの表から導出される）。
+    /// （`dataTypeOfName` と `parseDataType` の両方がこの表から導出される）。
     let private TypeTable =
         [
             "INTEGER", DataType.Integer

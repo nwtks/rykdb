@@ -104,7 +104,10 @@ dotnet test                                                    # 全件
 dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"    # Server のみ
 ```
 
-**テスト方針**: `DatabaseTests` / `SqlReferenceTests` / `ServerTests` は「SQL 文字列 → 結果」の通し経路しか検証しない。
+**テスト方針**: `DatabaseTests` はハンドル API と内部機構
+（MVCC / WAL / プロセスロック / 索引 backfill・後始末 / snapshot 登録 / 永続性 / 末尾再帰）
+も検証する。
+`SqlReferenceTests` / `ServerTests` は「SQL 文字列 → 結果」の通し経路を検証する。
 Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだけで分かる。
 
 **役割の分担**:
@@ -113,7 +116,7 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
   （文・句・式・リテラル・識別子が受理 / 拒否され、評価結果も仕様どおりであること）。
   テスト名の接頭辞は `SqlReference:`。
 - `DatabaseTests` — ハンドル API と内部機構
-  （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / snapshot 登録 / 永続性 / 性能 / 末尾再帰）。
+  （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / snapshot 登録 / 永続性 / 末尾再帰）。
 
 **書き方**:
 
@@ -131,7 +134,6 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
   （リフレクションで数える）。
   F# 10 の FS0842 への対策（[`gotchas.md`](gotchas.md) §9.1）。
   ファイルを増やしたら下限数のアサートも更新する。
-  `DatabaseTests` に `E2E` / `性能`、`ServerTests` に `TCP` のテスト名が残っていることも検査する。
 
 **並び順**:
 
@@ -143,6 +145,8 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
   テストを並べ替えたときに参照順が壊れるのを防ぐ。
 - 例外: `SqlReferenceTests` は `sql-reference.md` の節順に従う（ソースの定義順ではない）。
   `DatabaseTests` / `ServerTests` / `CliTests` は利用者から見た操作・プロトコルの流れを優先する。
+  `SessionTests` は主要な公開 API から順に並べる
+  （`Session` → `SessionOptions` → `RowReader` → `SessionPool`）。
 
 **乱数生成のテストは退行に注意**（[`gotchas.md`](gotchas.md) §9.6）。
 
@@ -162,10 +166,13 @@ dotnet run -c Release --project tools/RykDb.Bench -- --dry          # 1 回だ�
 - **CI ではビルドのみ**（`dotnet build -t:Rebuild` に含まれる）。実行は手元で行う。
 - 結果は `BenchmarkDotNet.Artifacts/`（実行時のカレントディレクトリ）に残る。git 対象外。
 - シナリオ:
-  - `PointLookup` / `CountStar` / `RangeScan` / `FilterSeqScan` / `SelectConstant` / `CountConstantWhere` / `Insert100Rows`
+  - `PointLookup` / `PointLookup500` / `CountStar` / `RangeScan` / `FilterSeqScan` / `SelectConstant` / `CountConstantWhere`
+  - `Insert100Rows` / `Insert10kRows`（2,000行 × 5 文を 1 transaction で流して ROLLBACK）
   - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
   - `MatchesLiteral` / `MatchesColumn` / `MatchesBinary` / `MatchesComplex` — DB を使わない式評価器のマイクロベンチ
   - `CompactL0` — L0 の 4ファイル（各 25,000件）を 1回 compaction する
+- **性能スモーク（10,000行 INSERT → 500回の point lookup → `COUNT(*)`）はベンチで確認する**（旧 `DatabaseTests` の `性能:` テスト）。
+  実時間の上限で落とすテストは置かない（マシン依存のため。回帰はベンチの前後比較で見る）。
 - クエリ系は `Database.OpenWith`（同期 compaction）で開き、
   シード後に一度 Close して memtable を SSTable へ flush してから測る
   （背景 compaction のタイミングで揺れないようにする）。

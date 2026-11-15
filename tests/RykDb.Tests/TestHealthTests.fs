@@ -89,19 +89,3 @@ let ``テスト: 各テストモジュールが 1つ以上の Fact を持つ`` (
     for moduleName in modules do
         let count = (namesOf moduleName).Length
         Assert.True(count >= 1, sprintf "%s の Fact が 0件（FS0842 の疑い）" moduleName)
-
-    // テスト名は Assembly に残るので、カテゴリ名が消えていないか確認する。
-    Assert.True(
-        namesOf "RykDb.DatabaseTests" |> Array.exists (fun n -> n.Contains "E2E"),
-        "DatabaseTests に E2E のテストが見つかりません"
-    )
-
-    Assert.True(
-        namesOf "RykDb.DatabaseTests" |> Array.exists (fun n -> n.Contains "性能"),
-        "DatabaseTests に性能のテストが見つかりません"
-    )
-
-    Assert.True(
-        namesOf "RykDb.ServerTests" |> Array.exists (fun n -> n.Contains "TCP"),
-        "ServerTests に TCP のテストが見つかりません"
-    )

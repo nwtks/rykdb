@@ -5,7 +5,8 @@
 // 持つ。flush と compaction worker はこの Host を通して Version を公開する。
 //
 // * 状態は ConcurrentDictionary の単一セル + TryUpdate の末尾再帰 CAS で更新する。
-// * MANIFEST 追記・ファイル番号採番・install は installGate で直列化する。
+// * MANIFEST 追記・install は installGate で直列化し、
+//   ファイル番号採番は ConcurrentDictionary の CAS で行う。
 // * 読み取りは Session 呼び出し単位で Version 全ファイルを pin する。
 //   install は入力を retired にし、refcount が 0 になってから実ファイルを消す。
 // ===========================================================================

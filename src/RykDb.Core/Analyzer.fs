@@ -17,7 +17,7 @@ type internal ScanMethod =
     | SeqScan
     /// 主キーの等値検索
     | PkLookup of SqlValue array
-    /// 索引の等値検索（単一列索引は 1値、複合索引は全列の値）
+    /// 索引の等値検索（単一列索引は 1値、複合索引は先頭から連続した等値列の値）
     | IndexLookup of string * SqlValue array
     /// 範囲走査（主キー / 索引の前方一致）
     | RangeScan of string * SqlValue array * SqlValue array option
@@ -663,7 +663,8 @@ module internal Analyzer =
         List.collect Predicate.splitConjuncts >> accumulateBounds tn colName None None
 
     /// WHERE から等価条件を探して走査方法を決める。
-    /// 複合主キー・複合索引は、全列の等値条件が揃ったときだけ Lookup にする。
+    /// 複合主キーは全列の等値条件が揃ったときだけ PkLookup にし、
+    /// 複合索引は先頭から連続する等値列の範囲で IndexLookup にする。
     let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
         let equalitiesOf tn =
             List.collect Predicate.splitConjuncts

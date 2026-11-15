@@ -54,6 +54,18 @@ let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array ->
 
     File.WriteAllBytes(path, data)
 
+/// キー 1..2 のファイル（10）とキー 3..4 のファイル（11）を作り、11 のマジックを
+/// 壊す（`Sstable.openPartial` が失敗する＝開封時に検出される壊れたファイル）。
+let private twoFilesWithBrokenSecond (dir: string) =
+    let f1 =
+        mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1); Entry.put (intKey 2) 2UL (intRow 2) ]
+
+    let f2 =
+        mkSst dir 11L 0 [ Entry.put (intKey 3) 3UL (intRow 3); Entry.put (intKey 4) 4UL (intRow 4) ]
+
+    patchSstable dir 11L (fun data -> data.[data.Length - Sstable.FooterSize] <- 0x00uy)
+    f1, f2
+
 [<Fact>]
 let ``StorageEngine.getAtMasked: 古い snapshot は SSTable 内の見える版まで戻る`` () =
     withDir "se-snapshot" (fun dir ->
@@ -194,60 +206,6 @@ let ``StorageEngine.scanAtMasked: 先頭 1 件だけなら全件を実体化し�
                 sprintf "先頭 1件の確保 %d バイトが全件 %d バイトに対して大きすぎます" firstBytes fullBytes
             )))
 
-/// キー 1..2 のファイル（10）とキー 3..4 のファイル（11）を作り、11 のマジックを
-/// 壊す（openTable が失敗する＝開封時に検出される壊れたファイル）。
-let private twoFilesWithBrokenSecond (dir: string) =
-    let f1 =
-        mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1); Entry.put (intKey 2) 2UL (intRow 2) ]
-
-    let f2 =
-        mkSst dir 11L 0 [ Entry.put (intKey 3) 3UL (intRow 3); Entry.put (intKey 4) 4UL (intRow 4) ]
-
-    patchSstable dir 11L (fun data -> data.[data.Length - Sstable.FooterSize] <- 0x00uy)
-    f1, f2
-
-[<Fact>]
-let ``StorageEngine.getAtMasked / scanAtMasked: 必要なブロックだけを部分読みする`` () =
-    withDir "se-partial-blocks" (fun dir ->
-        withEngine dir (fun engine ->
-            // 300件 = 3ブロック（128件ずつ）
-            let entries =
-                [ for i in 0..299 -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i) ]
-
-            let f = mkSst dir 10L 0 entries
-
-            // 2番目のブロックの内部を壊す（ブロックのチェックサムも合わなくなる）。
-            let path = FileMetaData.path dir 10L
-            let reader = ok (Sstable.openPartial path)
-            let block = reader.Index.[1]
-            let data = File.ReadAllBytes path
-            data.[block.Offset + 2] <- data.[block.Offset + 2] ^^^ 0xFFuy
-            File.WriteAllBytes(path, data)
-            File.SetLastWriteTimeUtc(path, System.DateTime.UtcNow.AddSeconds 1.0)
-
-            let engine =
-                { engine with
-                    Version = Version.Empty |> Version.addFile f
-                }
-
-            // ブロック 0 のキーは読める
-            Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] engine)).IsSome)
-            // ブロック 1 のキーは壊れている
-            expectErrorKind
-                ErrorKind.CorruptionError
-                "必要なブロックの破損は検出する"
-                (StorageEngine.getAtMasked None (intKey 200) [||] engine)
-            // limit 5 はブロック 0 だけで足りる
-            let five =
-                ok (StorageEngine.scanAtMasked None 5 [||] [||] engine) |> SstScan.toArray |> ok
-
-            Assert.Equal<int>(5, five.Length)
-            // 全件走査は壊れたブロックのチェックサムで検出する
-            expectErrorKind
-                ErrorKind.CorruptionError
-                "全件走査は壊れたブロックを検出する"
-                (ok (StorageEngine.scanAtMasked None 0 [||] [||] engine) |> SstScan.toArray)))
-
 [<Fact>]
 let ``StorageEngine.scanAtMasked: limit 1 は後続の壊れたファイルを開かない`` () =
     withDir "se-lazy-open" (fun dir ->
@@ -320,6 +278,48 @@ let ``StorageEngine.scanAtMasked: 欠落ファイルは必要になった時点�
                  |> SstScan.toArray)))
 
 [<Fact>]
+let ``StorageEngine.getAtMasked / scanAtMasked: 必要なブロックだけを部分読みする`` () =
+    withDir "se-partial-blocks" (fun dir ->
+        withEngine dir (fun engine ->
+            // 300件 = 3ブロック（128件ずつ）
+            let entries =
+                [ for i in 0..299 -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i) ]
+
+            let f = mkSst dir 10L 0 entries
+
+            // 2番目のブロックの内部を壊す（ブロックのチェックサムも合わなくなる）。
+            let path = FileMetaData.path dir 10L
+            let reader = ok (Sstable.openPartial path)
+            let block = reader.Index.[1]
+            let data = File.ReadAllBytes path
+            data.[block.Offset + 2] <- data.[block.Offset + 2] ^^^ 0xFFuy
+            File.WriteAllBytes(path, data)
+            File.SetLastWriteTimeUtc(path, System.DateTime.UtcNow.AddSeconds 1.0)
+
+            let engine =
+                { engine with
+                    Version = Version.Empty |> Version.addFile f
+                }
+
+            // ブロック 0 のキーは読める
+            Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] engine)).IsSome)
+            // ブロック 1 のキーは壊れている
+            expectErrorKind
+                ErrorKind.CorruptionError
+                "必要なブロックの破損は検出する"
+                (StorageEngine.getAtMasked None (intKey 200) [||] engine)
+            // limit 5 はブロック 0 だけで足りる
+            let five =
+                ok (StorageEngine.scanAtMasked None 5 [||] [||] engine) |> SstScan.toArray |> ok
+
+            Assert.Equal<int>(5, five.Length)
+            // 全件走査は壊れたブロックのチェックサムで検出する
+            expectErrorKind
+                ErrorKind.CorruptionError
+                "全件走査は壊れたブロックを検出する"
+                (ok (StorageEngine.scanAtMasked None 0 [||] [||] engine) |> SstScan.toArray)))
+
+[<Fact>]
 let ``StorageEngine.maybeFlush: flush 後に compaction が不要なら compactOnce は noop で返す`` () =
     withDir "se-mf-noop" (fun dir ->
         withEngine dir (fun engine ->
@@ -364,16 +364,6 @@ let ``StorageEngine.maybeFlush: 4 本目の L0 で compactOnce が L0→L1 compa
             Assert.False(File.Exists(FileMetaData.path dir 12L))))
 
 [<Fact>]
-let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush する`` () =
-    withDir "se-disk-flush" (fun dir ->
-        let engine = ok (StorageEngine.openDatabaseWith None dir)
-        let disk = DiskStorageEngine { engine with MemLimitBytes = 1 } :> IStorageEngine
-        let disk = ok (disk.WriteBatch [| Entry.put (intKey 1) 1UL (intRow 1) |])
-        let disk = ok (disk.MaybeFlush())
-        Assert.NotEmpty(Directory.GetFiles(dir, "*" + FileMetaData.SstExtension))
-        Assert.True((ok (disk.GetAtMasked None (intKey 1) [||])).IsSome))
-
-[<Fact>]
 let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engine を返す`` () =
     withDir "se-mf-err" (fun dir ->
         withEngine dir (fun engine ->
@@ -412,7 +402,17 @@ let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engin
             Assert.True(File.Exists(FileMetaData.path dir 12L))))
 
 [<Fact>]
-let ``StorageEngine.openDatabase: 実ファイルが消えていても NextFileNumber は進む`` () =
+let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush する`` () =
+    withDir "se-disk-flush" (fun dir ->
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
+        let disk = DiskStorageEngine { engine with MemLimitBytes = 1 } :> IStorageEngine
+        let disk = ok (disk.WriteBatch [| Entry.put (intKey 1) 1UL (intRow 1) |])
+        let disk = ok (disk.MaybeFlush())
+        Assert.NotEmpty(Directory.GetFiles(dir, "*" + FileMetaData.SstExtension))
+        Assert.True((ok (disk.GetAtMasked None (intKey 1) [||])).IsSome))
+
+[<Fact>]
+let ``StorageEngine.openDatabaseWith: 実ファイルが消えていても NextFileNumber は進む`` () =
     withDir "re-next-file" (fun dir ->
         ok (Manifest.ensureDirectory dir)
         // Version が参照するファイルが実在しない状態 + 番号 0 の WAL を作る
@@ -428,7 +428,7 @@ let ``StorageEngine.openDatabase: 実ファイルが消えていても NextFileN
         Assert.Empty(Version.allFiles engine.Version))
 
 [<Fact>]
-let ``StorageEngine.openDatabase: 最大 SeqNo はファイルの並び順に関係なく取れる`` () =
+let ``StorageEngine.openDatabaseWith: 最大 SeqNo はファイルの並び順に関係なく取れる`` () =
     withDir "re-seqmax" (fun dir ->
         ok (Manifest.ensureDirectory dir)
         let _ = ok (Manifest.openOrCreate dir)
@@ -445,7 +445,7 @@ let ``StorageEngine.openDatabase: 最大 SeqNo はファイルの並び順に関
         Assert.Equal(6UL, engine.NextSeqNo))
 
 [<Fact>]
-let ``StorageEngine.openDatabase: NextTxnId は WAL の最大 txnId + 1 から再開する`` () =
+let ``StorageEngine.openDatabaseWith: NextTxnId は WAL の最大 txnId + 1 から再開する`` () =
     withDir "re-next-txn" (fun dir ->
         let engine = ok (StorageEngine.openDatabaseWith None dir)
 
@@ -465,7 +465,7 @@ let ``StorageEngine.openDatabase: NextTxnId は WAL の最大 txnId + 1 から�
         Assert.Equal<uint64<txnId>>(3UL<txnId>, (ok (StorageEngine.openDatabaseWith None dir)).NextTxnId))
 
 [<Fact>]
-let ``StorageEngine.openDatabase: 孤児の SSTable は削除せず退避する`` () =
+let ``StorageEngine.openDatabaseWith: 孤児の SSTable は削除せず退避する`` () =
     withDir "re5" (fun dir ->
         withEngine dir (fun _ -> ())
         // MANIFEST に無いファイルを 1 個置いてから開く

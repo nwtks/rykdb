@@ -236,8 +236,9 @@ module internal Ops =
             substituteAggs offsets wholeOffsets row predicate
             >>= Eval.matchesWith resolve row
 
-    /// 集約の 1 項目分の_accumulator。
-    /// SUM / AVG は decimal で累積し、最後に型を決める（丸め誤差を避ける）。
+    /// 集約の 1 項目分のアキュムレータ。
+    /// SUM / AVG は REAL が現れるまでは decimal、現れた後は double で累積し、最後に型を決める
+    /// （整数・DECIMAL の丸め誤差を避ける）。
     type private Acc =
         {
             Kind: AggFunc

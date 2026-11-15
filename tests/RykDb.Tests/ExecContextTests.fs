@@ -97,7 +97,6 @@ let ``ExecContext.schemaOf: 大文字小文字違いのキーでも引ける`` (
     withStore "ec-schemaof-alias" (fun store ->
         let c0 = ExecContext.create store None
         let c1 = ExecContext.withSchema "People" peopleSchema c0
-
         // Map は Ordinal なので完全一致しないが、eqName で一致するキーへ落ちる
         let s = ok (ExecContext.schemaOf "people" c1)
         Assert.Equal("people", s.Name))
@@ -108,7 +107,6 @@ let ``ExecContext.schemaOf: カタログのテーブルへフォールバック�
         let cat = Catalog.addTable Catalog.Empty (Catalog.toDefinition peopleSchema)
         let c0 = ExecContext.create store None
         let c1 = ExecContext.withCatalog cat c0
-
         // Schemas に無くても Catalog から引ける
         let s = ok (ExecContext.schemaOf "PEOPLE" c1)
         Assert.Equal("people", s.Name))

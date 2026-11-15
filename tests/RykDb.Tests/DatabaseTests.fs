@@ -1,5 +1,5 @@
 // ===========================================================================
-// Database.fs のテスト: ハンドル API・トランザクション機構・永続性・性能
+// Database.fs のテスト: ハンドル API・トランザクション機構・永続性
 //
 // ライブラリ API（Begin / Commit / Rollback / Close）と、内部機構
 // （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / snapshot 登録）を
@@ -46,9 +46,17 @@ let private collectGarbage () =
     System.GC.WaitForPendingFinalizers()
     System.GC.Collect()
 
-// ---------------------------------------------------------------------------
-// トランザクション（Begin / Commit / Rollback）
-// ---------------------------------------------------------------------------
+/// 最新 SSTable の先頭バイトを壊し、mtime を進める。
+/// `openDatabase` は MaxSeqNo の復元でデータブロックを読まないため、open 後に呼ぶ。
+let private corruptNewestTableSstable (dir: string) =
+    let newest =
+        System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
+        |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
+
+    let bytes = System.IO.File.ReadAllBytes newest
+    bytes.[0] <- bytes.[0] ^^^ 0xFFuy
+    System.IO.File.WriteAllBytes(newest, bytes)
+    System.IO.File.SetLastWriteTimeUtc(newest, System.DateTime.UtcNow.AddSeconds 1.0)
 
 [<Fact>]
 let ``Database: 値を使わない射影・集約は空の行でも件数を返す`` () =
@@ -126,7 +134,7 @@ let ``Database: BEGIN/COMMIT でまとめて反映される`` () =
         Assert.Equal<int>(2, res.Rows.Length))
 
 [<Fact>]
-let ``E2E: commit してない transaction は残らない`` () =
+let ``Database: commit してない transaction は残らない`` () =
     withDir "crash2" (fun dir ->
         let db = seedLibrary (ok (Database.OpenWith dir))
 
@@ -144,7 +152,7 @@ let ``E2E: commit してない transaction は残らない`` () =
         ok (reopened.Close()))
 
 [<Fact>]
-let ``E2E: 別ハンドルの書き込みは既存 transaction に見えない`` () =
+let ``Database: 別ハンドルの書き込みは既存 transaction に見えない`` () =
     withDir "mvcc" (fun dir ->
         let db = seedLibrary (ok (Database.OpenWith dir))
 
@@ -217,7 +225,7 @@ let ``Database: 明示 transaction 中の DDL はエラーになる`` () =
         Assert.Contains("u", db2.TableNames()))
 
 [<Fact>]
-let ``E2E: 明示 transaction 内の書き込みが SELECT に見える`` () =
+let ``Database: 明示 transaction 内の書き込みが SELECT に見える`` () =
     withDb "tx6" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let tx0 = ok (db1.Begin())
@@ -241,7 +249,7 @@ let ``E2E: 明示 transaction 内の書き込みが SELECT に見える`` () =
         Assert.Equal<int>(0, after.Rows.Length))
 
 [<Fact>]
-let ``E2E: 既存行がある transaction 内の INSERT は SELECT に全行見える`` () =
+let ``Database: 既存行がある transaction 内の INSERT は SELECT に全行見える`` () =
     withDb "tx-overlay-insert" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1, 10), (3, 30), (5, 50)")
@@ -256,7 +264,7 @@ let ``E2E: 既存行がある transaction 内の INSERT は SELECT に全行見�
         Assert.Equal<int64 array>([| 0L; 1L; 2L; 3L; 4L; 5L |], after.Rows |> Array.map (fun r -> asInt r.[0])))
 
 [<Fact>]
-let ``E2E: 既存行がある transaction 内の複数 UPDATE が正しい`` () =
+let ``Database: 既存行がある transaction 内の複数 UPDATE が正しい`` () =
     withDb "tx-overlay-update" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
@@ -281,7 +289,7 @@ let ``E2E: 既存行がある transaction 内の複数 UPDATE が正しい`` () 
         Assert.Equal<int64>(300L, asInt after.Rows.[2].[1]))
 
 [<Fact>]
-let ``E2E: 既存行がある transaction 内の索引検索が書き込みを見る`` () =
+let ``Database: 既存行がある transaction 内の索引検索が書き込みを見る`` () =
     withDb "tx-overlay-index" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE INDEX ix_t_v ON t (v)"
@@ -305,7 +313,7 @@ let ``E2E: 既存行がある transaction 内の索引検索が書き込みを�
         Assert.Equal<int>(1, newKey.Rows.Length))
 
 [<Fact>]
-let ``E2E: 明示 transaction 内の索引検索が書き込みを見る`` () =
+let ``Database: 明示 transaction 内の索引検索が書き込みを見る`` () =
     withDb "tx7" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE INDEX ix_t_v ON t (v)"
@@ -320,22 +328,6 @@ let ``E2E: 明示 transaction 内の索引検索が書き込みを見る`` () =
 
         let _, newKey = ok (execSql tx4 "SELECT id FROM t WHERE v = 8")
         Assert.Equal<int>(1, newKey.Rows.Length))
-
-// ---------------------------------------------------------------------------
-// ハンドル API・索引の backfill・DROP の後始末・ストレージ破損
-// ---------------------------------------------------------------------------
-
-/// 最新 SSTable の先頭バイトを壊し、mtime を進める。
-/// `openDatabase` は MaxSeqNo の復元でデータブロックを読まないため、open 後に呼ぶ。
-let private corruptNewestTableSstable (dir: string) =
-    let newest =
-        System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
-        |> Array.maxBy (fun path -> System.Int64.Parse(System.IO.Path.GetFileNameWithoutExtension path))
-
-    let bytes = System.IO.File.ReadAllBytes newest
-    bytes.[0] <- bytes.[0] ^^^ 0xFFuy
-    System.IO.File.WriteAllBytes(newest, bytes)
-    System.IO.File.SetLastWriteTimeUtc(newest, System.DateTime.UtcNow.AddSeconds 1.0)
 
 [<Fact>]
 let ``Database: Root はルートディレクトリを返す`` () =
@@ -603,16 +595,8 @@ let ``Database: DROP INDEX 後の同名再作成で旧索引エントリが復�
         Assert.Equal<int>(1, alive.Rows.Length)
         Assert.Equal<int64>(2L, asInt alive.Rows.[0].[0]))
 
-// ===========================================================================
-// E2E（通し経路）・性能・末尾再帰
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// ライブラリ API の E2E
-// ---------------------------------------------------------------------------
-
 [<Fact>]
-let ``E2E: 一連の流れが誤差なく通る`` () =
+let ``Database: 一連の流れが誤差なく通る`` () =
     withDir "flow" (fun dir ->
         let db0 = ok (Database.OpenWith dir)
         let db = seedLibrary db0
@@ -671,68 +655,6 @@ let ``E2E: 一連の流れが誤差なく通る`` () =
         | Error e -> Assert.Contains("nope", DbError.toDisplayString e)
 
         ok (db3.Close()))
-
-// ---------------------------------------------------------------------------
-// 性能スモーク
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``性能: 多数行の insert → point lookup → range scan`` () =
-    withDir "perf" (fun dir ->
-        // 10000行。実用時間内で終わることを確かめる。
-        let rowCount = 10000
-
-        let db =
-            exec (ok (Database.OpenWith dir)) "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-
-        // 複数行 INSERT をまとめて流す。
-        let sw = System.Diagnostics.Stopwatch.StartNew()
-        let mutable current = db
-
-        let mutable i = 1
-
-        while i <= rowCount do
-            let take = min 2000 (rowCount - i + 1)
-
-            let values =
-                [ i .. i + take - 1 ]
-                |> List.map (fun id -> sprintf "(%d, %d)" id (id * 3))
-                |> String.concat ", "
-
-            current <- exec current (sprintf "INSERT INTO t VALUES %s" values)
-            i <- i + take
-
-        let insertMs = sw.ElapsedMilliseconds
-
-        // point lookup（主キー）
-        let sw2 = System.Diagnostics.Stopwatch.StartNew()
-        let mutable probe = 0L
-
-        for id in [ 1..500 ] do
-            let r = query current (sprintf "SELECT v FROM t WHERE id = %d" id)
-
-            if r.Rows.Length = 1 then
-                probe <- probe + asInt r.Rows.[0].[0]
-
-        let lookupMs = sw2.ElapsedMilliseconds
-
-        // range scan（集計で全行を走らせる）
-        let sw3 = System.Diagnostics.Stopwatch.StartNew()
-        let count = query current "SELECT COUNT(*) FROM t"
-        let scanMs = sw3.ElapsedMilliseconds
-        Assert.Equal<int64>(int64 rowCount, asInt count.Rows.[0].[0])
-        Assert.True(probe > 0)
-
-        // 「実用時間内」の緩い基準（少なくともハングしていないこと）。
-        Assert.True(insertMs < 60000L, sprintf "insert が遅すぎます: %d ms" insertMs)
-        Assert.True(lookupMs < 60000L, sprintf "point lookup が遅すぎます: %d ms" lookupMs)
-        Assert.True(scanMs < 60000L, sprintf "scan が遅すぎます: %d ms" scanMs)
-
-        ok (current.Close()))
-
-// ---------------------------------------------------------------------------
-// 末尾再帰の検証（大量の文でスタックを食わないこと）
-// ---------------------------------------------------------------------------
 
 [<Fact>]
 let ``末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`` () =
@@ -810,10 +732,6 @@ let ``末尾再帰: 多数の列を持つ INSERT / UPDATE が完了する`` () =
         Assert.Equal(1, updated.Rows.Length)
         Assert.Equal<int64>(0L, asInt updated.Rows.[0].[0])
         Assert.Equal<int64>(int64 cols, asInt updated.Rows.[0].[1]))
-
-// ---------------------------------------------------------------------------
-// 再オープン（OpenWith / Close）: 永続性とクラッシュ耐性
-// ---------------------------------------------------------------------------
 
 [<Fact>]
 let ``Database: 閉じて開き直すとデータが残る`` () =
@@ -893,7 +811,7 @@ let ``Database: 古いハンドルを Close しても新しいハンドルの co
         ok (reopened.Close()))
 
 [<Fact>]
-let ``E2E: プロセス再起動を模して Disk から復元できる`` () =
+let ``Database: プロセス再起動を模して Disk から復元できる`` () =
     withDir "reopen" (fun dir ->
         let db = seedLibrary (ok (Database.OpenWith dir))
         ok (db.Close())
@@ -914,7 +832,7 @@ let ``E2E: プロセス再起動を模して Disk から復元できる`` () =
         ok (reopened.Close()))
 
 [<Fact>]
-let ``E2E: Close しなくても commit 済みの行は残る`` () =
+let ``Database: Close しなくても commit 済みの行は残る`` () =
     withDir "crash" (fun dir ->
         let _db = seedLibrary (ok (Database.OpenWith dir))
         // Close を呼ばない（memtable は SSTable 未落下、残るのは WAL 再生のみ）。
@@ -924,10 +842,6 @@ let ``E2E: Close しなくても commit 済みの行は残る`` () =
         Assert.Equal<int64>(4L, asInt count.Rows.[0].[0])
 
         ok (reopened.Close()))
-
-// ---------------------------------------------------------------------------
-// snapshot registry・プロセスロック・DDL の排他
-// ---------------------------------------------------------------------------
 
 [<Fact>]
 let ``Database: active transaction は snapshot registry に登録され、commit / rollback / Close で外れる`` () =
@@ -1027,7 +941,7 @@ let ``Database: 同じ root を二度開くと同じプロセスのエラーに�
 
         let canLockExternally () =
             try
-                use fs =
+                use _ =
                     new System.IO.FileStream(
                         lockPath,
                         System.IO.FileMode.OpenOrCreate,

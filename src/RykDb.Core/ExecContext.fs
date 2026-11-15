@@ -184,8 +184,8 @@ module internal DmlOps =
         | None -> ret true
 
     /// 値式を列位置に対応付け、型強制して (位置, 値) のリストにする。
-    /// INSERT は行の外（定数）で、UPDATE は現在行を参照して評価するので、
-    /// 評価器 evalOne を受け取って両方を同じ経路で処理する。
+    /// UPDATE の現在行を使った評価を受け取る
+    /// （INSERT は `evalValues` → `assembleRow` の別経路）。
     let private gatherWith
         (evalOne: Expr -> Result<SqlValue, DbError>)
         (schema: TableSchema)

@@ -41,7 +41,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 `try` / `with` は `protect` のほか、`Manifest.decodeRecord`（base64 の解析）と
 `RowReader` の解放処理（`Session.fs`）で使い、
 いずれも `DbError` に変換するか例外を飲み込んで、外へ出さない。
-`try` / `finally` は `Engine` / `EngineHost` / `Sstable` / `Session` /
+`try` / `finally` は `Engine` / `EngineHost` / `SstScan` / `Session` /
 `ProcessLock` / `StorageEngine` / `Transactions` の解放処理に使う。
 
 失敗は `ErrorKind`（`DbError.Kind`）で分類する。
@@ -129,7 +129,9 @@ JIT は `tail.` を尊重する。
   深さの上限は設けない。回帰テストは `ParserTests` の
   `末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない` と
   `末尾再帰: 5000段の深いサブクエリの入れ子も解析できる`。
-  CPS 群には `[<TailCall>]` を付けない（継続ラムダ内の相互再帰を FS3569 が非末尾と判定するため）。
+  CPS 群でも自己再帰がすべて末尾位置の関数には `[<TailCall>]` を付ける
+  （`parseExprC` / `parseExprBpC` / `parsePrefixC` など）。
+  `parseExprLoopC` は継続ラムダ内の相互再帰を FS3569 が非末尾と判定するため付けない。
 - **述語（比較 / IS / IN / BETWEEN / LIKE）は非結合**にする。
   1つの式に 2つ目の述語が来たら `SyntaxError` にする（`a = b = c` / `a IS NULL = 1`）。
 - **前置演算子は「最低結合強度以上」のときだけ受理する**。
@@ -154,13 +156,14 @@ JIT は `tail.` を尊重する。
 - **`result { }` 計算式はループする関数では使わない**。
   `Delay` でクロージャに包まれるため末尾最適化が効かず、
   500000トークンで Lexer が `StackOverflow` した実測がある。
-- **左偏ヒープのマージは明示スタックで畳む**（`SstMerge`、`Sstable.fs`）。
+- **左偏ヒープのマージは明示スタックで畳む**（`SstMerge`、`SstScan.fs`）。
   再帰の結果を `node` の引数にする形は非末尾になる。
   右スパインを `picked` リストへ積み、`List.fold` で組み直せば自己再帰が消える
   （左偏性により右スパインは log オーダーだが、深度保証に頼らず監査を通す）。
-  ヒープは `SstMerge` に集約し、`StorageEngine.scanAt` と `Compaction` のストリーミング merge が共有する。
+  ヒープは `SstMerge` に集約し、`StorageEngine.scanAtValues` / `scanAtMasked`（内部は `scanAtWith`）と
+  `Compaction` のストリーミング merge が共有する。
   回帰テストは `SstScanTests` の `SstMerge: 多数のソースをまとめてマージできる`、
-  `StorageEngineTests` の `StorageEngine.scanAt: 多数のファイルをキー昇順にマージする`、
+  `StorageEngineTests` の `StorageEngine.scanAtValues: 多数のファイルをキー昇順にマージする`、
   `CompactionTests` の `Compaction: 多数の入力ファイルをストリーミングでマージする`。
 - **`[<TailCall>]` は「その関数本体の自己再帰が全部末尾位置」のときだけ付ける**。
   1つでも外れると FS3569 になり、`TreatWarningsAsErrors` のせいでビルドエラーになる。
@@ -172,7 +175,7 @@ JIT は `tail.` を尊重する。
   - `Plan.runSubquery` — 相関サブクエリの再計画用に自分自身を runner として渡す。
     実際の呼び出しは `Run` の末尾位置（`Result.bind` の継続）で起きるが、
     TailAudit は関数値を引数として渡す形を `bare` として非末尾に数えるため、
-    `StorageEngine.scanAt` の `pull` と同様にベースラインで追認する。
+    `StorageEngine.scanAtWith` の `pull` と同様にベースラインで追認する。
   - 逆に**要素数に比例する反復は `match` に直して末尾再帰にする**
     （`IN` の候補リストと `CASE` の WHEN 節。`eval ... >>= fun` だと候補の数だけスタックが積まれる）。
     カーソルから件数分を読み出す処理（`Catalog` の列定義・名前、`Memtable` のエントリ）は

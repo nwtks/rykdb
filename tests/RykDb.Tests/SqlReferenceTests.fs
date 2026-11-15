@@ -21,6 +21,24 @@ let private asReal (v: SqlValue) =
         Assert.Fail(sprintf "REAL ではありません: %A" v)
         0.0
 
+/// テスト用のテーブルを用意する。
+let private seeded (tag: string) (f: Database -> unit) =
+    withDb tag (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
+
+        let db2, _ =
+            ok (execSql db1 "INSERT INTO people VALUES (1,'alice',30),(2,'bob',25),(3,'carol',35)")
+
+        f db2)
+
+/// SQL を実行し、エラーメッセージに断片が含まれることを確かめる。
+/// §13「よく見るメッセージ（実測）」は文言そのものが仕様なので文字で照合する。
+let private expectMessage (fragment: string) (sql: string) (db: Database) =
+    match execSql db sql with
+    | Ok _ -> Assert.Fail(sprintf "エラーにならないはず: %s" sql)
+    | Error e -> Assert.Contains(fragment, DbError.toDisplayString e)
+
 // ---------------------------------------------------------------------------
 // 静かな誤答を防ぐ（識別子の大小文字・集計・HAVING・LIMIT・DEFAULT）
 // ---------------------------------------------------------------------------
@@ -645,17 +663,6 @@ let ``SqlReference: DELETE は WHERE に合う行を消す`` () =
         let _db4, res = ok (execSql db3 "SELECT id FROM t")
         Assert.Equal<int>(1, res.Rows.Length)
         Assert.Equal<int64>(1L, asInt res.Rows.[0].[0]))
-
-/// テスト用のテーブルを用意する。
-let private seeded (tag: string) (f: Database -> unit) =
-    withDb tag (fun db0 ->
-        let db1 =
-            exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
-
-        let db2, _ =
-            ok (execSql db1 "INSERT INTO people VALUES (1,'alice',30),(2,'bob',25),(3,'carol',35)")
-
-        f db2)
 
 [<Fact>]
 let ``SqlReference: SELECT * は全列を返す`` () =
@@ -1640,6 +1647,32 @@ let ``SqlReference: LENGTH はサロゲートペアを 1文字として数える
         Assert.Equal<int64>(3L, asInt rows.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: LIKE の _ はサロゲートペアを 1文字として扱う`` () =
+    withDb "p1-like-surrogate" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
+
+        let db2 =
+            exec db1 "INSERT INTO t VALUES (1, 'a\U0001F600b'), (2, 'a\U0001F600\U0001F600b'), (3, 'a%b')"
+
+        // サロゲートペア 1個は `_` 1個に一致し、2個なら一致しない。
+        // 'a%b' も「a + 任意の 1 コードポイント + b」なので 1 に含まれる。
+        let _, one = ok (execSql db2 "SELECT id FROM t WHERE s LIKE 'a_b' ORDER BY id")
+        Assert.Equal<int>(2, one.Rows.Length)
+        Assert.Equal<int64>(1L, asInt one.Rows.[0].[0])
+        Assert.Equal<int64>(3L, asInt one.Rows.[1].[0])
+
+        let _, two = ok (execSql db2 "SELECT id FROM t WHERE s LIKE 'a__b'")
+        Assert.Equal<int>(1, two.Rows.Length)
+        Assert.Equal<int64>(2L, asInt two.Rows.[0].[0])
+
+        // ESCAPE 文字自身も 1 コードポイント（サロゲートペア可）
+        let _, esc =
+            ok (execSql db2 "SELECT id FROM t WHERE s LIKE 'a\U0001F600%b' ESCAPE '\U0001F600'")
+
+        Assert.Equal<int>(1, esc.Rows.Length)
+        Assert.Equal<int64>(3L, asInt esc.Rows.[0].[0]))
+
+[<Fact>]
 let ``SqlReference: INSERT DEFAULT VALUES と DEFAULT`` () =
     withDb "p1-default-values" (fun db0 ->
         let db1 =
@@ -1688,13 +1721,6 @@ let ``SqlReference: ORDER BY の式と序数`` () =
 // sql-reference.md の記載を検証（§1 / §2 / §3 / §4 / §5 / §7 / §8 / §9 / §10 /
 // §11 / §12 / §13 / §14）
 // ---------------------------------------------------------------------------
-
-/// SQL を実行し、エラーメッセージに断片が含まれることを確かめる。
-/// §13「よく見るメッセージ（実測）」は文言そのものが仕様なので文字で照合する。
-let private expectMessage (fragment: string) (sql: string) (db: Database) =
-    match execSql db sql with
-    | Ok _ -> Assert.Fail(sprintf "エラーにならないはず: %s" sql)
-    | Error e -> Assert.Contains(fragment, DbError.toDisplayString e)
 
 [<Fact>]
 let ``SqlReference: FROM を省略した SELECT は定数 1 行を返す`` () =

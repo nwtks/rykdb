@@ -223,10 +223,11 @@ let ``TableSchema.requireIndexOf: 無い列はエラー`` () =
     expectErrorKind ErrorKind.NameError "無い列で位置が返った" (TableSchema.requireIndexOf peopleSchema "nope")
 
 [<Fact>]
-let ``Catalog.addTable: 空のカタログにテーブルを追加・検索・削除`` () =
+let ``Catalog.addTable / findTable / removeTable: 空のカタログにテーブルを追加・検索・削除`` () =
     let defn = Catalog.toDefinition peopleSchema
     let c1 = Catalog.addTable Catalog.Empty defn
     Assert.Single c1.Tables |> ignore
+
     Assert.True(Catalog.findTable c1 "people" |> Option.isSome)
     // SQL の識別子は大文字小文字を区別しない
     Assert.True(Catalog.findTable c1 "PEOPLE" |> Option.isSome)
@@ -326,7 +327,7 @@ let ``Catalog.toSchema: 主キー列が存在しない場合はエラー`` () =
     expectError "存在しない主キー列で復元できました" (Catalog.toSchema bad)
 
 [<Fact>]
-let ``Catalog: 保存したカタログを読み込める`` () =
+let ``Catalog.save / load: 保存したカタログを読み込める`` () =
     withStore "cat1" (fun store ->
         let people = Catalog.toDefinition peopleSchema
         let ix = indexDefinition "people" peopleSchema.Indexes.[0]
@@ -343,7 +344,7 @@ let ``Catalog: 保存したカタログを読み込める`` () =
         Assert.Equal<string>("people", loaded.Indexes.[0].TableName))
 
 [<Fact>]
-let ``Catalog: DEFAULT 式は保存・再読込しても復元される`` () =
+let ``Catalog.save / load: DEFAULT 式は保存・再読込しても復元される`` () =
     withStore "cat-default" (fun store ->
         let defaultCol name dt value =
             { col name dt with
@@ -371,7 +372,7 @@ let ``Catalog: DEFAULT 式は保存・再読込しても復元される`` () =
         let loaded = ok (Catalog.load store)
 
         match Catalog.findTable loaded "t" with
-        | None -> Assert.Fail("テーブルが読み込まれていません")
+        | None -> Assert.Fail "テーブルが読み込まれていません"
         | Some t ->
             let defaults =
                 t.Columns

@@ -13,8 +13,8 @@ type internal FileMetaData =
         /// ファイルサイズ（バイト）
         Size: int64
         /// このファイルに含まれる SeqNo の最大値。
-        /// GC の判定に使う：
-        /// 「最古の active snapshot より小さい SeqNo の版はもう誰にも見えないので捨てられる」ために使う。
+        /// 起動時の NextSeqNo 復元に使う
+        /// （GC は `Compaction.gcGroup` が activeSnapshot と版ごとの SeqNo で判定する）。
         MaxSeqNo: uint64
     }
 

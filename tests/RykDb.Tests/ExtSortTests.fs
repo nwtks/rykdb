@@ -27,7 +27,7 @@ let private col (name: string) =
     Expr.Column { Qualifier = None; Name = name }
 
 [<Fact>]
-let ``ExtSort: バジェットが小さいと一時ファイルに溢らして整列できる`` () =
+let ``ExtSort.sortRows: バジェットが小さいと一時ファイルに溢らして整列できる`` () =
     // 1行 ≈ 数十バイト。バジェット 1 ならほぼ毎行が run として溢れる。
     let n = 500
 
@@ -56,29 +56,10 @@ let ``ExtSort: バジェットが小さいと一時ファイルに溢らして�
     Assert.All(leftovers, fun p -> Assert.Fail $"一時ファイルが残っています: {p}")
 
 [<Fact>]
-let ``ExtSort: 比較不能な型は呼び出し時に Error`` () =
-    let mixed =
-        opOfRows
-            [
-                row [ SqlValue.Int 1L; SqlValue.Int 1L ]
-                row [ SqlValue.Text "x"; SqlValue.Int 2L ]
-            ]
-
-    let keys =
-        [
-            {
-                Expression = col "a"
-                Direction = SortDirection.Ascending
-            }
-        ]
-
-    expectErrorKind ErrorKind.TypeError "比較不能な型は Error" (Ops.sortBy schema2 keys mixed)
-
-[<Fact>]
-let ``ExtSort: 5000行を小さなバジェットで溢らしても整列できる`` () =
-    // 1 行ずつ run に溢らしながら 5000行を流す。
+let ``ExtSort.sortRows: 50000行を小さなバジェットで溢らしても整列できる`` () =
+    // 1 行ずつ run に溢らしながら 50000行を流す。
     // ingest が末尾再帰でなければスタックを積み上がる（数百 run で枯渇する）。
-    let n = 5_000
+    let n = 50_000
 
     let rec make (i: int) : Op =
         if i >= n then
@@ -113,3 +94,22 @@ let ``ExtSort: 5000行を小さなバジェットで溢らしても整列でき�
         System.IO.Directory.GetFiles(System.IO.Path.GetTempPath(), "rykdb-sort-*")
 
     Assert.Equal<int>(0, leftovers.Length)
+
+[<Fact>]
+let ``ExtSort.sortRows: 比較不能な型は呼び出し時に Error`` () =
+    let mixed =
+        opOfRows
+            [
+                row [ SqlValue.Int 1L; SqlValue.Int 1L ]
+                row [ SqlValue.Text "x"; SqlValue.Int 2L ]
+            ]
+
+    let keys =
+        [
+            {
+                Expression = col "a"
+                Direction = SortDirection.Ascending
+            }
+        ]
+
+    expectErrorKind ErrorKind.TypeError "比較不能な型は Error" (Ops.sortBy schema2 keys mixed)

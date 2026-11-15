@@ -3,7 +3,7 @@
 //
 // 1. 採番: コミット済みの論理時計を 1つに並ばせる（「DB の時刻」）
 // 2. 可視性: snapshot = SeqNo <= S の書き込みだけ見える。
-//    StorageEngine.getAt / scanAt が SeqNo で絞るので実装はフィルタ 1つだけ
+//    StorageEngine.getAtMasked / scanAtWith が SeqNo で絞るので実装はフィルタ 1つだけ
 // 3. 競合検出: 同じキーに書いたら後から commit した方を失敗させる
 //    （first-committer-wins）
 //
@@ -165,7 +165,7 @@ module internal Transaction =
 
         Set.union physical txn.Reservations
 
-    /// バッファを keyspace ごとに「SeqNo 降順で採番済みの Entry 配列」に変換する。
+    /// バッファを keyspace ごとに「SeqNo 昇順で採番済みの Entry 配列」に変換する。
     /// 採番は nextSeqNo から 1つずつ採番する。
     /// 決定的な順序にするため keyspace 名 → キーの昇順で採番する
     /// （同じ transaction は常に同じ SeqNo 割当になる）。
@@ -521,7 +521,7 @@ type internal RegistrationLease(registration: ActiveRegistration) =
 /// - **DDL**（CREATE INDEX / DROP INDEX / DROP TABLE / CREATE TABLE）は排他ロックを取る。
 /// - **文の実行と commit** は共有ロックを取り、DDL の実行中は待つ。
 /// 明示 transaction はロックを保持しない
-/// （DDL と重なった場合は commit 時にカタログ版の不一致を検出して ConflictError にする。）。
+/// （DDL は active snapshot を検出して ConflictError で拒否する）。
 /// 同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
 /// </remarks>
 module internal RootGate =

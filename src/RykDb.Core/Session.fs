@@ -504,7 +504,8 @@ type private ResultBudget = { RowsLeft: int64; BytesLeft: int64 }
 
 /// `Execute` の前後で transaction の状態がどう変わったか。
 /// <remarks>
-/// サーバが接続ごとの transaction 所有権を判定するために使う。
+/// `Execute` の内部で transaction の遷移を判定するために使う
+/// （公開 API には出さない）。
 /// </remarks>
 [<RequireQualifiedAccess>]
 type private SessionTransactionChange =
@@ -670,7 +671,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                 System.Threading.Monitor.PulseAll stateGate)
 
     /// 読み取り経路。
-    /// SELECT だけを、捕捉したスナップショットに対してロックなしで実行する。
+    /// SELECT / EXPLAIN だけを、捕捉したスナップショットに対してロックなしで実行する。
     let runRead (statements: Statement list) =
         match tryEnterRead () with
         | Error e -> err e
@@ -691,7 +692,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             finally
                 exitRead lease
 
-    /// SELECT だけのバッチか。
+    /// SELECT / EXPLAIN だけのバッチか。
     let isReadOnlyBatch =
         List.forall (function
             | Statement.Select _

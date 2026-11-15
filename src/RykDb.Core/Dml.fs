@@ -167,7 +167,7 @@ module internal Dml =
 
     /// `SstScan` を `Op` に変換する。
     /// `take` が false になった時点で走査を打ち切る（キー昇順なので範囲の上限に使える）。
-    /// `RowStore.scanAtRaw` の None（削除済み）は読み飛ばす。
+    /// `SstScan` が返す None（削除済み）は読み飛ばす。
     let private opOfScan (width: int) (take: SstEntry -> bool) (scan: SstScan) =
         let rowOf (value: SqlValue array option) =
             match value with

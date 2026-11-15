@@ -256,9 +256,11 @@ type internal ScanScope() =
     member internal _.ActiveCount = active.Count
 
 /// SSTable の遅延走査。
-/// `next` を呼ぶまでデータブロックを読まず、呼び出しごとに必要なブロックを1つずつ読む。
+/// `next` を呼ぶまでデータブロックを読まず、呼び出しごとに必要なブロックを最大 8個まとめて読み、
+/// 解析は 1個ずつ行う。
 /// ブロックのチェックサムや内容の検証に失敗した場合は、そのブロックを読む `next` が `Error` を返す。
-/// `openTable` は footer やメタデータを検証するが、まだ読んでいないデータブロックは検証しない。
+/// `Sstable.openPartial` は footer やメタデータを検証するが、
+/// まだ読んでいないデータブロックは検証しない。
 type internal SstScan =
     /// ステップ関数と、途中で捨てられたときの後始末（ファイルを持つ走査だけが使う）。
     | SstScan of (unit -> Result<(SstEntry * SstScan) option, DbError>) * (unit -> unit)

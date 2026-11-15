@@ -3,7 +3,7 @@
 //
 // 探索は「memtable -> L0（新しい順）-> 各レベル（新しい順）」の順。
 // 各ステップで Bloom filter と VersionSet の key range で枝刈りする。
-// 可視性（SeqNo <= snapshot）は getAt / scanAt の visible フィルタで判定する。
+// 可視性（SeqNo <= snapshot）は getAtMasked / scanAtWith の visible フィルタで判定する。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -73,7 +73,7 @@ type internal StorageEngine =
         /// コンパクションの設定
         Compaction: CompactionOptions
         /// 最古の active snapshot の SeqNo。
-        /// GC は「これより新しい版」と「これ以下の最新 1版」を残す（Compaction.gc）。
+        /// GC は「これより新しい版」と「これ以下の最新 1版」を残す（Compaction.gcGroup）。
         /// 0 は「全版を残す」。
         ActiveSnapshot: uint64
         /// 直近の compaction の失敗（成功したら None）。
@@ -320,7 +320,7 @@ module internal StorageEngine =
                 closeState
             |> ret
 
-    /// 範囲ルックアップ（値は復号する）。
+    /// 範囲ルックアップ（`needsValues = true` なら値を復号し、false なら空の行を返す）。
     let scanAtValues visible limit startKey needsValues engine =
         scanAtWith visible limit startKey (if needsValues then None else Some [||]) engine
 
@@ -411,15 +411,14 @@ module internal StorageEngine =
                 return! finishFlush engine version manifestNumber
         }
 
-    /// memtable が上限に達していれば flush し、続けて compaction する。
+    /// memtable が上限に達していれば flush する
+    /// （compaction はしない。background compaction は worker が行う）。
     /// 上限に達していなければ何もしない。
-    /// flush / compaction / WAL rotate は同じ keyspace の writeBatch / close と競合させないため、
+    /// flush / WAL rotate は同じ keyspace の writeBatch / close と競合させないため、
     /// ディレクトリ単位の Gate の内側で行う。
-    /// WAL への書き込みが成功した時点で commit は成立しているため、
-    /// flush / compaction の失敗を Error にしない（呼び出し側が SeqNo を再利用し得る）。
-    /// flush 失敗時は memtable を残して次の write で再試行し、
-    /// compaction 失敗時は flush 後の engine に LastCompactionError を記録して返す。
-    /// 上限に達していれば flush だけを行う（compaction はしない）。
+    /// flush 自体の失敗は Result で返す。
+    /// WAL への書き込みが成功した時点で commit は成立しているため、呼び出し側の `RowStore` はそれを握り潰し、
+    /// 失敗前の memtable を保持して次の write で再試行する。
     /// background compaction の有効時は RowStore がこちらを呼び、MANIFEST 反映後に worker を起こす。
     /// 戻り値の bool は「実際に flush したか」。
     let flushIfNeededWith (allocateFileNumber: unit -> int64) (engine: StorageEngine) =

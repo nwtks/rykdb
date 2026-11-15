@@ -35,6 +35,15 @@ let private selectOf (items: SelectItem list) (from: TableRef option) (joins: Jo
         Offset = None
     }
 
+/// xtra を登録した文脈（people / orders に加えて 3つ目のテーブル）。
+let private ctxWithExtra (store: RowStore) =
+    ctxOf store |> ExecContext.withSchema "xtra" peopleSchema
+
+let private xCol (n: string) =
+    Expr.Column { Qualifier = Some "xtra"; Name = n }
+
+let private eq a b = Expr.Binary(BinaryOp.Eq, a, b)
+
 [<Fact>]
 let ``Optimizer.buildLogicalWith: 単純な SELECT は Scan + Project になる`` () =
     withStore "pl1" (fun store ->
@@ -48,55 +57,6 @@ let ``Optimizer.buildLogicalWith: 単純な SELECT は Scan + Project になる`
         match tree with
         | Logical.Project(_, Logical.Scan(name, ScanMethod.SeqScan)) -> Assert.Equal<string>("people", name)
         | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
-
-[<Fact>]
-let ``Optimizer.explain: 論理木を 1行 1ノードで表示する`` () =
-    withStore "pl-explain" (fun store ->
-        let ctx = ctxOf store
-
-        let stmt =
-            selectOf
-                [ { Expression = Expr.Star; Alias = None } ]
-                (Some { Name = "people"; Alias = None })
-                []
-                (Some(Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))))
-
-        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
-
-        Assert.Equal<string list>(
-            [ "Project(*)"; "  Filter((people.age > 30))"; "    Scan(people, SeqScan)" ],
-            Optimizer.explain ctx tree Schema.empty
-        ))
-
-[<Fact>]
-let ``Optimizer.explain: 結合アルゴリズムも表示する`` () =
-    withStore "pl-explain-join" (fun store ->
-        let ctx = ctxOf store
-
-        let stmt =
-            selectOf
-                [ { Expression = Expr.Star; Alias = None } ]
-                (Some { Name = "people"; Alias = None })
-                [
-                    {
-                        Kind = JoinKind.Inner
-                        Table = TableSource.Named { Name = "orders"; Alias = None }
-                        On = Expr.Binary(BinaryOp.Eq, pCol "id", oCol "person_id")
-                    }
-                ]
-                None
-
-        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
-
-        Assert.Equal<string list>(
-            [
-                "Project(*)"
-                "  Join(INNER, HashJoin, right=orders, on=(people.id = orders.person_id))"
-                "    Scan(people, SeqScan)"
-                "    Scan(orders, SeqScan)"
-            ],
-            Optimizer.explain ctx tree Schema.empty
-        ))
 
 [<Fact>]
 let ``Optimizer.buildLogicalWith: WHERE があれば Scan の直下に Filter が付く`` () =
@@ -466,150 +426,6 @@ let ``Optimizer.buildLogicalWith: 集約と * の併用はエラー`` () =
         expectErrorKind ErrorKind.SyntaxError "集約と * は併用できない" (Optimizer.buildLogicalWith ctx stmt Map.empty))
 
 [<Fact>]
-let ``Optimizer.exec: RangeScan は全走査へ落ちる`` () =
-    withStore "ex-range" (fun store ->
-        let ctx = ctxOf store
-        let schema = Schema.ofTable "people" None peopleSchema
-
-        // 範囲走査はまだ Plan からは作られない（現状は全走査と同じ）
-        let tree =
-            Logical.Scan(
-                "people",
-                ScanMethod.RangeScan("ix_people_age", [| SqlValue.Int 1L |], Some [| SqlValue.Int 9L |])
-            )
-
-        let rows = ok (Op.toArray (ok (Optimizer.exec ctx tree schema)))
-        Assert.Empty rows)
-
-[<Fact>]
-let ``Optimizer.exec: Join 右側のスキーマが引けなくても空スキーマで続行する`` () =
-    withStore "ex-defschema" (fun store ->
-        let ctx = ctxOf store
-        let schema = Schema.ofTable "people" None peopleSchema
-
-        // 登録に無い Join 名（defaultSchema の Error 経路）
-        let tree =
-            Logical.Join(
-                JoinKind.Inner,
-                "missing",
-                Expr.Literal(Literal.Bool true),
-                Logical.Scan("people", ScanMethod.SeqScan),
-                Logical.Scan("people", ScanMethod.SeqScan)
-            )
-
-        let rows = ok (Op.toArray (ok (Optimizer.exec ctx tree schema)))
-        Assert.Empty rows)
-
-[<Fact>]
-let ``Optimizer.exec: Filter の下のラッパーを透過する`` () =
-    withStore "ex-wrappers" (fun store ->
-        let ctx = ctxOf store
-        let schema = Schema.ofTable "people" None peopleSchema
-        let p = Expr.Literal(Literal.Bool true)
-        let scan = Logical.Scan("people", ScanMethod.SeqScan)
-
-        // outputOf が stripWrappers で中身まで降りること（Limit / Distinct / Sort / Having / Project）
-        let wrappers =
-            [
-                Logical.Limit(0, 0, scan)
-                Logical.Distinct scan
-                Logical.Sort(
-                    [
-                        {
-                            Expression = pCol "id"
-                            Direction = SortDirection.Ascending
-                        }
-                    ],
-                    scan
-                )
-                Logical.Having(p, [], [], scan)
-                Logical.Project([ { Expression = Expr.Star; Alias = None } ], scan)
-            ]
-
-        for w in wrappers do
-            let rows = ok (Op.toArray (ok (Optimizer.exec ctx (Logical.Filter(p, w)) schema)))
-            Assert.Empty rows)
-
-[<Fact>]
-let ``Optimizer.exec: Join の左右でエラーになった木は Error を返す`` () =
-    withStore "ex-joinerr" (fun store ->
-        let ctx = ctxOf store
-        let schema = Schema.ofTable "people" None peopleSchema
-        let on = Expr.Literal(Literal.Bool true)
-
-        // 左部分木の実行が失敗する（descend の Error 経路）
-        let badLeft =
-            Logical.Join(
-                JoinKind.Inner,
-                "people",
-                on,
-                Logical.Scan("missing", ScanMethod.SeqScan),
-                Logical.Scan("people", ScanMethod.SeqScan)
-            )
-
-        expectError "左部分木の失敗が伝播していません" (Optimizer.exec ctx badLeft schema)
-
-        // 右部分木の実行が失敗する（unwind の Error 経路）
-        let badRight =
-            Logical.Join(
-                JoinKind.Inner,
-                "people",
-                on,
-                Logical.Scan("people", ScanMethod.SeqScan),
-                Logical.Scan("missing", ScanMethod.SeqScan)
-            )
-
-        expectError "右部分木の失敗が伝播していません" (Optimizer.exec ctx badRight schema)
-
-        // 右部分木の materialize が失敗する（join 実行時の Error 経路）。
-        // 行がある Values にできない式を評価させる（行が無いと評価されない）。
-        let badCol = Expr.Column { Qualifier = None; Name = "nope" }
-        let failingRight = Logical.Filter(badCol, Logical.Values [| SqlValue.Int 1L |])
-
-        let badJoin =
-            Logical.Join(JoinKind.Inner, "people", on, Logical.Scan("people", ScanMethod.SeqScan), failingRight)
-
-        expectError "右の評価失敗が join で伝播していません" (Optimizer.exec ctx badJoin schema))
-
-[<Fact>]
-let ``Plan.runSelect: FROM なしの SELECT は 1 行の定数を返す`` () =
-    withStore "pl10" (fun store ->
-        let ctx = ctxOf store
-
-        let stmt =
-            selectOf
-                [
-                    {
-                        Expression = Expr.Literal(Literal.Int 1L)
-                        Alias = None
-                    }
-                ]
-                None
-                []
-                None
-
-        let columns, op = ok (Plan.runSelect ctx stmt)
-        let rows = ok (Op.toArray op)
-        // FROM なしの入力は 1行 0列で、射影が定数を 1列にする
-        Assert.Equal<string array>([| "1" |], columns)
-        Assert.Equal<int>(1, rows.Length)
-        Assert.Equal<int>(1, rows.[0].Length)
-        Assert.Equal<int64>(1L, asInt rows.[0].[0]))
-
-// ---------------------------------------------------------------------------
-// 結合述語の昇格と INNER の結合順
-// ---------------------------------------------------------------------------
-
-/// xtra を登録した文脈（people / orders に加えて 3つ目のテーブル）。
-let private ctxWithExtra (store: RowStore) =
-    ctxOf store |> ExecContext.withSchema "xtra" peopleSchema
-
-let private xCol (n: string) =
-    Expr.Column { Qualifier = Some "xtra"; Name = n }
-
-let private eq a b = Expr.Binary(BinaryOp.Eq, a, b)
-
-[<Fact>]
 let ``Optimizer.buildLogicalWith: WHERE の結合述語は INNER の ON へ昇格する`` () =
     withStore "pl-promote" (fun store ->
         let ctx = ctxOf store
@@ -739,3 +555,183 @@ let ``Optimizer.buildLogicalWith: INNER の後に続く LEFT JOIN も積まれ�
         | Logical.Project(_, Logical.Join(JoinKind.Left, "xtra", _, Logical.Join(JoinKind.Inner, "orders", _, _, _), _)) ->
             ()
         | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+
+[<Fact>]
+let ``Optimizer.exec: RangeScan は全走査へ落ちる`` () =
+    withStore "ex-range" (fun store ->
+        let ctx = ctxOf store
+        let schema = Schema.ofTable "people" None peopleSchema
+
+        // 範囲走査はまだ Plan からは作られない（現状は全走査と同じ）
+        let tree =
+            Logical.Scan(
+                "people",
+                ScanMethod.RangeScan("ix_people_age", [| SqlValue.Int 1L |], Some [| SqlValue.Int 9L |])
+            )
+
+        let rows = ok (Op.toArray (ok (Optimizer.exec ctx tree schema)))
+        Assert.Empty rows)
+
+[<Fact>]
+let ``Optimizer.exec: Join 右側のスキーマが引けなくても空スキーマで続行する`` () =
+    withStore "ex-defschema" (fun store ->
+        let ctx = ctxOf store
+        let schema = Schema.ofTable "people" None peopleSchema
+
+        // 登録に無い Join 名（defaultSchema の Error 経路）
+        let tree =
+            Logical.Join(
+                JoinKind.Inner,
+                "missing",
+                Expr.Literal(Literal.Bool true),
+                Logical.Scan("people", ScanMethod.SeqScan),
+                Logical.Scan("people", ScanMethod.SeqScan)
+            )
+
+        let rows = ok (Op.toArray (ok (Optimizer.exec ctx tree schema)))
+        Assert.Empty rows)
+
+[<Fact>]
+let ``Optimizer.exec: Filter の下のラッパーを透過する`` () =
+    withStore "ex-wrappers" (fun store ->
+        let ctx = ctxOf store
+        let schema = Schema.ofTable "people" None peopleSchema
+        let p = Expr.Literal(Literal.Bool true)
+        let scan = Logical.Scan("people", ScanMethod.SeqScan)
+
+        // outputOf が stripWrappers で中身まで降りること（Limit / Distinct / Sort / Having / Project）
+        let wrappers =
+            [
+                Logical.Limit(0, 0, scan)
+                Logical.Distinct scan
+                Logical.Sort(
+                    [
+                        {
+                            Expression = pCol "id"
+                            Direction = SortDirection.Ascending
+                        }
+                    ],
+                    scan
+                )
+                Logical.Having(p, [], [], scan)
+                Logical.Project([ { Expression = Expr.Star; Alias = None } ], scan)
+            ]
+
+        for w in wrappers do
+            let rows = ok (Op.toArray (ok (Optimizer.exec ctx (Logical.Filter(p, w)) schema)))
+            Assert.Empty rows)
+
+[<Fact>]
+let ``Optimizer.exec: Join の左右でエラーになった木は Error を返す`` () =
+    withStore "ex-joinerr" (fun store ->
+        let ctx = ctxOf store
+        let schema = Schema.ofTable "people" None peopleSchema
+        let on = Expr.Literal(Literal.Bool true)
+
+        // 左部分木の実行が失敗する（descend の Error 経路）
+        let badLeft =
+            Logical.Join(
+                JoinKind.Inner,
+                "people",
+                on,
+                Logical.Scan("missing", ScanMethod.SeqScan),
+                Logical.Scan("people", ScanMethod.SeqScan)
+            )
+
+        expectError "左部分木の失敗が伝播していません" (Optimizer.exec ctx badLeft schema)
+
+        // 右部分木の実行が失敗する（unwind の Error 経路）
+        let badRight =
+            Logical.Join(
+                JoinKind.Inner,
+                "people",
+                on,
+                Logical.Scan("people", ScanMethod.SeqScan),
+                Logical.Scan("missing", ScanMethod.SeqScan)
+            )
+
+        expectError "右部分木の失敗が伝播していません" (Optimizer.exec ctx badRight schema)
+
+        // 右部分木の materialize が失敗する（join 実行時の Error 経路）。
+        // 行がある Values にできない式を評価させる（行が無いと評価されない）。
+        let badCol = Expr.Column { Qualifier = None; Name = "nope" }
+        let failingRight = Logical.Filter(badCol, Logical.Values [| SqlValue.Int 1L |])
+
+        let badJoin =
+            Logical.Join(JoinKind.Inner, "people", on, Logical.Scan("people", ScanMethod.SeqScan), failingRight)
+
+        expectError "右の評価失敗が join で伝播していません" (Optimizer.exec ctx badJoin schema))
+
+[<Fact>]
+let ``Optimizer.explain: 論理木を 1行 1ノードで表示する`` () =
+    withStore "pl-explain" (fun store ->
+        let ctx = ctxOf store
+
+        let stmt =
+            selectOf
+                [ { Expression = Expr.Star; Alias = None } ]
+                (Some { Name = "people"; Alias = None })
+                []
+                (Some(Expr.Binary(BinaryOp.Gt, pCol "age", Expr.Literal(Literal.Int 30L))))
+
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
+
+        Assert.Equal<string list>(
+            [ "Project(*)"; "  Filter((people.age > 30))"; "    Scan(people, SeqScan)" ],
+            Optimizer.explain ctx tree Schema.empty
+        ))
+
+[<Fact>]
+let ``Optimizer.explain: 結合アルゴリズムも表示する`` () =
+    withStore "pl-explain-join" (fun store ->
+        let ctx = ctxOf store
+
+        let stmt =
+            selectOf
+                [ { Expression = Expr.Star; Alias = None } ]
+                (Some { Name = "people"; Alias = None })
+                [
+                    {
+                        Kind = JoinKind.Inner
+                        Table = TableSource.Named { Name = "orders"; Alias = None }
+                        On = Expr.Binary(BinaryOp.Eq, pCol "id", oCol "person_id")
+                    }
+                ]
+                None
+
+        let tree = ok (Optimizer.buildLogicalWith ctx stmt Map.empty)
+
+        Assert.Equal<string list>(
+            [
+                "Project(*)"
+                "  Join(INNER, HashJoin, right=orders, on=(people.id = orders.person_id))"
+                "    Scan(people, SeqScan)"
+                "    Scan(orders, SeqScan)"
+            ],
+            Optimizer.explain ctx tree Schema.empty
+        ))
+
+[<Fact>]
+let ``Plan.runSelect: FROM なしの SELECT は 1 行の定数を返す`` () =
+    withStore "pl10" (fun store ->
+        let ctx = ctxOf store
+
+        let stmt =
+            selectOf
+                [
+                    {
+                        Expression = Expr.Literal(Literal.Int 1L)
+                        Alias = None
+                    }
+                ]
+                None
+                []
+                None
+
+        let columns, op = ok (Plan.runSelect ctx stmt)
+        let rows = ok (Op.toArray op)
+        // FROM なしの入力は 1行 0列で、射影が定数を 1列にする
+        Assert.Equal<string array>([| "1" |], columns)
+        Assert.Equal<int>(1, rows.Length)
+        Assert.Equal<int>(1, rows.[0].Length)
+        Assert.Equal<int64>(1L, asInt rows.[0].[0]))

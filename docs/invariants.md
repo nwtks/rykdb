@@ -23,7 +23,7 @@ F# の型システムでは表現できないため、
 | -------------- | ----------------------------------------------------- | ----------------------------------------------------------------------- |
 | 型             | DU / record / newtype / units of measure で表現できる | `SqlValue`、`DataType`、`TruthValue`                                    |
 | コンストラクタ | 生ケースを隠し、スマートコンストラクタだけを使う      | `Op.fsi`（ケース非公開）と `Op.Empty` / `ofRow` / `emit` / `compute`    |
-| `validate`     | テストから呼ぶ `Result` ベースの検査関数              | `Version.validate`、`TransactionManager.validate`                       |
+| `validate`     | テストから呼ぶ `Result` ベースの検査関数              | `VersionSetTests.fs` / `TransactionsTests.fs` 内の private `validate`   |
 | プロパティ     | ランダム入力で性質を検査する                          | `OrderingPropertyTests`                                                 |
 | 構築制限       | `.fsi` でレコード・DU のケースを隠す                  | `Op.fsi` / `Writer.fsi` / `SstScan.fsi` / `Cursor.fsi` / `Memtable.fsi` |
 | 実行時         | 本番経路で `Result` として検出する                    | チェックサム、SSTable のキー順検証                                      |
@@ -36,15 +36,15 @@ F# の型システムでは表現できないため、
 | INV-02 | 返した行は DB 内部と独立                                 | `SqlValue.copyRow`、`Engine.runSelect`、`RowReader.TryRead`                                                                                                                           | ✅ 完了 |
 | INV-03 | キー順の定義は 1つ                                       | `KeyOrder.compare`、`Entry.compareKeys`、`SstEntry.compare`                                                                                                                           | ✅ 完了 |
 | INV-04 | 意味の違う番号（manifest / file / seq / txn）を混ぜない  | 単位 `manifestNo` / `txnId`（同型ペアの片側だけに付与）                                                                                                                               | ✅ 完了 |
-| INV-05 | `TransactionManager` の SeqNo / Active / LastCommitted   | `TransactionManager.validate`                                                                                                                                                         | ✅ 完了 |
-| INV-06 | `Version` のレベル・番号・範囲                           | `Version.validate`                                                                                                                                                                    | ✅ 完了 |
+| INV-05 | `TransactionManager` の SeqNo / Active / LastCommitted   | `TransactionsTests.fs` の private `validate`                                                                                                                                          | ✅ 完了 |
+| INV-06 | `Version` のレベル・番号・範囲                           | `VersionSetTests.fs` の private `validate`                                                                                                                                            | ✅ 完了 |
 | INV-07 | compaction GC は可視集合を保存                           | `Compaction.gcGroup` と可視性プロパティテスト                                                                                                                                         | ✅ 完了 |
 | INV-08 | MANIFEST は追記専用・番号は単調                          | `VersionEdit` encode/decode + 再オープンのプロパティテスト                                                                                                                            | ✅ 完了 |
 | INV-09 | WAL は commit 済み prefix だけ再生                       | `Wal.foldCommitted` の全切断位置テスト                                                                                                                                                | ✅ 完了 |
 | INV-10 | keyspace 接頭辞が混ざらない                              | `Keyspace.prefixedKey` の往復・非相互接頭辞テスト、`RowStore` のキー分離テスト                                                                                                        | ✅ 完了 |
 | INV-11 | ヘッダ長 = 行幅 = 射影長                                 | `SelectProjection.create`（式・表示ヘッダ・参照ヘッダを一度に構築）                                                                                                                   | ✅ 完了 |
 | INV-12 | `Cursor` は `0 <= Pos <= End <= Data.Length`             | `Cursor.fsi`（レコード非公開、構築は `create` / `createSlice`、前進は `advance`）+ `createSlice` の構築時検証 + プロパティテスト                                                      | ✅ 完了 |
-| INV-13 | `BloomFilter.bitCount` は 8 の倍数                       | 築く側 `bitsFor` が 8 単位に丸める + 読む側 `deserialize` の拒否 + パラメータ網羅テスト                                                                                               | ✅ 完了 |
+| INV-13 | `BloomFilter.BitCount` は 8 の倍数                       | 築く側 `bitsFor` が 8 単位に丸める + 読む側 `deserialize` の拒否 + パラメータ網羅テスト                                                                                               | ✅ 完了 |
 | INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`         | `Memtable.fsi`（構築は `Empty` / `insert` / `apply` に限定）+ `Memtable.insert` の会計とランダム挿入・順序独立性のプロパティテスト                                                    | ✅ 完了 |
 | INV-15 | `RowReader` は Reading / Exhausted / Closed のいずれか   | `RowReaderState`（状態 DU に置き換え、`releaseTo` が遷移と 1回解放を担当）                                                                                                            | ✅ 完了 |
 | INV-16 | `Session` のロック規約                                   | `stateGate` / `writeGate` の設計 + `SessionTests` の並行テスト 6 本                                                                                                                   | ✅ 完了 |
@@ -144,7 +144,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `Active` の TxnId はマップのキーと一致し、`NextTxnId` より小さい
   - `Active` の snapshot は `LastCommitSeqNo` 以下
   - `LastCommitted` の SeqNo は `0 < seq <= LastCommitSeqNo` かつ `seq < NextSeqNo`
-- 担保: `TransactionManager.validate`。
+- 担保: `TransactionsTests.fs` 内の private `validate`（src には公開していない）。
 - 回帰テスト:
   - `TransactionManager.validate: 初期状態は妥当`
   - `TransactionManager.validate: NextSeqNo の逆転を検出`
@@ -163,7 +163,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - 各レベルのファイルは `Smallest` 昇順
   - L1 以上は範囲が重ならない（L0 は重なってよい）
   - `Smallest <= Largest`
-- 担保: `Version.validate`。
+- 担保: `VersionSetTests.fs` 内の private `validate`（src には公開していない）。
 - 回帰テスト:
   - `Version.validate: 空の Version は妥当`
   - `Version.validate: ファイル番号の重複を検出`
@@ -267,8 +267,8 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `releaseTo next` が「`Reading` のときだけ `release ()` を呼んで遷移する」ので、
     `release` は 1 回しか呼ばれないことも型ではなく遷移で保たれる。
   - `Exhausted` と `Closed` はどちらも解放済みで、`TryRead` の結果だけが違う。
-- 回帰テスト: 既存の `RowReader: 終端後の TryRead` / `Dispose 後の TryRead` /
-  `Dispose すると Close が待たずに完了できる`。
+- 回帰テスト: `RowReader: 単一 SELECT を1行ずつ読める`（終端後の `TryRead` を含む） /
+  `RowReader: Dispose すると Close が待たずに完了できる`（Dispose 後の `TryRead` を含む）。
 
 ### INV-16 Session のロック規約
 
@@ -306,9 +306,9 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
     （以前は private / ローカル `let` で外部から検査できなかった）。
   - `AstTests.allNodeKinds`（29 サンプル: 葉 / 1..3 子 / 可変子 / CASE の ELSE 有無 /
     LIKE の ESCAPE 有無 / サブクエリを含む型）で 3点を検査:
-    - `Ast: plugChildren は children と同じ順・同じ内容で復元する（全ノード種）`
-    - `Ast: plugChildren は子を渡した順にそのまま入れる`
-    - `Ast: plugChildren は arity が children と合わないと InternalError`
+    - `Expr.plugChildren: children と同じ順・同じ内容で復元する（全ノード種）`
+    - `Expr.plugChildren: 子を渡した順にそのまま入れる`
+    - `Expr.plugChildren: arity が children と合わないと InternalError`
 - **新しい `Expr` ケースを足したら `AstTests.allNodeKinds` にも足す**
   （ここに無いノードは arity のずれを検出できない）。
 
@@ -368,7 +368,8 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 - 回帰テスト:
   - `Transaction.reserveUnique: 同じ索引値の予約は 1 件にまとまる`
   - `TransactionManager.commit: UNIQUE の論理予約が競合する`
-  - `TransactionManager.commit: UNIQUE の論理予約は active transaction が無くなると GC される`
+  - `TransactionManager.commit: active が無ければ commit 直後に LastCommitted を捨てる`
+    （予約キーも同じ GC 経路で消える）
   - `SessionPool: 接続間で UNIQUE の同時 INSERT を検出する`
   - `SessionPool: 接続間で UNIQUE の同時 UPDATE を検出する`
   - `SessionPool: UNIQUE の NULL は接続間でも重複できる`

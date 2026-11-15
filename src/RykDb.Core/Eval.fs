@@ -29,8 +29,10 @@ type internal ColumnResolver =
 
 module internal Scalar =
     /// LIKE のトークン。
+    /// リテラルは UTF-16 の code unit ではなく Unicode コードポイントで持つ
+    /// （`_` の 1文字と同じ単位に揃える）。
     type private LikeToken =
-        | LiteralChar of char
+        | LiteralCodePoint of int
         | AnyOne
         | AnyMany
 
@@ -38,9 +40,24 @@ module internal Scalar =
     /// パターンは行ごとに変わらないので、1回だけトークン列にして再利用する。
     type private LikePattern = { Tokens: LikeToken array }
 
+    /// 位置 i の Unicode コードポイントと、その UTF-16 幅（1 または 2）。
+    /// 対になっていないサロゲートは 1 コード単位として返す（範囲外アクセスを避ける）。
+    let private codePointAt (text: System.ReadOnlySpan<char>) (i: int) =
+        let c = text.[i]
+
+        if
+            System.Char.IsHighSurrogate c
+            && i + 1 < text.Length
+            && System.Char.IsLowSurrogate text.[i + 1]
+        then
+            struct (System.Char.ConvertToUtf32(c, text.[i + 1]), 2)
+        else
+            struct (int c, 1)
+
     /// ESCAPE を解釈してパターンをトークン列にする。
     /// ESCAPE の後に文字が無ければ TypeError。
-    let private compileTokens (escape: char option) (pattern: string) =
+    /// ESCAPE 文字とエスケープした文字は 1 コードポイントとして扱う。
+    let private compileTokens (escape: int option) (pattern: string) =
         let rec loop i acc =
             if i >= pattern.Length then
                 ret
@@ -48,17 +65,22 @@ module internal Scalar =
                         Tokens = List.rev acc |> List.toArray
                     }
             else
+                let struct (cp, w) = codePointAt (System.MemoryExtensions.AsSpan pattern) i
+
                 match escape with
-                | Some e when pattern.[i] = e ->
-                    if i + 1 >= pattern.Length then
+                | Some e when cp = e ->
+                    if i + w >= pattern.Length then
                         err (DbError.typeError "LIKE の ESCAPE の後に文字がありません")
                     else
-                        loop (i + 2) (LiteralChar pattern.[i + 1] :: acc)
+                        let struct (nextCp, nextW) =
+                            codePointAt (System.MemoryExtensions.AsSpan pattern) (i + w)
+
+                        loop (i + w + nextW) (LiteralCodePoint nextCp :: acc)
                 | _ ->
                     match pattern.[i] with
                     | '%' -> loop (i + 1) (AnyMany :: acc)
                     | '_' -> loop (i + 1) (AnyOne :: acc)
-                    | c -> loop (i + 1) (LiteralChar c :: acc)
+                    | _ -> loop (i + w) (LiteralCodePoint cp :: acc)
 
         loop 0 []
 
@@ -80,7 +102,7 @@ module internal Scalar =
     /// 呼び出しごとにデリゲートを作らないよう、モジュールスコープに 1個だけ置く。
     let private compileEntry =
         System.Func<struct (int * string), Result<LikePattern, DbError>>(fun (struct (code, p)) ->
-            let escape = if code < 0 then None else Some(char code)
+            let escape = if code < 0 then None else Some code
             compileTokens escape p)
 
     /// パターンをコンパイルする（キャッシュ経由）。
@@ -98,10 +120,16 @@ module internal Scalar =
         else
             i
 
+    /// テキストを 1 コードポイント進める（`%` のバックトラック用）。
+    let private advanceCodePoint (text: System.ReadOnlySpan<char>) (i: int) =
+        let struct (_, w) = codePointAt text i
+        i + w
+
     /// トークン列によるワイルドカード照合。
     /// 最後の `%` だけを覚えて戻る貪欲法（指数的なバックトラックをしない）。
     /// `%` の位置は int（-1 = なし）で持つ。option は行ごとに割り当てるため使わない。
     /// span はローカル関数に捕捉できないため、ループはモジュールスコープに置く。
+    /// テキストの位置は UTF-16 の code unit 添字だが、進める単位はコードポイント。
     [<TailCall>]
     let rec private goLike
         (tokens: LikeToken array)
@@ -118,36 +146,57 @@ module internal Scalar =
             skipTrailingStars tokens pi >= m
         elif pi >= m then
             if star >= 0 && starTi < n then
-                goLike tokens text (starTi + 1) (star + 1) star (starTi + 1)
+                let next = advanceCodePoint text starTi
+                goLike tokens text next (star + 1) star next
             else
                 false
         else
             match tokens.[pi] with
             | AnyMany -> goLike tokens text ti (pi + 1) pi ti
-            | AnyOne -> goLike tokens text (ti + 1) (pi + 1) star starTi
-            | LiteralChar c when text.[ti] = c -> goLike tokens text (ti + 1) (pi + 1) star starTi
-            | _ ->
-                if star >= 0 && starTi < n then
-                    goLike tokens text (starTi + 1) (star + 1) star (starTi + 1)
+            | AnyOne -> goLike tokens text (advanceCodePoint text ti) (pi + 1) star starTi
+            | LiteralCodePoint cp ->
+                let struct (c, w) = codePointAt text ti
+
+                if c = cp then
+                    goLike tokens text (ti + w) (pi + 1) star starTi
+                elif star >= 0 && starTi < n then
+                    let next = advanceCodePoint text starTi
+                    goLike tokens text next (star + 1) star next
                 else
                     false
 
     let private matchLikeTokens (tokens: LikeToken array) (text: System.ReadOnlySpan<char>) =
         goLike tokens text 0 0 -1 0
 
-    /// LIKE のパターン照合。`%` は任意の文字列、`_` は 1文字。
+    /// LIKE のパターン照合。
+    /// `%` は任意の文字列、`_` は Unicode コードポイント 1個。
     /// 正規表現に落とさずに手で照合する（LIKE の方言差を吸収するため）。
     /// パターンはキャッシュしたトークン列を使う（行ごとに解析しない）。
-    /// バックトラックは 1 段だけ（無限ループしないことが最優先）。
+    /// バックトラックは 1段だけ（無限ループしないことが最優先）。
     let likeMatch (pattern: string) (text: string) =
         match compileLike NoEscape pattern with
         | Ok compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text)
         | Error _ -> false
 
     /// ESCAPE 付き LIKE。
-    let likeMatchWithEscape (escape: char) (pattern: string) (text: string) =
-        compileLike (int escape) pattern
+    /// `escape` は Unicode コードポイント。
+    let likeMatchWithEscape (escape: int) (pattern: string) (text: string) =
+        compileLike escape pattern
         |> Result.map (fun compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
+
+    /// ESCAPE 句の文字列を 1 コードポイントとして取り出す。
+    /// コードポイントが 1個でなければ TypeError。
+    let escapeCodePoint (s: string) =
+        if s.Length = 1 then
+            ret (int s.[0])
+        elif
+            s.Length = 2
+            && System.Char.IsHighSurrogate s.[0]
+            && System.Char.IsLowSurrogate s.[1]
+        then
+            ret (System.Char.ConvertToUtf32(s, 0))
+        else
+            err (DbError.typeError "LIKE の ESCAPE は 1 文字で指定してください")
 
     /// Unicode のコードポイント数を数える。
     /// `string.Length` は UTF-16 の code unit 数なので、
@@ -704,14 +753,12 @@ module internal Eval =
                 if SqlValue.isNull v then
                     step resolve row rest (Arrive SqlValue.Null)
                 else
-                    let escapeText = SqlValue.toDisplayString v
-
-                    if escapeText.Length <> 1 then
-                        err (DbError.typeError "LIKE の ESCAPE は 1 文字で指定してください")
-                    else
+                    match Scalar.escapeCodePoint (SqlValue.toDisplayString v) with
+                    | Error er -> err er
+                    | Ok escape ->
                         match
                             Scalar.likeMatchWithEscape
-                                escapeText.[0]
+                                escape
                                 (SqlValue.toDisplayString pattern)
                                 (SqlValue.toDisplayString x)
                         with

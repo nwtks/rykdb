@@ -67,6 +67,10 @@ let private validate (m: TransactionManager) =
         return ()
     }
 
+/// root の重複を避ける（xUnit はテストクラス単位で並列に走る）。
+let private freshRoot (tag: string) =
+    System.IO.Path.Combine(System.IO.Path.GetTempPath(), tag + "-" + string System.DateTime.UtcNow.Ticks)
+
 [<Fact>]
 let ``Transaction.create: 空の transaction`` () =
     let snap = { Snapshot.SeqNo = 0UL }
@@ -98,7 +102,7 @@ let ``Transaction.put: 同じ transaction 内の二重書き込みは 1 件に�
     Assert.Equal(1, total)
 
 [<Fact>]
-let ``Transaction: バッファ上限を超えると commit できない`` () =
+let ``TransactionManager.commit: バッファ上限を超えると commit できない`` () =
     let mgr =
         { TransactionManager.create () with
             MaxTransactionBytes = 1L
@@ -142,6 +146,15 @@ let ``Transaction.conflictKey: keyspace と key を連結`` () =
     Assert.True(k.StartsWith "t:people:")
 
 [<Fact>]
+let ``Transaction.reserveUnique: 同じ索引値の予約は 1 件にまとまる`` () =
+    let txn0 = Transaction.create 1UL<txnId> { Snapshot.SeqNo = 0UL }
+    let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |]
+    let txn1 = Transaction.reserveUnique "idx_email" key txn0
+    let txn2 = Transaction.reserveUnique "idx_email" key txn1
+    Assert.Equal(1, txn2.Reservations.Count)
+    Assert.Equal(txn1.ApproxBytes, txn2.ApproxBytes)
+
+[<Fact>]
 let ``Transaction.writeKeys: 書き込みキーを返す`` () =
     let snap = { Snapshot.SeqNo = 0UL }
     let txn0 = Transaction.create 1UL<txnId> snap
@@ -150,13 +163,40 @@ let ``Transaction.writeKeys: 書き込みキーを返す`` () =
     Assert.Equal(1, keys.Count)
 
 [<Fact>]
-let ``Transaction.reserveUnique: 同じ索引値の予約は 1 件にまとまる`` () =
-    let txn0 = Transaction.create 1UL<txnId> { Snapshot.SeqNo = 0UL }
-    let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |]
-    let txn1 = Transaction.reserveUnique "idx_email" key txn0
-    let txn2 = Transaction.reserveUnique "idx_email" key txn1
-    Assert.Equal(1, txn2.Reservations.Count)
-    Assert.Equal(txn1.ApproxBytes, txn2.ApproxBytes)
+let ``Transaction: read-only な transaction は keys が空`` () =
+    let mgr = TransactionManager.create ()
+    let _, txn = TransactionManager.beginTxn mgr
+    Assert.Empty(Transaction.writeKeys txn)
+
+[<Fact>]
+let ``TransactionManager.activeSnapshot: 最古の active snapshot を返す`` () =
+    let mgr = TransactionManager.create ()
+    // active が無ければ「次の SeqNo」
+    Assert.Equal<uint64>(1UL, TransactionManager.activeSnapshot mgr)
+
+    let mgr1, t1 = TransactionManager.beginTxn mgr
+    Assert.Equal<uint64>(0UL, TransactionManager.activeSnapshot mgr1)
+    let t1 = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] t1
+    let mgr2, _, _ = TransactionManager.commit t1 mgr1 |> ok
+    Assert.Equal<uint64>(2UL, TransactionManager.activeSnapshot mgr2)
+
+    // t2 (snapshot 1) が残っている間は、t3 が commit しても境界は 1 のまま
+    let mgr3, t2 = TransactionManager.beginTxn mgr2
+    let mgr4, t3 = TransactionManager.beginTxn mgr3
+    let t3 = Transaction.put "t:y" [| 2uy |] [| SqlValue.Int 2L |] t3
+    let mgr5, _, _ = TransactionManager.commit t3 mgr4 |> ok
+    Assert.Equal<uint64>(1UL, TransactionManager.activeSnapshot mgr5)
+
+    let mgr6 = TransactionManager.abort t2 mgr5
+    Assert.Equal<uint64>(3UL, TransactionManager.activeSnapshot mgr6)
+
+    // SeqNo が上限なら +1 しない
+    let saturated =
+        { TransactionManager.create () with
+            LastCommitSeqNo = System.UInt64.MaxValue
+        }
+
+    Assert.Equal<uint64>(System.UInt64.MaxValue, TransactionManager.activeSnapshot saturated)
 
 [<Fact>]
 let ``TransactionManager.commit: UNIQUE の論理予約が競合する`` () =
@@ -168,98 +208,6 @@ let ``TransactionManager.commit: UNIQUE の論理予約が競合する`` () =
     let txnB = Transaction.reserveUnique "idx_email" key txnB
     let mgr3, _, _ = ok (TransactionManager.commit txnA mgr2)
     expectErrorKind ErrorKind.ConflictError "UNIQUE 予約の競合を検出できない" (TransactionManager.commit txnB mgr3)
-
-[<Fact>]
-let ``Transaction: read-only な transaction は keys が空`` () =
-    let mgr = TransactionManager.create ()
-    let _, txn = TransactionManager.beginTxn mgr
-    Assert.Empty(Transaction.writeKeys txn)
-
-[<Fact>]
-let ``TransactionManager.abort: abort は何も残さない`` () =
-    let mgr = TransactionManager.create ()
-    let mgr, txn = TransactionManager.beginTxn mgr
-    let txn = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] txn
-    Assert.Equal(1, activeCount mgr)
-
-    let mgr = TransactionManager.abort txn mgr
-    Assert.Equal(0, activeCount mgr)
-    Assert.Equal<uint64>(0UL, currentSeqNo mgr)
-
-[<Fact>]
-let ``TransactionManager.validate: 初期状態は妥当`` () =
-    ok (validate (TransactionManager.create ())) |> ignore
-
-[<Fact>]
-let ``TransactionManager.validate: NextSeqNo の逆転を検出`` () =
-    let mgr =
-        { TransactionManager.create () with
-            NextSeqNo = 1UL
-            LastCommitSeqNo = 1UL
-        }
-
-    expectErrorKind ErrorKind.InternalError "NextSeqNo の逆転を検出するはず" (validate mgr)
-
-[<Fact>]
-let ``TransactionManager.validate: Active の snapshot が未来なら検出`` () =
-    let mgr, txn = TransactionManager.beginTxn (TransactionManager.create ())
-
-    let broken =
-        { mgr with
-            Active =
-                Map.add
-                    txn.TxnId
-                    { txn with
-                        Snapshot =
-                            {
-                                Snapshot.SeqNo = mgr.LastCommitSeqNo + 1UL
-                            }
-                    }
-                    mgr.Active
-        }
-
-    expectErrorKind ErrorKind.InternalError "Active の snapshot が未来を検出するはず" (validate broken)
-
-[<Fact>]
-let ``TransactionManager.validate: LastCommitted の範囲外を検出`` () =
-    let mgr =
-        { TransactionManager.create () with
-            LastCommitted = Map.ofList [ ("k", 1UL) ]
-        }
-
-    expectErrorKind ErrorKind.InternalError "LastCommitted の範囲外を検出するはず" (validate mgr)
-
-[<Fact>]
-let ``TransactionManager.validate: begin/put/commit/abort を繰り返しても不変条件を保つ`` () =
-    let random = System.Random 20261111
-    let mutable mgr = TransactionManager.create ()
-    let mutable active: Transaction list = []
-
-    for _ in 1..200 do
-        match random.Next 3 with
-        | 0 ->
-            let next, txn = TransactionManager.beginTxn mgr
-            mgr <- next
-            active <- txn :: active
-        | 1 ->
-            match active with
-            | txn :: rest ->
-                let txn =
-                    Transaction.put "t:x" [| byte (random.Next 4) |] [| SqlValue.Int(int64 (random.Next 100)) |] txn
-
-                active <- txn :: rest
-            | [] -> ()
-        | _ ->
-            match active with
-            | txn :: rest ->
-                match TransactionManager.commit txn mgr with
-                | Ok(next, _, _) -> mgr <- next
-                | Error _ -> mgr <- TransactionManager.abort txn mgr
-
-                active <- rest
-            | [] -> ()
-
-        ok (validate mgr) |> ignore
 
 [<Fact>]
 let ``TransactionManager.commit: commit 済み SeqNo を表す`` () =
@@ -302,36 +250,6 @@ let ``TransactionManager.commit: 別 keyspace の同じキーは衝突しない`
     let t2 = Transaction.put "i:x" [| 1uy |] [| SqlValue.Int 2L |] t2
     let _, seq2, _ = TransactionManager.commit t2 mgr |> ok
     Assert.True(seq2 > seq1)
-
-[<Fact>]
-let ``TransactionManager.activeSnapshot: 最古の active snapshot を返す`` () =
-    let mgr = TransactionManager.create ()
-    // active が無ければ「次の SeqNo」
-    Assert.Equal<uint64>(1UL, TransactionManager.activeSnapshot mgr)
-
-    let mgr1, t1 = TransactionManager.beginTxn mgr
-    Assert.Equal<uint64>(0UL, TransactionManager.activeSnapshot mgr1)
-    let t1 = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] t1
-    let mgr2, _, _ = TransactionManager.commit t1 mgr1 |> ok
-    Assert.Equal<uint64>(2UL, TransactionManager.activeSnapshot mgr2)
-
-    // t2 (snapshot 1) が残っている間は、t3 が commit しても境界は 1 のまま
-    let mgr3, t2 = TransactionManager.beginTxn mgr2
-    let mgr4, t3 = TransactionManager.beginTxn mgr3
-    let t3 = Transaction.put "t:y" [| 2uy |] [| SqlValue.Int 2L |] t3
-    let mgr5, _, _ = TransactionManager.commit t3 mgr4 |> ok
-    Assert.Equal<uint64>(1UL, TransactionManager.activeSnapshot mgr5)
-
-    let mgr6 = TransactionManager.abort t2 mgr5
-    Assert.Equal<uint64>(3UL, TransactionManager.activeSnapshot mgr6)
-
-    // SeqNo が上限なら +1 しない
-    let saturated =
-        { TransactionManager.create () with
-            LastCommitSeqNo = System.UInt64.MaxValue
-        }
-
-    Assert.Equal<uint64>(System.UInt64.MaxValue, TransactionManager.activeSnapshot saturated)
 
 [<Fact>]
 let ``TransactionManager.commit: active が無ければ commit 直後に LastCommitted を捨てる`` () =
@@ -378,12 +296,94 @@ let ``TransactionManager.commit: abort 済み transaction の commit はエラ�
     // Active から消えているので内部エラーになる
     expectErrorKind ErrorKind.InternalError "abort 済みの commit" (TransactionManager.commit txn mgr)
 
-/// root の重複を避ける（xUnit はテストクラス単位で並列に走る）。
-let private freshRoot (tag: string) =
-    System.IO.Path.Combine(System.IO.Path.GetTempPath(), tag + "-" + string System.DateTime.UtcNow.Ticks)
+[<Fact>]
+let ``TransactionManager.abort: abort は何も残さない`` () =
+    let mgr = TransactionManager.create ()
+    let mgr, txn = TransactionManager.beginTxn mgr
+    let txn = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] txn
+    Assert.Equal(1, activeCount mgr)
+
+    let mgr = TransactionManager.abort txn mgr
+    Assert.Equal(0, activeCount mgr)
+    Assert.Equal<uint64>(0UL, currentSeqNo mgr)
 
 [<Fact>]
-let ``ActiveSnapshotRegistry: root ごとに最古の active snapshot を返す`` () =
+let ``TransactionManager: 初期状態は妥当`` () =
+    ok (validate (TransactionManager.create ())) |> ignore
+
+[<Fact>]
+let ``TransactionManager: NextSeqNo の逆転を検出`` () =
+    let mgr =
+        { TransactionManager.create () with
+            NextSeqNo = 1UL
+            LastCommitSeqNo = 1UL
+        }
+
+    expectErrorKind ErrorKind.InternalError "NextSeqNo の逆転を検出するはず" (validate mgr)
+
+[<Fact>]
+let ``TransactionManager: Active の snapshot が未来なら検出`` () =
+    let mgr, txn = TransactionManager.beginTxn (TransactionManager.create ())
+
+    let broken =
+        { mgr with
+            Active =
+                Map.add
+                    txn.TxnId
+                    { txn with
+                        Snapshot =
+                            {
+                                Snapshot.SeqNo = mgr.LastCommitSeqNo + 1UL
+                            }
+                    }
+                    mgr.Active
+        }
+
+    expectErrorKind ErrorKind.InternalError "Active の snapshot が未来を検出するはず" (validate broken)
+
+[<Fact>]
+let ``TransactionManager: LastCommitted の範囲外を検出`` () =
+    let mgr =
+        { TransactionManager.create () with
+            LastCommitted = Map.ofList [ ("k", 1UL) ]
+        }
+
+    expectErrorKind ErrorKind.InternalError "LastCommitted の範囲外を検出するはず" (validate mgr)
+
+[<Fact>]
+let ``TransactionManager: begin/put/commit/abort を繰り返しても不変条件を保つ`` () =
+    let random = System.Random 20261111
+    let mutable mgr = TransactionManager.create ()
+    let mutable active: Transaction list = []
+
+    for _ in 1..200 do
+        match random.Next 3 with
+        | 0 ->
+            let next, txn = TransactionManager.beginTxn mgr
+            mgr <- next
+            active <- txn :: active
+        | 1 ->
+            match active with
+            | txn :: rest ->
+                let txn =
+                    Transaction.put "t:x" [| byte (random.Next 4) |] [| SqlValue.Int(int64 (random.Next 100)) |] txn
+
+                active <- txn :: rest
+            | [] -> ()
+        | _ ->
+            match active with
+            | txn :: rest ->
+                match TransactionManager.commit txn mgr with
+                | Ok(next, _, _) -> mgr <- next
+                | Error _ -> mgr <- TransactionManager.abort txn mgr
+
+                active <- rest
+            | [] -> ()
+
+        ok (validate mgr) |> ignore
+
+[<Fact>]
+let ``ActiveSnapshotRegistry.oldestExcept: root ごとに最古の active snapshot を返す`` () =
     let root = freshRoot "reg"
 
     let first = ActiveSnapshotRegistry.register root 10UL

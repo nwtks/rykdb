@@ -28,32 +28,6 @@ let private evI (row: SqlValue array) (e: Expr) =
     | SqlValue.Int i -> i
     | v -> failwithf "INTEGER 以外が返りました: %A" v
 
-[<Fact>]
-let ``Scalar.likeMatch: LIKE の空パターンと % 走査の境界`` () =
-    // 空パターンは空テキストだけに一致する
-    Assert.True(Scalar.likeMatch "" "")
-    Assert.False(Scalar.likeMatch "" "x")
-    // 末尾が固定のパターンで、テキストが短すぎて走査の上限に当たる
-    Assert.False(Scalar.likeMatch "%abcd" "x")
-    // 途中の % の次のセグメントが残りより長い
-    Assert.False(Scalar.likeMatch "%ab%c" "a")
-    // 途中の % は 1 文字ずつずらして再試行する（末尾固定の走査）
-    Assert.True(Scalar.likeMatch "%ab" "xab")
-    // 途中の % の後のセグメントも、最初の位置で失敗したら次の位置を試す
-    Assert.True(Scalar.likeMatch "%a%" "xa")
-    // 先頭の固定セグメントが一致しない
-    Assert.False(Scalar.likeMatch "a%b" "xa")
-
-[<Fact>]
-let ``Scalar.likeMatchWithEscape: エスケープした % _ ! をリテラルにする`` () =
-    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!%b" "a%b"))
-    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!%b" "axb"))
-    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!_b" "a_b"))
-    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!_b" "axb"))
-    Assert.True(ok (Scalar.likeMatchWithEscape '!' "a!!b" "a!b"))
-    Assert.False(ok (Scalar.likeMatchWithEscape '!' "a!!b" "ab"))
-    expectErrorKind ErrorKind.TypeError "末尾 ESCAPE" (Scalar.likeMatchWithEscape '!' "a!" "a")
-
 /// テスト用の独立オラクル: LIKE パターンを正規表現へ変換する。
 /// 本体は正規表現を使わない（方言差を吸収するため）ので、テスト側だけで照合する。
 let private likeToRegex (escape: char option) (pattern: string) =
@@ -72,6 +46,26 @@ let private likeToRegex (escape: char option) (pattern: string) =
 
     let body = loop 0 [] |> String.concat ""
     System.Text.RegularExpressions.Regex("\\A" + body + "\\z", System.Text.RegularExpressions.RegexOptions.Singleline)
+
+/// ESCAPE 付き LIKE を char で書けるようにする（本体はコードポイントを受け取る）。
+let private likeEsc (escape: char) (pattern: string) (text: string) =
+    Scalar.likeMatchWithEscape (int escape) pattern text
+
+[<Fact>]
+let ``Scalar.likeMatch: LIKE の空パターンと % 走査の境界`` () =
+    // 空パターンは空テキストだけに一致する
+    Assert.True(Scalar.likeMatch "" "")
+    Assert.False(Scalar.likeMatch "" "x")
+    // 末尾が固定のパターンで、テキストが短すぎて走査の上限に当たる
+    Assert.False(Scalar.likeMatch "%abcd" "x")
+    // 途中の % の次のセグメントが残りより長い
+    Assert.False(Scalar.likeMatch "%ab%c" "a")
+    // 途中の % は 1 文字ずつずらして再試行する（末尾固定の走査）
+    Assert.True(Scalar.likeMatch "%ab" "xab")
+    // 途中の % の後のセグメントも、最初の位置で失敗したら次の位置を試す
+    Assert.True(Scalar.likeMatch "%a%" "xa")
+    // 先頭の固定セグメントが一致しない
+    Assert.False(Scalar.likeMatch "a%b" "xa")
 
 [<Fact>]
 let ``Scalar.likeMatch: 正規表現オラクルと一致する（ランダム）`` () =
@@ -109,7 +103,7 @@ let ``Scalar.likeMatch: 正規表現オラクルと一致する（ランダム�
 
         if trailingEscapes pattern % 2 = 0 then
             let expected = (likeToRegex (Some '!') pattern).IsMatch text
-            Assert.Equal(expected, ok (Scalar.likeMatchWithEscape '!' pattern text))
+            Assert.Equal(expected, ok (likeEsc '!' pattern text))
 
 [<Fact>]
 let ``Scalar.likeMatch: 同じパターンは行ごとに配列を確保しない`` () =
@@ -137,6 +131,16 @@ let ``Scalar.likeMatch: 同じパターンは行ごとに配列を確保しな�
     Assert.True(allocated < 10_000L, sprintf "1000 回で %d バイト確保しました" allocated)
 
 [<Fact>]
+let ``Scalar.likeMatchWithEscape: エスケープした % _ ! をリテラルにする`` () =
+    Assert.True(ok (likeEsc '!' "a!%b" "a%b"))
+    Assert.False(ok (likeEsc '!' "a!%b" "axb"))
+    Assert.True(ok (likeEsc '!' "a!_b" "a_b"))
+    Assert.False(ok (likeEsc '!' "a!_b" "axb"))
+    Assert.True(ok (likeEsc '!' "a!!b" "a!b"))
+    Assert.False(ok (likeEsc '!' "a!!b" "ab"))
+    expectErrorKind ErrorKind.TypeError "末尾 ESCAPE" (likeEsc '!' "a!" "a")
+
+[<Fact>]
 let ``Eval.eval: LIKE の % と _`` () =
     let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
 
@@ -156,6 +160,30 @@ let ``Eval.eval: LIKE の % と _`` () =
     Assert.True(test "%" "anything")
     // `%` の後に何もない（0 文字一致）も許す
     Assert.True(test "abc%" "abc")
+
+[<Fact>]
+let ``Scalar.likeMatch: _ とリテラルは Unicode コードポイント単位で照合する`` () =
+    // サロゲートペア（BMP 外）は `_` 1個に一致する（UTF-16 の code unit 2個分ではない）
+    Assert.True(Scalar.likeMatch "a_b" "a\U0001F600b")
+    Assert.True(Scalar.likeMatch "a_b" "a\U00020BB7b")
+    Assert.False(Scalar.likeMatch "a__b" "a\U0001F600b")
+    // パターン中のサロゲートペアは 1 リテラルとして比較する
+    Assert.True(Scalar.likeMatch "a\U0001F600b" "a\U0001F600b")
+    Assert.False(Scalar.likeMatch "a\U0001F600b" "a\U0001F601b")
+    // `%` のバックトラックもコードポイント単位で進む
+    Assert.True(Scalar.likeMatch "%b" "\U0001F600b")
+    Assert.True(Scalar.likeMatch "%\U0001F600" "x\U0001F600")
+    Assert.False(Scalar.likeMatch "%\U0001F600" "x\U0001F601")
+    // ESCAPE 直後のサロゲートペアも 1 リテラル
+    Assert.True(ok (likeEsc '!' "a!\U0001F600b" "a\U0001F600b"))
+    Assert.False(ok (likeEsc '!' "a!\U0001F600b" "a\U0001F601b"))
+    // ESCAPE 文字自身も 1 コードポイント（サロゲートペアも可）
+    let smile = System.Char.ConvertToUtf32("\U0001F600", 0)
+    Assert.True(ok (Scalar.likeMatchWithEscape smile "a\U0001F600%b" "a%b"))
+    Assert.False(ok (Scalar.likeMatchWithEscape smile "a\U0001F600%b" "axb"))
+    // ESCAPE が 1 コードポイントでなければ TypeError
+    expectErrorKind ErrorKind.TypeError "2 コードポイントの ESCAPE" (Scalar.escapeCodePoint "ab")
+    expectErrorKind ErrorKind.TypeError "空の ESCAPE" (Scalar.escapeCodePoint "")
 
 [<Fact>]
 let ``Eval.eval: スカラー関数`` () =
@@ -333,10 +361,8 @@ let ``Eval.eval: 算術の型昇格は DECIMAL / REAL / 非数値も扱う`` () 
 
     // DECIMAL どうしは DECIMAL のまま
     Assert.Equal(SqlValue.Decimal 4.0M, arith2 BinaryOp.Add (Literal.Decimal 1.5M) (Literal.Decimal 2.5M))
-
     // INTEGER と REAL の混在は REAL
     Assert.Equal(SqlValue.Real 3.5, arith2 BinaryOp.Add (Literal.Real 1.5) (Literal.Int 2L))
-
     // 減算と剰余
     Assert.Equal(SqlValue.Int 2L, arith2 BinaryOp.Sub (Literal.Int 5L) (Literal.Int 3L))
     Assert.Equal(SqlValue.Int 1L, arith2 BinaryOp.Mod (Literal.Int 7L) (Literal.Int 3L))
@@ -525,28 +551,20 @@ let ``Eval.eval: IS TRUE / FALSE / UNKNOWN`` () =
     Assert.Equal(SqlValue.Bool false, ok (ev (SqlValue.Bool false) (Expr.IsTruth(col "b", TruthValue.True, false))))
     Assert.Equal(SqlValue.Bool false, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.True, false))))
     Assert.Equal(SqlValue.Bool true, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.True, true))))
-
     Assert.Equal(SqlValue.Bool true, ok (ev (SqlValue.Bool false) (Expr.IsTruth(col "b", TruthValue.False, false))))
-
     Assert.Equal(SqlValue.Bool true, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.False, true))))
-
     Assert.Equal(SqlValue.Bool true, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.Unknown, false))))
-
     Assert.Equal(SqlValue.Bool false, ok (ev (SqlValue.Bool true) (Expr.IsTruth(col "b", TruthValue.Unknown, false))))
-
     Assert.Equal(SqlValue.Bool false, ok (ev SqlValue.Null (Expr.IsTruth(col "b", TruthValue.Unknown, true))))
-
     Assert.Equal(SqlValue.Bool true, ok (ev (SqlValue.Bool false) (Expr.IsTruth(col "b", TruthValue.Unknown, true))))
 
 [<Fact>]
 let ``Eval.eval: CAST は TEXT から数値・BOOLEAN へ変換できる`` () =
     let ev e = Eval.eval Schema.empty [||] e
+
     Assert.Equal(SqlValue.Int 42L, ok (ev (Expr.Cast(Expr.Literal(Literal.String "42"), DataType.Integer))))
-
     Assert.Equal(SqlValue.Real 1.5, ok (ev (Expr.Cast(Expr.Literal(Literal.String "1.5"), DataType.Real))))
-
     Assert.Equal(SqlValue.Bool true, ok (ev (Expr.Cast(Expr.Literal(Literal.String "true"), DataType.Boolean))))
-
     Assert.Equal(SqlValue.Text "42", ok (ev (Expr.Cast(Expr.Literal(Literal.Int 42L), DataType.Text))))
 
     expectErrorKind

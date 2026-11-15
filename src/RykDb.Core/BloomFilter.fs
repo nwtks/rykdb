@@ -3,7 +3,7 @@ namespace RykDb.Core
 /// SSTable の Bloom filter。
 /// SSTable がメモリ上に載る前に「その SSTable にキーが存在し得るか」を O(1) で判定し、
 /// 存在しないキーではファイル I/O そのものを省く。
-/// false positive（あるのに無いと返す）は許されるが、false negative（無いのにあると返す）は許されない。
+/// false positive（無いのにあると返す）は許されるが、false negative（あるのに無いと返す）は許されない。
 /// 構築してから読み取り専用。
 /// 不変なので複数の読み取りスレッドで共有できる。
 [<Struct>]
