@@ -9,7 +9,7 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 let private rowKey (i: int) =
-    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
+    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ] |> ok
 
 let private isVisible (snap: Snapshot) (seqNo: uint64) = seqNo <= snap.SeqNo
 
@@ -148,7 +148,7 @@ let ``Transaction.conflictKey: keyspace と key を連結`` () =
 [<Fact>]
 let ``Transaction.reserveUnique: 同じ索引値の予約は 1 件にまとまる`` () =
     let txn0 = Transaction.create 1UL<txnId> { Snapshot.SeqNo = 0UL }
-    let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |]
+    let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |] |> ok
     let txn1 = Transaction.reserveUnique "idx_email" key txn0
     let txn2 = Transaction.reserveUnique "idx_email" key txn1
     Assert.Equal(1, txn2.Reservations.Count)
@@ -203,7 +203,7 @@ let ``TransactionManager.commit: UNIQUE の論理予約が競合する`` () =
     let mgr0 = TransactionManager.create ()
     let mgr1, txnA = TransactionManager.beginTxn mgr0
     let mgr2, txnB = TransactionManager.beginTxn mgr1
-    let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |]
+    let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |] |> ok
     let txnA = Transaction.reserveUnique "idx_email" key txnA
     let txnB = Transaction.reserveUnique "idx_email" key txnB
     let mgr3, _, _ = ok (TransactionManager.commit txnA mgr2)

@@ -108,23 +108,24 @@ module internal Ops =
     /// </remarks>
     let distinct (src: Op) =
         let encode row =
-            ValueCodec.writeValues row Writer.Empty |> Writer.toArray
+            ValueCodec.writeValues row Writer.Empty |> Result.map Writer.toArray
 
         let seen = System.Collections.Generic.HashSet<byte array> HashIdentity.Structural
 
         let rec skipSeen used =
             Op.pull (fun row nxt ->
-                let key = encode row
-
-                if seen.Contains key then
-                    Op.next (skipSeen used nxt)
-                elif used > DistinctBudgetBytes then
-                    sprintf "SELECT DISTINCT のユニーク行が多すぎます（概算 %d バイトの上限）。条件で絞るか、集約で代替してください" DistinctBudgetBytes
-                    |> DbError.capacity
-                    |> err
-                else
-                    seen.Add key |> ignore
-                    ret (Some(row, skipSeen (used + int64 (ValueCodec.managedRowBytes row)) nxt)))
+                match encode row with
+                | Error e -> err e
+                | Ok key ->
+                    if seen.Contains key then
+                        Op.next (skipSeen used nxt)
+                    elif used > DistinctBudgetBytes then
+                        sprintf "SELECT DISTINCT のユニーク行が多すぎます（概算 %d バイトの上限）。条件で絞るか、集約で代替してください" DistinctBudgetBytes
+                        |> DbError.capacity
+                        |> err
+                    else
+                        seen.Add key |> ignore
+                        ret (Some(row, skipSeen (used + int64 (ValueCodec.managedRowBytes row)) nxt)))
 
         skipSeen 0L src
 

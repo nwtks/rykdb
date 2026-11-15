@@ -274,6 +274,7 @@ module internal OrderPreserving =
         |]
 
     /// 値をキーへ追加する（型タグ + escape 済みペイロード + 終端）。
+    /// `SqlValue.Unloaded`（列マスクのプレースホルダ）は符号化できないため `InternalError` を返す。
     let writeValue (v: SqlValue) (w: Writer) =
         let writeEscapedPayload bs w =
             let escaped =
@@ -286,24 +287,26 @@ module internal OrderPreserving =
         let terminate = Writer.writeByte Terminator
 
         match v with
-        | SqlValue.Null -> tagged Tag.Null |> terminate
-        | SqlValue.Bool b -> tagged Tag.Bool |> Writer.writeByte (if b then 1uy else 0uy) |> terminate
-        | SqlValue.Int i -> tagged Tag.Int |> writeOrderedInt64 i |> terminate
+        | SqlValue.Null -> ret (tagged Tag.Null |> terminate)
+        | SqlValue.Bool b -> ret (tagged Tag.Bool |> Writer.writeByte (if b then 1uy else 0uy) |> terminate)
+        | SqlValue.Int i -> ret (tagged Tag.Int |> writeOrderedInt64 i |> terminate)
         | SqlValue.Real f ->
-            tagged Tag.Real
-            |> Writer.uint64BE (uint64 (mapDouble (SqlValue.normalizeFloat f)))
-            |> terminate
-        | SqlValue.Decimal d -> tagged Tag.Decimal |> writeOrderedDecimal d |> terminate
+            let bits =
+                tagged Tag.Real
+                |> Writer.uint64BE (uint64 (mapDouble (SqlValue.normalizeFloat f)))
+
+            ret (bits |> terminate)
+        | SqlValue.Decimal d -> ret (tagged Tag.Decimal |> writeOrderedDecimal d |> terminate)
         | SqlValue.Date d ->
             let days =
                 d.ToDateTime(System.TimeOnly.MinValue).Ticks / System.TimeSpan.TicksPerDay
 
-            tagged Tag.Date |> writeOrderedInt64 days |> terminate
-        | SqlValue.Timestamp t -> tagged Tag.Timestamp |> writeOrderedInt64 t.UtcTicks |> terminate
-        | SqlValue.Text s -> writeEscapedPayload (System.Text.Encoding.UTF8.GetBytes s) (tagged Tag.Text)
-        | SqlValue.Blob bs -> writeEscapedPayload bs (tagged Tag.Blob)
-        | SqlValue.Uuid g -> tagged Tag.Uuid |> Writer.writeBytes (guidToOrderedBytes g) |> terminate
-        | SqlValue.Unloaded -> invalidOp "SqlValue.Unloaded は符号化できません"
+            ret (tagged Tag.Date |> writeOrderedInt64 days |> terminate)
+        | SqlValue.Timestamp t -> ret (tagged Tag.Timestamp |> writeOrderedInt64 t.UtcTicks |> terminate)
+        | SqlValue.Text s -> ret (writeEscapedPayload (System.Text.Encoding.UTF8.GetBytes s) (tagged Tag.Text))
+        | SqlValue.Blob bs -> ret (writeEscapedPayload bs (tagged Tag.Blob))
+        | SqlValue.Uuid g -> ret (tagged Tag.Uuid |> Writer.writeBytes (guidToOrderedBytes g) |> terminate)
+        | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
 module internal Hashing =
     /// バイト列の 64bit ハッシュ（FNV-1a）。
@@ -409,17 +412,26 @@ module internal Hashing =
 /// フィールドを順に足して 1本のバイト列キーにする。
 module internal KeyBuilder =
     /// 値の並びを 1本のキーに符号化する。
+    /// `SqlValue.Unloaded` が混ざっている場合は `InternalError`。
     let ofValues (values: SqlValue seq) =
         values
-        |> Seq.fold (fun w v -> OrderPreserving.writeValue v w) Writer.Empty
-        |> Writer.toArray
+        |> foldOk (fun w v -> OrderPreserving.writeValue v w) Writer.Empty
+        |> Result.map Writer.toArray
+
+    /// 省略可能な値の並びを符号化する（`None` はそのまま `None`）。
+    let ofOptionalValues (values: SqlValue array option) =
+        match values with
+        | Some vs -> ofValues vs |> Result.map Some
+        | None -> ret None
 
     /// 索引キー（索引列 + 主キー列）。
     /// 主キーは行を一意に特定するために末尾へ追加する。
     let ofIndexAndPrimary (indexCols: SqlValue seq) (primaryCols: SqlValue seq) =
-        let appendCols = Seq.fold (fun w v -> OrderPreserving.writeValue v w)
-        let withIndex = appendCols Writer.Empty indexCols
-        appendCols withIndex primaryCols |> Writer.toArray
+        let appendCols = foldOk (fun w v -> OrderPreserving.writeValue v w)
+
+        match appendCols Writer.Empty indexCols with
+        | Error e -> err e
+        | Ok withIndex -> appendCols withIndex primaryCols |> Result.map Writer.toArray
 
     /// バイト列 key が prefix で始まるか。
     let startsWithPrefix (key: byte array) (prefix: byte array) =
@@ -442,22 +454,28 @@ module internal ValueCodec =
         let tagged tag = w |> Writer.writeByte (byte tag)
 
         function
-        | SqlValue.Null -> tagged 0uy
-        | SqlValue.Bool b -> tagged 1uy |> Writer.bool b
-        | SqlValue.Int i -> tagged 2uy |> Writer.int64LE i
+        | SqlValue.Null -> ret (tagged 0uy)
+        | SqlValue.Bool b -> ret (tagged 1uy |> Writer.bool b)
+        | SqlValue.Int i -> ret (tagged 2uy |> Writer.int64LE i)
         | SqlValue.Real f ->
-            tagged 3uy
-            |> Writer.int64LE (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits)
+            let bits =
+                tagged 3uy
+                |> Writer.int64LE (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits)
+
+            ret bits
         | SqlValue.Decimal d ->
-            normalizeDecimal d
-            |> System.Decimal.GetBits
-            |> Array.fold (fun w b -> w |> Writer.int64LE (int64 b)) (tagged 4uy)
-        | SqlValue.Text s -> tagged 5uy |> Writer.str s
-        | SqlValue.Blob bs -> tagged 6uy |> Writer.lengthPrefixed bs
-        | SqlValue.Date d -> tagged 7uy |> Writer.int64LE (d.ToDateTime(System.TimeOnly.MinValue).Ticks)
-        | SqlValue.Timestamp t -> tagged 8uy |> Writer.int64LE t.UtcTicks
-        | SqlValue.Uuid g -> tagged 9uy |> Writer.writeBytes (g.ToByteArray())
-        | SqlValue.Unloaded -> invalidOp "SqlValue.Unloaded は符号化できません"
+            let unfolded =
+                normalizeDecimal d
+                |> System.Decimal.GetBits
+                |> Array.fold (fun w b -> w |> Writer.int64LE (int64 b)) (tagged 4uy)
+
+            ret unfolded
+        | SqlValue.Text s -> ret (tagged 5uy |> Writer.str s)
+        | SqlValue.Blob bs -> ret (tagged 6uy |> Writer.lengthPrefixed bs)
+        | SqlValue.Date d -> ret (tagged 7uy |> Writer.int64LE (d.ToDateTime(System.TimeOnly.MinValue).Ticks))
+        | SqlValue.Timestamp t -> ret (tagged 8uy |> Writer.int64LE t.UtcTicks)
+        | SqlValue.Uuid g -> ret (tagged 9uy |> Writer.writeBytes (g.ToByteArray()))
+        | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
     let private readValueSlow (c: Cursor) =
         result {
@@ -521,10 +539,11 @@ module internal ValueCodec =
         }
 
     /// 値の並びをまとめて書き出す。
+    /// `SqlValue.Unloaded` が混ざっている場合は `InternalError`。
     let writeValues (values: SqlValue seq) (w: Writer) =
         let arr = Seq.toArray values
         let withCount = w |> Writer.varint (uint64 arr.Length)
-        Array.fold writeValue withCount arr
+        foldOk writeValue withCount arr
 
     let private writeInt64LETo (out: byte array) (pos: int) (v: int64) =
         let u = uint64 v
@@ -535,55 +554,58 @@ module internal ValueCodec =
         pos + 8
 
     /// 1値を出力配列へ直接書く。次の位置を返す。
+    /// エラー時は `out` の内容が不定になる（呼び出し側はバッファを破棄する）。
     let private writeValueTo (out: byte array) (pos: int) =
         function
         | SqlValue.Null ->
             out.[pos] <- 0uy
-            pos + 1
+            ret (pos + 1)
         | SqlValue.Bool b ->
             out.[pos] <- 1uy
             out.[pos + 1] <- if b then 1uy else 0uy
-            pos + 2
+            ret (pos + 2)
         | SqlValue.Int i ->
             out.[pos] <- 2uy
-            writeInt64LETo out (pos + 1) i
+            ret (writeInt64LETo out (pos + 1) i)
         | SqlValue.Real f ->
             out.[pos] <- 3uy
-            writeInt64LETo out (pos + 1) (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits)
+            ret (writeInt64LETo out (pos + 1) (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits))
         | SqlValue.Decimal d ->
             out.[pos] <- 4uy
 
             normalizeDecimal d
             |> System.Decimal.GetBits
             |> Array.fold (fun p b -> writeInt64LETo out p (int64 b)) (pos + 1)
+            |> ret
         | SqlValue.Text s ->
             let bytes = System.Text.Encoding.UTF8.GetBytes s
             out.[pos] <- 5uy
             let p = Writer.writeVarintTo out (pos + 1) (uint64 bytes.Length)
             Array.blit bytes 0 out p bytes.Length
-            p + bytes.Length
+            ret (p + bytes.Length)
         | SqlValue.Blob bs ->
             out.[pos] <- 6uy
             let p = Writer.writeVarintTo out (pos + 1) (uint64 bs.Length)
             Array.blit bs 0 out p bs.Length
-            p + bs.Length
+            ret (p + bs.Length)
         | SqlValue.Date d ->
             out.[pos] <- 7uy
-            writeInt64LETo out (pos + 1) (d.ToDateTime(System.TimeOnly.MinValue).Ticks)
+            ret (writeInt64LETo out (pos + 1) (d.ToDateTime(System.TimeOnly.MinValue).Ticks))
         | SqlValue.Timestamp t ->
             out.[pos] <- 8uy
-            writeInt64LETo out (pos + 1) t.UtcTicks
+            ret (writeInt64LETo out (pos + 1) t.UtcTicks)
         | SqlValue.Uuid g ->
             let bytes = g.ToByteArray()
             out.[pos] <- 9uy
             Array.blit bytes 0 out (pos + 1) 16
-            pos + 17
-        | SqlValue.Unloaded -> invalidOp "SqlValue.Unloaded は符号化できません"
+            ret (pos + 17)
+        | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
     /// 値の並びを出力配列へ直接書く。次の位置を返す。
+    /// `SqlValue.Unloaded` が混ざっている場合は `InternalError`。
     let writeValuesTo (out: byte array) (pos: int) (values: SqlValue array) =
         let pos = Writer.writeVarintTo out pos (uint64 values.Length)
-        Array.fold (fun p v -> writeValueTo out p v) pos values
+        foldOk (writeValueTo out) pos values
 
     let private readInt (c: Cursor) =
         let d = Cursor.data c

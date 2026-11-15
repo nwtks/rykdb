@@ -324,12 +324,14 @@ module internal DmlOps =
                                 check pk pkBytes rest
 
         let pk = TableSchema.primaryKeyOf schema row
-        let pkBytes = KeyBuilder.ofValues pk
 
-        match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes ctx.Visible txn existsMask with
+        match KeyBuilder.ofValues pk with
         | Error e -> err e
-        | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
-        | Ok None -> check pk pkBytes (schema.Indexes |> List.filter _.Unique)
+        | Ok pkBytes ->
+            match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes ctx.Visible txn existsMask with
+            | Error e -> err e
+            | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
+            | Ok None -> check pk pkBytes (schema.Indexes |> List.filter _.Unique)
 
     /// 1行を制約検査して transaction へ積む。
     let private insertRow (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
@@ -514,12 +516,13 @@ module internal DmlOps =
                                 if values |> Array.exists SqlValue.isNull then
                                     ret seen
                                 else
-                                    let key = KeyBuilder.ofValues values
-
-                                    if Set.contains key seen then
-                                        err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                                    else
-                                        checkExisting idx seen key values)
+                                    match KeyBuilder.ofValues values with
+                                    | Error e -> err e
+                                    | Ok key ->
+                                        if Set.contains key seen then
+                                            err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                                        else
+                                            checkExisting idx seen key values)
                             Set.empty
 
                     return ()

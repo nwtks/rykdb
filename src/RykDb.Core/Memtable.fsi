@@ -21,7 +21,7 @@ module internal Entry =
     val compareKeys: Entry -> Entry -> int
     val priority: Entry -> uint64
     val takeOwnership: Entry -> Entry
-    val encodeBatch: TxnId -> Entry array -> byte array
+    val encodeBatch: TxnId -> Entry array -> Result<byte array, DbError>
     val decodeBatch: byte array -> Result<TxnId * Entry array, DbError>
 
 /// memtable（永続 Treap）。

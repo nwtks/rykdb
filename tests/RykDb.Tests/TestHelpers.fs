@@ -435,15 +435,15 @@ let render (vs: SqlValue[]) =
     vs
     |> Array.map (fun v -> (v |> SqlValue.dataType |> DataType.toSqlName) + ":" + SqlLiteral.toSqlLiteral v)
 
-// KeyBuilder の戻り値はそのままバイト列キー
-let keyOf (v: SqlValue) = KeyBuilder.ofValues [ v ]
-let keyOfTuple (vs: SqlValue[]) = KeyBuilder.ofValues vs
+// KeyBuilder の戻り値はそのままバイト列キー（テストでは Ok 前提）
+let keyOf (v: SqlValue) = KeyBuilder.ofValues [ v ] |> ok
+let keyOfTuple (vs: SqlValue[]) = KeyBuilder.ofValues vs |> ok
 
 /// 連番の整数から作るテスト用キー。
 /// SSTable / MANIFEST / StorageEngine / WAL の `sstKey`、Memtable / BloomFilter の
 /// `bloomKey` として 7ファイルに同一実装がコピーされていたので一本化した。
 let intKey (i: int) =
-    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]
+    KeyBuilder.ofValues [ SqlValue.Int(int64 i) ] |> ok
 
 /// INTEGER 1 列の行。
 /// Memtable / StorageEngine / WAL の `valOf` にあたる（Executor の `intArr` も同義）。

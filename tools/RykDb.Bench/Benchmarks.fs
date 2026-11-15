@@ -9,6 +9,10 @@
 //     背景 compaction のタイミングで測定が揺れないようにする。
 //   * シード後は一度 Close して memtable を SSTable へ flush し、
 //     ディスクからの走査を測る（再オープンして測定する）。
+//   * ポイント検索は 4段階を同じ DB で測れるようにする:
+//       PointLookup（SQL）> PointLookupParsed（parse 済みの文）
+//       > PointLookupPlanned（計画済みの木）> PointLookupStorage（ストレージ直）
+//     差を取ると parse / plan / 実行の内訳になる。
 //   * compaction は内部 API を使い、4本の L0 ファイルを 1回 compact する。
 //     出力は呼び出しごとに削除する（削除時間は測定対象外）。
 // ===========================================================================
@@ -50,6 +54,14 @@ module private BenchText =
 type QueryBenchmarks() =
     let mutable session = Unchecked.defaultof<Session>
     let mutable root = ""
+    /// 低レベルシナリオ用のハンドル（読み取りだけに使う）。
+    let mutable db = Unchecked.defaultof<Database>
+    /// `pointSql` を parse した文。parse を除いた実行を測るために 1回だけ作る。
+    let mutable parsedLookup = Unchecked.defaultof<Statement>
+    /// `pointSql` の計画。parse と plan を除いた実行を測るために 1回だけ作る。
+    let mutable lookupPlan = Unchecked.defaultof<PlannedQuery>
+    /// `SELECT b` が復号する列（id, a, b の b だけ）。PkLookup が使うマスクと同じ。
+    let lookupMask = [| false; false; true |]
     let pointSql = "SELECT b FROM t WHERE id = 50000"
     let countSql = "SELECT COUNT(*) FROM t"
     let rangeSql = "SELECT COUNT(*) FROM t WHERE id BETWEEN 1000 AND 1999"
@@ -99,8 +111,8 @@ type QueryBenchmarks() =
     [<GlobalSetup>]
     member this.Setup() =
         root <- BenchEnv.newTempDir "query"
-        let db = Database.OpenWith root |> Check.ok
-        session <- Session.OpenWith(root, SessionOptions.Default, db)
+        let opened = Database.OpenWith root |> Check.ok
+        session <- Session.OpenWith(root, SessionOptions.Default, opened)
         this.Exec "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
         this.Exec "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
         this.Exec "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -118,7 +130,43 @@ type QueryBenchmarks() =
         session.Close() |> Check.ok |> ignore
 
         let reopened = Database.OpenWith root |> Check.ok
+        db <- reopened
         session <- Session.OpenWith(root, SessionOptions.Default, reopened)
+
+        // 低レベルシナリオ用に、文（AST）と計画を 1回だけ作る。
+        let select =
+            match Parser.parseStatements pointSql with
+            | Ok [ Statement.Select stmt ] -> stmt
+            | Ok _ -> failwith "PointLookup の SQL は SELECT 1文である必要があります"
+            | Error e -> failwith (DbError.toDisplayString e)
+
+        parsedLookup <- Statement.Select select
+        lookupPlan <- db.PrepareSelect select |> Check.ok
+
+        // 計画が本当に 1行を返すことを 1回だけ確認する（測定条件の取り違え防止）。
+        let rowCount (op: Op) = (Op.toArray op |> Check.ok).Length
+
+        let plannedRows =
+            try
+                let op =
+                    Optimizer.exec lookupPlan.Context lookupPlan.Tree lookupPlan.Input |> Check.ok
+
+                rowCount op
+            finally
+                lookupPlan.Context.Scope.DisposeAll()
+
+        let storageRows =
+            try
+                let op =
+                    ExecContext.byPrimaryKeyMasked lookupPlan.Context "t" [| SqlValue.Int 50000L |] lookupMask
+                    |> Check.ok
+
+                rowCount op
+            finally
+                lookupPlan.Context.Scope.DisposeAll()
+
+        if plannedRows <> 1 || storageRows <> 1 then
+            failwithf "PointLookup の低レベルシナリオが 1行を返しません（planned=%d, storage=%d）" plannedRows storageRows
 
     [<GlobalCleanup>]
     member _.Cleanup() =
@@ -133,6 +181,43 @@ type QueryBenchmarks() =
     /// 主キーのポイント検索（SSTable の Bloom + 部分読み）。
     [<Benchmark>]
     member this.PointLookup() = this.Exec pointSql
+
+    /// parse 済みの文をそのまま実行する（lexer / parser と Session のゲートを通らない）。
+    /// `PointLookup` との差が parse のコストになる。
+    [<Benchmark>]
+    member _.PointLookupParsed() =
+        // 読み取り専用の SELECT は状態を変えないので、返るハンドルは同じものを指す。
+        let _, result = db.Execute parsedLookup |> Check.ok
+        result.Rows.Length
+
+    /// 計画済みの論理木から Op を組み立てて実行する（parse も plan もしない）。
+    /// `PointLookupParsed` との差がプランナのコストになる。
+    /// 行の materialize は `Op.toArrayLimited` まで
+    /// （`Engine.runSelect` の `ensureLoaded` / 行の複製は含まない）。
+    [<Benchmark>]
+    member _.PointLookupPlanned() =
+        let ctx = lookupPlan.Context
+
+        try
+            let op = Optimizer.exec ctx lookupPlan.Tree lookupPlan.Input |> Check.ok
+            (Op.toArrayLimited System.Int64.MaxValue System.Int64.MaxValue op |> Check.ok).Length
+        finally
+            ctx.Scope.DisposeAll()
+
+    /// ストレージ層の主キー検索だけ（`PkLookup` が実行する呼び出しそのもの）。
+    /// Dml → RowStore → SSTable のポイント検索と、必要な列の復号だけを測る。
+    [<Benchmark>]
+    member _.PointLookupStorage() =
+        let ctx = lookupPlan.Context
+
+        try
+            let op =
+                ExecContext.byPrimaryKeyMasked ctx "t" [| SqlValue.Int 50000L |] lookupMask
+                |> Check.ok
+
+            (Op.toArrayLimited System.Int64.MaxValue System.Int64.MaxValue op |> Check.ok).Length
+        finally
+            ctx.Scope.DisposeAll()
 
     /// 全件の COUNT(*)。
     /// 現状は値もデコードするため、値の遅延デコードの効果を測る基準になる。
@@ -223,7 +308,7 @@ type CompactionBenchmarks() =
                         let id = i * fileCount + file
 
                         SstEntry.make
-                            (KeyBuilder.ofValues [ SqlValue.Int(int64 id) ])
+                            (KeyBuilder.ofValues [ SqlValue.Int(int64 id) ] |> Check.ok)
                             (uint64 (file + 1))
                             (Some [| SqlValue.Int(int64 id); SqlValue.Text(BenchText.ofInt id) |])
                 |]

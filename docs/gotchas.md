@@ -2521,13 +2521,14 @@ type private Step =
 - 空マスク（`COUNT(*)` / `SELECT 1 FROM t`）でも **行の要素数は 0 にしない**。
   スキーマ幅で `Unloaded` を並べる（`ORDER BY 1` のソートキー位置がずれないようにする）。
 - `Unloaded` を比較・ソート・DISTINCT・符号化に渡してはいけない。
-  `compareValues` は内部エラー、`ValueCodec` の書き込みは `invalidOp` になる。
+  `compareValues` は内部エラー、`KeyBuilder.ofValues` / `ValueCodec.writeValues` /
+  `ValueCodec.writeValuesTo` は `InternalError` を返す（例外は投げない）。
 - `Dml.opOfScan` は空の行を `Unloaded` でパディングする。
   `NULL` で埋めない（誤って読んだときに静かに NULL 扱いにならないようにするため）。
 - 最終結果の境界（`Engine.runSelect`）と `RowReader.TryRead` は
   `SqlValue.ensureLoaded` で `Unloaded` を検査する。
-  ここに来る前に `InternalError` になるのが正しく、出力の `invalidOp` まで持ち越してはいけない。
-- 点検索は `Sstable.lookupMasked` / `GetAtMasked` / `getByPrimaryKeyWithTxnMask` を使う。
+  ここに来る前に `InternalError` になるのが正しく、出力の符号化エラーまで持ち越してはいけない。
+- ポイント検索は `Sstable.lookupMasked` / `GetAtMasked` / `getByPrimaryKeyWithTxnMask` を使う。
   transaction slot の行にも `SqlValue.maskRow` を適用する。
 - 存在確認だけなら全列 false マスクを使う（例: `DmlOps.checkUnique` の主キー重複）。
   UNIQUE 索引の重複検査は主キー列だけを復号する。
@@ -2548,8 +2549,11 @@ type private Step =
 - 回帰テスト: `SSTable: 列マスクで必要な列だけ復号する`、
   `SSTable: lookupMasked は必要な列だけ復号する`、
   `SqlValue.ensureLoaded: Unloaded は結果境界でエラー`、
+  `KeyBuilder.ofValues: Unloaded は InternalError`、
+  `ValueCodec.writeValues: Unloaded は InternalError`、
+  `ValueCodec.writeValuesTo: Unloaded は InternalError`、
   `Database: 値を使わない射影・集約は空の行でも件数を返す`
-  （部分列・点検索・索引・transaction overlay・DISTINCT・ORDER BY・GROUP BY・派生テーブルを含む）。
+  （部分列・ポイント検索・索引・transaction overlay・DISTINCT・ORDER BY・GROUP BY・派生テーブルを含む）。
 - 計測（10万行）: `CountStar` 約 381MB → **316MB**、
   `SelectConstant` **331MB**、`CountConstantWhere` **351MB**、
   部分列の `FilterSeqScan` 約 388MB → **363MB**。

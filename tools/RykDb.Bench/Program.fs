@@ -31,15 +31,20 @@ type private Options =
         Class: string option
         /// `default` / `quick` / `dry`。
         Mode: string
+        /// BenchmarkDotNet の `--filter` に渡すパターン（繰り返し指定できる）。
+        Filters: string list
     }
 
 let private usage () =
-    printfn "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|compaction|eval] [--quick|--dry]"
+    printfn
+        "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|compaction|eval] [--quick|--dry] [--filter <pattern>]"
+
     printfn "  --class query       クエリ系のみ"
     printfn "  --class compaction  compaction のみ"
     printfn "  --class eval        式評価器のマイクロベンチのみ"
     printfn "  --quick             短いジョブ（既定より速いが精度は低い）"
     printfn "  --dry               1回だけ実行して設定を検証する"
+    printfn "  --filter <pattern>  シナリオ名で絞る（例: *QueryBenchmarks.PointLookup）"
 
 let private parseArgs (argv: string array) =
     let rec loop i (options: Options) =
@@ -55,6 +60,12 @@ let private parseArgs (argv: string array) =
                     }
             | "--quick" -> loop (i + 1) { options with Mode = "quick" }
             | "--dry" -> loop (i + 1) { options with Mode = "dry" }
+            | "--filter" when i + 1 < argv.Length ->
+                loop
+                    (i + 2)
+                    { options with
+                        Filters = options.Filters @ [ argv.[i + 1] ]
+                    }
             | "-h"
             | "--help" ->
                 usage ()
@@ -64,7 +75,13 @@ let private parseArgs (argv: string array) =
                 usage ()
                 exit 2
 
-    loop 0 { Class = None; Mode = "default" }
+    loop
+        0
+        {
+            Class = None
+            Mode = "default"
+            Filters = []
+        }
 
 [<EntryPoint>]
 let main argv =
@@ -115,13 +132,20 @@ let main argv =
 
     printfn "RykDb benchmarks（CI ではビルドのみ。実行は手元で -c Release）"
 
+    // `--filter` は BenchmarkDotNet の引数としてそのまま渡す。
+    // BDN の `--filter` は値を複数並べられる（`--filter *A* *B*`）。
+    let filterArgs =
+        match options.Filters with
+        | [] -> [||]
+        | patterns -> Array.append [| "--filter" |] (List.toArray patterns)
+
     if runQuery then
-        BenchmarkRunner.Run<QueryBenchmarks> config |> ignore
+        BenchmarkRunner.Run<QueryBenchmarks>(config, filterArgs) |> ignore
 
     if runCompaction then
-        BenchmarkRunner.Run<CompactionBenchmarks> config |> ignore
+        BenchmarkRunner.Run<CompactionBenchmarks>(config, filterArgs) |> ignore
 
     if runEval then
-        BenchmarkRunner.Run<EvalBenchmarks> config |> ignore
+        BenchmarkRunner.Run<EvalBenchmarks>(config, filterArgs) |> ignore
 
     0

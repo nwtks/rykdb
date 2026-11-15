@@ -59,15 +59,12 @@ module internal Wal =
             Writer.build [ Writer.writeByte tag; Writer.uint64BE (uint64 txnId) ]
 
         match r with
-        | WalRecord.Begin txnId -> txnRecord TagBegin txnId
-        | WalRecord.Commit txnId -> txnRecord TagCommit txnId
-        | WalRecord.Abort txnId -> txnRecord TagAbort txnId
+        | WalRecord.Begin txnId -> ret (txnRecord TagBegin txnId)
+        | WalRecord.Commit txnId -> ret (txnRecord TagCommit txnId)
+        | WalRecord.Abort txnId -> ret (txnRecord TagAbort txnId)
         | WalRecord.Batch(txnId, entries) ->
-            Writer.build
-                [
-                    Writer.writeByte TagBatch
-                    Entry.encodeBatch txnId entries |> Writer.writeBytes
-                ]
+            Entry.encodeBatch txnId entries
+            |> Result.map (fun bytes -> Writer.build [ Writer.writeByte TagBatch; Writer.writeBytes bytes ])
 
     let private decodePayload (payload: byte array) =
         result {
@@ -113,13 +110,15 @@ module internal Wal =
 
         let rec writeAll (fs: System.IO.FileStream) written =
             function
-            | [] -> written
+            | [] -> ret written
             | record :: rest ->
-                let payload = encodePayload record
-                let header = headerOf payload
-                fs.Write(header, 0, header.Length)
-                fs.Write(payload, 0, payload.Length)
-                writeAll fs (written + header.Length + payload.Length) rest
+                match encodePayload record with
+                | Error e -> err e
+                | Ok payload ->
+                    let header = headerOf payload
+                    fs.Write(header, 0, header.Length)
+                    fs.Write(payload, 0, payload.Length)
+                    writeAll fs (written + header.Length + payload.Length) rest
 
         match records with
         | [] -> ret state
@@ -133,12 +132,14 @@ module internal Wal =
                         System.IO.FileShare.ReadWrite
                     )
 
-                let written = writeAll fs 0 records
-                fs.Flush sync
+                writeAll fs 0 records
+                |> Result.map (fun written ->
+                    fs.Flush sync
 
-                { state with
-                    Size = state.Size + written
-                })
+                    { state with
+                        Size = state.Size + written
+                    }))
+            >>= id
 
     /// レコード列を追記して fsync まで行う。
     let append = appendCore true

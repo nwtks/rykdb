@@ -34,14 +34,15 @@ module internal Dml =
 
     let private reserveUniqueValues (txn: Transaction) (schema: TableSchema) (index: IndexSchema) =
         function
-        | None -> txn
+        | None -> ret txn
         | Some values ->
             let keyValues = RowKey.indexValues schema index values
 
             if keyValues |> List.exists SqlValue.isNull then
-                txn
+                ret txn
             else
-                Transaction.reserveUnique index.Name (KeyBuilder.ofValues keyValues) txn
+                KeyBuilder.ofValues keyValues
+                |> Result.map (fun key -> Transaction.reserveUnique index.Name key txn)
 
     /// 旧行と新行の差分を索引へ反映する。
     /// 同じ索引キーなら上書きだけ行い、キーが変わった場合だけ旧キーを削除する。
@@ -54,29 +55,36 @@ module internal Dml =
         schema.Indexes
         |> foldOk
             (fun current index ->
-                let current' =
+                let reserved =
                     if index.Unique then
-                        let afterOld = reserveUniqueValues current schema index oldRow
-                        reserveUniqueValues afterOld schema index newRow
+                        reserveUniqueValues current schema index oldRow
+                        >>= fun afterOld -> reserveUniqueValues afterOld schema index newRow
                     else
-                        current
+                        ret current
 
-                let keyFor row = RowKey.indexKey schema index row
                 let space = indexSpace index
+                let keyFor row = RowKey.indexKey schema index row
 
                 match oldRow, newRow with
-                | None, None -> ret current'
-                | None, Some row -> ret (Transaction.put space (keyFor row) row current')
-                | Some row, None -> ret (Transaction.remove space (keyFor row) current')
+                | None, None -> reserved
+                | None, Some row ->
+                    reserved
+                    >>= fun txn -> keyFor row |> Result.map (fun key -> Transaction.put space key row txn)
+                | Some row, None ->
+                    reserved
+                    >>= fun txn -> keyFor row |> Result.map (fun key -> Transaction.remove space key txn)
                 | Some oldValue, Some newValue ->
-                    let oldKey = keyFor oldValue
-                    let newKey = keyFor newValue
-
-                    if oldKey = newKey then
-                        ret (Transaction.put space newKey newValue current')
-                    else
-                        let removed = Transaction.remove space oldKey current'
-                        ret (Transaction.put space newKey newValue removed))
+                    reserved
+                    >>= fun txn ->
+                        keyFor oldValue
+                        >>= fun oldKey ->
+                            keyFor newValue
+                            |> Result.map (fun newKey ->
+                                if oldKey = newKey then
+                                    Transaction.put space newKey newValue txn
+                                else
+                                    let removed = Transaction.remove space oldKey txn
+                                    Transaction.put space newKey newValue removed))
             txn
 
     /// store の行に txn の書き込みを重ねる（ストリーミング）。
@@ -88,7 +96,7 @@ module internal Dml =
     /// slot は 1回ずつしか消費されない（store 行と突き合わせたとき、あるいは store が尽きたとき）。
     /// </remarks>
     let private overlayRows
-        (keyOf: SqlValue array -> byte array)
+        (keyOf: SqlValue array -> Result<byte array, DbError>)
         (slots: (byte array * SqlValue array option) list)
         (rows: Op)
         =
@@ -115,19 +123,21 @@ module internal Dml =
                         | Error e -> err e
                         | Ok None -> emitRemaining i |> Op.next
                         | Ok(Some(row, nxt)) ->
-                            let rk = keyOf row
                             let sk, sv = slotArr.[i]
 
-                            match Bytes.compare rk sk with
-                            | c when c < 0 -> ret (Some(row, merge nxt i))
-                            | 0 ->
-                                match sv with
-                                | Some v -> ret (Some(v, merge nxt (i + 1)))
-                                | None -> merge nxt (i + 1) |> Op.next
-                            | _ ->
-                                match sv with
-                                | Some v -> ret (Some(v, Op.emit row (merge nxt (i + 1))))
-                                | None -> ret (Some(row, merge nxt (i + 1))))
+                            match keyOf row with
+                            | Error e -> err e
+                            | Ok rk ->
+                                match Bytes.compare rk sk with
+                                | c when c < 0 -> ret (Some(row, merge nxt i))
+                                | 0 ->
+                                    match sv with
+                                    | Some v -> ret (Some(v, merge nxt (i + 1)))
+                                    | None -> merge nxt (i + 1) |> Op.next
+                                | _ ->
+                                    match sv with
+                                    | Some v -> ret (Some(v, Op.emit row (merge nxt (i + 1))))
+                                    | None -> ret (Some(row, merge nxt (i + 1))))
 
             merge rows 0
 
@@ -222,7 +232,8 @@ module internal Dml =
         (txn: Transaction)
         (mask: bool array)
         =
-        getByPrimaryKeyBytesWithTxnMask store schema (KeyBuilder.ofValues key) visible txn mask
+        KeyBuilder.ofValues key
+        >>= fun bytes -> getByPrimaryKeyBytesWithTxnMask store schema bytes visible txn mask
 
     /// 主キーで prefix 走査する（キー昇順）。
     /// 返り値は遅延の `Op`（1行ずつ引くまで store を読まない）。
@@ -289,37 +300,44 @@ module internal Dml =
         (txn: Transaction)
         (mask: bool array)
         =
-        let startBytes = KeyBuilder.ofValues startKey
-        let endBytes = endKey |> Option.map KeyBuilder.ofValues
+        result {
+            let! startBytes = KeyBuilder.ofValues startKey
+            let! endBytes = KeyBuilder.ofOptionalValues endKey
 
-        let slots =
-            Transaction.slotsOf (tableSpace schema) txn
-            |> List.filter (fun (key, _) -> inKeyRange startBytes endBytes key)
+            let slots =
+                Transaction.slotsOf (tableSpace schema) txn
+                |> List.filter (fun (key, _) -> inKeyRange startBytes endBytes key)
 
-        let mask =
-            if endBytes.IsNone && List.isEmpty slots then
-                mask
-            else
-                widenMask mask schema.PrimaryKey
+            let mask =
+                if endBytes.IsNone && List.isEmpty slots then
+                    mask
+                else
+                    widenMask mask schema.PrimaryKey
 
-        let scanPrimaryKeyRange lowerBytes upperBytes limit =
-            RowStore.scanAtRawMasked (tableSpace schema) lowerBytes limit visible scope mask store
-            |> Result.map (fun scan ->
-                let rows =
-                    opOfScan schema.Columns.Length (fun e -> inKeyRange lowerBytes upperBytes e.Key) scan
+            let scanPrimaryKeyRange lowerBytes upperBytes limit =
+                RowStore.scanAtRawMasked (tableSpace schema) lowerBytes limit visible scope mask store
+                |> Result.map (fun scan ->
+                    let rows =
+                        opOfScan schema.Columns.Length (fun e -> inKeyRange lowerBytes upperBytes e.Key) scan
 
-                if limit > 0 then Op.take limit rows else rows)
+                    if limit > 0 then Op.take limit rows else rows)
 
-        scanPrimaryKeyRange startBytes endBytes (storeLimitFor limit slots)
-        |> Result.map (fun rows ->
+            let! rows = scanPrimaryKeyRange startBytes endBytes (storeLimitFor limit slots)
             let merged = overlayRows (RowKey.primary schema) slots rows
 
             let filtered =
                 match endBytes with
                 | None -> merged
-                | Some eb -> Op.filter (fun row -> ret (Bytes.compare (RowKey.primary schema row) eb <= 0)) merged
+                | Some eb ->
+                    Op.filter
+                        (fun row -> RowKey.primary schema row |> Result.map (fun key -> Bytes.compare key eb <= 0))
+                        merged
 
-            if limit > 0 then Op.take limit filtered else filtered)
+            if limit > 0 then
+                return Op.take limit filtered
+            else
+                return filtered
+        }
 
     /// 索引の値に一致する全行を引く（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`。
@@ -334,30 +352,35 @@ module internal Dml =
         (txn: Transaction)
         (mask: bool array)
         =
-        let prefix = KeyBuilder.ofValues values
+        result {
+            let! prefix = KeyBuilder.ofValues values
 
-        let slots =
-            Transaction.slotsOf (indexSpace index) txn
-            |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
+            let slots =
+                Transaction.slotsOf (indexSpace index) txn
+                |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
 
-        let mask =
-            if List.isEmpty slots then
-                mask
-            else
-                widenMask mask (Seq.append (indexColumnIndices schema index) schema.PrimaryKey)
+            let mask =
+                if List.isEmpty slots then
+                    mask
+                else
+                    widenMask mask (Seq.append (indexColumnIndices schema index) schema.PrimaryKey)
 
-        let scanIndexPrefix prefix limit =
-            RowStore.scanAtRawMasked (indexSpace index) prefix limit visible scope mask store
-            |> Result.map (fun scan ->
-                let rows =
-                    opOfScan schema.Columns.Length (fun e -> KeyBuilder.startsWithPrefix e.Key prefix) scan
+            let scanIndexPrefix prefix limit =
+                RowStore.scanAtRawMasked (indexSpace index) prefix limit visible scope mask store
+                |> Result.map (fun scan ->
+                    let rows =
+                        opOfScan schema.Columns.Length (fun e -> KeyBuilder.startsWithPrefix e.Key prefix) scan
 
-                if limit > 0 then Op.take limit rows else rows)
+                    if limit > 0 then Op.take limit rows else rows)
 
-        scanIndexPrefix prefix (storeLimitFor limit slots)
-        |> Result.map (fun rows ->
+            let! rows = scanIndexPrefix prefix (storeLimitFor limit slots)
             let overlaid = overlayRows (RowKey.indexKey schema index) slots rows
-            if limit > 0 then Op.take limit overlaid else overlaid)
+
+            if limit > 0 then
+                return Op.take limit overlaid
+            else
+                return overlaid
+        }
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`。
@@ -373,31 +396,36 @@ module internal Dml =
         (txn: Transaction)
         (mask: bool array)
         =
-        let lowerBytes = KeyBuilder.ofValues lower
-        let upperBytes = upper |> Option.map KeyBuilder.ofValues
+        result {
+            let! lowerBytes = KeyBuilder.ofValues lower
+            let! upperBytes = KeyBuilder.ofOptionalValues upper
 
-        let slots =
-            Transaction.slotsOf (indexSpace index) txn
-            |> List.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
+            let slots =
+                Transaction.slotsOf (indexSpace index) txn
+                |> List.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
 
-        let mask =
-            if List.isEmpty slots then
-                mask
-            else
-                widenMask mask (Seq.append (indexColumnIndices schema index) schema.PrimaryKey)
+            let mask =
+                if List.isEmpty slots then
+                    mask
+                else
+                    widenMask mask (Seq.append (indexColumnIndices schema index) schema.PrimaryKey)
 
-        let scanIndexRange lowerBytes upperBytes limit =
-            RowStore.scanAtRawMasked (indexSpace index) lowerBytes limit visible scope mask store
-            |> Result.map (fun scan ->
-                let rows =
-                    opOfScan schema.Columns.Length (fun e -> inIndexRange lowerBytes upperBytes e.Key) scan
+            let scanIndexRange lowerBytes upperBytes limit =
+                RowStore.scanAtRawMasked (indexSpace index) lowerBytes limit visible scope mask store
+                |> Result.map (fun scan ->
+                    let rows =
+                        opOfScan schema.Columns.Length (fun e -> inIndexRange lowerBytes upperBytes e.Key) scan
 
-                if limit > 0 then Op.take limit rows else rows)
+                    if limit > 0 then Op.take limit rows else rows)
 
-        scanIndexRange lowerBytes upperBytes (storeLimitFor limit slots)
-        |> Result.map (fun rows ->
+            let! rows = scanIndexRange lowerBytes upperBytes (storeLimitFor limit slots)
             let overlaid = overlayRows (RowKey.indexKey schema index) slots rows
-            if limit > 0 then Op.take limit overlaid else overlaid)
+
+            if limit > 0 then
+                return Op.take limit overlaid
+            else
+                return overlaid
+        }
 
     /// 1行を transaction に積む（まだ DB には入らない）。
     /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。
@@ -424,10 +452,8 @@ module internal Dml =
         result {
             do! TableSchema.validateRow schema newRow
             do! ensureSamePrimaryKey schema oldRow newRow
-
-            let afterMain =
-                Transaction.put (tableSpace schema) (RowKey.primary schema newRow) newRow txn
-
+            let! key = RowKey.primary schema newRow
+            let afterMain = Transaction.put (tableSpace schema) key newRow txn
             let! changed = applyIndexChange afterMain schema (Some oldRow) (Some newRow)
             return! Transaction.checkLimit changed
         }
@@ -435,7 +461,8 @@ module internal Dml =
     /// 走査済みの行をそのまま使って削除する（主キー検索をやり直さない）。
     let deleteRow (txn: Transaction) (schema: TableSchema) (oldRow: SqlValue array) =
         result {
-            let next = Transaction.remove (tableSpace schema) (RowKey.primary schema oldRow) txn
+            let! key = RowKey.primary schema oldRow
+            let next = Transaction.remove (tableSpace schema) key txn
             let! changed = applyIndexChange next schema (Some oldRow) None
             return! Transaction.checkLimit changed
         }

@@ -255,7 +255,7 @@ let ``RowStore: keyspace は 1 本の LSM の接頭辞で分離される`` () =
         let row = rowOf 1 "a@x.com" 1
 
         let txn =
-            Dml.insertWithKey (RowKey.primary usersWithEmailIndex row) txn usersWithEmailIndex row
+            Dml.insertWithKey (RowKey.primary usersWithEmailIndex row |> ok) txn usersWithEmailIndex row
             |> ok
 
         let store = commitInto store 1UL txn
@@ -287,7 +287,7 @@ let ``RowStore.scanKeys: 値を復号せずキーだけ返す`` () =
         let row = rowOf 1 "a@x.com" 1
 
         let txn =
-            Dml.insertWithKey (RowKey.primary usersWithEmailIndex row) txn usersWithEmailIndex row
+            Dml.insertWithKey (RowKey.primary usersWithEmailIndex row |> ok) txn usersWithEmailIndex row
             |> ok
 
         let store = commitInto store 1UL txn

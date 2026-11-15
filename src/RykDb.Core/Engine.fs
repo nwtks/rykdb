@@ -311,12 +311,13 @@ module internal Ddl =
                     if values |> Array.exists SqlValue.isNull then
                         loop previous positions idx rest
                     else
-                        let prefix = KeyBuilder.ofValues values
-
-                        match previous with
-                        | Some before when Bytes.compare before prefix = 0 ->
-                            err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                        | _ -> loop (Some prefix) positions idx rest
+                        match KeyBuilder.ofValues values with
+                        | Error e -> err e
+                        | Ok prefix ->
+                            match previous with
+                            | Some before when Bytes.compare before prefix = 0 ->
+                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                            | _ -> loop (Some prefix) positions idx rest
 
         let checkEntries = loop None
 
@@ -351,11 +352,11 @@ module internal Ddl =
                     let! cleared = clearSpaceChunksResult state space
                     let! rows = Dml.scanByPrimaryKey cleared.Store withIndex 0 None
 
-                    let indexKeyFor row = RowKey.indexKey withIndex idx row
-
                     let! filled =
                         applyOpChunks
-                            (fun txn row -> ret (Transaction.put space (indexKeyFor row) row txn))
+                            (fun txn row ->
+                                RowKey.indexKey withIndex idx row
+                                |> Result.map (fun key -> Transaction.put space key row txn))
                             rows
                             cleared
 
@@ -522,6 +523,32 @@ module internal Engine =
                     })
             finally
                 ctx.Scope.DisposeAll()
+
+    /// SELECT の計画だけを組み立てる（実行しない）。
+    /// <remarks>
+    /// ベンチ・診断用の入口。
+    /// 返した計画の `Context` は snapshot を固定したまま再利用できるので、
+    /// `Optimizer.exec` + `Op.toArrayLimited` を繰り返せば
+    /// 「parse / plan を除いた実行」だけを測れる。
+    /// 実行のたびに `plan.Context.Scope.DisposeAll()` を呼ぶこと。
+    /// snapshot を登録しないため、読み取りの間に書き込みが入る用途には使わない。
+    /// </remarks>
+    let internal prepareSelect (state: DbState) (stmt: SelectStatement) =
+        let snapshot =
+            {
+                SeqNo = state.Manager.LastCommitSeqNo
+            }
+
+        let txn = Transaction.create 0UL<txnId> snapshot
+
+        match contextOf state txn with
+        | Error e -> err e
+        | Ok ctx ->
+            match Plan.explainSelect ctx stmt with
+            | Ok plan -> ret plan
+            | Error e ->
+                ctx.Scope.DisposeAll()
+                err e
 
     /// SELECT を materialize せずにストリーミング用の Op として開く。
     /// 呼び出し側は返された `Cleanup` を必ず呼び、snapshot 登録と走査を解放する。

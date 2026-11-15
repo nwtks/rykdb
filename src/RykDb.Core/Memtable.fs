@@ -68,18 +68,18 @@ module internal Entry =
         }
 
     let private encodeEntry (e: Entry) =
-        let body =
-            Writer.build
-                [
-                    Writer.varint e.SeqNo
-                    Writer.bool e.IsDelete
-                    Writer.lengthPrefixed e.Key
-                    match e.Value with
-                    | Some values when not e.IsDelete -> ValueCodec.writeValues values
-                    | _ -> id
-                ]
+        let header =
+            Writer.build [ Writer.varint e.SeqNo; Writer.bool e.IsDelete; Writer.lengthPrefixed e.Key ]
 
-        Writer.build [ Writer.lengthPrefixed body ]
+        let body =
+            match e.Value with
+            | Some values when not e.IsDelete ->
+                ValueCodec.writeValues values Writer.Empty
+                |> Result.map (fun vw ->
+                    Writer.build [ Writer.writeBytes header; Writer.writeBytes (Writer.toArray vw) ])
+            | _ -> ret header
+
+        body |> Result.map (fun b -> Writer.build [ Writer.lengthPrefixed b ])
 
     let private decodeEntry (data: byte array) =
         result {
@@ -104,12 +104,12 @@ module internal Entry =
 
     let encodeBatch (txnId: TxnId) (entries: Entry array) =
         entries
-        |> Array.fold
-            (fun w e -> Writer.writeBytes (encodeEntry e) w)
+        |> foldOk
+            (fun w e -> encodeEntry e |> Result.map (fun bytes -> Writer.writeBytes bytes w))
             (Writer.Empty
              |> Writer.uint64BE (uint64 txnId)
              |> Writer.varint (uint64 entries.Length))
-        |> Writer.toArray
+        |> Result.map Writer.toArray
 
     let decodeBatch (data: byte array) =
         let readOne c =

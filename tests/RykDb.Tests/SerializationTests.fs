@@ -251,25 +251,29 @@ let ``Hashing.checksumChunks: 連結した入力と同じ値になる`` () =
 
 [<Fact>]
 let ``KeyBuilder.ofValues: 空列は空キー`` () =
-    let k = KeyBuilder.ofValues []
+    let k = KeyBuilder.ofValues [] |> ok
     Assert.Equal(0, k.Length)
 
 [<Fact>]
 let ``KeyBuilder.ofValues: 値を符号化する`` () =
-    let k = KeyBuilder.ofValues [ SqlValue.Int 1L ]
+    let k = KeyBuilder.ofValues [ SqlValue.Int 1L ] |> ok
     Assert.True(k.Length > 0)
 
 [<Fact>]
 let ``KeyBuilder.ofValues: REAL の -0.0 は +0.0 と同じキー`` () =
     let negativeZero = BitConverter.Int64BitsToDouble 0x8000000000000000L
-    let positive = KeyBuilder.ofValues [ SqlValue.vReal 0.0 ]
-    let negative = KeyBuilder.ofValues [ SqlValue.Real negativeZero ]
+    let positive = KeyBuilder.ofValues [ SqlValue.vReal 0.0 ] |> ok
+    let negative = KeyBuilder.ofValues [ SqlValue.Real negativeZero ] |> ok
     Assert.Equal<byte array>(positive, negative)
 
 [<Fact>]
+let ``KeyBuilder.ofValues: Unloaded は InternalError`` () =
+    expectErrorKind ErrorKind.InternalError "Unloaded をキーに符号化できてしまう" (KeyBuilder.ofValues [ SqlValue.Unloaded ])
+
+[<Fact>]
 let ``KeyBuilder.ofIndexAndPrimary: 索引列 + 主キー列`` () =
-    let k = KeyBuilder.ofIndexAndPrimary [ SqlValue.Int 20L ] [ SqlValue.Int 7L ]
-    let prefix = KeyBuilder.ofValues [ SqlValue.Int 20L ]
+    let k = KeyBuilder.ofIndexAndPrimary [ SqlValue.Int 20L ] [ SqlValue.Int 7L ] |> ok
+    let prefix = KeyBuilder.ofValues [ SqlValue.Int 20L ] |> ok
     Assert.True(KeyBuilder.startsWithPrefix k prefix)
 
 [<Fact>]
@@ -283,7 +287,7 @@ let ``KeyBuilder.startsWithPrefix: 前缀一致`` () =
 [<Fact>]
 let ``ValueCodec: 全型の往復`` () =
     let values = Array.init 3000 (fun _ -> randomValue ())
-    let w = ValueCodec.writeValues values Writer.Empty
+    let w = ValueCodec.writeValues values Writer.Empty |> ok
     let got, _ = ok (ValueCodec.readValues (Cursor.create (Writer.toArray w)))
     Assert.Equal(values.Length, got.Length)
 
@@ -305,10 +309,12 @@ let ``ValueCodec: 負のゼロは正のゼロと同じ符号化`` () =
 
     let positive =
         ValueCodec.writeValues [ SqlValue.vReal 0.0; SqlValue.Decimal 0M ] Writer.Empty
+        |> ok
         |> Writer.toArray
 
     let negative =
         ValueCodec.writeValues [ SqlValue.Real negativeZero; SqlValue.Decimal(-0.0M) ] Writer.Empty
+        |> ok
         |> Writer.toArray
 
     Assert.Equal<byte array>(positive, negative)
@@ -331,6 +337,22 @@ let ``ValueCodec: 不明な型タグは CorruptionError`` () =
 let ``ValueCodec: 要素数が大きすぎると CorruptionError`` () =
     let bytes = Writer.build [ Writer.varint (uint64 Int32.MaxValue + 1UL) ]
     expectErrorKind ErrorKind.CorruptionError "要素数が大きすぎる場合はエラー" (ValueCodec.readValues (Cursor.create bytes))
+
+[<Fact>]
+let ``ValueCodec.writeValues: Unloaded は InternalError`` () =
+    expectErrorKind
+        ErrorKind.InternalError
+        "Unloaded を行値に符号化できてしまう"
+        (ValueCodec.writeValues [ SqlValue.Int 1L; SqlValue.Unloaded ] Writer.Empty)
+
+[<Fact>]
+let ``ValueCodec.writeValuesTo: Unloaded は InternalError`` () =
+    let out = Array.zeroCreate<byte> 64
+
+    expectErrorKind
+        ErrorKind.InternalError
+        "Unloaded を行値に符号化できてしまう"
+        (ValueCodec.writeValuesTo out 0 [| SqlValue.Unloaded |])
 
 [<Fact>]
 let ``ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの概算`` () =

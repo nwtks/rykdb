@@ -212,8 +212,8 @@ let ``順序保持プロパティ: Entry と SstEntry の並びが一致する``
         Entry.put key seqNo [| SqlValue.Int(int64 seqNo) |]
 
     for _ in 1..2000 do
-        let keyA = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 100)) ]
-        let keyB = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 100)) ]
+        let keyA = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 100)) ] |> ok
+        let keyB = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 100)) ] |> ok
         let seqA = uint64 (random.Next 10)
         let seqB = uint64 (random.Next 10)
 
@@ -229,7 +229,7 @@ let ``順序保持プロパティ: KeyOrder は反対称で推移的`` () =
     let random = Random 20261112
 
     let randomPair () =
-        let key = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 50)) ]
+        let key = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 50)) ] |> ok
         key, uint64 (random.Next 5)
 
     for _ in 1..1000 do

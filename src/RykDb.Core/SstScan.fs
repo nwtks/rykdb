@@ -77,14 +77,14 @@ module internal SstEntry =
         match e.RawValue with
         | Some raw ->
             Array.blit raw.Buffer raw.Offset out pos raw.Length
-            pos + raw.Length
+            ret (pos + raw.Length)
         | None ->
             match e.Value with
             | None ->
                 out.[pos] <- 0uy
                 let pos = pos + 1
                 out.[pos] <- 0uy
-                pos + 1
+                ret (pos + 1)
             | Some values ->
                 out.[pos] <- 1uy
                 ValueCodec.writeValuesTo out (pos + 1) values

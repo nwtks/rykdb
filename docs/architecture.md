@@ -842,11 +842,12 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
   不要列は型タグと長さを見て読み飛ばす。
 - 不要列には `SqlValue.Unloaded` を置く。
   これは実際の NULL ではない。
-  `compareValues` は内部エラー、出力の符号化は `invalidOp` になる。
+  `compareValues` と符号化（`OrderPreserving.writeValue` / `ValueCodec.writeValue(s)`）は
+  `InternalError` を返す。
 - 空マスクの行を `[||]` にせず、スキーマ幅で埋める
   （`ORDER BY 1` などが行の幅を前提にするため）。
 - overlay（transaction の書き込み）は主キーを、索引スキャンは索引列 + 主キーをマスクに足す。
-- 点検索も `Sstable.lookupMasked` でマスク復号する。
+- ポイント検索も `Sstable.lookupMasked` でマスク復号する。
   `lookupCached` は値スライスをコピーせず `SstEntry.decodeMaskedValueAt` に渡す。
 - 制約検査の存在確認（`DmlOps.checkUnique`）は全列 false のマスク、
   UNIQUE 索引の重複検査は主キー列だけのマスクを使う。

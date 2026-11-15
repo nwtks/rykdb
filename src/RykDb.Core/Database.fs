@@ -114,6 +114,10 @@ type internal Database(root: string, state: DbState, ownsStore: bool) =
     /// テーブル一覧を返す。
     member _.TableNames() = state.Catalog.Tables |> List.map _.Name
 
+    /// SELECT の計画だけを組み立てる（実行しない。ベンチ・診断用）。
+    /// 返した `PlannedQuery` は `Optimizer.exec` で繰り返し実行できる。
+    member internal _.PrepareSelect(stmt: SelectStatement) = Engine.prepareSelect state stmt
+
     /// DB を閉じる（memtable を flush し、WAL を削除する）。
     /// <remarks>
     /// ハンドルは不変なので「閉じた」状態をこのハンドルには記録しない。

@@ -94,14 +94,17 @@ module private Spill =
         |> ignore
 
     let private frameRow (row: SqlValue seq) =
-        let payload = ValueCodec.writeValues row Writer.Empty |> Writer.toArray
-        Writer.build [ Writer.varint (uint64 payload.Length); Writer.writeBytes payload ]
+        ValueCodec.writeValues row Writer.Empty
+        |> Result.map (fun writer ->
+            let payload = Writer.toArray writer
+            Writer.build [ Writer.varint (uint64 payload.Length); Writer.writeBytes payload ])
 
     /// 1行を run へ書き出す。
     let writeRow (row: SqlValue seq) (sink: Sink) =
         let (Sink s) = sink
-        let bytes = frameRow row
-        protect (fun () -> s.Write(bytes, 0, bytes.Length))
+
+        frameRow row
+        >>= fun bytes -> protect (fun () -> s.Write(bytes, 0, bytes.Length))
 
     /// run ファイル 1本を作る（受入中の行を整列して書き出す）。
     let writeRun

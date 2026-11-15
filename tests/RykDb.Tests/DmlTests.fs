@@ -60,7 +60,7 @@ let private rowOf (id: int) (email: string) (age: int) =
 
 /// 主キーを計算して 1行を transaction に積む。
 let private insertRow (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
-    Dml.insertWithKey (RowKey.primary schema row) txn schema row
+    Dml.insertWithKey (RowKey.primary schema row |> ok) txn schema row
 
 /// transaction のバッファを DB に流し込む。
 let private commitInto (store: RowStore) (nextSeq: uint64) (txn: Transaction) =
@@ -71,7 +71,7 @@ let private commitInto (store: RowStore) (nextSeq: uint64) (txn: Transaction) =
 let ``RowKey.primary: 主キー列を符号化する`` () =
     let schema = peopleSchema
     let row = [| SqlValue.Int 7L; SqlValue.Text "alice"; SqlValue.Int 20L |]
-    let k = RowKey.primary schema row
+    let k = RowKey.primary schema row |> ok
     Assert.True(k.Length > 0)
 
 [<Fact>]

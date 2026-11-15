@@ -98,7 +98,8 @@ module internal Sstable =
     [<Literal>]
     let private FooterChecksumLength = 80
 
-    /// 点検索のブロック解析結果。件数上限を超えたら全消しする（LRU は持たない）。
+    /// ポイント検索のブロック解析結果。
+    /// 件数上限を超えたら全消しする（LRU は持たない）。
     let private blockCache =
         System.Collections.Concurrent.ConcurrentDictionary<SstBlockKey, CachedSstBlock>()
 
@@ -282,37 +283,42 @@ module internal Sstable =
 
             let rec writeEntries block i prev pos =
                 if i >= items.Length then
-                    pos
+                    ret pos
                 else
-                    writeEntries block (i + 1) items.[i].Key (writeEntry block pos prev items.[i])
+                    match writeEntry block pos prev items.[i] with
+                    | Error e -> err e
+                    | Ok next -> writeEntries block (i + 1) items.[i].Key next
 
             let length = bodyLength 0 [||] 0
             let block = Array.zeroCreate<byte>(length + 4)
-            writeEntries block 0 [||] 0 |> ignore
-            let sum = Hashing.checksumRange block 0 length
-            block.[length] <- byte (sum &&& 0xFFu)
-            block.[length + 1] <- byte (sum >>> 8 &&& 0xFFu)
-            block.[length + 2] <- byte (sum >>> 16 &&& 0xFFu)
-            block.[length + 3] <- byte (sum >>> 24 &&& 0xFFu)
-            block
+
+            writeEntries block 0 [||] 0
+            |> Result.map (fun _ ->
+                let sum = Hashing.checksumRange block 0 length
+                block.[length] <- byte (sum &&& 0xFFu)
+                block.[length + 1] <- byte (sum >>> 8 &&& 0xFFu)
+                block.[length + 2] <- byte (sum >>> 16 &&& 0xFFu)
+                block.[length + 3] <- byte (sum >>> 24 &&& 0xFFu)
+                block)
 
         let writeBlock items offset indexEntries =
-            let data = buildBlock items
-            let nextOffset = int64 offset + int64 data.Length
+            buildBlock items
+            >>= fun data ->
+                let nextOffset = int64 offset + int64 data.Length
 
-            if nextOffset > int64 System.Int32.MaxValue then
-                err (DbError.internalError "Sstable: ファイルが大きすぎます")
-            else
-                stream.Write(data, 0, data.Length)
+                if nextOffset > int64 System.Int32.MaxValue then
+                    err (DbError.internalError "Sstable: ファイルが大きすぎます")
+                else
+                    stream.Write(data, 0, data.Length)
 
-                let entry =
-                    {
-                        LastKey = items.[items.Length - 1].Key
-                        Offset = offset
-                        Length = data.Length
-                    }
+                    let entry =
+                        {
+                            LastKey = items.[items.Length - 1].Key
+                            Offset = offset
+                            Length = data.Length
+                        }
 
-                ret (int nextOffset, entry :: indexEntries)
+                    ret (int nextOffset, entry :: indexEntries)
 
         let indexBytesOf =
             Array.collect (fun (e: SstIndexEntry) ->
@@ -805,7 +811,7 @@ module internal Sstable =
         rangeScanPartialWith DecodeValues startKey limit partial
 
     /// ブロック内のキー・SeqNo・値の位置をキャッシュする。
-    /// 点検索のたびにキー復元と値の読み飛ばしを繰り返さないため。
+    /// ポイント検索のたびにキー復元と値の読み飛ばしを繰り返さないため。
     /// `Partial` を強参照して、ブロックがキャッシュされている間は
     /// `SstPartialCache` の弱参照が外れても index/Bloom を開き直さないようにする。
     let private cacheBlock (partial: SstPartial) (data: byte array) (indexEntry: SstIndexEntry) =

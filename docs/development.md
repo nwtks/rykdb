@@ -161,17 +161,24 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query  # クエリ�
 dotnet run -c Release --project tools/RykDb.Bench -- --class eval   # 式評価器のみ
 dotnet run -c Release --project tools/RykDb.Bench -- --quick        # 短いジョブ
 dotnet run -c Release --project tools/RykDb.Bench -- --dry          # 1 回だけ実行して検証
+# シナリオを絞る（BenchmarkDotNet の --filter。複数指定は OR）
+dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --filter "*QueryBenchmarks.PointLookup" --filter "*PointLookupParsed*"
 ```
 
 - **CI ではビルドのみ**（`dotnet build -t:Rebuild` に含まれる）。実行は手元で行う。
 - 結果は `BenchmarkDotNet.Artifacts/`（実行時のカレントディレクトリ）に残る。git 対象外。
 - シナリオ:
   - `PointLookup` / `PointLookup500` / `CountStar` / `RangeScan` / `FilterSeqScan` / `SelectConstant` / `CountConstantWhere`
-  - `Insert100Rows` / `Insert10kRows`（2,000行 × 5 文を 1 transaction で流して ROLLBACK）
+  - `PointLookupParsed` / `PointLookupPlanned` / `PointLookupStorage` — 同じポイント検索を「parse 済みの文」「計画済みの木」「ストレージ直（`PkLookup` が実行する `byPrimaryKeyMasked`）」で測る低レベル版。
+    `PointLookup` との差で parse / plan / 実行の内訳が分かる。
+    **計画・実行の変更はこの 3 本を見る**（`PointLookup` は plan が支配的で、ストレージの変化が埋もれる）。
+    `Database.PrepareSelect`（internal）で計画だけを組み、`Optimizer.exec` + `Op.toArrayLimited` を繰り返す。
+    実行のたびに `Scope.DisposeAll()` を呼ぶ。
+  - `Insert100Rows` / `Insert10kRows`（2,000行 × 5文を 1 transaction で流して ROLLBACK）
   - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
   - `MatchesLiteral` / `MatchesColumn` / `MatchesBinary` / `MatchesComplex` — DB を使わない式評価器のマイクロベンチ
   - `CompactL0` — L0 の 4ファイル（各 25,000件）を 1回 compaction する
-- **性能スモーク（10,000行 INSERT → 500回の point lookup → `COUNT(*)`）はベンチで確認する**（旧 `DatabaseTests` の `性能:` テスト）。
+- **性能スモーク（10,000行 INSERT → 500回の point lookup → `COUNT(*)`）はベンチで確認する**。
   実時間の上限で落とすテストは置かない（マシン依存のため。回帰はベンチの前後比較で見る）。
 - クエリ系は `Database.OpenWith`（同期 compaction）で開き、
   シード後に一度 Close して memtable を SSTable へ flush してから測る

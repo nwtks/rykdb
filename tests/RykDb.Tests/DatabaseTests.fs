@@ -452,6 +452,7 @@ let ``Database: CREATE INDEX は残った索引エントリを消してから ba
         // 前回の失敗などで索引 keyspace にだけ残った行を用意する。
         let staleKey =
             KeyBuilder.ofIndexAndPrimary [| SqlValue.Int 999L |] [| SqlValue.Int 999L |]
+            |> ok
 
         let staleRow = [| SqlValue.Int 999L; SqlValue.Int 999L |]
         let store = ok (RowStore.openStore dir)
@@ -511,6 +512,7 @@ let ``Database: DROP TABLE は索引 keyspace の孤児エントリも消す`` (
         // 前回の失敗などで索引 keyspace にだけ残った行を追加する。
         let staleKey =
             KeyBuilder.ofIndexAndPrimary [| SqlValue.Int 999L |] [| SqlValue.Int 999L |]
+            |> ok
 
         let store = ok (RowStore.openStore dir)
 

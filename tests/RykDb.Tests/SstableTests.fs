@@ -176,7 +176,7 @@ let ``SSTable: 全 10型の値を往復できる`` () =
 
     let entries =
         values
-        |> Array.mapi (fun i vs -> SstEntry.make (KeyBuilder.ofValues [ SqlValue.Int(int64 i) ]) 1UL (Some vs))
+        |> Array.mapi (fun i vs -> SstEntry.make (KeyBuilder.ofValues [ SqlValue.Int(int64 i) ] |> ok) 1UL (Some vs))
         |> Array.sortWith SstEntry.compare
 
     let reader =
