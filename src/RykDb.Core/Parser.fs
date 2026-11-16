@@ -348,6 +348,84 @@ module internal Parser =
             return Statement.DropIndex(name, ifEx), st
         }
 
+    /// `ALTER TABLE`。
+    /// <remarks>
+    /// `ALTER` / `ADD` / `COLUMN` / `RENAME` / `TO` は予約語にしない
+    /// （`EXPLAIN` と同じく、識別子として使える語を増やさないため）。
+    /// 未対応の操作（型変更・テーブル名の変更など）は黙って無視せず SyntaxError にする。
+    /// </remarks>
+    let private parseAlterTable (st: PState) =
+        let alterAction name st =
+            let withOptionalColumn st =
+                if isIdentName "COLUMN" st then advance st else st
+
+            if isIdentName "ADD" st then
+                let st = advance st |> withOptionalColumn
+
+                result {
+                    let! col, st = parseColumnDefinition st
+                    let! _, st = eatOptionalSemicolon st
+
+                    return
+                        Statement.AlterTable
+                            {
+                                Table = name
+                                Action = AlterTableAction.AddColumn col
+                            },
+                        st
+                }
+            elif isKeyword "DROP" st then
+                let st = advance st |> withOptionalColumn
+
+                result {
+                    let! column, st = parseIdent st
+                    let! _, st = eatOptionalSemicolon st
+
+                    return
+                        Statement.AlterTable
+                            {
+                                Table = name
+                                Action = AlterTableAction.DropColumn column
+                            },
+                        st
+                }
+            elif isIdentName "RENAME" st then
+                let st = advance st
+
+                if isIdentName "TO" st then
+                    fail "ALTER TABLE ... RENAME TO（テーブル名の変更）は未対応です" st
+                else
+                    let st = if isIdentName "COLUMN" st then advance st else st
+
+                    result {
+                        let! oldName, st = parseIdent st
+
+                        do!
+                            if isIdentName "TO" st then
+                                ret ()
+                            else
+                                fail "RENAME COLUMN の後ろには TO が必要です" st
+
+                        let! newName, st = parseIdent (advance st)
+                        let! _, st = eatOptionalSemicolon st
+
+                        return
+                            Statement.AlterTable
+                                {
+                                    Table = name
+                                    Action = AlterTableAction.RenameColumn(oldName, newName)
+                                },
+                            st
+                    }
+            else
+                fail "ALTER TABLE では ADD COLUMN / DROP COLUMN / RENAME COLUMN を指定してください" st
+
+        result {
+            let! _, st = expectKeyword "TABLE" st
+            let! name, st = parseIdent st
+            return! alterAction name st
+        }
+
     let private parseOne (st: PState) =
         let nextToken =
             if st.Pos + 1 < st.Tokens.Length then
@@ -390,6 +468,7 @@ module internal Parser =
                     return Statement.Explain sel, st
                 }
             | _ -> fail "EXPLAIN は SELECT 文だけに対応しています" st
+        | Token.Ident name when name.ToUpperInvariant() = "ALTER" -> advance st |> parseAlterTable
         | Token.Ident name when name.ToUpperInvariant() = "START" ->
             let st = advance st
 

@@ -326,6 +326,22 @@ and internal CreateIndex =
         IfNotExists: bool
     }
 
+/// `ALTER TABLE` の操作。
+/// 行の書き換えが必要なのは列の追加と削除だけ（列名は行の値に含まれない）。
+and [<RequireQualifiedAccess>] internal AlterTableAction =
+    /// `ADD [COLUMN] 列定義`。既存行は DEFAULT（無ければ NULL）で埋める。
+    | AddColumn of ColumnDefinition
+    /// `DROP [COLUMN] 列名`。主キー列と索引の列は削除できない。
+    | DropColumn of string
+    /// `RENAME [COLUMN] 旧名 TO 新名`。カタログの名前だけを書き換える。
+    | RenameColumn of string * string
+
+and internal AlterTable =
+    {
+        Table: string
+        Action: AlterTableAction
+    }
+
 and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
     | Select of SelectStatement
     /// `EXPLAIN SELECT ...`。実行はせず、論理計画（走査方法・結合アルゴリズム）を返す。
@@ -337,6 +353,7 @@ and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
     | DropTable of string * bool
     | CreateIndex of CreateIndex
     | DropIndex of string * bool
+    | AlterTable of AlterTable
     | Begin
     | Commit
     | Rollback

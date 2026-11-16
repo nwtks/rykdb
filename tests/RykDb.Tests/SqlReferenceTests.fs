@@ -347,6 +347,156 @@ let ``SqlReference: 暗黙の UNIQUE 索引は DROP できない`` () =
         expectErrorKind ErrorKind.NameError "予約された索引名を許してはいけない" (execSql db2 "CREATE INDEX __unique_t_9 ON t (email)"))
 
 [<Fact>]
+let ``SqlReference: ALTER TABLE ADD COLUMN は既存行を DEFAULT で埋める`` () =
+    withDb "alter-add" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
+        let db3 = exec db2 "CREATE INDEX ix_name ON t (name)"
+        let db4 = exec db3 "ALTER TABLE t ADD COLUMN age INTEGER DEFAULT 0"
+        let db5 = exec db4 "ALTER TABLE t ADD nn INTEGER NOT NULL DEFAULT 7"
+
+        // 既存行は既定値で埋まる（DEFAULT なしなら NULL）
+        let _, rows = ok (execSql db5 "SELECT * FROM t ORDER BY id")
+        Assert.Equal<string list>([ "id"; "name"; "age"; "nn" ], rows.Columns |> Array.toList)
+        Assert.Equal<int64 list>([ 0L; 0L ], rows.Rows |> Array.map (fun r -> asInt r.[2]) |> List.ofArray)
+        Assert.Equal<int64 list>([ 7L; 7L ], rows.Rows |> Array.map (fun r -> asInt r.[3]) |> List.ofArray)
+
+        // 索引エントリの行も書き換わる（索引経由で新しい列が返る）
+        let _, byIndex = ok (execSql db5 "SELECT age, nn FROM t WHERE name = 'b'")
+        Assert.Equal<int64>(0L, asInt byIndex.Rows.[0].[0])
+        Assert.Equal<int64>(7L, asInt byIndex.Rows.[0].[1])
+
+        // 新しい INSERT も既定値を使える
+        let db6 = exec db5 "INSERT INTO t (id, name) VALUES (3, 'c')"
+        let _, inserted = ok (execSql db6 "SELECT age, nn FROM t WHERE id = 3")
+        Assert.Equal<int64>(0L, asInt inserted.Rows.[0].[0])
+        Assert.Equal<int64>(7L, asInt inserted.Rows.[0].[1])
+
+        // UPDATE も新しい列を含む行で動く
+        let db7 = exec db6 "UPDATE t SET age = 5, nn = 8 WHERE id = 1"
+        let _, updated = ok (execSql db7 "SELECT age, nn FROM t WHERE id = 1")
+        Assert.Equal<int64>(5L, asInt updated.Rows.[0].[0])
+        Assert.Equal<int64>(8L, asInt updated.Rows.[0].[1]))
+
+[<Fact>]
+let ``SqlReference: ALTER TABLE ADD COLUMN の制約`` () =
+    withDb "alter-add-errors" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+
+        expectErrorKind ErrorKind.NameError "重複した列" (execSql db1 "ALTER TABLE t ADD COLUMN v INTEGER")
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "PRIMARY KEY の追加"
+            (execSql db1 "ALTER TABLE t ADD COLUMN k INTEGER PRIMARY KEY")
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "UNIQUE の追加"
+            (execSql db1 "ALTER TABLE t ADD COLUMN u INTEGER UNIQUE")
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "DEFAULT なしの NOT NULL"
+            (execSql db1 "ALTER TABLE t ADD COLUMN n INTEGER NOT NULL")
+
+        expectErrorKind ErrorKind.NotFound "存在しないテーブル" (execSql db1 "ALTER TABLE nope ADD COLUMN n INTEGER")
+
+        // 失敗した ALTER はテーブルを変えない
+        let _, rows = ok (execSql db1 "SELECT * FROM t")
+        Assert.Equal<string list>([ "id"; "v" ], rows.Columns |> Array.toList))
+
+[<Fact>]
+let ``SqlReference: ALTER TABLE DROP COLUMN は行と索引から列を除く`` () =
+    withDb "alter-drop" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')"
+        let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
+        let db4 = exec db3 "ALTER TABLE t DROP COLUMN b"
+
+        let _, rows = ok (execSql db4 "SELECT * FROM t ORDER BY id")
+        Assert.Equal<string list>([ "id"; "a" ], rows.Columns |> Array.toList)
+        Assert.Equal<int64 list>([ 10L; 20L ], rows.Rows |> Array.map (fun r -> asInt r.[1]) |> List.ofArray)
+        expectErrorKind ErrorKind.NameError "削除した列" (execSql db4 "SELECT b FROM t")
+
+        // 索引エントリの行も詰められている（索引経由で正しい行が引ける）
+        let _, byIndex = ok (execSql db4 "SELECT id FROM t WHERE a = 20")
+        Assert.Equal<int64>(2L, asInt byIndex.Rows.[0].[0])
+
+        // 主キー列・索引列・存在しない列は削除できない
+        expectErrorKind ErrorKind.ConstraintViolation "主キー列の削除" (execSql db4 "ALTER TABLE t DROP COLUMN id")
+        expectErrorKind ErrorKind.ConstraintViolation "索引列の削除" (execSql db4 "ALTER TABLE t DROP COLUMN a")
+        expectErrorKind ErrorKind.NameError "存在しない列の削除" (execSql db4 "ALTER TABLE t DROP COLUMN nope")
+
+        // UNIQUE 制約の列も削除できない
+        let db5 = exec db0 "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
+        expectErrorKind ErrorKind.ConstraintViolation "UNIQUE 列の削除" (execSql db5 "ALTER TABLE u DROP COLUMN email"))
+
+[<Fact>]
+let ``SqlReference: ALTER TABLE RENAME COLUMN は行と索引の列名を書き換える`` () =
+    withDb "alter-rename" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10), (2, 20)"
+        let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
+        let db4 = exec db3 "ALTER TABLE t RENAME COLUMN a TO b"
+
+        let _, rows = ok (execSql db4 "SELECT b FROM t ORDER BY b")
+        Assert.Equal<int64 list>([ 10L; 20L ], rows.Rows |> Array.map (fun r -> asInt r.[0]) |> List.ofArray)
+        expectErrorKind ErrorKind.NameError "旧名では引けない" (execSql db4 "SELECT a FROM t")
+
+        // 索引の定義も新しい名前になっている（索引経由で引ける）
+        let _, byIndex = ok (execSql db4 "SELECT id FROM t WHERE b = 20")
+        Assert.Equal<int64>(2L, asInt byIndex.Rows.[0].[0])
+
+        // 主キー列の名前も変えられる
+        let db5 = exec db4 "ALTER TABLE t RENAME COLUMN id TO tid"
+        let _, pk = ok (execSql db5 "SELECT tid FROM t WHERE tid = 1")
+        Assert.Equal<int64>(1L, asInt pk.Rows.[0].[0])
+
+        // 大小文字だけの変更もできる
+        let db6 = exec db5 "ALTER TABLE t RENAME COLUMN b TO B"
+        let _, upper = ok (execSql db6 "SELECT B FROM t WHERE B = 10")
+        Assert.Equal<int64>(10L, asInt upper.Rows.[0].[0])
+
+        // 重複・存在しない列
+        expectErrorKind ErrorKind.NameError "重複" (execSql db6 "ALTER TABLE t RENAME COLUMN B TO tid")
+        expectErrorKind ErrorKind.NameError "不在" (execSql db6 "ALTER TABLE t RENAME COLUMN nope TO x"))
+
+[<Fact>]
+let ``SqlReference: ALTER TABLE は transaction 中に実行できない`` () =
+    withDb "alter-txn" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+
+        let db2 = ok (db1.Begin())
+        expectErrorKind ErrorKind.SyntaxError "transaction 中の ALTER" (execSql db2 "ALTER TABLE t ADD COLUMN v INTEGER")
+
+        let db3 = ok (db2.Rollback())
+        let db4 = exec db3 "ALTER TABLE t ADD COLUMN v INTEGER"
+        let _, rows = ok (execSql db4 "SELECT * FROM t")
+        Assert.Equal<string list>([ "id"; "v" ], rows.Columns |> Array.toList))
+
+[<Fact>]
+let ``SqlReference: ALTER TABLE の変更は再オープン後も残る`` () =
+    withDir "alter-reopen" (fun dir ->
+        let db0 = ok (Database.OpenWith dir)
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, x TEXT)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')"
+        let db3 = exec db2 "ALTER TABLE t ADD COLUMN n INTEGER NOT NULL DEFAULT 7"
+        let db4 = exec db3 "ALTER TABLE t RENAME COLUMN v TO val"
+        let db5 = exec db4 "ALTER TABLE t DROP COLUMN x"
+        ok (db5.Close())
+
+        let db6 = ok (Database.OpenWith dir)
+        let _, rows = ok (execSql db6 "SELECT * FROM t ORDER BY id")
+        Assert.Equal<string list>([ "id"; "val"; "n" ], rows.Columns |> Array.toList)
+        Assert.Equal<int64 list>([ 7L; 7L ], rows.Rows |> Array.map (fun r -> asInt r.[2]) |> List.ofArray)
+
+        let db7 = exec db6 "INSERT INTO t (id, val) VALUES (3, 30)"
+        let _, inserted = ok (execSql db7 "SELECT n FROM t WHERE id = 3")
+        Assert.Equal<int64>(7L, asInt inserted.Rows.[0].[0])
+        ok (db7.Close()))
+
+[<Fact>]
 let ``SqlReference: UNIQUE 制約は複数の NULL を許す`` () =
     withDb "unique-null" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
@@ -2631,7 +2781,9 @@ let ``SqlReference: 未対応の構文は明示的な SyntaxError`` () =
             (execSql db2 "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t")
 
         // DDL / 実行計画
-        expectErrorKind ErrorKind.SyntaxError "ALTER TABLE" (execSql db2 "ALTER TABLE t ADD COLUMN z INTEGER")
+        // ALTER TABLE の ADD / DROP / RENAME COLUMN は対応済み。それ以外の操作は明示エラー。
+        expectErrorKind ErrorKind.SyntaxError "RENAME TO" (execSql db2 "ALTER TABLE t RENAME TO u")
+        expectErrorKind ErrorKind.SyntaxError "列の型変更" (execSql db2 "ALTER TABLE t ALTER COLUMN v TYPE INTEGER")
         expectErrorKind ErrorKind.SyntaxError "TRUNCATE" (execSql db2 "TRUNCATE TABLE t")
 
         // DML の未対応形

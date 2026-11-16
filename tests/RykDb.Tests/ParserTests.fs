@@ -163,6 +163,61 @@ let ``Parser: CREATE INDEX IF NOT EXISTS`` () =
     | other -> failActual "CREATE INDEX ではない" other
 
 [<Fact>]
+let ``Parser: ALTER TABLE`` () =
+    match parseOneOk "ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 0" with
+    | Statement.AlterTable a ->
+        Assert.Equal("t", a.Table)
+
+        match a.Action with
+        | AlterTableAction.AddColumn c ->
+            Assert.Equal("z", c.Name)
+            Assert.Equal<DataType>(DataType.Integer, c.DataType)
+            Assert.True c.Constraint.Default.IsSome
+        | other -> failActual "ADD COLUMN ではない" other
+    | other -> failActual "ALTER TABLE ではない" other
+
+    // COLUMN は省略できる
+    match parseOneOk "ALTER TABLE t ADD z INTEGER" with
+    | Statement.AlterTable {
+                               Action = AlterTableAction.AddColumn c
+                           } -> Assert.Equal("z", c.Name)
+    | other -> failActual "ADD ではない" other
+
+    match parseOneOk "ALTER TABLE t DROP COLUMN z" with
+    | Statement.AlterTable {
+                               Action = AlterTableAction.DropColumn z
+                           } -> Assert.Equal("z", z)
+    | other -> failActual "DROP COLUMN ではない" other
+
+    match parseOneOk "ALTER TABLE t DROP z" with
+    | Statement.AlterTable {
+                               Action = AlterTableAction.DropColumn z
+                           } -> Assert.Equal("z", z)
+    | other -> failActual "DROP ではない" other
+
+    match parseOneOk "ALTER TABLE t RENAME COLUMN a TO b" with
+    | Statement.AlterTable {
+                               Action = AlterTableAction.RenameColumn(a, b)
+                           } ->
+        Assert.Equal("a", a)
+        Assert.Equal("b", b)
+    | other -> failActual "RENAME COLUMN ではない" other
+
+    match parseOneOk "ALTER TABLE t RENAME a TO b" with
+    | Statement.AlterTable {
+                               Action = AlterTableAction.RenameColumn(a, b)
+                           } ->
+        Assert.Equal("a", a)
+        Assert.Equal("b", b)
+    | other -> failActual "RENAME ではない" other
+
+    // 未対応の操作は黙って無視せず SyntaxError
+    expectErrorKind ErrorKind.SyntaxError "RENAME TO" (parseStatement "ALTER TABLE t RENAME TO u")
+    expectErrorKind ErrorKind.SyntaxError "型変更" (parseStatement "ALTER TABLE t ALTER COLUMN a TYPE INTEGER")
+    expectErrorKind ErrorKind.SyntaxError "TO 忘れ" (parseStatement "ALTER TABLE t RENAME COLUMN a b")
+    expectErrorKind ErrorKind.SyntaxError "操作なし" (parseStatement "ALTER TABLE t")
+
+[<Fact>]
 let ``Parser: 複数文`` () =
     match ok (Parser.parseStatements "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);") with
     | [ Statement.CreateTable _; Statement.Insert _ ] -> ()

@@ -244,6 +244,38 @@ module internal Catalog =
                 }
         }
 
+    /// カタログのテーブル定義キー（`table:<name>`）。
+    let private tableKey (name: string) =
+        System.Text.Encoding.UTF8.GetBytes("table:" + name)
+
+    /// カタログの索引定義キー（`index:<name>`）。
+    let private indexKey (name: string) =
+        System.Text.Encoding.UTF8.GetBytes("index:" + name)
+
+    let private toValue (bytes: byte array) = [| SqlValue.Blob bytes |]
+
+    let private tableBatch (t: TableDefinition) (seq: uint64) =
+        Keyspace.CatalogKeyspace, [| Entry.put (tableKey t.Name) seq (toValue (encodeTable t)) |]
+
+    let private indexBatch (i: IndexDefinition) (seq: uint64) =
+        Keyspace.CatalogKeyspace, [| Entry.put (indexKey i.IndexName) seq (toValue (encodeIndex i)) |]
+
+    let private deleteBatch (key: byte array) (seq: uint64) =
+        Keyspace.CatalogKeyspace, [| Entry.delete key seq |]
+
+    let rec private numberList (mk: 'a -> uint64 -> 'b) (rest: 'a list) (seq: uint64) (acc: 'b list) =
+        match rest with
+        | [] -> List.rev acc, seq
+        | x :: tail -> numberList mk tail (seq + 1UL) (mk x seq :: acc)
+
+    /// テーブル定義を transaction に積む（`ALTER TABLE` が行の書き換えと原子的に commit する）。
+    let putTableInTxn (t: TableDefinition) (txn: Transaction) =
+        Transaction.put Keyspace.CatalogKeyspace (tableKey t.Name) (toValue (encodeTable t)) txn
+
+    /// 索引定義を transaction に積む（列名の変更を 1 commit で反映する）。
+    let putIndexInTxn (i: IndexDefinition) (txn: Transaction) =
+        Transaction.put Keyspace.CatalogKeyspace (indexKey i.IndexName) (toValue (encodeIndex i)) txn
+
     /// カタログを保存する（消えた定義は tombstone で落とす）。
     /// previous は保存前のカタログ（store にあった内容）。
     /// 消えた定義は「previous にあり catalog にないキー」として差分だけで求める
@@ -251,28 +283,6 @@ module internal Catalog =
     /// 書き込みは 1バッチにまとめる
     /// （tombstone も同じバッチに含めるので WAL の fsync は 1回で済む）。
     let save (store: RowStore) (previous: Catalog) (catalog: Catalog) =
-        let tableKey (name: string) =
-            System.Text.Encoding.UTF8.GetBytes("table:" + name)
-
-        let indexKey (name: string) =
-            System.Text.Encoding.UTF8.GetBytes("index:" + name)
-
-        let rec numberList (mk: 'a -> uint64 -> 'b) (rest: 'a list) (seq: uint64) (acc: 'b list) =
-            match rest with
-            | [] -> List.rev acc, seq
-            | x :: tail -> numberList mk tail (seq + 1UL) (mk x seq :: acc)
-
-        let toValue (bytes: byte array) = [| SqlValue.Blob bytes |]
-
-        let tableBatch (t: TableDefinition) (seq: uint64) =
-            Keyspace.CatalogKeyspace, [| Entry.put (tableKey t.Name) seq (toValue (encodeTable t)) |]
-
-        let indexBatch (i: IndexDefinition) (seq: uint64) =
-            Keyspace.CatalogKeyspace, [| Entry.put (indexKey i.IndexName) seq (toValue (encodeIndex i)) |]
-
-        let deleteBatch (key: byte array) (seq: uint64) =
-            Keyspace.CatalogKeyspace, [| Entry.delete key seq |]
-
         let bytesEqual (a: byte array) (b: byte array) =
             a.Length = b.Length && Array.forall2 (=) a b
 

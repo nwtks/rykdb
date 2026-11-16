@@ -56,6 +56,9 @@ ddl            ::= CREATE TABLE [IF NOT EXISTS] ident "(" table_element {"," tab
                 | CREATE [UNIQUE] INDEX [IF NOT EXISTS] ident ON ident "(" column_list ")"
                 | DROP TABLE  [IF EXISTS] ident
                 | DROP INDEX  [IF EXISTS] ident
+                | ALTER TABLE ident ( ADD [COLUMN] column_def
+                                    | DROP [COLUMN] ident
+                                    | RENAME [COLUMN] ident TO ident )
 table_element  ::= column_def | PRIMARY KEY "(" column_list ")" | UNIQUE "(" column_list ")"
 column_def     ::= ident (data_type [type_args] [column_constraint {column_constraint}]
                          | column_constraint {column_constraint})
@@ -1169,6 +1172,44 @@ DROP TABLE IF EXISTS tmp_data;
 DROP INDEX idx_dept;
 ```
 
+### 11.4 ALTER TABLE
+
+```sql
+ALTER TABLE テーブル名 ADD    [COLUMN] 列定義;
+ALTER TABLE テーブル名 DROP   [COLUMN] 列名;
+ALTER TABLE テーブル名 RENAME [COLUMN] 旧列名 TO 新列名;
+```
+
+- **`ADD [COLUMN]`** — 列を末尾に追加する。
+  **既存の行は `DEFAULT`（無ければ `NULL`）で埋められる**。
+  - 追加できるのは通常の列だけ。
+    `PRIMARY KEY` は `ConstraintViolation`（主キーは LSM のキーに使われているため）、
+    `UNIQUE` も `ConstraintViolation`（必要なら `CREATE UNIQUE INDEX` を使う）。
+  - `NOT NULL` を付けるには `DEFAULT` が必要（無いと `ConstraintViolation`）。
+  - 同じ名前の列（大文字小文字を無視）があれば `NameError`。
+  - `DEFAULT` は追加時に 1回評価され、既存行と以後の `INSERT` の両方に使われる。
+- **`DROP [COLUMN]`** — 列を削除する。
+  **既存の行と索引エントリからも値が取り除かれる**。
+  - 主キー列は削除できない（`ConstraintViolation`）。
+  - 索引（`UNIQUE` 制約の暗黙索引を含む）で使われている列は削除できない（`ConstraintViolation`）。
+  - 存在しない列は `NameError`。
+- **`RENAME [COLUMN]`** — 列名を変更する。
+  **行の値は書き換えない**（名前は行に含まれない）。
+  - 主キー列・索引の列名も一緒に書き換わるので、索引検索はそのまま使える。
+  - 新しい名前が既存の列と重複すれば `NameError`（大文字小文字だけの変更は可）。
+- 行の書き換え（`ADD` / `DROP`）は **1 transaction** で行い、カタログ更新も同じ commit に含める。
+  途中で失敗しても何も変わらない。
+  1 transaction のバッファ上限（256MiB）を超えるテーブルは `CapacityError` になる（§12）。
+- DDL なので明示 transaction 中には実行できない（§12）。
+- 未対応: `RENAME TO`（テーブル名の変更）、`ALTER COLUMN ... TYPE` などの型変更（§14）。
+
+```sql
+ALTER TABLE people ADD COLUMN email TEXT;
+ALTER TABLE people ADD COLUMN score INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE people DROP COLUMN score;
+ALTER TABLE people RENAME COLUMN email TO mail;
+```
+
 ---
 
 ## 12. トランザクション
@@ -1198,7 +1239,7 @@ ROLLBACK;        -- 削除を取り消し
 - `ROLLBACK` はバッファを捨てる。
 - 1 transaction の書き込みバッファは管理メモリの概算 256MiB が上限。
   超えると `CapacityError` になる（DDL の一括処理は除く）。
-- **DDL（`CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX`）は明示 transaction 中には実行できない**
+- **DDL（`CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX` / `ALTER TABLE`）は明示 transaction 中には実行できない**
   （即時反映のため）。
   `COMMIT` または `ROLLBACK` してから実行する。
 - 1 つの `Session.Execute` / スクリプト内で複数文を `;` 区切りで渡した場合、
@@ -1347,6 +1388,10 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 | `CREATE TABLE t (a INTEGER);`                                                     | `テーブル t に主キーがありません`                                                              |
 | `CREATE TABLE t (...);`（重複）                                                   | `テーブル t は既に存在します`                                                                  |
 | `CREATE INDEX ix ON t (nosuchcol);`                                               | `テーブル t に列 nosuchcol がありません`                                                       |
+| `ALTER TABLE t ADD COLUMN n INTEGER NOT NULL;`                                    | `NOT NULL 列 n を追加するには DEFAULT が必要です`                                              |
+| `ALTER TABLE t DROP COLUMN id;`（主キー）                                         | `主キー列 id は削除できません（主キーは LSM のキーに使われています）`                          |
+| `ALTER TABLE t DROP COLUMN a;`（索引列）                                          | `列 a は索引 ix_a で使われているため削除できません`                                            |
+| `ALTER TABLE t RENAME TO u;`                                                      | `ALTER TABLE ... RENAME TO（テーブル名の変更）は未対応です (位置 1行)`                         |
 | `SELECT id FROM t JOIN t ON t.id = t.id;`                                         | `テーブル t が重複しています（エイリアスを付けてください）`                                    |
 | `DROP TABLE nosuch;`                                                              | `テーブル nosuch が存在しません`                                                               |
 | `INSERT INTO t (id) VALUES (1, 2);`                                               | `INSERT の列数(1)と値の数(2)が合いません`                                                      |
@@ -1393,7 +1438,9 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 - `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`
 - 分離レベルの指定（`BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...`）と
   読み取り専用トランザクション（分離レベルは Snapshot Isolation 固定）
-- `ALTER TABLE`（列の追加・削除・型変更）
+- `ALTER TABLE` の未対応操作:
+  テーブル名の変更（`RENAME TO`）と列の型変更（`ALTER COLUMN ... TYPE` など）。
+  列の追加・削除・名前変更は §11.4。
 - `TRUNCATE`
 - `RETURNING`
 - `CREATE TABLE ... DEFAULT (SELECT ...)`（構文は受理されるが INSERT 時に `SyntaxError`。§7.9）

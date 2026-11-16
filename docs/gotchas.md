@@ -961,6 +961,20 @@ DU は `type` 宣言（モジュールスコープのものは `private` 可）�
 - ✅ 型名も用途が分かる `SelectProjection` にする。
 - 判断基準: 既存で広く使われているフィールド名（`Items` / `Name` / `Type` など）を
   新しいレコードに付けない。
+- ⚠️ **後から型を足すと、既存の型注釈なし引数が壊れる**。
+  `ALTER TABLE` の `AlterTable = { Table: string; ... }` を追加しただけで、
+  `let createIndexCore ci state = ... ci.Table ...` の `ci` が `AlterTable` と推論され、
+  **`ci.Name` が FS0039** になった（`CreateIndex` と `Table` が衝突）。
+  → レコードを受ける関数は `(ci: CreateIndex)` のように**型注釈を付ける**。
+
+### 8.18b レコードの `.Length` は配列と誤推論される
+
+`let transform row = if row.Length = width then ... row.[i] ...` のように
+配列らしい値を受けるラムダで型注釈を省くと、`SstIndexEntry`（`Length: int` を持つレコード）と推論され、
+`row.[i]` が FS0039 / FS0001 になる。
+
+- ✅ `let transform (row: SqlValue array) = ...` と注釈する。
+- 判断基準: **`.Length` / `.Name` のような一般名のフィールドを読む引数は注釈する**。
 
 ### 8.19 単位（units of measure）で番号を取り違えない（INV-04）
 

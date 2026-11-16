@@ -1089,6 +1089,10 @@ DDL 自体は transaction 上限を外すが、`CREATE INDEX` の backfill と
 DROP はカタログ削除前に `.drop-cleanup` ジャーナルを書き、後始末が終わったら消す。
 起動時にカタログへ存在しない keyspace だけをジャーナルから再消去する。
 `CREATE TABLE` は作成前に同名の table / 暗黙索引 keyspace を空にする。
+`ALTER TABLE` の行の書き換え（列の追加・削除）は、
+テーブル本体と全索引の行をそろえて書き換える必要があるため **1 transaction** にまとめる
+（行とカタログがずれた中間状態を作らない。既定の 256MiB 上限を超えると `CapacityError`）。
+列名の変更（`RENAME COLUMN`）は行の値に名前が含まれないのでカタログの書き換えだけで済む。
 複数行 `UPDATE` は最終状態検査のため対象行をメモリに集めるが、
 旧行 + 新行の概算が上限を超えた時点で `CapacityError` にする。
 
@@ -1217,11 +1221,11 @@ DB 全体を閉じるのは所有者（`Session.OpenWith` の `Session`、また
 途中に他の書き込みが入ると**索引に載らない行**ができる（または消えた行のエントリが残る）。
 そこで **DDL だけはプロセス内で排他**にする（`RootGate`、`Transactions.fs`）。
 
-| 操作                                      | ゲート                               |
-| ----------------------------------------- | ------------------------------------ |
-| DDL（CREATE / DROP TABLE / INDEX）        | **排他**（`RootGate.withExclusive`） |
-| 文の実行と commit（暗黙 transaction）     | 共有（`RootGate.withShared`）        |
-| `DatabaseHost.Begin` の登録とカタログ読込 | 共有（短時間だけ保持）               |
+| 操作                                       | ゲート                               |
+| ------------------------------------------ | ------------------------------------ |
+| DDL（CREATE / DROP / ALTER TABLE / INDEX） | **排他**（`RootGate.withExclusive`） |
+| 文の実行と commit（暗黙 transaction）      | 共有（`RootGate.withShared`）        |
+| `DatabaseHost.Begin` の登録とカタログ読込  | 共有（短時間だけ保持）               |
 
 DDL は次を順に行う。
 
