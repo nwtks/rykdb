@@ -42,6 +42,8 @@ module internal Optimizer =
         | JoinIndexLeftFrame of JoinFrame
         /// 右部分木も評価し終えた Join。左 Op を保持している。
         | JoinApplyFrame of JoinFrame * Op
+        /// UNION ALL の枝を評価中（外側の文脈・完了した枝の Op（逆順）・残りの枝）。
+        | UnionFrame of ExecContext * Op list * PlannedQuery list
 
     /// 評価機の状態。
     /// 木を 1つ降りるか、Op が上がってきたか。
@@ -118,6 +120,7 @@ module internal Optimizer =
             match leaf with
             | Logical.Aggregate(groupBy, aggs, _) -> aggregateSchema groupBy aggs
             | Logical.Derived plan -> plan.Output
+            | Logical.UnionAll(plan :: _) -> plan.Output
             | Logical.Scan(name, _) -> Schema.ofTable name None (defaultSchema ctx name)
             | Logical.Values _ -> Schema.empty
             | _ -> inSchema
@@ -219,6 +222,10 @@ module internal Optimizer =
                 let innerOutput = outputOf plan.Context plan.Input plan.Tree
                 let innerNeeded = needed |> Set.filter (fun i -> i < innerOutput.Columns.Length)
                 go plan.Context plan.Input innerNeeded plan.Tree
+            | Logical.UnionAll plans ->
+                plans
+                |> List.iter (fun plan ->
+                    go plan.Context plan.Input (allColumns (outputOf plan.Context plan.Input plan.Tree)) plan.Tree)
             | Logical.Values _ -> ()
 
         go ctx inSchema (allColumns (outputOf ctx inSchema tree)) tree
@@ -416,6 +423,14 @@ module internal Optimizer =
                     }
 
                 run innerCtx (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None))
+            | Logical.UnionAll [] -> run ctx frames (ApplyOp Op.Empty)
+            | Logical.UnionAll(plan :: rest) ->
+                let innerCtx =
+                    { plan.Context with
+                        ScanNeeds = ctx.ScanNeeds
+                    }
+
+                run innerCtx (UnionFrame(ctx, [], rest) :: frames) (EvalNode(plan.Tree, plan.Input, None))
             | Logical.Scan(name, method) as node ->
                 match execScan node ctx name method hint with
                 | Error e -> err e
@@ -474,6 +489,19 @@ module internal Optimizer =
                     match execJoin frame leftOp op with
                     | Error e -> err e
                     | Ok joined -> run ctx rest (ApplyOp joined)
+                | UnionFrame(outer, doneOps, []) ->
+                    let combined = List.foldBack Op.append (List.rev (op :: doneOps)) Op.Empty
+                    run outer rest (ApplyOp combined)
+                | UnionFrame(outer, doneOps, plan :: plans) ->
+                    let innerCtx =
+                        { plan.Context with
+                            ScanNeeds = outer.ScanNeeds
+                        }
+
+                    run
+                        innerCtx
+                        (UnionFrame(outer, op :: doneOps, plans) :: rest)
+                        (EvalNode(plan.Tree, plan.Input, None))
 
     /// 論理代数を Op に変換する。
     /// <remarks>
@@ -625,6 +653,10 @@ module internal Optimizer =
 
                 text, [ childOf item child item.Schema ]
             | Logical.Derived plan -> "Derived", [ childItem (item.Indent + 1) plan.Tree plan.Input plan.Context ]
+            | Logical.UnionAll plans ->
+                "UnionAll",
+                plans
+                |> List.map (fun plan -> childItem (item.Indent + 1) plan.Tree plan.Input plan.Context)
 
         let rec emit acc =
             function

@@ -1784,26 +1784,32 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 対策:
 
 - `parseTableAlias` が未対応語を裸のテーブル別名として消費しない（`AS` を付ければ使える）。
+  集合演算の語（`UNION` / `INTERSECT` / `EXCEPT`）は**エラーにせず消費もしない**
+  （`SELECT ... FROM t UNION ALL ...` を集合演算の規則で読むため。判定は後段に委ねる）。
 - `parseOptAlias`（列の別名）も未対応語を裸の別名として消費しない
   （`SELECT 1 UNION SELECT 2` の `UNION` が列別名になり、後続の SELECT が別の文として実行されていた）。
 - `parseJoins` が `USING` を明示エラーにする。
-  FROM の直後に残った未対応語（`FROM t AS x RIGHT JOIN ...` など）も明示エラーにする。
+  FROM の直後に残った未対応 JOIN 語（`FROM t AS x RIGHT JOIN ...` など）も明示エラーにする。
 - `JOIN` の種類（`LEFT` / `INNER`）だけ書いて `JOIN` が続かない入力は明示エラーにする
   （`FROM t LEFT WHERE ...` が「LEFT JOIN なし」として静かに通っていた）。
 - DML の対象テーブルの別名（`UPDATE t AS x`）は、列解決に使われず `WHERE x.id` だけが
   `NameError` になる中途半端な状態を避けるため、パース時に `SyntaxError` にする。
 - `parseStatements` は文の区切りに `;` を必須にする。
-- `parseSelect` は句の後ろの `UNION` / `INTERSECT` / `EXCEPT` も明示エラーにする。
+- `parseSelectStatement` は `UNION ALL` の枝を読み、`UNION`（ALL なし）/ `INTERSECT` /
+  `EXCEPT` は明示エラーにする。`ORDER BY` / `LIMIT` より後ろに集合演算が来たら
+  `UNION / INTERSECT / EXCEPT は ORDER BY / LIMIT より前に書いてください` にする。
 
 回帰テスト:
 
 - `Parser: 未対応の集合演算は明示エラー`
+- `Parser: UNION ALL は集合演算としてパースされる`
 - `Parser: 未対応の JOIN は明示エラー`
 - `Parser: JOIN の種類だけで JOIN が無い入力はエラー`
 - `Parser: 列別名が集合演算を飲み込まない`
 - `Parser: DML のテーブル別名は明示エラー`
 - `Parser: 複数文は ; で区切る`
 - `SqlReference: UNION はエラーになり 2 文として実行されない`
+- `SqlReference: UNION ALL の列数が違うとエラー`
 - `SqlReference: RIGHT JOIN はエラーになり INNER JOIN として実行されない`
 
 ### 11.39 CAST は暗黙変換 (`SqlValue.coerce`) と分ける
@@ -2653,3 +2659,39 @@ Core のホットパスでは次の 2 つを使い、公開 API の境界で `Re
 `ParserExpr.fs` の `List.head`（`List.length = 1` の直後）、
 `Serialization.fs` の `List.head`（seed 付きの `crcTables.build`）、
 `ExecContext.fs` の `Array.forall2`（同スキーマ前提、幅不一致なら `ArgumentException`）。
+
+### 11.77 同じフィールド名を持つレコードを足すと既存コードの推論が静かに変わる（FS3566）
+
+`UNION ALL` のために `SetOperation = { Kind; Statement }` を追加したら、
+`JoinClause = { Kind; On; Table }` と `Kind` が衝突し、**後から宣言された型に推論**された。
+
+```fsharp
+// ❌ clause が SetOperation と推論され、clause.On が FS0039
+| (index, clause) :: rest when clause.Kind = JoinKind.Left ->
+    ... clause.On ...
+// ✅ ラムダ・パターンに型注釈を付ける
+| (index, (clause: JoinClause)) :: rest when clause.Kind = JoinKind.Left ->
+```
+
+`PlanBuilder` の JOIN 順序の組み立て（`buildSteps` / `qualifiedOns` / `byName` / `apply` /
+`stmt.Joins |> List.indexed`）は `Kind` と `On` の両方を読むので、全部に注釈が要る。
+F# は同名列のレコードが増えると既存コードの推論をエラーなしで変え得る。
+**レコード型を追加したら、同じフィールド名を持つ既存型の使用箇所を grep する**。
+
+### 11.78 CPS グループ内の局所ループは、グループ関数を具体型の継続で呼べない（FS0064）
+
+`UNION ALL` の枝を順に計画するとき、グループ内の `planCoreCWith` を
+局所 `let rec planAll` から `Result<PlannedQuery list, DbError>` を返す継続で呼ぶと、
+再帰グループの `'r` が `PlannedQuery list` に固定され、
+**グループ全員**が FS0064（`'r` が `PlannedQuery list` に制約されました）になる
+（`Plan.fs` の 540 / 559 / 696 行など、触っていない関数にも波及する）。
+
+解法は「継続を渡す汎用のリスト走査」をグループの外に置くこと。
+`Plan.traverseC` は入出力が同じ型専用なので、型が変わる `Plan.mapC` を追加した。
+
+```fsharp
+mapC (fun (b: SelectStatement) contn -> planCoreCWith runner outer contn ctx (branchOf b)) branches [] finish
+```
+
+継続の最終型が `'r`（グループの型変数）のままなら、グループ内呼び出しは推論を壊さない。
+回帰テスト: `SqlReference: UNION ALL は両方の行を連結する`。

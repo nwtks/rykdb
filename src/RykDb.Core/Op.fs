@@ -131,6 +131,15 @@ module internal Op =
 
         drop
 
+    /// 2つの演算子を順に連結する（左をすべて出してから右）。
+    /// 右は左が尽きるまで評価しない（`compute` の遅延を保つ）。
+    let rec append (first: Op) (second: Op) =
+        compute (fun () ->
+            match next first with
+            | OpStep.OpDone -> next second
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpRow(row, nxt) -> OpStep.OpRow(row, append nxt second))
+
     /// 全行を上限つきで配列に materialize する。
     /// 上限を超えたら `CapacityError` を返し、部分結果は返さない。
     let toArrayLimited (maxRows: int64) (maxBytes: int64) (op: Op) =

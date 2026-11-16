@@ -59,45 +59,38 @@ module internal Plan =
             go 0 scopes
 
     /// 論理木が直接参照する式を列挙する。
-    /// 派生テーブルの内側は別スコープなので含めない。
-    let private treeExprs (tree: Logical) =
-        let childrenOf =
-            function
-            | Logical.Filter(e, child) -> [ e ], [ child ]
-            | Logical.Project(items, child) -> items |> List.map _.Expression, [ child ]
-            | Logical.Join(_, _, on, left, right) -> [ on ], [ left; right ]
-            | Logical.Aggregate(groupBy, aggs, child) -> groupBy @ (aggs |> List.map (fun (_, _, _, e) -> e)), [ child ]
-            | Logical.Having(h, aggs, groupBy, child) ->
-                h :: (aggs |> List.map (fun (_, _, _, e) -> e)) @ groupBy, [ child ]
-            | Logical.Distinct child -> [], [ child ]
-            | Logical.Sort(keys, child) -> keys |> List.map _.Expression, [ child ]
-            | Logical.Limit(_, _, child) -> [], [ child ]
-            | Logical.Scan _
-            | Logical.Values _
-            | Logical.Derived _ -> [], []
-
-        let rec go acc pending =
-            match pending with
-            | [] -> List.rev acc
-            | t :: rest ->
-                let exprs, kids = childrenOf t
-                go (List.rev exprs @ acc) (kids @ rest)
-
-        go [] [ tree ]
+    /// 派生テーブル・集合演算の枝は別スコープなので含めない。
+    let private childrenOf =
+        function
+        | Logical.Filter(e, child) -> [ e ], [ child ]
+        | Logical.Project(items, child) -> items |> List.map _.Expression, [ child ]
+        | Logical.Join(_, _, on, left, right) -> [ on ], [ left; right ]
+        | Logical.Aggregate(groupBy, aggs, child) -> groupBy @ (aggs |> List.map (fun (_, _, _, e) -> e)), [ child ]
+        | Logical.Having(h, aggs, groupBy, child) ->
+            h :: (aggs |> List.map (fun (_, _, _, e) -> e)) @ groupBy, [ child ]
+        | Logical.Distinct child -> [], [ child ]
+        | Logical.Sort(keys, child) -> keys |> List.map _.Expression, [ child ]
+        | Logical.Limit(_, _, child) -> [], [ child ]
+        | Logical.Scan _
+        | Logical.Values _
+        | Logical.Derived _
+        | Logical.UnionAll _ -> [], []
 
     /// 論理木が相関している外側スコープの位置（0 = 直近の外側）を集める。
     /// 入れ子の相関サブクエリは、その `Depths` のうち深さ 2 以上
     /// （このクエリより外側への依存）だけを引き継ぐ。
-    let private outerRefs (inner: Schema) (scopes: OuterScope list) =
-        let addExpr =
+    /// 集合演算の枝は入力スキーマが枝ごとに違うので、
+    /// 作業リストに「その木を評価する入力スキーマ」を一緒に積む。
+    let private outerRefs (inner: Schema) (scopes: OuterScope list) (tree: Logical) =
+        let addExpr scopeSchema =
             Expr.fold (fun acc ->
                 function
                 | Expr.Column c ->
-                    match outerScopeIndex inner scopes c with
+                    match outerScopeIndex scopeSchema scopes c with
                     | Some i -> i :: acc
                     | None -> acc
                 | Expr.Name n ->
-                    match outerScopeIndex inner scopes { Qualifier = None; Name = n } with
+                    match outerScopeIndex scopeSchema scopes { Qualifier = None; Name = n } with
                     | Some i -> i :: acc
                     | None -> acc
                 | Expr.CorrelatedSubquery c ->
@@ -106,7 +99,20 @@ module internal Plan =
                     |> List.fold (fun acc d -> d - 2 :: acc) acc
                 | _ -> acc)
 
-        treeExprs >> List.fold addExpr [] >> List.distinct
+        let rec collect acc =
+            function
+            | [] -> acc
+            | (scopeSchema, t) :: rest ->
+                match t with
+                | Logical.UnionAll plans ->
+                    let branches = plans |> List.map (fun p -> p.Input, p.Tree)
+                    collect acc (branches @ rest)
+                | _ ->
+                    let exprs, kids = childrenOf t
+                    let children = kids |> List.map (fun k -> scopeSchema, k)
+                    collect (List.fold (addExpr scopeSchema) acc exprs) (children @ rest)
+
+        collect [] [ (inner, tree) ] |> List.distinct
 
     /// 外側参照を外側行の値へ置き換える（内側スコープが優先）。
     /// 解決できない参照はそのまま残し、評価時の `NameError` に委ねる。
@@ -134,9 +140,32 @@ module internal Plan =
             | Expr.Name n -> defaultArg (subst { Qualifier = None; Name = n }) x
             | _ -> x)
 
+    /// 集合演算の枝を置換するときの作業フレーム。
+    /// 枝は必ずコア（`SetOperations` を持たない）だが、
+    /// 将来入れ子になっても組み直せるよう明示スタックで辿る。
+    type private SubstituteFrame =
+        {
+            /// 枝以外を置換済みの文（`SetOperations` は空）。
+            Base: SelectStatement
+            /// 処理中の枝（`Kind` を保つため元のレコードを保持する）。
+            Current: SetOperation
+            /// まだ処理していない枝。
+            Rest: SetOperation list
+            /// 置換済みの枝（逆順）。
+            Done: SetOperation list
+        }
+
+    /// 置換の作業状態（これから降りる文 / 組み上がった文）。
+    type private SubstituteStep =
+        | Visit of SelectStatement
+        | Completed of SelectStatement
+
     /// 文の各式に外側参照の置換を適用する。
     /// 入れ子のサブクエリ（`Subquery` / `Exists`）の内部には入らない
     /// （そのスコープは実行時に別途解決する）。
+    /// 集合演算の枝は自前の入力スキーマを持つが、外側参照の判定は
+    /// 呼び出し側が渡した `inner`（枝の入力をすべて含む保守的なスキーマ）で行う。
+    /// 枝は明示スタックで降りて戻りながら組み直す（自己再帰は全経路で末尾）。
     let private substituteStatement (inner: Schema) (scopes: OuterScope list) (stmt: SelectStatement) =
         let sub = substituteOuter inner scopes
 
@@ -145,41 +174,91 @@ module internal Plan =
             | None -> ret None
             | Some e -> sub e |> Result.map Some
 
-        result {
-            let! items =
-                stmt.Items
-                |> List.map (fun i -> sub i.Expression |> Result.map (fun e -> { i with Expression = e }))
-                |> all
+        let substituteFields s =
+            result {
+                let! items =
+                    s.Items
+                    |> List.map (fun i -> sub i.Expression |> Result.map (fun e -> { i with Expression = e }))
+                    |> all
 
-            let! joins =
-                stmt.Joins
-                |> List.map (fun j -> sub j.On |> Result.map (fun e -> { j with On = e }))
-                |> all
+                let! joins =
+                    s.Joins
+                    |> List.map (fun j -> sub j.On |> Result.map (fun e -> { j with On = e }))
+                    |> all
 
-            let! whereE = subOpt stmt.Where
-            let! groupBy = stmt.GroupBy |> List.map sub |> all
-            let! having = subOpt stmt.Having
+                let! whereE = subOpt s.Where
+                let! groupBy = s.GroupBy |> List.map sub |> all
+                let! having = subOpt s.Having
 
-            let! orderBy =
-                stmt.OrderBy
-                |> List.map (fun k -> sub k.Expression |> Result.map (fun e -> { k with Expression = e }))
-                |> all
+                let! orderBy =
+                    s.OrderBy
+                    |> List.map (fun k -> sub k.Expression |> Result.map (fun e -> { k with Expression = e }))
+                    |> all
 
-            let! limit = subOpt stmt.Limit
-            let! offset = subOpt stmt.Offset
+                let! limit = subOpt s.Limit
+                let! offset = subOpt s.Offset
 
-            return
-                { stmt with
-                    Items = items
-                    Joins = joins
-                    Where = whereE
-                    GroupBy = groupBy
-                    Having = having
-                    OrderBy = orderBy
-                    Limit = limit
-                    Offset = offset
-                }
-        }
+                return
+                    { s with
+                        Items = items
+                        Joins = joins
+                        Where = whereE
+                        GroupBy = groupBy
+                        Having = having
+                        OrderBy = orderBy
+                        Limit = limit
+                        Offset = offset
+                        SetOperations = []
+                    }
+            }
+
+        let rec loop frames =
+            function
+            | Visit s ->
+                match substituteFields s with
+                | Error e -> err e
+                | Ok baseStmt ->
+                    match s.SetOperations with
+                    | [] -> loop frames (Completed baseStmt)
+                    | first :: rest ->
+                        loop
+                            ({
+                                Base = baseStmt
+                                Current = first
+                                Rest = rest
+                                Done = []
+                             }
+                             :: frames)
+                            (Visit first.Statement)
+            | Completed doneStmt ->
+                match frames with
+                | [] -> ret doneStmt
+                | frame :: outerFrames ->
+                    let done' =
+                        { frame.Current with
+                            Statement = doneStmt
+                        }
+                        :: frame.Done
+
+                    match frame.Rest with
+                    | [] ->
+                        loop
+                            outerFrames
+                            (Completed
+                                { frame.Base with
+                                    SetOperations = List.rev done'
+                                })
+                    | next :: rest ->
+                        loop
+                            ({ frame with
+                                Current = next
+                                Rest = rest
+                                Done = done'
+                             }
+                             :: outerFrames)
+                            (Visit next.Statement)
+
+        loop [] (Visit stmt)
 
     /// 現在のクエリの行を先頭に差し込んだスコープ列。
     let private withCurrentRow (row: SqlValue array) =
@@ -199,10 +278,25 @@ module internal Plan =
         (pending: 'a list)
         (acc: 'a list)
         (k: 'a list -> Result<'r, DbError>)
-        : Result<'r, DbError> =
+        =
         match pending with
         | [] -> k (List.rev acc)
         | x :: rest -> f x (fun x2 -> traverseC f rest (x2 :: acc) k)
+
+    /// CPS のリスト走査（要素の型が変わる版）。
+    /// `traverseC` は入出力が同じ型のときだけ使える。
+    /// 自己再帰は `f` へ渡すラムダの中にあるので、
+    /// 監査上は非末尾として扱われる（`traverseC` と同じ）。
+    [<TailCall>]
+    let rec private mapC
+        (f: 'a -> ('b -> Result<'r, DbError>) -> Result<'r, DbError>)
+        (pending: 'a list)
+        (acc: 'b list)
+        (k: 'b list -> Result<'r, DbError>)
+        =
+        match pending with
+        | [] -> k (List.rev acc)
+        | x :: rest -> f x (fun y -> mapC f rest (y :: acc) k)
 
     /// FROM / JOIN の入力を `TableRef` に読み替える。
     /// `resolveSourcesC` が派生テーブルを実テーブル参照（別名）へ書き換えるので、
@@ -308,15 +402,99 @@ module internal Plan =
             go sources [] Map.empty
 
     /// 外側スコープ付きで SELECT を計画する（CPS）。実行はしない。
-    /// `outer` は「この SELECT の外側」のスコープ列（先頭が直近）。
-    /// `runner` は相関サブクエリを外側行ごとに再計画・実行する関数。
+    /// `UNION ALL` の複合文は `planCompoundCWith` へ、
+    /// 通常の SELECT は `planSimpleCWith` へ振り分ける。
     and [<TailCall>] private planCoreCWith
         (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
         (outer: OuterScope list)
         (k: PlannedQuery -> Result<'r, DbError>)
         (ctx: ExecContext)
         (stmt: SelectStatement)
-        : Result<'r, DbError> =
+        =
+        if List.isEmpty stmt.SetOperations then
+            planSimpleCWith runner outer k ctx stmt
+        else
+            planCompoundCWith runner outer k ctx stmt
+
+    /// `UNION ALL` の複合 SELECT を計画する（CPS）。
+    /// 枝ごとに通常の SELECT として計画し、`Logical.UnionAll` で連結する。
+    /// 列数は全枝で一致が必要（列名は先頭の SELECT に従う）。
+    /// `ORDER BY` / `LIMIT` / `OFFSET` は連結後の結果全体へ掛ける
+    /// （列名・別名・序数は先頭の SELECT の出力列で解決する）。
+    and [<TailCall>] private planCompoundCWith
+        (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
+        (outer: OuterScope list)
+        (k: PlannedQuery -> Result<'r, DbError>)
+        (ctx: ExecContext)
+        (stmt: SelectStatement)
+        =
+        let branchOf s =
+            { s with
+                OrderBy = []
+                Limit = None
+                Offset = None
+                SetOperations = []
+            }
+
+        let branches = stmt :: (stmt.SetOperations |> List.map _.Statement)
+
+        let finish plans =
+            let first = plans |> List.head
+            let expected = first.Header.Columns.Length
+
+            let mismatch =
+                plans
+                |> List.indexed
+                |> List.tryFind (fun (_, plan) -> plan.Header.Columns.Length <> expected)
+
+            match mismatch with
+            | Some(index, plan) ->
+                sprintf "UNION ALL の列数が一致しません（1 番目: %d 列、%d 番目: %d 列）" expected (index + 1) plan.Header.Columns.Length
+                |> DbError.create ErrorKind.SyntaxError
+                |> err
+            | None ->
+                let tailStmt =
+                    { stmt with
+                        Items = []
+                        From = None
+                        Joins = []
+                        Where = None
+                        GroupBy = []
+                        Having = None
+                        SetOperations = []
+                    }
+
+                let scopes = { Schema = first.Output; Row = None } :: outer
+
+                resolveSelectC
+                    runner
+                    scopes
+                    (fun tail ->
+                        PlanBuilder.applySetOperationTail first.Output tail (Logical.UnionAll plans)
+                        >>= fun tree ->
+                            k
+                                {
+                                    Output = first.Output
+                                    Header = first.Header
+                                    Input = plans |> List.map _.Input |> Schema.concatAll
+                                    Context = ctx
+                                    Tree = tree
+                                })
+                    ctx
+                    tailStmt
+
+        mapC (fun (b: SelectStatement) contn -> planCoreCWith runner outer contn ctx (branchOf b)) branches [] finish
+
+    /// 外側スコープ付きで通常の SELECT を計画する（CPS）。実行はしない。
+    /// `outer` は「この SELECT の外側」のスコープ列（先頭が直近）。
+    /// `runner` は相関サブクエリを外側行ごとに再計画・実行する関数。
+    and [<TailCall>] private planSimpleCWith
+        (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
+        (outer: OuterScope list)
+        (k: PlannedQuery -> Result<'r, DbError>)
+        (ctx: ExecContext)
+        (stmt: SelectStatement)
+        =
         let originalItems = stmt.Items
 
         resolveSourcesC
@@ -379,13 +557,13 @@ module internal Plan =
     /// サブクエリ・派生テーブルの入れ子段数に依存せずスタックは積み上がらない
     /// （Parser の式・SELECT と同じ方針）。
     /// </remarks>
-    and [<TailCall>] private resolveSelectC
+    and private resolveSelectC
         (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
         (scopes: OuterScope list)
         (k: SelectStatement -> Result<'r, DbError>)
         (ctx: ExecContext)
         (stmt: SelectStatement)
-        : Result<'r, DbError> =
+        =
         let resolveOpt v cont =
             match v with
             | None -> cont None
@@ -441,13 +619,13 @@ module internal Plan =
                                             finish items joins whereE groupBy having orderBy limit offset))))))))
 
     /// 式の中のサブクエリを解決する（CPS）。
-    and private resolveExprC
+    and [<TailCall>] private resolveExprC
         (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
         (scopes: OuterScope list)
         (k: Expr -> Result<'r, DbError>)
         (ctx: ExecContext)
         (e: Expr)
-        : Result<'r, DbError> =
+        =
         if Expr.hasSubquery e then
             Expr.rewriteWithC (resolveLeafC runner scopes ctx) k e
         else
@@ -463,7 +641,7 @@ module internal Plan =
         (ctx: ExecContext)
         (e: Expr)
         (k: Expr -> Result<'r, DbError>)
-        : Result<'r, DbError> =
+        =
         let singleColumnMessage count =
             sprintf "サブクエリは 1列だけを返す必要があります（%d 列）" count |> DbError.typeError
 
@@ -585,7 +763,7 @@ module internal Plan =
         (ctx: ExecContext)
         (stmt: SelectStatement)
         (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
-        : Result<'r, DbError> =
+        =
         planCoreCWith
             runner
             outer
@@ -603,11 +781,7 @@ module internal Plan =
     /// 実際の再帰呼び出しは `Run` の末尾位置（`Result.bind` の継続）で起きるので、
     /// 外側行が増えてもフレームは積み上がらない。
     /// </remarks>
-    let rec private runSubquery
-        (outer: OuterScope list)
-        (ctx: ExecContext)
-        (stmt: SelectStatement)
-        : Result<Schema * Op, DbError> =
+    let rec private runSubquery (outer: OuterScope list) (ctx: ExecContext) (stmt: SelectStatement) =
         runSubquery |> planSelectCWith outer ret ctx stmt
 
     /// DML（INSERT / UPDATE / DELETE）の式に含まれるサブクエリを解決する。

@@ -1551,6 +1551,65 @@ let ``SqlReference: UNION はエラーになり 2 文として実行されない
         Assert.Equal<int64>(2L, asInt res.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: UNION ALL は両方の行を連結する`` () =
+    withDb "union-all" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT)"
+        let db3 = exec db2 "INSERT INTO a VALUES (1, 'x'), (2, 'y')"
+        let db4 = exec db3 "INSERT INTO b VALUES (2, 'y'), (3, 'z')"
+
+        let _, res =
+            ok (execSql db4 "SELECT id, v FROM a UNION ALL SELECT id, v FROM b ORDER BY id")
+
+        // 列名は先頭の SELECT のもの。UNION ALL は重複を除かない（(2, 'y') が 2 行）。
+        Assert.Equal<string array>([| "id"; "v" |], res.Columns)
+        Assert.Equal<int>(4, res.Rows.Length)
+        Assert.Equal<int64 list>([ 1L; 2L; 2L; 3L ], res.Rows |> Array.map (fun r -> asInt r.[0]) |> Array.toList)
+
+        // ORDER BY / LIMIT / OFFSET は連結後の結果全体に掛かる
+        let _, limited =
+            ok (execSql db4 "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id DESC LIMIT 2 OFFSET 1")
+
+        Assert.Equal<int64 list>([ 2L; 2L ], limited.Rows |> Array.map (fun r -> asInt r.[0]) |> Array.toList))
+
+[<Fact>]
+let ``SqlReference: UNION ALL の列数が違うとエラー`` () =
+    withDb "union-all-cols" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY)"
+        let db3 = exec db2 "INSERT INTO a VALUES (1, 'x')"
+        let db4 = exec db3 "INSERT INTO b VALUES (1)"
+        expectMessage "UNION ALL の列数が一致しません" "SELECT id, v FROM a UNION ALL SELECT id FROM b" db4)
+
+[<Fact>]
+let ``SqlReference: UNION ALL は派生テーブルと INSERT ... SELECT でも使える`` () =
+    withDb "union-all-ctx" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY)"
+        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY)"
+        let db4 = exec db3 "INSERT INTO a VALUES (1), (2)"
+        let db5 = exec db4 "INSERT INTO b VALUES (3)"
+
+        let _, derived =
+            ok (execSql db5 "SELECT COUNT(*) FROM (SELECT id FROM a UNION ALL SELECT id FROM b) AS u")
+
+        Assert.Equal<int64>(3L, asInt derived.Rows.[0].[0])
+
+        let db6 = exec db5 "INSERT INTO c SELECT id FROM a UNION ALL SELECT id FROM b"
+        let _, count = ok (execSql db6 "SELECT COUNT(*) FROM c")
+        Assert.Equal<int64>(3L, asInt count.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: EXPLAIN に UnionAll が出る`` () =
+    withDb "union-all-explain" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO a VALUES (1)"
+
+        let _, plan = ok (execSql db2 "EXPLAIN SELECT id FROM a UNION ALL SELECT id FROM a")
+        let lines = plan.Rows |> Array.map (fun r -> asText r.[0])
+        Assert.Contains(lines, fun line -> line.Contains "UnionAll"))
+
+[<Fact>]
 let ``SqlReference: RIGHT JOIN はエラーになり INNER JOIN として実行されない`` () =
     withDb "p0-right-join" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"

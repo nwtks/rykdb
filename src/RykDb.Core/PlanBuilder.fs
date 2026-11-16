@@ -84,6 +84,24 @@ module internal PlanBuilder =
         | Base b -> Analyzer.schemaOf b
         | DerivedSource(_, plan) -> plan.Output
 
+    /// LIMIT / OFFSET の定数式を評価する（0 以上の int）。
+    let private evalCount what =
+        function
+        | Expr.Literal(Literal.Int i) when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
+        | e when Expr.hasCorrelated e -> sprintf "%s に相関サブクエリは使えません" what |> DbError.create ErrorKind.SyntaxError |> err
+        | e ->
+            Eval.eval Schema.empty [||] e
+            >>= function
+                | SqlValue.Int i when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
+                | SqlValue.Int _ ->
+                    sprintf "%s は 0 以上 %d 以下の整数で指定してください" what System.Int32.MaxValue
+                    |> DbError.create ErrorKind.SyntaxError
+                    |> err
+                | _ ->
+                    sprintf "%s は 0 以上の整数で指定してください" what
+                    |> DbError.create ErrorKind.SyntaxError
+                    |> err
+
     /// SELECT 文を論理代数に変換する。
     /// `derived` は計画済みの派生テーブル（別名の小文字 -> 計画）。
     let buildLogicalWith (ctx: ExecContext) (stmt: SelectStatement) (derived: Map<string, PlannedQuery>) =
@@ -288,7 +306,7 @@ module internal PlanBuilder =
             =
             match steps with
             | [] -> ret (acc, accSchema, used)
-            | (index, clause) :: rest when clause.Kind = JoinKind.Left ->
+            | (index, clause: JoinClause) :: rest when clause.Kind = JoinKind.Left ->
                 match buildJoin bindings scans acc accSchema JoinKind.Left index clause.On [] with
                 | Error e -> err e
                 | Ok(node, schema) ->
@@ -530,24 +548,6 @@ module internal PlanBuilder =
                 |> Result.map (fun e -> { item with Expression = e }))
             >> all
 
-        let evalCount what =
-            function
-            | Expr.Literal(Literal.Int i) when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
-            | e when Expr.hasCorrelated e ->
-                sprintf "%s に相関サブクエリは使えません" what |> DbError.create ErrorKind.SyntaxError |> err
-            | e ->
-                Eval.eval Schema.empty [||] e
-                >>= function
-                    | SqlValue.Int i when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
-                    | SqlValue.Int _ ->
-                        sprintf "%s は 0 以上 %d 以下の整数で指定してください" what System.Int32.MaxValue
-                        |> DbError.create ErrorKind.SyntaxError
-                        |> err
-                    | _ ->
-                        sprintf "%s は 0 以上の整数で指定してください" what
-                        |> DbError.create ErrorKind.SyntaxError
-                        |> err
-
         let applyLimit stmt tree =
             match stmt.Limit, stmt.Offset with
             | None, None -> ret tree
@@ -688,4 +688,47 @@ module internal PlanBuilder =
                         projected
 
                 return! applyLimit stmt deduped
+        }
+
+    /// 集合演算（`UNION ALL`）全体に掛かる ORDER BY / LIMIT / OFFSET を論理木へ適用する。
+    /// ORDER BY は先頭の SELECT の出力列（列名・別名・序数）で解決する。
+    /// 枝単位の ORDER BY / LIMIT は持てない（構文上も全体に掛かる）。
+    let applySetOperationTail (output: Schema) (stmt: SelectStatement) (tree: Logical) =
+        let keyOf (k: SortKey) =
+            match k.Expression with
+            | Expr.Literal(Literal.Int n) ->
+                if n < 1L || n > int64 output.Columns.Length then
+                    sprintf "ORDER BY の列番号 %d は範囲外です" n
+                    |> DbError.create ErrorKind.SyntaxError
+                    |> err
+                else
+                    ret
+                        { k with
+                            Expression =
+                                Expr.Column
+                                    {
+                                        Qualifier = None
+                                        Name = output.Columns.[int n - 1].Name
+                                    }
+                        }
+            | e -> ret { k with Expression = e }
+
+        result {
+            let! keys = stmt.OrderBy |> List.map keyOf |> all
+            let sorted = if List.isEmpty keys then tree else Logical.Sort(keys, tree)
+
+            let! limit =
+                match stmt.Limit with
+                | None -> ret -1
+                | Some e -> evalCount "LIMIT" e
+
+            let! offset =
+                match stmt.Offset with
+                | None -> ret 0
+                | Some e -> evalCount "OFFSET" e
+
+            if stmt.Limit.IsNone && stmt.Offset.IsNone then
+                return sorted
+            else
+                return Logical.Limit(offset, limit, sorted)
         }

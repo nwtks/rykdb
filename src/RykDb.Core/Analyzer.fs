@@ -74,6 +74,10 @@ type internal Logical =
     /// FROM / JOIN のサブクエリ（派生テーブル）。
     /// 内側の論理木を自前の入力スキーマ・実行文脈で 1回だけ実行する。
     | Derived of PlannedQuery
+    /// `UNION ALL`（各枝を順に実行して行を連結する）。
+    /// 枝ごとに入力スキーマ・実行文脈が異なるので `PlannedQuery` をそのまま持つ。
+    /// 出力スキーマは先頭の枝のもの（列名も先頭の SELECT に従う）。
+    | UnionAll of PlannedQuery list
 
 /// 派生テーブル（FROM / JOIN のサブクエリ）の計画結果。
 /// 計画時には実行せず、外側のオペレータ木がこのノードに到達した時点で実行する。
@@ -97,7 +101,7 @@ and internal PlannedQuery =
         Tree: Logical
     }
 
-/// 1 つのテーブルが持つスキーマと、その識別名。
+/// 1つのテーブルが持つスキーマと、その識別名。
 type internal TableBinding =
     {
         /// SELECT 句での名前（別名があれば別名）
@@ -205,7 +209,7 @@ module internal Analyzer =
         (rightTree: Logical)
         (on: Expr)
         =
-        let isMatch (r: ColumnRef) (c: OutputColumn) =
+        let isMatch (r: ColumnRef) c =
             match r.Qualifier with
             | Some q ->
                 SqlName.equal c.Name r.Name

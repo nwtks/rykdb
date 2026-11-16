@@ -509,6 +509,29 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
 回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
 `PlanBuilder.buildLogicalWith: FROM のサブクエリは Logical.Derived になる`。
 
+#### UNION ALL
+
+`SELECT ... UNION ALL SELECT ...` は**枝ごとに通常の SELECT として計画**し、
+`Logical.UnionAll` で連結する。
+
+- AST は `SelectStatement.SetOperations: SetOperation list`
+  （`Kind = UnionAll` と枝の `Statement`）。
+  先頭の SELECT 自身が 1 番目の枝で、`OrderBy` / `Limit` / `Offset` は**連結後全体**に掛かる。
+- Parser は「SELECT コア → `UNION ALL` の枝 → ORDER BY / LIMIT / OFFSET」の順に読む。
+  `UNION`（ALL なし）・`INTERSECT`・`EXCEPT` は明示 `SyntaxError`。
+  `ORDER BY` / `LIMIT` より後ろの集合演算も専用メッセージで拒否する。
+- `Plan.planCoreCWith` は `SetOperations` が空でなければ `planCompoundCWith` へ振り分け、
+  枝を `mapC`（CPS のリスト走査）で順に計画する。
+  列数が全枝で一致することを確認し、`PlanBuilder.applySetOperationTail` が
+  先頭の出力スキーマ（列名・別名・序数）で ORDER BY / LIMIT / OFFSET を被せる。
+- `Optimizer.run` は `Logical.UnionAll` の各枝を自前の `ExecContext` / 入力スキーマで評価し、
+  `Op.append` で順に連結する（`UnionFrame` が残りの枝を持つ）。
+- `Logical.UnionAll` は `scanOrder` で `None` に落ちるためマージ結合には選ばれない。
+
+回帰テスト: `SqlReference: UNION ALL は両方の行を連結する` /
+`SqlReference: UNION ALL の列数が違うとエラー` /
+`Parser: UNION ALL は集合演算としてパースされる`。
+
 #### 束縛（Binder）
 
 - パーサは裸の名前を `Expr.Name` として作る。

@@ -294,6 +294,18 @@ and internal UpdateStatement =
 
 and internal DeleteStatement = { Table: TableRef; Where: Expr option }
 
+/// 集合演算の種類。
+and [<RequireQualifiedAccess>] internal SetOperationKind =
+    /// `UNION ALL`（重複を除かずに連結する）。
+    | UnionAll
+
+/// `UNION ALL` で連結する枝。
+and internal SetOperation =
+    {
+        Kind: SetOperationKind
+        Statement: SelectStatement
+    }
+
 and internal SelectStatement =
     {
         Distinct: bool
@@ -306,6 +318,15 @@ and internal SelectStatement =
         OrderBy: SortKey list
         Limit: Expr option
         Offset: Expr option
+        /// `UNION ALL` で連結する後続の SELECT（空なら通常の SELECT）。
+        /// <remarks>
+        /// 空でないとき、この文は「先頭の SELECT（このレコード自身）と
+        /// `SetOperations` の枝を順に `UNION ALL` する」複合文になる。
+        /// その場合の `OrderBy` / `Limit` / `Offset` は**全体**へ掛かり、
+        /// 枝側の `OrderBy` / `Limit` / `Offset` は常に空になる。
+        /// 列名は先頭の SELECT のものが使われる。
+        /// </remarks>
+        SetOperations: SetOperation list
     }
 
 /// FROM / JOIN の入力。

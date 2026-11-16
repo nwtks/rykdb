@@ -496,7 +496,7 @@ module internal Parser =
             |> eatOptionalSemicolon
             |> Result.map (fun (_, st) -> Statement.Rollback, st)
         | Token.Ident name when Set.contains (name.ToUpperInvariant()) SetOperationWords ->
-            fail "集合演算（UNION / INTERSECT / EXCEPT）は未対応です" st
+            fail "集合演算は UNION ALL のみ対応しています" st
         | _ -> fail "文の開始として解釈できません" st
 
     /// `Token.Param` の個数。

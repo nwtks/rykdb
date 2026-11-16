@@ -38,6 +38,8 @@ module internal Op =
     val take: int -> Op -> Op
     /// 先頭 n 行を読み飛ばす。
     val skip: (int -> Op -> Op)
+    /// 2つの演算子を順に連結する（左をすべて出してから右）。
+    val append: Op -> Op -> Op
     /// 全行を上限つきで配列に materialize する。
     val toArrayLimited: int64 -> int64 -> Op -> Result<SqlValue array array, DbError>
     /// 全行を配列に materialize する（無制限）。

@@ -33,13 +33,15 @@ statement      ::= select | explain | insert | update | delete | ddl | txn
 
 explain        ::= EXPLAIN select
 
-select         ::= SELECT [DISTINCT] select_item {"," select_item}
+select         ::= select_core { UNION ALL select_core }
+                   [ ORDER BY sort_key {"," sort_key} ]
+                   [ LIMIT expr ] [ OFFSET expr ]
+
+select_core    ::= SELECT [DISTINCT] select_item {"," select_item}
                    [ FROM table_ref { join_clause } ]
                    [ WHERE expr ]
                    [ GROUP BY expr {"," expr} ]
                    [ HAVING expr ]
-                   [ ORDER BY sort_key {"," sort_key} ]
-                   [ LIMIT expr ] [ OFFSET expr ]
 
 select_item    ::= "*" | ident "." "*" | expr [ [AS] ident ]
 table_ref      ::= ident [ [AS] ident ]
@@ -555,6 +557,7 @@ SELECT [DISTINCT] 項目 [, 項目 …]
   [WHERE 条件]
   [GROUP BY 式 [, 式 …]]
   [HAVING 条件]
+  [UNION ALL SELECT …] …
   [ORDER BY 式 [ASC|DESC] [, …]]
   [LIMIT 定数式] [OFFSET 定数式];
 
@@ -574,6 +577,8 @@ SELECT [DISTINCT] 項目 [, 項目 …]
   `RIGHT` / `FULL` / `CROSS` は**ない**。
 - `ON` は省略できない
   （`CROSS JOIN` の代わりに `ON 1 = 1`）。
+- `UNION ALL` で複数の `SELECT` を連結できる（§7.12）。
+  `ORDER BY` / `LIMIT` / `OFFSET` は連結後の結果全体に掛かる。
 - `DISTINCT` は射影の**後**に適用される
   （`SELECT DISTINCT a, b` は `(a, b)` の組で重複除去）。
 
@@ -923,9 +928,45 @@ Project(t.id)
 | `Limit(offset=N, count=M)`                    | `count` は無制限なら省略                                                                                            |
 | `Values`                                      | `FROM` なしの入力（1行 0列）                                                                                        |
 | `Derived`                                     | 派生テーブル。内側の計画を子に持つ                                                                                  |
+| `UnionAll`                                    | `UNION ALL`。枝ごとの計画を子に持つ                                                                                 |
 
 `EXPLAIN` は `SELECT` だけを受け付ける
 （それ以外は `SyntaxError`）。
+
+---
+
+### 7.12 UNION ALL
+
+```sql
+SELECT … UNION ALL SELECT … [UNION ALL SELECT …]
+  [ORDER BY …] [LIMIT …] [OFFSET …];
+```
+
+複数の `SELECT` の結果を**重複を除かずに連結**する。
+
+- 列数は全枝で一致が必要。
+  不一致は `UNION ALL の列数が一致しません（1 番目: n 列、m 番目: k 列）`（`SyntaxError`）。
+- 列名は**先頭の `SELECT`** のものになる。
+- 値は型変換せずにそのまま連結する
+  （`SELECT 1 UNION ALL SELECT 'a'` は `INTEGER` と `TEXT` の 2 行になる）。
+  型を揃えたいときは `CAST` を使う。
+- `ORDER BY` / `LIMIT` / `OFFSET` は**連結後の結果全体**に掛かる。
+  `ORDER BY` は先頭の `SELECT` の出力列名・別名・序数（1 始まり）で解決する。
+  枝の後ろ（`UNION ALL` より前）に `ORDER BY` / `LIMIT` を書くと `SyntaxError`。
+- 各枝は通常の `SELECT`（`FROM` / `JOIN` / `WHERE` / `GROUP BY` / `HAVING` / `DISTINCT` /
+  サブクエリ / 派生テーブル）を書ける。
+  枝単位の `ORDER BY` / `LIMIT` は持てない。
+- `UNION`（`ALL` なし = 重複除去）・`INTERSECT`・`EXCEPT` は未対応（`SyntaxError`）。
+- サブクエリ・派生テーブル・`INSERT ... SELECT` の中でも使える。
+
+```sql
+SELECT id, name FROM people WHERE age >= 30
+UNION ALL
+SELECT id, name FROM people WHERE age < 30
+ORDER BY id;
+```
+
+`EXPLAIN` では `UnionAll` ノードの下に各枝の計画が出る（§7.11）。
 
 ---
 
@@ -1410,7 +1451,10 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 | `SAVEPOINT s;`                                                                    | `文の開始として解釈できません (位置 1行)`                                                      |
 | `UPDATE t SET v = 1 FROM u;`                                                      | `文の区切りには ; が必要です（複数文は ; で区切ってください） (位置 1行)`                      |
 | `SELECT * FROM t LEFT WHERE 1 = 1;`                                               | `LEFT / INNER の後ろには JOIN が必要です (位置 1行)`                                           |
-| `SELECT 1 UNION SELECT 2;`                                                        | `集合演算（UNION / INTERSECT / EXCEPT）は未対応です (位置 1行)`                                |
+| `SELECT 1 UNION SELECT 2;`                                                        | `UNION（重複を除く集合演算）は未対応です（UNION ALL を使ってください） (位置 1行)`             |
+| `SELECT 1 INTERSECT SELECT 2;`                                                    | `INTERSECT は未対応です（集合演算は UNION ALL のみ対応） (位置 1行)`                           |
+| `SELECT a FROM t UNION ALL SELECT a, b FROM u;`                                   | `UNION ALL の列数が一致しません（1 番目: 1 列、2 番目: 2 列）`                                 |
+| `SELECT a FROM t ORDER BY a UNION ALL SELECT a FROM u;`                           | `UNION / INTERSECT / EXCEPT は ORDER BY / LIMIT より前に書いてください (位置 1行)`             |
 | `UPDATE t AS x SET a = 1;`                                                        | `INSERT / UPDATE / DELETE の対象テーブルに別名は使えません（別名を外してください） (位置 1行)` |
 | `SELECT * FROM t WHERE a = b = c;`                                                | `比較・述語は 1つの式に 1回だけ書けます（括弧で囲んでください） (位置 1行)`                    |
 | `SELECT NULL.* FROM t;`                                                           | `'.' の後ろには列名か '*' が必要です（修飾子は識別子にだけ付けられます） (位置 1行)`           |
@@ -1426,7 +1470,7 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 
 - **相関派生テーブル（LATERAL）**（`FROM (SELECT ... 外側の列 ...) AS x` は `NameError`）。
   式の中の相関サブクエリは §7.9。
-- `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`
+- `UNION`（`ALL` なし）/ `INTERSECT` / `EXCEPT`（`UNION ALL` は §7.12）
 - CTE（`WITH`）、再帰クエリ
 - ウィンドウ関数（`OVER` / `PARTITION BY` / `ROW_NUMBER` …）
 - `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN` / `USING`

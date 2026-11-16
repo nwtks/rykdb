@@ -77,6 +77,8 @@ module internal ParserExpr =
         | _ -> false
 
     /// 未対応の集合演算。
+    /// `UNION` は `UNION ALL` だけ受理する
+    /// （`UNION` 単独・`INTERSECT` / `EXCEPT` は明示エラー）。
     /// これらは予約語ではないため、テーブル別名として飲み込むと
     /// 後続の SELECT が別の文として実行されてしまう。
     let internal SetOperationWords = Set.ofList [ "UNION"; "INTERSECT"; "EXCEPT" ]
@@ -86,9 +88,9 @@ module internal ParserExpr =
     let private UnsupportedJoinWords =
         Set.ofList [ "RIGHT"; "FULL"; "CROSS"; "NATURAL"; "OUTER" ]
 
-    /// テーブル別名として飲み込んではいけない語。
-    let private UnsupportedTableAliasWords =
-        Set.union SetOperationWords UnsupportedJoinWords
+    /// 裸の別名として飲み込んではいけない語。
+    /// 集合演算の語はここでは消費せず、後続の構文規則（集合演算・文の境界）に判定を委ねる。
+    let private ReservedAliasWords = Set.union SetOperationWords UnsupportedJoinWords
 
     /// 現在位置が指定した識別子（大文字小文字を無視）か。
     let internal isIdentName (name: string) (st: PState) =
@@ -105,7 +107,7 @@ module internal ParserExpr =
         match word with
         | "UNION"
         | "INTERSECT"
-        | "EXCEPT" -> sprintf "%s は未対応です（集合演算は未対応。別名にする場合は AS を付けてください）" word
+        | "EXCEPT" -> sprintf "%s は未対応です（集合演算は UNION ALL のみ対応。別名にする場合は AS を付けてください）" word
         | "RIGHT"
         | "FULL"
         | "CROSS"
@@ -113,18 +115,19 @@ module internal ParserExpr =
         | "OUTER" -> sprintf "%s は未対応です（INNER JOIN / LEFT JOIN のみ対応。別名にする場合は AS を付けてください）" word
         | _ -> sprintf "%s は未対応です" word
 
-    /// 集合演算が続いている場合は、別名として飲み込まずに明示エラーにする。
+    /// 集合演算が ORDER BY / LIMIT の後ろに続いている場合は、専用のエラーにする。
+    /// ORDER BY / LIMIT は複合文全体に掛かるため、枝の後ろ（集合演算より前）にしか書けない。
     let private rejectSetOperation (st: PState) =
         match peek st with
         | Token.Ident s when Set.contains (s.ToUpperInvariant()) SetOperationWords ->
-            fail "集合演算（UNION / INTERSECT / EXCEPT）は未対応です" st
+            fail "UNION / INTERSECT / EXCEPT は ORDER BY / LIMIT より前に書いてください" st
         | _ -> ret ()
 
     /// JOIN の位置に未対応語が来たら、別名や別の JOIN として解釈せず明示エラーにする。
     /// テーブルに `AS` で別名を付けた場合（`FROM t AS x RIGHT JOIN u`）もここで拾う。
     let private rejectUnsupportedClause (st: PState) =
         match peek st with
-        | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedTableAliasWords ->
+        | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedJoinWords ->
             fail (unsupportedAliasMessage (s.ToUpperInvariant())) st
         | _ -> ret ()
 
@@ -208,13 +211,15 @@ module internal ParserExpr =
             advance st |> parseIdent |> Result.map (fun (a, st) -> Some a, st)
         else
             match peek st with
-            | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedTableAliasWords -> ret (None, st)
+            | Token.Ident s when Set.contains (s.ToUpperInvariant()) ReservedAliasWords -> ret (None, st)
             | Token.Ident s -> ret (Some s, advance st)
             | Token.QuotedIdent s -> ret (Some s, advance st)
             | _ -> ret (None, st)
 
     /// テーブル別名を読む。
     /// 未対応の SQL 語は裸の別名として飲み込まない（`AS` を付ければ別名として使える）。
+    /// 集合演算の語（UNION など）はここでは消費もエラーもしない
+    /// （`SELECT ... FROM t UNION ALL ...` を後段の集合演算の規則で扱うため）。
     /// `USING` はここでは消費せず、呼び出し側が JOIN / DELETE の文脈に応じてエラーにする。
     let private parseTableAlias (st: PState) =
         if isKeyword "AS" st then
@@ -222,7 +227,8 @@ module internal ParserExpr =
         else
             match peek st with
             | Token.Ident s when s.ToUpperInvariant() = "USING" -> ret (None, st)
-            | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedTableAliasWords ->
+            | Token.Ident s when Set.contains (s.ToUpperInvariant()) SetOperationWords -> ret (None, st)
+            | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedJoinWords ->
                 fail (unsupportedAliasMessage (s.ToUpperInvariant())) st
             | Token.Ident s -> ret (Some s, advance st)
             | Token.QuotedIdent s -> ret (Some s, advance st)
@@ -647,7 +653,30 @@ module internal ParserExpr =
             else
                 parseExprListC afterParen (fun (xs, st) -> k (Expr.InList(left, xs, negated), st))
 
+    /// SELECT 文（`UNION ALL` の複合文を含む）。
+    /// 先頭の SELECT（コア）→ 集合演算の枝 → ORDER BY / LIMIT / OFFSET の順に読む。
+    /// ORDER BY / LIMIT は複合文全体に掛かる（枝の後ろには書けない）。
     and [<TailCall>] private parseSelectStatementC (st: PState) (k: SelectStatement * PState -> Result<'r, DbError>) =
+        parseSelectCoreC st (fun (core, st) ->
+            parseSetOperationsC [] st (fun (setOps, st) ->
+                parseOrderByC st (fun (orderBy, st) ->
+                    parseLimitOffsetC st (fun ((limit, offset), st) ->
+                        match rejectSetOperation st with
+                        | Error e -> err e
+                        | Ok() ->
+                            k (
+                                { core with
+                                    SetOperations = setOps
+                                    OrderBy = orderBy
+                                    Limit = limit
+                                    Offset = offset
+                                },
+                                st
+                            )))))
+
+    /// 集合演算を除いた 1つの SELECT（`SELECT ... WHERE ... GROUP BY ... HAVING ...`）。
+    /// `ORDER BY` / `LIMIT` / `OFFSET` は複合文全体に掛かるのでここでは読まない。
+    and [<TailCall>] private parseSelectCoreC (st: PState) (k: SelectStatement * PState -> Result<'r, DbError>) =
         match expectKeyword "SELECT" st with
         | Error e -> err e
         | Ok(_, st) ->
@@ -657,11 +686,40 @@ module internal ParserExpr =
             parseSelectItemsC st (fun (items, st) ->
                 if isKeyword "FROM" st then
                     parseSourceC (advance st) (fun (fromRef, st) ->
-                        parseSelectTailC distinct items (Some fromRef) st k)
+                        parseSelectCoreTailC distinct items (Some fromRef) st k)
                 elif isKeyword "JOIN" st || isKeyword "INNER" st || isKeyword "LEFT" st then
                     fail "JOIN には FROM が必要です" st
                 else
-                    parseSelectTailC distinct items None st k)
+                    parseSelectCoreTailC distinct items None st k)
+
+    /// `UNION ALL` の枝（0個以上）を読む。
+    /// `UNION`（ALL なし）と `INTERSECT` / `EXCEPT` は未対応なので明示エラーにする。
+    and [<TailCall>] private parseSetOperationsC
+        (acc: SetOperation list)
+        (st: PState)
+        (k: SetOperation list * PState -> Result<'r, DbError>)
+        =
+        if isIdentName "UNION" st then
+            let afterUnion = advance st
+
+            if isIdentName "ALL" afterUnion then
+                parseSelectCoreC (advance afterUnion) (fun (core, st) ->
+                    parseSetOperationsC
+                        ({
+                            Kind = SetOperationKind.UnionAll
+                            Statement = core
+                         }
+                         :: acc)
+                        st
+                        k)
+            else
+                fail "UNION（重複を除く集合演算）は未対応です（UNION ALL を使ってください）" st
+        elif isIdentName "INTERSECT" st then
+            fail "INTERSECT は未対応です（集合演算は UNION ALL のみ対応）" st
+        elif isIdentName "EXCEPT" st then
+            fail "EXCEPT は未対応です（集合演算は UNION ALL のみ対応）" st
+        else
+            k (List.rev acc, st)
 
     and private parseSelectItemsLoop
         (acc: SelectItem list)
@@ -725,9 +783,10 @@ module internal ParserExpr =
                 | Error e -> err e
                 | Ok(alias, st) -> k (TableSource.Named { Name = name; Alias = alias }, st)
 
-    /// FROM（省略可）より後ろの句を順に読む。
+    /// SELECT のコア（FROM 省略可）より後ろの句を順に読む。
     /// FROM を省略した SELECT の入力は 1行 0列になる。
-    and [<TailCall>] private parseSelectTailC
+    /// `ORDER BY` / `LIMIT` / `OFFSET` は集合演算（`parseSelectStatementC`）が読む。
+    and [<TailCall>] private parseSelectCoreTailC
         (distinct: bool)
         (items: SelectItem list)
         (fromRef: TableSource option)
@@ -738,26 +797,22 @@ module internal ParserExpr =
             parseWhereC st (fun (whereE, st) ->
                 parseGroupByC st (fun (groupBy, st) ->
                     parseHavingC st (fun (having, st) ->
-                        parseOrderByC st (fun (orderBy, st) ->
-                            parseLimitOffsetC st (fun ((limit, offset), st) ->
-                                match rejectSetOperation st with
-                                | Error e -> err e
-                                | Ok() ->
-                                    k (
-                                        {
-                                            Distinct = distinct
-                                            Items = items
-                                            From = fromRef
-                                            Joins = joins
-                                            Where = whereE
-                                            GroupBy = groupBy
-                                            Having = having
-                                            OrderBy = orderBy
-                                            Limit = limit
-                                            Offset = offset
-                                        },
-                                        st
-                                    )))))))
+                        k (
+                            {
+                                Distinct = distinct
+                                Items = items
+                                From = fromRef
+                                Joins = joins
+                                Where = whereE
+                                GroupBy = groupBy
+                                Having = having
+                                OrderBy = []
+                                Limit = None
+                                Offset = None
+                                SetOperations = []
+                            },
+                            st
+                        )))))
 
     and private parseJoinsLoop
         (acc: JoinClause list)

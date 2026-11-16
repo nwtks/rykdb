@@ -33,6 +33,7 @@ let private selectOf (items: SelectItem list) (from: TableRef option) (joins: Jo
         OrderBy = []
         Limit = None
         Offset = None
+        SetOperations = []
     }
 
 [<Fact>]

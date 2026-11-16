@@ -487,8 +487,8 @@ let ``Parser: 文法エラーの諸形`` () =
 
 [<Fact>]
 let ``Parser: 未対応の集合演算は明示エラー`` () =
+    // UNION（ALL なし）・INTERSECT・EXCEPT は未対応。UNION ALL だけが受理される。
     expectErrorKind ErrorKind.SyntaxError "UNION" (parseStatement "SELECT a FROM t UNION SELECT a FROM t")
-    expectErrorKind ErrorKind.SyntaxError "UNION ALL" (parseStatement "SELECT a FROM t UNION ALL SELECT a FROM t")
     expectErrorKind ErrorKind.SyntaxError "INTERSECT" (parseStatement "SELECT a FROM t INTERSECT SELECT a FROM t")
     expectErrorKind ErrorKind.SyntaxError "EXCEPT" (parseStatement "SELECT a FROM t EXCEPT SELECT a FROM t")
 
@@ -498,15 +498,57 @@ let ``Parser: 未対応の集合演算は明示エラー`` () =
         "WHERE の後の UNION"
         (parseStatement "SELECT a FROM t WHERE a = 1 UNION SELECT a FROM t")
 
+    // ORDER BY / LIMIT は複合文全体に掛かるので、集合演算より後ろにしか書けない
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "ORDER BY の後の UNION ALL"
+        (parseStatement "SELECT a FROM t ORDER BY a UNION ALL SELECT a FROM t")
+
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "LIMIT の後の UNION ALL"
+        (parseStatement "SELECT a FROM t LIMIT 1 UNION ALL SELECT a FROM t")
+
+[<Fact>]
+let ``Parser: UNION ALL は集合演算としてパースされる`` () =
+    // 枝が 1 つ。末尾の ORDER BY / LIMIT / OFFSET は複合文全体に付く。
+    let sel =
+        parseSelectOk "SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1 DESC LIMIT 3 OFFSET 1"
+
+    Assert.Equal<int>(1, sel.SetOperations.Length)
+
+    let branch = sel.SetOperations.Head
+    Assert.Equal(SetOperationKind.UnionAll, branch.Kind)
+    Assert.Equal<int>(1, branch.Statement.Items.Length)
+    Assert.True branch.Statement.OrderBy.IsEmpty
+    Assert.True branch.Statement.Limit.IsNone
+    Assert.Equal<int>(1, sel.OrderBy.Length)
+    Assert.Equal(SortDirection.Descending, sel.OrderBy.Head.Direction)
+    Assert.True sel.Limit.IsSome
+    Assert.True sel.Offset.IsSome
+
+    // 3 つ以上も連結できる
+    let chained = parseSelectOk "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3"
+    Assert.Equal<int>(2, chained.SetOperations.Length)
+
+    Assert.Equal<SetOperationKind list>(
+        [ SetOperationKind.UnionAll; SetOperationKind.UnionAll ],
+        chained.SetOperations |> List.map _.Kind
+    )
+
 [<Fact>]
 let ``Parser: 列別名が集合演算を飲み込まない`` () =
     // 以前は SELECT 項目の別名が UNION を消費し、後続の SELECT が別の文として扱われていた
     expectErrorKind ErrorKind.SyntaxError "UNION" (parseStatement "SELECT 1 UNION SELECT 2")
-    expectErrorKind ErrorKind.SyntaxError "UNION ALL" (parseStatement "SELECT 1 UNION ALL SELECT 2")
+
+    // UNION ALL は集合演算としてパースされ、2 つ目の SELECT が別の文にならない
+    let sel = parseSelectOk "SELECT 1 UNION ALL SELECT 2"
+    Assert.Equal<int>(1, sel.SetOperations.Length)
+    Assert.Equal<int>(1, sel.SetOperations.Head.Statement.Items.Length)
 
     // AS を付ければ別名として使える
-    let sel = parseSelectOk "SELECT a AS union FROM t"
-    Assert.Equal<string option>(Some "union", sel.Items.[0].Alias)
+    let aliased = parseSelectOk "SELECT a AS union FROM t"
+    Assert.Equal<string option>(Some "union", aliased.Items.[0].Alias)
 
 [<Fact>]
 let ``Parser: 未対応の JOIN は明示エラー`` () =

@@ -27,6 +27,7 @@ let private emptySelect =
         OrderBy = []
         Limit = None
         Offset = None
+        SetOperations = []
     }
 
 /// `children` / `plugChildren` の arity 検査に使う全ノード種のサンプル。
