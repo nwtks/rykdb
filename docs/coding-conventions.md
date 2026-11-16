@@ -57,8 +57,14 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 
 ## 2. 命令型の構文・機能を使わない
 
-`src/RykDb.Core/` では **`mutable` / `while` / `ref` を 0件**に保つ。
-例外は公開セッション層（`Session.fs` / `SessionHost.fs`）だけで、次を意図的に使う。
+**ロジック層（型・字句・構文・計画・実行・ストレージ）では `mutable` / `while` / `ref` を 0件**に保つ。
+`src/RykDb.Core/` に残る `mutable` は公開セッション層（`Session.fs` / `SessionHost.fs`）の
+状態 DU のスロット 5箇所と読み取り数カウンタだけで、次を意図的に使う。
+
+この規約が保証するのは**可変状態の所在が列挙できること**であり、可変状態の全廃ではない。
+ロジック層の状態は `ResizeArray` / `Dictionary` / `HashSet` / `ConcurrentDictionary` /
+`SemaphoreSlim` / `lock` へ移っている（下の許可リスト）。
+「Core に mutable が無い」ではなく「可変状態はここにしかない」と読むこと。
 
 - `DatabaseHost` の `let mutable lifecycle`（`HostLifecycle` = `Running` / `Closed`、`SessionHost.fs`）:
   全接続で共有する committed な `DbState` と Close 状態を 1つの状態 DU で持つ。
@@ -106,6 +112,10 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 | ホットパスの成功値 | `DbResult<'T>`（`DbOk` / `DbErr`）。公開境界で `Result` に変換する              |
 | 平衡木の再構築     | 明示スタック（`list` を積む）                                                   |
 | 遅延列挙           | `Op`（one-shot。構築は `Op.compute` / `Op.emit`、消費は `Op.next` の `OpStep`） |
+
+関数名の末尾の `V`（`matchesWithV` / `compareValuesV`）は
+「値ベース（`Result` ではなく `DbResult`）版」を表す。
+`DbResult` はホットパス専用なので、外側から呼ぶときは `Result` を返す版を使う。
 
 ## 3. 末尾再帰を前提にする
 

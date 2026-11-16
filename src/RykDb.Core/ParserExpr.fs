@@ -618,8 +618,8 @@ module internal ParserExpr =
                 let st = if distinct then advance st else st
 
                 parseExprListC st (fun (argList, st) ->
-                    match AggFunc.tryParse upper with
-                    | Some agg when List.length argList = 1 -> k (Expr.AggCall(agg, distinct, List.head argList), st)
+                    match AggFunc.tryParse upper, argList with
+                    | Some agg, [ arg ] -> k (Expr.AggCall(agg, distinct, arg), st)
                     | _ -> k (Expr.FuncCall(upper, argList), st))
 
     and private parseExprListLoop (acc: Expr list) (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =

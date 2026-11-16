@@ -55,27 +55,59 @@ module internal Eval =
     let private overflowError () =
         DbErr(DbError.constraintViolation "数値演算の結果が表現可能な範囲を超えました")
 
-    let private intArith (op: ArithOp) (a: int64) (b: int64) =
-        let x = System.Numerics.BigInteger a
-        let y = System.Numerics.BigInteger b
+    /// 整数の四則演算。
+    /// 例外も `BigInteger` も使わず、桁あふれを演算前に判定する
+    /// （行ごとの評価で値ごとにオブジェクトを確保しないため）。
+    let private intArith (a: int64) (b: int64) (op: ArithOp) =
+        let addOverflows =
+            b > 0L && a > System.Int64.MaxValue - b
+            || b < 0L && a < System.Int64.MinValue - b
 
-        let r =
-            match op with
-            | Add -> x + y
-            | Sub -> x - y
-            | Mul -> x * y
-            | Div -> x / y
-            | Mod -> x % y
+        let subOverflows =
+            b > 0L && a < System.Int64.MinValue + b
+            || b < 0L && a > System.Int64.MaxValue + b
 
-        if
-            r < System.Numerics.BigInteger System.Int64.MinValue
-            || r > System.Numerics.BigInteger System.Int64.MaxValue
-        then
-            overflowError ()
-        else
-            DbOk(SqlValue.Int(int64 r))
+        let mulOverflows =
+            if a = 0L || b = 0L then
+                false
+            elif a > 0L then
+                if b > 0L then
+                    a > System.Int64.MaxValue / b
+                else
+                    b < System.Int64.MinValue / a
+            elif b > 0L then
+                a < System.Int64.MinValue / b
+            else
+                b < System.Int64.MaxValue / a
 
-    let private decimalArith (op: ArithOp) (a: decimal) (b: decimal) =
+        match op with
+        | Add ->
+            if addOverflows then
+                overflowError ()
+            else
+                DbOk(SqlValue.Int(a + b))
+        | Sub ->
+            if subOverflows then
+                overflowError ()
+            else
+                DbOk(SqlValue.Int(a - b))
+        | Mul ->
+            if mulOverflows then
+                overflowError ()
+            else
+                DbOk(SqlValue.Int(a * b))
+        | Div ->
+            if a = System.Int64.MinValue && b = -1L then
+                overflowError ()
+            else
+                DbOk(SqlValue.Int(a / b))
+        | Mod ->
+            if b = -1L then
+                DbOk(SqlValue.Int 0L)
+            else
+                DbOk(SqlValue.Int(a % b))
+
+    let private decimalArith (a: decimal) (b: decimal) (op: ArithOp) =
         let maxD = System.Decimal.MaxValue
         let minD = System.Decimal.MinValue
 
@@ -90,7 +122,7 @@ module internal Eval =
         | Mul ->
             let aa = abs a
             let bb = abs b
-            let overflows = if bb >= 1M then aa > maxD / bb else aa > maxD * bb
+            let overflows = bb >= 1M && aa > maxD / bb
 
             if overflows then
                 overflowError ()
@@ -104,7 +136,7 @@ module internal Eval =
         | Div -> DbOk(SqlValue.Decimal(a / b))
         | Mod -> DbOk(SqlValue.Decimal(a % b))
 
-    let private realArith (op: ArithOp) (a: float) (b: float) =
+    let private realArith (a: float) (b: float) (op: ArithOp) =
         let r =
             match op with
             | Add -> a + b
@@ -137,11 +169,11 @@ module internal Eval =
 
     let private liftNumeric (op: ArithOp) (a: SqlValue) (b: SqlValue) =
         match a, b with
-        | SqlValue.Int x, SqlValue.Int y -> intArith op x y
+        | SqlValue.Int x, SqlValue.Int y -> intArith x y op
         | (SqlValue.Int _ | SqlValue.Decimal _), (SqlValue.Int _ | SqlValue.Decimal _) ->
-            decimalArith op (decimalOf a) (decimalOf b)
+            decimalArith (decimalOf a) (decimalOf b) op
         | (SqlValue.Int _ | SqlValue.Decimal _ | SqlValue.Real _),
-          (SqlValue.Int _ | SqlValue.Decimal _ | SqlValue.Real _) -> realArith op (floatOf a) (floatOf b)
+          (SqlValue.Int _ | SqlValue.Decimal _ | SqlValue.Real _) -> realArith (floatOf a) (floatOf b) op
         | _ -> DbOk SqlValue.Null
 
     let private arith (op: ArithOp) (a: SqlValue) (b: SqlValue) =

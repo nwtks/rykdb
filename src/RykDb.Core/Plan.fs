@@ -439,49 +439,51 @@ module internal Plan =
         let branches = stmt :: (stmt.SetOperations |> List.map _.Statement)
 
         let finish plans =
-            let first = plans |> List.head
-            let expected = first.Header.Columns.Length
+            match plans with
+            | [] -> DbError.internalError "UNION ALL の枝が計画されていません" |> err
+            | first :: _ ->
+                let expected = first.Header.Columns.Length
 
-            let mismatch =
-                plans
-                |> List.indexed
-                |> List.tryFind (fun (_, plan) -> plan.Header.Columns.Length <> expected)
+                let mismatch =
+                    plans
+                    |> List.indexed
+                    |> List.tryFind (fun (_, plan) -> plan.Header.Columns.Length <> expected)
 
-            match mismatch with
-            | Some(index, plan) ->
-                sprintf "UNION ALL の列数が一致しません（1 番目: %d 列、%d 番目: %d 列）" expected (index + 1) plan.Header.Columns.Length
-                |> DbError.create ErrorKind.SyntaxError
-                |> err
-            | None ->
-                let tailStmt =
-                    { stmt with
-                        Items = []
-                        From = None
-                        Joins = []
-                        Where = None
-                        GroupBy = []
-                        Having = None
-                        SetOperations = []
-                    }
+                match mismatch with
+                | Some(index, plan) ->
+                    sprintf "UNION ALL の列数が一致しません（1番目: %d列、%d番目: %d列）" expected (index + 1) plan.Header.Columns.Length
+                    |> DbError.create ErrorKind.SyntaxError
+                    |> err
+                | None ->
+                    let tailStmt =
+                        { stmt with
+                            Items = []
+                            From = None
+                            Joins = []
+                            Where = None
+                            GroupBy = []
+                            Having = None
+                            SetOperations = []
+                        }
 
-                let scopes = { Schema = first.Output; Row = None } :: outer
+                    let scopes = { Schema = first.Output; Row = None } :: outer
 
-                resolveSelectC
-                    runner
-                    scopes
-                    (fun tail ->
-                        PlanBuilder.applySetOperationTail first.Output tail (Logical.UnionAll plans)
-                        >>= fun tree ->
-                            k
-                                {
-                                    Output = first.Output
-                                    Header = first.Header
-                                    Input = plans |> List.map _.Input |> Schema.concatAll
-                                    Context = ctx
-                                    Tree = tree
-                                })
-                    ctx
-                    tailStmt
+                    resolveSelectC
+                        runner
+                        scopes
+                        (fun tail ->
+                            PlanBuilder.applySetOperationTail first.Output tail (Logical.UnionAll plans)
+                            >>= fun tree ->
+                                k
+                                    {
+                                        Output = first.Output
+                                        Header = first.Header
+                                        Input = plans |> List.map _.Input |> Schema.concatAll
+                                        Context = ctx
+                                        Tree = tree
+                                    })
+                        ctx
+                        tailStmt
 
         mapC (fun (b: SelectStatement) contn -> planCoreCWith runner outer contn ctx (branchOf b)) branches [] finish
 

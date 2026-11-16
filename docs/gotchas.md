@@ -2655,10 +2655,11 @@ Core のホットパスでは次の 2 つを使い、公開 API の境界で `Re
 
 判断基準: 「制御フローで自明に安全」でも、**(1) protect 外に出る経路**と **(2) 型で保証されない**の
 2点が揃うなら総和化する。
-今回はスコープ外にした 3 件（いずれも 1 点が欠ける）:
-`ParserExpr.fs` の `List.head`（`List.length = 1` の直後）、
-`Serialization.fs` の `List.head`（seed 付きの `crcTables.build`）、
-`ExecContext.fs` の `Array.forall2`（同スキーマ前提、幅不一致なら `ArgumentException`）。
+残る既知の例外は `ExecContext.fs` の `Array.forall2` だけ
+（同スキーマ前提で、幅不一致なら `ArgumentException`）。
+`List.head` は 2026-11-17 に全廃した（`ParserExpr` はリストパターン、
+`Serialization` は `prev :: _`、`Plan` は `match plans with [] -> ...`。
+到達しない防御腕は `DbError.internalError` を返す）。
 
 ### 11.77 同じフィールド名を持つレコードを足すと既存コードの推論が静かに変わる（FS3566）
 
@@ -2695,3 +2696,24 @@ mapC (fun (b: SelectStatement) contn -> planCoreCWith runner outer contn ctx (br
 
 継続の最終型が `'r`（グループの型変数）のままなら、グループ内呼び出しは推論を壊さない。
 回帰テスト: `SqlReference: UNION ALL は両方の行を連結する`。
+
+### 11.79 整数・DECIMAL の桁あふれは「演算前に判定」する（例外も `BigInteger` も使わない）
+
+`Eval.intArith` は当初 `BigInteger` で範囲を判定していたが、
+行ごとの式評価で **値 1つにつき 1個のオブジェクトを確保**していた。
+現在は `Add` / `Sub` は `MaxValue - b` / `MinValue + b` との比較、
+`Mul` は除算で判定する（`BigInteger` は `Serialization` の DECIMAL 分解だけに残る）。
+
+- **`Int64.MinValue % -1` は 0 だが、.NET の `%` は `OverflowException` を投げる**。
+  `Div` は `MinValue / -1` だけを桁あふれにし、`Mod` は `b = -1L` を 0 で返す。
+  どちらも `Eval.intArith` で明示する（0 除算は `arith` が先に弾いている）。
+- **`decimal` の乗算は `|b| < 1` を桁あふれにしない**。
+  旧実装は `aa > maxD * bb` で判定しており、`MaxValue * 0.5` を誤って桁あふれにしていた
+  （`|b| < 1` なら `|a * b| < |a| <= MaxValue` なので必ず範囲内）。
+  判定は `bb >= 1M && aa > maxD / bb`。
+- **`decimal` の除算は逆に `|b| < 1` で桁あふれし得る**（`|a| > maxD * |b|` が判定）。
+- `decimal` は `MinValue = -MaxValue` の対称な範囲なので `abs` は桁あふれしない
+  （`int64` の `ABS Int64.MinValue` とは違う。こちらは `Scalar` が明示的に弾く）。
+
+回帰テスト: `EvalTests` の
+`Eval.eval: 数値演算は範囲外で DbError を返し、REAL は精度を落とさない`（DECIMAL 除算と INTEGER の乗算・減算・剰余を追加）。

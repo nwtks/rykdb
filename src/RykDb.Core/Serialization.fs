@@ -340,10 +340,9 @@ module internal Hashing =
             Array.init 256 (fun i -> (prev.[i] >>> 8) ^^^ crcTable0.[int (prev.[i] &&& 0xFFu)])
 
         let rec build n acc =
-            if n = 0 then
-                acc |> List.rev |> Array.ofList
-            else
-                build (n - 1) (next (List.head acc) :: acc)
+            match acc with
+            | prev :: _ when n > 0 -> build (n - 1) (next prev :: acc)
+            | _ -> acc |> List.rev |> Array.ofList
 
         build 7 [ crcTable0 ]
 

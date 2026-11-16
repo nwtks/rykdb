@@ -280,6 +280,32 @@ let ``Eval.eval: 数値演算は範囲外で DbError を返し、REAL は精度�
         "DECIMAL 乗算のオーバーフロー"
         (arith2 BinaryOp.Mul (Literal.Decimal System.Decimal.MaxValue) (Literal.Decimal 2M))
 
+    expectErrorKind
+        ErrorKind.ConstraintViolation
+        "整数乗算のオーバーフロー"
+        (arith2 BinaryOp.Mul (Literal.Int System.Int64.MaxValue) (Literal.Int 2L))
+
+    expectErrorKind
+        ErrorKind.ConstraintViolation
+        "整数減算のオーバーフロー"
+        (arith2 BinaryOp.Sub (Literal.Int System.Int64.MinValue) (Literal.Int 1L))
+
+    // `Int64.MinValue % -1` は 0（.NET の `%` は OverflowException を投げる）
+    match ok (arith2 BinaryOp.Mod (Literal.Int System.Int64.MinValue) (Literal.Int -1L)) with
+    | SqlValue.Int r -> Assert.Equal<int64>(0L, r)
+    | v -> failActual "INTEGER ではありません" v
+
+    // 乗算の桁あふれ判定は |b| < 1 を誤検出しない（MaxValue * 0.5 は範囲内）
+    match ok (arith2 BinaryOp.Mul (Literal.Decimal System.Decimal.MaxValue) (Literal.Decimal 0.5M)) with
+    | SqlValue.Decimal r -> Assert.True(r > 3.9e28M && r < 4.0e28M, sprintf "想定外の DECIMAL: %M" r)
+    | v -> failActual "DECIMAL ではありません" v
+
+    // 逆に |b| < 1 の除算は桁あふれし得る
+    expectErrorKind
+        ErrorKind.ConstraintViolation
+        "DECIMAL 除算のオーバーフロー"
+        (arith2 BinaryOp.Div (Literal.Decimal System.Decimal.MinValue) (Literal.Decimal 0.5M))
+
     // REAL は decimal を経由せず float で計算する
     let assertReal (expected: float) (r: Result<SqlValue, DbError>) =
         match ok r with

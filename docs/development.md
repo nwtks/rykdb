@@ -41,14 +41,14 @@ dotnet test -p:CollectCoverage=true -p:Threshold=90 -p:ThresholdType=line -p:Thr
 lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>/` を消してから
 `dotnet restore --force-evaluate` を実行する。
 
-| ゲート                  | 設定                                             |
-| ----------------------- | ------------------------------------------------ |
-| `TreatWarningsAsErrors` | **有効**                                         |
-| `LangVersion`           | `10.0`                                           |
-| `WarningLevel`          | `3`                                              |
-| `OtherFlags`            | `--warnon:1182`（未使用ローカル変数もエラー）    |
-| 依存の再現性            | `global.json`（SDK） / `packages.lock.json`      |
-| Core の命令型構文・機能 | `mutable` / `while` / `ref` は `Session.fs` のみ |
+| ゲート                  | 設定                                                                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `TreatWarningsAsErrors` | **有効**                                                                                                                                         |
+| `LangVersion`           | `10.0`                                                                                                                                           |
+| `WarningLevel`          | `3`                                                                                                                                              |
+| `OtherFlags`            | `--warnon:1182`（未使用ローカル変数もエラー）                                                                                                    |
+| 依存の再現性            | `global.json`（SDK） / `packages.lock.json`                                                                                                      |
+| Core の命令型構文・機能 | ロジック層は `mutable` / `while` / `ref` なし。例外は `Session.fs` / `SessionHost.fs` の状態 DU スロットのみ（可変コレクションは別途許可リスト） |
 
 > **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
 > （[`gotchas.md`](gotchas.md) §10.4）。
