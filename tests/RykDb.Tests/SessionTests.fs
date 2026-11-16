@@ -7,8 +7,6 @@
 
 module RykDb.SessionTests
 
-open System.Threading
-open System.Threading.Tasks
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -25,11 +23,11 @@ let private withSession (tag: string) (f: Session -> unit) =
 /// 走査と書き込みを任意のタイミングで止めるためのゲート。
 /// 並行性テストで「読み取りが書き込み中に進む」ことを決定的に確かめる。
 type private EngineGates() =
-    let scanGate = new ManualResetEventSlim true
-    let writeGate = new ManualResetEventSlim true
+    let scanGate = new System.Threading.ManualResetEventSlim true
+    let writeGate = new System.Threading.ManualResetEventSlim true
 
-    member val ScanEntered = new ManualResetEventSlim false
-    member val WriteEntered = new ManualResetEventSlim false
+    member val ScanEntered = new System.Threading.ManualResetEventSlim false
+    member val WriteEntered = new System.Threading.ManualResetEventSlim false
 
     member this.BlockScans() =
         this.ScanEntered.Reset()
@@ -116,7 +114,7 @@ let private withGatedSession (_tag: string) (f: Session -> EngineGates -> unit) 
 /// ブロックして待つ処理は専用スレッドで動かす。
 /// スレッドプールが他のテストで飽和していても開始が遅れない。
 let private startDedicated (f: unit -> 'T) =
-    Task.Factory.StartNew(f, TaskCreationOptions.LongRunning)
+    System.Threading.Tasks.Task.Factory.StartNew(f, System.Threading.Tasks.TaskCreationOptions.LongRunning)
 
 let private withSessionOptions options (tag: string) (f: Session -> unit) =
     withDir tag (fun dir ->
@@ -306,9 +304,10 @@ let ``Session: 同一 Session を複数スレッドで使っても書き込み�
         let tasks =
             [ 1..rowCount ]
             |> List.map (fun id ->
-                Task.Run(fun () -> session.Execute(sprintf "INSERT INTO t VALUES (%d)" id) |> ok |> ignore))
+                System.Threading.Tasks.Task.Run(fun () ->
+                    session.Execute(sprintf "INSERT INTO t VALUES (%d)" id) |> ok |> ignore))
 
-        tasks |> Array.ofList |> Task.WaitAll
+        tasks |> Array.ofList |> System.Threading.Tasks.Task.WaitAll
 
         let count = ok (session.Execute "SELECT COUNT(*) FROM t")
         Assert.Equal<int64>(int64 rowCount, asInt count.Rows.[0].[0]))
@@ -395,7 +394,7 @@ let ``Session: Close は実行中の読み取りの完了を待つ`` () =
         Assert.True(gates.ScanEntered.Wait 5000, "読み取りが始まりません")
 
         let closing = startDedicated (fun () -> session.Close())
-        Thread.Sleep 200
+        System.Threading.Thread.Sleep 200
         Assert.False(closing.IsCompleted, "Close が実行中の読み取りを待っていません")
 
         gates.ResumeScans()
@@ -417,7 +416,7 @@ let ``Session: 並行読み取りは commit 済みの一貫した snapshot を�
         let batches = 20
 
         let writer =
-            Task.Run(fun () ->
+            System.Threading.Tasks.Task.Run(fun () ->
                 for b in 1..batches do
                     let values =
                         [ 1..batchSize ]
@@ -429,14 +428,14 @@ let ``Session: 並行読み取りは commit 済みの一貫した snapshot を�
         let readers =
             [ 1..4 ]
             |> List.map (fun _ ->
-                Task.Run(fun () ->
+                System.Threading.Tasks.Task.Run(fun () ->
                     for _ in 1..20 do
                         let count = ok (session.Execute "SELECT COUNT(*) FROM t")
                         let n = asInt count.Rows.[0].[0]
 
                         Assert.True(n % int64 batchSize = 0L, sprintf "commit 途中の batch が見えています: %d 行" n)))
 
-        Task.WaitAll(Array.append [| writer |] (List.toArray readers))
+        System.Threading.Tasks.Task.WaitAll(Array.append [| writer |] (List.toArray readers))
 
         let finalCount = ok (session.Execute "SELECT COUNT(*) FROM t")
         Assert.Equal<int64>(int64 (batchSize * batches), asInt finalCount.Rows.[0].[0]))
@@ -628,7 +627,7 @@ let ``RowReader: Dispose すると Close が待たずに完了できる`` () =
         | None -> Assert.Fail "単一 SELECT が RowReader になりませんでした"
         | Some reader ->
             let closing = startDedicated (fun () -> session.Close())
-            Thread.Sleep 200
+            System.Threading.Thread.Sleep 200
             Assert.False(closing.IsCompleted, "Close が開いている RowReader を待っていません")
 
             (reader :> System.IDisposable).Dispose()
@@ -895,10 +894,11 @@ let ``Session: 並行 commit を Close して再オープンしても読める``
         let tasks =
             [|
                 for i in 1..16 do
-                    Task.Run(fun () -> session.Execute(sprintf "INSERT INTO t VALUES (%d, %d)" i i))
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        session.Execute(sprintf "INSERT INTO t VALUES (%d, %d)" i i))
             |]
 
-        Task.WaitAll(tasks |> Array.map (fun t -> t :> Task))
+        System.Threading.Tasks.Task.WaitAll(tasks |> Array.map (fun t -> t :> System.Threading.Tasks.Task))
         tasks |> Array.iter (fun t -> ok t.Result |> ignore)
         ok (session.Close())
 

@@ -117,7 +117,7 @@ Debug ビルドでも F# に `tail.` プレフィックスを出させる
 （Debug の既定は `Tailcalls=false`、Release の既定は `true`）。
 JIT は `tail.` を尊重する。
 ただし、JIT の自己再帰ループ化だけでは、相互再帰やクロージャ経由の呼び出しでスタックが残る。
-この設定により、CPS（`Planner` のサブクエリ解決など）の継続呼び出しも実際の末尾呼び出しにする。
+この設定により、CPS（`Plan` のサブクエリ解決など）の継続呼び出しも実際の末尾呼び出しにする。
 `[<TailCall>]` は構文上の末尾性を検査する属性であり、コード生成方法は切り替えない。
 
 採用した手法は次のとおり。
@@ -140,13 +140,13 @@ JIT は `tail.` を尊重する。
 - **「葉の書き換えが別の再帰を経る」式走査は `Expr.rewriteWithC`（継続を取る版）を使う**。
   `Plan` のサブクエリ解決（`resolveExprC` → `resolveLeafC` → `planSelectCWith` → …）がこれ。
   `Expr.rewriteWith` はその糖で、失敗を返す葉の書き換え（束縛・集約の読み替え）に使う。
-- **Planner のサブクエリ解決は CPS**。
+- **`Plan` のサブクエリ解決は CPS**。
   継続は名前付きの `and` グループメンバーへ hoist する
   （`[<TailCall>]` 付き関数でラムダを書くと FS3569 が出る）。
   **CPS グループの全メンバーに `: Result<'r, DbError>` の戻り型を明示する**
   （型引数 `<'r>` だけだと群内の相互参照で戻り値の型が別の推論変数 'r0 になり
   FS0043「'r と 'r0 が一致しない」で**群全体が型検査に失敗する**）。
-- **継続を値として渡す呼び出し（Planner）は、TailAudit の引数位置の判定では非末尾と判定される**。
+- **継続を値として渡す呼び出し（`Plan`）は、TailAudit の引数位置の判定では非末尾と判定される**。
   部分適用は関数値を作るだけで、実呼び出しは呼ばれた側の末尾位置なのでフレームは積まれない。
   ベースラインで追認する（TailAudit の `[lambda]` 判定と同じ保守側の扱い）。
 - **呼び出し回数の多い再帰はローカル `let rec` にせず、モジュールレベルの `let rec` へ hoist する**。
@@ -168,7 +168,7 @@ JIT は `tail.` を尊重する。
   `Compaction` のストリーミング merge が共有する。
   回帰テストは `SstScanTests` の `SstMerge: 多数のソースをまとめてマージできる`、
   `StorageEngineTests` の `StorageEngine.scanAtValues: 多数のファイルをキー昇順にマージする`、
-  `CompactionTests` の `Compaction: 多数の入力ファイルをストリーミングでマージする`。
+  `CompactionTests` の `Compaction.compact: 多数の入力ファイルをストリーミングでマージする`。
 - **`[<TailCall>]` は「その関数本体の自己再帰が全部末尾位置」のときだけ付ける**。
   1つでも外れると FS3569 になり、`TreatWarningsAsErrors` のせいでビルドエラーになる。
   構造上末尾にできないものは**付けない理由を呼び出しの直前にコメントで残す**:
@@ -193,7 +193,8 @@ JIT は `tail.` を尊重する。
     再帰は `step` の自己再帰だけなので全末尾位置になり、式の深さ・`IN` の候補数に依存せずスタックは一定
     （継続はヒープのリストに積む）。
     成功値は `[<Struct>] DbResult<'T>`（`DbOk` / `DbErr`）で返し、
-    `Eval.evalWith` / `matchesWith` / `matchesJoined` のような公開境界のラッパーだけが `Result` に戻す。
+    `Eval.evalWith` のような公開境界のラッパーだけが `Result` に戻す
+    （`Eval.matchesWithV` / `Eval.matchesJoinedV` は `DbResult` のまま返す）。
     `Result` の `Ok` は参照 DU なので、行ごとの評価で確保しない
     （[`gotchas.md`](gotchas.md) §11.75）。
   - pull 層も同じ考え方で、`Op.next` は `[<Struct>] OpStep`（`OpDone` / `OpError` / `OpRow`）を返す。

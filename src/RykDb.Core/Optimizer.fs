@@ -304,82 +304,99 @@ module internal Optimizer =
                 | _ -> hint |> Option.map (fun h -> addClamp offset h)
 
         let execIndexJoin frame left =
-            let keys = frame.Keys.Value
+            match frame.Keys with
+            | None -> err (DbError.internalError "index nested loop に結合キーがありません")
+            | Some keys ->
+                let indexName =
+                    match frame.Algorithm with
+                    | JoinAlgorithm.IndexNestedLoop indexName -> indexName
+                    | _ -> ""
 
-            let indexName =
-                match frame.Algorithm with
-                | JoinAlgorithm.IndexNestedLoop indexName -> indexName
-                | _ -> ""
-
-            let rightMask =
-                match frame.Right with
-                | Logical.Scan _ as scan ->
-                    match ctx.ScanNeeds.TryGetValue(box scan) with
-                    | true, mask -> mask
+                let rightMask =
+                    match frame.Right with
+                    | Logical.Scan _ as scan ->
+                        match ctx.ScanNeeds.TryGetValue(box scan) with
+                        | true, mask -> mask
+                        | _ -> Array.create frame.RightSchema.Columns.Length true
                     | _ -> Array.create frame.RightSchema.Columns.Length true
-                | _ -> Array.create frame.RightSchema.Columns.Length true
 
-            let lookup keyValues =
-                ExecContext.byIndexMasked ctx frame.RightName indexName keyValues 0 rightMask
+                let lookup keyValues =
+                    ExecContext.byIndexMasked ctx frame.RightName indexName keyValues 0 rightMask
 
-            match frame.Kind with
-            | JoinKind.Inner ->
-                Ops.innerJoinIndexed frame.LeftSchema left frame.LeftKeyIndices frame.RightSchema lookup keys.Residual
-            | JoinKind.Left ->
-                Ops.leftJoinIndexed frame.LeftSchema left frame.LeftKeyIndices frame.RightSchema lookup keys.Residual
+                ret (
+                    match frame.Kind with
+                    | JoinKind.Inner ->
+                        OpsJoin.innerJoinIndexed
+                            frame.LeftSchema
+                            left
+                            frame.LeftKeyIndices
+                            frame.RightSchema
+                            lookup
+                            keys.Residual
+                    | JoinKind.Left ->
+                        OpsJoin.leftJoinIndexed
+                            frame.LeftSchema
+                            left
+                            frame.LeftKeyIndices
+                            frame.RightSchema
+                            lookup
+                            keys.Residual
+                )
 
         let execJoin frame left right =
             match frame.Algorithm with
             | JoinAlgorithm.NestedLoop ->
                 match frame.Kind with
-                | JoinKind.Inner -> Ops.innerJoin frame.LeftSchema left frame.RightSchema right frame.On
-                | JoinKind.Left -> Ops.leftJoin frame.LeftSchema left frame.RightSchema right frame.On
+                | JoinKind.Inner -> OpsJoin.innerJoin frame.LeftSchema left frame.RightSchema right frame.On
+                | JoinKind.Left -> OpsJoin.leftJoin frame.LeftSchema left frame.RightSchema right frame.On
             | JoinAlgorithm.HashJoin ->
-                let keys = frame.Keys.Value
-
-                match frame.Kind with
-                | JoinKind.Inner ->
-                    Ops.innerJoinHash
-                        frame.LeftSchema
-                        left
-                        keys.LeftIndices
-                        frame.RightSchema
-                        right
-                        keys.RightIndices
-                        keys.Residual
-                | JoinKind.Left ->
-                    Ops.leftJoinHash
-                        frame.LeftSchema
-                        left
-                        keys.LeftIndices
-                        frame.RightSchema
-                        right
-                        keys.RightIndices
-                        keys.Residual
+                match frame.Keys with
+                | None -> err (DbError.internalError "ハッシュ結合に結合キーがありません")
+                | Some keys ->
+                    match frame.Kind with
+                    | JoinKind.Inner ->
+                        OpsJoin.innerJoinHash
+                            frame.LeftSchema
+                            left
+                            keys.LeftIndices
+                            frame.RightSchema
+                            right
+                            keys.RightIndices
+                            keys.Residual
+                    | JoinKind.Left ->
+                        OpsJoin.leftJoinHash
+                            frame.LeftSchema
+                            left
+                            keys.LeftIndices
+                            frame.RightSchema
+                            right
+                            keys.RightIndices
+                            keys.Residual
             | JoinAlgorithm.IndexNestedLoop _ ->
                 DbError.internalError "index nested loop は JoinIndexLeftFrame で実行します" |> err
             | JoinAlgorithm.MergeJoin ->
-                let keys = frame.Keys.Value
-
-                match frame.Kind with
-                | JoinKind.Inner ->
-                    Ops.innerJoinMerge
-                        frame.LeftSchema
-                        left
-                        keys.LeftIndices
-                        frame.RightSchema
-                        right
-                        keys.RightIndices
-                        keys.Residual
-                | JoinKind.Left ->
-                    Ops.leftJoinMerge
-                        frame.LeftSchema
-                        left
-                        keys.LeftIndices
-                        frame.RightSchema
-                        right
-                        keys.RightIndices
-                        keys.Residual
+                match frame.Keys with
+                | None -> err (DbError.internalError "マージ結合に結合キーがありません")
+                | Some keys ->
+                    match frame.Kind with
+                    | JoinKind.Inner ->
+                        OpsJoin.innerJoinMerge
+                            frame.LeftSchema
+                            left
+                            keys.LeftIndices
+                            frame.RightSchema
+                            right
+                            keys.RightIndices
+                            keys.Residual
+                    | JoinKind.Left ->
+                        OpsJoin.leftJoinMerge
+                            frame.LeftSchema
+                            left
+                            keys.LeftIndices
+                            frame.RightSchema
+                            right
+                            keys.RightIndices
+                            keys.Residual
 
         match step with
         | EvalNode(node, inSchema, hint) ->
@@ -447,7 +464,10 @@ module internal Optimizer =
                     run ctx rest (ApplyOp limited)
                 | ProjectFrame(items, childSchema, groupBy) ->
                     run ctx rest (ApplyOp(Ops.project childSchema groupBy items op))
-                | JoinIndexLeftFrame frame -> run ctx rest (ApplyOp(execIndexJoin frame op))
+                | JoinIndexLeftFrame frame ->
+                    match execIndexJoin frame op with
+                    | Error e -> err e
+                    | Ok joined -> run ctx rest (ApplyOp joined)
                 | JoinRightFrame frame ->
                     run ctx (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
                 | JoinApplyFrame(frame, leftOp) ->

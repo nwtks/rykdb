@@ -321,22 +321,22 @@ module internal RowStore =
             | Ok stale ->
                 match takeKeys ClearChunkEntries [] stale with
                 | Error e -> err e
-                | Ok([], _) -> ret (currentStore, currentMgr)
                 | Ok(chunk, _) ->
-                    let lastKey = List.last chunk
+                    match List.tryLast chunk with
+                    | None -> ret (currentStore, currentMgr)
+                    | Some lastKey ->
+                        let mgr0, txn =
+                            TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) currentMgr
 
-                    let mgr0, txn =
-                        TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) currentMgr
-
-                    match foldOk (fun t key -> ret (Transaction.remove space key t)) txn chunk with
-                    | Error e -> err e
-                    | Ok txn2 ->
-                        match TransactionManager.commit txn2 mgr0 with
+                        match foldOk (fun t key -> ret (Transaction.remove space key t)) txn chunk with
                         | Error e -> err e
-                        | Ok(mgr1, _, batches) ->
-                            match writeBatches batches currentStore with
+                        | Ok txn2 ->
+                            match TransactionManager.commit txn2 mgr0 with
                             | Error e -> err e
-                            | Ok store1 -> loop (store1, mgr1) lastKey
+                            | Ok(mgr1, _, batches) ->
+                                match writeBatches batches currentStore with
+                                | Error e -> err e
+                                | Ok store1 -> loop (store1, mgr1) lastKey
 
         loop (store, mgr) [||]
 

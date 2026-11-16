@@ -1302,7 +1302,7 @@ db> .rollback
 ### 表示形式
 
 字句・構文解析器が返す文法エラーには行番号が付く。
-Planner / ExecContext / Eval が返す `SyntaxError`
+PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 （例: FROM なしの `*`、集約と `SELECT *` の併用、`LIMIT` の相関サブクエリ）
 には付かないことがある。
 

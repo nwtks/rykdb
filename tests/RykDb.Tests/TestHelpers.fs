@@ -11,17 +11,13 @@ open RykDb.Core
 let entry (e: Entry option) =
     match e with
     | Some v -> v
-    | None ->
-        Assert.Fail "エントリが見つかりません"
-        Unchecked.defaultof<Entry>
+    | None -> failwith "エントリが見つかりません"
 
 /// Result が Ok でなければテストを落とす。Err なら DbError を表示する。
 let ok (r: Result<'T, DbError>) : 'T =
     match r with
     | Ok v -> v
-    | Error e ->
-        Assert.Fail(sprintf "Result が Error でした: %s" (DbError.toDisplayString e))
-        Unchecked.defaultof<'T>
+    | Error e -> failwithf "Result が Error でした: %s" (DbError.toDisplayString e)
 
 /// Result の Ok 値を取り出す。Err なら 0 を返す（数値比較の補助など）。
 let okOr defaultValue (r: Result<'T, DbError>) : 'T =
@@ -33,9 +29,7 @@ let okOr defaultValue (r: Result<'T, DbError>) : 'T =
 let okV (r: DbResult<'T>) : 'T =
     match r with
     | DbOk v -> v
-    | DbErr e ->
-        Assert.Fail(sprintf "DbResult が Error でした: %s" (DbError.toDisplayString e))
-        Unchecked.defaultof<'T>
+    | DbErr e -> failwithf "DbResult が Error でした: %s" (DbError.toDisplayString e)
 
 /// DbResult が Error であることを確認する。
 let expectErrorV message (r: DbResult<'T>) =
@@ -250,6 +244,14 @@ let expectErrorKind (kind: ErrorKind) (message: string) (r: Result<'a, DbError>)
     | Error e -> Assert.Equal<ErrorKind>(kind, e.Kind)
     | Ok _ -> Assert.Fail message
 
+/// 「<ラベル>: <実際の値（%A）>」でテストを落とす。
+/// <remarks>
+/// variant 不一致・想定外の形の定型（`| other -> failActual "X ではない" other`）。
+/// 実際の値を必ず表示するので、原因の切り分けに失敗メッセージだけが使える。
+/// </remarks>
+let failActual (label: string) (actual: 'a) =
+    Assert.Fail(sprintf "%s: %A" label actual)
+
 // ---------------------------------------------------------------------------
 // スキーマを作るときの列定義ビルダー（各ファイルに書くとコピペになるため）
 // ---------------------------------------------------------------------------
@@ -332,17 +334,53 @@ let ordersSchema: TableSchema =
 let asInt (v: SqlValue) =
     match v with
     | SqlValue.Int n -> n
-    | _ ->
-        Assert.Fail(sprintf "INTEGER ではありません: %A" v)
-        0L
+    | _ -> failwithf "INTEGER ではありません: %A" v
 
 /// TEXT でなければテストを落とす。
 let asText (v: SqlValue) =
     match v with
     | SqlValue.Text s -> s
-    | _ ->
-        Assert.Fail(sprintf "TEXT ではありません: %A" v)
-        ""
+    | _ -> failwithf "TEXT ではありません: %A" v
+
+// ---------------------------------------------------------------------------
+// Parser テストの共通ヘルパー（ParserTests / ParserExprTests で同一実装が
+// 2 ファイル分あったものを集約。失敗は failwith 系で総和化する）
+// ---------------------------------------------------------------------------
+
+/// SQL テキストを 1 文として解析する。複数文はエラー。
+let parseStatement (sql: string) =
+    Parser.parseStatements sql
+    >>= fun stmts ->
+        match stmts with
+        | [ s ] -> ret s
+        | [] -> err (DbError.create ErrorKind.SyntaxError "文がありません")
+        | _ -> err (DbError.create ErrorKind.SyntaxError "複数の文が渡されました（1 文ずつ実行してください）")
+
+/// SQL を 1 文解析し、失敗したらテストを落とす。
+let parseOneOk (sql: string) : Statement =
+    match parseStatement sql with
+    | Ok s -> s
+    | Error e -> failwithf "解析に失敗: %s\nSQL: %s" (DbError.toDisplayString e) sql
+
+/// SQL を 1 文解析し、variant から値を抜き出せなければテストを落とす。
+let expectVariant (tag: string) (pick: Statement -> 'T option) (sql: string) : 'T =
+    match pick (parseOneOk sql) with
+    | Some v -> v
+    | None -> failwithf "%s ではない: %s" tag sql
+
+let parseSelectOk (sql: string) : SelectStatement =
+    expectVariant
+        "SELECT"
+        (function
+        | Statement.Select s -> Some s
+        | _ -> None)
+        sql
+
+/// SELECT 文の WHERE 式を取り出す（無い・SELECT でないならテストを落とす）。
+let whereOf (sql: string) : Expr =
+    match (parseSelectOk sql).Where with
+    | Some e -> e
+    | None -> failwithf "WHERE 句がありません: %s" sql
 
 /// テスト用に SQL を 1文へ解析して `Database.Execute` へ渡す。
 /// 複数文は公開 API の `Session.Execute` で扱う。

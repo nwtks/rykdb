@@ -4,7 +4,6 @@
 
 module RykDb.WriterTests
 
-open System
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -38,7 +37,7 @@ let ``Writer: bool / readBool の往復`` () =
 
 [<Fact>]
 let ``Writer: varint の往復`` () =
-    for v in [ 0UL; 1UL; 127UL; 128UL; 16383UL; 16384UL; UInt64.MaxValue ] do
+    for v in [ 0UL; 1UL; 127UL; 128UL; 16383UL; 16384UL; System.UInt64.MaxValue ] do
         let w = Writer.Empty |> Writer.varint v |> Writer.toArray
         let c = Cursor.create w
         let got, c2 = ok (Reader.readVarint c)

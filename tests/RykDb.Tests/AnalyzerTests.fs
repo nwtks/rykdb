@@ -65,7 +65,7 @@ let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば Inde
     | JoinAlgorithm.IndexNestedLoop name, _, Some lefts ->
         Assert.Equal<string>("ix_r_a", name)
         Assert.Equal<int array>([| 0 |], lefts)
-    | other -> Assert.Fail(sprintf "IndexNestedLoop ではありません: %A" other)
+    | other -> failActual "IndexNestedLoop ではありません" other
 
     // 左が大きい（Limit なし）なら、両方が主キー `a` の走査なのでマージ結合
     match
@@ -81,7 +81,7 @@ let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば Inde
     | JoinAlgorithm.MergeJoin, Some keys, _ ->
         Assert.Equal<int array>([| 0 |], keys.LeftIndices)
         Assert.Equal<int array>([| 0 |], keys.RightIndices)
-    | other -> Assert.Fail(sprintf "MergeJoin ではありません: %A" other)
+    | other -> failActual "MergeJoin ではありません" other
 
     // 非等値なら入れ子ループ
     let nonEqui =
@@ -93,7 +93,7 @@ let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば Inde
 
     match Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema (Some rightTable) leftSmall rightScan nonEqui with
     | JoinAlgorithm.NestedLoop, _, _ -> ()
-    | other -> Assert.Fail(sprintf "NestedLoop ではありません: %A" other)
+    | other -> failActual "NestedLoop ではありません" other
 
 [<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致するときだけマージ結合`` () =
@@ -147,7 +147,7 @@ let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致�
     | JoinAlgorithm.MergeJoin, Some keys, _ ->
         Assert.Equal<int array>([| 0; 1 |], keys.LeftIndices)
         Assert.Equal<int array>([| 0; 1 |], keys.RightIndices)
-    | other -> Assert.Fail(sprintf "MergeJoin ではありません: %A" other)
+    | other -> failActual "MergeJoin ではありません" other
 
     // 主キーの 2 列目だけの等値は走査順の先頭と一致しないのでハッシュ結合
     match
@@ -161,7 +161,7 @@ let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致�
             (eq "l" "b" "r" "b")
     with
     | JoinAlgorithm.HashJoin, _, _ -> ()
-    | other -> Assert.Fail(sprintf "HashJoin ではありません: %A" other)
+    | other -> failActual "HashJoin ではありません" other
 
     // 右の主キー順が (b, a) だとキー順が揃わないのでハッシュ結合
     let rightReversed =
@@ -184,7 +184,7 @@ let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致�
 
     match planReversed with
     | JoinAlgorithm.HashJoin, _, _ -> ()
-    | other -> Assert.Fail(sprintf "HashJoin ではありません: %A" other)
+    | other -> failActual "HashJoin ではありません" other
 
 [<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`` () =
@@ -247,7 +247,7 @@ let ``Analyzer.chooseScanMethod: 等価条件があれば主キー検索にす�
         | ScanMethod.PkLookup values ->
             Assert.Equal<int>(1, values.Length)
             Assert.Equal<int64>(1L, asInt values.[0])
-        | _ -> Assert.Fail(sprintf "主キー検索になっていません: %A" m))
+        | _ -> failActual "主キー検索になっていません" m)
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: 索引があれば索引検索にする`` () =
@@ -262,7 +262,7 @@ let ``Analyzer.chooseScanMethod: 索引があれば索引検索にする`` () =
         | ScanMethod.IndexLookup(name, values) ->
             Assert.Equal<string>("ix_people_age", name)
             Assert.Equal<int64>(30L, asInt values.[0])
-        | _ -> Assert.Fail(sprintf "索引検索になっていません: %A" m))
+        | _ -> failActual "索引検索になっていません" m)
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: AND の奥と左右対称の等価条件を探せる`` () =
@@ -274,14 +274,14 @@ let ``Analyzer.chooseScanMethod: AND の奥と左右対称の等価条件を探�
 
         match ok (Analyzer.chooseScanMethod b Catalog.Empty [ first; second ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(7L, asInt values.[0])
-        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
+        | m -> failActual "PkLookup ではない" m
 
         // 値 = 列 の順（左右対称）でも探せる
         let reversed = Expr.Binary(BinaryOp.Eq, Expr.Literal(Literal.Int 8L), pCol "id")
 
         match ok (Analyzer.chooseScanMethod b Catalog.Empty [ reversed ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(8L, asInt values.[0])
-        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m))
+        | m -> failActual "PkLookup ではない" m)
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: 1 つの conjunct 内の AND も掘れる`` () =
@@ -298,7 +298,7 @@ let ``Analyzer.chooseScanMethod: 1 つの conjunct 内の AND も掘れる`` () 
 
         match ok (Analyzer.chooseScanMethod b Catalog.Empty [ leftHit ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(9L, asInt values.[0])
-        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
+        | m -> failActual "PkLookup ではない" m
 
         // 左の枝では見つからず右で見つかる（search の None → 右の経路）
         let rightHit =
@@ -310,7 +310,7 @@ let ``Analyzer.chooseScanMethod: 1 つの conjunct 内の AND も掘れる`` () 
 
         match ok (Analyzer.chooseScanMethod b Catalog.Empty [ rightHit ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(10L, asInt values.[0])
-        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m))
+        | m -> failActual "PkLookup ではない" m)
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: 負のリテラルは等値条件に使える`` () =
@@ -323,7 +323,7 @@ let ``Analyzer.chooseScanMethod: 負のリテラルは等値条件に使える``
 
         match ok (Analyzer.chooseScanMethod b Catalog.Empty [ negInt ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(-5L, asInt values.[0])
-        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
+        | m -> failActual "PkLookup ではない" m
 
         // 実数の単項マイナスも定数として解釈される（索引が無いので結果は全走査）
         let negReal =
@@ -375,17 +375,17 @@ let ``Analyzer.chooseScanMethod: 複合主キーは全列一致のときだけ P
             Assert.Equal<int>(2, values.Length)
             Assert.Equal<int64>(1L, asInt values.[0])
             Assert.Equal<int64>(2L, asInt values.[1])
-        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m)
+        | m -> failActual "PkLookup ではない" m
 
         // 部分一致は全走査
         match ok (Analyzer.chooseScanMethod b Catalog.Empty [ eq "a" (Literal.Int 1L) ]) with
         | ScanMethod.SeqScan -> ()
-        | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m)
+        | m -> failActual "SeqScan ではない" m
 
         // キー列の型と違うリテラルは全走査（比較時に型エラーにする）
         match ok (Analyzer.chooseScanMethod b Catalog.Empty [ eq "a" (Literal.String "1") ]) with
         | ScanMethod.SeqScan -> ()
-        | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m))
+        | m -> failActual "SeqScan ではない" m)
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: 複合索引は前置等値 + 範囲で IndexRangeScan`` () =
@@ -430,14 +430,14 @@ let ``Analyzer.chooseScanMethod: 複合索引は前置等値 + 範囲で IndexRa
             Assert.Equal<int64>(1L, asInt lower.[0])
             Assert.Equal<int64>(2L, asInt lower.[1])
             Assert.True upper.IsNone
-        | m -> Assert.Fail(sprintf "IndexRangeScan ではない: %A" m)
+        | m -> failActual "IndexRangeScan ではない" m
 
         // 前置 a の等値が無ければ全走査
         let onlyRange = Expr.Binary(BinaryOp.Gt, colRef "b", Expr.Literal(Literal.Int 2L))
 
         match ok (Analyzer.chooseScanMethod b catalog [ onlyRange ]) with
         | ScanMethod.SeqScan -> ()
-        | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m)
+        | m -> failActual "SeqScan ではない" m
 
         // 全列等値 → IndexLookup（複合索引でも使う）
         let bothEq =
@@ -452,7 +452,7 @@ let ``Analyzer.chooseScanMethod: 複合索引は前置等値 + 範囲で IndexRa
             Assert.Equal<int>(2, values.Length)
             Assert.Equal<int64>(1L, asInt values.[0])
             Assert.Equal<int64>(2L, asInt values.[1])
-        | m -> Assert.Fail(sprintf "IndexLookup ではない: %A" m)
+        | m -> failActual "IndexLookup ではない" m
 
         // 前置 1列だけの等値 → IndexLookup（全列でなくても先頭から連続していれば使う）
         let onlyPrefix = Expr.Binary(BinaryOp.Eq, colRef "a", Expr.Literal(Literal.Int 1L))
@@ -462,14 +462,14 @@ let ``Analyzer.chooseScanMethod: 複合索引は前置等値 + 範囲で IndexRa
             Assert.Equal<string>("ix_pair", name)
             Assert.Equal<int>(1, values.Length)
             Assert.Equal<int64>(1L, asInt values.[0])
-        | m -> Assert.Fail(sprintf "IndexLookup ではない: %A" m)
+        | m -> failActual "IndexLookup ではない" m
 
         // 先頭でない列だけの等値は索引の前置にならない → SeqScan
         let onlySecond = Expr.Binary(BinaryOp.Eq, colRef "b", Expr.Literal(Literal.Int 2L))
 
         match ok (Analyzer.chooseScanMethod b catalog [ onlySecond ]) with
         | ScanMethod.SeqScan -> ()
-        | m -> Assert.Fail(sprintf "SeqScan ではない: %A" m))
+        | m -> failActual "SeqScan ではない" m)
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: LIKE 'prefix%' は索引の範囲走査にする`` () =
@@ -509,7 +509,7 @@ let ``Analyzer.chooseScanMethod: LIKE 'prefix%' は索引の範囲走査にす�
             Assert.Equal<string>("ab", asText lower.[0])
             Assert.True upper.IsSome
             Assert.Equal<string>("ac", asText upper.Value.[0])
-        | m -> Assert.Fail(sprintf "IndexRangeScan ではない: %A" m))
+        | m -> failActual "IndexRangeScan ではない" m)
 
 [<Fact>]
 let ``Analyzer.chooseScanMethod: 等価条件があっても索引が無ければ全走査`` () =
@@ -547,4 +547,4 @@ let ``Analyzer.chooseScanMethod: 20000段の AND を chooseScanMethod しても�
 
         match ok (Analyzer.chooseScanMethod b Catalog.Empty [ deep ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(42L, asInt values.[0])
-        | m -> Assert.Fail(sprintf "PkLookup ではない: %A" m))
+        | m -> failActual "PkLookup ではない" m)

@@ -4,7 +4,6 @@
 
 module RykDb.StorageEngineTests
 
-open System.IO
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -26,7 +25,7 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
 /// （FooterSize = 84、metadata checksum は +76、Footer checksum は +80）。
 let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array -> unit) =
     let path = FileMetaData.path dir fileNumber
-    let data = File.ReadAllBytes path
+    let data = System.IO.File.ReadAllBytes path
     let footerStart = data.Length - Sstable.FooterSize
 
     let readI64 offset =
@@ -52,7 +51,7 @@ let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array ->
 
     writeU32 (Sstable.FooterSize - 4) footerChecksum
 
-    File.WriteAllBytes(path, data)
+    System.IO.File.WriteAllBytes(path, data)
 
 /// キー 1..2 のファイル（10）とキー 3..4 のファイル（11）を作り、11 のマジックを
 /// 壊す（`Sstable.openPartial` が失敗する＝開封時に検出される壊れたファイル）。
@@ -256,7 +255,7 @@ let ``StorageEngine.scanAtMasked: 欠落ファイルは必要になった時点�
     withDir "se-missing-open" (fun dir ->
         withEngine dir (fun engine ->
             let f1, f2 = twoFilesWithBrokenSecond dir
-            File.Delete(FileMetaData.path dir 11L)
+            System.IO.File.Delete(FileMetaData.path dir 11L)
 
             let engine =
                 { engine with
@@ -291,10 +290,10 @@ let ``StorageEngine.getAtMasked / scanAtMasked: 必要なブロックだけを�
             let path = FileMetaData.path dir 10L
             let reader = ok (Sstable.openPartial path)
             let block = reader.Index.[1]
-            let data = File.ReadAllBytes path
+            let data = System.IO.File.ReadAllBytes path
             data.[block.Offset + 2] <- data.[block.Offset + 2] ^^^ 0xFFuy
-            File.WriteAllBytes(path, data)
-            File.SetLastWriteTimeUtc(path, System.DateTime.UtcNow.AddSeconds 1.0)
+            System.IO.File.WriteAllBytes(path, data)
+            System.IO.File.SetLastWriteTimeUtc(path, System.DateTime.UtcNow.AddSeconds 1.0)
 
             let engine =
                 { engine with
@@ -359,9 +358,9 @@ let ``StorageEngine.maybeFlush: 4 本目の L0 で compactOnce が L0→L1 compa
             Assert.Equal(0, (Version.filesAt 0 after.Version).Length)
             Assert.True((Version.filesAt 1 after.Version).Length > 0)
             // 元の 3 ファイルはディスクから削除される
-            Assert.False(File.Exists(FileMetaData.path dir 10L))
-            Assert.False(File.Exists(FileMetaData.path dir 11L))
-            Assert.False(File.Exists(FileMetaData.path dir 12L))))
+            Assert.False(System.IO.File.Exists(FileMetaData.path dir 10L))
+            Assert.False(System.IO.File.Exists(FileMetaData.path dir 11L))
+            Assert.False(System.IO.File.Exists(FileMetaData.path dir 12L))))
 
 [<Fact>]
 let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engine を返す`` () =
@@ -372,9 +371,9 @@ let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engin
             let f3 = mkSst dir 12L 0 [ Entry.put (intKey 3) 3UL (intRow 3) ]
             // チェックサムを合わせずに 1 バイト壊す
             let path = FileMetaData.path dir 11L
-            let data = File.ReadAllBytes path
+            let data = System.IO.File.ReadAllBytes path
             data.[0] <- data.[0] ^^^ 0xFFuy
-            File.WriteAllBytes(path, data)
+            System.IO.File.WriteAllBytes(path, data)
 
             let version =
                 Version.Empty |> Version.addFile f1 |> Version.addFile f2 |> Version.addFile f3
@@ -397,9 +396,9 @@ let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engin
             // compaction の失敗は診断として残る
             Assert.True after.LastCompactionError.IsSome
             // 入力ファイルは削除されない
-            Assert.True(File.Exists(FileMetaData.path dir 10L))
-            Assert.True(File.Exists(FileMetaData.path dir 11L))
-            Assert.True(File.Exists(FileMetaData.path dir 12L))))
+            Assert.True(System.IO.File.Exists(FileMetaData.path dir 10L))
+            Assert.True(System.IO.File.Exists(FileMetaData.path dir 11L))
+            Assert.True(System.IO.File.Exists(FileMetaData.path dir 12L))))
 
 [<Fact>]
 let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush する`` () =
@@ -408,7 +407,7 @@ let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush �
         let disk = DiskStorageEngine { engine with MemLimitBytes = 1 } :> IStorageEngine
         let disk = ok (disk.WriteBatch [| Entry.put (intKey 1) 1UL (intRow 1) |])
         let disk = ok (disk.MaybeFlush())
-        Assert.NotEmpty(Directory.GetFiles(dir, "*" + FileMetaData.SstExtension))
+        Assert.NotEmpty(System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension))
         Assert.True((ok (disk.GetAtMasked None (intKey 1) [||])).IsSome))
 
 [<Fact>]
@@ -469,9 +468,11 @@ let ``StorageEngine.openDatabaseWith: 孤児の SSTable は削除せず退避す
     withDir "re5" (fun dir ->
         withEngine dir (fun _ -> ())
         // MANIFEST に無いファイルを 1 個置いてから開く
-        File.WriteAllBytes(Path.Combine(dir, "000999.sst"), [| 1uy; 2uy; 3uy |])
+        System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "000999.sst"), [| 1uy; 2uy; 3uy |])
 
         withEngine dir (fun _ ->
             // 消さずに .orphans へ移す（manifest の読み落としで消すと復元できない）
-            Assert.False(File.Exists(Path.Combine(dir, "000999.sst")))
-            Assert.Single(Directory.GetFiles(Path.Combine(dir, ".orphans"))) |> ignore))
+            Assert.False(System.IO.File.Exists(System.IO.Path.Combine(dir, "000999.sst")))
+
+            Assert.Single(System.IO.Directory.GetFiles(System.IO.Path.Combine(dir, ".orphans")))
+            |> ignore))

@@ -196,18 +196,14 @@ let ``TableSchema.validateRow: 列数不一致はエラー`` () =
     let schema = peopleSchema
     let row = [| SqlValue.Int 7L |]
 
-    match TableSchema.validateRow schema row with
-    | Error _ -> ()
-    | Ok _ -> Assert.Fail "列数不一致はエラーになるべき"
+    expectError "列数不一致はエラーになるべき" (TableSchema.validateRow schema row)
 
 [<Fact>]
 let ``TableSchema.validateRow: NOT NULL 違反はエラー`` () =
     let schema = peopleSchema
     let row = [| SqlValue.Null; SqlValue.Text "alice"; SqlValue.Int 20L |]
 
-    match TableSchema.validateRow schema row with
-    | Error _ -> ()
-    | Ok _ -> Assert.Fail "NOT NULL 違反はエラーになるべき"
+    expectError "NOT NULL 違反はエラーになるべき" (TableSchema.validateRow schema row)
 
 [<Fact>]
 let ``TableSchema.primaryKeyOf: 主キー列を取り出す`` () =

@@ -154,7 +154,7 @@ let ``Server: loopback で SQL が通る`` () =
 
         match client.Send "INSERT INTO t VALUES (1, 'a'), (2, 'b')" with
         | Affected 2 -> ()
-        | other -> Assert.Fail(sprintf "INSERT の影響行数が一致しません: %A" other)
+        | other -> failActual "INSERT の影響行数が一致しません" other
 
         let cols, rows = okRows (client.Send "SELECT id, name FROM t ORDER BY id")
         Assert.Equal<string list>([ "id"; "name" ], cols)
@@ -167,7 +167,7 @@ let ``Server: loopback で SQL が通る`` () =
         // エラーは ERR で返る（HALT しない）
         match client.Send "SELECT * FROM nope" with
         | Failure m -> Assert.Contains("nope", m)
-        | other -> Assert.Fail(sprintf "ERR を期待しましたが: %A" other)
+        | other -> failActual "ERR を期待しましたが" other
 
         // ping
         let cols, _ = okRows (client.Send ".ping")
@@ -397,7 +397,7 @@ let ``Client: 不正な短い OK は Failure`` () =
 
         match c.Send "x" with
         | Failure _ -> ()
-        | other -> Assert.Fail(sprintf "Failure ではない: %A" other))
+        | other -> failActual "Failure ではない" other)
 
 [<Fact>]
 let ``Client: 不正な件数は Failure`` () =
@@ -406,7 +406,7 @@ let ``Client: 不正な件数は Failure`` () =
 
         match c.Send "x" with
         | Failure _ -> ()
-        | other -> Assert.Fail(sprintf "Failure ではない: %A" other))
+        | other -> failActual "Failure ではない" other)
 
 [<Fact>]
 let ``Client: 応答の列と行を読む`` () =
@@ -416,7 +416,7 @@ let ``Client: 応答の列と行を読む`` () =
 
         match c.Send "x" with
         | Rows([ "c1"; "c2" ], [ "1,2"; "3,4" ]) -> ()
-        | other -> Assert.Fail(sprintf "行列が一致しない: %A" other))
+        | other -> failActual "行列が一致しない" other)
 
 [<Fact>]
 let ``Client: Send は STREAM を Rows に materialize する`` () =
@@ -425,7 +425,7 @@ let ``Client: Send は STREAM を Rows に materialize する`` () =
 
         match c.Send "x" with
         | Rows([ "c1"; "c2" ], [ "1,2"; "3,4" ]) -> ()
-        | other -> Assert.Fail(sprintf "STREAM の materialize が一致しません: %A" other))
+        | other -> failActual "STREAM の materialize が一致しません" other)
 
 [<Fact>]
 let ``Client: 接続が RST で切れたら Halt`` () =
@@ -446,7 +446,7 @@ let ``Client: 接続が RST で切れたら Halt`` () =
 
         match c.Send "x" with
         | Halt -> ()
-        | other -> Assert.Fail(sprintf "Halt ではない: %A" other)
+        | other -> failActual "Halt ではない" other
     finally
         listener.Stop()
         task.Wait 5000 |> ignore
@@ -740,7 +740,7 @@ let ``Server: 接続間で write-write 競合を検出する`` () =
 
         match clientB.Send "COMMIT" with
         | Failure m -> Assert.Contains("競合", m)
-        | other -> Assert.Fail(sprintf "競合エラーを期待しましたが: %A" other)
+        | other -> failActual "競合エラーを期待しましたが" other
 
         okRows (clientB.Send "ROLLBACK") |> ignore
 
@@ -759,7 +759,7 @@ let ``Server: transaction 中の DDL は他接続で ConflictError になる`` (
 
         match clientB.Send "CREATE INDEX ix ON t (id)" with
         | Failure m -> Assert.Contains("transaction", m)
-        | other -> Assert.Fail(sprintf "ConflictError を期待しましたが: %A" other)
+        | other -> failActual "ConflictError を期待しましたが" other
 
         okRows (clientA.Send "COMMIT") |> ignore
 
@@ -862,7 +862,7 @@ let ``Server: Client.SendStream は行を蓄積せずに受け取る`` () =
 
         match client.SendStream("SELECT id, v FROM t ORDER BY id", rows.Add) with
         | Streamed([ "id"; "v" ], 2) -> ()
-        | other -> Assert.Fail(sprintf "STREAM の結果が一致しません: %A" other)
+        | other -> failActual "STREAM の結果が一致しません" other
 
         Assert.Equal<string list>([ "1,'a'"; "2,'b'" ], List.ofSeq rows)
 
@@ -875,7 +875,7 @@ let ``Server: Client.SendStream は行を蓄積せずに受け取る`` () =
 
         match client.SendStream("INSERT INTO t VALUES (3, 'c')", fallbackRows.Add) with
         | Affected 1 -> ()
-        | other -> Assert.Fail(sprintf "OK フォールバックの結果が一致しません: %A" other)
+        | other -> failActual "OK フォールバックの結果が一致しません" other
 
         Assert.Empty fallbackRows)
 
@@ -895,7 +895,7 @@ let ``Client: SendStream は STREAM・OK・途中 ERR を読む`` () =
 
             match c.SendStream("STREAM", rows.Add) with
             | Streamed([ "c1"; "c2" ], 2) -> ()
-            | other -> Assert.Fail(sprintf "STREAM の結果が一致しません: %A" other)
+            | other -> failActual "STREAM の結果が一致しません" other
 
             Assert.Equal<string list>([ "1,2"; "3,4" ], List.ofSeq rows)
 
@@ -903,7 +903,7 @@ let ``Client: SendStream は STREAM・OK・途中 ERR を読む`` () =
 
             match c.SendStream("FALLBACK", fallbackRows.Add) with
             | Streamed([ "c" ], 1) -> ()
-            | other -> Assert.Fail(sprintf "OK フォールバックの結果が一致しません: %A" other)
+            | other -> failActual "OK フォールバックの結果が一致しません" other
 
             Assert.Equal<string list>([ "1" ], List.ofSeq fallbackRows)
 
@@ -911,7 +911,7 @@ let ``Client: SendStream は STREAM・OK・途中 ERR を読む`` () =
 
             match c.SendStream("ERROR", partialRows.Add) with
             | Failure m -> Assert.Equal("boom", m)
-            | other -> Assert.Fail(sprintf "途中の ERR が Failure ではありません: %A" other)
+            | other -> failActual "途中の ERR が Failure ではありません" other
 
             Assert.Equal<string list>([ "1" ], List.ofSeq partialRows))
 
@@ -931,14 +931,14 @@ let ``Server: .stream は SessionOptions の結果上限を適用しない`` () 
         // 通常の SELECT は上限で失敗する。
         match client.Send "SELECT id FROM t ORDER BY id" with
         | Failure m -> Assert.Contains("上限", m)
-        | other -> Assert.Fail(sprintf "通常 SELECT が上限エラーになりません: %A" other)
+        | other -> failActual "通常 SELECT が上限エラーになりません" other
 
         // .stream は materialize しないので 3 行すべて読める。
         let rows = ResizeArray<string>()
 
         match client.SendStream("SELECT id FROM t ORDER BY id", rows.Add) with
         | Streamed([ "id" ], 3) -> ()
-        | other -> Assert.Fail(sprintf "STREAM の結果が一致しません: %A" other)
+        | other -> failActual "STREAM の結果が一致しません" other
 
         Assert.Equal<string list>([ "1"; "2"; "3" ], List.ofSeq rows))
 
@@ -950,7 +950,7 @@ let ``Server: STREAM の途中エラーは ERR を返し接続を維持する`` 
 
         match setup.Send "INSERT INTO t VALUES (1), (2), (3)" with
         | Affected 3 -> ()
-        | other -> Assert.Fail(sprintf "INSERT の影響行数が一致しません: %A" other)
+        | other -> failActual "INSERT の影響行数が一致しません" other
 
         use raw = new TcpClient("127.0.0.1", port)
         raw.ReceiveTimeout <- 10000
@@ -1003,13 +1003,13 @@ let ``Server: STREAM 中に切断してもサーバは次の接続を受け付�
 
         match client.Send ".ping" with
         | Rows([ "pong" ], []) -> ()
-        | other -> Assert.Fail(sprintf "ping が一致しません: %A" other)
+        | other -> failActual "ping が一致しません" other
 
         let rows = ResizeArray<string>()
 
         match client.SendStream("SELECT id FROM t WHERE id <= 3 ORDER BY id", rows.Add) with
         | Streamed([ "id" ], 3) -> ()
-        | other -> Assert.Fail(sprintf "再 STREAM の結果が一致しません: %A" other)
+        | other -> failActual "再 STREAM の結果が一致しません" other
 
         Assert.Equal<string list>([ "1"; "2"; "3" ], List.ofSeq rows))
 
@@ -1021,7 +1021,7 @@ let ``Server: transaction 中の .stream SELECT は OK にフォールバック�
 
         match setup.Send "INSERT INTO t VALUES (1), (2)" with
         | Affected 2 -> ()
-        | other -> Assert.Fail(sprintf "INSERT の影響行数が一致しません: %A" other)
+        | other -> failActual "INSERT の影響行数が一致しません" other
 
         use raw = new TcpClient("127.0.0.1", port)
         raw.ReceiveTimeout <- 10000

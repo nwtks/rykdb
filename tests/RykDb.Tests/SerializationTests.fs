@@ -4,7 +4,6 @@
 
 module RykDb.SerializationTests
 
-open System
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -22,7 +21,7 @@ let ``Reader: 10 バイトを超える varint は CorruptionError`` () =
 
 [<Fact>]
 let ``Reader: Int32.MaxValue を超える長さ指定は CorruptionError`` () =
-    let bytes = Writer.build [ Writer.varint (uint64 Int32.MaxValue + 1UL) ]
+    let bytes = Writer.build [ Writer.varint (uint64 System.Int32.MaxValue + 1UL) ]
     expectErrorKind ErrorKind.CorruptionError "長すぎる長さ指定はエラー" (Reader.readLengthPrefixed (Cursor.create bytes))
 
 [<Fact>]
@@ -99,45 +98,45 @@ let ``順序保持: 各型の境界値`` () =
         [
             "INTEGER",
             [
-                SqlValue.Int Int64.MinValue
+                SqlValue.Int System.Int64.MinValue
                 SqlValue.Int -5000L
                 SqlValue.Int -1L
                 SqlValue.Int 0L
                 SqlValue.Int 1L
-                SqlValue.Int Int64.MaxValue
+                SqlValue.Int System.Int64.MaxValue
             ]
             "REAL",
             [
-                SqlValue.Real Double.NegativeInfinity
+                SqlValue.Real System.Double.NegativeInfinity
                 SqlValue.Real -1.5
                 SqlValue.Real 0.0
                 SqlValue.Real 1.5
-                SqlValue.Real Double.PositiveInfinity
+                SqlValue.Real System.Double.PositiveInfinity
             ]
-            "REAL_NaN", [ SqlValue.Real 1.5; SqlValue.Real Double.NaN ]
+            "REAL_NaN", [ SqlValue.Real 1.5; SqlValue.Real System.Double.NaN ]
             "DECIMAL",
             [
-                SqlValue.Decimal Decimal.MinValue
+                SqlValue.Decimal System.Decimal.MinValue
                 SqlValue.Decimal -12345.6789M
                 SqlValue.Decimal -0.000001M
                 SqlValue.Decimal 0M
                 SqlValue.Decimal 0.000001M
                 SqlValue.Decimal 12345.6789M
-                SqlValue.Decimal Decimal.MaxValue
+                SqlValue.Decimal System.Decimal.MaxValue
             ]
             "BOOLEAN", [ SqlValue.Bool false; SqlValue.Bool true ]
             "DATE",
             [
-                SqlValue.Date DateOnly.MinValue
-                SqlValue.Date(DateOnly.FromDayNumber 1)
-                SqlValue.Date(DateOnly.FromDayNumber 100000)
-                SqlValue.Date DateOnly.MaxValue
+                SqlValue.Date System.DateOnly.MinValue
+                SqlValue.Date(System.DateOnly.FromDayNumber 1)
+                SqlValue.Date(System.DateOnly.FromDayNumber 100000)
+                SqlValue.Date System.DateOnly.MaxValue
             ]
             "TIMESTAMP",
             [
-                SqlValue.Timestamp(DateTimeOffset(DateTime(0L, DateTimeKind.Utc)))
-                SqlValue.Timestamp(DateTimeOffset(DateTime(1_000_000_000L, DateTimeKind.Utc)))
-                SqlValue.Timestamp(DateTimeOffset(DateTime.MaxValue.Ticks, TimeSpan.Zero))
+                SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(0L, System.DateTimeKind.Utc)))
+                SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(1_000_000_000L, System.DateTimeKind.Utc)))
+                SqlValue.Timestamp(System.DateTimeOffset(System.DateTime.MaxValue.Ticks, System.TimeSpan.Zero))
             ]
             "TEXT",
             [
@@ -159,10 +158,10 @@ let ``順序保持: 各型の境界値`` () =
             ]
             "UUID",
             [
-                SqlValue.Uuid(Guid.Parse "00000000-0000-0000-0000-000000000000")
-                SqlValue.Uuid(Guid.Parse "00000000-0000-0000-0000-000000000001")
-                SqlValue.Uuid(Guid.Parse "7fffffff-ffff-ffff-ffff-ffffffffffff")
-                SqlValue.Uuid(Guid.Parse "ffffffff-ffff-ffff-ffff-ffffffffffff")
+                SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-000000000000")
+                SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-000000000001")
+                SqlValue.Uuid(System.Guid.Parse "7fffffff-ffff-ffff-ffff-ffffffffffff")
+                SqlValue.Uuid(System.Guid.Parse "ffffffff-ffff-ffff-ffff-ffffffffffff")
             ]
         ]
 
@@ -253,7 +252,7 @@ let ``KeyBuilder.ofValues: 値を符号化する`` () =
 
 [<Fact>]
 let ``KeyBuilder.ofValues: REAL の -0.0 は +0.0 と同じキー`` () =
-    let negativeZero = BitConverter.Int64BitsToDouble 0x8000000000000000L
+    let negativeZero = System.BitConverter.Int64BitsToDouble 0x8000000000000000L
     let positive = KeyBuilder.ofValues [ SqlValue.vReal 0.0 ] |> ok
     let negative = KeyBuilder.ofValues [ SqlValue.Real negativeZero ] |> ok
     Assert.Equal<byte array>(positive, negative)
@@ -288,7 +287,7 @@ let ``ValueCodec: 全型の往復`` () =
 
         let same =
             match a, b with
-            | SqlValue.Real x, SqlValue.Real y -> Double.IsNaN x && Double.IsNaN y || x = y
+            | SqlValue.Real x, SqlValue.Real y -> System.Double.IsNaN x && System.Double.IsNaN y || x = y
             | SqlValue.Blob x, SqlValue.Blob y -> x = y
             | SqlValue.Timestamp x, SqlValue.Timestamp y -> x.UtcTicks = y.UtcTicks
             | _ -> a = b
@@ -297,7 +296,7 @@ let ``ValueCodec: 全型の往復`` () =
 
 [<Fact>]
 let ``ValueCodec: 負のゼロは正のゼロと同じ符号化`` () =
-    let negativeZero = BitConverter.Int64BitsToDouble 0x8000000000000000L
+    let negativeZero = System.BitConverter.Int64BitsToDouble 0x8000000000000000L
 
     let positive =
         ValueCodec.writeValues [ SqlValue.vReal 0.0; SqlValue.Decimal 0M ] Writer.Empty
@@ -315,10 +314,10 @@ let ``ValueCodec: 負のゼロは正のゼロと同じ符号化`` () =
 
     match got with
     | [| SqlValue.Real f; SqlValue.Decimal d |] ->
-        let bits = Decimal.GetBits d
-        Assert.Equal(0L, BitConverter.DoubleToInt64Bits f)
+        let bits = System.Decimal.GetBits d
+        Assert.Equal(0L, System.BitConverter.DoubleToInt64Bits f)
         Assert.Equal(0u, uint32 bits.[3] &&& 0x80000000u)
-    | other -> Assert.Fail(sprintf "往復結果が想定外: %A" other)
+    | other -> failActual "往復結果が想定外" other
 
 [<Fact>]
 let ``ValueCodec: 不明な型タグは CorruptionError`` () =
@@ -327,7 +326,7 @@ let ``ValueCodec: 不明な型タグは CorruptionError`` () =
 
 [<Fact>]
 let ``ValueCodec: 要素数が大きすぎると CorruptionError`` () =
-    let bytes = Writer.build [ Writer.varint (uint64 Int32.MaxValue + 1UL) ]
+    let bytes = Writer.build [ Writer.varint (uint64 System.Int32.MaxValue + 1UL) ]
     expectErrorKind ErrorKind.CorruptionError "要素数が大きすぎる場合はエラー" (ValueCodec.readValues (Cursor.create bytes))
 
 [<Fact>]
@@ -378,8 +377,8 @@ let ``Entry.managedBytes: 値が長いほど保持量が大きい`` () =
     let tombstone = Entry.delete key 1UL
     Assert.True(Entry.managedBytes tombstone < Entry.managedBytes entry)
 
-let private negativeZero = BitConverter.Int64BitsToDouble 0x8000000000000000L
-let private negativeNaN = BitConverter.Int64BitsToDouble 0xFFF8000000000000L
+let private negativeZero = System.BitConverter.Int64BitsToDouble 0x8000000000000000L
+let private negativeNaN = System.BitConverter.Int64BitsToDouble 0xFFF8000000000000L
 
 let private textOfChars (chars: int list) =
     System.String(chars |> List.map char |> Array.ofList)
@@ -390,30 +389,30 @@ let private edgeValues: (string * SqlValue list) list =
         "BOOLEAN", [ SqlValue.Bool false; SqlValue.Bool true ]
         "INTEGER",
         [
-            SqlValue.Int Int64.MinValue
+            SqlValue.Int System.Int64.MinValue
             SqlValue.Int -1L
             SqlValue.Int 0L
             SqlValue.Int 1L
-            SqlValue.Int Int64.MaxValue
+            SqlValue.Int System.Int64.MaxValue
         ]
         "REAL",
         [
-            SqlValue.Real Double.NegativeInfinity
-            SqlValue.Real Double.MinValue
+            SqlValue.Real System.Double.NegativeInfinity
+            SqlValue.Real System.Double.MinValue
             SqlValue.Real -1.5
-            SqlValue.Real -Double.Epsilon
+            SqlValue.Real -System.Double.Epsilon
             SqlValue.Real negativeZero
             SqlValue.Real 0.0
-            SqlValue.Real Double.Epsilon
+            SqlValue.Real System.Double.Epsilon
             SqlValue.Real 1.5
-            SqlValue.Real Double.MaxValue
-            SqlValue.Real Double.PositiveInfinity
-            SqlValue.Real Double.NaN
+            SqlValue.Real System.Double.MaxValue
+            SqlValue.Real System.Double.PositiveInfinity
+            SqlValue.Real System.Double.NaN
             SqlValue.Real negativeNaN
         ]
         "DECIMAL",
         [
-            SqlValue.Decimal Decimal.MinValue
+            SqlValue.Decimal System.Decimal.MinValue
             SqlValue.Decimal -1.00M
             SqlValue.Decimal -1M
             SqlValue.Decimal -0.0M
@@ -422,7 +421,7 @@ let private edgeValues: (string * SqlValue list) list =
             SqlValue.Decimal 0.0000000000000000000000000001M
             SqlValue.Decimal 1M
             SqlValue.Decimal 1.00M
-            SqlValue.Decimal Decimal.MaxValue
+            SqlValue.Decimal System.Decimal.MaxValue
         ]
         "TEXT",
         [
@@ -459,28 +458,28 @@ let private edgeValues: (string * SqlValue list) list =
         ]
         "DATE",
         [
-            SqlValue.Date DateOnly.MinValue
-            SqlValue.Date(DateOnly.FromDayNumber 1)
-            SqlValue.Date(DateOnly.FromDayNumber 100000)
-            SqlValue.Date DateOnly.MaxValue
+            SqlValue.Date System.DateOnly.MinValue
+            SqlValue.Date(System.DateOnly.FromDayNumber 1)
+            SqlValue.Date(System.DateOnly.FromDayNumber 100000)
+            SqlValue.Date System.DateOnly.MaxValue
         ]
         "TIMESTAMP",
         [
-            SqlValue.Timestamp(DateTimeOffset(DateTime.MinValue.Ticks, TimeSpan.Zero))
-            SqlValue.Timestamp(DateTimeOffset(DateTime(1_000_000_000L, DateTimeKind.Utc)))
-            SqlValue.Timestamp(DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero))
-            SqlValue.Timestamp(DateTimeOffset(2020, 1, 1, 9, 0, 0, TimeSpan.FromHours 9.0))
-            SqlValue.Timestamp(DateTimeOffset(2019, 12, 31, 15, 0, 0, TimeSpan.FromHours -9.0))
-            SqlValue.Timestamp(DateTimeOffset(DateTime.MaxValue.Ticks, TimeSpan.Zero))
+            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime.MinValue.Ticks, System.TimeSpan.Zero))
+            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(1_000_000_000L, System.DateTimeKind.Utc)))
+            SqlValue.Timestamp(System.DateTimeOffset(2020, 1, 1, 0, 0, 0, System.TimeSpan.Zero))
+            SqlValue.Timestamp(System.DateTimeOffset(2020, 1, 1, 9, 0, 0, System.TimeSpan.FromHours 9.0))
+            SqlValue.Timestamp(System.DateTimeOffset(2019, 12, 31, 15, 0, 0, System.TimeSpan.FromHours -9.0))
+            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime.MaxValue.Ticks, System.TimeSpan.Zero))
         ]
         "UUID",
         [
-            SqlValue.Uuid Guid.Empty
-            SqlValue.Uuid(Guid.Parse "00000000-0000-0000-0000-000000000001")
-            SqlValue.Uuid(Guid.Parse "00000000-0000-0000-0000-ffffffffffff")
-            SqlValue.Uuid(Guid.Parse "7fffffff-ffff-ffff-ffff-ffffffffffff")
-            SqlValue.Uuid(Guid.Parse "80000000-0000-0000-0000-000000000000")
-            SqlValue.Uuid(Guid.Parse "ffffffff-ffff-ffff-ffff-ffffffffffff")
+            SqlValue.Uuid System.Guid.Empty
+            SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-000000000001")
+            SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-ffffffffffff")
+            SqlValue.Uuid(System.Guid.Parse "7fffffff-ffff-ffff-ffff-ffffffffffff")
+            SqlValue.Uuid(System.Guid.Parse "80000000-0000-0000-0000-000000000000")
+            SqlValue.Uuid(System.Guid.Parse "ffffffff-ffff-ffff-ffff-ffffffffffff")
         ]
     ]
 
@@ -533,7 +532,7 @@ let ``順序保持: ランダムな同一型のペアでキー順と比較順が
         Array.init 4000 (fun _ -> randomValue ())
         |> Array.filter (fun v -> not (SqlValue.isNull v))
 
-    let random = Random 20261110
+    let random = System.Random 20261110
 
     for _, group in values |> Array.groupBy SqlValue.dataType do
         for _ in 1..300 do
@@ -543,7 +542,7 @@ let ``順序保持: ランダムな同一型のペアでキー順と比較順が
 
 [<Fact>]
 let ``順序保持: 複合キーのペアでキー順とタプル比較順が一致する`` () =
-    let random = Random 20261110
+    let random = System.Random 20261110
 
     let tuples =
         Array.init 500 (fun _ ->
@@ -579,7 +578,7 @@ let ``順序保持: 複合キーのペアでキー順とタプル比較順が一
 
 [<Fact>]
 let ``順序保持: Entry と SstEntry の並びが一致する`` () =
-    let random = Random 20261111
+    let random = System.Random 20261111
 
     let makeEntry key seqNo =
         Entry.put key seqNo [| SqlValue.Int(int64 seqNo) |]
@@ -599,7 +598,7 @@ let ``順序保持: Entry と SstEntry の並びが一致する`` () =
 
 [<Fact>]
 let ``順序保持: KeyOrder は反対称で推移的`` () =
-    let random = Random 20261112
+    let random = System.Random 20261112
 
     let randomPair () =
         let key = KeyBuilder.ofValues [ SqlValue.Int(int64 (random.Next 50)) ] |> ok

@@ -98,8 +98,8 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 - 担保: `KeyOrder.compare` が唯一の実装。
   `Entry.compareKeys`（memtable）と `SstEntry.compare`（SSTable）はこれを呼ぶ。
 - 回帰テスト:
-  - `順序保持プロパティ: Entry と SstEntry の並びが一致する`
-  - `順序保持プロパティ: KeyOrder は反対称で推移的`
+  - `順序保持: Entry と SstEntry の並びが一致する`
+  - `順序保持: KeyOrder は反対称で推移的`
 
 ### INV-04 意味の違う番号
 
@@ -146,11 +146,11 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `LastCommitted` の SeqNo は `0 < seq <= LastCommitSeqNo` かつ `seq < NextSeqNo`
 - 担保: `TransactionsTests.fs` 内の private `validate`（src には公開していない）。
 - 回帰テスト:
-  - `TransactionManager.validate: 初期状態は妥当`
-  - `TransactionManager.validate: NextSeqNo の逆転を検出`
-  - `TransactionManager.validate: Active の snapshot が未来なら検出`
-  - `TransactionManager.validate: LastCommitted の範囲外を検出`
-  - `TransactionManager.validate: begin/put/commit/abort を繰り返しても不変条件を保つ`
+  - `TransactionManager: 初期状態は妥当`
+  - `TransactionManager: NextSeqNo の逆転を検出`
+  - `TransactionManager: Active の snapshot が未来なら検出`
+  - `TransactionManager: LastCommitted の範囲外を検出`
+  - `TransactionManager: begin/put/commit/abort を繰り返しても不変条件を保つ`
 - 補足: 以前の `TxnRecord.Keys` は更新されない死んだフィールドだったため削除した。
   `Active` は `Map<TxnId, Transaction>` で直接持つ。
 
@@ -164,8 +164,12 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - L1 以上は範囲が重ならない（L0 は重なってよい）
   - `Smallest <= Largest`
 - 担保: `VersionSetTests.fs` 内の private `validate`（src には公開していない）。
+- 本番では検査しないが、`Compaction.boundsOf` が `Smallest > Largest` の入力を
+  `CorruptionError` に変換する
+  （部分関数の例外を protect 外へ脱出させない。§11.76）。
 - 回帰テスト:
   - `Version.validate: 空の Version は妥当`
+  - `Compaction.compact: Smallest > Largest の入力は CorruptionError になる`
   - `Version.validate: ファイル番号の重複を検出`
   - `Version.validate: NextFileNumber の巻き戻しを検出`
   - `Version.validate: L1 以上の範囲重複を検出`
@@ -229,7 +233,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - 各読み取りは `Pos < End` を確認してから進むので、帰納的に保たれる。
   - `Cursor.advance` がレコード更新を 1箇所に集約する。
 - 回帰テスト:
-  - `Cursor: createSlice は範囲外を CorruptionError`
+  - `Cursor.createSlice: 範囲外を CorruptionError`
     （負の offset / length、境界超過、オーバーフローを狙った指定）
   - `Cursor: create / createSlice / 読み取りは不変条件 0 <= Pos <= End <= Data.Length を保つ`
 

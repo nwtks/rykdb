@@ -8,39 +8,6 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-/// SQL テキストを 1 文として解析する。複数文はエラー。
-let private parseStatement (sql: string) =
-    Parser.parseStatements sql
-    >>= fun stmts ->
-        match stmts with
-        | [ s ] -> ret s
-        | [] -> err (DbError.create ErrorKind.SyntaxError "文がありません")
-        | _ -> err (DbError.create ErrorKind.SyntaxError "複数の文が渡されました（1 文ずつ実行してください）")
-
-/// SQL を 1 文解析し、失敗したらテストを落とす。
-let private parseOneOk (sql: string) =
-    match parseStatement sql with
-    | Ok s -> s
-    | Error e ->
-        Assert.Fail(sprintf "解析に失敗: %s\nSQL: %s" (DbError.toDisplayString e) sql)
-        Unchecked.defaultof<Statement>
-
-/// SQL を 1 文解析し、variant から値を抜き出せなければテストを落とす。
-let private expectVariant (tag: string) (pick: Statement -> 'T option) (sql: string) : 'T =
-    match pick (parseOneOk sql) with
-    | Some v -> v
-    | None ->
-        Assert.Fail(tag + " ではない: " + sql)
-        Unchecked.defaultof<'T>
-
-let private parseSelectOk (sql: string) : SelectStatement =
-    expectVariant
-        "SELECT"
-        (function
-        | Statement.Select s -> Some s
-        | _ -> None)
-        sql
-
 /// FROM の実テーブル参照（派生テーブルや FROM なしは None）。
 let private fromTable (sel: SelectStatement) =
     match sel.From with
@@ -54,14 +21,6 @@ let private parseUpdateOk (sql: string) : UpdateStatement =
         | Statement.Update u -> Some u
         | _ -> None)
         sql
-
-/// SELECT 文の WHERE 式を取り出す（無い・SELECT でないならテストを落とす）。
-let private whereOf (sql: string) : Expr =
-    match (parseSelectOk sql).Where with
-    | Some e -> e
-    | None ->
-        Assert.Fail("WHERE 句がありません: " + sql)
-        Unchecked.defaultof<Expr>
 
 /// WHERE 式の表示文字列（無いときは "(なし)"）。
 let private whereTextOf (sql: string) : string =
@@ -130,59 +89,59 @@ let ``式: 不正な修飾子はその場でエラー`` () =
 let ``Parser: IS NULL / IN / LIKE / NOT`` () =
     match whereOf "SELECT * FROM t WHERE a IS NULL" with
     | Expr.IsNull(_, false) -> ()
-    | _ -> Assert.Fail "IS NULL ではない"
+    | other -> failActual "IS NULL ではない" other
 
     match whereOf "SELECT * FROM t WHERE a IS NOT NULL" with
     | Expr.IsNull(_, true) -> ()
-    | _ -> Assert.Fail "IS NOT NULL ではない"
+    | other -> failActual "IS NOT NULL ではない" other
 
     match whereOf "SELECT * FROM t WHERE a IN (1, 2, 3)" with
     | Expr.InList(_, xs, false) -> Assert.Equal(3, xs.Length)
-    | _ -> Assert.Fail "IN ではない"
+    | other -> failActual "IN ではない" other
 
     match whereOf "SELECT * FROM t WHERE a NOT IN (1)" with
     | Expr.InList(_, _, true) -> ()
-    | _ -> Assert.Fail "NOT IN ではない"
+    | other -> failActual "NOT IN ではない" other
 
     match whereOf "SELECT * FROM t WHERE a LIKE 'x%'" with
     | Expr.Like(_, _, false, None) -> ()
-    | _ -> Assert.Fail "LIKE ではない"
+    | other -> failActual "LIKE ではない" other
 
     match whereOf "SELECT * FROM t WHERE NOT a = 1" with
     | Expr.Unary(UnaryOp.Not, _) -> ()
-    | _ -> Assert.Fail "NOT ではない"
+    | other -> failActual "NOT ではない" other
 
 [<Fact>]
 let ``Parser: IS TRUE / FALSE / UNKNOWN と LIKE ESCAPE`` () =
     match whereOf "SELECT * FROM t WHERE a IS TRUE" with
     | Expr.IsTruth(_, TruthValue.True, false) -> ()
-    | other -> Assert.Fail(sprintf "IS TRUE ではない: %A" other)
+    | other -> failActual "IS TRUE ではない" other
 
     match whereOf "SELECT * FROM t WHERE a IS NOT FALSE" with
     | Expr.IsTruth(_, TruthValue.False, true) -> ()
-    | other -> Assert.Fail(sprintf "IS NOT FALSE ではない: %A" other)
+    | other -> failActual "IS NOT FALSE ではない" other
 
     match whereOf "SELECT * FROM t WHERE a IS UNKNOWN" with
     | Expr.IsTruth(_, TruthValue.Unknown, false) -> ()
-    | other -> Assert.Fail(sprintf "IS UNKNOWN ではない: %A" other)
+    | other -> failActual "IS UNKNOWN ではない" other
 
     match whereOf "SELECT * FROM t WHERE a IS NOT UNKNOWN" with
     | Expr.IsTruth(_, TruthValue.Unknown, true) -> ()
-    | other -> Assert.Fail(sprintf "IS NOT UNKNOWN ではない: %A" other)
+    | other -> failActual "IS NOT UNKNOWN ではない" other
 
     match whereOf "SELECT * FROM t WHERE a LIKE 'x!%' ESCAPE '!'" with
     | Expr.Like(_, _, false, Some _) -> ()
-    | other -> Assert.Fail(sprintf "LIKE ESCAPE ではない: %A" other)
+    | other -> failActual "LIKE ESCAPE ではない" other
 
     match whereOf "SELECT * FROM t WHERE a NOT LIKE 'x!_' ESCAPE '!'" with
     | Expr.Like(_, _, true, Some _) -> ()
-    | other -> Assert.Fail(sprintf "NOT LIKE ESCAPE ではない: %A" other)
+    | other -> failActual "NOT LIKE ESCAPE ではない" other
 
 [<Fact>]
 let ``Parser: CASE と関数`` () =
     match (parseSelectOk "SELECT CASE WHEN a = 1 THEN 'one' ELSE 'other' END FROM t").Items.[0].Expression with
     | Expr.Case(_, Some _) -> ()
-    | other -> Assert.Fail(sprintf "CASE ではない: %A" other)
+    | other -> failActual "CASE ではない" other
 
     let sel = parseSelectOk "SELECT UPPER(name), LENGTH(name), COALESCE(a, b, 0) FROM t"
     Assert.Equal(3, sel.Items.Length)
@@ -199,46 +158,44 @@ let ``Parser: CAST と DEFAULT`` () =
     | [ {
             Expression = Expr.Cast(_, DataType.Integer)
         } ] -> ()
-    | other -> Assert.Fail(sprintf "CAST ではない: %A" other)
+    | other -> failActual "CAST ではない" other
 
     match parseOneOk "INSERT INTO t DEFAULT VALUES" with
     | Statement.Insert ins ->
         match ins.Source with
         | InsertSource.Values [ [] ] -> ()
-        | other -> Assert.Fail(sprintf "DEFAULT VALUES ではない: %A" other)
-    | other -> Assert.Fail(sprintf "INSERT ではない: %A" other)
+        | other -> failActual "DEFAULT VALUES ではない" other
+    | other -> failActual "INSERT ではない" other
 
     match parseOneOk "INSERT INTO t VALUES (1, DEFAULT)" with
     | Statement.Insert ins ->
         match ins.Source with
         | InsertSource.Values [ [ _; Expr.Default ] ] -> ()
-        | other -> Assert.Fail(sprintf "DEFAULT ではない: %A" other)
-    | other -> Assert.Fail(sprintf "INSERT ではない: %A" other)
+        | other -> failActual "DEFAULT ではない" other
+    | other -> failActual "INSERT ではない" other
 
 [<Fact>]
 let ``Parser: 集約関数の DISTINCT`` () =
     let item (sql: string) =
         match (parseSelectOk sql).Items with
         | [ it ] -> it.Expression
-        | other ->
-            Assert.Fail(sprintf "項目数が違う: %A" other)
-            Unchecked.defaultof<Expr>
+        | other -> failwithf "項目数が違う: %A" other
 
     match item "SELECT SUM(DISTINCT a) FROM t" with
     | Expr.AggCall(AggFunc.Sum, true, _) -> ()
-    | other -> Assert.Fail(sprintf "SUM DISTINCT ではない: %A" other)
+    | other -> failActual "SUM DISTINCT ではない" other
 
     match item "SELECT AVG(DISTINCT a) FROM t" with
     | Expr.AggCall(AggFunc.Avg, true, _) -> ()
-    | other -> Assert.Fail(sprintf "AVG DISTINCT ではない: %A" other)
+    | other -> failActual "AVG DISTINCT ではない" other
 
     match item "SELECT MIN(DISTINCT a) FROM t" with
     | Expr.AggCall(AggFunc.Min, true, _) -> ()
-    | other -> Assert.Fail(sprintf "MIN DISTINCT ではない: %A" other)
+    | other -> failActual "MIN DISTINCT ではない" other
 
     match item "SELECT MAX(DISTINCT a) FROM t" with
     | Expr.AggCall(AggFunc.Max, true, _) -> ()
-    | other -> Assert.Fail(sprintf "MAX DISTINCT ではない: %A" other)
+    | other -> failActual "MAX DISTINCT ではない" other
 
 [<Fact>]
 let ``Parser: リテラルとコメント`` () =
@@ -280,8 +237,8 @@ let ``Parser: LEFT OUTER JOIN`` () =
             match j.Kind with
             | JoinKind.Left -> ()
             | _ -> Assert.Fail("LEFT JOIN ではない")
-        | other -> Assert.Fail(sprintf "JOIN の数が違う: %A" other)
-    | other -> Assert.Fail(sprintf "SELECT ではない: %A" other)
+        | other -> failActual "JOIN の数が違う" other
+    | other -> failActual "SELECT ではない" other
 
 [<Fact>]
 let ``Parser: SELECT 各種`` () =
@@ -310,7 +267,7 @@ let ``Parser: EXPLAIN は SELECT を包む`` () =
     | Statement.Explain sel ->
         Assert.Single<SelectItem> sel.Items |> ignore
         Assert.True sel.Where.IsSome
-    | other -> Assert.Fail(sprintf "EXPLAIN ではない: %A" other)
+    | other -> failActual "EXPLAIN ではない" other
 
     // 未対応の文・欠落は明示的な SyntaxError
     expectErrorKind ErrorKind.SyntaxError "EXPLAIN の後に SELECT 以外" (parseStatement "EXPLAIN INSERT INTO t VALUES (1)")
@@ -335,7 +292,7 @@ let ``Parser: サブクエリ（スカラー / IN / EXISTS）`` () =
     | Some(TableSource.Derived(inner, alias)) ->
         Assert.Equal("x", alias)
         Assert.Equal<int>(1, inner.Items.Length)
-    | other -> Assert.Fail(sprintf "派生テーブルではない: %A" other)
+    | other -> failActual "派生テーブルではない" other
 
     parseOneOk "SELECT id FROM (SELECT id FROM t) AS x JOIN u ON u.id = x.id"
     |> ignore
@@ -487,7 +444,7 @@ let ``末尾再帰: 長い文字列リテラルを字句解析できる`` () =
 
     match whereOf sql with
     | Expr.Binary(BinaryOp.Eq, _, Expr.Literal(Literal.String s)) -> Assert.Equal(len, s.Length)
-    | other -> Assert.Fail(sprintf "想定外の式: %A" other)
+    | other -> failActual "想定外の式" other
 
 [<Fact>]
 let ``末尾再帰: 長いバイナリリテラルを字句解析できる`` () =

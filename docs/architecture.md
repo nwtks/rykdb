@@ -127,17 +127,25 @@ flowchart TB
 
 | 領域       | 手法・アルゴリズム                                                                                        | 詳細                                                |
 | ---------- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| ストレージ | LSM-Tree + **Leveled compaction**（LevelDB / RocksDB 方式）                                               | §8                                                  |
+| ストレージ | LSM-Tree + **Leveled compaction**。1本のツリーを **keyspace 接頭辞**（`t:` / `i:` / `__catalog__`）で分離 | §6.1, §8                                            |
 | memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                                            | §8.1                                                |
-| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter + Footer v6（84バイト）                                          | §8.2                                                |
+| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter（double hashing）+ Footer v6。**部分読み**（弱参照キャッシュ）   | §8.2                                                |
+| 整合性     | **CRC32C**（Castagnoli、slicing-by-8）— SSTable のブロック・メタデータ・Footer、MANIFEST、WAL フレーム    | §8.2, §8.4–8.5                                      |
 | 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                                     | §8.4–8.5                                            |
-| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）                                                     | §8.6                                                |
+| 耐久       | commit の fsync を**グループコミット**（WAL 位置を登録し、先頭の待機者が 1回 fsync）                      | §8.5, §7.7                                          |
+| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）。tombstone は最下位レベルで回収                     | §8.6                                                |
 | 並行制御   | **Session で読み取り並行・書き込み直列** + MVCC（Snapshot Isolation）+ first-committer-wins。DDL だけ排他 | §7                                                  |
+| 排他       | DDL は `RootGate`、DB は `.rykdb.format` の **`FileShare.None`**（プロセス間）                            | §7.8–7.9                                            |
 | compaction | **background worker**（`Session.OpenWith`）。MANIFEST 追記は installGate、採番は CAS で一意化             | §8.6–8.7                                            |
-| キー符号化 | **順序保持エンコーディング**（型タグ・escape・タプル）                                                    | §4                                                  |
+| 符号化     | **順序保持エンコーディング**（型タグ・escape・タプル）と **varint**（長さ・件数）                         | §4, §6.1, §8.2                                      |
 | 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                                                 | §6                                                  |
+| 最適化     | Filter pushdown、結合順の貪欲法、主キー順 `ORDER BY` の Sort 省略、LIMIT 件数ヒントの伝播                 | §5.1                                                |
 | 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                                               | §5.2                                                |
-| 構文解析   | 手書き Lexer + 再帰下降 Parser（式は Pratt / precedence climbing）                                        | §3                                                  |
+| 結合       | **インデックス入れ子ループ / マージ / ハッシュ / 入れ子ループ**を走査順と見積りで選択                     | §5.1                                                |
+| 並べ替え   | **外部マージソート**（run へ溢らし、fan-in 32 の multi-pass k-way merge）                                 | §5.3                                                |
+| 列読み出し | **列マスク**（必要な列だけ復号し、不要列は `Unloaded` として読み飛ばす）                                  | §5.4                                                |
+| 式評価     | **CPS + メモ化 resolver**、3値論理、手書き LIKE 照合、struct DU / `DbResult` で割当を抑える               | §5.4                                                |
+| 構文解析   | 手書き Lexer + 再帰下降 Parser（式は Pratt / precedence climbing、SELECT は CPS）                         | §3                                                  |
 | エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                                       | [`coding-conventions.md`](coding-conventions.md) §1 |
 | ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                                         | §4.2, §8.1                                          |
 
@@ -207,7 +215,7 @@ flowchart TB
 | `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                                            |
 | `SstScan.fs`       | SSTable / メモリの遅延走査 `SstScan` とマージ `SstMerge`（`ScanScope`）                                              |
 | `SstableFormat.fs` | SSTable の形式・Footer・ブロックキャッシュ・書き出し（`writeTo` / v6 / Bloom / index）                               |
-| `Sstable.fs`       | SSTable の部分読み・走査・点検索（`openPartial` / `rangeScanPartial*` / `lookupMasked`）                             |
+| `Sstable.fs`       | SSTable の部分読み・走査・ポイント検索（`openPartial` / `rangeScanPartial*` / `lookupMasked`）                       |
 | `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                                            |
 | `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                                          |
 | `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                                                    |
@@ -413,7 +421,7 @@ escape の正しさをバイト列で確認した例（フィールド `["ab", "
 
 ## 5. 実行層
 
-### 5.1 Planner — 束縛 → 論理代数 → Op
+### 5.1 計画（束縛 → 論理代数 → Op）
 
 ```mermaid
 flowchart LR
@@ -604,7 +612,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
    （キーでない列が間に挟まる走査はキー順にならない）。
    `ON` の等値条件の順が走査順と違っても、等値は対称なので走査順に並べ替えてよい。
    両側が 1行（`PkLookup` / `Values`）なら任意の順序でよい。
-   右側を materialize せず、両側を 1行ずつ流す（`Ops.innerJoinMerge` / `leftJoinMerge`）。
+   右側を materialize せず、両側を 1行ずつ流す（`OpsJoin.innerJoinMerge` / `OpsJoin.leftJoinMerge`）。
 3. **ハッシュ結合**（`HashJoin`）:
    等値キーがあり、上記以外。右側を `Dictionary<SqlValue array, ...>` のハッシュ表にする。
 4. **入れ子ループ**（`NestedLoop`）:
@@ -644,13 +652,13 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
 - `Scan` は `execScan` が `ScanMethod` に応じて `ExecContext.tableMasked` / `ExecContext.byPrimaryKeyMasked` / `ExecContext.byIndexMasked` へ振り分ける。
 - `Join` は左を「**左部分木が実際に出力するレイアウト**」（`outputOf`）、
   右を「右テーブル 1つだけのスキーマ」で実行し、
-  戦略に応じて `Ops.innerJoin` / `Ops.leftJoin`（入れ子ループ）、
-  `Ops.innerJoinHash` / `Ops.leftJoinHash`（ハッシュ）、
-  `Ops.innerJoinMerge` / `Ops.leftJoinMerge`（マージ）、
-  `Ops.innerJoinIndexed` / `Ops.leftJoinIndexed`（インデックス）へ振り分ける
+  戦略に応じて `OpsJoin.innerJoin` / `OpsJoin.leftJoin`（入れ子ループ）、
+  `OpsJoin.innerJoinHash` / `OpsJoin.leftJoinHash`（ハッシュ）、
+  `OpsJoin.innerJoinMerge` / `OpsJoin.leftJoinMerge`（マージ）、
+  `OpsJoin.innerJoinIndexed` / `OpsJoin.leftJoinIndexed`（インデックス）へ振り分ける
   （ON は左行 + 右行で評価）。
   結合順を並べ替えると「入力スキーマから右テーブルを除いた列順」と実際の行の並びが一致しないため、
-  列位置で行を読む `Ops` へは必ず実際のレイアウトを渡す（gotchas §11.67）。
+  列位置で行を読む `OpsJoin` へは必ず実際のレイアウトを渡す（gotchas §11.67）。
 - `Filter` / `Sort` / `Project` は子の**出力スキーマ**（`outputOf`）を求めてから掛ける。
   集約の後は行の並びが「groupBy の値 + 各集約の結果」に変わるため、
   「入力スキーマ（テーブル定義）」と取り違えると `SELECT SUM(age)` が引数を評価できず `NULL` になる。
@@ -683,11 +691,11 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 **マージ結合は右側を materialize せず、両側を 1行ずつ流す**
 （同じキーの行のグループだけを保持する）。
 materialize は管理メモリ換算で **256MiB が上限**で、超過は `CapacityError`
-（`Ops.toArrayWithBudget`。インデックス検索の結果も同じ上限）。
+（`OpsJoin.toArrayWithBudget`。インデックス検索の結果も同じ上限）。
 ソート・集約・DISTINCT は**入力行を抱えず**、
 それぞれ外部マージ・アキュムレータ・符号化済みキーで処理する（§5.3）。
 
-`Ops` モジュールの演算子は以下のとおり。
+`Ops` / `OpsJoin` モジュールの演算子は以下のとおり。
 
 | 演算子                                                             | 役割                                         |
 | ------------------------------------------------------------------ | -------------------------------------------- |
@@ -696,10 +704,10 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 | `Ops.project`                                                      | 射影（`*` / `t.*` の展開を含む）             |
 | `Ops.sortBy`                                                       | ソート（外部マージ。§5.3）                   |
 | `Op.take` / `Op.skip`                                              | LIMIT / OFFSET                               |
-| `Ops.innerJoin` / `leftJoin`                                       | 入れ子ループ結合                             |
-| `Ops.innerJoinHash` / `leftJoinHash`                               | ハッシュ結合                                 |
-| `Ops.innerJoinMerge` / `leftJoinMerge`                             | マージ結合                                   |
-| `Ops.innerJoinIndexed` / `leftJoinIndexed`                         | インデックス入れ子ループ                     |
+| `OpsJoin.innerJoin` / `leftJoin`                                   | 入れ子ループ結合                             |
+| `OpsJoin.innerJoinHash` / `leftJoinHash`                           | ハッシュ結合                                 |
+| `OpsJoin.innerJoinMerge` / `leftJoinMerge`                         | マージ結合                                   |
+| `OpsJoin.innerJoinIndexed` / `leftJoinIndexed`                     | インデックス入れ子ループ                     |
 | `Ops.aggregate`                                                    | 集約（`groupBy` 値 + 各集約結果 の行を生成） |
 | `Ops.distinct`                                                     | 重複除去                                     |
 | `ExecContext.tableMasked` / `byPrimaryKeyMasked` / `byIndexMasked` | 走査（列マスク付き）                         |
@@ -713,10 +721,10 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 | `Ops.project`                                  | `Compute`（1行ずつ）                                                          |
 | `Ops.sortBy` / `Ops.aggregate`                 | **Op 構築時**に全入力を消費するが、行は抱えない（§5.3）                       |
 | `Ops.distinct`                                 | 符号化済みキーの `HashSet` を持ち回る（出現順を保持。バジェット上限あり）     |
-| `Ops.innerJoin` / `leftJoin`                   | 右を materialize し、左を 1行ずつ流す入れ子ループ                             |
-| `Ops.innerJoinHash` / `leftJoinHash`           | 右をハッシュ表に materialize する                                             |
-| `Ops.innerJoinMerge` / `leftJoinMerge`         | 両側を 1行ずつ流す（同じキーの行のグループだけを保持。右の materialize なし） |
-| `Ops.innerJoinIndexed` / `leftJoinIndexed`     | 左行ごとに `ExecContext.byIndexMasked` で右を引く                             |
+| `OpsJoin.innerJoin` / `leftJoin`               | 右を materialize し、左を 1行ずつ流す入れ子ループ                             |
+| `OpsJoin.innerJoinHash` / `leftJoinHash`       | 右をハッシュ表に materialize する                                             |
+| `OpsJoin.innerJoinMerge` / `leftJoinMerge`     | 両側を 1行ずつ流す（同じキーの行のグループだけを保持。右の materialize なし） |
+| `OpsJoin.innerJoinIndexed` / `leftJoinIndexed` | 左行ごとに `ExecContext.byIndexMasked` で右を引く                             |
 | `ExecContext.*`                                | スキャン結果を `Op` として受け取る（snapshot は生成時に固定）                 |
 
 `DISTINCT` は `ValueCodec` で符号化したバイト列をキーにし、
@@ -725,10 +733,10 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 
 **JOIN 内側の割当**
 
-- ON 句と residual は `Eval.matchesJoined` で評価する。
+- ON 句と residual は `Eval.matchesJoinedV` で評価する。
   左右の行を `Array.append` で連結せず、左の列の後ろに右の列が並んでいるものとして列位置を読む。
   行を連結するのは **出力する行だけ**。
-- LEFT JOIN の NULL 埋めは `Ops.padWithNulls` で 1回の配列確保にまとめる
+- LEFT JOIN の NULL 埋めは `OpsJoin.padWithNulls` で 1回の配列確保にまとめる
   （`Array.create` + `Array.append` の 2回確保をしない）。
 - マージ結合のキー比較は `compareKeyVectors` がキー列の位置から直接比較する
   （比較のたびにキー配列を作らない）。
@@ -807,7 +815,7 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
   （`Ops.aggregate` の `addAcc` が `distinct` フラグで `Seen` を管理）。
 - ソート（`Ops.sortBy`）は列参照なら「列インデックス + 向き」に解決して `ExtSort.sortRows`（外部マージ）で並べる。
   式のキーは行ごとに評価して行末に足し、ソート後に元の列だけを残す。
-  `ORDER BY` の序数（1 始まり）は `Planner.applySort` が `SELECT` 項目の式へ置き換える。
+  `ORDER BY` の序数（1 始まり）は `PlanBuilder.applySort` が `SELECT` 項目の式へ置き換える。
   解決は修飾つき（`t.age`）を優先するので、集約後の出力（列名が `SUM(t.age)` になる）でも動く。
 - 射影（`Ops.project`）は `*` / `t.*` を列参照へ展開する。
   入力が集約結果のときは `substituteAggs` で位置に読み替えてから評価する。
@@ -861,7 +869,8 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
   FSharp.Core の `Result` は参照 DU で、成功パスでも `Ok` を 1個確保する。
   `Eval.step` / `valueAt` / `compare` / `truthOf` と `SqlValue.compareValuesV` は `DbResult` を返し、
   公開 API の境界（`Database` / `Session` / `Op.toArrayLimited`）で `Result` に戻す。
-  `Eval.evalWith` / `matchesWith` / `matchesJoined` は境界用のラッパー。
+  `Eval.evalWith` は境界用のラッパー（`Result` に戻す）。
+  `Eval.matchesWithV` / `Eval.matchesJoinedV` は `DbResult` のまま返す内部ホットパス。
 - pull 層の 1行は `[<Struct>] OpStep`（`OpDone` / `OpError` / `OpRow`）。
   `Op.next` は `Result<(row * Op) option, _>` を返さないので、 `Ok` + `Some` + tuple を確保しない。
   `Op.map` / `Op.filter` のコールバックも `DbResult`。
@@ -883,7 +892,7 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
   不要列は型タグと長さを見て読み飛ばす。
 - 不要列には `SqlValue.Unloaded` を置く。
   これは実際の NULL ではない。
-  `compareValues` と符号化（`OrderPreserving.writeValue` / `ValueCodec.writeValue(s)`）は
+  `compareValuesV` と符号化（`OrderPreserving.writeValue` / `ValueCodec.writeValue(s)`）は
   `InternalError` を返す。
 - 空マスクの行を `[||]` にせず、スキーマ幅で埋める
   （`ORDER BY 1` などが行の幅を前提にするため）。
@@ -906,7 +915,7 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
 
 - 比較はオペランドに NULL があると `NULL`（UNKNOWN）を返す。
   `AND` は左が `FALSE` なら右を評価せず `FALSE`、`OR` は左が `TRUE` なら右を評価せず `TRUE`（短絡評価）。
-- `WHERE` / `HAVING` は UNKNOWN を**偽**として扱う（`Eval.matchesWith`）。
+- `WHERE` / `HAVING` は UNKNOWN を**偽**として扱う（`Eval.matchesWithV`）。
 - `BETWEEN` は `>=` と `<=` の AND として 3値論理で評価する。
 - `IN` は「一致する要素があれば TRUE、
   一致せず NULL（UNKNOWN）を 1 つでも見れば UNKNOWN、それ以外は FALSE」。
@@ -1414,8 +1423,8 @@ WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
 `Engine.runSelect` / `runDml` が `finally` で `DisposeAll` する。
 登録は `RowStore.scanAtRawValues` / `scanAtRawMasked` が `StorageEngine.ScanAtValues` / `ScanAtMasked` の直後に `SstScan.scoped` で行う。
 `RowStore.scanWithinPrefix` は `SstScan.ofStepWithClose` で包み、`Dispose` を下流の走査へ伝播する
-（回帰テストは `SstScanTests: ScanScope: 早期終了しても登録した走査を閉じられる` /
-`SstScanTests: ScanScope: 最後まで読むと登録が外れる`）。
+（回帰テストは `ScanScope: 早期終了しても登録した走査を閉じられる` /
+`ScanScope: 最後まで読むと登録が外れる`）。
 
 走査は `SstScan`（`next` を呼ぶまでブロックを 1個も読まない遅延 pull）で行い、
 `rangeScanPartial` は `LastKey` の二分探索で `startKey` を含み得る最初のブロックへ飛ぶ

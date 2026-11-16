@@ -285,7 +285,7 @@ let ``Schema.expandStar: * は全列`` () =
 
     match Schema.expandStar s Expr.Star with
     | Some(false, cols) -> Assert.Equal(2, cols.Length)
-    | other -> Assert.Fail(sprintf "expandStar * が想定外: %A" other)
+    | other -> failActual "expandStar * が想定外" other
 
 [<Fact>]
 let ``Schema.expandStar: t.* は修飾一致のみ`` () =
@@ -298,7 +298,7 @@ let ``Schema.expandStar: t.* は修飾一致のみ`` () =
 
     match Schema.expandStar s (Expr.QualifiedStar "t") with
     | Some(true, cols) -> Assert.Equal(1, cols.Length)
-    | other -> Assert.Fail(sprintf "expandStar t.* が想定外: %A" other)
+    | other -> failActual "expandStar t.* が想定外" other
 
 [<Fact>]
 let ``Schema.tryAsColumnRef: Column / Name を列参照に`` () =

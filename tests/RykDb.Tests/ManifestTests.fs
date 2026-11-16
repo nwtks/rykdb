@@ -4,7 +4,6 @@
 
 module RykDb.ManifestTests
 
-open System.IO
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -75,7 +74,7 @@ let ``Manifest: 末尾の書きかけレコードは読み飛ばす`` () =
         let v0, mn = ok (Manifest.openOrCreate dir)
         let _ = applyEdit dir mn v0 (VersionEdit.addFile (fmd 1L 0 100 199))
         // 末尾に不正な base64 を追記する（クラッシュで書きかけになった追記を模擬）
-        File.AppendAllText(Path.Combine(dir, "MANIFEST-000001"), "!!!not-base64!!!\n")
+        System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "MANIFEST-000001"), "!!!not-base64!!!\n")
 
         // 末尾だけなので読み飛ばし、1 件目までの状態が残る
         let reopened, _ = ok (Manifest.openOrCreate dir)
@@ -89,9 +88,9 @@ let ``Manifest: 途中の壊れたレコードは CorruptionError`` () =
         let _ = applyEdit dir mn v0 (VersionEdit.addFile (fmd 2L 0 100 199))
 
         // 有効な 2 行の間に壊れた行を挿入する（bit rot を模擬）
-        let path = Path.Combine(dir, "MANIFEST-000001")
-        let lines = File.ReadAllLines path
-        File.WriteAllLines(path, Array.append [| lines.[0]; "!!!not-base64!!!" |] lines.[1..])
+        let path = System.IO.Path.Combine(dir, "MANIFEST-000001")
+        let lines = System.IO.File.ReadAllLines path
+        System.IO.File.WriteAllLines(path, Array.append [| lines.[0]; "!!!not-base64!!!" |] lines.[1..])
 
         expectErrorKind ErrorKind.CorruptionError "途中の破損は黙って捨てない" (Manifest.openOrCreate dir))
 
@@ -104,12 +103,12 @@ let ``Manifest: 途中のレコードのチェックサム不一致は Corruptio
 
         // base64 としては正しいまま中身を 1バイト壊す（bit rot を模擬）。
         // チェックサムが無いと VersionEdit として偶然デコードされ得る破損。
-        let path = Path.Combine(dir, "MANIFEST-000001")
-        let lines = File.ReadAllLines path
+        let path = System.IO.Path.Combine(dir, "MANIFEST-000001")
+        let lines = System.IO.File.ReadAllLines path
         let bytes = System.Convert.FromBase64String lines.[0]
         bytes.[bytes.Length - 1] <- bytes.[bytes.Length - 1] ^^^ 0xFFuy
         lines.[0] <- System.Convert.ToBase64String bytes
-        File.WriteAllLines(path, lines)
+        System.IO.File.WriteAllLines(path, lines)
 
         expectErrorKind ErrorKind.CorruptionError "チェックサムで途中の破損を検出する" (Manifest.openOrCreate dir))
 
@@ -119,7 +118,7 @@ let ``Manifest: 空行は読み飛ばす`` () =
         let v0, mn = ok (Manifest.openOrCreate dir)
         let _ = applyEdit dir mn v0 (VersionEdit.addFile (fmd 1L 0 100 199))
         // 末尾に空行を挟んでも再オープンできる
-        File.AppendAllText(Path.Combine(dir, "MANIFEST-000001"), "\n")
+        System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "MANIFEST-000001"), "\n")
 
         let reopened, _ = ok (Manifest.openOrCreate dir)
         Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], levelCounts reopened))
@@ -128,7 +127,7 @@ let ``Manifest: 空行は読み飛ばす`` () =
 let ``Manifest: 空の CURRENT は新規作成として扱う`` () =
     withDir "manifest-empty-current" (fun dir ->
         ok (Manifest.ensureDirectory dir)
-        File.WriteAllText(Path.Combine(dir, "CURRENT"), "\n")
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "\n")
 
         let version, manifestNumber = ok (Manifest.openOrCreate dir)
         Assert.Equal<int64<manifestNo>>(1L<manifestNo>, manifestNumber)
@@ -138,9 +137,9 @@ let ``Manifest: 空の CURRENT は新規作成として扱う`` () =
 let ``Manifest: CURRENT の .manifest 付き表記は番号として読む`` () =
     withDir "manifest-suffix" (fun dir ->
         ok (Manifest.ensureDirectory dir)
-        File.WriteAllText(Path.Combine(dir, "CURRENT"), "MANIFEST-000007.manifest\n")
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "MANIFEST-000007.manifest\n")
         // 指している MANIFEST は空でよい
-        File.WriteAllText(Path.Combine(dir, "MANIFEST-000007"), "")
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "MANIFEST-000007"), "")
 
         let version, manifestNumber = ok (Manifest.openOrCreate dir)
         Assert.Equal<int64<manifestNo>>(7L<manifestNo>, manifestNumber)
@@ -150,7 +149,7 @@ let ``Manifest: CURRENT の .manifest 付き表記は番号として読む`` () 
 let ``Manifest: CURRENT が指す MANIFEST が無ければ CorruptionError`` () =
     withDir "manifest-missing" (fun dir ->
         ok (Manifest.ensureDirectory dir)
-        File.WriteAllText(Path.Combine(dir, "CURRENT"), "MANIFEST-000007\n")
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "MANIFEST-000007\n")
 
         // 空の Version で開くと SSTable が孤児になるので、開かずにエラーにする
         expectErrorKind ErrorKind.CorruptionError "manifest の欠落はエラーになる" (Manifest.openOrCreate dir))
@@ -159,7 +158,7 @@ let ``Manifest: CURRENT が指す MANIFEST が無ければ CorruptionError`` () 
 let ``Manifest: CURRENT が無いのに SSTable があれば CorruptionError`` () =
     withDir "manifest-no-current" (fun dir ->
         ok (Manifest.ensureDirectory dir)
-        File.WriteAllBytes(Path.Combine(dir, "000001.sst"), [| 1uy |])
+        System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "000001.sst"), [| 1uy |])
 
         expectErrorKind ErrorKind.CorruptionError "SSTable を孤児にしないため開かない" (Manifest.openOrCreate dir))
 
@@ -167,10 +166,10 @@ let ``Manifest: CURRENT が無いのに SSTable があれば CorruptionError`` (
 let ``Manifest: 中身があるのに Version が空なら CorruptionError`` () =
     withDir "manifest-empty-version" (fun dir ->
         ok (Manifest.ensureDirectory dir)
-        File.WriteAllText(Path.Combine(dir, "CURRENT"), "MANIFEST-000001\n")
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "MANIFEST-000001\n")
         // "AAAA" は 4バイトで、チェックサムフレームとしても VersionEdit としても不正
-        File.WriteAllText(Path.Combine(dir, "MANIFEST-000001"), "AAAA\n")
-        File.WriteAllBytes(Path.Combine(dir, "000002.sst"), [| 1uy |])
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "MANIFEST-000001"), "AAAA\n")
+        System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "000002.sst"), [| 1uy |])
 
         expectErrorKind ErrorKind.CorruptionError "SSTable があるのに空の Version はエラー" (Manifest.openOrCreate dir))
 
@@ -178,7 +177,7 @@ let ``Manifest: 中身があるのに Version が空なら CorruptionError`` () 
 let ``Manifest: CURRENT が不正なら CorruptionError`` () =
     withDir "manifest-corrupt" (fun dir ->
         ok (Manifest.ensureDirectory dir)
-        File.WriteAllText(Path.Combine(dir, "CURRENT"), "not-a-manifest")
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "not-a-manifest")
         expectErrorKind ErrorKind.CorruptionError "壊れた CURRENT はエラーになるはず" (Manifest.openOrCreate dir))
 
 [<Fact>]

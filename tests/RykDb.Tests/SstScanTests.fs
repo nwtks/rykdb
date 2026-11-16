@@ -22,9 +22,7 @@ let private scanOfArray (items: SstEntry array) =
 let private drainMerge (merge: SstMerge) =
     let rec loop (m: SstMerge) (acc: SstEntry list) =
         match SstMerge.next m with
-        | Error e ->
-            Assert.Fail(sprintf "マージでエラー: %s" (DbError.toDisplayString e))
-            Unchecked.defaultof<SstEntry array>
+        | Error e -> failwithf "マージでエラー: %s" (DbError.toDisplayString e)
         | Ok None -> List.rev acc |> List.toArray
         | Ok(Some(e, rest)) -> loop rest (e :: acc)
 
@@ -96,7 +94,7 @@ let ``ScanScope: 最後まで読むと登録が外れる`` () =
 let ``SstScan.empty: 次は None`` () =
     match SstScan.next SstScan.Empty with
     | Ok None -> ()
-    | other -> Assert.Fail(sprintf "empty は None を返すべき: %A" other)
+    | other -> failActual "empty は None を返すべき" other
 
 [<Fact>]
 let ``SstScan.emit: 1件ずつ取り出せる`` () =

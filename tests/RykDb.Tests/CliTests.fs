@@ -73,9 +73,7 @@ SELECT 1 / (id - 2) AS x FROM t ORDER BY id;
 INSERT INTO t VALUES (4);
 """
 
-        match runScript out session script with
-        | Error _ -> ()
-        | Ok() -> Assert.Fail "SELECT の途中エラーが Ok になっています"
+        expectError "SELECT の途中エラーが Ok になっています" (runScript out session script)
 
         let expected = [ "(0 rows)"; "(3 rows)"; "x"; "-"; "  -1" ]
         Assert.Equal<string list>(expected, lines (out.ToString()))

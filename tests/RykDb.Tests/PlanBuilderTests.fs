@@ -56,7 +56,7 @@ let ``PlanBuilder.buildLogicalWith: 単純な SELECT は Scan + Project にな�
 
         match tree with
         | Logical.Project(_, Logical.Scan(name, ScanMethod.SeqScan)) -> Assert.Equal<string>("people", name)
-        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+        | _ -> failActual "想定外の形" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: WHERE があれば Scan の直下に Filter が付く`` () =
@@ -79,7 +79,7 @@ let ``PlanBuilder.buildLogicalWith: WHERE があれば Scan の直下に Filter 
             match method with
             | ScanMethod.SeqScan -> () // カタログに索引が無いので全走査
             | _ -> ()
-        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+        | _ -> failActual "想定外の形" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: JOIN があれば Logical.Join が作られる`` () =
@@ -106,7 +106,7 @@ let ``PlanBuilder.buildLogicalWith: JOIN があれば Logical.Join が作られ�
         | Logical.Project(_, Logical.Join(JoinKind.Inner, rightName, _, Logical.Scan(leftName, _), _)) ->
             Assert.Equal<string>("people", leftName)
             Assert.Equal<string>("orders", rightName)
-        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+        | _ -> failActual "想定外の形" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: FROM のサブクエリは Logical.Derived になる`` () =
@@ -144,7 +144,7 @@ let ``PlanBuilder.buildLogicalWith: FROM のサブクエリは Logical.Derived �
         | Logical.Project(_, Logical.Derived p) ->
             Assert.Equal<string>("id", p.Output.Columns.[0].Name)
             Assert.Equal<string option>(Some "x", p.Output.Columns.[0].Qualifier)
-        | other -> Assert.Fail(sprintf "Derived ではない: %A" other))
+        | other -> failActual "Derived ではない" other)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: GROUP BY があれば Logical.Aggregate が作られる`` () =
@@ -172,7 +172,7 @@ let ``PlanBuilder.buildLogicalWith: GROUP BY があれば Logical.Aggregate が�
         | Logical.Project(_, Logical.Aggregate(groupBy, aggs, _)) ->
             Assert.Equal<int>(1, groupBy.Length)
             Assert.Equal<int>(1, aggs |> List.length)
-        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+        | _ -> failActual "想定外の形" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: 集約がなければ Logical.Aggregate は作られない`` () =
@@ -195,7 +195,7 @@ let ``PlanBuilder.buildLogicalWith: 集約がなければ Logical.Aggregate は�
 
         match tree with
         | Logical.Project(_, Logical.Scan(_, _)) -> ()
-        | _ -> Assert.Fail(sprintf "集約が無いのに集約がある: %A" tree))
+        | _ -> failActual "集約が無いのに集約がある" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: LIMIT / OFFSET は Logical.Limit になる`` () =
@@ -219,7 +219,7 @@ let ``PlanBuilder.buildLogicalWith: LIMIT / OFFSET は Logical.Limit になる``
         | Logical.Limit(offset, limit, Logical.Project(_, _)) ->
             Assert.Equal<int>(5, offset)
             Assert.Equal<int>(10, limit)
-        | _ -> Assert.Fail(sprintf "LIMIT が木の中心でない: %A" tree))
+        | _ -> failActual "LIMIT が木の中心でない" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: FROM が無ければ Values（1 行 0 列）が入力になる`` () =
@@ -243,7 +243,7 @@ let ``PlanBuilder.buildLogicalWith: FROM が無ければ Values（1 行 0 列）
         // 入力は Logical.Values（1 行 0 列）で、その上に射影が載る
         match tree with
         | Logical.Project(_, Logical.Values _) -> ()
-        | _ -> Assert.Fail(sprintf "FROM なしの入力が Values でない: %A" tree))
+        | _ -> failActual "FROM なしの入力が Values でない" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: LIMIT の定数式と OFFSET 単独`` () =
@@ -269,7 +269,7 @@ let ``PlanBuilder.buildLogicalWith: LIMIT の定数式と OFFSET 単独`` () =
 
         match ok (PlanBuilder.buildLogicalWith ctx stmt3 Map.empty) with
         | Logical.Limit(0, 1, _) -> ()
-        | other -> Assert.Fail(sprintf "LIMIT 1+0 が 1 になっていない: %A" other)
+        | other -> failActual "LIMIT 1+0 が 1 になっていない" other
 
         // OFFSET だけ指定（Limit = None の分岐）→ limit = -1（制限なし）
         let stmt2 =
@@ -279,7 +279,7 @@ let ``PlanBuilder.buildLogicalWith: LIMIT の定数式と OFFSET 単独`` () =
 
         match ok (PlanBuilder.buildLogicalWith ctx stmt2 Map.empty) with
         | Logical.Limit(3, -1, _) -> ()
-        | other -> Assert.Fail(sprintf "OFFSET が 3 になっていない: %A" other))
+        | other -> failActual "OFFSET が 3 になっていない" other)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: 主キー順の ORDER BY は Sort を作らない`` () =
@@ -304,7 +304,7 @@ let ``PlanBuilder.buildLogicalWith: 主キー順の ORDER BY は Sort を作ら�
 
         match ok (PlanBuilder.buildLogicalWith ctx stmt Map.empty) with
         | Logical.Project(_, Logical.Scan("people", ScanMethod.SeqScan)) -> ()
-        | other -> Assert.Fail(sprintf "Sort が残っています: %A" other))
+        | other -> failActual "Sort が残っています" other)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: 主キー以外・降順の ORDER BY は Sort を作る`` () =
@@ -356,12 +356,12 @@ let ``PlanBuilder.buildLogicalWith: 複合主キーは全列の昇順なら Sort
                 ]
         with
         | Logical.Project(_, Logical.Scan("people", ScanMethod.SeqScan)) -> ()
-        | other -> Assert.Fail(sprintf "複合主キーの全列でも Sort が残っています: %A" other)
+        | other -> failActual "複合主キーの全列でも Sort が残っています" other
 
         // 主キーの先頭 1列だけでは並びが決まらない → ソートが必要
         match treeOf [ key (pCol "id") SortDirection.Ascending ] with
         | Logical.Project(_, Logical.Sort _) -> ()
-        | other -> Assert.Fail(sprintf "主キーの一部なのに Sort がありません: %A" other)
+        | other -> failActual "主キーの一部なのに Sort がありません" other
 
         // 主キーの列でも定義順と違えばソートが必要
         match
@@ -372,7 +372,7 @@ let ``PlanBuilder.buildLogicalWith: 複合主キーは全列の昇順なら Sort
                 ]
         with
         | Logical.Project(_, Logical.Sort _) -> ()
-        | other -> Assert.Fail(sprintf "主キーの順序違いなのに Sort がありません: %A" other))
+        | other -> failActual "主キーの順序違いなのに Sort がありません" other)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: FROM なしの * と JOIN はエラー`` () =
@@ -450,7 +450,7 @@ let ``PlanBuilder.buildLogicalWith: WHERE の結合述語は INNER の ON へ昇
         match tree with
         | Logical.Project(_, Logical.Join(JoinKind.Inner, "orders", on, _, _)) ->
             Assert.Contains("person_id", Expr.toDisplayString on)
-        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+        | _ -> failActual "想定外の形" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: INNER の結合順は選択性の高いテーブルを先に積む`` () =
@@ -487,8 +487,8 @@ let ``PlanBuilder.buildLogicalWith: INNER の結合順は選択性の高いテ�
             | Logical.Join(JoinKind.Inner, inner, _, Logical.Scan(first, _), _) ->
                 Assert.Equal<string>("xtra", inner)
                 Assert.Equal<string>("people", first)
-            | _ -> Assert.Fail(sprintf "想定外の左部分木: %A" left)
-        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+            | _ -> failActual "想定外の左部分木" left
+        | _ -> failActual "想定外の形" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: LEFT JOIN は結合順の境界になる`` () =
@@ -521,8 +521,8 @@ let ``PlanBuilder.buildLogicalWith: LEFT JOIN は結合順の境界になる`` (
             match left with
             | Logical.Join(JoinKind.Left, "orders", _, Logical.Scan(first, _), _) ->
                 Assert.Equal<string>("people", first)
-            | _ -> Assert.Fail(sprintf "想定外の左部分木: %A" left)
-        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+            | _ -> failActual "想定外の左部分木" left
+        | _ -> failActual "想定外の形" tree)
 
 [<Fact>]
 let ``PlanBuilder.buildLogicalWith: INNER の後に続く LEFT JOIN も積まれる`` () =
@@ -554,4 +554,4 @@ let ``PlanBuilder.buildLogicalWith: INNER の後に続く LEFT JOIN も積まれ
         match tree with
         | Logical.Project(_, Logical.Join(JoinKind.Left, "xtra", _, Logical.Join(JoinKind.Inner, "orders", _, _, _), _)) ->
             ()
-        | _ -> Assert.Fail(sprintf "想定外の形: %A" tree))
+        | _ -> failActual "想定外の形" tree)

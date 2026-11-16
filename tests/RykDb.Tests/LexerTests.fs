@@ -6,6 +6,7 @@ module RykDb.LexerTests
 
 open Xunit
 open RykDb.Core
+open RykDb.TestHelpers
 
 let private tokens (sql: string) =
     match Lexer.tokenize sql with
@@ -86,7 +87,7 @@ let ``Lexer: バイナリリテラル`` () =
 
     match ks with
     | [ Token.BlobLit b; Token.Eos ] -> Assert.Equal<byte array>([| 0xABuy |], b)
-    | other -> Assert.Fail(sprintf "BlobLit ではない: %A" other)
+    | other -> failActual "BlobLit ではない" other
 
 [<Fact>]
 let ``Lexer: 実数の指数表記`` () =
@@ -115,25 +116,19 @@ let ``Lexer: 空入力は Eof のみ`` () =
 
     match ts.Head.Token with
     | Token.Eos -> ()
-    | other -> Assert.Fail(sprintf "Eof ではない: %A" other)
+    | other -> failActual "Eof ではない" other
 
 [<Fact>]
 let ``Lexer: 閉じないブロックコメントはエラー`` () =
-    match Lexer.tokenize "1 /* unclosed" with
-    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
-    | Ok _ -> Assert.Fail "エラーになるべき"
+    expectErrorKind ErrorKind.SyntaxError "エラーになるべき" (Lexer.tokenize "1 /* unclosed")
 
 [<Fact>]
 let ``Lexer: 閉じない文字列はエラー`` () =
-    match Lexer.tokenize "'unclosed" with
-    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
-    | Ok _ -> Assert.Fail "エラーになるべき"
+    expectErrorKind ErrorKind.SyntaxError "エラーになるべき" (Lexer.tokenize "'unclosed")
 
 [<Fact>]
 let ``Lexer: 予期しない文字はエラー`` () =
-    match Lexer.tokenize "@" with
-    | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
-    | Ok _ -> Assert.Fail "エラーになるべき"
+    expectErrorKind ErrorKind.SyntaxError "エラーになるべき" (Lexer.tokenize "@")
 
 [<Fact>]
 let ``Lexer: 大きすぎる整数はエラー`` () =
@@ -145,9 +140,7 @@ let ``Lexer: 大きすぎる整数はエラー`` () =
 [<Fact>]
 let ``Lexer: バイナリリテラルの異常系はエラー`` () =
     let bad (sql: string) =
-        match Lexer.tokenize sql with
-        | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
-        | Ok _ -> Assert.Fail(sprintf "エラーになるべき: %s" sql)
+        expectErrorKind ErrorKind.SyntaxError (sprintf "エラーになるべき: %s" sql) (Lexer.tokenize sql)
 
     bad "X'12" // 閉じていない
     bad "X'123'" // 桁数が奇数
@@ -200,7 +193,7 @@ let ``Lexer: バイナリリテラルは空・小文字・混在した 16 進を
     | [ Token.BlobLit empty; Token.BlobLit bytes; Token.Eos ] ->
         Assert.Empty empty
         Assert.Equal<byte array>([| 0xABuy; 0xCDuy |], bytes)
-    | other -> Assert.Fail(sprintf "BlobLit ではない: %A" other)
+    | other -> failActual "BlobLit ではない" other
 
 [<Fact>]
 let ``Lexer: 識別子に数字とアンダースコアを含められる`` () =
@@ -229,9 +222,7 @@ let ``Lexer: 比較・論理演算子の記号を 1 トークンで読む`` () =
 [<Fact>]
 let ``Lexer: 単独の ! と | はエラー`` () =
     let bad (sql: string) =
-        match Lexer.tokenize sql with
-        | Error e -> Assert.Equal(ErrorKind.SyntaxError, e.Kind)
-        | Ok _ -> Assert.Fail(sprintf "エラーになるべき: %s" sql)
+        expectErrorKind ErrorKind.SyntaxError (sprintf "エラーになるべき: %s" sql) (Lexer.tokenize sql)
 
     bad "!"
     bad "|"

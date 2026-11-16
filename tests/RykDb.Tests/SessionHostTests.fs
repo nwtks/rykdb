@@ -4,8 +4,6 @@
 
 module RykDb.SessionHostTests
 
-open System.Threading
-open System.Threading.Tasks
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -69,7 +67,7 @@ let ``CommitDurability: 同時待機でも fsync は 1回だけ`` () =
 
     let durable =
         CommitDurability(fun _ ->
-            Interlocked.Increment(&syncs) |> ignore
+            System.Threading.Interlocked.Increment(&syncs) |> ignore
             ret ())
 
     let first = pos 40L 10
@@ -79,10 +77,10 @@ let ``CommitDurability: 同時待機でも fsync は 1回だけ`` () =
 
     let tasks =
         [|
-            Task.Run(fun () -> durable.Await first)
-            Task.Run(fun () -> durable.Await second)
+            System.Threading.Tasks.Task.Run(fun () -> durable.Await first)
+            System.Threading.Tasks.Task.Run(fun () -> durable.Await second)
         |]
 
-    Task.WaitAll(tasks |> Array.map (fun t -> t :> Task))
+    System.Threading.Tasks.Task.WaitAll(tasks |> Array.map (fun t -> t :> System.Threading.Tasks.Task))
     tasks |> Array.iter (fun t -> ok t.Result)
     Assert.Equal(1, syncs)

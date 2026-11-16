@@ -41,8 +41,13 @@
 ```fsharp
 type Op =
     | Done
-    | Step    of SqlValue array * Op                                    // 遅延しない
-    | Compute of (unit -> Result<(SqlValue array * Op) option, DbError>) // 遅延する
+    | Step    of SqlValue array * Op   // 遅延しない
+    | Compute of (unit -> OpStep)      // 遅延する
+
+and OpStep =
+    | OpDone
+    | OpError of DbError
+    | OpRow   of SqlValue array * Op
 ```
 
 ### 2.1 `Step` は遅延ではない（最重要）
@@ -74,7 +79,7 @@ let rec go (i: int) : Op =
 // ✅ Compute で「次を要求されてから 1行だけ」作る
 let rec go (i: int) : Op =
     if i >= rows.Length then Done
-    else Compute(fun () -> ret (Some(rows.[i], go (i + 1))))
+    else Compute(fun () -> OpStep.OpRow(rows.[i], go (i + 1)))
 ```
 
 ### 2.2 継続を「別ループ」に飛ばすと結果が落ちる
@@ -96,9 +101,9 @@ let rec go (src: Op) : Op =
 
 ```fsharp
 // ❌ 内側ループの 2行目以降が消える（JOIN で 3行あるはずが 2行になる）
-| Ok true -> Op.Step(Array.append lrow rrow, go lnext)
+| DbOk true -> OpStep.OpRow(Array.append lrow rrow, go lnext)
 // ✅ 同じ左行の「次の右行」へ続ける
-| Ok true -> Op.Step(Array.append lrow rrow, inner rest lrow lnext)
+| DbOk true -> OpStep.OpRow(Array.append lrow rrow, inner rest lrow lnext)
 ```
 
 教訓: **「継続」は必ず「今の位置の残り」を表す。ループを作り直さない**。
@@ -120,10 +125,10 @@ let rec go (cur: Op) (acc: SqlValue array list) =
 ```fsharp
 // ✅ 末尾位置の match + let rec。フレームが増えない。
 let rec go (cur: Op) : Result<SqlValue array array, DbError> =
-    match next cur with
-    | Error e -> Error e
-    | Ok None -> Ok(rows.ToArray())
-    | Ok(Some(row, nxt)) ->
+    match Op.next cur with
+    | OpStep.OpError e -> err e
+    | OpStep.OpDone -> ret (rows.ToArray())
+    | OpStep.OpRow(row, nxt) ->
         rows.Add row
         go nxt
 ```
@@ -139,17 +144,17 @@ let rec go (cur: Op) : Result<SqlValue array array, DbError> =
 // ✅ 既出の値をすべて覚えておく必要がある（符号化キーの HashSet<byte array>）
 ```
 
-### 2.5 評価エラーを `Op.empty` で「0行」にしない
+### 2.5 評価エラーを `Op.Empty` で「0行」にしない
 
-JOIN の ON 句のように行ごとに評価する式が失敗したとき、`Op.empty` に置き換えると
+JOIN の ON 句のように行ごとに評価する式が失敗したとき、`Op.Empty` に置き換えると
 **エラーが消えて「一致なし」の結果**になる。
 `INNER JOIN` では空の結果に、`LEFT JOIN` では NULL 埋めの行になり、どちらも原因を隠してしまう。
 
 ```fsharp
 // ❌ 評価失敗を「行が無い」と区別できない
-| Error _ -> Op.empty
+| DbErr _ -> Op.Empty
 // ✅ エラーを Op の計算として流し、呼び出し元の Result まで届ける
-| Error e -> Op.Compute(fun () -> err e)
+| DbErr e -> Op.compute (fun () -> OpStep.OpError e)
 ```
 
 ### 2.6 `Op` を返す関数を「値」にすると状態が全クエリで共有される
@@ -269,7 +274,7 @@ match Schema.resolve schema c with
 - 症状: `FROM a JOIN b ON … JOIN c ON …` が**エラーにならず 0行**を返す
   （2テーブル結合は正しく動く）。
   `joinPred` の `Schema.resolve` が列を見つけられず `Error` →
-  `joinLoop` の `onError` が `Op.empty` を返すため、**エラーにならず空の結果になる**。
+  `joinLoop` の `onError` が `Op.Empty` を返すため、**エラーにならず空の結果になる**。
 - 原因: `schema − 右テーブル` は段ごとに計算していたが、
   左へ渡すのが**全スキーマ**のままだったこと。
 
@@ -1012,7 +1017,7 @@ Assert.True(
 type internal Op =
     | Done
     | Step of SqlValue array * Op
-    | Compute of (unit -> Result<(SqlValue array * Op) option, DbError>)
+    | Compute of (unit -> OpStep)
 // ❌ どちらのファイルからも Op.Done / Op.Step が書けてしまう
 ```
 
@@ -1024,7 +1029,7 @@ type internal Op
 
 module internal Op =
     val Empty: Op
-    val next: Op -> Result<(SqlValue array * Op) option, DbError>
+    val next: Op -> OpStep
 ```
 
 - 効く範囲は `src` の他ファイルだけでなく、`InternalsVisibleTo` 先のテストにも及ぶ。
@@ -1391,10 +1396,10 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
   `Compaction.compactWith` 内の `pump` が `deleteOutputs` で削除する。
   プロセスがクラッシュした場合などに残った出力だけが
   MANIFEST に載らず、次回オープン時に孤児として `.orphans/` へ退避される（§11.13）。
-- 回帰テスト: `Compaction: 出力はエントリ数ではなく OutputFileTargetBytes ごとに分ける` /
-  `Compaction: 同じキーの版は出力ファイルを跨がない` /
-  `Compaction: 複数ブロックの入力をストリーミングで読み書きできる` /
-  `Compaction: 多数の入力ファイルをストリーミングでマージする`。
+- 回帰テスト: `Compaction.compact: 出力はエントリ数ではなく OutputFileTargetBytes ごとに分ける` /
+  `Compaction.compact: 同じキーの版は出力ファイルを跨がない` /
+  `Compaction.compact: 複数ブロックの入力をストリーミングで読み書きできる` /
+  `Compaction.compact: 多数の入力ファイルをストリーミングでマージする`。
 
 ### 11.12 `LastCommitted` は commit のたびに active snapshot 以前を捨てる
 
@@ -1599,7 +1604,7 @@ DDL だけはプロセス内で排他にする必要がある。
 
 **例外は主キー順の `ORDER BY`**。単一テーブル・集約なし・`DISTINCT` なしで、
 `ORDER BY` の先頭が主キー全列（定義順・昇順）なら `Sort` ノードを作らないので、
-`ORDER BY 主キー LIMIT n` のヒントが走査まで降りる（`Planner.sortIsRedundant`）。
+`ORDER BY 主キー LIMIT n` のヒントが走査まで降りる（`PlanBuilder.sortIsRedundant`）。
 主キーの一部だけ・`DESC`・索引走査になる条件（`WHERE 索引列 = ...` など）・集約・`DISTINCT`・結合では
 従来どおりソートする。
 回帰テストは `Database: 主キー順の ORDER BY は Sort を作らず LIMIT がストレージへ降りる`
@@ -1642,12 +1647,12 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 既存行がある状態の `BEGIN; INSERT/UPDATE; SELECT` が行の欠落・重複・古い値を返していた
 （`Dml.overlayRows`）。
 
-- 正しい形: `match Op.next cur with | Ok(Some(row, nxt)) -> ... merge nxt ...`
-- **構築は `Op.empty` / `Op.ofRow` / `Op.emit` / `Op.compute` / `Op.ofArray` に限る**。
+- 正しい形: `match Op.next cur with | OpStep.OpRow(row, nxt) -> ... merge nxt ...`
+- **構築は `Op.Empty` / `Op.ofRow` / `Op.emit` / `Op.compute` / `Op.ofArray` に限る**。
   `Op.Done` / `Op.Step` / `Op.Compute` を直接書かない
-  （`OpTests` の `構築はスマートコンストラクタに限る` がソースを検査する）。
+  （`Op.fsi` でケースを隠しているため、src の他ファイルから直接構築・パターンマッチできない）。
 - テストでは `TestHelpers.oneShot` でソースを包むと、2 回目の `next` を検出できる。
-- 回帰テスト: `E2E: 既存行がある transaction 内の INSERT は SELECT に全行見える` /
+- 回帰テスト: `Database: 既存行がある transaction 内の INSERT は SELECT に全行見える` /
   `...複数 UPDATE が正しい` / `...索引検索が書き込みを見る`。
 - store が空の transaction だけを試すと、このバグは出ない。
 
@@ -1657,7 +1662,7 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 `SELECT age ... GROUP BY age HAVING COUNT(*) > 1` の `COUNT(*)` が集約ノードで計算されず、
 `substituteAggs` が `NULL` に置き換えるため条件が UNKNOWN になり、**静かに 0行**になる。
 
-- `Planner.applyAggregate` は HAVING の式から `Ops.aggCalls` で集約を集め、
+- `PlanBuilder.applyAggregate` は HAVING の式から `Ops.aggCalls` で集約を集め、
   `allAggs` と `hasAgg` に含める。
 - 回帰テスト: `SqlReference: HAVING にしか現れない集約でも絞り込める`。
 
@@ -1691,7 +1696,7 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
 
 `Schema.expandStar` は修飾子に一致する列が 0件でも `Some(true, [])` を返す。
 そのままだと `SELECT nope.* FROM t` が「0列・1行」で成功し、列の無い結果を静かに返す。
-`Planner.buildLogicalWith` で `Schema.hasQualifier` を検査し、`NameError` にする。
+`PlanBuilder.buildLogicalWith` で `Schema.hasQualifier` を検査し、`NameError` にする。
 
 - 回帰テスト: `SqlReference: FROM に無い t.* は NameError`。
 
@@ -1737,7 +1742,7 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 （multi-pass merge）。
 
 - 中間 run も同じ `[varint 長][ValueCodec]` 形式で、読み終えた入力 run は削除する。
-- 回帰テスト: `ExtSort: 5000行を小さなバジェットで溢らしても整列できる`
+- 回帰テスト: `ExtSort.sortRows: 50000行を小さなバジェットで溢らしても整列できる`
   （数百 run を作り、一時ファイルが残らないことも確認）。
 
 ### 11.37 `StorageEngine` の書き込み Gate はディレクトリ単位にする
@@ -1798,10 +1803,10 @@ TEXT → 数値 / BOOLEAN を InvariantCulture で解析する。
 
 回帰テスト: `Eval.eval: CAST は TEXT から数値・BOOLEAN へ変換できる`。
 
-### 11.40 ORDER BY の序数は Planner で解決する
+### 11.40 ORDER BY の序数は PlanBuilder で解決する
 
 `ORDER BY 1` を式として評価すると「定数 1」のソートになり、静かに no-op になる。
-`Planner.applySort` が 1 始まりの序数を `SELECT` 項目の式へ置き換える。
+`PlanBuilder.applySort` が 1 始まりの序数を `SELECT` 項目の式へ置き換える。
 範囲外の序数は `SyntaxError`。
 `SELECT *` の序数は `Schema.expandStar` で列へ展開する。
 
@@ -1862,7 +1867,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 
 入れ子ループ / ハッシュ結合は右側の全行を保持する（設計どおり）。
 無制限だと巨大な右テーブルで OOM し、プロセスごと落ちる。
-`Ops.toArrayWithBudget` が **管理メモリ換算 256MiB** で打ち切り、
+`OpsJoin.toArrayWithBudget` が **管理メモリ換算 256MiB** で打ち切り、
 超過は `CapacityError`（`Ops.distinct` / transaction と同じ考え方）。
 
 - インデックス入れ子ループの検索結果（非一意索引の 1キーに大量の行）も同じ上限。
@@ -1941,7 +1946,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
   `a = b = c` や `a IS NULL = 1` はその場でエラーになる（括弧で囲めば通る）。
   サブクエリのため式と SELECT のパーサは同じ `let rec` グループにあり、**CPS** で書く。
   継続はヒープに積まれ、深さ上限はない（§11.48）。
-- **Planner のサブクエリ解決（`Plan.planSelectCWith` / `resolveSelectC` / `resolveExprC` / `resolveLeafC`）も CPS**。
+- **`Plan` のサブクエリ解決（`Plan.planSelectCWith` / `resolveSelectC` / `resolveExprC` / `resolveLeafC`）も CPS**。
   式の走査は `Expr.rewriteWithC`（葉の書き換えが継続を取る版）、
   リスト（項目 / JOIN / GROUP BY / ORDER BY）は `traverseC` が 1件ずつ継続で回す。
   葉からの `planSelectC` 呼び出しを `>>=` のレシーバに置くとそこでフレームが残るので、
@@ -1983,7 +1988,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 ### 11.49 FROM を省略した SELECT は「1行 0列」を入力にする
 
 `SELECT 1` / `SELECT 1 + 2 AS x` のような FROM なしの SELECT は、
-Parser が `From = None` にし、Planner が `Logical.Values [||]`（1行 0列）を入力にする。
+Parser が `From = None` にし、PlanBuilder が `Logical.Values [||]`（1行 0列）を入力にする。
 `WHERE` / 集約 / `ORDER BY` / 射影 / `DISTINCT` / `LIMIT` はその 1行にそのまま被せる。
 
 - `SELECT COUNT(*)` は **1**（`WHERE` で 0行にすれば 0）、
@@ -2137,8 +2142,8 @@ pin した Version とハンドルの snapshot seq が一致する。
 各接続の `Session.Close` が自分の transaction だけを rollback するので、
 所有権をサーバ側で追う必要がない（§11.64）。
 
-回帰テスト: `TCP: 他接続の切断は transaction を rollback しない` /
-`TCP: 接続中の接続があっても新しい接続を受け付ける` /
+回帰テスト: `Server: 他接続の切断は transaction を rollback しない` /
+`Server: 接続中の接続があっても新しい接続を受け付ける` /
 `SessionPool: 接続を閉じるとその transaction だけ rollback される`。
 
 ### 11.55 background compaction の worker は専用スレッドで起動する
@@ -2170,24 +2175,23 @@ worker は `signal.Wait()` でブロックし続ける長寿命タスクなの�
 
 ✅ テストでは `SpinWait.SpinUntil((fun () -> not session.InTransaction), 10000)` で rollback 完了を待つ。
 
-回帰テスト: `TCP: 切断時に open transaction は rollback される`。
+回帰テスト: `Server: 切断時に open transaction は rollback される`。
 
 ### 11.57 ORDER BY の比較関数は全順序にする（NULL を「等しい」にしない）
 
 ❌ `Ops.sortBy` の `compareWith` で、
-`SqlValue.compareValues` の `Error`（NULL 比較）を 0 に落とす。
+`SqlValue.compareValuesV` の `Error`（NULL 比較）を 0 に落とす。
 NULL がすべての値と等しい関係になり、推移律が壊れる。
 `Array.sortWith` や外部マージの k-way merge は全順序を前提にするため、
 NULL を含む列を `ORDER BY` すると**非 NULL の値が未ソートのまま**返る。
 
-✅ `SqlValue.compareValuesForSort` を使い、NULL を最小として全順序にする
+✅ `SqlValue.compareValuesForSortV` を使い、NULL を最小として全順序にする
 （`ASC` 先頭 / `DESC` 末尾、SQLite 互換）。
-`WHERE` などの 3値論理は `compareValues` のまま（NULL との比較は `UNKNOWN`）。
+`WHERE` などの 3値論理は `compareValuesV` のまま（NULL との比較は `UNKNOWN`）。
 `Ops.sortBy` の `check` は NULL を代表値にしない
 （NULL は型不一致の判定に使わず、非 NULL 同士だけを比較する）。
 
-回帰テスト: `SqlValue.compareValuesForSort: NULL は最小` /
-`sortBy: NULL は昇順で先頭、降順で末尾` /
+回帰テスト: `sortBy: NULL は昇順で先頭、降順で末尾` /
 `SqlReference: ORDER BY は NULL を昇順で先頭、降順で末尾に置く`。
 
 ### 11.58 TEXT の比較は UTF-8 の符号化順に合わせる
@@ -2202,8 +2206,7 @@ Ordinal は UTF-16 コード単位順であり、UTF-8 の符号化順と逆転�
 UTF-8 はコードポイント順にバイト列が増えるため、キー符号化の順序と一致する。
 不正なサロゲートは `Encoding.UTF8` と同じく `U+FFFD` として扱う。
 
-回帰テスト: `SqlValue.compareValues: TEXT は UTF-8 の符号化順で比較する` /
-`SqlReference: TEXT の比較は UTF-8 の符号化順に一致する`。
+回帰テスト: `SqlReference: TEXT の比較は UTF-8 の符号化順に一致する`。
 
 ### 11.59 REAL の -0.0 はキー・DISTINCT でも +0.0 に正規化する
 
@@ -2259,8 +2262,8 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 
 - continuation の差し替え時に古い登録を Dispose しない。
   同じファイルハンドルを共有しており、最新の continuation を閉じれば足りる。
-- 回帰テスト: `SstScanTests: ScanScope: 早期終了しても登録した走査を閉じられる` /
-  `SstScanTests: ScanScope: 最後まで読むと登録が外れる`。
+- 回帰テスト: `ScanScope: 早期終了しても登録した走査を閉じられる` /
+  `ScanScope: 最後まで読むと登録が外れる`。
 
 ### 11.62 RowReader は終端・Dispose で snapshot と走査を解放する
 
@@ -2346,7 +2349,7 @@ let leftSchema = { inSchema with Columns = inSchema.Columns |> Array.filter (fun
 **結合順を並べ替えると一致しない**。
 たとえば `a ⋈ c` を先に作ると左の行は `(a, c)` の順に並ぶが、
 `inSchema - b` は `(a, c)` ではなく元の `inSchema` の順を保つため、
-`Ops.innerJoinHash` などが列位置を取り違え、値が別の列から読まれる
+`OpsJoin.innerJoinHash` などが列位置を取り違え、値が別の列から読まれる
 （60 段 JOIN のテストで「59 を期待して 1 が返る」形で顕在化した）。
 
 ✅ `outputOf inSchema lTree` で**左部分木が実際に出力するレイアウト**を求めて渡す。
@@ -2354,7 +2357,7 @@ let leftSchema = { inSchema with Columns = inSchema.Columns |> Array.filter (fun
 （`Join` の出力 = 左のレイアウト + 右のレイアウト）。
 `Aggregate` も同じ理由で `outputOf inSchema child` を `AggregateFrame` に渡す。
 
-回帰テスト: `Database: 60 段の入れ子 JOIN が正しい行を返す` /
+回帰テスト: `末尾再帰: 60 段の入れ子 JOIN が正しい行を返す` /
 `SqlReference: 結合順が並べ替えられても結果は同じ`。
 
 ### 11.68 `INSERT ... SELECT` の選択は「文の開始時点の Op」で読む
@@ -2444,7 +2447,7 @@ B: COMMIT 成功              -- ← 重複したまま
 
 `Eval.eval` は呼び出しごとに `ColumnResolver` を作る簡易版で、
 行ごとに使うと `Schema.resolve` の線形探索と候補リストの割当が毎行発生する。
-`Eval.matches` という簡易版は無く、行ごとの述語評価は `Eval.matchesWith resolve row predicate` を使う。
+`Eval.matches` という簡易版は無く、行ごとの述語評価は `Eval.matchesWithV resolve row predicate` を使う。
 
 ```fsharp
 // ❌ 行ごとに resolver を捨てる（従来と同じコスト）
@@ -2452,7 +2455,7 @@ Op.filter (fun row -> Eval.eval schema row predicate)
 
 // ✅ 1オペレータ分だけ作って使い回す
 let resolve = Eval.resolver schema
-Op.filter (fun row -> Eval.matchesWith resolve row predicate)
+Op.filter (fun row -> Eval.matchesWithV resolve row predicate)
 ```
 
 - `Schema` が変わるところ（JOIN の出力、集約後の `Schema.empty`）では新しい resolver を作る。
@@ -2508,7 +2511,7 @@ type private Step =
   （ブロック CRC は読み込み時に検証済み）。
 - compaction の出力は `SstEntry.writeValueTo` が raw バイト列をそのままコピーする。
   `encodedValueLength` / `approximateBytes` も raw 長を使う。
-- 回帰テスト: `Sstable: raw スキャンは復号なしで同じ値・削除タグを返す`、
+- 回帰テスト: `SSTable: raw スキャンは復号なしで同じ値・削除タグを返す`、
   `CompactionTests` は `openBackRaw` で raw 経路を通す。
 - 計測（`tools/RykDb.Bench --class compaction --quick`、L0 4ファイル・10万件）:
   復号あり 424ms / 380MB → raw **296ms / 302MB**。
@@ -2521,7 +2524,7 @@ type private Step =
 - 空マスク（`COUNT(*)` / `SELECT 1 FROM t`）でも **行の要素数は 0 にしない**。
   スキーマ幅で `Unloaded` を並べる（`ORDER BY 1` のソートキー位置がずれないようにする）。
 - `Unloaded` を比較・ソート・DISTINCT・符号化に渡してはいけない。
-  `compareValues` は内部エラー、`KeyBuilder.ofValues` / `ValueCodec.writeValues` /
+  `compareValuesV` は内部エラー、`KeyBuilder.ofValues` / `ValueCodec.writeValues` /
   `ValueCodec.writeValuesTo` は `InternalError` を返す（例外は投げない）。
 - `Dml.opOfScan` は空の行を `Unloaded` でパディングする。
   `NULL` で埋めない（誤って読んだときに静かに NULL 扱いにならないようにするため）。
@@ -2605,3 +2608,34 @@ Core のホットパスでは次の 2 つを使い、公開 API の境界で `Re
 - 残りの大きな割当は `SstScan.next` / `StorageEngine.scanAtWith` / `Sstable.parseBlockAt` の
   `Ok` + `Some` + tuple。
   スキャン系をさらに削るならこの層（Phase D）。
+
+### 11.76 部分関数は protect の外で例外になる — `Array.reduce` / `.Value` / `List.last` を総和化
+
+`Errors.protect` の catch-all が挟まらない経路では、部分関数の例外は公開 API まで抜ける
+（`Database.Execute` / `Session.Execute` に catch-all は無い。
+背景 compaction のみ `EngineHost.loop` の catch が受けて `LastCompactionError` になる）。
+
+- **`Compaction.expand` の `Array.reduce`（`minKeyOf` / `maxKeyOf`）**:
+  `found = []` は `Smallest > Largest` の壊れた MANIFEST だけが起こす
+  （正常な seed は必ず自分の範囲に残り、探索範囲は単調に広がる）。
+  `VersionEdit.decode` はレベル範囲しか検査せず、
+  `Smallest <= Largest` の検査はテスト側の private `validate` だけなので、
+  同期 compaction に来ると **`ArgumentException: The input array was empty` が未処理例外で脱出**していた（実測）。
+  → 1パスの fold にした `Compaction.boundsOf` が空なら `DbError.corruption`。
+  `expand` / `selectInputs` / `compactPlan` は `Result` を通し、`compactPlan` は `result { let! ... }` に。
+  - 回帰テスト: `Compaction.compact: Smallest > Largest の入力は CorruptionError になる`
+    （`fmd 1L 0 2 1` で境界反転 + `L0CompactionTrigger = 1`。修正前に例外で落ちることを実測済み）
+- **`Optimizer` の `frame.Keys.Value`（3箇所）**:
+  `Keys = None` は `chooseJoinAlgorithm` が NestedLoop を返すときだけで、Hash / Merge / IndexNestedLoop では必ず `Some keys`。
+  `.Value` は例外なので、`match frame.Keys with | None -> err (DbError.internalError ...)` に変更。
+  `execIndexJoin` の戻り値は `Result<Op, DbError>` になり、呼び出し側は `JoinApplyFrame` と同じ形に。
+- **`Engine` / `RowStore` の `List.last`**: 先行の `Ok([], _)` 腕が空を弾いていたので実害は無いが、
+  腕の並べ替え・削除で壊れる。
+  `List.tryLast` で総和化し、空チャンクの腕と 1 本の match に統合。
+
+判断基準: 「制御フローで自明に安全」でも、**(1) protect 外に出る経路**と **(2) 型で保証されない**の
+2点が揃うなら総和化する。
+今回はスコープ外にした 3 件（いずれも 1 点が欠ける）:
+`ParserExpr.fs` の `List.head`（`List.length = 1` の直後）、
+`Serialization.fs` の `List.head`（seed 付きの `crcTables.build`）、
+`ExecContext.fs` の `Array.forall2`（同スキーマ前提、幅不一致なら `ArgumentException`）。

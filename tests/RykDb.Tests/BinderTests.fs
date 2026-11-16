@@ -20,7 +20,7 @@ let ``Binder.qualify: 修飾子無しの列が一意なら修飾名を付ける`
 
     match bound with
     | Expr.Column c -> Assert.Equal<string>("people", defaultArg c.Qualifier "")
-    | _ -> Assert.Fail "EColumn ではない"
+    | other -> failActual "EColumn ではない" other
 
 [<Fact>]
 let ``Binder.qualify: 修飾子無しの列が曖昧なら付けない`` () =
@@ -50,7 +50,7 @@ let ``Binder.qualify: 修飾子無しの列が曖昧なら付けない`` () =
 
     match bound with
     | Expr.Column c -> Assert.True(System.String.IsNullOrEmpty(defaultArg c.Qualifier ""))
-    | _ -> Assert.Fail "Expr.EColumn ではない"
+    | other -> failActual "Expr.EColumn ではない" other
 
 [<Fact>]
 let ``Binder.qualify: スターは修飾の対象外`` () =
@@ -59,7 +59,7 @@ let ``Binder.qualify: スターは修飾の対象外`` () =
 
     match bound with
     | Expr.QualifiedStar q -> Assert.Equal<string>("people", q)
-    | other -> Assert.Fail(sprintf "QualifiedStar ではない: %A" other)
+    | other -> failActual "QualifiedStar ではない" other
 
 [<Fact>]
 let ``Binder.qualify: 全ノード種を qualify しても構造が保たれる`` () =

@@ -210,7 +210,7 @@ let ``Expr.toDisplayString: その他の演算子の表示`` () =
 let ``Ast: BLOB リテラルは SqlValue へ変換できる`` () =
     match (Literal.Blob [| 1uy; 2uy |]).ToSqlValue with
     | SqlValue.Blob b -> Assert.Equal<byte array>([| 1uy; 2uy |], b)
-    | v -> Assert.Fail(sprintf "BLOB が Blob になりません: %A" v)
+    | v -> failActual "BLOB が Blob になりません" v
 
 [<Fact>]
 let ``Ast: AggFunc と BinaryOp の表示名`` () =

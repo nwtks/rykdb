@@ -158,15 +158,15 @@ module internal Compaction =
                         OutputLevel = min (level + 1) Levels.Max
                     }
 
-        let minKeyOf files =
-            files
-            |> Array.map (fun f -> f.Smallest)
-            |> Array.reduce (fun a b -> if Bytes.compare a b <= 0 then a else b)
+        let widen (mn, mx) f =
+            let mn' = if Bytes.compare f.Smallest mn <= 0 then f.Smallest else mn
+            let mx' = if Bytes.compare f.Largest mx >= 0 then f.Largest else mx
+            mn', mx'
 
-        let maxKeyOf files =
-            files
-            |> Array.map (fun f -> f.Largest)
-            |> Array.reduce (fun a b -> if Bytes.compare a b >= 0 then a else b)
+        let boundsOf files =
+            match Array.tryHead files with
+            | None -> err (DbError.corruption "compaction の入力ファイルが空です（MANIFEST のキー範囲が不正）")
+            | Some first -> ret (files |> Array.fold widen (first.Smallest, first.Largest))
 
         let inRange minKey maxKey f =
             Bytes.compare f.Largest minKey >= 0 && Bytes.compare f.Smallest maxKey <= 0
@@ -175,20 +175,21 @@ module internal Compaction =
             let inputs = current |> Array.filter (inRange minBound maxBound)
             let nextFiles = next |> Array.filter (inRange minBound maxBound)
             let found = Array.append inputs nextFiles
-            let minKey' = minKeyOf found
-            let maxKey' = maxKeyOf found
 
-            if Bytes.compare minKey' minBound = 0 && Bytes.compare maxKey' maxBound = 0 then
-                inputs |> Array.toList, nextFiles |> Array.toList
-            else
-                expand current next minKey' maxKey'
+            match boundsOf found with
+            | Error e -> err e
+            | Ok(minKey', maxKey') ->
+                if Bytes.compare minKey' minBound = 0 && Bytes.compare maxKey' maxBound = 0 then
+                    ret (inputs |> Array.toList, nextFiles |> Array.toList)
+                else
+                    expand current next minKey' maxKey'
 
         let selectInputs version level maxFiles =
             let current = Version.filesAt level version
             let seed = current |> Array.toList |> List.truncate maxFiles
 
             match seed with
-            | [] -> [], []
+            | [] -> ret ([], [])
             | _ ->
                 let nextLevel = level + 1
 
@@ -199,7 +200,10 @@ module internal Compaction =
                         Version.filesAt nextLevel version
 
                 let seed' = Array.ofList seed
-                expand current next (minKeyOf seed') (maxKeyOf seed')
+
+                match boundsOf seed' with
+                | Error e -> err e
+                | Ok(minBound, maxBound) -> expand current next minBound maxBound
 
         let rec openAll files scans =
             match files with
@@ -331,10 +335,9 @@ module internal Compaction =
                 err e
 
         let compactPlan plan =
-            let inputs, nextFiles = selectInputs version plan.Level options.MaxInputFiles
-            let allInputs = inputs @ nextFiles
-
             result {
+                let! inputs, nextFiles = selectInputs version plan.Level options.MaxInputFiles
+                let allInputs = inputs @ nextFiles
                 let! scans = openAll allInputs []
                 let! merge = openMerge scans
                 return! runPump plan allInputs merge

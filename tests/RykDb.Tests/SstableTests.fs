@@ -1,10 +1,9 @@
 // ===========================================================================
-// Sstable.fs のテスト（部分読み・走査・点検索）
+// Sstable.fs のテスト（部分読み・走査・ポイント検索）
 // ===========================================================================
 
 module RykDb.SstableTests
 
-open System
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -126,11 +125,15 @@ let ``SSTable: 全 10型の値を往復できる`` () =
         [|
             [| SqlValue.Null |]
             [| SqlValue.Bool true; SqlValue.Bool false |]
-            [| SqlValue.Int Int64.MinValue; SqlValue.Int 0L; SqlValue.Int Int64.MaxValue |]
+            [|
+                SqlValue.Int System.Int64.MinValue
+                SqlValue.Int 0L
+                SqlValue.Int System.Int64.MaxValue
+            |]
             [|
                 SqlValue.Real -1.5
                 SqlValue.Real 0.0
-                SqlValue.Real Double.PositiveInfinity
+                SqlValue.Real System.Double.PositiveInfinity
             |]
             [|
                 SqlValue.Decimal -12345.6789M
@@ -139,9 +142,14 @@ let ``SSTable: 全 10型の値を往復できる`` () =
             |]
             [| SqlValue.Text ""; SqlValue.Text "hello"; SqlValue.Text "中文" |]
             [| SqlValue.Blob [||]; SqlValue.Blob [| 1uy; 2uy; 3uy |] |]
-            [| SqlValue.Date DateOnly.MinValue; SqlValue.Date DateOnly.MaxValue |]
-            [| SqlValue.Timestamp(DateTimeOffset(DateTime(0L, DateTimeKind.Utc))) |]
-            [| SqlValue.Uuid(Guid.Parse "01234567-89ab-cdef-0123-456789abcdef") |]
+            [|
+                SqlValue.Date System.DateOnly.MinValue
+                SqlValue.Date System.DateOnly.MaxValue
+            |]
+            [|
+                SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(0L, System.DateTimeKind.Utc)))
+            |]
+            [| SqlValue.Uuid(System.Guid.Parse "01234567-89ab-cdef-0123-456789abcdef") |]
         |]
 
     let entries =

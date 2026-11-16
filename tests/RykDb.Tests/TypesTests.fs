@@ -4,7 +4,6 @@
 
 module RykDb.TypesTests
 
-open System
 open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
@@ -60,9 +59,9 @@ let ``DataType: 型タグの往復と未知タグの扱い`` () =
 
 [<Fact>]
 let ``SqlValue: asNumeric は NaN と無限大を拒否する`` () =
-    Assert.True((SqlValue.asNumeric (SqlValue.Real Double.NaN)).IsNone)
-    Assert.True((SqlValue.asNumeric (SqlValue.Real Double.PositiveInfinity)).IsNone)
-    Assert.True((SqlValue.asNumeric (SqlValue.Real Double.NegativeInfinity)).IsNone)
+    Assert.True((SqlValue.asNumeric (SqlValue.Real System.Double.NaN)).IsNone)
+    Assert.True((SqlValue.asNumeric (SqlValue.Real System.Double.PositiveInfinity)).IsNone)
+    Assert.True((SqlValue.asNumeric (SqlValue.Real System.Double.NegativeInfinity)).IsNone)
     Assert.Equal<decimal option>(Some 2.5M, SqlValue.asNumeric (SqlValue.Real 2.5))
     Assert.Equal<decimal option>(Some 3M, SqlValue.asNumeric (SqlValue.Int 3L))
     Assert.True((SqlValue.asNumeric (SqlValue.Real 1e30)).IsNone)
@@ -81,13 +80,13 @@ let ``SqlValue.normalizeFloat: NaN 以外はそのまま返す`` () =
 
 [<Fact>]
 let ``SqlValue.normalizeFloat: -0.0 は +0.0 に正規化される`` () =
-    let negativeZero = BitConverter.Int64BitsToDouble 0x8000000000000000L
-    Assert.Equal(0L, BitConverter.DoubleToInt64Bits(SqlValue.normalizeFloat negativeZero))
-    Assert.Equal(0L, BitConverter.DoubleToInt64Bits(SqlValue.normalizeFloat 0.0))
+    let negativeZero = System.BitConverter.Int64BitsToDouble 0x8000000000000000L
+    Assert.Equal(0L, System.BitConverter.DoubleToInt64Bits(SqlValue.normalizeFloat negativeZero))
+    Assert.Equal(0L, System.BitConverter.DoubleToInt64Bits(SqlValue.normalizeFloat 0.0))
 
     match SqlValue.vReal negativeZero with
-    | SqlValue.Real f -> Assert.Equal(0L, BitConverter.DoubleToInt64Bits f)
-    | other -> Assert.Fail(sprintf "vReal が REAL ではありません: %A" other)
+    | SqlValue.Real f -> Assert.Equal(0L, System.BitConverter.DoubleToInt64Bits f)
+    | other -> failActual "vReal が REAL ではありません" other
 
 [<Fact>]
 let ``SqlValue.toDisplayString: 各型`` () =
@@ -98,31 +97,33 @@ let ``SqlValue.toDisplayString: 各型`` () =
     Assert.Equal("2.5", SqlValue.toDisplayString (SqlValue.Real 2.5))
     Assert.Equal("hi", SqlValue.toDisplayString (SqlValue.Text "hi"))
     Assert.Equal("<blob 3 bytes>", SqlValue.toDisplayString (SqlValue.Blob [| 1uy; 2uy; 3uy |]))
-    Assert.Equal("2026-01-02", SqlValue.toDisplayString (SqlValue.Date(DateOnly(2026, 1, 2))))
+    Assert.Equal("2026-01-02", SqlValue.toDisplayString (SqlValue.Date(System.DateOnly(2026, 1, 2))))
 
     Assert.Equal(
         "2026-01-02T03:04:05.000Z",
-        SqlValue.toDisplayString (SqlValue.Timestamp(DateTimeOffset(DateTime(2026, 1, 2, 3, 4, 5, DateTimeKind.Utc))))
+        SqlValue.toDisplayString (
+            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(2026, 1, 2, 3, 4, 5, System.DateTimeKind.Utc)))
+        )
     )
 
     Assert.Equal("1.5", SqlValue.toDisplayString (SqlValue.Decimal 1.5M))
 
     Assert.Equal(
         "11111111-1111-1111-1111-111111111111",
-        SqlValue.toDisplayString (SqlValue.Uuid(Guid "11111111-1111-1111-1111-111111111111"))
+        SqlValue.toDisplayString (SqlValue.Uuid(System.Guid "11111111-1111-1111-1111-111111111111"))
     )
 
 [<Fact>]
 let ``SqlValue.coerce: Int -> Real`` () =
     match SqlValue.coerce DataType.Real (SqlValue.Int 3L) with
     | Ok(SqlValue.Real f) -> Assert.Equal(3.0, f)
-    | other -> Assert.Fail(sprintf "coerce Int->Real が想定外: %A" other)
+    | other -> failActual "coerce Int->Real が想定外" other
 
 [<Fact>]
 let ``SqlValue.coerce: Real は数値と真偽値を受ける`` () =
     match SqlValue.coerce DataType.Real (SqlValue.Real 2.5) with
     | Ok(SqlValue.Real f) -> Assert.Equal(2.5, f)
-    | other -> Assert.Fail(sprintf "coerce Real->Real が想定外: %A" other)
+    | other -> failActual "coerce Real->Real が想定外" other
 
     Assert.Equal(SqlValue.Real 1.0, ok (SqlValue.coerce DataType.Real (SqlValue.Bool true)))
     Assert.Equal(SqlValue.Real 0.0, ok (SqlValue.coerce DataType.Real (SqlValue.Bool false)))
@@ -166,12 +167,12 @@ let ``SqlValue.coerce: Decimal は有限の数値だけ受ける`` () =
     Assert.Equal(SqlValue.Decimal 2.5M, ok (SqlValue.coerce DataType.Decimal (SqlValue.Real 2.5)))
     Assert.Equal(SqlValue.Decimal 1.0M, ok (SqlValue.coerce DataType.Decimal (SqlValue.Bool true)))
     Assert.Equal(SqlValue.Decimal 0.0M, ok (SqlValue.coerce DataType.Decimal (SqlValue.Bool false)))
-    expectErrorKind ErrorKind.TypeError "NaN は型エラー" (SqlValue.coerce DataType.Decimal (SqlValue.Real Double.NaN))
+    expectErrorKind ErrorKind.TypeError "NaN は型エラー" (SqlValue.coerce DataType.Decimal (SqlValue.Real System.Double.NaN))
 
     expectErrorKind
         ErrorKind.TypeError
         "Infinity は型エラー"
-        (SqlValue.coerce DataType.Decimal (SqlValue.Real Double.PositiveInfinity))
+        (SqlValue.coerce DataType.Decimal (SqlValue.Real System.Double.PositiveInfinity))
 
     expectErrorKind ErrorKind.TypeError "decimal の範囲外は型エラー" (SqlValue.coerce DataType.Decimal (SqlValue.Real 1e30))
     expectErrorKind ErrorKind.TypeError "文字列は型エラー" (SqlValue.coerce DataType.Decimal (SqlValue.Text "1"))
@@ -182,13 +183,13 @@ let ``SqlValue.coerce: Text / Blob / Uuid への変換`` () =
 
     match SqlValue.coerce DataType.Blob (SqlValue.Blob [| 1uy |]) with
     | Ok(SqlValue.Blob b) -> Assert.Equal<byte array>([| 1uy |], b)
-    | other -> Assert.Fail(sprintf "coerce Blob->Blob が想定外: %A" other)
+    | other -> failActual "coerce Blob->Blob が想定外" other
 
     match SqlValue.coerce DataType.Blob (SqlValue.Text "hi") with
     | Ok(SqlValue.Blob b) -> Assert.Equal<byte array>([| 104uy; 105uy |], b)
-    | other -> Assert.Fail(sprintf "coerce Text->Blob が想定外: %A" other)
+    | other -> failActual "coerce Text->Blob が想定外" other
 
-    let g = Guid "11111111-1111-1111-1111-111111111111"
+    let g = System.Guid "11111111-1111-1111-1111-111111111111"
     Assert.Equal(SqlValue.Uuid g, ok (SqlValue.coerce DataType.Uuid (SqlValue.Uuid g)))
     Assert.Equal(SqlValue.Uuid g, ok (SqlValue.coerce DataType.Uuid (SqlValue.Text(g.ToString "D"))))
     expectErrorKind ErrorKind.TypeError "GUID でない文字列は型エラー" (SqlValue.coerce DataType.Uuid (SqlValue.Text "not-a-guid"))
@@ -197,14 +198,16 @@ let ``SqlValue.coerce: Text / Blob / Uuid への変換`` () =
 
 [<Fact>]
 let ``SqlValue.coerce: Date / Timestamp の相互変換と Text 解析`` () =
-    let d = DateOnly(2026, 1, 2)
-    let t = DateTimeOffset(DateTime(2026, 1, 2, 3, 4, 5, DateTimeKind.Utc))
+    let d = System.DateOnly(2026, 1, 2)
+
+    let t =
+        System.DateTimeOffset(System.DateTime(2026, 1, 2, 3, 4, 5, System.DateTimeKind.Utc))
 
     // TIMESTAMP -> DATE は UTC の日付、DATE -> TIMESTAMP は UTC 午夜
     Assert.Equal(SqlValue.Date d, ok (SqlValue.coerce DataType.Date (SqlValue.Timestamp t)))
 
     Assert.Equal(
-        SqlValue.Timestamp(DateTimeOffset(DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc))),
+        SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(2026, 1, 2, 0, 0, 0, System.DateTimeKind.Utc))),
         ok (SqlValue.coerce DataType.Timestamp (SqlValue.Date d))
     )
 

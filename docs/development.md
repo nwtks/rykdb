@@ -69,7 +69,7 @@ lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>
    （ベースラインは `dotnet run --project tools/TailAudit -- --update` で生成する。
    **未生成なら全件を新規とみなして exit 1 になる**ので、内容を確認のうえ生成しておく。）
    - 非末尾は**「ラムダ内 / 直接」の内訳**を表示する。
-     ラムダ内 = `Compute` / `pull` 継続・CPS 継続（Planner・Parser）・Pratt の右辺降下。
+     ラムダ内 = `Compute` / `pull` 継続・CPS 継続（Plan・Parser）・Pratt の右辺降下。
      Parser の CPS は継続呼び出しが `bare`（関数値呼び出し）として非末尾に数えられるが、
      実行時は `tail.` で末尾呼び出しになるためベースラインで追認する。
      直接 = 監査部・引数など「結果を消費してから」型（**本来の末尾化候補**）。
@@ -80,7 +80,7 @@ lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>
 
 `[<TailCall>]` は構文上の検査にすぎない。
 `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` により Debug でも実際の `tail.` を出力する。
-この設定を外すと CPS（Planner のサブクエリ解決）や式の再帰がテストでスタックオーバーフローする
+この設定を外すと CPS（Plan のサブクエリ解決）や式の再帰がテストでスタックオーバーフローする
 （[`gotchas.md`](gotchas.md) §8.16）。
 式・サブクエリに深さ上限はない（[`coding-conventions.md`](coding-conventions.md) §3）。
 
@@ -108,7 +108,7 @@ dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"    # Server のみ
 （MVCC / WAL / プロセスロック / 索引 backfill・後始末 / snapshot 登録 / 永続性 / 末尾再帰）
 も検証する。
 `SqlReferenceTests` / `ServerTests` は「SQL 文字列 → 結果」の通し経路を検証する。
-Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだけで分かる。
+Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグはそこだけで分かる。
 
 **役割の分担**:
 
@@ -123,8 +123,16 @@ Parser / Analyzer / Planner / ExecContext / Catalog の連携バグはそこだ�
 - 1テスト = 1関数。
   `let ``説明`` () = ...` の**関数形**
   （FS0842: 関数でない場合、テストとして認識されず無視される）。
-- 共通ヘルパー（`ok` / `withDir` / `asInt` / 乱数生成 / `buildSstable` / `scanOfEntries` / `levelCounts` / `indexDefinition`）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
+- 共通ヘルパー（`ok` / `expectError` / `expectErrorKind` / `failActual` / `withDir` / `asInt` / `parseOneOk` / `whereOf` / 乱数生成 / `buildSstable` / `scanOfEntries` / `levelCounts` / `indexDefinition`）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
   ファイル固有のヘルパー・fixture（スキーマ、`DmlTests` の `insertRow` など）は各ファイルに private で置く。
+  **同一実装が 2ファイル以上にあるヘルパーは重複させず TestHelpers に置く**
+  （`parseStatement` / `parseOneOk` / `expectVariant` / `parseSelectOk` / `whereOf` を Parser 系 2ファイルから集約した）。
+- 失敗の書き方は役割で選ぶ:
+  - **variant 不一致・想定外の形の unit 腕** → `failActual "ラベル" 実値`
+    （`ラベル: 実値` を `%A` で表示する定型。メッセージを書くより実値が必ず残る）。
+  - **「エラーになるべき」** → `expectError` / `expectErrorKind`（Error 臂の検査も込み）。
+  - **値を返すヘルパー**（`ok` / `asInt` / `parseOneOk` など） → `failwithf`。
+    例外は xUnit が失敗として扱うので、`Assert.Fail` + `Unchecked.defaultof<'T>` のような**偽の戻り値は書かない**。
 - `withStore` / `withDb` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
   ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Database.OpenWith` を直接使って検証する。
 - 新しいファイルは `.fsproj` の Compile 順（= src のコンパイル順）に追加する。

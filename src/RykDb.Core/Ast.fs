@@ -117,6 +117,22 @@ type internal BinaryOp =
         | Or -> "OR"
         | Like -> "LIKE"
 
+/// 比較演算子。
+/// <remarks>
+/// `BinaryOp` の比較 6 種だけを型として抜き出したもので、
+/// 評価器（`Eval`）が 3 値論理へ変換するときの演算子表に使う。
+/// 文字列タグ（"eq" / "lt" など）で渡すと誤ったタグでも型検査が通るため、
+/// 演算子の分岐は必ずこの型で受け取る。
+/// </remarks>
+[<RequireQualifiedAccess>]
+type internal CompareOp =
+    | Eq
+    | Ne
+    | Lt
+    | Le
+    | Gt
+    | Ge
+
 [<RequireQualifiedAccess>]
 type internal JoinKind =
     | Inner

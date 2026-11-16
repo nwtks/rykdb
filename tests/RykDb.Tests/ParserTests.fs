@@ -9,39 +9,6 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 
-/// SQL テキストを 1 文として解析する。複数文はエラー。
-let private parseStatement (sql: string) =
-    Parser.parseStatements sql
-    >>= fun stmts ->
-        match stmts with
-        | [ s ] -> ret s
-        | [] -> err (DbError.create ErrorKind.SyntaxError "文がありません")
-        | _ -> err (DbError.create ErrorKind.SyntaxError "複数の文が渡されました（1 文ずつ実行してください）")
-
-/// SQL を 1 文解析し、失敗したらテストを落とす。
-let private parseOneOk (sql: string) =
-    match parseStatement sql with
-    | Ok s -> s
-    | Error e ->
-        Assert.Fail(sprintf "解析に失敗: %s\nSQL: %s" (DbError.toDisplayString e) sql)
-        Unchecked.defaultof<Statement>
-
-/// SQL を 1 文解析し、variant から値を抜き出せなければテストを落とす。
-let private expectVariant (tag: string) (pick: Statement -> 'T option) (sql: string) : 'T =
-    match pick (parseOneOk sql) with
-    | Some v -> v
-    | None ->
-        Assert.Fail(tag + " ではない: " + sql)
-        Unchecked.defaultof<'T>
-
-let private parseSelectOk (sql: string) : SelectStatement =
-    expectVariant
-        "SELECT"
-        (function
-        | Statement.Select s -> Some s
-        | _ -> None)
-        sql
-
 /// FROM の実テーブル参照（派生テーブルや FROM なしは None）。
 let private fromTable (sel: SelectStatement) =
     match sel.From with
@@ -96,14 +63,6 @@ let private parseDropTableOk (sql: string) : string * bool =
         | _ -> None)
         sql
 
-/// SELECT 文の WHERE 式を取り出す（無い・SELECT でないならテストを落とす）。
-let private whereOf (sql: string) : Expr =
-    match (parseSelectOk sql).Where with
-    | Some e -> e
-    | None ->
-        Assert.Fail("WHERE 句がありません: " + sql)
-        Unchecked.defaultof<Expr>
-
 /// WHERE 式の表示文字列（無いときは "(なし)"）。
 let private whereTextOf (sql: string) : string =
     match (parseSelectOk sql).Where with
@@ -129,7 +88,7 @@ let ``Parser: INSERT / UPDATE / DELETE`` () =
 
     match ins.Source with
     | InsertSource.Values rows -> Assert.Equal(2, rows.Length)
-    | other -> Assert.Fail(sprintf "VALUES ではない: %A" other)
+    | other -> failActual "VALUES ではない" other
 
     Assert.Equal<string list option>(Some [ "a"; "b" ], ins.Columns)
 
@@ -152,7 +111,7 @@ let ``Parser: INSERT ... SELECT`` () =
     | InsertSource.Select sel ->
         Assert.Equal(2, sel.Items.Length)
         Assert.True sel.Where.IsSome
-    | other -> Assert.Fail(sprintf "SELECT ではない: %A" other)
+    | other -> failActual "SELECT ではない" other
 
     // 列リストなし・ORDER BY / LIMIT 付き
     let ins2 = parseInsertOk "INSERT INTO t SELECT * FROM u ORDER BY x LIMIT 2"
@@ -162,7 +121,7 @@ let ``Parser: INSERT ... SELECT`` () =
     | InsertSource.Select sel ->
         Assert.Equal(1, sel.OrderBy.Length)
         Assert.True sel.Limit.IsSome
-    | other -> Assert.Fail(sprintf "SELECT ではない: %A" other)
+    | other -> failActual "SELECT ではない" other
 
 [<Fact>]
 let ``Parser: DML のテーブル別名は明示エラー`` () =
@@ -201,13 +160,13 @@ let ``Parser: CREATE INDEX IF NOT EXISTS`` () =
     | Statement.CreateIndex ci ->
         Assert.True ci.IfNotExists
         Assert.Equal<string>("ix", ci.Name)
-    | other -> Assert.Fail(sprintf "CREATE INDEX ではない: %A" other)
+    | other -> failActual "CREATE INDEX ではない" other
 
 [<Fact>]
 let ``Parser: 複数文`` () =
     match ok (Parser.parseStatements "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);") with
     | [ Statement.CreateTable _; Statement.Insert _ ] -> ()
-    | other -> Assert.Fail(sprintf "想定外の文列: %A" other)
+    | other -> failActual "想定外の文列" other
 
 [<Fact>]
 let ``Parser: 複数文は ; で区切る`` () =
@@ -230,37 +189,37 @@ let ``Parser: トランザクション制御`` () =
     // パターンマッチで検証する。
     match parseOneOk "BEGIN" with
     | Statement.Begin -> ()
-    | other -> Assert.Fail(sprintf "BEGIN ではない: %A" other)
+    | other -> failActual "BEGIN ではない" other
 
     match parseOneOk "COMMIT" with
     | Statement.Commit -> ()
-    | other -> Assert.Fail(sprintf "COMMIT ではない: %A" other)
+    | other -> failActual "COMMIT ではない" other
 
     match parseOneOk "ROLLBACK" with
     | Statement.Rollback -> ()
-    | other -> Assert.Fail(sprintf "ROLLBACK ではない: %A" other)
+    | other -> failActual "ROLLBACK ではない" other
 
 [<Fact>]
 let ``Parser: トランザクションの別綴り`` () =
     (match parseOneOk "BEGIN TRANSACTION" with
      | Statement.Begin -> ()
-     | other -> Assert.Fail(sprintf "BEGIN ではない: %A" other))
+     | other -> failActual "BEGIN ではない" other)
 
     (match parseOneOk "START TRANSACTION" with
      | Statement.Begin -> ()
-     | other -> Assert.Fail(sprintf "START ではない: %A" other))
+     | other -> failActual "START ではない" other)
 
     (match parseOneOk "COMMIT WORK" with
      | Statement.Commit -> ()
-     | other -> Assert.Fail(sprintf "COMMIT ではない: %A" other))
+     | other -> failActual "COMMIT ではない" other)
 
     (match parseOneOk "ROLLBACK TRANSACTION" with
      | Statement.Rollback -> ()
-     | other -> Assert.Fail(sprintf "ROLLBACK ではない: %A" other))
+     | other -> failActual "ROLLBACK ではない" other)
 
     match parseOneOk "END" with
     | Statement.Commit -> ()
-    | other -> Assert.Fail(sprintf "END ではない: %A" other)
+    | other -> failActual "END ではない" other
 
 [<Fact>]
 let ``Parser: 構文エラーは位置つき DbError`` () =
@@ -294,7 +253,7 @@ let ``Parser: 引用した識別子`` () =
 
     match sel.Items.[0].Expression with
     | Expr.QualifiedStar q -> Assert.Equal("p", q)
-    | other -> Assert.Fail(sprintf "QualifiedStar ではない: %A" other)
+    | other -> failActual "QualifiedStar ではない" other
 
 [<Fact>]
 let ``Parser: NULL.* を QualifiedStar にしない`` () =
@@ -331,7 +290,7 @@ let ``Parser: テーブル制約の主キー`` () =
 
     match ct.Constraints with
     | [ TableConstraint.PrimaryKeyColumns cols ] -> Assert.Equal<string list>([ "a"; "b" ], cols)
-    | other -> Assert.Fail(sprintf "テーブル制約が違う: %A" other)
+    | other -> failActual "テーブル制約が違う" other
 
 [<Fact>]
 let ``Parser: DROP INDEX`` () =
@@ -339,7 +298,7 @@ let ``Parser: DROP INDEX`` () =
     | Statement.DropIndex(n, ifEx) ->
         Assert.Equal("ix_g", n)
         Assert.True(ifEx)
-    | other -> Assert.Fail(sprintf "DROP INDEX ではない: %A" other)
+    | other -> failActual "DROP INDEX ではない" other
 
 [<Fact>]
 let ``Parser: リテラルと引用識別子を式として読める`` () =

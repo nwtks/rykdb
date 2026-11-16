@@ -577,13 +577,3 @@ module internal Ops =
 
                         fill 0 allExprs)
                     src
-
-    // 結合は実装を `OpsJoin.fs` に分けている。
-    let innerJoin = OpsJoin.innerJoin
-    let leftJoin = OpsJoin.leftJoin
-    let innerJoinHash = OpsJoin.innerJoinHash
-    let leftJoinHash = OpsJoin.leftJoinHash
-    let innerJoinMerge = OpsJoin.innerJoinMerge
-    let leftJoinMerge = OpsJoin.leftJoinMerge
-    let innerJoinIndexed = OpsJoin.innerJoinIndexed
-    let leftJoinIndexed = OpsJoin.leftJoinIndexed

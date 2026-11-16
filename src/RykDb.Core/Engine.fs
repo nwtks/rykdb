@@ -194,15 +194,20 @@ module internal Ddl =
             | Ok scan ->
                 match takeScanChunk BackfillChunkRows scan with
                 | Error e -> err e
-                | Ok([], _) -> ret st
                 | Ok(chunk, _) ->
-                    let lastKey = (List.last chunk).Key
+                    match List.tryLast chunk with
+                    | None -> ret st
+                    | Some lastEntry ->
+                        let lastKey = lastEntry.Key
 
-                    match
-                        commitChunk (fun txn key -> ret (Transaction.remove space key txn)) (chunk |> List.map _.Key) st
-                    with
-                    | Error e -> err e
-                    | Ok st' -> loop st' lastKey
+                        match
+                            commitChunk
+                                (fun txn key -> ret (Transaction.remove space key txn))
+                                (chunk |> List.map _.Key)
+                                st
+                        with
+                        | Error e -> err e
+                        | Ok st' -> loop st' lastKey
 
         loop state [||]
 

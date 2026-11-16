@@ -78,11 +78,11 @@ let ``Eval.eval: スカラー関数`` () =
 
     match call "UPPER" [ col "s" ] with
     | SqlValue.Text t -> Assert.Equal("  ABC  ", t)
-    | v -> Assert.Fail(sprintf "UPPER が文字列ではありません: %A" v)
+    | v -> failActual "UPPER が文字列ではありません" v
 
     match call "TRIM" [ col "s" ] with
     | SqlValue.Text t -> Assert.Equal("AbC", t)
-    | v -> Assert.Fail(sprintf "TRIM が文字列ではありません: %A" v)
+    | v -> failActual "TRIM が文字列ではありません" v
 
     // テキスト以外は表示文字列に落として渡す
     Assert.Equal(SqlValue.Text "5", call "UPPER" [ Expr.Literal(Literal.Int 5L) ])
@@ -101,16 +101,16 @@ let ``Eval.eval: スカラー関数の LOWER / LENGTH / COALESCE`` () =
 
     match call "LOWER" [ col "s" ] with
     | SqlValue.Text t -> Assert.Equal("  abc  ", t)
-    | v -> Assert.Fail(sprintf "LOWER が文字列ではありません: %A" v)
+    | v -> failActual "LOWER が文字列ではありません" v
 
     match call "LENGTH" [ col "s" ] with
     | SqlValue.Int n -> Assert.Equal(7L, n)
-    | v -> Assert.Fail(sprintf "LENGTH が整数ではありません: %A" v)
+    | v -> failActual "LENGTH が整数ではありません" v
 
     // サロゲートペアは 1文字として数える（UTF-16 の code unit では 4）
     match call "LENGTH" [ Expr.Literal(Literal.String "a\U0001F600b") ] with
     | SqlValue.Int n -> Assert.Equal(3L, n)
-    | v -> Assert.Fail(sprintf "LENGTH が整数ではありません: %A" v)
+    | v -> failActual "LENGTH が整数ではありません" v
 
     // NULL は NULL のまま伝播する
     Assert.Equal(SqlValue.Null, call "LENGTH" [ Expr.Literal Literal.Null ])
@@ -151,7 +151,7 @@ let ``Eval.eval: 算術は SQL の昇格規則に従う`` () =
     // 0 での除算はエラー
     match ev (row2 1L 0L) (Expr.Binary(BinaryOp.Div, col "a", col "b")) with
     | Error _ -> ()
-    | Ok v -> Assert.Fail(sprintf "0 除算が OK になっています: %A" v)
+    | Ok v -> failActual "0 除算が OK になっています" v
 
 [<Fact>]
 let ``Eval.eval: NULL が算術に絡むと NULL`` () =
@@ -169,7 +169,7 @@ let ``Eval.eval: NULL の比較は NULL（UNKNOWN）であって FALSE ではな
     // `NULL IS NULL` は TRUE
     match ok (ev r (Expr.IsNull(col "a", false))) with
     | SqlValue.Bool b -> Assert.True b
-    | v -> Assert.Fail(sprintf "IS NULL が TRUE になりません: %A" v)
+    | v -> failActual "IS NULL が TRUE になりません" v
 
 [<Fact>]
 let ``Eval.eval: 3 値論理の AND / OR / NOT`` () =
@@ -178,14 +178,14 @@ let ``Eval.eval: 3 値論理の AND / OR / NOT`` () =
 
     match ok (ev r1 (Expr.Binary(BinaryOp.And, col "a", col "b"))) with
     | SqlValue.Bool b -> Assert.False b
-    | v -> Assert.Fail(sprintf "FALSE AND NULL が FALSE になりません: %A" v)
+    | v -> failActual "FALSE AND NULL が FALSE になりません" v
 
     // TRUE OR UNKNOWN = TRUE
     let r2 = [| SqlValue.Bool true; SqlValue.Null |]
 
     match ok (ev r2 (Expr.Binary(BinaryOp.Or, col "a", col "b"))) with
     | SqlValue.Bool b -> Assert.True b
-    | v -> Assert.Fail(sprintf "TRUE OR NULL が TRUE になりません: %A" v)
+    | v -> failActual "TRUE OR NULL が TRUE になりません" v
 
     // NOT UNKNOWN = UNKNOWN
     let r3 = [| SqlValue.Null; SqlValue.Int 0L |]
@@ -198,28 +198,28 @@ let ``Eval.eval: AND / OR は右辺の FALSE / TRUE も 3 値論理どおり`` (
 
     match ok (ev r1 (Expr.Binary(BinaryOp.And, col "a", col "b"))) with
     | SqlValue.Bool b -> Assert.False b
-    | v -> Assert.Fail(sprintf "TRUE AND FALSE が FALSE になりません: %A" v)
+    | v -> failActual "TRUE AND FALSE が FALSE になりません" v
 
     // FALSE OR TRUE = TRUE（右辺の TRUE が UNKNOWN に化けて NULL になっていた）
     let r2 = [| SqlValue.Bool false; SqlValue.Bool true |]
 
     match ok (ev r2 (Expr.Binary(BinaryOp.Or, col "a", col "b"))) with
     | SqlValue.Bool b -> Assert.True b
-    | v -> Assert.Fail(sprintf "FALSE OR TRUE が TRUE になりません: %A" v)
+    | v -> failActual "FALSE OR TRUE が TRUE になりません" v
 
     // NULL OR TRUE = TRUE（片方が NULL でも TRUE は TRUE のまま）
     let r3 = [| SqlValue.Null; SqlValue.Bool true |]
 
     match ok (ev r3 (Expr.Binary(BinaryOp.Or, col "a", col "b"))) with
     | SqlValue.Bool b -> Assert.True b
-    | v -> Assert.Fail(sprintf "NULL OR TRUE が TRUE になりません: %A" v)
+    | v -> failActual "NULL OR TRUE が TRUE になりません" v
 
     // NULL AND FALSE = FALSE
     let r4 = [| SqlValue.Null; SqlValue.Bool false |]
 
     match ok (ev r4 (Expr.Binary(BinaryOp.And, col "a", col "b"))) with
     | SqlValue.Bool b -> Assert.False b
-    | v -> Assert.Fail(sprintf "NULL AND FALSE が FALSE になりません: %A" v)
+    | v -> failActual "NULL AND FALSE が FALSE になりません" v
 
 [<Fact>]
 let ``Eval.eval: BETWEEN の範囲判定と NOT IN の一致判定`` () =
@@ -228,7 +228,7 @@ let ``Eval.eval: BETWEEN の範囲判定と NOT IN の一致判定`` () =
     // 5 BETWEEN 1 AND 10 = TRUE
     match ok (ev r (Expr.Between(col "a", col "b", Expr.Literal(Literal.Int 10L), false))) with
     | SqlValue.Bool b -> Assert.True b
-    | v -> Assert.Fail(sprintf "BETWEEN が TRUE になりません: %A" v)
+    | v -> failActual "BETWEEN が TRUE になりません" v
 
     // 5 NOT IN (1, 2) = TRUE
     let notIn =
@@ -236,7 +236,7 @@ let ``Eval.eval: BETWEEN の範囲判定と NOT IN の一致判定`` () =
 
     match notIn with
     | SqlValue.Bool b -> Assert.True b
-    | v -> Assert.Fail(sprintf "NOT IN が TRUE になりません: %A" v)
+    | v -> failActual "NOT IN が TRUE になりません" v
 
 [<Fact>]
 let ``Eval.eval: 算術の型昇格は DECIMAL / REAL / 非数値も扱う`` () =
@@ -288,7 +288,7 @@ let ``Eval.eval: 数値演算は範囲外で DbError を返し、REAL は精度�
                 abs (actual - expected) <= abs expected * 1e-12,
                 sprintf "REAL が想定外: expected=%g actual=%g" expected actual
             )
-        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+        | v -> failActual "REAL ではありません" v
 
     assertReal 2e30 (arith2 BinaryOp.Add (Literal.Real 1e30) (Literal.Real 1e30))
     assertReal 1e60 (arith2 BinaryOp.Mul (Literal.Real 1e30) (Literal.Real 1e30))

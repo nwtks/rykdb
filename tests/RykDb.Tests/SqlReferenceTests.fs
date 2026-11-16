@@ -17,9 +17,7 @@ open RykDb.TestHelpers
 let private asReal (v: SqlValue) =
     match v with
     | SqlValue.Real f -> f
-    | _ ->
-        Assert.Fail(sprintf "REAL ではありません: %A" v)
-        0.0
+    | _ -> failwithf "REAL ではありません: %A" v
 
 /// テスト用のテーブルを用意する。
 let private seeded (tag: string) (f: Database -> unit) =
@@ -502,20 +500,20 @@ let ``SqlReference: 数値の範囲外は例外ではなくエラーを返す`` 
 
         match big.Rows.[0].[0] with
         | SqlValue.Real f -> Assert.True(f > 1e59 && f < 1e61, sprintf "想定外の REAL: %f" f)
-        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+        | v -> failActual "REAL ではありません" v
 
         // 極小の REAL も 0 に丸めない
         let _, tiny = ok (execSql db2 "SELECT (1e-30 * 1.0) FROM t WHERE id = 1")
 
         match tiny.Rows.[0].[0] with
         | SqlValue.Real f -> Assert.True(f > 0.0 && f < 1e-29, sprintf "想定外の REAL: %f" f)
-        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+        | v -> failActual "REAL ではありません" v
 
         let _, sum = ok (execSql db2 "SELECT SUM(v) FROM t")
 
         match sum.Rows.[0].[0] with
         | SqlValue.Real f -> Assert.Equal(1e30, f)
-        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+        | v -> failActual "REAL ではありません" v
 
         // 整数・DECIMAL のオーバーフローは DbError になる
         expectErrorKind
@@ -842,7 +840,7 @@ let ``SqlReference: REAL の -0.0 は +0.0 と同じ主キー`` () =
 
         match res.Rows.[0].[0] with
         | SqlValue.Real f -> Assert.Equal(0L, System.BitConverter.DoubleToInt64Bits f)
-        | v -> Assert.Fail(sprintf "REAL ではありません: %A" v)
+        | v -> failActual "REAL ではありません" v
 
         let _, byValue = ok (execSql db2 "SELECT x FROM r WHERE x = -0.0")
         Assert.Equal<int>(1, byValue.Rows.Length)
@@ -1738,7 +1736,7 @@ let ``SqlReference: FROM を省略した SELECT は定数 1 行を返す`` () =
 
         match expr.Rows.[0].[1] with
         | SqlValue.Text s -> Assert.Equal("x", s)
-        | v -> Assert.Fail(sprintf "TEXT ではありません: %A" v)
+        | v -> failActual "TEXT ではありません" v
 
         // WHERE は 1 行に対して効く（偽なら 0 行）
         let _, filtered = ok (execSql db0 "SELECT 1 WHERE 1 = 2")
@@ -2361,7 +2359,7 @@ let ``SqlReference: 集約結果は DATE の型を保つ`` () =
 
         match grouped.Rows.[0].[0] with
         | SqlValue.Date _ -> ()
-        | v -> Assert.Fail(sprintf "DATE ではありません: %A" v))
+        | v -> failActual "DATE ではありません" v)
 
 [<Fact>]
 let ``SqlReference: 深いサブクエリの入れ子も実行できる`` () =

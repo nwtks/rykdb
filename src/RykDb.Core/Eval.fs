@@ -156,38 +156,38 @@ module internal Eval =
     /// <remarks>
     /// compare（SqlValue を返す文脈）と truthOf（TruthValue を返す文脈）は
     /// NULL 判定と演算子の表だけが違うので、両方ここへ寄せる。
-    /// 未知の演算子名は Unknown = False 側へ寄せる（SQL では到達しない）。
+    /// 演算子は文字列タグではなく `CompareOp` で受け、6 演算子を漏れなく分岐する
+    /// （未知の演算子を黙って Unknown へ寄せる既定分岐は持たない）。
     /// </remarks>
-    let private applyComparison (opName: string) (c: int) =
+    let private applyComparison (op: CompareOp) (c: int) =
         let tf b =
             if b then TruthValue.True else TruthValue.False
 
-        match opName with
-        | "eq" -> tf (c = 0)
-        | "ne" -> tf (c <> 0)
-        | "lt" -> tf (c < 0)
-        | "le" -> tf (c <= 0)
-        | "gt" -> tf (c > 0)
-        | "ge" -> tf (c >= 0)
-        | _ -> TruthValue.Unknown
+        match op with
+        | CompareOp.Eq -> tf (c = 0)
+        | CompareOp.Ne -> tf (c <> 0)
+        | CompareOp.Lt -> tf (c < 0)
+        | CompareOp.Le -> tf (c <= 0)
+        | CompareOp.Gt -> tf (c > 0)
+        | CompareOp.Ge -> tf (c >= 0)
 
     /// 比較を 3値論理に変換する。
-    let private compare (opName: string) (a: SqlValue) (b: SqlValue) =
+    let private compare (op: CompareOp) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
             DbOk SqlValue.Null
         else
             match SqlValue.compareValuesV a b with
             | DbErr e -> DbErr e
-            | DbOk c -> DbOk(SqlValue.ofBool (applyComparison opName c = TruthValue.True))
+            | DbOk c -> DbOk(SqlValue.ofBool (applyComparison op c = TruthValue.True))
 
     /// WHERE 用に TruthValue で判定する（UNKNOWN は偽）。
-    let private truthOf (opName: string) (a: SqlValue) (b: SqlValue) =
+    let private truthOf (op: CompareOp) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
             DbOk TruthValue.Unknown
         else
             match SqlValue.compareValuesV a b with
             | DbErr e -> DbErr e
-            | DbOk c -> DbOk(applyComparison opName c)
+            | DbOk c -> DbOk(applyComparison op c)
 
     /// 2値（真偽を直接返す）の文脈用。
     /// NULL は False。
@@ -195,16 +195,6 @@ module internal Eval =
         match v with
         | SqlValue.Bool b -> b
         | _ -> false
-
-    let private nameOf (op: BinaryOp) =
-        match op with
-        | BinaryOp.Eq -> "eq"
-        | BinaryOp.Ne -> "ne"
-        | BinaryOp.Lt -> "lt"
-        | BinaryOp.Le -> "le"
-        | BinaryOp.Gt -> "gt"
-        | BinaryOp.Ge -> "ge"
-        | _ -> "eq"
 
     /// 行の範囲外アクセスを安全なエラーにする。
     let private valueAt (row: RowView) (i: int) (e: Expr) =
@@ -415,12 +405,12 @@ module internal Eval =
                                     Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString l)
                                 )
                             )
-                    | BinaryOp.Eq
-                    | BinaryOp.Ne
-                    | BinaryOp.Lt
-                    | BinaryOp.Le
-                    | BinaryOp.Gt
-                    | BinaryOp.Ge -> compare (nameOf op) l v
+                    | BinaryOp.Eq -> compare CompareOp.Eq l v
+                    | BinaryOp.Ne -> compare CompareOp.Ne l v
+                    | BinaryOp.Lt -> compare CompareOp.Lt l v
+                    | BinaryOp.Le -> compare CompareOp.Le l v
+                    | BinaryOp.Gt -> compare CompareOp.Gt l v
+                    | BinaryOp.Ge -> compare CompareOp.Ge l v
                     | BinaryOp.And -> DbOk(andValue l v)
                     | BinaryOp.Or -> DbOk(orValue l v)
 
@@ -440,10 +430,10 @@ module internal Eval =
             | KBetweenX(lo, hi, negated) :: rest -> step resolve row (KBetweenLo(v, hi, negated) :: rest) (Descend lo)
             | KBetweenLo(x, hi, negated) :: rest -> step resolve row (KBetweenHi(x, v, negated) :: rest) (Descend hi)
             | KBetweenHi(x, lov, negated) :: rest ->
-                match truthOf "ge" x lov with
+                match truthOf CompareOp.Ge x lov with
                 | DbErr er -> DbErr er
                 | DbOk ge ->
-                    match truthOf "le" x v with
+                    match truthOf CompareOp.Le x v with
                     | DbErr er -> DbErr er
                     | DbOk le ->
                         match TruthValue.and2 ge le with
@@ -455,7 +445,7 @@ module internal Eval =
                 | [] -> step resolve row rest (Arrive(SqlValue.ofBool negated))
                 | cand :: tail -> step resolve row (KInArg(v, negated, tail, false) :: rest) (Descend cand)
             | KInArg(x, negated, tail, sawUnknown) :: rest ->
-                match truthOf "eq" x v with
+                match truthOf CompareOp.Eq x v with
                 | DbErr er -> DbErr er
                 | DbOk TruthValue.True -> step resolve row rest (Arrive(SqlValue.ofBool (not negated)))
                 | DbOk tv ->
