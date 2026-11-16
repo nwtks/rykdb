@@ -884,6 +884,185 @@ let ``SessionPool: 閉じた後の操作はエラーになる`` () =
         session.Close() |> ignore)
 
 [<Fact>]
+let ``Session: パラメータ付きで INSERT / SELECT / UPDATE / DELETE できる`` () =
+    withSession "session-params-dml" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL)")
+        |> ignore
+
+        let inserted =
+            ok (
+                session.Execute(
+                    "INSERT INTO t VALUES (?, ?, ?), (?, ?, ?)",
+                    [|
+                        SqlValue.Int 1L
+                        SqlValue.Text "alice"
+                        SqlValue.Real 1.5
+                        SqlValue.Int 2L
+                        SqlValue.Text "bob"
+                        SqlValue.Null
+                    |]
+                )
+            )
+
+        Assert.Equal<int>(2, inserted.RowsAffected)
+
+        let selected =
+            ok (session.Execute("SELECT id, name FROM t WHERE score = ?", [| SqlValue.Real 1.5 |]))
+
+        Assert.Equal<int>(1, selected.Rows.Length)
+        Assert.Equal<int64>(1L, asInt selected.Rows.[0].[0])
+        Assert.Equal("alice", asText selected.Rows.[0].[1])
+
+        let updated =
+            ok (session.Execute("UPDATE t SET name = ? WHERE id = ?", [| SqlValue.Text "bobby"; SqlValue.Int 2L |]))
+
+        Assert.Equal<int>(1, updated.RowsAffected)
+
+        let deleted =
+            ok (session.Execute("DELETE FROM t WHERE id = ?", [| SqlValue.Int 1L |]))
+
+        Assert.Equal<int>(1, deleted.RowsAffected)
+        Assert.Equal(1L, scalar session "SELECT COUNT(*) FROM t"))
+
+[<Fact>]
+let ``Session: パラメータは LIKE / LIMIT / OFFSET / NULL にも使える`` () =
+    withSession "session-params-expr" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        |> ignore
+
+        ok (session.Execute "INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        |> ignore
+
+        let result =
+            ok (
+                session.Execute(
+                    "SELECT id FROM t WHERE name LIKE ? ORDER BY id LIMIT ? OFFSET ?",
+                    [| SqlValue.Text "a%"; SqlValue.Int 1L; SqlValue.Int 0L |]
+                )
+            )
+
+        Assert.Equal<int>(1, result.Rows.Length)
+        Assert.Equal<int64>(1L, asInt result.Rows.[0].[0])
+
+        let isNull = ok (session.Execute("SELECT ? IS NULL", [| SqlValue.Null |]))
+        Assert.Equal(SqlValue.Bool true, isNull.Rows.[0].[0]))
+
+[<Fact>]
+let ``Session: パラメータの型を保って入出力できる`` () =
+    withSession "session-params-types" (fun session ->
+        ok (
+            session.Execute
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP, dec DECIMAL, u UUID, b BLOB, flag BOOLEAN)"
+        )
+        |> ignore
+
+        let date = System.DateOnly(2024, 1, 2)
+        let timestamp = System.DateTimeOffset(2024, 1, 2, 3, 4, 5, System.TimeSpan.Zero)
+        let uuid = System.Guid.NewGuid()
+
+        ok (
+            session.Execute(
+                "INSERT INTO t VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [|
+                    SqlValue.Int 1L
+                    SqlValue.Date date
+                    SqlValue.Timestamp timestamp
+                    SqlValue.Decimal 12.34m
+                    SqlValue.Uuid uuid
+                    SqlValue.Blob [| 1uy; 2uy; 3uy |]
+                    SqlValue.Bool true
+                |]
+            )
+        )
+        |> ignore
+
+        let row = (ok (session.Execute "SELECT d, ts, dec, u, b, flag FROM t")).Rows.[0]
+        Assert.Equal(SqlValue.Date date, row.[0])
+        Assert.Equal(SqlValue.Timestamp timestamp, row.[1])
+        Assert.Equal(SqlValue.Decimal 12.34m, row.[2])
+        Assert.Equal(SqlValue.Uuid uuid, row.[3])
+        Assert.Equal(SqlValue.Blob [| 1uy; 2uy; 3uy |], row.[4])
+        Assert.Equal(SqlValue.Bool true, row.[5]))
+
+[<Fact>]
+let ``RowReader: パラメータ付き SELECT をストリーミングできる`` () =
+    withSession "session-reader-params" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
+
+        ok (session.Execute "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a')")
+        |> ignore
+
+        match ok (session.TryOpenReader("SELECT id FROM t WHERE v = ? ORDER BY id", [| SqlValue.Text "a" |])) with
+        | None -> Assert.Fail "パラメータ付き SELECT が RowReader になりませんでした"
+        | Some reader ->
+            use reader = reader
+            let rows = drainReader reader
+            Assert.Equal<int>(2, rows.Length)
+            Assert.Equal<int64>(1L, asInt rows.[0].[0])
+            Assert.Equal<int64>(3L, asInt rows.[1].[0]))
+
+[<Fact>]
+let ``Session: パラメータの個数不一致・Unloaded は TypeError`` () =
+    withSession "session-params-errors" (fun session ->
+        expectErrorKind ErrorKind.TypeError "パラメータ不足" (session.Execute("SELECT ?", [||]))
+        expectErrorKind ErrorKind.TypeError "パラメータ過剰" (session.Execute("SELECT 1", [| SqlValue.Int 1L |]))
+        expectErrorKind ErrorKind.TypeError "RowReader でも不足" (session.TryOpenReader("SELECT ?", [||]))
+        expectErrorKind ErrorKind.TypeError "Unloaded" (session.Execute("SELECT ?", [| SqlValue.Unloaded |]))
+        expectErrorKind ErrorKind.TypeError "TEXT の null" (session.Execute("SELECT ?", [| SqlValue.Text null |]))
+        expectErrorKind ErrorKind.TypeError "BLOB の null" (session.Execute("SELECT ?", [| SqlValue.Blob null |]))
+
+        expectErrorKind
+            ErrorKind.TypeError
+            "parameters が null"
+            (session.Execute("SELECT 1", Unchecked.defaultof<SqlValue array>)))
+
+[<Fact>]
+let ``RowReader: パラメータの BLOB を後から書き換えても結果は変わらない`` () =
+    withSession "session-reader-param-copy" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1, X'01'), (2, X'02')") |> ignore
+
+        let key = [| 1uy |]
+
+        match ok (session.TryOpenReader("SELECT id FROM t WHERE b = ? ORDER BY id", [| SqlValue.Blob key |])) with
+        | None -> Assert.Fail "パラメータ付き SELECT が RowReader になりませんでした"
+        | Some reader ->
+            use reader = reader
+            // 読み始める前に呼び出し側の配列を書き換える。
+            key.[0] <- 2uy
+            let rows = drainReader reader
+            Assert.Equal<int>(1, rows.Length)
+            Assert.Equal<int64>(1L, asInt rows.[0].[0]))
+
+[<Fact>]
+let ``Session: パラメータは複数文バッチでも通し番号`` () =
+    withSession "session-params-batch" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
+
+        let result =
+            ok (
+                session.Execute("BEGIN; INSERT INTO t VALUES (?, ?); COMMIT", [| SqlValue.Int 1L; SqlValue.Text "a" |])
+            )
+
+        Assert.Equal<int>(1, result.RowsAffected)
+        Assert.False session.InTransaction
+        Assert.Equal(1L, scalar session "SELECT COUNT(*) FROM t"))
+
+[<Fact>]
+let ``Session: パラメータでも主キー検索の計画になる`` () =
+    withSession "session-params-plan" (fun session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        |> ignore
+
+        ok (session.Execute "INSERT INTO t VALUES (1, 10), (2, 20)") |> ignore
+
+        let plan =
+            ok (session.Execute("EXPLAIN SELECT * FROM t WHERE id = ?", [| SqlValue.Int 2L |]))
+
+        let text = plan.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+        Assert.Contains("PkLookup(2)", text))
+
+[<Fact>]
 let ``Session: 並行 commit を Close して再オープンしても読める`` () =
     withDir "session-group-commit" (fun dir ->
         let session = ok (Session.OpenWith dir)

@@ -13,6 +13,10 @@ type internal Token =
     | StringLit of string
     /// X'ABCD'
     | BlobLit of byte[]
+    /// `?` の位置パラメータ。
+    /// 値は SQL テキスト中の出現順（0 始まり）。
+    /// 実際の値への置き換えはパーサが行う。
+    | Param of int
     /// 記号・演算子
     | Symbol of string
     | Eos
@@ -264,7 +268,8 @@ module internal Lexer =
 
     /// 1トークンを読む。
     /// 読み後は次の位置を返す。
-    let private scanToken (input: string) (n: int) (startPos: Position) (s: LexState) =
+    /// `paramIndex` は `?` に割り当てる位置パラメータ番号。
+    let private scanToken (input: string) (n: int) (startPos: Position) (paramIndex: int) (s: LexState) =
         let c = input.[s.Index]
 
         if (c = 'x' || c = 'X') && s.Index + 1 < n && input.[s.Index + 1] = '\'' then
@@ -379,6 +384,7 @@ module internal Lexer =
             | '*' -> ret (Token.Symbol "*", advanceBy 1 s)
             | '/' -> ret (Token.Symbol "/", advanceBy 1 s)
             | '%' -> ret (Token.Symbol "%", advanceBy 1 s)
+            | '?' -> ret (Token.Param paramIndex, advanceBy 1 s)
             | ';' -> ret (Token.Symbol ";", advanceBy 1 s)
             | ',' -> ret (Token.Symbol ",", advanceBy 1 s)
             | '.' -> ret (Token.Symbol ".", advanceBy 1 s)
@@ -387,18 +393,25 @@ module internal Lexer =
             | _ -> err (DbError.syntax (sprintf "unexpected character '%c'" c) startPos.Line)
 
     [<TailCall>]
-    let rec private collectTokens (input: string) (n: int) (acc: TokenItem list) (s: LexState) =
+    let rec private collectTokens (input: string) (n: int) (acc: TokenItem list) (nextParam: int) (s: LexState) =
         match skipTrivia input s with
         | Error e -> err e
         | Ok s when s.Index >= n -> ret (List.rev ({ Token = Token.Eos; Pos = s.Position } :: acc))
         | Ok s ->
             let startPos = s.Position
 
-            match scanToken input n startPos s with
+            match scanToken input n startPos nextParam s with
             | Error e -> err e
-            | Ok(tok, s') -> collectTokens input n ({ Token = tok; Pos = startPos } :: acc) s'
+            | Ok(tok, s') ->
+                let nextParam =
+                    match tok with
+                    | Token.Param _ -> nextParam + 1
+                    | _ -> nextParam
+
+                collectTokens input n ({ Token = tok; Pos = startPos } :: acc) nextParam s'
 
     /// SQL テキストをトークン列へ分解する。
     /// 位置と出力は不変で、外側の再帰が値を積み上げる。
+    /// `?` は出現順に 0 始まりの番号を振られる。
     let tokenize (input: string) =
-        { Index = 0; Line = 1; Column = 1 } |> collectTokens input input.Length []
+        { Index = 0; Line = 1; Column = 1 } |> collectTokens input input.Length [] 0

@@ -169,6 +169,27 @@ let ``Parser: 複数文`` () =
     | other -> failActual "想定外の文列" other
 
 [<Fact>]
+let ``Parser: 位置パラメータを値へ置き換える`` () =
+    let parsed =
+        Parser.parseStatementsWith [| SqlValue.Int 1L; SqlValue.Text "x" |] "SELECT id FROM t WHERE a = ? AND b = ?"
+
+    match ok parsed with
+    | [ Statement.Select sel ] ->
+        match sel.Where with
+        | Some(Expr.Binary(BinaryOp.And,
+                           Expr.Binary(BinaryOp.Eq, _, Expr.Value a),
+                           Expr.Binary(BinaryOp.Eq, _, Expr.Value b))) ->
+            Assert.Equal(SqlValue.Int 1L, a)
+            Assert.Equal(SqlValue.Text "x", b)
+        | other -> failActual "WHERE が想定外" other
+    | other -> failActual "SELECT ではない" other
+
+[<Fact>]
+let ``Parser: パラメータの個数が一致しないときは TypeError`` () =
+    expectErrorKind ErrorKind.TypeError "パラメータ不足" (Parser.parseStatementsWith [||] "SELECT ?")
+    expectErrorKind ErrorKind.TypeError "パラメータ過剰" (Parser.parseStatementsWith [| SqlValue.Int 1L |] "SELECT 1")
+
+[<Fact>]
 let ``Parser: 複数文は ; で区切る`` () =
     expectErrorKind ErrorKind.SyntaxError "区切りなし" (parseStatement "SELECT a FROM t SELECT a FROM t")
 

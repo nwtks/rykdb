@@ -313,18 +313,76 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             | Statement.Explain _ -> true
             | _ -> false)
 
+    /// パラメータに `SqlValue.Unloaded`（内部専用の未復号マーカー）が含まれていないか検査する。
+    /// 呼び出し側が誤って内部値を持ち込むと、行のマスク漏れと同じ事故になるため拒否する。
+    /// `Blob` の配列は呼び出し側と共有しない（`SqlValue.copyRow` で複製する）。
+    let validateParameters (parameters: SqlValue array) =
+        let rec loop i =
+            if i >= parameters.Length then
+                ret ()
+            else
+                match parameters.[i] with
+                | SqlValue.Unloaded -> err (DbError.typeError "パラメータに SqlValue.Unloaded は指定できません")
+                | SqlValue.Text s when isNull s -> err (DbError.typeError "パラメータの TEXT に null は指定できません")
+                | SqlValue.Blob b when isNull b -> err (DbError.typeError "パラメータの BLOB に null 配列は指定できません")
+                | _ -> loop (i + 1)
+
+        if isNull parameters then
+            err (DbError.typeError "parameters に null は指定できません")
+        else
+            loop 0
+
     /// 単一文または複数文を実行し、transaction の遷移も返す。
-    let executeCore (sql: string) =
+    let executeCore (sql: string) (parameters: SqlValue array) =
         if isClosed () then
             err (closedError ())
         else
             match host.DurabilityFailure with
             | Some e -> err e
             | None ->
-                match Parser.parseStatements sql with
+                match validateParameters parameters with
                 | Error e -> err e
-                | Ok statements when isReadOnlyBatch statements -> runRead statements
-                | Ok statements -> runExclusive statements
+                | Ok() ->
+                    let parameters = SqlValue.copyRow parameters
+
+                    match Parser.parseStatementsWith parameters sql with
+                    | Error e -> err e
+                    | Ok statements when isReadOnlyBatch statements -> runRead statements
+                    | Ok statements -> runExclusive statements
+
+    /// `TryOpenReader` の実装。
+    let tryOpenReaderCore (sql: string) (parameters: SqlValue array) =
+        if isClosed () then
+            err (closedError ())
+        else
+            match host.DurabilityFailure with
+            | Some e -> err e
+            | None ->
+                match validateParameters parameters with
+                | Error e -> err e
+                | Ok() ->
+                    let parameters = SqlValue.copyRow parameters
+
+                    match Parser.parseStatementsWith parameters sql with
+                    | Error e -> err e
+                    | Ok [ Statement.Select stmt ] ->
+                        match tryEnterRead () with
+                        | Error e -> err e
+                        | Ok None -> ret None
+                        | Ok(Some(readState, lease)) ->
+                            match Engine.openSelect readState stmt with
+                            | Error e ->
+                                exitRead lease
+                                err e
+                            | Ok stream ->
+                                let release () =
+                                    try
+                                        stream.Cleanup()
+                                    finally
+                                        exitRead lease
+
+                                ret (Some(new RowReader(stream.Columns, stream.Op, release)))
+                    | Ok _ -> ret None
 
     /// DB を開く（background compaction 有効、既定の上限）。
     static member OpenWith(root: string) =
@@ -362,33 +420,13 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// 必要なら SQL の `LIMIT` を使う。
     /// 返した `RowReader` は使い終わったら `Dispose` すること。
     /// </remarks>
-    member _.TryOpenReader(sql: string) =
-        if isClosed () then
-            err (closedError ())
-        else
-            match host.DurabilityFailure with
-            | Some e -> err e
-            | None ->
-                match Parser.parseStatements sql with
-                | Error e -> err e
-                | Ok [ Statement.Select stmt ] ->
-                    match tryEnterRead () with
-                    | Error e -> err e
-                    | Ok None -> ret None
-                    | Ok(Some(readState, lease)) ->
-                        match Engine.openSelect readState stmt with
-                        | Error e ->
-                            exitRead lease
-                            err e
-                        | Ok stream ->
-                            let release () =
-                                try
-                                    stream.Cleanup()
-                                finally
-                                    exitRead lease
+    member _.TryOpenReader(sql: string) = tryOpenReaderCore sql [||]
 
-                            ret (Some(new RowReader(stream.Columns, stream.Op, release)))
-                | Ok _ -> ret None
+    /// パラメータ付きで単一 SELECT をストリーミング用に開く。
+    /// SQL 中の `?` の扱いは `Execute(sql, parameters)` と同じ。
+    /// 値は SQL 文字列へ連結せず `Expr.Value` として埋め込むため、
+    /// 値の内容で SQL の構文が変わることはない。
+    member _.TryOpenReader(sql: string, parameters: SqlValue array) = tryOpenReaderCore sql parameters
 
     /// 単一文または複数文を実行する。
     /// <remarks>
@@ -398,7 +436,19 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// 必要に応じて `Rollback()` すること。
     /// SELECT だけのバッチは、実行中の書き込みと並行して実行される。
     /// </remarks>
-    member _.Execute(sql: string) = executeCore sql |> Result.map fst
+    member _.Execute(sql: string) = executeCore sql [||] |> Result.map fst
+
+    /// パラメータ付きで単一文または複数文を実行する。
+    /// <remarks>
+    /// SQL 中の `?` は、出現順に `parameters` の値へ置き換えられる。
+    /// 個数が一致しない場合は `TypeError` になる。
+    /// 値は SQL リテラルと同じく式として評価される
+    /// （`LIMIT ?` や `LIKE ?`、`INSERT ... VALUES (?, ?)` にも使える）。
+    /// 値は SQL 文字列へ連結せず `Expr.Value` として埋め込むため、
+    /// 値の内容で SQL の構文が変わることはない。
+    /// </remarks>
+    member _.Execute(sql: string, parameters: SqlValue array) =
+        executeCore sql parameters |> Result.map fst
 
     /// トランザクションを始める。
     member _.Begin() =

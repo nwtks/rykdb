@@ -327,11 +327,15 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 - 担保:
   - `Entry.takeOwnership`（キー + 行。Blob の `byte[]` も複製）— `Memtable.insert` が呼ぶ。
   - `Transaction.setSlot` — `put` / `remove` の入口で複製。
+  - `Session.Execute(sql, parameters)` / `TryOpenReader(sql, parameters)` —
+    パラメータの配列と Blob の `byte[]` を `SqlValue.copyRow` で複製してから AST に埋め込む
+    （`RowReader` が読んでいる間の書き換えに影響されない）。
   - `SqlValue.copyRow` は INV-02（出口）と INV-19（入口）で共有。
 - 回帰テスト（**修正前に実際に失敗することを確認済み**）:
   - `Memtable: 挿入したキー配列を後から書き換えても木は保たれる`
   - `Memtable: 挿入した行配列を後から書き換えても値は変わらない`
   - `Transaction: put したキー・行配列を後から書き換えてもバッファは保たれる`
+  - `RowReader: パラメータの BLOB を後から書き換えても結果は変わらない`
 - コスト: キー + 行の複製で 1行あたり約 0.4µs（20万行の実測）。
   50k行 INSERT の全体（5.7秒）に対し約 0.7%。正しさを優先して採用。
 - **`SstEntry` は複製しない**（読み取り専用のビュー）。

@@ -116,7 +116,12 @@ printfn "%A" result.RowsAffected  // 2
 result.ToDisplayLines()           // [ "id | v"; "------"; "  1, 10"; "  2, 20" ]
 ok (session.TableNames())         // [ "t" ]
 
+// パラメータ化クエリ: SQL 中の ? は、出現順に渡した値へ置き換えられる。
+let filtered = ok (session.Execute("SELECT id, v FROM t WHERE v > ?", [| SqlValue.Int 10L |]))
+printfn "%A" filtered.Rows        // [|[|Int 2L; Int 20L|]|]
+
 // 単一 SELECT を1行ずつ読む場合は TryOpenReader を使う（結果上限の対象外）。
+// TryOpenReader(sql, parameters) も同じように ? を使える。
 // 複数文・非 SELECT・transaction 中は None が返る。
 match ok (session.TryOpenReader "SELECT id, v FROM t ORDER BY id") with
 | Some reader ->

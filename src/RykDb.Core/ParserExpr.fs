@@ -8,7 +8,13 @@ namespace RykDb.Core
 /// パーサの状態。
 /// 読み取り位置は値が持つので mutable は使わない。
 /// すべての構文規則は (値, 次の状態) を返す純粋な関数になる。
-type internal PState = { Tokens: TokenItem array; Pos: int }
+/// `Parameters` は `?` へ出現順に割り当てる値。
+type internal PState =
+    {
+        Tokens: TokenItem array
+        Pos: int
+        Parameters: SqlValue array
+    }
 
 /// 式と SELECT のパーサ（文は `Parser`）。
 /// 失敗はすべて Result<'T, DbError> として返し、例外は送らない。
@@ -477,6 +483,10 @@ module internal ParserExpr =
         | Token.RealLit v -> k (Expr.Literal(Literal.Real v), advance st)
         | Token.StringLit s -> k (Expr.Literal(Literal.String s), advance st)
         | Token.BlobLit b -> k (Expr.Literal(Literal.Blob b), advance st)
+        | Token.Param i ->
+            match Array.tryItem i st.Parameters with
+            | Some v -> k (Expr.Value v, advance st)
+            | None -> fail (sprintf "パラメータ ?%d が指定されていません" (i + 1)) st
         | Token.Keyword "NULL" -> k (Expr.Literal Literal.Null, advance st)
         | Token.Keyword "TRUE" -> k (Expr.Literal(Literal.Bool true), advance st)
         | Token.Keyword "FALSE" -> k (Expr.Literal(Literal.Bool false), advance st)

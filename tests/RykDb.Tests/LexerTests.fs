@@ -82,6 +82,22 @@ let ``Lexer: 整数・実数・文字列・記号`` () =
     )
 
 [<Fact>]
+let ``Lexer: 位置パラメータは出現順に番号が付く`` () =
+    let ks = kinds "? = ?; '?'"
+
+    Assert.Equal<Token list>(
+        [
+            Token.Param 0
+            Token.Symbol "="
+            Token.Param 1
+            Token.Symbol ";"
+            Token.StringLit "?"
+            Token.Eos
+        ],
+        ks
+    )
+
+[<Fact>]
 let ``Lexer: バイナリリテラル`` () =
     let ks = kinds "X'AB'"
 

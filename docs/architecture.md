@@ -203,51 +203,51 @@ flowchart TB
 
 ### モジュール一覧（`src/RykDb.Core/`）
 
-| ファイル           | 役割                                                                                                                 |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）                                    |
-| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）                            |
-| `Writer.fs`        | 不変のチャンク書き込み `Writer`                                                                                      |
-| `Cursor.fs`        | 読み取り位置を値として保持する `Cursor`                                                                              |
-| `Serialization.fs` | 順序保持エンコーディング / `Reader` / `OrderPreserving` / `KeyBuilder` / `ValueCodec` / `Hashing`                    |
-| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                                                       |
-| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                                               |
-| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                                            |
-| `SstScan.fs`       | SSTable / メモリの遅延走査 `SstScan` とマージ `SstMerge`（`ScanScope`）                                              |
-| `SstableFormat.fs` | SSTable の形式・Footer・ブロックキャッシュ・書き出し（`writeTo` / v6 / Bloom / index）                               |
-| `Sstable.fs`       | SSTable の部分読み・走査・ポイント検索（`openPartial` / `rangeScanPartial*` / `lookupMasked`）                       |
-| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                                            |
-| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                                          |
-| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                                                    |
-| `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                                                |
-| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                                          |
-| `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                                                 |
-| `ParserExpr.fs`    | 字句の読み進め・式（Pratt / precedence climbing）・SELECT の構文規則（CPS でスタック一定）                           |
-| `Parser.fs`        | 文（INSERT / UPDATE / DELETE / DDL / トランザクション）の構文規則と公開 API `parseStatements`                        |
-| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                                           |
-| `EngineHost.fs`    | background compaction の共有状態（Version / 採番 / ファイル refcount / worker / install）                            |
-| `ProcessLock.fs`   | プロセス間ロック（`.rykdb.format` を排他で保持、`ProcessLock`）                                                      |
-| `RowStore.fs`      | 単一 LSM と keyspace 接頭辞（`RowStore` 型 + `Keyspace` モジュール）                                                 |
-| `TableSchema.fs`   | `IndexSchema` / `TableSchema`（テーブル定義の検証・主キー解決）                                                      |
-| `Catalog.fs`       | `Catalog` と出力 `Schema` / `OutputColumn` / `SelectProjection` の型・モジュール                                     |
-| `Scalar.fs`        | スカラー関数 `Scalar`（LIKE 照合・スカラー関数）                                                                     |
-| `Eval.fs`          | 式評価器 `Eval`（算術・3値論理・CASE・CAST）                                                                         |
-| `Op.fs`            | pull 演算子 `Op` / `Row`（`ExtSort` が `Op` を使うため先にコンパイル）                                               |
-| `ExtSort.fs`       | 外部マージソート `ExtSort` と一時ファイル `Spill`（ソートの溢らし・k-way merge）                                     |
-| `OpsJoin.fs`       | 結合の実装 `OpsJoin`（nested loop / ハッシュ / マージ / インデックス）                                               |
-| `Ops.fs`           | 演算子の組み立て `Ops`（フィルタ・ソート・集約・射影・DISTINCT。結合は `OpsJoin` に委譲）                            |
-| `Dml.fs`           | `RowKey` / `Dml`（`Transaction` のバッファへ行・索引を積む DML ヘルパ）                                              |
-| `ExecContext.fs`   | 実行時文脈 `ExecContext` と DML `DmlOps`（INSERT / UPDATE / DELETE）                                                 |
-| `Binder.fs`        | 名前束縛 `Binder` / 別名 `Alias` / 述語の分解 `Predicate`                                                            |
-| `Analyzer.fs`      | `ScanMethod` / `JoinAlgorithm` / `Logical` と `Analyzer`（走査方法・結合アルゴリズムの選択）                         |
-| `PlanBuilder.fs`   | `PlanBuilder`（SELECT の論理代数の組み立て）                                                                         |
-| `Optimizer.fs`     | `Optimizer`（論理代数 → `Op` の実行と `explain`）                                                                    |
-| `Plan.fs`          | `Plan`（サブクエリ解決・派生テーブル・`runSelect` / `explainSelect`）                                                |
-| `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                                               |
-| `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                                         |
-| `Database.fs`      | internal の不変ハンドル `Database`（transaction・状態遷移）                                                          |
-| `SessionHost.fs`   | `DatabaseHost` と `CommitDurability`（共有 committed state・採番・fsync のグループコミット）                         |
-| `Session.fs`       | 公開 API `Session` / `SessionPool` / `RowReader`（接続ごとの transaction・読み取りは並行、書き込みはホストで直列化） |
+| ファイル           | 役割                                                                                                                  |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `Errors.fs`        | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）                                     |
+| `Types.fs`         | `SqlValue` / `DataType` / `TruthValue`（3値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）                             |
+| `Writer.fs`        | 不変のチャンク書き込み `Writer`                                                                                       |
+| `Cursor.fs`        | 読み取り位置を値として保持する `Cursor`                                                                               |
+| `Serialization.fs` | 順序保持エンコーディング / `Reader` / `OrderPreserving` / `KeyBuilder` / `ValueCodec` / `Hashing`                     |
+| `Memtable.fs`      | 永続 Treap の memtable（`apply` / `getVisible` / `rangeScan`）                                                        |
+| `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                                                |
+| `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                                             |
+| `SstScan.fs`       | SSTable / メモリの遅延走査 `SstScan` とマージ `SstMerge`（`ScanScope`）                                               |
+| `SstableFormat.fs` | SSTable の形式・Footer・ブロックキャッシュ・書き出し（`writeTo` / v6 / Bloom / index）                                |
+| `Sstable.fs`       | SSTable の部分読み・走査・ポイント検索（`openPartial` / `rangeScanPartial*` / `lookupMasked`）                        |
+| `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                                             |
+| `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                                           |
+| `Compaction.fs`    | Leveled compaction・版単位 GC・孤児ファイルの特定                                                                     |
+| `StorageEngine.fs` | LSM ツリー 1本の公開層（open / put / flush / scan / compact / close）                                                 |
+| `Ast.fs`           | 式 `Expr` / 文 `Statement` の判別可能共用体                                                                           |
+| `Lexer.fs`         | 手書きトークナイザ（読み取り位置を値として保持する）                                                                  |
+| `ParserExpr.fs`    | 字句の読み進め・式（Pratt / precedence climbing）・SELECT の構文規則（CPS でスタック一定）                            |
+| `Parser.fs`        | 文（INSERT / UPDATE / DELETE / DDL / トランザクション）の構文規則と公開 API `parseStatements` / `parseStatementsWith` |
+| `Transactions.fs`  | SeqNo 採番・snapshot・write-write 競合検出                                                                            |
+| `EngineHost.fs`    | background compaction の共有状態（Version / 採番 / ファイル refcount / worker / install）                             |
+| `ProcessLock.fs`   | プロセス間ロック（`.rykdb.format` を排他で保持、`ProcessLock`）                                                       |
+| `RowStore.fs`      | 単一 LSM と keyspace 接頭辞（`RowStore` 型 + `Keyspace` モジュール）                                                  |
+| `TableSchema.fs`   | `IndexSchema` / `TableSchema`（テーブル定義の検証・主キー解決）                                                       |
+| `Catalog.fs`       | `Catalog` と出力 `Schema` / `OutputColumn` / `SelectProjection` の型・モジュール                                      |
+| `Scalar.fs`        | スカラー関数 `Scalar`（LIKE 照合・スカラー関数）                                                                      |
+| `Eval.fs`          | 式評価器 `Eval`（算術・3値論理・CASE・CAST）                                                                          |
+| `Op.fs`            | pull 演算子 `Op` / `Row`（`ExtSort` が `Op` を使うため先にコンパイル）                                                |
+| `ExtSort.fs`       | 外部マージソート `ExtSort` と一時ファイル `Spill`（ソートの溢らし・k-way merge）                                      |
+| `OpsJoin.fs`       | 結合の実装 `OpsJoin`（nested loop / ハッシュ / マージ / インデックス）                                                |
+| `Ops.fs`           | 演算子の組み立て `Ops`（フィルタ・ソート・集約・射影・DISTINCT。結合は `OpsJoin` に委譲）                             |
+| `Dml.fs`           | `RowKey` / `Dml`（`Transaction` のバッファへ行・索引を積む DML ヘルパ）                                               |
+| `ExecContext.fs`   | 実行時文脈 `ExecContext` と DML `DmlOps`（INSERT / UPDATE / DELETE）                                                  |
+| `Binder.fs`        | 名前束縛 `Binder` / 別名 `Alias` / 述語の分解 `Predicate`                                                             |
+| `Analyzer.fs`      | `ScanMethod` / `JoinAlgorithm` / `Logical` と `Analyzer`（走査方法・結合アルゴリズムの選択）                          |
+| `PlanBuilder.fs`   | `PlanBuilder`（SELECT の論理代数の組み立て）                                                                          |
+| `Optimizer.fs`     | `Optimizer`（論理代数 → `Op` の実行と `explain`）                                                                     |
+| `Plan.fs`          | `Plan`（サブクエリ解決・派生テーブル・`runSelect` / `explainSelect`）                                                 |
+| `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                                                |
+| `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                                          |
+| `Database.fs`      | internal の不変ハンドル `Database`（transaction・状態遷移）                                                           |
+| `SessionHost.fs`   | `DatabaseHost` と `CommitDurability`（共有 committed state・採番・fsync のグループコミット）                          |
+| `Session.fs`       | 公開 API `Session` / `SessionPool` / `RowReader`（接続ごとの transaction・読み取りは並行、書き込みはホストで直列化）  |
 
 ### F# のコンパイル順
 
@@ -323,6 +323,9 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
   `parseExprLoopC` は継続（ラムダ）の中から同じ群の関数を呼ぶ形があり、
   FS3569 が「末尾でない」と判定するため付けない。
   `Directory.Build.props` の `Tailcalls=true` と深い入れ子の回帰テストで実行時の末尾呼び出しを担保する。
+- `?` は字句解析で出現順の `Token.Param` になり、
+  `parseStatementsWith` が `parameters` の値へ置き換えて `Expr.Value` を埋め込む
+  （パーサ以降は定数と同じ経路。`parseStatements` はパラメータなし）。
 - `*` / `t.*` は別名を取らない。
   `NULL.*` のような識別子以外の修飾子は `'.' の後ろには列名か '*' が必要です` で拒否する。
 

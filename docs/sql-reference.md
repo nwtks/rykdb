@@ -144,6 +144,28 @@ X'0a1b'
 
 奇数長・16進以外の文字が含まれる場合は構文エラーになる。
 
+### 位置パラメータ
+
+`?` はパラメータ化クエリの位置パラメータ。SQL テキスト中の出現順（1 個目、2 個目 …）に、
+`Session.Execute(sql, parameters)` / `Session.TryOpenReader(sql, parameters)` へ渡した
+`SqlValue array` の要素と対応する。
+
+```fsharp
+let sql = "SELECT id FROM people WHERE age >= ? AND name LIKE ? ORDER BY id LIMIT ?"
+let result = ok (session.Execute(sql, [| SqlValue.Int 20L; SqlValue.Text "a%"; SqlValue.Int 10L |]))
+```
+
+- 値は通常の式と同じ位置に書ける
+  （`VALUES`、`WHERE`、`HAVING`、`LIMIT` / `OFFSET`、`LIKE` のパターンなど）。
+- 値は SQL 文字列へ連結せずリテラルと同じ式ノードとして埋め込むため、
+  値の内容で SQL の構文が変わらない
+  （SQL インジェクションは起こらない）。
+- `NULL` も渡せる。`? = NULL` は「不明」になるため、NULL の判定には `? IS NULL` を使う。
+- 個数が一致しない場合と `SqlValue.Unloaded` は `TypeError`。
+- 名前付きパラメータ（`:name` / `@name`）は未対応。`?` のみ。
+- `EXPLAIN` でも使え、渡した値は定数として計画に現れる
+  （索引・範囲走査の選択にも使われる）。
+
 ### 文字の単位
 
 SQL が「1文字」として数える単位は **Unicode コードポイント**。
@@ -598,7 +620,8 @@ SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
 
 ### 7.4 索引が使われる条件
 
-`WHERE` に**列 = 定数**（リテラル、または負の数値リテラル）の条件が `AND` で連結されていれば、条件をまとめて索引の検索に使う。
+`WHERE` に**列 = 定数**（リテラル、負の数値リテラル、または `?` に渡した値）の条件が
+`AND` で連結されていれば、条件をまとめて索引の検索に使う。
 `LIKE 'prefix%'`（`%` が末尾のみ・`_` なし）は**範囲条件として索引に降ろす**。
 
 | 条件                                                                   | 走査方法                                                  |
@@ -612,8 +635,8 @@ SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
 
 複合索引では、先頭列から順に条件が必要になる。たとえば索引 `(a, b)` なら、`a = 1 AND b > 2` は範囲走査に使えるが、`b > 2` だけでは使えない。
 
-主キー・索引は値のバイト列表現で引くため、列の宣言型とリテラルの型が一致するときだけ使う。
-型が違うリテラルでは索引・主キー検索を使わず全走査になる。
+主キー・索引は値のバイト列表現で引くため、列の宣言型と値の型が一致するときだけ使う。
+型が違うリテラル／パラメータでは索引・主キー検索を使わず全走査になる。
 比較は数値3種（`INTEGER` / `REAL` / `DECIMAL`）や `DATE` / `TIMESTAMP` なら型をまたいで成功するため、
 `TypeError` になるのは `BOOLEAN` と `INTEGER` など比較不能な組み合わせだけ
 （例: `INTEGER` 列 = `1.0` は一致する）。
@@ -640,7 +663,7 @@ SELECT id FROM t WHERE a = 1;                 -- 前置 1列の等値 → IndexL
   複合索引の範囲検索は「範囲列より前の列すべてが `=`、その次の 1列が範囲条件」という形で使う。
 - `LIKE` は **`%` が末尾のみ・`_` なし**のときだけ範囲に変換する。
   `LIKE '%x'` や `LIKE 'a_b%'` は全走査 + 後段の `Filter`。
-- 型が一致しないリテラルは全走査に落ちる
+- 型が一致しないリテラル／パラメータは全走査に落ちる
   （比較自体は数値3種や `DATE` / `TIMESTAMP` なら成功する）。
 
 ### 7.5 結合アルゴリズム
@@ -713,7 +736,8 @@ SELECT p.id, d.dname
 
 ### 7.7 `LIMIT` / `OFFSET`
 
-- 値は **0 以上の定数式**（行ごとの列参照・負数・範囲外はエラー）。
+- 値は **0以上の定数式**
+  （リテラル、`?` に渡した値、またはそれらの定数式。行ごとの列参照・負数・範囲外はエラー）。
   `LIMIT 1+0` のような定数式は評価される。
 - 評価は最後に 1回だけ。
   `OFFSET` → `LIMIT` の順で適用される。
@@ -1374,6 +1398,8 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 - `RETURNING`
 - `CREATE TABLE ... DEFAULT (SELECT ...)`（構文は受理されるが INSERT 時に `SyntaxError`。§7.9）
 - ユーザ定義関数・トリガー・ビュー・ストアドプロシージャ
+- 名前付きパラメータ（`:name` / `@name`）。
+  位置パラメータ `?` のみ対応（§2「位置パラメータ」）
 - パーティショニング、圧縮、暗号化
 - 複数プロセスからの同時アクセス（2つ目のプロセスは `IoError` で開けない。§12）
 
@@ -1392,6 +1418,7 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 | `SELECT DISTINCT`   | 符号化キーの集合。既定 256MiB で上限があり、超過は `CapacityError`                                                                          |
 | `JOIN`              | 入れ子ループ / ハッシュ結合は右側を、マージ結合は同じキーの行だけを保持。管理メモリ換算 256MiB で上限があり、超過は `CapacityError`         |
 | `GROUP BY`          | 行を抱えず集約。グループ数の上限は 400万                                                                                                    |
+| パラメータ          | `?` の位置パラメータのみ（名前付きは未対応）。個数は SQL 全体で一致が必要。値は `SqlValue` で渡す                                           |
 | 最終結果            | materialize。既定 100万行 / 256MiB で、超過は `CapacityError`（`SessionOptions` で変更可）                                                  |
 | ストリーミング      | `Session.TryOpenReader` は単一 SELECT のみ。materialize しないため結果上限は適用外。終端または `RowReader.Dispose` で走査と snapshot を解放 |
 | `AVG`               | `SUM / COUNT` を実行時に計算                                                                                                                |

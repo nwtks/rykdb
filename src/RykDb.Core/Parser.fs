@@ -420,31 +420,64 @@ module internal Parser =
             fail "集合演算（UNION / INTERSECT / EXCEPT）は未対応です" st
         | _ -> fail "文の開始として解釈できません" st
 
-    /// SQL テキストを 1文以上へ分解して AST にする。
-    let parseStatements (sql: string) =
-        let rec parseAll acc st =
-            if st.Pos >= st.Tokens.Length - 1 then
-                ret (List.rev acc)
-            else
-                match parseOne st with
-                | Error e -> err e
-                | Ok(statement, next) ->
-                    let separated =
-                        next.Pos > st.Pos && st.Tokens.[next.Pos - 1].Token = Token.Symbol ";"
+    /// `Token.Param` の個数。
+    let private parameterCount =
+        Array.sumBy (fun t ->
+            match t.Token with
+            | Token.Param _ -> 1
+            | _ -> 0)
 
-                    if next.Pos < st.Tokens.Length - 1 && not separated then
-                        fail "文の区切りには ; が必要です（複数文は ; で区切ってください）" next
-                    else
-                        parseAll (statement :: acc) next
+    /// 最初の `Token.Param` の行。個数不一致のエラー位置に使う。
+    let private firstParameterLine =
+        Array.tryPick (fun t ->
+            match t.Token with
+            | Token.Param _ -> Some t.Pos.Line
+            | _ -> None)
+        >> Option.defaultValue 1
 
-        Lexer.tokenize sql
-        >>= fun tokens ->
+    /// トークン列を 1文以上へ分解し、`?` を `parameters` の順に値へ置き換える。
+    let private parseTokens (parameters: SqlValue array) (tokens: TokenItem array) =
+        let expected = parameterCount tokens
+
+        if expected <> parameters.Length then
+            let message = sprintf "パラメータの個数が一致しません（SQL: %d個、指定: %d個）" expected parameters.Length
+
+            { DbError.typeError message with
+                Position = Some(firstParameterLine tokens)
+            }
+            |> err
+        else
+            let rec parseAll acc st =
+                if st.Pos >= st.Tokens.Length - 1 then
+                    ret (List.rev acc)
+                else
+                    match parseOne st with
+                    | Error e -> err e
+                    | Ok(statement, next) ->
+                        let separated =
+                            next.Pos > st.Pos && st.Tokens.[next.Pos - 1].Token = Token.Symbol ";"
+
+                        if next.Pos < st.Tokens.Length - 1 && not separated then
+                            fail "文の区切りには ; が必要です（複数文は ; で区切ってください）" next
+                        else
+                            parseAll (statement :: acc) next
+
             parseAll
                 []
                 {
-                    Tokens = Array.ofList tokens
+                    Tokens = tokens
                     Pos = 0
+                    Parameters = parameters
                 }
+
+    /// SQL テキストを 1文以上へ分解して AST にする。
+    /// `?` は出現順に `parameters` の値へ置き換える。
+    let parseStatementsWith (parameters: SqlValue array) (sql: string) =
+        Lexer.tokenize sql
+        >>= fun tokens -> parseTokens parameters (Array.ofList tokens)
+
+    /// SQL テキストを 1文以上へ分解して AST にする（パラメータなし）。
+    let parseStatements (sql: string) = parseStatementsWith [||] sql
 
     /// SQL テキストを 1つの式として解析する。
     /// DEFAULT の永続化文字列を復元するために使う。
@@ -456,6 +489,7 @@ module internal Parser =
                 {
                     Tokens = Array.ofList tokens
                     Pos = 0
+                    Parameters = [||]
                 }
 
             let! e, st = parseExprValue st

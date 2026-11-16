@@ -394,6 +394,12 @@ module internal Analyzer =
             | SqlValue.Int i -> Some(SqlValue.Int -i)
             | SqlValue.Real f -> Some(SqlValue.vReal -f)
             | _ -> None
+        | Expr.Value v -> Some v
+        | Expr.Unary(UnaryOp.Neg, Expr.Value v) ->
+            match v with
+            | SqlValue.Int i -> Some(SqlValue.Int -i)
+            | SqlValue.Real f -> Some(SqlValue.vReal -f)
+            | _ -> None
         | _ -> None
 
     let private rangeBounds (tn: string) (colName: string) =

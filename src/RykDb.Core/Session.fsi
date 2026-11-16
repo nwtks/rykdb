@@ -37,8 +37,17 @@ type Session =
     member TableNames: unit -> Result<string list, DbError>
     /// 単一の SELECT を materialize せずに開く。
     member TryOpenReader: sql: string -> Result<RowReader option, DbError>
+    /// パラメータ付きで単一の SELECT を materialize せずに開く。
+    /// `?` は出現順に `parameters` の値へ置き換えられる。
+    /// 値は SQL 文字列へ連結せず式として埋め込むため、SQL インジェクションは起こらない。
+    member TryOpenReader: sql: string * parameters: SqlValue array -> Result<RowReader option, DbError>
     /// 単一文または複数文を実行する。
     member Execute: sql: string -> Result<StatementResult, DbError>
+    /// パラメータ付きで単一文または複数文を実行する。
+    /// SQL 中の `?` は出現順に `parameters` の値へ置き換えられる。
+    /// 個数が一致しない場合は `TypeError` になる。
+    /// 値は SQL 文字列へ連結せず式として埋め込むため、SQL インジェクションは起こらない。
+    member Execute: sql: string * parameters: SqlValue array -> Result<StatementResult, DbError>
     /// トランザクションを始める。
     member Begin: unit -> Result<unit, DbError>
     /// COMMIT。
