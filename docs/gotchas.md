@@ -961,6 +961,13 @@ DU は `type` 宣言（モジュールスコープのものは `private` 可）�
   `let createIndexCore ci state = ... ci.Table ...` の `ci` が `AlterTable` と推論され、
   **`ci.Name` が FS0039** になった（`CreateIndex` と `Table` が衝突）。
   → レコードを受ける関数は `(ci: CreateIndex)` のように**型注釈を付ける**。
+- ⚠️ **新しいレコードのフィールド名も既存と衝突させるな**。
+  `Prepared = { Schema; Columns; Likes }` を追加したら、`schema.Columns` を読むだけの
+  既存関数（`Analyzer` / `Optimizer` / `PlanBuilder`）が `Prepared` と推論され、
+  `ImmutableDictionary` に `.Length` が無いという FS0039 が大量に出た。
+  → `Source` / `Resolved` / `Patterns` に改名して解消。
+  判断基準: **`Columns` / `Rows` / `Name` / `Value` / `Items` / `Table` は既存で使われている**。
+  新規レコードでは用途が分かる別名にする。
 
 ### 8.18b レコードの `.Length` は配列と誤推論される
 
@@ -2445,24 +2452,28 @@ B: COMMIT 成功              -- ← 重複したまま
 - `SessionPool: 接続間で UNIQUE の同時 UPDATE を検出する`
 - `TransactionManager.commit: UNIQUE の論理予約が競合する`
 
-### 11.71 行ごとの式評価では `Eval.resolver` を使い回す
+### 11.71 行ごとの式評価では `Eval.prepare` の `Prepared` を使い回す
 
-`Eval.eval` は呼び出しごとに `ColumnResolver` を作る簡易版で、
-行ごとに使うと `Schema.resolve` の線形探索と候補リストの割当が毎行発生する。
-`Eval.matches` という簡易版は無く、行ごとの述語評価は `Eval.matchesWithV resolve row predicate` を使う。
+`Eval.eval` は評価準備を都度作る簡易版で、
+行ごとに使うと列解決表の構築（`Expr.fold` + `ImmutableDictionary`）が毎行発生する。
+行ごとの述語評価は `Eval.matchesWithV prepared row predicate` を使う。
 
 ```fsharp
-// ❌ 行ごとに resolver を捨てる（従来と同じコスト）
+// ❌ 行ごとに準備を作り直す
 Op.filter (fun row -> Eval.eval schema row predicate)
 
 // ✅ 1オペレータ分だけ作って使い回す
-let resolve = Eval.resolver schema
-Op.filter (fun row -> Eval.matchesWithV resolve row predicate)
+let prepared = Eval.prepare schema [ predicate ]
+Op.filter (fun row -> Eval.matchesWithV prepared row predicate)
 ```
 
-- `Schema` が変わるところ（JOIN の出力、集約後の `Schema.empty`）では新しい resolver を作る。
-- resolver はスキーマごとの `Dictionary` なので、複数スレッドで共有しない
-  （`Op` は one-shot なので通常は問題ない）。
+- `Prepared` は不変（`ImmutableDictionary`）で、評価中に状態は変わらない。
+  キャッシュではなく前計算なので、複数スレッドで共有しても安全。
+- `Schema` が変わるところ（JOIN の出力、集約後の `Schema.empty`）では新しい `Prepared` を作る。
+- **罠**: `ImmutableDictionary.TryGetValue` は F# では `bool * 'T` のタプルを返すため、
+  行ごとに約 48 バイト確保する。ホットパスでは `ContainsKey` + インデクサで引く。
+  回帰テスト: `Eval.matchesWithV: リテラル述語は 1000 回でも結果を確保しない` /
+  `Scalar.likeMatch: 計画時にコンパイルしたパターンは行ごとに配列を確保しない`。
 - 実測（`tools/RykDb.Bench` の `FilterSeqScan`、10万行）:
   導入前 約 520MB → 導入後 約 400MB の割当。
   残りは SSTable の値デコードが支配的（値の遅延デコードは別の改善）。

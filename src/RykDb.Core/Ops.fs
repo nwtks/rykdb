@@ -7,7 +7,7 @@ module internal Ops =
 
     /// 述語で弾く。
     let filter (schema: Schema) (predicate: Expr) =
-        let resolve = Eval.resolver schema
+        let resolve = Eval.prepare schema [ predicate ]
         Op.filter (fun row -> Eval.matchesWithV resolve row predicate)
 
     /// ソート。
@@ -15,7 +15,7 @@ module internal Ops =
     /// 式が含まれる場合はキーを評価して行末へ足してからソートする。
     /// `*` / `t.*` はORDER BY には書けない。
     let sortBy (schema: Schema) (keys: RykDb.Core.SortKey list) (src: Op) =
-        let resolve = Eval.resolver schema
+        let resolve = Eval.prepare schema (keys |> List.map _.Expression)
 
         let compareWith plan (a: SqlValue array) (b: SqlValue array) =
             let rec compareKeys =
@@ -245,7 +245,7 @@ module internal Ops =
     let havingFilter (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (predicate: Expr) =
         let offsets = aggOffsets groupBy aggs
         let wholeOffsets = wholeGroupOffsets groupBy
-        let resolve = Eval.resolver Schema.empty
+        let resolve = Eval.prepare Schema.empty [ predicate ]
 
         fun row ->
             match substituteAggs offsets wholeOffsets row predicate with
@@ -281,7 +281,9 @@ module internal Ops =
     /// </remarks>
     let aggregate (schema: Schema) (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (src: Op) =
         let groupBudget = 4_000_000
-        let resolve = Eval.resolver schema
+
+        let resolve =
+            Eval.prepare schema (groupBy @ (aggs |> List.map (fun (_, _, _, e) -> e)))
 
         let keyOfRow row =
             let keys = Array.zeroCreate<SqlValue> groupBy.Length
@@ -527,7 +529,7 @@ module internal Ops =
             let foundAggs = aggCallsOf projection.SelectItems
             let offsets = aggOffsets groupBy foundAggs
             let wholeOffsets = wholeGroupOffsets groupBy
-            let resolve = Eval.resolver schema
+            let resolve = Eval.prepare schema allExprs
 
             let evalItems row (exprs: Expr list) =
                 let values = Array.zeroCreate<SqlValue> exprs.Length
@@ -547,7 +549,7 @@ module internal Ops =
             if List.isEmpty foundAggs && List.isEmpty groupBy then
                 Op.map (fun row -> evalItems row allExprs) src
             else
-                let resolveAgg = Eval.resolver Schema.empty
+                let resolveAgg = Eval.prepare Schema.empty allExprs
 
                 Op.map
                     (fun row ->

@@ -144,7 +144,7 @@ flowchart TB
 | 結合       | **インデックス入れ子ループ / マージ / ハッシュ / 入れ子ループ**を走査順と見積りで選択                     | §5.1                                                |
 | 並べ替え   | **外部マージソート**（run へ溢らし、fan-in 32 の multi-pass k-way merge）                                 | §5.3                                                |
 | 列読み出し | **列マスク**（必要な列だけ復号し、不要列は `Unloaded` として読み飛ばす）                                  | §5.4                                                |
-| 式評価     | **CPS + メモ化 resolver**、3値論理、手書き LIKE 照合、struct DU / `DbResult` で割当を抑える               | §5.4                                                |
+| 式評価     | **CPS + 計画時の準備値（`Eval.prepare`）**、3値論理、手書き LIKE 照合、struct DU / `DbResult` で割当を抑える | §5.4                                                |
 | 構文解析   | 手書き Lexer + 再帰下降 Parser（式は Pratt / precedence climbing、SELECT は CPS）                         | §3                                                  |
 | エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                                       | [`coding-conventions.md`](coding-conventions.md) §1 |
 | ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                                         | §4.2, §8.1                                          |
@@ -876,11 +876,13 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 
 **列参照の解決**
 
-`Eval.step` は列参照を `Schema.resolve` で直接解決せず、
-`Eval.resolver` が作る `ColumnRef -> 列位置` のメモ化済み resolver を使う。
-オペレータ（WHERE / JOIN / 射影 / 集約 / ORDER BY / DML）ごとに 1個作り、
-同じ式を行ごとに評価しても線形探索と候補リストの割当を繰り返さない。
-`Schema` が変わるところ（JOIN の出力、集約後など）では新しい resolver を作る。
+`Eval.step` は列参照を毎行 `Schema.resolve` しない。
+演算子（WHERE / JOIN / 射影 / 集約 / ORDER BY / DML）は実行前に
+`Eval.prepare schema exprs` で `Prepared`（不変）を作り、
+列位置の解決表とリテラル LIKE のコンパイル済みトークン列を保持する。
+`Prepared` は評価中に変化しない（可変のキャッシュではなく前計算）。
+列パターン（`a LIKE b`）だけは計画時に決まらないので、評価のたびにコンパイルする。
+`Schema` が変わるところ（JOIN の出力、集約後など）では新しい `Prepared` を作る。
 
 **評価機のメモリ**
 

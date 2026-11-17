@@ -178,7 +178,7 @@ module internal DmlOps =
 
     /// WHERE の述語。
     /// WHERE が無ければ「全部通過」（UPDATE / DELETE で共通）。
-    let private matchesWhere (resolve: ColumnResolver) (row: SqlValue array) =
+    let private matchesWhere (resolve: Prepared) (row: SqlValue array) =
         function
         | Some w -> Eval.matchesWithV resolve row w
         | None -> DbOk true
@@ -430,8 +430,8 @@ module internal DmlOps =
     /// （DELETE + INSERT を使う）。
     let update (ctx: ExecContext) (schema: TableSchema) (assignments: (string * Expr) list) (where: Expr option) =
         let targetSchema = targetSchemaOf schema
-        let resolve = Eval.resolver targetSchema
         let assignExprs = List.map snd assignments
+        let resolve = Eval.prepare targetSchema (assignExprs @ Option.toList where)
 
         let assign targets row =
             gatherWith (Eval.evalWithV resolve row) schema assignExprs targets
@@ -555,7 +555,7 @@ module internal DmlOps =
     /// WHERE に合う行を主キー + 全索引に tombstone で消す。
     let delete (ctx: ExecContext) (schema: TableSchema) (where: Expr option) =
         let targetSchema = targetSchemaOf schema
-        let resolve = Eval.resolver targetSchema
+        let resolve = Eval.prepare targetSchema (Option.toList where)
 
         let deleteMask =
             let width = schema.Columns.Length

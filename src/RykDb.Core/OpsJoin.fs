@@ -50,7 +50,7 @@ module internal OpsJoin =
         (rightRows: SqlValue array array)
         (lrow: SqlValue array)
         =
-        let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
+        let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
         let joinPred l r = Eval.matchesJoinedV resolve l r
 
         // 1回の Op.next で「一致するまで右を進める」。
@@ -141,7 +141,10 @@ module internal OpsJoin =
         (residual: Expr option)
         =
         let rightWidth = rightSchema.Columns.Length
-        let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
+
+        let resolve =
+            Eval.prepare (Schema.concat leftSchema rightSchema) (Option.toList residual)
+
         let padded lrow = padWithNulls lrow rightWidth
 
         let rec probe cur =
@@ -338,7 +341,10 @@ module internal OpsJoin =
         (residual: Expr option)
         =
         let rightWidth = rightSchema.Columns.Length
-        let resolve = Eval.resolver (Schema.concat leftSchema rightSchema)
+
+        let resolve =
+            Eval.prepare (Schema.concat leftSchema rightSchema) (Option.toList residual)
+
         let padded lrow = padWithNulls lrow rightWidth
 
         let rec loop lside rside =

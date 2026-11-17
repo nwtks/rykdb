@@ -740,7 +740,7 @@ module internal Plan =
                                 | s :: _ -> s.Schema
                                 | [] -> Schema.empty
 
-                            let resolve = Eval.resolver currentSchema
+                            let resolve = Eval.prepare currentSchema [ left ]
 
                             let run row =
                                 let withRow = withCurrentRow row scopes

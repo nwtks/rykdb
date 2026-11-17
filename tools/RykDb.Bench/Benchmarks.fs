@@ -353,7 +353,6 @@ type EvalBenchmarks() =
             Tables = [ "t" ]
         }
 
-    let resolver = Eval.resolver schema
     let row = [| SqlValue.Int 500L; SqlValue.Int 10L |]
     let compareA = SqlValue.Int 1L
     let compareB = SqlValue.Int 2L
@@ -376,6 +375,9 @@ type EvalBenchmarks() =
                 Expr.IsNull(col "b", false)
             )
         )
+
+    // 式はすべて計画時に列解決済み（ベンチは評価だけを見る）。
+    let resolver = Eval.prepare schema [ binary; complex ]
 
     [<Benchmark>]
     member _.MatchesLiteralV() =

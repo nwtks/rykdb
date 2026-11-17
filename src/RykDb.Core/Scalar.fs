@@ -4,14 +4,15 @@ module internal Scalar =
     /// LIKE のトークン。
     /// リテラルは UTF-16 の code unit ではなく Unicode コードポイントで持つ
     /// （`_` の 1文字と同じ単位に揃える）。
-    type private LikeToken =
+    type internal LikeToken =
         | LiteralCodePoint of int
         | AnyOne
         | AnyMany
 
     /// コンパイル済みの LIKE パターン。
-    /// パターンは行ごとに変わらないので、1回だけトークン列にして再利用する。
-    type private LikePattern = { Tokens: LikeToken array }
+    /// リテラルは計画時に `Eval.prepare` が 1回だけコンパイルし、
+    /// 行ごとの再コンパイルをしない（列パターンだけは評価のたびにコンパイルする）。
+    type internal LikePattern = { Tokens: LikeToken array }
 
     /// 位置 i の Unicode コードポイントと、その UTF-16 幅（1 または 2）。
     /// 対になっていないサロゲートは 1 コード単位として返す（範囲外アクセスを避ける）。
@@ -30,7 +31,7 @@ module internal Scalar =
     /// ESCAPE を解釈してパターンをトークン列にする。
     /// ESCAPE の後に文字が無ければ TypeError。
     /// ESCAPE 文字とエスケープした文字は 1 コードポイントとして扱う。
-    let private compileTokens (escape: int option) (pattern: string) =
+    let internal compileTokens (escape: int option) (pattern: string) =
         let rec loop i acc =
             if i >= pattern.Length then
                 ret
@@ -57,14 +58,9 @@ module internal Scalar =
 
         loop 0 []
 
-    /// ESCAPE なしを表すキャッシュキー。
+    /// ESCAPE なしを表すコードポイント。
     [<Literal>]
-    let private NoEscape = -1
-
-    /// キャッシュするパターン数の上限。
-    /// 列パターン（行ごとに違う文字列）で辞書が単調に増えないようにする。
-    [<Literal>]
-    let private MaxCachedLikePatterns = 1024
+    let internal NoEscape = -1
 
     /// 末尾の連続する `%` を読み飛ばす。
     [<TailCall>]
@@ -119,49 +115,27 @@ module internal Scalar =
                 else
                     false
 
-    let private matchLikeTokens (tokens: LikeToken array) (text: System.ReadOnlySpan<char>) =
+    /// コンパイル済みトークン列で照合する（`Eval.prepare` がコンパイルした結果を使う）。
+    let internal matchLikeTokens (tokens: LikeToken array) (text: System.ReadOnlySpan<char>) =
         goLike tokens text 0 0 -1 0
-
-    /// 1クエリ分のコンパイル済み LIKE パターン。
-    /// resolver が所有するので、クエリをまたいで状態を共有しない。
-    type internal LikeCache() =
-        let cache =
-            System.Collections.Generic.Dictionary<struct (int * string), Result<LikePattern, DbError>>()
-
-        member private _.Compile (escapeCode: int) (pattern: string) =
-            let key = struct (escapeCode, pattern)
-
-            if cache.ContainsKey key then
-                cache.[key]
-            else
-                if cache.Count >= MaxCachedLikePatterns then
-                    cache.Clear()
-
-                let escape = if escapeCode < 0 then None else Some escapeCode
-                let compiled = compileTokens escape pattern
-                cache.[key] <- compiled
-                compiled
-
-        member this.Match (pattern: string) (text: string) =
-            match this.Compile NoEscape pattern with
-            | Ok compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text)
-            | Error _ -> false
-
-        member this.MatchWithEscape (escape: int) (pattern: string) (text: string) =
-            this.Compile escape pattern
-            |> Result.map (fun compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
 
     /// LIKE のパターン照合。
     /// `%` は任意の文字列、`_` は Unicode コードポイント 1個。
     /// 正規表現に落とさずに手で照合する（LIKE の方言差を吸収するため）。
-    /// パターンはキャッシュしたトークン列を使う（行ごとに解析しない）。
+    /// 行ごとに呼ぶホットパスでは `Eval.prepare` の `Like` を使う
+    /// （この関数は式を伴わない単発の照合用で、毎回コンパイルする）。
     /// バックトラックは 1段だけ（無限ループしないことが最優先）。
-    let likeMatch (pattern: string) (text: string) = LikeCache().Match pattern text
+    let likeMatch (pattern: string) (text: string) =
+        match compileTokens None pattern with
+        | Ok compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text)
+        | Error _ -> false
 
     /// ESCAPE 付き LIKE。
     /// `escape` は Unicode コードポイント。
+    /// 行ごとに呼ぶホットパスでは `Eval.prepare` の `Like` を使う。
     let likeMatchWithEscape (escape: int) (pattern: string) (text: string) =
-        LikeCache().MatchWithEscape escape pattern text
+        compileTokens (Some escape) pattern
+        |> Result.map (fun compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
 
     /// ESCAPE 句の文字列を 1 コードポイントとして取り出す。
     /// コードポイントが 1個でなければ TypeError。

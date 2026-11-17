@@ -98,8 +98,6 @@ Core では `ResizeArray` を使わない。
 - `SstableFormat` の DB ごとの partial reader / ブロックキャッシュ（`ConcurrentDictionary`）
 - `EngineHost` の host state / ファイル refcount / 採番（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
-- `Eval.resolver` の列解決キャッシュと LIKE パターンキャッシュ
-  （1オペレータ = 1スキーマ。行ごとの `Schema.resolve` と LIKE の再コンパイルを繰り返さない）
 
 | やりたいこと       | 命令形の代わりに使うもの                                                        |
 | ------------------ | ------------------------------------------------------------------------------- |
@@ -109,6 +107,7 @@ Core では `ResizeArray` を使わない。
 | 走査・畳み込み     | `Result` を返す末尾再帰                                                         |
 | ホットパスの成功値 | `DbResult<'T>`（`DbOk` / `DbErr`）。公開境界で `Result` に変換する              |
 | 平衡木の再構築     | 明示スタック（`list` を積む）                                                   |
+| 行ごとの列解決     | `Eval.prepare`（計画時の不変な準備値。`ImmutableDictionary` で解決済み）       |
 | 遅延列挙           | `Op`（one-shot。構築は `Op.compute` / `Op.emit`、消費は `Op.next` の `OpStep`） |
 
 関数名の末尾の `V`（`matchesWithV` / `compareValuesV`）は

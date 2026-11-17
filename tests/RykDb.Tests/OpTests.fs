@@ -22,7 +22,8 @@ let private row (values: SqlValue list) = List.toArray values
 let private col (name: string) =
     Expr.Column { Qualifier = None; Name = name }
 
-let private matches = Eval.resolver >> Eval.matchesWithV
+let private matches (schema: Schema) (row: SqlValue array) (predicate: Expr) =
+    Eval.matchesWithV (Eval.prepare schema [ predicate ]) row predicate
 
 [<Fact>]
 let ``Op: 次の行を引くまで計算しない`` () =

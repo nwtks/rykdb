@@ -86,12 +86,19 @@ let ``Scalar.likeMatch: 正規表現オラクルと一致する（ランダム�
             Assert.Equal(expected, ok (likeEsc '!' pattern text))
 
 [<Fact>]
-let ``Scalar.likeMatch: 同じパターンは行ごとに配列を確保しない`` () =
-    // 初回だけコンパイルし、以降はキャッシュしたトークン列で照合する。
+let ``Scalar.likeMatch: 計画時にコンパイルしたパターンは行ごとに配列を確保しない`` () =
+    // リテラルパターンは `Eval.prepare` が 1回だけコンパイルし、
+    // 以降はコンパイル済みトークン列で照合する。
     let pattern = "a%b%c"
     let text = "aXXbYYc"
-    let cache = Scalar.LikeCache()
-    Assert.True(cache.Match pattern text)
+    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
+
+    let expr =
+        Expr.Like(Expr.Column { Qualifier = None; Name = "s" }, Expr.Literal(Literal.String pattern), false, None)
+
+    let prepared = Eval.prepare schema [ expr ]
+    let compiled = ok (prepared.Like Scalar.NoEscape pattern)
+    Assert.True(Scalar.matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
 
     let before = System.GC.GetAllocatedBytesForCurrentThread()
 
@@ -99,7 +106,12 @@ let ``Scalar.likeMatch: 同じパターンは行ごとに配列を確保しな�
         if i >= 1000 then
             matched
         else
-            loop (i + 1) (if cache.Match pattern text then matched + 1 else matched)
+            let m =
+                match prepared.Like Scalar.NoEscape pattern with
+                | Ok cached -> Scalar.matchLikeTokens cached.Tokens (System.MemoryExtensions.AsSpan text)
+                | Error _ -> false
+
+            loop (i + 1) (if m then matched + 1 else matched)
 
     let matched = loop 0 0
     let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before

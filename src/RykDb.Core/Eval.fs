@@ -1,32 +1,51 @@
 namespace RykDb.Core
 
-/// 列参照の解決を 1オペレータ（1クエリ）分だけメモ化する。
+/// 1オペレータ分の評価準備（不変）。
 /// <remarks>
-/// 同じ式を行ごとに評価するとき、`Schema.resolve` の線形探索と
-/// 候補リスト（`int list`）の割当を繰り返さないために使う。
-/// `Schema` が変わるところ（JOIN の出力、集約後など）では新しい resolver を作る。
-/// 1つの resolver は複数スレッドから同時に使わないこと（`Op` は one-shot）。
+/// 演算子が評価する式から、列参照の解決とリテラル LIKE パターンのコンパイルを
+/// **計画時に 1回だけ**行って保持する。行ごとの `Schema.resolve` と LIKE の
+/// 再コンパイルを繰り返さないための前計算であり、評価中に変わる状態は無い。
+/// `Schema` が変わるところ（JOIN の出力、集約後など）では新しい `Prepared` を作る。
+/// 列パターン（`a LIKE b`）だけは評価のたびにコンパイルする（`Like` のフォールバック）。
 /// </remarks>
 [<NoEquality; NoComparison>]
-type internal ColumnResolver =
+type internal Prepared =
     private
         {
-            Schema: Schema
-            Cache: System.Collections.Generic.Dictionary<struct (string option * string), Result<int, DbError>>
-            LikeCache: Scalar.LikeCache
+            Source: Schema
+            Resolved:
+                System.Collections.Immutable.ImmutableDictionary<struct (string option * string), Result<int, DbError>>
+            Patterns:
+                System.Collections.Immutable.ImmutableDictionary<
+                    struct (int * string),
+                    Result<Scalar.LikePattern, DbError>
+                 >
         }
 
     /// 列参照を列位置へ解決する。
-    /// 同じ参照は 1回しか `Schema.resolve` を呼ばない。
+    /// 計画時に拾えなかった参照だけ `Schema.resolve` に落ちる。
+    /// <remarks>
+    /// `TryGetValue` は F# では `bool * 'T` のタプルを返すため行ごとに確保する。
+    /// ホットパスなので `ContainsKey` + インデクサで引く（参照の割当なし）。
+    /// </remarks>
     member this.Resolve(r: ColumnRef) =
         let key = struct (r.Qualifier, r.Name)
 
-        match this.Cache.TryGetValue key with
-        | true, result -> result
-        | _ ->
-            let result = Schema.resolve this.Schema r
-            this.Cache.[key] <- result
-            result
+        if this.Resolved.ContainsKey key then
+            this.Resolved.[key]
+        else
+            Schema.resolve this.Source r
+
+    /// コンパイル済み LIKE パターンを返す。
+    /// `escape` はコードポイント（`Scalar.NoEscape` = ESCAPE なし）。
+    /// リテラル以外のパターンはここでコンパイルする。
+    member this.Like (escape: int) (pattern: string) =
+        let key = struct (escape, pattern)
+
+        if this.Patterns.ContainsKey key then
+            this.Patterns.[key]
+        else
+            Scalar.compileTokens (if escape = Scalar.NoEscape then None else Some escape) pattern
 
 /// 評価対象の行。
 /// JOIN の ON 句では左右の行を連結せずに参照する（構造体なのでヒープ割当なし）。
@@ -52,6 +71,17 @@ module internal Eval =
         | Mul
         | Div
         | Mod
+
+    /// LIKE 照合。コンパイル失敗は偽（ESCAPE なしの従来の `Match` と同じ振る舞い）。
+    let private likeMatches (resolve: Prepared) (escape: int) (pattern: string) (text: string) =
+        match resolve.Like escape pattern with
+        | Ok compiled -> Scalar.matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text)
+        | Error _ -> false
+
+    /// LIKE 照合。コンパイル失敗をエラーとして返す（ESCAPE 付き）。
+    let private tryLikeMatches (resolve: Prepared) (escape: int) (pattern: string) (text: string) =
+        resolve.Like escape pattern
+        |> Result.map (fun compiled -> Scalar.matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
 
     let private overflowError () =
         DbErr(DbError.constraintViolation "数値演算の結果が表現可能な範囲を超えました")
@@ -320,9 +350,10 @@ module internal Eval =
     /// 降りる／上がるを継続スタック Kont でつなぐ（CPS）。
     /// 再帰はこの関数の自己再帰だけなので全部末尾位置になり、
     /// 式の深さ・IN の候補数に依存せずスタックは一定（継続はヒープのリストに積む）。
-    /// `resolve` は列解決のキャッシュ付き resolver（`Eval.resolver` で作る）。
+    /// `resolve` は計画時に作った評価準備（`Eval.prepare`）で、
+    /// 列解決と LIKE のコンパイルを済ませてある。
     [<TailCall>]
-    let rec private step (resolve: ColumnResolver) (row: RowView) (kont: Kont list) (st: Step) =
+    let rec private step (resolve: Prepared) (row: RowView) (kont: Kont list) (st: Step) =
         match st with
         | Descend e ->
             match e with
@@ -435,7 +466,11 @@ module internal Eval =
                         else
                             DbOk(
                                 SqlValue.ofBool (
-                                    resolve.LikeCache.Match (SqlValue.toDisplayString v) (SqlValue.toDisplayString l)
+                                    likeMatches
+                                        resolve
+                                        Scalar.NoEscape
+                                        (SqlValue.toDisplayString v)
+                                        (SqlValue.toDisplayString l)
                                 )
                             )
                     | BinaryOp.Eq -> compare CompareOp.Eq l v
@@ -495,7 +530,11 @@ module internal Eval =
                     match esc with
                     | None ->
                         let m =
-                            resolve.LikeCache.Match (SqlValue.toDisplayString v) (SqlValue.toDisplayString x)
+                            likeMatches
+                                resolve
+                                Scalar.NoEscape
+                                (SqlValue.toDisplayString v)
+                                (SqlValue.toDisplayString x)
 
                         step resolve row rest (Arrive(SqlValue.ofBool (if negated then not m else m)))
                     | Some escExpr -> step resolve row (KLikeE(x, v, negated) :: rest) (Descend escExpr)
@@ -507,7 +546,8 @@ module internal Eval =
                     | Error er -> DbErr er
                     | Ok escape ->
                         match
-                            resolve.LikeCache.MatchWithEscape
+                            tryLikeMatches
+                                resolve
                                 escape
                                 (SqlValue.toDisplayString pattern)
                                 (SqlValue.toDisplayString x)
@@ -536,28 +576,109 @@ module internal Eval =
                     | Ok res -> step resolve row rest (Arrive res)
                 | a :: more -> step resolve row (KFuncArg(n, acc, more) :: rest) (Descend a)
 
-    /// 列参照の解決をスキーマ単位でメモ化した resolver を作る。
-    /// 同じスキーマで行ごとに評価するときは、こちらを 1回だけ作って使い回す。
-    let resolver (schema: Schema) =
+    /// 演算子が評価する式から、列解決とリテラル LIKE のコンパイルを 1回で済ませる。
+    /// 可変のキャッシュではなく、返した値は評価中に変化しない。
+    /// 列パターン（`a LIKE b`）は計画時に決まらないので、ここではコンパイルしない。
+    let prepare (schema: Schema) (exprs: Expr list) =
+        let emptyColumns
+            : System.Collections.Immutable.ImmutableDictionary<struct (string option * string), Result<int, DbError>> =
+            System.Collections.Immutable.ImmutableDictionary.Create()
+
+        let addColumn
+            (acc:
+                System.Collections.Immutable.ImmutableDictionary<struct (string option * string), Result<int, DbError>>)
+            (c: ColumnRef)
+            =
+            let key = struct (c.Qualifier, c.Name)
+
+            if acc.ContainsKey key then
+                acc
+            else
+                acc.Add(key, Schema.resolve schema c)
+
+        let columns =
+            (emptyColumns, exprs)
+            ||> List.fold (fun acc e ->
+                Expr.fold
+                    (fun acc node ->
+                        match node with
+                        | Expr.Column c -> addColumn acc c
+                        | _ -> acc)
+                    acc
+                    e)
+
+        let emptyLikes
+            : System.Collections.Immutable.ImmutableDictionary<
+                struct (int * string),
+                Result<Scalar.LikePattern, DbError>
+               > =
+            System.Collections.Immutable.ImmutableDictionary.Create()
+
+        let addLike
+            (acc:
+                System.Collections.Immutable.ImmutableDictionary<
+                    struct (int * string),
+                    Result<Scalar.LikePattern, DbError>
+                 >)
+            (escape: Expr option)
+            (pattern: Expr)
+            =
+            match pattern with
+            | Expr.Literal(Literal.String p) ->
+                let code =
+                    match escape with
+                    | None -> Some Scalar.NoEscape
+                    | Some(Expr.Literal(Literal.String s)) ->
+                        match Scalar.escapeCodePoint s with
+                        | Ok cp -> Some cp
+                        | Error _ -> None
+                    | Some _ -> None
+
+                match code with
+                | Some code ->
+                    let key = struct (code, p)
+
+                    if acc.ContainsKey key then
+                        acc
+                    else
+                        let compiled =
+                            Scalar.compileTokens (if code = Scalar.NoEscape then None else Some code) p
+
+                        acc.Add(key, compiled)
+                | None -> acc
+            | _ -> acc
+
+        let likes =
+            (emptyLikes, exprs)
+            ||> List.fold (fun acc e ->
+                Expr.fold
+                    (fun acc node ->
+                        match node with
+                        | Expr.Like(_, p, _, esc) -> addLike acc esc p
+                        | Expr.Binary(BinaryOp.Like, _, p) -> addLike acc None p
+                        | _ -> acc)
+                    acc
+                    e)
+
         {
-            Schema = schema
-            Cache = System.Collections.Generic.Dictionary<struct (string option * string), Result<int, DbError>>()
-            LikeCache = Scalar.LikeCache()
+            Source = schema
+            Resolved = columns
+            Patterns = likes
         }
 
-    /// メモ化済み resolver で式を評価する（内部ホットパス用）。
+    /// 計画時に作った評価準備で式を評価する（内部ホットパス用）。
     /// 集約呼び出しはここでエラーになる。
     /// 評価機 step を空の継続スタックで始める（末尾再帰のまま深さ・候補数に依存しない）。
-    let evalWithV (resolve: ColumnResolver) (row: SqlValue array) (e: Expr) : DbResult<SqlValue> =
+    let evalWithV (resolve: Prepared) (row: SqlValue array) (e: Expr) : DbResult<SqlValue> =
         step resolve (Single row) [] (Descend e)
 
-    /// メモ化済み resolver で式を評価する（公開境界用）。
-    let evalWith (resolve: ColumnResolver) (row: SqlValue array) (e: Expr) =
+    /// 評価準備で式を評価する（公開境界用）。
+    let evalWith (resolve: Prepared) (row: SqlValue array) (e: Expr) =
         evalWithV resolve row e |> DbResult.toResult
 
-    /// 式を評価する（resolver を都度作る簡易版）。
-    /// 行ごとに呼ぶホットパスでは `evalWithV` に resolver を渡すこと。
-    let eval = resolver >> evalWith
+    /// 式を評価する（評価準備を都度作る簡易版）。
+    /// 行ごとに呼ぶホットパスでは `prepare` を 1回だけ作って `evalWithV` に渡すこと。
+    let eval (schema: Schema) = prepare schema [] |> evalWith
 
     /// 評価結果を WHERE の真偽へ変換する（UNKNOWN は偽）。
     let private asMatchV (r: DbResult<SqlValue>) : DbResult<bool> =
@@ -574,11 +695,11 @@ module internal Eval =
 
     /// WHERE の判定（内部ホットパス用）。
     /// UNKNOWN は偽（SQL 標準）。
-    let matchesWithV (resolve: ColumnResolver) (row: SqlValue array) (predicate: Expr) =
+    let matchesWithV (resolve: Prepared) (row: SqlValue array) (predicate: Expr) =
         evalWithV resolve row predicate |> asMatchV
 
     /// JOIN の ON 句（および residual）の判定（内部ホットパス用）。
     /// 左右の行を連結せずに、左の列の後ろに右の列が並んでいるものとして評価する。
-    /// resolver は `Schema.concat leftSchema rightSchema` に対応するものを使う。
-    let matchesJoinedV (resolve: ColumnResolver) (left: SqlValue array) (right: SqlValue array) (predicate: Expr) =
+    /// resolve は `Schema.concat leftSchema rightSchema` と ON 句の式から作る。
+    let matchesJoinedV (resolve: Prepared) (left: SqlValue array) (right: SqlValue array) (predicate: Expr) =
         step resolve (Joined(left, right)) [] (Descend predicate) |> asMatchV
