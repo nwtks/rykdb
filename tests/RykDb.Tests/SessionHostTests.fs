@@ -125,7 +125,7 @@ let ``DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録
         let host = ok (DatabaseHost.OpenWith(root, commitDurability = durable))
 
         let execute sql =
-            host.ExecuteNonTransaction SessionState.none ResultLimits.Unlimited (parseOneOk sql)
+            host.ExecuteNonTransaction TxnState.none ResultLimits.Unlimited (parseOneOk sql)
 
         try
             ok (execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)") |> ignore

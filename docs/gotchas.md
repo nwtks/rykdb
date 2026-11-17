@@ -536,7 +536,7 @@ let (mgr, txn2) = TransactionManager.beginTxn mgr
 
 ### 5.6 公開 API では `Session` を使う
 
-`Session` は接続ローカルの transaction 状態（`SessionState`）を持ち、
+`Session` は接続ローカルの transaction 状態（`TxnState`）を持ち、
 各文の成功後にそこだけを進める（committed な状態は `DatabaseHost` が管理する）ため、
 利用者が戻り値を引き継ぐ必要はない。
 
@@ -1493,7 +1493,7 @@ DDL だけは DB ごとに排他にする必要がある。
 - 結果: トランザクションを `Rollback` / `Commit` せずに捨てると、その登録が残り、
   **その root の DDL は `ConflictError` になる**。
   `Close()` / `Dispose()` で解除され、接続への参照が切れて GC されても外れる
-  （`SessionState.Registration` の `RegistrationLease`。§7.5）。
+  （`TxnState.Lease` の `RegistrationLease`。§7.5）。
   GC の時期は不定なので、明示的に終わらせるのが基本。
 - 回帰テスト: `SessionPool: transaction 中の DDL は他接続で ConflictError` /
   `Database: commit せずに捨てた transaction も GC されれば登録が外れる` /
@@ -2311,10 +2311,10 @@ BEGIN 時点の `TransactionManager`（`NextSeqNo` / `LastCommitted` / `Active`�
 （SeqNo の衝突・write-write 競合の見逃し・commit の取りこぼし）。
 `Store` も古いため、他接続の commit が memtable に載っていない。
 
-✅ 文を実行するたびに **最新の committed state に接続ローカルの transaction を重ねる**（`SessionState.apply`）。
-`Catalog` / `Active` / `Pending` / `Registration` だけをローカルに持ち、
-`Store` / `Manager` は `DatabaseHost` の最新値を使い、
-`Catalog` は BEGIN 時点の接続ローカル値（`SessionState.Catalog`）を使う
+✅ 文を実行するたびに **最新の committed state に接続ローカルの transaction を重ねる**（`ExecState` を組み立てる）。
+`CatalogAtBegin` / `Active` / `Pending` / `Lease` だけをローカル（`TxnState`）に持ち、
+`Store` / `Manager` は `DatabaseHost` の最新値（`Committed`）を使い、
+`Catalog` は BEGIN 時点の接続ローカル値（`TxnState.CatalogAtBegin`）を使う
 （transaction 中は DDL できないので変化しない）。
 可視性は `Transaction.Snapshot.SeqNo` で決まるので、Store を最新にしても repeatable read は崩れない。
 BEGIN / COMMIT / ROLLBACK と暗黙 transaction の DML / DDL は `DatabaseHost.writeGate` の下で行い、

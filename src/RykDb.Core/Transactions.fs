@@ -536,7 +536,7 @@ type internal RootRuntime() =
 
 /// 進行中 transaction の登録の生存に結び付いたリース。
 /// <remarks>
-/// `SessionState.Registration` が持ち、接続（`Session`）が Close されずに捨てられても、
+/// `TxnState.Lease` が持ち、接続（`Session`）が Close されずに捨てられても、
 /// GC された時点で（その登録のリースが最後の 1本なら）登録を外す。
 /// finalizer が走るのは「その接続がもう使えない」状態なので、
 /// まだ commit できる transaction を誤って解放することはない。
@@ -546,7 +546,7 @@ type internal RegistrationLease(registration: ActiveRegistration) =
     /// このリースの生存トークン。
     let token = registration.Attach()
 
-    /// 登録そのもの（`DbState.ActiveRegistration` へ渡す）。
+    /// 登録そのもの（`ExecState.ActiveRegistration` へ渡す）。
     member _.Registration = registration
 
     /// このリースの登録を外す。

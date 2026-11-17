@@ -48,7 +48,7 @@ F# の型システムでは表現できないため、
 | INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`                            | `Memtable.fsi`（構築は `Empty` / `insert` / `apply` に限定）+ `Memtable.insert` の会計とランダム挿入・順序独立性のプロパティテスト                                                    | ✅ 完了 |
 | INV-15 | `RowReader` は Reading / Exhausted / Closed のいずれか                      | `RowReaderState`（状態 DU に置き換え、`releaseTo` が遷移と 1回解放を担当）                                                                                                            | ✅ 完了 |
 | INV-16 | `Session` のロック規約                                                      | `stateGate` / `writeGate` の設計 + `SessionTests` の並行テスト 6 本                                                                                                                   | ✅ 完了 |
-| INV-17 | lease の所有権                                                              | `ProcessLockLease.ForceRelease`（二重解放は無害）+ `SessionState.Registration` の `RegistrationLease`（GC で解除）+ `DatabaseTests` の GC 回帰テスト                                  | ✅ 完了 |
+| INV-17 | lease の所有権                                                                 | `ProcessLockLease.ForceRelease`（二重解放は無害） + `TxnState.Lease` の `RegistrationLease`（GC で解除） + `DatabaseTests` の GC 回帰テスト                                  | ✅ 完了 |
 | INV-18 | `Expr.children` / `plugChildren` の arity                                   | `Expr.plugChildren`（モジュールレベルへ引き上げ）+ `AstTests` の全ノード種テスト                                                                                                      | ✅ 完了 |
 | INV-19 | 保持する側はキー・行の所有権を複製で取り込む                                | `Entry.takeOwnership` / `Transaction.setSlot` の複製と回帰テスト                                                                                                                      | ✅ 完了 |
 | INV-20 | `Writer.Chunks` は逆順（先頭が最新の書き込み）                              | `Writer.fsi`（ケース非公開、構築は `Empty` / 各 write 関数に限定）+ 順序プロパティテスト                                                                                              | ✅ 完了 |
@@ -57,6 +57,7 @@ F# の型システムでは表現できないため、
 | INV-23 | 結果行は `LoadedRow`（`Unloaded` を含まない）                               | `LoadedRow.create` + `StatementResult` の非公開コンストラクタ（`Create` は `LoadedRow` だけを受ける） + `RowReader.TryRead` の戻り値型                                                | ✅ 完了 |
 | INV-24 | `EngineHost` の Version 公開とファイル refcount                             | `EngineHost.publish` / `install` / `AcquireCall` + `BackgroundCompactionTests` の並行・ランダム操作列テスト                                                                           | ✅ 完了 |
 | INV-25 | commit の WAL 位置は fsync 前に登録する                                     | `DatabaseHost.serialized` の `writeGate` 内 `Register` + `SessionHostTests` の統合テスト（3 commit / 2 fsync）                                                                        | ✅ 完了 |
+| INV-26 | 確定状態は transaction を持たない                                           | `Committed`（transaction フィールド無し）+ `HostLifecycle` が `Committed` のみを保持 + 実行時だけ `ExecState` に合成                                                                 | ✅ 完了 |
 
 ---
 
@@ -300,7 +301,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 - `ProcessLockLease` は root とトークンだけを持ち、ロックの解放は `ForceRelease` だけ
   （`RowStore.close` とエラー経路が呼ぶ。二重解放は `ProcessLock.release` の台帳で無害）。
   DB を開閉する所有者は `DatabaseHost` 1つなので、ハンドルごとの所有権トークンは持たない。
-- 進行中 transaction の登録は `SessionState.Registration` が `RegistrationLease` として持つ。
+- 進行中 transaction の登録は `TxnState.Lease` が `RegistrationLease` として持つ。
   接続が Close されずに捨てられても、最後のリースが GC された時点で登録を外す
   （`ActiveRegistration` の生存トークン）。
 - 回帰テスト:
@@ -411,7 +412,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `DatabaseHost.HostLifecycle`（`Running` / `Closed`）。
     Close 後の publish は `Closed` 側で捨てる。
   - `Session.LocalSession`（`Open` / `Closed`）。
-    閉じた後に `SessionState` を読む経路が無い。
+    閉じた後に `TxnState` を読む経路が無い。
   - `SessionPool.PoolLifecycle`（`Open` / `Closed`）。
   - `RowReader.RowReaderState`（INV-15）。
 - 回帰テスト: `DurabilityTests` のグループコミット 4 本、
@@ -471,6 +472,23 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `DatabaseHost` はテスト用に `CommitDurability` を注入できる（`?commitDurability`）。
 - 回帰テスト: `DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録し fsync をまとめる`
   （3 commit が 2回の fsync にまとまり、最後の fsync が 3番目の位置まで届く）。
+
+### INV-26 確定状態は transaction を持たない
+
+- 宣言: 全接続で共有する確定状態 `Committed`（`Root` / `Store` / `Catalog` / `Manager` / `DeferDurability`）は
+  transaction のフィールドを持たない。接続ローカルの transaction は `TxnState`
+  （`CatalogAtBegin` / `Active` / `Pending` / `Lease`）だけが持つ。
+- 理由: 以前の `DbState` は確定状態と transaction を 1つのレコードに同居させていたため、
+  committed を publish するたびに `Active = None; Pending = None; ActiveRegistration = None` を
+  書き足す必要があり、埋め忘れると「確定状態に transaction が載る」状態を作れた。
+- 担保:
+  - `Committed` に transaction 系のフィールドが無い（型として作れない）。
+  - `HostLifecycle` は `Running of Committed` / `Closed of Committed` だけを持つ。
+  - 文の実行時だけ `ExecState = { Committed; Txn; Registration }` に合成する。
+    `ExecState.Catalog` は transaction 中なら `Txn.CatalogAtBegin`、外なら `Committed.Catalog`。
+  - DDL / DML / SELECT は `ExecState` を受けるが、確定状態の更新は `Committed` の組み直しだけ。
+- 回帰テスト: `SessionPool` / `SessionHostTests` / `DatabaseTests` の transaction・再オープン・
+  DDL 排他のテストが経路を覆う（型変更なので専用テストは置かない）。
 
 ---
 

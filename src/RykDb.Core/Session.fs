@@ -134,12 +134,12 @@ type private SessionTransactionChange =
 /// `Session` の接続ローカル状態。
 /// <remarks>
 /// `Closed` は終端で、以後の操作はすべてエラーになる。
-/// 「閉じたか」と `SessionState` を別々に持つと、閉じた後も `local` を読めてしまう。
+/// 「閉じたか」と `TxnState` を別々に持つと、閉じた後も `local` を読めてしまう。
 /// 実行中の読み取り数（`readers`）はカウンタなので `Session` 側で別に持つ。
 /// </remarks>
 [<RequireQualifiedAccess>]
 type private LocalSession =
-    | Open of SessionState
+    | Open of TxnState
     | Closed
 
 /// データベースへのセッション（1接続）。
@@ -157,7 +157,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     let stateGate = obj ()
     // 書き込み・transaction 操作・Close を接続内で直列化するロック。
     let writeGate = obj ()
-    let mutable local = LocalSession.Open SessionState.none
+    let mutable local = LocalSession.Open TxnState.none
     let mutable readers = 0
 
     let limits =
@@ -203,7 +203,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
         lock stateGate (fun () ->
             match local with
             | LocalSession.Closed -> false
-            | LocalSession.Open state -> SessionState.inTransaction state)
+            | LocalSession.Open state -> TxnState.inTransaction state)
 
     let summarize (results: StatementResult list) =
         let selects = results |> List.filter (fun r -> not (Array.isEmpty r.Columns))
@@ -220,7 +220,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             match lock stateGate (fun () -> local) with
             | LocalSession.Closed -> err (closedError ())
             | LocalSession.Open start ->
-                let wasInTransaction = SessionState.inTransaction start
+                let wasInTransaction = TxnState.inTransaction start
 
                 let rec run budget acc state =
                     function
@@ -261,7 +261,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
         lock stateGate (fun () ->
             match local with
             | LocalSession.Closed -> Error(closedError ())
-            | LocalSession.Open state when SessionState.inTransaction state -> Ok None
+            | LocalSession.Open state when TxnState.inTransaction state -> Ok None
             | LocalSession.Open _ ->
                 match host.AcquireReadSnapshot() with
                 | Error e -> Error e
@@ -292,7 +292,12 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                     function
                     | [] -> ret (List.rev acc)
                     | stmt :: tail ->
-                        match Engine.executeStatementWithLimits (limitsOfBudget budget) readState stmt with
+                        match
+                            Engine.executeStatementWithLimits
+                                (limitsOfBudget budget)
+                                (ExecState.ofCommitted readState)
+                                stmt
+                        with
                         | Error e -> err e
                         | Ok(_, result) -> run (consumeBudget result budget) (result :: acc) tail
 
@@ -372,7 +377,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                         | Error e -> err e
                         | Ok None -> ret None
                         | Ok(Some(readState, lease)) ->
-                            match Engine.openSelect readState stmt with
+                            match Engine.openSelect (ExecState.ofCommitted readState) stmt with
                             | Error e ->
                                 exitRead lease
                                 err e
@@ -483,7 +488,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// 書き込みを挟まない用途に限る（固定 snapshot を ActiveSnapshot に登録しない）。
     /// </remarks>
     member internal _.PrepareSelect(stmt: SelectStatement) =
-        Engine.prepareSelect host.Committed stmt
+        Engine.prepareSelect (ExecState.ofCommitted host.Committed) stmt
 
     /// トランザクションを始める。
     member _.Begin() =
@@ -542,7 +547,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                         System.Threading.Monitor.Wait stateGate |> ignore)
 
                 let rollback =
-                    if SessionState.inTransaction state then
+                    if TxnState.inTransaction state then
                         host.Rollback state |> Result.map ignore
                     else
                         ret ()

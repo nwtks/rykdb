@@ -243,7 +243,7 @@ flowchart TB
 | `Optimizer.fs`     | `Optimizer`（論理代数 → `Op` の実行と `explain`）                                                                     |
 | `Plan.fs`          | `Plan`（サブクエリ解決・派生テーブル・`runSelect` / `explainSelect`）                                                 |
 | `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                                                |
-| `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                                          |
+| `Engine.fs`        | `StatementResult` / `Committed` / `TxnState` / `ExecState` / `Ddl` / `Engine`（文の実行）                                                          |
 | `SessionHost.fs`   | `DatabaseHost` と `CommitDurability`（store の open/close・共有 committed state・採番・fsync のグループコミット）     |
 | `Session.fs`       | 公開 API `Session` / `SessionPool` / `RowReader`（接続ごとの transaction・読み取りは並行、書き込みはホストで直列化）  |
 
@@ -1150,7 +1150,7 @@ replay 中は 0（全版を残す）を使う。
 
 登録は `DatabaseHost.Begin` / 接続の暗黙 transaction（`Engine.executeStatementWithLimits`）で行い、
 commit 成功・rollback・`Session.Close` で解除する。
-接続の登録は `SessionState.Registration` が `RegistrationLease` として持ち、
+接続の登録は `TxnState.Lease` が `RegistrationLease` として持ち、
 接続が Close されずに捨てられても **最後のリースが GC された時点で自動的に解除**する。
 これにより、commit / rollback / Close されずに捨てられた接続（`SessionPool` の接続など）でも、
 参照が切れて GC されれば DDL が `ConflictError` のまま止まらない。
@@ -1172,8 +1172,11 @@ commit 成功・rollback・`Session.Close` で解除する。
 > 明示 transaction はライブラリ API の `session.Begin()` / CLI の `.begin` `.commit` `.rollback` と同じ経路。
 
 **`Session` は 1接続 = 1論理接続**。同じ DB を共有する複数の `Session` は `SessionPool` が発行する。
-接続ローカルの状態（`Catalog` / `Active` / `Pending` / `Registration`）は `SessionState` に置き、
-committed な Store / Catalog / Manager は `DatabaseHost` が全接続で共有する。
+接続ローカルの状態（`CatalogAtBegin` / `Active` / `Pending` / `Lease`）は `TxnState` に置き、
+committed な Store / Catalog / Manager は `DatabaseHost` が `Committed` として全接続で共有する。
+文を実行するときだけ、その 2 つを `ExecState`（`Committed` + `Txn` + 実行中の登録）に合成する。
+確定状態（`Committed`）は transaction のフィールドを持たないので、
+「確定状態に transaction が載っている」状態は型で作れない。
 
 - **BEGIN**: 共有の `TransactionManager` で採番し、`Active` に加える。
 - **COMMIT / ROLLBACK**: 共有の Manager に対して競合検出・採番・abort を行う。
@@ -1198,7 +1201,7 @@ DB 全体を閉じるのは所有者（`Session.OpenWith` の `Session`、また
 
 | 層                 | 役割                           | 詳細                                                                                                                                                                                                                                                                                    |
 | ------------------ | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. 不変レコード    | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `DbState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                                                                                                                 |
+| 1. 不変レコード    | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `Committed` / `ExecState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                                    |
 | 2. `Session`       | **公開 API の並行性の単位**    | 接続ごとに独立した `Session` が transaction を持ち、SELECT だけの `Execute` は `stateGate`（入口・出口の短い区間）だけで並行実行できる。書き込み・`Begin` / `Commit` / `Rollback`・`Close` は接続内で `writeGate` 直列化し、DB 全体の書き込みは `DatabaseHost.writeGate` で直列化する。 |
 | 3. MVCC + 競合検査 | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                                                                                                                         |
 | 4. keyspace 接頭辞 | **論理的な分離**               | `t:` / `i:` / `__catalog__` は 1本の LSM 上で接頭辞により分離される。物理ツリーは共有するため、テーブル間の並列性は提供しない（§6.1）                                                                                                                                                   |
@@ -1270,7 +1273,7 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 ゲートは DB ごとの `RootRuntime` が持つ `ReaderWriterLockSlim` で、
 同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
 ロックはプロセス内の表に残る（開いた DB の数だけ。数はふつう小さい）。
-**接続の登録は `SessionState.Registration` が `RegistrationLease` として保持し、参照が切れて GC されれば外れる**（§7.5）。
+**接続の登録は `TxnState.Lease` が `RegistrationLease` として保持し、参照が切れて GC されれば外れる**（§7.5）。
 ただし GC の時期は不定なので、`Session` は `Rollback()` / `Close()`
 （または `use` による `Dispose()`）で確実に終わらせること。
 参照が残っている間は、その root の DDL は `ConflictError` のまま。
@@ -1814,7 +1817,7 @@ fsync を省くと、再起動後にデータが読めなくなる。
 ## 11. インターフェース層
 
 3つのインターフェースが**すべて `Session.fs` だけ**を見る。
-`DatabaseHost` / `SessionState` は internal で、`Session` の内部実装に閉じている。
+`DatabaseHost` / `TxnState` / `ExecState` は internal で、`Session` の内部実装に閉じている。
 
 ### 11.1 ライブラリ API
 

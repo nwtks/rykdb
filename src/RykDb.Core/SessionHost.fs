@@ -113,90 +113,29 @@ type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
     /// 最初の待機者がリーダーとなり、登録済みの最大位置まで同期する。
     member _.Await(pos: WalState) = awaitLoop pos
 
-/// 接続ローカルの transaction 状態。
-/// <remarks>
-/// committed な Store / Catalog / Manager は `DatabaseHost` が共有し、
-/// ここには接続だけが持つ transaction を置く。
-/// Snapshot.SeqNo は BEGIN 時に固定されるので、
-/// 実行のたびに最新の Store へ載せ替えても可視性（repeatable read）は変わらない。
-/// </remarks>
-type internal SessionState =
-    {
-        /// BEGIN 時点のカタログ。transaction 中は DDL が拒否されるので変化しない。
-        Catalog: Catalog
-        /// 明示 transaction。
-        Active: Transaction option
-        /// 未 commit の変更を積んだ transaction。
-        Pending: Transaction option
-        /// 進行中 transaction の ActiveSnapshot 登録。
-        /// 接続（`Session`）が Close されずに GC された場合も、
-        /// 最後のリースが回収された時点で登録が外れる（`RegistrationLease`）。
-        Registration: RegistrationLease option
-    }
-
-module internal SessionState =
-    /// transaction を持たない状態。
-    let none: SessionState =
-        {
-            Catalog = Catalog.Empty
-            Active = None
-            Pending = None
-            Registration = None
-        }
-
-    let inTransaction (state: SessionState) = state.Active.IsSome
-
-    /// `state` の transaction 状態を写し取る。
-    /// `Registration` は `state.ActiveRegistration` が残っている間だけ `local` の lease を引き継ぐ
-    /// （lease 自体は `DbState` に載らないため、同じ登録を指している間は元の lease を使う）。
-    let ofState (local: SessionState) (state: DbState) =
-        {
-            Catalog = state.Catalog
-            Active = state.Active
-            Pending = state.Pending
-            Registration =
-                if state.ActiveRegistration.IsSome then
-                    local.Registration
-                else
-                    None
-        }
-
-    /// 共有の committed state に接続ローカルの transaction を重ねる。
-    /// transaction 外では committed state をそのまま使う。
-    let apply (local: SessionState) (committed: DbState) =
-        match local.Active with
-        | None -> committed
-        | Some _ ->
-            { committed with
-                Catalog = local.Catalog
-                Active = local.Active
-                Pending = local.Pending
-                ActiveRegistration = local.Registration |> Option.map _.Registration
-            }
-
 /// `DatabaseHost` のライフサイクル。
 /// <remarks>
-/// `Closed` は終端で、`Close` を実行するときに最後の state を読めるよう `DbState` を保持する。
-/// 「閉じたか」と committed state を別々の mutable にすると、Close 後の publish を作れてしまう。
+/// `Closed` は終端で、`Close` を実行するときに最後の state を読めるよう `Committed` を保持する。
+/// 「閉じたか」と確定状態を別々の mutable にすると、Close 後の publish を作れてしまう。
 /// </remarks>
 [<RequireQualifiedAccess>]
 type private HostLifecycle =
-    | Running of DbState
-    | Closed of DbState
+    | Running of Committed
+    | Closed of Committed
 
 /// 同一 DB を共有する複数の `Session`（接続）のコミット状態。
 /// <remarks>
 /// 1つの `RowStore` と `TransactionManager` を全接続で共有し、
 /// 各 `Session` は自分だけの transaction を持つ。
-/// - committed な `DbState`（Store / Catalog / Manager）はここが唯一の持ち主。
+/// - 確定状態（`Committed`）はここが唯一の持ち主。
 /// - 書き込み・BEGIN / COMMIT / ROLLBACK・DDL は `writeGate` で直列化する。
-/// - 読み取りは `writeGate` を取らず、committed state のスナップショットを見る。
+/// - 読み取りは `writeGate` を取らず、確定状態のスナップショットを見る。
 /// - WAL の fsync はホスト単位で 1回にまとめる（`CommitDurability`）。
 /// - ストアを開くのも閉じるのもこの型（`OpenWithBackground` / `Close`）。
 /// - 閉じるのは所有者だけ（`SessionPool.Close` / 単独の `Session.Close`）。
 /// </remarks>
-type internal DatabaseHost(root: string, state: DbState, ?commitDurability: CommitDurability) =
-    // ライフサイクル（committed state と Close 状態）を保護する短いロック。
+type internal DatabaseHost(root: string, state: Committed, ?commitDurability: CommitDurability) =
+    // ライフサイクル（確定状態と Close 状態）を保護する短いロック。
     let stateGate = obj ()
     // 書き込み・transaction 操作・Close を直列化するロック。
     let writeGate = obj ()
@@ -206,14 +145,22 @@ type internal DatabaseHost(root: string, state: DbState, ?commitDurability: Comm
         | Some d -> d
         | None -> CommitDurability(fun pos -> Wal.sync root pos)
 
-    // committed state は常に Active / Pending / ActiveRegistration を持たない。
+    // 確定状態は transaction を持たない（型で保証される）。
     // WAL の fsync はホストのグループコミットへ委ねる（DeferDurability）。
     let mutable lifecycle = HostLifecycle.Running { state with DeferDurability = true }
 
     let snapshot () = lock stateGate (fun () -> lifecycle)
 
+    /// 確定状態と接続ローカルの transaction から実行状態を作る。
+    let execStateOf (committed: Committed) (local: TxnState) =
+        {
+            Committed = committed
+            Txn = local
+            Registration = local.Lease |> Option.map _.Registration
+        }
+
     /// Close 後は何もしない（呼び出しはすべて writeGate の内側で Closed を確認済み）。
-    let publish (state: DbState) =
+    let publish (state: Committed) =
         lock stateGate (fun () ->
             match lifecycle with
             | HostLifecycle.Running _ -> lifecycle <- HostLifecycle.Running state
@@ -222,8 +169,8 @@ type internal DatabaseHost(root: string, state: DbState, ?commitDurability: Comm
     let closedError () = DbError.internalError "データベースは閉じられています"
 
     /// writeGate の内側で実行し、WAL の fsync を gate の外で待つ。
-    /// `run` は「実行後の共有状態」と値も返す（読み取りだけなら入力をそのまま返す）。
-    let serialized (run: DbState -> Result<DbState * 'a, DbError>) =
+    /// `run` は「実行後の確定状態」と値も返す（読み取りだけなら入力をそのまま返す）。
+    let serialized (run: Committed -> Result<Committed * 'a, DbError>) =
         let outcome, position =
             lock writeGate (fun () ->
                 match snapshot () with
@@ -275,9 +222,6 @@ type internal DatabaseHost(root: string, state: DbState, ?commitDurability: Comm
                         Store = store
                         Catalog = catalog
                         Manager = manager
-                        Active = None
-                        Pending = None
-                        ActiveRegistration = None
                         DeferDurability = true
                     },
                     ?commitDurability = commitDurability
@@ -325,11 +269,11 @@ type internal DatabaseHost(root: string, state: DbState, ?commitDurability: Comm
             ret (readState, lease)
 
     /// 明示 transaction を始める（接続ローカルの状態を返す）。
-    member _.Begin(local: SessionState) =
-        if SessionState.inTransaction local then
+    member _.Begin(local: TxnState) =
+        if TxnState.inTransaction local then
             ret local
         else
-            let run (current: DbState) =
+            let run (current: Committed) =
                 current.Store.Runtime.WithShared(fun () ->
                     let mgr, txn = TransactionManager.beginTxn current.Manager
                     let registration = current.Store.Runtime.Register(root, txn.Snapshot.SeqNo)
@@ -343,12 +287,12 @@ type internal DatabaseHost(root: string, state: DbState, ?commitDurability: Comm
                         let next = { current with Manager = mgr }
                         publish next
 
-                        let nextLocal: SessionState =
+                        let nextLocal: TxnState =
                             {
-                                Catalog = fresh
+                                CatalogAtBegin = fresh
                                 Active = Some txn
                                 Pending = None
-                                Registration = Some lease
+                                Lease = Some lease
                             }
 
                         ret (next, (nextLocal, StatementResult.Empty)))
@@ -356,65 +300,44 @@ type internal DatabaseHost(root: string, state: DbState, ?commitDurability: Comm
             serialized run |> Result.map fst
 
     /// COMMIT。接続の transaction を共有の Manager で確定する。
-    member _.Commit(local: SessionState) =
+    member _.Commit(local: TxnState) =
         match local.Active with
         | None -> err (DbError.internalError "コミットする transaction がありません")
         | Some _ ->
             serialized (fun current ->
-                let state = SessionState.apply local current
-
-                match Engine.executeCommit state with
+                match Engine.executeCommit (execStateOf current local) with
                 | Error e -> err e
                 | Ok next ->
-                    let committed =
-                        { next with
-                            Active = None
-                            Pending = None
-                            ActiveRegistration = None
-                        }
-
-                    publish committed
-                    ret (committed, (SessionState.ofState local committed, StatementResult.Empty)))
+                    local.Lease |> Option.iter _.Release()
+                    publish next.Committed
+                    ret (next.Committed, (next.Txn, StatementResult.Empty)))
 
     /// ROLLBACK。接続の transaction を捨てる。
-    member _.Rollback(local: SessionState) =
+    member _.Rollback(local: TxnState) =
         match local.Active with
         | None -> err (DbError.internalError "ロールバックする transaction がありません")
         | Some _ ->
             serialized (fun current ->
-                let state = SessionState.apply local current
-                let next = Engine.executeRollback state
-
-                let committed =
-                    { next with
-                        Active = None
-                        Pending = None
-                        ActiveRegistration = None
-                    }
-
-                publish committed
-                ret (committed, (SessionState.ofState local committed, StatementResult.Empty)))
+                let next = Engine.executeRollback (execStateOf current local)
+                local.Lease |> Option.iter _.Release()
+                publish next.Committed
+                ret (next.Committed, (next.Txn, StatementResult.Empty)))
 
     /// transaction 以外の文（SELECT / DML / DDL）を実行する。
-    member _.ExecuteNonTransaction (local: SessionState) (limits: ResultLimits) (stmt: Statement) =
+    member _.ExecuteNonTransaction (local: TxnState) (limits: ResultLimits) (stmt: Statement) =
         serialized (fun current ->
-            let state = SessionState.apply local current
-
-            match Engine.executeStatementWithLimits limits state stmt with
+            match Engine.executeStatementWithLimits limits (execStateOf current local) stmt with
             | Error e -> err e
             | Ok(next, result) ->
-                let nextLocal = SessionState.ofState local next
+                // 登録が残っている間だけ、接続が持つリースを引き継ぐ。
+                let nextLocal =
+                    { next.Txn with
+                        Lease = if next.Registration.IsSome then local.Lease else None
+                    }
 
                 if next.Active.IsNone && next.Pending.IsNone then
-                    let committed =
-                        { next with
-                            Active = None
-                            Pending = None
-                            ActiveRegistration = None
-                        }
-
-                    publish committed
-                    ret (committed, (nextLocal, result))
+                    publish next.Committed
+                    ret (next.Committed, (nextLocal, result))
                 else
                     // transaction 内: 共有するのは Manager の変化だけ
                     let committed = { current with Manager = next.Manager }
@@ -457,12 +380,7 @@ type internal DatabaseHost(root: string, state: DbState, ?commitDurability: Comm
                         |> Map.toList
                         |> List.fold (fun m (_, txn) -> TransactionManager.abort txn m) state.Manager
 
-                    { state with
-                        Manager = mgr
-                        Active = None
-                        Pending = None
-                        ActiveRegistration = None
-                    }
+                    { state with Manager = mgr }
 
             let closeResult = RowStore.close state.Store
 

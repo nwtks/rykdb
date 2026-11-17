@@ -67,7 +67,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 「Core に mutable が無い」ではなく「可変状態はここにしかない」と読むこと。
 
 - `DatabaseHost` の `let mutable lifecycle`（`HostLifecycle` = `Running` / `Closed`、`SessionHost.fs`）:
-  全接続で共有する committed な `DbState` と Close 状態を 1つの状態 DU で持つ。
+  全接続で共有する確定状態（`Committed`）と Close 状態を 1つの状態 DU で持つ。
 - `Session` の `let mutable local`（`LocalSession` = `Open` / `Closed`）と
   `let mutable readers`: 接続ローカルの transaction 状態と Close 状態を状態 DU で、
   実行中の読み取り数だけをカウンタで保持する。
@@ -85,7 +85,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `Monitor.Wait` / `PulseAll`: `Session.Close` が実行中の読み取りの完了を待つために使う。
 
 これらは `Session` / `SessionPool` / `DatabaseHost` の内部に閉じ込め、
-`DatabaseHost` / `SessionState` を internal にして外部へ漏らさない。
+`DatabaseHost` / `TxnState` / `ExecState` を internal にして外部へ漏らさない。
 
 `Dictionary` / `HashSet` / `ConcurrentDictionary` を使うのは次の場所に限る
 （CLI / Server は対象外）。

@@ -73,58 +73,129 @@ type internal SelectStream =
         Cleanup: unit -> unit
     }
 
-/// DB の状態。
-type internal DbState =
+/// 確定済み（commit 済み）の DB 状態。
+/// <remarks>
+/// 接続ローカルの transaction を持たない。
+/// 「確定状態に transaction が載っている」状態を型で作れないようにするため、
+/// transaction は `TxnState`、実行時の合成は `ExecState` に分ける。
+/// </remarks>
+type internal Committed =
     {
         Root: string
         Store: RowStore
         Catalog: Catalog
         Manager: TransactionManager
-        Active: Transaction option
-        Pending: Transaction option
-        /// 進行中 transaction の ActiveSnapshot 登録。
-        /// 他のハンドルの compaction が、この snapshot より新しい版だけを残して
-        /// 古い版を捨ててしまわないようにするために登録する。
-        /// 同じ transaction の state は複数のハンドルが共有できる（登録側で生存を数える）。
-        ActiveRegistration: ActiveRegistration option
         /// WAL の fsync を Session のグループコミットに任せるか。
         DeferDurability: bool
     }
 
-/// Transaction を commit して DbState に反映する共通処理。
-module internal DbStateOps =
-    let commitTransaction (txn: Transaction) (state: DbState) =
+/// 接続ローカルの transaction 状態。
+/// <remarks>
+/// 確定状態（`Committed`）は `DatabaseHost` が共有し、ここには接続だけが持つ
+/// transaction を置く。`Snapshot.SeqNo` は BEGIN 時に固定されるので、
+/// 実行のたびに最新の Store へ載せ替えても可視性（repeatable read）は変わらない。
+/// </remarks>
+type internal TxnState =
+    {
+        /// BEGIN 時点のカタログ。transaction 中は DDL が拒否されるので変化しない。
+        CatalogAtBegin: Catalog
+        /// 明示 transaction。
+        Active: Transaction option
+        /// 未 commit の変更を積んだ transaction。
+        Pending: Transaction option
+        /// 進行中 transaction の ActiveSnapshot 登録のリース。
+        /// 接続（`Session`）が Close されずに GC された場合も、
+        /// 最後のリースが回収された時点で登録が外れる（`RegistrationLease`）。
+        Lease: RegistrationLease option
+    }
+
+module internal TxnState =
+    /// transaction を持たない状態。
+    let none: TxnState =
+        {
+            CatalogAtBegin = Catalog.Empty
+            Active = None
+            Pending = None
+            Lease = None
+        }
+
+    let inTransaction (state: TxnState) = state.Active.IsSome
+
+/// 1回の文実行の入力（確定状態 + 接続ローカルの transaction + 実行中の登録）。
+/// <remarks>
+/// `Registration` は実行中の文（暗黙 transaction を含む）の一時的な登録で、
+/// 確定状態には載らない。
+/// 読み取りは既存の名前（`Store` / `Catalog` / `Active` など）をそのまま使える。
+/// 更新は `Committed` / `Txn` を組み直す。
+/// </remarks>
+type internal ExecState =
+    {
+        Committed: Committed
+        Txn: TxnState
+        /// 実行中の文の ActiveSnapshot 登録（暗黙 transaction・DDL の排他判定用）。
+        Registration: ActiveRegistration option
+    }
+
+    member this.Root = this.Committed.Root
+    member this.Store = this.Committed.Store
+    member this.Manager = this.Committed.Manager
+    member this.DeferDurability = this.Committed.DeferDurability
+
+    /// 有効なカタログ（transaction 中は BEGIN 時点、外は確定版）。
+    member this.Catalog =
+        if this.Txn.Active.IsSome then
+            this.Txn.CatalogAtBegin
+        else
+            this.Committed.Catalog
+
+    member this.Active = this.Txn.Active
+    member this.Pending = this.Txn.Pending
+    member this.ActiveRegistration = this.Registration
+
+module internal ExecState =
+    /// 確定状態だけから実行状態を作る（transaction なし）。
+    let ofCommitted (state: Committed) =
+        {
+            Committed = state
+            Txn = TxnState.none
+            Registration = None
+        }
+
+/// Transaction を commit して確定状態に反映する共通処理。
+/// 接続ローカルの transaction の消去は呼び出し側で行う。
+module internal CommitOps =
+    let commitTransaction (txn: Transaction) (state: ExecState) =
         result {
             let! store, manager =
                 RowStore.commitToStoreWith
-                    state.DeferDurability
-                    state.Root
-                    state.ActiveRegistration
-                    state.Manager
+                    state.Committed.DeferDurability
+                    state.Committed.Root
+                    state.Registration
+                    state.Committed.Manager
                     txn
-                    state.Store
+                    state.Committed.Store
 
             return
-                { state with
+                { state.Committed with
                     Store = store
                     Manager = manager
-                    Active = None
-                    Pending = None
-                    ActiveRegistration = None
                 }
         }
 
 module internal Ddl =
     /// カタログを保存し、保存後の Store と新しい Catalog で state を作り直す。
     /// （CREATE / DROP すべてが使う「保存 → state 更新」の定型）
-    let private saved (state: DbState) (next: Catalog) =
+    let private saved (state: ExecState) (next: Catalog) =
         result {
-            let! store = Catalog.save state.Store state.Catalog next
+            let! store = Catalog.save state.Committed.Store state.Committed.Catalog next
 
             return
                 { state with
-                    Store = store
-                    Catalog = next
+                    Committed =
+                        { state.Committed with
+                            Store = store
+                            Catalog = next
+                        }
                 }
         }
 
@@ -136,7 +207,7 @@ module internal Ddl =
     ///   待つと、commit されないまま残った transaction で永久に止まるので失敗側に倒す。
     /// - 新しい transaction の開始と文の実行は排他の間ブロックされる（実行後は新しいカタログを見る）。
     /// </remarks>
-    let private exclusiveDdl (state: DbState) (run: DbState -> Result<DbState, DbError>) =
+    let private exclusiveDdl (state: ExecState) (run: ExecState -> Result<ExecState, DbError>) =
         state.Store.Runtime.WithExclusive(fun () ->
             match state.Store.Runtime.OldestExcept(state.Root, state.ActiveRegistration) with
             | Some _ -> err (DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください")
@@ -145,7 +216,11 @@ module internal Ddl =
     let private BackfillChunkRows = 8192
 
     /// 1チャンク分を transaction にして commit する。
-    let private commitChunk (apply: Transaction -> 'a -> Result<Transaction, DbError>) (chunk: 'a list) (st: DbState) =
+    let private commitChunk
+        (apply: Transaction -> 'a -> Result<Transaction, DbError>)
+        (chunk: 'a list)
+        (st: ExecState)
+        =
         let mgr, txn =
             TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) st.Manager
 
@@ -157,8 +232,11 @@ module internal Ddl =
 
             return
                 { st with
-                    Store = store
-                    Manager = mgr2
+                    Committed =
+                        { st.Committed with
+                            Store = store
+                            Manager = mgr2
+                        }
                 }
         }
 
@@ -190,7 +268,7 @@ module internal Ddl =
 
     /// Op をチャンク単位で消費する（全件を実体化しない）。
     let private applyOpChunks (apply: Transaction -> SqlValue array -> Result<Transaction, DbError>) =
-        let rec loop op st =
+        let rec loop op (st: ExecState) =
             match takeOpChunk BackfillChunkRows op with
             | Error e -> err e
             | Ok([], _) -> ret st
@@ -207,8 +285,8 @@ module internal Ddl =
     /// `lastKey` から走査し直す。走査中に compaction がファイルを消しても、
     /// 古いスナップショットのファイルを開き続けない。
     /// </remarks>
-    let private clearSpaceChunksResult (state: DbState) (space: string) =
-        let rec loop st startKey =
+    let private clearSpaceChunksResult (state: ExecState) (space: string) =
+        let rec loop (st: ExecState) startKey =
             match RowStore.scanKeys space startKey 0 st.Store with
             | Error e -> err e
             | Ok scan ->
@@ -231,8 +309,8 @@ module internal Ddl =
 
         loop state [||]
 
-    let createTable (c: CreateTable) (state: DbState) =
-        let createTableCore (c: CreateTable) state =
+    let createTable (c: CreateTable) (state: ExecState) =
+        let createTableCore (c: CreateTable) (state: ExecState) =
             let existing = Catalog.findTable state.Catalog c.Name
 
             match existing, c.IfNotExists with
@@ -283,8 +361,8 @@ module internal Ddl =
     ///   1. 先にカタログから定義を外してテーブルを見えなくする
     ///   2. テーブルと全索引 keyspace の全エントリをチャンク単位で tombstone 消去する
     /// 後始末が中断しても、次回の CREATE TABLE が同名 keyspace を空にしてから作る。
-    let dropTable (name: string) (ifExists: bool) (state: DbState) =
-        let dropTableCore name ifExists state =
+    let dropTable (name: string) (ifExists: bool) (state: ExecState) =
+        let dropTableCore name ifExists (state: ExecState) =
             match Catalog.findTable state.Catalog name with
             | None ->
                 if ifExists then
@@ -322,7 +400,7 @@ module internal Ddl =
 
         dropTableCore name ifExists |> exclusiveDdl state
 
-    let createIndex (ci: CreateIndex) (state: DbState) =
+    let createIndex (ci: CreateIndex) (state: ExecState) =
         let rec loop previous positions (idx: IndexSchema) scan =
             match SstScan.next scan with
             | Error e -> err e
@@ -356,12 +434,12 @@ module internal Ddl =
                 RowStore.scanAtRawMasked (Keyspace.index idx.Name) [||] 0 None None mask store
                 >>= fun scan -> checkEntries pos idx scan
 
-        let clearSpaceChunks state space =
+        let clearSpaceChunks (state: ExecState) space =
             match clearSpaceChunksResult state space with
             | Ok next -> next
             | Error _ -> state
 
-        let backfillIndex tableName idx state =
+        let backfillIndex tableName idx (state: ExecState) =
             match Catalog.findTable state.Catalog tableName with
             | None -> ret state
             | Some defn ->
@@ -395,7 +473,7 @@ module internal Ddl =
                         return filled
                 }
 
-        let createIndexCore (ci: CreateIndex) state =
+        let createIndexCore (ci: CreateIndex) (state: ExecState) =
             match Catalog.findTable state.Catalog ci.Table with
             | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
             | Some tableDef ->
@@ -460,8 +538,8 @@ module internal Ddl =
     /// 先にカタログから定義を外して索引を見えなくし、
     /// その後で索引 keyspace をチャンク単位で tombstone 消去する。
     /// 後始末が中断しても、次回の CREATE INDEX が同名 keyspace を空にしてから作る。
-    let dropIndex (name: string) (ifExists: bool) (state: DbState) =
-        let dropIndexCore name ifExists state =
+    let dropIndex (name: string) (ifExists: bool) (state: ExecState) =
+        let dropIndexCore name ifExists (state: ExecState) =
             match Catalog.findIndex state.Catalog name with
             | None ->
                 if ifExists then
@@ -550,7 +628,7 @@ module internal Ddl =
     /// そのため 1 transaction のバッファ上限（256MiB）を超えるテーブルは `CapacityError` になる。
     /// 主キーは LSM のキーなので、主キー列の追加・削除は許可しない。
     /// </remarks>
-    let alterTable (a: AlterTable) (state: DbState) =
+    let alterTable (a: AlterTable) (state: ExecState) =
         let commitRewrite catalog build =
             let mgr, txn = TransactionManager.beginTxn state.Manager
 
@@ -568,13 +646,16 @@ module internal Ddl =
 
                 return
                     { state with
-                        Store = store
-                        Manager = mgr2
-                        Catalog = catalog
+                        Committed =
+                            { state.Committed with
+                                Store = store
+                                Manager = mgr2
+                                Catalog = catalog
+                            }
                     }
             }
 
-        let alterTableCore a state =
+        let alterTableCore a (state: ExecState) =
             match Catalog.findTable state.Catalog a.Table with
             | None -> err (sprintf "テーブル %s が存在しません" a.Table |> DbError.notFound)
             | Some defn ->
@@ -740,7 +821,7 @@ module internal Ddl =
         alterTableCore a |> exclusiveDdl state
 
 module internal Engine =
-    let private addTable (state: DbState) (ctx: ExecContext) (t: TableDefinition) =
+    let private addTable (state: ExecState) (ctx: ExecContext) (t: TableDefinition) =
         Catalog.toSchema t
         >>= fun schema ->
             let withIndexes =
@@ -750,7 +831,7 @@ module internal Engine =
 
             ret (ExecContext.withSchema t.Name withIndexes ctx)
 
-    let private contextOf (state: DbState) (txn: Transaction) =
+    let private contextOf (state: ExecState) (txn: Transaction) =
         let ctx =
             ExecContext.create state.Store (Snapshot.toVisible txn.Snapshot)
             |> ExecContext.withTransaction txn
@@ -758,7 +839,7 @@ module internal Engine =
 
         state.Catalog.Tables |> foldOk (addTable state) ctx
 
-    let private runSelect (limits: ResultLimits) (state: DbState) (txn: Transaction) (stmt: SelectStatement) =
+    let private runSelect (limits: ResultLimits) (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
         contextOf state txn
         >>= fun ctx ->
             try
@@ -775,7 +856,7 @@ module internal Engine =
 
     /// EXPLAIN: 実行計画を組み立て、木を 1行 1ノードの文字列にして返す。
     /// クエリ本体は実行しない（ただしサブクエリは計画時に評価される。Planner の計画経路と同じ）。
-    let private runExplain (state: DbState) (txn: Transaction) (stmt: SelectStatement) =
+    let private runExplain (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
         contextOf state txn
         >>= fun ctx ->
             try
@@ -798,7 +879,7 @@ module internal Engine =
     /// 実行のたびに `plan.Context.Scope.DisposeAll()` を呼ぶこと。
     /// snapshot を登録しないため、読み取りの間に書き込みが入る用途には使わない。
     /// </remarks>
-    let internal prepareSelect (state: DbState) (stmt: SelectStatement) =
+    let internal prepareSelect (state: ExecState) (stmt: SelectStatement) =
         let snapshot =
             {
                 SeqNo = state.Manager.LastCommitSeqNo
@@ -817,7 +898,7 @@ module internal Engine =
 
     /// SELECT を materialize せずにストリーミング用の Op として開く。
     /// 呼び出し側は返された `Cleanup` を必ず呼び、snapshot 登録と走査を解放する。
-    let openSelect (state: DbState) (stmt: SelectStatement) =
+    let openSelect (state: ExecState) (stmt: SelectStatement) =
         if state.Active.IsSome then
             err (DbError.internalError "transaction 中の SELECT は RowReader で開けません")
         else
@@ -826,8 +907,8 @@ module internal Engine =
 
             let startState =
                 { state with
-                    Manager = mgr
-                    ActiveRegistration = Some registration
+                    Committed = { state.Committed with Manager = mgr }
+                    Registration = Some registration
                 }
 
             let run () =
@@ -904,19 +985,28 @@ module internal Engine =
             return! DmlOps.delete ctx schema whereE
         }
 
-    let private runDml (state: DbState) (txn: Transaction) (run: ExecContext -> Result<(Transaction * int), DbError>) =
+    let private runDml
+        (state: ExecState)
+        (txn: Transaction)
+        (run: ExecContext -> Result<(Transaction * int), DbError>)
+        =
         contextOf state txn
         >>= fun ctx ->
             try
                 result {
                     let! outcome = run ctx
                     let txn2, n = outcome
-                    return { state with Pending = Some txn2 }, StatementResult.Affected n
+
+                    return
+                        { state with
+                            Txn = { state.Txn with Pending = Some txn2 }
+                        },
+                        StatementResult.Affected n
                 }
             finally
                 ctx.Scope.DisposeAll()
 
-    let private runDdl (state: DbState) (run: DbState -> Result<'a, DbError>) =
+    let private runDdl (state: ExecState) (run: ExecState -> Result<ExecState, DbError>) =
         if state.Active.IsSome then
             err (
                 DbError.create
@@ -924,27 +1014,27 @@ module internal Engine =
                     "トランザクション中は DDL（CREATE / DROP / ALTER）を実行できません。COMMIT または ROLLBACK してから実行してください"
             )
         else
-            run state
+            run state |> Result.map (fun next -> next, StatementResult.Empty)
 
     let private noRows = Result.map (fun s -> s, StatementResult.Empty)
 
-    let private runStatement (limits: ResultLimits) (state: DbState) (txn: Transaction) =
+    let private runStatement (limits: ResultLimits) (state: ExecState) (txn: Transaction) =
         function
         | Statement.Select stmt -> runSelect limits state txn stmt
         | Statement.Explain stmt -> runExplain state txn stmt
         | Statement.Insert stmt -> runInsert stmt |> runDml state txn
         | Statement.Update stmt -> runUpdate stmt |> runDml state txn
         | Statement.Delete stmt -> runDelete stmt |> runDml state txn
-        | Statement.CreateTable c -> Ddl.createTable c |> runDdl state |> noRows
-        | Statement.DropTable(n, ifE) -> Ddl.dropTable n ifE |> runDdl state |> noRows
-        | Statement.CreateIndex ci -> Ddl.createIndex ci |> runDdl state |> noRows
-        | Statement.DropIndex(n, ifE) -> Ddl.dropIndex n ifE |> runDdl state |> noRows
-        | Statement.AlterTable a -> Ddl.alterTable a |> runDdl state |> noRows
+        | Statement.CreateTable c -> Ddl.createTable c |> runDdl state
+        | Statement.DropTable(n, ifE) -> Ddl.dropTable n ifE |> runDdl state
+        | Statement.CreateIndex ci -> Ddl.createIndex ci |> runDdl state
+        | Statement.DropIndex(n, ifE) -> Ddl.dropIndex n ifE |> runDdl state
+        | Statement.AlterTable a -> Ddl.alterTable a |> runDdl state
         | Statement.Begin
         | Statement.Commit
         | Statement.Rollback -> ret state |> noRows
 
-    let executeStatementWithLimits (limits: ResultLimits) (state: DbState) (stmt: Statement) =
+    let executeStatementWithLimits (limits: ResultLimits) (state: ExecState) (stmt: Statement) =
         match state.Active with
         | Some activeTxn ->
             let running = state.Pending |> Option.defaultValue activeTxn
@@ -963,8 +1053,8 @@ module internal Engine =
                 result {
                     let startState =
                         { state with
-                            Manager = mgr
-                            ActiveRegistration = Some registration
+                            Committed = { state.Committed with Manager = mgr }
+                            Registration = Some registration
                         }
 
                     let! midState, result = runStatement limits startState txn stmt
@@ -973,8 +1063,8 @@ module internal Engine =
                         return state, result
                     else
                         let toCommit = midState.Pending |> Option.defaultValue txn
-                        let! nextState = DbStateOps.commitTransaction toCommit midState
-                        return nextState, result
+                        let! committed = CommitOps.commitTransaction toCommit midState
+                        return ExecState.ofCommitted committed, result
                 }
 
             let finish r =
@@ -992,27 +1082,21 @@ module internal Engine =
 
             (if isDdl then run () else state.Store.Runtime.WithShared run) |> finish
 
-    let executeCommit (state: DbState) =
+    let executeCommit (state: ExecState) =
         match state.Active with
         | None -> ret state
         | Some activeTxn ->
             let txn = state.Pending |> Option.defaultValue activeTxn
 
-            DbStateOps.commitTransaction txn state
-            |> Result.map (fun nextState ->
+            CommitOps.commitTransaction txn state
+            |> Result.map (fun committed ->
                 state.ActiveRegistration |> Option.iter state.Store.Runtime.Unregister
-                nextState)
+                ExecState.ofCommitted committed)
 
-    let executeRollback (state: DbState) =
+    let executeRollback (state: ExecState) =
         match state.Active with
         | None -> state
         | Some txn ->
             let mgr = TransactionManager.abort txn state.Manager
             state.ActiveRegistration |> Option.iter state.Store.Runtime.Unregister
-
-            { state with
-                Manager = mgr
-                Active = None
-                Pending = None
-                ActiveRegistration = None
-            }
+            ExecState.ofCommitted { state.Committed with Manager = mgr }
