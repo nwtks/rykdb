@@ -96,7 +96,7 @@ Core では `ResizeArray` を使わない。
 - `Ops.distinct` の符号化済みキー集合（`HashSet<byte array>`）
 - `OpsJoin.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
 - `SstableFormat` の DB ごとの partial reader / ブロックキャッシュ（`ConcurrentDictionary`）
-- `EngineHost` の host state / ファイル refcount / 採番（`ConcurrentDictionary`）
+- `EngineHost` の host state / ファイル refcount / worker 状態（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
 
 | やりたいこと       | 命令形の代わりに使うもの                                                        |

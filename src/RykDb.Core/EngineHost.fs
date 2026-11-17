@@ -16,6 +16,22 @@ namespace RykDb.Core
 /// 1ファイルの pin / retired 状態。
 type private FileRefState = { Pins: int; Retired: bool }
 
+/// compaction worker の状態。
+/// <remarks>
+/// 「未起動 / 起動中 / 実行中（activity）/ 停止」を 1つの値で持つ。
+/// 旧実装は `worker` / `stopped` / `activity` を別々のセルに持っていたため、
+/// 「停止済みなのに実行中」のような組み合わせを作れた。
+/// </remarks>
+type private WorkerState =
+    /// まだ起動していない。
+    | NotStarted
+    /// タスクを作成中（起動の並行呼び出しで 2本目を走らせないための予約）。
+    | Starting of pending: bool
+    /// 起動済み。`activity` は `Idle` / `Busy` / `Pending` のビット和。
+    | Running of task: System.Threading.Tasks.Task * activity: int
+    /// 停止済み（終端）。
+    | Stopped
+
 /// background compaction の共有状態。
 /// `initial` は open 直後の MANIFEST 反映済み状態。
 type internal EngineHost
@@ -28,8 +44,7 @@ type internal EngineHost
         scanHook: (FileMetaData -> unit) option
     ) =
     let stateKey = "current"
-    let numberKey = "n"
-    let activityKey = "activity"
+    let workerKey = "worker"
 
     [<Literal>]
     let Idle = 0
@@ -45,21 +60,14 @@ type internal EngineHost
 
     do stateCell.[stateKey] <- initial
 
-    let fileNumbers =
-        System.Collections.Concurrent.ConcurrentDictionary<string, int64>()
-
-    do fileNumbers.[numberKey] <- initial.Version.NextFileNumber
-
     let fileRefs =
         System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>()
 
-    let activity = System.Collections.Concurrent.ConcurrentDictionary<string, int>()
-    do activity.[activityKey] <- Idle
+    /// worker のライフサイクルと activity を 1セルで持つ（遷移は CAS 1回）。
+    let workerCell =
+        System.Collections.Concurrent.ConcurrentDictionary<string, WorkerState>()
 
-    let worker =
-        System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.Tasks.Task>()
-
-    let stopped = System.Collections.Concurrent.ConcurrentDictionary<string, unit>()
+    do workerCell.[workerKey] <- WorkerState.NotStarted
 
     let installGate = new System.Threading.SemaphoreSlim(1, 1)
     let cancel = new System.Threading.CancellationTokenSource()
@@ -84,25 +92,28 @@ type internal EngineHost
         finally
             installGate.Release() |> ignore
 
-    let normalize (state: HostState) =
-        { state with
-            Version =
-                { state.Version with
-                    NextFileNumber = max state.Version.NextFileNumber fileNumbers.[numberKey]
-                }
-        }
-
     /// 状態を CAS で更新する。
+    /// <remarks>
+    /// `NextFileNumber` は巻き戻さない。採番は `allocateFileNumber` が
+    /// 同じセルの CAS で進めるので、別のセルに持たない。
+    /// </remarks>
     let publish (update: HostState -> HostState) =
         let rec loop () =
             let current = stateCell.[stateKey]
 
-            let next =
+            let updated =
                 update
                     { current with
                         Generation = current.Generation + 1L
                     }
-                |> normalize
+
+            let next =
+                { updated with
+                    Version =
+                        { updated.Version with
+                            NextFileNumber = max updated.Version.NextFileNumber current.Version.NextFileNumber
+                        }
+                }
 
             if stateCell.TryUpdate(stateKey, next, current) then
                 next
@@ -111,13 +122,23 @@ type internal EngineHost
 
         loop ()
 
+    /// ファイル番号を 1つ予約する。
+    /// Version を公開せずに `NextFileNumber` だけ進める（`Generation` は上げない）。
     let allocateFileNumber () =
         let rec loop () =
-            let current = fileNumbers.[numberKey]
-            let next = current + 1L
+            let current = stateCell.[stateKey]
+            let number = current.Version.NextFileNumber
 
-            if fileNumbers.TryUpdate(numberKey, next, current) then
-                current
+            let next =
+                { current with
+                    Version =
+                        { current.Version with
+                            NextFileNumber = number + 1L
+                        }
+                }
+
+            if stateCell.TryUpdate(stateKey, next, current) then
+                number
             else
                 loop ()
 
@@ -289,30 +310,56 @@ type internal EngineHost
                     if not cancel.IsCancellationRequested then
                         runCycle (remaining - 1)
 
+    /// 実行中の activity を書き換える（`Running` 以外では何もしない）。
     let updateActivity (update: int -> int) =
         let rec loop () =
-            let current = activity.[activityKey]
-            let next = update current
+            match workerCell.[workerKey] with
+            | WorkerState.Running(task, activity) ->
+                let next = update activity
 
-            if next = current then
-                current
-            elif activity.TryUpdate(activityKey, next, current) then
-                next
-            else
-                loop ()
+                if next = activity then
+                    activity
+                elif
+                    workerCell.TryUpdate(
+                        workerKey,
+                        WorkerState.Running(task, next),
+                        WorkerState.Running(task, activity)
+                    )
+                then
+                    next
+                else
+                    loop ()
+            | WorkerState.NotStarted
+            | WorkerState.Starting _
+            | WorkerState.Stopped -> Idle
 
         loop ()
 
+    /// 「追加の要求あり」を立てる。既に立っていれば true。
     let markPending () =
         let rec loop () =
-            let current = activity.[activityKey]
-
-            if current &&& Pending <> 0 then
-                true
-            elif activity.TryUpdate(activityKey, current ||| Pending, current) then
-                false
-            else
-                loop ()
+            match workerCell.[workerKey] with
+            | WorkerState.NotStarted
+            | WorkerState.Stopped -> true
+            | WorkerState.Starting true -> true
+            | WorkerState.Starting false ->
+                if workerCell.TryUpdate(workerKey, WorkerState.Starting true, WorkerState.Starting false) then
+                    false
+                else
+                    loop ()
+            | WorkerState.Running(task, activity) ->
+                if activity &&& Pending <> 0 then
+                    true
+                elif
+                    workerCell.TryUpdate(
+                        workerKey,
+                        WorkerState.Running(task, activity ||| Pending),
+                        WorkerState.Running(task, activity)
+                    )
+                then
+                    false
+                else
+                    loop ()
 
         loop ()
 
@@ -372,14 +419,36 @@ type internal EngineHost
                     sweep ()
             })
 
-    member _.IsIdle = activity.[activityKey] = Idle
+    member _.IsIdle =
+        match workerCell.[workerKey] with
+        | WorkerState.Running(_, activity) -> activity = Idle
+        | WorkerState.NotStarted
+        | WorkerState.Starting _
+        | WorkerState.Stopped -> true
 
     member _.Signal() = signalWork ()
 
+    /// テスト用: 「signal を消費した後に Pending だけが残った」状態を作る。
+    /// `Shutdown` が Pending を見て起床を省略すると worker join が永久に待つので、
+    /// その回帰を再現するために使う（セマフォには追加しない）。
+    member internal _.MarkPendingWithoutSignal() = markPending () |> ignore
+
     /// worker を起動する。長時間ブロックして回り続ける専用スレッドにする
     /// （スレッドプールだと混雑時に `WaitingToRun` のまま compaction が開始されないことがある）。
+    /// 二重起動は無視する。
     member _.Start() =
-        if not (worker.ContainsKey "worker") then
+        let rec claim () =
+            match workerCell.[workerKey] with
+            | WorkerState.NotStarted ->
+                if workerCell.TryUpdate(workerKey, WorkerState.Starting false, WorkerState.NotStarted) then
+                    true
+                else
+                    claim ()
+            | WorkerState.Starting _
+            | WorkerState.Running _
+            | WorkerState.Stopped -> false
+
+        if claim () then
             let task =
                 System.Threading.Tasks.Task.Factory.StartNew(
                     loop,
@@ -388,19 +457,52 @@ type internal EngineHost
                     System.Threading.Tasks.TaskScheduler.Default
                 )
 
-            worker.TryAdd("worker", task) |> ignore
+            let rec attach () =
+                match workerCell.[workerKey] with
+                | WorkerState.Starting pending ->
+                    let activity = if pending then Pending else Idle
+
+                    if
+                        not (
+                            workerCell.TryUpdate(
+                                workerKey,
+                                WorkerState.Running(task, activity),
+                                WorkerState.Starting pending
+                            )
+                        )
+                    then
+                        attach ()
+                | _ -> ()
+
+            attach ()
 
     member _.Shutdown() =
-        if stopped.TryAdd("stopped", ()) then
-            cancel.Cancel()
-            signal.Release() |> ignore
+        let rec claim () =
+            let current = workerCell.[workerKey]
 
-            match worker.TryGetValue "worker" with
-            | true, task ->
-                try
-                    task.Wait()
-                with _ ->
-                    ()
-            | false, _ -> ()
+            match current with
+            | WorkerState.Stopped -> None
+            | WorkerState.NotStarted
+            | WorkerState.Starting _ ->
+                if workerCell.TryUpdate(workerKey, WorkerState.Stopped, current) then
+                    None
+                else
+                    claim ()
+            | WorkerState.Running(task, _) ->
+                if workerCell.TryUpdate(workerKey, WorkerState.Stopped, current) then
+                    Some task
+                else
+                    claim ()
 
-            sweep ()
+        let task = claim ()
+        cancel.Cancel()
+        signal.Release() |> ignore
+
+        task
+        |> Option.iter (fun t ->
+            try
+                t.Wait()
+            with _ ->
+                ())
+
+        sweep ()

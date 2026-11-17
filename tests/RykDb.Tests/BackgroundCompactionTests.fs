@@ -212,18 +212,7 @@ let ``background compaction: Pending が残った状態でも close が完了す
 
         // worker が signal を消費した直後に Pending だけが残った状態を再現する。
         // close が Pending を見て起床を省略すると、worker join が永久に待つ。
-        let field =
-            typeof<EngineHost>
-                .GetField(
-                    "activity",
-                    System.Reflection.BindingFlags.Instance
-                    ||| System.Reflection.BindingFlags.NonPublic
-                )
-
-        let activity =
-            field.GetValue host :?> System.Collections.Concurrent.ConcurrentDictionary<string, int>
-
-        activity.["activity"] <- 2
+        host.MarkPendingWithoutSignal()
 
         let closing =
             System.Threading.Tasks.Task.Run(fun () -> RowStore.close store |> ignore)

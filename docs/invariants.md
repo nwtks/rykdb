@@ -447,6 +447,8 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   pin を忘れると読み取り中のファイルが消え、採番を戻すと古い Version が公開される。
 - 担保:
   - 状態は `ConcurrentDictionary` の単一セル + `TryUpdate` の CAS。
+  - ファイル番号は `Version.NextFileNumber` を同じセルの CAS で予約する。
+    `publish` は現在値との `max` を取るので、古い Version を公開しても番号は戻らない。
     MANIFEST 追記と install は `installGate` で直列化する。
   - `AcquireCall` が現在の Version の全ファイルを pin し、`Dispose` で release + sweep する。
 - 回帰テスト（`BackgroundCompactionTests`）:

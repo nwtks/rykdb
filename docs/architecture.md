@@ -183,7 +183,7 @@ flowchart TB
    committed な状態とストアの open/close は `DatabaseHost` が唯一の持ち主として差し替えるので、
    利用者が更新を忘れる経路はない。
 
-ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`EngineHost` の host state / refcount / 採番などでは
+ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`EngineHost` の host state / refcount / worker 状態などでは
 `Dictionary` / `HashSet` / `ConcurrentDictionary` を使う。
 行・キー・アキュムレータの蓄積は `list` / `array` で行い、Core では `ResizeArray` を使わない
 （[`coding-conventions.md`](coding-conventions.md) §2）。
@@ -1670,8 +1670,11 @@ L0 が増えて読み取りのコスト（read amplification）と引き換え�
   を `ConcurrentDictionary` の単一セル + `TryUpdate` の末尾再帰 CAS で保持する。
 - **MANIFEST 追記と install は installGate で直列化**する。
   flush も worker install も同じ gate の内側で `Manifest.logAndApply` を呼ぶ。
-  ファイル番号は host の `ConcurrentDictionary` カウンタを `TryUpdate` の CAS で進めて確保する
-  （採番自体は gate の外でも衝突しない）。
+  ファイル番号は `HostState.Version.NextFileNumber` を同じセルの CAS で予約する
+  （別のカウンタセルを持たない。`publish` は `NextFileNumber` を巻き戻さない）。
+- **worker の状態は 1つのセル（`WorkerState`）にまとめる**。
+  未起動 / 起動中 / 実行中（`Idle` / `Busy` / `Pending` のビット和）/ 停止を 1値で表し、
+  遷移は CAS 1回で行う。「停止済みなのに実行中」のような組み合わせを作れない。
 - **読み取りは Session 呼び出し単位で Version 全ファイルを pin** する
   （同じバッチに複数の `SELECT` があっても pin は 1回だけ取り、共有する）。
   worker は install 後に入力を retired にし、refcount が 0 になったものだけを削除する。
