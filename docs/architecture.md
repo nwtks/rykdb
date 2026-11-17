@@ -186,10 +186,9 @@ flowchart TB
    committed な状態は `DatabaseHost` が唯一の持ち主として差し替えるので、
    利用者が更新を忘れる経路はない。
 
-ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`Op.toArray`、`ExtSort` の受け皿、
-`Sstable` のブロック構築と partial reader キャッシュ、
-`EngineHost` の host state / refcount / 採番などでは
-`ResizeArray` / `Dictionary` / `HashSet` / `ConcurrentDictionary` を使う
+ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`EngineHost` の host state / refcount / 採番などでは
+`Dictionary` / `HashSet` / `ConcurrentDictionary` を使う。
+行・キー・アキュムレータの蓄積は `list` / `array` で行い、Core では `ResizeArray` を使わない
 （[`coding-conventions.md`](coding-conventions.md) §2）。
 
 `EngineHost.fs` は「不変の `StorageEngine` の外側にある共有状態」で、
@@ -804,7 +803,7 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 - `Op.map` / `filter` / `take` / `skip` は「次を要求されたときだけ 1段進む」形で、残りの継続も自分自身へ繋ぎ直す
   （継続をそのまま渡すと変換が 1行だけに効くバグになる）。
 - エラーは `Error` をそのまま返して列挙を打ち切る（例外は使わない）。
-- `Op.toArray` は `ResizeArray` + `match` 直下の再帰で回す
+- `Op.toArray` は行のリストを積んで `match` 直下の再帰で回し、最後に `List.rev` して配列化する
   （`>>=` を重ねると末尾呼び出しが効かず 10万行でスタックオーバーフロー。[`coding-conventions.md`](coding-conventions.md) §3）。
 
 #### 走査（`ExecContext`）

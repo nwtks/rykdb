@@ -275,8 +275,7 @@ module internal Ops =
     /// 入力行は**抱え込まない**。
     /// グループごとの集約値だけを更新していくので、
     /// メモリは「グループ数 × アキュムレータ」に比例し、
-    /// 入力行数には比例しない
-    /// （従来は全行を `ResizeArray` に保持していた）。
+    /// 入力行数には比例しない。
     /// グループ数にも上限を置き、超過は `CapacityError` で止める。
     /// 出力順は従来どおり「最初に現れたグループ」の順。
     /// </remarks>
@@ -412,20 +411,17 @@ module internal Ops =
                 | DbErr e -> DbErr e
                 | DbOk v -> addAcc acc (Some v) false distinct
 
-        let addToBucket (bucket: ResizeArray<Acc>) row =
-            let rec step i =
-                if i >= aggs.Length then
-                    DbOk()
-                else
-                    let _, star, distinct, arg = aggs.[i]
-
-                    match add star distinct arg bucket.[i] row with
+        let addToBucket bucket row =
+            let rec step defs accs out =
+                match defs, accs with
+                | [], [] -> DbOk(List.rev out)
+                | (_, star, distinct, arg) :: defsTail, acc :: accsTail ->
+                    match add star distinct arg acc row with
                     | DbErr e -> DbErr e
-                    | DbOk acc ->
-                        bucket.[i] <- acc
-                        step (i + 1)
+                    | DbOk next -> step defsTail accsTail (next :: out)
+                | _ -> DbErr(DbError.internalError "集約の状態数が一致しません（内部不整合）")
 
-            step 0
+            step aggs bucket []
 
         let emptyAcc kind =
             {
@@ -441,7 +437,7 @@ module internal Ops =
             }
 
         let newBucket () =
-            aggs |> List.map (fun (f, _, _, _) -> emptyAcc f) |> ResizeArray
+            aggs |> List.map (fun (f, _, _, _) -> emptyAcc f)
 
         let finishAcc acc =
             match acc.Kind with
@@ -461,20 +457,17 @@ module internal Ops =
             | AggFunc.Max -> defaultArg acc.Max SqlValue.Null
 
         let rowOf bucket key =
-            let av = bucket |> Seq.map finishAcc |> Seq.toArray
-            Array.append key av
+            bucket |> List.map finishAcc |> List.toArray |> Array.append key
 
         let buckets =
-            System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<Acc>>(
+            System.Collections.Generic.Dictionary<SqlValue array, Acc list>(
                 HashIdentity.Structural: System.Collections.Generic.IEqualityComparer<SqlValue array>
             )
 
-        let order = ResizeArray<SqlValue array>()
-
-        let rec consume cur =
+        let rec consume count order cur =
             match Op.next cur with
             | OpStep.OpError e -> err e
-            | OpStep.OpDone -> ret ()
+            | OpStep.OpDone -> ret (List.rev order)
             | OpStep.OpRow(row, nxt) ->
                 match keyOfRow row with
                 | DbErr e -> err e
@@ -483,9 +476,11 @@ module internal Ops =
                     | true, bucket ->
                         match addToBucket bucket row with
                         | DbErr e -> err e
-                        | DbOk() -> consume nxt
+                        | DbOk next ->
+                            buckets.[k] <- next
+                            consume count order nxt
                     | _ ->
-                        if order.Count >= groupBudget then
+                        if count >= groupBudget then
                             sprintf "GROUP BY のグループ数が多すぎます（上限 %d）。条件で絞るか、サンプリングしてください" groupBudget
                             |> DbError.capacity
                             |> err
@@ -494,29 +489,25 @@ module internal Ops =
 
                             match addToBucket bucket row with
                             | DbErr e -> err e
-                            | DbOk() ->
-                                buckets.[k] <- bucket
-                                order.Add k
-                                consume nxt
+                            | DbOk next ->
+                                buckets.[k] <- next
+                                consume (count + 1) (k :: order) nxt
 
-        let rec emitGroups i =
-            if i >= order.Count then
-                Op.Empty
-            else
-                Op.compute (fun () ->
-                    let key = order.[i]
-                    OpStep.OpRow(rowOf buckets.[key] key, emitGroups (i + 1)))
+        let rec emitGroups =
+            function
+            | [] -> Op.Empty
+            | key :: rest -> Op.compute (fun () -> OpStep.OpRow(rowOf buckets.[key] key, emitGroups rest))
 
         result {
-            do! consume src
+            let! order = consume 0 [] src
 
-            if order.Count = 0 && List.isEmpty groupBy then
+            if List.isEmpty order && List.isEmpty groupBy then
                 let vals =
                     aggs |> List.map (fun (f, _, _, _) -> finishAcc (emptyAcc f)) |> List.toArray
 
                 return Op.ofArray [| vals |]
             else
-                return emitGroups 0
+                return emitGroups order
         }
 
     /// 射影。

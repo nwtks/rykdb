@@ -247,8 +247,7 @@ module internal ExtSort =
         (compareRows: SqlValue array -> SqlValue array -> int)
         (src: Op)
         =
-        let inMemory (rows: ResizeArray<SqlValue array>) =
-            rows.ToArray() |> Array.sortWith compareRows |> Op.ofArray
+        let inMemory = List.rev >> List.toArray >> Array.sortWith compareRows >> Op.ofArray
 
         let rec openAll rest acc =
             match rest with
@@ -393,10 +392,10 @@ module internal ExtSort =
                 ret (inMemory buf)
             else
                 let all =
-                    if buf.Count = 0 then
+                    if List.isEmpty buf then
                         ret paths
                     else
-                        Spill.writeRun stamp written compareRows (buf.ToArray())
+                        Spill.writeRun stamp written compareRows (buf |> List.rev |> List.toArray)
                         |> Result.map (fun p -> paths @ [ p ])
 
                 match all with
@@ -429,18 +428,15 @@ module internal ExtSort =
                 | DbOk state' ->
                     let size = int64 (ValueCodec.managedRowBytes row)
 
-                    if buf.Count > 0 && bufBytes + size > budgetBytes then
-                        match Spill.writeRun stamp written compareRows (buf.ToArray()) with
+                    if not (List.isEmpty buf) && bufBytes + size > budgetBytes then
+                        match Spill.writeRun stamp written compareRows (buf |> List.rev |> List.toArray) with
                         | Error e ->
                             Spill.forget paths
                             err e
-                        | Ok p ->
-                            buf.Clear()
-                            ingest stamp buf 0L (written + 1) (p :: paths) state' (Op.emit row tail)
+                        | Ok p -> ingest stamp [] 0L (written + 1) (p :: paths) state' (Op.emit row tail)
                     else
-                        buf.Add row
-                        ingest stamp buf (bufBytes + size) written paths state' tail
+                        ingest stamp (row :: buf) (bufBytes + size) written paths state' tail
 
         Spill.sweepStale ()
         let stamp = System.Guid.NewGuid().ToString "N"
-        ingest stamp (ResizeArray<SqlValue array>()) 0L 0 [] init src
+        ingest stamp [] 0L 0 [] init src

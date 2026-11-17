@@ -171,7 +171,7 @@ let ``Op.toArrayLimited: バイト上限ちょうどは成功し、1バイト超
 
 [<Fact>]
 let ``Op.toArray: 呼び出しごとに独立した配列を返す`` () =
-    // 部分適用した toArray が ResizeArray を共有すると、2回目に前回の行が混ざる。
+    // 部分適用した toArray が行の受け皿を共有すると、2回目に前回の行が混ざる。
     let op = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
     let first = ok (Op.toArray op)
     let second = ok (Op.toArray op)

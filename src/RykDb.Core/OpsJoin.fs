@@ -137,7 +137,7 @@ module internal OpsJoin =
         (left: Op)
         (leftKeys: int array)
         (rightSchema: Schema)
-        (lookupRows: SqlValue array -> Result<ResizeArray<SqlValue array> option, DbError>)
+        (lookupRows: SqlValue array -> Result<SqlValue array array option, DbError>)
         (residual: Expr option)
         =
         let rightWidth = rightSchema.Columns.Length
@@ -164,7 +164,7 @@ module internal OpsJoin =
                 cur
 
         and emit lrow lnext rows i matched =
-            if i >= rows.Count then
+            if i >= rows.Length then
                 if isLeft && not matched then
                     Op.compute (fun () -> OpStep.OpRow(padded lrow, probe lnext))
                 else
@@ -181,22 +181,29 @@ module internal OpsJoin =
         probe left
 
     /// 右側のハッシュ表を作る（NULL キーは登録しない）。
+    /// バケットは右入力の順序を保つ（マージ結合と同じ出力順にするため）。
     let private buildHashTable (rightRows: SqlValue array array) (rightKeys: int array) =
-        let table =
-            System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<SqlValue array>> HashIdentity.Structural
+        let buckets =
+            System.Collections.Generic.Dictionary<SqlValue array, SqlValue array list> HashIdentity.Structural
 
         for rrow in rightRows do
             if not (hasNullKey rrow rightKeys) then
                 let key = keyOf rrow rightKeys
 
-                match table.TryGetValue key with
-                | true, bucket -> bucket.Add rrow
-                | _ -> table.[key] <- ResizeArray<SqlValue array>([ rrow ])
+                match buckets.TryGetValue key with
+                | true, bucket -> buckets.[key] <- rrow :: bucket
+                | _ -> buckets.[key] <- [ rrow ]
+
+        let table =
+            System.Collections.Generic.Dictionary<SqlValue array, SqlValue array array> HashIdentity.Structural
+
+        for kv in buckets do
+            table.[kv.Key] <- kv.Value |> List.rev |> List.toArray
 
         table
 
     let private lookupHash
-        (table: System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<SqlValue array>>)
+        (table: System.Collections.Generic.Dictionary<SqlValue array, SqlValue array array>)
         (key: SqlValue array)
         =
         match table.TryGetValue key with
@@ -454,11 +461,7 @@ module internal OpsJoin =
         lookup key
         >>= fun op ->
             toArrayWithBudget JoinBudgetBytes op
-            |> Result.map (fun rows ->
-                if Array.isEmpty rows then
-                    None
-                else
-                    Some(ResizeArray<SqlValue array> rows))
+            |> Result.map (fun rows -> if Array.isEmpty rows then None else Some rows)
 
     /// INNER JOIN（インデックス入れ子ループ）。
     let innerJoinIndexed

@@ -361,20 +361,11 @@ module internal SstableFormat =
             >> Array.toList
             >> Writer.build
 
-        let finish
-            firstKey
-            lastKey
-            maxSeqNo
-            count
-            (keys: ResizeArray<byte array>)
-            (block: ResizeArray<SstEntry>)
-            offset
-            indexEntries
-            =
-            (if block.Count = 0 then
+        let finish firstKey lastKey maxSeqNo count keys block offset indexEntries =
+            (if List.isEmpty block then
                  ret (offset, indexEntries)
              else
-                 writeBlock (block.ToArray()) offset indexEntries)
+                 writeBlock (block |> List.rev |> List.toArray) offset indexEntries)
             >>= fun (dataSize, indexEntries) ->
                 let metaBytes =
                     match firstKey, lastKey with
@@ -387,7 +378,7 @@ module internal SstableFormat =
                     if count = 0L then
                         [||]
                     else
-                        BloomFilter.ofKeys (int count) bloomFalsePositiveRate (keys.ToArray())
+                        BloomFilter.ofKeys (int count) bloomFalsePositiveRate (keys |> List.rev |> List.toArray)
                         |> BloomFilter.serialize
 
                 let indexOff = bloomOff + bloomBytes.Length
@@ -426,31 +417,18 @@ module internal SstableFormat =
                             MaxSeqNo = maxSeqNo
                         }
 
-        let rec loop
-            firstKey
-            lastKey
-            maxSeqNo
-            count
-            (keys: ResizeArray<byte array>)
-            (block: ResizeArray<SstEntry>)
-            offset
-            indexEntries
-            prev
-            =
-            if block.Count >= EntriesPerBlock then
-                match writeBlock (block.ToArray()) offset indexEntries with
+        let rec loop firstKey lastKey maxSeqNo count keys block blockCount offset indexEntries prev =
+            if blockCount >= EntriesPerBlock then
+                match writeBlock (block |> List.rev |> List.toArray) offset indexEntries with
                 | Error e -> err e
                 | Ok(nextOffset, indexEntries') ->
-                    loop firstKey lastKey maxSeqNo count keys (ResizeArray<SstEntry>()) nextOffset indexEntries' prev
+                    loop firstKey lastKey maxSeqNo count keys [] 0 nextOffset indexEntries' prev
             elif e.MoveNext() then
                 let item = e.Current
 
                 match prev with
                 | Some p when SstEntry.compare p item > 0 -> err (DbError.internalError "Sstable: エントリがキー順に並んでいません")
                 | _ ->
-                    keys.Add item.Key
-                    block.Add item
-
                     loop
                         (match firstKey with
                          | None -> Some item.Key
@@ -458,12 +436,13 @@ module internal SstableFormat =
                         (Some item.Key)
                         (max maxSeqNo item.SeqNo)
                         (count + 1L)
-                        keys
-                        block
+                        (item.Key :: keys)
+                        (item :: block)
+                        (blockCount + 1)
                         offset
                         indexEntries
                         (Some item)
             else
                 finish firstKey lastKey maxSeqNo count keys block offset indexEntries
 
-        loop None None 0UL 0L (ResizeArray<byte array>()) (ResizeArray<SstEntry>()) 0 [] None
+        loop None None 0UL 0L [] [] 0 0 [] None

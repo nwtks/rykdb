@@ -62,8 +62,8 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 状態 DU のスロット 5箇所と読み取り数カウンタだけで、次を意図的に使う。
 
 この規約が保証するのは**可変状態の所在が列挙できること**であり、可変状態の全廃ではない。
-ロジック層の状態は `ResizeArray` / `Dictionary` / `HashSet` / `ConcurrentDictionary` /
-`SemaphoreSlim` / `lock` へ移っている（下の許可リスト）。
+ロジック層の状態は `Dictionary` / `HashSet` / `ConcurrentDictionary` /`SemaphoreSlim` / `lock` へ移っている（下の許可リスト）。
+行・キー・アキュムレータの蓄積には `ResizeArray` を使わず、`list` / `array` を使う。
 「Core に mutable が無い」ではなく「可変状態はここにしかない」と読むこと。
 
 - `DatabaseHost` の `let mutable lifecycle`（`HostLifecycle` = `Running` / `Closed`、`SessionHost.fs`）:
@@ -87,16 +87,15 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 これらは `Session` / `SessionPool` / `DatabaseHost` の内部に閉じ込め、
 `Database` を internal にして外部へ漏らさない。
 
-`ResizeArray` / `Dictionary` / `HashSet` / `ConcurrentDictionary` を使うのは次の場所に限る
+`Dictionary` / `HashSet` / `ConcurrentDictionary` を使うのは次の場所に限る
 （CLI / Server は対象外）。
+Core では `ResizeArray` を使わない。
 いずれもホットパスか同時実行の台帳であり、使う理由はコメントに残す。
 
-- `Op.toArray` の行の蓄積
 - `Ops.aggregate` のグループ表（入力行は抱えず、アキュムレータだけ）
 - `Ops.distinct` の符号化済みキー集合（`HashSet<byte array>`）
 - `OpsJoin.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
-- `ExtSort` の受け皿（バジェット内に収まる分。超過分は一時ファイルへ退避する）
-- `SstableFormat` のブロック構築（`ResizeArray`）と DB ごとの partial reader / ブロックキャッシュ（`ConcurrentDictionary`）
+- `SstableFormat` の DB ごとの partial reader / ブロックキャッシュ（`ConcurrentDictionary`）
 - `EngineHost` の host state / ファイル refcount / 採番（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
 - `Eval.resolver` の列解決キャッシュと LIKE パターンキャッシュ
