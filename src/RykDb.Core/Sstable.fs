@@ -1,6 +1,6 @@
 // ===========================================================================
 // SSTable — 不変のソート済みファイルの読み取り（部分読み・走査・ポイント検索）。
-// 形式の定義・Footer・ブロックキャッシュ・書き出しは `SstableFormat.fs`。
+// 形式の定義・Footer・書き出しは `SstableFormat.fs`。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -43,7 +43,7 @@ module internal Sstable =
 
     /// ファイルの一部だけを読んで SSTable を開く。
     /// footer / index / Bloom / meta だけを読み、データブロックは必要になったとき読む。
-    let openPartialWith (cache: SstCache) (path: string) =
+    let openPartial (path: string) =
         let readMinMaxKey metaBytes =
             match Cursor.create metaBytes |> Reader.readLengthPrefixed with
             | Ok(mn, c) ->
@@ -156,44 +156,19 @@ module internal Sstable =
                         return
                             {
                                 Path = path
-                                FileKey = ""
                                 Index = indexEntries
                                 MinKey = minKey
                                 MaxKey = maxKey
                                 Bloom = bloom
                                 EntryCount = int64 footer.EntryCount
                                 MaxSeqNo = footer.MaxSeqNo
-                                Cache = cache
                             }
                     }
 
         protect (fun () ->
             use stream = System.IO.File.OpenRead path
-
-            readAll stream
-            >>= fun partial ->
-                ret
-                    { partial with
-                        FileKey =
-                            sprintf "%s|%d|%d" path stream.Length (System.IO.File.GetLastWriteTimeUtc(path).Ticks)
-                    })
+            readAll stream)
         >>= id
-
-    /// ファイルの一部だけを読んで SSTable を開く（単体利用向け）。
-    /// DB 経由の読み取りは、DB が所有するキャッシュを渡す `openPartialWith` を使う。
-    let openPartial (path: string) = openPartialWith (SstCache()) path
-
-    /// 接頭辞共有されたキーを復元する。
-    /// `Array.append (Array.take ...)` の中間配列を作らない。
-    let private reconstructKey (prev: byte array) (shared: uint64) (tail: byte array) =
-        if shared = 0UL then
-            tail
-        else
-            let sharedLength = int shared
-            let key = Array.zeroCreate<byte>(sharedLength + tail.Length)
-            Array.blit prev 0 key 0 sharedLength
-            Array.blit tail 0 key sharedLength tail.Length
-            key
 
     /// ブロック内の値をどう扱うか。
     /// Decode は通常のクエリ、Raw は compaction、Skip は列が不要なクエリ。
@@ -264,7 +239,7 @@ module internal Sstable =
     /// ブロックは最大 8個まとめて 1回の open で読み、解析は必要になったときだけ行う。
     /// `RawValues` は compaction 用で値を復号せずスライスだけを保持し、
     /// `SkipValues` は値が不要なクエリ用で空の行を返す。
-    let private rangeScanPartialWith (mode: ValueMode) (startKey: byte array) (limit: int) (partial: SstPartial) =
+    let private rangeScanPartialWith (mode: ValueMode) (startKey: byte array) (limit: int) (partial: SstReadInfo) =
         let rec search lo hi =
             if lo >= hi then
                 lo
@@ -375,160 +350,16 @@ module internal Sstable =
                 | Ok(raw, startOffset, batchEnd) -> SstScan.next (loadBlock raw startOffset batchEnd 0 startBlock))
 
     /// 値を復号せずに走査する（compaction 用）。
-    let rangeScanPartialRaw (startKey: byte array) (limit: int) (partial: SstPartial) =
-        rangeScanPartialWith RawValues startKey limit partial
+    let rangeScanPartialRaw = rangeScanPartialWith RawValues
 
     /// 値を復号せず、空の行だけを返す（列が不要なクエリ用）。
-    let rangeScanPartialSkipped (startKey: byte array) (limit: int) (partial: SstPartial) =
-        rangeScanPartialWith SkipValues startKey limit partial
+    let rangeScanPartialSkipped = rangeScanPartialWith SkipValues
 
     /// 列マスクに従って必要な列だけ復号する。
-    let rangeScanPartialMasked (mask: bool array) (startKey: byte array) (limit: int) (partial: SstPartial) =
-        rangeScanPartialWith (MaskValues mask) startKey limit partial
+    let rangeScanPartialMasked (mask: bool array) = rangeScanPartialWith (MaskValues mask)
 
     /// 値を復号しながら走査する（通常のクエリ・検証用）。
-    let rangeScanPartial (startKey: byte array) (limit: int) (partial: SstPartial) =
-        rangeScanPartialWith DecodeValues startKey limit partial
-
-    /// ブロック内のキー・SeqNo・値の位置をキャッシュする。
-    /// ポイント検索のたびにキー復元と値の読み飛ばしを繰り返さないため。
-    /// `Partial` を強参照して、ブロックがキャッシュされている間は
-    /// DB の部分読みキャッシュの弱参照が外れても index/Bloom を開き直さないようにする。
-    let private cacheBlock (partial: SstPartial) (data: byte array) (indexEntry: SstIndexEntry) =
-        let rec loop payloadLen (prev: byte array) keys seqNos offsets lengths c =
-            if Cursor.atEnd c then
-                match keys with
-                | [] -> err (DbError.corruption "Sstable: ブロックにエントリがありません")
-                | lastKey :: _ ->
-                    if Bytes.compare lastKey indexEntry.LastKey <> 0 then
-                        err (DbError.corruption "Sstable: 索引の LastKey とブロックが一致しません")
-                    else
-                        let block =
-                            {
-                                Partial = partial
-                                Raw = data
-                                Keys = keys |> List.rev |> Array.ofList
-                                SeqNos = seqNos |> List.rev |> Array.ofList
-                                ValueOffsets = offsets |> List.rev |> Array.ofList
-                                ValueLengths = lengths |> List.rev |> Array.ofList
-                                LastKey = lastKey
-                            }
-
-                        ret block
-            else
-                match Reader.readVarint c with
-                | Error e -> err e
-                | Ok(shared, c1) ->
-                    if shared > uint64 prev.Length then
-                        err (DbError.corruption "Sstable: 接頭辞長が直前のキーを超えています")
-                    else
-                        match Reader.readVarint c1 with
-                        | Error e -> err e
-                        | Ok(nonShared, c2) ->
-                            match Reader.readVarint c2 with
-                            | Error e -> err e
-                            | Ok(valueLen, c3) ->
-                                if nonShared > uint64 System.Int32.MaxValue then
-                                    err (DbError.corruption "Sstable: キー長が不正です")
-                                else
-                                    match Reader.readBytes (int nonShared) c3 with
-                                    | Error e -> err e
-                                    | Ok(tail, c4) ->
-                                        let key = reconstructKey prev shared tail
-                                        let valueOffset = Cursor.pos c4
-                                        let valueLength = int valueLen
-
-                                        if
-                                            valueLength < 0
-                                            || valueLength > payloadLen
-                                            || valueOffset > payloadLen - valueLength
-                                        then
-                                            err (DbError.corruption "Sstable: 値長が不正です")
-                                        else
-                                            let slice = Cursor.createSlice data valueOffset valueLength
-
-                                            match slice >>= Reader.readVarint with
-                                            | Error e -> err e
-                                            | Ok(seqNo, _) ->
-                                                match Reader.skipBytes valueLength c4 with
-                                                | Error e -> err e
-                                                | Ok c5 ->
-                                                    loop
-                                                        payloadLen
-                                                        key
-                                                        (key :: keys)
-                                                        (seqNo :: seqNos)
-                                                        (valueOffset :: offsets)
-                                                        (valueLength :: lengths)
-                                                        c5
-
-        let n = data.Length
-
-        if n < 4 then
-            err (DbError.corruption "Sstable: ブロックにチェックサムがありません")
-        else
-            let payloadLen = n - 4
-            let stored = Bytes.readLE32 data payloadLen
-
-            if Hashing.checksumRange data 0 payloadLen <> stored then
-                err (DbError.corruption "Sstable: ブロックのチェックサム不一致")
-            else
-                match Cursor.createSlice data 0 payloadLen with
-                | Error e -> err e
-                | Ok slice -> loop payloadLen [||] [] [] [] [] slice
-
-    let private lookupCachedWith
-        (maskOpt: bool array option)
-        (block: CachedSstBlock)
-        (key: byte array)
-        (visible: uint64 option)
-        (indexEntry: SstIndexEntry)
-        =
-        if Bytes.compare block.LastKey indexEntry.LastKey <> 0 then
-            err (DbError.corruption "Sstable: 索引の LastKey とブロックが一致しません")
-        else
-            let rec lowerBound lo hi =
-                if lo >= hi then
-                    lo
-                else
-                    let mid = lo + (hi - lo) / 2
-
-                    if Bytes.compare block.Keys.[mid] key < 0 then
-                        lowerBound (mid + 1) hi
-                    else
-                        lowerBound lo mid
-
-            let rec findVisible i =
-                if i >= block.Keys.Length || Bytes.compare block.Keys.[i] key <> 0 then
-                    ret None
-                else
-                    let isVisible =
-                        match visible with
-                        | Some s -> block.SeqNos.[i] <= s
-                        | None -> true
-
-                    if not isVisible then
-                        findVisible (i + 1)
-                    else
-                        let offset = block.ValueOffsets.[i]
-                        let length = block.ValueLengths.[i]
-
-                        match maskOpt with
-                        | None ->
-                            let valueBytes = Array.sub block.Raw offset length
-
-                            match SstEntry.decodeValue valueBytes with
-                            | Error e -> err e
-                            | Ok(seqNo, value) -> ret (Some(SstEntry.make block.Keys.[i] seqNo value))
-                        | Some mask ->
-                            match Cursor.createSlice block.Raw offset length with
-                            | Error e -> err e
-                            | Ok c ->
-                                match SstEntry.decodeMaskedValueAt mask c length with
-                                | Error e -> err e
-                                | Ok(seqNo, value, _) -> ret (Some(SstEntry.make block.Keys.[i] seqNo value))
-
-            findVisible (lowerBound 0 block.Keys.Length)
+    let rangeScanPartial = rangeScanPartialWith DecodeValues
 
     /// 部分読みで 1キーを検索する。
     /// 同一キーの複数版は SeqNo 降順で並ぶので、最初の可視版を返す。
@@ -537,9 +368,9 @@ module internal Sstable =
         (maskOpt: bool array option)
         (key: byte array)
         (visible: uint64 option)
-        (partial: SstPartial)
+        (partial: SstReadInfo)
         =
-        let mayContainPartial key partial =
+        let mayContainPartial key (partial: SstReadInfo) =
             match partial.Bloom with
             | None -> true
             | Some bloom -> Hashing.hashBytes key |> Hashing.mix |> BloomFilter.mightContain bloom
@@ -555,7 +386,7 @@ module internal Sstable =
                 else
                     search lo mid
 
-        let readBlock (indexEntry: SstIndexEntry) =
+        let readBlock indexEntry =
             protect (fun () ->
                 use stream = System.IO.File.OpenRead partial.Path
                 stream.Seek(int64 indexEntry.Offset, System.IO.SeekOrigin.Begin) |> ignore
@@ -563,18 +394,91 @@ module internal Sstable =
                 stream.ReadExactly(buffer, 0, buffer.Length)
                 buffer)
 
+        let readVarintAt (data: byte array) payloadLen pos =
+            let rec go shift acc i =
+                if i >= payloadLen || shift >= 64 then
+                    struct (false, 0UL, i)
+                else
+                    let b = data.[i]
+                    let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
+
+                    if b &&& 0x80uy = 0uy then
+                        struct (true, acc, i + 1)
+                    else
+                        go (shift + 7) acc (i + 1)
+
+            go 0 0UL pos
+
+        let decodeValue data valuePos valueLen =
+            match Cursor.createSlice data valuePos valueLen with
+            | Error e -> err e
+            | Ok slice ->
+                match maskOpt with
+                | None -> SstEntry.decodeValueAt slice valueLen
+                | Some mask -> SstEntry.decodeMaskedValueAt mask slice valueLen
+
+        let rec scan (indexEntry: SstIndexEntry) data payloadLen prev pos =
+            if pos >= payloadLen then
+                if Bytes.compare prev indexEntry.LastKey <> 0 then
+                    err (DbError.corruption "Sstable: 索引の LastKey とブロックが一致しません")
+                else
+                    ret None
+            else
+                let struct (ok1, shared, p1) = readVarintAt data payloadLen pos
+                let struct (ok2, tailLen, p2) = readVarintAt data payloadLen p1
+                let struct (ok3, valueLen, p3) = readVarintAt data payloadLen p2
+
+                if not (ok1 && ok2 && ok3) then
+                    err (DbError.corruption "Sstable: ブロックの varint が不正です")
+                elif shared > uint64 prev.Length then
+                    err (DbError.corruption "Sstable: 接頭辞長が直前のキーを超えています")
+                elif
+                    tailLen > uint64 System.Int32.MaxValue
+                    || int shared + int tailLen > System.Int32.MaxValue
+                then
+                    err (DbError.corruption "Sstable: キー長が不正です")
+                elif int tailLen > payloadLen - p3 then
+                    err (DbError.corruption "Sstable: キーがブロックの終端を超えています")
+                else
+                    let sharedLength = int shared
+                    let tailLength = int tailLen
+                    let entryKey = Array.zeroCreate<byte>(sharedLength + tailLength)
+                    Array.blit prev 0 entryKey 0 sharedLength
+                    Array.blit data p3 entryKey sharedLength tailLength
+                    let valuePos = p3 + tailLength
+                    let ordering = Bytes.compare entryKey key
+
+                    if ordering < 0 then
+                        scan indexEntry data payloadLen entryKey (valuePos + int valueLen)
+                    elif ordering > 0 then
+                        ret None
+                    else
+                        match decodeValue data valuePos (int valueLen) with
+                        | Error e -> err e
+                        | Ok(seqNo, value, _) ->
+                            let isVisible =
+                                match visible with
+                                | Some s -> seqNo <= s
+                                | None -> true
+
+                            if isVisible then
+                                ret (Some(SstEntry.make entryKey seqNo value))
+                            else
+                                scan indexEntry data payloadLen entryKey (valuePos + int valueLen)
+
         let lookupEntry indexEntry =
-            match partial.Cache.TryGetBlock(partial, indexEntry) with
-            | Some block -> lookupCachedWith maskOpt block key visible indexEntry
-            | None ->
-                match readBlock indexEntry with
-                | Error e -> err e
-                | Ok raw ->
-                    match cacheBlock partial raw indexEntry with
-                    | Error e -> err e
-                    | Ok block ->
-                        partial.Cache.PutBlock(partial, indexEntry, block)
-                        lookupCachedWith maskOpt block key visible indexEntry
+            match readBlock indexEntry with
+            | Error e -> err e
+            | Ok data ->
+                let n = data.Length
+                let payloadLen = n - 4
+
+                if n < 4 then
+                    err (DbError.corruption "Sstable: ブロックにチェックサムがありません")
+                elif Hashing.checksumRange data 0 payloadLen <> Bytes.readLE32 data payloadLen then
+                    err (DbError.corruption "Sstable: ブロックのチェックサム不一致")
+                else
+                    scan indexEntry data payloadLen [||] 0
 
         let rec find i =
             if i >= partial.Index.Length then
@@ -597,5 +501,5 @@ module internal Sstable =
             find (search 0 partial.Index.Length)
 
     /// 列マスクに従って必要な列だけ復号して 1キーを検索する。
-    let lookupMasked mask key visible partial =
+    let lookupMasked (mask: bool array) (key: byte array) (visible: uint64 option) (partial: SstReadInfo) =
         lookupWith (Some mask) key visible partial

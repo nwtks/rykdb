@@ -125,29 +125,29 @@ flowchart TB
 
 ### 採用している手法（サマリ）
 
-| 領域       | 手法・アルゴリズム                                                                                        | 詳細                                                |
-| ---------- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| ストレージ | LSM-Tree + **Leveled compaction**。1本のツリーを **keyspace 接頭辞**（`t:` / `i:` / `__catalog__`）で分離 | §6.1, §8                                            |
-| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                                            | §8.1                                                |
-| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter（double hashing）+ Footer v6。**部分読み**（弱参照キャッシュ）   | §8.2                                                |
-| 整合性     | **CRC32C**（Castagnoli、slicing-by-8）— SSTable のブロック・メタデータ・Footer、MANIFEST、WAL フレーム    | §8.2, §8.4–8.5                                      |
-| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                                     | §8.4–8.5                                            |
-| 耐久       | commit の fsync を**グループコミット**（WAL 位置を登録し、先頭の待機者が 1回 fsync）                      | §8.5, §7.7                                          |
-| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）。tombstone は最下位レベルで回収                     | §8.6                                                |
-| 並行制御   | **Session で読み取り並行・書き込み直列** + MVCC（Snapshot Isolation）+ first-committer-wins。DDL だけ排他 | §7                                                  |
-| 排他       | DDL は `RootRuntime`、DB は `.rykdb.format` の **`FileShare.None`**（プロセス間）                         | §7.8–7.9                                            |
-| compaction | **background worker**（`Session.OpenWith`）。MANIFEST 追記は installGate、採番は CAS で一意化             | §8.6–8.7                                            |
-| 符号化     | **順序保持エンコーディング**（型タグ・escape・タプル）と **varint**（長さ・件数）                         | §4, §6.1, §8.2                                      |
-| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                                                 | §6                                                  |
-| 最適化     | Filter pushdown、結合順の貪欲法、主キー順 `ORDER BY` の Sort 省略、LIMIT 件数ヒントの伝播                 | §5.1                                                |
-| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                                               | §5.2                                                |
-| 結合       | **インデックス入れ子ループ / マージ / ハッシュ / 入れ子ループ**を走査順と見積りで選択                     | §5.1                                                |
-| 並べ替え   | **外部マージソート**（run へ溢らし、fan-in 32 の multi-pass k-way merge）                                 | §5.3                                                |
-| 列読み出し | **列マスク**（必要な列だけ復号し、不要列は `Unloaded` として読み飛ばす）                                  | §5.4                                                |
-| 式評価     | **CPS + 計画時の準備値（`Eval.prepare`）**、3値論理、手書き LIKE 照合、struct DU / `DbResult` で割当を抑える | §5.4                                                |
-| 構文解析   | 手書き Lexer + 再帰下降 Parser（式は Pratt / precedence climbing、SELECT は CPS）                         | §3                                                  |
-| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                                       | [`coding-conventions.md`](coding-conventions.md) §1 |
-| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                                         | §4.2, §8.1                                          |
+| 領域       | 手法・アルゴリズム                                                                                                  | 詳細                                                |
+| ---------- | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| ストレージ | LSM-Tree + **Leveled compaction**。1本のツリーを **keyspace 接頭辞**（`t:` / `i:` / `__catalog__`）で分離           | §6.1, §8                                            |
+| memtable   | **永続 Treap**（優先度はハッシュ由来・決定的）                                                                      | §8.1                                                |
+| SSTable    | ブロック（**接頭辞共有**）+ Bloom filter（double hashing）+ Footer v6。**部分読み**（`ReadInfo` を Version に付随） | §8.2                                                |
+| 整合性     | **CRC32C**（Castagnoli、slicing-by-8）— SSTable のブロック・メタデータ・Footer、MANIFEST、WAL フレーム              | §8.2, §8.4–8.5                                      |
+| 障害回復   | **WAL（論理ログ）** + MANIFEST / CURRENT の原子的更新                                                               | §8.4–8.5                                            |
+| 耐久       | commit の fsync を**グループコミット**（WAL 位置を登録し、先頭の待機者が 1回 fsync）                                | §8.5, §7.7                                          |
+| GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）。tombstone は最下位レベルで回収                               | §8.6                                                |
+| 並行制御   | **Session で読み取り並行・書き込み直列** + MVCC（Snapshot Isolation）+ first-committer-wins。DDL だけ排他           | §7                                                  |
+| 排他       | DDL は `RootRuntime`、DB は `.rykdb.format` の **`FileShare.None`**（プロセス間）                                   | §7.8–7.9                                            |
+| compaction | **background worker**（`Session.OpenWith`）。MANIFEST 追記は installGate、採番は CAS で一意化                       | §8.6–8.7                                            |
+| 符号化     | **順序保持エンコーディング**（型タグ・escape・タプル）と **varint**（長さ・件数）                                   | §4, §6.1, §8.2                                      |
+| 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                                                           | §6                                                  |
+| 最適化     | Filter pushdown、結合順の貪欲法、主キー順 `ORDER BY` の Sort 省略、LIMIT 件数ヒントの伝播                           | §5.1                                                |
+| 実行       | **Volcano 方式の pull 演算子**（不変 `Op`）                                                                         | §5.2                                                |
+| 結合       | **インデックス入れ子ループ / マージ / ハッシュ / 入れ子ループ**を走査順と見積りで選択                               | §5.1                                                |
+| 並べ替え   | **外部マージソート**（run へ溢らし、fan-in 32 の multi-pass k-way merge）                                           | §5.3                                                |
+| 列読み出し | **列マスク**（必要な列だけ復号し、不要列は `Unloaded` として読み飛ばす）                                            | §5.4                                                |
+| 式評価     | **CPS + 計画時の準備値（`Eval.prepare`）**、3値論理、手書き LIKE 照合、struct DU / `DbResult` で割当を抑える        | §5.4                                                |
+| 構文解析   | 手書き Lexer + 再帰下降 Parser（式は Pratt / precedence climbing、SELECT は CPS）                                   | §3                                                  |
+| エラー処理 | `Result` ベース（`>>=` / `result { }` / `protect`）                                                                 | [`coding-conventions.md`](coding-conventions.md) §1 |
+| ハッシュ   | **FNV-1a 64bit** + **splitmix64**（Bloom filter・Treap の優先度）                                                   | §4.2, §8.1                                          |
 
 ### 依存の向き
 
@@ -213,7 +213,7 @@ flowchart TB
 | `Wal.fs`           | 論理ログ WAL（Begin / Batch / Commit / Abort と redo）                                                                |
 | `BloomFilter.fs`   | SSTable 用 Bloom filter（double hashing）                                                                             |
 | `SstScan.fs`       | SSTable / メモリの遅延走査 `SstScan` とマージ `SstMerge`（`ScanScope`）                                               |
-| `SstableFormat.fs` | SSTable の形式・Footer・ブロックキャッシュ・書き出し（`writeTo` / v6 / Bloom / index）                                |
+| `SstableFormat.fs` | SSTable の形式・Footer・読み取りメタデータ・書き出し（`writeTo` / v6 / Bloom / index）                                |
 | `Sstable.fs`       | SSTable の部分読み・走査・ポイント検索（`openPartial` / `rangeScanPartial*` / `lookupMasked`）                        |
 | `VersionSet.fs`    | `Version`（レベルの不変スナップショット）と `VersionEdit`                                                             |
 | `Manifest.fs`      | MANIFEST / CURRENT の読み書き（原子的更新）                                                                           |
@@ -243,7 +243,7 @@ flowchart TB
 | `Optimizer.fs`     | `Optimizer`（論理代数 → `Op` の実行と `explain`）                                                                     |
 | `Plan.fs`          | `Plan`（サブクエリ解決・派生テーブル・`runSelect` / `explainSelect`）                                                 |
 | `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                                                |
-| `Engine.fs`        | `StatementResult` / `Committed` / `TxnState` / `ExecState` / `Ddl` / `Engine`（文の実行）                                                          |
+| `Engine.fs`        | `StatementResult` / `Committed` / `TxnState` / `ExecState` / `Ddl` / `Engine`（文の実行）                             |
 | `SessionHost.fs`   | `DatabaseHost` と `CommitDurability`（store の open/close・共有 committed state・採番・fsync のグループコミット）     |
 | `Session.fs`       | 公開 API `Session` / `SessionPool` / `RowReader`（接続ごとの transaction・読み取りは並行、書き込みはホストで直列化）  |
 
@@ -1201,7 +1201,7 @@ DB 全体を閉じるのは所有者（`Session.OpenWith` の `Session`、また
 
 | 層                 | 役割                           | 詳細                                                                                                                                                                                                                                                                                    |
 | ------------------ | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. 不変レコード    | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `Committed` / `ExecState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                                    |
+| 1. 不変レコード    | **読み取りがロックを取らない** | `StorageEngine` / `RowStore` / `Committed` / `ExecState` はすべて値。読むときは掴んだスナップショットをそのまま見る（§1「なぜ不変か」）                                                                                                                                                 |
 | 2. `Session`       | **公開 API の並行性の単位**    | 接続ごとに独立した `Session` が transaction を持ち、SELECT だけの `Execute` は `stateGate`（入口・出口の短い区間）だけで並行実行できる。書き込み・`Begin` / `Commit` / `Rollback`・`Close` は接続内で `writeGate` 直列化し、DB 全体の書き込みは `DatabaseHost.writeGate` で直列化する。 |
 | 3. MVCC + 競合検査 | **commit の一意性**            | 採番と first-committer-wins の競合検査が `TransactionManager.commit` の 1経路を通る（§7.1–7.5）                                                                                                                                                                                         |
 | 4. keyspace 接頭辞 | **論理的な分離**               | `t:` / `i:` / `__catalog__` は 1本の LSM 上で接頭辞により分離される。物理ツリーは共有するため、テーブル間の並列性は提供しない（§6.1）                                                                                                                                                   |
@@ -1413,7 +1413,7 @@ entry = [shared:varint][nonShared:varint][valueLen:varint][key の非共有部�
 `StorageEngine` は**部分読みだけ**を使う。
 
 - **部分読み**（`Sstable.openPartial`）: Footer / meta / Bloom / index だけを読み、
-  `SstPartial`（パス + インデックス）を返す。データブロックは `rangeScanPartial` /
+  `SstReadInfo`（パス + インデックス）を返す。データブロックは `rangeScanPartial` /
   `lookup` が必要になったときだけ `FileStream` で読む。
   `openPartial` は Footer/meta/Bloom/index を **1回の open** で読み、
   `rangeScanPartial` は最大 **8ブロック**を 1回の open でまとめて読む
@@ -1434,15 +1434,23 @@ Footer は `metadataChecksum`（Meta / Bloom / Index）と自身のチェック�
 （読まなかったブロックは検証されない）。
 全体チェックサムは部分読みでは検証できないため持たない。
 
-パース済みの `SstPartial` は DB ごとの `SstCache` が**弱参照**で保持する
-（キーは「パス + サイズ + mtime」。
-ファイル番号は単調増加で中身は書き換わらないため安全に共有でき、GC が回収できるのでメモリを圧迫しない）。
-同じファイルの 2回目以降の検索・走査は Footer/index の再読み込みを省略できる。
-`SstCache` は `StorageRuntime` が所有し、不変の `StorageEngine` のコピー間で共有される
-（DB の寿命と一緒に回収され、プロセス全体のサイドテーブルにはならない）。
-キーはファイル世代ごとに増える（flush / compaction で SSTable が作り直される）ため、
-`put` がキー数 512 ごとに**死んだ弱参照だけ**を掃除する
-（生きた参照は実行中の走査が使うので残す）。
+パース済みの読み取りメタデータ（Footer / index / Bloom / meta）は `SstReadInfo` として
+`FileMetaData.ReadInfo` に載る（**可変のキャッシュではない**）。
+不変の `Version` に付随する値なので、読み取りのたびに開き直さない。
+
+- flush / compaction は `SstableFormat.writeTo` が書き出しと同時に得た index / Bloom を使い、
+  追加の I/O なしで `ReadInfo` を作る。
+- MANIFEST から復元したファイルは `StorageEngine.openDatabaseWith` が 1回だけ hydrate する。
+  ここで Footer / index / Bloom の破損を検出する（データブロックは従来どおり遅延検出）。
+- 書き込み後にファイルを差し替えても、メモリ上の `Version` の `ReadInfo` は古いままなので、
+  再オープンするまで気付かない
+  （回帰テスト: `StorageEngine.openDatabase: 書き込み後に壊れたファイルは再オープンで検出する`）。
+
+ブロックの解析結果はキャッシュしない（ポイント検索のたびに 1ブロックを読んで走査する）。
+ブロック内は接頭辞共有なので先頭から走査するが、キー配列を作らず配列添字で varint を読む。
+実測（`tools/RykDb.Bench`、10万行ではなく 1万行・`--quick`）:
+`PointLookup` 約 68µs → 約 107µs、`PointLookupStorage` 約 9µs → 約 51µs。
+キャッシュを外した代償として約 1.6倍（ストレージ層は約 5.5倍）を許容する。
 
 `StorageEngine.openDatabaseWith` は `FileMetaData.MaxSeqNo` から NextSeqNo を、
 WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
@@ -1678,7 +1686,7 @@ L0 が増えて読み取りのコスト（read amplification）と引き換え�
 - **読み取りは Session 呼び出し単位で Version 全ファイルを pin** する
   （同じバッチに複数の `SELECT` があっても pin は 1回だけ取り、共有する）。
   worker は install 後に入力を retired にし、refcount が 0 になったものだけを削除する。
-  `SstPartial` / `SstScan` 自体には pin を配線していない。
+  `SstReadInfo` / `SstScan` 自体には pin を配線していない。
 - install 時は現在 Version を再読し、
   (1) 入力がまだ Version に存在するか、
   (2) 開始時より古い snapshot が登録されていないか

@@ -214,6 +214,7 @@ let ``Manifest: 大きくなった manifest はスナップショットへロー
                 EntryCount = 1L
                 Size = 1L
                 MaxSeqNo = 1UL
+                ReadInfo = None
             }
 
         let _, mn1 = ok (Manifest.logAndApply dir mn0 v0 (VersionEdit.addFile file))

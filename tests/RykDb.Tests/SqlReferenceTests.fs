@@ -1157,6 +1157,34 @@ let ``SqlReference: DISTINCT を続けて実行しても毎回全行が返る`` 
             Assert.Equal<int64>(10L, asInt res.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎回同じ結果になる`` () =
+    // 演算子の作業用コレクション（グループ表・ハッシュ表）は Op の構築時に作り、
+    // 返した Op の外へ持ち出さない。モジュールスコープに置くと 2回目以降が壊れる
+    // （DISTINCT で実際に踏んだ。gotchas §2.6）。
+    withDb "sel7c" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY, h INTEGER)"
+        let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (1,10),(2,20),(3,10),(4,30)")
+        let db4, _ = ok (execSql db3 "INSERT INTO u VALUES (1,10),(2,99),(3,10)")
+
+        let groupSql = "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g"
+        let joinSql = "SELECT t.id, u.h FROM t JOIN u ON t.g = u.h ORDER BY t.id"
+
+        let expectedGroups = execSql db4 groupSql |> ok |> snd
+        let expectedJoin = execSql db4 joinSql |> ok |> snd
+
+        Assert.Equal<int>(3, expectedGroups.Rows.Length)
+        Assert.Equal<int>(4, expectedJoin.Rows.Length)
+
+        for _ in 1..3 do
+            let _db, groups = ok (execSql db4 groupSql)
+            let _db, joined = ok (execSql db4 joinSql)
+            Assert.Equal<int>(expectedGroups.Rows.Length, groups.Rows.Length)
+            Assert.Equal<int>(expectedJoin.Rows.Length, joined.Rows.Length)
+            Assert.Equal<int64>(asInt expectedGroups.Rows.[0].[1], asInt groups.Rows.[0].[1])
+            Assert.Equal<int64>(asInt expectedJoin.Rows.[0].[0], asInt joined.Rows.[0].[0]))
+
+[<Fact>]
 let ``SqlReference: 別名を付けられる`` () =
     seeded "sel8" (fun db ->
         let _db10, res = ok (execSql db "SELECT name AS n FROM people ORDER BY id LIMIT 1")

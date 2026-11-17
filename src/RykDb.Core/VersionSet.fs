@@ -16,6 +16,14 @@ type internal FileMetaData =
         /// 起動時の NextSeqNo 復元に使う
         /// （GC は `Compaction.gcGroup` が activeSnapshot と版ごとの SeqNo で判定する）。
         MaxSeqNo: uint64
+        /// 読み取り用のメタデータ（footer / index / Bloom / meta の解析結果）。
+        /// <remarks>
+        /// MANIFEST には保存しない（ファイル内容から導出できる）。
+        /// flush / compaction の書き出し時に 1回で作り、
+        /// open 時に MANIFEST から復元したファイルは 1回だけ hydrate する。
+        /// 不変の `Version` に付随するので、読み取りのたびに開き直さない。
+        /// </remarks>
+        ReadInfo: SstReadInfo option
     }
 
 module internal FileMetaData =
@@ -35,6 +43,7 @@ module internal FileMetaData =
             EntryCount = 0L
             Size = 0L
             MaxSeqNo = 0UL
+            ReadInfo = None
         }
 
     /// SSTable のフルパス。
@@ -65,6 +74,17 @@ module internal FileMetaData =
                 EntryCount = info.EntryCount
                 Size = info.Size
                 MaxSeqNo = info.MaxSeqNo
+                ReadInfo =
+                    Some
+                        {
+                            Path = path dir fileNumber
+                            Index = info.Index
+                            MinKey = info.FirstKey
+                            MaxKey = info.LastKey
+                            Bloom = info.Bloom
+                            EntryCount = info.EntryCount
+                            MaxSeqNo = info.MaxSeqNo
+                        }
             }
 
         let target = path dir fileNumber
@@ -262,6 +282,7 @@ module internal VersionEdit =
                         EntryCount = int64 cnt
                         Size = int64 size
                         MaxSeqNo = maxSeq
+                        ReadInfo = None
                     }
             }
 

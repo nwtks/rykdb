@@ -179,7 +179,10 @@ let distinct (src: Op) =
 
 - 部分適用で関数を作るときも、可変な状態を呼び出しをまたいで共有しないこと（純粋な関数だけにする）。
 - 気付き方: 単体のテストは成功するが、他のテストと並行実行すると 0行になる（xUnit の並列実行で表面化）。
-- 回帰テスト: `SqlReference: DISTINCT を続けて実行しても毎回全行が返る`。
+- 同じ規則を `Ops.aggregate` のグループ表と `OpsJoin.innerJoinHash` / `leftJoinHash` のハッシュ表にも適用する
+  （演算子の構築時に作り、返した `Op` の外へ出さない）。
+- 回帰テスト: `SqlReference: DISTINCT を続けて実行しても毎回全行が返る` /
+  `SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎回同じ結果になる`。
 
 ---
 
@@ -1567,19 +1570,20 @@ DDL だけは DB ごとに排他にする必要がある。
 - `Engine.contextOf`: `Catalog.toSchema` の失敗を無視せず、文のエラーとして返す。
 - `Ops.sortBy`: 非 NULL の代表値と比較できない値があれば、ソート前にエラーにする。
 
-### 11.22 SSTable の partial reader キャッシュは「パス + サイズ + mtime」で無効化する
+### 11.22 SSTable の読み取りメタデータは `Version` に付随させる（キャッシュしない）
 
-DB ごとの `SstCache` はパース済み `SstPartial` を弱参照で保持する。
-キーにサイズと mtime を含めないと、同じファイル番号のファイルを差し替えたときに古い内容を返す。
+`FileMetaData.ReadInfo` は Footer / index / Bloom / meta の解析結果（`SstReadInfo`）を持つ。
+これはファイル内容だけで決まる不変の値で、**DB やプロセスの寿命にわたるキャッシュではない**。
 
-- テストで SSTable を書き換えたら `File.SetLastWriteTimeUtc` で mtime を確実に進める。
-- キャッシュは弱参照なので、メモリが逼迫すれば GC が回収する（LRU ではない）。
-- キーはファイル世代ごとに増えるため、`put` がキー数 512 ごとに死んだ弱参照（GC 済み）を辞書から外す。
-  生きた参照は実行中の走査が使うので残す。
-  ファイル差し替え後の再読み込みは
-  `StorageEngine.getAtMasked / scanAtMasked: 必要なブロックだけを部分読みする` で確認する
-  （弱参照の掃除自体の専用テストは無い）。
-- 欠落ファイルはキー計算（`FileInfo.Length`）の時点で IoError になる。
+- flush / compaction は書き出し時に `SstWriteInfo`（`Index` / `Bloom`）から組み立てる。
+- MANIFEST から復元したファイルは `openDatabaseWith` が 1回だけ hydrate する。
+- **書き込み後にファイルを差し替えても `ReadInfo` は古いまま**。
+  再オープンで初めて検出する
+  （回帰テスト: `StorageEngine.openDatabase: 書き込み後に壊れたファイルは再オープンで検出する`）。
+  遅延オープンの検証（`twoFilesWithBrokenSecond`）は `ReadInfo = None` にして
+  「必要なときに開く」経路を検査する。
+- ブロックの解析結果はキャッシュしないので、ポイント検索は毎回 1ブロックを読んで先頭から走査する。
+  実測では `PointLookup` が約 1.6倍、`PointLookupStorage` が約 5.5倍になった（§8.2）。
 
 ### 11.23 DISTINCT / GROUP BY のキーは文字列化しない
 
@@ -1624,13 +1628,13 @@ Footer は Meta / Bloom / Index の連続領域を守る `metadataChecksum` と�
 自身（先頭 80バイト）を守る `footerChecksum` を持ち、`openPartial` でも検証する。
 全体チェックサムは部分読みでは検証できないため持たない
 （ファイル全体を読む経路も、各ブロックとメタデータの検証で破損を検出する）。
-`SstPartial` は Footer / meta / Bloom / index だけを開き、
+`SstReadInfo` は Footer / meta / Bloom / index だけを持ち、
 データブロックは必要になったとき `FileStream` で読む。
 読んだブロックは `parseBlockAt` がチェックサムを検証する。
 
 - 部分読みで読まなかったブロックの破損は、そのクエリでは検出されない。
 - テストでファイルを書き換えたら mtime を進める（§11.22）。
-- `SstPartial` の `rangeScanPartial` は最大 8ブロックを 1回の open で読み、解析は必要になったときだけ行う。
+- `SstReadInfo` の `rangeScanPartial` は最大 8ブロックを 1回の open で読み、解析は必要になったときだけ行う。
   `lookup` は通常は該当ブロック 1個だけを読むが、同じキーの可視版がブロック末尾に無い場合は、
   同じキーの古い版が続く次のブロックも読む。
 

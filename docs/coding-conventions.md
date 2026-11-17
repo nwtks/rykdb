@@ -95,9 +95,8 @@ Core では `ResizeArray` を使わない。
 - `Ops.aggregate` のグループ表（入力行は抱えず、アキュムレータだけ）
 - `Ops.distinct` の符号化済みキー集合（`HashSet<byte array>`）
 - `OpsJoin.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
-- `SstableFormat` の DB ごとの partial reader / ブロックキャッシュ（`ConcurrentDictionary`）
 - `EngineHost` の host state / ファイル refcount / worker 状態（`ConcurrentDictionary`）
-- `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
+- `StorageEngine` の書き込み Gate / `ProcessLock` / `Transactions` の登録台帳（`SemaphoreSlim` / `ConcurrentDictionary`）
 
 | やりたいこと       | 命令形の代わりに使うもの                                                        |
 | ------------------ | ------------------------------------------------------------------------------- |
@@ -107,8 +106,16 @@ Core では `ResizeArray` を使わない。
 | 走査・畳み込み     | `Result` を返す末尾再帰                                                         |
 | ホットパスの成功値 | `DbResult<'T>`（`DbOk` / `DbErr`）。公開境界で `Result` に変換する              |
 | 平衡木の再構築     | 明示スタック（`list` を積む）                                                   |
-| 行ごとの列解決     | `Eval.prepare`（計画時の不変な準備値。`ImmutableDictionary` で解決済み）       |
+| 行ごとの列解決     | `Eval.prepare`（計画時の不変な準備値。`ImmutableDictionary` で解決済み）        |
 | 遅延列挙           | `Op`（one-shot。構築は `Op.compute` / `Op.emit`、消費は `Op.next` の `OpStep`） |
+
+演算子の作業用コレクション（`Ops.distinct` の `HashSet` / `Ops.aggregate` のグループ表 /
+`OpsJoin.innerJoinHash` / `leftJoinHash` のハッシュ表）は
+**演算子の構築時に作り、返した `Op` の中だけで使う**。
+モジュールスコープに置くと 2回目以降の実行が壊れる
+（DISTINCT で実際に踏んだ。gotchas §2.6）。
+回帰テスト: `SqlReference: DISTINCT を続けて実行しても毎回全行が返る` /
+`SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎回同じ結果になる`。
 
 関数名の末尾の `V`（`matchesWithV` / `compareValuesV`）は
 「値ベース（`Result` ではなく `DbResult`）版」を表す。

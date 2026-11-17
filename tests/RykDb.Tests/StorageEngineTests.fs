@@ -55,6 +55,11 @@ let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array ->
 
 /// キー 1..2 のファイル（10）とキー 3..4 のファイル（11）を作り、11 のマジックを
 /// 壊す（`Sstable.openPartial` が失敗する＝開封時に検出される壊れたファイル）。
+/// <remarks>
+/// `writeSstable` は書き込み時に `ReadInfo` を作るので、書き込み後にファイルを壊しても
+/// そのままでは気付かない。ここでは「MANIFEST から復元したファイル」と同じ状態
+/// （`ReadInfo = None`）にして、必要なときに開く経路を検査する。
+/// </remarks>
 let private twoFilesWithBrokenSecond (dir: string) =
     let f1 =
         mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1); Entry.put (intKey 2) 2UL (intRow 2) ]
@@ -63,7 +68,17 @@ let private twoFilesWithBrokenSecond (dir: string) =
         mkSst dir 11L 0 [ Entry.put (intKey 3) 3UL (intRow 3); Entry.put (intKey 4) 4UL (intRow 4) ]
 
     patchSstable dir 11L (fun data -> data.[data.Length - Sstable.FooterSize] <- 0x00uy)
+
+    let f2 = { f2 with ReadInfo = None }
     f1, f2
+
+[<Fact>]
+let ``StorageEngine.openDatabase: 書き込み後に壊れたファイルは再オープンで検出する`` () =
+    withDir "se-hydrate-corrupt" (fun dir ->
+        let _f = mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1) ]
+        // `ReadInfo` は書き込み時点の内容なので、後から壊しても open 中の hydrate で初めて検出する。
+        patchSstable dir 10L (fun data -> data.[data.Length - Sstable.FooterSize] <- 0x00uy)
+        expectErrorKind ErrorKind.CorruptionError "再オープンで Footer の破損を検出する" (StorageEngine.openDatabaseWith None dir))
 
 [<Fact>]
 let ``StorageEngine.getAtMasked: 古い snapshot は SSTable 内の見える版まで戻る`` () =
@@ -179,7 +194,7 @@ let ``StorageEngine.scanAtMasked: 先頭 1 件だけなら全件を実体化し�
                     Version = Version.Empty |> Version.addFile f
                 }
 
-            // SstPartial の読み込みを先に済ませる（計測から index/Bloom の解析を除く）。
+            // SstReadInfo の読み込みを先に済ませる（計測から index/Bloom の解析を除く）。
             let all =
                 ok (StorageEngine.scanAtMasked None 0 [||] [||] engine) |> SstScan.toArray |> ok
 

@@ -619,6 +619,7 @@ let fmd (num: int64) (level: int) (lo: int) (hi: int) : FileMetaData =
         EntryCount = int64 (hi - lo + 1)
         Size = int64 (hi - lo + 1) * 100L
         MaxSeqNo = uint64 (hi + 1)
+        ReadInfo = None
     }
 
 /// レベルごとのファイル数。

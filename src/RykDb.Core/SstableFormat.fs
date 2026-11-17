@@ -1,5 +1,5 @@
 // ===========================================================================
-// SSTable のファイル形式 — 定数・Footer・ブロックキャッシュ・書き出し。
+// SSTable のファイル形式 — 定数・Footer・読み取りメタデータ・書き出し。
 // 読み取り（部分読み・走査・ポイント検索）は `Sstable.fs`。
 //
 //   [Block 0]...[Block N-1][Meta][Bloom][Index][Footer 84 bytes]
@@ -19,99 +19,28 @@ type internal SstIndexEntry =
         Length: int
     }
 
-/// ファイル世代（FileKey）とブロック位置でブロックを特定する。
-[<Struct>]
-type private SstBlockKey =
-    {
-        FileKey: string
-        Offset: int
-        Length: int
-    }
-
-/// SSTable の部分読み取り用リーダー。
-/// ファイル全体を読まず、footer / index / Bloom / meta だけを保持する。
-type internal SstPartial =
+/// SSTable の部分読み取りに必要なメタデータ（不変）。
+/// <remarks>
+/// footer / index / Bloom / meta を 1回解析した結果で、ファイル内容だけで決まる純粋な値。
+/// `FileMetaData.ReadInfo` に載せ、読み取りのたびに開き直さない。
+/// DB・プロセスの寿命にわたるキャッシュではない（不変の Version に付随する）。
+/// </remarks>
+type internal SstReadInfo =
     {
         Path: string
-        /// path + length + mtime。同じパスのファイルが作り直された場合に
-        /// ブロックキャッシュを誤って再利用しないための識別子。
-        FileKey: string
         Index: SstIndexEntry array
         MinKey: byte array
         MaxKey: byte array
         Bloom: BloomFilter option
         EntryCount: int64
         MaxSeqNo: uint64
-        /// この部分読みを所有する DB のキャッシュ。
-        Cache: SstCache
     }
-
-/// ポイント検索で解析済みの 1ブロック。
-and internal CachedSstBlock =
-    {
-        Partial: SstPartial
-        Raw: byte array
-        Keys: byte array array
-        SeqNos: uint64 array
-        ValueOffsets: int array
-        ValueLengths: int array
-        LastKey: byte array
-    }
-
-/// DB ごとの SSTable キャッシュ。
-/// 不変の `StorageEngine` が参照を共有するので、DB の寿命と一緒に回収される。
-and internal SstCache() =
-    let partials =
-        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstPartial>>(
-            System.StringComparer.Ordinal
-        )
-
-    let blocks =
-        System.Collections.Concurrent.ConcurrentDictionary<SstBlockKey, CachedSstBlock>()
-
-    let blockKey (partial: SstPartial) (indexEntry: SstIndexEntry) =
-        {
-            FileKey = partial.FileKey
-            Offset = indexEntry.Offset
-            Length = indexEntry.Length
-        }
-
-    let sweep () =
-        for kv in partials do
-            match kv.Value.TryGetTarget() with
-            | true, _ -> ()
-            | _ -> partials.TryRemove kv.Key |> ignore
-
-    member _.TryGetPartial(key: string) =
-        match partials.TryGetValue key with
-        | true, weak ->
-            match weak.TryGetTarget() with
-            | true, partial -> Some partial
-            | _ ->
-                partials.TryRemove key |> ignore
-                None
-        | _ -> None
-
-    member _.PutPartial(key: string, partial: SstPartial) =
-        partials.[key] <- System.WeakReference<SstPartial> partial
-
-        if partials.Count % 512 = 0 then
-            sweep ()
-
-    member _.TryGetBlock(partial: SstPartial, indexEntry: SstIndexEntry) =
-        match blocks.TryGetValue(blockKey partial indexEntry) with
-        | true, block -> Some block
-        | _ -> None
-
-    member _.PutBlock(partial: SstPartial, indexEntry: SstIndexEntry, block: CachedSstBlock) =
-        if blocks.Count >= 2048 then
-            blocks.Clear()
-
-        blocks.TryAdd(blockKey partial indexEntry, block) |> ignore
 
 /// `SstableFormat.writeTo` の結果。
 /// 入力が `seq` なので、書き出しに成功してから先頭・末尾のキーを数え直せない。
 /// `FileMetaData.writeSstable` がこれを `FileMetaData` に載せる。
+/// `Index` / `Bloom` は書き出しと同時に得られるので、
+/// 読み取り用の `SstReadInfo` を再解析なしで組み立てられる。
 type internal SstWriteInfo =
     {
         /// 書き込んだバイト数
@@ -122,6 +51,10 @@ type internal SstWriteInfo =
         LastKey: byte array
         EntryCount: int64
         MaxSeqNo: uint64
+        /// 索引（ブロック位置）。
+        Index: SstIndexEntry array
+        /// 書き出した Bloom filter（0 件なら None）。
+        Bloom: BloomFilter option
     }
 
 module internal SstableFormat =
@@ -374,15 +307,18 @@ module internal SstableFormat =
 
                 let bloomOff = dataSize + metaBytes.Length
 
-                let bloomBytes =
+                let bloom =
                     if count = 0L then
-                        [||]
+                        None
                     else
-                        BloomFilter.ofKeys (int count) bloomFalsePositiveRate (keys |> List.rev |> List.toArray)
-                        |> BloomFilter.serialize
+                        Some(BloomFilter.ofKeys (int count) bloomFalsePositiveRate (keys |> List.rev |> List.toArray))
+
+                let bloomBytes =
+                    bloom |> Option.map BloomFilter.serialize |> Option.defaultValue [||]
 
                 let indexOff = bloomOff + bloomBytes.Length
-                let indexBytes = indexBytesOf (List.rev indexEntries |> List.toArray)
+                let index = List.rev indexEntries |> List.toArray
+                let indexBytes = indexBytesOf index
 
                 if int64 indexOff + int64 indexBytes.Length > int64 System.Int32.MaxValue then
                     err (DbError.internalError "Sstable: ファイルが大きすぎます")
@@ -415,6 +351,8 @@ module internal SstableFormat =
                             LastKey = defaultArg lastKey [||]
                             EntryCount = count
                             MaxSeqNo = maxSeqNo
+                            Index = index
+                            Bloom = bloom
                         }
 
         let rec loop firstKey lastKey maxSeqNo count keys block blockCount offset indexEntries prev =

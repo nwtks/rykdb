@@ -414,7 +414,7 @@ module internal RowStore =
                         HostState.initial engine.Version engine.ManifestNumber,
                         engine.Compaction,
                         (fun () -> runtime.OldestExcept(root, None)),
-                        (fun f -> StorageEngine.openScan engine.Runtime.Cache root f),
+                        (fun f -> StorageEngine.openScan root f),
                         options.ScanHook
                     )
                     |> Some

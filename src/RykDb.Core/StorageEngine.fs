@@ -11,9 +11,7 @@ namespace RykDb.Core
 /// 1つの DB が共有する実行時状態。
 /// `StorageEngine` の不変コピー間で参照を共有し、DB の寿命と一緒に回収する。
 type internal StorageRuntime() =
-    let cache = SstCache()
     let gate = new System.Threading.SemaphoreSlim(1, 1)
-    member _.Cache = cache
     member _.Gate = gate
 
 /// StorageEngine の不変状態。
@@ -43,7 +41,7 @@ type internal StorageEngine =
         /// GC は「これより新しい版」と「これ以下の最新 1版」を残す（Compaction.gcGroup）。
         /// 0 は「全版を残す」。
         ActiveSnapshot: uint64
-        /// DB ごとの実行時状態（SSTable キャッシュ・書き込み Gate）。
+        /// DB ごとの実行時状態（書き込み Gate）。
         Runtime: StorageRuntime
     }
 
@@ -58,11 +56,6 @@ module internal StorageEngine =
         finally
             engine.Runtime.Gate.Release() |> ignore
 
-    /// ファイルの同一性を表すキー。
-    /// 同じ番号のファイルが差し替わった場合はサイズ/mtime が変わるので別キーになる。
-    let private cacheKeyOf (path: string) (info: System.IO.FileInfo) =
-        sprintf "%s|%d|%d" path info.Length info.LastWriteTimeUtc.Ticks
-
     /// SSTable に書く Bloom filter の誤検出率。
     [<Literal>]
     let private BloomFalsePositiveRate = 0.01
@@ -71,29 +64,21 @@ module internal StorageEngine =
     [<Literal>]
     let private DefaultMemLimitBytes = 64 * 1024 * 1024
 
-    /// 部分読み用の reader を開く（index / Bloom / meta のみ）。
-    let private openPartialSstIn (cache: SstCache) (dir: string) (f: FileMetaData) =
-        let path = FileMetaData.path dir f.FileNumber
+    /// 読み取り用メタデータを返す。
+    /// flush / compaction が作ったファイルは `ReadInfo` を持っている。
+    /// MANIFEST から復元したファイル（テストの手組みを含む）は、ここで 1回だけ解析する。
+    let private readInfoOf (dir: string) (f: FileMetaData) =
+        match f.ReadInfo with
+        | Some info -> ret info
+        | None -> Sstable.openPartial (FileMetaData.path dir f.FileNumber)
 
-        protect (fun () -> System.IO.FileInfo path |> cacheKeyOf path)
-        >>= fun key ->
-            match cache.TryGetPartial key with
-            | Some partial -> ret partial
-            | None ->
-                Sstable.openPartialWith cache path
-                >>= fun partial ->
-                    cache.PutPartial(key, partial)
-                    ret partial
-
-    let private openPartialSst (f: FileMetaData) (engine: StorageEngine) =
-        openPartialSstIn engine.Runtime.Cache engine.Dir f
+    let private readInfoIn (f: FileMetaData) (engine: StorageEngine) = readInfoOf engine.Dir f
 
     /// バックグラウンド compaction 用の走査。
     /// ファイルの先頭から全件を遅延して読む。
     /// compaction はキー・SeqNo・削除タグしか見ないので、値は復号せずスライスのまま渡す。
-    let openScan (cache: SstCache) (dir: string) (f: FileMetaData) =
-        openPartialSstIn cache dir f
-        >>= fun partial -> ret (Sstable.rangeScanPartialRaw [||] 0 partial)
+    let openScan (dir: string) (f: FileMetaData) =
+        readInfoOf dir f >>= fun info -> ret (Sstable.rangeScanPartialRaw [||] 0 info)
 
     /// 列マスク付きのポイントルックアップ。
     let getAtMasked (visible: uint64 option) (key: byte array) (mask: bool array) (engine: StorageEngine) =
@@ -101,10 +86,10 @@ module internal StorageEngine =
             match files with
             | [] -> ret None
             | f :: rest ->
-                match openPartialSst f engine with
+                match readInfoIn f engine with
                 | Error e -> err e
-                | Ok partial ->
-                    match Sstable.lookupMasked mask key visible partial with
+                | Ok info ->
+                    match Sstable.lookupMasked mask key visible info with
                     | Error e -> err e
                     | Ok(Some e) -> ret (Some e)
                     | Ok None -> probe rest
@@ -166,12 +151,12 @@ module internal StorageEngine =
                 startKey
 
         let openPending index f merge =
-            openPartialSst f engine
-            >>= fun partial ->
+            readInfoIn f engine
+            >>= fun info ->
                 match maskOpt with
-                | None -> Sstable.rangeScanPartial startKey 0 partial
-                | Some mask when mask.Length = 0 -> Sstable.rangeScanPartialSkipped startKey 0 partial
-                | Some mask -> Sstable.rangeScanPartialMasked mask startKey 0 partial
+                | None -> Sstable.rangeScanPartial startKey 0 info
+                | Some mask when mask.Length = 0 -> Sstable.rangeScanPartialSkipped startKey 0 info
+                | Some mask -> Sstable.rangeScanPartialMasked mask startKey 0 info
                 |> ret
                 >>= fun scan ->
                     match SstScan.next scan with
@@ -409,8 +394,8 @@ module internal StorageEngine =
     /// 入力はファイル全体を読まず、ブロック単位で読む（部分読みリーダー）。
     let private compactOnce (engine: StorageEngine) =
         let scanOf f =
-            openPartialSst f engine
-            >>= fun partial -> ret (Sstable.rangeScanPartialRaw [||] 0 partial)
+            readInfoIn f engine
+            >>= fun info -> ret (Sstable.rangeScanPartialRaw [||] 0 info)
 
         let buildCompacted version manifestNumber result =
             let nextNum =
@@ -579,10 +564,32 @@ module internal StorageEngine =
                 Mem = mem
             }
 
+        /// MANIFEST から復元したファイルの読み取りメタデータを 1回だけ構築する。
+        /// ここで解析した結果は不変の Version に載り、読み取りのたびに開き直さない。
+        let hydrateVersion (version: Version) =
+            let hydrate (f: FileMetaData) =
+                match f.ReadInfo with
+                | Some _ -> ret f
+                | None ->
+                    Sstable.openPartial (FileMetaData.path dir f.FileNumber)
+                    |> Result.map (fun info -> { f with ReadInfo = Some info })
+
+            let hydrateLevel (files: FileMetaData array) =
+                files |> Array.map hydrate |> all |> Result.map List.toArray
+
+            version.Files
+            |> Array.map hydrateLevel
+            |> all
+            |> Result.map (fun levels ->
+                { version with
+                    Files = List.toArray levels
+                })
+
         result {
             let! version, manifestNumber = Manifest.openOrCreate dir
             let! version', manifestNumber' = dropMissingFiles dir manifestNumber version
             do! quarantineOrphans dir version'
+            let! version' = hydrateVersion version'
             let! walState = openOrCreateWal dir version'
 
             let! replayed =

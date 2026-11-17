@@ -27,7 +27,7 @@ let private fixFooterChecksum (bytes: byte array) =
         bytes.[footerStart + Sstable.FooterSize - 4 + i] <- byte (checksum >>> (8 * i) &&& 0xFFu)
 
 /// 先頭から全エントリを配列で返す（全件必要ならこちら）。
-let private readEntries (partial: SstPartial) =
+let private readEntries (partial: SstReadInfo) =
     Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray
 
 [<Fact>]
