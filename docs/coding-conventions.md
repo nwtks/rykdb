@@ -220,7 +220,9 @@ JIT は `tail.` を尊重する。
   - 式の走査・組み立ては**評価機 `Expr.rewrite`（`Ast.fs`）を共用**する。
     葉の書き換え関数（`rewriteLeaf`）だけを受け取り、
     非葉ノードは `RewriteFrame`（`Parent` / `Done` / `Rest`）に積んで、
-    上がってきた子を内部のローカル関数 `plugChildren`（`Expr.children` の逆変換）で組み直す。
+    上がってきた子を `plugChildren`（`Expr.children` の逆変換）で組み直す。
+    子の列挙と組み直しは `Expr.mapChildrenState` の 1つの match に集約し、
+    `children` / `plugChildren` はその導出にする（ノード追加は 1箇所）。
     `rewrite` 内のローカル関数 `loop` の自己再帰だけなので、式の深さに依存せずスタックは一定。
     使うのは束縛の `Binder.qualify` と、集約後の読み替え（`Ops` の内部 `substituteAggs`）
     （`AggCall` のように子を持つノードを丸ごと定数へ置き換えるのも `rewriteLeaf` で表現できる）。

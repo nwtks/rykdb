@@ -95,13 +95,13 @@ type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
                 releaseTo Exhausted
                 ret None
             | OpStep.OpRow(row, nxt) ->
-                match SqlValue.ensureLoaded row with
+                match LoadedRow.create (SqlValue.copyRow row) with
                 | Error e ->
                     releaseTo Closed
                     err e
                 | Ok loaded ->
                     state <- Reading nxt
-                    ret (Some(SqlValue.copyRow loaded))
+                    ret (Some loaded)
 
     override _.Finalize() =
         try
@@ -209,12 +209,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
 
         match selects with
         | [ s ] -> s
-        | _ ->
-            {
-                RowsAffected = results |> List.sumBy _.RowsAffected
-                Columns = [||]
-                Rows = [||]
-            }
+        | _ -> StatementResult.Affected(results |> List.sumBy _.RowsAffected)
 
     /// 排他経路。
     /// 文を 1つずつ host の writeGate の下で実行し、成功するたびに接続ローカルの状態を更新する。

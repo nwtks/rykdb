@@ -13,6 +13,86 @@ let entry (e: Entry option) =
     | Some v -> v
     | None -> failwith "エントリが見つかりません"
 
+/// Option が Some でなければテストを落とす。
+/// `None` のまま `.Value` を呼ぶと NullReferenceException になり、
+/// どのテストがどの理由で落ちたか分からなくなるのを避ける。
+let expectSome (label: string) (o: 'T option) =
+    match o with
+    | Some v -> v
+    | None -> failwithf "%s: None です" label
+
+/// Version の不変条件（レベル構成・番号の一意性・範囲の並び）を検査する。
+/// VersionSetTests と BackgroundCompactionTests（並行ストレス）で共有する。
+let validateVersion (v: Version) =
+    let fail msg =
+        err (DbError.internalError ("Version: " + msg))
+
+    let checkLevel () level =
+        let files = v.Files.[level]
+
+        let checkTag =
+            if files |> Array.forall (fun f -> f.Level = level) then
+                ret ()
+            else
+                fail "ファイルの Level と格納位置が不一致"
+
+        let checkOrder =
+            seq { 1 .. files.Length - 1 }
+            |> foldOk
+                (fun () i ->
+                    (if Bytes.compare files.[i - 1].Smallest files.[i].Smallest <= 0 then
+                         ret ()
+                     else
+                         fail "ファイルが Smallest 昇順に並んでいない")
+                    >>= fun () ->
+                        if level > 0 then
+                            if Bytes.compare files.[i - 1].Largest files.[i].Smallest < 0 then
+                                ret ()
+                            else
+                                fail "L1 以上のファイル範囲が重複"
+                        else
+                            ret ())
+                ()
+
+        checkTag >>= fun () -> checkOrder
+
+    result {
+        do!
+            if v.Files.Length = Levels.Count then
+                ret ()
+            else
+                fail "レベルの数が不正"
+
+        let all = v.Files |> Array.collect id
+        let numbers = all |> Array.map _.FileNumber
+
+        do!
+            if (numbers |> Array.distinct).Length = numbers.Length then
+                ret ()
+            else
+                fail "ファイル番号が重複"
+
+        do!
+            if all |> Array.forall (fun f -> f.FileNumber < v.NextFileNumber) then
+                ret ()
+            else
+                fail "NextFileNumber が巻き戻っている"
+
+        do!
+            if all |> Array.forall (fun f -> f.Level >= 0 && f.Level <= Levels.Max) then
+                ret ()
+            else
+                fail "レベルが範囲外"
+
+        do!
+            if all |> Array.forall (fun f -> Bytes.compare f.Smallest f.Largest <= 0) then
+                ret ()
+            else
+                fail "Smallest が Largest より大きい"
+
+        return! seq { 0 .. Levels.Max } |> foldOk checkLevel ()
+    }
+
 /// Result が Ok でなければテストを落とす。Err なら DbError を表示する。
 let ok (r: Result<'T, DbError>) : 'T =
     match r with
@@ -464,8 +544,8 @@ let compareValues (a: SqlValue) (b: SqlValue) =
 
 /// テスト用の全順序。型順位 → 同一型内は SQL 比較。
 let compareForSort (a: SqlValue) (b: SqlValue) =
-    let ra = a |> SqlValue.dataType |> DataType.rank
-    let rb = b |> SqlValue.dataType |> DataType.rank
+    let ra = a |> SqlValue.dataType |> ok |> DataType.rank
+    let rb = b |> SqlValue.dataType |> ok |> DataType.rank
 
     if ra <> rb then
         compare ra rb
@@ -490,7 +570,10 @@ let compareKeyBytes (a: byte[]) (b: byte[]) =
 /// 比較結果を見える形にする。型の情報も含めることで描画の衝突を避ける。
 let render (vs: SqlValue[]) =
     vs
-    |> Array.map (fun v -> (v |> SqlValue.dataType |> DataType.toSqlName) + ":" + SqlLiteral.toSqlLiteral v)
+    |> Array.map (fun v ->
+        (v |> SqlValue.dataType |> ok |> DataType.toSqlName)
+        + ":"
+        + SqlLiteral.toSqlLiteral v)
 
 // KeyBuilder の戻り値はそのままバイト列キー（テストでは Ok 前提）
 let keyOf (v: SqlValue) = KeyBuilder.ofValues [ v ] |> ok

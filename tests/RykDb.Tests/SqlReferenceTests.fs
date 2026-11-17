@@ -2007,9 +2007,9 @@ let ``SqlReference: 型の別綴りはすべて受理される`` () =
                 "INSERT INTO ty (id, j, g, h) VALUES (1, '2024-01-15', '2024-01-15T10:30:00Z', '0f8fad5b-d9cb-469f-a165-70867728950e')"
 
         let _, rows = ok (execSql db2 "SELECT j, g, h FROM ty WHERE id = 1")
-        Assert.Equal<DataType>(DataType.Date, SqlValue.dataType rows.Rows.[0].[0])
-        Assert.Equal<DataType>(DataType.Timestamp, SqlValue.dataType rows.Rows.[0].[1])
-        Assert.Equal<DataType>(DataType.Uuid, SqlValue.dataType rows.Rows.[0].[2]))
+        Assert.Equal<DataType>(DataType.Date, ok (SqlValue.dataType rows.Rows.[0].[0]))
+        Assert.Equal<DataType>(DataType.Timestamp, ok (SqlValue.dataType rows.Rows.[0].[1]))
+        Assert.Equal<DataType>(DataType.Uuid, ok (SqlValue.dataType rows.Rows.[0].[2])))
 
 [<Fact>]
 let ``SqlReference: VARCHAR(1) は値を切り詰めない`` () =

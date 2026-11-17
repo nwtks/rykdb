@@ -18,7 +18,7 @@ type RowReader =
     /// 結果の列名。
     member Columns: string array
     /// 次の 1行。終端は `Ok None`。
-    member TryRead: unit -> Result<SqlValue array option, DbError>
+    member TryRead: unit -> Result<LoadedRow option, DbError>
     interface System.IDisposable
 
 /// 1接続のセッション。

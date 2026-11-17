@@ -347,8 +347,10 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 組み立ては **`Expr.rewrite`**（`Ast.fs`）が担う。
 葉の書き換え関数（`rewriteLeaf`）を受け取り、
-内部のローカル関数 `plugChildren`（`children` の逆変換）で子を 1つずつ加工した式に戻すので、
+内部の `plugChildren`（`children` の逆変換）で子を 1つずつ加工した式に戻すので、
 深い式でもスタックを食わない。
+子の**列挙と組み直しは `Expr.mapChildrenState` の 1つの match** に集約し、
+`children` / `plugChildren` はそこから導出する（ノード追加時の更新は 1箇所）。
 `Expr.rewrite` は束縛（`Binder.qualify`）と、
 集約後の読み替え（`Ops` の内部 `substituteAggs`）が共用している。
 結果を返す書き換えは `Expr.rewriteWith`（失敗する葉の書き換え）を使う。
@@ -918,7 +920,7 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
   不要列は型タグと長さを見て読み飛ばす。
 - 不要列には `SqlValue.Unloaded` を置く。
   これは実際の NULL ではない。
-  `compareValuesV` と符号化（`OrderPreserving.writeValue` / `ValueCodec.writeValue(s)`）は
+  `compareValuesV`・`SqlValue.dataType`・符号化（`OrderPreserving.writeValue` / `ValueCodec.writeValue(s)`）は
   `InternalError` を返す。
 - 空マスクの行を `[||]` にせず、スキーマ幅で埋める
   （`ORDER BY 1` などが行の幅を前提にするため）。
@@ -933,7 +935,9 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
 - DML の本体スキャンは `DELETE` が WHERE 参照列 + 主キー + 全索引列のマスク、
   `UPDATE` は未変更列も含む新しい行を書き戻すため全列。
 - 最終結果の境界（`Engine.runSelect`）と `RowReader.TryRead` は
-  `SqlValue.ensureLoaded` で `Unloaded` の漏洩を `InternalError` にする。
+  復号済みの行を `LoadedRow`（ケース非公開・構築は `LoadedRow.create`）で包む。
+  `StatementResult` は非公開コンストラクタで、行付きの構築は `LoadedRow` だけを受ける。
+  `Unloaded` の漏洩は型で塞がれ、検査は `LoadedRow.create` の 1箇所だけ。
 - `Ops.project` は必要な出力項目だけを評価するのではなく **すべての出力式** を評価する。
   そのため Project は使わない項目の参照列も要求する（Derived の内側も同じ）。
 

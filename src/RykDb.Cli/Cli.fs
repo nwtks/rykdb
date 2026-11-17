@@ -92,6 +92,7 @@ let private writeReader (out: TextWriter) (reader: RowReader) =
         | Ok None -> Ok()
         | Ok(Some row) ->
             row
+            |> LoadedRow.toArray
             |> Array.map SqlLiteral.toSqlLiteral
             |> String.concat ", "
             |> fun text -> out.WriteLine("  " + text)

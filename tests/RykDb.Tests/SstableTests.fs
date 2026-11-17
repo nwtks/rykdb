@@ -44,8 +44,8 @@ let ``SSTable: 構築と全件走査の往復`` () =
         Assert.Equal(entries.[i].SeqNo, all.[i].SeqNo)
 
         Assert.Equal<string>(
-            SqlLiteral.toSqlLiteral entries.[i].Value.Value.[0],
-            SqlLiteral.toSqlLiteral all.[i].Value.Value.[0]
+            (expectSome "値" entries.[i].Value).[0] |> SqlLiteral.toSqlLiteral,
+            (expectSome "値" all.[i].Value).[0] |> SqlLiteral.toSqlLiteral
         )
 
 [<Fact>]
@@ -84,7 +84,7 @@ let ``SSTable: 列マスクで必要な列だけ復号する`` () =
         |> SstScan.toArray
         |> ok
 
-    let values = masked.[0].Value.Value
+    let values = expectSome "値" masked.[0].Value
     Assert.Equal<SqlValue>(SqlValue.Int 10L, values.[0])
     Assert.Equal<SqlValue>(SqlValue.Unloaded, values.[1])
     Assert.Equal<SqlValue>(SqlValue.Int 30L, values.[2])
@@ -101,7 +101,7 @@ let ``SSTable: lookupMasked は必要な列だけ復号する`` () =
 
     let found = ok (Sstable.lookupMasked [| true; false; true |] (intKey 1) None reader)
     Assert.True found.IsSome
-    let values = found.Value.Value.Value
+    let values = (expectSome "SstEntry" found).Value |> expectSome "値"
     Assert.Equal<SqlValue>(SqlValue.Int 10L, values.[0])
     Assert.Equal<SqlValue>(SqlValue.Unloaded, values.[1])
     Assert.Equal<SqlValue>(SqlValue.Int 30L, values.[2])
@@ -163,7 +163,7 @@ let ``SSTable: 全 10型の値を往復できる`` () =
     let all = ok (readEntries reader) |> Seq.toArray
 
     for i in 0 .. values.Length - 1 do
-        let got = all.[i].Value.Value
+        let got = expectSome "値" all.[i].Value
         Assert.Equal(values.[i].Length, got.Length)
 
         for j in 0 .. values.[i].Length - 1 do

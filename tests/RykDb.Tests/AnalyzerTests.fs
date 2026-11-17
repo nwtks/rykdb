@@ -508,7 +508,7 @@ let ``Analyzer.chooseScanMethod: LIKE 'prefix%' は索引の範囲走査にす�
             Assert.Equal<int>(1, lower.Length)
             Assert.Equal<string>("ab", asText lower.[0])
             Assert.True upper.IsSome
-            Assert.Equal<string>("ac", asText upper.Value.[0])
+            Assert.Equal<string>("ac", asText (expectSome "upper" upper).[0])
         | m -> failActual "IndexRangeScan ではない" m)
 
 [<Fact>]

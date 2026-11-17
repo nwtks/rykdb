@@ -110,4 +110,4 @@ let ``Predicate.joinConjuncts: split した conjunct を AND で戻せる`` () =
 
     Assert.True(rejoined |> Option.isSome)
     // 分割 → 再結合 で conjunct が 2 個のまま保たれる
-    Assert.Equal<int>(2, Predicate.splitConjuncts rejoined.Value |> List.length)
+    Assert.Equal<int>(2, Predicate.splitConjuncts (expectSome "rejoined" rejoined) |> List.length)

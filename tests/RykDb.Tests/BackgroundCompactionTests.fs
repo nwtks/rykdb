@@ -54,7 +54,7 @@ let ``background compaction: flush 後に L0 が background で compaction さ�
         let store = openBackground dir 1 None
 
         try
-            let host = store.Host |> Option.get
+            let host = expectSome "store.Host" store.Host
             let mutable current = store
 
             for i in 1..4 do
@@ -114,7 +114,7 @@ let ``background compaction: 読み取り中のファイルは削除されず、
         let mutable current = store
 
         try
-            let host = store.Host |> Option.get
+            let host = expectSome "store.Host" store.Host
 
             for i in 1..4 do
                 current <- writeOne current i
@@ -158,7 +158,7 @@ let ``background compaction: install 後に再オープンしても行が残る`
             for i in 1..4 do
                 current <- writeOne current i
 
-            waitIdle (store.Host |> Option.get)
+            waitIdle (expectSome "store.Host" store.Host)
             RowStore.close current |> ok |> ignore
 
             let reopened = ok (RowStore.openStore dir)
@@ -207,7 +207,7 @@ let ``background compaction: close は進行中の compaction を停止して再
 let ``background compaction: Pending が残った状態でも close が完了する`` () =
     withDir "bg-close-pending" (fun dir ->
         let store = openBackground dir 1 None
-        let host = store.Host |> Option.get
+        let host = expectSome "store.Host" store.Host
         waitIdle host
 
         // worker が signal を消費した直後に Pending だけが残った状態を再現する。
@@ -254,7 +254,7 @@ let ``background compaction: 開始後に古い snapshot が現れたら境界�
         let mutable current = store
 
         try
-            let host = store.Host |> Option.get
+            let host = expectSome "store.Host" store.Host
 
             // GC 境界 6 で書き込む（ActiveSnapshot = 6）。
             for i in 1..4 do
@@ -312,7 +312,7 @@ let ``background compaction: Close しなくても install 済みの行は再オ
         let mutable current = store
 
         try
-            let host = store.Host |> Option.get
+            let host = expectSome "store.Host" store.Host
 
             for i in 1..10 do
                 current <- writeOne current i
@@ -342,7 +342,7 @@ let ``background compaction: flush と install が競合してもファイル番
         let mutable current = store
 
         try
-            let host = store.Host |> Option.get
+            let host = expectSome "store.Host" store.Host
 
             for i in 1..60 do
                 current <- writeOne current i
@@ -401,9 +401,232 @@ let ``background compaction: DB を開いた時点で未 compaction の L0 を�
             |> ok
 
         try
-            let host = reopened.Host |> Option.get
+            let host = expectSome "reopened.Host" reopened.Host
             waitIdle host
             Assert.True((Version.filesAt 0 host.Current.Version).Length < 4)
             Assert.True((Version.filesAt 1 host.Current.Version).Length > 0)
         finally
             RowStore.close reopened |> ignore)
+
+[<Fact>]
+let ``background compaction: 書き込み・読み取り・snapshot pin を並行に回しても壊れない`` () =
+    withDir "bg-stress" (fun dir ->
+        let store = openBackground dir 1 None
+        let writes = 120
+        let mutable current = store
+
+        try
+            let host = expectSome "store.Host" store.Host
+            use stop = new CancellationTokenSource()
+
+            // pin した時点の Version だけを読む。
+            // 読み取り中に compaction がファイルを消さないことは refcount が担保する。
+            let readLoop (seed: int) =
+                let rnd = System.Random seed
+
+                let rec loop () =
+                    if not stop.IsCancellationRequested then
+                        let state, lease = host.AcquireCall()
+
+                        try
+                            let view =
+                                { store with
+                                    Engine = store.Engine.WithHostState state
+                                }
+
+                            let key = rnd.Next(1, writes + 1)
+
+                            match RowStore.getAtMasked "t" (intKey key) None [| true |] view |> ok with
+                            // まだ書かれていないキーは None でよい（書き込みと競合する）
+                            | Some row -> Assert.Equal<SqlValue>(SqlValue.Int(int64 key), row.[0])
+                            | None -> ()
+
+                            if rnd.Next 4 = 0 then
+                                Thread.Sleep(rnd.Next(1, 3))
+                        finally
+                            lease.Dispose()
+
+                        loop ()
+
+                loop ()
+
+            // lease を長めに握り、retire / sweep を揺らす。
+            let pinLoop (seed: int) =
+                let rnd = System.Random seed
+
+                let rec loop () =
+                    if not stop.IsCancellationRequested then
+                        let _, lease = host.AcquireCall()
+                        Thread.Sleep(rnd.Next(1, 4))
+                        lease.Dispose()
+                        loop ()
+
+                loop ()
+
+            let readers =
+                [| for i in 1..3 -> System.Threading.Tasks.Task.Run(fun () -> readLoop i) |]
+
+            let pins =
+                [|
+                    for i in 1..2 -> System.Threading.Tasks.Task.Run(fun () -> pinLoop (100 + i))
+                |]
+
+            try
+                for i in 1..writes do
+                    current <- writeOne current i
+
+                    if i % 20 = 0 then
+                        Thread.Sleep 2
+            finally
+                stop.Cancel()
+
+            Assert.True(System.Threading.Tasks.Task.WaitAll(Array.append readers pins, 15000), "並行タスクが停止しません")
+
+            waitIdle host
+
+            let state = host.Current
+            ok (validateVersion state.Version) |> ignore
+
+            match state.LastCompactionError with
+            | Some e -> Assert.Fail(sprintf "background compaction が失敗しました: %s" (DbError.toDisplayString e))
+            | None -> ()
+
+            for file in Version.allFiles state.Version do
+                Assert.True(
+                    System.IO.File.Exists(FileMetaData.path dir file.FileNumber),
+                    sprintf "Version が参照するファイルがありません: %d" file.FileNumber
+                )
+
+            // 最後の状態からは全キーが読める（欠落・重複・古い値が無い）。
+            let refreshed = refresh current
+
+            for i in 1..writes do
+                match RowStore.getAtMasked "t" (intKey i) None [| true |] refreshed |> ok with
+                | Some row -> Assert.Equal<SqlValue>(SqlValue.Int(int64 i), row.[0])
+                | None -> Assert.Fail(sprintf "キー %d が読めません" i)
+        finally
+            RowStore.close current |> ignore)
+
+[<Fact>]
+let ``background compaction: ランダムな操作列でも Version と refcount の不変条件を保つ`` () =
+    withDir "bg-model" (fun dir ->
+        let store = openBackground dir 1 None
+        let operations = 200
+        let mutable current = store
+
+        try
+            let host = expectSome "store.Host" store.Host
+            let rnd = System.Random 20261117
+            let mutable written = 0
+            let mutable lastGeneration = -1L
+            let mutable lastFileNumber = 0L
+            let leases = ResizeArray<int * System.IDisposable * RowStore>()
+
+            let checkVersion (state: HostState) =
+                ok (validateVersion state.Version) |> ignore
+
+                Assert.True(
+                    state.Generation >= lastGeneration,
+                    sprintf "Generation が戻りました: %d -> %d" lastGeneration state.Generation
+                )
+
+                lastGeneration <- state.Generation
+
+                Assert.True(
+                    state.Version.NextFileNumber >= lastFileNumber,
+                    sprintf "NextFileNumber が戻りました: %d -> %d" lastFileNumber state.Version.NextFileNumber
+                )
+
+                lastFileNumber <- state.Version.NextFileNumber
+
+                match state.LastCompactionError with
+                | Some e -> Assert.Fail(sprintf "compaction が失敗: %s" (DbError.toDisplayString e))
+                | None -> ()
+
+            // 現在の Version を pin してから検査する（検査中に retire されない）。
+            let pinnedCheck () =
+                let state, lease = host.AcquireCall()
+                use _ = lease
+                checkVersion state
+
+                for file in Version.allFiles state.Version do
+                    Assert.True(
+                        System.IO.File.Exists(FileMetaData.path dir file.FileNumber),
+                        sprintf "Version が参照するファイルがありません: %d" file.FileNumber
+                    )
+
+            let expireLeases () =
+                let next = ResizeArray<int * System.IDisposable * RowStore>()
+
+                for remaining, lease, view in leases do
+                    if remaining <= 1 then
+                        lease.Dispose()
+                    else
+                        next.Add((remaining - 1, lease, view))
+
+                leases.Clear()
+                leases.AddRange next
+
+            let readAt (requireHit: bool) (view: RowStore) =
+                if written > 0 then
+                    let key = rnd.Next(1, written + 1)
+
+                    match RowStore.getAtMasked "t" (intKey key) None [| true |] view |> ok with
+                    | Some row -> Assert.Equal<SqlValue>(SqlValue.Int(int64 key), row.[0])
+                    | None -> Assert.False(requireHit, sprintf "キー %d が pin 済みの state から読めません" key)
+
+            try
+                for step in 1..operations do
+                    expireLeases ()
+
+                    match rnd.Next 100 with
+                    | n when n < 55 ->
+                        written <- written + 1
+                        current <- writeOne current written
+                    | n when n < 80 ->
+                        // 保持中の lease があれば、その古い state から読む（None もあり得る）。
+                        if leases.Count > 0 then
+                            let _, _, view = leases.[rnd.Next(leases.Count)]
+                            readAt false view
+                        else
+                            let state, lease = host.AcquireCall()
+                            use _ = lease
+
+                            readAt
+                                true
+                                { store with
+                                    Engine = store.Engine.WithHostState state
+                                }
+                    | n when n < 92 ->
+                        // lease を数操作ぶん保持して retire / sweep を揺らす。
+                        let state, lease = host.AcquireCall()
+
+                        leases.Add(
+                            (rnd.Next(1, 6),
+                             lease,
+                             { store with
+                                 Engine = store.Engine.WithHostState state
+                             })
+                        )
+                    | _ -> Thread.Sleep(rnd.Next(0, 2))
+
+                    if step % 25 = 0 then
+                        pinnedCheck ()
+            finally
+                for _, lease, _ in leases do
+                    lease.Dispose()
+
+                leases.Clear()
+
+            waitIdle host
+            pinnedCheck ()
+
+            // 最終状態からは全キーが読める（欠落・torn write が無い）。
+            let refreshed = refresh current
+
+            for i in 1..written do
+                match RowStore.getAtMasked "t" (intKey i) None [| true |] refreshed |> ok with
+                | Some row -> Assert.Equal<SqlValue>(SqlValue.Int(int64 i), row.[0])
+                | None -> Assert.Fail(sprintf "キー %d が読めません" i)
+        finally
+            RowStore.close current |> ignore)

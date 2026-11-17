@@ -101,7 +101,7 @@ let ``Memtable: 挿入したキー配列を後から書き換えても木は保�
     key.[0] <- 0xFFuy
 
     match Memtable.getVisible (intKey 5) None mem with
-    | Some e -> Assert.Equal<int64>(5L, asInt e.Value.Value.[0])
+    | Some e -> Assert.Equal<int64>(5L, asInt (expectSome "行" e.Value).[0])
     | None -> Assert.Fail "挿入したキーが引けなくなった（キー配列の変更で木が壊れた）"
 
 [<Fact>]
@@ -111,7 +111,7 @@ let ``Memtable: 挿入した行配列を後から書き換えても値は変わ�
     row.[0] <- SqlValue.Int 999L
 
     match Memtable.getVisible (intKey 5) None mem with
-    | Some e -> Assert.Equal<int64>(5L, asInt e.Value.Value.[0])
+    | Some e -> Assert.Equal<int64>(5L, asInt (expectSome "行" e.Value).[0])
     | None -> Assert.Fail "挿入したキーが引けない"
 
     // 空への apply は何も変えない
@@ -131,16 +131,20 @@ let ``Memtable: apply したエントリを getVisible で引ける`` () =
             Memtable.Empty
 
     Assert.Equal(3, countOf mem)
-    Assert.Equal<SqlValue array>([| SqlValue.Int 10L |], (entry (Memtable.getVisible (intKey 1) None mem)).Value.Value)
+
+    Assert.Equal<SqlValue array>(
+        [| SqlValue.Int 10L |],
+        expectSome "行" (entry (Memtable.getVisible (intKey 1) None mem)).Value
+    )
 
     Assert.Equal<SqlValue array>(
         [| SqlValue.Text "hello" |],
-        (entry (Memtable.getVisible (intKey 2) None mem)).Value.Value
+        expectSome "行" (entry (Memtable.getVisible (intKey 2) None mem)).Value
     )
 
     Assert.Equal<SqlValue array>(
         [| SqlValue.Blob [| 1uy; 2uy; 3uy |] |],
-        (entry (Memtable.getVisible (intKey 3) None mem)).Value.Value
+        expectSome "行" (entry (Memtable.getVisible (intKey 3) None mem)).Value
     )
 
     Assert.True((Memtable.getVisible (intKey 99) None mem).IsNone)
@@ -158,10 +162,13 @@ let ``Memtable: apply しても元の memtable は変わらない`` () =
     // 変更していないキーの内容も変わらない
     Assert.Equal<SqlValue array>(
         [| SqlValue.Int 1L |],
-        (entry (Memtable.getVisible (intKey 1) None before)).Value.Value
+        expectSome "行" (entry (Memtable.getVisible (intKey 1) None before)).Value
     )
 
-    Assert.Equal<SqlValue array>([| SqlValue.Int 1L |], (entry (Memtable.getVisible (intKey 1) None after)).Value.Value)
+    Assert.Equal<SqlValue array>(
+        [| SqlValue.Int 1L |],
+        expectSome "行" (entry (Memtable.getVisible (intKey 1) None after)).Value
+    )
 
 [<Fact>]
 let ``Memtable: 同一キーは SeqNo が最大の版を返す`` () =
@@ -209,7 +216,7 @@ let ``Memtable: 全キーを個別に引ける（探索方向の誤りを検出�
 
     for i in 0 .. n - 1 do
         let e = entry (Memtable.getVisible (intKey i) None mem)
-        Assert.Equal<int64>(int64 (i * 3), e.Value.Value.[0] |> asInt)
+        Assert.Equal<int64>(int64 (i * 3), (expectSome "行" e.Value).[0] |> asInt)
 
     // 範囲外のキーは None（境界の直前・直後）
     Assert.True((Memtable.getVisible (intKey -1) None mem).IsNone)

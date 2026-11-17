@@ -5,28 +5,48 @@
 namespace RykDb.Core
 
 /// 文の実行結果。
-type StatementResult =
-    {
-        RowsAffected: int
-        Columns: string array
-        Rows: SqlValue array array
-    }
+/// <remarks>
+/// コンストラクタは非公開。構築は `Empty` / `Create` / `Affected` / `OfRows` だけ。
+/// `Create` は復号済みの `LoadedRow` だけを受け取るので、
+/// `SqlValue.Unloaded` を含む結果は型として作れない。
+/// </remarks>
+[<Sealed>]
+type StatementResult private (rowsAffected: int, columns: string array, rows: SqlValue array array) =
+    static member Empty = StatementResult(0, [||], [||])
 
-    static member Empty =
-        {
-            RowsAffected = 0
-            Columns = [||]
-            Rows = [||]
-        }
+    /// 復号済みの行から作る（結果行の正規の構築経路）。
+    static member internal Create(rowsAffected: int, columns: string array, rows: LoadedRow array) =
+        StatementResult(rowsAffected, columns, Array.map LoadedRow.toArray rows)
 
-    member this.ToDisplayLines() =
-        if Array.isEmpty this.Columns then
-            [ sprintf "(%d rows)" this.RowsAffected ]
+    /// 行を持たない結果（DML / DDL / バッチの集約）。
+    static member internal Affected(rowsAffected: int) =
+        StatementResult(rowsAffected, [||], [||])
+
+    /// 生の行から作る（テスト・診断用）。復号済みかを検査する。
+    static member internal OfRows(rowsAffected: int, columns: string array, rows: SqlValue array array) =
+        rows
+        |> Array.map LoadedRow.create
+        |> all
+        |> Result.map (fun loaded ->
+            StatementResult(rowsAffected, columns, loaded |> List.toArray |> Array.map LoadedRow.toArray))
+
+    /// 更新・削除などの対象件数（SELECT では行数）。
+    member _.RowsAffected = rowsAffected
+
+    /// 列名（行を持たない結果では空）。
+    member _.Columns = columns
+
+    /// 復号済みの行（`LoadedRow` で検証済み）。
+    member _.Rows = rows
+
+    member _.ToDisplayLines() =
+        if Array.isEmpty columns then
+            [ sprintf "(%d rows)" rowsAffected ]
         else
-            let header = System.String.Join(" | ", this.Columns)
+            let header = System.String.Join(" | ", columns)
 
             let body =
-                this.Rows
+                rows
                 |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ", " >> fun s -> "  " + s)
 
             header :: System.String('-', header.Length) :: Array.toList body
@@ -745,16 +765,11 @@ module internal Engine =
                 Plan.runSelect ctx stmt
                 >>= fun (columns, op) ->
                     Op.toArrayLimited limits.MaxRows limits.MaxBytes op
-                    >>= (Array.map SqlValue.ensureLoaded
+                    >>= (Array.map (SqlValue.copyRow >> LoadedRow.create)
                          >> Array.toList
                          >> all
                          >> Result.map (fun checkedRows ->
-                             state,
-                             {
-                                 RowsAffected = checkedRows.Length
-                                 Columns = columns
-                                 Rows = checkedRows |> List.toArray |> Array.map SqlValue.copyRow
-                             }))
+                             state, StatementResult.Create(checkedRows.Length, columns, checkedRows |> List.toArray)))
             finally
                 ctx.Scope.DisposeAll()
 
@@ -765,15 +780,12 @@ module internal Engine =
         >>= fun ctx ->
             try
                 Plan.explainSelect ctx stmt
-                |> Result.map (fun plan ->
-                    let lines = Optimizer.explain plan.Context plan.Tree plan.Input
-
-                    state,
-                    {
-                        RowsAffected = lines.Length
-                        Columns = [| "plan" |]
-                        Rows = lines |> List.map (fun line -> [| SqlValue.Text line |]) |> Array.ofList
-                    })
+                >>= fun plan ->
+                    Optimizer.explain plan.Context plan.Tree plan.Input
+                    |> List.map (fun line -> LoadedRow.create [| SqlValue.Text line |])
+                    |> all
+                    |> Result.map (fun loaded ->
+                        state, StatementResult.Create(loaded.Length, [| "plan" |], List.toArray loaded))
             finally
                 ctx.Scope.DisposeAll()
 
@@ -899,12 +911,7 @@ module internal Engine =
                 result {
                     let! outcome = run ctx
                     let txn2, n = outcome
-
-                    return
-                        { state with Pending = Some txn2 },
-                        { StatementResult.Empty with
-                            RowsAffected = n
-                        }
+                    return { state with Pending = Some txn2 }, StatementResult.Affected n
                 }
             finally
                 ctx.Scope.DisposeAll()

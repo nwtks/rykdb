@@ -26,7 +26,10 @@ let ``テストデータ: 乱数生成器が実際に多様な値を返す`` () 
 
     let distinct =
         samples
-        |> Array.map (fun v -> (v |> SqlValue.dataType |> DataType.toSqlName) + ":" + SqlLiteral.toSqlLiteral v)
+        |> Array.map (fun v ->
+            (v |> SqlValue.dataType |> ok |> DataType.toSqlName)
+            + ":"
+            + SqlLiteral.toSqlLiteral v)
         |> Set.ofArray
 
     Assert.True(distinct.Count > 20, sprintf "乱数データが退行しています（相異なる値が %d種類しかない）" distinct.Count)
@@ -34,7 +37,7 @@ let ``テストデータ: 乱数生成器が実際に多様な値を返す`` () 
     // 10種すべての型が生成されていること（偏った生成器を検出する）
     let typesCovered =
         samples
-        |> Array.map (fun v -> v |> SqlValue.dataType |> DataType.toSqlName)
+        |> Array.map (fun v -> v |> SqlValue.dataType |> ok |> DataType.toSqlName)
         |> Set.ofArray
 
     for t in
@@ -84,7 +87,7 @@ let ``テスト: 各テストモジュールが 1つ以上の Fact を持つ`` (
             | _ -> None)
         |> Array.sort
 
-    Assert.True(modules.Length >= 46, sprintf "テストモジュールが %d個しか見つかりません" modules.Length)
+    Assert.True(modules.Length >= 47, sprintf "テストモジュールが %d個しか見つかりません" modules.Length)
 
     for moduleName in modules do
         let count = (namesOf moduleName).Length

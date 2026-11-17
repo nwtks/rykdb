@@ -112,7 +112,7 @@ let private handleClientSession (onLog: string -> unit) (session: Session) (clie
         with _ ->
             false
 
-    let sendResult result =
+    let sendResult (result: StatementResult) =
         if Array.isEmpty result.Columns then
             sprintf "%s %d" OkTag result.RowsAffected |> send
         else
@@ -136,7 +136,11 @@ let private handleClientSession (onLog: string -> unit) (session: Session) (clie
                     match rowReader.TryRead() with
                     | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
                     | Ok None -> send EndTag
-                    | Ok(Some row) -> if send (rowLine row) then loop () else false
+                    | Ok(Some row) ->
+                        if send (rowLine (LoadedRow.toArray row)) then
+                            loop ()
+                        else
+                            false
 
                 loop ()
 

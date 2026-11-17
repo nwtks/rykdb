@@ -19,14 +19,14 @@ F# の型システムでは表現できないため、
 
 ## 担保の種類
 
-| 種類           | 意味                                                  | 例                                                                      |
-| -------------- | ----------------------------------------------------- | ----------------------------------------------------------------------- |
-| 型             | DU / record / newtype / units of measure で表現できる | `SqlValue`、`DataType`、`TruthValue`                                    |
-| コンストラクタ | 生ケースを隠し、スマートコンストラクタだけを使う      | `Op.fsi`（ケース非公開）と `Op.Empty` / `ofRow` / `emit` / `compute`    |
-| `validate`     | テストから呼ぶ `Result` ベースの検査関数              | `VersionSetTests.fs` / `TransactionsTests.fs` 内の private `validate`   |
-| プロパティ     | ランダム入力で性質を検査する                          | `OrderingPropertyTests`                                                 |
-| 構築制限       | `.fsi` でレコード・DU のケースを隠す                  | `Op.fsi` / `Writer.fsi` / `SstScan.fsi` / `Cursor.fsi` / `Memtable.fsi` |
-| 実行時         | 本番経路で `Result` として検出する                    | チェックサム、SSTable のキー順検証                                      |
+| 種類           | 意味                                                  | 例                                                                               |
+| -------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------- |
+| 型             | DU / record / newtype / units of measure で表現できる | `SqlValue`、`DataType`、`TruthValue`                                             |
+| コンストラクタ | 生ケースを隠し、スマートコンストラクタだけを使う      | `Op.fsi`（ケース非公開）と `Op.Empty` / `ofRow` / `emit` / `compute`             |
+| `validate`     | テストから呼ぶ `Result` ベースの検査関数              | `VersionSetTests.fs` / `TransactionsTests.fs` 内の private `validate`            |
+| プロパティ     | ランダム入力で性質を検査する                          | `SerializationTests`（順序保持） / `BackgroundCompactionTests`（ランダム操作列） |
+| 構築制限       | `.fsi` でレコード・DU のケースを隠す                  | `Op.fsi` / `Writer.fsi` / `SstScan.fsi` / `Cursor.fsi` / `Memtable.fsi`          |
+| 実行時         | 本番経路で `Result` として検出する                    | チェックサム、SSTable のキー順検証                                               |
 
 ## 一覧
 
@@ -54,6 +54,8 @@ F# の型システムでは表現できないため、
 | INV-20 | `Writer.Chunks` は逆順（先頭が最新の書き込み）                              | `Writer.fsi`（ケース非公開、構築は `Empty` / 各 write 関数に限定）+ 順序プロパティテスト                                                                                              | ✅ 完了 |
 | INV-21 | UNIQUE の予約は commit まで競合検出に残る                                   | `Transaction.reserveUnique` / `writeKeys` / `TransactionManager.commit` + `TransactionsTests` / `SessionTests` の同時実行テスト                                                       | ✅ 完了 |
 | INV-22 | `Session.fs` / `SessionHost.fs` の `mutable` は状態 DU のスロットとカウンタ | `SyncState` / `HostLifecycle` / `LocalSession` / `PoolLifecycle` / `RowReaderState`                                                                                                   | ✅ 完了 |
+| INV-23 | 結果行は `LoadedRow`（`Unloaded` を含まない）                               | `LoadedRow.create` + `StatementResult` の非公開コンストラクタ（`Create` は `LoadedRow` だけを受ける） + `RowReader.TryRead` の戻り値型                                                | ✅ 完了 |
+| INV-24 | `EngineHost` の Version 公開とファイル refcount                             | `EngineHost.publish` / `install` / `AcquireCall` + `BackgroundCompactionTests` の並行・ランダム操作列テスト                                                                           | ✅ 完了 |
 
 ---
 
@@ -288,7 +290,9 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `Session: 同一 Session を複数スレッドで使っても書き込みが消えない`
   - **`Session: BEGIN は writeGate を取るので実行中の書き込みを待ち、SELECT は待たない`**
     （transaction 制御が `writeGate` に入る側を初めて直接検査）
-- ランダムに操作を組み合わせるストレステストは未実施（既知の穴）。
+- Session のロック規約は決定的テストのみ。
+  **ランダム操作列のストレステストは未実施**
+  （`EngineHost` の並行性は INV-24 で実施済み。Session のロックは別の問題）。
 
 ### INV-17 lease
 
@@ -301,12 +305,15 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 
 - 宣言: `Expr.plugChildren (Expr.children e) e` が同じ式を復元し、
   子の個数が合わなければ `InternalError` で返る。
-- 理由: `children`（列挙）と `plugChildren`（組み立て）は別々の match なので、
-  ノードを追加したときに片方だけ更新すると arity がずれる
+- 理由: `children`（列挙）と `plugChildren`（組み立て）が別々の match だと、
+  ノードを追加したときに片方だけ更新して arity がずれる
   （`Case` の ELSE 取りこぼしは実際に発生したバグ）。
 - 担保:
-  - `children` を `internal` に、`plugChildren` を `rewriteWithC` の中から
-    `Expr` モジュールレベルへ引き上げて**隣接させ、直接テスト可能**にした
+  - **子の構造を `Expr.mapChildrenState` の 1 つの match に統合**。
+    `children` は「子を状態へ積む `step`」、`plugChildren` は「未使用の子を渡す `step`」
+    として同じ match から導出するので、ノードを追加したときに直す場所は 1箇所。
+    さらにこの match は網羅検査される（欠けたケースは FS0025 = エラー）。
+  - `children` / `plugChildren` を `internal` にして直接テスト可能にした
     （以前は private / ローカル `let` で外部から検査できなかった）。
   - `AstTests.allNodeKinds`（29 サンプル: 葉 / 1..3 子 / 可変子 / CASE の ELSE 有無 /
     LIKE の ESCAPE 有無 / サブクエリを含む型）で 3点を検査:
@@ -401,6 +408,46 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 - 回帰テスト: `DurabilityTests` のグループコミット 4 本、
   `SessionTests` の並行・Close 系（INV-16 と同じ一覧）、`SessionPool` の接続テスト。
 
+### INV-23 結果行は `LoadedRow`
+
+- 宣言: 公開 API へ返す行は `LoadedRow`（`SqlValue.Unloaded` を含まない）。
+- 理由: `Unloaded` は列マスク復号の内部プレースホルダで、SQL の NULL ではない。
+  比較・型の問い合わせ・符号化は `InternalError` にするが、
+  「結果に漏れない」を規約とテストだけに頼ると、新しい出力経路を足したときに検査を忘れる。
+  F# は union case 単位のアクセシビリティを持たない（FS0572）ため、
+  `SqlValue.Unloaded` 自体は公開のままにし、**出力境界の型**で閉じる。
+- 担保:
+  - `LoadedRow` はケース非公開の struct DU。
+    構築は `LoadedRow.create` だけ（内部で `SqlValue.ensureLoaded` を使う）。
+  - 非公開コンストラクタの `StatementResult`。
+    行付きの構築は `StatementResult.Create`（`LoadedRow array` のみ受理）だけ。
+    生の行を受ける `OfRows` も内部で `LoadedRow.create` を通す。
+  - `RowReader.TryRead` の戻り値は `LoadedRow option`。
+- 回帰テスト: `LoadedRow.create: Unloaded を含む行は InternalError`、
+  `StatementResult.OfRows: Unloaded を含む行は拒否する`、
+  `SqlValue.dataType: Unloaded は InternalError`。
+
+### INV-24 EngineHost の Version 公開とファイル refcount
+
+- 宣言:
+  - `publish` による `Generation` と `Version.NextFileNumber` は単調（戻らない）。
+  - `install` した Version が参照するファイルは存在し、pin されている間は削除されない。
+  - retired のファイルは pin が 0 になってから削除される。
+- 理由: compaction は不変の `StorageEngine` の外側で Version を差し替える。
+  pin を忘れると読み取り中のファイルが消え、採番を戻すと古い Version が公開される。
+- 担保:
+  - 状態は `ConcurrentDictionary` の単一セル + `TryUpdate` の CAS。
+    MANIFEST 追記と install は `installGate` で直列化する。
+  - `AcquireCall` が現在の Version の全ファイルを pin し、`Dispose` で release + sweep する。
+- 回帰テスト（`BackgroundCompactionTests`）:
+  - `background compaction: 書き込み・読み取り・snapshot pin を並行に回しても壊れない`
+    （複数スレッドの同時実行）
+  - `background compaction: ランダムな操作列でも Version と refcount の不変条件を保つ`
+    （固定シードの操作列: Generation / NextFileNumber の単調性、Version の妥当性、
+    pin 中の全ファイル存在、`LastCompactionError = None` を検査）
+- 残る既知の未対応: プロセス断を挿入するランダム操作列は未実施
+  （クラッシュ再開自体は他の `BackgroundCompactionTests` が個別に検証する）。
+
 ---
 
 ## 既知の未対応（次の候補）
@@ -413,6 +460,5 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   所有権は INV-19（`Entry.takeOwnership` / `Transaction.setSlot`）が担保するので、
   チェックを足しても**守るものが無く空振りになる**。
   （接頭辞の付与・剥離は `Keyspace` と同じファイルに置くのが凝集的で、他のファイルへ移すとむしろ悪化する。）
-- `EngineHost` の並行操作（CAS / refcount / retire）をランダムに組み合わせるストレステストは未実施。
 - INV-19 は 2回所持するため、commit 経路（`Transaction.put` → `Memtable.insert`）は行を 2回複製する。
   単純な重複排除には「複製済みを渡す」経路（線形型）が必要で、現状はコストを許容している。

@@ -2543,13 +2543,15 @@ type private Step =
 
 - 空マスク（`COUNT(*)` / `SELECT 1 FROM t`）でも **行の要素数は 0 にしない**。
   スキーマ幅で `Unloaded` を並べる（`ORDER BY 1` のソートキー位置がずれないようにする）。
-- `Unloaded` を比較・ソート・DISTINCT・符号化に渡してはいけない。
-  `compareValuesV` は内部エラー、`KeyBuilder.ofValues` / `ValueCodec.writeValues` /
-  `ValueCodec.writeValuesTo` は `InternalError` を返す（例外は投げない）。
+- `Unloaded` を比較・ソート・DISTINCT・符号化・型の問い合わせに渡してはいけない。
+  `compareValuesV` と `SqlValue.dataType` は `InternalError`、`KeyBuilder.ofValues` / `ValueCodec.writeValues` /
+  `ValueCodec.writeValuesTo` も `InternalError` を返す（例外は投げない）。
 - `Dml.opOfScan` は空の行を `Unloaded` でパディングする。
   `NULL` で埋めない（誤って読んだときに静かに NULL 扱いにならないようにするため）。
 - 最終結果の境界（`Engine.runSelect`）と `RowReader.TryRead` は
-  `SqlValue.ensureLoaded` で `Unloaded` を検査する。
+  `LoadedRow.create`（ケース非公開）で `Unloaded` を検査する。
+  `StatementResult` は非公開コンストラクタで、
+  行付きの構築は `StatementResult.Create`（`LoadedRow array` だけを受ける）に限る。
   ここに来る前に `InternalError` になるのが正しく、出力の符号化エラーまで持ち越してはいけない。
 - ポイント検索は `Sstable.lookupMasked` / `GetAtMasked` / `getByPrimaryKeyWithTxnMask` を使う。
   transaction slot の行にも `SqlValue.maskRow` を適用する。
@@ -2572,6 +2574,9 @@ type private Step =
 - 回帰テスト: `SSTable: 列マスクで必要な列だけ復号する`、
   `SSTable: lookupMasked は必要な列だけ復号する`、
   `SqlValue.ensureLoaded: Unloaded は結果境界でエラー`、
+  `LoadedRow.create: Unloaded を含む行は InternalError`、
+  `StatementResult.OfRows: Unloaded を含む行は拒否する`、
+  `SqlValue.dataType: Unloaded は InternalError`、
   `KeyBuilder.ofValues: Unloaded は InternalError`、
   `ValueCodec.writeValues: Unloaded は InternalError`、
   `ValueCodec.writeValuesTo: Unloaded は InternalError`、

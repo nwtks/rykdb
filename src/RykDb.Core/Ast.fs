@@ -380,9 +380,32 @@ and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
     | Rollback
 
 module internal Expr =
-    /// 直接の子式をリストで返す（走査順は左から右）。
-    /// 再帰は呼び出し側が行う。
-    let internal children =
+    /// 子を左から右へ 1つずつ `step` に渡し、組み直した子で親を作る。
+    /// 状態をスレッドするので、子の列挙（`children`）と子の差し替え（`plugChildren`）の
+    /// **両方をこの 1箇所から導出**できる。
+    /// ノードを追加したときに直すのはこの match だけ。
+    let private mapChildrenState (step: 's -> Expr -> 's * Expr) (state: 's) =
+        let mapList =
+            let rec loop acc state =
+                function
+                | [] -> state, List.rev acc
+                | x :: rest ->
+                    let state, x' = step state x
+                    loop (x' :: acc) state rest
+
+            loop []
+
+        let mapPairs =
+            let rec loop acc state =
+                function
+                | [] -> state, List.rev acc
+                | (w, t) :: rest ->
+                    let state, w' = step state w
+                    let state, t' = step state t
+                    loop ((w', t') :: acc) state rest
+
+            loop []
+
         function
         | Expr.Literal _
         | Expr.Column _
@@ -392,20 +415,64 @@ module internal Expr =
         | Expr.Value _
         | Expr.Subquery _
         | Expr.Exists _
-        | Expr.CorrelatedSubquery _ -> []
-        | Expr.Unary(_, x) -> [ x ]
-        | Expr.Binary(_, a, b) -> [ a; b ]
-        | Expr.IsNull(x, _) -> [ x ]
-        | Expr.IsTruth(x, _, _) -> [ x ]
-        | Expr.Between(x, a, b, _) -> [ x; a; b ]
-        | Expr.InList(x, xs, _) -> x :: xs
-        | Expr.InSubquery(x, _, _) -> [ x ]
-        | Expr.Like(x, p, _, esc) -> x :: p :: Option.toList esc
-        | Expr.Case(branches, elseE) -> (branches |> List.collect (fun (w, t) -> [ w; t ])) @ (elseE |> Option.toList)
-        | Expr.FuncCall(_, args) -> args
-        | Expr.Cast(x, _) -> [ x ]
-        | Expr.Default -> []
-        | Expr.AggCall(_, _, x) -> [ x ]
+        | Expr.CorrelatedSubquery _
+        | Expr.Default as e -> state, e
+        | Expr.Unary(op, x) ->
+            let state, x' = step state x
+            state, Expr.Unary(op, x')
+        | Expr.Binary(op, a, b) ->
+            let state, a' = step state a
+            let state, b' = step state b
+            state, Expr.Binary(op, a', b')
+        | Expr.IsNull(x, neg) ->
+            let state, x' = step state x
+            state, Expr.IsNull(x', neg)
+        | Expr.IsTruth(x, expected, neg) ->
+            let state, x' = step state x
+            state, Expr.IsTruth(x', expected, neg)
+        | Expr.Between(x, lo, hi, neg) ->
+            let state, x' = step state x
+            let state, lo' = step state lo
+            let state, hi' = step state hi
+            state, Expr.Between(x', lo', hi', neg)
+        | Expr.InList(x, xs, neg) ->
+            let state, x' = step state x
+            let state, xs' = mapList state xs
+            state, Expr.InList(x', xs', neg)
+        | Expr.InSubquery(x, sel, neg) ->
+            let state, x' = step state x
+            state, Expr.InSubquery(x', sel, neg)
+        | Expr.Like(x, p, neg, esc) ->
+            let state, x' = step state x
+            let state, p' = step state p
+
+            match esc with
+            | None -> state, Expr.Like(x', p', neg, None)
+            | Some esc ->
+                let state, esc' = step state esc
+                state, Expr.Like(x', p', neg, Some esc')
+        | Expr.Case(branches, elseE) ->
+            let state, branches' = mapPairs state branches
+
+            match elseE with
+            | None -> state, Expr.Case(branches', None)
+            | Some elseExpr ->
+                let state, else' = step state elseExpr
+                state, Expr.Case(branches', Some else')
+        | Expr.FuncCall(n, args) ->
+            let state, args' = mapList state args
+            state, Expr.FuncCall(n, args')
+        | Expr.Cast(x, dt) ->
+            let state, x' = step state x
+            state, Expr.Cast(x', dt)
+        | Expr.AggCall(f, star, x) ->
+            let state, x' = step state x
+            state, Expr.AggCall(f, star, x')
+
+    /// 直接の子式をリストで返す（走査順は左から右）。
+    /// 再帰は呼び出し側が行う。
+    let internal children (e: Expr) =
+        mapChildrenState (fun acc x -> x :: acc, x) [] e |> fst |> List.rev
 
     /// `children` の逆変換。子の列を親ノードへ戻して式を組み直す。
     /// 自分では再帰しない（再帰は `rewriteWithC` / `rewrite` が行う）。
@@ -414,50 +481,19 @@ module internal Expr =
     /// （arity がずれるとここが最初に落ちる。`AstTests` が全ノード種で検査する）。
     /// </remarks>
     let internal plugChildren (kids: Expr list) (e: Expr) =
-        let rec toPairs acc =
-            function
-            | w :: t :: tail -> toPairs ((w, t) :: acc) tail
-            | _ -> List.rev acc
+        let step (remaining, complete) original =
+            match remaining with
+            | kid :: tail -> (tail, complete), kid
+            | [] -> ([], false), original
 
-        let expectedChildren = List.length (children e)
+        let (leftover, complete), parent = mapChildrenState step (kids, true) e
 
-        let miss () =
-            sprintf "plugChildren: 子の個数が合いません（%d 個 / 期待 %d 個）" (List.length kids) expectedChildren
+        if complete && List.isEmpty leftover then
+            ret parent
+        else
+            sprintf "plugChildren: 子の個数が合いません（%d 個 / 期待 %d 個）" (List.length kids) (List.length (children e))
             |> DbError.internalError
             |> err
-
-        if List.length kids <> expectedChildren then
-            miss ()
-        else
-            match e, kids with
-            | Expr.Literal _, [] -> ret e
-            | Expr.Column _, [] -> ret e
-            | Expr.Name _, [] -> ret e
-            | Expr.Star, [] -> ret e
-            | Expr.QualifiedStar _, [] -> ret e
-            | Expr.Value _, [] -> ret e
-            | Expr.Subquery _, [] -> ret e
-            | Expr.Exists _, [] -> ret e
-            | Expr.CorrelatedSubquery _, [] -> ret e
-            | Expr.InSubquery(_, sel, neg), [ x ] -> ret (Expr.InSubquery(x, sel, neg))
-            | Expr.Unary(op, _), [ x ] -> ret (Expr.Unary(op, x))
-            | Expr.Binary(op, _, _), [ a; b ] -> ret (Expr.Binary(op, a, b))
-            | Expr.IsNull(_, neg), [ x ] -> ret (Expr.IsNull(x, neg))
-            | Expr.IsTruth(_, expected, neg), [ x ] -> ret (Expr.IsTruth(x, expected, neg))
-            | Expr.Between(_, _, _, neg), [ x; lo; hi ] -> ret (Expr.Between(x, lo, hi, neg))
-            | Expr.InList(_, _, neg), x :: xs -> ret (Expr.InList(x, xs, neg))
-            | Expr.Like(_, _, neg, None), [ x; p ] -> ret (Expr.Like(x, p, neg, None))
-            | Expr.Like(_, _, neg, Some _), [ x; p; esc ] -> ret (Expr.Like(x, p, neg, Some esc))
-            | Expr.Case(_, elseE), _ ->
-                match elseE, List.rev kids with
-                | None, _ -> ret (Expr.Case(toPairs [] kids, None))
-                | Some _, last :: branchRev -> ret (Expr.Case(List.rev branchRev |> toPairs [], Some last))
-                | Some _, [] -> miss ()
-            | Expr.FuncCall(n, _), xs -> ret (Expr.FuncCall(n, xs))
-            | Expr.Cast(_, dt), [ x ] -> ret (Expr.Cast(x, dt))
-            | Expr.Default, [] -> ret e
-            | Expr.AggCall(f, star, _), [ x ] -> ret (Expr.AggCall(f, star, x))
-            | _ -> miss ()
 
     /// 書き換え待ちの親ノード。
     /// 子を 1つずつ加工してから `plugChildren` で組み立てる。

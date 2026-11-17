@@ -517,8 +517,11 @@ module internal Analyzer =
                 | _ -> None)
 
         let typeMatches (schema: TableSchema) colName value =
-            schema.Columns
-            |> List.exists (fun c -> Catalog.eqName c.Name colName && c.DataType = SqlValue.dataType value)
+            match SqlValue.dataType value with
+            | Ok t ->
+                schema.Columns
+                |> List.exists (fun c -> Catalog.eqName c.Name colName && c.DataType = t)
+            | Error _ -> false
 
         let findValue (tn: string) colName =
             equalitiesOf (tn.ToLowerInvariant()) predicates

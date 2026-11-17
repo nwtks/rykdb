@@ -30,7 +30,9 @@ type SqlValue =
     | Timestamp of System.DateTimeOffset
     | Decimal of decimal
     | Uuid of System.Guid
-    /// 列が必要ないスキャンで復号を省略した値。読み取り側へ漏れてはいけない。
+    /// 列が必要ないスキャンで復号を省略した値。
+    /// エンジン内部の列マスク復号だけで使うプレースホルダであり、
+    /// 結果の境界では `LoadedRow` が混入を拒否する（公開 API へは出さない）。
     | Unloaded
 
 [<RequireQualifiedAccess>]
@@ -222,19 +224,27 @@ module internal SqlValue =
     /// bool を共有済みの SqlValue.Bool へ変換する。
     let inline ofBool b = if b then TrueValue else FalseValue
 
+    /// 値の型。`Unloaded`（列マスクのプレースホルダ）は型を持たないためエラー。
     let dataType =
         function
-        | SqlValue.Null -> DataType.Null
-        | SqlValue.Bool _ -> DataType.Boolean
-        | SqlValue.Int _ -> DataType.Integer
-        | SqlValue.Real _ -> DataType.Real
-        | SqlValue.Text _ -> DataType.Text
-        | SqlValue.Blob _ -> DataType.Blob
-        | SqlValue.Date _ -> DataType.Date
-        | SqlValue.Timestamp _ -> DataType.Timestamp
-        | SqlValue.Decimal _ -> DataType.Decimal
-        | SqlValue.Uuid _ -> DataType.Uuid
-        | SqlValue.Unloaded -> DataType.Null
+        | SqlValue.Null -> ret DataType.Null
+        | SqlValue.Bool _ -> ret DataType.Boolean
+        | SqlValue.Int _ -> ret DataType.Integer
+        | SqlValue.Real _ -> ret DataType.Real
+        | SqlValue.Text _ -> ret DataType.Text
+        | SqlValue.Blob _ -> ret DataType.Blob
+        | SqlValue.Date _ -> ret DataType.Date
+        | SqlValue.Timestamp _ -> ret DataType.Timestamp
+        | SqlValue.Decimal _ -> ret DataType.Decimal
+        | SqlValue.Uuid _ -> ret DataType.Uuid
+        | SqlValue.Unloaded -> err (DbError.internalError "復号していない列の型を参照しました")
+
+    /// 比較エラーの表示用の型名。
+    /// `Unloaded` は比較前に弾かれるが、表示側でも例外にしない。
+    let private typeNameOf (v: SqlValue) =
+        match dataType v with
+        | Ok t -> DataType.toSqlName t
+        | Error _ -> "<unloaded>"
 
     let isNull =
         function
@@ -266,7 +276,7 @@ module internal SqlValue =
                 row
 
     /// 列マスクのプレースホルダが結果に漏れていないか検査する。
-    /// 最終結果・RowReader・STREAM の境界で呼ぶ。
+    /// 結果の境界では `LoadedRow.create` がこれを呼ぶ（直接呼ぶのはそこだけ）。
     let ensureLoaded (row: SqlValue array) =
         if
             row
@@ -449,10 +459,9 @@ module internal SqlValue =
 
             DbOk(System.DateTimeOffset.Compare(x, ys))
         | _ ->
-            DbErr(
-                sprintf "型 '%s' と '%s' は比較できません" (dataType a |> DataType.toSqlName) (dataType b |> DataType.toSqlName)
-                |> DbError.typeError
-            )
+            sprintf "型 '%s' と '%s' は比較できません" (typeNameOf a) (typeNameOf b)
+            |> DbError.typeError
+            |> DbErr
 
     /// ORDER BY 用の全順序比較（内部ホットパス用）。
     /// NULL は他のすべての値より小さいものとして扱う（ASC の先頭、DESC の末尾）。
@@ -667,3 +676,39 @@ module internal SqlValue =
                 | "0" -> ret FalseValue
                 | _ -> fail ()
             | _ -> coerce target v
+
+/// 復号済みの行。
+/// 列マスクのプレースホルダ（`SqlValue.Unloaded`）を含まないことが構築時に保証される。
+/// <remarks>
+/// ケースは非公開で、構築は `LoadedRow.create` だけ。
+/// 結果の境界（`StatementResult` / `RowReader`）はこの型を経由するので、
+/// 復号していない行が公開 API へ漏れる経路は型で塞がれている。
+/// `toArray` の配列は内部で複製済みのものを共有する（書き換えないこと）。
+/// </remarks>
+[<Struct>]
+type LoadedRow =
+    private
+    | LoadedRow of SqlValue array
+
+    /// 列数。
+    member this.Length =
+        match this with
+        | LoadedRow row -> row.Length
+
+    /// 列の値。
+    member this.Item
+        with get index =
+            match this with
+            | LoadedRow row -> row.[index]
+
+[<RequireQualifiedAccess>]
+module LoadedRow =
+    /// 復号済みであることを検査して行を作る。
+    /// `SqlValue.Unloaded` が混ざっていれば `InternalError`。
+    let internal create (row: SqlValue array) =
+        match SqlValue.ensureLoaded row with
+        | Ok loaded -> Ok(LoadedRow loaded)
+        | Error e -> Error e
+
+    /// 内部配列を取り出す（コピーしない）。
+    let toArray (LoadedRow row) = row

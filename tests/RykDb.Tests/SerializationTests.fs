@@ -534,7 +534,7 @@ let ``順序保持: ランダムな同一型のペアでキー順と比較順が
 
     let random = System.Random 20261110
 
-    for _, group in values |> Array.groupBy SqlValue.dataType do
+    for _, group in values |> Array.groupBy (SqlValue.dataType >> ok) do
         for _ in 1..300 do
             let a = group.[random.Next(group.Length)]
             let b = group.[random.Next(group.Length)]

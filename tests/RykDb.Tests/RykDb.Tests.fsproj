@@ -53,6 +53,7 @@
     <Compile Include="SessionTests.fs" />
     <Compile Include="SqlReferenceTests.fs" />
     <Compile Include="BackgroundCompactionTests.fs" />
+    <Compile Include="KeyEncodingTests.fs" />
     <Compile Include="ServerTests.fs" />
     <Compile Include="CliTests.fs" />
     <Compile Include="TestHealthTests.fs" />

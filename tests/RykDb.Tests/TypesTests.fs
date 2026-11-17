@@ -31,6 +31,23 @@ let ``SqlValue.ensureLoaded: Unloaded は結果境界でエラー`` () =
         (SqlValue.ensureLoaded [| SqlValue.Int 1L; SqlValue.Unloaded |])
 
 [<Fact>]
+let ``SqlValue.dataType: Unloaded は InternalError`` () =
+    Assert.Equal<DataType>(DataType.Integer, ok (SqlValue.dataType (SqlValue.Int 1L)))
+    expectErrorKind ErrorKind.InternalError "Unloaded の型は取れない" (SqlValue.dataType SqlValue.Unloaded)
+
+[<Fact>]
+let ``LoadedRow.create: Unloaded を含む行は InternalError`` () =
+    let loaded = ok (LoadedRow.create [| SqlValue.Int 1L; SqlValue.Null |])
+    Assert.Equal(2, loaded.Length)
+    Assert.Equal<SqlValue>(SqlValue.Int 1L, loaded.[0])
+    Assert.Equal<SqlValue>(SqlValue.Null, loaded.[1])
+
+    expectErrorKind
+        ErrorKind.InternalError
+        "Unloaded を含む行は結果にできない"
+        (LoadedRow.create [| SqlValue.Int 1L; SqlValue.Unloaded |])
+
+[<Fact>]
 let ``DataType: 型タグの往復と未知タグの扱い`` () =
     let all =
         [

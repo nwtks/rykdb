@@ -215,50 +215,61 @@ module internal OrderPreserving =
     [<Literal>]
     let private DecimalMaxDigits = 29
 
+    /// 96bit の非スケール値を 10 で割った商と余り。
+    /// `BigInteger` を使わずに DECIMAL の桁列を作るための部品。
+    /// 32bit のチャンクごとに「前のチャンクの余り × 2^32 + 次」を割る。
+    let private div10 (hi: uint32) (mid: uint32) (lo: uint32) =
+        let mid64 = uint64 (hi % 10u) <<< 32 ||| uint64 mid
+        let lo64 = uint64 (uint32 (mid64 % 10UL)) <<< 32 ||| uint64 lo
+        hi / 10u, uint32 (mid64 / 10UL), uint32 (lo64 / 10UL), uint32 (lo64 % 10UL)
+
+    /// 96bit 非スケール値の 10進桁を `Buffer.[Start]` から `Count` 個返す。
+    /// 末尾の 0 は落として `Count` を縮め、落とす前の桁数を第4要素で返す。
+    /// 指数は「元の桁数 - スケール」なので、落とした 0 は指数に影響しない。
+    let private unscaledDigits (hi: uint32) (mid: uint32) (lo: uint32) =
+        let buffer = Array.zeroCreate<byte> DecimalMaxDigits
+
+        let rec fill hi mid lo pos =
+            if hi = 0u && mid = 0u && lo = 0u then
+                pos
+            else
+                let hi', mid', lo', digit = div10 hi mid lo
+                buffer.[pos] <- byte digit
+                fill hi' mid' lo' (pos - 1)
+
+        let start = fill hi mid lo (DecimalMaxDigits - 1) + 1
+        let total = DecimalMaxDigits - start
+
+        let rec trim count =
+            if count > 1 && buffer.[start + count - 1] = 0uy then
+                trim (count - 1)
+            else
+                count
+
+        buffer, start, trim total, total
+
     let private writeOrderedDecimal (v: decimal) (w: Writer) =
-        let rec trim unscaled scale =
-            if unscaled % System.Numerics.BigInteger 10 = System.Numerics.BigInteger.Zero then
-                trim (unscaled / System.Numerics.BigInteger 10) (scale - 1)
-            else
-                unscaled, scale
+        let bits = System.Decimal.GetBits v
+        let flags = uint32 bits.[3]
+        let scale = int (flags >>> 16 &&& 0xFFu)
 
-        let decimalParts v =
-            let bits = System.Decimal.GetBits v
-            let flags = uint32 bits.[3]
-            let negative = flags &&& 0x80000000u <> 0u
-            let scale = int (flags >>> 16 &&& 0xFFu)
+        let buffer, start, count, total =
+            unscaledDigits (uint32 bits.[2]) (uint32 bits.[1]) (uint32 bits.[0])
 
-            let unscaled =
-                System.Numerics.BigInteger(uint32 bits.[0])
-                + (System.Numerics.BigInteger(uint32 bits.[1]) <<< 32)
-                + (System.Numerics.BigInteger(uint32 bits.[2]) <<< 64)
-
-            if unscaled.IsZero then
-                false, 0, ""
-            else
-                let u, s = trim unscaled scale
-                let digits = u.ToString()
-                negative, int digits.Length - s, digits
-
-        let negative, exponent, digits = decimalParts v
-        let isZero = digits = ""
-
-        let paddedDigits =
-            Seq.append
-                (digits |> Seq.map (fun ch -> byte (int ch) - 0x30uy))
-                (Seq.init (DecimalMaxDigits - String.length digits) (fun _ -> 0uy))
-            |> Seq.toArray
+        let isZero = total = 0
+        let negative = not isZero && flags &&& 0x80000000u <> 0u
 
         let digitBytes =
-            if negative then
-                Array.map (fun b -> 9uy - b) paddedDigits
-            else
-                paddedDigits
+            Array.init DecimalMaxDigits (fun i ->
+                let digit = if i < count then buffer.[start + i] else 0uy
+                if negative then 9uy - digit else digit)
 
         let exponentValue =
-            if isZero then System.Int64.MinValue
-            elif negative then -int64 exponent
-            else int64 exponent
+            if isZero then
+                System.Int64.MinValue
+            else
+                let exponent = int64 total - int64 scale
+                if negative then -exponent else exponent
 
         w
         |> Writer.writeByte (if negative then 0x00uy else 0x01uy)
