@@ -92,6 +92,14 @@ type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
             | SyncState.Idle _
             | SyncState.Leading _ -> None)
 
+    /// 登録済みの最大 WAL 位置（テスト・診断用）。
+    member internal _.Pending =
+        lock gate (fun () ->
+            match state with
+            | SyncState.Idle(_, pending)
+            | SyncState.Leading(_, _, pending) -> pending
+            | SyncState.Failed _ -> None)
+
     /// 同期対象の位置を登録する。
     member _.Register(pos: WalState) =
         lock gate (fun () ->
@@ -177,12 +185,17 @@ type private HostLifecycle =
 /// - WAL の fsync はホスト単位で 1回にまとめる（`CommitDurability`）。
 /// - 閉じるのは所有者だけ（`SessionPool.Close` / 単独の `Session.Close`）。
 /// </remarks>
-type internal DatabaseHost(root: string, owner: Database) =
+type internal DatabaseHost(root: string, owner: Database, ?commitDurability: CommitDurability) =
     // ライフサイクル（committed state と Close 状態）を保護する短いロック。
     let stateGate = obj ()
     // 書き込み・transaction 操作・Close を直列化するロック。
     let writeGate = obj ()
-    let durability = CommitDurability(fun pos -> Wal.sync root pos)
+
+    let durability =
+        match commitDurability with
+        | Some d -> d
+        | None -> CommitDurability(fun pos -> Wal.sync root pos)
+
     // committed state は常に Active / Pending / ActiveRegistration を持たない。
     let mutable lifecycle = HostLifecycle.Running owner.StateWithDeferredDurability
 
@@ -205,9 +218,13 @@ type internal DatabaseHost(root: string, owner: Database) =
                 match snapshot () with
                 | HostLifecycle.Closed _ -> Error(closedError ()), None
                 | HostLifecycle.Running current ->
-                    match run current with
-                    | Error e -> Error e, current.Store.Engine.WalState
-                    | Ok(next, value) -> Ok value, next.Store.Engine.WalState)
+                    let outcome, position =
+                        match run current with
+                        | Error e -> Error e, current.Store.Engine.WalState
+                        | Ok(next, value) -> Ok value, next.Store.Engine.WalState
+
+                    position |> Option.iter durability.Register
+                    outcome, position)
 
         match position with
         | Some pos ->

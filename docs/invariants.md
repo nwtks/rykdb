@@ -56,6 +56,7 @@ F# の型システムでは表現できないため、
 | INV-22 | `Session.fs` / `SessionHost.fs` の `mutable` は状態 DU のスロットとカウンタ | `SyncState` / `HostLifecycle` / `LocalSession` / `PoolLifecycle` / `RowReaderState`                                                                                                   | ✅ 完了 |
 | INV-23 | 結果行は `LoadedRow`（`Unloaded` を含まない）                               | `LoadedRow.create` + `StatementResult` の非公開コンストラクタ（`Create` は `LoadedRow` だけを受ける） + `RowReader.TryRead` の戻り値型                                                | ✅ 完了 |
 | INV-24 | `EngineHost` の Version 公開とファイル refcount                             | `EngineHost.publish` / `install` / `AcquireCall` + `BackgroundCompactionTests` の並行・ランダム操作列テスト                                                                           | ✅ 完了 |
+| INV-25 | commit の WAL 位置は fsync 前に登録する                                     | `DatabaseHost.serialized` の `writeGate` 内 `Register` + `SessionHostTests` の統合テスト（3 commit / 2 fsync）                                                                        | ✅ 完了 |
 
 ---
 
@@ -447,6 +448,21 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
     pin 中の全ファイル存在、`LastCompactionError = None` を検査）
 - 残る既知の未対応: プロセス断を挿入するランダム操作列は未実施
   （クラッシュ再開自体は他の `BackgroundCompactionTests` が個別に検証する）。
+
+### INV-25 commit の WAL 位置は fsync 前に登録する
+
+- 宣言: `DatabaseHost.serialized` は、実行後の `WalState` を `writeGate` の内側で
+  `CommitDurability.Register` し、`writeGate` の外側で `Await` する。
+- 理由: `Await` は「登録済みの最大位置」までしか同期しない。
+  `Register` を忘れると、待機中の commit の WAL 位置が leader の fsync target に入らず、
+  commit ごとに fsync が走る（グループコミットが実質無効になる）。
+  `CommitDurability` 単体のテストは `Register` を直接呼ぶため、
+  この統合欠落を検出できない。
+- 担保:
+  - `DatabaseHost.serialized` が `writeGate` の内側で `position |> Option.iter durability.Register` を呼ぶ。
+  - `DatabaseHost` はテスト用に `CommitDurability` を注入できる（`?commitDurability`）。
+- 回帰テスト: `DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録し fsync をまとめる`
+  （3 commit が 2回の fsync にまとまり、最後の fsync が 3番目の位置まで届く）。
 
 ---
 

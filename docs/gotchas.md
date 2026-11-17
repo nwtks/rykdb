@@ -2722,3 +2722,17 @@ mapC (fun (b: SelectStatement) contn -> planCoreCWith runner outer contn ctx (br
 
 回帰テスト: `EvalTests` の
 `Eval.eval: 数値演算は範囲外で DbError を返し、REAL は精度を落とさない`（DECIMAL 除算と INTEGER の乗算・減算・剰余を追加）。
+
+### 11.80 グループコミットは WAL 位置の登録まで含めて 1組
+
+❌ `CommitDurability.Await` だけを呼び、`Register` を忘れる。
+待機中に後続の commit が WAL に追記しても、その位置が leader の fsync target に入らず、
+commit ごとに fsync が走る（グループコミットが実質無効になる）。
+`DatabaseHost` 導入時に通常の commit 経路から `Register` が落ち、
+`CommitDurability` 単体のテストは `Register` を直接呼ぶため気付けなかった。
+
+✅ `writeGate` の内側で、実行後の `WalState` を `durability.Register` してから
+外側で `Await` する。後続の commit は `pending` に位置を足し、
+次のリーダーが登録済みの最大位置まで 1回の fsync でまとめる。
+
+回帰テスト: `DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録し fsync をまとめる`。
