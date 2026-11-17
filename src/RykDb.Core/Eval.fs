@@ -13,6 +13,7 @@ type internal ColumnResolver =
         {
             Schema: Schema
             Cache: System.Collections.Generic.Dictionary<struct (string option * string), Result<int, DbError>>
+            LikeCache: Scalar.LikeCache
         }
 
     /// 列参照を列位置へ解決する。
@@ -434,7 +435,7 @@ module internal Eval =
                         else
                             DbOk(
                                 SqlValue.ofBool (
-                                    Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString l)
+                                    resolve.LikeCache.Match (SqlValue.toDisplayString v) (SqlValue.toDisplayString l)
                                 )
                             )
                     | BinaryOp.Eq -> compare CompareOp.Eq l v
@@ -493,7 +494,9 @@ module internal Eval =
                 else
                     match esc with
                     | None ->
-                        let m = Scalar.likeMatch (SqlValue.toDisplayString v) (SqlValue.toDisplayString x)
+                        let m =
+                            resolve.LikeCache.Match (SqlValue.toDisplayString v) (SqlValue.toDisplayString x)
+
                         step resolve row rest (Arrive(SqlValue.ofBool (if negated then not m else m)))
                     | Some escExpr -> step resolve row (KLikeE(x, v, negated) :: rest) (Descend escExpr)
             | KLikeE(x, pattern, negated) :: rest ->
@@ -504,7 +507,7 @@ module internal Eval =
                     | Error er -> DbErr er
                     | Ok escape ->
                         match
-                            Scalar.likeMatchWithEscape
+                            resolve.LikeCache.MatchWithEscape
                                 escape
                                 (SqlValue.toDisplayString pattern)
                                 (SqlValue.toDisplayString x)
@@ -539,6 +542,7 @@ module internal Eval =
         {
             Schema = schema
             Cache = System.Collections.Generic.Dictionary<struct (string option * string), Result<int, DbError>>()
+            LikeCache = Scalar.LikeCache()
         }
 
     /// メモ化済み resolver で式を評価する（内部ホットパス用）。

@@ -91,7 +91,7 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
 
         member _.MaybeFlush() =
             inner.MaybeFlush()
-            |> Result.map (fun next -> GatedEngine(gates, next) :> IStorageEngine)
+            |> Result.map (fun (next, error) -> GatedEngine(gates, next) :> IStorageEngine, error)
 
         member _.Close() = inner.Close()
 

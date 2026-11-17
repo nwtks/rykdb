@@ -98,10 +98,9 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `ExtSort` の受け皿（バジェット内に収まる分。超過分は一時ファイルへ退避する）
 - `SstableFormat` のブロック構築（`ResizeArray`）と `Sstable` の partial reader / scan scope のキャッシュ（`ConcurrentDictionary`）
 - `EngineHost` の host state / ファイル refcount / 採番（`ConcurrentDictionary`）
-- `Compaction` の作業ディレクトリ別カウンタ（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
-- `Scalar` の LIKE パターンキャッシュ（コンパイル済みトークン列を `(escape, pattern)` ごとに再利用）
-- `Eval.resolver` の列解決キャッシュ（1オペレータ = 1スキーマ。行ごとの `Schema.resolve` を繰り返さない）
+- `Eval.resolver` の列解決キャッシュと LIKE パターンキャッシュ
+  （1オペレータ = 1スキーマ。行ごとの `Schema.resolve` と LIKE の再コンパイルを繰り返さない）
 
 | やりたいこと       | 命令形の代わりに使うもの                                                        |
 | ------------------ | ------------------------------------------------------------------------------- |

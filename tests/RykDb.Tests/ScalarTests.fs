@@ -90,7 +90,8 @@ let ``Scalar.likeMatch: 同じパターンは行ごとに配列を確保しな�
     // 初回だけコンパイルし、以降はキャッシュしたトークン列で照合する。
     let pattern = "a%b%c"
     let text = "aXXbYYc"
-    Assert.True(Scalar.likeMatch pattern text)
+    let cache = Scalar.LikeCache()
+    Assert.True(cache.Match pattern text)
 
     let before = System.GC.GetAllocatedBytesForCurrentThread()
 
@@ -98,12 +99,7 @@ let ``Scalar.likeMatch: 同じパターンは行ごとに配列を確保しな�
         if i >= 1000 then
             matched
         else
-            loop
-                (i + 1)
-                (if Scalar.likeMatch pattern text then
-                     matched + 1
-                 else
-                     matched)
+            loop (i + 1) (if cache.Match pattern text then matched + 1 else matched)
 
     let matched = loop 0 0
     let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before

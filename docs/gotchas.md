@@ -2061,7 +2061,7 @@ flush 成功・compaction 失敗のときに `Error` が返り、
   （compaction のエラーが flush の結果を巻き戻す）
 - ✅ flush 失敗: pre-flush の engine を `Ok` で返す（memtable を残して次回再試行）。
   flush 成功・compaction 失敗: **flush 後の engine** を `Ok` で返し、
-  `LastCompactionError = Some e` を記録する。
+  compaction の失敗は戻り値の `DbError option` で返す。
 - WAL への書き込みが成功した時点で commit は成立している。
   ここで `Error` を返すと、呼び出し側が SeqNo を再利用し得る（§11.8）。
   `RowStore.writeBatchesWithSnapshotWith` の `MaybeFlush` エラー握り潰しはこのための保険として残す。

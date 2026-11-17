@@ -66,25 +66,6 @@ module internal Scalar =
     [<Literal>]
     let private MaxCachedLikePatterns = 1024
 
-    /// コンパイル済みパターンのキャッシュ。
-    /// キーは struct なので、ヒット時に行ごとの割当は発生しない。
-    let private likeCache =
-        System.Collections.Concurrent.ConcurrentDictionary<struct (int * string), Result<LikePattern, DbError>>()
-
-    /// キャッシュミス時のコンパイル。
-    /// 呼び出しごとにデリゲートを作らないよう、モジュールスコープに 1個だけ置く。
-    let private compileEntry =
-        System.Func<struct (int * string), Result<LikePattern, DbError>>(fun (struct (code, p)) ->
-            let escape = if code < 0 then None else Some code
-            compileTokens escape p)
-
-    /// パターンをコンパイルする（キャッシュ経由）。
-    let private compileLike (escapeCode: int) (pattern: string) =
-        if likeCache.Count >= MaxCachedLikePatterns then
-            likeCache.Clear()
-
-        likeCache.GetOrAdd(struct (escapeCode, pattern), compileEntry)
-
     /// 末尾の連続する `%` を読み飛ばす。
     [<TailCall>]
     let rec private skipTrailingStars (tokens: LikeToken array) (i: int) =
@@ -141,21 +122,46 @@ module internal Scalar =
     let private matchLikeTokens (tokens: LikeToken array) (text: System.ReadOnlySpan<char>) =
         goLike tokens text 0 0 -1 0
 
+    /// 1クエリ分のコンパイル済み LIKE パターン。
+    /// resolver が所有するので、クエリをまたいで状態を共有しない。
+    type internal LikeCache() =
+        let cache =
+            System.Collections.Generic.Dictionary<struct (int * string), Result<LikePattern, DbError>>()
+
+        member private _.Compile (escapeCode: int) (pattern: string) =
+            let key = struct (escapeCode, pattern)
+
+            if cache.ContainsKey key then
+                cache.[key]
+            else
+                if cache.Count >= MaxCachedLikePatterns then
+                    cache.Clear()
+
+                let escape = if escapeCode < 0 then None else Some escapeCode
+                let compiled = compileTokens escape pattern
+                cache.[key] <- compiled
+                compiled
+
+        member this.Match (pattern: string) (text: string) =
+            match this.Compile NoEscape pattern with
+            | Ok compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text)
+            | Error _ -> false
+
+        member this.MatchWithEscape (escape: int) (pattern: string) (text: string) =
+            this.Compile escape pattern
+            |> Result.map (fun compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
+
     /// LIKE のパターン照合。
     /// `%` は任意の文字列、`_` は Unicode コードポイント 1個。
     /// 正規表現に落とさずに手で照合する（LIKE の方言差を吸収するため）。
     /// パターンはキャッシュしたトークン列を使う（行ごとに解析しない）。
     /// バックトラックは 1段だけ（無限ループしないことが最優先）。
-    let likeMatch (pattern: string) (text: string) =
-        match compileLike NoEscape pattern with
-        | Ok compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text)
-        | Error _ -> false
+    let likeMatch (pattern: string) (text: string) = LikeCache().Match pattern text
 
     /// ESCAPE 付き LIKE。
     /// `escape` は Unicode コードポイント。
     let likeMatchWithEscape (escape: int) (pattern: string) (text: string) =
-        compileLike escape pattern
-        |> Result.map (fun compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
+        LikeCache().MatchWithEscape escape pattern text
 
     /// ESCAPE 句の文字列を 1 コードポイントとして取り出す。
     /// コードポイントが 1個でなければ TypeError。

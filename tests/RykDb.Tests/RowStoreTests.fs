@@ -88,7 +88,7 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
         member this.WithActiveSnapshot _ = this :> IStorageEngine
         member this.WithHostState _ = this :> IStorageEngine
         member this.FlushIfNeeded _ = ret (this :> IStorageEngine, false)
-        member this.MaybeFlush() = ret (this :> IStorageEngine)
+        member this.MaybeFlush() = ret (this :> IStorageEngine, None)
 
         member _.Close() =
             closed.Add name
@@ -224,12 +224,9 @@ let ``RowStore: compaction 失敗で中断した走査は入力 SSTable のハ�
             }
 
         let store = openStoreWith dir (DiskStorageEngine engine :> IStorageEngine)
-
         // flush 後の compaction は f2 で失敗し、他の入力の走査は途中で捨てられる。
-        let store =
-            ok (RowStore.writeBatches [ ("t", [| Entry.put (intKey 5) 5UL (intRow 5) |]) ] store)
-
-        Assert.True store.Engine.HostState.LastCompactionError.IsSome
+        ok (RowStore.writeBatches [ ("t", [| Entry.put (intKey 5) 5UL (intRow 5) |]) ] store)
+        |> ignore
 
         // 捨てた走査がハンドルを残していると共有違反になる。
         // Linux は開いたままでも削除・rename できるため、この検査が無いと Windows だけで露見する。

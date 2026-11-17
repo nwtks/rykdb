@@ -126,7 +126,7 @@ module internal OpsJoin =
         | Some p -> Eval.matchesJoinedV resolve lrow rrow p
 
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
-    /// lookupRows は左キーから右行のリストを返す（見つからなければ空）。
+    /// lookupRows は左キーから右行のリストを返す（見つからなければ None）。
     /// <remarks>
     /// Op.compute の継続内の相互再帰は「次の行を要求されたとき」に 1段ずつ進むので、スタックは積み上がらない。
     /// TailAudit はラムダ内の呼び出しを非末尾として報告するためベースラインに登録している。
@@ -137,7 +137,7 @@ module internal OpsJoin =
         (left: Op)
         (leftKeys: int array)
         (rightSchema: Schema)
-        (lookupRows: SqlValue array -> Result<ResizeArray<SqlValue array>, DbError>)
+        (lookupRows: SqlValue array -> Result<ResizeArray<SqlValue array> option, DbError>)
         (residual: Expr option)
         =
         let rightWidth = rightSchema.Columns.Length
@@ -155,7 +155,12 @@ module internal OpsJoin =
                     else
                         match lookupRows (keyOf lrow leftKeys) with
                         | Error e -> OpStep.OpError e
-                        | Ok rows -> Op.next (emit lrow lnext rows 0 false))
+                        | Ok None ->
+                            if isLeft then
+                                OpStep.OpRow(padded lrow, probe lnext)
+                            else
+                                Op.next (probe lnext)
+                        | Ok(Some rows) -> Op.next (emit lrow lnext rows 0 false))
                 cur
 
         and emit lrow lnext rows i matched =
@@ -190,18 +195,13 @@ module internal OpsJoin =
 
         table
 
-    /// 見つからないときの空リスト。
-    /// `joinProbe` は `rows` を読み取り専用でしか使わないので共有してよい
-    /// （モジュールスコープの値は 1回だけ評価される。`Ops.distinct` の教訓参照）。
-    let private emptyRows = ResizeArray<SqlValue array>()
-
     let private lookupHash
         (table: System.Collections.Generic.Dictionary<SqlValue array, ResizeArray<SqlValue array>>)
         (key: SqlValue array)
         =
         match table.TryGetValue key with
-        | true, bucket -> ret bucket
-        | _ -> ret emptyRows
+        | true, bucket -> ret (Some bucket)
+        | _ -> ret None
 
     /// INNER JOIN（ハッシュ結合）。右側をハッシュ表にする。
     let innerJoinHash
@@ -452,7 +452,13 @@ module internal OpsJoin =
     /// 非一意索引の prefix 検索は 1キーに大量の行が付き得るため上限を置く。
     let private lookupBounded (lookup: SqlValue array -> Result<Op, DbError>) (key: SqlValue array) =
         lookup key
-        >>= fun op -> toArrayWithBudget JoinBudgetBytes op |> Result.map ResizeArray<SqlValue array>
+        >>= fun op ->
+            toArrayWithBudget JoinBudgetBytes op
+            |> Result.map (fun rows ->
+                if Array.isEmpty rows then
+                    None
+                else
+                    Some(ResizeArray<SqlValue array> rows))
 
     /// INNER JOIN（インデックス入れ子ループ）。
     let innerJoinIndexed

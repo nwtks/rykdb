@@ -185,8 +185,9 @@ flowchart TB
    利用者が更新を忘れる経路はない。
 
 ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`Op.toArray`、`ExtSort` の受け皿、
-`Sstable` のブロック構築と partial reader キャッシュ、`EngineHost` の host state / refcount、
-`Compaction` の採番カウンタなどでは `ResizeArray` / `Dictionary` / `HashSet` / `ConcurrentDictionary` を使う
+`Sstable` のブロック構築と partial reader キャッシュ、
+`EngineHost` の host state / refcount / 採番などでは
+`ResizeArray` / `Dictionary` / `HashSet` / `ConcurrentDictionary` を使う
 （[`coding-conventions.md`](coding-conventions.md) §2）。
 
 `EngineHost.fs` は「不変の `StorageEngine` の外側にある共有状態」で、
@@ -1629,8 +1630,8 @@ MANIFEST の読み落としで消してしまう事故を避けるため）。
 （逆順にするとデータを失う経緯は [`gotchas.md`](gotchas.md) §11.4）。
 
 **compaction の失敗は flush を取り消さない**。
-`maybeFlush` は flush 成功後に compaction が失敗してもflush 後の engine を返し、
-`LastCompactionError` に診断を残す（次回の flush 時に再試行される）。
+`maybeFlush` は flush 成功後に compaction が失敗しても flush 後の engine を返し、
+診断を `DbError option` として一緒に返す（次回の flush 時に再試行される）。
 WAL への書き込みが成功した時点で commit は成立しているため、ここで `Error` を返してはならない
 （呼び出し側が SeqNo を再利用し得る。gotchas §11.51）。
 
@@ -1732,7 +1733,7 @@ SQL 文字列
    `Session.OpenWith` では flush 後に `EngineHost.Signal` で background worker を起こし、
    internal の `Database.OpenWith` では `maybeFlush` が同期的に `compactOnce` を呼ぶ。
    flush / compaction の失敗は commit を失敗させない
-   （memtable を残して次回再試行するか、flush 後の engine に `LastCompactionError` を記録する。gotchas §11.51）
+   （memtable を残して次回再試行するか、flush 後の engine と一緒に compaction の失敗を返す。gotchas §11.51）
 ```
 
 flush / compact は `RowStore` が `WriteBatch` 後に `IStorageEngine.MaybeFlush` を呼んで実行する

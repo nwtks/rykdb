@@ -115,7 +115,6 @@ module internal RowStore =
                             Version = flushedState.Version
                             ManifestNumber = flushedState.ManifestNumber
                             ActiveSnapshot = activeSnapshot
-                            LastCompactionError = flushedState.LastCompactionError
                         })
                     |> ignore
 
@@ -152,7 +151,7 @@ module internal RowStore =
                 match store.Host with
                 | None ->
                     match bumped.MaybeFlush() with
-                    | Ok flushed -> ret { store with Engine = flushed }
+                    | Ok(flushed, _) -> ret { store with Engine = flushed }
                     | Error _ -> ret { store with Engine = bumped }
                 | Some host ->
                     match flushAndPublish bumped host with

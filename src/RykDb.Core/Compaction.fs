@@ -105,6 +105,18 @@ module internal Compaction =
             let kept = if keepNewest then newest :: keptOlder else keptOlder
             kept, dropped, (if keepNewest then 0 else 1)
 
+    /// 出力ファイル番号の供給方法。
+    /// 同期 compaction は決まった開始番号から純粋に進め、
+    /// バックグラウンド compaction はホストが持つ allocator から取得する。
+    type private FileNumberSupply =
+        | Sequence of int64
+        | Allocator of (unit -> int64)
+
+    let private takeFileNumber supply =
+        match supply with
+        | Sequence current -> current, Sequence(current + 1L)
+        | Allocator allocate -> allocate (), supply
+
     /// 1回の Leveled compaction を行う（ストリーミング）。
     /// <remarks>
     /// 入力は全読みしない。各ファイルを `SstScan` で開き、`SstMerge` で 1件ずつマージしながら
@@ -113,13 +125,13 @@ module internal Compaction =
     /// `openScan` はファイルの先頭から読むスキャンを返す（部分読みリーダーを使えばブロック単位で読む）。
     /// MANIFEST の更新と実ファイルの削除は呼び出し側が行う。
     /// </remarks>
-    let compactWith
+    let private runCompact
         (dir: string)
         (version: Version)
         (options: CompactionOptions)
         (activeSnapshot: uint64)
         (openScan: FileMetaData -> Result<SstScan, DbError>)
-        (allocateFileNumber: unit -> int64)
+        (supply: FileNumberSupply)
         (shouldStop: unit -> bool)
         =
         let emptyResult =
@@ -264,7 +276,18 @@ module internal Compaction =
                 Level = plan.OutputLevel
             }
 
-        let rec pump plan allInputs dropTombstones merge chunk chunkBytes added droppedVersions droppedTombstones =
+        let rec pump
+            supply
+            plan
+            allInputs
+            dropTombstones
+            merge
+            chunk
+            chunkBytes
+            added
+            droppedVersions
+            droppedTombstones
+            =
             if shouldStop () then
                 deleteOutputs added
                 ret emptyResult
@@ -274,7 +297,9 @@ module internal Compaction =
                     deleteOutputs added
                     err e
                 | Ok None ->
-                    match flushChunk plan chunk (allocateFileNumber ()) with
+                    let fileNumber, _ = takeFileNumber supply
+
+                    match flushChunk plan chunk fileNumber with
                     | Error e ->
                         deleteOutputs added
                         err e
@@ -293,7 +318,9 @@ module internal Compaction =
                         not (List.isEmpty chunk)
                         && chunkBytes + keptBytes > options.OutputFileTargetBytes
                     then
-                        match flushChunk plan chunk (allocateFileNumber ()) with
+                        let fileNumber, supply = takeFileNumber supply
+
+                        match flushChunk plan chunk fileNumber with
                         | Error e ->
                             deleteOutputs added
                             err e
@@ -304,6 +331,7 @@ module internal Compaction =
                                 | None -> added
 
                             pump
+                                supply
                                 plan
                                 allInputs
                                 dropTombstones
@@ -315,6 +343,7 @@ module internal Compaction =
                                 (droppedTombstones + tombstones)
                     else
                         pump
+                            supply
                             plan
                             allInputs
                             dropTombstones
@@ -328,7 +357,7 @@ module internal Compaction =
         let runPump plan allInputs merge =
             let dropTombstones = plan.OutputLevel >= options.DropTombstonesBelowLevel
 
-            match pump plan allInputs dropTombstones merge [] 0L [] 0 0 with
+            match pump supply plan allInputs dropTombstones merge [] 0L [] 0 0 with
             | Ok result -> ret result
             | Error e ->
                 SstMerge.dispose merge
@@ -347,6 +376,19 @@ module internal Compaction =
         | Some plan -> compactPlan plan
         | None -> ret emptyResult
 
+    /// バックグラウンド compaction。
+    /// ファイル番号は [allocateFileNumber] から取得する。
+    let compactWith
+        (dir: string)
+        (version: Version)
+        (options: CompactionOptions)
+        (activeSnapshot: uint64)
+        (openScan: FileMetaData -> Result<SstScan, DbError>)
+        (allocateFileNumber: unit -> int64)
+        (shouldStop: unit -> bool)
+        =
+        runCompact dir version options activeSnapshot openScan (Allocator allocateFileNumber) shouldStop
+
     /// 同期 compaction。
     /// ファイル番号は [nextFileNumber] から 1 ずつ採番する。
     let compact
@@ -357,17 +399,4 @@ module internal Compaction =
         (nextFileNumber: int64)
         (openScan: FileMetaData -> Result<SstScan, DbError>)
         =
-        let numberKey = "n"
-        let counter = System.Collections.Concurrent.ConcurrentDictionary<string, int64>()
-        counter.[numberKey] <- nextFileNumber
-
-        let rec allocate () =
-            let current = counter.[numberKey]
-            let next = current + 1L
-
-            if counter.TryUpdate(numberKey, next, current) then
-                current
-            else
-                allocate ()
-
-        compactWith dir version options activeSnapshot openScan allocate (fun () -> false)
+        runCompact dir version options activeSnapshot openScan (Sequence nextFileNumber) (fun () -> false)

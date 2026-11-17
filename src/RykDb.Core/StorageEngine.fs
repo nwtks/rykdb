@@ -76,9 +76,6 @@ type internal StorageEngine =
         /// GC は「これより新しい版」と「これ以下の最新 1版」を残す（Compaction.gcGroup）。
         /// 0 は「全版を残す」。
         ActiveSnapshot: uint64
-        /// 直近の compaction の失敗（成功したら None）。
-        /// flush は成功しているため、失敗しても engine は flush 後の状態を保つ。
-        LastCompactionError: DbError option
     }
 
 module internal StorageEngine =
@@ -497,6 +494,7 @@ module internal StorageEngine =
         }
 
     /// memtable が上限に達していれば flush し、続けて compaction する（同期版）。
+    /// compaction の失敗は flush 後の engine と一緒に返す。
     let maybeFlush (engine: StorageEngine) =
         withDirGate engine.Dir (fun () ->
             if
@@ -504,21 +502,13 @@ module internal StorageEngine =
                 && Memtable.approxBytes engine.Mem >= engine.MemLimitBytes
             then
                 match flush engine with
-                | Error _ -> ret engine
+                | Error _ -> ret (engine, None)
                 | Ok flushed ->
                     match compactOnce flushed with
-                    | Ok compacted ->
-                        ret
-                            { compacted with
-                                LastCompactionError = None
-                            }
-                    | Error e ->
-                        ret
-                            { flushed with
-                                LastCompactionError = Some e
-                            }
+                    | Ok compacted -> ret (compacted, None)
+                    | Error e -> ret (flushed, Some e)
             else
-                ret engine)
+                ret (engine, None))
 
     /// データベースを開く（新規なら作る）。
     /// [memLimitBytes] を指定すると memtable の上限を差し替える。
@@ -608,7 +598,6 @@ module internal StorageEngine =
                 MemLimitBytes = DefaultMemLimitBytes
                 Compaction = CompactionOptions.Defaults
                 ActiveSnapshot = 0UL
-                LastCompactionError = None
             }
 
         let buildRecovered version manifestNumber walState mem walMax diskMax walMaxTxn =
@@ -712,7 +701,7 @@ type internal IStorageEngine =
     /// 上限超過時は flush だけを行う（compaction はしない）。
     /// 戻り値の bool は「実際に flush したか」。
     abstract FlushIfNeeded: allocateFileNumber: (unit -> int64) -> Result<IStorageEngine * bool, DbError>
-    abstract MaybeFlush: unit -> Result<IStorageEngine, DbError>
+    abstract MaybeFlush: unit -> Result<IStorageEngine * DbError option, DbError>
     abstract Close: unit -> Result<unit, DbError>
 
 /// 実ディスクの StorageEngine を IStorageEngine として公開する。
@@ -726,7 +715,7 @@ type internal DiskStorageEngine(engine: StorageEngine) =
                 Version = engine.Version
                 ManifestNumber = engine.ManifestNumber
                 ActiveSnapshot = engine.ActiveSnapshot
-                LastCompactionError = engine.LastCompactionError
+                LastCompactionError = None
                 Generation = 0L
             }
 
@@ -765,7 +754,6 @@ type internal DiskStorageEngine(engine: StorageEngine) =
                     Version = state.Version
                     ManifestNumber = state.ManifestNumber
                     ActiveSnapshot = state.ActiveSnapshot
-                    LastCompactionError = state.LastCompactionError
                 }
             :> IStorageEngine
 
@@ -775,6 +763,6 @@ type internal DiskStorageEngine(engine: StorageEngine) =
 
         member _.MaybeFlush() =
             StorageEngine.maybeFlush engine
-            |> Result.map (fun next -> DiskStorageEngine next :> IStorageEngine)
+            |> Result.map (fun (next, error) -> DiskStorageEngine next :> IStorageEngine, error)
 
         member _.Close() = StorageEngine.close engine

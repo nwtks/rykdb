@@ -327,7 +327,7 @@ let ``StorageEngine.maybeFlush: flush 後に compaction が不要なら compactO
             let engine =
                 ok (StorageEngine.writeBatch [| Entry.put (intKey 1) 1UL (intRow 1) |] engine)
 
-            let after = ok (StorageEngine.maybeFlush engine)
+            let after, _ = ok (StorageEngine.maybeFlush engine)
             // flush した 1 ファイルが L0 に残り、compaction は走っていない
             Assert.Equal(1, (Version.filesAt 0 after.Version).Length)))
 
@@ -353,7 +353,7 @@ let ``StorageEngine.maybeFlush: 4 本目の L0 で compactOnce が L0→L1 compa
             let engine =
                 ok (StorageEngine.writeBatch [| Entry.put (intKey 4) 4UL (intRow 4) |] engine)
 
-            let after = ok (StorageEngine.maybeFlush engine)
+            let after, _ = ok (StorageEngine.maybeFlush engine)
             // compaction が走り、L0 は空、L1 にファイルが存在する
             Assert.Equal(0, (Version.filesAt 0 after.Version).Length)
             Assert.True((Version.filesAt 1 after.Version).Length > 0)
@@ -389,12 +389,12 @@ let ``StorageEngine.maybeFlush: compaction が失敗しても flush 後の engin
             let engine =
                 ok (StorageEngine.writeBatch [| Entry.put (intKey 4) 4UL (intRow 4) |] engine)
 
-            let after = ok (StorageEngine.maybeFlush engine)
+            let after, compactionError = ok (StorageEngine.maybeFlush engine)
             // flush は成功している（memtable は空、L0 に 4 本）
             Assert.True(Memtable.isEmpty after.Mem)
             Assert.Equal(4, (Version.filesAt 0 after.Version).Length)
-            // compaction の失敗は診断として残る
-            Assert.True after.LastCompactionError.IsSome
+            // compaction の失敗は診断として返る
+            Assert.True compactionError.IsSome
             // 入力ファイルは削除されない
             Assert.True(System.IO.File.Exists(FileMetaData.path dir 10L))
             Assert.True(System.IO.File.Exists(FileMetaData.path dir 11L))
@@ -406,7 +406,7 @@ let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush �
         let engine = ok (StorageEngine.openDatabaseWith None dir)
         let disk = DiskStorageEngine { engine with MemLimitBytes = 1 } :> IStorageEngine
         let disk = ok (disk.WriteBatch [| Entry.put (intKey 1) 1UL (intRow 1) |])
-        let disk = ok (disk.MaybeFlush())
+        let disk, _ = ok (disk.MaybeFlush())
         Assert.NotEmpty(System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension))
         Assert.True((ok (disk.GetAtMasked None (intKey 1) [||])).IsSome))
 

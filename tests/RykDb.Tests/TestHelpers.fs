@@ -270,7 +270,7 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
         member this.FlushIfNeeded _ = ret (this :> IStorageEngine, false)
 
         member _.MaybeFlush() =
-            MemoryStorageEngine state :> IStorageEngine |> ret
+            ret (MemoryStorageEngine state :> IStorageEngine, None)
 
         member _.Close() = ret ()
 
