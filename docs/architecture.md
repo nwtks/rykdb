@@ -12,7 +12,7 @@ SQL の対応範囲は [`sql-reference.md`](sql-reference.md)、
 
 1. [全体像](#1-全体像)
 2. [プロジェクト構成](#2-プロジェクト構成)
-3. [フロントエンド](#3-フロントエンド)
+3. [SQL層](#3-SQL層)
 4. [型と順序保持エンコーディング](#4-型と順序保持エンコーディング)
 5. [実行層](#5-実行層)
 6. [行ストア層](#6-行ストア層)
@@ -67,7 +67,7 @@ flowchart TB
         SER["Serialization.fs<br/>順序保持符号化"]
     end
 
-    subgraph FE["フロントエンド"]
+    subgraph FE["SQL層"]
         P["ParserExpr.fs / Parser.fs"]
         L["Lexer.fs"]
         A["Ast.fs"]
@@ -122,6 +122,8 @@ flowchart TB
    LSM の merge・索引・走査すべての前提（§4.2）。
 5. **末尾再帰 / 明示スタック** — 要素数に比例する処理はスタックを積まない形で書く
    （[`coding-conventions.md`](coding-conventions.md) §3）。
+6. **単一プロセス前提** — 1つの DB ディレクトリを開けるのは同時に 1プロセスだけ。
+   複数プロセスからの同時更新は目標としない（ファイル排他の複雑化を避ける。§7.9）。
 
 ### 採用している手法（サマリ）
 
@@ -135,7 +137,7 @@ flowchart TB
 | 耐久       | commit の fsync を**グループコミット**（WAL 位置を登録し、先頭の待機者が 1回 fsync）                      | §8.5, §7.7                                          |
 | GC         | **版単位**の SeqNo 判定（ファイル単位では判定しない）。tombstone は最下位レベルで回収                     | §8.6                                                |
 | 並行制御   | **Session で読み取り並行・書き込み直列** + MVCC（Snapshot Isolation）+ first-committer-wins。DDL だけ排他 | §7                                                  |
-| 排他       | DDL は `RootGate`、DB は `.rykdb.format` の **`FileShare.None`**（プロセス間）                            | §7.8–7.9                                            |
+| 排他       | DDL は `RootRuntime`、DB は `.rykdb.format` の **`FileShare.None`**（プロセス間）                         | §7.8–7.9                                            |
 | compaction | **background worker**（`Session.OpenWith`）。MANIFEST 追記は installGate、採番は CAS で一意化             | §8.6–8.7                                            |
 | 符号化     | **順序保持エンコーディング**（型タグ・escape・タプル）と **varint**（長さ・件数）                         | §4, §6.1, §8.2                                      |
 | 索引       | 複合キー（索引列 + 主キー）の prefix 走査                                                                 | §6                                                  |
@@ -161,7 +163,7 @@ flowchart TB
 | 行ストア         | `RowStore.fs` `Dml.fs` `Catalog.fs` `EngineHost.fs`                                           | `StorageEngine` `Compaction` `Manifest` `Transactions` |
 | MVCC             | `Transactions.fs`                                                                             | `Memtable`(`Entry`) `Errors` `Types`                   |
 | ストレージ       | `StorageEngine.fs` とその下                                                                   | `Errors` `Types` `Serialization`                       |
-| フロントエンド   | `Lexer` `Parser` `Ast`                                                                        | `Types` `Errors`                                       |
+| SQL層            | `Lexer` `Parser` `Ast`                                                                        | `Types` `Errors`                                       |
 
 > **Transactions と RowStore の依存方向**: `Transactions.fs` は `RowStore` を参照しない。
 > 依存は **`Dml` / `RowStore` → `Transactions` → `Memtable`** の向きで、
@@ -267,7 +269,7 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 ---
 
-## 3. フロントエンド
+## 3. SQL層
 
 `Ast.fs`（式・文の型）→ `Lexer.fs` → `ParserExpr.fs` → `Parser.fs` → `Binder.fs` → `Analyzer.fs` → `PlanBuilder.fs` → `Optimizer.fs` → `Plan.fs` という一方向のパイプライン。
 
@@ -1143,8 +1145,8 @@ commit 済みデータと食い違う）。flush の失敗自体は次の `Close
 
 `TransactionManager.activeSnapshot` は active な transaction の **最小 snapshot** を返す
 （無ければ `LastCommitSeqNo + 1`）。
-さらに `ActiveSnapshotRegistry`（`Transactions.fs`）が、
-**同じ DB を開いている全ハンドルの active snapshot** をプロセス内で集約する。
+さらに DB ごとの `SnapshotRegistry`（`Transactions.fs`）が、
+**同じ DB を開いている全ハンドルの active snapshot** を集約する。
 commit 時の GC 境界は両者の最小値で、これが各 `StorageEngine.ActiveSnapshot` に設定され、
 compaction の GC は「この SeqNo より古い版」だけを捨てる。
 replay 中は 0（全版を残す）を使う。
@@ -1232,8 +1234,8 @@ DB 全体を閉じるのは所有者（`Session.OpenWith` の `Session`、また
   install（MANIFEST 追記・Version 公開）だけを `EngineHost` の installGate で直列化する。
   reader は Session 呼び出し単位で Version 全ファイルを pin する。
 - **WAL は `FileMode.Append, FileShare.ReadWrite`**（`Wal.fs`）。
-  `writeBatch` / `maybeFlush` / `close` は DB のディレクトリ単位の Gate で直列化する。
-  異なる DB の書き込みは並行に進められる（Gate 表はプロセス内で共有）。
+  `writeBatch` / `maybeFlush` / `close` は DB ごとの `StorageRuntime` が持つ Gate で直列化する。
+  異なる DB の書き込みは並行に進められる（Gate は DB の寿命と一緒に回収される）。
   **プロセス全体の 1本の Gate にしない**（無関係な DB まで待たせない）。
 - **commit の fsync は Session のグループコミットでまとめる**（§8.5）。
   `writeGate` の内側では WAL 追記と位置の登録だけを行い、
@@ -1244,22 +1246,23 @@ DB 全体を閉じるのは所有者（`Session.OpenWith` の `Session`、また
   読み取りは接続間で並行、書き込みは `DatabaseHost.writeGate` で直列。
 - **プロセス間は `.rykdb.format` で排他**する（root 直下、`FileShare.None`。§7.9）
 
-### 7.8 DDL の排他（`RootGate`）
+### 7.8 DDL の排他（`RootRuntime`）
 
 `CREATE INDEX` の backfill は「テーブルを走査して索引エントリを書く」ので、
 途中に他の書き込みが入ると**索引に載らない行**ができる（または消えた行のエントリが残る）。
-そこで **DDL だけはプロセス内で排他**にする（`RootGate`、`Transactions.fs`）。
+そこで **DDL だけは DB ごとに排他**にする（`RootRuntime`、`Transactions.fs`）。
 
-| 操作                                       | ゲート                               |
-| ------------------------------------------ | ------------------------------------ |
-| DDL（CREATE / DROP / ALTER TABLE / INDEX） | **排他**（`RootGate.withExclusive`） |
-| 文の実行と commit（暗黙 transaction）      | 共有（`RootGate.withShared`）        |
-| `DatabaseHost.Begin` の登録とカタログ読込  | 共有（短時間だけ保持）               |
+| 操作                                       | ゲート                                  |
+| ------------------------------------------ | --------------------------------------- |
+| DDL（CREATE / DROP / ALTER TABLE / INDEX） | **排他**（`RootRuntime.WithExclusive`） |
+| 文の実行と commit（暗黙 transaction）      | 共有（`RootRuntime.WithShared`）        |
+| `DatabaseHost.Begin` の登録とカタログ読込  | 共有（短時間だけ保持）                  |
 
 DDL は次を順に行う。
 
 1. 排他を取る（実行中の文があれば終わるまで**待つ**）。
-2. `ActiveSnapshotRegistry` を見て、**同じ root で実行中の transaction があれば `ConflictError`** を返す。
+2. `RootRuntime.OldestExcept` を見て、
+   **同じ root で実行中の transaction があれば `ConflictError`** を返す。
    待たないのは、commit されないまま残った transaction で DDL が永久に止まらないため。
 3. 既存索引エントリの tombstone → 8192行ずつ backfill を commit → カタログ保存。
    `CREATE UNIQUE INDEX` は backfill 後に索引を走査して重複を検査する（直前の索引値だけ保持）。
@@ -1269,7 +1272,7 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 古いカタログの transaction は step 2 で弾かれるので、
 「索引を作ったのに、その索引を知らない transaction が後から commit する」経路がない。
 
-ゲートは root（正規化した絶対パス）単位の `ReaderWriterLockSlim` で、
+ゲートは DB ごとの `RootRuntime` が持つ `ReaderWriterLockSlim` で、
 同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
 ロックはプロセス内の表に残る（開いた DB の数だけ。数はふつう小さい）。
 **internal の `Database` ハンドル経由の登録は、参照が切れて GC されれば外れる**
@@ -1279,6 +1282,12 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 ハンドルへの参照が残っている間は、その root の DDL は `ConflictError` のまま。
 
 ### 7.9 プロセス間の排他（`.rykdb.format`）
+
+**マルチプロセスでの同時利用は目標としない。**
+複数プロセスが同じ DB を更新できるようにすると、ファイル単位のロック順序・
+stale lock の回収・他プロセスの部分書き込みの検出まで必要になり、排他制御が煩雑になる。
+そこで **DB を開いている間はファイルをロックし、他のプロセスが更新できないようにする**。
+プロセス内の並行アクセスは `Session` / MVCC で扱う（§7–§7.8）。
 
 WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つのプロセスが同じ DB を書くと壊れる。
 そこで `RowStore.openStore` は root の **`.rykdb.format` を `FileShare.None` で開いたまま保持**し
@@ -1428,11 +1437,12 @@ Footer は `metadataChecksum`（Meta / Bloom / Index）と自身のチェック�
 （読まなかったブロックは検証されない）。
 全体チェックサムは部分読みでは検証できないため持たない。
 
-パース済みの `SstPartial` は `SstPartialCache` が**弱参照**で保持する
+パース済みの `SstPartial` は DB ごとの `SstCache` が**弱参照**で保持する
 （キーは「パス + サイズ + mtime」。
 ファイル番号は単調増加で中身は書き換わらないため安全に共有でき、GC が回収できるのでメモリを圧迫しない）。
 同じファイルの 2回目以降の検索・走査は Footer/index の再読み込みを省略できる。
-（不変 engine は読み取り中に状態を持てないため、キャッシュはモジュール内のサイドテーブル）。
+`SstCache` は `StorageRuntime` が所有し、不変の `StorageEngine` のコピー間で共有される
+（DB の寿命と一緒に回収され、プロセス全体のサイドテーブルにはならない）。
 キーはファイル世代ごとに増える（flush / compaction で SSTable が作り直される）ため、
 `put` がキー数 512 ごとに**死んだ弱参照だけ**を掃除する
 （生きた参照は実行中の走査が使うので残す）。
@@ -1961,13 +1971,14 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 ### 12.1 採用しなかったもの
 
-| もの                  | 理由                                                                                      |
-| --------------------- | ----------------------------------------------------------------------------------------- |
-| B-Tree                | LSM を採用したため。range scan と書き込みの線形化が方針                                   |
-| 永続スキップリスト    | パスコピーでは level 0 の鎖が壊れる（§8.1）                                               |
-| ページイメージ WAL    | 論理ログのほうが安全（§8.5）                                                              |
-| ブロック圧縮 / 暗号化 | スコープ外                                                                                |
-| lock-free データ構造  | 接続単位の `Session` で読み取りを並行・書き込みを直列に扱い、内部は不変値で足りる（§7.7） |
+| もの                       | 理由                                                                                                                    |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| B-Tree                     | LSM を採用したため。range scan と書き込みの線形化が方針                                                                 |
+| 永続スキップリスト         | パスコピーでは level 0 の鎖が壊れる（§8.1）                                                                             |
+| ページイメージ WAL         | 論理ログのほうが安全（§8.5）                                                                                            |
+| ブロック圧縮 / 暗号化      | スコープ外                                                                                                              |
+| lock-free データ構造       | 接続単位の `Session` で読み取りを並行・書き込みを直列に扱い、内部は不変値で足りる（§7.7）                               |
+| マルチプロセスでの同時更新 | ファイル排他が煩雑になるため。1つの root は同時に 1プロセスだけが開き、他プロセスは `FileShare.None` で拒否する（§7.9） |
 
 ### 12.2 既知の制約
 
@@ -2011,7 +2022,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 
 #### 12.2.3 並行性・トランザクション
 
-- **DDL はプロセス内で排他**（`RootGate`）。
+- **DDL は DB ごとに排他**（`RootRuntime`）。
   `CREATE INDEX` の backfill 中は他の文が待つ。
   同じ root で実行中の transaction があれば DDL は `ConflictError` を返す（§7.8）。
 - **接続ごとに `Session` を作る**（`SessionPool.CreateSession`。§7.6 / §11.3）。
@@ -2025,9 +2036,10 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   分離レベルの指定（`BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...`）、
   `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`、読み取り専用トランザクションは未対応
   （`sql-reference.md` §12/§14）。
-- **同じ root はプロセス内で 1つしか開けない**（§7.9）。
-  2回目の `Session.OpenWith` は `IoError`。
-  別プロセスが開いていても `IoError`。
+- **マルチプロセスでの同時更新はサポートしない**（§7.9）。
+  1つの root を開けるのは同時に 1プロセスだけで、別プロセスが開いていれば
+  `.rykdb.format` の `FileShare.None` により 2つ目の `Session.OpenWith` は `IoError`。
+  同じプロセスで二重に開くこともできない（2回目の `Session.OpenWith` は `IoError`）。
   クラッシュ再現テストに限り、`RowStore.openStoreTakingOver` と `Database.OpenWithStore` で例外的に二重に開く。
 - **internal の `Database` ハンドル経由の transaction は、commit / rollback / `Close()` されずに参照が切れて GC されるまでその root の DDL を `ConflictError` にする**（§7.8）。
   公開 `Session` の登録は finalizer が無いため、`Rollback()` / `Close()` で確実に終わらせること。

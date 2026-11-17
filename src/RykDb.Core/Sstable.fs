@@ -43,7 +43,7 @@ module internal Sstable =
 
     /// ファイルの一部だけを読んで SSTable を開く。
     /// footer / index / Bloom / meta だけを読み、データブロックは必要になったとき読む。
-    let openPartial (path: string) =
+    let openPartialWith (cache: SstCache) (path: string) =
         let readMinMaxKey metaBytes =
             match Cursor.create metaBytes |> Reader.readLengthPrefixed with
             | Ok(mn, c) ->
@@ -163,6 +163,7 @@ module internal Sstable =
                                 Bloom = bloom
                                 EntryCount = int64 footer.EntryCount
                                 MaxSeqNo = footer.MaxSeqNo
+                                Cache = cache
                             }
                     }
 
@@ -177,6 +178,10 @@ module internal Sstable =
                             sprintf "%s|%d|%d" path stream.Length (System.IO.File.GetLastWriteTimeUtc(path).Ticks)
                     })
         >>= id
+
+    /// ファイルの一部だけを読んで SSTable を開く（単体利用向け）。
+    /// DB 経由の読み取りは、DB が所有するキャッシュを渡す `openPartialWith` を使う。
+    let openPartial (path: string) = openPartialWith (SstCache()) path
 
     /// 接頭辞共有されたキーを復元する。
     /// `Array.append (Array.take ...)` の中間配列を作らない。
@@ -388,7 +393,7 @@ module internal Sstable =
     /// ブロック内のキー・SeqNo・値の位置をキャッシュする。
     /// ポイント検索のたびにキー復元と値の読み飛ばしを繰り返さないため。
     /// `Partial` を強参照して、ブロックがキャッシュされている間は
-    /// `SstPartialCache` の弱参照が外れても index/Bloom を開き直さないようにする。
+    /// DB の部分読みキャッシュの弱参照が外れても index/Bloom を開き直さないようにする。
     let private cacheBlock (partial: SstPartial) (data: byte array) (indexEntry: SstIndexEntry) =
         let rec loop payloadLen (prev: byte array) keys seqNos offsets lengths c =
             if Cursor.atEnd c then
@@ -398,7 +403,7 @@ module internal Sstable =
                     if Bytes.compare lastKey indexEntry.LastKey <> 0 then
                         err (DbError.corruption "Sstable: 索引の LastKey とブロックが一致しません")
                     else
-                        let block: SstableFormat.CachedSstBlock =
+                        let block =
                             {
                                 Partial = partial
                                 Raw = data
@@ -474,7 +479,7 @@ module internal Sstable =
 
     let private lookupCachedWith
         (maskOpt: bool array option)
-        (block: SstableFormat.CachedSstBlock)
+        (block: CachedSstBlock)
         (key: byte array)
         (visible: uint64 option)
         (indexEntry: SstIndexEntry)
@@ -559,7 +564,7 @@ module internal Sstable =
                 buffer)
 
         let lookupEntry indexEntry =
-            match SstableFormat.tryGetCachedBlock partial indexEntry with
+            match partial.Cache.TryGetBlock(partial, indexEntry) with
             | Some block -> lookupCachedWith maskOpt block key visible indexEntry
             | None ->
                 match readBlock indexEntry with
@@ -568,7 +573,7 @@ module internal Sstable =
                     match cacheBlock partial raw indexEntry with
                     | Error e -> err e
                     | Ok block ->
-                        SstableFormat.putCachedBlock partial indexEntry block
+                        partial.Cache.PutBlock(partial, indexEntry, block)
                         lookupCachedWith maskOpt block key visible indexEntry
 
         let rec find i =

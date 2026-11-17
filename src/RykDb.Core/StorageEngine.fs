@@ -8,46 +8,13 @@
 
 namespace RykDb.Core
 
-/// 部分読み用の SSTable リーダー（index / Bloom / meta のみ）のキャッシュ。
-module private SstPartialCache =
-    let private Cache =
-        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstPartial>>
-            System.StringComparer.Ordinal
-
-    /// キー数がこの倍数になるたびに、死んだ弱参照を掃除する。
-    /// キーは「ファイルごと」に増える（flush / compaction でファイルが作り直される）ため、
-    /// 掃除しないと辞書のキー文字列だけがプロセス寿命で溜まり続ける。
-    [<Literal>]
-    let private SweepEvery = 512
-
-    /// ファイルの同一性を表すキー。
-    /// 同じ番号のファイルが差し替わった場合はサイズ/mtime が変わるので別キーになる。
-    let keyOf (path: string) (info: System.IO.FileInfo) =
-        sprintf "%s|%d|%d" path info.Length info.LastWriteTimeUtc.Ticks
-
-    let tryGet (key: string) =
-        match Cache.TryGetValue key with
-        | true, weak ->
-            match weak.TryGetTarget() with
-            | true, partial -> Some partial
-            | _ ->
-                Cache.TryRemove key |> ignore
-                None
-        | _ -> None
-
-    /// 死んだ弱参照（対象の `SstPartial` が GC されたエントリ）を辞書から外す。
-    /// 生きた参照は、実行中の走査が使っている可能性があるので残す。
-    let private sweep () =
-        for kv in Cache do
-            match kv.Value.TryGetTarget() with
-            | true, _ -> ()
-            | _ -> Cache.TryRemove kv.Key |> ignore
-
-    let put (key: string) (partial: SstPartial) =
-        Cache.[key] <- System.WeakReference<SstPartial> partial
-
-        if Cache.Count % SweepEvery = 0 then
-            sweep ()
+/// 1つの DB が共有する実行時状態。
+/// `StorageEngine` の不変コピー間で参照を共有し、DB の寿命と一緒に回収する。
+type internal StorageRuntime() =
+    let cache = SstCache()
+    let gate = new System.Threading.SemaphoreSlim(1, 1)
+    member _.Cache = cache
+    member _.Gate = gate
 
 /// StorageEngine の不変状態。
 /// すべての操作は新しい状態を返す。
@@ -76,33 +43,25 @@ type internal StorageEngine =
         /// GC は「これより新しい版」と「これ以下の最新 1版」を残す（Compaction.gcGroup）。
         /// 0 は「全版を残す」。
         ActiveSnapshot: uint64
+        /// DB ごとの実行時状態（SSTable キャッシュ・書き込み Gate）。
+        Runtime: StorageRuntime
     }
 
 module internal StorageEngine =
-    // writeBatch / maybeFlush / close は、同じ DB の WAL / memtable 競合を
-    // 防ぐため直列化する。
-    // 異なる DB は並行に進められるよう、ディレクトリ単位の Gate にする
-    // （プロセス全体の 1本にしない）。
-    let private DirGates =
-        System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.SemaphoreSlim>
-            System.StringComparer.Ordinal
-
-    let private normalizeDir (dir: string) =
-        match protect (fun () -> System.IO.Path.GetFullPath dir) with
-        | Ok full -> full
-        | Error _ -> dir
-
-    let private dirGate (dir: string) =
-        DirGates.GetOrAdd(normalizeDir dir, fun _ -> new System.Threading.SemaphoreSlim(1, 1))
-
-    let private withDirGate (dir: string) (f: unit -> 'T) =
-        let gate = dirGate dir
-        gate.Wait()
+    // writeBatch / maybeFlush / close は、同じ DB の WAL / memtable 競合を防ぐため直列化する。
+    // Gate は DB の Runtime が所有する。
+    let private withRuntimeGate (engine: StorageEngine) (f: unit -> 'T) =
+        engine.Runtime.Gate.Wait()
 
         try
             f ()
         finally
-            gate.Release() |> ignore
+            engine.Runtime.Gate.Release() |> ignore
+
+    /// ファイルの同一性を表すキー。
+    /// 同じ番号のファイルが差し替わった場合はサイズ/mtime が変わるので別キーになる。
+    let private cacheKeyOf (path: string) (info: System.IO.FileInfo) =
+        sprintf "%s|%d|%d" path info.Length info.LastWriteTimeUtc.Ticks
 
     /// SSTable に書く Bloom filter の誤検出率。
     [<Literal>]
@@ -113,26 +72,27 @@ module internal StorageEngine =
     let private DefaultMemLimitBytes = 64 * 1024 * 1024
 
     /// 部分読み用の reader を開く（index / Bloom / meta のみ）。
-    let private openPartialSstIn (dir: string) (f: FileMetaData) =
+    let private openPartialSstIn (cache: SstCache) (dir: string) (f: FileMetaData) =
         let path = FileMetaData.path dir f.FileNumber
 
-        protect (fun () -> System.IO.FileInfo path |> SstPartialCache.keyOf path)
+        protect (fun () -> System.IO.FileInfo path |> cacheKeyOf path)
         >>= fun key ->
-            match SstPartialCache.tryGet key with
+            match cache.TryGetPartial key with
             | Some partial -> ret partial
             | None ->
-                Sstable.openPartial path
+                Sstable.openPartialWith cache path
                 >>= fun partial ->
-                    SstPartialCache.put key partial
+                    cache.PutPartial(key, partial)
                     ret partial
 
-    let private openPartialSst (f: FileMetaData) (engine: StorageEngine) = openPartialSstIn engine.Dir f
+    let private openPartialSst (f: FileMetaData) (engine: StorageEngine) =
+        openPartialSstIn engine.Runtime.Cache engine.Dir f
 
     /// バックグラウンド compaction 用の走査。
     /// ファイルの先頭から全件を遅延して読む。
     /// compaction はキー・SeqNo・削除タグしか見ないので、値は復号せずスライスのまま渡す。
-    let openScan (dir: string) (f: FileMetaData) =
-        openPartialSstIn dir f
+    let openScan (cache: SstCache) (dir: string) (f: FileMetaData) =
+        openPartialSstIn cache dir f
         >>= fun partial -> ret (Sstable.rangeScanPartialRaw [||] 0 partial)
 
     /// 列マスク付きのポイントルックアップ。
@@ -339,7 +299,7 @@ module internal StorageEngine =
                 NextTxnId = nextTxnId
             }
 
-        withDirGate engine.Dir (fun () ->
+        withRuntimeGate engine (fun () ->
             result {
                 let txnId = engine.NextTxnId
 
@@ -419,7 +379,7 @@ module internal StorageEngine =
     /// background compaction の有効時は RowStore がこちらを呼び、MANIFEST 反映後に worker を起こす。
     /// 戻り値の bool は「実際に flush したか」。
     let flushIfNeededWith (allocateFileNumber: unit -> int64) (engine: StorageEngine) =
-        withDirGate engine.Dir (fun () ->
+        withRuntimeGate engine (fun () ->
             if
                 not (Memtable.isEmpty engine.Mem)
                 && Memtable.approxBytes engine.Mem >= engine.MemLimitBytes
@@ -496,7 +456,7 @@ module internal StorageEngine =
     /// memtable が上限に達していれば flush し、続けて compaction する（同期版）。
     /// compaction の失敗は flush 後の engine と一緒に返す。
     let maybeFlush (engine: StorageEngine) =
-        withDirGate engine.Dir (fun () ->
+        withRuntimeGate engine (fun () ->
             if
                 not (Memtable.isEmpty engine.Mem)
                 && Memtable.approxBytes engine.Mem >= engine.MemLimitBytes
@@ -598,6 +558,7 @@ module internal StorageEngine =
                 MemLimitBytes = DefaultMemLimitBytes
                 Compaction = CompactionOptions.Defaults
                 ActiveSnapshot = 0UL
+                Runtime = StorageRuntime()
             }
 
         let buildRecovered version manifestNumber walState mem walMax diskMax walMaxTxn =
@@ -651,7 +612,7 @@ module internal StorageEngine =
     /// （古い memtable を flush すると新しいハンドルの書き込みを消してしまう）。
     /// </remarks>
     let close (engine: StorageEngine) =
-        withDirGate engine.Dir (fun () ->
+        withRuntimeGate engine (fun () ->
             let isLatestWriter =
                 match protect (fun () -> System.IO.FileInfo(Wal.path engine.Dir engine.Wal.FileNumber).Length) with
                 | Ok size -> size = int64 engine.Wal.Size

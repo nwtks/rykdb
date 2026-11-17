@@ -386,7 +386,7 @@ module internal RootKey =
 /// Core は `mutable` / `ref` を 0件に保つ規約なので、
 /// 連番カウンタではなく参照等価のオブジェクトを鍵にする。
 /// </remarks>
-type internal ActiveRegistration internal (root: string) =
+type internal ActiveRegistration internal (root: string, unregister: ActiveRegistration -> unit) =
     /// 生存しているハンドルのトークン。
     let handles = System.Collections.Concurrent.ConcurrentDictionary<obj, byte>()
 
@@ -405,18 +405,21 @@ type internal ActiveRegistration internal (root: string) =
         handles.TryRemove token |> ignore
         handles.IsEmpty
 
-/// プロセス内で開いている全ハンドルの active transaction の snapshot を集約する。
+    /// 登録を解除する（登録先のレジストリを保持している）。
+    member this.Unregister() = unregister this
+
+/// DB ごとの active transaction の snapshot を集約する。
 /// <remarks>
 /// GC の境界は「最古の active snapshot」なので、
 /// 同じ DB を別ハンドルで開いて長い transaction を走らせている場合も、
 /// その snapshot を考慮しないと compaction がまだ必要な版を捨ててしまう
 /// （`TransactionManager` はハンドル単位のため分からない）。
-/// 複数プロセスからの同時アクセスは非対応なので、プロセス内の表で十分。
+/// 複数プロセスからの同時アクセスは非対応なので、DB ごとの表で十分。
 /// 永続化もしない（再オープン後の transaction は存在しない）。
 /// </remarks>
-module internal ActiveSnapshotRegistry =
+type internal SnapshotRegistry() =
     /// 正規化した root -> (登録 -> snapshot)。
-    let private ByRoot =
+    let byRoot =
         System.Collections.Concurrent.ConcurrentDictionary<
             string,
             System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>
@@ -425,55 +428,53 @@ module internal ActiveSnapshotRegistry =
 
     /// 全操作を直列化する。
     /// <remarks>
-    /// `register` が bucket を `GetOrAdd` してから登録を追加する前に、
-    /// 別スレッドの `unregister` が空の bucket を削除すると、
+    /// `Register` が bucket を `GetOrAdd` してから登録を追加する前に、
+    /// 別スレッドの `Unregister` が空の bucket を削除すると、
     /// 登録が削除済みの bucket に書かれて消える。
     /// 登録・解除・最古値の走査を 1本の Gate に通して競合をなくす。
     /// </remarks>
-    let private Gate = new System.Threading.SemaphoreSlim(1, 1)
+    let gate = new System.Threading.SemaphoreSlim(1, 1)
 
-    let private withGate (f: unit -> 'T) =
-        Gate.Wait()
+    let withGate (f: unit -> 'T) =
+        gate.Wait()
 
         try
             f ()
         finally
-            Gate.Release() |> ignore
+            gate.Release() |> ignore
 
     /// 正規化済み key の bucket を取る（呼び出しは Gate の内側）。
-    let private bucket (key: string) =
-        ByRoot.GetOrAdd(key, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>())
+    let bucket (key: string) =
+        byRoot.GetOrAdd(key, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>())
 
     /// snapshot を登録し、解除に使う登録を返す。
-    let register (root: string) (snapshot: uint64) =
+    member this.Register(root: string, snapshot: uint64) =
         let key = RootKey.normalize root
 
         withGate (fun () ->
-            let registration = ActiveRegistration key
+            let registration = ActiveRegistration(key, fun reg -> this.Unregister reg)
             (bucket key).[registration] <- snapshot
             registration)
 
     /// 登録を解除する（commit 成功・rollback・Close・最後のハンドルの GC）。
     /// 解除し忘れても「版を余分に残す」側にしか倒れない（安全側）。
-    let unregister (root: string) (registration: ActiveRegistration) =
-        let key = RootKey.normalize root
-
+    member _.Unregister(registration: ActiveRegistration) =
         withGate (fun () ->
-            match ByRoot.TryGetValue key with
+            match byRoot.TryGetValue registration.Root with
             | true, inner ->
                 inner.TryRemove registration |> ignore
 
                 if inner.IsEmpty then
-                    ByRoot.TryRemove key |> ignore
+                    byRoot.TryRemove registration.Root |> ignore
             | _ -> ())
 
     /// その root で active な snapshot の最小値。
     /// registration に自分の登録を渡すと、これから commit する transaction 自身を除外できる。
-    let oldestExcept (root: string) (registration: ActiveRegistration option) =
+    member _.OldestExcept(root: string, registration: ActiveRegistration option) =
         let key = RootKey.normalize root
 
         withGate (fun () ->
-            match ByRoot.TryGetValue key with
+            match byRoot.TryGetValue key with
             | true, inner ->
                 inner
                 |> Seq.fold
@@ -492,6 +493,47 @@ module internal ActiveSnapshotRegistry =
                     None
             | _ -> None)
 
+/// DB ごとの RootGate と active snapshot 登録。
+/// `RowStore` が所有し、不変ハンドル間で共有する。
+type internal RootRuntime() =
+    let gate =
+        new System.Threading.ReaderWriterLockSlim(System.Threading.LockRecursionPolicy.SupportsRecursion)
+
+    let snapshots = SnapshotRegistry()
+
+    /// 書き込み系（文の実行と commit）の共有ロック。
+    /// 既にこのスレッドがロックを持っていれば何もしない（DDL の内部 commit・入れ子の commit）。
+    member _.WithShared(f: unit -> 'r) =
+        if gate.IsReadLockHeld || gate.IsWriteLockHeld then
+            f ()
+        else
+            gate.EnterReadLock()
+
+            try
+                f ()
+            finally
+                gate.ExitReadLock()
+
+    /// DDL の排他ロック。
+    /// 書き込み中の文があれば終わるまで待つ。
+    member _.WithExclusive(f: unit -> 'r) =
+        if gate.IsWriteLockHeld then
+            f ()
+        else
+            gate.EnterWriteLock()
+
+            try
+                f ()
+            finally
+                gate.ExitWriteLock()
+
+    member _.Register(root: string, snapshot: uint64) = snapshots.Register(root, snapshot)
+
+    member _.Unregister(registration: ActiveRegistration) = snapshots.Unregister registration
+
+    member _.OldestExcept(root: string, registration: ActiveRegistration option) =
+        snapshots.OldestExcept(root, registration)
+
 /// `Database` ハンドルの生存に結び付いた登録リース。
 /// <remarks>
 /// ハンドルが commit / rollback / Close されずに捨てられても、
@@ -508,60 +550,8 @@ type internal RegistrationLease(registration: ActiveRegistration) =
     /// 最後の 1本なら registry からも消える。二重呼び出しは無害。
     member _.Release() =
         if registration.Detach token then
-            ActiveSnapshotRegistry.unregister registration.Root registration
+            registration.Unregister()
 
     override this.Finalize() =
         // finalizer から例外を漏らさない（.NET ではプロセス終了になる）。
         protect (fun () -> this.Release()) |> ignore
-
-/// 進行中の書き込みと DDL を同じ root 単位で直列化する。
-/// <remarks>
-/// `CREATE INDEX` の backfill は「テーブルを走査して索引エントリを書く」ので、
-/// 途中で別の書き込みが入ると索引に載らない行ができる。
-/// - **DDL**（CREATE INDEX / DROP INDEX / DROP TABLE / CREATE TABLE）は排他ロックを取る。
-/// - **文の実行と commit** は共有ロックを取り、DDL の実行中は待つ。
-/// 明示 transaction はロックを保持しない
-/// （DDL は active snapshot を検出して ConflictError で拒否する）。
-/// 同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
-/// </remarks>
-module internal RootGate =
-    /// 正規化した root -> ゲート。
-    let private Gates =
-        System.Collections.Concurrent.ConcurrentDictionary<string, System.Threading.ReaderWriterLockSlim>
-            System.StringComparer.Ordinal
-
-    let private gateOf (root: string) =
-        Gates.GetOrAdd(
-            RootKey.normalize root,
-            fun _ -> new System.Threading.ReaderWriterLockSlim(System.Threading.LockRecursionPolicy.SupportsRecursion)
-        )
-
-    /// 書き込み系（文の実行と commit）の共有ロック。
-    /// 既にこのスレッドがロックを持っていれば何もしない（DDL の内部 commit・入れ子の commit）。
-    let withShared (root: string) (f: unit -> 'r) =
-        let gate = gateOf root
-
-        if gate.IsReadLockHeld || gate.IsWriteLockHeld then
-            f ()
-        else
-            gate.EnterReadLock()
-
-            try
-                f ()
-            finally
-                gate.ExitReadLock()
-
-    /// DDL の排他ロック。
-    /// 書き込み中の文があれば終わるまで待つ。
-    let withExclusive (root: string) (f: unit -> 'r) =
-        let gate = gateOf root
-
-        if gate.IsWriteLockHeld then
-            f ()
-        else
-            gate.EnterWriteLock()
-
-            try
-                f ()
-            finally
-                gate.ExitWriteLock()

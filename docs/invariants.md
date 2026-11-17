@@ -380,7 +380,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - 物理エントリの無い予約だけの commit でも SeqNo を進める。
   - `NULL` を含む UNIQUE 値は予約しない（既存の UNIQUE 検査と同じ）。
   - 予約は物理キーではないため、`CREATE UNIQUE INDEX` の backfill は不要。
-    DDL は排他（`RootGate`）で active transaction を拒否する。
+    DDL は排他（`RootRuntime`）で active transaction を拒否する。
 - 回帰テスト:
   - `Transaction.reserveUnique: 同じ索引値の予約は 1 件にまとまる`
   - `TransactionManager.commit: UNIQUE の論理予約が競合する`

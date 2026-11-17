@@ -19,6 +19,15 @@ type internal SstIndexEntry =
         Length: int
     }
 
+/// ファイル世代（FileKey）とブロック位置でブロックを特定する。
+[<Struct>]
+type private SstBlockKey =
+    {
+        FileKey: string
+        Offset: int
+        Length: int
+    }
+
 /// SSTable の部分読み取り用リーダー。
 /// ファイル全体を読まず、footer / index / Bloom / meta だけを保持する。
 type internal SstPartial =
@@ -33,7 +42,72 @@ type internal SstPartial =
         Bloom: BloomFilter option
         EntryCount: int64
         MaxSeqNo: uint64
+        /// この部分読みを所有する DB のキャッシュ。
+        Cache: SstCache
     }
+
+/// ポイント検索で解析済みの 1ブロック。
+and internal CachedSstBlock =
+    {
+        Partial: SstPartial
+        Raw: byte array
+        Keys: byte array array
+        SeqNos: uint64 array
+        ValueOffsets: int array
+        ValueLengths: int array
+        LastKey: byte array
+    }
+
+/// DB ごとの SSTable キャッシュ。
+/// 不変の `StorageEngine` が参照を共有するので、DB の寿命と一緒に回収される。
+and internal SstCache() =
+    let partials =
+        System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<SstPartial>>(
+            System.StringComparer.Ordinal
+        )
+
+    let blocks =
+        System.Collections.Concurrent.ConcurrentDictionary<SstBlockKey, CachedSstBlock>()
+
+    let blockKey (partial: SstPartial) (indexEntry: SstIndexEntry) =
+        {
+            FileKey = partial.FileKey
+            Offset = indexEntry.Offset
+            Length = indexEntry.Length
+        }
+
+    let sweep () =
+        for kv in partials do
+            match kv.Value.TryGetTarget() with
+            | true, _ -> ()
+            | _ -> partials.TryRemove kv.Key |> ignore
+
+    member _.TryGetPartial(key: string) =
+        match partials.TryGetValue key with
+        | true, weak ->
+            match weak.TryGetTarget() with
+            | true, partial -> Some partial
+            | _ ->
+                partials.TryRemove key |> ignore
+                None
+        | _ -> None
+
+    member _.PutPartial(key: string, partial: SstPartial) =
+        partials.[key] <- System.WeakReference<SstPartial> partial
+
+        if partials.Count % 512 = 0 then
+            sweep ()
+
+    member _.TryGetBlock(partial: SstPartial, indexEntry: SstIndexEntry) =
+        match blocks.TryGetValue(blockKey partial indexEntry) with
+        | true, block -> Some block
+        | _ -> None
+
+    member _.PutBlock(partial: SstPartial, indexEntry: SstIndexEntry, block: CachedSstBlock) =
+        if blocks.Count >= 2048 then
+            blocks.Clear()
+
+        blocks.TryAdd(blockKey partial indexEntry, block) |> ignore
 
 /// `SstableFormat.writeTo` の結果。
 /// 入力が `seq` なので、書き出しに成功してから先頭・末尾のキーを数え直せない。
@@ -51,26 +125,6 @@ type internal SstWriteInfo =
     }
 
 module internal SstableFormat =
-    type internal CachedSstBlock =
-        {
-            Partial: SstPartial
-            Raw: byte array
-            Keys: byte array array
-            SeqNos: uint64 array
-            ValueOffsets: int array
-            ValueLengths: int array
-            LastKey: byte array
-        }
-
-    /// ファイル世代（FileKey）とブロック位置でブロックを特定する。
-    [<Struct>]
-    type private SstBlockKey =
-        {
-            FileKey: string
-            Offset: int
-            Length: int
-        }
-
     /// 1ブロックあたりのエントリ数。
     [<Literal>]
     let private EntriesPerBlock = 128
@@ -97,29 +151,6 @@ module internal SstableFormat =
     /// Footer で footerChecksum がカバーするバイト数（metadataChecksum フィールド込み）。
     [<Literal>]
     let private FooterChecksumLength = 80
-
-    /// ポイント検索のブロック解析結果。
-    /// 件数上限を超えたら全消しする（LRU は持たない）。
-    let private blockCache =
-        System.Collections.Concurrent.ConcurrentDictionary<SstBlockKey, CachedSstBlock>()
-
-    let private blockKey (partial: SstPartial) (indexEntry: SstIndexEntry) =
-        {
-            FileKey = partial.FileKey
-            Offset = indexEntry.Offset
-            Length = indexEntry.Length
-        }
-
-    let internal tryGetCachedBlock (partial: SstPartial) (indexEntry: SstIndexEntry) =
-        match blockCache.TryGetValue(blockKey partial indexEntry) with
-        | true, block -> Some block
-        | _ -> None
-
-    let internal putCachedBlock (partial: SstPartial) (indexEntry: SstIndexEntry) (block: CachedSstBlock) =
-        if blockCache.Count >= 2048 then
-            blockCache.Clear()
-
-        blockCache.TryAdd(blockKey partial indexEntry, block) |> ignore
 
     // Footer
     //   magic(8) version(4) maxSeqNo(8) indexOff(8) indexLen(8)

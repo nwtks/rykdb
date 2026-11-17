@@ -1485,14 +1485,14 @@ DDL を transaction に載せる設計に変えるまでは、この制約を維
 現在行を 8192行ずつ backfill し、成功後にカタログへ登録する。
 途中で失敗しても索引はカタログに載っておらず、次回の `CREATE INDEX` が残骸を消してからやり直す。
 
-### 11.16a DDL（CREATE INDEX など）は `RootGate` で排他にする
+### 11.16a DDL（CREATE INDEX など）は `RootRuntime` で排他にする
 
 backfill の途中に別の書き込みが入ると、**その行が索引に載らない**（逆に、消えた行の
 エントリが残る）。
-DDL だけはプロセス内で排他にする必要がある。
+DDL だけは DB ごとに排他にする必要がある。
 
-- 文の実行と commit は `RootGate.withShared`、DDL は `RootGate.withExclusive`（§7.8）。
-- DDL は排他を取ったあと `ActiveSnapshotRegistry` を見て、
+- 文の実行と commit は `RootRuntime.WithShared`、DDL は `RootRuntime.WithExclusive`（§7.8）。
+- DDL は排他を取ったあと `RootRuntime.OldestExcept` を見て、
   **同じ root で実行中の transaction があれば `ConflictError`** を返す。
   古いカタログで計算した索引エントリを後から commit されるのを防ぐため。
   **待たない**（commit されないまま残った transaction で永久に止まらないように）。
@@ -1576,7 +1576,7 @@ DDL だけはプロセス内で排他にする必要がある。
 
 ### 11.22 SSTable の partial reader キャッシュは「パス + サイズ + mtime」で無効化する
 
-`SstPartialCache` はパース済み `SstPartial` を弱参照で保持する。
+DB ごとの `SstCache` はパース済み `SstPartial` を弱参照で保持する。
 キーにサイズと mtime を含めないと、同じファイル番号のファイルを差し替えたときに古い内容を返す。
 
 - テストで SSTable を書き換えたら `File.SetLastWriteTimeUtc` で mtime を確実に進める。
@@ -1737,15 +1737,15 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
   `RowStore.openStore: ロック失敗時は format マーカーを書き換えない` /
   `RowStore: format マーカーがプロセス間ロックを兼ねる`。
 
-### 11.35 `ActiveSnapshotRegistry` の bucket 削除と register は競合する
+### 11.35 `SnapshotRegistry` の bucket 削除と register は競合する
 
 `ConcurrentDictionary.GetOrAdd` で bucket を取ってから登録を追加する間、
-別スレッドの `unregister` が「空になった」と判断して bucket を削除すると、
+別スレッドの `Unregister` が「空になった」と判断して bucket を削除すると、
 追加した登録が削除済みの bucket に入って消える。
 registry の登録が消えると compaction の GC 境界が上がり、まだ必要な版を捨て得る。
 
-- `register` / `unregister` / `oldestExcept` を 1本の `SemaphoreSlim`（Gate）で直列化する。
-- 回帰テスト: `ActiveSnapshotRegistry: 並行 register/unregister で登録が消えない`
+- `Register` / `Unregister` / `OldestExcept` を 1本の `SemaphoreSlim`（Gate）で直列化する。
+- 回帰テスト: `SnapshotRegistry: 並行 register/unregister で登録が消えない`
   （登録直後の `oldestExcept` が必ず `Some` になることを並列で確認）。
 
 ### 11.36 外部ソートの run は全部を同時に open しない
@@ -1759,16 +1759,15 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 - 回帰テスト: `ExtSort.sortRows: 50000行を小さなバジェットで溢らしても整列できる`
   （数百 run を作り、一時ファイルが残らないことも確認）。
 
-### 11.37 `StorageEngine` の書き込み Gate はディレクトリ単位にする
+### 11.37 `StorageEngine` の書き込み Gate は DB ごとの Runtime が持つ
 
 以前は `WriteCloseGate` というプロセス全体の 1本の `SemaphoreSlim` で
 `writeBatch` / `close` を直列化していた。
 このため、無関係な DB の書き込みまで互いに待たされていた。
 
-- `StorageEngine` は `Dir`（正規化した DB ディレクトリ）ごとの Gate を持つ。
+- `StorageEngine` は DB ごとの `StorageRuntime` が持つ Gate を共有する。
 - `writeBatch` / `maybeFlush`（flush + compaction）/ `close` を同じ Gate で直列化する。
-- 異なる DB は並行。Gate 表はプロセス内で共有し、キーは正規化したパス。
-- Gate 表は開いた DB の数だけ残る（プロセス寿命。通常は小さい）。
+- 異なる DB は並行。Gate は DB の寿命と一緒に回収される。
 
 ### 11.38 未対応の SQL 語をテーブル別名として飲み込まない
 
@@ -2079,7 +2078,7 @@ merge 中に foreground の flush や新しい transaction が入り得る。
   開始後に登録された古い snapshot が見る版を削除したりする。
 - ✅ install は **installGate** の下で現在の `HostState` を再読する。
   1. `Removed` の全ファイルが現在の Version に存在するか。
-  2. 現在の最古 snapshot（`ActiveSnapshotRegistry.oldestExcept` と
+  2. 現在の最古 snapshot（`RootRuntime.OldestExcept` と
      `HostState.ActiveSnapshot` の小さい方）が開始時より古くなっていないか。
      どちらかが不成立なら **出力を削除して再試行**する。
 - ファイル番号は `EngineHost` の CAS 採番だけを使う。

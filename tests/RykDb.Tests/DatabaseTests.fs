@@ -36,7 +36,7 @@ let private openWithTakingOver (root: string) =
 [<System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)>]
 let private abandonTransaction (db: Database) =
     let tx = ok (db.Begin())
-    let registered = (ActiveSnapshotRegistry.oldestExcept db.Root None).IsSome
+    let registered = (db.Runtime.OldestExcept(db.Root, None)).IsSome
     // tx はここを抜けると到達不能になる（finalizer が登録を外せる）。
     registered && tx.InTransaction
 
@@ -850,35 +850,36 @@ let ``Database: active transaction は snapshot registry に登録され、commi
     withDir "reg-lifecycle" (fun dir ->
         let db = ok (Database.OpenWith dir)
         let root = db.Root
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
+        let runtime = db.Runtime
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
         // 明示 transaction: Begin で登録、Commit で解除
         let tx = ok (db.Begin())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
         let committed = ok (tx.Commit())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
         // Rollback でも解除
         let tx2 = ok (committed.Begin())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
         let rolledBack = ok (tx2.Rollback())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
         // SQL の BEGIN / COMMIT 経由でも同じ
         let sqlTx, _ = ok (execSql rolledBack "BEGIN")
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
         let sqlDone, _ = ok (execSql sqlTx "COMMIT")
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
         // 暗黙 transaction は Execute の中で登録・解除が完結する
         let withTable, _ = ok (execSql sqlDone "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone)
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
         // Close でも解除される（閉じたハンドルの snapshot は誰も読めない）
         let openTx = ok (withTable.Begin())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
         ok (openTx.Close())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsNone))
+        Assert.True((runtime.OldestExcept(root, None)).IsNone))
 
 [<Fact>]
 let ``Database: commit せずに捨てた transaction も GC されれば登録が外れる`` () =
@@ -889,7 +890,7 @@ let ``Database: commit せずに捨てた transaction も GC されれば登録�
 
         collectGarbage ()
         // 最後のハンドルが消えたので登録が外れる（修正前はここに残り続けた）。
-        Assert.True((ActiveSnapshotRegistry.oldestExcept withTable.Root None).IsNone)
+        Assert.True((withTable.Runtime.OldestExcept(withTable.Root, None)).IsNone)
 
         // 登録が残っていると ConflictError になる DDL が通る。
         let indexed = exec withTable "CREATE INDEX ix_v ON t (v)"
@@ -906,10 +907,10 @@ let ``Database: 生きている transaction は GC されても登録が残る``
         let tx = ok (db.Begin())
         // tx はこのあと Rollback で使うので GC されない（finalizer は走らない）。
         collectGarbage ()
-        Assert.True((ActiveSnapshotRegistry.oldestExcept db.Root None).IsSome)
+        Assert.True((db.Runtime.OldestExcept(db.Root, None)).IsSome)
 
         let rolled = ok (tx.Rollback())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept db.Root None).IsNone)
+        Assert.True((db.Runtime.OldestExcept(db.Root, None)).IsNone)
         ok (rolled.Close()))
 
 [<Fact>]
@@ -917,10 +918,10 @@ let ``Database: Dispose でも transaction の登録が外れる`` () =
     withDir "reg-dispose" (fun dir ->
         let db = ok (Database.OpenWith dir)
         let tx = ok (db.Begin())
-        Assert.True((ActiveSnapshotRegistry.oldestExcept db.Root None).IsSome)
+        Assert.True((db.Runtime.OldestExcept(db.Root, None)).IsSome)
 
         (tx :> System.IDisposable).Dispose()
-        Assert.True((ActiveSnapshotRegistry.oldestExcept db.Root None).IsNone))
+        Assert.True((db.Runtime.OldestExcept(db.Root, None)).IsNone))
 
 [<Fact>]
 let ``Database: 別プロセスが開いている DB は開けない`` () =

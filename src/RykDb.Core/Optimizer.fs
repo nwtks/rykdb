@@ -168,13 +168,12 @@ module internal Optimizer =
         let refsOfAll schema exprs =
             exprs |> List.fold (fun acc e -> Set.union acc (refsOf schema e)) Set.empty
 
-        let needs =
-            System.Collections.Generic.Dictionary<obj, bool array> HashIdentity.Reference
-
-        let rec go nodeCtx nodeInput (needed: Set<int>) =
+        let rec go nodeCtx nodeInput needed =
             function
             | Logical.Scan _ as node ->
-                needs.[box node] <- Array.init nodeInput.Columns.Length (fun i -> Set.contains i needed)
+                [
+                    box node, Array.init nodeInput.Columns.Length (fun i -> Set.contains i needed)
+                ]
             | Logical.Filter(p, child) ->
                 let childSchema = outputOf nodeCtx nodeInput child
                 go nodeCtx nodeInput (Set.union needed (refsOf childSchema p)) child
@@ -216,20 +215,22 @@ module internal Optimizer =
                     |> Set.filter (fun i -> i >= leftWidth)
                     |> Set.map (fun i -> i - leftWidth)
 
-                go nodeCtx nodeInput leftNeeded left
-                go nodeCtx nodeInput rightNeeded right
+                go nodeCtx nodeInput leftNeeded left @ go nodeCtx nodeInput rightNeeded right
             | Logical.Derived plan ->
                 let innerOutput = outputOf plan.Context plan.Input plan.Tree
                 let innerNeeded = needed |> Set.filter (fun i -> i < innerOutput.Columns.Length)
                 go plan.Context plan.Input innerNeeded plan.Tree
             | Logical.UnionAll plans ->
                 plans
-                |> List.iter (fun plan ->
+                |> List.collect (fun plan ->
                     go plan.Context plan.Input (allColumns (outputOf plan.Context plan.Input plan.Tree)) plan.Tree)
-            | Logical.Values _ -> ()
+            | Logical.Values _ -> []
 
-        go ctx inSchema (allColumns (outputOf ctx inSchema tree)) tree
-        needs
+        let entries =
+            go ctx inSchema (allColumns (outputOf ctx inSchema tree)) tree
+            |> List.map (fun (key, mask) -> System.Collections.Generic.KeyValuePair<obj, bool array>(key, mask))
+
+        System.Collections.Immutable.ImmutableDictionary.CreateRange<obj, bool array>(HashIdentity.Reference, entries)
 
     let private groupByOf (tree: Logical) =
         match stripWrappers tree with

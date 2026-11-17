@@ -21,8 +21,8 @@ type internal ExecContext =
         Scope: ScanScope
         /// 各 `Logical.Scan` が必要とする列（true = 復号する）。
         /// `Logical` はこのファイルより後に定義されるため、参照等価の `obj` キーで持つ。
-        /// `Optimizer.exec` がクエリ開始時に埋める。
-        ScanNeeds: System.Collections.Generic.Dictionary<obj, bool array>
+        /// `Optimizer.exec` がクエリ開始時に構築する（クエリ中は不変）。
+        ScanNeeds: System.Collections.Immutable.ImmutableDictionary<obj, bool array>
     }
 
 module internal ExecContext =
@@ -34,7 +34,7 @@ module internal ExecContext =
             Catalog = Catalog.Empty
             Txn = Transaction.create 0UL<txnId> { SeqNo = 0UL }
             Scope = ScanScope()
-            ScanNeeds = System.Collections.Generic.Dictionary<obj, bool array>(HashIdentity.Reference)
+            ScanNeeds = System.Collections.Immutable.ImmutableDictionary.Create<obj, bool array> HashIdentity.Reference
         }
 
     /// スキーマを登録する（別名つきで）。

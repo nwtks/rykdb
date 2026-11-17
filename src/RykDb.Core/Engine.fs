@@ -137,8 +137,8 @@ module internal Ddl =
     /// - 新しい transaction の開始と文の実行は排他の間ブロックされる（実行後は新しいカタログを見る）。
     /// </remarks>
     let private exclusiveDdl (state: DbState) (run: DbState -> Result<DbState, DbError>) =
-        RootGate.withExclusive state.Root (fun () ->
-            match ActiveSnapshotRegistry.oldestExcept state.Root state.ActiveRegistration with
+        state.Store.Runtime.WithExclusive(fun () ->
+            match state.Store.Runtime.OldestExcept(state.Root, state.ActiveRegistration) with
             | Some _ -> err (DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください")
             | None -> run state)
 
@@ -822,7 +822,7 @@ module internal Engine =
             err (DbError.internalError "transaction 中の SELECT は RowReader で開けません")
         else
             let mgr, txn = TransactionManager.beginTxn state.Manager
-            let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
+            let registration = state.Store.Runtime.Register(state.Root, txn.Snapshot.SeqNo)
 
             let startState =
                 { state with
@@ -833,13 +833,13 @@ module internal Engine =
             let run () =
                 match contextOf startState txn with
                 | Error e ->
-                    ActiveSnapshotRegistry.unregister state.Root registration
+                    state.Store.Runtime.Unregister registration
                     err e
                 | Ok ctx ->
                     match Plan.runSelect ctx stmt with
                     | Error e ->
                         ctx.Scope.DisposeAll()
-                        ActiveSnapshotRegistry.unregister state.Root registration
+                        state.Store.Runtime.Unregister registration
                         err e
                     | Ok(columns, op) ->
                         ret
@@ -850,10 +850,10 @@ module internal Engine =
                                 Cleanup =
                                     fun () ->
                                         ctx.Scope.DisposeAll()
-                                        ActiveSnapshotRegistry.unregister state.Root registration
+                                        state.Store.Runtime.Unregister registration
                             }
 
-            RootGate.withShared state.Root run
+            state.Store.Runtime.WithShared run
 
     let private resolveWhere (target: Schema) (ctx: ExecContext) =
         function
@@ -951,7 +951,7 @@ module internal Engine =
             runStatement limits state running stmt
         | None ->
             let mgr, txn = TransactionManager.beginTxn state.Manager
-            let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
+            let registration = state.Store.Runtime.Register(state.Root, txn.Snapshot.SeqNo)
 
             let isReadOnly =
                 match stmt with
@@ -978,7 +978,7 @@ module internal Engine =
                 }
 
             let finish r =
-                ActiveSnapshotRegistry.unregister state.Root registration
+                state.Store.Runtime.Unregister registration
                 r
 
             let isDdl =
@@ -990,19 +990,19 @@ module internal Engine =
                 | Statement.AlterTable _ -> true
                 | _ -> false
 
-            (if isDdl then run () else RootGate.withShared state.Root run) |> finish
+            (if isDdl then run () else state.Store.Runtime.WithShared run) |> finish
 
     let executeBegin (state: DbState) =
         match state.Active with
         | Some _ -> ret state
         | None ->
-            RootGate.withShared state.Root (fun () ->
+            state.Store.Runtime.WithShared(fun () ->
                 let mgr, txn = TransactionManager.beginTxn state.Manager
-                let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
+                let registration = state.Store.Runtime.Register(state.Root, txn.Snapshot.SeqNo)
 
                 match Catalog.load state.Store with
                 | Error e ->
-                    ActiveSnapshotRegistry.unregister state.Root registration
+                    state.Store.Runtime.Unregister registration
                     err e
                 | Ok fresh ->
                     ret
@@ -1021,9 +1021,7 @@ module internal Engine =
 
             DbStateOps.commitTransaction txn state
             |> Result.map (fun nextState ->
-                state.ActiveRegistration
-                |> Option.iter (ActiveSnapshotRegistry.unregister state.Root)
-
+                state.ActiveRegistration |> Option.iter state.Store.Runtime.Unregister
                 nextState)
 
     let executeRollback (state: DbState) =
@@ -1031,9 +1029,7 @@ module internal Engine =
         | None -> state
         | Some txn ->
             let mgr = TransactionManager.abort txn state.Manager
-
-            state.ActiveRegistration
-            |> Option.iter (ActiveSnapshotRegistry.unregister state.Root)
+            state.ActiveRegistration |> Option.iter state.Store.Runtime.Unregister
 
             { state with
                 Manager = mgr

@@ -399,6 +399,7 @@ let ``RowStore.close: engine の失敗を返して Close を呼ぶ`` () =
             Engine = CloseTrackingEngine("a", true, closed) :> IStorageEngine
             Lock = None
             Host = None
+            Runtime = RootRuntime()
         }
 
     let outcome = RowStore.close store
@@ -421,13 +422,13 @@ let ``RowStore.commitToStore: 別ハンドルの active snapshot を GC 境界�
         let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
 
         // 同じ DB を開いた別ハンドルが snapshot 5 で読み始めている状態。
-        let other = ActiveSnapshotRegistry.register dir 5UL
+        let other = store.Runtime.Register(dir, 5UL)
         let committed, _ = ok (RowStore.commitToStoreWith false dir None mgr txn store)
         let engine = ok (RowStore.ensure committed)
         // 自ハンドルだけなら 12（LastCommitSeqNo 11 + 1）だが、別ハンドルの 5 が下限になる。
         Assert.Equal(5UL, engine.ActiveSnapshot)
 
-        ActiveSnapshotRegistry.unregister dir other
+        store.Runtime.Unregister other
         RowStore.close committed |> ok)
 
 [<Fact>]
@@ -445,7 +446,7 @@ let ``RowStore.commitToStore: 自分の登録は GC 境界から除外する`` (
         let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
 
         // 自分（これから commit する transaction）の登録は除外し、他の登録だけを見る。
-        let own = ActiveSnapshotRegistry.register dir txn.Snapshot.SeqNo
+        let own = store.Runtime.Register(dir, txn.Snapshot.SeqNo)
 
         let committed, _ =
             ok (RowStore.commitToStoreWith false dir (Some own) mgr txn store)
@@ -453,7 +454,7 @@ let ``RowStore.commitToStore: 自分の登録は GC 境界から除外する`` (
         let engine = ok (RowStore.ensure committed)
         Assert.Equal(12UL, engine.ActiveSnapshot)
 
-        ActiveSnapshotRegistry.unregister dir own
+        store.Runtime.Unregister own
         RowStore.close committed |> ok)
 
 [<Fact>]

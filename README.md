@@ -5,6 +5,11 @@
 テーブル本体も索引も、B-Tree ではなく DB ごとの単一 **LSM ツリー** に keyspace 接頭辞付きで保持する。
 ライブラリ API・SQL REPL・TCP サーバの3つのインターフェースを提供する。
 
+1つの DB ディレクトリを開けるのは同時に **1プロセスだけ**。
+マルチプロセスでの同時更新は目標とせず、DB を開いている間は `.rykdb.format` を
+`FileShare.None` でロックして他プロセスからの更新を拒否する
+（[`architecture.md`](docs/architecture.md) §7.9）。
+
 ---
 
 ## 目次

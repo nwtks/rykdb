@@ -80,6 +80,8 @@ type internal RowStore =
         Lock: ProcessLockLease option
         /// background compaction の共有状態。同期実装では None。
         Host: EngineHost option
+        /// DB ごとの RootGate と active snapshot 登録。
+        Runtime: RootRuntime
     }
 
 module internal RowStore =
@@ -180,8 +182,8 @@ module internal RowStore =
     /// Active / Pending のような state フィールドの更新は呼び出し側で行う
     /// （backfillIndex はトランザクションを外さないため触らない）。
     /// GC 境界は「自ハンドルの active snapshot」と「同じ DB を開いている他ハンドルの active snapshot」の最小値。
-    /// 後者は `ActiveSnapshotRegistry` から集約する（`registration` は自分自身の登録で、除外する）。
-    /// 書き込みは `RootGate` の共有ロックを取り、DDL の排他と交差しないようにする。
+    /// 後者は DB の active snapshot 登録から集約する（`registration` は自分自身の登録で、除外する）。
+    /// 書き込みは DB の RootGate の共有ロックを取り、DDL の排他と交差しないようにする。
     let commitToStoreWith
         (deferDurability: bool)
         (root: string)
@@ -190,14 +192,14 @@ module internal RowStore =
         (txn: Transaction)
         (store: RowStore)
         =
-        RootGate.withShared root (fun () ->
+        store.Runtime.WithShared(fun () ->
             result {
                 let! manager, _, batches = TransactionManager.commit txn mgr
 
                 let snapshot =
                     let own = TransactionManager.activeSnapshot manager
 
-                    match ActiveSnapshotRegistry.oldestExcept root registration with
+                    match store.Runtime.OldestExcept(root, registration) with
                     | Some other -> min own other
                     | None -> own
 
@@ -403,14 +405,16 @@ module internal RowStore =
                 | Some compaction -> { engine with Compaction = compaction }
                 | None -> engine
 
+            let runtime = RootRuntime()
+
             let host =
                 if options.BackgroundCompaction then
                     new EngineHost(
                         root,
                         HostState.initial engine.Version engine.ManifestNumber,
                         engine.Compaction,
-                        (fun () -> ActiveSnapshotRegistry.oldestExcept root None),
-                        (fun f -> StorageEngine.openScan root f),
+                        (fun () -> runtime.OldestExcept(root, None)),
+                        (fun f -> StorageEngine.openScan engine.Runtime.Cache root f),
                         options.ScanHook
                     )
                     |> Some
@@ -423,6 +427,7 @@ module internal RowStore =
                     Engine = DiskStorageEngine engine :> IStorageEngine
                     Lock = Some lease
                     Host = host
+                    Runtime = runtime
                 }
         }
 

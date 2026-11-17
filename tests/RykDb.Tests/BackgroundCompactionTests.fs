@@ -281,7 +281,7 @@ let ``background compaction: 開始後に古い snapshot が現れたら境界�
             Assert.True(started.Wait 5000, diag ())
 
             // compaction の開始後に、より古い snapshot（2）の transaction が現れる。
-            let registration = ActiveSnapshotRegistry.register dir 2UL
+            let registration = store.Runtime.Register(dir, 2UL)
             release.Set()
             waitIdle host
             // 開始時の境界 6 で作った出力は破棄され、境界 2 でやり直して install される。
@@ -293,7 +293,7 @@ let ``background compaction: 開始後に古い snapshot が現れたら境界�
             for i in 1..4 do
                 Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] refreshed)).IsSome)
 
-            ActiveSnapshotRegistry.unregister dir registration
+            store.Runtime.Unregister registration
         finally
             release.Set()
             RowStore.close store |> ignore)

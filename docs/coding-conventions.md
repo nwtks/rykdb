@@ -96,7 +96,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `Ops.distinct` の符号化済みキー集合（`HashSet<byte array>`）
 - `OpsJoin.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
 - `ExtSort` の受け皿（バジェット内に収まる分。超過分は一時ファイルへ退避する）
-- `SstableFormat` のブロック構築（`ResizeArray`）と `Sstable` の partial reader / scan scope のキャッシュ（`ConcurrentDictionary`）
+- `SstableFormat` のブロック構築（`ResizeArray`）と DB ごとの partial reader / ブロックキャッシュ（`ConcurrentDictionary`）
 - `EngineHost` の host state / ファイル refcount / 採番（`ConcurrentDictionary`）
 - `StorageEngine` / `ProcessLock` / `Transactions` のキャッシュ・ロック・登録台帳（`ConcurrentDictionary`）
 - `Eval.resolver` の列解決キャッシュと LIKE パターンキャッシュ

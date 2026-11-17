@@ -264,13 +264,13 @@ type internal DatabaseHost(root: string, owner: Database, ?commitDurability: Com
             ret local
         else
             let run (current: DbState) =
-                RootGate.withShared root (fun () ->
+                current.Store.Runtime.WithShared(fun () ->
                     let mgr, txn = TransactionManager.beginTxn current.Manager
-                    let registration = ActiveSnapshotRegistry.register root txn.Snapshot.SeqNo
+                    let registration = current.Store.Runtime.Register(root, txn.Snapshot.SeqNo)
 
                     match Catalog.load current.Store with
                     | Error e ->
-                        ActiveSnapshotRegistry.unregister root registration
+                        current.Store.Runtime.Unregister registration
                         err e
                     | Ok fresh ->
                         let next = { current with Manager = mgr }

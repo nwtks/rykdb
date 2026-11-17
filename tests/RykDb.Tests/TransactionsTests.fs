@@ -383,53 +383,57 @@ let ``TransactionManager: begin/put/commit/abort を繰り返しても不変条�
         ok (validate mgr) |> ignore
 
 [<Fact>]
-let ``ActiveSnapshotRegistry.oldestExcept: root ごとに最古の active snapshot を返す`` () =
+let ``SnapshotRegistry.oldestExcept: root ごとに最古の active snapshot を返す`` () =
     let root = freshRoot "reg"
+    let registry = SnapshotRegistry()
 
-    let first = ActiveSnapshotRegistry.register root 10UL
-    let second = ActiveSnapshotRegistry.register root 7UL
-    Assert.Equal<uint64 option>(Some 7UL, ActiveSnapshotRegistry.oldestExcept root None)
+    let first = registry.Register(root, 10UL)
+    let second = registry.Register(root, 7UL)
+    Assert.Equal<uint64 option>(Some 7UL, registry.OldestExcept(root, None))
     // 自分自身の登録は除外できる（これから commit する transaction）
-    Assert.Equal<uint64 option>(Some 10UL, ActiveSnapshotRegistry.oldestExcept root (Some second))
+    Assert.Equal<uint64 option>(Some 10UL, registry.OldestExcept(root, Some second))
 
-    ActiveSnapshotRegistry.unregister root first
-    Assert.Equal<uint64 option>(Some 7UL, ActiveSnapshotRegistry.oldestExcept root None)
+    registry.Unregister first
+    Assert.Equal<uint64 option>(Some 7UL, registry.OldestExcept(root, None))
 
-    ActiveSnapshotRegistry.unregister root second
-    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept root None)
+    registry.Unregister second
+    Assert.Equal<uint64 option>(None, registry.OldestExcept(root, None))
 
 [<Fact>]
-let ``ActiveSnapshotRegistry: 別 root は混ざらない`` () =
+let ``SnapshotRegistry: 別 root は混ざらない`` () =
     let root = freshRoot "reg-a"
     let other = freshRoot "reg-b"
+    let registry = SnapshotRegistry()
 
-    let a = ActiveSnapshotRegistry.register root 5UL
-    let b = ActiveSnapshotRegistry.register other 3UL
-    Assert.Equal<uint64 option>(Some 5UL, ActiveSnapshotRegistry.oldestExcept root None)
-    Assert.Equal<uint64 option>(Some 3UL, ActiveSnapshotRegistry.oldestExcept other None)
+    let a = registry.Register(root, 5UL)
+    let b = registry.Register(other, 3UL)
+    Assert.Equal<uint64 option>(Some 5UL, registry.OldestExcept(root, None))
+    Assert.Equal<uint64 option>(Some 3UL, registry.OldestExcept(other, None))
 
-    ActiveSnapshotRegistry.unregister root a
-    ActiveSnapshotRegistry.unregister other b
-    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept root None)
-    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept other None)
+    registry.Unregister a
+    registry.Unregister b
+    Assert.Equal<uint64 option>(None, registry.OldestExcept(root, None))
+    Assert.Equal<uint64 option>(None, registry.OldestExcept(other, None))
 
 [<Fact>]
-let ``ActiveSnapshotRegistry: 相対パスと絶対パスは同じ DB として扱う`` () =
+let ``SnapshotRegistry: 相対パスと絶対パスは同じ DB として扱う`` () =
     let rel = "./" + System.IO.Path.GetFileName(freshRoot "reg-path")
-    let token = ActiveSnapshotRegistry.register rel 4UL
+    let registry = SnapshotRegistry()
+    let token = registry.Register(rel, 4UL)
     // GetFullPath で正規化するので、同じ DB を別表記で開いても同じ束になる
     let full = System.IO.Path.GetFullPath rel
 
-    match ActiveSnapshotRegistry.oldestExcept full None with
+    match registry.OldestExcept(full, None) with
     | Some snap -> Assert.Equal(4UL, snap)
     | None -> Assert.Fail "相対パスで登録した snapshot が引けない"
 
-    ActiveSnapshotRegistry.unregister full token
-    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept rel None)
+    registry.Unregister token
+    Assert.Equal<uint64 option>(None, registry.OldestExcept(rel, None))
 
 [<Fact>]
-let ``ActiveSnapshotRegistry: 並行 register/unregister で登録が消えない`` () =
+let ``SnapshotRegistry: 並行 register/unregister で登録が消えない`` () =
     let root = freshRoot "reg-race"
+    let registry = SnapshotRegistry()
 
     // 登録が bucket に載っている間は oldestExcept が必ず Some を返す。
     // bucket の GetOrAdd と空 bucket の削除が競合すると None になる。
@@ -437,10 +441,10 @@ let ``ActiveSnapshotRegistry: 並行 register/unregister で登録が消えな�
         0,
         5000,
         fun i ->
-            let registration = ActiveSnapshotRegistry.register root (uint64 i + 1UL)
-            Assert.True((ActiveSnapshotRegistry.oldestExcept root None).IsSome)
-            ActiveSnapshotRegistry.unregister root registration
+            let registration = registry.Register(root, uint64 i + 1UL)
+            Assert.True((registry.OldestExcept(root, None)).IsSome)
+            registry.Unregister registration
     )
     |> ignore
 
-    Assert.Equal<uint64 option>(None, ActiveSnapshotRegistry.oldestExcept root None)
+    Assert.Equal<uint64 option>(None, registry.OldestExcept(root, None))

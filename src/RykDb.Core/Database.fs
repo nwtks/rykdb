@@ -99,24 +99,23 @@ type internal Database(root: string, state: DbState, ownsStore: bool) =
                 |> ret
 
     /// DB のルートディレクトリ。
-    member _.Root = root
+    member internal _.Root = root
 
     /// 実行中の transaction があるか。
-    member _.InTransaction = state.Active.IsSome
+    member internal _.InTransaction = state.Active.IsSome
 
     /// WAL の fsync を `Session` のグループコミットに任せる状態を返す。
     /// ハンドルを作らないので ProcessLock の所有者は変わらない。
     member _.StateWithDeferredDurability = { state with DeferDurability = true }
 
+    /// DB ごとの RootGate / active snapshot 登録（テスト・診断用）。
+    member internal _.Runtime = state.Store.Runtime
+
     /// 状態だけ差し替えたハンドルを返す。ストアの所有権は引き継ぐ。
     member _.WithState(next: DbState) = new Database(root, next, ownsStore)
 
     /// テーブル一覧を返す。
-    member _.TableNames() = state.Catalog.Tables |> List.map _.Name
-
-    /// SELECT の計画だけを組み立てる（実行しない。ベンチ・診断用）。
-    /// 返した `PlannedQuery` は `Optimizer.exec` で繰り返し実行できる。
-    member internal _.PrepareSelect(stmt: SelectStatement) = Engine.prepareSelect state stmt
+    member internal _.TableNames() = state.Catalog.Tables |> List.map _.Name
 
     /// DB を閉じる（memtable を flush し、WAL を削除する）。
     /// <remarks>
@@ -138,20 +137,24 @@ type internal Database(root: string, state: DbState, ownsStore: bool) =
     interface System.IDisposable with
         member this.Dispose() = this.Close() |> ignore
 
+    /// SELECT の計画だけを組み立てる（実行しない。ベンチ・診断用）。
+    /// 返した `PlannedQuery` は `Optimizer.exec` で繰り返し実行できる。
+    member internal _.PrepareSelect(stmt: SelectStatement) = Engine.prepareSelect state stmt
+
     /// トランザクションを始める。
     /// 明示的な BEGIN。
     /// カタログの再読み込みに失敗したらエラーを返す（古いカタログで黙って続行しない）。
-    member this.Begin() =
+    member internal this.Begin() =
         if state.Active.IsSome then
             ret this
         else
-            RootGate.withShared state.Root (fun () ->
+            state.Store.Runtime.WithShared(fun () ->
                 let mgr, txn = TransactionManager.beginTxn state.Manager
-                let registration = ActiveSnapshotRegistry.register state.Root txn.Snapshot.SeqNo
+                let registration = state.Store.Runtime.Register(state.Root, txn.Snapshot.SeqNo)
 
                 match Catalog.load state.Store with
                 | Error e ->
-                    ActiveSnapshotRegistry.unregister state.Root registration
+                    state.Store.Runtime.Unregister registration
                     err e
                 | Ok fresh ->
                     new Database(
@@ -172,23 +175,27 @@ type internal Database(root: string, state: DbState, ownsStore: bool) =
     /// コミットする transaction は「Active か Pending のうちバッファを持つ方」。
     /// Pending は DML が実行されるたびに更新されるので、複数文の DML を 1つの transaction にまとめられる。
     /// </remarks>
-    member _.Commit() =
+    member internal _.Commit() =
         match state.Pending |> Option.orElse state.Active with
         | None -> err (DbError.internalError "コミットする transaction がありません")
         | Some txn ->
             DbStateOps.commitTransaction txn state
             |> Result.map (fun nextState ->
-                state.ActiveRegistration |> Option.iter (ActiveSnapshotRegistry.unregister root)
+                state.ActiveRegistration
+                |> Option.iter (fun registration -> state.Store.Runtime.Unregister registration)
+
                 new Database(root, nextState, ownsStore))
 
     /// ROLLBACK。
     /// バッファを捨てる。
-    member _.Rollback() =
+    member internal _.Rollback() =
         match state.Active with
         | None -> err (DbError.internalError "ロールバックする transaction がありません")
         | Some txn ->
             let mgr = TransactionManager.abort txn state.Manager
-            state.ActiveRegistration |> Option.iter (ActiveSnapshotRegistry.unregister root)
+
+            state.ActiveRegistration
+            |> Option.iter (fun registration -> state.Store.Runtime.Unregister registration)
 
             new Database(
                 root,
@@ -209,11 +216,11 @@ type internal Database(root: string, state: DbState, ownsStore: bool) =
     /// 明示的な transaction が無い場合は暗黙の transaction で実行し commit する。
     /// 複数文を実行する場合は、公開 API の `Session.Execute` を使う。
     /// </remarks>
-    member this.Execute(stmt: Statement) =
+    member internal this.Execute(stmt: Statement) =
         this.ExecuteWithLimits(ResultLimits.Unlimited, stmt)
 
     /// 1文だけ実行し、SELECT 結果には limits を適用する。
-    member this.ExecuteWithLimits(limits: ResultLimits, stmt: Statement) =
+    member private this.ExecuteWithLimits(limits: ResultLimits, stmt: Statement) =
         let nextOf nextState =
             if obj.ReferenceEquals(nextState, state) then
                 this

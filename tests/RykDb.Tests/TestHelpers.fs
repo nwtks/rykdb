@@ -288,6 +288,7 @@ let openStoreWith (root: string) (engine: IStorageEngine) =
         Engine = engine
         Lock = None
         Host = None
+        Runtime = RootRuntime()
     }
 
 /// メモリ上の RowStore を渡す（ディスク I/O なし）。
@@ -296,8 +297,8 @@ let withStore (_tag: string) (f: RowStore -> unit) = f (openStoreWith "" (memory
 /// メモリ上の DB を開いてテストし、最後に閉じる（ディスク I/O なし）。
 /// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で差し替える。
 /// <remarks>
-/// root はテストごとに一意にする。root はプロセス内の `RootGate` /
-/// `ActiveSnapshotRegistry` のキーなので、空文字を共有すると
+/// root はテストごとに一意にする。root は DB ごとの RootGate /
+/// active snapshot 登録のキーなので、空文字を共有すると
 /// 並行する他のテストの transaction が DDL の排他判定に引っかかる。
 /// store 側の root は空のまま（commit intent をディスクに書かない）。
 /// </remarks>
