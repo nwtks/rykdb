@@ -28,8 +28,15 @@ type Session =
     static member OpenWith: root: string -> Result<Session, DbError>
     /// DB を開く（background compaction 有効、指定した上限）。
     static member OpenWith: root: string * options: SessionOptions -> Result<Session, DbError>
-    /// テスト・内部用: 既に開いた `Database` から Session を作る。
-    static member internal OpenWith: root: string * options: SessionOptions * db: Database -> Session
+    /// テスト・ベンチ用: 同期 compaction で開く（ホストを所有する）。
+    static member internal OpenWithSync: root: string * options: SessionOptions -> Result<Session, DbError>
+
+    /// テスト・内部用: 既に開いた `RowStore` から Session を作る（ホストを所有する）。
+    static member internal OpenWithStore:
+        root: string * options: SessionOptions * store: RowStore -> Result<Session, DbError>
+
+    /// テスト・内部用: 既に開いた `DatabaseHost` から接続を作る。
+    static member internal Create: host: DatabaseHost * options: SessionOptions * ownsHost: bool -> Session
 
     /// 実行中の transaction があるか。
     member InTransaction: bool
@@ -48,6 +55,10 @@ type Session =
     /// 個数が一致しない場合は `TypeError` になる。
     /// 値は SQL 文字列へ連結せず式として埋め込むため、SQL インジェクションは起こらない。
     member Execute: sql: string * parameters: SqlValue array -> Result<StatementResult, DbError>
+    /// 解析済みの 1文を実行する（テスト・ベンチ用）。
+    member internal ExecuteStatement: stmt: Statement -> Result<StatementResult, DbError>
+    /// SELECT の計画だけを組み立てる（テスト・ベンチ用。書き込みを挟まない用途限定）。
+    member internal PrepareSelect: stmt: SelectStatement -> Result<PlannedQuery, DbError>
     /// トランザクションを始める。
     member Begin: unit -> Result<unit, DbError>
     /// COMMIT。

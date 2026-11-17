@@ -48,7 +48,7 @@ F# の型システムでは表現できないため、
 | INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`                            | `Memtable.fsi`（構築は `Empty` / `insert` / `apply` に限定）+ `Memtable.insert` の会計とランダム挿入・順序独立性のプロパティテスト                                                    | ✅ 完了 |
 | INV-15 | `RowReader` は Reading / Exhausted / Closed のいずれか                      | `RowReaderState`（状態 DU に置き換え、`releaseTo` が遷移と 1回解放を担当）                                                                                                            | ✅ 完了 |
 | INV-16 | `Session` のロック規約                                                      | `stateGate` / `writeGate` の設計 + `SessionTests` の並行テスト 6 本                                                                                                                   | ✅ 完了 |
-| INV-17 | lease の所有権                                                              | `ProcessLockHandle` / `ProcessLockLease` / `RegistrationLease`                                                                                                                        | ✅ 完了 |
+| INV-17 | lease の所有権                                                              | `ProcessLockLease.ForceRelease`（二重解放は無害）+ `SessionState.Registration` の `RegistrationLease`（GC で解除）+ `DatabaseTests` の GC 回帰テスト                                  | ✅ 完了 |
 | INV-18 | `Expr.children` / `plugChildren` の arity                                   | `Expr.plugChildren`（モジュールレベルへ引き上げ）+ `AstTests` の全ノード種テスト                                                                                                      | ✅ 完了 |
 | INV-19 | 保持する側はキー・行の所有権を複製で取り込む                                | `Entry.takeOwnership` / `Transaction.setSlot` の複製と回帰テスト                                                                                                                      | ✅ 完了 |
 | INV-20 | `Writer.Chunks` は逆順（先頭が最新の書き込み）                              | `Writer.fsi`（ケース非公開、構築は `Empty` / 各 write 関数に限定）+ 順序プロパティテスト                                                                                              | ✅ 完了 |
@@ -297,10 +297,18 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 
 ### INV-17 lease
 
-- `ProcessLockHandle` が所有権ハンドルを表し、`IsOwner` はこの型だけを受け取る。
-- `RowStore` のエラー経路も `ProcessLockLease.ForceRelease` を使う。
-  `ProcessLock.release` の呼び出しは lease 内だけ。
-- 回帰テスト: 既存のプロセスロック / 古いハンドルの Close テスト。
+- `ProcessLockLease` は root とトークンだけを持ち、ロックの解放は `ForceRelease` だけ
+  （`RowStore.close` とエラー経路が呼ぶ。二重解放は `ProcessLock.release` の台帳で無害）。
+  DB を開閉する所有者は `DatabaseHost` 1つなので、ハンドルごとの所有権トークンは持たない。
+- 進行中 transaction の登録は `SessionState.Registration` が `RegistrationLease` として持つ。
+  接続が Close されずに捨てられても、最後のリースが GC された時点で登録を外す
+  （`ActiveRegistration` の生存トークン）。
+- 回帰テスト:
+  - `Database: commit せずに捨てた transaction も GC されれば登録が外れる`
+  - `Database: 生きている transaction は GC されても登録が残る`
+  - `Database: Dispose でも transaction の登録が外れる`
+  - `Database: 別プロセスが開いている DB は開けない` /
+    `Database: 同じ root を二度開くと同じプロセスのエラーになり、Close 後は開ける`
 
 ### INV-18 children / plugChildren の arity
 

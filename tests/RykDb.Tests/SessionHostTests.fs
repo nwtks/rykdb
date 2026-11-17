@@ -103,7 +103,6 @@ let ``CommitDurability: 同時待機でも fsync は 1回だけ`` () =
 [<Fact>]
 let ``DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録し fsync をまとめる`` () =
     withDir "group-commit" (fun root ->
-        let db = ok (Database.OpenWith root)
         let syncs = ResizeArray<WalState>()
         let syncGate = obj ()
         let firstSyncEntered = new System.Threading.ManualResetEventSlim false
@@ -123,7 +122,7 @@ let ``DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録
 
                 ret ())
 
-        let host = DatabaseHost(root, db, commitDurability = durable)
+        let host = ok (DatabaseHost.OpenWith(root, commitDurability = durable))
 
         let execute sql =
             host.ExecuteNonTransaction SessionState.none ResultLimits.Unlimited (parseOneOk sql)

@@ -36,10 +36,8 @@ flowchart TB
     end
 
     SESS["Session.fs<br/>Session（1接続）/ SessionPool"]
-    HOST["SessionHost.fs<br/>DatabaseHost<br/>共有 committed state・採番・fsync"]
-    DB["Database.fs<br/>internal の不変ハンドル"]
+    HOST["SessionHost.fs<br/>DatabaseHost<br/>store の open/close・共有 committed state・採番・fsync"]
     SESS --> HOST
-    HOST --> DB
 
     subgraph EX["実行"]
         EN["Engine.fs<br/>文の実行（Ddl / Engine）"]
@@ -180,10 +178,9 @@ flowchart TB
 2. **MVCC の snapshot が自然に固定される**。
    読み取り中に状態が書き換わらない。
 3. **更新の書き忘れを型で防ぐ**。
-   接続の入口として外部に公開するのは `Session` / `SessionPool` だけで、
-   不変ハンドル `Database` は internal に閉じる。
+   接続の入口として外部に公開するのは `Session` / `SessionPool` だけ。
    接続ローカルの transaction 状態は `Session` が持ち、
-   committed な状態は `DatabaseHost` が唯一の持ち主として差し替えるので、
+   committed な状態とストアの open/close は `DatabaseHost` が唯一の持ち主として差し替えるので、
    利用者が更新を忘れる経路はない。
 
 ただし `Ops` の集約処理・ハッシュ結合・DISTINCT、`EngineHost` の host state / refcount / 採番などでは
@@ -247,8 +244,7 @@ flowchart TB
 | `Plan.fs`          | `Plan`（サブクエリ解決・派生テーブル・`runSelect` / `explainSelect`）                                                 |
 | `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                                                |
 | `Engine.fs`        | `StatementResult` / `DbState` / `Ddl` / `Engine`（文の実行）                                                          |
-| `Database.fs`      | internal の不変ハンドル `Database`（transaction・状態遷移）                                                           |
-| `SessionHost.fs`   | `DatabaseHost` と `CommitDurability`（共有 committed state・採番・fsync のグループコミット）                          |
+| `SessionHost.fs`   | `DatabaseHost` と `CommitDurability`（store の open/close・共有 committed state・採番・fsync のグループコミット）     |
 | `Session.fs`       | 公開 API `Session` / `SessionPool` / `RowReader`（接続ごとの transaction・読み取りは並行、書き込みはホストで直列化）  |
 
 ### F# のコンパイル順
@@ -259,8 +255,8 @@ Errors → Types → Writer → Cursor → Serialization → Memtable → Wal �
        → StorageEngine → Ast → Lexer → ParserExpr → Parser → Transactions → EngineHost
        → ProcessLock → RowStore → TableSchema → Catalog → Scalar → Eval → Op
        → ExtSort → OpsJoin → Ops → Dml → ExecContext → Binder → Analyzer
-       → PlanBuilder → Optimizer → Plan → DropCleanup → Engine → Database
-       → SessionHost → Session
+       → PlanBuilder → Optimizer → Plan → DropCleanup → Engine → SessionHost
+       → Session
 ```
 
 F# はファイルを**コンパイル順に評価する**ため、上から下へ一方向の依存になるよう `.fsproj` の `Compile` を手で並べる
@@ -898,7 +894,7 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 - 評価機の内部結果は `[<Struct>] DbResult<'T>`（`DbOk` / `DbErr`）。
   FSharp.Core の `Result` は参照 DU で、成功パスでも `Ok` を 1個確保する。
   `Eval.step` / `valueAt` / `compare` / `truthOf` と `SqlValue.compareValuesV` は `DbResult` を返し、
-  公開 API の境界（`Database` / `Session` / `Op.toArrayLimited`）で `Result` に戻す。
+  公開 API の境界（`Session` / `Op.toArrayLimited`）で `Result` に戻す。
   `Eval.evalWith` は境界用のラッパー（`Result` に戻す）。
   `Eval.matchesWithV` / `Eval.matchesJoinedV` は `DbResult` のまま返す内部ホットパス。
 - pull 層の 1行は `[<Struct>] OpStep`（`OpDone` / `OpError` / `OpRow`）。
@@ -1152,11 +1148,9 @@ replay 中は 0（全版を残す）を使う。
 
 登録は `DatabaseHost.Begin` / 接続の暗黙 transaction（`Engine.executeStatementWithLimits`）で行い、
 commit 成功・rollback・`Session.Close` で解除する。
-1つの登録は同じ transaction の state を持つ**複数のハンドルで共有**される
-（`tx.Execute` のたびに新しいハンドルが返るため）。
-そこで登録はハンドルの生存トークンを数え（`ActiveRegistration`）、
-`Database` がフィールドで持つ `RegistrationLease` が **最後の 1本の GC で自動的に解除**する。
-これにより、commit / rollback / Close されずに捨てられたハンドルでも、
+接続の登録は `SessionState.Registration` が `RegistrationLease` として持ち、
+接続が Close されずに捨てられても **最後のリースが GC された時点で自動的に解除**する。
+これにより、commit / rollback / Close されずに捨てられた接続（`SessionPool` の接続など）でも、
 参照が切れて GC されれば DDL が `ConflictError` のまま止まらない。
 参照が残っている間は「版を余分に残す」側に倒れるので、データを失う方向には働かない。
 トークンは `obj()` の参照等価
@@ -1224,11 +1218,11 @@ DB 全体を閉じるのは所有者（`Session.OpenWith` の `Session`、また
    複数スレッドで 1つの transaction を共有しないこと（transaction は接続単位）。
 2. **commit の直列化は「その経路を単一に通る」という規約**であり、
    `Session` の `lock` は公開 API の呼び出しを守るが、
-   internal の `Database` を直接使うテストでは規約が前提になる。
+   internal の `DatabaseHost` を直接使うテストでは規約が前提になる。
 
 外周はすべて逐次処理。
 
-- **compaction は `Session.OpenWith` では background worker、internal の `Database.OpenWith` では同期**（§8.7 / §12.2）。
+- **compaction は `Session.OpenWith` では background worker、internal の `Session.OpenWithSync` では同期**（§8.7 / §12.2）。
   worker は merge を gate の外で行い、
   install（MANIFEST 追記・Version 公開）だけを `EngineHost` の installGate で直列化する。
   reader は Session 呼び出し単位で Version 全ファイルを pin する。
@@ -1274,11 +1268,10 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 ゲートは DB ごとの `RootRuntime` が持つ `ReaderWriterLockSlim` で、
 同じスレッドの再帰を許す（DDL の内部 commit は排他を持ったまま共有を取る）。
 ロックはプロセス内の表に残る（開いた DB の数だけ。数はふつう小さい）。
-**internal の `Database` ハンドル経由の登録は、参照が切れて GC されれば外れる**
-（`RegistrationLease` の finalizer。§7.5）。
-公開 `Session` の登録は `SessionState.Registration` が保持するだけで finalizer が無いため、
-`Session` を捨てる前に `Rollback()` / `Close()`（または `use` による `Dispose()`）で確実に終わらせること。
-ハンドルへの参照が残っている間は、その root の DDL は `ConflictError` のまま。
+**接続の登録は `SessionState.Registration` が `RegistrationLease` として保持し、参照が切れて GC されれば外れる**（§7.5）。
+ただし GC の時期は不定なので、`Session` は `Rollback()` / `Close()`
+（または `use` による `Dispose()`）で確実に終わらせること。
+参照が残っている間は、その root の DDL は `ConflictError` のまま。
 
 ### 7.9 プロセス間の排他（`.rykdb.format`）
 
@@ -1304,12 +1297,12 @@ WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つの�
   - これで「同じ root を開いた複数のハンドルが互いに見えない」という不整合は起きない。
     1つのハンドルの中では MVCC の snapshot で一貫性が保たれる。
 - **クラッシュ再現だけは例外的に二重オープンする**: `RowStore.openStoreTakingOver` で
-  取得した store を internal の `Database.OpenWithStore` に渡す（テスト専用）。
+  取得した store を internal の `Session.OpenWithStore` に渡す（テスト専用）。
   ハンドルを失った状況を作って WAL 再生 / 未 commit の切り捨てを検証する。
-- **最新のハンドル**の `Close()` でロックを解放する（二重 `Close()` は無害）。
-  古いハンドルの `Close()` は no-op にする
-  （生きている新しいハンドルのロックを外すと、同じ root を別 store で再オープンできてしまう）。
-  全ハンドルを Close しないままプロセスが終了しても、OS がロックを解放する。
+- **`DatabaseHost.Close`（所有者の `Session` / `SessionPool`）** でロックを解放する
+  （二重 Close は無害。`HostLifecycle.Closed` が 2回目以降を no-op にする）。
+  所有者は 1つだけなので、古いハンドルの Close がロックを外す問題は起きない。
+  プロセスが Close せずに終了しても、OS がロックを解放する。
 - 強制力は OS のファイル共有に依存する（同一マシン・同一ファイルシステムが前提）。
   ネットワークファイルシステムでは保証されない。
 
@@ -1647,7 +1640,7 @@ WAL への書き込みが成功した時点で commit は成立しているた�
 ### 8.7 background compaction（`EngineHost.fs`）
 
 `Session.OpenWith` で開いた DB は、flush 後の compaction を 1本の worker で行う。
-internal の `Database.OpenWith` は従来どおり同期 compaction（内部 API とテスト用）。
+internal の `Session.OpenWithSync` は従来どおり同期 compaction（テスト・ベンチ用）。
 
 **なぜバックグラウンド化するか**。
 flush + compaction を含む書き込みは、compaction の分だけ commit のテールレイテンシが伸びる。
@@ -1740,7 +1733,7 @@ SQL 文字列
 4. memtable が MemLimitBytes に達したら flush → L0 の SSTable（`RowStore.writeBatchesWithSnapshotWith` が `WriteBatch` 後に `MaybeFlush`（background 有効時は `FlushIfNeeded`）を呼ぶ。memtable が上限未満なら何もしない）
 5. レベルが閾値を超えたら compact する。
    `Session.OpenWith` では flush 後に `EngineHost.Signal` で background worker を起こし、
-   internal の `Database.OpenWith` では `maybeFlush` が同期的に `compactOnce` を呼ぶ。
+   internal の `Session.OpenWithSync` では `maybeFlush` が同期的に `compactOnce` を呼ぶ。
    flush / compaction の失敗は commit を失敗させない
    （memtable を残して次回再試行するか、flush 後の engine と一緒に compaction の失敗を返す。gotchas §11.51）
 ```
@@ -1753,7 +1746,7 @@ flush / compact は `RowStore` が `WriteBatch` 後に `IStorageEngine.MaybeFlus
 
 ```
 Session.OpenWith root
-  → Database.OpenWithBackground root  background compaction 有効の internal ハンドルを作る
+  → DatabaseHost.OpenWithBackground root  background compaction 有効のホストを作る
   → RowStore.openStoreWithBackground root  root を作成し、.rykdb.format を排他で開く
       ├─ ensureFormat                開いた .rykdb.format を検証 / 新規作成
       └─ StorageEngine.openDatabaseWith  ルート直下の LSM ツリーを開く
@@ -1769,21 +1762,21 @@ Session.OpenWith root
   → RowStore.startBackground         compaction worker を開始する
 ```
 
-テスト・内部用の `Database.OpenWith` は `RowStore.openStore` を使う同期 compaction 版である（§8.7）。
+テスト・ベンチ用の internal `Session.OpenWithSync` は `RowStore.openStore` を使う同期 compaction 版である（§8.7）。
 
 ### 9.4 閉じるとき
 
 `Session.Close()` は実行中の読み取りが終わるのを待ち、接続ローカルの transaction を rollback する
 （このとき WAL のグループコミット待機も drain される）。
-所有者の `Session` は続いて `Database.Close()` を呼ぶ。
-`Database.Close()` は `StorageEngine.close` を行い、
+所有者の `Session` は続いて `DatabaseHost.Close()` を呼ぶ。
+`DatabaseHost.Close()` は `RowStore.close` → `StorageEngine.close` を行い、
 memtable を flush し、WAL の現在位置を fsync してから WAL を削除する。
 fsync を省くと、再起動後にデータが読めなくなる。
 戻り値は close のエラー。
 `Session` は「閉じた」状態を記録するため、Close 後の `Execute` / `TableNames` /
 `Begin` / `Commit` / `Rollback` は `InternalError` を返す（二重 Close は安全）。
-実際に flush / WAL 削除 / `ProcessLock` 解放を行うのは**最新の internal ハンドル**だけで、
-古いハンドルの `Close()` は no-op（§7.9）。
+実際に flush / WAL 削除 / `ProcessLock` 解放を行うのは**所有者の 1本**だけで、
+2回目以降の Close は no-op（§7.9）。
 `Session` は `IDisposable` なので、`use session = ...` / `Dispose()` でも Close できる
 （§7.5 の登録解除も同じ経路）。
 
@@ -1819,7 +1812,7 @@ fsync を省くと、再起動後にデータが読めなくなる。
 ## 11. インターフェース層
 
 3つのインターフェースが**すべて `Session.fs` だけ**を見る。
-`Database` は internal で、`Session` の内部実装に閉じている。
+`DatabaseHost` / `SessionState` は internal で、`Session` の内部実装に閉じている。
 
 ### 11.1 ライブラリ API
 
@@ -1862,7 +1855,7 @@ ok (session.Close())
 
 > **重要**: 接続の入口として公開するのは `Session`（1接続）と `SessionPool`（接続の供給）。
 > 公開型にはこのほか `SessionOptions` / `RowReader` がある。
-> `Database` は internal の不変ハンドルで、committed な状態は `DatabaseHost` が保持し、
+> committed な状態とストアの open/close は internal の `DatabaseHost` が保持し、
 > `Session` は実行のたびに「最新の committed state + 接続ローカルの transaction」を作って使う（§7.6）。
 
 ### 11.2 CLI REPL
@@ -2039,9 +2032,9 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   1つの root を開けるのは同時に 1プロセスだけで、別プロセスが開いていれば
   `.rykdb.format` の `FileShare.None` により 2つ目の `Session.OpenWith` は `IoError`。
   同じプロセスで二重に開くこともできない（2回目の `Session.OpenWith` は `IoError`）。
-  クラッシュ再現テストに限り、`RowStore.openStoreTakingOver` と `Database.OpenWithStore` で例外的に二重に開く。
-- **internal の `Database` ハンドル経由の transaction は、commit / rollback / `Close()` されずに参照が切れて GC されるまでその root の DDL を `ConflictError` にする**（§7.8）。
-  公開 `Session` の登録は finalizer が無いため、`Rollback()` / `Close()` で確実に終わらせること。
+  クラッシュ再現テストに限り、`RowStore.openStoreTakingOver` と `Session.OpenWithStore` で例外的に二重に開く。
+- **commit / rollback / `Close()` されずに捨てられた `Session` も、参照が切れて GC されるまでその root の DDL を `ConflictError` にする**（§7.8）。
+  GC の時期は不定なので、`Rollback()` / `Close()` で確実に終わらせること。
 - **明示 transaction の状態はプロセス内のみ**。
   共有の `TransactionManager` は `DatabaseHost` が、
   接続ローカルの `Active` / `Pending` / `Registration` は各 `Session` が保持する。

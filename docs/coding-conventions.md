@@ -85,7 +85,7 @@ RykDb（**.NET 10 / F# 10**）を書くときの規約。
 - `Monitor.Wait` / `PulseAll`: `Session.Close` が実行中の読み取りの完了を待つために使う。
 
 これらは `Session` / `SessionPool` / `DatabaseHost` の内部に閉じ込め、
-`Database` を internal にして外部へ漏らさない。
+`DatabaseHost` / `SessionState` を internal にして外部へ漏らさない。
 
 `Dictionary` / `HashSet` / `ConcurrentDictionary` を使うのは次の場所に限る
 （CLI / Server は対象外）。

@@ -2,16 +2,17 @@
 // Session — 公開エントリポイント。
 // ライブラリ利用者・CLI・TCP サーバはこの層だけを見る。
 //
-// * Database の不変ハンドルを内部に隠し、常に最新の状態を保持する。
+// * committed state は `DatabaseHost`（internal）が隠し、
+//   Session は接続ローカルの transaction だけを持つ。
 //   公開メソッドはハンドルを返さないので、戻り値の差し替え忘れは起こらない。
 // * SELECT のみの Execute は複数スレッド／複数接続から並行実行できる。
 //   書き込み・transaction 操作・Close は直列化される。
-// * 読み取りは入口で現在のハンドルとスナップショット（ファイル pin）を同じ短いロック区間で取得し、
+// * 読み取りは入口で現在の状態とスナップショット（ファイル pin）を同じ短いロック区間で取得し、
 //   実行中はロックを取らない（MVCC スナップショット読み）。
 // * Close は実行中の読み取りが終わるのを待ってから閉じる。
 // * 1つの Session は 1つの論理接続として扱う。
 //   複数の接続で共有すると transaction も共有される。
-// * Execute は SQL を 1文ずつ実行し、成功するたびに内部ハンドルを更新する。
+// * Execute は SQL を 1文ずつ実行し、成功するたびに接続ローカルの状態と committed state を更新する。
 //   途中の文が失敗しても、最後に成功した状態は失わない。
 // ===========================================================================
 
@@ -327,6 +328,13 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
         else
             loop 0
 
+    /// 解析済みの文を実行する（ゲート＝closed / durability を確認した後）。
+    let executeStatementsCore (statements: Statement list) =
+        if isReadOnlyBatch statements then
+            runRead statements
+        else
+            runExclusive statements
+
     /// 単一文または複数文を実行し、transaction の遷移も返す。
     let executeCore (sql: string) (parameters: SqlValue array) =
         if isClosed () then
@@ -342,8 +350,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
 
                     match Parser.parseStatementsWith parameters sql with
                     | Error e -> err e
-                    | Ok statements when isReadOnlyBatch statements -> runRead statements
-                    | Ok statements -> runExclusive statements
+                    | Ok statements -> executeStatementsCore statements
 
     /// `TryOpenReader` の実装。
     let tryOpenReaderCore (sql: string) (parameters: SqlValue array) =
@@ -388,12 +395,29 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
         match SessionOptions.Validate options with
         | Error e -> err e
         | Ok() ->
-            Database.OpenWithBackground root
-            |> Result.map (fun db -> new Session(DatabaseHost(root, db), options, true))
+            DatabaseHost.OpenWithBackground root
+            |> Result.map (fun host -> new Session(host, options, true))
 
-    /// テスト・内部用: 既に開いた `Database` から Session を作る（ホストを所有する）。
-    static member internal OpenWith(root: string, options: SessionOptions, db: Database) =
-        new Session(DatabaseHost(root, db), options, true)
+    /// テスト・ベンチ用: 同期 compaction で開く（ホストを所有する）。
+    static member internal OpenWithSync(root: string, options: SessionOptions) =
+        match SessionOptions.Validate options with
+        | Error e -> err e
+        | Ok() ->
+            DatabaseHost.OpenWith root
+            |> Result.map (fun host -> new Session(host, options, true))
+
+    /// テスト・内部用: 既に開いた `RowStore` から Session を作る（ホストを所有する）。
+    static member internal OpenWithStore(root: string, options: SessionOptions, store: RowStore) =
+        match SessionOptions.Validate options with
+        | Error e -> err e
+        | Ok() ->
+            DatabaseHost.OpenWithStore(root, store)
+            |> Result.map (fun host -> new Session(host, options, true))
+
+    /// テスト・内部用: 既に開いた `DatabaseHost` から接続を作る。
+    /// `ownsHost = false` なら `Close` は自分の transaction を rollback するだけで、DB は閉じない。
+    static member internal Create(host: DatabaseHost, options: SessionOptions, ownsHost: bool) =
+        new Session(host, options, ownsHost)
 
     /// 実行中の transaction があるか。
     member _.InTransaction = inTransaction ()
@@ -444,6 +468,22 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// </remarks>
     member _.Execute(sql: string, parameters: SqlValue array) =
         executeCore sql parameters |> Result.map fst
+
+    /// 解析済みの 1文を実行する（テスト・ベンチ用。`Execute` と同じゲートを通る）。
+    member internal _.ExecuteStatement(stmt: Statement) =
+        if isClosed () then
+            err (closedError ())
+        else
+            match host.DurabilityFailure with
+            | Some e -> err e
+            | None -> executeStatementsCore [ stmt ] |> Result.map fst
+
+    /// SELECT の計画だけを組み立てる（テスト・ベンチ用）。
+    /// <remarks>
+    /// 書き込みを挟まない用途に限る（固定 snapshot を ActiveSnapshot に登録しない）。
+    /// </remarks>
+    member internal _.PrepareSelect(stmt: SelectStatement) =
+        Engine.prepareSelect host.Committed stmt
 
     /// トランザクションを始める。
     member _.Begin() =
@@ -543,8 +583,8 @@ type SessionPool internal (host: DatabaseHost, options: SessionOptions) =
         match SessionOptions.Validate options with
         | Error e -> err e
         | Ok() ->
-            Database.OpenWithBackground root
-            |> Result.map (fun db -> new SessionPool(DatabaseHost(root, db), options))
+            DatabaseHost.OpenWithBackground root
+            |> Result.map (fun host -> new SessionPool(host, options))
 
     /// 接続用の Session を作る。使い終わったら `Session.Close` する。
     member _.CreateSession() =

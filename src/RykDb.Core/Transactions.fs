@@ -377,29 +377,29 @@ module internal RootKey =
 
 /// 進行中 transaction の snapshot 登録 1件。
 /// <remarks>
-/// 1つの transaction から複数の `Database` ハンドルが作られる。
-/// たとえば `Begin()` や `Execute` は新しいハンドルを返す。
-/// ハンドルが1つでも残っていれば transaction は利用中なので、その snapshot の登録を維持する。
-/// ハンドルごとに生存トークンを付け、最後のトークンが GC で回収されたときに登録を解除する。
-/// 登録を解除しないと、使われていない snapshot が残り、同じ root の DDL が `ConflictError` で拒否され続ける。
+/// 1つの登録に対して、それを参照するリース（`RegistrationLease`）が複数存在しうる。
+/// リースが1つでも残っていれば transaction は利用中なので、その snapshot の登録を維持する。
+/// リースごとに生存トークンを付け、最後のトークンが GC で回収されたときに登録を解除する。
+/// 登録を解除しないと、使われていない snapshot が残り、
+/// 同じ root の DDL が `ConflictError` で拒否され続ける。
 /// トークンは `obj()` の参照等価。
 /// Core は `mutable` / `ref` を 0件に保つ規約なので、
 /// 連番カウンタではなく参照等価のオブジェクトを鍵にする。
 /// </remarks>
 type internal ActiveRegistration internal (root: string, unregister: ActiveRegistration -> unit) =
-    /// 生存しているハンドルのトークン。
+    /// 生存しているリースのトークン。
     let handles = System.Collections.Concurrent.ConcurrentDictionary<obj, byte>()
 
     /// 正規化済みの root。
     member _.Root = root
 
-    /// ハンドルの生存を登録し、解除に使うトークンを返す。
+    /// リースの生存を登録し、解除に使うトークンを返す。
     member _.Attach() =
         let token = obj ()
         handles.[token] <- 0uy
         token
 
-    /// ハンドルの解除。
+    /// リースの解除。
     /// 戻り値は「これが最後の 1本だった」かどうか。
     member _.Detach(token: obj) =
         handles.TryRemove token |> ignore
@@ -534,19 +534,22 @@ type internal RootRuntime() =
     member _.OldestExcept(root: string, registration: ActiveRegistration option) =
         snapshots.OldestExcept(root, registration)
 
-/// `Database` ハンドルの生存に結び付いた登録リース。
+/// 進行中 transaction の登録の生存に結び付いたリース。
 /// <remarks>
-/// ハンドルが commit / rollback / Close されずに捨てられても、
-/// GC された時点で（その登録のハンドルが最後の 1本なら）登録を外す。
-/// finalizer が走るのは「そのハンドルがもう使えない」状態なので、
+/// `SessionState.Registration` が持ち、接続（`Session`）が Close されずに捨てられても、
+/// GC された時点で（その登録のリースが最後の 1本なら）登録を外す。
+/// finalizer が走るのは「その接続がもう使えない」状態なので、
 /// まだ commit できる transaction を誤って解放することはない。
 /// 明示的に終わらせた場合は登録が先に外れているので何もしない（解除は冪等）。
 /// </remarks>
 type internal RegistrationLease(registration: ActiveRegistration) =
-    /// このハンドルの生存トークン。
+    /// このリースの生存トークン。
     let token = registration.Attach()
 
-    /// このハンドルの登録を外す。
+    /// 登録そのもの（`DbState.ActiveRegistration` へ渡す）。
+    member _.Registration = registration
+
+    /// このリースの登録を外す。
     /// 最後の 1本なら registry からも消える。二重呼び出しは無害。
     member _.Release() =
         if registration.Detach token then

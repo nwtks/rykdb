@@ -92,7 +92,7 @@ module DbError =
 /// <remarks>
 /// FSharp.Core の `Result` は参照 DU なので、成功パスでも `Ok` を 1個確保する。
 /// 行ごと・値ごとに評価するホットパスではこの struct 版を使い、
-/// 公開 API の境界（`Database` / `Session` / `Op.toArrayLimited`）で `Result` に戻す。
+/// 公開 API の境界（`Session` / `Op.toArrayLimited`）で `Result` に戻す。
 /// ケースは struct DU のためフィールド名を付ける（FS3585）。
 /// `Unchecked.defaultof` で作らないこと（tag 0 = `DbOk` の既定値になる）。
 /// コレクションの要素にしないこと（セルが大きくなり、コピーも増える）。

@@ -96,13 +96,11 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
         member _.Close() = inner.Close()
 
 /// ゲート付きメモリエンジンの上に Session を組み立ててテストする。
-/// `Session` の internal ctor と `Database.OpenWithStore` を使う。
 let private withGatedSession (_tag: string) (f: Session -> EngineGates -> unit) =
     let gates = EngineGates()
     let root = "mem:" + System.Guid.NewGuid().ToString "N"
     let store = openStoreWith "" (GatedEngine(gates, memoryEngine ()) :> IStorageEngine)
-    let db = ok (Database.OpenWithStore root store)
-    let session = Session.OpenWith(root, SessionOptions.Default, db)
+    let session = ok (Session.OpenWithStore(root, SessionOptions.Default, store))
 
     try
         f session gates
@@ -449,10 +447,10 @@ let ``Session: 空 SQL は 0 行の結果を返す`` () =
         Assert.Empty result.Rows)
 
 [<Fact>]
-let ``Session: Database 型は公開されていない`` () =
-    let dbType = typeof<Session>.Assembly.GetType "RykDb.Core.Database"
-    Assert.NotNull dbType
-    Assert.False dbType.IsPublic
+let ``Session: DatabaseHost 型は公開されていない`` () =
+    let hostType = typeof<Session>.Assembly.GetType "RykDb.Core.DatabaseHost"
+    Assert.NotNull hostType
+    Assert.False hostType.IsPublic
 
 [<Fact>]
 let ``SessionOptions: 行数上限を超える SELECT は CapacityError`` () =

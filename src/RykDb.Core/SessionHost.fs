@@ -129,7 +129,9 @@ type internal SessionState =
         /// 未 commit の変更を積んだ transaction。
         Pending: Transaction option
         /// 進行中 transaction の ActiveSnapshot 登録。
-        Registration: ActiveRegistration option
+        /// 接続（`Session`）が Close されずに GC された場合も、
+        /// 最後のリースが回収された時点で登録が外れる（`RegistrationLease`）。
+        Registration: RegistrationLease option
     }
 
 module internal SessionState =
@@ -144,12 +146,19 @@ module internal SessionState =
 
     let inTransaction (state: SessionState) = state.Active.IsSome
 
-    let ofState (state: DbState) =
+    /// `state` の transaction 状態を写し取る。
+    /// `Registration` は `state.ActiveRegistration` が残っている間だけ `local` の lease を引き継ぐ
+    /// （lease 自体は `DbState` に載らないため、同じ登録を指している間は元の lease を使う）。
+    let ofState (local: SessionState) (state: DbState) =
         {
             Catalog = state.Catalog
             Active = state.Active
             Pending = state.Pending
-            Registration = state.ActiveRegistration
+            Registration =
+                if state.ActiveRegistration.IsSome then
+                    local.Registration
+                else
+                    None
         }
 
     /// 共有の committed state に接続ローカルの transaction を重ねる。
@@ -162,7 +171,7 @@ module internal SessionState =
                 Catalog = local.Catalog
                 Active = local.Active
                 Pending = local.Pending
-                ActiveRegistration = local.Registration
+                ActiveRegistration = local.Registration |> Option.map _.Registration
             }
 
 /// `DatabaseHost` のライフサイクル。
@@ -183,9 +192,10 @@ type private HostLifecycle =
 /// - 書き込み・BEGIN / COMMIT / ROLLBACK・DDL は `writeGate` で直列化する。
 /// - 読み取りは `writeGate` を取らず、committed state のスナップショットを見る。
 /// - WAL の fsync はホスト単位で 1回にまとめる（`CommitDurability`）。
+/// - ストアを開くのも閉じるのもこの型（`OpenWithBackground` / `Close`）。
 /// - 閉じるのは所有者だけ（`SessionPool.Close` / 単独の `Session.Close`）。
 /// </remarks>
-type internal DatabaseHost(root: string, owner: Database, ?commitDurability: CommitDurability) =
+type internal DatabaseHost(root: string, state: DbState, ?commitDurability: CommitDurability) =
     // ライフサイクル（committed state と Close 状態）を保護する短いロック。
     let stateGate = obj ()
     // 書き込み・transaction 操作・Close を直列化するロック。
@@ -197,7 +207,8 @@ type internal DatabaseHost(root: string, owner: Database, ?commitDurability: Com
         | None -> CommitDurability(fun pos -> Wal.sync root pos)
 
     // committed state は常に Active / Pending / ActiveRegistration を持たない。
-    let mutable lifecycle = HostLifecycle.Running owner.StateWithDeferredDurability
+    // WAL の fsync はホストのグループコミットへ委ねる（DeferDurability）。
+    let mutable lifecycle = HostLifecycle.Running { state with DeferDurability = true }
 
     let snapshot () = lock stateGate (fun () -> lifecycle)
 
@@ -233,6 +244,61 @@ type internal DatabaseHost(root: string, owner: Database, ?commitDurability: Com
             | Ok() -> outcome
         | None -> outcome
 
+    /// 与えたストアで DB を開く。
+    /// カタログ読込・DROP 後始末・background worker の開始まで行う。
+    /// 失敗した場合はストアを閉じる。
+    static member OpenWithStore(root: string, store: RowStore, ?commitDurability: CommitDurability) =
+        match Catalog.load store with
+        | Error e ->
+            RowStore.close store |> ignore
+            err e
+        | Ok catalog ->
+            match TransactionManager.create () |> DropCleanupRecovery.recover store catalog with
+            | Error e ->
+                RowStore.close store |> ignore
+                err e
+            | Ok(store, mgr) ->
+                let lastSeq = RowStore.lastSeqNo store
+
+                let manager =
+                    { mgr with
+                        LastCommitSeqNo = lastSeq
+                        NextSeqNo = lastSeq + 1UL
+                    }
+
+                RowStore.startBackground store
+
+                new DatabaseHost(
+                    root,
+                    {
+                        Root = root
+                        Store = store
+                        Catalog = catalog
+                        Manager = manager
+                        Active = None
+                        Pending = None
+                        ActiveRegistration = None
+                        DeferDurability = true
+                    },
+                    ?commitDurability = commitDurability
+                )
+                |> ret
+
+    /// background compaction を有効にして開く（公開 API の `Session` が使う）。
+    /// 同じ root はプロセス内で 1つしか開けない。
+    static member OpenWithBackground(root: string, ?commitDurability: CommitDurability) =
+        result {
+            let! store = RowStore.openStoreWithBackground root
+            return! DatabaseHost.OpenWithStore(root, store, ?commitDurability = commitDurability)
+        }
+
+    /// background compaction を無効にして開く（同期 compaction）。
+    static member OpenWith(root: string, ?commitDurability: CommitDurability) =
+        result {
+            let! store = RowStore.openStore root
+            return! DatabaseHost.OpenWithStore(root, store, ?commitDurability = commitDurability)
+        }
+
     /// 現在の committed state（Close 後は最後の state）。
     member _.Committed =
         lock stateGate (fun () ->
@@ -267,6 +333,7 @@ type internal DatabaseHost(root: string, owner: Database, ?commitDurability: Com
                 current.Store.Runtime.WithShared(fun () ->
                     let mgr, txn = TransactionManager.beginTxn current.Manager
                     let registration = current.Store.Runtime.Register(root, txn.Snapshot.SeqNo)
+                    let lease = RegistrationLease registration
 
                     match Catalog.load current.Store with
                     | Error e ->
@@ -281,7 +348,7 @@ type internal DatabaseHost(root: string, owner: Database, ?commitDurability: Com
                                 Catalog = fresh
                                 Active = Some txn
                                 Pending = None
-                                Registration = Some registration
+                                Registration = Some lease
                             }
 
                         ret (next, (nextLocal, StatementResult.Empty)))
@@ -307,7 +374,7 @@ type internal DatabaseHost(root: string, owner: Database, ?commitDurability: Com
                         }
 
                     publish committed
-                    ret (committed, (SessionState.ofState committed, StatementResult.Empty)))
+                    ret (committed, (SessionState.ofState local committed, StatementResult.Empty)))
 
     /// ROLLBACK。接続の transaction を捨てる。
     member _.Rollback(local: SessionState) =
@@ -326,7 +393,7 @@ type internal DatabaseHost(root: string, owner: Database, ?commitDurability: Com
                     }
 
                 publish committed
-                ret (committed, (SessionState.ofState committed, StatementResult.Empty)))
+                ret (committed, (SessionState.ofState local committed, StatementResult.Empty)))
 
     /// transaction 以外の文（SELECT / DML / DDL）を実行する。
     member _.ExecuteNonTransaction (local: SessionState) (limits: ResultLimits) (stmt: Statement) =
@@ -336,7 +403,7 @@ type internal DatabaseHost(root: string, owner: Database, ?commitDurability: Com
             match Engine.executeStatementWithLimits limits state stmt with
             | Error e -> err e
             | Ok(next, result) ->
-                let nextLocal = SessionState.ofState next
+                let nextLocal = SessionState.ofState local next
 
                 if next.Active.IsNone && next.Pending.IsNone then
                     let committed =
@@ -397,7 +464,7 @@ type internal DatabaseHost(root: string, owner: Database, ?commitDurability: Com
                         ActiveRegistration = None
                     }
 
-            let closeResult = owner.WithState(state).Close()
+            let closeResult = RowStore.close state.Store
 
             match syncError with
             | Some e -> err e

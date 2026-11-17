@@ -1,9 +1,10 @@
 // ===========================================================================
-// Database.fs のテスト: ハンドル API・トランザクション機構・永続性
+// DB 全体の通し経路テスト: トランザクション機構・永続性・内部機構
 //
-// ライブラリ API（Begin / Commit / Rollback / Close）と、内部機構
+// 公開 API の `Session`（と `SessionPool`）を使い、内部機構
 // （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / snapshot 登録）を
 // 検証する。SQL の構文・意味論は SqlReferenceTests.fs にある。
+// `Database`（internal の不変ハンドル）は 2026-11-17 に廃止した。
 // ===========================================================================
 
 module RykDb.DatabaseTests
@@ -12,8 +13,12 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
+/// 同期 compaction でディスクの DB を開く（テスト用）。
+let private openDb (root: string) =
+    ok (Session.OpenWithSync(root, SessionOptions.Default))
+
 /// ライブラリ API で DB を仕込む（E2E で共通）。
-let private seedLibrary (db: Database) =
+let private seedLibrary (db: Session) =
     db
     |> fun d -> exec d "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)"
     |> fun d -> exec d "INSERT INTO people VALUES (1, 'alice', 30), (2, 'bob', 25), (3, 'carol', 35), (4, 'dave', 25)"
@@ -27,18 +32,18 @@ let private seedLibrary (db: Database) =
 let private openWithTakingOver (root: string) =
     result {
         let! store = RowStore.openStoreTakingOver root
-        return! Database.OpenWithStore root store
+        return! Session.OpenWithStore(root, SessionOptions.Default, store)
     }
 
-/// transaction を開始してハンドルを捨てる（呼び出し側は戻り値しか持たない）。
+/// transaction を開始して Session を捨てる（呼び出し側は戻り値しか持たない）。
 /// `NoInlining` は Debug ビルドのローカルがメソッド末尾まで生き残るのを避けるため。
 /// 戻り値は「開始直後は確かに登録されていた」こと。
 [<System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)>]
-let private abandonTransaction (db: Database) =
-    let tx = ok (db.Begin())
-    let registered = (db.Runtime.OldestExcept(db.Root, None)).IsSome
-    // tx はここを抜けると到達不能になる（finalizer が登録を外せる）。
-    registered && tx.InTransaction
+let private abandonTransaction (host: DatabaseHost) =
+    let session = Session.Create(host, SessionOptions.Default, false)
+    ok (session.Begin())
+    // session はここを抜けると到達不能になる（RegistrationLease の finalizer が登録を外せる）。
+    (host.Committed.Store.Runtime.OldestExcept(host.Committed.Root, None)).IsSome
 
 /// finalizer を確実に走らせる。
 let private collectGarbage () =
@@ -109,8 +114,8 @@ let ``Database: 値を使わない射影・集約は空の行でも件数を返�
         Assert.Equal<string>("x", asText star.Rows.[0].[2])
 
         // transaction overlay は主キーを必要とするため、空マスクでも主キーを足す。
-        let tx = ok (dbIx.Begin())
-        let tx, _ = ok (execSql tx "UPDATE t SET b = 'z' WHERE id = 1")
+        ok (dbIx.Begin())
+        let tx, _ = ok (execSql dbIx "UPDATE t SET b = 'z' WHERE id = 1")
         let _, countTx = ok (execSql tx "SELECT COUNT(*) FROM t")
         Assert.Equal<int64>(2L, asInt countTx.Rows.[0].[0])
 
@@ -122,25 +127,25 @@ let ``Database: 値を使わない射影・集約は空の行でも件数を返�
 let ``Database: BEGIN/COMMIT でまとめて反映される`` () =
     withDb "tx1" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = ok (db1.Begin())
-        Assert.True db2.InTransaction
+        ok (db1.Begin())
+        Assert.True db1.InTransaction
 
-        let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (1, 1)")
-        let db4, _ = ok (execSql db3 "INSERT INTO t VALUES (2, 2)")
-        let db5 = ok (db4.Commit())
-        Assert.False db5.InTransaction
+        let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1, 1)")
+        let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (2, 2)")
+        ok (db3.Commit())
+        Assert.False db3.InTransaction
 
-        let _db11, res = ok (execSql db5 "SELECT id FROM t")
+        let _db4, res = ok (execSql db3 "SELECT id FROM t")
         Assert.Equal<int>(2, res.Rows.Length))
 
 [<Fact>]
 let ``Database: commit してない transaction は残らない`` () =
     withDir "crash2" (fun dir ->
-        let db = seedLibrary (ok (Database.OpenWith dir))
+        let db = seedLibrary (openDb dir)
 
         // 明示 transaction を開いて write してから捨てる。
-        let tx = ok (db.Begin())
-        let tx2 = exec tx "INSERT INTO people VALUES (99, 'ghost', 1)"
+        ok (db.Begin())
+        let tx2 = exec db "INSERT INTO people VALUES (99, 'ghost', 1)"
         Assert.True tx2.InTransaction
 
         // `Close` しないので、幽霊行は WAL にしか無い。
@@ -152,25 +157,31 @@ let ``Database: commit してない transaction は残らない`` () =
         ok (reopened.Close()))
 
 [<Fact>]
-let ``Database: 別ハンドルの書き込みは既存 transaction に見えない`` () =
+let ``Database: 別接続の書き込みは既存 transaction に見えない`` () =
     withDir "mvcc" (fun dir ->
-        let db = seedLibrary (ok (Database.OpenWith dir))
+        let pool = ok (SessionPool.OpenWith(dir))
+
+        let reader = ok (pool.CreateSession())
+        seedLibrary reader |> ignore
 
         // 読み取り専用 transaction を開く（`Active` だけ立てる）。
-        let reader = ok (db.Begin())
+        ok (reader.Begin())
         Assert.True reader.InTransaction
 
-        // 別のハンドルから書き込む。
-        let writer = exec db "INSERT INTO people VALUES (5, 'erin', 41)"
+        // 別の接続から書き込む。
+        let writer = ok (pool.CreateSession())
+        ok (writer.Execute "INSERT INTO people VALUES (5, 'erin', 41)") |> ignore
         // reader は commit していないので、新しい行は見えない。
-        let before = query reader "SELECT COUNT(*) FROM people"
+        let before = ok (reader.Execute "SELECT COUNT(*) FROM people")
         Assert.Equal<int64>(4L, asInt before.Rows.[0].[0])
 
         // 書き込んだ側からは見える。
-        let after = query writer "SELECT COUNT(*) FROM people"
+        let after = ok (writer.Execute "SELECT COUNT(*) FROM people")
         Assert.Equal<int64>(5L, asInt after.Rows.[0].[0])
 
-        ok (writer.Close()))
+        ok (reader.Close())
+        ok (writer.Close())
+        ok (pool.Close()))
 
 [<Fact>]
 let ``Database: ROLLBACK で元に戻る`` () =
@@ -178,58 +189,58 @@ let ``Database: ROLLBACK で元に戻る`` () =
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1, 1)")
 
-        let db3 = ok (db2.Begin())
-        let db4, _ = ok (execSql db3 "INSERT INTO t VALUES (2, 2)")
-        let db5 = ok (db4.Rollback())
-        Assert.False db5.InTransaction
+        ok (db2.Begin())
+        let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (2, 2)")
+        ok (db3.Rollback())
+        Assert.False db3.InTransaction
 
-        let _db12, res = ok (execSql db5 "SELECT id FROM t")
+        let _db4, res = ok (execSql db3 "SELECT id FROM t")
         Assert.Equal<int>(1, res.Rows.Length))
 
 [<Fact>]
 let ``Database: 二重 Begin と空の Commit / Rollback`` () =
     withDb "tx3" (fun db0 ->
         // 二重 Begin は進行中の transaction を維持する
-        let db1 = ok (db0.Begin())
-        let db2 = ok (db1.Begin())
-        Assert.True db2.InTransaction
+        ok (db0.Begin())
+        ok (db0.Begin())
+        Assert.True db0.InTransaction
 
         // DML なしの Commit は Active の transaction をそのまま流す
-        let db3 = ok (db2.Commit())
-        Assert.False db3.InTransaction
+        ok (db0.Commit())
+        Assert.False db0.InTransaction
 
         // transaction が無い状態の Commit はエラー
-        expectError "transaction が無い Commit はエラー" (db3.Commit())
+        expectError "transaction が無い Commit はエラー" (db0.Commit())
         // transaction が無い状態の Rollback はエラー（Commit と対称）
-        expectError "transaction が無い Rollback はエラー" (db3.Rollback()))
+        expectError "transaction が無い Rollback はエラー" (db0.Rollback()))
 
 [<Fact>]
 let ``Database: transaction 中の文エラーはそのまま返る`` () =
     withDb "tx4" (fun db0 ->
-        let db1 = ok (db0.Begin())
-        expectError "BEGIN 中の存在しないテーブル" (execSql db1 "SELECT * FROM nope"))
+        ok (db0.Begin())
+        expectError "BEGIN 中の存在しないテーブル" (execSql db0 "SELECT * FROM nope"))
 
 [<Fact>]
 let ``Database: 明示 transaction 中の DDL はエラーになる`` () =
     withDb "tx-ddl" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let tx = ok (db1.Begin())
+        ok (db1.Begin())
         // DDL は自動 commit されて ROLLBACK で戻らないので、明示的に拒否する
-        expectError "BEGIN 中の CREATE TABLE" (execSql tx "CREATE TABLE u (id INTEGER PRIMARY KEY)")
-        expectError "BEGIN 中の CREATE INDEX" (execSql tx "CREATE INDEX ix ON t (v)")
-        expectError "BEGIN 中の DROP TABLE" (execSql tx "DROP TABLE t")
+        expectError "BEGIN 中の CREATE TABLE" (execSql db1 "CREATE TABLE u (id INTEGER PRIMARY KEY)")
+        expectError "BEGIN 中の CREATE INDEX" (execSql db1 "CREATE INDEX ix ON t (v)")
+        expectError "BEGIN 中の DROP TABLE" (execSql db1 "DROP TABLE t")
 
         // transaction を閉じれば DDL できる
-        let committed = ok (tx.Commit())
-        let db2 = exec committed "CREATE TABLE u (id INTEGER PRIMARY KEY)"
-        Assert.Contains("u", db2.TableNames()))
+        ok (db1.Commit())
+        let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY)"
+        Assert.Contains("u", ok (db2.TableNames())))
 
 [<Fact>]
 let ``Database: 明示 transaction 内の書き込みが SELECT に見える`` () =
     withDb "tx6" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let tx0 = ok (db1.Begin())
-        let tx1, _ = ok (execSql tx0 "INSERT INTO t VALUES (1, 10)")
+        ok (db1.Begin())
+        let tx1, _ = ok (execSql db1 "INSERT INTO t VALUES (1, 10)")
 
         let tx2, added = ok (execSql tx1 "SELECT id, v FROM t")
         Assert.Equal<int>(1, added.Rows.Length)
@@ -244,8 +255,8 @@ let ``Database: 明示 transaction 内の書き込みが SELECT に見える`` (
         let tx6, deleted = ok (execSql tx5 "SELECT id FROM t")
         Assert.Equal<int>(0, deleted.Rows.Length)
 
-        let committed = ok (tx6.Commit())
-        let _, after = ok (execSql committed "SELECT id FROM t")
+        ok (tx6.Commit())
+        let _, after = ok (execSql tx6 "SELECT id FROM t")
         Assert.Equal<int>(0, after.Rows.Length))
 
 [<Fact>]
@@ -254,13 +265,13 @@ let ``Database: 既存行がある transaction 内の INSERT は SELECT に全�
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1, 10), (3, 30), (5, 50)")
 
-        let tx0 = ok (db2.Begin())
-        let tx1, _ = ok (execSql tx0 "INSERT INTO t VALUES (0, 0), (2, 20), (4, 40)")
+        ok (db2.Begin())
+        let tx1, _ = ok (execSql db2 "INSERT INTO t VALUES (0, 0), (2, 20), (4, 40)")
         let tx2, rows = ok (execSql tx1 "SELECT id, v FROM t ORDER BY id")
         Assert.Equal<int64 array>([| 0L; 1L; 2L; 3L; 4L; 5L |], rows.Rows |> Array.map (fun r -> asInt r.[0]))
 
-        let committed = ok (tx2.Commit())
-        let _, after = ok (execSql committed "SELECT id FROM t ORDER BY id")
+        ok (tx2.Commit())
+        let _, after = ok (execSql tx2 "SELECT id FROM t ORDER BY id")
         Assert.Equal<int64 array>([| 0L; 1L; 2L; 3L; 4L; 5L |], after.Rows |> Array.map (fun r -> asInt r.[0])))
 
 [<Fact>]
@@ -269,8 +280,8 @@ let ``Database: 既存行がある transaction 内の複数 UPDATE が正しい`
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 
-        let tx0 = ok (db2.Begin())
-        let tx1, _ = ok (execSql tx0 "UPDATE t SET v = 100 WHERE id = 1")
+        ok (db2.Begin())
+        let tx1, _ = ok (execSql db2 "UPDATE t SET v = 100 WHERE id = 1")
         let tx2, _ = ok (execSql tx1 "UPDATE t SET v = 300 WHERE id = 3")
 
         let tx3, rows = ok (execSql tx2 "SELECT id, v FROM t ORDER BY id")
@@ -282,8 +293,8 @@ let ``Database: 既存行がある transaction 内の複数 UPDATE が正しい`
         Assert.Equal<int64>(3L, asInt rows.Rows.[2].[0])
         Assert.Equal<int64>(300L, asInt rows.Rows.[2].[1])
 
-        let committed = ok (tx3.Commit())
-        let _, after = ok (execSql committed "SELECT id, v FROM t ORDER BY id")
+        ok (tx3.Commit())
+        let _, after = ok (execSql tx3 "SELECT id, v FROM t ORDER BY id")
         Assert.Equal<int64>(100L, asInt after.Rows.[0].[1])
         Assert.Equal<int64>(20L, asInt after.Rows.[1].[1])
         Assert.Equal<int64>(300L, asInt after.Rows.[2].[1]))
@@ -295,8 +306,8 @@ let ``Database: 既存行がある transaction 内の索引検索が書き込み
         let db2 = exec db1 "CREATE INDEX ix_t_v ON t (v)"
         let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 
-        let tx0 = ok (db3.Begin())
-        let tx1, _ = ok (execSql tx0 "INSERT INTO t VALUES (4, 40)")
+        ok (db3.Begin())
+        let tx1, _ = ok (execSql db3 "INSERT INTO t VALUES (4, 40)")
         let tx2, added = ok (execSql tx1 "SELECT id FROM t WHERE v = 40")
         Assert.Equal<int>(1, added.Rows.Length)
         Assert.Equal<int64>(4L, asInt added.Rows.[0].[0])
@@ -317,8 +328,8 @@ let ``Database: 明示 transaction 内の索引検索が書き込みを見る`` 
     withDb "tx7" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE INDEX ix_t_v ON t (v)"
-        let tx0 = ok (db2.Begin())
-        let tx1, _ = ok (execSql tx0 "INSERT INTO t VALUES (1, 7)")
+        ok (db2.Begin())
+        let tx1, _ = ok (execSql db2 "INSERT INTO t VALUES (1, 7)")
         let tx2, found = ok (execSql tx1 "SELECT id FROM t WHERE v = 7")
         Assert.Equal<int>(1, found.Rows.Length)
 
@@ -330,27 +341,20 @@ let ``Database: 明示 transaction 内の索引検索が書き込みを見る`` 
         Assert.Equal<int>(1, newKey.Rows.Length))
 
 [<Fact>]
-let ``Database: Root はルートディレクトリを返す`` () =
-    withDir "rootprop" (fun dir ->
-        let db = ok (Database.OpenWith dir)
-        Assert.Equal(dir, db.Root)
-        ok (db.Close()))
-
-[<Fact>]
 let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
     withDir "limit-pushdown" (fun dir ->
         // 2回に分けて Close し、テーブル t の SSTable を 2 個作る。
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
         ok (db2.Close())
 
-        let db3 = ok (Database.OpenWith dir)
+        let db3 = openDb dir
         let db4 = exec db3 "INSERT INTO t VALUES (3), (4)"
         ok (db4.Close())
 
         // openDatabase は MaxSeqNo の復元で全 SSTable を読むため、open 後に壊す。
-        let db5 = ok (Database.OpenWith dir)
+        let db5 = openDb dir
         corruptNewestTableSstable dir
 
         // LIMIT 1 は先頭 1行だけなので、キー 3 以降の壊れた SSTable を開かない。
@@ -366,16 +370,16 @@ let ``Database: LIMIT 1 は後続の壊れた SSTable を開かない`` () =
 [<Fact>]
 let ``Database: 主キー順の ORDER BY は Sort を作らず LIMIT がストレージへ降りる`` () =
     withDir "orderby-pk-pushdown" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
         ok (db2.Close())
 
-        let db3 = ok (Database.OpenWith dir)
+        let db3 = openDb dir
         let db4 = exec db3 "INSERT INTO t VALUES (3), (4)"
         ok (db4.Close())
 
-        let db5 = ok (Database.OpenWith dir)
+        let db5 = openDb dir
         corruptNewestTableSstable dir
 
         // 主キー昇順の ORDER BY は Sort ノードを作らないので、
@@ -462,7 +466,7 @@ let ``Database: CREATE INDEX は残った索引エントリを消してから ba
 
         ok (RowStore.close store)
 
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
         let db2 = exec db1 "CREATE INDEX ix_a ON t (a)"
         let _, rows = ok (execSql db2 "SELECT id FROM t WHERE a = 999")
@@ -503,7 +507,7 @@ let ``Database: 索引ごと DROP TABLE しても旧索引エントリが復活�
 [<Fact>]
 let ``Database: DROP TABLE は索引 keyspace の孤児エントリも消す`` () =
     withDir "drop-table-stale" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 10)"
         let db3 = exec db2 "CREATE INDEX ix_g ON t (g)"
@@ -528,7 +532,7 @@ let ``Database: DROP TABLE は索引 keyspace の孤児エントリも消す`` (
 
         ok (RowStore.close store)
 
-        let db4 = ok (Database.OpenWith dir)
+        let db4 = openDb dir
         let db5 = exec db4 "DROP TABLE t"
         ok (db5.Close())
 
@@ -547,7 +551,7 @@ let ``Database: DROP TABLE は索引 keyspace の孤児エントリも消す`` (
 [<Fact>]
 let ``Database: 中断した DROP の後始末を open 時に再開する`` () =
     withDir "drop-cleanup-recover" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 10)"
         let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
@@ -562,8 +566,8 @@ let ``Database: 中断した DROP の後始末を open 時に再開する`` () =
         ok (RowStore.close store)
 
         // open 時にジャーナルを検出して後始末を再開する。
-        let db4 = ok (Database.OpenWith dir)
-        Assert.Empty(db4.TableNames())
+        let db4 = openDb dir
+        Assert.Empty(ok (db4.TableNames()))
         ok (db4.Close())
 
         let store = ok (RowStore.openStore dir)
@@ -600,7 +604,7 @@ let ``Database: DROP INDEX 後の同名再作成で旧索引エントリが復�
 [<Fact>]
 let ``Database: 一連の流れが誤差なく通る`` () =
     withDir "flow" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db = seedLibrary db0
 
         // 単純な射影
@@ -738,14 +742,14 @@ let ``末尾再帰: 多数の列を持つ INSERT / UPDATE が完了する`` () =
 [<Fact>]
 let ``Database: 閉じて開き直すとデータが残る`` () =
     withDir "i-reopen" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2, _ins = ok (execSql db1 "INSERT INTO t VALUES (1, 'kept')")
         ok (db2.Close())
 
         // 開き直す
-        let db3 = ok (Database.OpenWith dir)
-        Assert.Equal<string list>([ "t" ], db3.TableNames())
+        let db3 = openDb dir
+        Assert.Equal<string list>([ "t" ], ok (db3.TableNames()))
 
         let _db4, res = ok (execSql db3 "SELECT v FROM t")
         Assert.Equal<int>(1, res.Rows.Length)
@@ -759,7 +763,7 @@ let ``Database: 閉じて開き直すとデータが残る`` () =
 [<Fact>]
 let ``Database: カタログ破損で開くのに失敗してもロックを解放する`` () =
     withDir "catalog-corrupt-lock" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         ok (db1.Close())
 
@@ -782,46 +786,22 @@ let ``Database: カタログ破損で開くのに失敗してもロックを解�
 
         ok (RowStore.close store)
 
-        expectError "壊れたカタログを読めてしまう" (Database.OpenWith dir)
+        expectError "壊れたカタログを読めてしまう" (Session.OpenWithSync(dir, SessionOptions.Default))
 
         // 失敗した open がロックを残していると、ここで IoError になる。
         let store = ok (RowStore.openStore dir)
         ok (RowStore.close store))
 
 [<Fact>]
-let ``Database: 古いハンドルを Close しても新しいハンドルの commit は失われない`` () =
-    withDir "stale-close" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
-        let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1)")
-        let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (2)")
-
-        let before = query db3 "SELECT COUNT(*) FROM t"
-        Assert.Equal<int64>(2L, asInt before.Rows.[0].[0])
-
-        // db2 は db3 より前の状態。古いハンドルの Close で WAL を消してはいけない。
-        ok (db2.Close())
-
-        // 古いハンドルの Close は、生きている db3 のプロセスロックも解放しない。
-        expectErrorKind ErrorKind.IoError "古いハンドルの Close で再オープンできてしまった" (Database.OpenWith dir)
-
-        // 最新ハンドルを閉じれば WAL もロックも解放され、再オープンできる。
-        ok (db3.Close())
-        let reopened = ok (Database.OpenWith dir)
-        let after = query reopened "SELECT COUNT(*) FROM t"
-        Assert.Equal<int64>(2L, asInt after.Rows.[0].[0])
-        ok (reopened.Close()))
-
-[<Fact>]
 let ``Database: プロセス再起動を模して Disk から復元できる`` () =
     withDir "reopen" (fun dir ->
-        let db = seedLibrary (ok (Database.OpenWith dir))
+        let db = seedLibrary (openDb dir)
         ok (db.Close())
 
         // 別ハンドルを「別プロセス」として扱う。
-        let reopened = ok (Database.OpenWith dir)
+        let reopened = openDb dir
         // `TableNames` の並び順は保証されない（keyspace のディレクトリ順）のでソートする。
-        Assert.Equal<string list>([ "orders"; "people" ], reopened.TableNames() |> List.sort)
+        Assert.Equal<string list>([ "orders"; "people" ], ok (reopened.TableNames()) |> List.sort)
 
         let people = query reopened "SELECT COUNT(*) FROM people"
         Assert.Equal<int64>(4L, asInt people.Rows.[0].[0])
@@ -836,7 +816,7 @@ let ``Database: プロセス再起動を模して Disk から復元できる`` (
 [<Fact>]
 let ``Database: Close しなくても commit 済みの行は残る`` () =
     withDir "crash" (fun dir ->
-        let _db = seedLibrary (ok (Database.OpenWith dir))
+        let _db = seedLibrary (openDb dir)
         // Close を呼ばない（memtable は SSTable 未落下、残るのは WAL 再生のみ）。
         let reopened = ok (openWithTakingOver dir)
 
@@ -847,81 +827,78 @@ let ``Database: Close しなくても commit 済みの行は残る`` () =
 
 [<Fact>]
 let ``Database: active transaction は snapshot registry に登録され、commit / rollback / Close で外れる`` () =
-    withDir "reg-lifecycle" (fun dir ->
-        let db = ok (Database.OpenWith dir)
-        let root = db.Root
-        let runtime = db.Runtime
+    withDbHost "reg-lifecycle" (fun host session ->
+        let runtime = host.Committed.Store.Runtime
+        let root = host.Committed.Root
         Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
         // 明示 transaction: Begin で登録、Commit で解除
-        let tx = ok (db.Begin())
+        ok (session.Begin())
         Assert.True((runtime.OldestExcept(root, None)).IsSome)
-        let committed = ok (tx.Commit())
+        ok (session.Commit())
         Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
         // Rollback でも解除
-        let tx2 = ok (committed.Begin())
+        ok (session.Begin())
         Assert.True((runtime.OldestExcept(root, None)).IsSome)
-        let rolledBack = ok (tx2.Rollback())
+        ok (session.Rollback())
         Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
         // SQL の BEGIN / COMMIT 経由でも同じ
-        let sqlTx, _ = ok (execSql rolledBack "BEGIN")
+        ok (session.Execute "BEGIN") |> ignore
         Assert.True((runtime.OldestExcept(root, None)).IsSome)
-        let sqlDone, _ = ok (execSql sqlTx "COMMIT")
+        ok (session.Execute "COMMIT") |> ignore
         Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
         // 暗黙 transaction は Execute の中で登録・解除が完結する
-        let withTable, _ = ok (execSql sqlDone "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
         Assert.True((runtime.OldestExcept(root, None)).IsNone)
 
-        // Close でも解除される（閉じたハンドルの snapshot は誰も読めない）
-        let openTx = ok (withTable.Begin())
+        // Close でも解除される（閉じた接続の snapshot は誰も読めない）
+        ok (session.Begin())
         Assert.True((runtime.OldestExcept(root, None)).IsSome)
-        ok (openTx.Close())
+        ok (session.Close())
         Assert.True((runtime.OldestExcept(root, None)).IsNone))
 
 [<Fact>]
 let ``Database: commit せずに捨てた transaction も GC されれば登録が外れる`` () =
-    withDir "reg-abandon" (fun dir ->
-        let db = ok (Database.OpenWith dir)
-        let withTable = exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        Assert.True(abandonTransaction withTable)
+    withDbHost "reg-abandon" (fun host session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        |> ignore
+
+        Assert.True(abandonTransaction host)
 
         collectGarbage ()
-        // 最後のハンドルが消えたので登録が外れる（修正前はここに残り続けた）。
-        Assert.True((withTable.Runtime.OldestExcept(withTable.Root, None)).IsNone)
+        // 最後の Session が消えたので登録が外れる（修正前はここに残り続けた）。
+        Assert.True((host.Committed.Store.Runtime.OldestExcept(host.Committed.Root, None)).IsNone)
 
         // 登録が残っていると ConflictError になる DDL が通る。
-        let indexed = exec withTable "CREATE INDEX ix_v ON t (v)"
-        let inserted = exec indexed "INSERT INTO t VALUES (1, 10)"
-        let _, found = ok (execSql inserted "SELECT id FROM t WHERE v = 10")
-        Assert.Equal<int>(1, found.Rows.Length)
-
-        ok (inserted.Close()))
+        ok (session.Execute "CREATE INDEX ix_v ON t (v)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+        let _, found = ok (execSql session "SELECT id FROM t WHERE v = 10")
+        Assert.Equal<int>(1, found.Rows.Length))
 
 [<Fact>]
 let ``Database: 生きている transaction は GC されても登録が残る`` () =
-    withDir "reg-live-gc" (fun dir ->
-        let db = ok (Database.OpenWith dir)
-        let tx = ok (db.Begin())
-        // tx はこのあと Rollback で使うので GC されない（finalizer は走らない）。
+    withDbHost "reg-live-gc" (fun host session ->
+        ok (session.Begin())
+        // session はこのあと Rollback で使うので GC されない（finalizer は走らない）。
         collectGarbage ()
-        Assert.True((db.Runtime.OldestExcept(db.Root, None)).IsSome)
+        Assert.True((host.Committed.Store.Runtime.OldestExcept(host.Committed.Root, None)).IsSome)
 
-        let rolled = ok (tx.Rollback())
-        Assert.True((db.Runtime.OldestExcept(db.Root, None)).IsNone)
-        ok (rolled.Close()))
+        ok (session.Rollback())
+        Assert.True((host.Committed.Store.Runtime.OldestExcept(host.Committed.Root, None)).IsNone))
 
 [<Fact>]
 let ``Database: Dispose でも transaction の登録が外れる`` () =
-    withDir "reg-dispose" (fun dir ->
-        let db = ok (Database.OpenWith dir)
-        let tx = ok (db.Begin())
-        Assert.True((db.Runtime.OldestExcept(db.Root, None)).IsSome)
+    withDbHost "reg-dispose" (fun host session ->
+        let runtime = host.Committed.Store.Runtime
+        let root = host.Committed.Root
+        ok (session.Begin())
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
 
-        (tx :> System.IDisposable).Dispose()
-        Assert.True((db.Runtime.OldestExcept(db.Root, None)).IsNone))
+        (session :> System.IDisposable).Dispose()
+        Assert.True((runtime.OldestExcept(root, None)).IsNone))
 
 [<Fact>]
 let ``Database: 別プロセスが開いている DB は開けない`` () =
@@ -935,7 +912,7 @@ let ``Database: 別プロセスが開いている DB は開けない`` () =
                 System.IO.FileShare.None
             )
 
-        expectErrorKind ErrorKind.IoError "別プロセスが開いている DB は開けない" (Database.OpenWith dir))
+        expectErrorKind ErrorKind.IoError "別プロセスが開いている DB は開けない" (Session.OpenWithSync(dir, SessionOptions.Default)))
 
 [<Fact>]
 let ``Database: 同じ root を二度開くと同じプロセスのエラーになり、Close 後は開ける`` () =
@@ -956,76 +933,26 @@ let ``Database: 同じ root を二度開くと同じプロセスのエラーに�
             with :? System.IO.IOException ->
                 false
 
-        let db1 = ok (Database.OpenWith dir)
+        let db1 = openDb dir
         Assert.False(canLockExternally ())
         // 同じ root を二度開くと、memtable が分かれて古い行を読むので拒否する。
-        expectErrorKind ErrorKind.IoError "同じ root の二重オープン" (Database.OpenWith dir)
+        expectErrorKind ErrorKind.IoError "同じ root の二重オープン" (Session.OpenWithSync(dir, SessionOptions.Default))
 
         // Close すればロックも外れ、開き直せる。
         ok (db1.Close())
         Assert.True(canLockExternally ())
 
-        let db2 = ok (Database.OpenWith dir)
+        let db2 = openDb dir
         ok (db2.Close()))
 
 [<Fact>]
-let ``Database: 明示 transaction があるハンドルは Close でロックを外す`` () =
+let ``Database: transaction 中の Session を Close してもロックが外れる`` () =
     withDir "proc-lock-txn" (fun dir ->
-        let db = ok (Database.OpenWith dir)
-        let tx = ok (db.Begin())
-        // 進行中 transaction を持つハンドル（元の db ではない方）を閉じてもロックは外れる。
-        ok (tx.Close())
-        ok (Database.OpenWith dir) |> fun d -> ok (d.Close()))
-
-[<Fact>]
-let ``Database: 古いハンドルの Close は生きている新しいハンドルのロックを解放しない`` () =
-    withDir "old-close-lock" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1, 10)")
-        let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (2, 20)")
-
-        // db0 は最新ではない。ここでロックを外すと、db3 が生きているのに
-        // 同じ root を別 store で開けてしまう。
-        ok (db0.Close())
-        expectErrorKind ErrorKind.IoError "古いハンドルの Close でロックが外れてしまった" (Database.OpenWith dir)
-
-        // 新しいハンドルはそのまま使える。
-        let db4, counted = ok (execSql db3 "SELECT COUNT(*) FROM t")
-        Assert.Equal<int64>(2L, asInt counted.Rows.[0].[0])
-
-        // 最新ハンドルを閉じれば解放される。
-        ok (db4.Close())
-        let reopened = ok (Database.OpenWith dir)
-        let _, after = ok (execSql reopened "SELECT COUNT(*) FROM t")
-        Assert.Equal<int64>(2L, asInt after.Rows.[0].[0])
-        ok (reopened.Close()))
-
-[<Fact>]
-let ``Database: 実行中の transaction があると DDL は ConflictError`` () =
-    withDir "ddl-conflict" (fun dir ->
-        let db1 = ok (Database.OpenWith dir)
-        let db2 = exec db1 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-
-        // BEGIN は新しいハンドルを返す。元のハンドルは transaction を持たないので DDL を試せる。
-        let tx = ok (db2.Begin())
-        let tx2, _ = ok (execSql tx "INSERT INTO t VALUES (1, 10)")
-
-        // backfill 中に古いスキーマの transaction が commit すると索引が壊れるので、排他にする。
-        expectErrorKind
-            ErrorKind.ConflictError
-            "実行中の transaction があると CREATE INDEX は ConflictError"
-            (execSql db2 "CREATE INDEX ix_v ON t (v)")
-
-        // transaction を終わらせれば通る（そのあとは索引が維持される）。
-        let rolled = ok (tx2.Rollback())
-        let made = exec db2 "CREATE INDEX ix_v ON t (v)"
-        let inserted = exec made "INSERT INTO t VALUES (2, 20)"
-        let _, found = ok (execSql inserted "SELECT id FROM t WHERE v = 20")
-        Assert.Equal<int>(1, found.Rows.Length)
-
-        ok (inserted.Close())
-        ok (rolled.Close()))
+        let session = openDb dir
+        ok (session.Begin())
+        // 進行中 transaction を持つ接続を閉じても、rollback してからロックが外れる。
+        ok (session.Close())
+        openDb dir |> fun next -> ok (next.Close()))
 
 [<Fact>]
 let ``Database: 返した行を書き換えても DB の内容は変わらない`` () =

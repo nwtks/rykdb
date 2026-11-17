@@ -534,20 +534,15 @@ let (mgr, txn) = TransactionManager.beginTxn mgr
 let (mgr, txn2) = TransactionManager.beginTxn mgr
 ```
 
-### 5.6 公開 API では `Session` を使う（`Database.Execute` は internal）
+### 5.6 公開 API では `Session` を使う
 
-`Database` は internal の不変ハンドルで、`Execute` は新しいハンドルを返す。
-公開 API の `Session` は接続ローカルの transaction 状態（`SessionState`）を持ち、
+`Session` は接続ローカルの transaction 状態（`SessionState`）を持ち、
 各文の成功後にそこだけを進める（committed な状態は `DatabaseHost` が管理する）ため、
 利用者が戻り値を引き継ぐ必要はない。
 
 ```fsharp
 // ✅ Session が状態を進める
 ok (session.Execute "INSERT ...")
-
-// Database を直接使うのは internal のテストだけ。
-// Execute は Statement を 1つ受け取り、次のハンドルを返す。
-let db2, _ = db.Execute stmt
 ```
 
 ---
@@ -1443,27 +1438,17 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
   `Manifest: 途中のレコードのチェックサム不一致は CorruptionError` /
   `Manifest: CURRENT が指す MANIFEST が無ければ CorruptionError`。
 
-### 11.14 古い `Database` ハンドルの `Close` は WAL を消さない（internal の話）
+### 11.14 不変ハンドルの `Close` で WAL を消さない対策は廃止した（履歴）
 
-公開 API の `Session` は `DatabaseHost` が持つ committed state を共有するため、この問題は起きない。
-以下は internal の `Database.Execute` を直接使うテストの注意。
+以前は internal の不変ハンドル `Database` が `Execute` ごとに作られ、
+古いハンドルの `Close()` が flush / WAL 削除 / `ProcessLock` 解放を行うと
+**新しいハンドルの commit 済みデータを失う**ため、
+`ProcessLockLease` の所有者トークンで「最新のハンドルだけが閉じる」ようにしていた。
 
-ハンドルは不変で、`Execute` は新しいハンドルを返す。
-古いハンドルも `Close` を呼べるが、そのまま flush / WAL 削除をすると
-**新しいハンドルの commit 済みデータを失う**。
-
-`StorageEngine.close` は WAL の実サイズとハンドルの `Wal.Size` を比較し、
-一致する（= 自分が最新の書き手）ときだけ flush と WAL 削除を行う。
-一致しなければ何もしない（データは WAL に残っており、新しいハンドルが flush する）。
-
-同じ理由で **古いハンドルの `Close()` は `ProcessLock` も解放しない**。
-`Database` は `ProcessLockLease` の所有者トークンを持ち、
-新しいハンドルが作られるたびに所有者が移る。
-所有者（最新）の `Close()` だけが LSM を閉じて `.rykdb.format` を解放する。
-
-- 回帰テスト:
-  `Database: 古いハンドルを Close しても新しいハンドルの commit は失われない` /
-  `Database: 古いハンドルの Close は生きている新しいハンドルのロックを解放しない`。
+2026-11-17 に `Database` を削除し、所有者は `DatabaseHost` 1つだけになった。
+`DatabaseHost.Close` は `HostLifecycle.Closed` で二重 Close を no-op にするので、
+古いハンドルが Close する経路自体が無い。
+`StorageEngine.close` の WAL サイズ比較（古い書き手が flush しない）は防御として残っている。
 
 ### 11.15 DDL は明示トランザクションに参加しない（ので拒否する）
 
@@ -1497,12 +1482,13 @@ DDL だけは DB ごとに排他にする必要がある。
   古いカタログで計算した索引エントリを後から commit されるのを防ぐため。
   **待たない**（commit されないまま残った transaction で永久に止まらないように）。
 - 同じスレッドで「共有 → 排他」の昇格はできない。
-  そのため `Database.Execute` は **DDL 文だけ共有ロックを取らない**（`Ddl` 側が排他を取る）。
+  そのため `DatabaseHost.ExecuteNonTransaction` は **DDL 文だけ共有ロックを取らない**（`Ddl` 側が排他を取る）。
 - 結果: トランザクションを `Rollback` / `Commit` せずに捨てると、その登録が残り、
   **その root の DDL は `ConflictError` になる**。
-  `Close()` / `Dispose()` で解除され、ハンドルへの参照が切れて GC されても外れる
-  （`RegistrationLease`。§7.5）。GC の時期は不定なので、明示的に終わらせるのが基本。
-- 回帰テスト: `Database: 実行中の transaction があると DDL は ConflictError` /
+  `Close()` / `Dispose()` で解除され、接続への参照が切れて GC されても外れる
+  （`SessionState.Registration` の `RegistrationLease`。§7.5）。
+  GC の時期は不定なので、明示的に終わらせるのが基本。
+- 回帰テスト: `SessionPool: transaction 中の DDL は他接続で ConflictError` /
   `Database: commit せずに捨てた transaction も GC されれば登録が外れる` /
   `Database: 生きている transaction は GC されても登録が残る` /
   `Database: Dispose でも transaction の登録が外れる`。
@@ -1516,9 +1502,9 @@ DDL だけは DB ごとに排他にする必要がある。
 **既にこのプロセスが開いている root の 2回目は `IoError`** にする。
 
 - 失敗を返す方が、黙って古い行を返すより安全。
-- **最新ハンドルの `Close()`** でロックを解放（二重 `Close` は無害）。
-  古いハンドルの `Close()` は no-op（`ProcessLockLease` の所有者だけが解放する）。
-- **クラッシュ再現テストは `RowStore.openStoreTakingOver` と internal の `Database.OpenWithStore` を使う**。
+- **所有者（`DatabaseHost.Close`）** でロックを解放（二重 `Close` は無害）。
+  所有者は 1つだけなので、古いハンドルの Close がロックを外す問題は起きない。
+- **クラッシュ再現テストは `RowStore.openStoreTakingOver` と internal の `Session.OpenWithStore` を使う**。
   ここだけは意図的に二重オープンし、WAL 再生を検証する。
 - 開く途中で失敗したら（壊れた MANIFEST など）**必ず解放する**。
   押さえたままだと、同じプロセスからも再オープンできない。
@@ -1526,8 +1512,7 @@ DDL だけは DB ごとに排他にする必要がある。
 - 回帰テスト:
   `Database: 別プロセスが開いている DB は開けない` /
   `Database: 同じ root を二度開くと同じプロセスのエラーになり、Close 後は開ける` /
-  `Database: 明示 transaction があるハンドルは Close でロックを外す` /
-  `Database: 古いハンドルの Close は生きている新しいハンドルのロックを解放しない`。
+  `Database: transaction 中の Session を Close してもロックが外れる`。
 
 ### 11.17 識別子の比較は `SqlName.equal` に一本化する
 
@@ -1570,7 +1555,8 @@ DDL だけは DB ごとに排他にする必要がある。
 ### 11.21 `Result` を握り潰さない（DEFAULT / `Begin()` / schema）
 
 - `DmlOps.insert`: 未指定列の DEFAULT の評価エラーを `NULL` にしない（値を指定した列の DEFAULT は評価しない）。
-- `Database.Begin()` は `Result<Database, DbError>` を返す（カタログ再読み込みの失敗を隠さない）。
+- `DatabaseHost.Begin` / `Session.Begin()` は `Result` を返す
+  （カタログ再読み込みの失敗を隠さない）。
 - `Engine.contextOf`: `Catalog.toSchema` の失敗を無視せず、文のエラーとして返す。
 - `Ops.sortBy`: 非 NULL の代表値と比較できない値があれば、ソート前にエラーにする。
 
@@ -2111,7 +2097,7 @@ merge 中に foreground の flush や新しい transaction が入り得る。
   Pending は「signal 未消費」を意味しない（worker が permit を消費した直後、
   Pending を消す前に close が割り込むと、Pending あり・permit なしになる）ため。
 - **worker の開始はリカバリ後**。
-  `Database.OpenWithStore` のカタログ読込と DROP 後始末が終わってから `RowStore.startBackground` を呼ぶ。
+  `DatabaseHost.OpenWithStore` のカタログ読込と DROP 後始末が終わってから `RowStore.startBackground` を呼ぶ。
   先に動かすと、リカバリの走査中に入力ファイルが retired / 削除され得る。
 - 回帰テスト: `background compaction: flush 後に L0 が background で compaction される` /
   `background compaction: compaction 中でも次の write が返る` /
@@ -2256,7 +2242,7 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 `writeGate` の外で fsync を待つため、待機中の別 commit が WAL に追記できる。
 その場合、リーダーは登録済みの最大位置まで同期し、1回の fsync でまとめる。
 
-- deferred 追記した commit は fsync 前に memtable / `Database` ハンドルへ公開される。
+- deferred 追記した commit は fsync 前に memtable / committed state へ公開される。
   並行 SELECT が未耐久の commit を見る可能性があるが、
   commit の完了を返すのは fsync 後なので、クライアントへの応答は失われない。
 
@@ -2312,11 +2298,11 @@ DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
 
 ### 11.64 接続ごとの transaction は「接続ローカルの状態 + 共有 Manager の rebase」
 
-❌ 接続の `Database` ハンドルをそのまま `Commit()` する。
-ハンドルは BEGIN 時点の `TransactionManager`（`NextSeqNo` / `LastCommitted` / `Active`）を持っているので、
+❌ BEGIN 時に捕捉した `Store` / `Manager` をそのまま `Commit` する。
+BEGIN 時点の `TransactionManager`（`NextSeqNo` / `LastCommitted` / `Active`）で
 他接続の commit を知らないまま採番・競合判定してしまう
 （SeqNo の衝突・write-write 競合の見逃し・commit の取りこぼし）。
-ハンドルの `Store` も古いため、他接続の commit が memtable に載っていない。
+`Store` も古いため、他接続の commit が memtable に載っていない。
 
 ✅ 文を実行するたびに **最新の committed state に接続ローカルの transaction を重ねる**（`SessionState.apply`）。
 `Catalog` / `Active` / `Pending` / `Registration` だけをローカルに持ち、
@@ -2329,19 +2315,16 @@ BEGIN / COMMIT / ROLLBACK と暗黙 transaction の DML / DDL は `DatabaseHost.
 回帰テスト: `SessionPool: 明示 transaction は開始時の snapshot を見る` /
 `SessionPool: 接続間で write-write 競合を検出する`。
 
-### 11.65 共有ストア用の `Database` ハンドルは ProcessLock の所有者を奪ってはいけない
+### 11.65 DB の open/close は `DatabaseHost` 1つに集約する
 
-❌ 接続ごとに `new Database(root, state)` を作る。
-コンストラクタが `ProcessLockLease.Attach()` で所有者トークンを置き換えるため、
-最後に作ったハンドルだけが所有者になる。
-ホストが `Close` しても「所有者ではない」と判定されて no-op になり、DB が閉じられない
-（WAL が削除されず、次の `OpenWith` も `IoError` になる）。
+❌ 接続ごとにストアを開いて `ProcessLock` を取得する。
+同じ root の二重オープンは `IoError` になるし、仮に通しても
+memtable / WAL ビューが分かれて他接続の commit が見えない。
 
-✅ 共有ストア用の接続は `Session(host, options, ownsHost = false)` で作り、
+✅ 共有ストアの接続は `Session.Create(host, options, ownsHost = false)` で作り、
 `Session.Close` は `host.Close()` を呼ばない。
-所有者は `Database.OpenWithBackground` が作った 1本だけで、
-`DatabaseHost.Close` が `owner.WithState(最新状態).Close()` で閉じる
-（`Database` は `ownsStore = false` では生成されない）。
+ストアを開くのは `DatabaseHost.OpenWithBackground` / `DatabaseHost.OpenWithStore` だけで、
+`DatabaseHost.Close` が唯一の所有者として `RowStore.close`（flush / WAL 削除 / `ProcessLock` 解放）を行う。
 回帰テスト: `SessionPool: 接続を閉じるとその transaction だけ rollback される`（再オープンで確認）。
 
 ### 11.66 接続の Close は DB を閉じない（所有者だけが閉じる）
@@ -2636,7 +2619,7 @@ Core のホットパスでは次の 2 つを使い、公開 API の境界で `Re
 ### 11.76 部分関数は protect の外で例外になる — `Array.reduce` / `.Value` / `List.last` を総和化
 
 `Errors.protect` の catch-all が挟まらない経路では、部分関数の例外は公開 API まで抜ける
-（`Database.Execute` / `Session.Execute` に catch-all は無い。
+（`Session.Execute` / `Op.toArrayLimited` に catch-all は無い。
 背景 compaction のみ `EngineHost.loop` の catch が受けて `LastCompactionError` になる）。
 
 - **`Compaction.expand` の `Array.reduce`（`minKeyOf` / `maxKeyOf`）**:

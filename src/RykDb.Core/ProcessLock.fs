@@ -5,7 +5,7 @@ namespace RykDb.Core
 /// **別プロセス**の同時オープンは WAL / MANIFEST を壊すので `FileShare.None` で拒否する。
 /// 排他のための専用ファイルは作らず、レイアウトの format マーカーを開いたままロックを兼ねる。
 /// **同じプロセス**でも既に開いている root は二度開けない。
-/// `Database.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
+/// `Session.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
 /// 一方の commit が他方から見えない（古い行を読んでしまう）ため。
 /// クラッシュ再現テストだけは `takeOver = true` で意図的に二重オープンする。
 /// 最後のハンドルを Close するとファイルロックも解放される。
@@ -89,39 +89,12 @@ module internal ProcessLock =
         finally
             Gate.Release() |> ignore
 
-/// プロセスロックの所有権ハンドル。
-/// `obj` のまま持ち回らず、この型で「誰が所有者か」を表す。
-[<Sealed>]
-type internal ProcessLockHandle internal (token: obj) =
-    member internal _.Token = token
-
 /// プロセスロックを保持する 1本分の寿命。
 /// <remarks>
-/// `Database.Execute` / `Begin` / `Commit` は新しいハンドルを返す。
-/// そのため、同じ `RowStore` とロックを共有するハンドルが同時に存在しうる。
-/// `Attach` のたびに最新のハンドルを所有者として記録し、所有者の `Close` だけが実際のロックを解放する。
-/// 古いハンドルから解放できると、新しいハンドルが使用中なのに同じ root を再オープンできてしまう。
-/// その結果、memtable と WAL が分かれた別々の store ができる。
+/// ロックの解放は `ForceRelease` だけ（`RowStore.close` とエラー経路が呼ぶ）。
+/// 二重解放は `ProcessLock.release` の台帳で無害になる。
+/// DB を開閉する所有者は `DatabaseHost` 1つなので、ハンドルごとの所有者トークンは持たない。
 /// </remarks>
 type internal ProcessLockLease internal (root: string, token: obj) =
-    /// 所有者のトークン。
-    /// ConcurrentDictionary に 1エントリだけ置く。
-    let owner =
-        System.Collections.Concurrent.ConcurrentDictionary<string, obj> System.StringComparer.Ordinal
-
-    /// このハンドルを所有者にする。
-    member _.Attach() =
-        let handle = ProcessLockHandle(obj ())
-        owner.["owner"] <- handle.Token
-        handle
-
-    /// このハンドルが現在の所有者か。
-    member _.IsOwner(handle: ProcessLockHandle) =
-        match owner.TryGetValue "owner" with
-        | true, current -> System.Object.ReferenceEquals(current, handle.Token)
-        | _ -> false
-
     /// 強制的にロックを解放する（RowStore を直接閉じるテスト・エラー経路用）。
-    member _.ForceRelease() =
-        owner.Clear()
-        ProcessLock.release root token
+    member _.ForceRelease() = ProcessLock.release root token

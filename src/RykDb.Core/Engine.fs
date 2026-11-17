@@ -992,27 +992,6 @@ module internal Engine =
 
             (if isDdl then run () else state.Store.Runtime.WithShared run) |> finish
 
-    let executeBegin (state: DbState) =
-        match state.Active with
-        | Some _ -> ret state
-        | None ->
-            state.Store.Runtime.WithShared(fun () ->
-                let mgr, txn = TransactionManager.beginTxn state.Manager
-                let registration = state.Store.Runtime.Register(state.Root, txn.Snapshot.SeqNo)
-
-                match Catalog.load state.Store with
-                | Error e ->
-                    state.Store.Runtime.Unregister registration
-                    err e
-                | Ok fresh ->
-                    ret
-                        { state with
-                            Manager = mgr
-                            Active = Some txn
-                            Catalog = fresh
-                            ActiveRegistration = Some registration
-                        })
-
     let executeCommit (state: DbState) =
         match state.Active with
         | None -> ret state

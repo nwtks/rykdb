@@ -5,7 +5,7 @@
 // CI ではビルドのみ。実行は手元で `dotnet run -c Release` を使う。
 //
 // 方針:
-//   * クエリ系は `Database.OpenWith`（同期 compaction）で開き、
+//   * クエリ系は `Session.OpenWithSync`（同期 compaction）で開き、
 //     背景 compaction のタイミングで測定が揺れないようにする。
 //   * シード後は一度 Close して memtable を SSTable へ flush し、
 //     ディスクからの走査を測る（再オープンして測定する）。
@@ -54,8 +54,6 @@ module private BenchText =
 type QueryBenchmarks() =
     let mutable session = Unchecked.defaultof<Session>
     let mutable root = ""
-    /// 低レベルシナリオ用のハンドル（読み取りだけに使う）。
-    let mutable db = Unchecked.defaultof<Database>
     /// `pointSql` を parse した文。parse を除いた実行を測るために 1回だけ作る。
     let mutable parsedLookup = Unchecked.defaultof<Statement>
     /// `pointSql` の計画。parse と plan を除いた実行を測るために 1回だけ作る。
@@ -111,8 +109,7 @@ type QueryBenchmarks() =
     [<GlobalSetup>]
     member this.Setup() =
         root <- BenchEnv.newTempDir "query"
-        let opened = Database.OpenWith root |> Check.ok
-        session <- Session.OpenWith(root, SessionOptions.Default, opened)
+        session <- Session.OpenWithSync(root, SessionOptions.Default) |> Check.ok
         this.Exec "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
         this.Exec "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
         this.Exec "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -129,9 +126,7 @@ type QueryBenchmarks() =
         // memtable を SSTable へ flush し、ディスク走査を測れる状態にする。
         session.Close() |> Check.ok |> ignore
 
-        let reopened = Database.OpenWith root |> Check.ok
-        db <- reopened
-        session <- Session.OpenWith(root, SessionOptions.Default, reopened)
+        session <- Session.OpenWithSync(root, SessionOptions.Default) |> Check.ok
 
         // 低レベルシナリオ用に、文（AST）と計画を 1回だけ作る。
         let select =
@@ -141,7 +136,7 @@ type QueryBenchmarks() =
             | Error e -> failwith (DbError.toDisplayString e)
 
         parsedLookup <- Statement.Select select
-        lookupPlan <- db.PrepareSelect select |> Check.ok
+        lookupPlan <- session.PrepareSelect select |> Check.ok
 
         // 計画が本当に 1行を返すことを 1回だけ確認する（測定条件の取り違え防止）。
         let rowCount (op: Op) = (Op.toArray op |> Check.ok).Length
@@ -186,8 +181,8 @@ type QueryBenchmarks() =
     /// `PointLookup` との差が parse のコストになる。
     [<Benchmark>]
     member _.PointLookupParsed() =
-        // 読み取り専用の SELECT は状態を変えないので、返るハンドルは同じものを指す。
-        let _, result = db.Execute parsedLookup |> Check.ok
+        // 読み取り専用の SELECT は状態を変えないので、同じ Session を使い続けられる。
+        let result = session.ExecuteStatement parsedLookup |> Check.ok
         result.Rows.Length
 
     /// 計画済みの論理木から Op を組み立てて実行する（parse も plan もしない）。

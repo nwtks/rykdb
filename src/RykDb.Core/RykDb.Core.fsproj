@@ -52,7 +52,6 @@
     <Compile Include="Plan.fs" />
     <Compile Include="DropCleanup.fs" />
     <Compile Include="Engine.fs" />
-    <Compile Include="Database.fs" />
     <Compile Include="SessionHost.fs" />
     <Compile Include="Session.fsi" />
     <Compile Include="Session.fs" />

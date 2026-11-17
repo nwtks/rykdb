@@ -91,22 +91,22 @@ xUnit。
 （`src/RykDb.Core/Dml.fs` → `tests/RykDb.Tests/DmlTests.fs`）。
 モジュール名も `module RykDb.DmlTests` と対象名に合わせる。
 
-**例外**: `Database.fs` の通し経路テストは 2ファイルに分かれる。
-`Session.fs` の公開 API は `SessionTests.fs`、`SessionHost.fs` は `SessionHostTests.fs` で検証する。
+**例外**: `Session.fs` の公開 API は `SessionTests.fs`、`SessionHost.fs` は `SessionHostTests.fs` で検証する。
+`DatabaseTests.fs` は src に対応ファイルを持たない DB 全体の通し経路テスト
+（公開 API の `Session` / `SessionPool` で内部機構を検証する）。
 `ProcessLock.fs` / `EngineHost.fs` は専用ファイルを持たず、
 `RowStoreTests` / `BackgroundCompactionTests` / `DatabaseTests` で間接的に検証する。
 `DurabilityTests` / `OrderingPropertyTests` は横断的な性質テスト、`CliTests` は CLI 全体のテスト。
-[`sql-reference.md`](sql-reference.md) が扱う構文・意味論は `SqlReferenceTests.fs`、
-ハンドル API と内部機構は `DatabaseTests.fs`（役割の分担は下の「テスト方針」）。
+[`sql-reference.md`](sql-reference.md) が扱う構文・意味論は `SqlReferenceTests.fs`。
 
 ```bash
 dotnet test                                                    # 全件
 dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"    # Server のみ
 ```
 
-**テスト方針**: `DatabaseTests` はハンドル API と内部機構
+**テスト方針**: `DatabaseTests` は DB 全体の通し経路として内部機構
 （MVCC / WAL / プロセスロック / 索引 backfill・後始末 / snapshot 登録 / 永続性 / 末尾再帰）
-も検証する。
+を検証する。
 `SqlReferenceTests` / `ServerTests` は「SQL 文字列 → 結果」の通し経路を検証する。
 Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグはそこだけで分かる。
 
@@ -115,7 +115,7 @@ Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグ�
 - `SqlReferenceTests` — [`sql-reference.md`](sql-reference.md) の構文・意味論
   （文・句・式・リテラル・識別子が受理 / 拒否され、評価結果も仕様どおりであること）。
   テスト名の接頭辞は `SqlReference:`。
-- `DatabaseTests` — ハンドル API と内部機構
+- `DatabaseTests` — DB 全体の通し経路（`Session` / `SessionPool` 経由）と内部機構
   （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / snapshot 登録 / 永続性 / 末尾再帰）。
 
 **書き方**:
@@ -134,7 +134,7 @@ Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグ�
   - **値を返すヘルパー**（`ok` / `asInt` / `parseOneOk` など） → `failwithf`。
     例外は xUnit が失敗として扱うので、`Assert.Fail` + `Unchecked.defaultof<'T>` のような**偽の戻り値は書かない**。
 - `withStore` / `withDb` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
-  ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Database.OpenWith` を直接使って検証する。
+  ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Session.OpenWithSync` を直接使って検証する。
 - 新しいファイルは `.fsproj` の Compile 順（= src のコンパイル順）に追加する。
 - 一時ディレクトリは `Path.GetTempPath()` + `Ticks`。
   `try/finally` で必ず削除する。
@@ -181,7 +181,7 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
   - `PointLookupParsed` / `PointLookupPlanned` / `PointLookupStorage` — 同じポイント検索を「parse 済みの文」「計画済みの木」「ストレージ直（`PkLookup` が実行する `byPrimaryKeyMasked`）」で測る低レベル版。
     `PointLookup` との差で parse / plan / 実行の内訳が分かる。
     **計画・実行の変更はこの 3 本を見る**（`PointLookup` は plan が支配的で、ストレージの変化が埋もれる）。
-    `Database.PrepareSelect`（internal）で計画だけを組み、`Optimizer.exec` + `Op.toArrayLimited` を繰り返す。
+    `Session.PrepareSelect`（internal）で計画だけを組み、`Optimizer.exec` + `Op.toArrayLimited` を繰り返す。
     実行のたびに `Scope.DisposeAll()` を呼ぶ。
   - `Insert100Rows` / `Insert10kRows`（2,000行 × 5文を 1 transaction で流して ROLLBACK）
   - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
@@ -196,7 +196,7 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
   `gotchas.md` §11.75 に実測値を置いている。
 - **性能スモーク（10,000行 INSERT → 500回の point lookup → `COUNT(*)`）はベンチで確認する**。
   実時間の上限で落とすテストは置かない（マシン依存のため。回帰はベンチの前後比較で見る）。
-- クエリ系は `Database.OpenWith`（同期 compaction）で開き、
+- クエリ系は `Session.OpenWithSync`（同期 compaction）で開き、
   シード後に一度 Close して memtable を SSTable へ flush してから測る
   （背景 compaction のタイミングで揺れないようにする）。
 - compaction の出力削除は測定の外側（`IterationCleanup`）で行う。

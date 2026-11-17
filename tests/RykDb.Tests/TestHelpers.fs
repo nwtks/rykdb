@@ -295,22 +295,34 @@ let openStoreWith (root: string) (engine: IStorageEngine) =
 let withStore (_tag: string) (f: RowStore -> unit) = f (openStoreWith "" (memoryEngine ()))
 
 /// メモリ上の DB を開いてテストし、最後に閉じる（ディスク I/O なし）。
-/// `Execute` の戻り値（新しいハンドル）は呼び出し側が `exec` で差し替える。
+/// `Session` は同じインスタンスを使い続ける（`exec` は同じ Session を返す）。
 /// <remarks>
 /// root はテストごとに一意にする。root は DB ごとの RootGate /
 /// active snapshot 登録のキーなので、空文字を共有すると
 /// 並行する他のテストの transaction が DDL の排他判定に引っかかる。
 /// store 側の root は空のまま（commit intent をディスクに書かない）。
 /// </remarks>
-let withDb (_tag: string) (f: Database -> unit) =
+let withDb (_tag: string) (f: Session -> unit) =
     let root = "mem:" + System.Guid.NewGuid().ToString "N"
     let store = openStoreWith "" (memoryEngine ())
-    let db = ok (Database.OpenWithStore root store)
+    let session = ok (Session.OpenWithStore(root, SessionOptions.Default, store))
 
     try
-        f db
+        f session
     finally
-        ok (db.Close()) |> ignore
+        ok (session.Close()) |> ignore
+
+/// `withDb` と同じだが、`DatabaseHost` も渡す（registry / root を直接見るテスト用）。
+let withDbHost (_tag: string) (f: DatabaseHost -> Session -> unit) =
+    let root = "mem:" + System.Guid.NewGuid().ToString "N"
+    let store = openStoreWith "" (memoryEngine ())
+    let host = ok (DatabaseHost.OpenWithStore(root, store))
+    let session = Session.Create(host, SessionOptions.Default, true)
+
+    try
+        f host session
+    finally
+        ok (session.Close()) |> ignore
 
 /// Error でなければテストを落とす（エラー内容まで見るテストは match で個別に書く）。
 let expectError (message: string) (r: Result<'a, DbError>) =
@@ -463,27 +475,27 @@ let whereOf (sql: string) : Expr =
     | Some e -> e
     | None -> failwithf "WHERE 句がありません: %s" sql
 
-/// テスト用に SQL を 1文へ解析して `Database.Execute` へ渡す。
+/// テスト用に SQL を 1文へ解析して `Session.ExecuteStatement` へ渡す。
 /// 複数文は公開 API の `Session.Execute` で扱う。
-let execSql (db: Database) (sql: string) : Result<Database * StatementResult, DbError> =
+let execSql (session: Session) (sql: string) : Result<Session * StatementResult, DbError> =
     match Parser.parseStatements sql with
     | Error e -> Error e
-    | Ok [] -> Ok(db, StatementResult.Empty)
-    | Ok [ stmt ] -> db.Execute stmt
+    | Ok [] -> Ok(session, StatementResult.Empty)
+    | Ok [ stmt ] -> session.ExecuteStatement stmt |> Result.map (fun result -> session, result)
     | Ok _ -> failwithf "テストヘルパー execSql は 1文だけ受け付けます: %s" sql
 
-/// `execSql` の戻り値を「新しいハンドル」に差し替える。
-let exec (db: Database) (sql: string) =
-    let next, _ = ok (execSql db sql)
+/// `execSql` の戻り値から Session を取り出す（同じインスタンスを返す）。
+let exec (session: Session) (sql: string) =
+    let next, _ = ok (execSql session sql)
     next
 
 /// 実行して結果だけ返す。
-let query (db: Database) (sql: string) =
-    let _, r = ok (execSql db sql)
+let query (session: Session) (sql: string) =
+    let _, r = ok (execSql session sql)
     r
 
-/// 1 文を実行して「新しい Database」と結果の両方を返す。
-let execRes (db: Database) (sql: string) = ok (execSql db sql)
+/// 1 文を実行して「Session」と結果の両方を返す。
+let execRes (session: Session) (sql: string) = ok (execSql session sql)
 
 /// `toSqlLiteral` で 1 行を文字列化する（クライアント比較用）。
 let rowText (r: StatementResult) =

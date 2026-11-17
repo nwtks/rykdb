@@ -19,8 +19,12 @@ let private asReal (v: SqlValue) =
     | SqlValue.Real f -> f
     | _ -> failwithf "REAL ではありません: %A" v
 
+/// 同期 compaction でディスクの DB を開く（テスト用）。
+let private openDb (root: string) =
+    ok (Session.OpenWithSync(root, SessionOptions.Default))
+
 /// テスト用のテーブルを用意する。
-let private seeded (tag: string) (f: Database -> unit) =
+let private seeded (tag: string) (f: Session -> unit) =
     withDb tag (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
@@ -32,7 +36,7 @@ let private seeded (tag: string) (f: Database -> unit) =
 
 /// SQL を実行し、エラーメッセージに断片が含まれることを確かめる。
 /// §13「よく見るメッセージ（実測）」は文言そのものが仕様なので文字で照合する。
-let private expectMessage (fragment: string) (sql: string) (db: Database) =
+let private expectMessage (fragment: string) (sql: string) (db: Session) =
     match execSql db sql with
     | Ok _ -> Assert.Fail(sprintf "エラーにならないはず: %s" sql)
     | Error e -> Assert.Contains(fragment, DbError.toDisplayString e)
@@ -179,33 +183,34 @@ let ``SqlReference: 複合索引の全列等値で行を引ける`` () =
 [<Fact>]
 let ``SqlReference: VARCHAR(32) は再オープン後も使える`` () =
     withDir "varchar-reopen" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(32))"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'abc')"
         ok (db2.Close())
 
         // 型引数はカタログに保存されないが、列型（TEXT）と値はそのまま使える
-        let db3 = ok (Database.OpenWith dir)
+        let db3 = openDb dir
         let _, r = ok (execSql db3 "SELECT v FROM t")
         Assert.Equal<string>("abc", asText r.Rows.[0].[0])
         ok (db3.Close()))
 
 [<Fact>]
 let ``SqlReference: SQL の BEGIN / COMMIT / ROLLBACK は受理される`` () =
-    // 文として受理される（§12）。transaction を実際に制御する様子は
-    // `SQL の BEGIN と ROLLBACK で書き込みを取り消す` で検証する。
+    // 文として受理され、暗黙の transaction を制御する（§12）。
+    // `Session` は SQL の BEGIN / COMMIT / ROLLBACK をライブラリ API と同じ状態機械で扱う。
     withDb "tx5" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "BEGIN"
+        Assert.True db2.InTransaction
         let db3 = exec db2 "INSERT INTO t VALUES (1)"
         let db4 = exec db3 "COMMIT"
         let db5, res = ok (execSql db4 "SELECT id FROM t")
         Assert.Equal<int>(1, res.Rows.Length)
-        // SQL の BEGIN はライブラリ API のハンドル状態（InTransaction）を立てない
         Assert.False db5.InTransaction
 
-        let db6 = exec db5 "ROLLBACK"
-        let _, after = ok (execSql db6 "SELECT id FROM t")
+        // transaction が無い状態の ROLLBACK はエラー（ライブラリ API と対称）
+        expectErrorKind ErrorKind.InternalError "transaction が無い ROLLBACK" (execSql db5 "ROLLBACK")
+        let _, after = ok (execSql db5 "SELECT id FROM t")
         Assert.Equal<int>(1, after.Rows.Length))
 
 [<Fact>]
@@ -214,7 +219,7 @@ let ``SqlReference: CREATE TABLE でテーブルができる`` () =
         let db =
             exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
 
-        Assert.Equal<string list>([ "people" ], db.TableNames()))
+        Assert.Equal<string list>([ "people" ], ok (db.TableNames())))
 
 [<Fact>]
 let ``SqlReference: CREATE TABLE IF NOT EXISTS は 2 回呼んでも OK`` () =
@@ -224,7 +229,7 @@ let ``SqlReference: CREATE TABLE IF NOT EXISTS は 2 回呼んでも OK`` () =
         let db2 =
             exec db1 "CREATE TABLE IF NOT EXISTS people (id INTEGER PRIMARY KEY, name TEXT)"
 
-        Assert.Equal<string list>([ "people" ], db2.TableNames()))
+        Assert.Equal<string list>([ "people" ], ok (db2.TableNames())))
 
 [<Fact>]
 let ``SqlReference: CREATE TABLE の重複はエラー（IF NOT EXISTS なし）`` () =
@@ -277,13 +282,13 @@ let ``SqlReference: DROP TABLE でテーブルが消える`` () =
     withDb "ddl4" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
         let db2 = exec db1 "DROP TABLE people"
-        Assert.Empty(db2.TableNames()))
+        Assert.Empty(ok (db2.TableNames())))
 
 [<Fact>]
 let ``SqlReference: DROP TABLE IF EXISTS は無ければ OK`` () =
     withDb "ddl5" (fun db0 ->
         let db1 = exec db0 "DROP TABLE IF EXISTS nothing"
-        Assert.Empty(db1.TableNames()))
+        Assert.Empty(ok (db1.TableNames())))
 
 [<Fact>]
 let ``SqlReference: 存在しない列の索引はエラー`` () =
@@ -467,18 +472,18 @@ let ``SqlReference: ALTER TABLE は transaction 中に実行できない`` () =
     withDb "alter-txn" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
 
-        let db2 = ok (db1.Begin())
-        expectErrorKind ErrorKind.SyntaxError "transaction 中の ALTER" (execSql db2 "ALTER TABLE t ADD COLUMN v INTEGER")
+        ok (db1.Begin())
+        expectErrorKind ErrorKind.SyntaxError "transaction 中の ALTER" (execSql db1 "ALTER TABLE t ADD COLUMN v INTEGER")
 
-        let db3 = ok (db2.Rollback())
-        let db4 = exec db3 "ALTER TABLE t ADD COLUMN v INTEGER"
-        let _, rows = ok (execSql db4 "SELECT * FROM t")
+        ok (db1.Rollback())
+        let db2 = exec db1 "ALTER TABLE t ADD COLUMN v INTEGER"
+        let _, rows = ok (execSql db2 "SELECT * FROM t")
         Assert.Equal<string list>([ "id"; "v" ], rows.Columns |> Array.toList))
 
 [<Fact>]
 let ``SqlReference: ALTER TABLE の変更は再オープン後も残る`` () =
     withDir "alter-reopen" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, x TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')"
         let db3 = exec db2 "ALTER TABLE t ADD COLUMN n INTEGER NOT NULL DEFAULT 7"
@@ -486,7 +491,7 @@ let ``SqlReference: ALTER TABLE の変更は再オープン後も残る`` () =
         let db5 = exec db4 "ALTER TABLE t DROP COLUMN x"
         ok (db5.Close())
 
-        let db6 = ok (Database.OpenWith dir)
+        let db6 = openDb dir
         let _, rows = ok (execSql db6 "SELECT * FROM t ORDER BY id")
         Assert.Equal<string list>([ "id"; "val"; "n" ], rows.Columns |> Array.toList)
         Assert.Equal<int64 list>([ 7L; 7L ], rows.Rows |> Array.map (fun r -> asInt r.[2]) |> List.ofArray)
@@ -617,7 +622,7 @@ let ``SqlReference: DEFAULT 付きの列定義も保存できる`` () =
 [<Fact>]
 let ``SqlReference: DEFAULT は再オープン後も既定値として使われる`` () =
     withDir "default-e2e" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
 
         let db1 =
             exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 42, s TEXT DEFAULT 'hi')"
@@ -628,7 +633,7 @@ let ``SqlReference: DEFAULT は再オープン後も既定値として使われ�
         Assert.Equal<string>("hi", asText before.Rows.[0].[1])
         ok (db2.Close())
 
-        let db3 = ok (Database.OpenWith dir)
+        let db3 = openDb dir
         let _, after = ok (execSql db3 "SELECT v, s FROM t WHERE id = 1")
         Assert.Equal<int64>(42L, asInt after.Rows.[0].[0])
         Assert.Equal<string>("hi", asText after.Rows.[0].[1])
@@ -1739,12 +1744,12 @@ let ``SqlReference: 負数の主キー等値検索`` () =
 [<Fact>]
 let ``SqlReference: Unicode テーブル名でも再オープン後に読める`` () =
     withDir "unicode-reopen" (fun dir ->
-        let db0 = ok (Database.OpenWith dir)
+        let db0 = openDb dir
         let db1 = exec db0 "CREATE TABLE 住所 (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO 住所 VALUES (1, '東京')"
         ok (db2.Close())
 
-        let db3 = ok (Database.OpenWith dir)
+        let db3 = openDb dir
         let result = query db3 "SELECT * FROM 住所"
         Assert.Equal<int>(1, result.Rows.Length)
         Assert.Equal<string>("東京", asText result.Rows.[0].[1])
@@ -1998,7 +2003,7 @@ let ``SqlReference: 型の別綴りはすべて受理される`` () =
                 db0
                 "CREATE TABLE ty (id INTEGER PRIMARY KEY, a BOOL, b INT, c BIGINT, d DOUBLE, e NUMERIC, f VARCHAR(3), g DATETIME, h UUID, i BLOB, j DATE)"
 
-        Assert.Equal<string list>([ "ty" ], db1.TableNames())
+        Assert.Equal<string list>([ "ty" ], ok (db1.TableNames()))
 
         // 文字列で渡した値は列の型へ暗黙変換される（§3）
         let db2 =
@@ -2147,7 +2152,7 @@ let ``SqlReference: 主キーの無い CREATE TABLE はエラー`` () =
     // §11.1: 主キーは省略できない。
     withDb "pk-required" (fun db0 ->
         expectErrorKind ErrorKind.ConstraintViolation "主キー無しの CREATE TABLE" (execSql db0 "CREATE TABLE t (a INTEGER)")
-        Assert.Empty(db0.TableNames()))
+        Assert.Empty(ok (db0.TableNames())))
 
 [<Fact>]
 let ``SqlReference: PRIMARY KEY の定義は 1 テーブルに 1 つだけ`` () =
@@ -2171,7 +2176,7 @@ let ``SqlReference: PRIMARY KEY の定義は 1 テーブルに 1 つだけ`` () 
 
         // 複数列のテーブルレベルは 1 定義なら通る
         let db1 = exec db0 "CREATE TABLE k4 (a INTEGER, b TEXT, PRIMARY KEY (a, b))"
-        Assert.Equal<string list>([ "k4" ], db1.TableNames()))
+        Assert.Equal<string list>([ "k4" ], ok (db1.TableNames())))
 
 [<Fact>]
 let ``SqlReference: 型を省略した列定義は TEXT になる`` () =
@@ -2193,7 +2198,7 @@ let ``SqlReference: CREATE TABLE IF EXISTS は既存なら何もしない`` () =
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a')"
         let db3 = exec db2 "CREATE TABLE IF EXISTS t (id INTEGER PRIMARY KEY, v TEXT)"
-        Assert.Equal<string list>([ "t" ], db3.TableNames())
+        Assert.Equal<string list>([ "t" ], ok (db3.TableNames()))
 
         let _, rows = ok (execSql db3 "SELECT COUNT(*) FROM t")
         Assert.Equal<int64>(1L, asInt rows.Rows.[0].[0]))
@@ -2215,7 +2220,7 @@ let ``SqlReference: テーブルレベル UNIQUE の列を検証する`` () =
         let db1 =
             exec db0 "CREATE TABLE v (id INTEGER PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b))"
 
-        Assert.Equal<string list>([ "v" ], db1.TableNames()))
+        Assert.Equal<string list>([ "v" ], ok (db1.TableNames())))
 
 [<Fact>]
 let ``SqlReference: SQL の BEGIN と ROLLBACK で書き込みを取り消す`` () =

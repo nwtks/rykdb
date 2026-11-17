@@ -453,7 +453,7 @@ module internal RowStore =
         | None -> ()
 
     /// テスト用: オプションを指定して開く。
-    /// Database を介さないため、ここでbackground worker を開始する。
+    /// DatabaseHost を介さないため、ここでbackground worker を開始する。
     let internal openStoreWithOptions (options: RowStoreOptions) (root: string) =
         openStoreCore false options root
         |> Result.map (fun store ->
