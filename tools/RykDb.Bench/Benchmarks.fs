@@ -13,6 +13,7 @@
 //       PointLookup（SQL）> PointLookupParsed（parse 済みの文）
 //       > PointLookupPlanned（計画済みの木）> PointLookupStorage（ストレージ直）
 //     差を取ると parse / plan / 実行の内訳になる。
+//   * parse 単体は ParsePoint（字句解析 + 構文解析だけ）で直接測る。
 //   * compaction は内部 API を使い、4本の L0 ファイルを 1回 compact する。
 //     出力は呼び出しごとに削除する（削除時間は測定対象外）。
 // ===========================================================================
@@ -176,6 +177,13 @@ type QueryBenchmarks() =
     /// 主キーのポイント検索（SSTable の Bloom + 部分読み）。
     [<Benchmark>]
     member this.PointLookup() = this.Exec pointSql
+
+    /// 字句解析 + 構文解析だけ（計画・実行はしない）。
+    /// `PointLookup` と `PointLookupParsed` の差が parse のコストになるが、
+    /// ここではパーサの変更を直接 A/B するために単体で測る。
+    [<Benchmark>]
+    member _.ParsePoint() =
+        (Parser.parseStatements pointSql |> Check.ok).Length
 
     /// parse 済みの文をそのまま実行する（lexer / parser と Session のゲートを通らない）。
     /// `PointLookup` との差が parse のコストになる。

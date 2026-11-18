@@ -166,6 +166,12 @@ JIT は `tail.` を尊重する。
 - **呼び出し回数の多い再帰はローカル `let rec` にせず、モジュールレベルの `let rec` へ hoist する**。
   ローカル関数は呼び出しごとにクロージャを確保する（`Lexer` のトークン走査で実測）。
   モジュールレベルなら `[<TailCall>]` で末尾性も検証できる。
+- **トークン分類のアクティブパターンは重複した分岐をまとめるときだけ使い、ゼロ割当を必須にする**。
+  `ParserExpr` の `LiteralExpr` / `NameToken` が例。
+  部分アクティブパターンは既定で `Some` を確保するので `[<return: Struct>]` + `voption` にする。
+  真偽値が欲しいだけの箇所は `isSymbol` / `isKeyword` / `isIdentName` のまま
+  （`if` 連鎖やアームごとの `when` ガードでは AP の再評価で `ToUpperInvariant` が増える）。
+  `Token.QuotedIdent` を `Ident` と混ぜてよいのは、予約語チェックをしない文脈だけ。
 - **実行時のスタック増加を深さカウンタで止める設計は取らない**。
   式・サブクエリの深さは CPS の継続をヒープに積んで吸収し、
   パーサに `MaxExpressionDepth` のような上限は置かない。

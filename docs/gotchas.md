@@ -2796,3 +2796,20 @@ v2 を書く。データがあれば v1 以前として `CorruptionError`。
 回帰テスト: `RowStore: format マーカーがプロセス間ロックを兼ねる`、
 `RowStore: v1 の format マーカーは明示エラー`、
 `RowStore: 空マーカーでもデータファイルがあれば旧形式として拒否する`。
+
+### 11.85 アクティブパターンは行数を減らさない — 重複の一元化にだけ使う
+
+`Parser` に `LiteralExpr` / `NameToken`（`[<return: Struct>]` + `voption`）を入れた実測。
+
+- リテラル式の 8分岐が `parsePrimaryC` と `parseInsert` の `simpleLiteral` に重複していたのを 1箇所へ。
+  **行数はネット +12**（定義とコメントが削除分を上回る）。
+  狙いは行数ではなく「同じ文法規則を 2箇所に持たない」こと。
+- 割当は **4.71KB → 4.71KB（不変）**、時間は 2.220 → 2.275µs
+  （DefaultJob、+2.5%・ノイズ込み）。`inline` を付けても 2.274µs で変わらない
+  （JIT が既に内包している）ので付けない。
+- 部分アクティブパターンは既定で `Some` を確保する。`[<return: Struct>]` + `voption` を必須にする。
+- 真偽値が欲しい `if` 連鎖は `isSymbol` / `isKeyword` / `isIdentName` のまま。
+  アームごとの `when` ガードで AP を使うと `ToUpperInvariant` がアーム数だけ走る。
+- `NameToken` は `Ident` / `QuotedIdent` をまとめるが、**別名の解析には使わない**
+  （`QuotedIdent` は予約語チェックを通さないので `"UNION"` を別名にできなくなる）。
+- 計測は `tools/RykDb.Bench` の `ParsePoint`（字句解析 + 構文解析だけ）。

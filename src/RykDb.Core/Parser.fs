@@ -23,14 +23,7 @@ module internal Parser =
                 None
             else
                 match peek st with
-                | Token.IntLit v -> Some(Expr.Literal(Literal.Int v), advance st)
-                | Token.RealLit v -> Some(Expr.Literal(Literal.Real v), advance st)
-                | Token.StringLit v -> Some(Expr.Literal(Literal.String v), advance st)
-                | Token.BlobLit v -> Some(Expr.Literal(Literal.Blob v), advance st)
-                | Token.Keyword "NULL" -> Some(Expr.Literal Literal.Null, advance st)
-                | Token.Keyword "TRUE" -> Some(Expr.Literal(Literal.Bool true), advance st)
-                | Token.Keyword "FALSE" -> Some(Expr.Literal(Literal.Bool false), advance st)
-                | Token.Keyword "DEFAULT" -> Some(Expr.Default, advance st)
+                | LiteralExpr e -> Some(e, advance st)
                 | _ -> None
 
         let rec one acc st =

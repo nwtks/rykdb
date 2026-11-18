@@ -66,6 +66,35 @@ module internal ParserExpr =
     let internal fail (msg: string) (st: PState) =
         err (DbError.syntax msg (peekPos st).Line)
 
+    /// 単純リテラルなら式を返す。
+    /// `parsePrimaryC` と `Parser.parseInsert` の VALUES 高速経路が共有する
+    /// （同じ分岐を 2箇所に持たない）。
+    /// 部分アクティブパターンは既定で `Some` を確保するため、
+    /// `[<return: Struct>]` + `voption` でホットパスを割当ゼロに保つ。
+    [<return: Struct>]
+    let internal (|LiteralExpr|_|) (tok: Token) : Expr voption =
+        match tok with
+        | Token.IntLit v -> ValueSome(Expr.Literal(Literal.Int v))
+        | Token.RealLit v -> ValueSome(Expr.Literal(Literal.Real v))
+        | Token.StringLit v -> ValueSome(Expr.Literal(Literal.String v))
+        | Token.BlobLit v -> ValueSome(Expr.Literal(Literal.Blob v))
+        | Token.Keyword "NULL" -> ValueSome(Expr.Literal Literal.Null)
+        | Token.Keyword "TRUE" -> ValueSome(Expr.Literal(Literal.Bool true))
+        | Token.Keyword "FALSE" -> ValueSome(Expr.Literal(Literal.Bool false))
+        | Token.Keyword "DEFAULT" -> ValueSome Expr.Default
+        | _ -> ValueNone
+
+    /// 識別子（引用識別子を含む）なら名前を返す。
+    /// 別名の解析には使わない
+    /// （`QuotedIdent` は予約語チェックを通さない仕様なので、`Ident` と混ぜると
+    /// `"UNION"` を別名にできなくなる）。
+    [<return: Struct>]
+    let internal (|NameToken|_|) (tok: Token) : string voption =
+        match tok with
+        | Token.Ident s
+        | Token.QuotedIdent s -> ValueSome s
+        | _ -> ValueNone
+
     let internal isSymbol (s: string) (st: PState) =
         match peek st with
         | Token.Symbol x -> x = s
@@ -158,8 +187,7 @@ module internal ParserExpr =
     /// 型名（INTEGER など）は予約語ではなく Ident として字句解析されるので、ここでそのまま通る。
     let internal parseIdent (st: PState) =
         match peek st with
-        | Token.Ident s -> ret (s, advance st)
-        | Token.QuotedIdent s -> ret (s, advance st)
+        | NameToken s -> ret (s, advance st)
         | _ -> fail "識別子が必要ですが見つかりませんでした" st
 
     /// 括弧の対応を取って読み飛ばす（CAST の型引数用）。
@@ -485,24 +513,16 @@ module internal ParserExpr =
 
     and [<TailCall>] private parsePrimaryC (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
         match peek st with
-        | Token.IntLit v -> k (Expr.Literal(Literal.Int v), advance st)
-        | Token.RealLit v -> k (Expr.Literal(Literal.Real v), advance st)
-        | Token.StringLit s -> k (Expr.Literal(Literal.String s), advance st)
-        | Token.BlobLit b -> k (Expr.Literal(Literal.Blob b), advance st)
+        | LiteralExpr e -> k (e, advance st)
         | Token.Param i ->
             match Array.tryItem i st.Parameters with
             | Some v -> k (Expr.Value v, advance st)
             | None -> fail (sprintf "パラメータ ?%d が指定されていません" (i + 1)) st
-        | Token.Keyword "NULL" -> k (Expr.Literal Literal.Null, advance st)
-        | Token.Keyword "TRUE" -> k (Expr.Literal(Literal.Bool true), advance st)
-        | Token.Keyword "FALSE" -> k (Expr.Literal(Literal.Bool false), advance st)
-        | Token.Keyword "DEFAULT" -> k (Expr.Default, advance st)
         | Token.Keyword "CASE" -> parseCaseC st k
         | Token.Symbol "*" -> k (Expr.Star, advance st)
         | Token.Keyword "EXISTS" -> parseExistsC st k
         | Token.Symbol "(" -> parseParenExprC st k
-        | Token.Ident name -> parseNamedPrimaryC name st k
-        | Token.QuotedIdent name -> parseNamedPrimaryC name st k
+        | NameToken name -> parseNamedPrimaryC name st k
         | _ -> fail "式が必要ですが見つかりませんでした" st
 
     /// CASE 式。
@@ -741,8 +761,7 @@ module internal ParserExpr =
     and [<TailCall>] private parseSelectItemC (st: PState) (k: SelectItem * PState -> Result<'r, DbError>) =
         match peek st with
         | Token.Symbol "*" -> k ({ Expression = Expr.Star; Alias = None }, advance st)
-        | Token.Ident name
-        | Token.QuotedIdent name when isDotStar st ->
+        | NameToken name when isDotStar st ->
             k (
                 {
                     Expression = Expr.QualifiedStar name

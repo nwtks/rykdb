@@ -326,6 +326,13 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
   （パーサ以降は定数と同じ経路。`parseStatements` はパラメータなし）。
 - `*` / `t.*` は別名を取らない。
   `NULL.*` のような識別子以外の修飾子は `'.' の後ろには列名か '*' が必要です` で拒否する。
+- トークンの分類は 2種類を使い分ける。
+  真偽値が欲しい `if` 連鎖は `isSymbol` / `isKeyword` / `isIdentName`、
+  単純リテラルと識別子の分解はゼロ割当のアクティブパターン
+  `LiteralExpr`（`[<return: Struct>]` + `voption`）と `NameToken` を使う。
+  `LiteralExpr` は `parsePrimaryC` と `Parser.parseInsert` の VALUES 高速経路が共有する。
+  `NameToken` は `Ident` と `QuotedIdent` をまとめるが、別名の解析には使わない
+  （`QuotedIdent` は予約語チェックを通さない）。
 
 回帰テスト: `末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない` /
 `末尾再帰: 5000段の深いサブクエリの入れ子も解析できる` /
