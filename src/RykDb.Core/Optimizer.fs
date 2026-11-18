@@ -172,7 +172,7 @@ module internal Optimizer =
             function
             | Logical.Scan _ as node ->
                 [
-                    box node, Array.init nodeInput.Columns.Length (fun i -> Set.contains i needed)
+                    (box node, Array.init nodeInput.Columns.Length (fun i -> Set.contains i needed))
                 ]
             | Logical.Filter(p, child) ->
                 let childSchema = outputOf nodeCtx nodeInput child
@@ -215,7 +215,7 @@ module internal Optimizer =
                     |> Set.filter (fun i -> i >= leftWidth)
                     |> Set.map (fun i -> i - leftWidth)
 
-                go nodeCtx nodeInput leftNeeded left @ go nodeCtx nodeInput rightNeeded right
+                go nodeCtx leftSchema leftNeeded left @ go nodeCtx rightSchema rightNeeded right
             | Logical.Derived plan ->
                 let innerOutput = outputOf plan.Context plan.Input plan.Tree
                 let innerNeeded = needed |> Set.filter (fun i -> i < innerOutput.Columns.Length)
@@ -269,6 +269,17 @@ module internal Optimizer =
 
             frame, leftSchema
 
+        let execIndexScan ctx name indexName mask build =
+            result {
+                let! scanMask, fetchMask = ExecContext.indexAccessMasks ctx name indexName mask
+                let! op = build scanMask
+
+                if fetchMask |> Array.exists id then
+                    return! ExecContext.fetchMissing ctx name fetchMask op
+                else
+                    return op
+            }
+
         let execScan node ctx name method =
             let mask =
                 match ctx.ScanNeeds.TryGetValue(box node) with
@@ -284,11 +295,13 @@ module internal Optimizer =
                 | ScanMethod.SeqScan -> ExecContext.tableMasked ctx name limit mask
                 | ScanMethod.PkLookup values -> ExecContext.byPrimaryKeyMasked ctx name values mask
                 | ScanMethod.IndexLookup(indexName, values) ->
-                    ExecContext.byIndexMasked ctx name indexName values limit mask
+                    execIndexScan ctx name indexName mask (fun scanMask ->
+                        ExecContext.byIndexMasked ctx name indexName values limit scanMask)
                 | ScanMethod.RangeScan(_, startKey, endKey) ->
                     ExecContext.rangeScanMasked ctx name startKey endKey limit mask
                 | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
-                    ExecContext.byIndexRangeMasked ctx name indexName lower upper limit mask
+                    execIndexScan ctx name indexName mask (fun scanMask ->
+                        ExecContext.byIndexRangeMasked ctx name indexName lower upper limit scanMask)
 
         let addClamp a b =
             if a > System.Int32.MaxValue - b then
@@ -311,6 +324,17 @@ module internal Optimizer =
                     )
                 | _ -> hint |> Option.map (fun h -> addClamp offset h)
 
+        let lookup frame indexName scanMask fetchMask keyValues =
+            result {
+                let! op =
+                    ExecContext.byIndexMasked ctx frame.RightName indexName keyValues 0 scanMask
+
+                if fetchMask |> Array.exists id then
+                    return! ExecContext.fetchMissing ctx frame.RightName fetchMask op
+                else
+                    return op
+            }
+
         let execIndexJoin frame left =
             match frame.Keys with
             | None -> err (DbError.internalError "index nested loop に結合キーがありません")
@@ -328,28 +352,29 @@ module internal Optimizer =
                         | _ -> Array.create frame.RightSchema.Columns.Length true
                     | _ -> Array.create frame.RightSchema.Columns.Length true
 
-                let lookup keyValues =
-                    ExecContext.byIndexMasked ctx frame.RightName indexName keyValues 0 rightMask
+                result {
+                    let! scanMask, fetchMask =
+                        ExecContext.indexAccessMasks ctx frame.RightName indexName rightMask
 
-                ret (
-                    match frame.Kind with
-                    | JoinKind.Inner ->
-                        OpsJoin.innerJoinIndexed
-                            frame.LeftSchema
-                            left
-                            frame.LeftKeyIndices
-                            frame.RightSchema
-                            lookup
-                            keys.Residual
-                    | JoinKind.Left ->
-                        OpsJoin.leftJoinIndexed
-                            frame.LeftSchema
-                            left
-                            frame.LeftKeyIndices
-                            frame.RightSchema
-                            lookup
-                            keys.Residual
-                )
+                    return
+                        match frame.Kind with
+                        | JoinKind.Inner ->
+                            OpsJoin.innerJoinIndexed
+                                frame.LeftSchema
+                                left
+                                frame.LeftKeyIndices
+                                frame.RightSchema
+                                (lookup frame indexName scanMask fetchMask)
+                                keys.Residual
+                        | JoinKind.Left ->
+                            OpsJoin.leftJoinIndexed
+                                frame.LeftSchema
+                                left
+                                frame.LeftKeyIndices
+                                frame.RightSchema
+                                (lookup frame indexName scanMask fetchMask)
+                                keys.Residual
+                }
 
         let execJoin frame left right =
             match frame.Algorithm with
@@ -537,6 +562,11 @@ module internal Optimizer =
     /// 論理木を EXPLAIN 用の行にする（実行しない）。
     /// `exec` と同じ規則で走査方法・結合アルゴリズムを選び、木を深さ優先で並べる。
     let explain (ctx: ExecContext) (tree: Logical) (schema: Schema) =
+        let ctx =
+            { ctx with
+                ScanNeeds = scanNeedsMasks ctx schema tree
+            }
+
         let childItem indent tree schema context =
             {
                 Indent = indent
@@ -598,7 +628,20 @@ module internal Optimizer =
 
         let describe item =
             match item.Tree with
-            | Logical.Scan(name, method) -> sprintf "Scan(%s)" (scanText name method), []
+            | Logical.Scan(name, method) ->
+                let fetchSuffix =
+                    match method with
+                    | ScanMethod.IndexLookup(indexName, _)
+                    | ScanMethod.IndexRangeScan(indexName, _, _) ->
+                        match item.Context.ScanNeeds.TryGetValue(box item.Tree) with
+                        | true, mask ->
+                            match ExecContext.indexAccessMasks item.Context name indexName mask with
+                            | Ok(_, fetchMask) when fetchMask |> Array.exists id -> " + Fetch"
+                            | _ -> ""
+                        | _ -> ""
+                    | _ -> ""
+
+                sprintf "Scan(%s)%s" (scanText name method) fetchSuffix, []
             | Logical.Values values ->
                 if Array.isEmpty values then
                     "Values", []

@@ -2733,3 +2733,66 @@ commit ごとに fsync が走る（グループコミットが実質無効にな
 次のリーダーが登録済みの最大位置まで 1回の fsync でまとめる。
 
 回帰テスト: `DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録し fsync をまとめる`。
+
+### 11.81 索引エントリの「空の値」は削除ではない — overlay はキーで行う
+
+❌ 索引 keyspace の値を `None`（tombstone）と比較して「行が無い」と判断する。
+索引値は `Some [||]`（空の行）で、`None` は削除だけを表す。
+`Dml.opOfIndexScan` は `e.Value.IsNone` だけを見て削除を判定し、
+`Some` ならキーから行を組み立てる。
+
+❌ transaction の索引スロットを「行から索引キーを再計算」して突き合わせる。
+索引値に行が無いので再計算できない。
+スロットは `Transaction.slotsOf (Keyspace.index ...)` の**生キー**を使い、
+store の `SstEntry.Key` と `Bytes.compare` でマージする。
+`Some` は上書き、`None` は削除。
+
+回帰テスト: `Dml.scanByIndexPrefix: transaction の索引書き込みもキーで overlay する`、
+`Dml.insertWithKey: 索引エントリの値は空になる`。
+
+### 11.82 キー復号は書き込みと対称に検証する（終端・escape・DECIMAL）
+
+❌ `Cursor.advance` で長さを決め打ちしてキーを読む。
+`Cursor.advance` は範囲を検査しない（`Cursor.fsi` の規約は呼び出し側の確認）。
+壊れたキーで `IndexOutOfRangeException` になる。
+復号は `Reader.readByte` / `readBytes` / `readUint64BE` の検査付き読み取りを使う。
+
+❌ TEXT / BLOB の `0x00` をそのまま終端とみなす。
+書き込みは `0x00` を `0x00 0xFF` に escape し、終端は `0x00` 1バイト。
+`0x00` の次が `0xFF` ならペイロードの `0x00`、それ以外なら終端（次は次フィールド）。
+
+❌ 負の DECIMAL の桁だけを戻して指数を戻し忘れる。
+`writeOrderedDecimal` は負数のとき**指数も桁も両方**反転する。
+復号は `scale = 桁数 - 指数` を検証し、96bit 非スケール値は
+32bit チャンクの `×10 + 桁` で組み立てる（`BigInteger` は使わない）。
+
+回帰テスト: `キー復号: 全型が往復する`、`キー復号: golden バイト列から値を復元できる`、
+`キー復号: 壊れたキーは CorruptionError になる`。
+
+### 11.83 fetch は「最初の 1行」ではなく全行に適用する
+
+❌ `Op.pull step op` で 1行だけ変換する。
+`Op.pull` の継続に渡される `next` は**元の未変換の Op** なので、
+2行目以降は fetch されず `Unloaded` が結果へ漏れる
+（索引入れ子ループで 2件目だけ失敗した）。
+
+✅ `fetchMissing` は `Op.compute` の中で `Op.next` を回し、
+各行を変換したうえで `go next` を返す（`Op.pull` を再帰的に包む）。
+表行が見つからない索引エントリ（防御）は `advance next` で捨てる。
+
+回帰テスト: `Database: 非被覆索引は本体から列を fetch する`、
+`SqlReference: インデックス入れ子ループ（右索引 + 左が小さい）`。
+
+### 11.84 format マーカーは「空 = 新規」と決めつけない
+
+❌ `.rykdb.format` が空なら常に新規 DB とみなす。
+format マーカー導入前の DB は空マーカーのままデータファイルを持つ。
+そこへ v2 を書くと、v1 の索引値を新しい読み取りで解釈してしまう。
+
+✅ 空マーカーは**データファイル（`*.sst` / `*.wal` / `CURRENT` / `MANIFEST-*`）が無いときだけ**新規とし、
+v2 を書く。データがあれば v1 以前として `CorruptionError`。
+`rykdb-prefixed-v1` も明示エラーにする（WAL 復旧より前の `ensureFormat` で拒否）。
+
+回帰テスト: `RowStore: format マーカーがプロセス間ロックを兼ねる`、
+`RowStore: v1 の format マーカーは明示エラー`、
+`RowStore: 空マーカーでもデータファイルがあれば旧形式として拒否する`。

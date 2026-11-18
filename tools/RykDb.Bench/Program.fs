@@ -37,10 +37,11 @@ type private Options =
 
 let private usage () =
     printfn
-        "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|compaction|eval|op] [--quick|--dry] [--filter <pattern>]"
+        "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|compaction|index|eval|op] [--quick|--dry] [--filter <pattern>]"
 
     printfn "  --class query       クエリ系のみ"
     printfn "  --class compaction  compaction のみ"
+    printfn "  --class index       索引の読み書き・サイズのベンチのみ"
     printfn "  --class eval        式評価器のマイクロベンチのみ"
     printfn "  --class op          Op（pull 演算子）のマイクロベンチのみ"
     printfn "  --quick             短いジョブ（既定より速いが精度は低い）"
@@ -92,10 +93,11 @@ let main argv =
     | None
     | Some "query"
     | Some "compaction"
+    | Some "index"
     | Some "eval"
     | Some "op" -> ()
     | Some other ->
-        eprintfn "不明な --class です: %s（query / compaction / eval / op）" other
+        eprintfn "不明な --class です: %s（query / compaction / index / eval / op）" other
         exit 2
 
     let job =
@@ -126,6 +128,12 @@ let main argv =
         | Some "compaction" -> true
         | _ -> false
 
+    let runIndex =
+        match options.Class with
+        | None
+        | Some "index" -> true
+        | _ -> false
+
     let runEval =
         match options.Class with
         | None
@@ -152,6 +160,9 @@ let main argv =
 
     if runCompaction then
         BenchmarkRunner.Run<CompactionBenchmarks>(config, filterArgs) |> ignore
+
+    if runIndex then
+        BenchmarkRunner.Run<IndexBenchmarks>(config, filterArgs) |> ignore
 
     if runEval then
         BenchmarkRunner.Run<EvalBenchmarks>(config, filterArgs) |> ignore

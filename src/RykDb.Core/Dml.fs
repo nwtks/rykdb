@@ -41,6 +41,11 @@ module internal Dml =
     /// 索引 schema を登録する。
     let private indexSpace (index: IndexSchema) = Keyspace.index index.Name
 
+    /// 索引エントリの値。
+    /// 索引列 + 主キーはキーに埋め込んであるので、値は空にする
+    /// （行全体の複製を避ける。読み取りはキーから復号する）。
+    let private emptyIndexValue: SqlValue array = Array.empty
+
     let private reserveUniqueValues (txn: Transaction) (schema: TableSchema) (index: IndexSchema) =
         function
         | None -> ret txn
@@ -78,7 +83,9 @@ module internal Dml =
                 | None, None -> reserved
                 | None, Some row ->
                     reserved
-                    >>= fun txn -> keyFor row |> Result.map (fun key -> Transaction.put space key row txn)
+                    >>= fun txn ->
+                        keyFor row
+                        |> Result.map (fun key -> Transaction.put space key emptyIndexValue txn)
                 | Some row, None ->
                     reserved
                     >>= fun txn -> keyFor row |> Result.map (fun key -> Transaction.remove space key txn)
@@ -90,10 +97,10 @@ module internal Dml =
                             keyFor newValue
                             |> Result.map (fun newKey ->
                                 if oldKey = newKey then
-                                    Transaction.put space newKey newValue txn
+                                    Transaction.put space newKey emptyIndexValue txn
                                 else
                                     let removed = Transaction.remove space oldKey txn
-                                    Transaction.put space newKey newValue removed))
+                                    Transaction.put space newKey emptyIndexValue removed))
             txn
 
     /// store の行に txn の書き込みを重ねる（ストリーミング）。
@@ -179,10 +186,43 @@ module internal Dml =
 
         copy
 
-    /// 索引を構成する列の位置。
+    /// 索引を構成する列の表内位置。
     let private indexColumnIndices (schema: TableSchema) (index: IndexSchema) =
-        index.Columns
-        |> List.choose (fun name -> schema.Columns |> List.tryFindIndex (fun c -> Catalog.eqName c.Name name))
+        index.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
+
+    /// 索引キーに含まれる列の表内位置（索引列 + 主キー列の順）。
+    let private indexAndPrimaryIndices (schema: TableSchema) (index: IndexSchema) =
+        indexColumnIndices schema index
+        |> Result.map (fun positions -> positions @ schema.PrimaryKey)
+
+    /// 索引スキャンで使う mask と、本体から fetch する列の mask を返す。
+    /// <remarks>
+    /// 索引キーには索引列 + 主キーが入っているので、その範囲内だけなら索引スキャンで完結する。
+    /// 被覆外の列が必要な場合は、スキャン時に主キーを復号できるよう scanMask に PK を足し、
+    /// fetchMask に「必要かつ被覆外」の列を立てる。
+    /// </remarks>
+    let indexAccessMasks (schema: TableSchema) (index: IndexSchema) (mask: bool array) =
+        indexAndPrimaryIndices schema index
+        |> Result.map (fun positions ->
+            let covered = Array.create schema.Columns.Length false
+
+            positions
+            |> List.iter (fun p ->
+                if p >= 0 && p < covered.Length then
+                    covered.[p] <- true)
+
+            let fetchMask =
+                Array.init schema.Columns.Length (fun i -> i < mask.Length && mask.[i] && not covered.[i])
+
+            let needsFetch = fetchMask |> Array.exists id
+
+            let scanMask =
+                if needsFetch then
+                    widenMask mask schema.PrimaryKey
+                else
+                    mask
+
+            scanMask, fetchMask)
 
     /// `SstScan` を `Op` に変換する。
     /// `take` が false になった時点で走査を打ち切る（キー昇順なので範囲の上限に使える）。
@@ -215,6 +255,121 @@ module internal Dml =
                 pull scan)
 
         emit scan
+
+    /// 索引キーから表幅の行を組み立てる関数を作る。
+    /// `positions` は「索引列 + 主キー列」の表内位置。
+    /// mask false の列は復号せず `Unloaded` のままにする。
+    let private indexRowDecoder (schema: TableSchema) (positions: int list) (mask: bool array) (key: byte array) =
+        let positions' = Array.ofList positions
+
+        let compactMask =
+            positions' |> Array.map (fun p -> p >= 0 && p < mask.Length && mask.[p])
+
+        match OrderPreserving.readValuesMasked compactMask positions'.Length (Cursor.create key) with
+        | Error e -> err e
+        | Ok(values, rest) ->
+            if not (Cursor.atEnd rest) then
+                err (DbError.corruption "索引キーに余分なバイトがあります")
+            else
+                let row = Array.create schema.Columns.Length SqlValue.Unloaded
+                Array.iteri (fun i p -> row.[p] <- values.[i]) positions'
+                ret row
+
+    /// 索引スキャン。
+    /// store の走査と transaction のスロットを**キーで**マージする。
+    /// <remarks>
+    /// 索引値は空なので、行はキーから復号する。
+    /// `slots` の値（`Some` / `None`）は存在・削除の区別にだけ使い、中身は読まない。
+    /// </remarks>
+    let private opOfIndexScan
+        (rowOf: byte array -> Result<SqlValue array, DbError>)
+        (inRange: byte array -> bool)
+        (slots: (byte array * SqlValue array option) list)
+        (scan: SstScan)
+        =
+        let slotArr =
+            slots |> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b) |> List.toArray
+
+        let slotCount = slotArr.Length
+
+        let rec emitSlots i =
+            if i >= slotCount then
+                Op.Empty
+            else
+                Op.compute (fun () -> advance i)
+
+        and advance j =
+            if j >= slotCount then
+                OpStep.OpDone
+            else
+                let key, value = slotArr.[j]
+
+                match value with
+                | None -> advance (j + 1)
+                | Some _ ->
+                    match rowOf key with
+                    | Error e -> OpStep.OpError e
+                    | Ok row -> OpStep.OpRow(row, emitSlots (j + 1))
+
+        let rec pull scan i = Op.compute (fun () -> advance scan i)
+
+        and advance scan j =
+            if j >= slotCount then
+                match SstScan.next scan with
+                | Error e ->
+                    SstScan.dispose scan
+                    OpStep.OpError e
+                | Ok None -> OpStep.OpDone
+                | Ok(Some(e, rest)) ->
+                    if not (inRange e.Key) then
+                        SstScan.dispose rest
+                        OpStep.OpDone
+                    elif e.Value.IsNone then
+                        advance rest j
+                    else
+                        match rowOf e.Key with
+                        | Error e -> OpStep.OpError e
+                        | Ok row -> OpStep.OpRow(row, pull rest j)
+            else
+                match SstScan.next scan with
+                | Error e ->
+                    SstScan.dispose scan
+                    OpStep.OpError e
+                | Ok None -> Op.next (emitSlots j)
+                | Ok(Some(e, rest)) ->
+                    if not (inRange e.Key) then
+                        SstScan.dispose rest
+                        Op.next (emitSlots j)
+                    else
+                        let sk, sv = slotArr.[j]
+
+                        match Bytes.compare e.Key sk with
+                        | c when c < 0 ->
+                            if e.Value.IsNone then
+                                advance rest j
+                            else
+                                match rowOf e.Key with
+                                | Error e -> OpStep.OpError e
+                                | Ok row -> OpStep.OpRow(row, pull rest j)
+                        | 0 ->
+                            match sv with
+                            | None -> advance rest (j + 1)
+                            | Some _ ->
+                                match rowOf sk with
+                                | Error e -> OpStep.OpError e
+                                | Ok row -> OpStep.OpRow(row, pull rest (j + 1))
+                        | _ ->
+                            let replay =
+                                SstScan.ofStepWithClose (fun () -> ret (Some(e, rest))) (fun () -> SstScan.dispose rest)
+
+                            match sv with
+                            | None -> advance replay (j + 1)
+                            | Some _ ->
+                                match rowOf sk with
+                                | Error e -> OpStep.OpError e
+                                | Ok row -> OpStep.OpRow(row, pull replay (j + 1))
+
+        pull scan 0
 
     /// 符号化済みの主キーで既存行を列マスク付きで取り出す。
     let getByPrimaryKeyBytesWithTxnMask
@@ -349,6 +504,7 @@ module internal Dml =
         }
 
     /// 索引の値に一致する全行を引く（txn の書き込みを含む）。
+    /// 索引値は空で、行は「索引列 + 主キー」のキーから復号する。
     /// 返り値は遅延の `Op`。
     let scanByIndexPrefixWithTxnMask
         (store: RowStore)
@@ -363,32 +519,21 @@ module internal Dml =
         =
         result {
             let! prefix = KeyBuilder.ofValues values
+            let! positions = indexAndPrimaryIndices schema index
 
             let slots =
                 Transaction.slotsOf (indexSpace index) txn
                 |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
 
-            let mask =
-                if List.isEmpty slots then
-                    mask
-                else
-                    widenMask mask (Seq.append (indexColumnIndices schema index) schema.PrimaryKey)
+            let rowOf = indexRowDecoder schema positions mask
 
-            let scanIndexPrefix prefix limit =
-                RowStore.scanAtRawMasked (indexSpace index) prefix limit visible scope mask store
-                |> Result.map (fun scan ->
-                    let rows =
-                        opOfScan schema.Columns.Length (fun e -> KeyBuilder.startsWithPrefix e.Key prefix) scan
+            let! scan =
+                RowStore.scanAtRawMasked (indexSpace index) prefix (storeLimitFor limit slots) visible scope [||] store
 
-                    if limit > 0 then Op.take limit rows else rows)
+            let rows =
+                opOfIndexScan rowOf (fun key -> KeyBuilder.startsWithPrefix key prefix) slots scan
 
-            let! rows = scanIndexPrefix prefix (storeLimitFor limit slots)
-            let overlaid = overlayRows (RowKey.indexKeyV schema index) slots rows
-
-            if limit > 0 then
-                return Op.take limit overlaid
-            else
-                return overlaid
+            if limit > 0 then return Op.take limit rows else return rows
         }
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
@@ -408,32 +553,28 @@ module internal Dml =
         result {
             let! lowerBytes = KeyBuilder.ofValues lower
             let! upperBytes = KeyBuilder.ofOptionalValues upper
+            let! positions = indexAndPrimaryIndices schema index
 
             let slots =
                 Transaction.slotsOf (indexSpace index) txn
                 |> List.filter (fun (key, _) -> inIndexRange lowerBytes upperBytes key)
 
-            let mask =
-                if List.isEmpty slots then
-                    mask
-                else
-                    widenMask mask (Seq.append (indexColumnIndices schema index) schema.PrimaryKey)
+            let rowOf = indexRowDecoder schema positions mask
 
-            let scanIndexRange lowerBytes upperBytes limit =
-                RowStore.scanAtRawMasked (indexSpace index) lowerBytes limit visible scope mask store
-                |> Result.map (fun scan ->
-                    let rows =
-                        opOfScan schema.Columns.Length (fun e -> inIndexRange lowerBytes upperBytes e.Key) scan
+            let! scan =
+                RowStore.scanAtRawMasked
+                    (indexSpace index)
+                    lowerBytes
+                    (storeLimitFor limit slots)
+                    visible
+                    scope
+                    [||]
+                    store
 
-                    if limit > 0 then Op.take limit rows else rows)
+            let rows =
+                opOfIndexScan rowOf (fun key -> inIndexRange lowerBytes upperBytes key) slots scan
 
-            let! rows = scanIndexRange lowerBytes upperBytes (storeLimitFor limit slots)
-            let overlaid = overlayRows (RowKey.indexKeyV schema index) slots rows
-
-            if limit > 0 then
-                return Op.take limit overlaid
-            else
-                return overlaid
+            if limit > 0 then return Op.take limit rows else return rows
         }
 
     /// 1行を transaction に積む（まだ DB には入らない）。

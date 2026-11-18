@@ -59,6 +59,7 @@ F# の型システムでは表現できないため、
 | INV-25 | commit の WAL 位置は fsync 前に登録する                                     | `DatabaseHost.serialized` の `writeGate` 内 `Register` + `SessionHostTests` の統合テスト（3 commit / 2 fsync）                                                                                                                 | ✅ 完了 |
 | INV-26 | 確定状態は transaction を持たない                                           | `Committed`（transaction フィールド無し）+ `HostLifecycle` が `Committed` のみを保持 + 実行時だけ `ExecState` に合成                                                                                                           | ✅ 完了 |
 | INV-27 | 並列制御以外に DB・プロセス寿命の可変キャッシュを持たない                   | `Eval.Prepared`（計画時の `ImmutableDictionary`）+ `FileMetaData.ReadInfo`（不変の `Version` に付随）+ mutable/`ConcurrentDictionary` の許可リスト（Session 層・`EngineHost`・`ProcessLock`・`Transactions`・`SstScan.Scope`） | ✅ 完了 |
+| INV-28 | 索引エントリの値は空。索引列 + 主キーはキーから復号し、非被覆列は PK lookup | `Dml.indexKeyRow` / `opOfIndexScan` / `indexAccessMasks` / `ExecContext.fetchMissing` + キー復号 golden / 索引 fetch テスト                                                                                                    | ✅ 完了 |
 
 ---
 
@@ -516,6 +517,35 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   `StorageEngine.openDatabase: 書き込み後に壊れたファイルは再オープンで検出する`、
   `SqlReference: DISTINCT を続けて実行しても毎回全行が返る` /
   `SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎回同じ結果になる`。
+
+### INV-28 索引エントリの値は空で、索引列 + 主キーはキーから復号する
+
+- 宣言: `i:<index>` keyspace の値は空（`Array.empty`）。
+  論理キーは「索引列（`IndexSchema.Columns` 順）+ 主キー列（`TableSchema.PrimaryKey` 順）」。
+  索引スキャンはキーから索引列 + 主キーを `OrderPreserving.readValuesMasked` で復号し、
+  被覆外の列は `ExecContext.fetchMissing` が同じ `Visible` / `Txn` で主キー lookup して埋める。
+  結果に `Unloaded` を漏らさない。
+- 理由: 値に行全体を複製すると、索引 1本ごとにストレージと書き込みが行幅ぶん増え、
+  `ALTER TABLE` が全索引の書き換えを必要とする。
+  索引キーだけで行を一意に特定できる。
+- 担保:
+  - 書き込みは `Dml.applyIndexChange` と `Engine.backfillIndex` の 2箇所だけで、どちらも空値を書く。
+  - 読み取りは `Dml.indexKeyRow` / `opOfIndexScan`。transaction のスロットも**生キーで**マージする。
+  - `Dml.indexAccessMasks` が (スキャン mask, fetch mask) を返し、
+    `Optimizer.execScan` / `execIndexJoin` が非被覆のときだけ fetch を挟む。
+  - `CREATE UNIQUE INDEX` は `Engine.createIndex` の `checkUniqueIndex` が
+    `RowStore.scanKeys` でキーだけを走査し、索引列を復号して重複を検査する。
+  - `ALTER TABLE` の行書き換えは `Engine.rewriteTable` でテーブル本体だけを対象にする。
+- 回帰テスト:
+  - `Dml.insertWithKey: 索引エントリの値は空になる`
+  - `Dml.scanByIndexPrefix: 索引キーから索引列と主キーを復元する`
+  - `Dml.scanByIndexPrefix: マスクした列は Unloaded になる`
+  - `Dml.scanByIndexPrefix: transaction の索引書き込みもキーで overlay する`
+  - `Database: 非被覆索引は本体から列を fetch する`
+  - `Database: 索引 fetch は transaction の書き込みを見る`
+  - `Database: UNIQUE 索引の backfill は複数の NULL を許す`
+  - `SqlReference: ALTER TABLE DROP COLUMN は行と索引から列を除く`
+  - `キー復号: 全型が往復する` / `キー復号: 壊れたキーは CorruptionError になる`
 
 ---
 

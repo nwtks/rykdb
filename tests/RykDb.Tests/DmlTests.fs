@@ -67,6 +67,14 @@ let private commitInto (store: RowStore) (nextSeq: uint64) (txn: Transaction) =
     let batches = Transaction.toEntries nextSeq txn |> fst
     RowStore.writeBatches batches store |> ok |> ignore
 
+/// 読み取り用の空 transaction。
+let private emptyTxn = Transaction.create 0UL<txnId> { SeqNo = 0UL }
+
+let private allTrue (schema: TableSchema) = Array.create schema.Columns.Length true
+
+let private emailIndex =
+    usersWithEmailIndex.Indexes |> List.find (fun i -> i.Name = "users_email")
+
 [<Fact>]
 let ``RowKey.primary: 主キー列を符号化する`` () =
     let schema = peopleSchema
@@ -114,6 +122,119 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる（limit）`` ()
             Dml.scanByPrimaryKey store usersWithEmailIndex 2 None |> ok |> Op.toArray |> ok
 
         Assert.Equal(2, rows.Length))
+
+[<Fact>]
+let ``Dml.insertWithKey: 索引エントリの値は空になる`` () =
+    withStore "dml-index-empty" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+        let txn = insertRow usersWithEmailIndex txn (rowOf 1 "a@example.com" 10) |> ok
+
+        let slots = Transaction.slotsOf (Keyspace.index "users_email") txn
+        Assert.NotEmpty slots
+
+        for _, value in slots do
+            match value with
+            | Some values -> Assert.Empty values
+            | None -> failwith "索引エントリが tombstone になっています"
+
+        commitInto store 1UL txn
+
+        let entries =
+            RowStore.scan (Keyspace.index "users_email") [||] 0 store
+            |> ok
+            |> SstScan.toArray
+            |> ok
+
+        for entry in entries do
+            match entry.Value with
+            | Some values -> Assert.Empty values
+            | None -> failwith "永続化された索引エントリが tombstone です")
+
+[<Fact>]
+let ``Dml.scanByIndexPrefix: 索引キーから索引列と主キーを復元する`` () =
+    withStore "dml-index-row" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+
+        let txn =
+            [ 1, "a@example.com", 10; 2, "b@example.com", 20 ]
+            |> List.fold (fun t (id, email, age) -> insertRow usersWithEmailIndex t (rowOf id email age) |> ok) txn
+
+        commitInto store 1UL txn
+
+        let rows =
+            Dml.scanByIndexPrefixWithTxnMask
+                store
+                usersWithEmailIndex
+                emailIndex
+                [| SqlValue.Text "b@example.com" |]
+                0
+                None
+                None
+                emptyTxn
+                (allTrue usersWithEmailIndex)
+            |> ok
+            |> Op.toArray
+            |> ok
+
+        Assert.Equal(1, rows.Length)
+        Assert.Equal<int64>(2L, asInt rows.[0].[0])
+        Assert.Equal<string>("b@example.com", asText rows.[0].[1])
+        Assert.Equal<SqlValue>(SqlValue.Unloaded, rows.[0].[2]))
+
+[<Fact>]
+let ``Dml.scanByIndexPrefix: マスクした列は Unloaded になる`` () =
+    withStore "dml-index-mask" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+        let txn = insertRow usersWithEmailIndex txn (rowOf 1 "a@example.com" 10) |> ok
+        commitInto store 1UL txn
+
+        let rows =
+            Dml.scanByIndexPrefixWithTxnMask
+                store
+                usersWithEmailIndex
+                emailIndex
+                [| SqlValue.Text "a@example.com" |]
+                0
+                None
+                None
+                emptyTxn
+                [| false; true; false |]
+            |> ok
+            |> Op.toArray
+            |> ok
+
+        Assert.Equal(1, rows.Length)
+        Assert.Equal<SqlValue>(SqlValue.Unloaded, rows.[0].[0])
+        Assert.Equal<string>("a@example.com", asText rows.[0].[1])
+        Assert.Equal<SqlValue>(SqlValue.Unloaded, rows.[0].[2]))
+
+[<Fact>]
+let ``Dml.scanByIndexPrefix: transaction の索引書き込みもキーで overlay する`` () =
+    withStore "dml-index-txn" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+        let txn = insertRow usersWithEmailIndex txn (rowOf 1 "a@example.com" 10) |> ok
+
+        let rows =
+            Dml.scanByIndexPrefixWithTxnMask
+                store
+                usersWithEmailIndex
+                emailIndex
+                [| SqlValue.Text "a@example.com" |]
+                0
+                None
+                None
+                txn
+                (allTrue usersWithEmailIndex)
+            |> ok
+            |> Op.toArray
+            |> ok
+
+        Assert.Equal(1, rows.Length)
+        Assert.Equal<int64>(1L, asInt rows.[0].[0]))
 
 [<Fact>]
 let ``Dml.insertWithKey: NOT NULL 制約違反は弾かれる`` () =

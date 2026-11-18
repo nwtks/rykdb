@@ -319,6 +319,228 @@ module internal OrderPreserving =
         | SqlValue.Uuid g -> ret (tagged Tag.Uuid |> Writer.writeBytes (guidToOrderedBytes g) |> terminate)
         | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
+    /// 固定長フィールドの終端（0x00）を検証する。
+    let private expectTerminator (c: Cursor) =
+        Reader.readByte c
+        >>= fun (b, c') ->
+            if b = 0uy then
+                ret c'
+            else
+                err (DbError.corruption (sprintf "OrderPreserving: 終端が不正です (0x%02X)" b))
+
+    /// int64 の順序写像を戻す。
+    let private unmapInt64 (u: uint64) = int64 (u - 0x8000000000000000UL)
+
+    /// double の順序写像を戻す。
+    let private unmapDouble (u: uint64) =
+        let bits =
+            if u >= 0x8000000000000000UL then
+                int64 (u - 0x8000000000000000UL)
+            else
+                ~~~(int64 u)
+
+        System.BitConverter.Int64BitsToDouble bits
+
+    /// escape されたペイロードを読む（0x00 0xFF を 0x00 に戻す）。
+    /// 0xFF 以外が続く 0x00 を終端として扱う。
+    let private readEscapedPayload (c: Cursor) =
+        let d = Cursor.data c
+        let start = Cursor.pos c
+        let finish = Cursor.endPos c
+
+        let rec scan i length =
+            if i >= finish then
+                ValueNone
+            elif d.[i] = 0uy then
+                if i + 1 < finish && d.[i + 1] = 0xFFuy then
+                    scan (i + 2) (length + 1)
+                else
+                    ValueSome struct (i, length)
+            else
+                scan (i + 1) (length + 1)
+
+        let rec fill (out: byte array) terminator i j =
+            if i >= terminator then
+                ()
+            elif d.[i] = 0uy then
+                out.[j] <- 0uy
+                fill out terminator (i + 2) (j + 1)
+            else
+                out.[j] <- d.[i]
+                fill out terminator (i + 1) (j + 1)
+
+        match scan start 0 with
+        | ValueNone -> err (DbError.corruption "OrderPreserving: 文字列の終端がありません")
+        | ValueSome struct (terminator, length) ->
+            let out = Array.zeroCreate<byte> length
+            fill out terminator start 0
+            ret (out, Cursor.advance (terminator + 1 - start) c)
+
+    /// DECIMAL を復号する（符号・指数・29 桁の補数）。
+    let private readOrderedDecimal (c: Cursor) =
+        let digit negative (digits: byte array) i =
+            let d = if negative then 9 - int digits.[i] else int digits.[i]
+            if d < 0 || d > 9 then ValueNone else ValueSome d
+
+        let rec digitsValid negative digits i =
+            if i >= DecimalMaxDigits then
+                ValueSome()
+            else
+                match digit negative digits i with
+                | ValueSome _ -> digitsValid negative digits (i + 1)
+                | ValueNone -> ValueNone
+
+        let rec lastNonZero negative digits i =
+            if i < 0 then
+                -1
+            else
+                match digit negative digits i with
+                | ValueSome d when d <> 0 -> i
+                | _ -> lastNonZero negative digits (i - 1)
+
+        let rec accumulate negative digits total i hi mid lo =
+            if i >= total then
+                struct (hi, mid, lo)
+            else
+                match digit negative digits i with
+                | ValueNone -> struct (hi, mid, lo)
+                | ValueSome d ->
+                    let lo' = lo * 10UL + uint64 d
+                    let mid' = mid * 10UL + (lo' >>> 32)
+                    let hi' = hi * 10UL + (mid' >>> 32)
+                    accumulate negative digits total (i + 1) hi' (mid' &&& 0xFFFFFFFFUL) (lo' &&& 0xFFFFFFFFUL)
+
+        Reader.readByte c
+        >>= fun (sign, c1) ->
+            Reader.readUint64BE c1
+            >>= fun (exponentBits, c2) ->
+                Reader.readBytes DecimalMaxDigits c2
+                >>= fun (digits, c3) ->
+                    expectTerminator c3
+                    >>= fun c4 ->
+                        if sign <> 0uy && sign <> 1uy then
+                            err (DbError.corruption "OrderPreserving: DECIMAL の符号が不正です")
+                        else
+                            let negative = sign = 0uy
+
+                            match digitsValid negative digits 0 with
+                            | ValueNone -> err (DbError.corruption "OrderPreserving: DECIMAL の桁が不正です")
+                            | ValueSome() ->
+                                let total = lastNonZero negative digits (DecimalMaxDigits - 1) + 1
+
+                                if total = 0 then
+                                    ret (System.Decimal.Zero, c4)
+                                else
+                                    let rawExponent = unmapInt64 exponentBits
+
+                                    if rawExponent = System.Int64.MinValue then
+                                        err (DbError.corruption "OrderPreserving: DECIMAL の指数が不正です")
+                                    else
+                                        let exponent = if negative then -rawExponent else rawExponent
+                                        let scale = int64 total - exponent
+
+                                        if scale < 0L || scale > 28L then
+                                            err (DbError.corruption "OrderPreserving: DECIMAL のスケールが不正です")
+                                        else
+                                            let struct (hi, mid, lo) = accumulate negative digits total 0 0UL 0UL 0UL
+
+                                            if hi > 0xFFFFFFFFUL then
+                                                err (DbError.corruption "OrderPreserving: DECIMAL の桁数が大きすぎます")
+                                            else
+                                                let flags =
+                                                    uint32 (int scale) <<< 16 ||| if negative then 0x80000000u else 0u
+
+                                                let bits =
+                                                    [| int (uint32 lo); int (uint32 mid); int (uint32 hi); int flags |]
+
+                                                ret (System.Decimal bits, c4)
+
+    /// キーの 1値を復号する。
+    let private readValue (c: Cursor) =
+        Reader.readByte c
+        >>= fun (tag, c1) ->
+            match tag with
+            | 0x00uy -> expectTerminator c1 >>= fun c2 -> ret (SqlValue.Null, c2)
+            | 0x10uy ->
+                Reader.readByte c1
+                >>= fun (b, c2) -> expectTerminator c2 >>= fun c3 -> ret (SqlValue.ofBool (b <> 0uy), c3)
+            | 0x20uy ->
+                Reader.readUint64BE c1
+                >>= fun (u, c2) -> expectTerminator c2 >>= fun c3 -> ret (SqlValue.Int(unmapInt64 u), c3)
+            | 0x21uy ->
+                Reader.readUint64BE c1
+                >>= fun (u, c2) -> expectTerminator c2 >>= fun c3 -> ret (SqlValue.Real(unmapDouble u), c3)
+            | 0x22uy -> readOrderedDecimal c1 |> Result.map (fun (d, c2) -> SqlValue.Decimal d, c2)
+            | 0x30uy ->
+                Reader.readUint64BE c1
+                >>= fun (u, c2) ->
+                    expectTerminator c2
+                    >>= fun c3 ->
+                        let days = unmapInt64 u
+
+                        if
+                            days < int64 System.DateOnly.MinValue.DayNumber
+                            || days > int64 System.DateOnly.MaxValue.DayNumber
+                        then
+                            err (DbError.corruption "OrderPreserving: DATE の範囲が不正です")
+                        else
+                            ret (SqlValue.Date(System.DateOnly.FromDayNumber(int days)), c3)
+            | 0x40uy ->
+                Reader.readUint64BE c1
+                >>= fun (u, c2) ->
+                    expectTerminator c2
+                    >>= fun c3 ->
+                        let ticks = unmapInt64 u
+
+                        if ticks < 0L || ticks > System.DateTimeOffset.MaxValue.Ticks then
+                            err (DbError.corruption "OrderPreserving: TIMESTAMP の範囲が不正です")
+                        else
+                            ret (SqlValue.Timestamp(System.DateTimeOffset(ticks, System.TimeSpan.Zero)), c3)
+            | 0x50uy ->
+                readEscapedPayload c1
+                |> Result.map (fun (bs, c2) -> SqlValue.Text(System.Text.Encoding.UTF8.GetString bs), c2)
+            | 0x60uy -> readEscapedPayload c1 |> Result.map (fun (bs, c2) -> SqlValue.Blob bs, c2)
+            | 0x70uy ->
+                Reader.readBytes 16 c1
+                >>= fun (bs, c2) ->
+                    expectTerminator c2
+                    |> Result.map (fun c3 ->
+                        let text = System.Convert.ToHexString bs
+                        SqlValue.Uuid(System.Guid text), c3)
+            | _ -> err (DbError.corruption (sprintf "OrderPreserving: 不明な型タグ %d" (int tag)))
+
+    /// 値を count 件復号する。
+    /// `mask` が Some のとき、false の位置は値を作らず `SqlValue.Unloaded` を置く。
+    [<TailCall>]
+    let rec private readValuesLoop (mask: bool array option) (count: int) (i: int) (acc: SqlValue list) (c: Cursor) =
+        if i >= count then
+            ret (List.rev acc |> Array.ofList, c)
+        else
+            let materialize =
+                match mask with
+                | Some m when i < m.Length && not m.[i] -> false
+                | _ -> true
+
+            match readValue c with
+            | Error e -> err e
+            | Ok(v, c') ->
+                let value = if materialize then v else SqlValue.Unloaded
+                readValuesLoop mask count (i + 1) (value :: acc) c'
+
+    /// 値を count 件復号する（末尾の余りは消費しない）。
+    let readValues (count: int) (c: Cursor) =
+        if count < 0 then
+            err (DbError.corruption "OrderPreserving: 復号する値の個数が負です")
+        else
+            readValuesLoop None count 0 [] c
+
+    /// マスク付きで値を count 件復号する。
+    let readValuesMasked (mask: bool array) (count: int) (c: Cursor) =
+        if count < 0 then
+            err (DbError.corruption "OrderPreserving: 復号する値の個数が負です")
+        else
+            readValuesLoop (Some mask) count 0 [] c
+
 module internal Hashing =
     /// バイト列の 64bit ハッシュ（FNV-1a）。
     /// Bloom filter のビット位置を決めるのに使う。

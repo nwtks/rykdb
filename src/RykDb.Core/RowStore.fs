@@ -89,8 +89,9 @@ module internal RowStore =
     let private ClearChunkEntries = 8192
 
     /// レイアウトの format マーカーのバージョン。
+    /// v2 は索引エントリの値が空（索引列 + 主キーはキーから復号する）形式。
     [<Literal>]
-    let private FormatVersion = "rykdb-prefixed-v1"
+    let private FormatVersion = "rykdb-prefixed-v2"
 
     /// 論理 keyspace 名は物理キーの接頭辞で表すため、エンジンは常に 1本。
     let ensure (store: RowStore) = ret store.Engine
@@ -346,6 +347,17 @@ module internal RowStore =
         let next = store.Engine.NextSeqNo
         if next = 0UL then 0UL else next - 1UL
 
+    /// format マーカーより前に作られた DB か（データファイルがあるか）。
+    let private hasDataFiles (root: string) =
+        System.IO.Directory.EnumerateFiles root
+        |> Seq.exists (fun path ->
+            let name = System.IO.Path.GetFileName path
+
+            name = "CURRENT"
+            || name.StartsWith("MANIFEST-", System.StringComparison.Ordinal)
+            || name.EndsWith(".sst", System.StringComparison.Ordinal)
+            || name.EndsWith(".wal", System.StringComparison.Ordinal))
+
     /// format マーカーを検証し、新規なら書く。
     /// ファイルは `ProcessLock` が `FileShare.None` で開いたままのストリームを使う
     /// （開き直すと自分のロックに弾かれる）。
@@ -361,21 +373,29 @@ module internal RowStore =
             if text = FormatVersion then
                 return ()
             elif text = "" then
-                do!
-                    protect (fun () ->
-                        let bytes = System.Text.Encoding.UTF8.GetBytes(FormatVersion + "\n")
-                        format.Position <- 0L
-                        format.SetLength 0L
-                        format.Write(bytes, 0, bytes.Length)
-                        format.Flush true)
+                if hasDataFiles root then
+                    return!
+                        sprintf
+                            "データベース %s は旧形式（索引が行全体を保持する v1 以前）です。旧バージョンでエクスポートして作り直してください（%s）"
+                            root
+                            ProcessLock.FormatFileName
+                        |> DbError.corruption
+                        |> err
+                else
+                    do!
+                        protect (fun () ->
+                            let bytes = System.Text.Encoding.UTF8.GetBytes(FormatVersion + "\n")
+                            format.Position <- 0L
+                            format.SetLength 0L
+                            format.Write(bytes, 0, bytes.Length)
+                            format.Flush true)
 
-                return ()
+                    return ()
             else
                 return!
-                    err (
-                        sprintf "データベース %s の format が不正です（%s）" root ProcessLock.FormatFileName
-                        |> DbError.corruption
-                    )
+                    sprintf "データベース %s の format が不正です（%s）" root ProcessLock.FormatFileName
+                    |> DbError.corruption
+                    |> err
         }
 
     /// DB を開く（新規ならルート直下に 1本の LSM を作る）。

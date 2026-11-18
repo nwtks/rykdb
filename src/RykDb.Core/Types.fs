@@ -278,16 +278,17 @@ module internal SqlValue =
     /// 列マスクのプレースホルダが結果に漏れていないか検査する。
     /// 結果の境界では `LoadedRow.create` がこれを呼ぶ（直接呼ぶのはそこだけ）。
     let ensureLoaded (row: SqlValue array) =
-        if
-            row
-            |> Array.exists (fun v ->
-                match v with
-                | SqlValue.Unloaded -> true
-                | _ -> false)
-        then
-            err (DbError.internalError "復号していない列がクエリ結果に含まれています")
-        else
-            ret row
+        let rec firstUnloaded i =
+            if i >= row.Length then
+                None
+            else
+                match row.[i] with
+                | SqlValue.Unloaded -> Some i
+                | _ -> firstUnloaded (i + 1)
+
+        match firstUnloaded 0 with
+        | None -> ret row
+        | Some i -> err (DbError.internalError (sprintf "復号していない列がクエリ結果に含まれています（列位置: %d）" i))
 
     /// REAL を decimal へ変換できる絶対値の上限。
     /// System.Decimal の最大値（約 7.9228e28）より少し小さい安全側の値。

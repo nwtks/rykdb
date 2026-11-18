@@ -458,11 +458,11 @@ let ``Database: CREATE INDEX は残った索引エントリを消してから ba
             KeyBuilder.ofIndexAndPrimary [| SqlValue.Int 999L |] [| SqlValue.Int 999L |]
             |> ok
 
-        let staleRow = [| SqlValue.Int 999L; SqlValue.Int 999L |]
+        let staleValue: SqlValue array = Array.empty
         let store = ok (RowStore.openStore dir)
 
         let store =
-            ok (RowStore.writeBatches [ (Keyspace.index "ix_a", [| Entry.put staleKey 1UL staleRow |]) ] store)
+            ok (RowStore.writeBatches [ (Keyspace.index "ix_a", [| Entry.put staleKey 1UL staleValue |]) ] store)
 
         ok (RowStore.close store)
 
@@ -524,8 +524,7 @@ let ``Database: DROP TABLE は索引 keyspace の孤児エントリも消す`` (
             ok (
                 RowStore.writeBatches
                     [
-                        (Keyspace.index "ix_g",
-                         [| Entry.put staleKey 1000UL [| SqlValue.Int 999L; SqlValue.Int 999L |] |])
+                        (Keyspace.index "ix_g", [| Entry.put staleKey 1000UL (Array.empty: SqlValue array) |])
                     ]
                     store
             )
@@ -975,3 +974,55 @@ let ``Database: 返した行を書き換えても DB の内容は変わらない
         match again.Rows.[0].[1] with
         | SqlValue.Blob bytes -> Assert.Equal<byte>(1uy, bytes.[0])
         | _ -> Assert.Fail "BLOB ではありません")
+
+[<Fact>]
+let ``Database: 非被覆索引は本体から列を fetch する`` () =
+    withDb "index-fetch" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')"
+        let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
+
+        // 索引列 a で引き、非被覆列 b を本体から取る。
+        let _, byIndex = ok (execSql db3 "SELECT b FROM t WHERE a = 20")
+        Assert.Equal(1, byIndex.Rows.Length)
+        Assert.Equal<string>("y", asText byIndex.Rows.[0].[0])
+
+        let _, all = ok (execSql db3 "SELECT * FROM t WHERE a = 10")
+        Assert.Equal(3, all.Rows.[0].Length)
+        Assert.Equal<int64>(1L, asInt all.Rows.[0].[0])
+        Assert.Equal<int64>(10L, asInt all.Rows.[0].[1])
+        Assert.Equal<string>("x", asText all.Rows.[0].[2])
+
+        // 値を必要としない集約は fetch しない（件数は索引だけで分かる）。
+        let _, count = ok (execSql db3 "SELECT COUNT(*) FROM t WHERE a >= 0")
+        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0])
+
+        // ALTER で足した列も索引経由で fetch できる。
+        let db4 = exec db3 "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7"
+        let _, added = ok (execSql db4 "SELECT c, b FROM t WHERE a = 10")
+        Assert.Equal<int64>(7L, asInt added.Rows.[0].[0])
+        Assert.Equal<string>("x", asText added.Rows.[0].[1]))
+
+[<Fact>]
+let ``Database: 索引 fetch は transaction の書き込みを見る`` () =
+    withDb "index-fetch-txn" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')"
+        let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
+        let db4 = exec db3 "BEGIN"
+        let db5 = exec db4 "INSERT INTO t VALUES (3, 30, 'z')"
+
+        let _, inserted = ok (execSql db5 "SELECT b FROM t WHERE a = 30")
+        Assert.Equal<string>("z", asText inserted.Rows.[0].[0])
+
+        let db6 = exec db5 "UPDATE t SET b = 'w' WHERE id = 1"
+        let _, updated = ok (execSql db6 "SELECT b FROM t WHERE a = 10")
+        Assert.Equal<string>("w", asText updated.Rows.[0].[0])
+
+        let db7 = exec db6 "DELETE FROM t WHERE id = 2"
+        let _, deleted = ok (execSql db7 "SELECT b FROM t WHERE a = 20")
+        Assert.Empty deleted.Rows
+
+        let db8 = exec db7 "ROLLBACK"
+        let _, rolledBack = ok (execSql db8 "SELECT b FROM t WHERE a = 10")
+        Assert.Equal<string>("x", asText rolledBack.Rows.[0].[0]))

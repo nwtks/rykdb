@@ -329,7 +329,22 @@ let ``RowStore: format マーカーがプロセス間ロックを兼ねる`` () 
 
         ok (RowStore.close store)
         Assert.True(canLockExternally ())
+        Assert.Equal("rykdb-prefixed-v2", System.IO.File.ReadAllText(formatPath).Trim()))
+
+[<Fact>]
+let ``RowStore: v1 の format マーカーは明示エラー`` () =
+    withDir "rs-format-v1" (fun dir ->
+        let formatPath = System.IO.Path.Combine(dir, ".rykdb.format")
+        System.IO.File.WriteAllText(formatPath, "rykdb-prefixed-v1\n")
+        expectErrorKind ErrorKind.CorruptionError "v1 の DB を開けてしまった" (RowStore.openStore dir)
         Assert.Equal("rykdb-prefixed-v1", System.IO.File.ReadAllText(formatPath).Trim()))
+
+[<Fact>]
+let ``RowStore: 空マーカーでもデータファイルがあれば旧形式として拒否する`` () =
+    withDir "rs-format-empty-data" (fun dir ->
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "MANIFEST-000001\n")
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, ".rykdb.format"), "")
+        expectErrorKind ErrorKind.CorruptionError "旧形式の DB を開けてしまった" (RowStore.openStore dir))
 
 [<Fact>]
 let ``RowStore.openStore: ロック失敗時は format マーカーを書き換えない`` () =

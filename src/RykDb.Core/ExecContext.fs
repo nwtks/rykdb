@@ -157,6 +157,61 @@ module internal ExecContext =
                         mask
         }
 
+    /// 索引スキャン用の mask を計算する。
+    /// 返り値は (スキャン mask, 本体から fetch する列の mask)。
+    let indexAccessMasks (ctx: ExecContext) (table: string) (indexName: string) (mask: bool array) =
+        result {
+            let! schema = schemaOf table ctx
+
+            match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
+            | None -> return! err (sprintf "テーブル %s に索引 %s がありません" table indexName |> DbError.name)
+            | Some idx -> return! Dml.indexAccessMasks schema idx mask
+        }
+
+    /// 索引スキャンで被覆できなかった列を、同じスナップショットの主キー lookup で埋める。
+    /// 表行が見つからない索引エントリ（防御）は行ごと捨てる。
+    let fetchMissing (ctx: ExecContext) (table: string) (fetchMask: bool array) (op: Op) =
+        let fetchOne schema pkPositions (row: SqlValue array) =
+            let pk = pkPositions |> Array.map (fun i -> row.[i])
+
+            if
+                pk
+                |> Array.exists (function
+                    | SqlValue.Unloaded -> true
+                    | _ -> false)
+            then
+                err (DbError.internalError "索引 fetch: 主キーが復号されていません")
+            else
+                KeyBuilder.ofValues pk
+                >>= fun keyBytes ->
+                    Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema keyBytes ctx.Visible ctx.Txn fetchMask
+                    |> Result.map (
+                        Option.map (fun fetched ->
+                            Array.init schema.Columns.Length (fun i ->
+                                if i < fetchMask.Length && fetchMask.[i] then
+                                    fetched.[i]
+                                else
+                                    row.[i]))
+                    )
+
+        let rec go schema pkPositions op =
+            Op.compute (fun () -> advance schema pkPositions op)
+
+        and advance schema pkPositions current =
+            match Op.next current with
+            | OpStep.OpRow(row, next) ->
+                match fetchOne schema pkPositions row with
+                | Error e -> OpStep.OpError e
+                | Ok None -> advance schema pkPositions next
+                | Ok(Some merged) -> OpStep.OpRow(merged, go schema pkPositions next)
+            | x -> x
+
+        result {
+            let! schema = schemaOf table ctx
+            let pkPositions = Array.ofList schema.PrimaryKey
+            return go schema pkPositions op
+        }
+
     /// 主キーで 1行を列マスク付きで引く。
     let byPrimaryKeyMasked (ctx: ExecContext) (table: string) (key: SqlValue array) (mask: bool array) =
         result {

@@ -924,14 +924,19 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
   `InternalError` を返す。
 - 空マスクの行を `[||]` にせず、スキーマ幅で埋める
   （`ORDER BY 1` などが行の幅を前提にするため）。
-- overlay（transaction の書き込み）は主キーを、索引スキャンは索引列 + 主キーをマスクに足す。
+- overlay（transaction の書き込み）は主キーをマスクに足す。
+- 索引スキャンは索引値を持たないので、索引列 + 主キーを**キーから復号**して行を組み立てる。
+  必要列がこの範囲に収まる（被覆読み）なら本体を読まない。
+  被覆外の列がある場合は、スキャン用マスクに主キーを足したうえで
+  `ExecContext.fetchMissing` が同じ可視性境界・transaction で主キー lookup を行い、
+  被覆外の列だけを埋める（`Dml.indexAccessMasks` が 2 つのマスクを返す）。
 - ポイント検索も `Sstable.lookupMasked` でマスク復号する。
   `lookupCached` は値スライスをコピーせず `SstEntry.decodeMaskedValueAt` に渡す。
 - 制約検査の存在確認（`DmlOps.checkUnique`）は全列 false のマスク、
-  UNIQUE 索引の重複検査は主キー列だけのマスクを使う。
+  UNIQUE 索引の重複検査は主キー列だけのマスクを使う（PK はキーから復号される）。
 - `RowStore.scan` は全列。キーだけなら `scanKeys`、索引列だけなら `scanAtRawMasked` を使う。
   Catalog の読み込みは値が必要で全列、keyspace の削除は `scanKeys`、
-  CREATE INDEX の重複検査は `scanAtRawMasked` + 索引列マスク。
+  CREATE INDEX の重複検査は `scanKeys` + キーの索引列を復号して行う。
 - DML の本体スキャンは `DELETE` が WHERE 参照列 + 主キー + 全索引列のマスク、
   `UPDATE` は未変更列も含む新しい行を書き戻すため全列。
 - 最終結果の境界（`Engine.runSelect`）と `RowReader.TryRead` は
@@ -975,15 +980,19 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
 テーブル・索引・カタログは**論理 keyspace** で分けるが、物理的には DB ごとに **1本の LSM ツリー**に載せる。
 物理キーは `[varint(keyspace の UTF-8 長)][keyspace][論理キー]` で、keyspace はキーの前方一致する接頭辞になる。
 
-| keyspace      | 中身                     | 論理キー                                       |
-| ------------- | ------------------------ | ---------------------------------------------- |
-| `t:<table>`   | テーブルの行（主キー順） | `KeyBuilder.ofValues 主キー列`                 |
-| `i:<index>`   | 索引エントリ             | `KeyBuilder.ofIndexAndPrimary 索引列 主キー列` |
-| `__catalog__` | スキーマ定義             | `table:<名前>` / `index:<名前>`                |
+| keyspace      | 中身                     | 論理キー                                       | 値                                          |
+| ------------- | ------------------------ | ---------------------------------------------- | ------------------------------------------- |
+| `t:<table>`   | テーブルの行（主キー順） | `KeyBuilder.ofValues 主キー列`                 | 行全体（`ValueCodec`）                      |
+| `i:<index>`   | 索引エントリ             | `KeyBuilder.ofIndexAndPrimary 索引列 主キー列` | **空**（索引列 + 主キーはキーから復号する） |
+| `__catalog__` | スキーマ定義             | `table:<名前>` / `index:<名前>`                | テーブル / 索引の定義                       |
+
+索引エントリの値は**空**にし、行全体を複製しない。
+索引スキャンはキーから索引列 + 主キーを復号し（`OrderPreserving.readValuesMasked`）、
+被覆外の列だけを同じスナップショットの主キー lookup で取得する（§5.4）。
 
 ```
 <root>/
-  .rykdb.format      単一 LSM レイアウトのマーカー（プロセス間ロックを兼ねる）
+  .rykdb.format      レイアウトの format マーカー（v2）とプロセス間ロック
   MANIFEST-000001    世代ごとの VersionSet 定義（DB 全体で 1本）
   CURRENT            有効な MANIFEST 番号
   000123.sst         データファイル（全 keyspace を含む）
@@ -992,6 +1001,10 @@ Scan は `StorageEngine.ScanAtMasked ... mask` で **必要な列だけ復号**�
 
 長さを先頭に置くため、`t:a` と `t:ab` のように前方一致する keyspace 名でもキーは混ざらない。
 走査は接頭辞の境界で停止し、返すキーから接頭辞を外すので、`Dml` からは従来どおり論理キーだけが見える。
+
+`.rykdb.format` は `rykdb-prefixed-v2` を書き、WAL 復旧より前に検証する。
+v1（索引が行全体を保持する形式）と、マーカーが空でデータファイルが残っている v1 以前の DB は
+`CorruptionError` で開けない（自動移行はしない）。
 
 **この方式の意味:**
 
@@ -1116,9 +1129,10 @@ DDL 自体は transaction 上限を外すが、`CREATE INDEX` の backfill と
 DROP はカタログ削除前に `.drop-cleanup` ジャーナルを書き、後始末が終わったら消す。
 起動時にカタログへ存在しない keyspace だけをジャーナルから再消去する。
 `CREATE TABLE` は作成前に同名の table / 暗黙索引 keyspace を空にする。
-`ALTER TABLE` の行の書き換え（列の追加・削除）は、
-テーブル本体と全索引の行をそろえて書き換える必要があるため **1 transaction** にまとめる
+`ALTER TABLE` の行の書き換え（列の追加・削除）はテーブル本体だけを **1 transaction** で書き換える
 （行とカタログがずれた中間状態を作らない。既定の 256MiB 上限を超えると `CapacityError`）。
+索引エントリの値は空で、索引キーは「索引列 + 主キー」の値だけから作られるため、
+列の追加・削除では索引 keyspace を書き換える必要がない。
 列名の変更（`RENAME COLUMN`）は行の値に名前が含まれないのでカタログの書き換えだけで済む。
 複数行 `UPDATE` は最終状態検査のため対象行をメモリに集めるが、
 旧行 + 新行の概算が上限を超えた時点で `CapacityError` にする。
@@ -1263,7 +1277,9 @@ DDL は次を順に行う。
    **同じ root で実行中の transaction があれば `ConflictError`** を返す。
    待たないのは、commit されないまま残った transaction で DDL が永久に止まらないため。
 3. 既存索引エントリの tombstone → 8192行ずつ backfill を commit → カタログ保存。
-   `CREATE UNIQUE INDEX` は backfill 後に索引を走査して重複を検査する（直前の索引値だけ保持）。
+   backfill は索引キーだけを書き、値は空にする。
+   `CREATE UNIQUE INDEX` は backfill 後に索引 keyspace をキーだけで走査し、
+   キーから索引列を復号して重複を検査する（直前の索引列プレフィックスだけ保持）。
 
 排他を持っている間は新しい文と `Begin()` がブロックされるので、
 DDL の後に始まる transaction は必ず**新しいカタログ**を読む。
@@ -1812,14 +1828,14 @@ fsync を省くと、再起動後にデータが読めなくなる。
 └── .orphans/                ← MANIFEST 非参照ファイルの退避先
 ```
 
-| ファイル        | 役割                                                            |
-| --------------- | --------------------------------------------------------------- |
-| `MANIFEST-%06d` | VersionSet の変更履歴（4MiB 超でローテーション）                |
-| `CURRENT`       | 有効な MANIFEST 番号（1行）                                     |
-| `%06d.wal`      | 先行ログ                                                        |
-| `%06d.sst`      | データファイル                                                  |
-| `.rykdb.format` | 現在のキー配置（`rykdb-prefixed-v1`、プロセス間ロックを兼ねる） |
-| `.orphans/`     | MANIFEST 非参照ファイルの退避先（削除しない）                   |
+| ファイル        | 役割                                                                             |
+| --------------- | -------------------------------------------------------------------------------- |
+| `MANIFEST-%06d` | VersionSet の変更履歴（4MiB 超でローテーション）                                 |
+| `CURRENT`       | 有効な MANIFEST 番号（1行）                                                      |
+| `%06d.wal`      | 先行ログ                                                                         |
+| `%06d.sst`      | データファイル                                                                   |
+| `.rykdb.format` | 保存レイアウトの版（`rykdb-prefixed-v2`）とプロセス間ロック。v1 の DB は開けない |
+| `.orphans/`     | MANIFEST 非参照ファイルの退避先（削除しない）                                    |
 
 `.rykdb.format` は開いている間 `FileShare.None` で保持され、プロセス間ロックを兼ねる（§7.9）。
 
@@ -2005,6 +2021,11 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   集約後の `SELECT` / `HAVING` / `ORDER BY`、`LIMIT` / `OFFSET`、派生テーブル（LATERAL）では使えない。
 - **範囲走査は主キー / 索引の前置等値列 + 次列の範囲条件（下限あり）に限る**。
   `LIKE` は索引を要求しない（§5.1）。
+- **非被覆の索引読みは行ごとに主キー lookup を行う**。
+  索引列 + 主キーだけで完結するクエリ（被覆読み）は本体を読まないが、
+  それ以外の列が必要な場合はヒット行数に比例して lookup が増える。
+  統計（`ANALYZE`）とコストモデルが無いため、多数ヒットする範囲走査を
+  自動で `SeqScan` に切り替える判断はしない（§5.4）。
 - **ORDER BY のソート省略は単一テーブル・主キー全列の昇順だけ**。
   それ以外は全件ソートする（§5.1）。
 - **結合順序は INNER の連続区間の中だけで並べ替える**

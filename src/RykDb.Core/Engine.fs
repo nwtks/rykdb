@@ -401,18 +401,16 @@ module internal Ddl =
         dropTableCore name ifExists |> exclusiveDdl state
 
     let createIndex (ci: CreateIndex) (state: ExecState) =
-        let rec loop previous positions (idx: IndexSchema) scan =
+        let rec checkEntries (idx: IndexSchema) previous scan =
             match SstScan.next scan with
             | Error e -> err e
             | Ok None -> ret ()
             | Ok(Some(e, rest)) ->
-                match e.Value with
-                | None -> loop previous positions idx rest
-                | Some row ->
-                    let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
-
+                match OrderPreserving.readValues idx.Columns.Length (Cursor.create e.Key) with
+                | Error e -> err e
+                | Ok(values, _) ->
                     if values |> Array.exists SqlValue.isNull then
-                        loop previous positions idx rest
+                        checkEntries idx previous rest
                     else
                         match KeyBuilder.ofValues values with
                         | Error e -> err e
@@ -420,21 +418,13 @@ module internal Ddl =
                             match previous with
                             | Some before when Bytes.compare before prefix = 0 ->
                                 err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                            | _ -> loop (Some prefix) positions idx rest
+                            | _ -> checkEntries idx (Some prefix) rest
 
-        let checkEntries = loop None
+        let checkUniqueIndex (idx: IndexSchema) store =
+            RowStore.scanKeys (Keyspace.index idx.Name) [||] 0 store
+            >>= fun scan -> SstScan.withScan scan (fun scan -> checkEntries idx None scan)
 
-        let checkUniqueIndex schema (idx: IndexSchema) store =
-            idx.Columns
-            |> List.map (TableSchema.requireIndexOf schema)
-            |> all
-            >>= fun pos ->
-                let mask = Array.init schema.Columns.Length (fun i -> List.contains i pos)
-
-                RowStore.scanAtRawMasked (Keyspace.index idx.Name) [||] 0 None None mask store
-                >>= fun scan -> checkEntries pos idx scan
-
-        let clearSpaceChunks (state: ExecState) space =
+        let clearSpaceChunks state space =
             match clearSpaceChunksResult state space with
             | Ok next -> next
             | Error _ -> state
@@ -459,12 +449,12 @@ module internal Ddl =
                         applyOpChunks
                             (fun txn row ->
                                 RowKey.indexKey withIndex idx row
-                                |> Result.map (fun key -> Transaction.put space key row txn))
+                                |> Result.map (fun key -> Transaction.put space key Array.empty txn))
                             rows
                             cleared
 
                     if idx.Unique then
-                        match checkUniqueIndex withIndex idx filled.Store with
+                        match checkUniqueIndex idx filled.Store with
                         | Ok() -> return filled
                         | Error e ->
                             clearSpaceChunks filled space |> ignore
@@ -611,15 +601,13 @@ module internal Ddl =
         RowStore.scan space [||] 0 store
         >>= fun scan -> SstScan.withScan scan (fun scan -> loop txn scan)
 
-    /// テーブル本体と全索引 keyspace の行を書き換える。
+    /// テーブル本体の行を書き換える。
     /// <remarks>
-    /// 索引エントリは行の値も保持するため、列を足す・削除するときは
-    /// テーブル本体と同じ変換を全索引にも適用しないと、索引経由の読み取りだけ列数がずれる。
+    /// 索引エントリの値は空で、索引キーは「索引列 + 主キー」の値だけから作られる。
+    /// 列の追加・削除では索引キーが変わらないため、索引 keyspace の書き換えは不要。
     /// </remarks>
-    let private rewriteTableAndIndexes (schema: TableSchema) transform txn store =
-        Keyspace.table schema.Name
-        :: (schema.Indexes |> List.map (fun idx -> Keyspace.index idx.Name))
-        |> foldOk (fun txn space -> rewriteSpace space transform txn store) txn
+    let private rewriteTable (schema: TableSchema) =
+        rewriteSpace (Keyspace.table schema.Name)
 
     /// `ALTER TABLE`。
     /// <remarks>
@@ -721,7 +709,7 @@ module internal Ddl =
                                     Columns = nextDefn.Columns
                                 }
 
-                            rewriteTableAndIndexes nextSchema transform txn state.Store
+                            rewriteTable nextSchema transform txn state.Store
                             |> Result.map (Catalog.putTableInTxn nextDefn)
 
                         return! commitRewrite (Catalog.addTable state.Catalog nextDefn) build
@@ -771,7 +759,7 @@ module internal Ddl =
                                     Columns = newColumns
                                 }
 
-                            rewriteTableAndIndexes nextSchema transform txn state.Store
+                            rewriteTable nextSchema transform txn state.Store
                             |> Result.map (Catalog.putTableInTxn nextDefn)
 
                         return! commitRewrite (Catalog.addTable state.Catalog nextDefn) build

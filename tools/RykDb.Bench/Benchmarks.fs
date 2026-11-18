@@ -460,3 +460,114 @@ type OpBenchmarks() =
         | OpStep.OpRow _ -> ()
         | OpStep.OpDone -> failwith "行が返りませんでした"
         | OpStep.OpError e -> failwith (DbError.toDisplayString e)
+
+/// 索引のストレージ・書き込み・被覆 / 非被覆読みのベンチマーク。
+/// 同じデータを「索引あり」「索引なし」の 2つの DB に入れ、
+/// 総サイズの差を索引のストレージ増分として出力する。
+[<MemoryDiagnoser>]
+type IndexBenchmarks() =
+    let mutable indexed = Unchecked.defaultof<Session>
+    let mutable plain = Unchecked.defaultof<Session>
+    let mutable indexedRoot = ""
+    let mutable plainRoot = ""
+
+    let exec (s: Session) (sql: string) = s.Execute sql |> Check.ok |> ignore
+
+    let rowsOf (s: Session) (sql: string) = (s.Execute sql |> Check.ok).Rows.Length
+
+    let seed (s: Session) (table: string) (maxId: int) =
+        for start in 0..10_000..maxId do
+            let stop = min maxId (start + 9_999)
+
+            let values =
+                [
+                    for i in start..stop -> sprintf "(%d, %d, '%s')" i (i % 1000) (BenchText.ofInt i)
+                ]
+                |> String.concat ", "
+
+            exec s "BEGIN"
+            exec s (sprintf "INSERT INTO %s VALUES %s" table values)
+            exec s "COMMIT"
+
+    let insert100Sql =
+        let values =
+            [ for i in 0..99 -> sprintf "(%d, %d, 'payload-%d')" (20_000 + i) (i % 1000) i ]
+            |> String.concat ", "
+
+        sprintf "BEGIN; INSERT INTO t VALUES %s; ROLLBACK;" values
+
+    let dirBytes (dir: string) =
+        Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories)
+        |> Seq.sumBy (fun path -> FileInfo(path).Length)
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        indexedRoot <- BenchEnv.newTempDir "index"
+        plainRoot <- BenchEnv.newTempDir "index-plain"
+        indexed <- Session.OpenWithSync(indexedRoot, SessionOptions.Default) |> Check.ok
+        plain <- Session.OpenWithSync(plainRoot, SessionOptions.Default) |> Check.ok
+        exec indexed "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
+        exec plain "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
+        exec indexed "CREATE INDEX ix_a ON t (a)"
+        seed indexed "t" 19_999
+        seed plain "t" 19_999
+
+        indexed.Close() |> Check.ok |> ignore
+        plain.Close() |> Check.ok |> ignore
+        indexed <- Session.OpenWithSync(indexedRoot, SessionOptions.Default) |> Check.ok
+        plain <- Session.OpenWithSync(plainRoot, SessionOptions.Default) |> Check.ok
+
+        let covered = rowsOf indexed "SELECT a FROM t WHERE a = 500"
+        let fetched = rowsOf indexed "SELECT b FROM t WHERE a = 500"
+        let counted = rowsOf indexed "SELECT COUNT(*) FROM t WHERE a = 500"
+
+        if covered <> 20 || fetched <> 20 || counted <> 1 then
+            failwithf "索引ベンチの前提が崩れています（covered=%d, fetched=%d, counted=%d）" covered fetched counted
+
+        printfn
+            "索引のストレージ: 索引あり=%d バイト / 索引なし=%d バイト（差 %d バイト）"
+            (dirBytes indexedRoot)
+            (dirBytes plainRoot)
+            (dirBytes indexedRoot - dirBytes plainRoot)
+
+    [<GlobalCleanup>]
+    member _.Cleanup() =
+        try
+            if not (isNull (box indexed)) then
+                indexed.Close() |> ignore
+
+            if not (isNull (box plain)) then
+                plain.Close() |> ignore
+        with _ ->
+            ()
+
+        BenchEnv.deleteDir indexedRoot
+        BenchEnv.deleteDir plainRoot
+
+    /// 被覆読み（索引列 + 主キーだけで完結する）。
+    [<Benchmark>]
+    member _.IndexCoveredLookup() =
+        rowsOf indexed "SELECT a FROM t WHERE a = 500"
+
+    /// 非被覆読み（本体から b を fetch する）。
+    [<Benchmark>]
+    member _.IndexFetchLookup() =
+        rowsOf indexed "SELECT b FROM t WHERE a = 500"
+
+    /// 件数だけ（値を復号しない）。
+    [<Benchmark>]
+    member _.IndexCoveredCount() =
+        rowsOf indexed "SELECT COUNT(*) FROM t WHERE a = 500"
+
+    /// 非被覆の範囲読み。
+    [<Benchmark>]
+    member _.IndexFetchRange() =
+        rowsOf indexed "SELECT b FROM t WHERE a BETWEEN 100 AND 199"
+
+    /// 索引 2本（作成済みの ix_a と暗黙なし）を持つ表への 100行 INSERT + ROLLBACK。
+    [<Benchmark>]
+    member _.InsertWithIndex100Rows() = exec indexed insert100Sql
+
+    /// 索引なしの表への 100行 INSERT + ROLLBACK。
+    [<Benchmark>]
+    member _.InsertNoIndex100Rows() = exec plain insert100Sql

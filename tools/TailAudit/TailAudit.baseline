@@ -3,8 +3,14 @@
 src/RykDb.Core/Analyzer.fs|estimatedRowsCps|estimatedRowsCps|call
 src/RykDb.Core/Ast.fs|loop|loop|call
 src/RykDb.Core/Dml.fs|emitRemaining|emitRemaining|call
+src/RykDb.Core/Dml.fs|emitSlots/advance|advance|call
+src/RykDb.Core/Dml.fs|emitSlots/advance|emitSlots|call
 src/RykDb.Core/Dml.fs|emit|emit|call
 src/RykDb.Core/Dml.fs|merge|merge|call
+src/RykDb.Core/Dml.fs|pull/advance|advance|call
+src/RykDb.Core/Dml.fs|pull/advance|pull|call
+src/RykDb.Core/ExecContext.fs|go/advance|advance|call
+src/RykDb.Core/ExecContext.fs|go/advance|go|call
 src/RykDb.Core/ExtSort.fs|mergeRuns|mergeRuns|call
 src/RykDb.Core/Op.fs|append|append|call
 src/RykDb.Core/Op.fs|drop|drop|call

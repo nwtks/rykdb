@@ -366,7 +366,7 @@ let ``SqlReference: ALTER TABLE ADD COLUMN は既存行を DEFAULT で埋める`
         Assert.Equal<int64 list>([ 0L; 0L ], rows.Rows |> Array.map (fun r -> asInt r.[2]) |> List.ofArray)
         Assert.Equal<int64 list>([ 7L; 7L ], rows.Rows |> Array.map (fun r -> asInt r.[3]) |> List.ofArray)
 
-        // 索引エントリの行も書き換わる（索引経由で新しい列が返る）
+        // 索引経由でも新しい列が本体から fetch されて返る
         let _, byIndex = ok (execSql db5 "SELECT age, nn FROM t WHERE name = 'b'")
         Assert.Equal<int64>(0L, asInt byIndex.Rows.[0].[0])
         Assert.Equal<int64>(7L, asInt byIndex.Rows.[0].[1])
@@ -424,7 +424,7 @@ let ``SqlReference: ALTER TABLE DROP COLUMN は行と索引から列を除く`` 
         Assert.Equal<int64 list>([ 10L; 20L ], rows.Rows |> Array.map (fun r -> asInt r.[1]) |> List.ofArray)
         expectErrorKind ErrorKind.NameError "削除した列" (execSql db4 "SELECT b FROM t")
 
-        // 索引エントリの行も詰められている（索引経由で正しい行が引ける）
+        // 索引値は空のまま（キーは変わらない）で、索引経由で正しい行が引ける
         let _, byIndex = ok (execSql db4 "SELECT id FROM t WHERE a = 20")
         Assert.Equal<int64>(2L, asInt byIndex.Rows.[0].[0])
 
