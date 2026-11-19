@@ -329,6 +329,8 @@ module internal Eval =
         | KInX of Expr list * bool
         /// IN の候補 1件を評価中（左辺の値, 否定, 残りの候補, UNKNOWN を見たか）。
         | KInArg of SqlValue * bool * Expr list * bool
+        /// IN の集合に対する判定待ち（集合, 否定）。
+        | KInSet of Membership * bool
         | KLikeX of Expr * bool * Expr option
         | KLikeP of SqlValue * bool * Expr option
         /// ESCAPE 式の評価中（左辺, パターン, 否定）。
@@ -390,6 +392,7 @@ module internal Eval =
             | Expr.IsTruth(x, expected, negated) -> step resolve row (KIsTruth(expected, negated) :: kont) (Descend x)
             | Expr.Between(x, lo, hi, negated) -> step resolve row (KBetweenX(lo, hi, negated) :: kont) (Descend x)
             | Expr.InList(x, list, negated) -> step resolve row (KInX(list, negated) :: kont) (Descend x)
+            | Expr.InSet(x, set, negated) -> step resolve row (KInSet(set, negated) :: kont) (Descend x)
             | Expr.Like(x, p, negated, esc) -> step resolve row (KLikeX(p, negated, esc) :: kont) (Descend x)
             | Expr.Case(branches, elseE) ->
                 match branches with
@@ -522,6 +525,12 @@ module internal Eval =
                     match tail with
                     | [] -> step resolve row rest (Arrive(if saw then SqlValue.Null else SqlValue.ofBool negated))
                     | cand :: more -> step resolve row (KInArg(x, negated, more, saw) :: rest) (Descend cand)
+            | KInSet(set, negated) :: rest ->
+                match set.Contains v with
+                | DbErr er -> DbErr er
+                | DbOk TruthValue.True -> step resolve row rest (Arrive(SqlValue.ofBool (not negated)))
+                | DbOk TruthValue.False -> step resolve row rest (Arrive(SqlValue.ofBool negated))
+                | DbOk TruthValue.Unknown -> step resolve row rest (Arrive SqlValue.Null)
             | KLikeX(p, negated, esc) :: rest -> step resolve row (KLikeP(v, negated, esc) :: rest) (Descend p)
             | KLikeP(x, negated, esc) :: rest ->
                 if SqlValue.isNull x || SqlValue.isNull v then

@@ -5,28 +5,6 @@
 namespace RykDb.Core
 
 module internal Plan =
-    /// IN サブクエリの結果を保持する上限（管理メモリの概算バイト）。
-    /// 上限超過は OOM ではなく `CapacityError` で止める。
-    let private SubqueryBudgetBytes = 256L * 1024L * 1024L
-
-    /// IN サブクエリの行を上限付きで集める。
-    let private collectSubqueryRows =
-        let rec go used acc cur =
-            match Op.next cur with
-            | OpStep.OpError e -> err e
-            | OpStep.OpDone -> ret (List.rev acc |> List.toArray)
-            | OpStep.OpRow(row, nxt) ->
-                let used = used + int64 (ValueCodec.managedRowBytes row) + 32L
-
-                if used > SubqueryBudgetBytes then
-                    sprintf "IN サブクエリの結果が多すぎます（概算 %d バイトの上限）" SubqueryBudgetBytes
-                    |> DbError.capacity
-                    |> err
-                else
-                    go used (row :: acc) nxt
-
-        go 0L []
-
     /// 相関サブクエリの外側スコープ。
     /// 先頭が直近の外側（式を含むクエリの入力）で、後ろへ行くほど外側。
     type private OuterScope =
@@ -729,11 +707,15 @@ module internal Plan =
                         | [] ->
                             Optimizer.exec plan.Context plan.Tree plan.Input
                             >>= fun op ->
-                                match collectSubqueryRows op with
-                                | Error er -> err er
-                                | Ok rows ->
-                                    let values = rows |> Array.map (fun row -> Expr.Value row.[0]) |> Array.toList
-                                    k (Expr.InList(left, values, negated))
+                                ValueSet.build plan.Context.Budget op
+                                >>= fun set ->
+                                    let membership =
+                                        {
+                                            Contains = set.Contains
+                                            Release = fun () -> (set :> System.IDisposable).Dispose()
+                                        }
+
+                                    k (Expr.InSet(left, membership, negated))
                         | refs ->
                             let currentSchema =
                                 match scopes with
@@ -748,10 +730,17 @@ module internal Plan =
                                 substituteStatement plan.Input withRow sel
                                 >>= runner withRow ctx
                                 >>= fun (_, op) ->
-                                    collectSubqueryRows op
-                                    >>= fun rows ->
-                                        let values = rows |> Array.map (fun r -> Expr.Value r.[0]) |> Array.toList
-                                        Eval.evalWith resolve row (Expr.InList(left, values, negated))
+                                    ValueSet.build ctx.Budget op
+                                    >>= fun set ->
+                                        let membership =
+                                            {
+                                                Contains = set.Contains
+                                                Release = fun () -> (set :> System.IDisposable).Dispose()
+                                            }
+
+                                        let result = Eval.evalWith resolve row (Expr.InSet(left, membership, negated))
+                                        membership.Release()
+                                        result
 
                             k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx

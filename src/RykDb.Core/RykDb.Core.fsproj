@@ -49,6 +49,7 @@
     <Compile Include="Analyzer.fs" />
     <Compile Include="PlanBuilder.fs" />
     <Compile Include="Optimizer.fs" />
+    <Compile Include="ValueSet.fs" />
     <Compile Include="Plan.fs" />
     <Compile Include="DropCleanup.fs" />
     <Compile Include="Engine.fs" />

@@ -45,6 +45,7 @@
     <Compile Include="AnalyzerTests.fs" />
     <Compile Include="PlanBuilderTests.fs" />
     <Compile Include="OptimizerTests.fs" />
+    <Compile Include="ValueSetTests.fs" />
     <Compile Include="PlanTests.fs" />
     <Compile Include="DropCleanupTests.fs" />
     <Compile Include="EngineTests.fs" />

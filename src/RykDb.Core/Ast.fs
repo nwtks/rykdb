@@ -156,6 +156,18 @@ type internal CorrelatedSubquery =
         Depths: int list
     }
 
+/// IN の候補集合（サブクエリの結果）。
+/// 計画時に構築し、外側の行ごとに問い合わせる。
+/// 集合が大きいときは一時ファイルへ退避する実装が入るので、
+/// 評価器は集合の実装を知らずに `Contains` だけを使う。
+type internal Membership =
+    {
+        /// 値を含むか（SQL の 3値論理。NULL を含む集合では UNKNOWN があり得る）。
+        Contains: SqlValue -> DbResult<TruthValue>
+        /// 集合のリソースを解放する（メモリなら何もしない）。多重呼び出しは安全。
+        Release: unit -> unit
+    }
+
 /// 式。
 /// 束縛後は列参照が解決済みになる。
 [<RequireQualifiedAccess; NoComparison; NoEquality>]
@@ -208,6 +220,9 @@ type internal Expr =
     /// `x [NOT] IN (SELECT ...)`。
     /// 実行計画の段階で IN の要素リストへ展開される。
     | InSubquery of Expr * SelectStatement * bool
+    /// `x [NOT] IN (集合)`。
+    /// `IN (SELECT ...)` の結果を集合として保持する（要素リストへ展開しない）。
+    | InSet of Expr * Membership * bool
     /// 相関サブクエリの実行時評価器。
     /// 計画時に外側参照を検出したときだけ現れる
     /// （外側参照のないサブクエリは計画時に値へ置換される）。
@@ -442,6 +457,9 @@ module internal Expr =
         | Expr.InSubquery(x, sel, neg) ->
             let state, x' = step state x
             state, Expr.InSubquery(x', sel, neg)
+        | Expr.InSet(x, set, neg) ->
+            let state, x' = step state x
+            state, Expr.InSet(x', set, neg)
         | Expr.Like(x, p, neg, esc) ->
             let state, x' = step state x
             let state, p' = step state p
@@ -792,6 +810,12 @@ module internal Expr =
                     put "(subquery)"
                     writeSteps next
                 | Expr.InSubquery(x, _, neg) ->
+                    put "("
+
+                    sub x [ text (if neg then " NOT IN (subquery))" else " IN (subquery))") ]
+                    :: next
+                    |> writeSteps
+                | Expr.InSet(x, _, neg) ->
                     put "("
 
                     sub x [ text (if neg then " NOT IN (subquery))" else " IN (subquery))") ]

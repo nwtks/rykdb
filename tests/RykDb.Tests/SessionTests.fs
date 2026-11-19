@@ -676,6 +676,55 @@ let ``RowReader: LIMIT で早期終了しても一時ファイルが残らない
             session.Close() |> ignore)
 
 [<Fact>]
+let ``Session: IN サブクエリは作業メモリを超えても退避して同じ結果`` () =
+    withDir "session-in-spill" (fun dir ->
+        let spillDir = System.IO.Path.Combine(dir, "spill")
+        System.IO.Directory.CreateDirectory spillDir |> ignore
+
+        let options =
+            { SessionOptions.Default with
+                WorkMemBytes = 1L
+                SortBufferBytes = 1L
+                SpillDirectory = Some spillDir
+            }
+
+        let session = ok (Session.OpenWith(dir, options))
+
+        try
+            ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            |> ignore
+
+            ok (session.Execute "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
+            |> ignore
+
+            ok (session.Execute "CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+            |> ignore
+
+            ok (session.Execute "INSERT INTO s VALUES (1,20),(2,40),(3,NULL)") |> ignore
+
+            // IN: NULL を含む集合で見つからない値は UNKNOWN（行にならない）。
+            let rows =
+                ok (session.Execute "SELECT id FROM t WHERE v IN (SELECT v FROM s) ORDER BY id")
+
+            Assert.Equal<int>(2, rows.Rows.Length)
+            Assert.Equal<int64>(2L, asInt rows.Rows.[0].[0])
+            Assert.Equal<int64>(4L, asInt rows.Rows.[1].[0])
+
+            // 相関 IN も同じ結果になる。
+            let correlated =
+                ok (
+                    session.Execute
+                        "SELECT a.id FROM t AS a WHERE a.v IN (SELECT b.v FROM s AS b WHERE b.v > a.v - 1) ORDER BY a.id"
+                )
+
+            Assert.Equal<int>(2, correlated.Rows.Length)
+
+            // クエリ終了時に退避ファイルは消える。
+            Assert.Empty(System.IO.Directory.GetFiles spillDir)
+        finally
+            session.Close() |> ignore)
+
+[<Fact>]
 let ``RowReader: 読み取り中に commit しても開始時 snapshot を見る`` () =
     withDiskSession "session-reader-snapshot" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore

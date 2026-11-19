@@ -845,8 +845,9 @@ WHERE EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > e.sala
 - `FROM (SELECT ...) AS x`（派生テーブル）は §7.10。
 - `CREATE TABLE ... DEFAULT (SELECT ...)` は未対応（INSERT 時に `SyntaxError`）。
 - スカラーサブクエリは最大 2行、`EXISTS` は 1行だけを読む（非相関）。
-  `IN (SELECT ...)` は結果をすべて保持する
-  （管理メモリ換算 256MiB の上限。超過は `CapacityError`）。
+  `IN (SELECT ...)` の結果は値集合（`ValueSet`）として保持する。
+  作業メモリに収まらない分は一時ファイルへ退避し、Bloom filter + ブロック索引で判定する
+  （上限超過でも `CapacityError` にしない）。
 - 相関サブクエリは外側行ごとに内側を計画・実行するため、
   **外側行数 × 内側の走査コスト**がかかる。
 - サブクエリの入れ子にも**パーサの深さ上限はない**

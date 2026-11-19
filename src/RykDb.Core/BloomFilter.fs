@@ -100,6 +100,34 @@ module internal BloomFilter =
 
         check 0
 
+    /// 逐次追加できる Bloom filter ビルダ。
+    /// `ofKeys` と同じパラメータで作り、`Add` でキーを足して `Build` で確定する。
+    /// 件数が期待値を大きく超えると誤検出率が悪化するが、
+    /// false negative は出ないので**正しさには影響しない**（遅くなるだけ）。
+    [<Sealed>]
+    type BloomBuilder(expectedCount: int, falsePositiveRate: float) =
+        let template = ofKeys expectedCount falsePositiveRate Seq.empty
+        let bits = Array.copy template.Bits
+        let mutable hashes = 0
+
+        /// キーを 1つ追加する（ハッシュは `ofKeys` と同じ導出）。
+        member _.Add(key: byte array) =
+            let hash = key |> Hashing.hashBytes |> Hashing.mix
+            let h1, step = firstAndStep template.BitCount hash
+
+            for i in 0 .. template.HashCount - 1 do
+                let pos = positionAt template.BitCount h1 step i
+                bits.[pos / 8] <- bits.[pos / 8] ||| (1uy <<< pos % 8)
+
+            hashes <- hashes + template.HashCount
+
+        /// 確定した filter。
+        member _.Build() =
+            { template with
+                Bits = bits
+                Count = hashes
+            }
+
     /// 直列化のバージョン（1ビット = 1ビット）。
     [<Literal>]
     let private Version = 2uy

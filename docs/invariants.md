@@ -572,6 +572,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `Spill.openRun: 破損した run は CorruptionError`
   - `Spill.spool: 存在しないディレクトリは IoError`
   - `Spill.reopen: ScanScope の早期終了でファイルを消す`
+  - `ValueSet: 退避した集合は ScanScope の早期終了でもファイルが残らない`
   - `RowReader: LIMIT で早期終了しても一時ファイルが残らない`
   - `distinct: 上限を超えて退避しても結果と順序が変わらない`
   - `集約: 上限を超えて退避しても結果と順序が変わらない`
