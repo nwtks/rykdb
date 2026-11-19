@@ -106,9 +106,7 @@ module internal Dml =
     /// store の行に txn の書き込みを重ねる（ストリーミング）。
     /// <remarks>
     /// store の行も txn のバッファも**キー昇順**なので、両者を突き合わせながら 1行ずつ合成できる。
-    /// 従来は「store の全行を配列化 → 差し替え → 追加分を足して再ソート」だったので、
-    /// transaction 中の大テーブル走査が O(テーブル行数) のメモリを使った。
-    /// ここでは store 側は 1行だけ、slot 側は txn のバッファぶんだけしか持たない。
+    /// store 側は 1行だけ、slot 側は txn のバッファぶんだけしか持たない。
     /// slot は 1回ずつしか消費されない（store 行と突き合わせたとき、あるいは store が尽きたとき）。
     /// </remarks>
     let private overlayRows

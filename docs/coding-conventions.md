@@ -137,11 +137,12 @@ JIT は `tail.` を尊重する。
 採用した手法は次のとおり。
 
 - **式と SELECT の構文規則は CPS** — 継続を引数で受け、末尾で呼ぶ
-  （`Parser.fs` の `parseExprC` / `parseExprBpC` / `parseExprLoopC`）。
+  （`ParserExpr.fs` の `parseExprC` / `parseExprBpC` / `parseExprLoopC`）。
   Pratt（precedence climbing）で中置演算子はループ、右辺だけを結合強度で再帰させる。
   左結合の右辺は `lbp + 1`、比較・述語の右辺は `PredicateRightBp`（加算以上）で読む。
   継続はヒープに積まれるので、式・サブクエリの入れ子段数に依存せずスタックは一定。
-  深さの上限は設けない。回帰テストは `ParserTests` の
+  深さの上限は設けない。
+  回帰テストは `ParserExprTests` の
   `末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない` と
   `末尾再帰: 5000段の深いサブクエリの入れ子も解析できる`。
   CPS 群でも自己再帰がすべて末尾位置の関数には `[<TailCall>]` を付ける
@@ -236,7 +237,7 @@ JIT は `tail.` を尊重する。
     `rewrite` 内のローカル関数 `loop` の自己再帰だけなので、式の深さに依存せずスタックは一定。
     使うのは束縛の `Binder.qualify` と、集約後の読み替え（`Ops` の内部 `substituteAggs`）
     （`AggCall` のように子を持つノードを丸ごと定数へ置き換えるのも `rewriteLeaf` で表現できる）。
-    検証は `AnalyzerTests` の `Binder.qualify: 全ノード種を qualify しても構造が保たれる` と
+    検証は `BinderTests` の `Binder.qualify: 全ノード種を qualify しても構造が保たれる` と
     `OpsTests` の `末尾再帰: 50000段の式を havingFilter してもスタックを食わない`。
 
 ## 4. 予約語に注意
@@ -251,7 +252,7 @@ JIT は `tail.` を尊重する。
 パス操作・ファイル I/O・プロセス間排他などは .NET のクロスプラットフォーム API
 （`System.IO.Path` / `Environment` / `FileShare` 等）を使い、
 OS 固有のパス区切り・コマンド・API を直接呼ばない。
-CI は Linux で走るが、Windows / macOS でも同じ挙動を保つこと。
+CI は Linux / Windows / macOS の 3 OS で走る。
 
 ## 6. 意味の違う番号と所有権を守る
 

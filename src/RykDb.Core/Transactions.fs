@@ -493,8 +493,8 @@ type internal SnapshotRegistry() =
                     None
             | _ -> None)
 
-/// DB ごとの RootGate と active snapshot 登録。
-/// `RowStore` が所有し、不変ハンドル間で共有する。
+/// DB ごとの RootRuntime と active snapshot 登録。
+/// `RowStore` が所有し、Session 間で共有する。
 type internal RootRuntime() =
     let gate =
         new System.Threading.ReaderWriterLockSlim(System.Threading.LockRecursionPolicy.SupportsRecursion)

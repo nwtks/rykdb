@@ -404,7 +404,7 @@ let ``Compaction.compact: 出力はエントリ数ではなく OutputFileTargetB
         let f = mkSst dir 10L 1 es
         let version = Version.addFile f Version.Empty
 
-        // 1エントリ約 2KB。旧実装の「128エントリ」では 1ファイルに収まるが、
+        // 1エントリ約 2KB。
         // 目標 5KB なら 2 + 2 + 1 に割れる。
         let options =
             { pickFirstLevel with

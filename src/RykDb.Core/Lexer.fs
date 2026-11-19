@@ -115,7 +115,7 @@ module internal Lexer =
 
     let private Keywords = makeKeywordMap System.StringComparer.OrdinalIgnoreCase
 
-    /// 非 ASCII を含む識別子は従来どおり ToUpperInvariant してから引く
+    /// 非 ASCII を含む識別子は ToUpperInvariant してから引く
     /// （ſ のような文字の大文字化で予約語に一致する挙動を保つ）。
     let private KeywordsUpper = makeKeywordMap System.StringComparer.Ordinal
 

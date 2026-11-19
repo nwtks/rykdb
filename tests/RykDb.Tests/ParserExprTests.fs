@@ -82,7 +82,7 @@ let ``式: NOT は述語の前置に置けない`` () =
 let ``式: 不正な修飾子はその場でエラー`` () =
     // 識別子以外の後ろの `.` は修飾子として認めない
     expectErrorKind ErrorKind.SyntaxError "式の後ろの ." (parseStatement "SELECT (a + b) . c FROM t")
-    // 正しい修飾子は従来どおり
+    // 正しい修飾子はそのまま
     parsesOk "SELECT a.b, a + b.c FROM t WHERE a.b = 1"
 
 [<Fact>]

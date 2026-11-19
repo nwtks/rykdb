@@ -43,7 +43,7 @@ module internal Keyspace =
             ret ()
 
 /// RowStore の開き方。
-/// `BackgroundCompaction = false` は従来の同期 compaction。
+/// `BackgroundCompaction = false` は同期 compaction。
 type internal RowStoreOptions =
     {
         BackgroundCompaction: bool
@@ -80,7 +80,7 @@ type internal RowStore =
         Lock: ProcessLockLease option
         /// background compaction の共有状態。同期実装では None。
         Host: EngineHost option
-        /// DB ごとの RootGate と active snapshot 登録。
+        /// DB ごとの RootRuntime と active snapshot 登録。
         Runtime: RootRuntime
     }
 
@@ -184,7 +184,7 @@ module internal RowStore =
     /// （backfillIndex はトランザクションを外さないため触らない）。
     /// GC 境界は「自ハンドルの active snapshot」と「同じ DB を開いている他ハンドルの active snapshot」の最小値。
     /// 後者は DB の active snapshot 登録から集約する（`registration` は自分自身の登録で、除外する）。
-    /// 書き込みは DB の RootGate の共有ロックを取り、DDL の排他と交差しないようにする。
+    /// 書き込みは DB の RootRuntime の共有ロックを取り、DDL の排他と交差しないようにする。
     let commitToStoreWith
         (deferDurability: bool)
         (root: string)

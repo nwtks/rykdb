@@ -312,9 +312,9 @@ let withStore (_tag: string) (f: RowStore -> unit) = f (openStoreWith "" (memory
 /// メモリ上の DB を開いてテストし、最後に閉じる（ディスク I/O なし）。
 /// `Session` は同じインスタンスを使い続ける（`exec` は同じ Session を返す）。
 /// <remarks>
-/// root はテストごとに一意にする。root は DB ごとの RootGate /
-/// active snapshot 登録のキーなので、空文字を共有すると
-/// 並行する他のテストの transaction が DDL の排他判定に引っかかる。
+/// root はテストごとに一意にする。
+/// root は DB ごとの RootRuntime / active snapshot 登録のキーなので、
+/// 空文字を共有すると並行する他のテストの transaction が DDL の排他判定に引っかかる。
 /// store 側の root は空のまま（commit intent をディスクに書かない）。
 /// </remarks>
 let withSession (_tag: string) (f: Session -> unit) =

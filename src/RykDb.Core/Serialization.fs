@@ -783,7 +783,7 @@ module internal ValueCodec =
     /// 列マスクで「不要」とされた列は `Unloaded` のまま行に残る。
     /// 退避した行を読み戻したときに列位置がずれないよう、タグ 10 のプレースホルダとして往復させる。
     /// 永続化（WAL / SSTable）には使わないこと
-    /// （`writeValues` は従来どおり `Unloaded` を拒否する）。
+    /// （`writeValues` は `Unloaded` を拒否する）。
     /// </remarks>
     let writeValuesSparse (values: SqlValue seq) (w: Writer) =
         let arr = Seq.toArray values

@@ -16,12 +16,7 @@ namespace RykDb.Core
 /// 1ファイルの pin / retired 状態。
 type private FileRefState = { Pins: int; Retired: bool }
 
-/// compaction worker の状態。
-/// <remarks>
-/// 「未起動 / 起動中 / 実行中（activity）/ 停止」を 1つの値で持つ。
-/// 旧実装は `worker` / `stopped` / `activity` を別々のセルに持っていたため、
-/// 「停止済みなのに実行中」のような組み合わせを作れた。
-/// </remarks>
+/// compaction worker の状態（未起動 / 起動中 / 実行中 / 停止を 1つの値で持つ）。
 type private WorkerState =
     /// まだ起動していない。
     | NotStarted

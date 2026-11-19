@@ -1152,9 +1152,6 @@ CI の失敗が `tools/TailAudit/Program.fs` の FCS 型エラーなら、まず
 - ✅ 設計時に一度、禁止に該当するコードを紛れ込ませて**必ず落ちる**ことを確認する。
   `.fsi` を追加したときは、外から生ケース・レコードを書いて **FS0039** になることを実測する
   （`Op.fsi` / `Writer.fsi` / `SstScan.fsi` / `Cursor.fsi` / `Memtable.fsi` で実施）。
-- ✅ 旧 INV-12 のソース検査（`Cursor: レコード更新は Serialization.fs の中だけ`）は、
-  `Sstable.fs` を一時的に `{ c with Pos = ... }` へ戻して失敗を確認してから校正した。
-  現在は `Cursor.fsi` のコンパイル時検査に置き換えて削除済み。
 - ✅ ソース検査を残す場合は、許可リストの**理由**をコメントに残し、検査対象を `src/` のみにする。
 - ✅ `.fsi` 化で「不正な値を作って試すテスト」が書けなくなったら、そのテストは削除してよい
   （不変条件が構築時に保証されるため。例: `Reader` の範囲外 Cursor テスト）。
@@ -1233,8 +1230,8 @@ Result が Error でした: The process cannot access the file because it is bei
 - 症状: **Windows だけ** `RowStore: compaction 失敗後も flush 結果を保持し、再起動で commit を失わない` が落ちる。
   失敗位置は再オープン時の孤児退避（`openDatabaseWith` → `.orphans` への `File.Move`）。
 - 原因: compaction が壊れた入力（チェックサム不一致）で中断すると、他の入力の走査が途中で捨てられる。
-  旧 `SstScan.ofStep` は **`Dispose` を持たない**ため `SstScan.dispose` が no-op になり、
-  `FileStream`（`FileShare.Read`）が GC まで残る。
+  `SstScan.ofStep` は **`Dispose` を持たない**ため、ファイルを所有する step は
+  `SstScan.ofStepWithClose` で作る必要がある。
   Linux は開いたままで `unlink` / `rename` できるので `File.Move` が成功し、Windows だけ共有違反になる。
 - 対策: ファイルを所有する step 走査は `SstScan.ofStepWithClose step close` で作る
   （`Sstable.rangeScanPartial` / `RowStore.scanWithinPrefix`）。
@@ -1341,16 +1338,13 @@ compaction / version 適用では **MANIFEST への反映が先、入力ファ�
 - `Double.NaN` は .NET では符号ビットが立っている。
   正の quiet NaN に正規化しないとキー順が壊れる（`SqlValue.normalizeFloat`）。
 
-### 11.7 キー復号を戻すなら「ピーク分」を戻す（現在は削除済み）
+### 11.7 エスケープ付きフィールドの終端は 1 バイト戻す
 
 `TEXT` / `BLOB` のペイロードは `0x00` を `0x00 0xFF` に escape し、フィールド終端に素の `0x00` を置く。
 復号する場合は終端 `0x00` の**次を 1 バイトピーク**して、`0xFF` なら escape の続き、
 それ以外なら「ここがフィールド終端で、ピークしたバイトは次フィールドの先頭」と判定する。
 このときカーソルを**終端バイトを指す位置**（ピーク分を戻す）にしないと、
 終端検証が次フィールドのタグを読んで `終端が不正 (0xXX)` で失敗する。
-
-- キー復号（`OrderPreserving.readFirstValue`）は本体から使われず、テスト専用だったため削除した。
-  再導入する場合は、複合キーの先頭フィールドを読む回帰テストを必ず追加する。
 
 ### 11.8 keyspace 横断 commit は 1回の WAL バッチにする
 
@@ -1366,8 +1360,6 @@ WAL には `Begin / Batch / Commit` が 1回の `Wal.append` で書かれるた�
   呼び出し側が `TransactionManager` を進めず、同じ SeqNo を再利用してコミット済み WAL と食い違う。
 - flush に失敗しても `WriteBatch` が返した memtable は保持し、成功を返す。
   次の commit / `Close` で flush を再試行する。
-- 旧 `.commit/journal` の publish / resolve は削除した。
-  再適用用の `filterApplied` も不要（WAL の Commit レコードが原子性を保証する）。
 - 回帰テスト: `RowStore: 複数 keyspace の書き込みは 1 回の WAL バッチで回復する`。
 
 ### 11.9 `ActiveSnapshot = 0` は「全版を残す」
@@ -1448,17 +1440,10 @@ DELETE 時に索引 tombstone が書かれないため、backfill 後の索引�
   `Manifest: 途中のレコードのチェックサム不一致は CorruptionError` /
   `Manifest: CURRENT が指す MANIFEST が無ければ CorruptionError`。
 
-### 11.14 不変ハンドルの `Close` で WAL を消さない対策は廃止した（履歴）
+### 11.14 `DatabaseHost.Close` は二重 Close を no-op にする
 
-以前は internal の不変ハンドル `Database` が `Execute` ごとに作られ、
-古いハンドルの `Close()` が flush / WAL 削除 / `ProcessLock` 解放を行うと
-**新しいハンドルの commit 済みデータを失う**ため、
-`ProcessLockLease` の所有者トークンで「最新のハンドルだけが閉じる」ようにしていた。
-
-2026-11-17 に `Database` を削除し、所有者は `DatabaseHost` 1つだけになった。
-`DatabaseHost.Close` は `HostLifecycle.Closed` で二重 Close を no-op にするので、
-古いハンドルが Close する経路自体が無い。
-`StorageEngine.close` の WAL サイズ比較（古い書き手が flush しない）は防御として残っている。
+`DatabaseHost` がストアの唯一の所有者で、`HostLifecycle.Closed` が二重 Close を吸収する。
+`StorageEngine.close` の WAL サイズ比較（古い書き手が flush しない）は防御として残す。
 
 ### 11.15 DDL は明示トランザクションに参加しない（ので拒否する）
 
@@ -1541,8 +1526,8 @@ DDL だけは DB ごとに排他にする必要がある。
 
 ### 11.19 走査の開封エラーを握り潰さない
 
-以前は開けなかったファイルを空と見なしていたため、
-壊れた SSTable があると `Ok` のまま行が欠けた（静かな誤答）。
+開けなかったファイルを空と見なすと、
+壊れた SSTable があるとき `Ok` のまま行が欠ける（静かな誤答）。
 現在の `StorageEngine.scanAtValues` / `scanAtMasked` は pull（`SstScan`）を返し、
 候補ファイルをキー下限順に必要になった時点で `prepare` で開き、
 開封・ブロック解析のエラーをその `next` が返す（§11.24）。
@@ -1616,8 +1601,7 @@ DDL だけは DB ごとに排他にする必要がある。
 **例外は主キー順の `ORDER BY`**。単一テーブル・集約なし・`DISTINCT` なしで、
 `ORDER BY` の先頭が主キー全列（定義順・昇順）なら `Sort` ノードを作らないので、
 `ORDER BY 主キー LIMIT n` のヒントが走査まで降りる（`PlanBuilder.sortIsRedundant`）。
-主キーの一部だけ・`DESC`・索引走査になる条件（`WHERE 索引列 = ...` など）・集約・`DISTINCT`・結合では
-従来どおりソートする。
+主キーの一部だけ・`DESC`・索引走査になる条件（`WHERE 索引列 = ...` など）・集約・`DISTINCT`・結合ではソートする。
 回帰テストは `Session: 主キー順の ORDER BY は Sort を作らず LIMIT がストレージへ降りる`
 （2本目の SSTable を壊し、`ORDER BY id LIMIT 1` は成功・`ORDER BY id DESC LIMIT 1` は `CorruptionError`）。
 
@@ -1758,11 +1742,9 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 
 ### 11.37 `StorageEngine` の書き込み Gate は DB ごとの Runtime が持つ
 
-以前は `WriteCloseGate` というプロセス全体の 1本の `SemaphoreSlim` で
-`writeBatch` / `close` を直列化していた。
-このため、無関係な DB の書き込みまで互いに待たされていた。
+プロセス全体の 1本の Gate だと無関係な DB の書き込みまで待たされるため、
+`StorageEngine` は DB ごとの `StorageRuntime` が持つ Gate を共有する。
 
-- `StorageEngine` は DB ごとの `StorageRuntime` が持つ Gate を共有する。
 - `writeBatch` / `maybeFlush`（flush + compaction）/ `close` を同じ Gate で直列化する。
 - 異なる DB は並行。Gate は DB の寿命と一緒に回収される。
 
@@ -1770,7 +1752,7 @@ run の数だけ file descriptor を消費する（大入力で枯渇する）�
 
 `UNION` / `INTERSECT` / `EXCEPT` / `RIGHT` / `FULL` / `CROSS` / `NATURAL` / `OUTER` は
 `Lexer.Keywords` に無いため識別子として読まれる。
-以前は `parseOptAlias` がこれをテーブル別名として消費し、次のような静かな誤動作になっていた。
+`parseOptAlias` がこれをテーブル別名として消費すると、次のような静かな誤動作になる。
 
 - `SELECT id FROM t UNION SELECT id FROM t` → `FROM t AS UNION` + 別文の SELECT に分解され、
   `Execute` が `RowsAffected` の合計だけを返す（エラーにならない）。
@@ -1876,7 +1858,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 
 - 原子性は「フレームごとの CRC」+「Commit に到達した Batch だけを再生する `foldCommitted`」が守る。
   途中で落ちても未 commit の Batch は捨てられるので、コミット済みトランザクションが中途半端にならない。
-- 空のレコード列ではファイルを作らない（従来どおり）。
+- 空のレコード列ではファイルを作らない。
 - 回帰テスト: `WalTests`（フレームの往復）と `DatabaseTests` の WAL 再生・クラッシュ耐性。
 
 ### 11.44 JOIN が保持する行は上限までメモリ、超えたら退避する
@@ -1896,7 +1878,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
   非一意索引の 1キーに大量の行が付いていても追加のメモリを要らない。
 - ハッシュ結合の表（バケット）は行配列の後に作られ、行配列は表作りの後に捨てられる
   （メモリに収まる場合のピークは概ね上限の 2倍まで）。
-- `lookupHash` はバケットをそのまま返す（probe ごとの `ToArray` を廃止）。
+- `lookupHash` はバケットをそのまま返す（probe ごとの配列化を避ける）。
 
 ### 11.44b 退避した run の読み直しは one-shot（読みかけの状態を返さない）
 
@@ -1922,9 +1904,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 
 - `FileMetaData.writeSstable` は失敗時（キー順違反・書き込み失敗・空の入力）に
   **部分ファイルを消してから**エラーを返す（孤児 `.sst` を残さない）。
-- 検証は `writeTo` 内に統合したため、
-  `Sstable.validate` / `SstEntry.splitInto` / `SstEntry.maxSeqNo` は削除
-  （それぞれ `loop` の逐次チェック・1ブロック分のため・書き出し中の集計に置き換え）。
+- キー順の検証・`maxSeqNo` の集計は `writeTo` の `loop` が行う。
 - 末尾再帰の `loop` は `use`（列挙子の破棄）の後ろにあるが、
   F# は `use` / `try/finally` の中でも自己再帰を末尾呼び出しにする
   （300万回の反復で実測済み）。
@@ -2001,8 +1981,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
 
 ### 11.48 Parser の深さ上限は撤廃（CPS でスタック一定）
 
-以前は `Parser.MaxExpressionDepth = 200` で式の再帰に上限を課していた。
-現在は式・SELECT の構文規則を **CPS**（継続を引数で受け、末尾で呼ぶ）にしたので、
+式・SELECT の構文規則は **CPS**（継続を引数で受け、末尾で呼ぶ）で、
 深さ上限は設けていない。
 
 - 継続は関数値としてヒープに積まれ、呼び出しは必ず末尾位置になる。
@@ -2016,7 +1995,7 @@ Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Writ
   ホストプロセスを巻き込まないことを優先する。
 - `Tailcalls=false` にすると継続呼び出しが末尾にならず、深い入力でプロセスごと落ちる。
   設定を外さないこと（§8.16）。
-- 回帰テスト: `ParserTests` の
+- 回帰テスト: `ParserExprTests` の
   `末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない` /
   `末尾再帰: 5000段の深いサブクエリの入れ子も解析できる` /
   `末尾再帰: 200000個の NOT が連なってもスタックを食わない` /
@@ -2048,7 +2027,7 @@ Parser が `From = None` にし、PlanBuilder が `Logical.Values [||]`（1行 0
 - `Plan.resolveSourcesC` が AST の `TableSource.Derived` を `TableSource.Named`（別名）へ書き換え、
   別名の小文字をキーにした Map を `PlanBuilder.buildLogicalWith` に渡す。
   書き換え後に `From` / `Joins[].Table` に `Derived` が残っていたら解決漏れ。
-- `Logical.Derived` の実行は `Optimizer.run` の `DerivedFrame`。
+- `Logical.Derived` の実行は `Optimizer.exec` の `DerivedFrame`。
   内側の木は **内側の `ExecContext`**（内側のテーブル別名を登録したもの）で走らせる。
   外側の ctx で走らせると `FROM people p` の `p` を引けない。
 - 派生の列名は参照名（`SELECT t.id` → `id`）で持つ（`Schema.referenceColumns`）。
@@ -2731,8 +2710,7 @@ mapC (fun (b: SelectStatement) contn -> planCoreCWith runner outer contn ctx (br
   `Div` は `MinValue / -1` だけを桁あふれにし、`Mod` は `b = -1L` を 0 で返す。
   どちらも `Eval.intArith` で明示する（0 除算は `arith` が先に弾いている）。
 - **`decimal` の乗算は `|b| < 1` を桁あふれにしない**。
-  旧実装は `aa > maxD * bb` で判定しており、`MaxValue * 0.5` を誤って桁あふれにしていた
-  （`|b| < 1` なら `|a * b| < |a| <= MaxValue` なので必ず範囲内）。
+  `|b| < 1` なら `|a * b| < |a| <= MaxValue` なので必ず範囲内。
   判定は `bb >= 1M && aa > maxD / bb`。
 - **`decimal` の除算は逆に `|b| < 1` で桁あふれし得る**（`|a| > maxD * |b|` が判定）。
 - `decimal` は `MinValue = -MaxValue` の対称な範囲なので `abs` は桁あふれしない

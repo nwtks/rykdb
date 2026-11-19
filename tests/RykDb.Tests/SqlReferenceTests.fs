@@ -137,7 +137,7 @@ let ``SqlReference: LIMIT の定数式と負数`` () =
         expectErrorKind ErrorKind.SyntaxError "LIMIT -1 はエラー" (execSql db2 "SELECT id FROM t LIMIT -1")
         expectError "LIMIT に列参照は使えない" (execSql db2 "SELECT id FROM t LIMIT id")
 
-        // LIMIT 0 は 0 行（従来どおり）
+        // LIMIT 0 は 0 行
         let _, none = ok (execSql db2 "SELECT id FROM t LIMIT 0")
         Assert.Empty none.Rows)
 
@@ -1506,7 +1506,7 @@ let ``SqlReference: JOIN の WHERE は右テーブルと横断述語に効く`` 
         Assert.Equal<int>(1, rightOnly.Rows.Length)
         Assert.Equal<int64>(1L, asInt rightOnly.Rows.[0].[0])
 
-        // 非修飾でも一意に決まる列（amount は orders だけ）は従来どおり pushdown できる
+        // 非修飾でも一意に決まる列（amount は orders だけ）は pushdown できる
         let _, unqualifiedUnique =
             ok (
                 execSql
@@ -2055,7 +2055,7 @@ let ``SqlReference: VARCHAR(1) は値を切り詰めない`` () =
 
 [<Fact>]
 let ``SqlReference: CHAR は型名として受け付けない`` () =
-    // §3: TEXT の別綴りは VARCHAR のみ。CHAR は削除済み。
+    // §3: TEXT の別綴りは VARCHAR のみ。
     withSession "char-removed" (fun db0 ->
         expectErrorKind
             ErrorKind.SyntaxError

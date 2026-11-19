@@ -48,7 +48,7 @@ F# の型システムでは表現できないため、
 | INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`                             | `Memtable.fsi`（構築は `Empty` / `insert` / `apply` に限定）+ `Memtable.insert` の会計とランダム挿入・順序独立性のプロパティテスト                                                                                             | ✅ 完了 |
 | INV-15 | `RowReader` は Reading / Exhausted / Closed のいずれか                       | `RowReaderState`（状態 DU に置き換え、`releaseTo` が遷移と 1回解放を担当）                                                                                                                                                     | ✅ 完了 |
 | INV-16 | `Session` のロック規約                                                       | `stateGate` / `writeGate` の設計 + `SessionTests` の並行テスト 6 本                                                                                                                                                            | ✅ 完了 |
-| INV-17 | lease の所有権                                                               | `ProcessLockLease.ForceRelease`（二重解放は無害） + `TxnState.Lease` の `RegistrationLease`（GC で解除） + `DatabaseTests` の GC 回帰テスト                                                                                    | ✅ 完了 |
+| INV-17 | lease の所有権                                                               | `ProcessLockLease.ForceRelease`（二重解放は無害） + `TxnState.Lease` の `RegistrationLease`（GC で解除） + `DatabaseHostTests` の GC 回帰テスト                                                                                | ✅ 完了 |
 | INV-18 | `Expr.children` / `plugChildren` の arity                                    | `Expr.plugChildren`（モジュールレベルへ引き上げ）+ `AstTests` の全ノード種テスト                                                                                                                                               | ✅ 完了 |
 | INV-19 | 保持する側はキー・行の所有権を複製で取り込む                                 | `Entry.takeOwnership` / `Transaction.setSlot` の複製と回帰テスト                                                                                                                                                               | ✅ 完了 |
 | INV-20 | `Writer.Chunks` は逆順（先頭が最新の書き込み）                               | `Writer.fsi`（ケース非公開、構築は `Empty` / 各 write 関数に限定）+ 順序プロパティテスト                                                                                                                                       | ✅ 完了 |
@@ -137,9 +137,8 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 - `sprintf "%d"` / `max` / `compare` / `Map` / `Set` は単位付きのまま使える。
   使えないのは**単位が付いたリテラル**と**素との加減算**だけ
   （`1UL` → `1UL<txnId>`、`LanguagePrimitives.UInt64WithMeasure`）。
-- 実際に効いた箇所（ともにビルド時に FS0001）:
-  - `Manifest.logAndApply dir 1L` ← `1L` は file number 扱いで拒否された
-  - `StorageEngine.NextTxnId = 1UL` ← `NextSeqNo`（素の uint64）との取り違えを拒否
+- `Manifest.logAndApply` の第 2 引数は `int64<manifestNo>`（例: `1L<manifestNo>`）。
+  素の `1L` を渡すと file number 扱いで FS0001 になる。
 - 単位は実行時に消えるのでコストは 0。
   `Manifest` / `StorageEngine` / `VersionSet` / `Transactions` / `Wal` / `ExecContext`
   と対応テストが対象。
@@ -158,8 +157,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `TransactionManager: Active の snapshot が未来なら検出`
   - `TransactionManager: LastCommitted の範囲外を検出`
   - `TransactionManager: begin/put/commit/abort を繰り返しても不変条件を保つ`
-- 補足: 以前の `TxnRecord.Keys` は更新されない死んだフィールドだったため削除した。
-  `Active` は `Map<TxnId, Transaction>` で直接持つ。
+- `Active` は `Map<TxnId, Transaction>` で直接持つ。
 
 ### INV-06 Version
 
@@ -270,7 +268,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 ### INV-15 RowReader の状態
 
 - 宣言: `Reading` / `Exhausted` / `Closed` のいずれか 1 つ。
-- 理由: 以前は `closed` / `exhausted` の bool 2 つで、
+- 理由: `closed` / `exhausted` の bool 2 つでは
   「終端後」と「Dispose 後」の区別が**判定の順序に依存**し、
   両方が true になる状態も作れた。
 - 担保:
@@ -326,8 +324,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
     `children` は「子を状態へ積む `step`」、`plugChildren` は「未使用の子を渡す `step`」
     として同じ match から導出するので、ノードを追加したときに直す場所は 1箇所。
     さらにこの match は網羅検査される（欠けたケースは FS0025 = エラー）。
-  - `children` / `plugChildren` を `internal` にして直接テスト可能にした
-    （以前は private / ローカル `let` で外部から検査できなかった）。
+  - `children` / `plugChildren` は `internal` で直接テスト可能。
   - `AstTests.allNodeKinds`（29 サンプル: 葉 / 1..3 子 / 可変子 / CASE の ELSE 有無 /
     LIKE の ESCAPE 有無 / サブクエリを含む型）で 3点を検査:
     - `Expr.plugChildren: children と同じ順・同じ内容で復元する（全ノード種）`
@@ -484,9 +481,9 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 - 宣言: 全接続で共有する確定状態 `Committed`（`Root` / `Store` / `Catalog` / `Manager` / `DeferDurability`）は
   transaction のフィールドを持たない。接続ローカルの transaction は `TxnState`
   （`CatalogAtBegin` / `Active` / `Pending` / `Lease`）だけが持つ。
-- 理由: 以前の `DbState` は確定状態と transaction を 1つのレコードに同居させていたため、
-  committed を publish するたびに `Active = None; Pending = None; ActiveRegistration = None` を
-  書き足す必要があり、埋め忘れると「確定状態に transaction が載る」状態を作れた。
+- 理由: 確定状態と transaction を 1つのレコードに同居させると、
+  committed を publish するたびに transaction 系フィールドを空に書き足す必要があり、
+  埋め忘れると「確定状態に transaction が載る」状態を作れた。
 - 担保:
   - `Committed` に transaction 系のフィールドが無い（型として作れない）。
   - `HostLifecycle` は `Running of Committed` / `Closed of Committed` だけを持つ。
@@ -509,7 +506,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `Eval.Prepared` は `Eval.prepare` が計画時に作る不変の `ImmutableDictionary` を持つ。
     参照列とリテラル LIKE を 1回で解決・コンパイルし、行ごとに再解決しない。
   - `FileMetaData.ReadInfo`（`SstReadInfo`）は書き出し時または open 時の hydrate で 1回だけ作り、
-    不変の `Version` に載せる。DB・プロセス寿命のキャッシュ（`SstCache`）は削除した。
+    不変の `Version` に載せる。DB・プロセス寿命のキャッシュは持たない。
   - 残る可変コレクションは `coding-conventions.md` §2 の許可リスト
     （Session 層の状態 DU・`EngineHost` の CAS セル・`ProcessLock` / `Transactions` の台帳・
     演算子の作業用コレクション）に限る。

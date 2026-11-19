@@ -5,7 +5,6 @@
 // （MVCC / WAL / プロセスロック / 索引の backfill・後始末）を検証する。
 // `DatabaseHost` の共有状態（snapshot 登録・グループコミット）は
 // DatabaseHostTests.fs にある。SQL の構文・意味論は SqlReferenceTests.fs にある。
-// `Database`（internal の不変ハンドル）は 2026-11-17 に廃止した。
 // ===========================================================================
 
 module RykDb.DatabaseTests

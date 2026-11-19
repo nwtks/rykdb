@@ -25,7 +25,7 @@ type internal Row = SqlValue array
 /// 元の `Op` をもう一度 `next` してはいけない
 /// （`Step` は同じ行を再び返し、`Compute` は継続を巻き戻す）。
 /// 構築は `empty` / `ofRow` / `emit` / `compute` / `ofArray` に限る
-/// （`OpTests` が直接ケースを使っていないことを検査する）。
+/// （`.fsi` でケースを隠して守る）。
 /// </remarks>
 [<RequireQualifiedAccess>]
 type internal Op =
@@ -142,7 +142,7 @@ module internal Op =
 
     /// 全行を上限つきで配列に materialize する。
     /// 上限を超えたら `CapacityError` を返し、部分結果は返さない。
-    /// 上限が負なら無制限（`SessionOptions` の `-1`、または `Database` の `ResultLimits.Unlimited`）。
+    /// 上限が負なら無制限（`SessionOptions` の `-1`、または `ResultLimits.Unlimited`）。
     let toArrayLimited (maxRows: int64) (maxBytes: int64) (op: Op) =
         let rowLimit = maxRows >= 0L
         let byteLimit = maxBytes >= 0L

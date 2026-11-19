@@ -6,7 +6,7 @@ namespace RykDb.Core
 
 module internal Plan =
     /// IN サブクエリの結果を保持する上限（管理メモリの概算バイト）。
-    /// `Ops` の JOIN と同じ考え方で、OOM ではなく `CapacityError` で止める。
+    /// 上限超過は OOM ではなく `CapacityError` で止める。
     let private SubqueryBudgetBytes = 256L * 1024L * 1024L
 
     /// IN サブクエリの行を上限付きで集める。
@@ -779,7 +779,7 @@ module internal Plan =
     /// 外側参照を値へ置換した文を渡すので、ここから先は通常のサブクエリ解決と同じ経路を通る。
     /// <remarks>
     /// 入れ子の相関サブクエリも同じ手順で実行するため、自分自身を runner として
-    /// planner に渡す必要があり `let rec` にしている。
+    /// 計画関数 `planSelectCWith` に渡す必要があり `let rec` にしている。
     /// 実際の再帰呼び出しは `Run` の末尾位置（`Result.bind` の継続）で起きるので、
     /// 外側行が増えてもフレームは積み上がらない。
     /// </remarks>

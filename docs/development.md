@@ -96,7 +96,8 @@ xUnit。
 （公開 API の `Session` / `SessionPool` で内部機構を検証する）。
 `ProcessLock.fs` / `EngineHost.fs` は専用ファイルを持たず、
 `RowStoreTests` / `BackgroundCompactionTests` / `DatabaseTests` で間接的に検証する。
-`DurabilityTests` / `OrderingPropertyTests` は横断的な性質テスト、`CliTests` は CLI 全体のテスト。
+`DatabaseHostTests` の `CommitDurability:` / `SerializationTests` の `順序保持:` は横断的な性質テスト、
+`CliTests` は CLI 全体のテスト。
 [`sql-reference.md`](sql-reference.md) が扱う構文・意味論は `SqlReferenceTests.fs`。
 
 ```bash
@@ -184,11 +185,10 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
     **計画・実行の変更はこの 3 本を見る**（`PointLookup` は plan が支配的で、ストレージの変化が埋もれる）。
     `Session.PrepareSelect`（internal）で計画だけを組み、`Optimizer.exec` + `Op.toArrayLimited` を繰り返す。
     実行のたびに `Scope.DisposeAll()` を呼ぶ。
-  - `Insert100Rows` / `Insert10kRows`（2,000行 × 5文を 1 transaction で流して ROLLBACK）
+  - `Insert100Rows`（100行 × 1文）/ `Insert10kRows`（2,000行 × 5文を 1 transaction で流して ROLLBACK）
   - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
-  - `MatchesLiteral` / `MatchesColumn` / `MatchesBinary` / `MatchesComplex` — DB を使わない式評価器のマイクロベンチ
-  - `MatchesComplexV` / `MatchesComplexJoined` / `MatchesComplexJoinedV` —
-    `DbResult` 版と `Result` 版、JOIN の ON 句
+  - `MatchesLiteralV` / `MatchesColumnV` / `MatchesBinaryV` / `MatchesComplexV` — DB を使わない式評価器のマイクロベンチ
+  - `MatchesComplexJoinedV` — JOIN の ON 句の式評価
   - `CompareValuesV` — `SqlValue.compareValuesV` の割当
   - `OpMaterialize` / `OpFilterMapTake` / `NextStep` —
     DB を使わない pull 層（`Op.ofArray` / `filter` / `map` / `skip` / `take` / `Op.next`）のマイクロベンチ

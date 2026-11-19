@@ -92,7 +92,7 @@ module internal Bytes =
 
 /// エントリの並び順（キー昇順・同一キーは SeqNo 降順）の**唯一の定義**。
 /// memtable の `Entry` と SSTable の `SstEntry` は必ずこれを経由する
-/// （2実装になると片方だけ壊れる。`OrderingPropertyTests` が一致を検査する）。
+/// （2実装になると片方だけ壊れる。`SerializationTests` の `順序保持:` が検査する）。
 module internal KeyOrder =
     let compare (keyA: byte array) (seqA: uint64) (keyB: byte array) (seqB: uint64) =
         match Bytes.compare keyA keyB with

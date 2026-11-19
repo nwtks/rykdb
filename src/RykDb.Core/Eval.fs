@@ -72,7 +72,7 @@ module internal Eval =
         | Div
         | Mod
 
-    /// LIKE 照合。コンパイル失敗は偽（ESCAPE なしの従来の `Match` と同じ振る舞い）。
+    /// LIKE 照合。コンパイル失敗は偽（ESCAPE なしの単純一致と同じ振る舞い）。
     let private likeMatches (resolve: Prepared) (escape: int) (pattern: string) (text: string) =
         match resolve.Like escape pattern with
         | Ok compiled -> Scalar.matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text)

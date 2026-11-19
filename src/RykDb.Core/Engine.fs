@@ -208,7 +208,7 @@ module internal Ddl =
 
     /// DDL を排他の内側で実行する。
     /// <remarks>
-    /// - 書き込み中の文があれば、それが終わるまで待つ（`RootGate` の共有ロック）。
+    /// - 書き込み中の文があれば、それが終わるまで待つ（`RootRuntime` の共有ロック）。
     /// - 実行中の transaction があれば **待たずに ConflictError** にする。
     ///   古いスキーマで計算した索引エントリを commit されると、索引に載らない行ができるため。
     ///   待つと、commit されないまま残った transaction で永久に止まるので失敗側に倒す。
@@ -851,7 +851,7 @@ module internal Engine =
                 ctx.Scope.DisposeAll()
 
     /// EXPLAIN: 実行計画を組み立て、木を 1行 1ノードの文字列にして返す。
-    /// クエリ本体は実行しない（ただしサブクエリは計画時に評価される。Planner の計画経路と同じ）。
+    /// クエリ本体は実行しない（ただしサブクエリは計画時に評価される）。
     let private runExplain (limits: ResultLimits) (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
         contextOf limits.Budget state txn
         >>= fun ctx ->
