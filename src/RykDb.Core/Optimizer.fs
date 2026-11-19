@@ -364,24 +364,24 @@ module internal Optimizer =
                                 left
                                 frame.LeftKeyIndices
                                 frame.RightSchema
-                                (lookup frame indexName scanMask fetchMask)
                                 keys.Residual
+                                (lookup frame indexName scanMask fetchMask)
                         | JoinKind.Left ->
                             OpsJoin.leftJoinIndexed
                                 frame.LeftSchema
                                 left
                                 frame.LeftKeyIndices
                                 frame.RightSchema
-                                (lookup frame indexName scanMask fetchMask)
                                 keys.Residual
+                                (lookup frame indexName scanMask fetchMask)
                 }
 
         let execJoin frame left right =
             match frame.Algorithm with
             | JoinAlgorithm.NestedLoop ->
                 match frame.Kind with
-                | JoinKind.Inner -> OpsJoin.innerJoin frame.LeftSchema left frame.RightSchema right frame.On
-                | JoinKind.Left -> OpsJoin.leftJoin frame.LeftSchema left frame.RightSchema right frame.On
+                | JoinKind.Inner -> OpsJoin.innerJoin ctx.Budget frame.LeftSchema left frame.RightSchema right frame.On
+                | JoinKind.Left -> OpsJoin.leftJoin ctx.Budget frame.LeftSchema left frame.RightSchema right frame.On
             | JoinAlgorithm.HashJoin ->
                 match frame.Keys with
                 | None -> err (DbError.internalError "ハッシュ結合に結合キーがありません")
@@ -389,6 +389,7 @@ module internal Optimizer =
                     match frame.Kind with
                     | JoinKind.Inner ->
                         OpsJoin.innerJoinHash
+                            ctx.Budget
                             frame.LeftSchema
                             left
                             keys.LeftIndices
@@ -398,6 +399,7 @@ module internal Optimizer =
                             keys.Residual
                     | JoinKind.Left ->
                         OpsJoin.leftJoinHash
+                            ctx.Budget
                             frame.LeftSchema
                             left
                             keys.LeftIndices
@@ -414,6 +416,7 @@ module internal Optimizer =
                     match frame.Kind with
                     | JoinKind.Inner ->
                         OpsJoin.innerJoinMerge
+                            ctx.Budget
                             frame.LeftSchema
                             left
                             keys.LeftIndices
@@ -423,6 +426,7 @@ module internal Optimizer =
                             keys.Residual
                     | JoinKind.Left ->
                         OpsJoin.leftJoinMerge
+                            ctx.Budget
                             frame.LeftSchema
                             left
                             keys.LeftIndices
@@ -488,15 +492,15 @@ module internal Optimizer =
                 | DerivedFrame outer -> run outer rest (ApplyOp op)
                 | FilterFrame(p, childSchema) -> run ctx rest (ApplyOp(Ops.filter childSchema p op))
                 | AggregateFrame(groupBy, aggs, inSchema) ->
-                    match Ops.aggregate inSchema groupBy aggs op with
+                    match Ops.aggregate ctx.Budget inSchema groupBy aggs op with
                     | Error e -> err e
                     | Ok aggregated -> run ctx rest (ApplyOp aggregated)
                 | HavingFrame(h, aggs, groupBy) ->
                     let p = Ops.havingFilter groupBy aggs h
                     run ctx rest (ApplyOp(Op.filter p op))
-                | DistinctFrame -> run ctx rest (ApplyOp(Ops.distinct op))
+                | DistinctFrame -> run ctx rest (ApplyOp(Ops.distinct ctx.Budget op))
                 | SortFrame(keys, childSchema) ->
-                    match Ops.sortBy childSchema keys op with
+                    match Ops.sortBy ctx.Budget childSchema keys op with
                     | Error e -> err e
                     | Ok sorted -> run ctx rest (ApplyOp sorted)
                 | LimitFrame(offset, limit) ->

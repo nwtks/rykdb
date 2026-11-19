@@ -767,6 +767,7 @@ module internal ValueCodec =
             | 9uy ->
                 let! bs, c = Reader.readBytes 16 c
                 return System.Guid bs |> SqlValue.Uuid, c
+            | 10uy -> return SqlValue.Unloaded, c
             | _ -> return! err (sprintf "ValueCodec: 不明な型タグ %d" (int tag) |> DbError.corruption)
         }
 
@@ -776,6 +777,24 @@ module internal ValueCodec =
         let arr = Seq.toArray values
         let withCount = w |> Writer.varint (uint64 arr.Length)
         foldOk writeValue withCount arr
+
+    /// 一時ファイル（スピル）用: `SqlValue.Unloaded` を含む行も書き出す。
+    /// <remarks>
+    /// 列マスクで「不要」とされた列は `Unloaded` のまま行に残る。
+    /// 退避した行を読み戻したときに列位置がずれないよう、タグ 10 のプレースホルダとして往復させる。
+    /// 永続化（WAL / SSTable）には使わないこと
+    /// （`writeValues` は従来どおり `Unloaded` を拒否する）。
+    /// </remarks>
+    let writeValuesSparse (values: SqlValue seq) (w: Writer) =
+        let arr = Seq.toArray values
+        let withCount = w |> Writer.varint (uint64 arr.Length)
+
+        let write w =
+            function
+            | SqlValue.Unloaded -> ret (w |> Writer.writeByte 10uy)
+            | v -> writeValue w v
+
+        foldOk write withCount arr
 
     let private writeInt64LETo (out: byte array) (pos: int) (v: int64) =
         let u = uint64 v
@@ -965,7 +984,7 @@ module internal ValueCodec =
         | SqlValue.Date _ -> Some 9
         | SqlValue.Timestamp _ -> Some 9
         | SqlValue.Uuid _ -> Some 17
-        | SqlValue.Unloaded -> Some 0
+        | SqlValue.Unloaded -> Some 1
         | SqlValue.Text _
         | SqlValue.Blob _ -> None
 

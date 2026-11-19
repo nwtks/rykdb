@@ -1,6 +1,6 @@
 # コーディング規約
 
-RykDb（**.NET 10 / F# 10**）を書くときの規約。
+RykDb を書くときの規約。
 設計の全体像は [`architecture.md`](architecture.md)、
 実際に踏んだ落とし穴は [`gotchas.md`](gotchas.md) を参照。
 

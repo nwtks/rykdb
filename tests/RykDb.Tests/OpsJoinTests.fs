@@ -8,6 +8,18 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
+/// 既存のテストは「上限なし（スピルしない）」の従来挙動を検証する。
+/// スピル経路は専用のバジェットで別途テストする。
+module private UnlimitedOpsJoin =
+    let innerJoin = OpsJoin.innerJoin MemoryBudget.Unlimited
+    let leftJoin = OpsJoin.leftJoin MemoryBudget.Unlimited
+    let innerJoinHash = OpsJoin.innerJoinHash MemoryBudget.Unlimited
+    let leftJoinHash = OpsJoin.leftJoinHash MemoryBudget.Unlimited
+    let innerJoinMerge = OpsJoin.innerJoinMerge MemoryBudget.Unlimited
+    let leftJoinMerge = OpsJoin.leftJoinMerge MemoryBudget.Unlimited
+    let innerJoinIndexed = OpsJoin.innerJoinIndexed
+    let leftJoinIndexed = OpsJoin.leftJoinIndexed
+
 let private leftSchema =
     outSchema [ outCol "lid" (Some "l") (Some DataType.Integer) ]
 
@@ -26,7 +38,7 @@ let ``結合: INNER JOIN`` () =
     let on = Expr.Binary(BinaryOp.Eq, lcol, rcol)
 
     let rows =
-        ok (Op.toArray (ok (OpsJoin.innerJoin leftSchema left rightSchema right on)))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.innerJoin leftSchema left rightSchema right on)))
 
     Assert.Equal<int>(2, rows.Length)
     Assert.Equal<int64>(2L, asInt rows.[0].[0])
@@ -39,13 +51,11 @@ let ``結合: LEFT JOIN は一致が無ければ NULL`` () =
     let on = Expr.Binary(BinaryOp.Eq, lcol, rcol)
 
     let rows =
-        ok (Op.toArray (ok (OpsJoin.leftJoin leftSchema left rightSchema right on)))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.leftJoin leftSchema left rightSchema right on)))
 
     Assert.Equal<int>(2, rows.Length)
-
     // 1 は一致が無いので右が NULL
     Assert.True(SqlValue.isNull rows.[0].[1])
-
     // 2 は一致
     Assert.Equal<int64>(2L, asInt rows.[1].[1])
 
@@ -57,7 +67,7 @@ let ``結合: ハッシュ INNER JOIN`` () =
     let right = Op.ofArray [| [| SqlValue.Int 2L |]; [| SqlValue.Int 3L |] |]
 
     let rows =
-        ok (Op.toArray (ok (OpsJoin.innerJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.innerJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
 
     Assert.Equal<int>(2, rows.Length)
     Assert.Equal<int64>(2L, asInt rows.[0].[0])
@@ -69,7 +79,7 @@ let ``結合: ハッシュ LEFT JOIN は一致が無ければ NULL`` () =
     let right = Op.ofArray [| [| SqlValue.Int 2L |] |]
 
     let rows =
-        ok (Op.toArray (ok (OpsJoin.leftJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.leftJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
 
     Assert.Equal<int>(2, rows.Length)
     Assert.True(SqlValue.isNull rows.[0].[1])
@@ -81,7 +91,7 @@ let ``結合: ハッシュ結合は NULL キーを一致させない`` () =
     let right = Op.ofArray [| [| SqlValue.Null |]; [| SqlValue.Int 2L |] |]
 
     let rows =
-        ok (Op.toArray (ok (OpsJoin.innerJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.innerJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
 
     Assert.Equal<int>(1, rows.Length)
     Assert.Equal<int64>(2L, asInt rows.[0].[0])
@@ -116,7 +126,11 @@ let ``結合: ハッシュ結合は残りの ON 句を評価する`` () =
 
     // キー a だけでは 2 行候補。b > 15 で 1 行に絞る。
     let rows =
-        ok (Op.toArray (ok (OpsJoin.innerJoinHash leftSchema2 left [| 0 |] rightSchema2 right [| 0 |] (Some residual))))
+        ok (
+            Op.toArray (
+                ok (UnlimitedOpsJoin.innerJoinHash leftSchema2 left [| 0 |] rightSchema2 right [| 0 |] (Some residual))
+            )
+        )
 
     Assert.Equal<int>(1, rows.Length)
     Assert.Equal<int64>(20L, asInt rows.[0].[3])
@@ -130,7 +144,7 @@ let ``結合: マージ INNER JOIN は重複キーを掛け合わせる`` () =
         Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 1L |]; [| SqlValue.Int 3L |] |]
 
     let rows =
-        ok (Op.toArray (ok (OpsJoin.innerJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.innerJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
 
     // キー 1 の 2×2。キー 2 / 3 は一致しない。
     Assert.Equal<int>(4, rows.Length)
@@ -142,7 +156,7 @@ let ``結合: マージ LEFT JOIN は一致が無ければ NULL`` () =
     let right = Op.ofArray [| [| SqlValue.Int 2L |] |]
 
     let rows =
-        ok (Op.toArray (ok (OpsJoin.leftJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.leftJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
 
     Assert.Equal<int>(2, rows.Length)
     Assert.True(SqlValue.isNull rows.[0].[1])
@@ -154,7 +168,7 @@ let ``結合: マージ結合は NULL キーを一致させない`` () =
     let right = Op.ofArray [| [| SqlValue.Null |]; [| SqlValue.Int 2L |] |]
 
     let rows =
-        ok (Op.toArray (ok (OpsJoin.innerJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.innerJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
 
     Assert.Equal<int>(1, rows.Length)
     Assert.Equal<int64>(2L, asInt rows.[0].[0])
@@ -193,7 +207,11 @@ let ``結合: マージ結合は複合キーと残りの ON 句を評価する``
             |]
 
     let rows =
-        ok (Op.toArray (ok (OpsJoin.innerJoinMerge leftSchema2 left [| 0; 1 |] rightSchema2 right [| 0; 1 |] None)))
+        ok (
+            Op.toArray (
+                ok (UnlimitedOpsJoin.innerJoinMerge leftSchema2 left [| 0; 1 |] rightSchema2 right [| 0; 1 |] None)
+            )
+        )
 
     Assert.Equal<int>(2, rows.Length)
     Assert.Equal<int64>(20L, asInt rows.[0].[1])
@@ -207,7 +225,9 @@ let ``結合: マージ結合は複合キーと残りの ON 句を評価する``
 
     let rows2 =
         ok (
-            Op.toArray (ok (OpsJoin.innerJoinMerge leftSchema2 left [| 0 |] rightSchema2 right [| 0 |] (Some residual)))
+            Op.toArray (
+                ok (UnlimitedOpsJoin.innerJoinMerge leftSchema2 left [| 0 |] rightSchema2 right [| 0 |] (Some residual))
+            )
         )
 
     Assert.Equal<int>(4, rows2.Length)
@@ -234,15 +254,31 @@ let ``結合: マージ結合はハッシュ結合と同じ行を返す`` () =
 
         let merged =
             if isLeft then
-                ok (Op.toArray (ok (OpsJoin.leftJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+                ok (
+                    Op.toArray (
+                        ok (UnlimitedOpsJoin.leftJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)
+                    )
+                )
             else
-                ok (Op.toArray (ok (OpsJoin.innerJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+                ok (
+                    Op.toArray (
+                        ok (UnlimitedOpsJoin.innerJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)
+                    )
+                )
 
         let hashed =
             if isLeft then
-                ok (Op.toArray (ok (OpsJoin.leftJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+                ok (
+                    Op.toArray (
+                        ok (UnlimitedOpsJoin.leftJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)
+                    )
+                )
             else
-                ok (Op.toArray (ok (OpsJoin.innerJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+                ok (
+                    Op.toArray (
+                        ok (UnlimitedOpsJoin.innerJoinHash leftSchema left [| 0 |] rightSchema right [| 0 |] None)
+                    )
+                )
 
         Assert.Equal<int>(hashed.Length, merged.Length)
 
@@ -265,7 +301,7 @@ let ``結合: インデックス入れ子ループ（INNER / LEFT）`` () =
         | _ -> Ok Op.Empty
 
     let inner =
-        ok (Op.toArray (OpsJoin.innerJoinIndexed leftSchema left [| 0 |] rightSchema lookup None))
+        ok (Op.toArray (UnlimitedOpsJoin.innerJoinIndexed leftSchema left [| 0 |] rightSchema None lookup))
 
     Assert.Equal<int>(2, inner.Length)
     Assert.Equal<int64>(2L, asInt inner.[0].[0])
@@ -274,7 +310,7 @@ let ``結合: インデックス入れ子ループ（INNER / LEFT）`` () =
     let left2 = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
 
     let leftRows =
-        ok (Op.toArray (OpsJoin.leftJoinIndexed leftSchema left2 [| 0 |] rightSchema lookup None))
+        ok (Op.toArray (UnlimitedOpsJoin.leftJoinIndexed leftSchema left2 [| 0 |] rightSchema None lookup))
 
     Assert.Equal<int>(2, leftRows.Length)
     Assert.True(SqlValue.isNull leftRows.[0].[1])
@@ -291,7 +327,7 @@ let ``結合: INNER JOIN の ON 評価失敗は Error になる`` () =
     let on = Expr.Binary(BinaryOp.Eq, div0, Expr.Literal(Literal.Int 0L))
 
     // 黙って空結果にせず、エラーとして呼び出し元へ返す。
-    expectError "ON の評価失敗が握り潰されています" (Op.toArray (ok (OpsJoin.innerJoin leftSchema left rightSchema right on)))
+    expectError "ON の評価失敗が握り潰されています" (Op.toArray (ok (UnlimitedOpsJoin.innerJoin leftSchema left rightSchema right on)))
 
 [<Fact>]
 let ``結合: LEFT JOIN の ON 評価失敗も Error になる`` () =
@@ -309,4 +345,224 @@ let ``結合: LEFT JOIN の ON 評価失敗も Error になる`` () =
             Expr.Binary(BinaryOp.Eq, div0, Expr.Literal(Literal.Int 0L))
         )
 
-    expectError "ON の評価失敗が握り潰されています" (Op.toArray (ok (OpsJoin.leftJoin leftSchema left rightSchema right on)))
+    expectError "ON の評価失敗が握り潰されています" (Op.toArray (ok (UnlimitedOpsJoin.leftJoin leftSchema left rightSchema right on)))
+
+/// スピルを強制する小さな作業領域（一時ファイルもこのディレクトリへ）。
+let private tightBudget (dir: string) (bytes: int64) =
+    { MemoryBudget.Default with
+        Work = bytes
+        Sort = bytes
+        Directory = Some dir
+    }
+
+/// 行の並びを順序非依存の文字列にする（結合アルゴリズムが変わっても比較できる）。
+let private rowsText (rows: SqlValue array array) =
+    rows
+    |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
+    |> Array.sort
+    |> String.concat "|"
+
+/// 退避に使った一時ファイルが残っていないことを確かめる。
+let private assertNoLeftovers (dir: string) =
+    let files = System.IO.Directory.GetFiles dir
+
+    if files.Length > 0 then
+        Assert.Fail(sprintf "一時ファイルが残っています: %A" (files |> Array.map System.IO.Path.GetFileName))
+
+/// 重複キーを含む左右の入力（左 40行 / 右 24行）。
+let private dupLeft () =
+    Op.ofArray [| for i in 0..39 -> [| SqlValue.Int(int64 (i % 5)) |] |]
+
+let private dupRight () =
+    Op.ofArray [| for i in 0..23 -> [| SqlValue.Int(int64 (i % 8)) |] |]
+
+let private onEq = Expr.Binary(BinaryOp.Eq, lcol, rcol)
+
+[<Fact>]
+let ``結合: 入れ子ループは右を退避しても結果が変わらない`` () =
+    withDir "join-nested-spill" (fun dir ->
+        let baseline =
+            ok (Op.toArray (ok (UnlimitedOpsJoin.innerJoin leftSchema (dupLeft ()) rightSchema (dupRight ()) onEq)))
+
+        let spilled =
+            ok (
+                Op.toArray (
+                    ok (OpsJoin.innerJoin (tightBudget dir 1L) leftSchema (dupLeft ()) rightSchema (dupRight ()) onEq)
+                )
+            )
+
+        Assert.Equal<int>(120, baseline.Length)
+        Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: 入れ子ループの LEFT JOIN も右を退避すると NULL 拡張が同じ`` () =
+    withDir "join-nested-left-spill" (fun dir ->
+        let baseline =
+            ok (Op.toArray (ok (UnlimitedOpsJoin.leftJoin leftSchema (dupLeft ()) rightSchema (dupRight ()) onEq)))
+
+        let spilled =
+            ok (
+                Op.toArray (
+                    ok (OpsJoin.leftJoin (tightBudget dir 1L) leftSchema (dupLeft ()) rightSchema (dupRight ()) onEq)
+                )
+            )
+
+        Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: ハッシュ結合は右が上限を超えるとマージ結合へ切り替わり結果が同じ`` () =
+    withDir "join-hash-spill" (fun dir ->
+        let baseline =
+            ok (
+                Op.toArray (
+                    ok (
+                        UnlimitedOpsJoin.innerJoinHash
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        let spilled =
+            ok (
+                Op.toArray (
+                    ok (
+                        OpsJoin.innerJoinHash
+                            (tightBudget dir 1L)
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: ハッシュの LEFT JOIN も退避すると結果が同じ`` () =
+    withDir "join-hash-left-spill" (fun dir ->
+        let baseline =
+            ok (
+                Op.toArray (
+                    ok (
+                        UnlimitedOpsJoin.leftJoinHash
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        let spilled =
+            ok (
+                Op.toArray (
+                    ok (
+                        OpsJoin.leftJoinHash
+                            (tightBudget dir 1L)
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: マージ結合は同一キーのグループを退避しても結果が同じ`` () =
+    withDir "join-merge-spill" (fun dir ->
+        let baseline =
+            ok (
+                Op.toArray (
+                    ok (
+                        UnlimitedOpsJoin.innerJoinMerge
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        let spilled =
+            ok (
+                Op.toArray (
+                    ok (
+                        OpsJoin.innerJoinMerge
+                            (tightBudget dir 1L)
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: マージの LEFT JOIN もグループを退避すると NULL 拡張が同じ`` () =
+    withDir "join-merge-left-spill" (fun dir ->
+        let baseline =
+            ok (
+                Op.toArray (
+                    ok (
+                        UnlimitedOpsJoin.leftJoinMerge
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        let spilled =
+            ok (
+                Op.toArray (
+                    ok (
+                        OpsJoin.leftJoinMerge
+                            (tightBudget dir 1L)
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        assertNoLeftovers dir)

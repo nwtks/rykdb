@@ -661,7 +661,7 @@ module internal Plan =
                         match outerRefs plan.Input scopes plan.Tree with
                         | [] ->
                             Optimizer.exec plan.Context plan.Tree plan.Input
-                            |> Result.bind (fun op ->
+                            >>= fun op ->
                                 match Op.next op with
                                 | OpStep.OpError er -> err er
                                 | OpStep.OpDone -> k (Expr.Literal Literal.Null)
@@ -669,14 +669,14 @@ module internal Plan =
                                     match Op.next rest with
                                     | OpStep.OpError er -> err er
                                     | OpStep.OpDone -> k (Expr.Value row.[0])
-                                    | OpStep.OpRow _ -> DbError.constraintViolation twoRowsMessage |> err)
+                                    | OpStep.OpRow _ -> DbError.constraintViolation twoRowsMessage |> err
                         | refs ->
                             let run row =
                                 let withRow = withCurrentRow row scopes
 
                                 substituteStatement plan.Input withRow sel
-                                |> Result.bind (runner withRow ctx)
-                                |> Result.bind (fun (_, op) ->
+                                >>= runner withRow ctx
+                                >>= fun (_, op) ->
                                     match Op.next op with
                                     | OpStep.OpError er -> err er
                                     | OpStep.OpDone -> ret SqlValue.Null
@@ -684,7 +684,7 @@ module internal Plan =
                                         match Op.next rest with
                                         | OpStep.OpError er -> err er
                                         | OpStep.OpDone -> ret r.[0]
-                                        | OpStep.OpRow _ -> DbError.constraintViolation twoRowsMessage |> err)
+                                        | OpStep.OpRow _ -> DbError.constraintViolation twoRowsMessage |> err
 
                             k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx
@@ -697,22 +697,22 @@ module internal Plan =
                     match outerRefs plan.Input scopes plan.Tree with
                     | [] ->
                         Optimizer.exec plan.Context plan.Tree plan.Input
-                        |> Result.bind (fun op ->
+                        >>= fun op ->
                             match Op.next op with
                             | OpStep.OpError er -> err er
                             | OpStep.OpDone -> k (Expr.Literal(Literal.Bool false))
-                            | OpStep.OpRow _ -> k (Expr.Literal(Literal.Bool true)))
+                            | OpStep.OpRow _ -> k (Expr.Literal(Literal.Bool true))
                     | refs ->
                         let run row =
                             let withRow = withCurrentRow row scopes
 
                             substituteStatement plan.Input withRow sel
-                            |> Result.bind (runner withRow ctx)
-                            |> Result.bind (fun (_, op) ->
+                            >>= runner withRow ctx
+                            >>= fun (_, op) ->
                                 match Op.next op with
                                 | OpStep.OpError er -> err er
                                 | OpStep.OpDone -> ret (SqlValue.ofBool false)
-                                | OpStep.OpRow _ -> ret (SqlValue.ofBool true))
+                                | OpStep.OpRow _ -> ret (SqlValue.ofBool true)
 
                         k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx
@@ -728,12 +728,12 @@ module internal Plan =
                         match outerRefs plan.Input scopes plan.Tree with
                         | [] ->
                             Optimizer.exec plan.Context plan.Tree plan.Input
-                            |> Result.bind (fun op ->
+                            >>= fun op ->
                                 match collectSubqueryRows op with
                                 | Error er -> err er
                                 | Ok rows ->
                                     let values = rows |> Array.map (fun row -> Expr.Value row.[0]) |> Array.toList
-                                    k (Expr.InList(left, values, negated)))
+                                    k (Expr.InList(left, values, negated))
                         | refs ->
                             let currentSchema =
                                 match scopes with
@@ -746,12 +746,12 @@ module internal Plan =
                                 let withRow = withCurrentRow row scopes
 
                                 substituteStatement plan.Input withRow sel
-                                |> Result.bind (runner withRow ctx)
-                                |> Result.bind (fun (_, op) ->
+                                >>= runner withRow ctx
+                                >>= fun (_, op) ->
                                     collectSubqueryRows op
-                                    |> Result.bind (fun rows ->
+                                    >>= fun rows ->
                                         let values = rows |> Array.map (fun r -> Expr.Value r.[0]) |> Array.toList
-                                        Eval.evalWith resolve row (Expr.InList(left, values, negated))))
+                                        Eval.evalWith resolve row (Expr.InList(left, values, negated))
 
                             k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx

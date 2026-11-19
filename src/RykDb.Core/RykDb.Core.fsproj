@@ -40,6 +40,7 @@
     <Compile Include="Eval.fs" />
     <Compile Include="Op.fsi" />
     <Compile Include="Op.fs" />
+    <Compile Include="Spill.fs" />
     <Compile Include="ExtSort.fs" />
     <Compile Include="OpsJoin.fs" />
     <Compile Include="Ops.fs" />

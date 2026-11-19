@@ -53,13 +53,20 @@ type StatementResult private (rowsAffected: int, columns: string array, rows: Sq
 
 /// SELECT 結果の上限。
 /// `Int64.MaxValue` は無制限。0 は 1行も許さない。
-type internal ResultLimits = { MaxRows: int64; MaxBytes: int64 }
+type internal ResultLimits =
+    {
+        MaxRows: int64
+        MaxBytes: int64
+        /// 演算子が使ってよいメモリ作業領域とスピル先。
+        Budget: MemoryBudget
+    }
 
 module internal ResultLimits =
     let Unlimited =
         {
             MaxRows = System.Int64.MaxValue
             MaxBytes = System.Int64.MaxValue
+            Budget = MemoryBudget.Default
         }
 
 /// ストリーミング SELECT の実行状態。
@@ -819,16 +826,17 @@ module internal Engine =
 
             ret (ExecContext.withSchema t.Name withIndexes ctx)
 
-    let private contextOf (state: ExecState) (txn: Transaction) =
+    let private contextOf (budget: MemoryBudget) (state: ExecState) (txn: Transaction) =
         let ctx =
             ExecContext.create state.Store (Snapshot.toVisible txn.Snapshot)
             |> ExecContext.withTransaction txn
             |> ExecContext.withCatalog state.Catalog
+            |> ExecContext.withBudget budget
 
         state.Catalog.Tables |> foldOk (addTable state) ctx
 
     let private runSelect (limits: ResultLimits) (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
-        contextOf state txn
+        contextOf limits.Budget state txn
         >>= fun ctx ->
             try
                 Plan.runSelect ctx stmt
@@ -844,8 +852,8 @@ module internal Engine =
 
     /// EXPLAIN: 実行計画を組み立て、木を 1行 1ノードの文字列にして返す。
     /// クエリ本体は実行しない（ただしサブクエリは計画時に評価される。Planner の計画経路と同じ）。
-    let private runExplain (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
-        contextOf state txn
+    let private runExplain (limits: ResultLimits) (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
+        contextOf limits.Budget state txn
         >>= fun ctx ->
             try
                 Plan.explainSelect ctx stmt
@@ -875,7 +883,7 @@ module internal Engine =
 
         let txn = Transaction.create 0UL<txnId> snapshot
 
-        match contextOf state txn with
+        match contextOf MemoryBudget.Default state txn with
         | Error e -> err e
         | Ok ctx ->
             match Plan.explainSelect ctx stmt with
@@ -900,7 +908,7 @@ module internal Engine =
                 }
 
             let run () =
-                match contextOf startState txn with
+                match contextOf MemoryBudget.Default startState txn with
                 | Error e ->
                     state.Store.Runtime.Unregister registration
                     err e
@@ -974,11 +982,12 @@ module internal Engine =
         }
 
     let private runDml
+        (limits: ResultLimits)
         (state: ExecState)
         (txn: Transaction)
         (run: ExecContext -> Result<(Transaction * int), DbError>)
         =
-        contextOf state txn
+        contextOf limits.Budget state txn
         >>= fun ctx ->
             try
                 result {
@@ -1009,10 +1018,10 @@ module internal Engine =
     let private runStatement (limits: ResultLimits) (state: ExecState) (txn: Transaction) =
         function
         | Statement.Select stmt -> runSelect limits state txn stmt
-        | Statement.Explain stmt -> runExplain state txn stmt
-        | Statement.Insert stmt -> runInsert stmt |> runDml state txn
-        | Statement.Update stmt -> runUpdate stmt |> runDml state txn
-        | Statement.Delete stmt -> runDelete stmt |> runDml state txn
+        | Statement.Explain stmt -> runExplain limits state txn stmt
+        | Statement.Insert stmt -> runInsert stmt |> runDml limits state txn
+        | Statement.Update stmt -> runUpdate stmt |> runDml limits state txn
+        | Statement.Delete stmt -> runDelete stmt |> runDml limits state txn
         | Statement.CreateTable c -> Ddl.createTable c |> runDdl state
         | Statement.DropTable(n, ifE) -> Ddl.dropTable n ifE |> runDdl state
         | Statement.CreateIndex ci -> Ddl.createIndex ci |> runDdl state

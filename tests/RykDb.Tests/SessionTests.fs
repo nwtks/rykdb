@@ -510,16 +510,36 @@ let ``SessionOptions: 0 行上限でも 0 行の SELECT は成功する`` () =
         expectErrorKind ErrorKind.CapacityError "1行でも上限超過" (session.Execute "SELECT 1"))
 
 [<Fact>]
-let ``SessionOptions: 負の上限は開くときに CapacityError`` () =
+let ``SessionOptions: -1 は無制限、-2 以下は開くときに CapacityError`` () =
     let dir = newDir "session-invalid-options"
 
     try
-        let options =
+        // -1 は「無制限」。開けて、上限を超える行数でも返る。
+        let unlimited =
             { SessionOptions.Default with
                 MaxResultRows = -1L
+                MaxResultBytes = -1L
             }
 
-        expectErrorKind ErrorKind.CapacityError "負の行数上限はエラー" (Session.OpenWith(dir, options))
+        match Session.OpenWith(dir, unlimited) with
+        | Error e -> Assert.Fail $"無制限の上限で開けませんでした: {e.Message}"
+        | Ok session ->
+            use session = session
+            ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+
+            ok (session.Execute "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)")
+            |> ignore
+
+            let rows = ok (session.Execute "SELECT * FROM t")
+            Assert.Equal<int>(3, rows.Rows.Length)
+
+        // -2 は不正。
+        let invalid =
+            { SessionOptions.Default with
+                MaxResultRows = -2L
+            }
+
+        expectErrorKind ErrorKind.CapacityError "-2 の行数上限はエラー" (Session.OpenWith(dir, invalid))
     finally
         System.IO.Directory.Delete(dir, true)
 

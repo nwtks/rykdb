@@ -60,6 +60,7 @@ F# の型システムでは表現できないため、
 | INV-26 | 確定状態は transaction を持たない                                           | `Committed`（transaction フィールド無し）+ `HostLifecycle` が `Committed` のみを保持 + 実行時だけ `ExecState` に合成                                                                                                           | ✅ 完了 |
 | INV-27 | 並列制御以外に DB・プロセス寿命の可変キャッシュを持たない                   | `Eval.Prepared`（計画時の `ImmutableDictionary`）+ `FileMetaData.ReadInfo`（不変の `Version` に付随）+ mutable/`ConcurrentDictionary` の許可リスト（Session 層・`EngineHost`・`ProcessLock`・`Transactions`・`SstScan.Scope`） | ✅ 完了 |
 | INV-28 | 索引エントリの値は空。索引列 + 主キーはキーから復号し、非被覆列は PK lookup | `Dml.indexKeyRow` / `opOfIndexScan` / `indexAccessMasks` / `ExecContext.fetchMissing` + キー復号 golden / 索引 fetch テスト                                                                                                    | ✅ 完了 |
+| INV-29 | 退避した一時ファイルは必ず閉じ、読み切ったら消す                            | `Spill.openSink` / `closeSink` / `foldRun`（閉じて消す）/ `foldRunKeep`（閉じるだけ）/ `reopen`（消す）/ `reopenKeep`（消さない）+ `SpillTests` / `OpsTests` / `OpsJoinTests` の「一時ファイルが残らない」検査                 | ✅ 完了 |
 
 ---
 
@@ -546,6 +547,33 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `Database: UNIQUE 索引の backfill は複数の NULL を許す`
   - `SqlReference: ALTER TABLE DROP COLUMN は行と索引から列を除く`
   - `キー復号: 全型が往復する` / `キー復号: 壊れたキーは CorruptionError になる`
+
+---
+
+### INV-29 退避した一時ファイルは必ず閉じ、読み切ったら消す
+
+- 宣言: `Spill` が作る run ファイルは、
+  **書き込み後は必ず閉じ**（`closeSink`）、
+  **読み切ったら閉じて消す**（`foldRun` / `reopen`）。
+  同じ行を何度も読む用途では「閉じるだけで消さない」(`foldRunKeep` / `reopenKeep`) を使い、
+  使い終わったら `deleteSpool` で消す。
+- 理由: 途中打ち切り（`LIMIT`・`RowReader.Dispose`）で開いたままにすると
+  file descriptor が漏れ、消し忘れると一時ファイルが溜まる。
+- 担保:
+  - 書き込みは `Spill.openSink` → `writeRow`/`writeChunk` → `closeSink` の 1経路。
+  - 読み取りは 4種類だけ: `foldRun`（閉じて消す）/ `foldRunKeep`（閉じるだけ）/
+    `reopen`（消す）/ `reopenKeep`（消さない）。
+  - 分割のやり直しは `repartitionRun` が元の run を消す。
+  - 途中打ち切りで残ったものは `Spill.sweepStale` が 24時間後に回収する。
+- 回帰テスト:
+  - `Spill.spool: 上限を超えると退避し、reopen で同じ順序で読める`
+  - `Spill.spool: reopenKeep は何度でも読める`
+  - `Spill.foldRun: 終端でファイルを消す`
+  - `distinct: 上限を超えて退避しても結果と順序が変わらない`
+  - `集約: 上限を超えて退避しても結果と順序が変わらない`
+  - `結合: 入れ子ループは右を退避しても結果が変わらない`
+  - `結合: ハッシュ結合は右が上限を超えるとマージ結合へ切り替わり結果が同じ`
+  - `結合: マージ結合は同一キーのグループを退避しても結果が同じ`
 
 ---
 

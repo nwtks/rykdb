@@ -1,6 +1,6 @@
 # AGENTS.md
 
-RykDb（**.NET 10 / F# 10** の組込み RDBMS、LSM-Tree + MVCC + WAL）を開発するときの指針。
+RykDb を開発するときの指針。
 
 ## 開発の流れ
 

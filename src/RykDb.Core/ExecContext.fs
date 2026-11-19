@@ -23,6 +23,9 @@ type internal ExecContext =
         /// `Logical` はこのファイルより後に定義されるため、参照等価の `obj` キーで持つ。
         /// `Optimizer.exec` がクエリ開始時に構築する（クエリ中は不変）。
         ScanNeeds: System.Collections.Immutable.ImmutableDictionary<obj, bool array>
+        /// 演算子が使ってよいメモリ作業領域とスピル先。
+        /// クエリ開始時に 1回だけ決まる。
+        Budget: MemoryBudget
     }
 
 module internal ExecContext =
@@ -35,7 +38,11 @@ module internal ExecContext =
             Txn = Transaction.create 0UL<txnId> { SeqNo = 0UL }
             Scope = ScanScope()
             ScanNeeds = System.Collections.Immutable.ImmutableDictionary.Create<obj, bool array> HashIdentity.Reference
+            Budget = MemoryBudget.Default
         }
+
+    /// メモリ作業領域の上限を差し替える。
+    let withBudget (budget: MemoryBudget) (ctx: ExecContext) = { ctx with Budget = budget }
 
     /// スキーマを登録する（別名つきで）。
     let withSchema (alias: string) (schema: TableSchema) (ctx: ExecContext) =

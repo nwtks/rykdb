@@ -142,11 +142,17 @@ module internal Op =
 
     /// 全行を上限つきで配列に materialize する。
     /// 上限を超えたら `CapacityError` を返し、部分結果は返さない。
+    /// 上限が負なら無制限（`SessionOptions` の `-1`、または `Database` の `ResultLimits.Unlimited`）。
     let toArrayLimited (maxRows: int64) (maxBytes: int64) (op: Op) =
+        let rowLimit = maxRows >= 0L
+        let byteLimit = maxBytes >= 0L
+
         let tooLarge () =
-            DbError.capacity (
-                sprintf "SELECT 結果が上限を超えました（上限: %d 行 / %d バイト）。LIMIT を付けるか、SessionOptions で上限を変更してください" maxRows maxBytes
-            )
+            sprintf
+                "SELECT 結果が上限を超えました（上限: %s 行 / %s バイト）。LIMIT を付けるか、SessionOptions で上限を変更するか、Session.TryOpenReader で 1行ずつ読んでください"
+                (if rowLimit then sprintf "%d" maxRows else "無制限")
+                (if byteLimit then sprintf "%d" maxBytes else "無制限")
+            |> DbError.capacity
             |> err
 
         let rec drain acc count bytes cur =
@@ -154,12 +160,12 @@ module internal Op =
             | OpStep.OpError e -> err e
             | OpStep.OpDone -> ret (List.rev acc |> List.toArray)
             | OpStep.OpRow(row, nxt) ->
-                if count >= maxRows then
+                if rowLimit && count >= maxRows then
                     tooLarge ()
                 else
                     let rowBytes = int64 (ValueCodec.managedRowBytes row)
 
-                    if rowBytes > maxBytes - bytes then
+                    if byteLimit && rowBytes > maxBytes - bytes then
                         tooLarge ()
                     else
                         drain (row :: acc) (count + 1L) (bytes + rowBytes) nxt

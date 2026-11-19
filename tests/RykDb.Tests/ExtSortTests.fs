@@ -8,6 +8,10 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
+/// スピルしない既定のバジェットで `Ops.sortBy` を呼ぶ。
+module private UnlimitedOps =
+    let sortBy = Ops.sortBy MemoryBudget.Unlimited
+
 /// 2 列（a, b）のスキーマ。
 let private schema2 =
     outSchema
@@ -26,6 +30,12 @@ let private row (values: SqlValue list) = List.toArray values
 let private col (name: string) =
     Expr.Column { Qualifier = None; Name = name }
 
+/// ソートの受け皿だけを指定したバジェット（スピルを強制する）。
+let private sortBudget (bytes: int64) =
+    { MemoryBudget.Default with
+        Sort = bytes
+    }
+
 [<Fact>]
 let ``ExtSort.sortRows: バジェットが小さいと一時ファイルに溢らして整列できる`` () =
     // 1行 ≈ 数十バイト。バジェット 1 ならほぼ毎行が run として溢れる。
@@ -41,7 +51,7 @@ let ``ExtSort.sortRows: バジェットが小さいと一時ファイルに溢�
         | Error _ -> 0
 
     let sorted =
-        ok (ExtSort.sortRows 1L Map.empty (fun _ _ -> DbOk Map.empty) cmp (opOfRows shuffled))
+        ok (ExtSort.sortRows (sortBudget 1L) Map.empty (fun _ _ -> DbOk Map.empty) cmp (opOfRows shuffled))
 
     let rows = ok (Op.toArray sorted)
     Assert.Equal<int>(n, rows.Length)
@@ -77,7 +87,7 @@ let ``ExtSort.sortRows: 50000行を小さなバジェットで溢らしても整
     // バジェット 256バイト → 数百個の run が生まれる。
     // run は MaxFanIn（32）を超えるので、中間 run への multi-pass merge も通る。
     let sorted =
-        ok (ExtSort.sortRows 256L Map.empty (fun _ _ -> DbOk Map.empty) cmp (make 0))
+        ok (ExtSort.sortRows (sortBudget 256L) Map.empty (fun _ _ -> DbOk Map.empty) cmp (make 0))
 
     let rows = ok (Op.toArray sorted)
     Assert.Equal<int>(n, rows.Length)
@@ -96,6 +106,75 @@ let ``ExtSort.sortRows: 50000行を小さなバジェットで溢らしても整
     Assert.Equal<int>(0, leftovers.Length)
 
 [<Fact>]
+let ``ExtSort.sortRows: スピル先を指定しても一時ファイルが残らない`` () =
+    withDir "extsort-spill-dir" (fun dir ->
+        let budget =
+            { MemoryBudget.Default with
+                Sort = 1L
+                Directory = Some dir
+            }
+
+        let shuffled =
+            [
+                for i in 0..99 -> row [ SqlValue.Int(int64 ((i * 37 + 11) % 100)); SqlValue.Int(int64 i) ]
+            ]
+
+        let cmp (a: SqlValue array) (b: SqlValue array) =
+            match compareValues a.[0] b.[0] with
+            | Ok c -> c
+            | Error _ -> 0
+
+        let sorted =
+            ok (ExtSort.sortRows budget Map.empty (fun _ _ -> DbOk Map.empty) cmp (opOfRows shuffled))
+
+        let rows = ok (Op.toArray sorted)
+        Assert.Equal<int>(100, rows.Length)
+
+        let leftovers = System.IO.Directory.GetFiles dir
+
+        if leftovers.Length > 0 then
+            Assert.Fail(sprintf "一時ファイルが残っています: %A" (leftovers |> Array.map System.IO.Path.GetFileName)))
+
+[<Fact>]
+let ``ExtSort.sortRows: 2 本のスピル結果を交互に読める`` () =
+    // 結合の代替経路（両側を外部ソートしてマージ結合）と同じ使い方。
+    withDir "extsort-two" (fun dir ->
+        let budget =
+            { MemoryBudget.Default with
+                Sort = 1L
+                Directory = Some dir
+            }
+
+        let make (n: int) (step: int) =
+            opOfRows [ for i in 0 .. n - 1 -> row [ SqlValue.Int(int64 ((i * step) % n)) ] ]
+
+        let cmp (a: SqlValue array) (b: SqlValue array) =
+            match compareValues a.[0] b.[0] with
+            | Ok c -> c
+            | Error _ -> 0
+
+        let a = ok (ExtSort.sortRows budget () (fun () _ -> DbOk()) cmp (make 50 7))
+        let b = ok (ExtSort.sortRows budget () (fun () _ -> DbOk()) cmp (make 40 3))
+
+        // 2 本を交互に進める（片方だけを読み切らない）。
+        let rec interleave (x: Op) (y: Op) acc =
+            match Op.next x, Op.next y with
+            | OpStep.OpRow(rx, nx), OpStep.OpRow(ry, ny) -> interleave nx ny (rx :: ry :: acc)
+            | OpStep.OpRow(rx, nx), OpStep.OpDone -> interleave nx Op.Empty (rx :: acc)
+            | OpStep.OpDone, OpStep.OpRow(ry, ny) -> interleave Op.Empty ny (ry :: acc)
+            | OpStep.OpError e, _ -> failwith e.Message
+            | _, OpStep.OpError e -> failwith e.Message
+            | OpStep.OpDone, OpStep.OpDone -> List.rev acc
+
+        let all = interleave a b []
+        Assert.Equal<int>(90, all.Length)
+
+        let leftovers = System.IO.Directory.GetFiles dir
+
+        if leftovers.Length > 0 then
+            Assert.Fail(sprintf "一時ファイルが残っています: %A" (leftovers |> Array.map System.IO.Path.GetFileName)))
+
+[<Fact>]
 let ``ExtSort.sortRows: 比較不能な型は呼び出し時に Error`` () =
     let mixed =
         opOfRows
@@ -112,4 +191,4 @@ let ``ExtSort.sortRows: 比較不能な型は呼び出し時に Error`` () =
             }
         ]
 
-    expectErrorKind ErrorKind.TypeError "比較不能な型は Error" (Ops.sortBy schema2 keys mixed)
+    expectErrorKind ErrorKind.TypeError "比較不能な型は Error" (UnlimitedOps.sortBy schema2 keys mixed)

@@ -268,7 +268,7 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 `Ast.fs`（式・文の型）→ `Lexer.fs` → `ParserExpr.fs` → `Parser.fs` → `Binder.fs` → `Analyzer.fs` → `PlanBuilder.fs` → `Optimizer.fs` → `Plan.fs` という一方向のパイプライン。
 
-### 3.1 Lexer — 状態スレッドの字句解析
+### 3.1 Lexer
 
 - `LexState` は `{ Index; Line; Column }` の不変レコード。
   **前進すると新しい値を返す**ので mutable なインデックスを持たない。
@@ -297,7 +297,7 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
   `Lexer: バイナリリテラルは空・小文字・混在した 16 進を受け付ける` /
   `Lexer: 複数行の文字列の後の位置は行を進める`。
 
-### 3.2 Parser — 再帰下降 + Pratt の式（CPS）
+### 3.2 Parser
 
 文・句・式リストのうち、式と SELECT は継続（CPS）を取る再帰下降で読む
 （DML 文は値を返す通常の関数）。
@@ -369,14 +369,14 @@ F# はファイルを**コンパイル順に評価する**ため、上から下�
 
 ## 4. 型と順序保持エンコーディング
 
-### 4.1 10 の型
+### 4.1 型
 
 `NULL` / `BOOLEAN` / `INTEGER` / `REAL` / `DECIMAL` / `TEXT` / `BLOB` / `DATE` / `TIMESTAMP` / `UUID`。
 
 `SqlValue` は実行時の値を表し、`NULL` は他のすべての型と区別できる特別なケース。
 `TruthValue` で SQL の 3値論理（`True` / `False` / `Unknown`）を表現する。
 
-### 4.2 順序保持符号化（LSM 採用の最大の制約）
+### 4.2 順序保持符号化
 
 LSM はキーをバイト列として比較する。
 そのため、符号化後のバイト順が SQL の値の比較順と一致しなければならない。これが設計の中心的な制約である。
@@ -431,7 +431,7 @@ escape の正しさをバイト列で確認した例（フィールド `["ab", "
 
 ## 5. 実行層
 
-### 5.1 計画（束縛 → 論理代数 → Op）
+### 5.1 計画
 
 ```mermaid
 flowchart LR
@@ -447,7 +447,7 @@ flowchart LR
    `Analyzer.chooseScanMethod` で走査方法を決めて論理代数を組む。
 3. `Optimizer.exec` — 論理代数を `Op` に変換する（`execScan` / `execJoin` など）。
 
-#### サブクエリの解決（`Plan.planSelectC`）
+#### サブクエリの解決
 
 式の中のサブクエリは、原則として論理代数を組む前に **1回だけ実行して定数へ置き換える**。
 `Plan.planSelectC` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` が相互再帰し、
@@ -489,7 +489,7 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
 `SqlReference: 深いサブクエリの入れ子も実行できる` /
 `末尾再帰: 5000段の深いサブクエリの入れ子も解析できる`。
 
-#### 派生テーブル（FROM / JOIN のサブクエリ）
+#### 派生テーブル
 
 `FROM (SELECT ...) AS x` は**計画と実行を分ける**。
 計画時に結果を作らない。
@@ -539,7 +539,7 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
 `SqlReference: UNION ALL の列数が違うとエラー` /
 `Parser: UNION ALL は集合演算としてパースされる`。
 
-#### 束縛（Binder）
+#### 束縛
 
 - パーサは裸の名前を `Expr.Name` として作る。
   `Binder.qualify` が**一意に決まる場合だけ**修飾名（`t.age`）へ直し、
@@ -548,7 +548,7 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
   列の修飾子は**別名**（`x.id`）になり、比較は大文字小文字を区別しない。
 - WHERE は `Predicate.splitConjuncts` で AND を平坦化してから扱う。
 
-#### 論理代数の構築（buildLogicalWith）
+#### 論理代数の構築
 
 1. `FROM` は省略できる（入力は 1行 0列の `Logical.Values`）。
    `JOIN` には `FROM` が必要で、Parser が `JOIN には FROM が必要です` にする。
@@ -574,7 +574,7 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
 - **LIMIT / OFFSET は 0 以上の定数式**（行ごとの列参照・負数はエラー）。
   `LIMIT` は最外層に置き、`OFFSET` を先、`LIMIT` を後に適用する。
 
-#### 最適化ルール（実装済みの範囲）
+#### 最適化ルール
 
 | ルール            | 内容                                                                                                                                                                                                           |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -586,7 +586,7 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
 > `DISTINCT` を射影の**前**に置いてしまうと `(id, g)` の組を重複排除してしまう。
 > `LIMIT` は常に最外層に置き、`OFFSET` を先に `LIMIT` を後に適用する。
 
-#### WHERE の置き場所（JOIN があるとき）
+#### WHERE の置き場所
 
 | 述語                                                                   | 置き場所                                                                                 |
 | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
@@ -601,7 +601,7 @@ Parser も同じ CPS なので、サブクエリの入れ子段数に上限は�
 **LEFT の NULL 供給側を跨ぐ述語は昇格しない**
 （昇格すると NULL 拡張行が消えて結果が変わる）。
 
-#### 走査方法の選択（`chooseScanMethod`）
+#### 走査方法の選択
 
 ```
 WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して全 conjunct を見る）
@@ -680,7 +680,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
 `c`（主キー等値 = 1行）を先に結合し、`a` を索引で引く。
 `FROM` の順のままだと `a × b`（全走査どうし）を先に作ってしまう。
 
-#### 論理代数 → Op（`Optimizer.exec`）
+#### 論理代数 → Op
 
 - `Scan` は `execScan` が `ScanMethod` に応じて `ExecContext.tableMasked` / `ExecContext.byPrimaryKeyMasked` / `ExecContext.byIndexMasked` へ振り分ける。
 - `Join` は左を「**左部分木が実際に出力するレイアウト**」（`outputOf`）、
@@ -705,7 +705,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
   （ヘッダと射影の式が同じ列を共有するため）。
   `*` は修飾なしの列名、`t.*` は修飾つきの表示名で出す。
 
-### 5.2 Ops — pull 演算子
+### 5.2 Ops
 
 #### なぜ pull 方式か
 
@@ -719,12 +719,12 @@ F# の `seq { }` は内部に mutable な列挙子を持つので、本実装で
 `Compute` は「次に 1行を返す関数」なので、要求されるまで計算しない。
 `Op.ofArray` は 1行ずつ `Compute` を繋ぐので、行数ぶんのスタックを積まない。
 
-一方で、**入れ子ループ結合とハッシュ結合は Op を組み立てる時点で右側を materialize** する
+一方で、**入れ子ループ結合とハッシュ結合は Op を組み立てる時点で右側を読み切る**
 （インデックス入れ子ループは左行ごとに右を引く。下表の「遅延」列を参照）。
-**マージ結合は右側を materialize せず、両側を 1行ずつ流す**
+**マージ結合は右側を読み切らず、両側を 1行ずつ流す**
 （同じキーの行のグループだけを保持する）。
-materialize は管理メモリ換算で **256MiB が上限**で、超過は `CapacityError`
-（`OpsJoin.toArrayWithBudget`。インデックス検索の結果も同じ上限）。
+読み切る量は管理メモリ換算の作業上限（既定 256MiB）までで、超えた分は一時ファイルへ退避する
+（`Spill.spool`。インデックス検索の結果は materialize しない）。
 ソート・集約・DISTINCT は**入力行を抱えず**、
 それぞれ外部マージ・アキュムレータ・符号化済みキーで処理する（§5.3）。
 
@@ -776,14 +776,18 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 - 入れ子ループは「一致するまで右を進める」ループを 1つの `Op.compute` の中に置く。
   一致しない候補ごとに `Op.compute` のクロージャを作らない。
 
-### 5.3 メモリを抑える 3つの手段
+### 5.3 メモリを抑える手段
 
-| 対象              | 手段                                                                                                                                                             | メモリの上限                                                       |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `ORDER BY`        | 外部マージソート（`ExtSort`）。バジェット内はメモリ、超過分は一時ファイルの run へ退避して k-way merge。**主キー全列の昇順（単一テーブル）なら Sort を作らない** | 受け皿 1枚（既定 64MiB）+ run ごとの先頭 1行                       |
-| `GROUP BY`        | 行を抱えずアキュムレータだけ更新（`Ops.aggregate`）                                                                                                              | グループ数 × アキュムレータ（上限 400万グループ）                  |
-| `SELECT DISTINCT` | 符号化済みキーの `HashSet`                                                                                                                                       | 既定 256MiB。超過は `CapacityError`（OOM で死なない）              |
-| `JOIN`            | 右側を materialize（入れ子ループ / ハッシュ結合。インデックス検索の結果も同様）。マージ結合は両側を流し、同じキーの行だけ保持                                    | 256MiB（右側 1つ、または 1キーのグループ）。超過は `CapacityError` |
+**メモリ上限を超えたら `CapacityError` にせず一時ファイルへ退避する**のが基本方針。
+作業メモリと退避先は `SessionOptions`（`WorkMemBytes` / `SortBufferBytes` / `SpillDirectory`）で決まり、
+`ExecContext.Budget` として各演算子へ渡る。
+
+| 対象              | 手段                                                                                                                                                             | メモリの上限                                             |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `ORDER BY`        | 外部マージソート（`ExtSort`）。バジェット内はメモリ、超過分は一時ファイルの run へ退避して k-way merge。**主キー全列の昇順（単一テーブル）なら Sort を作らない** | 受け皿 1枚（既定 64MiB）+ run ごとの先頭 1行             |
+| `GROUP BY`        | 行を抱えずアキュムレータだけ更新（`Ops.aggregate`）                                                                                                              | グループ数 × アキュムレータ（超過分は退避）              |
+| `SELECT DISTINCT` | 符号化済みキーの `HashSet`                                                                                                                                       | 既定 256MiB。超過分は退避                                |
+| `JOIN`            | 右側を materialize（入れ子ループ / ハッシュ結合。インデックス検索の結果も同様）。マージ結合は両側を流し、同じキーの行だけ保持                                    | 256MiB（右側 1つ、または 1キーのグループ）。超過分は退避 |
 
 - 上限の判定は**管理メモリの概算**で行う（`ValueCodec.managedRowBytes` / `Entry.managedBytes`）。
   `SqlValue`（参照型の DU）・string（UTF-16）・配列ヘッダ・Treap / Map ノードを含む。
@@ -791,15 +795,24 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
   （SSTable のファイルサイズ見積り）で、メモリの判定には使わない。
 - 同時に開く run は最大 **32本**。run が 32本を超える場合は 32本ずつ中間 run にマージし、
   最後に 32本以下を k-way merge する（file descriptor の枯渇を防ぐ multi-pass merge）。
-- 一時ファイルは `%TEMP%/rykdb-sort-*` 。run が尽きた時点で消し、途中打ち切りで残ったものは
-  次のソート開始時に 24時間を超えたものだけ回収する。
+- 一時ファイルは既定で `%TEMP%/rykdb-sort-*`（`SessionOptions.SpillDirectory` で変更可）。
+  run が尽きた時点で消し、途中打ち切りで残ったものは次の退避開始時に 24時間を超えたものだけ回収する。
 - ソートは全入力を消費してからでないと 1行も出せないため、`Ops.sortBy` は**呼び出し時に**入力を消化し、
   比較不能な型などのエラーも呼び出し時に返す（従来の契約と同じ）。
-- なお、**JOIN の右側を materialize するのは入れ子ループ / ハッシュ結合とインデックス検索**。
-  両入力がキー順に走査できる等値結合はマージ結合でストリーミングする。
+- **JOIN の右側を保持するのは入れ子ループ / ハッシュ結合**。上限を超えたときは
+  入れ子ループが右を run に退避して左行ごとに読み直し、ハッシュ結合は両側を外部ソートして
+  マージ結合へ切り替える（結果は同じ）。マージ結合は両側を流し、同じキーのグループだけを保持する。
+  インデックス入れ子ループの検索結果は **materialize しない**（1行ずつ流す）。
+- **`DISTINCT`** は上限までは符号化キーの `HashSet` でストリーミングし、超えたら
+  `(連番, 行)` をキーハッシュでパーティションへ退避してから、キーごとに最小連番の行だけを残し、
+  連番で並べ直して「最初に現れた順」を復元する。
+- **`GROUP BY`** は上限まではアキュムレータだけを更新し、超えたら以降の行をグループキーで退避する。
+  パーティションごとに畳み、グループの初出連番で並べ直す。パーティションが再び上限を超えたら
+  salt を変えて分割し直す（深さ上限あり）。
 - **最終結果**（`Engine.runSelect`）は `Op.toArrayLimited` で materialize する。
   `Session` 経由の既定は **100万行 / 256MiB**（管理メモリ概算）で、超えたら `CapacityError` を返す。
-  上限は `SessionOptions` で変更でき、複数 SELECT を含む `Execute` では呼び出し全体で累積判定する。
+  上限は `SessionOptions` で変更でき（**負値は無制限**）、複数 SELECT を含む `Execute` では累積判定する。
+  上限なしで読みたい場合は `Session.TryOpenReader` で 1行ずつ読む。
 
 #### 演算子の共通規約
 
@@ -809,7 +822,7 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 - `Op.toArray` は行のリストを積んで `match` 直下の再帰で回し、最後に `List.rev` して配列化する
   （`>>=` を重ねると末尾呼び出しが効かず 10万行でスタックオーバーフロー。[`coding-conventions.md`](coding-conventions.md) §3）。
 
-#### 走査（`ExecContext`）
+#### 走査
 
 - `ExecContext` は `{ Store; Visible; Schemas; Catalog; Txn; Scope }`。
   `Visible`（snapshot の SeqNo）は Op を作るときに 1回だけ決まる。
@@ -853,7 +866,7 @@ materialize は管理メモリ換算で **256MiB が上限**で、超過は `Cap
 - 射影（`Ops.project`）は `*` / `t.*` を列参照へ展開する。
   入力が集約結果のときは `substituteAggs` で位置に読み替えてから評価する。
 
-#### DML（`DmlOps`、`ExecContext.fs`）
+#### DML
 
 DML は pull 演算子ではなく、`Transaction` を積み上げて件数を返す実行関数（§9.2）。
 
@@ -1183,7 +1196,7 @@ commit 成功・rollback・`Session.Close` で解除する。
 登録・解除・最古値の走査はプロセス内の Gate で直列化する
 （空になった bucket の削除と register の追加が競合して登録が消えるのを防ぐ）。
 
-### 7.6 `Session` の transaction モデル（接続ごとに独立）
+### 7.6 Session の transaction モデル
 
 `Session.Execute` は任意の SQL を実行し、暗黙の transaction で自動的に commit する。
 `Begin()` 以降は `Commit()` / `Rollback()` するまで同じ transaction を使う。
@@ -1215,7 +1228,7 @@ pin は `Session` 呼び出しごとに 1回取得し、同じバッチに含ま
 `Session.Close` は自分の transaction を rollback してから接続を閉じる。
 DB 全体を閉じるのは所有者（`Session.OpenWith` の `Session`、または `SessionPool.Close`）だけ。
 
-### 7.7 同時実行制御 — 並行性は値、Session は読み取り並行・書き込み直列、DDL だけ排他
+### 7.7 同時実行制御
 
 `Session` 層を除く通常の読み書き経路に `lock` / `Monitor` / `Interlocked` はない。
 同時実行制御は次の 4層の組み合わせで成り立っている。
@@ -1265,7 +1278,7 @@ DB 全体を閉じるのは所有者（`Session.OpenWith` の `Session`、また
   読み取りは接続間で並行、書き込みは `DatabaseHost.writeGate` で直列。
 - **プロセス間は `.rykdb.format` で排他**する（root 直下、`FileShare.None`。§7.9）
 
-### 7.8 DDL の排他（`RootRuntime`）
+### 7.8 DDL の排他
 
 `CREATE INDEX` の backfill は「テーブルを走査して索引エントリを書く」ので、
 途中に他の書き込みが入ると**索引に載らない行**ができる（または消えた行のエントリが残る）。
@@ -1301,7 +1314,7 @@ DDL の後に始まる transaction は必ず**新しいカタログ**を読む�
 （または `use` による `Dispose()`）で確実に終わらせること。
 参照が残っている間は、その root の DDL は `ConflictError` のまま。
 
-### 7.9 プロセス間の排他（`.rykdb.format`）
+### 7.9 プロセス間の排他
 
 **マルチプロセスでの同時利用は目標としない。**
 複数プロセスが同じ DB を更新できるようにすると、ファイル単位のロック順序・
@@ -1351,7 +1364,7 @@ WAL / MANIFEST はプロセスを跨いだ排他を持たないので、2つの�
 | `BloomFalsePositiveRate`      | 0.01                      |
 | `Levels.Count` / `Levels.Max` | 7 / 6                     |
 
-### 8.1 Memtable — 永続 Treap
+### 8.1 Memtable
 
 memtable は追記のみなので、レベルごとの insertion buffer として使う。
 構造は「キー昇順・同一キーは SeqNo 降順」で探索・全順序走査できる平衡二分探索木。
@@ -1539,7 +1552,7 @@ L と L+1 のキー域が重なるファイルを閉包が取れるまで追加�
 概算バイトなので厳密なサイズではない。1つのキーの版が複数ファイルに跨らない）。
 ポイント検索のファイル順は「新しいレベルのほうが先（L0 が最新）、同レベルではファイル番号の降順」（`filesForPointLookup`）。
 
-### 8.4 Manifest — 唯一 atomic 更新を要するファイル
+### 8.4 Manifest
 
 ```
 CURRENT           「1行の有効な MANIFEST 番号」
@@ -1568,7 +1581,7 @@ checksum は本体全体の CRC32C。
 `NextFileNumber` は 1 に戻る。
 `StorageEngine.openDatabaseWith` が `maxFileNumberOnDisk + 1` まで進め直すのはこのため（§8.3）。
 
-### 8.5 WAL — 論理ログ
+### 8.5 WAL
 
 ページイメージではなく更新内容を記録する。
 
@@ -1611,7 +1624,7 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
 - 複数 keyspace にまたがる commit も、全エントリを 1つの WAL バッチに入れる（§7.5）。
   途中で落ちても `Wal.foldCommitted` は Commit まで到達したバッチだけを再生する。
 
-### 8.6 Compaction — Leveled + GC
+### 8.6 Compaction
 
 ```
 L0  … flush の出力先。複数のファイルでキー域が重なる
@@ -1673,7 +1686,7 @@ MANIFEST の読み落としで消してしまう事故を避けるため）。
 WAL への書き込みが成功した時点で commit は成立しているため、ここで `Error` を返してはならない
 （呼び出し側が SeqNo を再利用し得る。gotchas §11.51）。
 
-### 8.7 background compaction（`EngineHost.fs`）
+### 8.7 background compaction
 
 `Session.OpenWith` で開いた DB は、flush 後の compaction を 1本の worker で行う。
 internal の `Session.OpenWithSync` は従来どおり同期 compaction（テスト・ベンチ用）。
@@ -1741,7 +1754,7 @@ L0 が増えて読み取りのコスト（read amplification）と引き換え�
 
 ## 9. データフロー
 
-### 9.1 読み取り（`SELECT`）
+### 9.1 読み取り
 
 ```
 SQL 文字列
@@ -1757,7 +1770,7 @@ SQL 文字列
 走査の探索順は **memtable → L0（新しい順）→ 各レベル（新しい順）**。
 各ステップで Bloom filter と `FileMetaData.mightContain` で枝刈りする。
 
-### 9.2 書き込み（`INSERT` / `UPDATE` / `DELETE`）
+### 9.2 書き込み
 
 ```
 1. Engine が DmlOps 経由で DML を Transaction の更新に変換
@@ -1867,6 +1880,12 @@ let ok =
 // 既定の SELECT 結果上限は 100万行 / 256MiB。
 // 変更する場合は Session.OpenWith(path, options) に SessionOptions を渡す。
 let session = ok (Session.OpenWith "./mydata")
+
+// SessionOptions は結果上限のほかに、演算子の作業メモリと退避先を持つ。
+//   MaxResultRows / MaxResultBytes : 最終結果の上限（負値は無制限）
+//   WorkMemBytes   : JOIN / DISTINCT / GROUP BY の作業上限（既定 256MiB、負値は退避しない）
+//   SortBufferBytes: ORDER BY の受け皿（既定 64MiB、負値は退避しない）
+//   SpillDirectory : 一時ファイルの置き場所（None は OS の一時ディレクトリ）
 
 ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
 |> ignore
@@ -2020,9 +2039,9 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   commit は compaction の完了を待たないため、書き込みが続くと L0 が増えて読み取りコストが上がる。
   close 時のキャンセルは出力ファイル境界でのみ確認するため、巨大な出力や長いブロック読み取り中は待つ。
 - **Version 全ファイルの pin は Session 呼び出しごとに O(ファイル数)**（§8.7）。
-- **JOIN の右側は materialize する**（入れ子ループ / ハッシュ結合）。
-  インデックス入れ子ループも左行ごとの検索結果を materialize する。
-  管理メモリ 256MiB を超えると `CapacityError`（§5.3）。
+- **JOIN の右側は上限までメモリに持ち、超えたら退避する**（入れ子ループ / ハッシュ結合）。
+  入れ子ループは run を左行ごとに読み直し、ハッシュ結合は両側を外部ソートしてマージ結合へ切り替える。
+  インデックス入れ子ループは左行ごとの検索結果を materialize しない（§5.3）。
 - **相関サブクエリは外側行ごとに内側を再計画・実行する**。
   外側行数 × 内側の走査コストがかかる。
   集約後の `SELECT` / `HAVING` / `ORDER BY`、`LIMIT` / `OFFSET`、派生テーブル（LATERAL）では使えない。
@@ -2050,7 +2069,7 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - **最終結果は配列化する**ため、結果セット全体がメモリに載る
   （`Engine.runSelect` の `Op.toArrayLimited`）。
   `Session` 経由の既定上限は 100万行 / 256MiB で、超えたら部分結果を返さず `CapacityError`。
-  `SessionOptions` で変更でき、複数 SELECT を含む `Execute` では累積で判定する。
+  `SessionOptions` で変更でき（**負値は無制限**）、複数 SELECT を含む `Execute` では累積で判定する。
 - **`Session.TryOpenReader` は materialize しない**ため、上記の結果上限を適用しない。
   単一 SELECT のみを対象とし、読み取り中の snapshot 登録と走査は
   終端・エラー・`RowReader.Dispose` のいずれかで解放する。

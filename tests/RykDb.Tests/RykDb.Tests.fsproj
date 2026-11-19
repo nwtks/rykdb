@@ -36,6 +36,7 @@
     <Compile Include="ScalarTests.fs" />
     <Compile Include="EvalTests.fs" />
     <Compile Include="OpTests.fs" />
+    <Compile Include="SpillTests.fs" />
     <Compile Include="ExtSortTests.fs" />
     <Compile Include="OpsJoinTests.fs" />
     <Compile Include="OpsTests.fs" />

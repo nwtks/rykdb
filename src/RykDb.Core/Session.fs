@@ -18,28 +18,44 @@
 
 namespace RykDb.Core
 
-/// Session の結果上限。
-/// materialize する SELECT 結果に適用する。
+/// Session の結果上限と作業メモリ。
 type SessionOptions =
     {
         /// 1回の Execute で保持する SELECT 行数の上限。
+        /// 負値は無制限。
         MaxResultRows: int64
         /// 1回の Execute で保持する SELECT 行のメモリ概算上限。
+        /// 負値は無制限。
         MaxResultBytes: int64
+        /// JOIN / DISTINCT / GROUP BY / IN が作業用に保持してよいメモリの概算上限（バイト）。
+        /// 超えた分は一時ファイルへ退避する。負値は「退避しない（無制限）」。
+        WorkMemBytes: int64
+        /// ORDER BY の受け皿（メモリ内で整列する上限）。
+        /// 超えた分は一時ファイルの run へ退避する。負値は「退避しない（無制限）」。
+        SortBufferBytes: int64
+        /// 一時ファイルの置き場所（`None` は OS の一時ディレクトリ）。
+        SpillDirectory: string option
     }
 
-    /// 既定値（100万行 / 256MiB）。
+    /// 既定値（結果 100万行 / 256MiB、作業 256MiB、ソート受け皿 64MiB）。
     static member Default =
         {
             MaxResultRows = 1_000_000L
             MaxResultBytes = 256L * 1024L * 1024L
+            WorkMemBytes = 256L * 1024L * 1024L
+            SortBufferBytes = 64L * 1024L * 1024L
+            SpillDirectory = None
         }
 
     static member internal Validate(options: SessionOptions) =
-        if options.MaxResultRows < 0L then
-            DbError.capacity "MaxResultRows は 0 以上でなければなりません" |> err
-        elif options.MaxResultBytes < 0L then
-            DbError.capacity "MaxResultBytes は 0 以上でなければなりません" |> err
+        if options.MaxResultRows < -1L then
+            DbError.capacity "MaxResultRows は -1（無制限）以上でなければなりません" |> err
+        elif options.MaxResultBytes < -1L then
+            DbError.capacity "MaxResultBytes は -1（無制限）以上でなければなりません" |> err
+        elif options.WorkMemBytes < -1L then
+            DbError.capacity "WorkMemBytes は -1（無制限）以上でなければなりません" |> err
+        elif options.SortBufferBytes < -1L then
+            DbError.capacity "SortBufferBytes は -1（無制限）以上でなければなりません" |> err
         else
             ret ()
 
@@ -162,8 +178,22 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
 
     let limits =
         {
-            MaxRows = options.MaxResultRows
-            MaxBytes = options.MaxResultBytes
+            MaxRows =
+                if options.MaxResultRows < 0L then
+                    System.Int64.MaxValue
+                else
+                    options.MaxResultRows
+            MaxBytes =
+                if options.MaxResultBytes < 0L then
+                    System.Int64.MaxValue
+                else
+                    options.MaxResultBytes
+            Budget =
+                {
+                    Work = options.WorkMemBytes
+                    Sort = options.SortBufferBytes
+                    Directory = options.SpillDirectory
+                }
         }
 
     let initialBudget =
@@ -176,6 +206,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
         {
             MaxRows = max 0L budget.RowsLeft
             MaxBytes = max 0L budget.BytesLeft
+            Budget = limits.Budget
         }
 
     let consumeBudget (result: StatementResult) (budget: ResultBudget) =

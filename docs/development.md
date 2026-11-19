@@ -1,6 +1,6 @@
 # 開発ガイド
 
-RykDb（**.NET 10 / F# 10**）のビルド・テスト・品質ゲート。
+RykDb のビルド・テスト・品質ゲート。
 設計は [`architecture.md`](architecture.md)、
 コーディング規約は [`coding-conventions.md`](coding-conventions.md)、
 実際に踏んだ落とし穴は [`gotchas.md`](gotchas.md) を参照。

@@ -1508,12 +1508,12 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 | 索引                | 単一列・複合索引の前置等値（1列以上）、複合索引の前置等値 + 次列の範囲、`LIKE 'prefix%'` の範囲。索引値は空で、索引列 + 主キーはキーから復号する。被覆外の列は行ごとに主キー lookup する |
 | `LIMIT` / `OFFSET`  | 0 以上の定数式のみ（行ごとの列参照・負数はエラー）。`LIMIT 0` は「0行」                                                                                                                  |
 | 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                                                                                                                                                   |
-| ソート              | 外部マージ（一時ファイルへ退避）。バジェット内はメモリのみ                                                                                                                               |
-| `SELECT DISTINCT`   | 符号化キーの集合。既定 256MiB で上限があり、超過は `CapacityError`                                                                                                                       |
-| `JOIN`              | 入れ子ループ / ハッシュ結合は右側を、マージ結合は同じキーの行だけを保持。管理メモリ換算 256MiB で上限があり、超過は `CapacityError`                                                      |
-| `GROUP BY`          | 行を抱えず集約。グループ数の上限は 400万                                                                                                                                                 |
+| ソート              | 外部マージ（一時ファイルへ退避）。受け皿（既定 64MiB）に収まる分はメモリのみ                                                                                                             |
+| `SELECT DISTINCT`   | 符号化キーの集合。作業メモリ（既定 256MiB）を超えた分は一時ファイルへ退避し、最初に現れた順を保って完走する                                                                              |
+| `JOIN`              | 入れ子ループ / ハッシュ結合は右側を、マージ結合は同じキーの行だけを保持。作業メモリ換算 256MiB を超えた分は一時ファイルへ退避（ハッシュ結合は両側を外部ソートしてマージ結合へ切替）      |
+| `GROUP BY`          | 行を抱えず集約。グループが作業メモリを超えたら、以降の行をグループキーで退避してパーティションごとに集約する                                                                             |
 | パラメータ          | `?` の位置パラメータのみ（名前付きは未対応）。個数は SQL 全体で一致が必要。値は `SqlValue` で渡す                                                                                        |
-| 最終結果            | materialize。既定 100万行 / 256MiB で、超過は `CapacityError`（`SessionOptions` で変更可）                                                                                               |
+| 最終結果            | materialize。既定 100万行 / 256MiB で、超過は `CapacityError`（`SessionOptions` で変更可。**負値は無制限**。上限なしは `TryOpenReader` が省メモリ）                                      |
 | ストリーミング      | `Session.TryOpenReader` は単一 SELECT のみ。materialize しないため結果上限は適用外。終端または `RowReader.Dispose` で走査と snapshot を解放                                              |
 | `AVG`               | `SUM / COUNT` を実行時に計算                                                                                                                                                             |
 | `UPDATE` / `DELETE` | `FROM` / `USING` / `LIMIT` 相当の句がない                                                                                                                                                |
