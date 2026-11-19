@@ -36,7 +36,7 @@ flowchart TB
     end
 
     SESS["Session.fs<br/>Session（1接続）/ SessionPool"]
-    HOST["SessionHost.fs<br/>DatabaseHost<br/>store の open/close・共有 committed state・採番・fsync"]
+    HOST["DatabaseHost.fs<br/>DatabaseHost<br/>store の open/close・共有 committed state・採番・fsync"]
     SESS --> HOST
 
     subgraph EX["実行"]
@@ -244,7 +244,7 @@ flowchart TB
 | `Plan.fs`          | `Plan`（サブクエリ解決・派生テーブル・`runSelect` / `explainSelect`）                                                 |
 | `DropCleanup.fs`   | DROP 後始末ジャーナル `DropCleanup` と起動時回復 `DropCleanupRecovery`                                                |
 | `Engine.fs`        | `StatementResult` / `Committed` / `TxnState` / `ExecState` / `Ddl` / `Engine`（文の実行）                             |
-| `SessionHost.fs`   | `DatabaseHost` と `CommitDurability`（store の open/close・共有 committed state・採番・fsync のグループコミット）     |
+| `DatabaseHost.fs`  | `DatabaseHost` と `CommitDurability`（store の open/close・共有 committed state・採番・fsync のグループコミット）     |
 | `Session.fs`       | 公開 API `Session` / `SessionPool` / `RowReader`（接続ごとの transaction・読み取りは並行、書き込みはホストで直列化）  |
 
 ### F# のコンパイル順
@@ -255,7 +255,7 @@ Errors → Types → Writer → Cursor → Serialization → Memtable → Wal �
        → StorageEngine → Ast → Lexer → ParserExpr → Parser → Transactions → EngineHost
        → ProcessLock → RowStore → TableSchema → Catalog → Scalar → Eval → Op
        → ExtSort → OpsJoin → Ops → Dml → ExecContext → Binder → Analyzer
-       → PlanBuilder → Optimizer → Plan → DropCleanup → Engine → SessionHost
+       → PlanBuilder → Optimizer → Plan → DropCleanup → Engine → DatabaseHost
        → Session
 ```
 

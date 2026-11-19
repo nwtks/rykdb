@@ -435,3 +435,16 @@ let ``Memtable: 挿入順に関わらずキー昇順で列挙される`` () =
     all
     |> Array.pairwise
     |> Array.iter (fun (a, b) -> Assert.True(compareKeyBytes a.Key b.Key < 0, "キー昇順になっていない"))
+
+[<Fact>]
+let ``Entry.managedBytes: 値が長いほど保持量が大きい`` () =
+    let key = [| 1uy; 2uy |]
+    let entry = Entry.put key 1UL [| SqlValue.Int 1L; SqlValue.Text "abcdef" |]
+
+    // 同じ行でも値が長いほど大きい
+    let longer = Entry.put key 1UL [| SqlValue.Int 1L; SqlValue.Text "abcdefghij" |]
+    Assert.True(Entry.managedBytes longer > Entry.managedBytes entry)
+
+    // tombstone は行を持たない（差分は行配列 + 値の分だけ減る）
+    let tombstone = Entry.delete key 1UL
+    Assert.True(Entry.managedBytes tombstone < Entry.managedBytes entry)

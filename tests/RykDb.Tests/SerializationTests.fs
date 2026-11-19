@@ -8,6 +8,136 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
+let private negativeZero = System.BitConverter.Int64BitsToDouble 0x8000000000000000L
+let private negativeNaN = System.BitConverter.Int64BitsToDouble 0xFFF8000000000000L
+
+let private textOfChars (chars: int list) =
+    System.String(chars |> List.map char |> Array.ofList)
+
+let private edgeValues: (string * SqlValue list) list =
+    [
+        "NULL", [ SqlValue.Null ]
+        "BOOLEAN", [ SqlValue.Bool false; SqlValue.Bool true ]
+        "INTEGER",
+        [
+            SqlValue.Int System.Int64.MinValue
+            SqlValue.Int -1L
+            SqlValue.Int 0L
+            SqlValue.Int 1L
+            SqlValue.Int System.Int64.MaxValue
+        ]
+        "REAL",
+        [
+            SqlValue.Real System.Double.NegativeInfinity
+            SqlValue.Real System.Double.MinValue
+            SqlValue.Real -1.5
+            SqlValue.Real -System.Double.Epsilon
+            SqlValue.Real negativeZero
+            SqlValue.Real 0.0
+            SqlValue.Real System.Double.Epsilon
+            SqlValue.Real 1.5
+            SqlValue.Real System.Double.MaxValue
+            SqlValue.Real System.Double.PositiveInfinity
+            SqlValue.Real System.Double.NaN
+            SqlValue.Real negativeNaN
+        ]
+        "DECIMAL",
+        [
+            SqlValue.Decimal System.Decimal.MinValue
+            SqlValue.Decimal -1.00M
+            SqlValue.Decimal -1M
+            SqlValue.Decimal -0.0M
+            SqlValue.Decimal 0M
+            SqlValue.Decimal 0.00M
+            SqlValue.Decimal 0.0000000000000000000000000001M
+            SqlValue.Decimal 1M
+            SqlValue.Decimal 1.00M
+            SqlValue.Decimal System.Decimal.MaxValue
+        ]
+        "TEXT",
+        [
+            SqlValue.Text ""
+            SqlValue.Text "A"
+            SqlValue.Text "a"
+            SqlValue.Text(textOfChars [ 0 ])
+            SqlValue.Text("a" + textOfChars [ 0 ])
+            SqlValue.Text(textOfChars [ 0x7F ])
+            SqlValue.Text(textOfChars [ 0x80 ])
+            SqlValue.Text(textOfChars [ 0x7FF ])
+            SqlValue.Text(textOfChars [ 0x800 ])
+            SqlValue.Text(textOfChars [ 0xD800 ])
+            SqlValue.Text(textOfChars [ 0xDC00 ])
+            SqlValue.Text(textOfChars [ 0xE000 ])
+            SqlValue.Text(textOfChars [ 0xFF21 ])
+            SqlValue.Text(textOfChars [ 0xFFFD ])
+            SqlValue.Text(textOfChars [ 0xFFFF ])
+            SqlValue.Text(textOfChars [ 0xD83D; 0xDE00 ])
+            SqlValue.Text("a" + textOfChars [ 0xD83D; 0xDE00 ])
+            SqlValue.Text(System.String('a', 100))
+            SqlValue.Text(System.String('a', 101))
+        ]
+        "BLOB",
+        [
+            SqlValue.Blob [||]
+            SqlValue.Blob [| 0uy |]
+            SqlValue.Blob [| 0uy; 0uy |]
+            SqlValue.Blob [| 0uy; 1uy |]
+            SqlValue.Blob [| 1uy |]
+            SqlValue.Blob [| 1uy; 0uy |]
+            SqlValue.Blob [| 255uy |]
+            SqlValue.Blob [| 255uy; 0uy |]
+        ]
+        "DATE",
+        [
+            SqlValue.Date System.DateOnly.MinValue
+            SqlValue.Date(System.DateOnly.FromDayNumber 1)
+            SqlValue.Date(System.DateOnly.FromDayNumber 100000)
+            SqlValue.Date System.DateOnly.MaxValue
+        ]
+        "TIMESTAMP",
+        [
+            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime.MinValue.Ticks, System.TimeSpan.Zero))
+            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(1_000_000_000L, System.DateTimeKind.Utc)))
+            SqlValue.Timestamp(System.DateTimeOffset(2020, 1, 1, 0, 0, 0, System.TimeSpan.Zero))
+            SqlValue.Timestamp(System.DateTimeOffset(2020, 1, 1, 9, 0, 0, System.TimeSpan.FromHours 9.0))
+            SqlValue.Timestamp(System.DateTimeOffset(2019, 12, 31, 15, 0, 0, System.TimeSpan.FromHours -9.0))
+            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime.MaxValue.Ticks, System.TimeSpan.Zero))
+        ]
+        "UUID",
+        [
+            SqlValue.Uuid System.Guid.Empty
+            SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-000000000001")
+            SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-ffffffffffff")
+            SqlValue.Uuid(System.Guid.Parse "7fffffff-ffff-ffff-ffff-ffffffffffff")
+            SqlValue.Uuid(System.Guid.Parse "80000000-0000-0000-0000-000000000000")
+            SqlValue.Uuid(System.Guid.Parse "ffffffff-ffff-ffff-ffff-ffffffffffff")
+        ]
+    ]
+
+let private allEdgeValues = edgeValues |> List.collect snd
+
+let private comparableEdgeValues =
+    edgeValues |> List.filter (fun (name, _) -> name <> "NULL")
+
+let private label (a: SqlValue) (b: SqlValue) =
+    sprintf "a=[%s] b=[%s]" (String.concat ", " (render [| a |])) (String.concat ", " (render [| b |]))
+
+let private assertSameTypeOrder (a: SqlValue) (b: SqlValue) =
+    let comparison = ok (compareValues a b)
+    let keyA = keyOf a
+    let keyB = keyOf b
+    let keyComparison = compareKeyBytes keyA keyB
+
+    Assert.True(
+        sign comparison = sign keyComparison,
+        sprintf "順序が不一致: %s comparison=%d key=%d" (label a b) comparison keyComparison
+    )
+
+    Assert.True(
+        (comparison = 0) = (keyComparison = 0),
+        sprintf "等値判定が不一致: %s comparison=%d key=%d" (label a b) comparison keyComparison
+    )
+
 [<Fact>]
 let ``Reader: 負のバイト数は CorruptionError`` () =
     expectErrorKind ErrorKind.CorruptionError "負のバイト数はエラー" (Reader.readBytes -1 (Cursor.create [| 1uy |]))
@@ -363,149 +493,6 @@ let ``ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの�
     // 行は配列ヘッダ 24 + スロット 8 × 列数 + 各値
     let row = [| SqlValue.Int 1L; SqlValue.Null |]
     Assert.Equal(24 + 8 * 2 + 24, ValueCodec.managedRowBytes row)
-
-[<Fact>]
-let ``Entry.managedBytes: 値が長いほど保持量が大きい`` () =
-    let key = [| 1uy; 2uy |]
-    let entry = Entry.put key 1UL [| SqlValue.Int 1L; SqlValue.Text "abcdef" |]
-
-    // 同じ行でも値が長いほど大きい
-    let longer = Entry.put key 1UL [| SqlValue.Int 1L; SqlValue.Text "abcdefghij" |]
-    Assert.True(Entry.managedBytes longer > Entry.managedBytes entry)
-
-    // tombstone は行を持たない（差分は行配列 + 値の分だけ減る）
-    let tombstone = Entry.delete key 1UL
-    Assert.True(Entry.managedBytes tombstone < Entry.managedBytes entry)
-
-let private negativeZero = System.BitConverter.Int64BitsToDouble 0x8000000000000000L
-let private negativeNaN = System.BitConverter.Int64BitsToDouble 0xFFF8000000000000L
-
-let private textOfChars (chars: int list) =
-    System.String(chars |> List.map char |> Array.ofList)
-
-let private edgeValues: (string * SqlValue list) list =
-    [
-        "NULL", [ SqlValue.Null ]
-        "BOOLEAN", [ SqlValue.Bool false; SqlValue.Bool true ]
-        "INTEGER",
-        [
-            SqlValue.Int System.Int64.MinValue
-            SqlValue.Int -1L
-            SqlValue.Int 0L
-            SqlValue.Int 1L
-            SqlValue.Int System.Int64.MaxValue
-        ]
-        "REAL",
-        [
-            SqlValue.Real System.Double.NegativeInfinity
-            SqlValue.Real System.Double.MinValue
-            SqlValue.Real -1.5
-            SqlValue.Real -System.Double.Epsilon
-            SqlValue.Real negativeZero
-            SqlValue.Real 0.0
-            SqlValue.Real System.Double.Epsilon
-            SqlValue.Real 1.5
-            SqlValue.Real System.Double.MaxValue
-            SqlValue.Real System.Double.PositiveInfinity
-            SqlValue.Real System.Double.NaN
-            SqlValue.Real negativeNaN
-        ]
-        "DECIMAL",
-        [
-            SqlValue.Decimal System.Decimal.MinValue
-            SqlValue.Decimal -1.00M
-            SqlValue.Decimal -1M
-            SqlValue.Decimal -0.0M
-            SqlValue.Decimal 0M
-            SqlValue.Decimal 0.00M
-            SqlValue.Decimal 0.0000000000000000000000000001M
-            SqlValue.Decimal 1M
-            SqlValue.Decimal 1.00M
-            SqlValue.Decimal System.Decimal.MaxValue
-        ]
-        "TEXT",
-        [
-            SqlValue.Text ""
-            SqlValue.Text "A"
-            SqlValue.Text "a"
-            SqlValue.Text(textOfChars [ 0 ])
-            SqlValue.Text("a" + textOfChars [ 0 ])
-            SqlValue.Text(textOfChars [ 0x7F ])
-            SqlValue.Text(textOfChars [ 0x80 ])
-            SqlValue.Text(textOfChars [ 0x7FF ])
-            SqlValue.Text(textOfChars [ 0x800 ])
-            SqlValue.Text(textOfChars [ 0xD800 ])
-            SqlValue.Text(textOfChars [ 0xDC00 ])
-            SqlValue.Text(textOfChars [ 0xE000 ])
-            SqlValue.Text(textOfChars [ 0xFF21 ])
-            SqlValue.Text(textOfChars [ 0xFFFD ])
-            SqlValue.Text(textOfChars [ 0xFFFF ])
-            SqlValue.Text(textOfChars [ 0xD83D; 0xDE00 ])
-            SqlValue.Text("a" + textOfChars [ 0xD83D; 0xDE00 ])
-            SqlValue.Text(System.String('a', 100))
-            SqlValue.Text(System.String('a', 101))
-        ]
-        "BLOB",
-        [
-            SqlValue.Blob [||]
-            SqlValue.Blob [| 0uy |]
-            SqlValue.Blob [| 0uy; 0uy |]
-            SqlValue.Blob [| 0uy; 1uy |]
-            SqlValue.Blob [| 1uy |]
-            SqlValue.Blob [| 1uy; 0uy |]
-            SqlValue.Blob [| 255uy |]
-            SqlValue.Blob [| 255uy; 0uy |]
-        ]
-        "DATE",
-        [
-            SqlValue.Date System.DateOnly.MinValue
-            SqlValue.Date(System.DateOnly.FromDayNumber 1)
-            SqlValue.Date(System.DateOnly.FromDayNumber 100000)
-            SqlValue.Date System.DateOnly.MaxValue
-        ]
-        "TIMESTAMP",
-        [
-            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime.MinValue.Ticks, System.TimeSpan.Zero))
-            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime(1_000_000_000L, System.DateTimeKind.Utc)))
-            SqlValue.Timestamp(System.DateTimeOffset(2020, 1, 1, 0, 0, 0, System.TimeSpan.Zero))
-            SqlValue.Timestamp(System.DateTimeOffset(2020, 1, 1, 9, 0, 0, System.TimeSpan.FromHours 9.0))
-            SqlValue.Timestamp(System.DateTimeOffset(2019, 12, 31, 15, 0, 0, System.TimeSpan.FromHours -9.0))
-            SqlValue.Timestamp(System.DateTimeOffset(System.DateTime.MaxValue.Ticks, System.TimeSpan.Zero))
-        ]
-        "UUID",
-        [
-            SqlValue.Uuid System.Guid.Empty
-            SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-000000000001")
-            SqlValue.Uuid(System.Guid.Parse "00000000-0000-0000-0000-ffffffffffff")
-            SqlValue.Uuid(System.Guid.Parse "7fffffff-ffff-ffff-ffff-ffffffffffff")
-            SqlValue.Uuid(System.Guid.Parse "80000000-0000-0000-0000-000000000000")
-            SqlValue.Uuid(System.Guid.Parse "ffffffff-ffff-ffff-ffff-ffffffffffff")
-        ]
-    ]
-
-let private allEdgeValues = edgeValues |> List.collect snd
-
-let private comparableEdgeValues =
-    edgeValues |> List.filter (fun (name, _) -> name <> "NULL")
-
-let private label (a: SqlValue) (b: SqlValue) =
-    sprintf "a=[%s] b=[%s]" (String.concat ", " (render [| a |])) (String.concat ", " (render [| b |]))
-
-let private assertSameTypeOrder (a: SqlValue) (b: SqlValue) =
-    let comparison = ok (compareValues a b)
-    let keyA = keyOf a
-    let keyB = keyOf b
-    let keyComparison = compareKeyBytes keyA keyB
-
-    Assert.True(
-        sign comparison = sign keyComparison,
-        sprintf "順序が不一致: %s comparison=%d key=%d" (label a b) comparison keyComparison
-    )
-
-    Assert.True(
-        (comparison = 0) = (keyComparison = 0),
-        sprintf "等値判定が不一致: %s comparison=%d key=%d" (label a b) comparison keyComparison
-    )
 
 [<Fact>]
 let ``順序保持: 同一型の境界値でキー順と比較順が一致する`` () =

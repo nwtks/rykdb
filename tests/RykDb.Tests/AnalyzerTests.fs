@@ -8,15 +8,6 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-/// テスト用の ExecContext（people と orders を登録済み）。
-let private ctxOf (store: RowStore) =
-    ExecContext.create store None
-    |> ExecContext.withSchema "people" peopleSchema
-    |> ExecContext.withSchema "orders" ordersSchema
-
-let private pCol (n: string) =
-    Expr.Column { Qualifier = Some "people"; Name = n }
-
 [<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば IndexNestedLoop`` () =
     let leftTable =

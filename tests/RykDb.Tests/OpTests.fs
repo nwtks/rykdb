@@ -8,14 +8,6 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-/// 2列（a, b）のスキーマ。
-let private schema2 =
-    outSchema
-        [
-            outCol "a" None (Some DataType.Integer)
-            outCol "b" None (Some DataType.Integer)
-        ]
-
 /// 1行を作る。
 let private row (values: SqlValue list) = List.toArray values
 

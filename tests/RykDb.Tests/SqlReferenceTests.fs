@@ -25,7 +25,7 @@ let private openDb (root: string) =
 
 /// テスト用のテーブルを用意する。
 let private seeded (tag: string) (f: Session -> unit) =
-    withDb tag (fun db0 ->
+    withSession tag (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
 
@@ -47,7 +47,7 @@ let private expectMessage (fragment: string) (sql: string) (db: Session) =
 
 [<Fact>]
 let ``SqlReference: 索引列と主キーの大文字小文字は区別しない`` () =
-    withDb "case-ident" (fun db0 ->
+    withSession "case-ident" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO c VALUES (1, 'a'), (2, 'b')"
         let db3 = exec db2 "CREATE INDEX ci ON c (V)"
@@ -64,7 +64,7 @@ let ``SqlReference: 索引列と主キーの大文字小文字は区別しない
 
 [<Fact>]
 let ``SqlReference: SUM / AVG は型が混在しても値を落とさない`` () =
-    withDb "sum-mixed" (fun db0 ->
+    withSession "sum-mixed" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE s (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO s VALUES (1), (2), (3)"
 
@@ -81,7 +81,7 @@ let ``SqlReference: SUM / AVG は型が混在しても値を落とさない`` ()
 
 [<Fact>]
 let ``SqlReference: 集約なしの HAVING はエラー`` () =
-    withDb "having-noagg" (fun db0 ->
+    withSession "having-noagg" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
 
@@ -92,21 +92,21 @@ let ``SqlReference: 集約なしの HAVING はエラー`` () =
 
 [<Fact>]
 let ``SqlReference: GROUP BY と * の併用はエラー`` () =
-    withDb "group-star" (fun db0 ->
+    withSession "group-star" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 10), (2, 10)"
         expectErrorKind ErrorKind.SyntaxError "SELECT * は GROUP BY と併用できない" (execSql db2 "SELECT * FROM t GROUP BY v"))
 
 [<Fact>]
 let ``SqlReference: テーブル名と同じ非修飾名は列として解決しない`` () =
-    withDb "resolve-qual" (fun db0 ->
+    withSession "resolve-qual" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE q (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO q VALUES (1)"
         expectErrorKind ErrorKind.NameError "テーブル名を列として解決しない" (execSql db2 "SELECT q FROM q"))
 
 [<Fact>]
 let ``SqlReference: t.* の大文字小文字は区別しない`` () =
-    withDb "star-case" (fun db0 ->
+    withSession "star-case" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE st (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO st VALUES (1)"
         let _, r = ok (execSql db2 "SELECT ST.* FROM st")
@@ -114,7 +114,7 @@ let ``SqlReference: t.* の大文字小文字は区別しない`` () =
 
 [<Fact>]
 let ``SqlReference: FROM に無い t.* は NameError`` () =
-    withDb "star-unknown" (fun db0 ->
+    withSession "star-unknown" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1)"
         // 一致 0 件の `t.*` を「0列の 1行」で成功させない。
@@ -123,7 +123,7 @@ let ``SqlReference: FROM に無い t.* は NameError`` () =
 
 [<Fact>]
 let ``SqlReference: LIMIT の定数式と負数`` () =
-    withDb "limit-expr" (fun db0 ->
+    withSession "limit-expr" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1), (2), (3)"
 
@@ -143,7 +143,7 @@ let ``SqlReference: LIMIT の定数式と負数`` () =
 
 [<Fact>]
 let ``SqlReference: DEFAULT の評価エラーは NULL にしない`` () =
-    withDb "default-error" (fun db0 ->
+    withSession "default-error" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (1 / 0))"
 
@@ -151,7 +151,7 @@ let ``SqlReference: DEFAULT の評価エラーは NULL にしない`` () =
 
 [<Fact>]
 let ``SqlReference: DEFAULT は列型へ暗黙変換される`` () =
-    withDb "default-coerce" (fun db0 ->
+    withSession "default-coerce" (fun db0 ->
         // INTEGER の既定値を TEXT 列へ入れると TEXT に変換される
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT DEFAULT 42)"
         let db2, _ = ok (execSql db1 "INSERT INTO t (id) VALUES (1)")
@@ -166,7 +166,7 @@ let ``SqlReference: DEFAULT は列型へ暗黙変換される`` () =
 
 [<Fact>]
 let ``SqlReference: 複合索引の全列等値で行を引ける`` () =
-    withDb "comp-index-eq" (fun db0 ->
+    withSession "comp-index-eq" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (a INTEGER, b INTEGER, id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 2, 10), (1, 3, 11), (2, 2, 12)"
         let db3 = exec db2 "CREATE INDEX ix_ab ON t (a, b)"
@@ -198,7 +198,7 @@ let ``SqlReference: VARCHAR(32) は再オープン後も使える`` () =
 let ``SqlReference: SQL の BEGIN / COMMIT / ROLLBACK は受理される`` () =
     // 文として受理され、暗黙の transaction を制御する（§12）。
     // `Session` は SQL の BEGIN / COMMIT / ROLLBACK をライブラリ API と同じ状態機械で扱う。
-    withDb "tx5" (fun db0 ->
+    withSession "tx5" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "BEGIN"
         Assert.True db2.InTransaction
@@ -215,7 +215,7 @@ let ``SqlReference: SQL の BEGIN / COMMIT / ROLLBACK は受理される`` () =
 
 [<Fact>]
 let ``SqlReference: CREATE TABLE でテーブルができる`` () =
-    withDb "ddl1" (fun db0 ->
+    withSession "ddl1" (fun db0 ->
         let db =
             exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
 
@@ -223,7 +223,7 @@ let ``SqlReference: CREATE TABLE でテーブルができる`` () =
 
 [<Fact>]
 let ``SqlReference: CREATE TABLE IF NOT EXISTS は 2 回呼んでも OK`` () =
-    withDb "ddl2" (fun db0 ->
+    withSession "ddl2" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
 
         let db2 =
@@ -233,7 +233,7 @@ let ``SqlReference: CREATE TABLE IF NOT EXISTS は 2 回呼んでも OK`` () =
 
 [<Fact>]
 let ``SqlReference: CREATE TABLE の重複はエラー（IF NOT EXISTS なし）`` () =
-    withDb "ddl3" (fun db0 ->
+    withSession "ddl3" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
 
         expectError
@@ -242,7 +242,7 @@ let ``SqlReference: CREATE TABLE の重複はエラー（IF NOT EXISTS なし）
 
 [<Fact>]
 let ``SqlReference: テーブル制約の複合主キー`` () =
-    withDb "ddl6" (fun db0 ->
+    withSession "ddl6" (fun db0 ->
         // 主キーをテーブル制約で指定（列制約ではない）
         let db1 =
             exec db0 "CREATE TABLE t (a INTEGER, b INTEGER, v INTEGER, PRIMARY KEY (a, b))"
@@ -258,7 +258,7 @@ let ``SqlReference: テーブル制約の複合主キー`` () =
 
 [<Fact>]
 let ``SqlReference: 複合主キーは全列一致で検索でき、部分一致も取りこぼさない`` () =
-    withDb "ddl6-search" (fun db0 ->
+    withSession "ddl6-search" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE t (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))"
 
@@ -279,26 +279,26 @@ let ``SqlReference: 複合主キーは全列一致で検索でき、部分一致
 
 [<Fact>]
 let ``SqlReference: DROP TABLE でテーブルが消える`` () =
-    withDb "ddl4" (fun db0 ->
+    withSession "ddl4" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
         let db2 = exec db1 "DROP TABLE people"
         Assert.Empty(ok (db2.TableNames())))
 
 [<Fact>]
 let ``SqlReference: DROP TABLE IF EXISTS は無ければ OK`` () =
-    withDb "ddl5" (fun db0 ->
+    withSession "ddl5" (fun db0 ->
         let db1 = exec db0 "DROP TABLE IF EXISTS nothing"
         Assert.Empty(ok (db1.TableNames())))
 
 [<Fact>]
 let ``SqlReference: 存在しない列の索引はエラー`` () =
-    withDb "ddl7" (fun db0 ->
+    withSession "ddl7" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)"
         expectError "存在しない列の CREATE INDEX が OK になっています" (execSql db1 "CREATE INDEX ix ON people (nope)"))
 
 [<Fact>]
 let ``SqlReference: 存在しないテーブルの索引と索引名の重複はエラー`` () =
-    withDb "ddl8" (fun db0 ->
+    withSession "ddl8" (fun db0 ->
         expectError "存在しないテーブルの CREATE INDEX が OK になっています" (execSql db0 "CREATE INDEX ix ON nope (a)")
 
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
@@ -307,7 +307,7 @@ let ``SqlReference: 存在しないテーブルの索引と索引名の重複は
 
 [<Fact>]
 let ``SqlReference: DROP INDEX で索引が消える`` () =
-    withDb "ddl9" (fun db0 ->
+    withSession "ddl9" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
         let db2, _ = execRes db1 "INSERT INTO t VALUES (1, 10)"
 
@@ -327,13 +327,13 @@ let ``SqlReference: DROP INDEX で索引が消える`` () =
 
 [<Fact>]
 let ``SqlReference: DROP INDEX IF EXISTS と存在しない索引のエラー`` () =
-    withDb "ddl10" (fun db0 ->
+    withSession "ddl10" (fun db0 ->
         let db1 = exec db0 "DROP INDEX IF EXISTS nothing"
         expectError "存在しない DROP INDEX が OK になっています" (execSql db1 "DROP INDEX nothing"))
 
 [<Fact>]
 let ``SqlReference: 暗黙の UNIQUE 索引は DROP できない`` () =
-    withDb "ddl-implicit-unique" (fun db0 ->
+    withSession "ddl-implicit-unique" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a@example.com')"
 
@@ -353,7 +353,7 @@ let ``SqlReference: 暗黙の UNIQUE 索引は DROP できない`` () =
 
 [<Fact>]
 let ``SqlReference: ALTER TABLE ADD COLUMN は既存行を DEFAULT で埋める`` () =
-    withDb "alter-add" (fun db0 ->
+    withSession "alter-add" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
         let db3 = exec db2 "CREATE INDEX ix_name ON t (name)"
@@ -385,7 +385,7 @@ let ``SqlReference: ALTER TABLE ADD COLUMN は既存行を DEFAULT で埋める`
 
 [<Fact>]
 let ``SqlReference: ALTER TABLE ADD COLUMN の制約`` () =
-    withDb "alter-add-errors" (fun db0 ->
+    withSession "alter-add-errors" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
 
         expectErrorKind ErrorKind.NameError "重複した列" (execSql db1 "ALTER TABLE t ADD COLUMN v INTEGER")
@@ -413,7 +413,7 @@ let ``SqlReference: ALTER TABLE ADD COLUMN の制約`` () =
 
 [<Fact>]
 let ``SqlReference: ALTER TABLE DROP COLUMN は行と索引から列を除く`` () =
-    withDb "alter-drop" (fun db0 ->
+    withSession "alter-drop" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')"
         let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
@@ -439,7 +439,7 @@ let ``SqlReference: ALTER TABLE DROP COLUMN は行と索引から列を除く`` 
 
 [<Fact>]
 let ``SqlReference: ALTER TABLE RENAME COLUMN は行と索引の列名を書き換える`` () =
-    withDb "alter-rename" (fun db0 ->
+    withSession "alter-rename" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 10), (2, 20)"
         let db3 = exec db2 "CREATE INDEX ix_a ON t (a)"
@@ -469,7 +469,7 @@ let ``SqlReference: ALTER TABLE RENAME COLUMN は行と索引の列名を書き�
 
 [<Fact>]
 let ``SqlReference: ALTER TABLE は transaction 中に実行できない`` () =
-    withDb "alter-txn" (fun db0 ->
+    withSession "alter-txn" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
 
         ok (db1.Begin())
@@ -503,7 +503,7 @@ let ``SqlReference: ALTER TABLE の変更は再オープン後も残る`` () =
 
 [<Fact>]
 let ``SqlReference: UNIQUE 制約は複数の NULL を許す`` () =
-    withDb "unique-null" (fun db0 ->
+    withSession "unique-null" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
         let db2 = exec db1 "INSERT INTO u VALUES (1, NULL), (2, NULL)"
         let _, count = ok (execSql db2 "SELECT COUNT(*) FROM u")
@@ -516,7 +516,7 @@ let ``SqlReference: UNIQUE 制約は複数の NULL を許す`` () =
 
 [<Fact>]
 let ``SqlReference: 複合 UNIQUE は NULL を含む行を重複扱いしない`` () =
-    withDb "unique-null-composite" (fun db0 ->
+    withSession "unique-null-composite" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE (a, b))"
 
@@ -531,7 +531,7 @@ let ``SqlReference: 複合 UNIQUE は NULL を含む行を重複扱いしない`
 
 [<Fact>]
 let ``SqlReference: UNIQUE 列の UPDATE でも NULL は重複扱いしない`` () =
-    withDb "unique-null-update" (fun db0 ->
+    withSession "unique-null-update" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
 
@@ -546,7 +546,7 @@ let ``SqlReference: UNIQUE 列の UPDATE でも NULL は重複扱いしない`` 
 
 [<Fact>]
 let ``SqlReference: UPDATE で UNIQUE 値を交換できる`` () =
-    withDb "unique-update-swap" (fun db0 ->
+    withSession "unique-update-swap" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
 
@@ -566,7 +566,7 @@ let ``SqlReference: UPDATE で UNIQUE 値を交換できる`` () =
 
 [<Fact>]
 let ``SqlReference: table-level PRIMARY KEY は NULL を拒否する`` () =
-    withDb "table-pk-not-null" (fun db0 ->
+    withSession "table-pk-not-null" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER, v TEXT, PRIMARY KEY (id))"
 
         expectErrorKind
@@ -576,7 +576,7 @@ let ``SqlReference: table-level PRIMARY KEY は NULL を拒否する`` () =
 
 [<Fact>]
 let ``SqlReference: 重複列・重複 INSERT 列・重複 UPDATE 代入を拒否する`` () =
-    withDb "duplicate-names" (fun db0 ->
+    withSession "duplicate-names" (fun db0 ->
         expectErrorKind
             ErrorKind.NameError
             "CREATE TABLE の重複列を許してはいけない"
@@ -598,7 +598,7 @@ let ``SqlReference: 重複列・重複 INSERT 列・重複 UPDATE 代入を拒�
 
 [<Fact>]
 let ``SqlReference: 長すぎるテーブル名・索引名は拒否する`` () =
-    withDb "long-name" (fun db0 ->
+    withSession "long-name" (fun db0 ->
         let name = System.String('a', 128 + 1)
 
         expectErrorKind
@@ -612,7 +612,7 @@ let ``SqlReference: 長すぎるテーブル名・索引名は拒否する`` () 
 
 [<Fact>]
 let ``SqlReference: DEFAULT 付きの列定義も保存できる`` () =
-    withDb "ddl-default" (fun db0 ->
+    withSession "ddl-default" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT DEFAULT 'x')"
 
         // 保存時に DEFAULT 式が書かれる（再読込後に既定値として使われるかは別問題）
@@ -646,7 +646,7 @@ let ``SqlReference: DEFAULT は再オープン後も既定値として使われ�
 
 [<Fact>]
 let ``SqlReference: 数値の範囲外は例外ではなくエラーを返す`` () =
-    withDb "numeric-e2e" (fun db0 ->
+    withSession "numeric-e2e" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL, d DECIMAL)"
         let db2 = exec db1 "INSERT INTO t (id, v, d) VALUES (1, 1e30, 7.9e28)"
 
@@ -696,7 +696,7 @@ let ``SqlReference: 数値の範囲外は例外ではなくエラーを返す`` 
 
 [<Fact>]
 let ``SqlReference: INSERT した行が SELECT で見える`` () =
-    withDb "dml1" (fun db0 ->
+    withSession "dml1" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
 
@@ -713,7 +713,7 @@ let ``SqlReference: INSERT した行が SELECT で見える`` () =
 
 [<Fact>]
 let ``SqlReference: INSERT は複数 VALUES を 1 文で`` () =
-    withDb "dml2" (fun db0 ->
+    withSession "dml2" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2, ins = ok (execSql db1 "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
         Assert.Equal<int>(3, ins.RowsAffected)
@@ -723,7 +723,7 @@ let ``SqlReference: INSERT は複数 VALUES を 1 文で`` () =
 
 [<Fact>]
 let ``SqlReference: INSERT ... SELECT は選択結果を挿入する`` () =
-    withDb "insert-select" (fun db0 ->
+    withSession "insert-select" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT, n INTEGER)"
 
         let db2 = exec db1 "INSERT INTO src VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)"
@@ -759,7 +759,7 @@ let ``SqlReference: INSERT ... SELECT は選択結果を挿入する`` () =
 
 [<Fact>]
 let ``SqlReference: INSERT ... SELECT の制約違反は文全体を取り消す`` () =
-    withDb "insert-select-errors" (fun db0 ->
+    withSession "insert-select-errors" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL, n INTEGER DEFAULT 0)"
 
@@ -794,7 +794,7 @@ let ``SqlReference: INSERT ... SELECT の制約違反は文全体を取り消す
 
 [<Fact>]
 let ``SqlReference: UPDATE は WHERE に合う行だけを変える`` () =
-    withDb "dml3" (fun db0 ->
+    withSession "dml3" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2, _ = execRes db1 "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)"
         let db3, upd = ok (execSql db2 "UPDATE t SET v = 99 WHERE id > 1")
@@ -807,7 +807,7 @@ let ``SqlReference: UPDATE は WHERE に合う行だけを変える`` () =
 
 [<Fact>]
 let ``SqlReference: DELETE は WHERE に合う行を消す`` () =
-    withDb "dml4" (fun db0 ->
+    withSession "dml4" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
         let db3, del = ok (execSql db2 "DELETE FROM t WHERE v >= 20")
@@ -846,7 +846,7 @@ let ``SqlReference: ORDER BY が効く`` () =
 [<Fact>]
 let ``SqlReference: 主キー順の ORDER BY は昇順・降順・LIMIT が正しい`` () =
     // 主キー昇順の ORDER BY は Sort ノードを作らない（走査順がそのまま答え）。
-    withDb "orderby-pk" (fun db0 ->
+    withSession "orderby-pk" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (3,'c'),(1,'a'),(4,'d'),(2,'b')")
 
@@ -863,7 +863,7 @@ let ``SqlReference: 主キー順の ORDER BY は昇順・降順・LIMIT が正�
 
 [<Fact>]
 let ``SqlReference: 複合主キーは全列の昇順で並ぶ`` () =
-    withDb "orderby-pk2" (fun db0 ->
+    withSession "orderby-pk2" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE c (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))"
 
@@ -886,7 +886,7 @@ let ``SqlReference: 複合主キーは全列の昇順で並ぶ`` () =
 
 [<Fact>]
 let ``SqlReference: ORDER BY は NULL を昇順で先頭、降順で末尾に置く`` () =
-    withDb "orderby-null" (fun db0 ->
+    withSession "orderby-null" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)"
 
         let db2, _ =
@@ -915,7 +915,7 @@ let ``SqlReference: ORDER BY は NULL を昇順で先頭、降順で末尾に置
 
 [<Fact>]
 let ``SqlReference: TEXT の比較は UTF-8 の符号化順に一致する`` () =
-    withDb "text-utf8-order" (fun db0 ->
+    withSession "text-utf8-order" (fun db0 ->
         // UTF-16 のコード単位順では絵文字が全角 A より小さいが、
         // UTF-8 の符号化順（コードポイント順）では全角 A のほうが小さい。
         let fullwidthA = "\uFF21"
@@ -981,7 +981,7 @@ let ``SqlReference: TEXT の比較は UTF-8 の符号化順に一致する`` () 
 
 [<Fact>]
 let ``SqlReference: REAL の -0.0 は +0.0 と同じ主キー`` () =
-    withDb "real-negative-zero" (fun db0 ->
+    withSession "real-negative-zero" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE r (x REAL PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO r VALUES (0.0, 'a')"
 
@@ -1137,7 +1137,7 @@ let ``SqlReference: OFFSET`` () =
 
 [<Fact>]
 let ``SqlReference: DISTINCT`` () =
-    withDb "sel7" (fun db0 ->
+    withSession "sel7" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1,10),(2,20),(3,10),(4,30)")
         let _db9, res = ok (execSql db2 "SELECT DISTINCT g FROM t ORDER BY g")
@@ -1147,7 +1147,7 @@ let ``SqlReference: DISTINCT`` () =
 [<Fact>]
 let ``SqlReference: DISTINCT を続けて実行しても毎回全行が返る`` () =
     // 既出集合をモジュール初期化時に 1個だけ作ると、2回目以降が全行を重複と見なして 0行になる。
-    withDb "sel7b" (fun db0 ->
+    withSession "sel7b" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1,10),(2,20),(3,10),(4,30)")
 
@@ -1161,7 +1161,7 @@ let ``SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎
     // 演算子の作業用コレクション（グループ表・ハッシュ表）は Op の構築時に作り、
     // 返した Op の外へ持ち出さない。モジュールスコープに置くと 2回目以降が壊れる
     // （DISTINCT で実際に踏んだ。gotchas §2.6）。
-    withDb "sel7c" (fun db0 ->
+    withSession "sel7c" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
         let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY, h INTEGER)"
         let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (1,10),(2,20),(3,10),(4,30)")
@@ -1205,7 +1205,7 @@ let ``SqlReference: 集約関数`` () =
 
 [<Fact>]
 let ``SqlReference: JOIN`` () =
-    withDb "sel10" (fun db0 ->
+    withSession "sel10" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
 
@@ -1233,7 +1233,7 @@ let ``SqlReference: 3 テーブルの入れ子 JOIN が行を返す`` () =
     // 結合で内側の JOIN が右テーブルの列まで含んだ schema で ON 句を解決し、
     // 列が見つからずに INNER JOIN が黙って 0 行を返していた。
     // 左へ下ろすのは「右テーブルを除いたスキーマ」。
-    withDb "join3" (fun db0 ->
+    withSession "join3" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, av INTEGER)"
         let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, bv INTEGER)"
@@ -1257,7 +1257,7 @@ let ``SqlReference: エイリアスでの自己結合が行を返す`` () =
     // JOIN の対応付けを RealName で探していたころは、`FROM t AS x JOIN t AS y` が
     // 先頭の t にヒットして JOIN が丸ごと省略され、
     // 列インデックスが範囲外（2 列中）になって落ちていた。
-    withDb "selfjoin" (fun db0 ->
+    withSession "selfjoin" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"
 
@@ -1294,7 +1294,7 @@ let ``SqlReference: エイリアスでの自己結合が行を返す`` () =
 
 [<Fact>]
 let ``SqlReference: ハッシュ結合（INNER / LEFT / NULL キー）`` () =
-    withDb "joinhash" (fun db0 ->
+    withSession "joinhash" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
         let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
         let db3 = exec db2 "INSERT INTO a VALUES (1,10),(2,20),(3,NULL)"
@@ -1327,7 +1327,7 @@ let ``SqlReference: ハッシュ結合（INNER / LEFT / NULL キー）`` () =
 
 [<Fact>]
 let ``SqlReference: マージ結合（主キー同士・LEFT・複合キー）`` () =
-    withDb "joinmerge" (fun db0 ->
+    withSession "joinmerge" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE m1 (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE TABLE m2 (id INTEGER PRIMARY KEY, w INTEGER)"
         let db3 = exec db2 "INSERT INTO m1 VALUES (1,10),(2,20),(4,40)"
@@ -1409,7 +1409,7 @@ let ``SqlReference: マージ結合（主キー同士・LEFT・複合キー）``
 
 [<Fact>]
 let ``SqlReference: インデックス入れ子ループ（右索引 + 左が小さい）`` () =
-    withDb "joinindex" (fun db0 ->
+    withSession "joinindex" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE depts (id INTEGER PRIMARY KEY, name TEXT)"
 
         let db2 =
@@ -1459,7 +1459,7 @@ let ``SqlReference: インデックス入れ子ループ（右索引 + 左が小
 let ``SqlReference: JOIN の非修飾で曖昧な列は NameError`` () =
     // 非修飾 id は p と q の両方にある。各テーブルへ pushdown すると
     // それぞれ id = 1 で絞ってしまい、曖昧エラーにならず意味が変わる。
-    withDb "joinambig" (fun db0 ->
+    withSession "joinambig" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20)"
 
@@ -1472,7 +1472,7 @@ let ``SqlReference: JOIN の非修飾で曖昧な列は NameError`` () =
 let ``SqlReference: テーブル名の重複はエラー（エイリアスが必要）`` () =
     // 識別名が重複すると exec が名前でスキーマを引けず（両方が消える）、
     // エラーではなく静かな誤答になるので、名前解決の段階で止める。
-    withDb "dupjoin" (fun db0 ->
+    withSession "dupjoin" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10)"
 
@@ -1483,7 +1483,7 @@ let ``SqlReference: テーブル名の重複はエラー（エイリアスが必
 
 [<Fact>]
 let ``SqlReference: JOIN の WHERE は右テーブルと横断述語に効く`` () =
-    withDb "sel11" (fun db0 ->
+    withSession "sel11" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
 
@@ -1530,7 +1530,7 @@ let ``SqlReference: JOIN の WHERE は右テーブルと横断述語に効く`` 
 
 [<Fact>]
 let ``SqlReference: LEFT JOIN の WHERE は null 供給側に効く`` () =
-    withDb "sel12" (fun db0 ->
+    withSession "sel12" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"
 
@@ -1566,14 +1566,14 @@ let ``SqlReference: LEFT JOIN の WHERE は null 供給側に効く`` () =
 
 [<Fact>]
 let ``SqlReference: セミコロンなしの複数文はエラー`` () =
-    withDb "p0-separator" (fun db0 ->
+    withSession "p0-separator" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
 
         expectError "セミコロンなしの複数文が OK になっています" (execSql db1 "SELECT id FROM t SELECT id FROM t"))
 
 [<Fact>]
 let ``SqlReference: UNION はエラーになり 2 文として実行されない`` () =
-    withDb "p0-union" (fun db0 ->
+    withSession "p0-union" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
 
@@ -1585,7 +1585,7 @@ let ``SqlReference: UNION はエラーになり 2 文として実行されない
 
 [<Fact>]
 let ``SqlReference: UNION ALL は両方の行を連結する`` () =
-    withDb "union-all" (fun db0 ->
+    withSession "union-all" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT)"
         let db3 = exec db2 "INSERT INTO a VALUES (1, 'x'), (2, 'y')"
@@ -1607,7 +1607,7 @@ let ``SqlReference: UNION ALL は両方の行を連結する`` () =
 
 [<Fact>]
 let ``SqlReference: UNION ALL の列数が違うとエラー`` () =
-    withDb "union-all-cols" (fun db0 ->
+    withSession "union-all-cols" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY)"
         let db3 = exec db2 "INSERT INTO a VALUES (1, 'x')"
@@ -1616,7 +1616,7 @@ let ``SqlReference: UNION ALL の列数が違うとエラー`` () =
 
 [<Fact>]
 let ``SqlReference: UNION ALL は派生テーブルと INSERT ... SELECT でも使える`` () =
-    withDb "union-all-ctx" (fun db0 ->
+    withSession "union-all-ctx" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY)"
         let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY)"
@@ -1634,7 +1634,7 @@ let ``SqlReference: UNION ALL は派生テーブルと INSERT ... SELECT でも�
 
 [<Fact>]
 let ``SqlReference: EXPLAIN に UnionAll が出る`` () =
-    withDb "union-all-explain" (fun db0 ->
+    withSession "union-all-explain" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO a VALUES (1)"
 
@@ -1644,7 +1644,7 @@ let ``SqlReference: EXPLAIN に UnionAll が出る`` () =
 
 [<Fact>]
 let ``SqlReference: RIGHT JOIN はエラーになり INNER JOIN として実行されない`` () =
-    withDb "p0-right-join" (fun db0 ->
+    withSession "p0-right-join" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY, w TEXT)"
         let db3 = exec db2 "INSERT INTO t VALUES (1)"
@@ -1658,7 +1658,7 @@ let ``SqlReference: RIGHT JOIN はエラーになり INNER JOIN として実行�
 
 [<Fact>]
 let ``SqlReference: 存在しないテーブルの SELECT はエラー`` () =
-    withDb "err1" (fun db -> expectError "存在しないテーブルの SELECT が OK になっています" (execSql db "SELECT * FROM nothing"))
+    withSession "err1" (fun db -> expectError "存在しないテーブルの SELECT が OK になっています" (execSql db "SELECT * FROM nothing"))
 
 [<Fact>]
 let ``SqlReference: 存在しない列の WHERE はエラー`` () =
@@ -1667,11 +1667,11 @@ let ``SqlReference: 存在しない列の WHERE はエラー`` () =
 
 [<Fact>]
 let ``SqlReference: 構文エラーはエラー（例外ではない）`` () =
-    withDb "err3" (fun db -> expectError "構文エラーが OK になっています" (execSql db "SELEC 1"))
+    withSession "err3" (fun db -> expectError "構文エラーが OK になっています" (execSql db "SELEC 1"))
 
 [<Fact>]
 let ``SqlReference: NOT NULL 制約違反はエラー`` () =
-    withDb "err4" (fun db0 ->
+    withSession "err4" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)"
 
         expectError "NOT NULL 違反が OK になっています" (execSql db1 "INSERT INTO t (id) VALUES (1)"))
@@ -1727,7 +1727,7 @@ let ``SqlReference: LIMIT は OFFSET を適用してから取る`` () =
 
 [<Fact>]
 let ``SqlReference: 索引の等価検索は一致する行をすべて返す`` () =
-    withDb "reg-index" (fun db0 ->
+    withSession "reg-index" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
 
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1,10),(2,20),(3,20),(4,30)")
@@ -1741,7 +1741,7 @@ let ``SqlReference: 索引の等価検索は一致する行をすべて返す`` 
 
 [<Fact>]
 let ``SqlReference: 索引列を更新すると索引も追従する`` () =
-    withDb "reg-index-upd" (fun db0 ->
+    withSession "reg-index-upd" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1,10),(2,20)")
         let db3 = exec db2 "CREATE INDEX ix_g ON t (g)"
@@ -1759,7 +1759,7 @@ let ``SqlReference: 索引列を更新すると索引も追従する`` () =
 
 [<Fact>]
 let ``SqlReference: 負数の主キー等値検索`` () =
-    withDb "reg-negpk" (fun db0 ->
+    withSession "reg-negpk" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (-5, 50), (5, 50)")
         // 主キー検索（Unary Neg のリテラルから PkLookup が選ばれる）
@@ -1785,7 +1785,7 @@ let ``SqlReference: Unicode テーブル名でも再オープン後に読める`
 
 [<Fact>]
 let ``SqlReference: CREATE INDEX IF NOT EXISTS は既存なら成功する`` () =
-    withDb "p1-index-if" (fun db0 ->
+    withSession "p1-index-if" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE INDEX ix_v ON t (v)"
         let db3 = exec db2 "CREATE INDEX IF NOT EXISTS ix_v ON t (v)"
@@ -1798,7 +1798,7 @@ let ``SqlReference: CREATE INDEX IF NOT EXISTS は既存なら成功する`` () 
 
 [<Fact>]
 let ``SqlReference: LEFT OUTER JOIN の OUTER 綴り`` () =
-    withDb "p1-left-outer" (fun db0 ->
+    withSession "p1-left-outer" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY, w TEXT)"
         let db3 = exec db2 "INSERT INTO t VALUES (1), (2)"
@@ -1813,7 +1813,7 @@ let ``SqlReference: LEFT OUTER JOIN の OUTER 綴り`` () =
 
 [<Fact>]
 let ``SqlReference: BEGIN/START/COMMIT WORK/END`` () =
-    withDb "p1-txn-spellings" (fun db0 ->
+    withSession "p1-txn-spellings" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "BEGIN TRANSACTION"
         let db3 = exec db2 "INSERT INTO t VALUES (1)"
@@ -1826,7 +1826,7 @@ let ``SqlReference: BEGIN/START/COMMIT WORK/END`` () =
 
 [<Fact>]
 let ``SqlReference: 集約 DISTINCT と IS TRUE/FALSE`` () =
-    withDb "p1-distinct-truth" (fun db0 ->
+    withSession "p1-distinct-truth" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, b BOOLEAN)"
 
         let db2 =
@@ -1859,7 +1859,7 @@ let ``SqlReference: 集約 DISTINCT と IS TRUE/FALSE`` () =
 
 [<Fact>]
 let ``SqlReference: LIKE ESCAPE と CAST`` () =
-    withDb "p1-like-cast" (fun db0 ->
+    withSession "p1-like-cast" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a%b'), (2, 'axb'), (3, 'a_b')"
 
@@ -1879,7 +1879,7 @@ let ``SqlReference: LIKE ESCAPE と CAST`` () =
 
 [<Fact>]
 let ``SqlReference: LENGTH はサロゲートペアを 1文字として数える`` () =
-    withDb "p1-length-surrogate" (fun db0 ->
+    withSession "p1-length-surrogate" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a\U0001F600b')"
         let _, rows = ok (execSql db2 "SELECT LENGTH(s) FROM t")
@@ -1888,7 +1888,7 @@ let ``SqlReference: LENGTH はサロゲートペアを 1文字として数える
 
 [<Fact>]
 let ``SqlReference: LIKE の _ はサロゲートペアを 1文字として扱う`` () =
-    withDb "p1-like-surrogate" (fun db0 ->
+    withSession "p1-like-surrogate" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
 
         let db2 =
@@ -1914,7 +1914,7 @@ let ``SqlReference: LIKE の _ はサロゲートペアを 1文字として扱�
 
 [<Fact>]
 let ``SqlReference: INSERT DEFAULT VALUES と DEFAULT`` () =
-    withDb "p1-default-values" (fun db0 ->
+    withSession "p1-default-values" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT 1, v INTEGER DEFAULT 5, s TEXT)"
 
@@ -1931,7 +1931,7 @@ let ``SqlReference: INSERT DEFAULT VALUES と DEFAULT`` () =
 
 [<Fact>]
 let ``SqlReference: ORDER BY の式と序数`` () =
-    withDb "p1-order-expr" (fun db0 ->
+    withSession "p1-order-expr" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20)"
 
@@ -1965,7 +1965,7 @@ let ``SqlReference: ORDER BY の式と序数`` () =
 [<Fact>]
 let ``SqlReference: FROM を省略した SELECT は定数 1 行を返す`` () =
     // §7.1: FROM は省略できる。入力は 1 行 0 列で、式だけを評価する。
-    withDb "select-no-from" (fun db0 ->
+    withSession "select-no-from" (fun db0 ->
         let _, one = ok (execSql db0 "SELECT 1")
         Assert.Equal<string array>([| "1" |], one.Columns)
         Assert.Equal<int>(1, one.Rows.Length)
@@ -2013,7 +2013,7 @@ let ``SqlReference: FROM を省略した SELECT は定数 1 行を返す`` () =
 [<Fact>]
 let ``SqlReference: 数字から始まる識別子は受け付けない`` () =
     // §2: 数字から始められない。`_` 始まりは使える。
-    withDb "ident-start" (fun db0 ->
+    withSession "ident-start" (fun db0 ->
         expectErrorKind ErrorKind.SyntaxError "数字始まりのテーブル名" (execSql db0 "CREATE TABLE 1a (id INTEGER PRIMARY KEY)")
 
         let db1 = exec db0 "CREATE TABLE _u (id INTEGER PRIMARY KEY)"
@@ -2025,7 +2025,7 @@ let ``SqlReference: 数字から始まる識別子は受け付けない`` () =
 let ``SqlReference: 型の別綴りはすべて受理される`` () =
     // §3: BOOLEAN / BOOL, INTEGER / INT / BIGINT, REAL / DOUBLE, DECIMAL / NUMERIC,
     // TEXT / VARCHAR, DATE, TIMESTAMP / DATETIME, UUID。
-    withDb "type-aliases" (fun db0 ->
+    withSession "type-aliases" (fun db0 ->
         let db1 =
             exec
                 db0
@@ -2047,7 +2047,7 @@ let ``SqlReference: 型の別綴りはすべて受理される`` () =
 [<Fact>]
 let ``SqlReference: VARCHAR(1) は値を切り詰めない`` () =
     // §3: 型引数は読み取られるだけで、切り詰めも検証も行わない。
-    withDb "varchar-no-truncate" (fun db0 ->
+    withSession "varchar-no-truncate" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s VARCHAR(1))"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'abcdefghij')"
         let _, rows = ok (execSql db2 "SELECT s FROM t")
@@ -2056,7 +2056,7 @@ let ``SqlReference: VARCHAR(1) は値を切り詰めない`` () =
 [<Fact>]
 let ``SqlReference: CHAR は型名として受け付けない`` () =
     // §3: TEXT の別綴りは VARCHAR のみ。CHAR は削除済み。
-    withDb "char-removed" (fun db0 ->
+    withSession "char-removed" (fun db0 ->
         expectErrorKind
             ErrorKind.SyntaxError
             "CHAR は未知の型"
@@ -2065,7 +2065,7 @@ let ``SqlReference: CHAR は型名として受け付けない`` () =
 [<Fact>]
 let ``SqlReference: INSERT の値式は列参照を含められない`` () =
     // §4: 値は定数式のみ。列参照は名前解決でエラーになる。
-    withDb "insert-column-ref" (fun db0 ->
+    withSession "insert-column-ref" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, n INTEGER)"
         let db2, ins = ok (execSql db1 "INSERT INTO t (id, v, n) VALUES (1, 'a', 2 + 3)")
         Assert.Equal<int>(1, ins.RowsAffected)
@@ -2079,7 +2079,7 @@ let ``SqlReference: INSERT の値式は列参照を含められない`` () =
 [<Fact>]
 let ``SqlReference: SELECT 項目の後置演算子`` () =
     // §5: SELECT 項目は式として解析されるので、裸の識別子・関数の後に演算子を書ける。
-    withDb "select-postfix" (fun db0 ->
+    withSession "select-postfix" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, n INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a', 1)"
 
@@ -2093,7 +2093,7 @@ let ``SqlReference: SELECT 項目の後置演算子`` () =
 [<Fact>]
 let ``SqlReference: 式の列名は丸括弧つきの表示文字列`` () =
     // §7.3: `SELECT (1 + 2)` の列名は `(1 + 2)`（常に丸括弧つき）。
-    withDb "expr-column-name" (fun db0 ->
+    withSession "expr-column-name" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a')"
         let _, r = ok (execSql db2 "SELECT (1 + 2), v || 'x' FROM t")
@@ -2102,7 +2102,7 @@ let ``SqlReference: 式の列名は丸括弧つきの表示文字列`` () =
 [<Fact>]
 let ``SqlReference: ORDER BY に集約式は書けない`` () =
     // §7.3: 集約式（ORDER BY COUNT(*) など）は未対応。
-    withDb "order-by-agg" (fun db0 ->
+    withSession "order-by-agg" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
         expectErrorKind ErrorKind.NameError "ORDER BY COUNT(*)" (execSql db2 "SELECT id FROM t ORDER BY COUNT(*)"))
@@ -2110,7 +2110,7 @@ let ``SqlReference: ORDER BY に集約式は書けない`` () =
 [<Fact>]
 let ``SqlReference: ORDER BY の序数は範囲外だとエラー`` () =
     // §7.3: 序数は 1 始まり。範囲外は黙って切らずに SyntaxError。
-    withDb "order-by-ordinal" (fun db0 ->
+    withSession "order-by-ordinal" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
 
@@ -2123,7 +2123,7 @@ let ``SqlReference: ORDER BY の序数は範囲外だとエラー`` () =
 [<Fact>]
 let ``SqlReference: 主キーの重複 INSERT はエラー（upsert しない）`` () =
     // §8: 主キー重複はエラーになる（複数列の主キーも同じ）。
-    withDb "pk-duplicate" (fun db0 ->
+    withSession "pk-duplicate" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a')"
 
@@ -2137,7 +2137,7 @@ let ``SqlReference: 主キーの重複 INSERT はエラー（upsert しない）
 [<Fact>]
 let ``SqlReference: UPDATE は主キー列を変えられない`` () =
     // §9: 主キー列を SET するとエラーになり、何も更新されない。
-    withDb "pk-update" (fun db0 ->
+    withSession "pk-update" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b')"
 
@@ -2149,7 +2149,7 @@ let ``SqlReference: UPDATE は主キー列を変えられない`` () =
 [<Fact>]
 let ``SqlReference: UPDATE の式は更新前の行に対して評価する`` () =
     // §9: 式は更新前の行に対して評価される。
-    withDb "update-pre-row" (fun db0 ->
+    withSession "update-pre-row" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 10, 'x')"
 
@@ -2166,7 +2166,7 @@ let ``SqlReference: UPDATE の式は更新前の行に対して評価する`` ()
 [<Fact>]
 let ``SqlReference: DELETE は WHERE を省略すると全行を消す`` () =
     // §10
-    withDb "delete-all" (fun db0 ->
+    withSession "delete-all" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')"
         let db3, del = ok (execSql db2 "DELETE FROM t")
@@ -2178,7 +2178,7 @@ let ``SqlReference: DELETE は WHERE を省略すると全行を消す`` () =
 [<Fact>]
 let ``SqlReference: 主キーの無い CREATE TABLE はエラー`` () =
     // §11.1: 主キーは省略できない。
-    withDb "pk-required" (fun db0 ->
+    withSession "pk-required" (fun db0 ->
         expectErrorKind ErrorKind.ConstraintViolation "主キー無しの CREATE TABLE" (execSql db0 "CREATE TABLE t (a INTEGER)")
         Assert.Empty(ok (db0.TableNames())))
 
@@ -2186,7 +2186,7 @@ let ``SqlReference: 主キーの無い CREATE TABLE はエラー`` () =
 let ``SqlReference: PRIMARY KEY の定義は 1 テーブルに 1 つだけ`` () =
     // §11.1: 列レベルとテーブルレベルの併用、複数列への列レベル、
     // 複数のテーブルレベルはいずれも ConstraintViolation。
-    withDb "pk-once" (fun db0 ->
+    withSession "pk-once" (fun db0 ->
         expectErrorKind
             ErrorKind.ConstraintViolation
             "列レベルとテーブルレベルの併用"
@@ -2209,7 +2209,7 @@ let ``SqlReference: PRIMARY KEY の定義は 1 テーブルに 1 つだけ`` () 
 [<Fact>]
 let ``SqlReference: 型を省略した列定義は TEXT になる`` () =
     // §11.1: 型を書かずに制約だけを書く構文も受け付ける（型は TEXT）。
-    withDb "column-type-omitted" (fun db0 ->
+    withSession "column-type-omitted" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, name NOT NULL)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'zz')"
         // TEXT 列なので数値も文字列表現へ変換される
@@ -2222,7 +2222,7 @@ let ``SqlReference: 型を省略した列定義は TEXT になる`` () =
 [<Fact>]
 let ``SqlReference: CREATE TABLE IF EXISTS は既存なら何もしない`` () =
     // §11.1: `IF EXISTS` と `IF NOT EXISTS` の両方の綴りを受け付ける。
-    withDb "create-table-if-exists" (fun db0 ->
+    withSession "create-table-if-exists" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a')"
         let db3 = exec db2 "CREATE TABLE IF EXISTS t (id INTEGER PRIMARY KEY, v TEXT)"
@@ -2234,7 +2234,7 @@ let ``SqlReference: CREATE TABLE IF EXISTS は既存なら何もしない`` () =
 [<Fact>]
 let ``SqlReference: テーブルレベル UNIQUE の列を検証する`` () =
     // §11.1: 存在しない列・重複列は NameError で拒否する。
-    withDb "table-unique-columns" (fun db0 ->
+    withSession "table-unique-columns" (fun db0 ->
         expectErrorKind
             ErrorKind.NameError
             "UNIQUE の存在しない列"
@@ -2253,7 +2253,7 @@ let ``SqlReference: テーブルレベル UNIQUE の列を検証する`` () =
 [<Fact>]
 let ``SqlReference: SQL の BEGIN と ROLLBACK で書き込みを取り消す`` () =
     // §12 の例どおり。BEGIN / COMMIT / ROLLBACK は暗黙の transaction を制御する。
-    withDb "sql-txn" (fun db0 ->
+    withSession "sql-txn" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a')"
 
@@ -2271,7 +2271,7 @@ let ``SqlReference: SQL の BEGIN と ROLLBACK で書き込みを取り消す`` 
 
 [<Fact>]
 let ``SqlReference: サブクエリ（スカラー・IN・EXISTS）`` () =
-    withDb "subquery" (fun db0 ->
+    withSession "subquery" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"
 
@@ -2386,7 +2386,7 @@ let ``SqlReference: サブクエリ（スカラー・IN・EXISTS）`` () =
 
 [<Fact>]
 let ``SqlReference: 相関サブクエリ`` () =
-    withDb "correlated" (fun db0 ->
+    withSession "correlated" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept TEXT, salary INTEGER)"
 
@@ -2520,7 +2520,7 @@ let ``SqlReference: 相関サブクエリ`` () =
 
 [<Fact>]
 let ``SqlReference: 相関サブクエリの未対応形`` () =
-    withDb "correlated-errors" (fun db0 ->
+    withSession "correlated-errors" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20)"
 
@@ -2552,7 +2552,7 @@ let ``SqlReference: 相関サブクエリの未対応形`` () =
 
 [<Fact>]
 let ``SqlReference: サブクエリの未対応形とエラー`` () =
-    withDb "subquery-errors" (fun db0 ->
+    withSession "subquery-errors" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20)"
 
@@ -2586,7 +2586,7 @@ let ``SqlReference: サブクエリの未対応形とエラー`` () =
 let ``SqlReference: 集約結果は DATE の型を保つ`` () =
     // 集約後の値を Literal に落とすと DATE / TIMESTAMP / UUID が TEXT になり、
     // 外側の DATE 列と比較できなくなる（サブクエリで顕在化した）。
-    withDb "agg-date" (fun db0 ->
+    withSession "agg-date" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE d (id INTEGER PRIMARY KEY, dt DATE)"
         let db2 = exec db1 "INSERT INTO d VALUES (1,'2026-11-03'),(2,'2026-11-04')"
 
@@ -2608,7 +2608,7 @@ let ``SqlReference: 深いサブクエリの入れ子も実行できる`` () =
     // `Plan.planSelect` / `resolveSelect` / `resolveExpr` / `resolveLeaf` は相互再帰するが、
     // 継続を末尾で呼ぶので入れ子段数に依存せずスタックは一定。
     // Parser 側も CPS なので、式・サブクエリの深さ上限はない。
-    withDb "subquery-depth" (fun db0 ->
+    withSession "subquery-depth" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10)"
 
@@ -2624,7 +2624,7 @@ let ``SqlReference: 深いサブクエリの入れ子も実行できる`` () =
 
 [<Fact>]
 let ``SqlReference: 派生テーブル（FROM / JOIN）`` () =
-    withDb "derived" (fun db0 ->
+    withSession "derived" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"
         let db3 = exec db2 "CREATE TABLE u (id INTEGER PRIMARY KEY, w INTEGER)"
@@ -2760,7 +2760,7 @@ let ``SqlReference: 派生テーブル（FROM / JOIN）`` () =
 
 [<Fact>]
 let ``SqlReference: EXPLAIN は実行せずに計画を返す`` () =
-    withDb "explain" (fun db0 ->
+    withSession "explain" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')"
         let db3 = exec db2 "CREATE INDEX ix ON t (v)"
@@ -2860,7 +2860,7 @@ let ``SqlReference: EXPLAIN は実行せずに計画を返す`` () =
 [<Fact>]
 let ``SqlReference: 未対応の構文は明示的な SyntaxError`` () =
     // §14「構文が未対応のもの」。集合演算と RIGHT / FULL JOIN は ParserTests が担当。
-    withDb "unsupported-syntax" (fun db0 ->
+    withSession "unsupported-syntax" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
         let db2 = exec db1 "INSERT INTO t VALUES (1, 'a')"
 
@@ -2888,7 +2888,7 @@ let ``SqlReference: 未対応の構文は明示的な SyntaxError`` () =
 [<Fact>]
 let ``SqlReference: よく見るエラーメッセージは sql-reference §13 と一致する`` () =
     // §13 の一覧は「実測」した文言そのもの。種別（ErrorKind）だけでは文言の劣化を検出できない。
-    withDb "error-messages" (fun db0 ->
+    withSession "error-messages" (fun db0 ->
         let db1 =
             exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT NOT NULL, num INTEGER, active BOOLEAN)"
 
@@ -2923,7 +2923,7 @@ let ``SqlReference: よく見るエラーメッセージは sql-reference §13 �
 let ``SqlReference: WHERE に書いた結合述語は ON と同じ結果になる`` () =
     // 複数テーブルを参照する WHERE の述語は INNER の ON へ昇格する
     // （INNER では ON と WHERE は同値。昇格しないと結合キーに使えず入れ子ループになる）。
-    withDb "join-promote" (fun db0 ->
+    withSession "join-promote" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER)"
         let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, g INTEGER)"
         let db3, _ = execRes db2 "INSERT INTO a VALUES (1,10),(2,20),(3,10)"
@@ -2945,7 +2945,7 @@ let ``SqlReference: WHERE に書いた結合述語は ON と同じ結果にな�
 [<Fact>]
 let ``SqlReference: 結合順が並べ替えられても結果は同じ`` () =
     // c の主キー等値で c が先に結合される（FROM に書いた順とは違う計画になる）。
-    withDb "join-order" (fun db0 ->
+    withSession "join-order" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, av INTEGER)"
         let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, bv INTEGER)"
@@ -2967,7 +2967,7 @@ let ``SqlReference: 結合順が並べ替えられても結果は同じ`` () =
 
 [<Fact>]
 let ``SqlReference: 並べ替えても LEFT JOIN の NULL 拡張は変わらない`` () =
-    withDb "join-order-left" (fun db0 ->
+    withSession "join-order-left" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE l (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE TABLE r (id INTEGER PRIMARY KEY, lv INTEGER)"
         let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, rv INTEGER)"
@@ -2987,7 +2987,7 @@ let ``SqlReference: 並べ替えても LEFT JOIN の NULL 拡張は変わらな�
 
 [<Fact>]
 let ``SqlReference: JOIN の後に続く LEFT JOIN も実行される`` () =
-    withDb "join-inner-then-left" (fun db0 ->
+    withSession "join-inner-then-left" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE e (id INTEGER PRIMARY KEY, d INTEGER)"
         let db2 = exec db1 "CREATE TABLE d (id INTEGER PRIMARY KEY, c INTEGER)"
         let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY)"

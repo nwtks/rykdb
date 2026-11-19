@@ -12,14 +12,6 @@ open RykDb.TestHelpers
 module private UnlimitedOps =
     let sortBy = Ops.sortBy MemoryBudget.Unlimited
 
-/// 2 列（a, b）のスキーマ。
-let private schema2 =
-    outSchema
-        [
-            outCol "a" None (Some DataType.Integer)
-            outCol "b" None (Some DataType.Integer)
-        ]
-
 /// 行の配列を Op にする（入れ子の配列推論を避けるため明示的に作る）。
 let private opOfRows (rows: SqlValue array list) = Op.ofArray (List.toArray rows)
 

@@ -16,14 +16,6 @@ module private UnlimitedOps =
     let aggregate = Ops.aggregate MemoryBudget.Unlimited
     let havingFilter = Ops.havingFilter
 
-/// 2 列（a, b）のスキーマ。
-let private schema2 =
-    outSchema
-        [
-            outCol "a" None (Some DataType.Integer)
-            outCol "b" None (Some DataType.Integer)
-        ]
-
 /// 行の配列を Op にする（入れ子の配列推論を避けるため明示的に作る）。
 let private opOfRows (rows: SqlValue array list) = Op.ofArray (List.toArray rows)
 
@@ -44,6 +36,24 @@ let private asReal (v: SqlValue) =
 
 let private col (name: string) =
     Expr.Column { Qualifier = None; Name = name }
+
+/// 行の並びを表示用の文字列にする（スピル有無の比較用）。
+let private rowsText (rows: SqlValue array array) =
+    rows
+    |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
+    |> String.concat "|"
+
+/// 退避に使った一時ファイルが残っていないことを確かめる（サイズ付きの詳細表示）。
+let private assertNoLeftoversDetailed (dir: string) =
+    let files = System.IO.Directory.GetFiles dir
+
+    if files.Length > 0 then
+        let detail =
+            files
+            |> Array.map (fun p -> sprintf "%s(%d)" (System.IO.Path.GetFileName p) (System.IO.FileInfo(p).Length))
+            |> String.concat " "
+
+        Assert.Fail(sprintf "一時ファイルが残っています: %s" detail)
 
 [<Fact>]
 let ``sortBy: 昇順と降順`` () =
@@ -466,61 +476,6 @@ let ``project: 項目が空なら入力をそのまま返す`` () =
     Assert.Equal<int64>(1L, asInt rows.[0].[0])
 
 [<Fact>]
-let ``SelectProjection: ヘッダと式の列数が一致する`` () =
-    let items =
-        [
-            { Expression = Expr.Star; Alias = None }
-            {
-                Expression = col "a"
-                Alias = Some "x"
-            }
-            {
-                Expression = Expr.Binary(BinaryOp.Add, col "a", col "b")
-                Alias = None
-            }
-        ]
-
-    let projection = SelectProjection.create schema2 items
-
-    // * は 2 列、別名つき列が 1 列、式が 1 列。
-    Assert.Equal<int>(4, projection.Expressions.Length)
-    Assert.Equal<int>(4, projection.DisplayHeader.Length)
-    Assert.Equal<int>(4, projection.ReferenceHeader.Length)
-
-[<Fact>]
-let ``SelectProjection: 項目が空なら入力スキーマをそのまま使う`` () =
-    let projection = SelectProjection.create schema2 []
-    Assert.Empty projection.Expressions
-    Assert.Equal<int>(2, projection.DisplayHeader.Length)
-    Assert.Equal<int>(2, projection.ReferenceHeader.Length)
-
-/// スピルを強制する小さな作業領域（一時ファイルもこのディレクトリへ）。
-let private tightBudget (dir: string) (bytes: int64) =
-    { MemoryBudget.Default with
-        Work = bytes
-        Sort = bytes
-        Directory = Some dir
-    }
-
-/// 行の並びを表示用の文字列にする（スピル有無の比較用）。
-let private rowsText (rows: SqlValue array array) =
-    rows
-    |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
-    |> String.concat "|"
-
-/// 退避に使った一時ファイルが残っていないことを確かめる。
-let private assertNoLeftovers (dir: string) =
-    let files = System.IO.Directory.GetFiles dir
-
-    if files.Length > 0 then
-        let detail =
-            files
-            |> Array.map (fun p -> sprintf "%s(%d)" (System.IO.Path.GetFileName p) (System.IO.FileInfo(p).Length))
-            |> String.concat " "
-
-        Assert.Fail(sprintf "一時ファイルが残っています: %s" detail)
-
-[<Fact>]
 let ``distinct: 上限を超えて退避しても結果と順序が変わらない`` () =
     withDir "distinct-spill" (fun dir ->
         // 37 種類の行が繰り返し現れる（300 行）。
@@ -545,7 +500,7 @@ let ``distinct: 上限を超えて退避しても結果と順序が変わらな�
         Assert.Equal<int64>(36L, asInt baseline.[36].[0])
 
         // 一時ファイルは残らない。
-        assertNoLeftovers dir)
+        assertNoLeftoversDetailed dir)
 
 [<Fact>]
 let ``集約: 上限を超えて退避しても結果と順序が変わらない`` () =
@@ -579,7 +534,7 @@ let ``集約: 上限を超えて退避しても結果と順序が変わらない
         Assert.Equal<int64>(0L, asInt baseline.[0].[0])
         Assert.Equal<int64>(52L, asInt baseline.[52].[0])
 
-        assertNoLeftovers dir)
+        assertNoLeftoversDetailed dir)
 
 [<Fact>]
 let ``集約: 退避したグループにも DISTINCT 集約が効く`` () =
@@ -600,4 +555,4 @@ let ``集約: 退避したグループにも DISTINCT 集約が効く`` () =
 
         Assert.Equal<int>(7, baseline.Length)
         Assert.Equal<string>(rowsText baseline, rowsText spilled)
-        assertNoLeftovers dir)
+        assertNoLeftoversDetailed dir)

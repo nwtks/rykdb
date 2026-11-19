@@ -8,34 +8,6 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-/// テスト用の ExecContext（people と orders を登録済み）。
-let private ctxOf (store: RowStore) =
-    ExecContext.create store None
-    |> ExecContext.withSchema "people" peopleSchema
-    |> ExecContext.withSchema "orders" ordersSchema
-
-let private pCol (n: string) =
-    Expr.Column { Qualifier = Some "people"; Name = n }
-
-let private oCol (n: string) =
-    Expr.Column { Qualifier = Some "orders"; Name = n }
-
-/// テスト用の文を作る。
-let private selectOf (items: SelectItem list) (from: TableRef option) (joins: JoinClause list) (w: Expr option) =
-    {
-        Distinct = false
-        Items = items
-        From = Option.map TableSource.Named from
-        Joins = joins
-        Where = w
-        GroupBy = []
-        Having = None
-        OrderBy = []
-        Limit = None
-        Offset = None
-        SetOperations = []
-    }
-
 /// xtra を登録した文脈（people / orders に加えて 3つ目のテーブル）。
 let private ctxWithExtra (store: RowStore) =
     ctxOf store |> ExecContext.withSchema "xtra" peopleSchema

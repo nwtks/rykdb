@@ -29,6 +29,22 @@ let private rightSchema =
 let private lcol = Expr.Column { Qualifier = Some "l"; Name = "lid" }
 let private rcol = Expr.Column { Qualifier = Some "r"; Name = "rid" }
 
+/// 行の並びを順序非依存の文字列にする（結合アルゴリズムが変わっても比較できる）。
+let private rowsText (rows: SqlValue array array) =
+    rows
+    |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
+    |> Array.sort
+    |> String.concat "|"
+
+/// 重複キーを含む左右の入力（左 40行 / 右 24行）。
+let private dupLeft () =
+    Op.ofArray [| for i in 0..39 -> [| SqlValue.Int(int64 (i % 5)) |] |]
+
+let private dupRight () =
+    Op.ofArray [| for i in 0..23 -> [| SqlValue.Int(int64 (i % 8)) |] |]
+
+let private onEq = Expr.Binary(BinaryOp.Eq, lcol, rcol)
+
 [<Fact>]
 let ``結合: INNER JOIN`` () =
     let left =
@@ -346,37 +362,6 @@ let ``結合: LEFT JOIN の ON 評価失敗も Error になる`` () =
         )
 
     expectError "ON の評価失敗が握り潰されています" (Op.toArray (ok (UnlimitedOpsJoin.leftJoin leftSchema left rightSchema right on)))
-
-/// スピルを強制する小さな作業領域（一時ファイルもこのディレクトリへ）。
-let private tightBudget (dir: string) (bytes: int64) =
-    { MemoryBudget.Default with
-        Work = bytes
-        Sort = bytes
-        Directory = Some dir
-    }
-
-/// 行の並びを順序非依存の文字列にする（結合アルゴリズムが変わっても比較できる）。
-let private rowsText (rows: SqlValue array array) =
-    rows
-    |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
-    |> Array.sort
-    |> String.concat "|"
-
-/// 退避に使った一時ファイルが残っていないことを確かめる。
-let private assertNoLeftovers (dir: string) =
-    let files = System.IO.Directory.GetFiles dir
-
-    if files.Length > 0 then
-        Assert.Fail(sprintf "一時ファイルが残っています: %A" (files |> Array.map System.IO.Path.GetFileName))
-
-/// 重複キーを含む左右の入力（左 40行 / 右 24行）。
-let private dupLeft () =
-    Op.ofArray [| for i in 0..39 -> [| SqlValue.Int(int64 (i % 5)) |] |]
-
-let private dupRight () =
-    Op.ofArray [| for i in 0..23 -> [| SqlValue.Int(int64 (i % 8)) |] |]
-
-let private onEq = Expr.Binary(BinaryOp.Eq, lcol, rcol)
 
 [<Fact>]
 let ``結合: 入れ子ループは右を退避しても結果が変わらない`` () =

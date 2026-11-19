@@ -23,7 +23,6 @@
     <Compile Include="SstableFormat.fs" />
     <Compile Include="Sstable.fs" />
     <Compile Include="VersionSet.fs" />
-    <Compile Include="Manifest.fs" />
     <Compile Include="Compaction.fs" />
     <Compile Include="StorageEngine.fs" />
     <Compile Include="Ast.fs" />
@@ -53,7 +52,7 @@
     <Compile Include="Plan.fs" />
     <Compile Include="DropCleanup.fs" />
     <Compile Include="Engine.fs" />
-    <Compile Include="SessionHost.fs" />
+    <Compile Include="DatabaseHost.fs" />
     <Compile Include="Session.fsi" />
     <Compile Include="Session.fs" />
   </ItemGroup>

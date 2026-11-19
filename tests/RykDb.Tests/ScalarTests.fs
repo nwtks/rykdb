@@ -119,16 +119,6 @@ let ``Scalar.likeMatch: 計画時にコンパイルしたパターンは行ご�
     Assert.True(allocated < 10_000L, sprintf "1000 回で %d バイト確保しました" allocated)
 
 [<Fact>]
-let ``Scalar.likeMatchWithEscape: エスケープした % _ ! をリテラルにする`` () =
-    Assert.True(ok (likeEsc '!' "a!%b" "a%b"))
-    Assert.False(ok (likeEsc '!' "a!%b" "axb"))
-    Assert.True(ok (likeEsc '!' "a!_b" "a_b"))
-    Assert.False(ok (likeEsc '!' "a!_b" "axb"))
-    Assert.True(ok (likeEsc '!' "a!!b" "a!b"))
-    Assert.False(ok (likeEsc '!' "a!!b" "ab"))
-    expectErrorKind ErrorKind.TypeError "末尾 ESCAPE" (likeEsc '!' "a!" "a")
-
-[<Fact>]
 let ``Scalar.likeMatch: _ とリテラルは Unicode コードポイント単位で照合する`` () =
     // サロゲートペア（BMP 外）は `_` 1個に一致する（UTF-16 の code unit 2個分ではない）
     Assert.True(Scalar.likeMatch "a_b" "a\U0001F600b")
@@ -151,3 +141,13 @@ let ``Scalar.likeMatch: _ とリテラルは Unicode コードポイント単位
     // ESCAPE が 1 コードポイントでなければ TypeError
     expectErrorKind ErrorKind.TypeError "2 コードポイントの ESCAPE" (Scalar.escapeCodePoint "ab")
     expectErrorKind ErrorKind.TypeError "空の ESCAPE" (Scalar.escapeCodePoint "")
+
+[<Fact>]
+let ``Scalar.likeMatchWithEscape: エスケープした % _ ! をリテラルにする`` () =
+    Assert.True(ok (likeEsc '!' "a!%b" "a%b"))
+    Assert.False(ok (likeEsc '!' "a!%b" "axb"))
+    Assert.True(ok (likeEsc '!' "a!_b" "a_b"))
+    Assert.False(ok (likeEsc '!' "a!_b" "axb"))
+    Assert.True(ok (likeEsc '!' "a!!b" "a!b"))
+    Assert.False(ok (likeEsc '!' "a!!b" "ab"))
+    expectErrorKind ErrorKind.TypeError "末尾 ESCAPE" (likeEsc '!' "a!" "a")

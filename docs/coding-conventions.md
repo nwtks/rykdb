@@ -58,7 +58,7 @@ RykDb を書くときの規約。
 ## 2. 命令型の構文・機能を使わない
 
 **ロジック層（型・字句・構文・計画・実行・ストレージ）では `mutable` / `while` / `ref` を 0件**に保つ。
-`src/RykDb.Core/` に残る `mutable` は公開セッション層（`Session.fs` / `SessionHost.fs`）の
+`src/RykDb.Core/` に残る `mutable` は公開セッション層（`Session.fs` / `DatabaseHost.fs`）の
 状態 DU のスロット 5箇所と読み取り数カウンタだけで、次を意図的に使う。
 
 この規約が保証するのは**可変状態の所在が列挙できること**であり、可変状態の全廃ではない。
@@ -66,7 +66,7 @@ RykDb を書くときの規約。
 行・キー・アキュムレータの蓄積には `ResizeArray` を使わず、`list` / `array` を使う。
 「Core に mutable が無い」ではなく「可変状態はここにしかない」と読むこと。
 
-- `DatabaseHost` の `let mutable lifecycle`（`HostLifecycle` = `Running` / `Closed`、`SessionHost.fs`）:
+- `DatabaseHost` の `let mutable lifecycle`（`HostLifecycle` = `Running` / `Closed`、`DatabaseHost.fs`）:
   全接続で共有する確定状態（`Committed`）と Close 状態を 1つの状態 DU で持つ。
 - `Session` の `let mutable local`（`LocalSession` = `Open` / `Closed`）と
   `let mutable readers`: 接続ローカルの transaction 状態と Close 状態を状態 DU で、

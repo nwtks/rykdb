@@ -41,14 +41,14 @@ dotnet test -p:CollectCoverage=true -p:Threshold=90 -p:ThresholdType=line -p:Thr
 lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>/` を消してから
 `dotnet restore --force-evaluate` を実行する。
 
-| ゲート                  | 設定                                                                                                                                             |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `TreatWarningsAsErrors` | **有効**                                                                                                                                         |
-| `LangVersion`           | `10.0`                                                                                                                                           |
-| `WarningLevel`          | `3`                                                                                                                                              |
-| `OtherFlags`            | `--warnon:1182`（未使用ローカル変数もエラー）                                                                                                    |
-| 依存の再現性            | `global.json`（SDK） / `packages.lock.json`                                                                                                      |
-| Core の命令型構文・機能 | ロジック層は `mutable` / `while` / `ref` なし。例外は `Session.fs` / `SessionHost.fs` の状態 DU スロットのみ（可変コレクションは別途許可リスト） |
+| ゲート                  | 設定                                                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TreatWarningsAsErrors` | **有効**                                                                                                                                          |
+| `LangVersion`           | `10.0`                                                                                                                                            |
+| `WarningLevel`          | `3`                                                                                                                                               |
+| `OtherFlags`            | `--warnon:1182`（未使用ローカル変数もエラー）                                                                                                     |
+| 依存の再現性            | `global.json`（SDK） / `packages.lock.json`                                                                                                       |
+| Core の命令型構文・機能 | ロジック層は `mutable` / `while` / `ref` なし。例外は `Session.fs` / `DatabaseHost.fs` の状態 DU スロットのみ（可変コレクションは別途許可リスト） |
 
 > **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
 > （[`gotchas.md`](gotchas.md) §10.4）。
@@ -91,7 +91,7 @@ xUnit。
 （`src/RykDb.Core/Dml.fs` → `tests/RykDb.Tests/DmlTests.fs`）。
 モジュール名も `module RykDb.DmlTests` と対象名に合わせる。
 
-**例外**: `Session.fs` の公開 API は `SessionTests.fs`、`SessionHost.fs` は `SessionHostTests.fs` で検証する。
+**例外**: `Session.fs` の公開 API は `SessionTests.fs`、`DatabaseHost.fs` は `DatabaseHostTests.fs` で検証する。
 `DatabaseTests.fs` は src に対応ファイルを持たない DB 全体の通し経路テスト
 （公開 API の `Session` / `SessionPool` で内部機構を検証する）。
 `ProcessLock.fs` / `EngineHost.fs` は専用ファイルを持たず、
@@ -105,7 +105,7 @@ dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"    # Server のみ
 ```
 
 **テスト方針**: `DatabaseTests` は DB 全体の通し経路として内部機構
-（MVCC / WAL / プロセスロック / 索引 backfill・後始末 / snapshot 登録 / 永続性 / 末尾再帰）
+（MVCC / WAL / プロセスロック / 索引 backfill・後始末 / 永続性 / 末尾再帰）
 を検証する。
 `SqlReferenceTests` / `ServerTests` は「SQL 文字列 → 結果」の通し経路を検証する。
 Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグはそこだけで分かる。
@@ -116,14 +116,14 @@ Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグ�
   （文・句・式・リテラル・識別子が受理 / 拒否され、評価結果も仕様どおりであること）。
   テスト名の接頭辞は `SqlReference:`。
 - `DatabaseTests` — DB 全体の通し経路（`Session` / `SessionPool` 経由）と内部機構
-  （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / snapshot 登録 / 永続性 / 末尾再帰）。
+  （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / 永続性 / 末尾再帰）。
 
 **書き方**:
 
 - 1テスト = 1関数。
   `let ``説明`` () = ...` の**関数形**
   （FS0842: 関数でない場合、テストとして認識されず無視される）。
-- 共通ヘルパー（`ok` / `expectError` / `expectErrorKind` / `failActual` / `withDir` / `asInt` / `parseOneOk` / `whereOf` / 乱数生成 / `buildSstable` / `scanOfEntries` / `levelCounts` / `indexDefinition`）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
+- 共通ヘルパー（`ok` / `expectError` / `expectErrorKind` / `failActual` / `withDir` / `tightBudget` / `assertNoLeftovers` / `asInt` / `schema2` / `ctxOf` / `pCol` / `oCol` / `selectOf` / `parseOneOk` / `whereOf` / 乱数生成 / `buildSstable` / `scanOfEntries` / `levelCounts` / `indexDefinition`）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
   ファイル固有のヘルパー・fixture（スキーマ、`DmlTests` の `insertRow` など）は各ファイルに private で置く。
   **同一実装が 2ファイル以上にあるヘルパーは重複させず TestHelpers に置く**
   （`parseStatement` / `parseOneOk` / `expectVariant` / `parseSelectOk` / `whereOf` を Parser 系 2ファイルから集約した）。
@@ -133,7 +133,7 @@ Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグ�
   - **「エラーになるべき」** → `expectError` / `expectErrorKind`（Error 臂の検査も込み）。
   - **値を返すヘルパー**（`ok` / `asInt` / `parseOneOk` など） → `failwithf`。
     例外は xUnit が失敗として扱うので、`Assert.Fail` + `Unchecked.defaultof<'T>` のような**偽の戻り値は書かない**。
-- `withStore` / `withDb` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
+- `withStore` / `withSession` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
   ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Session.OpenWithSync` を直接使って検証する。
 - 新しいファイルは `.fsproj` の Compile 順（= src のコンパイル順）に追加する。
 - 一時ディレクトリは `Path.GetTempPath()` + `Ticks`。

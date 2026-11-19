@@ -150,6 +150,22 @@ let withDir (tag: string) (f: string -> unit) =
             with _ ->
                 ()
 
+/// スピルを強制する小さな作業領域（一時ファイルもこのディレクトリへ）。
+/// OpsTests / OpsJoinTests / SpillTests で共有する。
+let tightBudget (dir: string) (bytes: int64) =
+    { MemoryBudget.Default with
+        Work = bytes
+        Sort = bytes
+        Directory = Some dir
+    }
+
+/// 退避に使った一時ファイルが残っていないことを確かめる。
+let assertNoLeftovers (dir: string) =
+    let files = System.IO.Directory.GetFiles dir
+
+    if files.Length > 0 then
+        Assert.Fail(sprintf "一時ファイルが残っています: %A" (files |> Array.map System.IO.Path.GetFileName))
+
 /// 純粋な seq を SstScan に変換する。
 let scanOfEntries (items: seq<SstEntry>) =
     let e = items.GetEnumerator()
@@ -279,7 +295,6 @@ let memoryEngine () =
     let state = MemoryEngineState()
     MemoryStorageEngine state :> IStorageEngine
 
-
 /// エンジンを差し替えて、空の RowStore を作る（テスト用）。
 /// ディスクに触れないメモリ実装を渡せば、全 keyspace が 1本の LSM に載る。
 let openStoreWith (root: string) (engine: IStorageEngine) =
@@ -302,7 +317,7 @@ let withStore (_tag: string) (f: RowStore -> unit) = f (openStoreWith "" (memory
 /// 並行する他のテストの transaction が DDL の排他判定に引っかかる。
 /// store 側の root は空のまま（commit intent をディスクに書かない）。
 /// </remarks>
-let withDb (_tag: string) (f: Session -> unit) =
+let withSession (_tag: string) (f: Session -> unit) =
     let root = "mem:" + System.Guid.NewGuid().ToString "N"
     let store = openStoreWith "" (memoryEngine ())
     let session = ok (Session.OpenWithStore(root, SessionOptions.Default, store))
@@ -312,7 +327,7 @@ let withDb (_tag: string) (f: Session -> unit) =
     finally
         ok (session.Close()) |> ignore
 
-/// `withDb` と同じだが、`DatabaseHost` も渡す（registry / root を直接見るテスト用）。
+/// `withSession` と同じだが、`DatabaseHost` も渡す（registry / root を直接見るテスト用）。
 let withDbHost (_tag: string) (f: DatabaseHost -> Session -> unit) =
     let root = "mem:" + System.Guid.NewGuid().ToString "N"
     let store = openStoreWith "" (memoryEngine ())
@@ -382,6 +397,14 @@ let outSchema (cols: OutputColumn list) =
         Columns = cols |> List.toArray
     }
 
+/// 2 列（a, b）の出力スキーマ（Eval / Op / Ops / ExtSort / Catalog のテストで共有）。
+let schema2 =
+    outSchema
+        [
+            outCol "a" None (Some DataType.Integer)
+            outCol "b" None (Some DataType.Integer)
+        ]
+
 /// 共有のテスト用テーブルスキーマ（CatalogTests / PlannerTests が同一定義を使っていた）。
 let peopleSchema: TableSchema =
     {
@@ -421,6 +444,36 @@ let ordersSchema: TableSchema =
                     Unique = false
                 }
             ]
+    }
+
+/// people / orders を登録済みのテスト用 ExecContext
+/// （Analyzer / Optimizer / PlanBuilder / Plan のテストで共有）。
+let ctxOf (store: RowStore) =
+    ExecContext.create store None
+    |> ExecContext.withSchema "people" peopleSchema
+    |> ExecContext.withSchema "orders" ordersSchema
+
+/// 修飾子つきの列参照（people / orders）。
+let pCol (n: string) =
+    Expr.Column { Qualifier = Some "people"; Name = n }
+
+let oCol (n: string) =
+    Expr.Column { Qualifier = Some "orders"; Name = n }
+
+/// テスト用の SELECT 文（句は Where まで指定し、残りは既定値）。
+let selectOf (items: SelectItem list) (from: TableRef option) (joins: JoinClause list) (w: Expr option) =
+    {
+        Distinct = false
+        Items = items
+        From = Option.map TableSource.Named from
+        Joins = joins
+        Where = w
+        GroupBy = []
+        Having = None
+        OrderBy = []
+        Limit = None
+        Offset = None
+        SetOperations = []
     }
 
 /// INTEGER でなければテストを落とす。
@@ -609,7 +662,6 @@ let sstEntries (n: int) =
     |> Array.sortWith SstEntry.compare
 
 /// FileMetaData のテスト用ビルダー（キー lo..hi の連番区間）。
-/// ManifestTests と VersionSetTests に同一実装が 2 ファイル分あった。
 let fmd (num: int64) (level: int) (lo: int) (hi: int) : FileMetaData =
     {
         FileNumber = num

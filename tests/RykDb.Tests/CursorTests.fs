@@ -44,6 +44,26 @@ let ``Cursor.createSlice: 範囲を切り出す`` () =
     ok (validate c2)
 
 [<Fact>]
+let ``Cursor.createSlice: 範囲外を CorruptionError`` () =
+    let data = [| 0uy; 1uy; 2uy |]
+    expectErrorKind ErrorKind.CorruptionError "offset が負" (Cursor.createSlice data -1 2)
+    expectErrorKind ErrorKind.CorruptionError "length が負" (Cursor.createSlice data 0 -1)
+    expectErrorKind ErrorKind.CorruptionError "offset+length が配列長を超える" (Cursor.createSlice data 1 3)
+    expectErrorKind ErrorKind.CorruptionError "offset が配列長を超える" (Cursor.createSlice data 4 0)
+    // 判定は data.Length - length で行うので、巨大な length でもオーバーフローで通らない。
+    expectErrorKind
+        ErrorKind.CorruptionError
+        "巨大な length がオーバーフロー回避できない"
+        (Cursor.createSlice data 0 System.Int32.MaxValue)
+
+[<Fact>]
+let ``Cursor.atEnd: 位置が終端に達したら true`` () =
+    let c = Cursor.create [| 1uy |]
+    let _, c2 = ok (Reader.readByte c)
+    Assert.True(Cursor.atEnd c2)
+    Assert.False(Cursor.atEnd c)
+
+[<Fact>]
 let ``Cursor.splitAt: 先頭を切り出し、残りを返す`` () =
     let data = [| 0uy; 1uy; 2uy; 3uy; 4uy |]
     let c = ok (Cursor.createSlice data 1 4)
@@ -68,26 +88,6 @@ let ``Cursor.splitAt: 範囲外を CorruptionError`` () =
     let c = Cursor.create [| 0uy; 1uy; 2uy |]
     expectErrorKind ErrorKind.CorruptionError "length が負" (Cursor.splitAt -1 c)
     expectErrorKind ErrorKind.CorruptionError "length が残りを超える" (Cursor.splitAt 4 c)
-
-[<Fact>]
-let ``Cursor.atEnd: 位置が終端に達したら true`` () =
-    let c = Cursor.create [| 1uy |]
-    let _, c2 = ok (Reader.readByte c)
-    Assert.True(Cursor.atEnd c2)
-    Assert.False(Cursor.atEnd c)
-
-[<Fact>]
-let ``Cursor.createSlice: 範囲外を CorruptionError`` () =
-    let data = [| 0uy; 1uy; 2uy |]
-    expectErrorKind ErrorKind.CorruptionError "offset が負" (Cursor.createSlice data -1 2)
-    expectErrorKind ErrorKind.CorruptionError "length が負" (Cursor.createSlice data 0 -1)
-    expectErrorKind ErrorKind.CorruptionError "offset+length が配列長を超える" (Cursor.createSlice data 1 3)
-    expectErrorKind ErrorKind.CorruptionError "offset が配列長を超える" (Cursor.createSlice data 4 0)
-    // 判定は data.Length - length で行うので、巨大な length でもオーバーフローで通らない。
-    expectErrorKind
-        ErrorKind.CorruptionError
-        "巨大な length がオーバーフロー回避できない"
-        (Cursor.createSlice data 0 System.Int32.MaxValue)
 
 [<Fact>]
 let ``Cursor: create / createSlice / 読み取りは不変条件 0 <= Pos <= End <= Data.Length を保つ`` () =

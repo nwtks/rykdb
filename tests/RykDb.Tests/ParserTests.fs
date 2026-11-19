@@ -595,3 +595,15 @@ let ``Parser: 未対応語でも列名と明示 AS の別名には使える`` ()
 [<Fact>]
 let ``Parser: DELETE ... USING は明示エラー`` () =
     expectErrorKind ErrorKind.SyntaxError "DELETE USING" (parseStatement "DELETE FROM t USING u")
+
+[<Fact>]
+let ``Parser: EXPLAIN は SELECT を包む`` () =
+    match parseOneOk "EXPLAIN SELECT id FROM t WHERE id = 1;" with
+    | Statement.Explain sel ->
+        Assert.Single<SelectItem> sel.Items |> ignore
+        Assert.True sel.Where.IsSome
+    | other -> failActual "EXPLAIN ではない" other
+
+    // 未対応の文・欠落は明示的な SyntaxError
+    expectErrorKind ErrorKind.SyntaxError "EXPLAIN の後に SELECT 以外" (parseStatement "EXPLAIN INSERT INTO t VALUES (1)")
+    expectErrorKind ErrorKind.SyntaxError "EXPLAIN だけ" (parseStatement "EXPLAIN")

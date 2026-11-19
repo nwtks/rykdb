@@ -8,14 +8,6 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-/// 2 列（a, b）のスキーマ。
-let private schema2 =
-    outSchema
-        [
-            outCol "a" None (Some DataType.Integer)
-            outCol "b" None (Some DataType.Integer)
-        ]
-
 let private row2 (a: int64) (b: int64) = [| SqlValue.Int a; SqlValue.Int b |]
 
 let private col (name: string) =

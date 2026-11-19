@@ -1,8 +1,9 @@
 // ===========================================================================
-// SessionHost.fs のテスト: グループコミット（CommitDurability）の fsync 統合
+// DatabaseHost.fs のテスト: グループコミット（CommitDurability）と
+// 共有 committed state（snapshot 登録・解除）
 // ===========================================================================
 
-module RykDb.SessionHostTests
+module RykDb.DatabaseHostTests
 
 open Xunit
 open RykDb.Core
@@ -25,6 +26,22 @@ let private waitFor (label: string) (predicate: unit -> bool) =
             loop ()
 
     loop ()
+
+/// transaction を開始して Session を捨てる（呼び出し側は戻り値しか持たない）。
+/// `NoInlining` は Debug ビルドのローカルがメソッド末尾まで生き残るのを避けるため。
+/// 戻り値は「開始直後は確かに登録されていた」こと。
+[<System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)>]
+let private abandonTransaction (host: DatabaseHost) =
+    let session = Session.Create(host, SessionOptions.Default, false)
+    ok (session.Begin())
+    // session はここを抜けると到達不能になる（RegistrationLease の finalizer が登録を外せる）。
+    (host.Committed.Store.Runtime.OldestExcept(host.Committed.Root, None)).IsSome
+
+/// finalizer を確実に走らせる。
+let private collectGarbage () =
+    System.GC.Collect()
+    System.GC.WaitForPendingFinalizers()
+    System.GC.Collect()
 
 [<Fact>]
 let ``CommitDurability: 複数登録を 1回の fsync にまとめる`` () =
@@ -180,3 +197,84 @@ let ``DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録
         finally
             releaseFirst.Set()
             ok (host.Close()) |> ignore)
+
+[<Fact>]
+let ``DatabaseHost: active transaction は snapshot registry に登録され、commit / rollback / Close で外れる`` () =
+    withDbHost "reg-lifecycle" (fun host session ->
+        let runtime = host.Committed.Store.Runtime
+        let root = host.Committed.Root
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
+
+        // 明示 transaction: Begin で登録、Commit で解除
+        ok (session.Begin())
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
+        ok (session.Commit())
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
+
+        // Rollback でも解除
+        ok (session.Begin())
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
+        ok (session.Rollback())
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
+
+        // SQL の BEGIN / COMMIT 経由でも同じ
+        ok (session.Execute "BEGIN") |> ignore
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
+        ok (session.Execute "COMMIT") |> ignore
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
+
+        // 暗黙 transaction は Execute の中で登録・解除が完結する
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
+
+        // Close でも解除される（閉じた接続の snapshot は誰も読めない）
+        ok (session.Begin())
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
+        ok (session.Close())
+        Assert.True((runtime.OldestExcept(root, None)).IsNone))
+
+[<Fact>]
+let ``DatabaseHost: commit せずに捨てた transaction も GC されれば登録が外れる`` () =
+    withDbHost "reg-abandon" (fun host session ->
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        |> ignore
+
+        Assert.True(abandonTransaction host)
+
+        collectGarbage ()
+        // 最後の Session が消えたので登録が外れる（修正前はここに残り続けた）。
+        Assert.True((host.Committed.Store.Runtime.OldestExcept(host.Committed.Root, None)).IsNone)
+
+        // 登録が残っていると ConflictError になる DDL が通る。
+        ok (session.Execute "CREATE INDEX ix_v ON t (v)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+        let _, found = ok (execSql session "SELECT id FROM t WHERE v = 10")
+        Assert.Equal<int>(1, found.Rows.Length))
+
+[<Fact>]
+let ``DatabaseHost: 生きている transaction は GC されても登録が残る`` () =
+    withDbHost "reg-live-gc" (fun host session ->
+        ok (session.Begin())
+        // session はこのあと Rollback で使うので GC されない（finalizer は走らない）。
+        collectGarbage ()
+        Assert.True((host.Committed.Store.Runtime.OldestExcept(host.Committed.Root, None)).IsSome)
+
+        ok (session.Rollback())
+        Assert.True((host.Committed.Store.Runtime.OldestExcept(host.Committed.Root, None)).IsNone))
+
+[<Fact>]
+let ``DatabaseHost: Dispose でも transaction の登録が外れる`` () =
+    withDbHost "reg-dispose" (fun host session ->
+        let runtime = host.Committed.Store.Runtime
+        let root = host.Committed.Root
+        ok (session.Begin())
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
+
+        (session :> System.IDisposable).Dispose()
+        Assert.True((runtime.OldestExcept(root, None)).IsNone))
+
+[<Fact>]
+let ``DatabaseHost: 型は公開されていない`` () =
+    let hostType = typeof<Session>.Assembly.GetType "RykDb.Core.DatabaseHost"
+    Assert.NotNull hostType
+    Assert.False hostType.IsPublic

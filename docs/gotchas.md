@@ -1499,9 +1499,9 @@ DDL だけは DB ごとに排他にする必要がある。
   （`TxnState.Lease` の `RegistrationLease`。§7.5）。
   GC の時期は不定なので、明示的に終わらせるのが基本。
 - 回帰テスト: `SessionPool: transaction 中の DDL は他接続で ConflictError` /
-  `Database: commit せずに捨てた transaction も GC されれば登録が外れる` /
-  `Database: 生きている transaction は GC されても登録が残る` /
-  `Database: Dispose でも transaction の登録が外れる`。
+  `DatabaseHost: commit せずに捨てた transaction も GC されれば登録が外れる` /
+  `DatabaseHost: 生きている transaction は GC されても登録が残る` /
+  `DatabaseHost: Dispose でも transaction の登録が外れる`。
 
 ### 11.16b 二重オープンは「ロック + 台帳」で防ぐ
 
@@ -1520,9 +1520,9 @@ DDL だけは DB ごとに排他にする必要がある。
   押さえたままだと、同じプロセスからも再オープンできない。
 - 注意: `FileShare` の強制力は OS / ファイルシステム依存（同一マシンのローカル FS 前提）。
 - 回帰テスト:
-  `Database: 別プロセスが開いている DB は開けない` /
-  `Database: 同じ root を二度開くと同じプロセスのエラーになり、Close 後は開ける` /
-  `Database: transaction 中の Session を Close してもロックが外れる`。
+  `Session: 別プロセスが開いている DB は開けない` /
+  `Session: 同じ root を二度開くと同じプロセスのエラーになり、Close 後は開ける` /
+  `Session: transaction 中の Session を Close してもロックが外れる`。
 
 ### 11.17 識別子の比較は `SqlName.equal` に一本化する
 
@@ -1618,7 +1618,7 @@ DDL だけは DB ごとに排他にする必要がある。
 `ORDER BY 主キー LIMIT n` のヒントが走査まで降りる（`PlanBuilder.sortIsRedundant`）。
 主キーの一部だけ・`DESC`・索引走査になる条件（`WHERE 索引列 = ...` など）・集約・`DISTINCT`・結合では
 従来どおりソートする。
-回帰テストは `Database: 主キー順の ORDER BY は Sort を作らず LIMIT がストレージへ降りる`
+回帰テストは `Session: 主キー順の ORDER BY は Sort を作らず LIMIT がストレージへ降りる`
 （2本目の SSTable を壊し、`ORDER BY id LIMIT 1` は成功・`ORDER BY id DESC LIMIT 1` は `CorruptionError`）。
 
 ### 11.26 部分読みはブロック / メタデータ / Footer のチェックサムで守る
@@ -1663,7 +1663,7 @@ transaction の overlay（store の行 + txn のスロット）で `cur` を再�
   `Op.Done` / `Op.Step` / `Op.Compute` を直接書かない
   （`Op.fsi` でケースを隠しているため、src の他ファイルから直接構築・パターンマッチできない）。
 - テストでは `TestHelpers.oneShot` でソースを包むと、2 回目の `next` を検出できる。
-- 回帰テスト: `Database: 既存行がある transaction 内の INSERT は SELECT に全行見える` /
+- 回帰テスト: `Session: 既存行がある transaction 内の INSERT は SELECT に全行見える` /
   `...複数 UPDATE が正しい` / `...索引検索が書き込みを見る`。
 - store が空の transaction だけを試すと、このバグは出ない。
 
@@ -2598,7 +2598,7 @@ type private Step =
   `KeyBuilder.ofValues: Unloaded は InternalError`、
   `ValueCodec.writeValues: Unloaded は InternalError`、
   `ValueCodec.writeValuesTo: Unloaded は InternalError`、
-  `Database: 値を使わない射影・集約は空の行でも件数を返す`
+  `Session: 値を使わない射影・集約は空の行でも件数を返す`
   （部分列・ポイント検索・索引・transaction overlay・DISTINCT・ORDER BY・GROUP BY・派生テーブルを含む）。
 - 計測（10万行）: `CountStar` 約 381MB → **316MB**、
   `SelectConstant` **331MB**、`CountConstantWhere` **351MB**、
@@ -2801,7 +2801,7 @@ store の `SstEntry.Key` と `Bytes.compare` でマージする。
 各行を変換したうえで `go next` を返す（`Op.pull` を再帰的に包む）。
 表行が見つからない索引エントリ（防御）は `advance next` で捨てる。
 
-回帰テスト: `Database: 非被覆索引は本体から列を fetch する`、
+回帰テスト: `Session: 非被覆索引は本体から列を fetch する`、
 `SqlReference: インデックス入れ子ループ（右索引 + 左が小さい）`。
 
 ### 11.84 format マーカーは「空 = 新規」と決めつけない

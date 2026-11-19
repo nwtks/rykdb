@@ -362,3 +362,37 @@ let ``Schema.projectColumns: 空なら入力ヘッダ / t.* は修飾つき`` ()
         |> Array.map (fun c -> c.Display)
 
     Assert.Equal<string array>([| "t.id" |], h)
+
+[<Fact>]
+let ``SelectProjection: ヘッダと式の列数が一致する`` () =
+    let items =
+        [
+            { Expression = Expr.Star; Alias = None }
+            {
+                Expression = Expr.Column { Qualifier = None; Name = "a" }
+                Alias = Some "x"
+            }
+            {
+                Expression =
+                    Expr.Binary(
+                        BinaryOp.Add,
+                        Expr.Column { Qualifier = None; Name = "a" },
+                        Expr.Column { Qualifier = None; Name = "b" }
+                    )
+                Alias = None
+            }
+        ]
+
+    let projection = SelectProjection.create schema2 items
+
+    // * は 2 列、別名つき列が 1 列、式が 1 列。
+    Assert.Equal<int>(4, projection.Expressions.Length)
+    Assert.Equal<int>(4, projection.DisplayHeader.Length)
+    Assert.Equal<int>(4, projection.ReferenceHeader.Length)
+
+[<Fact>]
+let ``SelectProjection: 項目が空なら入力スキーマをそのまま使う`` () =
+    let projection = SelectProjection.create schema2 []
+    Assert.Empty projection.Expressions
+    Assert.Equal<int>(2, projection.DisplayHeader.Length)
+    Assert.Equal<int>(2, projection.ReferenceHeader.Length)

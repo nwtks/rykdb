@@ -262,18 +262,6 @@ let ``Parser: SELECT 各種`` () =
     Assert.True sel2.Offset.IsSome
 
 [<Fact>]
-let ``Parser: EXPLAIN は SELECT を包む`` () =
-    match parseOneOk "EXPLAIN SELECT id FROM t WHERE id = 1;" with
-    | Statement.Explain sel ->
-        Assert.Single<SelectItem> sel.Items |> ignore
-        Assert.True sel.Where.IsSome
-    | other -> failActual "EXPLAIN ではない" other
-
-    // 未対応の文・欠落は明示的な SyntaxError
-    expectErrorKind ErrorKind.SyntaxError "EXPLAIN の後に SELECT 以外" (parseStatement "EXPLAIN INSERT INTO t VALUES (1)")
-    expectErrorKind ErrorKind.SyntaxError "EXPLAIN だけ" (parseStatement "EXPLAIN")
-
-[<Fact>]
 let ``Parser: サブクエリ（スカラー / IN / EXISTS）`` () =
     parseOneOk "SELECT (SELECT MAX(v) FROM t) FROM t" |> ignore
     parseOneOk "SELECT id FROM t WHERE id IN (SELECT id FROM t)" |> ignore

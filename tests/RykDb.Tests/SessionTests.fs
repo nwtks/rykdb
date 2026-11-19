@@ -11,9 +11,18 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-let private withSession (tag: string) (f: Session -> unit) =
+let private withDiskSession (tag: string) (f: Session -> unit) =
     withDir tag (fun dir ->
         let session = ok (Session.OpenWith dir)
+
+        try
+            f session
+        finally
+            session.Close() |> ignore)
+
+let private withDiskSessionOptions options (tag: string) (f: Session -> unit) =
+    withDir tag (fun dir ->
+        let session = ok (Session.OpenWith(dir, options))
 
         try
             f session
@@ -114,15 +123,6 @@ let private withGatedSession (_tag: string) (f: Session -> EngineGates -> unit) 
 let private startDedicated (f: unit -> 'T) =
     System.Threading.Tasks.Task.Factory.StartNew(f, System.Threading.Tasks.TaskCreationOptions.LongRunning)
 
-let private withSessionOptions options (tag: string) (f: Session -> unit) =
-    withDir tag (fun dir ->
-        let session = ok (Session.OpenWith(dir, options))
-
-        try
-            f session
-        finally
-            session.Close() |> ignore)
-
 let private drainReader (reader: RowReader) =
     let rec loop acc =
         match ok (reader.TryRead()) with
@@ -147,7 +147,7 @@ let private scalar (session: Session) (sql: string) =
 
 [<Fact>]
 let ``Session: ハンドルなしで連続実行できる`` () =
-    withSession "session-basic" (fun session ->
+    withDiskSession "session-basic" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
         |> ignore
 
@@ -162,7 +162,7 @@ let ``Session: ハンドルなしで連続実行できる`` () =
 
 [<Fact>]
 let ``Session: 複数文の結果は SELECT が 1つならその結果、それ以外は合計`` () =
-    withSession "session-multi-summary" (fun session ->
+    withDiskSession "session-multi-summary" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
         ok (session.Execute "INSERT INTO t VALUES (1, 'a'), (2, 'b')") |> ignore
 
@@ -190,7 +190,7 @@ let ``Session: 複数文の結果は SELECT が 1つならその結果、それ�
 
 [<Fact>]
 let ``Session: 複数文を ; で渡せる`` () =
-    withSession "session-multi" (fun session ->
+    withDiskSession "session-multi" (fun session ->
         let sql =
             "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER); "
             + "INSERT INTO t VALUES (1, 1); "
@@ -204,7 +204,7 @@ let ``Session: 複数文を ; で渡せる`` () =
 let ``Session: 大量の文を 1 度の Execute で実行できる`` () =
     let n = 2_000
 
-    withSession "session-tail-exec" (fun session ->
+    withDiskSession "session-tail-exec" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)")
         |> ignore
 
@@ -214,7 +214,7 @@ let ``Session: 大量の文を 1 度の Execute で実行できる`` () =
 
 [<Fact>]
 let ``Session: 複数文の途中エラーでも最後の成功状態を保持する`` () =
-    withSession "session-partial" (fun session ->
+    withDiskSession "session-partial" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
         |> ignore
 
@@ -227,7 +227,7 @@ let ``Session: 複数文の途中エラーでも最後の成功状態を保持�
 
 [<Fact>]
 let ``Session: 複数文の BEGIN 後エラーは transaction を開いたままにする`` () =
-    withSession "session-partial-tx" (fun session ->
+    withDiskSession "session-partial-tx" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
         expectError "BEGIN 後の途中エラーが成功になっています" (session.Execute "BEGIN; INSERT INTO t VALUES (1); SELECT * FROM nope")
 
@@ -239,7 +239,7 @@ let ``Session: 複数文の BEGIN 後エラーは transaction を開いたまま
 
 [<Fact>]
 let ``Session: Begin / Commit / Rollback が使える`` () =
-    withSession "session-tx" (fun session ->
+    withDiskSession "session-tx" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
         |> ignore
 
@@ -294,7 +294,7 @@ let ``Session: Close は開いた transaction を rollback する`` () =
 
 [<Fact>]
 let ``Session: 同一 Session を複数スレッドで使っても書き込みが消えない`` () =
-    withSession "session-thread" (fun session ->
+    withDiskSession "session-thread" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
 
         let rowCount = 64
@@ -407,7 +407,7 @@ let ``Session: Close は実行中の読み取りの完了を待つ`` () =
 
 [<Fact>]
 let ``Session: 並行読み取りは commit 済みの一貫した snapshot を見る`` () =
-    withSession "session-parallel-read" (fun session ->
+    withDiskSession "session-parallel-read" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
 
         let batchSize = 10
@@ -440,17 +440,11 @@ let ``Session: 並行読み取りは commit 済みの一貫した snapshot を�
 
 [<Fact>]
 let ``Session: 空 SQL は 0 行の結果を返す`` () =
-    withSession "session-empty" (fun session ->
+    withDiskSession "session-empty" (fun session ->
         let result = ok (session.Execute "")
         Assert.Equal<int>(0, result.RowsAffected)
         Assert.Empty result.Columns
         Assert.Empty result.Rows)
-
-[<Fact>]
-let ``Session: DatabaseHost 型は公開されていない`` () =
-    let hostType = typeof<Session>.Assembly.GetType "RykDb.Core.DatabaseHost"
-    Assert.NotNull hostType
-    Assert.False hostType.IsPublic
 
 [<Fact>]
 let ``SessionOptions: 行数上限を超える SELECT は CapacityError`` () =
@@ -460,7 +454,7 @@ let ``SessionOptions: 行数上限を超える SELECT は CapacityError`` () =
             MaxResultBytes = System.Int64.MaxValue
         }
 
-    withSessionOptions options "session-row-limit" (fun session ->
+    withDiskSessionOptions options "session-row-limit" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
 
         ok (session.Execute "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)")
@@ -479,7 +473,7 @@ let ``SessionOptions: 複数 SELECT は累積で上限を判定する`` () =
             MaxResultBytes = System.Int64.MaxValue
         }
 
-    withSessionOptions options "session-cumulative-limit" (fun session ->
+    withDiskSessionOptions options "session-cumulative-limit" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
 
         ok (session.Execute "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)")
@@ -503,7 +497,7 @@ let ``SessionOptions: 0 行上限でも 0 行の SELECT は成功する`` () =
             MaxResultBytes = 0L
         }
 
-    withSessionOptions options "session-zero-limit" (fun session ->
+    withDiskSessionOptions options "session-zero-limit" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
         let empty = ok (session.Execute "SELECT * FROM t")
         Assert.Empty empty.Rows
@@ -545,7 +539,7 @@ let ``SessionOptions: -1 は無制限、-2 以下は開くときに CapacityErro
 
 [<Fact>]
 let ``RowReader: 単一 SELECT を1行ずつ読める`` () =
-    withSession "session-reader-basic" (fun session ->
+    withDiskSession "session-reader-basic" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
 
         ok (session.Execute "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
@@ -570,7 +564,7 @@ let ``RowReader: 単一 SELECT を1行ずつ読める`` () =
 
 [<Fact>]
 let ``RowReader: 対象外の SQL は Ok None を返す`` () =
-    withSession "session-reader-none" (fun session ->
+    withDiskSession "session-reader-none" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
         let empty = ok (session.TryOpenReader "")
         Assert.True(Option.isNone empty)
@@ -595,7 +589,7 @@ let ``RowReader: SessionOptions の結果上限を適用しない`` () =
             MaxResultBytes = 1L
         }
 
-    withSessionOptions options "session-reader-no-limit" (fun session ->
+    withDiskSessionOptions options "session-reader-no-limit" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
         ok (session.Execute "INSERT INTO t VALUES (1), (2), (3)") |> ignore
 
@@ -611,7 +605,7 @@ let ``RowReader: SessionOptions の結果上限を適用しない`` () =
 
 [<Fact>]
 let ``RowReader: 読み取り中に commit しても開始時 snapshot を見る`` () =
-    withSession "session-reader-snapshot" (fun session ->
+    withDiskSession "session-reader-snapshot" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
         ok (session.Execute "INSERT INTO t VALUES (1), (2)") |> ignore
 
@@ -903,7 +897,7 @@ let ``SessionPool: 閉じた後の操作はエラーになる`` () =
 
 [<Fact>]
 let ``Session: パラメータ付きで INSERT / SELECT / UPDATE / DELETE できる`` () =
-    withSession "session-params-dml" (fun session ->
+    withDiskSession "session-params-dml" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL)")
         |> ignore
 
@@ -944,7 +938,7 @@ let ``Session: パラメータ付きで INSERT / SELECT / UPDATE / DELETE でき
 
 [<Fact>]
 let ``Session: パラメータは LIKE / LIMIT / OFFSET / NULL にも使える`` () =
-    withSession "session-params-expr" (fun session ->
+    withDiskSession "session-params-expr" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
         |> ignore
 
@@ -967,7 +961,7 @@ let ``Session: パラメータは LIKE / LIMIT / OFFSET / NULL にも使える``
 
 [<Fact>]
 let ``Session: パラメータの型を保って入出力できる`` () =
-    withSession "session-params-types" (fun session ->
+    withDiskSession "session-params-types" (fun session ->
         ok (
             session.Execute
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP, dec DECIMAL, u UUID, b BLOB, flag BOOLEAN)"
@@ -1004,7 +998,7 @@ let ``Session: パラメータの型を保って入出力できる`` () =
 
 [<Fact>]
 let ``RowReader: パラメータ付き SELECT をストリーミングできる`` () =
-    withSession "session-reader-params" (fun session ->
+    withDiskSession "session-reader-params" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
 
         ok (session.Execute "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a')")
@@ -1021,7 +1015,7 @@ let ``RowReader: パラメータ付き SELECT をストリーミングできる`
 
 [<Fact>]
 let ``Session: パラメータの個数不一致・Unloaded は TypeError`` () =
-    withSession "session-params-errors" (fun session ->
+    withDiskSession "session-params-errors" (fun session ->
         expectErrorKind ErrorKind.TypeError "パラメータ不足" (session.Execute("SELECT ?", [||]))
         expectErrorKind ErrorKind.TypeError "パラメータ過剰" (session.Execute("SELECT 1", [| SqlValue.Int 1L |]))
         expectErrorKind ErrorKind.TypeError "RowReader でも不足" (session.TryOpenReader("SELECT ?", [||]))
@@ -1036,7 +1030,7 @@ let ``Session: パラメータの個数不一致・Unloaded は TypeError`` () =
 
 [<Fact>]
 let ``RowReader: パラメータの BLOB を後から書き換えても結果は変わらない`` () =
-    withSession "session-reader-param-copy" (fun session ->
+    withDiskSession "session-reader-param-copy" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)") |> ignore
         ok (session.Execute "INSERT INTO t VALUES (1, X'01'), (2, X'02')") |> ignore
 
@@ -1054,7 +1048,7 @@ let ``RowReader: パラメータの BLOB を後から書き換えても結果は
 
 [<Fact>]
 let ``Session: パラメータは複数文バッチでも通し番号`` () =
-    withSession "session-params-batch" (fun session ->
+    withDiskSession "session-params-batch" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
 
         let result =
@@ -1068,7 +1062,7 @@ let ``Session: パラメータは複数文バッチでも通し番号`` () =
 
 [<Fact>]
 let ``Session: パラメータでも主キー検索の計画になる`` () =
-    withSession "session-params-plan" (fun session ->
+    withDiskSession "session-params-plan" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
         |> ignore
 
