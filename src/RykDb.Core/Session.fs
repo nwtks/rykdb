@@ -4,16 +4,10 @@
 //
 // * committed state は `DatabaseHost`（internal）が隠し、
 //   Session は接続ローカルの transaction だけを持つ。
-//   公開メソッドはハンドルを返さないので、戻り値の差し替え忘れは起こらない。
-// * SELECT のみの Execute は複数スレッド／複数接続から並行実行できる。
-//   書き込み・transaction 操作・Close は直列化される。
-// * 読み取りは入口で現在の状態とスナップショット（ファイル pin）を同じ短いロック区間で取得し、
-//   実行中はロックを取らない（MVCC スナップショット読み）。
-// * Close は実行中の読み取りが終わるのを待ってから閉じる。
-// * 1つの Session は 1つの論理接続として扱う。
-//   複数の接続で共有すると transaction も共有される。
-// * Execute は SQL を 1文ずつ実行し、成功するたびに接続ローカルの状態と committed state を更新する。
-//   途中の文が失敗しても、最後に成功した状態は失わない。
+// * SELECT のみの Execute は並行実行でき、書き込み・transaction 操作・Close は直列化される。
+//   読み取りは入口で状態とスナップショット（ファイル pin）を同じ短いロック区間で取る。
+// * Close は実行中の読み取りが終わるのを待つ。1つの Session は 1つの論理接続。
+// * Execute は 1文ずつ実行し、途中で失敗しても最後に成功した状態は失わない。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -22,16 +16,16 @@ namespace RykDb.Core
 type SessionOptions =
     {
         /// 1回の Execute で保持する SELECT 行数の上限。
-        /// 負値は無制限。
+        /// `-1` で無制限（`-2` 以下はエラー）。
         MaxResultRows: int64
         /// 1回の Execute で保持する SELECT 行のメモリ概算上限。
-        /// 負値は無制限。
+        /// `-1` で無制限（`-2` 以下はエラー）。
         MaxResultBytes: int64
         /// JOIN / DISTINCT / GROUP BY / IN が作業用に保持してよいメモリの概算上限（バイト）。
-        /// 超えた分は一時ファイルへ退避する。負値は「退避しない（無制限）」。
+        /// 超えた分は一時ファイルへ退避する。`-1` で無制限（`-2` 以下はエラー）。
         WorkMemBytes: int64
         /// ORDER BY の受け皿（メモリ内で整列する上限）。
-        /// 超えた分は一時ファイルの run へ退避する。負値は「退避しない（無制限）」。
+        /// 超えた分は一時ファイルの run へ退避する。`-1` で無制限（`-2` 以下はエラー）。
         SortBufferBytes: int64
         /// 一時ファイルの置き場所（`None` は OS の一時ディレクトリ）。
         SpillDirectory: string option
@@ -477,7 +471,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
 
     /// 単一文または複数文を実行する。
     /// <remarks>
-    /// 文は順に実行され、成功するたびに内部ハンドルが更新される。
+    /// 文は順に実行され、成功するたびに接続ローカルの状態と committed state が更新される。
     /// 途中の文が失敗した場合、それ以前に成功した文の状態は保持される。
     /// `BEGIN` 済みなら transaction は開いたままになるので、
     /// 必要に応じて `Rollback()` すること。

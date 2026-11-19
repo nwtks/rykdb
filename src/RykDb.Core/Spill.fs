@@ -490,8 +490,8 @@ module internal Spill =
 
     /// 退避した行を先頭から読む Op を作る（`deleteRun` なら尽きた run を消す）。
     /// <remarks>
-    /// `openNext` / `stream` は `Op.compute` の継続の中で呼ぶので、TailAudit はラムダ内の
-    /// 呼び出しを非末尾として報告する（1行ごとに 1段だけ進み、スタックは積み上がらない）。
+    /// `openNext` / `stream` は `Op.compute` の継続の中で呼ぶので、
+    /// 1行ごとに 1段だけ進み、スタックは積み上がらない。
     /// </remarks>
     let private reopenWith (deleteRun: bool) (scope: ScanScope option) =
         let closeOne st = closeTracked scope deleteRun st

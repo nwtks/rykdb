@@ -41,7 +41,7 @@ RykDb を書くときの規約。
 `try` / `with` は `protect` のほか、`Manifest.decodeRecord`（base64 の解析）と
 `RowReader` の解放処理（`Session.fs`）で使い、
 いずれも `DbError` に変換するか例外を飲み込んで、外へ出さない。
-`try` / `finally` は `Engine` / `EngineHost` / `SstScan` / `Session` /
+`try` / `finally` は `Engine` / `VersionCoordinator` / `SstScan` / `Session` /
 `ProcessLock` / `StorageEngine` / `Transactions` の解放処理に使う。
 
 失敗は `ErrorKind`（`DbError.Kind`）で分類する。
@@ -57,12 +57,18 @@ RykDb を書くときの規約。
 
 ## 2. 命令型の構文・機能を使わない
 
-**ロジック層（型・字句・構文・計画・実行・ストレージ）では `mutable` / `while` / `ref` を 0件**に保つ。
-`src/RykDb.Core/` に残る `mutable` は公開セッション層（`Session.fs` / `DatabaseHost.fs`）の
-状態 DU のスロット 5箇所と読み取り数カウンタだけで、次を意図的に使う。
+**ロジック層（型・字句・構文・計画・実行・ストレージ）では `mutable` / `while` / `ref` を使わない。**
+例外はクエリ・構築の寿命に閉じた次の 2 箇所だけで、DB やプロセスを跨いで共有しない。
+
+- `ValueSet.IndexedValues` — 退避ファイルの reader・直近 1ブロックのキャッシュ・`disposed`。
+  1つの評価スレッドから順に呼ばれる前提。
+- `BloomFilter.BloomBuilder` — 追加済みハッシュ数のカウンタ。構築中だけ使う。
+
+残りの `mutable` は公開セッション層（`Session.fs` / `DatabaseHost.fs`）の
+状態 DU のスロットと読み取り数カウンタだけで、次を意図的に使う。
 
 この規約が保証するのは**可変状態の所在が列挙できること**であり、可変状態の全廃ではない。
-ロジック層の状態は `Dictionary` / `HashSet` / `ConcurrentDictionary` /`SemaphoreSlim` / `lock` へ移っている（下の許可リスト）。
+ロジック層の状態は `Dictionary` / `HashSet` / `ConcurrentDictionary` / `SemaphoreSlim` / `lock` へ移っている（下の許可リスト）。
 行・キー・アキュムレータの蓄積には `ResizeArray` を使わず、`list` / `array` を使う。
 「Core に mutable が無い」ではなく「可変状態はここにしかない」と読むこと。
 
@@ -82,10 +88,13 @@ RykDb を書くときの規約。
   読み取りは入口・出口でしか取らない。
 - `lock writeGate`: `Execute`（書き込みを含むバッチ）/ `Begin` / `Commit` / `Rollback` / `Close` を直列化する。
   `DatabaseHost.writeGate` は DB 全体、`Session.writeGate` は接続内を守る。
-- `Monitor.Wait` / `PulseAll`: `Session.Close` が実行中の読み取りの完了を待つために使う。
+- `lock gate`（`ValueSet.IndexedValues`）: クエリ局所の reader と 1ブロックキャッシュを守る。
+- `Monitor.Wait` / `PulseAll`: `Session.Close` の読み取り drain と
+  `CommitDurability` のグループコミットで待機・起床に使う。
 
-これらは `Session` / `SessionPool` / `DatabaseHost` の内部に閉じ込め、
+Session 層のものは `Session` / `SessionPool` / `DatabaseHost` の内部に閉じ込め、
 `DatabaseHost` / `TxnState` / `ExecState` を internal にして外部へ漏らさない。
+`ValueSet.IndexedValues` は 1クエリの評価中だけ存在する。
 
 `Dictionary` / `HashSet` / `ConcurrentDictionary` を使うのは次の場所に限る
 （CLI / Server は対象外）。
@@ -95,7 +104,7 @@ Core では `ResizeArray` を使わない。
 - `Ops.aggregate` のグループ表（入力行は抱えず、アキュムレータだけ）
 - `Ops.distinct` の符号化済みキー集合（`HashSet<byte array>`）
 - `OpsJoin.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
-- `EngineHost` の host state / ファイル refcount / worker 状態（`ConcurrentDictionary`）
+- `VersionCoordinator` の公開状態 / ファイル refcount / worker 状態（`ConcurrentDictionary`）
 - `StorageEngine` の書き込み Gate / `ProcessLock` / `Transactions` の登録台帳（`SemaphoreSlim` / `ConcurrentDictionary`）
 
 | やりたいこと       | 命令形の代わりに使うもの                                                        |
@@ -175,7 +184,7 @@ JIT は `tail.` を尊重する。
   `Token.QuotedIdent` を `Ident` と混ぜてよいのは、予約語チェックをしない文脈だけ。
 - **実行時のスタック増加を深さカウンタで止める設計は取らない**。
   式・サブクエリの深さは CPS の継続をヒープに積んで吸収し、
-  パーサに `MaxExpressionDepth` のような上限は置かない。
+  パーサに式の深さ上限は置かない。
   `tail.` が効かない環境（設定漏れ・JIT 非対応）でも暴走しないことは、
   深い入れ子の回帰テストで担保する。
 - **`result { }` 計算式はループする関数では使わない**。

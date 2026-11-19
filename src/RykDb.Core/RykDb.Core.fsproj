@@ -30,8 +30,8 @@
     <Compile Include="ParserExpr.fs" />
     <Compile Include="Parser.fs" />
     <Compile Include="Transactions.fs" />
-    <Compile Include="EngineHost.fs" />
     <Compile Include="ProcessLock.fs" />
+    <Compile Include="VersionCoordinator.fs" />
     <Compile Include="RowStore.fs" />
     <Compile Include="TableSchema.fs" />
     <Compile Include="Catalog.fs" />

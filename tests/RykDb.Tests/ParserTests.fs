@@ -333,7 +333,7 @@ let ``Parser: 引用した識別子`` () =
 
 [<Fact>]
 let ``Parser: NULL.* を QualifiedStar にしない`` () =
-    // 以前は `NULL` の後ろの `.*` を読んで `QualifiedStar ""` を作っていた
+    // 修飾子にできるのは識別子だけ。
     expectErrorKind ErrorKind.SyntaxError "NULL.*" (parseStatement "SELECT NULL.* FROM t")
 
 [<Fact>]
@@ -538,7 +538,7 @@ let ``Parser: UNION ALL は集合演算としてパースされる`` () =
 
 [<Fact>]
 let ``Parser: 列別名が集合演算を飲み込まない`` () =
-    // 以前は SELECT 項目の別名が UNION を消費し、後続の SELECT が別の文として扱われていた
+    // `UNION` は別名ではなく集合演算として読む。
     expectErrorKind ErrorKind.SyntaxError "UNION" (parseStatement "SELECT 1 UNION SELECT 2")
 
     // UNION ALL は集合演算としてパースされ、2 つ目の SELECT が別の文にならない
@@ -567,8 +567,7 @@ let ``Parser: 未対応の JOIN は明示エラー`` () =
 
 [<Fact>]
 let ``Parser: JOIN の種類だけで JOIN が無い入力はエラー`` () =
-    // 以前は LEFT / INNER を消費して以降の句を読み、JOIN を黙って捨てていた
-    // （`FROM t LEFT WHERE ...` が「LEFT JOIN なし」として静かに通っていた）。
+    // JOIN の種類を読んだら、続く JOIN 本体まで要求する。
     expectErrorKind ErrorKind.SyntaxError "FROM の後の LEFT" (parseStatement "SELECT * FROM t LEFT")
     expectErrorKind ErrorKind.SyntaxError "FROM の後の INNER" (parseStatement "SELECT * FROM t INNER")
     expectErrorKind ErrorKind.SyntaxError "FROM の後の LEFT OUTER" (parseStatement "SELECT * FROM t LEFT OUTER")

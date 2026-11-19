@@ -4,16 +4,16 @@ namespace RykDb.Core
 type SessionOptions =
     {
         /// 1回の Execute で保持する SELECT 行数の上限。
-        /// 負値は無制限。
+        /// `-1` で無制限（`-2` 以下はエラー）。
         MaxResultRows: int64
         /// 1回の Execute で保持する SELECT 行のメモリ概算上限。
-        /// 負値は無制限。
+        /// `-1` で無制限（`-2` 以下はエラー）。
         MaxResultBytes: int64
         /// JOIN / DISTINCT / GROUP BY / IN が作業用に保持してよいメモリの概算上限（バイト）。
-        /// 超えた分は一時ファイルへ退避する。負値は「退避しない（無制限）」。
+        /// 超えた分は一時ファイルへ退避する。`-1` で無制限（`-2` 以下はエラー）。
         WorkMemBytes: int64
         /// ORDER BY の受け皿（メモリ内で整列する上限）。
-        /// 超えた分は一時ファイルの run へ退避する。負値は「退避しない（無制限）」。
+        /// 超えた分は一時ファイルの run へ退避する。`-1` で無制限（`-2` 以下はエラー）。
         SortBufferBytes: int64
         /// 一時ファイルの置き場所（`None` は OS の一時ディレクトリ）。
         SpillDirectory: string option

@@ -118,8 +118,8 @@ module internal OpsJoin =
     /// 右側を退避したときの入れ子ループ。
     /// 左行ごとに run を先頭から読み直す（I/O は O(左行数 × 右行数) になるが、メモリは一定）。
     /// <remarks>
-    /// `joinRows` / `scan` は `Op.compute` の継続内で呼ぶので、TailAudit はラムダ内の呼び出しを
-    /// 非末尾として報告する（1行ごとに 1段だけ進み、スタックは積み上がらない）。
+    /// `joinRows` / `scan` は `Op.compute` の継続内で呼ぶので、1行ごとに 1段だけ進み、
+    /// スタックは積み上がらない。
     /// </remarks>
     let private innerJoinSpilled
         (budget: MemoryBudget)
@@ -221,7 +221,6 @@ module internal OpsJoin =
     /// lookupRows は左キーから右の行を返す（空の Op でもよい）。
     /// <remarks>
     /// Op.compute の継続内の相互再帰は「次の行を要求されたとき」に 1段ずつ進むので、スタックは積み上がらない。
-    /// TailAudit はラムダ内の呼び出しを非末尾として報告するためベースラインに登録している。
     /// </remarks>
     let private joinProbe
         (isLeft: bool)
@@ -443,8 +442,7 @@ module internal OpsJoin =
     /// （`Analyzer.chooseJoinAlgorithm` が走査の並び順を確認して選ぶ）。
     /// 右側を materialize せず、両側を 1行ずつ流す。
     /// <remarks>
-    /// `Op.compute` の継続内で `loop` / `emitGroup` を呼ぶので、TailAudit はラムダ内の
-    /// 呼び出しを非末尾として報告する（`joinProbe` の `probe/emit` と同じ、1行ごとに 1段だけ進む）。
+    /// `Op.compute` の継続内で `loop` / `emitGroup` を呼ぶので、1行ごとに 1段だけ進む。
     /// </remarks>
     let private mergeJoinWith
         (isLeft: bool)
@@ -566,16 +564,14 @@ module internal OpsJoin =
         loop (MergeStart left) (MergeStart right)
 
     /// ハッシュ結合の外部版。
-    /// 両側を結合キーのハッシュで `Spill.Partitions` 本に分割し、
+    /// 両側を結合キーで `Spill.Partitions` 本に分割し、
     /// 各パーティションの右をハッシュ表にして左を probe する。
-    /// 1パーティションがまだ上限を超える場合は salt を変えて再分割し、
-    /// 深さ上限に達したらそのパーティションだけマージ結合へフォールバックする。
+    /// 上限を超えるパーティションは salt を変えて再分割し、
+    /// 深さ上限でマージ結合へフォールバックする。
     /// <remarks>
-    /// 出力順はパーティション順（SQL は ORDER BY が無い限り順序を保証しない）。
-    /// 一時ファイルは `Spill.registerSpool` でクエリの ScanScope に登録されるので、
-    /// 早期終了・エラーでも `DisposeAll` が消す。
-    /// `joinWork` は明示スタックで 1パーティションずつ処理し、すべての再帰が末尾位置
-    /// （TailAudit のベースライン不要）。再分割の深さは `maxDepth` で有界。
+    /// 出力順はパーティション順（ORDER BY が無い限り SQL は順序を保証しない）。
+    /// 一時ファイルは `Spill.registerSpool` で `ScanScope` に登録する。
+    /// `joinWork` は明示スタックで 1パーティションずつ処理する。
     /// </remarks>
     let private hashJoinPartitioned
         (isLeft: bool)

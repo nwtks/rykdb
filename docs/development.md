@@ -22,8 +22,8 @@ RykDb のビルド・テスト・品質ゲート。
 ```bash
 dotnet build -t:Rebuild       # ビルド
 dotnet test                   # テスト
-dotnet tool restore           # fantomas インストール
-dotnet fantomas src/ tests/   # 整形
+dotnet tool restore                 # fantomas インストール
+dotnet fantomas src/ tests/ tools/  # 整形
 
 # CI と同じゲート（coverage 90% 必須）
 dotnet restore --locked-mode
@@ -41,14 +41,14 @@ dotnet test -p:CollectCoverage=true -p:Threshold=90 -p:ThresholdType=line -p:Thr
 lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>/` を消してから
 `dotnet restore --force-evaluate` を実行する。
 
-| ゲート                  | 設定                                                                                                                                              |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TreatWarningsAsErrors` | **有効**                                                                                                                                          |
-| `LangVersion`           | `10.0`                                                                                                                                            |
-| `WarningLevel`          | `3`                                                                                                                                               |
-| `OtherFlags`            | `--warnon:1182`（未使用ローカル変数もエラー）                                                                                                     |
-| 依存の再現性            | `global.json`（SDK） / `packages.lock.json`                                                                                                       |
-| Core の命令型構文・機能 | ロジック層は `mutable` / `while` / `ref` なし。例外は `Session.fs` / `DatabaseHost.fs` の状態 DU スロットのみ（可変コレクションは別途許可リスト） |
+| ゲート                  | 設定                                                                                                                                                                                                                                         |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TreatWarningsAsErrors` | **有効**                                                                                                                                                                                                                                     |
+| `LangVersion`           | `10.0`                                                                                                                                                                                                                                       |
+| `WarningLevel`          | `3`                                                                                                                                                                                                                                          |
+| `OtherFlags`            | `--warnon:1182`（未使用ローカル変数もエラー）                                                                                                                                                                                                |
+| 依存の再現性            | `global.json`（SDK） / `packages.lock.json`                                                                                                                                                                                                  |
+| Core の命令型構文・機能 | ロジック層は `mutable` / `while` / `ref` なし。例外は `Session.fs` / `DatabaseHost.fs` の状態 DU スロット、`ValueSet.IndexedValues` の reader / 1ブロックキャッシュ、`BloomFilter.BloomBuilder` の件数カウンタ（いずれもクエリ・構築の寿命） |
 
 > **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
 > （[`gotchas.md`](gotchas.md) §10.4）。
@@ -94,10 +94,8 @@ xUnit。
 **例外**: `Session.fs` の公開 API は `SessionTests.fs`、`DatabaseHost.fs` は `DatabaseHostTests.fs` で検証する。
 `DatabaseTests.fs` は src に対応ファイルを持たない DB 全体の通し経路テスト
 （公開 API の `Session` / `SessionPool` で内部機構を検証する）。
-`ProcessLock.fs` / `EngineHost.fs` は専用ファイルを持たず、
-`RowStoreTests` / `BackgroundCompactionTests` / `DatabaseTests` で間接的に検証する。
-`DatabaseHostTests` の `CommitDurability:` / `SerializationTests` の `順序保持:` は横断的な性質テスト、
-`CliTests` は CLI 全体のテスト。
+`ProcessLock.fs は専用ファイルを持たず、`RowStoreTests`/`DatabaseTests`で間接的に検証する。
+`DatabaseHostTests`の`CommitDurability:`/`SerializationTests`の`順序保持:`は横断的な性質テスト、`CliTests` は CLI 全体のテスト。
 [`sql-reference.md`](sql-reference.md) が扱う構文・意味論は `SqlReferenceTests.fs`。
 
 ```bash
@@ -105,19 +103,14 @@ dotnet test                                                    # 全件
 dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"    # Server のみ
 ```
 
-**テスト方針**: `DatabaseTests` は DB 全体の通し経路として内部機構
-（MVCC / WAL / プロセスロック / 索引 backfill・後始末 / 永続性 / 末尾再帰）
-を検証する。
-`SqlReferenceTests` / `ServerTests` は「SQL 文字列 → 結果」の通し経路を検証する。
-Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグはそこだけで分かる。
-
-**役割の分担**:
+**通し経路の役割**:
 
 - `SqlReferenceTests` — [`sql-reference.md`](sql-reference.md) の構文・意味論
   （文・句・式・リテラル・識別子が受理 / 拒否され、評価結果も仕様どおりであること）。
   テスト名の接頭辞は `SqlReference:`。
 - `DatabaseTests` — DB 全体の通し経路（`Session` / `SessionPool` 経由）と内部機構
   （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / 永続性 / 末尾再帰）。
+  Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグはここで分かる。
 
 **書き方**:
 
@@ -180,6 +173,7 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
 - 結果は `BenchmarkDotNet.Artifacts/`（実行時のカレントディレクトリ）に残る。git 対象外。
 - シナリオ:
   - `PointLookup` / `PointLookup500` / `CountStar` / `RangeScan` / `FilterSeqScan` / `SelectConstant` / `CountConstantWhere`
+  - `ParsePoint` — 字句解析 + 構文解析だけ。
   - `PointLookupParsed` / `PointLookupPlanned` / `PointLookupStorage` — 同じポイント検索を「parse 済みの文」「計画済みの木」「ストレージ直（`PkLookup` が実行する `byPrimaryKeyMasked`）」で測る低レベル版。
     `PointLookup` との差で parse / plan / 実行の内訳が分かる。
     **計画・実行の変更はこの 3 本を見る**（`PointLookup` は plan が支配的で、ストレージの変化が埋もれる）。

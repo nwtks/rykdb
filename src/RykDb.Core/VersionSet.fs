@@ -339,32 +339,6 @@ module internal VersionEdit =
                 ]
         }
 
-/// MANIFEST に反映済みの現在状態
-/// （background compaction が共有する）。
-type internal HostState =
-    {
-        Version: Version
-        /// 有効な manifest 番号
-        /// （SSTable のファイル番号とは単位が違う）。
-        ManifestNumber: int64<manifestNo>
-        /// commit 時に更新される GC 境界。0 は「全版を残す」。
-        ActiveSnapshot: uint64
-        /// 直近の compaction の失敗（成功したら None）。
-        LastCompactionError: DbError option
-        /// publish のたびに増える世代番号。
-        Generation: int64
-    }
-
-module internal HostState =
-    let initial (version: Version) (manifestNumber: int64<manifestNo>) =
-        {
-            Version = version
-            ManifestNumber = manifestNumber
-            ActiveSnapshot = 0UL
-            LastCompactionError = None
-            Generation = 0L
-        }
-
 module internal Manifest =
     /// manifest ファイル名の接頭辞。
     [<Literal>]
@@ -624,4 +598,30 @@ module internal Manifest =
                 |> ignore
 
                 return bumped, nextNumber
+        }
+
+/// MANIFEST に反映済みの現在状態
+/// （background compaction が共有する）。
+type internal PublishedState =
+    {
+        Version: Version
+        /// 有効な manifest 番号
+        /// （SSTable のファイル番号とは単位が違う）。
+        ManifestNumber: int64<manifestNo>
+        /// commit 時に更新される GC 境界。0 は「全版を残す」。
+        ActiveSnapshot: uint64
+        /// 直近の compaction の失敗（成功したら None）。
+        LastCompactionError: DbError option
+        /// publish のたびに増える世代番号。
+        Generation: int64
+    }
+
+module internal PublishedState =
+    let initial (version: Version) (manifestNumber: int64<manifestNo>) =
+        {
+            Version = version
+            ManifestNumber = manifestNumber
+            ActiveSnapshot = 0UL
+            LastCompactionError = None
+            Generation = 0L
         }

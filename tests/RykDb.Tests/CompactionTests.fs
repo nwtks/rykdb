@@ -535,9 +535,7 @@ let ``Compaction.compact: Smallest > Largest の入力は CorruptionError にな
     withDir "comp-broken-range" (fun dir ->
         // MANIFEST の破損で Largest < Smallest のファイルだけの Version。
         // seed 自身が inRange を外れるため expand の入力が空になり、
-        // 修正前は minKeyOf の Array.reduce が ArgumentException
-        // （The input array was empty）を未処理例外として投げていた
-        // （protect の外なので公開 API まで例外が抜けた）。
+        // boundsOf が CorruptionError を返す。
         let broken = fmd 1L 0 2 1
         let version = Version.addFile broken Version.Empty
         // L0 はファイル数が閾値以上でしか選ばれないため 1 にする。

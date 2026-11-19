@@ -29,6 +29,7 @@
     <Compile Include="ParserExprTests.fs" />
     <Compile Include="ParserTests.fs" />
     <Compile Include="TransactionsTests.fs" />
+    <Compile Include="VersionCoordinatorTests.fs" />
     <Compile Include="RowStoreTests.fs" />
     <Compile Include="TableSchemaTests.fs" />
     <Compile Include="CatalogTests.fs" />
@@ -53,7 +54,6 @@
     <Compile Include="SessionTests.fs" />
     <Compile Include="DatabaseTests.fs" />
     <Compile Include="SqlReferenceTests.fs" />
-    <Compile Include="BackgroundCompactionTests.fs" />
     <Compile Include="KeyEncodingTests.fs" />
     <Compile Include="ServerTests.fs" />
     <Compile Include="CliTests.fs" />

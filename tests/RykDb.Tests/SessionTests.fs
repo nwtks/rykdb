@@ -57,7 +57,7 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
     interface IStorageEngine with
         member _.NextSeqNo = inner.NextSeqNo
         member _.ActiveSnapshot = inner.ActiveSnapshot
-        member _.HostState = inner.HostState
+        member _.PublishedState = inner.PublishedState
         member _.WalState = inner.WalState
         member _.GetAtMasked visible key mask = inner.GetAtMasked visible key mask
 

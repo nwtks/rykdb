@@ -1229,10 +1229,7 @@ let ``SqlReference: JOIN`` () =
 
 [<Fact>]
 let ``SqlReference: 3 テーブルの入れ子 JOIN が行を返す`` () =
-    // exec は左部分木に「全スキーマ」を渡していたため、3 テーブル以上の入れ子
-    // 結合で内側の JOIN が右テーブルの列まで含んだ schema で ON 句を解決し、
-    // 列が見つからずに INNER JOIN が黙って 0 行を返していた。
-    // 左へ下ろすのは「右テーブルを除いたスキーマ」。
+    // 左部分木へ渡すスキーマは「右テーブルを除いたもの」。
     withSession "join3" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, av INTEGER)"
@@ -1254,9 +1251,7 @@ let ``SqlReference: 3 テーブルの入れ子 JOIN が行を返す`` () =
 
 [<Fact>]
 let ``SqlReference: エイリアスでの自己結合が行を返す`` () =
-    // JOIN の対応付けを RealName で探していたころは、`FROM t AS x JOIN t AS y` が
-    // 先頭の t にヒットして JOIN が丸ごと省略され、
-    // 列インデックスが範囲外（2 列中）になって落ちていた。
+    // 自己結合の対応付けはテーブル名ではなく別名で行う。
     withSession "selfjoin" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"

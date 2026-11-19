@@ -48,11 +48,11 @@ table_ref      ::= ident [ [AS] ident ]
 join_clause    ::= [INNER | LEFT [OUTER]] JOIN table_ref ON expr
 sort_key       ::= expr [ASC | DESC]
 
-insert         ::= INSERT INTO table_ref ( DEFAULT VALUES
+insert         ::= INSERT INTO ident ( DEFAULT VALUES
                    | [ "(" column_list ")" ] (VALUES row {"," row} | select) )
 row            ::= "(" expr {"," expr} ")"
-update         ::= UPDATE table_ref SET assignment {"," assignment} [ WHERE expr ]
-delete         ::= DELETE FROM table_ref [ WHERE expr ]
+update         ::= UPDATE ident SET assignment {"," assignment} [ WHERE expr ]
+delete         ::= DELETE FROM ident [ WHERE expr ]
 
 ddl            ::= CREATE TABLE [IF NOT EXISTS] ident "(" table_element {"," table_element} ")"
                 | CREATE [UNIQUE] INDEX [IF NOT EXISTS] ident ON ident "(" column_list ")"
@@ -95,7 +95,7 @@ txn            ::= BEGIN [TRANSACTION] | START TRANSACTION
 ### 識別子
 
 - 通常: 開始は**文字または `_`**、以降は文字・数字・ `_`
-  （`Char.IsLetter` / `LetterOrDigit`。英字以外の Unicode 文字も識別子として使える）
+  （`Char.IsLetter` / `Char.IsLetterOrDigit`。英字以外の Unicode 文字も識別子として使える）
 - 引用: `"..."`（`""` で `"` をエスケープ）
 
 **大文字小文字は区別しない**（テーブル名・列名・索引名の比較は `OrdinalIgnoreCase`）。
@@ -113,7 +113,7 @@ BEGIN   COMMIT  ROLLBACK PRIMARY KEY     UNIQUE  DEFAULT CASE    WHEN
 THEN    ELSE    END      EXISTS  IF      TRUE    FALSE
 ```
 
-`TRUE` / `FALSE` は上の一覧（`Lexer.Keywords`）には含まれないが、字句解析で特別に扱われる。
+この一覧が `Lexer` の `KeywordSpellings` と一致する。
 
 ### 記号（演算子・区切り）
 
@@ -284,14 +284,16 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 
 ### `INSERT` の値式は定数のみ
 
-`INSERT ... VALUES` の値は **列参照を含む式にできない**。
+`INSERT ... VALUES` の値は **列参照を含む式にできない**（対象テーブルの列も読めない）。
+サブクエリは定数として評価できる（§7.9）。
 
 ```sql
-INSERT INTO t VALUES (1, 2 + 3);      -- OK（定数式）
-INSERT INTO t VALUES (1, other_col);  -- NameError（'other_col' は列でも関数でもありません）
+INSERT INTO t VALUES (1, 2 + 3);                 -- OK（定数式）
+INSERT INTO t VALUES (1, (SELECT MAX(v) FROM u)); -- OK（サブクエリ）
+INSERT INTO t VALUES (1, other_col);             -- NameError（'other_col' は列でも関数でもありません）
 ```
 
-列や別テーブルの値を使いたい場合は `INSERT ... SELECT` を使う（§8）。
+行の値を使いたい場合は `INSERT ... SELECT` を使う（§8）。
 
 ### 出力の表示（`SqlLiteral.toSqlLiteral`）
 
@@ -622,7 +624,8 @@ SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
 - `ORDER BY` には列参照・式・序数（1 始まり）を書ける。
   序数は `SELECT` 項目の位置（`ORDER BY 2` は 2 番目の項目）。
   式は行ごとに評価され、ソート後に元の列だけが残る。
-  集約式（`ORDER BY COUNT(*)` など）は未対応。
+  `ORDER BY` に集約式を直接書くことはできない
+  （`SELECT id FROM t ORDER BY COUNT(*)` は `NameError`。集約クエリでは `SELECT` の別名を並べる）。
 - `t.*` の `t` が `FROM` / `JOIN` に存在しない場合は `NameError`
   （0列の成功にはしない）。
 
@@ -830,7 +833,7 @@ WHERE EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > e.sala
 - 外側の列は、内側のスコープで解決できない場合だけ外側へフォールバックする
   （内側に同じ名前の列・テーブルがある場合は内側が優先）。
 - **非相関**サブクエリは外側のクエリを実行する前に 1回だけ実行され、結果は定数へ置き換わる
-  （`IN` は要素のリストへ展開する）。
+  （`IN` は値集合 `ValueSet` に構築する）。
   同じ文の中のサブクエリは同じスナップショットを見る。
 - **相関**サブクエリは外側の行ごとに実行される。
 - 列数が 1 でないサブクエリは `TypeError`。
@@ -1513,8 +1516,9 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 | `SELECT DISTINCT`   | 符号化キーの集合。作業メモリ（既定 256MiB）を超えた分は一時ファイルへ退避し、最初に現れた順を保って完走する                                                                                               |
 | `JOIN`              | 入れ子ループ / ハッシュ結合は右側を、マージ結合は同じキーの行だけを保持。作業メモリ換算 256MiB を超えた分は一時ファイルへ退避（ハッシュ結合は両側をキーハッシュでパーティション分割して外部ハッシュ結合） |
 | `GROUP BY`          | 行を抱えず集約。グループが作業メモリを超えたら、以降の行をグループキーで退避してパーティションごとに集約する。`DISTINCT` 集約の値が上限を超えたら外部ソートで重複除去                                     |
+| `IN (SELECT ...)`   | 値集合 `ValueSet`。上限を超えた分は一時ファイルへ退避し、Bloom filter + ブロック索引で判定する。NULL は `HasNull` だけを持つ                                                                              |
 | パラメータ          | `?` の位置パラメータのみ（名前付きは未対応）。個数は SQL 全体で一致が必要。値は `SqlValue` で渡す                                                                                                         |
-| 最終結果            | materialize。既定 100万行 / 256MiB で、超過は `CapacityError`（`SessionOptions` で変更可。**負値は無制限**。上限なしは `TryOpenReader` が省メモリ）                                                       |
+| 最終結果            | materialize。既定 100万行 / 256MiB で、超過は `CapacityError`（`SessionOptions` で変更可。**`-1` で無制限**。上限なしは `TryOpenReader` が省メモリ）                                                      |
 | ストリーミング      | `Session.TryOpenReader` は単一 SELECT のみ。materialize しないため結果上限は適用外。終端または `RowReader.Dispose` で走査と snapshot を解放                                                               |
 | `AVG`               | `SUM / COUNT` を実行時に計算                                                                                                                                                                              |
 | `UPDATE` / `DELETE` | `FROM` / `USING` / `LIMIT` 相当の句がない                                                                                                                                                                 |

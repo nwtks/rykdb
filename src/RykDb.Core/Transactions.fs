@@ -411,9 +411,9 @@ type internal ActiveRegistration internal (root: string, unregister: ActiveRegis
 /// DB ごとの active transaction の snapshot を集約する。
 /// <remarks>
 /// GC の境界は「最古の active snapshot」なので、
-/// 同じ DB を別ハンドルで開いて長い transaction を走らせている場合も、
+/// 同じ root に複数の store / 接続があり、その 1つで長い transaction を走らせている場合も、
 /// その snapshot を考慮しないと compaction がまだ必要な版を捨ててしまう
-/// （`TransactionManager` はハンドル単位のため分からない）。
+/// （`TransactionManager` は接続側の状態だけでは分からない）。
 /// 複数プロセスからの同時アクセスは非対応なので、DB ごとの表で十分。
 /// 永続化もしない（再オープン後の transaction は存在しない）。
 /// </remarks>
@@ -456,7 +456,7 @@ type internal SnapshotRegistry() =
             (bucket key).[registration] <- snapshot
             registration)
 
-    /// 登録を解除する（commit 成功・rollback・Close・最後のハンドルの GC）。
+    /// 登録を解除する（commit 成功・rollback・Close・最後の接続の GC）。
     /// 解除し忘れても「版を余分に残す」側にしか倒れない（安全側）。
     member _.Unregister(registration: ActiveRegistration) =
         withGate (fun () ->

@@ -69,7 +69,7 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
         member _.NextSeqNo = 0UL
         member _.ActiveSnapshot = 0UL
 
-        member _.HostState =
+        member _.PublishedState =
             {
                 Version = Version.Empty
                 ManifestNumber = 0L<manifestNo>

@@ -151,8 +151,8 @@ Debug ビルド・単一スレッド・10万行（`INTEGER` 主キー 1列 + `IN
 | ポイント検索 200回                | 約 0.06秒（0.3ms/回） |
 | 全走査（`COUNT(*)`）              | 約 0.8秒              |
 
-Release ビルドではさらに速くなる。
-Bloom filter のキーあたりのビット数と、LSM のレベル間の容量比は未調整である。
+Release ビルドではさらに速い。
+Bloom filter のキーあたりのビット数と、LSM のレベル間の容量比は未調整。
 再現可能な計測は [`tools/RykDb.Bench`](tools/RykDb.Bench) で行う
 （手順は [`development.md`](docs/development.md) §4）。
 

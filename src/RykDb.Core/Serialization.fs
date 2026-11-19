@@ -677,7 +677,7 @@ module internal KeyBuilder =
 /// キーと異なり、行値には順序保持が不要なので varint で詰めて小さくする。
 module internal ValueCodec =
     /// 小数の負のゼロ (-0.0M) を +0.0M に正規化する。
-    /// compareValues は両者を等しいと扱うため、
+    /// compareValuesV が両者を等しいと扱うため、
     /// DISTINCT などの符号化でも同じビット列にして重複と見なす。
     let private normalizeDecimal (d: decimal) = if d = 0M then 0M else d
 

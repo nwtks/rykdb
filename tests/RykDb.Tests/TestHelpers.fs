@@ -22,7 +22,7 @@ let expectSome (label: string) (o: 'T option) =
     | None -> failwithf "%s: None です" label
 
 /// Version の不変条件（レベル構成・番号の一意性・範囲の並び）を検査する。
-/// VersionSetTests と BackgroundCompactionTests（並行ストレス）で共有する。
+/// VersionSetTests と VersionCoordinatorTests（並行ストレス）で共有する。
 let validateVersion (v: Version) =
     let fail msg =
         err (DbError.internalError ("Version: " + msg))
@@ -193,7 +193,7 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
         member _.NextSeqNo = state.NextSeqNo
         member _.ActiveSnapshot = 0UL
 
-        member _.HostState =
+        member _.PublishedState =
             {
                 Version = Version.Empty
                 ManifestNumber = 0L<manifestNo>
@@ -405,7 +405,7 @@ let schema2 =
             outCol "b" None (Some DataType.Integer)
         ]
 
-/// 共有のテスト用テーブルスキーマ（CatalogTests / PlannerTests が同一定義を使っていた）。
+/// 共有のテスト用テーブルスキーマ。
 let peopleSchema: TableSchema =
     {
         Name = "people"
@@ -646,13 +646,10 @@ let keyOf (v: SqlValue) = KeyBuilder.ofValues [ v ] |> ok
 let keyOfTuple (vs: SqlValue[]) = KeyBuilder.ofValues vs |> ok
 
 /// 連番の整数から作るテスト用キー。
-/// SSTable / MANIFEST / StorageEngine / WAL の `sstKey`、Memtable / BloomFilter の
-/// `bloomKey` として 7ファイルに同一実装がコピーされていたので一本化した。
 let intKey (i: int) =
     KeyBuilder.ofValues [ SqlValue.Int(int64 i) ] |> ok
 
 /// INTEGER 1 列の行。
-/// Memtable / StorageEngine / WAL の `valOf` にあたる（Executor の `intArr` も同義）。
 let intRow (i: int) = [| SqlValue.Int(int64 i) |]
 
 /// SSTable 用の連番エントリ（キー昇順・同一キーなし。SeqNo は 1..n）。

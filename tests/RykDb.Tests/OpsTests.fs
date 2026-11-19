@@ -8,7 +8,7 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-/// 既存のテストは「上限なし（スピルしない）」の従来挙動を検証する。
+/// このモジュールのテストは上限なし（スピルしない）経路を検証する。
 /// スピル経路は専用のバジェットで別途テストする。
 module private UnlimitedOps =
     let sortBy = Ops.sortBy MemoryBudget.Unlimited

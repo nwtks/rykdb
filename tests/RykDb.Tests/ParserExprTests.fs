@@ -418,8 +418,7 @@ let ``末尾再帰: 比較演算子の判定が hoist 後も正しい`` (expr: s
 
 [<Fact>]
 let ``末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない`` () =
-    // MaxExpressionDepth = 1000000 を仮に置いても届かない深さ。
-    // 括弧は AST に残らないので、中身は定数 1 になる。
+    // 深さ上限はない。括弧は AST に残らないので、中身は定数 1 になる。
     let depth = 1_000_000
     let nest = System.String('(', depth) + "1" + System.String(')', depth)
     Assert.Equal<string>("1", whereTextOf ("SELECT * FROM t WHERE " + nest))

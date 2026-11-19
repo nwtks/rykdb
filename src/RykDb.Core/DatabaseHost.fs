@@ -250,7 +250,8 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
     /// 永続化（WAL の fsync）の失敗。失敗後は全接続がエラーを返す。
     member _.DurabilityFailure = durability.Failure
 
-    /// 読み取り用の committed state と、GC から守る lease を返す。
+    /// 読み取り用の committed state と Version 全ファイルの pin を 1回で返す
+    /// （返した lease を Dispose するまで GC から守る）。
     member _.AcquireReadSnapshot() =
         match snapshot () with
         | HostLifecycle.Closed _ -> err (closedError ())

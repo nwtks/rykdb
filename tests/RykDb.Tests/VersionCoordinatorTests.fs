@@ -1,8 +1,8 @@
 // ===========================================================================
-// BackgroundCompactionTests — EngineHost / background compactions の縦切りテスト。
+// VersionCoordinatorTests — VersionCoordinator / background compaction の縦切りテスト。
 // ===========================================================================
 
-module RykDb.BackgroundCompactionTests
+module RykDb.VersionCoordinatorTests
 
 open System.Diagnostics
 open System.IO
@@ -30,7 +30,7 @@ let private forceL1Compaction =
         MaxLevelBytes = limits
     }
 
-let private waitIdle (host: EngineHost) =
+let private waitIdle (host: VersionCoordinator) =
     Assert.True(SpinWait.SpinUntil((fun () -> host.IsIdle), 10000), "worker が idle になりません")
 
 let private writeWithSeq (store: RowStore) (seqNo: uint64) (i: int) =
@@ -376,7 +376,7 @@ let ``background compaction: DB を開いた時点で未 compaction の L0 を�
             for i in 1..4 do
                 current <- writeOne current i
 
-            Assert.Equal(4, (Version.filesAt 0 current.Engine.HostState.Version).Length)
+            Assert.Equal(4, (Version.filesAt 0 current.Engine.PublishedState.Version).Length)
             ok (RowStore.close current) |> ignore
         with _ ->
             RowStore.close current |> ignore
@@ -511,7 +511,7 @@ let ``background compaction: ランダムな操作列でも Version と refcount
             let mutable lastFileNumber = 0L
             let leases = ResizeArray<int * System.IDisposable * RowStore>()
 
-            let checkVersion (state: HostState) =
+            let checkVersion (state: PublishedState) =
                 ok (validateVersion state.Version) |> ignore
 
                 Assert.True(

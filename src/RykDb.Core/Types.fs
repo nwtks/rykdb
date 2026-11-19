@@ -333,8 +333,8 @@ module internal SqlValue =
 
     /// 浮動小数点数を単一のビットパターンに正規化する。
     /// - NaN は単一のビットパターンに揃える（キー符号化の順序を一意にする）。
-    /// - -0.0 は +0.0 に揃える（compareValues が両者を等しいと扱うため、
-    ///   キーや DISTINCT の符号化でも同じ値にする）。
+    /// - -0.0 は +0.0 に揃える
+    /// （compareValuesV が両者を等しいと扱うため、キーや DISTINCT の符号化でも同じ値にする）。
     let normalizeFloat (f: float) =
         if System.Double.IsNaN f then canonicalNaN
         elif f = 0.0 then 0.0
@@ -467,7 +467,7 @@ module internal SqlValue =
     /// ORDER BY 用の全順序比較（内部ホットパス用）。
     /// NULL は他のすべての値より小さいものとして扱う（ASC の先頭、DESC の末尾）。
     /// SQL の 3値論理では NULL は比較不能だが、ソートには全順序が必要なのでここだけ規則を分ける。
-    /// NULL 以外の型が比較不能な場合は compareValues と同じエラーを返す。
+    /// NULL 以外の型が比較不能な場合は compareValuesV と同じエラーを返す。
     let compareValuesForSortV (a: SqlValue) (b: SqlValue) =
         match a, b with
         | SqlValue.Null, SqlValue.Null -> DbOk 0

@@ -644,7 +644,7 @@ type internal IStorageEngine =
     abstract NextSeqNo: uint64
     abstract ActiveSnapshot: uint64
     /// MANIFEST に反映済みの状態（background compaction が共有する）。
-    abstract HostState: HostState
+    abstract PublishedState: PublishedState
     /// 現在の WAL 位置。メモリエンジンは None。
     abstract WalState: WalState option
 
@@ -665,7 +665,8 @@ type internal IStorageEngine =
     abstract WriteBatchDeferred: entries: Entry array -> Result<IStorageEngine, DbError>
     abstract WithNextSeqNo: nextSeqNo: uint64 -> IStorageEngine
     abstract WithActiveSnapshot: snapshot: uint64 -> IStorageEngine
-    abstract WithHostState: state: HostState -> IStorageEngine
+    /// coordinator が公開した Version / MANIFEST 番号 / GC 境界で差し替える。
+    abstract WithHostState: state: PublishedState -> IStorageEngine
     /// 上限超過時は flush だけを行う（compaction はしない）。
     /// 戻り値の bool は「実際に flush したか」。
     abstract FlushIfNeeded: allocateFileNumber: (unit -> int64) -> Result<IStorageEngine * bool, DbError>
@@ -678,7 +679,7 @@ type internal DiskStorageEngine(engine: StorageEngine) =
         member _.NextSeqNo = engine.NextSeqNo
         member _.ActiveSnapshot = engine.ActiveSnapshot
 
-        member _.HostState =
+        member _.PublishedState =
             {
                 Version = engine.Version
                 ManifestNumber = engine.ManifestNumber

@@ -19,48 +19,48 @@ F# の型システムでは表現できないため、
 
 ## 担保の種類
 
-| 種類           | 意味                                                  | 例                                                                               |
-| -------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------- |
-| 型             | DU / record / newtype / units of measure で表現できる | `SqlValue`、`DataType`、`TruthValue`                                             |
-| コンストラクタ | 生ケースを隠し、スマートコンストラクタだけを使う      | `Op.fsi`（ケース非公開）と `Op.Empty` / `ofRow` / `emit` / `compute`             |
-| `validate`     | テストから呼ぶ `Result` ベースの検査関数              | `VersionSetTests.fs` / `TransactionsTests.fs` 内の private `validate`            |
-| プロパティ     | ランダム入力で性質を検査する                          | `SerializationTests`（順序保持） / `BackgroundCompactionTests`（ランダム操作列） |
-| 構築制限       | `.fsi` でレコード・DU のケースを隠す                  | `Op.fsi` / `Writer.fsi` / `SstScan.fsi` / `Cursor.fsi` / `Memtable.fsi`          |
-| 実行時         | 本番経路で `Result` として検出する                    | チェックサム、SSTable のキー順検証                                               |
+| 種類           | 意味                                                  | 例                                                                             |
+| -------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------ |
+| 型             | DU / record / newtype / units of measure で表現できる | `SqlValue`、`DataType`、`TruthValue`                                           |
+| コンストラクタ | 生ケースを隠し、スマートコンストラクタだけを使う      | `Op.fsi`（ケース非公開）と `Op.Empty` / `ofRow` / `emit` / `compute`           |
+| `validate`     | テストから呼ぶ `Result` ベースの検査関数              | `VersionSetTests.fs` / `TransactionsTests.fs` 内の private `validate`          |
+| プロパティ     | ランダム入力で性質を検査する                          | `SerializationTests`（順序保持） / `VersionCoordinatorTests`（ランダム操作列） |
+| 構築制限       | `.fsi` でレコード・DU のケースを隠す                  | `Op.fsi` / `Writer.fsi` / `SstScan.fsi` / `Cursor.fsi` / `Memtable.fsi`        |
+| 実行時         | 本番経路で `Result` として検出する                    | チェックサム、SSTable のキー順検証                                             |
 
 ## 一覧
 
-| ID     | 不変条件                                                                     | 担保                                                                                                                                                                                                                           | 状態    |
-| ------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
-| INV-01 | `Op` / `SstScan` は one-shot                                                 | `Op.emit` / `Op.compute`、`Op.fsi`（Op のケース非公開）、`SstScan.fsi`（SstScan のケース非公開）、`TestHelpers.oneShot`、`SstScan.ofStep` / `ofArray` / `ofState`、`SstScan.withScan`                                          | ✅ 完了 |
-| INV-02 | 返した行は DB 内部と独立                                                     | `SqlValue.copyRow`、`Engine.runSelect`、`RowReader.TryRead`                                                                                                                                                                    | ✅ 完了 |
-| INV-03 | キー順の定義は 1つ                                                           | `KeyOrder.compare`、`Entry.compareKeys`、`SstEntry.compare`                                                                                                                                                                    | ✅ 完了 |
-| INV-04 | 意味の違う番号（manifest / file / seq / txn）を混ぜない                      | 単位 `manifestNo` / `txnId`（同型ペアの片側だけに付与）                                                                                                                                                                        | ✅ 完了 |
-| INV-05 | `TransactionManager` の SeqNo / Active / LastCommitted                       | `TransactionsTests.fs` の private `validate`                                                                                                                                                                                   | ✅ 完了 |
-| INV-06 | `Version` のレベル・番号・範囲                                               | `VersionSetTests.fs` の private `validate`                                                                                                                                                                                     | ✅ 完了 |
-| INV-07 | compaction GC は可視集合を保存                                               | `Compaction.gcGroup` と可視性プロパティテスト                                                                                                                                                                                  | ✅ 完了 |
-| INV-08 | MANIFEST は追記専用・番号は単調                                              | `VersionEdit` encode/decode + 再オープンのプロパティテスト                                                                                                                                                                     | ✅ 完了 |
-| INV-09 | WAL は commit 済み prefix だけ再生                                           | `Wal.foldCommitted` の全切断位置テスト                                                                                                                                                                                         | ✅ 完了 |
-| INV-10 | keyspace 接頭辞が混ざらない                                                  | `Keyspace.prefixedKey` の往復・非相互接頭辞テスト、`RowStore` のキー分離テスト                                                                                                                                                 | ✅ 完了 |
-| INV-11 | ヘッダ長 = 行幅 = 射影長                                                     | `SelectProjection.create`（式・表示ヘッダ・参照ヘッダを一度に構築）                                                                                                                                                            | ✅ 完了 |
-| INV-12 | `Cursor` は `0 <= Pos <= End <= Data.Length`                                 | `Cursor.fsi`（レコード非公開、構築は `create` / `createSlice`、前進は `advance`）+ `createSlice` の構築時検証 + プロパティテスト                                                                                               | ✅ 完了 |
-| INV-13 | `BloomFilter.BitCount` は 8 の倍数                                           | 築く側 `bitsFor` が 8 単位に丸める + 読む側 `deserialize` の拒否 + パラメータ網羅テスト                                                                                                                                        | ✅ 完了 |
-| INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`                             | `Memtable.fsi`（構築は `Empty` / `insert` / `apply` に限定）+ `Memtable.insert` の会計とランダム挿入・順序独立性のプロパティテスト                                                                                             | ✅ 完了 |
-| INV-15 | `RowReader` は Reading / Exhausted / Closed のいずれか                       | `RowReaderState`（状態 DU に置き換え、`releaseTo` が遷移と 1回解放を担当）                                                                                                                                                     | ✅ 完了 |
-| INV-16 | `Session` のロック規約                                                       | `stateGate` / `writeGate` の設計 + `SessionTests` の並行テスト 6 本                                                                                                                                                            | ✅ 完了 |
-| INV-17 | lease の所有権                                                               | `ProcessLockLease.ForceRelease`（二重解放は無害） + `TxnState.Lease` の `RegistrationLease`（GC で解除） + `DatabaseHostTests` の GC 回帰テスト                                                                                | ✅ 完了 |
-| INV-18 | `Expr.children` / `plugChildren` の arity                                    | `Expr.plugChildren`（モジュールレベルへ引き上げ）+ `AstTests` の全ノード種テスト                                                                                                                                               | ✅ 完了 |
-| INV-19 | 保持する側はキー・行の所有権を複製で取り込む                                 | `Entry.takeOwnership` / `Transaction.setSlot` の複製と回帰テスト                                                                                                                                                               | ✅ 完了 |
-| INV-20 | `Writer.Chunks` は逆順（先頭が最新の書き込み）                               | `Writer.fsi`（ケース非公開、構築は `Empty` / 各 write 関数に限定）+ 順序プロパティテスト                                                                                                                                       | ✅ 完了 |
-| INV-21 | UNIQUE の予約は commit まで競合検出に残る                                    | `Transaction.reserveUnique` / `writeKeys` / `TransactionManager.commit` + `TransactionsTests` / `SessionTests` の同時実行テスト                                                                                                | ✅ 完了 |
-| INV-22 | `Session.fs` / `DatabaseHost.fs` の `mutable` は状態 DU のスロットとカウンタ | `SyncState` / `HostLifecycle` / `LocalSession` / `PoolLifecycle` / `RowReaderState`                                                                                                                                            | ✅ 完了 |
-| INV-23 | 結果行は `LoadedRow`（`Unloaded` を含まない）                                | `LoadedRow.create` + `StatementResult` の非公開コンストラクタ（`Create` は `LoadedRow` だけを受ける） + `RowReader.TryRead` の戻り値型                                                                                         | ✅ 完了 |
-| INV-24 | `EngineHost` の Version 公開とファイル refcount                              | `EngineHost.publish` / `install` / `AcquireCall` + `BackgroundCompactionTests` の並行・ランダム操作列テスト                                                                                                                    | ✅ 完了 |
-| INV-25 | commit の WAL 位置は fsync 前に登録する                                      | `DatabaseHost.serialized` の `writeGate` 内 `Register` + `DatabaseHostTests` の統合テスト（3 commit / 2 fsync）                                                                                                                | ✅ 完了 |
-| INV-26 | 確定状態は transaction を持たない                                            | `Committed`（transaction フィールド無し）+ `HostLifecycle` が `Committed` のみを保持 + 実行時だけ `ExecState` に合成                                                                                                           | ✅ 完了 |
-| INV-27 | 並列制御以外に DB・プロセス寿命の可変キャッシュを持たない                    | `Eval.Prepared`（計画時の `ImmutableDictionary`）+ `FileMetaData.ReadInfo`（不変の `Version` に付随）+ mutable/`ConcurrentDictionary` の許可リスト（Session 層・`EngineHost`・`ProcessLock`・`Transactions`・`SstScan.Scope`） | ✅ 完了 |
-| INV-28 | 索引エントリの値は空。索引列 + 主キーはキーから復号し、非被覆列は PK lookup  | `Dml.indexKeyRow` / `opOfIndexScan` / `indexAccessMasks` / `ExecContext.fetchMissing` + キー復号 golden / 索引 fetch テスト                                                                                                    | ✅ 完了 |
-| INV-29 | 退避した一時ファイルは必ず閉じ、読み切ったら消す                             | `Spill.openSink` / `closeSink` / `foldRun`（閉じて消す）/ `foldRunKeep`（閉じるだけ）/ `reopen`（消す）/ `reopenKeep`（消さない）+ `SpillTests` / `OpsTests` / `OpsJoinTests` の「一時ファイルが残らない」検査                 | ✅ 完了 |
+| ID     | 不変条件                                                                     | 担保                                                                                                                                                                                                                                   | 状態    |
+| ------ | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| INV-01 | `Op` / `SstScan` は one-shot                                                 | `Op.emit` / `Op.compute`、`Op.fsi`（Op のケース非公開）、`SstScan.fsi`（SstScan のケース非公開）、`TestHelpers.oneShot`、`SstScan.ofStep` / `ofArray` / `ofState`、`SstScan.withScan`                                                  | ✅ 完了 |
+| INV-02 | 返した行は DB 内部と独立                                                     | `SqlValue.copyRow`、`Engine.runSelect`、`RowReader.TryRead`                                                                                                                                                                            | ✅ 完了 |
+| INV-03 | キー順の定義は 1つ                                                           | `KeyOrder.compare`、`Entry.compareKeys`、`SstEntry.compare`                                                                                                                                                                            | ✅ 完了 |
+| INV-04 | 意味の違う番号（manifest / file / seq / txn）を混ぜない                      | 単位 `manifestNo` / `txnId`（同型ペアの片側だけに付与）                                                                                                                                                                                | ✅ 完了 |
+| INV-05 | `TransactionManager` の SeqNo / Active / LastCommitted                       | `TransactionsTests.fs` の private `validate`                                                                                                                                                                                           | ✅ 完了 |
+| INV-06 | `Version` のレベル・番号・範囲                                               | `VersionSetTests.fs` の private `validate`                                                                                                                                                                                             | ✅ 完了 |
+| INV-07 | compaction GC は可視集合を保存                                               | `Compaction.gcGroup` と可視性プロパティテスト                                                                                                                                                                                          | ✅ 完了 |
+| INV-08 | MANIFEST は追記専用・番号は単調                                              | `VersionEdit` encode/decode + 再オープンのプロパティテスト                                                                                                                                                                             | ✅ 完了 |
+| INV-09 | WAL は commit 済み prefix だけ再生                                           | `Wal.foldCommitted` の全切断位置テスト                                                                                                                                                                                                 | ✅ 完了 |
+| INV-10 | keyspace 接頭辞が混ざらない                                                  | `Keyspace.prefixedKey` の往復・非相互接頭辞テスト、`RowStore` のキー分離テスト                                                                                                                                                         | ✅ 完了 |
+| INV-11 | ヘッダ長 = 行幅 = 射影長                                                     | `SelectProjection.create`（式・表示ヘッダ・参照ヘッダを一度に構築）                                                                                                                                                                    | ✅ 完了 |
+| INV-12 | `Cursor` は `0 <= Pos <= End <= Data.Length`                                 | `Cursor.fsi`（レコード非公開、構築は `create` / `createSlice`、前進は `advance`）+ `createSlice` の構築時検証 + プロパティテスト                                                                                                       | ✅ 完了 |
+| INV-13 | `BloomFilter.BitCount` は 8 の倍数                                           | 築く側 `bitsFor` が 8 単位に丸める + 読む側 `deserialize` の拒否 + パラメータ網羅テスト                                                                                                                                                | ✅ 完了 |
+| INV-14 | `Memtable.ApproxBytes` は `Σ Entry.managedBytes`                             | `Memtable.fsi`（構築は `Empty` / `insert` / `apply` に限定）+ `Memtable.insert` の会計とランダム挿入・順序独立性のプロパティテスト                                                                                                     | ✅ 完了 |
+| INV-15 | `RowReader` は Reading / Exhausted / Closed のいずれか                       | `RowReaderState`（状態 DU に置き換え、`releaseTo` が遷移と 1回解放を担当）                                                                                                                                                             | ✅ 完了 |
+| INV-16 | `Session` のロック規約                                                       | `stateGate` / `writeGate` の設計 + `SessionTests` の並行テスト 6 本                                                                                                                                                                    | ✅ 完了 |
+| INV-17 | lease の所有権                                                               | `ProcessLockLease.ForceRelease`（二重解放は無害） + `TxnState.Lease` の `RegistrationLease`（GC で解除） + `DatabaseHostTests` の GC 回帰テスト                                                                                        | ✅ 完了 |
+| INV-18 | `Expr.children` / `plugChildren` の arity                                    | `Expr.plugChildren`（モジュールレベルへ引き上げ）+ `AstTests` の全ノード種テスト                                                                                                                                                       | ✅ 完了 |
+| INV-19 | 保持する側はキー・行の所有権を複製で取り込む                                 | `Entry.takeOwnership` / `Transaction.setSlot` の複製と回帰テスト                                                                                                                                                                       | ✅ 完了 |
+| INV-20 | `Writer.Chunks` は逆順（先頭が最新の書き込み）                               | `Writer.fsi`（ケース非公開、構築は `Empty` / 各 write 関数に限定）+ 順序プロパティテスト                                                                                                                                               | ✅ 完了 |
+| INV-21 | UNIQUE の予約は commit まで競合検出に残る                                    | `Transaction.reserveUnique` / `writeKeys` / `TransactionManager.commit` + `TransactionsTests` / `SessionTests` の同時実行テスト                                                                                                        | ✅ 完了 |
+| INV-22 | `Session.fs` / `DatabaseHost.fs` の `mutable` は状態 DU のスロットとカウンタ | `SyncState` / `HostLifecycle` / `LocalSession` / `PoolLifecycle` / `RowReaderState`。クエリ局所の `ValueSet.IndexedValues` / `BloomFilter.BloomBuilder` は別枠                                                                         | ✅ 完了 |
+| INV-23 | 結果行は `LoadedRow`（`Unloaded` を含まない）                                | `LoadedRow.create` + `StatementResult` の非公開コンストラクタ（`Create` は `LoadedRow` だけを受ける） + `RowReader.TryRead` の戻り値型                                                                                                 | ✅ 完了 |
+| INV-24 | `VersionCoordinator` の Version 公開とファイル refcount                      | `VersionCoordinator.publish` / `install` / `AcquireCall` + `VersionCoordinatorTests` の並行・ランダム操作列テスト                                                                                                                      | ✅ 完了 |
+| INV-25 | commit の WAL 位置は fsync 前に登録する                                      | `DatabaseHost.serialized` の `writeGate` 内 `Register` + `DatabaseHostTests` の統合テスト（3 commit / 2 fsync）                                                                                                                        | ✅ 完了 |
+| INV-26 | 確定状態は transaction を持たない                                            | `Committed`（transaction フィールド無し）+ `HostLifecycle` が `Committed` のみを保持 + 実行時だけ `ExecState` に合成                                                                                                                   | ✅ 完了 |
+| INV-27 | 並列制御以外に DB・プロセス寿命の可変キャッシュを持たない                    | `Eval.Prepared`（計画時の `ImmutableDictionary`）+ `FileMetaData.ReadInfo`（不変の `Version` に付随）+ mutable/`ConcurrentDictionary` の許可リスト（Session 層・`VersionCoordinator`・`ProcessLock`・`Transactions`・`SstScan.Scope`） | ✅ 完了 |
+| INV-28 | 索引エントリの値は空。索引列 + 主キーはキーから復号し、非被覆列は PK lookup  | `RowKey.indexKey` / `opOfIndexScan` / `indexAccessMasks` / `ExecContext.fetchMissing` + キー復号 golden / 索引 fetch テスト                                                                                                            | ✅ 完了 |
+| INV-29 | 退避した一時ファイルは必ず閉じ、読み切ったら消す                             | `Spill.openSink` / `closeSink` / `foldRun`（閉じて消す）/ `foldRunKeep`（閉じるだけ）/ `reopen`（消す）/ `reopenKeep`（消さない）+ `SpillTests` / `OpsTests` / `OpsJoinTests` の「一時ファイルが残らない」検査                         | ✅ 完了 |
 
 ---
 
@@ -282,8 +282,9 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 ### INV-16 Session のロック規約
 
 - 宣言:
-  - `stateGate` は committed / closed / readers のみを守る（短いロック）。
-  - `writeGate` は書き込み・BEGIN / COMMIT / ROLLBACK・DDL・Close を直列化する。
+  - `Session.stateGate` は `local` / `readers`、`DatabaseHost.stateGate` は `lifecycle` を守る（短いロック）。
+  - `Session.writeGate` は接続内、`DatabaseHost.writeGate` は DB 全体の
+    書き込み・BEGIN / COMMIT / ROLLBACK・DDL・Close を直列化する。
   - SELECT のみのバッチは `writeGate` を取らず、`AcquireReadSnapshot` で並行する。
 - 担保（`SessionTests`）:
   - `Session: 読み取りは実行中の書き込みを待たない`
@@ -295,13 +296,13 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
     （transaction 制御が `writeGate` に入る側を初めて直接検査）
 - Session のロック規約は決定的テストのみ。
   **ランダム操作列のストレステストは未実施**
-  （`EngineHost` の並行性は INV-24 で実施済み。Session のロックは別の問題）。
+  （`VersionCoordinator` の並行性は INV-24 で実施済み。Session のロックは別の問題）。
 
 ### INV-17 lease
 
 - `ProcessLockLease` は root とトークンだけを持ち、ロックの解放は `ForceRelease` だけ
   （`RowStore.close` とエラー経路が呼ぶ。二重解放は `ProcessLock.release` の台帳で無害）。
-  DB を開閉する所有者は `DatabaseHost` 1つなので、ハンドルごとの所有権トークンは持たない。
+  DB を開閉する所有者は `DatabaseHost` 1つなので、接続ごとの所有権トークンは持たない。
 - 進行中 transaction の登録は `TxnState.Lease` が `RegistrationLease` として持つ。
   接続が Close されずに捨てられても、最後のリースが GC された時点で登録を外す
   （`ActiveRegistration` の生存トークン）。
@@ -400,9 +401,11 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `SessionPool: UNIQUE の NULL は接続間でも重複できる`
   - `SessionPool: rollback した UNIQUE の予約は残らない`
 
-### INV-22 Session 層（Session.fs / DatabaseHost.fs）に残る mutable
+### INV-22 Session 層とクエリ局所リソースに残る mutable
 
-- 宣言: `Session.fs` / `DatabaseHost.fs` に残る `mutable` は、状態 DU を保持するスロットと読み取り数 `readers`（カウンタ）だけ。
+- 宣言: `Session.fs` / `DatabaseHost.fs` に残る `mutable` は、
+  状態 DU を保持するスロットと読み取り数 `readers`（カウンタ）だけ。
+  クエリ局所の例外は `ValueSet.IndexedValues` と `BloomFilter.BloomBuilder` だけ。
 - 理由: bool・option・カウンタを並べると「同時に成立してはいけない組み合わせ」を作れてしまう
   （INV-15 と同じ理由）。
   Session 層は意図的に `mutable` を使う層なので、残る `mutable` を状態 DU に寄せる。
@@ -416,6 +419,8 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `SessionPool.PoolLifecycle`（`Open` / `Closed`）。
   - `RowReader.RowReaderState`（INV-15）。
   - `TxnState` / `ExecState` / `Committed` は不変レコード（`mutable` を持たない）。
+- クエリ局所の例外: `ValueSet.IndexedValues`（reader / 直近 1ブロックのキャッシュ / `disposed`）と
+  `BloomFilter.BloomBuilder`（件数カウンタ）は、クエリ・構築の寿命に閉じ、DB を跨いで共有しない。
 - 回帰テスト: `DatabaseHostTests` の `CommitDurability:` 4本、
   `SessionTests` の並行・Close 系（INV-16 と同じ一覧）、`SessionPool` の接続テスト。
 
@@ -438,7 +443,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   `StatementResult.OfRows: Unloaded を含む行は拒否する`、
   `SqlValue.dataType: Unloaded は InternalError`。
 
-### INV-24 EngineHost の Version 公開とファイル refcount
+### INV-24 VersionCoordinator の Version 公開とファイル refcount
 
 - 宣言:
   - `publish` による `Generation` と `Version.NextFileNumber` は単調（戻らない）。
@@ -452,14 +457,14 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
     `publish` は現在値との `max` を取るので、古い Version を公開しても番号は戻らない。
     MANIFEST 追記と install は `installGate` で直列化する。
   - `AcquireCall` が現在の Version の全ファイルを pin し、`Dispose` で release + sweep する。
-- 回帰テスト（`BackgroundCompactionTests`）:
+- 回帰テスト（`VersionCoordinatorTests`）:
   - `background compaction: 書き込み・読み取り・snapshot pin を並行に回しても壊れない`
     （複数スレッドの同時実行）
   - `background compaction: ランダムな操作列でも Version と refcount の不変条件を保つ`
     （固定シードの操作列: Generation / NextFileNumber の単調性、Version の妥当性、
     pin 中の全ファイル存在、`LastCompactionError = None` を検査）
 - 残る既知の未対応: プロセス断を挿入するランダム操作列は未実施
-  （クラッシュ再開自体は他の `BackgroundCompactionTests` が個別に検証する）。
+  （クラッシュ再開自体は他の `VersionCoordinatorTests` が個別に検証する）。
 
 ### INV-25 commit の WAL 位置は fsync 前に登録する
 
@@ -508,8 +513,8 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `FileMetaData.ReadInfo`（`SstReadInfo`）は書き出し時または open 時の hydrate で 1回だけ作り、
     不変の `Version` に載せる。DB・プロセス寿命のキャッシュは持たない。
   - 残る可変コレクションは `coding-conventions.md` §2 の許可リスト
-    （Session 層の状態 DU・`EngineHost` の CAS セル・`ProcessLock` / `Transactions` の台帳・
-    演算子の作業用コレクション）に限る。
+    （Session 層の状態 DU・`VersionCoordinator` の CAS セル・`ProcessLock` / `Transactions` の台帳・
+    演算子の作業用コレクション・`ValueSet.IndexedValues` のクエリ局所キャッシュ）に限る。
 - 回帰テスト: `Eval.matchesWithV: リテラル述語は 1000 回でも結果を確保しない`、
   `Scalar.likeMatch: 計画時にコンパイルしたパターンは行ごとに配列を確保しない`、
   `StorageEngine.openDatabase: 書き込み後に壊れたファイルは再オープンで検出する`、
@@ -528,7 +533,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   索引キーだけで行を一意に特定できる。
 - 担保:
   - 書き込みは `Dml.applyIndexChange` と `Engine.backfillIndex` の 2箇所だけで、どちらも空値を書く。
-  - 読み取りは `Dml.indexKeyRow` / `opOfIndexScan`。transaction のスロットも**生キーで**マージする。
+  - 読み取りは `RowKey.indexKey` / `opOfIndexScan`。transaction のスロットも**生キーで**マージする。
   - `Dml.indexAccessMasks` が (スキャン mask, fetch mask) を返し、
     `Optimizer.execScan` / `execIndexJoin` が非被覆のときだけ fetch を挟む。
   - `CREATE UNIQUE INDEX` は `Engine.createIndex` の `checkUniqueIndex` が
@@ -564,7 +569,8 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - 開いた run と退避した spool は `MemoryBudget.Scope`（`ExecContext.Scope`）に登録し、
     `LIMIT` や `RowReader.Dispose` の早期終了で `DisposeAll()` が閉じて消す。
     通常終了では `ScanScope.Forget` で登録を外してから明示的に消す。
-  - 途中打ち切りで残ったものは `Spill.sweepStale` が 24時間後に回収する。
+  - 途中打ち切りで残ったものは、次の外部ソート時に `Spill.sweepStale` が
+    24時間を超えた分だけ回収する。
 - 回帰テスト:
   - `Spill.spool: 上限を超えると退避し、reopen で同じ順序で読める`
   - `Spill.spool: reopenKeep は何度でも読める`

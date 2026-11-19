@@ -93,7 +93,7 @@ module internal ProcessLock =
 /// <remarks>
 /// ロックの解放は `ForceRelease` だけ（`RowStore.close` とエラー経路が呼ぶ）。
 /// 二重解放は `ProcessLock.release` の台帳で無害になる。
-/// DB を開閉する所有者は `DatabaseHost` 1つなので、ハンドルごとの所有者トークンは持たない。
+/// DB を開閉する所有者は `DatabaseHost` 1つなので、接続ごとの所有者トークンは持たない。
 /// </remarks>
 type internal ProcessLockLease internal (root: string, token: obj) =
     /// 強制的にロックを解放する（RowStore を直接閉じるテスト・エラー経路用）。

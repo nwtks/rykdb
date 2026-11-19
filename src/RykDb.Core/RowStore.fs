@@ -79,7 +79,7 @@ type internal RowStore =
         /// メモリ上のテスト用 store は None（ファイルを作らない）。
         Lock: ProcessLockLease option
         /// background compaction の共有状態。同期実装では None。
-        Host: EngineHost option
+        Host: VersionCoordinator option
         /// DB ごとの RootRuntime と active snapshot 登録。
         Runtime: RootRuntime
     }
@@ -104,14 +104,14 @@ module internal RowStore =
         (batches: (string * Entry array) list)
         (store: RowStore)
         =
-        let flushAndPublish (bumped: IStorageEngine) (host: EngineHost) =
+        let flushAndPublish (bumped: IStorageEngine) (host: VersionCoordinator) =
             host.WithInstallGate(fun () ->
                 let state = host.Current
                 let hinted = bumped.WithHostState state
 
                 hinted.FlushIfNeeded host.AllocateFileNumber
                 |> Result.map (fun (flushed, didFlush) ->
-                    let flushedState = flushed.HostState
+                    let flushedState = flushed.PublishedState
 
                     host.Publish(fun current ->
                         { current with
@@ -181,7 +181,7 @@ module internal RowStore =
     /// 戻り値は (書き込み後の Store, commit 後の Manager)。
     /// Active / Pending のような state フィールドの更新は呼び出し側で行う
     /// （backfillIndex はトランザクションを外さないため触らない）。
-    /// GC 境界は「自ハンドルの active snapshot」と「同じ DB を開いている他ハンドルの active snapshot」の最小値。
+    /// GC 境界は「自分の active snapshot」と「同じ DB を開いている他の store の active snapshot」の最小値。
     /// 後者は DB の active snapshot 登録から集約する（`registration` は自分自身の登録で、除外する）。
     /// 書き込みは DB の RootRuntime の共有ロックを取り、DDL の排他と交差しないようにする。
     let commitToStoreWith
@@ -428,9 +428,9 @@ module internal RowStore =
 
             let host =
                 if options.BackgroundCompaction then
-                    new EngineHost(
+                    new VersionCoordinator(
                         root,
-                        HostState.initial engine.Version engine.ManifestNumber,
+                        PublishedState.initial engine.Version engine.ManifestNumber,
                         engine.Compaction,
                         (fun () -> runtime.OldestExcept(root, None)),
                         (fun f -> StorageEngine.openScan root f),
@@ -457,7 +457,7 @@ module internal RowStore =
     /// background compaction を有効にして開く。
     let openStoreWithBackground = openStoreCore false RowStoreOptions.Background
 
-    /// 既に開いているハンドルを「クラッシュで失った」ことにして開き直す（テスト用）。
+    /// 既に開いている store を「クラッシュで失った」ことにして開き直す（テスト用）。
     /// 本番経路では使わない（二重に開くと memtable が分かれて古い行を読む）。
     let internal openStoreTakingOver = openStoreCore true RowStoreOptions.Default
 
@@ -472,7 +472,7 @@ module internal RowStore =
         | None -> ()
 
     /// テスト用: オプションを指定して開く。
-    /// DatabaseHost を介さないため、ここでbackground worker を開始する。
+    /// DatabaseHost を介さないため、ここで background worker を開始する。
     let internal openStoreWithOptions (options: RowStoreOptions) (root: string) =
         openStoreCore false options root
         |> Result.map (fun store ->
