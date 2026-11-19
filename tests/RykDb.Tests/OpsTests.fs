@@ -556,3 +556,83 @@ let ``集約: 退避したグループにも DISTINCT 集約が効く`` () =
         Assert.Equal<int>(7, baseline.Length)
         Assert.Equal<string>(rowsText baseline, rowsText spilled)
         assertNoLeftoversDetailed dir)
+
+[<Fact>]
+let ``集約: DISTINCT の値が上限を超えても全集約関数が同じ結果`` () =
+    withDir "aggregate-distinct-spill" (fun dir ->
+        // 1グループに 500行、値は 0..49 を繰り返す（ユニーク 50個）。
+        // グループ分割では割れないので、Seen の退避経路が必須。
+        let op () =
+            opOfRows [ for i in 0..499 -> row [ SqlValue.Int(int64 (i % 50)) ] ]
+
+        let aggs =
+            [
+                AggFunc.Count, false, true, col "a"
+                AggFunc.Sum, false, true, col "a"
+                AggFunc.Avg, false, true, col "a"
+                AggFunc.Min, false, true, col "a"
+                AggFunc.Max, false, true, col "a"
+            ]
+
+        let baseline = ok (Op.toArray (ok (UnlimitedOps.aggregate schema2 [] aggs (op ()))))
+
+        let spilled =
+            ok (Op.toArray (ok (Ops.aggregate (tightBudget dir 1L) schema2 [] aggs (op ()))))
+
+        Assert.Equal<int>(1, baseline.Length)
+        Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        Assert.Equal<int64>(50L, asInt baseline.[0].[0])
+        Assert.Equal<decimal>(1225M, asDec baseline.[0].[1])
+        assertNoLeftoversDetailed dir)
+
+[<Fact>]
+let ``集約: DISTINCT の退避は NULL と REAL も正しく扱う`` () =
+    withDir "aggregate-distinct-spill-null" (fun dir ->
+        let op () =
+            opOfRows
+                [
+                    for i in 0..199 ->
+                        row
+                            [
+                                if i % 7 = 0 then
+                                    SqlValue.Null
+                                else
+                                    SqlValue.vReal (float (i % 11))
+                            ]
+                ]
+
+        let aggs =
+            [ AggFunc.Count, false, true, col "a"; AggFunc.Sum, false, true, col "a" ]
+
+        let baseline = ok (Op.toArray (ok (UnlimitedOps.aggregate schema2 [] aggs (op ()))))
+
+        let spilled =
+            ok (Op.toArray (ok (Ops.aggregate (tightBudget dir 1L) schema2 [] aggs (op ()))))
+
+        Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        assertNoLeftoversDetailed dir)
+
+[<Fact>]
+let ``集約: DISTINCT の退避ファイルは集約完了時点で消える`` () =
+    withDir "aggregate-distinct-spill-cleanup" (fun dir ->
+        let scope = ScanScope()
+
+        let budget =
+            { tightBudget dir 1L with
+                Scope = Some scope
+            }
+
+        let op () =
+            opOfRows [ for i in 0..199 -> row [ SqlValue.Int(int64 (i % 50)) ] ]
+
+        let aggs = [ (AggFunc.Count, false, true, col "a") ]
+        let result = ok (Ops.aggregate budget schema2 [] aggs (op ()))
+
+        // aggregate は入力を読み切るので、退避した値の畳み込みもこの時点で終わっている。
+        assertNoLeftoversDetailed dir
+
+        // 出力を 1行も読まずに打ち切っても（LIMIT 0 相当）、残骸は出ない。
+        let rows = ok (Op.toArray result)
+        Assert.Equal<int64>(50L, asInt rows.[0].[0])
+        scope.DisposeAll()
+        assertNoLeftoversDetailed dir)

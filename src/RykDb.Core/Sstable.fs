@@ -26,7 +26,6 @@ module internal Sstable =
                     ret (Array.sub items 0 count)
             else
                 match step c state with
-                | Error e -> err e
                 | Ok(c', item, state') ->
                     let items =
                         if count < items.Length then
@@ -38,6 +37,7 @@ module internal Sstable =
 
                     items.[count] <- item
                     readAll c' state' items (count + 1)
+                | Error e -> err e
 
         readAll c state (Array.zeroCreate<'Item> 128) 0
 
@@ -231,9 +231,8 @@ module internal Sstable =
             if Hashing.checksumRange data payloadStart payloadLen <> stored then
                 err (DbError.corruption "Sstable: ブロックのチェックサム不一致")
             else
-                match Cursor.createSlice data payloadStart payloadLen with
-                | Error e -> err e
-                | Ok payload -> readItems decodeEntry payload [||]
+                Cursor.createSlice data payloadStart payloadLen
+                >>= fun payload -> readItems decodeEntry payload [||]
 
     /// 部分読みした reader から startKey 以降を遅延生成する。
     /// ブロックは最大 8個まとめて 1回の open で読み、解析は必要になったときだけ行う。
@@ -410,9 +409,8 @@ module internal Sstable =
             go 0 0UL pos
 
         let decodeValue data valuePos valueLen =
-            match Cursor.createSlice data valuePos valueLen with
-            | Error e -> err e
-            | Ok slice ->
+            Cursor.createSlice data valuePos valueLen
+            >>= fun slice ->
                 match maskOpt with
                 | None -> SstEntry.decodeValueAt slice valueLen
                 | Some mask -> SstEntry.decodeMaskedValueAt mask slice valueLen
@@ -454,7 +452,6 @@ module internal Sstable =
                         ret None
                     else
                         match decodeValue data valuePos (int valueLen) with
-                        | Error e -> err e
                         | Ok(seqNo, value, _) ->
                             let isVisible =
                                 match visible with
@@ -465,11 +462,11 @@ module internal Sstable =
                                 ret (Some(SstEntry.make entryKey seqNo value))
                             else
                                 scan indexEntry data payloadLen entryKey (valuePos + int valueLen)
+                        | Error e -> err e
 
         let lookupEntry indexEntry =
-            match readBlock indexEntry with
-            | Error e -> err e
-            | Ok data ->
+            readBlock indexEntry
+            >>= fun data ->
                 let n = data.Length
                 let payloadLen = n - 4
 
@@ -487,13 +484,13 @@ module internal Sstable =
                 let indexEntry = partial.Index.[i]
 
                 match lookupEntry indexEntry with
-                | Error e -> err e
                 | Ok(Some e) -> ret (Some e)
                 | Ok None ->
                     if Bytes.compare indexEntry.LastKey key = 0 then
                         find (i + 1)
                     else
                         ret None
+                | Error e -> err e
 
         if not (mayContainPartial key partial) then
             ret None

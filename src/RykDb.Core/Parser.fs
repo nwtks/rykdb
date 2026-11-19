@@ -33,24 +33,24 @@ module internal Parser =
                 | None -> parseExprValue st
 
             match parsed with
-            | Error e -> err e
             | Ok(e, st) ->
                 if isSymbol "," st then
                     advance st |> one (e :: acc)
                 else
                     expectSymbol ")" st |> Result.map (fun (_, st) -> List.rev (e :: acc), st)
+            | Error e -> err e
 
         let rec rows acc st =
             match expectSymbol "(" st with
-            | Error e -> err e
             | Ok(_, st) ->
                 match one [] st with
-                | Error e -> err e
                 | Ok(r, st) ->
                     if isSymbol "," st then
                         advance st |> rows (r :: acc)
                     else
                         ret (List.rev (r :: acc), st)
+                | Error e -> err e
+            | Error e -> err e
 
         result {
             let! _, st = expectKeyword "INSERT" st
@@ -107,18 +107,18 @@ module internal Parser =
     let private parseUpdate (st: PState) =
         let rec assigns acc st =
             match parseIdent st with
-            | Error e -> err e
             | Ok(col, st) ->
                 match expectSymbol "=" st with
-                | Error e -> err e
                 | Ok(_, st) ->
                     match parseExprValue st with
-                    | Error e -> err e
                     | Ok(e, st) ->
                         if isSymbol "," st then
                             advance st |> assigns ((col, e) :: acc)
                         else
                             ret (List.rev ((col, e) :: acc), st)
+                    | Error e -> err e
+                | Error e -> err e
+            | Error e -> err e
 
         result {
             let! _, st = expectKeyword "UPDATE" st
@@ -158,7 +158,6 @@ module internal Parser =
     let private parseTypeArguments (st: PState) =
         let rec loop acc st =
             match parseExprValue st with
-            | Error e -> err e
             | Ok(e, st) ->
                 let v =
                     match e with
@@ -174,6 +173,7 @@ module internal Parser =
                         |> List.rev
                         |> List.choose (fun (n, ok) -> if ok then Some("n", n) else None),
                         st)
+            | Error e -> err e
 
         if not (isSymbol "(" st) then
             ret ([], st)
@@ -184,11 +184,10 @@ module internal Parser =
         let rec loop c st =
             if isKeyword "NOT" st then
                 match advance st |> expectKeyword "NULL" with
-                | Error e -> err e
                 | Ok(_, st) -> loop { c with NotNull = true } st
+                | Error e -> err e
             elif isKeyword "PRIMARY" st then
                 match advance st |> expectKeyword "KEY" with
-                | Error e -> err e
                 | Ok(_, st) ->
                     loop
                         { c with
@@ -196,12 +195,13 @@ module internal Parser =
                             NotNull = true
                         }
                         st
+                | Error e -> err e
             elif isKeyword "UNIQUE" st then
                 advance st |> loop { c with Unique = true }
             elif isKeyword "DEFAULT" st then
                 match advance st |> parseExprValue with
-                | Error e -> err e
                 | Ok(e, st) -> loop { c with Default = Some e } st
+                | Error e -> err e
             else
                 ret (c, st)
 
@@ -254,14 +254,14 @@ module internal Parser =
             let next =
                 if isKeyword "PRIMARY" st then
                     match expectKeyword "PRIMARY" st with
-                    | Error e -> err e
                     | Ok(_, st) ->
                         match expectKeyword "KEY" st with
-                        | Error e -> err e
                         | Ok(_, st) ->
                             parseParenIdentList st
                             |> Result.map (fun (pkCols, st) ->
                                 cols, TableConstraint.PrimaryKeyColumns pkCols :: constrs, st)
+                        | Error e -> err e
+                    | Error e -> err e
                 elif isKeyword "UNIQUE" st then
                     advance st
                     |> parseParenIdentList
@@ -270,13 +270,13 @@ module internal Parser =
                     parseColumnDefinition st |> Result.map (fun (c, st) -> c :: cols, constrs, st)
 
             match next with
-            | Error e -> err e
             | Ok(cols, constrs, st) ->
                 if isSymbol "," st then
                     advance st |> body cols constrs
                 else
                     expectSymbol ")" st
                     |> Result.map (fun (_, st) -> List.rev cols, List.rev constrs, st)
+            | Error e -> err e
 
         result {
             let! _, st = expectKeyword "CREATE" st
@@ -524,7 +524,6 @@ module internal Parser =
                     ret (List.rev acc)
                 else
                     match parseOne st with
-                    | Error e -> err e
                     | Ok(statement, next) ->
                         let separated =
                             next.Pos > st.Pos && st.Tokens.[next.Pos - 1].Token = Token.Symbol ";"
@@ -533,6 +532,7 @@ module internal Parser =
                             fail "文の区切りには ; が必要です（複数文は ; で区切ってください）" next
                         else
                             parseAll (statement :: acc) next
+                    | Error e -> err e
 
             parseAll
                 []

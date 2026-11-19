@@ -254,9 +254,9 @@ module internal Ddl =
                 ret (List.rev acc, scan)
             else
                 match SstScan.next scan with
-                | Error e -> err e
                 | Ok None -> ret (List.rev acc, SstScan.Empty)
                 | Ok(Some(e, rest)) -> loop (e :: acc) (n - 1) rest
+                | Error e -> err e
 
         loop []
 
@@ -277,12 +277,12 @@ module internal Ddl =
     let private applyOpChunks (apply: Transaction -> SqlValue array -> Result<Transaction, DbError>) =
         let rec loop op (st: ExecState) =
             match takeOpChunk BackfillChunkRows op with
-            | Error e -> err e
             | Ok([], _) -> ret st
             | Ok(chunk, rest) ->
                 match commitChunk apply chunk st with
-                | Error e -> err e
                 | Ok st' -> loop rest st'
+                | Error e -> err e
+            | Error e -> err e
 
         loop
 
@@ -295,10 +295,8 @@ module internal Ddl =
     let private clearSpaceChunksResult (state: ExecState) (space: string) =
         let rec loop (st: ExecState) startKey =
             match RowStore.scanKeys space startKey 0 st.Store with
-            | Error e -> err e
             | Ok scan ->
                 match takeScanChunk BackfillChunkRows scan with
-                | Error e -> err e
                 | Ok(chunk, _) ->
                     match List.tryLast chunk with
                     | None -> ret st
@@ -311,8 +309,10 @@ module internal Ddl =
                                 (chunk |> List.map _.Key)
                                 st
                         with
-                        | Error e -> err e
                         | Ok st' -> loop st' lastKey
+                        | Error e -> err e
+                | Error e -> err e
+            | Error e -> err e
 
         loop state [||]
 
@@ -410,22 +410,22 @@ module internal Ddl =
     let createIndex (ci: CreateIndex) (state: ExecState) =
         let rec checkEntries (idx: IndexSchema) previous scan =
             match SstScan.next scan with
-            | Error e -> err e
             | Ok None -> ret ()
             | Ok(Some(e, rest)) ->
                 match OrderPreserving.readValues idx.Columns.Length (Cursor.create e.Key) with
-                | Error e -> err e
                 | Ok(values, _) ->
                     if values |> Array.exists SqlValue.isNull then
                         checkEntries idx previous rest
                     else
                         match KeyBuilder.ofValues values with
-                        | Error e -> err e
                         | Ok prefix ->
                             match previous with
                             | Some before when Bytes.compare before prefix = 0 ->
                                 err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
                             | _ -> checkEntries idx (Some prefix) rest
+                        | Error e -> err e
+                | Error e -> err e
+            | Error e -> err e
 
         let checkUniqueIndex (idx: IndexSchema) store =
             RowStore.scanKeys (Keyspace.index idx.Name) [||] 0 store
@@ -591,19 +591,19 @@ module internal Ddl =
         =
         let rec loop txn scan =
             match SstScan.next scan with
-            | Error e -> err e
             | Ok None -> ret txn
             | Ok(Some(e, rest)) ->
                 match e.Value with
                 | None -> loop txn rest
                 | Some row ->
                     match transform row with
-                    | Error e -> err e
                     | Ok None -> loop txn rest
                     | Ok(Some next) ->
                         match Transaction.put space e.Key next txn |> Transaction.checkLimit with
-                        | Error e -> err e
                         | Ok txn2 -> loop txn2 rest
+                        | Error e -> err e
+                    | Error e -> err e
+            | Error e -> err e
 
         RowStore.scan space [||] 0 store
         >>= fun scan -> SstScan.withScan scan (fun scan -> loop txn scan)
@@ -887,11 +887,9 @@ module internal Engine =
                 SeqNo = state.Manager.LastCommitSeqNo
             }
 
-        let txn = Transaction.create 0UL<txnId> snapshot
-
-        match contextOf MemoryBudget.Default state txn with
-        | Error e -> err e
-        | Ok ctx ->
+        Transaction.create 0UL<txnId> snapshot
+        |> contextOf MemoryBudget.Default state
+        >>= fun ctx ->
             match Plan.explainSelect ctx stmt with
             | Ok plan -> ret plan
             | Error e ->

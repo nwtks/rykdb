@@ -151,10 +151,10 @@ module internal SstEntry =
         Cursor.splitAt length c
         >>= fun (value, rest) ->
             match decodeHeader value with
-            | Error er -> err er
             | Ok(seqNo, 0uy, _) -> ret (seqNo, None, rest)
             | Ok(seqNo, 1uy, _) -> ret (seqNo, Some Array.empty<SqlValue>, rest)
             | Ok(_, tag, _) -> err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
+            | Error e -> err e
 
     /// 列マスクに従って値を復号する。
     /// `mask` が false の列は `SqlValue.Unloaded` を置き、値本体を読み飛ばす。
@@ -162,7 +162,6 @@ module internal SstEntry =
         Cursor.splitAt length c
         >>= fun (value, rest) ->
             match decodeHeader value with
-            | Error er -> err er
             | Ok(seqNo, 0uy, _) -> ret (seqNo, None, rest)
             | Ok(seqNo, 1uy, payload) ->
                 if mask.Length = 0 || Array.forall (fun needed -> not needed) mask then
@@ -171,15 +170,15 @@ module internal SstEntry =
                     ValueCodec.readValuesMasked mask payload
                     |> Result.map (fun (values, _) -> seqNo, Some values, rest)
             | Ok(_, tag, _) -> err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
+            | Error e -> err e
 
     /// 符号化された値の位置を返す（復号しない）。
     /// `length` バイトを消費した次のカーソルも返す。
     let decodeRawValueAt (c: Cursor) (length: int) =
         Cursor.splitAt length c
         >>= fun (value, rest) ->
-            match decodeHeader value with
-            | Error er -> err er
-            | Ok(seqNo, tag, payload) ->
+            decodeHeader value
+            >>= fun (seqNo, tag, payload) ->
                 if tag <> 0uy && tag <> 1uy then
                     err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
                 else
@@ -430,9 +429,9 @@ module internal SstScan =
     let toArray (scan: SstScan) =
         let rec drain acc cur =
             match next cur with
-            | Error e -> err e
             | Ok None -> List.rev acc |> Array.ofList |> ret
             | Ok(Some(e, nxt)) -> drain (e :: acc) nxt
+            | Error e -> err e
 
         withScan scan (drain [])
 
@@ -529,9 +528,9 @@ module internal SstMerge =
     let ofScans (scans: SstScan array) =
         let ofScan source scan =
             match SstScan.next scan with
-            | Error e -> err e
             | Ok None -> ret Empty
             | Ok(Some(entry, rest)) -> ret (insert source entry rest Empty)
+            | Error e -> err e
 
         let union (SstMerge a) (SstMerge b) = SstMerge(mergeHeaps a b)
 
@@ -540,8 +539,8 @@ module internal SstMerge =
                 ret merge
             else
                 match ofScan i scans.[i] with
-                | Error e -> err e
                 | Ok more -> add (i + 1) (union merge more)
+                | Error e -> err e
 
         add 0 Empty
 

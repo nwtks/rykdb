@@ -352,12 +352,12 @@ module internal Catalog =
                         match keyKindOf key with
                         | Some(false, name) ->
                             match decodeTable name bytes with
-                            | Error e -> err e
                             | Ok t -> addTable acc t |> decodeRows rows (i + 1)
+                            | Error e -> err e
                         | Some(true, name) ->
                             match decodeIndex name bytes with
-                            | Error e -> err e
                             | Ok idx -> addIndex acc idx |> decodeRows rows (i + 1)
+                            | Error e -> err e
                         | None -> decodeRows rows (i + 1) acc
 
         RowStore.scan Keyspace.CatalogKeyspace [||] 0 store

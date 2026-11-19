@@ -707,9 +707,7 @@ module LoadedRow =
     /// 復号済みであることを検査して行を作る。
     /// `SqlValue.Unloaded` が混ざっていれば `InternalError`。
     let internal create (row: SqlValue array) =
-        match SqlValue.ensureLoaded row with
-        | Ok loaded -> ret (LoadedRow loaded)
-        | Error e -> err e
+        SqlValue.ensureLoaded row |> Result.map LoadedRow
 
     /// 内部配列を取り出す（コピーしない）。
     let toArray (LoadedRow row) = row

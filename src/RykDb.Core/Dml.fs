@@ -263,9 +263,8 @@ module internal Dml =
         let compactMask =
             positions' |> Array.map (fun p -> p >= 0 && p < mask.Length && mask.[p])
 
-        match OrderPreserving.readValuesMasked compactMask positions'.Length (Cursor.create key) with
-        | Error e -> err e
-        | Ok(values, rest) ->
+        OrderPreserving.readValuesMasked compactMask positions'.Length (Cursor.create key)
+        >>= fun (values, rest) ->
             if not (Cursor.atEnd rest) then
                 err (DbError.corruption "索引キーに余分なバイトがあります")
             else

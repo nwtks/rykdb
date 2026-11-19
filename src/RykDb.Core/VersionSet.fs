@@ -319,12 +319,12 @@ module internal VersionEdit =
                 ret (List.rev added, List.rev deleted)
             else
                 match step c with
-                | Error e -> err e
                 | Ok(c', f, isAdded) ->
                     if isAdded then
                         readFiles c' (f :: added) deleted
                     else
                         readFiles c' added (f :: deleted)
+                | Error e -> err e
 
         result {
             let! body, _ = Cursor.create data |> Reader.readLengthPrefixed
@@ -480,13 +480,13 @@ module internal Manifest =
 
         let readAll dir manifestNumber =
             match protect (fun () -> read dir manifestNumber) with
-            | Error e -> err e
             | Ok(Error e) -> err e
             | Ok(Ok lines) ->
                 let hasContent = lines |> List.exists (fun line -> line.Trim() <> "")
 
                 decodeLines [] lines
                 |> Result.map (fun (edits, truncated) -> edits, truncated, hasContent)
+            | Error e -> err e
 
         let applyAll edits initial =
             List.fold VersionEdit.apply initial edits

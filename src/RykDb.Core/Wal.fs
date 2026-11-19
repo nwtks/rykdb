@@ -113,12 +113,12 @@ module internal Wal =
             | [] -> ret written
             | record :: rest ->
                 match encodePayload record with
-                | Error e -> err e
                 | Ok payload ->
                     let header = headerOf payload
                     fs.Write(header, 0, header.Length)
                     fs.Write(payload, 0, payload.Length)
                     writeAll fs (written + header.Length + payload.Length) rest
+                | Error e -> err e
 
         match records with
         | [] -> ret state
@@ -216,12 +216,12 @@ module internal Wal =
         let foldFrames fs step initial =
             let rec loop state =
                 match readFrameFrom fs with
-                | Error e -> err e
                 | Ok None -> ret state
                 | Ok(Some record) ->
                     match step state record with
-                    | Error e -> err e
                     | Ok next -> loop next
+                    | Error e -> err e
+                | Error e -> err e
 
             loop initial
 

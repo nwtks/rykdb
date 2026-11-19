@@ -87,12 +87,12 @@ module internal StorageEngine =
             | [] -> ret None
             | f :: rest ->
                 match readInfoIn f engine with
-                | Error e -> err e
                 | Ok info ->
                     match Sstable.lookupMasked mask key visible info with
-                    | Error e -> err e
                     | Ok(Some e) -> ret (Some e)
                     | Ok None -> probe rest
+                    | Error e -> err e
+                | Error e -> err e
 
         match Memtable.getVisible key visible engine.Mem with
         | Some e ->
@@ -160,9 +160,9 @@ module internal StorageEngine =
                 |> ret
                 >>= fun scan ->
                     match SstScan.next scan with
-                    | Error e -> err e
                     | Ok None -> ret merge
                     | Ok(Some(e, nxt)) -> ret (SstMerge.insert index e nxt merge)
+                    | Error e -> err e
 
         let rec prepare pending merge =
             match pending with
@@ -172,8 +172,8 @@ module internal StorageEngine =
                 | Some top when Bytes.compare bound top.Key > 0 -> ret (merge, pending)
                 | _ ->
                     match openPending index f merge with
-                    | Error e -> err e
                     | Ok merge' -> prepare rest merge'
+                    | Error e -> err e
 
         let isVisible e =
             match visible with
@@ -187,10 +187,8 @@ module internal StorageEngine =
                 ret None
             else
                 match prepare state.Pending state.Merge with
-                | Error e -> err e
                 | Ok(ready, remaining) ->
                     match SstMerge.next ready with
-                    | Error e -> err e
                     | Ok None -> ret None
                     | Ok(Some(e, merge')) ->
                         let sameKey =
@@ -219,6 +217,8 @@ module internal StorageEngine =
                                 Some(e, SstScan.ofState advanced stepObj closeState) |> ret
                             else
                                 stepObj advanced
+                    | Error e -> err e
+                | Error e -> err e
 
         let pendingFiles =
             Version.allFiles engine.Version
@@ -238,7 +238,6 @@ module internal StorageEngine =
                 SstEntry.make e.Key e.SeqNo value)
 
         match SstScan.next (seqToScan memSeq) with
-        | Error e -> err e
         | Ok None ->
             SstScan.ofState
                 {
@@ -261,6 +260,7 @@ module internal StorageEngine =
                 stepObj
                 closeState
             |> ret
+        | Error e -> err e
 
     /// 範囲ルックアップ（`needsValues = true` なら値を復号し、false なら空の行を返す）。
     let scanAtValues visible limit startKey needsValues engine =

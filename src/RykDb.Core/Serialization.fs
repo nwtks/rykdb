@@ -158,8 +158,8 @@ module internal Reader =
                 ret (List.rev acc, c)
             else
                 match readOne c with
-                | Error e -> err e
                 | Ok(v, c') -> readRemaining (rest - 1UL) (v :: acc) c'
+                | Error e -> err e
 
         readRemaining count [] c
 
@@ -522,10 +522,10 @@ module internal OrderPreserving =
                 | _ -> true
 
             match readValue c with
-            | Error e -> err e
             | Ok(v, c') ->
                 let value = if materialize then v else SqlValue.Unloaded
                 readValuesLoop mask count (i + 1) (value :: acc) c'
+            | Error e -> err e
 
     /// 値を count 件復号する（末尾の余りは消費しない）。
     let readValues (count: int) (c: Cursor) =
@@ -661,9 +661,8 @@ module internal KeyBuilder =
     let ofIndexAndPrimary (indexCols: SqlValue seq) (primaryCols: SqlValue seq) =
         let appendCols = foldOk (fun w v -> OrderPreserving.writeValue v w)
 
-        match appendCols Writer.Empty indexCols with
-        | Error e -> err e
-        | Ok withIndex -> appendCols withIndex primaryCols |> Result.map Writer.toArray
+        appendCols Writer.Empty indexCols
+        >>= fun withIndex -> appendCols withIndex primaryCols |> Result.map Writer.toArray
 
     /// バイト列 key が prefix で始まるか。
     let startsWithPrefix (key: byte array) (prefix: byte array) =
@@ -904,10 +903,10 @@ module internal ValueCodec =
                             fill (i + 1) c'
                         | ValueNone ->
                             match readValue c with
-                            | Error e -> err e
                             | Ok(v, c') ->
                                 values.[i] <- v
                                 fill (i + 1) c'
+                            | Error e -> err e
 
                 return! fill 0 c
         }
@@ -955,8 +954,8 @@ module internal ValueCodec =
                         ret (values, c)
                     else if i < mask.Length && not mask.[i] then
                         match skipValue c with
-                        | Error e -> err e
                         | Ok c' -> fill (i + 1) c'
+                        | Error e -> err e
                     else
                         match readInt c with
                         | ValueSome struct (v, c') ->
@@ -964,10 +963,10 @@ module internal ValueCodec =
                             fill (i + 1) c'
                         | ValueNone ->
                             match readValue c with
-                            | Error e -> err e
                             | Ok(v, c') ->
                                 values.[i] <- v
                                 fill (i + 1) c'
+                            | Error e -> err e
 
                 return! fill 0 c
         }

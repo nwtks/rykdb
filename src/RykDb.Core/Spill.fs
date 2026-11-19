@@ -173,12 +173,11 @@ module internal Spill =
                 ret ()
             else
                 match writeRow rows.[i] sink with
-                | Error e -> err e
                 | Ok() -> writeAll (i + 1) sink
+                | Error e -> err e
 
-        match openSink path with
-        | Error e -> err e
-        | Ok sink ->
+        openSink path
+        >>= fun sink ->
             match writeAll 0 sink with
             | Error e ->
                 closeSink sink
@@ -243,12 +242,12 @@ module internal Spill =
                 ret None
             else
                 match readVarintFrom s (byte first) with
-                | Error e -> err e
                 | Ok len when len > uint64 System.Int32.MaxValue -> err (DbError.corruption "Spill: 行の長さが異常です")
                 | Ok len ->
                     readExactly s (int len)
                     >>= (Cursor.create >> ValueCodec.readValues)
-                    >>= fun (values, _) -> ret (Some values))
+                    >>= fun (values, _) -> ret (Some values)
+                | Error e -> err e)
         >>= id
 
     /// 読み込み口を閉じる。
@@ -279,9 +278,8 @@ module internal Spill =
     /// ScanScope に登録して run を開く。
     /// 早期終了（`DisposeAll`）で閉じて消す後始末を一緒に登録する。
     let openTracked (scope: ScanScope option) (path: string) =
-        match openRun path with
-        | Error e -> err e
-        | Ok st ->
+        openRun path
+        >>= fun st ->
             match scope with
             | Some s ->
                 let cleanup =
@@ -386,9 +384,7 @@ module internal Spill =
                         ret next
                     | Ok(Some head) -> go next { st with Head = Some head }
 
-        match openRun path with
-        | Error e -> err e
-        | Ok first -> go init first
+        openRun path >>= go init
 
     /// 1本の run を先頭から読み、行ごとに `step` を適用する。
     /// 終端・エラーで閉じるが、**ファイルは消さない**（分割し直すときに使う）。
@@ -413,9 +409,7 @@ module internal Spill =
                         ret next
                     | Ok(Some head) -> go next { st with Head = Some head }
 
-        match openRun path with
-        | Error e -> err e
-        | Ok first -> go init first
+        openRun path >>= go init
 
     /// 1本の run を N 本のパーティションへ分割し直す。
     /// `salt` をキーに混ぜるので、同じキー分布でも分割のされ方が変わる
@@ -436,9 +430,7 @@ module internal Spill =
             err e
         | Ok writer ->
             let writeToPartition row =
-                match keyOf row with
-                | Error e -> err e
-                | Ok key -> writer.Write(partitionOfKey salt key, row)
+                keyOf row >>= fun key -> writer.Write(partitionOfKey salt key, row)
 
             match foldRunKeep path () (fun () row -> writeToPartition row) with
             | Error e ->
@@ -642,9 +634,7 @@ module internal Spill =
                             | Ok None -> go used { st with Head = None }
                             | Ok(Some head) -> go used { st with Head = Some head }
 
-        match openRun path with
-        | Error e -> err e
-        | Ok st -> go (seeds |> List.sumBy (snd >> stateBytes)) st
+        openRun path >>= go (seeds |> List.sumBy (snd >> stateBytes))
 
     /// 退避した行をキーごとに畳み、結果行の Op を作る。
     /// <remarks>
@@ -740,10 +730,10 @@ module internal Spill =
             | OpStep.OpDone -> ret seq
             | OpStep.OpRow(row, nxt) ->
                 match keyOf row with
-                | Error e -> err e
                 | Ok key ->
                     match writer.Write(partitionOfKey 0UL key, frame seq row) with
-                    | Error e -> err e
                     | Ok() -> go (seq + 1L) nxt
+                    | Error e -> err e
+                | Error e -> err e
 
         go

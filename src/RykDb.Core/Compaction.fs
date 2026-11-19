@@ -189,12 +189,12 @@ module internal Compaction =
             let found = Array.append inputs nextFiles
 
             match boundsOf found with
-            | Error e -> err e
             | Ok(minKey', maxKey') ->
                 if Bytes.compare minKey' minBound = 0 && Bytes.compare maxKey' maxBound = 0 then
                     ret (inputs |> Array.toList, nextFiles |> Array.toList)
                 else
                     expand current next minKey' maxKey'
+            | Error e -> err e
 
         let selectInputs version level maxFiles =
             let current = Version.filesAt level version
@@ -211,11 +211,9 @@ module internal Compaction =
                     else
                         Version.filesAt nextLevel version
 
-                let seed' = Array.ofList seed
-
-                match boundsOf seed' with
-                | Error e -> err e
-                | Ok(minBound, maxBound) -> expand current next minBound maxBound
+                Array.ofList seed
+                |> boundsOf
+                >>= fun (minBound, maxBound) -> expand current next minBound maxBound
 
         let rec openAll files scans =
             match files with
@@ -238,20 +236,20 @@ module internal Compaction =
             match SstMerge.top m with
             | Some e when Bytes.compare e.Key newest.Key = 0 ->
                 match SstMerge.next m with
-                | Error e -> err e
                 | Ok None -> ret (m, List.rev acc)
                 | Ok(Some(nxt, rest)) -> gather newest rest (nxt :: acc)
+                | Error e -> err e
             | _ -> ret (m, List.rev acc)
 
         let nextGroup dropTombstones merge =
             match SstMerge.next merge with
-            | Error e -> err e
             | Ok None -> ret None
             | Ok(Some(newest, afterNewest)) ->
                 gather newest afterNewest []
                 >>= fun (rest, older) ->
                     let kept, dropped, tombstones = gcGroup activeSnapshot dropTombstones older newest
                     ret (Some(kept, dropped, tombstones, rest))
+            | Error e -> err e
 
         let flushChunk plan chunk fileNumber =
             match chunk with

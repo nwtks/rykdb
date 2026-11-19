@@ -552,20 +552,15 @@ module internal Expr =
                         loop (next :: more) (Visit c)
                     | [] ->
                         match plugChildren (v :: frame.Done |> List.rev) frame.Parent with
-                        | Error er -> err er
                         | Ok parent -> loop more (Arrive parent)
+                        | Error e -> err e
 
         loop [] (Visit root)
 
     /// 葉の書き換え関数で式を組み直す（末尾再帰。式の深さに依存せずスタックは一定）。
     /// 葉の書き換えが失敗する版（束縛・集約の読み替えなど）。
     let private rewriteWith (rewriteLeaf: Expr -> Result<Expr, DbError>) =
-        rewriteWithC
-            (fun e k ->
-                match rewriteLeaf e with
-                | Error er -> err er
-                | Ok x -> k x)
-            ret
+        rewriteWithC (fun e k -> rewriteLeaf e >>= k) ret
 
     /// 葉の書き換え関数で式を組み直す。
     let rewrite (rewriteLeaf: Expr -> Expr) = rewriteWith (rewriteLeaf >> ret)

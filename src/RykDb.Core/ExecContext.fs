@@ -326,8 +326,8 @@ module internal DmlOps =
             | [], [] -> ret acc
             | v :: rest, i :: restIdx ->
                 match SqlValue.coerce schema.Columns.[i].DataType v with
-                | Error e -> err e
                 | Ok coerced -> gather ((i, coerced) :: acc) rest restIdx
+                | Error e -> err e
             | _ -> err (widthMismatch ())
 
         if values.Length <> List.length idxs then
@@ -355,7 +355,6 @@ module internal DmlOps =
             | [] -> ret pkBytes
             | idx :: rest ->
                 match indexValuesOf schema idx row with
-                | Error e -> err e
                 | Ok values when values |> Array.exists SqlValue.isNull -> check pk pkBytes rest
                 | Ok values ->
                     match
@@ -370,10 +369,8 @@ module internal DmlOps =
                             txn
                             pkMask
                     with
-                    | Error e -> err e
                     | Ok scan ->
                         match Op.toArray scan with
-                        | Error e -> err e
                         | Ok rows ->
                             if
                                 rows
@@ -384,16 +381,18 @@ module internal DmlOps =
                                 err (sprintf "UNIQUE 制約に違反: %s" idx.Name |> DbError.constraintViolation)
                             else
                                 check pk pkBytes rest
+                        | Error e -> err e
+                    | Error e -> err e
+                | Error e -> err e
 
         let pk = TableSchema.primaryKeyOf schema row
 
-        match KeyBuilder.ofValues pk with
-        | Error e -> err e
-        | Ok pkBytes ->
+        KeyBuilder.ofValues pk
+        >>= fun pkBytes ->
             match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes ctx.Visible txn existsMask with
-            | Error e -> err e
             | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
             | Ok None -> check pk pkBytes (schema.Indexes |> List.filter _.Unique)
+            | Error e -> err e
 
     /// 1行を制約検査して transaction へ積む。
     let private insertRow (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
@@ -422,8 +421,8 @@ module internal DmlOps =
                         | _ -> evalConstant v
 
                     match evaluated with
-                    | Error e -> err e
                     | Ok value -> gather (value :: acc) rest restIdx
+                    | Error e -> err e
                 | _ -> err (widthMismatch (List.length idxs) (List.length values))
 
             if List.length values <> List.length idxs then
@@ -473,11 +472,11 @@ module internal DmlOps =
             | OpStep.OpDone -> ret (txn, count)
             | OpStep.OpRow(row, nxt) ->
                 match assembleRow schema idxs defaults row with
-                | Error e -> err e
                 | Ok values ->
                     match insertRow ctx schema txn values with
-                    | Error e -> err e
                     | Ok next -> go idxs defaults next (count + 1) nxt
+                    | Error e -> err e
+                | Error e -> err e
 
         result {
             let! idxs = insertTargets schema columns
@@ -579,9 +578,8 @@ module internal DmlOps =
                                 if values |> Array.exists SqlValue.isNull then
                                     ret seen
                                 else
-                                    match KeyBuilder.ofValues values with
-                                    | Error e -> err e
-                                    | Ok key ->
+                                    KeyBuilder.ofValues values
+                                    >>= fun key ->
                                         if Set.contains key seen then
                                             err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
                                         else
@@ -678,8 +676,8 @@ module internal DmlOps =
                     | DbOk false -> go t c nxt
                     | DbOk true ->
                         match onRow t c row with
-                        | Error e -> err e
                         | Ok(tc, c') -> go tc c' nxt
+                        | Error e -> err e
 
             result {
                 let! scan =

@@ -308,7 +308,6 @@ module internal PlanBuilder =
             | [] -> ret (acc, accSchema, used)
             | (index, clause: JoinClause) :: rest when clause.Kind = JoinKind.Left ->
                 match buildJoin bindings scans acc accSchema JoinKind.Left index clause.On [] with
-                | Error e -> err e
                 | Ok(node, schema) ->
                     buildSteps
                         bindings
@@ -320,6 +319,7 @@ module internal PlanBuilder =
                         (Set.add (lowerName bindings.[index]) joined)
                         used
                         rest
+                | Error e -> err e
             | _ ->
                 let inner = steps |> List.takeWhile (fun (_, j) -> j.Kind = JoinKind.Inner)
                 let restSteps = steps |> List.skipWhile (fun (_, j) -> j.Kind = JoinKind.Inner)
@@ -371,11 +371,10 @@ module internal PlanBuilder =
                         let promoted, used' = promoteAt joinPredicates joined used next
 
                         match buildJoin bindings scans acc accSchema JoinKind.Inner index clause.On promoted with
-                        | Error e -> err e
                         | Ok(node, schema) -> apply node schema (Set.add next joined) used' tail
+                        | Error e -> err e
 
                 match apply acc accSchema joined used order with
-                | Error e -> err e
                 | Ok(node, schema, used') ->
                     buildSteps
                         bindings
@@ -387,6 +386,7 @@ module internal PlanBuilder =
                         (Set.union joined (Set.ofList (inner |> List.map (fun (i, _) -> lowerName bindings.[i]))))
                         used'
                         restSteps
+                | Error e -> err e
 
         let aggregateTree schema stmt tree =
             let aliases = Alias.dropCyclic (Alias.ofItems stmt.Items)

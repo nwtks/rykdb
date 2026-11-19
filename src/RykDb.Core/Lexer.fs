@@ -178,8 +178,8 @@ module internal Lexer =
                 let s' = advance input (advance input s)
 
                 match skipBlockComment input n 1 s' with
-                | Error e -> err e
                 | Ok st -> skipTriviaLoop input n st
+                | Error e -> err e
             else
                 ret s
 
@@ -395,13 +395,11 @@ module internal Lexer =
     [<TailCall>]
     let rec private collectTokens (input: string) (n: int) (acc: TokenItem list) (nextParam: int) (s: LexState) =
         match skipTrivia input s with
-        | Error e -> err e
         | Ok s when s.Index >= n -> ret (List.rev ({ Token = Token.Eos; Pos = s.Position } :: acc))
         | Ok s ->
             let startPos = s.Position
 
             match scanToken input n startPos nextParam s with
-            | Error e -> err e
             | Ok(tok, s') ->
                 let nextParam =
                     match tok with
@@ -409,6 +407,8 @@ module internal Lexer =
                     | _ -> nextParam
 
                 collectTokens input n ({ Token = tok; Pos = startPos } :: acc) nextParam s'
+            | Error e -> err e
+        | Error e -> err e
 
     /// SQL テキストをトークン列へ分解する。
     /// 位置と出力は不変で、外側の再帰が値を積み上げる。

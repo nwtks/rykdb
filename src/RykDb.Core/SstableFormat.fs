@@ -250,8 +250,8 @@ module internal SstableFormat =
                     ret pos
                 else
                     match writeEntry block pos prev items.[i] with
-                    | Error e -> err e
                     | Ok next -> writeEntries block (i + 1) items.[i].Key next
+                    | Error e -> err e
 
             let length = bodyLength 0 [||] 0
             let block = Array.zeroCreate<byte>(length + 4)
@@ -358,9 +358,9 @@ module internal SstableFormat =
         let rec loop firstKey lastKey maxSeqNo count keys block blockCount offset indexEntries prev =
             if blockCount >= EntriesPerBlock then
                 match writeBlock (block |> List.rev |> List.toArray) offset indexEntries with
-                | Error e -> err e
                 | Ok(nextOffset, indexEntries') ->
                     loop firstKey lastKey maxSeqNo count keys [] 0 nextOffset indexEntries' prev
+                | Error e -> err e
             elif e.MoveNext() then
                 let item = e.Current
 

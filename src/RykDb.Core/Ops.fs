@@ -126,62 +126,55 @@ module internal Ops =
             | SqlValue.Int x, SqlValue.Int y -> compare x y
             | _ -> 0
 
+        let frame s r = Array.append [| SqlValue.Int s |] r
+
+        let keyOfFrame (f: SqlValue array) =
+            match f.[0] with
+            | SqlValue.Blob b -> ret b
+            | SqlValue.Int _ -> encode (Array.sub f 1 (f.Length - 1)) |> DbResult.toResult
+            | _ -> err (DbError.internalError "DISTINCT の退避行が不正です")
+
+        let seed () =
+            struct (System.Int64.MaxValue, Array.empty<SqlValue>)
+
+        let addOne struct (best, bestRow) (f: SqlValue array) =
+            match f.[0] with
+            | SqlValue.Blob _ -> ret struct (System.Int64.MinValue, [||])
+            | SqlValue.Int s ->
+                let r = Array.sub f 1 (f.Length - 1)
+
+                if s < best then
+                    ret struct (s, r)
+                else
+                    ret struct (best, bestRow)
+            | _ -> err (DbError.internalError "DISTINCT の退避行が不正です")
+
+        let stateBytes struct (_, r) =
+            int64 (ValueCodec.managedRowBytes r) + 64L
+
+        let emitOne struct (best, r) =
+            if best = System.Int64.MinValue then
+                ret None
+            else
+                ret (Some(Array.append [| SqlValue.Int best |] r))
+
         let seen = System.Collections.Generic.HashSet<byte array> HashIdentity.Structural
 
         let externalize seq row key rest =
             let stamp = System.Guid.NewGuid().ToString "N"
 
-            match Spill.openPartitions budget.Directory stamp 0 Spill.Partitions with
-            | Error e -> err e
-            | Ok writer ->
+            Spill.openPartitions budget.Directory stamp 0 Spill.Partitions
+            >>= fun writer ->
                 let marker k =
                     writer.Write(Spill.partitionOfKey 0UL k, [| SqlValue.Blob k; SqlValue.Int System.Int64.MinValue |])
-
-                let frame s r = Array.append [| SqlValue.Int s |] r
 
                 let abandon e =
                     writer.Abandon()
                     err e
 
-                let keyOfFrame (f: SqlValue array) =
-                    match f.[0] with
-                    | SqlValue.Blob b -> ret b
-                    | SqlValue.Int _ -> encode (Array.sub f 1 (f.Length - 1)) |> DbResult.toResult
-                    | _ -> err (DbError.internalError "DISTINCT の退避行が不正です")
-
-                let seed () =
-                    struct (System.Int64.MaxValue, Array.empty<SqlValue>)
-
-                let addOne struct (best, bestRow) (f: SqlValue array) =
-                    match f.[0] with
-                    | SqlValue.Blob _ -> ret struct (System.Int64.MinValue, [||])
-                    | SqlValue.Int s ->
-                        let r = Array.sub f 1 (f.Length - 1)
-
-                        if s < best then
-                            ret struct (s, r)
-                        else
-                            ret struct (best, bestRow)
-                    | _ -> err (DbError.internalError "DISTINCT の退避行が不正です")
-
-                let stateBytes struct (_, r) =
-                    int64 (ValueCodec.managedRowBytes r) + 64L
-
-                let emitOne struct (best, r) =
-                    if best = System.Int64.MinValue then
-                        ret None
-                    else
-                        ret (Some(Array.append [| SqlValue.Int best |] r))
-
-                let markers =
-                    (ret (), seen)
-                    ||> Seq.fold (fun acc k ->
-                        match acc with
-                        | Error e -> err e
-                        | Ok() -> marker k)
-
                 let written =
-                    markers
+                    (ret (), seen)
+                    ||> Seq.fold (fun acc k -> acc >>= fun () -> marker k)
                     >>= fun () -> writer.Write(Spill.partitionOfKey 0UL key, frame seq row)
                     >>= fun () -> Spill.fillPartitions writer (encode >> DbResult.toResult) frame (seq + 1L) rest
 
@@ -190,20 +183,17 @@ module internal Ops =
                 | Ok _ ->
                     writer.Close()
 
-                    match
-                        Spill.groupPartitions
-                            budget
-                            stamp
-                            keyOfFrame
-                            seed
-                            addOne
-                            stateBytes
-                            emitOne
-                            []
-                            (writer.Paths |> Array.toList)
-                    with
-                    | Error e -> err e
-                    | Ok rows ->
+                    Spill.groupPartitions
+                        budget
+                        stamp
+                        keyOfFrame
+                        seed
+                        addOne
+                        stateBytes
+                        emitOne
+                        []
+                        (writer.Paths |> Array.toList)
+                    >>= fun rows ->
                         ExtSort.sortRows budget () (fun () _ -> DbOk()) compareSeq rows
                         |> Result.map (Op.map (fun f -> DbOk(Array.sub f 1 (f.Length - 1))))
 
@@ -354,6 +344,7 @@ module internal Ops =
             Max: SqlValue option
             First: SqlValue option
             Seen: Set<SqlValue>
+            SeenRuns: string list
         }
 
     /// GROUP BY + 集約。
@@ -403,6 +394,29 @@ module internal Ops =
                 DbErr(DbError.constraintViolation "SUM の結果が DECIMAL の範囲を超えました")
             else
                 DbOk(a + b)
+
+        let spillSeen acc =
+            let stamp = System.Guid.NewGuid().ToString "N"
+
+            let rows =
+                acc.Seen
+                |> Set.toList
+                |> List.map (fun v ->
+                    ValueCodec.writeValues [| v |] Writer.Empty
+                    |> Result.map (fun w -> [| SqlValue.Blob(Writer.toArray w) |]))
+                |> all
+
+            match rows with
+            | Error e -> DbErr e
+            | Ok rows ->
+                match Spill.writeChunk budget.Directory stamp 0 (List.toArray rows) with
+                | Error e -> DbErr e
+                | Ok path ->
+                    DbOk
+                        { acc with
+                            Seen = Set.empty
+                            SeenRuns = path :: acc.SeenRuns
+                        }
 
         let addValue acc bump v newSeen =
             match acc.Kind with
@@ -486,8 +500,6 @@ module internal Ops =
                         | Some v when not (SqlValue.isNull v) -> Some v
                         | _ -> None
 
-                let bump = { acc with Count = acc.Count + 1L }
-
                 let newSeen =
                     if distinct then
                         match value with
@@ -496,9 +508,20 @@ module internal Ops =
                     else
                         acc.Seen
 
-                match counted with
-                | None -> DbOk { acc with Seen = newSeen }
-                | Some v -> addValue acc bump v newSeen
+                let withSeen =
+                    if distinct && MemoryBudget.exceeded (budget.Work, int64 (Set.count newSeen) * 32L) then
+                        spillSeen { acc with Seen = newSeen }
+                    else
+                        DbOk { acc with Seen = newSeen }
+
+                match withSeen with
+                | DbErr e -> DbErr e
+                | DbOk a ->
+                    match counted with
+                    | None -> DbOk a
+                    | Some v ->
+                        let bump = { a with Count = a.Count + 1L }
+                        addValue a bump v a.Seen
 
         let add star distinct arg acc row =
             if star then
@@ -531,10 +554,64 @@ module internal Ops =
                 Max = None
                 First = None
                 Seen = Set.empty
+                SeenRuns = []
             }
 
         let newBucket () =
             aggs |> List.map (fun (f, _, _, _) -> emptyAcc f)
+
+        let compareBlob (a: SqlValue array) (b: SqlValue array) =
+            match a.[0], b.[0] with
+            | SqlValue.Blob x, SqlValue.Blob y -> Bytes.compare x y
+            | _ -> 0
+
+        let foldDistinct fresh prev cur =
+            let rec go (a: Acc) previous op =
+                match Op.next op with
+                | OpStep.OpError e -> DbErr e
+                | OpStep.OpDone -> DbOk a
+                | OpStep.OpRow(row, nxt) ->
+                    match row.[0] with
+                    | SqlValue.Blob bytes when previous <> Some bytes ->
+                        match ValueCodec.readValues (Cursor.create bytes) with
+                        | Error e -> DbErr e
+                        | Ok(values, _) ->
+                            let v = values.[0]
+                            let bump = { a with Count = a.Count + 1L }
+
+                            match addValue a bump v Set.empty with
+                            | DbErr e -> DbErr e
+                            | DbOk next -> go next (Some bytes) nxt
+                    | SqlValue.Blob _ -> go a previous nxt
+                    | _ -> DbErr(DbError.internalError "DISTINCT 集約の退避行が不正です")
+
+            go fresh prev cur
+
+        let finalizeAcc acc =
+            if List.isEmpty acc.SeenRuns then
+                DbOk acc
+            else
+                let paths = acc.SeenRuns
+
+                let runOps =
+                    paths
+                    |> List.map (fun p -> Spill.reopen budget.Scope (Spill.RowSpool.Disk([ p ], 0)))
+                    |> all
+
+                match runOps with
+                | Error e ->
+                    Spill.forget paths
+                    DbErr e
+                | Ok ops ->
+                    let src = List.foldBack Op.append ops Op.Empty
+
+                    match ExtSort.sortRows budget () (fun () _ -> DbOk()) compareBlob src with
+                    | Error e ->
+                        Spill.forget paths
+                        DbErr e
+                    | Ok sorted ->
+                        foldDistinct (emptyAcc acc.Kind) None sorted
+                        |> DbResult.map (fun final -> { final with SeenRuns = [] })
 
         let finishAcc acc =
             match acc.Kind with
@@ -557,7 +634,10 @@ module internal Ops =
             bucket |> List.map finishAcc |> List.toArray |> Array.append key
 
         let bucketBytes key bucket =
-            let seen = bucket |> List.sumBy (fun a -> int64 (Set.count a.Seen) * 32L)
+            let seen =
+                bucket
+                |> List.sumBy (fun a -> int64 (Set.count a.Seen) * 32L + int64 (List.length a.SeenRuns) * 64L)
+
             int64 (ValueCodec.managedRowBytes key) + 96L * int64 bucket.Length + seen + 64L
 
         let emptyResult () =
@@ -570,6 +650,44 @@ module internal Ops =
 
         let encodeKey key =
             ValueCodec.writeValues key Writer.Empty |> Result.map Writer.toArray
+
+        let keyOf r =
+            keyOfRow r |> DbResult.toResult >>= encodeKey
+
+        let frame s r = Array.append [| SqlValue.Int s |] r
+
+        let keyOfFrame (f: SqlValue array) =
+            match f.[0] with
+            | SqlValue.Int _ -> keyOf (Array.sub f 1 (f.Length - 1))
+            | _ -> err (DbError.internalError "GROUP BY の退避行が不正です")
+
+        let seed () =
+            struct (Array.empty<SqlValue>, newBucket (), System.Int64.MaxValue)
+
+        let addFrame struct (_, accs, first) (f: SqlValue array) =
+            match f.[0] with
+            | SqlValue.Int s ->
+                let r = Array.sub f 1 (f.Length - 1)
+
+                match keyOfRow r with
+                | DbErr e -> err e
+                | DbOk k ->
+                    match addToBucket accs r with
+                    | DbErr e -> err e
+                    | DbOk next -> ret struct (k, next, min first s)
+            | _ -> err (DbError.internalError "GROUP BY の退避行が不正です")
+
+        let stateBytes struct (key, accs, _) = bucketBytes key accs
+
+        let emitGroup struct (key, accs, first) =
+            accs
+            |> List.map (finalizeAcc >> DbResult.toResult)
+            |> all
+            |> Result.map (fun finalAccs ->
+                Array.append
+                    [| SqlValue.Int first |]
+                    (Array.append key (finalAccs |> List.map finishAcc |> List.toArray))
+                |> Some)
 
         let buckets =
             System.Collections.Generic.Dictionary<SqlValue array, Acc list>(
@@ -584,47 +702,11 @@ module internal Ops =
         let externalize row seq rest =
             let stamp = System.Guid.NewGuid().ToString "N"
 
-            match Spill.openPartitions budget.Directory stamp 0 Spill.Partitions with
-            | Error e -> err e
-            | Ok writer ->
-                let keyOf r =
-                    keyOfRow r |> DbResult.toResult >>= encodeKey
-
-                let frame s r = Array.append [| SqlValue.Int s |] r
-
+            Spill.openPartitions budget.Directory stamp 0 Spill.Partitions
+            >>= fun writer ->
                 let abandon e =
                     writer.Abandon()
                     err e
-
-                let keyOfFrame (f: SqlValue array) =
-                    match f.[0] with
-                    | SqlValue.Int _ -> keyOf (Array.sub f 1 (f.Length - 1))
-                    | _ -> err (DbError.internalError "GROUP BY の退避行が不正です")
-
-                let seed () =
-                    struct (Array.empty<SqlValue>, newBucket (), System.Int64.MaxValue)
-
-                let addFrame struct (_, accs, first) (f: SqlValue array) =
-                    match f.[0] with
-                    | SqlValue.Int s ->
-                        let r = Array.sub f 1 (f.Length - 1)
-
-                        match keyOfRow r with
-                        | DbErr e -> err e
-                        | DbOk k ->
-                            match addToBucket accs r with
-                            | DbErr e -> err e
-                            | DbOk next -> ret struct (k, next, min first s)
-                    | _ -> err (DbError.internalError "GROUP BY の退避行が不正です")
-
-                let stateBytes struct (key, accs, _) = bucketBytes key accs
-
-                let emitGroup struct (key, accs, first) =
-                    Array.append
-                        [| SqlValue.Int first |]
-                        (Array.append key (accs |> List.map finishAcc |> List.toArray))
-                    |> Some
-                    |> ret
 
                 let written = Spill.fillPartitions writer keyOf frame seq (Op.emit row rest)
 
@@ -641,20 +723,17 @@ module internal Ops =
                             | Error _ -> None)
                         |> List.ofSeq
 
-                    match
-                        Spill.groupPartitions
-                            budget
-                            stamp
-                            keyOfFrame
-                            seed
-                            addFrame
-                            stateBytes
-                            emitGroup
-                            seeds
-                            (writer.Paths |> Array.toList)
-                    with
-                    | Error e -> err e
-                    | Ok rows ->
+                    Spill.groupPartitions
+                        budget
+                        stamp
+                        keyOfFrame
+                        seed
+                        addFrame
+                        stateBytes
+                        emitGroup
+                        seeds
+                        (writer.Paths |> Array.toList)
+                    >>= fun rows ->
                         ExtSort.sortRows budget () (fun () _ -> DbOk()) compareFirst rows
                         |> Result.map (Op.map (fun f -> DbOk(Array.sub f 1 (f.Length - 1))))
 
@@ -667,10 +746,22 @@ module internal Ops =
             match Op.next cur with
             | OpStep.OpError e -> err e
             | OpStep.OpDone ->
-                if List.isEmpty order && List.isEmpty groupBy then
-                    ret (Op.ofArray [| emptyResult () |])
-                else
-                    ret (emitGroups (List.rev order))
+                buckets
+                |> Seq.map (fun kv -> kv.Key, kv.Value)
+                |> List.ofSeq
+                |> List.map (fun (k, bucket) ->
+                    bucket
+                    |> List.map (finalizeAcc >> DbResult.toResult)
+                    |> all
+                    |> Result.map (fun final -> k, final))
+                |> all
+                >>= fun finalized ->
+                    finalized |> List.iter (fun (k, bucket) -> buckets.[k] <- bucket)
+
+                    if List.isEmpty order && List.isEmpty groupBy then
+                        ret (Op.ofArray [| emptyResult () |])
+                    else
+                        ret (emitGroups (List.rev order))
             | OpStep.OpRow(row, nxt) ->
                 match keyOfRow row with
                 | DbErr e -> err e

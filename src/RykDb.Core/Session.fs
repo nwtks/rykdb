@@ -261,20 +261,19 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                         let outcome =
                             match stmt with
                             | Statement.Begin ->
-                                host.Begin state |> Result.map (fun next -> (next, StatementResult.Empty))
+                                host.Begin state |> Result.map (fun next -> next, StatementResult.Empty)
                             | Statement.Commit -> host.Commit state
                             | Statement.Rollback -> host.Rollback state
                             | _ -> host.ExecuteNonTransaction state (limitsOfBudget budget) stmt
 
                         match outcome with
-                        | Error e -> err e
                         | Ok(next, result) ->
                             lock stateGate (fun () -> local <- LocalSession.Open next)
                             run (consumeBudget result budget) (result :: acc) next tail
+                        | Error e -> err e
 
-                match run initialBudget [] start statements with
-                | Error e -> err e
-                | Ok results ->
+                run initialBudget [] start statements
+                >>= fun results ->
                     let nowInTransaction = inTransaction ()
 
                     let change =
@@ -295,9 +294,8 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             | LocalSession.Closed -> err (closedError ())
             | LocalSession.Open state when TxnState.inTransaction state -> ret None
             | LocalSession.Open _ ->
-                match host.AcquireReadSnapshot() with
-                | Error e -> err e
-                | Ok(readState, lease) ->
+                host.AcquireReadSnapshot()
+                >>= fun (readState, lease) ->
                     readers <- readers + 1
                     ret (Some(readState, lease)))
 
@@ -316,7 +314,6 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// SELECT / EXPLAIN だけを、捕捉したスナップショットに対してロックなしで実行する。
     let runRead (statements: Statement list) =
         match tryEnterRead () with
-        | Error e -> err e
         | Ok None -> runExclusive statements
         | Ok(Some(readState, lease)) ->
             try
@@ -330,14 +327,14 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                                 (ExecState.ofCommitted readState)
                                 stmt
                         with
-                        | Error e -> err e
                         | Ok(_, result) -> run (consumeBudget result budget) (result :: acc) tail
+                        | Error e -> err e
 
-                match run initialBudget [] statements with
-                | Error e -> err e
-                | Ok results -> ret (summarize results, SessionTransactionChange.NoChange)
+                run initialBudget [] statements
+                >>= fun results -> ret (summarize results, SessionTransactionChange.NoChange)
             finally
                 exitRead lease
+        | Error e -> err e
 
     /// SELECT / EXPLAIN だけのバッチか。
     let isReadOnlyBatch =
@@ -380,14 +377,12 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             match host.DurabilityFailure with
             | Some e -> err e
             | None ->
-                match validateParameters parameters with
-                | Error e -> err e
-                | Ok() ->
+                validateParameters parameters
+                >>= fun () ->
                     let parameters = SqlValue.copyRow parameters
 
-                    match Parser.parseStatementsWith parameters sql with
-                    | Error e -> err e
-                    | Ok statements -> executeStatementsCore statements
+                    Parser.parseStatementsWith parameters sql
+                    >>= fun statements -> executeStatementsCore statements
 
     /// `TryOpenReader` の実装。
     let tryOpenReaderCore (sql: string) (parameters: SqlValue array) =
@@ -397,16 +392,13 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             match host.DurabilityFailure with
             | Some e -> err e
             | None ->
-                match validateParameters parameters with
-                | Error e -> err e
-                | Ok() ->
+                validateParameters parameters
+                >>= fun () ->
                     let parameters = SqlValue.copyRow parameters
 
                     match Parser.parseStatementsWith parameters sql with
-                    | Error e -> err e
                     | Ok [ Statement.Select stmt ] ->
                         match tryEnterRead () with
-                        | Error e -> err e
                         | Ok None -> ret None
                         | Ok(Some(readState, lease)) ->
                             match Engine.openSelect limits.Budget (ExecState.ofCommitted readState) stmt with
@@ -421,7 +413,9 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                                         exitRead lease
 
                                 ret (Some(new RowReader(stream.Columns, stream.Op, release)))
+                        | Error e -> err e
                     | Ok _ -> ret None
+                    | Error e -> err e
 
     /// DB を開く（background compaction 有効、既定の上限）。
     static member OpenWith(root: string) =
@@ -429,25 +423,22 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
 
     /// DB を開く（background compaction 有効、指定した上限）。
     static member OpenWith(root: string, options: SessionOptions) =
-        match SessionOptions.Validate options with
-        | Error e -> err e
-        | Ok() ->
+        SessionOptions.Validate options
+        >>= fun () ->
             DatabaseHost.OpenWithBackground root
             |> Result.map (fun host -> new Session(host, options, true))
 
     /// テスト・ベンチ用: 同期 compaction で開く（ホストを所有する）。
     static member internal OpenWithSync(root: string, options: SessionOptions) =
-        match SessionOptions.Validate options with
-        | Error e -> err e
-        | Ok() ->
+        SessionOptions.Validate options
+        >>= fun () ->
             DatabaseHost.OpenWith root
             |> Result.map (fun host -> new Session(host, options, true))
 
     /// テスト・内部用: 既に開いた `RowStore` から Session を作る（ホストを所有する）。
     static member internal OpenWithStore(root: string, options: SessionOptions, store: RowStore) =
-        match SessionOptions.Validate options with
-        | Error e -> err e
-        | Ok() ->
+        SessionOptions.Validate options
+        >>= fun () ->
             DatabaseHost.OpenWithStore(root, store)
             |> Result.map (fun host -> new Session(host, options, true))
 
@@ -528,11 +519,10 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             match lock stateGate (fun () -> local) with
             | LocalSession.Closed -> err (closedError ())
             | LocalSession.Open state ->
-                match host.Begin state with
-                | Error e -> err e
-                | Ok next ->
+                host.Begin state
+                |> Result.map (fun next ->
                     lock stateGate (fun () -> local <- LocalSession.Open next)
-                    ret ())
+                    ()))
 
     /// COMMIT。
     member _.Commit() =
@@ -617,9 +607,8 @@ type SessionPool internal (host: DatabaseHost, options: SessionOptions) =
 
     /// DB を開く（指定した上限）。
     static member OpenWith(root: string, options: SessionOptions) =
-        match SessionOptions.Validate options with
-        | Error e -> err e
-        | Ok() ->
+        SessionOptions.Validate options
+        >>= fun () ->
             DatabaseHost.OpenWithBackground root
             |> Result.map (fun host -> new SessionPool(host, options))
 

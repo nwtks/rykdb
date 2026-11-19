@@ -185,10 +185,7 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                     outcome, position)
 
         match position with
-        | Some pos ->
-            match durability.Await pos with
-            | Error e -> err e
-            | Ok() -> outcome
+        | Some pos -> durability.Await pos >>= fun () -> outcome
         | None -> outcome
 
     /// 与えたストアで DB を開く。
@@ -305,9 +302,8 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
         | None -> err (DbError.internalError "コミットする transaction がありません")
         | Some _ ->
             serialized (fun current ->
-                match Engine.executeCommit (execStateOf current local) with
-                | Error e -> err e
-                | Ok next ->
+                Engine.executeCommit (execStateOf current local)
+                >>= fun next ->
                     local.Lease |> Option.iter _.Release()
                     publish next.Committed
                     ret (next.Committed, (next.Txn, StatementResult.Empty)))
@@ -326,9 +322,8 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
     /// transaction 以外の文（SELECT / DML / DDL）を実行する。
     member _.ExecuteNonTransaction (local: TxnState) (limits: ResultLimits) (stmt: Statement) =
         serialized (fun current ->
-            match Engine.executeStatementWithLimits limits (execStateOf current local) stmt with
-            | Error e -> err e
-            | Ok(next, result) ->
+            Engine.executeStatementWithLimits limits (execStateOf current local) stmt
+            >>= fun (next, result) ->
                 // 登録が残っている間だけ、接続が持つリースを引き継ぐ。
                 let nextLocal =
                     { next.Txn with

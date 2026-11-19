@@ -216,7 +216,6 @@ module internal Plan =
             function
             | Visit s ->
                 match substituteFields s with
-                | Error e -> err e
                 | Ok baseStmt ->
                     match s.SetOperations with
                     | [] -> loop frames (Completed baseStmt)
@@ -230,6 +229,7 @@ module internal Plan =
                              }
                              :: frames)
                             (Visit first.Statement)
+                | Error e -> err e
             | Completed doneStmt ->
                 match frames with
                 | [] -> ret doneStmt

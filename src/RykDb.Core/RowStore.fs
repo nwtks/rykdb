@@ -145,9 +145,8 @@ module internal RowStore =
                 else
                     engine.WriteBatch physicalEntries
 
-            match written with
-            | Error e -> err e
-            | Ok updated ->
+            written
+            >>= fun updated ->
                 let maxSeq = Entry.maxSeqNo physicalEntries
                 let bumped = updated.WithNextSeqNo(max updated.NextSeqNo (maxSeq + 1UL))
 
@@ -221,7 +220,6 @@ module internal RowStore =
     let private scanWithinPrefix (prefix: byte array) (scan: SstScan) =
         let rec loop current =
             match SstScan.next current with
-            | Error e -> err e
             | Ok None -> ret None
             | Ok(Some(e, rest)) ->
                 if not (KeyBuilder.startsWithPrefix e.Key prefix) then
@@ -234,6 +232,7 @@ module internal RowStore =
                         SstScan.ofStepWithClose (fun () -> loop rest) (fun () -> SstScan.dispose rest)
                     )
                     |> ret
+            | Error e -> err e
 
         SstScan.ofStepWithClose (fun () -> loop scan) (fun () -> SstScan.dispose scan)
 
@@ -313,16 +312,14 @@ module internal RowStore =
                 ret (List.rev acc, scan)
             else
                 match SstScan.next scan with
-                | Error e -> err e
                 | Ok None -> ret (List.rev acc, SstScan.Empty)
                 | Ok(Some(e, rest)) -> takeKeys (n - 1) (e.Key :: acc) rest
+                | Error e -> err e
 
         let rec loop (currentStore, currentMgr) startKey =
             match scanKeys space startKey 0 currentStore with
-            | Error e -> err e
             | Ok stale ->
                 match takeKeys ClearChunkEntries [] stale with
-                | Error e -> err e
                 | Ok(chunk, _) ->
                     match List.tryLast chunk with
                     | None -> ret (currentStore, currentMgr)
@@ -331,14 +328,16 @@ module internal RowStore =
                             TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) currentMgr
 
                         match foldOk (fun t key -> ret (Transaction.remove space key t)) txn chunk with
-                        | Error e -> err e
                         | Ok txn2 ->
                             match TransactionManager.commit txn2 mgr0 with
-                            | Error e -> err e
                             | Ok(mgr1, _, batches) ->
                                 match writeBatches batches currentStore with
-                                | Error e -> err e
                                 | Ok store1 -> loop (store1, mgr1) lastKey
+                                | Error e -> err e
+                            | Error e -> err e
+                        | Error e -> err e
+                | Error e -> err e
+            | Error e -> err e
 
         loop (store, mgr) [||]
 

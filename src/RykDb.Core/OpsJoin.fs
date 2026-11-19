@@ -376,7 +376,6 @@ module internal OpsJoin =
             | DbOk(MergeStart _) -> err (DbError.internalError "merge join: 入力状態が不正です")
             | DbOk(MergeAt(row, _) as next) ->
                 match sameKey first row with
-                | Error e -> err e
                 | Ok false -> ret (List.rev buf, None, next)
                 | Ok true ->
                     let size = int64 (ValueCodec.managedRowBytes row) + 32L
@@ -385,6 +384,7 @@ module internal OpsJoin =
                         ret (List.rev buf, Some row, next)
                     else
                         fill first (row :: buf) (bufBytes + size) next
+                | Error e -> err e
 
         let rec writeAll sink rest =
             match rest with
@@ -401,12 +401,12 @@ module internal OpsJoin =
             | DbOk(MergeStart _) -> err (DbError.internalError "merge join: 入力状態が不正です")
             | DbOk(MergeAt(row, _) as next) ->
                 match sameKey first row with
-                | Error e -> err e
                 | Ok false -> ret (count, next)
                 | Ok true ->
                     match Spill.writeRow row sink with
-                    | Error e -> err e
                     | Ok() -> drain sink first (count + 1) next
+                    | Error e -> err e
+                | Error e -> err e
 
         match side with
         | MergeStart _
@@ -415,14 +415,12 @@ module internal OpsJoin =
             let firstBytes = int64 (ValueCodec.managedRowBytes first) + 32L
 
             match fill first [ first ] firstBytes side with
-            | Error e -> err e
             | Ok(rows, None, next) -> ret (Spill.RowSpool.Memory(List.toArray rows), next)
             | Ok(rows, Some pending, next) ->
                 let path = Spill.runPath budget.Directory (System.Guid.NewGuid().ToString "N") 0
 
-                match Spill.openSink path with
-                | Error e -> err e
-                | Ok sink ->
+                Spill.openSink path
+                >>= fun sink ->
                     let buffered = rows @ [ pending ]
 
                     match writeAll sink buffered with
@@ -439,6 +437,7 @@ module internal OpsJoin =
                         | Ok(count, next') ->
                             Spill.closeSink sink
                             ret (Spill.RowSpool.Disk([ path ], count), next')
+            | Error e -> err e
 
     /// マージ結合。両入力は結合キーで昇順に並んでいる必要がある
     /// （`Analyzer.chooseJoinAlgorithm` が走査の並び順を確認して選ぶ）。
@@ -603,9 +602,8 @@ module internal OpsJoin =
             spool
 
         let partitionSide serial keys src =
-            match Spill.openPartitions budget.Directory stamp serial Spill.Partitions with
-            | Error e -> err e
-            | Ok writer ->
+            Spill.openPartitions budget.Directory stamp serial Spill.Partitions
+            >>= fun writer ->
                 match Spill.fillPartitions writer (keyBytes keys) (fun _ row -> row) 0L src with
                 | Error e ->
                     writer.Abandon()
@@ -639,46 +637,46 @@ module internal OpsJoin =
             | [] -> ret (List.foldBack Op.append (List.rev acc) Op.Empty)
             | (depth, salt, lspool, rspool) :: rest ->
                 match Spill.reopenKeep budget.Scope rspool >>= Spill.spool budget with
-                | Error e -> err e
                 | Ok(Spill.RowSpool.Memory rightRows) ->
                     let table = buildHashTable rightRows rightKeys
 
                     match Spill.reopenKeep budget.Scope lspool with
-                    | Error e -> err e
                     | Ok l ->
                         let op =
                             joinProbe isLeft leftSchema l leftKeys rightSchema residual (lookupHash table)
 
                         joinWork (op :: acc) rest
+                    | Error e -> err e
                 | Ok rightSpool when depth < maxDepth ->
                     Spill.forgetSpool budget.Scope rightSpool
                     Spill.deleteSpool rightSpool
 
                     match repartitionOne salt "l" leftKeys lspool with
-                    | Error e -> err e
                     | Ok lparts ->
                         match repartitionOne salt "r" rightKeys rspool with
-                        | Error e -> err e
                         | Ok rparts ->
                             let next =
                                 Array.map2 (fun l r -> depth + 1, salt + 1UL, l, r) lparts rparts
                                 |> Array.toList
 
                             joinWork acc (next @ rest)
+                        | Error e -> err e
+                    | Error e -> err e
                 | Ok rightSpool ->
                     Spill.forgetSpool budget.Scope rightSpool
                     Spill.deleteSpool rightSpool
 
                     match Spill.reopenKeep budget.Scope lspool with
-                    | Error e -> err e
                     | Ok l ->
                         match Spill.reopenKeep budget.Scope rspool with
-                        | Error e -> err e
                         | Ok r ->
                             let op =
                                 mergeJoinWith isLeft budget leftSchema l leftKeys rightSchema r rightKeys residual
 
                             joinWork (op :: acc) rest
+                        | Error e -> err e
+                    | Error e -> err e
+                | Error e -> err e
 
         partitionSide 0 leftKeys left
         >>= fun lparts ->

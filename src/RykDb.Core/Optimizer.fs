@@ -463,8 +463,8 @@ module internal Optimizer =
                 run innerCtx (UnionFrame(ctx, [], rest) :: frames) (EvalNode(plan.Tree, plan.Input, None))
             | Logical.Scan(name, method) as node ->
                 match execScan node ctx name method hint with
-                | Error e -> err e
                 | Ok op -> run ctx frames (ApplyOp op)
+                | Error e -> err e
             | Logical.Filter(p, child) ->
                 let childSchema = outputOf ctx inSchema child
                 run ctx (FilterFrame(p, childSchema) :: frames) (EvalNode(child, inSchema, None))
@@ -493,16 +493,16 @@ module internal Optimizer =
                 | FilterFrame(p, childSchema) -> run ctx rest (ApplyOp(Ops.filter childSchema p op))
                 | AggregateFrame(groupBy, aggs, inSchema) ->
                     match Ops.aggregate ctx.Budget inSchema groupBy aggs op with
-                    | Error e -> err e
                     | Ok aggregated -> run ctx rest (ApplyOp aggregated)
+                    | Error e -> err e
                 | HavingFrame(h, aggs, groupBy) ->
                     let p = Ops.havingFilter groupBy aggs h
                     run ctx rest (ApplyOp(Op.filter p op))
                 | DistinctFrame -> run ctx rest (ApplyOp(Ops.distinct ctx.Budget op))
                 | SortFrame(keys, childSchema) ->
                     match Ops.sortBy ctx.Budget childSchema keys op with
-                    | Error e -> err e
                     | Ok sorted -> run ctx rest (ApplyOp sorted)
+                    | Error e -> err e
                 | LimitFrame(offset, limit) ->
                     let skipped = if offset > 0 then Op.skip offset op else op
                     let limited = if limit >= 0 then Op.take limit skipped else skipped
@@ -511,14 +511,14 @@ module internal Optimizer =
                     run ctx rest (ApplyOp(Ops.project childSchema groupBy items op))
                 | JoinIndexLeftFrame frame ->
                     match execIndexJoin frame op with
-                    | Error e -> err e
                     | Ok joined -> run ctx rest (ApplyOp joined)
+                    | Error e -> err e
                 | JoinRightFrame frame ->
                     run ctx (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
                 | JoinApplyFrame(frame, leftOp) ->
                     match execJoin frame leftOp op with
-                    | Error e -> err e
                     | Ok joined -> run ctx rest (ApplyOp joined)
+                    | Error e -> err e
                 | UnionFrame(outer, doneOps, []) ->
                     let combined = List.foldBack Op.append (List.rev (op :: doneOps)) Op.Empty
                     run outer rest (ApplyOp combined)

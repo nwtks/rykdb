@@ -92,8 +92,8 @@ module internal DropCleanupRecovery =
             | [] -> ret (currentStore, currentMgr)
             | space :: tail ->
                 match RowStore.clearKeyspaceChunks currentMgr space currentStore with
-                | Error e -> err e
                 | Ok next -> clear next tail
+                | Error e -> err e
 
         DropCleanup.pending store.Root
         >>= (List.filter (shouldClean catalog) >> clear (store, mgr))
