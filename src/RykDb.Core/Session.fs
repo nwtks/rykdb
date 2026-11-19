@@ -193,6 +193,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                     Work = options.WorkMemBytes
                     Sort = options.SortBufferBytes
                     Directory = options.SpillDirectory
+                    Scope = None
                 }
         }
 
@@ -291,14 +292,14 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     let tryEnterRead () =
         lock stateGate (fun () ->
             match local with
-            | LocalSession.Closed -> Error(closedError ())
-            | LocalSession.Open state when TxnState.inTransaction state -> Ok None
+            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Open state when TxnState.inTransaction state -> ret None
             | LocalSession.Open _ ->
                 match host.AcquireReadSnapshot() with
-                | Error e -> Error e
+                | Error e -> err e
                 | Ok(readState, lease) ->
                     readers <- readers + 1
-                    Ok(Some(readState, lease)))
+                    ret (Some(readState, lease)))
 
     /// 読み取りの出口。
     /// lease を返して readers を減らす。
@@ -408,7 +409,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                         | Error e -> err e
                         | Ok None -> ret None
                         | Ok(Some(readState, lease)) ->
-                            match Engine.openSelect (ExecState.ofCommitted readState) stmt with
+                            match Engine.openSelect limits.Budget (ExecState.ofCommitted readState) stmt with
                             | Error e ->
                                 exitRead lease
                                 err e

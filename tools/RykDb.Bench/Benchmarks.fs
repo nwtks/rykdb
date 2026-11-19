@@ -284,6 +284,88 @@ type QueryBenchmarks() =
 
         rows
 
+/// スピル経路を強制するベンチマーク。
+/// 作業メモリを 1バイトにして、DISTINCT / GROUP BY / JOIN / ORDER BY が
+/// 一時ファイルへ退避する経路を測る（通常経路との差は QueryBenchmarks と比較する）。
+[<MemoryDiagnoser>]
+type SpillBenchmarks() =
+    let mutable session = Unchecked.defaultof<Session>
+    let mutable root = ""
+    let mutable spillDir = ""
+
+    let distinctSql = "SELECT DISTINCT v FROM t"
+    let groupBySql = "SELECT v, COUNT(*) FROM t GROUP BY v"
+    let joinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id"
+    let sortSql = "SELECT v FROM t ORDER BY v LIMIT 10"
+
+    member private _.Exec(sql: string) =
+        session.Execute sql |> Check.ok |> ignore
+
+    [<GlobalSetup>]
+    member this.Setup() =
+        root <- BenchEnv.newTempDir "spill"
+        spillDir <- Path.Combine(root, "spill")
+        Directory.CreateDirectory spillDir |> ignore
+
+        let options =
+            { SessionOptions.Default with
+                WorkMemBytes = 1L
+                SortBufferBytes = 1L
+                SpillDirectory = Some spillDir
+            }
+
+        session <- Session.OpenWithSync(root, options) |> Check.ok
+
+        this.Exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)"
+
+        let seed table count =
+            let values =
+                [ for i in 0 .. count - 1 -> sprintf "(%d, %d)" i (i % 50) ]
+                |> String.concat ", "
+
+            this.Exec(sprintf "INSERT INTO %s VALUES %s" table values)
+
+        seed "t" 2000
+        seed "a" 200
+        seed "b" 200
+        seed "c" 200
+
+        // 退避経路が実際に使われていることを 1回だけ確認する（測定条件の取り違え防止）。
+        let distinctRows = (session.Execute distinctSql |> Check.ok).Rows.Length
+        let groupRows = (session.Execute groupBySql |> Check.ok).Rows.Length
+
+        if distinctRows <> 50 || groupRows <> 50 then
+            failwithf "スピル経路の結果が不正です（distinct=%d, group=%d）" distinctRows groupRows
+
+    [<GlobalCleanup>]
+    member _.Cleanup() =
+        try
+            if not (isNull (box session)) then
+                session.Close() |> ignore
+        with _ ->
+            ()
+
+        BenchEnv.deleteDir root
+
+    /// DISTINCT の外部重複除去（連番で最初の出現順を復元する経路）。
+    [<Benchmark>]
+    member this.DistinctSpill() = this.Exec distinctSql
+
+    /// GROUP BY の外部集約（パーティション＋salt 再分割の経路）。
+    [<Benchmark>]
+    member this.GroupBySpill() = this.Exec groupBySql
+
+    /// 3テーブル JOIN（右側が上限を超え、パーティション分割ハッシュへ入る経路）。
+    [<Benchmark>]
+    member this.Join3TablesSpill() = this.Exec joinSql
+
+    /// ORDER BY の外部マージソート（受け皿 1バイト）。
+    [<Benchmark>]
+    member this.SortSpill() = this.Exec sortSql
+
 /// compaction のベンチマーク。
 /// L0 に 4ファイル（各 25,000件）を作り、1回の L0 → L1 compaction を測る。
 [<MemoryDiagnoser>]

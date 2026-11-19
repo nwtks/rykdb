@@ -38,19 +38,21 @@ module internal ExtSort =
         (compareRows: SqlValue array -> SqlValue array -> int)
         (src: Op)
         =
-        let inMemory (rows: SqlValue array list) =
-            rows |> List.toArray |> Array.sortWith compareRows |> Op.ofArray
+        let inMemory = List.toArray >> Array.sortWith compareRows >> Op.ofArray
+        let openRun = Spill.openTracked budget.Scope
+        let closeRun = Spill.closeTracked budget.Scope true
+        let closeAll = Spill.closeAllTracked budget.Scope
 
-        let rec openAll rest acc =
+        let rec openAll acc rest =
             match rest with
             | [] -> ret (List.rev acc)
             | p :: tail ->
-                match Spill.openRun p with
+                match openRun p with
                 | Error e ->
-                    Spill.closeAll acc
+                    closeAll acc
                     Spill.forget rest
                     err e
-                | Ok state -> openAll tail (state :: acc)
+                | Ok state -> openAll (state :: acc) tail
 
         let rec scan i bestIdx best =
             function
@@ -75,37 +77,37 @@ module internal ExtSort =
             let idx = scan 0 -1 None states
 
             if idx < 0 then
-                Spill.closeAll states
+                closeAll states
                 ret ()
             else
                 let before, chosenAndAfter = splitAt idx [] states
 
                 match chosenAndAfter with
                 | [] ->
-                    Spill.closeAll states
+                    closeAll states
                     ret ()
                 | chosen :: after ->
                     match chosen.Head with
                     | None ->
-                        Spill.closeRun chosen
+                        closeRun chosen
                         writeMerged sink (before @ after)
                     | Some row ->
                         match Spill.writeRow row sink with
                         | Error e ->
-                            Spill.closeAll (before @ chosenAndAfter)
+                            closeAll (before @ chosenAndAfter)
                             err e
                         | Ok() ->
                             match Spill.readRow chosen.Src with
                             | Error e ->
-                                Spill.closeAll (before @ chosenAndAfter)
+                                closeAll (before @ chosenAndAfter)
                                 err e
                             | Ok None ->
-                                Spill.closeRun chosen
+                                closeRun chosen
                                 writeMerged sink (before @ after)
                             | Ok(Some nxt) -> writeMerged sink (before @ { chosen with Head = Some nxt } :: after)
 
         let mergeToRun stamp serial paths =
-            match openAll paths [] with
+            match openAll [] paths with
             | Error e ->
                 Spill.forget paths
                 err e
@@ -114,7 +116,7 @@ module internal ExtSort =
 
                 match Spill.openSink path with
                 | Error e ->
-                    Spill.closeAll states
+                    closeAll states
                     err e
                 | Ok sink ->
                     match writeMerged sink states with
@@ -150,7 +152,7 @@ module internal ExtSort =
             let idx = scan 0 -1 None states
 
             if idx < 0 then
-                Spill.closeAll states
+                closeAll states
                 ret None
             else
                 let before, chosenAndAfter = splitAt idx [] states
@@ -163,10 +165,10 @@ module internal ExtSort =
                     | Some row ->
                         match Spill.readRow chosen.Src with
                         | Error e ->
-                            Spill.closeAll (before @ chosenAndAfter)
+                            closeAll (before @ chosenAndAfter)
                             err e
                         | Ok None ->
-                            Spill.closeRun chosen
+                            closeRun chosen
                             ret (Some(row, before @ after))
                         | Ok(Some nxt) ->
                             let advanced = { chosen with Head = Some nxt }
@@ -200,7 +202,7 @@ module internal ExtSort =
                         Spill.forget runPaths
                         err e
                     | Ok reduced ->
-                        match openAll reduced [] with
+                        match openAll [] reduced with
                         | Error e ->
                             Spill.forget reduced
                             err e

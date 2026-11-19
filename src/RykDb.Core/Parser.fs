@@ -29,7 +29,7 @@ module internal Parser =
         let rec one acc st =
             let parsed =
                 match simpleLiteral st with
-                | Some e -> Ok e
+                | Some e -> ret e
                 | None -> parseExprValue st
 
             match parsed with

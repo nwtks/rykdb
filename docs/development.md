@@ -187,6 +187,10 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
     実行のたびに `Scope.DisposeAll()` を呼ぶ。
   - `Insert100Rows`（100行 × 1文）/ `Insert10kRows`（2,000行 × 5文を 1 transaction で流して ROLLBACK）
   - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
+  - `DistinctSpill` / `GroupBySpill` / `Join3TablesSpill` / `SortSpill` —
+    `--class spill`。作業メモリ 1バイトで退避経路を強制する
+    （DISTINCT / GROUP BY / パーティション分割ハッシュ結合 / 外部マージソート）。
+    通常経路との差は `QueryBenchmarks` の同名シナリオと比較する。
   - `MatchesLiteralV` / `MatchesColumnV` / `MatchesBinaryV` / `MatchesComplexV` — DB を使わない式評価器のマイクロベンチ
   - `MatchesComplexJoinedV` — JOIN の ON 句の式評価
   - `CompareValuesV` — `SqlValue.compareValuesV` の割当

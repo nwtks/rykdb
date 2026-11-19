@@ -57,6 +57,8 @@ type internal MemoryBudget =
         Sort: int64
         /// 一時ファイルの置き場所（`None` は OS の一時ディレクトリ）。
         Directory: string option
+        /// このクエリの走査台帳。早期終了で開いた run を閉じて消すために使う。
+        Scope: ScanScope option
     }
 
 module internal MemoryBudget =
@@ -66,6 +68,7 @@ module internal MemoryBudget =
             Work = 256L * 1024L * 1024L
             Sort = 64L * 1024L * 1024L
             Directory = None
+            Scope = None
         }
 
     /// 上限なし（一切スピルしない）。
@@ -74,6 +77,7 @@ module internal MemoryBudget =
             Work = -1L
             Sort = -1L
             Directory = None
+            Scope = None
         }
 
     /// 上限を超えたか（負の上限は無制限）。
@@ -272,11 +276,40 @@ module internal Spill =
         closeSource state.Src
         unlink state.Path
 
-    /// 複数の run をまとめて閉じて消す。
-    let closeAll (states: RunState list) = states |> List.iter closeRun
+    /// ScanScope に登録して run を開く。
+    /// 早期終了（`DisposeAll`）で閉じて消す後始末を一緒に登録する。
+    let openTracked (scope: ScanScope option) (path: string) =
+        match openRun path with
+        | Error e -> err e
+        | Ok st ->
+            match scope with
+            | Some s ->
+                let cleanup =
+                    { new System.IDisposable with
+                        member _.Dispose() =
+                            closeSource st.Src
+                            unlink path
+                    }
+
+                s.Register(box st.Src, cleanup)
+            | None -> ()
+
+            ret st
+
+    /// 通常終了: 登録を外してから閉じる（`deleteRun` なら消す）。
+    let closeTracked (scope: ScanScope option) (deleteRun: bool) (st: RunState) =
+        match scope with
+        | Some s -> s.Forget(box st.Src)
+        | None -> ()
+
+        if deleteRun then closeRun st else closeSource st.Src
+
+    /// 複数の run をまとめて（通常終了として）閉じる。
+    let closeAllTracked (scope: ScanScope option) (states: RunState list) =
+        states |> List.iter (closeTracked scope true)
 
     /// キーからパーティション番号を決める。
-    let partitionOf (count: int) (key: byte array) =
+    let private partitionOf (count: int) (key: byte array) =
         if count <= 1 then
             0
         else
@@ -444,59 +477,60 @@ module internal Spill =
         | RowSpool.Memory _ -> ()
         | RowSpool.Disk(paths, _) -> forget paths
 
+    /// 退避した spool を ScanScope に登録する。
+    /// 早期終了でファイルを消すための後始末を一緒に登録する。
+    let registerSpool (scope: ScanScope option) (spool: RowSpool) =
+        match scope, spool with
+        | Some s, RowSpool.Disk(paths, _) ->
+            let cleanup =
+                { new System.IDisposable with
+                    member _.Dispose() = forget paths
+                }
+
+            s.Register(box spool, cleanup)
+        | _ -> ()
+
+    /// 通常終了: spool の登録を外す（ファイルは呼び出し側が消す）。
+    let forgetSpool (scope: ScanScope option) (spool: RowSpool) =
+        match scope with
+        | Some s -> s.Forget(box spool)
+        | None -> ()
+
     /// 退避した行を先頭から読む Op を作る（`deleteRun` なら尽きた run を消す）。
     /// <remarks>
     /// `openNext` / `stream` は `Op.compute` の継続の中で呼ぶので、TailAudit はラムダ内の
     /// 呼び出しを非末尾として報告する（1行ごとに 1段だけ進み、スタックは積み上がらない）。
     /// </remarks>
     let private reopenWith (deleteRun: bool) (scope: ScanScope option) =
-        let closeOne st =
-            if deleteRun then closeRun st else closeSource st.Src
+        let closeOne st = closeTracked scope deleteRun st
 
-        let release key =
-            match scope with
-            | Some s -> s.Release key
-            | None -> ()
-
-        let register key src =
-            match scope with
-            | Some s -> s.Register(key, src :> System.IDisposable)
-            | None -> ()
-
-        let rec openNext key rest =
+        let rec openNext rest =
             match rest with
             | [] -> Op.Empty
             | path :: tail ->
-                match openRun path with
+                match openTracked scope path with
                 | Error e -> Op.compute (fun () -> OpStep.OpError e)
-                | Ok st ->
-                    register key st.Src
-                    stream key tail st
+                | Ok st -> stream tail st
 
-        and stream key rest st =
+        and stream rest st =
             match st.Head with
             | None ->
-                release key
                 closeOne st
-                openNext key rest
+                openNext rest
             | Some row ->
                 Op.compute (fun () ->
                     match readRow st.Src with
                     | Error e ->
-                        release key
                         closeOne st
                         OpStep.OpError e
                     | Ok None ->
-                        release key
                         closeOne st
-                        OpStep.OpRow(row, openNext key rest)
-                    | Ok(Some head) -> OpStep.OpRow(row, stream key rest { st with Head = Some head }))
+                        OpStep.OpRow(row, openNext rest)
+                    | Ok(Some head) -> OpStep.OpRow(row, stream rest { st with Head = Some head }))
 
         function
         | RowSpool.Memory rows -> ret (Op.ofArray rows)
-        | RowSpool.Disk(paths, _) ->
-            let key = obj ()
-            ret (openNext key paths)
+        | RowSpool.Disk(paths, _) -> ret (openNext paths)
 
     /// 退避した行を先頭から読む Op を作る。
     /// `scope` を渡すと、途中で捨てられても開いたファイルを閉じられる。
@@ -529,6 +563,9 @@ module internal Spill =
                         forget paths
                         err e
                     | Ok last -> ret (RowSpool.Disk(List.rev (last :: paths), written + bufCount))
+                |> Result.map (fun spool ->
+                    registerSpool budget.Scope spool
+                    spool)
             | OpStep.OpRow(row, nxt) ->
                 let size = int64 (ValueCodec.managedRowBytes row) + 32L
 

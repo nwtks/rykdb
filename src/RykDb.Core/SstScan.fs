@@ -245,6 +245,10 @@ type internal ScanScope() =
         | true, resource -> resource.Dispose()
         | _ -> ()
 
+    /// 登録を外すが Dispose はしない。
+    /// 正常終了でファイルを残す（後で使う／呼び出し側が消す）ときに使う。
+    member _.Forget(key: obj) = active.TryRemove key |> ignore
+
     /// 登録されている走査をすべて Dispose する。
     member _.DisposeAll() =
         for entry in active do

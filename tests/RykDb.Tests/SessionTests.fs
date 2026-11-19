@@ -604,6 +604,78 @@ let ``RowReader: SessionOptions の結果上限を適用しない`` () =
         expectErrorKind ErrorKind.CapacityError "Execute には上限が効く" (session.Execute "SELECT id FROM t"))
 
 [<Fact>]
+let ``RowReader: SessionOptions のスピル先と作業上限を使う`` () =
+    withDir "session-reader-spill" (fun dir ->
+        let spillDir = System.IO.Path.Combine(dir, "spill")
+        System.IO.Directory.CreateDirectory spillDir |> ignore
+
+        let options =
+            { SessionOptions.Default with
+                WorkMemBytes = 1L
+                SortBufferBytes = 1L
+                SpillDirectory = Some spillDir
+            }
+
+        let session = ok (Session.OpenWith(dir, options))
+
+        try
+            ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            |> ignore
+
+            ok (session.Execute "INSERT INTO t VALUES (1,10),(2,20),(3,10),(4,30),(5,20)")
+            |> ignore
+
+            match ok (session.TryOpenReader "SELECT DISTINCT v FROM t ORDER BY v") with
+            | None -> Assert.Fail "単一 SELECT が RowReader になりませんでした"
+            | Some reader ->
+                // 演算子の構築時に退避が起きるので、指定したディレクトリに一時ファイルができる。
+                Assert.NotEmpty(System.IO.Directory.GetFiles spillDir)
+                use reader = reader
+                let rows = drainReader reader
+                Assert.Equal<int>(3, rows.Length)
+
+            // 読み切ると一時ファイルは消える。
+            Assert.Empty(System.IO.Directory.GetFiles spillDir)
+        finally
+            session.Close() |> ignore)
+
+[<Fact>]
+let ``RowReader: LIMIT で早期終了しても一時ファイルが残らない`` () =
+    withDir "session-reader-early-exit" (fun dir ->
+        let spillDir = System.IO.Path.Combine(dir, "spill")
+        System.IO.Directory.CreateDirectory spillDir |> ignore
+
+        let options =
+            { SessionOptions.Default with
+                WorkMemBytes = 1L
+                SortBufferBytes = 1L
+                SpillDirectory = Some spillDir
+            }
+
+        let session = ok (Session.OpenWith(dir, options))
+
+        try
+            ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            |> ignore
+
+            ok (session.Execute "INSERT INTO t VALUES (1,10),(2,20),(3,10),(4,30),(5,20)")
+            |> ignore
+
+            match ok (session.TryOpenReader "SELECT DISTINCT v FROM t ORDER BY v LIMIT 1") with
+            | None -> Assert.Fail "単一 SELECT が RowReader になりませんでした"
+            | Some reader ->
+                use reader = reader
+
+                match ok (reader.TryRead()) with
+                | Some _ -> ()
+                | None -> Assert.Fail "先頭行が返りませんでした"
+
+            // Dispose で ScanScope が閉じられ、退避ファイルも消える。
+            Assert.Empty(System.IO.Directory.GetFiles spillDir)
+        finally
+            session.Close() |> ignore)
+
+[<Fact>]
 let ``RowReader: 読み取り中に commit しても開始時 snapshot を見る`` () =
     withDiskSession "session-reader-snapshot" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore

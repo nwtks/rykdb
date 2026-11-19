@@ -708,8 +708,8 @@ module LoadedRow =
     /// `SqlValue.Unloaded` が混ざっていれば `InternalError`。
     let internal create (row: SqlValue array) =
         match SqlValue.ensureLoaded row with
-        | Ok loaded -> Ok(LoadedRow loaded)
-        | Error e -> Error e
+        | Ok loaded -> ret (LoadedRow loaded)
+        | Error e -> err e
 
     /// 内部配列を取り出す（コピーしない）。
     let toArray (LoadedRow row) = row

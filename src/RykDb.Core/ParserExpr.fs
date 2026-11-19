@@ -845,15 +845,15 @@ module internal ParserExpr =
 
             let kindAnswer =
                 if isKeyword "JOIN" st then
-                    Ok(JoinKind.Inner, st)
+                    ret (JoinKind.Inner, st)
                 else
                     match parsedKind with
                     | Some(kind, afterKind) ->
                         if isKeyword "JOIN" afterKind then
-                            Ok(kind, afterKind)
+                            ret (kind, afterKind)
                         else
                             fail "LEFT / INNER の後ろには JOIN が必要です" afterKind
-                    | None -> Ok(JoinKind.Inner, st)
+                    | None -> ret (JoinKind.Inner, st)
 
             match kindAnswer with
             | Error e -> err e

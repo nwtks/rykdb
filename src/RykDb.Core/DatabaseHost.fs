@@ -174,12 +174,12 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
         let outcome, position =
             lock writeGate (fun () ->
                 match snapshot () with
-                | HostLifecycle.Closed _ -> Error(closedError ()), None
+                | HostLifecycle.Closed _ -> err (closedError ()), None
                 | HostLifecycle.Running current ->
                     let outcome, position =
                         match run current with
-                        | Error e -> Error e, current.Store.Engine.WalState
-                        | Ok(next, value) -> Ok value, next.Store.Engine.WalState
+                        | Error e -> err e, current.Store.Engine.WalState
+                        | Ok(next, value) -> ret value, next.Store.Engine.WalState
 
                     position |> Option.iter durability.Register
                     outcome, position)

@@ -827,11 +827,17 @@ module internal Engine =
             ret (ExecContext.withSchema t.Name withIndexes ctx)
 
     let private contextOf (budget: MemoryBudget) (state: ExecState) (txn: Transaction) =
-        let ctx =
+        let baseCtx =
             ExecContext.create state.Store (Snapshot.toVisible txn.Snapshot)
             |> ExecContext.withTransaction txn
             |> ExecContext.withCatalog state.Catalog
-            |> ExecContext.withBudget budget
+
+        let ctx =
+            ExecContext.withBudget
+                { budget with
+                    Scope = Some baseCtx.Scope
+                }
+                baseCtx
 
         state.Catalog.Tables |> foldOk (addTable state) ctx
 
@@ -894,7 +900,7 @@ module internal Engine =
 
     /// SELECT を materialize せずにストリーミング用の Op として開く。
     /// 呼び出し側は返された `Cleanup` を必ず呼び、snapshot 登録と走査を解放する。
-    let openSelect (state: ExecState) (stmt: SelectStatement) =
+    let openSelect (budget: MemoryBudget) (state: ExecState) (stmt: SelectStatement) =
         if state.Active.IsSome then
             err (DbError.internalError "transaction 中の SELECT は RowReader で開けません")
         else
@@ -908,7 +914,7 @@ module internal Engine =
                 }
 
             let run () =
-                match contextOf MemoryBudget.Default startState txn with
+                match contextOf budget startState txn with
                 | Error e ->
                     state.Store.Runtime.Unregister registration
                     err e

@@ -36,23 +36,6 @@ module internal OpsJoin =
         | None -> DbOk true
         | Some p -> Eval.matchesJoinedV resolve lrow rrow p
 
-    /// 結合キーの昇順で外部ソートする。
-    /// 退避したときにマージ結合へ切り替えるために使う。
-    let private sortByKeys (budget: MemoryBudget) (keys: int array) =
-        let cmp (a: SqlValue array) (b: SqlValue array) =
-            let rec go i =
-                if i >= keys.Length then
-                    0
-                else
-                    match SqlValue.compareValuesForSortV a.[keys.[i]] b.[keys.[i]] with
-                    | DbErr _ -> 0
-                    | DbOk 0 -> go (i + 1)
-                    | DbOk c -> c
-
-            go 0
-
-        ExtSort.sortRows budget () (fun () _ -> DbOk()) cmp
-
     /// nested loop 結合の内側ループ（1つの左行 × 右の全行）を回す共通処理。
     /// onExhausted matched は右を最後まで試し終えたときの Op。
     /// onError error matched は ON 句の評価が失敗したときの Op。
@@ -139,6 +122,7 @@ module internal OpsJoin =
     /// 非末尾として報告する（1行ごとに 1段だけ進み、スタックは積み上がらない）。
     /// </remarks>
     let private innerJoinSpilled
+        (budget: MemoryBudget)
         (spool: Spill.RowSpool)
         (leftSchema: Schema)
         (left: Op)
@@ -152,10 +136,11 @@ module internal OpsJoin =
                 match Op.next cur with
                 | OpStep.OpError e -> OpStep.OpError e
                 | OpStep.OpDone ->
+                    Spill.forgetSpool budget.Scope spool
                     Spill.deleteSpool spool
                     OpStep.OpDone
                 | OpStep.OpRow(lrow, lnext) ->
-                    match Spill.reopenKeep None spool with
+                    match Spill.reopenKeep budget.Scope spool with
                     | Error e -> OpStep.OpError e
                     | Ok rows -> Op.next (scan lrow lnext rows))
 
@@ -174,6 +159,7 @@ module internal OpsJoin =
 
     /// 右側を退避したときの LEFT JOIN。
     let private leftJoinSpilled
+        (budget: MemoryBudget)
         (spool: Spill.RowSpool)
         (leftSchema: Schema)
         (left: Op)
@@ -188,10 +174,11 @@ module internal OpsJoin =
                 match Op.next cur with
                 | OpStep.OpError e -> OpStep.OpError e
                 | OpStep.OpDone ->
+                    Spill.forgetSpool budget.Scope spool
                     Spill.deleteSpool spool
                     OpStep.OpDone
                 | OpStep.OpRow(lrow, lnext) ->
-                    match Spill.reopenKeep None spool with
+                    match Spill.reopenKeep budget.Scope spool with
                     | Error e -> OpStep.OpError e
                     | Ok rows -> Op.next (scan lrow lnext rows false))
 
@@ -219,7 +206,7 @@ module internal OpsJoin =
         Spill.spool budget right
         >>= function
             | Spill.RowSpool.Memory rightRows -> ret (innerJoinArrays leftSchema left rightSchema rightRows on)
-            | spool -> ret (innerJoinSpilled spool leftSchema left rightSchema on)
+            | spool -> ret (innerJoinSpilled budget spool leftSchema left rightSchema on)
 
     /// LEFT JOIN。
     /// 左の行に右が 1行も無ければ NULL で埋める。
@@ -228,7 +215,7 @@ module internal OpsJoin =
         Spill.spool budget right
         >>= function
             | Spill.RowSpool.Memory rightRows -> ret (leftJoinArrays leftSchema left rightSchema rightRows on)
-            | spool -> ret (leftJoinSpilled spool leftSchema left rightSchema on)
+            | spool -> ret (leftJoinSpilled budget spool leftSchema left rightSchema on)
 
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
     /// lookupRows は左キーから右の行を返す（空の Op でもよい）。
@@ -328,15 +315,6 @@ module internal OpsJoin =
 
         go
 
-    /// 結合キーで外部ソートし、結果を spool に受ける。
-    /// `ExtSort` の merge Op を読み切るので、一時ファイルはここで消える。
-    let private sortedSpool (budget: MemoryBudget) (keys: int array) (src: Op) =
-        sortByKeys budget keys src >>= Spill.spool budget
-
-    // -----------------------------------------------------------------------
-    // マージ結合
-    // -----------------------------------------------------------------------
-
     /// マージ結合の入力側の状態。
     /// `MergeStart` はまだ 1行も取り出していない入力、`MergeAt` は現在行と続き。
     type private MergeSide =
@@ -387,9 +365,9 @@ module internal OpsJoin =
     let private takeMergeGroup (budget: MemoryBudget) (keys: int array) (side: MergeSide) =
         let sameKey first row =
             match compareKeyVectors 0 keys first keys row with
-            | DbErr e -> Error e
-            | DbOk 0 -> Ok true
-            | DbOk _ -> Ok false
+            | DbErr e -> err e
+            | DbOk 0 -> ret true
+            | DbOk _ -> ret false
 
         let rec fill first buf bufBytes current =
             match pullMergeSide current with
@@ -551,7 +529,7 @@ module internal OpsJoin =
                             | Ok(rgroup, rnext) -> emitGroup lgroup rgroup lnext rnext
 
         and emitGroup lspool rspool lnext rnext =
-            match Spill.reopenKeep None lspool with
+            match Spill.reopenKeep budget.Scope lspool with
             | Error e -> Op.compute (fun () -> OpStep.OpError e)
             | Ok lrows -> nextLeft lspool rspool lnext rnext lrows
 
@@ -560,11 +538,13 @@ module internal OpsJoin =
                 match Op.next lrows with
                 | OpStep.OpError e -> OpStep.OpError e
                 | OpStep.OpDone ->
+                    Spill.forgetSpool budget.Scope lspool
                     Spill.deleteSpool lspool
+                    Spill.forgetSpool budget.Scope rspool
                     Spill.deleteSpool rspool
                     Op.next (loop lnext rnext)
                 | OpStep.OpRow(lrow, lrest) ->
-                    match Spill.reopenKeep None rspool with
+                    match Spill.reopenKeep budget.Scope rspool with
                     | Error e -> OpStep.OpError e
                     | Ok rrows -> Op.next (nextRight lspool rspool lnext rnext lrow lrest rrows false))
 
@@ -585,6 +565,134 @@ module internal OpsJoin =
                         OpStep.OpRow(Array.append lrow rrow, nextRight lspool rspool lnext rnext lrow lrest rrest true))
 
         loop (MergeStart left) (MergeStart right)
+
+    /// ハッシュ結合の外部版。
+    /// 両側を結合キーのハッシュで `Spill.Partitions` 本に分割し、
+    /// 各パーティションの右をハッシュ表にして左を probe する。
+    /// 1パーティションがまだ上限を超える場合は salt を変えて再分割し、
+    /// 深さ上限に達したらそのパーティションだけマージ結合へフォールバックする。
+    /// <remarks>
+    /// 出力順はパーティション順（SQL は ORDER BY が無い限り順序を保証しない）。
+    /// 一時ファイルは `Spill.registerSpool` でクエリの ScanScope に登録されるので、
+    /// 早期終了・エラーでも `DisposeAll` が消す。
+    /// `joinWork` は明示スタックで 1パーティションずつ処理し、すべての再帰が末尾位置
+    /// （TailAudit のベースライン不要）。再分割の深さは `maxDepth` で有界。
+    /// </remarks>
+    let private hashJoinPartitioned
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (leftSchema: Schema)
+        (left: Op)
+        (leftKeys: int array)
+        (rightSchema: Schema)
+        (right: Op)
+        (rightKeys: int array)
+        (residual: Expr option)
+        =
+        let stamp = System.Guid.NewGuid().ToString "N"
+        let spools = System.Collections.Generic.List<Spill.RowSpool>()
+        let maxDepth = 4
+
+        let keyBytes keys row =
+            ValueCodec.writeValues (keyOf row keys) Writer.Empty
+            |> Result.map Writer.toArray
+
+        let register spool =
+            Spill.registerSpool budget.Scope spool
+            spools.Add spool
+            spool
+
+        let partitionSide serial keys src =
+            match Spill.openPartitions budget.Directory stamp serial Spill.Partitions with
+            | Error e -> err e
+            | Ok writer ->
+                match Spill.fillPartitions writer (keyBytes keys) (fun _ row -> row) 0L src with
+                | Error e ->
+                    writer.Abandon()
+                    err e
+                | Ok _ ->
+                    writer.Close()
+
+                    writer.Paths
+                    |> Array.map (fun p -> register (Spill.RowSpool.Disk([ p ], 0)))
+                    |> ret
+
+        let repartitionOne salt side keys =
+            function
+            | Spill.RowSpool.Memory rows -> ret [| Spill.RowSpool.Memory rows |]
+            | Spill.RowSpool.Disk([ path ], _) ->
+                let callStamp = System.Guid.NewGuid().ToString "N"
+
+                Spill.repartitionRun
+                    budget.Directory
+                    (sprintf "%s-%s-%s" stamp side callStamp)
+                    0
+                    Spill.Partitions
+                    salt
+                    (keyBytes keys)
+                    path
+                |> Result.map (List.map (fun p -> register (Spill.RowSpool.Disk([ p ], 0))) >> Array.ofList)
+            | Spill.RowSpool.Disk _ -> err (DbError.internalError "hash join: パーティションが複数の run です")
+
+        let rec joinWork acc =
+            function
+            | [] -> ret (List.foldBack Op.append (List.rev acc) Op.Empty)
+            | (depth, salt, lspool, rspool) :: rest ->
+                match Spill.reopenKeep budget.Scope rspool >>= Spill.spool budget with
+                | Error e -> err e
+                | Ok(Spill.RowSpool.Memory rightRows) ->
+                    let table = buildHashTable rightRows rightKeys
+
+                    match Spill.reopenKeep budget.Scope lspool with
+                    | Error e -> err e
+                    | Ok l ->
+                        let op =
+                            joinProbe isLeft leftSchema l leftKeys rightSchema residual (lookupHash table)
+
+                        joinWork (op :: acc) rest
+                | Ok rightSpool when depth < maxDepth ->
+                    Spill.forgetSpool budget.Scope rightSpool
+                    Spill.deleteSpool rightSpool
+
+                    match repartitionOne salt "l" leftKeys lspool with
+                    | Error e -> err e
+                    | Ok lparts ->
+                        match repartitionOne salt "r" rightKeys rspool with
+                        | Error e -> err e
+                        | Ok rparts ->
+                            let next =
+                                Array.map2 (fun l r -> depth + 1, salt + 1UL, l, r) lparts rparts
+                                |> Array.toList
+
+                            joinWork acc (next @ rest)
+                | Ok rightSpool ->
+                    Spill.forgetSpool budget.Scope rightSpool
+                    Spill.deleteSpool rightSpool
+
+                    match Spill.reopenKeep budget.Scope lspool with
+                    | Error e -> err e
+                    | Ok l ->
+                        match Spill.reopenKeep budget.Scope rspool with
+                        | Error e -> err e
+                        | Ok r ->
+                            let op =
+                                mergeJoinWith isLeft budget leftSchema l leftKeys rightSchema r rightKeys residual
+
+                            joinWork (op :: acc) rest
+
+        partitionSide 0 leftKeys left
+        >>= fun lparts ->
+            partitionSide Spill.Partitions rightKeys right
+            >>= fun rparts ->
+                let work = Array.map2 (fun l r -> 0, 0UL, l, r) lparts rparts |> Array.toList
+
+                joinWork [] work
+                |> Result.map (
+                    onExhausted (fun () ->
+                        for sp in spools do
+                            Spill.forgetSpool budget.Scope sp
+                            Spill.deleteSpool sp)
+                )
 
     /// INNER JOIN（マージ結合）。両入力は結合キーで昇順であること。
     let innerJoinMerge
@@ -629,24 +737,9 @@ module internal OpsJoin =
                 let table = buildHashTable rightRows rightKeys
                 ret (joinProbe false leftSchema left leftKeys rightSchema residual (lookupHash table))
             | spool ->
-                // ハッシュ表が上限に収まらない。
-                // 両側を結合キーで外部ソートし、マージ結合で 1行ずつ流す（結果は同じ）。
-                // 右側は spool（入力は one-shot なので読み直さない）から読む。
-                Spill.reopen None spool
-                >>= sortedSpool budget rightKeys
-                >>= fun rightSpool ->
-                    sortedSpool budget leftKeys left
-                    >>= fun leftSpool ->
-                        Spill.reopenKeep None leftSpool
-                        >>= fun l ->
-                            Spill.reopenKeep None rightSpool
-                            >>= fun r ->
-                                ret (mergeJoinWith false budget leftSchema l leftKeys rightSchema r rightKeys residual)
-                        |> Result.map (
-                            onExhausted (fun () ->
-                                Spill.deleteSpool leftSpool
-                                Spill.deleteSpool rightSpool)
-                        )
+                Spill.reopen budget.Scope spool
+                >>= fun rightRows ->
+                    hashJoinPartitioned false budget leftSchema left leftKeys rightSchema rightRows rightKeys residual
 
     /// LEFT JOIN（ハッシュ結合）。
     let leftJoinHash
@@ -665,21 +758,9 @@ module internal OpsJoin =
                 let table = buildHashTable rightRows rightKeys
                 ret (joinProbe true leftSchema left leftKeys rightSchema residual (lookupHash table))
             | spool ->
-                Spill.reopen None spool
-                >>= sortedSpool budget rightKeys
-                >>= fun rightSpool ->
-                    sortedSpool budget leftKeys left
-                    >>= fun leftSpool ->
-                        Spill.reopenKeep None leftSpool
-                        >>= fun l ->
-                            Spill.reopenKeep None rightSpool
-                            >>= fun r ->
-                                ret (mergeJoinWith true budget leftSchema l leftKeys rightSchema r rightKeys residual)
-                        |> Result.map (
-                            onExhausted (fun () ->
-                                Spill.deleteSpool leftSpool
-                                Spill.deleteSpool rightSpool)
-                        )
+                Spill.reopen budget.Scope spool
+                >>= fun rightRows ->
+                    hashJoinPartitioned true budget leftSchema left leftKeys rightSchema rightRows rightKeys residual
 
     /// INNER JOIN（インデックス入れ子ループ）。
     /// 索引検索の結果は materialize せず 1行ずつ流す。

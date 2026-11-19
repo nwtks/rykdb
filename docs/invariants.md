@@ -561,11 +561,18 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - 読み取りは 4種類だけ: `foldRun`（閉じて消す）/ `foldRunKeep`（閉じるだけ）/
     `reopen`（消す）/ `reopenKeep`（消さない）。
   - 分割のやり直しは `repartitionRun` が元の run を消す。
+  - 開いた run と退避した spool は `MemoryBudget.Scope`（`ExecContext.Scope`）に登録し、
+    `LIMIT` や `RowReader.Dispose` の早期終了で `DisposeAll()` が閉じて消す。
+    通常終了では `ScanScope.Forget` で登録を外してから明示的に消す。
   - 途中打ち切りで残ったものは `Spill.sweepStale` が 24時間後に回収する。
 - 回帰テスト:
   - `Spill.spool: 上限を超えると退避し、reopen で同じ順序で読める`
   - `Spill.spool: reopenKeep は何度でも読める`
   - `Spill.foldRun: 終端でファイルを消す`
+  - `Spill.openRun: 破損した run は CorruptionError`
+  - `Spill.spool: 存在しないディレクトリは IoError`
+  - `Spill.reopen: ScanScope の早期終了でファイルを消す`
+  - `RowReader: LIMIT で早期終了しても一時ファイルが残らない`
   - `distinct: 上限を超えて退避しても結果と順序が変わらない`
   - `集約: 上限を超えて退避しても結果と順序が変わらない`
   - `結合: 入れ子ループは右を退避しても結果が変わらない`

@@ -154,30 +154,30 @@ module internal Ops =
 
                 let addOne struct (best, bestRow) (f: SqlValue array) =
                     match f.[0] with
-                    | SqlValue.Blob _ -> Ok struct (System.Int64.MinValue, [||])
+                    | SqlValue.Blob _ -> ret struct (System.Int64.MinValue, [||])
                     | SqlValue.Int s ->
                         let r = Array.sub f 1 (f.Length - 1)
 
                         if s < best then
-                            Ok struct (s, r)
+                            ret struct (s, r)
                         else
-                            Ok struct (best, bestRow)
-                    | _ -> Error(DbError.internalError "DISTINCT の退避行が不正です")
+                            ret struct (best, bestRow)
+                    | _ -> err (DbError.internalError "DISTINCT の退避行が不正です")
 
                 let stateBytes struct (_, r) =
                     int64 (ValueCodec.managedRowBytes r) + 64L
 
                 let emitOne struct (best, r) =
                     if best = System.Int64.MinValue then
-                        Ok None
+                        ret None
                     else
-                        Ok(Some(Array.append [| SqlValue.Int best |] r))
+                        ret (Some(Array.append [| SqlValue.Int best |] r))
 
                 let markers =
                     (ret (), seen)
                     ||> Seq.fold (fun acc k ->
                         match acc with
-                        | Error e -> Error e
+                        | Error e -> err e
                         | Ok() -> marker k)
 
                 let written =
@@ -610,12 +610,12 @@ module internal Ops =
                         let r = Array.sub f 1 (f.Length - 1)
 
                         match keyOfRow r with
-                        | DbErr e -> Error e
+                        | DbErr e -> err e
                         | DbOk k ->
                             match addToBucket accs r with
-                            | DbErr e -> Error e
-                            | DbOk next -> Ok struct (k, next, min first s)
-                    | _ -> Error(DbError.internalError "GROUP BY の退避行が不正です")
+                            | DbErr e -> err e
+                            | DbOk next -> ret struct (k, next, min first s)
+                    | _ -> err (DbError.internalError "GROUP BY の退避行が不正です")
 
                 let stateBytes struct (key, accs, _) = bucketBytes key accs
 
@@ -624,7 +624,7 @@ module internal Ops =
                         [| SqlValue.Int first |]
                         (Array.append key (accs |> List.map finishAcc |> List.toArray))
                     |> Some
-                    |> Ok
+                    |> ret
 
                 let written = Spill.fillPartitions writer keyOf frame seq (Op.emit row rest)
 

@@ -135,3 +135,59 @@ let ``Spill.spool: 列マスクの Unloaded も往復する`` () =
         )
 
         assertNoLeftovers dir)
+
+[<Fact>]
+let ``Spill.openRun: 破損した run は CorruptionError`` () =
+    withDir "spill-corrupt" (fun dir ->
+        // 0xFF が続く varint は 63 シフトを超えるので CorruptionError になる。
+        let path = Spill.runPath (Some dir) "corrupt" 0
+        System.IO.File.WriteAllBytes(path, Array.create 16 0xFFuy)
+
+        expectErrorKind ErrorKind.CorruptionError "壊れた run が CorruptionError になりません" (Spill.openRun path)
+
+        // 破損を検出した時点でファイルは消える（開き直しても残骸が無い）。
+        Assert.Empty(System.IO.Directory.GetFiles dir))
+
+[<Fact>]
+let ``Spill.spool: 存在しないディレクトリは IoError`` () =
+    let missing =
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), sprintf "rykdb-missing-%d" System.DateTime.Now.Ticks)
+
+    let budget =
+        { MemoryBudget.Default with
+            Work = 1L
+            Directory = Some missing
+        }
+
+    expectErrorKind
+        ErrorKind.IoError
+        "存在しない退避先が IoError になりません"
+        (Spill.spool budget (Op.ofArray (rowsOf [ 1; 2; 3 ] |> Array.ofList)))
+
+[<Fact>]
+let ``Spill.reopen: ScanScope の早期終了でファイルを消す`` () =
+    withDir "spill-early-exit" (fun dir ->
+        let scope = ScanScope()
+
+        let budget =
+            { tightBudget dir 1L with
+                Scope = Some scope
+            }
+
+        let spool = ok (Spill.spool budget (Op.ofArray (rowsOf [ 1..20 ] |> Array.ofList)))
+        Assert.True(Spill.isSpilled spool)
+        Assert.NotEmpty(System.IO.Directory.GetFiles dir)
+
+        // 先頭 1行だけ読んで打ち切る（LIMIT 相当）。
+        let op = ok (Spill.reopen budget.Scope spool)
+
+        match Op.next op with
+        | OpStep.OpRow(row, _) -> Assert.Equal<int64>(1L, asInt row.[0])
+        | other -> Assert.Fail(sprintf "先頭行が返りませんでした: %A" other)
+
+        // 通常の終端には到達していないので、ここではまだファイルが残る。
+        Assert.NotEmpty(System.IO.Directory.GetFiles dir)
+
+        // Engine の DisposeAll 相当: 開いた run を閉じて消す。
+        scope.DisposeAll()
+        assertNoLeftovers dir)

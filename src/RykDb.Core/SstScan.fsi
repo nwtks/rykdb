@@ -33,6 +33,7 @@ type internal ScanScope =
     new: unit -> ScanScope
     member Register: key: obj * resource: System.IDisposable -> unit
     member Release: key: obj -> unit
+    member Forget: key: obj -> unit
     member DisposeAll: unit -> unit
     member internal ActiveCount: int
 
