@@ -37,7 +37,7 @@ dotnet test -p:CollectCoverage=true -p:Threshold=90 -p:ThresholdType=line -p:Thr
 （`Directory.Build.props` の `DisableImplicitLibraryPacksFolder`）。
 同じバージョン番号でも SDK のビルドごとに中身が異なり、
 `--locked-mode` が NU1403（contentHash 不一致）で落ちるため
-（[`gotchas.md`](gotchas.md) §9.10）。
+（[`gotchas.md`](gotchas.md) §9.15）。
 lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>/` を消してから
 `dotnet restore --force-evaluate` を実行する。
 
@@ -51,10 +51,10 @@ lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>
 | Core の命令型構文・機能 | ロジック層は `mutable` / `while` / `ref` なし。例外は `Session.fs` / `DatabaseHost.fs` の状態 DU スロット、`ValueSet.IndexedValues` の reader / 1ブロックキャッシュ、`BloomFilter.BloomBuilder` の件数カウンタ（いずれもクエリ・構築の寿命） |
 
 > **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
-> （[`gotchas.md`](gotchas.md) §10.4）。
+> （[`gotchas.md`](gotchas.md) §10.9）。
 
 > **dotnet build / dotnet test を並行して実行しない**
-> （並行実行時に発生する見かけ上のエラーについては [`gotchas.md`](gotchas.md) §9.4 を参照）。
+> （並行実行時に発生する見かけ上のエラーについては [`gotchas.md`](gotchas.md) §9.13 を参照）。
 
 ## 2. tail call 監査
 
@@ -81,7 +81,7 @@ lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>
 `[<TailCall>]` は構文上の検査にすぎない。
 `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` により Debug でも実際の `tail.` を出力する。
 この設定を外すと CPS（Plan のサブクエリ解決）や式の再帰がテストでスタックオーバーフローする
-（[`gotchas.md`](gotchas.md) §8.16）。
+（[`gotchas.md`](gotchas.md) §9.9）。
 式・サブクエリに深さ上限はない（[`coding-conventions.md`](coding-conventions.md) §3）。
 
 ## 3. テスト構成
@@ -199,7 +199,7 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
 - **割当の見方**: `EvalBenchmarks` の `Allocated` は `Result` の `Ok` を反映しない。
   Release の JIT が式評価の `Ok` をスタック割当・除去するためで、`DbResult` 化の前後でも 592B のまま。
   `Result` の割当を見るのは `OpBenchmarks` とクエリ系（`CountStar` / `FilterSeqScan` / JOIN）。
-  `gotchas.md` §11.75 に実測値を置いている。
+  [`gotchas.md`](gotchas.md) §7.10 に実測値を置いている。
 - **性能スモーク（10,000行 INSERT → 500回の point lookup → `COUNT(*)`）はベンチで確認する**。
   実時間の上限で落とすテストは置かない（マシン依存のため。回帰はベンチの前後比較で見る）。
 - クエリ系は `Session.OpenWithSync`（同期 compaction）で開き、
@@ -214,6 +214,6 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
 - [ ] `dotnet test` が全緑（逐次実行）
 - [ ] `dotnet run --project tools/TailAudit` が exit 0（新規の非末尾再帰なし。追認は内容確認のうえ `-- --update`）
 - [ ] 不変条件を追加・変更したら [`invariants.md`](invariants.md) と対応するテストを更新
-- [ ] 構築に不変条件がある型は `.fsi` で表現を隠したか（`[<Struct>]` レコードは不可。[`gotchas.md`](gotchas.md) §8.21）
+- [ ] 構築に不変条件がある型は `.fsi` で表現を隠したか（`[<Struct>]` レコードは不可。[`gotchas.md`](gotchas.md) §9.11）
 - [ ] 性能に影響する変更は `tools/RykDb.Bench` で前後を測ったか（測れない場合は理由を記録）
 - [ ] `docs/gotchas.md` に**同じ原因の再発**があれば追記

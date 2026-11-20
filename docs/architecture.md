@@ -690,7 +690,7 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
   `OpsJoin.innerJoinIndexed` / `OpsJoin.leftJoinIndexed`（インデックス）へ振り分ける
   （ON は左行 + 右行で評価）。
   結合順を並べ替えると「入力スキーマから右テーブルを除いた列順」と実際の行の並びが一致しないため、
-  列位置で行を読む `OpsJoin` へは必ず実際のレイアウトを渡す（gotchas §11.67）。
+  列位置で行を読む `OpsJoin` へは必ず実際のレイアウトを渡す（[`gotchas.md`](gotchas.md) §3.2）。
 - `Filter` / `Sort` / `Project` は子の**出力スキーマ**（`outputOf`）を求めてから掛ける。
   集約の後は行の並びが「groupBy の値 + 各集約の結果」に変わるため、
   「入力スキーマ（テーブル定義）」と取り違えると `SELECT SUM(age)` が引数を評価できず `NULL` になる。
@@ -1670,7 +1670,7 @@ L1〜 … 1ファイル = 1キー域で互いに重ならない（RocksDB/LevelD
 途中で読み取り・書き込みエラーになると、それまでに作った出力ファイルは
 `Compaction.compactWith` 内の `pump` が `deleteOutputs` で削除する。
 プロセスがクラッシュした場合などに残った出力だけが MANIFEST に載らず、
-次回オープン時に孤児として `.orphans/` へ退避される（gotchas §11.13）。
+次回オープン時に孤児として `.orphans/` へ退避される（[`gotchas.md`](gotchas.md) §4.10）。
 
 GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判定は**しない**
 （snapshot S の読み手は `SeqNo <= S` の版を見るので、**SeqNo が小さい版こそ**まだ読まれ得る）。
@@ -1700,7 +1700,7 @@ MANIFEST の読み落としで消してしまう事故を避けるため）。
 `maybeFlush` は flush 成功後に compaction が失敗しても flush 後の engine を返し、
 診断を `DbError option` として一緒に返す（次回の flush 時に再試行される）。
 WAL への書き込みが成功した時点で commit は成立しているため、ここで `Error` を返してはならない
-（呼び出し側が SeqNo を再利用し得る。gotchas §11.51）。
+（呼び出し側が SeqNo を再利用し得る。[`gotchas.md`](gotchas.md) §5.1）。
 
 ### 8.7 background compaction
 
@@ -1747,7 +1747,7 @@ L0 が増えて読み取りのコスト（read amplification）と引き換え�
   （境界を戻さないと同じ判定で破棄し続ける）。
 - worker の起動はカタログ読込と DROP 後始末の後（`RowStore.startBackground`）。
   先に動かすとリカバリの走査中に入力ファイルが消え得る。
-- flush / compaction の失敗は commit を失敗させない（§9.2 / gotchas §11.51）。
+- flush / compaction の失敗は commit を失敗させない（§9.2 / [`gotchas.md`](gotchas.md) §4.15）。
 - close は cancel → worker 起床（無条件 signal）→ worker join → engine refresh → flush → WAL fsync → WAL 削除 → ProcessLock 解放の順。
   出力ファイル境界で `shouldStop` を確認するため、進行中の merge は途中で止められる。
 - クラッシュ復旧の不変条件は同期版と同じ
@@ -1803,7 +1803,7 @@ SQL 文字列
    `Session.OpenWith` では flush 後に `VersionCoordinator.Signal` で background worker を起こし、
    internal の `Session.OpenWithSync` では `maybeFlush` が同期的に `compactOnce` を呼ぶ。
    flush / compaction の失敗は commit を失敗させない
-   （memtable を残して次回再試行するか、flush 後の engine と一緒に compaction の失敗を返す。gotchas §11.51）
+   （memtable を残して次回再試行するか、flush 後の engine と一緒に compaction の失敗を返す。[`gotchas.md`](gotchas.md) §4.15）
 ```
 
 flush / compact は `RowStore` が `WriteBatch` 後に `IStorageEngine.MaybeFlush` を呼んで実行する
@@ -1855,7 +1855,7 @@ fsync を省くと、再起動後にデータが読めなくなる。
 ```
 <root>/
 ├── .rykdb.format            ← レイアウトのマーカー（プロセス間ロックを兼ねる、§7.9）
-├── .drop-cleanup            ← 未完了 DROP の後始末対象（gotchas §11.10）
+├── .drop-cleanup            ← 未完了 DROP の後始末対象（[`gotchas.md`](gotchas.md) §6.6）
 ├── MANIFEST-000001          ← VersionSet の変更履歴（DB 全体）
 ├── CURRENT                  ← 有効な MANIFEST 番号（1行）
 ├── 000002.wal               ← 先行ログ（全 keyspace を含む）

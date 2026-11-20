@@ -122,7 +122,7 @@ Core では `ResizeArray` を使わない。
 `OpsJoin.innerJoinHash` / `leftJoinHash` のハッシュ表）は
 **演算子の構築時に作り、返した `Op` の中だけで使う**。
 モジュールスコープに置くと 2回目以降の実行が壊れる
-（DISTINCT で実際に踏んだ。gotchas §2.6）。
+（DISTINCT で実際に踏んだ。[`gotchas.md`](gotchas.md) §2.6）。
 回帰テスト: `SqlReference: DISTINCT を続けて実行しても毎回全行が返る` /
 `SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎回同じ結果になる`。
 
@@ -226,11 +226,11 @@ JIT は `tail.` を尊重する。
     `Eval.evalWith` のような公開境界のラッパーだけが `Result` に戻す
     （`Eval.matchesWithV` / `Eval.matchesJoinedV` は `DbResult` のまま返す）。
     `Result` の `Ok` は参照 DU なので、行ごとの評価で確保しない
-    （[`gotchas.md`](gotchas.md) §11.75）。
+    （[`gotchas.md`](gotchas.md) §7.10）。
   - pull 層も同じ考え方で、`Op.next` は `[<Struct>] OpStep`（`OpDone` / `OpError` / `OpRow`）を返す。
     `Op.map` / `Op.filter` のコールバックは `DbResult` を返す。
     **`Op.emit` は第 2 引数を即時評価する**ので、行ループの継続を `Op.emit` で繋がない
-    （`Op.compute (fun () -> OpStep.OpRow(row, next))` で遅延する。§11.75 の StackOverflow 例）。
+    （`Op.compute (fun () -> OpStep.OpRow(row, next))` で遅延する。[`gotchas.md`](gotchas.md) §7.10）。
   - `Optimizer.exec` も同じ方式。
     論理木の評価を `ExecFrame`（継続）と `ExecStep`（`EvalNode` / `ApplyOp`）に分け、
     `run` の自己再帰だけにまとめる（`[<TailCall>]` 付き）。
@@ -253,7 +253,7 @@ JIT は `tail.` を尊重する。
 
 `key` / `base` / `begin` / `new` / `old` / `type` / `value` は F# の予約語で、
 匿名レコードのフィールド名にも使えない。
-衝突例と回避策は [`gotchas.md`](gotchas.md) §8.10 を参照。
+衝突例と回避策は [`gotchas.md`](gotchas.md) §9.5 を参照。
 
 ## 5. クロスプラットフォームにする
 

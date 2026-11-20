@@ -1159,8 +1159,7 @@ let ``SqlReference: DISTINCT を続けて実行しても毎回全行が返る`` 
 [<Fact>]
 let ``SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎回同じ結果になる`` () =
     // 演算子の作業用コレクション（グループ表・ハッシュ表）は Op の構築時に作り、
-    // 返した Op の外へ持ち出さない。モジュールスコープに置くと 2回目以降が壊れる
-    // （DISTINCT で実際に踏んだ。gotchas §2.6）。
+    // 返した Op の外へ持ち出さない。モジュールスコープに置くと 2回目以降が壊れる。
     withSession "sel7c" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
         let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY, h INTEGER)"

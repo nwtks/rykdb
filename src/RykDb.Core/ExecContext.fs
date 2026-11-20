@@ -303,8 +303,8 @@ module internal DmlOps =
 
     /// 省略された列を埋める既定値の並び。
     /// 値が指定された列の位置は `assembleRow` が上書きするので NULL を置く。
-    /// 指定された列の DEFAULT を評価しないのは、壊れた DEFAULT を持つ列へ明示値を入れる
-    /// ときにエラーにしないため（gotchas §11.21）。
+    /// 指定された列の DEFAULT を評価しないのは、壊れた DEFAULT を持つ列へ明示値を入れるときに
+    /// エラーにしないため。
     let private defaultValuesOf (schema: TableSchema) (supplied: Set<int>) =
         schema.Columns
         |> List.mapi (fun i _ ->

@@ -1,2815 +1,719 @@
 # 開発で踏んだ落とし穴
 
-このプロジェクトで**実際に発生し、修正した**バグと、その原因・対策をまとめたもの。
-「設計の意図」ではなく「間違えると何が壊れるか」を軸にした記録。
-
----
+この文書は、RykDb の実装で実際に発生したバグと、その再発防止策を簡潔にまとめたもの。
+設計は [`architecture.md`](architecture.md)、不変条件は [`invariants.md`](invariants.md)、コーディング規約は [`coding-conventions.md`](coding-conventions.md) を参照する。
 
 ## 目次
 
-1. [特に注意が必要な 5つのカテゴリ](#1-特に注意が必要な-5つのカテゴリ)
-2. [pull 演算子（`Op`）の罠](#2-pull-演算子op-の罠)
-3. [`Optimizer.exec` の罠](#3-optimizer-exec-の罠)
-4. [LSM / ストレージの罠](#4-lsm--ストレージの罠)
-5. [MVCC / トランザクションの罠](#5-mvcc--トランザクションの罠)
-6. [索引（index）の罠](#6-索引index-の罠)
-7. [SQL 意味論の罠](#7-sql-意味論の罠)
-8. [F# 10 の言語の罠](#8-f-10-の言語の罠)
-9. [テスト・ビルドの罠](#9-テスト・ビルドの罠)
-10. [デバッグ手法](#10-デバッグ手法)
-11. [設計上の注意点](#11-設計上の注意点)
+1. [基本原則](#1-基本原則)
+2. [Pull 演算子と再帰](#2-pull-演算子と再帰)
+3. [計画・実行・スキーマ](#3-計画実行スキーマ)
+4. [LSM・WAL・MANIFEST](#4-lsmwalmanifest)
+5. [MVCC・transaction](#5-mvcctransaction)
+6. [索引・結合・クエリ意味論](#6-索引結合クエリ意味論)
+7. [メモリ・退避・列読み込み](#7-メモリ退避列読み込み)
+8. [並行実行・接続・通信](#8-並行実行接続通信)
+9. [F# とビルド](#9-f-とビルド)
+10. [テストとデバッグ](#10-テストとデバッグ)
+11. [実装時チェックリスト](#11-実装時チェックリスト)
 
 ---
 
-## 1. 特に注意が必要な 5つのカテゴリ
+## 1. 基本原則
 
-| #   | 分類                        | 症状                                                 | 原因                                                            |
-| --- | --------------------------- | ---------------------------------------------------- | --------------------------------------------------------------- |
-| 1   | **スタックオーバーフロー**  | テストプロセスが `SIGABRT`（exit 134）で異常終了する | `>>=` チェーンで組んだ末尾再帰                                  |
-| 2   | **pull 演算子の継続飛ばし** | 射影が最初の 1行だけ / JOIN の 2行目以降が消える     | 継続に「次の行」ではなく「次のループ」を渡した                  |
-| 3   | **SeqNo の取り違え**        | tombstone が消える / reopen 後 0行                   | put と delete で同じ SeqNo、または reopen で SeqNo を再開しない |
-| 4   | **O(n) な操作の混入**       | ポイント検索 43ms                                    | `rangeScan` をポイント検索に使った                              |
-| 5   | **F# の型推論の破綻**       | 謎の FS0001 / FS0072                                 | 引数の型注釈・スコープ                                          |
+以下を守ると、多くの落とし穴を事前に防げる。
+
+- 履歴がある処理は、実際のトラブルの再現テストから作る。
+- 失敗は例外ではなく `Result<'T, DbError>` またはホットパス用の `DbResult<'T>` で返す。
+- 同じループ・再帰・スキーマ解決を複数箇所に実装しない。
+- 可変な操作用コレクションは、演算子やクエリごとに作り、モジュールスコープやクエリ間で共有しない。
+- 配列・キー・行を内部に保持する側は所有権を取り込むため複製する。
+- クエリの状態は値として進める。ロジック層に無制限の可変キャッシュを持たない。
+- 複数の長大な走査は末尾再帰か CPSで、フレームが要素数や深さに比例しない形にする。
+- commit point は WAL の commit 到達時。後続の flush / compaction の失敗で成功済み commit を巻き戻さない。
+- 破損・不足・不整合は黙って空結果や既定値にせず、`DbError` を返す。
+- 変更後はビルド、テスト、TailAudit を単独実行し、必要なら性能ベンチを測る。
 
 ---
 
-## 2. pull 演算子（`Op`）の罠
+## 2. Pull 演算子と再帰
 
-`Op.fs` の `Op` は、「残りの計算」を値として持ち回る不変な pull 演算子
-（Volcano 方式 / イテレータモデル）。
+### 2.1 `Op.Step` は遅延ではない
 
-```fsharp
-type Op =
-    | Done
-    | Step    of SqlValue array * Op   // 遅延しない
-    | Compute of (unit -> OpStep)      // 遅延する
-
-and OpStep =
-    | OpDone
-    | OpError of DbError
-    | OpRow   of SqlValue array * Op
-```
-
-### 2.1 `Step` は遅延ではない（最重要）
-
-`Step(row, nextOp)` の **`nextOp` は「次の行の値を返す」のではなく「継続を表す値」**。
-F# は評価が厳しいので `Step(f x, g y)` と書くと **`g y` が先に計算される**。
+`Op.Step(row, nextOp)` の第2引数は「次の行を生成する関数」ではなく、すでに計算された継続。
+厳格評価なので、再帰で次の継続を第2引数に直接渡すと、全行ぶんの連鎖を構築するか無限再帰になる。
 
 ```fsharp
-// ❌ 無限再帰になる（Step は遅延ではない）
+// 非推奨
 let rec loop () = Op.Step(row, loop ())
 
-// ✅ 遅延が必要なら Compute
-let rec loop () = Op.Compute(fun () -> ...)
+// 正しい
+let rec loop () =
+    Op.Compute(fun () -> OpStep.OpRow(row, loop ()))
 ```
 
-**`Step` は「有限の既知の連鎖」専用**。
-無限系列は `Compute` で組む。
+有限の既知の連鎖には `Step` を使い、それ以外は `Compute` を使う。
 
-有限の連鎖でも、**再帰を第 2引数（または `let rest = ...`）に渡すとコンストラクト時に「深さ = 要素数」のスタック**を積む。
+### 2.2 継続を別ループへ変更しない
 
-```fsharp
-// ❌ コンストラクト時に全行ぶんのスタックを積む（行数比例で Stack overflow）
-let rec go (i: int) : Op =
-    if i >= rows.Length then Done
-    else
-        let rest = go (i + 1)      // ← これが先に評価される
-        Step(rows.[i], rest)
+filter・map・join は、継続を「今のループの残り」に進める。述語を通した後に元の継続を捨て、別のループを作り直すと、行が重複・欠落する。
+JOIN では、結合済みの左行に対する「次の右行」を、元の右走査ではなく現在の結合ループへ渡す。
 
-// ✅ Compute で「次を要求されてから 1行だけ」作る
-let rec go (i: int) : Op =
-    if i >= rows.Length then Done
-    else Compute(fun () -> OpStep.OpRow(rows.[i], go (i + 1)))
-```
+### 2.3 `>>=` に再帰を載せない
 
-### 2.2 継続を「別ループ」に飛ばすと結果が落ちる
+`let rec go ... = next cur >>= fun ... -> go ...` は、フレームを要素数ぶん積む。末尾再帰の形に直す。
 
 ```fsharp
-// ❌ filter が効かない（偽の行がそのまま流れ落ちる）
-let rec go (src: Op) : Op =
-    Compute(fun () ->
-        next src
-        >>= function
-        | Some(row, nxt) -> ret (Some(row, go nxt))   // ← ここが `nxt`
-        | None -> ret None)
-```
-
-`go nxt` は「**まだ述語を通していない**残り」を表すので、正しくは `nxt` をそのまま渡す。
-`go nxt` にすると「述語を通した列」と「通していない列」が交互に出る。
-
-**同じ罠は `Op.map` / `innerJoin` / `leftJoin` にもあった**。
-
-```fsharp
-// ❌ 内側ループの 2行目以降が消える（JOIN で 3行あるはずが 2行になる）
-| DbOk true -> OpStep.OpRow(Array.append lrow rrow, go lnext)
-// ✅ 同じ左行の「次の右行」へ続ける
-| DbOk true -> OpStep.OpRow(Array.append lrow rrow, inner rest lrow lnext)
-```
-
-教訓: **「継続」は必ず「今の位置の残り」を表す。ループを作り直さない**。
-
-### 2.3 `Op.toArray` に `>>=` チェーンを使うとスタックオーバーフロー
-
-```fsharp
-// ❌ 10万行で SIGABRT
-let rec go (cur: Op) (acc: SqlValue array list) =
-    next cur
-    >>= function
-    | None -> ret (List.rev acc |> List.toArray)
-    | Some(row, nxt) -> go nxt (row :: acc)
-```
-
-`>>=` が F# の末尾呼び出し最適化を**妨げる**ため、フレームが 1行ずつ増える。
-`Array.take` で最後に `List.rev` する形は **O(n²)** でもある。
-
-```fsharp
-// ✅ 末尾位置の match + let rec。フレームが増えない。
-let rec go (cur: Op) : Result<SqlValue array array, DbError> =
+let rec go cur =
     match Op.next cur with
-    | OpStep.OpError e -> err e
-    | OpStep.OpDone -> ret (rows.ToArray())
-    | OpStep.OpRow(row, nxt) ->
-        rows.Add row
-        go nxt
+    | OpError e -> err e
+    | OpDone -> ret result
+    | OpRow(row, next) ->
+        add row
+        go next
 ```
 
-教訓: **「再帰 + `>>=`」組み合わせは使わない**。**`match` を書いて末尾位置を保つ**。
+再帰の末尾呼び出しに処理を残さない。`Result.map`・`>>=` の引数やレシーバ内で自己再帰しない。
 
-### 2.4 `Ops.distinct` は「直前の値」比較では書けない
+### 2.4 `DISTINCT`・集約・ハッシュ結合はクエリごとに作る
 
-`2, 1, 2` の 3つ目の `2` は直前の `1` と違うため、直前との比較では重複を除去できない。
+`seen`・グループ表・右側ハッシュ表をモジュールスコープの値にすると、複数の SELECT や並行セッションで状態が共有される。
+演算子を構築する関数の中で作り、返した `Op` の中だけで使う。
 
-```fsharp
-// ❌ 2 が 2回目に出るので除去されない
-// ✅ 既出の値をすべて覚えておく必要がある（符号化キーの HashSet<byte array>）
-```
+### 2.5 エラーを空行へ変換しない
 
-### 2.5 評価エラーを `Op.Empty` で「0行」にしない
+式評価や JOIN の ON 評価が失敗したとき、`Op.Empty` を返すと「一致なし」に見えてエラーが消える。
+`OpError` として呼び出し元まで伝播する。
 
-JOIN の ON 句のように行ごとに評価する式が失敗したとき、`Op.Empty` に置き換えると
-**エラーが消えて「一致なし」の結果**になる。
-`INNER JOIN` では空の結果に、`LEFT JOIN` では NULL 埋めの行になり、どちらも原因を隠してしまう。
+### 2.6 `Op` は one-shot
 
-```fsharp
-// ❌ 評価失敗を「行が無い」と区別できない
-| DbErr _ -> Op.Empty
-// ✅ エラーを Op の計算として流し、呼び出し元の Result まで届ける
-| DbErr e -> Op.compute (fun () -> OpStep.OpError e)
-```
+`Op.next cur` を呼んだ後は、元の `cur`ではなく返された `nxt` を使う。
+同じ値を再利用すると、行が重複・欠落・無限ループになる。
+構築は `Op.Empty`・`ofRow`・`ofArray`・`emit`・`compute`を使う。`Done`・`Step`・`Compute`を直接構築しない。
 
-### 2.6 `Op` を返す関数を「値」にすると状態が全クエリで共有される
+### 2.7 配列へ変換するときのメモリ
 
-F# のモジュールスコープ `let` は起動時に 1回だけ評価される。
-`Ops.distinct` を引数なしの値として書くと、内側の `HashSet`（既出行）も 1個だけ作られ、
-**同じプロセスで 2回目以降の `SELECT DISTINCT` が全行を重複と見なして 0行**になる。
-サーバでは他セッションの行まで混ざり、`HashSet` は非スレッドセーフなので並行時に壊れる。
+`Op.toArray` と外部走査では、複数の行配列を途中で実体化しない。
+制限やメモリ上限がある場合、上限でスプールし、ストリーミングで完走する。
 
-```fsharp
-// ❌ seen がモジュール初期化時の 1個で固定され、全クエリで共有される
-let distinct =
-    let seen = HashSet<byte array> HashIdentity.Structural
-    let rec skipSeen used cur = ...
-    skipSeen 0L
-// ✅ src を引数に取り、seen を呼び出しごとに作る
-let distinct (src: Op) =
-    let seen = HashSet<byte array> HashIdentity.Structural
-    let rec skipSeen used cur = ...
-    skipSeen 0L src
-```
+### 2.8 `DISTINCT` と集約のキー
 
-- 部分適用で関数を作るときも、可変な状態を呼び出しをまたいで共有しないこと（純粋な関数だけにする）。
-- 気付き方: 単体のテストは成功するが、他のテストと並行実行すると 0行になる（xUnit の並列実行で表面化）。
-- 同じ規則を `Ops.aggregate` のグループ表と `OpsJoin.innerJoinHash` / `leftJoinHash` のハッシュ表にも適用する
-  （演算子の構築時に作り、返した `Op` の外へ出さない）。
-- 回帰テスト: `SqlReference: DISTINCT を続けて実行しても毎回全行が返る` /
-  `SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎回同じ結果になる`。
+重複判定やグループキーを文字列化しない。
+`ValueCodec.writeValues` で符号化したバイト列を使う。
+メモリ上限を超えたら、最初に現れた順を保ちながらパーティションへ退避する。
 
 ---
 
-## 3. `Optimizer.exec` の罠
+## 3. 計画・実行・スキーマ
 
-### 3.1 下へ渡すのは「入力スキーマ」
+### 3.1 下へ渡すスキーマは実行時の入力スキーマ
 
-```fsharp
-// run の EvalNode 分岐（継続は ExecFrame list に積む）
-| Logical.Sort(keys, child) ->
-    let childSchema = outputOf child inSchema               // ← child の出力スキーマ
-    run ctx (SortFrame(keys, childSchema) :: frames) (EvalNode(child, childSchema)) // ← ❌ 破綻
-```
+`Sort` / `Aggregate` / `Join` のフレームに入れるスキーマは二種類ある。
 
-`outputOf child inSchema` は「**child の出力**スキーマ」であって、「child を**実行**するときの**入力**スキーマ」ではない。
+- 子を読む側のスキーマ（子の出力）
+- 子を実行する側のスキーマ（現在の入力）
 
-これを間違えると、集約ノードが「集約後のヘッダ（`SUM(t.age)` など）」を**入力**として受け取る:
+下へ渡すのは入力スキーマ。集約後のヘッダを子へ渡すと、集約引数や GROUP BY 列が解決できない。
 
-- `SELECT SUM(age) FROM t` → `SUM` が `NULL` になる（引数の `t.age` を評価できない）
-- `GROUP BY age` → `id` でグループ化してしまう
+### 3.2 入れ子 JOIN は左部分木の実際の出力スキーマを渡す
 
-```fsharp
-// ✅ childSchema は「結果を読む側」だけが使う。下へは inSchema を渡す。
-| Logical.Sort(keys, child) ->
-    let childSchema = outputOf child inSchema
-    run ctx (SortFrame(keys, childSchema) :: frames) (EvalNode(child, inSchema))
-```
+結合順を並べ替える場合、元のスキーマから右テーブル名を取り除く方法では列位置がずれる。
+`outputOf lTree inSchema`で左部分木の実レイアウトを求める。
 
-### 3.2 `Aggregate` は「包みを剥がして」探す
+### 3.3 JOIN の右部分木を捨てない
 
-`Project` の `child` は `Limit → Sort → Distinct → Aggregate` と包まれている。
-直接 `Aggregate` を match すると**見つからない**。
+WHERE pushdownで右部分木に付いた `Filter`を実行せずスキャンを直接呼ぶと、右テーブルだけの述語と横断述語が消える。
+INNER JOIN のみに安全な pushdown を行い、LEFT JOIN の右側述語は結合後に置く。
 
-```fsharp
-// ✅ 包みを全部剥がして探す
-let rec private groupByOf (tree: Logical) : Expr list =
-    match tree with
-    | Logical.Aggregate(groupBy, _, _) -> groupBy
-    | Logical.Having(_, _, _, child) -> groupByOf child
-    | Logical.Distinct child -> groupByOf child
-    | Logical.Sort(_, child) -> groupByOf child
-    | Logical.Limit(_, _, child) -> groupByOf child
-    | Logical.Filter(_, child) -> groupByOf child
-    | _ -> []
-```
+### 3.4 JOIN の対応付けはテーブル名ではなく位置と別名で行う
 
-### 3.3 `Ops.sortBy` は「修飾つきを先に」試す
+自己結合では同じ実テーブル名が複数ある。対応する JOINはbindingsの位置で決める。
+同じテーブル名をエイリアスなしで複数指定する場合は `NameError` にする。
 
-集約後の出力では列名が `t.age` のまま残るので、修飾子を先に剥がすと「列 age が存在しません」になる。
+### 3.5 集約ノードを包みから直接探さない
 
-```fsharp
-// ✅ 修飾つき → 修飾なしの順で試す
-match Schema.resolve schema c with
-| Ok i -> Ok(i, dir)
-| Error _ ->
-    Schema.resolve schema bare |> Result.map (fun i -> (i, dir))
-```
+集約ノードは `Project → Limit → Sort → Distinct → Filter`など複数のラップに隠れる。
+ラップを降りながら `Aggregate`・`Having`を探す。
 
-### 3.4 `Join` の右部分木を捨てると WHERE が消える
+### 3.6 ORDER BY は修飾名を優先して解決する
 
-`buildLogicalWith` は WHERE を各スキャンの直下へ pushdown して右部分木に持たせる。
-なのに `exec` は `execScan ctx name method` を呼んで **`rTree` を捨てていた**:
+集約後の出力では列名が修飾名のまま残る場合がある。
+修飾付きから解決し、失敗したときだけ修飾なしへフォールバックする。
 
-- 右テーブルだけを参照する `WHERE b.v = 100` が効かなくなり、**全行**が返る
-- 2テーブルをまたぐ WHERE は pushdown 先がなく、どこにも置かれないまま**エラーにならず無視される**
+### 3.7 ORDER BY の序数は計画時に式へ置き換える
 
-```fsharp
-// ❌ rTree（pushdown した Filter を含む）が未使用
-| Join(kind, name, method, on, lTree, rTree) ->
-    exec ctx lTree schema >>= fun lOp ->
-        execScan ctx name method >>= fun rOp -> ...
-// ✅ 右部分木をそのまま実行する
-| Join(kind, name, on, lTree, rTree) ->
-    exec ctx rTree rightSchema >>= fun rOp -> ...
-```
+`ORDER BY 1`を式として評価すると定数ソートになる。
+実装は1始まりで項目へ置換し、範囲外は構文エラーにする。
 
-あわせて **LEFT JOIN の右（null 供給側）には WHERE を pushdown してはいけない**。
-入力側へ適用すると NULL 拡張行を残すかどうかの判断が変わるため、JOIN の上で評価する必要がある。
-`WHERE b.v IS NULL`（未一致行だけ残す）は、入力側へ先に適用すると**全行**が残ってしまう。
+### 3.8 SQL の処理順序を揃える
 
-- 修正: `buildLogicalWith` は INNER だけ pushdown し、LEFT の WHERE は top（JOIN の上）に置く。
-  どのテーブルにも属さない述語も top に置く。
-- 回帰テスト: `SqlReferenceTests` の `SqlReference: JOIN の WHERE は右テーブルと横断述語に効く` /
-  `SqlReference: LEFT JOIN の WHERE は null 供給側に効く`
+論理計画は概ね次の順序。
 
-### 3.5 入れ子 `Join` に「全スキーマ」を渡すと 3テーブル結合が 0行になる
+`FROM/JOIN → WHERE → GROUP BY/HAVING → 集約 → ORDER BY → 射影 → DISTINCT → LIMIT/OFFSET`
 
-`buildLogicalWith` は `List.fold` で `Join(Join(a, b), c)` と**左深い木**を組む。
-`exec` が左部分木へ `schema`（全テーブル分）をそのまま渡していたので、
-内側の JOIN は「自分と左のテーブル」ではなく「全テーブル」のスキーマで `ON` 句を解決してしまう。
+特にDISTINCTは射影の後、LIMITは射影とDISTINCTの後に適用する。
 
-- 症状: `FROM a JOIN b ON … JOIN c ON …` が**エラーにならず 0行**を返す
-  （2テーブル結合は正しく動く）。
-  `joinPred` の `Schema.resolve` が列を見つけられず `Error` →
-  `joinLoop` の `onError` が `Op.Empty` を返すため、**エラーにならず空の結果になる**。
-- 原因: `schema − 右テーブル` は段ごとに計算していたが、
-  左へ渡すのが**全スキーマ**のままだったこと。
+### 3.9 サブクエリの計画と実行を分ける
 
-```fsharp
-// ❌ 左部分木に全スキーマを渡す（内側で外側のテーブルまで解決してしまう）
-run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, inSchema))
+派生テーブルや相関サブクエリを計画時に実行しない。
 
-// ✅ 積む側で「自分の右テーブルを除いたスキーマ」を左へ下ろす
-run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema))
-```
+- 非相関サブクエリは計画時またはクエリ開始時に1回畳み込む。
+- 相関サブクエリは外側行ごとに再計画・実行する。
+- 相関述語は Filter pushdownやJOINへ昇格しない。
+- 集約後の式、LIMIT、OFFSETは外側スコープを持たない。
 
-あわせて `exec l >>= fun lOp -> exec r >>= …` は JOIN の数だけフレームが積もるので、
-`JoinRightFrame`（左を評価し終えたら右を評価）と
-`JoinApplyFrame`（右も評価し終えたら結合）を `ExecFrame list` に積む。
-ラッパも含めて単一の `run` の自己再帰で回すので、
-評価順（left → right → join）を保ったまま末尾再帰になる。
+派生テーブルは内側のエラーを外側のスキーマへ漏らさない形で別計画・別実行にする。
 
-- 回帰テスト: `SqlReferenceTests` の `SqlReference: 3 テーブルの入れ子 JOIN が行を返す` /
-  `DatabaseTests` の `末尾再帰: 60 段の入れ子 JOIN が正しい行を返す`（深さ方向の累積を検証）
+### 3.10 FROMなしのSELECTは1行0列
 
-### 3.6 JOIN の対応付けをテーブル名で探すと自己結合が消える
+`SELECT 1`は`Logical.Values [||]`（1行0列）を入力にする。
+`WHERE`や集約をこの1行へ適用する。
+`FROM`なしの`*`や未知の`t.*`は成功させずエラーにする。
 
-`buildLogicalWith` は `bindings |> List.findIndex (fun b -> b.RealName = j.Table.Name)` で
-「その JOIN 句がどのバインディングか」を探していた。
-`FROM t AS x JOIN t AS y`（自己結合）だと**両方 `RealName = "t"`** なので先頭にヒットし、
-`| idx when idx = 0 -> …` で **JOIN が丸ごと省略**される。
+### 3.11 LIMIT/OFFSETは定数式に限定する
 
-- 症状: `SELECT p.id, q.v FROM t AS p JOIN t AS q ON p.id = q.id` が
-  `列インデックス 3 が範囲外です（2列中）: q.v` で落ちる
-  （JOIN が無いので p の 2列しか無く、q を参照する射影が外れる）。
-  q を参照しない場合は、**エラーにならず p の全行**を返す。
-- ついでに、F# の `List.findIndex` は見つからないと**例外を投げる**。
-  コードは `| -1 -> …` で判定していた（.NET の `List.FindIndex` と取り違えていた）。
-  そのため未マッチの経路は実質存在しなかった。
+負数、列参照、定数に評価できない式、`Int32`上限を超える値はエラー。
+`LIMIT 0`は0行、`LIMITなし`は別の状態として扱う。
 
-```fsharp
-// ❌ RealName で探す（重複時に先頭へヒット、未マッチは例外）
-let idx = bindings |> List.findIndex (fun b -> b.RealName = j.Table.Name)
+### 3.12 未知の列・別名・識別子を黙らせない
 
-// ✅ sources と同順なので「i 番目の JOIN 句 = bindings.[i + 1]」で位置対応
-let right = bindings.[i + 1]
-```
+未知の修飾列、未知の`t.*`、重複する識別名は`NameError`または`SyntaxError`。
+識別子比較は`SqlName.equal`を共通利用する。
 
-あわせて**識別名が重複する** `FROM t JOIN t`（エイリアス無し）は
-`Plan.runSelect` で `ErrorKind.NameError` にする。
-exec が「右テーブルを除いたスキーマ」を**名前で**引く（§3.5）ため、
-重複名を区別できず、誤った結果がエラーにならず返る。
-自己結合は必ずエイリアスで表す。
+### 3.13 未対応のSQL語を別名へ吸収しない
 
-- 回帰テスト: `SqlReferenceTests` の `SqlReference: エイリアスでの自己結合が行を返す` /
-  `SqlReference: テーブル名の重複はエラー（エイリアスが必要）`
+`UNION`・`INTERSECT`・`EXCEPT`・`RIGHT`・`FULL`・`CROSS`・`NATURAL`・`OUTER`を裸の別名として読まない。
+未対応の構文は明示エラーにする。集合演算は文の区切り規則へ通す。
+
+### 3.14 結合アルゴリズムは走査順を検証する
+
+マージ結合は左右の走査が結合キーで昇順に並ぶ場合だけ選ぶ。
+結合キーが走査の先頭列に一致し、左右の列順も一致しない場合は選ばない。
+ハッシュ・索引結合は等値列の型が一致する場合だけ使う。
 
 ---
 
-## 4. LSM / ストレージの罠
+## 4. LSM・WAL・MANIFEST
 
-### 4.1 ポイント検索に `rangeScan` を使うと O(n) になる
+### 4.1 ポイント検索にrangeScanを使わない
 
-```fsharp
-// ❌ ポイント検索なのに「そのキー以降の全エントリ」を列挙している
-let fromMem =
-    Memtable.rangeScan key 0 engine.Mem
-    |> Seq.map (...)
-    |> firstVisible visible key
-```
+ポイント検索は`Memtable.getVisible`かストレージの lookupを使う。
+`rangeScan`は範囲走査であり、10万行規模ではポイント検索より桁違いに遅くなる。
 
-10万行で **1回あたり 43ms**。
-`SELECT COUNT(*)` 全体（10万行走査）が 0.2秒なので、ポイント検索のほうが**全走査より 200倍遅い**という異常な状態だった。
+### 4.2 下限とファイル枝刈りは別処理
 
-```fsharp
-// ✅ ポイントルックアップ（O(log n)）を使う
-let fromMem =
-    match Memtable.getVisible key visible engine.Mem with
-    | None -> ret None
-    | Some e -> ret (Some(SstEntry.make e.Key e.SeqNo e.Value))
-```
+SSTableのファイル選択でLargestを確認するだけでなく、読み出し側でもstartKeyより前をスキップする。
+再オープン後はmemtableが空になるため、startKeyの欠落が一度に顕在化する。
 
-教訓: **ポイント検索・prefix 検索に `rangeScan` を使わない**。**`getVisible` を使う**。
+### 4.3 prefix検索は先頭一致だけで決めない
 
-> `Memtable.rangeScan` は遅延 seq なので、❌ の形でも必要な分しか実体化しない
-> （`startKey` 以降を 1件ずつ返す）。
-> それでも `getVisible` のほうが軽い（列挙子も `Result` も作らず、O(log n) で直接引く）ので方針は不変。
+走査の先頭がprefix外のことがある。先頭エントリを取得したら`startsWithPrefix`を検証する。
 
-### 4.2 `scanAtWith` の `startKey` が SSTable に効いていない（**再オープン後にだけ表面化する**）
+### 4.4 ファイル番号は巻き戻さない
 
-```fsharp
-// ❌ 枝刈りだけして、中身は全件 merge している
-let files =
-    Version.allFiles engine.Version
-    |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
-// ... そのままだと startKey より前のエントリも混ざる
-```
+新規/再オープン時はディスク上の最大番号より大きい`NextFileNumber`を設定する。
+MANIFESTに反映した後に出力ファイルを削除し、削除の前にMANIFESTへ反映する。
+番号の巻き戻しは既存SSTableの上書きとデータ損失につながる。
 
-`memtable` 側は `Memtable.rangeScan` が下限を適用するので、**同一プロセス内では動く**。
-**reopen すると memtable が空になり SSTable だけが残るため、そこで初めて壊れる**。
+### 4.5 全レベルをポイント検索対象にする
 
-```fsharp
-// ✅ 下限は読み出し側で適用する
-//   ファイルを選ぶ枝刈り（Largest >= startKey）と、中身の下限は別物。
-//   → Sstable.rangeScanPartial が index を二分探索して startKey より前のブロックを読み飛ばし、
-//     Memtable.rangeScan は木を途中から降りる。
-let merged = SstMerge.ofScans (Array.append [| memScan |] fileScans)
-// 可視性の判定と同一キーの最新版への畳み込みは、SstMerge から 1件ずつ取り出す
-// 側（StorageEngine.scanAtWith の isVisible）が行う。
-// memtable も各ファイルも startKey 以降しか返さないので、merge 後の絞り込みは不要
-```
+`filesForPointLookup`はL0だけでなく全レベルを見る。
+レベルごとに順位を揃え、同レベルではファイル番号の降順で並べる。
 
-教訓: **「ファイルを選ぶ枝刈り」と「中身の下限」は別物。両方が必要**。
-中身の下限はいま `Memtable.rangeScan` / `Sstable.rangeScanPartial` が持っているので、
-`scanAtWith` 側で絞り直さない
-（絞り直すと、下限が効かなくなった退行に気付けなくなる）。
+### 4.6 Footerサイズとレイアウトは同期する
 
-### 4.3 prefix 検索では先頭の 1件が答えとは限らない
+Footerフィールドを追加・変更したら`FooterSize`、解析処理、チェックサム型を同時に更新する。
+開始位置やサイズがずれると再オープン時に壊れる。
 
-```fsharp
-// ❌ 走査の先頭が接頭辞と一致しないことがある
-RowStore.scanAtRawValues ks prefix 0 visible None true store
-|> Result.map (fun scan -> SstScan.next scan)
+### 4.7 走査の進行状態は必ず返す
 
-// ✅ 接頭辞が一致するか確かめてから取り出す
-RowStore.scanAtRawValues ks prefix 0 visible None true store
-|> Result.bind (fun scan ->
-    SstScan.next scan
-    |> Result.map (fun head ->
-        match head with
-        | Some(e, _) when KeyBuilder.startsWithPrefix e.Key prefix -> e.Value
-        | _ -> None))
-```
+SSTableのk-way mergeは、開いたファイルをヒープへ追加した後、残りのpendingファイルも更新して返す。
+heapだけを返すと同じファイルを毎行再オープンし無限ループになる。
 
-### 4.4 `Manifest.logAndApply` が `NextFileNumber` を進めていないとデータを消す
+### 4.8 WALはフレーム単位で追記する
 
-compaction の出力が入力と同じファイル番号になり、`deleteObsolete` が**自分で書いたファイルを消す**。
-`logAndApply` 内で `max(追加ファイルの番号) + 1` まで進めること。
+Begin・Batch・Commitのフレームを結合して一度に書かず、フレームごとにWriteして最後に一度fsyncする。
+commit済みprefixだけを再生し、不完全な末尾は捨てる。
 
-併せて `Compaction.compact` には `nextFileNumber` を**明示引数**で渡す
-（`version.NextFileNumber` は MANIFEST 反映後にしか更新されない）。
+### 4.9 複数keyspaceのcommitは1本のWALバッチ
 
-### 4.5 `Version.filesForPointLookup` が `v.Files.[0]` だけ見ていた
+テーブルと全索引の更新は1つの`Entry array`へまとめ、`StorageEngine.writeBatch`を1回だけ呼ぶ。
+テーブルだけ先にcommitされたり、索引だけ失敗したりしない状態を作る。
 
-compaction で L1+ に降ろしたデータが一切見つからなくなった。
+### 4.10 MANIFEST破損は空のVersionとして扱わない
 
-```fsharp
-// ❌ L0 しか見ていない
-// ✅ 全レベルを走査し、L0 を先頭にレベル昇順（`-level` の降順）、同レベルはファイル番号の降順で並べる
-Array.mapi (fun level files -> ...)
-```
+途中のレコード破損は`CorruptionError`。末尾の書きかけだけを許容する。
+`CURRENT`やMANIFESTがないのにSSTableが残っている場合もエラー。
+孤児は削除せず`.orphans/`へ退避する。
 
-### 4.6 `Sstable.FooterSize` の変更は `readFooterFields` と合わせて行う
+### 4.11 SSTable検証は構造比較ではなくファイルの順序規則で行う
 
-`MaxSeqNo` を追加したときは `FooterSize` を `72 → 80` に、
-Footer 自身のチェックサムを追加したときは `80 → 84` に変更した。
-v5 で全体 checksum を削除して `metadataChecksum` を追加したときは `88 → 84` に戻した。
-v6 でチェックサムを FNV-1a から CRC32C に変更した（Footer の長さは 84 のまま）。
-**放置すると Footer の開始位置がずれて、ファイル全体の読み取りが壊れる**。
+並びはキー昇順・同キーでSeqNo降順。レコードのF#構造比較を使うと正しいファイルも壊れたと判定する。
 
-### 4.7 「状態を進めるヘルパー」は進んだ状態も返す（`scanAtWith` の無限ループ）
+### 4.12 壊れたブロック・キー・メタデータは例外ではなくCorruptionError
 
-`scanAtWith` の k-way merge は、ヒープと「まだ開いていないファイル一覧（pending）」を持ち回る。
-`prepare` がファイルを開いてヒープへ積むとき、**pending の残りも返さないと、
-呼び出し側は毎行同じファイルを開き直し、同じ先頭エントリを積み続けて終わらない**。
+境界で長さ、範囲、チェックサム、エスケープ、DECIMAL、レベル番号を検証する。
+未捕捉例外や空の成功を作らない。
 
-```fsharp
-// ❌ heap だけ返す → 次の行で同じファイルを再オープン（無限ループ）
-let rec prepare heap pending = ...
-// ✅ 使い切った pending も返す
-let rec prepare heap pending =
-    | [] -> Ok(heap, [])
-    | (i, bound, f) :: rest -> ... Ok(heap', rest) / Ok(heap, pending)
-```
+### 4.13 compaction出力はバイト上限とキー境界で分割する
 
-症状は「SSTable だけの keyspace（Close 直後・再オープン直後）を読むと固まる」。
-memtable に 1件でもあると先へ進むため、テストが無いと気づきにくい。
-回帰テストは `StorageEngineTests` の
-`StorageEngine.scanAtMasked: memtable が空でも SSTable だけを走査できる` /
-`StorageEngine.scanAtValues: 多数のファイルをキー昇順にマージする`。
+件数やファイル数をエントリ数とみなして分割しない。
+目標バイト数に達したときだけ、キーグループの境界で切る。
+
+### 4.14 compactionのinstallは現在の状態を再検証する
+
+MANIFESTへ反映する前に、削除対象ファイルが現在のVersionに存在するか、古いsnapshotが必要な版を守っているかを再確認する。
+ファイル番号は同じCAS採番経路だけで進める。
+
+### 4.15 maybeFlushの結果をcompaction失敗で巻き戻さない
+
+flush成功後にcompactionが失敗したら、flush後のengineを返す。
+flush失敗時だけpre-flush engineを返す。
+WAL commit成功後に`Error`を返さない。
 
 ---
 
-## 5. MVCC / トランザクションの罠
+## 5. MVCC・transaction
 
-### 5.1 put と tombstone に同じ SeqNo を書くと tombstone が消える
+### 5.1 putとdeleteには異なるSeqNoを使う
 
-LSM の規則「同じキーでは SeqNo が大きい put が勝つ」により、
-**同じ SeqNo の put と delete が同居すると、tombstone が負ける**。
+同一キー・同一SeqNoのputとtombstoneでは、SeqNo降順の規則によりtombstoneが負ける。
+書き込みごとに現在の`NextSeqNo`から単調増加させる。
 
-```fsharp
-// ❌ 全部 0UL にしていた
-// ✅ 現在値から採番して単調増加させる
-let nextSeq = engine.NextSeqNo
-```
+### 5.2 再オープン時は最大SeqNoを復元する
 
-### 5.2 reopen 時に SeqNo を再開しないと「全部未来」で見えない
+`NextSeqNo`とLastCommitSeqNoをディスク上の最大SeqNoから復元する。
+復元しないと既存行がすべて「未来」になり0行になる。
 
-`StorageEngine.openDatabaseWith` はディスク上の最大 SeqNo から `NextSeqNo` を復元する。
-`RowStore.lastSeqNo` を通して `TransactionManager` の `LastCommitSeqNo` を初期化しないと、
-**ディスク上の行がすべて「未来」** と判定されて **0行**になる。
+### 5.3 snapshotに必要な版をGCしない
 
-```fsharp
-// ✅ 開いた engine から SeqNo を復元する
-let lastSeqNo (store: RowStore) =
-    let next = store.Engine.NextSeqNo
-    if next = 0UL then 0UL else next - 1UL
-```
+読み手のsnapshotは`SeqNo <= snapshot`を見る。
+activeな最古snapshotより古い版だけをGC対象にする。
+tombstoneは古い版を残している間は消さない。
+ファイルの回収は参照されなくなったファイルだけを対象にする。
+`ActiveSnapshot = 0`は履歴を残す状態。
 
-### 5.3 GC の SeqNo 判定は「snapshot が小さいほどまだ読まれている」
+### 5.4 一行内のputとdeleteは打ち消さない
 
-snapshot `S` の読み手は `SeqNo <= S` の版を見る。
-つまり **SeqNo が小さい版こそ、まだ読まれている**。
+transactionの同じキーはputとdeleteを別々のslotとして残さず、最終的な状態へ正規化する。
+主キー変更はdelete/insertとして扱い、索引も主キーと全索引へ更新する。
 
-```fsharp
-// ❌ データ損失になる誤った判定
-let obsolete = Version.allFiles version
-               |> List.filter (fun f -> f.MaxSeqNo < activeSnapshot)
-```
+### 5.5 同じTransactionManagerを複数作らない
 
-正しい方針:
+`create`を複数回呼ぶとSeqNoを別々に1から始める。
+`beginTxn`で返されたmanagerを次のbeginへ連鎖させる。
+公開APIでは利用者が状態を持たず、`Session`が管理する。
 
-- **版（エントリ）単位の GC**: 同キーのうち SeqNo 最大の版は**必ず残す**。
-- 最新版以外は `SeqNo > activeSnapshot` の版を全部残す。
-  `SeqNo <= activeSnapshot` の版は **最新の 1件だけ**残す
-  （最古の active snapshot が読むのはこの版）。
-  それより古い版だけ捨てる。
-- 最新版が `activeSnapshot` 以下なら、最新版自身が全 snapshot から見えるのでそれより古い版は全て捨てる
-  （compaction の GC にある `keepOlder`）。
-- 最下位レベルでも、**同じキーの古い版が残るなら tombstone は消さない**。
-  消すと下位の古い値が復活する
-  （`Compaction.gcGroup` は `dropTombstones` が真で、GC 後に残す古い版が無い（`keptOlder` が空）ときだけ tombstone を捨てる）。
-- **ファイル単位の回収は SeqNo で判定しない**。
-  LevelDB と同じ「Version が参照していないファイル」だけ
-  （`quarantineOrphans` が `.orphans/` へ退避する。削除はしない）。
+### 5.6 commit後のLastCommittedと競合検査を掃除する
 
-### 5.4 `Transaction.Buffers` は「同一キーに put と delete を書くと打ち消し合う」
+生きている最古snapshotより古いLastCommittedを捨てる。
+active transactionがない場合は`LastCommitSeqNo + 1`を境界にする。
+このcommit自身のSeqNoを反映した後の境界で掃除する。
 
-```fsharp
-type Transaction =
-    {
-        Buffers: Map<string, Map<byte array, SqlValue array option>>
-        //                                       ^^^^ これが option
-    }
-```
+### 5.7 UNIQUEの同時重複を論理予約で防ぐ
 
-`Dml.updateRow` は「delete → put」ではなく「put だけ」で更新する
-（LSM は新しい SeqNo の put が旧 put を隠す）。
-主キーの変更は禁止されているため、変更する場合は DELETE + INSERT を使う。
+物理索引キーは主キーまで含むため、同じUNIQUE値の別主キー同士を競合検出できない。
+transactionに`@unique:<index>:<encoded value>`の論理予約キーを持たせ、commit時の競合検査へ含める。
+予約キーはWAL/SSTableへ書かない。
 
-索引側は `Dml.applyIndexChange` が「値が変わるときだけ古い索引キーへ tombstone → 新しい索引キーへ put」。
+### 5.8 明示transactionは接続ごとに保持する
 
-### 5.5 `TransactionManager.create ()` を 2回呼ぶと SeqNo が衝突する
+接続ごとの状態はCatalog・Active・Pending・leaseだけを保持し、StoreとManagerは共有hostの最新committed stateを使う。
+文ごとにtransactionを最新stateへrebaseする。
+切断時はその接続のtransactionだけをrollbackする。
 
-テストで `TransactionManager.create ()` を 2回呼ぶと、
-両方とも SeqNo 1 から採番し、2つ目の transaction の書き込みが**先に見えた上位の SeqNo に隠される**。
+### 5.9 DDLは明示transactionに含めない
 
-```fsharp
-// ✅ beginTxn の戻り値を次の transaction に引き継ぐ
-let (mgr, txn) = TransactionManager.beginTxn mgr
-// ... 任意の処理 ...
-let (mgr, txn2) = TransactionManager.beginTxn mgr
-```
-
-### 5.6 公開 API では `Session` を使う
-
-`Session` は接続ローカルの transaction 状態（`TxnState`）を持ち、
-各文の成功後にそこだけを進める（committed な状態は `DatabaseHost` が管理する）ため、
-利用者が戻り値を引き継ぐ必要はない。
-
-```fsharp
-// ✅ Session が状態を進める
-ok (session.Execute "INSERT ...")
-```
+DDLと索引backfillは同一transactionへ載せられないため、`BEGIN`中のDDLは拒否する。
+CREATE INDEXは排他ロックを取り、backfill成功後にカタログへ登録する。
+backfill中の他の書き込みを防ぐ。
 
 ---
 
-## 6. 索引（index）の罠
+## 6. 索引・結合・クエリ意味論
 
-### 6.1 索引選択が緩いと「別の列の索引」を引く
+### 6.1 素の列一致で索引を選ばない
 
-`chooseScanMethod` の判定が:
+索引選択は索引の列名と検索列が完全一致する場合だけ行う。
+複合索引は先頭から連続する等値列、次の範囲列を優先する。
 
-```fsharp
-// ❌ 1列の索引なら列名に関係なく当ててしまう
-let found =
-    idxes
-    |> List.tryFind (fun i ->
-        i.Columns |> List.forall (fun c -> Catalog.eqName c colName)
-        || i.Columns.Length = 1)
-```
+### 6.2 Catalogと実行スキーマを同期する
 
-`CREATE INDEX ON t (name)` と `ON t (age)` の両方があれば、
-`WHERE name = 'bob'` が **age の索引**を引いて 0行になっていた。
+`TableSchema.Indexes`へ索引schemaを載せる。
+載せないと実行層が索引を見つけられず、実行時に失敗するか空になる。
 
-```fsharp
-// ✅ 索引の列が検索列と完全に一致するものだけを使う
-let found =
-    idxes
-    |> List.tryFind (fun i ->
-        match i.Columns with
-        | [ c ] -> Catalog.eqName c colName
-        | _ -> false)
-```
+### 6.3 CREATE INDEXにはbackfillと再試行を含める
 
-- 等値一致は索引の**先頭から連続する** `= 定数` が 1列以上あれば `IndexLookup`
-  （`Analyzer.chooseScanMethod` の `tryIndexEquality`）。
-- 範囲条件がその次の列にある場合は、より多くの列を絞れる `IndexRangeScan` を優先（`tryIndexMethod`）。
-- 複合索引の範囲は「前置列すべてが等値 + 次列が範囲」（`tryIndexRange`）。
+既存行をバッチでindex keyspaceへ書き込む。
+失敗時もカタログへ載せず、再実行時に残骸を消してやり直せるようにする。
 
-### 6.2 `Catalog.toSchema` は `Indexes = []` で埋まる
+### 6.4 索引走査にはTableSchemaとIndexSchemaが必要
 
-索引を定義しても実行系の `TableSchema.Indexes` に載らないと、
-`ExecContext.byIndexMasked` / `byIndexRangeMasked` が「索引が無い」と言って検索に失敗する。
+索引キーには索引列と主キー列を含むため、片方のスキーマだけでは復号・構築できない。
 
-```fsharp
-// ✅ contextOf で明示的に載せる
-let withIndexes =
-    { schema with
-        Indexes = Catalog.indexSchemasOf state.Catalog t.Name }
-```
+### 6.5 DELETEは主キーと全索引へtombstoneを書く
 
-### 6.3 `CREATE INDEX` に backfill が無いと過去行が見つからない
+索引側の削除を忘れると削除済み行が索引から復活する。
 
-索引は**別の論理 keyspace**（`i:<name>`）に持つので、`CREATE INDEX` 時に中身を写さないと、
-**その前に `INSERT` した行が検索に出てこない**。
+### 6.6 DROPはカタログとkeyspaceを安全な順序で消す
 
-```fsharp
-// ✅ 既存行をチャンクごとの transaction で index keyspace に書き込む
-let! rows = Dml.scanByPrimaryKey cleared.Store withIndex 0 None
+DROP後始末はカタログ削除前にジャーナルへ記録し、一定件数ずつtombstoneを消す。
+再オープン時にジャーナルを読み、未完了の削除を再開する。
 
-let! filled =
-    applyOpChunks
-        (fun txn row ->
-            ret (Transaction.put (Keyspace.index idx.Name) (RowKey.indexKey withIndex idx row) row txn))
-        rows
-        cleared
-```
+### 6.7 集約・射影の式を正しく配置する
 
-`Dml.scanByPrimaryKey` は遅延 `Op` を返すので、
-全行をメモリに載せず `BackfillChunkRows` 単位で transaction を分ける。
+- 集約引数の式は集約前に評価する。
+- `AggCall`の第2引数はDISTINCTフラグ。
+- `COUNT(*)`はNULLを数え、`COUNT(列)`はNULLを数えない。
+- HAVINGにしか現れない集約も計画時に集める。
+- GROUP BY式は木全体を集約スロットへ置換する。
 
-### 6.4 索引走査は `TableSchema` と `IndexSchema` の両方が要る
+### 6.8 3値論理を維持する
 
-`RowKey.indexKey` は索引列の位置を `TableSchema.indexOf`（`Option`）で引き、見つからない列は除外する。
-索引キーには索引列だけでなく主キー列も埋め込むため、`IndexSchema` だけでは完全なキーを作れない。
+`IN`候補が一致しなければFALSE。NULL比較が一つでもあり一致がなければUNKNOWN。
+失敗や不足を0/falseに変換しない。
 
-```fsharp
-// ✅ スキーマ・索引 schema・値・limit・visible・txn を渡す
-Dml.scanByIndexPrefixWithTxnMask store schema index values limit visible scope txn mask
-```
+### 6.9 LIKEは進捗を保証する
+
+バックトラックでstar位置やtext位置が進まなくなると無限ループになる。
+状態遷移ごとに必ず位置を進めるか、失敗を返す。
+
+### 6.10 CASTと暗黙変換を分ける
+
+INSERT/UPDATEの暗黙変換は`SqlValue.coerce`。
+`CAST`は明示変換で`SqlValue.cast`を使う。
+暗黙変換の受理範囲を広げない。
+
+### 6.11 TEXT・REAL・NULLの比較を全順序で扱う
+
+- TEXTはUTF-8/Unicodeコードポイント順。
+- REALの-0.0は+0.0へ正規化。
+- ORDER BYの比較ではNULLを昇順先頭・降順末尾に置く全順序を使う。
+- WHEREの比較は3値論理を維持する。
 
 ---
 
-## 7. SQL 意味論の罠
+## 7. メモリ・退避・列読み込み
 
-### 7.1 SQL の評価順は「集約 → 並び替え → 射影 → DISTINCT → LIMIT」
+### 7.1 メモリ上限は管理メモリで測る
 
-`DISTINCT` を射影の前にすると `(id, g)` の組を重複排除してしまう。
+memtable・Join・DISTINCT・GROUP BYの上限は、Treapノード、配列ヘッダ、UTF-16、参照型を含む管理メモリで計算する。
+SSTableのファイルサイズ見積りをメモリ上限へ流用しない。
 
-```fsharp
-// ✅ DISTINCT は射影の後
-let projected = Project(items, withSorted)
-let deduped = if stmt.Distinct then Distinct projected else projected
-applyLimit deduped stmt
-```
+### 7.2 作業上限を超えたら退避する
 
-### 7.2 `AggCall` の第 2引数は「DISTINCT フラグ」
+右側を保持する結合、DISTINCT、GROUP BY、外部ソートは、上限までメモリに保持し、超過分をrunへ退避する。
+退避後の走査も終了・エラー・閉じ忘れがないようにする。
 
-`COUNT(*)` は**引数が `Star` かどうか**で `isStar` を判定する。
+### 7.3 退避runはone-shot
 
-```fsharp
-// ✅ COUNT(*) は Star で表す
-AggCall(AggFunc.Count, false, Star)
-// ✅ COUNT(DISTINCT a) は第 2引数が true
-AggCall(AggFunc.Count, true, Name "a")
-```
+`reopen`した`Op`は、読み直し用に前の状態へ戻せない。
+読みかけの行をpendingとして次の状態へ渡す。
 
-第 2引数を `isStar` と誤解すると `COUNT(DISTINCT a)` が解析できない。
+### 7.4 外部ソートのrunは一度に全部openしない
 
-### 7.3 `COUNT(*)` は NULL を数える。`COUNT(列)` は数えない
+最終k-way mergeは同時に開くrun数を上限以下にする。
+上限を超えたら複数パスで中間runへまとめる。
 
-`addAcc` の `isStar` 分岐を**先に**置かないと、`Some Null` が「NULL を無視」側に落ちて **0** になる。
+### 7.5 格納する配列を複製する
 
-### 7.4 `InList` の未一致は FALSE であって UNKNOWN ではない
+memtable・transaction・内部バッファへ渡すキー・行・BLOBは複製して所有する。
+呼び出し側が配列を書き換えても内部状態が壊れないようにする。
 
-SQL 標準の 3値論理:
+### 7.6 結果へ返す配列も複製する
 
-```fsharp
-// ❌ 5 IN (1,2) が NULL になる
-| [] -> ret Null
-// ✅ 一致すれば TRUE / どれも一致しなければ FALSE /
-//    NULL 比較が 1つでもあれば UNKNOWN
-| [] -> if sawUnknown then ret Null else ret (Bool negated)
-```
+`StatementResult.Rows`と`RowReader`は内部配列とは別物を返す。
+`SqlValue.copyRow`で行とBLOBを複製する。
 
-### 7.5 `LIKE` のバックトラックは「進捗保証」が無いと無限ループ
+### 7.7 列マスクの`Unloaded`をNULLと混同しない
 
-テストプロセスが **SIGABRT / exit 134** で落ちた。
+列マスクで復号しなかった列は`SqlValue.Unloaded`。
+SQLのNULLではない。比較・ソート・DISTINCT・符号化・型問い合わせへ渡さない。
+最終結果境界でロード済み行へ変換する。
 
-`%` で分割 → 区間を左から順に前方一致で探す、という**単純な走査**に書き換えた。
-`%` で `go (pi+1) ti pi ti` のように `ti` が進まず、`star+1` のリトライが永久に終わらない。
+### 7.8 必要な列だけを復号する
 
-教訓: **バックトラックする再帰には必ず「進捗が必ず進む」保証を書く**。
+SELECT定数、`COUNT(*)`、DELETE、INDEX lookupは参照列だけ復号する。
+全列を復号しない。
+非被覆索引は主キーで本体をfetchし、`fetch`を全行へ適用する。
+
+### 7.9 compactionはraw値スライスを使う
+
+値を復号せずブロックバッファのスライスを保持し、出力へコピーする。
+スライスの間にバッファを再利用しない。
+削除判定は`SstEntry.IsDelete`で行う。
+
+### 7.10 結果型の割当をホットパスへ持ち込まない
+
+ホットパスでは`DbResult`と`OpStep`を使い、公開APIの境界で`Result`へ変換する。
+`Op.emit`の第2引数は遅延させる。即時再帰するとスタックオーバーフローになる。
 
 ---
 
-## 8. F# 10 の言語の罠
+## 8. 並行実行・接続・通信
 
-### 8.1 主コンストラクタの中に副作用のある呼び出しを単独で書けない
+### 8.1 DBの所有者はDatabaseHostに集約する
 
-```fsharp
-// ❌ FS0010 "Unexpected identifier in member definition"
-type T(host: string, port: int) =
-    let client = new TcpClient()
-    client.Connect(host, port)   // ← ここ
-    member _.Port = port
+ストアを開くのはhostだけ。接続ごとにRowStoreを開くと二重オープンやcommit非可視になる。
+通常のSessionとTCPのセッションはhostを共有し、ownerだけが閉じる。
 
-// ✅ コンストラクタ引数で接続を成立させる
-type T(host: string, port: int) =
-    let client = new TcpClient(host, port)
-    member _.Port = port
-```
+### 8.2 二重オープンはロックと台帳で防ぐ
 
-### 8.2 `Result` の共用体ケース名が衝突する
+プロセス間は`.rykdb.format`を`FileShare.None`でロックする。
+同一プロセスの二重オープンは正規化rootの台帳で拒否する。
+オープン途中の失敗でもロックを解放する。
 
-```fsharp
-// ❌ Reply.Ok が Result.Ok を shadow して全部壊れる
-type Reply = | Ok of ... | Error of string
-// ✅ 名前を変える
-type Reply = | Rows of ... | Failure of string | Halt
-```
+### 8.3 Session.Closeは実行中の読み取りを待つ
 
-### 8.3 `let private rec` の順序は逆
+closed状態を先に確定し、`readers`が0になるまで待ってからrollback/closeする。
+読み取りはローカルtransactionを書き戻さない。
 
-```fsharp
-// ❌ FS0110
-let private rec f x = ...
-// ✅
-let rec private f x = ...
-```
+### 8.4 read snapshotとファイルpinは一度に取得する
 
-### 8.4 namespace 直下には値を置けない（FS0201）
+committed stateを取得してから別にpinすると、pinとGCの間に必要な版が消える。
+`AcquireReadSnapshot`でstateと全ファイルのleaseを一度に取得する。
 
-```fsharp
-// ❌ FS0201
-namespace RykDb.Core
-let myHelper x = ...     // ← 不可
-// ✅ module に入れる
-namespace RykDb.Core
-module MyModule =
-    let myHelper x = ...
-```
+### 8.5 TCP切断は接続ごとのtransactionだけrollbackする
 
-### 8.5 型の member から同じファイルの後にある `let` を見られない
+切断検知とrollbackは非同期になるため、テストでは完了を待つ。
+サーバのSessionを接続間で共有しない。
 
-```fsharp
-type Catalog =
-    { Tables: TableDefinition list }
-    // ← この member から下の updateTables が見えない
-    member this.Count = this.Tables.Length
+### 8.6 TCPプロトコルのレスポンス形を区別する
 
-let updateTables t ... = ...   // ← member から参照不可
-```
+列がある`OK n`はn行のSELECT。列がない`OK n`はDML/DDLのaffected件数。
+STREAMは`END`または`ERR`まで読み切る。
 
-→ **検索・更新は module 関数**にする。
+### 8.7 background compactionは専用スレッドで実行する
 
-### 8.6 `all` は `seq` を要求する
+`TaskCreationOptions.LongRunning`で起こす。
+スレッドプールの空きに依存させない。
 
-リスト・配列はそのまま渡せる。
-空リストリテラルだけは要素型が決まらないので注釈を付ける（FS0030）。
+### 8.8 compactionの状態はIdle/Busy/Pendingを一つで管理する
 
-```fsharp
-// ✅ リストも配列も渡せる
-all [ r1; r2 ]
+busyとpendingを別に読むとidle判定が完了前にtrueになる。
+shutdownではpermitに関係なくsignalを発行する。
 
-// ✅ 空のときは注釈で要素型を決める
-let empty: Result<int list, DbError> = all []
-```
+### 8.9 走査のハンドルは発生源でScopeへ登録する
 
-**意味論**: `all` は `foldOk` と同じく**最初の `Error` で打ち切り**、残りの項目は列挙しない。
-複数の `Error` があっても返るのは最初の 1つ。
-1回限りの `seq`（列挙子）を渡しても、二重に列挙されることはない。
+ラップではなく、走査を作った直後に`ScanScope`へ登録する。
+continuationを更新し、終端・エラー・Disposeで登録を外す。
+文の終端で`ScanScope.DisposeAll()`を呼ぶ。
 
-### 8.7 `SqlValue` は `:?>` できない（FS0016）
+### 8.10 group commitの失敗はSession全体をfatalにする
 
-proper subtype がないので型テストできない。
+fsync失敗を待機者だけに返さず、失敗位置とエラーを共有する。
+以後のcommitも同じfsyncエラーを返す。
 
-```fsharp
-// ❌ FS0016
-match v with :? SqlValue.Int n -> ...
-// ✅ ヘルパー
-let asInt (v: SqlValue) = match v with | SqlValue.Int n -> n | _ -> 0L
-```
+### 8.11 fsync位置はwriteGate内で登録する
 
-### 8.8 `Binary` などの「引数 3 つ」のケースはタプル形
+`WalState`を`CommitDurability.Register`した後にgate外で`Await`する。
+登録漏れはcommitごとのfsyncを再発させる。
 
-```fsharp
-// ❌ FS0727
-| Binary(op, _, _) -> ...
-// ✅
-| Binary(op, a, b) -> ...
-```
+### 8.12 commit中のファイルをworkerが削除しない
 
-### 8.9 `take` 述語は「先頭から連続」で止まる
-
-`Dml.scanByIndexPrefixWithTxnMask` は `RowStore.scanAtRawMasked` が返す pull を
-`opOfScan` の `take` 述語（`KeyBuilder.startsWithPrefix`）で読み進め、外れた時点で終端にする。
-**ファイル側の下限が効いていないと 1件目で止まり、0件になる**（§4.2 を参照）。
-
-### 8.10 予約語
-
-`default` / `value` / `old` / `type` / `base` は変数名・引数名に使えない。
-
-```fsharp
-// ❌ base は予約語
-let f (base: Schema) = ...
-// ✅
-let f (tree: Logical) = ...
-```
-
-モジュール名に使えないのもある（`CompactionOptions` の既定値は現在 `CompactionOptions.Defaults`）。
-
-`key` / `base` / `begin` / `new` / `old` / `type` / `value` は**匿名レコードのフィールド名にも使えない**。
-
-```fsharp
-// ❌ 予約語と衝突
-let private entryKey ... = { Key = ... }
-
-// ✅ 動詞で始まる名前にする
-let private hashKey (e: Entry) = ...
-let private writeByte (w: Writer) = ...
-```
-
-モジュール名と型名が同じ（`Wal` / `Memtable`）場合、`Module.field` は型と誤認される。
-型注釈付きのヘルパー経由で構築する。
-
-### 8.11 ローカル関数名が外側の関数と被ると後者が優先される
-
-```fsharp
-// ❌ pickMax (2引数) に解決されて壊れる
-let pickMaxFrom gs = pickMax (gs + 1) gs ge
-// ✅ 名前を変える
-let pickMaxFrom gs = pickMaxIdx (gs + 1) gs ge
-```
-
-同種に **match パターンの変数が外側の `let` を隠す**場合がある。
-
-```fsharp
-// ❌ IsTruth のフィールド名 expected が外側の int を隠す
-let expected = List.length (children e)
-match e, kids with
-| Expr.IsTruth(_, expected, neg), [ x ] -> ...   // ここでは TruthValue
-// ✅ 外側の名前を変える
-let expectedChildren = List.length (children e)
-```
-
-隠れた側を参照しても型が合わなければエラーになるが、**まだ参照していない間は無言**。
-命名で避けるのが確実。
-
-### 8.12 `op_GreaterGreaterEquals` の連鎖で末尾再帰が壊れる
-
-`Result` のbind を `>>=` で重ねると F# の末尾呼び出し最適化が効かない。
-**「再帰 + `>>=`」の組み合わせは使わない**（§2.3 を参照）。
-
-### 8.13 `use` は主コンストラクタに書けない（FS0523）
-
-```fsharp
-// ❌ FS0523
-type T() =
-    use stream = ...
-// ✅ let で持って Dispose で破棄
-type T() =
-    let stream = ...
-    interface IDisposable with
-        member _.Dispose() = stream.Dispose()
-```
-
-### 8.14 `member _.Foo = _.Bar` の短縮ラムダは atomic 式のみ
-
-```fsharp
-// ❌ FS3584
-member _.Query sql = _.Send sql
-// ✅
-member this.Query sql = this.Send sql
-```
-
-### 8.15 F# 10 では型注釈付きの戻り値宣言は 1行
-
-```fsharp
-// ❌ FS0058
-let rec go (rest: T list) (acc: Map<string, int>) :
-    Result<string list * Map<string, int>, DbError> =
-    ...
-// ✅ 引数リストを複数行にして、戻り値型も 1行で
-let rec go
-    (rest: T list)
-    (acc: Map<string, int>)
-    : Result<string list * Map<string, int>, DbError> =
-    ...
-```
+Session単位のread leaseでSSTableをpinする。
+workerはretiredとしてrefcountが0になった後に削除する。
+closeはworker join後にWALとロックを解放する。
 
 ---
 
-### 8.16 `[<TailCall>]` は末尾位置に置けたときだけ付ける（FS3569）
+## 9. F# とビルド
 
-`TreatWarningsAsErrors=true` なので、属性を付けた関数の自己再帰が 1つでも末尾位置に来ないと **FS3569 がビルドエラーになる**。
-最小プローブで位置ごとに実測した結果は次のとおり。
+### 9.1 主コンストラクタで副作用を単独実行しない
 
-| 書き方                                             | 判定      |
-| -------------------------------------------------- | --------- |
-| `match f x with` の**枝**で `f (n-1)`              | ✅ 末尾   |
-| `match 別関数 x with` の枝で `f (n-1)`             | ✅ 末尾   |
-| `if ... then f (n-1) else ...`（本体レベル）       | ✅ 末尾   |
-| ネストした `let rec go` の本体                     | ✅ 末尾   |
-| ラムダの本体が**そのまま** `f (n-1)`               | ✅ 末尾   |
-| `match f x with`（自己再帰の結果がそのまま戻り値） | ❌ FS3569 |
-| `f (n-1) \|> Result.map g` / `g (f (n-1))`（引数） | ❌ FS3569 |
-| `f (n-1) >>= fun ... ->`（レシーバ = 引数）        | ❌ FS3569 |
-| ラムダの本体が `if` で、枝に `f (n-1)`             | ❌ FS3569 |
+副作用は引数で初期化するか、型の中で確定してから公開する。
+`use`や接続処理を主コンストラクタ本体へ単独で置かない。
 
-「評価結果を**消費してから**次をする」再帰（`>>=` / `Result.map` / 戻り値をそのまま返す形）は
-構造上どうしても末尾にならない。選択肢は 2 つ。
+### 9.2 共用体ケース名とレコードフィールド名を衝突させない
 
-```fsharp
-// ❌ FS3569（結果を消費してから整形する）
-exec ctx child schema |> Result.map (fun op -> Ops.sortBy schema op keys)
+`Result.Ok`を独自型のケース名として使わない。
+一般名のフィールドや引数により型推論が変わるため、用途の明確な名前へする。
+レコード型を追加したら、既存の同名フィールドをgrepする。
 
-// ✅ 属性を外して理由をコメントで残す
-// [<TailCall>] を付けない理由: 子の Result を消費するため末尾にならず FS3569 になる。
-// 論理木の深さは入力の式の深さに比例する（Parser の式・サブクエリは CPS で深さ上限なし）。
-exec ctx child schema |> Result.map (fun op -> Ops.sortBy schema op keys)
+### 9.3 namespace直下やmoduleスコープに不正な束縛を置かない
 
-// ✅ あるいは「積む側」と「回す側」に分けて本当に末尾再帰にする
-let rec readAll n c acc =
-    match readOne c with
-    | Error e -> Error e
-    | Ok(v, c1) -> readAll (n - 1UL) c1 (v :: acc)   // 末尾
-```
+namespace直下に値を置かずmoduleへ入れる。
+モジュールスコープにDUを`let`束縛で置かない。`type`宣言を使う。
+`let private rec`ではなく`let rec private`を書く。
 
-**ローカルの `let rec` には `[<TailCall>]` を書けない**（FS0010 → `TreatWarningsAsErrors` でエラー）。
-末尾化したい関数が別の関数の中にあるなら、その関数を**モジュールスコープへ引き上げ**、必要なものは引数で渡す
-（`Expr.rewrite`（`Ast.fs`）は `rewriteLeaf` を受け取る形で、内部のローカル関数 `loop` が末尾再帰。
-`Binder.qualify` と `Ops` の集約読み替えが共用している）。
+### 9.4 型注釈を省かない箇所を把握する
 
-**要素数に比例する反復は必ず後者にする**（`match` に直せば末尾になる）。
-`>>=` で受けると候補の数・WHEN 節の数だけスタックが積まれる。
-該当は `IN` の候補リストと `CASE` の WHEN 節（`Eval.eval`）。
-深い式の回帰テストは `AstTests` の `末尾再帰: AST の深い走査でスタックを食わない` と
-`OpsTests` の `末尾再帰: 50000段の式を havingFilter してもスタックを食わない`。
-カーソルからの数え上げ読み出しは `Reader.readItems`（Serialization.fs）に共通化し、
-`Catalog` / `Memtable` が使う。
+型推論はレコード追加や関数名の衝突で静かに変わることがある。
+特に配列を受けるラムダ、レコードを受ける関数、CPSグループ、オーバーロードを持つ文字列処理は型注釈を付ける。
 
-**Debug の `Tailcalls` は既定で false**。
-`dotnet test` / `dotnet run` は Debug なので、CPS の相互末尾再帰が `tail.` にならず、
-50000個の `IN` リストで `Stack overflow.`（exit 134）になる。
-`Directory.Build.props` の `<Tailcalls>true</Tailcalls>` を消すと再発するので注意。
-Parser の式・サブクエリは CPS で深さ上限を持たない（→ §11.48）。
+### 9.5 数値と予約語を取り違えない
 
-属性の無い関数（ローカル `let rec` 含む）まで含めた**反復検証**は `dotnet run --project tools/TailAudit`
-（既知分は `tools/TailAudit/TailAudit.baseline` と差分を取り、新規があれば exit 1。
-追認は内容確認のうえ `-- --update`）。
+`default`・`value`・`old`・`type`・`base`・`key`・`begin`・`new`は識別子に使えない場合がある。
+意味の異なる番号はunits of measureで区別する。
 
-### 8.17 モジュールスコープには DU を `let` 束縛で書けない（FS0010）
+### 9.6 `f(x = y, msg)`は比較式ではなく名前付き引数になる
 
-ヘルパー化の過程で「テーブルの定義か索引の定義か」を表したいとき、
-`let private Kind = | A | B` と書くと FS0010 になる（`|` が binding に来た）。
-DU は `type` 宣言（モジュールスコープのものは `private` 可）か、
-**フラグと名前だけ返す**（`(bool * string) option`）のどちらか。
+比較式を二重括弧で囲む。
 
-- ✅ 1種類の値だけ返すなら `bool` フラグで足りる（`Catalog.keyKindOf` はこれ）。
-- ❌ 相互再帰でない `let` を `and` で並べると FS0576（ヘルパーを `and` にしてしまった）。
-- ❌ ローカル `let tryPrefix prefix = ...` の中で `Encoding.UTF8.GetBytes prefix` を
-  引数注釈なしのままだと FS0041（オーバーロード解決が決められない）。`let p: byte array = ...` と注釈する。
+### 9.7 privateはアセンブリ内では隠蔽しない
 
-### 8.18 レコードのフィールド名が既存型と衝突すると型推論が壊れる（FS3566）
+同じアセンブリの別ファイルからは見える場合がある。
+生ケース・レコードフィールドを隠すには`.fsi`を使う。
 
-既存の `Items` と同名のフィールドを持つレコードを追加すると、
-`{ stmt with Items = ... }` の `stmt` が `SelectStatement` ではなく新しい型と推論され、
-`FS3566 Multiple type matches were found` と
-`FS0039 ... does not define ... 'OrderBy'` が連鎖する。
+### 9.8 `[<TailCall>]`は末尾位置でだけ付ける
 
-- ✅ フィールド名を `SelectItems` にして、既存の `Items` と衝突させない。
-- ✅ 型名も用途が分かる `SelectProjection` にする。
-- 判断基準: 既存で広く使われているフィールド名（`Items` / `Name` / `Type` など）を
-  新しいレコードに付けない。
-- ⚠️ **後から型を足すと、既存の型注釈なし引数が壊れる**。
-  `ALTER TABLE` の `AlterTable = { Table: string; ... }` を追加しただけで、
-  `let createIndexCore ci state = ... ci.Table ...` の `ci` が `AlterTable` と推論され、
-  **`ci.Name` が FS0039** になった（`CreateIndex` と `Table` が衝突）。
-  → レコードを受ける関数は `(ci: CreateIndex)` のように**型注釈を付ける**。
-- ⚠️ **新しいレコードのフィールド名も既存と衝突させるな**。
-  `Prepared = { Schema; Columns; Likes }` を追加したら、`schema.Columns` を読むだけの
-  既存関数（`Analyzer` / `Optimizer` / `PlanBuilder`）が `Prepared` と推論され、
-  `ImmutableDictionary` に `.Length` が無いという FS0039 が大量に出た。
-  → `Source` / `Resolved` / `Patterns` に改名して解消。
-  判断基準: **`Columns` / `Rows` / `Name` / `Value` / `Items` / `Table` は既存で使われている**。
-  新規レコードでは用途が分かる別名にする。
+自己再帰が`>>=`・`map`・引数位置・ラムダ内の分岐に残る場合は付けないか、末尾再帰へ分解する。
+ローカル`let rec`には付けられないため、モジュールレベルへhoistする。
 
-### 8.18b レコードの `.Length` は配列と誤推論される
+### 9.9 Tailcallsを有効に保つ
 
-`let transform row = if row.Length = width then ... row.[i] ...` のように
-配列らしい値を受けるラムダで型注釈を省くと、`SstIndexEntry`（`Length: int` を持つレコード）と推論され、
-`row.[i]` が FS0039 / FS0001 になる。
+`Directory.Build.props`の`<Tailcalls>true</Tailcalls>`を外さない。
+式・サブクエリ・Parserは深さ上限なしのCPSで、テストでスタックを検証する。
 
-- ✅ `let transform (row: SqlValue array) = ...` と注釈する。
-- 判断基準: **`.Length` / `.Name` のような一般名のフィールドを読む引数は注釈する**。
+### 9.10 CPSグループの型を固定しない
 
-### 8.19 単位（units of measure）で番号を取り違えない（INV-04）
+相互再帰グループの各関数は具体型ではなく汎用の継続型を保つ。
+リスト走査や相関実行が型変数を固定すると、グループ全体が型推論に失敗する。
 
-`type TxnId = uint64` のような**型略記は安全性が 0**。
-`NextSeqNo: uint64` へ `manager.NextTxnId` を代入してもコンパイルが通る
-（2つは同じレコードで隣接していた）。
+### 9.11 struct DUのフィールド名と配置に注意する
 
-```fsharp
-// Types.fs（Memtable / Wal より前にコンパイルされる位置）
-[<Measure>] type manifestNo
-[<Measure>] type txnId
-type internal TxnId = uint64<txnId>   // 略記もここに置く
-```
+struct DUのケースにはフィールド名を付ける。
+`Unchecked.defaultof`で構築しない。コレクション要素や参照型化の対象にしない。
+`Kont`など参照DUのサイズと割当はベンチで確認する。
 
-- ✅ **片側だけ単位を付ける**（`ManifestNumber` ↔ `FileNumber`、`TxnId` ↔ `SeqNo`）。
-  片側だけでも対は区別できる。全サイトを触らずに済む。
-- ✅ 使えるもの: `sprintf "%d"` / `max` / `min` / `compare` / `=` / `Map` / `Set` / `Array.sort`。
-- ❌ **単位付きリテラルは明示**: `1UL` → `1UL<txnId>`、`1L` → `1L<manifestNo>`。
-- ❌ **素の値と単位付きの加減算は通らない**。
-  パース・ファイル名読み込みの境界で `LanguagePrimitives.Int64WithMeasure<manifestNo>` /
-  `LanguagePrimitives.UInt64WithMeasure<txnId>` を使う。
-- ❌ **単位付きの範囲**（`1UL<txnId> .. 20UL<txnId>`）は範囲演算子側が素の型を求めて失敗。
-  素の整数ループにしてから変換する。
-- ⚠️ **略記は使うファイルより前のコンパイル順に置く**。
-  `TxnId` を `Transactions.fs` に置いていたと `Wal.fs` から見えず、
-  `Types.fs`（measure のすぐ隣）へ移した。
-- 実行時は単位が消えるのでコストは 0。
+### 9.12 部分関数を公開境界へ出さない
 
-### 8.20 `f(x = y, msg)` は名前付き引数として解釈される（FS0691）
+`Array.reduce`・`Array.take`・`.Value`・`List.last`・`List.head`・`Array.forall2`などの例外経路を避ける。
+空入力と範囲外を先に検査し、型で表せない不変条件は`InternalError`/`CorruptionError`へ変換する。
 
-```fsharp
-// ❌ `v = int64 i` が名前付き引数と解釈され FS0691「Named arguments must appear after all other arguments」
-Assert.True(
-    v = int64 i,
-    sprintf "子が入れ替わっている: %d" i
-)
-// ✅ 比較式を二重括弧で囲む
-Assert.True(
-    (v = int64 i),
-    sprintf "子が入れ替わっている: %d" i
-)
-```
+### 9.13 build/testは並行実行しない
 
-`f(a = b)` の形は F# の名前付き引数構文になる。
-比較代入の `=` だけが該当し、`>=` / `<=` / `<>` は対象外。
+MSBuildのincremental stateとファイルロックが競合し、ソースが正しいのに幻影エラーになる。
 
-### 8.21 `private` はアセンブリ内の他ファイルには効かない（`.fsi` で隠す）
+### 9.14 SDK更新時はTailAuditを個別にビルドする
 
-行レベルの `private` で DU のケースを隠したつもりでも、同じアセンブリの他ファイルからは見える。
+TailAuditはソリューション外。FCS APIの型変更はソリューションのビルドでは検出されない。
+SDK更新後は`dotnet build tools/TailAudit/TailAudit.fsproj -t:Rebuild`を実行する。
 
-```fsharp
-// Op.fs
-[<RequireQualifiedAccess>]
-type internal Op =
-    | Done
-    | Step of SqlValue array * Op
-    | Compute of (unit -> OpStep)
-// ❌ どちらのファイルからも Op.Done / Op.Step が書けてしまう
-```
+### 9.15 FSharp.Coreの復元元を固定する
 
-✅ **シグネチャファイル（`.fsi`）でケースを書かなければ、実装ファイル以外から構築・パターンマッチできない**。
-
-```fsharp
-// Op.fsi（Op.fs の直前に .fsproj へ並べる）
-type internal Op
-
-module internal Op =
-    val Empty: Op
-    val next: Op -> OpStep
-```
-
-- 効く範囲は `src` の他ファイルだけでなく、`InternalsVisibleTo` 先のテストにも及ぶ。
-- ⚠️ 実装が**計算済みの関数値**（部分適用）のときは戻り値を括弧で囲む。
-  囲まないと FS0034「arities in the signature and implementation differ」になる。
-
-```fsharp
-val skip: (int -> Op -> Op)          // ✅ 実装が let skip = ... の関数値
-val toArray: Op -> Result<...>      // ✅ 実装が関数定義
-```
-
-- `type X = private { ... }` を `.fsi` に書くと、
-  **別アセンブリからは構築できないが、同一アセンブリの他ファイルからは構築できる**。
-  src 内の不変条件には不十分で、表現を完全に隠す `type X` が必要。
-- 不透明化した record のフィールドは `member` で公開できない（FS0193 / FS0938）。
-  読み取りは **関数**（`val approxBytes: X -> int` など）で公開する（例: `Memtable.fsi`）。
-- ⚠️ `[<Struct>]` レコードは表現を隠せない（FS0927「kind ... does not match」/ FS0300）。
-  struct 型は `.fsi` の適用対象から外す（`BloomFilter` が該当）。
-- `IDisposable` を実装する型を不透明にするときは、シグネチャに
-  `interface System.IDisposable` を書き、型の種別を `[<Sealed>]`（DU） / `[<Class>]`（通常クラス）で示す
-  （FS0050 / FS0938 / FS0297）。
+`DisableImplicitLibraryPacksFolder=true`でnuget.orgへ固定する。
+ロック更新時は古いFSharp.Coreパッケージキャッシュを消して`dotnet restore --force-evaluate`を実行する。
 
 ---
 
-## 9. テスト・ビルドの罠
+## 10. テストとデバッグ
 
-### 9.1 `[<Fact>]` は関数でない let 束縛に付くと黙って無視される（FS0842）
+### 10.1 `[<Fact>]`には関数形を使う
 
-```fsharp
-// ❌ 実行されない（FS0842 が警告、しかしエラーに昇格しない）
-let ``説明`` = assertEqual 1 1
-// ✅ 関数形
-let ``説明`` () = assertEqual 1 1
-```
+値束縛に`[<Fact>]`を付けても無視される。
+`let ``説明`` () = ...`とする。
 
-「全部緑なのに 0件しか走っていない」状態になる。
-そこで、`[<Fact>]` の件数をリフレクションで数えるテストを置いた。
+### 10.2 テストディレクトリは明示的に作る
 
-### 9.2 `withDir` はディレクトリを作らない
+`withDir`ではディレクトリが作られないので、`Directory.CreateDirectory`を呼ぶ。
+`try/finally`で削除する。
 
-```fsharp
-// ❌ ディレクトリが無いので失敗する
-let withDir tag f = f ("/tmp/" + tag)
-// ✅ 明示的に作る
-let withDir tag f =
-    let dir = Path.Combine(Path.GetTempPath(), sprintf "rykdb-%s-%d" tag DateTime.Now.Ticks)
-    Directory.CreateDirectory dir |> ignore
-    try f dir finally Directory.Delete(dir, true)
-```
+### 10.3 Assertの型を揃える
 
-### 9.3 `Assert.Equal<int64>(3L, list.Length)` は通らない
+`list.Length`は`int`。`int64`として比較しない。
 
-`list.Length` は `int`。`Assert.Equal<int>(3, list.Length)` にする。
+### 10.4 SIGABRTは件数ではなくスタックを疑う
 
-### 9.4 `dotnet build` / `dotnet test` を並行で走らせない
+末尾再帰・`>>=`・CPS・deep ASTの経路を確認する。
+`dotnet test --logger "console;verbosity=detailed"`で切り分ける。
 
-ビルドロック競合で謎の `Error` が出る。**逐次実行**すること。
+### 10.5 ガードは一度わざと失敗させて検証する
 
-並行にすると incremental state が壊れ、
-`StorageEngine.fs(338): error FS0039 'isEmpty' is not defined`
-のような**幻影エラー**が出る（ソース自体は正しい）。
+禁止事項や`.fsi`の検査は違反を組み込んで落ちることを確認する。
+常に緑になるガードは機能していない可能性がある。
 
-### 9.5 テストが SIGABRT すると件数が不定になる
+### 10.6 actions/setup-dotnetのcacheはglobを明示する
 
-実行済み分だけ報告される。`--logger "console;verbosity=detailed"` で個別に切り分ける。
+lockファイルが複数プロジェクトに分散する場合は`cache-dependency-path: "**/packages.lock.json"`を指定する。
 
-### 9.6 乱数生成のテストは seed 固定だと退行する
+### 10.7 WindowsのファイルハンドルをLinuxでも再現する
 
-`let rnd () = Random(seed)` は全ケースが同じ値になり、バグを検出できないまま緑になる。
+SSTableの走査は終端・エラー・Disposeで閉じる。
+`ofStepWithClose`を使わないか、close漏れを発生させるテストを用意する。
 
-モジュールスコープに `Random` を 1つ置き、「テストデータ: 乱数生成器が実際に多様な値を返す」で明示的にアサートする。
+### 10.8 DLLを直接叩くときは参照先を揃える
 
-### 9.7 TailAudit は SDK の**パッチ更新**でビルドできなくなる（FCS API の変化）
+FSIでの相対パス参照を確認し、コピーしたDLLを参照しない。
 
-TailAudit は FCS を `$(MSBuildBinPath)/FSharp/FSharp.Compiler.Service.dll` から参照するため、
-**SDK のパッチ更新で FCS の AST 型が変わるとビルドが落ちる**。
-2026-11 の 10.0.404（FCS 43.12 → 43.13）で実際に発生した:
+### 10.9 ファイルを整形したらリビルドする
 
-- `FSharpParsingOptions.StrictIndentation` が廃止 → FS0039
-- レコード式のフィールドが `SynExprRecordField` → `SynExprRecordFieldOrSpread`（`Field` / `Spread`）に包まれ、
-  `SynExprRecordField` 自体も 5 引数 → 4 引数に → FS0001 / FS0019 / FS0025
-
-`dotnet-version: "10.0.x"` のようなパッチを許す指定では防げない
-（`ubuntu-latest` のイメージが新しいパッチに追従した時点で CI だけ落ちる）。
-対策は**型の形に依存しない書き方**:
-
-- `FSharpParsingOptions` はレコードリテラルを書かず
-  `checker.GetParsingOptionsFromCommandLineArgs` で作る。
-- レコード式のフィールド式は `SynExprRecordField` を直接パターンマッチせず、
-  共用体 / レコード / 列を反射でたどって `SynExpr` を集める（`containedExprs`）。
-
-SDK を上げたら `dotnet build tools/TailAudit/TailAudit.fsproj -t:Rebuild` を必ず流すこと
-（TailAudit は `RykDb.slnx` に含まれないので、`dotnet build -t:Rebuild` では検出できない）。
-CI の失敗が `tools/TailAudit/Program.fs` の FCS 型エラーなら、まずログの `dotnet --version` を見る。
-
-### 9.8 禁止を検査するガードは「一度は落ちること」を確かめる
-
-禁止を検査するテストやシグネチャは、違反が 0件だと**常に緑**になる。
-正しく動いていない（条件が噛み合っていない）ことも分からない、**空振りのガード**である。
-
-- ✅ 設計時に一度、禁止に該当するコードを紛れ込ませて**必ず落ちる**ことを確認する。
-  `.fsi` を追加したときは、外から生ケース・レコードを書いて **FS0039** になることを実測する
-  （`Op.fsi` / `Writer.fsi` / `SstScan.fsi` / `Cursor.fsi` / `Memtable.fsi` で実施）。
-- ✅ ソース検査を残す場合は、許可リストの**理由**をコメントに残し、検査対象を `src/` のみにする。
-- ✅ `.fsi` 化で「不正な値を作って試すテスト」が書けなくなったら、そのテストは削除してよい
-  （不変条件が構築時に保証されるため。例: `Reader` の範囲外 Cursor テスト）。
-
-### 9.9 `actions/setup-dotnet` の `cache: true` はリポジトリ直下の lock ファイルしか探さない
-
-```text
-Error: Dependencies lock file is not found in /home/runner/work/<repo>/<repo>.
-Supported file patterns: packages.lock.json
-```
-
-`cache-dependency-path` を指定しないと、`setup-dotnet` は `GITHUB_WORKSPACE` 直下を
-`readdir` して `packages.lock.json` を探すだけ（`src/cache-restore.ts` の `findLockFile`）。
-本リポジトリの lock ファイルは `src/` / `tests/` / `tools/` の各プロジェクト配下に分散しているため
-1件も見つからず、**「Setup .NET」ステップで CI が即死**する（`dotnet restore` まで到達しない）。
-
-対策は glob を明示すること:
-
-```yaml
-- uses: actions/setup-dotnet@v6
-  with:
-    dotnet-version: "10.0.x"
-    cache: true
-    cache-dependency-path: "**/packages.lock.json"
-```
-
-`cache-dependency-path` は `@actions/glob` の `hashFiles` にそのまま渡るので、glob を受け付ける。
-パターンが 1件も一致しないと `Some specified paths were not resolved, unable to cache dependencies.` で落ちる。
-
-### 9.10 `--locked-mode` が NU1403（FSharp.Core の contentHash 不一致）で落ちる
-
-```text
-error NU1403: Package content hash validation failed for FSharp.Core.10.1.404.
-The package is different than the last restore.
-```
-
-`Microsoft.FSharp.NetSdk.targets` は SDK 同梱の `<SDK>/FSharp/library-packs` を NuGet ソースとして追加する
-（`RestoreAdditionalProjectSources`）。
-このフォルダの `FSharp.Core.10.1.404.nupkg` は **nuget.org の同名・同バージョンのパッケージと中身が違う**
-（同じコミット表記でも別ビルド。実測では 2026-10-30 の 10 分違いのビルドで、
-`FSharp.Core.dll` のバイト列・`.signature.p7s`・`FSharp.Core.xml` のサイズが異なっていた）。
-
-`contentHash` は「その nupkg の中身」のハッシュなので、
-環境ごとに library-packs（Linux 開発機・ubuntu ランナー）と nuget.org（Windows ランナー）の
-どちらが選ばれるかで lock ファイルと一致しなくなる。
-`--locked-mode` では即エラーになる。
-
-対策は library-packs を無効化して復元元を nuget.org に固定すること（`Directory.Build.props`）。
-
-```xml
-<DisableImplicitLibraryPacksFolder>true</DisableImplicitLibraryPacksFolder>
-```
-
-無効化したうえで `dotnet restore --force-evaluate` を実行し、
-lock ファイルの `contentHash` を nuget.org の値へ更新する。
-ただし `~/.nuget/packages/fsharp.core/<ver>/` に library-packs 由来のパッケージが残っていると
-**古いハッシュのまま再評価される**ので、先にそのフォルダを消す。
-
-```bash
-rm -rf ~/.nuget/packages/fsharp.core/10.1.404
-dotnet restore --force-evaluate
-# TailAudit はソリューション外なので個別に
-dotnet restore tools/TailAudit/TailAudit.fsproj --force-evaluate
-
-grep -h -A1 '"resolved": "10.1.404"' src/*/packages.lock.json tests/*/packages.lock.json tools/*/packages.lock.json \
-  | grep contentHash | sort -u          # 1種類だけになること
-cat ~/.nuget/packages/fsharp.core/10.1.404/.nupkg.metadata   # source が api.nuget.org になること
-```
-
-### 9.11 `SstScan` の step 走査に後始末が無いと Windows でファイルを消せない
-
-```text
-Result が Error でした: The process cannot access the file because it is being used by another process. [IOException]
-```
-
-- 症状: **Windows だけ** `RowStore: compaction 失敗後も flush 結果を保持し、再起動で commit を失わない` が落ちる。
-  失敗位置は再オープン時の孤児退避（`openDatabaseWith` → `.orphans` への `File.Move`）。
-- 原因: compaction が壊れた入力（チェックサム不一致）で中断すると、他の入力の走査が途中で捨てられる。
-  `SstScan.ofStep` は **`Dispose` を持たない**ため、ファイルを所有する step は
-  `SstScan.ofStepWithClose` で作る必要がある。
-  Linux は開いたままで `unlink` / `rename` できるので `File.Move` が成功し、Windows だけ共有違反になる。
-- 対策: ファイルを所有する step 走査は `SstScan.ofStepWithClose step close` で作る
-  （`Sstable.rangeScanPartial` / `RowStore.scanWithinPrefix`）。
-  `SstMerge.next` が途中で `Error` になった場合も、残りのソースを閉じる。
-- 検出: Linux でも `FileShare` は flock で強制される
-  （`FileShare.Read` のハンドルがあると `FileShare.None` のオープンが `IOException` になる）。
-  テスト `RowStore: compaction 失敗で中断した走査は入力 SSTable のハンドルを残さない` が
-  Windows の共有違反と同じ条件を Linux で検査する。
+Fantomas後は`dotnet build -t:Rebuild`を必ず実行する。
+FS0020など整形後の警告を検出する。
 
 ---
 
-## 10. デバッグ手法
-
-### 10.1 `/tmp/probe.fsx` で DLL を直接叩く
-
-```fsharp
-#r "src/RykDb.Core/bin/Debug/net10.0/RykDb.Core.dll"   // リポジトリルートからの相対パス
-open RykDb.Core
-
-let ok r = match r with | Ok v -> v | Error e -> failwithf "%s" (DbError.toDisplayString e)
-
-let dir = "/tmp/probe-db"
-if System.IO.Directory.Exists dir then System.IO.Directory.Delete(dir, true)
-
-let session = ok (Session.OpenWith dir)
-ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
-// ... 1 演算子ずつ確認 ...
-```
-
-重要: **DLL をコピーしないこと**。
-FSI は `/tmp/probe.dll` のようなパスをキャッシュする。
-**呼び出し側が同じ DLL を参照しているか**確認すること。
-
-### 10.2 データが本当にディスクに書かれたか確認
-
-全 keyspace がルート直下の 1本の LSM に入る
-（`t:people` の行は `[長さ]["t:people"][主キー]` という物理キーになる）。
-
-```fsharp
-System.IO.Directory.GetFiles(dir, "*", System.IO.SearchOption.AllDirectories)
-|> Array.iter (fun f -> printfn "%s (%d B)" f (int (System.IO.FileInfo f).Length))
-```
-
-### 10.3 treap の検索が O(n) になっていないか
-
-`Memtable.getVisible` を使うようにすると **43ms → 0.3ms** になった。
-「ポイント検索が遅い」ときは、まず `rangeScan` を使っていないか確認する。
-
-### 10.4 fantomas で整形したら必ずリビルド
-
-```bash
-dotnet fantomas tests/RykDb.Tests/
-dotnet build -t:Rebuild   # FS0020（戻り値の無視）などは整形後に増える
-```
-
----
-
-## 11. 設計上の注意点
-
-| #   | 注意点                                    | 詳細         |
-| --- | ----------------------------------------- | ------------ |
-| 1   | **`Op` の継続を飛ばさない**               | §2.2         |
-| 2   | **`exec` には「入力スキーマ」を渡す**     | §3.1         |
-| 3   | **再帰を `>>=` で組まない**               | §2.3 / §8.12 |
-| 4   | **ポイント検索に `rangeScan` を使わない** | §4.1         |
-
-### 11.1 `Array.take` に「全部」を表す巨大数を渡さない
-
-FSharp.Core の `Array.take` は `Seq.take` 相当で、要素数が足りないと
-`The input sequence has an insufficient number of elements.`
-で落ちる（`Int32.MaxValue` を「全部」の意で渡さない）。
-
-### 11.2 ファイル番号を巻き戻さない
-
-`NextFileNumber` は MANIFEST に残らない（§4.4）。
-復旧時にディスク上の最大番号より小さい値に戻すと、
-**次の flush が既存の SSTable を上書きしてデータを失う**。
-復旧時は必ず `maxFileNumberOnDisk + 1` で上へ進める。
-
-### 11.3 削除は主キー + 全索引に墓碑を書く
-
-論理 keyspace を分けている代償として、削除は主キー側に加えて**全索引にもtombstone を書き込む**。
-索引側を忘れると、索引経由の検索で**削除済みの行が復活する**。
-
-### 11.4 MANIFEST を先に、ファイル削除を後にする
-
-compaction / version 適用では **MANIFEST への反映が先、入力ファイルの削除が後**。
-逆順にすると「MANIFEST は新しいがファイルは古い」状態になり、
-**データ損失**になる（§4.4 参照）。
-
-### 11.5 SSTable の検証はレコードの構造比較を使ってはいけない
-
-並びは「キー昇順・同一キーは SeqNo 降順」（`SstEntry.compare`）。
-レコードの構造比較（F# のレコード等価）はこの順序と一致しないため、
-検証に使うと正しく並んでいるファイルを「壊れている」と誤判定する。
-
-### 11.6 順序保持符号化の実装ミス（キー順が壊れる）
-
-- `int64` の順序写像に `~~~` は**使えない**。
-  `-1` のビットパターンが全 1 なので反転すると最小になり `-2` より小さく並ぶ。
-  正しくは `mapInt64 v = (uint64) v + 0x8000000000000000UL`。
-- `DECIMAL` の raw ビット列（96bit + スケール）も順序保持にならない。
-  内部表現は `(符号, 10進指数, 桁列 29桁右詰め)` で、**負数は指数も桁列も両方反転**する。
-- `Double.NaN` は .NET では符号ビットが立っている。
-  正の quiet NaN に正規化しないとキー順が壊れる（`SqlValue.normalizeFloat`）。
-
-### 11.7 エスケープ付きフィールドの終端は 1 バイト戻す
-
-`TEXT` / `BLOB` のペイロードは `0x00` を `0x00 0xFF` に escape し、フィールド終端に素の `0x00` を置く。
-復号する場合は終端 `0x00` の**次を 1 バイトピーク**して、`0xFF` なら escape の続き、
-それ以外なら「ここがフィールド終端で、ピークしたバイトは次フィールドの先頭」と判定する。
-このときカーソルを**終端バイトを指す位置**（ピーク分を戻す）にしないと、
-終端検証が次フィールドのタグを読んで `終端が不正 (0xXX)` で失敗する。
-
-### 11.8 keyspace 横断 commit は 1回の WAL バッチにする
-
-テーブルと索引は論理 keyspace が別だが、物理ツリーと WAL は DB 全体で 1本。
-`RowStore.commitToStoreWith`（内部の `writeBatchesWithSnapshotWith`）は
-全 keyspace のエントリに接頭辞を付けて **1つの `Entry array`** にまとめ、
-`StorageEngine.writeBatch` を 1回だけ呼ぶ。
-WAL には `Begin / Batch / Commit` が 1回の `Wal.append` で書かれるため、
-「テーブルだけ書けて索引が書けない」状態は発生しない。
-
-- **WAL 追記の成功を commit point にする**。
-  その後の memtable flush 失敗で `Error` を返してはいけない。
-  呼び出し側が `TransactionManager` を進めず、同じ SeqNo を再利用してコミット済み WAL と食い違う。
-- flush に失敗しても `WriteBatch` が返した memtable は保持し、成功を返す。
-  次の commit / `Close` で flush を再試行する。
-- 回帰テスト: `RowStore: 複数 keyspace の書き込みは 1 回の WAL バッチで回復する`。
-
-### 11.9 `ActiveSnapshot = 0` は「全版を残す」
-
-`Compaction.gcGroup` は `ActiveSnapshot = 0` を「全版を残す」として扱う。
-0 を「最新版だけ残す」と解釈すると replay 中や境界未設定時に履歴を失う。
-replay 中や境界未設定時は 0 のままにし、通常の commit では
-`TransactionManager.activeSnapshot`（active の最小 snapshot、無ければ `LastCommitSeqNo + 1`）を設定する。
-
-### 11.10 DROP は種類ごとに安全な順序で行う
-
-`DROP TABLE` / `DROP INDEX` はカタログから定義を外すだけでは不十分。
-論理 keyspace の接頭辞は名前から決まる（`t:<name>` / `i:<name>`）ので、
-残骸があるまま同名で再作成すると**旧データや旧索引エントリが見える**。
-特に「索引を DROP → 行を DELETE → 同名 CREATE INDEX」の順では、
-DELETE 時に索引 tombstone が書かれないため、backfill 後の索引検索で削除済みの行が復活する。
-
-- `DROP TABLE` / `DROP INDEX` は、カタログ削除の前に後始末対象 keyspace を
-  root の `.drop-cleanup` ジャーナルへ書く。
-- その後でカタログ定義を外し、keyspace を 8192エントリずつ tombstone 消去する。
-- 後始末が成功したらジャーナルを消す。
-  途中で失敗・クラッシュしても、次回 `Session.OpenWith` がジャーナルを読み、
-  カタログに存在しない keyspace だけを再消去する。
-- カタログに定義が残っている場合（カタログ削除前にクラッシュ）は、
-  DROP 未完了としてジャーナルを捨て、データは消さない。
-- 残骸は同名の `CREATE TABLE` / `CREATE INDEX` も掃除する。
-
-### 11.11 compaction の出力分割は「件数」ではなく「バイト」、かつキーの切れ目で切る
-
-`SstEntry.splitInto (MaxInputFiles * 4)` のように **ファイル数の上限をエントリ数として使う**と、
-値の大きさに関係なく 128エントリで分割され、大きい値では 1ファイルが肥大化する。
-出力は `CompactionOptions.OutputFileTargetBytes`（既定 4MiB）と `SstEntry.approximateBytes` の
-概算バイトで分ける（厳密なファイルサイズではない）。
-
-- **1キー分の版が複数ファイルに跨らない**ように、キーグループの切れ目で切り替える
-  （`Compaction.compactWith` 内の `pump`）。
-  1キー分が目標を超える場合は、そのキーだけで 1ファイルにする（空のファイルは作らない）。
-- 入力は `SstScan`（部分読みリーダー）+ `SstMerge` で 1件ずつ読み、
-  出力中の 1ファイル分だけをメモリに持つ。入力全体は実体化しない。
-- 固定長の型の定数は `ValueCodec.fixedEncodedBytes` に集約し、
-  SSTable のファイルサイズ見積り（`ValueCodec.approximateBytes` / `SstEntry.approximateBytes`）と共有する。
-  memtable のメモリ見積りは `Entry.managedBytes`（`ValueCodec.managedBytes` / `managedRowBytes`）を使う
-  （TEXT / BLOB だけは、memtable が安価な UTF-16 長、SSTable が UTF-8 実バイト数と方針が違う）。
-- 途中で読み取り・書き込みエラーになると、それまでに作った出力ファイルは
-  `Compaction.compactWith` 内の `pump` が `deleteOutputs` で削除する。
-  プロセスがクラッシュした場合などに残った出力だけが
-  MANIFEST に載らず、次回オープン時に孤児として `.orphans/` へ退避される（§11.13）。
-- 回帰テスト: `Compaction.compact: 出力はエントリ数ではなく OutputFileTargetBytes ごとに分ける` /
-  `Compaction.compact: 同じキーの版は出力ファイルを跨がない` /
-  `Compaction.compact: 複数ブロックの入力をストリーミングで読み書きできる` /
-  `Compaction.compact: 多数の入力ファイルをストリーミングでマージする`。
-
-### 11.12 `LastCommitted` は commit のたびに active snapshot 以前を捨てる
-
-`LastCommitted` は書き込みキーの衝突検出用だが、捨てないと**プロセス寿命の間ずっと全キーを保持**する。
-`TransactionManager.commit` は自分の transaction を `Active` から外した後で `activeSnapshot` を取り直し、
-`SeqNo < その値` の版を `Map.filter` で捨てる。
-
-- 生きている transaction の snapshot 以降の版だけが衝突判定に使われる
-  （衝突条件は「commit の SeqNo > txn の snapshot」なので、それより古い版は不要）。
-- active が無ければ境界は `LastCommitSeqNo + 1`。次の commit で直前の commit の版まで掃除される。
-- 掃除を「commit した版そのものを除く」にすると、まだ古い snapshot の transaction が
-  同じキーを書いたときに衝突を見逃すので、必ず `activeSnapshot` を基準にする。
-
-### 11.13 MANIFEST が壊れていたら「空の Version」で開かずエラーにする
-
-`Manifest.openOrCreate` 内の `decodeLines` は**途中**のレコード破損を `CorruptionError` にし、
-**末尾の書きかけ**だけを読み飛ばす。
-`CURRENT` の指す manifest が無い場合や、`CURRENT` が無い/空なのに `*.sst` が残っている場合もエラーにする。
-
-- 空の Version を返すと `StorageEngine.openDatabaseWith` が全 SSTable を孤児として扱い、**データが見えなくなる**。
-- 孤児は削除せず `<root>/.orphans/` へ退避する（`quarantineOrphans`）。
-  manifest を読み落としただけのケースでも実体は復元できる。
-- 末尾の書きかけを許容するのは、`logAndApply` の `fs.Write` + `Flush(true)` が途中で切れた場合のため。
-- 各レコードは `[checksum:u32LE][VersionEdit 本体]` のフレーム（CRC32C）を base64 にした 1行。
-  base64 としては正しいが中身が壊れた行もチェックサムで検出する。
-- 回帰テスト: `Manifest: 途中の壊れたレコードは CorruptionError` /
-  `Manifest: 途中のレコードのチェックサム不一致は CorruptionError` /
-  `Manifest: CURRENT が指す MANIFEST が無ければ CorruptionError`。
-
-### 11.14 `DatabaseHost.Close` は二重 Close を no-op にする
-
-`DatabaseHost` がストアの唯一の所有者で、`HostLifecycle.Closed` が二重 Close を吸収する。
-`StorageEngine.close` の WAL サイズ比較（古い書き手が flush しない）は防御として残す。
-
-### 11.15 DDL は明示トランザクションに参加しない（ので拒否する）
-
-カタログと SSTable（索引 backfill）の更新を同じ transaction に載せる設計になっていない。
-黙って DDL を auto-commit すると:
-
-- `BEGIN; CREATE TABLE ...; ROLLBACK` でテーブルが残る。
-- `BEGIN; INSERT ...; CREATE INDEX ...; COMMIT` の backfill が未 commit 行を見ないため、
-  索引検索が行を取りこぼす。
-
-`Engine.runStatement` は `Active` な transaction があるとき DDL を `SyntaxError` にする。
-DDL を transaction に載せる設計に変えるまでは、この制約を維持する。
-
-### 11.16 `CREATE INDEX` は backfill → カタログの順で行う
-
-逆順（カタログ → backfill）だと backfill の失敗で「索引はあるが中身が無い」状態が永続化され、
-再オープン後も索引検索が行を取りこぼす。
-`Ddl.createIndex` は既存の索引エントリをチャンク単位で tombstone 消去してから、
-現在行を 8192行ずつ backfill し、成功後にカタログへ登録する。
-途中で失敗しても索引はカタログに載っておらず、次回の `CREATE INDEX` が残骸を消してからやり直す。
-
-### 11.16a DDL（CREATE INDEX など）は `RootRuntime` で排他にする
-
-backfill の途中に別の書き込みが入ると、**その行が索引に載らない**（逆に、消えた行の
-エントリが残る）。
-DDL だけは DB ごとに排他にする必要がある。
-
-- 文の実行と commit は `RootRuntime.WithShared`、DDL は `RootRuntime.WithExclusive`（§7.8）。
-- DDL は排他を取ったあと `RootRuntime.OldestExcept` を見て、
-  **同じ root で実行中の transaction があれば `ConflictError`** を返す。
-  古いカタログで計算した索引エントリを後から commit されるのを防ぐため。
-  **待たない**（commit されないまま残った transaction で永久に止まらないように）。
-- 同じスレッドで「共有 → 排他」の昇格はできない。
-  そのため `DatabaseHost.ExecuteNonTransaction` は **DDL 文だけ共有ロックを取らない**（`Ddl` 側が排他を取る）。
-- 結果: トランザクションを `Rollback` / `Commit` せずに捨てると、その登録が残り、
-  **その root の DDL は `ConflictError` になる**。
-  `Close()` / `Dispose()` で解除され、接続への参照が切れて GC されても外れる
-  （`TxnState.Lease` の `RegistrationLease`。§7.5）。
-  GC の時期は不定なので、明示的に終わらせるのが基本。
-- 回帰テスト: `SessionPool: transaction 中の DDL は他接続で ConflictError` /
-  `DatabaseHost: commit せずに捨てた transaction も GC されれば登録が外れる` /
-  `DatabaseHost: 生きている transaction は GC されても登録が残る` /
-  `DatabaseHost: Dispose でも transaction の登録が外れる`。
-
-### 11.16b 二重オープンは「ロック + 台帳」で防ぐ
-
-`FileShare.None` で他プロセスは防げるが、**同じプロセスの二重オープンは別問題**。
-`Session.OpenWith` のたびに別の `RowStore`（別 memtable / WAL ビュー）ができ、
-一方の commit が他方から見えない（**古い行を黙って返す**）。
-そこで `ProcessLock` は台帳（正規化 root → トークン → `FileStream`）を持ち、
-**既にこのプロセスが開いている root の 2回目は `IoError`** にする。
-
-- 失敗を返す方が、黙って古い行を返すより安全。
-- **所有者（`DatabaseHost.Close`）** でロックを解放（二重 `Close` は無害）。
-  所有者は 1つだけなので、他の接続の Close がロックを外す問題は起きない。
-- **クラッシュ再現テストは `RowStore.openStoreTakingOver` と internal の `Session.OpenWithStore` を使う**。
-  ここだけは意図的に二重オープンし、WAL 再生を検証する。
-- 開く途中で失敗したら（壊れた MANIFEST など）**必ず解放する**。
-  押さえたままだと、同じプロセスからも再オープンできない。
-- 注意: `FileShare` の強制力は OS / ファイルシステム依存（同一マシンのローカル FS 前提）。
-- 回帰テスト:
-  `Session: 別プロセスが開いている DB は開けない` /
-  `Session: 同じ root を二度開くと同じプロセスのエラーになり、Close 後は開ける` /
-  `Session: transaction 中の Session を Close してもロックが外れる`。
-
-### 11.17 識別子の比較は `SqlName.equal` に一本化する
-
-`TableSchema.indexOf` が完全一致で `Catalog.eqName` が `OrdinalIgnoreCase` だったため、
-`CREATE INDEX ix ON c (V)` が成功しても索引キーに列が入らず、索引検索が **0 行** を返していた
-（UNIQUE 索引では `row.[-1]` で未捕捉の `IndexOutOfRangeException`）。
-`Types.fs` の `SqlName.equal` をカタログ・スキーマ・実行層で共用する。
-`PRIMARY KEY (ID)` と列 `id` の対応も同じ規則で解決する。
-
-### 11.18 `LIMIT` / `OFFSET` は 0 以上の定数式
-
-非リテラルを `0` に丸めると `LIMIT 1+0` が **0行** になる（かつてドキュメントは「制限なし」と書いていた）。
-現在の `PlanBuilder.buildLogicalWith` 内の `applyLimit` は定数式を `Eval.eval Schema.empty [||]` で評価し、
-行ごとの列参照・負数・`Int32.MaxValue` 超をエラーにする。
-`Limit` ノードの `limit = -1` が「LIMIT なし」、`0` は 0行。
-
-### 11.19 走査の開封エラーを握り潰さない
-
-開けなかったファイルを空と見なすと、
-壊れた SSTable があるとき `Ok` のまま行が欠ける（静かな誤答）。
-現在の `StorageEngine.scanAtValues` / `scanAtMasked` は pull（`SstScan`）を返し、
-候補ファイルをキー下限順に必要になった時点で `prepare` で開き、
-開封・ブロック解析のエラーをその `next` が返す（§11.24）。
-全件走査でも必要になったファイルだけを開く（最初に一括では開かない）。
-`limit > 0` は limit 件で止まるため、到達しない後続ファイルの破損は検出しない。
-全件を消費する SQL 演算子（集約・ソート・DISTINCT など）は、
-途中で Error になれば最終結果を返さない。
-
-### 11.20 壊れたデータは未捕捉例外にしない
-
-ファイル内容から値を復元するコンストラクタは例外を送出し得る。境界で検証して `CorruptionError` にする:
-
-- `Sstable.parseBlockAt`: `shared > prev.Length` を拒否。
-- `Sstable.parseFooterBytes` / `validateFooter`: 未知バージョン、セクションの重なり・隙間・範囲外を拒否。
-- `ValueCodec`: DECIMAL の flags/scale（scale ≤ 28・予約ビット 0）、DATE / TIMESTAMP の範囲。
-- `VersionEdit`: レベルは `0..Levels.Max`。
-- `BloomFilter.deserialize`: ビット数・ハッシュ数 0、8 の倍数でないビット数、過大な件数、余分な末尾バイトを拒否
-  （`% 0` と過大確保の防止）。
-
-### 11.21 `Result` を握り潰さない（DEFAULT / `Begin()` / schema）
-
-- `DmlOps.insert`: 未指定列の DEFAULT の評価エラーを `NULL` にしない（値を指定した列の DEFAULT は評価しない）。
-- `DatabaseHost.Begin` / `Session.Begin()` は `Result` を返す
-  （カタログ再読み込みの失敗を隠さない）。
-- `Engine.contextOf`: `Catalog.toSchema` の失敗を無視せず、文のエラーとして返す。
-- `Ops.sortBy`: 非 NULL の代表値と比較できない値があれば、ソート前にエラーにする。
-
-### 11.22 SSTable の読み取りメタデータは `Version` に付随させる（キャッシュしない）
-
-`FileMetaData.ReadInfo` は Footer / index / Bloom / meta の解析結果（`SstReadInfo`）を持つ。
-これはファイル内容だけで決まる不変の値で、**DB やプロセスの寿命にわたるキャッシュではない**。
-
-- flush / compaction は書き出し時に `SstWriteInfo`（`Index` / `Bloom`）から組み立てる。
-- MANIFEST から復元したファイルは `openDatabaseWith` が 1回だけ hydrate する。
-- **書き込み後にファイルを差し替えても `ReadInfo` は古いまま**。
-  再オープンで初めて検出する
-  （回帰テスト: `StorageEngine.openDatabase: 書き込み後に壊れたファイルは再オープンで検出する`）。
-  遅延オープンの検証（`twoFilesWithBrokenSecond`）は `ReadInfo = None` にして
-  「必要なときに開く」経路を検査する。
-- ブロックの解析結果はキャッシュしないので、ポイント検索は毎回 1ブロックを読んで先頭から走査する
-  （実測は §8.2）。
-
-### 11.23 DISTINCT / GROUP BY のキーは文字列化しない
-
-- **`SELECT DISTINCT`**: `ValueCodec.writeValues` で行を扁平なバイト列にしてから
-  `HashSet<byte array>` に入れ、重複を判定する（同じ値なら同じ列になる）。
-  `SqlValue array` のまま抱えるとボックス付きオブジェクトが山盛りになるため。
-  作業メモリ（既定 256MiB）を超えたらパーティションへ退避し、最初に現れた順を保って完走する。
-- **`GROUP BY`**: `HashIdentity.Structural` で `SqlValue array` を構造比較する（NULL は NULL 同士で等しい）。
-  行は抱えず、グループごとのアキュムレータだけを更新する。
-  上限を超えたら以降の行をグループキーで退避してパーティションごとに集約する。
-- `COUNT(DISTINCT)` は `Set<SqlValue>` を持ち、上限超過分は符号化値を run へ退避して
-  外部ソートで重複を除く。
-- `SqlLiteral` による文字列化は表示専用で、行ごとのホットパスでは使わない。
-
-### 11.24 limit 付き scan は後続の SSTable を開かない
-
-`StorageEngine.scanAtValues` / `scanAtMasked` は `limit > 0` のとき、
-**必要になったファイル・ブロックだけ**を開き、`limit` 件に達したら止まる。
-そのため、limit で到達しない後続 SSTable / ブロックの破損・欠落はそのクエリでは検出されない
-（全件走査でも必要になった時点で検出し、クエリは結果を返さない）。
-これは「先頭 limit 件に寄与しないデータは読まない」という最適化の副作用。
-`StorageEngine.openDatabaseWith` は `FileMetaData.MaxSeqNo` を使うため起動時にデータブロックを読まない。
-したがって起動時にも検出されない。
-全件を読むクエリ（`limit = 0`）で、そのファイルに到達した時点で検出する。
-
-### 11.25 LIMIT pushdown は Filter / Sort / Aggregate を越えない
-
-`Optimizer` は `Limit` の件数ヒント（`OFFSET + LIMIT`）を `Project` だけ通して `Scan` に降ろす。
-`Filter` / `Sort` / `Aggregate` / `Distinct` / `Join` は行数を変える（または順序を作る）ため、
-ヒントを落として全件走査に戻す。`WHERE` 付きの `LIMIT` は pushdown されない。
-
-**例外は主キー順の `ORDER BY`**。単一テーブル・集約なし・`DISTINCT` なしで、
-`ORDER BY` の先頭が主キー全列（定義順・昇順）なら `Sort` ノードを作らないので、
-`ORDER BY 主キー LIMIT n` のヒントが走査まで降りる（`PlanBuilder.sortIsRedundant`）。
-主キーの一部だけ・`DESC`・索引走査になる条件（`WHERE 索引列 = ...` など）・集約・`DISTINCT`・結合ではソートする。
-回帰テストは `Session: 主キー順の ORDER BY は Sort を作らず LIMIT がストレージへ降りる`
-（2本目の SSTable を壊し、`ORDER BY id LIMIT 1` は成功・`ORDER BY id DESC LIMIT 1` は `CorruptionError`）。
-
-### 11.26 部分読みはブロック / メタデータ / Footer のチェックサムで守る
-
-v6 の SSTable は各ブロック末尾に 4バイトの CRC32C チェックサムを持つ。
-Footer は Meta / Bloom / Index の連続領域を守る `metadataChecksum` と、
-自身（先頭 80バイト）を守る `footerChecksum` を持ち、`openPartial` でも検証する。
-全体チェックサムは部分読みでは検証できないため持たない
-（ファイル全体を読む経路も、各ブロックとメタデータの検証で破損を検出する）。
-`SstReadInfo` は Footer / meta / Bloom / index だけを持ち、
-データブロックは必要になったとき `FileStream` で読む。
-読んだブロックは `parseBlockAt` がチェックサムを検証する。
-
-- 部分読みで読まなかったブロックの破損は、そのクエリでは検出されない。
-- テストでファイルを書き換えたら mtime を進める（§11.22）。
-- `SstReadInfo` の `rangeScanPartial` は最大 8ブロックを 1回の open で読み、解析は必要になったときだけ行う。
-  `lookup` は通常は該当ブロック 1個だけを読むが、同じキーの可視版がブロック末尾に無い場合は、
-  同じキーの古い版が続く次のブロックも読む。
-
-### 11.27 結合アルゴリズムの前提
-
-- ハッシュ/インデックス結合は、`ON` の左×右の等値条件が**同じ DataType** の列同士のときだけ使う。
-  型が違うと入れ子ループに落ちる（暗黙変換した等値は自動選択しない）。
-- `NULL` キーは一致しない。
-  ハッシュ表にも登録しない。
-- インデックス入れ子ループは、右部分木が `Filter` のときは使わない
-  （右への WHERE pushdown を落とさないため）。
-  `LEFT JOIN` の右側述語は結合後なので `Scan` のまま使える。
-
-### 11.28 `Op` は one-shot — `Op.next cur` の後の `cur` を再利用しない
-
-`Op` は one-shot な値で、行を 1つ進めると次の状態 `nxt` が返る。
-`Op.next cur` を呼んだ後、返り値の `nxt` ではなく `cur` をもう一度 `Op.next` すると、
-**先頭行ではなく次の行**が返る
-（状態を持つソースでは行が飛ぶ・重複する。純粋な `Op.ofArray` では同じ先頭行が再び返る）。
-transaction の overlay（store の行 + txn のスロット）で `cur` を再利用してしまい、
-既存行がある状態の `BEGIN; INSERT/UPDATE; SELECT` が行の欠落・重複・古い値を返していた
-（`Dml.overlayRows`）。
-
-- 正しい形: `match Op.next cur with | OpStep.OpRow(row, nxt) -> ... merge nxt ...`
-- **構築は `Op.Empty` / `Op.ofRow` / `Op.emit` / `Op.compute` / `Op.ofArray` に限る**。
-  `Op.Done` / `Op.Step` / `Op.Compute` を直接書かない
-  （`Op.fsi` でケースを隠しているため、src の他ファイルから直接構築・パターンマッチできない）。
-- テストでは `TestHelpers.oneShot` でソースを包むと、2 回目の `next` を検出できる。
-- 回帰テスト: `Session: 既存行がある transaction 内の INSERT は SELECT に全行見える` /
-  `...複数 UPDATE が正しい` / `...索引検索が書き込みを見る`。
-- store が空の transaction だけを試すと、このバグは出ない。
-
-### 11.29 HAVING の集約は HAVING からも集める
-
-`allAggs` を SELECT / ORDER BY の集約だけから作ると、
-`SELECT age ... GROUP BY age HAVING COUNT(*) > 1` の `COUNT(*)` が集約ノードで計算されず、
-`substituteAggs` が `NULL` に置き換えるため条件が UNKNOWN になり、**静かに 0行**になる。
-
-- `PlanBuilder.applyAggregate` は HAVING の式から `Ops.aggCalls` で集約を集め、
-  `allAggs` と `hasAgg` に含める。
-- 回帰テスト: `SqlReference: HAVING にしか現れない集約でも絞り込める`。
-
-### 11.30 `BEGIN` 後のエラーでは transaction が開いたままになる
-
-`Session.Execute` は 1文ずつ実行し、成功するたびに接続ローカルの状態を更新する。
-`BEGIN` が成功した後に後続の文が失敗した場合、Session は transaction を開いたまま保持する
-（それ以前に成功した文の状態も保持する）。
-呼び出し側が `Rollback()` するか `Close()` するまで transaction は続く。
-`Close()` は進行中 transaction を rollback してから閉じ、ActiveSnapshot 登録も解除する。
-
-- 回帰テスト: `Session: 複数文の BEGIN 後エラーは transaction を開いたままにする` /
-  `Session: Close は開いた transaction を rollback する`。
-
-### 11.31 GROUP BY の式は木全体でスロットへ置き換える
-
-`GROUP BY age + 1` の集約結果は「式の値」1列になるが、式の木は `age + 1` のまま残る。
-葉の `t.age` だけをスロットへ置き換えると、
-`SELECT age + 1` が集約後のスキーマに無い `t.age` を参照して `列 't.age' が存在しません` になる。
-
-- `Ops.substituteAggs` は **非葉の式の表示文字列** でもスロットを探し、
-  式全体をリテラルへ置き換える
-  （`project` / `havingFilter` 共通）。
-- `GROUP BY` が葉だけなら表示文字列を作らない。
-  深い HAVING 式で `Expr.toDisplayString` をノードごとに呼ぶと O(深さ²) になる
-  （`末尾再帰: 50000段の式を havingFilter してもスタックを食わない` がハングした）。
-- `project` は GROUP BY があるとき、集約が 0個でも置換経路を通す。
-- 回帰テスト: `SqlReference: GROUP BY の式を SELECT / HAVING でも使える`。
-
-### 11.32 未知の `t.*` は 0列の成功にしない
-
-`Schema.expandStar` は修飾子に一致する列が 0件でも `Some(true, [])` を返す。
-そのままだと `SELECT nope.* FROM t` が「0列・1行」で成功し、列の無い結果を静かに返す。
-`PlanBuilder.buildLogicalWith` で `Schema.hasQualifier` を検査し、`NameError` にする。
-
-- 回帰テスト: `SqlReference: FROM に無い t.* は NameError`。
-
-### 11.33 DEFAULT も列型へ強制する
-
-`DmlOps.insert` は指定された値を `SqlValue.coerce` していたが、
-省略列の `DEFAULT` は生の評価結果をそのまま保存していた。
-`INTEGER` 列に `DEFAULT 'oops'` を書くと TEXT のまま格納され、後続の比較が型エラーになる。
-
-- `defaultValuesOf` の評価後に `SqlValue.coerce col.DataType` を通す。
-- 回帰テスト: `SqlReference: DEFAULT は列型へ暗黙変換される`。
-
-### 11.34 format マーカーの検証は排他を取ってから行う
-
-`RowStore.openStore` は `.rykdb.format` を `ProcessLock.acquire` で `FileShare.None` のまま開き、
-そのストリームを検証 / 新規作成に使う（ロックファイルを別に作らない）。
-ロック前に書くと、同じ root を開こうとした第2のプロセスが
-使用中の DB のマーカーを変更してしまう。
-
-- `Directory.CreateDirectory root` → `ProcessLock.acquire` → `ensureFormat` の順にする。
-- `ensureFormat` は `ProcessLock.acquire` が返したストリームを使う（開き直すと自分のロックに弾かれる）。
-- `ensureFormat` が失敗したら取得済みのロックを解放する。
-- 回帰テスト:
-  `RowStore.openStore: ロック失敗時は format マーカーを書き換えない` /
-  `RowStore: format マーカーがプロセス間ロックを兼ねる`。
-
-### 11.35 `SnapshotRegistry` の bucket 削除と register は競合する
-
-`ConcurrentDictionary.GetOrAdd` で bucket を取ってから登録を追加する間、
-別スレッドの `Unregister` が「空になった」と判断して bucket を削除すると、
-追加した登録が削除済みの bucket に入って消える。
-registry の登録が消えると compaction の GC 境界が上がり、まだ必要な版を捨て得る。
-
-- `Register` / `Unregister` / `OldestExcept` を 1本の `SemaphoreSlim`（Gate）で直列化する。
-- 回帰テスト: `SnapshotRegistry: 並行 register/unregister で登録が消えない`
-  （登録直後の `oldestExcept` が必ず `Some` になることを並列で確認）。
-
-### 11.36 外部ソートの run は全部を同時に open しない
-
-`ExtSort` の最終 k-way merge で全 run を `openRun` すると、
-run の数だけ file descriptor を消費する（大入力で枯渇する）。
-同時に開くのは **32本まで** にし、超える場合は 32本ずつ中間 run にマージしてから最終 merge する
-（multi-pass merge）。
-
-- 中間 run も同じ `[varint 長][ValueCodec]` 形式で、読み終えた入力 run は削除する。
-- 回帰テスト: `ExtSort.sortRows: 50000行を小さなバジェットで溢らしても整列できる`
-  （数百 run を作り、一時ファイルが残らないことも確認）。
-
-### 11.37 `StorageEngine` の書き込み Gate は DB ごとの Runtime が持つ
-
-プロセス全体の 1本の Gate だと無関係な DB の書き込みまで待たされるため、
-`StorageEngine` は DB ごとの `StorageRuntime` が持つ Gate を共有する。
-
-- `writeBatch` / `maybeFlush`（flush + compaction）/ `close` を同じ Gate で直列化する。
-- 異なる DB は並行。Gate は DB の寿命と一緒に回収される。
-
-### 11.38 未対応の SQL 語をテーブル別名として飲み込まない
-
-`UNION` / `INTERSECT` / `EXCEPT` / `RIGHT` / `FULL` / `CROSS` / `NATURAL` / `OUTER` は
-`Lexer.Keywords` に無いため識別子として読まれる。
-`parseOptAlias` がこれをテーブル別名として消費すると、次のような静かな誤動作になる。
-
-- `SELECT id FROM t UNION SELECT id FROM t` → `FROM t AS UNION` + 別文の SELECT に分解され、
-  `Execute` が `RowsAffected` の合計だけを返す（エラーにならない）。
-- `SELECT u.id FROM t RIGHT JOIN u ON u.id = 1` → `RIGHT` が `t` の別名になり、
-  通常の INNER JOIN として実行される（本来の RIGHT JOIN と結果が違う）。
-
-対策:
-
-- `parseTableAlias` が未対応語を裸のテーブル別名として消費しない（`AS` を付ければ使える）。
-  集合演算の語（`UNION` / `INTERSECT` / `EXCEPT`）は**エラーにせず消費もしない**
-  （`SELECT ... FROM t UNION ALL ...` を集合演算の規則で読むため。判定は後段に委ねる）。
-- `parseOptAlias`（列の別名）も未対応語を裸の別名として消費しない
-  （`SELECT 1 UNION SELECT 2` の `UNION` が列別名になり、後続の SELECT が別の文として実行されていた）。
-- `parseJoinsC` が `USING` を明示エラーにする。
-  FROM の直後に残った未対応 JOIN 語（`FROM t AS x RIGHT JOIN ...` など）も明示エラーにする。
-- `JOIN` の種類（`LEFT` / `INNER`）だけ書いて `JOIN` が続かない入力は明示エラーにする
-  （`FROM t LEFT WHERE ...` が「LEFT JOIN なし」として静かに通っていた）。
-- DML の対象テーブルの別名（`UPDATE t AS x`）は、列解決に使われず `WHERE x.id` だけが
-  `NameError` になる中途半端な状態を避けるため、パース時に `SyntaxError` にする。
-- `parseStatements` は文の区切りに `;` を必須にする。
-- `parseSelectStatementC` は `UNION ALL` の枝を読み、`UNION`（ALL なし）/ `INTERSECT` /
-  `EXCEPT` は明示エラーにする。`ORDER BY` / `LIMIT` より後ろに集合演算が来たら
-  `UNION / INTERSECT / EXCEPT は ORDER BY / LIMIT より前に書いてください` にする。
-
-回帰テスト:
-
-- `Parser: 未対応の集合演算は明示エラー`
-- `Parser: UNION ALL は集合演算としてパースされる`
-- `Parser: 未対応の JOIN は明示エラー`
-- `Parser: JOIN の種類だけで JOIN が無い入力はエラー`
-- `Parser: 列別名が集合演算を飲み込まない`
-- `Parser: DML のテーブル別名は明示エラー`
-- `Parser: 複数文は ; で区切る`
-- `SqlReference: UNION はエラーになり 2 文として実行されない`
-- `SqlReference: UNION ALL の列数が違うとエラー`
-- `SqlReference: RIGHT JOIN はエラーになり INNER JOIN として実行されない`
-
-### 11.39 CAST は暗黙変換 (`SqlValue.coerce`) と分ける
-
-`coerce` は INSERT / UPDATE の暗黙変換で、TEXT → INTEGER を受け付けない
-（`INSERT INTO t (int_col) VALUES ('42')` は `TypeError`）。
-`CAST('42' AS INTEGER)` は明示変換なので、`SqlValue.cast` を別に用意し、
-TEXT → 数値 / BOOLEAN を InvariantCulture で解析する。
-数値 → TEXT などは `coerce` に委譲する。
-`coerce` を広げると暗黙変換の仕様が変わってしまうので、両者を混ぜないこと。
-
-回帰テスト: `Eval.eval: CAST は TEXT から数値・BOOLEAN へ変換できる`。
-
-### 11.40 ORDER BY の序数は PlanBuilder で解決する
-
-`ORDER BY 1` を式として評価すると「定数 1」のソートになり、静かに no-op になる。
-`PlanBuilder.applySort` が 1 始まりの序数を `SELECT` 項目の式へ置き換える。
-範囲外の序数は `SyntaxError`。
-`SELECT *` の序数は `Schema.expandStar` で列へ展開する。
-
-回帰テスト: `SqlReference: ORDER BY の式と序数`。
-
-### 11.41 `LastCommitted` の掃除は「この commit を反映した後」の境界で行う
-
-`TransactionManager.commit` の GC 境界を更新前の `LastCommitSeqNo` で計算すると、
-`activeSnapshot` が「前回 commit の SeqNo + 1」を返すため、
-**今 commit した全キーが次の commit まで `LastCommitted` に残る**
-（100k 行の commit で約 10.7 MiB。次の commit で解放されていた）。
-
-```fsharp
-// ❌ 更新前の LastCommitSeqNo（= 前回の commit の SeqNo）が境界になる
-let gcThreshold = activeSnapshot staged
-// ✅ この commit の SeqNo を反映した状態で境界を求める
-let gcThreshold = activeSnapshot { staged with LastCommitSeqNo = commitSeq }
-```
-
-active な transaction が無ければ境界は `commitSeq + 1` になり、commit 直後に空へ戻る。
-生きている transaction がある間は「最古の active snapshot」が境界なので、必要な版は残る。
-
-`LastCommitted` が空のときは `findConflicts` が即 `[]` を返す
-（全書き込みキーの `Set<string>`（base64 文字列）を作らない）。
-回帰テスト: `TransactionManager.commit: active が無ければ commit 直後に LastCommitted を捨てる` /
-`TransactionManager.commit: 古い snapshot の transaction が居る間は掃除しない`。
-
-### 11.42 メモリ上限は「符号化サイズ」ではなく「管理メモリ」で見積もる
-
-`ValueCodec.approximateBytes` / `SstEntry.approximateBytes` は SSTable の**ファイルサイズ**見積りで、
-型タグとペイロードしか数えない
-（参照型の `SqlValue` オブジェクト・string の UTF-16・配列ヘッダ・Treap / Map ノードを含まない）。
-これをメモリ上限の判定に使うと、`MemLimitBytes = 64MiB` でも memtable が実測 450MiB 程度まで膨らんだ
-（20万行・2列で符号化 13.4MiB に対して実測 96.8MiB、約 7倍）。
-
-- メモリ判定は `ValueCodec.managedBytes`（値 1個）・`managedRowBytes`（行配列）・
-  `Entry.managedBytes`（Treap ノード + Entry + option + キー配列 + 行）・
-  `Transaction.slotBytes`（Map スロット）を使う。
-- ファイルサイズの見積り（compaction の出力分割）は `ValueCodec.approximateBytes` /
-  `SstEntry.approximateBytes` のまま変えない。
-- 実測（2列・TEXT 48文字）: 20,000行で実測 7.8MiB / 見積り 6.7MiB（約 1.2倍）。
-  200,000行では 64MiB を超えて commit 中に flush され、memtable の保持はほぼ 0 になった。
-- 回帰テスト: `Memtable: 件数と ApproxBytes は挿入したエントリの合計になる` /
-  `ValueCodec.managedBytes: 参照型と UTF-16 を含む管理メモリの概算`。
-
-### 11.43 `Wal.append` はフレーム単位で書き出す（全フレームを連結しない）
-
-Begin / Batch / Commit の全フレームを `Array.concat` して 1回の `Write` にすると、
-大きな transaction で「バッチ本体 + 連結コピー + 中間配列」が同時に生じ、ピークが約 2倍になる。
-`Wal.append` は **1フレームずつ `Write` し、最後に `Flush(true)`** する。
-
-- 原子性は「フレームごとの CRC」+「Commit に到達した Batch だけを再生する `foldCommitted`」が守る。
-  途中で落ちても未 commit の Batch は捨てられるので、コミット済みトランザクションが中途半端にならない。
-- 空のレコード列ではファイルを作らない。
-- 回帰テスト: `WalTests`（フレームの往復）と `DatabaseTests` の WAL 再生・クラッシュ耐性。
-
-### 11.44 JOIN が保持する行は上限までメモリ、超えたら退避する
-
-入れ子ループ / ハッシュ結合は右側の全行を保持する（設計どおり）。
-無制限だと巨大な右テーブルで OOM し、プロセスごと落ちる。
-そこで `Spill.spool` で **管理メモリ換算の作業上限（既定 256MiB）までメモリに持ち、
-超えたら一時ファイルの run へ退避する**（`CapacityError` にはしない）。
-
-- 入れ子ループは右を run に退避し、**左行ごとに `Spill.reopenKeep` で読み直す**
-  （I/O は O(左行数 × 右行数)。メモリは一定）。
-- ハッシュ結合は、表が上限に収まらないとき **両側を結合キーハッシュでパーティション分割し、
-  各パーティションの右をハッシュ表にして左を probe する**（`hashJoinPartitioned`）。
-  1パーティションがまだ上限を超えたら salt を変えて再分割し、
-  深さ上限（4）でそのパーティションだけマージ結合へフォールバックする。
-  出力順はパーティション順になる（ORDER BY が無い限り SQL は順序を保証しない）。
-- マージ結合は右側を丸ごと持たないが、**同じキーの行のグループ**（左右それぞれ）を保持する。
-  グループが上限を超えたら `Spill.RowSpool` へ退避し、左グループを 1行ずつ流して右グループを読み直す。
-- 片側が先に尽きても、**もう片側を読み切る**（`mergeJoinWith` の `drain`）。
-  `reopenKeep` の run を開いたまま捨てると Windows で `File.Delete` が共有違反になり一時ファイルが残る
-  （Linux は開いたまま削除できるため Windows CI だけ失敗した）。
-  回帰テスト: `結合: マージ結合は左が先に尽きても右を読み切る（退避ファイルの後始末）`。
-- インデックス入れ子ループの検索結果は **materialize しない**（索引の Op を 1行ずつ流す）。
-  非一意索引の 1キーに大量の行が付いていても追加のメモリを要らない。
-- ハッシュ結合の表（バケット）は行配列の後に作られ、行配列は表作りの後に捨てられる
-  （メモリに収まる場合のピークは概ね上限の 2倍まで）。
-- `lookupHash` はバケットをそのまま返す（probe ごとの配列化を避ける）。
-
-### 11.44b 退避した run の読み直しは one-shot（読みかけの状態を返さない）
-
-`Spill.reopen` / `reopenKeep` が返す `Op` は **one-shot** で、
-1つの run は「先頭 1行を読んだ状態」から 1回だけ前へ進む。
-そのため「上限に当たったので、読む前の状態に戻してもう一度読む」書き方はできない
-（同じ `Op` をもう一度 `next` すると、閉じたストリームを読んで
-`Cannot access a closed Stream` になるか、行が重複する）。
-
-❌ 上限超過時に `current`（読む前の状態）を返して呼び出し側で読み直す
-✅ 読みかけの行を `pending` として返し、呼び出し側が run へ書き足してから続きを読む
-
-`OpsJoin.takeMergeGroup` がこの形（`fill` が `(rows, pending, next)` を返す）。
-回帰テスト: `OpsJoinTests` の
-`結合: マージ結合は同一キーのグループを退避しても結果が同じ` /
-`結合: ハッシュ結合は右が上限を超えるとマージ結合へ切り替わり結果が同じ`。
-
-### 11.45 `SstableFormat.writeTo` は入力を 1回だけ列挙する
-
-`writeTo` は `seq` を受け、**1回だけ列挙**してブロック単位で書き出す
-（memtable の flush が全件を `SstEntry` 配列へ実体化しない）。
-キー順の検証・先頭/末尾キー・`maxSeqNo`・Bloom 用のキーは書き出しと同時に集める。
-
-- `FileMetaData.writeSstable` は失敗時（キー順違反・書き込み失敗・空の入力）に
-  **部分ファイルを消してから**エラーを返す（孤児 `.sst` を残さない）。
-- キー順の検証・`maxSeqNo` の集計は `writeTo` の `loop` が行う。
-- 末尾再帰の `loop` は `use`（列挙子の破棄）の後ろにあるが、
-  F# は `use` / `try/finally` の中でも自己再帰を末尾呼び出しにする
-  （300万回の反復で実測済み）。
-- 回帰テスト: `SstableFormat.writeTo: 入力の seq は 1 回だけ列挙する` /
-  `FileMetaData.writeSstable: キー順でない入力はエラー`
-  （部分ファイルが残らないことを含む）。
-
-### 11.46 マージ結合は「走査が結合キー順」のときだけ選ぶ
-
-`Analyzer.chooseJoinAlgorithm` は `Logical` の走査から昇順の列を求める（`scanOrder`）。
-`SeqScan` / `RangeScan` は主キー列、`IndexLookup` / `IndexRangeScan` は索引列、
-`Filter` / `Limit` は透過、`PkLookup` / `Values` は単一行（任意の順序）。
-
-- 結合キーが走査順の**先頭 |keys| 列**と一致するときだけマージ結合にする。
-  キーでない列がキーの間に挟まる走査（PK `(a,b)` に対するキー `{a,c}` など）は
-  全体としてキー順にならないので使わない。
-- 左右のキー順が違う場合（左 PK `(a,b)` / 右 PK `(b,a)` で `{a,b}` を結合）も使わない。
-- `ON` の記述順は自由。等値は対称なので、走査順にキーを並べ替えてよい。
-- 回帰テスト: `Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致するときだけマージ結合` /
-  `SqlReference: マージ結合（主キー同士・LEFT・複合キー）` /
-  `OpsTests` のマージ結合 5 本（ハッシュ結合との差分比較を含む）。
-
-### 11.47 サブクエリは計画時に定数へ畳み込む（相関は実行時に外側行ごと）
-
-`Plan.planSelectCWith` は `SELECT` の全式（項目 / `ON` / `WHERE` / `GROUP BY` / `HAVING` /
-`ORDER BY` / `LIMIT` / `OFFSET`）からサブクエリを再帰的に探し、
-**非相関**なら論理代数を組む前に実行して `Expr.Value` / `Expr.InSet` / 真偽値へ置き換える。
-
-- **相関サブクエリは実行時評価**。
-  `resolveSelectC` は外側クエリの入力スキーマをスコープ列として受け取り、
-  内側で解決できない列参照が外側スコープに一致すれば相関と判定して
-  `Expr.CorrelatedSubquery`（`Run` と `Depths`）へ置き換える。
-  実行時は外側行の値で参照を置換し、`runSubquery` が内側を再計画・実行する。
-  外側と同じ実テーブル名が内側の `FROM` にある場合は標準どおり内側が優先される。
-- `Depths` は外側スコープの深さ（1 = 直近）。
-  入れ子の相関は深さ 2以上だけを外側クエリの相関として引き継ぐ。
-- **相関参照を含む述語は押し下げない**。
-  子スコープ（1テーブルの走査）の行で評価すると外側列の位置が変わる。
-  `Expr.hasCorrelated` で述語の押し下げと JOIN の `ON` への昇格から除外する。
-- 集約後の行を読む位置（集約クエリの `SELECT` / `HAVING` / `ORDER BY`）と
-  `LIMIT` / `OFFSET` は外側行を持たないので `SyntaxError`。
-- 非相関サブクエリは**クエリごとに 1回**実行される。
-  `IN (SELECT ...)` は `ValueSet` に構築する（上限超過分は一時ファイルへ退避。
-  スカラーは最大 2行、`EXISTS` は 1行だけ読む）。
-  相関サブクエリは外側行ごとに実行される（外側行数 × 内側走査）。
-- ヘッダは解決前の式から作る。
-  解決後から作ると `SELECT (SELECT MAX(v) FROM t) FROM t` の列名が `30` のようになる。
-- 集約後の行（`Ops.substituteAggs`）は `Expr.Value` で値を埋め込む。
-  DATE / TIMESTAMP / UUID を TEXT に変換すると比較が `TypeError` になるため、リテラル化しない。
-- DML は `Engine.runInsert` / `runUpdate` / `runDelete` が `Plan.resolveDmlExprWith` で解決する
-  （UPDATE / DELETE は対象行のスキーマを渡すので外側行を参照できる）。
-  `CREATE TABLE ... DEFAULT (SELECT ...)` は解決しない（実行時に `SyntaxError`）。
-- Parser の式は **Pratt（precedence climbing）** で、中置演算子はループ、右辺だけを結合強度で再帰させる
-  （`parseExprBpC` / `parseExprLoopC`）。
-  比較・述語（`IS` / `IN` / `BETWEEN` / `LIKE`）は非結合なので、
-  `a = b = c` や `a IS NULL = 1` はその場でエラーになる（括弧で囲めば通る）。
-  サブクエリのため式と SELECT のパーサは同じ `let rec` グループにあり、**CPS** で書く。
-  継続はヒープに積まれ、深さ上限はない（§11.48）。
-- **`Plan` のサブクエリ解決（`Plan.planSelectCWith` / `resolveSelectC` / `resolveExprC` / `resolveLeafC`）も CPS**。
-  式の走査は `Expr.rewriteWithC`（葉の書き換えが継続を取る版）、
-  リスト（項目 / JOIN / GROUP BY / ORDER BY）は `traverseC` が 1件ずつ継続で回す。
-  葉からの `planSelectC` 呼び出しを `>>=` のレシーバに置くとそこでフレームが残るので、
-  `match` / 継続の末尾呼び出しで書く。
-- **相関の再実行は計画関数の型を具体化しない**。
-  `planCoreCWith` / `planSelectCWith` / `resolveSelectC` / `resolveExprC` / `resolveLeafC` は相互再帰グループなので、
-  `resolveLeafC` の中で `planSelectCWith ... ret` のように具体型の継続を渡すと、
-  グループの `'r` が `Schema * Op` に固定されて他の呼び出し（DML の式解決など）が型エラーになる。
-  外側行ごとの実行は `runSubquery`（グループの外の `let rec`）に切り出し、
-  グループ内へは関数引数 `runner` として渡す。
-- 回帰テスト: `SqlReference: サブクエリ（スカラー・IN・EXISTS）` /
-  `SqlReference: 相関サブクエリ` / `SqlReference: 相関サブクエリの未対応形` /
-  `SqlReference: サブクエリの未対応形とエラー` / `Parser: サブクエリ（スカラー / IN / EXISTS）` /
-  `末尾再帰: 大量の SELECT 項目・GROUP BY・ORDER BY がパースできる`。
-
-### 11.48 Parser は深さ上限を設けない（CPS でスタック一定）
-
-式・SELECT の構文規則は **CPS**（継続を引数で受け、末尾で呼ぶ）。
-深さ上限は設けない。
-
-- 継続は関数値としてヒープに積まれ、呼び出しは必ず末尾位置になる。
-  `Directory.Build.props` の `<Tailcalls>true</Tailcalls>` により Debug でも `tail.` が出るので、
-  括弧・前置演算子・CASE・関数呼び出し・サブクエリの入れ子段数に依存せずスタックは一定。
-- 自己再帰がすべて末尾位置の関数には `[<TailCall>]` を付ける（`parseExprC` / `parseExprBpC` / `parsePrefixC` など）。
-  `parseExprLoopC` は継続ラムダの中から同じ群の関数を呼ぶ形があり、FS3569 が非末尾と判定するため付けない。
-  付けない関数は深い入力の回帰テストで実行時の末尾呼び出しを固定する。
-- メモリは深さに比例する（AST と継続をヒープに持つ）。
-  入力長 O(n) のコストはかかるが、`StackOverflowException` は**捕捉できない**ため、
-  ホストプロセスを巻き込まないことを優先する。
-- `Tailcalls=false` にすると継続呼び出しが末尾にならず、深い入力でプロセスごと落ちる。
-  設定を外さないこと（§8.16）。
-- 回帰テスト: `ParserExprTests` の
-  `末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない` /
-  `末尾再帰: 5000段の深いサブクエリの入れ子も解析できる` /
-  `末尾再帰: 200000個の NOT が連なってもスタックを食わない` /
-  `SqlReferenceTests` の `SqlReference: 深いサブクエリの入れ子も実行できる`。
-
-### 11.49 FROM を省略した SELECT は「1行 0列」を入力にする
-
-`SELECT 1` / `SELECT 1 + 2 AS x` のような FROM なしの SELECT は、
-Parser が `From = None` にし、PlanBuilder が `Logical.Values [||]`（1行 0列）を入力にする。
-`WHERE` / 集約 / `ORDER BY` / 射影 / `DISTINCT` / `LIMIT` はその 1行にそのまま被せる。
-
-- `SELECT COUNT(*)` は **1**（`WHERE` で 0行にすれば 0）、
-  `SELECT 1 WHERE 1 = 2` は **0行**。
-- `FROM` の無い `JOIN` は Parser が `JOIN には FROM が必要です` にする。
-- **`*` / `t.*` はエラーにする**（`FROM のない SELECT では * を使えません` / `NameError`）。
-  許すと 0列 1行の「成功」になり、ヘッダと行の列数がずれる
-  （§11.32 の `SELECT nope.*` と同じ型の静かな誤答）。
-- `SELECT` の句も継続を取る CPS（`parseJoinsC` / `parseWhereC` / `parseSelectCoreTailC` …）。
-  句の追加は `parseSelectCoreTailC` の継続の連鎖に 1段足す。
-- 回帰テスト: `SqlReference: FROM を省略した SELECT は定数 1 行を返す` /
-  `Parser: FROM を省略した SELECT`。
-
-### 11.50 派生テーブルは「計画」と「実行」を分ける（`planCoreCWith` / `Logical.Derived`）
-
-`FROM (SELECT ...) AS x` は **計画時に実行しない**。
-`Plan.planSelectCWith` を `planCoreCWith`（論理木まで）と実行に分け、
-派生は `PlannedQuery { Output; Header; Input; Context; Tree }` として持ち回る。
-
-- `Plan.resolveSourcesC` が AST の `TableSource.Derived` を `TableSource.Named`（別名）へ書き換え、
-  別名の小文字をキーにした Map を `PlanBuilder.buildLogicalWith` に渡す。
-  書き換え後に `From` / `Joins[].Table` に `Derived` が残っていたら解決漏れ。
-- `Logical.Derived` の実行は `Optimizer.exec` の `DerivedFrame`。
-  内側の木は **内側の `ExecContext`**（内側のテーブル別名を登録したもの）で走らせる。
-  外側の ctx で走らせると `FROM people p` の `p` を引けない。
-- 派生の列名は参照名（`SELECT t.id` → `id`）で持つ（`Schema.referenceColumns`）。
-  表示名のままだと入れ子の派生で `y.v` ではなく `y."x.v"` になる。
-- 述語は内側へ押し下げない（集約 / DISTINCT / LIMIT を跨ぐと意味が変わる）。
-  派生ノードの上に `Filter` を付ける。
-- `Logical.Derived` は `scanOrder` で `None` に落ちるのでマージ結合にはならない。
-  型が `None` の派生列は等値キーにもならない（入れ子ループになるが結果は正しい）。
-- 再帰：`planCoreCWith` / `resolveSourcesC` は CPS で、
-  `planCoreCWith` を呼ぶ継続はラムダ内なので TailAudit のベースラインに載る
-  （Parser も CPS なので深さ上限はない）。
-- 回帰テスト: `SqlReference: 派生テーブル（FROM / JOIN）` /
-  `Parser: サブクエリ（スカラー / IN / EXISTS）` /
-  `PlanBuilder.buildLogicalWith: FROM のサブクエリは Logical.Derived になる` /
-  `Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`。
-
-### 11.51 `maybeFlush` は WAL commit 後に Error を返さない（compaction 失敗で flush を巻き戻さない）
-
-`maybeFlush` を `flush engine >>= compactOnce` にすると、
-flush 成功・compaction 失敗のときに `Error` が返り、
-`RowStore` は **pre-flush の engine** を保持してしまう。
-一方、ディスクでは flush の SSTable が MANIFEST に載り、WAL は rotate 済み。
-この状態で次の write は古い WAL 番号へ追記し、再起動時の復旧は最大番号の WAL しか読まないため、
-**commit 済みの行が失われ得る**。
-
-- ❌ `match flush engine with Error e -> e | Ok flushed -> compactOnce flushed`
-  （compaction のエラーが flush の結果を巻き戻す）
-- ✅ flush 失敗: pre-flush の engine を `Ok` で返す（memtable を残して次回再試行）。
-  flush 成功・compaction 失敗: **flush 後の engine** を `Ok` で返し、
-  compaction の失敗は戻り値の `DbError option` で返す。
-- WAL への書き込みが成功した時点で commit は成立している。
-  ここで `Error` を返すと、呼び出し側が SeqNo を再利用し得る（§11.8）。
-  `RowStore.writeBatchesWithSnapshotWith` の `MaybeFlush` エラー握り潰しはこのための保険として残す。
-- 回帰テスト: `StorageEngine.maybeFlush: compaction が失敗しても flush 後の engine を返す` /
-  `RowStore: compaction 失敗後も flush 結果を保持し、再起動で commit を失わない`。
-
-### 11.52 background compaction は install 時に Version / GC 境界 / 採番を再検証する
-
-background compaction の worker は、開始時の `Version` と `ActiveSnapshot` をそのまま
-MANIFEST に書いてはいけない。
-merge 中に foreground の flush や新しい transaction が入り得る。
-
-- ❌ 開始時の Version に `AddedFiles` / `DeletedFiles` を適用して MANIFEST に書く。
-  flush で追加されたファイルを巻き戻したり、
-  開始後に登録された古い snapshot が見る版を削除したりする。
-- ✅ install は **installGate** の下で現在の `PublishedState` を再読する。
-  1. `Removed` の全ファイルが現在の Version に存在するか。
-  2. 現在の最古 snapshot（`RootRuntime.OldestExcept` と
-     `PublishedState.ActiveSnapshot` の小さい方）が開始時より古くなっていないか。
-     どちらかが不成立なら **出力を削除して再試行**する。
-- ファイル番号は `VersionCoordinator` の CAS 採番だけを使う。
-  flush も worker も `Manifest.logAndApply` を同じ installGate の内側で呼ぶ。
-- 読み取りは Session 呼び出し単位で Version 全ファイルを pin する。
-  worker は入力の実ファイルを即削除せず、retired にして refcount が 0 になってから消す。
-  `SstScan` 自体には pin を配線していない（snapshot の粗い pin で安全性を保つ）。
-  早期終了時の FileStream は `ScanScope` が `Engine` の `finally` で破棄する（§11.61）。
-- close は cancel → **無条件の signal** → worker join → flush → WAL 削除 → ProcessLock 解放。
-  worker が install 中でも join が完了してから WAL を消す。
-  Pending ビットが立っていても、worker が既に signal を消費して Pending を消す前かもしれない。
-  この状態で release を省略すると cancel 後の `signal.Wait()` から永久に戻らず、close がハングする
-  （`SessionTests` の短命な open/close で実際に発生した）。
-- **破棄したあとは GC 境界を下げて publish する**。
-  境界を戻さないと、次のサイクルも同じ判定で破棄し続けて前進しない
-  （古い transaction が開いている間、compaction が終わらない）。
-- **Version 全ファイルの pin を取るのは読み取りバッチだけ**（`Session.runRead` の `AcquireReadSnapshot`）。
-  書き込みを含むバッチは pin を取らず、`DatabaseHost.writeGate` の下で 1文ずつ実行する
-  （`Session.runExclusive`）。
-  読み取りバッチは SELECT が state を変えないのでハンドルが変わらず、
-  入口で 1回 pin してバッチ全体をそのハンドルで実行してよい（§11.53 と同じ条件）。
-- **Idle 判定は単一の状態で行う**。
-  busy と pending を別々に持つと、 worker が pending を消してから busy を立てる間や、
-  2つを別々に読む間に `IsIdle` が true を返し、
-  `waitIdle` が compaction 完了前に進んでテストが flaky になる。
-  `VersionCoordinator` は `Idle` / `Busy` / `Pending` を 1つの CAS セルで持つ。
-  `Signal` の wake 要否は pending を立てる**前**の値で判断する
-  （更新後の値を見ると release が漏れて worker が起動せず、テストがハングする）。
-  **Shutdown だけは例外**で、Pending の有無に関係なく `signal.Release()` する。
-  Pending は「signal 未消費」を意味しない（worker が permit を消費した直後、
-  Pending を消す前に close が割り込むと、Pending あり・permit なしになる）ため。
-- **worker の開始はリカバリ後**。
-  `DatabaseHost.OpenWithStore` のカタログ読込と DROP 後始末が終わってから `RowStore.startBackground` を呼ぶ。
-  先に動かすと、リカバリの走査中に入力ファイルが retired / 削除され得る。
-- 回帰テスト: `background compaction: flush 後に L0 が background で compaction される` /
-  `background compaction: compaction 中でも次の write が返る` /
-  `background compaction: 読み取り中のファイルは削除されず、lease 解放後に削除される` /
-  `background compaction: close は進行中の compaction を停止して再オープンできる` /
-  `background compaction: install 後に再オープンしても行が残る` /
-  `background compaction: 開始後に古い snapshot が現れたら境界を下げてやり直す` /
-  `background compaction: Close しなくても install 済みの行は再オープンで残る` /
-  `background compaction: flush と install が競合してもファイル番号が重複しない` /
-  `background compaction: DB を開いた時点で未 compaction の L0 を解消する`。
-
-### 11.53 Session の並行読み取りは「捕捉と pin を 1 回で」行う
-
-並行読み取りを入れるときの落とし穴。
-
-❌ committed state を先に読み、ロックを外してから別の呼び出しで Version を pin する。
-間に commit + flush + compaction が入ると、古い snapshot に必要な版が GC され、
-「その時点では見えていた行」が読めなくなる。
-
-✅ `DatabaseHost.AcquireReadSnapshot` が committed state と Version 全ファイルの pin を 1回で返す。
-`Session.tryEnterRead` は `stateGate` の下でこれを呼び、`(readState, lease)` と `readers` を更新する。
-
-❌ 読み取りで Session の `local` を書き戻す。
-読み取りは状態を変えないので不要なうえ、実行中の書き込みを古い state で上書きする競合になる。
-
-✅ 読み取りは `readState` をローカルにスレッドして終わり。`local` には触らない。
-
-❌ `Close` が `readers` を待たずに store を閉じる。
-実行中の読み取りが close 後の engine / WAL を触る。
-
-✅ `closed <- true` の後に `readers = 0` まで `Monitor.Wait` してから rollback + close。
-
-回帰テスト: `Session: 読み取りは実行中の書き込みを待たない` /
-`Session: 書き込みは実行中の読み取りを待たない` /
-`Session: Close は実行中の読み取りの完了を待つ` /
-`Session: 並行読み取りは commit 済みの一貫した snapshot を見る`。
-
-### 11.54 TCP サーバの切断 rollback は「その接続の transaction」だけ
-
-❌ 切断時に `if session.InTransaction then Rollback()` をサーバ全体の Session に対して行う。
-複数接続が Session を共有すると、関係ない接続の切断で他の transaction が消える。
-
-✅ **接続ごとに独立した `Session` を持たせる**（`SessionPool.CreateSession`）。
-各接続の `Session.Close` が自分の transaction だけを rollback するので、
-所有権をサーバ側で追う必要がない（§11.64）。
-
-回帰テスト: `Server: 他接続の切断は transaction を rollback しない` /
-`Server: 接続中の接続があっても新しい接続を受け付ける` /
-`SessionPool: 接続を閉じるとその transaction だけ rollback される`。
-
-### 11.55 background compaction の worker は専用スレッドで起動する
-
-❌ `VersionCoordinator.Start()` を `Task.Factory.StartNew` の既定スケジューラ（=`Task.Run`）で起動する。
-worker は `signal.Wait()` でブロックし続ける長寿命タスクなので、
-スレッドプールが混雑していると `WaitingToRun` のままキューに積まれ、
-書き込みが L0 に揃っても compaction がいつまでも始まらない。
-
-✅ `TaskCreationOptions.LongRunning` で専用スレッドを起こす。
-スレッドプールの可用性に依存しない。
-
-- 現在の診断は `VersionCoordinator.IsIdle` と `VersionCoordinator.Current.LastCompactionError`。
-  `L0=4`（トリガ条件は満たされている）なのに compaction が動かない場合は、
-  worker が signal を処理中か、失敗が `LastCompactionError` に記録されているかを確認する。
-  `LongRunning` 化後は、スレッドプール枯渇による `WaitingToRun` は原因にならない。
-- `LongRunning` のスレッドは background thread なので、
-  store を閉じ忘れた worker が残っていてもプロセス終了は妨げない。
-
-回帰テスト: `background compaction: 開始後に古い snapshot が現れたら境界を下げてやり直す`
-（`started.Wait 5000` が false になると「compaction が開始されません」で落ちる）。
-
-### 11.56 TCP の切断 rollback 完了を待たずに次の接続から照会すると flaky
-
-❌ クライアントを切った直後に別の接続から `SELECT` する。
-切断（EOF）の検知と rollback はサーバの接続タスクで非同期に進むため、
-先に届いた `SELECT` が rollback より先に `writeGate` を取ると、未 commit の行が見える
-（テストでは期待 `0` に対して `1` が返り、`Collections differ` になる）。
-
-✅ テストでは `SpinWait.SpinUntil((fun () -> not session.InTransaction), 10000)` で rollback 完了を待つ。
-
-回帰テスト: `Server: 切断時に open transaction は rollback される`。
-
-### 11.57 ORDER BY の比較関数は全順序にする（NULL を「等しい」にしない）
-
-❌ `Ops.sortBy` の `compareWith` で、
-`SqlValue.compareValuesV` の `Error`（NULL 比較）を 0 に落とす。
-NULL がすべての値と等しい関係になり、推移律が壊れる。
-`Array.sortWith` や外部マージの k-way merge は全順序を前提にするため、
-NULL を含む列を `ORDER BY` すると**非 NULL の値が未ソートのまま**返る。
-
-✅ `SqlValue.compareValuesForSortV` を使い、NULL を最小として全順序にする
-（`ASC` 先頭 / `DESC` 末尾、SQLite 互換）。
-`WHERE` などの 3値論理は `compareValuesV` のまま（NULL との比較は `UNKNOWN`）。
-`Ops.sortBy` の `check` は NULL を代表値にしない
-（NULL は型不一致の判定に使わず、非 NULL 同士だけを比較する）。
-
-回帰テスト: `sortBy: NULL は昇順で先頭、降順で末尾` /
-`SqlReference: ORDER BY は NULL を昇順で先頭、降順で末尾に置く`。
-
-### 11.58 TEXT の比較は UTF-8 の符号化順に合わせる
-
-❌ `StringComparer.Ordinal` で `TEXT` を比較する。
-Ordinal は UTF-16 コード単位順であり、UTF-8 の符号化順と逆転する範囲がある
-（例: `U+FF21`（全角 A）と `U+1F600`（絵文字））。
-キーの符号化は UTF-8 なので、SQL の比較とキー順が食い違い、
-`ORDER BY` のソート省略（主キー順）・主キー/索引の range scan で行を取りこぼす。
-
-✅ `SqlValue.compareText` で Unicode コードポイント順に比較する。
-UTF-8 はコードポイント順にバイト列が増えるため、キー符号化の順序と一致する。
-不正なサロゲートは `Encoding.UTF8` と同じく `U+FFFD` として扱う。
-
-回帰テスト: `SqlReference: TEXT の比較は UTF-8 の符号化順に一致する`。
-
-### 11.59 REAL の -0.0 はキー・DISTINCT でも +0.0 に正規化する
-
-❌ 比較だけ `-0.0 = +0.0` とし、符号化は `DoubleToInt64Bits` の生ビットを書く。
-主キー/`UNIQUE` 索引では別キーになり、両方 INSERT できる。
-`SELECT x FROM r WHERE x = 0.0` が 1行でも、`(x + 0.0) = 0.0` では 2行になる。
-
-✅ `SqlValue.normalizeFloat` で `-0.0` を `+0.0` に正規化し、
-`vReal` 経由の生成（リテラル・単項マイナス・算術・`CAST`・範囲定数）と
-`ValueCodec` の符号化で同じビット列にする。
-DECIMAL の `-0.0M` も `ValueCodec` で `0M` に正規化する。
-
-回帰テスト: `SqlValue.normalizeFloat: -0.0 は +0.0 に正規化される` /
-`KeyBuilder.ofValues: REAL の -0.0 は +0.0 と同じキー` /
-`ValueCodec: 負のゼロは正のゼロと同じ符号化` /
-`SqlReference: REAL の -0.0 は +0.0 と同じ主キー`。
-
-### 11.60 グループコミットの fsync 失敗は Session 全体を fatal にする
-
-❌ リーダーの `Wal.sync` が失敗したとき、その待機者だけにエラーを返し、
-ほかの待機者を古い同期位置のまま待たせる（または成功扱いにする）。
-同じ WAL に対する後続の commit も成功したように見え、耐久性の保証が崩れる。
-
-✅ `CommitDurability` が失敗を保持し、
-待機中の全員と以後の `Execute` / `Commit` に同じエラーを返す。
-`Close` は現在位置を同期してから閉じるが、
-同期に失敗した場合は WAL を削除せずエラーを返す。
-`writeGate` の外で fsync を待つため、待機中の別 commit が WAL に追記できる。
-その場合、リーダーは登録済みの最大位置まで同期し、1回の fsync でまとめる。
-
-- deferred 追記した commit は fsync 前に memtable / committed state へ公開される。
-  並行 SELECT が未耐久の commit を見る可能性があるが、
-  commit の完了を返すのは fsync 後なので、クライアントへの応答は失われない。
-
-回帰テスト: `CommitDurability: 複数登録を 1回の fsync にまとめる` /
-`CommitDurability: fsync 失敗を全待機者に伝播し、再試行しない` /
-`CommitDurability: 同時待機でも fsync は 1回だけ`。
-
-### 11.61 スキャン破棄はラッパーではなく発生源で台帳に登録する
-
-❌ `RowStore.scanAtRawValues` / `scanAtRawMasked` が返した `SstScan` を外側から
-`SstScan.filter` などで包み、その `Dispose` だけに頼る。
-`RowStore.scanWithinPrefix` は `SstScan.ofStepWithClose` で包み、
-下流の `Dispose` を `rest` へ伝播するが、外側のラッパーが `Dispose` を呼ばなければ `FileStream` が残る
-（`SstScan.toArray` の最後まで読む経路だけは閉じられる）。
-
-✅ `StorageEngine.ScanAtValues` / `ScanAtMasked` の直後（`RowStore.scanAtRawValues` / `scanAtRawMasked`）で
-`SstScan.scoped scope scan` として `ScanScope` に登録する。
-`ScopedScan` は `next` のたびに最新の continuation を同じキーで登録し直し、
-終端・エラー・`Dispose` で登録を外して閉じる。
-`Engine.runSelect` / `runDml` は `finally` で `ScanScope.DisposeAll()` を呼ぶので、
-どの経路で止まっても開いた走査が残らない。
-
-- continuation の差し替え時に古い登録を Dispose しない。
-  同じファイルハンドルを共有しており、最新の continuation を閉じれば足りる。
-- 回帰テスト: `ScanScope: 早期終了しても登録した走査を閉じられる` /
-  `ScanScope: 最後まで読むと登録が外れる`。
-
-### 11.62 RowReader は終端・Dispose で snapshot と走査を解放する
-
-❌ `Session.TryOpenReader` が返した `RowReader` を途中で捨てる。
-読み取り中の snapshot 登録と `ScanScope` が残り、`Session.Close` が readers の完了を待ち続ける
-（finalizer が動くまで待つため、実質的に停止する）。
-
-✅ 列挙を最後まで読む（終端で自動解放）か、`use` / `Dispose` で明示的に解放する。
-`RowReader.TryRead` は終端・エラーでも解放するが、途中で読むのをやめる場合は自動では解放されない。
-`Session.TryOpenReader` は単一 SELECT のみを対象とし、
-結果セットを保持しないため `SessionOptions` の `MaxResultRows` / `MaxResultBytes` を適用しない。
-
-### 11.63 STREAM の END と DML の OK 件数を取り違えない
-
-❌ `OK <n>` の `n` を常にデータ行数とみなす。
-列名の無い `OK <n>` は DML / DDL の `RowsAffected` であり、データ行は続かない。
-`n` 行を読もうとすると次の応答まで読み進めて接続がずれる。
-
-✅ 列名がある `OK` だけ `n` 行のデータを読む。
-`RykDb.Client` は列なしを `Affected n` として返す。
-
-❌ `.stream` の `STREAM` ヘッダだけ読んで `END` を消費せず、次の SQL を送る。
-残りの行が次の応答として読まれ、プロトコルがずれる。
-
-✅ `RykDb.Client` の `RykDbClient.SendStream` のように `END` または途中の `ERR` まで読み切る。
-途中で読むのをやめる低レベル実装では、接続を閉じるか `END` まで drain する。
-
-### 11.64 接続ごとの transaction は「接続ローカルの状態 + 共有 Manager の rebase」
-
-❌ BEGIN 時に捕捉した `Store` / `Manager` をそのまま `Commit` する。
-BEGIN 時点の `TransactionManager`（`NextSeqNo` / `LastCommitted` / `Active`）で
-他接続の commit を知らないまま採番・競合判定してしまう
-（SeqNo の衝突・write-write 競合の見逃し・commit の取りこぼし）。
-`Store` も古いため、他接続の commit が memtable に載っていない。
-
-✅ 文を実行するたびに **最新の committed state に接続ローカルの transaction を重ねる**（`ExecState` を組み立てる）。
-`CatalogAtBegin` / `Active` / `Pending` / `Lease` だけをローカル（`TxnState`）に持ち、
-`Store` / `Manager` は `DatabaseHost` の最新値（`Committed`）を使い、
-`Catalog` は BEGIN 時点の接続ローカル値（`TxnState.CatalogAtBegin`）を使う
-（transaction 中は DDL できないので変化しない）。
-可視性は `Transaction.Snapshot.SeqNo` で決まるので、Store を最新にしても repeatable read は崩れない。
-BEGIN / COMMIT / ROLLBACK と暗黙 transaction の DML / DDL は `DatabaseHost.writeGate` の下で行い、
-結果の committed 部分だけを publish する。
-回帰テスト: `SessionPool: 明示 transaction は開始時の snapshot を見る` /
-`SessionPool: 接続間で write-write 競合を検出する`。
-
-### 11.65 DB の open/close は `DatabaseHost` 1つに集約する
-
-❌ 接続ごとにストアを開いて `ProcessLock` を取得する。
-同じ root の二重オープンは `IoError` になるし、仮に通しても
-memtable / WAL ビューが分かれて他接続の commit が見えない。
-
-✅ 共有ストアの接続は `Session.Create(host, options, ownsHost = false)` で作り、
-`Session.Close` は `host.Close()` を呼ばない。
-ストアを開くのは `DatabaseHost.OpenWithBackground` / `DatabaseHost.OpenWithStore` だけで、
-`DatabaseHost.Close` が唯一の所有者として `RowStore.close`（flush / WAL 削除 / `ProcessLock` 解放）を行う。
-回帰テスト: `SessionPool: 接続を閉じるとその transaction だけ rollback される`（再オープンで確認）。
-
-### 11.66 接続の Close は DB を閉じない（所有者だけが閉じる）
-
-❌ `Session.Close` が常に `RowStore.close` を呼ぶ。
-接続が 1本切れただけで DB 全体が閉じ、他の接続が動かなくなる。
-
-✅ `Session` は `ownsHost` を持つ。
-`Session.OpenWith` のセッションだけが DB を閉じ、
-`SessionPool.CreateSession` のセッションは自分の transaction を rollback して登録を外すだけ。
-DB を閉じるのは `SessionPool.Close`。
-`Session.Close` は実行中の読み取り（`readers`）を drain してから閉じる。
-
-### 11.67 結合順を並べ替えるときは「右テーブルを除いたスキーマ」を左へ渡してはいけない
-
-❌ `Optimizer.exec` の `Join` で、左部分木の入力を `inSchema` から右テーブルの列を取り除いて作る。
-
-```fsharp
-let leftSchema = { inSchema with Columns = inSchema.Columns |> Array.filter (fun c -> c.Qualifier <> Some name) }
-```
-
-`FROM a JOIN b ON ... JOIN c ON ...` のように右が常に「それまでの末尾」なら
-`左 = inSchema - 右` は実際の行の並びと一致する。
-**結合順を並べ替えると一致しない**。
-たとえば `a ⋈ c` を先に作ると左の行は `(a, c)` の順に並ぶが、
-`inSchema - b` は `(a, c)` ではなく元の `inSchema` の順を保つため、
-`OpsJoin.innerJoinHash` などが列位置を取り違え、値が別の列から読まれる
-（60 段 JOIN のテストで「59 を期待して 1 が返る」形で顕在化した）。
-
-✅ `outputOf inSchema lTree` で**左部分木が実際に出力するレイアウト**を求めて渡す。
-`outputOf` は左スパインを末尾再帰で降り、右スキーマを下から連結する
-（`Join` の出力 = 左のレイアウト + 右のレイアウト）。
-`Aggregate` も同じ理由で `outputOf inSchema child` を `AggregateFrame` に渡す。
-
-回帰テスト: `末尾再帰: 60 段の入れ子 JOIN が正しい行を返す` /
-`SqlReference: 結合順が並べ替えられても結果は同じ`。
-
-### 11.68 `INSERT ... SELECT` の選択は「文の開始時点の Op」で読む
-
-❌ 選択結果を読みながら同じ transaction へ積み、走査がその transaction を参照する。
-
-`Dml.scanByPrimaryKeyWithTxnMask`（または `scanByPrimaryKeyWithTxnValues`）は
-transaction のバッファを `overlayRows` で重ねる。
-`INSERT INTO t SELECT * FROM t` の走査が自分の書き込みを見ると**終わらない**
-（1行挿入するたびに次の行が現れる）。
-
-✅ 挿入を始める前に `Plan.runSelect ctx sel` を呼び、返った `Op` を使う。
-`Op` は計画時点の snapshot と transaction（`ctx.Txn`）を握っているので、
-その後の挿入（新しい `Transaction` 値）は走査から見えない。
-`DmlOps.insertSelect` は `ctx.Txn` から積み上げを始め、
-制約検査だけは積み上げ中の transaction を見る（同一文内の主キー / UNIQUE 重複を検出する）。
-
-回帰テスト: `SqlReference: INSERT ... SELECT は選択結果を挿入する`
-（自分のテーブルから選んでも行数が倍になるだけで止まる）。
-
-### 11.69 格納する側はキー・行を複製しないと配列の変更で壊れる（INV-19）
-
-❌ `Transaction.put` / `Memtable.insert` が渡された配列をそのまま保持する。
-
-Treap の探索と `Map<byte array, _>` の順序は**配列の中身**に依存する。
-呼び出し側が保持した配列を後から書き換えると、
-木 / バッファが壊れて「挿入したキーが引けない」「値が変わる」が起きる。
-F# に線形型が無いので、所有権をコメント契約にせず**複製して取り込む**。
-
-```fsharp
-// ✅ Entry.takeOwnership（キー + 行。Blob の byte[] も複製）
-let insert (given: Entry) (mem: Memtable) =
-    let e = Entry.takeOwnership given
-    ...
-
-// ✅ Transaction.setSlot の入口
-let key = Array.copy givenKey
-let slot = givenSlot |> Option.map SqlValue.copyRow
-```
-
-- 保持する側（memtable / transaction バッファ）だけが複製する。
-  素の配列を返す側（`SstEntry` は読み取り専用のビュー）は対象外。
-- 出口の `SqlValue.copyRow`（INV-02）と入口が同じヘルパーを共有する。
-- コストは 1行あたり約 0.4µs（20万行の実測、全体の約 0.7%）。
-
-回帰テスト（修正前に実際に失敗することを確認済み）:
-
-- `Memtable: 挿入したキー配列を後から書き換えても木は保たれる`
-- `Memtable: 挿入した行配列を後から書き換えても値は変わらない`
-- `Transaction: put したキー・行配列を後から書き換えてもバッファは保たれる`
-
-### 11.70 UNIQUE の物理キーだけでは同時実行の重複を防げない（INV-21）
-
-❌ 索引キーが「索引値 + 主キー」だからといって、
-同じ UNIQUE 値の同時 INSERT が first-committer-wins で衝突すると考える。
-
-索引キーは主キーが違えば別物になる。
-`checkUnique` は transaction の snapshot しか見ないため、
-両方の transaction が commit まで進んでしまう。
-
-```text
-A: INSERT id=1, email='x'   -- snapshot に 'x' は無い
-B: INSERT id=2, email='x'   -- snapshot に 'x' は無い
-A: COMMIT 成功
-B: COMMIT 成功              -- ← 重複したまま
-```
-
-✅ transaction に `@unique:<索引名>:<base64(索引値)>` の論理予約キーを持たせ、
-`writeKeys` に含めて commit 時の競合検出へ渡す。
-
-- 予約は物理キーではない。
-  `LastCommitted` に commit SeqNo で登録するだけで、WAL / SSTable には書かない。
-  再起動後に active transaction は無いので永続化不要。
-- `NULL` を含む UNIQUE 値は予約しない（既存の UNIQUE 検査と同じ）。
-- 物理エントリが無い予約だけの commit でも SeqNo を進める
-  （後続の snapshot が予約の SeqNo を正しく跨げるようにする）。
-- `CREATE UNIQUE INDEX` の backfill は DDL 排他で active transaction を拒否するため、
-  予約キーの backfill は不要。
-
-回帰テスト:
-
-- `SessionPool: 接続間で UNIQUE の同時 INSERT を検出する`
-- `SessionPool: 接続間で UNIQUE の同時 UPDATE を検出する`
-- `TransactionManager.commit: UNIQUE の論理予約が競合する`
-
-### 11.71 行ごとの式評価では `Eval.prepare` の `Prepared` を使い回す
-
-`Eval.eval` は評価準備を都度作る簡易版で、
-行ごとに使うと列解決表の構築（`Expr.fold` + `ImmutableDictionary`）が毎行発生する。
-行ごとの述語評価は `Eval.matchesWithV prepared row predicate` を使う。
-
-```fsharp
-// ❌ 行ごとに準備を作り直す
-Op.filter (fun row -> Eval.eval schema row predicate)
-
-// ✅ 1オペレータ分だけ作って使い回す
-let prepared = Eval.prepare schema [ predicate ]
-Op.filter (fun row -> Eval.matchesWithV prepared row predicate)
-```
-
-- `Prepared` は不変（`ImmutableDictionary`）で、評価中に状態は変わらない。
-  キャッシュではなく前計算なので、複数スレッドで共有しても安全。
-- `Schema` が変わるところ（JOIN の出力、集約後の `Schema.empty`）では新しい `Prepared` を作る。
-- **罠**: `ImmutableDictionary.TryGetValue` は F# では `bool * 'T` のタプルを返すため、
-  行ごとに約 48 バイト確保する。ホットパスでは `ContainsKey` + インデクサで引く。
-  回帰テスト: `Eval.matchesWithV: リテラル述語は 1000 回でも結果を確保しない` /
-  `Scalar.likeMatch: 計画時にコンパイルしたパターンは行ごとに配列を確保しない`。
-- 実測（`tools/RykDb.Bench` の `FilterSeqScan`、10万行）:
-  導入前 約 520MB → 導入後 約 400MB の割当。
-  残りは SSTable の値デコードが支配的（値の遅延デコードは別の改善）。
-
-### 11.72 式評価機の `Step` は struct、`Kont` は参照 DU、Bool は共有する
-
-`Eval.step` の状態 `Step` は呼び出しごとに作り捨てるだけなので、
-`[<Struct>]` にするとヒープ割当が消える。
-一方、継続 `Kont` を `[<Struct>]` にすると **逆効果** になる。
-
-```fsharp
-// ✅ Step は struct。ケースごとにフィールド名を付ける（FS3585 回避）
-[<Struct>]
-type private Step =
-    | Descend of expr: Expr
-    | Arrive of value: SqlValue
-
-// ❌ Kont を struct にすると Kont list のセルが大きくなり、割当が約 2 倍
-```
-
-- `SqlValue.Bool` は true / false の 2種類しかないので、
-  `SqlValue.TrueValue` / `FalseValue` / `ofBool` で共有する。
-- 実測（`tools/RykDb.Bench --class eval --quick`、式あたりの割当）:
-  - `a = b + 1000`: Step 参照 808B → Step struct **568B** → Bool 共有 **544B**
-  - `a < 1000 AND (b = 10 OR b IS NULL)`: 1120B → **736B** → **592B**
-  - `Kont` も struct にすると 568B → **1144B**（+101%）
-- エンドツーエンド（`NestedLoopNoMatch`、400万回の ON 評価）:
-  P0-2 直後 3.37GB → Step struct 2.43GB → Step + Bool 共有 **2.34GB**。
-- `SqlValue` 全体を struct DU にするのは、
-  行配列（`SqlValue array`）の 1スロットが 8B → 24〜32B に増え、
-  NULL 共有の利点も失うため、ベンチで測るまで採用しない。
-- 残る割当は `Kont` のオブジェクト / リストセル、`Result` の `Ok`、`SqlValue`。
-  次に削るなら、オペレータごとに再利用する配列スタックか、浅い式の直接評価 fast path が候補
-  （どちらもスタック安全性と再入の設計が必要）。
-
-### 11.73 compaction の raw 値スライスはブロックバッファを参照する
-
-`Sstable.rangeScanPartialRaw` は値を復号せず、
-`RawSstValue`（`Buffer` / `Offset` / `Length`）としてブロックバッファの一部を指す。
-
-- `SstEntry` は `Value`（復号済み）と `RawValue`（符号化スライス）の**どちらか一方**を持つ。
-  削除判定は必ず `SstEntry.IsDelete`（`Value.IsNone` を直接見ない）。
-- スライスを持つ間はバッファを書き換えない。
-  現在の実装はブロックバッファを読み込み後に変更しないので安全だが、
-  バッファを再利用する最適化を入れると過去のエントリが壊れる。
-- 削除タグ（0/1）は raw 解析時に検証する。
-  値本体の長さ・型の検証は復号時まで遅れる
-  （ブロック CRC は読み込み時に検証済み）。
-- compaction の出力は `SstEntry.writeValueTo` が raw バイト列をそのままコピーする。
-  `encodedValueLength` / `approximateBytes` も raw 長を使う。
-- 回帰テスト: `SSTable: raw スキャンは復号なしで同じ値・削除タグを返す`、
-  `CompactionTests` は `openBackRaw` で raw 経路を通す。
-- 計測（`tools/RykDb.Bench --class compaction --quick`、L0 4ファイル・10万件）:
-  復号あり 424ms / 380MB → raw **296ms / 302MB**。
-
-### 11.74 列マスク復号の `SqlValue.Unloaded` は実際の NULL ではない
-
-列マスク復号では、不要な列に `SqlValue.Unloaded` を置く。
-これは「復号していない」ことを表す内部値であり、SQL の `NULL` ではない。
-
-- 空マスク（`COUNT(*)` / `SELECT 1 FROM t`）でも **行の要素数は 0 にしない**。
-  スキーマ幅で `Unloaded` を並べる（`ORDER BY 1` のソートキー位置がずれないようにする）。
-- `Unloaded` を比較・ソート・DISTINCT・符号化・型の問い合わせに渡してはいけない。
-  `compareValuesV` と `SqlValue.dataType` は `InternalError`、`KeyBuilder.ofValues` / `ValueCodec.writeValues` /
-  `ValueCodec.writeValuesTo` も `InternalError` を返す（例外は投げない）。
-- `Dml.opOfScan` は空の行を `Unloaded` でパディングする。
-  `NULL` で埋めない（誤って読んだときに静かに NULL 扱いにならないようにするため）。
-- 最終結果の境界（`Engine.runSelect`）と `RowReader.TryRead` は
-  `LoadedRow.create`（ケース非公開）で `Unloaded` を検査する。
-  `StatementResult` は非公開コンストラクタで、
-  行付きの構築は `StatementResult.Create`（`LoadedRow array` だけを受ける）に限る。
-  ここに来る前に `InternalError` になるのが正しく、出力の符号化エラーまで持ち越してはいけない。
-- ポイント検索は `Sstable.lookupMasked` / `GetAtMasked` / `getByPrimaryKeyWithTxnMask` を使う。
-  transaction slot の行にも `SqlValue.maskRow` を適用する。
-- 存在確認だけなら全列 false マスクを使う（例: `DmlOps.checkUnique` の主キー重複）。
-  UNIQUE 索引の重複検査は主キー列だけを復号する。
-  行の値が必要ないのに全列 true のマスクで復号しない。
-- `RowStore.scan` は全列のまま（Catalog のように値が必要な用途）。
-  キーだけなら `scanKeys`、索引列だけなら `scanAtRawMasked` を使う。
-  keyspace 削除は `scanKeys`、CREATE INDEX の重複検査は索引列マスク。
-  memtable 行にも `StorageEngine.scanAtWith` で `maskRow` を適用する
-  （ファイルだけスキップして memtable が全列のままにならないようにする）。
-- DML の本体スキャン:
-  - `DELETE` は **WHERE 参照列 + 主キー + 全索引列** のマスクで足りる。
-  - `UPDATE` は未変更列も含む新しい行を書き戻すため **全列** が必要。
-    `UPDATE` の UNIQUE 検査スキャンは主キー列だけで足りる。
-- `Optimizer.scanNeedsMasks` の解析が前提。
-  `Ops.project` は使わない項目も評価するので、Project は全出力式の参照列を要求する。
-  派生テーブルの内側も同じ。
-- overlay（書き込み中）は主キー、索引スキャンは索引列 + 主キーをマスクに足す。
-- 回帰テスト: `SSTable: 列マスクで必要な列だけ復号する`、
-  `SSTable: lookupMasked は必要な列だけ復号する`、
-  `SqlValue.ensureLoaded: Unloaded は結果境界でエラー`、
-  `LoadedRow.create: Unloaded を含む行は InternalError`、
-  `StatementResult.OfRows: Unloaded を含む行は拒否する`、
-  `SqlValue.dataType: Unloaded は InternalError`、
-  `KeyBuilder.ofValues: Unloaded は InternalError`、
-  `ValueCodec.writeValues: Unloaded は InternalError`、
-  `ValueCodec.writeValuesTo: Unloaded は InternalError`、
-  `Session: 値を使わない射影・集約は空の行でも件数を返す`
-  （部分列・ポイント検索・索引・transaction overlay・DISTINCT・ORDER BY・GROUP BY・派生テーブルを含む）。
-- 計測（10万行）: `CountStar` 約 381MB → **316MB**、
-  `SelectConstant` **331MB**、`CountConstantWhere` **351MB**、
-  部分列の `FilterSeqScan` 約 388MB → **363MB**。
-
-### 11.75 `Result` の `Ok` は参照型 — ホットパスは `DbResult` / `OpStep`
-
-FSharp.Core の `Result` は参照 DU なので、成功パスでも `Ok` を 1個確保する。
-Core のホットパスでは次の 2 つを使い、公開 API の境界で `Result` に戻す。
-
-- `[<Struct>] DbResult<'T> = DbOk of value | DbErr of error`（`Errors.fs`）。
-  `Eval.step` / `valueAt` / `compare` / `truthOf`、`SqlValue.compareValuesV`、
-  `Op.map` / `Op.filter` のコールバックが使う。
-- `[<Struct>] OpStep = OpDone | OpError | OpRow of row * next`（`Op.fs`）。
-  `Op.next` / `Op.compute` / `Op.pull` は `Result<(row * Op) option, _>` を返さない。
-
-罠:
-
-- struct DU のケースには**フィールド名を付ける**（FS3585）。
-  `Unchecked.defaultof` で作らない（tag 0 = `DbOk` の既定値になる）。
-  コレクションの要素にしない（セルが太る）。
-- `.fsi` では `Op` はケース非公開のまま、`OpStep` は**ケースを公開**する（他ファイルが照合する）。
-  相互再帰の `and` グループにし、`Op` が関数を含むため `[<NoEquality; NoComparison>]` を付ける。
-- **`Op.emit` の第 2 引数は即時評価される**。
-  行ループの継続を `Op.emit row (loop ...)` で繋ぐと、次の行を作る `loop` がその場で走り、
-  `StackOverflow` になる（merge join で実際に踏んだ）。
-  `Op.compute (fun () -> OpStep.OpRow(row, next))` で遅延する。
-- `DbResult` を `|> ignore` すると Debug で箱化することがある（`compareValuesV` の実測 64B/call）。
-  Release のベンチでは 0B。
-  **割当の回帰テストは Eval / Op の 0B が取れる箇所に置く**
-  （`Eval.matchesWithV` と `Op.next` は Debug でも 0B）。
-- `Result.map` を外すだけでは足りない。
-  `compareValuesV` のローカル関数や
-  `DbResult.map (fun c -> ...)` は**呼び出しごとにクロージャ**を確保するので、
-  ヘルパーはモジュール直下へ出し、`match` に展開する。
-
-実測（同一マシン、`--quick`）:
-
-- Op: `OpMaterialize` 1,462,508 → **902,508B**（-38%）、
-  `OpFilterMapTake` 1,630,520 → **1,109,720B**（-32%）、`NextStep` 56 → **0B**。
-- Query: `CountStar` 318,515 → **300,547KB**（-5.6%）、
-  `SelectConstant` 345,535 → **314,284KB**（-9.0%）、
-  `CountConstantWhere` 352,118 → **328,680KB**（-6.7%）、
-  `RangeScan` 5,017 → **4,727KB**（-5.8%）、
-  `FilterSeqScan` 360,151 → **348,588KB**（-3.2%）、
-  `MergeJoin2Tables` 127,124 → **122,147KB**（-3.9%）。
-- `EvalBenchmarks` と `NestedLoopNoMatch` はほぼ不変。
-  Release の JIT が式評価の `Ok` をスタック割当・除去するため、割当計測に出ない
-  （残るのは `Kont` / リストセル / `SqlValue`）。
-- 残りの大きな割当は `SstScan.next` / `StorageEngine.scanAtWith` / `Sstable.parseBlockAt` の
-  `Ok` + `Some` + tuple。
-  スキャン系をさらに削るならこの層（Phase D）。
-
-### 11.76 部分関数は protect の外で例外になる — `Array.reduce` / `.Value` / `List.last` を総和化
-
-`Errors.protect` の catch-all が挟まらない経路では、部分関数の例外は公開 API まで抜ける
-（`Session.Execute` / `Op.toArrayLimited` に catch-all は無い。
-背景 compaction のみ `VersionCoordinator.loop` の catch が受けて `LastCompactionError` になる）。
-
-- **`Compaction.boundsOf`**: 入力が空になるのは `Smallest > Largest` の壊れた MANIFEST だけ
-  （正常な seed は必ず自分の範囲に残り、探索範囲は単調に広がる）。
-  `VersionEdit.decode` はレベル範囲しか検査せず、`Smallest <= Largest` の検査は
-  テスト側の private `validate` だけなので、同期 compaction では `CorruptionError` として返す。
-  `expand` / `selectInputs` / `compactPlan` は `Result` を通す。
-  - 回帰テスト: `Compaction.compact: Smallest > Largest の入力は CorruptionError になる`
-    （`fmd 1L 0 2 1` で境界反転 + `L0CompactionTrigger = 1`）
-- **`Optimizer` の `frame.Keys`**: `Keys = None` は `chooseJoinAlgorithm` が NestedLoop を返すときだけ。
-  `.Value` を使わず `match` で `InternalError` にする。
-  `execIndexJoin` は `Result<Op, DbError>` を返し、呼び出し側は `JoinApplyFrame` と同じ形で扱う。
-- **`Engine` / `RowStore` の末尾要素**: `List.tryLast` で空チャンクを `Ok([], _)` の腕に統合する
-  （腕の並べ替え・削除で壊れない）。
-
-判断基準: 「制御フローで自明に安全」でも、**(1) protect 外に出る経路**と **(2) 型で保証されない**の
-2点が揃うなら総和化する。
-残る既知の例外は `ExecContext.fs` の `Array.forall2` だけ
-（同スキーマ前提で、幅不一致なら `ArgumentException`）。
-`List.head` は使わない（`ParserExpr` はリストパターン、
-`Serialization` は `prev :: _`、`Plan` は `match plans with [] -> ...`。
-到達しない防御腕は `DbError.internalError` を返す）。
-
-### 11.77 同じフィールド名を持つレコードを足すと既存コードの推論が静かに変わる（FS3566）
-
-`UNION ALL` のために `SetOperation = { Kind; Statement }` を追加したら、
-`JoinClause = { Kind; On; Table }` と `Kind` が衝突し、**後から宣言された型に推論**された。
-
-```fsharp
-// ❌ clause が SetOperation と推論され、clause.On が FS0039
-| (index, clause) :: rest when clause.Kind = JoinKind.Left ->
-    ... clause.On ...
-// ✅ ラムダ・パターンに型注釈を付ける
-| (index, (clause: JoinClause)) :: rest when clause.Kind = JoinKind.Left ->
-```
-
-`PlanBuilder` の JOIN 順序の組み立て（`buildSteps` / `qualifiedOns` / `byName` / `apply` /
-`stmt.Joins |> List.indexed`）は `Kind` と `On` の両方を読むので、全部に注釈が要る。
-F# は同名列のレコードが増えると既存コードの推論をエラーなしで変え得る。
-**レコード型を追加したら、同じフィールド名を持つ既存型の使用箇所を grep する**。
-
-### 11.78 CPS グループ内の局所ループは、グループ関数を具体型の継続で呼べない（FS0064）
-
-`UNION ALL` の枝を順に計画するとき、グループ内の `planCoreCWith` を
-局所 `let rec planAll` から `Result<PlannedQuery list, DbError>` を返す継続で呼ぶと、
-再帰グループの `'r` が `PlannedQuery list` に固定され、
-**グループ全員**が FS0064（`'r` が `PlannedQuery list` に制約されました）になる
-（`Plan.fs` の 540 / 559 / 696 行など、触っていない関数にも波及する）。
-
-解法は「継続を渡す汎用のリスト走査」をグループの外に置くこと。
-`Plan.traverseC` は入出力が同じ型専用なので、型が変わる `Plan.mapC` を追加した。
-
-```fsharp
-mapC (fun (b: SelectStatement) contn -> planCoreCWith runner outer contn ctx (branchOf b)) branches [] finish
-```
-
-継続の最終型が `'r`（グループの型変数）のままなら、グループ内呼び出しは推論を壊さない。
-回帰テスト: `SqlReference: UNION ALL は両方の行を連結する`。
-
-### 11.79 整数・DECIMAL の桁あふれは「演算前に判定」する（例外も `BigInteger` も使わない）
-
-`Eval.intArith` は当初 `BigInteger` で範囲を判定していたが、
-行ごとの式評価で **値 1つにつき 1個のオブジェクトを確保**していた。
-現在は `Add` / `Sub` は `MaxValue - b` / `MinValue + b` との比較、
-`Mul` は除算で判定する（`BigInteger` は `Serialization` の DECIMAL 分解だけに残る）。
-
-- **`Int64.MinValue % -1` は 0 だが、.NET の `%` は `OverflowException` を投げる**。
-  `Div` は `MinValue / -1` だけを桁あふれにし、`Mod` は `b = -1L` を 0 で返す。
-  どちらも `Eval.intArith` で明示する（0 除算は `arith` が先に弾いている）。
-- **`decimal` の乗算は `|b| < 1` を桁あふれにしない**。
-  `|b| < 1` なら `|a * b| < |a| <= MaxValue` なので必ず範囲内。
-  判定は `bb >= 1M && aa > maxD / bb`。
-- **`decimal` の除算は逆に `|b| < 1` で桁あふれし得る**（`|a| > maxD * |b|` が判定）。
-- `decimal` は `MinValue = -MaxValue` の対称な範囲なので `abs` は桁あふれしない
-  （`int64` の `ABS Int64.MinValue` とは違う。こちらは `Scalar` が明示的に弾く）。
-
-回帰テスト: `EvalTests` の
-`Eval.eval: 数値演算は範囲外で DbError を返し、REAL は精度を落とさない`（DECIMAL 除算と INTEGER の乗算・減算・剰余を追加）。
-
-### 11.80 グループコミットは WAL 位置の登録まで含めて 1組
-
-❌ `CommitDurability.Await` だけを呼び、`Register` を忘れる。
-待機中に後続の commit が WAL に追記しても、その位置が leader の fsync target に入らず、
-commit ごとに fsync が走る（グループコミットが実質無効になる）。
-`DatabaseHost` 導入時に通常の commit 経路から `Register` が落ち、
-`CommitDurability` 単体のテストは `Register` を直接呼ぶため気付けなかった。
-
-✅ `writeGate` の内側で、実行後の `WalState` を `durability.Register` してから
-外側で `Await` する。後続の commit は `pending` に位置を足し、
-次のリーダーが登録済みの最大位置まで 1回の fsync でまとめる。
-
-回帰テスト: `DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録し fsync をまとめる`。
-
-### 11.81 索引エントリの「空の値」は削除ではない — overlay はキーで行う
-
-❌ 索引 keyspace の値を `None`（tombstone）と比較して「行が無い」と判断する。
-索引値は `Some [||]`（空の行）で、`None` は削除だけを表す。
-`Dml.opOfIndexScan` は `e.Value.IsNone` だけを見て削除を判定し、
-`Some` ならキーから行を組み立てる。
-
-❌ transaction の索引スロットを「行から索引キーを再計算」して突き合わせる。
-索引値に行が無いので再計算できない。
-スロットは `Transaction.slotsOf (Keyspace.index ...)` の**生キー**を使い、
-store の `SstEntry.Key` と `Bytes.compare` でマージする。
-`Some` は上書き、`None` は削除。
-
-回帰テスト: `Dml.scanByIndexPrefix: transaction の索引書き込みもキーで overlay する`、
-`Dml.insertWithKey: 索引エントリの値は空になる`。
-
-### 11.82 キー復号は書き込みと対称に検証する（終端・escape・DECIMAL）
-
-❌ `Cursor.advance` で長さを決め打ちしてキーを読む。
-`Cursor.advance` は範囲を検査しない（`Cursor.fsi` の規約は呼び出し側の確認）。
-壊れたキーで `IndexOutOfRangeException` になる。
-復号は `Reader.readByte` / `readBytes` / `readUint64BE` の検査付き読み取りを使う。
-
-❌ TEXT / BLOB の `0x00` をそのまま終端とみなす。
-書き込みは `0x00` を `0x00 0xFF` に escape し、終端は `0x00` 1バイト。
-`0x00` の次が `0xFF` ならペイロードの `0x00`、それ以外なら終端（次は次フィールド）。
-
-❌ 負の DECIMAL の桁だけを戻して指数を戻し忘れる。
-`writeOrderedDecimal` は負数のとき**指数も桁も両方**反転する。
-復号は `scale = 桁数 - 指数` を検証し、96bit 非スケール値は
-32bit チャンクの `×10 + 桁` で組み立てる（`BigInteger` は使わない）。
-
-回帰テスト: `キー復号: 全型が往復する`、`キー復号: golden バイト列から値を復元できる`、
-`キー復号: 壊れたキーは CorruptionError になる`。
-
-### 11.83 fetch は「最初の 1行」ではなく全行に適用する
-
-❌ `Op.pull step op` で 1行だけ変換する。
-`Op.pull` の継続に渡される `next` は**元の未変換の Op** なので、
-2行目以降は fetch されず `Unloaded` が結果へ漏れる
-（索引入れ子ループで 2件目だけ失敗した）。
-
-✅ `fetchMissing` は `Op.compute` の中で `Op.next` を回し、
-各行を変換したうえで `go next` を返す（`Op.pull` を再帰的に包む）。
-表行が見つからない索引エントリ（防御）は `advance next` で捨てる。
-
-回帰テスト: `Session: 非被覆索引は本体から列を fetch する`、
-`SqlReference: インデックス入れ子ループ（右索引 + 左が小さい）`。
-
-### 11.84 format マーカーは「空 = 新規」と決めつけない
-
-❌ `.rykdb.format` が空なら常に新規 DB とみなす。
-format マーカー導入前の DB は空マーカーのままデータファイルを持つ。
-そこへ v2 を書くと、v1 の索引値を新しい読み取りで解釈してしまう。
-
-✅ 空マーカーは**データファイル（`*.sst` / `*.wal` / `CURRENT` / `MANIFEST-*`）が無いときだけ**新規とし、
-v2 を書く。データがあれば v1 以前として `CorruptionError`。
-`rykdb-prefixed-v1` も明示エラーにする（WAL 復旧より前の `ensureFormat` で拒否）。
-
-回帰テスト: `RowStore: format マーカーがプロセス間ロックを兼ねる`、
-`RowStore: v1 の format マーカーは明示エラー`、
-`RowStore: 空マーカーでもデータファイルがあれば旧形式として拒否する`。
-
-### 11.85 アクティブパターンは行数を減らさない — 重複の一元化にだけ使う
-
-`Parser` に `LiteralExpr` / `NameToken`（`[<return: Struct>]` + `voption`）を入れた実測。
-
-- リテラル式の 8分岐が `parsePrimaryC` と `parseInsert` の `simpleLiteral` に重複していたのを 1箇所へ。
-  **行数はネット +12**（定義とコメントが削除分を上回る）。
-  狙いは行数ではなく「同じ文法規則を 2箇所に持たない」こと。
-- 割当は **4.71KB → 4.71KB（不変）**、時間は 2.220 → 2.275µs
-  （DefaultJob、+2.5%・ノイズ込み）。`inline` を付けても 2.274µs で変わらない
-  （JIT が既に内包している）ので付けない。
-- 部分アクティブパターンは既定で `Some` を確保する。`[<return: Struct>]` + `voption` を必須にする。
-- 真偽値が欲しい `if` 連鎖は `isSymbol` / `isKeyword` / `isIdentName` のまま。
-  アームごとの `when` ガードで AP を使うと `ToUpperInvariant` がアーム数だけ走る。
-- `NameToken` は `Ident` / `QuotedIdent` をまとめるが、**別名の解析には使わない**
-  （`QuotedIdent` は予約語チェックを通さないので `"UNION"` を別名にできなくなる）。
-- 計測は `tools/RykDb.Bench` の `ParsePoint`（字句解析 + 構文解析だけ）。
+## 11. 実装時チェックリスト
+
+変更の種類ごとに、最低限次を確認する。
+
+### 11.1 Pull演算子・再帰
+
+- [ ] `Step`の第2引数を遅延せず構築していないか
+- [ ] 継続を別ループへ飛ばしていないか
+- [ ] 再帰に`>>=`や`Result.map`を載せていないか
+- [ ] 可変状態をモジュールスコープで共有していないか
+- [ ] 式評価エラーを`Op.Empty`へ変換していないか
+- [ ] `Op.next cur`の次は`nxt`を使っているか
+- [ ] 退避runはone-shotとして扱っているか
+
+### 11.2 計画・実行
+
+- [ ] 下へ渡すスキーマは入力スキーマか
+- [ ] JOINの右部分木とそのpushdown Filterを実行しているか
+- [ ] 入れ子JOINへ実際の左出力スキーマを渡しているか
+- [ ] 集約ノードをラップを降りて探しているか
+- [ ] HAVINGにだけある集約を集めているか
+- [ ] GROUP BY式を木全体で置換しているか
+- [ ] `ORDER BY`序数を計画時に解決しているか
+- [ ] DISTINCTは射影の後に適用しているか
+- [ ] 相関サブクエリを外側行ごとに再計画しているか
+- [ ] 未対応語を別名へ吸収していないか
+
+### 11.3 Storage・MVCC
+
+- [ ] ポイント検索にrangeScanを使っていないか
+- [ ] SSTable走査のstartKeyとファイル枝刈りを両方適用しているか
+- [ ] ファイル番号を巻き戻していないか
+- [ ] MANIFEST反映をファイル削除より先にしているか
+- [ ] SSTableのキー順とFooterを正しく検証しているか
+- [ ] WALはフレーム単位で書き、commit済みprefixだけ再生するか
+- [ ] 複数keyspaceを1回のWAL/batchへまとめているか
+- [ ] 古いsnapshotとtombstoneをGCで消していないか
+- [ ] 再オープン時にSeqNoを復元しているか
+- [ ] UNIQUEの論理予約を競合検査へ含めているか
+
+### 11.4 索引・JOIN・SQL意味論
+
+- [ ] 索引の列名が一致するものだけ選んでいるか
+- [ ] CatalogへIndexSchemaを載せているか
+- [ ] CREATE INDEXはbackfill→カタログ登録の順か
+- [ ] DELETEは主キーと全索引へtombstoneを書いているか
+- [ ] DROPと再作成時に残骸を掃除しているか
+- [ ] `IN`と`LIKE`が3値論理・進捗を守るか
+- [ ] TEXT・REAL・NULLの比較規則を揃えているか
+- [ ] CASTと暗黙変換を分けているか
+
+### 11.5 メモリ・並行・通信
+
+- [ ] 管理メモリ上限とファイルサイズ見積りを混同していないか
+- [ ] 上限超過時に退避runへ移行できるか
+- [ ] 走査をcloseせずに捨てていないか
+- [ ] 内部へ格納する配列を複製しているか
+- [ ] 結果へ返す配列を内部配列と分離しているか
+- [ ] `Unloaded`をNULLとして扱っていないか
+- [ ] Snapshotとファイルpinを一度に取得しているか
+- [ ] 接続ごとのtransactionだけrollbackしているか
+- [ ] STREAMはENDまで読み切っているか
+- [ ] fsync失敗を全Sessionへ伝播しているか
+
+### 11.6 F#・テスト
+
+- [ ] 同名レコード・ケースで型推論が変わっていないか
+- [ ] `.fsi`で公開する表現を制限しているか
+- [ ] `[<TailCall>]`と`<Tailcalls>true</Tailcalls>`を正しく使っているか
+- [ ] build/testを並行実行していないか
+- [ ] `[<Fact>]`の関数形を守っているか
+- [ ] ガードは意図的な違反で一度失敗を確認したか
+- [ ] Fantomas後にリビルドしているか
+- [ ] TailAuditと回帰テストを単独実行しているか
