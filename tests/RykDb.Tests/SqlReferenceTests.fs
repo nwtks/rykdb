@@ -1320,6 +1320,25 @@ let ``SqlReference: ハッシュ結合（INNER / LEFT / NULL キー）`` () =
         Assert.Equal<int64>(1L, asInt residual.Rows.[0].[1]))
 
 [<Fact>]
+let ``SqlReference: REAL の NaN 同士はハッシュ結合でも一致する`` () =
+    // REAL の比較は NaN = NaN が真（§2）。ハッシュ結合のキーも同じ意味論にする。
+    withSession "joinnan" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE nan1 (id INTEGER PRIMARY KEY, r REAL)"
+        let db2 = exec db1 "CREATE TABLE nan2 (id INTEGER PRIMARY KEY, r REAL)"
+        let db3 = exec db2 "INSERT INTO nan1 VALUES (1, CAST('NaN' AS REAL)), (2, 1.5)"
+        let db4 = exec db3 "INSERT INTO nan2 VALUES (1, CAST('NaN' AS REAL)), (2, 1.5)"
+
+        // r は主キーでも索引でもないのでハッシュ結合になる
+        let _, res =
+            ok (execSql db4 "SELECT nan1.id, nan2.id FROM nan1 JOIN nan2 ON nan1.r = nan2.r ORDER BY nan1.id")
+
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(2L, asInt res.Rows.[1].[0])
+        Assert.Equal<int64>(2L, asInt res.Rows.[1].[1]))
+
+[<Fact>]
 let ``SqlReference: マージ結合（主キー同士・LEFT・複合キー）`` () =
     withSession "joinmerge" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE m1 (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -1447,7 +1466,25 @@ let ``SqlReference: インデックス入れ子ループ（右索引 + 左が小
             )
 
         Assert.Equal<int>(1, residual.Rows.Length)
-        Assert.Equal<string>("bob", asText residual.Rows.[0].[0]))
+        Assert.Equal<string>("bob", asText residual.Rows.[0].[0])
+
+        // 右の WHERE は Filter として pushdown されていても、索引結合の residual として評価される
+        let _, local =
+            ok (
+                execSql
+                    db5
+                    "SELECT users.name FROM depts JOIN users ON depts.id = users.dept_id WHERE depts.id = 1 AND users.name <> 'alice' ORDER BY users.id"
+            )
+
+        Assert.Equal<int>(1, local.Rows.Length)
+        Assert.Equal<string>("bob", asText local.Rows.[0].[0])
+
+        // 右の等値条件が主キーそのものでも索引入れ子ループで引ける
+        let _, byPk =
+            ok (execSql db5 "SELECT users.name FROM depts JOIN users ON depts.id = users.id WHERE depts.id = 1")
+
+        Assert.Equal<int>(1, byPk.Rows.Length)
+        Assert.Equal<string>("alice", asText byPk.Rows.[0].[0]))
 
 [<Fact>]
 let ``SqlReference: JOIN の非修飾で曖昧な列は NameError`` () =
@@ -2764,19 +2801,15 @@ let ``SqlReference: EXPLAIN は実行せずに計画を返す`` () =
             Assert.Equal<string list>([ "plan" ], r.Columns |> Array.toList)
             r.Rows |> Array.map (fun row -> asText row.[0]) |> Array.toList
 
-        // 主キー等値 → PkLookup
+        // 主キー等値 → PkLookup（述語は走査で吸収し Filter は残らない）
         Assert.Equal<string list>(
-            [ "Project(*)"; "  Filter((t.id = 2))"; "    Scan(t, PkLookup(2))" ],
+            [ "Project(*)"; "  Scan(t, PkLookup(2))" ],
             planOf "EXPLAIN SELECT * FROM t WHERE id = 2"
         )
 
-        // 索引の等値 → IndexLookup（述語は再検査のため残る）
+        // 索引の等値 → IndexLookup（述語は走査で吸収し Filter は残らない）
         Assert.Equal<string list>(
-            [
-                "Project(t.id)"
-                "  Filter((t.v = 'a'))"
-                "    Scan(t, IndexLookup(ix, 'a'))"
-            ],
+            [ "Project(t.id)"; "  Scan(t, IndexLookup(ix, 'a'))" ],
             planOf "EXPLAIN SELECT id FROM t WHERE v = 'a'"
         )
 
@@ -2829,8 +2862,7 @@ let ``SqlReference: EXPLAIN は実行せずに計画を返す`` () =
                 "Project(x.id)"
                 "  Derived"
                 "    Project(t.id)"
-                "      Filter((t.id = 1))"
-                "        Scan(t, PkLookup(1))"
+                "      Scan(t, PkLookup(1))"
             ],
             planOf "EXPLAIN SELECT x.id FROM (SELECT id FROM t WHERE id = 1) AS x"
         )

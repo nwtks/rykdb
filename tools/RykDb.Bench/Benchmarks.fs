@@ -290,20 +290,36 @@ type QueryBenchmarks() =
 [<MemoryDiagnoser>]
 type SpillBenchmarks() =
     let mutable session = Unchecked.defaultof<Session>
+    let mutable baseline = Unchecked.defaultof<Session>
     let mutable root = ""
+    let mutable baseRoot = ""
     let mutable spillDir = ""
 
     let distinctSql = "SELECT DISTINCT v FROM t"
     let groupBySql = "SELECT v, COUNT(*) FROM t GROUP BY v"
     let joinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id"
+    // 結合キーが主キーでない（走査順と一致しない）JOIN。ハッシュのパーティション経路を通る。
+    let joinByValueSql =
+        "SELECT COUNT(*) FROM a JOIN b ON a.v = b.v JOIN c ON b.v = c.v"
+
     let sortSql = "SELECT v FROM t ORDER BY v LIMIT 10"
 
     member private _.Exec(sql: string) =
         session.Execute sql |> Check.ok |> ignore
 
+    /// 結果を順序非依存の文字列にする（退避経路と通常経路の比較用）。
+    member private _.RowsText(s: Session, sql: string) =
+        let res = s.Execute sql |> Check.ok
+
+        res.Rows
+        |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
+        |> Array.sort
+        |> String.concat "|"
+
     [<GlobalSetup>]
     member this.Setup() =
         root <- BenchEnv.newTempDir "spill"
+        baseRoot <- BenchEnv.newTempDir "spill-base"
         spillDir <- Path.Combine(root, "spill")
         Directory.CreateDirectory spillDir |> ignore
 
@@ -315,40 +331,52 @@ type SpillBenchmarks() =
             }
 
         session <- Session.OpenWithSync(root, options) |> Check.ok
+        baseline <- Session.OpenWithSync(baseRoot, SessionOptions.Default) |> Check.ok
 
-        this.Exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        this.Exec "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
-        this.Exec "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)"
-        this.Exec "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)"
+        let seedInto (s: Session) =
+            let exec (sql: string) = s.Execute sql |> Check.ok |> ignore
 
-        let seed table count =
-            let values =
-                [ for i in 0 .. count - 1 -> sprintf "(%d, %d)" i (i % 50) ]
-                |> String.concat ", "
+            exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+            exec "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)"
+            exec "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)"
+            exec "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)"
 
-            this.Exec(sprintf "INSERT INTO %s VALUES %s" table values)
+            let seed table count =
+                let values =
+                    [ for i in 0 .. count - 1 -> sprintf "(%d, %d)" i (i % 50) ]
+                    |> String.concat ", "
 
-        seed "t" 2000
-        seed "a" 200
-        seed "b" 200
-        seed "c" 200
+                exec (sprintf "INSERT INTO %s VALUES %s" table values)
 
-        // 退避経路が実際に使われていることを 1回だけ確認する（測定条件の取り違え防止）。
-        let distinctRows = (session.Execute distinctSql |> Check.ok).Rows.Length
-        let groupRows = (session.Execute groupBySql |> Check.ok).Rows.Length
+            seed "t" 2000
+            seed "a" 200
+            seed "b" 200
+            seed "c" 200
 
-        if distinctRows <> 50 || groupRows <> 50 then
-            failwithf "スピル経路の結果が不正です（distinct=%d, group=%d）" distinctRows groupRows
+        seedInto session
+        seedInto baseline
+
+        // 退避経路の結果が通常のバジェットと一致することを確かめる。
+        // パーティション分割・フォールバックの誤りは実行時間に現れないため、
+        // 結果を突き合わせないとベンチが緑のまま誤答を見逃す。
+        for sql in [ distinctSql; groupBySql; joinSql; joinByValueSql; sortSql ] do
+            let spilled = this.RowsText(session, sql)
+            let normal = this.RowsText(baseline, sql)
+
+            if spilled <> normal then
+                failwithf "スピル経路の結果が通常経路と一致しません: %s\n  spill=%s\n  normal=%s" sql spilled normal
 
     [<GlobalCleanup>]
     member _.Cleanup() =
-        try
-            if not (isNull (box session)) then
-                session.Close() |> ignore
-        with _ ->
-            ()
+        for s in [ session; baseline ] do
+            try
+                if not (isNull (box s)) then
+                    s.Close() |> ignore
+            with _ ->
+                ()
 
         BenchEnv.deleteDir root
+        BenchEnv.deleteDir baseRoot
 
     /// DISTINCT の外部重複除去（連番で最初の出現順を復元する経路）。
     [<Benchmark>]
@@ -361,6 +389,10 @@ type SpillBenchmarks() =
     /// 3テーブル JOIN（右側が上限を超え、パーティション分割ハッシュへ入る経路）。
     [<Benchmark>]
     member this.Join3TablesSpill() = this.Exec joinSql
+
+    /// 結合キーが主キーでない 3テーブル JOIN（未整列のキーでハッシュのパーティション経路を通る）。
+    [<Benchmark>]
+    member this.JoinByValueSpill() = this.Exec joinByValueSql
 
     /// ORDER BY の外部マージソート（受け皿 1バイト）。
     [<Benchmark>]

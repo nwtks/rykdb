@@ -24,6 +24,14 @@ type internal ScanMethod =
     /// 索引の範囲走査（索引列の値が [lower, upper] の行）
     | IndexRangeScan of string * SqlValue array * SqlValue array option
 
+/// インデックス入れ子ループで右テーブルを引く方法。
+[<RequireQualifiedAccess>]
+type internal JoinLookup =
+    /// 主キーの等値検索
+    | PrimaryKey
+    /// 索引による検索（索引名）
+    | Index of string
+
 /// 結合アルゴリズム。
 [<RequireQualifiedAccess>]
 type internal JoinAlgorithm =
@@ -33,8 +41,8 @@ type internal JoinAlgorithm =
     | HashJoin
     /// マージ結合（両入力がキー順）
     | MergeJoin
-    /// インデックス入れ子ループ（右を索引で引く）
-    | IndexNestedLoop of string
+    /// インデックス入れ子ループ（右を索引 / 主キーで引く）
+    | IndexNestedLoop of JoinLookup
 
 /// 左×右の等値結合キー。
 type internal JoinKeys =
@@ -195,9 +203,77 @@ module internal Analyzer =
                 let prefix = List.truncate indices.Length names
                 reorder prefix |> Option.map (fun reordered -> reordered, prefix)
 
+    /// 右部分木が `Scan`（`Filter` を重ねてもよい）なら、実行時に評価する述語を返す。
+    /// インデックス入れ子ループは右部分木を実行しないため、
+    /// `Filter` の述語は residual として結合時に評価する
+    /// （捨てると WHERE の pushdown が消えて結果が変わる）。
+    let private indexableRight =
+        let rec unwrap preds =
+            function
+            | Logical.Scan _ -> Some preds
+            | Logical.Filter(p, child) -> unwrap (p :: preds) child
+            | _ -> None
+
+        unwrap []
+
+    /// 見積りの作業項目（明示スタック。「深さ優先の後置評価」を末尾再帰で回す）。
+    type private EstimateWork =
+        | Visit of Logical
+        | ApplyFilter
+        | MinOfTwo
+
+    /// 行数の粗い見積り（統計なし）。
+    /// 結合順の決定（`PlanBuilder`）とインデックス入れ子ループの判断（`chooseJoinAlgorithm`）で
+    /// 同じ値を使う。上限なし・未知は `infinity`。
+    /// <remarks>
+    /// 基本値は走査方法だけで決め、`Filter` 1段ごとに 0.1倍（下限 1）、`Limit` は件数。
+    /// `Join` は左右の小さい方（外側の行数は内側で絞られる）。
+    /// </remarks>
+    let estimateRows (tree: Logical) =
+        let baseRows =
+            function
+            | Logical.Scan(_, ScanMethod.PkLookup _) -> 1.0
+            | Logical.Scan(_, ScanMethod.IndexLookup _) -> 2.0
+            | Logical.Scan(_, ScanMethod.RangeScan _)
+            | Logical.Scan(_, ScanMethod.IndexRangeScan _) -> 100.0
+            | Logical.Scan _ -> 1000.0
+            | Logical.Values _ -> 1.0
+            | _ -> System.Double.PositiveInfinity
+
+        let rec go values =
+            function
+            | [] ->
+                match values with
+                | v :: _ -> v
+                | [] -> System.Double.PositiveInfinity
+            | Visit node :: rest ->
+                match node with
+                | Logical.Filter(_, child) -> go values (ApplyFilter :: Visit child :: rest)
+                | Logical.Limit(_, n, _) when n >= 0 -> go (float n :: values) rest
+                | Logical.Limit(_, _, child)
+                | Logical.Project(_, child)
+                | Logical.Sort(_, child)
+                | Logical.Distinct child
+                | Logical.Having(_, _, _, child) -> go values (Visit child :: rest)
+                | Logical.Aggregate(groupBy, _, _) when List.isEmpty groupBy -> go (1.0 :: values) rest
+                | Logical.Aggregate(_, _, child) -> go values (Visit child :: rest)
+                | Logical.Join(_, _, _, left, right) -> go values (MinOfTwo :: Visit right :: Visit left :: rest)
+                | leaf -> go (baseRows leaf :: values) rest
+            | ApplyFilter :: rest ->
+                match values with
+                | v :: tail -> go (max 1.0 (v * 0.1) :: tail) rest
+                | [] -> go (1.0 :: values) rest
+            | MinOfTwo :: rest ->
+                match values with
+                | r :: l :: tail -> go (min l r :: tail) rest
+                | _ -> go (System.Double.PositiveInfinity :: values) rest
+
+        go [] [ Visit tree ]
+
     /// 結合アルゴリズムを選ぶ。
     /// - 等値キーなし: 入れ子ループ
-    /// - 左が小さい（上限 32行）かつ右に使える索引: インデックス入れ子ループ
+    /// - 左が小さい（上限 32行）かつ右を主キー / 索引の前置で引ける: インデックス入れ子ループ
+    ///   （右の `Filter` の述語は residual として評価する）
     /// - 両入力が結合キー順に走査できる: マージ結合
     /// - それ以外の等値結合: ハッシュ結合
     let chooseJoinAlgorithm
@@ -268,67 +344,49 @@ module internal Analyzer =
                         Residual = Predicate.joinConjuncts (List.rev residual)
                     }
 
-        let rightIndexForJoin rightSchema (rightTable: TableSchema) keys =
-            let keyNames =
-                keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
+        let coversAll (keyNames: string array) cols =
+            List.length cols = keyNames.Length
+            && cols
+               |> List.forall (fun c -> keyNames |> Array.exists (fun k -> Catalog.eqName c k))
+            && keyNames
+               |> Array.forall (fun k -> cols |> List.exists (fun c -> Catalog.eqName c k))
 
+        let leftIndicesOf keys cols =
             let findLeft colName =
                 keys.RightIndices
                 |> Array.tryFindIndex (fun ri -> Catalog.eqName rightSchema.Columns.[ri].Name colName)
                 |> Option.map (fun keyPos -> keys.LeftIndices.[keyPos])
 
-            rightTable.Indexes
-            |> List.choose (fun idx ->
-                let coversAll =
-                    idx.Columns.Length = keyNames.Length
-                    && idx.Columns
-                       |> List.forall (fun c -> keyNames |> Array.exists (fun k -> Catalog.eqName c k))
-                    && keyNames
-                       |> Array.forall (fun k -> idx.Columns |> List.exists (fun c -> Catalog.eqName c k))
+            let lefts = cols |> List.map findLeft
 
-                if not coversAll then
-                    None
-                else
-                    let lefts = idx.Columns |> List.map findLeft
+            if lefts |> List.forall Option.isSome then
+                Some(lefts |> List.choose id |> Array.ofList)
+            else
+                None
 
-                    if lefts |> List.forall Option.isSome then
-                        Some(idx.Name, lefts |> List.choose id |> Array.ofList)
+        let rightLookupForJoin rightSchema (rightTable: TableSchema) keys =
+            let keyNames =
+                keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
+
+            let pkNames =
+                rightTable.PrimaryKey |> List.map (fun i -> rightTable.Columns.[i].Name)
+
+            if List.isEmpty pkNames || not (coversAll keyNames pkNames) then
+                None
+            else
+                leftIndicesOf keys pkNames
+                |> Option.map (fun lefts -> JoinLookup.PrimaryKey, lefts)
+            |> Option.orElseWith (fun () ->
+                rightTable.Indexes
+                |> List.choose (fun idx ->
+                    let prefix = List.truncate keyNames.Length idx.Columns
+
+                    if coversAll keyNames prefix then
+                        Some(JoinLookup.Index idx.Name, prefix)
                     else
                         None)
-            |> List.tryHead
-
-        let rec estimatedRowsCps k =
-            function
-            | Logical.Values _ -> k 1
-            | Logical.Limit(_, limit, _) when limit >= 0 -> k limit
-            | Logical.Limit(_, _, child) -> estimatedRowsCps k child
-            | Logical.Scan(_, ScanMethod.PkLookup _) -> k 1
-            | Logical.Project(_, child) -> estimatedRowsCps k child
-            | Logical.Filter(_, child) -> estimatedRowsCps k child
-            | Logical.Sort(_, child) -> estimatedRowsCps k child
-            | Logical.Distinct child -> estimatedRowsCps k child
-            | Logical.Aggregate(groupBy, _, child) ->
-                if List.isEmpty groupBy then
-                    k 1
-                else
-                    estimatedRowsCps k child
-            | Logical.Join(_, _, _, left, right) ->
-                estimatedRowsCps
-                    (fun l ->
-                        if l = System.Int32.MaxValue then
-                            k System.Int32.MaxValue
-                        else
-                            estimatedRowsCps
-                                (fun r ->
-                                    if r = System.Int32.MaxValue then
-                                        k System.Int32.MaxValue
-                                    else
-                                        k (min l r))
-                                right)
-                    left
-            | _ -> k System.Int32.MaxValue
-
-        let estimatedRows = estimatedRowsCps id
+                |> List.tryPick (fun (lookup, cols) ->
+                    leftIndicesOf keys cols |> Option.map (fun lefts -> lookup, lefts)))
 
         let mergeJoinKeys keys =
             let leftOrder = scanOrder tableOf leftTree
@@ -372,14 +430,17 @@ module internal Analyzer =
         match joinKeys on with
         | None -> JoinAlgorithm.NestedLoop, None, None
         | Some keys ->
-            let index =
-                match rightTree, rightTable with
-                | Logical.Scan(_, _), Some table -> rightIndexForJoin rightSchema table keys
+            let lookup =
+                match indexableRight rightTree, rightTable with
+                | Some rightPreds, Some table ->
+                    rightLookupForJoin rightSchema table keys
+                    |> Option.map (fun (target, leftIndices) -> target, leftIndices, rightPreds)
                 | _ -> None
 
-            match index with
-            | Some(indexName, leftIndices) when estimatedRows leftTree <= 32 ->
-                JoinAlgorithm.IndexNestedLoop indexName, Some keys, Some leftIndices
+            match lookup with
+            | Some(target, leftIndices, rightPreds) when estimateRows leftTree <= 32.0 ->
+                let residual = Option.toList keys.Residual @ rightPreds |> Predicate.joinConjuncts
+                JoinAlgorithm.IndexNestedLoop target, Some { keys with Residual = residual }, Some leftIndices
             | _ ->
                 match mergeJoinKeys keys with
                 | Some aligned -> JoinAlgorithm.MergeJoin, Some aligned, None
@@ -643,3 +704,36 @@ module internal Analyzer =
             match tryIndexMethod tn with
             | Some m -> ret m
             | None -> ret ScanMethod.SeqScan
+
+    /// 走査方法が同じ等値条件を保証するか。
+    /// `PkLookup` / `IndexLookup` が吸収済みの `col = 定数` を Filter から落とすために使う
+    /// （残しても結果は変わらないが、行ごとに二重評価になる）。
+    let impliedByScan (catalog: Catalog) (b: TableBinding) (method: ScanMethod) (predicate: Expr) =
+        let matches names (values: SqlValue array) name value =
+            names
+            |> List.tryFindIndex (fun n -> Catalog.eqName n name)
+            |> Option.exists (fun pos ->
+                pos < values.Length
+                && match SqlValue.compareValuesV values.[pos] value with
+                   | DbOk 0 -> true
+                   | _ -> false)
+
+        let tn = (refName b).ToLowerInvariant()
+
+        match predicate with
+        | Expr.Binary(BinaryOp.Eq, a, c) ->
+            match colOf tn a, litOf c with
+            | Some n, Some v -> Some(n, v)
+            | _ ->
+                match colOf tn c, litOf a with
+                | Some n, Some v -> Some(n, v)
+                | _ -> None
+        | _ -> None
+        |> Option.exists (fun (name, value) ->
+            match method with
+            | ScanMethod.PkLookup values ->
+                matches (b.Schema.PrimaryKey |> List.map (fun i -> b.Schema.Columns.[i].Name)) values name value
+            | ScanMethod.IndexLookup(indexName, values) ->
+                Catalog.findIndex catalog indexName
+                |> Option.exists (fun idx -> matches idx.Columns values name value)
+            | _ -> false)

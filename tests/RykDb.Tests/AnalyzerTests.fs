@@ -9,7 +9,7 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 [<Fact>]
-let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば IndexNestedLoop`` () =
+let ``Analyzer.chooseJoinAlgorithm: 左が小さく右を引けるなら IndexNestedLoop`` () =
     let leftTable =
         {
             Name = "l"
@@ -53,8 +53,9 @@ let ``Analyzer.chooseJoinAlgorithm: 左が小さく右に索引があれば Inde
         | _ -> None
 
     match Analyzer.chooseJoinAlgorithm tableOf leftSchema rightSchema (Some rightTable) leftSmall rightScan on with
-    | JoinAlgorithm.IndexNestedLoop name, _, Some lefts ->
-        Assert.Equal<string>("ix_r_a", name)
+    | JoinAlgorithm.IndexNestedLoop target, _, Some lefts ->
+        // 結合キーが主キーそのものなので主キー lookup を優先する。
+        Assert.Equal<JoinLookup>(JoinLookup.PrimaryKey, target)
         Assert.Equal<int array>([| 0 |], lefts)
     | other -> failActual "IndexNestedLoop ではありません" other
 
@@ -176,6 +177,93 @@ let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致�
     match planReversed with
     | JoinAlgorithm.HashJoin, _, _ -> ()
     | other -> failActual "HashJoin ではありません" other
+
+[<Fact>]
+let ``Analyzer.chooseJoinAlgorithm: 複合索引の前置と右の Filter を扱う`` () =
+    let leftTable =
+        {
+            Name = "l"
+            Columns = [ col "a" DataType.Integer; col "b" DataType.Integer ]
+            PrimaryKey = [ 0; 1 ]
+            Indexes = []
+        }
+
+    let rightTable =
+        {
+            Name = "r"
+            Columns =
+                [
+                    col "a" DataType.Integer
+                    col "b" DataType.Integer
+                    col "id" DataType.Integer
+                ]
+            PrimaryKey = [ 2 ]
+            Indexes =
+                [
+                    {
+                        Name = "ix_r_a_b"
+                        Columns = [ "a"; "b" ]
+                        Unique = false
+                    }
+                ]
+        }
+
+    let leftSchema = Schema.ofTable "l" None leftTable
+    let rightSchema = Schema.ofTable "r" None rightTable
+
+    let eq leftCol rightCol =
+        Expr.Binary(
+            BinaryOp.Eq,
+            Expr.Column { Qualifier = Some "l"; Name = leftCol },
+            Expr.Column
+                {
+                    Qualifier = Some "r"
+                    Name = rightCol
+                }
+        )
+
+    // 右の WHERE は Filter として残っていても residual として評価する
+    let rightFilter =
+        Expr.Binary(BinaryOp.Gt, Expr.Column { Qualifier = Some "r"; Name = "id" }, Expr.Literal(Literal.Int 1L))
+
+    let leftSmall = Logical.Limit(0, 1, Logical.Scan("l", ScanMethod.SeqScan))
+    let rightTree = Logical.Filter(rightFilter, Logical.Scan("r", ScanMethod.SeqScan))
+
+    // 結合キーが索引の先頭 1 列だけでも前置 lookup で使える
+    match
+        Analyzer.chooseJoinAlgorithm
+            (fun _ -> Some rightTable)
+            leftSchema
+            rightSchema
+            (Some rightTable)
+            leftSmall
+            rightTree
+            (eq "a" "a")
+    with
+    | JoinAlgorithm.IndexNestedLoop target, Some keys, Some lefts ->
+        Assert.Equal<JoinLookup>(JoinLookup.Index "ix_r_a_b", target)
+        Assert.Equal<int array>([| 0 |], lefts)
+
+        // Filter の述語は落とさず residual に入れる
+        match keys.Residual with
+        | Some p -> Assert.Contains("r.id", Expr.toDisplayString p)
+        | None -> Assert.Fail("右の Filter が residual に入っていません")
+    | other -> failActual "IndexNestedLoop ではありません" other
+
+    // 結合キーの順が索引と逆でも索引列順に並べ替える（a, b）
+    match
+        Analyzer.chooseJoinAlgorithm
+            (fun _ -> Some rightTable)
+            leftSchema
+            rightSchema
+            (Some rightTable)
+            leftSmall
+            (Logical.Scan("r", ScanMethod.SeqScan))
+            (Expr.Binary(BinaryOp.And, eq "b" "b", eq "a" "a"))
+    with
+    | JoinAlgorithm.IndexNestedLoop(JoinLookup.Index "ix_r_a_b"), Some _, Some lefts ->
+        Assert.Equal<int array>([| 0; 1 |], lefts)
+    | other -> failActual "IndexNestedLoop(ix_r_a_b) ではありません" other
 
 [<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`` () =

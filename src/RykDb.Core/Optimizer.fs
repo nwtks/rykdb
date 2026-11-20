@@ -335,46 +335,57 @@ module internal Optimizer =
                     return op
             }
 
+        let rec rightScanOf =
+            function
+            | Logical.Scan _ as scan -> Some scan
+            | Logical.Filter(_, child) -> rightScanOf child
+            | _ -> None
+
+        let joinWith frame left keys lookupRows =
+            match frame.Kind with
+            | JoinKind.Inner ->
+                OpsJoin.innerJoinIndexed
+                    frame.LeftSchema
+                    left
+                    frame.LeftKeyIndices
+                    frame.RightSchema
+                    keys.Residual
+                    lookupRows
+            | JoinKind.Left ->
+                OpsJoin.leftJoinIndexed
+                    frame.LeftSchema
+                    left
+                    frame.LeftKeyIndices
+                    frame.RightSchema
+                    keys.Residual
+                    lookupRows
+
         let execIndexJoin frame left =
             match frame.Keys with
             | None -> err (DbError.internalError "index nested loop に結合キーがありません")
             | Some keys ->
-                let indexName =
-                    match frame.Algorithm with
-                    | JoinAlgorithm.IndexNestedLoop indexName -> indexName
-                    | _ -> ""
-
                 let rightMask =
-                    match frame.Right with
-                    | Logical.Scan _ as scan ->
+                    match rightScanOf frame.Right with
+                    | Some scan ->
                         match ctx.ScanNeeds.TryGetValue(box scan) with
                         | true, mask -> mask
                         | _ -> Array.create frame.RightSchema.Columns.Length true
-                    | _ -> Array.create frame.RightSchema.Columns.Length true
+                    | None -> Array.create frame.RightSchema.Columns.Length true
 
-                result {
-                    let! scanMask, fetchMask =
-                        ExecContext.indexAccessMasks ctx frame.RightName indexName rightMask
+                match frame.Algorithm with
+                | JoinAlgorithm.IndexNestedLoop JoinLookup.PrimaryKey ->
+                    ret (
+                        joinWith frame left keys (fun keyValues ->
+                            ExecContext.byPrimaryKeyMasked ctx frame.RightName keyValues rightMask)
+                    )
+                | JoinAlgorithm.IndexNestedLoop(JoinLookup.Index indexName) ->
+                    result {
+                        let! scanMask, fetchMask =
+                            ExecContext.indexAccessMasks ctx frame.RightName indexName rightMask
 
-                    return
-                        match frame.Kind with
-                        | JoinKind.Inner ->
-                            OpsJoin.innerJoinIndexed
-                                frame.LeftSchema
-                                left
-                                frame.LeftKeyIndices
-                                frame.RightSchema
-                                keys.Residual
-                                (lookup frame indexName scanMask fetchMask)
-                        | JoinKind.Left ->
-                            OpsJoin.leftJoinIndexed
-                                frame.LeftSchema
-                                left
-                                frame.LeftKeyIndices
-                                frame.RightSchema
-                                keys.Residual
-                                (lookup frame indexName scanMask fetchMask)
-                }
+                        return joinWith frame left keys (lookup frame indexName scanMask fetchMask)
+                    }
+                | _ -> err (DbError.internalError "index nested loop ではありません")
 
         let execJoin frame left right =
             match frame.Algorithm with
@@ -611,7 +622,8 @@ module internal Optimizer =
             | JoinAlgorithm.NestedLoop -> "NestedLoop"
             | JoinAlgorithm.HashJoin -> "HashJoin"
             | JoinAlgorithm.MergeJoin -> "MergeJoin"
-            | JoinAlgorithm.IndexNestedLoop index -> sprintf "IndexNestedLoop(%s)" index
+            | JoinAlgorithm.IndexNestedLoop JoinLookup.PrimaryKey -> "IndexNestedLoop(pk)"
+            | JoinAlgorithm.IndexNestedLoop(JoinLookup.Index index) -> sprintf "IndexNestedLoop(%s)" index
 
         let joinKindText =
             function

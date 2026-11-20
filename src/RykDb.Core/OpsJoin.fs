@@ -20,6 +20,12 @@ module internal OpsJoin =
     /// 結合キーの値だけを取り出す（キー配列を作る）。
     let private keyOf (row: SqlValue array) = Array.map (fun i -> row.[i])
 
+    /// 結合キーを順序保持符号化する。
+    /// ハッシュの等値判定を SQL の比較（`SqlValue.compareValuesV`）と一致させる:
+    /// NaN は単一のビットパターンに正規化され、DECIMAL の 1.0 と 1.00 は同じキーになる。
+    /// パーティション分割も同じ符号化を使うので、等しいキーは必ず同じパーティションに入る。
+    let private encodeKey (row: SqlValue array) (keys: int array) = KeyBuilder.ofValues (keyOf row keys)
+
     /// 等値結合のキーが NULL を含むか（SQL では NULL は一致しない）。
     let private hasNullKey (row: SqlValue array) =
         Array.exists (fun i -> SqlValue.isNull row.[i])
@@ -218,6 +224,8 @@ module internal OpsJoin =
             | spool -> ret (leftJoinSpilled budget spool leftSchema left rightSchema on)
 
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
+    /// `keyFor` は左行からルックアップ用のキーを作る
+    /// （ハッシュ結合は符号化したバイト列、インデックス探索は索引列の値）。
     /// lookupRows は左キーから右の行を返す（空の Op でもよい）。
     /// <remarks>
     /// Op.compute の継続内の相互再帰は「次の行を要求されたとき」に 1段ずつ進むので、スタックは積み上がらない。
@@ -229,7 +237,8 @@ module internal OpsJoin =
         (leftKeys: int array)
         (rightSchema: Schema)
         (residual: Expr option)
-        (lookupRows: SqlValue array -> Result<Op, DbError>)
+        (keyFor: SqlValue array -> Result<'Key, DbError>)
+        (lookupRows: 'Key -> Result<Op, DbError>)
         =
         let rightWidth = rightSchema.Columns.Length
         let padded lrow = padWithNulls lrow rightWidth
@@ -246,9 +255,12 @@ module internal OpsJoin =
                         else
                             Op.next (probe lnext)
                     else
-                        match lookupRows (keyOf lrow leftKeys) with
+                        match keyFor lrow with
                         | Error e -> OpStep.OpError e
-                        | Ok rows -> Op.next (emit lrow lnext rows false))
+                        | Ok key ->
+                            match lookupRows key with
+                            | Error e -> OpStep.OpError e
+                            | Ok rows -> Op.next (emit lrow lnext rows false))
                 cur
 
         and emit lrow lnext rows matched =
@@ -269,30 +281,42 @@ module internal OpsJoin =
         probe left
 
     /// 右側のハッシュ表を作る（NULL キーは登録しない）。
+    /// キーは順序保持符号化のバイト列（`encodeKey`）なので、
+    /// `SqlValue` の構造的等価と SQL の比較が食い違う値（NaN など）も正しく一致する。
     /// バケットは右入力の順序を保つ（マージ結合と同じ出力順にするため）。
     let private buildHashTable (rightRows: SqlValue array array) (rightKeys: int array) =
         let buckets =
-            System.Collections.Generic.Dictionary<SqlValue array, SqlValue array list> HashIdentity.Structural
+            System.Collections.Generic.Dictionary<byte array, SqlValue array list> HashIdentity.Structural
 
-        for rrow in rightRows do
-            if not (hasNullKey rrow rightKeys) then
-                let key = keyOf rrow rightKeys
+        let add key rrow =
+            match buckets.TryGetValue key with
+            | true, bucket -> buckets.[key] <- rrow :: bucket
+            | _ -> buckets.[key] <- [ rrow ]
 
-                match buckets.TryGetValue key with
-                | true, bucket -> buckets.[key] <- rrow :: bucket
-                | _ -> buckets.[key] <- [ rrow ]
+        rightRows
+        |> foldOk
+            (fun () rrow ->
+                if hasNullKey rrow rightKeys then
+                    OkUnit
+                else
+                    match encodeKey rrow rightKeys with
+                    | Error e -> err e
+                    | Ok key ->
+                        add key rrow
+                        OkUnit)
+            ()
+        >>= fun () ->
+            let table =
+                System.Collections.Generic.Dictionary<byte array, SqlValue array array> HashIdentity.Structural
 
-        let table =
-            System.Collections.Generic.Dictionary<SqlValue array, SqlValue array array> HashIdentity.Structural
+            for kv in buckets do
+                table.[kv.Key] <- kv.Value |> List.rev |> List.toArray
 
-        for kv in buckets do
-            table.[kv.Key] <- kv.Value |> List.rev |> List.toArray
-
-        table
+            ret table
 
     let private lookupHash
-        (table: System.Collections.Generic.Dictionary<SqlValue array, SqlValue array array>)
-        (key: SqlValue array)
+        (table: System.Collections.Generic.Dictionary<byte array, SqlValue array array>)
+        (key: byte array)
         =
         match table.TryGetValue key with
         | true, bucket -> ret (Op.ofArray bucket)
@@ -357,6 +381,40 @@ module internal OpsJoin =
             | DbErr e -> DbErr e
             | DbOk 0 -> compareKeyVectors (i + 1) leftKeys left rightKeys right
             | DbOk c -> DbOk c
+
+    /// 結合キーでの行の比較（外部ソート用）。
+    /// NULL は最小として並べる（NULL キーは結合しないので順序は任意）。
+    /// 比較できない値（Unloaded・型不一致）は 0 を返して並びを保つ。
+    /// エラー自体はマージ結合の `compareKeyVectors` が返す。
+    let private compareKeyRows (keys: int array) (a: SqlValue array) (b: SqlValue array) =
+        let rec compareAt i =
+            if i >= keys.Length then
+                0
+            else
+                match a.[keys.[i]], b.[keys.[i]] with
+                | SqlValue.Null, SqlValue.Null -> compareAt (i + 1)
+                | SqlValue.Null, _ -> -1
+                | _, SqlValue.Null -> 1
+                | x, y ->
+                    match SqlValue.compareValuesV x y with
+                    | DbOk 0 -> compareAt (i + 1)
+                    | DbOk c -> c
+                    | DbErr _ -> 0
+
+        compareAt 0
+
+    /// マージ結合フォールバック用に、パーティションの run をキー順に外部ソートする。
+    /// 退避に使うメモリは作業メモリを超えないようにする。
+    let private sortByJoinKey (budget: MemoryBudget) (keys: int array) (src: Op) =
+        let sortBudget =
+            { budget with
+                Sort =
+                    if budget.Work < 0L then budget.Sort
+                    elif budget.Sort < 0L then budget.Work
+                    else min budget.Sort budget.Work
+            }
+
+        ExtSort.sortRows sortBudget () (fun () _ -> DbOk()) (compareKeyRows keys) src
 
     /// 等値キーの行をまとめて取り出す（入力はキー昇順）。
     /// 返り値は (グループの行, グループの次の行を含む状態)。
@@ -594,9 +652,12 @@ module internal OpsJoin =
         let spools = System.Collections.Generic.List<Spill.RowSpool>()
         let maxDepth = 4
 
-        let keyBytes keys row =
-            ValueCodec.writeValues (keyOf row keys) Writer.Empty
-            |> Result.map Writer.toArray
+        /// 再分割の総数の上限。
+        /// 1回で両側 16本ずつ作るので、これ × 32 本が一時ファイル数の上限になる
+        /// （上限に達したら整列マージフォールバックへ回す）。
+        let maxSplits = 128
+
+        let keyBytes keys row = encodeKey row keys
 
         let register spool =
             Spill.registerSpool budget.Scope spool
@@ -634,22 +695,31 @@ module internal OpsJoin =
                 |> Result.map (List.map (fun p -> register (Spill.RowSpool.Disk([ p ], 0))) >> Array.ofList)
             | Spill.RowSpool.Disk _ -> err (DbError.internalError "hash join: パーティションが複数の run です")
 
-        let rec joinWork acc =
+        let rec joinWork splits acc =
             function
             | [] -> ret (List.foldBack Op.append (List.rev acc) Op.Empty)
             | (depth, salt, lspool, rspool) :: rest ->
                 match Spill.reopenKeep budget.Scope rspool >>= Spill.spool budget with
                 | Ok(Spill.RowSpool.Memory rightRows) ->
-                    let table = buildHashTable rightRows rightKeys
+                    match buildHashTable rightRows rightKeys with
+                    | Ok table ->
+                        match Spill.reopenKeep budget.Scope lspool with
+                        | Ok l ->
+                            let op =
+                                joinProbe
+                                    isLeft
+                                    leftSchema
+                                    l
+                                    leftKeys
+                                    rightSchema
+                                    residual
+                                    (fun row -> encodeKey row leftKeys)
+                                    (lookupHash table)
 
-                    match Spill.reopenKeep budget.Scope lspool with
-                    | Ok l ->
-                        let op =
-                            joinProbe isLeft leftSchema l leftKeys rightSchema residual (lookupHash table)
-
-                        joinWork (op :: acc) rest
+                            joinWork splits (op :: acc) rest
+                        | Error e -> err e
                     | Error e -> err e
-                | Ok rightSpool when depth < maxDepth ->
+                | Ok rightSpool when depth < maxDepth && splits < maxSplits ->
                     Spill.forgetSpool budget.Scope rightSpool
                     Spill.deleteSpool rightSpool
 
@@ -661,7 +731,7 @@ module internal OpsJoin =
                                 Array.map2 (fun l r -> depth + 1, salt + 1UL, l, r) lparts rparts
                                 |> Array.toList
 
-                            joinWork acc (next @ rest)
+                            joinWork (splits + 1) acc (next @ rest)
                         | Error e -> err e
                     | Error e -> err e
                 | Ok rightSpool ->
@@ -670,12 +740,27 @@ module internal OpsJoin =
 
                     match Spill.reopenKeep budget.Scope lspool with
                     | Ok l ->
-                        match Spill.reopenKeep budget.Scope rspool with
-                        | Ok r ->
-                            let op =
-                                mergeJoinWith isLeft budget leftSchema l leftKeys rightSchema r rightKeys residual
+                        match sortByJoinKey budget leftKeys l with
+                        | Ok sortedLeft ->
+                            match Spill.reopenKeep budget.Scope rspool with
+                            | Ok r ->
+                                match sortByJoinKey budget rightKeys r with
+                                | Ok sortedRight ->
+                                    let op =
+                                        mergeJoinWith
+                                            isLeft
+                                            budget
+                                            leftSchema
+                                            sortedLeft
+                                            leftKeys
+                                            rightSchema
+                                            sortedRight
+                                            rightKeys
+                                            residual
 
-                            joinWork (op :: acc) rest
+                                    joinWork splits (op :: acc) rest
+                                | Error e -> err e
+                            | Error e -> err e
                         | Error e -> err e
                     | Error e -> err e
                 | Error e -> err e
@@ -684,9 +769,9 @@ module internal OpsJoin =
         >>= fun lparts ->
             partitionSide Spill.Partitions rightKeys right
             >>= fun rparts ->
-                let work = Array.map2 (fun l r -> 0, 0UL, l, r) lparts rparts |> Array.toList
+                let work = Array.map2 (fun l r -> 0, 1UL, l, r) lparts rparts |> Array.toList
 
-                joinWork [] work
+                joinWork 0 [] work
                 |> Result.map (
                     onExhausted (fun () ->
                         for sp in spools do
@@ -734,8 +819,19 @@ module internal OpsJoin =
         Spill.spool budget right
         >>= function
             | Spill.RowSpool.Memory rightRows ->
-                let table = buildHashTable rightRows rightKeys
-                ret (joinProbe false leftSchema left leftKeys rightSchema residual (lookupHash table))
+                buildHashTable rightRows rightKeys
+                >>= fun table ->
+                    ret (
+                        joinProbe
+                            false
+                            leftSchema
+                            left
+                            leftKeys
+                            rightSchema
+                            residual
+                            (fun row -> encodeKey row leftKeys)
+                            (lookupHash table)
+                    )
             | spool ->
                 Spill.reopen budget.Scope spool
                 >>= fun rightRows ->
@@ -755,8 +851,19 @@ module internal OpsJoin =
         Spill.spool budget right
         >>= function
             | Spill.RowSpool.Memory rightRows ->
-                let table = buildHashTable rightRows rightKeys
-                ret (joinProbe true leftSchema left leftKeys rightSchema residual (lookupHash table))
+                buildHashTable rightRows rightKeys
+                >>= fun table ->
+                    ret (
+                        joinProbe
+                            true
+                            leftSchema
+                            left
+                            leftKeys
+                            rightSchema
+                            residual
+                            (fun row -> encodeKey row leftKeys)
+                            (lookupHash table)
+                    )
             | spool ->
                 Spill.reopen budget.Scope spool
                 >>= fun rightRows ->
@@ -764,7 +871,9 @@ module internal OpsJoin =
 
     /// INNER JOIN（インデックス入れ子ループ）。
     /// 索引検索の結果は materialize せず 1行ずつ流す。
-    let innerJoinIndexed = joinProbe false
+    let innerJoinIndexed leftSchema left leftKeys rightSchema residual lookupRows =
+        joinProbe false leftSchema left leftKeys rightSchema residual (fun row -> Ok(keyOf row leftKeys)) lookupRows
 
     /// LEFT JOIN（インデックス入れ子ループ）。
-    let leftJoinIndexed = joinProbe true
+    let leftJoinIndexed leftSchema left leftKeys rightSchema residual lookupRows =
+        joinProbe true leftSchema left leftKeys rightSchema residual (fun row -> Ok(keyOf row leftKeys)) lookupRows

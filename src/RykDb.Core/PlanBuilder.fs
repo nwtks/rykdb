@@ -185,37 +185,23 @@ module internal PlanBuilder =
                 |> Set.ofList
                 |> Some
 
-        let buildScan catalog b local =
-            let withPredicates node =
-                match Predicate.joinConjuncts local with
-                | None -> ret node
-                | Some p -> ret (Logical.Filter(p, node))
+        let withPredicates preds node =
+            match Predicate.joinConjuncts preds with
+            | None -> ret node
+            | Some p -> ret (Logical.Filter(p, node))
 
+        let buildScan catalog b local =
             match b with
-            | DerivedSource(_, plan) -> withPredicates (Logical.Derived plan)
+            | DerivedSource(_, plan) -> withPredicates local (Logical.Derived plan)
             | Base tb ->
                 result {
                     let! method = Analyzer.chooseScanMethod tb catalog local
-                    return! withPredicates (Logical.Scan(bindingName b, method))
+
+                    let remaining =
+                        local |> List.filter (fun p -> not (Analyzer.impliedByScan catalog tb method p))
+
+                    return! withPredicates remaining (Logical.Scan(bindingName b, method))
                 }
-
-        let estimateRows tree =
-            let rec unwrap count t =
-                match t with
-                | Logical.Filter(_, child) -> unwrap (count + 1) child
-                | _ -> count, t
-
-            let filters, leaf = unwrap 0 tree
-
-            let baseRows =
-                match leaf with
-                | Logical.Scan(_, ScanMethod.PkLookup _) -> 1.0
-                | Logical.Scan(_, ScanMethod.IndexLookup _) -> 2.0
-                | Logical.Scan(_, ScanMethod.RangeScan _)
-                | Logical.Scan(_, ScanMethod.IndexRangeScan _) -> 100.0
-                | _ -> 1000.0
-
-            max 1.0 (baseRows * pown 0.1 (min filters 3))
 
         let buildJoin (bindings: SourceBinding list) (scans: Logical array) acc accSchema kind rightIndex on promoted =
             let right = bindings.[rightIndex]
@@ -641,7 +627,7 @@ module internal PlanBuilder =
                     |> all
 
                 let scans' = List.toArray scans
-                let estimates = scans' |> Array.map estimateRows
+                let estimates = scans' |> Array.map Analyzer.estimateRows
                 let joinPredicates' = List.toArray joinPredicates
 
                 let! joined, usedJoinPredicates =

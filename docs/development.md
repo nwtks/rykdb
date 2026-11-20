@@ -174,17 +174,20 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
 - シナリオ:
   - `PointLookup` / `PointLookup500` / `CountStar` / `RangeScan` / `FilterSeqScan` / `SelectConstant` / `CountConstantWhere`
   - `ParsePoint` — 字句解析 + 構文解析だけ。
-  - `PointLookupParsed` / `PointLookupPlanned` / `PointLookupStorage` — 同じポイント検索を「parse 済みの文」「計画済みの木」「ストレージ直（`PkLookup` が実行する `byPrimaryKeyMasked`）」で測る低レベル版。
+  - `PointLookupParsed` / `PointLookupPlanned` / `PointLookupStorage` —
+    同じポイント検索を「parse 済みの文」「計画済みの木」「ストレージ直（`PkLookup` が実行する `byPrimaryKeyMasked`）」で測る低レベル版。
     `PointLookup` との差で parse / plan / 実行の内訳が分かる。
     **計画・実行の変更はこの 3 本を見る**（`PointLookup` は plan が支配的で、ストレージの変化が埋もれる）。
     `Session.PrepareSelect`（internal）で計画だけを組み、`Optimizer.exec` + `Op.toArrayLimited` を繰り返す。
     実行のたびに `Scope.DisposeAll()` を呼ぶ。
   - `Insert100Rows`（100行 × 1文）/ `Insert10kRows`（2,000行 × 5文を 1 transaction で流して ROLLBACK）
   - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
-  - `DistinctSpill` / `GroupBySpill` / `Join3TablesSpill` / `SortSpill` —
-    `--class spill`。作業メモリ 1バイトで退避経路を強制する
-    （DISTINCT / GROUP BY / パーティション分割ハッシュ結合 / 外部マージソート）。
+  - `DistinctSpill` / `GroupBySpill` / `Join3TablesSpill` / `JoinByValueSpill` / `SortSpill` —
+    `--class spill`。
+    作業メモリ 1バイトで退避経路を強制する
+    （DISTINCT / GROUP BY / パーティション分割ハッシュ結合 / キーが主キーでない結合 / 外部マージソート）。
     通常経路との差は `QueryBenchmarks` の同名シナリオと比較する。
+    **結果は setup で通常のバジェットの実行と突き合わせる**（退避経路の誤りは時間に出ないため）。
   - `MatchesLiteralV` / `MatchesColumnV` / `MatchesBinaryV` / `MatchesComplexV` — DB を使わない式評価器のマイクロベンチ
   - `MatchesComplexJoinedV` — JOIN の ON 句の式評価
   - `CompareValuesV` — `SqlValue.compareValuesV` の割当
