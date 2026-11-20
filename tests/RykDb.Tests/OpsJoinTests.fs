@@ -551,3 +551,34 @@ let ``結合: マージの LEFT JOIN もグループを退避すると NULL 拡�
 
         Assert.Equal<string>(rowsText baseline, rowsText spilled)
         assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: マージ結合は左が先に尽きても右を読み切る（退避ファイルの後始末）`` () =
+    let drained = ref false
+    let rightRows = [| for i in 1..20 -> [| SqlValue.Int(int64 i) |] |]
+
+    let right =
+        let rec rowsFrom i =
+            Op.compute (fun () ->
+                if i >= rightRows.Length then
+                    drained.Value <- true
+                    OpStep.OpDone
+                else
+                    OpStep.OpRow(rightRows.[i], rowsFrom (i + 1)))
+
+        rowsFrom 0
+
+    // 左のキー 0 は右の全キーより小さいので、左が先に尽きる。
+    let left = Op.ofArray [| [| SqlValue.Int 0L |] |]
+
+    let rows =
+        ok (
+            Op.toArray (
+                ok (
+                    OpsJoin.innerJoinMerge MemoryBudget.Unlimited leftSchema left [| 0 |] rightSchema right [| 0 |] None
+                )
+            )
+        )
+
+    Assert.Empty rows
+    Assert.True(drained.Value, "左が先に尽きても右を読み切る必要があります")

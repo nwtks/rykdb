@@ -461,6 +461,12 @@ module internal OpsJoin =
         let resolve =
             Eval.prepare (Schema.concat leftSchema rightSchema) (residualExprs residual)
 
+        let drain =
+            function
+            | MergeStart op
+            | MergeAt(_, op) -> Op.filter (fun _ -> DbOk false) op
+            | MergeDone -> Op.Empty
+
         let rec loop lside rside =
             match lside, rside with
             | MergeStart _, _ ->
@@ -473,10 +479,10 @@ module internal OpsJoin =
                     match ensureMergeSide rside with
                     | DbErr e -> OpStep.OpError e
                     | DbOk rnext -> Op.next (loop lside rnext))
-            | MergeDone, _ -> Op.Empty
+            | MergeDone, _ -> drain rside
             | _, MergeDone ->
                 if not isLeft then
-                    Op.Empty
+                    drain lside
                 else
                     match lside with
                     | MergeAt(lrow, _) ->
