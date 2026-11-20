@@ -1415,57 +1415,57 @@ db> .rollback
 
 ### 表示形式
 
-字句・構文解析器が返す文法エラーには行番号が付く。
+字句・構文解析器が返す文法エラーには行番号と列番号が付く。
 PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 （例: FROM なしの `*`、集約と `SELECT *` の併用、`LIMIT` の相関サブクエリ）
 には付かないことがある。
 
 ```
-エラー: JOIN には FROM が必要です (位置 1行)
+エラー: JOIN には FROM が必要です (位置 1行 10列)
 ```
 
 ### よく見るメッセージ（実測）
 
-| SQL                                                                               | メッセージ                                                                                     |
-| --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `SELECT 1 JOIN t ON 1 = 1;`                                                       | `JOIN には FROM が必要です (位置 1行)`                                                         |
-| `SELECT *;`                                                                       | `FROM のない SELECT では * を使えません（列を明示してください）`                               |
-| `SELECT * FROM t WHERE id > 1 AND;`                                               | `式が必要ですが見つかりませんでした (位置 1行)`                                                |
-| `SELECT 'abc;`                                                                    | `unclosed string (位置 1行)`                                                                   |
-| `SELECT id FROM nosuchtable;`                                                     | `テーブル 'nosuchtable' が存在しません`                                                        |
-| `SELECT nosuchcol FROM t;`                                                        | `'nosuchcol' は列でも関数でもありません`                                                       |
-| `CREATE TABLE t (a INTEGER);`                                                     | `テーブル t に主キーがありません`                                                              |
-| `CREATE TABLE t (...);`（重複）                                                   | `テーブル t は既に存在します`                                                                  |
-| `CREATE INDEX ix ON t (nosuchcol);`                                               | `テーブル t に列 nosuchcol がありません`                                                       |
-| `ALTER TABLE t ADD COLUMN n INTEGER NOT NULL;`                                    | `NOT NULL 列 n を追加するには DEFAULT が必要です`                                              |
-| `ALTER TABLE t DROP COLUMN id;`（主キー）                                         | `主キー列 id は削除できません（主キーは LSM のキーに使われています）`                          |
-| `ALTER TABLE t DROP COLUMN a;`（索引列）                                          | `列 a は索引 ix_a で使われているため削除できません`                                            |
-| `ALTER TABLE t RENAME TO u;`                                                      | `ALTER TABLE ... RENAME TO（テーブル名の変更）は未対応です (位置 1行)`                         |
-| `SELECT id FROM t JOIN t ON t.id = t.id;`                                         | `テーブル t が重複しています（エイリアスを付けてください）`                                    |
-| `DROP TABLE nosuch;`                                                              | `テーブル nosuch が存在しません`                                                               |
-| `INSERT INTO t (id) VALUES (1, 2);`                                               | `INSERT の列数(1)と値の数(2)が合いません`                                                      |
-| `INSERT INTO t VALUES (1, NULL, …);`                                              | `NOT NULL 制約に違反: t.n`                                                                     |
-| `INSERT INTO t VALUES (5, 'z', 'abc');`                                           | `''abc'' は 'INTEGER' に変換できません`                                                        |
-| `SELECT (id) / 0 FROM t;`                                                         | `0 での除算は定義されていません`                                                               |
-| `SELECT LENGTH(id, n) FROM t;`                                                    | `LENGTH 関数は 1個の引数が必要ですが、2個渡されました`                                         |
-| `SELECT NOSUCHFN(id) FROM t;`                                                     | `未知のスカラー関数 'NOSUCHFN' です`                                                           |
-| `SELECT active = 1 FROM u;`                                                       | `型 'BOOLEAN' と 'INTEGER' は比較できません`                                                   |
-| `SELECT ROUND(name) FROM t;`                                                      | `ROUND は数値を受け付けますが 'abc' です`                                                      |
-| `SELECT id, (SELECT id, v FROM t) FROM t;`                                        | `サブクエリは 1 列だけを返す必要があります（2 列）`                                            |
-| `SELECT id, (SELECT v FROM t) FROM t;`                                            | `スカラーサブクエリが 2 行以上を返しました`                                                    |
-| `SELECT id FROM t AS o LIMIT (SELECT o.id FROM t AS x);`                          | `LIMIT に相関サブクエリは使えません`                                                           |
-| `SELECT (SELECT MAX(x.v) FROM t AS x WHERE x.v = o.v) FROM t AS o GROUP BY o.id;` | `GROUP BY / 集約関数を使うクエリの SELECT / HAVING / ORDER BY では相関サブクエリを使えません`  |
-| `SELECT id FROM (SELECT id FROM t);`                                              | `サブクエリ（派生テーブル）には別名が必要です（例: AS x） (位置 1行)`                          |
-| `SAVEPOINT s;`                                                                    | `文の開始として解釈できません (位置 1行)`                                                      |
-| `UPDATE t SET v = 1 FROM u;`                                                      | `文の区切りには ; が必要です（複数文は ; で区切ってください） (位置 1行)`                      |
-| `SELECT * FROM t LEFT WHERE 1 = 1;`                                               | `LEFT / INNER の後ろには JOIN が必要です (位置 1行)`                                           |
-| `SELECT 1 UNION SELECT 2;`                                                        | `UNION（重複を除く集合演算）は未対応です（UNION ALL を使ってください） (位置 1行)`             |
-| `SELECT 1 INTERSECT SELECT 2;`                                                    | `INTERSECT は未対応です（集合演算は UNION ALL のみ対応） (位置 1行)`                           |
-| `SELECT a FROM t UNION ALL SELECT a, b FROM u;`                                   | `UNION ALL の列数が一致しません（1 番目: 1 列、2 番目: 2 列）`                                 |
-| `SELECT a FROM t ORDER BY a UNION ALL SELECT a FROM u;`                           | `UNION / INTERSECT / EXCEPT は ORDER BY / LIMIT より前に書いてください (位置 1行)`             |
-| `UPDATE t AS x SET a = 1;`                                                        | `INSERT / UPDATE / DELETE の対象テーブルに別名は使えません（別名を外してください） (位置 1行)` |
-| `SELECT * FROM t WHERE a = b = c;`                                                | `比較・述語は 1つの式に 1回だけ書けます（括弧で囲んでください） (位置 1行)`                    |
-| `SELECT NULL.* FROM t;`                                                           | `'.' の後ろには列名か '*' が必要です（修飾子は識別子にだけ付けられます） (位置 1行)`           |
+| SQL                                                                               | メッセージ                                                                                          |
+| --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `SELECT 1 JOIN t ON 1 = 1;`                                                       | `JOIN には FROM が必要です (位置 1行 10列)`                                                         |
+| `SELECT *;`                                                                       | `FROM のない SELECT では * を使えません（列を明示してください）`                                    |
+| `SELECT * FROM t WHERE id > 1 AND;`                                               | `式が必要ですが見つかりませんでした (位置 1行 34列)`                                                |
+| `SELECT 'abc;`                                                                    | `unclosed string (位置 1行 8列)`                                                                    |
+| `SELECT id FROM nosuchtable;`                                                     | `テーブル 'nosuchtable' が存在しません`                                                             |
+| `SELECT nosuchcol FROM t;`                                                        | `'nosuchcol' は列でも関数でもありません`                                                            |
+| `CREATE TABLE t (a INTEGER);`                                                     | `テーブル t に主キーがありません`                                                                   |
+| `CREATE TABLE t (...);`（重複）                                                   | `テーブル t は既に存在します`                                                                       |
+| `CREATE INDEX ix ON t (nosuchcol);`                                               | `テーブル t に列 nosuchcol がありません`                                                            |
+| `ALTER TABLE t ADD COLUMN n INTEGER NOT NULL;`                                    | `NOT NULL 列 n を追加するには DEFAULT が必要です`                                                   |
+| `ALTER TABLE t DROP COLUMN id;`（主キー）                                         | `主キー列 id は削除できません（主キーは LSM のキーに使われています）`                               |
+| `ALTER TABLE t DROP COLUMN a;`（索引列）                                          | `列 a は索引 ix_a で使われているため削除できません`                                                 |
+| `ALTER TABLE t RENAME TO u;`                                                      | `ALTER TABLE ... RENAME TO（テーブル名の変更）は未対応です (位置 1行 22列)`                         |
+| `SELECT id FROM t JOIN t ON t.id = t.id;`                                         | `テーブル t が重複しています（エイリアスを付けてください）`                                         |
+| `DROP TABLE nosuch;`                                                              | `テーブル nosuch が存在しません`                                                                    |
+| `INSERT INTO t (id) VALUES (1, 2);`                                               | `INSERT の列数(1)と値の数(2)が合いません`                                                           |
+| `INSERT INTO t VALUES (1, NULL, …);`                                              | `NOT NULL 制約に違反: t.n`                                                                          |
+| `INSERT INTO t VALUES (5, 'z', 'abc');`                                           | `''abc'' は 'INTEGER' に変換できません`                                                             |
+| `SELECT (id) / 0 FROM t;`                                                         | `0 での除算は定義されていません`                                                                    |
+| `SELECT LENGTH(id, n) FROM t;`                                                    | `LENGTH 関数は 1個の引数が必要ですが、2個渡されました`                                              |
+| `SELECT NOSUCHFN(id) FROM t;`                                                     | `未知のスカラー関数 'NOSUCHFN' です`                                                                |
+| `SELECT active = 1 FROM u;`                                                       | `型 'BOOLEAN' と 'INTEGER' は比較できません`                                                        |
+| `SELECT ROUND(name) FROM t;`                                                      | `ROUND は数値を受け付けますが 'abc' です`                                                           |
+| `SELECT id, (SELECT id, v FROM t) FROM t;`                                        | `サブクエリは 1 列だけを返す必要があります（2 列）`                                                 |
+| `SELECT id, (SELECT v FROM t) FROM t;`                                            | `スカラーサブクエリが 2 行以上を返しました`                                                         |
+| `SELECT id FROM t AS o LIMIT (SELECT o.id FROM t AS x);`                          | `LIMIT に相関サブクエリは使えません`                                                                |
+| `SELECT (SELECT MAX(x.v) FROM t AS x WHERE x.v = o.v) FROM t AS o GROUP BY o.id;` | `GROUP BY / 集約関数を使うクエリの SELECT / HAVING / ORDER BY では相関サブクエリを使えません`       |
+| `SELECT id FROM (SELECT id FROM t);`                                              | `サブクエリ（派生テーブル）には別名が必要です（例: AS x） (位置 1行 34列)`                          |
+| `SAVEPOINT s;`                                                                    | `文の開始として解釈できません (位置 1行 1列)`                                                       |
+| `UPDATE t SET v = 1 FROM u;`                                                      | `文の区切りには ; が必要です（複数文は ; で区切ってください） (位置 1行 20列)`                      |
+| `SELECT * FROM t LEFT WHERE 1 = 1;`                                               | `LEFT / INNER の後ろには JOIN が必要です (位置 1行 22列)`                                           |
+| `SELECT 1 UNION SELECT 2;`                                                        | `UNION（重複を除く集合演算）は未対応です（UNION ALL を使ってください） (位置 1行 10列)`             |
+| `SELECT 1 INTERSECT SELECT 2;`                                                    | `INTERSECT は未対応です（集合演算は UNION ALL のみ対応） (位置 1行 10列)`                           |
+| `SELECT a FROM t UNION ALL SELECT a, b FROM u;`                                   | `UNION ALL の列数が一致しません（1 番目: 1 列、2 番目: 2 列）`                                      |
+| `SELECT a FROM t ORDER BY a UNION ALL SELECT a FROM u;`                           | `UNION / INTERSECT / EXCEPT は ORDER BY / LIMIT より前に書いてください (位置 1行 28列)`             |
+| `UPDATE t AS x SET a = 1;`                                                        | `INSERT / UPDATE / DELETE の対象テーブルに別名は使えません（別名を外してください） (位置 1行 15列)` |
+| `SELECT * FROM t WHERE a = b = c;`                                                | `比較・述語は 1つの式に 1回だけ書けます（括弧で囲んでください） (位置 1行 29列)`                    |
+| `SELECT NULL.* FROM t;`                                                           | `'.' の後ろには列名か '*' が必要です（修飾子は識別子にだけ付けられます） (位置 1行 12列)`           |
 
 未対応の後置句（`DELETE ... LIMIT`、`ON CONFLICT`、ウィンドウ関数の `OVER (...)` など）は
 専用のメッセージにならず、`;` 区切りのエラーとして報告される（§14）。

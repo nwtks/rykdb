@@ -155,7 +155,7 @@ module internal Lexer =
         if depth <= 0 then
             ret s
         elif s.Index >= n then
-            err (DbError.syntax "unclosed comment" s.Line)
+            err (DbError.syntax "unclosed comment" s.Position)
         elif s.Index + 1 < n && input.[s.Index] = '/' && input.[s.Index + 1] = '*' then
             skipBlockComment input n (depth + 1) (advance input (advance input s))
         elif s.Index + 1 < n && input.[s.Index] = '*' && input.[s.Index + 1] = '/' then
@@ -249,11 +249,11 @@ module internal Lexer =
         (n: int)
         (delim: char)
         (unclosedMsg: string)
-        (line: int)
+        (position: Position)
         (start: LexState)
         =
         match scanDelimited input n delim start with
-        | None -> err (DbError.syntax unclosedMsg line)
+        | None -> err (DbError.syntax unclosedMsg position)
         | Some(closeState, sawDouble) ->
             let raw = input.Substring(start.Index + 1, closeState.Index - start.Index - 1)
 
@@ -277,12 +277,12 @@ module internal Lexer =
             let closeIdx = findQuoteEnd input n contentStart
 
             if closeIdx < 0 then
-                err (DbError.syntax "unclosed binary literal" startPos.Line)
+                err (DbError.syntax "unclosed binary literal" startPos)
             else
                 let digitCount = closeIdx - contentStart
 
                 if digitCount % 2 <> 0 then
-                    err (DbError.syntax "binary literal has odd length" startPos.Line)
+                    err (DbError.syntax "binary literal has odd length" startPos)
                 else
                     let values =
                         Array.init (digitCount / 2) (fun k ->
@@ -292,7 +292,7 @@ module internal Lexer =
                     if Array.exists (fun v -> v < 0) values then
                         let hex = input.Substring(contentStart, digitCount)
                         let msg = sprintf "binary literal contains non-hex character: %s" hex
-                        err (DbError.syntax msg startPos.Line)
+                        err (DbError.syntax msg startPos)
                     else
                         ret (Token.BlobLit(Array.map byte values), advanceBy (digitCount + 3) s)
         elif isIdentStart c then
@@ -350,7 +350,7 @@ module internal Lexer =
                     )
                 with
                 | true, v -> ret (Token.RealLit v, afterExponent)
-                | _ -> err (DbError.syntax (sprintf "failed to parse real: %s" text) startPos.Line)
+                | _ -> err (DbError.syntax (sprintf "failed to parse real: %s" text) startPos)
             else
                 match
                     System.Int64.TryParse(
@@ -360,12 +360,12 @@ module internal Lexer =
                     )
                 with
                 | true, v -> ret (Token.IntLit v, afterExponent)
-                | _ -> err (DbError.syntax (sprintf "failed to parse integer: %s" text) startPos.Line)
+                | _ -> err (DbError.syntax (sprintf "failed to parse integer: %s" text) startPos)
         elif c = '\'' then
-            collectDelimited input n '\'' "unclosed string" startPos.Line s
+            collectDelimited input n '\'' "unclosed string" startPos s
             |> Result.map (fun (v, s') -> Token.StringLit v, s')
         elif c = '"' then
-            collectDelimited input n '"' "unclosed quoted identifier" startPos.Line s
+            collectDelimited input n '"' "unclosed quoted identifier" startPos s
             |> Result.map (fun (v, s') -> Token.QuotedIdent v, s')
         else
             let next = if s.Index + 1 < n then input.[s.Index + 1] else '\000'
@@ -390,7 +390,7 @@ module internal Lexer =
             | '.' -> ret (Token.Symbol ".", advanceBy 1 s)
             | '(' -> ret (Token.Symbol "(", advanceBy 1 s)
             | ')' -> ret (Token.Symbol ")", advanceBy 1 s)
-            | _ -> err (DbError.syntax (sprintf "unexpected character '%c'" c) startPos.Line)
+            | _ -> err (DbError.syntax (sprintf "unexpected character '%c'" c) startPos)
 
     [<TailCall>]
     let rec private collectTokens (input: string) (n: int) (acc: TokenItem list) (nextParam: int) (s: LexState) =

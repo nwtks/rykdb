@@ -499,13 +499,13 @@ module internal Parser =
             | Token.Param _ -> 1
             | _ -> 0)
 
-    /// 最初の `Token.Param` の行。個数不一致のエラー位置に使う。
-    let private firstParameterLine =
+    /// 最初の `Token.Param` の位置。個数不一致のエラー位置に使う。
+    let private firstParameterPosition =
         Array.tryPick (fun t ->
             match t.Token with
-            | Token.Param _ -> Some t.Pos.Line
+            | Token.Param _ -> Some t.Pos
             | _ -> None)
-        >> Option.defaultValue 1
+        >> Option.defaultValue { Offset = 0; Line = 1; Column = 1 }
 
     /// トークン列を 1文以上へ分解し、`?` を `parameters` の順に値へ置き換える。
     let private parseTokens (parameters: SqlValue array) (tokens: TokenItem array) =
@@ -515,7 +515,7 @@ module internal Parser =
             let message = sprintf "パラメータの個数が一致しません（SQL: %d個、指定: %d個）" expected parameters.Length
 
             { DbError.typeError message with
-                Position = Some(firstParameterLine tokens)
+                Position = Some(firstParameterPosition tokens)
             }
             |> err
         else

@@ -1,10 +1,5 @@
 namespace RykDb.Core
 
-/// SQL テキスト中の位置。
-/// エラー報告に使う。
-[<Struct>]
-type internal Position = { Offset: int; Line: int; Column: int }
-
 /// リテラル。
 [<RequireQualifiedAccess>]
 type internal Literal =

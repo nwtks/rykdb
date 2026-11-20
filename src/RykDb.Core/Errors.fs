@@ -1,5 +1,11 @@
 namespace RykDb.Core
 
+/// SQL テキスト中の位置。
+/// `Offset` は 0 始まり、`Line` / `Column` は 1 始まり。
+/// エラー報告に使う。
+[<Struct>]
+type Position = { Offset: int; Line: int; Column: int }
+
 /// 失敗の分類。
 /// エラー報告と回復可能性の判断に使う。
 [<RequireQualifiedAccess>]
@@ -32,7 +38,7 @@ type DbError =
     {
         Kind: ErrorKind
         Message: string
-        Position: int option
+        Position: Position option
         Detail: string option
     }
 
@@ -47,12 +53,12 @@ module DbError =
         }
 
     /// 構文エラー。
-    /// 行番号を伴う。
-    let syntax message line =
+    /// 字句・構文解析器が持つ位置（行・列）を伴う。
+    let syntax message (position: Position) =
         {
             Kind = ErrorKind.SyntaxError
             Message = message
-            Position = Some line
+            Position = Some position
             Detail = None
         }
 
@@ -84,7 +90,7 @@ module DbError =
     /// ユーザー向けの表示用メッセージ。
     let toDisplayString (e: DbError) =
         match e.Position, e.Detail with
-        | Some p, _ -> sprintf "%s (位置 %d行)" e.Message p
+        | Some p, _ -> sprintf "%s (位置 %d行 %d列)" e.Message p.Line p.Column
         | None, Some d -> sprintf "%s [%s]" e.Message d
         | None, None -> e.Message
 

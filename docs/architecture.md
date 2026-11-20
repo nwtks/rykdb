@@ -201,7 +201,7 @@ flowchart TB
 
 | ファイル                | 役割                                                                                                                  |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `Errors.fs`             | `DbError` / `ErrorKind` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）                                     |
+| `Errors.fs`             | `DbError` / `ErrorKind` / `Position` / `Result` 合成演算子（`>>=` / `result { }` / `protect`）                        |
 | `Types.fs`              | `SqlValue` / `DataType` / `TruthValue`（3値論理）/ `SqlLiteral` / `Bytes`（バイト列比較）                             |
 | `Writer.fs`             | 不変のチャンク書き込み `Writer`                                                                                       |
 | `Cursor.fs`             | 読み取り位置を値として保持する `Cursor`                                                                               |

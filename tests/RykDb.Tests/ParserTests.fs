@@ -302,7 +302,8 @@ let ``Parser: 構文エラーは位置つき DbError`` () =
     match parseStatement "SELECT * FROM" with
     | Error e ->
         Assert.Equal<ErrorKind>(ErrorKind.SyntaxError, e.Kind)
-        Assert.True e.Position.IsSome
+        let position = e.Position |> Option.map (fun p -> p.Line, p.Column)
+        Assert.Equal(Some(1, 14), position)
     | Ok _ -> Assert.Fail "エラーになるべき"
 
 [<Fact>]

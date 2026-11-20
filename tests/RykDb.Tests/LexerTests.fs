@@ -34,6 +34,14 @@ let ``Lexer: 位置情報は行と列を持つ`` () =
     Assert.Equal((2, 1), (ts.[2].Pos.Line, ts.[2].Pos.Column))
 
 [<Fact>]
+let ``Lexer: エラーの位置は行と列を持つ`` () =
+    match Lexer.tokenize "SELECT\n  'abc" with
+    | Error e ->
+        let expected: Position option = Some { Offset = 9; Line = 2; Column = 3 }
+        Assert.Equal(expected, e.Position)
+    | Ok _ -> Assert.Fail "エラーになるべき"
+
+[<Fact>]
 let ``Lexer: 行コメントとブロックコメントを読み飛ばす`` () =
     let ks = kinds "1 -- comment\n + /* block */ 2"
     Assert.Equal<Token list>([ Token.IntLit 1L; Token.Symbol "+"; Token.IntLit 2L; Token.Eos ], ks)

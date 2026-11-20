@@ -63,8 +63,7 @@ module internal ParserExpr =
 
     /// 現在位置を添えた構文エラーを返す。
     /// 送出はしない。
-    let internal fail (msg: string) (st: PState) =
-        err (DbError.syntax msg (peekPos st).Line)
+    let internal fail (msg: string) (st: PState) = err (DbError.syntax msg (peekPos st))
 
     /// 単純リテラルなら式を返す。
     /// `parsePrimaryC` と `Parser.parseInsert` の VALUES 高速経路が共有する

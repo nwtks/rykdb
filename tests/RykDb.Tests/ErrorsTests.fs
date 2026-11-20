@@ -11,6 +11,8 @@ open RykDb.Core
 // DbError
 // ---------------------------------------------------------------------------
 
+let private pos: Position = { Offset = 0; Line = 7; Column = 3 }
+
 [<Fact>]
 let ``DbError.create: Kind と Message を持つ`` () =
     let e = DbError.create ErrorKind.NotFound "missing"
@@ -21,9 +23,9 @@ let ``DbError.create: Kind と Message を持つ`` () =
 
 [<Fact>]
 let ``DbError.syntax: 位置を持つ`` () =
-    let e = DbError.syntax "bad" 7
+    let e = DbError.syntax "bad" pos
     Assert.Equal(ErrorKind.SyntaxError, e.Kind)
-    Assert.Equal(Some 7, e.Position)
+    Assert.Equal(Some pos, e.Position)
 
 [<Fact>]
 let ``DbError の各ファクトリが Kind を設定する`` () =
@@ -47,8 +49,8 @@ let ``DbError.io: 例外を包む`` () =
 
 [<Fact>]
 let ``DbError.toDisplayString: 位置あり`` () =
-    let e = DbError.syntax "bad" 7
-    Assert.Equal("bad (位置 7行)", DbError.toDisplayString e)
+    let e = DbError.syntax "bad" pos
+    Assert.Equal("bad (位置 7行 3列)", DbError.toDisplayString e)
 
 [<Fact>]
 let ``DbError.toDisplayString: Detail あり`` () =
