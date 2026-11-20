@@ -61,6 +61,7 @@ F# の型システムでは表現できないため、
 | INV-27 | 並列制御以外に DB・プロセス寿命の可変キャッシュを持たない                    | `Eval.Prepared`（計画時の `ImmutableDictionary`）+ `FileMetaData.ReadInfo`（不変の `Version` に付随）+ mutable/`ConcurrentDictionary` の許可リスト（Session 層・`VersionCoordinator`・`ProcessLock`・`Transactions`・`SstScan.Scope`） | ✅ 完了 |
 | INV-28 | 索引エントリの値は空。索引列 + 主キーはキーから復号し、非被覆列は PK lookup  | `RowKey.indexKey` / `opOfIndexScan` / `indexAccessMasks` / `ExecContext.fetchMissing` + キー復号 golden / 索引 fetch テスト                                                                                                            | ✅ 完了 |
 | INV-29 | 退避した一時ファイルは必ず閉じ、読み切ったら消す                             | `Spill.openSink` / `closeSink` / `foldRun`（閉じて消す）/ `foldRunKeep`（閉じるだけ）/ `reopen`（消す）/ `reopenKeep`（消さない）+ `SpillTests` / `OpsTests` / `OpsJoinTests` の「一時ファイルが残らない」検査                         | ✅ 完了 |
+| INV-30 | 外部キーは参照先の主キーへ解決し、DML/DDL は即時 RESTRICT で守る             | `ForeignKey.resolveCreatedTable` / `checkChildRow` / `checkParentDelete` / `Catalog.referencingForeignKeys` + `ForeignKeyTests` の検査                                                                                                 | ✅ 完了 |
 
 ---
 
@@ -587,6 +588,53 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `結合: ハッシュ結合は右が上限を超えるとマージ結合へ切り替わり結果が同じ`
   - `結合: マージ結合は同一キーのグループを退避しても結果が同じ`
   - `結合: マージ結合は左が先に尽きても右を読み切る（退避ファイルの後始末）`
+
+---
+
+### INV-30 外部キーの参照整合性
+
+- 宣言: `REFERENCES` / `FOREIGN KEY` は**親テーブルの主キーだけ**を参照し、
+  `CREATE TABLE` の時点で列名を解決して `TableDefinition.ForeignKeys` に保存する。
+  DML は **即時 RESTRICT** で検査する。
+  - 子の `INSERT` / `UPDATE`: 外部キーの値に対応する親行が無ければ `ConstraintViolation`
+    （外部キーの列に `NULL` を含む行は参照しない = MATCH SIMPLE）。
+  - 親の `DELETE`: 参照している子行があれば `ConstraintViolation`。
+  - 親の主キーは `UPDATE` できない（`Dml.updateRow`）ので、親側の更新検査は無い。
+- 理由: 参照先を `UNIQUE` 索引まで広げると索引の DROP と参照整合性の連動が要る。
+  主キーに限れば、子の存在確認は主キー lookup で完結し、参照先の一意性は既存の PK 制約が保証する。
+- 担保:
+  - 定義の解決・検証は `ForeignKey.resolveCreatedTable`（型の一致・主キーとの同数同順・列の実在）。
+  - 子の検査は `ForeignKey.checkChildRow`（`insertRow` / `insertSelect` / `update` が呼ぶ）。
+  - 親の検査は `ForeignKey.checkParentDelete`（`delete` が呼ぶ）。
+    子の探索は「外部キー列を先頭とする索引 → 子の主キー → 全走査」の順。
+  - `DROP TABLE` は参照している他テーブルがあれば拒否し、
+    `DROP COLUMN` は外部キーの列（子・親の両方）を拒否する。
+    `RENAME COLUMN` は外部キー定義の列名を追随させる。
+  - カタログの直列化は末尾に外部キーを追記する形式で、
+    外部キー導入前の定義（末尾に何も無い）は外部キーなしとして読む。
+- 回帰テスト（`ForeignKeyTests`）:
+  - `ForeignKey.resolveCreatedTable: 参照先の列を省略すると親の主キーになる`
+  - `ForeignKey.resolveCreatedTable: 参照先テーブルが無いと NameError`
+  - `ForeignKey.resolveCreatedTable: 主キー以外は参照できない`
+  - `ForeignKey.resolveCreatedTable: 列の型が違うと TypeError`
+  - `ForeignKey.resolveCreatedTable: 子の列が無いと NameError`
+  - `ForeignKey.resolveCreatedTable: 外部キーの列の重複は NameError`
+  - `ForeignKey.resolveCreatedTable: 列数が合わないと ConstraintViolation`
+  - `ForeignKey.resolveCreatedTable: 複合主キーを列の定義順で参照できる`
+  - `ForeignKey: カタログを再オープンしても定義が残る`
+  - `ForeignKey.checkChildRow: 親の行が無い INSERT は文全体を取り消す`
+  - `ForeignKey.checkChildRow: NULL を含む外部キーは親を要求しない`
+  - `ForeignKey.checkChildRow: INSERT ... SELECT でも検査する`
+  - `ForeignKey.checkChildRow: UPDATE で親の無い値にできない`
+  - `ForeignKey.checkParentDelete: 参照している子があると親を削除できない`
+  - `ForeignKey.checkParentDelete: 子を削除すれば親を削除できる`
+  - `ForeignKey.checkParentDelete: 自己参照の行は参照が残る間は削除できない`
+  - `ForeignKey.checkParentDelete: 子の索引があっても参照を検出する`
+  - `ForeignKey.checkParentDelete: 子の主キーが外部キーのときも参照を検出する`
+  - `ForeignKey: 参照されているテーブルは DROP できない`
+  - `ForeignKey: 外部キーの列は DROP COLUMN できない`
+  - `ForeignKey: 親の列名を RENAME すると子の定義が追随する`
+  - `ForeignKey: ALTER TABLE ADD COLUMN で REFERENCES は指定できない`
 
 ---
 

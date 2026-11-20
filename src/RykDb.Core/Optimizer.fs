@@ -137,10 +137,10 @@ module internal Optimizer =
                 Set.ofSeq [ 0 .. schema.Columns.Length - 1 ]
 
         let resolveRef schema r =
-            match Schema.resolve schema r with
+            match Schema.resolve r schema with
             | Ok i -> Some i
             | Error _ ->
-                match Schema.resolve schema { Qualifier = None; Name = r.Name } with
+                match Schema.resolve { Qualifier = None; Name = r.Name } schema with
                 | Ok i -> Some i
                 | Error _ -> None
 

@@ -70,7 +70,7 @@ module internal ExecContext =
             match aliasHit with
             | Some key -> ret ctx.Schemas.[key]
             | None ->
-                match Catalog.findTable ctx.Catalog name with
+                match Catalog.findTable name ctx.Catalog with
                 | Some t -> Catalog.toSchema t
                 | None -> err (sprintf "テーブル '%s' が存在しません" name |> DbError.name)
 
@@ -396,8 +396,10 @@ module internal DmlOps =
 
     /// 1行を制約検査して transaction へ積む。
     let private insertRow (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
-        checkUnique ctx schema txn row
-        >>= fun pkBytes -> Dml.insertWithKey pkBytes txn schema row
+        ForeignKey.checkChildRow ctx.Store ctx.Catalog ctx.Visible txn schema row
+        >>= fun () ->
+            checkUnique ctx schema txn row
+            >>= fun pkBytes -> Dml.insertWithKey pkBytes txn schema row
 
     /// INSERT。
     /// columns が None ならテーブル定義の順に並べる。
@@ -512,14 +514,17 @@ module internal DmlOps =
                     match assign targets row with
                     | DbErr e -> err e
                     | DbOk newRow ->
-                        let bytes = bytes + rowBytes row + rowBytes newRow + 24L
+                        match ForeignKey.checkChildRow ctx.Store ctx.Catalog ctx.Visible ctx.Txn schema newRow with
+                        | Error e -> err e
+                        | Ok() ->
+                            let bytes = bytes + rowBytes row + rowBytes newRow + 24L
 
-                        if bytes > ctx.Txn.LimitBytes then
-                            sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" ctx.Txn.LimitBytes
-                            |> DbError.capacity
-                            |> err
-                        else
-                            go targets ((row, newRow) :: acc) bytes next
+                            if bytes > ctx.Txn.LimitBytes then
+                                sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" ctx.Txn.LimitBytes
+                                |> DbError.capacity
+                                |> err
+                            else
+                                go targets ((row, newRow) :: acc) bytes next
 
         let collectUpdates txn targets =
             result {
@@ -649,10 +654,10 @@ module internal DmlOps =
                 let resolved =
                     refs
                     |> List.map (fun r ->
-                        match Schema.resolve targetSchema r with
+                        match Schema.resolve r targetSchema with
                         | Ok i -> Some i
                         | Error _ ->
-                            match Schema.resolve targetSchema { Qualifier = None; Name = r.Name } with
+                            match Schema.resolve { Qualifier = None; Name = r.Name } targetSchema with
                             | Ok i -> Some i
                             | Error _ -> None)
 
@@ -664,6 +669,16 @@ module internal DmlOps =
                             mask.[i] <- true
 
                     mask
+
+        // 外部キーの参照先（親）になっている列も、削除前の検査で読む。
+        for name in
+            ctx.Catalog.Tables
+            |> List.collect (fun t -> t.ForeignKeys)
+            |> List.filter (fun fk -> Catalog.eqName fk.ParentTable schema.Name)
+            |> List.collect (fun fk -> fk.ParentColumns) do
+            match TableSchema.indexOf schema name with
+            | Some i when i >= 0 && i < deleteMask.Length -> deleteMask.[i] <- true
+            | _ -> ()
 
         let foldRows ctx schema matched onRow =
             let rec go t c cur =
@@ -687,4 +702,5 @@ module internal DmlOps =
             }
 
         foldRows ctx schema (fun row -> matchesWhere resolve row where) (fun t count row ->
-            Dml.deleteRow t schema row |> Result.map (fun t2 -> t2, count + 1))
+            ForeignKey.checkParentDelete ctx.Store ctx.Catalog ctx.Visible ctx.Scope t schema row
+            >>= fun () -> Dml.deleteRow t schema row |> Result.map (fun t2 -> t2, count + 1))

@@ -242,12 +242,24 @@ and internal SelectItem =
         Alias: string option
     }
 
+/// `REFERENCES 親 [(列 [, …])]` の参照先。
+/// `ParentColumns` が None のときは親テーブルの主キー。
+/// 参照先は `CREATE TABLE` の時点で親の主キーへ解決する。
+and internal ForeignKeyRef =
+    {
+        ParentTable: string
+        ParentColumns: string list option
+    }
+
 and internal ColumnConstraint =
     {
         NotNull: bool
         PrimaryKey: bool
         Unique: bool
         Default: Expr option
+        /// 列レベルの `REFERENCES`（外部キー）。
+        /// テーブル作成時にテーブルレベルの外部キーへ揃える（カタログには列制約として保存しない）。
+        References: ForeignKeyRef option
     }
 
     static member Empty =
@@ -256,6 +268,7 @@ and internal ColumnConstraint =
             PrimaryKey = false
             Unique = false
             Default = None
+            References = None
         }
 
 and internal ColumnDefinition =
@@ -271,6 +284,8 @@ and internal ColumnDefinition =
 and [<RequireQualifiedAccess>] internal TableConstraint =
     | PrimaryKeyColumns of string list
     | UniqueColumns of string list
+    /// `FOREIGN KEY (列 [, …]) REFERENCES 親 [(列 [, …])]`
+    | ForeignKey of columns: string list * reference: ForeignKeyRef
 
 and internal CreateTable =
     {

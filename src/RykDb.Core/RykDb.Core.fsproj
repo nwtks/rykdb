@@ -44,6 +44,7 @@
     <Compile Include="OpsJoin.fs" />
     <Compile Include="Ops.fs" />
     <Compile Include="Dml.fs" />
+    <Compile Include="ForeignKey.fs" />
     <Compile Include="ExecContext.fs" />
     <Compile Include="Binder.fs" />
     <Compile Include="Analyzer.fs" />

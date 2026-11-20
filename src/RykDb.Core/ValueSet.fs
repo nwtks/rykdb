@@ -351,12 +351,12 @@ module internal ValueSet =
         let chunk = set |> Seq.map (fun v -> [| v |]) |> Seq.toArray |> Op.ofArray
 
         Spill.spool budget (Op.append chunk rest)
-        |> Result.bind (fun spool ->
+        >>= fun spool ->
             let total = set.Count + Spill.spoolCount spool
 
             Spill.reopen budget.Scope spool
-            |> Result.bind (fun rows -> ExtSort.sortRows budget None checkComparable compareValues rows)
-            |> Result.bind (writeIndexed budget total hasNull))
+            >>= ExtSort.sortRows budget None checkComparable compareValues
+            >>= writeIndexed budget total hasNull
 
     /// `src`（1列の行）から値集合を作る。
     /// 作業メモリを超えたら一時ファイルへ退避する。

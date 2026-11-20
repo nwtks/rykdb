@@ -168,9 +168,6 @@ module internal ExecState =
             Registration = None
         }
 
-/// Transaction を commit して確定状態に反映する共通処理。
-/// 接続ローカルの transaction の消去は呼び出し側で行う。
-module internal CommitOps =
     let commitTransaction (txn: Transaction) (state: ExecState) =
         result {
             let! store, manager =
@@ -189,10 +186,9 @@ module internal CommitOps =
                 }
         }
 
-module internal Ddl =
     /// カタログを保存し、保存後の Store と新しい Catalog で state を作り直す。
     /// （CREATE / DROP すべてが使う「保存 → state 更新」の定型）
-    let private saved (state: ExecState) (next: Catalog) =
+    let private saved (next: Catalog) (state: ExecState) =
         result {
             let! store = Catalog.save state.Committed.Store state.Committed.Catalog next
 
@@ -275,7 +271,7 @@ module internal Ddl =
 
     /// Op をチャンク単位で消費する（全件を実体化しない）。
     let private applyOpChunks (apply: Transaction -> SqlValue array -> Result<Transaction, DbError>) =
-        let rec loop op (st: ExecState) =
+        let rec loop op st =
             match takeOpChunk BackfillChunkRows op with
             | Ok([], _) -> ret st
             | Ok(chunk, rest) ->
@@ -292,7 +288,7 @@ module internal Ddl =
     /// `lastKey` から走査し直す。走査中に compaction がファイルを消しても、
     /// 古いスナップショットのファイルを開き続けない。
     /// </remarks>
-    let private clearSpaceChunksResult (state: ExecState) (space: string) =
+    let private clearSpaceChunksResult (space: string) (state: ExecState) =
         let rec loop (st: ExecState) startKey =
             match RowStore.scanKeys space startKey 0 st.Store with
             | Ok scan ->
@@ -316,98 +312,112 @@ module internal Ddl =
 
         loop state [||]
 
-    let createTable (c: CreateTable) (state: ExecState) =
-        let createTableCore (c: CreateTable) (state: ExecState) =
-            let existing = Catalog.findTable state.Catalog c.Name
+    let private createTableCore (c: CreateTable) (state: ExecState) =
+        let existing = Catalog.findTable c.Name state.Catalog
 
-            match existing, c.IfNotExists with
-            | Some _, true -> ret state
-            | Some _, false -> err (sprintf "テーブル %s は既に存在します" c.Name |> DbError.alreadyExists)
-            | None, _ ->
-                result {
-                    do! Keyspace.validateName "テーブル" c.Name
-                    let! schema = TableSchema.ofCreateTable c
+        match existing, c.IfNotExists with
+        | Some _, true -> ret state
+        | Some _, false -> err (sprintf "テーブル %s は既に存在します" c.Name |> DbError.alreadyExists)
+        | None, _ ->
+            result {
+                do! Keyspace.validateName "テーブル" c.Name
+                let! schema = TableSchema.ofCreateTable c
+                let! foreignKeys = ForeignKey.resolveCreatedTable state.Catalog schema c
 
-                    let implicitUniqueCols =
-                        (schema.Columns
-                         |> List.filter (fun col -> col.Constraint.Unique)
-                         |> List.map (fun col -> [ col.Name ]))
-                        @ (c.Constraints
-                           |> List.choose (fun tc ->
-                               match tc with
-                               | TableConstraint.UniqueColumns cols -> Some cols
-                               | _ -> None))
+                let implicitUniqueCols =
+                    (schema.Columns
+                     |> List.filter (fun col -> col.Constraint.Unique)
+                     |> List.map (fun col -> [ col.Name ]))
+                    @ (c.Constraints
+                       |> List.choose (fun tc ->
+                           match tc with
+                           | TableConstraint.UniqueColumns cols -> Some cols
+                           | _ -> None))
 
-                    let implicitIndexes =
-                        implicitUniqueCols
-                        |> List.mapi (fun i cols ->
-                            {
-                                IndexName = Catalog.implicitIndexName c.Name i
-                                TableName = c.Name
-                                Columns = cols
-                                Unique = true
-                            })
+                let implicitIndexes =
+                    implicitUniqueCols
+                    |> List.mapi (fun i cols ->
+                        {
+                            IndexName = Catalog.implicitIndexName c.Name i
+                            TableName = c.Name
+                            Columns = cols
+                            Unique = true
+                        })
 
-                    let catalog1 = Catalog.toDefinition schema |> Catalog.addTable state.Catalog
+                let catalog1 =
+                    Catalog.addTable (Catalog.toDefinitionWithForeignKeys schema foreignKeys) state.Catalog
 
-                    let catalog2 =
-                        implicitIndexes |> List.fold (fun cat idx -> Catalog.addIndex cat idx) catalog1
+                let catalog2 =
+                    implicitIndexes |> List.fold (fun cat idx -> Catalog.addIndex idx cat) catalog1
 
-                    let spaces =
-                        Keyspace.table c.Name
-                        :: (implicitIndexes |> List.map (fun idx -> Keyspace.index idx.IndexName))
+                let spaces =
+                    Keyspace.table c.Name
+                    :: (implicitIndexes |> List.map (fun idx -> Keyspace.index idx.IndexName))
 
-                    let! cleaned = spaces |> foldOk clearSpaceChunksResult state
-                    return! saved cleaned catalog2
-                }
+                let! cleaned = spaces |> foldOk (fun st sp -> clearSpaceChunksResult sp st) state
+                return! saved catalog2 cleaned
+            }
 
-        createTableCore c |> exclusiveDdl state
+    let createTable (c: CreateTable) (state: ExecState) = createTableCore c |> exclusiveDdl state
 
     /// DROP TABLE。
     /// 手順:
     ///   1. 先にカタログから定義を外してテーブルを見えなくする
     ///   2. テーブルと全索引 keyspace の全エントリをチャンク単位で tombstone 消去する
     /// 後始末が中断しても、次回の CREATE TABLE が同名 keyspace を空にしてから作る。
-    let dropTable (name: string) (ifExists: bool) (state: ExecState) =
-        let dropTableCore name ifExists (state: ExecState) =
-            match Catalog.findTable state.Catalog name with
-            | None ->
-                if ifExists then
-                    ret state
-                else
-                    err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
-            | Some defn ->
-                result {
-                    let! schema = Catalog.toSchema defn
+    let private dropTableCore (name: string) (ifExists: bool) (state: ExecState) =
+        match Catalog.findTable name state.Catalog with
+        | None ->
+            if ifExists then
+                ret state
+            else
+                err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
+        | Some defn ->
+            result {
+                let! () =
+                    match
+                        state.Catalog.Tables
+                        |> List.filter (fun t -> not (Catalog.eqName t.Name defn.Name))
+                        |> List.tryFind (fun t ->
+                            t.ForeignKeys |> List.exists (fun fk -> Catalog.eqName fk.ParentTable defn.Name))
+                    with
+                    | Some child ->
+                        sprintf "テーブル %s は %s の外部キーから参照されているため削除できません" defn.Name child.Name
+                        |> DbError.constraintViolation
+                        |> err
+                    | None -> ret ()
 
-                    let withIndexes =
-                        { schema with
-                            Indexes = Catalog.indexSchemasOf state.Catalog schema.Name
-                        }
+                let! schema = Catalog.toSchema defn
 
-                    let spaces =
-                        Keyspace.table schema.Name
-                        :: (withIndexes.Indexes |> List.map (fun index -> Keyspace.index index.Name))
+                let withIndexes =
+                    { schema with
+                        Indexes = Catalog.indexSchemasOf schema.Name state.Catalog
+                    }
 
-                    let! () = DropCleanup.add state.Store.Root spaces
+                let spaces =
+                    Keyspace.table schema.Name
+                    :: (withIndexes.Indexes |> List.map (fun index -> Keyspace.index index.Name))
 
-                    let! next =
-                        match Catalog.removeTable state.Catalog name |> saved state with
-                        | Ok next -> ret next
-                        | Error e ->
-                            DropCleanup.clear state.Store.Root |> ignore
-                            err e
+                let! () = DropCleanup.add state.Store.Root spaces
 
-                    match spaces |> foldOk clearSpaceChunksResult next with
-                    | Ok cleaned ->
+                let! next =
+                    match saved (Catalog.removeTable name state.Catalog) state with
+                    | Ok next -> ret next
+                    | Error e ->
                         DropCleanup.clear state.Store.Root |> ignore
-                        return cleaned
-                    | Error _ -> return next
-                }
+                        err e
 
+                match spaces |> foldOk (fun st sp -> clearSpaceChunksResult sp st) next with
+                | Ok cleaned ->
+                    DropCleanup.clear state.Store.Root |> ignore
+                    return cleaned
+                | Error _ -> return next
+            }
+
+    let dropTable (name: string) (ifExists: bool) (state: ExecState) =
         dropTableCore name ifExists |> exclusiveDdl state
 
-    let createIndex (ci: CreateIndex) (state: ExecState) =
+    let private createIndexCore (ci: CreateIndex) (state: ExecState) =
         let rec checkEntries (idx: IndexSchema) previous scan =
             match SstScan.next scan with
             | Ok None -> ret ()
@@ -432,12 +442,12 @@ module internal Ddl =
             >>= fun scan -> SstScan.withScan scan (fun scan -> checkEntries idx None scan)
 
         let clearSpaceChunks state space =
-            match clearSpaceChunksResult state space with
+            match clearSpaceChunksResult space state with
             | Ok next -> next
             | Error _ -> state
 
         let backfillIndex tableName idx (state: ExecState) =
-            match Catalog.findTable state.Catalog tableName with
+            match Catalog.findTable tableName state.Catalog with
             | None -> ret state
             | Some defn ->
                 result {
@@ -449,7 +459,7 @@ module internal Ddl =
                         }
 
                     let space = Keyspace.index idx.Name
-                    let! cleared = clearSpaceChunksResult state space
+                    let! cleared = clearSpaceChunksResult space state
                     let! rows = Dml.scanByPrimaryKey cleared.Store withIndex 0 None
 
                     let! filled =
@@ -470,64 +480,63 @@ module internal Ddl =
                         return filled
                 }
 
-        let createIndexCore (ci: CreateIndex) (state: ExecState) =
-            match Catalog.findTable state.Catalog ci.Table with
-            | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
-            | Some tableDef ->
-                result {
-                    do! Keyspace.validateName "索引" ci.Name
+        match Catalog.findTable ci.Table state.Catalog with
+        | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
+        | Some tableDef ->
+            result {
+                do! Keyspace.validateName "索引" ci.Name
 
-                    do!
-                        if Catalog.isReservedIndexName ci.Name then
-                            err (DbError.name (sprintf "索引名 %s は予約されています" ci.Name))
-                        else
-                            ret ()
+                do!
+                    if Catalog.isReservedIndexName ci.Name then
+                        err (DbError.name (sprintf "索引名 %s は予約されています" ci.Name))
+                    else
+                        ret ()
 
-                    let! () =
-                        match Catalog.findIndex state.Catalog ci.Name with
-                        | Some _ -> err (sprintf "索引 %s は既に存在します" ci.Name |> DbError.alreadyExists)
-                        | None -> ret ()
+                let! () =
+                    match Catalog.findIndex ci.Name state.Catalog with
+                    | Some _ -> err (sprintf "索引 %s は既に存在します" ci.Name |> DbError.alreadyExists)
+                    | None -> ret ()
 
-                    do!
-                        if List.isEmpty ci.Columns then
-                            err (DbError.constraintViolation (sprintf "索引 %s の列が空です" ci.Name))
-                        else
-                            ret ()
+                do!
+                    if List.isEmpty ci.Columns then
+                        err (DbError.constraintViolation (sprintf "索引 %s の列が空です" ci.Name))
+                    else
+                        ret ()
 
-                    let! () =
-                        match SqlName.duplicate ci.Columns with
-                        | Some name -> err (DbError.name (sprintf "索引 %s の列 %s が重複しています" ci.Name name))
-                        | None -> ret ()
+                let! () =
+                    match SqlName.duplicate ci.Columns with
+                    | Some name -> err (DbError.name (sprintf "索引 %s の列 %s が重複しています" ci.Name name))
+                    | None -> ret ()
 
-                    let missing =
-                        ci.Columns
-                        |> List.filter (fun n ->
-                            tableDef.Columns |> List.exists (fun c -> Catalog.eqName n c.Name) |> not)
+                let missing =
+                    ci.Columns
+                    |> List.filter (fun n -> tableDef.Columns |> List.exists (fun c -> Catalog.eqName n c.Name) |> not)
 
-                    do!
-                        if not (List.isEmpty missing) then
-                            err (
-                                sprintf "テーブル %s に列 %s がありません" ci.Table (System.String.Join(", ", missing))
-                                |> DbError.notFound
-                            )
-                        else
-                            ret ()
+                do!
+                    if not (List.isEmpty missing) then
+                        err (
+                            sprintf "テーブル %s に列 %s がありません" ci.Table (System.String.Join(", ", missing))
+                            |> DbError.notFound
+                        )
+                    else
+                        ret ()
 
-                    let defn =
-                        {
-                            IndexName = ci.Name
-                            TableName = ci.Table
-                            Columns = ci.Columns
-                            Unique = ci.Unique
-                        }
+                let defn =
+                    {
+                        IndexName = ci.Name
+                        TableName = ci.Table
+                        Columns = ci.Columns
+                        Unique = ci.Unique
+                    }
 
-                    let idxSchema = Catalog.toIndexSchema defn
-                    let next = Catalog.addIndex state.Catalog defn
-                    let! filled = backfillIndex ci.Table idxSchema state
-                    return! saved filled next
-                }
+                let idxSchema = Catalog.toIndexSchema defn
+                let next = Catalog.addIndex defn state.Catalog
+                let! filled = backfillIndex ci.Table idxSchema state
+                return! saved next filled
+            }
 
-        match Catalog.findIndex state.Catalog ci.Name with
+    let createIndex (ci: CreateIndex) (state: ExecState) =
+        match Catalog.findIndex ci.Name state.Catalog with
         | Some _ when ci.IfNotExists -> ret state
         | _ -> createIndexCore ci |> exclusiveDdl state
 
@@ -535,35 +544,35 @@ module internal Ddl =
     /// 先にカタログから定義を外して索引を見えなくし、
     /// その後で索引 keyspace をチャンク単位で tombstone 消去する。
     /// 後始末が中断しても、次回の CREATE INDEX が同名 keyspace を空にしてから作る。
-    let dropIndex (name: string) (ifExists: bool) (state: ExecState) =
-        let dropIndexCore name ifExists (state: ExecState) =
-            match Catalog.findIndex state.Catalog name with
-            | None ->
-                if ifExists then
-                    ret state
-                else
-                    err (sprintf "索引 %s が存在しません" name |> DbError.notFound)
-            | Some defn when Catalog.isReservedIndexName defn.IndexName ->
-                err (DbError.constraintViolation (sprintf "索引 %s は UNIQUE 制約用のため DROP できません" defn.IndexName))
-            | Some defn ->
-                result {
-                    let space = Keyspace.index defn.IndexName
-                    let! () = DropCleanup.add state.Store.Root [ space ]
+    let private dropIndexCore (name: string) (ifExists: bool) (state: ExecState) =
+        match Catalog.findIndex name state.Catalog with
+        | None ->
+            if ifExists then
+                ret state
+            else
+                err (sprintf "索引 %s が存在しません" name |> DbError.notFound)
+        | Some defn when Catalog.isReservedIndexName defn.IndexName ->
+            err (DbError.constraintViolation (sprintf "索引 %s は UNIQUE 制約用のため DROP できません" defn.IndexName))
+        | Some defn ->
+            result {
+                let space = Keyspace.index defn.IndexName
+                let! () = DropCleanup.add state.Store.Root [ space ]
 
-                    let! next =
-                        match Catalog.removeIndex state.Catalog name |> saved state with
-                        | Ok next -> ret next
-                        | Error e ->
-                            DropCleanup.clear state.Store.Root |> ignore
-                            err e
-
-                    match clearSpaceChunksResult next space with
-                    | Ok cleaned ->
+                let! next =
+                    match saved (Catalog.removeIndex name state.Catalog) state with
+                    | Ok next -> ret next
+                    | Error e ->
                         DropCleanup.clear state.Store.Root |> ignore
-                        return cleaned
-                    | Error _ -> return next
-                }
+                        err e
 
+                match clearSpaceChunksResult space next with
+                | Ok cleaned ->
+                    DropCleanup.clear state.Store.Root |> ignore
+                    return cleaned
+                | Error _ -> return next
+            }
+
+    let dropIndex (name: string) (ifExists: bool) (state: ExecState) =
         dropIndexCore name ifExists |> exclusiveDdl state
 
     /// 列を追加するときの既存行の値。
@@ -608,14 +617,6 @@ module internal Ddl =
         RowStore.scan space [||] 0 store
         >>= fun scan -> SstScan.withScan scan (fun scan -> loop txn scan)
 
-    /// テーブル本体の行を書き換える。
-    /// <remarks>
-    /// 索引エントリの値は空で、索引キーは「索引列 + 主キー」の値だけから作られる。
-    /// 列の追加・削除では索引キーが変わらないため、索引 keyspace の書き換えは不要。
-    /// </remarks>
-    let private rewriteTable (schema: TableSchema) =
-        rewriteSpace (Keyspace.table schema.Name)
-
     /// `ALTER TABLE`。
     /// <remarks>
     /// 行の書き換え（列の追加・削除）とカタログ更新を **1つの transaction** で commit する。
@@ -623,7 +624,10 @@ module internal Ddl =
     /// そのため 1 transaction のバッファ上限（256MiB）を超えるテーブルは `CapacityError` になる。
     /// 主キーは LSM のキーなので、主キー列の追加・削除は許可しない。
     /// </remarks>
-    let alterTable (a: AlterTable) (state: ExecState) =
+    let private alterTableCore (a: AlterTable) (state: ExecState) =
+        let rewriteTable (schema: TableSchema) =
+            rewriteSpace (Keyspace.table schema.Name)
+
         let commitRewrite catalog build =
             let mgr, txn = TransactionManager.beginTxn state.Manager
 
@@ -650,170 +654,236 @@ module internal Ddl =
                     }
             }
 
-        let alterTableCore a (state: ExecState) =
-            match Catalog.findTable state.Catalog a.Table with
-            | None -> err (sprintf "テーブル %s が存在しません" a.Table |> DbError.notFound)
-            | Some defn ->
-                result {
-                    let! schema = Catalog.toSchema defn
+        match Catalog.findTable a.Table state.Catalog with
+        | None -> err (sprintf "テーブル %s が存在しません" a.Table |> DbError.notFound)
+        | Some defn ->
+            result {
+                let! schema = Catalog.toSchema defn
 
-                    let withIndexes =
-                        { schema with
-                            Indexes = Catalog.indexSchemasOf state.Catalog defn.Name
+                let withIndexes =
+                    { schema with
+                        Indexes = Catalog.indexSchemasOf defn.Name state.Catalog
+                    }
+
+                match a.Action with
+                | AlterTableAction.AddColumn col ->
+                    do!
+                        if (TableSchema.indexOf schema col.Name).IsSome then
+                            err (DbError.name (sprintf "列 %s は既に存在します" col.Name))
+                        else
+                            ret ()
+
+                    do!
+                        if col.Constraint.PrimaryKey then
+                            err (DbError.constraintViolation "ALTER TABLE ... ADD COLUMN で PRIMARY KEY は指定できません")
+                        else
+                            ret ()
+
+                    do!
+                        if col.Constraint.References.IsSome then
+                            err (
+                                DbError.constraintViolation
+                                    "ALTER TABLE ... ADD COLUMN で REFERENCES は指定できません（テーブルを作り直してください）"
+                            )
+                        else
+                            ret ()
+
+                    do!
+                        if col.Constraint.Unique then
+                            err (
+                                DbError.constraintViolation
+                                    "ALTER TABLE ... ADD COLUMN で UNIQUE は指定できません（CREATE UNIQUE INDEX を使ってください）"
+                            )
+                        else
+                            ret ()
+
+                    do!
+                        if col.Constraint.NotNull && col.Constraint.Default.IsNone then
+                            err (DbError.constraintViolation (sprintf "NOT NULL 列 %s を追加するには DEFAULT が必要です" col.Name))
+                        else
+                            ret ()
+
+                    let! pad = addedColumnValue col
+                    let oldWidth = schema.Columns.Length
+                    let newWidth = oldWidth + 1
+
+                    let nextDefn =
+                        { defn with
+                            Columns = defn.Columns @ [ col ]
                         }
 
-                    match a.Action with
-                    | AlterTableAction.AddColumn col ->
-                        do!
-                            if (TableSchema.indexOf schema col.Name).IsSome then
-                                err (DbError.name (sprintf "列 %s は既に存在します" col.Name))
-                            else
-                                ret ()
+                    let transform (row: SqlValue array) =
+                        if row.Length = newWidth then
+                            ret None
+                        elif row.Length = oldWidth then
+                            ret (Some(Array.append row [| pad |]))
+                        else
+                            widthError schema row oldWidth
 
-                        do!
-                            if col.Constraint.PrimaryKey then
-                                err (DbError.constraintViolation "ALTER TABLE ... ADD COLUMN で PRIMARY KEY は指定できません")
-                            else
-                                ret ()
-
-                        do!
-                            if col.Constraint.Unique then
-                                err (
-                                    DbError.constraintViolation
-                                        "ALTER TABLE ... ADD COLUMN で UNIQUE は指定できません（CREATE UNIQUE INDEX を使ってください）"
-                                )
-                            else
-                                ret ()
-
-                        do!
-                            if col.Constraint.NotNull && col.Constraint.Default.IsNone then
-                                err (
-                                    DbError.constraintViolation (sprintf "NOT NULL 列 %s を追加するには DEFAULT が必要です" col.Name)
-                                )
-                            else
-                                ret ()
-
-                        let! pad = addedColumnValue col
-                        let oldWidth = schema.Columns.Length
-                        let newWidth = oldWidth + 1
-
-                        let nextDefn =
-                            { defn with
-                                Columns = defn.Columns @ [ col ]
+                    let build txn =
+                        let nextSchema =
+                            { withIndexes with
+                                Columns = nextDefn.Columns
                             }
 
-                        let transform (row: SqlValue array) =
-                            if row.Length = newWidth then
-                                ret None
-                            elif row.Length = oldWidth then
-                                ret (Some(Array.append row [| pad |]))
-                            else
-                                widthError schema row oldWidth
+                        rewriteTable nextSchema transform txn state.Store
+                        |> Result.map (Catalog.putTableInTxn nextDefn)
 
-                        let build txn =
-                            let nextSchema =
-                                { withIndexes with
-                                    Columns = nextDefn.Columns
-                                }
+                    return! commitRewrite (Catalog.addTable nextDefn state.Catalog) build
+                | AlterTableAction.DropColumn name ->
+                    let! pos = TableSchema.requireIndexOf schema name
 
-                            rewriteTable nextSchema transform txn state.Store
-                            |> Result.map (Catalog.putTableInTxn nextDefn)
+                    do!
+                        if schema.PrimaryKey |> List.contains pos then
+                            err (DbError.constraintViolation (sprintf "主キー列 %s は削除できません（主キーは LSM のキーに使われています）" name))
+                        else
+                            ret ()
 
-                        return! commitRewrite (Catalog.addTable state.Catalog nextDefn) build
-                    | AlterTableAction.DropColumn name ->
-                        let! pos = TableSchema.requireIndexOf schema name
+                    do!
+                        if
+                            defn.ForeignKeys
+                            |> List.exists (fun fk -> fk.Columns |> List.exists (fun c -> SqlName.equal c name))
+                        then
+                            err (DbError.constraintViolation (sprintf "列 %s は外部キーで使われているため削除できません" name))
+                        else
+                            ret ()
 
-                        do!
-                            if schema.PrimaryKey |> List.contains pos then
-                                err (
-                                    DbError.constraintViolation (sprintf "主キー列 %s は削除できません（主キーは LSM のキーに使われています）" name)
-                                )
-                            else
-                                ret ()
+                    do!
+                        if
+                            state.Catalog.Tables
+                            |> List.exists (fun t ->
+                                t.ForeignKeys
+                                |> List.exists (fun fk ->
+                                    Catalog.eqName fk.ParentTable defn.Name
+                                    && fk.ParentColumns |> List.exists (fun c -> SqlName.equal c name)))
+                        then
+                            err (DbError.constraintViolation (sprintf "列 %s は外部キーの参照先になっているため削除できません" name))
+                        else
+                            ret ()
 
-                        do!
-                            match
-                                withIndexes.Indexes
-                                |> List.tryFind (fun idx -> idx.Columns |> List.exists (fun c -> SqlName.equal c name))
-                            with
-                            | Some idx when Catalog.isReservedIndexName idx.Name ->
-                                err (DbError.constraintViolation (sprintf "列 %s は UNIQUE 制約で使われているため削除できません" name))
-                            | Some idx ->
-                                err (DbError.constraintViolation (sprintf "列 %s は索引 %s で使われているため削除できません" name idx.Name))
-                            | None -> ret ()
+                    do!
+                        match
+                            withIndexes.Indexes
+                            |> List.tryFind (fun idx -> idx.Columns |> List.exists (fun c -> SqlName.equal c name))
+                        with
+                        | Some idx when Catalog.isReservedIndexName idx.Name ->
+                            err (DbError.constraintViolation (sprintf "列 %s は UNIQUE 制約で使われているため削除できません" name))
+                        | Some idx ->
+                            err (DbError.constraintViolation (sprintf "列 %s は索引 %s で使われているため削除できません" name idx.Name))
+                        | None -> ret ()
 
-                        let oldWidth = schema.Columns.Length
-                        let newWidth = oldWidth - 1
+                    let oldWidth = schema.Columns.Length
+                    let newWidth = oldWidth - 1
 
-                        let newColumns =
+                    let newColumns =
+                        schema.Columns
+                        |> List.mapi (fun i c -> i, c)
+                        |> List.choose (fun (i, c) -> if i = pos then None else Some c)
+
+                    let nextDefn = { defn with Columns = newColumns }
+
+                    let transform (row: SqlValue array) =
+                        if row.Length = newWidth then
+                            ret None
+                        elif row.Length = oldWidth then
+                            ret (Some(Array.init newWidth (fun i -> row.[if i < pos then i else i + 1])))
+                        else
+                            widthError schema row oldWidth
+
+                    let build txn =
+                        let nextSchema =
+                            { withIndexes with
+                                Columns = newColumns
+                            }
+
+                        rewriteTable nextSchema transform txn state.Store
+                        |> Result.map (Catalog.putTableInTxn nextDefn)
+
+                    return! commitRewrite (Catalog.addTable nextDefn state.Catalog) build
+                | AlterTableAction.RenameColumn(oldName, newName) ->
+                    let! pos = TableSchema.requireIndexOf schema oldName
+
+                    do!
+                        if
                             schema.Columns
-                            |> List.mapi (fun i c -> i, c)
-                            |> List.choose (fun (i, c) -> if i = pos then None else Some c)
+                            |> List.indexed
+                            |> List.exists (fun (i, c) -> i <> pos && SqlName.equal c.Name newName)
+                        then
+                            err (DbError.name (sprintf "列 %s は既に存在します" newName))
+                        else
+                            ret ()
 
-                        let nextDefn = { defn with Columns = newColumns }
+                    let rename column =
+                        if SqlName.equal column oldName then newName else column
 
-                        let transform (row: SqlValue array) =
-                            if row.Length = newWidth then
-                                ret None
-                            elif row.Length = oldWidth then
-                                ret (Some(Array.init newWidth (fun i -> row.[if i < pos then i else i + 1])))
+                    let renameLocal (fk: ForeignKeyDefinition) =
+                        { fk with
+                            Columns = fk.Columns |> List.map rename
+                            ParentColumns =
+                                if Catalog.eqName fk.ParentTable defn.Name then
+                                    fk.ParentColumns |> List.map rename
+                                else
+                                    fk.ParentColumns
+                        }
+
+                    let referencing =
+                        state.Catalog.Tables
+                        |> List.filter (fun t -> not (Catalog.eqName t.Name defn.Name))
+                        |> List.choose (fun t ->
+                            let renamed =
+                                t.ForeignKeys
+                                |> List.map (fun fk ->
+                                    if Catalog.eqName fk.ParentTable defn.Name then
+                                        { fk with
+                                            ParentColumns = fk.ParentColumns |> List.map rename
+                                        }
+                                    else
+                                        fk)
+
+                            if renamed = t.ForeignKeys then
+                                None
                             else
-                                widthError schema row oldWidth
+                                Some { t with ForeignKeys = renamed })
 
-                        let build txn =
-                            let nextSchema =
-                                { withIndexes with
-                                    Columns = newColumns
-                                }
-
-                            rewriteTable nextSchema transform txn state.Store
-                            |> Result.map (Catalog.putTableInTxn nextDefn)
-
-                        return! commitRewrite (Catalog.addTable state.Catalog nextDefn) build
-                    | AlterTableAction.RenameColumn(oldName, newName) ->
-                        let! pos = TableSchema.requireIndexOf schema oldName
-
-                        do!
-                            if
+                    let nextDefn =
+                        { defn with
+                            Columns =
                                 schema.Columns
-                                |> List.indexed
-                                |> List.exists (fun (i, c) -> i <> pos && SqlName.equal c.Name newName)
-                            then
-                                err (DbError.name (sprintf "列 %s は既に存在します" newName))
-                            else
-                                ret ()
+                                |> List.mapi (fun i c -> if i = pos then { c with Name = newName } else c)
+                            PrimaryKeyColumns = defn.PrimaryKeyColumns |> List.map rename
+                            ForeignKeys = defn.ForeignKeys |> List.map renameLocal
+                        }
 
-                        let rename column =
-                            if SqlName.equal column oldName then newName else column
+                    let nextIndexes =
+                        Catalog.indexesOf defn.Name state.Catalog
+                        |> List.map (fun idx ->
+                            { idx with
+                                Columns = idx.Columns |> List.map rename
+                            })
 
-                        let nextDefn =
-                            { defn with
-                                Columns =
-                                    schema.Columns
-                                    |> List.mapi (fun i c -> if i = pos then { c with Name = newName } else c)
-                                PrimaryKeyColumns = defn.PrimaryKeyColumns |> List.map rename
-                            }
+                    let nextCatalog =
+                        referencing
+                        |> List.fold
+                            (fun cat t -> Catalog.addTable t cat)
+                            (nextIndexes
+                             |> List.fold
+                                 (fun cat i -> Catalog.addIndex i cat)
+                                 (Catalog.addTable nextDefn state.Catalog))
 
-                        let nextIndexes =
-                            Catalog.indexesOf state.Catalog defn.Name
-                            |> List.map (fun idx ->
-                                { idx with
-                                    Columns = idx.Columns |> List.map rename
-                                })
+                    let build txn =
+                        referencing
+                        |> List.fold
+                            (fun t childDefn -> Catalog.putTableInTxn childDefn t)
+                            (nextIndexes
+                             |> List.fold
+                                 (fun t idx -> Catalog.putIndexInTxn idx t)
+                                 (Catalog.putTableInTxn nextDefn txn))
+                        |> ret
 
-                        let nextCatalog =
-                            nextIndexes
-                            |> List.fold Catalog.addIndex (Catalog.addTable state.Catalog nextDefn)
+                    return! commitRewrite nextCatalog build
+            }
 
-                        let build txn =
-                            nextIndexes
-                            |> List.fold (fun t idx -> Catalog.putIndexInTxn idx t) (Catalog.putTableInTxn nextDefn txn)
-                            |> ret
-
-                        return! commitRewrite nextCatalog build
-                }
-
-        alterTableCore a |> exclusiveDdl state
+    let alterTable (a: AlterTable) (state: ExecState) = alterTableCore a |> exclusiveDdl state
 
 module internal Engine =
     let private addTable (state: ExecState) (ctx: ExecContext) (t: TableDefinition) =
@@ -821,7 +891,7 @@ module internal Engine =
         >>= fun schema ->
             let withIndexes =
                 { schema with
-                    Indexes = Catalog.indexSchemasOf state.Catalog t.Name
+                    Indexes = Catalog.indexSchemasOf t.Name state.Catalog
                 }
 
             ret (ExecContext.withSchema t.Name withIndexes ctx)
@@ -1026,11 +1096,11 @@ module internal Engine =
         | Statement.Insert stmt -> runInsert stmt |> runDml limits state txn
         | Statement.Update stmt -> runUpdate stmt |> runDml limits state txn
         | Statement.Delete stmt -> runDelete stmt |> runDml limits state txn
-        | Statement.CreateTable c -> Ddl.createTable c |> runDdl state
-        | Statement.DropTable(n, ifE) -> Ddl.dropTable n ifE |> runDdl state
-        | Statement.CreateIndex ci -> Ddl.createIndex ci |> runDdl state
-        | Statement.DropIndex(n, ifE) -> Ddl.dropIndex n ifE |> runDdl state
-        | Statement.AlterTable a -> Ddl.alterTable a |> runDdl state
+        | Statement.CreateTable c -> ExecState.createTable c |> runDdl state
+        | Statement.DropTable(n, ifE) -> ExecState.dropTable n ifE |> runDdl state
+        | Statement.CreateIndex ci -> ExecState.createIndex ci |> runDdl state
+        | Statement.DropIndex(n, ifE) -> ExecState.dropIndex n ifE |> runDdl state
+        | Statement.AlterTable a -> ExecState.alterTable a |> runDdl state
         | Statement.Begin
         | Statement.Commit
         | Statement.Rollback -> ret state |> noRows
@@ -1064,7 +1134,7 @@ module internal Engine =
                         return state, result
                     else
                         let toCommit = midState.Pending |> Option.defaultValue txn
-                        let! committed = CommitOps.commitTransaction toCommit midState
+                        let! committed = ExecState.commitTransaction toCommit midState
                         return ExecState.ofCommitted committed, result
                 }
 
@@ -1089,7 +1159,7 @@ module internal Engine =
         | Some activeTxn ->
             let txn = state.Pending |> Option.defaultValue activeTxn
 
-            CommitOps.commitTransaction txn state
+            ExecState.commitTransaction txn state
             |> Result.map (fun committed ->
                 state.ActiveRegistration |> Option.iter state.Store.Runtime.Unregister
                 ExecState.ofCommitted committed)

@@ -259,7 +259,7 @@ let ``PlanBuilder.buildLogicalWith: 主キー順の ORDER BY は Sort を作ら�
     withStore "sort-pk" (fun store ->
         let ctx =
             ctxOf store
-            |> ExecContext.withCatalog (Catalog.addTable Catalog.Empty (Catalog.toDefinition peopleSchema))
+            |> ExecContext.withCatalog (Catalog.addTable (Catalog.toDefinition peopleSchema) Catalog.Empty)
 
         let baseStmt =
             selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
@@ -284,7 +284,7 @@ let ``PlanBuilder.buildLogicalWith: 主キー以外・降順の ORDER BY は Sor
     withStore "sort-keep" (fun store ->
         let ctx =
             ctxOf store
-            |> ExecContext.withCatalog (Catalog.addTable Catalog.Empty (Catalog.toDefinition peopleSchema))
+            |> ExecContext.withCatalog (Catalog.addTable (Catalog.toDefinition peopleSchema) Catalog.Empty)
 
         let baseStmt =
             selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None
@@ -310,7 +310,7 @@ let ``PlanBuilder.buildLogicalWith: 複合主キーは全列の昇順なら Sort
 
         let ctx =
             ctxOf store
-            |> ExecContext.withCatalog (Catalog.addTable Catalog.Empty (Catalog.toDefinition composite))
+            |> ExecContext.withCatalog (Catalog.addTable (Catalog.toDefinition composite) Catalog.Empty)
 
         let baseStmt =
             selectOf [ { Expression = Expr.Star; Alias = None } ] (Some { Name = "people"; Alias = None }) [] None

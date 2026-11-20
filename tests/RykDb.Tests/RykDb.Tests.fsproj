@@ -41,6 +41,7 @@
     <Compile Include="OpsJoinTests.fs" />
     <Compile Include="OpsTests.fs" />
     <Compile Include="DmlTests.fs" />
+    <Compile Include="ForeignKeyTests.fs" />
     <Compile Include="ExecContextTests.fs" />
     <Compile Include="BinderTests.fs" />
     <Compile Include="AnalyzerTests.fs" />

@@ -11,14 +11,13 @@ open RykDb.TestHelpers
 [<Fact>]
 let ``Catalog.addTable / findTable / removeTable: 空のカタログにテーブルを追加・検索・削除`` () =
     let defn = Catalog.toDefinition peopleSchema
-    let c1 = Catalog.addTable Catalog.Empty defn
+    let c1 = Catalog.addTable defn Catalog.Empty
     Assert.Single c1.Tables |> ignore
-
-    Assert.True(Catalog.findTable c1 "people" |> Option.isSome)
+    Assert.True(Catalog.findTable "people" c1 |> Option.isSome)
     // SQL の識別子は大文字小文字を区別しない
-    Assert.True(Catalog.findTable c1 "PEOPLE" |> Option.isSome)
+    Assert.True(Catalog.findTable "PEOPLE" c1 |> Option.isSome)
 
-    let c2 = Catalog.removeTable c1 "people"
+    let c2 = Catalog.removeTable "people" c1
     Assert.Empty c2.Tables
 
 [<Fact>]
@@ -26,20 +25,16 @@ let ``Catalog.removeTable: 削除した定義は再読込時に消える`` () =
     withStore "cat2" (fun store ->
         let people = Catalog.toDefinition peopleSchema
         let orders = Catalog.toDefinition ordersSchema
-
-        let c1 =
-            Catalog.Empty
-            |> (fun c -> Catalog.addTable c people)
-            |> fun c -> Catalog.addTable c orders
-
+        let c1 = Catalog.Empty |> Catalog.addTable people |> Catalog.addTable orders
         let store = ok (Catalog.save store Catalog.Empty c1)
+
         // people を消して保存し直す（消えた定義は tombstone で落ちる）
-        let c2 = Catalog.removeTable c1 "people"
+        let c2 = Catalog.removeTable "people" c1
         let store = ok (Catalog.save store c1 c2)
         let loaded = ok (Catalog.load store)
         Assert.Single loaded.Tables |> ignore
         Assert.Equal<string>("orders", loaded.Tables.[0].Name)
-        Assert.True(Catalog.findTable loaded "people" |> Option.isNone))
+        Assert.True(Catalog.findTable "people" loaded |> Option.isNone))
 
 [<Fact>]
 let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
@@ -52,7 +47,7 @@ let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
                 Unique = true
             }
 
-        let c = ix |> Catalog.addIndex Catalog.Empty
+        let c = Catalog.addIndex ix Catalog.Empty
         let store = ok (Catalog.save store Catalog.Empty c)
         let loaded = ok (Catalog.load store)
         Assert.Empty loaded.Tables
@@ -80,12 +75,12 @@ let ``Catalog.removeIndex: removeIndex は指定した索引だけ消す`` () =
 
     let c =
         Catalog.Empty
-        |> (fun c -> Catalog.addIndex c ixA)
-        |> (fun c -> Catalog.addIndex c ixB)
-        |> fun c -> Catalog.removeIndex c "IX_A" // 大文字小文字は無視
+        |> Catalog.addIndex ixA
+        |> Catalog.addIndex ixB
+        |> Catalog.removeIndex "IX_A" // 大文字小文字は無視
 
-    Assert.True(Catalog.findIndex c "ix_a" |> Option.isNone)
-    Assert.True(Catalog.findIndex c "ix_b" |> Option.isSome)
+    Assert.True(Catalog.findIndex "ix_a" c |> Option.isNone)
+    Assert.True(Catalog.findIndex "ix_b" c |> Option.isSome)
 
 [<Fact>]
 let ``Catalog.toSchema: TableSchema を定義に変換して戻すと元に戻る`` () =
@@ -108,6 +103,7 @@ let ``Catalog.toSchema: 主キー列が存在しない場合はエラー`` () =
             Name = "broken"
             Columns = [ col "a" DataType.Integer ]
             PrimaryKeyColumns = [ "nope" ]
+            ForeignKeys = []
         }
 
     expectError "存在しない主キー列で復元できました" (Catalog.toSchema bad)
@@ -117,10 +113,7 @@ let ``Catalog.save / load: 保存したカタログを読み込める`` () =
     withStore "cat1" (fun store ->
         let people = Catalog.toDefinition peopleSchema
         let ix = indexDefinition "people" peopleSchema.Indexes.[0]
-
-        let c =
-            people |> Catalog.addTable Catalog.Empty |> fun c -> ix |> Catalog.addIndex c
-
+        let c = Catalog.addTable people Catalog.Empty |> fun c -> Catalog.addIndex ix c
         let store = ok (Catalog.save store Catalog.Empty c)
         let loaded = ok (Catalog.load store)
         Assert.Single loaded.Tables |> ignore
@@ -150,14 +143,15 @@ let ``Catalog.save / load: DEFAULT 式は保存・再読込しても復元され
                         defaultCol "s" DataType.Text (Expr.Literal(Literal.String "it's"))
                     ]
                 PrimaryKeyColumns = [ "id" ]
+                ForeignKeys = []
             }
 
         let store =
-            ok (Catalog.save store Catalog.Empty (Catalog.addTable Catalog.Empty defn))
+            ok (Catalog.save store Catalog.Empty (Catalog.addTable defn Catalog.Empty))
 
         let loaded = ok (Catalog.load store)
 
-        match Catalog.findTable loaded "t" with
+        match Catalog.findTable "t" loaded with
         | None -> Assert.Fail "テーブルが読み込まれていません"
         | Some t ->
             let defaults =
@@ -174,7 +168,7 @@ let ``Catalog.save: 消えた定義は差分から tombstone で落ちる`` () =
         let people = Catalog.toDefinition peopleSchema
 
         // テーブルを保存する
-        let c1 = Catalog.addTable Catalog.Empty people
+        let c1 = Catalog.addTable people Catalog.Empty
         let store = ok (Catalog.save store Catalog.Empty c1)
         let loaded = ok (Catalog.load store)
         Assert.Single loaded.Tables |> ignore
@@ -194,7 +188,7 @@ let ``Catalog.load: 未知のキーや不正な値は読み飛ばす`` () =
         let people = Catalog.toDefinition peopleSchema
 
         let store =
-            ok (Catalog.save store Catalog.Empty (Catalog.addTable Catalog.Empty people))
+            ok (Catalog.save store Catalog.Empty (Catalog.addTable people Catalog.Empty))
 
         let raw =
             ok (RowStore.scan Keyspace.CatalogKeyspace [||] 0 store)
@@ -227,8 +221,8 @@ let ``Catalog.load: 未知のキーや不正な値は読み飛ばす`` () =
         let store = ok (RowStore.writeBatches [ (Keyspace.CatalogKeyspace, entries) ] store)
         let loaded = ok (Catalog.load store)
         Assert.Equal<int>(2, loaded.Tables.Length)
-        Assert.True(Catalog.findTable loaded "people2" |> Option.isSome)
-        Assert.False(Catalog.findTable loaded "weird" |> Option.isSome))
+        Assert.True(Catalog.findTable "people2" loaded |> Option.isSome)
+        Assert.False(Catalog.findTable "weird" loaded |> Option.isSome))
 
 [<Fact>]
 let ``Catalog.load: 壊れた定義はエラー`` () =
@@ -283,7 +277,7 @@ let ``Schema.expandStar: * は全列`` () =
                 outCol "name" (Some "t") (Some DataType.Text)
             ]
 
-    match Schema.expandStar s Expr.Star with
+    match Schema.expandStar Expr.Star s with
     | Some(false, cols) -> Assert.Equal(2, cols.Length)
     | other -> failActual "expandStar * が想定外" other
 
@@ -296,7 +290,7 @@ let ``Schema.expandStar: t.* は修飾一致のみ`` () =
                 outCol "id" (Some "u") (Some DataType.Integer)
             ]
 
-    match Schema.expandStar s (Expr.QualifiedStar "t") with
+    match Schema.expandStar (Expr.QualifiedStar "t") s with
     | Some(true, cols) -> Assert.Equal(1, cols.Length)
     | other -> failActual "expandStar t.* が想定外" other
 
@@ -321,17 +315,17 @@ let ``Schema.ofTable: テーブルの全列を並べる`` () =
 
 [<Fact>]
 let ``Schema.resolve: 空スキーマのエラーは (なし) を出す`` () =
-    match Schema.resolve (outSchema []) { Qualifier = None; Name = "x" } with
+    match Schema.resolve { Qualifier = None; Name = "x" } (outSchema []) with
     | Error e -> Assert.Contains("(なし)", e.Message)
     | Ok _ -> Assert.Fail "NameError になるべき"
 
 [<Fact>]
 let ``Schema.resolve: 修飾子の無い列名が曖昧ならエラー`` () =
     let schema = outSchema [ outCol "id" (Some "a") None; outCol "id" (Some "b") None ]
-    expectError "曖昧な列名が解決できてしまいました" (Schema.resolve schema { Qualifier = None; Name = "id" })
+    expectError "曖昧な列名が解決できてしまいました" (Schema.resolve { Qualifier = None; Name = "id" } schema)
 
     // 修飾子付きなら解決できる
-    Assert.Equal(1, ok (Schema.resolve schema { Qualifier = Some "b"; Name = "id" }))
+    Assert.Equal(1, ok (Schema.resolve { Qualifier = Some "b"; Name = "id" } schema))
 
 [<Fact>]
 let ``Schema.projectColumns: * は入力列名`` () =

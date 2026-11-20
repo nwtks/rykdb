@@ -36,7 +36,7 @@ module internal PlanBuilder =
         let primaryKey =
             match stmt.From with
             | Some(TableSource.Named r) when List.isEmpty stmt.Joins && not stmt.Distinct ->
-                Catalog.findTable ctx.Catalog r.Name
+                Catalog.findTable r.Name ctx.Catalog
                 |> Option.bind (fun defn ->
                     match Catalog.toSchema defn with
                     | Ok table -> Some table.PrimaryKey
@@ -48,7 +48,7 @@ module internal PlanBuilder =
             |> List.map (fun k ->
                 match Schema.tryAsColumnRef k.Expression with
                 | Some c ->
-                    match Schema.resolve schema c with
+                    match Schema.resolve c schema with
                     | Ok i -> Some(i, k.Direction)
                     | Error _ -> None
                 | None -> None)
@@ -154,7 +154,7 @@ module internal PlanBuilder =
                 match item.Expression with
                 | Expr.Star when Array.isEmpty schema.Columns ->
                     Some(DbError.create ErrorKind.SyntaxError "FROM のない SELECT では * を使えません（列を明示してください）")
-                | Expr.QualifiedStar q when not (Schema.hasQualifier schema q) ->
+                | Expr.QualifiedStar q when not (Schema.hasQualifier q schema) ->
                     Some(sprintf "テーブルまたは別名 '%s' が FROM にありません" q |> DbError.name)
                 | _ -> None)
             |> function
@@ -474,7 +474,7 @@ module internal PlanBuilder =
             match item.Expression with
             | Expr.Star
             | Expr.QualifiedStar _ ->
-                match Schema.expandStar schema item.Expression with
+                match Schema.expandStar item.Expression schema with
                 | Some(_, cols) ->
                     cols
                     |> List.map (fun c ->

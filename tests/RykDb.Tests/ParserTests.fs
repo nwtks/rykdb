@@ -370,6 +370,47 @@ let ``Parser: テーブル制約の主キー`` () =
     | other -> failActual "テーブル制約が違う" other
 
 [<Fact>]
+let ``Parser: 列レベルの REFERENCES`` () =
+    let ct =
+        parseCreateTableOk "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id))"
+
+    match ct.Columns.[1].Constraint.References with
+    | Some r ->
+        Assert.Equal("p", r.ParentTable)
+        Assert.Equal<string list option>(Some [ "id" ], r.ParentColumns)
+    | None -> Assert.Fail "REFERENCES が読まれていません"
+
+[<Fact>]
+let ``Parser: テーブルレベルの FOREIGN KEY`` () =
+    let ct =
+        parseCreateTableOk
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, FOREIGN KEY (x, y) REFERENCES p)"
+
+    match ct.Constraints with
+    | [ TableConstraint.ForeignKey(cols, r) ] ->
+        Assert.Equal<string list>([ "x"; "y" ], cols)
+        Assert.Equal("p", r.ParentTable)
+        Assert.Equal<string list option>(None, r.ParentColumns)
+    | other -> failActual "テーブル制約が違う" other
+
+[<Fact>]
+let ``Parser: 参照アクション・MATCH・名前付き制約は未対応`` () =
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "ON DELETE を受理しました"
+        (parseStatement "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id) ON DELETE CASCADE)")
+
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "MATCH を受理しました"
+        (parseStatement "CREATE TABLE c (id INTEGER PRIMARY KEY, x INTEGER, FOREIGN KEY (x) REFERENCES p MATCH FULL)")
+
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "CONSTRAINT を受理しました"
+        (parseStatement "CREATE TABLE c (id INTEGER PRIMARY KEY, CONSTRAINT fk FOREIGN KEY (id) REFERENCES p (id))")
+
+[<Fact>]
 let ``Parser: DROP INDEX`` () =
     match parseOneOk "DROP INDEX IF EXISTS ix_g" with
     | Statement.DropIndex(n, ifEx) ->

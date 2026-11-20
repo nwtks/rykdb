@@ -160,7 +160,7 @@ flowchart TB
 | ---------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
 | インターフェース | `Session.fs` `RykDb.Cli` `RykDb.Server`                                                       | 全部                                                     |
 | 実行             | `Engine.fs` `Analyzer.fs` `PlanBuilder.fs` `Optimizer.fs` `Plan.fs` `ExecContext.fs` `Ops.fs` | `RowStore` `Catalog` `Transactions`                      |
-| 行ストア         | `RowStore.fs` `Dml.fs` `Catalog.fs` `VersionCoordinator.fs`                                   | `StorageEngine` `Compaction` `VersionSet` `Transactions` |
+| 行ストア         | `RowStore.fs` `Dml.fs` `ForeignKey.fs` `Catalog.fs` `VersionCoordinator.fs`                   | `StorageEngine` `Compaction` `VersionSet` `Transactions` |
 | MVCC             | `Transactions.fs`                                                                             | `Memtable`(`Entry`) `Errors` `Types`                     |
 | ストレージ       | `StorageEngine.fs` とその下                                                                   | `Errors` `Types` `Serialization`                         |
 | SQL層            | `Lexer` `Parser` `Ast`                                                                        | `Types` `Errors`                                         |
@@ -233,6 +233,7 @@ flowchart TB
 | `OpsJoin.fs`            | 結合の実装 `OpsJoin`（nested loop / ハッシュ / マージ / インデックス）                                                |
 | `Ops.fs`                | 演算子の組み立て `Ops`（フィルタ・ソート・集約・射影・DISTINCT。結合は `OpsJoin` に委譲）                             |
 | `Dml.fs`                | `RowKey` / `Dml`（`Transaction` のバッファへ行・索引を積む DML ヘルパ）                                               |
+| `ForeignKey.fs`         | 外部キーの解決 `resolveCreatedTable` と参照整合性検査（子の INSERT / UPDATE、親の DELETE）                            |
 | `ExecContext.fs`        | 実行時文脈 `ExecContext` と DML `DmlOps`（INSERT / UPDATE / DELETE）                                                  |
 | `Binder.fs`             | 名前束縛 `Binder` / 別名 `Alias` / 述語の分解 `Predicate`                                                             |
 | `Analyzer.fs`           | `ScanMethod` / `JoinAlgorithm` / `Logical` と `Analyzer`（走査方法・結合アルゴリズムの選択）                          |
@@ -252,7 +253,7 @@ Errors → Types → Writer → Cursor → Serialization → Memtable → Wal �
        → SstScan → SstableFormat → Sstable → VersionSet → Compaction
        → StorageEngine → Ast → Lexer → ParserExpr → Parser → Transactions
        → ProcessLock → VersionCoordinator → RowStore → TableSchema → Catalog → Scalar → Eval → Op
-       → Spill → ExtSort → OpsJoin → Ops → Dml → ExecContext → Binder → Analyzer
+       → Spill → ExtSort → OpsJoin → Ops → Dml → ForeignKey → ExecContext → Binder → Analyzer
        → PlanBuilder → Optimizer → ValueSet → Plan → DropCleanup → Engine
        → DatabaseHost → Session
 ```
@@ -908,6 +909,17 @@ DML は pull 演算子ではなく、`Transaction` を積み上げて件数を�
 - `update` — 全行をスキャンして WHERE を評価し、代入式は「現在の行」で評価して `Dml.updateRow` へ。
   **主キー列の書き換えは未対応**（`sql-reference.md` 参照）。
 - `delete` — 全行をスキャンし、WHERE に合う行の**主キー + 全索引に tombstone** を書く。
+
+外部キー（`ForeignKey.fs`）は DML の前後で**即時 RESTRICT** として検査する。
+
+- `insertRow` / `insertSelect` / `update` は書き込み前に `ForeignKey.checkChildRow` を呼び、
+  外部キーの値（NULL を含む行は除外）に対応する親行が同じ snapshot + transaction にあることを要求する。
+- `delete` は `ForeignKey.checkParentDelete` で、参照している子行があれば拒否する。
+  子の探索は外部キー列を先頭とする索引 → 子の主キー → 子テーブルの全走査の順に使う。
+- 親の主キーは `UPDATE` できないため、親側の更新検査は無い。
+- 参照先はカタログで解決する（親の主キーだけ）。
+  `CREATE TABLE` 時の検証は `ForeignKey.resolveCreatedTable` が行い、
+  定義は子テーブルの `TableDefinition.ForeignKeys` に保存する。
 
 いずれも書き込みは `Transaction` のバッファに溜まり、**commit 時にだけ** RowStore へ届く。
 

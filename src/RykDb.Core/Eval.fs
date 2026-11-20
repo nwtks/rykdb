@@ -34,7 +34,7 @@ type internal Prepared =
         if this.Resolved.ContainsKey key then
             this.Resolved.[key]
         else
-            Schema.resolve this.Source r
+            Schema.resolve r this.Source
 
     /// コンパイル済み LIKE パターンを返す。
     /// `escape` はコードポイント（`Scalar.NoEscape` = ESCAPE なし）。
@@ -603,7 +603,7 @@ module internal Eval =
             if acc.ContainsKey key then
                 acc
             else
-                acc.Add(key, Schema.resolve schema c)
+                acc.Add(key, Schema.resolve c schema)
 
         let columns =
             (emptyColumns, exprs)

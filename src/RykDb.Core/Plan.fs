@@ -23,14 +23,14 @@ module internal Plan =
 
     /// 内側で解決できず、外側スコープに一致する列参照の位置（0 = 直近）を返す。
     let private outerScopeIndex (inner: Schema) (scopes: OuterScope list) (r: ColumnRef) =
-        if Schema.resolve inner r |> Result.isOk || shadowedByInner inner r then
+        if Schema.resolve r inner |> Result.isOk || shadowedByInner inner r then
             None
         else
             let rec go i =
                 function
                 | [] -> None
                 | s :: rest ->
-                    match Schema.resolve s.Schema r with
+                    match Schema.resolve r s.Schema with
                     | Ok _ -> Some i
                     | Error _ -> go (i + 1) rest
 
@@ -96,14 +96,14 @@ module internal Plan =
     /// 解決できない参照はそのまま残し、評価時の `NameError` に委ねる。
     let private substituteOuter (inner: Schema) (scopes: OuterScope list) =
         let subst r =
-            if Schema.resolve inner r |> Result.isOk || shadowedByInner inner r then
+            if Schema.resolve r inner |> Result.isOk || shadowedByInner inner r then
                 None
             else
                 let rec go =
                     function
                     | [] -> None
                     | s :: rest ->
-                        match Schema.resolve s.Schema r with
+                        match Schema.resolve r s.Schema with
                         | Ok i ->
                             match s.Row with
                             | Some row when i >= 0 && i < row.Length -> Some(Expr.Value row.[i])
@@ -769,8 +769,7 @@ module internal Plan =
     /// <remarks>
     /// 入れ子の相関サブクエリも同じ手順で実行するため、自分自身を runner として
     /// 計画関数 `planSelectCWith` に渡す必要があり `let rec` にしている。
-    /// 実際の再帰呼び出しは `Run` の末尾位置（`Result.bind` の継続）で起きるので、
-    /// 外側行が増えてもフレームは積み上がらない。
+    /// 実際の再帰呼び出しは `Run` の末尾位置で起きるので、外側行が増えてもフレームは積み上がらない。
     /// </remarks>
     let rec private runSubquery (outer: OuterScope list) (ctx: ExecContext) (stmt: SelectStatement) =
         runSubquery |> planSelectCWith outer ret ctx stmt

@@ -80,9 +80,9 @@ module internal DropCleanup =
 module internal DropCleanupRecovery =
     let private shouldClean (catalog: Catalog) (space: string) =
         if space.StartsWith("t:", System.StringComparison.Ordinal) then
-            Catalog.findTable catalog (space.Substring 2) |> Option.isNone
+            Catalog.findTable (space.Substring 2) catalog |> Option.isNone
         elif space.StartsWith("i:", System.StringComparison.Ordinal) then
-            Catalog.findIndex catalog (space.Substring 2) |> Option.isNone
+            Catalog.findIndex (space.Substring 2) catalog |> Option.isNone
         else
             false
 

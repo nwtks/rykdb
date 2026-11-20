@@ -593,7 +593,7 @@ module internal Analyzer =
                     None)
 
         let tryIndexRange (tn: string) =
-            Catalog.indexesOf catalog b.RealName
+            Catalog.indexesOf b.RealName catalog
             |> List.tryPick (fun i ->
                 match i.Columns with
                 | [] -> None
@@ -653,7 +653,7 @@ module internal Analyzer =
             |> List.choose id
 
         let tryIndexEquality tn =
-            Catalog.indexesOf catalog b.RealName
+            Catalog.indexesOf b.RealName catalog
             |> List.choose (fun i ->
                 let values = equalityPrefix tn i
                 if List.isEmpty values then None else Some(i, values))
@@ -734,6 +734,6 @@ module internal Analyzer =
             | ScanMethod.PkLookup values ->
                 matches (b.Schema.PrimaryKey |> List.map (fun i -> b.Schema.Columns.[i].Name)) values name value
             | ScanMethod.IndexLookup(indexName, values) ->
-                Catalog.findIndex catalog indexName
+                Catalog.findIndex indexName catalog
                 |> Option.exists (fun idx -> matches idx.Columns values name value)
             | _ -> false)

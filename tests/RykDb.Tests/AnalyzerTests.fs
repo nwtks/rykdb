@@ -332,7 +332,7 @@ let ``Analyzer.chooseScanMethod: 等価条件があれば主キー検索にす�
 let ``Analyzer.chooseScanMethod: 索引があれば索引検索にする`` () =
     withStore "an3" (fun store ->
         let ix = indexDefinition "people" peopleSchema.Indexes.[0]
-        let catalog = ix |> Catalog.addIndex Catalog.Empty
+        let catalog = Catalog.addIndex ix Catalog.Empty
         let b = ok (Analyzer.bindTable (ctxOf store) { Name = "people"; Alias = None })
         let pred = Expr.Binary(BinaryOp.Eq, pCol "age", Expr.Literal(Literal.Int 30L))
         let m = ok (Analyzer.chooseScanMethod b catalog [ pred ])
@@ -487,7 +487,7 @@ let ``Analyzer.chooseScanMethod: 複合索引は前置等値 + 範囲で IndexRa
         let ctx = ExecContext.create store None |> ExecContext.withSchema "pairs" schema
         let b = ok (Analyzer.bindTable ctx { Name = "pairs"; Alias = None })
         let ix = indexDefinition "pairs" schema.Indexes.[0]
-        let catalog = ix |> Catalog.addIndex Catalog.Empty
+        let catalog = Catalog.addIndex ix Catalog.Empty
 
         let colRef name =
             Expr.Column
@@ -571,7 +571,7 @@ let ``Analyzer.chooseScanMethod: LIKE 'prefix%' は索引の範囲走査にす�
         let ctx = ExecContext.create store None |> ExecContext.withSchema "items" schema
         let b = ok (Analyzer.bindTable ctx { Name = "items"; Alias = None })
         let ix = indexDefinition "items" schema.Indexes.[0]
-        let catalog = ix |> Catalog.addIndex Catalog.Empty
+        let catalog = Catalog.addIndex ix Catalog.Empty
 
         let pred =
             Expr.Like(

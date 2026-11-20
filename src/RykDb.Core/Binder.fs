@@ -137,7 +137,7 @@ module internal Alias =
             | Expr.Name name ->
                 match Map.tryFind (name.ToLowerInvariant()) aliases with
                 | Some replacement ->
-                    match Schema.resolve schema { Qualifier = None; Name = name } with
+                    match Schema.resolve { Qualifier = None; Name = name } schema with
                     | Ok _ -> x
                     | Error _ -> replacement
                 | None -> x

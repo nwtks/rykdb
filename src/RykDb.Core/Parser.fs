@@ -180,6 +180,47 @@ module internal Parser =
         else
             advance st |> loop []
 
+    /// `REFERENCES 親 [(列 [, …])]` を読む。
+    /// 参照アクション（ON DELETE / ON UPDATE）・MATCH・DEFERRABLE は未対応として明示エラーにする
+    /// （黙って読み飛ばすと制約が無いものとして動いてしまう）。
+    let private parseReferences (st: PState) =
+        result {
+            let! parent, st = parseIdent st
+
+            let! columns, st =
+                if isSymbol "(" st then
+                    parseParenIdentList st |> Result.map (fun (cols, st) -> Some cols, st)
+                else
+                    ret (None, st)
+
+            do!
+                if isKeyword "ON" st then
+                    fail "参照アクション（ON DELETE / ON UPDATE）は未対応です" st
+                elif isIdentName "MATCH" st then
+                    fail "MATCH の指定は未対応です" st
+                elif isIdentName "DEFERRABLE" st then
+                    fail "DEFERRABLE は未対応です" st
+                else
+                    ret ()
+
+            return
+                {
+                    ParentTable = parent
+                    ParentColumns = columns
+                },
+                st
+        }
+
+    /// `FOREIGN KEY`（テーブルレベルの外部キー）の開始位置か。
+    /// `FOREIGN` は予約語ではないので、続く `KEY` まで見て判定する
+    /// （`foreign` という名前の列を壊さない）。
+    let private isForeignKeyStart (st: PState) =
+        isIdentName "FOREIGN" st
+        && st.Pos + 1 < st.Tokens.Length
+        && match st.Tokens.[st.Pos + 1].Token with
+           | Token.Keyword "KEY" -> true
+           | _ -> false
+
     let private parseColumnConstraint (acc: ColumnConstraint) (st: PState) =
         let rec loop c st =
             if isKeyword "NOT" st then
@@ -202,6 +243,10 @@ module internal Parser =
                 match advance st |> parseExprValue with
                 | Ok(e, st) -> loop { c with Default = Some e } st
                 | Error e -> err e
+            elif isIdentName "REFERENCES" st then
+                match advance st |> parseReferences with
+                | Ok(r, st) -> loop { c with References = Some r } st
+                | Error e -> err e
             else
                 ret (c, st)
 
@@ -217,6 +262,7 @@ module internal Parser =
                 | Token.Keyword "PRIMARY"
                 | Token.Keyword "UNIQUE"
                 | Token.Keyword "DEFAULT" -> true
+                | Token.Ident s when s.ToUpperInvariant() = "REFERENCES" -> true
                 | _ -> false
 
             let! dt, st =
@@ -266,6 +312,20 @@ module internal Parser =
                     advance st
                     |> parseParenIdentList
                     |> Result.map (fun (uqCols, st) -> cols, TableConstraint.UniqueColumns uqCols :: constrs, st)
+                elif isIdentName "CONSTRAINT" st then
+                    fail "名前付き制約（CONSTRAINT）は未対応です" st
+                elif isForeignKeyStart st then
+                    let st1 = advance st
+
+                    match advance st1 |> parseParenIdentList with
+                    | Error e -> err e
+                    | Ok(fkCols, st2) ->
+                        if not (isIdentName "REFERENCES" st2) then
+                            fail "FOREIGN KEY の後ろには REFERENCES が必要です" st2
+                        else
+                            advance st2
+                            |> parseReferences
+                            |> Result.map (fun (r, st3) -> cols, TableConstraint.ForeignKey(fkCols, r) :: constrs, st3)
                 else
                     parseColumnDefinition st |> Result.map (fun (c, st) -> c :: cols, constrs, st)
 

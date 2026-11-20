@@ -207,7 +207,7 @@ JIT は `tail.` を尊重する。
     同じパターンが `Sstable.rangeScanPartial` の `scanEntries` / `loadBlock`
     （ブロック読みを `SstScan.next` まで遅らせるため、続きの組み立てがラムダ内に入る）と `SstScan.emit` にもある。
   - `Plan.runSubquery` — 相関サブクエリの再計画用に自分自身を runner として渡す。
-    実際の呼び出しは `Run` の末尾位置（`Result.bind` の継続）で起きるが、
+    実際の呼び出しは `Run` の末尾位置で起きるが、
     TailAudit は関数値を引数として渡す形を `bare` として非末尾に数えるため、
     `StorageEngine.scanAtWith` の `pull` と同様にベースラインで追認する。
   - 逆に**要素数に比例する反復は `match` に直して末尾再帰にする**

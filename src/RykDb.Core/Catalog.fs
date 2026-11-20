@@ -10,6 +10,17 @@
 
 namespace RykDb.Core
 
+/// 外部キーの定義（永続化の対象）。
+/// 子テーブルが持つ（親の側は持たない）。
+type internal ForeignKeyDefinition =
+    {
+        /// 子テーブル側の列名（宣言順）
+        Columns: string list
+        ParentTable: string
+        /// 親テーブル側の列名（親の主キーと同順。作成時に解決済み）
+        ParentColumns: string list
+    }
+
 /// テーブルの定義（永続化の対象）。
 type internal TableDefinition =
     {
@@ -17,6 +28,8 @@ type internal TableDefinition =
         Columns: ColumnDefinition list
         /// 主キーになる列名（位置ではなく名前を保持する。DDL 変更に強い）
         PrimaryKeyColumns: string list
+        /// このテーブルが参照している外部キー
+        ForeignKeys: ForeignKeyDefinition list
     }
 
 /// 索引の定義（永続化の対象）。
@@ -42,15 +55,15 @@ module internal Catalog =
     let eqName (a: string) (b: string) = SqlName.equal a b
 
     /// テーブルを探す。無ければ None。
-    let findTable (c: Catalog) (name: string) =
+    let findTable (name: string) (c: Catalog) =
         c.Tables |> List.tryFind (fun t -> eqName t.Name name)
 
     /// 索引を探す。無ければ None。
-    let findIndex (c: Catalog) (name: string) =
+    let findIndex (name: string) (c: Catalog) =
         c.Indexes |> List.tryFind (fun i -> eqName i.IndexName name)
 
     /// あるテーブルが持つ索引を全部。
-    let indexesOf (c: Catalog) (table: string) =
+    let indexesOf (table: string) (c: Catalog) =
         c.Indexes |> List.filter (fun i -> eqName i.TableName table)
 
     /// 同名（大文字小文字を無視）の要素を除いてから末尾へ足す、共通の upsert。
@@ -61,41 +74,56 @@ module internal Catalog =
         |> fun xs -> xs @ [ item ]
 
     /// テーブルを追加（同名があれば置き換える）。
-    let addTable (c: Catalog) (t: TableDefinition) =
+    let addTable (t: TableDefinition) (c: Catalog) =
         { c with
-            Tables = upsert (fun (x: TableDefinition) -> x.Name) t c.Tables
+            Tables = upsert _.Name t c.Tables
         }
 
     /// テーブルを削除する（そのテーブルの索引も消える）。
-    let removeTable (c: Catalog) (name: string) =
+    let removeTable (name: string) (c: Catalog) =
         { c with
             Tables = c.Tables |> List.filter (fun t -> not (eqName t.Name name))
             Indexes = c.Indexes |> List.filter (fun i -> not (eqName i.TableName name))
         }
 
     /// 索引を追加（同名があれば置き換える）。
-    let addIndex (c: Catalog) (i: IndexDefinition) =
+    let addIndex (i: IndexDefinition) (c: Catalog) =
         { c with
-            Indexes = upsert (fun (x: IndexDefinition) -> x.IndexName) i c.Indexes
+            Indexes = upsert _.IndexName i c.Indexes
         }
 
     /// 索引を削除する。
-    let removeIndex (c: Catalog) (name: string) =
+    let removeIndex (name: string) (c: Catalog) =
         { c with
             Indexes = c.Indexes |> List.filter (fun i -> not (eqName i.IndexName name))
         }
 
-    /// TableSchema を永続化形にする。
+    /// TableSchema を永続化形にする（外部キーなし）。
     let toDefinition (schema: TableSchema) =
         {
             Name = schema.Name
             Columns = schema.Columns
             PrimaryKeyColumns = TableSchema.primaryKeyColumns schema |> List.ofArray
+            ForeignKeys = []
         }
+
+    /// TableSchema と外部キー定義から永続化形を作る。
+    let toDefinitionWithForeignKeys (schema: TableSchema) (foreignKeys: ForeignKeyDefinition list) =
+        { toDefinition schema with
+            ForeignKeys = foreignKeys
+        }
+
+    /// このテーブルを参照している外部キー（親側）を、子テーブルの定義と対にして返す。
+    let referencingForeignKeys (table: string) (catalog: Catalog) =
+        catalog.Tables
+        |> List.collect (fun t ->
+            t.ForeignKeys
+            |> List.filter (fun fk -> eqName fk.ParentTable table)
+            |> List.map (fun fk -> t, fk))
 
     /// 永続化形を TableSchema に戻す。
     let toSchema (t: TableDefinition) =
-        let rec findIndices (names: string list) (acc: int list) =
+        let rec findIndices names acc =
             match names with
             | [] -> ret (List.rev acc)
             | name :: rest ->
@@ -129,20 +157,25 @@ module internal Catalog =
         name.StartsWith("__unique_", System.StringComparison.OrdinalIgnoreCase)
 
     /// カタログにある索引を実行用の IndexSchema に変換する。
-    let indexSchemasOf (catalog: Catalog) (table: string) =
-        indexesOf catalog table |> List.map toIndexSchema
+    let indexSchemasOf (table: string) (catalog: Catalog) =
+        indexesOf table catalog |> List.map toIndexSchema
 
     // -- 直列化 --------------------------------------------------------------
     //
     //   テーブル: [colCount:varint]
     //            col × [name:lenPrefixed][tag:1][flags:1][default:lenPrefixed]
     //            [pkCount:varint][name:lenPrefixed] × pkCount
+    //            [fkCount:varint]
+    //            fk × [colCount:varint][name:lenPrefixed] × colCount
+    //                 [parentTable:lenPrefixed][parentColCount:varint]
+    //                 [name:lenPrefixed] × parentColCount
     //
     //   索引    : [table:lenPrefixed][unique:1][colCount:varint]
     //            [name:lenPrefixed] × colCount
     //
     // flags: bit0 = NOT NULL / bit1 = PRIMARY KEY / bit2 = UNIQUE
     // default は長さ 0 が「DEFAULT なし」。
+    // 外部キーを追加する前のテーブル定義は末尾に何も無いので、そこで読むのを止める。
     //
 
     let private encodeTable (t: TableDefinition) =
@@ -167,12 +200,41 @@ module internal Catalog =
                 w0
             |> Writer.varint (uint64 t.PrimaryKeyColumns.Length)
 
-        t.PrimaryKeyColumns
-        |> List.fold (fun w name -> Writer.str name w) w2
+        let w4 =
+            t.PrimaryKeyColumns
+            |> List.fold (fun w name -> Writer.str name w) w2
+            |> Writer.varint (uint64 t.ForeignKeys.Length)
+
+        t.ForeignKeys
+        |> List.fold
+            (fun w fk ->
+                let w = Writer.varint (uint64 fk.Columns.Length) w
+                let w = fk.Columns |> List.fold (fun w name -> Writer.str name w) w
+                let w = Writer.str fk.ParentTable w
+                let w = Writer.varint (uint64 fk.ParentColumns.Length) w
+                fk.ParentColumns |> List.fold (fun w name -> Writer.str name w) w)
+            w4
         |> Writer.toArray
 
+    let private readForeignKey (c: Cursor) =
+        result {
+            let! colCount, c1 = Reader.readVarint c
+            let! cols, c2 = Reader.readItems Reader.readStr colCount c1
+            let! parent, c3 = Reader.readStr c2
+            let! parentCount, c4 = Reader.readVarint c3
+            let! parentColumns, c5 = Reader.readItems Reader.readStr parentCount c4
+
+            return
+                {
+                    Columns = cols
+                    ParentTable = parent
+                    ParentColumns = parentColumns
+                },
+                c5
+        }
+
     let private decodeTable (name: string) (bytes: byte array) =
-        let readColumn (c: Cursor) =
+        let readColumn c =
             result {
                 let! name, c1 = Reader.readStr c
                 let! tag, c2 = Reader.readByte c1
@@ -200,6 +262,7 @@ module internal Catalog =
                                 PrimaryKey = flags &&& 2uy <> 0uy
                                 Unique = flags &&& 4uy <> 0uy
                                 Default = defaultExpr
+                                References = None
                             }
                     },
                     c4
@@ -209,13 +272,21 @@ module internal Catalog =
             let! colCount, cur1 = Cursor.create bytes |> Reader.readVarint
             let! cols, cur2 = Reader.readItems readColumn colCount cur1
             let! pkCount, cur3 = Reader.readVarint cur2
-            let! pks, _ = Reader.readItems Reader.readStr pkCount cur3
+            let! pks, cur4 = Reader.readItems Reader.readStr pkCount cur3
+
+            let! foreignKeys =
+                if Cursor.atEnd cur4 then
+                    ret []
+                else
+                    Reader.readVarint cur4
+                    >>= fun (fkCount, cur5) -> Reader.readItems readForeignKey fkCount cur5 |> Result.map fst
 
             return
                 {
                     Name = name
                     Columns = cols
                     PrimaryKeyColumns = pks
+                    ForeignKeys = foreignKeys
                 }
         }
 
@@ -313,8 +384,8 @@ module internal Catalog =
 
     /// カタログを読み込む。キーが無ければ空を返す。
     let load (store: RowStore) =
-        let ofValue (v: SqlValue array) =
-            match v with
+        let ofValue =
+            function
             | [| SqlValue.Blob b |] -> Some b
             | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
             | _ -> None
@@ -329,7 +400,7 @@ module internal Catalog =
             else
                 None
 
-        let keyKindOf (key: byte array) =
+        let keyKindOf key =
             match tryPrefix key "table:" with
             | Some name -> Some(false, name)
             | None ->
@@ -337,28 +408,28 @@ module internal Catalog =
                 | Some name -> Some(true, name)
                 | None -> None
 
-        let rec decodeRows (rows: (byte array * SqlValue array option) array) (i: int) (acc: Catalog) =
+        let rec decodeRows (rows: (byte array * SqlValue array option) array) i c =
             if i >= rows.Length then
-                ret acc
+                ret c
             else
                 let key, value = rows.[i]
 
                 match value with
-                | None -> decodeRows rows (i + 1) acc
+                | None -> decodeRows rows (i + 1) c
                 | Some v ->
                     match ofValue v with
-                    | None -> decodeRows rows (i + 1) acc
+                    | None -> decodeRows rows (i + 1) c
                     | Some bytes ->
                         match keyKindOf key with
                         | Some(false, name) ->
                             match decodeTable name bytes with
-                            | Ok t -> addTable acc t |> decodeRows rows (i + 1)
+                            | Ok t -> addTable t c |> decodeRows rows (i + 1)
                             | Error e -> err e
                         | Some(true, name) ->
                             match decodeIndex name bytes with
-                            | Ok idx -> addIndex acc idx |> decodeRows rows (i + 1)
+                            | Ok idx -> addIndex idx c |> decodeRows rows (i + 1)
                             | Error e -> err e
-                        | None -> decodeRows rows (i + 1) acc
+                        | None -> decodeRows rows (i + 1) c
 
         RowStore.scan Keyspace.CatalogKeyspace [||] 0 store
         >>= fun rows -> SstScan.toArray rows
@@ -421,8 +492,7 @@ module internal Schema =
             }
 
     /// スキーマ列を左から連結する（FROM / JOIN の出力スキーマ組み立て）。
-    let concatAll (schemas: Schema list) =
-        schemas |> List.fold (fun (acc: Schema) (s: Schema) -> concat acc s) empty
+    let concatAll = List.fold concat empty
 
     /// `*` / `t.*` が表す出力列を展開する。
     /// どちらもなければ None。
@@ -432,7 +502,7 @@ module internal Schema =
     /// Expr は `[<NoComparison>]` なので「どちらの star だったか」は別のフラグで返す
     /// （qualified = `t.*` なら true）。
     /// </remarks>
-    let expandStar (schema: Schema) (e: Expr) =
+    let expandStar (e: Expr) (schema: Schema) =
         match e with
         | Expr.Star -> Some(false, schema.Columns |> Array.toList)
         | Expr.QualifiedStar q ->
@@ -446,7 +516,7 @@ module internal Schema =
 
     /// 指定した修飾子（テーブル名・別名）の列が 1つ以上あるか。
     /// 存在しない `t.*` を 0列の成功にしないための検証に使う。
-    let hasQualifier (schema: Schema) (qualifier: string) =
+    let hasQualifier (qualifier: string) (schema: Schema) =
         schema.Columns
         |> Array.exists (fun c ->
             match c.Qualifier with
@@ -457,8 +527,8 @@ module internal Schema =
     /// Column はそのまま。修飾子なしの裸の名前（Name）も列として扱う
     /// （パーサが WHERE / ORDER BY の裸の名前を Name にするため）。
     /// 集約呼び出しや式は列ではないので None。
-    let tryAsColumnRef (e: Expr) =
-        match e with
+    let tryAsColumnRef =
+        function
         | Expr.Column c -> Some c
         | Expr.Name n -> Some { Qualifier = None; Name = n }
         | _ -> None
@@ -477,7 +547,7 @@ module internal Schema =
     /// 列参照を解決する。見つからなければエラー、曖昧ならエラー。
     /// 大文字小文字を区別しない（`SqlName.equal` と同じ規則）。
     /// 行ごとに呼ばれるので、文字列の小文字化や一時配列を作らない。
-    let resolve (schema: Schema) (r: ColumnRef) =
+    let resolve (r: ColumnRef) (schema: Schema) =
         let isMatch (c: OutputColumn) =
             match r.Qualifier with
             | Some q ->
@@ -487,7 +557,7 @@ module internal Schema =
                    | None -> false
             | None -> SqlName.equal c.Name r.Name
 
-        let rec collect (i: int) (acc: int list) =
+        let rec collect i acc =
             if i >= schema.Columns.Length then
                 List.rev acc
             elif isMatch schema.Columns.[i] then
@@ -500,21 +570,19 @@ module internal Schema =
         match hits with
         | [ i ] -> ret i
         | [] ->
-            err (
-                sprintf
-                    "列 '%s' が存在しません（使える列: %s）"
-                    r.Display
-                    (if schema.Columns.Length = 0 then
-                         "(なし)"
-                     else
-                         schema.Columns |> Array.map (fun c -> c.Display) |> String.concat ", ")
-                |> DbError.name
-            )
+            sprintf
+                "列 '%s' が存在しません（使える列: %s）"
+                r.Display
+                (if schema.Columns.Length = 0 then
+                     "(なし)"
+                 else
+                     schema.Columns |> Array.map (fun c -> c.Display) |> String.concat ", ")
+            |> DbError.name
+            |> err
         | many ->
-            err (
-                sprintf "列 '%s' が曖昧です（該当: %s）" r.Display (many |> List.map string |> String.concat ", ")
-                |> DbError.name
-            )
+            sprintf "列 '%s' が曖昧です（該当: %s）" r.Display (many |> List.map string |> String.concat ", ")
+            |> DbError.name
+            |> err
 
     /// 射影後の列（名前・修飾子・型）を作る。
     /// `SELECT *` は入力の列名をそのまま、`t.*` は修飾つきの表示名にする（元の挙動）。
@@ -530,7 +598,7 @@ module internal Schema =
         let referenced e =
             match tryAsColumnRef e with
             | Some c ->
-                match resolve schema c with
+                match resolve c schema with
                 | Ok i -> Some schema.Columns.[i]
                 | Error _ -> None
             | None -> None
@@ -547,7 +615,7 @@ module internal Schema =
         | items ->
             items
             |> List.collect (fun item ->
-                match expandStar schema item.Expression with
+                match expandStar item.Expression schema with
                 | Some(qualified, columns) ->
                     columns
                     |> List.map (fun c ->
@@ -597,7 +665,7 @@ type internal SelectProjection =
 module internal SelectProjection =
     let private expressionsOf (schema: Schema) =
         List.collect (fun item ->
-            match Schema.expandStar schema item.Expression with
+            match Schema.expandStar item.Expression schema with
             | Some(_, columns) ->
                 columns
                 |> List.map (fun c ->

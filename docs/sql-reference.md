@@ -1131,6 +1131,7 @@ CREATE TABLE [IF NOT EXISTS] テーブル名 (
   列定義 [, 列定義 …]
   [, PRIMARY KEY (列 [, …])]
   [, UNIQUE (列 [, …])]
+  [, FOREIGN KEY (列 [, …]) REFERENCES 親テーブル [(列 [, …])]]
 );
 ```
 
@@ -1153,6 +1154,8 @@ CREATE TABLE people (
 | `PRIMARY KEY` | 列・テーブル | **必須**。1テーブルに1定義だけ。`NOT NULL` も付く         |
 | `UNIQUE`      | 列・テーブル | 重複を検査する（`NULL` は除く）                           |
 | `DEFAULT`     | 列           | `INSERT` で値を省略したときに使われる（定数式のみ）       |
+| `REFERENCES`  | 列           | 外部キー（§11.5）。親の主キーを参照する                   |
+| `FOREIGN KEY` | テーブル     | 外部キー（§11.5）。複合キーを参照できる                   |
 
 `DEFAULT` はカタログに保存され、DB を再オープンした後も使われる。
 `DEFAULT` の値も列の型へ暗黙変換される。
@@ -1240,6 +1243,7 @@ ALTER TABLE テーブル名 RENAME [COLUMN] 旧列名 TO 新列名;
   - 追加できるのは通常の列だけ。
     `PRIMARY KEY` は `ConstraintViolation`（主キーは LSM のキーに使われているため）、
     `UNIQUE` も `ConstraintViolation`（必要なら `CREATE UNIQUE INDEX` を使う）。
+    `REFERENCES`（外部キー）も `ConstraintViolation`（テーブルを作り直す）。
   - `NOT NULL` を付けるには `DEFAULT` が必要（無いと `ConstraintViolation`）。
   - 同じ名前の列（大文字小文字を無視）があれば `NameError`。
   - `DEFAULT` は追加時に 1回評価され、既存行と以後の `INSERT` の両方に使われる。
@@ -1249,10 +1253,12 @@ ALTER TABLE テーブル名 RENAME [COLUMN] 旧列名 TO 新列名;
   削除する列が索引列でなければ索引 keyspace は書き換えない。
   - 主キー列は削除できない（`ConstraintViolation`）。
   - 索引（`UNIQUE` 制約の暗黙索引を含む）で使われている列は削除できない（`ConstraintViolation`）。
+  - 外部キーで使われている列（子の列・親の参照列）も削除できない（§11.5）。
   - 存在しない列は `NameError`。
 - **`RENAME [COLUMN]`** — 列名を変更する。
   **行の値は書き換えない**（名前は行に含まれない）。
   - 主キー列・索引の列名も一緒に書き換わるので、索引検索はそのまま使える。
+  - 外部キー定義の列名（子の列・親の参照列）も追随する（§11.5）。
   - 新しい名前が既存の列と重複すれば `NameError`（大文字小文字だけの変更は可）。
 - 行の書き換え（`ADD` / `DROP`）は **1 transaction** で行い、カタログ更新も同じ commit に含める。
   途中で失敗しても何も変わらない。
@@ -1265,6 +1271,61 @@ ALTER TABLE people ADD COLUMN email TEXT;
 ALTER TABLE people ADD COLUMN score INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE people DROP COLUMN score;
 ALTER TABLE people RENAME COLUMN email TO mail;
+```
+
+### 11.5 外部キー（FOREIGN KEY）
+
+```sql
+-- 列レベル
+CREATE TABLE orders (
+  id       INTEGER PRIMARY KEY,
+  person_id INTEGER REFERENCES people (id)
+);
+
+-- テーブルレベル（複合キー）
+CREATE TABLE order_lines (
+  id      INTEGER PRIMARY KEY,
+  oid     INTEGER,
+  line_no INTEGER,
+  FOREIGN KEY (oid, line_no) REFERENCES order_items (oid, line_no)
+);
+```
+
+- **参照先は親テーブルの `PRIMARY KEY` だけ**。
+  親の列を省略すると主キーになる。
+  指定する場合は主キーと**同数・同順**（列の定義順）で書く。
+  型も親の列と一致している必要がある（違えば `TypeError`）。
+- **参照整合性は即時（RESTRICT）に検査する**。
+  - 子の `INSERT` / `UPDATE` は、外部キーの値に対応する親行が無ければ `ConstraintViolation`
+    （文全体を取り消す）。
+  - 親の `DELETE` は、参照している子行があれば `ConstraintViolation`。
+  - 親の主キーは `UPDATE` できない（§9）ので、親側の更新検査は無い。
+- 外部キーの列に `NULL` を含む行は参照しない（SQL の MATCH SIMPLE）。
+  複合キーの一部だけ `NULL` でも参照しない。
+- 参照アクション（`ON DELETE` / `ON UPDATE`）と `MATCH` / `DEFERRABLE` は未対応で `SyntaxError`。
+  名前付き制約（`CONSTRAINT 名前 FOREIGN KEY ...`）も未対応。
+- 外部キーの列に索引が無くても検査できる（子テーブルの走査）。
+  子テーブルに外部キーの列を先頭とする索引があると、その索引を使う。
+- **参照されている親テーブルは `DROP TABLE` できない**（`ConstraintViolation`）。
+  子テーブルを先に削除する。
+- 外部キーで使われている列は `ALTER TABLE ... DROP COLUMN` できない。
+  `ALTER TABLE ... ADD COLUMN` で `REFERENCES` は指定できない。
+- `ALTER TABLE ... RENAME COLUMN` は外部キー定義の列名も追随する。
+- 自己参照（`REFERENCES 自分自身`）を作れる。
+  参照している行が残っている間は、参照先の行を削除できない。
+  相互に参照している行は 1 文の `DELETE` では消せない（参照している側から先に削除する）。
+- 定義はカタログに保存され、DB を再オープンしても使われる。
+
+```sql
+CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE pets (id INTEGER PRIMARY KEY, owner_id INTEGER REFERENCES people (id));
+
+INSERT INTO people VALUES (1, 'alice');
+INSERT INTO pets VALUES (10, 1);      -- OK
+INSERT INTO pets VALUES (11, 99);     -- 外部キー制約に違反（親が無い）
+DELETE FROM people WHERE id = 1;      -- 外部キー制約に違反（pets が参照している）
+DELETE FROM pets WHERE id = 10;
+DELETE FROM people WHERE id = 1;      -- OK
 ```
 
 ---
@@ -1449,6 +1510,13 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 | `ALTER TABLE t DROP COLUMN id;`（主キー）                                         | `主キー列 id は削除できません（主キーは LSM のキーに使われています）`                               |
 | `ALTER TABLE t DROP COLUMN a;`（索引列）                                          | `列 a は索引 ix_a で使われているため削除できません`                                                 |
 | `ALTER TABLE t RENAME TO u;`                                                      | `ALTER TABLE ... RENAME TO（テーブル名の変更）は未対応です (位置 1行 22列)`                         |
+| `CREATE TABLE c (... REFERENCES nope (id));`                                      | `参照先テーブル nope が存在しません`                                                                |
+| `CREATE TABLE c (... REFERENCES p (u));`（`u` は主キーでない）                    | `参照先の列（u）はテーブル p の主キー（id）と同順で指定してください`                                |
+| `CREATE TABLE c (... REFERENCES p (id) ON DELETE CASCADE);`                       | `参照アクション（ON DELETE / ON UPDATE）は未対応です (位置 1行 71列)`                               |
+| `CREATE TABLE c (... CONSTRAINT fk FOREIGN KEY ...);`                             | `名前付き制約（CONSTRAINT）は未対応です (位置 1行 41列)`                                            |
+| `INSERT INTO c VALUES (11, 99);`（親が無い）                                      | `外部キー制約に違反: c(pid) が参照する p(id) の行がありません`                                      |
+| `DELETE FROM p WHERE id = 1;`（子が参照中）                                       | `外部キー制約に違反: テーブル c の行が p(id) を参照しています`                                      |
+| `DROP TABLE p;`（子が参照中）                                                     | `テーブル p は c の外部キーから参照されているため削除できません`                                    |
 | `SELECT id FROM t JOIN t ON t.id = t.id;`                                         | `テーブル t が重複しています（エイリアスを付けてください）`                                         |
 | `DROP TABLE nosuch;`                                                              | `テーブル nosuch が存在しません`                                                                    |
 | `INSERT INTO t (id) VALUES (1, 2);`                                               | `INSERT の列数(1)と値の数(2)が合いません`                                                           |
@@ -1493,6 +1561,9 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 - 自然結合（`NATURAL JOIN`）
 - カンマ結合（`FROM a, b`）
 - `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）
+- `FOREIGN KEY` の参照アクション（`ON DELETE` / `ON UPDATE`）、`MATCH`、`DEFERRABLE`、
+  名前付き制約（`CONSTRAINT 名前 FOREIGN KEY ...`）（明示 `SyntaxError`）。
+  外部キーの参照先は主キーだけで、`UNIQUE` 索引は参照できない（§11.5）
 - `UPDATE ... FROM` / `UPDATE ... LIMIT` / `DELETE ... LIMIT`
 - `DELETE ... USING`（明示 `SyntaxError`）
 - `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`
@@ -1530,6 +1601,7 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 | ストリーミング      | `Session.TryOpenReader` は単一 SELECT のみ。materialize しないため結果上限は適用外。終端または `RowReader.Dispose` で走査と snapshot を解放                                                               |
 | `AVG`               | `SUM / COUNT` を実行時に計算                                                                                                                                                                              |
 | `UPDATE` / `DELETE` | `FROM` / `USING` / `LIMIT` 相当の句がない                                                                                                                                                                 |
+| 外部キー            | 参照先は親の主キーのみ。即時 RESTRICT（`ON DELETE` / `ON UPDATE` は未対応）。子の検査は外部キー列の索引があれば索引、無ければ子テーブルの走査                                                             |
 | DML の別名          | 対象テーブルに別名は書けない（`UPDATE t AS x` / `DELETE FROM t x` は `SyntaxError`）。列は実名で修飾する                                                                                                  |
 | トランザクション    | 分離レベルは Snapshot Isolation 固定。`SAVEPOINT` と読み取り専用トランザクションは未対応（§12）                                                                                                           |
 | DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）                                                                                                                                                |

@@ -104,7 +104,7 @@ let ``ExecContext.schemaOf: 大文字小文字違いのキーでも引ける`` (
 [<Fact>]
 let ``ExecContext.schemaOf: カタログのテーブルへフォールバックする`` () =
     withStore "ec-schemaof-cat" (fun store ->
-        let cat = Catalog.addTable Catalog.Empty (Catalog.toDefinition peopleSchema)
+        let cat = Catalog.addTable (Catalog.toDefinition peopleSchema) Catalog.Empty
         let c0 = ExecContext.create store None
         let c1 = ExecContext.withCatalog cat c0
         // Schemas に無くても Catalog から引ける
