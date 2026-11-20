@@ -649,8 +649,9 @@ module internal Schema =
     let referenceColumns = projectedColumns false
 
 /// SELECT の射影（出力式とヘッダ）を 1回の展開でまとめたもの。
-/// `Ops.project`（行の値）と `Plan` のヘッダが同じ展開を共有し、
+/// `Ops.project`（行の値）と `Plan` のヘッダが同じ展開用スキーマ（論理 = FROM 順）を共有し、
 /// 「ヘッダの列数と行の幅がずれる」不変条件違反を防ぐ。
+/// 行の評価は実レイアウトで行うため、`Ops.project` は展開用と評価用のスキーマを別に受け取る。
 type internal SelectProjection =
     {
         SelectItems: SelectItem list

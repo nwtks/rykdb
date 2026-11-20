@@ -43,6 +43,7 @@ module internal OpsJoin =
         | Some p -> Eval.matchesJoinedV resolve lrow rrow p
 
     /// nested loop 結合の内側ループ（1つの左行 × 右の全行）を回す共通処理。
+    /// `resolve` は呼び出し側で 1回だけ準備する（左行ごとに作り直さない）。
     /// onExhausted matched は右を最後まで試し終えたときの Op。
     /// onError error matched は ON 句の評価が失敗したときの Op。
     /// matched は「この左行で既に一致を出したか」。
@@ -50,13 +51,11 @@ module internal OpsJoin =
     let private joinLoop
         (onExhausted: bool -> Op)
         (onError: DbError -> bool -> Op)
-        (leftSchema: Schema)
-        (rightSchema: Schema)
         (lrow: SqlValue array)
         (rightRows: SqlValue array array)
+        (resolve: Prepared)
         (on: Expr)
         =
-        let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
         let joinPred l r = Eval.matchesJoinedV resolve l r on
 
         let rec loop matched i =
@@ -82,6 +81,8 @@ module internal OpsJoin =
         (rightRows: SqlValue array array)
         (on: Expr)
         =
+        let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
+
         let rec joinRows cur =
             Op.pull
                 (fun lrow lnext ->
@@ -89,10 +90,9 @@ module internal OpsJoin =
                         joinLoop
                             (fun _ -> joinRows lnext)
                             (fun e _ -> Op.compute (fun () -> OpStep.OpError e))
-                            leftSchema
-                            rightSchema
                             lrow
                             rightRows
+                            resolve
                             on
                     ))
                 cur
@@ -106,6 +106,8 @@ module internal OpsJoin =
         (rightRows: SqlValue array array)
         (on: Expr)
         =
+        let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
+
         let rec joinRows width cur =
             Op.pull
                 (fun lrow lnext ->
@@ -116,7 +118,7 @@ module internal OpsJoin =
                             Op.emit (padWithNulls lrow width) (joinRows width lnext)
 
                     let onError e _ = Op.compute (fun () -> OpStep.OpError e)
-                    Op.next (joinLoop onExhausted onError leftSchema rightSchema lrow rightRows on))
+                    Op.next (joinLoop onExhausted onError lrow rightRows resolve on))
                 cur
 
         joinRows rightSchema.Columns.Length left
@@ -493,7 +495,9 @@ module internal OpsJoin =
                             err e
                         | Ok(count, next') ->
                             Spill.closeSink sink
-                            ret (Spill.RowSpool.Disk([ path ], count), next')
+                            let spool = Spill.RowSpool.Disk([ path ], count)
+                            Spill.registerSpool budget.Scope spool
+                            ret (spool, next')
             | Error e -> err e
 
     /// マージ結合。両入力は結合キーで昇順に並んでいる必要がある

@@ -1487,6 +1487,99 @@ let ``SqlReference: インデックス入れ子ループ（右索引 + 左が小
         Assert.Equal<string>("alice", asText byPk.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: インデックス入れ子ループは右の吸収済み述語を落とさない`` () =
+    withSession "joinindex-absorbed" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT)"
+
+        let db2 =
+            exec db1 "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER, k INTEGER, v TEXT)"
+
+        let db3 = exec db2 "CREATE INDEX ix_c_pid ON c (pid)"
+        let db4 = exec db3 "CREATE INDEX ix_c_k ON c (k)"
+        let db5 = exec db4 "INSERT INTO p VALUES (1,'p1'),(2,'p2')"
+        let db6 = exec db5 "INSERT INTO c VALUES (1,1,10,'c1'),(2,1,20,'c2'),(3,2,99,'c3')"
+
+        // 右の主キー等値は INL の lookup に吸収されず、residual として評価される必要がある。
+        let _, byPk =
+            ok (execSql db6 "SELECT c.id FROM p JOIN c ON p.id = c.pid WHERE p.id = 1 AND c.id = 3")
+
+        Assert.Empty byPk.Rows
+
+        // 右の索引等値も同様。
+        let _, byIndex =
+            ok (execSql db6 "SELECT c.id FROM p JOIN c ON p.id = c.pid WHERE p.id = 1 AND c.k = 99")
+
+        Assert.Empty byIndex.Rows
+
+        // 一致する側は 1 行。
+        let _, matched =
+            ok (execSql db6 "SELECT c.id, c.k FROM p JOIN c ON p.id = c.pid WHERE p.id = 1 AND c.k = 20")
+
+        Assert.Equal<int>(1, matched.Rows.Length)
+        Assert.Equal<int64>(2L, asInt matched.Rows.[0].[0])
+        Assert.Equal<int64>(20L, asInt matched.Rows.[0].[1])
+
+        // 範囲述語は Filter に残るため、右が RangeScan でも INL の residual で評価できる。
+        let _, rightRange =
+            ok (execSql db6 "SELECT c.id FROM p JOIN c ON p.id = c.pid WHERE p.id = 1 AND c.id > 1")
+
+        Assert.Equal<int>(1, rightRange.Rows.Length)
+        Assert.Equal<int64>(2L, asInt rightRange.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: JOIN の並べ替え後も SELECT * は FROM 順の列を返す`` () =
+    withSession "join-star-order" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (aid INTEGER PRIMARY KEY, av TEXT)"
+        let db2 = exec db1 "CREATE TABLE b (bid INTEGER PRIMARY KEY, bv TEXT)"
+        let db3 = exec db2 "CREATE TABLE c (cid INTEGER PRIMARY KEY, cv TEXT)"
+        let db4 = exec db3 "INSERT INTO a VALUES (1,'A')"
+        let db5 = exec db4 "INSERT INTO b VALUES (1,'B')"
+        let db6 = exec db5 "INSERT INTO c VALUES (1,'C')"
+
+        // WHERE c.cid = 1 で c が先に結合され、物理レイアウトは a, c, b になる。
+        let _, star =
+            ok (execSql db6 "SELECT * FROM a JOIN b ON a.aid = b.bid JOIN c ON a.aid = c.cid WHERE c.cid = 1")
+
+        Assert.Equal<string array>([| "aid"; "av"; "bid"; "bv"; "cid"; "cv" |], star.Columns)
+        Assert.Equal<int>(1, star.Rows.Length)
+        Assert.Equal<int64>(1L, asInt star.Rows.[0].[0])
+        Assert.Equal<string>("A", asText star.Rows.[0].[1])
+        Assert.Equal<int64>(1L, asInt star.Rows.[0].[2])
+        Assert.Equal<string>("B", asText star.Rows.[0].[3])
+        Assert.Equal<int64>(1L, asInt star.Rows.[0].[4])
+        Assert.Equal<string>("C", asText star.Rows.[0].[5])
+
+        // 派生テーブルの `SELECT *` でも列名と値が一致する。
+        let _, derived =
+            ok (
+                execSql
+                    db6
+                    "SELECT d.bv, d.cv FROM (SELECT * FROM a JOIN b ON a.aid = b.bid JOIN c ON a.aid = c.cid WHERE c.cid = 1) AS d"
+            )
+
+        Assert.Equal<int>(1, derived.Rows.Length)
+        Assert.Equal<string>("B", asText derived.Rows.[0].[0])
+        Assert.Equal<string>("C", asText derived.Rows.[0].[1])
+
+        // INSERT ... SELECT * も FROM 順で書き込む。
+        let db7 =
+            exec db6 "CREATE TABLE t2 (k INTEGER PRIMARY KEY, x TEXT, y TEXT, z TEXT, w TEXT, u TEXT, v TEXT)"
+
+        let db8 =
+            exec
+                db7
+                "INSERT INTO t2 (k, x, y, z, w, u, v) SELECT 1, * FROM a JOIN b ON a.aid = b.bid JOIN c ON a.aid = c.cid WHERE c.cid = 1"
+
+        let _, inserted = ok (execSql db8 "SELECT x, y, z, w, u, v FROM t2")
+        Assert.Equal<int>(1, inserted.Rows.Length)
+        Assert.Equal<string>("1", asText inserted.Rows.[0].[0])
+        Assert.Equal<string>("A", asText inserted.Rows.[0].[1])
+        Assert.Equal<string>("1", asText inserted.Rows.[0].[2])
+        Assert.Equal<string>("B", asText inserted.Rows.[0].[3])
+        Assert.Equal<string>("1", asText inserted.Rows.[0].[4])
+        Assert.Equal<string>("C", asText inserted.Rows.[0].[5]))
+
+[<Fact>]
 let ``SqlReference: JOIN の非修飾で曖昧な列は NameError`` () =
     // 非修飾 id は p と q の両方にある。各テーブルへ pushdown すると
     // それぞれ id = 1 で絞ってしまい、曖昧エラーにならず意味が変わる。

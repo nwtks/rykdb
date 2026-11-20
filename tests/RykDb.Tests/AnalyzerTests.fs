@@ -88,6 +88,82 @@ let ``Analyzer.chooseJoinAlgorithm: 左が小さく右を引けるなら IndexNe
     | other -> failActual "NestedLoop ではありません" other
 
 [<Fact>]
+let ``Analyzer.chooseJoinAlgorithm: 右の PkLookup / IndexLookup は IndexNestedLoop にしない`` () =
+    let leftTable =
+        {
+            Name = "l"
+            Columns = [ col "a" DataType.Integer ]
+            PrimaryKey = [ 0 ]
+            Indexes = []
+        }
+
+    let rightTable =
+        {
+            Name = "r"
+            Columns = [ col "a" DataType.Integer ]
+            PrimaryKey = [ 0 ]
+            Indexes =
+                [
+                    {
+                        Name = "ix_r_a"
+                        Columns = [ "a" ]
+                        Unique = false
+                    }
+                ]
+        }
+
+    let leftSchema = Schema.ofTable "l" None leftTable
+    let rightSchema = Schema.ofTable "r" None rightTable
+
+    let on =
+        Expr.Binary(
+            BinaryOp.Eq,
+            Expr.Column { Qualifier = Some "l"; Name = "a" },
+            Expr.Column { Qualifier = Some "r"; Name = "a" }
+        )
+
+    let leftSmall = Logical.Limit(0, 1, Logical.Scan("l", ScanMethod.SeqScan))
+
+    let tableOf (name: string) =
+        match name with
+        | "l" -> Some leftTable
+        | "r" -> Some rightTable
+        | _ -> None
+
+    let assertNotInl method =
+        match
+            Analyzer.chooseJoinAlgorithm
+                tableOf
+                leftSchema
+                rightSchema
+                (Some rightTable)
+                leftSmall
+                (Logical.Scan("r", method))
+                on
+        with
+        | (JoinAlgorithm.IndexNestedLoop _, _, _) as other ->
+            failActual "吸収済み述語を落とす右スキャンで IndexNestedLoop を選んでいます" other
+        | _ -> ()
+
+    // PkLookup / IndexLookup は等値述語を走査が吸収するため、右部分木を実行しない INL では使えない。
+    assertNotInl (ScanMethod.PkLookup [| SqlValue.Int 1L |])
+    assertNotInl (ScanMethod.IndexLookup("ix_r_a", [| SqlValue.Int 1L |]))
+
+    // SeqScan なら従来どおり INL。
+    match
+        Analyzer.chooseJoinAlgorithm
+            tableOf
+            leftSchema
+            rightSchema
+            (Some rightTable)
+            leftSmall
+            (Logical.Scan("r", ScanMethod.SeqScan))
+            on
+    with
+    | JoinAlgorithm.IndexNestedLoop _, _, _ -> ()
+    | other -> failActual "SeqScan の右で IndexNestedLoop ではありません" other
+
+[<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致するときだけマージ結合`` () =
     let columns = [ col "a" DataType.Integer; col "b" DataType.Integer ]
 

@@ -784,22 +784,24 @@ module internal Ops =
 
     /// 射影。
     /// `SELECT` の項目順に値を並べる。
-    /// `*` / `t.*` は対象テーブルの全列に展開する。
+    /// `*` / `t.*` は `expandSchema`（論理的な入力スキーマ = FROM 順）で展開する。
+    /// 行の評価は `evalSchema`（実行時の実際のレイアウト）で解決する。
+    /// JOIN の並べ替えで両者がずれても、`*` の列順は論理スキーマのまま保たれる。
     /// `groupBy` は「射影の入力が集約結果」のときの GROUP BY 式。
     /// `SELECT age, COUNT(*) ... GROUP BY age` の `age` を
     /// 「集約後の行の先頭」にある値へ読み替えるために使う。
-    let project (schema: Schema) (groupBy: Expr list) (items: SelectItem list) (src: Op) =
+    let project (expandSchema: Schema) (evalSchema: Schema) (groupBy: Expr list) (items: SelectItem list) (src: Op) =
         let aggCallsOf = List.map _.Expression >> aggCalls
 
         if List.isEmpty items then
             src
         else
-            let projection = SelectProjection.create schema items
+            let projection = SelectProjection.create expandSchema items
             let allExprs = projection.Expressions
             let foundAggs = aggCallsOf projection.SelectItems
             let offsets = aggOffsets groupBy foundAggs
             let wholeOffsets = wholeGroupOffsets groupBy
-            let resolve = Eval.prepare schema allExprs
+            let resolve = Eval.prepare evalSchema allExprs
 
             let evalItems row (exprs: Expr list) =
                 let values = Array.zeroCreate<SqlValue> exprs.Length

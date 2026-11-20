@@ -207,10 +207,17 @@ module internal Analyzer =
     /// インデックス入れ子ループは右部分木を実行しないため、
     /// `Filter` の述語は residual として結合時に評価する
     /// （捨てると WHERE の pushdown が消えて結果が変わる）。
+    /// ただし `PkLookup` / `IndexLookup` は等値述語を走査が吸収して `Filter` から消えるため、
+    /// 右部分木を実行しない INL では述語を再評価できない。
+    /// ここでは対象外にしてハッシュ / マージ / 入れ子ループへ回す（右部分木が実行される）。
+    /// `RangeScan` / `IndexRangeScan` の範囲述語は `Filter` に残るので対象にできる。
     let private indexableRight =
         let rec unwrap preds =
             function
-            | Logical.Scan _ -> Some preds
+            | Logical.Scan(_, ScanMethod.SeqScan)
+            | Logical.Scan(_, ScanMethod.RangeScan _)
+            | Logical.Scan(_, ScanMethod.IndexRangeScan _) -> Some preds
+            | Logical.Scan _ -> None
             | Logical.Filter(p, child) -> unwrap (p :: preds) child
             | _ -> None
 

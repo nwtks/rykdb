@@ -33,7 +33,8 @@ module internal Optimizer =
         | DistinctFrame
         | SortFrame of SortKey list * Schema
         | LimitFrame of int * int
-        | ProjectFrame of SelectItem list * Schema * Expr list
+        /// 射影。第2・3要素は `*` の展開用（論理 = FROM 順）と評価用（実際の行レイアウト）のスキーマ。
+        | ProjectFrame of SelectItem list * Schema * Schema * Expr list
         /// 派生テーブルの内側を評価し終えた。外側の実行文脈へ戻す。
         | DerivedFrame of ExecContext
         /// 左部分木を評価し終えた Join。次に右部分木を評価する。
@@ -494,7 +495,11 @@ module internal Optimizer =
             | Logical.Project(items, child) ->
                 let childSchema = outputOf ctx inSchema child
                 let groupBy = groupByOf child
-                run ctx (ProjectFrame(items, childSchema, groupBy) :: frames) (EvalNode(child, inSchema, hint))
+
+                run
+                    ctx
+                    (ProjectFrame(items, inSchema, childSchema, groupBy) :: frames)
+                    (EvalNode(child, inSchema, hint))
         | ApplyOp op ->
             match frames with
             | [] -> ret op
@@ -518,8 +523,8 @@ module internal Optimizer =
                     let skipped = if offset > 0 then Op.skip offset op else op
                     let limited = if limit >= 0 then Op.take limit skipped else skipped
                     run ctx rest (ApplyOp limited)
-                | ProjectFrame(items, childSchema, groupBy) ->
-                    run ctx rest (ApplyOp(Ops.project childSchema groupBy items op))
+                | ProjectFrame(items, expandSchema, evalSchema, groupBy) ->
+                    run ctx rest (ApplyOp(Ops.project expandSchema evalSchema groupBy items op))
                 | JoinIndexLeftFrame frame ->
                     match execIndexJoin frame op with
                     | Ok joined -> run ctx rest (ApplyOp joined)

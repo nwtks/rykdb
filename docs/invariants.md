@@ -62,6 +62,8 @@ F# の型システムでは表現できないため、
 | INV-28 | 索引エントリの値は空。索引列 + 主キーはキーから復号し、非被覆列は PK lookup  | `RowKey.indexKey` / `opOfIndexScan` / `indexAccessMasks` / `ExecContext.fetchMissing` + キー復号 golden / 索引 fetch テスト                                                                                                            | ✅ 完了 |
 | INV-29 | 退避した一時ファイルは必ず閉じ、読み切ったら消す                             | `Spill.openSink` / `closeSink` / `foldRun`（閉じて消す）/ `foldRunKeep`（閉じるだけ）/ `reopen`（消す）/ `reopenKeep`（消さない）+ `SpillTests` / `OpsTests` / `OpsJoinTests` の「一時ファイルが残らない」検査                         | ✅ 完了 |
 | INV-30 | 外部キーは参照先の主キーへ解決し、DML/DDL は即時 RESTRICT で守る             | `ForeignKey.resolveCreatedTable` / `checkChildRow` / `checkParentDelete` / `Catalog.referencingForeignKeys` + `ForeignKeyTests` の検査                                                                                                 | ✅ 完了 |
+| INV-31 | INL は右部分木の制約を落とさない                                             | `Analyzer.indexableRight`（`PkLookup` / `IndexLookup` を除外）+ `AnalyzerTests` / `SqlReferenceTests` の回帰テスト                                                                                                                     | ✅ 完了 |
+| INV-32 | 射影の `*` は論理スキーマ（FROM 順）で展開し、評価は実レイアウトで行う       | `Ops.project` の `expandSchema` / `evalSchema` + `SqlReference: JOIN の並べ替え後も SELECT * は FROM 順の列を返す`                                                                                                                     | ✅ 完了 |
 
 ---
 
@@ -635,6 +637,32 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `ForeignKey: 外部キーの列は DROP COLUMN できない`
   - `ForeignKey: 親の列名を RENAME すると子の定義が追随する`
   - `ForeignKey: ALTER TABLE ADD COLUMN で REFERENCES は指定できない`
+
+### INV-31 インデックス入れ子ループは右部分木の制約を落とさない
+
+- 宣言: INL は右部分木を実行しないため、右の `Scan` に含まれる制約を residual で再評価できなければならない。
+- 根拠: `Analyzer.impliedByScan` は `PkLookup` / `IndexLookup` が保証する等値述語を `Filter` から除く。
+  吸収済み述語は `ScanMethod` の中にあり、`keys.Residual` には入らない。
+  そのまま INL を選ぶと、右テーブルだけの述語が静かに消える。
+- 担保: `Analyzer.indexableRight` は `PkLookup` / `IndexLookup` を INL の右にしない
+  （ハッシュ / マージ / 入れ子ループへ回し、右部分木を実行する）。
+  `RangeScan` / `IndexRangeScan` は範囲述語が `Filter` に残るので対象にできる。
+- 回帰テスト:
+  - `Analyzer.chooseJoinAlgorithm: 右の PkLookup / IndexLookup は IndexNestedLoop にしない`
+  - `SqlReference: インデックス入れ子ループは右の吸収済み述語を落とさない`
+- 将来: 吸収済み等値を `ScanMethod` とテーブル / 索引定義から `Expr` に再構成して residual へ加え、
+  右マスクにその列を含めれば INL を維持できる。
+
+### INV-32 射影の `*` は論理スキーマで展開する
+
+- 宣言: `SELECT *` / `t.*` の列順は `FROM` 順で、JOIN の物理レイアウトに依存しない。
+- 根拠: 結合順の並べ替えで `outputOf` は変わるが、ヘッダは `plan.Input`（FROM 順）で作られる。
+  展開と評価で同じ実レイアウトを使うと、ヘッダと値がずれる。
+- 担保: `Optimizer` の `ProjectFrame` が展開用 `inSchema` と評価用 `outputOf` を別に持ち、
+  `Ops.project` が `SelectProjection.create expandSchema` と `Eval.prepare evalSchema` を使う。
+- 回帰テスト:
+  - `SqlReference: JOIN の並べ替え後も SELECT * は FROM 順の列を返す`
+    （`SELECT *` / 派生テーブル / `INSERT ... SELECT *`）
 
 ---
 

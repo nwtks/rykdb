@@ -39,14 +39,14 @@ flowchart TB
     HOST["DatabaseHost.fs<br/>DatabaseHost<br/>store の open/close・共有 committed state・採番・fsync"]
     SESS --> HOST
 
-    subgraph EX["実行"]
+    subgraph EX["実行層"]
         EN["Engine.fs<br/>文の実行（Ddl / Engine）"]
         PL["Binder.fs / Analyzer.fs<br/>PlanBuilder / Optimizer / Plan<br/>束縛 → 論理代数 → Op"]
         OPS["Ops.fs / OpsJoin.fs / ExecContext.fs<br/>pull 演算子と走査"]
         VSET["ValueSet.fs<br/>IN サブクエリの値集合"]
     end
 
-    subgraph ROW["行ストア"]
+    subgraph ROW["行ストア層"]
         RS["RowStore.fs<br/>単一 LSM + keyspace 接頭辞"]
         CAT["TableSchema.fs / Catalog.fs<br/>スキーマ定義の永続化"]
     end
@@ -55,7 +55,7 @@ flowchart TB
 
     MVCC["Transactions.fs<br/>SeqNo 採番・snapshot・衝突検出"]
 
-    subgraph ST["ストレージ（1 DB = LSM ツリー 1本）"]
+    subgraph ST["ストレージ層（1 DB = LSM ツリー 1本）"]
         SE["StorageEngine.fs"]
         MEM["Memtable.fs<br/>永続 Treap"]
         SST["Sstable.fs / SstableFormat.fs"]
@@ -639,6 +639,10 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
    索引は結合キーが**先頭から連続した列**と一致すれば足りる
    （`(k, g)` 索引は `k` だけの結合にも使える。前置 lookup になる）。
    右は左行ごとに `ExecContext.byPrimaryKeyMasked` / `ExecContext.byIndexMasked` で引く。
+   ただし右の走査方法が `PkLookup` / `IndexLookup` のときは使わない。
+   これらの走査は等値述語を吸収して `Filter` から消すため、
+   右部分木を実行しない INL では述語を再評価できない（`Analyzer.indexableRight`）。
+   `RangeScan` / `IndexRangeScan` は範囲述語が `Filter` に残るので使える。
 2. **マージ結合**（`MergeJoin`）:
    等値キーがあり、左右の走査が**結合キー順**のとき。
    `Analyzer.scanOrder` が `SeqScan` / `RangeScan`（主キー列）、
@@ -650,7 +654,8 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
    両側が 1行（`PkLookup` / `Values`）なら任意の順序でよい。
    右側を materialize せず、両側を 1行ずつ流す（`OpsJoin.innerJoinMerge` / `OpsJoin.leftJoinMerge`）。
 3. **ハッシュ結合**（`HashJoin`）:
-   等値キーがあり、上記以外。右側を `Dictionary<SqlValue array, ...>` のハッシュ表にする。
+   等値キーがあり、上記以外。
+   右側を**順序保持符号化のバイト列**をキーにしたハッシュ表にする。
 4. **入れ子ループ**（`NestedLoop`）:
    等値キーがない（非等値・複合条件）。
 
@@ -702,6 +707,9 @@ WHERE に「列 = 定数」の等価述語があるか（AND を平坦化して�
   結合順を並べ替えると「入力スキーマから右テーブルを除いた列順」と実際の行の並びが一致しないため、
   列位置で行を読む `OpsJoin` へは必ず実際のレイアウトを渡す（[`gotchas.md`](gotchas.md) §3.2）。
 - `Filter` / `Sort` / `Project` は子の**出力スキーマ**（`outputOf`）を求めてから掛ける。
+  `Project` の `*` / `t.*` は**論理スキーマ**（`inSchema` = FROM 順）で展開し、
+  行の評価は実際のレイアウト（`outputOf`）で行う。
+  結合順を並べ替えても `SELECT *` の列順は FROM 順に保たれる（`Ops.project`）。
   集約の後は行の並びが「groupBy の値 + 各集約の結果」に変わるため、
   「入力スキーマ（テーブル定義）」と取り違えると `SELECT SUM(age)` が引数を評価できず `NULL` になる。
 - `Having` は集約後の行を**位置で読み替えて**から評価する（`Ops.havingFilter`）。

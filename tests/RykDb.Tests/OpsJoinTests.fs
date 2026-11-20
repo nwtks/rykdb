@@ -651,6 +651,39 @@ let ``結合: マージの LEFT JOIN もグループを退避すると NULL 拡�
         assertNoLeftovers dir)
 
 [<Fact>]
+let ``結合: マージ結合のグループ退避は作成直後に ScanScope へ登録する`` () =
+    withDir "join-merge-group-scope" (fun dir ->
+        let scope = ScanScope()
+
+        let budget =
+            { tightBudget dir 1L with
+                Scope = Some scope
+            }
+
+        let left = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 1L |] |]
+
+        // 1行目だけ返してから Error になる右入力。
+        // 右グループの取り出しで失敗するため、左グループの run はまだ開かれない。
+        let right =
+            let rec rowsFrom i =
+                Op.compute (fun () ->
+                    if i = 0 then
+                        OpStep.OpRow([| SqlValue.Int 1L |], rowsFrom 1)
+                    else
+                        OpStep.OpError(DbError.internalError "right error"))
+
+            rowsFrom 0
+
+        let joined =
+            ok (OpsJoin.innerJoinMerge budget leftSchema left [| 0 |] rightSchema right [| 0 |] None)
+
+        expectError "右入力のエラーが握り潰されています" (Op.toArray joined)
+
+        // 消費側がエラーで止まったときの Engine の DisposeAll 相当。
+        scope.DisposeAll()
+        assertNoLeftovers dir)
+
+[<Fact>]
 let ``結合: マージ結合は左が先に尽きても右を読み切る（退避ファイルの後始末）`` () =
     let drained = ref false
     let rightRows = [| for i in 1..20 -> [| SqlValue.Int(int64 i) |] |]

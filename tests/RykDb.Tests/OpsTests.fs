@@ -471,7 +471,7 @@ let ``集約: GROUP BY 式の評価失敗は Error`` () =
 [<Fact>]
 let ``project: 項目が空なら入力をそのまま返す`` () =
     let op = opOfRows [ row [ SqlValue.Int 1L ] ]
-    let rows = ok (Op.toArray (Ops.project schema2 [] [] op))
+    let rows = ok (Op.toArray (Ops.project schema2 schema2 [] [] op))
     Assert.Equal<int>(1, rows.Length)
     Assert.Equal<int64>(1L, asInt rows.[0].[0])
 
