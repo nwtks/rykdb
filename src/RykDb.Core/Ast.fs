@@ -262,8 +262,8 @@ and internal ColumnDefinition =
     {
         Name: string
         DataType: DataType
-        /// 宣言された型引数（`VARCHAR(32)` の 32 など）。
-        /// RykDb は長さ制限に使わないため、カタログには保存しない（再オープン後は空）。
+        /// 宣言された型引数（`DECIMAL(10, 2)` の 10 と 2 など）。
+        /// RykDb は精度・位取りに使わないため、カタログには保存しない（再オープン後は空）。
         TypeArguments: (string * int) list
         Constraint: ColumnConstraint
     }

@@ -32,7 +32,6 @@ module internal ParserExpr =
             "REAL", DataType.Real
             "DOUBLE", DataType.Real
             "TEXT", DataType.Text
-            "VARCHAR", DataType.Text
             "BLOB", DataType.Blob
             "BOOLEAN", DataType.Boolean
             "BOOL", DataType.Boolean

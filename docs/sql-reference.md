@@ -204,7 +204,7 @@ SQL が「1文字」として数える単位は **Unicode コードポイント*
 | `INTEGER`   | `INTEGER` `INT` `BIGINT` | 64 bit 符号付き整数    | `42`                           |
 | `REAL`      | `REAL` `DOUBLE`          | IEEE 754 double        | `1.5`                          |
 | `DECIMAL`   | `DECIMAL` `NUMERIC`      | 固定小数点数           | `150.25`                       |
-| `TEXT`      | `TEXT` `VARCHAR`         | UTF-16 文字列          | `'abc'`                        |
+| `TEXT`      | `TEXT`                   | UTF-16 文字列          | `'abc'`                        |
 | `BLOB`      | `BLOB`                   | バイト列               | `X'0A1B'`                      |
 | `DATE`      | `DATE`                   | 日付（UTC）            | `2024-01-15`                   |
 | `TIMESTAMP` | `TIMESTAMP` `DATETIME`   | UTC オフセット付き時刻 | `2024-01-15T10:30:00.0000000Z` |
@@ -212,8 +212,8 @@ SQL が「1文字」として数える単位は **Unicode コードポイント*
 
 ### 型引数
 
-`VARCHAR(32)` の `(32)` は**読み取られるだけ**で、切り詰めも検証も行わない。
-`VARCHAR(1)` に 100 文字を入れても保存される。
+`DECIMAL(10, 2)` の `(10, 2)` は**読み取られるだけ**で、丸めも検証も行わない。
+`DECIMAL(3, 1)` に `12345.6789` を入れても丸められずに保存される。
 
 ### 値を列の型へ自動変換する（`SqlValue.coerce`）
 
@@ -511,7 +511,7 @@ HAVING COUNT(*) > 1
   ただし空の引数リスト（`LENGTH()`）は関数の前に構文エラーになる。
 - `ROUND` は `INTEGER` / `REAL` / `DECIMAL` を受け付け、同じ型を返す。
   文字列など数値以外を渡すと `ROUND は数値を受け付けますが 'abc' です` になる。
-- `CAST` は `expr AS 型` の形で、型引数（`VARCHAR(10)` の `(10)`）は読み飛ばす。
+- `CAST` は `expr AS 型` の形で、型引数（`DECIMAL(10, 2)` の `(10, 2)`）は読み飛ばす。
   `TEXT` から `INTEGER` / `REAL` / `DECIMAL` / `BOOLEAN` への変換は CAST 専用の規則で行う
   （`CAST('42' AS INTEGER)` は `42`）。
   変換できない値は `TypeError`。
@@ -1138,7 +1138,7 @@ CREATE TABLE [IF NOT EXISTS] テーブル名 (
 CREATE TABLE people (
   id      INTEGER PRIMARY KEY,          -- 列レベル PRIMARY KEY（NOT NULL も付く）
   name    TEXT NOT NULL,
-  email   VARCHAR(255) UNIQUE,          -- 長さ 255 は宣言されるだけ
+  email   TEXT UNIQUE,
   age     INTEGER DEFAULT 0,
   created TIMESTAMP DEFAULT '2024-01-01T00:00:00Z',
   UNIQUE (name, email)                  -- テーブルレベル制約
@@ -1519,7 +1519,7 @@ PlanBuilder / ExecContext / Eval が返す `SyntaxError`
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 索引                | 単一列・複合索引の前置等値（1列以上）、複合索引の前置等値 + 次列の範囲、`LIKE 'prefix%'` の範囲。索引値は空で、索引列 + 主キーはキーから復号する。被覆外の列は行ごとに主キー lookup する                  |
 | `LIMIT` / `OFFSET`  | 0 以上の定数式のみ（行ごとの列参照・負数はエラー）。`LIMIT 0` は「0行」                                                                                                                                   |
-| 型引数              | `VARCHAR(32)` は宣言のみ。切り詰めなし                                                                                                                                                                    |
+| 型引数              | `DECIMAL(10, 2)` は宣言のみ。丸めなし                                                                                                                                                                     |
 | ソート              | 外部マージ（一時ファイルへ退避）。受け皿（既定 64MiB）に収まる分はメモリのみ                                                                                                                              |
 | `SELECT DISTINCT`   | 符号化キーの集合。作業メモリ（既定 256MiB）を超えた分は一時ファイルへ退避し、最初に現れた順を保って完走する                                                                                               |
 | `JOIN`              | 入れ子ループ / ハッシュ結合は右側を、マージ結合は同じキーの行だけを保持。作業メモリ換算 256MiB を超えた分は一時ファイルへ退避（ハッシュ結合は両側をキーハッシュでパーティション分割して外部ハッシュ結合） |

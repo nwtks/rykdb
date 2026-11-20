@@ -310,10 +310,10 @@ let ``Parser: 構文エラーは位置つき DbError`` () =
 let ``Parser: 型引数を読める`` () =
     let ct =
         parseCreateTableOk
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, name VARCHAR(32), price DECIMAL(10, 2), note VARCHAR(nope))"
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, price DECIMAL(10, 2), rate DECIMAL(5), note DECIMAL(nope))"
 
-    Assert.Equal<(string * int) list>([ ("n", 32) ], ct.Columns.[1].TypeArguments)
-    Assert.Equal<(string * int) list>([ "n", 10; "n", 2 ], ct.Columns.[2].TypeArguments)
+    Assert.Equal<(string * int) list>([ "n", 10; "n", 2 ], ct.Columns.[1].TypeArguments)
+    Assert.Equal<(string * int) list>([ ("n", 5) ], ct.Columns.[2].TypeArguments)
     // 整数リテラルでない引数は落とす
     Assert.Empty(ct.Columns.[3].TypeArguments)
 
@@ -449,7 +449,7 @@ let ``Parser: 文法エラーの諸形`` () =
     expectErrorKind
         ErrorKind.SyntaxError
         "型引数の式が不正"
-        (parseStatement "CREATE TABLE t (a INTEGER PRIMARY KEY, v VARCHAR()")
+        (parseStatement "CREATE TABLE t (a INTEGER PRIMARY KEY, v DECIMAL()")
     // 式の細かいエラー
     expectErrorKind ErrorKind.SyntaxError "関数引数の後続が不正" (parseStatement "SELECT f(a,) FROM t")
     expectErrorKind ErrorKind.SyntaxError "IN の ( が無い" (parseStatement "SELECT * FROM t WHERE a IN 1")

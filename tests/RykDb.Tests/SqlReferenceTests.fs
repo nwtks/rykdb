@@ -181,17 +181,17 @@ let ``SqlReference: 複合索引の全列等値で行を引ける`` () =
         Assert.Equal<int>(2, prefix.Rows.Length))
 
 [<Fact>]
-let ``SqlReference: VARCHAR(32) は再オープン後も使える`` () =
-    withDir "varchar-reopen" (fun dir ->
+let ``SqlReference: DECIMAL(10, 2) は再オープン後も使える`` () =
+    withDir "typeargs-reopen" (fun dir ->
         let db0 = openDb dir
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(32))"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 'abc')"
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v DECIMAL(10, 2))"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 1.5)"
         ok (db2.Close())
 
-        // 型引数はカタログに保存されないが、列型（TEXT）と値はそのまま使える
+        // 型引数はカタログに保存されないが、列型（DECIMAL）と値はそのまま使える
         let db3 = openDb dir
         let _, r = ok (execSql db3 "SELECT v FROM t")
-        Assert.Equal<string>("abc", asText r.Rows.[0].[0])
+        Assert.Equal<SqlValue>(SqlValue.Decimal 1.5M, r.Rows.[0].[0])
         ok (db3.Close()))
 
 [<Fact>]
@@ -2055,12 +2055,12 @@ let ``SqlReference: 数字から始まる識別子は受け付けない`` () =
 [<Fact>]
 let ``SqlReference: 型の別綴りはすべて受理される`` () =
     // §3: BOOLEAN / BOOL, INTEGER / INT / BIGINT, REAL / DOUBLE, DECIMAL / NUMERIC,
-    // TEXT / VARCHAR, DATE, TIMESTAMP / DATETIME, UUID。
+    // TEXT, DATE, TIMESTAMP / DATETIME, UUID。
     withSession "type-aliases" (fun db0 ->
         let db1 =
             exec
                 db0
-                "CREATE TABLE ty (id INTEGER PRIMARY KEY, a BOOL, b INT, c BIGINT, d DOUBLE, e NUMERIC, f VARCHAR(3), g DATETIME, h UUID, i BLOB, j DATE)"
+                "CREATE TABLE ty (id INTEGER PRIMARY KEY, a BOOL, b INT, c BIGINT, d DOUBLE, e NUMERIC, f TEXT, g DATETIME, h UUID, i BLOB, j DATE)"
 
         Assert.Equal<string list>([ "ty" ], ok (db1.TableNames()))
 
@@ -2076,22 +2076,27 @@ let ``SqlReference: 型の別綴りはすべて受理される`` () =
         Assert.Equal<DataType>(DataType.Uuid, ok (SqlValue.dataType rows.Rows.[0].[2])))
 
 [<Fact>]
-let ``SqlReference: VARCHAR(1) は値を切り詰めない`` () =
-    // §3: 型引数は読み取られるだけで、切り詰めも検証も行わない。
-    withSession "varchar-no-truncate" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s VARCHAR(1))"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 'abcdefghij')"
-        let _, rows = ok (execSql db2 "SELECT s FROM t")
-        Assert.Equal<string>("abcdefghij", asText rows.Rows.[0].[0]))
+let ``SqlReference: DECIMAL(3, 1) は値を丸めない`` () =
+    // §3: 型引数は読み取られるだけで、丸めも検証も行わない。
+    withSession "typeargs-no-round" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, n DECIMAL(3, 1))"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 12345.6789)"
+        let _, rows = ok (execSql db2 "SELECT n FROM t")
+        Assert.Equal<SqlValue>(SqlValue.Decimal 12345.6789M, rows.Rows.[0].[0]))
 
 [<Fact>]
-let ``SqlReference: CHAR は型名として受け付けない`` () =
-    // §3: TEXT の別綴りは VARCHAR のみ。
-    withSession "char-removed" (fun db0 ->
+let ``SqlReference: 未知の型名は受け付けない`` () =
+    // §3: 型の綴りは表のとおり。CHAR と VARCHAR は受け付けない。
+    withSession "unknown-type" (fun db0 ->
         expectErrorKind
             ErrorKind.SyntaxError
             "CHAR は未知の型"
-            (execSql db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, c CHAR(3))"))
+            (execSql db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, c CHAR(3))")
+
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "VARCHAR は未知の型"
+            (execSql db0 "CREATE TABLE u (id INTEGER PRIMARY KEY, v VARCHAR(3))"))
 
 [<Fact>]
 let ``SqlReference: INSERT の値式は列参照を含められない`` () =

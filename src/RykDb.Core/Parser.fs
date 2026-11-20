@@ -154,7 +154,7 @@ module internal Parser =
             return { Table = tbl; Where = whereE }, st
         }
 
-    /// VARCHAR(32) のような型引数を読む。
+    /// DECIMAL(10, 2) のような型引数を読む。
     let private parseTypeArguments (st: PState) =
         let rec loop acc st =
             match parseExprValue st with
