@@ -151,7 +151,10 @@ let ``Spill.openRun: 破損した run は CorruptionError`` () =
 [<Fact>]
 let ``Spill.spool: 存在しないディレクトリは IoError`` () =
     let missing =
-        System.IO.Path.Combine(System.IO.Path.GetTempPath(), sprintf "rykdb-missing-%d" System.DateTime.Now.Ticks)
+        System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            sprintf "rykdb-missing-%d-%s" System.DateTime.Now.Ticks (System.Guid.NewGuid().ToString "N")
+        )
 
     let budget =
         { MemoryBudget.Default with

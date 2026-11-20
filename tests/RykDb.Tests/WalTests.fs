@@ -94,7 +94,10 @@ let ``Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だ
 [<Fact>]
 let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
     let missing =
-        System.IO.Path.Combine(System.IO.Path.GetTempPath(), "rykdb-wal-missing-" + string System.DateTime.UtcNow.Ticks)
+        System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            sprintf "rykdb-wal-missing-%d-%s" System.DateTime.UtcNow.Ticks (System.Guid.NewGuid().ToString "N")
+        )
 
     Assert.Empty(Wal.walFiles missing)
 

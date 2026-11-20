@@ -69,7 +69,10 @@ let private validate (m: TransactionManager) =
 
 /// root の重複を避ける（xUnit はテストクラス単位で並列に走る）。
 let private freshRoot (tag: string) =
-    System.IO.Path.Combine(System.IO.Path.GetTempPath(), tag + "-" + string System.DateTime.UtcNow.Ticks)
+    System.IO.Path.Combine(
+        System.IO.Path.GetTempPath(),
+        sprintf "%s-%d-%s" tag System.DateTime.UtcNow.Ticks (System.Guid.NewGuid().ToString "N")
+    )
 
 [<Fact>]
 let ``Transaction.create: 空の transaction`` () =

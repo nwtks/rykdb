@@ -132,7 +132,10 @@ let oneShot (label: string) (op: Op) =
 /// 一意な一時ディレクトリを作る。
 let newDir (tag: string) =
     let dir =
-        System.IO.Path.Combine(System.IO.Path.GetTempPath(), sprintf "rykdb-%s-%d" tag System.DateTime.Now.Ticks)
+        System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            sprintf "rykdb-%s-%d-%s" tag System.DateTime.Now.Ticks (System.Guid.NewGuid().ToString "N")
+        )
 
     System.IO.Directory.CreateDirectory dir |> ignore
     dir

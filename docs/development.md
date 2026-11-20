@@ -130,7 +130,7 @@ dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"    # Server のみ
 - `withStore` / `withSession` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
   ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Session.OpenWithSync` を直接使って検証する。
 - 新しいファイルは `.fsproj` の Compile 順（= src のコンパイル順）に追加する。
-- 一時ディレクトリは `Path.GetTempPath()` + `Ticks`。
+- 一時ディレクトリは `Path.GetTempPath()` + `Ticks` + GUID（並列実行でも衝突しない名前にする）。
   `try/finally` で必ず削除する。
 - `TestHealthTests.fs` に**「Fact が 0件のテストモジュールが無い」ことを検出するテスト**がある
   （リフレクションで数える）。
