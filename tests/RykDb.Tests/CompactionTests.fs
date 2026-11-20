@@ -546,3 +546,52 @@ let ``Compaction.compact: Smallest > Largest の入力は CorruptionError にな
 
         let r = Compaction.compact dir version options 0UL 100L (openBackRaw dir)
         expectErrorKind ErrorKind.CorruptionError "壊れたキー範囲は CorruptionError になる" r)
+
+[<Fact>]
+let ``Compaction.compactWith: 停止したら出力を残さず入力の走査を閉じる`` () =
+    withDir "comp-stop" (fun dir ->
+        let files = [ for i in 1..3 -> mkSst dir (int64 (10 + i)) 0 [ entryOf i ] ]
+        let version = files |> List.fold (fun v f -> Version.addFile f v) Version.Empty
+
+        // 2グループ目で 1ファイル出力させ、3回目の判定で停止する。
+        let options =
+            { pickFirstLevel with
+                L0CompactionTrigger = 3
+                OutputFileTargetBytes = 1L
+            }
+
+        let checks = ref 0
+
+        let shouldStop () =
+            checks.Value <- checks.Value + 1
+            checks.Value > 2
+
+        let result, _ =
+            Compaction.compactWith dir version options 0UL (openBackRaw dir) (fun () -> 900L) shouldStop
+            |> ok
+
+        Assert.Equal(3, checks.Value)
+        // 停止した回は何も install しない。
+        Assert.Empty result.Added
+        Assert.Empty result.Removed
+
+        // 停止までに書いた出力は消え、入力だけが残る。
+        let remaining =
+            System.IO.Directory.GetFiles(dir, "*.sst")
+            |> Array.map System.IO.Path.GetFileName
+            |> Array.sort
+
+        Assert.Equal<string array>([| "000011.sst"; "000012.sst"; "000013.sst" |], remaining)
+
+        // 入力の走査を閉じていないと共有違反になる
+        // （Linux は開いたままでも削除できるため、この検査が無いと Windows だけで露見する）。
+        for num in [ 11L; 12L; 13L ] do
+            use _ =
+                new System.IO.FileStream(
+                    FileMetaData.path dir num,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.ReadWrite,
+                    System.IO.FileShare.None
+                )
+
+            ())

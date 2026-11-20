@@ -196,6 +196,12 @@ let ``background compaction: close は進行中の compaction を停止して再
             release.Set()
             Assert.True(closing.Wait 10000, "close が完了しません")
 
+            // 停止した compaction が入力のハンドルを残していない
+            // （Linux は開いたままでも再オープンできるため、この検査が無いと Windows だけで露見する）。
+            for path in Directory.GetFiles(dir, "*.sst") do
+                use _ = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)
+                ()
+
             let reopened = ok (RowStore.openStore dir)
             Assert.True((ok (RowStore.getAtMasked "t" (intKey 1) None [||] reopened)).IsSome)
             ok (RowStore.close reopened) |> ignore

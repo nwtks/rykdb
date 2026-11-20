@@ -271,6 +271,12 @@ flush成功後にcompactionが失敗したら、flush後のengineを返す。
 flush失敗時だけpre-flush engineを返す。
 WAL commit成功後に`Error`を返さない。
 
+### 4.16 compactionの停止でも入力の走査を閉じる
+
+`pump`は停止時に途中のmergeを持ち帰らない。
+`runPump`の`finally`で`SstMerge.dispose`し、出力の削除と入力ハンドルの解放を両方行う。
+片方だけだとWindowsで削除・renameが共有違反になる。
+
 ---
 
 ## 5. MVCC・transaction

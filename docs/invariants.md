@@ -85,6 +85,7 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
   - `SstScan: one-shot ガードは同じ値の 2回目の next を検出する`
   - `SstScan: filter / toArray はソースを 1回だけ消費する`
   - `RowStore: compaction 失敗で中断した走査は入力 SSTable のハンドルを残さない`
+  - `Compaction.compactWith: 停止したら出力を残さず入力の走査を閉じる`
 
 ### INV-02 返した行は DB 内部と独立
 

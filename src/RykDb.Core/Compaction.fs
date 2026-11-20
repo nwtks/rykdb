@@ -355,11 +355,10 @@ module internal Compaction =
         let runPump plan allInputs merge =
             let dropTombstones = plan.OutputLevel >= options.DropTombstonesBelowLevel
 
-            match pump supply plan allInputs dropTombstones merge [] 0L [] 0 0 with
-            | Ok result -> ret result
-            | Error e ->
+            try
+                pump supply plan allInputs dropTombstones merge [] 0L [] 0 0
+            finally
                 SstMerge.dispose merge
-                err e
 
         let compactPlan plan =
             result {
@@ -376,6 +375,8 @@ module internal Compaction =
 
     /// バックグラウンド compaction。
     /// ファイル番号は [allocateFileNumber] から取得する。
+    /// `shouldStop` が true を返したら、作成済みの出力を削除し、
+    /// 入力の走査を閉じて空の結果を返す（MANIFEST には何も書かない）。
     let compactWith
         (dir: string)
         (version: Version)

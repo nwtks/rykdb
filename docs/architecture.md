@@ -1750,6 +1750,7 @@ L0 が増えて読み取りのコスト（read amplification）と引き換え�
 - flush / compaction の失敗は commit を失敗させない（§9.2 / [`gotchas.md`](gotchas.md) §4.15）。
 - close は cancel → worker 起床（無条件 signal）→ worker join → engine refresh → flush → WAL fsync → WAL 削除 → ProcessLock 解放の順。
   出力ファイル境界で `shouldStop` を確認するため、進行中の merge は途中で止められる。
+  停止した回は作成済みの出力を削除し、入力の走査（FileStream）を閉じてから空の結果を返す。
 - クラッシュ復旧の不変条件は同期版と同じ
   （出力 SST を fsync → MANIFEST → 入力 retire → 実削除、未参照ファイルは `.orphans/` へ退避）。
 
