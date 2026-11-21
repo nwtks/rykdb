@@ -96,8 +96,8 @@ module internal Dml =
                         >>= fun oldKey ->
                             keyFor newValue
                             |> Result.map (fun newKey ->
-                                if oldKey = newKey then
-                                    Transaction.put space newKey emptyIndexValue txn
+                                if Bytes.compare oldKey newKey = 0 then
+                                    txn
                                 else
                                     let removed = Transaction.remove space oldKey txn
                                     Transaction.put space newKey emptyIndexValue removed))
@@ -117,7 +117,8 @@ module internal Dml =
         if List.isEmpty slots then
             rows
         else
-            let slotArr = slots |> List.sortBy fst |> List.toArray
+            let slotArr =
+                slots |> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b) |> List.toArray
 
             let rec emitRemaining i =
                 if i >= slotArr.Length then
@@ -467,7 +468,7 @@ module internal Dml =
                 |> List.filter (fun (key, _) -> inKeyRange startBytes endBytes key)
 
             let mask =
-                if endBytes.IsNone && List.isEmpty slots then
+                if List.isEmpty slots then
                     mask
                 else
                     widenMask mask schema.PrimaryKey
@@ -483,21 +484,10 @@ module internal Dml =
             let! rows = scanPrimaryKeyRange startBytes endBytes (storeLimitFor limit slots)
             let merged = overlayRows (RowKey.primaryV schema) slots rows
 
-            let filtered =
-                match endBytes with
-                | None -> merged
-                | Some eb ->
-                    Op.filter
-                        (fun row ->
-                            match RowKey.primaryV schema row with
-                            | DbErr e -> DbErr e
-                            | DbOk key -> DbOk(Bytes.compare key eb <= 0))
-                        merged
-
             if limit > 0 then
-                return Op.take limit filtered
+                return Op.take limit merged
             else
-                return filtered
+                return merged
         }
 
     /// 索引の値に一致する全行を引く（txn の書き込みを含む）。

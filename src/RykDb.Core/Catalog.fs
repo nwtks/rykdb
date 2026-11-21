@@ -349,13 +349,24 @@ module internal Catalog =
 
     /// カタログを保存する（消えた定義は tombstone で落とす）。
     /// previous は保存前のカタログ（store にあった内容）。
-    /// 消えた定義は「previous にあり catalog にないキー」として差分だけで求める
-    /// （カタログ keyspace の全走査をしない）。
+    /// 書き込みは「前回から変わった定義」と「消えた定義」の差分だけにする。
+    /// 定義の比較は保存形（エンコード後）のバイト列で行う
+    /// （`Expr` は構造比較できないため、カタログのレコードどうしは比べられない）。
     /// 書き込みは 1バッチにまとめる
     /// （tombstone も同じバッチに含めるので WAL の fsync は 1回で済む）。
     let save (store: RowStore) (previous: Catalog) (catalog: Catalog) =
         let bytesEqual (a: byte array) (b: byte array) =
             a.Length = b.Length && Array.forall2 (=) a b
+
+        let changedTable (t: TableDefinition) =
+            match previous.Tables |> List.tryFind (fun p -> eqName p.Name t.Name) with
+            | Some p -> not (bytesEqual (encodeTable p) (encodeTable t))
+            | None -> true
+
+        let changedIndex (i: IndexDefinition) =
+            match previous.Indexes |> List.tryFind (fun p -> eqName p.IndexName i.IndexName) with
+            | Some p -> not (bytesEqual (encodeIndex p) (encodeIndex i))
+            | None -> true
 
         let staleKeys =
             let wanted =
@@ -372,8 +383,13 @@ module internal Catalog =
         result {
             let! e = RowStore.ensure store
             let seq0 = e.NextSeqNo
-            let tableBatches, seq1 = numberList tableBatch catalog.Tables seq0 []
-            let indexBatches, seq2 = numberList indexBatch catalog.Indexes seq1 []
+
+            let tableBatches, seq1 =
+                numberList tableBatch (catalog.Tables |> List.filter changedTable) seq0 []
+
+            let indexBatches, seq2 =
+                numberList indexBatch (catalog.Indexes |> List.filter changedIndex) seq1 []
+
             let deleteBatches, _ = numberList deleteBatch staleKeys seq2 []
 
             let! updated =

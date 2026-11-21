@@ -188,6 +188,11 @@ module internal ExecState =
 
     /// カタログを保存し、保存後の Store と新しい Catalog で state を作り直す。
     /// （CREATE / DROP すべてが使う「保存 → state 更新」の定型）
+    /// <remarks>
+    /// カタログのエントリは Transaction を介さず `Catalog.save` が engine の `NextSeqNo` から採番する。
+    /// そのままでは Manager の採番がカタログより前を指し、データとカタログで SeqNo が重複する。
+    /// 保存後に Manager を engine の高水位まで進め、snapshot もそれに追随させる。
+    /// </remarks>
     let private saved (next: Catalog) (state: ExecState) =
         result {
             let! store = Catalog.save state.Committed.Store state.Committed.Catalog next
@@ -198,6 +203,7 @@ module internal ExecState =
                         { state.Committed with
                             Store = store
                             Catalog = next
+                            Manager = TransactionManager.synchronize (RowStore.lastSeqNo store) state.Committed.Manager
                         }
                 }
         }

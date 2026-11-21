@@ -225,6 +225,24 @@ module internal TransactionManager =
             MaxTransactionBytes = Transaction.DefaultLimitBytes
         }
 
+    /// engine の高水位（最後に採番された SeqNo）に Manager を合わせる。
+    /// <remarks>
+    /// 失敗した DDL の後始末のように、Manager を経由せず engine へ書かれた SeqNo があっても
+    /// 次の採番がそれを巻き戻さないようにする
+    /// （巻き戻すと同じキーに同じ SeqNo の版ができ、可視性と GC が曖昧になる）。
+    /// </remarks>
+    let synchronize (lastSeq: uint64) (manager: TransactionManager) =
+        let next =
+            if lastSeq = System.UInt64.MaxValue then
+                lastSeq
+            else
+                lastSeq + 1UL
+
+        { manager with
+            NextSeqNo = max manager.NextSeqNo next
+            LastCommitSeqNo = max manager.LastCommitSeqNo lastSeq
+        }
+
     /// 指定した上限で transaction を始める。
     let beginTxnWithLimit (limit: int64 option) (manager: TransactionManager) =
         let snap =

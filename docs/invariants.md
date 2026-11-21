@@ -143,6 +143,8 @@ transaction manager は次の関係を常に満たす。
 - `Active` の `TxnId` は map のキーと一致し、`NextTxnId` より小さい
 - `Active` の snapshot は `LastCommitSeqNo` 以下
 - `LastCommitted.SeqNo` は `0 < seq <= LastCommitSeqNo` かつ `seq < NextSeqNo`
+- 書き込みの採番は engine の高水位（`RowStore.lastSeqNo`）より後ろから行う
+  （カタログ保存や失敗した DDL の後始末は Manager を経由せず engine へ書くため）
 
 検証は `TransactionsTests.fs` 内の private `validate` が担当する。
 本番では公開しない。
@@ -553,6 +555,7 @@ DMLは即時RESTRICTを適用する。
 - `ForeignKey.resolveCreatedTable`で型、主キーとの列数・順序、列の存在を検証する。
 - `ForeignKey.checkChildRow`をINSERT、INSERT ... SELECT、UPDATEが呼ぶ。
 - `ForeignKey.checkParentDelete`をDELETEが呼ぶ。
+  子スキーマ、列位置、maskの準備は`ForeignKey.prepareParentDeleteChecks`が文単位で1回だけ行う。
 - 子テーブルの探索は、外部キー列から始まる索引、子主キー、全走査の順で行う。
 - DROP TABLEは参照先を持つテーブルを拒否する。
 - DROP COLUMNは外部キーに使われる子・親の列を拒否する。

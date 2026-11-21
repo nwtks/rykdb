@@ -180,6 +180,43 @@ let ``Catalog.save: 消えた定義は差分から tombstone で落ちる`` () =
         Assert.Empty loaded.Tables)
 
 [<Fact>]
+let ``Catalog.save: 変わっていない定義は書き直さない`` () =
+    withStore "cat-diff" (fun store ->
+        let people = Catalog.toDefinition peopleSchema
+        let orders = Catalog.toDefinition ordersSchema
+
+        let seqOf (name: string) (store: RowStore) =
+            let key = System.Text.Encoding.UTF8.GetBytes("table:" + name)
+
+            RowStore.scan Keyspace.CatalogKeyspace [||] 0 store
+            |> ok
+            |> SstScan.toArray
+            |> ok
+            |> Array.tryPick (fun e -> if e.Key = key then Some e.SeqNo else None)
+
+        let c1 = Catalog.Empty |> Catalog.addTable people
+        let store = ok (Catalog.save store Catalog.Empty c1)
+        let peopleSeq = expectSome "people の定義がありません" (seqOf "people" store)
+
+        // 別のテーブルを足しても、変わっていない people は書き直さない（SeqNo が進まない）。
+        let c2 = Catalog.addTable orders c1
+        let store = ok (Catalog.save store c1 c2)
+        Assert.Equal<uint64>(peopleSeq, expectSome "people の定義がありません" (seqOf "people" store))
+        Assert.True((seqOf "orders" store).IsSome)
+
+        // 定義が変われば書き直す。
+        let renamed =
+            { people with
+                Columns =
+                    people.Columns
+                    |> List.map (fun c -> if c.Name = "age" then { c with Name = "years" } else c)
+            }
+
+        let c3 = Catalog.addTable renamed c2
+        let store = ok (Catalog.save store c2 c3)
+        Assert.NotEqual<uint64>(peopleSeq, expectSome "people の定義がありません" (seqOf "people" store)))
+
+[<Fact>]
 let ``Catalog.load: 未知のキーや不正な値は読み飛ばす`` () =
     withStore "cat-junk" (fun store ->
         let utf8 (s: string) = System.Text.Encoding.UTF8.GetBytes s

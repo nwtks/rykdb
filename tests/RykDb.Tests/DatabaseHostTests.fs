@@ -274,6 +274,38 @@ let ``DatabaseHost: Dispose でも transaction の登録が外れる`` () =
         Assert.True((runtime.OldestExcept(root, None)).IsNone))
 
 [<Fact>]
+let ``DatabaseHost: DDL のカタログ保存後も Manager の採番は保存済み SeqNo の後ろになる`` () =
+    withDbHost "ddl-seq" (fun host session ->
+        // テーブル + 暗黙 UNIQUE 索引でカタログに 2エントリ書く。
+        let session = exec session "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)"
+
+        let committed = host.Committed
+        let lastSeq = RowStore.lastSeqNo committed.Store
+
+        // カタログは Transaction を介さず採番するが、Manager は保存済み SeqNo に追随する
+        // （追随しないと次の commit がカタログと同じ SeqNo を再利用する）。
+        Assert.True(lastSeq > 0UL)
+        Assert.Equal<uint64>(lastSeq, committed.Manager.LastCommitSeqNo)
+        Assert.Equal<uint64>(lastSeq + 1UL, committed.Manager.NextSeqNo)
+
+        // データを書いても SeqNo は単調に増え、Manager と一致し続ける。
+        let session = exec session "INSERT INTO t VALUES (1, 'a')"
+        let committed = host.Committed
+        let lastSeq2 = RowStore.lastSeqNo committed.Store
+
+        Assert.True(lastSeq2 > lastSeq)
+        Assert.Equal<uint64>(lastSeq2, committed.Manager.LastCommitSeqNo)
+        Assert.Equal<uint64>(lastSeq2 + 1UL, committed.Manager.NextSeqNo)
+
+        // 続けて DDL しても同じ関係が保たれる。
+        let _ = exec session "CREATE TABLE u (id INTEGER PRIMARY KEY)"
+        let committed = host.Committed
+        let lastSeq3 = RowStore.lastSeqNo committed.Store
+
+        Assert.Equal<uint64>(lastSeq3, committed.Manager.LastCommitSeqNo)
+        Assert.Equal<uint64>(lastSeq3 + 1UL, committed.Manager.NextSeqNo))
+
+[<Fact>]
 let ``DatabaseHost: 型は公開されていない`` () =
     let hostType = typeof<Session>.Assembly.GetType "RykDb.Core.DatabaseHost"
     Assert.NotNull hostType

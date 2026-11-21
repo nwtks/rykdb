@@ -622,7 +622,7 @@ module internal DmlOps =
         let targetSchema = targetSchemaOf schema
         let resolve = Eval.prepare targetSchema (Option.toList where)
 
-        let deleteMask =
+        let deleteMask (checks: ForeignKey.ParentDeleteCheck list) =
             let width = schema.Columns.Length
             let allColumns = Array.create width true
             let mask = Array.create width false
@@ -636,6 +636,11 @@ module internal DmlOps =
                     match TableSchema.indexOf schema name with
                     | Some i when i >= 0 && i < width -> mask.[i] <- true
                     | _ -> ()
+
+            for check in checks do
+                for i in check.ParentPositions do
+                    if i >= 0 && i < width then
+                        mask.[i] <- true
 
             match where with
             | None -> mask
@@ -670,17 +675,7 @@ module internal DmlOps =
 
                     mask
 
-        // 外部キーの参照先（親）になっている列も、削除前の検査で読む。
-        for name in
-            ctx.Catalog.Tables
-            |> List.collect (fun t -> t.ForeignKeys)
-            |> List.filter (fun fk -> Catalog.eqName fk.ParentTable schema.Name)
-            |> List.collect (fun fk -> fk.ParentColumns) do
-            match TableSchema.indexOf schema name with
-            | Some i when i >= 0 && i < deleteMask.Length -> deleteMask.[i] <- true
-            | _ -> ()
-
-        let foldRows ctx schema matched onRow =
+        let foldRows ctx schema mask matched onRow =
             let rec go t c cur =
                 match Op.next cur with
                 | OpStep.OpError e -> err e
@@ -696,11 +691,17 @@ module internal DmlOps =
 
             result {
                 let! scan =
-                    Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn deleteMask
+                    Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn mask
 
                 return! go ctx.Txn 0 scan
             }
 
-        foldRows ctx schema (fun row -> matchesWhere resolve row where) (fun t count row ->
-            ForeignKey.checkParentDelete ctx.Store ctx.Catalog ctx.Visible ctx.Scope t schema row
-            >>= fun () -> Dml.deleteRow t schema row |> Result.map (fun t2 -> t2, count + 1))
+        result {
+            let! checks = ForeignKey.prepareParentDeleteChecks ctx.Catalog schema
+            let mask = deleteMask checks
+
+            return!
+                foldRows ctx schema mask (fun row -> matchesWhere resolve row where) (fun t count row ->
+                    ForeignKey.checkParentDelete ctx.Store ctx.Visible ctx.Scope t schema checks row
+                    >>= fun () -> Dml.deleteRow t schema row |> Result.map (fun t2 -> t2, count + 1))
+        }

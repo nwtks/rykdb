@@ -96,6 +96,11 @@ module internal RowStore =
     /// 論理 keyspace 名は物理キーの接頭辞で表すため、エンジンは常に 1本。
     let ensure (store: RowStore) = ret store.Engine
 
+    /// 保存済みの SeqNo（= 次に採番する値 - 1）。
+    let lastSeqNo (store: RowStore) =
+        let next = store.Engine.NextSeqNo
+        if next = 0UL then 0UL else next - 1UL
+
     /// Entry を論理 keyspace の接頭辞付きで書き込む。
     /// 複数 keyspace の書き込みも同じ WAL バッチに入るため、途中で分断されない。
     let writeBatchesWithSnapshotWith
@@ -202,6 +207,7 @@ module internal RowStore =
         =
         store.Runtime.WithShared(fun () ->
             result {
+                let mgr = TransactionManager.synchronize (lastSeqNo store) mgr
                 let! manager, _, batches = TransactionManager.commit txn mgr
 
                 let snapshot =
@@ -247,13 +253,11 @@ module internal RowStore =
     /// keyspace を prefix で走査する（最新エントリ。値の filter はしない）。
     /// 返すキーは接頭辞を外した論理キー。
     /// 1行要求されるまで SSTable のブロックを読まない。
-    /// scope が指定されたら、返す走査を台帳に登録して早期終了時にも閉じられるようにする。
     let private scanAtRawValues
         (keyspace: string)
         (startKey: byte array)
         (limit: int)
         (visible: uint64 option)
-        (scope: ScanScope option)
         (needsValues: bool)
         (store: RowStore)
         =
@@ -265,12 +269,7 @@ module internal RowStore =
             let! scan =
                 e.ScanAtValues visible (Keyspace.prefixedKey keyspace startKey) limit needsValues
 
-            let scoped =
-                match scope with
-                | Some scope -> SstScan.scoped scope scan
-                | None -> scan
-
-            return scanWithinPrefix prefix scoped
+            return scanWithinPrefix prefix scan
         }
 
     /// keyspace を列マスク付きで走査する（必要な列だけ復号する）。
@@ -301,7 +300,7 @@ module internal RowStore =
 
     /// keyspace を走査する（制限なし・全列）。
     let scan (keyspace: string) (startKey: byte array) (limit: int) (store: RowStore) =
-        scanAtRawValues keyspace startKey limit None None true store
+        scanAtRawValues keyspace startKey limit None true store
         |> Result.map (SstScan.filter (fun e -> e.Value.IsSome))
 
     /// keyspace をキーだけ走査する（値は復号しない）。
@@ -352,11 +351,6 @@ module internal RowStore =
             | Error e -> err e
 
         loop (store, mgr) [||]
-
-    /// 保存済みの SeqNo（= 次に採番する値 - 1）。
-    let lastSeqNo (store: RowStore) =
-        let next = store.Engine.NextSeqNo
-        if next = 0UL then 0UL else next - 1UL
 
     /// format マーカーより前に作られた DB か（データファイルがあるか）。
     let private hasDataFiles (root: string) =

@@ -648,6 +648,10 @@ compactionはtombstoneを最下位レベルで回収する。
 カタログは`__catalog__`keyspaceへ永続化する。
 起動時はカタログをロードし、テーブル定義、主キー、索引、外部キーを再構築する。
 
+保存は変更のあった定義と消えた定義の差分だけを書く。
+変わっていない定義は書き直さない（エンコード後のバイト列で比較する）。
+消えた定義はtombstoneで落とす。
+
 外部キーは即時RESTRICTで検査する。
 
 - 子のINSERT、INSERT SELECT、UPDATEは外部キーの親行を確認する。
@@ -670,6 +674,12 @@ COMMIT時にtransaction内の各エントリへ順番にSeqNoを割り当てる�
 
 起動時はストレージから復元した最大SeqNoから採番を再開する。
 巻き戻すと古い書き込みを新しい番号で隠す可能性があるため、採番を巻き戻さない。
+
+カタログの保存はTransactionを介さずengineの`NextSeqNo`から直接採番する。
+失敗したDDLの後始末もManagerを経由せずengineへ書くことがある。
+そのため書き込みの前に`TransactionManager`をengineの高水位へ合わせる
+（`TransactionManager.synchronize`）。
+合わせないと次の採番が過去のSeqNoを再利用し、同じキーに同じSeqNoの版ができる。
 
 ### 7.2 可視性
 

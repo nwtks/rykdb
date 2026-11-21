@@ -360,6 +360,15 @@ DDLと索引backfillは同一transactionへ載せられないため、`BEGIN`中
 CREATE INDEXは排他ロックを取り、backfill成功後にカタログへ登録する。
 backfill中の他の書き込みを防ぐ。
 
+### 5.10 採番はengineの高水位より後ろで行う
+
+カタログの保存はTransactionを介さずengineの`NextSeqNo`から採番する。
+失敗したDDLの後始末（`CREATE UNIQUE INDEX`の巻き戻しなど）もManagerを経由せずengineへ書く。
+書き込みの前に`TransactionManager.synchronize`でManagerをengineの高水位へ合わせる。
+合わせないと次の採番が過去のSeqNoを再利用し、同じキーに同じSeqNoの版ができて可視性が壊れる。
+回帰: `DatabaseHost: DDL のカタログ保存後も Manager の採番は保存済み SeqNo の後ろになる` /
+`Session: UNIQUE 索引の backfill は重複値を拒否する`。
+
 ---
 
 ## 6. 索引・結合・クエリ意味論
@@ -468,6 +477,10 @@ SQLのNULLではない。比較・ソート・DISTINCT・符号化・型問い�
 SELECT定数、`COUNT(*)`、DELETE、INDEX lookupは参照列だけ復号する。
 全列を復号しない。
 非被覆索引は主キーで本体をfetchし、`fetch`を全行へ適用する。
+
+範囲走査の上限は`opOfScan`の打ち切りで担保する。
+返した行を読み直して主キーを再符号化するfilterを足さない（主キーの復号も強制される）。
+回帰: `Dml.scanByPrimaryKeyRange: 上限を超える行と範囲外の書き込みは結果に混ざらない`。
 
 ### 7.9 compactionはraw値スライスを使う
 

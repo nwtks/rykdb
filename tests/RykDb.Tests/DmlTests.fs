@@ -75,6 +75,18 @@ let private allTrue (schema: TableSchema) = Array.create schema.Columns.Length t
 let private emailIndex =
     usersWithEmailIndex.Indexes |> List.find (fun i -> i.Name = "users_email")
 
+let private usersWithAgeIndex =
+    withIndex
+        usersSchema
+        {
+            Name = "users_age"
+            Columns = [ "age" ]
+            Unique = false
+        }
+
+let private ageIndex =
+    usersWithAgeIndex.Indexes |> List.find (fun i -> i.Name = "users_age")
+
 [<Fact>]
 let ``RowKey.primary: 主キー列を符号化する`` () =
     let schema = peopleSchema
@@ -122,6 +134,44 @@ let ``Dml.scanByPrimaryKey: 主キーで全行を走査できる（limit）`` ()
             Dml.scanByPrimaryKey store usersWithEmailIndex 2 None |> ok |> Op.toArray |> ok
 
         Assert.Equal(2, rows.Length))
+
+[<Fact>]
+let ``Dml.scanByPrimaryKeyRange: 上限を超える行と範囲外の書き込みは結果に混ざらない`` () =
+    withStore "dml-range-txn" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn0 = TransactionManager.beginTxn mgr
+
+        let txn0 =
+            [ 1; 2; 3; 4; 5 ]
+            |> List.fold
+                (fun t i -> insertRow usersWithEmailIndex t (rowOf i (sprintf "u%d@example.com" i) i) |> ok)
+                txn0
+
+        commitInto store 1UL txn0
+
+        // 範囲の外（5 の削除、0 / 6 の追加）も同じ transaction に積む。
+        let _, txn1 = TransactionManager.beginTxn mgr
+        let txn1 = Dml.deleteRow txn1 usersWithEmailIndex (rowOf 5 "u5@example.com" 5) |> ok
+        let txn1 = insertRow usersWithEmailIndex txn1 (rowOf 0 "u0@example.com" 0) |> ok
+        let txn1 = insertRow usersWithEmailIndex txn1 (rowOf 6 "u6@example.com" 6) |> ok
+
+        let rows =
+            Dml.scanByPrimaryKeyRangeWithTxnMask
+                store
+                usersWithEmailIndex
+                [| SqlValue.Int 2L |]
+                (Some [| SqlValue.Int 4L |])
+                0
+                None
+                None
+                txn1
+                (allTrue usersWithEmailIndex)
+            |> ok
+            |> Op.toArray
+            |> ok
+
+        let ids = rows |> Array.toList |> List.map (fun r -> asInt r.[0])
+        Assert.Equal<int64 list>([ 2L; 3L; 4L ], ids))
 
 [<Fact>]
 let ``Dml.insertWithKey: 索引エントリの値は空になる`` () =
@@ -235,6 +285,145 @@ let ``Dml.scanByIndexPrefix: transaction の索引書き込みもキーで overl
 
         Assert.Equal(1, rows.Length)
         Assert.Equal<int64>(1L, asInt rows.[0].[0]))
+
+[<Fact>]
+let ``Dml.scanByIndexPrefix: store のキーより前の書き込みを先に返す`` () =
+    withStore "dml-index-prefix-replay" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn0 = TransactionManager.beginTxn mgr
+        let txn0 = insertRow usersWithAgeIndex txn0 (rowOf 2 "u2@example.com" 15) |> ok
+        commitInto store 1UL txn0
+
+        // 同じ索引値で主キーが小さい行を transaction に積む
+        // （store の索引キーより前になるので、store を先読みして戻す必要がある）。
+        let _, txn1 = TransactionManager.beginTxn mgr
+        let txn1 = insertRow usersWithAgeIndex txn1 (rowOf 1 "u1@example.com" 15) |> ok
+
+        let rows =
+            Dml.scanByIndexPrefixWithTxnMask
+                store
+                usersWithAgeIndex
+                ageIndex
+                [| SqlValue.Int 15L |]
+                0
+                None
+                None
+                txn1
+                (allTrue usersWithAgeIndex)
+            |> ok
+            |> Op.toArray
+            |> ok
+
+        let ids = rows |> Array.toList |> List.map (fun r -> asInt r.[0])
+        Assert.Equal<int64 list>([ 1L; 2L ], ids))
+
+[<Fact>]
+let ``Dml.scanByIndexRange: transaction の索引書き込みを store のキー間に挿入する`` () =
+    withStore "dml-index-range-insert" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn0 = TransactionManager.beginTxn mgr
+
+        let txn0 =
+            [ 1, 10; 2, 20; 3, 30 ]
+            |> List.fold
+                (fun t (id, age) ->
+                    insertRow usersWithAgeIndex t (rowOf id (sprintf "u%d@example.com" id) age)
+                    |> ok)
+                txn0
+
+        commitInto store 1UL txn0
+
+        let _, txn1 = TransactionManager.beginTxn mgr
+        let txn1 = insertRow usersWithAgeIndex txn1 (rowOf 4 "u4@example.com" 15) |> ok
+
+        let rows =
+            Dml.scanByIndexRangeWithTxnMask
+                store
+                usersWithAgeIndex
+                ageIndex
+                [| SqlValue.Int 10L |]
+                (Some [| SqlValue.Int 30L |])
+                0
+                None
+                None
+                txn1
+                (allTrue usersWithAgeIndex)
+            |> ok
+            |> Op.toArray
+            |> ok
+
+        let ages = rows |> Array.toList |> List.map (fun r -> asInt r.[2])
+        let ids = rows |> Array.toList |> List.map (fun r -> asInt r.[0])
+        Assert.Equal<int64 list>([ 10L; 15L; 20L; 30L ], ages)
+        Assert.Equal<int64 list>([ 1L; 4L; 2L; 3L ], ids))
+
+[<Fact>]
+let ``Dml.scanByIndexRange: 削除した行の索引エントリを残さずに overlay する`` () =
+    withStore "dml-index-range-delete" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn0 = TransactionManager.beginTxn mgr
+
+        let txn0 =
+            [ 1, 10; 2, 20; 3, 30 ]
+            |> List.fold
+                (fun t (id, age) ->
+                    insertRow usersWithAgeIndex t (rowOf id (sprintf "u%d@example.com" id) age)
+                    |> ok)
+                txn0
+
+        commitInto store 1UL txn0
+
+        let _, txn1 = TransactionManager.beginTxn mgr
+        let txn1 = Dml.deleteRow txn1 usersWithAgeIndex (rowOf 2 "u2@example.com" 20) |> ok
+        commitInto store 7UL txn1
+
+        let _, txn2 = TransactionManager.beginTxn mgr
+        let txn2 = insertRow usersWithAgeIndex txn2 (rowOf 4 "u4@example.com" 25) |> ok
+
+        let rows =
+            Dml.scanByIndexRangeWithTxnMask
+                store
+                usersWithAgeIndex
+                ageIndex
+                [| SqlValue.Int 10L |]
+                (Some [| SqlValue.Int 30L |])
+                0
+                None
+                None
+                txn2
+                (allTrue usersWithAgeIndex)
+            |> ok
+            |> Op.toArray
+            |> ok
+
+        let ages = rows |> Array.toList |> List.map (fun r -> asInt r.[2])
+        let ids = rows |> Array.toList |> List.map (fun r -> asInt r.[0])
+        Assert.Equal<int64 list>([ 10L; 25L; 30L ], ages)
+        Assert.Equal<int64 list>([ 1L; 4L; 3L ], ids))
+
+[<Fact>]
+let ``Dml.updateRow: 索引列が変わらない更新では索引エントリを書かない`` () =
+    withStore "dml-index-skip" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+        let row = rowOf 1 "a@example.com" 10
+        commitInto store 1UL (insertRow usersWithEmailIndex txn row |> ok)
+
+        let _, updateTxn = TransactionManager.beginTxn mgr
+
+        // email（索引列）はそのまま、age だけ変える。
+        let sameKey =
+            Dml.updateRow updateTxn usersWithEmailIndex row (rowOf 1 "a@example.com" 11)
+            |> ok
+
+        Assert.Empty(Transaction.slotsOf (Keyspace.index "users_email") sameKey)
+
+        // email（索引列）を変えれば索引エントリが書かれる。
+        let newKey =
+            Dml.updateRow updateTxn usersWithEmailIndex row (rowOf 1 "b@example.com" 10)
+            |> ok
+
+        Assert.Equal(2, (Transaction.slotsOf (Keyspace.index "users_email") newKey).Length))
 
 [<Fact>]
 let ``Dml.insertWithKey: NOT NULL 制約違反は弾かれる`` () =

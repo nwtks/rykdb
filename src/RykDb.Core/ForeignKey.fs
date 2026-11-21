@@ -12,6 +12,29 @@
 namespace RykDb.Core
 
 module internal ForeignKey =
+    /// 親行の削除を止める子側の参照検査。
+    /// 文単位で 1回だけ準備し、削除行ごとに使い回す
+    /// （子スキーマ・列位置・mask を行ごとに作り直さない）。
+    type internal ParentDeleteCheck =
+        {
+            /// 子テーブル（索引を載せた実行用スキーマ）。
+            Child: TableSchema
+            /// 子が参照している親の列名（エラーメッセージ用）。
+            ParentColumns: string list
+            /// 親行から参照値を取り出す位置。
+            ParentPositions: int list
+            /// 外部キーの列が前置になっている索引（あれば）。
+            Index: IndexSchema option
+            /// 外部キーの列が子の主キーと同順か。
+            PrimaryKeyMatches: bool
+            /// 存在確認だけに使う mask（全列 false）。
+            ProbeMask: bool array
+            /// 子の全走査で使う mask（外部キー列 + 主キー）。
+            ScanMask: bool array
+            /// 子行から外部キーの値を取り出す位置。
+            ChildPositions: int list
+        }
+
     /// 大文字小文字を無視した列名リストの一致。
     let private sameNames (a: string list) (b: string list) =
         a.Length = b.Length && List.forall2 SqlName.equal a b
@@ -122,23 +145,27 @@ module internal ForeignKey =
 
         references |> List.map resolveOne |> all
 
+    /// 列位置のリストから行の値を取り出す。
+    /// 列マスクで復号されていない列があれば InternalError（呼び出し側の mask 漏れ）。
+    let private valuesAt (positions: int list) (row: SqlValue array) =
+        let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
+
+        if
+            values
+            |> Array.exists (function
+                | SqlValue.Unloaded -> true
+                | _ -> false)
+        then
+            err (DbError.internalError "外部キーの列が復号されていません")
+        else
+            ret values
+
     /// 列名のリストから行の値を取り出す。
     let private valuesOf (schema: TableSchema) (names: string list) (row: SqlValue array) =
         names
         |> List.map (TableSchema.requireIndexOf schema)
         |> all
-        >>= fun positions ->
-            let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
-
-            if
-                values
-                |> Array.exists (function
-                    | SqlValue.Unloaded -> true
-                    | _ -> false)
-            then
-                err (DbError.internalError "外部キーの列が復号されていません")
-            else
-                ret values
+        >>= fun positions -> valuesAt positions row
 
     let private parentSchemaOf (catalog: Catalog) (table: string) =
         match Catalog.findTable table catalog with
@@ -197,6 +224,52 @@ module internal ForeignKey =
             |> Result.map ignore
         | None -> ret ()
 
+    /// 親を参照している子の検査を準備する。
+    /// 削除行ごとにカタログを引き直さないよう、文の実行前に 1回だけ呼ぶ。
+    let prepareParentDeleteChecks (catalog: Catalog) (schema: TableSchema) =
+        Catalog.referencingForeignKeys schema.Name catalog
+        |> List.map (fun (childDefn, fk) ->
+            result {
+                let! child =
+                    Catalog.toSchema childDefn
+                    |> Result.map (fun s ->
+                        { s with
+                            Indexes = Catalog.indexSchemasOf childDefn.Name catalog
+                        })
+
+                let! parentPositions =
+                    fk.ParentColumns |> List.map (TableSchema.requireIndexOf schema) |> all
+
+                let! childPositions =
+                    fk.Columns |> List.map (TableSchema.requireIndexOf child) |> all
+
+                let index =
+                    child.Indexes
+                    |> List.tryFind (fun idx -> sameNames (idx.Columns |> List.truncate fk.Columns.Length) fk.Columns)
+
+                let scanMask =
+                    let mask = Array.create child.Columns.Length false
+
+                    for p in childPositions @ child.PrimaryKey do
+                        if p >= 0 && p < mask.Length then
+                            mask.[p] <- true
+
+                    mask
+
+                return
+                    {
+                        Child = child
+                        ParentColumns = fk.ParentColumns
+                        ParentPositions = parentPositions
+                        Index = index
+                        PrimaryKeyMatches = sameNames (primaryKeyNames child) fk.Columns
+                        ProbeMask = Array.create child.Columns.Length false
+                        ScanMask = scanMask
+                        ChildPositions = childPositions
+                    }
+            })
+        |> all
+
     /// Op の行を先頭から調べ、`matches` が真になった時点で打ち切る。
     /// Op は one-shot なので途中で捨てた走査は Scope の DisposeAll で閉じる。
     let private anyRow (matches: SqlValue array -> DbResult<bool>) (op: Op) =
@@ -222,107 +295,82 @@ module internal ForeignKey =
         |> List.mapi (fun i p -> sameValue row.[p] values.[i])
         |> List.forall id
 
-    let private maskOf (schema: TableSchema) (names: string list) =
-        names
-        |> List.map (TableSchema.requireIndexOf schema)
-        |> all
-        |> Result.map (fun positions ->
-            let mask = Array.create schema.Columns.Length false
-
-            for p in positions do
-                if p >= 0 && p < mask.Length then
-                    mask.[p] <- true
-
-            mask)
-
     /// 子テーブルに、外部キー列が `values` と一致する行があるか。
     let private childRowExists
         (store: RowStore)
-        (child: TableSchema)
-        (fkColumns: string list)
+        (check: ParentDeleteCheck)
         (values: SqlValue array)
         (visible: uint64 option)
         (scope: ScanScope)
         (txn: Transaction)
         =
         result {
-            let mask = Array.create child.Columns.Length false
-
-            let indexHit =
-                child.Indexes
-                |> List.tryFind (fun idx -> sameNames (idx.Columns |> List.truncate fkColumns.Length) fkColumns)
-
-            match indexHit with
+            match check.Index with
             | Some idx ->
                 let! op =
-                    Dml.scanByIndexPrefixWithTxnMask store child idx values 1 visible (Some scope) txn mask
+                    Dml.scanByIndexPrefixWithTxnMask
+                        store
+                        check.Child
+                        idx
+                        values
+                        1
+                        visible
+                        (Some scope)
+                        txn
+                        check.ProbeMask
 
                 return! anyRow (fun _ -> DbOk true) op
             | None ->
-                if sameNames (primaryKeyNames child) fkColumns then
+                if check.PrimaryKeyMatches then
                     let! op =
                         Dml.scanByPrimaryKeyRangeWithTxnMask
                             store
-                            child
+                            check.Child
                             values
                             (Some values)
                             1
                             visible
                             (Some scope)
                             txn
-                            mask
+                            check.ProbeMask
 
                     return! anyRow (fun _ -> DbOk true) op
                 else
-                    let! scanMask = maskOf child fkColumns
-                    let! positions = fkColumns |> List.map (TableSchema.requireIndexOf child) |> all
-
-                    child.PrimaryKey
-                    |> List.iter (fun p ->
-                        if p >= 0 && p < scanMask.Length then
-                            scanMask.[p] <- true)
-
                     let! op =
-                        Dml.scanByPrimaryKeyWithTxnMask store child 0 visible (Some scope) txn scanMask
+                        Dml.scanByPrimaryKeyWithTxnMask store check.Child 0 visible (Some scope) txn check.ScanMask
 
-                    return! anyRow (fun row -> DbOk(rowMatches positions values row)) op
+                    return! anyRow (fun row -> DbOk(rowMatches check.ChildPositions values row)) op
         }
 
     /// 親行を削除してよいか（RESTRICT）。
     /// 参照している子行があれば `ConstraintViolation`。
+    /// `checks` は `prepareParentDeleteChecks` の結果（文単位で 1回だけ用意する）。
     let checkParentDelete
         (store: RowStore)
-        (catalog: Catalog)
         (visible: uint64 option)
         (scope: ScanScope)
         (txn: Transaction)
         (schema: TableSchema)
+        (checks: ParentDeleteCheck list)
         (row: SqlValue array)
         =
-        Catalog.referencingForeignKeys schema.Name catalog
-        |> List.map (fun (childDefn, fk) ->
+        checks
+        |> List.map (fun check ->
             result {
-                let! child =
-                    Catalog.toSchema childDefn
-                    |> Result.map (fun s ->
-                        { s with
-                            Indexes = Catalog.indexSchemasOf childDefn.Name catalog
-                        })
-
-                let! values = valuesOf schema fk.ParentColumns row
+                let! values = valuesAt check.ParentPositions row
 
                 if values |> Array.exists SqlValue.isNull then
                     return ()
                 else
-                    let! exists = childRowExists store child fk.Columns values visible scope txn
+                    let! exists = childRowExists store check values visible scope txn
 
                     if exists then
                         return!
                             sprintf
                                 "外部キー制約に違反: テーブル %s の行が %s(%s) を参照しています"
-                                child.Name
+                                check.Child.Name
                                 schema.Name
-                                (System.String.Join(", ", fk.ParentColumns))
+                                (System.String.Join(", ", check.ParentColumns))
                             |> DbError.constraintViolation
                             |> err
                     else
