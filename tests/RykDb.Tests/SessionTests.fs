@@ -59,6 +59,7 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
         member _.ActiveSnapshot = inner.ActiveSnapshot
         member _.PublishedState = inner.PublishedState
         member _.WalState = inner.WalState
+        member _.LastFlushError = inner.LastFlushError
         member _.GetAtMasked visible key mask = inner.GetAtMasked visible key mask
 
         member _.ScanAtValues visible startKey limit needsValues =

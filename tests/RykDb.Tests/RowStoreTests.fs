@@ -79,6 +79,7 @@ type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<s
             }
 
         member _.WalState = None
+        member _.LastFlushError = None
         member _.GetAtMasked _ _ _ = ret None
         member _.ScanAtValues _ _ _ _ = ret SstScan.Empty
         member _.ScanAtMasked _ _ _ _ = ret SstScan.Empty

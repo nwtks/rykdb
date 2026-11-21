@@ -223,11 +223,19 @@ module internal RowStore =
 
     /// keyspace から列マスク付きで読む（SeqNo 制限つき）。
     let getAtMasked (keyspace: string) (key: byte array) (visible: uint64 option) (mask: bool array) (store: RowStore) =
-        result {
-            let! e = ensure store
-            let! sst = e.GetAtMasked visible (Keyspace.prefixedKey keyspace key) mask
-            return Option.bind _.Value sst
-        }
+        let lease =
+            match store.Host with
+            | Some host -> Some(host.AcquireVersion store.Engine.PublishedState.Version)
+            | None -> None
+
+        try
+            result {
+                let! e = ensure store
+                let! sst = e.GetAtMasked visible (Keyspace.prefixedKey keyspace key) mask
+                return Option.bind _.Value sst
+            }
+        finally
+            lease |> Option.iter (fun lease -> lease.Dispose())
 
     /// 接頭辞の境界で走査を止め、返すキーから接頭辞を外す。
     /// 途中で捨てられても下流の走査（SSTable のファイルハンドル）を閉じられるようにする。
@@ -252,13 +260,11 @@ module internal RowStore =
 
     /// 走査が使う Version を、走査の Dispose まで pin する。
     /// Session の read lease より長く走査を保持しても compaction にファイルを消されない。
-    /// `scope` があるときは lease も台帳へ登録し、早期終了時の `DisposeAll` で解放する。
-    let private withVersionPin (scope: ScanScope option) (store: RowStore) (scan: Result<SstScan, DbError>) =
+    let private withVersionPin (store: RowStore) (scan: Result<SstScan, DbError>) =
         match store.Host with
         | None -> scan
         | Some host ->
             let lease = host.AcquireVersion store.Engine.PublishedState.Version
-            scope |> Option.iter (fun scope -> scope.Register(obj (), lease))
 
             match scan with
             | Ok scan -> Ok(SstScan.withResource lease scan)
@@ -287,7 +293,7 @@ module internal RowStore =
 
             return scanWithinPrefix prefix scan
         }
-        |> withVersionPin None store
+        |> withVersionPin store
 
     /// keyspace を列マスク付きで走査する（必要な列だけ復号する）。
     let scanAtRawMasked
@@ -307,14 +313,13 @@ module internal RowStore =
             let! scan =
                 e.ScanAtMasked visible (Keyspace.prefixedKey keyspace startKey) limit mask
 
-            let scoped =
-                match scope with
-                | Some scope -> SstScan.scoped scope scan
-                | None -> scan
-
-            return scanWithinPrefix prefix scoped
+            return scanWithinPrefix prefix scan
         }
-        |> withVersionPin scope store
+        |> withVersionPin store
+        |> fun scan ->
+            match scope with
+            | Some scope -> scan |> Result.map (SstScan.scoped scope)
+            | None -> scan
 
     /// keyspace を走査する（制限なし・全列）。
     let scan (keyspace: string) (startKey: byte array) (limit: int) (store: RowStore) =

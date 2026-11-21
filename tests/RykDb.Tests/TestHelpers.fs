@@ -206,6 +206,7 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
             }
 
         member _.WalState = None
+        member _.LastFlushError = None
 
         member _.GetAtMasked visible key mask =
             Memtable.getVisible key visible state.Mem

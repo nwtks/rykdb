@@ -521,6 +521,40 @@ let ``StorageEngine.openDatabaseWith: WAL の不完全な末尾を切り詰め�
         Assert.True((ok (StorageEngine.getAtMasked None (intKey 2) [||] reopened)).IsSome))
 
 [<Fact>]
+let ``StorageEngine.maybeFlush: WAL 作成に失敗しても旧 WAL を残し、次の flush で回復する`` () =
+    withDir "flush-wal-create-fail" (fun dir ->
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
+        let engine = { engine with MemLimitBytes = 1 }
+
+        let engine =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 1) 1UL (intRow 1) |] engine)
+
+        let oldWal = Wal.path dir engine.Wal.FileNumber
+        let nextWal = Wal.path dir (engine.Wal.FileNumber + 1L)
+
+        // 新しい WAL の作成をディレクトリで塞ぐ。
+        System.IO.Directory.CreateDirectory(nextWal) |> ignore
+
+        let engine, error = ok (StorageEngine.maybeFlush engine)
+        Assert.True(error.IsSome)
+        Assert.True engine.Runtime.LastFlushError.IsSome
+        // 旧 WAL は削除されず、engine の位置も変わらない。
+        Assert.True(System.IO.File.Exists oldWal)
+        Assert.Equal(oldWal, Wal.path dir engine.Wal.FileNumber)
+
+        // 障害を取り除けば、次の write / flush で回復する。
+        System.IO.Directory.Delete nextWal
+
+        let engine =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] engine)
+
+        let engine, error = ok (StorageEngine.maybeFlush engine)
+        Assert.True(error.IsNone)
+        Assert.True engine.Runtime.LastFlushError.IsNone
+        Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] engine)).IsSome)
+        Assert.True((ok (StorageEngine.getAtMasked None (intKey 2) [||] engine)).IsSome))
+
+[<Fact>]
 let ``StorageEngine.openDatabaseWith: 孤児の SSTable は削除せず退避する`` () =
     withDir "re5" (fun dir ->
         withEngine dir (fun _ -> ())

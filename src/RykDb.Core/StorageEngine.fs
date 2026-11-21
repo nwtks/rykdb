@@ -12,7 +12,18 @@ namespace RykDb.Core
 /// `StorageEngine` の不変コピー間で参照を共有し、DB の寿命と一緒に回収する。
 type internal StorageRuntime() =
     let gate = new System.Threading.SemaphoreSlim(1, 1)
+
+    let lastFlushError =
+        System.Collections.Concurrent.ConcurrentDictionary<string, DbError option>()
+
+    do lastFlushError.["current"] <- None
+
     member _.Gate = gate
+
+    /// 直近の flush の失敗（成功したら None）。
+    member _.LastFlushError
+        with get () = lastFlushError.["current"]
+        and set (value: DbError option) = lastFlushError.["current"] <- value
 
 /// StorageEngine の不変状態。
 /// すべての操作は新しい状態を返す。
@@ -316,12 +327,20 @@ module internal StorageEngine =
     /// MANIFEST の反映結果が不明な場合でも、同じファイル番号を再利用して
     /// MANIFEST が参照する SSTable を上書きしないため。
     /// </remarks>
-    let private flush (engine: StorageEngine) =
+    let private flushCore (engine: StorageEngine) =
         let rotateWal engine (next: WalState) =
             result {
                 do! Wal.sync engine.Dir engine.Wal
-                do! protect (fun () -> Wal.walFiles engine.Dir |> List.iter System.IO.File.Delete |> ignore)
+                // 先に新しい WAL を作る。作成に失敗した場合に旧 WAL を残し、
+                // engine が指す位置のログを失わないようにする。
                 let! _ = Wal.create engine.Dir next.FileNumber
+
+                protect (fun () ->
+                    Wal.walFiles engine.Dir
+                    |> List.filter (fun path -> path <> Wal.path engine.Dir next.FileNumber)
+                    |> List.iter System.IO.File.Delete)
+                |> ignore
+
                 return { engine with Wal = next }
             }
 
@@ -371,6 +390,17 @@ module internal StorageEngine =
                     | Error e -> Error(bumped, e)
                 | ManifestApplyResult.NotApplied e
                 | ManifestApplyResult.Unknown e -> Error(bumped, e)
+
+    /// flush を実行し、失敗を DB の診断欄へ残す。
+    let private flush (engine: StorageEngine) =
+        let outcome = flushCore engine
+
+        engine.Runtime.LastFlushError <-
+            match outcome with
+            | Ok _ -> None
+            | Error(_, e) -> Some e
+
+        outcome
 
     /// memtable が上限に達していれば flush する
     /// （compaction はしない。background compaction は worker が行う）。
@@ -485,7 +515,7 @@ module internal StorageEngine =
                 && Memtable.approxBytes engine.Mem >= engine.MemLimitBytes
             then
                 match flush engine with
-                | Error(bumped, _) -> ret (bumped, None)
+                | Error(bumped, e) -> ret (bumped, Some e)
                 | Ok flushed ->
                     match compactOnce flushed with
                     | Ok compacted -> ret (compacted, None)
@@ -689,6 +719,8 @@ type internal IStorageEngine =
     abstract PublishedState: PublishedState
     /// 現在の WAL 位置。メモリエンジンは None。
     abstract WalState: WalState option
+    /// 直近の flush 失敗（成功したら None）。
+    abstract LastFlushError: DbError option
 
     /// 列マスクに従って必要な列だけ復号して 1行を引く。
     abstract GetAtMasked:
@@ -731,6 +763,7 @@ type internal DiskStorageEngine(engine: StorageEngine) =
             }
 
         member _.WalState = Some engine.Wal
+        member _.LastFlushError = engine.Runtime.LastFlushError
 
         member _.GetAtMasked visible key mask =
             StorageEngine.getAtMasked visible key mask engine

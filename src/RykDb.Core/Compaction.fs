@@ -117,6 +117,15 @@ module internal Compaction =
         | Sequence current -> current, Sequence(current + 1L)
         | Allocator allocate -> allocate (), supply
 
+    type private GatherResult =
+        | GatherStopped
+        | Gathered of SstMerge * SstEntry list
+
+    type private NextGroup =
+        | NextGroupDone
+        | NextGroupStopped
+        | NextGroup of SstEntry list * int * int * SstMerge
+
     /// 1回の Leveled compaction を行う（ストリーミング）。
     /// <remarks>
     /// 入力は全読みしない。各ファイルを `SstScan` で開き、`SstMerge` で 1件ずつマージしながら
@@ -233,23 +242,34 @@ module internal Compaction =
                 err e
 
         let rec gather newest m acc =
-            match SstMerge.top m with
-            | Some e when Bytes.compare e.Key newest.Key = 0 ->
-                match SstMerge.next m with
-                | Ok None -> ret (m, List.rev acc)
-                | Ok(Some(nxt, rest)) -> gather newest rest (nxt :: acc)
-                | Error e -> err e
-            | _ -> ret (m, List.rev acc)
+            if shouldStop () then
+                ret GatherStopped
+            else
+                match SstMerge.top m with
+                | Some e when Bytes.compare e.Key newest.Key = 0 ->
+                    if shouldStop () then
+                        ret GatherStopped
+                    else
+                        match SstMerge.next m with
+                        | Ok None -> ret (Gathered(m, List.rev acc))
+                        | Ok(Some(nxt, rest)) -> gather newest rest (nxt :: acc)
+                        | Error e -> err e
+                | _ -> ret (Gathered(m, List.rev acc))
 
         let nextGroup dropTombstones merge =
-            match SstMerge.next merge with
-            | Ok None -> ret None
-            | Ok(Some(newest, afterNewest)) ->
-                gather newest afterNewest []
-                >>= fun (rest, older) ->
-                    let kept, dropped, tombstones = gcGroup activeSnapshot dropTombstones older newest
-                    ret (Some(kept, dropped, tombstones, rest))
-            | Error e -> err e
+            if shouldStop () then
+                ret NextGroupStopped
+            else
+                match SstMerge.next merge with
+                | Ok None -> ret NextGroupDone
+                | Ok(Some(newest, afterNewest)) ->
+                    match gather newest afterNewest [] with
+                    | Ok GatherStopped -> ret NextGroupStopped
+                    | Ok(Gathered(rest, older)) ->
+                        let kept, dropped, tombstones = gcGroup activeSnapshot dropTombstones older newest
+                        ret (NextGroup(kept, dropped, tombstones, rest))
+                    | Error e -> err e
+                | Error e -> err e
 
         let flushChunk plan chunk fileNumber =
             match chunk with
@@ -294,7 +314,10 @@ module internal Compaction =
                 | Error e ->
                     deleteOutputs added
                     err e
-                | Ok None ->
+                | Ok NextGroupStopped ->
+                    deleteOutputs added
+                    ret emptyResult
+                | Ok NextGroupDone ->
                     let fileNumber, _ = takeFileNumber supply
 
                     match flushChunk plan chunk fileNumber with
@@ -308,7 +331,7 @@ module internal Compaction =
                             | None -> added
 
                         ret (finish plan allInputs added droppedVersions droppedTombstones)
-                | Ok(Some(kept, dropped, tombstones, rest)) ->
+                | Ok(NextGroup(kept, dropped, tombstones, rest)) ->
                     let keptBytes = kept |> List.sumBy (fun e -> int64 (SstEntry.approximateBytes e))
                     let chunk' = List.fold (fun acc item -> item :: acc) chunk kept
 

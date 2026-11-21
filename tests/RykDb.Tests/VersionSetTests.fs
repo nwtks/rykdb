@@ -471,6 +471,21 @@ let ``Manifest.logAndApplyWithOutcome: 通常の追記は Applied を返す`` ()
         | other -> failActual "通常の追記は Applied であるべき" other)
 
 [<Fact>]
+let ``Manifest.logAndApplyWithOutcome: 追記を戻せない場合は Unknown`` () =
+    if not (System.OperatingSystem.IsLinux()) then
+        ()
+    else
+        withDir "manifest-unknown" (fun dir ->
+            let v0, mn0 = ok (Manifest.openOrCreate dir)
+            let path = System.IO.Path.Combine(dir, "MANIFEST-000001")
+            System.IO.File.Delete path
+            System.IO.File.CreateSymbolicLink(path, "/dev/full") |> ignore
+
+            match Manifest.logAndApplyWithOutcome dir mn0 v0 (VersionEdit.addFile (fmd 1L 0 100 199)) with
+            | ManifestApplyResult.Unknown _ -> ()
+            | other -> failActual "追記もロールバックも失敗したら Unknown であるべき" other)
+
+[<Fact>]
 let ``Manifest: 途中の壊れたレコードは CorruptionError`` () =
     withDir "manifest-mid-corrupt" (fun dir ->
         let v0, mn = ok (Manifest.openOrCreate dir)

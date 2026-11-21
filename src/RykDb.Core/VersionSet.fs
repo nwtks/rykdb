@@ -533,9 +533,8 @@ module internal Manifest =
                         System.IO.FileShare.Read
                     )
 
-                if fs.Length <> oldLength then
-                    fs.SetLength oldLength
-                    fs.Flush true)
+                fs.SetLength oldLength
+                fs.Flush true)
 
         let oldLength =
             protect (fun () ->

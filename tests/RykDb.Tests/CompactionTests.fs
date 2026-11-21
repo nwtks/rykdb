@@ -595,3 +595,52 @@ let ``Compaction.compactWith: 停止したら出力を残さず入力の走査�
                 )
 
             ())
+
+[<Fact>]
+let ``Compaction.compactWith: 同一キーのグループ途中でも停止できる`` () =
+    withDir "comp-stop-group" (fun dir ->
+        // 同じキー 1 の版を別ファイルに置き、gather がグループを畳んでいる途中で停止する。
+        let files =
+            [
+                mkSst dir 21L 0 [ Entry.put (intKey 1) 2UL (intRow 2) ]
+                mkSst dir 22L 0 [ Entry.put (intKey 1) 1UL (intRow 1) ]
+            ]
+
+        let version = files |> List.fold (fun v f -> Version.addFile f v) Version.Empty
+
+        let options =
+            { pickFirstLevel with
+                L0CompactionTrigger = 2
+            }
+
+        let checks = ref 0
+
+        let shouldStop () =
+            checks.Value <- checks.Value + 1
+            // pump の先頭と nextGroup の先頭を通過し、gather の先頭で停止する。
+            checks.Value > 2
+
+        let result, _ =
+            Compaction.compactWith dir version options 0UL (openBackRaw dir) (fun () -> 900L) shouldStop
+            |> ok
+
+        Assert.Empty result.Added
+        Assert.Empty result.Removed
+
+        let remaining =
+            System.IO.Directory.GetFiles(dir, "*.sst")
+            |> Array.map System.IO.Path.GetFileName
+            |> Array.sort
+
+        Assert.Equal<string array>([| "000021.sst"; "000022.sst" |], remaining)
+
+        for num in [ 21L; 22L ] do
+            use _ =
+                new System.IO.FileStream(
+                    FileMetaData.path dir num,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.ReadWrite,
+                    System.IO.FileShare.None
+                )
+
+            ())

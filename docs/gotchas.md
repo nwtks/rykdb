@@ -260,6 +260,9 @@ commit済みprefixだけを再生し、不完全な末尾は捨てる。
 open時は`Wal.foldCommitted`が返す最後の完全なフレーム位置までファイルを切り詰める。
 追記は`FileMode.Append`ではなく`WalState.Size`へ`SetLength`/`Seek`してから行い、
 不完全な末尾を残したまま次のcommitを書かない。
+flush後のrotateは新しいWALを作成してから旧WALを削除する。
+作成失敗時に旧WALを残す。
+flush失敗は`StorageRuntime.LastFlushError`に残し、次のwriteで再試行する。
 
 ### 4.9 複数keyspaceのcommitは1本のWALバッチ
 
@@ -308,6 +311,8 @@ WAL commit成功後に`Error`を返さない。
 `pump`は停止時に途中のmergeを持ち帰らない。
 `runPump`の`finally`で`SstMerge.dispose`し、出力の削除と入力ハンドルの解放を両方行う。
 片方だけだとWindowsで削除・renameが共有違反になる。
+停止確認は出力ファイル境界だけでなく、同一キーグループを畳む`gather`の各ステップでも行う。
+1回のブロック読み取り中だけは停止できない。
 
 ### 4.17 MANIFESTが参照するSSTableの欠落はCorruptionError
 
@@ -580,7 +585,7 @@ closeはworker join後にWALとロックを解放する。
 
 `VersionCoordinator.LastCompactionError`で直近の失敗を観測できる。
 失敗後は次のwriteでもworkerへsignalを送る（flushが起きなくても再試行する）。
-明示的な再試行には`RequestCompaction`を使う。
+明示的な再試行には`Signal`を使う。
 失敗が続いてもMANIFESTの状態とファイル番号は巻き戻さない。
 
 ---

@@ -973,6 +973,10 @@ Abort(txnId)
 commitのfsyncはグループ化する。
 待機中のcommitは最大WAL位置まで登録し、先頭の待機者が1回だけ`Flush(true)`する。
 
+flush後のWAL rotateは、新しいWALを作成してから旧WALを削除する。
+新しいWALの作成に失敗しても旧WALとengineの位置が残るため、次のwriteで回復できる。
+flushの失敗は`StorageRuntime.LastFlushError`に残す。
+
 ### 8.6 Compaction
 
 compactionは次の手順で行う。
@@ -1021,10 +1025,12 @@ SELECTのみのバッチごとにVersionをpinする。
 pinはVersion単位の参照数で管理し、同じVersionへの複数leaseはファイル数に比例しない。
 走査は`SstScan`自身がVersionのleaseを持ち、Sessionのread leaseより長く保持しても
 compactionにファイルを消されない。
+正常終了時は`ScanScope`から登録が外れる。
+point lookupは`RowStore.getAtMasked`が短いVersion leaseを取り、ファイル削除と競合しない。
 workerはinstall後に入力ファイルをretireし、refcountが0になったファイルだけ削除する。
 
 compactionの失敗は`LastCompactionError`に残し、次のwrite（flushが起きなくても）または
-明示的な`RequestCompaction`で再試行する。
+明示的な`Signal`で再試行する。
 失敗してもMANIFESTの状態とファイル番号は巻き戻さない。
 
 Closeは次の順で行う。
@@ -1033,6 +1039,9 @@ Closeは次の順で行う。
 2. 最新の`PublishedState`をengineへ反映する。
 3. memtableをflushする。
 4. WALをfsyncして削除する。
+
+停止確認は出力ファイル境界に加えて、同一キーグループを畳む途中の`gather`でも行う。
+巨大な1ブロックの読み取り中だけは待つ。
 5. ProcessLockを解放する。
 
 キャンセルは出力ファイル境界で確認する。

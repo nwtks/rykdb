@@ -201,7 +201,9 @@ MANIFEST の編集は追記専用とする。
 - `Wal.foldCommitted` は最後の完全なフレームの終端位置を返す。
 - `StorageEngine.openDatabaseWith` はその位置まで WAL を切り詰める。
 - 追記は `WalState.Size` から行い、不完全な末尾を残したまま次の commit を書かない。
+- flush 後の rotate は新 WAL を作成してから旧 WAL を削除する。
 - `WalState.Size` は `int64`（2GiB を超える WAL でも位置が溢れない）。
+- flush の失敗は `StorageRuntime.LastFlushError` に残す。
 
 回帰テストは任意の切断位置、torn tail 後の追記、切り詰め後の commit 継続を検査する。
 
@@ -349,6 +351,8 @@ MANIFEST追記と install は `installGate`で直列化する。
 最後のleaseがreleaseとsweepを行う。
 `RowStore`の走査は`SstScan.withResource`でVersion pinのleaseを結び付け、
 Sessionのread leaseより長く走査を保持してもファイルが消えない。
+`ScanScope`は最終的な走査を1つだけ登録し、正常終了時の`Dispose`で登録を外す。
+`RowStore.getAtMasked`も短いVersion leaseを取る。
 
 プロパティテストは並行読み取り、書き込み、snapshot pin、固定シードの操作列、
 Generation、採番、Version の妥当性、pin中のファイル存在を検査する。

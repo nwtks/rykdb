@@ -163,6 +163,30 @@ let ``background compaction: 診断情報と再試行要求を公開する`` () 
             RowStore.close store |> ignore)
 
 [<Fact>]
+let ``RowStore.scanAtRawMasked: 正常終了で ScanScope の登録が外れる`` () =
+    withDir "bg-scan-scope" (fun dir ->
+        let store = openBackground dir 1 None
+
+        try
+            let mutable current = store
+
+            for i in 1..4 do
+                current <- writeOne current i
+
+            let host = expectSome "store.Host" store.Host
+            waitIdle host
+
+            let snapStore, lease = RowStore.acquireSnapshot current
+            let scope = ScanScope()
+            let scan = ok (RowStore.scanAtRawMasked "t" [||] 0 None (Some scope) [||] snapStore)
+            let rows = ok (SstScan.toArray scan)
+            Assert.NotEmpty rows
+            Assert.Equal(0, scope.ActiveCount)
+            lease.Dispose()
+        finally
+            RowStore.close store |> ignore)
+
+[<Fact>]
 let ``background compaction: 走査は read lease より長く Version を pin する`` () =
     withDir "bg-scan-pin" (fun dir ->
         let store = openBackground dir 1 None
