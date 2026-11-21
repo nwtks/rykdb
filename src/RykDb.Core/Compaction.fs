@@ -225,14 +225,18 @@ module internal Compaction =
                 >>= fun (minBound, maxBound) -> expand current next minBound maxBound
 
         let rec openAll files scans =
-            match files with
-            | [] -> ret (List.rev scans |> List.toArray)
-            | f :: rest ->
-                match openScan f with
-                | Error e ->
-                    scans |> List.iter SstScan.dispose
-                    err e
-                | Ok scan -> openAll rest (scan :: scans)
+            if shouldStop () then
+                scans |> List.iter SstScan.dispose
+                ret None
+            else
+                match files with
+                | [] -> ret (Some(List.rev scans |> List.toArray))
+                | f :: rest ->
+                    match openScan f with
+                    | Error e ->
+                        scans |> List.iter SstScan.dispose
+                        err e
+                    | Ok scan -> openAll rest (scan :: scans)
 
         let openMerge scans =
             match SstMerge.ofScans scans with
@@ -387,9 +391,13 @@ module internal Compaction =
             result {
                 let! inputs, nextFiles = selectInputs version plan.Level options.MaxInputFiles
                 let allInputs = inputs @ nextFiles
-                let! scans = openAll allInputs []
-                let! merge = openMerge scans
-                return! runPump plan allInputs merge
+                let! opened = openAll allInputs []
+
+                match opened with
+                | None -> return emptyResult
+                | Some scans ->
+                    let! merge = openMerge scans
+                    return! runPump plan allInputs merge
             }
 
         match pickCompaction version with

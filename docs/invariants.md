@@ -187,6 +187,9 @@ MANIFEST の編集は追記専用とする。
 - `VersionEdit.encode` と `decode` は round-trip できる。
 - `Manifest.logAndApplyWithOutcome` は `Applied` / `NotApplied` / `Unknown` を返す。
   `NotApplied` は追記前の内容が保たれており、`Unknown` は追記の有無を保証できない。
+- `VersionCoordinator.install` は `Unknown` のとき MANIFEST を読み直し、
+  期待するファイル集合と一致すれば反映済みとして扱い、そうでなければ出力を削除する。
+  読み直しに失敗した場合だけ孤児として残す（次回 open の `quarantineOrphans`）。
 - ローテーションは追記前に判定し、追記失敗時は追記前の長さへ戻す。
 - 末尾が書きかけの場合、復元した Version を新しい MANIFEST に移して `CURRENT` を切り替える。
 - `VersionEdit.apply` は `NextFileNumber` を進めない。
@@ -354,6 +357,7 @@ MANIFEST追記と install は `installGate`で直列化する。
 Sessionのread leaseより長く走査を保持してもファイルが消えない。
 `ScanScope`は最終的な走査を1つだけ登録し、正常終了時の`Dispose`で登録を外す。
 `RowStore.getAtMasked`も短いVersion leaseを取る。
+leaseの取得と解放はCASだけで、`installGate`を取らない（ポイント検索のホットパス）。
 
 プロパティテストは並行読み取り、書き込み、snapshot pin、固定シードの操作列、
 Generation、採番、Version の妥当性、pin中のファイル存在を検査する。

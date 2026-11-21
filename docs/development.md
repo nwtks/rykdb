@@ -243,6 +243,9 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class eval
 # Op（pull 層）
 dotnet run -c Release --project tools/RykDb.Bench -- --class op
 
+# ストレージ層のポイント検索（Version lease の有無）
+dotnet run -c Release --project tools/RykDb.Bench -- --class storage
+
 # 短いジョブ
 dotnet run -c Release --project tools/RykDb.Bench -- --quick
 
@@ -263,6 +266,8 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
 - `PointLookupParsed`、`PointLookupPlanned`、`PointLookupStorage`:
   同じポイント検索を、構文解析済み、計画済み、ストレージ直呼び出しで測定する。
   `PkLookup` が実行する `byPrimaryKeyMasked` のオーバーヘッドを分離できる。
+- `StorageBenchmarks` の `RowStorePointLookup` と `EnginePointLookup`:
+  `RowStore.getAtMasked`（Version lease あり）と `IStorageEngine.GetAtMasked`（なし）を比べる。
   計画や実行の変更はこの3シナリオで確認する。
   `PointLookup` は計画が支配的なため、ストレージの変化が埋もれる。
 - `Insert100Rows`、`Insert10kRows`: INSERT のスループットを測定する。

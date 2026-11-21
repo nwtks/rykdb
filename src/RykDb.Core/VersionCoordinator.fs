@@ -37,10 +37,15 @@ type internal VersionCoordinator
         options: CompactionOptions,
         oldestSnapshot: unit -> uint64 option,
         scanOf: FileMetaData -> Result<SstScan, DbError>,
-        scanHook: (FileMetaData -> unit) option
+        scanHook: (FileMetaData -> unit) option,
+        manifestApply: (int64<manifestNo> -> Version -> VersionEdit -> ManifestApplyResult) option
     ) =
     let stateKey = "current"
     let workerKey = "worker"
+
+    let applyManifest =
+        defaultArg manifestApply (fun manifestNumber version edit ->
+            Manifest.logAndApplyWithOutcome dir manifestNumber version edit)
 
     [<Literal>]
     let Idle = 0
@@ -249,6 +254,12 @@ type internal VersionCoordinator
         Option.iter (fun hook -> hook f) scanHook
         scanOf f
 
+    let sameFileSet (a: Version) (b: Version) =
+        let numbers v =
+            Version.allFiles v |> List.map _.FileNumber |> Set.ofList
+
+        numbers a = numbers b
+
     let install (baseState: PublishedState, result: CompactionResult) =
         withGate (fun () ->
             let current = stateCell.[stateKey]
@@ -275,16 +286,13 @@ type internal VersionCoordinator
                     })
                 |> ignore
             else
-                match
-                    Manifest.logAndApplyWithOutcome
-                        dir
-                        current.ManifestNumber
-                        current.Version
-                        {
-                            VersionEdit.AddedFiles = result.Added
-                            DeletedFiles = result.Removed
-                        }
-                with
+                let edit =
+                    {
+                        VersionEdit.AddedFiles = result.Added
+                        DeletedFiles = result.Removed
+                    }
+
+                match applyManifest current.ManifestNumber current.Version edit with
                 | ManifestApplyResult.NotApplied e ->
                     FileMetaData.deleteObsolete dir result.Added |> ignore
 
@@ -294,11 +302,33 @@ type internal VersionCoordinator
                         })
                     |> ignore
                 | ManifestApplyResult.Unknown e ->
-                    publish (fun state ->
-                        { state with
-                            LastCompactionError = Some e
-                        })
-                    |> ignore
+                    let expected = VersionEdit.apply current.Version edit
+
+                    match Manifest.openOrCreate dir with
+                    | Ok(version, manifestNumber) when sameFileSet version expected ->
+                        publish (fun state ->
+                            { state with
+                                Version = version
+                                ManifestNumber = manifestNumber
+                                LastCompactionError = None
+                            })
+                        |> ignore
+
+                        result.Removed |> List.iter (fun f -> retireFile f.FileNumber)
+                    | Ok _ ->
+                        FileMetaData.deleteObsolete dir result.Added |> ignore
+
+                        publish (fun state ->
+                            { state with
+                                LastCompactionError = Some e
+                            })
+                        |> ignore
+                    | Error _ ->
+                        publish (fun state ->
+                            { state with
+                                LastCompactionError = Some e
+                            })
+                        |> ignore
                 | ManifestApplyResult.Applied(version, manifestNumber) ->
                     publish (fun state ->
                         { state with
@@ -502,13 +532,14 @@ type internal VersionCoordinator
 
     /// 指定した Version を pin する lease を返す。
     /// 走査が呼び出し元の read lease より長生きする場合に使う。
+    /// pin / release は CAS だけで完結するので installGate を取らない
+    /// （point lookup ごとに呼ばれるため、MANIFEST 追記と競合させない）。
     member _.AcquireVersion(version: Version) =
-        withGate (fun () ->
-            pinVersion version
+        pinVersion version
 
-            { new System.IDisposable with
-                member _.Dispose() = releaseVersion version
-            })
+        { new System.IDisposable with
+            member _.Dispose() = releaseVersion version
+        }
 
     member _.Signal() = signalWork ()
 

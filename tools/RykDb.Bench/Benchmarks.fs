@@ -117,19 +117,15 @@ type QueryBenchmarks() =
         this.Exec "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)"
         this.Exec "CREATE TABLE ins (id INTEGER PRIMARY KEY, v TEXT)"
 
-        // 10万行。a は 0..999 を繰り返し、b は 48文字程度の TEXT。
         this.Seed("t", 10_000, 99_999, fun i -> sprintf "(%d, %d, '%s')" i (i % 1000) (BenchText.ofInt i))
-        // JOIN 用に 2万行ずつ。c は 200行（非等値の入れ子ループを 400万回にする）。
         this.Seed("a", 5_000, 19_999, fun i -> sprintf "(%d, %d)" i (i % 100))
         this.Seed("b", 5_000, 19_999, fun i -> sprintf "(%d, %d)" i (i % 100))
         this.Seed("c", 200, 199, fun i -> sprintf "(%d, %d)" i i)
 
-        // memtable を SSTable へ flush し、ディスク走査を測れる状態にする。
         session.Close() |> Check.ok |> ignore
 
         session <- Session.OpenWithSync(root, SessionOptions.Default) |> Check.ok
 
-        // 低レベルシナリオ用に、文（AST）と計画を 1回だけ作る。
         let select =
             match Parser.parseStatements pointSql with
             | Ok [ Statement.Select stmt ] -> stmt
@@ -139,7 +135,6 @@ type QueryBenchmarks() =
         parsedLookup <- Statement.Select select
         lookupPlan <- session.PrepareSelect select |> Check.ok
 
-        // 計画が本当に 1行を返すことを 1回だけ確認する（測定条件の取り違え防止）。
         let rowCount (op: Op) = (Op.toArray op |> Check.ok).Length
 
         let plannedRows =
@@ -356,9 +351,6 @@ type SpillBenchmarks() =
         seedInto session
         seedInto baseline
 
-        // 退避経路の結果が通常のバジェットと一致することを確かめる。
-        // パーティション分割・フォールバックの誤りは実行時間に現れないため、
-        // 結果を突き合わせないとベンチが緑のまま誤答を見逃す。
         for sql in [ distinctSql; groupBySql; joinSql; joinByValueSql; sortSql ] do
             let spilled = this.RowsText(session, sql)
             let normal = this.RowsText(baseline, sql)
@@ -693,3 +685,58 @@ type IndexBenchmarks() =
     /// 索引なしの表への 100行 INSERT + ROLLBACK。
     [<Benchmark>]
     member _.InsertNoIndex100Rows() = exec plain insert100Sql
+
+/// ストレージ層のポイント検索マイクロベンチ。
+/// `RowStore.getAtMasked`（Version lease あり）と `IStorageEngine.GetAtMasked`
+/// （lease なし）の差が、Version pin のオーバーヘッドになる。
+[<MemoryDiagnoser>]
+type StorageBenchmarks() =
+    let mutable store = Unchecked.defaultof<RowStore>
+    let mutable root = ""
+    let key = KeyBuilder.ofValues [ SqlValue.Int 12345L ] |> Check.ok
+    let physicalKey = Keyspace.prefixedKey "t" key
+    let mask = [| true; true |]
+
+    let entries () =
+        [|
+            for i in 0..19_999 ->
+                let k = KeyBuilder.ofValues [ SqlValue.Int(int64 i) ] |> Check.ok
+
+                Entry.put k (uint64 i + 1UL) [| SqlValue.Int(int64 i); SqlValue.Int(int64 (i % 100)) |]
+        |]
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        root <- BenchEnv.newTempDir "storage"
+
+        let opened =
+            RowStore.openStoreWithOptions RowStoreOptions.Background root |> Check.ok
+
+        let opened = RowStore.writeBatches [ ("t", entries ()) ] opened |> Check.ok
+        RowStore.close opened |> Check.ok
+        store <- RowStore.openStoreWithOptions RowStoreOptions.Background root |> Check.ok
+        let byStore = RowStore.getAtMasked "t" key None mask store |> Check.ok
+        let byEngine = store.Engine.GetAtMasked None physicalKey mask |> Check.ok
+
+        if byStore.IsNone || byEngine.IsNone then
+            failwithf "StorageBenchmarks のポイント検索が 1行を返しません（store=%A engine=%A）" byStore byEngine
+
+    [<GlobalCleanup>]
+    member _.Cleanup() =
+        try
+            if not (isNull (box store)) then
+                RowStore.close store |> Check.ok |> ignore
+        with _ ->
+            ()
+
+        BenchEnv.deleteDir root
+
+    /// 公開経路（`RowStore`）。Version lease の取得と解放を含む。
+    [<Benchmark>]
+    member _.RowStorePointLookup() =
+        (RowStore.getAtMasked "t" key None mask store |> Check.ok).IsSome
+
+    /// エンジン直（`IStorageEngine.GetAtMasked`）。Version lease を含まない。
+    [<Benchmark>]
+    member _.EnginePointLookup() =
+        (store.Engine.GetAtMasked None physicalKey mask |> Check.ok).IsSome

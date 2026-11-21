@@ -1050,6 +1050,8 @@ pinはVersion単位の参照数で管理し、同じVersionへの複数leaseは�
 compactionにファイルを消されない。
 正常終了時は`ScanScope`から登録が外れる。
 point lookupは`RowStore.getAtMasked`が短いVersion leaseを取り、ファイル削除と競合しない。
+leaseの pin / release は CAS だけで完結し、MANIFEST 追記の `installGate` を取らないため、
+index lookup が行ごとに走ってもロック競合しない。
 workerはinstall後に入力ファイルをretireし、refcountが0になったファイルだけ削除する。
 
 compactionの失敗は`LastCompactionError`に残し、次のwrite（flushが起きなくても）または

@@ -187,6 +187,72 @@ let ``RowStore.scanAtRawMasked: 正常終了で ScanScope の登録が外れる`
             RowStore.close store |> ignore)
 
 [<Fact>]
+let ``background compaction: MANIFEST の結果が不明でも再読で未反映を判定して出力を消す`` () =
+    withDir "bg-manifest-unknown" (fun dir ->
+        // install は常に Unknown を返し、MANIFEST には何も書かない。
+        let hook (_: VersionEdit) =
+            Some(ManifestApplyResult.Unknown(DbError.create ErrorKind.IoError "injected"))
+
+        let store =
+            openBackgroundWith
+                dir
+                { RowStoreOptions.Background with
+                    MemLimitBytes = Some 1
+                    Compaction = Some forceL1Compaction
+                    ManifestApplyHook = Some hook
+                }
+
+        let mutable current = store
+
+        try
+            for i in 1..4 do
+                current <- writeOne current i
+
+            let host = expectSome "store.Host" store.Host
+            waitIdle host
+
+            Assert.True(
+                host.LastCompactionError.IsSome,
+                sprintf
+                    "gen=%d files=%A"
+                    host.Current.Generation
+                    (Version.allFiles host.Current.Version |> List.map _.FileNumber)
+            )
+
+            // MANIFEST を読み直して未反映と判定したので、compaction 出力は残らない。
+            let referenced =
+                Version.allFiles host.Current.Version |> List.map _.FileNumber |> Set.ofList
+
+            let unreferenced =
+                System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
+                |> Array.map (System.IO.Path.GetFileNameWithoutExtension >> int64)
+                |> Array.filter (fun n -> not (Set.contains n referenced))
+
+            Assert.Empty unreferenced
+        finally
+            RowStore.close current |> ignore
+
+        // 再オープンでき、行も読める。出力は消えているので .orphans にも残らない。
+        // ここは同期モードで開き、背景 compaction の削除と読み取りを競合させない。
+        let reopened = ok (RowStore.openStore dir)
+        let refreshed = refresh reopened
+
+        for i in 1..4 do
+            Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] refreshed)).IsSome)
+
+        let orphans = System.IO.Path.Combine(dir, ".orphans")
+
+        let orphanCount =
+            if System.IO.Directory.Exists orphans then
+                System.IO.Directory.GetFiles(orphans, "*" + FileMetaData.SstExtension).Length
+            else
+                0
+
+        Assert.Equal(0, orphanCount)
+        ok (RowStore.close reopened) |> ignore)
+
+
+[<Fact>]
 let ``background compaction: 走査は read lease より長く Version を pin する`` () =
     withDir "bg-scan-pin" (fun dir ->
         let store = openBackground dir 1 None

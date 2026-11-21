@@ -37,7 +37,7 @@ type private Options =
 
 let private usage () =
     printfn
-        "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|spill|compaction|index|eval|op] [--quick|--dry] [--filter <pattern>]"
+        "使い方: dotnet run -c Release --project tools/RykDb.Bench -- [--class query|spill|compaction|index|eval|op|storage] [--quick|--dry] [--filter <pattern>]"
 
     printfn "  --class query       クエリ系のみ"
     printfn "  --class spill       スピル強制（DISTINCT / GROUP BY / JOIN / ORDER BY）のみ"
@@ -45,6 +45,7 @@ let private usage () =
     printfn "  --class index       索引の読み書き・サイズのベンチのみ"
     printfn "  --class eval        式評価器のマイクロベンチのみ"
     printfn "  --class op          Op（pull 演算子）のマイクロベンチのみ"
+    printfn "  --class storage     RowStore / エンジンのポイント検索のみ"
     printfn "  --quick             短いジョブ（既定より速いが精度は低い）"
     printfn "  --dry               1回だけ実行して設定を検証する"
     printfn "  --filter <pattern>  シナリオ名で絞る（例: *QueryBenchmarks.PointLookup）"
@@ -97,9 +98,10 @@ let main argv =
     | Some "compaction"
     | Some "index"
     | Some "eval"
-    | Some "op" -> ()
+    | Some "op"
+    | Some "storage" -> ()
     | Some other ->
-        eprintfn "不明な --class です: %s（query / spill / compaction / index / eval / op）" other
+        eprintfn "不明な --class です: %s（query / spill / compaction / index / eval / op / storage）" other
         exit 2
 
     let job =
@@ -154,6 +156,11 @@ let main argv =
         | Some "op" -> true
         | _ -> false
 
+    let runStorage =
+        match options.Class with
+        | Some "storage" -> true
+        | _ -> false
+
     printfn "RykDb benchmarks（CI ではビルドのみ。実行は手元で -c Release）"
 
     // `--filter` は BenchmarkDotNet の引数としてそのまま渡す。
@@ -180,5 +187,8 @@ let main argv =
 
     if runOp then
         BenchmarkRunner.Run<OpBenchmarks>(config, filterArgs) |> ignore
+
+    if runStorage then
+        BenchmarkRunner.Run<StorageBenchmarks>(config, filterArgs) |> ignore
 
     0

@@ -296,8 +296,11 @@ flush失敗は`StorageRuntime.LastFlushError`に残し、次のwriteで再試行
 MANIFESTへ反映する前に、削除対象ファイルが現在のVersionに存在するか、古いsnapshotが必要な版を守っているかを再確認する。
 ファイル番号は同じCAS採番経路だけで進める。
 `Manifest.logAndApplyWithOutcome`は`Applied` / `NotApplied` / `Unknown`を返す。
-`NotApplied`は出力を削除してよく、`Unknown`はMANIFESTが参照している可能性があるので削除しない。
-切り詰め自体に失敗した場合も`Unknown`とし、次回openの`quarantineOrphans`に任せる。
+`NotApplied`は出力を削除してよく、`Unknown`はすぐには削除も退避もしない。
+`Unknown`のときは`Manifest.openOrCreate`でMANIFESTを読み直し、
+期待するファイル集合と一致すればAppliedとして公開し、
+一致しなければNotAppliedとして出力を削除する。
+読み直し自体が失敗した場合だけ、次回openの`quarantineOrphans`に任せる。
 同期のflush/compactionは失敗時に次のファイル番号を進めたengineを返し、参照中SSTableを上書きしない。
 
 ### 4.15 maybeFlushの結果をcompaction失敗で巻き戻さない

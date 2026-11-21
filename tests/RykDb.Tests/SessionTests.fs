@@ -162,6 +162,20 @@ let ``Session: ハンドルなしで連続実行できる`` () =
         Assert.Equal<string list>([ "t" ], ok (session.TableNames())))
 
 [<Fact>]
+let ``Session: flush / compaction の直近の失敗を公開する`` () =
+    withDiskSession "session-diagnostics" (fun session ->
+        // 正常に開いた直後はどちらも失敗していない。
+        Assert.True(session.LastFlushError.IsNone)
+        Assert.True(session.LastCompactionError.IsNone)
+
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        |> ignore
+
+        Assert.True(session.LastFlushError.IsNone)
+        // 同期 compaction の Session は worker を持たないため常に None。
+        Assert.True(session.LastCompactionError.IsNone))
+
+[<Fact>]
 let ``Session: 複数文の結果は SELECT が 1つならその結果、それ以外は合計`` () =
     withDiskSession "session-multi-summary" (fun session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore

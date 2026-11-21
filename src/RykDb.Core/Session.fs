@@ -444,6 +444,16 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// 実行中の transaction があるか。
     member _.InTransaction = inTransaction ()
 
+    /// 直近の flush 失敗（成功したら None）。
+    /// WAL へ commit 済みのため書き込みは継続できるが、SSTable 化が失敗している。
+    member _.LastFlushError = host.Committed.Store.Engine.LastFlushError
+
+    /// 直近の background compaction の失敗（成功したら None）。
+    /// 同期 compaction で開いた場合は常に None。
+    member _.LastCompactionError =
+        host.Committed.Store.Host
+        |> Option.bind (fun coordinator -> coordinator.LastCompactionError)
+
     /// テーブル一覧を返す。
     member _.TableNames() =
         lock stateGate (fun () ->

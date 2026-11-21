@@ -52,6 +52,8 @@ type internal RowStoreOptions =
         Compaction: CompactionOptions option
         /// テスト用: compaction が入力ファイルを開く直前に呼ばれる。
         ScanHook: (FileMetaData -> unit) option
+        /// テスト用: MANIFEST への反映結果を差し替える（`None` なら実装どおり）。
+        ManifestApplyHook: (VersionEdit -> ManifestApplyResult option) option
     }
 
 module internal RowStoreOptions =
@@ -61,6 +63,7 @@ module internal RowStoreOptions =
             MemLimitBytes = None
             Compaction = None
             ScanHook = None
+            ManifestApplyHook = None
         }
 
     let Background =
@@ -468,7 +471,13 @@ module internal RowStore =
                         engine.Compaction,
                         (fun () -> runtime.OldestExcept(root, None)),
                         (fun f -> StorageEngine.openScan root f),
-                        options.ScanHook
+                        options.ScanHook,
+                        options.ManifestApplyHook
+                        |> Option.map (fun hook ->
+                            fun manifestNumber version edit ->
+                                match hook edit with
+                                | Some result -> result
+                                | None -> Manifest.logAndApplyWithOutcome root manifestNumber version edit)
                     )
                     |> Some
                 else

@@ -50,6 +50,10 @@ type Session =
 
     /// 実行中の transaction があるか。
     member InTransaction: bool
+    /// 直近の flush 失敗（成功したら None）。
+    member LastFlushError: DbError option
+    /// 直近の background compaction の失敗（成功したら None）。
+    member LastCompactionError: DbError option
     /// テーブル一覧を返す。
     member TableNames: unit -> Result<string list, DbError>
     /// 単一の SELECT を materialize せずに開く。
