@@ -13,10 +13,16 @@ module internal Optimizer =
 
     /// ハッシュ結合の build 側を推定行数で決める。
     /// LEFT JOIN は左行を保存する必要があるため常に右を build する。
-    let private hashBuildSide (algorithm: JoinAlgorithm) (kind: JoinKind) (left: Logical) (right: Logical) =
+    let private hashBuildSide
+        (statsOf: string -> TableStats option)
+        (algorithm: JoinAlgorithm)
+        (kind: JoinKind)
+        (left: Logical)
+        (right: Logical)
+        =
         match algorithm, kind with
         | JoinAlgorithm.HashJoin, JoinKind.Inner ->
-            if Analyzer.estimateRows left < Analyzer.estimateRows right then
+            if Analyzer.estimateRowsWith statsOf left < Analyzer.estimateRowsWith statsOf right then
                 HashBuildLeft
             else
                 HashBuildRight
@@ -271,8 +277,10 @@ module internal Optimizer =
                     let table = defaultSchema ctx name
                     Schema.ofTable name None table, Some table
 
+            let statsOf name = ExecContext.statsOf name ctx
+
             let algorithm, keys, leftKeyIndices =
-                Analyzer.chooseJoinAlgorithm (tableOf ctx) leftSchema rightSchema rightTable left right on
+                Analyzer.chooseJoinAlgorithmWith statsOf (tableOf ctx) leftSchema rightSchema rightTable left right on
 
             let frame: JoinFrame =
                 {
@@ -285,7 +293,7 @@ module internal Optimizer =
                     Algorithm = algorithm
                     Keys = keys
                     LeftKeyIndices = defaultArg leftKeyIndices [||]
-                    BuildSide = hashBuildSide algorithm kind left right
+                    BuildSide = hashBuildSide statsOf algorithm kind left right
                 }
 
             frame, leftSchema
@@ -730,11 +738,21 @@ module internal Optimizer =
                         let table = defaultSchema item.Context name
                         Schema.ofTable name None table, Some table
 
+                let statsOf name = ExecContext.statsOf name item.Context
+
                 let algorithm, _, _ =
-                    Analyzer.chooseJoinAlgorithm (tableOf item.Context) leftSchema rightSchema rightTable left right on
+                    Analyzer.chooseJoinAlgorithmWith
+                        statsOf
+                        (tableOf item.Context)
+                        leftSchema
+                        rightSchema
+                        rightTable
+                        left
+                        right
+                        on
 
                 let algorithmTextValue =
-                    match algorithm, hashBuildSide algorithm kind left right with
+                    match algorithm, hashBuildSide statsOf algorithm kind left right with
                     | JoinAlgorithm.HashJoin, HashBuildLeft -> "HashJoin(left)"
                     | _ -> algorithmText algorithm
 

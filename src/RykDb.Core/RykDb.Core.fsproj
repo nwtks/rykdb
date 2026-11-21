@@ -48,6 +48,7 @@
     <Compile Include="ExecContext.fs" />
     <Compile Include="Binder.fs" />
     <Compile Include="Analyzer.fs" />
+    <Compile Include="JoinOrder.fs" />
     <Compile Include="PlanBuilder.fs" />
     <Compile Include="Optimizer.fs" />
     <Compile Include="ValueSet.fs" />

@@ -479,6 +479,25 @@ module internal Parser =
             return! alterAction name st
         }
 
+    /// `ANALYZE [TABLE] テーブル名`。
+    /// `ANALYZE` / `TABLE` は予約語にしない（`EXPLAIN` / `ALTER` と同じ）。
+    let private parseAnalyze (st: PState) =
+        let st =
+            match peek st with
+            | Token.Keyword "TABLE" -> advance st
+            | _ -> st
+
+        match peek st with
+        | Token.Ident name
+        | Token.QuotedIdent name ->
+            let st = advance st
+
+            result {
+                let! _, st = eatOptionalSemicolon st
+                return Statement.Analyze name, st
+            }
+        | _ -> fail "ANALYZE にはテーブル名が必要です" st
+
     let private parseOne (st: PState) =
         let nextToken =
             if st.Pos + 1 < st.Tokens.Length then
@@ -522,6 +541,7 @@ module internal Parser =
                 }
             | _ -> fail "EXPLAIN は SELECT 文だけに対応しています" st
         | Token.Ident name when name.ToUpperInvariant() = "ALTER" -> advance st |> parseAlterTable
+        | Token.Ident name when name.ToUpperInvariant() = "ANALYZE" -> advance st |> parseAnalyze
         | Token.Ident name when name.ToUpperInvariant() = "START" ->
             let st = advance st
 

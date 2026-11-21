@@ -74,6 +74,12 @@ module internal ExecContext =
                 | Some t -> Catalog.toSchema t
                 | None -> err (sprintf "テーブル '%s' が存在しません" name |> DbError.name)
 
+    /// テーブルの統計を引く（別名はスキーマ経由で実テーブル名へ解決する）。
+    let statsOf (name: string) (ctx: ExecContext) =
+        match schemaOf name ctx with
+        | Ok schema -> Catalog.findStats schema.Name ctx.Catalog
+        | Error _ -> None
+
     /// テーブルを全走査する（列マスク付き）。
     let tableMasked (ctx: ExecContext) (table: string) (limit: int) (mask: bool array) =
         result {

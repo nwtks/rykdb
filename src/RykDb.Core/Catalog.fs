@@ -41,15 +41,33 @@ type internal IndexDefinition =
         Unique: bool
     }
 
+/// `ANALYZE` が収集するテーブル統計。
+/// <remarks>
+/// `ColumnNDV` は列名 -> 異なり値数（NULL を含む）。
+/// 統計は手動で更新する。INSERT / UPDATE / DELETE では自動更新しない。
+/// </remarks>
+type internal TableStats =
+    {
+        Table: string
+        RowCount: int64
+        ColumnNDV: (string * int64) list
+    }
+
 /// カタログ全体のスナップショット。
 type internal Catalog =
     {
         Tables: TableDefinition list
         Indexes: IndexDefinition list
+        Stats: TableStats list
     }
 
 module internal Catalog =
-    let Empty = { Tables = []; Indexes = [] }
+    let Empty =
+        {
+            Tables = []
+            Indexes = []
+            Stats = []
+        }
 
     /// SQL の識別子は大文字小文字を区別しない（OrdinalIgnoreCase）。
     let eqName (a: string) (b: string) = SqlName.equal a b
@@ -67,11 +85,27 @@ module internal Catalog =
         c.Indexes |> List.filter (fun i -> eqName i.TableName table)
 
     /// 同名（大文字小文字を無視）の要素を除いてから末尾へ足す、共通の upsert。
-    /// addTable / addIndex は名前の取り出し方だけが違う。
+    /// addTable / addIndex / addStats は名前の取り出し方だけが違う。
     let private upsert (nameOf: 'a -> string) (item: 'a) (items: 'a list) =
         items
         |> List.filter (fun x -> not (eqName (nameOf x) (nameOf item)))
         |> fun xs -> xs @ [ item ]
+
+    /// テーブルの統計を探す。無ければ None。
+    let findStats (table: string) (c: Catalog) =
+        c.Stats |> List.tryFind (fun s -> eqName s.Table table)
+
+    /// テーブルの統計を追加（同名があれば置き換える）。
+    let addStats (s: TableStats) (c: Catalog) =
+        { c with
+            Stats = upsert _.Table s c.Stats
+        }
+
+    /// テーブルの統計を削除する。
+    let removeStats (table: string) (c: Catalog) =
+        { c with
+            Stats = c.Stats |> List.filter (fun s -> not (eqName s.Table table))
+        }
 
     /// テーブルを追加（同名があれば置き換える）。
     let addTable (t: TableDefinition) (c: Catalog) =
@@ -79,11 +113,12 @@ module internal Catalog =
             Tables = upsert _.Name t c.Tables
         }
 
-    /// テーブルを削除する（そのテーブルの索引も消える）。
+    /// テーブルを削除する（そのテーブルの索引と統計も消える）。
     let removeTable (name: string) (c: Catalog) =
         { c with
             Tables = c.Tables |> List.filter (fun t -> not (eqName t.Name name))
             Indexes = c.Indexes |> List.filter (fun i -> not (eqName i.TableName name))
+            Stats = c.Stats |> List.filter (fun s -> not (eqName s.Table name))
         }
 
     /// 索引を追加（同名があれば置き換える）。
@@ -315,6 +350,37 @@ module internal Catalog =
                 }
         }
 
+    let private encodeStats (s: TableStats) =
+        let w0 =
+            Writer.Empty
+            |> Writer.int64LE s.RowCount
+            |> Writer.varint (uint64 s.ColumnNDV.Length)
+
+        s.ColumnNDV
+        |> List.fold (fun w (name, ndv) -> w |> Writer.str name |> Writer.int64LE ndv) w0
+        |> Writer.toArray
+
+    let private readColumnStat (c: Cursor) =
+        result {
+            let! name, c1 = Reader.readStr c
+            let! ndv, c2 = Reader.readInt64LE c1
+            return (name, ndv), c2
+        }
+
+    let private decodeStats (table: string) (bytes: byte array) =
+        result {
+            let! rowCount, cur1 = Cursor.create bytes |> Reader.readInt64LE
+            let! colCount, cur2 = Reader.readVarint cur1
+            let! cols, _ = Reader.readItems readColumnStat colCount cur2
+
+            return
+                {
+                    Table = table
+                    RowCount = rowCount
+                    ColumnNDV = cols
+                }
+        }
+
     /// カタログのテーブル定義キー（`table:<name>`）。
     let private tableKey (name: string) =
         System.Text.Encoding.UTF8.GetBytes("table:" + name)
@@ -323,6 +389,10 @@ module internal Catalog =
     let private indexKey (name: string) =
         System.Text.Encoding.UTF8.GetBytes("index:" + name)
 
+    /// カタログの統計キー（`stats:<name>`）。
+    let private statsKey (name: string) =
+        System.Text.Encoding.UTF8.GetBytes("stats:" + name)
+
     let private toValue (bytes: byte array) = [| SqlValue.Blob bytes |]
 
     let private tableBatch (t: TableDefinition) (seq: uint64) =
@@ -330,6 +400,9 @@ module internal Catalog =
 
     let private indexBatch (i: IndexDefinition) (seq: uint64) =
         Keyspace.CatalogKeyspace, [| Entry.put (indexKey i.IndexName) seq (toValue (encodeIndex i)) |]
+
+    let private statsBatch (s: TableStats) (seq: uint64) =
+        Keyspace.CatalogKeyspace, [| Entry.put (statsKey s.Table) seq (toValue (encodeStats s)) |]
 
     let private deleteBatch (key: byte array) (seq: uint64) =
         Keyspace.CatalogKeyspace, [| Entry.delete key seq |]
@@ -346,6 +419,10 @@ module internal Catalog =
     /// 索引定義を transaction に積む（列名の変更を 1 commit で反映する）。
     let putIndexInTxn (i: IndexDefinition) (txn: Transaction) =
         Transaction.put Keyspace.CatalogKeyspace (indexKey i.IndexName) (toValue (encodeIndex i)) txn
+
+    /// テーブルの統計を transaction で削除する（`ALTER TABLE` で行の形が変わるとき）。
+    let removeStatsInTxn (table: string) (txn: Transaction) =
+        Transaction.remove Keyspace.CatalogKeyspace (statsKey table) txn
 
     /// カタログを保存する（消えた定義は tombstone で落とす）。
     /// previous は保存前のカタログ（store にあった内容）。
@@ -368,14 +445,21 @@ module internal Catalog =
             | Some p -> not (bytesEqual (encodeIndex p) (encodeIndex i))
             | None -> true
 
+        let changedStats (s: TableStats) =
+            match previous.Stats |> List.tryFind (fun p -> eqName p.Table s.Table) with
+            | Some p -> not (bytesEqual (encodeStats p) (encodeStats s))
+            | None -> true
+
         let staleKeys =
             let wanted =
                 (catalog.Tables |> List.map (fun t -> tableKey t.Name))
                 @ (catalog.Indexes |> List.map (fun i -> indexKey i.IndexName))
+                @ (catalog.Stats |> List.map (fun s -> statsKey s.Table))
 
             let known =
                 (previous.Tables |> List.map (fun t -> tableKey t.Name))
                 @ (previous.Indexes |> List.map (fun i -> indexKey i.IndexName))
+                @ (previous.Stats |> List.map (fun s -> statsKey s.Table))
 
             known
             |> List.filter (fun k -> not (wanted |> List.exists (fun w -> bytesEqual k w)))
@@ -390,10 +474,13 @@ module internal Catalog =
             let indexBatches, seq2 =
                 numberList indexBatch (catalog.Indexes |> List.filter changedIndex) seq1 []
 
-            let deleteBatches, _ = numberList deleteBatch staleKeys seq2 []
+            let statsBatches, seq3 =
+                numberList statsBatch (catalog.Stats |> List.filter changedStats) seq2 []
+
+            let deleteBatches, _ = numberList deleteBatch staleKeys seq3 []
 
             let! updated =
-                RowStore.writeBatches (tableBatches @ indexBatches @ deleteBatches) store
+                RowStore.writeBatches (tableBatches @ indexBatches @ statsBatches @ deleteBatches) store
 
             return updated
         }
@@ -418,11 +505,14 @@ module internal Catalog =
 
         let keyKindOf key =
             match tryPrefix key "table:" with
-            | Some name -> Some(false, name)
+            | Some name -> Some(0, name)
             | None ->
                 match tryPrefix key "index:" with
-                | Some name -> Some(true, name)
-                | None -> None
+                | Some name -> Some(1, name)
+                | None ->
+                    match tryPrefix key "stats:" with
+                    | Some name -> Some(2, name)
+                    | None -> None
 
         let rec decodeRows (rows: (byte array * SqlValue array option) array) i c =
             if i >= rows.Length then
@@ -437,15 +527,19 @@ module internal Catalog =
                     | None -> decodeRows rows (i + 1) c
                     | Some bytes ->
                         match keyKindOf key with
-                        | Some(false, name) ->
+                        | Some(0, name) ->
                             match decodeTable name bytes with
                             | Ok t -> addTable t c |> decodeRows rows (i + 1)
                             | Error e -> err e
-                        | Some(true, name) ->
+                        | Some(1, name) ->
                             match decodeIndex name bytes with
                             | Ok idx -> addIndex idx c |> decodeRows rows (i + 1)
                             | Error e -> err e
-                        | None -> decodeRows rows (i + 1) c
+                        | Some(2, name) ->
+                            match decodeStats name bytes with
+                            | Ok s -> addStats s c |> decodeRows rows (i + 1)
+                            | Error e -> err e
+                        | _ -> decodeRows rows (i + 1) c
 
         RowStore.scan Keyspace.CatalogKeyspace [||] 0 store
         >>= fun rows -> SstScan.toArray rows

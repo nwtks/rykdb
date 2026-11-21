@@ -400,6 +400,7 @@ and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
     | CreateIndex of CreateIndex
     | DropIndex of string * bool
     | AlterTable of AlterTable
+    | Analyze of string
     | Begin
     | Commit
     | Rollback

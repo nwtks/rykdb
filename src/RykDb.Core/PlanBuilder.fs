@@ -233,48 +233,6 @@ module internal PlanBuilder =
                     | _ -> None
                 | _ -> None)
 
-        let eligible dependencies joined name =
-            match dependencies |> Map.tryFind name with
-            | None -> true
-            | Some refs -> Set.isSubset refs (Set.add name joined)
-
-        let linkCount edges joined name =
-            edges
-            |> List.filter (fun e -> Set.contains name e && not (Set.isEmpty (Set.intersect e joined)))
-            |> List.length
-
-        let nextRows edges joined joinedRows (name, rows, _) =
-            let links = linkCount edges joined name
-
-            if links = 0 then
-                joinedRows * rows
-            else
-                max 1.0 (joinedRows * rows * 0.1 ** float links)
-
-        let chooseOrder initialRows joined edges items dependencies =
-            let rec go joinedRows joined remaining acc =
-                match remaining with
-                | [] -> List.rev acc
-                | _ ->
-                    let ready =
-                        remaining |> List.filter (fun (n, _, _) -> eligible dependencies joined n)
-
-                    let pool = if List.isEmpty ready then remaining else ready
-
-                    let name, rows, _ =
-                        pool
-                        |> List.minBy (fun item ->
-                            let _, _, position = item
-                            nextRows edges joined joinedRows item, position)
-
-                    go
-                        (nextRows edges joined joinedRows (name, rows, 0))
-                        (Set.add name joined)
-                        (remaining |> List.filter (fun (n, _, _) -> n <> name))
-                        (name :: acc)
-
-            go initialRows joined items []
-
         let promoteAt joinPredicates joined used next =
             let take, used' =
                 joinPredicates
@@ -297,6 +255,7 @@ module internal PlanBuilder =
             (bindings: SourceBinding list)
             scans
             (estimates: float array)
+            (estimate: Logical -> float)
             joinPredicates
             acc
             accSchema
@@ -313,6 +272,7 @@ module internal PlanBuilder =
                         bindings
                         scans
                         estimates
+                        estimate
                         joinPredicates
                         node
                         schema
@@ -352,11 +312,17 @@ module internal PlanBuilder =
 
                 let order =
                     if dependencies |> List.forall Option.isSome then
-                        chooseOrder
-                            (Analyzer.estimateRows acc)
+                        JoinOrder.choose
+                            (estimate acc)
                             joined
                             edges
-                            (inner |> List.map (fun (i, _) -> lowerName bindings.[i], estimates.[i], i))
+                            (inner
+                             |> List.map (fun (i, _) ->
+                                 {
+                                     Name = lowerName bindings.[i]
+                                     Rows = estimates.[i]
+                                     Position = i
+                                 }))
                             (dependencies |> List.choose id |> Map.ofList)
                     else
                         inner |> List.map (fun (i, _) -> lowerName bindings.[i])
@@ -381,6 +347,7 @@ module internal PlanBuilder =
                         bindings
                         scans
                         estimates
+                        estimate
                         joinPredicates
                         node
                         schema
@@ -583,6 +550,13 @@ module internal PlanBuilder =
 
                 let bindingNames = bindings |> List.map lowerName |> Set.ofList
 
+                let statsOf name =
+                    bindings
+                    |> List.tryFind (fun b -> Catalog.eqName (bindingName b) name)
+                    |> Option.bind (function
+                        | Base tb -> Catalog.findStats tb.RealName ctx.Catalog
+                        | DerivedSource _ -> None)
+
                 let classified =
                     predicates
                     |> List.map (fun p ->
@@ -642,7 +616,7 @@ module internal PlanBuilder =
                     |> all
 
                 let scans' = List.toArray scans
-                let estimates = scans' |> Array.map Analyzer.estimateRows
+                let estimates = scans' |> Array.map (Analyzer.estimateRowsWith statsOf)
                 let joinPredicates' = List.toArray joinPredicates
 
                 let! joined, usedJoinPredicates =
@@ -656,6 +630,7 @@ module internal PlanBuilder =
                             bindings
                             scans'
                             estimates
+                            (Analyzer.estimateRowsWith statsOf)
                             joinPredicates'
                             scans'.[0]
                             (bindingSchema first)

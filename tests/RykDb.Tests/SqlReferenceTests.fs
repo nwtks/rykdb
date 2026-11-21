@@ -468,6 +468,48 @@ let ``SqlReference: ALTER TABLE RENAME COLUMN は行と索引の列名を書き�
         expectErrorKind ErrorKind.NameError "不在" (execSql db6 "ALTER TABLE t RENAME COLUMN nope TO x"))
 
 [<Fact>]
+let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
+    withSession "analyze" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,10),(3,20)"
+        let db3 = exec db2 "ANALYZE t"
+        let _ = exec db3 "ANALYZE TABLE t;"
+        let _ = exec db3 "ANALYZE t"
+        // 存在しないテーブルは NameError
+        expectErrorKind ErrorKind.NotFound "存在しないテーブル" (execSql db3 "ANALYZE nope")
+        // DDL と同じく transaction 中は実行できない
+        let db4 = exec db3 "BEGIN"
+        expectErrorKind ErrorKind.SyntaxError "transaction 中の ANALYZE" (execSql db4 "ANALYZE t")
+        exec db4 "ROLLBACK" |> ignore)
+
+[<Fact>]
+let ``SqlReference: ANALYZE の統計は再オープン後も残り、ALTER TABLE で消える`` () =
+    withDir "analyze-reopen" (fun dir ->
+        let s1 = ok (Session.OpenWithSync(dir, SessionOptions.Default))
+        let s1 = exec s1 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let s1 = exec s1 "INSERT INTO t VALUES (1,10),(2,10),(3,20)"
+        let s1 = exec s1 "UPDATE t SET v = 30 WHERE id = 2"
+        let s1 = exec s1 "DELETE FROM t WHERE id = 1"
+        let s1 = exec s1 "ANALYZE t"
+        ok (s1.Close()) |> ignore
+
+        let store = ok (RowStore.openStore dir)
+        let loaded = ok (Catalog.load store)
+        let stats = expectSome "t の統計" (Catalog.findStats "t" loaded)
+        Assert.Equal<int64>(2L, stats.RowCount)
+        ok (RowStore.close store) |> ignore
+
+        // ALTER TABLE は統計を削除する（行の形が変わるため）。
+        let s2 = ok (Session.OpenWithSync(dir, SessionOptions.Default))
+        let s2 = exec s2 "ALTER TABLE t ADD COLUMN x INTEGER"
+        ok (s2.Close()) |> ignore
+
+        let store2 = ok (RowStore.openStore dir)
+        let loaded2 = ok (Catalog.load store2)
+        Assert.True(Catalog.findStats "t" loaded2 |> Option.isNone)
+        ok (RowStore.close store2) |> ignore)
+
+[<Fact>]
 let ``SqlReference: ALTER TABLE は transaction 中に実行できない`` () =
     withSession "alter-txn" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"

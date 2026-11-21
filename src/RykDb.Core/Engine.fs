@@ -324,6 +324,52 @@ module internal ExecState =
 
         loop state [||]
 
+    /// テーブルの行数と列の異なり値数を再収集する。
+    /// 統計はカタログに保存する（`Catalog.save` が差分を書く）。
+    let private analyzeCore (table: string) (state: ExecState) =
+        match Catalog.findTable table state.Catalog with
+        | None -> err (sprintf "テーブル %s が存在しません" table |> DbError.notFound)
+        | Some defn ->
+            result {
+                let! schema = Catalog.toSchema defn
+                let! scan = RowStore.scan (Keyspace.table schema.Name) [||] 0 state.Store
+
+                let columnSets =
+                    Array.init schema.Columns.Length (fun _ -> System.Collections.Generic.HashSet<string>())
+
+                let rec consume count scan =
+                    match SstScan.next scan with
+                    | Error e ->
+                        SstScan.dispose scan
+                        err e
+                    | Ok None -> ret count
+                    | Ok(Some(entry, rest)) ->
+                        entry.Value
+                        |> Option.iter (fun row ->
+                            row
+                            |> Array.iteri (fun i value ->
+                                if i < columnSets.Length then
+                                    columnSets.[i].Add(SqlLiteral.toSqlLiteral value) |> ignore))
+
+                        consume (count + 1L) rest
+
+                let! rowCount = consume 0L scan
+
+                let columnNdv =
+                    schema.Columns |> List.mapi (fun i col -> col.Name, int64 columnSets.[i].Count)
+
+                let stats =
+                    {
+                        Table = schema.Name
+                        RowCount = rowCount
+                        ColumnNDV = columnNdv
+                    }
+
+                return! saved (Catalog.addStats stats state.Catalog) state
+            }
+
+    let analyze (table: string) (state: ExecState) = exclusiveDdl state (analyzeCore table)
+
     let private createTableCore (c: CreateTable) (state: ExecState) =
         let existing = Catalog.findTable c.Name state.Catalog
 
@@ -739,9 +785,11 @@ module internal ExecState =
                             }
 
                         rewriteTable nextSchema transform txn state.Store
-                        |> Result.map (Catalog.putTableInTxn nextDefn)
+                        |> Result.map (fun txn ->
+                            txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn defn.Name)
 
-                    return! commitRewrite (Catalog.addTable nextDefn state.Catalog) build
+                    return!
+                        commitRewrite (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)) build
                 | AlterTableAction.DropColumn name ->
                     let! pos = TableSchema.requireIndexOf schema name
 
@@ -809,9 +857,11 @@ module internal ExecState =
                             }
 
                         rewriteTable nextSchema transform txn state.Store
-                        |> Result.map (Catalog.putTableInTxn nextDefn)
+                        |> Result.map (fun txn ->
+                            txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn defn.Name)
 
-                    return! commitRewrite (Catalog.addTable nextDefn state.Catalog) build
+                    return!
+                        commitRewrite (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)) build
                 | AlterTableAction.RenameColumn(oldName, newName) ->
                     let! pos = TableSchema.requireIndexOf schema oldName
 
@@ -880,7 +930,7 @@ module internal ExecState =
                             (nextIndexes
                              |> List.fold
                                  (fun cat i -> Catalog.addIndex i cat)
-                                 (Catalog.addTable nextDefn state.Catalog))
+                                 (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)))
 
                     let build txn =
                         referencing
@@ -889,7 +939,7 @@ module internal ExecState =
                             (nextIndexes
                              |> List.fold
                                  (fun t idx -> Catalog.putIndexInTxn idx t)
-                                 (Catalog.putTableInTxn nextDefn txn))
+                                 (txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn defn.Name))
                         |> ret
 
                     return! commitRewrite nextCatalog build
@@ -1113,6 +1163,7 @@ module internal Engine =
         | Statement.CreateIndex ci -> ExecState.createIndex ci |> runDdl state
         | Statement.DropIndex(n, ifE) -> ExecState.dropIndex n ifE |> runDdl state
         | Statement.AlterTable a -> ExecState.alterTable a |> runDdl state
+        | Statement.Analyze name -> ExecState.analyze name |> runDdl state
         | Statement.Begin
         | Statement.Commit
         | Statement.Rollback -> ret state |> noRows
@@ -1160,7 +1211,8 @@ module internal Engine =
                 | Statement.DropTable _
                 | Statement.CreateIndex _
                 | Statement.DropIndex _
-                | Statement.AlterTable _ -> true
+                | Statement.AlterTable _
+                | Statement.Analyze _ -> true
                 | _ -> false
 
             (if isDdl then run () else state.Store.Runtime.WithShared run) |> finish

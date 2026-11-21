@@ -70,6 +70,14 @@ type QueryBenchmarks() =
     let joinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id"
     let mergeJoinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id"
 
+    // 直積を含む疎な 4テーブル結合（結合順の DP で中間行数が変わる形）。
+    let join4SparseSql =
+        "SELECT COUNT(*) FROM j1 JOIN j2 ON TRUE JOIN j3 ON TRUE JOIN j4 ON j3.id = j4.id"
+
+    // 全テーブルが結合述語で繋がる密な 4テーブル結合。
+    let join4DenseSql =
+        "SELECT COUNT(*) FROM j1 JOIN j2 ON j1.id = j2.id JOIN j3 ON j2.id = j3.id JOIN j4 ON j3.id = j4.id"
+
     let residualJoinSql =
         "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id AND a.v + b.v > 190"
     // 結果は 0行。ON 句だけを 200 × 20,000回評価する（出力行の割当を除く）。
@@ -116,11 +124,19 @@ type QueryBenchmarks() =
         this.Exec "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)"
         this.Exec "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)"
         this.Exec "CREATE TABLE ins (id INTEGER PRIMARY KEY, v TEXT)"
+        this.Exec "CREATE TABLE j1 (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE j2 (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE j3 (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE j4 (id INTEGER PRIMARY KEY, v INTEGER)"
 
         this.Seed("t", 10_000, 99_999, fun i -> sprintf "(%d, %d, '%s')" i (i % 1000) (BenchText.ofInt i))
         this.Seed("a", 5_000, 19_999, fun i -> sprintf "(%d, %d)" i (i % 100))
         this.Seed("b", 5_000, 19_999, fun i -> sprintf "(%d, %d)" i (i % 100))
         this.Seed("c", 200, 199, fun i -> sprintf "(%d, %d)" i i)
+        this.Seed("j1", 10, 0, fun _ -> "(1, 1)")
+        this.Seed("j2", 10, 99, fun i -> sprintf "(%d, %d)" i i)
+        this.Seed("j3", 10, 9, fun i -> sprintf "(%d, %d)" i i)
+        this.Seed("j4", 10, 9, fun i -> sprintf "(%d, %d)" i i)
 
         session.Close() |> Check.ok |> ignore
 
@@ -241,6 +257,14 @@ type QueryBenchmarks() =
     /// 3テーブル JOIN（主キー同士の等値結合）。
     [<Benchmark>]
     member this.Join3Tables() = this.Exec joinSql
+
+    /// 直積を含む疎な 4テーブル JOIN（結合順の効果を測る）。
+    [<Benchmark>]
+    member this.Join4TablesSparse() = this.Exec join4SparseSql
+
+    /// 全テーブルが結合述語で繋がる密な 4テーブル JOIN。
+    [<Benchmark>]
+    member this.Join4TablesDense() = this.Exec join4DenseSql
 
     /// 2テーブルの等値結合（主キー順の走査なのでマージ結合になる）。
     [<Benchmark>]

@@ -56,6 +56,27 @@ let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
         Assert.True(loaded.Indexes.[0].Unique))
 
 [<Fact>]
+let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
+    withStore "cat-stats" (fun store ->
+        let stats: TableStats =
+            {
+                Table = "people"
+                RowCount = 3L
+                ColumnNDV = [ "id", 3L; "name", 2L ]
+            }
+
+        let c = Catalog.addStats stats Catalog.Empty
+        let store = ok (Catalog.save store Catalog.Empty c)
+        let loaded = ok (Catalog.load store)
+        let s = expectSome "people の統計" (Catalog.findStats "PEOPLE" loaded)
+        Assert.Equal<int64>(3L, s.RowCount)
+
+        Assert.True(
+            Catalog.findStats "people" (Catalog.removeTable "people" loaded)
+            |> Option.isNone
+        ))
+
+[<Fact>]
 let ``Catalog.removeIndex: removeIndex は指定した索引だけ消す`` () =
     let ixA =
         {

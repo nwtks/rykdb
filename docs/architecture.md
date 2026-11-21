@@ -50,7 +50,7 @@ flowchart TB
 
     subgraph EX["実行層"]
         ENGINE["Engine"]
-        PLAN["Binder / Analyzer / PlanBuilder / Optimizer"]
+        PLAN["Binder / Analyzer / JoinOrder / PlanBuilder / Optimizer"]
         OPS["Op / Ops / OpsJoin / Eval"]
     end
 
@@ -170,22 +170,22 @@ flowchart TB
 
 ### 主要モジュール
 
-| モジュール                                               | 役割                                   |
-| -------------------------------------------------------- | -------------------------------------- |
-| `Errors`、`Types`                                        | `DbError`、`SqlValue`、型、3値論理     |
-| `Writer`、`Cursor`、`Serialization`                      | 不変書き込み、カーソル、順序保持符号化 |
-| `Memtable`、`Wal`                                        | 永続Treapと論理ログ                    |
-| `SstScan`、`Sstable`、`SstableFormat`                    | 部分読み、ブロック走査、SSTable形式    |
-| `VersionSet`、`Manifest`、`Compaction`                   | レベル構成、版履歴、圧縮               |
-| `StorageEngine`                                          | LSMツリーの公開層                      |
-| `Ast`、`Lexer`、`Parser`                                 | SQL構文木、字句解析、構文解析          |
-| `Transactions`、`ProcessLock`                            | MVCC、プロセス間排他                   |
-| `RowStore`、`TableSchema`、`Catalog`                     | 行、スキーマ、論理keyspace             |
-| `Eval`、`Scalar`                                         | 式評価とスカラー関数                   |
-| `Op`、`Ops`、`OpsJoin`、`ExtSort`、`Spill`               | pull演算子、結合、ソート、退避         |
-| `Binder`、`Analyzer`、`PlanBuilder`、`Optimizer`、`Plan` | 名前解決、論理代数、物理計画           |
-| `Dml`、`ForeignKey`、`ExecContext`                       | DMLと参照整合性                        |
-| `Engine`、`DatabaseHost`、`Session`                      | 文実行、共有状態、接続API              |
+| モジュール                                                            | 役割                                   |
+| --------------------------------------------------------------------- | -------------------------------------- |
+| `Errors`、`Types`                                                     | `DbError`、`SqlValue`、型、3値論理     |
+| `Writer`、`Cursor`、`Serialization`                                   | 不変書き込み、カーソル、順序保持符号化 |
+| `Memtable`、`Wal`                                                     | 永続Treapと論理ログ                    |
+| `SstScan`、`Sstable`、`SstableFormat`                                 | 部分読み、ブロック走査、SSTable形式    |
+| `VersionSet`、`Manifest`、`Compaction`                                | レベル構成、版履歴、圧縮               |
+| `StorageEngine`                                                       | LSMツリーの公開層                      |
+| `Ast`、`Lexer`、`Parser`                                              | SQL構文木、字句解析、構文解析          |
+| `Transactions`、`ProcessLock`                                         | MVCC、プロセス間排他                   |
+| `RowStore`、`TableSchema`、`Catalog`                                  | 行、スキーマ、論理keyspace             |
+| `Eval`、`Scalar`                                                      | 式評価とスカラー関数                   |
+| `Op`、`Ops`、`OpsJoin`、`ExtSort`、`Spill`                            | pull演算子、結合、ソート、退避         |
+| `Binder`、`Analyzer`、`JoinOrder`、`PlanBuilder`、`Optimizer`、`Plan` | 名前解決、結合順、論理代数、物理計画   |
+| `Dml`、`ForeignKey`、`ExecContext`                                    | DMLと参照整合性                        |
+| `Engine`、`DatabaseHost`、`Session`                                   | 文実行、共有状態、接続API              |
 
 ### F#コンパイル順
 
@@ -199,7 +199,7 @@ Errors -> Types -> Writer -> Cursor -> Serialization -> Memtable -> Wal
     -> Transactions -> ProcessLock -> VersionCoordinator -> RowStore
     -> TableSchema -> Catalog -> Scalar -> Eval -> Op -> Spill -> ExtSort
     -> OpsJoin -> Ops -> Dml -> ForeignKey -> ExecContext -> Binder
-    -> Analyzer -> PlanBuilder -> Optimizer -> ValueSet -> Plan
+    -> Analyzer -> JoinOrder -> PlanBuilder -> Optimizer -> ValueSet -> Plan
     -> DropCleanup -> Engine -> DatabaseHost -> Session
 ```
 
@@ -211,7 +211,7 @@ SQL処理は次のパイプラインで進む。
 
 ```text
 Ast -> Lexer -> ParserExpr -> Parser -> Binder
-    -> Analyzer -> PlanBuilder -> Optimizer -> Plan
+    -> Analyzer -> JoinOrder -> PlanBuilder -> Optimizer -> Plan
 ```
 
 ### 3.1 Lexer
@@ -352,7 +352,8 @@ LSMはキーをバイト列として比較する。
 flowchart LR
     AST["AST"] --> BIND["Binder: 名前束縛"]
     BIND --> LOGICAL["PlanBuilder: 論理代数"]
-    LOGICAL --> PHYSICAL["Analyzer / Optimizer: 走査と結合"]
+    LOGICAL --> ORDER["JoinOrder: INNER 区間の結合順"]
+    ORDER --> PHYSICAL["Analyzer / Optimizer: 走査と結合"]
     PHYSICAL --> OP["Op"]
 ```
 
@@ -361,7 +362,7 @@ flowchart LR
 1. `Analyzer.bindTable`がFROM/JOINのテーブルを`TableBinding`へ束縛する。
 2. `Binder.qualify`が列参照を解決し、WHEREは`Predicate.splitConjuncts`でANDごとに分解する。
 3. `Analyzer.chooseScanMethod`が主キー・索引・範囲走査を選択する。
-4. `PlanBuilder.buildLogicalWith`が論理代数を組み立てる。
+4. `PlanBuilder.buildLogicalWith`が論理代数を組み立て、INNER区間は`JoinOrder`が並べ替える。
 5. `Optimizer.exec`が論理代数を`Op`へ変換する。
 
 #### サブクエリ
@@ -490,17 +491,27 @@ INNERでは推定行数の小さい側をbuildし、大きい側を1回だけ流
 左をbuildした場合に左が退避したときは、右をbuildする通常の経路へフォールバックする。
 LEFTは左行を保存する必要があるため常に右をbuildする。
 
-結合順序は統計の代わりに走査方法から得る粗い見積りで貪欲に決める。
+結合順序はSelinger DP（左深・先頭固定）で決める。
 
 - FROMの先頭テーブルは固定する。
 - LEFT JOINを境界として、INNER JOINの連続区間だけ並べ替える。
-- 中間結果の推定行数が小さい候補を優先する。
-- 結合述語1本ごとに選択性を1/10と見積もる。
-  述語で繋がらない候補は直積として見積もる。
-- 同点ならFROMで先に現れたテーブルを優先する。
+- 区間のテーブル数が12以下ならDP、超える場合・ONの依存先が不明な場合・推定が無限の場合は
+  従来の貪欲法へフォールバックする。
+- 状態は部分集合ごとの `(cost, rows, order)`。
+  中間行数は `rows * rows_t * 0.1^結合述語本数`（統計なし）で、直積は `rows * rows_t`。
+- コストは等値結合を `左 + 右 + 出力`、直積を `左 * 右 + 出力` の行訪問で見積もる。
+- 同点はFROMで先に現れたテーブルを優先する。
 
-見積りは`PkLookup`を1、`IndexLookup`を2、範囲走査を100、全走査を1000とする。
-pushdownされた述語1つごとに見積りを1/10する。
+`ANALYZE [TABLE] テーブル名` は行数と列の異なり値数（NDV）をカタログへ保存する。
+統計がある場合、`Analyzer.estimateRowsWith` は次の値を使う。
+
+- `SeqScan` は実測行数。
+- `PkLookup` は1、`IndexLookup` / 範囲走査は実測行数の1/10。
+- 等値結合は `1 / max(NDV_左, NDV_右)`。統計が揃わない結合は従来の `min(左, 右)`。
+- `Filter` は従来どおり1段ごとに1/10。
+
+統計はDMLで自動更新しない。`ALTER TABLE` はテーブルの統計を削除する。
+統計がない場合は `PkLookup`を1、`IndexLookup`を2、範囲走査を100、全走査を1000とする。
 
 #### 論理代数からOpへ
 
@@ -1247,8 +1258,10 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   同じVersionへの並行leaseはO(1)だが、最初のleaseはファイル数に比例する。
 - JOINの右側、DISTINCT、GROUP BYは上限までメモリへ保持し、超過分を退避する。
 - 相関サブクエリは外側行ごとに内側を再計画するため、外側行数と内側走査コストの積がかかる。
-- 結合順序は統計を持たないため、走査方法から得る粗い見積りだけで決める。
-- 統計やコストモデルがないため、高選択性を自動推定しない。
+- `ANALYZE` を実行していないテーブルは統計が無く、走査方法から得る粗い見積りになる。
+- 統計は行数と列NDVだけで、ヒストグラム・列間の相関・行幅・I/O・退避コストは見積もらない。
+- 統計はDMLで自動更新しない。
+  `ALTER TABLE` は対象テーブルの統計を削除する。
 - MVCCの古い版はactive snapshotがある間はcompactionで回収されない。
 - 非被覆索引はヒット行ごとに主キーlookupを行う。
 - ORDER BYのSort省略は主キー全列の単一テーブル昇順だけを対象とする。

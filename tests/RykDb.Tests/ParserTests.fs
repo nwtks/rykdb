@@ -648,3 +648,16 @@ let ``Parser: EXPLAIN は SELECT を包む`` () =
     // 未対応の文・欠落は明示的な SyntaxError
     expectErrorKind ErrorKind.SyntaxError "EXPLAIN の後に SELECT 以外" (parseStatement "EXPLAIN INSERT INTO t VALUES (1)")
     expectErrorKind ErrorKind.SyntaxError "EXPLAIN だけ" (parseStatement "EXPLAIN")
+
+[<Fact>]
+let ``Parser: ANALYZE はテーブル名を受ける`` () =
+    match parseOneOk "ANALYZE t" with
+    | Statement.Analyze name -> Assert.Equal<string>("t", name)
+    | other -> failActual "ANALYZE ではない" other
+
+    match parseOneOk "ANALYZE TABLE t;" with
+    | Statement.Analyze name -> Assert.Equal<string>("t", name)
+    | other -> failActual "ANALYZE TABLE ではない" other
+
+    expectErrorKind ErrorKind.SyntaxError "ANALYZE だけ" (parseStatement "ANALYZE")
+    expectErrorKind ErrorKind.SyntaxError "ANALYZE TABLE だけ" (parseStatement "ANALYZE TABLE")

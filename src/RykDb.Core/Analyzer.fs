@@ -257,23 +257,91 @@ module internal Analyzer =
     type private EstimateWork =
         | Visit of Logical
         | ApplyFilter
-        | MinOfTwo
+        | ApplyJoin of float option
 
-    /// 行数の粗い見積り（統計なし）。
-    /// 結合順の決定（`PlanBuilder`）とインデックス入れ子ループの判断（`chooseJoinAlgorithm`）で
-    /// 同じ値を使う。上限なし・未知は `infinity`。
+    /// 修飾付き列の異なり値数。
+    /// 統計が無い・未修飾なら None。
+    let private ndvOfColumn (statsOf: string -> TableStats option) (expr: Expr) =
+        match Schema.tryAsColumnRef expr with
+        | Some(r: ColumnRef) ->
+            r.Qualifier
+            |> Option.bind (fun q ->
+                statsOf q
+                |> Option.bind (fun stats ->
+                    stats.ColumnNDV
+                    |> List.tryFind (fun (name, _) -> SqlName.equal name r.Name)
+                    |> Option.map snd))
+        | None -> None
+
+    /// 式の修飾子（列参照でなければ None）。
+    let private qualifierOf (expr: Expr) =
+        match Schema.tryAsColumnRef expr with
+        | Some(r: ColumnRef) -> r.Qualifier
+        | None -> None
+
+    /// 等値結合の選択性。
+    /// 統計が揃っているときだけ `Some` を返す。
+    let private joinSelectivity (statsOf: string -> TableStats option) (on: Expr) =
+        let conjuncts = Predicate.splitConjuncts on
+
+        let equalities =
+            conjuncts
+            |> List.choose (fun conjunct ->
+                match conjunct with
+                | Expr.Binary(BinaryOp.Eq, a, b) ->
+                    match qualifierOf a, qualifierOf b with
+                    | Some qa, Some qb when not (Catalog.eqName qa qb) -> Some conjunct
+                    | _ -> None
+                | _ -> None)
+
+        if List.isEmpty equalities then
+            None
+        else
+            let estimated =
+                equalities
+                |> List.map (fun conjunct ->
+                    match conjunct with
+                    | Expr.Binary(BinaryOp.Eq, a, b) ->
+                        match ndvOfColumn statsOf a, ndvOfColumn statsOf b with
+                        | Some l, Some r when l > 0L && r > 0L -> Some(1.0 / float (max l r))
+                        | _ -> None
+                    | _ -> None)
+
+            if estimated |> List.exists Option.isNone then
+                None
+            else
+                Some(estimated |> List.choose id |> List.fold (*) 1.0)
+
+    /// 行数の見積り。
+    /// 統計が無ければ従来の定数だけを使う。
+    /// 結合順の決定（`PlanBuilder`）とインデックス入れ子ループの判断（`chooseJoinAlgorithm`）で同じ値を使う。
+    /// 上限なし・未知は `infinity`。
     /// <remarks>
     /// 基本値は走査方法だけで決め、`Filter` 1段ごとに 0.1倍（下限 1）、`Limit` は件数。
-    /// `Join` は左右の小さい方（外側の行数は内側で絞られる）。
+    /// 統計があるときは走査の基数を実測行数にし、等値結合を `1 / max(NDV_l, NDV_r)` で見積もる。
+    /// 統計が無い結合は従来どおり左右の小さい方（外側の行数は内側で絞られる）。
     /// </remarks>
-    let estimateRows (tree: Logical) =
+    let estimateRowsWith (statsOf: string -> TableStats option) (tree: Logical) =
         let baseRows =
             function
-            | Logical.Scan(_, ScanMethod.PkLookup _) -> 1.0
-            | Logical.Scan(_, ScanMethod.IndexLookup _) -> 2.0
-            | Logical.Scan(_, ScanMethod.RangeScan _)
-            | Logical.Scan(_, ScanMethod.IndexRangeScan _) -> 100.0
-            | Logical.Scan _ -> 1000.0
+            | Logical.Scan(name, method) ->
+                match statsOf name with
+                | Some stats ->
+                    let rows = float stats.RowCount
+
+                    match method with
+                    | ScanMethod.PkLookup _ -> 1.0
+                    | ScanMethod.IndexLookup _
+                    | ScanMethod.RangeScan _
+                    | ScanMethod.IndexRangeScan _ -> if rows <= 0.0 then 0.0 else max 1.0 (rows / 10.0)
+                    | ScanMethod.SeqScan -> rows
+                | None ->
+                    match method with
+                    | ScanMethod.PkLookup _ -> 1.0
+                    | ScanMethod.IndexLookup _ -> 2.0
+                    | ScanMethod.RangeScan _
+                    | ScanMethod.IndexRangeScan _ -> 100.0
+                    | ScanMethod.SeqScan -> 1000.0
             | Logical.Values _ -> 1.0
             | _ -> System.Double.PositiveInfinity
 
@@ -285,7 +353,7 @@ module internal Analyzer =
                 | [] -> System.Double.PositiveInfinity
             | Visit node :: rest ->
                 match node with
-                | Logical.Filter(_, child) -> go values (ApplyFilter :: Visit child :: rest)
+                | Logical.Filter(_, child) -> go values (Visit child :: ApplyFilter :: rest)
                 | Logical.Limit(_, n, _) when n >= 0 -> go (float n :: values) rest
                 | Logical.Limit(_, _, child)
                 | Logical.Project(_, child)
@@ -294,15 +362,23 @@ module internal Analyzer =
                 | Logical.Having(_, _, _, child) -> go values (Visit child :: rest)
                 | Logical.Aggregate(groupBy, _, _) when List.isEmpty groupBy -> go (1.0 :: values) rest
                 | Logical.Aggregate(_, _, child) -> go values (Visit child :: rest)
-                | Logical.Join(_, _, _, left, right) -> go values (MinOfTwo :: Visit right :: Visit left :: rest)
+                | Logical.Join(_, _, on, left, right) ->
+                    go values (Visit left :: Visit right :: ApplyJoin(joinSelectivity statsOf on) :: rest)
                 | leaf -> go (baseRows leaf :: values) rest
             | ApplyFilter :: rest ->
                 match values with
                 | v :: tail -> go (max 1.0 (v * 0.1) :: tail) rest
                 | [] -> go (1.0 :: values) rest
-            | MinOfTwo :: rest ->
+            | ApplyJoin selectivity :: rest ->
                 match values with
-                | r :: l :: tail -> go (min l r :: tail) rest
+                | r :: l :: tail ->
+                    let joined =
+                        match selectivity with
+                        | Some sel when System.Double.IsFinite l && System.Double.IsFinite r ->
+                            if l <= 0.0 || r <= 0.0 then 0.0 else max 1.0 (l * r * sel)
+                        | _ -> min l r
+
+                    go (joined :: tail) rest
                 | _ -> go (System.Double.PositiveInfinity :: values) rest
 
         go [] [ Visit tree ]
@@ -313,7 +389,8 @@ module internal Analyzer =
     ///   （右の `Filter` の述語と、走査が吸収した等値を residual として評価する）
     /// - 両入力が結合キー順に走査できる: マージ結合
     /// - それ以外の等値結合: ハッシュ結合
-    let chooseJoinAlgorithm
+    let chooseJoinAlgorithmWith
+        (statsOf: string -> TableStats option)
         (tableOf: string -> TableSchema option)
         (leftSchema: Schema)
         (rightSchema: Schema)
@@ -477,7 +554,7 @@ module internal Analyzer =
                 | _ -> None
 
             match lookup with
-            | Some(target, leftIndices, rightPreds) when estimateRows leftTree <= 32.0 ->
+            | Some(target, leftIndices, rightPreds) when estimateRowsWith statsOf leftTree <= 32.0 ->
                 let residual = Option.toList keys.Residual @ rightPreds |> Predicate.joinConjuncts
                 JoinAlgorithm.IndexNestedLoop target, Some { keys with Residual = residual }, Some leftIndices
             | _ ->

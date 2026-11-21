@@ -273,6 +273,9 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
 - `Insert100Rows`、`Insert10kRows`: INSERT のスループットを測定する。
 - `Join3Tables`、`MergeJoin2Tables`、`JoinWithResidual`、`NestedLoopNoMatch`:
   結合を測定する。
+- `Join4TablesSparse`、`Join4TablesDense`:
+  4テーブル結合の結合順（DP と貪欲のフォールバック）を測定する。
+  前者は直積を含む疎なグラフ、後者は全テーブルが結合述語で繋がる密なグラフ。
 - `DistinctSpill`、`GroupBySpill`、`Join3TablesSpill`、`JoinByValueSpill`、`SortSpill`:
   作業メモリを1バイトにして退避経路を強制する（`--class spill`）。
   通常経路の同名シナリオと比較する。
