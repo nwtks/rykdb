@@ -2,7 +2,7 @@
 // SstEntry / SstScan / SstMerge — SSTable の 1エントリと遅延走査・k-way merge。
 //
 // 走査は one-shot（同じ値の next を 2回呼ばない）。
-// 構築は SstScan.ofStep / ofArray / ofState / ofFilter / ofScoped に限り、
+// 構築は SstScan.ofStep / ofStepWithClose / ofArray / ofState / ofFilter / ofScoped / emit / scoped に限り、
 // ケースは SstScan.fsi で隠す。
 // ===========================================================================
 

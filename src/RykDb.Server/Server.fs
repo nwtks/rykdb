@@ -10,7 +10,7 @@
 //   STREAM\t<列名,...>      ストリーミング SELECT のヘッダ(続く行がデータ、END で終端)
 //   END                     STREAM の終端
 //   ERR <メッセージ>        失敗
-//   HALT                    終了
+//   HALT                    接続終了
 //
 // `.stream <SQL>` は単一 SELECT を materialize せずに STREAM で返す。
 // 対象外（複数文・非 SELECT・transaction 中など）は通常の OK / ERR にフォールバックする。

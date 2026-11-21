@@ -18,11 +18,11 @@ type ErrorKind =
     | TypeError
     /// NOT NULL / UNIQUE / PRIMARY KEY などの制約違反
     | ConstraintViolation
-    /// 存在しないテーブル・インデックス・行を参照した
+    /// 存在しないテーブル・列・インデックスを参照した
     | NotFound
     /// 既に存在する名前で作成しようとした
     | AlreadyExists
-    /// memtable やバッファのメモリ上限に達した
+    /// memtable・バッファ・結果件数の上限に達した
     | CapacityError
     /// チェックサム不一致など、ファイル内容が壊れている
     | CorruptionError

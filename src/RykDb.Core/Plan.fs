@@ -120,7 +120,7 @@ module internal Plan =
 
     /// 集合演算の枝を置換するときの作業フレーム。
     /// 枝は必ずコア（`SetOperations` を持たない）だが、
-    /// 将来入れ子になっても組み直せるよう明示スタックで辿る。
+    /// 入れ子の相関も扱えるよう明示スタックで辿る。
     type private SubstituteFrame =
         {
             /// 枝以外を置換済みの文（`SetOperations` は空）。

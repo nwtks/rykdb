@@ -1,9 +1,9 @@
 # 開発ガイド
 
-RykDb のビルド・テスト・品質ゲート。
+RykDb のビルド、テスト、品質ゲートを説明する。
 設計は [`architecture.md`](architecture.md)、
 コーディング規約は [`coding-conventions.md`](coding-conventions.md)、
-実際に踏んだ落とし穴は [`gotchas.md`](gotchas.md) を参照。
+既知の落とし穴は [`gotchas.md`](gotchas.md) を参照する。
 
 ---
 
@@ -20,203 +20,311 @@ RykDb のビルド・テスト・品質ゲート。
 ## 1. ビルドと品質ゲート
 
 ```bash
-dotnet build -t:Rebuild       # ビルド
-dotnet test                   # テスト
-dotnet tool restore                 # fantomas インストール
-dotnet fantomas src/ tests/ tools/  # 整形
+dotnet build -t:Rebuild
+dotnet test
+dotnet tool restore
+dotnet fantomas src/ tests/ tools/
 
-# CI と同じゲート（coverage 90% 必須）
+# CI と同じゲート。行カバレッジ 90%以上が必要。
 dotnet restore --locked-mode
 dotnet test -p:CollectCoverage=true -p:Threshold=90 -p:ThresholdType=line -p:ThresholdStat=total
 ```
 
-依存は `global.json` で SDK を、`packages.lock.json` でパッケージ版を固定する。
-パッケージを追加・更新したときは `dotnet restore` で lock ファイルを更新してコミットする。
+SDK とパッケージを固定する。
 
-`FSharp.Core` は SDK 同梱の `library-packs` ではなく nuget.org から復元する
-（`Directory.Build.props` の `DisableImplicitLibraryPacksFolder`）。
-同じバージョン番号でも SDK のビルドごとに中身が異なり、
-`--locked-mode` が NU1403（contentHash 不一致）で落ちるため
+- `global.json` が SDK を固定する。
+- `packages.lock.json` がパッケージのバージョンを固定する。
+- パッケージを追加または更新したら `dotnet restore` で lock ファイルを更新してコミットする。
+
+`FSharp.Core` は SDK 同梱の `library-packs` ではなく nuget.org から復元する。
+設定は `Directory.Build.props` の `DisableImplicitLibraryPacksFolder` にある。
+SDK のビルドごとにパッケージ内容が変わる場合があり、
+同じバージョンでも `--locked-mode` が NU1403（contentHash 不一致）で失敗する
 （[`gotchas.md`](gotchas.md) §9.15）。
-lock ファイルを作り直すときは、`~/.nuget/packages/fsharp.core/<ver>/` を消してから
+
+lock ファイルを作り直す場合は、`~/.nuget/packages/fsharp.core/<ver>/` を削除してから
 `dotnet restore --force-evaluate` を実行する。
 
-| ゲート                  | 設定                                                                                                                                                                                                                                         |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TreatWarningsAsErrors` | **有効**                                                                                                                                                                                                                                     |
-| `LangVersion`           | `10.0`                                                                                                                                                                                                                                       |
-| `WarningLevel`          | `3`                                                                                                                                                                                                                                          |
-| `OtherFlags`            | `--warnon:1182`（未使用ローカル変数もエラー）                                                                                                                                                                                                |
-| 依存の再現性            | `global.json`（SDK） / `packages.lock.json`                                                                                                                                                                                                  |
-| Core の命令型構文・機能 | ロジック層は `mutable` / `while` / `ref` なし。例外は `Session.fs` / `DatabaseHost.fs` の状態 DU スロット、`ValueSet.IndexedValues` の reader / 1ブロックキャッシュ、`BloomFilter.BloomBuilder` の件数カウンタ（いずれもクエリ・構築の寿命） |
+主要なビルド設定は次のとおり。
 
-> **fantomas 整形後は必ず `dotnet build -t:Rebuild` で FS0020 を確認する**
-> （[`gotchas.md`](gotchas.md) §10.9）。
+| 項目                    | 設定                                                |
+| ----------------------- | --------------------------------------------------- |
+| `TreatWarningsAsErrors` | 有効                                                |
+| `LangVersion`           | `10.0`                                              |
+| `WarningLevel`          | `3`                                                 |
+| `OtherFlags`            | `--warnon:1182`（未使用ローカル変数をエラーにする） |
+| 依存の再現性            | `global.json` / `packages.lock.json`                |
 
-> **dotnet build / dotnet test を並行して実行しない**
-> （並行実行時に発生する見かけ上のエラーについては [`gotchas.md`](gotchas.md) §9.13 を参照）。
+ロジック層では原則として `mutable`、`while`、`ref` を使わない。
+例外的に可変状態を使う箇所は次のとおり。
+
+- `Session.fs` / `DatabaseHost.fs` の状態 DU（lifecycle・`SyncState`・`RowReaderState`）
+- `ValueSet.IndexedValues` の reader と 1ブロックキャッシュ
+- `BloomFilter.BloomBuilder` の件数カウンタ
+
+fantomas の整形後は、必ず次のコマンドで FS0020 を確認する。
+
+```bash
+dotnet build -t:Rebuild
+```
+
+この確認が必要な理由は [`gotchas.md`](gotchas.md) §10.9 にある。
+
+`dotnet build` と `dotnet test` は並行して実行しない。
+並行実行時の見かけ上のエラーは [`gotchas.md`](gotchas.md) §9.13 にある。
 
 ## 2. tail call 監査
 
-再帰呼び出しの後に処理が残る形（非末尾再帰）は、入力が大きいとスタックオーバーフローを起こす。
-これを次の 3 層で検出する。
+再帰呼び出しの後に処理が残る非末尾再帰は、入力が大きいとスタックオーバーフローを起こす。
+次の 3層で検出する。
 
-1. **ビルド** — `[<TailCall>]` 属性付き関数の非末尾再帰を FS3569 として検出
-   （`TreatWarningsAsErrors` によりエラー）。
-2. **TailAudit** — `dotnet run --project tools/TailAudit` が構文木を調べ、
-   属性のない関数（ローカル `let rec` を含む）の非末尾再帰を検出する。
-   検出結果を `tools/TailAudit/TailAudit.baseline` と比較し、**新しい項目があれば exit 1**。
-   （ベースラインは `dotnet run --project tools/TailAudit -- --update` で生成する。
-   **未生成なら全件を新規とみなして exit 1 になる**ので、内容を確認のうえ生成しておく。）
-   - 非末尾は**「ラムダ内 / 直接」の内訳**を表示する。
-     ラムダ内 = `Compute` / `pull` 継続・CPS 継続（Plan・Parser）・Pratt の右辺降下。
-     Parser の CPS は継続呼び出しが `bare`（関数値呼び出し）として非末尾に数えられるが、
-     実行時は `tail.` で末尾呼び出しになるためベースラインで追認する。
-     直接 = 監査部・引数など「結果を消費してから」型（**本来の末尾化候補**）。
-     ベースラインのキーには含めない（内訳が変わっても差分化しないため）。
-   - pipe の**関数側**は末尾として数える（`x |> f a` = `f a x`）。
-     値側は非末尾のまま。
-3. **テスト** — `末尾再帰:` 系テストで、実際のスタック使用量を確認する。
+1. **ビルド**
 
-`[<TailCall>]` は構文上の検査にすぎない。
-`Directory.Build.props` の `<Tailcalls>true</Tailcalls>` により Debug でも実際の `tail.` を出力する。
-この設定を外すと CPS（Plan のサブクエリ解決）や式の再帰がテストでスタックオーバーフローする
+   `[<TailCall>]` を付けた関数の非末尾再帰を FS3569 として検出する。
+   `TreatWarningsAsErrors` により警告はエラーになる。
+
+2. **TailAudit**
+
+   次のコマンドで構文木を調べる。
+
+   ```bash
+   dotnet run --project tools/TailAudit
+   ```
+
+   属性を付けていない関数を含め、ローカルの `let rec` も検査する。
+   検出結果は `tools/TailAudit/TailAudit.baseline` と比較する。
+   新しい項目がある場合は exit 1 になる。
+
+   ベースラインは次のコマンドで更新する。
+
+   ```bash
+   dotnet run --project tools/TailAudit -- --update
+   ```
+
+   ベースライン未生成の場合も全項目を新規とみなして exit 1 になる。
+   更新前に検出内容を確認する。
+
+   監査では非末尾再帰を次の 2種類に分類する。
+   - ラムダ内
+     `Compute`、`pull` の継続、CPS 継続、Pratt の右辺降下などにある。
+     Parser の CPS 継続呼び出しは構文上は `bare` と数えるが、実行時は `tail.` になる。
+     この項目はベースラインに含める。
+   - 直接
+     監査処理や引数の評価など、結果を使ってから再帰する型である。
+     本来は末尾再帰へ直せる候補になる。
+     分類が変わっても差分にならないよう、ベースラインのキーには含めない。
+
+   pipe の関数側（`x |> f a`）は末尾として数える。
+   値側は非末尾のまま扱う。
+
+3. **テスト**
+
+   テスト名が「末尾再帰:」で始まるテストで実際のスタック使用量を確認する。
+
+`[<TailCall>]` は構文検査だけで、コード生成は `Directory.Build.props` の
+`<Tailcalls>true</Tailcalls>` が担う。
+この設定を外すと、Plan のサブクエリ解決や式の再帰でスタックオーバーフローが発生する
 （[`gotchas.md`](gotchas.md) §9.9）。
-式・サブクエリに深さ上限はない（[`coding-conventions.md`](coding-conventions.md) §3）。
+再帰の書き方は [`coding-conventions.md`](coding-conventions.md) §3 を参照する。
 
 ## 3. テスト構成
 
-xUnit。
-**テスト対象のソースファイルごとに、対応するテストファイルを 1つ設ける**
-（`src/RykDb.Core/Dml.fs` → `tests/RykDb.Tests/DmlTests.fs`）。
-モジュール名も `module RykDb.DmlTests` と対象名に合わせる。
+テストフレームワークは xUnit を使う。
 
-**例外**: `Session.fs` の公開 API は `SessionTests.fs`、`DatabaseHost.fs` は `DatabaseHostTests.fs` で検証する。
-`DatabaseTests.fs` は src に対応ファイルを持たない DB 全体の通し経路テスト
-（公開 API の `Session` / `SessionPool` で内部機構を検証する）。
-`ProcessLock.fs は専用ファイルを持たず、`RowStoreTests`/`DatabaseTests`で間接的に検証する。
-`DatabaseHostTests`の`CommitDurability:`/`SerializationTests`の`順序保持:`は横断的な性質テスト、`CliTests` は CLI 全体のテスト。
-[`sql-reference.md`](sql-reference.md) が扱う構文・意味論は `SqlReferenceTests.fs`。
+原則として、テスト対象のソースファイルごとに対応するテストファイルを1つ用意する。
+モジュール名は対象名に合わせる。
+たとえば `Dml.fs` に対応するテストモジュールは `module RykDb.DmlTests` とする。
+
+| 対象                    | テスト                          |
+| ----------------------- | ------------------------------- |
+| `src/RykDb.Core/Dml.fs` | `tests/RykDb.Tests/DmlTests.fs` |
+| `Session.fs` 公開 API   | `SessionTests.fs`               |
+| `DatabaseHost.fs`       | `DatabaseHostTests.fs`          |
+
+例外的なテスト構成は次のとおり。
+
+- `DatabaseTests.fs` はソースファイルに対応せず、`Session` / `SessionPool` 経由の DB 全体の通し経路を検証する。
+- `ProcessLock.fs` は専用ファイルを持たず、`RowStoreTests` / `DatabaseTests` で間接的に検証する。
+- `CommitDurability:` と `SerializationTests` の「順序保持:」は横断的な性質を検証する。
+- `CliTests` は CLI 全体を検証する。
+- SQL の構文と意味論は [`sql-reference.md`](sql-reference.md) に対応する `SqlReferenceTests.fs` に書く。
+
+全テストと個別テストは次のコマンドで実行する。
 
 ```bash
-dotnet test                                                    # 全件
-dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"    # Server のみ
+dotnet test
+dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"
 ```
 
-**通し経路の役割**:
+### 通し経路
 
-- `SqlReferenceTests` — [`sql-reference.md`](sql-reference.md) の構文・意味論
-  （文・句・式・リテラル・識別子が受理 / 拒否され、評価結果も仕様どおりであること）。
-  テスト名の接頭辞は `SqlReference:`。
-- `DatabaseTests` — DB 全体の通し経路（`Session` / `SessionPool` 経由）と内部機構
-  （MVCC / WAL / プロセスロック / 索引の backfill・後始末 / 永続性 / 末尾再帰）。
-  Parser / Analyzer / Plan / PlanBuilder / ExecContext / Catalog の連携バグはここで分かる。
+- `SqlReferenceTests`
+  - SQL の文、句、式、リテラル、識別子の受理と拒否を検証する。
+  - 評価結果が仕様どおりか確認する。
+  - テスト名には `SqlReference:` を付ける。
+- `DatabaseTests`
+  - MVCC、WAL、プロセスロック、索引の backfill と後始末、永続性、末尾再帰を検証する。
+  - Parser、Analyzer、Plan、PlanBuilder、ExecContext、Catalog の連携も検証する。
 
-**書き方**:
+### テストの書き方
 
-- 1テスト = 1関数。
-  `let ``説明`` () = ...` の**関数形**
-  （FS0842: 関数でない場合、テストとして認識されず無視される）。
-- 共通ヘルパー（`ok` / `expectError` / `expectErrorKind` / `failActual` / `withDir` / `tightBudget` / `assertNoLeftovers` / `asInt` / `schema2` / `ctxOf` / `pCol` / `oCol` / `selectOf` / `parseOneOk` / `whereOf` / 乱数生成 / `buildSstable` / `scanOfEntries` / `levelCounts` / `indexDefinition`）は `TestHelpers.fs` に置く（`.fsproj` では**先頭**）。
-  ファイル固有のヘルパー・fixture（スキーマ、`DmlTests` の `insertRow` など）は各ファイルに private で置く。
-  **同一実装が 2ファイル以上にあるヘルパーは重複させず TestHelpers に置く**
-  （`parseStatement` / `parseOneOk` / `expectVariant` / `parseSelectOk` / `whereOf` を Parser 系 2ファイルから集約した）。
-- 失敗の書き方は役割で選ぶ:
-  - **variant 不一致・想定外の形の unit 腕** → `failActual "ラベル" 実値`
-    （`ラベル: 実値` を `%A` で表示する定型。メッセージを書くより実値が必ず残る）。
-  - **「エラーになるべき」** → `expectError` / `expectErrorKind`（Error 臂の検査も込み）。
-  - **値を返すヘルパー**（`ok` / `asInt` / `parseOneOk` など） → `failwithf`。
-    例外は xUnit が失敗として扱うので、`Assert.Fail` + `Unchecked.defaultof<'T>` のような**偽の戻り値は書かない**。
-- `withStore` / `withSession` は `IStorageEngine` のメモリ実装で動く（ディスク I/O なし）。
-  ディスク固有の挙動（WAL / MANIFEST / 永続化）は `withDir` + `RowStore.openStore` / `Session.OpenWithSync` を直接使って検証する。
-- 新しいファイルは `.fsproj` の Compile 順（= src のコンパイル順）に追加する。
-- 一時ディレクトリは `Path.GetTempPath()` + `Ticks` + GUID（並列実行でも衝突しない名前にする）。
-  `try/finally` で必ず削除する。
-- `TestHealthTests.fs` に**「Fact が 0件のテストモジュールが無い」ことを検出するテスト**がある
-  （リフレクションで数える）。
-  F# 10 の FS0842 への対策（[`gotchas.md`](gotchas.md) §9.1）。
-  ファイルを増やしたら下限数のアサートも更新する。
+- 1テストは 1関数とする。
+- 関数名は `let ``説明`` () = ...` の形にする。
+- FS0842 により、値として定義したテストは認識されない。
 
-**並び順**:
+共通ヘルパーは `TestHelpers.fs` に置く。
+このファイルは `.fsproj` の先頭に登録する。
+ファイル固有のヘルパーや fixture は各テストファイル内で private として置く。
+同じ実装を 2ファイル以上で使うヘルパーは重複させず、`TestHelpers.fs` に集約する。
 
-- テストは**テスト対象（`src/RykDb.Core/*.fs`）の定義順**に合わせて並べる。
-  対象ファイルで関数 A → B → C の順に定義されていれば、
-  テストファイルも A のテスト → B のテスト → C のテストの順にする。
-- 同一関数のテストは **正常系 → 特殊状況（境界値・空入力・NULL・並行実行など）→ 異常系（エラー）** の順に並べる。
-- ヘルパー定義はテストブロックの間に置かず、**先頭にまとめる**。
-  テストを並べ替えたときに参照順が壊れるのを防ぐ。
-- 例外: `SqlReferenceTests` は `sql-reference.md` の節順に従う（ソースの定義順ではない）。
-  `DatabaseTests` / `ServerTests` / `CliTests` は利用者から見た操作・プロトコルの流れを優先する。
-  `SessionTests` は主要な公開 API から順に並べる
-  （`Session` → `SessionOptions` → `RowReader` → `SessionPool`）。
+失敗時の検証方法は用途に合わせて選ぶ。
 
-**乱数生成のテストは退行に注意**（[`gotchas.md`](gotchas.md) §9.6）。
+- variant の不一致や想定外の unit 腕は `failActual "ラベル" 実値` を使う。
+  メッセージではなく実値を `%A` で必ず表示する。
+- エラーになるべき処理は `expectError` または `expectErrorKind` を使う。
+- 値を返すヘルパーは `failwithf` を使う。
+- 値を返すヘルパーで `Assert.Fail` と `Unchecked.defaultof<'T>` の組み合わせを使わない。
+  xUnit が例外を失敗として扱う。
+
+`withStore` と `withSession` はメモリ上の `IStorageEngine` を使う。
+WAL、MANIFEST、永続化などディスク固有の挙動は `withDir` と `RowStore.openStore`
+または `Session.OpenWithSync` を直接使って検証する。
+
+新しいテストファイルは `.fsproj` の Compile 順に登録する。
+原則として、ソースファイルと同じコンパイル順にする。
+一時ディレクトリは `Path.GetTempPath()`、`Ticks`、GUID で衝突しない名前にする。
+`try/finally` で必ず削除する。
+
+`TestHealthTests.fs` は、Fact を持たないテストモジュールがないことをリフレクションで検査する。
+F# 10 の FS0842 に対策するためである（[`gotchas.md`](gotchas.md) §9.1）。
+テストファイルを追加したら、下限件数のアサートも更新する。
+
+### 並び順
+
+テストは、テスト対象のソースファイルにある関数の定義順に並べる。
+対象ファイルで A、B、C の順に定義している場合、テストファイルでも A、B、C のテストの順にする。
+
+同じ関数のテストは次の順に並べる。
+
+1. 正常系
+2. 境界値、空入力、NULL、並行実行などの特殊状況
+3. エラー系
+
+ヘルパー定義はテストブロックの間に置かず、ファイル先頭にまとめる。
+テストの並び替えで参照順が壊れるのを防ぐ。
+
+例外として、次のファイルはソースの定義順ではなく利用者に見える流れを優先する。
+
+- `SqlReferenceTests` は [`sql-reference.md`](sql-reference.md) の節順に並べる。
+- `DatabaseTests`、`ServerTests`、`CliTests` は操作とプロトコルの流れに並べる。
+- `SessionTests` は主要な公開 API の順に並べる。
+  `Session`、`SessionOptions`、`RowReader`、`SessionPool` の順を基本とする。
+
+乱数を使うテストはシードを固定し、失敗を再現できるようにする。
 
 ## 4. 性能ベンチ
 
-性能に影響する変更は `tools/RykDb.Bench` で前後を測る。
-数値はマシン依存なので、**同じマシンでの前後比較**にだけ使う。
+性能に影響する変更は `tools/RykDb.Bench` で前後を測定する。
+ベンチマークの数値はマシン依存なので、同じマシンでの比較だけに使う。
 
 ```bash
-dotnet run -c Release --project tools/RykDb.Bench                    # 全シナリオ
-dotnet run -c Release --project tools/RykDb.Bench -- --class compaction  # compaction のみ
-dotnet run -c Release --project tools/RykDb.Bench -- --class index   # 索引の読み書き・サイズのみ
-dotnet run -c Release --project tools/RykDb.Bench -- --class eval   # 式評価器のみ
-dotnet run -c Release --project tools/RykDb.Bench -- --class op     # Op（pull 層）のみ
-dotnet run -c Release --project tools/RykDb.Bench -- --quick        # 短いジョブ
-dotnet run -c Release --project tools/RykDb.Bench -- --dry          # 1 回だけ実行して検証
-# シナリオを絞る（BenchmarkDotNet の --filter。複数指定は OR）
+# 全シナリオ
+dotnet run -c Release --project tools/RykDb.Bench
+
+# compaction
+dotnet run -c Release --project tools/RykDb.Bench -- --class compaction
+
+# 索引の読み書きとサイズ
+dotnet run -c Release --project tools/RykDb.Bench -- --class index
+
+# 式評価器
+dotnet run -c Release --project tools/RykDb.Bench -- --class eval
+
+# Op（pull 層）
+dotnet run -c Release --project tools/RykDb.Bench -- --class op
+
+# 短いジョブ
+dotnet run -c Release --project tools/RykDb.Bench -- --quick
+
+# 1回だけ実行して正しさを確認
+dotnet run -c Release --project tools/RykDb.Bench -- --dry
+
+# BenchmarkDotNet のフィルターでシナリオを絞る
 dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --filter "*QueryBenchmarks.PointLookup" --filter "*PointLookupParsed*"
 ```
 
-- **CI ではビルドのみ**（`dotnet build -t:Rebuild` に含まれる）。実行は手元で行う。
-- 結果は `BenchmarkDotNet.Artifacts/`（実行時のカレントディレクトリ）に残る。git 対象外。
-- シナリオ:
-  - `PointLookup` / `PointLookup500` / `CountStar` / `RangeScan` / `FilterSeqScan` / `SelectConstant` / `CountConstantWhere`
-  - `ParsePoint` — 字句解析 + 構文解析だけ。
-  - `PointLookupParsed` / `PointLookupPlanned` / `PointLookupStorage` —
-    同じポイント検索を「parse 済みの文」「計画済みの木」「ストレージ直（`PkLookup` が実行する `byPrimaryKeyMasked`）」で測る低レベル版。
-    `PointLookup` との差で parse / plan / 実行の内訳が分かる。
-    **計画・実行の変更はこの 3 本を見る**（`PointLookup` は plan が支配的で、ストレージの変化が埋もれる）。
-    `Session.PrepareSelect`（internal）で計画だけを組み、`Optimizer.exec` + `Op.toArrayLimited` を繰り返す。
-    実行のたびに `Scope.DisposeAll()` を呼ぶ。
-  - `Insert100Rows`（100行 × 1文）/ `Insert10kRows`（2,000行 × 5文を 1 transaction で流して ROLLBACK）
-  - `Join3Tables` / `MergeJoin2Tables` / `JoinWithResidual` / `NestedLoopNoMatch`
-  - `DistinctSpill` / `GroupBySpill` / `Join3TablesSpill` / `JoinByValueSpill` / `SortSpill` —
-    `--class spill`。
-    作業メモリ 1バイトで退避経路を強制する
-    （DISTINCT / GROUP BY / パーティション分割ハッシュ結合 / キーが主キーでない結合 / 外部マージソート）。
-    通常経路との差は `QueryBenchmarks` の同名シナリオと比較する。
-    **結果は setup で通常のバジェットの実行と突き合わせる**（退避経路の誤りは時間に出ないため）。
-  - `MatchesLiteralV` / `MatchesColumnV` / `MatchesBinaryV` / `MatchesComplexV` — DB を使わない式評価器のマイクロベンチ
-  - `MatchesComplexJoinedV` — JOIN の ON 句の式評価
-  - `CompareValuesV` — `SqlValue.compareValuesV` の割当
-  - `OpMaterialize` / `OpFilterMapTake` / `NextStep` —
-    DB を使わない pull 層（`Op.ofArray` / `filter` / `map` / `skip` / `take` / `Op.next`）のマイクロベンチ
-  - `IndexCoveredLookup` / `IndexFetchLookup` / `IndexCoveredCount` / `IndexFetchRange` —
-    索引の被覆読み（索引列 + 主キーだけ）と非被覆読み（本体から fetch）、件数だけの読み取り。
-  - `InsertWithIndex100Rows` / `InsertNoIndex100Rows` —
-    同じ 100行 INSERT + ROLLBACK を索引あり / なしの表で比べる。
-    `--class index` のセットアップは 2つの DB の総サイズも出力する。
-  - `CompactL0` — L0 の 4ファイル（各 25,000件）を 1回 compaction する
-- **割当の見方**: `EvalBenchmarks` の `Allocated` は `Result` の `Ok` を反映しない。
-  Release の JIT が式評価の `Ok` をスタック割当・除去するためで、`DbResult` 化の前後でも 592B のまま。
-  `Result` の割当を見るのは `OpBenchmarks` とクエリ系（`CountStar` / `FilterSeqScan` / JOIN）。
-  [`gotchas.md`](gotchas.md) §7.10 に実測値を置いている。
-- **性能スモーク（10,000行 INSERT → 500回の point lookup → `COUNT(*)`）はベンチで確認する**。
-  実時間の上限で落とすテストは置かない（マシン依存のため。回帰はベンチの前後比較で見る）。
-- クエリ系は `Session.OpenWithSync`（同期 compaction）で開き、
-  シード後に一度 Close して memtable を SSTable へ flush してから測る
-  （背景 compaction のタイミングで揺れないようにする）。
-- compaction の出力削除は測定の外側（`IterationCleanup`）で行う。
-- 変更前後で `--quick` の結果が大きく変わったら、`--dry` で正しさを確認してから通常ジョブで再測する。
+- CI はビルドだけを実行する。ベンチマークは手元で実行する。
+- 結果は実行時のカレントディレクトリにある `BenchmarkDotNet.Artifacts/` に保存される（git 対象外）。
+
+主なシナリオは次のとおり。
+
+- `PointLookup`、`PointLookup500`、`CountStar`、`RangeScan`、`FilterSeqScan`、`SelectConstant`、`CountConstantWhere`
+- `ParsePoint`: 字句解析と構文解析だけを測定する。
+- `PointLookupParsed`、`PointLookupPlanned`、`PointLookupStorage`:
+  同じポイント検索を、構文解析済み、計画済み、ストレージ直呼び出しで測定する。
+  `PkLookup` が実行する `byPrimaryKeyMasked` のオーバーヘッドを分離できる。
+  計画や実行の変更はこの3シナリオで確認する。
+  `PointLookup` は計画が支配的なため、ストレージの変化が埋もれる。
+- `Insert100Rows`、`Insert10kRows`: INSERT のスループットを測定する。
+- `Join3Tables`、`MergeJoin2Tables`、`JoinWithResidual`、`NestedLoopNoMatch`:
+  結合を測定する。
+- `DistinctSpill`、`GroupBySpill`、`Join3TablesSpill`、`JoinByValueSpill`、`SortSpill`:
+  作業メモリを1バイトにして退避経路を強制する（`--class spill`）。
+  通常経路の同名シナリオと比較する。
+  正常経路と退避経路のバジェットを照合し、誤った退避判定を検出する。
+- `MatchesLiteralV`、`MatchesColumnV`、`MatchesBinaryV`、`MatchesComplexV`:
+  式評価器を DB なしで測定する。
+- `MatchesComplexJoinedV`: JOIN の ON 句の式評価を測定する。
+- `CompareValuesV`: `SqlValue.compareValuesV` の割当を測定する。
+- `OpMaterialize`、`OpFilterMapTake`、`NextStep`: `Op` の pull 層を DB なしで測定する。
+- `IndexCoveredLookup`、`IndexFetchLookup`、`IndexCoveredCount`、`IndexFetchRange`:
+  被覆読み、非被覆読み、件数読み取りを測定する。
+- `InsertWithIndex100Rows`、`InsertNoIndex100Rows`: 索引あり・なしで100行 INSERT を比較する。
+- `CompactL0`: L0 の4ファイルを1回 compaction する。
+
+計画と実行の測定では、`Session.PrepareSelect`（internal）で計画だけを組み、
+`Optimizer.exec` と `Op.toArrayLimited` を繰り返す。
+実行ごとに `Scope.DisposeAll()` を呼ぶ。
+
+割当の見方には注意する。
+
+- `EvalBenchmarks` の `Allocated` は `Result` の `Ok` を反映しない。
+- Release の JIT が式評価の `Ok` をスタック割当または除去する。
+- `DbResult` 化の前後で592Bのままになる場合がある。
+- `Result` の割当は `OpBenchmarks` とクエリ系で確認する。
+- 実測値は [`gotchas.md`](gotchas.md) §7.10 にある。
+
+性能スモークは次の流れで確認する。
+
+1. 10,000行を INSERTする。
+2. point lookup を500回実行する。
+3. `COUNT(*)` を実行する。
+
+実時間の上限でテストを落とさない。
+マシン依存になるため、ベンチマークの前後比較で確認する。
+
+クエリ系ベンチマークは次の手順で初期化する。
+
+1. `Session.OpenWithSync`（同期 compaction）で開く。
+2. シード後に一度 Closeする。
+3. memtable を SSTableへflushしてから測定する。
+
+この手順で背景 compaction のタイミングによる揺らぎを避ける。
+compaction の出力削除は `IterationCleanup` の外側で行う。
+
+変更前後で `--quick` の結果が大きく変わった場合は、最初に `--dry` で正しさを確認する。
+確認後に通常ジョブで再測定する。
 
 ## 5. 変更後のチェックリスト
 
 - [ ] `dotnet build -t:Rebuild` が 0 error / 0 warning
-- [ ] `dotnet test` が全緑（逐次実行）
-- [ ] `dotnet run --project tools/TailAudit` が exit 0（新規の非末尾再帰なし。追認は内容確認のうえ `-- --update`）
-- [ ] 不変条件を追加・変更したら [`invariants.md`](invariants.md) と対応するテストを更新
-- [ ] 構築に不変条件がある型は `.fsi` で表現を隠したか（`[<Struct>]` レコードは不可。[`gotchas.md`](gotchas.md) §9.11）
-- [ ] 性能に影響する変更は `tools/RykDb.Bench` で前後を測ったか（測れない場合は理由を記録）
-- [ ] `docs/gotchas.md` に**同じ原因の再発**があれば追記
+- [ ] `dotnet test` が全件成功（逐次実行）
+- [ ] `dotnet run --project tools/TailAudit` が exit 0
+  - 新規の非末尾再帰がないこと。
+  - ベースラインに追認する項目は、更新前に内容を確認する。
+- [ ] 不変条件を追加または変更した場合は、[`invariants.md`](invariants.md) と対応テストを更新した
+- [ ] 構築に不変条件がある型は `.fsi` で表現を隠した
+  - `[<Struct>]` レコードは不可（[`gotchas.md`](gotchas.md) §9.11）。
+- [ ] 性能に影響する変更は `tools/RykDb.Bench` で前後を測定した
+  - 測定できない場合は理由を記録した。
+- [ ] 再発する落とし穴は [`gotchas.md`](gotchas.md) に追記した

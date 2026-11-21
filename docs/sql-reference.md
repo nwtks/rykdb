@@ -1,110 +1,114 @@
 # SQL リファレンス
 
-RykDb が受け付ける SQL 文法の一覧。
-実装を確認して得た **実際に受理される範囲** を記載する。
-標準 SQL と異なる部分は［制限］印を付けて示す。
+RykDbが受け付けるSQLの文法と意味を示す。
+標準SQLとの主な相違点も併記する。
 
----
+実装は [`invariants.md`](invariants.md)、
+設計は [`architecture.md`](architecture.md)、
+既知の落とし穴は [`gotchas.md`](gotchas.md) を参照する。
 
 ## 目次
 
-1. [文の一覧](#1-文の一覧)
+1. [文](#1-文)
 2. [字句](#2-字句)
 3. [データ型](#3-データ型)
-4. [値の書き方と表示](#4-値の書き方と表示)
+4. [リテラルとパラメータ](#4-リテラルとパラメータ)
 5. [識別子と名前解決](#5-識別子と名前解決)
 6. [式](#6-式)
 7. [SELECT](#7-select)
 8. [INSERT](#8-insert)
-9. [UPDATE](#9-update)
-10. [DELETE](#10-delete)
-11. [DDL](#11-ddl)
-12. [トランザクション](#12-トランザクション)
-13. [エラー](#13-エラー)
-14. [既知の制限](#14-既知の制限)
-15. [付録: 完全な例](#15-付録-完全な例)
+9. [UPDATEとDELETE](#9-updateとdelete)
+10. [DDL](#10-ddl)
+11. [トランザクション](#11-トランザクション)
+12. [エラー](#12-エラー)
+13. [既知の制限](#13-既知の制限)
+14. [例](#14-例)
 
----
+## 1. 文
 
-## 1. 文の一覧
+文は次の形式を受け付ける。
 
 ```ebnf
-statement      ::= select | explain | insert | update | delete | ddl | txn
+statement ::= select | explain | insert | update | delete | ddl | transaction
 
-explain        ::= EXPLAIN select
+select_core ::= SELECT [DISTINCT] select_item { "," select_item }
+                [ FROM table_ref { join_clause } ]
+                [ WHERE expr ]
+                [ GROUP BY expr { "," expr } ]
+                [ HAVING expr ]
 
-select         ::= select_core { UNION ALL select_core }
-                   [ ORDER BY sort_key {"," sort_key} ]
-                   [ LIMIT expr ] [ OFFSET expr ]
+select ::= select_core { UNION ALL select_core }
+           [ ORDER BY sort_key { "," sort_key } ]
+           [ LIMIT expr ] [ OFFSET expr ]
 
-select_core    ::= SELECT [DISTINCT] select_item {"," select_item}
-                   [ FROM table_ref { join_clause } ]
-                   [ WHERE expr ]
-                   [ GROUP BY expr {"," expr} ]
-                   [ HAVING expr ]
+table_ref  ::= ident [ [AS] ident ]
+             | "(" select ")" [AS] ident
+join_clause ::= [ INNER | LEFT [OUTER] ] JOIN table_ref ON expr
+sort_key   ::= expr [ ASC | DESC ]
 
-select_item    ::= "*" | ident "." "*" | expr [ [AS] ident ]
-table_ref      ::= ident [ [AS] ident ]
-join_clause    ::= [INNER | LEFT [OUTER]] JOIN table_ref ON expr
-sort_key       ::= expr [ASC | DESC]
+explain    ::= EXPLAIN SELECT ...
 
-insert         ::= INSERT INTO ident ( DEFAULT VALUES
-                   | [ "(" column_list ")" ] (VALUES row {"," row} | select) )
-row            ::= "(" expr {"," expr} ")"
-update         ::= UPDATE ident SET assignment {"," assignment} [ WHERE expr ]
-delete         ::= DELETE FROM ident [ WHERE expr ]
+insert     ::= INSERT INTO ident [ "(" column_list ")" ]
+               ( VALUES row { "," row } | SELECT ... | DEFAULT VALUES )
 
-ddl            ::= CREATE TABLE [IF NOT EXISTS] ident "(" table_element {"," table_element} ")"
-                | CREATE [UNIQUE] INDEX [IF NOT EXISTS] ident ON ident "(" column_list ")"
-                | DROP TABLE  [IF EXISTS] ident
-                | DROP INDEX  [IF EXISTS] ident
-                | ALTER TABLE ident ( ADD [COLUMN] column_def
-                                    | DROP [COLUMN] ident
-                                    | RENAME [COLUMN] ident TO ident )
-table_element  ::= column_def | PRIMARY KEY "(" column_list ")" | UNIQUE "(" column_list ")"
-column_def     ::= ident (data_type [type_args] [column_constraint {column_constraint}]
-                         | column_constraint {column_constraint})
-column_constraint ::= NOT NULL | PRIMARY KEY | UNIQUE | DEFAULT expr
+update     ::= UPDATE ident SET assignment { "," assignment } [ WHERE expr ]
+delete     ::= DELETE FROM ident [ WHERE expr ]
 
-txn            ::= BEGIN [TRANSACTION] | START TRANSACTION
-                | COMMIT [WORK | TRANSACTION] | END
-                | ROLLBACK [WORK | TRANSACTION]
+ddl        ::= CREATE TABLE [IF NOT EXISTS] ident "(" table_element { "," table_element } ")"
+             | CREATE [UNIQUE] INDEX [IF NOT EXISTS] ident ON ident "(" column_list ")"
+             | DROP TABLE [IF EXISTS] ident
+             | DROP INDEX [IF EXISTS] ident
+             | ALTER TABLE ident ( ADD [COLUMN] column_def
+                                  | DROP [COLUMN] ident
+                                  | RENAME [COLUMN] ident TO ident )
+
+transaction ::= BEGIN [TRANSACTION] | START TRANSACTION
+              | COMMIT [WORK | TRANSACTION] | END
+              | ROLLBACK [WORK | TRANSACTION]
 ```
 
-> **注意** `BEGIN` / `COMMIT` / `ROLLBACK` は SQL 文として transaction を制御する（§12）。
-> 詳しくは [12. トランザクション](#12-トランザクション)。
->
-> `EXPLAIN` は `SELECT` だけに書ける（実行計画の表示。§7.11）。
+複数の文は `;`で区切る。
+末尾の `;`は省略できる。
+区切りなしは `SyntaxError`になる。
 
-文を複数書く場合は `;` で区切る（**区切りなしは `SyntaxError`**。末尾の `;` は省略可）。
 `Session.Execute` は複数文を順に実行する。
-結果を返す文（`SELECT` / `EXPLAIN`）が 1つだけならその結果を返し、複数（または 0個）なら
-`RowsAffected` の合計だけを返す（`Columns` / `Rows` は空）。
 
----
+- 結果を返す文が1つだけの場合は、その文の結果を返す。
+- 結果を返す文が複数、または結果を返さない場合は、`RowsAffected`の合計を返す。
+- `SELECT`以外で `Columns`と `Rows`は空になる。
+
+`EXPLAIN`は `SELECT`だけを受け付ける。
 
 ## 2. 字句
 
 ### コメント
 
-| 記法        | 範囲                                                      |
-| ----------- | --------------------------------------------------------- |
-| `--`        | 行末まで                                                  |
-| `/* ... */` | **入れ子可**（`/* a /* b */ c */` として `c` もコメント） |
+- `--` は行末までコメントになる。
+- `/* ... */` はブロックコメントになる。
+- ブロックコメントは入れ子にできる。
+
+```sql
+/* 外側 /* 内側 */ 外側もコメント */
+```
 
 ### 識別子
 
-- 通常: 開始は**文字または `_`**、以降は文字・数字・ `_`
-  （`Char.IsLetter` / `Char.IsLetterOrDigit`。英字以外の Unicode 文字も識別子として使える）
-- 引用: `"..."`（`""` で `"` をエスケープ）
+通常の識別子は、先頭が文字または `_`、以降が文字・数字・ `_`で構成される。
 
-**大文字小文字は区別しない**（テーブル名・列名・索引名の比較は `OrdinalIgnoreCase`）。
-数字から始めることはできない（`1a` は構文エラー。`_u` のように `_` 始まりは使える）。
-テーブル名・索引名は **UTF-8 で 128 バイト以下**（超えると `NameError`）。
+- Unicodeの文字は識別子に使える。
+- 数字から始めることはできない。
+- テーブル名と索引名はUTF-8で128バイト以内である必要がある。
+- 識別子名の大小文字は区別しない。
+- 引用識別子は `"..."`で囲む。`""`で `"`を表現する。
 
-### 予約語
-
+```sql
+SELECT "Order Id" FROM "My Table";
+SELECT _u FROM t;
 ```
+
+予約語の例は次のとおり。
+
+```text
 SELECT  FROM    WHERE   INSERT  INTO    VALUES  UPDATE  SET     DELETE
 CREATE  TABLE   INDEX    DROP    ON      AND     OR      NOT     NULL
 IS      IN      BETWEEN  LIKE    GROUP   BY      HAVING  ORDER   ASC
@@ -113,159 +117,121 @@ BEGIN   COMMIT  ROLLBACK PRIMARY KEY     UNIQUE  DEFAULT CASE    WHEN
 THEN    ELSE    END      EXISTS  IF      TRUE    FALSE
 ```
 
-この一覧が `Lexer` の `KeywordSpellings` と一致する。
+予約語を別名として使う場合は原則として `AS`を付ける。
 
-### 記号（演算子・区切り）
-
-長いものから照合する。
-
+```sql
+SELECT 1 AS right FROM t AS union;
 ```
+
+### 記号と数値
+
+演算子と区切り記号は次のとおり。
+
+```text
 <>   !=   <=   >=   ||   =   <   >   +   -   *   /   %   ;   ,   .   (   )
 ```
 
-### 数値リテラル
-
-| 形                         | 例                        | 型        |
-| -------------------------- | ------------------------- | --------- |
-| 整数                       | `0` `42` `-7`             | `INTEGER` |
-| 実数（小数部か指数部あり） | `1.5` `.5` `1e3` `1.5E-3` | `REAL`    |
-
-**`DECIMAL` のリテラルはない**。 `1.5` は `REAL`。
-厳密な小数を入力する場合は文字列リテラルで渡し、列の型に応じて変換する（§3）。
-
-### 文字列リテラル
+整数は `INTEGER`、小数点または指数部を持つ数値は `REAL`になる。
 
 ```sql
-'abc'        -- 通常の文字列
-'it''s'      -- ' を 1つ含む（'' がエスケープ）
+0 42 -7       -- INTEGER
+1.5 .5 1e3    -- REAL
 ```
 
-### バイナリリテラル
+`DECIMAL`のリテラルはない。
+厳密な小数を渡す場合は、文字列リテラルを列の型へ変換する。
+
+### 文字列とバイナリ
+
+文字列リテラルはシングルクォートで囲み、`'`は `''`で表す。
 
 ```sql
-X'0A1B'       -- 16進は大文字・小文字どちらでもよい（接頭辞も x / X）。バイト数は偶数
-X'0a1b'
+'abc'
+'it''s'
 ```
 
-奇数長・16進以外の文字が含まれる場合は構文エラーになる。
+バイナリリテラルは偶数桁の16進文字列を使う。
 
-### 位置パラメータ
-
-`?` はパラメータ化クエリの位置パラメータ。SQL テキスト中の出現順（1 個目、2 個目 …）に、
-`Session.Execute(sql, parameters)` / `Session.TryOpenReader(sql, parameters)` へ渡した
-`SqlValue array` の要素と対応する。
-
-```fsharp
-let sql = "SELECT id FROM people WHERE age >= ? AND name LIKE ? ORDER BY id LIMIT ?"
-let result = ok (session.Execute(sql, [| SqlValue.Int 20L; SqlValue.Text "a%"; SqlValue.Int 10L |]))
+```sql
+X'0A1B'
+x'0a1b'
 ```
 
-- 値は通常の式と同じ位置に書ける
-  （`VALUES`、`WHERE`、`HAVING`、`LIMIT` / `OFFSET`、`LIKE` のパターンなど）。
-- 値は SQL 文字列へ連結せずリテラルと同じ式ノードとして埋め込むため、
-  値の内容で SQL の構文が変わらない
-  （SQL インジェクションは起こらない）。
-- `NULL` も渡せる。`? = NULL` は「不明」になるため、NULL の判定には `? IS NULL` を使う。
-- 個数が一致しない場合と `SqlValue.Unloaded` は `TypeError`。
-- 名前付きパラメータ（`:name` / `@name`）は未対応。`?` のみ。
-- `EXPLAIN` でも使え、渡した値は定数として計画に現れる
-  （索引・範囲走査の選択にも使われる）。
-
-### 文字の単位
-
-SQL が「1文字」として数える単位は **Unicode コードポイント**。
-.NET の `string.Length` が数える UTF-16 コード単位ではない。
-
-- `LENGTH` の文字数
-- `LIKE` の `_`（1 コードポイントに一致）
-- `LIKE ... ESCAPE '文字'` のエスケープ文字（1 コードポイントで指定）
-
-サロゲートペア（絵文字など BMP 外の文字）は 1文字として数える。
-結合文字（基底文字 + 結合マーク）はコードポイントごとに数えるため、
-見た目の 1文字が複数になることがある。
-
-### 式の入れ子
-
-式・サブクエリの入れ子段数に**上限はない**。
-`a + b + c + ...` を大量に並べても、
-括弧・`NOT`・`CASE`・関数呼び出し・サブクエリを深く入れても構文エラーにならない。
-式の構文規則は CPS（継続を引数で受け、末尾で呼ぶ）で書いてあり、
-入れ子段数に依存せずスタックは一定になる。
-（深さに比例して AST と継続をヒープに持つため、入力長に比例するメモリは使う。）
-
----
+奇数桁や16進以外の文字を含むバイナリリテラルは構文エラーになる。
 
 ## 3. データ型
 
-| 型          | 受け付ける綴り           | 内部表現               | 表示                           |
-| ----------- | ------------------------ | ---------------------- | ------------------------------ |
-| `NULL`      | `NULL`                   | ―                      | `NULL`                         |
-| `BOOLEAN`   | `BOOLEAN` `BOOL`         | 真偽値                 | `TRUE` / `FALSE`               |
-| `INTEGER`   | `INTEGER` `INT` `BIGINT` | 64 bit 符号付き整数    | `42`                           |
-| `REAL`      | `REAL` `DOUBLE`          | IEEE 754 double        | `1.5`                          |
-| `DECIMAL`   | `DECIMAL` `NUMERIC`      | 固定小数点数           | `150.25`                       |
-| `TEXT`      | `TEXT`                   | UTF-16 文字列          | `'abc'`                        |
-| `BLOB`      | `BLOB`                   | バイト列               | `X'0A1B'`                      |
-| `DATE`      | `DATE`                   | 日付（UTC）            | `2024-01-15`                   |
-| `TIMESTAMP` | `TIMESTAMP` `DATETIME`   | UTC オフセット付き時刻 | `2024-01-15T10:30:00.0000000Z` |
-| `UUID`      | `UUID`                   | GUID                   | `0f8fad5b-…`                   |
+| 型          | 宣言に使える名前           | 内部表現              | 表示                                   |
+| ----------- | -------------------------- | --------------------- | -------------------------------------- |
+| `BOOLEAN`   | `BOOLEAN`、`BOOL`          | 真偽値                | `TRUE` / `FALSE`                       |
+| `INTEGER`   | `INTEGER`、`INT`、`BIGINT` | 64ビット符号付き整数  | `42`                                   |
+| `REAL`      | `REAL`、`DOUBLE`           | IEEE 754倍精度        | `1.5`                                  |
+| `DECIMAL`   | `DECIMAL`、`NUMERIC`       | 固定小数点数          | `150.25`                               |
+| `TEXT`      | `TEXT`                     | UTF-16文字列          | `'abc'`                                |
+| `BLOB`      | `BLOB`                     | バイト列              | `X'0A1B'`                              |
+| `DATE`      | `DATE`                     | 日付                  | `2024-01-15`                           |
+| `TIMESTAMP` | `TIMESTAMP`、`DATETIME`    | UTCオフセット付き時刻 | `2024-01-15T10:30:00.0000000Z`         |
+| `UUID`      | `UUID`                     | GUID                  | `0f8fad5b-d9cb-469f-a165-70867728950e` |
+
+`NULL`はリテラル専用で、列の型として宣言できない。
 
 ### 型引数
 
-`DECIMAL(10, 2)` の `(10, 2)` は**読み取られるだけ**で、丸めも検証も行わない。
-`DECIMAL(3, 1)` に `12345.6789` を入れても丸められずに保存される。
+`DECIMAL(10, 2)`の型引数は読まれるだけで、丸めや桁数検証は行わない。
 
-### 値を列の型へ自動変換する（`SqlValue.coerce`）
+```sql
+CREATE TABLE t (v DECIMAL(3, 1));
+INSERT INTO t VALUES (12345.6789);
+```
 
-`INSERT` / `UPDATE` では、値を列の型に合わせて自動変換する。
-変換できない場合は `TypeError` になる。
+保存時に丸めることなく、値を保持する。
 
-| 目標型      | 受け付ける値                                                                           |
-| ----------- | -------------------------------------------------------------------------------------- |
-| `INTEGER`   | `INTEGER` / `BOOLEAN`(0,1) / 小数部が 0 かつ int64 範囲内の `REAL`・`DECIMAL`          |
-| `REAL`      | `REAL` / `INTEGER` / `BOOLEAN` / `DECIMAL`                                             |
-| `DECIMAL`   | `DECIMAL` / `INTEGER` / `REAL` / `BOOLEAN`（`NaN`・`±Infinity`・decimal 範囲外は不可） |
-| `BOOLEAN`   | `BOOLEAN` / 0・1 の `INTEGER`・`REAL`                                                  |
-| `TEXT`      | **すべて**（`SqlLiteral.toSqlLiteral` の文字列表現になる）                             |
-| `BLOB`      | `BLOB` / `TEXT`（UTF-8 エンコード）                                                    |
-| `DATE`      | `DATE` / `TIMESTAMP` / `yyyy-MM-dd` 形式の `TEXT`                                      |
-| `TIMESTAMP` | `TIMESTAMP` / `DATE` / `DateTimeOffset` が解析できる `TEXT`                            |
-| `UUID`      | `UUID` / `Guid.TryParse` が通る `TEXT`                                                 |
+### 型への自動変換
+
+`INSERT`と `UPDATE`は値を列の型へ変換する。
+変換できない場合は `TypeError`になる。
+
+| 目標型      | 受け付ける値                                                      |
+| ----------- | ----------------------------------------------------------------- |
+| `INTEGER`   | `INTEGER`、`BOOLEAN`、小数部が0でint64範囲内の `REAL` / `DECIMAL` |
+| `REAL`      | `REAL`、`INTEGER`、`BOOLEAN`、`DECIMAL`                           |
+| `DECIMAL`   | `DECIMAL`、`INTEGER`、`REAL`、`BOOLEAN`                           |
+| `BOOLEAN`   | `BOOLEAN`、0または1の `INTEGER` / `REAL`                          |
+| `TEXT`      | すべての値                                                        |
+| `BLOB`      | `BLOB`、UTF-8へ変換できる `TEXT`                                  |
+| `DATE`      | `DATE`、`TIMESTAMP`、`yyyy-MM-dd`形式の `TEXT`                    |
+| `TIMESTAMP` | `TIMESTAMP`、`DATE`、解析できる `TEXT`                            |
+| `UUID`      | `UUID`、`Guid.TryParse`が通る `TEXT`                              |
+
+`DECIMAL`への変換では、`NaN`、無限大、decimal範囲外を拒否する。
 
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, hired DATE, uid UUID);
 INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
--- hired は DATE、uid は UUID になる
 ```
 
-### 値の比較
+### 比較規則
 
-| 種別                       | 規則                                                                                                                                                                                              |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `INTEGER` `REAL` `DECIMAL` | `INTEGER` / `DECIMAL` は decimal で比較。`REAL` 同士は float（`NaN` は最大、`NaN = NaN` は真）。`REAL` と `INTEGER` / `DECIMAL` は decimal で表せる範囲なら decimal、範囲外・`1e-28` 未満は float |
-| `REAL` の `NaN`            | **`REAL` 同士の比較でのみ**最大。`NaN = NaN` は真。`NaN` と `INTEGER` / `DECIMAL` の比較は `TypeError`（§14「演算の注意」）                                                                       |
-| `TEXT`                     | UTF-8 の符号化順（= Unicode コードポイント順）                                                                                                                                                    |
-| `BLOB`                     | バイト列の辞書順（短い方が先）                                                                                                                                                                    |
-| `DATE` `TIMESTAMP`         | 相互比較可（`DATE` は UTC 午前 0時の `TIMESTAMP` として扱う）                                                                                                                                     |
-| `UUID`                     | `Guid` の比較                                                                                                                                                                                     |
-| `BOOLEAN`                  | `FALSE < TRUE`                                                                                                                                                                                    |
+| 型                   | 比較規則                                                                   |
+| -------------------- | -------------------------------------------------------------------------- |
+| 数値                 | `INTEGER`と `DECIMAL`はdecimalで比較する。`REAL`同士は浮動小数点で比較する |
+| `REAL`の `NaN`       | `REAL`同士では最大値として扱う。`NaN = NaN`は真                            |
+| `TEXT`               | UTF-8バイト列の辞書順（Unicodeコードポイント順）                           |
+| `BLOB`               | バイト列の辞書順。短い方が先                                               |
+| `DATE` / `TIMESTAMP` | 相互比較可。`DATE`はUTC午前0時として扱う                                   |
+| `UUID`               | GUIDの比較規則                                                             |
+| `BOOLEAN`            | `FALSE < TRUE`                                                             |
 
-**上記以外の型の組み合わせは比較できない**（`TypeError`）。
-`active = 1`（`BOOLEAN` と `INTEGER`）はエラーになる。
+`INTEGER`、`REAL`、`DECIMAL`をまたぐ比較は、値がdecimalで表せる範囲にある場合はdecimalで比較する。
+範囲外または極小値はfloatで比較する。
+異なる型の組み合わせや、`NaN`と整数・decimalの比較は `TypeError`になる。
+`BOOLEAN`と `INTEGER`は比較できない。
 
-`TEXT` の比較順はキー符号化（UTF-8 バイト列）と同じになる。
-.NET の `StringComparer.Ordinal` は UTF-16 コード単位順で、
-補助文字（サロゲートペア）と `U+E000`..`U+FFFF` の間で UTF-8 の順序と逆転するため使わない。
-例: `U+FF21`（全角 A）< `U+1F600`（絵文字）。
+## 4. リテラルとパラメータ
 
-- 数値 3種の比較順位: `INTEGER` = `REAL` = `DECIMAL` < `DATE` < `TIMESTAMP` < `TEXT` < `BLOB` < `UUID`
-- `NULL` との比較は 3値論理（[§6.2](#62-3値論理)）に従い、結果は `UNKNOWN` になる。
+### リテラル
 
----
-
-## 4. 値の書き方と表示
-
-### 入力できる値
+リテラルには次の表記がある。
 
 | 値       | 書き方                                          |
 | -------- | ----------------------------------------------- |
@@ -279,78 +245,58 @@ INSERT INTO t VALUES (1, '2024-01-15', '0f8fad5b-d9cb-469f-a165-70867728950e');
 | 時刻     | `'2024-01-15T10:30:00Z'`                        |
 | UUID     | `'0f8fad5b-…'`                                  |
 
-**リテラルには `DECIMAL`・`DATE`・`TIMESTAMP`・`UUID` の書式がない**。
-これらは文字列リテラルで記述し、列の型に応じて変換する。
+`DECIMAL`、`DATE`、`TIMESTAMP`、`UUID`の専用リテラルはない。
+文字列リテラルを列の型へ変換するか、値をパラメータで渡す。
 
-### `INSERT` の値式は定数のみ
+### 位置パラメータ
 
-`INSERT ... VALUES` の値は **列参照を含む式にできない**（対象テーブルの列も読めない）。
-サブクエリは定数として評価できる（§7.9）。
+`?`は位置パラメータである。出現順が引数配列の添字になる。
 
-```sql
-INSERT INTO t VALUES (1, 2 + 3);                 -- OK（定数式）
-INSERT INTO t VALUES (1, (SELECT MAX(v) FROM u)); -- OK（サブクエリ）
-INSERT INTO t VALUES (1, other_col);             -- NameError（'other_col' は列でも関数でもありません）
+```fsharp
+let sql = "SELECT id FROM people WHERE age >= ? AND name LIKE ? LIMIT ?"
+let parameters =
+    [| SqlValue.Int 20L
+       SqlValue.Text "a%"
+       SqlValue.Int 10L |]
+
+session.Execute(sql, parameters)
 ```
 
-行の値を使いたい場合は `INSERT ... SELECT` を使う（§8）。
+- `VALUES`、述語、`HAVING`、`LIMIT`、`OFFSET`、`LIKE`パターンなどに使える。
+- SQL文字列へ値を連結しないため、SQLインジェクションを防ぐ。
+- 個数が一致しない場合と `SqlValue.Unloaded`は `TypeError`になる。
+- 名前付きパラメータは未対応。
+- `EXPLAIN`でも定数パラメータを計画に使える。
 
-### 出力の表示（`SqlLiteral.toSqlLiteral`）
+### 文字数
 
-| 型        | 表示                                                  |
-| --------- | ----------------------------------------------------- |
-| NULL      | `NULL`                                                |
-| BOOLEAN   | `TRUE` / `FALSE`                                      |
-| INTEGER   | `42`                                                  |
-| REAL      | `1.567`（`R` 書式。`NaN` / `Infinity` / `-Infinity`） |
-| DECIMAL   | `100.5`                                               |
-| TEXT      | `'alice'`（`'` は `''` にエスケープ）                 |
-| BLOB      | `X'0A1B'`                                             |
-| DATE      | `2024-01-15`                                          |
-| TIMESTAMP | `2024-01-15T10:30:00.0000000Z`                        |
-| UUID      | `0f8fad5b-d9cb-469f-a165-70867728950e`                |
+文字数はUnicodeコードポイント単位で数える。
 
-CLI は 1行目に列名、2行目に区切り（列名と同じ文字数の `-`）、3行目以降に `  値, 値, …` を出す。
-0 行の `SELECT` でもヘッダの 2行だけは出る。
-`SELECT` 以外は `(N rows)` の 1行だけ。
-ただし `EXPLAIN` は `plan` 列のヘッダ・区切りと計画行（引用符なし）を表示する。
+- `LENGTH`はコードポイント数を返す。
+- `LIKE`の `_`はコードポイント1個に一致する。
+- `ESCAPE`文字はコードポイント1個で指定する。
 
----
+サロゲートペアは1文字として数える。結合文字は別々のコードポイントとして数える。
 
 ## 5. 識別子と名前解決
 
 ```sql
-SELECT p.id, p.name FROM people p;      -- テーブル別名
-SELECT id FROM people p;                -- 修飾は省略できる
-SELECT people.id FROM people;           -- 修飾はテーブル実名でもよい
-SELECT "Order Id" FROM "My Table";      -- 引用識別子
+SELECT p.id, p.name FROM people p;
+SELECT id FROM people p;
+SELECT people.id FROM people;
+SELECT "Order Id" FROM "My Table";
 ```
 
-- 修飾なしの列名は `FROM` にあるテーブルの順に探す。
-- 結合句で同じ列名が複数の表にあれば、修飾が必須。
-- `UNION` / `RIGHT` / `FULL` / `CROSS` / `NATURAL` / `OUTER` などの未対応の SQL 語は、
-  列名には使えるが、**裸の別名（テーブル・列）**には使えない
-  （`FROM t AS right` / `SELECT a AS union` のように `AS` を付ける）。
-  `USING` はテーブル別名には使えないが、列の裸の別名としては受理される
-  （`SELECT 1 USING` の列名は `USING`）。
-  `JOIN ... USING (...)` は明示的な `SyntaxError` になる（§14）。
-
-### `SELECT` 項目の式
-
-`SELECT` の項目は式として解析されるため、列名や関数呼び出しの後ろにも演算子を続けて書ける。
-
-```sql
-SELECT name || 'x' FROM t;          -- OK
-SELECT SUM(d) + 0.5 FROM t;        -- OK
-```
-
----
+- 修飾なしの列名は `FROM`に現れるテーブルの順に解決する。
+- 結合で同名の列が複数ある場合は修飾が必要になる。
+- 別名を付けた場合は別名で修飾する（実名では解決しない）。
+- 名前の比較は大文字小文字を区別しない。
 
 ## 6. 式
 
 ### 6.1 演算子の優先順位
 
-優先順位の高い方から。
+優先順位が高いものから示す。
 
 | 優先順位 | 演算子                                                                                            | 意味                                         |
 | -------: | ------------------------------------------------------------------------------------------------- | -------------------------------------------- |
@@ -364,515 +310,371 @@ SELECT SUM(d) + 0.5 FROM t;        -- OK
 |        8 | `AND`                                                                                             | 論理積                                       |
 |        9 | `OR`                                                                                              | 論理和                                       |
 
-- `AND` は `OR` より強い（`a OR b AND c` は `a OR (b AND c)`）。
-- 算術演算子と `||` は同じ優先順位で**左結合**（`1 + 2 || 'x'` は `(1 + 2) || 'x'`）。
+算術演算と文字列連結は左結合する。
 
-### 6.2 3 値論理
+### 6.2 3値論理
 
-比較・`IS NULL` 以外の述語は `TRUE` / `FALSE` / `UNKNOWN` の 3 値。
+述語の結果は `TRUE`、`FALSE`、`UNKNOWN`のいずれかになる。
 
-| 式                            | 結果                                  |
-| ----------------------------- | ------------------------------------- |
-| `NULL = NULL`                 | `UNKNOWN`（＝`WHERE` では偽）         |
-| `NULL <> NULL`                | `UNKNOWN`                             |
-| `1 = NULL`                    | `UNKNOWN`                             |
-| `NULL AND FALSE`              | `FALSE`                               |
-| `NULL AND TRUE`               | `UNKNOWN`                             |
-| `NULL OR TRUE`                | `TRUE`                                |
-| `NOT NULL`                    | `UNKNOWN`                             |
-| `x IS NULL` / `x IS NOT NULL` | `TRUE` / `FALSE`（NULL でも常に真偽） |
+| 式                                        | 結果      |
+| ----------------------------------------- | --------- |
+| `NULL = NULL`、`NULL <> NULL`、`1 = NULL` | `UNKNOWN` |
+| `NULL AND FALSE`                          | `FALSE`   |
+| `NULL AND TRUE`                           | `UNKNOWN` |
+| `NULL OR TRUE`                            | `TRUE`    |
+| `NOT NULL`                                | `UNKNOWN` |
+| `x IS NULL`、`x IS NOT NULL`              | 常に真偽  |
 
-`WHERE` / `HAVING` では `UNKNOWN` は `FALSE` として扱う。
-算術演算・`ABS`・`CASE` の条件など、述語以外は NULL が**そのまま伝播**する。
+`WHERE`と `HAVING`では `UNKNOWN`を偽として扱う。
+算術、`ABS`、`CASE`では `NULL`が伝播する。
 
 ### 6.3 算術
 
-| 式              | 挙動                                                              |
-| --------------- | ----------------------------------------------------------------- |
-| `1 + 2`         | `3`                                                               |
-| `10 / 4`        | `2`（**整数演算は切り捨て**。`INTEGER` ÷ `INTEGER` は `INTEGER`） |
-| `10 % 4`        | `2`                                                               |
-| `1 + NULL`      | `NULL`                                                            |
-| `1 / 0`         | エラー（`0 での除算は定義されていません`）                        |
-| `1.5 + 1`       | `REAL`（片方が REAL/DECIMAL なら結果もそうなる）                  |
-| `'a' \|\| 'b'`  | `'ab'`                                                            |
-| `'a' \|\| NULL` | `NULL`                                                            |
+| 式              | 結果                            |
+| --------------- | ------------------------------- |
+| `1 + 2`         | `3`                             |
+| `10 / 4`        | `2`。整数同士の除算は切り捨てる |
+| `10 % 4`        | `2`                             |
+| `1 + NULL`      | `NULL`                          |
+| `1 / 0`         | `0 での除算`エラー              |
+| `1.5 + 1`       | `REAL`                          |
+| `'a' \|\| 'b'`  | `'ab'`                          |
+| `'a' \|\| NULL` | `NULL`                          |
 
-数値の型は次のとおり決まる。
-
-```
-INTEGER op INTEGER        -> INTEGER
-DECIMAL op DECIMAL        -> DECIMAL
-REAL が 1 つでも含まれる  -> REAL
-片方が NULL               -> NULL
-```
-
-実数除算にしたいときは `10 / 4.0` のように `REAL` を混ぜる。
+計算に `REAL`が含まれれば `REAL`になる。
+`INTEGER`同士は `INTEGER`、`DECIMAL`同士は `DECIMAL`、`INTEGER`と `DECIMAL`の混合は `DECIMAL`になる。
+片方が `NULL`なら結果も `NULL`になる。
+実数除算には `10 / 4.0`のように小数を使う。
 
 ### 6.4 述語
 
 ```sql
-x = 1        x <> 1       x != 1
-x <  1       x <= 1       x >  1       x >= 1
-x IS NULL    x IS NOT NULL
-x IS TRUE    x IS NOT TRUE    x IS FALSE    x IS NOT FALSE
-x IS UNKNOWN x IS NOT UNKNOWN
-x IN (1, 2, 3)      x NOT IN (1, 2, 3)
-x BETWEEN 1 AND 10   x NOT BETWEEN 1 AND 10
-name LIKE 'a%'       name NOT LIKE 'a%'
+x = 1  x <> 1  x != 1
+x < 1  x <= 1  x > 1  x >= 1
+x IS NULL  x IS NOT NULL
+x IS TRUE  x IS NOT TRUE
+x IS FALSE  x IS NOT FALSE
+x IS UNKNOWN  x IS NOT UNKNOWN
+x IN (1, 2, 3)
+x NOT IN (1, 2, 3)
+x BETWEEN 1 AND 10
+x NOT BETWEEN 1 AND 10
+name LIKE 'a%'
+name NOT LIKE 'a%'
 ```
 
-- `BETWEEN` は両端を含む（`1 <= x <= 10`）。
-- `IN` の要素は**式のリスト**。`x IN (SELECT ...)` も使える（§7.9）。
-- `EXISTS (SELECT ...)` / `NOT EXISTS (SELECT ...)` も使える（§7.9）。
-- `LIKE` のワイルドカード:
+`BETWEEN`は両端を含む。
+`IN`には式のリストまたはサブクエリを指定できる。
 
-| 記号 | 意味                                               |
-| ---- | -------------------------------------------------- |
-| `%`  | 0文字以上の任意の文字列                            |
-| `_`  | Unicode コードポイント 1個（サロゲートペアも 1個） |
+`LIKE`は次のワイルドカードを使う。
 
-- `_` は `LENGTH` と同じ数え方で、サロゲートペア（絵文字など BMP 外の文字）も 1文字として一致する。
-- `LIKE ... ESCAPE '文字'` に対応する。エスケープ文字は Unicode コードポイント 1個（サロゲートペアも 1文字）。
-  エスケープ文字の直後の `%` / `_` / エスケープ文字自身はリテラルになる。
-  エスケープ文字がパターンの末尾に来た場合は `TypeError`。
-  `\` を既定のエスケープにする仕組みや、大文字小文字を区別しないモード（`ILIKE`）は**ない**。
-- パターンも対象の値も文字列表現（`toDisplayString`）に変換して照合する。どちらかが `NULL` なら結果は `NULL`。
-- `IS TRUE` / `IS FALSE` / `IS UNKNOWN` は 3値論理の判定。
-  `NULL`（UNKNOWN）は `IS TRUE` / `IS FALSE` とも `FALSE`、`IS UNKNOWN` は `TRUE`。
-  否定形（`IS NOT …`）はその否定。`BOOLEAN` 以外の値は UNKNOWN として扱う
-  （例: `1 IS TRUE` は `FALSE`、`1 IS UNKNOWN` は `TRUE`）。
+| 記号 | 意味            |
+| ---- | --------------- |
+| `%`  | 0文字以上       |
+| `_`  | 1コードポイント |
+
+エスケープ文字を指定できる。
 
 ```sql
-SELECT name FROM people WHERE name LIKE 'a%';     -- a で始まる
-SELECT name FROM people WHERE name LIKE '_ob';     -- 2文字目が o、3文字目が b
-SELECT name FROM people WHERE name LIKE 'a_c';     -- 3文字、2文字目が任意
-SELECT name FROM people WHERE name LIKE 'a!%' ESCAPE '!';  -- 文字列 'a%'
+name LIKE 'a!%' ESCAPE '!'
 ```
+
+`!%`の `!`をエスケープとして解釈し、末尾の `%`をリテラルとして扱う。
+
+- パターン末尾にエスケープ文字だけが残る場合は `TypeError`になる。
+- `ILIKE`や既定の `\`エスケープはない。
+- `NULL`に対する `LIKE`の結果は `NULL`になる。
+
+`IS TRUE`、`IS FALSE`、`IS UNKNOWN`は、`BOOLEAN`以外の値をUNKNOWNとして扱う。
 
 ### 6.5 集約関数
 
-| 関数       | 戻り値             | 空のグループ | `NULL` の扱い |
-| ---------- | ------------------ | ------------ | ------------- |
-| `COUNT(*)` | `INTEGER`          | `0`          | 数える        |
-| `COUNT(x)` | `INTEGER`          | `0`          | **数えない**  |
-| `SUM(x)`   | `DECIMAL` / `REAL` | `NULL`       | 無視          |
-| `AVG(x)`   | 常に `REAL`        | `NULL`       | 無視          |
-| `MIN(x)`   | 入力と同じ型       | `NULL`       | 無視          |
-| `MAX(x)`   | 入力と同じ型       | `NULL`       | 無視          |
+| 関数       | 戻り値                 | 空のグループ | `NULL`   |
+| ---------- | ---------------------- | ------------ | -------- |
+| `COUNT(*)` | `INTEGER`              | `0`          | 数える   |
+| `COUNT(x)` | `INTEGER`              | `0`          | 数えない |
+| `SUM(x)`   | `DECIMAL`または `REAL` | `NULL`       | 無視     |
+| `AVG(x)`   | 常に `REAL`            | `NULL`       | 無視     |
+| `MIN(x)`   | 入力と同じ型           | `NULL`       | 無視     |
+| `MAX(x)`   | 入力と同じ型           | `NULL`       | 無視     |
 
 ```sql
 SELECT dept_id,
-       COUNT(*)    AS c,
+       COUNT(*) AS c,
        SUM(salary) AS total,
        AVG(salary) AS mean,
-       MIN(name)   AS lo,
-       MAX(name)   AS hi
-  FROM people
- GROUP BY dept_id
+       MIN(name) AS lo,
+       MAX(name) AS hi
+FROM people
+GROUP BY dept_id
 HAVING COUNT(*) > 1
- ORDER BY dept_id;
+ORDER BY dept_id;
 ```
 
-補足:
-
-- `AVG` は `SUM / COUNT` を実行時に計算する。
-- `MIN` / `MAX` は文字列・日付・時刻にも使える。
-- `GROUP BY` を書かない `SELECT SUM(x) FROM t` は表全体の 1グループとして集計される。
-- `GROUP BY` の式は `SELECT` 項目 / `HAVING` でも同じ式を書ける
-  （式全体が集約後のスロットへ解決される）。
-- `GROUP BY` / 集約関数を使うときに `SELECT *` は書けない（列を明示する）。
-- 集約も `GROUP BY` も無い `HAVING` は `SyntaxError`。
-- `SUM` / `AVG` は `INTEGER` / `DECIMAL` / `REAL` が混在しても合計を落とさない
-  （`REAL` が混在すると `SUM` も `REAL`、それ以外の `SUM` は `DECIMAL`。`AVG` は常に `REAL`）。
-  入力が 0行でも 1行を返す（`COUNT(*)` は `0`、`SUM` / `AVG` / `MIN` / `MAX` は `NULL`）。
-- 集約関数のエラーは**伝播する**。文字列列に `SUM` を掛けると `TypeError` になる。
-- `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` の `DISTINCT` は**重複排除する**
-  （`SUM(DISTINCT x)` など）。
-  `DISTINCT` は 1 引数の集約にだけ書ける。
+- `GROUP BY`を省略した集約は、表全体を1グループとして計算する。
+- `FROM`がない集約は1行を入力として計算する。
+- `SUM`と `AVG`に数値以外を渡すと `TypeError`になる。
+- 集約引数には `DISTINCT`を指定できる。
+- 集約と `GROUP BY`を使うクエリでは `SELECT *`を使えない。
+- 集約も `GROUP BY`もない `HAVING`は構文エラーになる。
 
 ### 6.6 スカラー関数
 
-関数名は大文字小文字を区別しない。
+関数名の大小文字は区別しない。
 
-| 関数                |   引数 | 戻り値               | `NULL` の扱い    | 備考                                                                    |
-| ------------------- | -----: | -------------------- | ---------------- | ----------------------------------------------------------------------- |
-| `UPPER(x)`          |      1 | `TEXT`               | 大文字化         |
-| `LOWER(x)`          |      1 | `TEXT`               | 小文字化         |
-| `TRIM(x)`           |      1 | `TEXT`               | 前後の空白を削除 |
-| `LENGTH(x)`         |      1 | `INTEGER`            | `NULL`           | Unicode コードポイント数（サロゲートペアは 1文字）                      |
-| `ABS(x)`            |      1 | 入力と同じ数値型     | `NULL`           | 非数値はエラー                                                          |
-| `ROUND(x)`          |      1 | 入力と同じ数値型     | `NULL`           | 0.5 は 1 へ（四捨五入・`AwayFromZero`）。`INTEGER` / `REAL` / `DECIMAL` |
-| `COALESCE(a, b, …)` | 1 以上 | 最初の非 `NULL` の型 | 全滅なら `NULL`  | 引数数は自由                                                            |
-| `CAST(x AS 型)`     |      1 | 変換後の型           | `NULL`           | 明示変換。`TEXT` → 数値 / `BOOLEAN` も可                                |
+| 関数                  |  引数 | 戻り値              | `NULL`                 |
+| --------------------- | ----: | ------------------- | ---------------------- |
+| `UPPER(x)`            |     1 | `TEXT`              | `NULL`                 |
+| `LOWER(x)`            |     1 | `TEXT`              | `NULL`                 |
+| `TRIM(x)`             |     1 | `TEXT`              | `NULL`                 |
+| `LENGTH(x)`           |     1 | `INTEGER`           | `NULL`                 |
+| `ABS(x)`              |     1 | 入力と同じ数値型    | `NULL`                 |
+| `ROUND(x)`            |     1 | 入力と同じ数値型    | `NULL`                 |
+| `COALESCE(a, b, ...)` | 1以上 | 最初の非 `NULL`の型 | 全て `NULL`なら `NULL` |
+| `CAST(x AS type)`     |     1 | 変換後の型          | `NULL`                 |
 
-- **未知の関数**は `未知のスカラー関数 '…' です`。
-- **引数数が違う**場合は `… 関数は 1個の引数が必要ですが、2個渡されました`。
-  ただし空の引数リスト（`LENGTH()`）は関数の前に構文エラーになる。
-- `ROUND` は `INTEGER` / `REAL` / `DECIMAL` を受け付け、同じ型を返す。
-  文字列など数値以外を渡すと `ROUND は数値を受け付けますが 'abc' です` になる。
-- `CAST` は `expr AS 型` の形で、型引数（`DECIMAL(10, 2)` の `(10, 2)`）は読み飛ばす。
-  `TEXT` から `INTEGER` / `REAL` / `DECIMAL` / `BOOLEAN` への変換は CAST 専用の規則で行う
-  （`CAST('42' AS INTEGER)` は `42`）。
-  変換できない値は `TypeError`。
-
-### 6.7 条件式
+`CAST`は型引数を無視して変換する。
+`TEXT`から数値・真偽値への変換もできる。
 
 ```sql
-CASE WHEN 条件 THEN 値 [WHEN 条件 THEN 値 …] [ELSE 既定値] END
+CAST('42' AS INTEGER)
+CAST('TRUE' AS BOOLEAN)
+CAST(3.14 AS TEXT)
 ```
 
-- 条件は上から順に評価され、**最初に真になった** `THEN` を返す。
-- 条件が `NULL`（`UNKNOWN`）のときは次の `WHEN` に進む。
-- `ELSE` を書かないと、真の分岐が 1 つも無いときは `NULL` を返す。
+未知の関数、引数不足、引数過多はエラーになる。
+空の引数リストは構文エラーになる。
+
+### 6.7 CASE式
 
 ```sql
-SELECT name,
-       CASE WHEN age > 30 THEN 'senior'
-            WHEN age > 20 THEN 'mid'
-            ELSE 'junior'
-       END AS band
-  FROM people
- ORDER BY id;
+CASE
+  WHEN 条件 THEN 値
+  [WHEN 条件 THEN 値 ...]
+  [ELSE 値]
+END
 ```
 
-### 6.8 関数呼び出し
+条件は上から順に評価し、最初に真となった `THEN`を返す。
+`ELSE`を省略し、真となる条件がない場合は `NULL`になる。
 
+```sql
+CASE WHEN age > 30 THEN 'senior'
+     WHEN age > 20 THEN 'mid'
+     ELSE 'junior'
+END
 ```
-関数名 "(" expr {"," expr} ")"
-```
 
-引数は 1個以上。
-`COUNT(*)` だけが特別に引数なしの形として受理される。
-空の引数リスト（`LENGTH()` / `COALESCE()`）は構文エラー。
-
----
+式とサブクエリの入れ子には深さ制限を設けない。
 
 ## 7. SELECT
 
-### 7.1 文法
+### 7.1 基本文法
 
 ```sql
-SELECT [DISTINCT] 項目 [, 項目 …]
-  [FROM 入力 [[AS] 別名]
-       [[INNER | LEFT [OUTER]] JOIN 入力 [[AS] 別名] ON 条件] …]
-  [WHERE 条件]
-  [GROUP BY 式 [, 式 …]]
-  [HAVING 条件]
-  [UNION ALL SELECT …] …
-  [ORDER BY 式 [ASC|DESC] [, …]]
-  [LIMIT 定数式] [OFFSET 定数式];
-
--- 入力 := テーブル | (SELECT ...)   ← 派生テーブル（別名必須。§7.10）
+SELECT [DISTINCT] select_item [, ...]
+FROM table_ref [ [AS] alias ]
+     [join_clause ...]
+[WHERE expr]
+[GROUP BY expr [, ...]]
+[HAVING expr]
+[UNION ALL select_core ...]
+[ORDER BY expr [ASC | DESC] [, ...]]
+[LIMIT expr]
+[OFFSET expr]
 ```
 
-- **`FROM` は省略できる**。入力は 1行 0列になる。
-  `SELECT 1` / `SELECT 1 + 2 AS x` は 1行 1列（列名は式の表示か別名）を返し、
-  `WHERE` / `ORDER BY` / `LIMIT` はその 1行に適用される。
-  集約は 1行を入力として集計する（`SELECT COUNT(*)` は 1、
-  `SELECT COUNT(*) WHERE 1 = 2` は 0）。
-  `FROM` が無いときは `*` / `t.*` を書けない（展開する列が無い）。
-  `JOIN` には `FROM` が必要。
-- 条件・式の中にはサブクエリを書ける（§7.9）。
-  `FROM` / `JOIN` には派生テーブル（`FROM (SELECT ...) AS x`、別名必須）も書ける（§7.10）。
-- `JOIN` は `INNER JOIN` / `JOIN` / `LEFT JOIN` / `LEFT OUTER JOIN`。
-  `RIGHT` / `FULL` / `CROSS` は**ない**。
-- `ON` は省略できない
-  （`CROSS JOIN` の代わりに `ON 1 = 1`）。
-- `UNION ALL` で複数の `SELECT` を連結できる（§7.12）。
-  `ORDER BY` / `LIMIT` / `OFFSET` は連結後の結果全体に掛かる。
-- `DISTINCT` は射影の**後**に適用される
-  （`SELECT DISTINCT a, b` は `(a, b)` の組で重複除去）。
+`FROM`は省略できる。
+`SELECT 1`は1行1列を返し、列名は式の表示文字列になる。
+`FROM`がないクエリでは `*`と `t.*`は使えない。
+
+`JOIN`は次の形式を受け付ける。
+
+```sql
+INNER JOIN table ON expr
+JOIN table ON expr
+LEFT JOIN table ON expr
+LEFT OUTER JOIN table ON expr
+```
+
+`ON`は省略できない。
+`RIGHT`、`FULL`、`CROSS`、`NATURAL`、`USING`、カンマ結合は未対応。
 
 ### 7.2 評価順
 
-```
-FROM → JOIN → WHERE → GROUP BY → 集約 → HAVING → ORDER BY → 射影 → DISTINCT → LIMIT
+実行順は概ね次のとおり。
+
+```text
+FROM → JOIN → WHERE → GROUP BY → 集約 → HAVING → ORDER BY
+→ 射影 → DISTINCT → LIMIT / OFFSET
 ```
 
-`LIMIT` は最後に適用される。
-ただし `WHERE` / `GROUP BY` / `DISTINCT` / 結合のない単純な全走査では、
-件数ヒント（`OFFSET + LIMIT`）をストレージへ降ろす（§7.7）。
+`OFFSET`の後に `LIMIT`を適用する。
 
 ### 7.3 結果の列名
 
-| 記述             | 列名                                            |
-| ---------------- | ----------------------------------------------- |
-| `SELECT id`      | `id`                                            |
-| `SELECT id AS x` | `x`                                             |
-| `SELECT (1 + 2)` | `(1 + 2)`（式の表示文字列。**常に丸括弧つき**） |
-| `SELECT *`       | 各列名（`id`, `name`, …）                       |
-| `SELECT t.*`     | `t.id`, `t.name`, …（修飾つき）                 |
+| 記述             | 列名         |
+| ---------------- | ------------ |
+| `SELECT id`      | `id`         |
+| `SELECT id AS x` | `x`          |
+| `SELECT (1 + 2)` | `(1 + 2)`    |
+| `SELECT *`       | 各列名       |
+| `SELECT t.*`     | 修飾付き列名 |
 
-クライアントが列名でアクセスする場合は `AS` を付けるのが安全。
+クライアントで列名を参照する場合は `AS`を付ける。
 
-#### 別名の参照
+`ORDER BY`、`GROUP BY`、`HAVING`では `SELECT`項目の別名を参照できる。
+入力に同名の列がある場合は列が優先される。
 
-`ORDER BY` / `GROUP BY` / `HAVING` では `SELECT` 項目の別名（`AS`）を参照できる。
+### 7.4 索引と走査
 
-```sql
-SELECT name, age AS a FROM people ORDER BY a;      -- age の順
-SELECT age AS a, COUNT(*) FROM people GROUP BY a;  -- age でまとめる
-SELECT COUNT(*) AS c FROM people HAVING c > 2;     -- 別名を使った条件
-```
+`WHERE`の列比較が索引に使える場合は、実行計画で索引走査を選ぶ。
 
-- 入力の表に**同名の列があるときは列が優先**される
-  （`SELECT name AS age ... ORDER BY age` は `age` 列の順になる）。
-- 別名の連鎖（別名の別名）も解決する。
-- 別名が自分自身や互いを参照する場合は解決しない
-  （`ORDER BY` では「列 'x' が存在しません」になる）。
-- `ORDER BY` には列参照・式・序数（1 始まり）を書ける。
-  序数は `SELECT` 項目の位置（`ORDER BY 2` は 2 番目の項目）。
-  式は行ごとに評価され、ソート後に元の列だけが残る。
-  `ORDER BY` に集約式を直接書くことはできない
-  （`SELECT id FROM t ORDER BY COUNT(*)` は `NameError`。集約クエリでは `SELECT` の別名を並べる）。
-- `t.*` の `t` が `FROM` / `JOIN` に存在しない場合は `NameError`
-  （0列の成功にはしない）。
+| 条件                                             | 走査                                   |
+| ------------------------------------------------ | -------------------------------------- |
+| 主キー全列が定数と等しい                         | `PkLookup`                             |
+| 主キーの一部の列だけが定数と等しい               | `PkLookup`にせず、索引の先頭等値を検討 |
+| 索引の先頭から連続する列が定数と等しい           | `IndexLookup`                          |
+| 索引の先頭列の範囲、または前置等値の次の列の範囲 | `IndexRangeScan`                       |
+| 単一主キー列の下限を含む範囲                     | `RangeScan`                            |
+| 使用可能な条件がない                             | `SeqScan`                              |
 
-### 7.4 索引が使われる条件
-
-`WHERE` に**列 = 定数**（リテラル、負の数値リテラル、または `?` に渡した値）の条件が
-`AND` で連結されていれば、条件をまとめて索引の検索に使う。
-`LIKE 'prefix%'`（`%` が末尾のみ・`_` なし）は**範囲条件として索引に降ろす**。
-
-| 条件                                                                   | 走査方法                                                  |
-| ---------------------------------------------------------------------- | --------------------------------------------------------- |
-| 主キーの全列 `= 定数`                                                  | `PkLookup`                                                |
-| 主キーの一部の列 `= 定数`                                              | `SeqScan`（その列を先頭に含む索引があれば `IndexLookup`） |
-| 索引の**先頭から連続する** `= 定数`（1列以上）                         | `IndexLookup`                                             |
-| 単一列の主キーに下限のある範囲条件 (`>`, `>=`, `BETWEEN`, `LIKE 'x%'`) | `RangeScan`                                               |
-| 索引（**複合可**）の範囲条件。ただし範囲列より前の全列に `= 定数`      | `IndexRangeScan`                                          |
-| それ以外                                                               | `SeqScan`                                                 |
-
-複合索引では、先頭列から順に条件が必要になる。たとえば索引 `(a, b)` なら、`a = 1 AND b > 2` は範囲走査に使えるが、`b > 2` だけでは使えない。
-
-主キー・索引は値のバイト列表現で引くため、列の宣言型と値の型が一致するときだけ使う。
-型が違うリテラル／パラメータでは索引・主キー検索を使わず全走査になる。
-比較は数値3種（`INTEGER` / `REAL` / `DECIMAL`）や `DATE` / `TIMESTAMP` なら型をまたいで成功するため、
-`TypeError` になるのは `BOOLEAN` と `INTEGER` など比較不能な組み合わせだけ
-（例: `INTEGER` 列 = `1.0` は一致する）。
+複合索引では、先頭列から順に条件が必要になる。
 
 ```sql
-CREATE INDEX idx_dept ON people (dept_id);
-SELECT id FROM people WHERE dept_id = 2;      -- 単一列索引の等値 → IndexLookup
-SELECT id FROM people WHERE dept_id > 2;      -- 範囲 → IndexRangeScan
-SELECT id FROM people WHERE name LIKE 'car%'; -- 接頭辞 → 範囲（索引があれば）
-
 CREATE INDEX ix_pair ON t (a, b);
-SELECT id FROM t WHERE a = 1 AND b > 2;       -- 前置 a が等値 + b が範囲 → IndexRangeScan
-SELECT id FROM t WHERE b > 2;                 -- 前置 a が無い → SeqScan
-SELECT id FROM t WHERE a = 1 AND b = 2;       -- 全列等値 → IndexLookup
-SELECT id FROM t WHERE a = 1;                 -- 前置 1列の等値 → IndexLookup
+
+SELECT * FROM t WHERE a = 1 AND b > 2; -- IndexRangeScan
+SELECT * FROM t WHERE a > 2;           -- IndexRangeScan
+SELECT * FROM t WHERE b > 2;           -- SeqScan
+SELECT * FROM t WHERE a = 1;           -- IndexLookup
+SELECT * FROM t WHERE a = 1 AND b = 2; -- IndexLookup
 ```
 
-制限:
+走査方法に使う等値・範囲は、列の宣言型と定数の型が一致する場合だけ選ぶ。
+型が異なる述語は `SeqScan` で評価する（評価自体は数値同士や `DATE` / `TIMESTAMP` 間でも可能）。
 
-- **範囲走査は下限のある条件のみ**。`<` / `<=` だけの条件は全走査になる。
-- **索引の等値検索（`IndexLookup`）は、索引の先頭から続く列に `= 定数` が 1つ以上あるとき**
-  （全列でなくてもよい）。
-  範囲条件がその次の列にある場合は、より多くの列を絞れる `IndexRangeScan` を優先する。
-  複合索引の範囲検索は「範囲列より前の列すべてが `=`、その次の 1列が範囲条件」という形で使う。
-- `LIKE` は **`%` が末尾のみ・`_` なし**のときだけ範囲に変換する。
-  `LIKE '%x'` や `LIKE 'a_b%'` は全走査 + 後段の `Filter`。
-- 型が一致しないリテラル／パラメータは全走査に落ちる
-  （比較自体は数値3種や `DATE` / `TIMESTAMP` なら成功する）。
+範囲走査には下限が必要で、`<`、`<=`だけでは索引を使わない。
+`LIKE 'prefix%'`は末尾の `%`だけで `_`を含まない場合に範囲へ変換する。
 
-### 7.5 結合アルゴリズム
+索引エントリの値は空で、キーは索引列と主キーから復元する。
+被覆していない列は主キーlookupで取得する。
 
-`ON` 句に左×右の等値条件がある場合、結合アルゴリズムを自動選択する。
+### 7.5 結合
 
-| 条件                                                                                         | アルゴリズム             |
-| -------------------------------------------------------------------------------------------- | ------------------------ |
-| 左が小さい（`LIMIT` / 主キー等値 / `VALUES` で 32行以下）かつ右を主キー / 索引の前置で引ける | インデックス入れ子ループ |
-| 両入力が結合キー順で走査できる（主キー / 索引の先頭列と結合キーが一致）                      | マージ結合               |
-| 左×右の等値条件がある（上記以外）                                                            | ハッシュ結合             |
-| 等値条件がない（非等値など）                                                                 | 入れ子ループ             |
+結合アルゴリズムは次の規則で選ぶ。
 
-- 等値キーは**列の型が一致する**ときだけ使う。
-  型が違うと入れ子ループに落ちる。
-- **マージ結合**は両入力が結合キーで昇順のときだけ選ぶ。
-  主キー走査・索引走査はキー順に返るので、結合キーがその先頭列と一致すれば使える
-  （`WHERE` の絞り込みや `LIMIT` は順序を変えない）。
-  `ON` の等値条件の記述順は自由で、走査順に合わせて並べ替える
-  （左 PK が `(a,b)` なら `ON b = b AND a = a` でもよい）。
-  右側を丸ごと保持せず、両側を 1行ずつ流す。
-  `LEFT JOIN` では一致が無い（または残りの `ON` 句が偽の）左行を `NULL` で補う。
-- `NULL` は `=` で一致しない（ハッシュ/索引/マージとも NULL キーは結合しない）。
-- 等値キー以外の `ON` 句は残りの条件として評価する。
-- **インデックス入れ子ループ**の右は `Scan`（`Filter` を重ねてもよい）で、
-  結合キーが**主キー**か**索引の先頭から連続した列**と一致すれば使える
-  （`(k, g)` 索引は `k` だけの結合にも使える）。
-  ただし右の走査方法が `PkLookup` / `IndexLookup` のときは使わない
-  （等値述語が走査に吸収されて `Filter` から消え、右部分木を実行しない INL では再評価できないため）。
-  右の `Filter` の述語は捨てずに residual として結合時に評価する。
-- **ハッシュ結合**のキーの等値は `=` と同じ意味論
-  （`NaN = NaN` は真、`DECIMAL` の `1.0` と `1.00` は同じキー）。
-  退避が発生したときは結合キーで 16 分割して外部ハッシュ結合し、
-  分割し切れないときはキー順に並べ直してマージ結合に切り替える。
-- **結合順序は自動で決まる**。
-  `FROM` の先頭テーブルと `LEFT JOIN` の位置は動かさず、連続する `INNER JOIN` の中だけを
-  「結合述語で繋がっているか」「行数の見積りが小さいか」「`FROM` に先に書かれたか」の順で並べ替える。
-  行数の見積りは統計ではなく走査方法と押し下げた `Filter` の段数で決める
-  （基本値は主キー等値 1 / 索引等値 2 / 範囲走査 100 / 全走査 1000。`Filter` 1段ごとに 0.1倍し、最小 1）。
-  統計に基づく選択性の推定はしないため、同じ見積りのテーブルは `FROM` の順のままになる。
-- `SELECT *` の列順は**常に `FROM` 句の順**で、結合順を並べ替えても変わらない。
-- **複数テーブルを参照する `WHERE` の述語は、参照先が揃った `INNER JOIN` の `ON` へ昇格する**
-  （`INNER` では `ON` と `WHERE` は同値なので、結合キーとして使える）。
-  `LEFT JOIN` の右（`NULL` 供給側）だけを参照する述語は昇格せず、結合の後で評価する。
-  ただし後続の `INNER JOIN` の表も参照する述語は、参照先が揃った `INNER JOIN` の `ON` へ昇格する
-  （`INNER` なので結果は同じ）。
-  そのため `ON a.k = b.k` と `WHERE a.k = b.k` は同じ実行計画になる。
-- `LEFT JOIN` は右側の一致がない場合に `NULL` を補う。
-- `ON` 句の評価が失敗した場合（型エラーなど）は、黙って行を落とさず**クエリ全体がエラー**になる。
+| 条件                                                 | アルゴリズム      |
+| ---------------------------------------------------- | ----------------- |
+| 左の見積りが32行以下で、右を主キーまたは索引で引ける | Index Nested Loop |
+| 両方を結合キー順に走査できる                         | Merge Join        |
+| 等値結合キーがあるが上記でない                       | Hash Join         |
+| 等値結合キーがない                                   | Nested Loop       |
+
+右部分木が`PkLookup` / `IndexLookup`の場合は、吸収済みの述語を再評価できないため INL にしない。
+
+等値キーは列の型が一致する場合だけ使う。
+型が異なる場合はNested Loopになる。
+
+`NULL`は `=`で一致しない。
+`LEFT JOIN`では一致しない左行へ `NULL`を補う。
+
+結合順は次の順で決める。
+
+1. 結合述語で繋がっているか
+2. 推定行数が少ないか
+3. `FROM`で先に書かれているか
+
+推定行数は統計ではなく、走査方法と `Filter`の数から決める。
+
+`SELECT *`の列順は結合順を並べ替えても、`FROM`に書いた論理順を維持する。
 
 ```sql
 SELECT p.id, p.name, d.dname
-  FROM people p
-  JOIN depts d ON p.dept_id = d.id
- ORDER BY p.id;
+FROM people p
+JOIN depts d ON p.dept_id = d.id
+ORDER BY p.id;
 
 SELECT p.id, d.dname
-  FROM people p
-  LEFT JOIN depts d ON p.dept_id = d.id
- ORDER BY p.id;
+FROM people p
+LEFT JOIN depts d ON p.dept_id = d.id;
 ```
 
-### 7.6 `ORDER BY` の安定性
+### 7.6 ORDER BY
 
-ソートは外部マージ（`ExtSort`）で並べる。
-バジェット（管理メモリの概算。既定 64MiB）に収まる入力はメモリだけで、
-超過分は一時ファイル（`%TEMP%/rykdb-sort-*`）へ退避してから k-way merge する。
-同時に開く run は最大 32本で、それを超える場合は中間 run へ multi-pass merge する。
-同値な行の順序は保証されない（`ORDER BY` のキーが一意でないとき）。
+ソートは外部マージソートを使う。
+既定の管理メモリ64MiBを超える入力は一時ファイルへ退避する。
 
-- **`NULL` は最小**として扱う（`ASC` では先頭、`DESC` では末尾）。
-  `NULLS FIRST` / `NULLS LAST` は未対応。
-- ソートは全入力を消費してからでないと 1行も出せないため、`NULL` 以外で比較不能な型があれば**その時点で** `TypeError` になる。
-- 一時ファイルは run が尽いた時点で消える。途中打ち切りで残ったものは次回のソート時に回収する。
-- **主キー順の `ORDER BY` はソートを省略する**。
-  単一テーブル・集約なし・`DISTINCT` なしで、
-  `ORDER BY` の先頭が**主キー全列を定義順・昇順**で並べている場合、
-  走査がそのまま主キー順に返るので `Sort` を作らない
-  （主キーは一意なので後続のキーは無関係）。
-  主キーの一部だけ・`DESC`・索引走査になる条件・集約・`DISTINCT`・結合では通常どおりソートする。
+- `NULL`は `ASC`で先頭、`DESC`で末尾になる。
+- `NULLS FIRST`、`NULLS LAST`は未対応。
+- 同値行の順序は保証しない。
+- 列参照、式、序数（1始まり）を指定できる。
 
-### 7.7 `LIMIT` / `OFFSET`
+主キー順に走査する単一テーブル（集約・`DISTINCT`・`JOIN`なし）で、
+`ORDER BY`の先頭が主キー全列を定義順・昇順に並べる場合はソートを省略する。
 
-- 値は **0以上の定数式**
-  （リテラル、`?` に渡した値、またはそれらの定数式。行ごとの列参照・負数・範囲外はエラー）。
-  `LIMIT 1+0` のような定数式は評価される。
-- 評価は最後に 1回だけ。
-  `OFFSET` → `LIMIT` の順で適用される。
-- `LIMIT` / `OFFSET` はそれぞれ単独でも書ける（`OFFSET` 単独は `LIMIT` なし扱い）。
-- `LIMIT 0` は「0 行」を返す（スキャン自体を実行しない）。
-- **単純な全走査**（`WHERE` / `GROUP BY` / `DISTINCT` / 結合なし）では、
-  `OFFSET + LIMIT` の件数をストレージへ降ろす。
-  ストレージは先頭 `OFFSET + LIMIT` 行だけをデコードし、必要になるまで後続の SSTable を開かない。
-  `ORDER BY` があっても、主キー全列の昇順（単一テーブル）なら Sort を作らないためヒントが降りる（§7.6）。
-  `WHERE` など行数を変える演算子がある場合は全件走査のまま（ヒントを降ろさない）。
+### 7.7 LIMITとOFFSET
+
+- 値は0以上の定数式である必要がある。
+- リテラル、パラメータ、定数式を受け付ける。
+- 負数、列参照、範囲外の値はエラーになる。
+- `OFFSET`単独、`LIMIT`単独を指定できる。
+- `OFFSET`を先に、次に `LIMIT`を適用する。
+- `LIMIT 0`はスキャンを実行せず0行を返す。
 
 ```sql
-SELECT id FROM people ORDER BY id LIMIT 2;            -- 先頭 2 行
-SELECT id FROM people ORDER BY id LIMIT 2 OFFSET 1;  -- 2 行目から 2 行
+SELECT id FROM people ORDER BY id LIMIT 2;
+SELECT id FROM people ORDER BY id LIMIT 2 OFFSET 1;
 ```
 
-### 7.8 例
+単純な全走査では `OFFSET + LIMIT`をストレージへ渡せる。
+`WHERE`、`GROUP BY`、`DISTINCT`、結合がある場合はヒントを使わない。
 
-```sql
-CREATE TABLE people (
-  id      INTEGER PRIMARY KEY,
-  name    TEXT NOT NULL,
-  age     INTEGER,
-  dept_id INTEGER,
-  salary  DECIMAL
-);
+### 7.8 サブクエリ
 
-INSERT INTO people VALUES
-  (1, 'alice', 30, 1, 100.5),
-  (2, 'bob',   25, 1, 200.25),
-  (3, 'carol', 41, 2, 150.0),
-  (4, 'dan',   25, 2, 120.0);
-```
+式には次のサブクエリを使える。
 
-```sql
-SELECT id, name FROM people WHERE age >= 25 ORDER BY name;
-
--- name
--- ----
--- 'alice'
--- 'bob'
--- 'dan'
-
-SELECT dept_id, COUNT(*) AS c, AVG(salary) AS mean
-  FROM people
- GROUP BY dept_id
- ORDER BY dept_id;
-
--- dept_id | c | mean
---        1 | 2 | 150.375
---        2 | 2 | 135
-```
-
-### 7.9 サブクエリ
-
-式の中に `SELECT` を書ける。
-外側の列を参照する**相関サブクエリ**も書ける（制限あり）。
-
-| 形                                     | 結果                                                                  |
-| -------------------------------------- | --------------------------------------------------------------------- |
-| `(SELECT ...)`                         | スカラー値。1列だけ・0 行なら `NULL`・2行以上は `ConstraintViolation` |
-| `x [NOT] IN (SELECT ...)`              | 1列の値を `IN` の要素として評価（`NULL` の 3値論理もそのまま）        |
-| `EXISTS (SELECT ...)` / `NOT EXISTS …` | 1行以上なら `TRUE`（列数は問わない）                                  |
+| 形                        | 結果                                      |
+| ------------------------- | ----------------------------------------- |
+| `(SELECT ...)`            | スカラー値。0行は `NULL`、2行以上はエラー |
+| `x IN (SELECT ...)`       | 1列の値を含むか判定                       |
+| `EXISTS (SELECT ...)`     | 1行以上なら `TRUE`                        |
+| `NOT EXISTS (SELECT ...)` | 1行もなければ `TRUE`                      |
 
 ```sql
 SELECT id, (SELECT MAX(v) FROM t) AS mx FROM t;
 
 SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t);
 
-SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE v >= 20);
-
-SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE v > 25);
-
--- 相関サブクエリ: 外側の行ごとに評価される
-SELECT d.name, (SELECT MAX(e.salary) FROM emp AS e WHERE e.dept = d.name) AS mx
-FROM dept AS d;
-
-SELECT e.id FROM emp AS e
-WHERE EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > e.salary);
+SELECT id FROM t WHERE EXISTS (
+  SELECT 1 FROM t AS x WHERE x.v > t.v
+);
 ```
 
-- 外側の列は、内側のスコープで解決できない場合だけ外側へフォールバックする
-  （内側に同じ名前の列・テーブルがある場合は内側が優先）。
-- **非相関**サブクエリは外側のクエリを実行する前に 1回だけ実行され、結果は定数へ置き換わる
-  （`IN` は値集合 `ValueSet` に構築する）。
-  同じ文の中のサブクエリは同じスナップショットを見る。
-- **相関**サブクエリは外側の行ごとに実行される。
-- 列数が 1 でないサブクエリは `TypeError`。
-- 相関サブクエリは `WHERE` / `JOIN` の `ON` / 集約を使わない `SELECT` 項目 /
-  `ORDER BY` / `UPDATE ... SET` / `UPDATE`・`DELETE` の `WHERE` で使える。
-- 次では相関サブクエリを使えない（`SyntaxError`）。
-  集約クエリ（`GROUP BY` または集約関数）の `SELECT` / `HAVING` / `ORDER BY`、
-  `LIMIT` / `OFFSET`。派生テーブル（LATERAL）も相関できない（`NameError`）。
-- `INSERT ... VALUES` / `UPDATE ... SET` / `UPDATE`・`DELETE` の `WHERE` でも使える。
-- `LIMIT` / `OFFSET` にも書ける（非相関のみ。定数へ解決される）。
-- サブクエリでも `FROM` を省略できる（`EXISTS (SELECT 1)` は常に真）。
-- `FROM (SELECT ...) AS x`（派生テーブル）は §7.10。
-- `CREATE TABLE ... DEFAULT (SELECT ...)` は未対応（INSERT 時に `SyntaxError`）。
-- スカラーサブクエリは最大 2行、`EXISTS` は 1行だけを読む（非相関）。
-  `IN (SELECT ...)` の結果は値集合（`ValueSet`）として保持する。
-  作業メモリに収まらない分は一時ファイルへ退避し、Bloom filter + ブロック索引で判定する
-  （上限超過でも `CapacityError` にしない）。
-- 相関サブクエリは外側行ごとに内側を計画・実行するため、
-  **外側行数 × 内側の走査コスト**がかかる。
-- サブクエリの入れ子にも**パーサの深さ上限はない**
-  （式・SELECT のパーサは CPS で、入れ子段数に依存せずスタックは一定。
-  深さに比例するメモリは使う）。
+サブクエリは相関、または非相関にできる。
 
----
+- 非相関サブクエリは外側のクエリの前に1回だけ計算して使い回す。
+- 相関サブクエリは外側の行ごとに計算する。
+- 内側のスコープで解決できない列だけ、外側へフォールバックする。
+- サブクエリの列数が1ではない場合は `TypeError`になる。
 
-### 7.10 派生テーブル（FROM / JOIN のサブクエリ）
+相関サブクエリは次の場所で使える。
 
-`FROM` と `JOIN` にはサブクエリを書ける。**別名は必須**。
+- `WHERE`
+- `JOIN`の `ON`
+- 集約を使わない `SELECT`項目
+- `ORDER BY`
+- `UPDATE`の `SET`
+- `UPDATE`と `DELETE`の `WHERE`
+
+`GROUP BY`または集約関数を使うクエリの `SELECT`・`HAVING`・`ORDER BY`、`LIMIT`・`OFFSET`、派生テーブルでは相関サブクエリを使えない。
+
+サブクエリの入れ子には深さ制限を設けない。
+
+### 7.9 派生テーブル
+
+`FROM`と `JOIN`にはサブクエリを使える。
+別名は必須である。
 
 ```sql
 SELECT x.id, x.v
@@ -883,96 +685,55 @@ SELECT t.id, d.w
 FROM t JOIN (SELECT id, w FROM u) AS d ON d.id = t.id;
 ```
 
-- 内側の SELECT は通常の SELECT と同じ
-  （`WHERE` / `GROUP BY` / `ORDER BY` / `LIMIT` など）。
-- 列は**別名で修飾**して参照する（`x.col`）。
-  `SELECT *` / `x.*` も使える。
-- 派生テーブルの列名は内側の射影から決まる
-  （`SELECT id AS k` なら `k`、`SELECT t.id` なら `id`。結果ヘッダの表示名 `t.id` とは別）。
-  別名を付けずに式を書いた場合は表示名（`v * 2` など）になる。
-- 型は**直接の列参照だけ**引き継ぐ（`SELECT id` / `SELECT id AS k` / `SELECT *`）。
-  式・集約・CAST の列は型が分からないため、その列での等値結合は入れ子ループになる（結果は正しい）。
-- **実行は外側のクエリが必要としたとき**。
-  計画時に結果を作らない。
-  内側のテーブル解決は計画時なので、存在しないテーブルは実行前に `NameError`。
-- 相関（LATERAL）は未対応。
-  内側から外側の列・別名は参照できない（`NameError`）。
-- `AS x(a, b)` の列別名リストは未対応。
-- カンマ結合（`FROM t, u`）は未対応。
+派生テーブルの列名は内側の射影から決まる。
+別名を付けない式の列名は式の表示名になる。
+列別名リスト `AS x(a, b)`、相関派生テーブル、カンマ結合は未対応。
 
----
-
-### 7.11 EXPLAIN
-
-```sql
-EXPLAIN SELECT ...;
-```
-
-`SELECT` の実行計画を表示する。
-**クエリ本体は実行しない**
-（ただしサブクエリは通常の計画と同じく計画時に評価される。§7.9）。
-
-結果は 1列 `plan` で、木の各ノードが 1行になる。
-深さは 2 スペースで字下げする。
-走査方法・結合アルゴリズムは実際の実行と同じ規則で選ばれる（§7.4 / §7.5）。
+### 7.10 EXPLAIN
 
 ```sql
 EXPLAIN SELECT id FROM t WHERE id = 2;
 ```
 
+実行計画を表示する。
+クエリ本体は実行しない。
+
 ```text
 plan
 ----
-Project(t.id)
-  Filter((t.id = 2))
+  Project(t.id)
     Scan(t, PkLookup(2))
 ```
 
-ノードの表記:
+`PkLookup`が吸収した等値述語は`Filter`に残らない。
 
-| ノード                                        | 内容                                                                                                                |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `Scan(表, 走査方法)`                          | `SeqScan` / `PkLookup(値)` / `IndexLookup(索引, 値)` / `RangeScan(下限..上限)` / `IndexRangeScan(索引, 下限..上限)` |
-| `Filter(条件)`                                | 述語。索引・主キーで絞っても再検査として残る                                                                        |
-| `Project(項目)`                               | 射影（`*` は展開前の表記）                                                                                          |
-| `Join(種類, アルゴリズム, right=表, on=条件)` | 種類は `INNER` / `LEFT`、アルゴリズムは `NestedLoop` / `HashJoin` / `MergeJoin` / `IndexNestedLoop(索引)`           |
-| `Aggregate(group by [...], aggregates [...])` | 集約                                                                                                                |
-| `Having(条件)`                                | 集約後の述語                                                                                                        |
-| `Distinct`                                    | 重複除去                                                                                                            |
-| `Sort(式 ASC, ...)`                           | 並び替え                                                                                                            |
-| `Limit(offset=N, count=M)`                    | `count` は無制限なら省略                                                                                            |
-| `Values`                                      | `FROM` なしの入力（1行 0列）                                                                                        |
-| `Derived`                                     | 派生テーブル。内側の計画を子に持つ                                                                                  |
-| `UnionAll`                                    | `UNION ALL`。枝ごとの計画を子に持つ                                                                                 |
+主なノードは次のとおり。
 
-`EXPLAIN` は `SELECT` だけを受け付ける
-（それ以外は `SyntaxError`）。
+| ノード      | 内容                                                                |
+| ----------- | ------------------------------------------------------------------- |
+| `Scan`      | `SeqScan`、`PkLookup`、`IndexLookup`、`RangeScan`、`IndexRangeScan` |
+| `Filter`    | 検査条件                                                            |
+| `Project`   | 射影                                                                |
+| `Join`      | 結合種類とアルゴリズム                                              |
+| `Aggregate` | グループと集約                                                      |
+| `Having`    | 集約後の述語                                                        |
+| `Distinct`  | 重複除去                                                            |
+| `Sort`      | 並び替え                                                            |
+| `Limit`     | 件数制限                                                            |
+| `Values`    | `FROM`なしの入力                                                    |
+| `Derived`   | 派生テーブル                                                        |
+| `UnionAll`  | UNION ALL                                                           |
 
----
-
-### 7.12 UNION ALL
+### 7.11 UNION ALL
 
 ```sql
-SELECT … UNION ALL SELECT … [UNION ALL SELECT …]
-  [ORDER BY …] [LIMIT …] [OFFSET …];
+SELECT ... UNION ALL SELECT ... [UNION ALL SELECT ...]
+[ORDER BY ...] [LIMIT ...] [OFFSET ...];
 ```
 
-複数の `SELECT` の結果を**重複を除かずに連結**する。
-
-- 列数は全枝で一致が必要。
-  不一致は `UNION ALL の列数が一致しません（1 番目: n 列、m 番目: k 列）`（`SyntaxError`）。
-- 列名は**先頭の `SELECT`** のものになる。
-- 値は型変換せずにそのまま連結する
-  （`SELECT 1 UNION ALL SELECT 'a'` は `INTEGER` と `TEXT` の 2 行になる）。
-  型を揃えたいときは `CAST` を使う。
-- `ORDER BY` / `LIMIT` / `OFFSET` は**連結後の結果全体**に掛かる。
-  `ORDER BY` は先頭の `SELECT` の出力列名・別名・序数（1 始まり）で解決する。
-  枝の後ろ（`UNION ALL` より前）に `ORDER BY` / `LIMIT` を書くと `SyntaxError`。
-- 各枝は通常の `SELECT`（`FROM` / `JOIN` / `WHERE` / `GROUP BY` / `HAVING` / `DISTINCT` /
-  サブクエリ / 派生テーブル）を書ける。
-  枝単位の `ORDER BY` / `LIMIT` は持てない。
-- `UNION`（`ALL` なし = 重複除去）・`INTERSECT`・`EXCEPT` は未対応（`SyntaxError`）。
-- サブクエリ・派生テーブル・`INSERT ... SELECT` の中でも使える。
+全枝の列数は一致させる必要がある。
+列名は先頭の `SELECT`のものになる。
+値は型変換せず連結する。
 
 ```sql
 SELECT id, name FROM people WHERE age >= 30
@@ -981,673 +742,474 @@ SELECT id, name FROM people WHERE age < 30
 ORDER BY id;
 ```
 
-`EXPLAIN` では `UnionAll` ノードの下に各枝の計画が出る（§7.11）。
+枝ごとの `ORDER BY`と `LIMIT`は使えない。
+`UNION`、`INTERSECT`、`EXCEPT`は未対応。
 
----
+### 7.12 DISTINCT
+
+`DISTINCT`は射影後の行に適用する。
+
+```sql
+SELECT DISTINCT dept_id, name FROM people;
+```
+
+結果は `(dept_id, name)`の組で重複を除去する。
 
 ## 8. INSERT
 
 ```sql
-INSERT INTO テーブル [ (列 [, 列 …]) ] VALUES (式 [, 式 …]) [, (式 [, …]) …];
-INSERT INTO テーブル DEFAULT VALUES;
-INSERT INTO テーブル [ (列 [, 列 …]) ] SELECT ...;
+INSERT INTO table [(column, ...)]
+VALUES (expr, ...)[, (expr, ...) ...];
+
+INSERT INTO table [(column, ...)] SELECT ...;
+INSERT INTO table DEFAULT VALUES;
 ```
 
-### 挙動
-
-- **列リストを省略**すると、テーブル定義の順に値を並べる。
-- **列リストに無い列**は `DEFAULT` を使い、無ければ `NULL` になる。
-- `DEFAULT VALUES` は列リスト無しで全列を既定値で埋める
-  （主キーなどに既定値が無い場合は `NOT NULL` 違反）。
-- `VALUES` の要素に `DEFAULT` を書くと、その列の既定値を使う。
-- **値式は定数のみ**（列参照不可）。サブクエリは使える（§7.9）。
-- `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）は未対応（§14）。
-- 値は列の型へ**自動変換**される（[§3](#値を列の型へ自動変換するsqlvaluecoerce)）。
-- `NOT NULL` 制約は行ごとに検証される。
-- **1つの `INSERT` は 1トランザクション**（途中で失敗したら何も残らない）。
-
-### 主キー重複はエラー
-
-**エラーになる**（upsert しない）。
-複数列の主キーも同じで、値の組が一致すればエラーになる。
-
-### `UNIQUE` は検査される
-
-`UNIQUE` 制約・`UNIQUE` 索引は重複を検査する。
-ただし `NULL` は「値なし」なので重複とみなさない。
-複合 `UNIQUE` では、対象列のどれか1つでも `NULL` なら検査をスキップする。
-複数行 `UPDATE` は文全体の最終状態で検査する。
-そのため、同一文内で一意値を交換する更新も成功する
-（更新対象外の行との衝突は `ConstraintViolation`）。
-
-同時実行では、別々の transaction が同じ UNIQUE 値（別々の主キー）を書いた場合、
-先に commit した transaction が成功し、後から commit した側は `ConflictError` になる。
-`NULL` は予約対象外なので、複数の transaction が同時に `NULL` を挿入できる。
+- 列リストを省略するとテーブル定義順に値を並べる。
+- 列リストにない列には `DEFAULT`、または `NULL`を使用する。
+- `VALUES`の要素には定数式とサブクエリを使える。
+- 列参照は使えない。
+- 値は列の型へ変換する。
+- `NOT NULL`違反や型変換失敗は文全体を取り消す。
 
 ```sql
-INSERT INTO people VALUES (1, 'alice2', 30, 1, 1.0);  -- id=1 が既に存在するのでエラー
-INSERT INTO people (id, email) VALUES (2, NULL), (3, NULL);  -- 複数の NULL は OK
+INSERT INTO people VALUES
+  (1, 'alice', 30),
+  (2, 'bob', 25);
+
+INSERT INTO people (name, id) VALUES ('carol', 3);
 ```
 
-### `INSERT ... SELECT`
+### 主キーとUNIQUE
 
-`INSERT INTO テーブル [ (列 …) ] SELECT ...` は、選択結果の行をまとめて挿入する。
+主キーの重複はエラーになる。
+複合主キーも値の組で重複を判定する。
 
-- 選択結果の列数は、列リスト（省略時はテーブル定義の列数）と一致している必要がある
-  （不一致は `INSERT の列数(n)と値の数(m)が合いません`）。
-- 値は列の型へ自動変換される。列リストに無い列は `DEFAULT`（無ければ `NULL`）で埋まる。
-- `WHERE` / `JOIN` / 集約 / `ORDER BY` / `LIMIT` など SELECT の句はそのまま使える
-  （式サブクエリ・派生テーブルも §7.9 / §7.10 の範囲で使える）。
-- 選択は**文の開始時点の snapshot** を読む。
-  `INSERT INTO t SELECT * FROM t` は増殖せず、開始時点の行を 1回だけ複製する。
-- 主キー重複・`UNIQUE` 違反・`NOT NULL` 違反は通常の `INSERT` と同じ（文全体が取り消される）。
+`UNIQUE`制約と索引は重複を検査する。
+`NULL`を含む場合は重複とみなさない。
+
+複数行の更新は文全体の最終状態で一意性を検査する。
+そのため、一意値の交換は成功する。
+
+同時実行では、別々のtransactionが同じUNIQUE値を挿入すると、先にcommitした側が成功し、
+後の側は `ConflictError`になる。
+
+### INSERT ... SELECT
+
+選択結果の列数は挿入先の列数または列リストの列数と一致させる。
+選択は文の開始時点のsnapshotを読む。
 
 ```sql
 INSERT INTO people (id, name)
-SELECT id + 100, UPPER(name) FROM people WHERE age >= 30;
+SELECT id + 100, UPPER(name)
+FROM people
+WHERE age >= 30;
 
--- 別テーブルへの集約結果の格納
-CREATE TABLE stats (name TEXT PRIMARY KEY, total DECIMAL);
-INSERT INTO stats (name, total) SELECT name, SUM(salary) FROM people GROUP BY name;
+INSERT INTO stats (name, total)
+SELECT name, SUM(salary)
+FROM people
+GROUP BY name;
 ```
 
-### 例
+`INSERT INTO t SELECT * FROM t`は開始時点の行だけを複製し、無限に増殖しない。
+
+`ON CONFLICT`と `ON DUPLICATE KEY UPDATE`は未対応。
+
+## 9. UPDATEとDELETE
+
+### UPDATE
 
 ```sql
-INSERT INTO people VALUES (1, 'alice', 30, 1, 100.5), (2, 'bob', 25, 1, 200.25);
-
-INSERT INTO people (name, id) VALUES ('carol', 3);
--- age, dept_id, salary は NULL
+UPDATE table SET column = expr [, ...] [WHERE expr];
 ```
 
----
+- 式は更新前の行に対して評価する。
+- サブクエリと外側の列参照を使える。
+- `WHERE`を省略すると全行を更新する。
+- テーブル別名は使えない。
 
-## 9. UPDATE
-
-```sql
-UPDATE テーブル SET 列 = 式 [, 列 = 式 …] [ WHERE 条件 ];
-```
-
-### 挙動
-
-- 複数列を同時に更新できる。式は**更新前の行**に対して評価される。
-  サブクエリは使える。
-  外側の行の列も参照できる（相関サブクエリ。§7.9）。
-- `WHERE` を省略すると全行が対象。
-- 条件に合う行すべてが更新される（`LIMIT` 相当の句がない）。
-- `UPDATE ... FROM` と `UPDATE ... LIMIT` は未対応（§14）。
-- テーブル別名は使えない（`UPDATE t AS x ...` は `SyntaxError`）。
-  `t.id` のように実名で修飾する。
-- 影響行数は `StatementResult.RowsAffected` に入る。
-- 索引があるテーブルでは、更新のたびにすべての索引のエントリが書き直される（値は空のまま）。
-
-### 主キー列は更新できない
-
-主キーの値を変更すると `ConstraintViolation` になる（古い主キーの行が残って重複するため）。
-同じ値への `SET`（`SET id = id` など）は成功する。
-主キーを変更するには、`DELETE` + `INSERT` を使う。
-
-```sql
-CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT);
-INSERT INTO t VALUES (1,'a'),(2,'b');
-UPDATE t SET id = id;                 -- OK（値は変わらない）
-UPDATE t SET id = 100 WHERE id = 1;   -- エラー（何も更新されない）
-
-SELECT id, n FROM t ORDER BY id;
--- 1, 'a'
--- 2, 'b'
-```
+主キーの変更はできない。
 
 ```sql
 UPDATE people SET age = age + 1 WHERE id = 1;
-UPDATE people SET salary = salary * 1.1;    -- 全行
+UPDATE people SET salary = salary * 1.1;
 ```
 
----
+主キーへ同じ値を代入する場合は成功する。
 
-## 10. DELETE
+索引のあるテーブルでは、更新した行の索引エントリだけを更新する
+（変わらない索引はそのまま）。
+
+### DELETE
 
 ```sql
-DELETE FROM テーブル [ WHERE 条件 ];
+DELETE FROM table [WHERE expr];
 ```
 
-- `WHERE` を省略すると全行を削除する。
-- 削除は主キーと**すべての索引**に墓碑（tombstone）を書く。
-- `DELETE ... USING` と `DELETE ... LIMIT` は未対応（§14）。
-- テーブル別名は使えない（`DELETE FROM t AS x ...` は `SyntaxError`、実名で修飾する）。
-- 影響行数は `StatementResult.RowsAffected` に入る。
-- 条件に合う行が 0件でもエラーにはならない（0行になる）。
+- `WHERE`を省略すると全行を削除する。
+- テーブル別名は使えない。
+- 対象が0行でもエラーにはならない。
+- 主キーとすべての索引へ墓標を追加する。
 
 ```sql
 DELETE FROM people WHERE age < 18;
-DELETE FROM people;             -- 全削除
+DELETE FROM people;
 ```
 
----
+`UPDATE ... FROM`、`UPDATE ... LIMIT`、`DELETE ... USING`、`DELETE ... LIMIT`は未対応。
 
-## 11. DDL
+## 10. DDL
 
-### 11.1 CREATE TABLE
+### 10.1 CREATE TABLE
 
 ```sql
-CREATE TABLE [IF NOT EXISTS] テーブル名 (
-  列定義 [, 列定義 …]
-  [, PRIMARY KEY (列 [, …])]
-  [, UNIQUE (列 [, …])]
-  [, FOREIGN KEY (列 [, …]) REFERENCES 親テーブル [(列 [, …])]]
+CREATE TABLE [IF NOT EXISTS] table (
+  column_def [, ...]
+  [, PRIMARY KEY (column [, ...])]
+  [, UNIQUE (column [, ...])]
+  [, FOREIGN KEY (column [, ...])
+     REFERENCES table [(column [, ...])]]
 );
 ```
 
 ```sql
 CREATE TABLE people (
-  id      INTEGER PRIMARY KEY,          -- 列レベル PRIMARY KEY（NOT NULL も付く）
-  name    TEXT NOT NULL,
-  email   TEXT UNIQUE,
-  age     INTEGER DEFAULT 0,
-  created TIMESTAMP DEFAULT '2024-01-01T00:00:00Z',
-  UNIQUE (name, email)                  -- テーブルレベル制約
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT UNIQUE,
+  age INTEGER DEFAULT 0,
+  UNIQUE (name, email)
 );
 ```
 
 #### 制約
 
-| 制約          | 場所         | 効果                                                      |
-| ------------- | ------------ | --------------------------------------------------------- |
-| `NOT NULL`    | 列           | **検査される**（`NULL` を入れると `ConstraintViolation`） |
-| `PRIMARY KEY` | 列・テーブル | **必須**。1テーブルに1定義だけ。`NOT NULL` も付く         |
-| `UNIQUE`      | 列・テーブル | 重複を検査する（`NULL` は除く）                           |
-| `DEFAULT`     | 列           | `INSERT` で値を省略したときに使われる（定数式のみ）       |
-| `REFERENCES`  | 列           | 外部キー（§11.5）。親の主キーを参照する                   |
-| `FOREIGN KEY` | テーブル     | 外部キー（§11.5）。複合キーを参照できる                   |
+| 制約          | 効果                                                      |
+| ------------- | --------------------------------------------------------- |
+| `NOT NULL`    | `NULL`の挿入を拒否する                                    |
+| `PRIMARY KEY` | 主キーを定義する。テーブルに1つだけ、各列をNOT NULLにする |
+| `UNIQUE`      | 重複を拒否する。`NULL`は重複とみなさない                  |
+| `DEFAULT`     | 値省略時に定数式を使用する                                |
+| `REFERENCES`  | 外部キーを定義する                                        |
+| `FOREIGN KEY` | 複合外部キーを定義する                                    |
 
-`DEFAULT` はカタログに保存され、DB を再オープンした後も使われる。
-`DEFAULT` の値も列の型へ暗黙変換される。
-変換できない既定値は `INSERT` 時に `TypeError` になる。
+主キーは省略できない。
+列レベルとテーブルレベルの併用、複数の主キー定義は拒否する。
 
-- **主キーは省略できない**。
-  1つもない場合は `テーブル t に主キーがありません` になる。
-- 主キーは1テーブルに1定義だけ。
-  列レベルとテーブルレベルの併用、複数列への列レベル `PRIMARY KEY`、
-  複数のテーブルレベル `PRIMARY KEY` は `ConstraintViolation` になる。
-- 主キーは複数列にできる。
-  値は列の宣言順に連結される。
-- テーブルレベルの `PRIMARY KEY` も、対象列に `NOT NULL` を付ける。
-- 列名の重複（大文字小文字を無視）は `NameError`。
-- テーブルレベルの `UNIQUE` は、存在しない列・重複列を `NameError` で拒否する。
-- `IF NOT EXISTS` を付けると、既存テーブルなら**何もせずに成功**する。
-- `IF NOT EXISTS` と `IF EXISTS` の両方の綴りを受け付ける。
-
-#### 列定義で型を省略する
-
-型を書かずに制約だけを書く構文も受け付ける（型は `TEXT` になる）。
+列名の重複、テーブルレベル制約の存在しない列、重複列はエラーになる。
+型を省略した列は `TEXT`になる。
 
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, name NOT NULL);
 ```
 
-### 11.2 CREATE INDEX
+### 10.2 CREATE INDEX
 
 ```sql
-CREATE [UNIQUE] INDEX [IF NOT EXISTS] 索引名 ON テーブル (列 [, 列 …]);
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] index_name
+ON table_name (column [, ...]);
 ```
 
-- **既存の行はすべて索引に投入される**（backfill）。
-- backfill は **プロセス内で排他**。
-  他の接続が transaction 中なら `ConflictError`（`実行中の transaction があります。…`）を返す。
-  自接続が明示 transaction 中なら `SyntaxError`（`トランザクション中は DDL…`）で拒否される。
-  どちらも COMMIT / ROLLBACK してから実行する。
-  他の文は backfill が終わるまで待つ。
-- 索引は論理 keyspace `i:<索引名>` に格納される（物理的には DB の単一 LSM 上で接頭辞分離）。
-  索引エントリのキーは「索引列 + 主キー」で、**値は空**。行はキーから復号する。
-  索引列 + 主キー以外の列を読むクエリは、同じスナップショットで主キー lookup を行って列を埋める。
-- `UNIQUE` は重複を検査する（`NULL` は除く）。
-- 同名の索引が既にあれば `索引 <名前> は既に存在します`。
-- 索引する列が存在しない場合は `テーブル <t> に列 <c> がありません`。
-- 索引列の重複は `NameError`。
-- `__unique_` で始まる索引名は `UNIQUE` 制約用に予約されており、作成できない。
-- `IF NOT EXISTS` を付けると、同名の索引が既にあっても**何もせずに成功**する。
+- 既存行を索引へ投入する。
+- 索引エントリのキーは索引列と主キー、値は空である。
+- 被覆しない列は主キーlookupで取得する。
+- `UNIQUE`は重複を検査する。`NULL`は除外する。
+- バックフィル中はプロセス内で排他する。
+- 明示transaction中の索引作成は拒否する。
 
 ```sql
 CREATE INDEX idx_dept ON people (dept_id);
 CREATE UNIQUE INDEX idx_email ON people (email);
 ```
 
-### 11.3 DROP
+`__unique_`で始まる索引名はUNIQUE制約用に予約される。
+
+### 10.3 DROP
 
 ```sql
-DROP TABLE [IF EXISTS] テーブル名;
-DROP INDEX [IF EXISTS] 索引名;
+DROP TABLE [IF EXISTS] table_name;
+DROP INDEX [IF EXISTS] index_name;
 ```
 
-- `IF EXISTS` を付けると、存在しなくても**エラーにならない**。
-- `DROP TABLE` は先に定義を外してテーブルを見えなくし、
-  その後でテーブルと全索引の論理 keyspace の全エントリへ tombstone を 8192件ずつ書く。
-  後始末は `.drop-cleanup` ジャーナルに記録され、失敗時は次回 open 時に再開する。
-- `DROP INDEX` も同様に、定義を外した後の索引 keyspace の消去を
-  `.drop-cleanup` ジャーナル経由で再開できる。
-- `__unique_` で始まる暗黙の `UNIQUE` 索引は `DROP` できない（`ConstraintViolation`）。
-  制約を消すにはテーブルを再作成する。
+テーブルと索引の削除は論理定義を先に外し、エントリへ順次tombstoneを追加する。
+失敗時の後始末は再オープン時に再開する。
+
+暗黙の `UNIQUE`索引は個別に `DROP`できない。
+
+### 10.4 ALTER TABLE
 
 ```sql
-DROP TABLE IF EXISTS tmp_data;
-DROP INDEX idx_dept;
+ALTER TABLE table ADD [COLUMN] column_def;
+ALTER TABLE table DROP [COLUMN] column_name;
+ALTER TABLE table RENAME [COLUMN] old_name TO new_name;
 ```
 
-### 11.4 ALTER TABLE
+#### ADD COLUMN
+
+- 列を末尾へ追加する。
+- 既存行には `DEFAULT`、または `NULL`を設定する。
+- `NOT NULL`には `DEFAULT`が必要になる。
+- 主キー、UNIQUE、外部キー制約の追加はできない。
+
+#### DROP COLUMN
+
+- 既存行から列を削除する。
+- 主キー列、索引列、外部キー列は削除できない。
+- 削除列が索引列でない場合は索引keyspaceを書き換えない。
+
+#### RENAME COLUMN
+
+- 列名を変更する。
+- 主キー、索引、外部キーの定義へ変更を反映する。
+- 新しい名前が既存列と重複する場合はエラーになる。
+
+ALTER TABLEの行変更は 1 transactionで行い、失敗時はカタログと行を巻き戻す。
+明示transaction中はDDLを実行できない。
+
+テーブル名の変更と列型の変更は未対応。
+
+### 10.5 外部キー
 
 ```sql
-ALTER TABLE テーブル名 ADD    [COLUMN] 列定義;
-ALTER TABLE テーブル名 DROP   [COLUMN] 列名;
-ALTER TABLE テーブル名 RENAME [COLUMN] 旧列名 TO 新列名;
-```
-
-- **`ADD [COLUMN]`** — 列を末尾に追加する。
-  **既存の行は `DEFAULT`（無ければ `NULL`）で埋められる**。
-  - 追加できるのは通常の列だけ。
-    `PRIMARY KEY` は `ConstraintViolation`（主キーは LSM のキーに使われているため）、
-    `UNIQUE` も `ConstraintViolation`（必要なら `CREATE UNIQUE INDEX` を使う）。
-    `REFERENCES`（外部キー）も `ConstraintViolation`（テーブルを作り直す）。
-  - `NOT NULL` を付けるには `DEFAULT` が必要（無いと `ConstraintViolation`）。
-  - 同じ名前の列（大文字小文字を無視）があれば `NameError`。
-  - `DEFAULT` は追加時に 1回評価され、既存行と以後の `INSERT` の両方に使われる。
-- **`DROP [COLUMN]`** — 列を削除する。
-  **既存の行の値が取り除かれる**。
-  索引エントリの値は空で、索引キーは索引列 + 主キーの値だけなので、
-  削除する列が索引列でなければ索引 keyspace は書き換えない。
-  - 主キー列は削除できない（`ConstraintViolation`）。
-  - 索引（`UNIQUE` 制約の暗黙索引を含む）で使われている列は削除できない（`ConstraintViolation`）。
-  - 外部キーで使われている列（子の列・親の参照列）も削除できない（§11.5）。
-  - 存在しない列は `NameError`。
-- **`RENAME [COLUMN]`** — 列名を変更する。
-  **行の値は書き換えない**（名前は行に含まれない）。
-  - 主キー列・索引の列名も一緒に書き換わるので、索引検索はそのまま使える。
-  - 外部キー定義の列名（子の列・親の参照列）も追随する（§11.5）。
-  - 新しい名前が既存の列と重複すれば `NameError`（大文字小文字だけの変更は可）。
-- 行の書き換え（`ADD` / `DROP`）は **1 transaction** で行い、カタログ更新も同じ commit に含める。
-  途中で失敗しても何も変わらない。
-  1 transaction のバッファ上限（256MiB）を超えるテーブルは `CapacityError` になる（§12）。
-- DDL なので明示 transaction 中には実行できない（§12）。
-- 未対応: `RENAME TO`（テーブル名の変更）、`ALTER COLUMN ... TYPE` などの型変更（§14）。
-
-```sql
-ALTER TABLE people ADD COLUMN email TEXT;
-ALTER TABLE people ADD COLUMN score INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE people DROP COLUMN score;
-ALTER TABLE people RENAME COLUMN email TO mail;
-```
-
-### 11.5 外部キー（FOREIGN KEY）
-
-```sql
--- 列レベル
 CREATE TABLE orders (
-  id       INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY,
   person_id INTEGER REFERENCES people (id)
 );
 
--- テーブルレベル（複合キー）
 CREATE TABLE order_lines (
-  id      INTEGER PRIMARY KEY,
-  oid     INTEGER,
+  id INTEGER PRIMARY KEY,
+  oid INTEGER,
   line_no INTEGER,
-  FOREIGN KEY (oid, line_no) REFERENCES order_items (oid, line_no)
+  FOREIGN KEY (oid, line_no)
+    REFERENCES order_items (oid, line_no)
 );
 ```
 
-- **参照先は親テーブルの `PRIMARY KEY` だけ**。
-  親の列を省略すると主キーになる。
-  指定する場合は主キーと**同数・同順**（列の定義順）で書く。
-  型も親の列と一致している必要がある（違えば `TypeError`）。
-- **参照整合性は即時（RESTRICT）に検査する**。
-  - 子の `INSERT` / `UPDATE` は、外部キーの値に対応する親行が無ければ `ConstraintViolation`
-    （文全体を取り消す）。
-  - 親の `DELETE` は、参照している子行があれば `ConstraintViolation`。
-  - 親の主キーは `UPDATE` できない（§9）ので、親側の更新検査は無い。
-- 外部キーの列に `NULL` を含む行は参照しない（SQL の MATCH SIMPLE）。
-  複合キーの一部だけ `NULL` でも参照しない。
-- 参照アクション（`ON DELETE` / `ON UPDATE`）と `MATCH` / `DEFERRABLE` は未対応で `SyntaxError`。
-  名前付き制約（`CONSTRAINT 名前 FOREIGN KEY ...`）も未対応。
-- 外部キーの列に索引が無くても検査できる（子テーブルの走査）。
-  子テーブルに外部キーの列を先頭とする索引があると、その索引を使う。
-- **参照されている親テーブルは `DROP TABLE` できない**（`ConstraintViolation`）。
-  子テーブルを先に削除する。
-- 外部キーで使われている列は `ALTER TABLE ... DROP COLUMN` できない。
-  `ALTER TABLE ... ADD COLUMN` で `REFERENCES` は指定できない。
-- `ALTER TABLE ... RENAME COLUMN` は外部キー定義の列名も追随する。
-- 自己参照（`REFERENCES 自分自身`）を作れる。
-  参照している行が残っている間は、参照先の行を削除できない。
-  相互に参照している行は 1 文の `DELETE` では消せない（参照している側から先に削除する）。
-- 定義はカタログに保存され、DB を再オープンしても使われる。
+参照先は親テーブルの主キーだけに制限する。
+親の列を省略すると主キー全列を参照する。
+列を指定する場合は、主キーと同じ列数・列順で指定する。
 
-```sql
-CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT);
-CREATE TABLE pets (id INTEGER PRIMARY KEY, owner_id INTEGER REFERENCES people (id));
+検査は即時RESTRICTで行う。
 
-INSERT INTO people VALUES (1, 'alice');
-INSERT INTO pets VALUES (10, 1);      -- OK
-INSERT INTO pets VALUES (11, 99);     -- 外部キー制約に違反（親が無い）
-DELETE FROM people WHERE id = 1;      -- 外部キー制約に違反（pets が参照している）
-DELETE FROM pets WHERE id = 10;
-DELETE FROM people WHERE id = 1;      -- OK
-```
+- 子の `INSERT`または `UPDATE`で親行がない場合は `ConstraintViolation`になる。
+- 外部キーに `NULL`を含む行は参照検査をスキップする。
+- 親の `DELETE`で参照中の子がある場合は拒否する。
+- 親の主キーは更新できない。
 
----
+参照アクション、MATCH、DEFERRABLE、名前付き制約は未対応。
 
-## 12. トランザクション
+参照されている親テーブルは `DROP TABLE`できない。
+外部キー列は `DROP COLUMN`できない。
 
-### SQL 文としての BEGIN / COMMIT / ROLLBACK
+自己参照も可能。
+ただし参照する行が残る間は親行を削除できない。
 
-`BEGIN` / `COMMIT` / `ROLLBACK` は SQL 文として受理され、**暗黙の transaction を明示的に制御する**。
+## 11. トランザクション
+
+### 11.1 SQLによる制御
 
 ```sql
 BEGIN;
 INSERT INTO t VALUES (1, 'a');
 INSERT INTO t VALUES (2, 'b');
-COMMIT;          -- 両方を確定
+COMMIT;
 
 BEGIN;
 DELETE FROM t WHERE id = 1;
-ROLLBACK;        -- 削除を取り消し
+ROLLBACK;
 ```
 
-- `BEGIN` は新しい transaction を始める（既に transaction 中なら何もしない）。
-  `BEGIN TRANSACTION` / `START TRANSACTION` も同じ。
-  `COMMIT WORK` / `COMMIT TRANSACTION` / `END` は `COMMIT`、
-  `ROLLBACK WORK` / `ROLLBACK TRANSACTION` は `ROLLBACK` の別綴り。
-  ライブラリ API の `Session.Begin()` も `Commit()` / `Rollback()` と同じく `Result` を返す。
-- 識別子（テーブル・列・索引・別名）は**大文字小文字を区別しない**。
-- `COMMIT` はバッファをエンジンへ流す。
-- `ROLLBACK` はバッファを捨てる。
-- 1 transaction の書き込みバッファは管理メモリの概算 256MiB が上限。
-  超えると `CapacityError` になる（DDL の一括処理は除く）。
-- **DDL（`CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX` / `ALTER TABLE`）は明示 transaction 中には実行できない**
-  （即時反映のため）。
-  `COMMIT` または `ROLLBACK` してから実行する。
-- 1 つの `Session.Execute` / スクリプト内で複数文を `;` 区切りで渡した場合、
-  `BEGIN` 以降は同じ transaction で実行される。
-- ライブラリ API の `Session.Begin()` / `Commit()` / `Rollback()` と等価。
+次の別綴りを受け付ける。
 
-### 暗黙のトランザクション
+- `BEGIN TRANSACTION`、`START TRANSACTION`
+- `COMMIT WORK`、`COMMIT TRANSACTION`、`END`
+- `ROLLBACK WORK`、`ROLLBACK TRANSACTION`
 
-`Begin()` していない状態の `Execute` は、**1文ごとに**暗黙のトランザクションを開始して自動 commit する。
-任意の SQL を実行するには `Execute` を使う。
+`BEGIN`を重ねても新しいtransactionは開始しない。
+明示transaction中にはDDLを実行できない。
+
+1 transactionの書き込みバッファ上限は256MiBである。
+超過時は `CapacityError`になる。
+
+### 11.2 暗黙のtransaction
+
+`Begin`を呼ばない `Execute`は、文ごとにtransactionを開始し、自動commitする。
+複数文を渡した場合も、明示transaction中でなければ文ごとにcommitする。
+
+### 11.3 ライブラリAPI
 
 ```fsharp
-// Result から値を取り出すための説明用ヘルパー。
-let ok =
-    function
-    | Ok v -> v
-    | Error e -> failwith (DbError.toDisplayString e)
-
 let session = ok (Session.OpenWith "./mydata")
-ok (session.Execute "INSERT INTO t VALUES (1, 10)")   // 1 文 = 1 commit
-ok (session.Close())
-```
-
-`Session.Execute` に `;` 区切りで複数文を渡した場合も、`BEGIN` を張っていない限り 1文ごとに commit される。
-
-### 明示的なトランザクション（ライブラリ API）
-
-```fsharp
-open RykDb.Core
-
-// Result から値を取り出すための説明用ヘルパー。
-let ok =
-    function
-    | Ok v -> v
-    | Error e -> failwith (DbError.toDisplayString e)
-
-let session = ok (Session.OpenWith "./mydata")
-// 明示トランザクション開始（Result）。
 ok (session.Begin())
 ok (session.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
-ok (session.Commit())                              // 確定
-// 破棄する場合は Commit() の代わりに:
-// ok (session.Rollback())
+ok (session.Commit())
 ok (session.Close())
 ```
 
-- `Session` が現在の状態を保持するため、`Execute` の戻り値を次の操作へ引き継ぐ必要はない。
-- 入れ子の `Begin()` は何もしない（既にトランザクション中なら成功する）。
-- `Close()` 後の `Session` は使えない。
-  `Execute` / `TableNames` / `Begin` / `Commit` / `Rollback` は `InternalError` を返す。
-  進行中の transaction は `Close()` 時に rollback される（二重 `Close` は安全）。
-- `Session` は `IDisposable`。`use session = ...` / `Dispose()` は `Close()` と同じ経路
-  （進行中 transaction の登録も外れる）。
-- **同じ DB を別プロセスから開くことはできない**。
-  `Session.OpenWith` は `<root>/.rykdb.format` を排他で押さえ、
-  取れなければ `IoError`（`データベース <root> は別のプロセスが開いています（.rykdb.format）`）を返す。
-- **同じ root を同じプロセスで二度開くこともできない**。
-  2回目の `Session.OpenWith` は `IoError`
-  （`データベース <root> は同じプロセスで既に開かれています。Close してから開き直してください`）を返す。
-  別の `RowStore` ができて memtable が分かれ、一方の commit が他方から見えないため。
-  同じ DB を複数接続で使う場合は、`Session.OpenWith` を繰り返さずに
-  **`SessionPool.OpenWith` + `pool.CreateSession()`** を使う（1 DB = 1 プール）。
-- **明示 transaction は接続（`Session`）ごとに独立している**。
-  同じプールから作った別の `Session` からは、他方の未 commit の行は見えない。
-  切断時はその `Session` の transaction だけが rollback される。
-- SELECT だけの `Execute`（1文でも複数文でも、すべて `SELECT`）は、
-  複数スレッド・複数接続から並行実行できる。
-  書き込み・`BEGIN` / `COMMIT` / `ROLLBACK`・`Close` は DB 全体で直列化される。
-- 読み取りは呼び出し開始時点のスナップショットで実行され、実行中の書き込みを待たない。
-  逆に書き込みも実行中の読み取りを待たない（`Close` だけは読み取りの完了を待つ）。
-- 実行中の transaction がある間は、その接続の読み取りも直列化される（read-your-writes を保つため）。
-  transaction の境界は呼び出し側が決めるため、複数スレッドで 1つの transaction を共有しないこと。
-- サーバは接続ごとに独立した `Session` を作るため、transaction の所有権を別途台帳で追う必要はない。
-  切断時は `Session.Close` がその接続の transaction を rollback する。
-- 複数文を 1 回の `Session.Execute` に渡したとき、途中の文がエラーになっても
-  それ以前に成功した文は確定済みのまま残る。
-  `BEGIN` が成功した後にエラーになった場合は transaction が開いたままになるので、
-  必要に応じて `Rollback()` する。
-- トランザクション中の読み取りは、開始時点の snapshot（データの見える範囲）に固定される。
-  そのため、同じトランザクションから同じ行を読み直しても、他のトランザクションの後続 commit は見えない（repeatable read）。
-- 分離レベルは Snapshot Isolation（スナップショット分離）で固定。
-  `BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...` による指定は未対応。
-- `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` と読み取り専用トランザクションは未対応（§14）。
-- snapshot 取得後に別のトランザクションが同じキーを先に commit していた場合、後から commit する側は `ConflictError` になる（先に commit した側が勝つ）。
+破棄する場合は `Rollback()`を呼ぶ。
 
-### CLI のドットコマンド
+- `Close()`後の操作は `InternalError`になる。
+- `Close()`は進行中のtransactionをrollbackする。
+- `Session`は `IDisposable`で、`Dispose()`と `Close()`は同じ経路になる。
+- 複数スレッドで同じtransactionを共有しない。
 
-| コマンド          | 効果                                        |
-| ----------------- | ------------------------------------------- |
-| `.help`           | コマンド一覧                                |
-| `.tables`         | テーブル一覧                                |
-| `.begin`          | transaction を開始                          |
-| `.commit`         | 開いているトランザクションを確定            |
-| `.rollback`       | 開いているトランザクションを破棄            |
-| `.exit` / `.quit` | 終了（`Close` して memtable を flush する） |
+### 11.4 SessionとSessionPool
 
-```
-db> .begin
-(begin しました)
-db> INSERT INTO people VALUES (9, 'eve', 50, 1, 1.0);
-db> .rollback
-(rollback しました)
+同じDBを別プロセスから開くことはできない。
+同じプロセスで同じrootを二度開くこともできない。
+複数接続では `SessionPool.OpenWith`と `pool.CreateSession()`を使う。
+
+```fsharp
+let pool = ok (SessionPool.OpenWith "./mydata")
+let session = ok (pool.CreateSession())
 ```
 
----
+明示transactionは接続ごとに独立する。
+未commitの変更を別の接続からは見られない。
 
-## 13. エラー
+読み取りだけのSELECTは複数接続・スレッドから並行実行できる。
+書き込み、BEGIN、COMMIT、ROLLBACK、CloseはDB全体で直列化する。
 
-すべての失敗は `DbError` として返る（例外を制御フローに使わない）。
+読み取りは呼び出し開始時点のsnapshotを見る。
+実行中の書き込みを待たない。
+書き込みも実行中の読み取りを待たない。
+Closeだけは読み取り完了を待つ。
 
-| 分類                  | 意味                             | 例                                      |
-| --------------------- | -------------------------------- | --------------------------------------- |
-| `SyntaxError`         | 文法を満たさない                 | `JOIN には FROM が必要です`             |
-| `NameError`           | 名前解決・関数の失敗             | `テーブル 'x' が存在しません`           |
-| `TypeError`           | 型の不一致・不可能な変換         | `''abc'' は 'INTEGER' に変換できません` |
-| `ConstraintViolation` | `NOT NULL`・主キー欠落・0 除算   | `NOT NULL 制約に違反: t.n`              |
-| `NotFound`            | 存在しないテーブル・索引・行     | `テーブル nosuch が存在しません`        |
-| `AlreadyExists`       | 同名の作成                       | `テーブル t は既に存在します`           |
-| `CapacityError`       | memtable / バッファ / 結果の上限 | ―                                       |
-| `CorruptionError`     | チェックサム不一致               | ―                                       |
-| `ConflictError`       | MVCC の write-write 競合         | ―                                       |
-| `IoError`             | ファイル I/O の失敗              | ―                                       |
-| `InternalError`       | 内部不整合（バグの兆候）         | ―                                       |
+### 11.5 隔離レベル
 
-### 表示形式
+分離レベルはSnapshot Isolationで固定する。
 
-字句・構文解析器が返す文法エラーには行番号と列番号が付く。
-PlanBuilder / ExecContext / Eval が返す `SyntaxError`
-（例: FROM なしの `*`、集約と `SELECT *` の併用、`LIMIT` の相関サブクエリ）
-には付かないことがある。
+- 他のtransactionの未commit変更は見えない。
+- transaction内で同じ行を読み直すと、後続のcommitは見えない。
+- snapshot取得後に別transactionが先に同じキーをcommitした場合、
+  自分のcommitは `ConflictError`になる。
 
-```
+`BEGIN ISOLATION LEVEL`、`SET TRANSACTION`、`SAVEPOINT`、読み取り専用transactionは未対応。
+
+### 11.6 複数文の実行
+
+複数文を `Session.Execute`へ渡した場合、途中の文でエラーになっても、成功した文は確定済みのまま残る。
+明示transaction中のエラーはtransactionを開いたままにするので、必要に応じて `Rollback()`する。
+
+## 12. エラー
+
+失敗は例外ではなく `DbError`で返す。
+
+| 分類                  | 意味                                  |
+| --------------------- | ------------------------------------- |
+| `SyntaxError`         | 文法エラー                            |
+| `NameError`           | 名前解決・未知の関数                  |
+| `TypeError`           | 型不一致・変換失敗                    |
+| `ConstraintViolation` | NOT NULL、主キー、外部キー、0除算など |
+| `NotFound`            | テーブル・索引・列の不在              |
+| `AlreadyExists`       | 重複作成                              |
+| `CapacityError`       | memtable、バッファ、結果件数の上限    |
+| `CorruptionError`     | チェックサム不一致やデータ破損        |
+| `ConflictError`       | MVCCのwrite-write競合、DDLとの競合    |
+| `IoError`             | ファイルI/O失敗                       |
+| `InternalError`       | 内部不整合                            |
+
+字句・構文解析エラーには行・列の位置を付ける。
+
+```text
 エラー: JOIN には FROM が必要です (位置 1行 10列)
 ```
 
-### よく見るメッセージ（実測）
+主なエラー例を示す。
 
-| SQL                                                                               | メッセージ                                                                                          |
-| --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `SELECT 1 JOIN t ON 1 = 1;`                                                       | `JOIN には FROM が必要です (位置 1行 10列)`                                                         |
-| `SELECT *;`                                                                       | `FROM のない SELECT では * を使えません（列を明示してください）`                                    |
-| `SELECT * FROM t WHERE id > 1 AND;`                                               | `式が必要ですが見つかりませんでした (位置 1行 34列)`                                                |
-| `SELECT 'abc;`                                                                    | `unclosed string (位置 1行 8列)`                                                                    |
-| `SELECT id FROM nosuchtable;`                                                     | `テーブル 'nosuchtable' が存在しません`                                                             |
-| `SELECT nosuchcol FROM t;`                                                        | `'nosuchcol' は列でも関数でもありません`                                                            |
-| `CREATE TABLE t (a INTEGER);`                                                     | `テーブル t に主キーがありません`                                                                   |
-| `CREATE TABLE t (...);`（重複）                                                   | `テーブル t は既に存在します`                                                                       |
-| `CREATE INDEX ix ON t (nosuchcol);`                                               | `テーブル t に列 nosuchcol がありません`                                                            |
-| `ALTER TABLE t ADD COLUMN n INTEGER NOT NULL;`                                    | `NOT NULL 列 n を追加するには DEFAULT が必要です`                                                   |
-| `ALTER TABLE t DROP COLUMN id;`（主キー）                                         | `主キー列 id は削除できません（主キーは LSM のキーに使われています）`                               |
-| `ALTER TABLE t DROP COLUMN a;`（索引列）                                          | `列 a は索引 ix_a で使われているため削除できません`                                                 |
-| `ALTER TABLE t RENAME TO u;`                                                      | `ALTER TABLE ... RENAME TO（テーブル名の変更）は未対応です (位置 1行 22列)`                         |
-| `CREATE TABLE c (... REFERENCES nope (id));`                                      | `参照先テーブル nope が存在しません`                                                                |
-| `CREATE TABLE c (... REFERENCES p (u));`（`u` は主キーでない）                    | `参照先の列（u）はテーブル p の主キー（id）と同順で指定してください`                                |
-| `CREATE TABLE c (... REFERENCES p (id) ON DELETE CASCADE);`                       | `参照アクション（ON DELETE / ON UPDATE）は未対応です (位置 1行 71列)`                               |
-| `CREATE TABLE c (... CONSTRAINT fk FOREIGN KEY ...);`                             | `名前付き制約（CONSTRAINT）は未対応です (位置 1行 41列)`                                            |
-| `INSERT INTO c VALUES (11, 99);`（親が無い）                                      | `外部キー制約に違反: c(pid) が参照する p(id) の行がありません`                                      |
-| `DELETE FROM p WHERE id = 1;`（子が参照中）                                       | `外部キー制約に違反: テーブル c の行が p(id) を参照しています`                                      |
-| `DROP TABLE p;`（子が参照中）                                                     | `テーブル p は c の外部キーから参照されているため削除できません`                                    |
-| `SELECT id FROM t JOIN t ON t.id = t.id;`                                         | `テーブル t が重複しています（エイリアスを付けてください）`                                         |
-| `DROP TABLE nosuch;`                                                              | `テーブル nosuch が存在しません`                                                                    |
-| `INSERT INTO t (id) VALUES (1, 2);`                                               | `INSERT の列数(1)と値の数(2)が合いません`                                                           |
-| `INSERT INTO t VALUES (1, NULL, …);`                                              | `NOT NULL 制約に違反: t.n`                                                                          |
-| `INSERT INTO t VALUES (5, 'z', 'abc');`                                           | `''abc'' は 'INTEGER' に変換できません`                                                             |
-| `SELECT (id) / 0 FROM t;`                                                         | `0 での除算は定義されていません`                                                                    |
-| `SELECT LENGTH(id, n) FROM t;`                                                    | `LENGTH 関数は 1個の引数が必要ですが、2個渡されました`                                              |
-| `SELECT NOSUCHFN(id) FROM t;`                                                     | `未知のスカラー関数 'NOSUCHFN' です`                                                                |
-| `SELECT active = 1 FROM u;`                                                       | `型 'BOOLEAN' と 'INTEGER' は比較できません`                                                        |
-| `SELECT ROUND(name) FROM t;`                                                      | `ROUND は数値を受け付けますが 'abc' です`                                                           |
-| `SELECT id, (SELECT id, v FROM t) FROM t;`                                        | `サブクエリは 1 列だけを返す必要があります（2 列）`                                                 |
-| `SELECT id, (SELECT v FROM t) FROM t;`                                            | `スカラーサブクエリが 2 行以上を返しました`                                                         |
-| `SELECT id FROM t AS o LIMIT (SELECT o.id FROM t AS x);`                          | `LIMIT に相関サブクエリは使えません`                                                                |
-| `SELECT (SELECT MAX(x.v) FROM t AS x WHERE x.v = o.v) FROM t AS o GROUP BY o.id;` | `GROUP BY / 集約関数を使うクエリの SELECT / HAVING / ORDER BY では相関サブクエリを使えません`       |
-| `SELECT id FROM (SELECT id FROM t);`                                              | `サブクエリ（派生テーブル）には別名が必要です（例: AS x） (位置 1行 34列)`                          |
-| `SAVEPOINT s;`                                                                    | `文の開始として解釈できません (位置 1行 1列)`                                                       |
-| `UPDATE t SET v = 1 FROM u;`                                                      | `文の区切りには ; が必要です（複数文は ; で区切ってください） (位置 1行 20列)`                      |
-| `SELECT * FROM t LEFT WHERE 1 = 1;`                                               | `LEFT / INNER の後ろには JOIN が必要です (位置 1行 22列)`                                           |
-| `SELECT 1 UNION SELECT 2;`                                                        | `UNION（重複を除く集合演算）は未対応です（UNION ALL を使ってください） (位置 1行 10列)`             |
-| `SELECT 1 INTERSECT SELECT 2;`                                                    | `INTERSECT は未対応です（集合演算は UNION ALL のみ対応） (位置 1行 10列)`                           |
-| `SELECT a FROM t UNION ALL SELECT a, b FROM u;`                                   | `UNION ALL の列数が一致しません（1 番目: 1 列、2 番目: 2 列）`                                      |
-| `SELECT a FROM t ORDER BY a UNION ALL SELECT a FROM u;`                           | `UNION / INTERSECT / EXCEPT は ORDER BY / LIMIT より前に書いてください (位置 1行 28列)`             |
-| `UPDATE t AS x SET a = 1;`                                                        | `INSERT / UPDATE / DELETE の対象テーブルに別名は使えません（別名を外してください） (位置 1行 15列)` |
-| `SELECT * FROM t WHERE a = b = c;`                                                | `比較・述語は 1つの式に 1回だけ書けます（括弧で囲んでください） (位置 1行 29列)`                    |
-| `SELECT NULL.* FROM t;`                                                           | `'.' の後ろには列名か '*' が必要です（修飾子は識別子にだけ付けられます） (位置 1行 12列)`           |
+| SQLまたは操作              | メッセージ                                                                          |
+| -------------------------- | ----------------------------------------------------------------------------------- |
+| 存在しないテーブルの参照   | `テーブル 'nosuch' が存在しません`                                                  |
+| 主キーなしのCREATE TABLE   | `テーブル t に主キーがありません`                                                   |
+| 重複したテーブル名         | `テーブル t は既に存在します`                                                       |
+| NOT NULL違反               | `NOT NULL 制約に違反: t.n`                                                          |
+| 型変換失敗                 | `''abc'' は 'INTEGER' に変換できません`                                             |
+| 0除算                      | `0 での除算は定義されていません`                                                    |
+| BOOLEANとINTEGERの比較     | `型 'BOOLEAN' と 'INTEGER' は比較できません`                                        |
+| スカラーサブクエリが複数行 | `スカラーサブクエリが 2行以上を返しました`                                          |
+| 列数の違うUNION ALL        | `UNION ALL の列数が一致しません`                                                    |
+| テーブル別名付きDML        | `INSERT / UPDATE / DELETE の対象テーブルに別名は使えません（別名を外してください）` |
 
-未対応の後置句（`DELETE ... LIMIT`、`ON CONFLICT`、ウィンドウ関数の `OVER (...)` など）は
-専用のメッセージにならず、`;` 区切りのエラーとして報告される（§14）。
+未対応の後置句は専用エラーにならず、文の区切りエラーとして報告される場合がある。
+`TEXT`値の変換エラーは、値を引用符付きで表示するため引用符が二重になる。
 
----
+## 13. 既知の制限
 
-## 14. 既知の制限
+### 未対応構文
 
-### 構文が未対応のもの
-
-- **相関派生テーブル（LATERAL）**（`FROM (SELECT ... 外側の列 ...) AS x` は `NameError`）。
-  式の中の相関サブクエリは §7.9。
-- `UNION`（`ALL` なし）/ `INTERSECT` / `EXCEPT`（`UNION ALL` は §7.12）
-- CTE（`WITH`）、再帰クエリ
-- ウィンドウ関数（`OVER` / `PARTITION BY` / `ROW_NUMBER` …）
-- `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN` / `USING`
-- 自然結合（`NATURAL JOIN`）
-- カンマ結合（`FROM a, b`）
-- `ON CONFLICT` / `ON DUPLICATE KEY UPDATE`（upsert）
-- `FOREIGN KEY` の参照アクション（`ON DELETE` / `ON UPDATE`）、`MATCH`、`DEFERRABLE`、
-  名前付き制約（`CONSTRAINT 名前 FOREIGN KEY ...`）（明示 `SyntaxError`）。
-  外部キーの参照先は主キーだけで、`UNIQUE` 索引は参照できない（§11.5）
-- `UPDATE ... FROM` / `UPDATE ... LIMIT` / `DELETE ... LIMIT`
-- `DELETE ... USING`（明示 `SyntaxError`）
-- `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`
-- 分離レベルの指定（`BEGIN ISOLATION LEVEL ...` / `SET TRANSACTION ...`）と
-  読み取り専用トランザクション（分離レベルは Snapshot Isolation 固定）
-- `ALTER TABLE` の未対応操作:
-  テーブル名の変更（`RENAME TO`）と列の型変更（`ALTER COLUMN ... TYPE` など）。
-  列の追加・削除・名前変更は §11.4。
-- `TRUNCATE`
-- `RETURNING`
-- `CREATE TABLE ... DEFAULT (SELECT ...)`（構文は受理されるが INSERT 時に `SyntaxError`。§7.9）
-- ユーザ定義関数・トリガー・ビュー・ストアドプロシージャ
-- 名前付きパラメータ（`:name` / `@name`）。
-  位置パラメータ `?` のみ対応（§2「位置パラメータ」）
+- 相関派生テーブル（LATERAL）
+- `UNION`、`INTERSECT`、`EXCEPT`
+- CTE、再帰クエリ
+- ウィンドウ関数
+- `RIGHT JOIN`、`FULL JOIN`、`CROSS JOIN`
+- 自然結合、`JOIN ... USING`、カンマ結合
+- `ON CONFLICT`、upsert
+- 外部キーの参照アクション、MATCH、DEFERRABLE、名前付き制約
+- `UPDATE ... FROM`、`UPDATE / DELETE`のLIMIT、`DELETE ... USING`
+- `SAVEPOINT`
+- 分離レベル指定と読み取り専用transaction
+- テーブル名の変更と列型の変更
+- `TRUNCATE`、`RETURNING`
+- ユーザ定義関数、トリガー、ビュー、ストアドプロシージャ
+- 名前付きパラメータ
 - パーティショニング、圧縮、暗号化
-
-未対応の集合演算・JOIN の綴りは、テーブル別名・列別名として解釈されず **`SyntaxError`** になる。
-これらの語を裸の別名に使うことはできない（`AS` を付ければ使える）。
-ただし `USING` はテーブル別名では拒否されるが、列の裸の別名としては受理される。
 
 ### 実装上の制約
 
-| 項目                | 内容                                                                                                                                                                                                      |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 索引                | 単一列・複合索引の前置等値（1列以上）、複合索引の前置等値 + 次列の範囲、`LIKE 'prefix%'` の範囲。索引値は空で、索引列 + 主キーはキーから復号する。被覆外の列は行ごとに主キー lookup する                  |
-| `LIMIT` / `OFFSET`  | 0 以上の定数式のみ（行ごとの列参照・負数はエラー）。`LIMIT 0` は「0行」                                                                                                                                   |
-| 型引数              | `DECIMAL(10, 2)` は宣言のみ。丸めなし                                                                                                                                                                     |
-| ソート              | 外部マージ（一時ファイルへ退避）。受け皿（既定 64MiB）に収まる分はメモリのみ                                                                                                                              |
-| `SELECT DISTINCT`   | 符号化キーの集合。作業メモリ（既定 256MiB）を超えた分は一時ファイルへ退避し、最初に現れた順を保って完走する                                                                                               |
-| `JOIN`              | 入れ子ループ / ハッシュ結合は右側を、マージ結合は同じキーの行だけを保持。作業メモリ換算 256MiB を超えた分は一時ファイルへ退避（ハッシュ結合は両側をキーハッシュでパーティション分割して外部ハッシュ結合） |
-| `GROUP BY`          | 行を抱えず集約。グループが作業メモリを超えたら、以降の行をグループキーで退避してパーティションごとに集約する。`DISTINCT` 集約の値が上限を超えたら外部ソートで重複除去                                     |
-| `IN (SELECT ...)`   | 値集合 `ValueSet`。上限を超えた分は一時ファイルへ退避し、Bloom filter + ブロック索引で判定する。NULL は `HasNull` だけを持つ                                                                              |
-| パラメータ          | `?` の位置パラメータのみ（名前付きは未対応）。個数は SQL 全体で一致が必要。値は `SqlValue` で渡す                                                                                                         |
-| 最終結果            | materialize。既定 100万行 / 256MiB で、超過は `CapacityError`（`SessionOptions` で変更可。**`-1` で無制限**。上限なしは `TryOpenReader` が省メモリ）                                                      |
-| ストリーミング      | `Session.TryOpenReader` は単一 SELECT のみ。materialize しないため結果上限は適用外。終端または `RowReader.Dispose` で走査と snapshot を解放                                                               |
-| `AVG`               | `SUM / COUNT` を実行時に計算                                                                                                                                                                              |
-| `UPDATE` / `DELETE` | `FROM` / `USING` / `LIMIT` 相当の句がない                                                                                                                                                                 |
-| 外部キー            | 参照先は親の主キーのみ。即時 RESTRICT（`ON DELETE` / `ON UPDATE` は未対応）。子の検査は外部キー列の索引があれば索引、無ければ子テーブルの走査                                                             |
-| DML の別名          | 対象テーブルに別名は書けない（`UPDATE t AS x` / `DELETE FROM t x` は `SyntaxError`）。列は実名で修飾する                                                                                                  |
-| トランザクション    | 分離レベルは Snapshot Isolation 固定。`SAVEPOINT` と読み取り専用トランザクションは未対応（§12）                                                                                                           |
-| DDL と transaction  | 明示 transaction 中は DDL を実行できない（即時反映のため）                                                                                                                                                |
-| `ORDER BY`          | 列参照・式・序数（1 始まり）が使える。`NULL` は最小（`ASC` 先頭 / `DESC` 末尾）。同値行の順序は保証しない                                                                                                 |
+| 項目               | 制約                                                   |
+| ------------------ | ------------------------------------------------------ |
+| 索引               | 単一列・複合索引、複合索引の前置等値、`LIKE 'prefix%'` |
+| `LIMIT` / `OFFSET` | 0以上の定数式のみ                                      |
+| 型引数             | `DECIMAL(p, s)`の桁数は検証しない                      |
+| ソート             | 外部マージソート。既定メモリ64MiB                      |
+| DISTINCT           | 作業メモリ256MiBを超えると退避                         |
+| 結合               | 作業メモリ256MiBを超えると退避                         |
+| GROUP BY           | グループを一時ファイルへ退避                           |
+| INサブクエリ       | メモリ上限を超えたら値集合を退避し、Bloom filterで絞る |
+| 最終結果           | 既定で100万行・256MiB。超過時は `CapacityError`        |
+| TryOpenReader      | 単一SELECTのみ。行数上限を適用しない                   |
+| UPDATE / DELETE    | FROM、USING、LIMIT句なし                               |
+| 外部キー           | 親の主キーだけ。即時RESTRICT                           |
+| DML別名            | 対象テーブル別名なし                                   |
+| DDL                | 明示transaction中に実行不可                            |
 
-- `.rykdb.format` が `rykdb-prefixed-v1`（索引エントリが行全体を保持する形式）の DB は開けない。
-  また、format マーカー導入前（空マーカー + データファイルあり）の DB も開けない。
-  いずれも `CorruptionError`（`旧形式` のメッセージ）になり、自動移行はしない。
+`SessionOptions.MaxResultRows` / `MaxResultBytes`で最終結果の上限を、
+`WorkMemBytes` / `SortBufferBytes` / `SpillDirectory`で作業領域を変更できる。
+数値上限は `-1`で無制限になる。
+
+旧形式のデータベースは開けない。
+形式マーカーがないデータや、行全体を索引値に保持する旧形式は `CorruptionError`になる。
 
 ### 演算の注意
 
-- `INTEGER / INTEGER` は切り捨て（`10 / 4` → `2`）。実数にしたいなら `10 / 4.0`。
-- `UPPER(NULL)` / `LOWER(NULL)` / `TRIM(NULL)` は `NULL` を返す。
-- `DATE` と `TIMESTAMP` は相互比較できるが、`DATE` は UTC 午前 0時として扱われる。
-- `REAL` の `NaN` は `REAL` 同士の比較でのみ特別扱いされる（`NaN` が最大、`NaN = NaN` は真）。
-  `NaN` と `INTEGER` / `DECIMAL` を比較すると `TypeError`（`NaN や ±Infinity は数値比較できません`）になる。
-  `NaN` / `±Infinity` に加えて decimal の範囲外（絶対値 約 7.9e28 超）も `DECIMAL` に変換できない。
-- `REAL` の `-0.0` は `+0.0` と同じ値として扱う。
-  主キー・`UNIQUE` 索引でも同じキーになり、保存時には `+0.0` に正規化される。
+- 整数除算は切り捨てる。
+- `DATE`と `TIMESTAMP`は相互比較できる。
+- `REAL`の `NaN`は `REAL`同士でのみ最大値として扱う。
+- `NaN`と整数・decimalの比較、無限大とdecimalへの変換はエラーになる。
+- `-0.0`と `+0.0`は同じ値として扱う。主キーとUNIQUE索引も同じキーになる。
 
----
+## 14. 例
 
-## 15. 付録: 完全な例
-
-### 15.1 スキーマ作成から集計まで
+### スキーマ作成
 
 ```sql
 CREATE TABLE depts (
-  id   INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY,
   name TEXT NOT NULL
 );
 
 CREATE TABLE people (
-  id       INTEGER PRIMARY KEY,
-  name     TEXT NOT NULL,
-  dept_id  INTEGER,
-  age      INTEGER,
-  salary   DECIMAL,
-  hired    DATE,
-  active   BOOLEAN DEFAULT TRUE
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  dept_id INTEGER,
+  age INTEGER,
+  salary DECIMAL,
+  hired DATE,
+  active BOOLEAN DEFAULT TRUE
 );
 
 INSERT INTO depts VALUES (1, 'eng'), (2, 'sales');
+
 INSERT INTO people VALUES
   (1, 'alice', 1, 30, 100.5,  '2024-01-15', TRUE),
   (2, 'bob',   1, 25, 200.25, '2023-06-01', FALSE),
@@ -1657,61 +1219,48 @@ CREATE INDEX idx_people_dept ON people (dept_id);
 CREATE INDEX idx_people_name ON people (name);
 ```
 
+### SELECTと集約
+
 ```sql
--- 索引付きポイント検索
-SELECT id, name FROM people WHERE dept_id = 2;
--- id | name
---  3 | 'carol'
+SELECT id, name
+FROM people
+WHERE dept_id = 2;
 
--- 結合
 SELECT p.name, d.name AS dept
-  FROM people p
-  JOIN depts d ON p.dept_id = d.id
- ORDER BY p.name;
+FROM people p
+JOIN depts d ON p.dept_id = d.id
+ORDER BY p.name;
 
--- LEFT JOIN（所属先が無くても残す）
-SELECT p.name, d.name AS dept
-  FROM people p
-  LEFT JOIN depts d ON p.dept_id = d.id + 100
- ORDER BY p.name;
-
--- 集計
-SELECT d.name AS dept, COUNT(*) AS headcount, AVG(p.salary) AS mean
-  FROM depts d
-  JOIN people p ON p.dept_id = d.id
- GROUP BY d.name
+SELECT d.name AS dept,
+       COUNT(*) AS headcount,
+       AVG(p.salary) AS mean
+FROM depts d
+JOIN people p ON p.dept_id = d.id
+GROUP BY d.name
 HAVING COUNT(*) >= 1
- ORDER BY d.name;
+ORDER BY d.name;
+```
 
--- 条件分岐
-SELECT name, CASE WHEN age > 30 THEN 'senior' ELSE 'junior' END AS band
-  FROM people
- ORDER BY id;
+### 更新と削除
 
--- ページング
-SELECT id, name FROM people ORDER BY id LIMIT 2 OFFSET 1;
-
--- 更新と削除
+```sql
 UPDATE people SET age = age + 1 WHERE id = 1;
 DELETE FROM people WHERE id = 3;
 ```
 
-### 15.2 エラーを起こす例
+### エラー
 
 ```sql
-CREATE TABLE t (a INTEGER);            -- 主キーがない
+CREATE TABLE t (a INTEGER);
 -- エラー: テーブル t に主キーがありません
 
-SELECT * FROM nosuch;                  -- 存在しないテーブル
+SELECT * FROM nosuch;
 -- エラー: テーブル 'nosuch' が存在しません
 
 CREATE TABLE u (id INTEGER PRIMARY KEY, n TEXT NOT NULL);
-INSERT INTO u VALUES (1, NULL);        -- NOT NULL 違反
+INSERT INTO u VALUES (1, NULL);
 -- エラー: NOT NULL 制約に違反: u.n
 
-SELECT (id) / 0 FROM u;                -- 0 除算
+SELECT (id) / 0 FROM u;
 -- エラー: 0 での除算は定義されていません
-
-SELECT active = 1 FROM u;              -- 型の比較
--- エラー: 型 'BOOLEAN' と 'INTEGER' は比較できません
 ```

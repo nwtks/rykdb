@@ -66,10 +66,9 @@ module internal SstableFormat =
     let internal Magic = "RykDbSST"
 
     /// 書き出すファイルのバージョン。
-    /// v6 はチェックサムを CRC32C に変更した版（v5 以前は FNV-1a）。
-    /// ブロック末尾・メタデータ（meta / Bloom / index）・Footer をそれぞれ検証し、
+    /// v6 はブロック末尾・メタデータ（meta / Bloom / index）・Footer を CRC32C で検証する。
     /// 全体チェックサムは持たない（部分読みでは読まなかったブロックは検証されない）。
-    /// v5 以前はチェックサムが一致しないため読めない。
+    /// v6 未満は読めない。
     [<Literal>]
     let internal Version = 6
 

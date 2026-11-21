@@ -38,10 +38,6 @@ type internal ScanScope =
     member internal ActiveCount: int
 
 /// SSTable の遅延走査（one-shot）。
-/// <remarks>
-/// ケースはこのシグネチャで隠す。
-/// 構築は `ofStep` / `ofArray` / `ofState` / `ofFilter` / `ofScoped` に限る。
-/// </remarks>
 [<Sealed>]
 type internal SstScan =
     interface System.IDisposable

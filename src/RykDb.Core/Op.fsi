@@ -3,7 +3,7 @@ namespace RykDb.Core
 /// 1行取り出す pull 演算子（one-shot）。
 /// <remarks>
 /// ケース（`Done` / `Step` / `Compute`）はこのシグネチャで隠す。
-/// 構築は `empty` / `ofRow` / `emit` / `compute` / `ofArray` に限る。
+/// 構築は `Empty` / `ofRow` / `emit` / `compute` / `ofArray` に限る。
 /// F# の `private` はアセンブリ内の他ファイルには効かないため、
 /// 構築規則はこの `.fsi` でコンパイラに守らせる。
 /// </remarks>

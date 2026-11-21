@@ -146,7 +146,7 @@ module internal Alias =
         Expr.rewrite rewriteLeaf
 
     /// 集計を含む別名は差し替えない表（GROUP BY 用）。
-    /// 集計をグループキーにすると意味が壊れるため）。
+    /// 集計をグループキーにすると意味が壊れるため。
     let withoutAggregates = Map.filter (fun (_: string) e -> not (Expr.isAggregate e))
 
 module internal Predicate =

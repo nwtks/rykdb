@@ -44,15 +44,15 @@
 厳格評価なので、再帰で次の継続を第2引数に直接渡すと、全行ぶんの連鎖を構築するか無限再帰になる。
 
 ```fsharp
-// 非推奨
-let rec loop () = Op.Step(row, loop ())
+// 非推奨（第2引数を構築時に評価してしまう）
+let rec loop () = Op.emit row (loop ())
 
 // 正しい
 let rec loop () =
-    Op.Compute(fun () -> OpStep.OpRow(row, loop ()))
+    Op.compute (fun () -> OpStep.OpRow(row, loop ()))
 ```
 
-有限の既知の連鎖には `Step` を使い、それ以外は `Compute` を使う。
+有限の既知の連鎖には `Op.emit`、それ以外は `Op.compute` を使う。
 
 ### 2.2 継続を別ループへ変更しない
 
@@ -66,9 +66,9 @@ JOIN では、結合済みの左行に対する「次の右行」を、元の右
 ```fsharp
 let rec go cur =
     match Op.next cur with
-    | OpError e -> err e
-    | OpDone -> ret result
-    | OpRow(row, next) ->
+    | OpStep.OpError e -> ...
+    | OpStep.OpDone -> ...
+    | OpStep.OpRow(row, next) ->
         add row
         go next
 ```
@@ -89,12 +89,13 @@ let rec go cur =
 
 `Op.next cur` を呼んだ後は、元の `cur`ではなく返された `nxt` を使う。
 同じ値を再利用すると、行が重複・欠落・無限ループになる。
-構築は `Op.Empty`・`ofRow`・`ofArray`・`emit`・`compute`を使う。`Done`・`Step`・`Compute`を直接構築しない。
+構築は `Op.Empty` / `ofRow` / `ofArray` / `emit` / `compute`だけを使う
+（ケースは `.fsi` で非公開）。
 
 ### 2.7 配列へ変換するときのメモリ
 
 `Op.toArray` と外部走査では、複数の行配列を途中で実体化しない。
-制限やメモリ上限がある場合、上限でスプールし、ストリーミングで完走する。
+制限やメモリ上限がある場合、上限を超えたらスプールし、ストリーミングで完走する。
 
 ### 2.8 `DISTINCT` と集約のキー
 
@@ -118,7 +119,7 @@ let rec go cur =
 ### 3.2 入れ子 JOIN は左部分木の実際の出力スキーマを渡す
 
 結合順を並べ替える場合、元のスキーマから右テーブル名を取り除く方法では列位置がずれる。
-`outputOf lTree inSchema`で左部分木の実レイアウトを求める。
+`outputOf ctx inSchema lTree`で左部分木の実レイアウトを求める。
 
 ### 3.3 JOIN の右部分木を捨てない
 
@@ -135,7 +136,7 @@ INL は右部分木を実行しないので、これらの走査を INL に使�
 
 ### 3.5 集約ノードを包みから直接探さない
 
-集約ノードは `Project → Limit → Sort → Distinct → Filter`など複数のラップに隠れる。
+集約ノードは `Limit → Distinct → Project → Sort → Filter`などのラップに隠れる。
 ラップを降りながら `Aggregate`・`Having`を探す。
 
 ### 3.6 ORDER BY は修飾名を優先して解決する
@@ -323,9 +324,9 @@ tombstoneは古い版を残している間は消さない。
 ファイルの回収は参照されなくなったファイルだけを対象にする。
 `ActiveSnapshot = 0`は履歴を残す状態。
 
-### 5.4 一行内のputとdeleteは打ち消さない
+### 5.4 putとdeleteは最終状態へ正規化する
 
-transactionの同じキーはputとdeleteを別々のslotとして残さず、最終的な状態へ正規化する。
+transactionの同じキーはputとdeleteを別々のslotとして残さず、最後の書き込みだけを保持する。
 主キー変更はdelete/insertとして扱い、索引も主キーと全索引へ更新する。
 
 ### 5.5 同じTransactionManagerを複数作らない
@@ -348,7 +349,8 @@ transactionに`@unique:<index>:<encoded value>`の論理予約キーを持たせ
 
 ### 5.8 明示transactionは接続ごとに保持する
 
-接続ごとの状態はCatalog・Active・Pending・leaseだけを保持し、StoreとManagerは共有hostの最新committed stateを使う。
+接続ごとの状態はBEGIN時点のCatalog・Active・Pending・leaseだけを保持し、
+StoreとManagerは共有hostの最新committed stateを使う。
 文ごとにtransactionを最新stateへrebaseする。
 切断時はその接続のtransactionだけをrollbackする。
 
@@ -362,10 +364,10 @@ backfill中の他の書き込みを防ぐ。
 
 ## 6. 索引・結合・クエリ意味論
 
-### 6.1 素の列一致で索引を選ばない
+### 6.1 索引は先頭から連続する等値列で選ぶ
 
-索引選択は索引の列名と検索列が完全一致する場合だけ行う。
-複合索引は先頭から連続する等値列、次の範囲列を優先する。
+索引選択は索引の先頭から連続する等値列で行う。
+次の列に範囲条件があれば `IndexRangeScan` を優先する。
 
 ### 6.2 Catalogと実行スキーマを同期する
 
@@ -518,8 +520,9 @@ STREAMは`END`または`ERR`まで読み切る。
 `TaskCreationOptions.LongRunning`で起こす。
 スレッドプールの空きに依存させない。
 
-### 8.8 compactionの状態はIdle/Busy/Pendingを一つで管理する
+### 8.8 compactionの状態は1つの値で管理する
 
+workerの起動状態と Idle / Busy / Pending の activity を `WorkerState` の1セルで管理する。
 busyとpendingを別に読むとidle判定が完了前にtrueになる。
 shutdownではpermitに関係なくsignalを発行する。
 

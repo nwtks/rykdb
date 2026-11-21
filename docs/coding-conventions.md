@@ -1,281 +1,279 @@
 # コーディング規約
 
-RykDb を書くときの規約。
-設計の全体像は [`architecture.md`](architecture.md)、
-実際に踏んだ落とし穴は [`gotchas.md`](gotchas.md) を参照。
-
----
+RykDb の実装で守る規約。
+設計は [`architecture.md`](architecture.md)、
+落とし穴は [`gotchas.md`](gotchas.md) を参照。
 
 ## 目次
 
-1. [例外を使わない](#1-例外を使わない)
-2. [命令型の構文・機能を使わない](#2-命令型の構文機能を使わない)
-3. [末尾再帰を前提にする](#3-末尾再帰を前提にする)
-4. [予約語に注意](#4-予約語に注意)
+1. [例外ではなく `Result` を使う](#1-例外ではなく-result-を使う)
+2. [可変状態を局所化する](#2-可変状態を局所化する)
+3. [末尾再帰とスタック安全性を保つ](#3-末尾再帰とスタック安全性を保つ)
+4. [予約語に注意する](#4-予約語に注意する)
 5. [クロスプラットフォームにする](#5-クロスプラットフォームにする)
-6. [意味の違う番号と所有権を守る](#6-意味の違う番号と所有権を守る)
+6. [型と所有権の境界を守る](#6-型と所有権の境界を守る)
 
 ---
 
-## 1. 例外を使わない
+## 1. 例外ではなく `Result` を使う
 
-**このプロジェクトは例外を制御フローに使わない**。
-失敗は必ず `Result<'T, DbError>` として返す。
-`exception` 定義は **0件**。
+このプロジェクトでは、例外を制御フローに使わない。
+失敗は原則として `Result<'T, DbError>` を返す。例外定義はない。
 
-合成に必要な関数は `Errors.fs` の `[<AutoOpen>] module ResultOps` にまとめている。
+合成関数は `Errors.fs` の `[<AutoOpen>] module ResultOps` に集約する。
 
-| 提供                       | 用途                                                 |
-| -------------------------- | ---------------------------------------------------- |
-| `( >>= )`                  | monadic な合成（フラットな bind）                    |
-| `ret` `err` `all` `foldOk` | 単発・畳み込み                                       |
-| `result { ... }`           | `DbResultBuilder` による計算式                       |
-| `protect`                  | .NET I/O API 境界の例外捕捉（`try`/`with` の主経路） |
+| 構文・関数       | 用途                           |
+| ---------------- | ------------------------------ |
+| `( >>= )`        | `Result` の連結                |
+| `ret` / `err`    | 成功値・エラーの作成           |
+| `all` / `foldOk` | 複数項目の短絡評価             |
+| `result { ... }` | `DbResultBuilder` による計算式 |
+| `protect`        | .NET I/O API 境界での例外捕捉  |
 
-`all` と `foldOk` は**最初の `Error` で打ち切り**、残りの項目は評価しない。
-複数の `Error` があっても返るのは最初の 1つ。
+`all` と `foldOk` は最初の `Error` で処理を終了し、残りの項目を評価しない。
+複数の失敗があっても、先に発生したエラーだけを返す。
 
-`protect` は `IOException` / `UnauthorizedAccessException` を `IoError`、
-`InvalidDataException` / `FormatException` / `OverflowException` を `CorruptionError` に変換する。
-ファイル内容の不整合を `InternalError`（バグの兆候）として扱わないため。
-`try` / `with` は `protect` のほか、`Manifest.decodeRecord`（base64 の解析）と
-`RowReader` の解放処理（`Session.fs`）で使い、
-いずれも `DbError` に変換するか例外を飲み込んで、外へ出さない。
-`try` / `finally` は `Engine` / `VersionCoordinator` / `SstScan` / `Session` /
-`ProcessLock` / `StorageEngine` / `Transactions` の解放処理に使う。
+`protect` は主な例外変換経路。
 
-失敗は `ErrorKind`（`DbError.Kind`）で分類する。
+- `IOException` / `UnauthorizedAccessException` → `IoError`
+- `InvalidDataException` / `FormatException` / `OverflowException` → `CorruptionError`
+- ファイル内容の不整合は `InternalError` にせず、データ破損として扱う
 
-| `ErrorKind`                                          | 意味                                     |
-| ---------------------------------------------------- | ---------------------------------------- |
-| `SyntaxError` / `NameError` / `TypeError`            | 字句・構文 / 名前解決 / 型の失敗         |
-| `ConstraintViolation` / `NotFound` / `AlreadyExists` | DML / DDL の失敗                         |
-| `CapacityError`                                      | memtable・バッファのメモリ上限           |
-| `CorruptionError`                                    | チェックサム不一致などファイル内容の問題 |
-| `ConflictError`                                      | MVCC の write-write 競合                 |
-| `IoError` / `InternalError`                          | I/O 失敗 / 内部不整合（バグの兆候）      |
+例外境界は次の用途だけに限定する。
 
-## 2. 命令型の構文・機能を使わない
+- `try` / `with`:
+  `protect`、`Manifest.decodeRecord` の base64 解析、`Manifest.append` の追記失敗時の切り詰め、
+  `VersionCoordinator` の worker ループと `Shutdown`、`Session.fs` の `RowReader` 解放
+- `try` / `finally`:
+  `Engine`、`Compaction`、`VersionCoordinator`、`SstScan`、`Session`、
+  `ProcessLock`、`StorageEngine`、`Transactions` のリソース解放
 
-**ロジック層（型・字句・構文・計画・実行・ストレージ）では `mutable` / `while` / `ref` を使わない。**
-例外はクエリ・構築の寿命に閉じた次の 2 箇所だけで、DB やプロセスを跨いで共有しない。
+例外は外へ伝播させず、`DbError` に変換するか、解放処理では例外を限定的に処理する。
 
-- `ValueSet.IndexedValues` — 退避ファイルの reader・直近 1ブロックのキャッシュ・`disposed`。
-  1つの評価スレッドから順に呼ばれる前提。
-- `BloomFilter.BloomBuilder` — 追加済みハッシュ数のカウンタ。構築中だけ使う。
+### エラー分類
 
-残りの `mutable` は公開セッション層（`Session.fs` / `DatabaseHost.fs`）の
-状態 DU のスロットと読み取り数カウンタだけで、次を意図的に使う。
+`DbError.Kind`（`ErrorKind`）で失敗を分類する。
 
-この規約が保証するのは**可変状態の所在が列挙できること**であり、可変状態の全廃ではない。
-ロジック層の状態は `Dictionary` / `HashSet` / `ConcurrentDictionary` / `SemaphoreSlim` / `lock` へ移っている（下の許可リスト）。
-行・キー・アキュムレータの蓄積には `ResizeArray` を使わず、`list` / `array` を使う。
-「Core に mutable が無い」ではなく「可変状態はここにしかない」と読むこと。
+| `ErrorKind`                                          | 意味                                 |
+| ---------------------------------------------------- | ------------------------------------ |
+| `SyntaxError` / `NameError` / `TypeError`            | 字句・構文、名前解決、型の失敗       |
+| `ConstraintViolation` / `NotFound` / `AlreadyExists` | DML・DDL の失敗                      |
+| `CapacityError`                                      | memtable・バッファのメモリ上限       |
+| `CorruptionError`                                    | チェックサム不一致などのファイル破損 |
+| `ConflictError`                                      | MVCC の write-write 競合             |
+| `IoError` / `InternalError`                          | I/O 失敗 / 内部不整合                |
 
-- `DatabaseHost` の `let mutable lifecycle`（`HostLifecycle` = `Running` / `Closed`、`DatabaseHost.fs`）:
-  全接続で共有する確定状態（`Committed`）と Close 状態を 1つの状態 DU で持つ。
-- `Session` の `let mutable local`（`LocalSession` = `Open` / `Closed`）と
-  `let mutable readers`: 接続ローカルの transaction 状態と Close 状態を状態 DU で、
-  実行中の読み取り数だけをカウンタで保持する。
-- `SessionPool` の `let mutable lifecycle`（`PoolLifecycle` = `Open` / `Closed`）:
-  新しい接続を受け付けるかを状態 DU で保持する。
-- `RowReader` の `let mutable state`（`RowReaderState` = `Reading` / `Exhausted` / `Closed`）:
-  ストリーミング SELECT の読み取り位置と解放状態を状態 DU で保持する。
-  `Session.fs` 内に閉じる。
-- `CommitDurability` の `let mutable state`（`SyncState` = `Idle` / `Leading` / `Failed`）:
-  WAL の fsync 位置・登録位置と進行状態（グループコミットの待機・失敗の共有）を 状態 DU で保持する。
-- `lock stateGate`: `Session` の `local` / `readers` と `DatabaseHost` の `lifecycle` を保護する短いロック。
-  読み取りは入口・出口でしか取らない。
-- `lock writeGate`: `Execute`（書き込みを含むバッチ）/ `Begin` / `Commit` / `Rollback` / `Close` を直列化する。
-  `DatabaseHost.writeGate` は DB 全体、`Session.writeGate` は接続内を守る。
-- `lock gate`（`ValueSet.IndexedValues`）: クエリ局所の reader と 1ブロックキャッシュを守る。
-- `Monitor.Wait` / `PulseAll`: `Session.Close` の読み取り drain と
-  `CommitDurability` のグループコミットで待機・起床に使う。
+---
 
-Session 層のものは `Session` / `SessionPool` / `DatabaseHost` の内部に閉じ込め、
-`DatabaseHost` / `TxnState` / `ExecState` を internal にして外部へ漏らさない。
-`ValueSet.IndexedValues` は 1クエリの評価中だけ存在する。
+## 2. 可変状態を局所化する
 
-`Dictionary` / `HashSet` / `ConcurrentDictionary` を使うのは次の場所に限る
-（CLI / Server は対象外）。
-Core では `ResizeArray` を使わない。
-いずれもホットパスか同時実行の台帳であり、使う理由はコメントに残す。
+ロジック層（型、字句解析、構文解析、計画、実行、ストレージ）では、
+原則として `mutable`、`while`、`ref` を使わない。
 
-- `Ops.aggregate` のグループ表（入力行は抱えず、アキュムレータだけ）
-- `Ops.distinct` の符号化済みキー集合（`HashSet<byte array>`）
-- `OpsJoin.innerJoinHash` / `leftJoinHash` の右側ハッシュ表
-- `VersionCoordinator` の公開状態 / ファイル refcount / worker 状態（`ConcurrentDictionary`）
-- `StorageEngine` の書き込み Gate / `ProcessLock` / `Transactions` の登録台帳（`SemaphoreSlim` / `ConcurrentDictionary`）
+可変状態は完全に廃止するものではなく、使用箇所を明示して閉じ込める。
 
-| やりたいこと       | 命令形の代わりに使うもの                                                        |
-| ------------------ | ------------------------------------------------------------------------------- |
-| 書き込み           | `Writer` = 不変のチャンク列                                                     |
-| 読み取り           | `Cursor` = 読み取り位置を値として保持する                                       |
-| パーサの状態       | `PState`（読み取り位置を値として保持する）                                      |
-| 走査・畳み込み     | `Result` を返す末尾再帰                                                         |
-| ホットパスの成功値 | `DbResult<'T>`（`DbOk` / `DbErr`）。公開境界で `Result` に変換する              |
-| 平衡木の再構築     | 明示スタック（`list` を積む）                                                   |
-| 行ごとの列解決     | `Eval.prepare`（計画時の不変な準備値。`ImmutableDictionary` で解決済み）        |
-| 遅延列挙           | `Op`（one-shot。構築は `Op.compute` / `Op.emit`、消費は `Op.next` の `OpStep`） |
+### 許可する mutable 状態
 
-演算子の作業用コレクション（`Ops.distinct` の `HashSet` / `Ops.aggregate` のグループ表 /
-`OpsJoin.innerJoinHash` / `leftJoinHash` のハッシュ表）は
-**演算子の構築時に作り、返した `Op` の中だけで使う**。
-モジュールスコープに置くと 2回目以降の実行が壊れる
-（DISTINCT で実際に踏んだ。[`gotchas.md`](gotchas.md) §2.6）。
-回帰テスト: `SqlReference: DISTINCT を続けて実行しても毎回全行が返る` /
-`SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎回同じ結果になる`。
+- `ValueSet.IndexedValues`
+  - 複数ブロックをまたぐ reader、直近 1ブロックのキャッシュ、`disposed`
+  - 1つの評価スレッドから順に使用する
+- `BloomFilter.BloomBuilder`
+  - 構築中の追加済みハッシュ数
+- `DatabaseHost.lifecycle`
+  - `HostLifecycle = Running | Closed`
+- `Session.local` / `Session.readers`
+  - 接続ごとの `LocalSession = Open | Closed` と実行中の読み取り数
+- `SessionPool.lifecycle`
+  - `PoolLifecycle = Open | Closed`
+- `RowReader.state`
+  - `RowReaderState = Reading | Exhausted | Closed`
+- `CommitDurability.state`
+  - `SyncState = Idle | Leading | Failed`
 
-関数名の末尾の `V`（`matchesWithV` / `compareValuesV`）は
-「値ベース（`Result` ではなく `DbResult`）版」を表す。
-`DbResult` はホットパス専用なので、外側から呼ぶときは `Result` を返す版を使う。
+公開セッション層以外の可変状態は、原則として次の抽象で表現する。
 
-## 3. 末尾再帰を前提にする
+| 用途               | 使用する型                                     |
+| ------------------ | ---------------------------------------------- |
+| 書き込み           | 不変チャンク列の `Writer`                      |
+| 読み取り位置       | 値として保持する `Cursor` / `PState`           |
+| 走査・畳み込み     | `Result` を返す末尾再帰                        |
+| ホットパスの成功値 | `[<Struct>] DbResult<'T>`（`DbOk` / `DbErr`）  |
+| 平衡木の再構築     | `list` を明示スタックとして使用                |
+| 行ごとの列解決     | 計画時に準備する不変値と `ImmutableDictionary` |
+| 遅延列挙           | `Op` と `OpStep`                               |
 
-末尾呼び出しとは、関数が最後の処理として別の関数を呼ぶ形である。
-呼び出し元のスタックを残さずに済むため、要素数の多い処理では再帰呼び出しを末尾に置く。
+`DbResult` はホットパス専用。公開境界では `Result` を返すラップ関数を使う。
+関数名末尾の `V` は、`Result` ではなく `DbResult` を扱う値ベース版を示す。
 
-`Directory.Build.props` で `<Tailcalls>true</Tailcalls>` を設定し、
-Debug ビルドでも F# に `tail.` プレフィックスを出させる
-（Debug の既定は `Tailcalls=false`、Release の既定は `true`）。
-JIT は `tail.` を尊重する。
-ただし、JIT の自己再帰ループ化だけでは、相互再帰やクロージャ経由の呼び出しでスタックが残る。
-この設定により、CPS（`Plan` のサブクエリ解決など）の継続呼び出しも実際の末尾呼び出しにする。
-`[<TailCall>]` は構文上の末尾性を検査する属性であり、コード生成方法は切り替えない。
+### 同期とコレクション
 
-採用した手法は次のとおり。
+共有状態は短い `lock` または非同期プリミティブで保護する。
 
-- **式と SELECT の構文規則は CPS** — 継続を引数で受け、末尾で呼ぶ
-  （`ParserExpr.fs` の `parseExprC` / `parseExprBpC` / `parseExprLoopC`）。
-  Pratt（precedence climbing）で中置演算子はループ、右辺だけを結合強度で再帰させる。
-  左結合の右辺は `lbp + 1`、比較・述語の右辺は `PredicateRightBp`（加算以上）で読む。
-  継続はヒープに積まれるので、式・サブクエリの入れ子段数に依存せずスタックは一定。
-  深さの上限は設けない。
-  回帰テストは `ParserExprTests` の
-  `末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない` と
-  `末尾再帰: 5000段の深いサブクエリの入れ子も解析できる`。
-  CPS 群でも自己再帰がすべて末尾位置の関数には `[<TailCall>]` を付ける
-  （`parseExprC` / `parseExprBpC` / `parsePrefixC` など）。
-  `parseExprLoopC` は継続ラムダ内の相互再帰を FS3569 が非末尾と判定するため付けない。
-- **述語（比較 / IS / IN / BETWEEN / LIKE）は非結合**にする。
-  1つの式に 2つ目の述語が来たら `SyntaxError` にする（`a = b = c` / `a IS NULL = 1`）。
-- **前置演算子は「最低結合強度以上」のときだけ受理する**。
-  これで `a = NOT b`（比較の右辺は 50、NOT は 30）を文法どおり拒否できる。
-- **「葉の書き換えが別の再帰を経る」式走査は `Expr.rewriteWithC`（継続を取る版）を使う**。
-  `Plan` のサブクエリ解決（`resolveExprC` → `resolveLeafC` → `planSelectCWith` → …）がこれ。
-  `Expr.rewriteWith` はその糖で、失敗を返す葉の書き換え（束縛・集約の読み替え）に使う。
-- **`Plan` のサブクエリ解決は CPS**。
-  継続は名前付きの `and` グループメンバーへ hoist する
-  （`[<TailCall>]` 付き関数でラムダを書くと FS3569 が出る）。
-  **CPS グループの全メンバーに `: Result<'r, DbError>` の戻り型を明示する**
-  （型引数 `<'r>` だけだと群内の相互参照で戻り値の型が別の推論変数 'r0 になり
-  FS0043「'r と 'r0 が一致しない」で**群全体が型検査に失敗する**）。
-- **継続を値として渡す呼び出し（`Plan`）は、TailAudit の引数位置の判定では非末尾と判定される**。
-  部分適用は関数値を作るだけで、実呼び出しは呼ばれた側の末尾位置なのでフレームは積まれない。
-  ベースラインで追認する（TailAudit の `[lambda]` 判定と同じ保守側の扱い）。
-- **呼び出し回数の多い再帰はローカル `let rec` にせず、モジュールレベルの `let rec` へ hoist する**。
-  ローカル関数は呼び出しごとにクロージャを確保する（`Lexer` のトークン走査で実測）。
-  モジュールレベルなら `[<TailCall>]` で末尾性も検証できる。
-- **トークン分類のアクティブパターンは重複した分岐をまとめるときだけ使い、ゼロ割当を必須にする**。
-  `ParserExpr` の `LiteralExpr` / `NameToken` が例。
-  部分アクティブパターンは既定で `Some` を確保するので `[<return: Struct>]` + `voption` にする。
-  真偽値が欲しいだけの箇所は `isSymbol` / `isKeyword` / `isIdentName` のまま
-  （`if` 連鎖やアームごとの `when` ガードでは AP の再評価で `ToUpperInvariant` が増える）。
-  `Token.QuotedIdent` を `Ident` と混ぜてよいのは、予約語チェックをしない文脈だけ。
-- **実行時のスタック増加を深さカウンタで止める設計は取らない**。
-  式・サブクエリの深さは CPS の継続をヒープに積んで吸収し、
-  パーサに式の深さ上限は置かない。
-  `tail.` が効かない環境（設定漏れ・JIT 非対応）でも暴走しないことは、
-  深い入れ子の回帰テストで担保する。
-- **`result { }` 計算式はループする関数では使わない**。
-  `Delay` でクロージャに包まれるため末尾最適化が効かず、
-  500000トークンで Lexer が `StackOverflow` した実測がある。
-- **左偏ヒープのマージは明示スタックで畳む**（`SstMerge`、`SstScan.fs`）。
-  再帰の結果を `node` の引数にする形は非末尾になる。
-  右スパインを `picked` リストへ積み、`List.fold` で組み直せば自己再帰が消える
-  （左偏性により右スパインは log オーダーだが、深度保証に頼らず監査を通す）。
-  ヒープは `SstMerge` に集約し、`StorageEngine.scanAtValues` / `scanAtMasked`（内部は `scanAtWith`）と
-  `Compaction` のストリーミング merge が共有する。
-  回帰テストは `SstScanTests` の `SstMerge: 多数のソースをまとめてマージできる`、
-  `StorageEngineTests` の `StorageEngine.scanAtValues: 多数のファイルをキー昇順にマージする`、
-  `CompactionTests` の `Compaction.compact: 多数の入力ファイルをストリーミングでマージする`。
-- **`[<TailCall>]` は「その関数本体の自己再帰が全部末尾位置」のときだけ付ける**。
-  1つでも外れると FS3569 になり、`TreatWarningsAsErrors` のせいでビルドエラーになる。
-  構造上末尾にできないものは**付けない理由を呼び出しの直前にコメントで残す**:
-  - `Op.map` / `Op.take` — 再帰が `Compute` の中にある。
-    次の 1行を取り出すときに 1段ずつ評価されるので、フレームは積み上がらない。
-    同じパターンが `Sstable.rangeScanPartial` の `scanEntries` / `loadBlock`
-    （ブロック読みを `SstScan.next` まで遅らせるため、続きの組み立てがラムダ内に入る）と `SstScan.emit` にもある。
-  - `Plan.runSubquery` — 相関サブクエリの再計画用に自分自身を runner として渡す。
-    実際の呼び出しは `Run` の末尾位置で起きるが、
-    TailAudit は関数値を引数として渡す形を `bare` として非末尾に数えるため、
-    `StorageEngine.scanAtWith` の `pull` と同様にベースラインで追認する。
-  - 逆に**要素数に比例する反復は `match` に直して末尾再帰にする**
-    （`IN` の候補リストと `CASE` の WHEN 節。`eval ... >>= fun` だと候補の数だけスタックが積まれる）。
-    カーソルから件数分を読み出す処理（`Catalog` の列定義・名前、`Memtable` のエントリ）は
-    `Reader.readItems`（Serialization.fs）に集約し、`match` の末尾再帰で回す。
-  - WHERE の AND を平坦化する `Predicate.flattenLoop` は明示スタック（`Expr list`）で末尾再帰にする
-    （`[<TailCall>]` 付き。ローカルの `let rec` には属性を付けられないので、モジュールスコープに置いている）。
-    深い AND を `Analyzer.chooseScanMethod` に渡す経路も
-    `AnalyzerTests` の `Analyzer.chooseScanMethod: 20000段の AND を chooseScanMethod してもスタックを食わない` で検証する。
-    さらに進めて **`Eval.eval` は継続を値（`Kont`）として持つ評価機 `Eval.step`** にする
-    （`[<TailCall>]` 付き。CPS だが継続はラムダではなくタグ付きの値）。
-    再帰は `step` の自己再帰だけなので全末尾位置になり、式の深さ・`IN` の候補数に依存せずスタックは一定
-    （継続はヒープのリストに積む）。
-    成功値は `[<Struct>] DbResult<'T>`（`DbOk` / `DbErr`）で返し、
-    `Eval.evalWith` のような公開境界のラッパーだけが `Result` に戻す
-    （`Eval.matchesWithV` / `Eval.matchesJoinedV` は `DbResult` のまま返す）。
-    `Result` の `Ok` は参照 DU なので、行ごとの評価で確保しない
-    （[`gotchas.md`](gotchas.md) §7.10）。
-  - pull 層も同じ考え方で、`Op.next` は `[<Struct>] OpStep`（`OpDone` / `OpError` / `OpRow`）を返す。
-    `Op.map` / `Op.filter` のコールバックは `DbResult` を返す。
-    **`Op.emit` は第 2 引数を即時評価する**ので、行ループの継続を `Op.emit` で繋がない
-    （`Op.compute (fun () -> OpStep.OpRow(row, next))` で遅延する。[`gotchas.md`](gotchas.md) §7.10）。
-  - `Optimizer.exec` も同じ方式。
-    論理木の評価を `ExecFrame`（継続）と `ExecStep`（`EvalNode` / `ApplyOp`）に分け、
-    `run` の自己再帰だけにまとめる（`[<TailCall>]` 付き）。
-    ラッパ（`Filter` / `Aggregate` / `Having` / `Distinct` / `Sort` / `Limit` / `Project`）と
-    `Join` の左右評価をすべて `ExecFrame list` に積むので、継続はヒープ、スタックは論理木の深さに依存しない。
-    `Join` は左 → 右 → 結合の順を `JoinRightFrame` / `JoinApplyFrame` で保つ。
-  - 式の走査・組み立ては**評価機 `Expr.rewrite`（`Ast.fs`）を共用**する。
-    葉の書き換え関数（`rewriteLeaf`）だけを受け取り、
-    非葉ノードは `RewriteFrame`（`Parent` / `Done` / `Rest`）に積んで、
-    上がってきた子を `plugChildren`（`Expr.children` の逆変換）で組み直す。
-    子の列挙と組み直しは `Expr.mapChildrenState` の 1つの match に集約し、
-    `children` / `plugChildren` はその導出にする（ノード追加は 1箇所）。
-    `rewrite` 内のローカル関数 `loop` の自己再帰だけなので、式の深さに依存せずスタックは一定。
-    使うのは束縛の `Binder.qualify` と、集約後の読み替え（`Ops` の内部 `substituteAggs`）
-    （`AggCall` のように子を持つノードを丸ごと定数へ置き換えるのも `rewriteLeaf` で表現できる）。
-    検証は `BinderTests` の `Binder.qualify: 全ノード種を qualify しても構造が保たれる` と
-    `OpsTests` の `末尾再帰: 50000段の式を havingFilter してもスタックを食わない`。
+- `stateGate`: `Session` の状態・読み取り数、`DatabaseHost` のライフサイクル
+- `writeGate`: バッチ、`Begin`、`Commit`、`Rollback`、`Close` の直列化
+- `gate`: `ValueSet.IndexedValues` の reader と 1ブロックキャッシュ
+- `Monitor.Wait` / `PulseAll`: 読み取りの終了待ち、グループコミット
 
-## 4. 予約語に注意
+Core の可変コレクションは用途を限定する。
+`ResizeArray` は使わず、行・キー・アキュムレータには `list` / `array` を使う。
 
-`key` / `base` / `begin` / `new` / `old` / `type` / `value` は F# の予約語で、
+- `Ops.aggregate`: グループ表
+- `Ops.distinct`: `HashSet<byte array>`
+- `OpsJoin.innerJoinHash` / `leftJoinHash`: 右側ハッシュ表
+- `VersionCoordinator`: 公開状態、ファイル refcount、worker 状態
+- `StorageEngine`、`ProcessLock`、`Transactions`: 同期・登録台帳
+
+演算子の作業用コレクションは、演算子の構築時に作り、返した `Op` の中だけで保持する。
+モジュールスコープに置くと実行ごとの状態が共有され、2回目以降の結果が壊れる。
+
+回帰テスト:
+
+- `SqlReference: DISTINCT を続けて実行しても毎回全行が返る`
+- `SqlReference: GROUP BY とハッシュ結合を続けて実行しても毎回同じ結果になる`
+
+---
+
+## 3. 末尾再帰とスタック安全性を保つ
+
+末尾再帰は、要素数に比例する処理でスタックフレームの蓄積を防ぐ。
+
+`Directory.Build.props` の `<Tailcalls>true</Tailcalls>` により、
+Debug ビルドでも F# コンパイラが `tail.` を生成する。
+`[<TailCall>]` は構文上の末尾性を検査し、コード生成は切り替えない。
+両方を組み合わせて、末尾性の検査と実行時のスタック安全性を確保する。
+
+### 基本方針
+
+- 要素数に比例する反復は `match` と末尾再帰で実装する
+- ローカルの頻繁な再帰は避け、モジュールレベルの `let rec` にする
+- `result { ... }` をループ内で使わない
+- 式やサブクエリの深さに上限を設けない
+- 深さカウンタでスタック増加を止める設計にしない
+- 継続と走査フレームはヒープ上の値・リストに保持する
+
+`result { ... }` は `Delay` によりクロージャを生成し、末尾最適化が効かない。
+500000トークンのループで `StackOverflow` が発生したため、ループ関数では使用しない。
+
+### 実装パターン
+
+**パーサーと式評価**
+
+- 式と SELECT の構文解析は CPS（継続渡し）で実装する
+- `parseExprC`、`parseExprBpC`、`parseExprLoopC` などが例
+- Pratt parser では、中置演算子をループで処理し、右辺だけ結合強度で再帰する
+- 左結合の右辺は `lbp + 1`、比較・述語の右辺は `PredicateRightBp` を使う
+- 比較・述語は非結合とし、2つ目が来たら `SyntaxError` にする
+- 前置演算子は、それ以上に結合する式の右辺だけで受理する
+- CPS で自己再帰がすべて末尾位置の関数には `[<TailCall>]` を付ける
+- 継続ラムダ内の相互再帰など、属性検査が失敗する箇所には付けない
+
+深い括弧とサブクエリは、`ParserExprTests` の次のテストで確認する。
+
+- `末尾再帰: 1000000段の深い括弧の入れ子もスタックを食わない`
+- `末尾再帰: 5000段の深いサブクエリの入れ子も解析できる`
+
+**式の書き換えと評価**
+
+- 葉の書き換えは `Expr.rewriteWithC` または `Expr.rewriteWith` を使う
+- `Expr.rewrite` は `RewriteFrame` に未処理ノードを積み、ローカル再帰で組み直す
+- `Eval.step` はタグ付きの継続 `Kont` を使い、自己再帰だけを末尾再帰にする
+- ホットパスは `[<Struct>] DbResult<'T>` を返し、公開境界で `Result` に変換する
+- `Op.next` は `[<Struct>] OpStep`（`OpDone` / `OpError` / `OpRow`）を返す
+- 行ループの継続は `Op.emit` に直接渡さず、
+  `Op.compute (fun () -> OpStep.OpRow(row, next))` として遅延する
+- `Optimizer.exec` は `ExecFrame` と `ExecStep` に分解し、論理木を反復処理する
+
+`Result` の参照型 DU を行ごとに生成しないこと、深い式、深い IN、長い WHEN 節、
+大量の行読み出しではスタックを一定に保つことが重要。
+
+**繰り返し処理**
+
+- IN の候補リストと CASE の WHEN 節は `match` による末尾再帰で処理する
+- カーソルからの項目読み出しは `Reader.readItems` に集約する
+- WHERE の AND は `Predicate.flattenLoop` で平坦化する
+- 左偏ヒープのマージは右スパインを `picked` リストへ移し、`List.fold` で組み直す
+
+`Plan.runSubquery` と `StorageEngine.scanAtWith.pull` など、
+継続を関数値として渡す処理は TailAudit では保守的に非末尾として数えられる。
+実行時は実呼び出しが末尾位置になるため、これらは TailAudit のベースラインで承認する。
+
+### `[<TailCall>]` の基準
+
+関数本体の自己再帰がすべて末尾位置の場合だけ属性を付ける。
+1箇所でも末尾でなければ FS3569になり、`TreatWarningsAsErrors` によりビルドエラーになる。
+
+構造上末尾再帰にできない箇所は、属性を付けず、呼び出し直前に理由をコメントする。
+
+- `Op.map` / `Op.take`: 再帰が `Compute` 内にある
+- `Sstable.rangeScanPartial` の `scanEntries` / `loadBlock`: ブロック読みが後続処理へ遅延する
+- `SstScan.emit`: 続きの組み立てがラムダ内にある
+- `Plan.runSubquery`: 自分自身を runner として渡す
+
+逆に、要素数に比例する反復は末尾再帰へ変更する。
+
+### 回帰テスト
+
+- `SstMerge: 多数のソースをまとめてマージできる`
+- `StorageEngine.scanAtValues: 多数のファイルをキー昇順にマージする`
+- `Compaction.compact: 多数の入力ファイルをストリーミングでマージする`
+- `Analyzer.chooseScanMethod: 20000段の AND を chooseScanMethod してもスタックを食わない`
+- `Binder.qualify: 全ノード種を qualify しても構造が保たれる`
+- `末尾再帰: 50000段の式を havingFilter してもスタックを食わない`
+
+さらに詳しい検査内容は [`development.md`](development.md) の tail call 監査を参照。
+
+---
+
+## 4. 予約語に注意する
+
+`key`、`base`、`begin`、`new`、`old`、`type`、`value` は F# の予約語。
 匿名レコードのフィールド名にも使えない。
+
 衝突例と回避策は [`gotchas.md`](gotchas.md) §9.5 を参照。
+
+---
 
 ## 5. クロスプラットフォームにする
 
-特定の OS に依存しない。
-パス操作・ファイル I/O・プロセス間排他などは .NET のクロスプラットフォーム API
-（`System.IO.Path` / `Environment` / `FileShare` 等）を使い、
-OS 固有のパス区切り・コマンド・API を直接呼ばない。
-CI は Linux / Windows / macOS の 3 OS で走る。
+特定の OS に依存する実装を避ける。
 
-## 6. 意味の違う番号と所有権を守る
+パス操作、ファイル I/O、プロセス間排他には、`System.IO.Path`、`Environment`、`FileShare`
+などのクロスプラットフォーム API を使用する。
+OS 固有の区切り文字、コマンド、API を直接呼ばない。
 
-一覧と根拠は [`invariants.md`](invariants.md)、実際の書き方は [`gotchas.md`](gotchas.md) を参照。
+CI では Linux、Windows、macOS の3環境で検証する。
 
-- **同じ素の型で意味が違う番号は単位で分ける**（INV-04）。
-  `FileNumber` ↔ `ManifestNumber` は `manifestNo`、`SeqNo` ↔ `TxnId` は `txnId`。
-  両側ではなく**片側だけ**付ければ対は区別できる。
-  単位と型略記は `Types.fs` に置く（`Wal.fs` より前のコンパイル順が必要）。
-  直列化の境界でだけ `uint64 x` / `LanguagePrimitives.Int64WithMeasure` で外す。
-- **保持する側は渡された配列を複製してから保持する**（INV-19）。
-  `Memtable.insert` は `Entry.takeOwnership`、`Transaction.put` / `remove` は `setSlot` が複製。
-  逆に `SstEntry` は読み取り専用のビューなので複製しない。
-  出口の行も `SqlValue.copyRow` で切り離す（INV-02）。
-- **状態は bool で表現せず状態 DU にする**（INV-15）。
-  2つの bool は「両方 true」と「判定の順序への依存」を許す。
-  1回だけの副作用（リソース解放）は遷移関数に閉じ込める。
+---
+
+## 6. 型と所有権の境界を守る
+
+一覧と根拠は [`invariants.md`](invariants.md)、
+具体的な書き方は [`gotchas.md`](gotchas.md) を参照。
+
+### 異なる意味の番号を型で区別する
+
+同じ素の型でも意味が異なる番号は、単位付き型で分ける（INV-04）。
+
+- `FileNumber` と `ManifestNumber`
+- `SeqNo` と `TxnId`
+
+型略記と単位は `Types.fs` に定義する。
+`Wal.fs` より前にコンパイルされる必要がある。
+直列化の境界だけで `uint64 x` または `LanguagePrimitives.Int64WithMeasure` に変換する。
+
+### 配列の所有権を明確にする
+
+保持する側は、渡された配列を複製してから保持する（INV-19）。
+
+- `Memtable.insert`: `Entry.takeOwnership`
+- `Transaction.put` / `remove`: `setSlot`
+
+読み取り専用のビューである `SstEntry` は複製しない。
+公開する行は `SqlValue.copyRow` により呼び出し側と切り離す（INV-02）。
+
+### 状態は bool ではなく DU で表現する
+
+状態遷移を2つの `bool` で表現しない（INV-15）。
+状態が増えると、両方 `true` の組み合わせや判定順序への依存が生じる。
+
+代わりに判別共用体を使用し、解放など副作用が1回だけ起こる遷移は状態関数内に閉じ込める。

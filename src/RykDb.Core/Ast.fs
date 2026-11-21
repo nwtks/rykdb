@@ -213,7 +213,7 @@ type internal Expr =
     /// 実行計画の段階で TRUE / FALSE へ置き換わる。
     | Exists of SelectStatement
     /// `x [NOT] IN (SELECT ...)`。
-    /// 実行計画の段階で IN の要素リストへ展開される。
+    /// 実行計画の段階で `ValueSet` を参照する `InSet` へ置き換わる。
     | InSubquery of Expr * SelectStatement * bool
     /// `x [NOT] IN (集合)`。
     /// `IN (SELECT ...)` の結果を集合として保持する（要素リストへ展開しない）。
@@ -406,7 +406,7 @@ and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
 
 module internal Expr =
     /// 子を左から右へ 1つずつ `step` に渡し、組み直した子で親を作る。
-    /// 状態をスレッドするので、子の列挙（`children`）と子の差し替え（`plugChildren`）の
+    /// 状態を引き回すので、子の列挙（`children`）と子の差し替え（`plugChildren`）の
     /// **両方をこの 1箇所から導出**できる。
     /// ノードを追加したときに直すのはこの match だけ。
     let private mapChildrenState (step: 's -> Expr -> 's * Expr) (state: 's) =

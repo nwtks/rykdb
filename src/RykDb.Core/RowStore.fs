@@ -89,7 +89,7 @@ module internal RowStore =
     let private ClearChunkEntries = 8192
 
     /// レイアウトの format マーカーのバージョン。
-    /// v2 は索引エントリの値が空（索引列 + 主キーはキーから復号する）形式。
+    /// 索引エントリの値は空で、索引列と主キーはキーから復号する。
     [<Literal>]
     let private FormatVersion = "rykdb-prefixed-v2"
 
