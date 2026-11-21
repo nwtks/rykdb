@@ -67,6 +67,7 @@
 | INV-31 | INL は右部分木の制約を落とさない                      | `Analyzer.absorbedPredicates`、`Optimizer.execIndexJoin`                 |
 | INV-32 | `SELECT *` は論理スキーマ順で展開する                 | `ProjectFrame`、`Ops.project`                                            |
 | INV-33 | ハッシュ結合は小さい側を build し、run を逐次削除する | `Optimizer.hashBuildSide`、`OpsJoin.innerJoinHashBuildLeft`、`ScanScope` |
+| INV-34 | 走査は tombstone を返さず、ポイント検索は削除を返す   | `StorageEngine.scanAtWith`、`getAtMasked`、回帰テスト                    |
 
 ---
 
@@ -475,6 +476,20 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 回帰テストは、左buildと右buildの結果一致、左退避時のフォールバック、
 早期終了後の一時ファイル残存、`HashJoin(left)`のEXPLAIN表示を検査する。
 
+### INV-34: 走査とポイント検索の tombstone
+
+範囲走査（`StorageEngine.scanAtValues` / `scanAtMasked`）は可視・最新・非 tombstone のエントリだけを返す。
+ポイント検索（`StorageEngine.getAtMasked`）は最新版をそのまま返し、削除を示す `Value = None` を返す。
+`RowStore.getAtMasked` が None にする。
+
+`Dml` の overlay は「走査に tombstone は現れない」ことを前提にする。
+現れても読み飛ばす防御分岐はあるが、通常経路では通らない。
+逆に、engine が tombstone を返すようになるとMVCC の可視性判定と overlay の両方が壊れるため、
+この契約は回帰テストで固定する。
+
+回帰テストは `StorageEngine: 走査は tombstone を返さず、ポイント検索は削除を Value = None で返す`
+（memtable と SSTable の両方）を検査する。
+
 ---
 
 ## 永続化とリソース管理
@@ -580,6 +595,9 @@ DMLは即時RESTRICTを適用する。
 
 - `ForeignKey.resolveCreatedTable`で型、主キーとの列数・順序、列の存在を検証する。
 - `ForeignKey.checkChildRow`をINSERT、INSERT ... SELECT、UPDATEが呼ぶ。
+  子スキーマと列位置、maskの準備は`ForeignKey.prepareChildChecks`が文単位で1回だけ行う。
+  検査は**行を書いた後**の transaction 状態で行うので、自分自身を参照する行は通る。
+  同一文の後続行はまだ書かれていないので参照できない（行単位の即時検査）。
 - `ForeignKey.checkParentDelete`をDELETEが呼ぶ。
   子スキーマ、列位置、maskの準備は`ForeignKey.prepareParentDeleteChecks`が文単位で1回だけ行う。
 - 子テーブルの探索は、外部キー列から始まる索引、子主キー、全走査の順で行う。
@@ -592,7 +610,7 @@ DMLは即時RESTRICTを適用する。
 
 回帰テストは参照先省略、NameError、主キー以外、型不一致、
 複合主キー、カタログ再オープン、INSERT/UPDATE/DELETE、
-自己参照、DROP、RENAME、ADD COLUMNを検査する。
+自己参照（INSERT / UPDATE / 同一文の先行行）、DROP、RENAME、ADD COLUMNを検査する。
 
 ---
 

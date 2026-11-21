@@ -333,9 +333,14 @@ module internal RowStore =
         |> Result.map (SstScan.filter (fun e -> e.Value.IsSome))
 
     /// keyspace の全エントリをチャンク単位で tombstone 消去する。
-    /// 起動時の DROP 後始末にも使う。
+    /// <remarks>
     /// 同じ keyspace を走査しながら書くため、1チャンク書くたびに新しい store で
     /// `lastKey` から走査し直す（走査中に compaction がファイルを消しても安全）。
+    /// 呼び出しは起動時の DROP 後始末（`DropCleanupRecovery`）だけ。
+    /// その時点には `ExecState` が無いので、自前の `TransactionManager` で commit する。
+    /// DDL の文脈で消すときは `Engine.clearSpaceChunksResult`（`commitToStoreWith` 経由）を使う。
+    /// 両者は持つ状態（store+mgr / ExecState）が違うため、意図的に分けている。
+    /// </remarks>
     let clearKeyspaceChunks (mgr: TransactionManager) (space: string) (store: RowStore) =
         let rec takeKeys n acc scan =
             if n <= 0 then

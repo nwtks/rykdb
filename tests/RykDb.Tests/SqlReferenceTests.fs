@@ -565,6 +565,30 @@ let ``SqlReference: UPDATE で UNIQUE 値を交換できる`` () =
         Assert.Equal<string>("a", asText rows.Rows.[1].[1]))
 
 [<Fact>]
+let ``SqlReference: UPDATE で UNIQUE 値を 3行で回転できる`` () =
+    withSession "unique-update-rotate" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)"
+
+        // a -> b, b -> c, c -> a の回転（全行が更新対象なので衝突しない）
+        let db3 =
+            exec db2 "UPDATE t SET u = CASE WHEN id = 1 THEN 20 WHEN id = 2 THEN 30 ELSE 10 END"
+
+        let _, rows = ok (execSql db3 "SELECT u FROM t ORDER BY id")
+        Assert.Equal<int64 list>([ 20L; 30L; 10L ], rows.Rows |> Array.toList |> List.map (fun r -> asInt r.[0])))
+
+[<Fact>]
+let ``SqlReference: UNIQUE 列を代入しても値が変わらなければ通る`` () =
+    withSession "unique-update-same" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 'A'), (2, 'B')"
+
+        // 同じ値に戻す更新（索引列は代入対象だが全行が変化しない）
+        let db3 = exec db2 "UPDATE t SET email = email"
+        let _, rows = ok (execSql db3 "SELECT email FROM t ORDER BY id")
+        Assert.Equal<string list>([ "A"; "B" ], rows.Rows |> Array.toList |> List.map (fun r -> asText r.[0])))
+
+[<Fact>]
 let ``SqlReference: table-level PRIMARY KEY は NULL を拒否する`` () =
     withSession "table-pk-not-null" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER, v TEXT, PRIMARY KEY (id))"

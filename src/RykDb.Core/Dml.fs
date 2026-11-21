@@ -1,15 +1,13 @@
 namespace RykDb.Core
 
 module internal RowKey =
-    /// 索引の列値を取り出す。
-    /// 索引列は CREATE INDEX で検証済み。
-    /// 万一欠けている場合は、その列を落とす（防御）。
+    /// 索引の列値を取り出す（索引列の定義順）。
+    /// 索引列は CREATE INDEX で検証済みだが、壊れたカタログを黙って落とさず `NameError` にする。
     let indexValues (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
         index.Columns
-        |> List.choose (fun name ->
-            match TableSchema.indexOf schema name with
-            | Some i -> Some row.[i]
-            | None -> None)
+        |> List.map (TableSchema.requireIndexOf schema)
+        |> all
+        |> Result.map (fun positions -> positions |> List.map (fun i -> row.[i]))
 
     /// 主キーの LSM へ入れるキー（内部ホットパス用）。
     let primaryV (schema: TableSchema) (row: SqlValue array) =
@@ -21,8 +19,11 @@ module internal RowKey =
 
     /// 索引の LSM へ入れるキー（索引列 + 主キー列、内部ホットパス用）。
     let indexKeyV (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
-        KeyBuilder.ofIndexAndPrimary (indexValues schema index row) (TableSchema.primaryKeyOf schema row)
-        |> DbResult.ofResult
+        match indexValues schema index row with
+        | Error e -> DbErr e
+        | Ok values ->
+            KeyBuilder.ofIndexAndPrimary values (TableSchema.primaryKeyOf schema row)
+            |> DbResult.ofResult
 
     /// 索引の LSM へ入れるキー（索引列 + 主キー列）。
     let indexKey (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
@@ -50,13 +51,13 @@ module internal Dml =
         function
         | None -> ret txn
         | Some values ->
-            let keyValues = RowKey.indexValues schema index values
-
-            if keyValues |> List.exists SqlValue.isNull then
-                ret txn
-            else
-                KeyBuilder.ofValues keyValues
-                |> Result.map (fun key -> Transaction.reserveUnique index.Name key txn)
+            RowKey.indexValues schema index values
+            >>= fun keyValues ->
+                if keyValues |> List.exists SqlValue.isNull then
+                    ret txn
+                else
+                    KeyBuilder.ofValues keyValues
+                    |> Result.map (fun key -> Transaction.reserveUnique index.Name key txn)
 
     /// 旧行と新行の差分を索引へ反映する。
     /// 同じ索引キーなら上書きだけ行い、キーが変わった場合だけ旧キーを削除する。
@@ -156,11 +157,15 @@ module internal Dml =
 
             merge rows 0
 
+    /// store の読み取り上限（txn の削除分を足す）。
+    /// 削除スロットは overlay で出力から落ちるので、その分だけ余分に読む。
     let private storeLimitFor (limit: int) (slots: (byte array * SqlValue array option) list) =
         if limit <= 0 then
             0
         else
-            let deletions = slots |> List.filter (fun (_, value) -> value.IsNone) |> List.length
+            let deletions =
+                slots |> List.fold (fun n (_, value) -> if value.IsNone then n + 1 else n) 0
+
             int (min (int64 System.Int32.MaxValue) (int64 limit + int64 deletions))
 
     let private inKeyRange (lowerBytes: byte array) (upperBytes: byte array option) (key: byte array) =
@@ -225,14 +230,19 @@ module internal Dml =
 
     /// `SstScan` を `Op` に変換する。
     /// `take` が false になった時点で走査を打ち切る（キー昇順なので範囲の上限に使える）。
-    /// `SstScan` が返す None（削除済み）は読み飛ばす。
+    /// <remarks>
+    /// engine の走査は tombstone を返さない契約（`StorageEngine.scanAtWith` が除外する。
+    /// 回帰: `StorageEngine: 走査とポイント検索は tombstone を返さない`）。
+    /// 防御として `Value = None` は読み飛ばし、想定外の行幅は `InternalError` にする。
+    /// </remarks>
     let private opOfScan (width: int) (take: SstEntry -> bool) (scan: SstScan) =
-        let rowOf (value: SqlValue array option) =
-            match value with
-            | Some row when row.Length = width -> row
-            | Some row when row.Length = 0 -> Array.create width SqlValue.Unloaded
-            | Some row -> row
-            | None -> [||]
+        let rowOf (row: SqlValue array) =
+            if row.Length = width then
+                Ok row
+            elif row.Length = 0 then
+                Ok(Array.create width SqlValue.Unloaded)
+            else
+                err (DbError.internalError (sprintf "行の幅が列数と一致しません（%d 列、%d 値）" width row.Length))
 
         let rec emit scan =
             Op.compute (fun () ->
@@ -248,7 +258,12 @@ module internal Dml =
                             OpStep.OpDone
                         else
                             match e.Value with
-                            | Some row -> OpStep.OpRow(rowOf (Some row), emit rest)
+                            | Some row ->
+                                match rowOf row with
+                                | Ok values -> OpStep.OpRow(values, emit rest)
+                                | Error e ->
+                                    SstScan.dispose rest
+                                    OpStep.OpError e
                             | None -> pull rest
 
                 pull scan)
@@ -278,6 +293,7 @@ module internal Dml =
     /// <remarks>
     /// 索引値は空なので、行はキーから復号する。
     /// `slots` の値（`Some` / `None`）は存在・削除の区別にだけ使い、中身は読まない。
+    /// engine は tombstone を返さない契約なので、`e.Value.IsNone` は防御分岐。
     /// </remarks>
     let private opOfIndexScan
         (rowOf: byte array -> Result<SqlValue array, DbError>)

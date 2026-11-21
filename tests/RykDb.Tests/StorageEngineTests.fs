@@ -97,6 +97,73 @@ let ``StorageEngine.getAtMasked: 古い snapshot は SSTable 内の見える版�
             | Some e -> Assert.Equal<uint64>(3UL, e.SeqNo)
             | None -> Assert.Fail "seq3 が見えるはず"))
 
+/// 走査は tombstone を結果に含めず、ポイント検索は「削除」を Value = None で返す。
+/// <remarks>
+/// `Dml` の overlay は「走査は tombstone を返さない」ことを前提にしている
+/// （返ってきたら捨てる防御分岐はあるが、通常経路では通らない）。
+/// ポイント検索は最新版が削除なら `Value = None` を返し、`RowStore.getAtMasked` が None にする。
+/// memtable と SSTable の両方で、その契約を固定する。
+/// </remarks>
+[<Fact>]
+let ``StorageEngine: 走査は tombstone を返さず、ポイント検索は削除を Value = None で返す`` () =
+    withDir "se-tombstone" (fun dir ->
+        withEngine dir (fun engine ->
+            // memtable: 1 は生存、2 は削除（seq 3 が最新）
+            let engine =
+                ok (
+                    StorageEngine.writeBatch
+                        [|
+                            Entry.put (intKey 1) 1UL (intRow 1)
+                            Entry.put (intKey 2) 2UL (intRow 2)
+                            Entry.delete (intKey 2) 3UL
+                        |]
+                        engine
+                )
+
+            let keysOf scan =
+                ok scan |> SstScan.toArray |> ok |> Array.toList |> List.map (fun e -> e.Key)
+
+            let expectTombstone key (engine: StorageEngine) =
+                match ok (StorageEngine.getAtMasked None key [| true |] engine) with
+                | Some e -> Assert.True(e.Value.IsNone, sprintf "tombstone ではなく値が返りました: %A" e.Key)
+                | None -> Assert.Fail "エンジンは tombstone を Value = None で返すはず"
+
+            Assert.Equal<byte array list>([ intKey 1 ], keysOf (StorageEngine.scanAtValues None 0 [||] true engine))
+
+            Assert.Equal<byte array list>(
+                [ intKey 1 ],
+                keysOf (StorageEngine.scanAtMasked None 0 [||] [| true |] engine)
+            )
+
+            expectTombstone (intKey 2) engine
+
+            // SSTable: 3 は削除だけ、4 は生存、5 は値の後に削除（最新が tombstone）。
+            // 並びは「キー昇順・同一キーは SeqNo 降順」。
+            let f =
+                mkSst
+                    dir
+                    10L
+                    0
+                    [
+                        Entry.delete (intKey 3) 5UL
+                        Entry.put (intKey 4) 4UL (intRow 4)
+                        Entry.delete (intKey 5) 7UL
+                        Entry.put (intKey 5) 6UL (intRow 6)
+                    ]
+
+            let engine =
+                { engine with
+                    Version = Version.addFile f engine.Version
+                }
+
+            Assert.Equal<byte array list>(
+                [ intKey 1; intKey 4 ],
+                keysOf (StorageEngine.scanAtValues None 0 [||] true engine)
+            )
+
+            expectTombstone (intKey 3) engine
+            expectTombstone (intKey 5) engine))
+
 [<Fact>]
 let ``StorageEngine.getAtMasked: 壊れたブロックは CorruptionError`` () =
     withDir "se-bad-block" (fun dir ->

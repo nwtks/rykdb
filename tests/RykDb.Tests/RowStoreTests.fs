@@ -367,6 +367,34 @@ let ``RowStore.openStore: ロック失敗時は format マーカーを書き換�
         Assert.Equal("keep-me", System.IO.File.ReadAllText(formatPath).Trim()))
 
 [<Fact>]
+let ``RowStore.openStore: 開く途中で失敗してもロックを解放する`` () =
+    withDir "rs-open-fail-lock" (fun dir ->
+        // SSTable を 1つ作って閉じる（close が memtable を flush する）。
+        let store = ok (RowStore.openStore dir)
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+
+        let txn =
+            Dml.insertWithKey (intKey 1) txn usersSchema (rowOf 1 "a@example.com" 10) |> ok
+
+        let store = commitInto store 1UL txn
+        ok (RowStore.close store)
+
+        // Footer の magic を壊す（MANIFEST から復元したファイルは open 時に hydrate する）。
+        let sst = System.IO.Directory.GetFiles(dir, "*.sst") |> Array.exactlyOne
+        let original = System.IO.File.ReadAllBytes sst
+        let broken = Array.copy original
+        let magicOffset = broken.Length - Sstable.FooterSize
+        broken.[magicOffset] <- broken.[magicOffset] ^^^ 0xFFuy
+        System.IO.File.WriteAllBytes(sst, broken)
+        expectErrorKind ErrorKind.CorruptionError "壊れた SSTable を開けてしまった" (RowStore.openStore dir)
+
+        // 失敗時にロックを残していれば、2回目は IoError（同じプロセスで開いている）になる。
+        System.IO.File.WriteAllBytes(sst, original)
+        let reopened = ok (RowStore.openStore dir)
+        ok (RowStore.close reopened))
+
+[<Fact>]
 let ``RowStore: 前方一致する keyspace 名でもキーが混ざらない`` () =
     withStore "rs-prefix-boundary" (fun store ->
         let spaceA = Keyspace.table "a"

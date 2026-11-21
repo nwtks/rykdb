@@ -336,13 +336,6 @@ module internal DmlOps =
             gather [] (List.ofArray values) idxs
             |> Result.map (fun filled -> scatter schema.Columns.Length filled (fun i -> defaults.[i]))
 
-    /// 索引列の値を取り出す（索引列は CREATE INDEX で検証済み）。
-    let private indexValuesOf (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
-        index.Columns
-        |> List.map (TableSchema.requireIndexOf schema)
-        |> all
-        |> Result.map (fun positions -> positions |> List.map (fun i -> row.[i]) |> List.toArray)
-
     /// 主キーと UNIQUE 索引の重複を検査し、確定した主キーのバイト列を返す。
     let private checkUnique (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
         let existsMask = Array.create schema.Columns.Length false
@@ -354,7 +347,7 @@ module internal DmlOps =
             function
             | [] -> ret pkBytes
             | idx :: rest ->
-                match indexValuesOf schema idx row with
+                match RowKey.indexValues schema idx row |> Result.map List.toArray with
                 | Ok values when values |> Array.exists SqlValue.isNull -> check pk pkBytes rest
                 | Ok values ->
                     match
@@ -395,16 +388,30 @@ module internal DmlOps =
             | Error e -> err e
 
     /// 1行を制約検査して transaction へ積む。
-    let private insertRow (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
-        ForeignKey.checkChildRow ctx.Store ctx.Catalog ctx.Visible txn schema row
-        >>= fun () ->
-            checkUnique ctx schema txn row
-            >>= fun pkBytes -> Dml.insertWithKey pkBytes txn schema row
+    /// 外部キーの検査は `insert` / `insertSelect` が文単位で準備したものを使う。
+    /// <remarks>
+    /// 外部キーは**行を積んだ後**の状態で検査する。
+    /// 先に検査すると、自分自身を参照する行（例 `(1, 1)`）を入れられない。
+    /// 失敗したら文全体が Error になり、バッファごと捨てられるので残留しない。
+    /// </remarks>
+    let private insertRow
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (checks: ForeignKey.ChildCheck list)
+        (txn: Transaction)
+        (row: SqlValue array)
+        =
+        checkUnique ctx schema txn row
+        >>= fun pkBytes ->
+            Dml.insertWithKey pkBytes txn schema row
+            >>= fun next ->
+                ForeignKey.checkChildRow ctx.Store ctx.Visible next schema checks row
+                |> Result.map (fun () -> next)
 
     /// INSERT。
     /// columns が None ならテーブル定義の順に並べる。
     /// DEFAULT / NULL の充足と型強制はここで行う。
-    /// TableSchema.validateRow が NOT NULL と型を最終確認する。
+    /// TableSchema.validateRow が NOT NULL と列数を最終確認する（型は`SqlValue.coerce`で強制済み）。
     let insert (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (rows: Expr list list) =
         let evalConstant = Eval.eval Schema.empty [||]
 
@@ -434,6 +441,7 @@ module internal DmlOps =
 
         result {
             let! idxs = insertTargets schema columns
+            let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
 
             match columns, rows with
             | None, [ [] ] ->
@@ -443,7 +451,7 @@ module internal DmlOps =
                     |> all
                     |> Result.map List.toArray
 
-                let! txn = insertRow ctx schema ctx.Txn row
+                let! txn = insertRow ctx schema checks ctx.Txn row
                 return txn, 1
             | _ ->
                 let! defaults = defaultValuesOf schema (Set.ofList idxs)
@@ -455,7 +463,7 @@ module internal DmlOps =
                             result {
                                 let! provided = evalValues idxs values
                                 let! row = assembleRow schema idxs defaults provided
-                                let! txnAcc2 = insertRow ctx schema txnAcc row
+                                let! txnAcc2 = insertRow ctx schema checks txnAcc row
                                 return txnAcc2, count + 1
                             })
                         (ctx.Txn, 0)
@@ -468,22 +476,23 @@ module internal DmlOps =
     /// 選択結果の `Op` は計画時点の snapshot と transaction を握っているため、
     /// 挿入した行を読み返して増え続けることはない（`INSERT INTO t SELECT * FROM t` も止まる）。
     let insertSelect (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (source: Op) =
-        let rec go idxs defaults txn count cur =
+        let rec go idxs defaults checks txn count cur =
             match Op.next cur with
             | OpStep.OpError e -> err e
             | OpStep.OpDone -> ret (txn, count)
             | OpStep.OpRow(row, nxt) ->
                 match assembleRow schema idxs defaults row with
                 | Ok values ->
-                    match insertRow ctx schema txn values with
-                    | Ok next -> go idxs defaults next (count + 1) nxt
+                    match insertRow ctx schema checks txn values with
+                    | Ok next -> go idxs defaults checks next (count + 1) nxt
                     | Error e -> err e
                 | Error e -> err e
 
         result {
             let! idxs = insertTargets schema columns
             let! defaults = defaultValuesOf schema (Set.ofList idxs)
-            return! go idxs defaults ctx.Txn 0 source
+            let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
+            return! go idxs defaults checks ctx.Txn 0 source
         }
 
     /// UPDATE。
@@ -514,17 +523,14 @@ module internal DmlOps =
                     match assign targets row with
                     | DbErr e -> err e
                     | DbOk newRow ->
-                        match ForeignKey.checkChildRow ctx.Store ctx.Catalog ctx.Visible ctx.Txn schema newRow with
-                        | Error e -> err e
-                        | Ok() ->
-                            let bytes = bytes + rowBytes row + rowBytes newRow + 24L
+                        let bytes = bytes + rowBytes row + rowBytes newRow + 24L
 
-                            if bytes > ctx.Txn.LimitBytes then
-                                sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" ctx.Txn.LimitBytes
-                                |> DbError.capacity
-                                |> err
-                            else
-                                go targets ((row, newRow) :: acc) bytes next
+                        if bytes > ctx.Txn.LimitBytes then
+                            sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" ctx.Txn.LimitBytes
+                            |> DbError.capacity
+                            |> err
+                        else
+                            go targets ((row, newRow) :: acc) bytes next
 
         let collectUpdates txn targets =
             result {
@@ -534,69 +540,91 @@ module internal DmlOps =
                 return! go targets [] 0L scan
             }
 
-        let validateUniqueUpdates txn updates =
+        let checkExisting updatedPks txn pkMask idx values =
+            result {
+                let! scan =
+                    Dml.scanByIndexPrefixWithTxnMask
+                        ctx.Store
+                        schema
+                        idx
+                        values
+                        0
+                        ctx.Visible
+                        (Some ctx.Scope)
+                        txn
+                        pkMask
+
+                let! rows = Op.toArray scan
+
+                if
+                    rows
+                    |> Array.exists (fun row -> not (Set.contains (TableSchema.primaryKeyOf schema row) updatedPks))
+                then
+                    return! err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                else
+                    return ()
+            }
+
+        let encodeValues positions (row: SqlValue array) =
+            let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
+
+            if values |> Array.exists SqlValue.isNull then
+                Ok None
+            else
+                KeyBuilder.ofValues values |> Result.map Some
+
+        let checkIndex txn updatedPks targetPositions pkMask updates (idx: IndexSchema) =
+            result {
+                let! positions = idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
+
+                if not (positions |> List.exists (fun p -> Set.contains p targetPositions)) then
+                    return ()
+                else
+                    let! _, changed =
+                        updates
+                        |> foldOk
+                            (fun (seen, changed) (oldRow, newRow) ->
+                                result {
+                                    let! newKey = encodeValues positions newRow
+
+                                    match newKey with
+                                    | None -> return seen, changed
+                                    | Some key ->
+                                        if Set.contains key seen then
+                                            return!
+                                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                                        else
+                                            let! oldKey = encodeValues positions oldRow
+                                            let changed = if oldKey = newKey then changed else newRow :: changed
+                                            return Set.add key seen, changed
+                                })
+                            (Set.empty, [])
+
+                    return!
+                        changed
+                        |> List.fold
+                            (fun acc newRow ->
+                                acc
+                                >>= fun () ->
+                                    let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
+                                    checkExisting updatedPks txn pkMask idx values)
+                            (ret ())
+            }
+
+        let validateUniqueUpdates txn targets updates =
             let updatedPks =
                 updates
                 |> List.map (fun (_, newRow) -> TableSchema.primaryKeyOf schema newRow)
                 |> Set.ofList
 
+            let targetPositions = Set.ofList targets
+
             let pkMask =
                 Array.init schema.Columns.Length (fun i -> List.contains i schema.PrimaryKey)
 
-            let checkExisting idx seen key values =
-                result {
-                    let! scan =
-                        Dml.scanByIndexPrefixWithTxnMask
-                            ctx.Store
-                            schema
-                            idx
-                            values
-                            0
-                            ctx.Visible
-                            (Some ctx.Scope)
-                            txn
-                            pkMask
-
-                    let! rows = Op.toArray scan
-
-                    if
-                        rows
-                        |> Array.exists (fun row ->
-                            let existingPk = TableSchema.primaryKeyOf schema row
-                            not (Set.contains existingPk updatedPks))
-                    then
-                        return! err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                    else
-                        return Set.add key seen
-                }
-
-            let checkIndex (idx: IndexSchema) =
-                result {
-                    let! positions = idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
-
-                    let! _ =
-                        updates
-                        |> foldOk
-                            (fun seen (_, newRow) ->
-                                let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
-
-                                if values |> Array.exists SqlValue.isNull then
-                                    ret seen
-                                else
-                                    KeyBuilder.ofValues values
-                                    >>= fun key ->
-                                        if Set.contains key seen then
-                                            err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                                        else
-                                            checkExisting idx seen key values)
-                            Set.empty
-
-                    return ()
-                }
-
             schema.Indexes
             |> List.filter _.Unique
-            |> foldOk (fun () idx -> checkIndex idx) ()
+            |> foldOk (fun () idx -> checkIndex txn updatedPks targetPositions pkMask updates idx) ()
 
         match assignments |> List.map fst |> SqlName.duplicate with
         | Some name -> err (DbError.name (sprintf "UPDATE の列 %s が重複しています" name))
@@ -606,12 +634,19 @@ module internal DmlOps =
             |> all
             >>= fun targets ->
                 result {
+                    let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
                     let! updates = collectUpdates ctx.Txn targets
-                    do! validateUniqueUpdates ctx.Txn updates
+                    do! validateUniqueUpdates ctx.Txn targets updates
 
                     let! txn2 =
                         updates
-                        |> foldOk (fun current (oldRow, newRow) -> Dml.updateRow current schema oldRow newRow) ctx.Txn
+                        |> foldOk
+                            (fun current (oldRow, newRow) ->
+                                Dml.updateRow current schema oldRow newRow
+                                >>= fun next ->
+                                    ForeignKey.checkChildRow ctx.Store ctx.Visible next schema checks newRow
+                                    |> Result.map (fun () -> next))
+                            ctx.Txn
 
                     return txn2, List.length updates
                 }

@@ -5,13 +5,29 @@
 //  ・子の外部キー列に NULL を含む行は参照しない（MATCH SIMPLE。SQL の既定）。
 //  ・参照アクションは未対応。RESTRICT（即時検査）だけを行う。
 //      - 子の INSERT / UPDATE は親行の存在を要求する。
-//      - 親の DELETE は参照している子行があると ConstraintViolation。
+//        検査は「行を書いた後」の transaction 状態で行う（この行自身を親にできる）。
+//      - 親の DELETE は参照している子行があると ConstraintViolation（削除前に行を検査）。
 //    親の主キーは UPDATE できない（`Dml.updateRow` が拒否する）ので、親の UPDATE 検査は要らない。
 // ===========================================================================
 
 namespace RykDb.Core
 
 module internal ForeignKey =
+    /// 子行の外部キー検査の準備結果。
+    /// 文単位で 1回だけ準備し、行ごとに使い回す
+    /// （親スキーマ・列位置・mask を行ごとに作り直さない）。
+    type internal ChildCheck =
+        {
+            /// 外部キー定義（列名・親テーブル）。
+            Definition: ForeignKeyDefinition
+            /// 子行から外部キーの値を取り出す位置。
+            ChildPositions: int list
+            /// 親テーブルの実行用スキーマ。
+            Parent: TableSchema
+            /// 存在確認だけに使う mask（全列 false）。
+            ProbeMask: bool array
+        }
+
     /// 親行の削除を止める子側の参照検査。
     /// 文単位で 1回だけ準備し、削除行ごとに使い回す
     /// （子スキーマ・列位置・mask を行ごとに作り直さない）。
@@ -160,69 +176,76 @@ module internal ForeignKey =
         else
             ret values
 
-    /// 列名のリストから行の値を取り出す。
-    let private valuesOf (schema: TableSchema) (names: string list) (row: SqlValue array) =
-        names
-        |> List.map (TableSchema.requireIndexOf schema)
-        |> all
-        >>= fun positions -> valuesAt positions row
-
     let private parentSchemaOf (catalog: Catalog) (table: string) =
         match Catalog.findTable table catalog with
         | Some defn -> Catalog.toSchema defn
         | None -> err (DbError.name (sprintf "参照先テーブル %s が存在しません" table))
 
-    let private checkOne
-        (store: RowStore)
-        (catalog: Catalog)
-        (visible: uint64 option)
-        (txn: Transaction)
-        (schema: TableSchema)
-        (fk: ForeignKeyDefinition)
-        (row: SqlValue array)
-        =
-        result {
-            let! values = valuesOf schema fk.Columns row
-
-            if values |> Array.exists SqlValue.isNull then
-                return ()
-            else
-                let! parent = parentSchemaOf catalog fk.ParentTable
-                let mask = Array.create parent.Columns.Length false
-                let! key = KeyBuilder.ofValues values
-                let! found = Dml.getByPrimaryKeyBytesWithTxnMask store parent key visible txn mask
-
-                if found.IsSome then
-                    return ()
-                else
-                    return!
-                        sprintf
-                            "外部キー制約に違反: %s(%s) が参照する %s(%s) の行がありません"
-                            schema.Name
-                            (System.String.Join(", ", fk.Columns))
-                            fk.ParentTable
-                            (System.String.Join(", ", fk.ParentColumns))
-                        |> DbError.constraintViolation
-                        |> err
-        }
-
-    /// 子行（INSERT / UPDATE 後）の外部キーを検査する。
-    /// テーブルがカタログに無い（単体テストのスキーマ）なら何もしない。
-    let checkChildRow
-        (store: RowStore)
-        (catalog: Catalog)
-        (visible: uint64 option)
-        (txn: Transaction)
-        (schema: TableSchema)
-        (row: SqlValue array)
-        =
+    /// 子行（INSERT / UPDATE）の外部キー検査を準備する。
+    /// カタログに無い（単体テストの）スキーマは検査なし。
+    /// 親テーブルや列が欠けたカタログは、行を読む前に `NameError` にする（fail fast）。
+    let prepareChildChecks (catalog: Catalog) (schema: TableSchema) =
         match Catalog.findTable schema.Name catalog with
+        | None -> ret []
         | Some defn ->
             defn.ForeignKeys
-            |> List.map (fun fk -> checkOne store catalog visible txn schema fk row)
+            |> List.map (fun fk ->
+                result {
+                    let! childPositions =
+                        fk.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
+
+                    let! parent = parentSchemaOf catalog fk.ParentTable
+
+                    return
+                        {
+                            Definition = fk
+                            ChildPositions = childPositions
+                            Parent = parent
+                            ProbeMask = Array.create parent.Columns.Length false
+                        }
+                })
             |> all
-            |> Result.map ignore
-        | None -> ret ()
+
+    /// 準備済みの検査で 1行を検査する。
+    /// 外部キー列に NULL を含む行は参照しない（MATCH SIMPLE）。
+    let checkChildRow
+        (store: RowStore)
+        (visible: uint64 option)
+        (txn: Transaction)
+        (schema: TableSchema)
+        (checks: ChildCheck list)
+        (row: SqlValue array)
+        =
+        checks
+        |> List.map (fun check ->
+            result {
+                let! values = valuesAt check.ChildPositions row
+
+                if values |> Array.exists SqlValue.isNull then
+                    return ()
+                else
+                    let! key = KeyBuilder.ofValues values
+
+                    let! found =
+                        Dml.getByPrimaryKeyBytesWithTxnMask store check.Parent key visible txn check.ProbeMask
+
+                    if found.IsSome then
+                        return ()
+                    else
+                        let fk = check.Definition
+
+                        return!
+                            sprintf
+                                "外部キー制約に違反: %s(%s) が参照する %s(%s) の行がありません"
+                                schema.Name
+                                (System.String.Join(", ", fk.Columns))
+                                fk.ParentTable
+                                (System.String.Join(", ", fk.ParentColumns))
+                            |> DbError.constraintViolation
+                            |> err
+            })
+        |> all
+        |> Result.map ignore
 
     /// 親を参照している子の検査を準備する。
     /// 削除行ごとにカタログを引き直さないよう、文の実行前に 1回だけ呼ぶ。

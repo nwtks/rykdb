@@ -295,6 +295,8 @@ module internal ExecState =
     /// 同じ keyspace を走査しながら書くため、1チャンク書くたびに新しい store で
     /// `lastKey` から走査し直す。走査中に compaction がファイルを消しても、
     /// 古いスナップショットのファイルを開き続けない。
+    /// 起動時の後始末は `RowStore.clearKeyspaceChunks` を使う
+    /// （その時点には `ExecState` が無い）。
     /// </remarks>
     let private clearSpaceChunksResult (space: string) (state: ExecState) =
         let rec loop (st: ExecState) startKey =

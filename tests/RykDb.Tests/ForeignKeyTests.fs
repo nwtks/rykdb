@@ -151,6 +151,45 @@ let ``ForeignKey.checkChildRow: NULL を含む外部キーは親を要求しな�
         Assert.Equal<int64>(1L, countOf db1 "c"))
 
 [<Fact>]
+let ``ForeignKey.checkChildRow: 自分自身を参照する行を INSERT できる`` () =
+    withSession "fk-self-insert" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE emp (id INTEGER PRIMARY KEY, mgr INTEGER REFERENCES emp (id))"
+
+        // 行を積んだ後の状態で検査するので、自分の主キーを親にできる。
+        let db2 = exec db1 "INSERT INTO emp VALUES (1, 1)"
+        Assert.Equal<int64>(1L, countOf db2 "emp"))
+
+[<Fact>]
+let ``ForeignKey.checkChildRow: 同一文の先行行は参照できるが後続行は参照できない`` () =
+    withSession "fk-self-batch" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE emp (id INTEGER PRIMARY KEY, mgr INTEGER REFERENCES emp (id))"
+
+        // 先行行（1）は既に transaction に積まれているので見える。
+        let db2 = exec db1 "INSERT INTO emp VALUES (1, NULL), (2, 1)"
+        Assert.Equal<int64>(2L, countOf db2 "emp")
+
+        // 後続行（3）はまだ書かれていないので見えない（行単位の即時検査）。
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "後続行を参照する INSERT が通りました"
+            (execSql db2 "INSERT INTO emp VALUES (3, 4), (4, NULL)")
+
+        Assert.Equal<int64>(2L, countOf db2 "emp"))
+
+[<Fact>]
+let ``ForeignKey.checkChildRow: UPDATE で自分自身を親にできる`` () =
+    withSession "fk-self-update" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE emp (id INTEGER PRIMARY KEY, mgr INTEGER REFERENCES emp (id))"
+
+        let db2 = exec db1 "INSERT INTO emp VALUES (1, NULL)"
+        let db3 = exec db2 "UPDATE emp SET mgr = id"
+        let _, result = ok (execSql db3 "SELECT mgr FROM emp")
+        Assert.Equal<int64>(1L, asInt result.Rows.[0].[0]))
+
+[<Fact>]
 let ``ForeignKey.checkChildRow: INSERT ... SELECT でも検査する`` () =
     withParentChild "fk-insert-select" (fun db0 ->
         let db1 = exec db0 "INSERT INTO p VALUES (1, 'a')"

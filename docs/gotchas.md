@@ -668,6 +668,14 @@ SDK更新後は`dotnet build tools/TailAudit/TailAudit.fsproj -t:Rebuild`を実�
 `DisableImplicitLibraryPacksFolder=true`でnuget.orgへ固定する。
 ロック更新時は古いFSharp.Coreパッケージキャッシュを消して`dotnet restore --force-evaluate`を実行する。
 
+### 9.16 レコードのフィールド名はメンバー解決を横取りする
+
+`Ast.fs`の`Membership`は`Contains: SqlValue -> DbResult<TruthValue>`というフィールドを持つ。
+この状態で`Set<int>`に`xs.Contains`と書くと、F#はレコードフィールド`Membership.Contains`を優先し、
+`xs`を`Membership`と推論して型エラーになる
+（`List.exists`に`SqlValue -> DbResult<TruthValue>`を渡した、という分かりにくいメッセージになる）。
+集合・辞書では`Set.contains p xs`のようにモジュール関数で書く。
+
 ---
 
 ## 10. テストとデバッグ
@@ -713,6 +721,12 @@ FSIでの相対パス参照を確認し、コピーしたDLLを参照しない�
 
 Fantomas後は`dotnet build -t:Rebuild`を必ず実行する。
 FS0020など整形後の警告を検出する。
+
+### 10.10 スピルの残留ファイルは全体テストを落とす
+
+`ExtSortTests`の一部は一時ディレクトリ全体を見て「一時ファイルが残っていない」ことを検査する。
+テストホストが途中でクラッシュして`/tmp/rykdb-sort-*`が残ると、関係のない回帰が落ちる。
+先に`rm -f /tmp/rykdb-sort-*`で掃除してから再実行する。
 
 ---
 
