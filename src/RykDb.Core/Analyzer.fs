@@ -204,25 +204,54 @@ module internal Analyzer =
                 let prefix = List.truncate indices.Length names
                 reorder prefix |> Option.map (fun reordered -> reordered, prefix)
 
-    /// 右部分木が `Scan`（`Filter` を重ねてもよい）なら、実行時に評価する述語を返す。
+    /// 右部分木の `Scan`（`Filter` を重ねてもよい）から、
+    /// 走査名・走査方法・residual の述語を返す。
     /// インデックス入れ子ループは右部分木を実行しないため、
     /// `Filter` の述語は residual として結合時に評価する
     /// （捨てると WHERE の pushdown が消えて結果が変わる）。
-    /// ただし `PkLookup` / `IndexLookup` は等値述語を走査が吸収して `Filter` から消えるため、
-    /// 右部分木を実行しない INL では述語を再評価できない。
-    /// ここでは対象外にしてハッシュ / マージ / 入れ子ループへ回す（右部分木が実行される）。
-    /// `RangeScan` / `IndexRangeScan` の範囲述語は `Filter` に残るので対象にできる。
-    let private indexableRight =
+    let private scanOfRight =
         let rec unwrap preds =
             function
-            | Logical.Scan(_, ScanMethod.SeqScan)
-            | Logical.Scan(_, ScanMethod.RangeScan _)
-            | Logical.Scan(_, ScanMethod.IndexRangeScan _) -> Some preds
-            | Logical.Scan _ -> None
+            | Logical.Scan(name, method) -> Some(name, method, preds)
             | Logical.Filter(p, child) -> unwrap (p :: preds) child
             | _ -> None
 
         unwrap []
+
+    /// 走査方法が吸収した等値述語を `Expr` に再構成する。
+    /// `Analyzer.impliedByScan` は `PkLookup` / `IndexLookup` が保証する等値を
+    /// `Filter` から除くため、INL では residual に戻さないと結果が変わる。
+    /// 索引が見つからない・値の数が合わないなど再構成できないときは None を返し、INL にしない。
+    let private absorbedPredicates (rightTable: TableSchema) (rightName: string) =
+        let column name =
+            Expr.Column
+                {
+                    Qualifier = Some rightName
+                    Name = name
+                }
+
+        let equality name value =
+            Expr.Binary(BinaryOp.Eq, column name, Expr.Value value)
+
+        function
+        | ScanMethod.PkLookup values ->
+            let pkNames =
+                rightTable.PrimaryKey
+                |> List.choose (fun i -> rightTable.Columns |> List.tryItem i |> Option.map _.Name)
+
+            if pkNames.Length = values.Length then
+                Some(List.map2 equality pkNames (List.ofArray values))
+            else
+                None
+        | ScanMethod.IndexLookup(indexName, values) ->
+            rightTable.Indexes
+            |> List.tryFind (fun i -> Catalog.eqName i.Name indexName)
+            |> Option.bind (fun idx ->
+                if values.Length <= idx.Columns.Length then
+                    Some(List.map2 equality (List.truncate values.Length idx.Columns) (List.ofArray values))
+                else
+                    None)
+        | _ -> Some []
 
     /// 見積りの作業項目（明示スタック。「深さ優先の後置評価」を末尾再帰で回す）。
     type private EstimateWork =
@@ -281,7 +310,7 @@ module internal Analyzer =
     /// 結合アルゴリズムを選ぶ。
     /// - 等値キーなし: 入れ子ループ
     /// - 左が小さい（上限 32行）かつ右を主キー / 索引の前置で引ける: インデックス入れ子ループ
-    ///   （右の `Filter` の述語は residual として評価する）
+    ///   （右の `Filter` の述語と、走査が吸収した等値を residual として評価する）
     /// - 両入力が結合キー順に走査できる: マージ結合
     /// - それ以外の等値結合: ハッシュ結合
     let chooseJoinAlgorithm
@@ -439,10 +468,12 @@ module internal Analyzer =
         | None -> JoinAlgorithm.NestedLoop, None, None
         | Some keys ->
             let lookup =
-                match indexableRight rightTree, rightTable with
-                | Some rightPreds, Some table ->
-                    rightLookupForJoin rightSchema table keys
-                    |> Option.map (fun (target, leftIndices) -> target, leftIndices, rightPreds)
+                match scanOfRight rightTree, rightTable with
+                | Some(rightName, method, rightPreds), Some table ->
+                    absorbedPredicates table rightName method
+                    |> Option.bind (fun absorbed ->
+                        rightLookupForJoin rightSchema table keys
+                        |> Option.map (fun (target, leftIndices) -> target, leftIndices, rightPreds @ absorbed))
                 | _ -> None
 
             match lookup with

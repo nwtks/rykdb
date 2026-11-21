@@ -14,6 +14,7 @@ module private UnlimitedOpsJoin =
     let innerJoin = OpsJoin.innerJoin MemoryBudget.Unlimited
     let leftJoin = OpsJoin.leftJoin MemoryBudget.Unlimited
     let innerJoinHash = OpsJoin.innerJoinHash MemoryBudget.Unlimited
+    let innerJoinHashBuildLeft = OpsJoin.innerJoinHashBuildLeft MemoryBudget.Unlimited
     let leftJoinHash = OpsJoin.leftJoinHash MemoryBudget.Unlimited
     let innerJoinMerge = OpsJoin.innerJoinMerge MemoryBudget.Unlimited
     let leftJoinMerge = OpsJoin.leftJoinMerge MemoryBudget.Unlimited
@@ -44,6 +45,86 @@ let private dupRight () =
     Op.ofArray [| for i in 0..23 -> [| SqlValue.Int(int64 (i % 8)) |] |]
 
 let private onEq = Expr.Binary(BinaryOp.Eq, lcol, rcol)
+
+/// 複合キー (a, b) と、結果の同一性を確かめるための値 v を持つスキーマ。
+let private diffLeftSchema =
+    outSchema
+        [
+            outCol "a" (Some "l") (Some DataType.Integer)
+            outCol "b" (Some "l") (Some DataType.Integer)
+            outCol "v" (Some "l") (Some DataType.Integer)
+        ]
+
+let private diffRightSchema =
+    outSchema
+        [
+            outCol "a" (Some "r") (Some DataType.Integer)
+            outCol "b" (Some "r") (Some DataType.Integer)
+            outCol "v" (Some "r") (Some DataType.Integer)
+        ]
+
+let private diffColumn side name =
+    Expr.Column { Qualifier = Some side; Name = name }
+
+let private diffKeyEq =
+    Expr.Binary(
+        BinaryOp.And,
+        Expr.Binary(BinaryOp.Eq, diffColumn "l" "a", diffColumn "r" "a"),
+        Expr.Binary(BinaryOp.Eq, diffColumn "l" "b", diffColumn "r" "b")
+    )
+
+let private diffResidual =
+    Expr.Binary(BinaryOp.Lt, diffColumn "l" "v", diffColumn "r" "v")
+
+/// NULL を最小としてキー列を比較する（マージ結合用の整列）。
+let private compareDiffKeys (a: SqlValue array) (b: SqlValue array) =
+    let rec go i =
+        if i >= 2 then
+            0
+        else
+            match a.[i], b.[i] with
+            | SqlValue.Null, SqlValue.Null -> go (i + 1)
+            | SqlValue.Null, _ -> -1
+            | _, SqlValue.Null -> 1
+            | x, y ->
+                match SqlValue.compareValuesV x y with
+                | DbOk 0 -> go (i + 1)
+                | DbOk c -> c
+                | DbErr _ -> 0
+
+    go 0
+
+/// 重複キー・NULL キー・複合キーを含むランダムな行。
+let private diffRows (seed: int) (count: int) =
+    let rnd = System.Random(seed)
+
+    Array.init count (fun i ->
+        let key modulus =
+            if rnd.Next(0, 8) = 0 then
+                SqlValue.Null
+            else
+                SqlValue.Int(int64 (rnd.Next(0, modulus)))
+
+        [| key 5; key 4; SqlValue.Int(int64 i) |])
+
+/// 右テーブルの索引探索を模した lookup（キーは `compareValuesV` で比較する）。
+let private diffLookup (rows: SqlValue array array) (keys: int array) (key: SqlValue array) : Result<Op, DbError> =
+    let sameKey (row: SqlValue array) =
+        let rec go i =
+            if i >= keys.Length then
+                true
+            else
+                match SqlValue.compareValuesV row.[keys.[i]] key.[i] with
+                | DbOk 0 -> go (i + 1)
+                | _ -> false
+
+        go 0
+
+    rows |> Array.filter sameKey |> Op.ofArray |> ret
+
+let private assertSameRows (label: string) (expected: SqlValue array array) (actual: SqlValue array array) =
+    if rowsText expected <> rowsText actual then
+        Assert.Fail(sprintf "%s: 結果が一致しません\n期待: %s\n実際: %s" label (rowsText expected) (rowsText actual))
 
 [<Fact>]
 let ``結合: INNER JOIN`` () =
@@ -163,6 +244,104 @@ let ``結合: ハッシュ結合は残りの ON 句を評価する`` () =
 
     Assert.Equal<int>(1, rows.Length)
     Assert.Equal<int64>(20L, asInt rows.[0].[3])
+
+[<Fact>]
+let ``結合: 左 build のハッシュ INNER JOIN は右 build と同じ行を返す`` () =
+    let baseline =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.innerJoinHash
+                        leftSchema
+                        (dupLeft ())
+                        [| 0 |]
+                        rightSchema
+                        (dupRight ())
+                        [| 0 |]
+                        None
+                )
+            )
+        )
+
+    let buildLeft =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.innerJoinHashBuildLeft
+                        leftSchema
+                        (dupLeft ())
+                        [| 0 |]
+                        rightSchema
+                        (dupRight ())
+                        [| 0 |]
+                        None
+                )
+            )
+        )
+
+    Assert.Equal<string>(rowsText baseline, rowsText buildLeft)
+
+    // NULL キーはどちらの build 側でも一致しない。
+    let leftWithNull = Op.ofArray [| [| SqlValue.Null |]; [| SqlValue.Int 2L |] |]
+    let rightWithNull = Op.ofArray [| [| SqlValue.Null |]; [| SqlValue.Int 2L |] |]
+
+    let nullRows =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.innerJoinHashBuildLeft
+                        leftSchema
+                        leftWithNull
+                        [| 0 |]
+                        rightSchema
+                        rightWithNull
+                        [| 0 |]
+                        None
+                )
+            )
+        )
+
+    Assert.Equal<int>(1, nullRows.Length)
+    Assert.Equal<int64>(2L, asInt nullRows.[0].[0])
+
+[<Fact>]
+let ``結合: 左 build のハッシュ INNER JOIN は左の退避時も結果が同じ`` () =
+    withDir "join-hash-build-left-spill" (fun dir ->
+        let baseline =
+            ok (
+                Op.toArray (
+                    ok (
+                        UnlimitedOpsJoin.innerJoinHash
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        let spilled =
+            ok (
+                Op.toArray (
+                    ok (
+                        OpsJoin.innerJoinHashBuildLeft
+                            (tightBudget dir 1L)
+                            leftSchema
+                            (dupLeft ())
+                            [| 0 |]
+                            rightSchema
+                            (dupRight ())
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        assertNoLeftovers dir)
 
 [<Fact>]
 let ``結合: マージ INNER JOIN は重複キーを掛け合わせる`` () =
@@ -344,6 +523,235 @@ let ``結合: インデックス入れ子ループ（INNER / LEFT）`` () =
     Assert.Equal<int>(2, leftRows.Length)
     Assert.True(SqlValue.isNull leftRows.[0].[1])
     Assert.Equal<int64>(2L, asInt leftRows.[1].[1])
+
+[<Fact>]
+let ``結合: 4つのアルゴリズムは INNER で同じ行を返す`` () =
+    let leftRows = diffRows 20261121 80
+    let rightRows = diffRows 20261122 60
+    let keys = [| 0; 1 |]
+    let on = Expr.Binary(BinaryOp.And, diffKeyEq, diffResidual)
+
+    let baseline =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.innerJoin
+                        diffLeftSchema
+                        (Op.ofArray leftRows)
+                        diffRightSchema
+                        (Op.ofArray rightRows)
+                        on
+                )
+            )
+        )
+
+    let hashed =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.innerJoinHash
+                        diffLeftSchema
+                        (Op.ofArray leftRows)
+                        keys
+                        diffRightSchema
+                        (Op.ofArray rightRows)
+                        keys
+                        (Some diffResidual)
+                )
+            )
+        )
+
+    let sortedRows (rows: SqlValue array array) = rows |> Array.sortWith compareDiffKeys
+
+    let merged =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.innerJoinMerge
+                        diffLeftSchema
+                        (Op.ofArray (sortedRows leftRows))
+                        keys
+                        diffRightSchema
+                        (Op.ofArray (sortedRows rightRows))
+                        keys
+                        (Some diffResidual)
+                )
+            )
+        )
+
+    let indexed =
+        ok (
+            Op.toArray (
+                UnlimitedOpsJoin.innerJoinIndexed
+                    diffLeftSchema
+                    (Op.ofArray leftRows)
+                    keys
+                    diffRightSchema
+                    (Some diffResidual)
+                    (diffLookup rightRows keys)
+            )
+        )
+
+    assertSameRows "HashJoin" baseline hashed
+    assertSameRows "MergeJoin" baseline merged
+    assertSameRows "IndexNestedLoop" baseline indexed
+
+[<Fact>]
+let ``結合: 4つのアルゴリズムは LEFT で同じ行を返す`` () =
+    let leftRows = diffRows 20261123 70
+    let rightRows = diffRows 20261124 50
+    let keys = [| 0; 1 |]
+
+    let baseline =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.leftJoin
+                        diffLeftSchema
+                        (Op.ofArray leftRows)
+                        diffRightSchema
+                        (Op.ofArray rightRows)
+                        diffKeyEq
+                )
+            )
+        )
+
+    let hashed =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.leftJoinHash
+                        diffLeftSchema
+                        (Op.ofArray leftRows)
+                        keys
+                        diffRightSchema
+                        (Op.ofArray rightRows)
+                        keys
+                        None
+                )
+            )
+        )
+
+    let sortedRows (rows: SqlValue array array) = rows |> Array.sortWith compareDiffKeys
+
+    let merged =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.leftJoinMerge
+                        diffLeftSchema
+                        (Op.ofArray (sortedRows leftRows))
+                        keys
+                        diffRightSchema
+                        (Op.ofArray (sortedRows rightRows))
+                        keys
+                        None
+                )
+            )
+        )
+
+    let indexed =
+        ok (
+            Op.toArray (
+                UnlimitedOpsJoin.leftJoinIndexed
+                    diffLeftSchema
+                    (Op.ofArray leftRows)
+                    keys
+                    diffRightSchema
+                    None
+                    (diffLookup rightRows keys)
+            )
+        )
+
+    assertSameRows "HashJoin" baseline hashed
+    assertSameRows "MergeJoin" baseline merged
+    assertSameRows "IndexNestedLoop" baseline indexed
+
+[<Fact>]
+let ``結合: 4つのアルゴリズムは NaN と -0.0 を同じ扱いにする`` () =
+    let nan = System.Double.NaN
+
+    let leftRows =
+        [| [| SqlValue.Real nan |]; [| SqlValue.Real -0.0 |]; [| SqlValue.Real 0.0 |] |]
+
+    let rightRows = [| [| SqlValue.Real nan |]; [| SqlValue.Real 0.0 |] |]
+    let keys = [| 0 |]
+
+    let baseline =
+        ok (
+            Op.toArray (
+                ok (UnlimitedOpsJoin.innerJoin leftSchema (Op.ofArray leftRows) rightSchema (Op.ofArray rightRows) onEq)
+            )
+        )
+
+    let hashed =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.innerJoinHash
+                        leftSchema
+                        (Op.ofArray leftRows)
+                        keys
+                        rightSchema
+                        (Op.ofArray rightRows)
+                        keys
+                        None
+                )
+            )
+        )
+
+    let compareReal (a: SqlValue array) (b: SqlValue array) =
+        match SqlValue.compareValuesV a.[0] b.[0] with
+        | DbOk c -> c
+        | DbErr _ -> 0
+
+    let merged =
+        ok (
+            Op.toArray (
+                ok (
+                    UnlimitedOpsJoin.innerJoinMerge
+                        leftSchema
+                        (Op.ofArray (Array.sortWith compareReal leftRows))
+                        keys
+                        rightSchema
+                        (Op.ofArray (Array.sortWith compareReal rightRows))
+                        keys
+                        None
+                )
+            )
+        )
+
+    let indexed =
+        ok (
+            Op.toArray (
+                UnlimitedOpsJoin.innerJoinIndexed
+                    leftSchema
+                    (Op.ofArray leftRows)
+                    keys
+                    rightSchema
+                    None
+                    (diffLookup rightRows keys)
+            )
+        )
+
+    Assert.Equal<int>(3, baseline.Length)
+    assertSameRows "HashJoin" baseline hashed
+    assertSameRows "MergeJoin" baseline merged
+    assertSameRows "IndexNestedLoop" baseline indexed
+
+[<Fact>]
+let ``結合: マージ LEFT JOIN は右が先に尽きても左を NULL 拡張する`` () =
+    let left = Op.ofArray [| [| SqlValue.Int 0L |]; [| SqlValue.Int 2L |] |]
+    let right = Op.ofArray [| [| SqlValue.Int 1L |] |]
+
+    let rows =
+        ok (Op.toArray (ok (UnlimitedOpsJoin.leftJoinMerge leftSchema left [| 0 |] rightSchema right [| 0 |] None)))
+
+    Assert.Equal<int>(2, rows.Length)
+    Assert.Equal<int64>(0L, asInt rows.[0].[0])
+    Assert.True(SqlValue.isNull rows.[0].[1])
+    Assert.Equal<int64>(2L, asInt rows.[1].[0])
+    Assert.True(SqlValue.isNull rows.[1].[1])
 
 [<Fact>]
 let ``結合: INNER JOIN の ON 評価失敗は Error になる`` () =
@@ -648,6 +1056,27 @@ let ``結合: マージの LEFT JOIN もグループを退避すると NULL 拡�
             )
 
         Assert.Equal<string>(rowsText baseline, rowsText spilled)
+        assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: ハッシュ結合のパーティションは早期終了でも残らない`` () =
+    withDir "join-hash-partition-scope" (fun dir ->
+        let scope = ScanScope()
+
+        let budget =
+            { tightBudget dir 1L with
+                Scope = Some scope
+            }
+
+        let op =
+            ok (OpsJoin.innerJoinHash budget leftSchema (dupLeft ()) [| 0 |] rightSchema (dupRight ()) [| 0 |] None)
+
+        match Op.next op with
+        | OpStep.OpRow _ -> ()
+        | other -> failActual "最初の行を取り出せません" other
+
+        // Engine の早期終了（LIMIT / エラー）相当。
+        scope.DisposeAll()
         assertNoLeftovers dir)
 
 [<Fact>]

@@ -88,7 +88,7 @@ let ``Analyzer.chooseJoinAlgorithm: 左が小さく右を引けるなら IndexNe
     | other -> failActual "NestedLoop ではありません" other
 
 [<Fact>]
-let ``Analyzer.chooseJoinAlgorithm: 右の PkLookup / IndexLookup は IndexNestedLoop にしない`` () =
+let ``Analyzer.chooseJoinAlgorithm: 右の PkLookup / IndexLookup は吸収済み述語を residual に戻す`` () =
     let leftTable =
         {
             Name = "l"
@@ -130,7 +130,7 @@ let ``Analyzer.chooseJoinAlgorithm: 右の PkLookup / IndexLookup は IndexNeste
         | "r" -> Some rightTable
         | _ -> None
 
-    let assertNotInl method =
+    let assertResidual method =
         match
             Analyzer.chooseJoinAlgorithm
                 tableOf
@@ -141,15 +141,17 @@ let ``Analyzer.chooseJoinAlgorithm: 右の PkLookup / IndexLookup は IndexNeste
                 (Logical.Scan("r", method))
                 on
         with
-        | (JoinAlgorithm.IndexNestedLoop _, _, _) as other ->
-            failActual "吸収済み述語を落とす右スキャンで IndexNestedLoop を選んでいます" other
-        | _ -> ()
+        | JoinAlgorithm.IndexNestedLoop _, Some keys, Some _ ->
+            match keys.Residual with
+            | Some p -> Assert.Contains("r.a", Expr.toDisplayString p)
+            | None -> Assert.Fail("吸収済み述語が residual に入っていません")
+        | other -> failActual "IndexNestedLoop ではありません" other
 
-    // PkLookup / IndexLookup は等値述語を走査が吸収するため、右部分木を実行しない INL では使えない。
-    assertNotInl (ScanMethod.PkLookup [| SqlValue.Int 1L |])
-    assertNotInl (ScanMethod.IndexLookup("ix_r_a", [| SqlValue.Int 1L |]))
+    // PkLookup / IndexLookup が吸収した等値を residual に戻して INL を使う。
+    assertResidual (ScanMethod.PkLookup [| SqlValue.Int 1L |])
+    assertResidual (ScanMethod.IndexLookup("ix_r_a", [| SqlValue.Int 1L |]))
 
-    // SeqScan なら従来どおり INL。
+    // 索引が見つからない場合は INL にしない（再構成できない）。
     match
         Analyzer.chooseJoinAlgorithm
             tableOf
@@ -157,11 +159,11 @@ let ``Analyzer.chooseJoinAlgorithm: 右の PkLookup / IndexLookup は IndexNeste
             rightSchema
             (Some rightTable)
             leftSmall
-            (Logical.Scan("r", ScanMethod.SeqScan))
+            (Logical.Scan("r", ScanMethod.IndexLookup("ix_missing", [| SqlValue.Int 1L |])))
             on
     with
-    | JoinAlgorithm.IndexNestedLoop _, _, _ -> ()
-    | other -> failActual "SeqScan の右で IndexNestedLoop ではありません" other
+    | JoinAlgorithm.IndexNestedLoop _, _, _ -> Assert.Fail "索引が無いのに IndexNestedLoop を選んでいます"
+    | _ -> ()
 
 [<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致するときだけマージ結合`` () =

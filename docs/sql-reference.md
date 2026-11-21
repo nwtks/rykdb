@@ -571,7 +571,8 @@ SELECT * FROM t WHERE a = 1 AND b = 2; -- IndexLookup
 | 等値結合キーがあるが上記でない                       | Hash Join         |
 | 等値結合キーがない                                   | Nested Loop       |
 
-右部分木が`PkLookup` / `IndexLookup`の場合は、吸収済みの述語を再評価できないため INL にしない。
+右部分木が`PkLookup` / `IndexLookup`の場合は、走査が吸収した等値をresidualへ戻してINLを使う。
+再構成できない場合はINLにしない。
 
 等値キーは列の型が一致する場合だけ使う。
 型が異なる場合はNested Loopになる。
@@ -579,13 +580,16 @@ SELECT * FROM t WHERE a = 1 AND b = 2; -- IndexLookup
 `NULL`は `=`で一致しない。
 `LEFT JOIN`では一致しない左行へ `NULL`を補う。
 
+ハッシュ結合は、`INNER JOIN`では推定行数の小さい側をbuildする（`EXPLAIN`では`HashJoin(left)`と表示する）。
+`LEFT JOIN`は常に右をbuildする。
+
 結合順は次の順で決める。
 
-1. 結合述語で繋がっているか
-2. 推定行数が少ないか
-3. `FROM`で先に書かれているか
+1. 中間結果の推定行数が小さいか
+2. `FROM`で先に書かれているか
 
-推定行数は統計ではなく、走査方法と `Filter`の数から決める。
+推定行数は統計ではなく、走査方法・`Filter` の数・結合述語の本数から決める。
+結合述語1本ごとに選択性を1/10と見積もり、述語で繋がらない候補は直積として見積もる。
 
 `SELECT *`の列順は結合順を並べ替えても、`FROM`に書いた論理順を維持する。
 

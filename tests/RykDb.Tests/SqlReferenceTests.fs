@@ -1499,17 +1499,32 @@ let ``SqlReference: インデックス入れ子ループは右の吸収済み述
         let db5 = exec db4 "INSERT INTO p VALUES (1,'p1'),(2,'p2')"
         let db6 = exec db5 "INSERT INTO c VALUES (1,1,10,'c1'),(2,1,20,'c2'),(3,2,99,'c3')"
 
+        let planText (sql: string) =
+            let _, plan = ok (execSql db6 ("EXPLAIN " + sql))
+
+            plan.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+
         // 右の主キー等値は INL の lookup に吸収されず、residual として評価される必要がある。
         let _, byPk =
             ok (execSql db6 "SELECT c.id FROM p JOIN c ON p.id = c.pid WHERE p.id = 1 AND c.id = 3")
 
         Assert.Empty byPk.Rows
 
+        Assert.Contains(
+            "IndexNestedLoop",
+            planText "SELECT c.id FROM p JOIN c ON p.id = c.pid WHERE p.id = 1 AND c.id = 3"
+        )
+
         // 右の索引等値も同様。
         let _, byIndex =
             ok (execSql db6 "SELECT c.id FROM p JOIN c ON p.id = c.pid WHERE p.id = 1 AND c.k = 99")
 
         Assert.Empty byIndex.Rows
+
+        Assert.Contains(
+            "IndexNestedLoop",
+            planText "SELECT c.id FROM p JOIN c ON p.id = c.pid WHERE p.id = 1 AND c.k = 99"
+        )
 
         // 一致する側は 1 行。
         let _, matched =
@@ -1525,6 +1540,27 @@ let ``SqlReference: インデックス入れ子ループは右の吸収済み述
 
         Assert.Equal<int>(1, rightRange.Rows.Length)
         Assert.Equal<int64>(2L, asInt rightRange.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: 左が小さいハッシュ結合は左を build する`` () =
+    withSession "join-hash-build-left" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db2 = exec db1 "CREATE INDEX ix_s_k ON s (k)"
+        let db3 = exec db2 "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db4 = exec db3 "INSERT INTO s VALUES (1,10),(2,20)"
+        let db5 = exec db4 "INSERT INTO b VALUES (1,10),(2,20)"
+
+        let sql = "SELECT s.id, b.id FROM s JOIN b ON s.k = b.k WHERE s.k = 10"
+        let _, rows = ok (execSql db5 sql)
+        Assert.Equal<int>(1, rows.Rows.Length)
+        Assert.Equal<int64>(1L, asInt rows.Rows.[0].[0])
+        Assert.Equal<int64>(1L, asInt rows.Rows.[0].[1])
+
+        let _, plan = ok (execSql db5 ("EXPLAIN " + sql))
+
+        let text = plan.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+
+        Assert.Contains("HashJoin(left)", text))
 
 [<Fact>]
 let ``SqlReference: JOIN の並べ替え後も SELECT * は FROM 順の列を返す`` () =
@@ -3088,6 +3124,35 @@ let ``SqlReference: 結合順が並べ替えられても結果は同じ`` () =
         Assert.Equal<int64>(10L, asInt reordered.Rows.[0].[0])
         Assert.Equal<int64>(10L, asInt reordered.Rows.[0].[1])
         Assert.Equal<int64>(10L, asInt reordered.Rows.[0].[2]))
+
+[<Fact>]
+let ``SqlReference: 結合順は中間行数の見積りで決まる`` () =
+    // c は a との結合述語を 2 本持つ（ON と昇格した WHERE）。
+    // b は 1 本だけなので、c を先に結合した方が中間行数が小さい。
+    withSession "join-order-edges" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, k1 INTEGER)"
+        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER)"
+        let db4 = exec db3 "INSERT INTO a VALUES (1,10,100),(2,20,200)"
+        let db5 = exec db4 "INSERT INTO b VALUES (1,10),(2,20)"
+        let db6 = exec db5 "INSERT INTO c VALUES (1,10,100),(2,20,200)"
+
+        let sql =
+            "SELECT a.id FROM a JOIN b ON a.k1 = b.k1 JOIN c ON a.k1 = c.k1 WHERE a.k2 = c.k2"
+
+        let _, rows = ok (execSql db6 sql)
+        Assert.Equal<int>(2, rows.Rows.Length)
+
+        let _, plan = ok (execSql db6 ("EXPLAIN " + sql))
+
+        let lines = plan.Rows |> Array.map (fun row -> asText row.[0])
+
+        let indexOf (text: string) =
+            lines |> Array.findIndex (fun (line: string) -> line.Contains text)
+
+        // 左深木では最後に結合したテーブルが外側（先に出力）になる。
+        // c を先に結合するので、外側が b、内側が c になる。
+        Assert.True(indexOf "right=c" > indexOf "right=b", String.concat "\n" lines))
 
 [<Fact>]
 let ``SqlReference: 並べ替えても LEFT JOIN の NULL 拡張は変わらない`` () =

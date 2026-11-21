@@ -5,6 +5,23 @@
 namespace RykDb.Core
 
 module internal Optimizer =
+    /// ハッシュ結合の build 側。
+    /// 左が小さいときは左を build して右を 1回だけ流す。
+    type private HashBuildSide =
+        | HashBuildRight
+        | HashBuildLeft
+
+    /// ハッシュ結合の build 側を推定行数で決める。
+    /// LEFT JOIN は左行を保存する必要があるため常に右を build する。
+    let private hashBuildSide (algorithm: JoinAlgorithm) (kind: JoinKind) (left: Logical) (right: Logical) =
+        match algorithm, kind with
+        | JoinAlgorithm.HashJoin, JoinKind.Inner ->
+            if Analyzer.estimateRows left < Analyzer.estimateRows right then
+                HashBuildLeft
+            else
+                HashBuildRight
+        | _ -> HashBuildRight
+
     /// Join の結合待ち情報。
     /// 右部分木の Op は左部分木を評価した後に作る
     /// （評価順を left → right → join に保つため）。
@@ -22,6 +39,8 @@ module internal Optimizer =
             Keys: JoinKeys option
             /// インデックス列順の左キー位置
             LeftKeyIndices: int array
+            /// ハッシュ結合の build 側
+            BuildSide: HashBuildSide
         }
 
     /// 評価待ちの処理。
@@ -266,6 +285,7 @@ module internal Optimizer =
                     Algorithm = algorithm
                     Keys = keys
                     LeftKeyIndices = defaultArg leftKeyIndices [||]
+                    BuildSide = hashBuildSide algorithm kind left right
                 }
 
             frame, leftSchema
@@ -365,13 +385,28 @@ module internal Optimizer =
             match frame.Keys with
             | None -> err (DbError.internalError "index nested loop に結合キーがありません")
             | Some keys ->
-                let rightMask =
+                let baseMask =
                     match rightScanOf frame.Right with
                     | Some scan ->
                         match ctx.ScanNeeds.TryGetValue(box scan) with
                         | true, mask -> mask
                         | _ -> Array.create frame.RightSchema.Columns.Length true
                     | None -> Array.create frame.RightSchema.Columns.Length true
+
+                let residualColumns =
+                    match keys.Residual with
+                    | None -> Set.empty
+                    | Some p ->
+                        Expr.columnRefs p
+                        |> List.choose (fun c ->
+                            match Schema.resolve c frame.RightSchema with
+                            | Ok i -> Some i
+                            | Error _ -> None)
+                        |> Set.ofList
+
+                let rightMask =
+                    Array.init frame.RightSchema.Columns.Length (fun i ->
+                        i < baseMask.Length && baseMask.[i] || Set.contains i residualColumns)
 
                 match frame.Algorithm with
                 | JoinAlgorithm.IndexNestedLoop JoinLookup.PrimaryKey ->
@@ -400,15 +435,27 @@ module internal Optimizer =
                 | Some keys ->
                     match frame.Kind with
                     | JoinKind.Inner ->
-                        OpsJoin.innerJoinHash
-                            ctx.Budget
-                            frame.LeftSchema
-                            left
-                            keys.LeftIndices
-                            frame.RightSchema
-                            right
-                            keys.RightIndices
-                            keys.Residual
+                        match frame.BuildSide with
+                        | HashBuildLeft ->
+                            OpsJoin.innerJoinHashBuildLeft
+                                ctx.Budget
+                                frame.LeftSchema
+                                left
+                                keys.LeftIndices
+                                frame.RightSchema
+                                right
+                                keys.RightIndices
+                                keys.Residual
+                        | HashBuildRight ->
+                            OpsJoin.innerJoinHash
+                                ctx.Budget
+                                frame.LeftSchema
+                                left
+                                keys.LeftIndices
+                                frame.RightSchema
+                                right
+                                keys.RightIndices
+                                keys.Residual
                     | JoinKind.Left ->
                         OpsJoin.leftJoinHash
                             ctx.Budget
@@ -686,11 +733,16 @@ module internal Optimizer =
                 let algorithm, _, _ =
                     Analyzer.chooseJoinAlgorithm (tableOf item.Context) leftSchema rightSchema rightTable left right on
 
+                let algorithmTextValue =
+                    match algorithm, hashBuildSide algorithm kind left right with
+                    | JoinAlgorithm.HashJoin, HashBuildLeft -> "HashJoin(left)"
+                    | _ -> algorithmText algorithm
+
                 let text =
                     sprintf
                         "Join(%s, %s, right=%s, on=%s)"
                         (joinKindText kind)
-                        (algorithmText algorithm)
+                        algorithmTextValue
                         name
                         (Expr.toDisplayString on)
 

@@ -127,7 +127,11 @@ WHERE pushdownで右部分木に付いた `Filter`を実行せずスキャンを
 INNER JOIN のみに安全な pushdown を行い、LEFT JOIN の右側述語は結合後に置く。
 `Analyzer.impliedByScan` が走査方法で保証済みの等値述語を `Filter` から除くため、
 右が `PkLookup` / `IndexLookup` のスキャンでは述語が `Filter` に残らない。
-INL は右部分木を実行しないので、これらの走査を INL に使わない（`Analyzer.indexableRight`）。
+INL は右部分木を実行しないので、吸収済みの等値を `Expr` に再構成して residual へ戻す
+（`Analyzer.absorbedPredicates`）。
+再構成した列は右の列マスクにも追加する。
+含めないと `Unloaded` と比較してしまう（`Optimizer.execIndexJoin`）。
+再構成できないときは INL を選ばない。
 
 ### 3.4 JOIN の対応付けはテーブル名ではなく位置と別名で行う
 
@@ -200,6 +204,14 @@ INL は右部分木を実行しないので、これらの走査を INL に使�
 結合順の並べ替えで行の物理レイアウトは変わるが、`SELECT *` の列順は `FROM` 順でなければならない。
 `Ops.project` は展開用スキーマ（`inSchema` = FROM 順）と評価用スキーマ（`outputOf` = 実際の行レイアウト）を分けて受け取る。
 両者を取り違えるとヘッダと値がずれ、`INSERT ... SELECT *` では誤った列へ書き込む。
+
+### 3.16 ハッシュ結合の build 側とパーティション
+
+`INNER JOIN` のハッシュ結合は推定行数の小さい側を build する。
+左を build した場合に左が退避したら、右を build する通常経路へフォールバックする。
+`LEFT JOIN` は左行を保存するため常に右を build する。
+読み終えたパーティションの run はその場で削除する。
+早期終了で読み切れなかった分は `ScanScope` が閉じて消す。
 
 ---
 
@@ -751,8 +763,11 @@ FS0020など整形後の警告を検出する。
 - [ ] `IN`と`LIKE`が3値論理・進捗を守るか
 - [ ] TEXT・REAL・NULLの比較規則を揃えているか
 - [ ] ハッシュ結合のキーを`compareValuesV`と同じ等値（順序保持符号化）にしているか
+- [ ] INNERハッシュ結合で小さい側をbuildし、LEFTは右をbuildしているか
 - [ ] パーティションしたrunをキー順と仮定していないか
-- [ ] INLで右部分木を実行しないとき、右の`Filter`をresidualに回しているか
+- [ ] 読み終えたパーティションのrunを逐次削除しているか
+- [ ] INLで右部分木を実行しないとき、右の`Filter`と吸収済み述語をresidualに回しているか
+- [ ] residualの列を右の列マスクに含めているか
 - [ ] CASTと暗黙変換を分けているか
 - [ ] 外部キーは参照先を親の主キーへ解決し、型と列順まで検証しているか
 - [ ] 子の `INSERT` / `UPDATE` と親の `DELETE` を即時 RESTRICT で検査しているか

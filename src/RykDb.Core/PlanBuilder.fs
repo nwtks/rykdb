@@ -233,33 +233,47 @@ module internal PlanBuilder =
                     | _ -> None
                 | _ -> None)
 
-        let chooseOrder joined edges items dependencies =
-            let eligible joined name =
-                match dependencies |> Map.tryFind name with
-                | None -> true
-                | Some refs -> Set.isSubset refs (Set.add name joined)
+        let eligible dependencies joined name =
+            match dependencies |> Map.tryFind name with
+            | None -> true
+            | Some refs -> Set.isSubset refs (Set.add name joined)
 
-            let connected joined name =
-                edges
-                |> List.exists (fun e -> Set.contains name e && not (Set.isEmpty (Set.intersect e joined)))
+        let linkCount edges joined name =
+            edges
+            |> List.filter (fun e -> Set.contains name e && not (Set.isEmpty (Set.intersect e joined)))
+            |> List.length
 
-            let rec go joined remaining acc =
+        let nextRows edges joined joinedRows (name, rows, _) =
+            let links = linkCount edges joined name
+
+            if links = 0 then
+                joinedRows * rows
+            else
+                max 1.0 (joinedRows * rows * 0.1 ** float links)
+
+        let chooseOrder initialRows joined edges items dependencies =
+            let rec go joinedRows joined remaining acc =
                 match remaining with
                 | [] -> List.rev acc
                 | _ ->
-                    let ready = remaining |> List.filter (fun (n, _, _) -> eligible joined n)
+                    let ready =
+                        remaining |> List.filter (fun (n, _, _) -> eligible dependencies joined n)
+
                     let pool = if List.isEmpty ready then remaining else ready
-                    let linked, isolated = pool |> List.partition (fun (n, _, _) -> connected joined n)
-                    let choice = if List.isEmpty linked then isolated else linked
 
-                    let name =
-                        choice
-                        |> List.minBy (fun (_, rows, position) -> rows, position)
-                        |> fun (n, _, _) -> n
+                    let name, rows, _ =
+                        pool
+                        |> List.minBy (fun item ->
+                            let _, _, position = item
+                            nextRows edges joined joinedRows item, position)
 
-                    go (Set.add name joined) (remaining |> List.filter (fun (n, _, _) -> n <> name)) (name :: acc)
+                    go
+                        (nextRows edges joined joinedRows (name, rows, 0))
+                        (Set.add name joined)
+                        (remaining |> List.filter (fun (n, _, _) -> n <> name))
+                        (name :: acc)
 
-            go joined items []
+            go initialRows joined items []
 
         let promoteAt joinPredicates joined used next =
             let take, used' =
@@ -339,6 +353,7 @@ module internal PlanBuilder =
                 let order =
                     if dependencies |> List.forall Option.isSome then
                         chooseOrder
+                            (Analyzer.estimateRows acc)
                             joined
                             edges
                             (inner |> List.map (fun (i, _) -> lowerName bindings.[i], estimates.[i], i))

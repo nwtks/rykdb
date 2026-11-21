@@ -324,6 +324,46 @@ module internal OpsJoin =
         | true, bucket -> ret (Op.ofArray bucket)
         | _ -> ret Op.Empty
 
+    /// 左をハッシュ表にした INNER ハッシュ結合の probe。
+    /// 右行ごとに左の一致行を引き、`左行 ++ 右行` の順で返す（列順は通常の JOIN と同じ）。
+    let private joinProbeBuildLeft
+        (leftSchema: Schema)
+        (rightSchema: Schema)
+        (right: Op)
+        (rightKeys: int array)
+        (residual: Expr option)
+        (table: System.Collections.Generic.Dictionary<byte array, SqlValue array array>)
+        =
+        let resolve =
+            Eval.prepare (Schema.concat leftSchema rightSchema) (residualExprs residual)
+
+        let rec probe cur =
+            Op.pull
+                (fun rrow rnext ->
+                    if hasNullKey rrow rightKeys then
+                        Op.next (probe rnext)
+                    else
+                        match encodeKey rrow rightKeys with
+                        | Error e -> OpStep.OpError e
+                        | Ok key ->
+                            match lookupHash table key with
+                            | Error e -> OpStep.OpError e
+                            | Ok rows -> Op.next (emit rrow rnext rows))
+                cur
+
+        and emit rrow rnext rows =
+            Op.compute (fun () ->
+                match Op.next rows with
+                | OpStep.OpError e -> OpStep.OpError e
+                | OpStep.OpDone -> Op.next (probe rnext)
+                | OpStep.OpRow(lrow, rest) ->
+                    match residualMatches resolve lrow rrow residual with
+                    | DbErr e -> OpStep.OpError e
+                    | DbOk false -> Op.next (emit rrow rnext rest)
+                    | DbOk true -> OpStep.OpRow(Array.append lrow rrow, emit rrow rnext rest))
+
+        probe right
+
     /// 結合結果が尽きたら `cleanup` を呼ぶ（退避したファイルを確実に消す）。
     /// `go` は `Op.compute` の継続内の再帰で、1行ごとに 1段だけ進む。
     let private onExhausted (cleanup: unit -> unit) =
@@ -707,7 +747,10 @@ module internal OpsJoin =
                 | Ok(Spill.RowSpool.Memory rightRows) ->
                     match buildHashTable rightRows rightKeys with
                     | Ok table ->
-                        match Spill.reopenKeep budget.Scope lspool with
+                        Spill.forgetSpool budget.Scope rspool
+                        Spill.deleteSpool rspool
+
+                        match Spill.reopen budget.Scope lspool with
                         | Ok l ->
                             let op =
                                 joinProbe
@@ -742,11 +785,11 @@ module internal OpsJoin =
                     Spill.forgetSpool budget.Scope rightSpool
                     Spill.deleteSpool rightSpool
 
-                    match Spill.reopenKeep budget.Scope lspool with
+                    match Spill.reopen budget.Scope lspool with
                     | Ok l ->
                         match sortByJoinKey budget leftKeys l with
                         | Ok sortedLeft ->
-                            match Spill.reopenKeep budget.Scope rspool with
+                            match Spill.reopen budget.Scope rspool with
                             | Ok r ->
                                 match sortByJoinKey budget rightKeys r with
                                 | Ok sortedRight ->
@@ -840,6 +883,29 @@ module internal OpsJoin =
                 Spill.reopen budget.Scope spool
                 >>= fun rightRows ->
                     hashJoinPartitioned false budget leftSchema left leftKeys rightSchema rightRows rightKeys residual
+
+    /// INNER JOIN（ハッシュ結合）。左側をハッシュ表にし、右を 1回だけ流す。
+    /// 左が小さい場合のメモリ使用量を右のサイズから切り離す。
+    /// 左が上限を超えて退避したときは、右を build する通常の経路へフォールバックする。
+    let innerJoinHashBuildLeft
+        (budget: MemoryBudget)
+        (leftSchema: Schema)
+        (left: Op)
+        (leftKeys: int array)
+        (rightSchema: Schema)
+        (right: Op)
+        (rightKeys: int array)
+        (residual: Expr option)
+        =
+        Spill.spool budget left
+        >>= function
+            | Spill.RowSpool.Memory leftRows ->
+                buildHashTable leftRows leftKeys
+                >>= fun table -> ret (joinProbeBuildLeft leftSchema rightSchema right rightKeys residual table)
+            | spool ->
+                Spill.reopen budget.Scope spool
+                >>= fun leftRows ->
+                    innerJoinHash budget leftSchema leftRows leftKeys rightSchema right rightKeys residual
 
     /// LEFT JOIN（ハッシュ結合）。
     let leftJoinHash
