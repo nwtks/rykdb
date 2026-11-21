@@ -11,6 +11,21 @@ type internal JoinOrderItem =
         Name: string
         Rows: float
         Position: int
+        /// このテーブルが持つ索引の列順（INL の可否判定用）。
+        IndexColumns: string list list
+        /// 1行あたりの管理メモリ概算（スピル判定用）。
+        RowBytes: float
+        /// 走査が自然に返す列順（マージ結合の可否判定用）。
+        NaturalOrder: string list option
+    }
+
+/// 結合述語 1 本。`Selectivity` が None なら既定の 0.1 を使う。
+type internal JoinOrderEdge =
+    {
+        Refs: Set<string>
+        Selectivity: float option
+        /// テーブル名 -> その側の結合キー列（複合キーは別の辺に分かれる）。
+        KeyColumns: Map<string, string>
     }
 
 module internal JoinOrder =
@@ -20,8 +35,33 @@ module internal JoinOrder =
         {
             Cost: float
             Rows: float
+            RowBytes: float
+            /// 左深木の出力順（先頭走査の自然順を引き継ぐ）。
+            Ordered: string list option
             Order: int list
         }
+
+    /// 右テーブルを索引で引ける結合辺か。
+    let private canIndexJoin (item: JoinOrderItem) (edge: JoinOrderEdge) =
+        match edge.KeyColumns |> Map.tryFind item.Name with
+        | Some column ->
+            item.IndexColumns
+            |> List.exists (function
+                | head :: _ -> SqlName.equal head column
+                | [] -> false)
+        | None -> false
+
+    /// 両側の自然順が結合キーで揃っているか（マージ結合の可否）。
+    let internal canMergeJoin (ordered: string list option) (item: JoinOrderItem) (edge: JoinOrderEdge) =
+        match ordered, item.NaturalOrder with
+        | Some(leftHead :: _), Some(rightHead :: _) ->
+            match edge.KeyColumns |> Map.tryFind item.Name with
+            | Some rightColumn ->
+                SqlName.equal rightHead rightColumn
+                && (edge.KeyColumns
+                    |> Map.exists (fun name column -> name <> item.Name && SqlName.equal column leftHead))
+            | None -> false
+        | _ -> false
 
     /// まだ結合していないテーブルのうち、ON の参照先が揃っているか。
     let private eligible (dependencies: Map<string, Set<string>>) (joined: Set<string>) (name: string) =
@@ -29,26 +69,30 @@ module internal JoinOrder =
         | None -> true
         | Some refs -> Set.isSubset refs (Set.add name joined)
 
-    /// 追加するテーブルに接する結合述語の本数（既に結合済みの側だけ数える）。
-    let private linkCount (edges: Set<string> list) (joined: Set<string>) (name: string) =
+    /// 追加するテーブルに接する結合述語（既に結合済みの側だけ数える）。
+    let private applicableEdges (edges: JoinOrderEdge list) (joined: Set<string>) (name: string) =
         edges
-        |> List.filter (fun e -> Set.contains name e && not (Set.isEmpty (Set.intersect e joined)))
-        |> List.length
+        |> List.filter (fun e -> Set.contains name e.Refs && not (Set.isEmpty (Set.intersect e.Refs joined)))
 
-    /// テーブルを 1つ追加した後の中間行数（統計なしの選択性 0.1）。
-    let private nextRows (edges: Set<string> list) (joined: Set<string>) (joinedRows: float) (item: JoinOrderItem) =
-        let links = linkCount edges joined item.Name
+    /// テーブルを 1つ追加した後の中間行数。
+    /// 選択性が分からない辺は 0.1 を使う。0 行の入力は 0 のまま返す。
+    let internal nextRows (edges: JoinOrderEdge list) (joined: Set<string>) (joinedRows: float) (item: JoinOrderItem) =
+        let applicable = applicableEdges edges joined item.Name
 
-        if links = 0 then
+        if List.isEmpty applicable then
             joinedRows * item.Rows
         else
-            max 1.0 (joinedRows * item.Rows * 0.1 ** float links)
+            let product =
+                applicable
+                |> List.fold (fun acc e -> acc * (e.Selectivity |> Option.defaultValue 0.1)) (joinedRows * item.Rows)
+
+            if product <= 0.0 then 0.0 else max 1.0 product
 
     /// 現行の貪欲法。先頭テーブルと LEFT の境界は呼び出し側が固定する。
     let greedy
         (initialRows: float)
         (initialJoined: Set<string>)
-        (edges: Set<string> list)
+        (edges: JoinOrderEdge list)
         (items: JoinOrderItem list)
         (dependencies: Map<string, Set<string>>)
         =
@@ -73,6 +117,48 @@ module internal JoinOrder =
 
         go initialRows initialJoined items []
 
+    /// 1テーブル追加時のコスト増分。
+    /// 等値結合はハッシュ / マージ / INL の最小、直積は入れ子ループ。
+    let internal transitionDelta
+        (rows: float)
+        (rowBytes: float)
+        (ordered: string list option)
+        (workMemBytes: float)
+        (applicable: JoinOrderEdge list)
+        (item: JoinOrderItem)
+        (newRows: float)
+        =
+        if List.isEmpty applicable then
+            rows * item.Rows + newRows
+        else
+            let hashDelta =
+                let buildRows = min rows item.Rows
+                let buildRowBytes = if rows < item.Rows then rowBytes else item.RowBytes
+                let buildBytes = buildRows * buildRowBytes
+                let buildPenalty = 0.1 * buildRows
+
+                let spillPenalty =
+                    if workMemBytes >= 0.0 && buildBytes > workMemBytes then
+                        buildRows
+                    else
+                        0.0
+
+                rows + item.Rows + newRows + buildPenalty + spillPenalty
+
+            let mergeDelta =
+                if applicable |> List.exists (canMergeJoin ordered item) then
+                    Some(rows + item.Rows + newRows)
+                else
+                    None
+
+            let inlDelta =
+                if rows <= 32.0 && applicable |> List.exists (canIndexJoin item) then
+                    Some(rows + newRows)
+                else
+                    None
+
+            [ hashDelta ] @ Option.toList mergeDelta @ Option.toList inlDelta |> List.min
+
     /// 同じ `mask` の状態として候補を採用するか。
     /// コストが同じなら FROM の位置順（辞書式）で決める。
     let private isBetter (items: JoinOrderItem array) (candidate: PlanState) (current: PlanState option) =
@@ -87,8 +173,11 @@ module internal JoinOrder =
     /// 適用できないときは None（呼び出し側が貪欲へフォールバックする）。
     let selinger
         (initialRows: float)
+        (initialRowBytes: float)
         (initialJoined: Set<string>)
-        (edges: Set<string> list)
+        (initialOrder: string list option)
+        (workMemBytes: float)
+        (edges: JoinOrderEdge list)
         (items: JoinOrderItem list)
         (dependencies: Map<string, Set<string>>)
         =
@@ -127,6 +216,8 @@ module internal JoinOrder =
                 {
                     Cost = 0.0
                     Rows = initialRows
+                    RowBytes = initialRowBytes
+                    Ordered = initialOrder
                     Order = []
                 }
 
@@ -148,19 +239,25 @@ module internal JoinOrder =
                                     states
                                 else
                                     let newMask = mask ||| bit
-                                    let links = linkCount edges joined item.Name
+                                    let applicable = applicableEdges edges joined item.Name
                                     let newRows = nextRows edges joined state.Rows item
 
                                     let delta =
-                                        if links = 0 then
-                                            state.Rows * item.Rows + newRows
-                                        else
-                                            state.Rows + item.Rows + newRows
+                                        transitionDelta
+                                            state.Rows
+                                            state.RowBytes
+                                            state.Ordered
+                                            workMemBytes
+                                            applicable
+                                            item
+                                            newRows
 
                                     let candidate =
                                         {
                                             Cost = state.Cost + delta
                                             Rows = newRows
+                                            RowBytes = state.RowBytes + item.RowBytes
+                                            Ordered = state.Ordered
                                             Order = state.Order @ [ i ]
                                         }
 
@@ -174,6 +271,6 @@ module internal JoinOrder =
             |> Option.map (fun state -> state.Order |> List.map (fun i -> itemArray.[i].Name))
 
     /// DP が使えれば DP、使えなければ貪欲法。
-    let choose initialRows initialJoined edges items dependencies =
-        selinger initialRows initialJoined edges items dependencies
+    let choose initialRows initialRowBytes initialJoined initialOrder workMemBytes edges items dependencies =
+        selinger initialRows initialRowBytes initialJoined initialOrder workMemBytes edges items dependencies
         |> Option.defaultWith (fun () -> greedy initialRows initialJoined edges items dependencies)

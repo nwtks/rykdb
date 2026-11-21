@@ -652,12 +652,17 @@ let ``Parser: EXPLAIN は SELECT を包む`` () =
 [<Fact>]
 let ``Parser: ANALYZE はテーブル名を受ける`` () =
     match parseOneOk "ANALYZE t" with
-    | Statement.Analyze name -> Assert.Equal<string>("t", name)
+    | Statement.Analyze(Some name) -> Assert.Equal<string>("t", name)
     | other -> failActual "ANALYZE ではない" other
 
     match parseOneOk "ANALYZE TABLE t;" with
-    | Statement.Analyze name -> Assert.Equal<string>("t", name)
+    | Statement.Analyze(Some name) -> Assert.Equal<string>("t", name)
     | other -> failActual "ANALYZE TABLE ではない" other
 
-    expectErrorKind ErrorKind.SyntaxError "ANALYZE だけ" (parseStatement "ANALYZE")
-    expectErrorKind ErrorKind.SyntaxError "ANALYZE TABLE だけ" (parseStatement "ANALYZE TABLE")
+    match parseOneOk "ANALYZE" with
+    | Statement.Analyze None -> ()
+    | other -> failActual "ANALYZE 全テーブルではない" other
+
+    match parseOneOk "ANALYZE TABLE" with
+    | Statement.Analyze None -> ()
+    | other -> failActual "ANALYZE TABLE 全テーブルではない" other

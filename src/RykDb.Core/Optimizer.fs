@@ -798,7 +798,22 @@ module internal Optimizer =
             | [] -> List.rev acc
             | item :: rest ->
                 let text, children = describe item
-                let line = String.replicate item.Indent "  " + text
+
+                let rowSuffix =
+                    if List.isEmpty item.Context.Catalog.Stats then
+                        ""
+                    else
+                        let rows =
+                            Analyzer.estimateRowsWith (fun name -> ExecContext.statsOf name item.Context) item.Tree
+
+                        if System.Double.IsFinite rows then
+                            sprintf " rows=%.0f" rows
+                        elif System.Double.IsPositiveInfinity rows then
+                            " rows=inf"
+                        else
+                            ""
+
+                let line = String.replicate item.Indent "  " + text + rowSuffix
                 emit (line :: acc) (children @ rest)
 
         emit

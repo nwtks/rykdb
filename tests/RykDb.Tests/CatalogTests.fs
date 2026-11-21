@@ -63,6 +63,7 @@ let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
                 Table = "people"
                 RowCount = 3L
                 ColumnNDV = [ "id", 3L; "name", 2L ]
+                Indexes = [ ("ix_name", [ "name" ]) ]
             }
 
         let c = Catalog.addStats stats Catalog.Empty
@@ -70,6 +71,8 @@ let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
         let loaded = ok (Catalog.load store)
         let s = expectSome "people の統計" (Catalog.findStats "PEOPLE" loaded)
         Assert.Equal<int64>(3L, s.RowCount)
+        Assert.Contains(("name", 2L), s.ColumnNDV)
+        Assert.Equal<(string * string list) list>([ ("ix_name", [ "name" ]) ], s.Indexes)
 
         Assert.True(
             Catalog.findStats "people" (Catalog.removeTable "people" loaded)

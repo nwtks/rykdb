@@ -84,6 +84,67 @@ module internal PlanBuilder =
         | Base b -> Analyzer.schemaOf b
         | DerivedSource(_, plan) -> plan.Output
 
+    /// 実テーブル束縛のスキーマ（派生テーブルは None）。
+    let private bindingTableSchema =
+        function
+        | Base b -> Some b.Schema
+        | DerivedSource _ -> None
+
+    /// 1行の管理メモリ概算（列数 × 固定の目安）。
+    let private rowBytesOfColumnCount (count: int) = 32.0 * float count
+
+    /// 等値述語の両側のテーブル名 -> 列名。
+    let private equalityColumns =
+        function
+        | Expr.Binary(BinaryOp.Eq, a, b) ->
+            match Schema.tryAsColumnRef a, Schema.tryAsColumnRef b with
+            | Some ca, Some cb ->
+                match ca.Qualifier, cb.Qualifier with
+                | Some qa, Some qb when not (Catalog.eqName qa qb) ->
+                    Map.ofList [ qa.ToLowerInvariant(), ca.Name; qb.ToLowerInvariant(), cb.Name ]
+                | _ -> Map.empty
+            | _ -> Map.empty
+        | _ -> Map.empty
+
+    /// 走査が自然に返す列順（マージ結合の可否判定用）。
+    let private scanOrderOf (table: TableSchema) =
+        let rec order =
+            function
+            | Logical.Filter(_, child) -> order child
+            | Logical.Scan(_, ScanMethod.SeqScan)
+            | Logical.Scan(_, ScanMethod.PkLookup _)
+            | Logical.Scan(_, ScanMethod.RangeScan _) -> Some(TableSchema.primaryKeyColumns table |> List.ofArray)
+            | Logical.Scan(_, ScanMethod.IndexLookup(index, _))
+            | Logical.Scan(_, ScanMethod.IndexRangeScan(index, _, _)) ->
+                table.Indexes
+                |> List.tryFind (fun i -> Catalog.eqName i.Name index)
+                |> Option.map _.Columns
+            | _ -> None
+
+        order
+
+    /// 結合順の候補を作る。
+    let private joinItem (binding: SourceBinding) (scan: Logical) (rows: float) (position: int) =
+        match binding with
+        | Base tb ->
+            {
+                Name = (bindingName binding).ToLowerInvariant()
+                Rows = rows
+                Position = position
+                IndexColumns = tb.Schema.Indexes |> List.map _.Columns
+                RowBytes = rowBytesOfColumnCount tb.Schema.Columns.Length
+                NaturalOrder = scanOrderOf tb.Schema scan
+            }
+        | DerivedSource(_, plan) ->
+            {
+                Name = (bindingName binding).ToLowerInvariant()
+                Rows = rows
+                Position = position
+                IndexColumns = []
+                RowBytes = rowBytesOfColumnCount plan.Output.Columns.Length
+                NaturalOrder = None
+            }
+
     /// LIMIT / OFFSET の定数式を評価する（0 以上の int）。
     let private evalCount what =
         function
@@ -229,7 +290,11 @@ module internal PlanBuilder =
 
                     match qualifierOf a, qualifierOf b with
                     | Some qa, Some qb when not (Catalog.eqName qa qb) ->
-                        Some(Set.ofList [ qa.ToLowerInvariant(); qb.ToLowerInvariant() ])
+                        Some(
+                            Set.ofList [ qa.ToLowerInvariant(); qb.ToLowerInvariant() ],
+                            conjunct,
+                            equalityColumns conjunct
+                        )
                     | _ -> None
                 | _ -> None)
 
@@ -256,6 +321,7 @@ module internal PlanBuilder =
             scans
             (estimates: float array)
             (estimate: Logical -> float)
+            (edgeSelectivity: Expr -> float option)
             joinPredicates
             acc
             accSchema
@@ -273,6 +339,7 @@ module internal PlanBuilder =
                         scans
                         estimates
                         estimate
+                        edgeSelectivity
                         joinPredicates
                         node
                         schema
@@ -300,8 +367,25 @@ module internal PlanBuilder =
 
                 let edges =
                     (qualifiedOns
-                     |> List.collect (fun (_, _, q) -> q |> Option.map equiLinks |> Option.defaultValue []))
-                    @ (joinPredicates |> Array.toList |> List.map fst)
+                     |> List.collect (fun (_, _, q) ->
+                         match q with
+                         | Some e ->
+                             equiLinks e
+                             |> List.map (fun (refs, conjunct, columns) ->
+                                 {
+                                     Refs = refs
+                                     Selectivity = edgeSelectivity conjunct
+                                     KeyColumns = columns
+                                 })
+                         | None -> []))
+                    @ (joinPredicates
+                       |> Array.toList
+                       |> List.map (fun (refs, p) ->
+                           {
+                               Refs = refs
+                               Selectivity = edgeSelectivity p
+                               KeyColumns = equalityColumns p
+                           }))
 
                 let dependencies =
                     qualifiedOns
@@ -312,17 +396,29 @@ module internal PlanBuilder =
 
                 let order =
                     if dependencies |> List.forall Option.isSome then
+                        let initialOrder =
+                            match bindings with
+                            | first :: _ ->
+                                bindingTableSchema first |> Option.bind (fun schema -> scanOrderOf schema acc)
+                            | [] -> None
+
+                        let initialRowBytes = rowBytesOfColumnCount accSchema.Columns.Length
+
+                        let workMemBytes =
+                            if ctx.Budget.Work >= 0L then
+                                float ctx.Budget.Work
+                            else
+                                -1.0
+
                         JoinOrder.choose
                             (estimate acc)
+                            initialRowBytes
                             joined
+                            initialOrder
+                            workMemBytes
                             edges
                             (inner
-                             |> List.map (fun (i, _) ->
-                                 {
-                                     Name = lowerName bindings.[i]
-                                     Rows = estimates.[i]
-                                     Position = i
-                                 }))
+                             |> List.map (fun (i, _) -> joinItem bindings.[i] scans.[i] estimates.[i] i))
                             (dependencies |> List.choose id |> Map.ofList)
                     else
                         inner |> List.map (fun (i, _) -> lowerName bindings.[i])
@@ -348,6 +444,7 @@ module internal PlanBuilder =
                         scans
                         estimates
                         estimate
+                        edgeSelectivity
                         joinPredicates
                         node
                         schema
@@ -631,6 +728,7 @@ module internal PlanBuilder =
                             scans'
                             estimates
                             (Analyzer.estimateRowsWith statsOf)
+                            (Analyzer.equalitySelectivity statsOf)
                             joinPredicates'
                             scans'.[0]
                             (bindingSchema first)

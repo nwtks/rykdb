@@ -347,6 +347,7 @@ let ``Analyzer.estimateRowsWith: 統計があると基数と結合選択性を�
                     Table = "people"
                     RowCount = 500L
                     ColumnNDV = [ "id", 500L; "age", 10L ]
+                    Indexes = []
                 }
         | "orders" ->
             Some
@@ -354,6 +355,7 @@ let ``Analyzer.estimateRowsWith: 統計があると基数と結合選択性を�
                     Table = "orders"
                     RowCount = 2000L
                     ColumnNDV = [ "oid", 2000L; "person_id", 100L ]
+                    Indexes = []
                 }
         | _ -> None
 
@@ -374,6 +376,119 @@ let ``Analyzer.estimateRowsWith: 統計があると基数と結合選択性を�
     Assert.Equal(2000.0, Analyzer.estimateRowsWith statsOf join)
     // 統計が無いときは従来どおり左右の小さい方
     Assert.Equal(1000.0, estimateRows join)
+
+[<Fact>]
+let ``Analyzer.estimateRowsWith: 一部の等値に統計が無くても既定の選択性で穴埋めする`` () =
+    let statsOf name =
+        match name with
+        | "people" ->
+            Some
+                {
+                    Table = "people"
+                    RowCount = 500L
+                    ColumnNDV = [ "id", 500L; "age", 10L ]
+                    Indexes = []
+                }
+        | "orders" ->
+            Some
+                {
+                    Table = "orders"
+                    RowCount = 2000L
+                    ColumnNDV = [ "oid", 2000L; "person_id", 100L ]
+                    Indexes = []
+                }
+        | _ -> None
+
+    // people.age = orders.v は NDV が無いので 0.1 で穴埋めする。
+    let on =
+        Expr.Binary(
+            BinaryOp.And,
+            Expr.Binary(BinaryOp.Eq, pCol "id", oCol "person_id"),
+            Expr.Binary(BinaryOp.Eq, pCol "age", oCol "amount")
+        )
+
+    let join =
+        Logical.Join(
+            JoinKind.Inner,
+            "orders",
+            on,
+            Logical.Scan("people", ScanMethod.SeqScan),
+            Logical.Scan("orders", ScanMethod.SeqScan)
+        )
+
+    // 500 * 2000 * (1/500) * 0.1 = 200
+    Assert.Equal(200.0, Analyzer.estimateRowsWith statsOf join)
+
+[<Fact>]
+let ``Analyzer.estimateRowsWith: 0 行のテーブルに Filter を付けても 0 行`` () =
+    let statsOf name =
+        if name = "empty" then
+            Some
+                {
+                    Table = "empty"
+                    RowCount = 0L
+                    ColumnNDV = [ ("id", 0L) ]
+                    Indexes = []
+                }
+        else
+            None
+
+    let filtered =
+        Logical.Filter(Expr.Literal(Literal.Int 1L), Logical.Scan("empty", ScanMethod.SeqScan))
+
+    Assert.Equal(0.0, Analyzer.estimateRowsWith statsOf filtered)
+
+[<Fact>]
+let ``Analyzer.estimateRowsWith: Filter は列の NDV と範囲で選択性を見積もる`` () =
+    let statsOf name =
+        if name = "t" then
+            Some
+                {
+                    Table = "t"
+                    RowCount = 500L
+                    ColumnNDV = [ "id", 500L; "v", 5L ]
+                    Indexes = []
+                }
+        else
+            None
+
+    let scan = Logical.Scan("t", ScanMethod.SeqScan)
+
+    let equality =
+        Logical.Filter(
+            Expr.Binary(BinaryOp.Eq, Expr.Column { Qualifier = Some "t"; Name = "v" }, Expr.Literal(Literal.Int 1L)),
+            scan
+        )
+
+    // 500 / NDV 5 = 100
+    Assert.Equal(100.0, Analyzer.estimateRowsWith statsOf equality)
+
+    let range =
+        Logical.Filter(
+            Expr.Binary(BinaryOp.Gt, Expr.Column { Qualifier = Some "t"; Name = "v" }, Expr.Literal(Literal.Int 1L)),
+            scan
+        )
+
+    // 範囲は 1/3
+    Assert.Equal(500.0 / 3.0, Analyzer.estimateRowsWith statsOf range)
+
+[<Fact>]
+let ``Analyzer.estimateRowsWith: IndexLookup は索引前置の NDV を使う`` () =
+    let statsOf name =
+        if name = "t" then
+            Some
+                {
+                    Table = "t"
+                    RowCount = 500L
+                    ColumnNDV = [ "id", 500L; "v", 5L ]
+                    Indexes = [ ("ix_v", [ "v" ]) ]
+                }
+        else
+            None
+
+    let scan = Logical.Scan("t", ScanMethod.IndexLookup("ix_v", [| SqlValue.Int 1L |]))
+    // 500 / NDV 5 = 100（統計が無ければ 500/10 = 50）
+    Assert.Equal(100.0, Analyzer.estimateRowsWith statsOf scan)
 
 [<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`` () =

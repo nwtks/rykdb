@@ -494,8 +494,12 @@ module internal Parser =
 
             result {
                 let! _, st = eatOptionalSemicolon st
-                return Statement.Analyze name, st
+                return Statement.Analyze(Some name), st
             }
+        | Token.Eos
+        | Token.Symbol ";" ->
+            eatOptionalSemicolon st
+            |> Result.map (fun (_, st) -> Statement.Analyze None, st)
         | _ -> fail "ANALYZE にはテーブル名が必要です" st
 
     let private parseOne (st: PState) =

@@ -472,15 +472,49 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
     withSession "analyze" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
         let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,10),(3,20)"
-        let db3 = exec db2 "ANALYZE t"
+        let db3, analyzed = execRes db2 "ANALYZE t"
+        Assert.Equal<int>(1, analyzed.Rows.Length)
+        Assert.Equal<string>("t", asText analyzed.Rows.[0].[0])
+        Assert.Equal<int64>(3L, asInt analyzed.Rows.[0].[1])
+        // 列数と NDV の表示
+        Assert.Equal<int64>(2L, asInt analyzed.Rows.[0].[2])
+        Assert.Contains("id=3", asText analyzed.Rows.[0].[3])
+
         let _ = exec db3 "ANALYZE TABLE t;"
         let _ = exec db3 "ANALYZE t"
+
+        // 名前を省略すると全テーブル
+        let db4 = exec db3 "CREATE TABLE u (id INTEGER PRIMARY KEY, w INTEGER)"
+        let db5, all = execRes db4 "ANALYZE"
+        Assert.Equal<int>(2, all.Rows.Length)
+
         // 存在しないテーブルは NameError
-        expectErrorKind ErrorKind.NotFound "存在しないテーブル" (execSql db3 "ANALYZE nope")
+        expectErrorKind ErrorKind.NotFound "存在しないテーブル" (execSql db5 "ANALYZE nope")
         // DDL と同じく transaction 中は実行できない
-        let db4 = exec db3 "BEGIN"
-        expectErrorKind ErrorKind.SyntaxError "transaction 中の ANALYZE" (execSql db4 "ANALYZE t")
-        exec db4 "ROLLBACK" |> ignore)
+        let db6 = exec db5 "BEGIN"
+        expectErrorKind ErrorKind.SyntaxError "transaction 中の ANALYZE" (execSql db6 "ANALYZE t")
+        exec db6 "ROLLBACK" |> ignore)
+
+[<Fact>]
+let ``SqlReference: EXPLAIN は統計があるとき推定行数を表示する`` () =
+    withSession "explain-stats" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"
+        // 統計が無いときは行数を出さない。
+        let _, before = execRes db2 "EXPLAIN SELECT * FROM t WHERE id = 1"
+
+        let beforeText =
+            before.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+
+        Assert.DoesNotContain("rows=", beforeText)
+
+        let db3 = exec db2 "ANALYZE t"
+        let _, after = execRes db3 "EXPLAIN SELECT * FROM t WHERE id = 1"
+
+        let afterText =
+            after.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+
+        Assert.Contains("rows=", afterText))
 
 [<Fact>]
 let ``SqlReference: ANALYZE の統計は再オープン後も残り、ALTER TABLE で消える`` () =

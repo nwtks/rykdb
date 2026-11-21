@@ -256,7 +256,7 @@ module internal Analyzer =
     /// 見積りの作業項目（明示スタック。「深さ優先の後置評価」を末尾再帰で回す）。
     type private EstimateWork =
         | Visit of Logical
-        | ApplyFilter
+        | ApplyFilter of Expr
         | ApplyJoin of float option
 
     /// 修飾付き列の異なり値数。
@@ -279,13 +279,24 @@ module internal Analyzer =
         | Some(r: ColumnRef) -> r.Qualifier
         | None -> None
 
-    /// 等値結合の選択性。
-    /// 統計が揃っているときだけ `Some` を返す。
-    let private joinSelectivity (statsOf: string -> TableStats option) (on: Expr) =
-        let conjuncts = Predicate.splitConjuncts on
+    /// 1本の等値述語の結合選択性。
+    /// 両側の列に NDV 統計があるときだけ `Some` を返す。
+    let equalitySelectivity (statsOf: string -> TableStats option) =
+        function
+        | Expr.Binary(BinaryOp.Eq, a, b) ->
+            match qualifierOf a, qualifierOf b with
+            | Some qa, Some qb when not (Catalog.eqName qa qb) ->
+                match ndvOfColumn statsOf a, ndvOfColumn statsOf b with
+                | Some l, Some r when l > 0L && r > 0L -> Some(1.0 / float (max l r))
+                | _ -> None
+            | _ -> None
+        | _ -> None
 
+    /// 等値結合の選択性。
+    /// 統計が欠けている等値は既定の 0.1 で穴埋めする。
+    let private joinSelectivity (statsOf: string -> TableStats option) (on: Expr) =
         let equalities =
-            conjuncts
+            Predicate.splitConjuncts on
             |> List.choose (fun conjunct ->
                 match conjunct with
                 | Expr.Binary(BinaryOp.Eq, a, b) ->
@@ -298,19 +309,93 @@ module internal Analyzer =
             None
         else
             let estimated =
-                equalities
-                |> List.map (fun conjunct ->
-                    match conjunct with
-                    | Expr.Binary(BinaryOp.Eq, a, b) ->
-                        match ndvOfColumn statsOf a, ndvOfColumn statsOf b with
-                        | Some l, Some r when l > 0L && r > 0L -> Some(1.0 / float (max l r))
-                        | _ -> None
-                    | _ -> None)
+                equalities |> List.map (fun conjunct -> equalitySelectivity statsOf conjunct)
 
-            if estimated |> List.exists Option.isNone then
+            if estimated |> List.forall Option.isNone then
                 None
             else
-                Some(estimated |> List.choose id |> List.fold (*) 1.0)
+                estimated |> List.map (Option.defaultValue 0.1) |> List.fold (*) 1.0 |> Some
+
+    /// リテラル（負号付きを含む）の値。
+    let private literalOf =
+        function
+        | Expr.Literal l -> Some l.ToSqlValue
+        | Expr.Unary(UnaryOp.Neg, Expr.Literal l) ->
+            match l.ToSqlValue with
+            | SqlValue.Int i -> Some(SqlValue.Int -i)
+            | SqlValue.Real f -> Some(SqlValue.vReal -f)
+            | _ -> None
+        | Expr.Value v -> Some v
+        | Expr.Unary(UnaryOp.Neg, Expr.Value v) ->
+            match v with
+            | SqlValue.Int i -> Some(SqlValue.Int -i)
+            | SqlValue.Real f -> Some(SqlValue.vReal -f)
+            | _ -> None
+        | _ -> None
+
+    /// 統計付きの列 NDV。
+    let private ndvOfName (stats: TableStats) (name: string) =
+        stats.ColumnNDV
+        |> List.tryFind (fun (n, _) -> SqlName.equal n name)
+        |> Option.map snd
+
+    /// 1本の述語の選択性（統計が無ければ既定値）。
+    let private filterConjunctSelectivity (statsOf: string -> TableStats option) (conjunct: Expr) =
+        let defaultSelectivity = 0.1
+        let rangeSelectivity = 1.0 / 3.0
+
+        let ndvSelectivity expr =
+            match ndvOfColumn statsOf expr with
+            | Some n when n > 0L -> Some(1.0 / float n)
+            | _ -> None
+
+        let withNegation neg value =
+            if neg then max 0.0 (1.0 - value) else value
+
+        match conjunct with
+        | Expr.Binary(BinaryOp.Eq, a, b) ->
+            match ndvOfColumn statsOf a, ndvOfColumn statsOf b with
+            | Some l, Some r when l > 0L && r > 0L -> 1.0 / float (max l r)
+            | _ ->
+                match ndvSelectivity a, literalOf b with
+                | Some s, Some _ -> s
+                | _ ->
+                    match ndvSelectivity b, literalOf a with
+                    | Some s, Some _ -> s
+                    | _ -> defaultSelectivity
+        | Expr.Binary(BinaryOp.Ne, a, b) ->
+            match ndvSelectivity a, literalOf b with
+            | Some s, Some _ -> max 0.0 (1.0 - s)
+            | _ -> 0.9
+        | Expr.Binary((BinaryOp.Gt | BinaryOp.Ge | BinaryOp.Lt | BinaryOp.Le), a, b) ->
+            match literalOf a, literalOf b with
+            | Some _, _
+            | _, Some _ -> rangeSelectivity
+            | _ -> defaultSelectivity
+        | Expr.Between(_, _, _, neg) -> withNegation neg rangeSelectivity
+        | Expr.InList(x, values, neg) ->
+            let selectivity =
+                match ndvOfColumn statsOf x with
+                | Some n when n > 0L -> min 1.0 (float (List.length values) / float n)
+                | _ -> defaultSelectivity
+
+            withNegation neg selectivity
+        | Expr.Like(_, pattern, neg, _) ->
+            let selectivity =
+                match literalOf pattern with
+                | Some(SqlValue.Text text) when text.EndsWith("%", System.StringComparison.Ordinal) ->
+                    if text.Length <= 1 then 1.0 else 0.1
+                | Some(SqlValue.Text _) -> 0.2
+                | _ -> defaultSelectivity
+
+            withNegation neg selectivity
+        | Expr.IsNull(_, neg) -> if neg then 0.9 else 0.1
+        | _ -> defaultSelectivity
+
+    let private filterSelectivity (statsOf: string -> TableStats option) (predicate: Expr) =
+        Predicate.splitConjuncts predicate
+        |> List.map (filterConjunctSelectivity statsOf)
+        |> List.fold (*) 1.0
 
     /// 行数の見積り。
     /// 統計が無ければ従来の定数だけを使う。
@@ -322,6 +407,28 @@ module internal Analyzer =
     /// 統計が無い結合は従来どおり左右の小さい方（外側の行数は内側で絞られる）。
     /// </remarks>
     let estimateRowsWith (statsOf: string -> TableStats option) (tree: Logical) =
+        let scaled rows selectivity =
+            if rows <= 0.0 then 0.0 else max 1.0 (rows * selectivity)
+
+        let indexSelectivity (stats: TableStats) indexName count =
+            stats.Indexes
+            |> List.tryFind (fun (name, _) -> Catalog.eqName name indexName)
+            |> Option.bind (fun (_, columns) ->
+                let prefix = List.truncate count columns
+
+                if List.length prefix <> count then
+                    None
+                else
+                    let selectivities = prefix |> List.map (ndvOfName stats)
+
+                    if selectivities |> List.exists Option.isNone then
+                        None
+                    else
+                        selectivities
+                        |> List.choose id
+                        |> List.fold (fun acc n -> if n > 0L then acc * (1.0 / float n) else acc) 1.0
+                        |> Some)
+
         let baseRows =
             function
             | Logical.Scan(name, method) ->
@@ -331,9 +438,12 @@ module internal Analyzer =
 
                     match method with
                     | ScanMethod.PkLookup _ -> 1.0
-                    | ScanMethod.IndexLookup _
+                    | ScanMethod.IndexLookup(indexName, values) ->
+                        match indexSelectivity stats indexName values.Length with
+                        | Some selectivity -> scaled rows selectivity
+                        | None -> if rows <= 0.0 then 0.0 else max 1.0 (rows / 10.0)
                     | ScanMethod.RangeScan _
-                    | ScanMethod.IndexRangeScan _ -> if rows <= 0.0 then 0.0 else max 1.0 (rows / 10.0)
+                    | ScanMethod.IndexRangeScan _ -> if rows <= 0.0 then 0.0 else max 1.0 (rows / 3.0)
                     | ScanMethod.SeqScan -> rows
                 | None ->
                     match method with
@@ -353,7 +463,7 @@ module internal Analyzer =
                 | [] -> System.Double.PositiveInfinity
             | Visit node :: rest ->
                 match node with
-                | Logical.Filter(_, child) -> go values (Visit child :: ApplyFilter :: rest)
+                | Logical.Filter(predicate, child) -> go values (Visit child :: ApplyFilter predicate :: rest)
                 | Logical.Limit(_, n, _) when n >= 0 -> go (float n :: values) rest
                 | Logical.Limit(_, _, child)
                 | Logical.Project(_, child)
@@ -365,9 +475,12 @@ module internal Analyzer =
                 | Logical.Join(_, _, on, left, right) ->
                     go values (Visit left :: Visit right :: ApplyJoin(joinSelectivity statsOf on) :: rest)
                 | leaf -> go (baseRows leaf :: values) rest
-            | ApplyFilter :: rest ->
+            | ApplyFilter predicate :: rest ->
                 match values with
-                | v :: tail -> go (max 1.0 (v * 0.1) :: tail) rest
+                | v :: tail ->
+                    let selectivity = filterSelectivity statsOf predicate
+                    let filtered = if v <= 0.0 then 0.0 else max 1.0 (v * selectivity)
+                    go (filtered :: tail) rest
                 | [] -> go (1.0 :: values) rest
             | ApplyJoin selectivity :: rest ->
                 match values with
@@ -567,22 +680,6 @@ module internal Analyzer =
         | Expr.Column { Qualifier = Some q; Name = n } when q.ToLowerInvariant() = tn -> Some n
         | _ -> None
 
-    let private litOf =
-        function
-        | Expr.Literal l -> Some l.ToSqlValue
-        | Expr.Unary(UnaryOp.Neg, Expr.Literal l) ->
-            match l.ToSqlValue with
-            | SqlValue.Int i -> Some(SqlValue.Int -i)
-            | SqlValue.Real f -> Some(SqlValue.vReal -f)
-            | _ -> None
-        | Expr.Value v -> Some v
-        | Expr.Unary(UnaryOp.Neg, Expr.Value v) ->
-            match v with
-            | SqlValue.Int i -> Some(SqlValue.Int -i)
-            | SqlValue.Real f -> Some(SqlValue.vReal -f)
-            | _ -> None
-        | _ -> None
-
     let private rangeBounds (tn: string) (colName: string) =
         let rec accumulateBounds tn colName lower upper =
             function
@@ -591,48 +688,48 @@ module internal Analyzer =
                 match e with
                 | Expr.Binary(BinaryOp.Gt, a, b) ->
                     let lower' =
-                        match colOf tn a, litOf b with
+                        match colOf tn a, literalOf b with
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> lower
 
                     let upper' =
-                        match colOf tn b, litOf a with
+                        match colOf tn b, literalOf a with
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> upper
 
                     accumulateBounds tn colName lower' upper' tail
                 | Expr.Binary(BinaryOp.Ge, a, b) ->
                     let lower' =
-                        match colOf tn a, litOf b with
+                        match colOf tn a, literalOf b with
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> lower
 
                     let upper' =
-                        match colOf tn b, litOf a with
+                        match colOf tn b, literalOf a with
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> upper
 
                     accumulateBounds tn colName lower' upper' tail
                 | Expr.Binary(BinaryOp.Lt, a, b) ->
                     let upper' =
-                        match colOf tn a, litOf b with
+                        match colOf tn a, literalOf b with
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> upper
 
                     let lower' =
-                        match colOf tn b, litOf a with
+                        match colOf tn b, literalOf a with
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> lower
 
                     accumulateBounds tn colName lower' upper' tail
                 | Expr.Binary(BinaryOp.Le, a, b) ->
                     let upper' =
-                        match colOf tn a, litOf b with
+                        match colOf tn a, literalOf b with
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> upper
 
                     let lower' =
-                        match colOf tn b, litOf a with
+                        match colOf tn b, literalOf a with
                         | Some n, Some v when Catalog.eqName n colName -> Some v
                         | _ -> lower
 
@@ -640,12 +737,12 @@ module internal Analyzer =
                 | Expr.Between(x, lo, hi, false) ->
                     match colOf tn x with
                     | Some n when Catalog.eqName n colName ->
-                        match litOf lo, litOf hi with
+                        match literalOf lo, literalOf hi with
                         | Some lv, Some hv -> accumulateBounds tn colName (Some lv) (Some hv) tail
                         | _ -> accumulateBounds tn colName lower upper tail
                     | _ -> accumulateBounds tn colName lower upper tail
                 | Expr.Like(x, p, false, None) ->
-                    match colOf tn x, litOf p with
+                    match colOf tn x, literalOf p with
                     | Some n, Some(SqlValue.Text pattern) when Catalog.eqName n colName ->
                         if
                             pattern.EndsWith "%"
@@ -685,10 +782,10 @@ module internal Analyzer =
             List.collect Predicate.splitConjuncts
             >> List.choose (function
                 | Expr.Binary(BinaryOp.Eq, a, b) ->
-                    match colOf tn a, litOf b with
+                    match colOf tn a, literalOf b with
                     | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
                     | _ ->
-                        match colOf tn b, litOf a with
+                        match colOf tn b, literalOf a with
                         | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
                         | _ -> None
                 | _ -> None)
@@ -838,10 +935,10 @@ module internal Analyzer =
 
         match predicate with
         | Expr.Binary(BinaryOp.Eq, a, c) ->
-            match colOf tn a, litOf c with
+            match colOf tn a, literalOf c with
             | Some n, Some v -> Some(n, v)
             | _ ->
-                match colOf tn c, litOf a with
+                match colOf tn c, literalOf a with
                 | Some n, Some v -> Some(n, v)
                 | _ -> None
         | _ -> None

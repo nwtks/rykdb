@@ -216,11 +216,14 @@ module internal ExecState =
     ///   待つと、commit されないまま残った transaction で永久に止まるので失敗側に倒す。
     /// - 新しい transaction の開始と文の実行は排他の間ブロックされる（実行後は新しいカタログを見る）。
     /// </remarks>
-    let private exclusiveDdl (state: ExecState) (run: ExecState -> Result<ExecState, DbError>) =
+    let private exclusiveDdlWith (state: ExecState) (run: ExecState -> Result<'a, DbError>) =
         state.Store.Runtime.WithExclusive(fun () ->
             match state.Store.Runtime.OldestExcept(state.Root, state.ActiveRegistration) with
             | Some _ -> err (DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください")
             | None -> run state)
+
+    let private exclusiveDdl (state: ExecState) (run: ExecState -> Result<ExecState, DbError>) =
+        exclusiveDdlWith state run
 
     let private BackfillChunkRows = 8192
 
@@ -324,51 +327,67 @@ module internal ExecState =
 
         loop state [||]
 
-    /// テーブルの行数と列の異なり値数を再収集する。
-    /// 統計はカタログに保存する（`Catalog.save` が差分を書く）。
-    let private analyzeCore (table: string) (state: ExecState) =
-        match Catalog.findTable table state.Catalog with
-        | None -> err (sprintf "テーブル %s が存在しません" table |> DbError.notFound)
-        | Some defn ->
-            result {
-                let! schema = Catalog.toSchema defn
-                let! scan = RowStore.scan (Keyspace.table schema.Name) [||] 0 state.Store
+    /// テーブルの行数と列の異なり値数を収集する。
+    let private collectStats (defn: TableDefinition) (state: ExecState) =
+        result {
+            let! schema = Catalog.toSchema defn
+            let! scan = RowStore.scan (Keyspace.table schema.Name) [||] 0 state.Store
 
-                let columnSets =
-                    Array.init schema.Columns.Length (fun _ -> System.Collections.Generic.HashSet<string>())
+            let columnSets =
+                Array.init schema.Columns.Length (fun _ -> System.Collections.Generic.HashSet<string>())
 
-                let rec consume count scan =
-                    match SstScan.next scan with
-                    | Error e ->
-                        SstScan.dispose scan
-                        err e
-                    | Ok None -> ret count
-                    | Ok(Some(entry, rest)) ->
-                        entry.Value
-                        |> Option.iter (fun row ->
-                            row
-                            |> Array.iteri (fun i value ->
-                                if i < columnSets.Length then
-                                    columnSets.[i].Add(SqlLiteral.toSqlLiteral value) |> ignore))
+            let rec consume count scan =
+                match SstScan.next scan with
+                | Error e ->
+                    SstScan.dispose scan
+                    err e
+                | Ok None -> ret count
+                | Ok(Some(entry, rest)) ->
+                    entry.Value
+                    |> Option.iter (fun row ->
+                        row
+                        |> Array.iteri (fun i value ->
+                            if i < columnSets.Length then
+                                columnSets.[i].Add(SqlLiteral.toSqlLiteral value) |> ignore))
 
-                        consume (count + 1L) rest
+                    consume (count + 1L) rest
 
-                let! rowCount = consume 0L scan
+            let! rowCount = consume 0L scan
 
-                let columnNdv =
-                    schema.Columns |> List.mapi (fun i col -> col.Name, int64 columnSets.[i].Count)
+            return
+                {
+                    Table = schema.Name
+                    RowCount = rowCount
+                    ColumnNDV = schema.Columns |> List.mapi (fun i col -> col.Name, int64 columnSets.[i].Count)
+                    Indexes =
+                        Catalog.indexesOf schema.Name state.Catalog
+                        |> List.map (fun i -> i.IndexName, i.Columns)
+                }
+        }
 
-                let stats =
-                    {
-                        Table = schema.Name
-                        RowCount = rowCount
-                        ColumnNDV = columnNdv
-                    }
+    /// テーブルの統計を再収集する。名前が None なら全テーブル。
+    /// 統計はカタログに 1回で保存する。
+    let private analyzeCore (table: string option) (state: ExecState) =
+        result {
+            let! defns =
+                match table with
+                | Some name ->
+                    match Catalog.findTable name state.Catalog with
+                    | Some defn -> ret [ defn ]
+                    | None -> err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
+                | None -> ret state.Catalog.Tables
 
-                return! saved (Catalog.addStats stats state.Catalog) state
-            }
+            let! stats = defns |> List.map (fun defn -> collectStats defn state) |> all
 
-    let analyze (table: string) (state: ExecState) = exclusiveDdl state (analyzeCore table)
+            let nextCatalog =
+                stats |> List.fold (fun catalog s -> Catalog.addStats s catalog) state.Catalog
+
+            let! next = saved nextCatalog state
+            return next, stats
+        }
+
+    let analyze (table: string option) (state: ExecState) =
+        exclusiveDdlWith state (analyzeCore table)
 
     let private createTableCore (c: CreateTable) (state: ExecState) =
         let existing = Catalog.findTable c.Name state.Catalog
@@ -1139,7 +1158,7 @@ module internal Engine =
             finally
                 ctx.Scope.DisposeAll()
 
-    let private runDdl (state: ExecState) (run: ExecState -> Result<ExecState, DbError>) =
+    let private runDdlWithState (state: ExecState) (run: ExecState -> Result<ExecState * StatementResult, DbError>) =
         if state.Active.IsSome then
             err (
                 DbError.create
@@ -1147,7 +1166,10 @@ module internal Engine =
                     "トランザクション中は DDL（CREATE / DROP / ALTER）を実行できません。COMMIT または ROLLBACK してから実行してください"
             )
         else
-            run state |> Result.map (fun next -> next, StatementResult.Empty)
+            run state
+
+    let private runDdl (state: ExecState) (run: ExecState -> Result<ExecState, DbError>) =
+        runDdlWithState state (run >> Result.map (fun next -> next, StatementResult.Empty))
 
     let private noRows = Result.map (fun s -> s, StatementResult.Empty)
 
@@ -1163,7 +1185,27 @@ module internal Engine =
         | Statement.CreateIndex ci -> ExecState.createIndex ci |> runDdl state
         | Statement.DropIndex(n, ifE) -> ExecState.dropIndex n ifE |> runDdl state
         | Statement.AlterTable a -> ExecState.alterTable a |> runDdl state
-        | Statement.Analyze name -> ExecState.analyze name |> runDdl state
+        | Statement.Analyze name ->
+            runDdlWithState state (fun st ->
+                ExecState.analyze name st
+                |> Result.bind (fun (next, stats) ->
+                    let columns = [| "table"; "rows"; "columns"; "ndv" |]
+
+                    let rows =
+                        stats
+                        |> List.map (fun s ->
+                            [|
+                                SqlValue.Text s.Table
+                                SqlValue.Int s.RowCount
+                                SqlValue.Int(int64 s.ColumnNDV.Length)
+                                SqlValue.Text(
+                                    s.ColumnNDV |> List.map (fun (n, v) -> sprintf "%s=%d" n v) |> String.concat ","
+                                )
+                            |])
+                        |> Array.ofList
+
+                    StatementResult.OfRows(0, columns, rows)
+                    |> Result.map (fun result -> next, result)))
         | Statement.Begin
         | Statement.Commit
         | Statement.Rollback -> ret state |> noRows

@@ -68,6 +68,7 @@
 | INV-32 | `SELECT *` は論理スキーマ順で展開する                 | `ProjectFrame`、`Ops.project`                                            |
 | INV-33 | ハッシュ結合は小さい側を build し、run を逐次削除する | `Optimizer.hashBuildSide`、`OpsJoin.innerJoinHashBuildLeft`、`ScanScope` |
 | INV-34 | 走査は tombstone を返さず、ポイント検索は削除を返す   | `StorageEngine.scanAtWith`、`getAtMasked`、回帰テスト                    |
+| INV-35 | 統計キーはテーブル定義の寿命に従う                    | `Catalog.removeTable`、`Catalog.removeStatsInTxn`、`ANALYZE` テスト      |
 
 ---
 
@@ -493,6 +494,18 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 
 回帰テストは `StorageEngine: 走査は tombstone を返さず、ポイント検索は削除を Value = None で返す`
 （memtable と SSTable の両方）を検査する。
+
+### INV-35: 統計キーはテーブル定義の寿命に従う
+
+`ANALYZE` が保存する `stats:<table>` は、そのテーブルの定義が存在する間だけ有効である。
+
+- `DROP TABLE` はテーブル・索引・統計を同じカタログ差分で消す。
+- `ALTER TABLE` は行の形が変わるため、テーブルの統計を transaction 内で tombstone にする。
+- 統計が無い・古い場合は見積りが粗くなるだけで、クエリ結果は変わらない。
+- DML では統計を自動更新しない（手動 `ANALYZE` のみ）。
+
+回帰テストは `SqlReference: ANALYZE の統計は再オープン後も残り、ALTER TABLE で消える` と
+`Catalog.save / load: 統計を往復し、removeTable で消える` を検査する。
 
 ---
 

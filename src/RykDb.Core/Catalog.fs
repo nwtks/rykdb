@@ -51,6 +51,7 @@ type internal TableStats =
         Table: string
         RowCount: int64
         ColumnNDV: (string * int64) list
+        Indexes: (string * string list) list
     }
 
 /// カタログ全体のスナップショット。
@@ -356,8 +357,17 @@ module internal Catalog =
             |> Writer.int64LE s.RowCount
             |> Writer.varint (uint64 s.ColumnNDV.Length)
 
-        s.ColumnNDV
-        |> List.fold (fun w (name, ndv) -> w |> Writer.str name |> Writer.int64LE ndv) w0
+        let w1 =
+            s.ColumnNDV
+            |> List.fold (fun w (name, ndv) -> w |> Writer.str name |> Writer.int64LE ndv) w0
+            |> Writer.varint (uint64 s.Indexes.Length)
+
+        s.Indexes
+        |> List.fold
+            (fun w (name, columns) ->
+                let w = w |> Writer.str name |> Writer.varint (uint64 columns.Length)
+                columns |> List.fold (fun w c -> Writer.str c w) w)
+            w1
         |> Writer.toArray
 
     let private readColumnStat (c: Cursor) =
@@ -367,17 +377,33 @@ module internal Catalog =
             return (name, ndv), c2
         }
 
+    let private readIndexStat (c: Cursor) =
+        result {
+            let! name, c1 = Reader.readStr c
+            let! count, c2 = Reader.readVarint c1
+            let! columns, c3 = Reader.readItems Reader.readStr count c2
+            return (name, columns), c3
+        }
+
     let private decodeStats (table: string) (bytes: byte array) =
         result {
             let! rowCount, cur1 = Cursor.create bytes |> Reader.readInt64LE
             let! colCount, cur2 = Reader.readVarint cur1
-            let! cols, _ = Reader.readItems readColumnStat colCount cur2
+            let! cols, cur3 = Reader.readItems readColumnStat colCount cur2
+
+            let! indexes =
+                if Cursor.atEnd cur3 then
+                    ret []
+                else
+                    Reader.readVarint cur3
+                    >>= fun (count, cur4) -> Reader.readItems readIndexStat count cur4 |> Result.map fst
 
             return
                 {
                     Table = table
                     RowCount = rowCount
                     ColumnNDV = cols
+                    Indexes = indexes
                 }
         }
 
