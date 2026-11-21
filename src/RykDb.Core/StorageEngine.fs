@@ -311,6 +311,11 @@ module internal StorageEngine =
 
     /// memtable を L0 の SSTable にして書き出す。
     /// memtable が空なら何もしない（WAL も切り替えない）。
+    /// <remarks>
+    /// 失敗時は「次に採番するファイル番号を進めた engine」とエラーを返す。
+    /// MANIFEST の反映結果が不明な場合でも、同じファイル番号を再利用して
+    /// MANIFEST が参照する SSTable を上書きしないため。
+    /// </remarks>
     let private flush (engine: StorageEngine) =
         let rotateWal engine (next: WalState) =
             result {
@@ -335,23 +340,37 @@ module internal StorageEngine =
                     }
             }
 
-        result {
-            if Memtable.isEmpty engine.Mem then
-                return engine
-            else
-                let fileNumber = engine.Version.NextFileNumber
+        let bumpNextFileNumber (engine: StorageEngine) fileNumber =
+            { engine with
+                Version =
+                    { engine.Version with
+                        NextFileNumber = max engine.Version.NextFileNumber (fileNumber + 1L)
+                    }
+            }
 
-                let! meta =
-                    Memtable.rangeScan [||] 0 engine.Mem
-                    |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
-                    |> FileMetaData.writeSstable engine.Dir fileNumber 0 BloomFalsePositiveRate
+        if Memtable.isEmpty engine.Mem then
+            Ok engine
+        else
+            let fileNumber = engine.Version.NextFileNumber
+            let bumped = bumpNextFileNumber engine fileNumber
 
-                let! version, manifestNumber =
+            match
+                Memtable.rangeScan [||] 0 engine.Mem
+                |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+                |> FileMetaData.writeSstable engine.Dir fileNumber 0 BloomFalsePositiveRate
+            with
+            | Error e -> Error(bumped, e)
+            | Ok meta ->
+                match
                     VersionEdit.addFile meta
-                    |> Manifest.logAndApply engine.Dir engine.ManifestNumber engine.Version
-
-                return! finishFlush engine version manifestNumber
-        }
+                    |> Manifest.logAndApplyWithOutcome engine.Dir engine.ManifestNumber engine.Version
+                with
+                | ManifestApplyResult.Applied(version, manifestNumber) ->
+                    match finishFlush engine version manifestNumber with
+                    | Ok flushed -> Ok flushed
+                    | Error e -> Error(bumped, e)
+                | ManifestApplyResult.NotApplied e
+                | ManifestApplyResult.Unknown e -> Error(bumped, e)
 
     /// memtable が上限に達していれば flush する
     /// （compaction はしない。background compaction は worker が行う）。
@@ -379,7 +398,10 @@ module internal StorageEngine =
                             }
                     }
 
-                flush engine |> Result.map (fun flushed -> flushed, true)
+                flush engine
+                |> function
+                    | Ok flushed -> ret (flushed, true)
+                    | Error(bumped, _) -> ret (bumped, false)
             else
                 ret (engine, false))
 
@@ -397,35 +419,44 @@ module internal StorageEngine =
             readInfoIn f engine
             >>= fun info -> ret (Sstable.rangeScanPartialRaw [||] 0 info)
 
-        let buildCompacted version manifestNumber result =
-            let nextNum =
-                match result.Added with
-                | [] -> version.NextFileNumber
-                | files -> files |> List.map _.FileNumber |> List.max |> (+) 1L
+        let nextFileNumberAfter version result =
+            match result.Added with
+            | [] -> version.NextFileNumber
+            | files -> max version.NextFileNumber ((files |> List.map _.FileNumber |> List.max) + 1L)
 
+        let buildCompacted version manifestNumber result =
             { engine with
                 Version =
                     { version with
-                        NextFileNumber = nextNum
+                        NextFileNumber = nextFileNumberAfter version result
                     }
                 ManifestNumber = manifestNumber
             }
 
-        result {
-            let! compactionResult, _ =
-                Compaction.compact
-                    engine.Dir
-                    engine.Version
-                    engine.Compaction
-                    engine.ActiveSnapshot
-                    engine.Version.NextFileNumber
-                    scanOf
-
+        match
+            Compaction.compact
+                engine.Dir
+                engine.Version
+                engine.Compaction
+                engine.ActiveSnapshot
+                engine.Version.NextFileNumber
+                scanOf
+        with
+        | Error e -> Error(engine, e)
+        | Ok(compactionResult, _) ->
             if List.isEmpty compactionResult.Added && List.isEmpty compactionResult.Removed then
-                return engine
+                Ok engine
             else
-                let! version, manifestNumber =
-                    Manifest.logAndApply
+                let fallbackEngine =
+                    { engine with
+                        Version =
+                            { engine.Version with
+                                NextFileNumber = nextFileNumberAfter engine.Version compactionResult
+                            }
+                    }
+
+                match
+                    Manifest.logAndApplyWithOutcome
                         engine.Dir
                         engine.ManifestNumber
                         engine.Version
@@ -433,10 +464,17 @@ module internal StorageEngine =
                             VersionEdit.AddedFiles = compactionResult.Added
                             DeletedFiles = compactionResult.Removed
                         }
+                with
+                | ManifestApplyResult.Applied(version, manifestNumber) ->
+                    let compacted = buildCompacted version manifestNumber compactionResult
 
-                do! FileMetaData.deleteObsolete engine.Dir compactionResult.Removed
-                return buildCompacted version manifestNumber compactionResult
-        }
+                    match FileMetaData.deleteObsolete engine.Dir compactionResult.Removed with
+                    | Ok() -> Ok compacted
+                    | Error e -> Error(compacted, e)
+                | ManifestApplyResult.NotApplied e ->
+                    FileMetaData.deleteObsolete engine.Dir compactionResult.Added |> ignore
+                    Error(fallbackEngine, e)
+                | ManifestApplyResult.Unknown e -> Error(fallbackEngine, e)
 
     /// memtable が上限に達していれば flush し、続けて compaction する（同期版）。
     /// compaction の失敗は flush 後の engine と一緒に返す。
@@ -447,11 +485,11 @@ module internal StorageEngine =
                 && Memtable.approxBytes engine.Mem >= engine.MemLimitBytes
             then
                 match flush engine with
-                | Error _ -> ret (engine, None)
+                | Error(bumped, _) -> ret (bumped, None)
                 | Ok flushed ->
                     match compactOnce flushed with
                     | Ok compacted -> ret (compacted, None)
-                    | Error e -> ret (flushed, Some e)
+                    | Error(bumped, e) -> ret (bumped, Some e)
             else
                 ret (engine, None))
 
@@ -519,7 +557,7 @@ module internal StorageEngine =
             protect (fun () -> System.IO.File.Exists(Wal.path dir walNumber))
             >>= fun exists ->
                 if exists then
-                    protect (fun () -> int (System.IO.FileInfo(Wal.path dir walNumber).Length))
+                    protect (fun () -> System.IO.FileInfo(Wal.path dir walNumber).Length)
                     |> Result.map (fun size -> { FileNumber = walNumber; Size = size })
                 else
                     Wal.create dir walNumber
@@ -538,7 +576,7 @@ module internal StorageEngine =
                 ManifestNumber = 1L<manifestNo>
                 Version = Version.Empty
                 Mem = Memtable.Empty
-                Wal = { FileNumber = 1L; Size = 0 }
+                Wal = { FileNumber = 1L; Size = 0L }
                 NextSeqNo = 1UL
                 NextTxnId = 1UL<txnId>
                 MemLimitBytes = DefaultMemLimitBytes
@@ -624,20 +662,22 @@ module internal StorageEngine =
         withRuntimeGate engine (fun () ->
             let isLatestWriter =
                 match protect (fun () -> System.IO.FileInfo(Wal.path engine.Dir engine.Wal.FileNumber).Length) with
-                | Ok size -> size = int64 engine.Wal.Size
+                | Ok size -> size = engine.Wal.Size
                 | Error _ -> false
 
             if not isLatestWriter then
                 ret ()
             else
                 result {
-                    let! flushed = flush engine
-                    do! Wal.sync flushed.Dir flushed.Wal
+                    match flush engine with
+                    | Error(_, e) -> return! err e
+                    | Ok flushed ->
+                        do! Wal.sync flushed.Dir flushed.Wal
 
-                    Wal.walFiles flushed.Dir
-                    |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore)
+                        Wal.walFiles flushed.Dir
+                        |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore)
 
-                    return ()
+                        return ()
                 })
 
 /// RowStore が使う StorageEngine の操作面。

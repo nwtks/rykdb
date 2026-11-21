@@ -167,7 +167,7 @@ module internal RowStore =
                 | Some host ->
                     match flushAndPublish bumped host with
                     | Ok(flushed, didFlush) ->
-                        if didFlush then
+                        if didFlush || host.LastCompactionError.IsSome then
                             host.Signal()
 
                         ret { store with Engine = flushed }
@@ -250,6 +250,22 @@ module internal RowStore =
 
         SstScan.ofStepWithClose (fun () -> loop scan) (fun () -> SstScan.dispose scan)
 
+    /// 走査が使う Version を、走査の Dispose まで pin する。
+    /// Session の read lease より長く走査を保持しても compaction にファイルを消されない。
+    /// `scope` があるときは lease も台帳へ登録し、早期終了時の `DisposeAll` で解放する。
+    let private withVersionPin (scope: ScanScope option) (store: RowStore) (scan: Result<SstScan, DbError>) =
+        match store.Host with
+        | None -> scan
+        | Some host ->
+            let lease = host.AcquireVersion store.Engine.PublishedState.Version
+            scope |> Option.iter (fun scope -> scope.Register(obj (), lease))
+
+            match scan with
+            | Ok scan -> Ok(SstScan.withResource lease scan)
+            | Error e ->
+                lease.Dispose()
+                Error e
+
     /// keyspace を prefix で走査する（最新エントリ。値の filter はしない）。
     /// 返すキーは接頭辞を外した論理キー。
     /// 1行要求されるまで SSTable のブロックを読まない。
@@ -271,6 +287,7 @@ module internal RowStore =
 
             return scanWithinPrefix prefix scan
         }
+        |> withVersionPin None store
 
     /// keyspace を列マスク付きで走査する（必要な列だけ復号する）。
     let scanAtRawMasked
@@ -297,6 +314,7 @@ module internal RowStore =
 
             return scanWithinPrefix prefix scoped
         }
+        |> withVersionPin scope store
 
     /// keyspace を走査する（制限なし・全列）。
     let scan (keyspace: string) (startKey: byte array) (limit: int) (store: RowStore) =

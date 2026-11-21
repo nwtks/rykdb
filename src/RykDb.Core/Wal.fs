@@ -34,7 +34,7 @@ type internal WalState =
         /// 現在の WAL ファイル番号
         FileNumber: int64
         /// 現在の WAL ファイルに書き込んだバイト数
-        Size: int
+        Size: int64
     }
 
 module internal Wal =
@@ -148,7 +148,7 @@ module internal Wal =
                         fs.Flush sync
 
                         { state with
-                            Size = state.Size + written
+                            Size = state.Size + int64 written
                         }))
             >>= id
 
@@ -275,7 +275,7 @@ module internal Wal =
     /// 不完全な末尾を残したまま追記すると、次回の再生がそこで止まり、
     /// 後続の commit が見えなくなるため、open 時に必ず呼ぶ。
     let truncateTo (dir: string) (state: WalState) (goodSize: int64) =
-        if goodSize < 0L || goodSize > int64 System.Int32.MaxValue then
+        if goodSize < 0L then
             err (DbError.internalError "Wal: ファイルサイズが範囲外です")
         else
             let p = path dir state.FileNumber
@@ -296,7 +296,7 @@ module internal Wal =
                         fs.SetLength goodSize
                         fs.Flush true
 
-                    ret { state with Size = int goodSize })
+                    ret { state with Size = goodSize })
             >>= id
 
     /// ディレクトリ内の WAL ファイル名（復旧時に孤児を消すのに使う）。
@@ -310,11 +310,11 @@ module internal Wal =
     let create (dir: string) (fileNumber: int64) =
         protect (fun () ->
             System.IO.File.WriteAllBytes(path dir fileNumber, [||])
-            { FileNumber = fileNumber; Size = 0 })
+            { FileNumber = fileNumber; Size = 0L })
 
     /// 新しい WAL ファイル番号に切り替える（flush 後に呼ぶ）。
     let rotate (state: WalState) =
         {
             FileNumber = state.FileNumber + 1L
-            Size = 0
+            Size = 0L
         }

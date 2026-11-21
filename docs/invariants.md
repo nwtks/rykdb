@@ -183,13 +183,15 @@ MANIFEST の編集は追記専用とする。
 末尾の不完全なレコードは open 時に修復し、再オープン後も同じファイル集合を復元できるようにする。
 
 - `VersionEdit.encode` と `decode` は round-trip できる。
-- `Manifest.logAndApply` の追記失敗は、`VersionEdit` が反映されていないことを意味する。
+- `Manifest.logAndApplyWithOutcome` は `Applied` / `NotApplied` / `Unknown` を返す。
+  `NotApplied` は追記前の内容が保たれており、`Unknown` は追記の有無を保証できない。
 - ローテーションは追記前に判定し、追記失敗時は追記前の長さへ戻す。
 - 末尾が書きかけの場合、復元した Version を新しい MANIFEST に移して `CURRENT` を切り替える。
 - `VersionEdit.apply` は `NextFileNumber` を進めない。
   採番は再オープン時に `StorageEngine` がディスク上の最大ファイル番号から再構築する。
 
-回帰テストはランダムな編集の encode/decode、追記と再オープン、末尾修復、ローテーション失敗時の保持を検査する。
+回帰テストはランダムな編集の encode/decode、追記と再オープン、末尾修復、ローテーション失敗時の保持、
+`Applied` / `NotApplied` の区別を検査する。
 
 ### INV-09: WAL は commit済み prefix を再生
 
@@ -198,6 +200,7 @@ MANIFEST の編集は追記専用とする。
 - `Wal.foldCommitted` は最後の完全なフレームの終端位置を返す。
 - `StorageEngine.openDatabaseWith` はその位置まで WAL を切り詰める。
 - 追記は `WalState.Size` から行い、不完全な末尾を残したまま次の commit を書かない。
+- `WalState.Size` は `int64`（2GiB を超える WAL でも位置が溢れない）。
 
 回帰テストは任意の切断位置、torn tail 後の追記、切り詰め後の commit 継続を検査する。
 
@@ -341,7 +344,10 @@ compaction の公開状態は、Versionの世代、採番、参照中ファイ�
 実装では、`ConcurrentDictionary` の1セルと CAS を使う。
 ファイル番号は同じセルで予約し、`publish` は現在値との `max` を取るため番号は戻らない。
 MANIFEST追記と install は `installGate`で直列化する。
-`AcquireCall` が全ファイルを pinし、`Dispose`が release と sweep を行う。
+`AcquireCall` / `AcquireVersion` はVersion単位の参照数を増やし、最初のleaseだけ全ファイルをpinする。
+最後のleaseがreleaseとsweepを行う。
+`RowStore`の走査は`SstScan.withResource`でVersion pinのleaseを結び付け、
+Sessionのread leaseより長く走査を保持してもファイルが消えない。
 
 プロパティテストは並行読み取り、書き込み、snapshot pin、固定シードの操作列、
 Generation、採番、Version の妥当性、pin中のファイル存在を検査する。

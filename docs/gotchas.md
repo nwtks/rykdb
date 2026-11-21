@@ -280,9 +280,10 @@ open時は`Wal.foldCommitted`が返す最後の完全なフレーム位置まで
 
 MANIFESTへ反映する前に、削除対象ファイルが現在のVersionに存在するか、古いsnapshotが必要な版を守っているかを再確認する。
 ファイル番号は同じCAS採番経路だけで進める。
-`Manifest.logAndApply`の`Error`は「VersionEditが反映されていない」を意味する。
-それでも追記失敗の切り詰めが失敗する可能性を考え、compactionの出力は`Error`時に削除せず、
-次回openの`quarantineOrphans`に任せる。
+`Manifest.logAndApplyWithOutcome`は`Applied` / `NotApplied` / `Unknown`を返す。
+`NotApplied`は出力を削除してよく、`Unknown`はMANIFESTが参照している可能性があるので削除しない。
+切り詰め自体に失敗した場合も`Unknown`とし、次回openの`quarantineOrphans`に任せる。
+同期のflush/compactionは失敗時に次のファイル番号を進めたengineを返し、参照中SSTableを上書きしない。
 
 ### 4.15 maybeFlushの結果をcompaction失敗で巻き戻さない
 
@@ -562,6 +563,13 @@ fsync失敗を待機者だけに返さず、失敗位置とエラーを共有す
 Session単位のread leaseでSSTableをpinする。
 workerはretiredとしてrefcountが0になった後に削除する。
 closeはworker join後にWALとロックを解放する。
+
+### 8.13 compactionの失敗は次のwriteで再試行する
+
+`VersionCoordinator.LastCompactionError`で直近の失敗を観測できる。
+失敗後は次のwriteでもworkerへsignalを送る（flushが起きなくても再試行する）。
+明示的な再試行には`RequestCompaction`を使う。
+失敗が続いてもMANIFESTの状態とファイル番号は巻き戻さない。
 
 ---
 

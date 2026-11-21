@@ -390,7 +390,7 @@ module internal RootKey =
             ""
         else
             match protect (fun () -> System.IO.Path.GetFullPath root) with
-            | Ok full -> full
+            | Ok full -> System.IO.Path.TrimEndingDirectorySeparator full
             | Error _ -> root
 
 /// 進行中 transaction の snapshot 登録 1件。

@@ -404,6 +404,13 @@ module internal SstScan =
     /// 明示的に資源を解放する（終端・エラー後の呼び出しも安全）。
     let dispose (scan: SstScan) = (scan :> System.IDisposable).Dispose()
 
+    /// 走査に追加の資源（Version pin の lease など）を結び付ける。
+    /// 走査を Dispose すると、下流の走査と資源の両方を解放する。
+    let withResource (resource: System.IDisposable) (scan: SstScan) =
+        ofStepWithClose (fun () -> next scan) (fun () ->
+            dispose scan
+            resource.Dispose())
+
     /// 走査を使い、成功・失敗・例外のいずれでも Dispose する。
     /// 開いた走査を全件読み切る用途で使う。
     let withScan (scan: SstScan) (f: SstScan -> Result<'a, DbError>) =

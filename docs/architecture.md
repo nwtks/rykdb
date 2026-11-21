@@ -769,7 +769,7 @@ memtableを保持して次回再試行する。
 SELECTだけのバッチは接続間で並行実行できる。
 `Begin`、書き込み、COMMIT、ROLLBACK、Closeは直列化する。
 
-読み取り時はcommitted stateと全ファイルのVersion pinを1回で取得する。
+読み取り時はcommitted stateとVersion pinを1回で取得する。
 stateの取得とpinの取得を分けると、間にcompactionが入り必要な版が回収されるためである。
 
 ### 7.8 DDLの排他
@@ -1009,8 +1009,15 @@ MANIFESTへ反映する前にクラッシュして残った出力ファイルは
 MANIFEST追記とVersion公開は`installGate`で直列化する。
 ファイル番号は単一セルのCASで予約する。
 
-SELECTのみのバッチごとにVersionの全ファイルをpinする。
+SELECTのみのバッチごとにVersionをpinする。
+pinはVersion単位の参照数で管理し、同じVersionへの複数leaseはファイル数に比例しない。
+走査は`SstScan`自身がVersionのleaseを持ち、Sessionのread leaseより長く保持しても
+compactionにファイルを消されない。
 workerはinstall後に入力ファイルをretireし、refcountが0になったファイルだけ削除する。
+
+compactionの失敗は`LastCompactionError`に残し、次のwrite（flushが起きなくても）または
+明示的な`RequestCompaction`で再試行する。
+失敗してもMANIFESTの状態とファイル番号は巻き戻さない。
 
 Closeは次の順で行う。
 
@@ -1194,7 +1201,8 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 #### 12.2.1 性能と資源
 
 - background compactionは1DB1workerで、周期実行はしない。
-- SELECTのみのバッチごとにVersion全ファイルをpinするため、ファイル数に比例する。
+- VersionのpinはVersion単位の参照数で管理する。
+  同じVersionへの並行leaseはO(1)だが、最初のleaseはファイル数に比例する。
 - JOINの右側、DISTINCT、GROUP BYは上限までメモリへ保持し、超過分を退避する。
 - 相関サブクエリは外側行ごとに内側を再計画するため、外側行数と内側走査コストの積がかかる。
 - 結合順序は統計を持たないため、走査方法から得る粗い見積りだけで決める。

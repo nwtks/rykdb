@@ -61,6 +61,7 @@ module internal SstScan =
     val ofScoped: SstScan -> ScanScope -> obj -> SstScan
     val next: (SstScan -> Result<(SstEntry * SstScan) option, DbError>)
     val dispose: SstScan -> unit
+    val withResource: System.IDisposable -> SstScan -> SstScan
     val withScan: SstScan -> (SstScan -> Result<'a, DbError>) -> Result<'a, DbError>
     val scoped: ScanScope -> SstScan -> SstScan
     val emit: (unit -> SstScan) -> SstEntry -> SstScan

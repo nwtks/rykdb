@@ -434,6 +434,12 @@ let ``SnapshotRegistry: 相対パスと絶対パスは同じ DB として扱う`
     Assert.Equal<uint64 option>(None, registry.OldestExcept(rel, None))
 
 [<Fact>]
+let ``RootKey.normalize: 末尾のディレクトリ区切りを吸収する`` () =
+    withDir "root-key-normalize" (fun dir ->
+        let withSeparator = dir + string System.IO.Path.DirectorySeparatorChar
+        Assert.Equal(RootKey.normalize dir, RootKey.normalize withSeparator))
+
+[<Fact>]
 let ``SnapshotRegistry: 並行 register/unregister で登録が消えない`` () =
     let root = freshRoot "reg-race"
     let registry = SnapshotRegistry()

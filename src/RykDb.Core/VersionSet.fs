@@ -369,6 +369,18 @@ module internal VersionEdit =
                 ]
         }
 
+/// MANIFEST への反映結果。
+/// <remarks>
+/// `NotApplied` は追記前の内容が保たれていることを意味し、出力ファイルを削除してよい。
+/// `Unknown` は追記が Disk に残ったか判別できない状態で、出力を消してはいけない
+/// （再オープン時に MANIFEST が参照している可能性がある）。
+/// </remarks>
+[<RequireQualifiedAccess>]
+type internal ManifestApplyResult =
+    | Applied of version: Version * manifestNumber: int64<manifestNo>
+    | NotApplied of error: DbError
+    | Unknown of error: DbError
+
 module internal Manifest =
     /// manifest ファイル名の接頭辞。
     [<Literal>]
@@ -471,14 +483,26 @@ module internal Manifest =
             fs.Write(data, 0, data.Length)
             fs.Flush true)
 
+    /// 追記の失敗種別。
+    /// `Rejected` は追記前の内容が保たれていることを意味する。
+    /// `Uncertain` は追記前の長さへ戻すことにも失敗し、レコードの有無を保証できない。
+    type private AppendFailure =
+        | AppendRejected of DbError
+        | AppendUncertain of DbError
+
     /// MANIFEST に 1レコード追記する。
     /// <remarks>
     /// 末尾が改行で終わっていなければ、前回の書き込みが途中で失敗したとみなして
     /// 最後の完全な行まで切り詰めてから追記する。
-    /// 書き込み中に失敗した場合も、追記前の長さまで戻す。
-    /// これにより、失敗した追記が後続のレコードを読めなくすることがない。
+    /// 書き込み中に失敗した場合は、追記前の長さまで戻す。
+    /// それにも失敗した場合だけ `AppendUncertain` を返す。
     /// </remarks>
     let private append (dir: string) (manifestNumber: int64<manifestNo>) (edit: VersionEdit) =
+        let path = manifestPath dir manifestNumber
+        let text = encodeRecord (VersionEdit.encode edit)
+        let data = System.Text.Encoding.UTF8.GetBytes text
+        let expectedLine = text.TrimEnd '\n'
+
         let rec lastNewline (fs: System.IO.FileStream) pos =
             if pos <= 0L then
                 0L
@@ -490,48 +514,79 @@ module internal Manifest =
                 else
                     lastNewline fs (pos - 1L)
 
-        protect (fun () ->
-            let path = manifestPath dir manifestNumber
-
-            let data =
-                System.Text.Encoding.UTF8.GetBytes(encodeRecord (VersionEdit.encode edit))
-
-            use fs =
-                new System.IO.FileStream(
-                    path,
-                    System.IO.FileMode.OpenOrCreate,
-                    System.IO.FileAccess.ReadWrite,
-                    System.IO.FileShare.Read
-                )
-
-            let oldLength =
-                if fs.Length = 0L then
-                    0L
-                else
-                    fs.Position <- fs.Length - 1L
-
-                    if fs.ReadByte() = int '\n' then
-                        fs.Length
-                    else
-                        lastNewline fs (fs.Length - 1L)
-
-            if fs.Length <> oldLength then
-                fs.SetLength oldLength
-                fs.Flush true
-
-            fs.Position <- oldLength
-
-            try
-                fs.Write(data, 0, data.Length)
-                fs.Flush true
-                oldLength + int64 data.Length
-            with _ ->
+        let recordWasWritten oldLength =
+            match
                 protect (fun () ->
+                    System.IO.FileInfo(path).Length = oldLength + int64 data.Length
+                    && System.IO.File.ReadAllLines path |> Array.tryLast = Some expectedLine)
+            with
+            | Ok written -> written
+            | Error _ -> false
+
+        let rollback oldLength =
+            protect (fun () ->
+                use fs =
+                    new System.IO.FileStream(
+                        path,
+                        System.IO.FileMode.Open,
+                        System.IO.FileAccess.ReadWrite,
+                        System.IO.FileShare.Read
+                    )
+
+                if fs.Length <> oldLength then
                     fs.SetLength oldLength
                     fs.Flush true)
-                |> ignore
 
-                reraise ())
+        let oldLength =
+            protect (fun () ->
+                use fs =
+                    new System.IO.FileStream(
+                        path,
+                        System.IO.FileMode.OpenOrCreate,
+                        System.IO.FileAccess.ReadWrite,
+                        System.IO.FileShare.Read
+                    )
+
+                let oldLength =
+                    if fs.Length = 0L then
+                        0L
+                    else
+                        fs.Position <- fs.Length - 1L
+
+                        if fs.ReadByte() = int '\n' then
+                            fs.Length
+                        else
+                            lastNewline fs (fs.Length - 1L)
+
+                if fs.Length <> oldLength then
+                    fs.SetLength oldLength
+                    fs.Flush true
+
+                oldLength)
+
+        match oldLength with
+        | Error e -> Error(AppendRejected e)
+        | Ok oldLength ->
+            match
+                protect (fun () ->
+                    use fs =
+                        new System.IO.FileStream(
+                            path,
+                            System.IO.FileMode.Open,
+                            System.IO.FileAccess.Write,
+                            System.IO.FileShare.Read
+                        )
+
+                    fs.Position <- oldLength
+                    fs.Write(data, 0, data.Length)
+                    fs.Flush true)
+            with
+            | Ok() -> Ok(oldLength + int64 data.Length)
+            | Error _ when recordWasWritten oldLength -> Ok(oldLength + int64 data.Length)
+            | Error e ->
+                match rollback oldLength with
+                | Ok() -> Error(AppendRejected e)
+                | Error _ -> Error(AppendUncertain e)
 
     /// ディレクトリを作る（既にあれば何もしない）。
     let ensureDirectory (dir: string) =
@@ -647,63 +702,83 @@ module internal Manifest =
     [<Literal>]
     let private MaxManifestBytes = 4L * 1024L * 1024L
 
-    /// .VersionEdit を反映し、Version と次の manifest 番号を返す。
+    /// .VersionEdit を反映し、結果を「反映済み / 未反映 / 不明」で返す。
     /// <remarks>
-    /// 返した `Ok` は VersionEdit が MANIFEST に反映済みであることを意味する。
-    /// `Error` は「反映されていない」ことを意味する（追記途中の失敗は追記前の長さへ戻す）。
     /// ローテーションが必要な場合は、追記ではなく新しい MANIFEST へ Version 全体を書いて CURRENT を切り替える。
     /// CURRENT の切り替えに失敗した場合は旧 MANIFEST がそのまま残る。
     /// `manifestNumber` は単位 `manifestNo` を持つ。
     /// この関数は `version.NextFileNumber`（SSTable のファイル番号・素の `int64`）も扱うので、
     /// 2つの番号を取り違えるとコンパイルが通らない。
     /// </remarks>
-    let logAndApply (dir: string) (manifestNumber: int64<manifestNo>) (version: Version) (edit: VersionEdit) =
-        result {
-            let next = VersionEdit.apply version edit
-            let seed = version.NextFileNumber
+    let logAndApplyWithOutcome
+        (dir: string)
+        (manifestNumber: int64<manifestNo>)
+        (version: Version)
+        (edit: VersionEdit)
+        =
+        let next = VersionEdit.apply version edit
+        let seed = version.NextFileNumber
 
-            let highestAdded =
-                edit.AddedFiles |> List.fold (fun acc f -> max acc f.FileNumber) seed
+        let highestAdded =
+            edit.AddedFiles |> List.fold (fun acc f -> max acc f.FileNumber) seed
 
-            let used = highestAdded + 1L
-            let current = next.NextFileNumber
+        let used = highestAdded + 1L
+        let current = next.NextFileNumber
 
-            let bumped =
-                if used > current then
-                    { next with NextFileNumber = used }
-                else
-                    next
-
-            let recordLength =
-                VersionEdit.encode edit
-                |> encodeRecord
-                |> System.Text.Encoding.UTF8.GetByteCount
-                |> int64
-
-            let path = manifestPath dir manifestNumber
-
-            let! size =
-                protect (fun () ->
-                    if System.IO.File.Exists path then
-                        System.IO.FileInfo(path).Length
-                    else
-                        0L)
-
-            if size + recordLength > MaxManifestBytes then
-                let! nextNumber = nextManifestNumber dir manifestNumber
-                let! _ = writeSnapshot dir nextNumber bumped
-                let! _ = writeCurrent dir nextNumber
-
-                protect (fun () ->
-                    if System.IO.File.Exists path then
-                        System.IO.File.Delete path)
-                |> ignore
-
-                return bumped, nextNumber
+        let bumped =
+            if used > current then
+                { next with NextFileNumber = used }
             else
-                let! _ = append dir manifestNumber edit
-                return bumped, manifestNumber
-        }
+                next
+
+        let recordLength =
+            VersionEdit.encode edit
+            |> encodeRecord
+            |> System.Text.Encoding.UTF8.GetByteCount
+            |> int64
+
+        let path = manifestPath dir manifestNumber
+
+        match
+            protect (fun () ->
+                if System.IO.File.Exists path then
+                    System.IO.FileInfo(path).Length
+                else
+                    0L)
+        with
+        | Error e -> ManifestApplyResult.NotApplied e
+        | Ok size when size + recordLength > MaxManifestBytes ->
+            match nextManifestNumber dir manifestNumber with
+            | Error e -> ManifestApplyResult.NotApplied e
+            | Ok nextNumber ->
+                match writeSnapshot dir nextNumber bumped with
+                | Error e -> ManifestApplyResult.NotApplied e
+                | Ok() ->
+                    match writeCurrent dir nextNumber with
+                    | Error e -> ManifestApplyResult.NotApplied e
+                    | Ok() ->
+                        protect (fun () ->
+                            if System.IO.File.Exists path then
+                                System.IO.File.Delete path)
+                        |> ignore
+
+                        ManifestApplyResult.Applied(bumped, nextNumber)
+        | Ok _ ->
+            match append dir manifestNumber edit with
+            | Ok _ -> ManifestApplyResult.Applied(bumped, manifestNumber)
+            | Error(AppendRejected e) -> ManifestApplyResult.NotApplied e
+            | Error(AppendUncertain e) -> ManifestApplyResult.Unknown e
+
+    /// .VersionEdit を反映する。
+    /// <remarks>
+    /// 戻り値の `Ok` は「MANIFEST に反映済み」、`Error` は「反映されていないか不明」を表す。
+    /// 不明と未反映を区別する必要がある呼び出し側は `logAndApplyWithOutcome` を使う。
+    /// </remarks>
+    let logAndApply (dir: string) (manifestNumber: int64<manifestNo>) (version: Version) (edit: VersionEdit) =
+        match logAndApplyWithOutcome dir manifestNumber version edit with
+        | ManifestApplyResult.Applied(version, manifestNumber) -> Ok(version, manifestNumber)
+        | ManifestApplyResult.NotApplied e
+        | ManifestApplyResult.Unknown e -> Error e
 
 /// MANIFEST に反映済みの現在状態
 /// （background compaction が共有する）。

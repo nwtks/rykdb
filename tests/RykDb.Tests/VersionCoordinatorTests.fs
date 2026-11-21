@@ -148,6 +148,53 @@ let ``background compaction: 読み取り中のファイルは削除されず、
             RowStore.close store |> ignore)
 
 [<Fact>]
+let ``background compaction: 診断情報と再試行要求を公開する`` () =
+    withDir "bg-diagnostics" (fun dir ->
+        let store = openBackground dir 1 None
+
+        try
+            let host = expectSome "store.Host" store.Host
+            waitIdle host
+            Assert.True host.LastCompactionError.IsNone
+            host.Signal()
+            waitIdle host
+            Assert.True host.LastCompactionError.IsNone
+        finally
+            RowStore.close store |> ignore)
+
+[<Fact>]
+let ``background compaction: 走査は read lease より長く Version を pin する`` () =
+    withDir "bg-scan-pin" (fun dir ->
+        let store = openBackground dir 1 None
+
+        try
+            let mutable current = store
+
+            for i in 1..4 do
+                current <- writeOne current i
+
+            let host = expectSome "store.Host" store.Host
+            waitIdle host
+
+            // 現在の Version を取得し、走査だけが pin を持つ状態にする。
+            let snapStore, lease = RowStore.acquireSnapshot current
+            let scan = ok (RowStore.scan "t" [||] 0 snapStore)
+            lease.Dispose()
+
+            // 同じキーを新しい SeqNo で書き、compaction の入力を retired にする。
+            for i in 1..4 do
+                current <- writeWithSeq current (uint64 (100 + i)) i
+
+            waitIdle host
+
+            // 走査が Version を pin しているので、retired になってもファイルは残り、
+            // 最後まで読める。
+            let rows = ok (SstScan.toArray scan)
+            Assert.Equal(4, rows.Length)
+        finally
+            RowStore.close store |> ignore)
+
+[<Fact>]
 let ``background compaction: install 後に再オープンしても行が残る`` () =
     withDir "bg-reopen" (fun dir ->
         let store = openBackground dir 1 None

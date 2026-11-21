@@ -59,6 +59,11 @@ type internal VersionCoordinator
     let fileRefs =
         System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>()
 
+    /// Version 単位の参照数。最初の lease でファイルを pin し、最後の lease で release する。
+    /// 参照等価で数える（構造が同じ別の Version を取り違えない）。
+    let versionPins =
+        System.Collections.Concurrent.ConcurrentDictionary<Version, int> HashIdentity.Reference
+
     /// worker のライフサイクルと activity を 1セルで持つ（遷移は CAS 1回）。
     let workerCell =
         System.Collections.Concurrent.ConcurrentDictionary<string, WorkerState>()
@@ -152,6 +157,22 @@ type internal VersionCoordinator
 
         loop ()
 
+    /// Version の参照を 1つ増やす。
+    /// 初回だけ全ファイルを pin するので、同じ Version への並行 lease は O(1) で増やせる。
+    let pinVersion (version: Version) =
+        let rec loop () =
+            match versionPins.TryGetValue version with
+            | true, count ->
+                if not (versionPins.TryUpdate(version, count + 1, count)) then
+                    loop ()
+            | false, _ ->
+                if versionPins.TryAdd(version, 1) then
+                    Version.allFiles version |> List.iter (fun f -> pinFile f.FileNumber)
+                else
+                    loop ()
+
+        loop ()
+
     /// 参照を 1つ減らす。0 かつ retired なら実ファイルを消す。
     let releaseFile (fileNumber: int64) =
         let rec loop () =
@@ -205,6 +226,25 @@ type internal VersionCoordinator
                     if not (tryDeleteFile pair.Key) then
                         fileRefs.TryAdd(pair.Key, { Pins = 0; Retired = true }) |> ignore)
 
+    /// Version の参照を 1つ減らす。最後の参照なら全ファイルを release する。
+    let releaseVersion (version: Version) =
+        let rec loop () =
+            match versionPins.TryGetValue version with
+            | true, count when count > 1 ->
+                if not (versionPins.TryUpdate(version, count - 1, count)) then
+                    loop ()
+            | true, 1 ->
+                if versionPins.TryRemove(System.Collections.Generic.KeyValuePair(version, 1)) then
+                    Version.allFiles version
+                    |> List.iter (fun f -> releaseFile f.FileNumber |> ignore)
+
+                    sweep ()
+                else
+                    loop ()
+            | _ -> ()
+
+        loop ()
+
     let scan (f: FileMetaData) =
         Option.iter (fun hook -> hook f) scanHook
         scanOf f
@@ -236,7 +276,7 @@ type internal VersionCoordinator
                 |> ignore
             else
                 match
-                    Manifest.logAndApply
+                    Manifest.logAndApplyWithOutcome
                         dir
                         current.ManifestNumber
                         current.Version
@@ -245,13 +285,21 @@ type internal VersionCoordinator
                             DeletedFiles = result.Removed
                         }
                 with
-                | Error e ->
+                | ManifestApplyResult.NotApplied e ->
+                    FileMetaData.deleteObsolete dir result.Added |> ignore
+
                     publish (fun state ->
                         { state with
                             LastCompactionError = Some e
                         })
                     |> ignore
-                | Ok(version, manifestNumber) ->
+                | ManifestApplyResult.Unknown e ->
+                    publish (fun state ->
+                        { state with
+                            LastCompactionError = Some e
+                        })
+                    |> ignore
+                | ManifestApplyResult.Applied(version, manifestNumber) ->
                     publish (fun state ->
                         { state with
                             Version = version
@@ -430,6 +478,9 @@ type internal VersionCoordinator
     /// 現在の状態。
     member _.Current = stateCell.[stateKey]
 
+    /// 直近の compaction の失敗（成功したら None）。
+    member _.LastCompactionError = stateCell.[stateKey].LastCompactionError
+
     /// install / MANIFEST 追記を直列化する。
     member _.WithInstallGate(f: unit -> 'T) = withGate f
 
@@ -437,19 +488,26 @@ type internal VersionCoordinator
 
     member _.AllocateFileNumber() = allocateFileNumber ()
 
-    /// 現在 Version の全ファイルを pin したスナップショットを取る。
-    /// 返した IDisposable を dispose するまで、その Version のファイルは削除されない。
+    /// 現在 Version のスナップショットと、その Version を pin した lease を返す。
+    /// 同じ Version への複数 lease はファイル数に比例しない（初回だけ全ファイルを pin する）。
     member _.AcquireCall() =
         withGate (fun () ->
             let state = stateCell.[stateKey]
-            let files = Version.allFiles state.Version |> List.map _.FileNumber
-            files |> List.iter pinFile
+            pinVersion state.Version
 
             state,
             { new System.IDisposable with
-                member _.Dispose() =
-                    files |> List.iter (fun n -> releaseFile n |> ignore)
-                    sweep ()
+                member _.Dispose() = releaseVersion state.Version
+            })
+
+    /// 指定した Version を pin する lease を返す。
+    /// 走査が呼び出し元の read lease より長生きする場合に使う。
+    member _.AcquireVersion(version: Version) =
+        withGate (fun () ->
+            pinVersion version
+
+            { new System.IDisposable with
+                member _.Dispose() = releaseVersion version
             })
 
     member _.Signal() = signalWork ()

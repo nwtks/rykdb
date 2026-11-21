@@ -444,9 +444,11 @@ let ``Manifest: ローテーション失敗時は旧 MANIFEST に編集を残さ
         System.IO.Directory.CreateDirectory(System.IO.Path.Combine(dir, "MANIFEST-000002"))
         |> ignore
 
-        expectError "ローテーション失敗がエラーにならない" (Manifest.logAndApply dir mn0 v0 (VersionEdit.addFile file))
+        match Manifest.logAndApplyWithOutcome dir mn0 v0 (VersionEdit.addFile file) with
+        | ManifestApplyResult.NotApplied _ -> ()
+        | other -> failActual "ローテーション失敗は NotApplied であるべき" other
 
-        // Error は「編集が反映されていない」ことを意味する。旧 MANIFEST はそのまま開ける。
+        // NotApplied は「編集が反映されていない」ことを意味する。旧 MANIFEST はそのまま開ける。
         let v1, mn1 = ok (Manifest.openOrCreate dir)
         Assert.Equal<int64<manifestNo>>(mn0, mn1)
         Assert.Empty(Version.allFiles v1)
@@ -456,6 +458,17 @@ let ``Manifest: ローテーション失敗時は旧 MANIFEST に編集を残さ
         Assert.NotEqual<int64<manifestNo>>(mn1, mn2)
         let v3, _ = ok (Manifest.openOrCreate dir)
         Assert.Equal<int>(1, Version.allFiles v3 |> List.length))
+
+[<Fact>]
+let ``Manifest.logAndApplyWithOutcome: 通常の追記は Applied を返す`` () =
+    withDir "manifest-outcome-applied" (fun dir ->
+        let v0, mn0 = ok (Manifest.openOrCreate dir)
+
+        match Manifest.logAndApplyWithOutcome dir mn0 v0 (VersionEdit.addFile (fmd 1L 0 100 199)) with
+        | ManifestApplyResult.Applied(v1, mn1) ->
+            Assert.Equal<int64<manifestNo>>(mn0, mn1)
+            Assert.Equal<int>(1, Version.allFiles v1 |> List.length)
+        | other -> failActual "通常の追記は Applied であるべき" other)
 
 [<Fact>]
 let ``Manifest: 途中の壊れたレコードは CorruptionError`` () =
