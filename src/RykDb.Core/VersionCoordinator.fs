@@ -246,8 +246,6 @@ type internal VersionCoordinator
                         }
                 with
                 | Error e ->
-                    FileMetaData.deleteObsolete dir result.Added |> ignore
-
                     publish (fun state ->
                         { state with
                             LastCompactionError = Some e

@@ -458,19 +458,20 @@ module internal StorageEngine =
     /// データベースを開く（新規なら作る）。
     /// [memLimitBytes] を指定すると memtable の上限を差し替える。
     let openDatabaseWith (memLimitBytes: int option) (dir: string) =
-        let dropMissingFiles dir manifestNumber version =
+        let ensureFilesPresent dir version =
             let missing =
                 Version.allFiles version
                 |> List.filter (fun f -> not (System.IO.File.Exists(FileMetaData.path dir f.FileNumber)))
 
             if List.isEmpty missing then
-                ret (version, manifestNumber)
+                ret ()
             else
-                {
-                    VersionEdit.AddedFiles = []
-                    DeletedFiles = missing
-                }
-                |> Manifest.logAndApply dir manifestNumber version
+                let names =
+                    missing
+                    |> List.map (fun f -> FileMetaData.path dir f.FileNumber)
+                    |> String.concat ", "
+
+                DbError.corruption (sprintf "MANIFEST が参照する SSTable が見つかりません: %s" names) |> err
 
         let parseNumber (path: string) =
             match System.Int64.TryParse(System.IO.Path.GetFileNameWithoutExtension path) with
@@ -587,9 +588,9 @@ module internal StorageEngine =
 
         result {
             let! version, manifestNumber = Manifest.openOrCreate dir
-            let! version', manifestNumber' = dropMissingFiles dir manifestNumber version
-            do! quarantineOrphans dir version'
-            let! version' = hydrateVersion version'
+            do! ensureFilesPresent dir version
+            do! quarantineOrphans dir version
+            let! version' = hydrateVersion version
             let! walState = openOrCreateWal dir version'
 
             let! replayed =
@@ -599,11 +600,12 @@ module internal StorageEngine =
                     (fun (mem, maxSeq) entry -> Memtable.insert entry mem, max maxSeq entry.SeqNo)
                     (Memtable.Empty, 0UL)
 
-            let (mem, walMax), walMaxTxn = replayed
+            let (mem, walMax), walMaxTxn, goodWalSize = replayed
+            let! alignedWal = Wal.truncateTo dir walState goodWalSize
             let diskMax = maxSeqNoOnDisk version'
 
             let engine =
-                buildRecovered version' manifestNumber' walState mem walMax diskMax walMaxTxn
+                buildRecovered version' manifestNumber alignedWal mem walMax diskMax walMaxTxn
 
             return
                 match memLimitBytes with

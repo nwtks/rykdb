@@ -426,20 +426,29 @@ let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush �
         Assert.True((ok (disk.GetAtMasked None (intKey 1) [||])).IsSome))
 
 [<Fact>]
-let ``StorageEngine.openDatabaseWith: 実ファイルが消えていても NextFileNumber は進む`` () =
-    withDir "re-next-file" (fun dir ->
+let ``StorageEngine.openDatabaseWith: MANIFEST が参照する SSTable が無ければ CorruptionError`` () =
+    withDir "re-missing-file" (fun dir ->
         ok (Manifest.ensureDirectory dir)
-        // Version が参照するファイルが実在しない状態 + 番号 0 の WAL を作る
         let _ = ok (Manifest.openOrCreate dir)
 
         let _ =
             ok (Manifest.logAndApply dir 1L<manifestNo> Version.Empty (VersionEdit.addFile (fmd 1L 0 1 1)))
 
-        let _ = ok (Wal.create dir 0L)
+        expectErrorKind ErrorKind.CorruptionError "欠落した SSTable を黙って捨てない" (StorageEngine.openDatabaseWith None dir))
+
+[<Fact>]
+let ``StorageEngine.openDatabaseWith: ディスク上の最大ファイル番号の次から採番する`` () =
+    withDir "re-next-file" (fun dir ->
+        ok (Manifest.ensureDirectory dir)
+        let _ = ok (Manifest.openOrCreate dir)
+        let f = mkSst dir 11L 0 [ Entry.put (intKey 1) 1UL (intRow 1) ]
+
+        let _ =
+            ok (Manifest.logAndApply dir 1L<manifestNo> Version.Empty (VersionEdit.addFile f))
+
         let engine = ok (StorageEngine.openDatabaseWith None dir)
-        // 消えたファイルの削除で NextFileNumber は 2 に進み、0 番の WAL があっても巻き戻らない
-        Assert.Equal(2L, engine.Version.NextFileNumber)
-        Assert.Empty(Version.allFiles engine.Version))
+        Assert.Equal(12L, engine.Version.NextFileNumber)
+        Assert.Equal<int>(1, Version.allFiles engine.Version |> List.length))
 
 [<Fact>]
 let ``StorageEngine.openDatabaseWith: 最大 SeqNo はファイルの並び順に関係なく取れる`` () =
@@ -477,6 +486,39 @@ let ``StorageEngine.openDatabaseWith: NextTxnId は WAL の最大 txnId + 1 か�
 
         Assert.Equal<uint64<txnId>>(3UL<txnId>, reopened.NextTxnId)
         Assert.Equal<uint64<txnId>>(3UL<txnId>, (ok (StorageEngine.openDatabaseWith None dir)).NextTxnId))
+
+[<Fact>]
+let ``StorageEngine.openDatabaseWith: WAL の不完全な末尾を切り詰めて次の commit を失わない`` () =
+    withDir "wal-torn-tail" (fun dir ->
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
+
+        let engine =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 1) 1UL (intRow 1) |] engine)
+
+        // フレームヘッダだけを末尾に足し、ペイロードが欠けた状態を作る。
+        do
+            use fs =
+                new System.IO.FileStream(
+                    Wal.path dir engine.Wal.FileNumber,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.Write,
+                    System.IO.FileShare.ReadWrite
+                )
+
+            let garbage = [| 0xFFuy; 0xFFuy; 0xFFuy; 0xFFuy; 0uy; 0uy; 0uy; 0uy |]
+            fs.Seek(0L, System.IO.SeekOrigin.End) |> ignore
+            fs.Write(garbage, 0, garbage.Length)
+            fs.Flush true
+
+        let reopened = ok (StorageEngine.openDatabaseWith None dir)
+        Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] reopened)).IsSome)
+
+        let _ =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] reopened)
+
+        let reopened = ok (StorageEngine.openDatabaseWith None dir)
+        Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] reopened)).IsSome)
+        Assert.True((ok (StorageEngine.getAtMasked None (intKey 2) [||] reopened)).IsSome))
 
 [<Fact>]
 let ``StorageEngine.openDatabaseWith: 孤児の SSTable は削除せず退避する`` () =

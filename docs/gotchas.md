@@ -228,6 +228,7 @@ MANIFESTに反映した後に出力ファイルを削除し、削除の前にMAN
 
 `filesForPointLookup`はL0だけでなく全レベルを見る。
 レベルごとに順位を揃え、同レベルではファイル番号の降順で並べる。
+L0は範囲内の全ファイルを番号降順に返し、L1以降は`Smallest`の二分探索で1ファイルに絞る。
 
 ### 4.6 Footerサイズとレイアウトは同期する
 
@@ -243,6 +244,9 @@ heapだけを返すと同じファイルを毎行再オープンし無限ルー�
 
 Begin・Batch・Commitのフレームを結合して一度に書かず、フレームごとにWriteして最後に一度fsyncする。
 commit済みprefixだけを再生し、不完全な末尾は捨てる。
+open時は`Wal.foldCommitted`が返す最後の完全なフレーム位置までファイルを切り詰める。
+追記は`FileMode.Append`ではなく`WalState.Size`へ`SetLength`/`Seek`してから行い、
+不完全な末尾を残したまま次のcommitを書かない。
 
 ### 4.9 複数keyspaceのcommitは1本のWALバッチ
 
@@ -252,6 +256,8 @@ commit済みprefixだけを再生し、不完全な末尾は捨てる。
 ### 4.10 MANIFEST破損は空のVersionとして扱わない
 
 途中のレコード破損は`CorruptionError`。末尾の書きかけだけを許容する。
+末尾の書きかけを検出したら、復元できたVersionを新しいMANIFESTへ移して`CURRENT`を切り替える。
+ローテーションは追記の前に判定し、追記失敗時は追記前の長さへ切り詰める。
 `CURRENT`やMANIFESTがないのにSSTableが残っている場合もエラー。
 孤児は削除せず`.orphans/`へ退避する。
 
@@ -273,6 +279,9 @@ commit済みprefixだけを再生し、不完全な末尾は捨てる。
 
 MANIFESTへ反映する前に、削除対象ファイルが現在のVersionに存在するか、古いsnapshotが必要な版を守っているかを再確認する。
 ファイル番号は同じCAS採番経路だけで進める。
+`Manifest.logAndApply`の`Error`は「VersionEditが反映されていない」を意味する。
+それでも追記失敗の切り詰めが失敗する可能性を考え、compactionの出力は`Error`時に削除せず、
+次回openの`quarantineOrphans`に任せる。
 
 ### 4.15 maybeFlushの結果をcompaction失敗で巻き戻さない
 
@@ -285,6 +294,12 @@ WAL commit成功後に`Error`を返さない。
 `pump`は停止時に途中のmergeを持ち帰らない。
 `runPump`の`finally`で`SstMerge.dispose`し、出力の削除と入力ハンドルの解放を両方行う。
 片方だけだとWindowsで削除・renameが共有違反になる。
+
+### 4.17 MANIFESTが参照するSSTableの欠落はCorruptionError
+
+`ensureFilesPresent`は、MANIFESTが参照するSSTableが実在しなければ`CorruptionError`にする。
+欠落をVersionから黙って除くと、バックアップの誤りや削除事故を正常な空DBとして扱ってしまうため。
+`.orphans/`へ退避するのはMANIFESTが参照しないファイルだけにする。
 
 ---
 
@@ -513,6 +528,8 @@ shutdownではpermitに関係なくsignalを発行する。
 ラップではなく、走査を作った直後に`ScanScope`へ登録する。
 continuationを更新し、終端・エラー・Disposeで登録を外す。
 文の終端で`ScanScope.DisposeAll()`を呼ぶ。
+`clearSpaceChunks` / `clearKeyspaceChunks`のようにチャンク単位で走査し直す処理も、
+取得したチャンクのcontinuationを必ず`SstScan.dispose`する。
 
 ### 8.10 group commitの失敗はSession全体をfatalにする
 

@@ -191,15 +191,45 @@ module internal Version =
 
         { v with Files = newFiles }
 
+    /// レベル内で key を含み得るファイルを 1つ返す。
+    /// L1 以降は Smallest 昇順・非重複なので二分探索できる。
+    let private findLevelFile (key: byte array) (files: FileMetaData array) =
+        let rec search lo hi =
+            if lo >= hi then
+                lo
+            else
+                let mid = lo + (hi - lo) / 2
+
+                if Bytes.compare files.[mid].Smallest key <= 0 then
+                    search (mid + 1) hi
+                else
+                    search lo mid
+
+        let index = search 0 files.Length
+
+        if index > 0 && FileMetaData.mightContain key files.[index - 1] then
+            Some files.[index - 1]
+        else
+            None
+
     /// ポイントルックアップで consulted すべきファイル（新しい順）。
+    /// L0 はキー域が重なり得るので範囲内の全ファイルを番号降順に返す。
+    /// L1 以降は 1ファイル = 1キー域なので、レベルごとの二分探索で候補を絞る。
     let filesForPointLookup (key: byte array) (v: Version) =
-        v.Files
-        |> Array.mapi (fun level files -> files |> Array.map (fun f -> level, f))
-        |> Array.collect id
-        |> Array.filter (fun (_, f) -> FileMetaData.mightContain key f)
-        |> Array.sortByDescending (fun (level, f) -> struct (-level, f.FileNumber))
-        |> Array.map snd
-        |> Array.toList
+        let l0 =
+            v.Files.[0]
+            |> Array.filter (fun f -> FileMetaData.mightContain key f)
+            |> Array.sortByDescending (fun f -> f.FileNumber)
+            |> Array.toList
+
+        let higher =
+            [ 1 .. Levels.Count - 1 ]
+            |> List.collect (fun level ->
+                match findLevelFile key v.Files.[level] with
+                | Some f -> [ f ]
+                | None -> [])
+
+        l0 @ higher
 
     /// すべてのファイル（レベル昇順、同レベルはキー昇順）。
     let allFiles (v: Version) =
@@ -399,6 +429,110 @@ module internal Manifest =
         | :? System.FormatException as e -> err (sprintf "manifest の base64 が不正: %s" e.Message |> DbError.corruption)
         | e -> err (sprintf "manifest のレコードが不正: %s" e.Message |> DbError.corruption)
 
+    /// manifest のファイル名から番号を取り出す。
+    let private parseManifestNumber (path: string) =
+        let name = System.IO.Path.GetFileName path
+
+        if name.StartsWith(ManifestPrefix, System.StringComparison.Ordinal) then
+            match System.Int64.TryParse(name.Substring 9) with
+            | true, value -> Some(LanguagePrimitives.Int64WithMeasure<manifestNo> value)
+            | _ -> None
+        else
+            None
+
+    /// 既存の最大番号より 1つ大きい manifest 番号を返す。
+    let private nextManifestNumber (dir: string) (current: int64<manifestNo>) =
+        protect (fun () ->
+            System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")
+            |> Array.choose parseManifestNumber
+            |> Array.fold (fun acc number -> max acc number) current
+            |> fun highest -> highest + 1L<manifestNo>)
+
+    /// Version 全体を新しい manifest に書き出す（スナップショット）。
+    let private writeSnapshot (dir: string) (manifestNumber: int64<manifestNo>) (version: Version) =
+        protect (fun () ->
+            let edit =
+                {
+                    AddedFiles = Version.allFiles version
+                    DeletedFiles = []
+                }
+
+            let data =
+                System.Text.Encoding.UTF8.GetBytes(encodeRecord (VersionEdit.encode edit))
+
+            use fs =
+                new System.IO.FileStream(
+                    manifestPath dir manifestNumber,
+                    System.IO.FileMode.Create,
+                    System.IO.FileAccess.Write,
+                    System.IO.FileShare.Read
+                )
+
+            fs.Write(data, 0, data.Length)
+            fs.Flush true)
+
+    /// MANIFEST に 1レコード追記する。
+    /// <remarks>
+    /// 末尾が改行で終わっていなければ、前回の書き込みが途中で失敗したとみなして
+    /// 最後の完全な行まで切り詰めてから追記する。
+    /// 書き込み中に失敗した場合も、追記前の長さまで戻す。
+    /// これにより、失敗した追記が後続のレコードを読めなくすることがない。
+    /// </remarks>
+    let private append (dir: string) (manifestNumber: int64<manifestNo>) (edit: VersionEdit) =
+        let rec lastNewline (fs: System.IO.FileStream) pos =
+            if pos <= 0L then
+                0L
+            else
+                fs.Position <- pos - 1L
+
+                if fs.ReadByte() = int '\n' then
+                    pos
+                else
+                    lastNewline fs (pos - 1L)
+
+        protect (fun () ->
+            let path = manifestPath dir manifestNumber
+
+            let data =
+                System.Text.Encoding.UTF8.GetBytes(encodeRecord (VersionEdit.encode edit))
+
+            use fs =
+                new System.IO.FileStream(
+                    path,
+                    System.IO.FileMode.OpenOrCreate,
+                    System.IO.FileAccess.ReadWrite,
+                    System.IO.FileShare.Read
+                )
+
+            let oldLength =
+                if fs.Length = 0L then
+                    0L
+                else
+                    fs.Position <- fs.Length - 1L
+
+                    if fs.ReadByte() = int '\n' then
+                        fs.Length
+                    else
+                        lastNewline fs (fs.Length - 1L)
+
+            if fs.Length <> oldLength then
+                fs.SetLength oldLength
+                fs.Flush true
+
+            fs.Position <- oldLength
+
+            try
+                fs.Write(data, 0, data.Length)
+                fs.Flush true
+                oldLength + int64 data.Length
+            with _ ->
+                protect (fun () ->
+                    fs.SetLength oldLength
+                    fs.Flush true)
+                |> ignore
+
+                reraise ())
+
     /// ディレクトリを作る（既にあれば何もしない）。
     let ensureDirectory (dir: string) =
         protect (fun () ->
@@ -476,11 +610,24 @@ module internal Manifest =
             match current with
             | Some manifestNumber ->
                 let! decoded = readAll dir manifestNumber
-                let edits, _, hasContent = decoded
+                let edits, truncated, hasContent = decoded
                 let version = applyAll edits Version.Empty
 
                 if List.isEmpty (Version.allFiles version) && hasContent && hasSsts then
                     return! err (DbError.corruption "manifest が壊れており、SSTable の管理情報を復元できません（SSTable は変更していません）")
+                elif truncated then
+                    let! nextNumber = nextManifestNumber dir manifestNumber
+                    let! _ = writeSnapshot dir nextNumber version
+                    let! _ = writeCurrent dir nextNumber
+
+                    protect (fun () ->
+                        let old = manifestPath dir manifestNumber
+
+                        if System.IO.File.Exists old then
+                            System.IO.File.Delete old)
+                    |> ignore
+
+                    return version, nextNumber
                 else
                     return version, manifestNumber
             | None ->
@@ -502,69 +649,16 @@ module internal Manifest =
 
     /// .VersionEdit を反映し、Version と次の manifest 番号を返す。
     /// <remarks>
+    /// 返した `Ok` は VersionEdit が MANIFEST に反映済みであることを意味する。
+    /// `Error` は「反映されていない」ことを意味する（追記途中の失敗は追記前の長さへ戻す）。
+    /// ローテーションが必要な場合は、追記ではなく新しい MANIFEST へ Version 全体を書いて CURRENT を切り替える。
+    /// CURRENT の切り替えに失敗した場合は旧 MANIFEST がそのまま残る。
     /// `manifestNumber` は単位 `manifestNo` を持つ。
     /// この関数は `version.NextFileNumber`（SSTable のファイル番号・素の `int64`）も扱うので、
     /// 2つの番号を取り違えるとコンパイルが通らない。
     /// </remarks>
     let logAndApply (dir: string) (manifestNumber: int64<manifestNo>) (version: Version) (edit: VersionEdit) =
-        let append dir manifestNumber edit =
-            protect (fun () ->
-                let path = manifestPath dir manifestNumber
-                let text = encodeRecord (VersionEdit.encode edit)
-
-                use fs =
-                    new System.IO.FileStream(
-                        path,
-                        System.IO.FileMode.Append,
-                        System.IO.FileAccess.Write,
-                        System.IO.FileShare.Read
-                    )
-
-                let data = System.Text.Encoding.UTF8.GetBytes text
-                fs.Write(data, 0, data.Length)
-                fs.Flush true)
-
-        let parseManifestNumber (path: string) =
-            let name = System.IO.Path.GetFileName path
-
-            if name.StartsWith(ManifestPrefix, System.StringComparison.Ordinal) then
-                match System.Int64.TryParse(name.Substring 9) with
-                | true, value -> Some(LanguagePrimitives.Int64WithMeasure<manifestNo> value)
-                | _ -> None
-            else
-                None
-
-        let nextManifestNumber dir current =
-            protect (fun () ->
-                System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")
-                |> Array.choose parseManifestNumber
-                |> Array.fold (fun acc number -> max acc number) current
-                |> fun highest -> highest + 1L<manifestNo>)
-
-        let writeSnapshot dir manifestNumber version =
-            protect (fun () ->
-                let edit =
-                    {
-                        AddedFiles = Version.allFiles version
-                        DeletedFiles = []
-                    }
-
-                let text = encodeRecord (VersionEdit.encode edit)
-                let data = System.Text.Encoding.UTF8.GetBytes text
-
-                use fs =
-                    new System.IO.FileStream(
-                        manifestPath dir manifestNumber,
-                        System.IO.FileMode.Create,
-                        System.IO.FileAccess.Write,
-                        System.IO.FileShare.Read
-                    )
-
-                fs.Write(data, 0, data.Length)
-                fs.Flush true)
-
         result {
-            let! _ = append dir manifestNumber edit
             let next = VersionEdit.apply version edit
             let seed = version.NextFileNumber
 
@@ -580,24 +674,35 @@ module internal Manifest =
                 else
                     next
 
-            let! size =
-                protect (fun () -> System.IO.FileInfo(manifestPath dir manifestNumber).Length)
+            let recordLength =
+                VersionEdit.encode edit
+                |> encodeRecord
+                |> System.Text.Encoding.UTF8.GetByteCount
+                |> int64
 
-            if size < MaxManifestBytes then
-                return bumped, manifestNumber
-            else
+            let path = manifestPath dir manifestNumber
+
+            let! size =
+                protect (fun () ->
+                    if System.IO.File.Exists path then
+                        System.IO.FileInfo(path).Length
+                    else
+                        0L)
+
+            if size + recordLength > MaxManifestBytes then
                 let! nextNumber = nextManifestNumber dir manifestNumber
                 let! _ = writeSnapshot dir nextNumber bumped
                 let! _ = writeCurrent dir nextNumber
 
                 protect (fun () ->
-                    let old = manifestPath dir manifestNumber
-
-                    if System.IO.File.Exists old then
-                        System.IO.File.Delete old)
+                    if System.IO.File.Exists path then
+                        System.IO.File.Delete path)
                 |> ignore
 
                 return bumped, nextNumber
+            else
+                let! _ = append dir manifestNumber edit
+                return bumped, manifestNumber
         }
 
 /// MANIFEST に反映済みの現在状態

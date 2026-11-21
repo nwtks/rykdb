@@ -252,7 +252,9 @@ module internal ExecState =
                 match SstScan.next scan with
                 | Ok None -> ret (List.rev acc, SstScan.Empty)
                 | Ok(Some(e, rest)) -> loop (e :: acc) (n - 1) rest
-                | Error e -> err e
+                | Error e ->
+                    SstScan.dispose scan
+                    err e
 
         loop []
 
@@ -293,7 +295,9 @@ module internal ExecState =
             match RowStore.scanKeys space startKey 0 st.Store with
             | Ok scan ->
                 match takeScanChunk BackfillChunkRows scan with
-                | Ok(chunk, _) ->
+                | Ok(chunk, rest) ->
+                    SstScan.dispose rest
+
                     match List.tryLast chunk with
                     | None -> ret st
                     | Some lastEntry ->

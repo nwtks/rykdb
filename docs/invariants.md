@@ -39,8 +39,8 @@ F# の型システムでは表現できないため、
 | INV-05 | `TransactionManager` の SeqNo / Active / LastCommitted                       | `TransactionsTests.fs` の private `validate`                                                                                                                                                                                           | ✅ 完了 |
 | INV-06 | `Version` のレベル・番号・範囲                                               | `VersionSetTests.fs` の private `validate`                                                                                                                                                                                             | ✅ 完了 |
 | INV-07 | compaction GC は可視集合を保存                                               | `Compaction.gcGroup` と可視性プロパティテスト                                                                                                                                                                                          | ✅ 完了 |
-| INV-08 | MANIFEST は追記専用・番号は単調                                              | `VersionEdit` encode/decode + 再オープンのプロパティテスト                                                                                                                                                                             | ✅ 完了 |
-| INV-09 | WAL は commit 済み prefix だけ再生                                           | `Wal.foldCommitted` の全切断位置テスト                                                                                                                                                                                                 | ✅ 完了 |
+| INV-08 | MANIFEST は追記専用・番号は単調。末尾の書きかけは修復する                    | `VersionEdit` encode/decode + 再オープンのプロパティテスト、末尾修復・ローテーション失敗の回帰テスト                                                                                                                                   | ✅ 完了 |
+| INV-09 | WAL は commit 済み prefix だけ再生し、open 時に torn tail を切り詰める       | `Wal.foldCommitted` の全切断位置テスト + torn tail 後の追記テスト                                                                                                                                                                      | ✅ 完了 |
 | INV-10 | keyspace 接頭辞が混ざらない                                                  | `Keyspace.prefixedKey` の往復・非相互接頭辞テスト、`RowStore` のキー分離テスト                                                                                                                                                         | ✅ 完了 |
 | INV-11 | ヘッダ長 = 行幅 = 射影長                                                     | `SelectProjection.create`（式・表示ヘッダ・参照ヘッダを一度に構築）                                                                                                                                                                    | ✅ 完了 |
 | INV-12 | `Cursor` は `0 <= Pos <= End <= Data.Length`                                 | `Cursor.fsi`（レコード非公開、構築は `create` / `createSlice`、前進は `advance`）+ `createSlice` の構築時検証 + プロパティテスト                                                                                                       | ✅ 完了 |
@@ -197,16 +197,26 @@ ID 順。宣言・根拠・担保・回帰テストを 1件ずつ示す。
 
 - `VersionEdit.encode` / `decode` の round-trip。
 - `Manifest.logAndApply` で追記した編集を `Manifest.openOrCreate` で再読込しても同じファイル集合になる。
+- `Manifest.logAndApply` の `Error` は「VersionEdit が反映されていない」を意味する。
+  ローテーションは追記前に判定し、追記失敗時は追記前の長さへ戻す。
+- 末尾の書きかけを検出した場合は、復元できた Version を新しい MANIFEST へ移して `CURRENT` を切り替える。
 - 回帰テスト:
   - `VersionEdit: ランダムな編集を encode/decode しても同じ`
   - `Manifest: ランダムな VersionEdit を追記して再オープンしても同じファイル集合`
+  - `Manifest: 末尾の書きかけを修復した後に追記できる`
+  - `Manifest: ローテーション失敗時は旧 MANIFEST に編集を残さない`
 - 補足: `VersionEdit.apply` は `NextFileNumber` を進めない。再オープン時の採番は
   `StorageEngine` がディスク上の最大番号から再構築する。
 
 ### INV-09 WAL
 
 - `Wal.foldCommitted` は任意のバイト位置で切っても、commit 済みトランザクションの prefix だけを再生する。
-- 回帰テスト: `Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だけ再生する`。
+- `Wal.foldCommitted` は最後の完全なフレームの終端位置を返し、
+  `StorageEngine.openDatabaseWith` はそこまで WAL を切り詰める。
+- 追記は `WalState.Size` から行い、不完全な末尾を残したまま次の commit を書かない。
+- 回帰テスト:
+  - `Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だけ再生する`
+  - `StorageEngine.openDatabaseWith: WAL の不完全な末尾を切り詰めて次の commit を失わない`
 
 ### INV-10 keyspace 接頭辞
 

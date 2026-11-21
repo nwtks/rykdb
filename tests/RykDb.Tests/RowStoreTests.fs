@@ -495,3 +495,52 @@ let ``RowStore.clearKeyspaceChunks: チャンクを跨いでも全件を消す``
         let store, _mgr = ok (RowStore.clearKeyspaceChunks mgr space store)
         let rows = ok (RowStore.scan space [||] 0 store) |> SstScan.toArray |> ok
         Assert.Empty rows)
+
+[<Fact>]
+let ``RowStore.clearKeyspaceChunks: チャンクを跨いでも走査のハンドルを残さない`` () =
+    withDir "clear-chunks-handles" (fun dir ->
+        // memtable 上限を 1 にして、すべてのチャンクを SSTable に落とす。
+        let store =
+            ok (
+                RowStore.openStoreWithOptions
+                    { RowStoreOptions.Default with
+                        MemLimitBytes = Some 1
+                    }
+                    dir
+            )
+
+        try
+            let space = Keyspace.table "t"
+
+            let entries =
+                [| for i in 0..8200 -> Entry.put (intKey i) (uint64 (i + 1)) (intRow i) |]
+
+            let store = ok (RowStore.writeBatches [ (space, entries) ] store)
+
+            let mgr =
+                { TransactionManager.create () with
+                    NextSeqNo = 8202UL
+                    LastCommitSeqNo = 8201UL
+                }
+
+            let mgr, _ = TransactionManager.beginTxn mgr
+            let store, _mgr = ok (RowStore.clearKeyspaceChunks mgr space store)
+
+            // 走査の continuation が残っていれば、同じ SSTable を排他で開けない。
+            let files = System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
+            Assert.NotEmpty files
+
+            for path in files do
+                use _ =
+                    new System.IO.FileStream(
+                        path,
+                        System.IO.FileMode.Open,
+                        System.IO.FileAccess.ReadWrite,
+                        System.IO.FileShare.None
+                    )
+
+                ()
+
+            RowStore.close store |> ignore
+        finally
+            RowStore.close store |> ignore)

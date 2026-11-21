@@ -37,7 +37,7 @@ let ``Wal.foldCommitted: コミット済みだけを順に再生する`` () =
 
         let _ = ok (Wal.append dir records w0)
 
-        let replayed, maxTxnId =
+        let replayed, maxTxnId, _ =
             ok (Wal.foldCommitted dir 1L (fun acc entry -> entry :: acc) [])
 
         Assert.Equal<uint64 list>([ 1UL; 3UL ], List.rev replayed |> List.map _.SeqNo)
@@ -75,7 +75,7 @@ let ``Wal.foldCommitted: 任意の位置で切っても commit 済み prefix だ
         let bytes = System.IO.File.ReadAllBytes path
 
         let replay () =
-            let entries, _ = ok (Wal.foldCommitted dir 1L (fun acc entry -> entry :: acc) [])
+            let entries, _, _ = ok (Wal.foldCommitted dir 1L (fun acc entry -> entry :: acc) [])
             List.rev entries
 
         let expected = replay ()

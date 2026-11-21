@@ -127,18 +127,29 @@ module internal Wal =
                 use fs =
                     new System.IO.FileStream(
                         path dir state.FileNumber,
-                        System.IO.FileMode.Append,
+                        System.IO.FileMode.OpenOrCreate,
                         System.IO.FileAccess.Write,
                         System.IO.FileShare.ReadWrite
                     )
 
-                writeAll fs 0 records
-                |> Result.map (fun written ->
-                    fs.Flush sync
+                let expected = int64 state.Size
 
-                    { state with
-                        Size = state.Size + written
-                    }))
+                if fs.Length < expected then
+                    err (DbError.corruption "Wal: 記録よりファイルが短くなっています")
+                else
+                    if fs.Length > expected then
+                        fs.SetLength expected
+                        fs.Flush true
+
+                    fs.Seek(expected, System.IO.SeekOrigin.Begin) |> ignore
+
+                    writeAll fs 0 records
+                    |> Result.map (fun written ->
+                        fs.Flush sync
+
+                        { state with
+                            Size = state.Size + written
+                        }))
             >>= id
 
     /// レコード列を追記して fsync まで行う。
@@ -174,8 +185,9 @@ module internal Wal =
 
     /// コミット済みエントリをメモリに溜めず、1件ずつ `step` へ渡して再生する。
     /// 大きな WAL でもコミット済みエントリの配列を保持しない。
-    /// 戻り値は `(再生後の状態, WAL に現れた最大 txnId)`。
+    /// 戻り値は `(再生後の状態, WAL に現れた最大 txnId, 最後の完全なフレームの終端位置)`。
     /// 最大 txnId は open 時に NextTxnId を復元し、既存ファイル内での採番の再利用を防ぐために返す。
+    /// 終端位置は open 時に不完全な末尾を切り詰めるために返す。
     let foldCommitted (dir: string) (fileNumber: int64) (step: 's -> Entry -> 's) (initial: 's) =
         let readAtMost (fs: System.IO.FileStream) (buffer: byte array) =
             let rec loop offset =
@@ -213,10 +225,12 @@ module internal Wal =
                     else
                         decodePayload payload |> Result.map Some
 
-        let foldFrames fs step initial =
+        let foldFrames (fs: System.IO.FileStream) step initial =
             let rec loop state =
+                let positionBefore = fs.Position
+
                 match readFrameFrom fs with
-                | Ok None -> ret state
+                | Ok None -> ret (state, positionBefore)
                 | Ok(Some record) ->
                     match step state record with
                     | Ok next -> loop next
@@ -243,7 +257,7 @@ module internal Wal =
 
         protect (fun () ->
             if not (System.IO.File.Exists p) then
-                ret (initial, 0UL<txnId>)
+                ret (initial, 0UL<txnId>, 0L)
             else
                 use fs =
                     new System.IO.FileStream(
@@ -254,8 +268,36 @@ module internal Wal =
                     )
 
                 foldFrames fs (fun state record -> ret (applyRecord state record)) ([], 0UL<txnId>, initial)
-                |> Result.map (fun (_, maxTxnId, state) -> state, maxTxnId))
+                |> Result.map (fun ((_, maxTxnId, state), goodSize) -> state, maxTxnId, goodSize))
         >>= id
+
+    /// 最後の完全なフレームの終端までファイルを切り詰め、WalState の Size を合わせる。
+    /// 不完全な末尾を残したまま追記すると、次回の再生がそこで止まり、
+    /// 後続の commit が見えなくなるため、open 時に必ず呼ぶ。
+    let truncateTo (dir: string) (state: WalState) (goodSize: int64) =
+        if goodSize < 0L || goodSize > int64 System.Int32.MaxValue then
+            err (DbError.internalError "Wal: ファイルサイズが範囲外です")
+        else
+            let p = path dir state.FileNumber
+
+            protect (fun () ->
+                if not (System.IO.File.Exists p) then
+                    err (DbError.create ErrorKind.IoError (sprintf "WAL が見つかりません: %s" p))
+                else
+                    use fs =
+                        new System.IO.FileStream(
+                            p,
+                            System.IO.FileMode.Open,
+                            System.IO.FileAccess.ReadWrite,
+                            System.IO.FileShare.ReadWrite
+                        )
+
+                    if fs.Length <> goodSize then
+                        fs.SetLength goodSize
+                        fs.Flush true
+
+                    ret { state with Size = int goodSize })
+            >>= id
 
     /// ディレクトリ内の WAL ファイル名（復旧時に孤児を消すのに使う）。
     let walFiles (dir: string) =

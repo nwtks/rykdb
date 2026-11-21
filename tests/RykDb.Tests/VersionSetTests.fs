@@ -221,6 +221,27 @@ let ``Version.filesForPointLookup: ポイントルックアップの候補は新
     // 範囲外のキーは候補なし
     Assert.Empty(Version.filesForPointLookup (intKey 9999) v)
 
+    // L1 以降は二分探索で 1ファイルに絞る（境界の前後も確認する）。
+    let l1Many =
+        Version.Empty
+        |> Version.addFile (fmd 10L 1 100 199)
+        |> Version.addFile (fmd 11L 1 200 299)
+        |> Version.addFile (fmd 12L 1 300 399)
+
+    Assert.Equal<int64 list>(
+        [ 11L ],
+        Version.filesForPointLookup (intKey 250) l1Many
+        |> List.map (fun f -> f.FileNumber)
+    )
+
+    Assert.Equal<int64 list>(
+        [ 12L ],
+        Version.filesForPointLookup (intKey 399) l1Many
+        |> List.map (fun f -> f.FileNumber)
+    )
+
+    Assert.Empty(Version.filesForPointLookup (intKey 50) l1Many)
+
 [<Fact>]
 let ``VersionEdit.apply: 変更適用は削除後に追加する`` () =
     let oldFile = fmd 1L 0 100 199
@@ -383,6 +404,58 @@ let ``Manifest: 末尾の書きかけレコードは読み飛ばす`` () =
         // 末尾だけなので読み飛ばし、1 件目までの状態が残る
         let reopened, _ = ok (Manifest.openOrCreate dir)
         Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], levelCounts reopened))
+
+[<Fact>]
+let ``Manifest: 末尾の書きかけを修復した後に追記できる`` () =
+    withDir "manifest-repair-tail" (fun dir ->
+        let v0, mn0 = ok (Manifest.openOrCreate dir)
+        let _ = applyEdit dir mn0 v0 (VersionEdit.addFile (fmd 1L 0 100 199))
+        System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "MANIFEST-000001"), "!!!not-base64!!!\n")
+
+        // 末尾の書きかけを検出したら、復元できた Version を新しい MANIFEST に移す。
+        let v1, mn1 = ok (Manifest.openOrCreate dir)
+        Assert.NotEqual<int64<manifestNo>>(mn0, mn1)
+        Assert.Equal<int>(1, Version.allFiles v1 |> List.length)
+
+        // 修復後の MANIFEST に追記しても、次の再オープンで両方の編集が残る。
+        let _ = applyEdit dir mn1 v1 (VersionEdit.addFile (fmd 2L 0 200 299))
+        let v2, _ = ok (Manifest.openOrCreate dir)
+        Assert.Equal<int array>([| 2; 0; 0; 0; 0; 0; 0 |], levelCounts v2))
+
+[<Fact>]
+let ``Manifest: ローテーション失敗時は旧 MANIFEST に編集を残さない`` () =
+    withDir "manifest-rotation-failure" (fun dir ->
+        let v0, mn0 = ok (Manifest.openOrCreate dir)
+        let big = Array.create (5 * 1024 * 1024) 1uy
+
+        let file =
+            { FileMetaData.Zero with
+                FileNumber = 1L
+                Level = 0
+                Smallest = big
+                Largest = big
+                EntryCount = 1L
+                Size = 1L
+                MaxSeqNo = 1UL
+                ReadInfo = None
+            }
+
+        // 次の manifest 番号をディレクトリで塞ぎ、スナップショット書き込みを失敗させる。
+        System.IO.Directory.CreateDirectory(System.IO.Path.Combine(dir, "MANIFEST-000002"))
+        |> ignore
+
+        expectError "ローテーション失敗がエラーにならない" (Manifest.logAndApply dir mn0 v0 (VersionEdit.addFile file))
+
+        // Error は「編集が反映されていない」ことを意味する。旧 MANIFEST はそのまま開ける。
+        let v1, mn1 = ok (Manifest.openOrCreate dir)
+        Assert.Equal<int64<manifestNo>>(mn0, mn1)
+        Assert.Empty(Version.allFiles v1)
+
+        System.IO.Directory.Delete(System.IO.Path.Combine(dir, "MANIFEST-000002"))
+        let _, mn2 = ok (Manifest.logAndApply dir mn1 v1 (VersionEdit.addFile file))
+        Assert.NotEqual<int64<manifestNo>>(mn1, mn2)
+        let v3, _ = ok (Manifest.openOrCreate dir)
+        Assert.Equal<int>(1, Version.allFiles v3 |> List.length))
 
 [<Fact>]
 let ``Manifest: 途中の壊れたレコードは CorruptionError`` () =

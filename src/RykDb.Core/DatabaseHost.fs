@@ -197,7 +197,15 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
             RowStore.close store |> ignore
             err e
         | Ok catalog ->
-            match TransactionManager.create () |> DropCleanupRecovery.recover store catalog with
+            let lastSeq = RowStore.lastSeqNo store
+
+            let seeded =
+                { TransactionManager.create () with
+                    LastCommitSeqNo = lastSeq
+                    NextSeqNo = lastSeq + 1UL
+                }
+
+            match seeded |> DropCleanupRecovery.recover store catalog with
             | Error e ->
                 RowStore.close store |> ignore
                 err e

@@ -1573,6 +1573,8 @@ WAL 再生で得た最大 txnId + 1 から NextTxnId を復元するため、
 
 - `FileMetaData.mightContain key` は Bloom より粗い判定（`Smallest ≤ key ≤ Largest`）。
 - `filesForPointLookup` はポイントルックアップ用のファイル順（新しい順）を返す。
+  L0 はキー域が重なり得るので範囲内の全ファイルを番号降順に並べ、
+  L1 以降は `Smallest` の二分探索でキーを含み得る 1ファイルに絞る。
 - **ファイル追加・削除は新しい `Version` を返す**ので、読み取り中に状態が書き換わらない。
 
 `VersionEdit` は Version の変更履歴で、直列化されて MANIFEST に書かれる。
@@ -1617,6 +1619,19 @@ checksum は本体全体の CRC32C。
 `MANIFEST` が 4MiB を超えると、現在の Version 全体を新しい番号の manifest へ書き、
 `CURRENT` を切り替えてから旧ファイルを削除する。起動時に読む履歴の長さを抑えるため。
 
+ローテーションは**追記の前**に判定する。
+今回の VersionEdit を含む Version 全体を新しいmanifest へ書き、
+`CURRENT` の切り替えに成功してから旧 manifest を削除する。
+`CURRENT` の切り替えに失敗した場合は旧 manifest がそのまま残るので、
+呼び出し側は「VersionEdit は反映されていない」と扱える。
+
+通常の追記は、末尾が改行で終わっていなければ最後の完全な行まで切り詰めてから行い、
+追記中に失敗した場合も追記前の長さへ戻す。
+起動時に末尾の書きかけを検出した場合は、
+それまでの Version を新しい manifest へスナップショットして `CURRENT` を切り替える。
+書きかけの行を残したまま追記すると、次回のオープン時に「壊れた行の後ろに有効な行」ができ、
+`CorruptionError` で開けなくなるため。
+
 `CURRENT` の更新は「`CURRENT.tmp` へ書き込んでから `File.Move(上書き)` で置き換える」原子的な書き換え
 （`Manifest.writeCurrent`）。書きかけの `CURRENT` が残らないので、クラッシュ後も
 `CURRENT` は旧番号か新番号のどちらか、**有効な** manifest を指す。
@@ -1655,6 +1670,14 @@ Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
   Begin / Batch / Commit は各フレームが checksum（CRC32C）で守られ、
   未 commit の Batch は再生時に捨てられるので、
   途中で落ちてもコミット済みトランザクションが中途半端にならない。
+- **open 時に不完全な末尾を切り詰める**。
+  `Wal.foldCommitted` は最後の完全なフレームの終端位置を返し、
+  `StorageEngine.openDatabaseWith` はそこまで WAL を切り詰めてから `WalState.Size` を合わせる。
+  不完全な末尾を残したまま新しい commit を追記すると、次回の再生がその末尾で止まり、
+  後続の commit が見えなくなるため。
+- **追記は `WalState.Size` から行う**。
+  `FileMode.Append` ではなく `SetLength` / `Seek` で既知の正常位置へ合わせてから書く。
+  追記途中の失敗で残った部分フレームも、次の追記時に切り詰められる。
 - **Session 経由の commit は `Flush(false)` で追記し、fsync をグループ化する**。
   `Session` は `writeGate` を解放してから、
   登録済みの最大 WAL 位置まで `Wal.sync` で 1回だけ `Flush(true)` する。
@@ -1709,6 +1732,8 @@ GC は**版（エントリ）単位**で行う。ファイル単位の SeqNo 判
 （snapshot S の読み手は `SeqNo <= S` の版を見るので、**SeqNo が小さい版こそ**まだ読まれ得る）。
 `ActiveSnapshot` は `TransactionManager.activeSnapshot` が返す最古の active snapshot で、active が無ければ次の SeqNo。
 0 は「全版を残す」を意味する（replay 時など）。
+`RowStore.writeBatches`（カタログ・DROP 後始末）は境界を 0 として渡すが、
+公開済みの `ActiveSnapshot` を 0 で上書きしない（現在値を維持する）。
 
 | 条件                                   | 措置                                                                                |
 | -------------------------------------- | ----------------------------------------------------------------------------------- |
@@ -1853,7 +1878,7 @@ Session.OpenWith root
       ├─ ensureFormat                開いた .rykdb.format を検証 / 新規作成
       └─ StorageEngine.openDatabaseWith  ルート直下の LSM ツリーを開く
            ├─ Manifest.openOrCreate  CURRENT を読む / なければ作る
-           ├─ dropMissingFiles       MANIFEST が参照するファイルが無いなら除去
+           ├─ ensureFilesPresent    MANIFEST が参照する SSTable の欠落を CorruptionError にする
            ├─ quarantineOrphans      MANIFEST が参照しない SSTable を .orphans/ へ退避
            ├─ Wal.foldCommitted      コミット済みの Batch を memtable へ再生
            └─ NextFileNumber をディスク上の最大番号 + 1 へ進める

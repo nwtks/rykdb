@@ -117,7 +117,11 @@ module internal RowStore =
                         { current with
                             Version = flushedState.Version
                             ManifestNumber = flushedState.ManifestNumber
-                            ActiveSnapshot = activeSnapshot
+                            ActiveSnapshot =
+                                if activeSnapshot = 0UL then
+                                    current.ActiveSnapshot
+                                else
+                                    activeSnapshot
                         })
                     |> ignore
 
@@ -165,7 +169,11 @@ module internal RowStore =
                     | Error _ ->
                         host.Publish(fun current ->
                             { current with
-                                ActiveSnapshot = activeSnapshot
+                                ActiveSnapshot =
+                                    if activeSnapshot = 0UL then
+                                        current.ActiveSnapshot
+                                    else
+                                        activeSnapshot
                             })
                         |> ignore
 
@@ -314,13 +322,17 @@ module internal RowStore =
                 match SstScan.next scan with
                 | Ok None -> ret (List.rev acc, SstScan.Empty)
                 | Ok(Some(e, rest)) -> takeKeys (n - 1) (e.Key :: acc) rest
-                | Error e -> err e
+                | Error e ->
+                    SstScan.dispose scan
+                    err e
 
         let rec loop (currentStore, currentMgr) startKey =
             match scanKeys space startKey 0 currentStore with
             | Ok stale ->
                 match takeKeys ClearChunkEntries [] stale with
-                | Ok(chunk, _) ->
+                | Ok(chunk, rest) ->
+                    SstScan.dispose rest
+
                     match List.tryLast chunk with
                     | None -> ret (currentStore, currentMgr)
                     | Some lastKey ->
