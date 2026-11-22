@@ -22,6 +22,81 @@ type internal ValueBlock =
         Count: int
     }
 
+/// Bloom のキー候補。SQL の等値（`SqlValue.compareValuesV`）は型・DECIMAL の
+/// スケール・DATE/TIMESTAMP を跨ぐため、1つの符号化に固定すると表現違いの等値で
+/// 偽陰性になる。等値になり得る表現をすべてキーにする。
+module internal ValueKey =
+    /// 末尾の 0 を落とす（`1.0` と `1.00` を同じ尺度にする）。
+    let private normalizeDecimal (d: decimal) =
+        if d = 0M then 0M else d / 1.0000000000000000000000000000M
+
+    /// 数値として等値になり得る他の型・スケールの表現。
+    let private numericEquivalents (v: SqlValue) =
+        let asDecimal =
+            match v with
+            | SqlValue.Int i -> Some(decimal i)
+            | SqlValue.Decimal d -> Some d
+            | SqlValue.Real f when
+                not (System.Double.IsNaN f)
+                && not (System.Double.IsInfinity f)
+                && System.Math.Abs f <= 7.9e28
+                ->
+                Some(decimal f)
+            | _ -> None
+
+        match asDecimal with
+        | None -> []
+        | Some d ->
+            let real =
+                let f = float d
+
+                if not (System.Double.IsNaN f) && not (System.Double.IsInfinity f) && decimal f = d then
+                    [ SqlValue.vReal f ]
+                else
+                    []
+
+            let int =
+                if
+                    d = System.Decimal.Truncate d
+                    && d >= decimal System.Int64.MinValue
+                    && d <= decimal System.Int64.MaxValue
+                then
+                    [ SqlValue.Int(int64 d) ]
+                else
+                    []
+
+            SqlValue.Decimal(normalizeDecimal d) :: real @ int
+
+    /// DATE と TIMESTAMP（同日 00:00 UTC）は等値なので、両方の表現を候補にする。
+    let private temporalEquivalents =
+        function
+        | SqlValue.Date d ->
+            let ts =
+                System.DateTimeOffset(d.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
+
+            [ SqlValue.Timestamp ts ]
+        | SqlValue.Timestamp t when t.UtcTicks % System.TimeSpan.TicksPerDay = 0L ->
+            [ SqlValue.Date(System.DateOnly.FromDateTime t.UtcDateTime) ]
+        | _ -> []
+
+    /// 値自身と、SQL の等値が成り立つ他の表現。
+    let private values (v: SqlValue) =
+        v :: (numericEquivalents v @ temporalEquivalents v)
+
+    /// 全候補の符号化（Bloom に登録するキー）。
+    let encode =
+        values
+        >> List.map (fun x -> ValueCodec.writeValues [| x |] Writer.Empty |> Result.map Writer.toArray)
+        >> all
+
+    /// Bloom 照会用のハッシュ。
+    let hashes =
+        encode
+        >> Result.map (
+            List.map (fun bytes -> bytes |> Hashing.hashBytes |> Hashing.mix)
+            >> List.distinct
+        )
+
 /// ソート済みファイルに置いた値集合。
 /// <remarks>
 /// 読み取り用のストリームと直近 1ブロックをキャッシュする。
@@ -107,12 +182,10 @@ type internal IndexedValues(path: string, blocks: ValueBlock array, bloom: Bloom
     /// 値を含むか（SQL の等値）。
     member _.Contains(v: SqlValue) =
         lock gate (fun () ->
-            match ValueCodec.writeValues [| v |] Writer.Empty |> Result.map Writer.toArray with
+            match ValueKey.hashes v with
             | Error e -> Error e
-            | Ok bytes ->
-                let h = bytes |> Hashing.hashBytes |> Hashing.mix
-
-                if not (BloomFilter.mightContain bloom h) then
+            | Ok hashes ->
+                if not (hashes |> List.exists (BloomFilter.mightContain bloom)) then
                     Ok false
                 else
                     // `v` を含み得るブロックは「先頭値が v 以下である最後のブロック」だけ。
@@ -214,10 +287,6 @@ module internal ValueSet =
     [<Literal>]
     let private BloomFalsePositiveRate = 0.01
 
-    /// 1値を符号化する（Bloom のキー）。
-    let private encode (v: SqlValue) =
-        ValueCodec.writeValues [| v |] Writer.Empty |> Result.map Writer.toArray
-
     /// 値の全順序比較（ソート用）。比較不能は検出済みなので 0 に倒す。
     let private compareValues (a: SqlValue array) (b: SqlValue array) =
         match SqlValue.compareValuesForSortV a.[0] b.[0] with
@@ -302,8 +371,8 @@ module internal ValueSet =
                     )
 
             let addBloom v =
-                match encode v with
-                | Ok bytes -> bloom.Add bytes
+                match ValueKey.encode v with
+                | Ok keys -> keys |> List.iter bloom.Add
                 | Error _ -> ()
 
             let rec go hasNull blocks buf n offset cur =

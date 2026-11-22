@@ -69,6 +69,9 @@
 | INV-33 | ハッシュ結合は小さい側を build し、run を逐次削除する | `Optimizer.hashBuildSide`、`OpsJoin.innerJoinHashBuildLeft`、`ScanScope` |
 | INV-34 | 走査は tombstone を返さず、ポイント検索は削除を返す   | `StorageEngine.scanAtWith`、`getAtMasked`、回帰テスト                    |
 | INV-35 | 統計キーはテーブル定義の寿命に従う                    | `Catalog.removeTable`、`Catalog.removeStatsInTxn`、`ANALYZE` テスト      |
+| INV-36 | 真偽の解釈は WHERE / NOT / CASE / IS TRUE で同一      | `Eval.truthOfValue`、EvalTests、SqlReferenceTests                        |
+| INV-37 | マージ結合のキーは連言の位置の対応を保つ              | `Analyzer.mergeJoinKeys`、AnalyzerTests、SqlReferenceTests               |
+| INV-38 | 退避した値集合の Bloom は SQL 等値の全表現を網羅する  | `ValueKey`、ValueSetTests                                                |
 
 ---
 
@@ -512,6 +515,47 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 
 回帰テストは `SqlReference: ANALYZE の統計は再オープン後も残り、ALTER TABLE で消える` と
 `Catalog.save / load: 統計を往復し、removeTable で消える` を検査する。
+
+### INV-36: 真偽の解釈は 1か所で行う
+
+`WHERE` / `HAVING` / `ON`、`NOT`、`AND` / `OR`、`CASE WHEN`、`IS [NOT] TRUE/FALSE/UNKNOWN` は
+同じ真偽の規則を使う。
+規則を分けると `WHERE 5` と `WHERE NOT 5` が同時に真になる。
+
+- `Eval.truthOfValue` が唯一の変換である。
+- `BOOLEAN` はそのまま、`INTEGER` は `0 = FALSE`・非 `0 = TRUE`、それ以外の型は `UNKNOWN`。
+- `NOT` は `UNKNOWN` を `NULL` へ戻し、`WHERE` は `UNKNOWN` を偽として扱う。
+- 実行演算子の構築時にも同じ解釈を使う（`Eval.matchesWithV`）。
+
+回帰テストは `Eval.eval: 真偽の解釈は WHERE / NOT / CASE / IS UNKNOWN で一致する` と
+`SqlReference: WHERE の真偽と NOT / CASE WHEN / IS UNKNOWN が一致する` を検査する。
+
+### INV-37: マージ結合のキーは連言の位置の対応を保つ
+
+等値キーのペアは ON の連言の位置で決まる。
+左右を列名で独立に並べ替えると、`ON a.id = b.k AND a.k = b.id` のように名前が一致してもペアが反転し、
+誤った列同士を比較して静かに 0行になる。
+
+- `Analyzer.mergeJoinKeys` は並べ直した左の順に右の列が連言の位置どおり対応するか検証する。
+- 対応が崩れるとき・片側の走査順が結合キーと一致しないときは選ばない（`HashJoin` へ）。
+- 片側が単一行の走査なら、もう片側の走査順へ連言の位置から合わせる。
+
+回帰テストは `Analyzer.chooseJoinAlgorithm: クロス名の等値はマージ結合にしない` と
+`SqlReference: クロス名の等値結合は行を取りこぼさない` を検査する。
+
+### INV-38: 退避した値集合の Bloom は SQL 等値の全表現を網羅する
+
+`ValueSet` の OnDisk Bloom は偽陰性を出してはならない。
+SQL の等値は型・DECIMAL のスケール・DATE/TIMESTAMP を跨ぐため、
+値の符号化 1つだけをキーにすると等しい値で偽陰性になる。
+
+- `ValueKey` が等値になり得る表現をすべてキーにする。
+  （数値の Int/Decimal/Real、DECIMAL の末尾 0 除去、DATE と同日 00:00 UTC の TIMESTAMP）
+- 格納側（`addBloom`）と探査側（`Contains`）の両方で同じ候補集合を使う。
+- 偽陽性はブロック読みを増やすだけで正しさに影響しない。
+
+回帰テストは `ValueSet: 退避しても型・スケール違いの等値を取りこぼさない` と
+`ValueSet: 退避しても DATE と同日 00:00 UTC の TIMESTAMP を等値に扱う` を検査する。
 
 ---
 

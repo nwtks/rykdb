@@ -81,6 +81,47 @@ let ``ValueSet: 上限を超えて退避してもメモリと同じ判定にな�
         dispose memory)
 
 [<Fact>]
+let ``ValueSet: 退避しても型・スケール違いの等値を取りこぼさない`` () =
+    // Bloom のキーを符号化バイト 1 つに固定すると、`Int 1` と `Decimal 1.0` のような
+    // SQL では等しい値で偽陰性になり得る（退避時だけ 0 行になる静かな誤答）。
+    withDir "valueset-spill-numeric" (fun dir ->
+        let values =
+            [
+                SqlValue.Decimal 1.0M
+                SqlValue.Decimal 2.50M
+                SqlValue.Int 3L
+                SqlValue.vReal 4.0
+            ]
+
+        let spilled = build (budgetIn dir 1L) values
+
+        Assert.Equal(TruthValue.True, contains spilled (SqlValue.Int 1L))
+        Assert.Equal(TruthValue.True, contains spilled (SqlValue.vReal 1.0))
+        Assert.Equal(TruthValue.True, contains spilled (SqlValue.Decimal 1.00M))
+        Assert.Equal(TruthValue.True, contains spilled (SqlValue.Decimal 2.5M))
+        Assert.Equal(TruthValue.True, contains spilled (SqlValue.Decimal 3.0M))
+        Assert.Equal(TruthValue.True, contains spilled (SqlValue.Int 4L))
+        Assert.Equal(TruthValue.False, contains spilled (SqlValue.Int 5L))
+        dispose spilled)
+
+[<Fact>]
+let ``ValueSet: 退避しても DATE と同日 00:00 UTC の TIMESTAMP を等値に扱う`` () =
+    withDir "valueset-spill-temporal" (fun dir ->
+        let spilled = build (budgetIn dir 1L) [ SqlValue.Date(System.DateOnly(2024, 1, 2)) ]
+
+        let midnight =
+            System.DateTimeOffset(System.DateTime(2024, 1, 2, 0, 0, 0), System.TimeSpan.Zero)
+
+        Assert.Equal(TruthValue.True, contains spilled (SqlValue.Timestamp midnight))
+
+        // 0 時以外は別の値。
+        let noon =
+            System.DateTimeOffset(System.DateTime(2024, 1, 2, 12, 0, 0), System.TimeSpan.Zero)
+
+        Assert.Equal(TruthValue.False, contains spilled (SqlValue.Timestamp noon))
+        dispose spilled)
+
+[<Fact>]
 let ``ValueSet: 退避した集合は ScanScope の早期終了でもファイルが残らない`` () =
     withDir "valueset-spill-scope" (fun dir ->
         let scope = ScanScope()

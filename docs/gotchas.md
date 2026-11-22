@@ -213,6 +213,20 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 読み終えたパーティションの run はその場で削除する。
 早期終了で読み切れなかった分は `ScanScope` が閉じて消す。
 
+### 3.17 数値リテラルの直後の識別子は字句エラー
+
+`0x1F` が `0 AS x1F`、`1_000` が `1 AS _000` として SELECT 項目で静かに通っていた。
+数値の直後に識別子が続く入力は字句の段階で `SyntaxError` にする。
+回帰: `Lexer: 数値の直後に識別子が続く入力はエラー`。
+
+### 3.18 IF EXISTS は文種で綴りを固定する
+
+`IF [NOT] EXISTS` の `NOT` を省略可能にすると、`DROP TABLE IF NOT EXISTS` が
+`IF EXISTS` と同じ意味になり、テーブルを削除してしまう。
+`CREATE` は `IF NOT EXISTS`、`DROP` は `IF EXISTS` だけを受理し、逆の綴りは `SyntaxError` にする。
+回帰: `Parser: IF EXISTS と IF NOT EXISTS を取り違えない` /
+`SqlReference: CREATE TABLE IF EXISTS は エラー（IF NOT EXISTS を使う）`。
+
 ---
 
 ## 4. LSM・WAL・MANIFEST
@@ -470,6 +484,22 @@ INSERT/UPDATEの暗黙変換は`SqlValue.coerce`。
 - ORDER BYの比較ではNULLを昇順先頭・降順末尾に置く全順序を使う。
 - WHEREの比較は3値論理を維持する。
 
+### 6.12 マージ結合は連言の位置でキーを対応させる
+
+左右を列名で独立に並べ替えると、列名が同じでも `ON a.id = b.k AND a.k = b.id` でペアが反転し、
+正しい 3 行が 0 行になる。
+並べ替えた左の順に右の列が連言の位置どおり対応するかを検証し、崩れるときは `HashJoin` へフォールバックする。
+回帰: `Analyzer.chooseJoinAlgorithm: クロス名の等値はマージ結合にしない` /
+`SqlReference: クロス名の等値結合は行を取りこぼさない`。
+
+### 6.13 真偽の解釈は1か所で行う
+
+`WHERE`、`NOT`、`CASE WHEN`、`IS UNKNOWN` で非 `BOOLEAN` の扱いが違うと、
+`WHERE 5` と `WHERE NOT 5` が同時に真になる。
+`Eval.truthOfValue`（`BOOLEAN` はそのまま、`INTEGER` は `0 = FALSE`・非 `0 = TRUE`、他は `UNKNOWN`）に一本化する。
+回帰: `Eval.eval: 真偽の解釈は WHERE / NOT / CASE / IS UNKNOWN で一致する` /
+`SqlReference: WHERE の真偽と NOT / CASE WHEN / IS UNKNOWN が一致する`。
+
 ---
 
 ## 7. メモリ・退避・列読み込み
@@ -530,6 +560,21 @@ SELECT定数、`COUNT(*)`、DELETE、INDEX lookupは参照列だけ復号する�
 
 ホットパスでは`DbResult`と`OpStep`を使い、公開APIの境界で`Result`へ変換する。
 `Op.emit`の第2引数は遅延させる。即時再帰するとスタックオーバーフローになる。
+
+### 7.11 DISTINCT 集約の退避は最後の Seen も run に含める
+
+`finalizeAcc` が `SeenRuns` だけを畳むと、最後のスピル以降に `Seen` へ溜まった値が消える。
+残っていれば先に run へ書き出してから全 run を畳み直す（実測: 100個が 65個になっていた）。
+回帰: `集約: 最後のスピル以降に溜まった DISTINCT 値も結果に含める`。
+
+### 7.12 退避した値集合の Bloom キーは SQL 等値の全表現を網羅する
+
+`ValueSet` の Bloom は符号化バイトで照合するが、SQL の等値は型・DECIMAL のスケール・DATE/TIMESTAMP を跨ぐ。
+1表現に固定すると `1 IN (SELECT DECIMAL列)` が退避時だけ 0行になる。
+`ValueKey` が等値になり得る表現（数値の Int/Decimal/Real、DATE と同日 00:00 UTC の TIMESTAMP）を
+すべてキーにする。
+回帰: `ValueSet: 退避しても型・スケール違いの等値を取りこぼさない` /
+`ValueSet: 退避しても DATE と同日 00:00 UTC の TIMESTAMP を等値に扱う`。
 
 ---
 
@@ -607,6 +652,13 @@ closeはworker join後にWALとロックを解放する。
 失敗後は次のwriteでもworkerへsignalを送る（flushが起きなくても再試行する）。
 明示的な再試行には`Signal`を使う。
 失敗が続いてもMANIFESTの状態とファイル番号は巻き戻さない。
+
+### 8.14 Sessionの境界で例外をInternalErrorにする
+
+想定外の例外が `readers` や lease の解放を跨ぐと、`Session.Close` が永久に待つ。
+`executeStatementsCore` が例外を `InternalError` へ変換し、
+`TryOpenReader` は lease を `finally` で返す。
+通常経路では例外は起きないため、既存の Session 並行・Close テストが退行の検出を担う。
 
 ---
 
@@ -845,6 +897,10 @@ Filterの1/10やJoinの選択性が無視される（統計テストでJoinが�
 - [ ] DPのINL/マージ判定は索引先頭列・走査順・作業メモリを実際の実行条件と揃えているか
 - [ ] 先頭テーブルを入れ替えても、ON述語を参照先が揃った結合へ昇格しているか
 - [ ] ON述語の昇格で述語を落としていないか（FROM全順列の結果同値テスト）
+- [ ] マージ結合のキーは連言の位置の対応まで検証しているか（クロス名等値でフォールバックするか）
+- [ ] 真偽の解釈（WHERE / NOT / AND / OR / CASE / IS TRUE）を同じ関数に揃えているか
+- [ ] 数値リテラルの直後の識別子を裸の別名として静かに解釈していないか
+- [ ] `IF EXISTS` / `IF NOT EXISTS` の綴りを文種ごとに検査しているか
 
 ### 11.5 メモリ・並行・通信
 
@@ -858,6 +914,9 @@ Filterの1/10やJoinの選択性が無視される（統計テストでJoinが�
 - [ ] 接続ごとのtransactionだけrollbackしているか
 - [ ] STREAMはENDまで読み切っているか
 - [ ] fsync失敗を全Sessionへ伝播しているか
+- [ ] 退避した値集合のBloomキーがSQL等値の全表現（数値の型・スケール、DATE/TIMESTAMP）を網羅しているか
+- [ ] DISTINCT集約のfinalizeが最後の`Seen`もrunに含めているか
+- [ ] Sessionの境界で想定外の例外を`InternalError`にし、leaseと`readers`を解放しているか
 
 ### 11.6 F#・テスト
 

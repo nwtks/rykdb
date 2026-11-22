@@ -589,6 +589,32 @@ let ``集約: DISTINCT の値が上限を超えても全集約関数が同じ結
         assertNoLeftoversDetailed dir)
 
 [<Fact>]
+let ``集約: 最後のスピル以降に溜まった DISTINCT 値も結果に含める`` () =
+    // 作業メモリ 2048B では 65 個目でスピルし、残り 35 個は `Seen` に溜まったまま終わる。
+    // finalize が `Seen` を run に含めないと COUNT が 65 になり、Min/Max も過小・過大のまま
+    // 返っていた（実測 65/100）。
+    withDir "aggregate-distinct-spill-tail" (fun dir ->
+        let op () =
+            opOfRows [ for i in 0..99 -> row [ SqlValue.Int(int64 i) ] ]
+
+        let aggs =
+            [
+                AggFunc.Count, false, true, col "a"
+                AggFunc.Sum, false, true, col "a"
+                AggFunc.Min, false, true, col "a"
+                AggFunc.Max, false, true, col "a"
+            ]
+
+        let spilled =
+            ok (Op.toArray (ok (Ops.aggregate (tightBudget dir 2048L) schema2 [] aggs (op ()))))
+
+        Assert.Equal<int64>(100L, asInt spilled.[0].[0])
+        Assert.Equal<decimal>(4950M, asDec spilled.[0].[1])
+        Assert.Equal<int64>(0L, asInt spilled.[0].[2])
+        Assert.Equal<int64>(99L, asInt spilled.[0].[3])
+        assertNoLeftoversDetailed dir)
+
+[<Fact>]
 let ``集約: DISTINCT の退避は NULL と REAL も正しく扱う`` () =
     withDir "aggregate-distinct-spill-null" (fun dir ->
         let op () =

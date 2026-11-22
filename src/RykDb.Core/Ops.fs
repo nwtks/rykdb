@@ -619,27 +619,32 @@ module internal Ops =
             if List.isEmpty acc.SeenRuns then
                 DbOk acc
             else
-                let paths = acc.SeenRuns
+                let flushed = if Set.isEmpty acc.Seen then DbOk acc else spillSeen acc
 
-                let runOps =
-                    paths
-                    |> List.map (fun p -> Spill.reopen budget.Scope (Spill.RowSpool.Disk([ p ], 0)))
-                    |> all
+                match flushed with
+                | DbErr e -> DbErr e
+                | DbOk acc ->
+                    let paths = acc.SeenRuns
 
-                match runOps with
-                | Error e ->
-                    Spill.forget paths
-                    DbErr e
-                | Ok ops ->
-                    let src = List.foldBack Op.append ops Op.Empty
+                    let runOps =
+                        paths
+                        |> List.map (fun p -> Spill.reopen budget.Scope (Spill.RowSpool.Disk([ p ], 0)))
+                        |> all
 
-                    match ExtSort.sortRows budget () (fun () _ -> DbOk()) compareBlob src with
+                    match runOps with
                     | Error e ->
                         Spill.forget paths
                         DbErr e
-                    | Ok sorted ->
-                        foldDistinct (emptyAcc acc.Kind) None sorted
-                        |> DbResult.map (fun final -> { final with SeenRuns = [] })
+                    | Ok ops ->
+                        let src = List.foldBack Op.append ops Op.Empty
+
+                        match ExtSort.sortRows budget () (fun () _ -> DbOk()) compareBlob src with
+                        | Error e ->
+                            Spill.forget paths
+                            DbErr e
+                        | Ok sorted ->
+                            foldDistinct (emptyAcc acc.Kind) None sorted
+                            |> DbResult.map (fun final -> { final with SeenRuns = [] })
 
         let finishAcc acc =
             match acc.Kind with

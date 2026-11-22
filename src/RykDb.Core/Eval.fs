@@ -259,12 +259,19 @@ module internal Eval =
             | DbErr e -> DbErr e
             | DbOk c -> DbOk(applyComparison op c)
 
-    /// 2値（真偽を直接返す）の文脈用。
-    /// NULL は False。
-    let private boolOf (v: SqlValue) =
+    /// SqlValue を 3値に変換する。
+    /// BOOL はそのまま、NULL は UNKNOWN。
+    /// BOOLEAN 以外は UNKNOWN だが、`WHERE` の互換のため INTEGER だけは
+    /// 0 = FALSE / 非 0 = TRUE とする（AND / OR / NOT / CASE / IS TRUE / IS UNKNOWN も同じ規則）。
+    let private truthOfValue (v: SqlValue) =
         match v with
-        | SqlValue.Bool b -> b
-        | _ -> false
+        | SqlValue.Bool b -> if b then TruthValue.True else TruthValue.False
+        | SqlValue.Int i -> if i <> 0L then TruthValue.True else TruthValue.False
+        | _ -> TruthValue.Unknown
+
+    /// 2値（真偽を直接返す）の文脈用。
+    /// UNKNOWN は False（`WHERE` と同じ扱い）。
+    let private boolOf (v: SqlValue) = truthOfValue v = TruthValue.True
 
     /// 行の範囲外アクセスを安全なエラーにする。
     let private valueAt (row: RowView) (i: int) (e: Expr) =
@@ -281,16 +288,6 @@ module internal Eval =
             match row with
             | Single r -> DbOk r.[i]
             | Joined(l, r) -> if i < l.Length then DbOk l.[i] else DbOk r.[i - l.Length]
-
-    /// SqlValue を 3値に変換する。
-    /// BOOL はそのまま、NULL と BOOL 以外は UNKNOWN。
-    let private truthOfValue (v: SqlValue) =
-        if SqlValue.isNull v then
-            TruthValue.Unknown
-        else
-            match v with
-            | SqlValue.Bool b -> if b then TruthValue.True else TruthValue.False
-            | _ -> TruthValue.Unknown
 
     /// 3値の判定結果を SqlValue へ戻す（UNKNOWN は NULL）。
     let private ofTruth (t: TruthValue) =
@@ -426,10 +423,10 @@ module internal Eval =
                     match op with
                     | UnaryOp.Not ->
                         DbOk(
-                            if SqlValue.isNull v then
-                                SqlValue.Null
-                            else
-                                SqlValue.ofBool (not (boolOf v))
+                            match truthOfValue v with
+                            | TruthValue.True -> SqlValue.FalseValue
+                            | TruthValue.False -> SqlValue.TrueValue
+                            | TruthValue.Unknown -> SqlValue.Null
                         )
                     | UnaryOp.Pos -> DbOk v
                     | UnaryOp.Neg ->
@@ -721,17 +718,11 @@ module internal Eval =
     let eval (schema: Schema) = prepare schema [] |> evalWith
 
     /// 評価結果を WHERE の真偽へ変換する（UNKNOWN は偽）。
-    let private asMatchV (r: DbResult<SqlValue>) =
+    /// 真偽の解釈は `truthOfValue` に一本化する。
+    let private asMatchV (r: DbResult<SqlValue>) : DbResult<bool> =
         match r with
         | DbErr e -> DbErr e
-        | DbOk v ->
-            DbOk(
-                match v with
-                | SqlValue.Bool b -> b
-                | SqlValue.Null -> false
-                | SqlValue.Int i -> i <> 0L
-                | _ -> false
-            )
+        | DbOk v -> DbOk(truthOfValue v = TruthValue.True)
 
     /// WHERE の判定（内部ホットパス用）。
     /// UNKNOWN は偽（SQL 標準）。

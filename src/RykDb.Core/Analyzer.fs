@@ -811,6 +811,31 @@ module internal Analyzer =
                 |> List.tryPick (fun (_, lookup, cols) ->
                     leftIndicesOf keys cols |> Option.map (fun lefts -> lookup, lefts)))
 
+        let orderBy targetNames otherKeyNames (ownIndices: int array) =
+            let rec go acc =
+                function
+                | [] -> Some(List.rev acc |> List.toArray)
+                | n :: rest ->
+                    match otherKeyNames |> Array.tryFindIndex (fun m -> SqlName.equal m n) with
+                    | Some i -> go (ownIndices.[i] :: acc) rest
+                    | None -> None
+
+            go [] targetNames
+
+        let pairsAligned (leftKeyNames: string array) (rightKeyNames: string array) leftNames rightNames =
+            if
+                List.length leftNames <> List.length rightNames
+                || List.length leftNames <> leftKeyNames.Length
+            then
+                false
+            else
+                leftNames
+                |> List.mapi (fun j leftName ->
+                    match leftKeyNames |> Array.tryFindIndex (fun n -> SqlName.equal n leftName) with
+                    | Some i -> SqlName.equal rightKeyNames.[i] rightNames.[j]
+                    | None -> false)
+                |> List.forall id
+
         let mergeJoinKeys keys =
             let leftOrder = scanOrder tableOf leftTree
             let rightOrder = scanOrder tableOf rightTree
@@ -820,32 +845,38 @@ module internal Analyzer =
                 alignJoinKeys rightSchema keys.RightIndices rightOrder
             with
             | Some(leftKeys, leftNames), Some(rightKeys, rightNames) ->
-                let targetNames = if List.isEmpty leftNames then rightNames else leftNames
+                let leftKeyNames =
+                    keys.LeftIndices |> Array.map (fun i -> leftSchema.Columns.[i].Name)
 
-                let leftAligned =
-                    if List.isEmpty leftNames then
-                        alignJoinKeys leftSchema keys.LeftIndices (Some targetNames) |> Option.map fst
-                    else
-                        Some leftKeys
+                let rightKeyNames =
+                    keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
 
-                let rightAligned =
-                    if List.isEmpty rightNames then
-                        alignJoinKeys rightSchema keys.RightIndices (Some targetNames) |> Option.map fst
-                    else
-                        Some rightKeys
-
-                let sameOrder =
-                    List.isEmpty leftNames
-                    || List.isEmpty rightNames
-                    || List.length leftNames = List.length rightNames
-                       && List.forall2 (fun a b -> SqlName.equal a b) leftNames rightNames
-
-                match leftAligned, rightAligned with
-                | Some lk, Some rk when sameOrder ->
+                match leftNames, rightNames with
+                | [], [] ->
                     Some
                         { keys with
-                            LeftIndices = lk
+                            LeftIndices = leftKeys
+                            RightIndices = rightKeys
+                        }
+                | _, [] ->
+                    orderBy leftNames leftKeyNames keys.RightIndices
+                    |> Option.map (fun rk ->
+                        { keys with
+                            LeftIndices = leftKeys
                             RightIndices = rk
+                        })
+                | [], _ ->
+                    orderBy rightNames rightKeyNames keys.LeftIndices
+                    |> Option.map (fun lk ->
+                        { keys with
+                            LeftIndices = lk
+                            RightIndices = rightKeys
+                        })
+                | _ when pairsAligned leftKeyNames rightKeyNames leftNames rightNames ->
+                    Some
+                        { keys with
+                            LeftIndices = leftKeys
+                            RightIndices = rightKeys
                         }
                 | _ -> None
             | _ -> None

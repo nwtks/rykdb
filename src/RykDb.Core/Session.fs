@@ -368,11 +368,19 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             loop 0
 
     /// 解析済みの文を実行する（ゲート＝closed / durability を確認した後）。
+    /// <remarks>
+    /// 想定外の例外がゲート（`writeGate` / `readers` / lease）を跨いで呼び出し側へ漏れると、
+    /// `Close` が永久に待つなど後続の操作が壊れる。
+    /// `Session` の境界で `InternalError` に変換し、例外を送らない契約にする。
+    /// </remarks>
     let executeStatementsCore (statements: Statement list) =
-        if isReadOnlyBatch statements then
-            runRead statements
-        else
-            runExclusive statements
+        try
+            if isReadOnlyBatch statements then
+                runRead statements
+            else
+                runExclusive statements
+        with ex ->
+            err (DbError.internalError ex.Message)
 
     /// 単一文または複数文を実行し、transaction の遷移も返す。
     let executeCore (sql: string) (parameters: SqlValue array) =
@@ -406,7 +414,12 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                         match tryEnterRead () with
                         | Ok None -> ret None
                         | Ok(Some(readState, lease)) ->
-                            match Engine.openSelect limits.Budget (ExecState.ofCommitted readState) stmt with
+                            let opened =
+                                protect (fun () ->
+                                    Engine.openSelect limits.Budget (ExecState.ofCommitted readState) stmt)
+                                >>= id
+
+                            match opened with
                             | Error e ->
                                 exitRead lease
                                 err e

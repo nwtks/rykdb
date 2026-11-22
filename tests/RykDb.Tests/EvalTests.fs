@@ -214,6 +214,58 @@ let ``Eval.eval: AND / OR は右辺の FALSE / TRUE も 3 値論理どおり`` (
     | v -> failActual "NULL AND FALSE が FALSE になりません" v
 
 [<Fact>]
+let ``Eval.eval: 真偽の解釈は WHERE / NOT / CASE / IS UNKNOWN で一致する`` () =
+    // 以前は WHERE 5 = 真（Int 非0）と NOT 5 = 真（boolOf は非 BOOL を false 扱い）が
+    // 同時に成り立っていた。WHERE / NOT / CASE WHEN / IS TRUE / IS UNKNOWN を
+    // 同じ規則（BOOL はそのまま、INTEGER は 0 = FALSE / 非 0 = TRUE、他は UNKNOWN）に揃える。
+    let r = row2 5L 0L
+
+    let isTrue (field: string) =
+        let resolver = Eval.prepare schema2 []
+        let predicate = Expr.Column { Qualifier = None; Name = field }
+        okV (Eval.matchesWithV resolver r predicate)
+
+    Assert.True(isTrue "a", "WHERE 5 は TRUE")
+    Assert.False(isTrue "b", "WHERE 0 は FALSE")
+
+    // NOT 5 = FALSE、NOT 0 = TRUE
+    match ok (ev r (Expr.Unary(UnaryOp.Not, col "a"))) with
+    | SqlValue.Bool b -> Assert.False b
+    | v -> failActual "NOT 5 が FALSE になりません" v
+
+    match ok (ev r (Expr.Unary(UnaryOp.Not, col "b"))) with
+    | SqlValue.Bool b -> Assert.True b
+    | v -> failActual "NOT 0 が TRUE になりません" v
+
+    // CASE WHEN 1 THEN 'a' ELSE 'b' END = 'a'（以前は 'b'）
+    let caseExpr =
+        Expr.Case(
+            [ (Expr.Literal(Literal.Int 1L), Expr.Literal(Literal.String "a")) ],
+            Some(Expr.Literal(Literal.String "b"))
+        )
+
+    match ok (ev r caseExpr) with
+    | SqlValue.Text s -> Assert.Equal<string>("a", s)
+    | v -> failActual "CASE WHEN 1 が真になりません" v
+
+    // 1 IS UNKNOWN = FALSE、1 IS TRUE = TRUE（以前は Unknown 扱いだった）
+    match ok (ev r (Expr.IsTruth(Expr.Literal(Literal.Int 1L), TruthValue.Unknown, false))) with
+    | SqlValue.Bool b -> Assert.False b
+    | v -> failActual "1 IS UNKNOWN が FALSE になりません" v
+
+    match ok (ev r (Expr.IsTruth(Expr.Literal(Literal.Int 1L), TruthValue.True, false))) with
+    | SqlValue.Bool b -> Assert.True b
+    | v -> failActual "1 IS TRUE が TRUE になりません" v
+
+    // TEXT などの非数値は UNKNOWN のまま: WHERE と NOT が同時に真にならない。
+    let textRow = [| SqlValue.Text "x"; SqlValue.Null |]
+    Assert.False(okV (Eval.matchesWithV (Eval.prepare schema2 []) textRow (col "a")))
+
+    match ok (ev textRow (Expr.Unary(UnaryOp.Not, col "a"))) with
+    | SqlValue.Null -> ()
+    | v -> failActual "NOT 'x' が NULL になりません" v
+
+[<Fact>]
 let ``Eval.eval: BETWEEN の範囲判定と NOT IN の一致判定`` () =
     let r = [| SqlValue.Int 5L; SqlValue.Int 1L |]
 
@@ -343,8 +395,10 @@ let ``Eval.eval: 単項演算子の + と - は型ごとに動く`` () =
     Assert.True(SqlValue.isNull (ok (ev [||] (un UnaryOp.Neg Literal.Null))))
     // 数値以外への - は型エラー
     expectErrorKind ErrorKind.TypeError "- は数値以外を受け付けない" (ev [||] (un UnaryOp.Neg (Literal.String "x")))
-    // NOT は非 BOOL を FALSE として扱う
-    Assert.Equal(SqlValue.Bool true, ok (ev [||] (un UnaryOp.Not (Literal.Int 5L))))
+    // NOT は WHERE と同じ規則（INTEGER は 0 = FALSE / 非 0 = TRUE、それ以外の非 BOOL は UNKNOWN = NULL）
+    Assert.Equal(SqlValue.Bool false, ok (ev [||] (un UnaryOp.Not (Literal.Int 5L))))
+    Assert.Equal(SqlValue.Bool true, ok (ev [||] (un UnaryOp.Not (Literal.Int 0L))))
+    Assert.True(SqlValue.isNull (ok (ev [||] (un UnaryOp.Not (Literal.String "x")))))
 
 [<Fact>]
 let ``Eval.eval: 連結 || と二項 LIKE`` () =
@@ -435,14 +489,17 @@ let ``Eval.eval: 未解決の列と行より長い列参照はエラー`` () =
     expectErrorKind ErrorKind.InternalError "裸の名前が行より長い" (Eval.eval schema2 [| SqlValue.Int 1L |] (Expr.Name "b"))
 
 [<Fact>]
-let ``Eval.eval: AND / OR は非 BOOL を UNKNOWN として扱う`` () =
+let ``Eval.eval: AND / OR の真偽は WHERE / NOT と同じ規則`` () =
     // TRUE AND NULL = UNKNOWN（NULL のまま）
     let r1 = [| SqlValue.Bool true; SqlValue.Null |]
     Assert.True(SqlValue.isNull (ok (ev r1 (Expr.Binary(BinaryOp.And, col "a", col "b")))))
 
-    // 数値は真偽に使わない（UNKNOWN）
+    // INTEGER は 0 = FALSE / 非 0 = TRUE（WHERE 5 が TRUE なのに 1 AND 1 が NULL、を解消）
     let r2 = [| SqlValue.Int 1L; SqlValue.Bool true |]
-    Assert.True(SqlValue.isNull (ok (ev r2 (Expr.Binary(BinaryOp.And, col "a", col "b")))))
+    Assert.Equal(SqlValue.Bool true, ok (ev r2 (Expr.Binary(BinaryOp.And, col "a", col "b"))))
+
+    let r3 = [| SqlValue.Int 0L; SqlValue.Bool true |]
+    Assert.Equal(SqlValue.Bool false, ok (ev r3 (Expr.Binary(BinaryOp.And, col "a", col "b"))))
 
 [<Fact>]
 let ``Eval.eval: IS TRUE / FALSE / UNKNOWN`` () =

@@ -1560,6 +1560,53 @@ let ``SqlReference: マージ結合（主キー同士・LEFT・複合キー）``
         Assert.Equal<int64>(1L, asInt duplicates.Rows.[1].[1]))
 
 [<Fact>]
+let ``SqlReference: クロス名の等値結合は行を取りこぼさない`` () =
+    // ON x1.id = x2.k AND x1.k = x2.id は、両側の走査順の列名が同じでも
+    // 連言の位置の対応は逆。キーを名前で独立に並べ替えると誤った列同士を比較し、
+    // 正しい 3 行が 0 行になっていた（マージ結合の選択時）。
+    withSession "join-merge-crossed" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE x1 (id INTEGER, k INTEGER, v INTEGER, PRIMARY KEY (id, k))"
+
+        let db2 =
+            exec db1 "CREATE TABLE x2 (id INTEGER, k INTEGER, w INTEGER, PRIMARY KEY (id, k))"
+
+        let db3 = exec db2 "INSERT INTO x1 VALUES (1,2,10),(2,4,20),(3,6,30)"
+        let db4 = exec db3 "INSERT INTO x2 VALUES (2,1,100),(4,2,200),(6,3,300)"
+
+        let _, rows =
+            ok (execSql db4 "SELECT COUNT(*) FROM x1 JOIN x2 ON x1.id = x2.k AND x1.k = x2.id")
+
+        Assert.Equal<int64>(3L, asInt rows.Rows.[0].[0])
+
+        // 対応が揃っている場合は 0 行（取り違えの検出用の対照）。
+        let _, none =
+            ok (execSql db4 "SELECT COUNT(*) FROM x1 JOIN x2 ON x1.id = x2.id AND x1.k = x2.k")
+
+        Assert.Equal<int64>(0L, asInt none.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: WHERE の真偽と NOT / CASE WHEN / IS UNKNOWN が一致する`` () =
+    // 以前は WHERE 5 が TRUE なのに NOT 5 も TRUE、CASE WHEN 1 は ELSE 側だった。
+    withSession "truth-consistency" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1),(2)"
+
+        let _, whereTrue = ok (execSql db2 "SELECT COUNT(*) FROM t WHERE 5")
+        Assert.Equal<int64>(2L, asInt whereTrue.Rows.[0].[0])
+
+        let _, notTrue = ok (execSql db2 "SELECT COUNT(*) FROM t WHERE NOT 5")
+        Assert.Equal<int64>(0L, asInt notTrue.Rows.[0].[0])
+
+        let _, case =
+            ok (execSql db2 "SELECT CASE WHEN 1 THEN 'a' ELSE 'b' END FROM t LIMIT 1")
+
+        Assert.Equal<string>("a", asText case.Rows.[0].[0])
+
+        let _, unknown = ok (execSql db2 "SELECT COUNT(*) FROM t WHERE 1 IS UNKNOWN")
+        Assert.Equal<int64>(0L, asInt unknown.Rows.[0].[0]))
+
+[<Fact>]
 let ``SqlReference: インデックス入れ子ループ（右索引 + 左が小さい）`` () =
     withSession "joinindex" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE depts (id INTEGER PRIMARY KEY, name TEXT)"
@@ -2524,16 +2571,22 @@ let ``SqlReference: 型を省略した列定義は TEXT になる`` () =
         Assert.Equal<string>("123", asText rows.Rows.[1].[0]))
 
 [<Fact>]
-let ``SqlReference: CREATE TABLE IF EXISTS は既存なら何もしない`` () =
-    // §11.1: `IF EXISTS` と `IF NOT EXISTS` の両方の綴りを受け付ける。
+let ``SqlReference: CREATE TABLE IF EXISTS は エラー（IF NOT EXISTS を使う）`` () =
+    // §11.1: CREATE は IF NOT EXISTS、DROP は IF EXISTS だけを受理する。
+    // 逆の綴りを黙って受け入れると DROP TABLE IF NOT EXISTS が削除を実行してしまう。
     withSession "create-table-if-exists" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1, 'a')"
-        let db3 = exec db2 "CREATE TABLE IF EXISTS t (id INTEGER PRIMARY KEY, v TEXT)"
-        Assert.Equal<string list>([ "t" ], ok (db3.TableNames()))
 
-        let _, rows = ok (execSql db3 "SELECT COUNT(*) FROM t")
-        Assert.Equal<int64>(1L, asInt rows.Rows.[0].[0]))
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "CREATE TABLE IF EXISTS"
+            (execSql db1 "CREATE TABLE IF EXISTS t (id INTEGER PRIMARY KEY, v TEXT)")
+
+        expectErrorKind ErrorKind.SyntaxError "DROP TABLE IF NOT EXISTS" (execSql db1 "DROP TABLE IF NOT EXISTS t")
+
+        // 逆の綴りがエラーでも、正しい綴りは従来どおり効く。
+        let db2 = exec db1 "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)"
+        Assert.Equal<string list>([ "t" ], ok (db2.TableNames())))
 
 [<Fact>]
 let ``SqlReference: テーブルレベル UNIQUE の列を検証する`` () =

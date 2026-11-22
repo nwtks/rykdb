@@ -133,6 +133,7 @@ SELECT 1 AS right FROM t AS union;
 ```
 
 整数は `INTEGER`、小数点または指数部を持つ数値は `REAL`になる。
+数値の直後に識別子を続けることはできない（`0x1F` / `1_000` / `1e5x` は `SyntaxError`）。
 
 ```sql
 0 42 -7       -- INTEGER
@@ -387,7 +388,10 @@ name LIKE 'a!%' ESCAPE '!'
 - `ILIKE`や既定の `\`エスケープはない。
 - `NULL`に対する `LIKE`の結果は `NULL`になる。
 
-`IS TRUE`、`IS FALSE`、`IS UNKNOWN`は、`BOOLEAN`以外の値をUNKNOWNとして扱う。
+`IS TRUE`、`IS FALSE`、`IS UNKNOWN`は、`WHERE`と同じ規則で真偽を判定する。
+`BOOLEAN`はそのまま、`INTEGER`は`0`が`FALSE`・非`0`が`TRUE`、
+それ以外の型は`UNKNOWN`として扱う。
+`NOT`、`AND`、`OR`、`CASE WHEN`も同じ規則を使う。
 
 ### 6.5 集約関数
 
@@ -909,6 +913,9 @@ CREATE TABLE people (
 列名の重複、テーブルレベル制約の存在しない列、重複列はエラーになる。
 型を省略した列は `TEXT`になる。
 
+`IF NOT EXISTS`は`IF NOT EXISTS`の綴りだけを受理する。
+`IF EXISTS`は`SyntaxError`になる（`CREATE`と`DROP`の取り違えを防ぐ）。
+
 ```sql
 CREATE TABLE t (id INTEGER PRIMARY KEY, name NOT NULL);
 ```
@@ -945,6 +952,9 @@ DROP INDEX [IF EXISTS] index_name;
 失敗時の後始末は再オープン時に再開する。
 
 暗黙の `UNIQUE`索引は個別に `DROP`できない。
+
+`IF EXISTS`は`IF EXISTS`の綴りだけを受理する。
+`DROP TABLE IF NOT EXISTS`は`SyntaxError`になる（削除を実行しない）。
 
 ### 10.4 ALTER TABLE
 
@@ -1156,18 +1166,20 @@ Closeだけは読み取り完了を待つ。
 
 主なエラー例を示す。
 
-| SQLまたは操作              | メッセージ                                                                          |
-| -------------------------- | ----------------------------------------------------------------------------------- |
-| 存在しないテーブルの参照   | `テーブル 'nosuch' が存在しません`                                                  |
-| 主キーなしのCREATE TABLE   | `テーブル t に主キーがありません`                                                   |
-| 重複したテーブル名         | `テーブル t は既に存在します`                                                       |
-| NOT NULL違反               | `NOT NULL 制約に違反: t.n`                                                          |
-| 型変換失敗                 | `''abc'' は 'INTEGER' に変換できません`                                             |
-| 0除算                      | `0 での除算は定義されていません`                                                    |
-| BOOLEANとINTEGERの比較     | `型 'BOOLEAN' と 'INTEGER' は比較できません`                                        |
-| スカラーサブクエリが複数行 | `スカラーサブクエリが 2行以上を返しました`                                          |
-| 列数の違うUNION ALL        | `UNION ALL の列数が一致しません`                                                    |
-| テーブル別名付きDML        | `INSERT / UPDATE / DELETE の対象テーブルに別名は使えません（別名を外してください）` |
+| SQLまたは操作              | メッセージ                                                                                        |
+| -------------------------- | ------------------------------------------------------------------------------------------------- |
+| 存在しないテーブルの参照   | `テーブル 'nosuch' が存在しません`                                                                |
+| 主キーなしのCREATE TABLE   | `テーブル t に主キーがありません`                                                                 |
+| 重複したテーブル名         | `テーブル t は既に存在します`                                                                     |
+| NOT NULL違反               | `NOT NULL 制約に違反: t.n`                                                                        |
+| 型変換失敗                 | `''abc'' は 'INTEGER' に変換できません`                                                           |
+| 0除算                      | `0 での除算は定義されていません`                                                                  |
+| BOOLEANとINTEGERの比較     | `型 'BOOLEAN' と 'INTEGER' は比較できません`                                                      |
+| スカラーサブクエリが複数行 | `スカラーサブクエリが 2行以上を返しました`                                                        |
+| 列数の違うUNION ALL        | `UNION ALL の列数が一致しません`                                                                  |
+| テーブル別名付きDML        | `INSERT / UPDATE / DELETE の対象テーブルに別名は使えません（別名を外してください）`               |
+| 逆向きの`IF`句             | `CREATE TABLE では IF NOT EXISTS を使ってください` / `DROP TABLE では IF EXISTS を使ってください` |
+| 数値直後の識別子           | `numeric literal is followed by an identifier: 0x`                                                |
 
 未対応の後置句は専用エラーにならず、文の区切りエラーとして報告される場合がある。
 `TEXT`値の変換エラーは、値を引用符付きで表示するため引用符が二重になる。

@@ -269,6 +269,70 @@ let ``Analyzer.chooseJoinAlgorithm: 結合キーが走査順の先頭と一致�
     | other -> failActual "HashJoin ではありません" other
 
 [<Fact>]
+let ``Analyzer.chooseJoinAlgorithm: クロス名の等値はマージ結合にしない`` () =
+    // ON l.a = r.b AND l.b = r.a は、両側の走査順の列名が一致していても
+    // 連言の位置の対応が逆。名前だけで並べ替えると誤った列同士を比較するため、
+    // マージ結合を選ばずハッシュ結合へフォールバックする。
+    let columns = [ col "a" DataType.Integer; col "b" DataType.Integer ]
+
+    let leftTable =
+        {
+            Name = "l"
+            Columns = columns
+            PrimaryKey = [ 0; 1 ]
+            Indexes = []
+        }
+
+    let rightTable =
+        {
+            Name = "r"
+            Columns = columns
+            PrimaryKey = [ 0; 1 ]
+            Indexes = []
+        }
+
+    let leftSchema = Schema.ofTable "l" None leftTable
+    let rightSchema = Schema.ofTable "r" None rightTable
+
+    let tableOf (name: string) =
+        match name with
+        | "l" -> Some leftTable
+        | "r" -> Some rightTable
+        | _ -> None
+
+    let eq side column otherSide otherColumn =
+        Expr.Binary(
+            BinaryOp.Eq,
+            Expr.Column { Qualifier = Some side; Name = column },
+            Expr.Column
+                {
+                    Qualifier = Some otherSide
+                    Name = otherColumn
+                }
+        )
+
+    let leftTree = Logical.Scan("l", ScanMethod.SeqScan)
+    let rightTree = Logical.Scan("r", ScanMethod.SeqScan)
+    let crossed = Expr.Binary(BinaryOp.And, eq "l" "a" "r" "b", eq "l" "b" "r" "a")
+
+    match chooseJoinAlgorithm tableOf leftSchema rightSchema (Some rightTable) leftTree rightTree crossed with
+    | JoinAlgorithm.HashJoin, _, _ -> ()
+    | JoinAlgorithm.MergeJoin, Some keys, _ ->
+        // マージ結合にするなら連言の位置のペア（l.a ↔ r.b、l.b ↔ r.a）を保つこと。
+        Assert.Equal<int array>([| 0; 1 |], keys.LeftIndices)
+        Assert.Equal<int array>([| 1; 0 |], keys.RightIndices)
+    | other -> failActual "HashJoin か正しく並べた MergeJoin ではありません" other
+
+    // 対応が揃っている通常の等値は従来どおりマージ結合。
+    let aligned = Expr.Binary(BinaryOp.And, eq "l" "a" "r" "a", eq "l" "b" "r" "b")
+
+    match chooseJoinAlgorithm tableOf leftSchema rightSchema (Some rightTable) leftTree rightTree aligned with
+    | JoinAlgorithm.MergeJoin, Some keys, _ ->
+        Assert.Equal<int array>([| 0; 1 |], keys.LeftIndices)
+        Assert.Equal<int array>([| 0; 1 |], keys.RightIndices)
+    | other -> failActual "MergeJoin ではありません" other
+
+[<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: 複合索引の前置と右の Filter を扱う`` () =
     let leftTable =
         {

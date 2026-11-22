@@ -163,6 +163,32 @@ let ``Parser: CREATE INDEX IF NOT EXISTS`` () =
     | other -> failActual "CREATE INDEX ではない" other
 
 [<Fact>]
+let ``Parser: IF EXISTS と IF NOT EXISTS を取り違えない`` () =
+    // CREATE は IF NOT EXISTS、DROP は IF EXISTS だけを受理する。
+    // 逆の綴りを黙って受け入れると、DROP TABLE IF NOT EXISTS が削除を実行してしまう。
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "CREATE TABLE IF EXISTS はエラー"
+        (parseStatement "CREATE TABLE IF EXISTS t (id INTEGER PRIMARY KEY)")
+
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "CREATE INDEX IF EXISTS はエラー"
+        (parseStatement "CREATE INDEX IF EXISTS ix ON t (a)")
+
+    expectErrorKind ErrorKind.SyntaxError "DROP TABLE IF NOT EXISTS はエラー" (parseStatement "DROP TABLE IF NOT EXISTS t")
+    expectErrorKind ErrorKind.SyntaxError "DROP INDEX IF NOT EXISTS はエラー" (parseStatement "DROP INDEX IF NOT EXISTS ix")
+
+    // 正しい綴りはフラグが立つ。
+    match parseOneOk "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)" with
+    | Statement.CreateTable ct -> Assert.True ct.IfNotExists
+    | other -> failActual "CREATE TABLE ではない" other
+
+    let n, ifEx = parseDropTableOk "DROP TABLE IF EXISTS users"
+    Assert.Equal("users", n)
+    Assert.True ifEx
+
+[<Fact>]
 let ``Parser: ALTER TABLE`` () =
     match parseOneOk "ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 0" with
     | Statement.AlterTable a ->

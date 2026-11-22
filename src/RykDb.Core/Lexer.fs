@@ -339,28 +339,35 @@ module internal Lexer =
                 else
                     afterFraction
 
-            let text = input.Substring(s.Index, afterExponent.Index - s.Index)
+            let followedByIdent =
+                afterExponent.Index < n && isIdentStart input.[afterExponent.Index]
 
-            if hasFraction || hasExponent then
-                match
-                    System.Double.TryParse(
-                        text,
-                        System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture
-                    )
-                with
-                | true, v -> ret (Token.RealLit v, afterExponent)
-                | _ -> err (DbError.syntax (sprintf "failed to parse real: %s" text) startPos)
+            if followedByIdent then
+                let text = input.Substring(s.Index, afterExponent.Index - s.Index + 1)
+                err (DbError.syntax (sprintf "numeric literal is followed by an identifier: %s" text) startPos)
             else
-                match
-                    System.Int64.TryParse(
-                        text,
-                        System.Globalization.NumberStyles.Integer,
-                        System.Globalization.CultureInfo.InvariantCulture
-                    )
-                with
-                | true, v -> ret (Token.IntLit v, afterExponent)
-                | _ -> err (DbError.syntax (sprintf "failed to parse integer: %s" text) startPos)
+                let text = input.Substring(s.Index, afterExponent.Index - s.Index)
+
+                if hasFraction || hasExponent then
+                    match
+                        System.Double.TryParse(
+                            text,
+                            System.Globalization.NumberStyles.Float,
+                            System.Globalization.CultureInfo.InvariantCulture
+                        )
+                    with
+                    | true, v -> ret (Token.RealLit v, afterExponent)
+                    | _ -> err (DbError.syntax (sprintf "failed to parse real: %s" text) startPos)
+                else
+                    match
+                        System.Int64.TryParse(
+                            text,
+                            System.Globalization.NumberStyles.Integer,
+                            System.Globalization.CultureInfo.InvariantCulture
+                        )
+                    with
+                    | true, v -> ret (Token.IntLit v, afterExponent)
+                    | _ -> err (DbError.syntax (sprintf "failed to parse integer: %s" text) startPos)
         elif c = '\'' then
             collectDelimited input n '\'' "unclosed string" startPos s
             |> Result.map (fun (v, s') -> Token.StringLit v, s')

@@ -285,15 +285,29 @@ module internal Parser =
         }
 
     /// `IF [NOT] EXISTS` を読む。
-    /// `NOT` は省略形（`IF EXISTS`）にも許可される SQL 実装があるため、あれば消費する。
-    /// 消費しないと `CREATE TABLE IF NOT EXISTS` が `EXISTS が必要` で落ちる。
+    /// 戻り値は `(IF 句があるか, NOT があるか)`。
+    /// `CREATE ... IF NOT EXISTS` と `DROP ... IF EXISTS` を取り違えないよう、
+    /// 綴りの検査は `ifFlag` で文種ごとに行う。
     let private parseIfExists (st: PState) =
         if isKeyword "IF" st then
             let st1 = advance st
-            let st2 = if isKeyword "NOT" st1 then advance st1 else st1
-            expectKeyword "EXISTS" st2 |> Result.map (fun (_, st) -> true, st)
+
+            if isKeyword "NOT" st1 then
+                expectKeyword "EXISTS" (advance st1)
+                |> Result.map (fun (_, st) -> (true, true), st)
+            else
+                expectKeyword "EXISTS" st1 |> Result.map (fun (_, st) -> (true, false), st)
         else
-            ret (false, st)
+            ret ((false, false), st)
+
+    /// `IF` 句の綴りを文種ごとに検査し、AST 用のフラグを返す。
+    /// `wantNot = true` は CREATE 用（`IF NOT EXISTS`）、false は DROP 用（`IF EXISTS`）。
+    let private ifFlag (kind: string) (wantNot: bool) (hasIf: bool) (hasNot: bool) (st: PState) =
+        if hasIf && hasNot <> wantNot then
+            let expected = if wantNot then "IF NOT EXISTS" else "IF EXISTS"
+            fail (sprintf "%s では %s を使ってください" kind expected) st
+        else
+            ret (hasIf, st)
 
     let private parseCreateTable (st: PState) =
         let rec body cols constrs st =
@@ -341,7 +355,8 @@ module internal Parser =
         result {
             let! _, st = expectKeyword "CREATE" st
             let! _, st = expectKeyword "TABLE" st
-            let! ifNotExists, st = parseIfExists st
+            let! (hasIf, hasNot), st = parseIfExists st
+            let! ifNotExists, st = ifFlag "CREATE TABLE" true hasIf hasNot st
             let! name, st = parseIdent st
             let! _, st = expectSymbol "(" st
             let! cols, constrs, st = body [] [] st
@@ -363,7 +378,8 @@ module internal Parser =
             let unique = isKeyword "UNIQUE" st
             let st = if unique then advance st else st
             let! _, st = expectKeyword "INDEX" st
-            let! ifNotExists, st = parseIfExists st
+            let! (hasIf, hasNot), st = parseIfExists st
+            let! ifNotExists, st = ifFlag "CREATE INDEX" true hasIf hasNot st
             let! name, st = parseIdent st
             let! _, st = expectKeyword "ON" st
             let! tbl, st = parseIdent st
@@ -385,7 +401,8 @@ module internal Parser =
         result {
             let! _, st = expectKeyword "DROP" st
             let! _, st = expectKeyword "TABLE" st
-            let! ifEx, st = parseIfExists st
+            let! (hasIf, hasNot), st = parseIfExists st
+            let! ifEx, st = ifFlag "DROP TABLE" false hasIf hasNot st
             let! name, st = parseIdent st
             let! _, st = eatOptionalSemicolon st
             return Statement.DropTable(name, ifEx), st
@@ -395,7 +412,8 @@ module internal Parser =
         result {
             let! _, st = expectKeyword "DROP" st
             let! _, st = expectKeyword "INDEX" st
-            let! ifEx, st = parseIfExists st
+            let! (hasIf, hasNot), st = parseIfExists st
+            let! ifEx, st = ifFlag "DROP INDEX" false hasIf hasNot st
             let! name, st = parseIdent st
             let! _, st = eatOptionalSemicolon st
             return Statement.DropIndex(name, ifEx), st

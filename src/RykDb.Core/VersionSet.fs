@@ -573,13 +573,13 @@ module internal Manifest =
 
         let oldLength =
             protect (fun () -> System.IO.File.Exists path)
-            |> Result.bind (fun exists ->
+            >>= fun exists ->
                 if exists then
                     protect readOldLength
                 else
                     sprintf "MANIFEST が見つかりません: %s" (fileName manifestNumber)
                     |> DbError.corruption
-                    |> err)
+                    |> err
 
         match oldLength with
         | Error e -> Error(AppendRejected e)

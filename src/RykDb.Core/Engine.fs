@@ -1402,7 +1402,7 @@ module internal Engine =
         | Statement.Analyze(name, sample) ->
             runDdlWithState state (fun st ->
                 ExecState.analyze (name, sample) limits.Cancel limits.Progress st
-                |> Result.bind (fun (next, stats) ->
+                >>= fun (next, stats) ->
                     let columns = [| "table"; "rows"; "columns"; "ndv" |]
 
                     let rows =
@@ -1421,7 +1421,7 @@ module internal Engine =
                         |> Array.ofList
 
                     StatementResult.OfRows(0, columns, rows)
-                    |> Result.map (fun result -> next, result)))
+                    |> Result.map (fun result -> next, result))
         | Statement.Begin
         | Statement.Commit
         | Statement.Rollback -> ret state |> noRows

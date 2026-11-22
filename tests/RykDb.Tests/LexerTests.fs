@@ -162,6 +162,31 @@ let ``Lexer: 大きすぎる整数はエラー`` () =
     | Ok _ -> Assert.Fail "エラーになるべき"
 
 [<Fact>]
+let ``Lexer: 数値の直後に識別子が続く入力はエラー`` () =
+    // `0x1F` が `0 AS x1F`、`1_000` が `1 AS _000` として静かに通っていた。
+    // 数値 + 裸の別名に化けないよう字句の段階で拒否する。
+    let bad (sql: string) =
+        expectErrorKind ErrorKind.SyntaxError (sprintf "エラーになるべき: %s" sql) (Lexer.tokenize sql)
+
+    bad "0x1F"
+    bad "1_000"
+    bad "1e5x"
+
+    // 空白や記号で区切られていれば通常どおり。
+    let ks = kinds "0 x1F 1 _000"
+
+    Assert.Equal<Token list>(
+        [
+            Token.IntLit 0L
+            Token.Ident "x1F"
+            Token.IntLit 1L
+            Token.Ident "_000"
+            Token.Eos
+        ],
+        ks
+    )
+
+[<Fact>]
 let ``Lexer: バイナリリテラルの異常系はエラー`` () =
     let bad (sql: string) =
         expectErrorKind ErrorKind.SyntaxError (sprintf "エラーになるべき: %s" sql) (Lexer.tokenize sql)
