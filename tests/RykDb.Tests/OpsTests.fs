@@ -12,7 +12,10 @@ open RykDb.TestHelpers
 /// スピル経路は専用のバジェットで別途テストする。
 module private UnlimitedOps =
     let filter = Ops.filter
-    let sortBy = Ops.sortBy MemoryBudget.Unlimited
+
+    let sortBy schema keys src =
+        Ops.sortBy MemoryBudget.Unlimited schema [] [] keys src
+
     let distinct = Ops.distinct MemoryBudget.Unlimited
     let aggregate = Ops.aggregate MemoryBudget.Unlimited
     let havingFilter = Ops.havingFilter
@@ -243,6 +246,63 @@ let ``sortBy: 式の評価エラーは Error になる`` () =
     |> expectErrorKind ErrorKind.NameError "ORDER BY の存在しない列が OK になっています"
 
 [<Fact>]
+let ``sortBy: 集約後の行を集約呼び出し・GROUP BY 式で並べ替えられる`` () =
+    // 集約後の行 = [GROUP BY 値; 集約値]。ORDER BY の集約式・GROUP BY 式は
+    // 計画時にスロット参照へ置き換えて評価する。
+    let op: Op =
+        Op.ofArray
+            [|
+                [| SqlValue.Int 1L; SqlValue.Int 2L |]
+                [| SqlValue.Int 2L; SqlValue.Int 5L |]
+                [| SqlValue.Int 3L; SqlValue.Int 1L |]
+            |]
+
+    let groupBy = [ col "a" ]
+    let aggs = [ (AggFunc.Count, true, false, Expr.Star) ]
+
+    let byAgg =
+        [
+            {
+                Expression = Expr.AggCall(AggFunc.Count, false, Expr.Star)
+                Direction = SortDirection.Descending
+            }
+        ]
+
+    let rows =
+        ok (Op.toArray (ok (Ops.sortBy MemoryBudget.Unlimited schema2 groupBy aggs byAgg op)))
+
+    Assert.Equal<int64>(2L, asInt rows.[0].[0])
+    Assert.Equal<int64>(1L, asInt rows.[1].[0])
+    Assert.Equal<int64>(3L, asInt rows.[2].[0])
+
+    // GROUP BY 式（`a + 0`）とスコープに無い集約はエラーになる（NULL で偽にしない）
+    let byGroupExpr =
+        [
+            {
+                Expression = Expr.Binary(BinaryOp.Add, col "a", Expr.Literal(Literal.Int 0L))
+                Direction = SortDirection.Descending
+            }
+        ]
+
+    let rows2 =
+        ok (Op.toArray (ok (Ops.sortBy MemoryBudget.Unlimited schema2 groupBy aggs byGroupExpr op)))
+
+    Assert.Equal<int64>(3L, asInt rows2.[0].[0])
+
+    let unknown =
+        [
+            {
+                Expression = col "zz"
+                Direction = SortDirection.Ascending
+            }
+        ]
+
+    expectErrorKind
+        ErrorKind.NameError
+        "集約後に存在しない列を ORDER BY しても OK になっています"
+        (Ops.sortBy MemoryBudget.Unlimited schema2 groupBy aggs unknown op)
+
+[<Fact>]
 let ``distinct: 最初に現れた順序を保つ`` () =
     let op: Op =
         Op.ofArray
@@ -257,6 +317,45 @@ let ``distinct: 最初に現れた順序を保つ`` () =
     Assert.Equal<int>(2, rows.Length)
     Assert.Equal<int64>(2L, asInt rows.[0].[0])
     Assert.Equal<int64>(1L, asInt rows.[1].[0])
+
+[<Fact>]
+let ``distinct: SQL 等値で同じ値（INTEGER / DECIMAL / REAL）は 1 行にまとめる`` () =
+    // `1 = 1.0` は真なので DISTINCT も同じ値として扱う（先頭の行を残す）。
+    let op: Op =
+        Op.ofArray
+            [|
+                [| SqlValue.Int 1L |]
+                [| SqlValue.Decimal 1.0M |]
+                [| SqlValue.Decimal 1.00M |]
+                [| SqlValue.Real 1.0 |]
+                [| SqlValue.Int 2L |]
+            |]
+
+    let rows = ok (Op.toArray (UnlimitedOps.distinct op))
+    Assert.Equal<int>(2, rows.Length)
+    Assert.Equal(SqlValue.Int 1L, rows.[0].[0])
+    Assert.Equal(SqlValue.Int 2L, rows.[1].[0])
+
+[<Fact>]
+let ``集約: INTEGER と DECIMAL が等しいグループは 1 つにまとめ、先頭行の値を返す`` () =
+    let op: Op =
+        Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Decimal 1.0M |]; [| SqlValue.Int 2L |] |]
+
+    let aggs = [ (AggFunc.Count, true, false, Expr.Star) ]
+    let rows = ok (Op.toArray (ok (UnlimitedOps.aggregate schema2 [ col "a" ] aggs op)))
+    Assert.Equal<int>(2, rows.Length)
+    // グループ値は先頭出現の値（と型）を保つ
+    Assert.Equal(SqlValue.Int 1L, rows.[0].[0])
+    Assert.Equal<int64>(2L, asInt rows.[0].[1])
+    Assert.Equal(SqlValue.Int 2L, rows.[1].[0])
+    Assert.Equal<int64>(1L, asInt rows.[1].[1])
+
+[<Fact>]
+let ``集約: DISTINCT 集約の等値も SQL 等値（INTEGER と DECIMAL）で判定する`` () =
+    let op: Op = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Decimal 1.0M |] |]
+    let aggs = [ (AggFunc.Count, false, true, col "a") ]
+    let rows = ok (Op.toArray (ok (UnlimitedOps.aggregate schema2 [] aggs op)))
+    Assert.Equal<int64>(1L, asInt rows.[0].[0])
 
 [<Fact>]
 let ``havingFilter: 集約値とグループ値を定数へ置き換える`` () =

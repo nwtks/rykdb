@@ -10,7 +10,8 @@ open RykDb.TestHelpers
 
 /// スピルしない既定のバジェットで `Ops.sortBy` を呼ぶ。
 module private UnlimitedOps =
-    let sortBy = Ops.sortBy MemoryBudget.Unlimited
+    let sortBy schema keys src =
+        Ops.sortBy MemoryBudget.Unlimited schema [] [] keys src
 
 /// 行の配列を Op にする（入れ子の配列推論を避けるため明示的に作る）。
 let private opOfRows (rows: SqlValue array list) = Op.ofArray (List.toArray rows)

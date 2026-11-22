@@ -1,6 +1,117 @@
 namespace RykDb.Core
 
 module internal Ops =
+    /// 集約呼び出しの識別キー（`COUNT(age)` のような表示文字列）。
+    let private aggKey (f: AggFunc) (distinct: bool) (arg: Expr) =
+        if distinct then
+            sprintf "%s(DISTINCT %s)" f.Name (Expr.toDisplayString arg)
+        else
+            sprintf "%s(%s)" f.Name (Expr.toDisplayString arg)
+
+    /// 集約後の行のスロット番号表。
+    /// GROUP BY 式が先頭に、集約呼び出しがその後に並ぶ（`Ops.aggregate` の出力順）。
+    /// 行に依存しないので 1クエリにつき 1回だけ作る。
+    let private aggOffsets (groupBy: Expr list) =
+        let groupSlots =
+            groupBy |> List.mapi (fun i e -> Expr.toDisplayString e, i) |> Map.ofList
+
+        List.mapi (fun i (f, _, distinct, arg) -> aggKey f distinct arg, List.length groupBy + i)
+        >> Map.ofList
+        >> Map.fold (fun acc k v -> Map.add k v acc) groupSlots
+
+    /// 葉（列・リテラル・集約呼び出し）は既存の置換で扱える。
+    /// それ以外の GROUP BY 式（`age + 1` など）だけ、木全体の表示文字列で照合する。
+    let private isLeafExpr =
+        function
+        | Expr.Literal _
+        | Expr.Value _
+        | Expr.Column _
+        | Expr.Name _
+        | Expr.Star
+        | Expr.QualifiedStar _
+        | Expr.AggCall _ -> true
+        | _ -> false
+
+    /// 木全体を置き換える必要がある GROUP BY 式の表示 -> スロット。
+    /// 空なら `substituteAggSlots` は表示文字列を作らない
+    /// （深い HAVING 式で O(深さ²) にならないようにするため）。
+    let private wholeGroupOffsets =
+        List.mapi (fun i e -> e, i)
+        >> List.filter (fun (e, _) -> not (isLeafExpr e))
+        >> List.map (fun (e, i) -> Expr.toDisplayString e, i)
+        >> Map.ofList
+
+    /// 集約後の行のスロットを指す予約名。
+    /// ソースに書けない制御文字から始め、ユーザーの識別子と衝突しないようにする。
+    let private slotName (i: int) = "\u0001" + string i
+
+    /// スロット参照だけを列に持つスキーマ（列位置 = スロット番号）。
+    /// 置換後に残った列参照はここで解決できず、構築時の `checkPrepared` が NameError にする。
+    let private slotSchema (width: int) =
+        { Schema.empty with
+            Columns =
+                Array.init width (fun i ->
+                    {
+                        Name = slotName i
+                        Qualifier = None
+                        DataType = None
+                    })
+        }
+
+    /// 集約後の式を、グループ値・集約値のスロット参照へ置き換える（計画時に 1 回）。
+    /// 置換の構造は行の値に依存しないので、行ごとに組み直す必要はない。
+    let private substituteAggSlots (offsets: Map<string, int>) (wholeOffsets: Map<string, int>) (e: Expr) =
+        let slot key =
+            match offsets |> Map.tryFind key with
+            | Some i when i >= 0 -> Some(Expr.Column { Qualifier = None; Name = slotName i })
+            | _ -> None
+
+        let wholeSlot x =
+            if Map.isEmpty wholeOffsets || isLeafExpr x then
+                None
+            else
+                slot (Expr.toDisplayString x)
+
+        let rewriteLeaf x =
+            match wholeSlot x with
+            | Some l -> l
+            | None ->
+                match x with
+                | Expr.AggCall(f, distinct, arg) ->
+                    match slot (aggKey f distinct arg) with
+                    | Some l -> l
+                    | None -> Expr.Literal Literal.Null
+                | Expr.Literal l -> Expr.Literal l
+                | Expr.Column _ as orig ->
+                    match slot (Expr.toDisplayString orig) with
+                    | Some l -> l
+                    | None -> orig
+                | Expr.Name n as orig ->
+                    match slot n with
+                    | Some l -> l
+                    | None -> orig
+                | other -> other
+
+        Expr.rewrite rewriteLeaf e
+
+    /// 集約後の行を読む式の一覧を、スロット参照の式と評価準備へ変換する。
+    /// 幅は集約後の行幅（GROUP BY 数 + 集約数）。
+    /// 解決できない参照が残っていれば、行を 1つも評価する前に NameError を返す。
+    let private prepareAggExprs (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (exprs: Expr list) =
+        let offsets = aggOffsets groupBy aggs
+        let wholeOffsets = wholeGroupOffsets groupBy
+        let width = groupBy.Length + aggs.Length
+        let substituted = all (List.map (substituteAggSlots offsets wholeOffsets) exprs)
+
+        match substituted with
+        | Error e -> err e
+        | Ok slotExprs ->
+            let resolve = Eval.prepare (slotSchema width) slotExprs
+
+            match Eval.checkPrepared resolve with
+            | Error e -> err e
+            | Ok() -> ret (resolve, slotExprs)
+
     /// 述語で弾く。
     /// 列参照が解決できなければ、行を評価する前に NameError を返す
     /// （入力が 0 行でも未知の列・関数名はエラー）。
@@ -14,8 +125,18 @@ module internal Ops =
     /// ソート。
     /// ORDER BY のキーを列位置へ解決できるならそのまま使い、
     /// 式が含まれる場合はキーを評価して行末へ足してからソートする。
+    /// 集約後の行（`groupBy` / `aggs` が非空）では、キー式を
+    /// グループ値・集約値のスロット参照へ計画時に置き換えてから評価する
+    /// （`ORDER BY COUNT(*)` / `ORDER BY age + 1` / 別名・序数経由の同じ形）。
     /// `*` / `t.*` はORDER BY には書けない。
-    let sortBy (budget: MemoryBudget) (schema: Schema) (keys: RykDb.Core.SortKey list) (src: Op) =
+    let sortBy
+        (budget: MemoryBudget)
+        (schema: Schema)
+        (groupBy: Expr list)
+        (aggs: (AggFunc * bool * bool * Expr) list)
+        (keys: RykDb.Core.SortKey list)
+        (src: Op)
+        =
         let resolve = Eval.prepare schema (keys |> List.map _.Expression)
 
         let compareWith plan (a: SqlValue array) (b: SqlValue array) =
@@ -97,36 +218,42 @@ module internal Ops =
                 else
                     let exprs = keys |> List.map _.Expression
 
-                    match Eval.checkPrepared (Eval.prepare schema exprs) with
+                    let prepared =
+                        if List.isEmpty groupBy && List.isEmpty aggs then
+                            let resolve = Eval.prepare schema exprs
+
+                            match Eval.checkPrepared resolve with
+                            | Error e -> err e
+                            | Ok() -> ret (resolve, exprs)
+                        else
+                            prepareAggExprs groupBy aggs exprs
+
+                    match prepared with
                     | Error e -> err e
-                    | Ok() ->
+                    | Ok(resolveKeys, slotExprs) ->
                         let width = schema.Columns.Length
                         let plan = keys |> List.mapi (fun i k -> width + i, k.Direction)
 
                         let projected =
                             Op.map
                                 (fun row ->
-                                    let keyValues = Array.zeroCreate<SqlValue> exprs.Length
+                                    let keyValues = Array.zeroCreate<SqlValue> slotExprs.Length
 
                                     let rec fill i =
                                         function
                                         | [] -> DbOk(Array.append row keyValues)
                                         | e :: tail ->
-                                            match Eval.evalWithV resolve row e with
+                                            match Eval.evalWithV resolveKeys row e with
                                             | DbErr er -> DbErr er
                                             | DbOk v ->
                                                 keyValues.[i] <- v
                                                 fill (i + 1) tail
 
-                                    fill 0 exprs)
+                                    fill 0 slotExprs)
                                 src
 
-                        result {
-                            let! sorted =
-                                ExtSort.sortRows budget Map.empty (check plan) (compareWith plan) projected
-
-                            return Op.map (fun row -> DbOk(Array.sub row 0 width)) sorted
-                        }
+                        ExtSort.sortRows budget Map.empty (check plan) (compareWith plan) projected
+                        |> Result.map (Op.map (fun row -> DbOk(Array.sub row 0 width)))
 
     /// 重複除去。
     /// 最初に現れた順序を保つ（SQL の DISTINCT）。
@@ -140,7 +267,7 @@ module internal Ops =
     /// </remarks>
     let distinct (budget: MemoryBudget) (src: Op) =
         let encode row =
-            match KeyBuilder.ofValues row with
+            match KeyBuilder.ofValues (Array.map SqlValue.keyNormalize row) with
             | Error e -> DbErr e
             | Ok key -> DbOk key
 
@@ -259,112 +386,15 @@ module internal Ops =
 
         List.fold collectAggs [] >> List.rev
 
-    /// 集約呼び出しの識別キー（`COUNT(age)` のような表示文字列）。
-    let private aggKey (f: AggFunc) (distinct: bool) (arg: Expr) =
-        if distinct then
-            sprintf "%s(DISTINCT %s)" f.Name (Expr.toDisplayString arg)
-        else
-            sprintf "%s(%s)" f.Name (Expr.toDisplayString arg)
-
-    /// 集約後の行のスロット番号表。
-    /// GROUP BY 式が先頭に、集約呼び出しがその後に並ぶ（`Ops.aggregate` の出力順）。
-    /// 行に依存しないので 1クエリにつき 1回だけ作る。
-    let private aggOffsets (groupBy: Expr list) =
-        let groupSlots =
-            groupBy |> List.mapi (fun i e -> Expr.toDisplayString e, i) |> Map.ofList
-
-        List.mapi (fun i (f, _, distinct, arg) -> aggKey f distinct arg, List.length groupBy + i)
-        >> Map.ofList
-        >> Map.fold (fun acc k v -> Map.add k v acc) groupSlots
-
-    /// 葉（列・リテラル・集約呼び出し）は既存の置換で扱える。
-    /// それ以外の GROUP BY 式（`age + 1` など）だけ、木全体の表示文字列で照合する。
-    let private isLeafExpr =
-        function
-        | Expr.Literal _
-        | Expr.Value _
-        | Expr.Column _
-        | Expr.Name _
-        | Expr.Star
-        | Expr.QualifiedStar _
-        | Expr.AggCall _ -> true
-        | _ -> false
-
-    /// 木全体を置き換える必要がある GROUP BY 式の表示 -> スロット。
-    /// 空なら `substituteAggs` は表示文字列を作らない
-    /// （深い HAVING 式で O(深さ²) にならないようにするため）。
-    let private wholeGroupOffsets =
-        List.mapi (fun i e -> e, i)
-        >> List.filter (fun (e, _) -> not (isLeafExpr e))
-        >> List.map (fun (e, i) -> Expr.toDisplayString e, i)
-        >> Map.ofList
-
-    /// 集約呼び出しの式を、計算済みの値（定数）へ置き換える。
-    /// HAVING と SELECT 項目の両方で使う。
-    /// `offsets` は `aggOffsets` の結果。
-    /// 行に依存するのは `row` だけなので offsets は呼び出し側で 1回だけ作る
-    /// （`project` / `havingFilter` は出力 1行ごとに呼ぶため、
-    /// ここで作ると行数ぶんだけマップを組み直すことになる）。
-    /// 組み立ては `Expr.rewrite`（末尾再帰の評価機）に任せるので、式の深さに依存しない。
-    let private substituteAggs (offsets: Map<string, int>) (wholeOffsets: Map<string, int>) (row: SqlValue array) =
-        let slot key =
-            match offsets |> Map.tryFind key with
-            | Some i when i >= 0 && i < row.Length -> Some(Expr.Value row.[i])
-            | _ -> None
-
-        let wholeSlot x =
-            if Map.isEmpty wholeOffsets || isLeafExpr x then
-                None
-            else
-                slot (Expr.toDisplayString x)
-
-        let rewriteLeaf x =
-            match wholeSlot x with
-            | Some l -> l
-            | None ->
-                match x with
-                | Expr.AggCall(f, distinct, arg) ->
-                    match slot (aggKey f distinct arg) with
-                    | Some l -> l
-                    | None -> Expr.Literal Literal.Null
-                | Expr.Literal l -> Expr.Literal l
-                | Expr.Column _ as orig ->
-                    match slot (Expr.toDisplayString orig) with
-                    | Some l -> l
-                    | None -> orig
-                | Expr.Name n as orig ->
-                    match slot n with
-                    | Some l -> l
-                    | None -> orig
-                | other -> other
-
-        Expr.rewrite rewriteLeaf
-
     /// HAVING を張る。
-    /// 集約後の行は位置のみの意味を持つので Schema.empty で評価する。
-    /// offsets はクロージャを 1回作るときにだけ組み立て、行ごとに持ち越さない。
-    /// 列参照の検査は、集約値・グループ値を置き換えた後の式で行う
-    /// （置換の構造は行の値に依存しないので、NULL だけのダミー行で 1回置換すれば足りる）。
+    /// 集約値・グループ値をスロット参照へ置き換えた述語を計画時に 1回だけ作り、
+    /// 行ごとの評価では列位置を引くだけにする。
+    /// 置換後に残った列参照はスロットのスキーマで解決できず NameError になる。
     let havingFilter (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (predicate: Expr) =
-        let offsets = aggOffsets groupBy aggs
-        let wholeOffsets = wholeGroupOffsets groupBy
-        let resolve = Eval.prepare Schema.empty [ predicate ]
-
-        let substituted =
-            substituteAggs offsets wholeOffsets (Array.create (groupBy.Length + aggs.Length) SqlValue.Null) predicate
-
-        let check =
-            match substituted with
-            | Error e -> err e
-            | Ok p -> Eval.checkPrepared (Eval.prepare Schema.empty [ p ])
-
-        match check with
+        match prepareAggExprs groupBy aggs [ predicate ] with
         | Error e -> err e
-        | Ok() ->
-            ret (fun row ->
-                match substituteAggs offsets wholeOffsets row predicate with
-                | Error e -> DbErr e
-                | Ok p -> Eval.matchesWithV resolve row p)
+        | Ok(resolve, [ p ]) -> ret (fun row -> Eval.matchesWithV resolve row p)
+        | Ok _ -> err (DbError.internalError "HAVING の置換結果が不正です")
 
     /// 集約の 1 項目分のアキュムレータ。
     /// SUM / AVG は REAL が現れるまでは decimal、現れた後は double で累積し、最後に型を決める
@@ -378,7 +408,6 @@ module internal Ops =
             SumReal: double
             Min: SqlValue option
             Max: SqlValue option
-            First: SqlValue option
             Seen: Set<SqlValue>
             SeenRuns: string list
         }
@@ -417,6 +446,8 @@ module internal Ops =
                         fill (i + 1) tail
 
             fill 0 groupBy
+
+        let normalizeKey = Array.map SqlValue.keyNormalize
 
         let addDecimal a b =
             let maxD = System.Decimal.MaxValue
@@ -529,11 +560,13 @@ module internal Ops =
                             DbOk updated
 
         let addAcc acc value isStar distinct =
+            let seenValue =
+                match value with
+                | Some v when not (SqlValue.isNull v) -> Some(SqlValue.keyNormalize v)
+                | _ -> None
+
             let alreadySeen =
-                distinct
-                && match value with
-                   | Some v when not (SqlValue.isNull v) -> Set.contains v acc.Seen
-                   | _ -> false
+                distinct && seenValue |> Option.exists (fun v -> Set.contains v acc.Seen)
 
             if alreadySeen then
                 DbOk acc
@@ -548,9 +581,9 @@ module internal Ops =
 
                 let newSeen =
                     if distinct then
-                        match value with
-                        | Some v when not (SqlValue.isNull v) -> Set.add v acc.Seen
-                        | _ -> acc.Seen
+                        match seenValue with
+                        | Some v -> Set.add v acc.Seen
+                        | None -> acc.Seen
                     else
                         acc.Seen
 
@@ -604,7 +637,6 @@ module internal Ops =
                 SumReal = 0.0
                 Min = None
                 Max = None
-                First = None
                 Seen = Set.empty
                 SeenRuns = []
             }
@@ -687,7 +719,7 @@ module internal Ops =
             | AggFunc.Min -> defaultArg acc.Min SqlValue.Null
             | AggFunc.Max -> defaultArg acc.Max SqlValue.Null
 
-        let rowOf bucket key =
+        let rowOf key bucket =
             bucket |> List.map finishAcc |> List.toArray |> Array.append key
 
         let seenBytes = List.sumBy (fun a -> int64 (Set.count a.Seen) * 32L)
@@ -708,7 +740,9 @@ module internal Ops =
             | _ -> 0
 
         let keyOf r =
-            keyOfRow r |> DbResult.toResult >>= KeyBuilder.ofValues
+            match keyOfRow r with
+            | DbErr e -> err e
+            | DbOk k -> KeyBuilder.ofValues (normalizeKey k)
 
         let frame s = Array.append [| SqlValue.Int s |]
 
@@ -750,6 +784,11 @@ module internal Ops =
                 HashIdentity.Structural: System.Collections.Generic.IEqualityComparer<SqlValue array>
             )
 
+        let outputKeys =
+            System.Collections.Generic.Dictionary<SqlValue array, SqlValue array>(
+                HashIdentity.Structural: System.Collections.Generic.IEqualityComparer<SqlValue array>
+            )
+
         let firstSeen =
             System.Collections.Generic.Dictionary<SqlValue array, int64>(
                 HashIdentity.Structural: System.Collections.Generic.IEqualityComparer<SqlValue array>
@@ -775,7 +814,7 @@ module internal Ops =
                         buckets
                         |> Seq.choose (fun kv ->
                             match KeyBuilder.ofValues kv.Key with
-                            | Ok encoded -> Some(encoded, struct (kv.Key, kv.Value, firstSeen.[kv.Key]))
+                            | Ok encoded -> Some(encoded, struct (outputKeys.[kv.Key], kv.Value, firstSeen.[kv.Key]))
                             | Error _ -> None)
                         |> List.ofSeq
 
@@ -796,7 +835,7 @@ module internal Ops =
         let rec emitGroups =
             function
             | [] -> Op.Empty
-            | key :: rest -> Op.compute (fun () -> OpStep.OpRow(rowOf buckets.[key] key, emitGroups rest))
+            | key :: rest -> Op.compute (fun () -> OpStep.OpRow(rowOf outputKeys.[key] buckets.[key], emitGroups rest))
 
         let rec consume order used seq cur =
             match Op.next cur with
@@ -822,12 +861,14 @@ module internal Ops =
                 match keyOfRow row with
                 | DbErr e -> err e
                 | DbOk k ->
-                    match buckets.TryGetValue k with
+                    let key = normalizeKey k
+
+                    match buckets.TryGetValue key with
                     | true, bucket ->
                         match addToBucket bucket row with
                         | DbErr e -> err e
                         | DbOk next ->
-                            buckets.[k] <- next
+                            buckets.[key] <- next
                             let grown = max 0L (seenBytes next - seenBytes bucket)
 
                             if MemoryBudget.exceeded (budget.Work, used + grown) then
@@ -835,7 +876,7 @@ module internal Ops =
                             else
                                 consume order (used + grown) (seq + 1L) nxt
                     | _ ->
-                        let size = bucketBytes k (newBucket ())
+                        let size = bucketBytes key (newBucket ())
 
                         if MemoryBudget.exceeded (budget.Work, used + size) then
                             externalize seq (Op.emit row nxt)
@@ -845,9 +886,10 @@ module internal Ops =
                             match addToBucket bucket row with
                             | DbErr e -> err e
                             | DbOk next ->
-                                buckets.[k] <- next
-                                firstSeen.[k] <- seq
-                                consume (k :: order) (used + size) (seq + 1L) nxt
+                                buckets.[key] <- next
+                                outputKeys.[key] <- k
+                                firstSeen.[key] <- seq
+                                consume (key :: order) (used + size) (seq + 1L) nxt
 
         match Eval.checkPrepared resolve with
         | Error e -> err e
@@ -861,6 +903,7 @@ module internal Ops =
     /// `groupBy` は「射影の入力が集約結果」のときの GROUP BY 式。
     /// `SELECT age, COUNT(*) ... GROUP BY age` の `age` を
     /// 「集約後の行の先頭」にある値へ読み替えるために使う。
+    /// 置換は計画時に 1回だけ行い、行ごとには組み直さない。
     /// 列参照が解決できなければ、行を評価する前に NameError を返す
     /// （集約後は GROUP BY 列と集約呼び出しを置き換えた後の式で検査する）。
     let project (expandSchema: Schema) (evalSchema: Schema) (groupBy: Expr list) (items: SelectItem list) (src: Op) =
@@ -887,8 +930,6 @@ module internal Ops =
             let projection = SelectProjection.create expandSchema items
             let allExprs = projection.Expressions
             let foundAggs = aggCallsOf projection.SelectItems
-            let offsets = aggOffsets groupBy foundAggs
-            let wholeOffsets = wholeGroupOffsets groupBy
 
             if List.isEmpty foundAggs && List.isEmpty groupBy then
                 let resolve = Eval.prepare evalSchema allExprs
@@ -897,35 +938,6 @@ module internal Ops =
                 | Error e -> err e
                 | Ok() -> ret (Op.map (fun row -> evalItems resolve row allExprs) src)
             else
-                let dummyRow = Array.create (groupBy.Length + foundAggs.Length) SqlValue.Null
-
-                let check =
-                    match allExprs |> List.map (substituteAggs offsets wholeOffsets dummyRow) |> all with
-                    | Error e -> err e
-                    | Ok exprs -> Eval.checkPrepared (Eval.prepare Schema.empty exprs)
-
-                match check with
-                | Error e -> err e
-                | Ok() ->
-                    let resolveAgg = Eval.prepare Schema.empty allExprs
-
-                    Op.map
-                        (fun row ->
-                            let values = Array.zeroCreate<SqlValue> allExprs.Length
-
-                            let rec fill i =
-                                function
-                                | [] -> DbOk values
-                                | e :: tail ->
-                                    match substituteAggs offsets wholeOffsets row e with
-                                    | Error er -> DbErr er
-                                    | Ok e ->
-                                        match Eval.evalWithV resolveAgg row e with
-                                        | DbErr er -> DbErr er
-                                        | DbOk v ->
-                                            values.[i] <- v
-                                            fill (i + 1) tail
-
-                            fill 0 allExprs)
-                        src
-                    |> ret
+                prepareAggExprs groupBy foundAggs allExprs
+                |> Result.map (fun (resolveAgg, slotExprs) ->
+                    Op.map (fun row -> evalItems resolveAgg row slotExprs) src)

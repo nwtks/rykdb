@@ -233,6 +233,5 @@ module internal ExtSort =
                     else
                         ingest stamp (row :: buf) (bufBytes + size) written paths state' tail
 
-        Spill.sweepStale budget.Directory
         let stamp = System.Guid.NewGuid().ToString "N"
         ingest stamp [] 0L 0 [] init src

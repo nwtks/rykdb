@@ -56,7 +56,7 @@ module internal Optimizer =
         | AggregateFrame of Expr list * (AggFunc * bool * bool * Expr) list * Schema
         | HavingFrame of Expr * (AggFunc * bool * bool * Expr) list * Expr list
         | DistinctFrame
-        | SortFrame of SortKey list * Schema
+        | SortFrame of SortKey list * Schema * Expr list * (AggFunc * bool * bool * Expr) list
         | LimitFrame of int * int
         /// 射影。第2・3要素は `*` の展開用（論理 = FROM 順）と評価用（実際の行レイアウト）のスキーマ。
         | ProjectFrame of SelectItem list * Schema * Schema * Expr list
@@ -167,9 +167,81 @@ module internal Optimizer =
     let private outputOf (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
         outputSchema ctx inSchema Schema.empty [ SchemaOf tree ]
 
+    /// 出力スキーマのメモ。実行・EXPLAIN の 1回分だけ使う。
+    /// `Logical` は参照等価で、ノード参照は木の中で一意なので文脈はキーに含めない
+    /// （同じノードは常に同じ実行文脈からだけ問い合わされる）。
+    type private OutputSchemaMemo() =
+        let cache =
+            System.Collections.Generic.Dictionary<obj, Schema> HashIdentity.Reference
+
+        member _.TryFind(tree: Logical) =
+            match cache.TryGetValue(box tree) with
+            | true, schema -> Some schema
+            | false, _ -> None
+
+        member _.Add(tree: Logical, schema: Schema) = cache.[box tree] <- schema
+
+    /// 出力スキーマを求める作業項目。
+    type private OutputJob =
+        | NeedNode of Logical
+        | PutWrapper of Logical * Logical
+        | PutJoin of Logical * Logical * Logical
+
+    /// 部分木の全ノードの出力スキーマを後順で求め、メモに入れる。
+    /// 明示スタックなので木の形に依存せずスタックは一定。
+    let private fillOutputSchemas (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (root: Logical) =
+        let rec loop =
+            function
+            | [] -> ()
+            | NeedNode node :: rest ->
+                match memo.TryFind node with
+                | Some _ -> loop rest
+                | None ->
+                    match node with
+                    | Logical.Scan _
+                    | Logical.Values _
+                    | Logical.Aggregate _
+                    | Logical.Derived _
+                    | Logical.UnionAll _ ->
+                        memo.Add(node, baseSchemaOf ctx inSchema node)
+                        loop rest
+                    | Logical.Filter(_, child)
+                    | Logical.Sort(_, child)
+                    | Logical.Limit(_, _, child)
+                    | Logical.Distinct child
+                    | Logical.Having(_, _, _, child)
+                    | Logical.Project(_, child) -> loop (NeedNode child :: PutWrapper(node, child) :: rest)
+                    | Logical.Join(_, _, _, left, right) ->
+                        loop (NeedNode left :: NeedNode right :: PutJoin(node, left, right) :: rest)
+            | PutWrapper(parent, child) :: rest ->
+                match memo.TryFind child with
+                | Some schema -> memo.Add(parent, schema)
+                | None -> ()
+
+                loop rest
+            | PutJoin(parent, left, right) :: rest ->
+                match memo.TryFind left, memo.TryFind right with
+                | Some leftSchema, Some rightSchema -> memo.Add(parent, Schema.concat leftSchema rightSchema)
+                | _ -> ()
+
+                loop rest
+
+        loop [ NeedNode root ]
+
+    /// 出力スキーマをメモから引く（未計算なら部分木を 1パスで計算してから引く）。
+    let private outputOfMemo (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (tree: Logical) =
+        match memo.TryFind tree with
+        | Some schema -> schema
+        | None ->
+            fillOutputSchemas ctx inSchema memo tree
+
+            match memo.TryFind tree with
+            | Some schema -> schema
+            | None -> outputOf ctx inSchema tree
+
     /// 出力列の必要集合を後方伝播し、各 Scan の列マスクを求める。
     /// `Logical` は参照等価の `obj` キーで覚える（構造比較はできない）。
-    let private scanNeedsMasks (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
+    let private scanNeedsMasks (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (tree: Logical) =
         let allColumns schema =
             if schema.Columns.Length = 0 then
                 Set.empty
@@ -215,18 +287,18 @@ module internal Optimizer =
                     (box node, Array.init nodeInput.Columns.Length (fun i -> Set.contains i needed))
                 ]
             | Logical.Filter(p, child) ->
-                let childSchema = outputOf nodeCtx nodeInput child
+                let childSchema = outputOfMemo nodeCtx nodeInput memo child
                 go nodeCtx nodeInput (Set.union needed (refsOf childSchema p)) child
             | Logical.Project(items, child) ->
-                let childSchema = outputOf nodeCtx nodeInput child
+                let childSchema = outputOfMemo nodeCtx nodeInput memo child
                 let projection = SelectProjection.create childSchema items
                 go nodeCtx nodeInput (refsOfAll childSchema projection.Expressions) child
             | Logical.Sort(keys, child) ->
-                let childSchema = outputOf nodeCtx nodeInput child
+                let childSchema = outputOfMemo nodeCtx nodeInput memo child
                 let keyExprs = keys |> List.map _.Expression
                 go nodeCtx nodeInput (Set.union needed (refsOfAll childSchema keyExprs)) child
             | Logical.Aggregate(groupBy, aggs, child) ->
-                let childSchema = outputOf nodeCtx nodeInput child
+                let childSchema = outputOfMemo nodeCtx nodeInput memo child
 
                 let exprs =
                     groupBy
@@ -239,12 +311,12 @@ module internal Optimizer =
                 let aggSchema = aggregateSchema groupBy aggs
                 go nodeCtx nodeInput (Set.union needed (refsOf aggSchema h)) child
             | Logical.Distinct child ->
-                let childSchema = outputOf nodeCtx nodeInput child
+                let childSchema = outputOfMemo nodeCtx nodeInput memo child
                 go nodeCtx nodeInput (allColumns childSchema) child
             | Logical.Limit(_, _, child) -> go nodeCtx nodeInput needed child
             | Logical.Join(_, _, on, left, right) ->
-                let leftSchema = outputOf nodeCtx nodeInput left
-                let rightSchema = outputOf nodeCtx nodeInput right
+                let leftSchema = outputOfMemo nodeCtx nodeInput memo left
+                let rightSchema = outputOfMemo nodeCtx nodeInput memo right
                 let joined = Schema.concat leftSchema rightSchema
                 let withOn = Set.union needed (refsOf joined on)
                 let leftWidth = leftSchema.Columns.Length
@@ -257,17 +329,21 @@ module internal Optimizer =
 
                 go nodeCtx leftSchema leftNeeded left @ go nodeCtx rightSchema rightNeeded right
             | Logical.Derived plan ->
-                let innerOutput = outputOf plan.Context plan.Input plan.Tree
+                let innerOutput = outputOfMemo plan.Context plan.Input memo plan.Tree
                 let innerNeeded = needed |> Set.filter (fun i -> i < innerOutput.Columns.Length)
                 go plan.Context plan.Input innerNeeded plan.Tree
             | Logical.UnionAll plans ->
                 plans
                 |> List.collect (fun plan ->
-                    go plan.Context plan.Input (allColumns (outputOf plan.Context plan.Input plan.Tree)) plan.Tree)
+                    go
+                        plan.Context
+                        plan.Input
+                        (allColumns (outputOfMemo plan.Context plan.Input memo plan.Tree))
+                        plan.Tree)
             | Logical.Values _ -> []
 
         let entries =
-            go ctx inSchema (allColumns (outputOf ctx inSchema tree)) tree
+            go ctx inSchema (allColumns (outputOfMemo ctx inSchema memo tree)) tree
             |> List.map (fun (key, mask) -> System.Collections.Generic.KeyValuePair<obj, bool array>(key, mask))
 
         System.Collections.Immutable.ImmutableDictionary.CreateRange<obj, bool array>(HashIdentity.Reference, entries)
@@ -277,17 +353,24 @@ module internal Optimizer =
         | Logical.Aggregate(groupBy, _, _) -> groupBy
         | _ -> []
 
+    /// 子（ラッパ越し）が集約なら GROUP BY と集約の一覧を返す。
+    /// 集約後の ORDER BY を、グループ値・集約値のスロット参照へ置き換えるために使う。
+    let private aggregateOf (tree: Logical) =
+        match stripWrappers tree with
+        | Logical.Aggregate(groupBy, aggs, _) -> Some(groupBy, aggs)
+        | _ -> None
+
     /// 論理木を 1ノードずつ処理する。
     /// 継続は ExecFrame list に積むので、ラッパの深さに依存せずスタックは一定。
     [<TailCall>]
-    let rec private run (ctx: ExecContext) (frames: ExecFrame list) (step: ExecStep) =
+    let rec private run (ctx: ExecContext) (memo: OutputSchemaMemo) (frames: ExecFrame list) (step: ExecStep) =
         let buildJoinFrame inSchema kind name on left right =
-            let leftSchema = outputOf ctx inSchema left
+            let leftSchema = outputOfMemo ctx inSchema memo left
 
             let rightSchema, rightTable =
                 match stripWrappers right with
                 | Logical.Derived plan -> plan.Output, None
-                | Logical.Join _ -> outputOf ctx inSchema right, None
+                | Logical.Join _ -> outputOfMemo ctx inSchema memo right, None
                 | _ ->
                     let table = defaultSchema ctx name
                     Schema.ofTable name None table, Some table
@@ -523,49 +606,56 @@ module internal Optimizer =
 
                 match frame.Algorithm with
                 | JoinAlgorithm.IndexNestedLoop _ ->
-                    run ctx (JoinIndexLeftFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
-                | _ -> run ctx (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
-            | Logical.Values values -> run ctx frames (ApplyOp(Op.ofRow values))
+                    run ctx memo (JoinIndexLeftFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
+                | _ -> run ctx memo (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
+            | Logical.Values values -> run ctx memo frames (ApplyOp(Op.ofRow values))
             | Logical.Derived plan ->
                 let innerCtx =
                     { plan.Context with
                         ScanNeeds = ctx.ScanNeeds
                     }
 
-                run innerCtx (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None))
-            | Logical.UnionAll [] -> run ctx frames (ApplyOp Op.Empty)
+                run innerCtx memo (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None))
+            | Logical.UnionAll [] -> run ctx memo frames (ApplyOp Op.Empty)
             | Logical.UnionAll(plan :: rest) ->
                 let innerCtx =
                     { plan.Context with
                         ScanNeeds = ctx.ScanNeeds
                     }
 
-                run innerCtx (UnionFrame(ctx, [], rest) :: frames) (EvalNode(plan.Tree, plan.Input, None))
+                run innerCtx memo (UnionFrame(ctx, [], rest) :: frames) (EvalNode(plan.Tree, plan.Input, None))
             | Logical.Scan(name, method) as node ->
                 match execScan node ctx name method hint with
-                | Ok op -> run ctx frames (ApplyOp op)
+                | Ok op -> run ctx memo frames (ApplyOp op)
                 | Error e -> err e
             | Logical.Filter(p, child) ->
-                let childSchema = outputOf ctx inSchema child
-                run ctx (FilterFrame(p, childSchema) :: frames) (EvalNode(child, inSchema, None))
+                let childSchema = outputOfMemo ctx inSchema memo child
+                run ctx memo (FilterFrame(p, childSchema) :: frames) (EvalNode(child, inSchema, None))
             | Logical.Aggregate(groupBy, aggs, child) ->
-                let childSchema = outputOf ctx inSchema child
-                run ctx (AggregateFrame(groupBy, aggs, childSchema) :: frames) (EvalNode(child, inSchema, None))
+                let childSchema = outputOfMemo ctx inSchema memo child
+                run ctx memo (AggregateFrame(groupBy, aggs, childSchema) :: frames) (EvalNode(child, inSchema, None))
             | Logical.Having(h, aggs, groupBy, child) ->
-                run ctx (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema, None))
-            | Logical.Distinct child -> run ctx (DistinctFrame :: frames) (EvalNode(child, inSchema, None))
+                run ctx memo (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema, None))
+            | Logical.Distinct child -> run ctx memo (DistinctFrame :: frames) (EvalNode(child, inSchema, None))
             | Logical.Sort(keys, child) ->
-                let childSchema = outputOf ctx inSchema child
-                run ctx (SortFrame(keys, childSchema) :: frames) (EvalNode(child, inSchema, None))
+                let childSchema = outputOfMemo ctx inSchema memo child
+
+                let groupBy, aggs =
+                    match aggregateOf child with
+                    | Some(groupBy, aggs) -> groupBy, aggs
+                    | None -> [], []
+
+                run ctx memo (SortFrame(keys, childSchema, groupBy, aggs) :: frames) (EvalNode(child, inSchema, None))
             | Logical.Limit(offset, limit, child) ->
                 let childHint = childLimitHint offset limit hint
-                run ctx (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema, childHint))
+                run ctx memo (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema, childHint))
             | Logical.Project(items, child) ->
-                let childSchema = outputOf ctx inSchema child
+                let childSchema = outputOfMemo ctx inSchema memo child
                 let groupBy = groupByOf child
 
                 run
                     ctx
+                    memo
                     (ProjectFrame(items, inSchema, childSchema, groupBy) :: frames)
                     (EvalNode(child, inSchema, hint))
         | ApplyOp op ->
@@ -573,45 +663,45 @@ module internal Optimizer =
             | [] -> ret op
             | frame :: rest ->
                 match frame with
-                | DerivedFrame outer -> run outer rest (ApplyOp op)
+                | DerivedFrame outer -> run outer memo rest (ApplyOp op)
                 | FilterFrame(p, childSchema) ->
                     match Ops.filter childSchema p op with
-                    | Ok filtered -> run ctx rest (ApplyOp filtered)
+                    | Ok filtered -> run ctx memo rest (ApplyOp filtered)
                     | Error e -> err e
                 | AggregateFrame(groupBy, aggs, inSchema) ->
                     match Ops.aggregate ctx.Budget inSchema groupBy aggs op with
-                    | Ok aggregated -> run ctx rest (ApplyOp aggregated)
+                    | Ok aggregated -> run ctx memo rest (ApplyOp aggregated)
                     | Error e -> err e
                 | HavingFrame(h, aggs, groupBy) ->
                     match Ops.havingFilter groupBy aggs h with
                     | Error e -> err e
-                    | Ok p -> run ctx rest (ApplyOp(Op.filter p op))
-                | DistinctFrame -> run ctx rest (ApplyOp(Ops.distinct ctx.Budget op))
-                | SortFrame(keys, childSchema) ->
-                    match Ops.sortBy ctx.Budget childSchema keys op with
-                    | Ok sorted -> run ctx rest (ApplyOp sorted)
+                    | Ok p -> run ctx memo rest (ApplyOp(Op.filter p op))
+                | DistinctFrame -> run ctx memo rest (ApplyOp(Ops.distinct ctx.Budget op))
+                | SortFrame(keys, childSchema, groupBy, aggs) ->
+                    match Ops.sortBy ctx.Budget childSchema groupBy aggs keys op with
+                    | Ok sorted -> run ctx memo rest (ApplyOp sorted)
                     | Error e -> err e
                 | LimitFrame(offset, limit) ->
                     let skipped = if offset > 0 then Op.skip offset op else op
                     let limited = if limit >= 0 then Op.take limit skipped else skipped
-                    run ctx rest (ApplyOp limited)
+                    run ctx memo rest (ApplyOp limited)
                 | ProjectFrame(items, expandSchema, evalSchema, groupBy) ->
                     match Ops.project expandSchema evalSchema groupBy items op with
-                    | Ok projected -> run ctx rest (ApplyOp projected)
+                    | Ok projected -> run ctx memo rest (ApplyOp projected)
                     | Error e -> err e
                 | JoinIndexLeftFrame frame ->
                     match execIndexJoin frame op with
-                    | Ok joined -> run ctx rest (ApplyOp joined)
+                    | Ok joined -> run ctx memo rest (ApplyOp joined)
                     | Error e -> err e
                 | JoinRightFrame frame ->
-                    run ctx (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
+                    run ctx memo (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
                 | JoinApplyFrame(frame, leftOp) ->
                     match execJoin frame leftOp op with
-                    | Ok joined -> run ctx rest (ApplyOp joined)
+                    | Ok joined -> run ctx memo rest (ApplyOp joined)
                     | Error e -> err e
                 | UnionFrame(outer, doneOps, []) ->
                     let combined = List.foldBack Op.append (List.rev (op :: doneOps)) Op.Empty
-                    run outer rest (ApplyOp combined)
+                    run outer memo rest (ApplyOp combined)
                 | UnionFrame(outer, doneOps, plan :: plans) ->
                     let innerCtx =
                         { plan.Context with
@@ -620,6 +710,7 @@ module internal Optimizer =
 
                     run
                         innerCtx
+                        memo
                         (UnionFrame(outer, op :: doneOps, plans) :: rest)
                         (EvalNode(plan.Tree, plan.Input, None))
 
@@ -635,12 +726,15 @@ module internal Optimizer =
     /// childSchema は「そのノードが結果を読む側」だけが使う。
     /// </remarks>
     let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
+        Spill.sweepStale ctx.Budget.Directory
+        let memo = OutputSchemaMemo()
+
         let ctx =
             { ctx with
-                ScanNeeds = scanNeedsMasks ctx schema tree
+                ScanNeeds = scanNeedsMasks ctx schema memo tree
             }
 
-        run ctx [] (EvalNode(tree, schema, None))
+        run ctx memo [] (EvalNode(tree, schema, None))
 
     /// EXPLAIN の作業項目。
     type private ExplainItem =
@@ -656,9 +750,11 @@ module internal Optimizer =
     /// 論理木を EXPLAIN 用の行にする（実行しない）。
     /// `exec` と同じ規則で走査方法・結合アルゴリズムを選び、木を深さ優先で並べる。
     let explain (ctx: ExecContext) (tree: Logical) (schema: Schema) =
+        let memo = OutputSchemaMemo()
+
         let ctx =
             { ctx with
-                ScanNeeds = scanNeedsMasks ctx schema tree
+                ScanNeeds = scanNeedsMasks ctx schema memo tree
             }
 
         let childItem indent tree schema context =
@@ -748,12 +844,12 @@ module internal Optimizer =
                 let text = items |> List.map itemText |> String.concat ", "
                 sprintf "Project(%s)" text, [ childOf item child item.Schema ]
             | Logical.Join(kind, name, on, left, right) ->
-                let leftSchema = outputOf item.Context item.Schema left
+                let leftSchema = outputOfMemo item.Context item.Schema memo left
 
                 let rightSchema, rightTable =
                     match stripWrappers right with
                     | Logical.Derived plan -> plan.Output, None
-                    | Logical.Join _ -> outputOf item.Context item.Schema right, None
+                    | Logical.Join _ -> outputOfMemo item.Context item.Schema memo right, None
                     | _ ->
                         let table = defaultSchema item.Context name
                         Schema.ofTable name None table, Some table

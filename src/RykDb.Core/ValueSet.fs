@@ -443,14 +443,17 @@ module internal ValueSet =
 
                 if SqlValue.isNull v then
                     scan used true nxt
-                elif set.Add v then
-                    let size = int64 (ValueCodec.managedBytes v) + 48L
-
-                    if MemoryBudget.exceeded (budget.Work, used + size) then
-                        spillToDisk budget set hasNull nxt
-                    else
-                        scan (used + size) hasNull nxt
                 else
-                    scan used hasNull nxt
+                    let key = SqlValue.keyNormalize v
+
+                    if set.Add key then
+                        let size = int64 (ValueCodec.managedBytes key) + 48L
+
+                        if MemoryBudget.exceeded (budget.Work, used + size) then
+                            spillToDisk budget set hasNull nxt
+                        else
+                            scan (used + size) hasNull nxt
+                    else
+                        scan used hasNull nxt
 
         scan 0L false src

@@ -519,7 +519,15 @@ module internal DmlOps =
     /// 検索キーは更新前の行の主キー。
     /// 主キー列の変更は `Dml.updateRow` が ConstraintViolation で拒否する
     /// （DELETE + INSERT を使う）。
-    let update (ctx: ExecContext) (schema: TableSchema) (assignments: (string * Expr) list) (where: Expr option) =
+    /// `scan` は候補行を開く関数（列マスクを受ける）。
+    /// WHERE は行ごとに再評価するので、候補が広めでも正しさは変わらない。
+    let updateWith
+        (scan: bool array -> Result<Op, DbError>)
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (assignments: (string * Expr) list)
+        (where: Expr option)
+        =
         let targetSchema = targetSchemaOf schema
         let assignExprs = List.map snd assignments
         let resolve = Eval.prepare targetSchema (assignExprs @ Option.toList where)
@@ -551,11 +559,9 @@ module internal DmlOps =
                         else
                             go targets ((row, newRow) :: acc) bytes next
 
-        let collectUpdates txn targets =
+        let collectUpdates targets =
             result {
-                let! scan =
-                    Dml.scanByPrimaryKeyWithTxnValues ctx.Store schema 0 ctx.Visible (Some ctx.Scope) txn true
-
+                let! scan = scan (Array.create schema.Columns.Length true)
                 return! go targets [] 0L scan
             }
 
@@ -660,7 +666,7 @@ module internal DmlOps =
                         |> foldOk (fun () e -> Eval.checkComparableTypes targetSchema e) ()
 
                     let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
-                    let! updates = collectUpdates ctx.Txn targets
+                    let! updates = collectUpdates targets
                     do! validateUniqueUpdates ctx.Txn targets updates
 
                     let! txn2 =
@@ -678,7 +684,13 @@ module internal DmlOps =
 
     /// DELETE。
     /// WHERE に合う行を主キー + 全索引に tombstone で消す。
-    let delete (ctx: ExecContext) (schema: TableSchema) (where: Expr option) =
+    /// `scan` は候補行を開く関数（列マスクを受ける）。
+    let deleteWith
+        (scan: bool array -> Result<Op, DbError>)
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (where: Expr option)
+        =
         let targetSchema = targetSchemaOf schema
         let resolve = Eval.prepare targetSchema (Option.toList where)
 
@@ -735,7 +747,7 @@ module internal DmlOps =
 
                     mask
 
-        let foldRows ctx schema mask matched onRow =
+        let foldRows ctx mask matched onRow =
             let rec go t c cur =
                 match Op.next cur with
                 | OpStep.OpError e -> err e
@@ -750,9 +762,7 @@ module internal DmlOps =
                         | Error e -> err e
 
             result {
-                let! scan =
-                    Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn mask
-
+                let! scan = scan mask
                 return! go ctx.Txn 0 scan
             }
 
@@ -768,7 +778,7 @@ module internal DmlOps =
             let mask = deleteMask checks
 
             return!
-                foldRows ctx schema mask (fun row -> matchesWhere resolve row where) (fun t count row ->
+                foldRows ctx mask (fun row -> matchesWhere resolve row where) (fun t count row ->
                     ForeignKey.checkParentDelete ctx.Store ctx.Visible ctx.Scope t schema checks row
                     >>= fun () -> Dml.deleteRow t schema row |> Result.map (fun t2 -> t2, count + 1))
         }

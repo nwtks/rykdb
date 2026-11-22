@@ -1315,6 +1315,70 @@ module internal Engine =
         | None -> ret None
         | Some e -> Plan.resolveDmlExprWith target ctx e |> Result.map Some
 
+    /// UPDATE / DELETE の候補行を、WHERE から選んだ走査方法で開く。
+    /// WHERE は呼び出し側が行ごとに再評価するので、走査は候補の十分条件にだけ使う
+    /// （範囲の閉区間など、走査が広めに返しても結果は変わらない）。
+    let private dmlCandidateScan (ctx: ExecContext) (schema: TableSchema) (where: Expr option) (mask: bool array) =
+        let indexScan indexName build =
+            result {
+                let! scanMask, fetchMask =
+                    ExecContext.indexAccessMasks ctx schema.Name indexName mask
+
+                let! op = build scanMask
+
+                if fetchMask |> Array.exists id then
+                    return! ExecContext.fetchMissing ctx schema.Name fetchMask op
+                else
+                    return op
+            }
+
+        let method =
+            match where with
+            | None -> ScanMethod.SeqScan
+            | Some w ->
+                let binding: TableBinding =
+                    {
+                        Ref = { Name = schema.Name; Alias = None }
+                        RealName = schema.Name
+                        Schema = schema
+                    }
+
+                match Binder.qualify (Schema.ofTable schema.Name None schema) w with
+                | Error _ -> ScanMethod.SeqScan
+                | Ok qualified ->
+                    match Analyzer.chooseScanMethod binding ctx.Catalog [ qualified ] with
+                    | Ok method -> method
+                    | Error _ -> ScanMethod.SeqScan
+
+        match method with
+        | ScanMethod.SeqScan ->
+            Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn mask
+        | ScanMethod.PkLookup values ->
+            result {
+                let! row =
+                    Dml.getByPrimaryKeyWithTxnMask ctx.Store schema values ctx.Visible ctx.Txn mask
+
+                match row with
+                | Some r -> return Op.ofRow r
+                | None -> return Op.Empty
+            }
+        | ScanMethod.RangeScan(_, startKey, endKey) ->
+            Dml.scanByPrimaryKeyRangeWithTxnMask
+                ctx.Store
+                schema
+                startKey
+                endKey
+                0
+                ctx.Visible
+                (Some ctx.Scope)
+                ctx.Txn
+                mask
+        | ScanMethod.IndexLookup(indexName, values) ->
+            indexScan indexName (fun scanMask -> ExecContext.byIndexMasked ctx schema.Name indexName values 0 scanMask)
+        | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
+            indexScan indexName (fun scanMask ->
+                ExecContext.byIndexRangeMasked ctx schema.Name indexName lower upper 0 scanMask)
+
     let private runInsert (stmt: InsertStatement) (ctx: ExecContext) =
         result {
             let! schema = ExecContext.schemaOf stmt.Table.Name ctx
@@ -1348,7 +1412,7 @@ module internal Engine =
                 |> all
 
             let! whereE = resolveWhere target ctx stmt.Where
-            return! DmlOps.update ctx schema assignments whereE
+            return! DmlOps.updateWith (dmlCandidateScan ctx schema whereE) ctx schema assignments whereE
         }
 
     let private runDelete (stmt: DeleteStatement) (ctx: ExecContext) =
@@ -1356,7 +1420,7 @@ module internal Engine =
             let! schema = ExecContext.schemaOf stmt.Table.Name ctx
             let target = Schema.ofTable schema.Name None schema
             let! whereE = resolveWhere target ctx stmt.Where
-            return! DmlOps.delete ctx schema whereE
+            return! DmlOps.deleteWith (dmlCandidateScan ctx schema whereE) ctx schema whereE
         }
 
     let private runDml

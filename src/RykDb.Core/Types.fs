@@ -342,6 +342,40 @@ module internal SqlValue =
 
     let vReal = normalizeFloat >> SqlValue.Real
 
+    /// 等値キー用の正規化。
+    /// DISTINCT / GROUP BY の同一性は符号化バイト列の一致で判定するため、
+    /// `compareValuesV` が等値とみなす表現差を 1つの表現へ寄せる:
+    /// - 整数値の DECIMAL は INTEGER に寄せる（`1.0` / `1.00` / `1` を同じキーに）
+    /// - REAL は 10進と厳密に往復できる値だけ寄せる（丸めが絡む値は REAL のまま残す。
+    ///   REAL と DECIMAL の等値は丸めで推移的でなくなり得るため、安全側に倒す）
+    /// - 深夜 0時 UTC の TIMESTAMP は DATE に寄せる（両者は等値）
+    /// 集計値の計算には使わない（元の値の型を保つ）。
+    let keyNormalize =
+        let canonicalDecimal d =
+            let stripped = if d = 0M then 0M else d / 1.0000000000000000000000000000M
+
+            if
+                stripped = System.Decimal.Truncate stripped
+                && stripped >= decimal System.Int64.MinValue
+                && stripped <= decimal System.Int64.MaxValue
+            then
+                SqlValue.Int(int64 stripped)
+            else
+                SqlValue.Decimal stripped
+
+        function
+        | SqlValue.Decimal d -> canonicalDecimal d
+        | SqlValue.Real f as v when
+            not (System.Double.IsNaN f)
+            && not (System.Double.IsInfinity f)
+            && System.Math.Abs f <= 7.9e28
+            ->
+            let d = decimal f
+            if float d = f then canonicalDecimal d else v
+        | SqlValue.Timestamp t when t.UtcTicks % System.TimeSpan.TicksPerDay = 0L ->
+            SqlValue.Date(System.DateOnly.FromDateTime t.UtcDateTime)
+        | other -> other
+
     /// TEXT を UTF-8 の符号化順（Unicode コードポイント順）で比較する。
     /// .NET の StringComparer.Ordinal は UTF-16 コード単位順であり、
     /// 補助文字（サロゲートペア）と U+E000..U+FFFF の間で UTF-8 の順序と逆転する。

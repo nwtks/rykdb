@@ -80,6 +80,8 @@
 | INV-44 | 放棄された transaction は次の書き込みで回収する       | `RegistrationLease`、`DatabaseHost.reclaimAbandoned`、DatabaseHostTests                   |
 | INV-45 | commit できない COMMIT は接続を transaction 外へ戻す  | `CommitOutcome`、`DatabaseHost.Commit`、`Session`、SessionTests                           |
 | INV-46 | fsync 失敗で適用済みの COMMIT の結果を捨てない        | `DatabaseHost.serialized`、`CommitOutcome.CommittedUnsynced`、DatabaseHostTests           |
+| INV-47 | 集約後の式は計画時にスロット参照へ置き換える          | `Ops.prepareAggExprs`（SELECT / HAVING / ORDER BY）、OpsTests、SqlReferenceTests          |
+| INV-48 | DML の候補走査は WHERE の十分条件だけを使う           | `Engine.dmlCandidateScan`、`DmlOps.updateWith` / `deleteWith`、SqlReferenceTests          |
 
 ---
 
@@ -808,6 +810,32 @@ fsync が失敗しても commit は**適用済み**である
 回帰テストは `DatabaseHost: fsync 失敗の COMMIT は適用済みを CommittedUnsynced で返す`、
 `DatabaseHost: fsync 失敗後も BEGIN と ROLLBACK は成功する`、
 `Session: fsync 失敗の COMMIT は transaction を閉じてからエラーを返す` を検査する。
+
+---
+
+### INV-47: 集約後の式は計画時にスロット参照へ置き換える
+
+集約後の行は「GROUP BY値 + 集約値」の位置だけに意味がある。
+`SELECT`・`HAVING`・`ORDER BY`の式を、GROUP BY式と集約呼び出しのスロット参照へ
+計画時に 1回だけ置き換える。
+
+- 行ごとに式を書き換えない（`Expr.rewrite` のコストを行数に比例させない）。
+- 置換後に残った列参照はスロット専用のスキーマで解決できず、行を 1つも評価する前に
+  `NameError` になる（0行の入力で静かに通らない）。
+- `ORDER BY COUNT(*)`・集約の別名・序数・`GROUP BY`式（`ORDER BY age + 1`）も同じ置換を通る。
+- 回帰: `sortBy: 集約後の行を集約呼び出し・GROUP BY 式で並べ替えられる` /
+  `SqlReference: ORDER BY は集約式・集約の別名・序数・GROUP BY 式で並べ替えられる`。
+
+### INV-48: DML の候補走査は WHERE の十分条件だけを使う
+
+`UPDATE` / `DELETE`の候補行の走査は`SELECT`と同じ規則で選ぶが、走査は候補の**十分条件**にだけ使う。
+行の可否は常に`WHERE`の再評価で決める。
+
+- 範囲の閉区間・`LIKE`前置の上限など、走査が広めに返しても結果は変わらない。
+- 修飾・型検査に失敗する`WHERE`（未知列など）は全走査で進め、エラーは既存の
+  `checkPrepared` / `checkComparableTypes` が返す。
+- 候補走査の列マスクは、`UPDATE`は全列、`DELETE`は主キー + 索引列 + `WHERE`参照列。
+- 回帰: `SqlReference: UPDATE / DELETE は索引・主キーの走査で候補を絞っても WHERE で再評価する`。
 
 ---
 

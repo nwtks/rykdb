@@ -989,6 +989,39 @@ let ``SqlReference: DELETE は WHERE に合う行を消す`` () =
         Assert.Equal<int64>(1L, asInt res.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: UPDATE / DELETE は索引・主キーの走査で候補を絞っても WHERE で再評価する`` () =
+    // DML の候補走査は SELECT と同じ規則（PkLookup / IndexLookup / 範囲）。
+    // 走査は候補の十分条件なので、WHERE 全体は行ごとに再評価される。
+    withSession "dml-scan-method" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
+        let db2 = exec db1 "CREATE INDEX ix_a ON t (a)"
+        let db3 = exec db2 "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 10, 'z')"
+
+        // 索引等値（a = 10）で 2 行に絞り、WHERE 全体（id < 3）で 1 行に再評価
+        let db4, u1 = ok (execSql db3 "UPDATE t SET b = 'u' WHERE a = 10 AND id < 3")
+        Assert.Equal<int>(1, u1.RowsAffected)
+
+        let _, r1 = ok (execSql db4 "SELECT id, b FROM t ORDER BY id")
+        Assert.Equal<string>("u", asText r1.Rows.[0].[1])
+        Assert.Equal<string>("y", asText r1.Rows.[1].[1])
+        Assert.Equal<string>("z", asText r1.Rows.[2].[1])
+
+        // 主キー等値
+        let db5, u2 = ok (execSql db4 "UPDATE t SET b = 'v' WHERE id = 2")
+        Assert.Equal<int>(1, u2.RowsAffected)
+
+        // 索引等値で削除（2 行）
+        let db6, d1 = ok (execSql db5 "DELETE FROM t WHERE a = 10")
+        Assert.Equal<int>(2, d1.RowsAffected)
+
+        // 主キーの範囲（閉区間の広い走査）でも WHERE で再評価して 1 行だけ消す
+        let db7, d2 = ok (execSql db6 "DELETE FROM t WHERE id > 0 AND id <= 2")
+        Assert.Equal<int>(1, d2.RowsAffected)
+
+        let _, left = ok (execSql db7 "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(0L, asInt left.Rows.[0].[0]))
+
+[<Fact>]
 let ``SqlReference: SELECT * は全列を返す`` () =
     seeded "sel1" (fun db ->
         let _db5, res = ok (execSql db "SELECT * FROM people ORDER BY id")
@@ -2567,9 +2600,50 @@ let ``SqlReference: 式の列名は丸括弧つきの表示文字列`` () =
         Assert.Equal<string array>([| "(1 + 2)"; "(v || 'x')" |], r.Columns))
 
 [<Fact>]
-let ``SqlReference: ORDER BY に集約式は書けない`` () =
-    // §7.3: 集約式（ORDER BY COUNT(*) など）は未対応。
+let ``SqlReference: ORDER BY は集約式・集約の別名・序数・GROUP BY 式で並べ替えられる`` () =
+    // §7.3: 集約後の ORDER BY は GROUP BY 値と集約値を参照できる。
     withSession "order-by-agg" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2)"
+
+        let _, agg =
+            ok (execSql db2 "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY COUNT(*) DESC")
+
+        Assert.Equal<int64>(1L, asInt agg.Rows.[0].[0])
+        Assert.Equal<int64>(2L, asInt agg.Rows.[0].[1])
+        Assert.Equal<int64>(2L, asInt agg.Rows.[1].[0])
+
+        let _, alias =
+            ok (execSql db2 "SELECT g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c DESC")
+
+        Assert.Equal<int64>(1L, asInt alias.Rows.[0].[0])
+
+        let _, ordinal =
+            ok (execSql db2 "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY 2 DESC")
+
+        Assert.Equal<int64>(1L, asInt ordinal.Rows.[0].[0])
+
+        // GROUP BY 式も ORDER BY（式・序数）で参照できる
+        let _, groupExpr =
+            ok (execSql db2 "SELECT g + 10, COUNT(*) FROM t GROUP BY g + 10 ORDER BY g + 10 DESC")
+
+        Assert.Equal<int64>(12L, asInt groupExpr.Rows.[0].[0])
+
+        let _, groupExprOrdinal =
+            ok (execSql db2 "SELECT g + 10, COUNT(*) FROM t GROUP BY g + 10 ORDER BY 1")
+
+        Assert.Equal<int64>(11L, asInt groupExprOrdinal.Rows.[0].[0])
+
+        // 集約外の列は従来どおり NameError
+        expectErrorKind
+            ErrorKind.NameError
+            "GROUP BY に無い列の ORDER BY"
+            (execSql db2 "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY id"))
+
+[<Fact>]
+let ``SqlReference: 集約があるのに GROUP BY に無い列を選ぶとエラー`` () =
+    // 上のテストの逆（集約式の ORDER BY 自体は使えるようになった）。
+    withSession "order-by-agg2" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
         expectErrorKind ErrorKind.NameError "ORDER BY COUNT(*)" (execSql db2 "SELECT id FROM t ORDER BY COUNT(*)"))

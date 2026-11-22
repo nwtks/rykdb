@@ -569,6 +569,10 @@ SELECT * FROM t WHERE a = 1 AND b = 2; -- IndexLookup
 範囲走査には下限が必要で、`<`、`<=`だけでは索引を使わない。
 `LIKE 'prefix%'`は末尾の `%`だけで `_`を含まない場合に範囲へ変換する。
 
+`UPDATE` / `DELETE`の`WHERE`も同じ規則で候補行の走査を選ぶ。
+走査は候補の十分条件にだけ使い、行の可否は`WHERE`の再評価で決まる
+（範囲の閉区間など、候補が広めでも結果は変わらない）。
+
 索引エントリの値は空で、キーは索引列と主キーから復元する。
 被覆していない列は主キーlookupで取得する。
 
@@ -629,6 +633,16 @@ LEFT JOIN depts d ON p.dept_id = d.id;
 - `NULLS FIRST`、`NULLS LAST`は未対応。
 - 同値行の順序は保証しない。
 - 列参照、式、序数（1始まり）を指定できる。
+- 集約クエリ（`GROUP BY` / 集約関数）の`ORDER BY`では、`GROUP BY`の式と集約呼び出しを参照できる。
+  集約の別名・序数（集約の選択項目を指すもの）も同じ規則で解決する。
+
+```sql
+SELECT dept_id, COUNT(*) FROM people GROUP BY dept_id ORDER BY COUNT(*) DESC;
+SELECT dept_id, COUNT(*) AS c FROM people GROUP BY dept_id ORDER BY c;
+SELECT age / 10, COUNT(*) FROM people GROUP BY age / 10 ORDER BY age / 10;
+```
+
+集約していない列を`ORDER BY`に書くと`NameError`になる。
 
 主キー順に走査する単一テーブル（集約・`DISTINCT`・`JOIN`なし）で、
 `ORDER BY`の先頭が主キー全列を定義順・昇順に並べる場合はソートを省略する。

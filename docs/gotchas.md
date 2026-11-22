@@ -227,6 +227,19 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 回帰: `Parser: IF EXISTS と IF NOT EXISTS を取り違えない` /
 `SqlReference: CREATE TABLE IF EXISTS は エラー（IF NOT EXISTS を使う）`。
 
+### 3.19 集約後の ORDER BY は集約出力の列参照だけでは足りない
+
+`ORDER BY COUNT(*)`・集約の別名・序数（集約項目を指すもの）・`ORDER BY age + 1`
+（GROUP BY 式）は、集約後の行では「列参照」にならない。
+`Ops.sortBy`が生の式を集約後のスキーマで評価すると
+`COUNT は集約なのでここでは評価できません` / `列 't.age' が存在しません` になる。
+
+- ✅ `Ops.prepareAggExprs`で、GROUP BY値と集約値のスロット参照へ計画時に置換する
+  （`SELECT` / `HAVING` / `ORDER BY` の共通経路）。
+- ❌ `ORDER BY`だけ置換を忘れると、集約列だけ動いて式・序数が落ちる（実際に踏んだ）。
+- 集約していない列は置換後も残り、スロット専用スキーマの`checkPrepared`が`NameError`にする。
+- 回帰: `SqlReference: ORDER BY は集約式・集約の別名・序数・GROUP BY 式で並べ替えられる`。
+
 ---
 
 ## 4. LSM・WAL・MANIFEST
@@ -563,6 +576,15 @@ INSERT/UPDATEの暗黙変換は`SqlValue.coerce`。
 回帰: `SqlReference: DISTINCT は DECIMAL のスケール違いを同じ値とみなす` /
 `集約: 退避しても DECIMAL のスケール違いを同じグループにする`。
 
+さらに、`1 = 1.0` が真でも型タグの違いで `DISTINCT` が 2行になっていた。
+`SqlValue.keyNormalize` で「整数値のDECIMAL・10進と厳密に往復できるREAL・深夜0時UTCのTIMESTAMP」を
+1つの表現へ寄せる。
+REAL の丸めが絡む値は REAL のまま残す
+（`DISTINCT`/`GROUP BY` のキーは推移律が必要なため、`compareValuesV` の等値より**細かい**側に倒す）。
+`GROUP BY` の出力値は先頭出現の元の値を使い、型とスケールを保つ。
+回帰: `distinct: SQL 等値で同じ値（INTEGER / DECIMAL / REAL）は 1 行にまとめる` /
+`集約: INTEGER と DECIMAL が等しいグループは 1 つにまとめ、先頭行の値を返す`。
+
 ### 6.15 COUNT 以外の集約に \* を許さない
 
 `MIN(*)` / `MAX(*)` は 1行テーブルで静かに NULL、2行以上で TypeError、
@@ -826,7 +848,29 @@ SDK更新後は`dotnet build tools/TailAudit/TailAudit.fsproj -t:Rebuild`を実�
 `DisableImplicitLibraryPacksFolder=true`でnuget.orgへ固定する。
 ロック更新時は古いFSharp.Coreパッケージキャッシュを消して`dotnet restore --force-evaluate`を実行する。
 
-### 9.16 レコードのフィールド名はメンバー解決を横取りする
+### 9.16 `|>` は `>>=` より優先順位が低い
+
+パイプの右側に関数を合成すると、`|>` の方が先に結合しない。
+
+```fsharp
+// ❌ `x |> (f >>= g)` と解釈され、型エラーが「List.map の結果」の形で出る
+exprs |> List.map (substitute f) |> all >>= fun slotExprs -> ...
+
+// ✅ 一度束縛してから match する
+let substituted = all (List.map (substitute f) exprs)
+
+match substituted with
+| Error e -> err e
+| Ok slotExprs -> ...
+```
+
+- カスタム演算子の優先順位は**先頭文字**で決まる。`>>=` は `>`（比較）と同じで、
+  `|>` より強い。
+- 似た罠: `Expr.rewrite rewriteLeaf` は**式を受け取る関数**を返す。
+  `let f ... (e: Expr) = ... Expr.rewrite rewriteLeaf` と書くと引数が 1 つ余分になり、
+  「`Expr -> Expr -> Result`」の型エラーになる。`Expr.rewrite rewriteLeaf e` まで書く。
+
+### 9.17 レコードのフィールド名はメンバー解決を横取りする
 
 `Ast.fs`の`Membership`は`Contains: SqlValue -> DbResult<TruthValue>`というフィールドを持つ。
 この状態で`Set<int>`に`xs.Contains`と書くと、F#はレコードフィールド`Membership.Contains`を優先し、
@@ -1005,7 +1049,9 @@ JOINのONは、並べ替え用の解析で`Binder.qualify`が失敗しても述�
 - [ ] 真偽の解釈（WHERE / NOT / AND / OR / CASE / IS TRUE）を同じ関数に揃えているか
 - [ ] 数値リテラルの直後の識別子を裸の別名として静かに解釈していないか
 - [ ] `IF EXISTS` / `IF NOT EXISTS` の綴りを文種ごとに検査しているか
-- [ ] `DISTINCT` / `GROUP BY` の退避キーが SQL の等値（`KeyBuilder`）に揃っているか
+- [ ] `DISTINCT` / `GROUP BY` の退避キーが SQL の等値（`KeyBuilder` + `keyNormalize`）に揃っているか
+- [ ] 集約後の `SELECT` / `HAVING` / `ORDER BY` がすべてスロット置換を通っているか
+- [ ] `UPDATE` / `DELETE` の候補走査は `WHERE` の十分条件だけで、行の可否は再評価で決めているか
 - [ ] COUNT 以外の集約に `*` を許していないか
 - [ ] REAL の演算・SUM が有限の入力から非有限を作らないか
 

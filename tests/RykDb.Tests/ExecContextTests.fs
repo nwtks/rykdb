@@ -63,6 +63,21 @@ let private seedPeople (store: RowStore) (mgr: TransactionManager) =
 let private col (name: string) =
     Expr.Column { Qualifier = None; Name = name }
 
+let private update (ctx: ExecContext) (schema: TableSchema) (assignments: (string * Expr) list) (where: Expr option) =
+    DmlOps.updateWith
+        (fun mask -> Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn mask)
+        ctx
+        schema
+        assignments
+        where
+
+let private delete (ctx: ExecContext) (schema: TableSchema) (where: Expr option) =
+    DmlOps.deleteWith
+        (fun mask -> Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn mask)
+        ctx
+        schema
+        where
+
 [<Fact>]
 let ``ExecContext.create: 空の Schemas と同一の Store`` () =
     withStore "ec-create" (fun store ->
@@ -277,7 +292,7 @@ let ``DmlOps.update: UPDATE は WHERE に合う行だけを変える`` () =
 
         let txn1, n =
             ok (
-                DmlOps.update
+                update
                     ctx
                     peopleSchema
                     [ ("age", Expr.Binary(BinaryOp.Add, col "age", Expr.Literal(Literal.Int 1L))) ]
@@ -306,7 +321,7 @@ let ``DmlOps.update: UPDATE 対象が transaction 上限を超えると Capacity
         expectErrorKind
             ErrorKind.CapacityError
             "UPDATE 上限を超えた対象行を検出できなかった"
-            (DmlOps.update (ctxOf store txn) peopleSchema [ ("age", Expr.Literal(Literal.Int 1L)) ] None))
+            (update (ctxOf store txn) peopleSchema [ ("age", Expr.Literal(Literal.Int 1L)) ] None))
 
 [<Fact>]
 let ``DmlOps.delete: DELETE は WHERE に合う行を消す`` () =
@@ -319,9 +334,7 @@ let ``DmlOps.delete: DELETE は WHERE に合う行を消す`` () =
         let ctx = ctxOf store txn1
 
         let txn2, n =
-            ok (
-                DmlOps.delete ctx peopleSchema (Some(Expr.Binary(BinaryOp.Eq, col "id", Expr.Literal(Literal.Int 1L))))
-            )
+            ok (delete ctx peopleSchema (Some(Expr.Binary(BinaryOp.Eq, col "id", Expr.Literal(Literal.Int 1L)))))
 
         Assert.Equal<int>(1, n)
 
