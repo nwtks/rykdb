@@ -497,9 +497,20 @@ module internal Parser =
             return! alterAction name st
         }
 
-    /// `ANALYZE [TABLE] テーブル名`。
+    /// 現在位置が `SAMPLE` で、直後が数値（`SAMPLE n` の n）か。
+    /// `SAMPLE` は予約語にしないので、表名と区別するために 1 トークン先を見る。
+    let private sampleClauseAhead (st: PState) =
+        isIdentName "SAMPLE" st
+        && st.Pos + 1 < st.Tokens.Length
+        && match st.Tokens.[st.Pos + 1].Token with
+           | Token.IntLit _
+           | Token.RealLit _
+           | Token.Symbol "-" -> true
+           | _ -> false
+
+    /// `ANALYZE [TABLE] テーブル名` / `ANALYZE [TABLE] SAMPLE n`。
     /// `ANALYZE` / `TABLE` は予約語にしない（`EXPLAIN` / `ALTER` と同じ）。
-    let private parseSample st =
+    let private parseSample (st: PState) =
         if isIdentName "SAMPLE" st then
             let st = advance st
 
@@ -519,21 +530,28 @@ module internal Parser =
             | Token.Keyword "TABLE" -> advance st
             | _ -> st
 
-        match peek st with
-        | Token.Ident name
-        | Token.QuotedIdent name ->
-            let st = advance st
-
+        if sampleClauseAhead st then
             result {
                 let! sample, st = parseSample st
                 let! _, st = eatOptionalSemicolon st
-                return Statement.Analyze(Some name, sample), st
+                return Statement.Analyze(None, sample), st
             }
-        | Token.Eos
-        | Token.Symbol ";" ->
-            eatOptionalSemicolon st
-            |> Result.map (fun (_, st) -> Statement.Analyze(None, None), st)
-        | _ -> fail "ANALYZE にはテーブル名が必要です" st
+        else
+            match peek st with
+            | Token.Ident name
+            | Token.QuotedIdent name ->
+                let st = advance st
+
+                result {
+                    let! sample, st = parseSample st
+                    let! _, st = eatOptionalSemicolon st
+                    return Statement.Analyze(Some name, sample), st
+                }
+            | Token.Eos
+            | Token.Symbol ";" ->
+                eatOptionalSemicolon st
+                |> Result.map (fun (_, st) -> Statement.Analyze(None, None), st)
+            | _ -> fail "ANALYZE にはテーブル名が必要です" st
 
     let private parseOne (st: PState) =
         let nextToken =

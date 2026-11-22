@@ -261,6 +261,11 @@ let ``Parser: SELECT 各種`` () =
     Assert.True sel2.Limit.IsSome
     Assert.True sel2.Offset.IsSome
 
+    // SELECT ALL は既定（重複を残す）の明示で、DISTINCT にはならない
+    let selAll = parseSelectOk "SELECT ALL a FROM t"
+    Assert.False selAll.Distinct
+    Assert.Equal(1, selAll.Items.Length)
+
 [<Fact>]
 let ``Parser: サブクエリ（スカラー / IN / EXISTS）`` () =
     parseOneOk "SELECT (SELECT MAX(v) FROM t) FROM t" |> ignore

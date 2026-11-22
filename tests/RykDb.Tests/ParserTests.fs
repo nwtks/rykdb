@@ -695,6 +695,20 @@ let ``Parser: ANALYZE はテーブル名を受ける`` () =
         Assert.Equal<int>(100, sample)
     | other -> failActual "ANALYZE SAMPLE ではない" other
 
+    // SAMPLE の直後が整数ならテーブル名を省略した節として読む
+    match parseOneOk "ANALYZE SAMPLE 10" with
+    | Statement.Analyze(None, Some sample) -> Assert.Equal<int>(10, sample)
+    | other -> failActual "ANALYZE 全テーブル SAMPLE ではない" other
+
+    match parseOneOk "ANALYZE TABLE SAMPLE 10" with
+    | Statement.Analyze(None, Some sample) -> Assert.Equal<int>(10, sample)
+    | other -> failActual "ANALYZE TABLE SAMPLE ではない" other
+
+    // 整数が続かない SAMPLE はテーブル名（予約語にしない）
+    match parseOneOk "ANALYZE SAMPLE" with
+    | Statement.Analyze(Some name, None) -> Assert.Equal<string>("SAMPLE", name)
+    | other -> failActual "テーブル名 SAMPLE ではない" other
+
     match parseOneOk "ANALYZE" with
     | Statement.Analyze(None, None) -> ()
     | other -> failActual "ANALYZE 全テーブルではない" other
@@ -705,3 +719,4 @@ let ``Parser: ANALYZE はテーブル名を受ける`` () =
 
     expectErrorKind ErrorKind.SyntaxError "SAMPLE 0" (parseStatement "ANALYZE t SAMPLE 0")
     expectErrorKind ErrorKind.SyntaxError "SAMPLE 欠落" (parseStatement "ANALYZE t SAMPLE")
+    expectErrorKind ErrorKind.SyntaxError "全テーブル SAMPLE 0" (parseStatement "ANALYZE SAMPLE 0")

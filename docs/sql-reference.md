@@ -31,7 +31,7 @@ RykDbが受け付けるSQLの文法と意味を示す。
 ```ebnf
 statement ::= select | explain | insert | update | delete | ddl | transaction
 
-select_core ::= SELECT [DISTINCT] select_item { "," select_item }
+select_core ::= SELECT [DISTINCT | ALL] select_item { "," select_item }
                 [ FROM table_ref { join_clause } ]
                 [ WHERE expr ]
                 [ GROUP BY expr { "," expr } ]
@@ -61,7 +61,7 @@ ddl        ::= CREATE TABLE [IF NOT EXISTS] ident "(" table_element { "," table_
              | ALTER TABLE ident ( ADD [COLUMN] column_def
                                   | DROP [COLUMN] ident
                                   | RENAME [COLUMN] ident TO ident )
-             | ANALYZE [TABLE] [ident]
+             | ANALYZE [TABLE] [ident] [SAMPLE n]
 
 transaction ::= BEGIN [TRANSACTION] | START TRANSACTION
               | COMMIT [WORK | TRANSACTION] | END
@@ -480,7 +480,7 @@ END
 ### 7.1 基本文法
 
 ```sql
-SELECT [DISTINCT] select_item [, ...]
+SELECT [DISTINCT | ALL] select_item [, ...]
 FROM table_ref [ [AS] alias ]
      [join_clause ...]
 [WHERE expr]
@@ -495,6 +495,10 @@ FROM table_ref [ [AS] alias ]
 `FROM`は省略できる。
 `SELECT 1`は1行1列を返し、列名は式の表示文字列になる。
 `FROM`がないクエリでは `*`と `t.*`は使えない。
+
+`ALL`は既定と同じで、重複を残す（`DISTINCT`の逆）。
+`ALL`は予約語ではないが、`SELECT`直後の `ALL`はこの綴りとして消費される
+（`ALL`という列名は `"ALL"`で参照する）。
 
 `JOIN`は次の形式を受け付ける。
 
@@ -772,6 +776,7 @@ ORDER BY id;
 ### 7.12 DISTINCT
 
 `DISTINCT`は射影後の行に適用する。
+`SELECT ALL`は既定（重複を残す）の明示で、`DISTINCT`と逆になる。
 等値の判定は SQL の比較に従う
 （`DECIMAL`の`1.0`と`1.00`は同じ値、`REAL`の`-0.0`と`0.0`も同じ）。
 `COUNT(DISTINCT)`と`GROUP BY`、ハッシュ結合のキーも同じ等値を使う。
@@ -1010,6 +1015,10 @@ ANALYZE [TABLE] [table_name] [SAMPLE n];
 テーブルの行数、列ごとの異なり値数（NDV）、NULL 数、数値列の最小/最大、
 索引の prefix NDV を収集し、カタログへ保存する。
 テーブル名を省略すると全テーブルを対象にする。
+`SAMPLE n`だけを書いてテーブル名を省略できる（全テーブルが対象）。
+`SAMPLE`の直後が整数なら節として扱うため、`sample`という名前のテーブルは
+`ANALYZE TABLE sample`か`ANALYZE "sample"`で指定する
+（`ANALYZE SAMPLE`のように整数が続かなければテーブル名のまま）。
 
 - 結合順、結合アルゴリズム、走査基数、Filter 選択性の見積りに使う。
 - 結果は `table` / `rows` / `columns` / `ndv` / `nulls` / `ranges` / `indexes` の 1行
@@ -1215,6 +1224,7 @@ WALは書きかけの末尾を切り捨ててから再追記するため、同�
 | 逆向きの`IF`句             | `CREATE TABLE では IF NOT EXISTS を使ってください` / `DROP TABLE では IF EXISTS を使ってください` |
 | 数値直後の識別子           | `numeric literal is followed by an identifier: 0x`                                                |
 | COUNT 以外の集約の `*`     | `MIN に * は使えません（* を使えるのは COUNT(*) だけです）`                                       |
+| SAMPLE に整数以外          | `SAMPLE には正の整数が必要です`                                                                   |
 | REAL の結果が無限大        | `数値演算の結果が表現可能な範囲を超えました` / `SUM の結果が REAL の範囲を超えました`             |
 
 未対応の後置句は専用エラーにならず、文の区切りエラーとして報告される場合がある。

@@ -502,6 +502,10 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
         Assert.Equal<int>(1, sampled.Rows.Length)
         Assert.Equal<int64>(3L, asInt sampled.Rows.[0].[1])
 
+        // テーブル名を省略した SAMPLE は全テーブルの標本解析
+        let _, sampledAll = execRes db5 "ANALYZE SAMPLE 2"
+        Assert.Equal<int>(2, sampledAll.Rows.Length)
+
         // 存在しないテーブルは NameError
         expectErrorKind ErrorKind.NotFound "存在しないテーブル" (execSql db5 "ANALYZE nope")
         // DDL と同じく transaction 中は実行できない
@@ -1624,6 +1628,18 @@ let ``SqlReference: WHERE の真偽と NOT / CASE WHEN / IS UNKNOWN が一致す
 
         let _, unknown = ok (execSql db2 "SELECT COUNT(*) FROM t WHERE 1 IS UNKNOWN")
         Assert.Equal<int64>(0L, asInt unknown.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: SELECT ALL は既定どおり重複を残す`` () =
+    withSession "select-all" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,10),(3,20)"
+
+        let _, rows = ok (execSql db2 "SELECT ALL g FROM t ORDER BY g")
+        Assert.Equal<int>(3, rows.Rows.Length)
+
+        let _, distinct = ok (execSql db2 "SELECT DISTINCT g FROM t ORDER BY g")
+        Assert.Equal<int>(2, distinct.Rows.Length))
 
 [<Fact>]
 let ``SqlReference: DISTINCT は DECIMAL のスケール違いを同じ値とみなす`` () =

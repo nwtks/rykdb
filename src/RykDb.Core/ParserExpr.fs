@@ -705,6 +705,7 @@ module internal ParserExpr =
         | Ok(_, st) ->
             let distinct = isKeyword "DISTINCT" st
             let st = if distinct then advance st else st
+            let st = if isIdentName "ALL" st then advance st else st
 
             parseSelectItemsC st (fun (items, st) ->
                 if isKeyword "FROM" st then
