@@ -20,7 +20,14 @@ type internal Prepared =
                     struct (int * string),
                     Result<Scalar.LikePattern, DbError>
                  >
+            /// 計画時に解決できなかった列参照の最初のエラー。
+            /// 評価は行ごとなので、入力が 0 行だとこのエラーが表に出ない。
+            /// 演算子は `Eval.checkPrepared` で構築時に検査する。
+            FirstError: DbError option
         }
+
+    /// 解決できなかった列参照の最初のエラー（無ければ None）。
+    member this.TryError = this.FirstError
 
     /// 列参照を列位置へ解決する。
     /// 計画時に拾えなかった参照だけ `Schema.resolve` に落ちる。
@@ -594,24 +601,40 @@ module internal Eval =
             System.Collections.Immutable.ImmutableDictionary.Create()
 
         let addColumn
-            (acc:
-                System.Collections.Immutable.ImmutableDictionary<struct (string option * string), Result<int, DbError>>)
+            (
+                acc:
+                    System.Collections.Immutable.ImmutableDictionary<
+                        struct (string option * string),
+                        Result<int, DbError>
+                     > *
+                    DbError option
+            )
+            asName
             (c: ColumnRef)
             =
+            let dict, firstError = acc
             let key = struct (c.Qualifier, c.Name)
 
-            if acc.ContainsKey key then
+            if dict.ContainsKey key then
                 acc
             else
-                acc.Add(key, Schema.resolve c schema)
+                let resolved =
+                    match Schema.resolve c schema with
+                    | Error _ when asName -> Error(DbError.name (sprintf "'%s' は列でも関数でもありません" c.Name))
+                    | other -> other
 
-        let columns =
-            (emptyColumns, exprs)
+                match resolved, firstError with
+                | Error e, None -> dict.Add(key, resolved), Some e
+                | _ -> dict.Add(key, resolved), firstError
+
+        let columns, firstError =
+            ((emptyColumns, None), exprs)
             ||> List.fold (fun acc e ->
                 Expr.fold
                     (fun acc node ->
                         match node with
-                        | Expr.Column c -> addColumn acc c
+                        | Expr.Column c -> addColumn acc false c
+                        | Expr.Name n -> addColumn acc true { Qualifier = None; Name = n }
                         | _ -> acc)
                     acc
                     e)
@@ -673,12 +696,20 @@ module internal Eval =
             Source = schema
             Resolved = columns
             Patterns = likes
+            FirstError = firstError
         }
+
+    /// 解決できなかった列参照があれば、その最初のエラーを返す。
+    /// 演算子は行を 1つも評価する前にこれを呼び、0 行の入力でも NameError を返す。
+    let checkPrepared (resolve: Prepared) =
+        match resolve.TryError with
+        | Some e -> err e
+        | None -> ret ()
 
     /// 計画時に作った評価準備で式を評価する（内部ホットパス用）。
     /// 集約呼び出しはここでエラーになる。
     /// 評価機 step を空の継続スタックで始める（末尾再帰のまま深さ・候補数に依存しない）。
-    let evalWithV (resolve: Prepared) (row: SqlValue array) (e: Expr) : DbResult<SqlValue> =
+    let evalWithV (resolve: Prepared) (row: SqlValue array) (e: Expr) =
         step resolve (Single row) [] (Descend e)
 
     /// 評価準備で式を評価する（公開境界用）。
@@ -690,7 +721,7 @@ module internal Eval =
     let eval (schema: Schema) = prepare schema [] |> evalWith
 
     /// 評価結果を WHERE の真偽へ変換する（UNKNOWN は偽）。
-    let private asMatchV (r: DbResult<SqlValue>) : DbResult<bool> =
+    let private asMatchV (r: DbResult<SqlValue>) =
         match r with
         | DbErr e -> DbErr e
         | DbOk v ->

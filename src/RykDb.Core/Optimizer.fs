@@ -418,16 +418,14 @@ module internal Optimizer =
 
                 match frame.Algorithm with
                 | JoinAlgorithm.IndexNestedLoop JoinLookup.PrimaryKey ->
-                    ret (
-                        joinWith frame left keys (fun keyValues ->
-                            ExecContext.byPrimaryKeyMasked ctx frame.RightName keyValues rightMask)
-                    )
+                    joinWith frame left keys (fun keyValues ->
+                        ExecContext.byPrimaryKeyMasked ctx frame.RightName keyValues rightMask)
                 | JoinAlgorithm.IndexNestedLoop(JoinLookup.Index indexName) ->
                     result {
                         let! scanMask, fetchMask =
                             ExecContext.indexAccessMasks ctx frame.RightName indexName rightMask
 
-                        return joinWith frame left keys (lookup frame indexName scanMask fetchMask)
+                        return! joinWith frame left keys (lookup frame indexName scanMask fetchMask)
                     }
                 | _ -> err (DbError.internalError "index nested loop ではありません")
 
@@ -561,14 +559,18 @@ module internal Optimizer =
             | frame :: rest ->
                 match frame with
                 | DerivedFrame outer -> run outer rest (ApplyOp op)
-                | FilterFrame(p, childSchema) -> run ctx rest (ApplyOp(Ops.filter childSchema p op))
+                | FilterFrame(p, childSchema) ->
+                    match Ops.filter childSchema p op with
+                    | Ok filtered -> run ctx rest (ApplyOp filtered)
+                    | Error e -> err e
                 | AggregateFrame(groupBy, aggs, inSchema) ->
                     match Ops.aggregate ctx.Budget inSchema groupBy aggs op with
                     | Ok aggregated -> run ctx rest (ApplyOp aggregated)
                     | Error e -> err e
                 | HavingFrame(h, aggs, groupBy) ->
-                    let p = Ops.havingFilter groupBy aggs h
-                    run ctx rest (ApplyOp(Op.filter p op))
+                    match Ops.havingFilter groupBy aggs h with
+                    | Error e -> err e
+                    | Ok p -> run ctx rest (ApplyOp(Op.filter p op))
                 | DistinctFrame -> run ctx rest (ApplyOp(Ops.distinct ctx.Budget op))
                 | SortFrame(keys, childSchema) ->
                     match Ops.sortBy ctx.Budget childSchema keys op with
@@ -579,7 +581,9 @@ module internal Optimizer =
                     let limited = if limit >= 0 then Op.take limit skipped else skipped
                     run ctx rest (ApplyOp limited)
                 | ProjectFrame(items, expandSchema, evalSchema, groupBy) ->
-                    run ctx rest (ApplyOp(Ops.project expandSchema evalSchema groupBy items op))
+                    match Ops.project expandSchema evalSchema groupBy items op with
+                    | Ok projected -> run ctx rest (ApplyOp projected)
+                    | Error e -> err e
                 | JoinIndexLeftFrame frame ->
                     match execIndexJoin frame op with
                     | Ok joined -> run ctx rest (ApplyOp joined)

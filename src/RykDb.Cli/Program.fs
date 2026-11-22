@@ -136,7 +136,9 @@ let private runRepl (session: Session) =
 
 let private runFile (session: Session) (path: string) =
     if not (System.IO.File.Exists path) then
-        Error(sprintf "ファイル %s がありません" path |> DbError.notFound)
+        let e = sprintf "ファイル %s がありません" path |> DbError.notFound
+        printError e
+        Error e
     else
         let sql = System.IO.File.ReadAllText path
 

@@ -509,7 +509,7 @@ let ``結合: インデックス入れ子ループ（INNER / LEFT）`` () =
         | _ -> Ok Op.Empty
 
     let inner =
-        ok (Op.toArray (UnlimitedOpsJoin.innerJoinIndexed leftSchema left [| 0 |] rightSchema None lookup))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.innerJoinIndexed leftSchema left [| 0 |] rightSchema None lookup)))
 
     Assert.Equal<int>(2, inner.Length)
     Assert.Equal<int64>(2L, asInt inner.[0].[0])
@@ -518,7 +518,7 @@ let ``結合: インデックス入れ子ループ（INNER / LEFT）`` () =
     let left2 = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
 
     let leftRows =
-        ok (Op.toArray (UnlimitedOpsJoin.leftJoinIndexed leftSchema left2 [| 0 |] rightSchema None lookup))
+        ok (Op.toArray (ok (UnlimitedOpsJoin.leftJoinIndexed leftSchema left2 [| 0 |] rightSchema None lookup)))
 
     Assert.Equal<int>(2, leftRows.Length)
     Assert.True(SqlValue.isNull leftRows.[0].[1])
@@ -582,13 +582,15 @@ let ``結合: 4つのアルゴリズムは INNER で同じ行を返す`` () =
     let indexed =
         ok (
             Op.toArray (
-                UnlimitedOpsJoin.innerJoinIndexed
-                    diffLeftSchema
-                    (Op.ofArray leftRows)
-                    keys
-                    diffRightSchema
-                    (Some diffResidual)
-                    (diffLookup rightRows keys)
+                ok (
+                    UnlimitedOpsJoin.innerJoinIndexed
+                        diffLeftSchema
+                        (Op.ofArray leftRows)
+                        keys
+                        diffRightSchema
+                        (Some diffResidual)
+                        (diffLookup rightRows keys)
+                )
             )
         )
 
@@ -653,13 +655,15 @@ let ``結合: 4つのアルゴリズムは LEFT で同じ行を返す`` () =
     let indexed =
         ok (
             Op.toArray (
-                UnlimitedOpsJoin.leftJoinIndexed
-                    diffLeftSchema
-                    (Op.ofArray leftRows)
-                    keys
-                    diffRightSchema
-                    None
-                    (diffLookup rightRows keys)
+                ok (
+                    UnlimitedOpsJoin.leftJoinIndexed
+                        diffLeftSchema
+                        (Op.ofArray leftRows)
+                        keys
+                        diffRightSchema
+                        None
+                        (diffLookup rightRows keys)
+                )
             )
         )
 
@@ -724,13 +728,15 @@ let ``結合: 4つのアルゴリズムは NaN と -0.0 を同じ扱いにする
     let indexed =
         ok (
             Op.toArray (
-                UnlimitedOpsJoin.innerJoinIndexed
-                    leftSchema
-                    (Op.ofArray leftRows)
-                    keys
-                    rightSchema
-                    None
-                    (diffLookup rightRows keys)
+                ok (
+                    UnlimitedOpsJoin.innerJoinIndexed
+                        leftSchema
+                        (Op.ofArray leftRows)
+                        keys
+                        rightSchema
+                        None
+                        (diffLookup rightRows keys)
+                )
             )
         )
 
@@ -1142,3 +1148,24 @@ let ``結合: マージ結合は左が先に尽きても右を読み切る（退
 
     Assert.Empty rows
     Assert.True(drained.Value, "左が先に尽きても右を読み切る必要があります")
+
+[<Fact>]
+let ``結合: ON と residual の未知の列は空の入力でも構築時に Error`` () =
+    // 入力が 0 行でも ON 句は一度も評価されない。
+    // 列解決は演算子の構築時に検査し、行数に依存せず NameError にする。
+    let unknown = Expr.Column { Qualifier = None; Name = "nope" }
+
+    expectErrorKind
+        ErrorKind.NameError
+        "nested loop の ON が OK になっています"
+        (UnlimitedOpsJoin.innerJoin leftSchema Op.Empty rightSchema Op.Empty unknown)
+
+    expectErrorKind
+        ErrorKind.NameError
+        "ハッシュ結合の residual が OK になっています"
+        (UnlimitedOpsJoin.innerJoinHash leftSchema Op.Empty [| 0 |] rightSchema Op.Empty [| 0 |] (Some unknown))
+
+    expectErrorKind
+        ErrorKind.NameError
+        "インデックス入れ子ループの residual が OK になっています"
+        (UnlimitedOpsJoin.innerJoinIndexed leftSchema Op.Empty [| 0 |] rightSchema (Some unknown) (fun _ -> Ok Op.Empty))

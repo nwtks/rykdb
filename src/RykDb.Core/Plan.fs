@@ -486,13 +486,20 @@ module internal Plan =
                      | Some r -> [ sourceRef r ])
                     @ (rewritten.Joins |> List.map (fun j -> sourceRef j.Table))
 
+                let nameKey (r: TableRef) =
+                    (defaultArg r.Alias r.Name).ToLowerInvariant()
+
                 let duplicate =
                     sources
-                    |> List.countBy (fun r -> defaultArg r.Alias r.Name)
+                    |> List.countBy nameKey
                     |> List.tryFind (fun (_, c) -> c > 1)
+                    |> Option.bind (fun (key, _) ->
+                        sources
+                        |> List.tryFind (fun r -> nameKey r = key)
+                        |> Option.map (fun r -> defaultArg r.Alias r.Name))
 
                 match duplicate with
-                | Some(name, _) -> sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name |> err
+                | Some name -> sprintf "テーブル %s が重複しています（エイリアスを付けてください）" name |> DbError.name |> err
                 | None ->
                     registerSources ctx derived sources
                     >>= fun (ctx2, inputSchema) ->

@@ -3338,3 +3338,38 @@ let ``SqlReference: JOIN の後に続く LEFT JOIN も実行される`` () =
         Assert.Equal<int64>(2L, asInt res.Rows.[1].[0])
         Assert.Equal<int64>(2L, asInt res.Rows.[1].[1])
         Assert.Equal<SqlValue>(SqlValue.Null, res.Rows.[1].[2]))
+
+[<Fact>]
+let ``SqlReference: 未知の列は行が 0 件でも実行前にエラー`` () =
+    // 列解決は演算子の構築時に検査する。入力が 0 行で述語・射影が一度も評価されなくても
+    // 未知の列・関数名は NameError（黙って 0 行を返さない）。
+    withSession "unknown-column-empty" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE e (id INTEGER PRIMARY KEY, v INTEGER)"
+        expectErrorKind ErrorKind.NameError "空テーブルの射影" (execSql db1 "SELECT nope FROM e")
+        expectErrorKind ErrorKind.NameError "空テーブルの修飾列" (execSql db1 "SELECT e.nope FROM e")
+        expectErrorKind ErrorKind.NameError "空テーブルの WHERE" (execSql db1 "SELECT * FROM e WHERE nope = 1")
+        expectErrorKind ErrorKind.NameError "空テーブルの COUNT" (execSql db1 "SELECT COUNT(*) FROM e WHERE nope = 1")
+        expectErrorKind ErrorKind.NameError "空テーブルの ORDER BY" (execSql db1 "SELECT id FROM e ORDER BY nope")
+        expectErrorKind ErrorKind.NameError "空テーブルの UPDATE" (execSql db1 "UPDATE e SET v = 1 WHERE nope = 1")
+        expectErrorKind ErrorKind.NameError "空テーブルの DELETE" (execSql db1 "DELETE FROM e WHERE nope = 1")
+
+        // 行があっても同じエラー（検出が早くなるだけで、エラーの種類は変わらない）。
+        let db2 = exec db1 "INSERT INTO e VALUES (1, 10)"
+        expectErrorKind ErrorKind.NameError "1 行ありの WHERE" (execSql db2 "SELECT * FROM e WHERE nope = 1"))
+
+[<Fact>]
+let ``SqlReference: テーブル名の重複は大小文字を区別せずにエラー`` () =
+    // 識別子はカタログと同じく大小文字を区別しない。
+    // 重複したまま計画すると列が曖昧になるので、計画前に NameError にする。
+    withSession "duplicate-table-case" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 10)"
+        expectErrorKind ErrorKind.NameError "実名と大文字" (execSql db2 "SELECT * FROM t JOIN T ON t.id = T.id")
+        expectErrorKind ErrorKind.NameError "別名の大小文字" (execSql db2 "SELECT * FROM t AS x JOIN t AS X ON x.id = X.id")
+
+        // 別名を付ければ同じテーブルの自己結合はできる。
+        let _, res =
+            ok (execSql db2 "SELECT a.id, b.v FROM t AS a JOIN t AS b ON a.id = b.id")
+
+        Assert.Equal<int>(1, res.Rows.Length)
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0]))

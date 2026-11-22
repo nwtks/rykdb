@@ -355,45 +355,47 @@ module internal PlanBuilder =
             function
             | [] -> ret (acc, accSchema, used)
             | next :: tail ->
-                let index = byName |> Map.find next
-                let promotedWhere, used' = promoteAt joinPredicates joined used next
+                match byName |> Map.tryFind next with
+                | None -> err (DbError.internalError "結合順の候補が FROM / JOIN の別名に対応しません")
+                | Some index ->
+                    let promotedWhere, used' = promoteAt joinPredicates joined used next
 
-                let promotedOns, usedOns' =
-                    onPredicates
-                    |> List.fold
-                        (fun (take, used) (i, refs, e) ->
-                            if not (Set.contains i used) && Set.isSubset refs (Set.add next joined) then
-                                e :: take, Set.add i used
-                            else
-                                take, used)
-                        ([], usedOns)
-
-                let ownOn =
-                    unmovableOns
-                    |> List.tryFind (fun (i, _) -> i = index)
-                    |> Option.map snd
-                    |> Option.toList
-
-                let on =
-                    Predicate.joinConjuncts (List.rev promotedOns @ promotedWhere @ ownOn)
-                    |> Option.defaultValue (Expr.Literal(Literal.Bool true))
-
-                match buildJoin bindings scans acc accSchema JoinKind.Inner index on [] with
-                | Ok(node, schema) ->
-                    apply
-                        bindings
-                        scans
-                        joinPredicates
+                    let promotedOns, usedOns' =
                         onPredicates
+                        |> List.fold
+                            (fun (take, used) (i, refs, e) ->
+                                if not (Set.contains i used) && Set.isSubset refs (Set.add next joined) then
+                                    e :: take, Set.add i used
+                                else
+                                    take, used)
+                            ([], usedOns)
+
+                    let ownOn =
                         unmovableOns
-                        byName
-                        node
-                        schema
-                        (Set.add next joined)
-                        used'
-                        usedOns'
-                        tail
-                | Error e -> err e
+                        |> List.tryFind (fun (i, _) -> i = index)
+                        |> Option.map snd
+                        |> Option.toList
+
+                    let on =
+                        Predicate.joinConjuncts (List.rev promotedOns @ promotedWhere @ ownOn)
+                        |> Option.defaultValue (Expr.Literal(Literal.Bool true))
+
+                    match buildJoin bindings scans acc accSchema JoinKind.Inner index on [] with
+                    | Ok(node, schema) ->
+                        apply
+                            bindings
+                            scans
+                            joinPredicates
+                            onPredicates
+                            unmovableOns
+                            byName
+                            node
+                            schema
+                            (Set.add next joined)
+                            used'
+                            usedOns'
+                            tail
+                    | Error e -> err e
 
         let rec buildSteps
             bindings
@@ -563,8 +565,11 @@ module internal PlanBuilder =
                         | [] -> None
                         | _ ->
                             let order = candidates |> List.minBy fst |> snd
-                            let firstIndex = allByName |> Map.find (List.head order)
-                            Some(firstIndex, order, allByName)
+
+                            order
+                            |> List.tryHead
+                            |> Option.bind (fun first -> allByName |> Map.tryFind first)
+                            |> Option.map (fun firstIndex -> firstIndex, order, allByName)
                     else
                         None
 

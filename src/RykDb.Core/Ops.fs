@@ -2,9 +2,14 @@ namespace RykDb.Core
 
 module internal Ops =
     /// 述語で弾く。
-    let filter (schema: Schema) (predicate: Expr) =
+    /// 列参照が解決できなければ、行を評価する前に NameError を返す
+    /// （入力が 0 行でも未知の列・関数名はエラー）。
+    let filter (schema: Schema) (predicate: Expr) (src: Op) =
         let resolve = Eval.prepare schema [ predicate ]
-        Op.filter (fun row -> Eval.matchesWithV resolve row predicate)
+
+        match Eval.checkPrepared resolve with
+        | Error e -> err e
+        | Ok() -> ret (Op.filter (fun row -> Eval.matchesWithV resolve row predicate) src)
 
     /// ソート。
     /// ORDER BY のキーを列位置へ解決できるならそのまま使い、
@@ -62,44 +67,62 @@ module internal Ops =
                     | Ok i -> Some(i, k.Direction)
                     | Error _ -> None
 
-        if List.isEmpty keys then
-            ret src
-        else
-            let columns = keys |> List.map resolveColumn
+        let unresolved =
+            keys
+            |> List.tryPick (fun k ->
+                match Schema.tryAsColumnRef k.Expression with
+                | None -> None
+                | Some c ->
+                    let bare = { Qualifier = None; Name = c.Name }
 
-            if List.forall Option.isSome columns then
-                let plan = columns |> List.choose id
+                    match Schema.resolve c schema with
+                    | Ok _ -> None
+                    | Error _ ->
+                        match Schema.resolve bare schema with
+                        | Ok _ -> None
+                        | Error e -> Some e)
 
-                result { return! ExtSort.sortRows budget Map.empty (check plan) (compareWith plan) src }
+        match unresolved with
+        | Some e -> err e
+        | None ->
+            if List.isEmpty keys then
+                ret src
             else
-                let exprs = keys |> List.map _.Expression
-                let width = schema.Columns.Length
-                let plan = keys |> List.mapi (fun i k -> width + i, k.Direction)
+                let columns = keys |> List.map resolveColumn
 
-                let projected =
-                    Op.map
-                        (fun row ->
-                            let keyValues = Array.zeroCreate<SqlValue> exprs.Length
+                if List.forall Option.isSome columns then
+                    let plan = columns |> List.choose id
 
-                            let rec fill i =
-                                function
-                                | [] -> DbOk(Array.append row keyValues)
-                                | e :: tail ->
-                                    match Eval.evalWithV resolve row e with
-                                    | DbErr er -> DbErr er
-                                    | DbOk v ->
-                                        keyValues.[i] <- v
-                                        fill (i + 1) tail
+                    result { return! ExtSort.sortRows budget Map.empty (check plan) (compareWith plan) src }
+                else
+                    let exprs = keys |> List.map _.Expression
+                    let width = schema.Columns.Length
+                    let plan = keys |> List.mapi (fun i k -> width + i, k.Direction)
 
-                            fill 0 exprs)
-                        src
+                    let projected =
+                        Op.map
+                            (fun row ->
+                                let keyValues = Array.zeroCreate<SqlValue> exprs.Length
 
-                result {
-                    let! sorted =
-                        ExtSort.sortRows budget Map.empty (check plan) (compareWith plan) projected
+                                let rec fill i =
+                                    function
+                                    | [] -> DbOk(Array.append row keyValues)
+                                    | e :: tail ->
+                                        match Eval.evalWithV resolve row e with
+                                        | DbErr er -> DbErr er
+                                        | DbOk v ->
+                                            keyValues.[i] <- v
+                                            fill (i + 1) tail
 
-                    return Op.map (fun row -> DbOk(Array.sub row 0 width)) sorted
-                }
+                                fill 0 exprs)
+                            src
+
+                    result {
+                        let! sorted =
+                            ExtSort.sortRows budget Map.empty (check plan) (compareWith plan) projected
+
+                        return Op.map (fun row -> DbOk(Array.sub row 0 width)) sorted
+                    }
 
     /// 重複除去。
     /// 最初に現れた順序を保つ（SQL の DISTINCT）。
@@ -316,15 +339,28 @@ module internal Ops =
     /// HAVING を張る。
     /// 集約後の行は位置のみの意味を持つので Schema.empty で評価する。
     /// offsets はクロージャを 1回作るときにだけ組み立て、行ごとに持ち越さない。
+    /// 列参照の検査は、集約値・グループ値を置き換えた後の式で行う
+    /// （置換の構造は行の値に依存しないので、NULL だけのダミー行で 1回置換すれば足りる）。
     let havingFilter (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) (predicate: Expr) =
         let offsets = aggOffsets groupBy aggs
         let wholeOffsets = wholeGroupOffsets groupBy
         let resolve = Eval.prepare Schema.empty [ predicate ]
 
-        fun row ->
-            match substituteAggs offsets wholeOffsets row predicate with
-            | Error e -> DbErr e
-            | Ok p -> Eval.matchesWithV resolve row p
+        let substituted =
+            substituteAggs offsets wholeOffsets (Array.create (groupBy.Length + aggs.Length) SqlValue.Null) predicate
+
+        let check =
+            match substituted with
+            | Error e -> err e
+            | Ok p -> Eval.checkPrepared (Eval.prepare Schema.empty [ p ])
+
+        match check with
+        | Error e -> err e
+        | Ok() ->
+            ret (fun row ->
+                match substituteAggs offsets wholeOffsets row predicate with
+                | Error e -> DbErr e
+                | Ok p -> Eval.matchesWithV resolve row p)
 
     /// 集約の 1 項目分のアキュムレータ。
     /// SUM / AVG は REAL が現れるまでは decimal、現れた後は double で累積し、最後に型を決める
@@ -780,7 +816,9 @@ module internal Ops =
                                 firstSeen.[k] <- seq
                                 consume (k :: order) (used + size) (seq + 1L) nxt
 
-        consume [] 0L 0L src
+        match Eval.checkPrepared resolve with
+        | Error e -> err e
+        | Ok() -> consume [] 0L 0L src
 
     /// 射影。
     /// `SELECT` の項目順に値を並べる。
@@ -790,55 +828,71 @@ module internal Ops =
     /// `groupBy` は「射影の入力が集約結果」のときの GROUP BY 式。
     /// `SELECT age, COUNT(*) ... GROUP BY age` の `age` を
     /// 「集約後の行の先頭」にある値へ読み替えるために使う。
+    /// 列参照が解決できなければ、行を評価する前に NameError を返す
+    /// （集約後は GROUP BY 列と集約呼び出しを置き換えた後の式で検査する）。
     let project (expandSchema: Schema) (evalSchema: Schema) (groupBy: Expr list) (items: SelectItem list) (src: Op) =
         let aggCallsOf = List.map _.Expression >> aggCalls
 
+        let evalItems resolve row (exprs: Expr list) =
+            let values = Array.zeroCreate<SqlValue> exprs.Length
+
+            let rec fill i =
+                function
+                | [] -> DbOk values
+                | e :: tail ->
+                    match Eval.evalWithV resolve row e with
+                    | DbErr er -> DbErr er
+                    | DbOk v ->
+                        values.[i] <- v
+                        fill (i + 1) tail
+
+            fill 0 exprs
+
         if List.isEmpty items then
-            src
+            ret src
         else
             let projection = SelectProjection.create expandSchema items
             let allExprs = projection.Expressions
             let foundAggs = aggCallsOf projection.SelectItems
             let offsets = aggOffsets groupBy foundAggs
             let wholeOffsets = wholeGroupOffsets groupBy
-            let resolve = Eval.prepare evalSchema allExprs
-
-            let evalItems row (exprs: Expr list) =
-                let values = Array.zeroCreate<SqlValue> exprs.Length
-
-                let rec fill i =
-                    function
-                    | [] -> DbOk values
-                    | e :: tail ->
-                        match Eval.evalWithV resolve row e with
-                        | DbErr er -> DbErr er
-                        | DbOk v ->
-                            values.[i] <- v
-                            fill (i + 1) tail
-
-                fill 0 exprs
 
             if List.isEmpty foundAggs && List.isEmpty groupBy then
-                Op.map (fun row -> evalItems row allExprs) src
+                let resolve = Eval.prepare evalSchema allExprs
+
+                match Eval.checkPrepared resolve with
+                | Error e -> err e
+                | Ok() -> ret (Op.map (fun row -> evalItems resolve row allExprs) src)
             else
-                let resolveAgg = Eval.prepare Schema.empty allExprs
+                let dummyRow = Array.create (groupBy.Length + foundAggs.Length) SqlValue.Null
 
-                Op.map
-                    (fun row ->
-                        let values = Array.zeroCreate<SqlValue> allExprs.Length
+                let check =
+                    match allExprs |> List.map (substituteAggs offsets wholeOffsets dummyRow) |> all with
+                    | Error e -> err e
+                    | Ok exprs -> Eval.checkPrepared (Eval.prepare Schema.empty exprs)
 
-                        let rec fill i =
-                            function
-                            | [] -> DbOk values
-                            | e :: tail ->
-                                match substituteAggs offsets wholeOffsets row e with
-                                | Error er -> DbErr er
-                                | Ok e ->
-                                    match Eval.evalWithV resolveAgg row e with
-                                    | DbErr er -> DbErr er
-                                    | DbOk v ->
-                                        values.[i] <- v
-                                        fill (i + 1) tail
+                match check with
+                | Error e -> err e
+                | Ok() ->
+                    let resolveAgg = Eval.prepare Schema.empty allExprs
 
-                        fill 0 allExprs)
-                    src
+                    Op.map
+                        (fun row ->
+                            let values = Array.zeroCreate<SqlValue> allExprs.Length
+
+                            let rec fill i =
+                                function
+                                | [] -> DbOk values
+                                | e :: tail ->
+                                    match substituteAggs offsets wholeOffsets row e with
+                                    | Error er -> DbErr er
+                                    | Ok e ->
+                                        match Eval.evalWithV resolveAgg row e with
+                                        | DbErr er -> DbErr er
+                                        | DbOk v ->
+                                            values.[i] <- v
+                                            fill (i + 1) tail
+
+                            fill 0 allExprs)
+                        src
+                    |> ret

@@ -31,7 +31,7 @@ module internal Scalar =
     /// ESCAPE を解釈してパターンをトークン列にする。
     /// ESCAPE の後に文字が無ければ TypeError。
     /// ESCAPE 文字とエスケープした文字は 1 コードポイントとして扱う。
-    let internal compileTokens (escape: int option) (pattern: string) =
+    let compileTokens (escape: int option) (pattern: string) =
         let rec loop i acc =
             if i >= pattern.Length then
                 ret
@@ -60,7 +60,7 @@ module internal Scalar =
 
     /// ESCAPE なしを表すコードポイント。
     [<Literal>]
-    let internal NoEscape = -1
+    let NoEscape = -1
 
     /// 末尾の連続する `%` を読み飛ばす。
     [<TailCall>]
@@ -116,26 +116,7 @@ module internal Scalar =
                     false
 
     /// コンパイル済みトークン列で照合する（`Eval.prepare` がコンパイルした結果を使う）。
-    let internal matchLikeTokens (tokens: LikeToken array) (text: System.ReadOnlySpan<char>) =
-        goLike tokens text 0 0 -1 0
-
-    /// LIKE のパターン照合。
-    /// `%` は任意の文字列、`_` は Unicode コードポイント 1個。
-    /// 正規表現に落とさずに手で照合する（LIKE の方言差を吸収するため）。
-    /// 行ごとに呼ぶホットパスでは `Eval.prepare` の `Like` を使う
-    /// （この関数は式を伴わない単発の照合用で、毎回コンパイルする）。
-    /// バックトラックは 1段だけ（無限ループしないことが最優先）。
-    let likeMatch (pattern: string) (text: string) =
-        match compileTokens None pattern with
-        | Ok compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text)
-        | Error _ -> false
-
-    /// ESCAPE 付き LIKE。
-    /// `escape` は Unicode コードポイント。
-    /// 行ごとに呼ぶホットパスでは `Eval.prepare` の `Like` を使う。
-    let likeMatchWithEscape (escape: int) (pattern: string) (text: string) =
-        compileTokens (Some escape) pattern
-        |> Result.map (fun compiled -> matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
+    let matchLikeTokens (tokens: LikeToken array) (text: System.ReadOnlySpan<char>) = goLike tokens text 0 0 -1 0
 
     /// ESCAPE 句の文字列を 1 コードポイントとして取り出す。
     /// コードポイントが 1個でなければ TypeError。

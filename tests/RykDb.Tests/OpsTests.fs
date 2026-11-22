@@ -11,6 +11,7 @@ open RykDb.TestHelpers
 /// このモジュールのテストは上限なし（スピルしない）経路を検証する。
 /// スピル経路は専用のバジェットで別途テストする。
 module private UnlimitedOps =
+    let filter = Ops.filter
     let sortBy = Ops.sortBy MemoryBudget.Unlimited
     let distinct = Ops.distinct MemoryBudget.Unlimited
     let aggregate = Ops.aggregate MemoryBudget.Unlimited
@@ -267,7 +268,9 @@ let ``havingFilter: 集約値とグループ値を定数へ置き換える`` () 
     let r = [| SqlValue.Int 7L; SqlValue.Int 3L; SqlValue.Int 10L |]
 
     let eval (pred: Expr) =
-        UnlimitedOps.havingFilter groupBy aggs pred r
+        match UnlimitedOps.havingFilter groupBy aggs pred with
+        | Error e -> DbErr e
+        | Ok p -> p r
 
     // 集約値（COUNT(*)）
     Assert.True(
@@ -311,7 +314,7 @@ let ``末尾再帰: 50000段の式を havingFilter してもスタックを食�
     let aggs = [ (AggFunc.Count, true, false, Expr.Star) ]
     // 行 = [a; COUNT(*)]
     let r = [| SqlValue.Int 7L; SqlValue.Int 3L |]
-    Assert.True(okV (UnlimitedOps.havingFilter groupBy aggs deep r))
+    Assert.True(okV ((ok (UnlimitedOps.havingFilter groupBy aggs deep)) r))
 
 [<Fact>]
 let ``集約: 入力行を抱えずにグループごとに集める`` () =
@@ -471,7 +474,7 @@ let ``集約: GROUP BY 式の評価失敗は Error`` () =
 [<Fact>]
 let ``project: 項目が空なら入力をそのまま返す`` () =
     let op = opOfRows [ row [ SqlValue.Int 1L ] ]
-    let rows = ok (Op.toArray (Ops.project schema2 schema2 [] [] op))
+    let rows = ok (Op.toArray (ok (Ops.project schema2 schema2 [] [] op)))
     Assert.Equal<int>(1, rows.Length)
     Assert.Equal<int64>(1L, asInt rows.[0].[0])
 
@@ -636,3 +639,28 @@ let ``集約: DISTINCT の退避ファイルは集約完了時点で消える`` 
         Assert.Equal<int64>(50L, asInt rows.[0].[0])
         scope.DisposeAll()
         assertNoLeftoversDetailed dir)
+
+[<Fact>]
+let ``列解決: 未知の列は行が 0 件でも演算子の構築時に Error`` () =
+    // 入力が 0 行だと述語・射影・並べ替えは一度も評価されない。
+    // 列解決は構築時に検査し、行数に依存せず NameError にする。
+    let sortKey =
+        {
+            Expression = col "nope"
+            Direction = SortDirection.Ascending
+        }
+
+    let item =
+        {
+            Expression = col "nope"
+            Alias = None
+        }
+
+    expectErrorKind ErrorKind.NameError "filter が OK になっています" (UnlimitedOps.filter schema2 (col "nope") Op.Empty)
+    expectErrorKind ErrorKind.NameError "sortBy が OK になっています" (UnlimitedOps.sortBy schema2 [ sortKey ] Op.Empty)
+    expectErrorKind ErrorKind.NameError "project が OK になっています" (Ops.project schema2 schema2 [] [ item ] Op.Empty)
+
+    expectErrorKind
+        ErrorKind.NameError
+        "aggregate が OK になっています"
+        (UnlimitedOps.aggregate schema2 [ col "nope" ] [ (AggFunc.Count, true, false, Expr.Star) ] Op.Empty)
