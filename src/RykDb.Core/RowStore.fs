@@ -464,27 +464,42 @@ module internal RowStore =
                 | Some compaction -> { engine with Compaction = compaction }
                 | None -> engine
 
-            let runtime = RootRuntime()
+            let abandon e =
+                protect (fun () -> StorageEngine.close engine |> ignore) |> ignore
+                lease.ForceRelease()
+                err e
 
-            let host =
-                if options.BackgroundCompaction then
-                    new VersionCoordinator(
-                        root,
-                        PublishedState.initial engine.Version engine.ManifestNumber,
-                        engine.Compaction,
-                        (fun () -> runtime.OldestExcept(root, None)),
-                        (fun f -> StorageEngine.openScan root f),
-                        options.ScanHook,
-                        options.ManifestApplyHook
-                        |> Option.map (fun hook ->
-                            fun manifestNumber version edit ->
-                                match hook edit with
-                                | Some result -> result
-                                | None -> Manifest.logAndApplyWithOutcome root manifestNumber version edit)
-                    )
-                    |> Some
-                else
-                    None
+            let! built =
+                match
+                    protect (fun () ->
+                        let runtime = RootRuntime()
+
+                        let host =
+                            if options.BackgroundCompaction then
+                                new VersionCoordinator(
+                                    root,
+                                    PublishedState.initial engine.Version engine.ManifestNumber,
+                                    engine.Compaction,
+                                    (fun () -> runtime.OldestExcept(root, None)),
+                                    (fun f -> StorageEngine.openScan root f),
+                                    options.ScanHook,
+                                    options.ManifestApplyHook
+                                    |> Option.map (fun hook ->
+                                        fun manifestNumber version edit ->
+                                            match hook edit with
+                                            | Some result -> result
+                                            | None -> Manifest.logAndApplyWithOutcome root manifestNumber version edit)
+                                )
+                                |> Some
+                            else
+                                None
+
+                        runtime, host)
+                with
+                | Ok built -> ret built
+                | Error e -> abandon e
+
+            let runtime, host = built
 
             return
                 {
