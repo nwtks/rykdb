@@ -323,6 +323,23 @@ WAL commit成功後に`Error`を返さない。
 欠落をVersionから黙って除くと、バックアップの誤りや削除事故を正常な空DBとして扱ってしまうため。
 `.orphans/`へ退避するのはMANIFESTが参照しないファイルだけにする。
 
+### 4.18 ローテーション後の失敗でもMANIFEST番号を進める
+
+`logAndApplyWithOutcome`のローテーションは`CURRENT`を切り替え、旧MANIFESTを削除してから`Applied`を返す。
+その後のWAL切り替えが失敗したときに旧MANIFEST番号を返すと、次のflushが`CURRENT`の指さない番号へ追記し、
+再オープンでそのSSTableがVersionから消える（データ損失）。
+`Applied`の後で続きが失敗したら、**新しい番号と反映済みVersionを持ったengine**を返す。
+さらに`Manifest.append`は対象ファイルが無いとき、`OpenOrCreate`で空ファイルを作り直さず`NotApplied`にする。
+回帰テスト: `StorageEngine.maybeFlush: MANIFEST ローテーション後の WAL 失敗でも番号を進めて次の flush を失わない`。
+
+### 4.19 走査に結び付けた資源は継続にも後始末を付ける
+
+`SstScan`の遅延走査は、`next`が返す**続き（continuation）を捨てる**のが実際の破棄経路になる。
+最初の値だけを`Dispose`するラッパー（`ofStepWithClose`で包むだけの形）では、
+2件目以降の続きを捨てたときにVersion pinのleaseが残る。
+`withResource`は各続きを包み直し、自然終端・破棄・エラーのどこで止まっても1回だけ解放する（`ScanScope.Release`が冪等）。
+回帰テスト: `background compaction: 途中で捨てた走査の Version pin も解放される`。
+
 ---
 
 ## 5. MVCC・transaction
@@ -774,6 +791,8 @@ Filterの1/10やJoinの選択性が無視される（統計テストでJoinが�
 - [ ] SSTable走査のstartKeyとファイル枝刈りを両方適用しているか
 - [ ] ファイル番号を巻き戻していないか
 - [ ] MANIFEST反映をファイル削除より先にしているか
+- [ ] MANIFESTローテーション後の失敗経路でも新しい番号を返しているか
+- [ ] 走査に結び付けた資源を、続きの破棄でも解放しているか
 - [ ] SSTableのキー順とFooterを正しく検証しているか
 - [ ] WALはフレーム単位で書き、commit済みprefixだけ再生するか
 - [ ] 複数keyspaceを1回のWAL/batchへまとめているか

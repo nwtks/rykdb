@@ -919,6 +919,11 @@ entry =
 ブロックは128エントリを目安に分割する。
 チェックサムはCRC32Cで、slicing-by-8を使う。
 
+書き出し（`SstableFormat.writeTo`）は入力の`seq`を1回だけ列挙し、
+ブロックとBloom filterを同時に構築する（キー列を溜めない）。
+Bloom filterのビット数は`expectedEntries`の見積りから決める。
+実件数がこれを超えてもfalse negativeは出ない（誤検出率が上がるだけ）。
+
 | 項目         | 内容                                                           |
 | ------------ | -------------------------------------------------------------- |
 | Footer       | magic、version、maxSeqNo、各セクション位置、件数、チェックサム |
@@ -1001,6 +1006,12 @@ MANIFESTが4MiBを超える場合は、現在のVersion全体を新しいMANIFES
 MANIFESTローテーションは追記前に行う。
 失敗時は元のMANIFESTが有効なまま残るため、進行中の変更が反映されていないと判断できる。
 
+ローテーションが成功した後でWALの切り替えが失敗した場合も、新しいMANIFEST番号をengineへ返す。
+古い番号のまま次の追記へ進むと、`CURRENT`の指さないMANIFESTへ書いてしまい、
+再オープンでそのSSTableがVersionから消える（データ損失）。
+`Manifest.append`は対象ファイルが存在しない場合、空ファイルを作り直さず
+`NotApplied`として返す（番号の陳腐化を検出する）。
+
 ### 8.5 WAL
 
 WALはページイメージではなく論理更新を記録する。
@@ -1080,9 +1091,15 @@ pinはVersion単位の参照数で管理し、同じVersionへの複数leaseは�
 走査は`SstScan`自身がVersionのleaseを持ち、Sessionのread leaseより長く保持しても
 compactionにファイルを消されない。
 正常終了時は`ScanScope`から登録が外れる。
+`SstScan.withResource`は返す続き（continuation）すべてに同じ後始末を付け、
+自然終端・破棄・エラーのどこで止まってもleaseを1回だけ解放する。
 point lookupは`RowStore.getAtMasked`が短いVersion leaseを取り、ファイル削除と競合しない。
 leaseの pin / release は CAS だけで完結し、MANIFEST 追記の `installGate` を取らないため、
 index lookup が行ごとに走ってもロック競合しない。
+SELECTバッチの`AcquireCall`も`installGate`を取らない。
+状態を読んでpinし、同じ状態のままか（参照等価）を確かめてから使う。
+installは「publish → retire」の順なので、pin後に状態が変わらなければファイルは消えない。
+変わっていれば解放してやり直す（flushは`installGate`を保持するが、SELECTは待たない）。
 workerはinstall後に入力ファイルをretireし、refcountが0になったファイルだけ削除する。
 
 compactionの失敗は`LastCompactionError`に残し、次のwrite（flushが起きなくても）または

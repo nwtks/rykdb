@@ -271,14 +271,17 @@ module internal Sstable =
             let batchEnd = min (i + batchBlocks) partial.Index.Length
             let startOffset = partial.Index.[i].Offset
             let endEntry = partial.Index.[batchEnd - 1]
-            let total = endEntry.Offset + endEntry.Length - startOffset
+            let total = int64 endEntry.Offset + int64 endEntry.Length - int64 startOffset
 
-            protect (fun () ->
-                let s = stream.Value
-                s.Seek(int64 startOffset, System.IO.SeekOrigin.Begin) |> ignore
-                let buffer = Array.zeroCreate<byte> total
-                s.ReadExactly(buffer, 0, total)
-                buffer, startOffset, batchEnd)
+            if total < 0L || total > int64 System.Int32.MaxValue then
+                err (DbError.corruption "Sstable: 索引範囲が不正です")
+            else
+                protect (fun () ->
+                    let s = stream.Value
+                    s.Seek(int64 startOffset, System.IO.SeekOrigin.Begin) |> ignore
+                    let buffer = Array.zeroCreate<byte>(int total)
+                    s.ReadExactly(buffer, 0, int total)
+                    buffer, startOffset, batchEnd)
 
         let parseRawBlock (raw: byte array) startOffset i =
             let ie = partial.Index.[i]
@@ -440,29 +443,33 @@ module internal Sstable =
                 else
                     let sharedLength = int shared
                     let tailLength = int tailLen
-                    let entryKey = Array.zeroCreate<byte>(sharedLength + tailLength)
-                    Array.blit prev 0 entryKey 0 sharedLength
-                    Array.blit data p3 entryKey sharedLength tailLength
                     let valuePos = p3 + tailLength
-                    let ordering = Bytes.compare entryKey key
 
-                    if ordering < 0 then
-                        scan indexEntry data payloadLen entryKey (valuePos + int valueLen)
-                    elif ordering > 0 then
-                        ret None
+                    if valueLen > uint64 System.Int32.MaxValue || int valueLen > payloadLen - valuePos then
+                        err (DbError.corruption "Sstable: 値がブロックの終端を超えています")
                     else
-                        match decodeValue data valuePos (int valueLen) with
-                        | Ok(seqNo, value, _) ->
-                            let isVisible =
-                                match visible with
-                                | Some s -> seqNo <= s
-                                | None -> true
+                        let entryKey = Array.zeroCreate<byte>(sharedLength + tailLength)
+                        Array.blit prev 0 entryKey 0 sharedLength
+                        Array.blit data p3 entryKey sharedLength tailLength
+                        let ordering = Bytes.compare entryKey key
 
-                            if isVisible then
-                                ret (Some(SstEntry.make entryKey seqNo value))
-                            else
-                                scan indexEntry data payloadLen entryKey (valuePos + int valueLen)
-                        | Error e -> err e
+                        if ordering < 0 then
+                            scan indexEntry data payloadLen entryKey (valuePos + int valueLen)
+                        elif ordering > 0 then
+                            ret None
+                        else
+                            match decodeValue data valuePos (int valueLen) with
+                            | Ok(seqNo, value, _) ->
+                                let isVisible =
+                                    match visible with
+                                    | Some s -> seqNo <= s
+                                    | None -> true
+
+                                if isVisible then
+                                    ret (Some(SstEntry.make entryKey seqNo value))
+                                else
+                                    scan indexEntry data payloadLen entryKey (valuePos + int valueLen)
+                            | Error e -> err e
 
         let lookupEntry indexEntry =
             readBlock indexEntry

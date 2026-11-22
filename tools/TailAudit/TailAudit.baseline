@@ -60,6 +60,7 @@ src/RykDb.Core/Plan.fs|traverseC|traverseC|call
 src/RykDb.Core/RowStore.fs|loop|loop|call
 src/RykDb.Core/Spill.fs|openNext/stream|openNext|call
 src/RykDb.Core/Spill.fs|openNext/stream|stream|call
+src/RykDb.Core/SstScan.fs|wrap|wrap|call
 src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|loadBlock|call
 src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|scanEntries|call
 src/RykDb.Core/StorageEngine.fs|pull|pull|bare

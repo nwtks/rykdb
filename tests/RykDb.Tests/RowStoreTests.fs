@@ -153,10 +153,11 @@ let ``RowStore: compaction 失敗後も flush 結果を保持し、再起動で 
         let engine = ok (StorageEngine.openDatabaseWith None dir)
 
         let mk (num: int64) (key: int) =
-            [| Entry.put (intKey key) (uint64 key) (intRow key) |]
-            |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
-            |> fun entries -> FileMetaData.writeSstable dir num 0 0.01 entries
-            |> ok
+            let entries =
+                [| Entry.put (intKey key) (uint64 key) (intRow key) |]
+                |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+
+            FileMetaData.writeSstable dir num 0 0.01 entries.Length entries |> ok
 
         let f1 = mk 10L 1
         let f2 = mk 11L 2
@@ -200,10 +201,11 @@ let ``RowStore: compaction 失敗で中断した走査は入力 SSTable のハ�
         let engine = ok (StorageEngine.openDatabaseWith None dir)
 
         let mk (num: int64) (key: int) =
-            [| Entry.put (intKey key) (uint64 key) (intRow key) |]
-            |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
-            |> fun entries -> FileMetaData.writeSstable dir num 0 0.01 entries
-            |> ok
+            let entries =
+                [| Entry.put (intKey key) (uint64 key) (intRow key) |]
+                |> Array.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+
+            FileMetaData.writeSstable dir num 0 0.01 entries.Length entries |> ok
 
         let f1 = mk 10L 1
         let f2 = mk 11L 2

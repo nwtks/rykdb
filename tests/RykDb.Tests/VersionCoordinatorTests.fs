@@ -148,6 +148,101 @@ let ``background compaction: 読み取り中のファイルは削除されず、
             RowStore.close store |> ignore)
 
 [<Fact>]
+let ``background compaction: 途中で捨てた走査の Version pin も解放される`` () =
+    withDir "bg-scan-partial-dispose" (fun dir ->
+        let store =
+            openBackgroundWith
+                dir
+                { RowStoreOptions.Background with
+                    MemLimitBytes = Some 1
+                    Compaction = Some forceL1Compaction
+                }
+
+        let mutable current = store
+
+        try
+            let host = expectSome "store.Host" store.Host
+
+            for i in 1..4 do
+                current <- writeOne current i
+
+            waitIdle host
+
+            // compaction 後の Version（scan が pin する対象）を取る。
+            let latest = refresh current
+
+            let pinned =
+                Version.allFiles latest.Engine.PublishedState.Version |> List.map _.FileNumber
+
+            Assert.NotEmpty pinned
+
+            // 1 件だけ読んで残りの走査を捨てる（DROP 後始末と同じ形）。
+            let scan = ok (RowStore.scanKeys "t" [||] 0 latest)
+
+            let rest =
+                match SstScan.next scan with
+                | Ok(Some(_, rest)) -> rest
+                | _ -> failwith "走査が空です"
+
+            SstScan.dispose rest
+
+            // 同じキー域を再書き込みして pinned ファイルを compaction の入力にする。
+            for i in 1..4 do
+                current <- writeWithSeq current (uint64 (100 + i)) i
+
+            waitIdle host
+
+            let stillReferenced =
+                Version.allFiles host.Current.Version |> List.map _.FileNumber |> Set.ofList
+
+            let retired = pinned |> List.filter (fun n -> not (Set.contains n stillReferenced))
+
+            Assert.NotEmpty retired
+
+            retired
+            |> List.iter (fun n -> Assert.False(File.Exists(FileMetaData.path dir n), sprintf "%d の pin が残っています" n))
+        finally
+            RowStore.close store |> ignore)
+
+[<Fact>]
+let ``background compaction: AcquireCall は installGate を待たない`` () =
+    withDir "bg-acquire-no-gate" (fun dir ->
+        let store = openBackground dir 1 None
+
+        try
+            let host = expectSome "store.Host" store.Host
+            use held = new ManualResetEventSlim false
+            use release = new ManualResetEventSlim false
+
+            let holder =
+                System.Threading.Tasks.Task.Factory.StartNew(
+                    (fun () ->
+                        host.WithInstallGate(fun () ->
+                            held.Set()
+                            release.Wait 10000 |> ignore)),
+                    System.Threading.CancellationToken.None,
+                    System.Threading.Tasks.TaskCreationOptions.LongRunning,
+                    System.Threading.Tasks.TaskScheduler.Default
+                )
+
+            try
+                Assert.True(held.Wait 5000, "installGate を取得できません")
+
+                let acquired =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        let _, lease = host.AcquireCall()
+                        lease.Dispose()
+                        true)
+
+                Assert.True(acquired.Wait 5000, "AcquireCall が installGate を待っています")
+            finally
+                release.Set()
+
+            Assert.True(holder.Wait 5000)
+        finally
+            RowStore.close store |> ignore)
+
+[<Fact>]
 let ``background compaction: 診断情報と再試行要求を公開する`` () =
     withDir "bg-diagnostics" (fun dir ->
         let store = openBackground dir 1 None

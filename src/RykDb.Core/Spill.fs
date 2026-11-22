@@ -115,7 +115,10 @@ module internal Spill =
 
                 System.IO.Directory.GetFiles(dir, Prefix + "*" + RunExt)
                 |> Array.iter (fun p ->
-                    if System.IO.FileInfo(p).CreationTimeUtc < cutoff then
+                    let info = System.IO.FileInfo p
+                    let lastTouch = max info.CreationTimeUtc info.LastWriteTimeUtc
+
+                    if lastTouch < cutoff then
                         protect (fun () -> System.IO.File.Delete p) |> ignore))
         |> ignore
 

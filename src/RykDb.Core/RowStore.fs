@@ -248,6 +248,7 @@ module internal RowStore =
             | Ok None -> ret None
             | Ok(Some(e, rest)) ->
                 if not (KeyBuilder.startsWithPrefix e.Key prefix) then
+                    SstScan.dispose rest
                     ret None
                 else
                     let key = Array.sub e.Key prefix.Length (e.Key.Length - prefix.Length)
@@ -409,7 +410,9 @@ module internal RowStore =
             if text = FormatVersion then
                 return ()
             elif text = "" then
-                if hasDataFiles root then
+                let! hasData = protect (fun () -> hasDataFiles root)
+
+                if hasData then
                     return!
                         sprintf
                             "データベース %s は旧形式（索引が行全体を保持する v1 以前）です。旧バージョンでエクスポートして作り直してください（%s）"

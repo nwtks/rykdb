@@ -284,6 +284,7 @@ module internal Compaction =
                     fileNumber
                     plan.OutputLevel
                     options.BloomFalsePositiveRate
+                    (List.length chunk)
                     (List.rev chunk)
                 |> Result.map Some
 

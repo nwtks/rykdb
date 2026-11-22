@@ -107,6 +107,51 @@ let ``SSTable: lookupMasked は必要な列だけ復号する`` () =
     Assert.Equal<SqlValue>(SqlValue.Int 30L, values.[2])
 
 [<Fact>]
+let ``SSTable: lookupMasked は値長が範囲外のブロックを CorruptionError にする`` () =
+    withDir "sst-value-len" (fun dir ->
+        let path = System.IO.Path.Combine(dir, "crafted.sst")
+        let entryKey = intKey 1
+        let lookupKey = intKey 2
+
+        // valueLen を Int32.MaxValue 超にして、符号変換で位置が負になる入口を作る。
+        let body =
+            Writer.build
+                [
+                    Writer.varint 0UL
+                    Writer.varint (uint64 entryKey.Length)
+                    Writer.varint 0x80000000UL
+                    Writer.writeBytes entryKey
+                ]
+
+        let block =
+            Array.append body (Writer.build [ Writer.uint32LE (Hashing.checksumRange body 0 body.Length) ])
+
+        System.IO.File.WriteAllBytes(path, block)
+
+        let info: SstReadInfo =
+            {
+                Path = path
+                Index =
+                    [|
+                        {
+                            LastKey = lookupKey
+                            Offset = 0
+                            Length = block.Length
+                        }
+                    |]
+                MinKey = entryKey
+                MaxKey = lookupKey
+                Bloom = None
+                EntryCount = 1L
+                MaxSeqNo = 1UL
+            }
+
+        expectErrorKind
+            ErrorKind.CorruptionError
+            "値長が範囲外のブロックは CorruptionError"
+            (Sstable.lookupMasked [||] lookupKey None info))
+
+[<Fact>]
 let ``SSTable: 複数ブロックに分割される`` () =
     // EntriesPerBlock = 128 なので 1000 件で 8 ブロック
     let entries = sstEntries 1000

@@ -405,11 +405,31 @@ module internal SstScan =
     let dispose (scan: SstScan) = (scan :> System.IDisposable).Dispose()
 
     /// 走査に追加の資源（Version pin の lease など）を結び付ける。
-    /// 走査を Dispose すると、下流の走査と資源の両方を解放する。
+    /// 資源は Dispose・自然終端・エラーのいずれでも 1回だけ解放する
+    /// （冪等な `ScanScope.Release` に任せる）。
+    /// 続きにも同じ後始末を付けるので、途中で捨てられた走査からも解放される。
     let withResource (resource: System.IDisposable) (scan: SstScan) =
-        ofStepWithClose (fun () -> next scan) (fun () ->
-            dispose scan
-            resource.Dispose())
+        let holder = ScanScope()
+        let key = obj ()
+        holder.Register(key, resource)
+        let release () = holder.Release key
+
+        let rec wrap current =
+            ofStepWithClose
+                (fun () ->
+                    match next current with
+                    | Ok None ->
+                        release ()
+                        ret None
+                    | Ok(Some(e, rest)) -> ret (Some(e, wrap rest))
+                    | Error e ->
+                        release ()
+                        err e)
+                (fun () ->
+                    dispose current
+                    release ())
+
+        wrap scan
 
     /// 走査を使い、成功・失敗・例外のいずれでも Dispose する。
     /// 開いた走査を全件読み切る用途で使う。

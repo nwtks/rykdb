@@ -447,7 +447,8 @@ type CompactionBenchmarks() =
                 |]
 
             let meta =
-                FileMetaData.writeSstable dir (int64 (10 + file)) 0 0.01 entries |> Check.ok
+                FileMetaData.writeSstable dir (int64 (10 + file)) 0 0.01 entries.Length entries
+                |> Check.ok
 
             current <- Version.addFile meta current
 

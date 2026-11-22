@@ -82,7 +82,7 @@ module internal Reader =
     /// リトルエンディアン 8バイト。
     /// 値ごとに配列を作らない（行のデコードで最も呼ばれる）。
     let readInt64LE (c: Cursor) =
-        if Cursor.pos c + 8 > Cursor.endPos c then
+        if Cursor.endPos c - Cursor.pos c < 8 then
             eof "Reader: 読み取り位置が末尾を超えました"
         else
             let d = Cursor.data c
@@ -102,7 +102,7 @@ module internal Reader =
 
     /// リトルエンディアン 4バイト（符号なし）を読む。
     let readUInt32LE (c: Cursor) =
-        if Cursor.pos c + 4 > Cursor.endPos c then
+        if Cursor.endPos c - Cursor.pos c < 4 then
             eof "Reader: 読み取り位置が末尾を超えました"
         else
             let d = Cursor.data c
@@ -119,7 +119,7 @@ module internal Reader =
     /// ビッグエンディアン 8バイト（符号なし）。
     /// 順序保持された整数の復元。
     let readUint64BE (c: Cursor) =
-        if Cursor.pos c + 8 > Cursor.endPos c then
+        if Cursor.endPos c - Cursor.pos c < 8 then
             eof "Reader: 読み取り位置が末尾を超えました"
         else
             let d = Cursor.data c

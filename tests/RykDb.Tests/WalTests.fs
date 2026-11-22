@@ -99,7 +99,7 @@ let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
             sprintf "rykdb-wal-missing-%d-%s" System.DateTime.UtcNow.Ticks (System.Guid.NewGuid().ToString "N")
         )
 
-    Assert.Empty(Wal.walFiles missing)
+    Assert.Empty(ok (Wal.walFiles missing))
 
 [<Fact>]
 let ``Wal: deferred append の位置を fsync でき、削除済みファイルは同期済み扱い`` () =

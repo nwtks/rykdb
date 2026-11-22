@@ -331,12 +331,11 @@ module internal StorageEngine =
         let rotateWal engine (next: WalState) =
             result {
                 do! Wal.sync engine.Dir engine.Wal
-                // 先に新しい WAL を作る。作成に失敗した場合に旧 WAL を残し、
-                // engine が指す位置のログを失わないようにする。
                 let! _ = Wal.create engine.Dir next.FileNumber
+                let! stale = Wal.walFiles engine.Dir
 
                 protect (fun () ->
-                    Wal.walFiles engine.Dir
+                    stale
                     |> List.filter (fun path -> path <> Wal.path engine.Dir next.FileNumber)
                     |> List.iter System.IO.File.Delete)
                 |> ignore
@@ -376,7 +375,7 @@ module internal StorageEngine =
             match
                 Memtable.rangeScan [||] 0 engine.Mem
                 |> Seq.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
-                |> FileMetaData.writeSstable engine.Dir fileNumber 0 BloomFalsePositiveRate
+                |> FileMetaData.writeSstable engine.Dir fileNumber 0 BloomFalsePositiveRate (Memtable.count engine.Mem)
             with
             | Error e -> Error(bumped, e)
             | Ok meta ->
@@ -387,7 +386,17 @@ module internal StorageEngine =
                 | ManifestApplyResult.Applied(version, manifestNumber) ->
                     match finishFlush engine version manifestNumber with
                     | Ok flushed -> Ok flushed
-                    | Error e -> Error(bumped, e)
+                    | Error e ->
+                        let applied =
+                            { engine with
+                                Version =
+                                    { version with
+                                        NextFileNumber = max version.NextFileNumber (engine.Wal.FileNumber + 1L)
+                                    }
+                                ManifestNumber = manifestNumber
+                            }
+
+                        Error(applied, e)
                 | ManifestApplyResult.NotApplied e
                 | ManifestApplyResult.Unknown e -> Error(bumped, e)
 
@@ -547,8 +556,9 @@ module internal StorageEngine =
             | _ -> None
 
         let sstNumbersOnDisk dir =
-            System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
-            |> Array.choose parseNumber
+            protect (fun () ->
+                System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
+                |> Array.choose parseNumber)
 
         let move quarantine n =
             let source = FileMetaData.path dir n
@@ -564,41 +574,54 @@ module internal StorageEngine =
             System.IO.File.Move(source, target, true)
 
         let quarantineOrphans dir version =
-            let referenced = Version.allFiles version |> List.map _.FileNumber |> Set.ofList
+            result {
+                let referenced = Version.allFiles version |> List.map _.FileNumber |> Set.ofList
+                let! numbers = sstNumbersOnDisk dir
+                let orphans = numbers |> Array.filter (fun n -> not (Set.contains n referenced))
 
-            let orphans =
-                sstNumbersOnDisk dir |> Array.filter (fun n -> not (Set.contains n referenced))
+                do!
+                    protect (fun () ->
+                        if not (Array.isEmpty orphans) then
+                            let quarantine = System.IO.Path.Combine(dir, ".orphans")
+                            System.IO.Directory.CreateDirectory quarantine |> ignore
+                            Array.iter (move quarantine) orphans)
 
-            protect (fun () ->
-                if not (Array.isEmpty orphans) then
-                    let quarantine = System.IO.Path.Combine(dir, ".orphans")
-                    System.IO.Directory.CreateDirectory quarantine |> ignore
-                    Array.iter (move quarantine) orphans)
+                return ()
+            }
 
-        let latestWalNumber dir =
-            Wal.walFiles dir |> List.choose parseNumber |> List.sort |> List.tryLast
+        let latestWalNumber =
+            Wal.walFiles
+            >> Result.map (fun files -> files |> List.choose parseNumber |> List.sort |> List.tryLast)
 
         let openOrCreateWal dir version =
-            let walNumber =
-                match latestWalNumber dir with
-                | Some n -> n
-                | None -> version.NextFileNumber
+            result {
+                let! latest = latestWalNumber dir
 
-            protect (fun () -> System.IO.File.Exists(Wal.path dir walNumber))
-            >>= fun exists ->
+                let walNumber =
+                    match latest with
+                    | Some n -> n
+                    | None -> version.NextFileNumber
+
+                let! exists = protect (fun () -> System.IO.File.Exists(Wal.path dir walNumber))
+
                 if exists then
-                    protect (fun () -> System.IO.FileInfo(Wal.path dir walNumber).Length)
-                    |> Result.map (fun size -> { FileNumber = walNumber; Size = size })
+                    return!
+                        protect (fun () -> System.IO.FileInfo(Wal.path dir walNumber).Length)
+                        |> Result.map (fun size -> { FileNumber = walNumber; Size = size })
                 else
-                    Wal.create dir walNumber
+                    return! Wal.create dir walNumber
+            }
 
-        let maxSeqNoOnDisk version =
-            Version.allFiles version |> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
+        let maxSeqNoOnDisk =
+            Version.allFiles >> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
 
         let maxFileNumberOnDisk dir =
-            let ssts = sstNumbersOnDisk dir
-            let wals = Wal.walFiles dir |> List.choose parseNumber |> List.toArray
-            Array.append ssts wals |> Array.fold (fun acc n -> max acc n) 0L
+            result {
+                let! ssts = sstNumbersOnDisk dir
+                let! wals = Wal.walFiles dir
+                let walNumbers = wals |> List.choose parseNumber |> List.toArray
+                return Array.append ssts walNumbers |> Array.fold (fun acc n -> max acc n) 0L
+            }
 
         let emptyEngine dir =
             {
@@ -615,13 +638,13 @@ module internal StorageEngine =
                 Runtime = StorageRuntime()
             }
 
-        let buildRecovered version manifestNumber walState mem walMax diskMax walMaxTxn =
+        let buildRecovered version manifestNumber walState mem walMax diskMax diskMaxFile walMaxTxn =
             let nextSeqNo = max walMax diskMax + 1UL
             let nextTxnId = walMaxTxn + 1UL<txnId>
 
             let bumped =
                 { version with
-                    NextFileNumber = max version.NextFileNumber (maxFileNumberOnDisk dir + 1L)
+                    NextFileNumber = max version.NextFileNumber (diskMaxFile + 1L)
                 }
 
             { emptyEngine dir with
@@ -633,10 +656,8 @@ module internal StorageEngine =
                 Mem = mem
             }
 
-        /// MANIFEST から復元したファイルの読み取りメタデータを 1回だけ構築する。
-        /// ここで解析した結果は不変の Version に載り、読み取りのたびに開き直さない。
-        let hydrateVersion (version: Version) =
-            let hydrate (f: FileMetaData) =
+        let hydrateVersion version =
+            let hydrate f =
                 match f.ReadInfo with
                 | Some _ -> ret f
                 | None ->
@@ -671,9 +692,10 @@ module internal StorageEngine =
             let (mem, walMax), walMaxTxn, goodWalSize = replayed
             let! alignedWal = Wal.truncateTo dir walState goodWalSize
             let diskMax = maxSeqNoOnDisk version'
+            let! diskMaxFile = maxFileNumberOnDisk dir
 
             let engine =
-                buildRecovered version' manifestNumber alignedWal mem walMax diskMax walMaxTxn
+                buildRecovered version' manifestNumber alignedWal mem walMax diskMax diskMaxFile walMaxTxn
 
             return
                 match memLimitBytes with
@@ -703,8 +725,9 @@ module internal StorageEngine =
                     | Error(_, e) -> return! err e
                     | Ok flushed ->
                         do! Wal.sync flushed.Dir flushed.Wal
+                        let! stale = Wal.walFiles flushed.Dir
 
-                        Wal.walFiles flushed.Dir
+                        stale
                         |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore)
 
                         return ()

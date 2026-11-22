@@ -356,9 +356,15 @@ MANIFEST追記と install は `installGate`で直列化する。
 最後のleaseがreleaseとsweepを行う。
 `RowStore`の走査は`SstScan.withResource`でVersion pinのleaseを結び付け、
 Sessionのread leaseより長く走査を保持してもファイルが消えない。
+`withResource`は続き（continuation）すべてに後始末を付け、
+自然終端・途中破棄・エラーのどこで止まってもleaseを1回だけ解放する
+（`ScanScope.Release`の冪等性を使う）。
 `ScanScope`は最終的な走査を1つだけ登録し、正常終了時の`Dispose`で登録を外す。
 `RowStore.getAtMasked`も短いVersion leaseを取る。
-leaseの取得と解放はCASだけで、`installGate`を取らない（ポイント検索のホットパス）。
+leaseの取得と解放はCASだけで、`installGate`を取らない。
+`AcquireCall`も`installGate`を取らず、状態を読んでpinした後に参照等価で状態が変わっていないことを確かめ、
+変わっていれば解放してやり直す
+（installはpublish→retireの順なのでpin後は削除されない）。
 
 プロパティテストは並行読み取り、書き込み、snapshot pin、固定シードの操作列、
 Generation、採番、Version の妥当性、pin中のファイル存在を検査する。

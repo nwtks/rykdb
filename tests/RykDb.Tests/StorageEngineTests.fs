@@ -14,11 +14,12 @@ let private withEngine (dir: string) (f: StorageEngine -> unit) =
 
 /// 与えたエントリ列を SSTable として書き、メタデータを返す。
 let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) =
-    entries
-    |> List.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
-    |> List.toArray
-    |> FileMetaData.writeSstable dir num level 0.01
-    |> ok
+    let sstEntries =
+        entries
+        |> List.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+        |> List.toArray
+
+    FileMetaData.writeSstable dir num level 0.01 sstEntries.Length sstEntries |> ok
 
 /// SSTable の本文を書き換え、メタデータ・Footer のチェックサムを合わせ直す。
 /// 「開けるが中身が壊れたファイル」を作る
@@ -620,6 +621,46 @@ let ``StorageEngine.maybeFlush: WAL 作成に失敗しても旧 WAL を残し、
         Assert.True engine.Runtime.LastFlushError.IsNone
         Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] engine)).IsSome)
         Assert.True((ok (StorageEngine.getAtMasked None (intKey 2) [||] engine)).IsSome))
+
+[<Fact>]
+let ``StorageEngine.maybeFlush: MANIFEST ローテーション後の WAL 失敗でも番号を進めて次の flush を失わない`` () =
+    withDir "flush-rotate-manifest-fail" (fun dir ->
+        let engine = ok (StorageEngine.openDatabaseWith (Some 1) dir)
+
+        let engine =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 1) 1UL (intRow 1) |] engine)
+
+        // MANIFEST を上限（4MiB）超に膨らませ、次の追記でローテーションさせる。
+        let manifest = System.IO.Path.Combine(dir, "MANIFEST-000001")
+        Assert.True(System.IO.File.Exists manifest, "MANIFEST-000001 があるはず")
+        System.IO.File.AppendAllText(manifest, System.String('\n', 4 * 1024 * 1024))
+
+        // 次の WAL の作成をディレクトリで塞ぐ（ローテーション後の finishFlush を失敗させる）。
+        let nextWal = Wal.path dir (engine.Wal.FileNumber + 1L)
+        System.IO.Directory.CreateDirectory(nextWal) |> ignore
+
+        let engine =
+            match StorageEngine.maybeFlush engine with
+            | Ok(flushed, Some _) -> flushed
+            | Ok(_, None) -> failwith "flush が失敗するはず"
+            | Error e -> failwithf "想定外のエラー: %A" e
+
+        // 古い番号を保持すると次の flush が CURRENT の指さない MANIFEST へ追記してしまう。
+        Assert.Equal<int64<manifestNo>>(2L<manifestNo>, engine.ManifestNumber)
+
+        System.IO.Directory.Delete nextWal
+
+        let engine =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] engine)
+
+        let engine, error = ok (StorageEngine.maybeFlush engine)
+        Assert.True(error.IsNone)
+        ok (StorageEngine.close engine)
+
+        // 再オープンで両方の commit が見える（2 行目を失わない）。
+        let reopened = ok (StorageEngine.openDatabaseWith None dir)
+        Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] reopened)).IsSome)
+        Assert.True((ok (StorageEngine.getAtMasked None (intKey 2) [||] reopened)).IsSome))
 
 [<Fact>]
 let ``StorageEngine.openDatabaseWith: 孤児の SSTable は削除せず退避する`` () =

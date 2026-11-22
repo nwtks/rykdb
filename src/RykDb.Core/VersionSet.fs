@@ -54,15 +54,17 @@ module internal FileMetaData =
         System.IO.Path.Combine(dir, fileName fileNumber)
 
     /// エントリ列を SSTable としてファイルへストリーム書きし、メタデータを返す。
-    /// ブロックは 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
+    /// ブロックと Bloom filter は 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
     /// 入力の `seq` は 1回だけ列挙する
     /// （memtable の flush が全件を配列にしないため）。
+    /// `expectedEntries` は Bloom filter のビット数を決める見積り。
     /// 失敗時（キー順違反・書き込み失敗・空の入力）は部分ファイルを消してからエラーを返す。
     let writeSstable
         (dir: string)
         (fileNumber: int64)
         (level: int)
         (bloomFalsePositiveRate: float)
+        (expectedEntries: int)
         (entries: seq<SstEntry>)
         =
         let ofChunk info =
@@ -107,7 +109,7 @@ module internal FileMetaData =
                         System.IO.FileOptions.SequentialScan
                     )
 
-                SstableFormat.writeTo fs bloomFalsePositiveRate entries
+                SstableFormat.writeTo fs bloomFalsePositiveRate expectedEntries entries
                 >>= fun info ->
                     fs.Flush true
                     ret info)
@@ -281,8 +283,15 @@ module internal VersionEdit =
         Writer.build [ Writer.build steps |> Writer.lengthPrefixed ]
 
     let decode (data: byte array) =
-        let readFileNumber c =
-            Reader.readVarint c |> Result.map (fun (v, c) -> int64 v, c)
+        let readInt64 label c =
+            Reader.readVarint c
+            >>= fun (v, c) ->
+                if v > uint64 System.Int64.MaxValue then
+                    err (sprintf "VersionEdit: %s が大きすぎます" label |> DbError.corruption)
+                else
+                    ret (int64 v, c)
+
+        let readFileNumber c = readInt64 "ファイル番号" c
 
         let readLevel c =
             Reader.readVarint c
@@ -296,8 +305,8 @@ module internal VersionEdit =
             result {
                 let! num, c = readFileNumber c
                 let! lvl, c = readLevel c
-                let! cnt, c = Reader.readVarint c
-                let! size, c = Reader.readVarint c
+                let! cnt, c = readInt64 "エントリ数" c
+                let! size, c = readInt64 "ファイルサイズ" c
                 let! maxSeq, c = Reader.readVarint c
                 let! smallest, c = Reader.readLengthPrefixed c
                 let! largest, c = Reader.readLengthPrefixed c
@@ -309,8 +318,8 @@ module internal VersionEdit =
                         Level = lvl
                         Smallest = smallest
                         Largest = largest
-                        EntryCount = int64 cnt
-                        Size = int64 size
+                        EntryCount = cnt
+                        Size = size
                         MaxSeqNo = maxSeq
                         ReadInfo = None
                     }
@@ -536,32 +545,41 @@ module internal Manifest =
                 fs.SetLength oldLength
                 fs.Flush true)
 
-        let oldLength =
-            protect (fun () ->
-                use fs =
-                    new System.IO.FileStream(
-                        path,
-                        System.IO.FileMode.OpenOrCreate,
-                        System.IO.FileAccess.ReadWrite,
-                        System.IO.FileShare.Read
-                    )
+        let readOldLength () =
+            use fs =
+                new System.IO.FileStream(
+                    path,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.ReadWrite,
+                    System.IO.FileShare.Read
+                )
 
-                let oldLength =
-                    if fs.Length = 0L then
-                        0L
+            let oldLength =
+                if fs.Length = 0L then
+                    0L
+                else
+                    fs.Position <- fs.Length - 1L
+
+                    if fs.ReadByte() = int '\n' then
+                        fs.Length
                     else
-                        fs.Position <- fs.Length - 1L
+                        lastNewline fs (fs.Length - 1L)
 
-                        if fs.ReadByte() = int '\n' then
-                            fs.Length
-                        else
-                            lastNewline fs (fs.Length - 1L)
+            if fs.Length <> oldLength then
+                fs.SetLength oldLength
+                fs.Flush true
 
-                if fs.Length <> oldLength then
-                    fs.SetLength oldLength
-                    fs.Flush true
+            oldLength
 
-                oldLength)
+        let oldLength =
+            protect (fun () -> System.IO.File.Exists path)
+            |> Result.bind (fun exists ->
+                if exists then
+                    protect readOldLength
+                else
+                    sprintf "MANIFEST が見つかりません: %s" (fileName manifestNumber)
+                    |> DbError.corruption
+                    |> err)
 
         match oldLength with
         | Error e -> Error(AppendRejected e)

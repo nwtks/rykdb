@@ -29,10 +29,30 @@ let ``FileMetaData.Zero: 空メタデータ`` () =
     Assert.Equal(0L, FileMetaData.Zero.EntryCount)
 
 [<Fact>]
+let ``VersionEdit.decode: int64 を超えるエントリ数は CorruptionError`` () =
+    let body =
+        Writer.build
+            [
+                Writer.varint 1UL // タグ（追加）
+                Writer.varint 7UL // ファイル番号
+                Writer.varint 0UL // レベル
+                Writer.varint 0x8000000000000000UL // エントリ数（2^63）
+                Writer.varint 1UL // サイズ
+                Writer.varint 1UL // MaxSeqNo
+                Writer.lengthPrefixed [| 1uy |]
+                Writer.lengthPrefixed [| 2uy |]
+            ]
+
+    expectErrorKind
+        ErrorKind.CorruptionError
+        "int64 を超えるエントリ数は CorruptionError"
+        (VersionEdit.decode (Writer.build [ Writer.lengthPrefixed body ]))
+
+[<Fact>]
 let ``FileMetaData.writeSstable: 書き出してメタデータを返す`` () =
     withDir "fmd-write" (fun dir ->
         let entries = sstEntries 5
-        let fmd = ok (FileMetaData.writeSstable dir 1L 0 0.01 entries)
+        let fmd = ok (FileMetaData.writeSstable dir 1L 0 0.01 entries.Length entries)
         Assert.Equal(1L, fmd.FileNumber)
         Assert.Equal(0, fmd.Level)
         Assert.Equal(5L, fmd.EntryCount)
@@ -47,7 +67,10 @@ let ``FileMetaData.writeSstable: キー順でない入力はエラー`` () =
                 SstEntry.make (intKey 1) 2UL (Some [| SqlValue.Int 1L |])
             |]
 
-        expectErrorKind ErrorKind.InternalError "キー順でない入力はエラーになるはず" (FileMetaData.writeSstable dir 1L 0 0.01 bad)
+        expectErrorKind
+            ErrorKind.InternalError
+            "キー順でない入力はエラーになるはず"
+            (FileMetaData.writeSstable dir 1L 0 0.01 bad.Length bad)
         // 失敗時に部分ファイルを残さない（次の open で孤児扱いされるのを防ぐ）
         Assert.False(System.IO.File.Exists(FileMetaData.path dir 1L)))
 
@@ -59,7 +82,7 @@ let ``FileMetaData.writeSstable: 書き込み失敗は IoError`` () =
         expectErrorKind
             ErrorKind.IoError
             "存在しないディレクトリへの書き込みはエラーになるはず"
-            (FileMetaData.writeSstable missing 1L 0 0.01 (sstEntries 3)))
+            (let entries = sstEntries 3 in FileMetaData.writeSstable missing 1L 0 0.01 entries.Length entries))
 
 [<Fact>]
 let ``FileMetaData.mightContain: 範囲内なら true`` () =

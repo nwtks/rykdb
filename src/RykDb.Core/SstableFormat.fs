@@ -200,10 +200,18 @@ module internal SstableFormat =
     /// <remarks>
     /// 入力は `seq` で **1回だけ列挙する**（memtable の flush が全件を配列にしないため）。
     /// キー順であることの検証は書き込みと同時に行う（失敗時は呼び出し側が部分ファイルを消す）。
-    /// ブロックは 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
+    /// ブロックと Bloom filter は書き出しと同時に構築するので、ファイル全体分のメモリを持たない。
+    /// `expectedEntries` は Bloom filter のビット数を決める見積り。
+    /// 実件数がこれを超えても false negative は出ない（誤検出率が上がるだけ）。
     /// I/O 例外は呼び出し側の `protect` が処理する。
     /// </remarks>
-    let writeTo (stream: System.IO.Stream) (bloomFalsePositiveRate: float) (entries: seq<SstEntry>) =
+    let writeTo
+        (stream: System.IO.Stream)
+        (bloomFalsePositiveRate: float)
+        (expectedEntries: int)
+        (entries: seq<SstEntry>)
+        =
+        let bloom = BloomFilter.BloomBuilder(max 1 expectedEntries, bloomFalsePositiveRate)
         use e = entries.GetEnumerator()
 
         let sharedPrefix (prev: byte array) (key: byte array) =
@@ -293,7 +301,7 @@ module internal SstableFormat =
             >> Array.toList
             >> Writer.build
 
-        let finish firstKey lastKey maxSeqNo count keys block offset indexEntries =
+        let finish firstKey lastKey maxSeqNo count block offset indexEntries =
             (if List.isEmpty block then
                  ret (offset, indexEntries)
              else
@@ -305,15 +313,10 @@ module internal SstableFormat =
                     | _ -> [||]
 
                 let bloomOff = dataSize + metaBytes.Length
-
-                let bloom =
-                    if count = 0L then
-                        None
-                    else
-                        Some(BloomFilter.ofKeys (int count) bloomFalsePositiveRate (keys |> List.rev |> List.toArray))
+                let bloomFilter = if count = 0L then None else Some(bloom.Build())
 
                 let bloomBytes =
-                    bloom |> Option.map BloomFilter.serialize |> Option.defaultValue [||]
+                    bloomFilter |> Option.map BloomFilter.serialize |> Option.defaultValue [||]
 
                 let indexOff = bloomOff + bloomBytes.Length
                 let index = List.rev indexEntries |> List.toArray
@@ -351,17 +354,18 @@ module internal SstableFormat =
                             EntryCount = count
                             MaxSeqNo = maxSeqNo
                             Index = index
-                            Bloom = bloom
+                            Bloom = bloomFilter
                         }
 
-        let rec loop firstKey lastKey maxSeqNo count keys block blockCount offset indexEntries prev =
+        let rec loop firstKey lastKey maxSeqNo count block blockCount offset indexEntries prev =
             if blockCount >= EntriesPerBlock then
                 match writeBlock (block |> List.rev |> List.toArray) offset indexEntries with
                 | Ok(nextOffset, indexEntries') ->
-                    loop firstKey lastKey maxSeqNo count keys [] 0 nextOffset indexEntries' prev
+                    loop firstKey lastKey maxSeqNo count [] 0 nextOffset indexEntries' prev
                 | Error e -> err e
             elif e.MoveNext() then
                 let item = e.Current
+                bloom.Add item.Key
 
                 match prev with
                 | Some p when SstEntry.compare p item > 0 -> err (DbError.internalError "Sstable: エントリがキー順に並んでいません")
@@ -373,13 +377,12 @@ module internal SstableFormat =
                         (Some item.Key)
                         (max maxSeqNo item.SeqNo)
                         (count + 1L)
-                        (item.Key :: keys)
                         (item :: block)
                         (blockCount + 1)
                         offset
                         indexEntries
                         (Some item)
             else
-                finish firstKey lastKey maxSeqNo count keys block offset indexEntries
+                finish firstKey lastKey maxSeqNo count block offset indexEntries
 
-        loop None None 0UL 0L [] [] 0 0 [] None
+        loop None None 0UL 0L [] 0 0 [] None

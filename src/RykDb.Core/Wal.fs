@@ -239,19 +239,24 @@ module internal Wal =
 
             loop initial
 
-        let applyRecord (pending, maxTxnId, state) =
+        let applyRecord (pending: Map<TxnId, Entry array list>, maxTxnId, state) =
             function
             | WalRecord.Begin txnId -> pending, max maxTxnId txnId, state
-            | WalRecord.Batch(txnId, entries) -> (txnId, entries) :: pending, max maxTxnId txnId, state
-            | WalRecord.Abort txnId -> pending |> List.filter (fun (t, _) -> t <> txnId), max maxTxnId txnId, state
+            | WalRecord.Batch(txnId, entries) ->
+                let batches =
+                    match pending.TryFind txnId with
+                    | Some earlier -> entries :: earlier
+                    | None -> [ entries ]
+
+                Map.add txnId batches pending, max maxTxnId txnId, state
+            | WalRecord.Abort txnId -> Map.remove txnId pending, max maxTxnId txnId, state
             | WalRecord.Commit txnId ->
                 let mine =
-                    pending
-                    |> List.filter (fun (t, _) -> t = txnId)
-                    |> List.collect (fun (_, e) -> Array.toList e)
-                    |> List.rev
+                    match pending.TryFind txnId with
+                    | Some batches -> batches |> List.rev |> List.collect Array.toList
+                    | None -> []
 
-                pending |> List.filter (fun (t, _) -> t <> txnId), max maxTxnId txnId, List.fold step state mine
+                Map.remove txnId pending, max maxTxnId txnId, List.fold step state mine
 
         let p = path dir fileNumber
 
@@ -267,7 +272,7 @@ module internal Wal =
                         System.IO.FileShare.Read
                     )
 
-                foldFrames fs (fun state record -> ret (applyRecord state record)) ([], 0UL<txnId>, initial)
+                foldFrames fs (fun state record -> ret (applyRecord state record)) (Map.empty, 0UL<txnId>, initial)
                 |> Result.map (fun ((_, maxTxnId, state), goodSize) -> state, maxTxnId, goodSize))
         >>= id
 
@@ -301,10 +306,11 @@ module internal Wal =
 
     /// ディレクトリ内の WAL ファイル名（復旧時に孤児を消すのに使う）。
     let walFiles (dir: string) =
-        if System.IO.Directory.Exists dir then
-            System.IO.Directory.GetFiles(dir, "*" + WalExtension) |> Array.toList
-        else
-            []
+        protect (fun () ->
+            if System.IO.Directory.Exists dir then
+                System.IO.Directory.GetFiles(dir, "*" + WalExtension) |> Array.toList
+            else
+                [])
 
     /// WAL ファイルを作る。
     let create (dir: string) (fileNumber: int64) =

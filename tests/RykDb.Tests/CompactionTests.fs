@@ -10,11 +10,12 @@ open RykDb.TestHelpers
 
 /// 与えたエントリ列を SSTable として書き、メタデータを返す。
 let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) =
-    entries
-    |> List.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
-    |> List.toArray
-    |> FileMetaData.writeSstable dir num level 0.01
-    |> ok
+    let sstEntries =
+        entries
+        |> List.map (fun e -> SstEntry.make e.Key e.SeqNo e.Value)
+        |> List.toArray
+
+    FileMetaData.writeSstable dir num level 0.01 sstEntries.Length sstEntries |> ok
 
 /// 書いた SSTable を開く（検証用。値は復号する）。
 let private openBack (dir: string) (f: FileMetaData) =

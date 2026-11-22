@@ -90,6 +90,16 @@ type internal VersionCoordinator
         | Ok() -> true
         | Error _ -> false
 
+    /// 二重 Dispose で参照数を 2回減らさないための 1回限りの解放。
+    let disposableOnce (release: unit -> unit) =
+        let guard = System.Collections.Concurrent.ConcurrentDictionary<string, bool>()
+
+        { new System.IDisposable with
+            member _.Dispose() =
+                if guard.TryAdd("done", true) then
+                    release ()
+        }
+
     let withGate (f: unit -> 'T) =
         installGate.Wait()
 
@@ -198,7 +208,7 @@ type internal VersionCoordinator
 
                         true
                     else
-                        loop ()
+                        false
                 else
                     fileRefs.TryRemove(System.Collections.Generic.KeyValuePair(fileNumber, { state with Pins = 0 }))
                     |> ignore
@@ -520,15 +530,24 @@ type internal VersionCoordinator
 
     /// 現在 Version のスナップショットと、その Version を pin した lease を返す。
     /// 同じ Version への複数 lease はファイル数に比例しない（初回だけ全ファイルを pin する）。
+    /// <remarks>
+    /// install は「publish -> retire」の順に行うので、
+    /// pin してから状態が変わっていないことを確かめれば、
+    /// installGate を取らずに「ファイルが消えない Version」を掴める
+    /// （SELECT が flush を待たない）。
+    /// </remarks>
     member _.AcquireCall() =
-        withGate (fun () ->
+        let rec loop () =
             let state = stateCell.[stateKey]
             pinVersion state.Version
 
-            state,
-            { new System.IDisposable with
-                member _.Dispose() = releaseVersion state.Version
-            })
+            if obj.ReferenceEquals(stateCell.[stateKey], state) then
+                state, disposableOnce (fun () -> releaseVersion state.Version)
+            else
+                releaseVersion state.Version
+                loop ()
+
+        loop ()
 
     /// 指定した Version を pin する lease を返す。
     /// 走査が呼び出し元の read lease より長生きする場合に使う。
@@ -536,10 +555,7 @@ type internal VersionCoordinator
     /// （point lookup ごとに呼ばれるため、MANIFEST 追記と競合させない）。
     member _.AcquireVersion(version: Version) =
         pinVersion version
-
-        { new System.IDisposable with
-            member _.Dispose() = releaseVersion version
-        }
+        disposableOnce (fun () -> releaseVersion version)
 
     member _.Signal() = signalWork ()
 

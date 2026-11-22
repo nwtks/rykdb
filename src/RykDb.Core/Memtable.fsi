@@ -38,4 +38,5 @@ module internal Memtable =
     val getVisible: byte array -> uint64 option -> Memtable -> Entry option
     val rangeScan: byte array -> int -> Memtable -> seq<Entry>
     val isEmpty: Memtable -> bool
+    val count: Memtable -> int
     val approxBytes: Memtable -> int

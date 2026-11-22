@@ -307,5 +307,9 @@ module internal Memtable =
     /// エントリを 1つも持たないか。
     let isEmpty (mem: Memtable) = mem.Count = 0
 
+    /// 保持しているエントリ数
+    /// （SSTable 書き出し時の Bloom filter の見積りに使う）。
+    let count (mem: Memtable) = mem.Count
+
     /// 保持しているエントリの管理メモリ概算。
     let approxBytes (mem: Memtable) = mem.ApproxBytes
