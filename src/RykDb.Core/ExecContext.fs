@@ -1,5 +1,12 @@
 namespace RykDb.Core
 
+/// INNER 結合区間の並べ替え戦略。
+/// `Greedy` は診断・A/B 用で、既定は `Dp`。
+[<RequireQualifiedAccess>]
+type internal JoinOrderStrategy =
+    | Dp
+    | Greedy
+
 /// 実行時文脈。
 /// 演算子はこれを「作る時点」に確定させる。
 type internal ExecContext =
@@ -26,6 +33,8 @@ type internal ExecContext =
         /// 演算子が使ってよいメモリ作業領域とスピル先。
         /// クエリ開始時に 1回だけ決まる。
         Budget: MemoryBudget
+        /// 結合順の戦略（A/B・診断用。既定は DP）。
+        JoinOrder: JoinOrderStrategy
     }
 
 module internal ExecContext =
@@ -39,7 +48,11 @@ module internal ExecContext =
             Scope = ScanScope()
             ScanNeeds = System.Collections.Immutable.ImmutableDictionary.Create<obj, bool array> HashIdentity.Reference
             Budget = MemoryBudget.Default
+            JoinOrder = JoinOrderStrategy.Dp
         }
+
+    /// 結合順の戦略を差し替える（A/B・診断用）。
+    let withJoinOrder (strategy: JoinOrderStrategy) (ctx: ExecContext) = { ctx with JoinOrder = strategy }
 
     /// メモリ作業領域の上限を差し替える。
     let withBudget (budget: MemoryBudget) (ctx: ExecContext) = { ctx with Budget = budget }

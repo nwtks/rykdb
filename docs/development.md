@@ -274,8 +274,11 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
 - `Join3Tables`、`MergeJoin2Tables`、`JoinWithResidual`、`NestedLoopNoMatch`:
   結合を測定する。
 - `Join4TablesSparse`、`Join4TablesDense`:
-  4テーブル結合の結合順（DP と貪欲のフォールバック）を測定する。
+  4テーブル結合の結合順を測定する。
   前者は直積を含む疎なグラフ、後者は全テーブルが結合述語で繋がる密なグラフ。
+- `Join4TablesSparseDp`、`Join4TablesSparseGreedy`、`Join4TablesDenseDp`、`Join4TablesDenseGreedy`:
+  parse / plan を除き、DP と貪欲の計画を実行して比べる。
+  `Session.PrepareSelectWith(JoinOrderStrategy.Greedy, stmt)` で貪欲計画を作る。
 - `DistinctSpill`、`GroupBySpill`、`Join3TablesSpill`、`JoinByValueSpill`、`SortSpill`:
   作業メモリを1バイトにして退避経路を強制する（`--class spill`）。
   通常経路の同名シナリオと比較する。

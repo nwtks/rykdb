@@ -480,6 +480,14 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
         // 列数と NDV の表示
         Assert.Equal<int64>(2L, asInt analyzed.Rows.[0].[2])
         Assert.Contains("id=3", asText analyzed.Rows.[0].[3])
+        // NULL 数・数値範囲・索引 prefix NDV
+        Assert.Equal<string list>(
+            [ "table"; "rows"; "columns"; "ndv"; "nulls"; "ranges"; "indexes" ],
+            analyzed.Columns |> Array.toList
+        )
+
+        Assert.Equal<string>("id=0,v=0", asText analyzed.Rows.[0].[4])
+        Assert.Equal<string>("id=[1,3],v=[10,20]", asText analyzed.Rows.[0].[5])
 
         let _ = exec db3 "ANALYZE TABLE t;"
         let _ = exec db3 "ANALYZE t"
@@ -531,25 +539,35 @@ let ``SqlReference: ANALYZE は進捗を通知し、キャンセルできる`` (
         ok (s2.Close()) |> ignore)
 
 [<Fact>]
-let ``SqlReference: EXPLAIN は統計があるとき推定行数を表示する`` () =
+let ``SqlReference: EXPLAIN は統計があるとき推定行数と結合選択性を表示する`` () =
     withSession "explain-stats" (fun db0 ->
-        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
-        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20),(3,30)"
-        // 統計が無いときは行数を出さない。
-        let _, before = execRes db2 "EXPLAIN SELECT * FROM t WHERE id = 1"
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, k INTEGER)"
+        let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db3 = exec db2 "INSERT INTO t VALUES (1,10,100),(2,20,200),(3,30,300)"
+        let db4 = exec db3 "INSERT INTO u VALUES (1,100),(2,200),(3,300)"
+
+        // 統計が無いときは行数・選択性を出さない。
+        let _, before = execRes db4 "EXPLAIN SELECT * FROM t JOIN u ON t.k = u.k"
 
         let beforeText =
             before.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
 
         Assert.DoesNotContain("rows=", beforeText)
+        Assert.DoesNotContain("sel=", beforeText)
 
-        let db3 = exec db2 "ANALYZE t"
-        let _, after = execRes db3 "EXPLAIN SELECT * FROM t WHERE id = 1"
-
-        let afterText =
-            after.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
-
-        Assert.Contains("rows=", afterText))
+        let db5 = exec db4 "ANALYZE"
+        let _, after = execRes db5 "EXPLAIN SELECT * FROM t JOIN u ON t.k = u.k"
+        let afterLines = after.Rows |> Array.map (fun row -> asText row.[0])
+        let afterText = afterLines |> String.concat "\n"
+        Assert.Contains("rows=", afterText)
+        Assert.Contains("sel=", afterText)
+        // 選択性は結合ノードにだけ付く。
+        Assert.DoesNotContain(
+            "sel=",
+            afterLines
+            |> Array.filter (fun line -> line.Contains "Scan(")
+            |> String.concat "\n"
+        ))
 
 [<Fact>]
 let ``SqlReference: ANALYZE の統計は再オープン後も残り、ALTER TABLE で消える`` () =
@@ -3389,6 +3407,36 @@ let ``SqlReference: 結合順が並べ替えられても結果は同じ`` () =
         Assert.Equal<int64>(10L, asInt reordered.Rows.[0].[0])
         Assert.Equal<int64>(10L, asInt reordered.Rows.[0].[1])
         Assert.Equal<int64>(10L, asInt reordered.Rows.[0].[2]))
+
+[<Fact>]
+let ``SqlReference: 貪欲な結合順でも DP と同じ結果になる`` () =
+    // A/B 用の戦略切り替え（DP / 貪欲）が結果を変えないことを固定する。
+    withSession "join-order-greedy" (fun db ->
+        let db = exec db "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "INSERT INTO a VALUES (1,10),(2,20),(3,30)"
+        let db = exec db "INSERT INTO b VALUES (1,10),(2,25),(3,30)"
+        let db = exec db "INSERT INTO c VALUES (1,10),(2,20),(3,30)"
+
+        let stmt =
+            match parseOneOk "SELECT a.id, b.id, c.id FROM a JOIN b ON a.k = b.k JOIN c ON a.k = c.k" with
+            | Statement.Select s -> s
+            | other -> failwithf "SELECT ではありません: %A" other
+
+        let run plan =
+            try
+                let op = ok (Optimizer.exec plan.Context plan.Tree plan.Input)
+
+                (op |> Op.toArray |> ok)
+                |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
+            finally
+                plan.Context.Scope.DisposeAll()
+
+        let dp = run (ok (db.PrepareSelect stmt))
+        let greedy = run (ok (db.PrepareSelectWith(JoinOrderStrategy.Greedy, stmt)))
+        Assert.Equal<int>(2, dp.Length)
+        Assert.Equal<string list>(dp |> Array.toList, greedy |> Array.toList))
 
 [<Fact>]
 let ``SqlReference: 結合順は中間行数の見積りで決まる`` () =

@@ -723,6 +723,14 @@ plan
 
 `PkLookup`が吸収した等値述語は`Filter`に残らない。
 
+`ANALYZE`の統計がある場合、各ノードの行末に推定行数`rows=`が付く。
+結合ノードには等値結合の選択性`sel=`も付く。
+統計が無いとき、`rows=`と`sel=`は表示しない。
+
+```text
+  Join(INNER, HashJoin, right=u, on=(t.k = u.k)) rows=3 sel=0.3333
+```
+
 主なノードは次のとおり。
 
 | ノード      | 内容                                                                |
@@ -1004,7 +1012,10 @@ ANALYZE [TABLE] [table_name] [SAMPLE n];
 テーブル名を省略すると全テーブルを対象にする。
 
 - 結合順、結合アルゴリズム、走査基数、Filter 選択性の見積りに使う。
-- 結果は `table` / `rows` / `columns` / `ndv` の 1行（全テーブルならテーブルごとに 1行）。
+- 結果は `table` / `rows` / `columns` / `ndv` / `nulls` / `ranges` / `indexes` の 1行
+  （全テーブルならテーブルごとに 1行）。
+  - `ndv` は `列=異なり値数` の並び、`nulls` は `列=NULL数` の並び。
+  - `ranges` は数値列の `列=[最小,最大]`、`indexes` は `索引名=[prefix NDV…]`。
 - `SAMPLE n` は reservoir sampling で最大 n 行を標本にする。
   行数は全体を数え、NDV・範囲・NULL 率・数値ヒストグラムは標本から推定する。
 - 進捗は `SessionOptions.OnAnalyzeProgress`、キャンセルは `SessionOptions.CancelAnalysis` で扱う。

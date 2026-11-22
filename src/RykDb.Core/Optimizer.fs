@@ -807,15 +807,26 @@ module internal Optimizer =
                     if List.isEmpty item.Context.Catalog.Stats then
                         ""
                     else
-                        let rows =
-                            Analyzer.estimateRowsWith (fun name -> ExecContext.statsOf name item.Context) item.Tree
+                        let statsOf name = ExecContext.statsOf name item.Context
+                        let rows = Analyzer.estimateRowsWith statsOf item.Tree
 
-                        if System.Double.IsFinite rows then
-                            sprintf " rows=%.0f" rows
-                        elif System.Double.IsPositiveInfinity rows then
-                            " rows=inf"
-                        else
-                            ""
+                        let rowsText =
+                            if System.Double.IsFinite rows then
+                                sprintf " rows=%.0f" rows
+                            elif System.Double.IsPositiveInfinity rows then
+                                " rows=inf"
+                            else
+                                ""
+
+                        let selectivityText =
+                            match item.Tree with
+                            | Logical.Join(_, _, on, _, _) ->
+                                match Analyzer.joinSelectivity statsOf on with
+                                | Some selectivity -> sprintf " sel=%.4g" selectivity
+                                | None -> ""
+                            | _ -> ""
+
+                        rowsText + selectivityText
 
                 let line = String.replicate item.Indent "  " + text + rowSuffix
                 emit (line :: acc) (children @ rest)

@@ -515,16 +515,24 @@ module internal PlanBuilder =
 
                         let initialRowBytes = rowBytesOfColumns (accSchema.Columns |> Seq.map _.DataType)
 
-                        JoinOrder.choose
-                            (estimate acc)
-                            initialRowBytes
-                            joined
-                            initialOrder
-                            workMemBytes
-                            edges
-                            (inner
-                             |> List.map (fun (i, _) -> joinItem statsOf bindings.[i] scans.[i] estimates.[i] i))
-                            (dependencies |> List.choose id |> Map.ofList)
+                        let items =
+                            inner
+                            |> List.map (fun (i, _) -> joinItem statsOf bindings.[i] scans.[i] estimates.[i] i)
+
+                        let deps = dependencies |> List.choose id |> Map.ofList
+
+                        match ctx.JoinOrder with
+                        | JoinOrderStrategy.Dp ->
+                            JoinOrder.choose
+                                (estimate acc)
+                                initialRowBytes
+                                joined
+                                initialOrder
+                                workMemBytes
+                                edges
+                                items
+                                deps
+                        | JoinOrderStrategy.Greedy -> JoinOrder.greedy (estimate acc) joined edges items deps
                     else
                         inner |> List.map (fun (i, _) -> lowerName bindings.[i])
 
@@ -532,7 +540,11 @@ module internal PlanBuilder =
                     inner |> List.map (fun (i, _) -> lowerName bindings.[i], i) |> Map.ofList
 
                 let relaxedOrder =
-                    if allowFirstRelax && dependencies |> List.forall Option.isSome then
+                    if
+                        allowFirstRelax
+                        && ctx.JoinOrder = JoinOrderStrategy.Dp
+                        && dependencies |> List.forall Option.isSome
+                    then
                         let allTables = 0 :: (inner |> List.map fst)
 
                         let allByName =

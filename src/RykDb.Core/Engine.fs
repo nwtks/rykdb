@@ -1246,7 +1246,7 @@ module internal Engine =
     /// 実行のたびに `plan.Context.Scope.DisposeAll()` を呼ぶこと。
     /// snapshot を登録しないため、読み取りの間に書き込みが入る用途には使わない。
     /// </remarks>
-    let internal prepareSelect (state: ExecState) (stmt: SelectStatement) =
+    let prepareSelectWith (strategy: JoinOrderStrategy) (state: ExecState) (stmt: SelectStatement) =
         let snapshot =
             {
                 SeqNo = state.Manager.LastCommitSeqNo
@@ -1254,12 +1254,16 @@ module internal Engine =
 
         Transaction.create 0UL<txnId> snapshot
         |> contextOf MemoryBudget.Default state
+        |> Result.map (ExecContext.withJoinOrder strategy)
         >>= fun ctx ->
             match Plan.explainSelect ctx stmt with
             | Ok plan -> ret plan
             | Error e ->
                 ctx.Scope.DisposeAll()
                 err e
+
+    let prepareSelect (state: ExecState) (stmt: SelectStatement) =
+        prepareSelectWith JoinOrderStrategy.Dp state stmt
 
     /// SELECT を materialize せずにストリーミング用の Op として開く。
     /// 呼び出し側は返された `Cleanup` を必ず呼び、snapshot 登録と走査を解放する。
@@ -1403,7 +1407,12 @@ module internal Engine =
             runDdlWithState state (fun st ->
                 ExecState.analyze (name, sample) limits.Cancel limits.Progress st
                 >>= fun (next, stats) ->
-                    let columns = [| "table"; "rows"; "columns"; "ndv" |]
+                    let columns = [| "table"; "rows"; "columns"; "ndv"; "nulls"; "ranges"; "indexes" |]
+
+                    let rangeText (c: ColumnStats) =
+                        match c.Min, c.Max with
+                        | Some lo, Some hi -> sprintf "%s=[%g,%g]" c.Name lo hi
+                        | _ -> ""
 
                     let rows =
                         stats
@@ -1415,6 +1424,19 @@ module internal Engine =
                                 SqlValue.Text(
                                     s.Columns
                                     |> List.map (fun c -> sprintf "%s=%d" c.Name c.NDV)
+                                    |> String.concat ","
+                                )
+                                SqlValue.Text(
+                                    s.Columns
+                                    |> List.map (fun c -> sprintf "%s=%d" c.Name c.Nulls)
+                                    |> String.concat ","
+                                )
+                                SqlValue.Text(
+                                    s.Columns |> List.map rangeText |> List.filter ((<>) "") |> String.concat ","
+                                )
+                                SqlValue.Text(
+                                    s.Indexes
+                                    |> List.map (fun i -> sprintf "%s=%A" i.Name i.PrefixNDV)
                                     |> String.concat ","
                                 )
                             |])

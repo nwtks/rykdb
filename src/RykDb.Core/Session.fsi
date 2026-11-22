@@ -78,6 +78,11 @@ type Session =
     member internal ExecuteStatement: stmt: Statement -> Result<StatementResult, DbError>
     /// SELECT の計画だけを組み立てる（テスト・ベンチ用。書き込みを挟まない用途限定）。
     member internal PrepareSelect: stmt: SelectStatement -> Result<PlannedQuery, DbError>
+
+    /// 結合順戦略を指定して計画する（A/B・診断用）。
+    member internal PrepareSelectWith:
+        strategy: JoinOrderStrategy * stmt: SelectStatement -> Result<PlannedQuery, DbError>
+
     /// トランザクションを始める。
     member Begin: unit -> Result<unit, DbError>
     /// COMMIT。

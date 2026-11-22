@@ -59,6 +59,11 @@ type QueryBenchmarks() =
     let mutable parsedLookup = Unchecked.defaultof<Statement>
     /// `pointSql` の計画。parse と plan を除いた実行を測るために 1回だけ作る。
     let mutable lookupPlan = Unchecked.defaultof<PlannedQuery>
+    /// 4テーブル結合の DP / 貪欲計画（A/B 用）。
+    let mutable join4SparseDp = Unchecked.defaultof<PlannedQuery>
+    let mutable join4SparseGreedy = Unchecked.defaultof<PlannedQuery>
+    let mutable join4DenseDp = Unchecked.defaultof<PlannedQuery>
+    let mutable join4DenseGreedy = Unchecked.defaultof<PlannedQuery>
     /// `SELECT b` が復号する列（id, a, b の b だけ）。PkLookup が使うマスクと同じ。
     let lookupMask = [| false; false; true |]
     let pointSql = "SELECT b FROM t WHERE id = 50000"
@@ -137,6 +142,10 @@ type QueryBenchmarks() =
         this.Seed("j2", 10, 99, fun i -> sprintf "(%d, %d)" i i)
         this.Seed("j3", 10, 9, fun i -> sprintf "(%d, %d)" i i)
         this.Seed("j4", 10, 9, fun i -> sprintf "(%d, %d)" i i)
+        this.Exec "ANALYZE j1"
+        this.Exec "ANALYZE j2"
+        this.Exec "ANALYZE j3"
+        this.Exec "ANALYZE j4"
 
         session.Close() |> Check.ok |> ignore
 
@@ -150,6 +159,24 @@ type QueryBenchmarks() =
 
         parsedLookup <- Statement.Select select
         lookupPlan <- session.PrepareSelect select |> Check.ok
+
+        let selectOf sql =
+            match Parser.parseStatements sql with
+            | Ok [ Statement.Select stmt ] -> stmt
+            | Ok _ -> failwithf "1文の SELECT である必要があります: %s" sql
+            | Error e -> failwith (DbError.toDisplayString e)
+
+        join4SparseDp <- session.PrepareSelect(selectOf join4SparseSql) |> Check.ok
+
+        join4SparseGreedy <-
+            session.PrepareSelectWith(JoinOrderStrategy.Greedy, selectOf join4SparseSql)
+            |> Check.ok
+
+        join4DenseDp <- session.PrepareSelect(selectOf join4DenseSql) |> Check.ok
+
+        join4DenseGreedy <-
+            session.PrepareSelectWith(JoinOrderStrategy.Greedy, selectOf join4DenseSql)
+            |> Check.ok
 
         let rowCount (op: Op) = (Op.toArray op |> Check.ok).Length
 
@@ -265,6 +292,28 @@ type QueryBenchmarks() =
     /// 全テーブルが結合述語で繋がる密な 4テーブル JOIN。
     [<Benchmark>]
     member this.Join4TablesDense() = this.Exec join4DenseSql
+
+    /// 計画済みの 4テーブル JOIN を実行する（parse / plan を含めない）。
+    /// DP と貪欲の差はこの 4 つを比べる。
+    member private _.RunPlanned(plan: PlannedQuery) =
+        try
+            let op = Optimizer.exec plan.Context plan.Tree plan.Input |> Check.ok
+
+            (Op.toArrayLimited System.Int64.MaxValue System.Int64.MaxValue op |> Check.ok).Length
+        finally
+            plan.Context.Scope.DisposeAll()
+
+    [<Benchmark>]
+    member this.Join4TablesSparseDp() = this.RunPlanned join4SparseDp
+
+    [<Benchmark>]
+    member this.Join4TablesSparseGreedy() = this.RunPlanned join4SparseGreedy
+
+    [<Benchmark>]
+    member this.Join4TablesDenseDp() = this.RunPlanned join4DenseDp
+
+    [<Benchmark>]
+    member this.Join4TablesDenseGreedy() = this.RunPlanned join4DenseGreedy
 
     /// 2テーブルの等値結合（主キー順の走査なのでマージ結合になる）。
     [<Benchmark>]

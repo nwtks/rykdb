@@ -141,7 +141,8 @@ module internal JoinOrder =
             if product <= 0.0 then 0.0 else max 1.0 product
 
     /// 現行の貪欲法。先頭テーブルと LEFT の境界は呼び出し側が固定する。
-    let private greedy
+    /// A/B・診断用に内部へ公開する。
+    let greedy
         (initialRows: float)
         (initialJoined: Set<string>)
         (edges: JoinOrderEdge list)

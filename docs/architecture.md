@@ -533,6 +533,10 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 - 複数索引の選択は prefix NDV が小さい索引を優先する。
 - bushy計画とLEFT JOINを跨ぐ再配置はまだモデル化していない。
 
+診断・A/B用に `ExecContext.JoinOrder`（`Dp` / `Greedy`）で戦略を切り替えられる。
+`Session.PrepareSelectWith(JoinOrderStrategy.Greedy, stmt)` は貪欲計画を返し、
+結果はDPと同じになる（回帰テストで固定）。
+
 #### 論理代数からOpへ
 
 `Scan`は走査方法に応じて、主キー、索引、範囲、全走査の実行関数へ振り分ける。

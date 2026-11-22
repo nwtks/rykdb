@@ -306,7 +306,8 @@ module internal Analyzer =
     /// 等値結合の選択性。
     /// 統計が欠けている等値は既定の 0.1 で穴埋めする。
     /// 同じテーブル対の複合等値は、索引 prefix NDV があればそれを使う。
-    let private joinSelectivity (statsOf: string -> TableStats option) (on: Expr) =
+    /// `Some` は「その結合でどれだけ行が減るか」、`None` は統計なし。
+    let joinSelectivity (statsOf: string -> TableStats option) (on: Expr) =
         let equalities =
             Predicate.splitConjuncts on
             |> List.choose (fun conjunct ->

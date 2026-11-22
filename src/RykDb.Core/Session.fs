@@ -548,6 +548,9 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     member internal _.PrepareSelect(stmt: SelectStatement) =
         Engine.prepareSelect (ExecState.ofCommitted host.Committed) stmt
 
+    member internal _.PrepareSelectWith(strategy: JoinOrderStrategy, stmt: SelectStatement) =
+        Engine.prepareSelectWith strategy (ExecState.ofCommitted host.Committed) stmt
+
     /// トランザクションを始める。
     member _.Begin() =
         lock writeGate (fun () ->
