@@ -78,6 +78,7 @@
 | INV-42 | 比較の型は計画時に判定し、行の有無に依存させない      | `Eval.checkComparableTypes`、`Binder.qualify`、`DmlOps`、SqlReferenceTests                |
 | INV-43 | 解析用の修飾失敗で ON 述語を落とさない                | `PlanBuilder.buildSteps`（raw ON へのフォールバック・残りの Filter 化）、PlanBuilderTests |
 | INV-44 | 放棄された transaction は次の書き込みで回収する       | `RegistrationLease`、`DatabaseHost.reclaimAbandoned`、DatabaseHostTests                   |
+| INV-45 | 競合した COMMIT は接続を transaction 外へ戻す         | `CommitOutcome`、`DatabaseHost.Commit`、`Session`、SessionTests                           |
 
 ---
 
@@ -764,6 +765,21 @@ DMLは即時RESTRICTを適用する。
 
 回帰テストは `DatabaseHost: 放棄された transaction は次の書き込みで manager から回収される`、
 `DatabaseHost: commit せずに捨てた transaction も GC されれば登録が外れる` を検査する。
+
+### INV-45: 競合した COMMIT は接続を transaction 外へ戻す
+
+write-write 競合で COMMIT が失敗した transaction は、同じ snapshot のまま再試行しても永久に競合する。
+開いたまま残すと、`Begin`が「既にtransaction中」を返し、
+以後の文は存在しないtransactionで走る。
+
+- `DatabaseHost.Commit`は`ConflictError`のとき`Engine.executeRollback`でabortし、
+  managerを公開して`CommitOutcome.RolledBack`を返す。
+- `Session`（`Commit()`とSQL `COMMIT`の両方）は、成功・自動rollbackのどちらでも
+  接続ローカル状態を返された`TxnState`へ進めてからエラーを返す。
+- 競合以外のCOMMIT失敗（WALのI/Oなど）はtransactionを残す（再試行できる）。
+
+回帰テストは `SessionPool: 競合した COMMIT は transaction を自動的に rollback する` と
+`SessionPool: SQL の COMMIT 競合でも transaction が閉じる` を検査する。
 
 ---
 

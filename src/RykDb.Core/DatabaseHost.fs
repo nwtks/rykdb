@@ -123,6 +123,19 @@ type private HostLifecycle =
     | Running of Committed
     | Closed of Committed
 
+/// COMMIT の結果。
+/// <remarks>
+/// 競合した transaction は同じ snapshot では永久に commit できない。
+/// `DatabaseHost.Commit` は write-write 競合のとき、その場で transaction を abort し、
+/// 接続を transaction 外へ戻す。
+/// エラーは値として返し、呼び出し側（`Session`）が接続状態を更新してから
+/// `ConflictError` として返す。
+/// </remarks>
+[<RequireQualifiedAccess>]
+type internal CommitOutcome =
+    | Committed of TxnState
+    | RolledBack of next: TxnState * error: DbError
+
 /// 同一 DB を共有する複数の `Session`（接続）のコミット状態。
 /// <remarks>
 /// 1つの `RowStore` と `TransactionManager` を全接続で共有し、
@@ -333,16 +346,28 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
             serialized run |> Result.map fst
 
     /// COMMIT。接続の transaction を共有の Manager で確定する。
+    /// <remarks>
+    /// write-write 競合で失敗した場合、同じ snapshot のまま再試行しても永久に競合する。
+    /// そのため transaction を abort して接続を transaction 外へ戻し、
+    /// `ConflictError` を `CommitOutcome.RolledBack` として返す。
+    /// 競合以外の失敗（WAL の I/O など）では transaction を残す。
+    /// </remarks>
     member _.Commit(local: TxnState) =
         match local.Active with
         | None -> err (DbError.internalError "コミットする transaction がありません")
         | Some _ ->
             serialized (fun current ->
-                Engine.executeCommit (execStateOf current local)
-                >>= fun next ->
+                match Engine.executeCommit (execStateOf current local) with
+                | Ok next ->
                     local.Lease |> Option.iter _.Release()
                     publish next.Committed
-                    ret (next.Committed, (next.Txn, StatementResult.Empty)))
+                    ret (next.Committed, (CommitOutcome.Committed next.Txn, StatementResult.Empty))
+                | Error e when e.Kind = ErrorKind.ConflictError ->
+                    let rolledBack = Engine.executeRollback (execStateOf current local)
+                    local.Lease |> Option.iter _.Release()
+                    publish rolledBack.Committed
+                    ret (rolledBack.Committed, (CommitOutcome.RolledBack(rolledBack.Txn, e), StatementResult.Empty))
+                | Error e -> err e)
 
     /// ROLLBACK。接続の transaction を捨てる。
     member _.Rollback(local: TxnState) =

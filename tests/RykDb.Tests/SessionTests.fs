@@ -839,8 +839,64 @@ let ``SessionPool: 接続間で write-write 競合を検出する`` () =
             ok (b.Execute "UPDATE t SET v = 12 WHERE id = 1") |> ignore
             ok (a.Commit()) |> ignore
             expectErrorKind ErrorKind.ConflictError "後から commit した側" (b.Commit())
-            ok (b.Rollback()) |> ignore
+            // 競合した COMMIT は transaction を自動的に rollback する
+            Assert.False b.InTransaction
             Assert.Equal(11L, scalar a "SELECT v FROM t WHERE id = 1")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: 競合した COMMIT は transaction を自動的に rollback する`` () =
+    withPool "pool-conflict-auto-rollback" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)") |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+            ok (a.Begin()) |> ignore
+            ok (b.Begin()) |> ignore
+            ok (a.Execute "UPDATE t SET v = 11 WHERE id = 1") |> ignore
+            ok (b.Execute "UPDATE t SET v = 12 WHERE id = 1") |> ignore
+            ok (a.Commit()) |> ignore
+            expectErrorKind ErrorKind.ConflictError "後から commit した側" (b.Commit())
+            // 失敗した COMMIT は transaction を捨て、接続は transaction 外へ戻る。
+            Assert.False b.InTransaction
+            expectErrorKind ErrorKind.InternalError "自動 rollback 後の COMMIT" (b.Commit())
+
+            // 新しい transaction で最初からやり直せる。
+            ok (b.Begin()) |> ignore
+            ok (b.Execute "UPDATE t SET v = 12 WHERE id = 1") |> ignore
+            ok (b.Commit()) |> ignore
+            Assert.Equal(12L, scalar a "SELECT v FROM t WHERE id = 1")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
+let ``SessionPool: SQL の COMMIT 競合でも transaction が閉じる`` () =
+    withPool "pool-conflict-sql" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)") |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+            ok (a.Execute "BEGIN") |> ignore
+            ok (b.Execute "BEGIN") |> ignore
+            ok (a.Execute "UPDATE t SET v = 11 WHERE id = 1") |> ignore
+            ok (b.Execute "UPDATE t SET v = 12 WHERE id = 1") |> ignore
+            ok (a.Execute "COMMIT") |> ignore
+            expectErrorKind ErrorKind.ConflictError "SQL の後から COMMIT" (b.Execute "COMMIT")
+            Assert.False b.InTransaction
+            expectErrorKind ErrorKind.InternalError "自動 rollback 後の SQL COMMIT" (b.Execute "COMMIT")
+
+            // BEGIN からやり直せる。
+            ok (b.Execute "BEGIN") |> ignore
+            ok (b.Execute "UPDATE t SET v = 12 WHERE id = 1") |> ignore
+            ok (b.Execute "COMMIT") |> ignore
+            Assert.Equal(12L, scalar a "SELECT v FROM t WHERE id = 1")
         finally
             a.Close() |> ignore
             b.Close() |> ignore)
@@ -861,7 +917,7 @@ let ``SessionPool: 接続間で UNIQUE の同時 INSERT を検出する`` () =
             ok (b.Execute "INSERT INTO t VALUES (2, 'x@example.com')") |> ignore
             ok (a.Commit()) |> ignore
             expectErrorKind ErrorKind.ConflictError "後から commit した UNIQUE INSERT" (b.Commit())
-            ok (b.Rollback()) |> ignore
+            Assert.False b.InTransaction
             Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t")
 
             expectErrorKind
@@ -889,7 +945,7 @@ let ``SessionPool: 接続間で UNIQUE の同時 UPDATE を検出する`` () =
             ok (b.Execute "UPDATE t SET email = 'c' WHERE id = 2") |> ignore
             ok (a.Commit()) |> ignore
             expectErrorKind ErrorKind.ConflictError "後から commit した UNIQUE UPDATE" (b.Commit())
-            ok (b.Rollback()) |> ignore
+            Assert.False b.InTransaction
             Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t WHERE email = 'c'")
         finally
             a.Close() |> ignore

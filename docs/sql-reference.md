@@ -1139,6 +1139,8 @@ Closeだけは読み取り完了を待つ。
 - transaction内で同じ行を読み直すと、後続のcommitは見えない。
 - snapshot取得後に別transactionが先に同じキーをcommitした場合、
   自分のcommitは `ConflictError`になる。
+- 競合で COMMIT が失敗した transaction は自動的に rollback され、接続は自動コミット状態へ戻る。
+  同じ snapshot では再試行しても永久に競合するため、 transaction 全体を最初からやり直す。
 
 Snapshot Isolationは直列化可能ではない。
 2つのtransactionが同じ行を読み、それぞれ別の行を更新すると、
@@ -1150,6 +1152,9 @@ Snapshot Isolationは直列化可能ではない。
 
 複数文を `Session.Execute`へ渡した場合、途中の文でエラーになっても、成功した文は確定済みのまま残る。
 明示transaction中のエラーはtransactionを開いたままにするので、必要に応じて `Rollback()`する。
+
+ただし COMMIT 自体が競合で失敗した場合は例外で、その transaction は閉じる（§11.5）。
+バッチはそこで止まる。
 
 ## 12. エラー
 

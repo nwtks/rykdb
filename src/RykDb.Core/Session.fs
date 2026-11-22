@@ -267,7 +267,14 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                             match stmt with
                             | Statement.Begin ->
                                 host.Begin state |> Result.map (fun next -> next, StatementResult.Empty)
-                            | Statement.Commit -> host.Commit state
+                            | Statement.Commit ->
+                                host.Commit state
+                                |> Result.bind (fun (outcome, result) ->
+                                    match outcome with
+                                    | CommitOutcome.Committed next -> ret (next, result)
+                                    | CommitOutcome.RolledBack(next, e) ->
+                                        lock stateGate (fun () -> local <- LocalSession.Open next)
+                                        err e)
                             | Statement.Rollback -> host.Rollback state
                             | _ -> host.ExecuteNonTransaction state (limitsOfBudget budget) stmt
 
@@ -553,13 +560,25 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                     ()))
 
     /// COMMIT。
+    /// <remarks>
+    /// write-write 競合で失敗した場合、host が transaction を abort する。
+    /// 接続は transaction 外へ戻り、`ConflictError` が返る
+    /// （同じ snapshot のまま再 COMMIT しても永久に競合するため）。
+    /// </remarks>
     member _.Commit() =
         lock writeGate (fun () ->
             match lock stateGate (fun () -> local) with
             | LocalSession.Closed -> err (closedError ())
             | LocalSession.Open state ->
                 host.Commit state
-                |> Result.map (fun (next, _) -> lock stateGate (fun () -> local <- LocalSession.Open next)))
+                |> Result.bind (fun (outcome, _) ->
+                    match outcome with
+                    | CommitOutcome.Committed next ->
+                        lock stateGate (fun () -> local <- LocalSession.Open next)
+                        ret ()
+                    | CommitOutcome.RolledBack(next, e) ->
+                        lock stateGate (fun () -> local <- LocalSession.Open next)
+                        err e))
 
     /// ROLLBACK。
     member _.Rollback() =

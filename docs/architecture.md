@@ -829,6 +829,8 @@ memtableを保持して次回再試行する。
 - BEGINは共有のTransactionManagerでtransactionを作る。
 - COMMITは競合検査と採番を行う。
 - ROLLBACKはバッファと予約だけを破棄する。
+- COMMITがwrite-write競合で失敗した場合、transactionをabortして接続をtransaction外へ戻す
+  （同じsnapshotでは再試行しても永久に競合するため。`CommitOutcome.RolledBack`）。
 - 複数文のバッチは文ごとに実行し、成功した文の状態だけを残す。
 
 途中の文が失敗しても、それ以前に成功した文と明示transactionは失われない。

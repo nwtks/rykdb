@@ -742,10 +742,18 @@ let ``Server: 接続間で write-write 競合を検出する`` () =
         | Failure m -> Assert.Contains("競合", m)
         | other -> failActual "競合エラーを期待しましたが" other
 
-        okRows (clientB.Send "ROLLBACK") |> ignore
+        // 競合した COMMIT は transaction を自動的に rollback する。
+        match clientB.Send "ROLLBACK" with
+        | Failure _ -> ()
+        | other -> failActual "transaction が無いので ROLLBACK はエラーになるはず" other
+
+        // 新しい transaction からやり直せる。
+        okRows (clientB.Send "BEGIN") |> ignore
+        okRows (clientB.Send "UPDATE t SET v = 12 WHERE id = 1") |> ignore
+        okRows (clientB.Send "COMMIT") |> ignore
 
         let _, rows = okRows (clientA.Send "SELECT v FROM t WHERE id = 1")
-        Assert.Equal<string list>([ "11" ], rows))
+        Assert.Equal<string list>([ "12" ], rows))
 
 [<Fact>]
 let ``Server: transaction 中の DDL は他接続で ConflictError になる`` () =
