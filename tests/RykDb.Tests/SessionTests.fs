@@ -864,6 +864,8 @@ let ``SessionPool: 競合した COMMIT は transaction を自動的に rollback 
             // 失敗した COMMIT は transaction を捨て、接続は transaction 外へ戻る。
             Assert.False b.InTransaction
             expectErrorKind ErrorKind.InternalError "自動 rollback 後の COMMIT" (b.Commit())
+            // 後始末の ROLLBACK は何もしない（成功）。
+            ok (b.Rollback()) |> ignore
 
             // 新しい transaction で最初からやり直せる。
             ok (b.Begin()) |> ignore
@@ -891,6 +893,8 @@ let ``SessionPool: SQL の COMMIT 競合でも transaction が閉じる`` () =
             expectErrorKind ErrorKind.ConflictError "SQL の後から COMMIT" (b.Execute "COMMIT")
             Assert.False b.InTransaction
             expectErrorKind ErrorKind.InternalError "自動 rollback 後の SQL COMMIT" (b.Execute "COMMIT")
+            // 後始末の ROLLBACK は何もしない（成功）。
+            ok (b.Execute "ROLLBACK") |> ignore
 
             // BEGIN からやり直せる。
             ok (b.Execute "BEGIN") |> ignore

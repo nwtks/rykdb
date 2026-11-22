@@ -125,11 +125,10 @@ type private HostLifecycle =
 
 /// COMMIT の結果。
 /// <remarks>
-/// 競合した transaction は同じ snapshot では永久に commit できない。
-/// `DatabaseHost.Commit` は write-write 競合のとき、その場で transaction を abort し、
+/// write-write 競合や書き込みバッファの上限超過は、再試行しても commit できない。
+/// `DatabaseHost.Commit` はその場合、その場で transaction を abort し、
 /// 接続を transaction 外へ戻す。
-/// エラーは値として返し、呼び出し側（`Session`）が接続状態を更新してから
-/// `ConflictError` として返す。
+/// エラーは値として返し、呼び出し側（`Session`）が接続状態を更新してからエラーとして返す。
 /// </remarks>
 [<RequireQualifiedAccess>]
 type internal CommitOutcome =
@@ -347,10 +346,12 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
 
     /// COMMIT。接続の transaction を共有の Manager で確定する。
     /// <remarks>
-    /// write-write 競合で失敗した場合、同じ snapshot のまま再試行しても永久に競合する。
+    /// write-write 競合やバッファ上限超過で失敗した場合、
+    /// その transaction は再試行しても commit できない
+    /// （競合は同じ snapshot のままでは永久に競合し、上限は減らない）。
     /// そのため transaction を abort して接続を transaction 外へ戻し、
-    /// `ConflictError` を `CommitOutcome.RolledBack` として返す。
-    /// 競合以外の失敗（WAL の I/O など）では transaction を残す。
+    /// エラーを `CommitOutcome.RolledBack` として返す。
+    /// それ以外の失敗（WAL の I/O など）では transaction を残す。
     /// </remarks>
     member _.Commit(local: TxnState) =
         match local.Active with
@@ -362,7 +363,7 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                     local.Lease |> Option.iter _.Release()
                     publish next.Committed
                     ret (next.Committed, (CommitOutcome.Committed next.Txn, StatementResult.Empty))
-                | Error e when e.Kind = ErrorKind.ConflictError ->
+                | Error e when e.Kind = ErrorKind.ConflictError || e.Kind = ErrorKind.CapacityError ->
                     let rolledBack = Engine.executeRollback (execStateOf current local)
                     local.Lease |> Option.iter _.Release()
                     publish rolledBack.Committed
@@ -370,9 +371,13 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                 | Error e -> err e)
 
     /// ROLLBACK。接続の transaction を捨てる。
+    /// <remarks>
+    /// transaction が無い場合は何もしない（成功）。
+    /// COMMIT の競合で自動 rollback 済みでも、後始末の ROLLBACK を失敗させない。
+    /// </remarks>
     member _.Rollback(local: TxnState) =
         match local.Active with
-        | None -> err (DbError.internalError "ロールバックする transaction がありません")
+        | None -> ret (local, StatementResult.Empty)
         | Some _ ->
             serialized (fun current ->
                 let next = Engine.executeRollback (execStateOf current local)

@@ -14,6 +14,42 @@ let private freshWal (dir: string) =
     ok (Wal.create dir 1L)
 
 [<Fact>]
+let ``Wal.append: 書きかけの末尾を切り捨ててから追記する`` () =
+    withDir "wal-retry-tail" (fun dir ->
+        let w0 = freshWal dir
+        let txn1 = 1UL<txnId>
+        let e1 = Entry.put (intKey 1) 1UL (intRow 1)
+
+        let w1 =
+            ok (Wal.append dir [ WalRecord.Begin txn1; WalRecord.Batch(txn1, [| e1 |]); WalRecord.Commit txn1 ] w0)
+
+        // 失敗した append が残した「書きかけのバイト」を模す（state.Size より後ろのゴミ）。
+        let path = Wal.path dir 1L
+        let garbage = Array.create 17 0xFFuy
+
+        do
+            use fs =
+                new System.IO.FileStream(path, System.IO.FileMode.Append, System.IO.FileAccess.Write)
+
+            fs.Write(garbage, 0, garbage.Length)
+            fs.Flush true
+
+        // 同じ state から再 append すると、末尾を切り捨ててから追記する（再試行が安全）。
+        let txn2 = 2UL<txnId>
+        let e2 = Entry.put (intKey 2) 2UL (intRow 2)
+
+        let w2 =
+            ok (Wal.append dir [ WalRecord.Begin txn2; WalRecord.Batch(txn2, [| e2 |]); WalRecord.Commit txn2 ] w1)
+
+        Assert.Equal<int64>(w2.Size, System.IO.FileInfo(path).Length)
+
+        let replayed, maxTxnId, _ =
+            ok (Wal.foldCommitted dir 1L (fun acc entry -> entry :: acc) [])
+
+        Assert.Equal<uint64 list>([ 1UL; 2UL ], replayed |> List.rev |> List.map _.SeqNo)
+        Assert.Equal(2UL<txnId>, maxTxnId))
+
+[<Fact>]
 let ``Wal.foldCommitted: コミット済みだけを順に再生する`` () =
     withDir "wal-fold" (fun dir ->
         let w0 = freshWal dir

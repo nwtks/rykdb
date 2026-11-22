@@ -84,7 +84,7 @@ type Session =
     /// write-write 競合で失敗した場合、その transaction は自動的に rollback され、
     /// 接続は transaction 外へ戻る（`ConflictError` が返る）。
     member Commit: unit -> Result<unit, DbError>
-    /// ROLLBACK。
+    /// ROLLBACK。transaction が無ければ何もしない（成功）。
     member Rollback: unit -> Result<unit, DbError>
     /// このセッションを閉じる。
     member Close: unit -> Result<unit, DbError>

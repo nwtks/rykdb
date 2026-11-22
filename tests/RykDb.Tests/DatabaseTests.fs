@@ -195,8 +195,9 @@ let ``Session: 二重 Begin と空の Commit / Rollback`` () =
 
         // transaction が無い状態の Commit はエラー
         expectError "transaction が無い Commit はエラー" (db0.Commit())
-        // transaction が無い状態の Rollback はエラー（Commit と対称）
-        expectError "transaction が無い Rollback はエラー" (db0.Rollback()))
+        // transaction が無い状態の Rollback は何もしない（後始末を失敗させない）
+        ok (db0.Rollback()) |> ignore
+        Assert.False db0.InTransaction)
 
 [<Fact>]
 let ``Session: transaction 中の文エラーはそのまま返る`` () =

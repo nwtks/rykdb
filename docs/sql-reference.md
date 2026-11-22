@@ -1082,6 +1082,9 @@ ROLLBACK;
 `BEGIN`を重ねても新しいtransactionは開始しない。
 明示transaction中にはDDLを実行できない。
 
+transaction が無い状態の `ROLLBACK` は何もしない（成功する）。
+`COMMIT` は `InternalError` になる。
+
 1 transactionの書き込みバッファ上限は256MiBである。
 超過時は `CapacityError`になる。
 
@@ -1139,12 +1142,16 @@ Closeだけは読み取り完了を待つ。
 - transaction内で同じ行を読み直すと、後続のcommitは見えない。
 - snapshot取得後に別transactionが先に同じキーをcommitした場合、
   自分のcommitは `ConflictError`になる。
-- 競合で COMMIT が失敗した transaction は自動的に rollback され、接続は自動コミット状態へ戻る。
-  同じ snapshot では再試行しても永久に競合するため、 transaction 全体を最初からやり直す。
+- 競合または書き込みバッファの上限超過で COMMIT が失敗した transaction は自動的に rollback され、
+  接続は自動コミット状態へ戻る。
+  同じ snapshot では再試行しても永久に競合し、上限は減らないため、transaction 全体を最初からやり直す。
 
 Snapshot Isolationは直列化可能ではない。
 2つのtransactionが同じ行を読み、それぞれ別の行を更新すると、
 両方commitできて「読んだ条件」を両方が破る状態（write skew）を作り得る。
+
+競合以外の理由（WALのI/Oなど）でCOMMITが失敗した場合、transactionは開いたまま残る。
+WALは書きかけの末尾を切り捨ててから再追記するため、同じtransactionをそのまま再COMMITできる。
 
 `BEGIN ISOLATION LEVEL`、`SET TRANSACTION`、`SAVEPOINT`、読み取り専用transactionは未対応。
 

@@ -435,19 +435,24 @@ finalizerは任意のスレッドで走り、`writeGate`で待つと他のオブ
 - 回帰: `DatabaseHost: 放棄された transaction は次の書き込みで manager から回収される` /
   `DatabaseHost: 生きている transaction は GC されても登録が残る`。
 
-### 5.12 競合した COMMIT は transaction を自動で捨てる
+### 5.12 commit できない COMMIT は transaction を自動で捨てる
 
-同じ snapshot のまま再 COMMIT しても永久に競合する。
-失敗した transaction を開いたまま残すと、`Begin`は「既にtransaction中」を返し、
+write-write競合や書き込みバッファの上限超過は、再COMMITしても成功しない
+（競合は同じsnapshotのまま、上限は減らない）。
+失敗したtransactionを開いたまま残すと、`Begin`は「既にtransaction中」を返し、
 以後の文は存在しないtransactionで走る。
 
-- ✅ `DatabaseHost.Commit`は`ConflictError`のとき`Engine.executeRollback`でabortし、
+- ✅ `DatabaseHost.Commit`は`ConflictError`/`CapacityError`のとき`Engine.executeRollback`でabortし、
   `CommitOutcome.RolledBack`を返す。
   `Session`はエラーでも接続ローカル状態を次へ進める。
 - ❌ `Commit`の失敗時に`local`を更新せず`Err`だけを返すと、接続とhostの状態がずれる。
 - 競合以外の失敗（WALのI/Oなど）ではtransactionを残す。
+  WALは`WalState.Size`で書きかけの末尾を切り捨てて再追記するため、同じtransactionを再COMMITできる
+  （回帰: `Wal.append: 書きかけの末尾を切り捨ててから追記する`）。
+- transactionが無い状態の`ROLLBACK`は何もしない（成功）。`COMMIT`だけがエラー。
 - 回帰: `SessionPool: 競合した COMMIT は transaction を自動的に rollback する` /
-  `SessionPool: SQL の COMMIT 競合でも transaction が閉じる`。
+  `SessionPool: SQL の COMMIT 競合でも transaction が閉じる` /
+  `DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollback する`。
 
 ---
 

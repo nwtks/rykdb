@@ -208,9 +208,10 @@ let ``SqlReference: SQL の BEGIN / COMMIT / ROLLBACK は受理される`` () =
         Assert.Equal<int>(1, res.Rows.Length)
         Assert.False db5.InTransaction
 
-        // transaction が無い状態の ROLLBACK はエラー（ライブラリ API と対称）
-        expectErrorKind ErrorKind.InternalError "transaction が無い ROLLBACK" (execSql db5 "ROLLBACK")
-        let _, after = ok (execSql db5 "SELECT id FROM t")
+        // transaction が無い状態の ROLLBACK は何もしない（後始末を失敗させない）
+        let db6, _ = ok (execSql db5 "ROLLBACK")
+        Assert.False db6.InTransaction
+        let _, after = ok (execSql db6 "SELECT id FROM t")
         Assert.Equal<int>(1, after.Rows.Length))
 
 [<Fact>]

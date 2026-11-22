@@ -199,6 +199,48 @@ let ``DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録
             ok (host.Close()) |> ignore)
 
 [<Fact>]
+let ``DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollback する`` () =
+    let root = "mem:" + System.Guid.NewGuid().ToString "N"
+    let store = openStoreWith "" (memoryEngine ())
+
+    let manager, txn =
+        TransactionManager.beginTxnWithLimit (Some 1L) (TransactionManager.create ())
+
+    let txn = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] txn
+
+    let host =
+        DatabaseHost(
+            root,
+            {
+                Root = root
+                Store = store
+                Catalog = Catalog.Empty
+                Manager = manager
+                DeferDurability = true
+            },
+            commitDurability = CommitDurability(fun _ -> ret ())
+        )
+
+    try
+        let local: TxnState =
+            {
+                CatalogAtBegin = Catalog.Empty
+                Active = Some txn
+                Pending = None
+                Lease = None
+            }
+
+        // 上限は減らないので、何度 COMMIT しても成功しない。競合と同じく abort する。
+        match host.Commit local with
+        | Ok(CommitOutcome.RolledBack(_, e), _) -> Assert.Equal(ErrorKind.CapacityError, e.Kind)
+        | Ok(CommitOutcome.Committed _, _) -> Assert.Fail "上限超過なのに commit できた"
+        | Error e -> Assert.Fail(sprintf "COMMIT が Error を返した: %A" e.Kind)
+
+        Assert.True(host.Committed.Manager.Active.IsEmpty)
+    finally
+        RowStore.close store |> ignore
+
+[<Fact>]
 let ``DatabaseHost: active transaction は snapshot registry に登録され、commit / rollback / Close で外れる`` () =
     withDbHost "reg-lifecycle" (fun host session ->
         let runtime = host.Committed.Store.Runtime

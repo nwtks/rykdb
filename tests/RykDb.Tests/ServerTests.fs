@@ -743,9 +743,8 @@ let ``Server: 接続間で write-write 競合を検出する`` () =
         | other -> failActual "競合エラーを期待しましたが" other
 
         // 競合した COMMIT は transaction を自動的に rollback する。
-        match clientB.Send "ROLLBACK" with
-        | Failure _ -> ()
-        | other -> failActual "transaction が無いので ROLLBACK はエラーになるはず" other
+        // 後始末の ROLLBACK は何もしない（成功）。
+        okRows (clientB.Send "ROLLBACK") |> ignore
 
         // 新しい transaction からやり直せる。
         okRows (clientB.Send "BEGIN") |> ignore

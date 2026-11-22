@@ -817,6 +817,10 @@ WAL追記が成功した時点でCOMMIT成立とする。
 その後のmemtable flushが失敗しても、WALから再生できるため`Error`にはせず、
 memtableを保持して次回再試行する。
 
+WAL追記が失敗した場合、engineの状態は進めない。
+次の追記は`WalState.Size`で書きかけの末尾を切り捨ててから書くため、
+同じtransactionを再COMMITできる。
+
 ### 7.6 Sessionのtransactionモデル
 
 `Session.Execute`は明示transactionがない場合、各文を暗黙transactionとして自動コミットする。
@@ -829,8 +833,10 @@ memtableを保持して次回再試行する。
 - BEGINは共有のTransactionManagerでtransactionを作る。
 - COMMITは競合検査と採番を行う。
 - ROLLBACKはバッファと予約だけを破棄する。
-- COMMITがwrite-write競合で失敗した場合、transactionをabortして接続をtransaction外へ戻す
-  （同じsnapshotでは再試行しても永久に競合するため。`CommitOutcome.RolledBack`）。
+- COMMITがwrite-write競合または書き込みバッファの上限超過で失敗した場合、
+  transactionをabortして接続をtransaction外へ戻す
+  （再試行してもcommitできないため。`CommitOutcome.RolledBack`）。
+- ROLLBACKはtransactionが無ければ何もしない（自動rollback済みでも後始末を失敗させない）。
 - 複数文のバッチは文ごとに実行し、成功した文の状態だけを残す。
 
 途中の文が失敗しても、それ以前に成功した文と明示transactionは失われない。

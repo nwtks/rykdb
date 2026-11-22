@@ -581,6 +581,9 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                         err e))
 
     /// ROLLBACK。
+    /// <remarks>
+    /// transaction が無い場合は何もしない（自動 rollback 済みでも後始末を失敗させない）。
+    /// </remarks>
     member _.Rollback() =
         lock writeGate (fun () ->
             match lock stateGate (fun () -> local) with
