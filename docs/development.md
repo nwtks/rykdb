@@ -24,6 +24,7 @@ dotnet build -t:Rebuild
 dotnet test
 dotnet tool restore
 dotnet fantomas src/ tests/ tools/
+dotnet run --project tools/UnusedAudit
 
 # CI と同じゲート。行カバレッジ 90%以上が必要。
 dotnet restore --locked-mode
@@ -72,6 +73,33 @@ dotnet build -t:Rebuild
 
 `dotnet build` と `dotnet test` は並行して実行しない。
 並行実行時の見かけ上のエラーは [`gotchas.md`](gotchas.md) §9.13 にある。
+
+### 未使用 private 宣言の監査
+
+F# コンパイラは未使用のローカル束縛（FS1182）しか検出しない。
+`let private`・private 型・private メンバーは検出しないため、
+`tools/UnusedAudit` が `src/` を監査する。
+
+```bash
+dotnet run --project tools/UnusedAudit              # 新規 0 件なら exit 0
+dotnet run --project tools/UnusedAudit -- --all     # 既知分も含めて全件表示
+dotnet run --project tools/UnusedAudit -- --update  # 内容確認後にベースラインを更新
+```
+
+検出対象は次のとおり。
+
+- module 直下の `let private`（値・関数）
+- `module private`
+- `type private`（DU はケース名、レコードはフィールド名の使用も型の使用とみなす）
+- `member private`、`member val private`、`val private`
+
+class 内の `let` は FS1182 が担当するため対象外（`--warnon:1182` で検出済み）。
+判定は同じファイル内の識別子トークンとの名前一致で行う。
+同名の別宣言が使われていれば「使用済み」とみなす（偽陽性を避ける）。
+
+リフレクション・シリアライズ等で意図的に残す宣言は、
+内容を確認してからベースライン（`tools/UnusedAudit/UnusedAudit.baseline`）へ追認する。
+演算子・アクティブパターン・private な union case / レコードフィールド・`.fsi`・`tests/` は対象外。
 
 ## 2. tail call 監査
 
@@ -334,6 +362,9 @@ compaction の出力削除は `IterationCleanup` の外側で行う。
 - [ ] `dotnet test` が全件成功（逐次実行）
 - [ ] `dotnet run --project tools/TailAudit` が exit 0
   - 新規の非末尾再帰がないこと。
+  - ベースラインに追認する項目は、更新前に内容を確認する。
+- [ ] `dotnet run --project tools/UnusedAudit` が exit 0
+  - 新規の未使用 private 宣言がないこと。
   - ベースラインに追認する項目は、更新前に内容を確認する。
 - [ ] 不変条件を追加または変更した場合は、[`invariants.md`](invariants.md) と対応テストを更新した
 - [ ] 構築に不変条件がある型は `.fsi` で表現を隠した

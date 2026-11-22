@@ -1,0 +1,2 @@
+# RykDb 未使用 private 監査ベースライン（dotnet run --project tools/UnusedAudit -- --update で再生成）
+# 形式: ファイル相対|種別|名前 — 行番号は含めない（行が動いても一致する）

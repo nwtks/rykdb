@@ -58,3 +58,6 @@ jobs:
 
       - name: TailAudit
         run: dotnet run --project tools/TailAudit
+
+      - name: UnusedAudit
+        run: dotnet run --project tools/UnusedAudit

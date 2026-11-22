@@ -92,35 +92,6 @@ module internal JoinOrder =
             |> List.tryHead
             |> Option.map snd
 
-    /// 両側の自然順が結合キーで揃っているか（マージ結合の可否）。
-    /// 右の走査順の先頭から、結合辺がある限り一致していれば良い。
-    let private canMergeJoin (ordered: string list option) (item: JoinOrderItem) (applicable: JoinOrderEdge list) =
-        match ordered, item.NaturalOrder with
-        | Some left, Some right ->
-            let rec loop i =
-                if i >= List.length right then
-                    true
-                else
-                    let rightColumn = right.[i]
-
-                    match
-                        applicable
-                        |> List.tryFind (fun e -> e.KeyColumns |> Map.tryFind item.Name = Some rightColumn)
-                    with
-                    | None -> i > 0
-                    | Some edge ->
-                        if
-                            i < List.length left
-                            && edge.KeyColumns
-                               |> Map.exists (fun name column -> name <> item.Name && SqlName.equal column left.[i])
-                        then
-                            loop (i + 1)
-                        else
-                            false
-
-            loop 0
-        | _ -> false
-
     /// まだ結合していないテーブルのうち、ON の参照先が揃っているか。
     let private eligible (dependencies: Map<string, Set<string>>) (joined: Set<string>) (name: string) =
         match dependencies |> Map.tryFind name with
