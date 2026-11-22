@@ -509,6 +509,44 @@ let ``Analyzer.estimateRowsWith: NULL 率と数値範囲を使う`` () =
     Assert.Equal(25.0, Analyzer.estimateRowsWith statsOf between)
 
 [<Fact>]
+let ``Analyzer.estimateRowsWith: 複合等値は索引 prefix NDV を使う`` () =
+    let statsOf name =
+        match name with
+        | "people" -> Some peopleStats
+        | "orders" ->
+            Some(
+                tableStats
+                    "orders"
+                    2000L
+                    [
+                        colStats "oid" 2000L 0L None None
+                        colStats "person_id" 100L 0L None None
+                        colStats "amount" 10L 0L None None
+                    ]
+                    [ idxStats "ix_person_amount" [ "person_id"; "amount" ] [ 100L; 20L ] ]
+            )
+        | _ -> None
+
+    let on =
+        Expr.Binary(
+            BinaryOp.And,
+            Expr.Binary(BinaryOp.Eq, pCol "id", oCol "person_id"),
+            Expr.Binary(BinaryOp.Eq, pCol "age", oCol "amount")
+        )
+
+    let join =
+        Logical.Join(
+            JoinKind.Inner,
+            "orders",
+            on,
+            Logical.Scan("people", ScanMethod.SeqScan),
+            Logical.Scan("orders", ScanMethod.SeqScan)
+        )
+
+    // 500 * 2000 / prefix NDV 20 = 50000（列 NDV の積なら 200）
+    Assert.Equal(50000.0, Analyzer.estimateRowsWith statsOf join)
+
+[<Fact>]
 let ``Analyzer.estimateRowsWith: ヒストグラムで範囲選択性を見る`` () =
     let histogram = List.replicate 90 0.0 @ List.replicate 10 100.0
 

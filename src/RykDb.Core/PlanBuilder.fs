@@ -124,14 +124,49 @@ module internal PlanBuilder =
         | _ -> Map.empty
 
     /// 結合順の候補を作る。
-    let private joinItem (binding: SourceBinding) (scan: Logical) (rows: float) (position: int) =
+    let private joinItem
+        (statsOf: string -> TableStats option)
+        (binding: SourceBinding)
+        (scan: Logical)
+        (rows: float)
+        (position: int)
+        =
         match binding with
         | Base tb ->
+            let indexStats name =
+                statsOf (bindingName binding)
+                |> Option.bind (fun stats ->
+                    stats.Indexes
+                    |> List.tryFind (fun (i: IndexStats) -> Catalog.eqName i.Name name))
+                |> Option.map _.PrefixNDV
+                |> Option.defaultValue []
+
             {
                 Name = (bindingName binding).ToLowerInvariant()
                 Rows = rows
                 Position = position
-                IndexColumns = tb.Schema.Indexes |> List.map _.Columns
+                Indexes =
+                    (let pkColumns = TableSchema.primaryKeyColumns tb.Schema |> List.ofArray
+
+                     if List.isEmpty pkColumns then
+                         []
+                     else
+                         [
+                             {
+                                 IndexName = "__pk"
+                                 IndexColumns = pkColumns
+                                 PrefixNDV = []
+                                 Unique = true
+                             }
+                         ])
+                    @ (tb.Schema.Indexes
+                       |> List.map (fun index ->
+                           {
+                               IndexName = index.Name
+                               IndexColumns = index.Columns
+                               PrefixNDV = indexStats index.Name
+                               Unique = index.Unique
+                           }))
                 RowBytes = rowBytesOfColumns (tb.Schema.Columns |> Seq.map (fun c -> Some c.DataType))
                 NaturalOrder = Analyzer.scanOrder (fun _ -> Some tb.Schema) scan
             }
@@ -140,7 +175,7 @@ module internal PlanBuilder =
                 Name = (bindingName binding).ToLowerInvariant()
                 Rows = rows
                 Position = position
-                IndexColumns = []
+                Indexes = []
                 RowBytes = rowBytesOfColumns (plan.Output.Columns |> Seq.map _.DataType)
                 NaturalOrder = None
             }
@@ -278,9 +313,9 @@ module internal PlanBuilder =
                 Logical.Join(kind, bindingName right, onAll, acc, scans.[rightIndex]),
                 Schema.concat accSchema rightSchema)
 
-        let equiLinks e =
-            Predicate.splitConjuncts e
-            |> List.choose (fun conjunct ->
+        let equiLinks =
+            Predicate.splitConjuncts
+            >> List.choose (fun conjunct ->
                 match conjunct with
                 | Expr.Binary(BinaryOp.Eq, a, b) ->
                     let qualifierOf x =
@@ -316,18 +351,64 @@ module internal PlanBuilder =
 
             List.rev take, used'
 
+        let rec apply bindings scans joinPredicates onPredicates unmovableOns byName acc accSchema joined used usedOns =
+            function
+            | [] -> ret (acc, accSchema, used)
+            | next :: tail ->
+                let index = byName |> Map.find next
+                let promotedWhere, used' = promoteAt joinPredicates joined used next
+
+                let promotedOns, usedOns' =
+                    onPredicates
+                    |> List.fold
+                        (fun (take, used) (i, refs, e) ->
+                            if not (Set.contains i used) && Set.isSubset refs (Set.add next joined) then
+                                e :: take, Set.add i used
+                            else
+                                take, used)
+                        ([], usedOns)
+
+                let ownOn =
+                    unmovableOns
+                    |> List.tryFind (fun (i, _) -> i = index)
+                    |> Option.map snd
+                    |> Option.toList
+
+                let on =
+                    Predicate.joinConjuncts (List.rev promotedOns @ promotedWhere @ ownOn)
+                    |> Option.defaultValue (Expr.Literal(Literal.Bool true))
+
+                match buildJoin bindings scans acc accSchema JoinKind.Inner index on [] with
+                | Ok(node, schema) ->
+                    apply
+                        bindings
+                        scans
+                        joinPredicates
+                        onPredicates
+                        unmovableOns
+                        byName
+                        node
+                        schema
+                        (Set.add next joined)
+                        used'
+                        usedOns'
+                        tail
+                | Error e -> err e
+
         let rec buildSteps
-            (bindings: SourceBinding list)
+            bindings
             scans
             (estimates: float array)
-            (estimate: Logical -> float)
-            (edgeSelectivity: Expr -> float option)
+            estimate
+            statsOf
+            edgeSelectivity
             joinPredicates
             acc
             accSchema
             joined
             used
             steps
+            allowFirstRelax
             =
             match steps with
             | [] -> ret (acc, accSchema, used)
@@ -339,6 +420,7 @@ module internal PlanBuilder =
                         scans
                         estimates
                         estimate
+                        statsOf
                         edgeSelectivity
                         joinPredicates
                         node
@@ -346,6 +428,7 @@ module internal PlanBuilder =
                         (Set.add (lowerName bindings.[index]) joined)
                         used
                         rest
+                        false
                 | Error e -> err e
             | _ ->
                 let inner = steps |> List.takeWhile (fun (_, j) -> j.Kind = JoinKind.Inner)
@@ -387,14 +470,35 @@ module internal PlanBuilder =
                                KeyColumns = equalityColumns p
                            }))
 
+                let onPredicates =
+                    qualifiedOns
+                    |> List.choose (fun (i, _, q) ->
+                        q
+                        |> Option.bind (fun e -> referencedTables e |> Option.map (fun refs -> i, refs, e)))
+
+                let unmovableOns =
+                    qualifiedOns
+                    |> List.choose (fun (i, _, q) ->
+                        match q with
+                        | Some e when (referencedTables e).IsNone -> Some(i, e)
+                        | _ -> None)
+
                 let dependencies =
                     qualifiedOns
                     |> List.map (fun (i, _, q) ->
                         q
-                        |> Option.bind referencedTables
-                        |> Option.map (fun refs -> lowerName bindings.[i], refs))
+                        |> Option.bind (fun e ->
+                            match referencedTables e with
+                            | Some _ -> Some(lowerName bindings.[i], Set.empty)
+                            | None -> None))
 
-                let order =
+                let workMemBytes =
+                    if ctx.Budget.Work >= 0L then
+                        float ctx.Budget.Work
+                    else
+                        -1.0
+
+                let normalOrder =
                     if dependencies |> List.forall Option.isSome then
                         let initialOrder =
                             match bindings with
@@ -405,12 +509,6 @@ module internal PlanBuilder =
 
                         let initialRowBytes = rowBytesOfColumns (accSchema.Columns |> Seq.map _.DataType)
 
-                        let workMemBytes =
-                            if ctx.Budget.Work >= 0L then
-                                float ctx.Budget.Work
-                            else
-                                -1.0
-
                         JoinOrder.choose
                             (estimate acc)
                             initialRowBytes
@@ -419,32 +517,96 @@ module internal PlanBuilder =
                             workMemBytes
                             edges
                             (inner
-                             |> List.map (fun (i, _) -> joinItem bindings.[i] scans.[i] estimates.[i] i))
+                             |> List.map (fun (i, _) -> joinItem statsOf bindings.[i] scans.[i] estimates.[i] i))
                             (dependencies |> List.choose id |> Map.ofList)
                     else
                         inner |> List.map (fun (i, _) -> lowerName bindings.[i])
 
-                let byName =
-                    inner |> List.map (fun (i, j) -> lowerName bindings.[i], (i, j)) |> Map.ofList
+                let normalByName =
+                    inner |> List.map (fun (i, _) -> lowerName bindings.[i], i) |> Map.ofList
 
-                let rec apply acc accSchema joined used order =
-                    match order with
-                    | [] -> ret (acc, accSchema, used)
-                    | next :: tail ->
-                        let index, clause = byName |> Map.find next
-                        let promoted, used' = promoteAt joinPredicates joined used next
+                let relaxedOrder =
+                    if allowFirstRelax && dependencies |> List.forall Option.isSome then
+                        let allTables = 0 :: (inner |> List.map fst)
 
-                        match buildJoin bindings scans acc accSchema JoinKind.Inner index clause.On promoted with
-                        | Ok(node, schema) -> apply node schema (Set.add next joined) used' tail
-                        | Error e -> err e
+                        let allByName =
+                            allTables |> List.map (fun i -> lowerName bindings.[i], i) |> Map.ofList
 
-                match apply acc accSchema joined used order with
+                        let allItems =
+                            allTables
+                            |> List.map (fun i -> joinItem statsOf bindings.[i] scans.[i] estimates.[i] i)
+
+                        let deps = dependencies |> List.choose id |> Map.ofList
+
+                        let candidates =
+                            allItems
+                            |> List.choose (fun firstItem ->
+                                let firstDeps = deps |> Map.tryFind firstItem.Name |> Option.defaultValue Set.empty
+
+                                if not (Set.isSubset firstDeps (Set.singleton firstItem.Name)) then
+                                    None
+                                else
+                                    let rest = allItems |> List.filter (fun item -> item.Name <> firstItem.Name)
+
+                                    JoinOrder.selingerPlan
+                                        firstItem.Rows
+                                        firstItem.RowBytes
+                                        (Set.singleton firstItem.Name)
+                                        firstItem.NaturalOrder
+                                        workMemBytes
+                                        edges
+                                        rest
+                                        deps
+                                    |> Option.map (fun plan -> plan.Cost, firstItem.Name :: plan.Order))
+
+                        match candidates with
+                        | [] -> None
+                        | _ ->
+                            let order = candidates |> List.minBy fst |> snd
+                            let firstIndex = allByName |> Map.find (List.head order)
+                            Some(firstIndex, order, allByName)
+                    else
+                        None
+
+                let applied =
+                    match relaxedOrder with
+                    | Some(firstIndex, order, byName) ->
+                        apply
+                            bindings
+                            scans
+                            joinPredicates
+                            onPredicates
+                            unmovableOns
+                            byName
+                            scans.[firstIndex]
+                            (bindingSchema bindings.[firstIndex])
+                            (Set.singleton (lowerName bindings.[firstIndex]))
+                            used
+                            Set.empty
+                            (List.tail order)
+                    | None ->
+                        apply
+                            bindings
+                            scans
+                            joinPredicates
+                            onPredicates
+                            unmovableOns
+                            normalByName
+                            acc
+                            accSchema
+                            joined
+                            used
+                            Set.empty
+                            normalOrder
+
+                match applied with
                 | Ok(node, schema, used') ->
                     buildSteps
                         bindings
                         scans
                         estimates
                         estimate
+                        statsOf
                         edgeSelectivity
                         joinPredicates
                         node
@@ -452,6 +614,7 @@ module internal PlanBuilder =
                         (Set.union joined (Set.ofList (inner |> List.map (fun (i, _) -> lowerName bindings.[i]))))
                         used'
                         restSteps
+                        false
                 | Error e -> err e
 
         let aggregateTree schema stmt tree =
@@ -721,20 +884,23 @@ module internal PlanBuilder =
                     match bindings with
                     | [] -> ret (Logical.Values [||], Set.empty)
                     | first :: _ ->
-                        stmt.Joins
-                        |> List.indexed
-                        |> List.map (fun (i, j) -> i + 1, j)
-                        |> buildSteps
+                        let steps = stmt.Joins |> List.indexed |> List.map (fun (i, j) -> i + 1, j)
+                        let allowFirstRelax = stmt.Joins |> List.forall (fun j -> j.Kind = JoinKind.Inner)
+
+                        buildSteps
                             bindings
                             scans'
                             estimates
                             (Analyzer.estimateRowsWith statsOf)
+                            statsOf
                             (Analyzer.equalitySelectivity statsOf)
                             joinPredicates'
                             scans'.[0]
                             (bindingSchema first)
                             (Set.singleton (lowerName first))
                             Set.empty
+                            steps
+                            allowFirstRelax
                         |> Result.map (fun (tree, _, used) -> tree, used)
 
                 let remaining =

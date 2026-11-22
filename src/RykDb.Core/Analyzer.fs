@@ -305,6 +305,7 @@ module internal Analyzer =
 
     /// 等値結合の選択性。
     /// 統計が欠けている等値は既定の 0.1 で穴埋めする。
+    /// 同じテーブル対の複合等値は、索引 prefix NDV があればそれを使う。
     let private joinSelectivity (statsOf: string -> TableStats option) (on: Expr) =
         let equalities =
             Predicate.splitConjuncts on
@@ -316,11 +317,98 @@ module internal Analyzer =
                     | _ -> None
                 | _ -> None)
 
-        if List.isEmpty equalities then
+        let sameSet a b =
+            List.length a = List.length b
+            && a |> List.forall (fun x -> b |> List.exists (SqlName.equal x))
+
+        let statsFor table name =
+            statsOf table
+            |> Option.bind (fun stats ->
+                stats.Columns
+                |> List.tryFind (fun c -> SqlName.equal c.Name name)
+                |> Option.map (fun c -> stats, c))
+
+        let prefixNdv table (names: string list) =
+            statsOf table
+            |> Option.bind (fun stats ->
+                stats.Indexes
+                |> List.tryPick (fun index ->
+                    let prefix = List.truncate names.Length index.Columns
+
+                    if List.length prefix = names.Length && sameSet prefix names then
+                        index.PrefixNDV |> List.tryItem (names.Length - 1)
+                    else
+                        None))
+
+        let groupSelectivity (leftTable, rightTable) items =
+            let leftNames = items |> List.map fst
+            let rightNames = items |> List.map snd
+
+            let nullFactor =
+                let factors =
+                    (leftNames
+                     |> List.choose (fun name ->
+                         statsFor leftTable name
+                         |> Option.map (fun (stats, column) -> 1.0 - nullRate stats column)))
+                    @ (rightNames
+                       |> List.choose (fun name ->
+                           statsFor rightTable name
+                           |> Option.map (fun (stats, column) -> 1.0 - nullRate stats column)))
+
+                if List.length factors = List.length leftNames + List.length rightNames then
+                    Some(factors |> List.fold (*) 1.0)
+                else
+                    None
+
+            let indexNdv =
+                [ prefixNdv leftTable leftNames; prefixNdv rightTable rightNames ]
+                |> List.choose id
+                |> List.sortDescending
+                |> List.tryHead
+
+            match nullFactor, indexNdv with
+            | Some nullFactor, Some ndv when ndv > 0L -> Some(nullFactor / float ndv)
+            | _ ->
+                let perColumn =
+                    List.zip leftNames rightNames
+                    |> List.map (fun (leftName, rightName) ->
+                        match statsFor leftTable leftName, statsFor rightTable rightName with
+                        | Some(sa, ca), Some(sb, cb) when ca.NDV > 0L && cb.NDV > 0L ->
+                            Some((1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV))
+                        | _ -> None)
+
+                if perColumn |> List.forall Option.isSome then
+                    Some(perColumn |> List.choose id |> List.fold (*) 1.0)
+                else
+                    let known = perColumn |> List.choose id
+                    let unknown = perColumn |> List.filter Option.isNone |> List.length
+
+                    if List.isEmpty known then
+                        None
+                    else
+                        Some((known |> List.fold (*) 1.0) * (0.1 ** float unknown))
+
+        let groups =
+            equalities
+            |> List.choose (fun conjunct ->
+                match conjunct with
+                | Expr.Binary(BinaryOp.Eq, a, b) ->
+                    match Schema.tryAsColumnRef a, Schema.tryAsColumnRef b with
+                    | Some ca, Some cb ->
+                        match ca.Qualifier, cb.Qualifier with
+                        | Some qa, Some qb when not (Catalog.eqName qa qb) ->
+                            Some((qa.ToLowerInvariant(), qb.ToLowerInvariant()), (ca.Name, cb.Name))
+                        | _ -> None
+                    | _ -> None
+                | _ -> None)
+            |> List.groupBy fst
+            |> List.map (fun (pair, items) -> pair, items |> List.map snd)
+
+        if List.isEmpty groups then
             None
         else
             let estimated =
-                equalities |> List.map (fun conjunct -> equalitySelectivity statsOf conjunct)
+                groups |> List.map (fun (pair, items) -> groupSelectivity pair items)
 
             if estimated |> List.forall Option.isNone then
                 None

@@ -453,13 +453,13 @@ let ``PlanBuilder.buildLogicalWith: INNER の結合順は選択性の高いテ�
 
         match tree with
         | Logical.Project(_, Logical.Join(JoinKind.Inner, right, _, left, _)) ->
-            // 外側（最後）が orders、内側に xtra が入る
+            // 外側（最後）が orders、内側は xtra を先に積んで people を結合する
             Assert.Equal<string>("orders", right)
 
             match left with
             | Logical.Join(JoinKind.Inner, inner, _, Logical.Scan(first, _), _) ->
-                Assert.Equal<string>("xtra", inner)
-                Assert.Equal<string>("people", first)
+                Assert.Equal<string>("people", inner)
+                Assert.Equal<string>("xtra", first)
             | _ -> failActual "想定外の左部分木" left
         | _ -> failActual "想定外の形" tree)
 
