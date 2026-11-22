@@ -279,6 +279,8 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
 - `Join4TablesSparseDp`、`Join4TablesSparseGreedy`、`Join4TablesDenseDp`、`Join4TablesDenseGreedy`:
   parse / plan を除き、DP と貪欲の計画を実行して比べる。
   `Session.PrepareSelectWith(JoinOrderStrategy.Greedy, stmt)` で貪欲計画を作る。
+- `Join4TablesSparseNoStats`、`Join4TablesDenseNoStats`:
+  同じ形・同じ行数で `ANALYZE` していないテーブル（`k1..k4`）を使い、統計ありとの差を測る。
 - `DistinctSpill`、`GroupBySpill`、`Join3TablesSpill`、`JoinByValueSpill`、`SortSpill`:
   作業メモリを1バイトにして退避経路を強制する（`--class spill`）。
   通常経路の同名シナリオと比較する。

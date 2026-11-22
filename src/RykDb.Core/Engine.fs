@@ -1485,6 +1485,7 @@ module internal Engine =
                             "nulls"
                             "ranges"
                             "indexes"
+                            "histograms"
                             "analyzed_at"
                         |]
 
@@ -1516,6 +1517,12 @@ module internal Engine =
                                 SqlValue.Text(
                                     s.Indexes
                                     |> List.map (fun i -> sprintf "%s=%A" i.Name i.PrefixNDV)
+                                    |> String.concat ","
+                                )
+                                SqlValue.Text(
+                                    s.Columns
+                                    |> List.filter (fun c -> not (List.isEmpty c.Histogram))
+                                    |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Histogram))
                                     |> String.concat ","
                                 )
                                 SqlValue.Text(

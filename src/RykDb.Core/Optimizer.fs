@@ -868,8 +868,28 @@ module internal Optimizer =
                         on
 
                 let algorithmTextValue =
-                    match algorithm, hashBuildSide statsOf algorithm kind left right with
+                    let buildSide = hashBuildSide statsOf algorithm kind left right
+
+                    match algorithm, buildSide with
                     | JoinAlgorithm.HashJoin, HashBuildLeft -> "HashJoin(left)"
+                    | JoinAlgorithm.HashJoin, HashBuildRight ->
+                        let buildSchema =
+                            if buildSide = HashBuildLeft then
+                                leftSchema
+                            else
+                                rightSchema
+
+                        let buildRows =
+                            min (Analyzer.estimateRowsWith statsOf left) (Analyzer.estimateRowsWith statsOf right)
+
+                        let buildBytes = buildRows * Analyzer.rowBytesOfSchema buildSchema
+                        let work = item.Context.Budget.Work
+
+                        if work >= 0L && buildBytes > float work then
+                            sprintf "HashJoin(spill=%.0fKB)" (buildBytes / 1024.0)
+                        else
+                            "HashJoin"
+
                     | _ -> algorithmText algorithm
 
                 let text =

@@ -240,6 +240,15 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 - 集約していない列は置換後も残り、スロット専用スキーマの`checkPrepared`が`NameError`にする。
 - 回帰: `SqlReference: ORDER BY は集約式・集約の別名・序数・GROUP BY 式で並べ替えられる`。
 
+### 3.20 LEFT JOIN を跨ぐ INNER の繰り上げは ON の参照で決める
+
+`LEFT JOIN`より後ろのINNERを前へ動かせるのは、ONの参照がその`LEFT JOIN`より前の表だけで閉じているときだけ。
+左行の出現回数は変わらないが、`LEFT`の右を見るONを動かすと`NULL`拡張の前後で一致判定が変わる。
+`PlanBuilder.hoistAcrossLeft`は、先頭INNER区間を種にして参照が閉じたものだけを繰り上げ、残りは元の順に並べ直す。
+直積になるINNER（先頭区間を1つも参照しないON）も繰り上げない。
+回帰: `SqlReference: LEFT JOIN を跨ぐ INNER は LEFT より前に繰り上げる` /
+`SqlReference: LEFT の右を参照する INNER は繰り上げない`。
+
 ---
 
 ## 4. LSM・WAL・MANIFEST
@@ -1044,6 +1053,9 @@ JOINのONは、並べ替え用の解析で`Binder.qualify`が失敗しても述�
 - [ ] 結合順の DP / 貪欲を切り替えても、同じ SQL の結果が変わらないか（A/B 回帰）
 - [ ] DP の interesting orders は「INL は左順を保つ・マージはキー順・ハッシュは順序なし」を守っているか
 - [ ] 右が結合の部分木（bushy）のとき INL を選ばず、`outputOf` でスキーマを求めているか
+- [ ] bushy の分割は両側が依存関係で閉じ、結合述語が跨るときだけ使っているか
+- [ ] bushy で使わなかった述語を Filter として残しているか
+- [ ] LEFT を跨いで INNER を繰り上げるのは、ON の参照が先頭区間で閉じるときだけか
 - [ ] 統計の旧形式（prefix のみ・tag 1）を既定値で読めるか（新フィールド追加時に壊さないか）
 - [ ] `EXPLAIN` の `rows=` / `sel=` は統計があるときだけ付くか（無い場合の表示を変えないか）
 - [ ] 真偽の解釈（WHERE / NOT / AND / OR / CASE / IS TRUE）を同じ関数に揃えているか

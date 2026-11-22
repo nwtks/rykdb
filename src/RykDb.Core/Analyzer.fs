@@ -303,6 +303,30 @@ module internal Analyzer =
             | _ -> None
         | _ -> None
 
+    /// 型ごとの管理メモリ概算（バイト）。
+    let dataTypeBytes =
+        function
+        | DataType.Boolean -> 1
+        | DataType.Integer -> 8
+        | DataType.Real -> 8
+        | DataType.Decimal -> 16
+        | DataType.Date -> 4
+        | DataType.Timestamp -> 8
+        | DataType.Uuid -> 16
+        | DataType.Text -> 32
+        | DataType.Blob -> 32
+        | DataType.Null -> 0
+
+    /// 1行の管理メモリ概算（行ヘッダ + 列の型別サイズ）。型が不明な列は 16 バイト。
+    let rowBytesOfTypes (types: DataType option seq) =
+        24.0
+        + (types
+           |> Seq.sumBy (fun dt -> float (dt |> Option.map dataTypeBytes |> Option.defaultValue 16)))
+
+    /// スキーマ 1行の管理メモリ概算。
+    let rowBytesOfSchema (schema: Schema) =
+        rowBytesOfTypes (schema.Columns |> Seq.map _.DataType)
+
     /// 等値結合の選択性。
     /// 統計が欠けている等値は既定の 0.1 で穴埋めする。
     /// 同じテーブル対の複合等値は、索引 prefix NDV があればそれを使う。

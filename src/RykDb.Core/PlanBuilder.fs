@@ -90,26 +90,6 @@ module internal PlanBuilder =
         | Base b -> Some b.Schema
         | DerivedSource _ -> None
 
-    /// 型ごとの概算バイト数。
-    let private dataTypeBytes =
-        function
-        | DataType.Boolean -> 1
-        | DataType.Integer -> 8
-        | DataType.Real -> 8
-        | DataType.Decimal -> 16
-        | DataType.Date -> 4
-        | DataType.Timestamp -> 8
-        | DataType.Uuid -> 16
-        | DataType.Text -> 32
-        | DataType.Blob -> 32
-        | DataType.Null -> 0
-
-    /// 1行の管理メモリ概算（行ヘッダ + 列の型別サイズ）。
-    let private rowBytesOfColumns (columns: DataType option seq) =
-        24.0
-        + (columns
-           |> Seq.sumBy (fun dt -> float (dt |> Option.map dataTypeBytes |> Option.defaultValue 16)))
-
     /// 等値述語の両側のテーブル名 -> 列名。
     let private equalityColumns =
         function
@@ -167,7 +147,7 @@ module internal PlanBuilder =
                                PrefixNDV = indexStats index.Name
                                Unique = index.Unique
                            }))
-                RowBytes = rowBytesOfColumns (tb.Schema.Columns |> Seq.map (fun c -> Some c.DataType))
+                RowBytes = Analyzer.rowBytesOfTypes (tb.Schema.Columns |> Seq.map (fun c -> Some c.DataType))
                 NaturalOrder = Analyzer.scanOrder (fun _ -> Some tb.Schema) scan
             }
         | DerivedSource(_, plan) ->
@@ -176,7 +156,7 @@ module internal PlanBuilder =
                 Rows = rows
                 Position = position
                 Indexes = []
-                RowBytes = rowBytesOfColumns (plan.Output.Columns |> Seq.map _.DataType)
+                RowBytes = Analyzer.rowBytesOfTypes (plan.Output.Columns |> Seq.map _.DataType)
                 NaturalOrder = None
             }
 
@@ -197,6 +177,102 @@ module internal PlanBuilder =
                     sprintf "%s は 0 以上の整数で指定してください" what
                     |> DbError.create ErrorKind.SyntaxError
                     |> err
+
+    /// bushy 木の畳み込みに使う入力（束縛・走査・述語）。
+    type private BushyEnv =
+        {
+            Bindings: SourceBinding list
+            Scans: Logical array
+            ByName: Map<string, int>
+            OnPredicates: (int * Set<string> * Expr) array
+            JoinPredicates: (Set<string> * Expr) array
+        }
+
+    /// bushy 木の畳み込み結果（部分木・出力スキーマ・名前集合・取り込み済み述語）。
+    type private BushyNode =
+        {
+            Tree: Logical
+            Schema: Schema
+            Names: Set<string>
+            UsedOn: Set<int>
+            UsedWhere: Set<int>
+        }
+
+    /// 左右の部分木を結合し、両方を参照する述語を ON に取り込む。
+    let private joinBushy (env: BushyEnv) (left: BushyNode) (right: BushyNode) (rightName: string) =
+        let both = Set.union left.Names right.Names
+
+        let crosses refs =
+            Set.isSubset refs both
+            && not (Set.isEmpty (Set.intersect refs left.Names))
+            && not (Set.isEmpty (Set.intersect refs right.Names))
+
+        let ons, usedOn =
+            env.OnPredicates
+            |> Array.fold
+                (fun (take, used) (k, refs, e) ->
+                    if not (Set.contains k used) && crosses refs then
+                        e :: take, Set.add k used
+                    else
+                        take, used)
+                ([], right.UsedOn)
+
+        let wheres, usedWhere =
+            env.JoinPredicates
+            |> Array.indexed
+            |> Array.fold
+                (fun (take, used) (k, (refs, p)) ->
+                    if not (Set.contains k used) && crosses refs then
+                        p :: take, Set.add k used
+                    else
+                        take, used)
+                ([], right.UsedWhere)
+
+        let on =
+            Predicate.joinConjuncts (List.rev wheres @ List.rev ons)
+            |> Option.defaultValue (Expr.Literal(Literal.Bool true))
+
+        {
+            Tree = Logical.Join(JoinKind.Inner, rightName, on, left.Tree, right.Tree)
+            Schema = Schema.concat left.Schema right.Schema
+            Names = both
+            UsedOn = usedOn
+            UsedWhere = usedWhere
+        }
+
+    /// bushy 木を後行順に畳む（CPS）。
+    /// 自己再帰は継続の末尾呼び出しだけなので、木の深さにスタックは依存しない。
+    /// 右部分木への再帰は継続ラムダの中で、監査上は非末尾として扱われる。
+    [<TailCall>]
+    let rec private foldBushy
+        (env: BushyEnv)
+        (tree: JoinOrderTree)
+        (usedOn: Set<int>)
+        (usedWhere: Set<int>)
+        (k: BushyNode -> Result<'r, DbError>)
+        =
+        match tree with
+        | JoinOrderTree.Leaf name ->
+            match env.ByName |> Map.tryFind name with
+            | None -> err (DbError.internalError "bushy 計画の葉が FROM / JOIN の別名に対応しません")
+            | Some index ->
+                {
+                    Tree = env.Scans.[index]
+                    Schema = bindingSchema env.Bindings.[index]
+                    Names = Set.singleton name
+                    UsedOn = usedOn
+                    UsedWhere = usedWhere
+                }
+                |> k
+        | JoinOrderTree.Branch(l, r) ->
+            foldBushy env l usedOn usedWhere (fun left ->
+                foldBushy env r left.UsedOn left.UsedWhere (fun right ->
+                    let rightName =
+                        match r with
+                        | JoinOrderTree.Leaf n -> n
+                        | JoinOrderTree.Branch _ -> ""
+
+                    joinBushy env left right rightName |> k))
 
     /// SELECT 文を論理代数に変換する。
     /// `derived` は計画済みの派生テーブル（別名の小文字 -> 計画）。
@@ -404,6 +480,45 @@ module internal PlanBuilder =
                             tail
                     | Error e -> err e
 
+        let rec grow nameOf ready accepted pending =
+            let fits, waiting =
+                pending
+                |> List.partition (fun ((i, _), refs) ->
+                    Set.isSubset refs (Set.add (nameOf i) ready)
+                    && not (Set.isEmpty (Set.intersect refs ready)))
+
+            match fits with
+            | [] -> accepted
+            | _ ->
+                let ready' = fits |> List.fold (fun s ((i, _), _) -> Set.add (nameOf i) s) ready
+                grow nameOf ready' (accepted @ (fits |> List.map fst)) waiting
+
+        let hoistAcrossLeft bindings (steps: (int * JoinClause) list) =
+            let leading = steps |> List.takeWhile (fun (_, j) -> j.Kind = JoinKind.Inner)
+            let rest = steps |> List.skipWhile (fun (_, j) -> j.Kind = JoinKind.Inner)
+
+            if List.isEmpty rest || List.isEmpty bindings then
+                steps
+            else
+                let nameOf i = lowerName bindings.[i]
+
+                let accepted =
+                    rest
+                    |> List.choose (fun (i, j) ->
+                        match referencedTables j.On with
+                        | Some refs when j.Kind = JoinKind.Inner -> Some((i, j), refs)
+                        | _ -> None)
+                    |> grow nameOf (Set.ofList (nameOf 0 :: (leading |> List.map (fun (i, _) -> nameOf i)))) []
+
+                if List.isEmpty accepted then
+                    steps
+                else
+                    let hoisted = accepted |> List.map fst |> Set.ofList
+
+                    leading
+                    @ accepted
+                    @ (rest |> List.filter (fun (i, _) -> not (Set.contains i hoisted)))
+
         let rec buildSteps
             bindings
             scans
@@ -513,7 +628,8 @@ module internal PlanBuilder =
                                 |> Option.bind (fun schema -> Analyzer.scanOrder (fun _ -> Some schema) acc)
                             | [] -> None
 
-                        let initialRowBytes = rowBytesOfColumns (accSchema.Columns |> Seq.map _.DataType)
+                        let initialRowBytes =
+                            Analyzer.rowBytesOfTypes (accSchema.Columns |> Seq.map _.DataType)
 
                         let items =
                             inner
@@ -533,6 +649,16 @@ module internal PlanBuilder =
                                 items
                                 deps
                         | JoinOrderStrategy.Greedy -> JoinOrder.greedy (estimate acc) joined edges items deps
+                        | JoinOrderStrategy.Bushy ->
+                            JoinOrder.choose
+                                (estimate acc)
+                                initialRowBytes
+                                joined
+                                initialOrder
+                                workMemBytes
+                                edges
+                                items
+                                deps
                     else
                         inner |> List.map (fun (i, _) -> lowerName bindings.[i])
 
@@ -589,36 +715,100 @@ module internal PlanBuilder =
                     else
                         None
 
+                let bushyApplied =
+                    if
+                        ctx.JoinOrder = JoinOrderStrategy.Bushy
+                        && joined = Set.singleton (lowerName bindings.[0])
+                        && not (List.isEmpty inner)
+                        && List.isEmpty unmovableOns
+                        && dependencies |> List.forall Option.isSome
+                    then
+                        let allTables = 0 :: (inner |> List.map fst)
+
+                        let allByName =
+                            allTables |> List.map (fun i -> lowerName bindings.[i], i) |> Map.ofList
+
+                        let allItems =
+                            allTables
+                            |> List.map (fun i -> joinItem statsOf bindings.[i] scans.[i] estimates.[i] i)
+
+                        let deps =
+                            (lowerName bindings.[0], Set.empty) :: (dependencies |> List.choose id)
+                            |> Map.ofList
+
+                        match JoinOrder.bushyPlan workMemBytes edges allItems deps with
+                        | None -> None
+                        | Some tree ->
+                            let onPredicatesArr = onPredicates |> Array.ofList
+
+                            let env =
+                                {
+                                    Bindings = bindings
+                                    Scans = scans
+                                    ByName = allByName
+                                    OnPredicates = onPredicatesArr
+                                    JoinPredicates = joinPredicates
+                                }
+
+                            match foldBushy env tree Set.empty Set.empty ret with
+                            | Error e -> Some(Error e)
+                            | Ok node ->
+                                let leftoverOn =
+                                    onPredicatesArr
+                                    |> Array.indexed
+                                    |> Array.choose (fun (k, (_, _, e)) ->
+                                        if Set.contains k node.UsedOn then None else Some e)
+                                    |> Array.toList
+
+                                let leftoverWhere =
+                                    joinPredicates
+                                    |> Array.indexed
+                                    |> Array.choose (fun (k, (_, p)) ->
+                                        if Set.contains k node.UsedWhere then None else Some p)
+                                    |> Array.toList
+
+                                let finalTree =
+                                    match Predicate.joinConjuncts (leftoverOn @ leftoverWhere) with
+                                    | None -> node.Tree
+                                    | Some p -> Logical.Filter(p, node.Tree)
+
+                                Some(Ok(finalTree, node.Schema, node.UsedWhere))
+                    else
+                        None
+
                 let applied =
-                    match relaxedOrder with
-                    | Some(firstIndex, order, byName) ->
-                        apply
-                            bindings
-                            scans
-                            joinPredicates
-                            onPredicates
-                            unmovableOns
-                            byName
-                            scans.[firstIndex]
-                            (bindingSchema bindings.[firstIndex])
-                            (Set.singleton (lowerName bindings.[firstIndex]))
-                            used
-                            Set.empty
-                            (List.tail order)
+                    match bushyApplied with
+                    | Some result -> result
                     | None ->
-                        apply
-                            bindings
-                            scans
-                            joinPredicates
-                            onPredicates
-                            unmovableOns
-                            normalByName
-                            acc
-                            accSchema
-                            joined
-                            used
-                            Set.empty
-                            normalOrder
+                        match relaxedOrder with
+                        | Some(firstIndex, order, byName) ->
+                            apply
+                                bindings
+                                scans
+                                joinPredicates
+                                onPredicates
+                                unmovableOns
+                                byName
+                                scans.[firstIndex]
+                                (bindingSchema bindings.[firstIndex])
+                                (Set.singleton (lowerName bindings.[firstIndex]))
+                                used
+                                Set.empty
+                                (List.tail order)
+                        | None ->
+                            apply
+                                bindings
+                                scans
+                                joinPredicates
+                                onPredicates
+                                unmovableOns
+                                normalByName
+                                acc
+                                accSchema
+                                joined
+                                used
+                                Set.empty
+                                normalOrder
 
                 match applied with
                 | Ok(node, schema, used') ->
@@ -903,7 +1093,12 @@ module internal PlanBuilder =
                     match bindings with
                     | [] -> ret (Logical.Values [||], Set.empty)
                     | first :: _ ->
-                        let steps = stmt.Joins |> List.indexed |> List.map (fun (i, j) -> i + 1, j)
+                        let steps =
+                            stmt.Joins
+                            |> List.indexed
+                            |> List.map (fun (i, j) -> i + 1, j)
+                            |> hoistAcrossLeft bindings
+
                         let allowFirstRelax = stmt.Joins |> List.forall (fun j -> j.Kind = JoinKind.Inner)
 
                         buildSteps

@@ -83,6 +83,13 @@ type QueryBenchmarks() =
     let join4DenseSql =
         "SELECT COUNT(*) FROM j1 JOIN j2 ON j1.id = j2.id JOIN j3 ON j2.id = j3.id JOIN j4 ON j3.id = j4.id"
 
+    // 同じ形・同じ行数で、ANALYZE していないテーブル（統計あり / なしの比較用）。
+    let join4SparseNoStatsSql =
+        "SELECT COUNT(*) FROM k1 JOIN k2 ON TRUE JOIN k3 ON TRUE JOIN k4 ON k3.id = k4.id"
+
+    let join4DenseNoStatsSql =
+        "SELECT COUNT(*) FROM k1 JOIN k2 ON k1.id = k2.id JOIN k3 ON k2.id = k3.id JOIN k4 ON k3.id = k4.id"
+
     let residualJoinSql =
         "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id AND a.v + b.v > 190"
     // 結果は 0行。ON 句だけを 200 × 20,000回評価する（出力行の割当を除く）。
@@ -133,6 +140,10 @@ type QueryBenchmarks() =
         this.Exec "CREATE TABLE j2 (id INTEGER PRIMARY KEY, v INTEGER)"
         this.Exec "CREATE TABLE j3 (id INTEGER PRIMARY KEY, v INTEGER)"
         this.Exec "CREATE TABLE j4 (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE k1 (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE k2 (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE k3 (id INTEGER PRIMARY KEY, v INTEGER)"
+        this.Exec "CREATE TABLE k4 (id INTEGER PRIMARY KEY, v INTEGER)"
 
         this.Seed("t", 10_000, 99_999, fun i -> sprintf "(%d, %d, '%s')" i (i % 1000) (BenchText.ofInt i))
         this.Seed("a", 5_000, 19_999, fun i -> sprintf "(%d, %d)" i (i % 100))
@@ -142,6 +153,10 @@ type QueryBenchmarks() =
         this.Seed("j2", 10, 99, fun i -> sprintf "(%d, %d)" i i)
         this.Seed("j3", 10, 9, fun i -> sprintf "(%d, %d)" i i)
         this.Seed("j4", 10, 9, fun i -> sprintf "(%d, %d)" i i)
+        this.Seed("k1", 10, 0, fun _ -> "(1, 1)")
+        this.Seed("k2", 10, 99, fun i -> sprintf "(%d, %d)" i i)
+        this.Seed("k3", 10, 9, fun i -> sprintf "(%d, %d)" i i)
+        this.Seed("k4", 10, 9, fun i -> sprintf "(%d, %d)" i i)
         this.Exec "ANALYZE j1"
         this.Exec "ANALYZE j2"
         this.Exec "ANALYZE j3"
@@ -292,6 +307,14 @@ type QueryBenchmarks() =
     /// 全テーブルが結合述語で繋がる密な 4テーブル JOIN。
     [<Benchmark>]
     member this.Join4TablesDense() = this.Exec join4DenseSql
+
+    /// 疎な 4テーブル JOIN を統計なしのテーブルで実行する（統計ありとの比較用）。
+    [<Benchmark>]
+    member this.Join4TablesSparseNoStats() = this.Exec join4SparseNoStatsSql
+
+    /// 密な 4テーブル JOIN を統計なしのテーブルで実行する（統計ありとの比較用）。
+    [<Benchmark>]
+    member this.Join4TablesDenseNoStats() = this.Exec join4DenseNoStatsSql
 
     /// 計画済みの 4テーブル JOIN を実行する（parse / plan を含めない）。
     /// DP と貪欲の差はこの 4 つを比べる。

@@ -2,10 +2,12 @@ namespace RykDb.Core
 
 /// INNER 結合区間の並べ替え戦略。
 /// `Greedy` は診断・A/B 用で、既定は `Dp`。
+/// `Bushy` は1段の分割計画も試す。
 [<RequireQualifiedAccess>]
 type internal JoinOrderStrategy =
     | Dp
     | Greedy
+    | Bushy
 
 /// 実行時文脈。
 /// 演算子はこれを「作る時点」に確定させる。

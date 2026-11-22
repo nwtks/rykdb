@@ -7,6 +7,12 @@ namespace RykDb.Core
 /// DP の結果（順序とコスト）。
 type internal JoinOrderPlan = { Order: string list; Cost: float }
 
+/// bushy 計画の木（葉はテーブル名、節は結合）。
+[<RequireQualifiedAccess>]
+type internal JoinOrderTree =
+    | Leaf of string
+    | Branch of left: JoinOrderTree * right: JoinOrderTree
+
 /// 結合順の INL 候補索引。
 type internal JoinOrderIndex =
     {
@@ -286,6 +292,215 @@ module internal JoinOrder =
         |> List.sortBy (fun s -> s.Cost)
         |> List.truncate maxOrders
 
+    /// 初期状態から部分集合ごとの状態リストを埋める（左深 DP の本体）。
+    let private dpCore
+        (itemArray: JoinOrderItem array)
+        (edges: JoinOrderEdge list)
+        (dependencies: Map<string, Set<string>>)
+        (workMemBytes: float)
+        (initialJoined: Set<string>)
+        (startMask: int)
+        (initial: PlanState)
+        =
+        let fullMask = (1 <<< itemArray.Length) - 1
+        let maxOrdersPerMask = 8
+
+        let joinedOf mask =
+            let names =
+                itemArray
+                |> Array.indexed
+                |> Array.choose (fun (i, item) -> if mask &&& (1 <<< i) <> 0 then Some item.Name else None)
+                |> Array.toList
+
+            Set.union initialJoined (Set.ofList names)
+
+        seq { 0..fullMask }
+        |> Seq.fold
+            (fun states mask ->
+                match states |> Map.tryFind mask with
+                | None -> states
+                | Some stateList ->
+                    let joined = joinedOf mask
+
+                    stateList
+                    |> List.fold
+                        (fun states state ->
+                            itemArray
+                            |> Array.indexed
+                            |> Array.fold
+                                (fun states (i, item) ->
+                                    let bit = 1 <<< i
+
+                                    if mask &&& bit <> 0 || not (eligible dependencies joined item.Name) then
+                                        states
+                                    else
+                                        let newMask = mask ||| bit
+                                        let applicable = applicableEdges edges joined item.Name
+                                        let newRows = nextRows edges joined state.Rows item
+
+                                        transitionVariants
+                                            state.Rows
+                                            state.RowBytes
+                                            state.Ordered
+                                            workMemBytes
+                                            applicable
+                                            item
+                                            newRows
+                                        |> List.fold
+                                            (fun states (delta, outOrder) ->
+                                                let candidate =
+                                                    {
+                                                        Cost = state.Cost + delta
+                                                        Rows = newRows
+                                                        RowBytes = state.RowBytes + item.RowBytes
+                                                        Ordered = outOrder
+                                                        Order = state.Order @ [ i ]
+                                                    }
+
+                                                let current =
+                                                    states |> Map.tryFind newMask |> Option.defaultValue []
+
+                                                states
+                                                |> Map.add
+                                                    newMask
+                                                    (insertState itemArray maxOrdersPerMask candidate current))
+                                            states)
+                                states)
+                        states)
+            (Map.ofList [ (startMask, [ initial ]) ])
+
+    /// `mask` の最良状態（コスト最小）。
+    let private bestState (states: Map<int, PlanState list>) (mask: int) =
+        states
+        |> Map.tryFind mask
+        |> Option.bind (fun list -> list |> List.sortBy (fun s -> s.Cost) |> List.tryHead)
+
+    /// 左深の順序から木を組み立てる。
+    let private treeOfOrder (itemArray: JoinOrderItem array) (order: int list) =
+        order
+        |> List.map (fun i -> JoinOrderTree.Leaf itemArray.[i].Name)
+        |> List.reduce (fun l r -> JoinOrderTree.Branch(l, r))
+
+    /// テーブル集合 `mask` の名前集合。
+    let private namesOf (itemArray: JoinOrderItem array) (mask: int) =
+        itemArray
+        |> Array.indexed
+        |> Array.choose (fun (i, item) -> if mask &&& (1 <<< i) <> 0 then Some item.Name else None)
+        |> Set.ofArray
+
+    /// bushy 計画（1段の分割。両側は左深）。
+    /// 適用できないときは None。
+    let bushyPlan
+        (workMemBytes: float)
+        (edges: JoinOrderEdge list)
+        (items: JoinOrderItem list)
+        (dependencies: Map<string, Set<string>>)
+        =
+        let maxBushyItems = 6
+        let itemArray = Array.ofList items
+        let count = itemArray.Length
+        let full = (1 <<< count) - 1
+
+        let unknownDependency =
+            dependencies
+            |> Map.exists (fun _ refs -> refs |> Set.exists (fun r -> not (Set.contains r (namesOf itemArray full))))
+
+        if count < 3 || count > maxBushyItems then
+            None
+        elif itemArray |> Array.exists (fun item -> not (System.Double.IsFinite item.Rows)) then
+            None
+        elif unknownDependency then
+            None
+        else
+            // 先頭テーブル候補ごとに左深 DP を回す（部分集合の最良計画を引くため）。
+            let perFirst =
+                itemArray
+                |> Array.mapi (fun f item ->
+                    let initial =
+                        {
+                            Cost = 0.0
+                            Rows = item.Rows
+                            RowBytes = item.RowBytes
+                            Ordered = item.NaturalOrder
+                            Order = [ f ]
+                        }
+
+                    f, dpCore itemArray edges dependencies workMemBytes (Set.singleton item.Name) (1 <<< f) initial)
+
+            let bestOf mask =
+                perFirst
+                |> Array.choose (fun (_, states) -> bestState states mask |> Option.map (fun s -> s.Cost, s))
+                |> Array.sortBy fst
+                |> Array.tryHead
+
+            let dependencyClosed mask =
+                let names = namesOf itemArray mask
+
+                itemArray
+                |> Array.indexed
+                |> Array.forall (fun (i, item) ->
+                    if mask &&& (1 <<< i) <> 0 then
+                        match dependencies |> Map.tryFind item.Name with
+                        | None -> true
+                        | Some refs -> Set.isSubset refs names
+                    else
+                        true)
+
+            let splitCost (leftNames: Set<string>) (rightNames: Set<string>) (lRows: float) (rRows: float) =
+                let crossing =
+                    edges
+                    |> List.filter (fun e ->
+                        not (Set.isEmpty (Set.intersect e.Refs leftNames))
+                        && not (Set.isEmpty (Set.intersect e.Refs rightNames))
+                        && Set.isSubset e.Refs (Set.union leftNames rightNames))
+
+                if List.isEmpty crossing then
+                    None
+                else
+                    let selectivity =
+                        crossing
+                        |> List.fold (fun acc e -> acc * (e.Selectivity |> Option.defaultValue 0.1)) 1.0
+
+                    let newRows =
+                        if lRows * rRows * selectivity <= 0.0 then
+                            0.0
+                        else
+                            max 1.0 (lRows * rRows * selectivity)
+
+                    let buildRows = min lRows rRows
+                    let hashDelta = buildRows + max lRows rRows + newRows + 0.1 * buildRows
+
+                    Some(hashDelta, newRows)
+
+            let splits =
+                seq { 1 .. full - 1 }
+                |> Seq.filter (fun l -> l < (full ^^^ l))
+                |> Seq.choose (fun l ->
+                    let r = full ^^^ l
+
+                    if not (dependencyClosed l) || not (dependencyClosed r) then
+                        None
+                    else
+                        match bestOf l, bestOf r with
+                        | Some(lCost, lState), Some(rCost, rState) ->
+                            let leftNames = namesOf itemArray l
+                            let rightNames = namesOf itemArray r
+
+                            splitCost leftNames rightNames lState.Rows rState.Rows
+                            |> Option.map (fun (joinDelta, _) -> lCost + rCost + joinDelta, lState, rState)
+                        | _ -> None)
+                |> Seq.sortBy (fun (cost, _, _) -> cost)
+                |> Seq.tryHead
+
+            match splits with
+            | Some(splitCostValue, lState, rState) ->
+                match bestOf full with
+                | Some(leftDeepCost, leftDeepState) when leftDeepCost <= splitCostValue ->
+                    Some(treeOfOrder itemArray leftDeepState.Order)
+                | _ ->
+                    Some(JoinOrderTree.Branch(treeOfOrder itemArray lState.Order, treeOfOrder itemArray rState.Order))
+            | None -> bestOf full |> Option.map (fun (_, state) -> treeOfOrder itemArray state.Order)
+
     /// Selinger DP（左深・先頭固定）。
     /// 適用できないときは None（呼び出し側が貪欲へフォールバックする）。
     let selingerPlan
@@ -298,15 +513,6 @@ module internal JoinOrder =
         (items: JoinOrderItem list)
         (dependencies: Map<string, Set<string>>)
         =
-        let joinedOf itemArray mask =
-            let names =
-                itemArray
-                |> Array.indexed
-                |> Array.choose (fun (i, item) -> if mask &&& (1 <<< i) <> 0 then Some item.Name else None)
-                |> Array.toList
-
-            Set.union initialJoined (Set.ofList names)
-
         let maxItems = 12
         let itemArray = Array.ofList items
         let count = itemArray.Length
@@ -328,7 +534,6 @@ module internal JoinOrder =
             None
         else
             let fullMask = (1 <<< count) - 1
-            let maxOrdersPerMask = 8
 
             let initial =
                 {
@@ -339,60 +544,7 @@ module internal JoinOrder =
                     Order = []
                 }
 
-            seq { 0..fullMask }
-            |> Seq.fold
-                (fun states mask ->
-                    match states |> Map.tryFind mask with
-                    | None -> states
-                    | Some stateList ->
-                        let joined = joinedOf itemArray mask
-
-                        stateList
-                        |> List.fold
-                            (fun states state ->
-                                itemArray
-                                |> Array.indexed
-                                |> Array.fold
-                                    (fun states (i, item) ->
-                                        let bit = 1 <<< i
-
-                                        if mask &&& bit <> 0 || not (eligible dependencies joined item.Name) then
-                                            states
-                                        else
-                                            let newMask = mask ||| bit
-                                            let applicable = applicableEdges edges joined item.Name
-                                            let newRows = nextRows edges joined state.Rows item
-
-                                            transitionVariants
-                                                state.Rows
-                                                state.RowBytes
-                                                state.Ordered
-                                                workMemBytes
-                                                applicable
-                                                item
-                                                newRows
-                                            |> List.fold
-                                                (fun states (delta, outOrder) ->
-                                                    let candidate =
-                                                        {
-                                                            Cost = state.Cost + delta
-                                                            Rows = newRows
-                                                            RowBytes = state.RowBytes + item.RowBytes
-                                                            Ordered = outOrder
-                                                            Order = state.Order @ [ i ]
-                                                        }
-
-                                                    let current =
-                                                        states |> Map.tryFind newMask |> Option.defaultValue []
-
-                                                    states
-                                                    |> Map.add
-                                                        newMask
-                                                        (insertState itemArray maxOrdersPerMask candidate current))
-                                                states)
-                                    states)
-                            states)
-                (Map.ofList [ (0, [ initial ]) ])
+            dpCore itemArray edges dependencies workMemBytes initialJoined 0 initial
             |> Map.tryFind fullMask
             |> Option.map (fun stateList ->
                 let best = stateList |> List.minBy (fun s -> s.Cost)

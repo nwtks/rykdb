@@ -6,6 +6,7 @@ module RykDb.JoinOrderTests
 
 open Xunit
 open RykDb.Core
+open RykDb.TestHelpers
 
 let private item name rows position : JoinOrderItem =
     {
@@ -46,6 +47,50 @@ let private keyedEdge selectivity keys : JoinOrderEdge =
         Selectivity = selectivity
         KeyColumns = keys
     }
+
+/// bushy 木の葉（テーブル名）を集める。
+let private leavesOf tree =
+    let rec go acc tree =
+        match tree with
+        | JoinOrderTree.Leaf name -> name :: acc
+        | JoinOrderTree.Branch(l, r) -> go (go acc l) r
+
+    go [] tree |> Set.ofList
+
+/// 根のどちらかが部分木か（左深なら根の子はどちらも葉）。
+let private isBushyShape tree =
+    match tree with
+    | JoinOrderTree.Branch(JoinOrderTree.Branch _, _)
+    | JoinOrderTree.Branch(_, JoinOrderTree.Branch _) -> true
+    | _ -> false
+
+[<Fact>]
+let ``JoinOrder.bushyPlan: 3テーブル以上で分割を検討する`` () =
+    let items = [ item "a" 1000.0 0; item "b" 1000.0 1; item "c" 1000.0 2 ]
+    let edges = [ edgeWith (Some 0.5) "a" "b"; edgeWith (Some 0.01) "b" "c" ]
+    let plan = JoinOrder.bushyPlan -1.0 edges items Map.empty
+    let tree = expectSome "bushy 計画" plan
+    Assert.Equal<Set<string>>(Set.ofList [ "a"; "b"; "c" ], leavesOf tree)
+
+[<Fact>]
+let ``JoinOrder.bushyPlan: 2テーブル以下では使わない`` () =
+    let items = [ item "a" 10.0 0; item "b" 10.0 1 ]
+    Assert.True((JoinOrder.bushyPlan -1.0 [ edge "a" "b" ] items Map.empty).IsNone)
+
+[<Fact>]
+let ``JoinOrder.bushyPlan: 7テーブル以上では使わない`` () =
+    let items = [ for i in 0..6 -> item (sprintf "t%d" i) 10.0 i ]
+    Assert.True((JoinOrder.bushyPlan -1.0 [] items Map.empty).IsNone)
+
+[<Fact>]
+let ``JoinOrder.bushyPlan: 分割の方が安ければ右が部分木になる`` () =
+    // a は大きい。b⋈c が極端に小さくなり、最後に a と結合する方が安い。
+    let items =
+        [ item "a" 1_000_000.0 0; item "b" 1_000_000.0 1; item "c" 1_000_000.0 2 ]
+
+    let edges = [ edgeWith (Some 0.0001) "b" "c"; edgeWith (Some 1.0) "a" "b" ]
+    let tree = expectSome "bushy 計画" (JoinOrder.bushyPlan -1.0 edges items Map.empty)
+    Assert.True(isBushyShape tree, sprintf "%A" tree)
 
 /// 順序だけを返す DP。
 let private selinger

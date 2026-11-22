@@ -605,6 +605,8 @@ SELECT * FROM t WHERE a = 1 AND b = 2; -- IndexLookup
 2. 同点なら `FROM`で先に書かれたテーブルを優先する
 
 `LEFT JOIN`を境界にINNER区間だけを並べ替える。
+ただし`LEFT JOIN`より後ろに書いたINNERでも、ONの参照がそれより前の表だけで
+閉じているものは`LEFT JOIN`の前へ繰り上げる（結果は変わらない）。
 `LEFT JOIN`が無い問い合わせでは、`FROM`の先頭テーブルもDPで選ぶ。
 このときON述語は、参照先が揃った結合へ昇格して評価する。
 `ANALYZE` の統計があれば行数・列NDV・NULL率・ヒストグラムを使う。
@@ -748,6 +750,9 @@ plan
 ```text
   Join(INNER, HashJoin, right=u, on=(t.k = u.k)) rows=3 sel=0.3333
 ```
+
+ハッシュ結合の build 側が推定で作業メモリを超えるときは `HashJoin(spill=…KB)` になる。
+小さい側（左）を build するときは `HashJoin(left)`。
 
 主なノードは次のとおり。
 
@@ -1035,10 +1040,11 @@ ANALYZE [TABLE] [table_name] [SAMPLE n];
 （`ANALYZE SAMPLE`のように整数が続かなければテーブル名のまま）。
 
 - 結合順、結合アルゴリズム、走査基数、Filter 選択性の見積りに使う。
-- 結果は `table` / `rows` / `columns` / `ndv` / `nulls` / `ranges` / `indexes` / `analyzed_at` の 1行
-  （全テーブルならテーブルごとに 1行）。
+- 結果は `table` / `rows` / `columns` / `ndv` / `nulls` / `ranges` / `indexes` / `histograms` /
+  `analyzed_at` の 1行（全テーブルならテーブルごとに 1行）。
   - `ndv` は `列=異なり値数` の並び、`nulls` は `列=NULL数` の並び。
   - `ranges` は数値列の `列=[最小,最大]`、`indexes` は `索引名=[prefix NDV…]`。
+  - `histograms` は数値列の `列:標本数`（標本を持たない列は出さない）。
   - `analyzed_at` は収集した UTC 時刻（ISO 8601）。
 - `SAMPLE n` は reservoir sampling で最大 n 行を標本にする。
   行数は全体を数え、NDV・範囲・NULL 率・数値ヒストグラムは標本から推定する。

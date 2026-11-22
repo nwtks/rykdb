@@ -543,14 +543,35 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 - ハッシュ結合はbuild側の行数×行幅が作業メモリを超えると、
   `Spill.Partitions` 本への書き出し・読み直しを含むスピルペナルティを加える。
 - 複数索引の選択は prefix NDV が小さい索引を優先する。
-- `PlanBuilder` はまだ左深木だけを組み立てる。
+- `PlanBuilder` は左深木を基本に組み立てる（`Bushy` のときは1段の分割木）。
   `Logical.Join` の右は結合の部分木も許容し、`Optimizer` は `outputOf` で
   部分木の出力スキーマを作業リストで求め、INL を無効化して実行する（bushy の土台）。
-- bushy の計画生成と LEFT JOIN を跨ぐ再配置はまだ実装していない。
 
-診断・A/B用に `ExecContext.JoinOrder`（`Dp` / `Greedy`）で戦略を切り替えられる。
-`Session.PrepareSelectWith(JoinOrderStrategy.Greedy, stmt)` は貪欲計画を返し、
-結果はDPと同じになる（回帰テストで固定）。
+診断・A/B用に `ExecContext.JoinOrder`（`Dp` / `Greedy` / `Bushy`）で戦略を切り替えられる。
+`Session.PrepareSelectWith(JoinOrderStrategy.Greedy, stmt)` は貪欲計画を、
+`Bushy` は1段の分割計画を返し、結果はDPと同じになる（回帰テストで固定）。
+
+`Bushy` の範囲は次のとおり。
+
+- `FROM` 先頭から始まる INNER 区間で、テーブル数 3〜6 のときだけ使う。
+- 全分割 `S = L ⊎ R` を試し、両側が依存関係で閉じていて結合述語が跨るときだけ候補にする。
+- 両側はそれぞれ左深の最良計画（先頭テーブル候補ごとに DP を回して求める）。
+- 分割の方が安いときだけ `Branch` を作り、右（または左）が部分木になる。
+- 使わなかった述語は INNER なので結合木の上に `Filter` として残す。
+
+#### LEFT JOIN を跨ぐ繰り上げ
+
+`PlanBuilder` は、`LEFT JOIN` より後ろに書かれた INNER を、
+先頭の INNER 区間へ繰り上げてから結合順を決める。
+繰り上げる条件は次のとおり。
+
+- INNER の ON が修飾名だけで書かれ、参照が先頭 INNER 区間（と繰り上げ済みの INNER）で閉じている。
+- 先頭区間の表を少なくとも 1 つ参照する（直積になる INNER は繰り上げない）。
+
+参照が閉じていない INNER（`LEFT` の右の表を見るもの）はその場に残り、
+次の INNER 区間として並べ直す。
+繰り上げても各表の出現回数は変わらない（`A ⟕ B` の行ごとに INNER が掛かるだけ）ので、
+意味を保ったまま結合順の探索範囲を広げる目的で常に行う。
 
 #### 論理代数からOpへ
 

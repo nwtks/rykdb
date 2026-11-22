@@ -480,7 +480,7 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
         // 列数と NDV の表示
         Assert.Equal<int64>(2L, asInt analyzed.Rows.[0].[2])
         Assert.Contains("id=3", asText analyzed.Rows.[0].[3])
-        // NULL 数・数値範囲・索引 prefix NDV・収集時刻
+        // NULL 数・数値範囲・索引 prefix NDV・ヒストグラム・収集時刻
         Assert.Equal<string list>(
             [
                 "table"
@@ -490,6 +490,7 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
                 "nulls"
                 "ranges"
                 "indexes"
+                "histograms"
                 "analyzed_at"
             ],
             analyzed.Columns |> Array.toList
@@ -497,6 +498,11 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
 
         Assert.Equal<string>("id=0,v=0", asText analyzed.Rows.[0].[4])
         Assert.Equal<string>("id=[1,3],v=[10,20]", asText analyzed.Rows.[0].[5])
+        // 数値列は標本ヒストグラムを持つ。
+        Assert.Contains("id:", asText analyzed.Rows.[0].[7])
+        Assert.Contains("v:", asText analyzed.Rows.[0].[7])
+        // 収集時刻が入る。
+        Assert.False(System.String.IsNullOrEmpty(asText analyzed.Rows.[0].[8]))
 
         let _ = exec db3 "ANALYZE TABLE t;"
         let _ = exec db3 "ANALYZE t"
@@ -3538,6 +3544,42 @@ let ``SqlReference: 貪欲な結合順でも DP と同じ結果になる`` () =
         Assert.Equal<string list>(dp |> Array.toList, greedy |> Array.toList))
 
 [<Fact>]
+let ``SqlReference: bushy 計画でも DP と同じ結果になる`` () =
+    // 入れ替えの自由度が高い 4 テーブルで、bushy（右が部分木）の結果を固定する。
+    withSession "join-order-bushy" (fun db ->
+        let db = exec db "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "INSERT INTO a VALUES (1,10),(2,20),(3,30)"
+        let db = exec db "INSERT INTO b VALUES (1,10),(2,20),(3,35)"
+        let db = exec db "INSERT INTO c VALUES (1,10),(2,20),(3,30)"
+        let db = exec db "INSERT INTO d VALUES (1,10),(2,20),(3,30)"
+
+        let stmt =
+            match
+                parseOneOk
+                    "SELECT a.id, b.id, c.id, d.id FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k JOIN d ON c.k = d.k"
+            with
+            | Statement.Select s -> s
+            | other -> failwithf "SELECT ではありません: %A" other
+
+        let run plan =
+            try
+                let op = ok (Optimizer.exec plan.Context plan.Tree plan.Input)
+
+                (op |> Op.toArray |> ok)
+                |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
+                |> Array.sort
+            finally
+                plan.Context.Scope.DisposeAll()
+
+        let dp = run (ok (db.PrepareSelect stmt))
+        let bushy = run (ok (db.PrepareSelectWith(JoinOrderStrategy.Bushy, stmt)))
+        Assert.Equal<int>(2, dp.Length)
+        Assert.Equal<string array>(dp, bushy))
+
+[<Fact>]
 let ``SqlReference: 結合順は中間行数の見積りで決まる`` () =
     // c は a との結合述語を 2 本持つ（ON と昇格した WHERE）。
     // b は 1 本だけなので、c を先に結合した方が中間行数が小さい。
@@ -3585,6 +3627,68 @@ let ``SqlReference: 並べ替えても LEFT JOIN の NULL 拡張は変わらな�
         Assert.Equal<int64>(1L, asInt res.Rows.[0].[1])
         Assert.Equal<int64>(2L, asInt res.Rows.[1].[0])
         Assert.Equal<SqlValue>(SqlValue.Null, res.Rows.[1].[1]))
+
+[<Fact>]
+let ``SqlReference: LEFT JOIN を跨ぐ INNER は LEFT より前に繰り上げる`` () =
+    // c の ON は l だけを見るので、LEFT の前へ動かしても同じ行が残る。
+    withSession "join-hoist-left" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE l (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "CREATE TABLE r (id INTEGER PRIMARY KEY, lv INTEGER)"
+        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, lv INTEGER)"
+        let db4 = exec db3 "INSERT INTO l VALUES (1),(2),(3)"
+        let db5 = exec db4 "INSERT INTO r VALUES (1,1),(2,2),(3,2)"
+        let db6 = exec db5 "INSERT INTO c VALUES (1,1),(2,2)"
+
+        let sql =
+            "SELECT l.id, r.lv, c.lv FROM l LEFT JOIN r ON l.id = r.lv JOIN c ON l.id = c.lv"
+
+        let _, plan = ok (execSql db6 ("EXPLAIN " + sql))
+        let lines = plan.Rows |> Array.map (fun row -> asText row.[0])
+
+        let indexOf (text: string) =
+            lines |> Array.findIndex (fun (line: string) -> line.Contains text)
+
+        // 繰り上げると根が LEFT になる（繰り上げないと根は INNER の c）。
+        Assert.True(indexOf "LEFT" < indexOf "right=c", String.concat "\n" lines)
+
+        // l.id=3 は c に無いので INNER で落ちる。r.lv=2 は 2 行あるので l.id=2 は 2 行残る。
+        let _, res = ok (execSql db6 (sql + " ORDER BY l.id, r.id"))
+        Assert.Equal<int>(3, res.Rows.Length)
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(2L, asInt res.Rows.[1].[0])
+        Assert.Equal<int64>(2L, asInt res.Rows.[1].[1])
+        Assert.Equal<int64>(2L, asInt res.Rows.[2].[0])
+        Assert.Equal<int64>(2L, asInt res.Rows.[2].[1]))
+
+[<Fact>]
+let ``SqlReference: LEFT の右を参照する INNER は繰り上げない`` () =
+    // c の ON が r を見るので、r が NULL 拡張される前に結合すると結果が変わる。
+    withSession "join-hoist-left-blocked" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE l (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "CREATE TABLE r (id INTEGER PRIMARY KEY, lv INTEGER)"
+        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, lv INTEGER)"
+        let db4 = exec db3 "INSERT INTO l VALUES (1),(2)"
+        let db5 = exec db4 "INSERT INTO r VALUES (1,10)"
+        let db6 = exec db5 "INSERT INTO c VALUES (1,10)"
+
+        let sql =
+            "SELECT l.id, r.lv, c.id FROM l LEFT JOIN r ON l.id = r.id JOIN c ON r.lv = c.lv"
+
+        let _, plan = ok (execSql db6 ("EXPLAIN " + sql))
+        let lines = plan.Rows |> Array.map (fun row -> asText row.[0])
+
+        let indexOf (text: string) =
+            lines |> Array.findIndex (fun (line: string) -> line.Contains text)
+
+        // 繰り上げないので根は INNER の c、LEFT はその内側。
+        Assert.True(indexOf "right=c" < indexOf "LEFT", String.concat "\n" lines)
+
+        // l.id=2 は r が NULL 拡張されるので c と一致せず落ちる。
+        let _, res = ok (execSql db6 (sql + " ORDER BY l.id"))
+        Assert.Equal<int>(1, res.Rows.Length)
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(10L, asInt res.Rows.[0].[1]))
 
 [<Fact>]
 let ``SqlReference: JOIN の後に続く LEFT JOIN も実行される`` () =

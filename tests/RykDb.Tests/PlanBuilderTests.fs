@@ -464,11 +464,11 @@ let ``PlanBuilder.buildLogicalWith: INNER の結合順は選択性の高いテ�
         | _ -> failActual "想定外の形" tree)
 
 [<Fact>]
-let ``PlanBuilder.buildLogicalWith: LEFT JOIN は結合順の境界になる`` () =
+let ``PlanBuilder.buildLogicalWith: LEFT JOIN を跨ぐ INNER は前へ繰り上げる`` () =
     withStore "pl-left-order" (fun store ->
         let ctx = ctxWithExtra store
 
-        // LEFT の右（orders）は動かさず、後続の INNER（xtra）だけを積む
+        // xtra の ON は people だけを見るので、LEFT（orders）より前へ動かせる。
         let stmt =
             selectOf
                 [ { Expression = Expr.Star; Alias = None } ]
@@ -486,6 +486,40 @@ let ``PlanBuilder.buildLogicalWith: LEFT JOIN は結合順の境界になる`` (
                     }
                 ]
                 (Some(eq (xCol "id") (Expr.Literal(Literal.Int 1L))))
+
+        let tree = ok (PlanBuilder.buildLogicalWith ctx stmt Map.empty)
+
+        match tree with
+        | Logical.Project(_, Logical.Join(JoinKind.Left, "orders", _, left, _)) ->
+            match left with
+            | Logical.Join(JoinKind.Inner, "xtra", _, Logical.Scan(first, _), _) ->
+                Assert.Equal<string>("people", first)
+            | _ -> failActual "想定外の左部分木" left
+        | _ -> failActual "想定外の形" tree)
+
+[<Fact>]
+let ``PlanBuilder.buildLogicalWith: LEFT の右を参照する INNER は後に残る`` () =
+    withStore "pl-left-order-blocked" (fun store ->
+        let ctx = ctxWithExtra store
+
+        // xtra の ON が LEFT の右（orders）を見るので、LEFT を跨げない。
+        let stmt =
+            selectOf
+                [ { Expression = Expr.Star; Alias = None } ]
+                (Some { Name = "people"; Alias = None })
+                [
+                    {
+                        Kind = JoinKind.Left
+                        Table = TableSource.Named { Name = "orders"; Alias = None }
+                        On = eq (pCol "id") (oCol "person_id")
+                    }
+                    {
+                        Kind = JoinKind.Inner
+                        Table = TableSource.Named { Name = "xtra"; Alias = None }
+                        On = eq (oCol "person_id") (xCol "id")
+                    }
+                ]
+                None
 
         let tree = ok (PlanBuilder.buildLogicalWith ctx stmt Map.empty)
 
