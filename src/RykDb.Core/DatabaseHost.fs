@@ -139,6 +139,9 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
     let stateGate = obj ()
     // 書き込み・transaction 操作・Close を直列化するロック。
     let writeGate = obj ()
+    // 放棄された接続の transaction の TxnId。
+    // finalizer が積み、`writeGate` の内側で回収する（finalizer はロックを取らない）。
+    let abandoned = System.Collections.Concurrent.ConcurrentQueue<TxnId>()
 
     let durability =
         match commitDurability with
@@ -168,6 +171,27 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
 
     let closedError () = DbError.internalError "データベースは閉じられています"
 
+    /// 放棄された接続の transaction を manager から外す（`writeGate` の内側で呼ぶ）。
+    /// <remarks>
+    /// 接続が Close されずに GC されると、その transaction は二度と commit できない。
+    /// `Active` に残すと `activeSnapshot` が下がり、`LastCommitted` が以後の commit の
+    /// キーを保持し続ける（メモリリーク）。
+    /// finalizer はキューに積むだけなので、finalizer スレッドが gate で止まることはない。
+    /// `abortId` は冪等で、既に commit / abort 済みの TxnId は無視される。
+    /// </remarks>
+    let reclaimAbandoned (current: Committed) =
+        let rec drain changed manager =
+            match abandoned.TryDequeue() with
+            | true, txnId -> drain true (TransactionManager.abortId txnId manager)
+            | _ -> manager, changed
+
+        match drain false current.Manager with
+        | manager, true ->
+            let next = { current with Manager = manager }
+            publish next
+            next
+        | _, false -> current
+
     /// writeGate の内側で実行し、WAL の fsync を gate の外で待つ。
     /// `run` は「実行後の確定状態」と値も返す（読み取りだけなら入力をそのまま返す）。
     let serialized (run: Committed -> Result<Committed * 'a, DbError>) =
@@ -176,6 +200,8 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                 match snapshot () with
                 | HostLifecycle.Closed _ -> err (closedError ()), None
                 | HostLifecycle.Running current ->
+                    let current = reclaimAbandoned current
+
                     let outcome, position =
                         match run current with
                         | Error e -> err e, current.Store.Engine.WalState
@@ -283,13 +309,14 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                 current.Store.Runtime.WithShared(fun () ->
                     let mgr, txn = TransactionManager.beginTxn current.Manager
                     let registration = current.Store.Runtime.Register(root, txn.Snapshot.SeqNo)
-                    let lease = RegistrationLease registration
 
                     match Catalog.load current.Store with
                     | Error e ->
                         current.Store.Runtime.Unregister registration
                         err e
                     | Ok fresh ->
+                        let lease = RegistrationLease(registration, (fun () -> abandoned.Enqueue txn.TxnId))
+
                         let next = { current with Manager = mgr }
                         publish next
 

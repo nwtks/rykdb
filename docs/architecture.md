@@ -779,6 +779,9 @@ UNIQUE索引は論理予約キー`@unique:<索引名>:<base64(索引値)>`を使
 予約キーは物理エントリを書かず、commit時に`LastCommitted`へ登録する。
 `NULL`を含むUNIQUE値は予約しない。
 
+競合時の`ConflictError`は、競合したキーの件数と先頭3件の内訳を示す。
+物理キーはkeyspace（`t:<表>`、`i:<索引>`）、UNIQUEの予約は`UNIQUE <索引名>`と表示する。
+
 ### 7.4 書き込みの状態
 
 transactionは、行と索引の更新をバッファに保持する。
@@ -877,6 +880,23 @@ WALとMANIFESTはプロセス間排他を持たない。
 排他がないと、複数プロセスのmemtableとWALが競合し、データを壊し得る。
 
 クラッシュ再現テストだけは、internalの再取得APIを使って二重オープンを再現する。
+
+### 7.10 放棄された transaction の回収
+
+接続がCloseされずに捨てられた場合、そのtransactionは二度とcommitできない。
+放置すると`TransactionManager.Active`に残り、
+`activeSnapshot`が下がって `LastCommitted`が以後のcommitのキーを保持し続ける
+（メモリリーク）。
+
+- `RegistrationLease`のfinalizerはsnapshot登録を外し、未解放なら`DatabaseHost`へ`TxnId`を通知する。
+- finalizerはキューに積むだけで、`writeGate`などのロックを取らない。
+- 次の書き込み（`DatabaseHost.serialized`）が`writeGate`の内側でキューを回収し、
+  `TransactionManager.abortId`で`Active`から外してmanagerを公開する。
+- `abortId`は冪等で、既にcommit/abort済みのTxnIdは無視される。
+- 明示的に解放済み（commit / rollback / Close）のリースは通知しない。
+
+回帰: `DatabaseHost: 放棄された transaction は次の書き込みで manager から回収される` /
+`DatabaseHost: commit せずに捨てた transaction も GC されれば登録が外れる`。
 
 ---
 
@@ -1336,10 +1356,13 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 #### 12.2.3 並行性とトランザクション
 
 - 分離レベルはSnapshot Isolationに固定する。
+- Snapshot Isolationは直列化可能ではない。
+  同じ行を読んでから別の行を更新する2つのtransactionはwrite skewを起こし得る。
 - `SAVEPOINT`、分離レベル指定、読み取り専用transactionは未対応である。
 - 複数スレッドで1つのSessionと1つのtransactionを共有しない。
 - DDL中は通常の文とBEGINをブロックする。
 - 実行中のtransactionがある場合、DDLは`ConflictError`になる。
+- Closeされずに捨てられた接続のtransactionは、GC後の次の書き込み時に回収する（§7.10）。
 - マルチプロセスでの同時更新はサポートしない。
 - transactionとleaseはプロセス内だけに保持する。
 

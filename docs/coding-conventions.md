@@ -89,6 +89,8 @@ RykDb の実装で守る規約。
   - `RowReaderState = Reading | Exhausted | Closed`
 - `CommitDurability.state`
   - `SyncState = Idle | Leading | Failed`
+- `DatabaseHost.abandoned`
+  - 放棄された接続の `TxnId`。finalizer が積み、`writeGate` の内側で回収する
 
 公開セッション層以外の可変状態は、原則として次の抽象で表現する。
 
@@ -122,6 +124,7 @@ Core の可変コレクションは用途を限定する。
 - `OpsJoin.innerJoinHash` / `leftJoinHash`: 右側ハッシュ表
 - `VersionCoordinator`: 公開状態、ファイル refcount、worker 状態
 - `StorageEngine`、`ProcessLock`、`Transactions`: 同期・登録台帳
+- `DatabaseHost`: 放棄された transaction の受け渡し（`ConcurrentQueue`）
 
 演算子の作業用コレクションは、演算子の構築時に作り、返した `Op` の中だけで保持する。
 モジュールスコープに置くと実行ごとの状態が共有され、2回目以降の結果が壊れる。

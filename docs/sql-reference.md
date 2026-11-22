@@ -1104,6 +1104,8 @@ ok (session.Close())
 
 - `Close()`後の操作は `InternalError`になる。
 - `Close()`は進行中のtransactionをrollbackする。
+- `Close()`せずに参照を失った `Session`のtransactionは、GC後の次の書き込み時に破棄される
+  （二度とcommitできない。放置すると古いsnapshotがGC境界を止め続けるため）。
 - `Session`は `IDisposable`で、`Dispose()`と `Close()`は同じ経路になる。
 - 複数スレッドで同じtransactionを共有しない。
 
@@ -1137,6 +1139,10 @@ Closeだけは読み取り完了を待つ。
 - transaction内で同じ行を読み直すと、後続のcommitは見えない。
 - snapshot取得後に別transactionが先に同じキーをcommitした場合、
   自分のcommitは `ConflictError`になる。
+
+Snapshot Isolationは直列化可能ではない。
+2つのtransactionが同じ行を読み、それぞれ別の行を更新すると、
+両方commitできて「読んだ条件」を両方が破る状態（write skew）を作り得る。
 
 `BEGIN ISOLATION LEVEL`、`SET TRANSACTION`、`SAVEPOINT`、読み取り専用transactionは未対応。
 

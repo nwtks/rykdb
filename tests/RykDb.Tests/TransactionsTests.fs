@@ -74,6 +74,23 @@ let private freshRoot (tag: string) =
         sprintf "%s-%d-%s" tag System.DateTime.UtcNow.Ticks (System.Guid.NewGuid().ToString "N")
     )
 
+/// エラー内容を見るテスト用（成功したらテストを落とす）。
+let private errorOf (r: Result<'a, DbError>) =
+    match r with
+    | Error e -> e
+    | Ok _ -> failwithf "エラーになるはずが成功した"
+
+
+/// 診断用のスナップショットを返す。
+let private status (manager: TransactionManager) =
+    {
+        NextSeqNo = manager.NextSeqNo
+        LastCommitSeqNo = manager.LastCommitSeqNo
+        ActiveCount = manager.Active.Count
+        OldestActiveSnapshot = TransactionManager.activeSnapshot manager
+        LastCommittedKeys = manager.LastCommitted.Count
+    }
+
 [<Fact>]
 let ``Transaction.create: 空の transaction`` () =
     let snap = { Snapshot.SeqNo = 0UL }
@@ -210,7 +227,10 @@ let ``TransactionManager.commit: UNIQUE の論理予約が競合する`` () =
     let txnA = Transaction.reserveUnique "idx_email" key txnA
     let txnB = Transaction.reserveUnique "idx_email" key txnB
     let mgr3, _, _ = ok (TransactionManager.commit txnA mgr2)
-    expectErrorKind ErrorKind.ConflictError "UNIQUE 予約の競合を検出できない" (TransactionManager.commit txnB mgr3)
+    let e = errorOf (TransactionManager.commit txnB mgr3)
+    Assert.Equal(ErrorKind.ConflictError, e.Kind)
+    // UNIQUE の予約は索引名で表示する（keyspace ではなく UNIQUE <索引名>）
+    Assert.Contains("UNIQUE idx_email", e.Message)
 
 [<Fact>]
 let ``TransactionManager.commit: commit 済み SeqNo を表す`` () =
@@ -240,6 +260,19 @@ let ``TransactionManager.commit: 同じキーを 2 つの transaction が書く�
     let t3 = Transaction.put "t:y" [| 1uy |] [| SqlValue.Int 3L |] t3
     let mgr, _, _ = TransactionManager.commit t3 mgr |> ok
     expectErrorKind ErrorKind.ConflictError "write-write 競合を検出できなかった" (TransactionManager.commit t2 mgr)
+
+[<Fact>]
+let ``TransactionManager.commit: 競合メッセージは keyspace の内訳を示す`` () =
+    let mgr0 = TransactionManager.create ()
+    let mgr1, txnA = TransactionManager.beginTxn mgr0
+    let mgr2, txnB = TransactionManager.beginTxn mgr1
+    let txnA = Transaction.put "t:people" [| 1uy |] [| SqlValue.Int 1L |] txnA
+    let txnB = Transaction.put "t:people" [| 1uy |] [| SqlValue.Int 2L |] txnB
+    let mgr3, _, _ = ok (TransactionManager.commit txnA mgr2)
+
+    let e = errorOf (TransactionManager.commit txnB mgr3)
+    Assert.Equal(ErrorKind.ConflictError, e.Kind)
+    Assert.Contains("t:people", e.Message)
 
 [<Fact>]
 let ``TransactionManager.commit: 別 keyspace の同じキーは衝突しない`` () =
@@ -292,12 +325,42 @@ let ``TransactionManager.commit: 古い snapshot の transaction が居る間は
     Assert.Equal<int>(0, mgr.LastCommitted.Count)
 
 [<Fact>]
+let ``TransactionManager.status: 長い transaction がある間は LastCommitted のキー数が見える`` () =
+    let mgr = TransactionManager.create ()
+    let mgr, reader = TransactionManager.beginTxn mgr
+    let mgr, writer = TransactionManager.beginTxn mgr
+    let writer = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] writer
+    let mgr, commitSeq, _ = ok (TransactionManager.commit writer mgr)
+
+    let observed = status mgr
+    Assert.Equal(1, observed.ActiveCount)
+    Assert.Equal(1, observed.LastCommittedKeys)
+    Assert.Equal<uint64>(reader.Snapshot.SeqNo, observed.OldestActiveSnapshot)
+    Assert.Equal<uint64>(commitSeq, observed.LastCommitSeqNo)
+    Assert.Equal<uint64>(mgr.NextSeqNo, observed.NextSeqNo)
+
+    // reader を捨てて次の commit をすると、LastCommitted が掃除される
+    let mgr = TransactionManager.abort reader mgr
+    let mgr, t = TransactionManager.beginTxn mgr
+    let mgr, _, _ = ok (TransactionManager.commit t mgr)
+    Assert.Equal(0, (status mgr).LastCommittedKeys)
+
+[<Fact>]
 let ``TransactionManager.commit: abort 済み transaction の commit はエラー`` () =
     let mgr = TransactionManager.create ()
     let mgr, txn = TransactionManager.beginTxn mgr
     let mgr = TransactionManager.abort txn mgr
     // Active から消えているので内部エラーになる
     expectErrorKind ErrorKind.InternalError "abort 済みの commit" (TransactionManager.commit txn mgr)
+
+[<Fact>]
+let ``TransactionManager.abortId: 存在しない TxnId は無視し、active だけを外す`` () =
+    let mgr = TransactionManager.create ()
+    let mgr, txn = TransactionManager.beginTxn mgr
+    // 未登録の TxnId（放棄された transaction の二重通知など）は何もしない
+    let untouched = TransactionManager.abortId (txn.TxnId + 100UL<txnId>) mgr
+    Assert.Equal(1, untouched.Active.Count)
+    Assert.Equal(0, (TransactionManager.abortId txn.TxnId untouched).Active.Count)
 
 [<Fact>]
 let ``TransactionManager.abort: abort は何も残さない`` () =

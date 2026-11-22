@@ -252,6 +252,30 @@ let ``DatabaseHost: commit せずに捨てた transaction も GC されれば登
         Assert.Equal<int>(1, found.Rows.Length))
 
 [<Fact>]
+let ``DatabaseHost: 放棄された transaction は次の書き込みで manager から回収される`` () =
+    withDbHost "reg-abandon-reclaim" (fun host session ->
+        Assert.True(abandonTransaction host)
+        // BEGIN は manager の Active へ載る（snapshot registry とは別）
+        Assert.Equal(1, host.Committed.Manager.Active.Count)
+
+        collectGarbage ()
+        // finalizer は snapshot 登録を外すが、manager の Active は次の書き込みまで残る。
+        Assert.True((host.Committed.Store.Runtime.OldestExcept(host.Committed.Root, None)).IsNone)
+        Assert.Equal(1, host.Committed.Manager.Active.Count)
+
+        // 次の書き込み（暗黙 transaction）が回収し、放棄された transaction は commit できない。
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        |> ignore
+
+        Assert.True(host.Committed.Manager.Active.IsEmpty)
+        Assert.Equal<int>(0, host.Committed.Manager.LastCommitted.Count)
+
+        // 回収済みなので通常の書き込み・読み取りが続く。
+        ok (session.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+        let _, found = ok (execSql session "SELECT id FROM t WHERE v = 10")
+        Assert.Equal<int>(1, found.Rows.Length))
+
+[<Fact>]
 let ``DatabaseHost: 生きている transaction は GC されても登録が残る`` () =
     withDbHost "reg-live-gc" (fun host session ->
         ok (session.Begin())

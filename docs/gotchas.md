@@ -421,6 +421,20 @@ backfill中の他の書き込みを防ぐ。
 回帰: `DatabaseHost: DDL のカタログ保存後も Manager の採番は保存済み SeqNo の後ろになる` /
 `Session: UNIQUE 索引の backfill は重複値を拒否する`。
 
+### 5.11 放棄された transaction は finalizer から直接公開しない
+
+finalizerは任意のスレッドで走り、`writeGate`で待つと他のオブジェクトの回収を遅らせる。
+後始末は最終状態の公開（`publish`）を伴うため、finalizerから直接触らない。
+
+- ✅ `RegistrationLease`のfinalizerは`TxnId`を`ConcurrentQueue`へ積むだけ。
+  `DatabaseHost.serialized`が`writeGate`の内側で回収する。
+- ❌ finalizerから`writeGate`を取ってmanagerを書き換えると、
+  finalizerスレッドが待ちに入り、他のfinalizerの実行を遅らせる。
+- 通知は未解放のまま回収されたときだけ行う（明示解放済みなら`Detach`がfalseになる）。
+- 回収は冪等（`abortId`）なので、二重通知やcommit済みのTxnIdでも壊れない。
+- 回帰: `DatabaseHost: 放棄された transaction は次の書き込みで manager から回収される` /
+  `DatabaseHost: 生きている transaction は GC されても登録が残る`。
+
 ---
 
 ## 6. 索引・結合・クエリ意味論

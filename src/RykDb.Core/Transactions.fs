@@ -139,6 +139,23 @@ module internal Transaction =
     let conflictKey (keyspace: string) (key: byte array) =
         keyspace + ":" + System.Convert.ToBase64String key
 
+    /// 競合メッセージ用に `conflictKey` を人が読める形へ縮める。
+    /// <remarks>
+    /// `conflictKey` は `keyspace + ":" + base64` で、base64 は `:` を含まないため、
+    /// 最後の `:` より前が keyspace である。
+    /// UNIQUE の予約は `@unique:<索引名>` を keyspace に持つので `UNIQUE <索引名>` と表示する。
+    /// </remarks>
+    let describeConflictKey (key: string) =
+        let space =
+            match key.LastIndexOf ':' with
+            | -1 -> key
+            | i -> key.Substring(0, i)
+
+        if space.StartsWith(ReservationKeyspacePrefix, System.StringComparison.Ordinal) then
+            "UNIQUE " + space.Substring ReservationKeyspacePrefix.Length
+        else
+            space
+
     /// UNIQUE 索引値の論理予約キー。
     let private uniqueReservationKey (indexName: string) (key: byte array) =
         conflictKey (ReservationKeyspacePrefix + indexName) key
@@ -192,6 +209,21 @@ module internal Transaction =
         |> Map.toList
         |> List.map (fun (ks, m) -> ks, m |> Map.toList)
         |> perKeyspace nextSeqNo []
+
+/// transaction manager の診断用スナップショット（テスト・診断用。挙動には影響しない）。
+/// <remarks>
+/// 放棄された transaction が `Active` に残ると `OldestActiveSnapshot` が下がり、
+/// `LastCommittedKeys` が以後の commit のキーを保持し続ける。
+/// その状態を外から観測できるようにする。
+/// </remarks>
+type internal TransactionStatus =
+    {
+        NextSeqNo: uint64
+        LastCommitSeqNo: uint64
+        ActiveCount: int
+        OldestActiveSnapshot: uint64
+        LastCommittedKeys: int
+    }
 
 /// transaction を管理し、commit order の一意性と write-write 競合を保証する。
 type internal TransactionManager =
@@ -334,10 +366,22 @@ module internal TransactionManager =
             let conflicting = findConflicts txn manager.LastCommitted txn.Snapshot.SeqNo
 
             if not (List.isEmpty conflicting) then
-                err (
-                    sprintf "Transaction %d が key %d 件と write-write 競合しました" txn.TxnId conflicting.Length
-                    |> DbError.conflict
-                )
+                let examples =
+                    conflicting
+                    |> List.truncate 3
+                    |> List.map Transaction.describeConflictKey
+                    |> String.concat ", "
+
+                let more = if conflicting.Length > 3 then ", ..." else ""
+
+                sprintf
+                    "Transaction %d が key %d 件と write-write 競合しました（例: %s%s）"
+                    txn.TxnId
+                    conflicting.Length
+                    examples
+                    more
+                |> DbError.conflict
+                |> err
             else
                 let batches, allocatedNext = Transaction.toEntries manager.NextSeqNo txn
 
@@ -376,12 +420,20 @@ module internal TransactionManager =
 
                 ret (updated, commitSeq, batches)
 
+    /// TxnId だけで active から外す。
+    /// <remarks>
+    /// 接続が Close されずに捨てられた場合、finalizer は TxnId しか分からない
+    /// （`Transaction` は接続側にあり、もう触れない）。
+    /// 存在しない TxnId は何もしない（既に commit / abort 済みでも安全）。
+    /// </remarks>
+    let abortId (txnId: TxnId) (manager: TransactionManager) =
+        { manager with
+            Active = Map.remove txnId manager.Active
+        }
+
     /// transaction を破棄する（abort）。
     /// バッファは捨てられるので DB には何も残らない。
-    let abort (txn: Transaction) (manager: TransactionManager) =
-        { manager with
-            Active = Map.remove txn.TxnId manager.Active
-        }
+    let abort (txn: Transaction) (manager: TransactionManager) = abortId txn.TxnId manager
 
 /// 同じ DB を指す root 表記の揺れ（相対・絶対・末尾の /）を吸収する。
 module internal RootKey =
@@ -559,20 +611,31 @@ type internal RootRuntime() =
 /// finalizer が走るのは「その接続がもう使えない」状態なので、
 /// まだ commit できる transaction を誤って解放することはない。
 /// 明示的に終わらせた場合は登録が先に外れているので何もしない（解除は冪等）。
+/// 未解放のまま GC された場合は、二度と commit できない transaction が
+/// `TransactionManager.Active` に残るため、`onAbandon` で通知する。
+/// 通知側（`DatabaseHost`）はロックを取らずにキューへ積み、次の書き込みで回収する。
 /// </remarks>
-type internal RegistrationLease(registration: ActiveRegistration) =
+type internal RegistrationLease(registration: ActiveRegistration, ?onAbandon: unit -> unit) =
     /// このリースの生存トークン。
     let token = registration.Attach()
+
+    /// 登録を外す。戻り値は「これが最後のリースだった」かどうか。
+    let releaseCore () =
+        if registration.Detach token then
+            registration.Unregister()
+            true
+        else
+            false
 
     /// 登録そのもの（`ExecState.ActiveRegistration` へ渡す）。
     member _.Registration = registration
 
     /// このリースの登録を外す。
     /// 最後の 1本なら registry からも消える。二重呼び出しは無害。
-    member _.Release() =
-        if registration.Detach token then
-            registration.Unregister()
+    member _.Release() = releaseCore () |> ignore
 
-    override this.Finalize() =
-        // finalizer から例外を漏らさない（.NET ではプロセス終了になる）。
-        protect (fun () -> this.Release()) |> ignore
+    override _.Finalize() =
+        protect (fun () ->
+            if releaseCore () then
+                onAbandon |> Option.iter (fun signal -> signal ()))
+        |> ignore

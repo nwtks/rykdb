@@ -77,6 +77,7 @@
 | INV-41 | 集約の作業メモリは `Seen` を含めて全体で計上する      | `Ops.aggregate` の `seenBytes` / `bucketBytes`、OpsTests                                  |
 | INV-42 | 比較の型は計画時に判定し、行の有無に依存させない      | `Eval.checkComparableTypes`、`Binder.qualify`、`DmlOps`、SqlReferenceTests                |
 | INV-43 | 解析用の修飾失敗で ON 述語を落とさない                | `PlanBuilder.buildSteps`（raw ON へのフォールバック・残りの Filter 化）、PlanBuilderTests |
+| INV-44 | 放棄された transaction は次の書き込みで回収する       | `RegistrationLease`、`DatabaseHost.reclaimAbandoned`、DatabaseHostTests                   |
 
 ---
 
@@ -746,6 +747,23 @@ DMLは即時RESTRICTを適用する。
 回帰テストは参照先省略、NameError、主キー以外、型不一致、
 複合主キー、カタログ再オープン、INSERT/UPDATE/DELETE、
 自己参照（INSERT / UPDATE / 同一文の先行行）、DROP、RENAME、ADD COLUMNを検査する。
+
+### INV-44: 放棄された transaction の回収
+
+接続がCloseされずにGCされた場合でも、二度とcommitできないtransactionを
+`TransactionManager.Active`に残さない。
+残すと`activeSnapshot`が下がり、`LastCommitted`が以後のcommitのキーを保持し続ける（メモリリーク）。
+
+- `RegistrationLease`のfinalizerは、明示解放されていなければ`onAbandon`で`TxnId`を`DatabaseHost`へ通知する。
+- finalizerは`ConcurrentQueue`に積むだけで、`writeGate`/`stateGate`を取らない
+  （finalizerスレッドをgate待ちで止めない）。
+- `DatabaseHost.serialized`が`writeGate`の内側でキューを回収し、
+  `TransactionManager.abortId`で`Active`から外して公開する。
+- 回収は冪等で、既にcommit/abort済みの`TxnId`は無視される。
+- 明示的なcommit / rollback / Closeは先にリースを解放するので通知しない。
+
+回帰テストは `DatabaseHost: 放棄された transaction は次の書き込みで manager から回収される`、
+`DatabaseHost: commit せずに捨てた transaction も GC されれば登録が外れる` を検査する。
 
 ---
 
