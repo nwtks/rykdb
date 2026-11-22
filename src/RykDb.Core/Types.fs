@@ -464,6 +464,23 @@ module internal SqlValue =
             |> DbError.typeError
             |> DbErr
 
+    /// 静的に比較できる型の組み合わせか（`compareValuesV` の型判定と同じ規則）。
+    /// NULL は 3値論理で NULL になるためどの型とも比べられる。
+    /// 値の内容（REAL の NaN / ±Infinity など）は見ない。
+    let typesComparable (a: DataType) (b: DataType) =
+        match a, b with
+        | DataType.Null, _
+        | _, DataType.Null -> true
+        | (DataType.Integer | DataType.Real | DataType.Decimal), (DataType.Integer | DataType.Real | DataType.Decimal) ->
+            true
+        | DataType.Boolean, DataType.Boolean -> true
+        | DataType.Text, DataType.Text -> true
+        | DataType.Blob, DataType.Blob -> true
+        | DataType.Uuid, DataType.Uuid -> true
+        | DataType.Date, (DataType.Date | DataType.Timestamp) -> true
+        | DataType.Timestamp, (DataType.Timestamp | DataType.Date) -> true
+        | _ -> false
+
     /// ORDER BY 用の全順序比較（内部ホットパス用）。
     /// NULL は他のすべての値より小さいものとして扱う（ASC の先頭、DESC の末尾）。
     /// SQL の 3値論理では NULL は比較不能だが、ソートには全順序が必要なのでここだけ規則を分ける。

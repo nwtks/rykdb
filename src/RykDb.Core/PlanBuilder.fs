@@ -353,7 +353,14 @@ module internal PlanBuilder =
 
         let rec apply bindings scans joinPredicates onPredicates unmovableOns byName acc accSchema joined used usedOns =
             function
-            | [] -> ret (acc, accSchema, used)
+            | [] ->
+                let leftovers =
+                    onPredicates
+                    |> List.choose (fun (i, _, e) -> if Set.contains i usedOns then None else Some e)
+
+                match Predicate.joinConjuncts leftovers with
+                | None -> ret (acc, accSchema, used)
+                | Some p -> ret (Logical.Filter(p, acc), accSchema, used)
             | next :: tail ->
                 match byName |> Map.tryFind next with
                 | None -> err (DbError.internalError "結合順の候補が FROM / JOIN の別名に対応しません")
@@ -443,12 +450,9 @@ module internal PlanBuilder =
                 let qualifiedOns =
                     inner
                     |> List.map (fun (i, j) ->
-                        let qualified =
-                            match Binder.qualify segmentSchema j.On with
-                            | Ok e -> Some e
-                            | Error _ -> None
-
-                        i, j, qualified)
+                        match Binder.qualify segmentSchema j.On with
+                        | Ok e -> i, j, Some e
+                        | Error _ -> i, j, Some j.On)
 
                 let edges =
                     (qualifiedOns

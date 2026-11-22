@@ -3498,3 +3498,51 @@ let ``SqlReference: テーブル名の重複は大小文字を区別せずにエ
 
         Assert.Equal<int>(1, res.Rows.Length)
         Assert.Equal<int64>(1L, asInt res.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: 比較できない型は行が 0 件でも計画時に TypeError`` () =
+    // 列の宣言型とリテラルの型から比較可能性が分かるので、行の有無に関係なく
+    // TypeError にする（1 行入れると実行時に落ちる、という差を作らない）。
+    withSession "static-type-check" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE e (id INTEGER PRIMARY KEY, v TEXT)"
+        let db2 = exec db1 "CREATE TABLE f (s TEXT PRIMARY KEY, n INTEGER)"
+
+        expectMessage "型 'INTEGER' と 'TEXT' は比較できません" "SELECT COUNT(*) FROM e WHERE id = '1'" db2
+        expectErrorKind ErrorKind.TypeError "空テーブルの等値結合" (execSql db2 "SELECT COUNT(*) FROM e JOIN f ON e.id = f.s")
+
+        expectErrorKind
+            ErrorKind.TypeError
+            "空テーブルの BETWEEN"
+            (execSql db2 "SELECT COUNT(*) FROM e WHERE id BETWEEN 'a' AND 'z'")
+
+        expectErrorKind ErrorKind.TypeError "空テーブルの IN" (execSql db2 "SELECT COUNT(*) FROM e WHERE id IN (1, 'x')")
+        expectErrorKind ErrorKind.TypeError "空テーブルの UPDATE" (execSql db2 "UPDATE e SET v = 'x' WHERE id = 'a'")
+        expectErrorKind ErrorKind.TypeError "空テーブルの DELETE" (execSql db2 "DELETE FROM e WHERE id = 'a'")
+
+        // 数値同士（INTEGER / DECIMAL / REAL）と NULL は比較できる。
+        let _, res =
+            ok (execSql db2 "SELECT COUNT(*) FROM e WHERE id = 1.5 AND id > -1e3 AND id = NULL")
+
+        Assert.Equal<int64>(0L, asInt res.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: ORDER BY の式に含まれる未知の列も 0 件でエラー`` () =
+    withSession "order-by-expr-ref" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE e (id INTEGER PRIMARY KEY)"
+
+        expectErrorKind ErrorKind.NameError "式の中の未知の列" (execSql db1 "SELECT id FROM e ORDER BY nope + 1")
+
+        // 正当な式は通る（0 行のまま）。
+        let _, res = ok (execSql db1 "SELECT id FROM e ORDER BY id + 1 DESC")
+        Assert.Equal<int>(0, res.Rows.Length))
+
+[<Fact>]
+let ``SqlReference: 相関 IN の左辺の未知の列も 0 件でエラー`` () =
+    withSession "correlated-in-left" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE e (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db2 = exec db1 "CREATE TABLE f (x INTEGER PRIMARY KEY, k INTEGER)"
+
+        expectErrorKind
+            ErrorKind.NameError
+            "相関 IN の左辺"
+            (execSql db2 "SELECT nope IN (SELECT f.x FROM f WHERE f.k = e.k) FROM e"))

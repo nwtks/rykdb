@@ -710,6 +710,60 @@ module internal Eval =
         | Some e -> err e
         | None -> ret ()
 
+    /// 比較の型を静的に検査する。
+    /// 列参照・リテラル・値・CAST から型が決まる比較だけを見て、
+    /// `compareValuesV` が型エラーにする組み合わせ（例: INTEGER と TEXT）を
+    /// 行の有無に関係なく TypeError にする。
+    /// 演算・関数・集約の結果は型を決めないので、実行時の判定に委ねる。
+    /// 走査は明示スタックなので、式の深さに依存せずスタックを食わない。
+    let checkComparableTypes (schema: Schema) (e: Expr) =
+        let columnType c =
+            match Schema.resolve c schema with
+            | Ok i -> schema.Columns.[i].DataType
+            | Error _ ->
+                match Schema.resolve { Qualifier = None; Name = c.Name } schema with
+                | Ok i -> schema.Columns.[i].DataType
+                | Error _ -> None
+
+        let simpleType =
+            function
+            | Expr.Column c -> columnType c
+            | Expr.Name n -> columnType { Qualifier = None; Name = n }
+            | Expr.Literal l -> SqlValue.dataType l.ToSqlValue |> Result.toOption
+            | Expr.Value v -> SqlValue.dataType v |> Result.toOption
+            | Expr.Cast(_, dt) -> Some dt
+            | _ -> None
+
+        let compareCheck a b =
+            match simpleType a, simpleType b with
+            | Some ta, Some tb when not (SqlValue.typesComparable ta tb) ->
+                sprintf "型 '%s' と '%s' は比較できません" (DataType.toSqlName ta) (DataType.toSqlName tb)
+                |> DbError.typeError
+                |> err
+            | _ -> ret ()
+
+        let nodeCheck =
+            function
+            | Expr.Binary(BinaryOp.Eq, a, b)
+            | Expr.Binary(BinaryOp.Ne, a, b)
+            | Expr.Binary(BinaryOp.Lt, a, b)
+            | Expr.Binary(BinaryOp.Le, a, b)
+            | Expr.Binary(BinaryOp.Gt, a, b)
+            | Expr.Binary(BinaryOp.Ge, a, b) -> compareCheck a b
+            | Expr.Between(x, lo, hi, _) -> compareCheck x lo >>= fun () -> compareCheck x hi
+            | Expr.InList(x, items, _) -> items |> foldOk (fun () item -> compareCheck x item) ()
+            | _ -> ret ()
+
+        let rec loop =
+            function
+            | [] -> ret ()
+            | node :: rest ->
+                match nodeCheck node with
+                | Error e -> err e
+                | Ok() -> loop (List.append (Expr.children node) rest)
+
+        loop [ e ]
+
     /// 計画時に作った評価準備で式を評価する（内部ホットパス用）。
     /// 集約呼び出しはここでエラーになる。
     /// 評価機 step を空の継続スタックで始める（末尾再帰のまま深さ・候補数に依存しない）。

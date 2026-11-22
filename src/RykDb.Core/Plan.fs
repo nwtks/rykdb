@@ -749,7 +749,9 @@ module internal Plan =
                                         membership.Release()
                                         result
 
-                            k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
+                            match Eval.checkPrepared resolve with
+                            | Error e -> err e
+                            | Ok() -> k (Expr.CorrelatedSubquery { Run = run; Depths = depthsOf refs }))
                 ctx
                 sel
         | other -> k other

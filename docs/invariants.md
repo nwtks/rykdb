@@ -32,49 +32,51 @@
 
 ## 一覧
 
-| ID     | 不変条件                                              | 主な担保                                                                 |
-| ------ | ----------------------------------------------------- | ------------------------------------------------------------------------ |
-| INV-01 | `Op` と `SstScan` は one-shot である                  | `Op.emit`、`Op.compute`、`SstScan.of*`、`TestHelpers.oneShot`            |
-| INV-02 | 出力行は DB 内部の配列と独立している                  | `SqlValue.copyRow`、`Engine.runSelect`、`RowReader.TryRead`              |
-| INV-03 | エントリ順序は 1種類に統一されている                  | `KeyOrder.compare`、`Entry.compareKeys`、`SstEntry.compare`              |
-| INV-04 | 異なる意味の番号を型で区別する                        | `manifestNo`、`txnId` units of measure                                   |
-| INV-05 | transaction manager の状態関係が成立する              | `TransactionsTests` の `validate`                                        |
-| INV-06 | `Version` のレベル、番号、キー範囲が妥当である        | `TestHelpers.validateVersion`                                            |
-| INV-07 | compaction の GC は可視行を保存する                   | `Compaction.gcGroup` と可視性プロパティテスト                            |
-| INV-08 | MANIFEST は追記専用かつ番号が単調である               | `VersionEdit`、`Manifest`、再オープンテスト                              |
-| INV-09 | WAL は commit済み prefix だけを再生する               | `Wal.foldCommitted` と torn-tail テスト                                  |
-| INV-10 | keyspace 接頭辞が互いに混ざらない                     | `Keyspace.prefixedKey`、`RowStore` の走査テスト                          |
-| INV-11 | ヘッダ長、行幅、射影長が一致する                      | `SelectProjection.create`                                                |
-| INV-12 | `Cursor` の位置は常に範囲内にある                     | `Cursor.fsi`、`Cursor.createSlice`                                       |
-| INV-13 | Bloom filter のビット数は 8 の倍数である              | `BloomFilter.bitsFor`、`deserialize`                                     |
-| INV-14 | memtable の ApproxBytes は正確である                  | `Memtable.fsi`、`Memtable.insert`                                        |
-| INV-15 | `RowReader` の状態は一意である                        | `RowReaderState`、`releaseTo`                                            |
-| INV-16 | Session のロック規約を守る                            | `stateGate`、`writeGate`、並行テスト                                     |
-| INV-17 | process lock と transaction の lease 所有権を保つ     | `ForceRelease`、`RegistrationLease`、GC テスト                           |
-| INV-18 | 式ノードの children と arity が一致する               | `Expr.mapChildrenState`、`AstTests.allNodeKinds`                         |
-| INV-19 | 保持する側はキーと行を複製して所有する                | `Entry.takeOwnership`、`Transaction.setSlot`                             |
-| INV-20 | `Writer.Chunks` は逆順に保持する                      | `Writer.fsi`、順序プロパティテスト                                       |
-| INV-21 | UNIQUE の論理予約を commitまで保持する                | `Transaction.reserveUnique`、`TransactionManager.commit`                 |
-| INV-22 | mutable 状態を許可された層とスロットに限定する        | 状態 DU、クエリ局所 mutable                                              |
-| INV-23 | 公開行は `LoadedRow` のみで構成する                   | `LoadedRow.create`、`StatementResult`、`RowReader`                       |
-| INV-24 | 公開 Version とファイル refcount を一貫させる         | `VersionCoordinator`、pin/sweep                                          |
-| INV-25 | commit の WAL 位置を fsync 前に登録する               | `DatabaseHost.serialized`                                                |
-| INV-26 | 確定状態には transaction を保持しない                 | `Committed`、`HostLifecycle`、`ExecState`                                |
-| INV-27 | DB・プロセス寿命の可変キャッシュを持たない            | 計画時の不変値、許可リスト                                               |
-| INV-28 | 索引エントリの値は空とし、キーから索引列を復号する    | `RowKey.indexKey`、`Dml.indexAccessMasks`                                |
-| INV-29 | spill ファイルは閉じ、不要になったら削除する          | `Spill`、`MemoryBudget.Scope`                                            |
-| INV-30 | 外部キーは親の主キーに解決し即時 RESTRICT を守る      | `ForeignKey.*`                                                           |
-| INV-31 | INL は右部分木の制約を落とさない                      | `Analyzer.absorbedPredicates`、`Optimizer.execIndexJoin`                 |
-| INV-32 | `SELECT *` は論理スキーマ順で展開する                 | `ProjectFrame`、`Ops.project`                                            |
-| INV-33 | ハッシュ結合は小さい側を build し、run を逐次削除する | `Optimizer.hashBuildSide`、`OpsJoin.innerJoinHashBuildLeft`、`ScanScope` |
-| INV-34 | 走査は tombstone を返さず、ポイント検索は削除を返す   | `StorageEngine.scanAtWith`、`getAtMasked`、回帰テスト                    |
-| INV-35 | 統計キーはテーブル定義の寿命に従う                    | `Catalog.removeTable`、`Catalog.removeStatsInTxn`、`ANALYZE` テスト      |
-| INV-36 | 真偽の解釈は WHERE / NOT / CASE / IS TRUE で同一      | `Eval.truthOfValue`、EvalTests、SqlReferenceTests                        |
-| INV-37 | マージ結合のキーは連言の位置の対応を保つ              | `Analyzer.mergeJoinKeys`、AnalyzerTests、SqlReferenceTests               |
-| INV-38 | 退避した値集合の Bloom は SQL 等値の全表現を網羅する  | `ValueKey`、ValueSetTests                                                |
-| INV-39 | 等値キーの符号化は SQL の等値と一致する               | `KeyBuilder`、`Ops.distinct`、`Ops.aggregate`、`OpsJoin.encodeKey`       |
-| INV-40 | 有限の REAL から非有限値を作らない                    | `Eval.realArith`、`Ops.addValue`、SqlReferenceTests                      |
-| INV-41 | 集約の作業メモリは `Seen` を含めて全体で計上する      | `Ops.aggregate` の `seenBytes` / `bucketBytes`、OpsTests                 |
+| ID     | 不変条件                                              | 主な担保                                                                                  |
+| ------ | ----------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| INV-01 | `Op` と `SstScan` は one-shot である                  | `Op.emit`、`Op.compute`、`SstScan.of*`、`TestHelpers.oneShot`                             |
+| INV-02 | 出力行は DB 内部の配列と独立している                  | `SqlValue.copyRow`、`Engine.runSelect`、`RowReader.TryRead`                               |
+| INV-03 | エントリ順序は 1種類に統一されている                  | `KeyOrder.compare`、`Entry.compareKeys`、`SstEntry.compare`                               |
+| INV-04 | 異なる意味の番号を型で区別する                        | `manifestNo`、`txnId` units of measure                                                    |
+| INV-05 | transaction manager の状態関係が成立する              | `TransactionsTests` の `validate`                                                         |
+| INV-06 | `Version` のレベル、番号、キー範囲が妥当である        | `TestHelpers.validateVersion`                                                             |
+| INV-07 | compaction の GC は可視行を保存する                   | `Compaction.gcGroup` と可視性プロパティテスト                                             |
+| INV-08 | MANIFEST は追記専用かつ番号が単調である               | `VersionEdit`、`Manifest`、再オープンテスト                                               |
+| INV-09 | WAL は commit済み prefix だけを再生する               | `Wal.foldCommitted` と torn-tail テスト                                                   |
+| INV-10 | keyspace 接頭辞が互いに混ざらない                     | `Keyspace.prefixedKey`、`RowStore` の走査テスト                                           |
+| INV-11 | ヘッダ長、行幅、射影長が一致する                      | `SelectProjection.create`                                                                 |
+| INV-12 | `Cursor` の位置は常に範囲内にある                     | `Cursor.fsi`、`Cursor.createSlice`                                                        |
+| INV-13 | Bloom filter のビット数は 8 の倍数である              | `BloomFilter.bitsFor`、`deserialize`                                                      |
+| INV-14 | memtable の ApproxBytes は正確である                  | `Memtable.fsi`、`Memtable.insert`                                                         |
+| INV-15 | `RowReader` の状態は一意である                        | `RowReaderState`、`releaseTo`                                                             |
+| INV-16 | Session のロック規約を守る                            | `stateGate`、`writeGate`、並行テスト                                                      |
+| INV-17 | process lock と transaction の lease 所有権を保つ     | `ForceRelease`、`RegistrationLease`、GC テスト                                            |
+| INV-18 | 式ノードの children と arity が一致する               | `Expr.mapChildrenState`、`AstTests.allNodeKinds`                                          |
+| INV-19 | 保持する側はキーと行を複製して所有する                | `Entry.takeOwnership`、`Transaction.setSlot`                                              |
+| INV-20 | `Writer.Chunks` は逆順に保持する                      | `Writer.fsi`、順序プロパティテスト                                                        |
+| INV-21 | UNIQUE の論理予約を commitまで保持する                | `Transaction.reserveUnique`、`TransactionManager.commit`                                  |
+| INV-22 | mutable 状態を許可された層とスロットに限定する        | 状態 DU、クエリ局所 mutable                                                               |
+| INV-23 | 公開行は `LoadedRow` のみで構成する                   | `LoadedRow.create`、`StatementResult`、`RowReader`                                        |
+| INV-24 | 公開 Version とファイル refcount を一貫させる         | `VersionCoordinator`、pin/sweep                                                           |
+| INV-25 | commit の WAL 位置を fsync 前に登録する               | `DatabaseHost.serialized`                                                                 |
+| INV-26 | 確定状態には transaction を保持しない                 | `Committed`、`HostLifecycle`、`ExecState`                                                 |
+| INV-27 | DB・プロセス寿命の可変キャッシュを持たない            | 計画時の不変値、許可リスト                                                                |
+| INV-28 | 索引エントリの値は空とし、キーから索引列を復号する    | `RowKey.indexKey`、`Dml.indexAccessMasks`                                                 |
+| INV-29 | spill ファイルは閉じ、不要になったら削除する          | `Spill`、`MemoryBudget.Scope`                                                             |
+| INV-30 | 外部キーは親の主キーに解決し即時 RESTRICT を守る      | `ForeignKey.*`                                                                            |
+| INV-31 | INL は右部分木の制約を落とさない                      | `Analyzer.absorbedPredicates`、`Optimizer.execIndexJoin`                                  |
+| INV-32 | `SELECT *` は論理スキーマ順で展開する                 | `ProjectFrame`、`Ops.project`                                                             |
+| INV-33 | ハッシュ結合は小さい側を build し、run を逐次削除する | `Optimizer.hashBuildSide`、`OpsJoin.innerJoinHashBuildLeft`、`ScanScope`                  |
+| INV-34 | 走査は tombstone を返さず、ポイント検索は削除を返す   | `StorageEngine.scanAtWith`、`getAtMasked`、回帰テスト                                     |
+| INV-35 | 統計キーはテーブル定義の寿命に従う                    | `Catalog.removeTable`、`Catalog.removeStatsInTxn`、`ANALYZE` テスト                       |
+| INV-36 | 真偽の解釈は WHERE / NOT / CASE / IS TRUE で同一      | `Eval.truthOfValue`、EvalTests、SqlReferenceTests                                         |
+| INV-37 | マージ結合のキーは連言の位置の対応を保つ              | `Analyzer.mergeJoinKeys`、AnalyzerTests、SqlReferenceTests                                |
+| INV-38 | 退避した値集合の Bloom は SQL 等値の全表現を網羅する  | `ValueKey`、ValueSetTests                                                                 |
+| INV-39 | 等値キーの符号化は SQL の等値と一致する               | `KeyBuilder`、`Ops.distinct`、`Ops.aggregate`、`OpsJoin.encodeKey`                        |
+| INV-40 | 有限の REAL から非有限値を作らない                    | `Eval.realArith`、`Ops.addValue`、SqlReferenceTests                                       |
+| INV-41 | 集約の作業メモリは `Seen` を含めて全体で計上する      | `Ops.aggregate` の `seenBytes` / `bucketBytes`、OpsTests                                  |
+| INV-42 | 比較の型は計画時に判定し、行の有無に依存させない      | `Eval.checkComparableTypes`、`Binder.qualify`、`DmlOps`、SqlReferenceTests                |
+| INV-43 | 解析用の修飾失敗で ON 述語を落とさない                | `PlanBuilder.buildSteps`（raw ON へのフォールバック・残りの Filter 化）、PlanBuilderTests |
 
 ---
 
@@ -595,6 +597,33 @@ SQL の等値は型・DECIMAL のスケール・DATE/TIMESTAMP を跨ぐため�
 
 回帰テストは `集約: DISTINCT の値が上限を超えても全集約関数が同じ結果` と
 `集約: 最後のスピル以降に溜まった DISTINCT 値も結果に含める` を検査する。
+
+### INV-42: 比較の型は計画時に判定し、行の有無に依存させない
+
+`compareValuesV` が型エラーにする組み合わせ（INTEGER と TEXT など）を実行時の行評価に任せると、
+対象が 0行のときだけ黙って成功する（同じクエリが行数で成否の変わる「静かな誤答」）。
+
+- `SqlValue.typesComparable` が `compareValuesV` の型判定を写し、`Eval.checkComparableTypes` が
+  列の宣言型・リテラル・`Expr.Value`・`CAST` から型が決まる比較（Eq/Ne/Lt/Le/Gt/Ge、BETWEEN、IN リスト）を検査する。
+- `Binder.qualify` と `DmlOps.update` / `delete` から呼ぶので、SELECT / JOIN ON / HAVING / ORDER BY /
+  UPDATE / DELETE のすべてが対象になる。
+- 演算・関数・集約の結果は型を決めないので実行時の判定に委ねる（遅い検出は残るが、誤検出は作らない）。
+
+回帰テストは `SqlReference: 比較できない型は行が 0 件でも計画時に TypeError` を検査する。
+
+### INV-43: 解析用の修飾失敗で ON 述語を落とさない
+
+結合順の解析は ON の `Binder.qualify` をベストエフォートで呼ぶ。
+ここで失敗を `None` として捨てると、`on=TRUE`（直積）になり述語が黙って消える。
+
+- 解析用の修飾が失敗したら、**元の ON 式**を解析結果として使う
+  （実行時に `buildJoin` がもう一度修飾して同じエラーを返す）。
+- どの結合にも昇格できなかった ON 述語は、結合の上に `Logical.Filter` として残す
+  （INNER では ON = WHERE）。
+  `usedOns` は結合句の番号で管理し、位置と取り違えない。
+
+回帰テストは `SqlReference: 型の違う列の等値結合は TypeError`・
+`PlanBuilder.buildLogicalWith: WHERE の結合述語は INNER の ON へ昇格する` を検査する。
 
 ---
 

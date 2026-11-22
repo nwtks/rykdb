@@ -249,3 +249,31 @@ let ``SqlValue.coerce: NULL はどの型へも NULL のまま`` () =
 [<Fact>]
 let ``SqlValue.coerce: 不変換は typeError`` () =
     expectErrorKind ErrorKind.TypeError "型エラーになるはず" (SqlValue.coerce DataType.Integer (SqlValue.Text "x"))
+
+[<Fact>]
+let ``SqlValue.typesComparable: compareValuesV と同じ組み合わせだけ比較できる`` () =
+    let comparable = SqlValue.typesComparable
+
+    // NULL は 3値論理で NULL になるのでどの型とも比べられる。
+    for dt in [ DataType.Integer; DataType.Text; DataType.Boolean; DataType.Date ] do
+        Assert.True(comparable DataType.Null dt)
+        Assert.True(comparable dt DataType.Null)
+
+    // 数値 3 型は相互に比較できる。
+    for a in [ DataType.Integer; DataType.Decimal; DataType.Real ] do
+        for b in [ DataType.Integer; DataType.Decimal; DataType.Real ] do
+            Assert.True(comparable a b, sprintf "%A と %A" a b)
+
+    Assert.True(comparable DataType.Date DataType.Timestamp)
+    Assert.True(comparable DataType.Timestamp DataType.Date)
+    Assert.True(comparable DataType.Text DataType.Text)
+    Assert.True(comparable DataType.Blob DataType.Blob)
+    Assert.True(comparable DataType.Uuid DataType.Uuid)
+    Assert.True(comparable DataType.Boolean DataType.Boolean)
+
+    // 型の異なる組み合わせは比較できない（実行時の compareValuesV と同じ）。
+    Assert.False(comparable DataType.Integer DataType.Text)
+    Assert.False(comparable DataType.Text DataType.Blob)
+    Assert.False(comparable DataType.Boolean DataType.Integer)
+    Assert.False(comparable DataType.Date DataType.Text)
+    Assert.False(comparable DataType.Uuid DataType.Text)

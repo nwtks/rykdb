@@ -641,6 +641,11 @@ module internal DmlOps =
             >>= fun targets ->
                 result {
                     do! Eval.checkPrepared resolve
+
+                    do!
+                        assignExprs @ Option.toList where
+                        |> foldOk (fun () e -> Eval.checkComparableTypes targetSchema e) ()
+
                     let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
                     let! updates = collectUpdates ctx.Txn targets
                     do! validateUniqueUpdates ctx.Txn targets updates
@@ -740,6 +745,12 @@ module internal DmlOps =
 
         result {
             do! Eval.checkPrepared resolve
+
+            do!
+                where
+                |> Option.toList
+                |> foldOk (fun () e -> Eval.checkComparableTypes targetSchema e) ()
+
             let! checks = ForeignKey.prepareParentDeleteChecks ctx.Catalog schema
             let mask = deleteMask checks
 

@@ -8,7 +8,7 @@ module internal Binder =
     /// 葉だけを直し、非葉ノードは形を保ったまま子を 1つずつ加工してから
     /// `Expr.plugChildren` で組み直す（`Expr.rewrite` の評価機）。
     /// </remarks>
-    let qualify (schema: Schema) =
+    let qualify (schema: Schema) (e: Expr) =
         let uniqueQualifier (name: string) =
             let lower = name.ToLowerInvariant()
 
@@ -37,7 +37,9 @@ module internal Binder =
                 | None -> x
             | _ -> x
 
-        Expr.rewrite rewriteLeaf
+        match Expr.rewrite rewriteLeaf e with
+        | Error err -> Error err
+        | Ok qualified -> Eval.checkComparableTypes schema qualified |> Result.map (fun () -> qualified)
 
     /// 複数の式をまとめて修飾名へ。
     let qualifyMany (schema: Schema) =

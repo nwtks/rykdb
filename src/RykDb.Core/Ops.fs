@@ -96,33 +96,37 @@ module internal Ops =
                     result { return! ExtSort.sortRows budget Map.empty (check plan) (compareWith plan) src }
                 else
                     let exprs = keys |> List.map _.Expression
-                    let width = schema.Columns.Length
-                    let plan = keys |> List.mapi (fun i k -> width + i, k.Direction)
 
-                    let projected =
-                        Op.map
-                            (fun row ->
-                                let keyValues = Array.zeroCreate<SqlValue> exprs.Length
+                    match Eval.checkPrepared (Eval.prepare schema exprs) with
+                    | Error e -> err e
+                    | Ok() ->
+                        let width = schema.Columns.Length
+                        let plan = keys |> List.mapi (fun i k -> width + i, k.Direction)
 
-                                let rec fill i =
-                                    function
-                                    | [] -> DbOk(Array.append row keyValues)
-                                    | e :: tail ->
-                                        match Eval.evalWithV resolve row e with
-                                        | DbErr er -> DbErr er
-                                        | DbOk v ->
-                                            keyValues.[i] <- v
-                                            fill (i + 1) tail
+                        let projected =
+                            Op.map
+                                (fun row ->
+                                    let keyValues = Array.zeroCreate<SqlValue> exprs.Length
 
-                                fill 0 exprs)
-                            src
+                                    let rec fill i =
+                                        function
+                                        | [] -> DbOk(Array.append row keyValues)
+                                        | e :: tail ->
+                                            match Eval.evalWithV resolve row e with
+                                            | DbErr er -> DbErr er
+                                            | DbOk v ->
+                                                keyValues.[i] <- v
+                                                fill (i + 1) tail
 
-                    result {
-                        let! sorted =
-                            ExtSort.sortRows budget Map.empty (check plan) (compareWith plan) projected
+                                    fill 0 exprs)
+                                src
 
-                        return Op.map (fun row -> DbOk(Array.sub row 0 width)) sorted
-                    }
+                        result {
+                            let! sorted =
+                                ExtSort.sortRows budget Map.empty (check plan) (compareWith plan) projected
+
+                            return Op.map (fun row -> DbOk(Array.sub row 0 width)) sorted
+                        }
 
     /// 重複除去。
     /// 最初に現れた順序を保つ（SQL の DISTINCT）。
