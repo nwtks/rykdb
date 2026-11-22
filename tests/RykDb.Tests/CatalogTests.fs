@@ -78,6 +78,7 @@ let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
         Assert.Equal<int>(1, s.Indexes.Length)
         Assert.Equal<string list>([ "name" ], s.Indexes.[0].Columns)
         Assert.Equal<int64 list>([ 2L ], s.Indexes.[0].PrefixNDV)
+        Assert.True(s.AnalyzedAt.IsNone)
 
         Assert.True(
             Catalog.findStats "people" (Catalog.removeTable "people" loaded)

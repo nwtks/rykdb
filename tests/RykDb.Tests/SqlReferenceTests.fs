@@ -480,9 +480,18 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
         // 列数と NDV の表示
         Assert.Equal<int64>(2L, asInt analyzed.Rows.[0].[2])
         Assert.Contains("id=3", asText analyzed.Rows.[0].[3])
-        // NULL 数・数値範囲・索引 prefix NDV
+        // NULL 数・数値範囲・索引 prefix NDV・収集時刻
         Assert.Equal<string list>(
-            [ "table"; "rows"; "columns"; "ndv"; "nulls"; "ranges"; "indexes" ],
+            [
+                "table"
+                "rows"
+                "columns"
+                "ndv"
+                "nulls"
+                "ranges"
+                "indexes"
+                "analyzed_at"
+            ],
             analyzed.Columns |> Array.toList
         )
 

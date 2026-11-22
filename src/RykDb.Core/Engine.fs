@@ -345,6 +345,8 @@ module internal ExecState =
         let nextRandom state =
             state * 6364136223846793005L + 1442695040888963407L
 
+        progress |> Option.iter (fun report -> report (defn.Name, 0L))
+
         let rec consume accumulate count scan =
             if count % 8192L = 0L && cancel.IsCancellationRequested then
                 SstScan.dispose scan
@@ -556,12 +558,15 @@ module internal ExecState =
 
                     indexStats)
 
+            progress |> Option.iter (fun report -> report (defn.Name, totalRows))
+
             return
                 {
                     Table = schema.Name
                     RowCount = totalRows
                     Columns = columns
                     Indexes = indexes
+                    AnalyzedAt = Some System.DateTimeOffset.UtcNow
                 }
         }
 
@@ -1407,7 +1412,17 @@ module internal Engine =
             runDdlWithState state (fun st ->
                 ExecState.analyze (name, sample) limits.Cancel limits.Progress st
                 >>= fun (next, stats) ->
-                    let columns = [| "table"; "rows"; "columns"; "ndv"; "nulls"; "ranges"; "indexes" |]
+                    let columns =
+                        [|
+                            "table"
+                            "rows"
+                            "columns"
+                            "ndv"
+                            "nulls"
+                            "ranges"
+                            "indexes"
+                            "analyzed_at"
+                        |]
 
                     let rangeText (c: ColumnStats) =
                         match c.Min, c.Max with
@@ -1438,6 +1453,12 @@ module internal Engine =
                                     s.Indexes
                                     |> List.map (fun i -> sprintf "%s=%A" i.Name i.PrefixNDV)
                                     |> String.concat ","
+                                )
+                                SqlValue.Text(
+                                    match s.AnalyzedAt with
+                                    | Some t ->
+                                        t.UtcDateTime.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
+                                    | None -> ""
                                 )
                             |])
                         |> Array.ofList

@@ -74,6 +74,8 @@ type internal TableStats =
         RowCount: int64
         Columns: ColumnStats list
         Indexes: IndexStats list
+        /// 統計を収集した時刻（UTC）。
+        AnalyzedAt: System.DateTimeOffset option
     }
 
 /// カタログ全体のスナップショット。
@@ -422,14 +424,19 @@ module internal Catalog =
                         |> Writer.varint (uint64 c.Histogram.Length)
 
                     c.Histogram |> List.fold (fun w v -> writeFloat v w) w)
-                (Writer.writeByte 1uy w2)
+                (Writer.writeByte 2uy w2)
 
-        s.Indexes
-        |> List.fold
-            (fun w i ->
-                let w = Writer.varint (uint64 i.PrefixNDV.Length) w
-                i.PrefixNDV |> List.fold (fun w n -> Writer.int64LE n w) w)
-            w3
+        let w4 =
+            s.Indexes
+            |> List.fold
+                (fun w i ->
+                    let w = Writer.varint (uint64 i.PrefixNDV.Length) w
+                    i.PrefixNDV |> List.fold (fun w n -> Writer.int64LE n w) w)
+                w3
+
+        match s.AnalyzedAt with
+        | None -> Writer.int64LE 0L w4
+        | Some t -> Writer.int64LE t.UtcTicks w4
         |> Writer.toArray
 
     let private readColumnStat (c: Cursor) =
@@ -518,18 +525,21 @@ module internal Catalog =
 
                     index)
 
+            let baseStats =
+                {
+                    Table = table
+                    RowCount = rowCount
+                    Columns = columns
+                    Indexes = indexes
+                    AnalyzedAt = None
+                }
+
             if Cursor.atEnd afterIndexes then
-                return
-                    {
-                        Table = table
-                        RowCount = rowCount
-                        Columns = columns
-                        Indexes = indexes
-                    }
+                return baseStats
             else
                 let! tag, cur4 = Reader.readByte afterIndexes
 
-                if tag <> 1uy then
+                if tag <> 1uy && tag <> 2uy then
                     return! err (sprintf "統計の形式が不明です: %d" tag |> DbError.corruption)
                 else
                     let! columnExtras, cur5 =
@@ -538,7 +548,19 @@ module internal Catalog =
                     let! indexExtras, cur6 =
                         Reader.readItems readIndexExtras (uint64 indexes.Length) cur5
 
-                    if not (Cursor.atEnd cur6) then
+                    let! analyzedAt, cur7 =
+                        if tag < 2uy then
+                            ret (None, cur6)
+                        else
+                            Reader.readInt64LE cur6
+                            |> Result.map (fun (ticks, cur) ->
+                                (if ticks > 0L then
+                                     Some(System.DateTimeOffset(ticks, System.TimeSpan.Zero))
+                                 else
+                                     None),
+                                cur)
+
+                    if not (Cursor.atEnd cur7) then
                         return! err (DbError.corruption "統計の末尾に余分なデータがあります")
                     else
                         let columns =
@@ -557,11 +579,10 @@ module internal Catalog =
                             List.map2 (fun i prefix -> { i with PrefixNDV = prefix }) indexes indexExtras
 
                         return
-                            {
-                                Table = table
-                                RowCount = rowCount
+                            { baseStats with
                                 Columns = columns
                                 Indexes = indexes
+                                AnalyzedAt = analyzedAt
                             }
         }
 

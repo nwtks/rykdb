@@ -9,6 +9,57 @@ open RykDb.Core
 open RykDb.TestHelpers
 
 [<Fact>]
+let ``Optimizer.exec: 右が結合の部分木（bushy）でも実行できる`` () =
+    withSession "bushy" (fun db ->
+        let db = exec db "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "INSERT INTO a VALUES (1,10),(2,20)"
+        let db = exec db "INSERT INTO b VALUES (1,10),(2,20)"
+        let db = exec db "INSERT INTO c VALUES (1,10),(2,20),(3,30)"
+
+        let stmt =
+            match parseOneOk "SELECT a.id FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k" with
+            | Statement.Select s -> s
+            | other -> failwithf "SELECT ではありません: %A" other
+
+        let plan = ok (db.PrepareSelect stmt)
+        let scan name = Logical.Scan(name, ScanMethod.SeqScan)
+
+        let col q n =
+            Expr.Column { Qualifier = Some q; Name = n }
+
+        let eq x y = Expr.Binary(BinaryOp.Eq, x, y)
+
+        // a ⋈ (b ⋈ c) の bushy 木（右が結合の部分木）。
+        let innerTree =
+            Logical.Join(JoinKind.Inner, "c", eq (col "b" "k") (col "c" "k"), scan "b", scan "c")
+
+        let bushy =
+            Logical.Join(JoinKind.Inner, "", eq (col "a" "k") (col "b" "k"), scan "a", innerTree)
+
+        let tree =
+            Logical.Project(
+                [
+                    {
+                        Expression = col "a" "id"
+                        Alias = None
+                    }
+                ],
+                bushy
+            )
+
+        let rows =
+            try
+                let op = ok (Optimizer.exec plan.Context tree plan.Input)
+                ok (Op.toArray op) |> Array.map (fun row -> asInt row.[0])
+            finally
+                plan.Context.Scope.DisposeAll()
+
+        // 左深の SQL 実行と同じ結果になる。
+        Assert.Equal<int64 list>([ 1L; 2L ], rows |> Array.sort |> Array.toList))
+
+[<Fact>]
 let ``Optimizer.exec: RangeScan は全走査へ落ちる`` () =
     withStore "ex-range" (fun store ->
         let ctx = ctxOf store

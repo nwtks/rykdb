@@ -170,9 +170,38 @@ module internal JoinOrder =
 
         go initialRows initialJoined items []
 
-    /// 1テーブル追加時のコスト増分。
-    /// 等値結合はハッシュ / マージ / INL の最小、直積は入れ子ループ。
-    let private transitionDelta
+    /// 両側の自然順が結合キーで揃っているときの、結合後の出力順。
+    /// 右の走査順の先頭から、結合辺がある限り一致した列名を返す。
+    let private mergeKeyOrder (ordered: string list option) (item: JoinOrderItem) (applicable: JoinOrderEdge list) =
+        match ordered, item.NaturalOrder with
+        | Some left, Some right ->
+            let rec loop i acc =
+                if i >= List.length right then
+                    Some(List.rev acc)
+                else
+                    let rightColumn = right.[i]
+
+                    match
+                        applicable
+                        |> List.tryFind (fun e -> e.KeyColumns |> Map.tryFind item.Name = Some rightColumn)
+                    with
+                    | None -> if i > 0 then Some(List.rev acc) else None
+                    | Some edge ->
+                        if
+                            i < List.length left
+                            && edge.KeyColumns
+                               |> Map.exists (fun name column -> name <> item.Name && SqlName.equal column left.[i])
+                        then
+                            loop (i + 1) (left.[i] :: acc)
+                        else
+                            None
+
+            loop 0 []
+        | _ -> None
+
+    /// 1テーブル追加時の (コスト, 結合後の出力順) の候補。
+    /// ハッシュ・INL・マージはそれぞれ出力順が違うので、すべて候補にする。
+    let private transitionVariants
         (rows: float)
         (rowBytes: float)
         (ordered: string list option)
@@ -182,7 +211,7 @@ module internal JoinOrder =
         (newRows: float)
         =
         if List.isEmpty applicable then
-            rows * item.Rows + newRows
+            [ (rows * item.Rows + newRows, None) ]
         else
             let hashDelta =
                 let buildRows = min rows item.Rows
@@ -201,24 +230,22 @@ module internal JoinOrder =
 
                 buildCost + probeCost + newRows + buildPenalty + spillPenalty
 
-            let mergeDelta =
-                if canMergeJoin ordered item applicable then
-                    Some(rows + item.Rows + newRows)
-                else
-                    None
+            let mergeVariant =
+                mergeKeyOrder ordered item applicable
+                |> Option.map (fun keyOrder -> rows + item.Rows + newRows, Some keyOrder)
 
-            let inlDelta =
+            let inlVariant =
                 if rows <= 32.0 then
                     bestIndexFor item applicable
                     |> Option.map (fun index ->
                         let probeWeight = if index.Unique then 0.5 else 0.8
-                        rows * probeWeight + newRows)
+                        rows * probeWeight + newRows, ordered)
                 else
                     None
 
-            [ hashDelta ] @ Option.toList mergeDelta @ Option.toList inlDelta |> List.min
+            [ (hashDelta, None) ] @ Option.toList mergeVariant @ Option.toList inlVariant
 
-    /// 同じ `mask` の状態として候補を採用するか。
+    /// 同じ出力順の状態として候補を採用するか。
     /// コストが同じなら FROM の位置順（辞書式）で決める。
     let private isBetter (items: JoinOrderItem array) (candidate: PlanState) (current: PlanState option) =
         let positions state =
@@ -227,6 +254,37 @@ module internal JoinOrder =
         match current with
         | None -> true
         | Some old -> (candidate.Cost, positions candidate) < (old.Cost, positions old)
+
+    /// 出力順の同一性（列名の大文字小文字は区別しない）。
+    let private sameOrder (a: string list option) (b: string list option) =
+        match a, b with
+        | None, None -> true
+        | Some x, Some y -> List.length x = List.length y && List.forall2 SqlName.equal x y
+        | _ -> false
+
+    /// 同一 mask の状態リストへ候補を追加する。
+    /// 出力順ごとに最良の 1件を残し、コスト順に `maxOrders` 件まで保持する。
+    let private insertState
+        (items: JoinOrderItem array)
+        (maxOrders: int)
+        (candidate: PlanState)
+        (current: PlanState list)
+        =
+        let replaced, others =
+            current |> List.partition (fun s -> sameOrder s.Ordered candidate.Ordered)
+
+        let sameOrderBest =
+            match replaced with
+            | [] -> candidate
+            | existing :: _ ->
+                if isBetter items candidate (Some existing) then
+                    candidate
+                else
+                    existing
+
+        sameOrderBest :: others
+        |> List.sortBy (fun s -> s.Cost)
+        |> List.truncate maxOrders
 
     /// Selinger DP（左深・先頭固定）。
     /// 適用できないときは None（呼び出し側が貪欲へフォールバックする）。
@@ -270,6 +328,7 @@ module internal JoinOrder =
             None
         else
             let fullMask = (1 <<< count) - 1
+            let maxOrdersPerMask = 8
 
             let initial =
                 {
@@ -285,56 +344,62 @@ module internal JoinOrder =
                 (fun states mask ->
                     match states |> Map.tryFind mask with
                     | None -> states
-                    | Some state ->
+                    | Some stateList ->
                         let joined = joinedOf itemArray mask
 
-                        itemArray
-                        |> Array.indexed
-                        |> Array.fold
-                            (fun states (i, item) ->
-                                let bit = 1 <<< i
+                        stateList
+                        |> List.fold
+                            (fun states state ->
+                                itemArray
+                                |> Array.indexed
+                                |> Array.fold
+                                    (fun states (i, item) ->
+                                        let bit = 1 <<< i
 
-                                if mask &&& bit <> 0 || not (eligible dependencies joined item.Name) then
-                                    states
-                                else
-                                    let newMask = mask ||| bit
-                                    let applicable = applicableEdges edges joined item.Name
-                                    let newRows = nextRows edges joined state.Rows item
+                                        if mask &&& bit <> 0 || not (eligible dependencies joined item.Name) then
+                                            states
+                                        else
+                                            let newMask = mask ||| bit
+                                            let applicable = applicableEdges edges joined item.Name
+                                            let newRows = nextRows edges joined state.Rows item
 
-                                    let delta =
-                                        transitionDelta
-                                            state.Rows
-                                            state.RowBytes
-                                            state.Ordered
-                                            workMemBytes
-                                            applicable
-                                            item
-                                            newRows
+                                            transitionVariants
+                                                state.Rows
+                                                state.RowBytes
+                                                state.Ordered
+                                                workMemBytes
+                                                applicable
+                                                item
+                                                newRows
+                                            |> List.fold
+                                                (fun states (delta, outOrder) ->
+                                                    let candidate =
+                                                        {
+                                                            Cost = state.Cost + delta
+                                                            Rows = newRows
+                                                            RowBytes = state.RowBytes + item.RowBytes
+                                                            Ordered = outOrder
+                                                            Order = state.Order @ [ i ]
+                                                        }
 
-                                    let candidate =
-                                        {
-                                            Cost = state.Cost + delta
-                                            Rows = newRows
-                                            RowBytes = state.RowBytes + item.RowBytes
-                                            Ordered =
-                                                if canMergeJoin state.Ordered item applicable then
-                                                    state.Ordered
-                                                else
-                                                    None
-                                            Order = state.Order @ [ i ]
-                                        }
+                                                    let current =
+                                                        states |> Map.tryFind newMask |> Option.defaultValue []
 
-                                    if isBetter itemArray candidate (states |> Map.tryFind newMask) then
-                                        states |> Map.add newMask candidate
-                                    else
-                                        states)
+                                                    states
+                                                    |> Map.add
+                                                        newMask
+                                                        (insertState itemArray maxOrdersPerMask candidate current))
+                                                states)
+                                    states)
                             states)
-                (Map.ofList [ (0, initial) ])
+                (Map.ofList [ (0, [ initial ]) ])
             |> Map.tryFind fullMask
-            |> Option.map (fun state ->
+            |> Option.map (fun stateList ->
+                let best = stateList |> List.minBy (fun s -> s.Cost)
+
                 {
-                    Order = state.Order |> List.map (fun i -> itemArray.[i].Name)
-                    Cost = state.Cost
+                    Order = best.Order |> List.map (fun i -> itemArray.[i].Name)
+                    Cost = best.Cost
                 })
 
     /// DP が使えれば DP、使えなければ貪欲法。

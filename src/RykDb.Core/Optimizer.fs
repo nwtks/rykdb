@@ -107,18 +107,6 @@ module internal Optimizer =
         | Logical.Project(_, child) -> stripWrappers child
         | other -> other
 
-    let private rightSchemaOf (ctx: ExecContext) (name: string) (right: Logical) =
-        match stripWrappers right with
-        | Logical.Derived plan -> plan.Output
-        | _ -> Schema.ofTable name None (defaultSchema ctx name)
-
-    /// 左スパインを降りて、下端のノードと右側のスキーマを集める。
-    [<TailCall>]
-    let rec private spine (ctx: ExecContext) (acc: Schema list) (tree: Logical) =
-        match stripWrappers tree with
-        | Logical.Join(_, name, _, left, right) -> spine ctx (rightSchemaOf ctx name right :: acc) left
-        | other -> other, acc
-
     let private aggregateSchema (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
         let column name =
             {
@@ -139,19 +127,45 @@ module internal Optimizer =
             Columns = Array.append (List.toArray groupColumns) (List.toArray aggColumns)
         }
 
+    /// 結合を含まないノードの出力スキーマ。
+    let private baseSchemaOf (ctx: ExecContext) (inSchema: Schema) =
+        function
+        | Logical.Aggregate(groupBy, aggs, _) -> aggregateSchema groupBy aggs
+        | Logical.Derived plan -> plan.Output
+        | Logical.UnionAll(plan :: _) -> plan.Output
+        | Logical.Scan(name, _) -> Schema.ofTable name None (defaultSchema ctx name)
+        | Logical.Values _ -> Schema.empty
+        | _ -> inSchema
+
+    /// 出力スキーマを求める作業項目。
+    /// 右部分木のスキーマは後順でしか決まらないが、
+    /// 作業リストへ積んでおけば木の形に依存せず左から順に連結できる。
+    type private SchemaWork =
+        /// 木の出力スキーマを求めて連結する。
+        | SchemaOf of Logical
+        /// 右部分木のスキーマを求めて連結する（結合の部分木なら中を左からたどり直す）。
+        | RightSchemaOf of string * Logical
+
+    /// 結合木を左から深さ優先でたどり、各ノードのスキーマを連結する。
+    /// 右部分木（bushy）は作業リストに積むので、木の深さに依存せずスタックは一定。
+    [<TailCall>]
+    let rec private outputSchema (ctx: ExecContext) (inSchema: Schema) (acc: Schema) (work: SchemaWork list) =
+        match work with
+        | [] -> acc
+        | SchemaOf tree :: rest ->
+            match stripWrappers tree with
+            | Logical.Join(_, name, _, left, right) ->
+                outputSchema ctx inSchema acc (SchemaOf left :: RightSchemaOf(name, right) :: rest)
+            | leaf -> outputSchema ctx inSchema (Schema.concat acc (baseSchemaOf ctx inSchema leaf)) rest
+        | RightSchemaOf(name, right) :: rest ->
+            match stripWrappers right with
+            | Logical.Derived plan -> outputSchema ctx inSchema (Schema.concat acc plan.Output) rest
+            | Logical.Join _ as subtree -> outputSchema ctx inSchema acc (SchemaOf subtree :: rest)
+            | _ ->
+                outputSchema ctx inSchema (Schema.concat acc (Schema.ofTable name None (defaultSchema ctx name))) rest
+
     let private outputOf (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
-        let leaf, rights = spine ctx [] tree
-
-        let baseSchema =
-            match leaf with
-            | Logical.Aggregate(groupBy, aggs, _) -> aggregateSchema groupBy aggs
-            | Logical.Derived plan -> plan.Output
-            | Logical.UnionAll(plan :: _) -> plan.Output
-            | Logical.Scan(name, _) -> Schema.ofTable name None (defaultSchema ctx name)
-            | Logical.Values _ -> Schema.empty
-            | _ -> inSchema
-
-        List.fold Schema.concat baseSchema rights
+        outputSchema ctx inSchema Schema.empty [ SchemaOf tree ]
 
     /// 出力列の必要集合を後方伝播し、各 Scan の列マスクを求める。
     /// `Logical` は参照等価の `obj` キーで覚える（構造比較はできない）。
@@ -273,6 +287,7 @@ module internal Optimizer =
             let rightSchema, rightTable =
                 match stripWrappers right with
                 | Logical.Derived plan -> plan.Output, None
+                | Logical.Join _ -> outputOf ctx inSchema right, None
                 | _ ->
                     let table = defaultSchema ctx name
                     Schema.ofTable name None table, Some table
@@ -738,6 +753,7 @@ module internal Optimizer =
                 let rightSchema, rightTable =
                     match stripWrappers right with
                     | Logical.Derived plan -> plan.Output, None
+                    | Logical.Join _ -> outputOf item.Context item.Schema right, None
                     | _ ->
                         let table = defaultSchema item.Context name
                         Schema.ofTable name None table, Some table

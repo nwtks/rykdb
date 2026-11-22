@@ -454,6 +454,7 @@ let tableStats (table: string) (rows: int64) (columns: ColumnStats list) (indexe
         RowCount = rows
         Columns = columns
         Indexes = indexes
+        AnalyzedAt = None
     }
 
 /// 共有のテスト用テーブルスキーマ。

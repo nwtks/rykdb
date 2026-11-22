@@ -1021,13 +1021,15 @@ ANALYZE [TABLE] [table_name] [SAMPLE n];
 （`ANALYZE SAMPLE`のように整数が続かなければテーブル名のまま）。
 
 - 結合順、結合アルゴリズム、走査基数、Filter 選択性の見積りに使う。
-- 結果は `table` / `rows` / `columns` / `ndv` / `nulls` / `ranges` / `indexes` の 1行
+- 結果は `table` / `rows` / `columns` / `ndv` / `nulls` / `ranges` / `indexes` / `analyzed_at` の 1行
   （全テーブルならテーブルごとに 1行）。
   - `ndv` は `列=異なり値数` の並び、`nulls` は `列=NULL数` の並び。
   - `ranges` は数値列の `列=[最小,最大]`、`indexes` は `索引名=[prefix NDV…]`。
+  - `analyzed_at` は収集した UTC 時刻（ISO 8601）。
 - `SAMPLE n` は reservoir sampling で最大 n 行を標本にする。
   行数は全体を数え、NDV・範囲・NULL 率・数値ヒストグラムは標本から推定する。
 - 進捗は `SessionOptions.OnAnalyzeProgress`、キャンセルは `SessionOptions.CancelAnalysis` で扱う。
+  コールバックはテーブルごとに開始（0行）と終了（全行）で呼ばれる。
 - 統計はDML（`INSERT` / `UPDATE` / `DELETE`）では自動更新しない。
   更新後は必要に応じて再度 `ANALYZE` を実行する。
 - `ALTER TABLE` は対象テーブルの統計を削除する。

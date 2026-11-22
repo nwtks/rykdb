@@ -501,6 +501,9 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 - 状態は部分集合ごとの `(cost, rows, order)`。
   中間行数は `rows * rows_t * 0.1^結合述語本数`（統計なし）で、直積は `rows * rows_t`。
 - コストは等値結合を `build*1.0 + probe*1.0 + 出力`、直積を `左 * 右 + 出力` の行訪問で見積もる。
+- 出力順の違う計画は部分集合ごとに最大8件まで残す（interesting orders）。
+  - `INL` は左の走査順を保ち、`マージ結合` は結合キー順に揃え、`ハッシュ結合` は順序を保証しない。
+  - 後続のマージ結合のために、一時的に高い計画を残せる。
 - 同点はFROMで先に現れたテーブルを優先する。
 
 `ANALYZE [TABLE] [テーブル名] [SAMPLE n]` は行数、列NDV、NULL数、数値列の最小/最大、
@@ -519,6 +522,15 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 統計はDMLで自動更新しない（手動 `ANALYZE` のみ）。
 `ALTER TABLE` はテーブルの統計を削除する。
 `ANALYZE` はテーブル名を省略すると全テーブルを対象にする。
+`TableStats.AnalyzedAt` に収集時刻（UTC）を保持する。
+
+カタログの統計は「旧 prefix + 末尾の tag 付き extras」で保存する。
+
+- 旧 prefix だけで終わる形式は、NULL 数 0・範囲なし・ヒストグラムなしとして読む。
+- tag 1 は列 extras（NULL数・min/max・ヒストグラム）と索引 prefix NDV。
+- tag 2 は tag 1 に `AnalyzedAt`（UTC ticks、0 は不明）を加えたもの。
+- 未知の tag は `CorruptionError`。
+
 統計がない場合は `PkLookup`を1、`IndexLookup`を2、範囲走査を100、全走査を1000とする。
 
 結合順のDPは辺ごとの選択性（NDV）、`IndexColumns`、行幅、走査順も見る。
@@ -531,7 +543,10 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 - ハッシュ結合はbuild側の行数×行幅が作業メモリを超えると、
   `Spill.Partitions` 本への書き出し・読み直しを含むスピルペナルティを加える。
 - 複数索引の選択は prefix NDV が小さい索引を優先する。
-- bushy計画とLEFT JOINを跨ぐ再配置はまだモデル化していない。
+- `PlanBuilder` はまだ左深木だけを組み立てる。
+  `Logical.Join` の右は結合の部分木も許容し、`Optimizer` は `outputOf` で
+  部分木の出力スキーマを作業リストで求め、INL を無効化して実行する（bushy の土台）。
+- bushy の計画生成と LEFT JOIN を跨ぐ再配置はまだ実装していない。
 
 診断・A/B用に `ExecContext.JoinOrder`（`Dp` / `Greedy`）で戦略を切り替えられる。
 `Session.PrepareSelectWith(JoinOrderStrategy.Greedy, stmt)` は貪欲計画を返し、
