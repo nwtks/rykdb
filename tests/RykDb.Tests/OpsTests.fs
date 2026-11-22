@@ -615,6 +615,38 @@ let ``集約: 最後のスピル以降に溜まった DISTINCT 値も結果に�
         assertNoLeftoversDetailed dir)
 
 [<Fact>]
+let ``集約: 退避しても DECIMAL のスケール違いを同じグループにする`` () =
+    // 1.0 と 1.00 は SQL では等しい。退避のキーを `ValueCodec` で符号化すると
+    // 別のグループに分かれていた（メモリ経路は構造的等価で一致していた）。
+    withDir "aggregate-spill-decimal" (fun dir ->
+        let op () =
+            opOfRows
+                [
+                    row [ SqlValue.Decimal 1.0M; SqlValue.Int 1L ]
+                    row [ SqlValue.Decimal 1.00M; SqlValue.Int 1L ]
+                    row [ SqlValue.Decimal 2.00M; SqlValue.Int 1L ]
+                ]
+
+        let aggs = [ (AggFunc.Count, false, false, col "b") ]
+
+        let baseline =
+            ok (Op.toArray (ok (UnlimitedOps.aggregate schema2 [ col "a" ] aggs (op ()))))
+
+        let spilled =
+            ok (Op.toArray (ok (Ops.aggregate (tightBudget dir 1L) schema2 [ col "a" ] aggs (op ()))))
+
+        Assert.Equal<int>(2, baseline.Length)
+        Assert.Equal<int>(2, spilled.Length)
+
+        // 退避経路はグループの代表値を最後に読んだ行の表現で返す（1.0 でも 1.00 でも同じ値）。
+        match spilled.[0].[0] with
+        | SqlValue.Decimal d -> Assert.Equal<decimal>(1M, d)
+        | other -> failActual "DECIMAL ではありません" other
+
+        Assert.Equal<int64 array>([| 1L; 2L |], spilled |> Array.map (fun r -> asInt r.[1]) |> Array.sort)
+        assertNoLeftoversDetailed dir)
+
+[<Fact>]
 let ``集約: DISTINCT の退避は NULL と REAL も正しく扱う`` () =
     withDir "aggregate-distinct-spill-null" (fun dir ->
         let op () =

@@ -72,6 +72,9 @@
 | INV-36 | 真偽の解釈は WHERE / NOT / CASE / IS TRUE で同一      | `Eval.truthOfValue`、EvalTests、SqlReferenceTests                        |
 | INV-37 | マージ結合のキーは連言の位置の対応を保つ              | `Analyzer.mergeJoinKeys`、AnalyzerTests、SqlReferenceTests               |
 | INV-38 | 退避した値集合の Bloom は SQL 等値の全表現を網羅する  | `ValueKey`、ValueSetTests                                                |
+| INV-39 | 等値キーの符号化は SQL の等値と一致する               | `KeyBuilder`、`Ops.distinct`、`Ops.aggregate`、`OpsJoin.encodeKey`       |
+| INV-40 | 有限の REAL から非有限値を作らない                    | `Eval.realArith`、`Ops.addValue`、SqlReferenceTests                      |
+| INV-41 | 集約の作業メモリは `Seen` を含めて全体で計上する      | `Ops.aggregate` の `seenBytes` / `bucketBytes`、OpsTests                 |
 
 ---
 
@@ -556,6 +559,42 @@ SQL の等値は型・DECIMAL のスケール・DATE/TIMESTAMP を跨ぐため�
 
 回帰テストは `ValueSet: 退避しても型・スケール違いの等値を取りこぼさない` と
 `ValueSet: 退避しても DATE と同日 00:00 UTC の TIMESTAMP を等値に扱う` を検査する。
+
+### INV-39: 等値キーの符号化は SQL の等値と一致する
+
+`DISTINCT`、`GROUP BY`、ハッシュ結合は同じ等値で行をまとめる必要がある。
+符号化を別々にすると、`DECIMAL` の `1.0` と `1.00` や `REAL` の `-0.0` と `0.0` で
+演算子ごとに答えが変わる。
+
+- キーは `KeyBuilder.ofValues`（順序保持符号化）を使う。
+- `Ops.distinct` の重複キー、`Ops.aggregate` の退避グループキー、`OpsJoin.encodeKey` が対象。
+- `ValueCodec` はストレージの値符号化であり、DECIMAL のスケールを保存するためキーに使わない。
+
+回帰テストは `SqlReference: DISTINCT は DECIMAL のスケール違いを同じ値とみなす` と
+`集約: 退避しても DECIMAL のスケール違いを同じグループにする` を検査する。
+
+### INV-40: 有限の REAL から非有限値を作らない
+
+有限の入力から `NaN` / `±Infinity` を作ると、値は出力できても比較段階で初めて型エラーになる。
+暗黙の非有限を作らず、演算の時点で `ConstraintViolation` にする。
+
+- `Eval.realArith` は結果が非有限で両入力が有限なら `overflowError` を返す。
+- `SUM` / `AVG` の `SumReal` が有限の入力から非有限になった時点でエラーにする。
+- 入力自体が非有限の場合は汚染として伝播する（ストレージには保存できる）。
+
+回帰テストは `SqlReference: REAL の演算が無限大になる場合はエラー` を検査する。
+
+### INV-41: 集約の作業メモリは `Seen` を含めて全体で計上する
+
+`COUNT(DISTINCT) ... GROUP BY` の `Seen` はグループごとに持つが、上限は全体で見る必要がある。
+グループ局所に判定するとグループ数分だけメモリが伸びる。
+
+- `seenBytes` がバケットの `Seen` のバイト概算を返し、`bucketBytes` と行のたびの増分計上で `used` に合算する。
+- 上限を超えたら、その行以降をパーティションへ退避する。
+- 極小の `WorkMem` では 1 run あたり最低 64 値（最大 2KiB の超過）までまとめる。
+
+回帰テストは `集約: DISTINCT の値が上限を超えても全集約関数が同じ結果` と
+`集約: 最後のスピル以降に溜まった DISTINCT 値も結果に含める` を検査する。
 
 ---
 

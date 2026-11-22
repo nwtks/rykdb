@@ -1607,6 +1607,78 @@ let ``SqlReference: WHERE の真偽と NOT / CASE WHEN / IS UNKNOWN が一致す
         Assert.Equal<int64>(0L, asInt unknown.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: DISTINCT は DECIMAL のスケール違いを同じ値とみなす`` () =
+    // 1.0 と 1.00 は SQL では等しい。SELECT DISTINCT が 2 行を返していた。
+    // COUNT(DISTINCT) / GROUP BY / ハッシュ結合のキーと揃える。
+    withSession "distinct-decimal-scale" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, d DECIMAL)"
+
+        let db2 =
+            exec
+                db1
+                "INSERT INTO t VALUES (1, CAST('1.0' AS DECIMAL)), (2, CAST('1.00' AS DECIMAL)), (3, CAST('2.00' AS DECIMAL))"
+
+        let _, rows = ok (execSql db2 "SELECT DISTINCT d FROM t ORDER BY d")
+        Assert.Equal<int>(2, rows.Rows.Length)
+
+        match rows.Rows.[0].[0], rows.Rows.[1].[0] with
+        | SqlValue.Decimal a, SqlValue.Decimal b ->
+            Assert.Equal<decimal>(1M, a)
+            Assert.Equal<decimal>(2M, b)
+        | other -> failActual "DECIMAL ではありません" other
+
+        let _, counted = ok (execSql db2 "SELECT COUNT(DISTINCT d) FROM t")
+        Assert.Equal<int64>(2L, asInt counted.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: REAL の演算が無限大になる場合はエラー`` () =
+    // 黙って Infinity を返すと、比較段階で初めて型エラーになる。
+    withSession "real-overflow" (fun db0 ->
+        expectErrorKind ErrorKind.ConstraintViolation "1e308 * 10 は Infinity になる" (execSql db0 "SELECT 1e308 * 10")
+
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, x REAL)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 1e308), (2, 1e308)"
+
+        expectErrorKind ErrorKind.ConstraintViolation "SUM(REAL) が Infinity になる" (execSql db2 "SELECT SUM(x) FROM t"))
+
+[<Fact>]
+let ``SqlReference: COUNT 以外の集約に * は使えない`` () =
+    withSession "aggregate-star" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        expectErrorKind ErrorKind.SyntaxError "MIN(*)" (execSql db1 "SELECT MIN(*) FROM t")
+        expectErrorKind ErrorKind.SyntaxError "SUM(*)" (execSql db1 "SELECT SUM(*) FROM t")
+        expectErrorKind ErrorKind.SyntaxError "COUNT(t.*)" (execSql db1 "SELECT COUNT(t.*) FROM t"))
+
+[<Fact>]
+let ``SqlReference: 型の違う列の等値結合は TypeError`` () =
+    // ハッシュ結合のキーは宣言型が一致する列だけ（`Analyzer.joinKeys`）。
+    // 型が違う等値は NestedLoop の比較で TypeError になる（無言の 0 行にしない）。
+    withSession "join-type-mismatch" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE ai (i INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "CREATE TABLE bt (s TEXT PRIMARY KEY)"
+        let db3 = exec db2 "INSERT INTO ai VALUES (1), (2)"
+        let db4 = exec db3 "INSERT INTO bt VALUES ('1'), ('2')"
+
+        expectErrorKind
+            ErrorKind.TypeError
+            "INTEGER と TEXT の等値結合"
+            (execSql db4 "SELECT COUNT(*) FROM ai JOIN bt ON ai.i = bt.s"))
+
+[<Fact>]
+let ``SqlReference: ORDER BY の範囲外の序数は SyntaxError`` () =
+    // 以前は `int n` へ先に変換していたため、32bit 範囲外で例外が漏れる恐れがあった。
+    withSession "order-by-ordinal" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1)"
+
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "ORDER BY 5000000000"
+            (execSql db2 "SELECT id FROM t ORDER BY 5000000000")
+
+        expectErrorKind ErrorKind.SyntaxError "ORDER BY 0" (execSql db2 "SELECT id FROM t ORDER BY 0"))
+
+[<Fact>]
 let ``SqlReference: インデックス入れ子ループ（右索引 + 左が小さい）`` () =
     withSession "joinindex" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE depts (id INTEGER PRIMARY KEY, name TEXT)"

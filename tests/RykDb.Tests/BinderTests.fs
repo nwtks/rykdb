@@ -111,3 +111,14 @@ let ``Predicate.joinConjuncts: split した conjunct を AND で戻せる`` () =
     Assert.True(rejoined |> Option.isSome)
     // 分割 → 再結合 で conjunct が 2 個のまま保たれる
     Assert.Equal<int>(2, Predicate.splitConjuncts (expectSome "rejoined" rejoined) |> List.length)
+
+[<Fact>]
+let ``Alias.substitute: 循環する別名でも終了する`` () =
+    // `substitute` は置換後の式を再訪問するため、循環を残すと終わらない。
+    // 呼び出し側の `dropCyclic` に頼らず、内部で冪等に落とす。
+    let schema = Schema.ofTable "people" None peopleSchema
+    let aliases = Map.ofList [ "a", Expr.Name "b"; "b", Expr.Name "a" ]
+
+    match ok (Alias.substitute schema aliases (Expr.Name "a")) with
+    | Expr.Name "a" -> ()
+    | other -> failActual "循環する別名は置換されないはず" other

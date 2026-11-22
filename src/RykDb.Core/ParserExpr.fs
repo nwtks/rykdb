@@ -625,18 +625,23 @@ module internal ParserExpr =
         | Error e -> err e
         | Ok(_, st) ->
             let upper = name.ToUpperInvariant()
+            let isAgg = (AggFunc.tryParse upper).IsSome
 
             if upper = "COUNT" && isSymbol "*" st then
                 match advance st |> expectSymbol ")" with
                 | Error e -> err e
                 | Ok(_, st) -> k (Expr.AggCall(AggFunc.Count, false, Expr.Star), st)
+            elif isAgg && isSymbol "*" st then
+                fail (sprintf "%s に * は使えません（* を使えるのは COUNT(*) だけです）" upper) st
             else
-                let isAgg = (AggFunc.tryParse upper).IsSome
                 let distinct = isAgg && isKeyword "DISTINCT" st
                 let st = if distinct then advance st else st
 
                 parseExprListC st (fun (argList, st) ->
                     match AggFunc.tryParse upper, argList with
+                    | Some _, Expr.Star :: _ -> fail (sprintf "%s に * は使えません（* を使えるのは COUNT(*) だけです）" upper) st
+                    | Some _, Expr.QualifiedStar _ :: _ ->
+                        fail (sprintf "%s に t.* は使えません（* を使えるのは COUNT(*) だけです）" upper) st
                     | Some agg, [ arg ] -> k (Expr.AggCall(agg, distinct, arg), st)
                     | _ -> k (Expr.FuncCall(upper, argList), st))
 

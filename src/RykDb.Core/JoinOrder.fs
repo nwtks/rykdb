@@ -315,7 +315,11 @@ module internal JoinOrder =
                                             Cost = state.Cost + delta
                                             Rows = newRows
                                             RowBytes = state.RowBytes + item.RowBytes
-                                            Ordered = state.Ordered
+                                            Ordered =
+                                                if canMergeJoin state.Ordered item applicable then
+                                                    state.Ordered
+                                                else
+                                                    None
                                             Order = state.Order @ [ i ]
                                         }
 

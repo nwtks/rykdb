@@ -4,7 +4,7 @@
 //   bindTable           : テーブル参照を TableBinding へ解決する
 //   chooseScanMethod    : WHERE の等値・範囲から ScanMethod を選ぶ
 //   chooseJoinAlgorithm : ON と昇格した WHERE から JoinAlgorithm を選ぶ
-//   estimateRows        : 統計を使わない粗い行数見積り（結合順と INL の判断で共有）
+//   estimateRows        : 統計（無ければ既定値）から行数を推定する（結合順と INL の判断で共有）
 //
 // 論理代数の組み立ては PlanBuilder、Op への変換は Optimizer。
 // ===========================================================================
@@ -908,59 +908,25 @@ module internal Analyzer =
         | _ -> None
 
     let private rangeBounds (tn: string) (colName: string) =
+        let literalFor a b =
+            match colOf tn a, literalOf b with
+            | Some n, Some v when Catalog.eqName n colName -> Some v
+            | _ -> None
+
+        let pick found current =
+            match found with
+            | Some v -> Some v
+            | None -> current
+
         let rec accumulateBounds tn colName lower upper =
             function
             | [] -> lower, upper
             | e :: tail ->
                 match e with
-                | Expr.Binary(BinaryOp.Gt, a, b) ->
-                    let lower' =
-                        match colOf tn a, literalOf b with
-                        | Some n, Some v when Catalog.eqName n colName -> Some v
-                        | _ -> lower
-
-                    let upper' =
-                        match colOf tn b, literalOf a with
-                        | Some n, Some v when Catalog.eqName n colName -> Some v
-                        | _ -> upper
-
-                    accumulateBounds tn colName lower' upper' tail
-                | Expr.Binary(BinaryOp.Ge, a, b) ->
-                    let lower' =
-                        match colOf tn a, literalOf b with
-                        | Some n, Some v when Catalog.eqName n colName -> Some v
-                        | _ -> lower
-
-                    let upper' =
-                        match colOf tn b, literalOf a with
-                        | Some n, Some v when Catalog.eqName n colName -> Some v
-                        | _ -> upper
-
-                    accumulateBounds tn colName lower' upper' tail
-                | Expr.Binary(BinaryOp.Lt, a, b) ->
-                    let upper' =
-                        match colOf tn a, literalOf b with
-                        | Some n, Some v when Catalog.eqName n colName -> Some v
-                        | _ -> upper
-
-                    let lower' =
-                        match colOf tn b, literalOf a with
-                        | Some n, Some v when Catalog.eqName n colName -> Some v
-                        | _ -> lower
-
-                    accumulateBounds tn colName lower' upper' tail
-                | Expr.Binary(BinaryOp.Le, a, b) ->
-                    let upper' =
-                        match colOf tn a, literalOf b with
-                        | Some n, Some v when Catalog.eqName n colName -> Some v
-                        | _ -> upper
-
-                    let lower' =
-                        match colOf tn b, literalOf a with
-                        | Some n, Some v when Catalog.eqName n colName -> Some v
-                        | _ -> lower
-
-                    accumulateBounds tn colName lower' upper' tail
+                | Expr.Binary((BinaryOp.Gt | BinaryOp.Ge), a, b) ->
+                    accumulateBounds tn colName (pick (literalFor a b) lower) (pick (literalFor b a) upper) tail
+                | Expr.Binary((BinaryOp.Lt | BinaryOp.Le), a, b) ->
+                    accumulateBounds tn colName (pick (literalFor b a) lower) (pick (literalFor a b) upper) tail
                 | Expr.Between(x, lo, hi, false) ->
                     match colOf tn x with
                     | Some n when Catalog.eqName n colName ->
@@ -1069,22 +1035,7 @@ module internal Analyzer =
                             else
                                 None
                         | _ -> None
-                    | None ->
-                        let firstCol = cols.Head
-                        let lo, hi = rangeBounds (tn.ToLowerInvariant()) firstCol predicates
-
-                        match lo with
-                        | Some lv when typeMatches b.Schema firstCol lv ->
-                            let upper = hi |> Option.filter (fun v -> typeMatches b.Schema firstCol v)
-
-                            Some(
-                                ScanMethod.IndexRangeScan(
-                                    i.IndexName,
-                                    [| lv |],
-                                    upper |> Option.map (fun v -> [| v |])
-                                )
-                            )
-                        | _ -> None)
+                    | None -> None)
 
         let equalityPrefix tn (i: IndexDefinition) =
             i.Columns

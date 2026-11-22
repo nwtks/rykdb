@@ -755,13 +755,17 @@ module internal Expr =
                     |> writeSteps
                 | Expr.InList(x, xs, neg) ->
                     put "("
-                    let n = List.length xs
+                    let opener = text (if neg then " NOT IN (" else " IN (")
 
-                    let items =
-                        xs |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then "))" else ", ") ])
+                    match xs with
+                    | [] -> sub x [ opener; text "))" ] :: next |> writeSteps
+                    | _ ->
+                        let n = List.length xs
 
-                    sub x [ text (if neg then " NOT IN (" else " IN (") ] :: (items @ next)
-                    |> writeSteps
+                        let items =
+                            xs |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then "))" else ", ") ])
+
+                        sub x [ opener ] :: (items @ next) |> writeSteps
                 | Expr.Like(x, p, neg, esc) ->
                     put "("
 

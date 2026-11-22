@@ -136,9 +136,9 @@ module internal Ops =
     /// </remarks>
     let distinct (budget: MemoryBudget) (src: Op) =
         let encode row =
-            match ValueCodec.writeValues row Writer.Empty with
+            match KeyBuilder.ofValues row with
             | Error e -> DbErr e
-            | Ok w -> DbOk(Writer.toArray w)
+            | Ok key -> DbOk key
 
         let compareSeq (a: SqlValue array) (b: SqlValue array) =
             match a.[0], b.[0] with
@@ -453,23 +453,37 @@ module internal Ops =
             | AggFunc.Avg ->
                 match v with
                 | SqlValue.Real f ->
-                    DbOk
-                        { bump with
-                            SawReal = true
-                            SumReal = acc.SumReal + float acc.SumDecimal + f
-                            SumDecimal = 0M
-                            Seen = newSeen
-                        }
+                    let sum = acc.SumReal + float acc.SumDecimal + f
+
+                    if
+                        not (System.Double.IsFinite sum)
+                        && System.Double.IsFinite acc.SumReal
+                        && System.Double.IsFinite f
+                    then
+                        DbErr(DbError.constraintViolation "SUM の結果が REAL の範囲を超えました")
+                    else
+                        DbOk
+                            { bump with
+                                SawReal = true
+                                SumReal = sum
+                                SumDecimal = 0M
+                                Seen = newSeen
+                            }
                 | SqlValue.Int _
                 | SqlValue.Decimal _ ->
                     match SqlValue.asNumeric v with
                     | Some d ->
                         if acc.SawReal then
-                            DbOk
-                                { bump with
-                                    SumReal = acc.SumReal + float d
-                                    Seen = newSeen
-                                }
+                            let sum = acc.SumReal + float d
+
+                            if not (System.Double.IsFinite sum) && System.Double.IsFinite acc.SumReal then
+                                DbErr(DbError.constraintViolation "SUM の結果が REAL の範囲を超えました")
+                            else
+                                DbOk
+                                    { bump with
+                                        SumReal = sum
+                                        Seen = newSeen
+                                    }
                         else
                             addDecimal acc.SumDecimal d
                             |> DbResult.map (fun sum ->
@@ -537,7 +551,13 @@ module internal Ops =
                         acc.Seen
 
                 let withSeen =
-                    if distinct && MemoryBudget.exceeded (budget.Work, int64 (Set.count newSeen) * 32L) then
+                    let seenLimit =
+                        if budget.Work < 0L then
+                            System.Int64.MaxValue
+                        else
+                            max 64L (budget.Work / 32L)
+
+                    if distinct && int64 (Set.count newSeen) > seenLimit then
                         spillSeen { acc with Seen = newSeen }
                     else
                         DbOk { acc with Seen = newSeen }
@@ -666,10 +686,12 @@ module internal Ops =
         let rowOf bucket key =
             bucket |> List.map finishAcc |> List.toArray |> Array.append key
 
+        let seenBytes = List.sumBy (fun a -> int64 (Set.count a.Seen) * 32L)
+
         let bucketBytes key bucket =
             let seen =
-                bucket
-                |> List.sumBy (fun a -> int64 (Set.count a.Seen) * 32L + int64 (List.length a.SeenRuns) * 64L)
+                seenBytes bucket
+                + (bucket |> List.sumBy (fun a -> int64 (List.length a.SeenRuns) * 64L))
 
             int64 (ValueCodec.managedRowBytes key) + 96L * int64 bucket.Length + seen + 64L
 
@@ -681,13 +703,10 @@ module internal Ops =
             | SqlValue.Int x, SqlValue.Int y -> compare x y
             | _ -> 0
 
-        let encodeKey key =
-            ValueCodec.writeValues key Writer.Empty |> Result.map Writer.toArray
-
         let keyOf r =
-            keyOfRow r |> DbResult.toResult >>= encodeKey
+            keyOfRow r |> DbResult.toResult >>= KeyBuilder.ofValues
 
-        let frame s r = Array.append [| SqlValue.Int s |] r
+        let frame s = Array.append [| SqlValue.Int s |]
 
         let keyOfFrame (f: SqlValue array) =
             match f.[0] with
@@ -732,7 +751,7 @@ module internal Ops =
                 HashIdentity.Structural: System.Collections.Generic.IEqualityComparer<SqlValue array>
             )
 
-        let externalize row seq rest =
+        let externalize startSeq start =
             let stamp = System.Guid.NewGuid().ToString "N"
 
             Spill.openPartitions budget.Directory stamp 0 Spill.Partitions
@@ -741,7 +760,7 @@ module internal Ops =
                     writer.Abandon()
                     err e
 
-                let written = Spill.fillPartitions writer keyOf frame seq (Op.emit row rest)
+                let written = Spill.fillPartitions writer keyOf frame startSeq start
 
                 match written with
                 | Error e -> abandon e
@@ -751,7 +770,7 @@ module internal Ops =
                     let seeds =
                         buckets
                         |> Seq.choose (fun kv ->
-                            match encodeKey kv.Key with
+                            match KeyBuilder.ofValues kv.Key with
                             | Ok encoded -> Some(encoded, struct (kv.Key, kv.Value, firstSeen.[kv.Key]))
                             | Error _ -> None)
                         |> List.ofSeq
@@ -805,12 +824,17 @@ module internal Ops =
                         | DbErr e -> err e
                         | DbOk next ->
                             buckets.[k] <- next
-                            consume order used (seq + 1L) nxt
+                            let grown = max 0L (seenBytes next - seenBytes bucket)
+
+                            if MemoryBudget.exceeded (budget.Work, used + grown) then
+                                externalize (seq + 1L) nxt
+                            else
+                                consume order (used + grown) (seq + 1L) nxt
                     | _ ->
                         let size = bucketBytes k (newBucket ())
 
                         if MemoryBudget.exceeded (budget.Work, used + size) then
-                            externalize row seq nxt
+                            externalize seq (Op.emit row nxt)
                         else
                             let bucket = newBucket ()
 

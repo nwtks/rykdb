@@ -522,6 +522,10 @@ let ``Parser: 文法エラーの諸形`` () =
     expectErrorKind ErrorKind.SyntaxError "IN の ( が無い" (parseStatement "SELECT * FROM t WHERE a IN 1")
     expectErrorKind ErrorKind.SyntaxError "IN リストが空" (parseStatement "SELECT * FROM t WHERE a IN ()")
     expectErrorKind ErrorKind.SyntaxError "COUNT(*) の ) が無い" (parseStatement "SELECT COUNT(* FROM t")
+    expectErrorKind ErrorKind.SyntaxError "MIN(*)" (parseStatement "SELECT MIN(*) FROM t")
+    expectErrorKind ErrorKind.SyntaxError "MAX(*)" (parseStatement "SELECT MAX(*) FROM t")
+    expectErrorKind ErrorKind.SyntaxError "SUM(*)" (parseStatement "SELECT SUM(*) FROM t")
+    expectErrorKind ErrorKind.SyntaxError "COUNT(t.*)" (parseStatement "SELECT COUNT(t.*) FROM t")
     expectErrorKind ErrorKind.SyntaxError "修飾名の後続が不正" (parseStatement "SELECT * FROM t WHERE t. = 1")
 
     // 選択リストの「t. の後が列名でない」場合は式として読み直す（結果として文法エラー）

@@ -500,6 +500,31 @@ INSERT/UPDATEの暗黙変換は`SqlValue.coerce`。
 回帰: `Eval.eval: 真偽の解釈は WHERE / NOT / CASE / IS UNKNOWN で一致する` /
 `SqlReference: WHERE の真偽と NOT / CASE WHEN / IS UNKNOWN が一致する`。
 
+### 6.14 等値キーの符号化は SQL の等値に搖える
+
+`DISTINCT` / `GROUP BY` の退避キーを `ValueCodec`（DECIMAL のスケールを保存）で符号化すると、
+`1.0` と `1.00` が別グループになる。
+メモリ経路は構造的等価、ハッシュ結合は `KeyBuilder` なので三者で答えが食い違う。
+`KeyBuilder` に揃える。
+回帰: `SqlReference: DISTINCT は DECIMAL のスケール違いを同じ値とみなす` /
+`集約: 退避しても DECIMAL のスケール違いを同じグループにする`。
+
+### 6.15 COUNT 以外の集約に \* を許さない
+
+`MIN(*)` / `MAX(*)` は 1行テーブルで静かに NULL、2行以上で TypeError、
+`SUM(*)` は実行時 TypeError になり、行数で結果が変わっていた。
+`COUNT(t.*)` も実行時 NameError になる。
+パース時に `SyntaxError` にする。
+回帰: `Parser: COUNT(*) の ) が無い` の隣の 4 本 / `SqlReference: COUNT 以外の集約に * は使えない`。
+
+### 6.16 REAL の演算から非有限を作らない
+
+`1e308 * 10` が Infinity を返し、比較段階で初めて型エラーになっていた。
+有限の入力から `NaN` / `±Infinity` を作る演算と、
+`SUM` / `AVG` の途中結果の非有限は `ConstraintViolation` にする。
+入力自体が非有限なら従来どおり伝播する。
+回帰: `SqlReference: REAL の演算が無限大になる場合はエラー`。
+
 ---
 
 ## 7. メモリ・退避・列読み込み
@@ -575,6 +600,13 @@ SELECT定数、`COUNT(*)`、DELETE、INDEX lookupは参照列だけ復号する�
 すべてキーにする。
 回帰: `ValueSet: 退避しても型・スケール違いの等値を取りこぼさない` /
 `ValueSet: 退避しても DATE と同日 00:00 UTC の TIMESTAMP を等値に扱う`。
+
+### 7.13 集約の Seen は全体予算へ計上する
+
+`COUNT(DISTINCT) ... GROUP BY` は `Seen` をグループごとに持ち、予算チェックもグループ局所だった。
+そのためグループ数分だけ上限を超え得た。`Seen` の増分を全体の `used` に計上し、超えたら残りを退避する。
+また WorkMem が 32B 未満だと 1値ごとに run を作るため、1 run あたり最低 64値をまとめる（超過は最大 2KiB）。
+回帰: `集約: DISTINCT の値が上限を超えても全集約関数が同じ結果`。
 
 ---
 
@@ -901,6 +933,9 @@ Filterの1/10やJoinの選択性が無視される（統計テストでJoinが�
 - [ ] 真偽の解釈（WHERE / NOT / AND / OR / CASE / IS TRUE）を同じ関数に揃えているか
 - [ ] 数値リテラルの直後の識別子を裸の別名として静かに解釈していないか
 - [ ] `IF EXISTS` / `IF NOT EXISTS` の綴りを文種ごとに検査しているか
+- [ ] `DISTINCT` / `GROUP BY` の退避キーが SQL の等値（`KeyBuilder`）に揃っているか
+- [ ] COUNT 以外の集約に `*` を許していないか
+- [ ] REAL の演算・SUM が有限の入力から非有限を作らないか
 
 ### 11.5 メモリ・並行・通信
 
@@ -916,6 +951,7 @@ Filterの1/10やJoinの選択性が無視される（統計テストでJoinが�
 - [ ] fsync失敗を全Sessionへ伝播しているか
 - [ ] 退避した値集合のBloomキーがSQL等値の全表現（数値の型・スケール、DATE/TIMESTAMP）を網羅しているか
 - [ ] DISTINCT集約のfinalizeが最後の`Seen`もrunに含めているか
+- [ ] 集約の `Seen` 使用量を全体の作業メモリへ計上しているか
 - [ ] Sessionの境界で想定外の例外を`InternalError`にし、leaseと`readers`を解放しているか
 
 ### 11.6 F#・テスト

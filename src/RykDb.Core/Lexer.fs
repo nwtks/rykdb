@@ -134,6 +134,7 @@ module internal Lexer =
             }
 
     /// 改行を含まないと分かっている範囲をまとめて進める。
+    /// 改行を含む範囲に使うと行・列の位置がずれるので、必ず呼び出し側で保証すること。
     let private advanceBy (count: int) (s: LexState) =
         {
             Index = s.Index + count

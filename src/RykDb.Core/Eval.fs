@@ -183,7 +183,14 @@ module internal Eval =
             | Div -> a / b
             | Mod -> a % b
 
-        DbOk(SqlValue.vReal r)
+        if
+            not (System.Double.IsFinite r)
+            && System.Double.IsFinite a
+            && System.Double.IsFinite b
+        then
+            overflowError ()
+        else
+            DbOk(SqlValue.vReal r)
 
     let private decimalOf (v: SqlValue) =
         match v with

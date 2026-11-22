@@ -737,14 +737,12 @@ module internal PlanBuilder =
         let ordinalExpr outputExprs itemCount =
             function
             | Expr.Literal(Literal.Int n) ->
-                let idx = int n - 1
-
-                if n < 1L || idx >= itemCount then
+                if n < 1L || n > int64 itemCount then
                     sprintf "ORDER BY の列番号 %d は範囲外です" n
                     |> DbError.create ErrorKind.SyntaxError
                     |> err
                 else
-                    match List.tryItem idx outputExprs with
+                    match List.tryItem (int n - 1) outputExprs with
                     | None -> err (DbError.internalError "ORDER BY の列番号が解決できません")
                     | Some item -> ret item
             | e -> ret e

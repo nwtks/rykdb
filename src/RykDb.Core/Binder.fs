@@ -132,6 +132,8 @@ module internal Alias =
     /// 差し替えた式の中の名前も差し替え対象になる（別名の連鎖を解決する）。
     /// （`Expr.rewrite` はplugChildren の失敗を返すので Result になる）
     let substitute (schema: Schema) (aliases: Map<string, Expr>) =
+        let aliases = dropCyclic aliases
+
         let rewriteLeaf x =
             match x with
             | Expr.Name name ->

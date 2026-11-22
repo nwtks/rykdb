@@ -421,6 +421,8 @@ ORDER BY dept_id;
 - `FROM`がない集約は1行を入力として計算する。
 - `SUM`と `AVG`に数値以外を渡すと `TypeError`になる。
 - 集約引数には `DISTINCT`を指定できる。
+- `*` を使えるのは `COUNT(*)` だけ。
+  `MIN(*)` / `SUM(*)` / `COUNT(t.*)` は `SyntaxError` になる。
 - 集約と `GROUP BY`を使うクエリでは `SELECT *`を使えない。
 - 集約も `GROUP BY`もない `HAVING`は構文エラーになる。
 
@@ -762,6 +764,9 @@ ORDER BY id;
 ### 7.12 DISTINCT
 
 `DISTINCT`は射影後の行に適用する。
+等値の判定は SQL の比較に従う
+（`DECIMAL`の`1.0`と`1.00`は同じ値、`REAL`の`-0.0`と`0.0`も同じ）。
+`COUNT(DISTINCT)`と`GROUP BY`、ハッシュ結合のキーも同じ等値を使う。
 
 ```sql
 SELECT DISTINCT dept_id, name FROM people;
@@ -1180,6 +1185,8 @@ Closeだけは読み取り完了を待つ。
 | テーブル別名付きDML        | `INSERT / UPDATE / DELETE の対象テーブルに別名は使えません（別名を外してください）`               |
 | 逆向きの`IF`句             | `CREATE TABLE では IF NOT EXISTS を使ってください` / `DROP TABLE では IF EXISTS を使ってください` |
 | 数値直後の識別子           | `numeric literal is followed by an identifier: 0x`                                                |
+| COUNT 以外の集約の `*`     | `MIN に * は使えません（* を使えるのは COUNT(*) だけです）`                                       |
+| REAL の結果が無限大        | `数値演算の結果が表現可能な範囲を超えました` / `SUM の結果が REAL の範囲を超えました`             |
 
 未対応の後置句は専用エラーにならず、文の区切りエラーとして報告される場合がある。
 `TEXT`値の変換エラーは、値を引用符付きで表示するため引用符が二重になる。
@@ -1238,6 +1245,8 @@ Closeだけは読み取り完了を待つ。
 - `DATE`と `TIMESTAMP`は相互比較できる。
 - `REAL`の `NaN`は `REAL`同士でのみ最大値として扱う。
 - `NaN`と整数・decimalの比較、無限大とdecimalへの変換はエラーになる。
+- 有限の `REAL` から `NaN` / `±Infinity` を作る演算（`1e308 * 10` など）と、
+  `SUM` / `AVG` の途中結果が `REAL` の範囲を超える場合は `ConstraintViolation` になる。
 - `-0.0`と `+0.0`は同じ値として扱う。主キーとUNIQUE索引も同じキーになる。
 
 ## 14. 例

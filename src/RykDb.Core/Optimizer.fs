@@ -313,7 +313,7 @@ module internal Optimizer =
             let mask =
                 match ctx.ScanNeeds.TryGetValue(box node) with
                 | true, mask -> mask
-                | _ -> Array.create 0 true
+                | _ -> Array.create (defaultSchema ctx name).Columns.Length true
 
             function
             | Some 0 -> ret Op.Empty
