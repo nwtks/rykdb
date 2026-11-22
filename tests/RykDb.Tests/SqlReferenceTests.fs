@@ -501,6 +501,35 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
         exec db6 "ROLLBACK" |> ignore)
 
 [<Fact>]
+let ``SqlReference: ANALYZE は進捗を通知し、キャンセルできる`` () =
+    withDir "analyze-cancel" (fun dir ->
+        let progress = ResizeArray<string * int64>()
+
+        let options =
+            { SessionOptions.Default with
+                OnAnalyzeProgress = Some(fun item -> progress.Add item)
+            }
+
+        let s1 = ok (Session.OpenWithSync(dir, options))
+        let s1 = exec s1 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let s1 = exec s1 "INSERT INTO t VALUES (1,10),(2,20)"
+        let s1 = exec s1 "ANALYZE t"
+        Assert.NotEmpty progress
+        ok (s1.Close()) |> ignore
+
+        use cts = new System.Threading.CancellationTokenSource()
+        cts.Cancel()
+
+        let options =
+            { SessionOptions.Default with
+                CancelAnalysis = cts.Token
+            }
+
+        let s2 = ok (Session.OpenWithSync(dir, options))
+        expectErrorKind ErrorKind.CapacityError "キャンセル済みの ANALYZE" (execSql s2 "ANALYZE t")
+        ok (s2.Close()) |> ignore)
+
+[<Fact>]
 let ``SqlReference: EXPLAIN は統計があるとき推定行数を表示する`` () =
     withSession "explain-stats" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -536,6 +565,11 @@ let ``SqlReference: ANALYZE の統計は再オープン後も残り、ALTER TABL
         let loaded = ok (Catalog.load store)
         let stats = expectSome "t の統計" (Catalog.findStats "t" loaded)
         Assert.Equal<int64>(2L, stats.RowCount)
+        let idColumn = stats.Columns |> List.find (fun c -> c.Name = "id")
+        let vColumn = stats.Columns |> List.find (fun c -> c.Name = "v")
+        Assert.Equal<int64>(2L, idColumn.NDV)
+        Assert.Equal<int64>(2L, vColumn.NDV)
+        Assert.False(List.isEmpty vColumn.Histogram)
         ok (RowStore.close store) |> ignore
 
         // ALTER TABLE は統計を削除する（行の形が変わるため）。

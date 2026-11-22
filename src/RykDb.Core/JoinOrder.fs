@@ -42,14 +42,24 @@ module internal JoinOrder =
         }
 
     /// 右テーブルを索引で引ける結合辺か。
-    let private canIndexJoin (item: JoinOrderItem) (edge: JoinOrderEdge) =
-        match edge.KeyColumns |> Map.tryFind item.Name with
-        | Some column ->
+    /// 結合キー全体が 1 つの索引の prefix に収まる場合だけ INL にする
+    /// （実行時の `leftIndicesOf` / `coversAll` と同じ条件）。
+    let private canIndexJoin (item: JoinOrderItem) (applicable: JoinOrderEdge list) =
+        let keyColumns =
+            applicable |> List.choose (fun edge -> edge.KeyColumns |> Map.tryFind item.Name)
+
+        if List.isEmpty keyColumns then
+            false
+        else
             item.IndexColumns
-            |> List.exists (function
-                | head :: _ -> SqlName.equal head column
-                | [] -> false)
-        | None -> false
+            |> List.exists (fun columns ->
+                let prefix = List.truncate keyColumns.Length columns
+
+                List.length prefix = keyColumns.Length
+                && prefix
+                   |> List.forall (fun c -> keyColumns |> List.exists (fun key -> SqlName.equal c key))
+                && keyColumns
+                   |> List.forall (fun key -> prefix |> List.exists (fun c -> SqlName.equal c key)))
 
     /// 両側の自然順が結合キーで揃っているか（マージ結合の可否）。
     /// 右の走査順の先頭から、結合辺がある限り一致していれば良い。
@@ -156,7 +166,7 @@ module internal JoinOrder =
 
                 let spillPenalty =
                     if workMemBytes >= 0.0 && buildBytes > workMemBytes then
-                        buildRows
+                        buildRows * 2.0 + float Spill.Partitions * 8.0
                     else
                         0.0
 
@@ -169,7 +179,7 @@ module internal JoinOrder =
                     None
 
             let inlDelta =
-                if rows <= 32.0 && applicable |> List.exists (canIndexJoin item) then
+                if rows <= 32.0 && canIndexJoin item applicable then
                     Some(rows + newRows)
                 else
                     None

@@ -90,8 +90,25 @@ module internal PlanBuilder =
         | Base b -> Some b.Schema
         | DerivedSource _ -> None
 
-    /// 1行の管理メモリ概算（列数 × 固定の目安）。
-    let private rowBytesOfColumnCount (count: int) = 32.0 * float count
+    /// 型ごとの概算バイト数。
+    let private dataTypeBytes =
+        function
+        | DataType.Boolean -> 1
+        | DataType.Integer -> 8
+        | DataType.Real -> 8
+        | DataType.Decimal -> 16
+        | DataType.Date -> 4
+        | DataType.Timestamp -> 8
+        | DataType.Uuid -> 16
+        | DataType.Text -> 32
+        | DataType.Blob -> 32
+        | DataType.Null -> 0
+
+    /// 1行の管理メモリ概算（行ヘッダ + 列の型別サイズ）。
+    let private rowBytesOfColumns (columns: DataType option seq) =
+        24.0
+        + (columns
+           |> Seq.sumBy (fun dt -> float (dt |> Option.map dataTypeBytes |> Option.defaultValue 16)))
 
     /// 等値述語の両側のテーブル名 -> 列名。
     let private equalityColumns =
@@ -115,7 +132,7 @@ module internal PlanBuilder =
                 Rows = rows
                 Position = position
                 IndexColumns = tb.Schema.Indexes |> List.map _.Columns
-                RowBytes = rowBytesOfColumnCount tb.Schema.Columns.Length
+                RowBytes = rowBytesOfColumns (tb.Schema.Columns |> Seq.map (fun c -> Some c.DataType))
                 NaturalOrder = Analyzer.scanOrder (fun _ -> Some tb.Schema) scan
             }
         | DerivedSource(_, plan) ->
@@ -124,7 +141,7 @@ module internal PlanBuilder =
                 Rows = rows
                 Position = position
                 IndexColumns = []
-                RowBytes = rowBytesOfColumnCount plan.Output.Columns.Length
+                RowBytes = rowBytesOfColumns (plan.Output.Columns |> Seq.map _.DataType)
                 NaturalOrder = None
             }
 
@@ -386,7 +403,7 @@ module internal PlanBuilder =
                                 |> Option.bind (fun schema -> Analyzer.scanOrder (fun _ -> Some schema) acc)
                             | [] -> None
 
-                        let initialRowBytes = rowBytesOfColumnCount accSchema.Columns.Length
+                        let initialRowBytes = rowBytesOfColumns (accSchema.Columns |> Seq.map _.DataType)
 
                         let workMemBytes =
                             if ctx.Budget.Work >= 0L then

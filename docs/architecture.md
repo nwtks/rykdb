@@ -512,7 +512,7 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 - `PkLookup` は1。`IndexLookup` は索引prefix NDVの逆数、範囲走査は数値範囲または1/3。
 - 等値結合は `(1 - NULL率_左) * (1 - NULL率_右) / max(NDV_左, NDV_右)`。
   統計が揃わない結合は従来の `min(左, 右)`。
-- `Filter` は等値ならNDV、数値範囲ならmin/max、`BETWEEN`/`IN`/`LIKE`/`IS NULL` を見る。
+- `Filter` は等値ならNDV、数値範囲ならmin/maxと標本ヒストグラム、`BETWEEN`/`IN`/`LIKE`/`IS NULL` を見る。
 
 統計はDMLで自動更新しない（手動 `ANALYZE` のみ）。
 `ALTER TABLE` はテーブルの統計を削除する。
@@ -524,8 +524,11 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 - 左が32行以下で右の索引先頭列が結合キーならINLのコストを使う。
 - 左右の走査順が結合キーで揃っていればマージ結合のコストを使う。
   右の走査順の先頭から結合辺がある限り一致する複合キーも対象にする。
-- ハッシュ結合はbuild側の行数×行幅が作業メモリを超えるとスピル相当のペナルティを加える。
-- 複数索引の選択、実際のスピル量、bushy計画はまだモデル化していない。
+- 行幅は列の型別サイズで見積もる。
+- ハッシュ結合はbuild側の行数×行幅が作業メモリを超えると、
+  `Spill.Partitions` 本への書き出し・読み直しを含むスピルペナルティを加える。
+- 複数索引の選択は prefix NDV が小さい索引を優先する。
+- bushy計画とLEFT JOINを跨ぐ再配置はまだモデル化していない。
 
 #### 論理代数からOpへ
 
@@ -1273,8 +1276,9 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - JOINの右側、DISTINCT、GROUP BYは上限までメモリへ保持し、超過分を退避する。
 - 相関サブクエリは外側行ごとに内側を再計画するため、外側行数と内側走査コストの積がかかる。
 - `ANALYZE` を実行していないテーブルは統計が無く、走査方法から得る粗い見積りになる。
-- 統計は行数・列NDV・NULL数・数値min/max・索引prefix NDVで、
-  ヒストグラム・列間の相関・正確な行幅・I/Oは見積もらない。
+- 統計は行数・列NDV・NULL数・数値min/max・標本ヒストグラム・索引prefix NDVで、
+  列間の相関・正確な行幅・I/Oは見積もらない。
+- `ANALYZE` の進捗通知とキャンセルは `SessionOptions` 経由で行う。
 - 統計はDMLで自動更新しない（`SAMPLE n` も含め手動 `ANALYZE` のみ）。
   `ALTER TABLE` は対象テーブルの統計を削除する。
 - MVCCの古い版はactive snapshotがある間はcompactionで回収されない。

@@ -509,6 +509,27 @@ let ``Analyzer.estimateRowsWith: NULL 率と数値範囲を使う`` () =
     Assert.Equal(25.0, Analyzer.estimateRowsWith statsOf between)
 
 [<Fact>]
+let ``Analyzer.estimateRowsWith: ヒストグラムで範囲選択性を見る`` () =
+    let histogram = List.replicate 90 0.0 @ List.replicate 10 100.0
+
+    let statsOf name =
+        if name = "t" then
+            Some(tableStats "t" 100L [ colStatsHist "v" 2L 0L (Some 0.0) (Some 100.0) histogram ] [])
+        else
+            None
+
+    let scan = Logical.Scan("t", ScanMethod.SeqScan)
+
+    let range =
+        Logical.Filter(
+            Expr.Binary(BinaryOp.Gt, Expr.Column { Qualifier = Some "t"; Name = "v" }, Expr.Literal(Literal.Int 50L)),
+            scan
+        )
+
+    // 100 行のうち 10 行が 100。min/max の線形補間なら 50 行になる。
+    Assert.Equal(10.0, Analyzer.estimateRowsWith statsOf range, 9)
+
+[<Fact>]
 let ``Analyzer.estimateRowsWith: 複合索引は prefix NDV を使う`` () =
     let statsOf name =
         if name = "t" then

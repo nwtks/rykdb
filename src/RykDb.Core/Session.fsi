@@ -1,6 +1,7 @@
 namespace RykDb.Core
 
 /// Session の結果上限と作業メモリ。
+[<NoEquality; NoComparison>]
 type SessionOptions =
     {
         /// 1回の Execute で保持する SELECT 行数の上限。
@@ -17,6 +18,10 @@ type SessionOptions =
         SortBufferBytes: int64
         /// 一時ファイルの置き場所（`None` は OS の一時ディレクトリ）。
         SpillDirectory: string option
+        /// ANALYZE のキャンセル。
+        CancelAnalysis: System.Threading.CancellationToken
+        /// ANALYZE の進捗（処理名, 処理済み行数）。
+        OnAnalyzeProgress: (string * int64 -> unit) option
     }
 
     /// 既定値（結果 100万行 / 256MiB、作業 256MiB、ソート受け皿 64MiB）。

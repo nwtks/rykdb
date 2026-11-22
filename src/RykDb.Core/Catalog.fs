@@ -51,6 +51,8 @@ type internal ColumnStats =
         /// 数値型の最小値・最大値（数値以外は None）。
         Min: float option
         Max: float option
+        /// 数値型の標本ヒストグラム（昇順の標本値。空なら未収集）。
+        Histogram: float list
     }
 
 /// 索引の統計。
@@ -411,7 +413,15 @@ module internal Catalog =
         let w3 =
             s.Columns
             |> List.fold
-                (fun w c -> w |> Writer.int64LE c.Nulls |> writeFloatOption c.Min |> writeFloatOption c.Max)
+                (fun w c ->
+                    let w =
+                        w
+                        |> Writer.int64LE c.Nulls
+                        |> writeFloatOption c.Min
+                        |> writeFloatOption c.Max
+                        |> Writer.varint (uint64 c.Histogram.Length)
+
+                    c.Histogram |> List.fold (fun w v -> writeFloat v w) w)
                 (Writer.writeByte 1uy w2)
 
         s.Indexes
@@ -453,7 +463,10 @@ module internal Catalog =
             let! nulls, c1 = Reader.readInt64LE c
             let! minValue, c2 = readFloatOption c1
             let! maxValue, c3 = readFloatOption c2
-            return (nulls, minValue, maxValue), c3
+            let! histogramCount, c4 = Reader.readVarint c3
+            let! bits, c5 = Reader.readItems Reader.readInt64LE histogramCount c4
+            let histogram = bits |> List.map System.BitConverter.Int64BitsToDouble
+            return (nulls, minValue, maxValue, histogram), c5
         }
 
     let private readIndexExtras (c: Cursor) =
@@ -488,6 +501,7 @@ module internal Catalog =
                             Nulls = 0L
                             Min = None
                             Max = None
+                            Histogram = []
                         }
 
                     column)
@@ -529,11 +543,12 @@ module internal Catalog =
                     else
                         let columns =
                             List.map2
-                                (fun c (nulls, minValue, maxValue) ->
+                                (fun c (nulls, minValue, maxValue, histogram) ->
                                     { c with
                                         Nulls = nulls
                                         Min = minValue
                                         Max = maxValue
+                                        Histogram = histogram
                                     })
                                 columns
                                 columnExtras

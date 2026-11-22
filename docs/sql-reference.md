@@ -986,7 +986,8 @@ ANALYZE [TABLE] [table_name] [SAMPLE n];
 - 結合順、結合アルゴリズム、走査基数、Filter 選択性の見積りに使う。
 - 結果は `table` / `rows` / `columns` / `ndv` の 1行（全テーブルならテーブルごとに 1行）。
 - `SAMPLE n` は reservoir sampling で最大 n 行を標本にする。
-  行数は全体を数え、NDV・範囲・NULL 率は標本から推定する。
+  行数は全体を数え、NDV・範囲・NULL 率・数値ヒストグラムは標本から推定する。
+- 進捗は `SessionOptions.OnAnalyzeProgress`、キャンセルは `SessionOptions.CancelAnalysis` で扱う。
 - 統計はDML（`INSERT` / `UPDATE` / `DELETE`）では自動更新しない。
   更新後は必要に応じて再度 `ANALYZE` を実行する。
 - `ALTER TABLE` は対象テーブルの統計を削除する。

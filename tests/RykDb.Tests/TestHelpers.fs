@@ -423,6 +423,20 @@ let colStats
         Nulls = nulls
         Min = minValue
         Max = maxValue
+        Histogram = []
+    }
+
+/// ヒストグラム付きの列統計。
+let colStatsHist
+    (name: string)
+    (ndv: int64)
+    (nulls: int64)
+    (minValue: float option)
+    (maxValue: float option)
+    (histogram: float list)
+    : ColumnStats =
+    { colStats name ndv nulls minValue maxValue with
+        Histogram = histogram
     }
 
 /// ANALYZE の索引統計。

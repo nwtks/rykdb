@@ -59,6 +59,10 @@ type internal ResultLimits =
         MaxBytes: int64
         /// 演算子が使ってよいメモリ作業領域とスピル先。
         Budget: MemoryBudget
+        /// ANALYZE など長時間処理のキャンセル。
+        Cancel: System.Threading.CancellationToken
+        /// 長時間処理の進捗（処理名, 処理済み行数）。
+        Progress: (string * int64 -> unit) option
     }
 
 module internal ResultLimits =
@@ -67,6 +71,8 @@ module internal ResultLimits =
             MaxRows = System.Int64.MaxValue
             MaxBytes = System.Int64.MaxValue
             Budget = MemoryBudget.Default
+            Cancel = System.Threading.CancellationToken.None
+            Progress = None
         }
 
 /// ストリーミング SELECT の実行状態。
@@ -329,44 +335,64 @@ module internal ExecState =
 
     /// テーブルの行数、列 NDV・NULL 数・数値範囲、索引 prefix NDV を収集する。
     /// `sample` が Some n なら reservoir sampling で n 行だけを標本にする。
-    let private collectStats (defn: TableDefinition) (state: ExecState) (sample: int option) =
+    let private collectStats
+        (defn: TableDefinition)
+        (state: ExecState)
+        (sample: int option)
+        (cancel: System.Threading.CancellationToken)
+        (progress: (string * int64 -> unit) option)
+        =
         let nextRandom state =
             state * 6364136223846793005L + 1442695040888963407L
 
         let rec consume accumulate count scan =
-            match SstScan.next scan with
-            | Error e ->
+            if count % 8192L = 0L && cancel.IsCancellationRequested then
                 SstScan.dispose scan
-                err e
-            | Ok None -> ret count
-            | Ok(Some(entry, rest)) ->
-                entry.Value |> Option.iter accumulate
-                consume accumulate (count + 1L) rest
+                err (DbError.capacity "ANALYZE はキャンセルされました")
+            else
+                if count % 8192L = 0L then
+                    progress |> Option.iter (fun report -> report (defn.Name, count))
+
+                match SstScan.next scan with
+                | Error e ->
+                    SstScan.dispose scan
+                    err e
+                | Ok None -> ret count
+                | Ok(Some(entry, rest)) ->
+                    entry.Value |> Option.iter accumulate
+                    consume accumulate (count + 1L) rest
 
         let rec loop n count samples sampleCount rng scan =
-            match SstScan.next scan with
-            | Error e ->
+            if count % 8192L = 0L && cancel.IsCancellationRequested then
                 SstScan.dispose scan
-                err e
-            | Ok None -> ret (count, samples, sampleCount)
-            | Ok(Some(entry, rest)) ->
-                match entry.Value with
-                | None -> loop n count samples sampleCount rng rest
-                | Some row ->
-                    let rng = nextRandom rng
-                    let count = count + 1L
+                err (DbError.capacity "ANALYZE はキャンセルされました")
+            else
+                if count % 8192L = 0L then
+                    progress |> Option.iter (fun report -> report (defn.Name, count))
 
-                    if sampleCount < n then
-                        loop n count (row :: samples) (sampleCount + 1) rng rest
-                    else
-                        let j = int ((rng >>> 1) % count)
+                match SstScan.next scan with
+                | Error e ->
+                    SstScan.dispose scan
+                    err e
+                | Ok None -> ret (count, samples, sampleCount)
+                | Ok(Some(entry, rest)) ->
+                    match entry.Value with
+                    | None -> loop n count samples sampleCount rng rest
+                    | Some row ->
+                        let rng = nextRandom rng
+                        let count = count + 1L
 
-                        if j < n then
-                            let samples = samples |> List.mapi (fun i current -> if i = j then row else current)
-
-                            loop n count samples sampleCount rng rest
+                        if sampleCount < n then
+                            loop n count (row :: samples) (sampleCount + 1) rng rest
                         else
-                            loop n count samples sampleCount rng rest
+                            let j = int ((rng >>> 1) % count)
+
+                            if j < n then
+                                let samples = samples |> List.mapi (fun i current -> if i = j then row else current)
+
+                                loop n count samples sampleCount rng rest
+                            else
+                                loop n count samples sampleCount rng rest
 
         result {
             let! schema = Catalog.toSchema defn
@@ -377,6 +403,11 @@ module internal ExecState =
 
             let nullCounts = System.Collections.Generic.Dictionary<int, int64>()
             let minMax = System.Collections.Generic.Dictionary<int, struct (float * float)>()
+            let numericSamples = System.Collections.Generic.Dictionary<int, float list>()
+            let numericSeen = System.Collections.Generic.Dictionary<int, int64>()
+            let numericRng = System.Collections.Generic.Dictionary<int, int64>()
+
+            let histogramSize = 64
 
             let indexes =
                 Catalog.indexesOf schema.Name state.Catalog
@@ -418,6 +449,34 @@ module internal ExecState =
                                 match minMax.TryGetValue i with
                                 | true, struct (lo, hi) -> minMax.[i] <- struct (min lo v, max hi v)
                                 | _ -> minMax.[i] <- struct (v, v)
+
+                                let seen =
+                                    match numericSeen.TryGetValue i with
+                                    | true, n -> n + 1L
+                                    | _ -> 1L
+
+                                numericSeen.[i] <- seen
+
+                                let samples =
+                                    match numericSamples.TryGetValue i with
+                                    | true, xs -> xs
+                                    | _ -> []
+
+                                if List.length samples < histogramSize then
+                                    numericSamples.[i] <- v :: samples
+                                else
+                                    let rng =
+                                        match numericRng.TryGetValue i with
+                                        | true, s -> s
+                                        | _ -> 1L
+
+                                    let rng = nextRandom rng
+                                    numericRng.[i] <- rng
+                                    let j = int ((rng >>> 1) % seen)
+
+                                    if j < histogramSize then
+                                        numericSamples.[i] <-
+                                            samples |> List.mapi (fun k current -> if k = j then v else current)
                             | None -> ())
 
                 for _, positions, sets in indexes do
@@ -467,13 +526,19 @@ module internal ExecState =
                         | true, struct (lo, hi) -> Some lo, Some hi
                         | _ -> None, None
 
-                    let column =
+                    let histogram =
+                        match numericSamples.TryGetValue i with
+                        | true, samples -> samples |> List.sort
+                        | _ -> []
+
+                    let column: ColumnStats =
                         {
                             Name = col.Name
                             NDV = int64 columnSets.[i].Count
                             Nulls = scaleNulls nulls
                             Min = minValue
                             Max = maxValue
+                            Histogram = histogram
                         }
 
                     column)
@@ -502,7 +567,13 @@ module internal ExecState =
 
     /// テーブルの統計を再収集する。名前が None なら全テーブル。
     /// 統計はカタログに 1回で保存する。
-    let private analyzeCore (table: string option) (sample: int option) (state: ExecState) =
+    let private analyzeCore
+        (table: string option)
+        (sample: int option)
+        (cancel: System.Threading.CancellationToken)
+        (progress: (string * int64 -> unit) option)
+        (state: ExecState)
+        =
         result {
             let! defns =
                 match table with
@@ -512,7 +583,10 @@ module internal ExecState =
                     | None -> err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
                 | None -> ret state.Catalog.Tables
 
-            let! stats = defns |> List.map (fun defn -> collectStats defn state sample) |> all
+            let! stats =
+                defns
+                |> List.map (fun defn -> collectStats defn state sample cancel progress)
+                |> all
 
             let nextCatalog =
                 stats |> List.fold (fun catalog s -> Catalog.addStats s catalog) state.Catalog
@@ -521,8 +595,13 @@ module internal ExecState =
             return next, stats
         }
 
-    let analyze (table: string option, sample: int option) (state: ExecState) =
-        exclusiveDdlWith state (analyzeCore table sample)
+    let analyze
+        (table: string option, sample: int option)
+        (cancel: System.Threading.CancellationToken)
+        (progress: (string * int64 -> unit) option)
+        (state: ExecState)
+        =
+        exclusiveDdlWith state (analyzeCore table sample cancel progress)
 
     let private createTableCore (c: CreateTable) (state: ExecState) =
         let existing = Catalog.findTable c.Name state.Catalog
@@ -1322,7 +1401,7 @@ module internal Engine =
         | Statement.AlterTable a -> ExecState.alterTable a |> runDdl state
         | Statement.Analyze(name, sample) ->
             runDdlWithState state (fun st ->
-                ExecState.analyze (name, sample) st
+                ExecState.analyze (name, sample) limits.Cancel limits.Progress st
                 |> Result.bind (fun (next, stats) ->
                     let columns = [| "table"; "rows"; "columns"; "ndv" |]
 

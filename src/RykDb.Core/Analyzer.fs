@@ -371,26 +371,39 @@ module internal Analyzer =
                     (1.0 - nullRate stats column) / float column.NDV
             | _ -> defaultSelectivity
 
+        let histogramCdf histogram v =
+            if List.isEmpty histogram then
+                None
+            else
+                let below = histogram |> List.filter (fun x -> x <= v) |> List.length
+                Some(float below / float histogram.Length)
+
         let rangeToLiteral columnExpr literal op =
             match columnWithStatsOf statsOf columnExpr, SqlValue.asNumeric literal with
-            | Some(_, column), Some n when column.Min.IsSome && column.Max.IsSome ->
-                let lo = column.Min.Value
-                let hi = column.Max.Value
+            | Some(_, column), Some n ->
+                let v = float n
 
-                if hi <= lo then
-                    rangeSelectivity
-                else
-                    let v = float n
+                match histogramCdf column.Histogram v with
+                | Some cdf ->
+                    match op with
+                    | BinaryOp.Gt
+                    | BinaryOp.Ge -> 1.0 - cdf
+                    | BinaryOp.Lt
+                    | BinaryOp.Le -> cdf
+                    | _ -> rangeSelectivity
+                | None ->
+                    match column.Min, column.Max with
+                    | Some lo, Some hi when hi > lo ->
+                        let selectivity =
+                            match op with
+                            | BinaryOp.Gt
+                            | BinaryOp.Ge -> (hi - v) / (hi - lo)
+                            | BinaryOp.Lt
+                            | BinaryOp.Le -> (v - lo) / (hi - lo)
+                            | _ -> rangeSelectivity
 
-                    let selectivity =
-                        match op with
-                        | BinaryOp.Gt
-                        | BinaryOp.Ge -> (hi - v) / (hi - lo)
-                        | BinaryOp.Lt
-                        | BinaryOp.Le -> (v - lo) / (hi - lo)
-                        | _ -> rangeSelectivity
-
-                    max 0.0 (min 1.0 selectivity)
+                        max 0.0 (min 1.0 selectivity)
+                    | _ -> rangeSelectivity
             | _ -> rangeSelectivity
 
         let flip =
@@ -433,14 +446,14 @@ module internal Analyzer =
         | Expr.Between(x, low, high, neg) ->
             let selectivity =
                 match columnWithStatsOf statsOf x, numericLiteral low, numericLiteral high with
-                | Some(_, column), Some lo, Some hi when column.Min.IsSome && column.Max.IsSome ->
-                    let minValue = column.Min.Value
-                    let maxValue = column.Max.Value
-
-                    if maxValue <= minValue then
-                        rangeSelectivity
-                    else
-                        max 0.0 (min 1.0 ((hi - lo) / (maxValue - minValue)))
+                | Some(_, column), Some lo, Some hi ->
+                    match histogramCdf column.Histogram hi, histogramCdf column.Histogram lo with
+                    | Some highCdf, Some lowCdf -> max 0.0 (min 1.0 (highCdf - lowCdf))
+                    | _ ->
+                        match column.Min, column.Max with
+                        | Some minValue, Some maxValue when maxValue > minValue ->
+                            max 0.0 (min 1.0 ((hi - lo) / (maxValue - minValue)))
+                        | _ -> rangeSelectivity
                 | _ -> rangeSelectivity
 
             withNegation neg selectivity
@@ -679,7 +692,13 @@ module internal Analyzer =
             else
                 None
 
-        let rightLookupForJoin rightSchema (rightTable: TableSchema) keys =
+        let indexPrefixNdv rightName (keyNames: string array) indexName =
+            statsOf rightName
+            |> Option.bind (fun stats -> stats.Indexes |> List.tryFind (fun i -> Catalog.eqName i.Name indexName))
+            |> Option.bind (fun index -> index.PrefixNDV |> List.tryItem (keyNames.Length - 1))
+            |> Option.defaultValue System.Int64.MaxValue
+
+        let rightLookupForJoin rightName rightSchema rightTable keys =
             let keyNames =
                 keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
 
@@ -697,10 +716,11 @@ module internal Analyzer =
                     let prefix = List.truncate keyNames.Length idx.Columns
 
                     if coversAll keyNames prefix then
-                        Some(JoinLookup.Index idx.Name, prefix)
+                        Some(indexPrefixNdv rightName keyNames idx.Name, JoinLookup.Index idx.Name, prefix)
                     else
                         None)
-                |> List.tryPick (fun (lookup, cols) ->
+                |> List.sortBy (fun (ndv, _, _) -> ndv)
+                |> List.tryPick (fun (_, lookup, cols) ->
                     leftIndicesOf keys cols |> Option.map (fun lefts -> lookup, lefts)))
 
         let mergeJoinKeys keys =
@@ -750,7 +770,7 @@ module internal Analyzer =
                 | Some(rightName, method, rightPreds), Some table ->
                     absorbedPredicates table rightName method
                     |> Option.bind (fun absorbed ->
-                        rightLookupForJoin rightSchema table keys
+                        rightLookupForJoin rightName rightSchema table keys
                         |> Option.map (fun (target, leftIndices) -> target, leftIndices, rightPreds @ absorbed))
                 | _ -> None
 

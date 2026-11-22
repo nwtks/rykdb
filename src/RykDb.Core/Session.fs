@@ -13,6 +13,7 @@
 namespace RykDb.Core
 
 /// Session の結果上限と作業メモリ。
+[<NoEquality; NoComparison>]
 type SessionOptions =
     {
         /// 1回の Execute で保持する SELECT 行数の上限。
@@ -29,6 +30,10 @@ type SessionOptions =
         SortBufferBytes: int64
         /// 一時ファイルの置き場所（`None` は OS の一時ディレクトリ）。
         SpillDirectory: string option
+        /// ANALYZE のキャンセル。
+        CancelAnalysis: System.Threading.CancellationToken
+        /// ANALYZE の進捗（処理名, 処理済み行数）。
+        OnAnalyzeProgress: (string * int64 -> unit) option
     }
 
     /// 既定値（結果 100万行 / 256MiB、作業 256MiB、ソート受け皿 64MiB）。
@@ -39,6 +44,8 @@ type SessionOptions =
             WorkMemBytes = 256L * 1024L * 1024L
             SortBufferBytes = 64L * 1024L * 1024L
             SpillDirectory = None
+            CancelAnalysis = System.Threading.CancellationToken.None
+            OnAnalyzeProgress = None
         }
 
     static member internal Validate(options: SessionOptions) =
@@ -189,6 +196,8 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                     Directory = options.SpillDirectory
                     Scope = None
                 }
+            Cancel = options.CancelAnalysis
+            Progress = options.OnAnalyzeProgress
         }
 
     let initialBudget =
@@ -202,6 +211,8 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             MaxRows = max 0L budget.RowsLeft
             MaxBytes = max 0L budget.BytesLeft
             Budget = limits.Budget
+            Cancel = limits.Cancel
+            Progress = limits.Progress
         }
 
     let consumeBudget (result: StatementResult) (budget: ResultBudget) =
