@@ -80,17 +80,6 @@ let private errorOf (r: Result<'a, DbError>) =
     | Error e -> e
     | Ok _ -> failwithf "エラーになるはずが成功した"
 
-
-/// 診断用のスナップショットを返す。
-let private status (manager: TransactionManager) =
-    {
-        NextSeqNo = manager.NextSeqNo
-        LastCommitSeqNo = manager.LastCommitSeqNo
-        ActiveCount = manager.Active.Count
-        OldestActiveSnapshot = TransactionManager.activeSnapshot manager
-        LastCommittedKeys = manager.LastCommitted.Count
-    }
-
 [<Fact>]
 let ``Transaction.create: 空の transaction`` () =
     let snap = { Snapshot.SeqNo = 0UL }
@@ -332,7 +321,7 @@ let ``TransactionManager.status: 長い transaction がある間は LastCommitte
     let writer = Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |] writer
     let mgr, commitSeq, _ = ok (TransactionManager.commit writer mgr)
 
-    let observed = status mgr
+    let observed = TransactionManager.status mgr
     Assert.Equal(1, observed.ActiveCount)
     Assert.Equal(1, observed.LastCommittedKeys)
     Assert.Equal<uint64>(reader.Snapshot.SeqNo, observed.OldestActiveSnapshot)
@@ -343,7 +332,7 @@ let ``TransactionManager.status: 長い transaction がある間は LastCommitte
     let mgr = TransactionManager.abort reader mgr
     let mgr, t = TransactionManager.beginTxn mgr
     let mgr, _, _ = ok (TransactionManager.commit t mgr)
-    Assert.Equal(0, (status mgr).LastCommittedKeys)
+    Assert.Equal(0, (TransactionManager.status mgr).LastCommittedKeys)
 
 [<Fact>]
 let ``TransactionManager.commit: abort 済み transaction の commit はエラー`` () =

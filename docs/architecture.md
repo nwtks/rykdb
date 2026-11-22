@@ -825,6 +825,14 @@ WAL追記が失敗した場合、engineの状態は進めない。
 次の追記は`WalState.Size`で書きかけの末尾を切り捨ててから書くため、
 同じtransactionを再COMMITできる。
 
+WAL追記が成功してもfsyncが失敗した場合、commitは**適用済み**だが永続化は保証されない。
+`DatabaseHost.serialized`はrunの結果を捨てずに`(値, 永続化エラー)`として返し、
+`Commit`は`CommitOutcome.CommittedUnsynced`へ変換する。
+`Session`は接続をtransaction外へ進めてからエラーを返す
+（適用済みを捨ててErrorだけ返すと、接続ローカルが「transaction中」のままhostと分断する）。
+fsyncの失敗は`CommitDurability`が記憶し、以後のすべての操作が同じエラーで失敗する。
+BEGIN / ROLLBACK・失敗した文はWALを進めないためfsyncを待たない。
+
 ### 7.6 Sessionのtransactionモデル
 
 `Session.Execute`は明示transactionがない場合、各文を暗黙transactionとして自動コミットする。
@@ -840,6 +848,8 @@ WAL追記が失敗した場合、engineの状態は進めない。
 - COMMITがwrite-write競合または書き込みバッファの上限超過で失敗した場合、
   transactionをabortして接続をtransaction外へ戻す
   （再試行してもcommitできないため。`CommitOutcome.RolledBack`）。
+- COMMITのfsyncが失敗した場合も接続をtransaction外へ戻す。
+  commitは適用済みなので、`CommitOutcome.CommittedUnsynced`で適用済みを伝えてからエラーを返す。
 - ROLLBACKはtransactionが無ければ何もしない（自動rollback済みでも後始末を失敗させない）。
 - 複数文のバッチは文ごとに実行し、成功した文の状態だけを残す。
 

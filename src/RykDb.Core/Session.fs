@@ -269,12 +269,13 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                                 host.Begin state |> Result.map (fun next -> next, StatementResult.Empty)
                             | Statement.Commit ->
                                 host.Commit state
-                                |> Result.bind (fun (outcome, result) ->
+                                >>= fun (outcome, result) ->
                                     match outcome with
                                     | CommitOutcome.Committed next -> ret (next, result)
+                                    | CommitOutcome.CommittedUnsynced(next, e)
                                     | CommitOutcome.RolledBack(next, e) ->
                                         lock stateGate (fun () -> local <- LocalSession.Open next)
-                                        err e)
+                                        err e
                             | Statement.Rollback -> host.Rollback state
                             | _ -> host.ExecuteNonTransaction state (limitsOfBudget budget) stmt
 
@@ -574,14 +575,15 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             | LocalSession.Closed -> err (closedError ())
             | LocalSession.Open state ->
                 host.Commit state
-                |> Result.bind (fun (outcome, _) ->
+                >>= fun (outcome, _) ->
                     match outcome with
                     | CommitOutcome.Committed next ->
                         lock stateGate (fun () -> local <- LocalSession.Open next)
                         ret ()
+                    | CommitOutcome.CommittedUnsynced(next, e)
                     | CommitOutcome.RolledBack(next, e) ->
                         lock stateGate (fun () -> local <- LocalSession.Open next)
-                        err e))
+                        err e)
 
     /// ROLLBACK。
     /// <remarks>

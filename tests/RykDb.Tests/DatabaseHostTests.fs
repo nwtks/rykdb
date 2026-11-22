@@ -199,6 +199,113 @@ let ``DatabaseHost: 同時 commit の WAL 位置を writeGate の内側で登録
             ok (host.Close()) |> ignore)
 
 [<Fact>]
+let ``DatabaseHost: fsync 失敗の COMMIT は適用済みを CommittedUnsynced で返す`` () =
+    withDir "commit-unsynced" (fun root ->
+        let mutable failSync = false
+
+        let durable =
+            CommitDurability(fun _ ->
+                if failSync then
+                    err (DbError.io (System.IO.IOException "fsync failed"))
+                else
+                    ret ())
+
+        let host = ok (DatabaseHost.OpenWith(root, commitDurability = durable))
+
+        let execute local sql =
+            host.ExecuteNonTransaction local ResultLimits.Unlimited (parseOneOk sql)
+
+        try
+            ok (execute TxnState.none "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            |> ignore
+
+            let local = ok (host.Begin TxnState.none)
+            let local2, _ = ok (execute local "INSERT INTO t VALUES (1, 10)")
+            failSync <- true
+
+            // 修正前: commit は適用済みなのに結果が捨てられ、生の fsync エラーだけが返った。
+            match host.Commit local2 with
+            | Ok(CommitOutcome.CommittedUnsynced(next, e), _) ->
+                Assert.Equal<ErrorKind>(ErrorKind.IoError, e.Kind)
+                Assert.True(e.Message.Contains "適用されました", sprintf "メッセージが適用済みを伝えない: %s" e.Message)
+                Assert.False(TxnState.inTransaction next)
+            | other -> Assert.Fail(sprintf "CommittedUnsynced が返るはず: %A" other)
+
+            // commit は適用済み: manager から transaction は消え、読み取りに見える。
+            Assert.True(host.Committed.Manager.Active.IsEmpty)
+            let _, found = ok (execute TxnState.none "SELECT id FROM t WHERE v = 10")
+            Assert.Equal<int>(1, found.Rows.Length)
+            Assert.True(host.DurabilityFailure.IsSome)
+        finally
+            host.Close() |> ignore)
+
+[<Fact>]
+let ``DatabaseHost: fsync 失敗後も BEGIN と ROLLBACK は成功する`` () =
+    withDir "begin-after-fsync-fail" (fun root ->
+        let mutable failSync = false
+
+        let durable =
+            CommitDurability(fun _ ->
+                if failSync then
+                    err (DbError.io (System.IO.IOException "fsync failed"))
+                else
+                    ret ())
+
+        let host = ok (DatabaseHost.OpenWith(root, commitDurability = durable))
+
+        let execute sql =
+            host.ExecuteNonTransaction TxnState.none ResultLimits.Unlimited (parseOneOk sql)
+
+        try
+            ok (execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)") |> ignore
+            failSync <- true
+            // 暗黙 commit は適用済みだが、永続化に失敗するので Error。
+            expectError "fsync 失敗後の書き込み" (execute "INSERT INTO t VALUES (1, 10)")
+            Assert.True(host.DurabilityFailure.IsSome)
+
+            // BEGIN / ROLLBACK は WAL を書かないので成功する
+            // （修正前は fsync 待ちで失敗し、manager に ghost transaction が残った）。
+            let local = ok (host.Begin TxnState.none)
+            Assert.True(TxnState.inTransaction local)
+            ok (host.Rollback local) |> ignore
+            Assert.True(host.Committed.Manager.Active.IsEmpty)
+        finally
+            host.Close() |> ignore)
+
+[<Fact>]
+let ``Session: fsync 失敗の COMMIT は transaction を閉じてからエラーを返す`` () =
+    withDir "session-commit-unsynced" (fun root ->
+        let mutable failSync = false
+
+        let durable =
+            CommitDurability(fun _ ->
+                if failSync then
+                    err (DbError.io (System.IO.IOException "fsync failed"))
+                else
+                    ret ())
+
+        let host = ok (DatabaseHost.OpenWith(root, commitDurability = durable))
+        let session = Session.Create(host, SessionOptions.Default, true)
+
+        try
+            ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            |> ignore
+
+            ok (session.Begin()) |> ignore
+            ok (session.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+            failSync <- true
+
+            match session.Commit() with
+            | Error e -> Assert.Equal<ErrorKind>(ErrorKind.IoError, e.Kind)
+            | Ok() -> Assert.Fail "fsync 失敗なのに COMMIT が成功した"
+
+            // 修正前: 接続ローカルが更新されず「transaction 中」のまま host と分断した。
+            Assert.False(session.InTransaction)
+            Assert.True(host.DurabilityFailure.IsSome)
+        finally
+            session.Close() |> ignore)
+
+[<Fact>]
 let ``DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollback する`` () =
     let root = "mem:" + System.Guid.NewGuid().ToString "N"
     let store = openStoreWith "" (memoryEngine ())
@@ -234,6 +341,7 @@ let ``DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollb
         match host.Commit local with
         | Ok(CommitOutcome.RolledBack(_, e), _) -> Assert.Equal(ErrorKind.CapacityError, e.Kind)
         | Ok(CommitOutcome.Committed _, _) -> Assert.Fail "上限超過なのに commit できた"
+        | Ok(CommitOutcome.CommittedUnsynced _, _) -> Assert.Fail "上限超過なのに commit できた"
         | Error e -> Assert.Fail(sprintf "COMMIT が Error を返した: %A" e.Kind)
 
         Assert.True(host.Committed.Manager.Active.IsEmpty)

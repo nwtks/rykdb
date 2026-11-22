@@ -314,6 +314,22 @@ module internal TransactionManager =
         else
             oldest
 
+    /// 診断用のスナップショット（テスト・診断用。挙動には影響しない）。
+    /// <remarks>
+    /// `OldestActiveSnapshot` は GC 境界に使う値（`activeSnapshot` と同じ）。
+    /// 放棄された transaction が `Active` に残っていると
+    /// `LastCommittedKeys` が以後の commit のキーを保持し続けるため、
+    /// その状態を外から観測できるようにする。
+    /// </remarks>
+    let internal status (manager: TransactionManager) =
+        {
+            NextSeqNo = manager.NextSeqNo
+            LastCommitSeqNo = manager.LastCommitSeqNo
+            ActiveCount = manager.Active.Count
+            OldestActiveSnapshot = activeSnapshot manager
+            LastCommittedKeys = manager.LastCommitted.Count
+        }
+
     /// commit する。
     /// 1. transaction 開始時の snapshot より後に、同じキーへの commit があれば競合とする。
     /// 2. 競合がなければ SeqNo を割り当て、今回の書き込みを `LastCommitted` に記録する。

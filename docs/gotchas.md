@@ -454,6 +454,27 @@ write-write競合や書き込みバッファの上限超過は、再COMMITして
   `SessionPool: SQL の COMMIT 競合でも transaction が閉じる` /
   `DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollback する`。
 
+### 5.13 fsync 失敗の COMMIT は適用済み。結果を捨てない
+
+`DatabaseHost.serialized`は`run`（commit の実行・publish・lease 解放）を完了させた後、
+gate の外で fsync を待つ。
+fsync が失敗しても**commit は適用済み**（WAL に記録済みで、再オープン時の WAL 再生で復元される）。
+ここで`Error`だけ返して run の結果を捨てると、呼び出し元は「COMMIT 失敗」と認識するが
+実際には適用されており、接続ローカルは「transaction 中」のまま host と分断する。
+
+- ✅ `serialized`は`(run の値, 永続化エラー)`を返し、`DatabaseHost.Commit`は
+  `CommitOutcome.CommittedUnsynced`（適用済み＋永続化失敗）へ変換する。
+  `Session`は接続ローカルを transaction 外へ進めてからエラーを返す。
+- ✅ BEGIN / ROLLBACK・失敗した文は WAL を進めないので fsync を待たない
+  （待つと、fsync 失敗後の`Begin`が ghost transaction を残す）。
+- ❌ `durability.Await pos >>= fun () -> outcome`は Await の失敗で outcome を捨てる。
+- 暗黙 commit（autocommit の DML / DDL）も「適用済みだが Error」になり得る。
+  接続ローカルは transaction を持たないので分断は無い。
+  以後の操作は`CommitDurability`の失敗状態ですべてエラーになる。
+- 回帰: `DatabaseHost: fsync 失敗の COMMIT は適用済みを CommittedUnsynced で返す` /
+  `DatabaseHost: fsync 失敗後も BEGIN と ROLLBACK は成功する` /
+  `Session: fsync 失敗の COMMIT は transaction を閉じてからエラーを返す`。
+
 ---
 
 ## 6. 索引・結合・クエリ意味論

@@ -1173,6 +1173,14 @@ Snapshot Isolationは直列化可能ではない。
 競合以外の理由（WALのI/Oなど）でCOMMITが失敗した場合、transactionは開いたまま残る。
 WALは書きかけの末尾を切り捨ててから再追記するため、同じtransactionをそのまま再COMMITできる。
 
+WALへの追記が成功してもfsyncが失敗した場合、COMMITは**適用済み**だが永続化は保証されない。
+この場合もtransactionは閉じ、`IoError`を返す
+（メッセージは「COMMIT は適用されましたが、WAL の fsync に失敗しました…」）。
+適用済みなのに失敗だけを返すと接続の状態が壊れるため、適用済みであることを結果で伝える。
+fsyncの失敗後は以後のすべての操作が同じエラーで失敗する。
+autocommitの文（DML / DDL）も同じ理由で「適用済みだがエラー」になり得るため、
+エラーを受け取ってもその文が適用されていないとは限らない。
+
 `BEGIN ISOLATION LEVEL`、`SET TRANSACTION`、`SAVEPOINT`、読み取り専用transactionは未対応。
 
 ### 11.6 複数文の実行

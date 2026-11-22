@@ -129,10 +129,15 @@ type private HostLifecycle =
 /// `DatabaseHost.Commit` はその場合、その場で transaction を abort し、
 /// 接続を transaction 外へ戻す。
 /// エラーは値として返し、呼び出し側（`Session`）が接続状態を更新してからエラーとして返す。
+/// WAL の fsync に失敗した場合も commit は**適用済み**（永続化だけ保証されない）。
+/// その場合も接続を transaction 外へ戻し、`CommittedUnsynced` で適用済みであることを伝える。
+/// 結果を捨てて Error だけ返すと、接続ローカルが「transaction 中」のまま host と分断する。
 /// </remarks>
 [<RequireQualifiedAccess>]
 type internal CommitOutcome =
     | Committed of TxnState
+    /// commit は適用済みだが、WAL の fsync に失敗した（永続化は保証されない）。
+    | CommittedUnsynced of next: TxnState * error: DbError
     | RolledBack of next: TxnState * error: DbError
 
 /// 同一 DB を共有する複数の `Session`（接続）のコミット状態。
@@ -204,8 +209,16 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
             next
         | _, false -> current
 
-    /// writeGate の内側で実行し、WAL の fsync を gate の外で待つ。
+    /// writeGate の内側で実行し、WAL を進めたときだけ fsync を gate の外で待つ。
     /// `run` は「実行後の確定状態」と値も返す（読み取りだけなら入力をそのまま返す）。
+    /// <remarks>
+    /// 戻り値は (run の値, 永続化エラー)。
+    /// 永続化エラーが Some のとき、run の変更は**適用済み**だが fsync に失敗している
+    /// （以後の操作は `CommitDurability` の失敗状態ですべてエラーになる）。
+    /// run が成功した結果を捨てて Error だけ返すと、呼び出し側の接続状態が host と分断する
+    /// （COMMIT 済みなのに「transaction 中」のまま残る）。
+    /// BEGIN / ROLLBACK・失敗した文は WAL を進めないので fsync を待たない。
+    /// </remarks>
     let serialized (run: Committed -> Result<Committed * 'a, DbError>) =
         let outcome, position =
             lock writeGate (fun () ->
@@ -219,17 +232,28 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                     try
                         let outcome, position =
                             match run current with
-                            | Error e -> err e, current.Store.Engine.WalState
-                            | Ok(next, value) -> ret value, next.Store.Engine.WalState
+                            | Error e -> err e, None
+                            | Ok(next, value) ->
+                                let position =
+                                    if next.Store.Engine.WalState = current.Store.Engine.WalState then
+                                        None
+                                    else
+                                        next.Store.Engine.WalState
 
-                        position |> Option.iter durability.Register
+                                position |> Option.iter durability.Register
+                                ret value, position
+
                         outcome, position
                     finally
                         lease.Dispose())
 
-        match position with
-        | Some pos -> durability.Await pos >>= fun () -> outcome
-        | None -> outcome
+        match outcome, position with
+        | Error e, _ -> err e
+        | Ok value, None -> ret (value, None)
+        | Ok value, Some pos ->
+            match durability.Await pos with
+            | Ok() -> ret (value, None)
+            | Error e -> ret (value, Some e)
 
     /// 与えたストアで DB を開く。
     /// カタログ読込・DROP 後始末・background worker の開始まで行う。
@@ -347,7 +371,7 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
 
                         ret (next, (nextLocal, StatementResult.Empty)))
 
-            serialized run |> Result.map fst
+            serialized run |> Result.map (fun ((nextLocal, _), _) -> nextLocal)
 
     /// COMMIT。接続の transaction を共有の Manager で確定する。
     /// <remarks>
@@ -356,6 +380,8 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
     /// （競合は同じ snapshot のままでは永久に競合し、上限は減らない）。
     /// そのため transaction を abort して接続を transaction 外へ戻し、
     /// エラーを `CommitOutcome.RolledBack` として返す。
+    /// WAL の fsync に失敗した場合、commit は適用済みだが永続化は保証されない。
+    /// 接続を transaction 外へ戻し、`CommitOutcome.CommittedUnsynced` として返す。
     /// それ以外の失敗（WAL の I/O など）では transaction を残す。
     /// </remarks>
     member _.Commit(local: TxnState) =
@@ -374,6 +400,20 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                     publish rolledBack.Committed
                     ret (rolledBack.Committed, (CommitOutcome.RolledBack(rolledBack.Txn, e), StatementResult.Empty))
                 | Error e -> err e)
+            >>= fun (outcome, result as value, durability) ->
+                match durability with
+                | None -> ret value
+                | Some e ->
+                    match outcome with
+                    | CommitOutcome.Committed next ->
+                        let unsynced =
+                            DbError.create
+                                e.Kind
+                                (sprintf "COMMIT は適用されましたが、WAL の fsync に失敗しました（再起動すると失われる可能性があります）: %s" e.Message)
+
+                        ret (CommitOutcome.CommittedUnsynced(next, unsynced), result)
+                    | CommitOutcome.CommittedUnsynced _
+                    | CommitOutcome.RolledBack _ -> ret value
 
     /// ROLLBACK。接続の transaction を捨てる。
     /// <remarks>
@@ -389,6 +429,7 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                 local.Lease |> Option.iter _.Release()
                 publish next.Committed
                 ret (next.Committed, (next.Txn, StatementResult.Empty)))
+            |> Result.map (fun (value, _) -> value)
 
     /// transaction 以外の文（SELECT / DML / DDL）を実行する。
     member _.ExecuteNonTransaction (local: TxnState) (limits: ResultLimits) (stmt: Statement) =
@@ -409,6 +450,10 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                     let committed = { current with Manager = next.Manager }
                     publish committed
                     ret (committed, (nextLocal, result)))
+        >>= fun (value, durability) ->
+            match durability with
+            | None -> ret value
+            | Some e -> err e
 
     /// DB 全体を閉じる（memtable を flush し、WAL を削除し、プロセスロックを解放する）。
     /// <remarks>

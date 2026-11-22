@@ -79,6 +79,7 @@
 | INV-43 | 解析用の修飾失敗で ON 述語を落とさない                | `PlanBuilder.buildSteps`（raw ON へのフォールバック・残りの Filter 化）、PlanBuilderTests |
 | INV-44 | 放棄された transaction は次の書き込みで回収する       | `RegistrationLease`、`DatabaseHost.reclaimAbandoned`、DatabaseHostTests                   |
 | INV-45 | commit できない COMMIT は接続を transaction 外へ戻す  | `CommitOutcome`、`DatabaseHost.Commit`、`Session`、SessionTests                           |
+| INV-46 | fsync 失敗で適用済みの COMMIT の結果を捨てない        | `DatabaseHost.serialized`、`CommitOutcome.CommittedUnsynced`、DatabaseHostTests           |
 
 ---
 
@@ -784,6 +785,29 @@ write-write競合や書き込みバッファの上限超過でCOMMITが失敗し
 `SessionPool: SQL の COMMIT 競合でも transaction が閉じる`、
 `DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollback する`、
 `Wal.append: 書きかけの末尾を切り捨ててから追記する` を検査する。
+
+---
+
+### INV-46: fsync 失敗で適用済みの COMMIT の結果を捨てない
+
+`DatabaseHost.serialized`は`run`（commit の実行・publish・lease 解放）を完了させた後、
+gate の外で fsync を待つ。
+fsync が失敗しても commit は**適用済み**である
+（WAL に記録済みで、再オープン時の WAL 再生で復元される）。
+
+- `serialized`は`(run の値, 永続化エラー)`を返し、run が成功した結果を捨てない。
+- `DatabaseHost.Commit`は永続化エラーを`CommitOutcome.CommittedUnsynced`
+  （適用済み＋永続化失敗）へ変換する。
+  `Session`は接続ローカルを transaction 外へ進めてからエラーを返す
+  （接続と host の分断を防ぐ）。
+- BEGIN / ROLLBACK・失敗した文は WAL を進めないので fsync を待たない。
+  待つと、fsync 失敗後の`Begin`が manager に ghost transaction を残す。
+- 暗黙 commit（autocommit の DML / DDL）も「適用済みだが Error」になり得る。
+  接続ローカルは transaction を持たないので分断は無い。
+
+回帰テストは `DatabaseHost: fsync 失敗の COMMIT は適用済みを CommittedUnsynced で返す`、
+`DatabaseHost: fsync 失敗後も BEGIN と ROLLBACK は成功する`、
+`Session: fsync 失敗の COMMIT は transaction を閉じてからエラーを返す` を検査する。
 
 ---
 
