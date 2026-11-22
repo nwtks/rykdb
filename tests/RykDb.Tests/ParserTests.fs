@@ -652,17 +652,26 @@ let ``Parser: EXPLAIN は SELECT を包む`` () =
 [<Fact>]
 let ``Parser: ANALYZE はテーブル名を受ける`` () =
     match parseOneOk "ANALYZE t" with
-    | Statement.Analyze(Some name) -> Assert.Equal<string>("t", name)
+    | Statement.Analyze(Some name, None) -> Assert.Equal<string>("t", name)
     | other -> failActual "ANALYZE ではない" other
 
     match parseOneOk "ANALYZE TABLE t;" with
-    | Statement.Analyze(Some name) -> Assert.Equal<string>("t", name)
+    | Statement.Analyze(Some name, None) -> Assert.Equal<string>("t", name)
     | other -> failActual "ANALYZE TABLE ではない" other
 
+    match parseOneOk "ANALYZE t SAMPLE 100" with
+    | Statement.Analyze(Some name, Some sample) ->
+        Assert.Equal<string>("t", name)
+        Assert.Equal<int>(100, sample)
+    | other -> failActual "ANALYZE SAMPLE ではない" other
+
     match parseOneOk "ANALYZE" with
-    | Statement.Analyze None -> ()
+    | Statement.Analyze(None, None) -> ()
     | other -> failActual "ANALYZE 全テーブルではない" other
 
     match parseOneOk "ANALYZE TABLE" with
-    | Statement.Analyze None -> ()
+    | Statement.Analyze(None, None) -> ()
     | other -> failActual "ANALYZE TABLE 全テーブルではない" other
+
+    expectErrorKind ErrorKind.SyntaxError "SAMPLE 0" (parseStatement "ANALYZE t SAMPLE 0")
+    expectErrorKind ErrorKind.SyntaxError "SAMPLE 欠落" (parseStatement "ANALYZE t SAMPLE")

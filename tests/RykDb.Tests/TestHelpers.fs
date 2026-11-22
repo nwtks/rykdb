@@ -409,6 +409,39 @@ let schema2 =
             outCol "b" None (Some DataType.Integer)
         ]
 
+/// ANALYZE の列統計。
+let colStats
+    (name: string)
+    (ndv: int64)
+    (nulls: int64)
+    (minValue: float option)
+    (maxValue: float option)
+    : ColumnStats =
+    {
+        Name = name
+        NDV = ndv
+        Nulls = nulls
+        Min = minValue
+        Max = maxValue
+    }
+
+/// ANALYZE の索引統計。
+let idxStats (name: string) (columns: string list) (prefixNdv: int64 list) : IndexStats =
+    {
+        Name = name
+        Columns = columns
+        PrefixNDV = prefixNdv
+    }
+
+/// ANALYZE のテーブル統計。
+let tableStats (table: string) (rows: int64) (columns: ColumnStats list) (indexes: IndexStats list) : TableStats =
+    {
+        Table = table
+        RowCount = rows
+        Columns = columns
+        Indexes = indexes
+    }
+
 /// 共有のテスト用テーブルスキーマ。
 let peopleSchema: TableSchema =
     {

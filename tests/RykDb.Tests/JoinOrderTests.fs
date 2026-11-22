@@ -136,6 +136,24 @@ let ``JoinOrder.transitionDelta: 作業メモリを超える build はスピル�
     Assert.True(spilled > normal)
 
 [<Fact>]
+let ``JoinOrder.transitionDelta: 複合キーのマージ結合もコストに使う`` () =
+    let b = itemWith "b" 1_000_000.0 1 [] (Some [ "k1"; "k2" ])
+
+    let edges =
+        [
+            keyedEdge (Some 0.1) (Map.ofList [ "a", "k1"; "b", "k1" ])
+            keyedEdge (Some 0.1) (Map.ofList [ "a", "k2"; "b", "k2" ])
+        ]
+
+    let newRows = JoinOrder.nextRows edges (Set.singleton "a") 10.0 b
+
+    let ordered =
+        JoinOrder.transitionDelta 10.0 32.0 (Some [ "k1"; "k2" ]) -1.0 edges b newRows
+
+    let unordered = JoinOrder.transitionDelta 10.0 32.0 None -1.0 edges b newRows
+    Assert.True(ordered < unordered)
+
+[<Fact>]
 let ``JoinOrder.selinger: 同点は FROM の位置順にする`` () =
     let items = [ item "b" 10.0 1; item "c" 10.0 2 ]
     let edges = [ edge "a" "b"; edge "a" "c" ]

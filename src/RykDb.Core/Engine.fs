@@ -327,47 +327,182 @@ module internal ExecState =
 
         loop state [||]
 
-    /// テーブルの行数と列の異なり値数を収集する。
-    let private collectStats (defn: TableDefinition) (state: ExecState) =
+    /// テーブルの行数、列 NDV・NULL 数・数値範囲、索引 prefix NDV を収集する。
+    /// `sample` が Some n なら reservoir sampling で n 行だけを標本にする。
+    let private collectStats (defn: TableDefinition) (state: ExecState) (sample: int option) =
+        let nextRandom state =
+            state * 6364136223846793005L + 1442695040888963407L
+
+        let rec consume accumulate count scan =
+            match SstScan.next scan with
+            | Error e ->
+                SstScan.dispose scan
+                err e
+            | Ok None -> ret count
+            | Ok(Some(entry, rest)) ->
+                entry.Value |> Option.iter accumulate
+                consume accumulate (count + 1L) rest
+
+        let rec loop n count samples sampleCount rng scan =
+            match SstScan.next scan with
+            | Error e ->
+                SstScan.dispose scan
+                err e
+            | Ok None -> ret (count, samples, sampleCount)
+            | Ok(Some(entry, rest)) ->
+                match entry.Value with
+                | None -> loop n count samples sampleCount rng rest
+                | Some row ->
+                    let rng = nextRandom rng
+                    let count = count + 1L
+
+                    if sampleCount < n then
+                        loop n count (row :: samples) (sampleCount + 1) rng rest
+                    else
+                        let j = int ((rng >>> 1) % count)
+
+                        if j < n then
+                            let samples = samples |> List.mapi (fun i current -> if i = j then row else current)
+
+                            loop n count samples sampleCount rng rest
+                        else
+                            loop n count samples sampleCount rng rest
+
         result {
             let! schema = Catalog.toSchema defn
-            let! scan = RowStore.scan (Keyspace.table schema.Name) [||] 0 state.Store
+            let schemaColumns = schema.Columns |> Array.ofList
 
             let columnSets =
-                Array.init schema.Columns.Length (fun _ -> System.Collections.Generic.HashSet<string>())
+                Array.init schemaColumns.Length (fun _ -> System.Collections.Generic.HashSet<string>())
 
-            let rec consume count scan =
-                match SstScan.next scan with
-                | Error e ->
-                    SstScan.dispose scan
-                    err e
-                | Ok None -> ret count
-                | Ok(Some(entry, rest)) ->
-                    entry.Value
-                    |> Option.iter (fun row ->
-                        row
-                        |> Array.iteri (fun i value ->
-                            if i < columnSets.Length then
-                                columnSets.[i].Add(SqlLiteral.toSqlLiteral value) |> ignore))
+            let nullCounts = System.Collections.Generic.Dictionary<int, int64>()
+            let minMax = System.Collections.Generic.Dictionary<int, struct (float * float)>()
 
-                    consume (count + 1L) rest
+            let indexes =
+                Catalog.indexesOf schema.Name state.Catalog
+                |> List.choose (fun index ->
+                    let positions =
+                        index.Columns
+                        |> List.map (fun name ->
+                            schemaColumns |> Array.tryFindIndex (fun col -> SqlName.equal col.Name name))
 
-            let! rowCount = consume 0L scan
+                    if positions |> List.exists Option.isNone then
+                        None
+                    else
+                        Some(
+                            index,
+                            positions |> List.choose id |> Array.ofList,
+                            Array.init index.Columns.Length (fun _ -> System.Collections.Generic.HashSet<string>())
+                        ))
+
+            let! scan = RowStore.scan (Keyspace.table schema.Name) [||] 0 state.Store
+
+            let accumulate row =
+                row
+                |> Array.iteri (fun i value ->
+                    if i < columnSets.Length then
+                        if SqlValue.isNull value then
+                            let current =
+                                match nullCounts.TryGetValue i with
+                                | true, n -> n
+                                | _ -> 0L
+
+                            nullCounts.[i] <- current + 1L
+                        else
+                            columnSets.[i].Add(SqlLiteral.toSqlLiteral value) |> ignore
+
+                            match SqlValue.asNumeric value with
+                            | Some d ->
+                                let v = float d
+
+                                match minMax.TryGetValue i with
+                                | true, struct (lo, hi) -> minMax.[i] <- struct (min lo v, max hi v)
+                                | _ -> minMax.[i] <- struct (v, v)
+                            | None -> ())
+
+                for _, positions, sets in indexes do
+                    positions
+                    |> Array.fold
+                        (fun (key, k) pos ->
+                            if pos < row.Length then
+                                let part = SqlLiteral.toSqlLiteral row.[pos]
+                                let key = key + string part.Length + ":" + part
+                                sets.[k].Add key |> ignore
+
+                            key, k + 1)
+                        ("", 0)
+                    |> ignore
+
+            let! totalRows, sampleSize =
+                match sample |> Option.map (min 100_000) with
+                | None ->
+                    result {
+                        let! count = consume accumulate 0L scan
+                        return count, count
+                    }
+                | Some n ->
+                    result {
+                        let! count, samples, sampleCount = loop n 0L [] 0 1L scan
+                        samples |> List.iter accumulate
+                        return count, sampleCount
+                    }
+
+            let scaleNulls nulls =
+                if sampleSize <= 0L then
+                    0L
+                else
+                    (nulls * totalRows + sampleSize / 2L) / sampleSize
+
+            let columns =
+                schemaColumns
+                |> Array.indexed
+                |> Array.map (fun (i, col) ->
+                    let nulls =
+                        match nullCounts.TryGetValue i with
+                        | true, n -> n
+                        | _ -> 0L
+
+                    let minValue, maxValue =
+                        match minMax.TryGetValue i with
+                        | true, struct (lo, hi) -> Some lo, Some hi
+                        | _ -> None, None
+
+                    let column =
+                        {
+                            Name = col.Name
+                            NDV = int64 columnSets.[i].Count
+                            Nulls = scaleNulls nulls
+                            Min = minValue
+                            Max = maxValue
+                        }
+
+                    column)
+                |> List.ofArray
+
+            let indexes =
+                indexes
+                |> List.map (fun (index, _, sets) ->
+                    let indexStats: IndexStats =
+                        {
+                            Name = index.IndexName
+                            Columns = index.Columns
+                            PrefixNDV = sets |> Array.map (fun set -> int64 set.Count) |> List.ofArray
+                        }
+
+                    indexStats)
 
             return
                 {
                     Table = schema.Name
-                    RowCount = rowCount
-                    ColumnNDV = schema.Columns |> List.mapi (fun i col -> col.Name, int64 columnSets.[i].Count)
-                    Indexes =
-                        Catalog.indexesOf schema.Name state.Catalog
-                        |> List.map (fun i -> i.IndexName, i.Columns)
+                    RowCount = totalRows
+                    Columns = columns
+                    Indexes = indexes
                 }
         }
 
     /// テーブルの統計を再収集する。名前が None なら全テーブル。
     /// 統計はカタログに 1回で保存する。
-    let private analyzeCore (table: string option) (state: ExecState) =
+    let private analyzeCore (table: string option) (sample: int option) (state: ExecState) =
         result {
             let! defns =
                 match table with
@@ -377,7 +512,7 @@ module internal ExecState =
                     | None -> err (sprintf "テーブル %s が存在しません" name |> DbError.notFound)
                 | None -> ret state.Catalog.Tables
 
-            let! stats = defns |> List.map (fun defn -> collectStats defn state) |> all
+            let! stats = defns |> List.map (fun defn -> collectStats defn state sample) |> all
 
             let nextCatalog =
                 stats |> List.fold (fun catalog s -> Catalog.addStats s catalog) state.Catalog
@@ -386,8 +521,8 @@ module internal ExecState =
             return next, stats
         }
 
-    let analyze (table: string option) (state: ExecState) =
-        exclusiveDdlWith state (analyzeCore table)
+    let analyze (table: string option, sample: int option) (state: ExecState) =
+        exclusiveDdlWith state (analyzeCore table sample)
 
     let private createTableCore (c: CreateTable) (state: ExecState) =
         let existing = Catalog.findTable c.Name state.Catalog
@@ -1185,21 +1320,23 @@ module internal Engine =
         | Statement.CreateIndex ci -> ExecState.createIndex ci |> runDdl state
         | Statement.DropIndex(n, ifE) -> ExecState.dropIndex n ifE |> runDdl state
         | Statement.AlterTable a -> ExecState.alterTable a |> runDdl state
-        | Statement.Analyze name ->
+        | Statement.Analyze(name, sample) ->
             runDdlWithState state (fun st ->
-                ExecState.analyze name st
+                ExecState.analyze (name, sample) st
                 |> Result.bind (fun (next, stats) ->
                     let columns = [| "table"; "rows"; "columns"; "ndv" |]
 
                     let rows =
                         stats
-                        |> List.map (fun s ->
+                        |> List.map (fun (s: TableStats) ->
                             [|
                                 SqlValue.Text s.Table
                                 SqlValue.Int s.RowCount
-                                SqlValue.Int(int64 s.ColumnNDV.Length)
+                                SqlValue.Int(int64 s.Columns.Length)
                                 SqlValue.Text(
-                                    s.ColumnNDV |> List.map (fun (n, v) -> sprintf "%s=%d" n v) |> String.concat ","
+                                    s.Columns
+                                    |> List.map (fun c -> sprintf "%s=%d" c.Name c.NDV)
+                                    |> String.concat ","
                                 )
                             |])
                         |> Array.ofList

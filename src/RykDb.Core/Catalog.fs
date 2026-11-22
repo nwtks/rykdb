@@ -41,17 +41,37 @@ type internal IndexDefinition =
         Unique: bool
     }
 
+/// 列の統計。
+type internal ColumnStats =
+    {
+        Name: string
+        /// NULL を除いた異なり値数。
+        NDV: int64
+        Nulls: int64
+        /// 数値型の最小値・最大値（数値以外は None）。
+        Min: float option
+        Max: float option
+    }
+
+/// 索引の統計。
+type internal IndexStats =
+    {
+        Name: string
+        Columns: string list
+        /// 先頭 k 列の異なる組の数（k = 1..Columns.Length）。
+        PrefixNDV: int64 list
+    }
+
 /// `ANALYZE` が収集するテーブル統計。
 /// <remarks>
-/// `ColumnNDV` は列名 -> 異なり値数（NULL を含む）。
 /// 統計は手動で更新する。INSERT / UPDATE / DELETE では自動更新しない。
 /// </remarks>
 type internal TableStats =
     {
         Table: string
         RowCount: int64
-        ColumnNDV: (string * int64) list
-        Indexes: (string * string list) list
+        Columns: ColumnStats list
+        Indexes: IndexStats list
     }
 
 /// カタログ全体のスナップショット。
@@ -107,6 +127,16 @@ module internal Catalog =
         { c with
             Stats = c.Stats |> List.filter (fun s -> not (eqName s.Table table))
         }
+
+    /// 列の統計を探す。
+    let findColumnStats (table: string) (column: string) (c: Catalog) =
+        findStats table c
+        |> Option.bind (fun s -> s.Columns |> List.tryFind (fun col -> eqName col.Name column))
+
+    /// 索引の統計を探す。
+    let findIndexStats (table: string) (index: string) (c: Catalog) =
+        findStats table c
+        |> Option.bind (fun s -> s.Indexes |> List.tryFind (fun idx -> eqName idx.Name index))
 
     /// テーブルを追加（同名があれば置き換える）。
     let addTable (t: TableDefinition) (c: Catalog) =
@@ -351,23 +381,45 @@ module internal Catalog =
                 }
         }
 
+    let private writeFloat (v: float) =
+        Writer.int64LE (System.BitConverter.DoubleToInt64Bits v)
+
+    let private writeFloatOption (v: float option) (w: Writer) =
+        match v with
+        | None -> Writer.bool false w
+        | Some x -> Writer.bool true w |> writeFloat x
+
     let private encodeStats (s: TableStats) =
         let w0 =
             Writer.Empty
             |> Writer.int64LE s.RowCount
-            |> Writer.varint (uint64 s.ColumnNDV.Length)
+            |> Writer.varint (uint64 s.Columns.Length)
 
         let w1 =
-            s.ColumnNDV
-            |> List.fold (fun w (name, ndv) -> w |> Writer.str name |> Writer.int64LE ndv) w0
+            s.Columns
+            |> List.fold (fun w c -> w |> Writer.str c.Name |> Writer.int64LE c.NDV) w0
             |> Writer.varint (uint64 s.Indexes.Length)
+
+        let w2 =
+            s.Indexes
+            |> List.fold
+                (fun w i ->
+                    let w = w |> Writer.str i.Name |> Writer.varint (uint64 i.Columns.Length)
+                    i.Columns |> List.fold (fun w c -> Writer.str c w) w)
+                w1
+
+        let w3 =
+            s.Columns
+            |> List.fold
+                (fun w c -> w |> Writer.int64LE c.Nulls |> writeFloatOption c.Min |> writeFloatOption c.Max)
+                (Writer.writeByte 1uy w2)
 
         s.Indexes
         |> List.fold
-            (fun w (name, columns) ->
-                let w = w |> Writer.str name |> Writer.varint (uint64 columns.Length)
-                columns |> List.fold (fun w c -> Writer.str c w) w)
-            w1
+            (fun w i ->
+                let w = Writer.varint (uint64 i.PrefixNDV.Length) w
+                i.PrefixNDV |> List.fold (fun w n -> Writer.int64LE n w) w)
+            w3
         |> Writer.toArray
 
     let private readColumnStat (c: Cursor) =
@@ -385,26 +437,117 @@ module internal Catalog =
             return (name, columns), c3
         }
 
+    let private readFloatOption (c: Cursor) =
+        result {
+            let! has, c1 = Reader.readBool c
+
+            if not has then
+                return None, c1
+            else
+                let! bits, c2 = Reader.readInt64LE c1
+                return Some(System.BitConverter.Int64BitsToDouble bits), c2
+        }
+
+    let private readColumnExtras (c: Cursor) =
+        result {
+            let! nulls, c1 = Reader.readInt64LE c
+            let! minValue, c2 = readFloatOption c1
+            let! maxValue, c3 = readFloatOption c2
+            return (nulls, minValue, maxValue), c3
+        }
+
+    let private readIndexExtras (c: Cursor) =
+        result {
+            let! count, c1 = Reader.readVarint c
+            let! ndvs, c2 = Reader.readItems Reader.readInt64LE count c1
+            return ndvs, c2
+        }
+
     let private decodeStats (table: string) (bytes: byte array) =
         result {
             let! rowCount, cur1 = Cursor.create bytes |> Reader.readInt64LE
             let! colCount, cur2 = Reader.readVarint cur1
             let! cols, cur3 = Reader.readItems readColumnStat colCount cur2
 
-            let! indexes =
+            let! indexDefs, afterIndexes =
                 if Cursor.atEnd cur3 then
-                    ret []
+                    ret ([], cur3)
                 else
                     Reader.readVarint cur3
-                    >>= fun (count, cur4) -> Reader.readItems readIndexStat count cur4 |> Result.map fst
+                    >>= fun (count, cur4) ->
+                        Reader.readItems readIndexStat count cur4
+                        |> Result.map (fun (items, cur5) -> items, cur5)
 
-            return
-                {
-                    Table = table
-                    RowCount = rowCount
-                    ColumnNDV = cols
-                    Indexes = indexes
-                }
+            let columns =
+                cols
+                |> List.map (fun (name, ndv) ->
+                    let column: ColumnStats =
+                        {
+                            Name = name
+                            NDV = ndv
+                            Nulls = 0L
+                            Min = None
+                            Max = None
+                        }
+
+                    column)
+
+            let indexes =
+                indexDefs
+                |> List.map (fun (name, columns) ->
+                    let index: IndexStats =
+                        {
+                            Name = name
+                            Columns = columns
+                            PrefixNDV = []
+                        }
+
+                    index)
+
+            if Cursor.atEnd afterIndexes then
+                return
+                    {
+                        Table = table
+                        RowCount = rowCount
+                        Columns = columns
+                        Indexes = indexes
+                    }
+            else
+                let! tag, cur4 = Reader.readByte afterIndexes
+
+                if tag <> 1uy then
+                    return! err (sprintf "統計の形式が不明です: %d" tag |> DbError.corruption)
+                else
+                    let! columnExtras, cur5 =
+                        Reader.readItems readColumnExtras (uint64 columns.Length) cur4
+
+                    let! indexExtras, cur6 =
+                        Reader.readItems readIndexExtras (uint64 indexes.Length) cur5
+
+                    if not (Cursor.atEnd cur6) then
+                        return! err (DbError.corruption "統計の末尾に余分なデータがあります")
+                    else
+                        let columns =
+                            List.map2
+                                (fun c (nulls, minValue, maxValue) ->
+                                    { c with
+                                        Nulls = nulls
+                                        Min = minValue
+                                        Max = maxValue
+                                    })
+                                columns
+                                columnExtras
+
+                        let indexes =
+                            List.map2 (fun i prefix -> { i with PrefixNDV = prefix }) indexes indexExtras
+
+                        return
+                            {
+                                Table = table
+                                RowCount = rowCount
+                                Columns = columns
+                                Indexes = indexes
+                            }
         }
 
     /// カタログのテーブル定義キー（`table:<name>`）。

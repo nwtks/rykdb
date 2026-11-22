@@ -148,7 +148,7 @@ module internal Analyzer =
     /// LSM の走査はキーのバイト順 = 主キー / 索引列の SQL 順なので、
     /// 主キー走査・索引走査はこの並びを返す。`Filter` / `Limit` は順序を変えない。
     /// </remarks>
-    let private scanOrder (tableOf: string -> TableSchema option) =
+    let scanOrder (tableOf: string -> TableSchema option) =
         let primaryKeyOrder t =
             match TableSchema.primaryKeyColumns t |> Array.toList with
             | [] -> None
@@ -261,16 +261,18 @@ module internal Analyzer =
 
     /// 修飾付き列の異なり値数。
     /// 統計が無い・未修飾なら None。
-    let private ndvOfColumn (statsOf: string -> TableStats option) (expr: Expr) =
+    /// 列参照から "テーブル統計 × 列統計" を引く。
+    let private columnWithStatsOf (statsOf: string -> TableStats option) (expr: Expr) =
         match Schema.tryAsColumnRef expr with
         | Some(r: ColumnRef) ->
             r.Qualifier
-            |> Option.bind (fun q ->
-                statsOf q
-                |> Option.bind (fun stats ->
-                    stats.ColumnNDV
-                    |> List.tryFind (fun (name, _) -> SqlName.equal name r.Name)
-                    |> Option.map snd))
+            |> Option.bind (
+                statsOf
+                >> Option.bind (fun stats ->
+                    stats.Columns
+                    |> List.tryFind (fun c -> SqlName.equal c.Name r.Name)
+                    |> Option.map (fun c -> stats, c))
+            )
         | None -> None
 
     /// 式の修飾子（列参照でなければ None）。
@@ -279,15 +281,24 @@ module internal Analyzer =
         | Some(r: ColumnRef) -> r.Qualifier
         | None -> None
 
+    /// NULL の割合。
+    let private nullRate (stats: TableStats) (column: ColumnStats) =
+        if stats.RowCount <= 0L then
+            0.0
+        else
+            float column.Nulls / float stats.RowCount
+
     /// 1本の等値述語の結合選択性。
     /// 両側の列に NDV 統計があるときだけ `Some` を返す。
+    /// 等値比較は NULL 同士を一致させないため、NULL 率を掛けて除く。
     let equalitySelectivity (statsOf: string -> TableStats option) =
         function
         | Expr.Binary(BinaryOp.Eq, a, b) ->
             match qualifierOf a, qualifierOf b with
             | Some qa, Some qb when not (Catalog.eqName qa qb) ->
-                match ndvOfColumn statsOf a, ndvOfColumn statsOf b with
-                | Some l, Some r when l > 0L && r > 0L -> Some(1.0 / float (max l r))
+                match columnWithStatsOf statsOf a, columnWithStatsOf statsOf b with
+                | Some(sa, ca), Some(sb, cb) when ca.NDV > 0L && cb.NDV > 0L ->
+                    Some((1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV))
                 | _ -> None
             | _ -> None
         | _ -> None
@@ -335,67 +346,142 @@ module internal Analyzer =
 
     /// 統計付きの列 NDV。
     let private ndvOfName (stats: TableStats) (name: string) =
-        stats.ColumnNDV
-        |> List.tryFind (fun (n, _) -> SqlName.equal n name)
-        |> Option.map snd
+        stats.Columns
+        |> List.tryFind (fun c -> SqlName.equal c.Name name)
+        |> Option.map _.NDV
+
+    /// 数値リテラル。
+    let private numericLiteral =
+        literalOf >> Option.bind (SqlValue.asNumeric >> Option.map float)
 
     /// 1本の述語の選択性（統計が無ければ既定値）。
     let private filterConjunctSelectivity (statsOf: string -> TableStats option) (conjunct: Expr) =
         let defaultSelectivity = 0.1
         let rangeSelectivity = 1.0 / 3.0
 
-        let ndvSelectivity expr =
-            match ndvOfColumn statsOf expr with
-            | Some n when n > 0L -> Some(1.0 / float n)
-            | _ -> None
-
         let withNegation neg value =
             if neg then max 0.0 (1.0 - value) else value
 
+        let eqToLiteral columnExpr literal =
+            match columnWithStatsOf statsOf columnExpr with
+            | Some(stats, column) when column.NDV > 0L ->
+                if SqlValue.isNull literal then
+                    nullRate stats column
+                else
+                    (1.0 - nullRate stats column) / float column.NDV
+            | _ -> defaultSelectivity
+
+        let rangeToLiteral columnExpr literal op =
+            match columnWithStatsOf statsOf columnExpr, SqlValue.asNumeric literal with
+            | Some(_, column), Some n when column.Min.IsSome && column.Max.IsSome ->
+                let lo = column.Min.Value
+                let hi = column.Max.Value
+
+                if hi <= lo then
+                    rangeSelectivity
+                else
+                    let v = float n
+
+                    let selectivity =
+                        match op with
+                        | BinaryOp.Gt
+                        | BinaryOp.Ge -> (hi - v) / (hi - lo)
+                        | BinaryOp.Lt
+                        | BinaryOp.Le -> (v - lo) / (hi - lo)
+                        | _ -> rangeSelectivity
+
+                    max 0.0 (min 1.0 selectivity)
+            | _ -> rangeSelectivity
+
+        let flip =
+            function
+            | BinaryOp.Gt -> BinaryOp.Lt
+            | BinaryOp.Ge -> BinaryOp.Le
+            | BinaryOp.Lt -> BinaryOp.Gt
+            | BinaryOp.Le -> BinaryOp.Ge
+            | other -> other
+
         match conjunct with
         | Expr.Binary(BinaryOp.Eq, a, b) ->
-            match ndvOfColumn statsOf a, ndvOfColumn statsOf b with
-            | Some l, Some r when l > 0L && r > 0L -> 1.0 / float (max l r)
+            match columnWithStatsOf statsOf a, columnWithStatsOf statsOf b with
+            | Some(sa, ca), Some(sb, cb) when ca.NDV > 0L && cb.NDV > 0L ->
+                (1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV)
             | _ ->
-                match ndvSelectivity a, literalOf b with
-                | Some s, Some _ -> s
-                | _ ->
-                    match ndvSelectivity b, literalOf a with
-                    | Some s, Some _ -> s
-                    | _ -> defaultSelectivity
+                match literalOf b with
+                | Some literal -> eqToLiteral a literal
+                | None ->
+                    match literalOf a with
+                    | Some literal -> eqToLiteral b literal
+                    | None -> defaultSelectivity
         | Expr.Binary(BinaryOp.Ne, a, b) ->
-            match ndvSelectivity a, literalOf b with
-            | Some s, Some _ -> max 0.0 (1.0 - s)
-            | _ -> 0.9
-        | Expr.Binary((BinaryOp.Gt | BinaryOp.Ge | BinaryOp.Lt | BinaryOp.Le), a, b) ->
-            match literalOf a, literalOf b with
-            | Some _, _
-            | _, Some _ -> rangeSelectivity
-            | _ -> defaultSelectivity
-        | Expr.Between(_, _, _, neg) -> withNegation neg rangeSelectivity
+            let equality =
+                match literalOf b with
+                | Some literal -> eqToLiteral a literal
+                | None ->
+                    match literalOf a with
+                    | Some literal -> eqToLiteral b literal
+                    | None -> defaultSelectivity
+
+            max 0.0 (1.0 - equality)
+        | Expr.Binary(BinaryOp.Gt | BinaryOp.Ge | BinaryOp.Lt | BinaryOp.Le as op, a, b) ->
+            match literalOf b with
+            | Some literal -> rangeToLiteral a literal op
+            | None ->
+                match literalOf a with
+                | Some literal -> rangeToLiteral b literal (flip op)
+                | None -> defaultSelectivity
+        | Expr.Between(x, low, high, neg) ->
+            let selectivity =
+                match columnWithStatsOf statsOf x, numericLiteral low, numericLiteral high with
+                | Some(_, column), Some lo, Some hi when column.Min.IsSome && column.Max.IsSome ->
+                    let minValue = column.Min.Value
+                    let maxValue = column.Max.Value
+
+                    if maxValue <= minValue then
+                        rangeSelectivity
+                    else
+                        max 0.0 (min 1.0 ((hi - lo) / (maxValue - minValue)))
+                | _ -> rangeSelectivity
+
+            withNegation neg selectivity
         | Expr.InList(x, values, neg) ->
+            let perValue =
+                values
+                |> List.tryHead
+                |> Option.map (fun v ->
+                    literalOf v
+                    |> Option.map (eqToLiteral x)
+                    |> Option.defaultValue defaultSelectivity)
+                |> Option.defaultValue defaultSelectivity
+
+            withNegation neg (min 1.0 (float (List.length values) * perValue))
+        | Expr.Like(x, pattern, neg, _) ->
             let selectivity =
-                match ndvOfColumn statsOf x with
-                | Some n when n > 0L -> min 1.0 (float (List.length values) / float n)
-                | _ -> defaultSelectivity
+                let baseSelectivity =
+                    match literalOf pattern with
+                    | Some(SqlValue.Text text) when text.EndsWith("%", System.StringComparison.Ordinal) ->
+                        if text.Length <= 1 then 1.0 else 0.1
+                    | Some(SqlValue.Text _) -> 0.2
+                    | _ -> defaultSelectivity
+
+                match columnWithStatsOf statsOf x with
+                | Some(stats, column) -> baseSelectivity * (1.0 - nullRate stats column)
+                | None -> baseSelectivity
 
             withNegation neg selectivity
-        | Expr.Like(_, pattern, neg, _) ->
+        | Expr.IsNull(x, neg) ->
             let selectivity =
-                match literalOf pattern with
-                | Some(SqlValue.Text text) when text.EndsWith("%", System.StringComparison.Ordinal) ->
-                    if text.Length <= 1 then 1.0 else 0.1
-                | Some(SqlValue.Text _) -> 0.2
-                | _ -> defaultSelectivity
+                match columnWithStatsOf statsOf x with
+                | Some(stats, column) -> nullRate stats column
+                | None -> defaultSelectivity
 
             withNegation neg selectivity
-        | Expr.IsNull(_, neg) -> if neg then 0.9 else 0.1
         | _ -> defaultSelectivity
 
-    let private filterSelectivity (statsOf: string -> TableStats option) (predicate: Expr) =
-        Predicate.splitConjuncts predicate
-        |> List.map (filterConjunctSelectivity statsOf)
-        |> List.fold (*) 1.0
+    let private filterSelectivity (statsOf: string -> TableStats option) =
+        Predicate.splitConjuncts
+        >> List.map (filterConjunctSelectivity statsOf)
+        >> List.fold (*) 1.0
 
     /// 行数の見積り。
     /// 統計が無ければ従来の定数だけを使う。
@@ -412,22 +498,24 @@ module internal Analyzer =
 
         let indexSelectivity (stats: TableStats) indexName count =
             stats.Indexes
-            |> List.tryFind (fun (name, _) -> Catalog.eqName name indexName)
-            |> Option.bind (fun (_, columns) ->
-                let prefix = List.truncate count columns
-
-                if List.length prefix <> count then
+            |> List.tryFind (fun index -> Catalog.eqName index.Name indexName)
+            |> Option.bind (fun index ->
+                if count <= 0 || count > index.Columns.Length then
                     None
                 else
-                    let selectivities = prefix |> List.map (ndvOfName stats)
+                    match index.PrefixNDV |> List.tryItem (count - 1) with
+                    | Some ndv when ndv > 0L -> Some(1.0 / float ndv)
+                    | _ ->
+                        let prefix = List.truncate count index.Columns
+                        let selectivities = prefix |> List.map (ndvOfName stats)
 
-                    if selectivities |> List.exists Option.isNone then
-                        None
-                    else
-                        selectivities
-                        |> List.choose id
-                        |> List.fold (fun acc n -> if n > 0L then acc * (1.0 / float n) else acc) 1.0
-                        |> Some)
+                        if selectivities |> List.exists Option.isNone then
+                            None
+                        else
+                            selectivities
+                            |> List.choose id
+                            |> List.fold (fun acc n -> if n > 0L then acc * (1.0 / float n) else acc) 1.0
+                            |> Some)
 
         let baseRows =
             function

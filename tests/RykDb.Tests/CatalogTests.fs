@@ -58,21 +58,26 @@ let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
 [<Fact>]
 let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
     withStore "cat-stats" (fun store ->
-        let stats: TableStats =
-            {
-                Table = "people"
-                RowCount = 3L
-                ColumnNDV = [ "id", 3L; "name", 2L ]
-                Indexes = [ ("ix_name", [ "name" ]) ]
-            }
+        let stats =
+            tableStats
+                "people"
+                3L
+                [ colStats "id" 3L 0L None None; colStats "name" 2L 1L (Some 1.0) (Some 3.0) ]
+                [ idxStats "ix_name" [ "name" ] [ 2L ] ]
 
         let c = Catalog.addStats stats Catalog.Empty
         let store = ok (Catalog.save store Catalog.Empty c)
         let loaded = ok (Catalog.load store)
         let s = expectSome "people の統計" (Catalog.findStats "PEOPLE" loaded)
         Assert.Equal<int64>(3L, s.RowCount)
-        Assert.Contains(("name", 2L), s.ColumnNDV)
-        Assert.Equal<(string * string list) list>([ ("ix_name", [ "name" ]) ], s.Indexes)
+        let nameColumn = s.Columns |> List.find (fun (c: ColumnStats) -> c.Name = "name")
+        Assert.Equal<int64>(2L, nameColumn.NDV)
+        Assert.Equal<int64>(1L, nameColumn.Nulls)
+        Assert.Equal<float option>(Some 1.0, nameColumn.Min)
+        Assert.Equal<float option>(Some 3.0, nameColumn.Max)
+        Assert.Equal<int>(1, s.Indexes.Length)
+        Assert.Equal<string list>([ "name" ], s.Indexes.[0].Columns)
+        Assert.Equal<int64 list>([ 2L ], s.Indexes.[0].PrefixNDV)
 
         Assert.True(
             Catalog.findStats "people" (Catalog.removeTable "people" loaded)

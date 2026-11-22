@@ -488,6 +488,11 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
         let db5, all = execRes db4 "ANALYZE"
         Assert.Equal<int>(2, all.Rows.Length)
 
+        // SAMPLE は標本から NDV を集めるが、行数は全体を数える。
+        let _, sampled = execRes db5 "ANALYZE t SAMPLE 2"
+        Assert.Equal<int>(1, sampled.Rows.Length)
+        Assert.Equal<int64>(3L, asInt sampled.Rows.[0].[1])
+
         // 存在しないテーブルは NameError
         expectErrorKind ErrorKind.NotFound "存在しないテーブル" (execSql db5 "ANALYZE nope")
         // DDL と同じく transaction 中は実行できない

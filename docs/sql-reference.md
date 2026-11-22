@@ -976,19 +976,21 @@ ALTER TABLEの行変更は 1 transactionで行い、失敗時はカタログと�
 ### 10.5 ANALYZE
 
 ```sql
-ANALYZE [TABLE] [table_name];
+ANALYZE [TABLE] [table_name] [SAMPLE n];
 ```
 
-テーブルの行数と列ごとの異なり値数（NDV）を収集し、カタログへ保存する。
+テーブルの行数、列ごとの異なり値数（NDV）、NULL 数、数値列の最小/最大、
+索引の prefix NDV を収集し、カタログへ保存する。
 テーブル名を省略すると全テーブルを対象にする。
 
-- 結合順、結合アルゴリズム、走査基数の見積りに使う。
+- 結合順、結合アルゴリズム、走査基数、Filter 選択性の見積りに使う。
 - 結果は `table` / `rows` / `columns` / `ndv` の 1行（全テーブルならテーブルごとに 1行）。
+- `SAMPLE n` は reservoir sampling で最大 n 行を標本にする。
+  行数は全体を数え、NDV・範囲・NULL 率は標本から推定する。
 - 統計はDML（`INSERT` / `UPDATE` / `DELETE`）では自動更新しない。
   更新後は必要に応じて再度 `ANALYZE` を実行する。
 - `ALTER TABLE` は対象テーブルの統計を削除する。
 - 明示transaction中は実行できない（DDLと同じ扱い）。
-- `ANALYZE` 実行時はテーブルを全走査する（サンプリングはしない）。
 
 統計が無いテーブルは、走査方法から得る粗い定数で見積もる。
 

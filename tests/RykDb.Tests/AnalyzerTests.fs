@@ -11,6 +11,24 @@ open RykDb.TestHelpers
 let private estimateRows = Analyzer.estimateRowsWith (fun _ -> None)
 let private chooseJoinAlgorithm = Analyzer.chooseJoinAlgorithmWith (fun _ -> None)
 
+let private peopleStats =
+    tableStats "people" 500L [ colStats "id" 500L 0L None None; colStats "age" 10L 0L None None ] []
+
+let private ordersStats =
+    tableStats "orders" 2000L [ colStats "oid" 2000L 0L None None; colStats "person_id" 100L 0L None None ] []
+
+let private emptyStats = tableStats "empty" 0L [ colStats "id" 0L 0L None None ] []
+
+let private valueStats =
+    tableStats "t" 500L [ colStats "id" 500L 0L None None; colStats "v" 5L 0L None None ] []
+
+let private indexedValueStats =
+    tableStats
+        "t"
+        500L
+        [ colStats "id" 500L 0L None None; colStats "v" 5L 0L None None ]
+        [ idxStats "ix_v" [ "v" ] [ 5L ] ]
+
 [<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: 左が小さく右を引けるなら IndexNestedLoop`` () =
     let leftTable =
@@ -341,22 +359,8 @@ let ``Analyzer.chooseJoinAlgorithm: 複合索引の前置と右の Filter を扱
 let ``Analyzer.estimateRowsWith: 統計があると基数と結合選択性を使う`` () =
     let statsOf name =
         match name with
-        | "people" ->
-            Some
-                {
-                    Table = "people"
-                    RowCount = 500L
-                    ColumnNDV = [ "id", 500L; "age", 10L ]
-                    Indexes = []
-                }
-        | "orders" ->
-            Some
-                {
-                    Table = "orders"
-                    RowCount = 2000L
-                    ColumnNDV = [ "oid", 2000L; "person_id", 100L ]
-                    Indexes = []
-                }
+        | "people" -> Some peopleStats
+        | "orders" -> Some ordersStats
         | _ -> None
 
     let on = Expr.Binary(BinaryOp.Eq, pCol "id", oCol "person_id")
@@ -381,22 +385,8 @@ let ``Analyzer.estimateRowsWith: 統計があると基数と結合選択性を�
 let ``Analyzer.estimateRowsWith: 一部の等値に統計が無くても既定の選択性で穴埋めする`` () =
     let statsOf name =
         match name with
-        | "people" ->
-            Some
-                {
-                    Table = "people"
-                    RowCount = 500L
-                    ColumnNDV = [ "id", 500L; "age", 10L ]
-                    Indexes = []
-                }
-        | "orders" ->
-            Some
-                {
-                    Table = "orders"
-                    RowCount = 2000L
-                    ColumnNDV = [ "oid", 2000L; "person_id", 100L ]
-                    Indexes = []
-                }
+        | "people" -> Some peopleStats
+        | "orders" -> Some ordersStats
         | _ -> None
 
     // people.age = orders.v は NDV が無いので 0.1 で穴埋めする。
@@ -422,16 +412,7 @@ let ``Analyzer.estimateRowsWith: 一部の等値に統計が無くても既定�
 [<Fact>]
 let ``Analyzer.estimateRowsWith: 0 行のテーブルに Filter を付けても 0 行`` () =
     let statsOf name =
-        if name = "empty" then
-            Some
-                {
-                    Table = "empty"
-                    RowCount = 0L
-                    ColumnNDV = [ ("id", 0L) ]
-                    Indexes = []
-                }
-        else
-            None
+        if name = "empty" then Some emptyStats else None
 
     let filtered =
         Logical.Filter(Expr.Literal(Literal.Int 1L), Logical.Scan("empty", ScanMethod.SeqScan))
@@ -441,16 +422,7 @@ let ``Analyzer.estimateRowsWith: 0 行のテーブルに Filter を付けても 
 [<Fact>]
 let ``Analyzer.estimateRowsWith: Filter は列の NDV と範囲で選択性を見積もる`` () =
     let statsOf name =
-        if name = "t" then
-            Some
-                {
-                    Table = "t"
-                    RowCount = 500L
-                    ColumnNDV = [ "id", 500L; "v", 5L ]
-                    Indexes = []
-                }
-        else
-            None
+        if name = "t" then Some valueStats else None
 
     let scan = Logical.Scan("t", ScanMethod.SeqScan)
 
@@ -475,20 +447,86 @@ let ``Analyzer.estimateRowsWith: Filter は列の NDV と範囲で選択性を�
 [<Fact>]
 let ``Analyzer.estimateRowsWith: IndexLookup は索引前置の NDV を使う`` () =
     let statsOf name =
-        if name = "t" then
-            Some
-                {
-                    Table = "t"
-                    RowCount = 500L
-                    ColumnNDV = [ "id", 500L; "v", 5L ]
-                    Indexes = [ ("ix_v", [ "v" ]) ]
-                }
-        else
-            None
+        if name = "t" then Some indexedValueStats else None
 
     let scan = Logical.Scan("t", ScanMethod.IndexLookup("ix_v", [| SqlValue.Int 1L |]))
     // 500 / NDV 5 = 100（統計が無ければ 500/10 = 50）
     Assert.Equal(100.0, Analyzer.estimateRowsWith statsOf scan)
+
+[<Fact>]
+let ``Analyzer.estimateRowsWith: NULL 率と数値範囲を使う`` () =
+    let statsOf name =
+        if name = "t" then
+            Some(
+                tableStats
+                    "t"
+                    100L
+                    [
+                        colStats "id" 100L 0L (Some 1.0) (Some 100.0)
+                        colStats "v" 10L 20L (Some 0.0) (Some 100.0)
+                    ]
+                    []
+            )
+        else
+            None
+
+    let scan = Logical.Scan("t", ScanMethod.SeqScan)
+
+    let equality =
+        Logical.Filter(
+            Expr.Binary(BinaryOp.Eq, Expr.Column { Qualifier = Some "t"; Name = "v" }, Expr.Literal(Literal.Int 1L)),
+            scan
+        )
+
+    // (1 - 20/100) / NDV 10 = 0.08 -> 8 行
+    Assert.Equal(8.0, Analyzer.estimateRowsWith statsOf equality)
+
+    let isNull =
+        Logical.Filter(Expr.IsNull(Expr.Column { Qualifier = Some "t"; Name = "v" }, false), scan)
+
+    Assert.Equal(20.0, Analyzer.estimateRowsWith statsOf isNull)
+
+    let range =
+        Logical.Filter(
+            Expr.Binary(BinaryOp.Gt, Expr.Column { Qualifier = Some "t"; Name = "v" }, Expr.Literal(Literal.Int 50L)),
+            scan
+        )
+
+    // (100 - 50) / (100 - 0) = 0.5 -> 50 行
+    Assert.Equal(50.0, Analyzer.estimateRowsWith statsOf range)
+
+    let between =
+        Logical.Filter(
+            Expr.Between(
+                Expr.Column { Qualifier = Some "t"; Name = "v" },
+                Expr.Literal(Literal.Int 0L),
+                Expr.Literal(Literal.Int 25L),
+                false
+            ),
+            scan
+        )
+
+    Assert.Equal(25.0, Analyzer.estimateRowsWith statsOf between)
+
+[<Fact>]
+let ``Analyzer.estimateRowsWith: 複合索引は prefix NDV を使う`` () =
+    let statsOf name =
+        if name = "t" then
+            Some(
+                tableStats
+                    "t"
+                    100L
+                    [ colStats "a" 10L 0L None None; colStats "b" 5L 0L None None ]
+                    [ idxStats "ix_ab" [ "a"; "b" ] [ 10L; 20L ] ]
+            )
+        else
+            None
+
+    let scan =
+        Logical.Scan("t", ScanMethod.IndexLookup("ix_ab", [| SqlValue.Int 1L; SqlValue.Int 2L |]))
+
+    // prefix NDV 20 -> 5 行（列 NDV の積 10*5 なら 2 行）
+    Assert.Equal(5.0, Analyzer.estimateRowsWith statsOf scan)
 
 [<Fact>]
 let ``Analyzer.chooseJoinAlgorithm: テーブルスキーマが無い右は IndexNestedLoop にしない`` () =

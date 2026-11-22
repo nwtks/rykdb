@@ -481,6 +481,20 @@ module internal Parser =
 
     /// `ANALYZE [TABLE] テーブル名`。
     /// `ANALYZE` / `TABLE` は予約語にしない（`EXPLAIN` / `ALTER` と同じ）。
+    let private parseSample st =
+        if isIdentName "SAMPLE" st then
+            let st = advance st
+
+            result {
+                match peek st with
+                | Token.IntLit n when n > 0L && n <= int64 System.Int32.MaxValue ->
+                    let st = advance st
+                    return Some(int n), st
+                | _ -> return! fail "SAMPLE には正の整数が必要です" st
+            }
+        else
+            ret (None, st)
+
     let private parseAnalyze (st: PState) =
         let st =
             match peek st with
@@ -493,13 +507,14 @@ module internal Parser =
             let st = advance st
 
             result {
+                let! sample, st = parseSample st
                 let! _, st = eatOptionalSemicolon st
-                return Statement.Analyze(Some name), st
+                return Statement.Analyze(Some name, sample), st
             }
         | Token.Eos
         | Token.Symbol ";" ->
             eatOptionalSemicolon st
-            |> Result.map (fun (_, st) -> Statement.Analyze None, st)
+            |> Result.map (fun (_, st) -> Statement.Analyze(None, None), st)
         | _ -> fail "ANALYZE にはテーブル名が必要です" st
 
     let private parseOne (st: PState) =

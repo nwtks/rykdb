@@ -106,23 +106,6 @@ module internal PlanBuilder =
             | _ -> Map.empty
         | _ -> Map.empty
 
-    /// 走査が自然に返す列順（マージ結合の可否判定用）。
-    let private scanOrderOf (table: TableSchema) =
-        let rec order =
-            function
-            | Logical.Filter(_, child) -> order child
-            | Logical.Scan(_, ScanMethod.SeqScan)
-            | Logical.Scan(_, ScanMethod.PkLookup _)
-            | Logical.Scan(_, ScanMethod.RangeScan _) -> Some(TableSchema.primaryKeyColumns table |> List.ofArray)
-            | Logical.Scan(_, ScanMethod.IndexLookup(index, _))
-            | Logical.Scan(_, ScanMethod.IndexRangeScan(index, _, _)) ->
-                table.Indexes
-                |> List.tryFind (fun i -> Catalog.eqName i.Name index)
-                |> Option.map _.Columns
-            | _ -> None
-
-        order
-
     /// 結合順の候補を作る。
     let private joinItem (binding: SourceBinding) (scan: Logical) (rows: float) (position: int) =
         match binding with
@@ -133,7 +116,7 @@ module internal PlanBuilder =
                 Position = position
                 IndexColumns = tb.Schema.Indexes |> List.map _.Columns
                 RowBytes = rowBytesOfColumnCount tb.Schema.Columns.Length
-                NaturalOrder = scanOrderOf tb.Schema scan
+                NaturalOrder = Analyzer.scanOrder (fun _ -> Some tb.Schema) scan
             }
         | DerivedSource(_, plan) ->
             {
@@ -399,7 +382,8 @@ module internal PlanBuilder =
                         let initialOrder =
                             match bindings with
                             | first :: _ ->
-                                bindingTableSchema first |> Option.bind (fun schema -> scanOrderOf schema acc)
+                                bindingTableSchema first
+                                |> Option.bind (fun schema -> Analyzer.scanOrder (fun _ -> Some schema) acc)
                             | [] -> None
 
                         let initialRowBytes = rowBytesOfColumnCount accSchema.Columns.Length
