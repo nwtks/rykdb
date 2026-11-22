@@ -331,8 +331,8 @@ module internal StorageEngine =
         let rotateWal engine (next: WalState) =
             result {
                 do! Wal.sync engine.Dir engine.Wal
-                let! _ = Wal.create engine.Dir next.FileNumber
                 let! stale = Wal.walFiles engine.Dir
+                let! _ = Wal.create engine.Dir next.FileNumber
 
                 protect (fun () ->
                     stale
@@ -416,9 +416,9 @@ module internal StorageEngine =
     /// 上限に達していなければ何もしない。
     /// flush / WAL rotate は同じ keyspace の writeBatch / close と競合させないため、
     /// ディレクトリ単位の Gate の内側で行う。
-    /// flush 自体の失敗は Result で返す。
-    /// WAL への書き込みが成功した時点で commit は成立しているため、呼び出し側の `RowStore` はそれを握り潰し、
-    /// 失敗前の memtable を保持して次の write で再試行する。
+    /// flush 自体の失敗は `LastFlushError` に記録し、Result は Ok（未 flush）として返す。
+    /// WAL への書き込みが成功した時点で commit は成立しているため、
+    /// 呼び出し側の `RowStore` は失敗前の memtable を保持して次の write で再試行する。
     /// background compaction の有効時は RowStore がこちらを呼び、MANIFEST 反映後に worker を起こす。
     /// 戻り値の bool は「実際に flush したか」。
     let flushIfNeededWith (allocateFileNumber: unit -> int64) (engine: StorageEngine) =

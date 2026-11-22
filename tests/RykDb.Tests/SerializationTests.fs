@@ -460,6 +460,17 @@ let ``ValueCodec: 要素数が大きすぎると CorruptionError`` () =
     expectErrorKind ErrorKind.CorruptionError "要素数が大きすぎる場合はエラー" (ValueCodec.readValues (Cursor.create bytes))
 
 [<Fact>]
+let ``ValueCodec: 要素数がカーソル残りを超えると CorruptionError`` () =
+    // 2^31-1 個を宣言するが値は 1 バイトも無い。確保より先に弾かないと巨大な配列を確保する。
+    let bytes = Writer.build [ Writer.varint (uint64 System.Int32.MaxValue - 1UL) ]
+    expectErrorKind ErrorKind.CorruptionError "確保前に要素数をカーソル残りと突き合わせる" (ValueCodec.readValues (Cursor.create bytes))
+
+    expectErrorKind
+        ErrorKind.CorruptionError
+        "マスク復号も同じ検査をする"
+        (ValueCodec.readValuesMasked [| true |] (Cursor.create bytes))
+
+[<Fact>]
 let ``ValueCodec.writeValues: Unloaded は InternalError`` () =
     expectErrorKind
         ErrorKind.InternalError

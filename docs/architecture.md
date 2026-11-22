@@ -985,6 +985,10 @@ Bloom filterのビット数は`expectedEntries`の見積りから決める。
 
 `Sstable.openPartial`はFooter、Meta、Bloom filter、Indexだけを読み込む。
 データブロックは必要になったときだけ開く。
+IndexはmetadataChecksumで守られるが、チェックサムごと作り直されたファイルに備え、
+open時に「各ブロックの範囲がfooterStart以内・重なりなし・`LastKey`が昇順」を検証し、
+違反は`CorruptionError`にする
+（壊れた索引が二分探索・範囲読みの前提を壊し、静かな誤答やブロック長の巨大割当になるのを防ぐ）。
 
 - ポイント検索は通常1ブロックだけ読む。
 - 範囲検索は最大8ブロックをまとめて読む。
@@ -1077,6 +1081,8 @@ Abort(txnId)
 1レコードは`payloadLength`、CRC32C、payloadで構成する。
 
 - ヘッダーやpayloadが末尾で不完全ならtorn writeとして切り詰める。
+- 長さフィールドはCRCの対象外なので、中間フレームの長さ破損が実ファイル長を超えた場合は
+  torn writeと区別できず切り詰めになる（LevelDBと同じトレードオフ）。
 - 完全なフレームのチェックサム不一致、未知タグ、破損payloadは`CorruptionError`になる。
 
 追記はフレームごとに行う。
@@ -1090,6 +1096,8 @@ commitのfsyncはグループ化する。
 待機中のcommitは最大WAL位置まで登録し、先頭の待機者が1回だけ`Flush(true)`する。
 
 flush後のWAL rotateは、新しいWALを作成してから旧WALを削除する。
+旧WALの列挙は作成より先に行う（作成後の列挙失敗で空の新WALだけが残り、
+再openがそれを最新として選んで旧WALの未flush分を失うのを防ぐ）。
 新しいWALの作成に失敗しても旧WALとengineの位置が残るため、次のwriteで回復できる。
 flushの失敗は`StorageRuntime.LastFlushError`に残す。
 
@@ -1151,6 +1159,13 @@ SELECTバッチの`AcquireCall`も`installGate`を取らない。
 状態を読んでpinし、同じ状態のままか（参照等価）を確かめてから使う。
 installは「publish → retire」の順なので、pin後に状態が変わらなければファイルは消えない。
 変わっていれば解放してやり直す（flushは`installGate`を保持するが、SELECTは待たない）。
+
+書き込み文（DML / DDL / BEGIN / COMMIT）も、実行前に`RowStore.acquireSnapshot`で
+最新Versionへ載せ替え、文の実行中はleaseでpinする。
+`install`はcoordinatorのVersionだけを進め、確定状態の`RowStore`は最後のcommit時点の
+Versionを指したまま残る。
+載せ替えないと、次のDMLの走査がcompactionの`retire`と`sweep`で削除済みのファイルを開いてしまう
+（`DatabaseHost.serialized`が防ぐ）。
 workerはinstall後に入力ファイルをretireし、refcountが0になったファイルだけ削除する。
 
 compactionの失敗は`LastCompactionError`に残し、次のwrite（flushが起きなくても）または

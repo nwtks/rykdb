@@ -372,6 +372,52 @@ let ``DatabaseHost: DDL のカタログ保存後も Manager の採番は保存�
         Assert.Equal<uint64>(lastSeq3 + 1UL, committed.Manager.NextSeqNo))
 
 [<Fact>]
+let ``DatabaseHost: background compaction の install 後も書き込み文が削除済みファイルを踏まない`` () =
+    withDir "host-bg-install" (fun dir ->
+        let store =
+            ok (
+                RowStore.openStoreWithOptions
+                    { RowStoreOptions.Background with
+                        MemLimitBytes = Some 1
+                    }
+                    dir
+            )
+
+        let host = ok (DatabaseHost.OpenWithStore(dir, store))
+        let session = Session.Create(host, SessionOptions.Default, true)
+
+        try
+            let mutable session = exec session "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+
+            for i in 1..4 do
+                session <- exec session (sprintf "INSERT INTO t VALUES (%d, 'v%d')" i i)
+
+            let coordinator = expectSome "store.Host" store.Host
+
+            let fileNumbers (version: Version) =
+                Version.allFiles version |> List.map _.FileNumber |> Set.ofList
+
+            // 最後の commit 時点の Version と、compaction が install した Version の差を待つ。
+            // 旧ファイルがディスクから消えるまで待つのは、修正前のコードで確実に失敗させるため。
+            let committedNumbers =
+                fileNumbers host.Committed.Store.Engine.PublishedState.Version
+
+            waitFor "compaction が install されません" (fun () ->
+                let removed =
+                    Set.difference committedNumbers (fileNumbers coordinator.Current.Version)
+
+                not (Set.isEmpty removed)
+                && removed
+                   |> Set.forall (fun n -> not (System.IO.File.Exists(FileMetaData.path dir n))))
+
+            // 修正前は確定状態の store が最後の commit 時点の Version を指したまま
+            // compaction が旧ファイルを削除していたため、UPDATE の走査が IoError になった。
+            let _, result = ok (execSql session "UPDATE t SET v = 'x'")
+            Assert.Equal(4, result.RowsAffected)
+        finally
+            session.Close() |> ignore)
+
+[<Fact>]
 let ``DatabaseHost: 型は公開されていない`` () =
     let hostType = typeof<Session>.Assembly.GetType "RykDb.Core.DatabaseHost"
     Assert.NotNull hostType

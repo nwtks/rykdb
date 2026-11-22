@@ -24,6 +24,11 @@ type internal CompactionOptions =
         /// 出力 SSTable ファイルの目標バイト数（概算値で近似するため厳密ではない）
         OutputFileTargetBytes: int64
         /// このレベル以下（最下位側）へ降ろす compaction で tombstone を消すか（既定値 = 最下位）
+        /// <remarks>
+        /// 最下位以外を指定すると、上位レベルに残る旧版を確認せずに tombstone を落として
+        /// データが復活し得る（LevelDB の IsBaseLevelForKey 相当の検査がないため）。
+        /// 変更する場合は入力選択に上位レベルの重なり検査を追加すること。
+        /// </remarks>
         DropTombstonesBelowLevel: int
         /// Bloom filter の誤検出率
         BloomFalsePositiveRate: float

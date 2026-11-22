@@ -312,17 +312,17 @@ module internal SstableFormat =
                     | Some first, Some last -> Writer.build [ Writer.lengthPrefixed first; Writer.lengthPrefixed last ]
                     | _ -> [||]
 
-                let bloomOff = dataSize + metaBytes.Length
+                let bloomOff = int64 dataSize + int64 metaBytes.Length
                 let bloomFilter = if count = 0L then None else Some(bloom.Build())
 
                 let bloomBytes =
                     bloomFilter |> Option.map BloomFilter.serialize |> Option.defaultValue [||]
 
-                let indexOff = bloomOff + bloomBytes.Length
+                let indexOff = bloomOff + int64 bloomBytes.Length
                 let index = List.rev indexEntries |> List.toArray
                 let indexBytes = indexBytesOf index
 
-                if int64 indexOff + int64 indexBytes.Length > int64 System.Int32.MaxValue then
+                if indexOff + int64 indexBytes.Length > int64 System.Int32.MaxValue then
                     err (DbError.internalError "Sstable: ファイルが大きすぎます")
                 else
                     let metadataChecksum =
@@ -335,9 +335,9 @@ module internal SstableFormat =
                     let footer =
                         encodeFooter
                             maxSeqNo
-                            indexOff
+                            (int indexOff)
                             indexBytes.Length
-                            bloomOff
+                            (int bloomOff)
                             bloomBytes.Length
                             dataSize
                             metaBytes.Length
@@ -348,7 +348,7 @@ module internal SstableFormat =
 
                     ret
                         {
-                            Size = int64 (indexOff + indexBytes.Length + footer.Length)
+                            Size = indexOff + int64 indexBytes.Length + int64 footer.Length
                             FirstKey = defaultArg firstKey [||]
                             LastKey = defaultArg lastKey [||]
                             EntryCount = count

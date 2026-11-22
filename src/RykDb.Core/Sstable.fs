@@ -88,6 +88,28 @@ module internal Sstable =
             else
                 readItems decodeIndexEntry (Cursor.create bytes) ()
 
+        let validateIndexEntries footerStart entries =
+            let rec loop prev =
+                function
+                | [] -> ret ()
+                | entry :: rest ->
+                    let endPos = int64 entry.Offset + int64 entry.Length
+
+                    if endPos > footerStart then
+                        err (DbError.corruption "Sstable: 索引の範囲がファイル外です")
+                    else
+                        match prev with
+                        | Some prevEntry ->
+                            if int64 entry.Offset < int64 prevEntry.Offset + int64 prevEntry.Length then
+                                err (DbError.corruption "Sstable: 索引の範囲が重なっています")
+                            elif Bytes.compare prevEntry.LastKey entry.LastKey > 0 then
+                                err (DbError.corruption "Sstable: 索引の LastKey が昇順ではありません")
+                            else
+                                loop (Some entry) rest
+                        | None -> loop (Some entry) rest
+
+            loop None (Array.toList entries)
+
         let readRegion (stream: System.IO.FileStream) offset length =
             if length = 0 then
                 [||]
@@ -152,17 +174,19 @@ module internal Sstable =
                             <> footer.MetadataChecksum
                         then
                             return! err (DbError.corruption "Sstable: 部分読みメタデータのチェックサム不一致")
+                        else
+                            do! validateIndexEntries footerStart indexEntries
 
-                        return
-                            {
-                                Path = path
-                                Index = indexEntries
-                                MinKey = minKey
-                                MaxKey = maxKey
-                                Bloom = bloom
-                                EntryCount = int64 footer.EntryCount
-                                MaxSeqNo = footer.MaxSeqNo
-                            }
+                            return
+                                {
+                                    Path = path
+                                    Index = indexEntries
+                                    MinKey = minKey
+                                    MaxKey = maxKey
+                                    Bloom = bloom
+                                    EntryCount = int64 footer.EntryCount
+                                    MaxSeqNo = footer.MaxSeqNo
+                                }
                     }
 
         protect (fun () ->
@@ -199,6 +223,8 @@ module internal Sstable =
 
                     if tailLength > System.Int32.MaxValue - sharedLength then
                         return! err (DbError.corruption "Sstable: キー長が不正です")
+                    elif valueLen > uint64 System.Int32.MaxValue then
+                        return! err (DbError.corruption "Sstable: 値長が不正です")
                     else
                         let key = Array.zeroCreate<byte>(sharedLength + tailLength)
                         Array.blit prev 0 key 0 sharedLength
@@ -435,7 +461,7 @@ module internal Sstable =
                     err (DbError.corruption "Sstable: 接頭辞長が直前のキーを超えています")
                 elif
                     tailLen > uint64 System.Int32.MaxValue
-                    || int shared + int tailLen > System.Int32.MaxValue
+                    || int tailLen > System.Int32.MaxValue - int shared
                 then
                     err (DbError.corruption "Sstable: キー長が不正です")
                 elif int tailLen > payloadLen - p3 then

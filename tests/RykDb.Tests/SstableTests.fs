@@ -26,6 +26,56 @@ let private fixFooterChecksum (bytes: byte array) =
     for i in 0..3 do
         bytes.[footerStart + Sstable.FooterSize - 4 + i] <- byte (checksum >>> (8 * i) &&& 0xFFu)
 
+/// Footer の int64 フィールドを読む。
+let private readI64At (bytes: byte array) (off: int) =
+    let mutable v = 0L
+
+    for i in 0..7 do
+        v <- v ||| (int64 bytes.[off + i] <<< (8 * i))
+
+    v
+
+/// Footer の int64 フィールドを書く。
+let private writeI64At (bytes: byte array) (off: int) (v: int64) =
+    for i in 0..7 do
+        bytes.[off + i] <- byte (v >>> (8 * i) &&& 0xFFL)
+
+/// varint を読んで (値, 次の位置) を返す。
+let private readVarintAtBytes (bytes: byte array) (pos: int) =
+    let rec go shift acc p =
+        let b = int bytes.[p]
+        let acc = acc ||| ((b &&& 0x7F) <<< shift)
+
+        if b &&& 0x80 = 0 then
+            acc, p + 1
+        else
+            go (shift + 7) acc (p + 1)
+
+    go 0 0 pos
+
+/// 索引を書き換えたときに呼ぶ: metadataChecksum と Footer のチェックサムを付け直す。
+let private refreshMetadataChecksums (bytes: byte array) =
+    let footerStart = bytes.Length - Sstable.FooterSize
+    let indexOff = int (readI64At bytes (footerStart + 20))
+    let indexLen = int (readI64At bytes (footerStart + 28))
+    let metaOff = int (readI64At bytes (footerStart + 52))
+    let metaLen = int (readI64At bytes (footerStart + 60))
+    let bloomOff = int (readI64At bytes (footerStart + 36))
+    let bloomLen = int (readI64At bytes (footerStart + 44))
+
+    let metadataChecksum =
+        Hashing.checksumChunks
+            [|
+                Array.sub bytes metaOff metaLen
+                Array.sub bytes bloomOff bloomLen
+                Array.sub bytes indexOff indexLen
+            |]
+
+    for i in 0..3 do
+        bytes.[footerStart + 76 + i] <- byte (metadataChecksum >>> (8 * i) &&& 0xFFu)
+
+    fixFooterChecksum bytes
+
 /// 先頭から全エントリを配列で返す（全件必要ならこちら）。
 let private readEntries (partial: SstReadInfo) =
     Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray
@@ -409,70 +459,38 @@ let ``Sstable.openPartial: 壊れたブロックは読み出し時に Corruption
             (Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray))
 
 [<Fact>]
-let ``Sstable.openPartial: 索引の範囲外は読み出し時に CorruptionError`` () =
+let ``Sstable.openPartial: 索引の範囲がファイル外なら CorruptionError`` () =
     withDir "sst-partial-index-range" (fun dir ->
         let path = System.IO.Path.Combine(dir, "1.sst")
         let bytes = Array.copy (ok (buildSstable 0.01 (sstEntries 300)))
         let footerStart = bytes.Length - Sstable.FooterSize
-
-        let readI64 (off: int) =
-            let mutable v = 0L
-
-            for i in 0..7 do
-                v <- v ||| (int64 bytes.[off + i] <<< (8 * i))
-
-            v
-
-        let writeI64 (off: int) (v: int64) =
-            for i in 0..7 do
-                bytes.[off + i] <- byte (v >>> (8 * i) &&& 0xFFL)
-
-        let writeU32 (off: int) (v: uint32) =
-            for i in 0..3 do
-                bytes.[off + i] <- byte (v >>> (8 * i) &&& 0xFFu)
-
-        let readVarint (pos: int) =
-            let rec go shift acc p =
-                let b = int bytes.[p]
-                let acc = acc ||| ((b &&& 0x7F) <<< shift)
-
-                if b &&& 0x80 = 0 then
-                    acc, p + 1
-                else
-                    go (shift + 7) acc (p + 1)
-
-            go 0 0 pos
-
-        let indexOff = int (readI64 (footerStart + 20))
-        let indexLen = int (readI64 (footerStart + 28))
+        let indexOff = int (readI64At bytes (footerStart + 20))
 
         // 先頭エントリ（長さ付き LastKey + Offset + Length）を飛ばし、2 個目の Offset を範囲外へ書き換える。
-        let keyLen0, afterLen0 = readVarint indexOff
+        let keyLen0, afterLen0 = readVarintAtBytes bytes indexOff
         let secondEntry = afterLen0 + keyLen0 + 16
-        let keyLen1, afterLen1 = readVarint secondEntry
-        writeI64 (afterLen1 + keyLen1) 1_000_000_000L
-
+        let keyLen1, afterLen1 = readVarintAtBytes bytes secondEntry
+        writeI64At bytes (afterLen1 + keyLen1) 1_000_000_000L
         // 索引を書き換えたので metadataChecksum と footerChecksum を付け直す。
-        let metaOff = int (readI64 (footerStart + 52))
-        let metaLen = int (readI64 (footerStart + 60))
-        let bloomOff = int (readI64 (footerStart + 36))
-        let bloomLen = int (readI64 (footerStart + 44))
-
-        let metadataChecksum =
-            Hashing.checksumChunks
-                [|
-                    Array.sub bytes metaOff metaLen
-                    Array.sub bytes bloomOff bloomLen
-                    Array.sub bytes indexOff indexLen
-                |]
-
-        writeU32 (footerStart + 76) metadataChecksum
-        fixFooterChecksum bytes
+        refreshMetadataChecksums bytes
         System.IO.File.WriteAllBytes(path, bytes)
+        // チェックサムが正しくても、範囲は open 時にファイルサイズで上界を検査する
+        // （読み出し時の巨大なブロック割当・範囲外読みに到達させない）。
+        expectErrorKind ErrorKind.CorruptionError "索引の範囲外は open で検出する" (Sstable.openPartial path))
 
-        let partial = ok (Sstable.openPartial path)
+[<Fact>]
+let ``Sstable.openPartial: 索引の LastKey が昇順でなければ CorruptionError`` () =
+    withDir "sst-partial-index-order" (fun dir ->
+        let path = System.IO.Path.Combine(dir, "1.sst")
+        let bytes = Array.copy (ok (buildSstable 0.01 (sstEntries 300)))
+        let footerStart = bytes.Length - Sstable.FooterSize
+        let indexOff = int (readI64At bytes (footerStart + 20))
 
-        expectErrorKind
-            ErrorKind.CorruptionError
-            "索引の範囲外でも例外にせず CorruptionError を返す"
-            (Sstable.rangeScanPartial [||] 0 partial |> SstScan.toArray))
+        // 先頭エントリの LastKey の先頭バイト（型タグ 0x20）を 0x7F にして、
+        // 2 個目以降の LastKey より大きいキーにする（二分探索の前提を壊す）。
+        let keyLen0, keyStart0 = readVarintAtBytes bytes indexOff
+        Assert.True(keyLen0 > 0)
+        bytes.[keyStart0] <- 0x7Fuy
+        refreshMetadataChecksums bytes
+        System.IO.File.WriteAllBytes(path, bytes)
+        expectErrorKind ErrorKind.CorruptionError "LastKey が降順の索引は open で検出する" (Sstable.openPartial path))

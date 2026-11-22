@@ -861,7 +861,7 @@ module internal ValueCodec =
         let d = Cursor.data c
         let start = Cursor.pos c
 
-        if start + 8 < Cursor.endPos c && d.[start] = 2uy then
+        if Cursor.remaining c >= 9 && d.[start] = 2uy then
             let p = start + 1
 
             let v =
@@ -887,7 +887,7 @@ module internal ValueCodec =
         result {
             let! n, c = Reader.readVarint c
 
-            if n > uint64 System.Int32.MaxValue then
+            if n > uint64 System.Int32.MaxValue || n > uint64 (Cursor.remaining c) then
                 return! sprintf "ValueCodec: 要素数が大きすぎます (%d)" n |> DbError.corruption |> err
             else
                 let count = int n
@@ -943,7 +943,7 @@ module internal ValueCodec =
         result {
             let! n, c = Reader.readVarint c
 
-            if n > uint64 System.Int32.MaxValue then
+            if n > uint64 System.Int32.MaxValue || n > uint64 (Cursor.remaining c) then
                 return! sprintf "ValueCodec: 要素数が大きすぎます (%d)" n |> DbError.corruption |> err
             else
                 let count = int n

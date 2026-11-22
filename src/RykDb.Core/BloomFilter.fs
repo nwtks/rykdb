@@ -48,7 +48,8 @@ module internal BloomFilter =
                 8
             else
                 let m = -float expectedCount * log falsePositiveRate / (ln2 * ln2)
-                max 8 (int (ceil m / 8.0) * 8)
+                let words = min (ceil (m / 8.0)) (float (System.Int32.MaxValue / 8))
+                max 8 (int words * 8)
 
         let hashesFor expectedCount bitCount =
             if expectedCount <= 0 then

@@ -213,14 +213,19 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                 | HostLifecycle.Closed _ -> err (closedError ()), None
                 | HostLifecycle.Running current ->
                     let current = reclaimAbandoned current
+                    let store, lease = RowStore.acquireSnapshot current.Store
+                    let current = { current with Store = store }
 
-                    let outcome, position =
-                        match run current with
-                        | Error e -> err e, current.Store.Engine.WalState
-                        | Ok(next, value) -> ret value, next.Store.Engine.WalState
+                    try
+                        let outcome, position =
+                            match run current with
+                            | Error e -> err e, current.Store.Engine.WalState
+                            | Ok(next, value) -> ret value, next.Store.Engine.WalState
 
-                    position |> Option.iter durability.Register
-                    outcome, position)
+                        position |> Option.iter durability.Register
+                        outcome, position
+                    finally
+                        lease.Dispose())
 
         match position with
         | Some pos -> durability.Await pos >>= fun () -> outcome
