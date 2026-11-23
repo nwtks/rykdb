@@ -35,6 +35,10 @@ type internal JoinOrderItem =
         RowBytes: float
         /// 走査が自然に返す列順（マージ結合の可否判定用）。
         NaturalOrder: string list option
+        /// 右部分木を索引で引ける形か（`Scan` か `Filter` の連なり）。
+        /// 実行時のインデックス入れ子ループは右部分木を実行しないので、
+        /// 実行しない形（派生テーブルなど）は `false` にして INL を候補にしない。
+        Lookupable: bool
     }
 
 /// 結合述語 1 本。`Selectivity` が None なら既定の 0.1 を使う。
@@ -55,7 +59,10 @@ module internal JoinOrder =
             Rows: float
             RowBytes: float
             /// 左深木の出力順（先頭走査の自然順を引き継ぐ）。
+            /// 先頭が実際に走査のときだけ意味がある（マージ結合は左が `Scan` のときだけ実行される）。
             Ordered: string list option
+            /// 左の入力が走査か（結合を重ねた後は false）。
+            ScanInput: bool
             Order: int list
         }
 
@@ -178,9 +185,11 @@ module internal JoinOrder =
 
     /// 1テーブル追加時の (コスト, 結合後の出力順) の候補。
     /// ハッシュ・INL・マージはそれぞれ出力順が違うので、すべて候補にする。
+    /// 実行時の `Analyzer.chooseJoinAlgorithmWith` と同じ条件で選ぶ。
     let private transitionVariants
         (rows: float)
         (rowBytes: float)
+        (leftIsScan: bool)
         (ordered: string list option)
         (workMemBytes: float)
         (applicable: JoinOrderEdge list)
@@ -189,30 +198,36 @@ module internal JoinOrder =
         =
         if List.isEmpty applicable then
             [ (rows * item.Rows + newRows, None) ]
+        elif applicable |> List.forall (fun e -> Map.isEmpty e.KeyColumns) then
+            [ (rows * item.Rows + newRows, None) ]
         else
             let hashDelta =
                 let buildRows = min rows item.Rows
                 let probeRows = max rows item.Rows
                 let buildRowBytes = if rows < item.Rows then rowBytes else item.RowBytes
-                let buildBytes = buildRows * buildRowBytes
                 let buildCost = buildRows
                 let probeCost = probeRows
                 let buildPenalty = 0.1 * buildRows
 
                 let spillPenalty =
-                    if workMemBytes >= 0.0 && buildBytes > workMemBytes then
-                        buildRows * 2.0 + float Spill.Partitions * 8.0
-                    else
+                    let spilled = Analyzer.spilledBuildRows buildRows buildRowBytes workMemBytes
+
+                    if spilled <= 0.0 then
                         0.0
+                    else
+                        spilled * 2.0 + float Spill.Partitions * 8.0
 
                 buildCost + probeCost + newRows + buildPenalty + spillPenalty
 
             let mergeVariant =
-                mergeKeyOrder ordered item applicable
-                |> Option.map (fun keyOrder -> rows + item.Rows + newRows, Some keyOrder)
+                if leftIsScan then
+                    mergeKeyOrder ordered item applicable
+                    |> Option.map (fun keyOrder -> rows + item.Rows + newRows, Some keyOrder)
+                else
+                    None
 
             let inlVariant =
-                if rows <= 32.0 then
+                if item.Lookupable && rows <= 32.0 then
                     bestIndexFor item applicable
                     |> Option.map (fun index ->
                         let probeWeight = if index.Unique then 0.5 else 0.8
@@ -312,6 +327,7 @@ module internal JoinOrder =
                                         transitionVariants
                                             state.Rows
                                             state.RowBytes
+                                            state.ScanInput
                                             state.Ordered
                                             workMemBytes
                                             applicable
@@ -325,6 +341,7 @@ module internal JoinOrder =
                                                         Rows = newRows
                                                         RowBytes = state.RowBytes + item.RowBytes
                                                         Ordered = outOrder
+                                                        ScanInput = false
                                                         Order = state.Order @ [ i ]
                                                     }
 
@@ -341,23 +358,20 @@ module internal JoinOrder =
             (Map.ofList [ (startMask, [ initial ]) ])
 
     /// `mask` の最良状態（コスト最小）。
-    let private bestState (states: Map<int, PlanState list>) (mask: int) =
-        states
-        |> Map.tryFind mask
-        |> Option.bind (fun list -> list |> List.sortBy (fun s -> s.Cost) |> List.tryHead)
+    let private bestState (mask: int) =
+        Map.tryFind mask
+        >> Option.bind (fun list -> list |> List.sortBy (fun s -> s.Cost) |> List.tryHead)
 
     /// 左深の順序から木を組み立てる。
-    let private treeOfOrder (itemArray: JoinOrderItem array) (order: int list) =
-        order
-        |> List.map (fun i -> JoinOrderTree.Leaf itemArray.[i].Name)
-        |> List.reduce (fun l r -> JoinOrderTree.Branch(l, r))
+    let private treeOfOrder (itemArray: JoinOrderItem array) =
+        List.map (fun i -> JoinOrderTree.Leaf itemArray.[i].Name)
+        >> List.reduce (fun l r -> JoinOrderTree.Branch(l, r))
 
     /// テーブル集合 `mask` の名前集合。
-    let private namesOf (itemArray: JoinOrderItem array) (mask: int) =
-        itemArray
-        |> Array.indexed
-        |> Array.choose (fun (i, item) -> if mask &&& (1 <<< i) <> 0 then Some item.Name else None)
-        |> Set.ofArray
+    let private namesOf (mask: int) =
+        Array.indexed
+        >> Array.choose (fun (i, item) -> if mask &&& (1 <<< i) <> 0 then Some item.Name else None)
+        >> Set.ofArray
 
     /// bushy 計画（1段の分割。両側は左深）。
     /// 適用できないときは None。
@@ -374,7 +388,7 @@ module internal JoinOrder =
 
         let unknownDependency =
             dependencies
-            |> Map.exists (fun _ refs -> refs |> Set.exists (fun r -> not (Set.contains r (namesOf itemArray full))))
+            |> Map.exists (fun _ refs -> refs |> Set.exists (fun r -> not (Set.contains r (namesOf full itemArray))))
 
         if count < 3 || count > maxBushyItems then
             None
@@ -393,6 +407,7 @@ module internal JoinOrder =
                             Rows = item.Rows
                             RowBytes = item.RowBytes
                             Ordered = item.NaturalOrder
+                            ScanInput = Option.isSome item.NaturalOrder
                             Order = [ f ]
                         }
 
@@ -400,12 +415,12 @@ module internal JoinOrder =
 
             let bestOf mask =
                 perFirst
-                |> Array.choose (fun (_, states) -> bestState states mask |> Option.map (fun s -> s.Cost, s))
+                |> Array.choose (fun (_, states) -> bestState mask states |> Option.map (fun s -> s.Cost, s))
                 |> Array.sortBy fst
                 |> Array.tryHead
 
             let dependencyClosed mask =
-                let names = namesOf itemArray mask
+                let names = namesOf mask itemArray
 
                 itemArray
                 |> Array.indexed
@@ -417,7 +432,7 @@ module internal JoinOrder =
                     else
                         true)
 
-            let splitCost (leftNames: Set<string>) (rightNames: Set<string>) (lRows: float) (rRows: float) =
+            let splitCost leftNames rightNames lRows lRowBytes rRows rRowBytes =
                 let crossing =
                     edges
                     |> List.filter (fun e ->
@@ -438,14 +453,27 @@ module internal JoinOrder =
                         else
                             max 1.0 (lRows * rRows * selectivity)
 
-                    let buildRows = min lRows rRows
-                    let hashDelta = buildRows + max lRows rRows + newRows + 0.1 * buildRows
+                    if crossing |> List.forall (fun e -> Map.isEmpty e.KeyColumns) then
+                        Some(lRows * rRows + newRows, newRows)
+                    else
+                        let buildRows = min lRows rRows
+                        let buildRowBytes = if lRows < rRows then lRowBytes else rRowBytes
+                        let spilled = Analyzer.spilledBuildRows buildRows buildRowBytes workMemBytes
 
-                    Some(hashDelta, newRows)
+                        let spillPenalty =
+                            if spilled <= 0.0 then
+                                0.0
+                            else
+                                spilled * 2.0 + float Spill.Partitions * 8.0
+
+                        let hashDelta =
+                            buildRows + max lRows rRows + newRows + 0.1 * buildRows + spillPenalty
+
+                        Some(hashDelta, newRows)
 
             let splits =
                 seq { 1 .. full - 1 }
-                |> Seq.filter (fun l -> l < (full ^^^ l))
+                |> Seq.filter (fun l -> l < full ^^^ l)
                 |> Seq.choose (fun l ->
                     let r = full ^^^ l
 
@@ -454,10 +482,10 @@ module internal JoinOrder =
                     else
                         match bestOf l, bestOf r with
                         | Some(lCost, lState), Some(rCost, rState) ->
-                            let leftNames = namesOf itemArray l
-                            let rightNames = namesOf itemArray r
+                            let leftNames = namesOf l itemArray
+                            let rightNames = namesOf r itemArray
 
-                            splitCost leftNames rightNames lState.Rows rState.Rows
+                            splitCost leftNames rightNames lState.Rows lState.RowBytes rState.Rows rState.RowBytes
                             |> Option.map (fun (joinDelta, _) -> lCost + rCost + joinDelta, lState, rState)
                         | _ -> None)
                 |> Seq.sortBy (fun (cost, _, _) -> cost)
@@ -512,6 +540,7 @@ module internal JoinOrder =
                     Rows = initialRows
                     RowBytes = initialRowBytes
                     Ordered = initialOrder
+                    ScanInput = Option.isSome initialOrder
                     Order = []
                 }
 

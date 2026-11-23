@@ -19,6 +19,21 @@ let private asReal (v: SqlValue) =
     | SqlValue.Real f -> f
     | _ -> failwithf "REAL ではありません: %A" v
 
+/// EXPLAIN の出力から最初の `rows=` を数値で取り出す。
+let private plannedRows (text: string) =
+    text.Split '\n'
+    |> Array.pick (fun line ->
+        let i = line.IndexOf "rows="
+
+        if i < 0 then
+            None
+        else
+            line.Substring(i + 5)
+            |> Seq.takeWhile (fun c -> System.Char.IsDigit c || c = '.')
+            |> System.String.Concat
+            |> float
+            |> Some)
+
 /// 同期 compaction でディスクの DB を開く（テスト用）。
 let private openDb (root: string) =
     ok (Session.OpenWithSync(root, SessionOptions.Default))
@@ -491,6 +506,8 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
                 "ranges"
                 "indexes"
                 "histograms"
+                "mcv"
+                "row_bytes"
                 "analyzed_at"
             ],
             analyzed.Columns |> Array.toList
@@ -498,11 +515,16 @@ let ``SqlReference: ANALYZE はテーブルの統計を再収集する`` () =
 
         Assert.Equal<string>("id=0,v=0", asText analyzed.Rows.[0].[4])
         Assert.Equal<string>("id=[1,3],v=[10,20]", asText analyzed.Rows.[0].[5])
-        // 数値列は標本ヒストグラムを持つ。
+        // 数値列は等頻度ヒストグラムを持つ。
         Assert.Contains("id:", asText analyzed.Rows.[0].[7])
         Assert.Contains("v:", asText analyzed.Rows.[0].[7])
+        // 2回以上現れた値は頻出値として残す（v は 10 が 2回）。
+        Assert.Equal<string>("v:1", asText analyzed.Rows.[0].[8])
+        // 1行の管理メモリ概算（型別サイズ + 24B ヘッダ）が入る。
+        // INTEGER 2列 = 24 + 2*8 + 24 + 24。
+        Assert.Equal<int64>(88L, asInt analyzed.Rows.[0].[9])
         // 収集時刻が入る。
-        Assert.False(System.String.IsNullOrEmpty(asText analyzed.Rows.[0].[8]))
+        Assert.False(System.String.IsNullOrEmpty(asText analyzed.Rows.[0].[10]))
 
         let _ = exec db3 "ANALYZE TABLE t;"
         let _ = exec db3 "ANALYZE t"
@@ -3609,6 +3631,107 @@ let ``SqlReference: 結合順は中間行数の見積りで決まる`` () =
         Assert.True(indexOf "right=c" > indexOf "right=b", String.concat "\n" lines))
 
 [<Fact>]
+let ``SqlReference: ヒストグラムは偏った分布でも範囲の行数を見積もる`` () =
+    // 99行が 0、1行が 1000。min/max の線形補間なら v < 500 は 50行になるが、
+    // 等頻度ヒストグラムなら 97行前後になる。
+    withSession "stats-histogram" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+
+        let values =
+            [ 1..99 ] |> List.map (fun i -> sprintf "(%d,0)" i) |> String.concat ","
+
+        let db2 = exec db1 (sprintf "INSERT INTO t VALUES %s" values)
+        let db3 = exec db2 "INSERT INTO t VALUES (100,1000)"
+        let db4 = exec db3 "ANALYZE t"
+
+        let _, plan = ok (execSql db4 "EXPLAIN SELECT id FROM t WHERE v < 500")
+        let text = plan.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+        Assert.True(plannedRows text > 90.0, text))
+
+[<Fact>]
+let ``SqlReference: 型が違う等値は結合キーにせず入れ子ループになる`` () =
+    // REAL と DECIMAL は比較できるが型が違うので、ハッシュ / マージ / INL のキーにしない。
+    // 結合順の見積りも同じ条件で入れ子ループとして見積もる。
+    withSession "join-key-type" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, r REAL)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, d DECIMAL)"
+        let db3 = exec db2 "INSERT INTO a VALUES (1,1.5),(2,2.5)"
+        let db4 = exec db3 "INSERT INTO b VALUES (1,1.5),(2,3.5)"
+
+        let sql = "SELECT a.id, b.id FROM a JOIN b ON a.r = b.d"
+        let _, plan = ok (execSql db4 ("EXPLAIN " + sql))
+        let lines = plan.Rows |> Array.map (fun row -> asText row.[0])
+        Assert.Contains("NestedLoop", String.concat "\n" lines)
+
+        let _, res = ok (execSql db4 (sql + " ORDER BY a.id"))
+        Assert.Equal<int>(1, res.Rows.Length)
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[1]))
+
+[<Fact>]
+let ``SqlReference: EXPLAIN ANALYZE は走査と結合の実測行数を返す`` () =
+    withSession "explain-analyze" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db3 = exec db2 "INSERT INTO a VALUES (1,10),(2,20),(3,30)"
+        let db4 = exec db3 "INSERT INTO b VALUES (1,10),(2,25),(3,30)"
+
+        let sql = "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k"
+        let _, plan = ok (execSql db4 ("EXPLAIN ANALYZE " + sql))
+        let lines = plan.Rows |> Array.map (fun row -> asText row.[0])
+        let text = String.concat "\n" lines
+
+        // 走査と結合に実測行数が付く（a は 3行、結合は 2行）。
+        Assert.Contains("Scan(a, SeqScan) actual=3", text)
+        Assert.Contains("Join(INNER, HashJoin, right=b", text)
+        Assert.Contains("actual=2", text)
+
+        // 末尾に件数と経過時間の 1行が付く。
+        Assert.StartsWith("Execution: rows=2 elapsed=", lines.[lines.Length - 1])
+        // 実行は結果を返さない（計画の行だけ）。
+        Assert.Equal<int>(lines.Length, plan.Rows.Length)
+
+        // 通常の EXPLAIN は実行しないので actual= が付かない。
+        let _, plain = ok (execSql db4 ("EXPLAIN " + sql))
+
+        let plainText =
+            plain.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+
+        Assert.DoesNotContain("actual=", plainText)
+        Assert.DoesNotContain("Execution:", plainText))
+
+[<Fact>]
+let ``SqlReference: EXPLAIN は ANALYZE 以降の更新行数を示す`` () =
+    // 統計は DML で自動更新しないので、推定が古いことを EXPLAIN で示す。
+    // 数えるのはコミットした行数だけ（ROLLBACK した分は数えない）。
+    withSession "stats-stale" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20)"
+        let db3 = exec db2 "ANALYZE t"
+
+        let planOf db sql =
+            let _, res = ok (execSql db ("EXPLAIN " + sql))
+            res.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+
+        Assert.DoesNotContain("Stats stale", planOf db3 "SELECT * FROM t")
+
+        let db4 = exec db3 "INSERT INTO t VALUES (3,30)"
+        Assert.Contains("Stats stale: t(+1)", planOf db4 "SELECT * FROM t")
+
+        let db5 = exec db4 "INSERT INTO t VALUES (4,40)"
+        Assert.Contains("Stats stale: t(+2)", planOf db5 "SELECT * FROM t")
+
+        // ROLLBACK した DELETE は数えない。
+        let db6 = exec db5 "BEGIN"
+        let db7 = exec db6 "DELETE FROM t"
+        let db8 = exec db7 "ROLLBACK"
+        Assert.Contains("Stats stale: t(+2)", planOf db8 "SELECT * FROM t")
+
+        // ANALYZE し直すと消える。
+        let db9 = exec db8 "ANALYZE t"
+        Assert.DoesNotContain("Stats stale", planOf db9 "SELECT * FROM t"))
+
+[<Fact>]
 let ``SqlReference: 並べ替えても LEFT JOIN の NULL 拡張は変わらない`` () =
     withSession "join-order-left" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE l (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -3798,3 +3921,63 @@ let ``SqlReference: 相関 IN の左辺の未知の列も 0 件でエラー`` ()
             ErrorKind.NameError
             "相関 IN の左辺"
             (execSql db2 "SELECT nope IN (SELECT f.x FROM f WHERE f.k = e.k) FROM e"))
+
+[<Fact>]
+let ``SqlReference: EXPLAIN は退避するハッシュ結合に spill を付ける`` () =
+    // 作業メモリを 1KB にして、広い行のビルド側が収まらない状態を作る。
+    // 表示するのは「あふれた分」で、結合順のコストと同じ式を使う。
+    withDir "explain-spill" (fun dir ->
+        let options =
+            { SessionOptions.Default with
+                WorkMemBytes = 1024L
+            }
+
+        let session = ok (Session.OpenWith(dir, options))
+
+        try
+            ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") |> ignore
+
+            let padding = String.replicate 600 "a"
+
+            let values =
+                [ 1..100 ]
+                |> List.map (fun i -> sprintf "(%d,'%s')" i padding)
+                |> String.concat ","
+
+            ok (session.Execute(sprintf "INSERT INTO t VALUES %s" values)) |> ignore
+
+            // id で結ぶと両側が主キー順になりマージ結合になるので、順序の無い v で結ぶ。
+            let plan =
+                ok (session.Execute "EXPLAIN SELECT * FROM t AS a JOIN t AS b ON a.v = b.v")
+
+            let text = plan.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+            Assert.Contains("spill=", text)
+        finally
+            ok (session.Close()) |> ignore)
+
+[<Fact>]
+let ``SqlReference: 頻出値（MCV）は等値の行数見積りに使う`` () =
+    // 100行のうち 90行が v=1、残り 10行が 2..11。
+    // NDV だけで割ると v=1 は約 9行になるが、MCV なら 90行になる。
+    withSession "stats-mcv" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+
+        let values =
+            ([ 1..90 ] |> List.map (fun i -> sprintf "(%d,1)" i))
+            @ ([ 91..100 ] |> List.map (fun i -> sprintf "(%d,%d)" i (i - 89)))
+            |> String.concat ","
+
+        let db2 = exec db1 (sprintf "INSERT INTO t VALUES %s" values)
+        let db3 = exec db2 "ANALYZE t"
+
+        let planOf db where =
+            let _, plan = ok (execSql db ("EXPLAIN SELECT id FROM t WHERE " + where))
+            plan.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+
+        // 頻出値は実測の割合（90/100）。
+        let frequent = planOf db3 "v = 1"
+        Assert.Equal(90.0, plannedRows frequent, 1)
+
+        // 未知の値は MCV の分を除いた残り（10行 / 10値）を使う。
+        let rare = planOf db3 "v = 99"
+        Assert.True(plannedRows rare < 5.0, rare))

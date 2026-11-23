@@ -147,6 +147,9 @@ type internal ExecState =
         Txn: TxnState
         /// 実行中の文の ActiveSnapshot 登録（暗黙 transaction・DDL の排他判定用）。
         Registration: ActiveRegistration option
+        /// COMMIT 前の DML が触った行数（小文字のテーブル名 -> 行数）。
+        /// COMMIT で統計の `Changes` に畳み込み、ROLLBACK で捨てる。
+        StatsDeltas: Map<string, int64>
     }
 
     member this.Root = this.Committed.Root
@@ -172,10 +175,53 @@ module internal ExecState =
             Committed = state
             Txn = TxnState.none
             Registration = None
+            StatsDeltas = Map.empty
         }
+
+    /// 統計の更新行数を transaction に積む（COMMIT と同じ atomically に反映する）。
+    /// 統計の無いテーブルは対象外（鮮度を示す相手が無い）。
+    let private applyStatsDeltas (txn: Transaction) (state: ExecState) =
+        state.StatsDeltas
+        |> Map.fold
+            (fun (txn, catalog) table delta ->
+                match Catalog.findStats table catalog with
+                | None -> txn, catalog
+                | Some stats ->
+                    let next =
+                        { stats with
+                            Changes = stats.Changes + delta
+                        }
+
+                    Catalog.putStatsInTxn next txn, Catalog.addStats next catalog)
+            (txn, state.Committed.Catalog)
+
+    /// DML が触った行数を積む（COMMIT まで持つ）。
+    let addStatsDelta (table: string) (rows: int) (state: ExecState) =
+        if rows <= 0 || Option.isNone (Catalog.findStats table state.Catalog) then
+            state
+        else
+            let key = table.ToLowerInvariant()
+            let delta = state.StatsDeltas |> Map.tryFind key |> Option.defaultValue 0L
+
+            { state with
+                StatsDeltas = Map.add key (delta + int64 rows) state.StatsDeltas
+            }
+
+    /// 統計を取り直したテーブルの未反映の行数を捨てる。
+    let private clearStatsDeltas (tables: string list) (state: ExecState) =
+        if List.isEmpty tables || Map.isEmpty state.StatsDeltas then
+            state
+        else
+            let cleared = tables |> List.map (fun t -> t.ToLowerInvariant()) |> Set.ofList
+
+            { state with
+                StatsDeltas = state.StatsDeltas |> Map.filter (fun k _ -> not (Set.contains k cleared))
+            }
 
     let commitTransaction (txn: Transaction) (state: ExecState) =
         result {
+            let txn, catalog = applyStatsDeltas txn state
+
             let! store, manager =
                 RowStore.commitToStoreWith
                     state.Committed.DeferDurability
@@ -189,6 +235,7 @@ module internal ExecState =
                 { state.Committed with
                     Store = store
                     Manager = manager
+                    Catalog = catalog
                 }
         }
 
@@ -333,6 +380,23 @@ module internal ExecState =
 
         loop state [||]
 
+    /// 標本から等頻度ヒストグラムの境界を選ぶ（`buckets + 1` 個）。
+    /// 値の分布が偏っていても、境界が同じ割合の行を区切るので CDF の推定がぶれにくい。
+    /// 標本が少ないときは全標本をそのまま返す。
+    let private equiDepthHistogram (buckets: int) (samples: float list) =
+        match samples |> List.sort with
+        | [] -> []
+        | sorted ->
+            let values = Array.ofList sorted
+            let last = values.Length - 1
+
+            if values.Length <= buckets then
+                List.ofArray values
+            else
+                [
+                    for k in 0..buckets -> values.[int (System.Math.Round(float k * float last / float buckets))]
+                ]
+
     /// テーブルの行数、列 NDV・NULL 数・数値範囲、索引 prefix NDV を収集する。
     /// `sample` が Some n なら reservoir sampling で n 行だけを標本にする。
     let private collectStats
@@ -347,7 +411,7 @@ module internal ExecState =
 
         progress |> Option.iter (fun report -> report (defn.Name, 0L))
 
-        let rec consume accumulate count scan =
+        let rec consume accumulate totalBytes count scan =
             if count % 8192L = 0L && cancel.IsCancellationRequested then
                 SstScan.dispose scan
                 err (DbError.capacity "ANALYZE はキャンセルされました")
@@ -359,10 +423,16 @@ module internal ExecState =
                 | Error e ->
                     SstScan.dispose scan
                     err e
-                | Ok None -> ret count
+                | Ok None -> ret (count, totalBytes)
                 | Ok(Some(entry, rest)) ->
                     entry.Value |> Option.iter accumulate
-                    consume accumulate (count + 1L) rest
+
+                    let totalBytes =
+                        match entry.Value with
+                        | Some row -> totalBytes + float (ValueCodec.managedRowBytes row)
+                        | None -> totalBytes
+
+                    consume accumulate totalBytes (count + 1L) rest
 
         let rec loop n count samples sampleCount rng scan =
             if count % 8192L = 0L && cancel.IsCancellationRequested then
@@ -396,12 +466,31 @@ module internal ExecState =
                             else
                                 loop n count samples sampleCount rng rest
 
+        let frequentValues
+            mcvLimit
+            totalRows
+            sampleSize
+            (counts: System.Collections.Generic.Dictionary<string, int64>)
+            =
+            let scale n =
+                if sampleSize <= 0L then
+                    n
+                else
+                    (n * totalRows + sampleSize / 2L) / sampleSize
+
+            counts
+            |> Seq.filter (fun kv -> kv.Value >= 2L)
+            |> Seq.map (fun kv -> kv.Key, scale kv.Value)
+            |> Seq.sortByDescending (fun (value, rows) -> rows, value)
+            |> Seq.truncate mcvLimit
+            |> List.ofSeq
+
         result {
             let! schema = Catalog.toSchema defn
             let schemaColumns = schema.Columns |> Array.ofList
 
             let columnSets =
-                Array.init schemaColumns.Length (fun _ -> System.Collections.Generic.HashSet<string>())
+                Array.init schemaColumns.Length (fun _ -> System.Collections.Generic.Dictionary<string, int64>())
 
             let nullCounts = System.Collections.Generic.Dictionary<int, int64>()
             let minMax = System.Collections.Generic.Dictionary<int, struct (float * float)>()
@@ -409,7 +498,8 @@ module internal ExecState =
             let numericSeen = System.Collections.Generic.Dictionary<int, int64>()
             let numericRng = System.Collections.Generic.Dictionary<int, int64>()
 
-            let histogramSize = 64
+            let histogramSamples = 1024
+            let histogramBuckets = 32
 
             let indexes =
                 Catalog.indexesOf schema.Name state.Catalog
@@ -442,7 +532,11 @@ module internal ExecState =
 
                             nullCounts.[i] <- current + 1L
                         else
-                            columnSets.[i].Add(SqlLiteral.toSqlLiteral value) |> ignore
+                            let key = SqlLiteral.toSqlLiteral value
+
+                            match columnSets.[i].TryGetValue key with
+                            | true, n -> columnSets.[i].[key] <- n + 1L
+                            | _ -> columnSets.[i].[key] <- 1L
 
                             match SqlValue.asNumeric value with
                             | Some d ->
@@ -464,7 +558,7 @@ module internal ExecState =
                                     | true, xs -> xs
                                     | _ -> []
 
-                                if List.length samples < histogramSize then
+                                if List.length samples < histogramSamples then
                                     numericSamples.[i] <- v :: samples
                                 else
                                     let rng =
@@ -476,7 +570,7 @@ module internal ExecState =
                                     numericRng.[i] <- rng
                                     let j = int ((rng >>> 1) % seen)
 
-                                    if j < histogramSize then
+                                    if j < histogramSamples then
                                         numericSamples.[i] <-
                                             samples |> List.mapi (fun k current -> if k = j then v else current)
                             | None -> ())
@@ -494,25 +588,34 @@ module internal ExecState =
                         ("", 0)
                     |> ignore
 
-            let! totalRows, sampleSize =
+            let! totalRows, sampleSize, rowBytesTotal =
                 match sample |> Option.map (min 100_000) with
                 | None ->
                     result {
-                        let! count = consume accumulate 0L scan
-                        return count, count
+                        let! count, bytes = consume accumulate 0.0 0L scan
+                        return count, count, bytes
                     }
                 | Some n ->
                     result {
                         let! count, samples, sampleCount = loop n 0L [] 0 1L scan
                         samples |> List.iter accumulate
-                        return count, sampleCount
+                        let bytes = samples |> List.sumBy (ValueCodec.managedRowBytes >> float)
+                        return count, sampleCount, bytes
                     }
+
+            let rowBytes =
+                if sampleSize <= 0L then
+                    0.0
+                else
+                    rowBytesTotal / float sampleSize
 
             let scaleNulls nulls =
                 if sampleSize <= 0L then
                     0L
                 else
                     (nulls * totalRows + sampleSize / 2L) / sampleSize
+
+            let mcvLimit = 32
 
             let columns =
                 schemaColumns
@@ -530,10 +633,10 @@ module internal ExecState =
 
                     let histogram =
                         match numericSamples.TryGetValue i with
-                        | true, samples -> samples |> List.sort
+                        | true, samples -> equiDepthHistogram histogramBuckets samples
                         | _ -> []
 
-                    let column: ColumnStats =
+                    let column =
                         {
                             Name = col.Name
                             NDV = int64 columnSets.[i].Count
@@ -541,6 +644,7 @@ module internal ExecState =
                             Min = minValue
                             Max = maxValue
                             Histogram = histogram
+                            Mcv = frequentValues mcvLimit totalRows sampleSize columnSets.[i]
                         }
 
                     column)
@@ -567,6 +671,8 @@ module internal ExecState =
                     Columns = columns
                     Indexes = indexes
                     AnalyzedAt = Some System.DateTimeOffset.UtcNow
+                    Changes = 0L
+                    RowBytes = rowBytes
                 }
         }
 
@@ -597,6 +703,7 @@ module internal ExecState =
                 stats |> List.fold (fun catalog s -> Catalog.addStats s catalog) state.Catalog
 
             let! next = saved nextCatalog state
+            let next = clearStatsDeltas (stats |> List.map (fun s -> s.Table)) next
             return next, stats
         }
 
@@ -1226,6 +1333,19 @@ module internal Engine =
             finally
                 ctx.Scope.DisposeAll()
 
+    /// 推定の元になった統計が古いときの 1行（無ければ None）。
+    /// `ANALYZE` 以降にコミットされた DML の行数を出す。
+    let private staleStatsLine (state: ExecState) =
+        let stale =
+            state.Catalog.Stats
+            |> List.filter (fun s -> s.Changes > 0L)
+            |> List.sortBy (fun s -> s.Table.ToLowerInvariant())
+            |> List.map (fun s -> sprintf "%s(+%d)" s.Table s.Changes)
+
+        match stale with
+        | [] -> None
+        | _ -> Some(sprintf "Stats stale: %s" (String.concat ", " stale))
+
     /// EXPLAIN: 実行計画を組み立て、木を 1行 1ノードの文字列にして返す。
     /// クエリ本体は実行しない（ただしサブクエリは計画時に評価される）。
     let private runExplain (limits: ResultLimits) (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
@@ -1234,11 +1354,65 @@ module internal Engine =
             try
                 Plan.explainSelect ctx stmt
                 >>= fun plan ->
-                    Optimizer.explain plan.Context plan.Tree plan.Input
+                    let lines = Optimizer.explain plan.Context plan.Tree plan.Input
+
+                    let lines =
+                        staleStatsLine state
+                        |> Option.map List.singleton
+                        |> Option.defaultValue []
+                        |> (@) lines
+
+                    lines
                     |> List.map (fun line -> LoadedRow.create [| SqlValue.Text line |])
                     |> all
                     |> Result.map (fun loaded ->
                         state, StatementResult.Create(loaded.Length, [| "plan" |], List.toArray loaded))
+            finally
+                ctx.Scope.DisposeAll()
+
+    /// EXPLAIN ANALYZE: クエリを実行し、走査と結合の実測行数を推定に添える。
+    /// 結果は materialize するが返さない（末尾に件数と経過時間の 1行を足す）。
+    let private runExplainAnalyze (limits: ResultLimits) (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
+        contextOf limits.Budget state txn
+        >>= fun ctx ->
+            try
+                Plan.explainSelect ctx stmt
+                >>= fun plan ->
+                    let counts =
+                        System.Collections.Generic.Dictionary<obj, int64>(HashIdentity.Reference)
+
+                    let clock = System.Diagnostics.Stopwatch.StartNew()
+
+                    let executed =
+                        Optimizer.execWithCounts plan.Context counts plan.Tree plan.Input
+                        >>= Op.toArrayLimited limits.MaxRows limits.MaxBytes
+
+                    clock.Stop()
+
+                    match executed with
+                    | Error e -> Error e
+                    | Ok rows ->
+                        let actualOf (tree: Logical) =
+                            match counts.TryGetValue(box tree) with
+                            | true, n -> Some n
+                            | false, _ -> None
+
+                        let lines = Optimizer.explainWithCounts actualOf plan.Context plan.Tree plan.Input
+
+                        let stale =
+                            staleStatsLine state |> Option.map List.singleton |> Option.defaultValue []
+
+                        let summary =
+                            sprintf "Execution: rows=%d elapsed=%.3fms" rows.Length clock.Elapsed.TotalMilliseconds
+
+                        let loaded =
+                            (lines @ stale @ [ summary ])
+                            |> List.map (fun line -> LoadedRow.create [| SqlValue.Text line |])
+
+                        match all loaded with
+                        | Error e -> Error e
+                        | Ok loadedRows ->
+                            Ok(state, StatementResult.Create(loadedRows.Length, [| "plan" |], Array.ofList loadedRows))
             finally
                 ctx.Scope.DisposeAll()
 
@@ -1427,6 +1601,7 @@ module internal Engine =
         (limits: ResultLimits)
         (state: ExecState)
         (txn: Transaction)
+        (table: string)
         (run: ExecContext -> Result<(Transaction * int), DbError>)
         =
         contextOf limits.Budget state txn
@@ -1436,11 +1611,12 @@ module internal Engine =
                     let! outcome = run ctx
                     let txn2, n = outcome
 
-                    return
+                    let next =
                         { state with
                             Txn = { state.Txn with Pending = Some txn2 }
-                        },
-                        StatementResult.Affected n
+                        }
+
+                    return ExecState.addStatsDelta table n next, StatementResult.Affected n
                 }
             finally
                 ctx.Scope.DisposeAll()
@@ -1464,9 +1640,10 @@ module internal Engine =
         function
         | Statement.Select stmt -> runSelect limits state txn stmt
         | Statement.Explain stmt -> runExplain limits state txn stmt
-        | Statement.Insert stmt -> runInsert stmt |> runDml limits state txn
-        | Statement.Update stmt -> runUpdate stmt |> runDml limits state txn
-        | Statement.Delete stmt -> runDelete stmt |> runDml limits state txn
+        | Statement.ExplainAnalyze stmt -> runExplainAnalyze limits state txn stmt
+        | Statement.Insert stmt -> runDml limits state txn stmt.Table.Name (runInsert stmt)
+        | Statement.Update stmt -> runDml limits state txn stmt.Table.Name (runUpdate stmt)
+        | Statement.Delete stmt -> runDml limits state txn stmt.Table.Name (runDelete stmt)
         | Statement.CreateTable c -> ExecState.createTable c |> runDdl state
         | Statement.DropTable(n, ifE) -> ExecState.dropTable n ifE |> runDdl state
         | Statement.CreateIndex ci -> ExecState.createIndex ci |> runDdl state
@@ -1486,6 +1663,8 @@ module internal Engine =
                             "ranges"
                             "indexes"
                             "histograms"
+                            "mcv"
+                            "row_bytes"
                             "analyzed_at"
                         |]
 
@@ -1526,6 +1705,13 @@ module internal Engine =
                                     |> String.concat ","
                                 )
                                 SqlValue.Text(
+                                    s.Columns
+                                    |> List.filter (fun c -> not (List.isEmpty c.Mcv))
+                                    |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Mcv))
+                                    |> String.concat ","
+                                )
+                                SqlValue.Int(int64 (System.Math.Round s.RowBytes))
+                                SqlValue.Text(
                                     match s.AnalyzedAt with
                                     | Some t ->
                                         t.UtcDateTime.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
@@ -1553,6 +1739,7 @@ module internal Engine =
                 match stmt with
                 | Statement.Select _
                 | Statement.Explain _ -> true
+                | Statement.ExplainAnalyze _ -> true
                 | _ -> false
 
             let run () =

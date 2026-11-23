@@ -249,6 +249,27 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 回帰: `SqlReference: LEFT JOIN を跨ぐ INNER は LEFT より前に繰り上げる` /
 `SqlReference: LEFT の右を参照する INNER は繰り上げない`。
 
+### 3.21 結合順の見積りと実行時アルゴリズムの条件を揃える
+
+結合順（`JoinOrder.transitionVariants`）が前提にするアルゴリズムと、
+実行時に `Analyzer.chooseJoinAlgorithmWith` が選ぶアルゴリズムは同じ条件でなければならない。
+ずれると「DP が選んだ順序の前提コスト」と実際の実行が食い違う。
+
+- 結合キーは両側が同じ型の等値だけ（`Analyzer.isJoinKeyEquality`）。
+  型が違う等値は residual としてだけ評価し、入れ子ループとして見積もる。
+- INL は右部分木が走査（`Scan` / `Filter`）のときだけ。
+  実行時は右部分木を実行しないので、派生テーブルなどは INL にしない
+  （`JoinOrderItem.Lookupable`）。
+- マージ結合は左が走査のときだけ。
+  実行時は左部分木の `scanOrder` を使うため、結合を重ねた左では `None` になり選ばれない
+  （`PlanState.ScanInput`）。
+- 等値キーが 1本も無い辺だけなら、ハッシュではなく入れ子ループ（直積 + 残差）として見積もる。
+
+回帰: `JoinOrder.selinger: 等値キーの無い辺は入れ子ループのコストで見積もる` /
+`JoinOrder.selinger: 右が走査でなければ INL のコストにしない` /
+`JoinOrder.selinger: マージ結合は左が走査のときだけ候補にする` /
+`SqlReference: 型が違う等値は結合キーにせず入れ子ループになる`。
+
 ---
 
 ## 4. LSM・WAL・MANIFEST
@@ -1056,6 +1077,9 @@ JOINのONは、並べ替え用の解析で`Binder.qualify`が失敗しても述�
 - [ ] bushy の分割は両側が依存関係で閉じ、結合述語が跨るときだけ使っているか
 - [ ] bushy で使わなかった述語を Filter として残しているか
 - [ ] LEFT を跨いで INNER を繰り上げるのは、ON の参照が先頭区間で閉じるときだけか
+- [ ] 結合順のコスト見積りと実行時のアルゴリズム選択が同じ条件（型・走査可否・左の順序）になっているか
+- [ ] 計測用のラッパを通常の実行経路に常時挟んでいないか（`RowCounts = None` なら包まない）
+- [ ] 統計の鮮度の更新は COMMIT と同じ transaction に積み、ROLLBACK で戻るようにしているか
 - [ ] 統計の旧形式（prefix のみ・tag 1）を既定値で読めるか（新フィールド追加時に壊さないか）
 - [ ] `EXPLAIN` の `rows=` / `sel=` は統計があるときだけ付くか（無い場合の表示を変えないか）
 - [ ] 真偽の解釈（WHERE / NOT / AND / OR / CASE / IS TRUE）を同じ関数に揃えているか

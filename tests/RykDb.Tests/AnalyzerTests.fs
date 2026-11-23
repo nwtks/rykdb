@@ -1013,3 +1013,10 @@ let ``Analyzer.chooseScanMethod: 20000段の AND を chooseScanMethod しても�
         match ok (Analyzer.chooseScanMethod b Catalog.Empty [ deep ]) with
         | ScanMethod.PkLookup values -> Assert.Equal<int64>(42L, asInt values.[0])
         | m -> failActual "PkLookup ではない" m)
+
+[<Fact>]
+let ``Analyzer.spilledBuildRows: 収まらなければはみ出した割合だけ退避する`` () =
+    // 無制限・収まる・はみ出す の 3通り。
+    Assert.Equal(0.0, Analyzer.spilledBuildRows 100.0 10.0 -1.0, 3)
+    Assert.Equal(0.0, Analyzer.spilledBuildRows 10.0 10.0 1000.0, 3)
+    Assert.Equal(50.0, Analyzer.spilledBuildRows 100.0 10.0 500.0, 3)

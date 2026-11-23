@@ -46,7 +46,7 @@ table_ref  ::= ident [ [AS] ident ]
 join_clause ::= [ INNER | LEFT [OUTER] ] JOIN table_ref ON expr
 sort_key   ::= expr [ ASC | DESC ]
 
-explain    ::= EXPLAIN SELECT ...
+explain    ::= EXPLAIN [ANALYZE] SELECT ...
 
 insert     ::= INSERT INTO ident [ "(" column_list ")" ]
                ( VALUES row { "," row } | SELECT ... | DEFAULT VALUES )
@@ -78,7 +78,8 @@ transaction ::= BEGIN [TRANSACTION] | START TRANSACTION
 - 結果を返す文が複数、または結果を返さない場合は、`RowsAffected`の合計を返す。
 - `SELECT`以外で `Columns`と `Rows`は空になる。
 
-`EXPLAIN`は `SELECT`だけを受け付ける。
+`EXPLAIN`と `EXPLAIN ANALYZE`は `SELECT`だけを受け付ける。
+`EXPLAIN ANALYZE`は実行を伴うが、`SELECT`なので読み取り専用として扱う。
 
 ## 2. 字句
 
@@ -612,6 +613,9 @@ SELECT * FROM t WHERE a = 1 AND b = 2; -- IndexLookup
 `ANALYZE` の統計があれば行数・列NDV・NULL率・ヒストグラムを使う。
 統計が無い場合は結合述語1本ごとに選択性を1/10と見積もり、
 述語で繋がらない候補は直積として見積もる。
+結合順の見積りも、実行時と同じ条件でアルゴリズムを選ぶ。
+型が違う等値は結合キーにせず（入れ子ループ）、右が走査でない INL と、
+左が走査でないマージ結合は候補にしない。
 
 `SELECT *`の列順は結合順を並べ替えても、`FROM`に書いた論理順を維持する。
 
@@ -751,8 +755,35 @@ plan
   Join(INNER, HashJoin, right=u, on=(t.k = u.k)) rows=3 sel=0.3333
 ```
 
+`ANALYZE` の後にコミットした DML があるテーブルは、推定が古いことを末尾の 1行で示す。
+`ANALYZE` を実行し直すと消える。
+
+```text
+  Scan(t, SeqScan) rows=3
+  Stats stale: t(+2)
+```
+
 ハッシュ結合の build 側が推定で作業メモリを超えるときは `HashJoin(spill=…KB)` になる。
+数値は作業メモリを超えた分（退避する推定バイト数）で、結合順のコストと同じ式で出す。
 小さい側（左）を build するときは `HashJoin(left)`。
+
+`EXPLAIN ANALYZE` はクエリを実行し、走査と結合に実際の出力行数を `actual=` で添える。
+最後に `Execution: rows=<結果行数> elapsed=<経過時間>` の 1行を返す。
+
+```text
+plan
+----
+  Project(t.id)
+    Join(INNER, HashJoin, right=u, on=(t.k = u.k)) actual=2
+      Scan(t, SeqScan) actual=3
+      Scan(u, SeqScan) actual=3
+  Execution: rows=2 elapsed=0.412ms
+```
+
+- 実測行数は `Scan` と `Join` だけに付く（他のノードは推定 `rows=` のみ）。
+- `LIMIT` などで途中終了した場合は、実際に取り出された行数になる。
+- 結果は materialize するが返さず、件数だけを `Execution` 行に出す。
+  `SessionOptions` の結果上限は通常の `SELECT` と同じように効く。
 
 主なノードは次のとおり。
 
@@ -1041,17 +1072,29 @@ ANALYZE [TABLE] [table_name] [SAMPLE n];
 
 - 結合順、結合アルゴリズム、走査基数、Filter 選択性の見積りに使う。
 - 結果は `table` / `rows` / `columns` / `ndv` / `nulls` / `ranges` / `indexes` / `histograms` /
-  `analyzed_at` の 1行（全テーブルならテーブルごとに 1行）。
+  `mcv` / `row_bytes` / `analyzed_at` の 1行（全テーブルならテーブルごとに 1行）。
   - `ndv` は `列=異なり値数` の並び、`nulls` は `列=NULL数` の並び。
   - `ranges` は数値列の `列=[最小,最大]`、`indexes` は `索引名=[prefix NDV…]`。
-  - `histograms` は数値列の `列:標本数`（標本を持たない列は出さない）。
+  - `histograms` は数値列の等頻度ヒストグラムの `列:境界数`（標本を持たない列は出さない）。
+  - `mcv` は頻出値の `列:件数`（2回以上現れた値を多い順に最大 32個）。
+  - `row_bytes` は 1行の管理メモリ概算の平均（バイト）。
   - `analyzed_at` は収集した UTC 時刻（ISO 8601）。
 - `SAMPLE n` は reservoir sampling で最大 n 行を標本にする。
   行数は全体を数え、NDV・範囲・NULL 率・数値ヒストグラムは標本から推定する。
+- 数値列のヒストグラムは最大 1024 標本から 32個の等頻度境界（標本が少なければ全標本）を作る。
+  値の分布が偏っていても範囲の行数を見積もりやすい。
+- 頻出値（MCV）は 2 回以上現れた値を多い順に最大 32個残す。
+  等値の選択性は MCV を優先し、MCV に無い値は残りの行を均等に割る。
+- `row_bytes` は行ごとの管理メモリ概算の平均で、`SAMPLE` のときは標本の平均になる。
+  結合順のコスト（スピル判定）はこの値を使う。
 - 進捗は `SessionOptions.OnAnalyzeProgress`、キャンセルは `SessionOptions.CancelAnalysis` で扱う。
   コールバックはテーブルごとに開始（0行）と終了（全行）で呼ばれる。
 - 統計はDML（`INSERT` / `UPDATE` / `DELETE`）では自動更新しない。
   更新後は必要に応じて再度 `ANALYZE` を実行する。
+- 代わりに、COMMIT した DML が触った行数を統計に積む
+  （`ROLLBACK` した分は数えない）。
+  `EXPLAIN` は推定が古いテーブルを `Stats stale: t(+12)` のように示す。
+  `ANALYZE` でそのテーブルの行数は 0 に戻る。
 - `ALTER TABLE` は対象テーブルの統計を削除する。
 - 明示transaction中は実行できない（DDLと同じ扱い）。
 

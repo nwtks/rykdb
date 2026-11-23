@@ -59,11 +59,19 @@ let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
 let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
     withStore "cat-stats" (fun store ->
         let stats =
-            tableStats
-                "people"
-                3L
-                [ colStats "id" 3L 0L None None; colStats "name" 2L 1L (Some 1.0) (Some 3.0) ]
-                [ idxStats "ix_name" [ "name" ] [ 2L ] ]
+            { tableStats
+                  "people"
+                  3L
+                  [
+                      colStats "id" 3L 0L None None
+                      { colStats "name" 2L 1L (Some 1.0) (Some 3.0) with
+                          Mcv = [ ("'alice'", 2L) ]
+                      }
+                  ]
+                  [ idxStats "ix_name" [ "name" ] [ 2L ] ] with
+                Changes = 4L
+                RowBytes = 40.0
+            }
 
         let c = Catalog.addStats stats Catalog.Empty
         let store = ok (Catalog.save store Catalog.Empty c)
@@ -78,7 +86,10 @@ let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
         Assert.Equal<int>(1, s.Indexes.Length)
         Assert.Equal<string list>([ "name" ], s.Indexes.[0].Columns)
         Assert.Equal<int64 list>([ 2L ], s.Indexes.[0].PrefixNDV)
+        Assert.Equal<(string * int64) list>([ ("'alice'", 2L) ], nameColumn.Mcv)
         Assert.True(s.AnalyzedAt.IsNone)
+        Assert.Equal<int64>(4L, s.Changes)
+        Assert.Equal(40.0, s.RowBytes, 3)
 
         Assert.True(
             Catalog.findStats "people" (Catalog.removeTable "people" loaded)

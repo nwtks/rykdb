@@ -218,6 +218,12 @@ module internal Analyzer =
 
         unwrap []
 
+    /// 右部分木を索引で引ける形か（`Scan` か `Filter` の連なり）。
+    /// インデックス入れ子ループは右部分木を実行しないため、
+    /// `Filter` は residual に回して評価する。
+    /// 結合順のコスト見積りが実行時と同じ条件で INL を選ぶために使う。
+    let canScanJoinRight = scanOfRight >> Option.isSome
+
     /// 走査方法が吸収した等値述語を `Expr` に再構成する。
     /// `Analyzer.impliedByScan` は `PkLookup` / `IndexLookup` が保証する等値を
     /// `Filter` から除くため、INL では residual に戻さないと結果が変わる。
@@ -288,6 +294,25 @@ module internal Analyzer =
         else
             float column.Nulls / float stats.RowCount
 
+    /// 結合キーに使える等値か（両側が同じ型の列参照）。
+    /// 実行時の `chooseJoinAlgorithmWith` が結合キーにする条件（`tryPair`）と同じで、
+    /// 型が違う等値は結合キーにせず residual としてだけ評価する（入れ子ループ）。
+    /// 結合順のコスト見積りはこの判定を通った辺だけを INL / マージ / ハッシュの候補にする。
+    let isJoinKeyEquality (schema: Schema) =
+        function
+        | Expr.Binary(BinaryOp.Eq, a, b) ->
+            match Schema.tryAsColumnRef a, Schema.tryAsColumnRef b with
+            | Some ca, Some cb ->
+                match Schema.resolve ca schema, Schema.resolve cb schema with
+                | Ok ia, Ok ib ->
+                    match schema.Columns.[ia].DataType, schema.Columns.[ib].DataType with
+                    | Some lt, Some rt -> lt = rt
+                    | _ -> false
+                | Error _, _
+                | _, Error _ -> false
+            | _ -> false
+        | _ -> false
+
     /// 1本の等値述語の結合選択性。
     /// 両側の列に NDV 統計があるときだけ `Some` を返す。
     /// 等値比較は NULL 同士を一致させないため、NULL 率を掛けて除く。
@@ -326,6 +351,18 @@ module internal Analyzer =
     /// スキーマ 1行の管理メモリ概算。
     let rowBytesOfSchema (schema: Schema) =
         rowBytesOfTypes (schema.Columns |> Seq.map _.DataType)
+
+    /// ハッシュ結合の build 側が作業メモリを超えるときに、ディスクへ退避する行数。
+    /// 実際の退避はパーティション単位なので、はみ出した割合で近似する。
+    /// `workMemBytes < 0` は無制限。
+    /// 退避量は結合順のコストと `EXPLAIN` の `spill=` で同じ値を使う。
+    let spilledBuildRows (buildRows: float) (buildRowBytes: float) (workMemBytes: float) =
+        let buildBytes = buildRows * buildRowBytes
+
+        if workMemBytes < 0.0 || buildBytes <= workMemBytes then
+            0.0
+        else
+            buildRows * (1.0 - workMemBytes / buildBytes)
 
     /// 等値結合の選択性。
     /// 統計が欠けている等値は既定の 0.1 で穴埋めする。
@@ -480,8 +517,19 @@ module internal Analyzer =
             | Some(stats, column) when column.NDV > 0L ->
                 if SqlValue.isNull literal then
                     nullRate stats column
+                elif stats.RowCount <= 0L then
+                    defaultSelectivity
                 else
-                    (1.0 - nullRate stats column) / float column.NDV
+                    let total = float stats.RowCount
+                    let key = SqlLiteral.toSqlLiteral literal
+
+                    match column.Mcv |> List.tryFind (fun (value, _) -> value = key) with
+                    | Some(_, rows) -> min 1.0 (float rows / total)
+                    | None ->
+                        let nulls = float column.Nulls / total
+                        let mcvShare = column.Mcv |> List.sumBy (snd >> float) |> fun rows -> rows / total
+                        let rest = max 0.0 (min 1.0 (1.0 - nulls - mcvShare))
+                        rest / float (max 1L (column.NDV - int64 column.Mcv.Length))
             | _ -> defaultSelectivity
 
         let histogramCdf histogram v =

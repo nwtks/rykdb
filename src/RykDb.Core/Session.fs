@@ -354,6 +354,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
         List.forall (function
             | Statement.Select _
             | Statement.Explain _ -> true
+            | Statement.ExplainAnalyze _ -> true
             | _ -> false)
 
     /// パラメータに `SqlValue.Unloaded`（内部専用の未復号マーカー）が含まれていないか検査する。

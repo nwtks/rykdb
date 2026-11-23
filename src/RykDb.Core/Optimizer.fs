@@ -28,11 +28,32 @@ module internal Optimizer =
                 HashBuildRight
         | _ -> HashBuildRight
 
+    /// EXPLAIN ANALYZE 用に、ノードの出力行数を数える。
+    /// 計測しない設定（`RowCounts = None`）では Op をそのまま返す。
+    let private countOutput (ctx: ExecContext) (node: Logical) (op: Op) =
+        match ctx.RowCounts with
+        | None -> op
+        | Some counts ->
+            let key = box node
+
+            Op.map
+                (fun row ->
+                    let current =
+                        match counts.TryGetValue key with
+                        | true, n -> n
+                        | false, _ -> 0L
+
+                    counts.[key] <- current + 1L
+                    DbResult.DbOk row)
+                op
+
     /// Join の結合待ち情報。
     /// 右部分木の Op は左部分木を評価した後に作る
     /// （評価順を left → right → join に保つため）。
     type private JoinFrame =
         {
+            /// この結合の `Logical` ノード（EXPLAIN ANALYZE の実測行数のキー）。
+            Node: Logical
             Kind: JoinKind
             Right: Logical
             On: Expr
@@ -364,7 +385,7 @@ module internal Optimizer =
     /// 継続は ExecFrame list に積むので、ラッパの深さに依存せずスタックは一定。
     [<TailCall>]
     let rec private run (ctx: ExecContext) (memo: OutputSchemaMemo) (frames: ExecFrame list) (step: ExecStep) =
-        let buildJoinFrame inSchema kind name on left right =
+        let buildJoinFrame inSchema node kind name on left right =
             let leftSchema = outputOfMemo ctx inSchema memo left
 
             let rightSchema, rightTable =
@@ -382,6 +403,7 @@ module internal Optimizer =
 
             let frame: JoinFrame =
                 {
+                    Node = node
                     Kind = kind
                     Right = right
                     On = on
@@ -602,7 +624,7 @@ module internal Optimizer =
         | EvalNode(node, inSchema, hint) ->
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
-                let frame, leftSchema = buildJoinFrame inSchema kind name on lTree rTree
+                let frame, leftSchema = buildJoinFrame inSchema node kind name on lTree rTree
 
                 match frame.Algorithm with
                 | JoinAlgorithm.IndexNestedLoop _ ->
@@ -624,9 +646,9 @@ module internal Optimizer =
                     }
 
                 run innerCtx memo (UnionFrame(ctx, [], rest) :: frames) (EvalNode(plan.Tree, plan.Input, None))
-            | Logical.Scan(name, method) as node ->
+            | Logical.Scan(name, method) ->
                 match execScan node ctx name method hint with
-                | Ok op -> run ctx memo frames (ApplyOp op)
+                | Ok op -> run ctx memo frames (ApplyOp(countOutput ctx node op))
                 | Error e -> err e
             | Logical.Filter(p, child) ->
                 let childSchema = outputOfMemo ctx inSchema memo child
@@ -691,13 +713,13 @@ module internal Optimizer =
                     | Error e -> err e
                 | JoinIndexLeftFrame frame ->
                     match execIndexJoin frame op with
-                    | Ok joined -> run ctx memo rest (ApplyOp joined)
+                    | Ok joined -> run ctx memo rest (ApplyOp(countOutput ctx frame.Node joined))
                     | Error e -> err e
                 | JoinRightFrame frame ->
                     run ctx memo (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
                 | JoinApplyFrame(frame, leftOp) ->
                     match execJoin frame leftOp op with
-                    | Ok joined -> run ctx memo rest (ApplyOp joined)
+                    | Ok joined -> run ctx memo rest (ApplyOp(countOutput ctx frame.Node joined))
                     | Error e -> err e
                 | UnionFrame(outer, doneOps, []) ->
                     let combined = List.foldBack Op.append (List.rev (op :: doneOps)) Op.Empty
@@ -736,6 +758,16 @@ module internal Optimizer =
 
         run ctx memo [] (EvalNode(tree, schema, None))
 
+    /// 実行しながら、走査と結合の出力行数を `counts` に数える。
+    /// `EXPLAIN ANALYZE` 用で、通常の `exec` は計測しない。
+    let execWithCounts
+        (ctx: ExecContext)
+        (counts: System.Collections.Generic.Dictionary<obj, int64>)
+        (tree: Logical)
+        (schema: Schema)
+        =
+        exec { ctx with RowCounts = Some counts } tree schema
+
     /// EXPLAIN の作業項目。
     type private ExplainItem =
         {
@@ -749,7 +781,8 @@ module internal Optimizer =
 
     /// 論理木を EXPLAIN 用の行にする（実行しない）。
     /// `exec` と同じ規則で走査方法・結合アルゴリズムを選び、木を深さ優先で並べる。
-    let explain (ctx: ExecContext) (tree: Logical) (schema: Schema) =
+    /// `actual` が Some を返したノードには実測行数（`EXPLAIN ANALYZE`）を添える。
+    let explainWithCounts (actual: Logical -> int64 option) (ctx: ExecContext) (tree: Logical) (schema: Schema) =
         let memo = OutputSchemaMemo()
 
         let ctx =
@@ -873,20 +906,27 @@ module internal Optimizer =
                     match algorithm, buildSide with
                     | JoinAlgorithm.HashJoin, HashBuildLeft -> "HashJoin(left)"
                     | JoinAlgorithm.HashJoin, HashBuildRight ->
-                        let buildSchema =
-                            if buildSide = HashBuildLeft then
-                                leftSchema
+                        let leftRows = Analyzer.estimateRowsWith statsOf left
+                        let rightRows = Analyzer.estimateRowsWith statsOf right
+                        let buildRows = min leftRows rightRows
+
+                        let buildRowBytes =
+                            if leftRows < rightRows then
+                                Analyzer.rowBytesOfSchema leftSchema
                             else
-                                rightSchema
+                                Analyzer.rowBytesOfSchema rightSchema
 
-                        let buildRows =
-                            min (Analyzer.estimateRowsWith statsOf left) (Analyzer.estimateRowsWith statsOf right)
+                        let spilled =
+                            Analyzer.spilledBuildRows
+                                buildRows
+                                buildRowBytes
+                                (if item.Context.Budget.Work >= 0L then
+                                     float item.Context.Budget.Work
+                                 else
+                                     -1.0)
 
-                        let buildBytes = buildRows * Analyzer.rowBytesOfSchema buildSchema
-                        let work = item.Context.Budget.Work
-
-                        if work >= 0L && buildBytes > float work then
-                            sprintf "HashJoin(spill=%.0fKB)" (buildBytes / 1024.0)
+                        if spilled > 0.0 then
+                            sprintf "HashJoin(spill=%.0fKB)" (spilled * buildRowBytes / 1024.0)
                         else
                             "HashJoin"
 
@@ -960,7 +1000,12 @@ module internal Optimizer =
 
                         rowsText + selectivityText
 
-                let line = String.replicate item.Indent "  " + text + rowSuffix
+                let actualSuffix =
+                    actual item.Tree
+                    |> Option.map (fun rows -> sprintf " actual=%d" rows)
+                    |> Option.defaultValue ""
+
+                let line = String.replicate item.Indent "  " + text + rowSuffix + actualSuffix
                 emit (line :: acc) (children @ rest)
 
         emit
@@ -973,3 +1018,7 @@ module internal Optimizer =
                     Context = ctx
                 }
             ]
+
+    /// 論理木を EXPLAIN 用の行にする（実行しない。実測行数は添えない）。
+    let explain (ctx: ExecContext) (tree: Logical) (schema: Schema) =
+        explainWithCounts (fun _ -> None) ctx tree schema

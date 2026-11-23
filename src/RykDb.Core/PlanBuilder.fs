@@ -113,11 +113,11 @@ module internal PlanBuilder =
         =
         match binding with
         | Base tb ->
+            let stats = statsOf (bindingName binding)
+
             let indexStats name =
-                statsOf (bindingName binding)
-                |> Option.bind (fun stats ->
-                    stats.Indexes
-                    |> List.tryFind (fun (i: IndexStats) -> Catalog.eqName i.Name name))
+                stats
+                |> Option.bind (fun s -> s.Indexes |> List.tryFind (fun (i: IndexStats) -> Catalog.eqName i.Name name))
                 |> Option.map _.PrefixNDV
                 |> Option.defaultValue []
 
@@ -147,8 +147,15 @@ module internal PlanBuilder =
                                PrefixNDV = indexStats index.Name
                                Unique = index.Unique
                            }))
-                RowBytes = Analyzer.rowBytesOfTypes (tb.Schema.Columns |> Seq.map (fun c -> Some c.DataType))
+                RowBytes =
+                    stats
+                    |> Option.filter (fun s -> s.RowBytes > 0.0)
+                    |> Option.map _.RowBytes
+                    |> Option.defaultValue (
+                        Analyzer.rowBytesOfTypes (tb.Schema.Columns |> Seq.map (fun c -> Some c.DataType))
+                    )
                 NaturalOrder = Analyzer.scanOrder (fun _ -> Some tb.Schema) scan
+                Lookupable = Analyzer.canScanJoinRight scan
             }
         | DerivedSource(_, plan) ->
             {
@@ -158,6 +165,7 @@ module internal PlanBuilder =
                 Indexes = []
                 RowBytes = Analyzer.rowBytesOfTypes (plan.Output.Columns |> Seq.map _.DataType)
                 NaturalOrder = None
+                Lookupable = false
             }
 
     /// LIMIT / OFFSET の定数式を評価する（0 以上の int）。
@@ -389,7 +397,7 @@ module internal PlanBuilder =
                 Logical.Join(kind, bindingName right, onAll, acc, scans.[rightIndex]),
                 Schema.concat accSchema rightSchema)
 
-        let equiLinks =
+        let equiLinks schema =
             Predicate.splitConjuncts
             >> List.choose (fun conjunct ->
                 match conjunct with
@@ -401,11 +409,13 @@ module internal PlanBuilder =
 
                     match qualifierOf a, qualifierOf b with
                     | Some qa, Some qb when not (Catalog.eqName qa qb) ->
-                        Some(
-                            Set.ofList [ qa.ToLowerInvariant(); qb.ToLowerInvariant() ],
-                            conjunct,
-                            equalityColumns conjunct
-                        )
+                        let columns =
+                            if Analyzer.isJoinKeyEquality schema conjunct then
+                                equalityColumns conjunct
+                            else
+                                Map.empty
+
+                        Some(Set.ofList [ qa.ToLowerInvariant(); qb.ToLowerInvariant() ], conjunct, columns)
                     | _ -> None
                 | _ -> None)
 
@@ -570,11 +580,13 @@ module internal PlanBuilder =
                         | Error _ -> i, j, Some j.On)
 
                 let edges =
+                    let keySchema = concatSchemas bindings
+
                     (qualifiedOns
                      |> List.collect (fun (_, _, q) ->
                          match q with
                          | Some e ->
-                             equiLinks e
+                             equiLinks segmentSchema e
                              |> List.map (fun (refs, conjunct, columns) ->
                                  {
                                      Refs = refs
@@ -588,7 +600,11 @@ module internal PlanBuilder =
                            {
                                Refs = refs
                                Selectivity = edgeSelectivity p
-                               KeyColumns = equalityColumns p
+                               KeyColumns =
+                                   if Analyzer.isJoinKeyEquality keySchema p then
+                                       equalityColumns p
+                                   else
+                                       Map.empty
                            }))
 
                 let onPredicates =

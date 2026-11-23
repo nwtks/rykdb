@@ -37,6 +37,10 @@ type internal ExecContext =
         Budget: MemoryBudget
         /// 結合順の戦略（A/B・診断用。既定は DP）。
         JoinOrder: JoinOrderStrategy
+        /// EXPLAIN ANALYZE の実測行数（`Logical` のノード参照 -> 出力行数）。
+        /// None のときは計測しない（通常の実行経路）。
+        /// クエリごとに作る可変の台帳で、`Optimizer.execWithCounts` だけが入れる。
+        RowCounts: System.Collections.Generic.Dictionary<obj, int64> option
     }
 
 module internal ExecContext =
@@ -51,6 +55,7 @@ module internal ExecContext =
             ScanNeeds = System.Collections.Immutable.ImmutableDictionary.Create<obj, bool array> HashIdentity.Reference
             Budget = MemoryBudget.Default
             JoinOrder = JoinOrderStrategy.Dp
+            RowCounts = None
         }
 
     /// 結合順の戦略を差し替える（A/B・診断用）。

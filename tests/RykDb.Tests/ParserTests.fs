@@ -680,6 +680,17 @@ let ``Parser: EXPLAIN は SELECT を包む`` () =
     expectErrorKind ErrorKind.SyntaxError "EXPLAIN だけ" (parseStatement "EXPLAIN")
 
 [<Fact>]
+let ``Parser: EXPLAIN ANALYZE は実行付きの EXPLAIN になる`` () =
+    match parseOneOk "EXPLAIN ANALYZE SELECT id FROM t;" with
+    | Statement.ExplainAnalyze sel -> Assert.Single<SelectItem> sel.Items |> ignore
+    | other -> failActual "EXPLAIN ANALYZE ではない" other
+
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "EXPLAIN ANALYZE の後に SELECT 以外"
+        (parseStatement "EXPLAIN ANALYZE INSERT INTO t VALUES (1)")
+
+[<Fact>]
 let ``Parser: ANALYZE はテーブル名を受ける`` () =
     match parseOneOk "ANALYZE t" with
     | Statement.Analyze(Some name, None) -> Assert.Equal<string>("t", name)

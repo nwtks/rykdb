@@ -51,8 +51,11 @@ type internal ColumnStats =
         /// 数値型の最小値・最大値（数値以外は None）。
         Min: float option
         Max: float option
-        /// 数値型の標本ヒストグラム（昇順の標本値。空なら未収集）。
+        /// 数値型の等頻度ヒストグラムの境界（昇順。空なら未収集）。
         Histogram: float list
+        /// 頻出値（SQL リテラルの表記）と行数。多い順に先頭のみ。
+        /// 等値の選択性はこの値を優先する（空なら NDV だけ）。
+        Mcv: (string * int64) list
     }
 
 /// 索引の統計。
@@ -67,6 +70,8 @@ type internal IndexStats =
 /// `ANALYZE` が収集するテーブル統計。
 /// <remarks>
 /// 統計は手動で更新する。INSERT / UPDATE / DELETE では自動更新しない。
+/// 代わりに、コミットした DML が触った行数を `Changes` に積み、
+/// `EXPLAIN` が「推定が古い」ことを示せるようにする（`ANALYZE` で 0 に戻る）。
 /// </remarks>
 type internal TableStats =
     {
@@ -76,6 +81,10 @@ type internal TableStats =
         Indexes: IndexStats list
         /// 統計を収集した時刻（UTC）。
         AnalyzedAt: System.DateTimeOffset option
+        /// この統計を取った後にコミットされた DML の行数（0 なら新鮮）。
+        Changes: int64
+        /// 1行の管理メモリ概算の平均（0 なら未計測）。
+        RowBytes: float
     }
 
 /// カタログ全体のスナップショット。
@@ -424,7 +433,7 @@ module internal Catalog =
                         |> Writer.varint (uint64 c.Histogram.Length)
 
                     c.Histogram |> List.fold (fun w v -> writeFloat v w) w)
-                (Writer.writeByte 2uy w2)
+                (Writer.writeByte 5uy w2)
 
         let w4 =
             s.Indexes
@@ -434,9 +443,21 @@ module internal Catalog =
                     i.PrefixNDV |> List.fold (fun w n -> Writer.int64LE n w) w)
                 w3
 
-        match s.AnalyzedAt with
-        | None -> Writer.int64LE 0L w4
-        | Some t -> Writer.int64LE t.UtcTicks w4
+        let w5 =
+            match s.AnalyzedAt with
+            | None -> Writer.int64LE 0L w4
+            | Some t -> Writer.int64LE t.UtcTicks w4
+            |> Writer.int64LE s.Changes
+            |> writeFloat s.RowBytes
+
+        s.Columns
+        |> List.fold
+            (fun w c ->
+                let w = Writer.varint (uint64 c.Mcv.Length) w
+
+                c.Mcv
+                |> List.fold (fun w (value, count) -> w |> Writer.str value |> Writer.int64LE count) w)
+            w5
         |> Writer.toArray
 
     let private readColumnStat (c: Cursor) =
@@ -483,6 +504,25 @@ module internal Catalog =
             return ndvs, c2
         }
 
+    /// 頻出値の並び（SQL リテラルの表記と行数）。
+    let private readMcv (c: Cursor) =
+        result {
+            let! count, c1 = Reader.readVarint c
+
+            let! items, c2 =
+                Reader.readItems
+                    (fun c ->
+                        result {
+                            let! value, c1 = Reader.readStr c
+                            let! rows, c2 = Reader.readInt64LE c1
+                            return (value, rows), c2
+                        })
+                    count
+                    c1
+
+            return items, c2
+        }
+
     let private decodeStats (table: string) (bytes: byte array) =
         result {
             let! rowCount, cur1 = Cursor.create bytes |> Reader.readInt64LE
@@ -509,6 +549,7 @@ module internal Catalog =
                             Min = None
                             Max = None
                             Histogram = []
+                            Mcv = []
                         }
 
                     column)
@@ -532,6 +573,8 @@ module internal Catalog =
                     Columns = columns
                     Indexes = indexes
                     AnalyzedAt = None
+                    Changes = 0L
+                    RowBytes = 0.0
                 }
 
             if Cursor.atEnd afterIndexes then
@@ -539,7 +582,7 @@ module internal Catalog =
             else
                 let! tag, cur4 = Reader.readByte afterIndexes
 
-                if tag <> 1uy && tag <> 2uy then
+                if tag <> 1uy && tag <> 2uy && tag <> 3uy && tag <> 4uy && tag <> 5uy then
                     return! err (sprintf "統計の形式が不明です: %d" tag |> DbError.corruption)
                 else
                     let! columnExtras, cur5 =
@@ -560,20 +603,41 @@ module internal Catalog =
                                      None),
                                 cur)
 
+                    let! changes, cur7 =
+                        if tag < 3uy then
+                            ret (0L, cur7)
+                        else
+                            Reader.readInt64LE cur7
+
+                    let! rowBytes, cur7 =
+                        if tag < 4uy then
+                            ret (0.0, cur7)
+                        else
+                            Reader.readInt64LE cur7
+                            |> Result.map (fun (bits, cur) -> System.BitConverter.Int64BitsToDouble bits, cur)
+
+                    let! mcvs, cur7 =
+                        if tag < 5uy then
+                            ret (List.init columns.Length (fun _ -> []), cur7)
+                        else
+                            Reader.readItems readMcv (uint64 columns.Length) cur7
+
                     if not (Cursor.atEnd cur7) then
                         return! err (DbError.corruption "統計の末尾に余分なデータがあります")
                     else
                         let columns =
-                            List.map2
-                                (fun c (nulls, minValue, maxValue, histogram) ->
+                            List.map3
+                                (fun c (nulls, minValue, maxValue, histogram) mcv ->
                                     { c with
                                         Nulls = nulls
                                         Min = minValue
                                         Max = maxValue
                                         Histogram = histogram
+                                        Mcv = mcv
                                     })
                                 columns
                                 columnExtras
+                                mcvs
 
                         let indexes =
                             List.map2 (fun i prefix -> { i with PrefixNDV = prefix }) indexes indexExtras
@@ -583,6 +647,8 @@ module internal Catalog =
                                 Columns = columns
                                 Indexes = indexes
                                 AnalyzedAt = analyzedAt
+                                Changes = changes
+                                RowBytes = rowBytes
                             }
         }
 
@@ -628,6 +694,10 @@ module internal Catalog =
     /// テーブルの統計を transaction で削除する（`ALTER TABLE` で行の形が変わるとき）。
     let removeStatsInTxn (table: string) (txn: Transaction) =
         Transaction.remove Keyspace.CatalogKeyspace (statsKey table) txn
+
+    /// テーブルの統計を transaction に積む（DML のコミットと同時に鮮度を進める）。
+    let putStatsInTxn (s: TableStats) (txn: Transaction) =
+        Transaction.put Keyspace.CatalogKeyspace (statsKey s.Table) (toValue (encodeStats s)) txn
 
     /// カタログを保存する（消えた定義は tombstone で落とす）。
     /// previous は保存前のカタログ（store にあった内容）。

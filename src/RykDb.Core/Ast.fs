@@ -392,6 +392,8 @@ and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
     | Select of SelectStatement
     /// `EXPLAIN SELECT ...`。実行はせず、論理計画（走査方法・結合アルゴリズム）を返す。
     | Explain of SelectStatement
+    /// `EXPLAIN ANALYZE SELECT ...`。実行して走査・結合の実際の行数を推定に添える。
+    | ExplainAnalyze of SelectStatement
     | Insert of InsertStatement
     | Update of UpdateStatement
     | Delete of DeleteStatement

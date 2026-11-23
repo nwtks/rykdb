@@ -517,9 +517,25 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 - 等値結合は `(1 - NULL率_左) * (1 - NULL率_右) / max(NDV_左, NDV_右)`。
   同じテーブル対の複合等値で索引prefixがあれば、そのprefix NDVを使う。
   統計が揃わない部分は既定の0.1で穴埋めし、全体が不明なら従来の `min(左, 右)`。
-- `Filter` は等値ならNDV、数値範囲ならmin/maxと標本ヒストグラム、`BETWEEN`/`IN`/`LIKE`/`IS NULL` を見る。
+- `Filter` は等値なら MCV（頻出値の実測割合、無ければ NDV）、
+  数値範囲なら min/max と等頻度ヒストグラム、`BETWEEN`/`IN`/`LIKE`/`IS NULL` を見る。
+  ヒストグラムは `ANALYZE` が最大 1024標本から選ぶ 32個の等頻度境界で、保存形は並びのまま
+  （値以下の境界の割合を CDF とする）。
+  MCV は 2回以上現れた値を多い順に最大 32個残し、
+  MCV に無い値は NULL と MCV の割合を除いた残りを均等に割る。
 
 統計はDMLで自動更新しない（手動 `ANALYZE` のみ）。
+代わりに、COMMIT した DML が触った行数を `TableStats.Changes` に積む。
+
+- 実行中の行数は `ExecState.StatsDeltas`（接続ローカル）に持ち、
+  `ExecState.commitTransaction` が同じ transaction に `Catalog.putStatsInTxn` で畳み込む。
+  ROLLBACK した分は捨てる
+  （統計の書き込みもロールバックされる）。
+- `ANALYZE` は `Changes = 0` で統計を作り直し、未反映の行数も捨てる。
+- `EXPLAIN` は 0 より大きいテーブルを `Stats stale: t(+12)` として示す。
+- 保存形は tag 4（従来の末尾に `Changes` と平均行幅を追加）。
+  tag 1〜3 は `Changes` / `RowBytes` を 0 として読む。
+
 `ALTER TABLE` はテーブルの統計を削除する。
 `ANALYZE` はテーブル名を省略すると全テーブルを対象にする。
 `TableStats.AnalyzedAt` に収集時刻（UTC）を保持する。
@@ -529,19 +545,35 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 - 旧 prefix だけで終わる形式は、NULL 数 0・範囲なし・ヒストグラムなしとして読む。
 - tag 1 は列 extras（NULL数・min/max・ヒストグラム）と索引 prefix NDV。
 - tag 2 は tag 1 に `AnalyzedAt`（UTC ticks、0 は不明）を加えたもの。
+- tag 3 は tag 2 に `Changes`（ANALYZE 以降の更新行数）、
+  tag 4 は tag 3 に `RowBytes`（平均行幅）、
+  tag 5 は tag 4 に列ごとの頻出値（MCV）を加えたもの。
 - 未知の tag は `CorruptionError`。
 
 統計がない場合は `PkLookup`を1、`IndexLookup`を2、範囲走査を100、全走査を1000とする。
 
 結合順のDPは辺ごとの選択性（NDV）、`IndexColumns`、行幅、走査順も見る。
 
-- 左が32行以下で右の索引（主キーを含む）の先頭列が結合キーならINLのコストを使う。
+- 結合キーにするのは、両側が同じ型の列参照である等値だけ
+  （`Analyzer.isJoinKeyEquality`。実行時の `chooseJoinAlgorithmWith` の `tryPair` と同じ）。
+  型が違う等値は residual としてだけ評価し、入れ子ループとして見積もる。
+- 左が32行以下で右が走査（`Scan` か `Filter` の連なり）で、
+  右の索引（主キーを含む）の先頭列が結合キーならINLのコストを使う。
+  `JoinOrderItem.Lookupable` が偽なら INL にしない
+  （実行時は右部分木を実行しないため）。
   `IndexStats.PrefixNDV` が小さい索引を選び、一意索引はprobe単価を下げる。
 - 左右の走査順が結合キーで揃っていればマージ結合のコストを使う。
   右の走査順の先頭から結合辺がある限り一致する複合キーも対象にする。
-- 行幅は列の型別サイズで見積もる。
+  ただし左が走査のときだけ候補にする
+  （実行時は左部分木の `scanOrder` を使うため、結合を重ねた左ではマージ結合を選ばない。
+  `PlanState.ScanInput`）。
+- 等値キーが 1本も無い辺だけなら、ハッシュ結合ではなく入れ子ループとして見積もる。
+- 行幅は `ANALYZE` の `TableStats.RowBytes`（行ごとの管理メモリ概算の平均）を使う。
+  統計が無いときは列の型別サイズで見積もる。
 - ハッシュ結合はbuild側の行数×行幅が作業メモリを超えると、
-  `Spill.Partitions` 本への書き出し・読み直しを含むスピルペナルティを加える。
+  `Analyzer.spilledBuildRows`（はみ出した割合 × build 行数）を書き出し・読み直しの 2回とし、
+  `Spill.Partitions` 本のパーティション固定費を加えたスピルペナルティを加える。
+  bushy の分割コストも同じ式を使う。
 - 複数索引の選択は prefix NDV が小さい索引を優先する。
 - `PlanBuilder` は左深木を基本に組み立てる（`Bushy` のときは1段の分割木）。
   `Logical.Join` の右は結合の部分木も許容し、`Optimizer` は `outputOf` で
@@ -577,6 +609,11 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 
 `Scan`は走査方法に応じて、主キー、索引、範囲、全走査の実行関数へ振り分ける。
 結合は実際の出力レイアウトと右テーブルのスキーマを別々に扱う。
+
+`EXPLAIN ANALYZE` は `ExecContext.RowCounts`（ノード参照 -> 出力行数）を有効にし、
+`Optimizer.countOutput` が `Scan` と `Join` の `Op` を `Op.map` で包んで数える。
+計測しない通常の実行では `RowCounts = None` なので包まない。
+推定は `EXPLAIN` と同じ規則で出すため、`explainWithCounts` が実測だけを差し込む。
 
 `Filter`と`Sort`は子の出力スキーマで列位置を解決する。
 `Project`は`*`の展開にFROM順の論理スキーマ、列位置の解決に実際の行レイアウトを使う。
@@ -1426,10 +1463,11 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - JOINの右側、DISTINCT、GROUP BYは上限までメモリへ保持し、超過分を退避する。
 - 相関サブクエリは外側行ごとに内側を再計画するため、外側行数と内側走査コストの積がかかる。
 - `ANALYZE` を実行していないテーブルは統計が無く、走査方法から得る粗い見積りになる。
-- 統計は行数・列NDV・NULL数・数値min/max・標本ヒストグラム・索引prefix NDVで、
-  列間の相関・正確な行幅・I/Oは見積もらない。
+- 統計は行数・列NDV・NULL数・数値min/max・等頻度ヒストグラム・頻出値・索引prefix NDV・平均行幅で、
+  列間の相関とI/Oは見積もらない。
 - `ANALYZE` の進捗通知とキャンセルは `SessionOptions` 経由で行う。
 - 統計はDMLで自動更新しない（`SAMPLE n` も含め手動 `ANALYZE` のみ）。
+  COMMIT した DML の行数を `TableStats.Changes` に積み、`EXPLAIN` が古いことを示す。
   `ALTER TABLE` は対象テーブルの統計を削除する。
 - MVCCの古い版はactive snapshotがある間はcompactionで回収されない。
 - 非被覆索引はヒット行ごとに主キーlookupを行う。

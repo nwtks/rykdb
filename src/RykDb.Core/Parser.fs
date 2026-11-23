@@ -587,12 +587,24 @@ module internal Parser =
         | Token.Ident name when name.ToUpperInvariant() = "EXPLAIN" ->
             let st = advance st
 
+            let st, analyze =
+                if isIdentName "ANALYZE" st then
+                    advance st, true
+                else
+                    st, false
+
             match peek st with
             | Token.Keyword "SELECT" ->
                 result {
                     let! sel, st = parseSelectStatementValue st
                     let! _, st = eatOptionalSemicolon st
-                    return Statement.Explain sel, st
+
+                    return
+                        (if analyze then
+                             Statement.ExplainAnalyze sel
+                         else
+                             Statement.Explain sel),
+                        st
                 }
             | _ -> fail "EXPLAIN は SELECT 文だけに対応しています" st
         | Token.Ident name when name.ToUpperInvariant() = "ALTER" -> advance st |> parseAlterTable

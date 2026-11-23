@@ -16,6 +16,7 @@ let private item name rows position : JoinOrderItem =
         Indexes = []
         RowBytes = 32.0
         NaturalOrder = None
+        Lookupable = true
     }
 
 let private index name columns prefixNdv unique : JoinOrderIndex =
@@ -109,7 +110,7 @@ let private selinger
 [<Fact>]
 let ``JoinOrder.choose: DP が使えるときは DP の順を返す`` () =
     let items = [ item "b" 1000.0 1; item "c" 100.0 2; item "d" 100.0 3 ]
-    let edges = [ edge "a" "b" ]
+    let edges = [ keyedEdge (Some 0.1) (Map.ofList [ "a", "k"; "b", "k" ]) ]
 
     let order =
         JoinOrder.choose 1.0 1.0 (Set.singleton "a") None -1.0 edges items Map.empty
@@ -118,25 +119,94 @@ let ``JoinOrder.choose: DP が使えるときは DP の順を返す`` () =
 
 [<Fact>]
 let ``JoinOrder.selinger: 小さい左と索引がある辺は INL のコストで優先する`` () =
+    let edges = [ keyedEdge (Some 0.1) (Map.ofList [ "a", "j"; "b", "k" ]) ]
+
+    let itemWithIndex =
+        itemWith "b" 1_000_000.0 2 [ index "ix_k" [ "k" ] [ 100L ] false ] None
+
+    let withIndex =
+        expectSome
+            "DP の計画"
+            (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 edges [ itemWithIndex ] Map.empty)
+
+    // 索引が無ければハッシュ結合（build + probe）のコストになる。
+    let withoutIndex =
+        expectSome
+            "DP の計画"
+            (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 edges [ item "b" 1_000_000.0 2 ] Map.empty)
+
+    Assert.True(withIndex.Cost < withoutIndex.Cost, sprintf "INL %g < ハッシュ %g" withIndex.Cost withoutIndex.Cost)
+
+[<Fact>]
+let ``JoinOrder.selinger: 等値キーの無い辺は入れ子ループのコストで見積もる`` () =
+    // 実行時は同じ型の等値キーが無ければ入れ子ループ（直積 + 残差）になる。
+    // ハッシュ結合（build + probe）のコストにしてはいけない。
+    let items = [ item "b" 100.0 1; item "c" 100.0 2 ]
+    let residualEdges = [ edge "a" "b"; edge "a" "c" ]
+
+    let nested =
+        expectSome
+            "DP の計画"
+            (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 residualEdges items Map.empty)
+
+    let keyedEdges =
+        [
+            keyedEdge None (Map.ofList [ "a", "k"; "b", "k" ])
+            keyedEdge None (Map.ofList [ "a", "k"; "c", "k" ])
+        ]
+
+    let hashed =
+        expectSome "DP の計画" (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 keyedEdges items Map.empty)
+
+    // 10*100 + 100 + (100*100 + 1000) = 12,100 が入れ子ループの見積り。
+    Assert.Equal(12100.0, nested.Cost, 3)
+    Assert.True(hashed.Cost < nested.Cost, sprintf "ハッシュ %g < 入れ子ループ %g" hashed.Cost nested.Cost)
+
+[<Fact>]
+let ``JoinOrder.selinger: 右が走査でなければ INL のコストにしない`` () =
+    // 実行時のインデックス入れ子ループは右が `Scan`（または `Filter` の連なり）のときだけ。
+    let edges = [ keyedEdge (Some 0.1) (Map.ofList [ "a", "j"; "b", "k" ]) ]
+    let indexes = [ index "ix_k" [ "k" ] [ 100L ] true ]
+    let lookupable = itemWith "b" 1_000.0 2 indexes None
+    let notLookupable = { lookupable with Lookupable = false }
+
+    let withLookup =
+        expectSome
+            "DP の計画"
+            (JoinOrder.selingerPlan 1.0 32.0 (Set.singleton "a") None -1.0 edges [ lookupable ] Map.empty)
+
+    let withoutLookup =
+        expectSome
+            "DP の計画"
+            (JoinOrder.selingerPlan 1.0 32.0 (Set.singleton "a") None -1.0 edges [ notLookupable ] Map.empty)
+
+    // 右を実行しない INL は 1*0.5 + 100 = 100.5、ハッシュは 1 + 1000 + 100 + 0.1 = 1101.1。
+    Assert.Equal(100.5, withLookup.Cost, 3)
+    Assert.Equal(1101.1, withoutLookup.Cost, 3)
+
+[<Fact>]
+let ``JoinOrder.selinger: マージ結合は左が走査のときだけ候補にする`` () =
+    // 実行時は左部分木の走査順（`Analyzer.scanOrder`）を使うので、
+    // 結合を重ねた左ではマージ結合を選ばない。
     let items =
         [
-            itemWith "b" 1_000_000.0 2 [ index "ix_k" [ "k" ] [ 100L ] false ] None
-            item "c" 1_000_000.0 1
+            itemWith "b" 100.0 1 [ index "ix_k" [ "k" ] [ 100L ] true ] (Some [ "k" ])
+            itemWith "c" 100.0 2 [ index "iy_k" [ "k" ] [ 100L ] true ] (Some [ "k" ])
         ]
 
     let edges =
-        [ keyedEdge (Some 0.1) (Map.ofList [ "a", "j"; "b", "k" ]); edge "a" "c" ]
+        [
+            keyedEdge (Some 0.1) (Map.ofList [ "a", "k"; "b", "k" ])
+            keyedEdge (Some 0.1) (Map.ofList [ "b", "k"; "c", "k" ])
+        ]
 
-    let order = selinger 10.0 32.0 (Set.singleton "a") None -1.0 edges items Map.empty
-    Assert.Equal<string list option>(Some [ "b"; "c" ], order)
+    let plan =
+        expectSome
+            "DP の計画"
+            (JoinOrder.selingerPlan 1.0 32.0 (Set.singleton "a") (Some [ "k" ]) 100.0 edges items Map.empty)
 
-    // 索引情報が無ければ位置順で c が先になる。
-    let noIndex = [ item "b" 1_000_000.0 2; item "c" 1_000_000.0 1 ]
-
-    let orderNoIndex =
-        selinger 10.0 32.0 (Set.singleton "a") None -1.0 edges noIndex Map.empty
-
-    Assert.Equal<string list option>(Some [ "c"; "b" ], orderNoIndex)
+    // 先頭は a のつもりなので、b と c の順だけを見る（マージ連鎖は前提にしない）。
+    Assert.Equal<string list>([ "b"; "c" ], plan.Order)
 
 [<Fact>]
 let ``JoinOrder.selinger: 同点は FROM の位置順にする`` () =
@@ -181,3 +251,18 @@ let ``JoinOrder.selinger: 上限を超えるテーブル数では DP を使わ�
         selinger 1.0 1.0 (Set.singleton "a") None -1.0 [] (List.tail items) Map.empty
 
     Assert.True order.IsNone
+
+[<Fact>]
+let ``JoinOrder.selinger: 作業メモリを超えるとスピル分のコストが乗る`` () =
+    // build 側（1000行 × 32B = 32,000B）が 1KB の作業メモリに収まらない。
+    // 退避した行は書き出し + 読み直しの 2回としてコストに乗る。
+    let items = [ item "b" 1000.0 1 ]
+    let edges = [ keyedEdge None (Map.ofList [ "a", "k"; "b", "k" ]) ]
+
+    let plan workMem =
+        expectSome "DP の計画" (JoinOrder.selingerPlan 1000.0 32.0 (Set.singleton "a") None workMem edges items Map.empty)
+
+    let unlimited = plan -1.0
+    let spilled = Analyzer.spilledBuildRows 1000.0 32.0 1024.0
+    let expected = unlimited.Cost + spilled * 2.0 + float Spill.Partitions * 8.0
+    Assert.Equal(expected, (plan 1024.0).Cost, 3)

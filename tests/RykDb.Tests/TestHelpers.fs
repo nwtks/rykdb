@@ -424,6 +424,13 @@ let colStats
         Min = minValue
         Max = maxValue
         Histogram = []
+        Mcv = []
+    }
+
+/// 頻出値付きの列統計。
+let colStatsMcv (name: string) (ndv: int64) (nulls: int64) (mcv: (string * int64) list) : ColumnStats =
+    { colStats name ndv nulls None None with
+        Mcv = mcv
     }
 
 /// ヒストグラム付きの列統計。
@@ -455,6 +462,8 @@ let tableStats (table: string) (rows: int64) (columns: ColumnStats list) (indexe
         Columns = columns
         Indexes = indexes
         AnalyzedAt = None
+        Changes = 0L
+        RowBytes = 0.0
     }
 
 /// 共有のテスト用テーブルスキーマ。
