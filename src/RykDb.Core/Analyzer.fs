@@ -348,10 +348,6 @@ module internal Analyzer =
         + (types
            |> Seq.sumBy (fun dt -> float (dt |> Option.map dataTypeBytes |> Option.defaultValue 16)))
 
-    /// スキーマ 1行の管理メモリ概算。
-    let rowBytesOfSchema (schema: Schema) =
-        rowBytesOfTypes (schema.Columns |> Seq.map _.DataType)
-
     /// ハッシュ結合の build 側が作業メモリを超えるときに、ディスクへ退避する行数。
     /// 実際の退避はパーティション単位なので、はみ出した割合で近似する。
     /// `workMemBytes < 0` は無制限。
@@ -369,16 +365,6 @@ module internal Analyzer =
     /// 同じテーブル対の複合等値は、索引 prefix NDV があればそれを使う。
     /// `Some` は「その結合でどれだけ行が減るか」、`None` は統計なし。
     let joinSelectivity (statsOf: string -> TableStats option) (on: Expr) =
-        let equalities =
-            Predicate.splitConjuncts on
-            |> List.choose (fun conjunct ->
-                match conjunct with
-                | Expr.Binary(BinaryOp.Eq, a, b) ->
-                    match qualifierOf a, qualifierOf b with
-                    | Some qa, Some qb when not (Catalog.eqName qa qb) -> Some conjunct
-                    | _ -> None
-                | _ -> None)
-
         let sameSet a b =
             List.length a = List.length b
             && a |> List.forall (fun x -> b |> List.exists (SqlName.equal x))
@@ -448,10 +434,17 @@ module internal Analyzer =
                     if List.isEmpty known then
                         None
                     else
-                        Some((known |> List.fold (*) 1.0) * (0.1 ** float unknown))
+                        Some((known |> List.fold (*) 1.0) * 0.1 ** float unknown)
 
         let groups =
-            equalities
+            Predicate.splitConjuncts on
+            |> List.choose (fun conjunct ->
+                match conjunct with
+                | Expr.Binary(BinaryOp.Eq, a, b) ->
+                    match qualifierOf a, qualifierOf b with
+                    | Some qa, Some qb when not (Catalog.eqName qa qb) -> Some conjunct
+                    | _ -> None
+                | _ -> None)
             |> List.choose (fun conjunct ->
                 match conjunct with
                 | Expr.Binary(BinaryOp.Eq, a, b) ->

@@ -323,7 +323,7 @@ module internal DmlOps =
 
         match col.Constraint.Default with
         | Some d ->
-            Eval.eval Schema.empty [||] d
+            Eval.eval Schema.Empty [||] d
             >>= fun value -> SqlValue.coerce col.DataType value
         | None -> ret SqlValue.Null
 
@@ -423,7 +423,7 @@ module internal DmlOps =
     let private insertRow
         (ctx: ExecContext)
         (schema: TableSchema)
-        (checks: ForeignKey.ChildCheck list)
+        (checks: ChildCheck list)
         (txn: Transaction)
         (row: SqlValue array)
         =
@@ -439,7 +439,7 @@ module internal DmlOps =
     /// DEFAULT / NULL の充足と型強制はここで行う。
     /// TableSchema.validateRow が NOT NULL と列数を最終確認する（型は`SqlValue.coerce`で強制済み）。
     let insert (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (rows: Expr list list) =
-        let evalConstant = Eval.eval Schema.empty [||]
+        let evalConstant = Eval.eval Schema.Empty [||]
 
         let widthMismatch expected provided =
             sprintf "INSERT の列数(%d)と値の数(%d)が合いません" expected provided
@@ -701,7 +701,7 @@ module internal DmlOps =
         let targetSchema = targetSchemaOf schema
         let resolve = Eval.prepare targetSchema (Option.toList where)
 
-        let deleteMask (checks: ForeignKey.ParentDeleteCheck list) =
+        let deleteMask checks =
             let width = schema.Columns.Length
             let allColumns = Array.create width true
             let mask = Array.create width false

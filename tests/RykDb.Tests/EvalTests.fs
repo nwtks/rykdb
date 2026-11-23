@@ -519,7 +519,7 @@ let ``Eval.eval: IS TRUE / FALSE / UNKNOWN`` () =
 
 [<Fact>]
 let ``Eval.eval: CAST は TEXT から数値・BOOLEAN へ変換できる`` () =
-    let ev e = Eval.eval Schema.empty [||] e
+    let ev e = Eval.eval Schema.Empty [||] e
 
     Assert.Equal(SqlValue.Int 42L, ok (ev (Expr.Cast(Expr.Literal(Literal.String "42"), DataType.Integer))))
     Assert.Equal(SqlValue.Real 1.5, ok (ev (Expr.Cast(Expr.Literal(Literal.String "1.5"), DataType.Real))))
@@ -535,4 +535,4 @@ let ``Eval.eval: CAST は TEXT から数値・BOOLEAN へ変換できる`` () =
 
 [<Fact>]
 let ``Eval.eval: DEFAULT は INSERT 以外でエラー`` () =
-    expectErrorKind ErrorKind.SyntaxError "DEFAULT 単体" (Eval.eval Schema.empty [||] Expr.Default)
+    expectErrorKind ErrorKind.SyntaxError "DEFAULT 単体" (Eval.eval Schema.Empty [||] Expr.Default)

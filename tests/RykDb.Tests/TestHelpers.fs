@@ -397,7 +397,7 @@ let outCol (name: string) (qualifier: string option) (dataType: DataType option)
 
 /// 出力スキーマ（列のリストだけ指定して `Schema.empty` を敷く）。
 let outSchema (cols: OutputColumn list) =
-    { Schema.empty with
+    { Schema.Empty with
         Columns = cols |> List.toArray
     }
 

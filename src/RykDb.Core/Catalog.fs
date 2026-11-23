@@ -141,16 +141,6 @@ module internal Catalog =
             Stats = c.Stats |> List.filter (fun s -> not (eqName s.Table table))
         }
 
-    /// 列の統計を探す。
-    let findColumnStats (table: string) (column: string) (c: Catalog) =
-        findStats table c
-        |> Option.bind (fun s -> s.Columns |> List.tryFind (fun col -> eqName col.Name column))
-
-    /// 索引の統計を探す。
-    let findIndexStats (table: string) (index: string) (c: Catalog) =
-        findStats table c
-        |> Option.bind (fun s -> s.Indexes |> List.tryFind (fun idx -> eqName idx.Name index))
-
     /// テーブルを追加（同名があれば置き換える）。
     let addTable (t: TableDefinition) (c: Catalog) =
         { c with
@@ -855,7 +845,7 @@ type internal Schema =
     }
 
 module internal Schema =
-    let empty = { Columns = [||]; Tables = [] }
+    let Empty = { Columns = [||]; Tables = [] }
 
     /// 横連結（JOIN 用）。
     let concat (schema: Schema) (other: Schema) =
@@ -877,7 +867,7 @@ module internal Schema =
             }
 
     /// スキーマ列を左から連結する（FROM / JOIN の出力スキーマ組み立て）。
-    let concatAll = List.fold concat empty
+    let concatAll = List.fold concat Empty
 
     /// `*` / `t.*` が表す出力列を展開する。
     /// どちらもなければ None。
@@ -969,70 +959,6 @@ module internal Schema =
             |> DbError.name
             |> err
 
-    /// 射影後の列（名前・修飾子・型）を作る。
-    /// `SELECT *` は入力の列名をそのまま、`t.*` は修飾つきの表示名にする（元の挙動）。
-    /// `SELECT id` は式を表示し、別名があればそれを使う。
-    /// <remarks>
-    /// 入力スキーマのヘッダをそのまま返すと `SELECT id` が `people.id` になるので、
-    /// 射影後の名前を組み立て直す必要がある。
-    /// 型は「直接の列参照」だけ引き継ぐ（式の型推論はしない）。
-    /// 派生テーブル（FROM のサブクエリ）の列型が None だとハッシュ結合のキーにできないため、
-    /// `SELECT id, v AS x FROM t` や `SELECT *` のような形では型を残す。
-    /// </remarks>
-    let internal projectedColumns (useDisplayName: bool) (schema: Schema) =
-        let referenced e =
-            match tryAsColumnRef e with
-            | Some c ->
-                match resolve c schema with
-                | Ok i -> Some schema.Columns.[i]
-                | Error _ -> None
-            | None -> None
-
-        let column name e =
-            {
-                Name = name
-                Qualifier = None
-                DataType = referenced e |> Option.bind (fun c -> c.DataType)
-            }
-
-        function
-        | [] -> schema.Columns
-        | items ->
-            items
-            |> List.collect (fun item ->
-                match expandStar item.Expression schema with
-                | Some(qualified, columns) ->
-                    columns
-                    |> List.map (fun c ->
-                        {
-                            Name = if qualified then c.Display else c.Name
-                            Qualifier = None
-                            DataType = c.DataType
-                        })
-                | None ->
-                    match item.Alias with
-                    | Some a -> [ column a item.Expression ]
-                    | None ->
-                        match if useDisplayName then None else referenced item.Expression with
-                        | Some c ->
-                            [
-                                {
-                                    Name = c.Name
-                                    Qualifier = None
-                                    DataType = c.DataType
-                                }
-                            ]
-                        | None -> [ column (Expr.toDisplayString item.Expression) item.Expression ])
-            |> List.toArray
-
-    /// 射影後の列（結果表示用の名前）。
-    let projectColumns = projectedColumns true
-
-    /// 射影後の列（参照用の名前）。
-    /// `SELECT t.id` の列名を `t.id` ではなく `id` にする。
-    /// 派生テーブルの列名に使う（外側から `x.id` で引けるようにするため）。
-    let referenceColumns = projectedColumns false
-
 /// SELECT の射影（出力式とヘッダ）を 1回の展開でまとめたもの。
 /// `Ops.project`（行の値）と `Plan` のヘッダが同じ展開用スキーマ（論理 = FROM 順）を共有し、
 /// 「ヘッダの列数と行の幅がずれる」不変条件違反を防ぐ。
@@ -1062,12 +988,68 @@ module internal SelectProjection =
                         })
             | None -> [ item.Expression ])
 
+    /// 射影後の列（名前・修飾子・型）を作る。
+    /// `SELECT *` は入力の列名をそのまま、`t.*` は修飾つきの表示名にする（元の挙動）。
+    /// `SELECT id` は式を表示し、別名があればそれを使う。
+    /// <remarks>
+    /// 入力スキーマのヘッダをそのまま返すと `SELECT id` が `people.id` になるので、
+    /// 射影後の名前を組み立て直す必要がある。
+    /// 型は「直接の列参照」だけ引き継ぐ（式の型推論はしない）。
+    /// 派生テーブル（FROM のサブクエリ）の列型が None だとハッシュ結合のキーにできないため、
+    /// `SELECT id, v AS x FROM t` や `SELECT *` のような形では型を残す。
+    /// </remarks>
+    let private projectedColumns (useDisplayName: bool) (schema: Schema) =
+        let referenced e =
+            match Schema.tryAsColumnRef e with
+            | Some c ->
+                match Schema.resolve c schema with
+                | Ok i -> Some schema.Columns.[i]
+                | Error _ -> None
+            | None -> None
+
+        let column name e =
+            {
+                Name = name
+                Qualifier = None
+                DataType = referenced e |> Option.bind (fun c -> c.DataType)
+            }
+
+        function
+        | [] -> schema.Columns
+        | items ->
+            items
+            |> List.collect (fun item ->
+                match Schema.expandStar item.Expression schema with
+                | Some(qualified, columns) ->
+                    columns
+                    |> List.map (fun c ->
+                        {
+                            Name = if qualified then c.Display else c.Name
+                            Qualifier = None
+                            DataType = c.DataType
+                        })
+                | None ->
+                    match item.Alias with
+                    | Some a -> [ column a item.Expression ]
+                    | None ->
+                        match if useDisplayName then None else referenced item.Expression with
+                        | Some c ->
+                            [
+                                {
+                                    Name = c.Name
+                                    Qualifier = None
+                                    DataType = c.DataType
+                                }
+                            ]
+                        | None -> [ column (Expr.toDisplayString item.Expression) item.Expression ])
+            |> List.toArray
+
     /// 射影を組み立てる。
     /// 空の `items` は「入力スキーマをそのまま出力」を表す。
     let create (schema: Schema) (items: SelectItem list) =
         {
             SelectItems = items
             Expressions = expressionsOf schema items
-            DisplayHeader = Schema.projectedColumns true schema items
-            ReferenceHeader = Schema.projectedColumns false schema items
+            DisplayHeader = projectedColumns true schema items
+            ReferenceHeader = projectedColumns false schema items
         }

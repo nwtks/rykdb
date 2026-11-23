@@ -12,45 +12,45 @@
 
 namespace RykDb.Core
 
+/// 子行の外部キー検査の準備結果。
+/// 文単位で 1回だけ準備し、行ごとに使い回す
+/// （親スキーマ・列位置・mask を行ごとに作り直さない）。
+type internal ChildCheck =
+    {
+        /// 外部キー定義（列名・親テーブル）。
+        Definition: ForeignKeyDefinition
+        /// 子行から外部キーの値を取り出す位置。
+        ChildPositions: int list
+        /// 親テーブルの実行用スキーマ。
+        Parent: TableSchema
+        /// 存在確認だけに使う mask（全列 false）。
+        ProbeMask: bool array
+    }
+
+/// 親行の削除を止める子側の参照検査。
+/// 文単位で 1回だけ準備し、削除行ごとに使い回す
+/// （子スキーマ・列位置・mask を行ごとに作り直さない）。
+type internal ParentDeleteCheck =
+    {
+        /// 子テーブル（索引を載せた実行用スキーマ）。
+        Child: TableSchema
+        /// 子が参照している親の列名（エラーメッセージ用）。
+        ParentColumns: string list
+        /// 親行から参照値を取り出す位置。
+        ParentPositions: int list
+        /// 外部キーの列が前置になっている索引（あれば）。
+        Index: IndexSchema option
+        /// 外部キーの列が子の主キーと同順か。
+        PrimaryKeyMatches: bool
+        /// 存在確認だけに使う mask（全列 false）。
+        ProbeMask: bool array
+        /// 子の全走査で使う mask（外部キー列 + 主キー）。
+        ScanMask: bool array
+        /// 子行から外部キーの値を取り出す位置。
+        ChildPositions: int list
+    }
+
 module internal ForeignKey =
-    /// 子行の外部キー検査の準備結果。
-    /// 文単位で 1回だけ準備し、行ごとに使い回す
-    /// （親スキーマ・列位置・mask を行ごとに作り直さない）。
-    type internal ChildCheck =
-        {
-            /// 外部キー定義（列名・親テーブル）。
-            Definition: ForeignKeyDefinition
-            /// 子行から外部キーの値を取り出す位置。
-            ChildPositions: int list
-            /// 親テーブルの実行用スキーマ。
-            Parent: TableSchema
-            /// 存在確認だけに使う mask（全列 false）。
-            ProbeMask: bool array
-        }
-
-    /// 親行の削除を止める子側の参照検査。
-    /// 文単位で 1回だけ準備し、削除行ごとに使い回す
-    /// （子スキーマ・列位置・mask を行ごとに作り直さない）。
-    type internal ParentDeleteCheck =
-        {
-            /// 子テーブル（索引を載せた実行用スキーマ）。
-            Child: TableSchema
-            /// 子が参照している親の列名（エラーメッセージ用）。
-            ParentColumns: string list
-            /// 親行から参照値を取り出す位置。
-            ParentPositions: int list
-            /// 外部キーの列が前置になっている索引（あれば）。
-            Index: IndexSchema option
-            /// 外部キーの列が子の主キーと同順か。
-            PrimaryKeyMatches: bool
-            /// 存在確認だけに使う mask（全列 false）。
-            ProbeMask: bool array
-            /// 子の全走査で使う mask（外部キー列 + 主キー）。
-            ScanMask: bool array
-            /// 子行から外部キーの値を取り出す位置。
-            ChildPositions: int list
-        }
-
     /// 大文字小文字を無視した列名リストの一致。
     let private sameNames (a: string list) (b: string list) =
         a.Length = b.Length && List.forall2 SqlName.equal a b

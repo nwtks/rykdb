@@ -92,17 +92,6 @@ let ``Binder.qualify: 全ノード種を qualify しても構造が保たれる`
         Assert.Equal<string>(Expr.toDisplayString expected, Expr.toDisplayString (ok (Binder.qualify schema input)))
 
 [<Fact>]
-let ``Predicate.splitConjuncts: AND を平坦化して分割する`` () =
-    let e =
-        Expr.Binary(BinaryOp.And, Expr.Binary(BinaryOp.And, pCol "id", pCol "age"), pCol "name")
-
-    let parts = Predicate.splitConjuncts e
-
-    Assert.Equal<int>(3, parts.Length)
-    Assert.True(Binder.referencesOnly "people" parts.[0])
-    Assert.True(Binder.referencesOnly "people" parts.[1])
-
-[<Fact>]
 let ``Predicate.joinConjuncts: split した conjunct を AND で戻せる`` () =
     let e = Expr.Binary(BinaryOp.And, pCol "id", pCol "age")
     let parts = Predicate.splitConjuncts e

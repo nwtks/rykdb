@@ -8,6 +8,14 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
+let private ofKeys count rate keys =
+    let bloom = BloomFilter.BloomBuilder(count, rate)
+
+    for k in keys do
+        bloom.Add k
+
+    bloom.Build()
+
 [<Fact>]
 let ``BloomFilter.ofKeys: ビット数は必ず 8 の倍数でビット配列と一致する`` () =
     // bitCount が 8 の倍数でないと `positionAt` が bits の範囲外を指す
@@ -15,7 +23,7 @@ let ``BloomFilter.ofKeys: ビット数は必ず 8 の倍数でビット配列と
     for expectedCount in [ -3; 0; 1; 2; 7; 100; 1_000; 10_000 ] do
         for rate in [ 0.01; 0.25; 0.5; 0.9 ] do
             let keys = Array.init (max 0 expectedCount) intKey
-            let filter = BloomFilter.ofKeys expectedCount rate keys
+            let filter = ofKeys expectedCount rate keys
 
             let label =
                 sprintf "count=%d rate=%.2f bitCount=%d" expectedCount rate filter.BitCount
@@ -39,7 +47,7 @@ let ``BloomFilter.ofKeys: ビット数は必ず 8 の倍数でビット配列と
 [<Fact>]
 let ``BloomFilter: ビット配列は 1ビット = 1ビットで保持する`` () =
     let keys = Array.init 1_000 intKey
-    let filter = BloomFilter.ofKeys keys.Length 0.01 keys
+    let filter = ofKeys keys.Length 0.01 keys
 
     Assert.True(filter.BitCount > 0)
     Assert.Equal(0, filter.BitCount % 8)
@@ -49,7 +57,7 @@ let ``BloomFilter: ビット配列は 1ビット = 1ビットで保持する`` (
 let ``BloomFilter.mightContain: 追加したキーはすべて maybe present`` () =
     let n = 2_000
     let keys = Array.init n intKey
-    let filter = BloomFilter.ofKeys n 0.01 keys
+    let filter = ofKeys n 0.01 keys
 
     for k in keys do
         let h = Hashing.hashBytes k |> Hashing.mix
@@ -60,7 +68,7 @@ let ``BloomFilter.mightContain: 追加していないキーはほぼ「なし」
     let n = 1_000
     let p = 0.01
     let keys = Array.init n intKey
-    let filter = BloomFilter.ofKeys n p keys
+    let filter = ofKeys n p keys
 
     // 別キー群を用意して、誤検出率が設計値を下回ることを確認する
     let others = Array.init 2_000 (fun i -> intKey (i + 10_000_000))
@@ -75,7 +83,7 @@ let ``BloomFilter.mightContain: 追加していないキーはほぼ「なし」
 
 [<Fact>]
 let ``BloomFilter.mightContain: 空のフィルタは何も含まない`` () =
-    let filter = BloomFilter.ofKeys 0 0.01 []
+    let filter = ofKeys 0 0.01 []
     Assert.Equal(0, filter.Count)
 
     for i in 0..99 do
@@ -85,7 +93,7 @@ let ``BloomFilter.mightContain: 空のフィルタは何も含まない`` () =
 [<Fact>]
 let ``BloomFilter.serialize / deserialize: 直列化の往復`` () =
     let keys = Array.init 5_000 intKey
-    let filter = BloomFilter.ofKeys 5_000 0.01 keys
+    let filter = ofKeys 5_000 0.01 keys
     let restored = ok (BloomFilter.deserialize (BloomFilter.serialize filter))
     Assert.Equal(filter.Count, restored.Count)
     Assert.Equal(filter.HashCount, restored.HashCount)
@@ -97,8 +105,8 @@ let ``BloomFilter.serialize / deserialize: 直列化の往復`` () =
 [<Fact>]
 let ``BloomFilter.serialize / deserialize: 直列化は決定的で、往復後も同じバイト列になる`` () =
     let keys = Array.init 500 intKey
-    let a = BloomFilter.serialize (BloomFilter.ofKeys 500 0.01 keys)
-    let b = BloomFilter.serialize (BloomFilter.ofKeys 500 0.01 keys)
+    let a = BloomFilter.serialize (ofKeys 500 0.01 keys)
+    let b = BloomFilter.serialize (ofKeys 500 0.01 keys)
     Assert.Equal<byte array>(a, b)
 
     // 往復してからもう一度直列化しても同じ結果（メタデータの欠落がない）

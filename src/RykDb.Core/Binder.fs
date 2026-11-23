@@ -45,39 +45,6 @@ module internal Binder =
     let qualifyMany (schema: Schema) =
         List.map (fun e -> qualify schema e) >> all
 
-    /// 式が指定したテーブルの列だけを参照しているか。
-    /// 修飾子のない列はどのテーブル由来か特定できないため、false とする
-    /// （曖昧な列を誤って pushdown しないため）。
-    let referencesOnly (table: string) =
-        let lower = table.ToLowerInvariant()
-
-        Expr.columnRefs
-        >> List.map (fun c ->
-            match c.Qualifier with
-            | Some q -> (q + "." + c.Name).ToLowerInvariant()
-            | None -> c.Name.ToLowerInvariant())
-        >> List.forall (fun full ->
-            match full.LastIndexOf '.' with
-            | -1 -> false
-            | i -> full.[0 .. i - 1] = lower)
-
-    /// 修飾子なしの列が、結合後スキーマで複数テーブルにまたがって存在するか。
-    /// そのような式はどのテーブルにも pushdown してはいけない
-    /// （各テーブルで個別に評価すると、曖昧エラーにならず意味が変わる）。
-    let hasAmbiguousColumn (schema: Schema) =
-        Expr.fold
-            (fun acc x ->
-                match x with
-                | Expr.Column { Qualifier = None; Name = n } -> n :: acc
-                | Expr.Name n -> n :: acc
-                | _ -> acc)
-            []
-        >> List.exists (fun name ->
-            schema.Columns
-            |> Array.filter (fun (c: OutputColumn) -> Catalog.eqName c.Name name)
-            |> Array.length
-            |> fun count -> count > 1)
-
 /// SELECT 項目の別名。
 /// 別名を ORDER BY / GROUP BY / HAVING で参照できるようにするために使う。
 module internal Alias =

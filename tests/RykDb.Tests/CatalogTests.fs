@@ -406,36 +406,6 @@ let ``Schema.resolve: 修飾子の無い列名が曖昧ならエラー`` () =
     Assert.Equal(1, ok (Schema.resolve { Qualifier = Some "b"; Name = "id" } schema))
 
 [<Fact>]
-let ``Schema.projectColumns: * は入力列名`` () =
-    let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
-
-    let h =
-        Schema.projectColumns s [ { Expression = Expr.Star; Alias = None } ]
-        |> Array.map (fun c -> c.Display)
-
-    Assert.Equal<string array>([| "id" |], h)
-
-[<Fact>]
-let ``Schema.projectColumns: 空なら入力ヘッダ / t.* は修飾つき`` () =
-    let s = outSchema [ outCol "id" (Some "t") (Some DataType.Integer) ]
-    // 射影が空なら入力スキーマのヘッダをそのまま返す
-    Assert.Equal<string array>([| "t.id" |], Schema.projectColumns s [] |> Array.map (fun c -> c.Display))
-
-    // t.* は修飾つきの表示名で出す
-    let h =
-        Schema.projectColumns
-            s
-            [
-                {
-                    Expression = Expr.QualifiedStar "t"
-                    Alias = None
-                }
-            ]
-        |> Array.map (fun c -> c.Display)
-
-    Assert.Equal<string array>([| "t.id" |], h)
-
-[<Fact>]
 let ``SelectProjection: ヘッダと式の列数が一致する`` () =
     let items =
         [

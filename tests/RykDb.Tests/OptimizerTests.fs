@@ -181,7 +181,7 @@ let ``Optimizer.explain: 論理木を 1行 1ノードで表示する`` () =
 
         Assert.Equal<string list>(
             [ "Project(*)"; "  Filter((people.age > 30))"; "    Scan(people, SeqScan)" ],
-            Optimizer.explain ctx tree Schema.empty
+            Optimizer.explain ctx tree Schema.Empty
         ))
 
 [<Fact>]
@@ -211,5 +211,5 @@ let ``Optimizer.explain: 結合アルゴリズムも表示する`` () =
                 "    Scan(people, SeqScan)"
                 "    Scan(orders, SeqScan)"
             ],
-            Optimizer.explain ctx tree Schema.empty
+            Optimizer.explain ctx tree Schema.Empty
         ))

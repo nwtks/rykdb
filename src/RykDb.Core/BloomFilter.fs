@@ -42,7 +42,7 @@ module internal BloomFilter =
         int ((h1 + uint64 i * step) % uint64 bitCount)
 
     /// キー列から filter を構築する（ハッシュはキーから導出）。
-    let ofKeys (expectedCount: int) (falsePositiveRate: float) =
+    let private ofKeys (expectedCount: int) (falsePositiveRate: float) =
         let bitsFor expectedCount falsePositiveRate =
             if expectedCount <= 0 then
                 8

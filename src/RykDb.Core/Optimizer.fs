@@ -144,7 +144,7 @@ module internal Optimizer =
                 let suffix = if star then "*" else Expr.toDisplayString arg
                 column (sprintf "%s(%s)" f.Name suffix))
 
-        { Schema.empty with
+        { Schema.Empty with
             Columns = Array.append (List.toArray groupColumns) (List.toArray aggColumns)
         }
 
@@ -155,7 +155,7 @@ module internal Optimizer =
         | Logical.Derived plan -> plan.Output
         | Logical.UnionAll(plan :: _) -> plan.Output
         | Logical.Scan(name, _) -> Schema.ofTable name None (defaultSchema ctx name)
-        | Logical.Values _ -> Schema.empty
+        | Logical.Values _ -> Schema.Empty
         | _ -> inSchema
 
     /// 出力スキーマを求める作業項目。
@@ -186,7 +186,7 @@ module internal Optimizer =
                 outputSchema ctx inSchema (Schema.concat acc (Schema.ofTable name None (defaultSchema ctx name))) rest
 
     let private outputOf (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
-        outputSchema ctx inSchema Schema.empty [ SchemaOf tree ]
+        outputSchema ctx inSchema Schema.Empty [ SchemaOf tree ]
 
     /// 出力スキーマのメモ。実行・EXPLAIN の 1回分だけ使う。
     /// `Logical` は参照等価で、ノード参照は木の中で一意なので文脈はキーに含めない
@@ -237,12 +237,7 @@ module internal Optimizer =
                 NeedNode left :: NeedNode right :: PutJoin(node, left, right) :: rest
 
     /// 作業項目 1つを処理し、残りの作業リストを返す。
-    let private processOutputJob
-        (ctx: ExecContext)
-        (inSchema: Schema)
-        (memo: OutputSchemaMemo)
-        (rest: OutputJob list)
-        =
+    let private processOutputJob (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (rest: OutputJob list) =
         function
         | NeedNode node -> processNeedNode ctx inSchema memo node rest
         | PutWrapper(parent, child) ->
@@ -879,6 +874,9 @@ module internal Optimizer =
 
             sprintf "%s %s" (Expr.toDisplayString k.Expression) direction
 
+        let rowBytesOfSchema schema =
+            Analyzer.rowBytesOfTypes (schema.Columns |> Seq.map _.DataType)
+
         let describe item =
             match item.Tree with
             | Logical.Scan(name, method) ->
@@ -941,9 +939,9 @@ module internal Optimizer =
 
                         let buildRowBytes =
                             if leftRows < rightRows then
-                                Analyzer.rowBytesOfSchema leftSchema
+                                rowBytesOfSchema leftSchema
                             else
-                                Analyzer.rowBytesOfSchema rightSchema
+                                rowBytesOfSchema rightSchema
 
                         let spilled =
                             Analyzer.spilledBuildRows

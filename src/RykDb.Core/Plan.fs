@@ -311,7 +311,7 @@ module internal Plan =
 
                         return c2, Schema.concat acc (Schema.ofTable realName r.Alias schema)
                     })
-            (ctx, Schema.empty)
+            (ctx, Schema.Empty)
 
     /// FROM / JOIN の派生テーブルを計画する（CPS、実行はしない）。
     /// AST の `Derived` は実テーブル参照（別名）へ書き換え、
@@ -727,7 +727,7 @@ module internal Plan =
                             let currentSchema =
                                 match scopes with
                                 | s :: _ -> s.Schema
-                                | [] -> Schema.empty
+                                | [] -> Schema.Empty
 
                             let resolve = Eval.prepare currentSchema [ left ]
 
@@ -790,7 +790,7 @@ module internal Plan =
         resolveExprC runSubquery [ { Schema = schema; Row = None } ] ret ctx
 
     /// DML の式に含まれるサブクエリを解決する（対象行のスキーマなし）。
-    let resolveDmlExpr = resolveDmlExprWith Schema.empty
+    let resolveDmlExpr = resolveDmlExprWith Schema.Empty
 
     /// 外側スコープなしで SELECT を計画・実行する（CPS）。
     let private planSelectC (k: (Schema * Op) -> Result<'r, DbError>) (ctx: ExecContext) (stmt: SelectStatement) =

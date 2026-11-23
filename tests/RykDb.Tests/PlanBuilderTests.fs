@@ -100,7 +100,7 @@ let ``PlanBuilder.buildLogicalWith: FROM のサブクエリは Logical.Derived �
                             |]
                         Tables = [ "x" ]
                     }
-                Header = Schema.empty
+                Header = Schema.Empty
                 Input = Schema.ofTable "people" None peopleSchema
                 Context = ctx
                 Tree = Logical.Scan("people", ScanMethod.SeqScan)

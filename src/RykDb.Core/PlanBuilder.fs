@@ -168,7 +168,7 @@ module internal PlanBuilder =
         | Expr.Literal(Literal.Int i) when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
         | e when Expr.hasCorrelated e -> sprintf "%s に相関サブクエリは使えません" what |> DbError.create ErrorKind.SyntaxError |> err
         | e ->
-            Eval.eval Schema.empty [||] e
+            Eval.eval Schema.Empty [||] e
             >>= function
                 | SqlValue.Int i when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
                 | SqlValue.Int _ ->

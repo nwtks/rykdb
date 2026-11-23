@@ -48,7 +48,7 @@ module internal Ops =
     /// スロット参照だけを列に持つスキーマ（列位置 = スロット番号）。
     /// 置換後に残った列参照はここで解決できず、構築時の `checkPrepared` が NameError にする。
     let private slotSchema (width: int) =
-        { Schema.empty with
+        { Schema.Empty with
             Columns =
                 Array.init width (fun i ->
                     {

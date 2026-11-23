@@ -983,7 +983,7 @@ module internal ExecState =
     let private addedColumnValue (col: ColumnDefinition) =
         match col.Constraint.Default with
         | Some d ->
-            Eval.eval Schema.empty [||] d
+            Eval.eval Schema.Empty [||] d
             >>= fun value -> SqlValue.coerce col.DataType value
         | None -> ret SqlValue.Null
 
