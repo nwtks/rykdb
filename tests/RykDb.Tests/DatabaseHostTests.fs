@@ -482,11 +482,14 @@ let ``DatabaseHost: DDL のカタログ保存後も Manager の採番は保存�
 [<Fact>]
 let ``DatabaseHost: background compaction の install 後も書き込み文が削除済みファイルを踏まない`` () =
     withDir "host-bg-install" (fun dir ->
+        let releaseCompaction = new System.Threading.ManualResetEventSlim false
+
         let store =
             ok (
                 RowStore.openStoreWithOptions
                     { RowStoreOptions.Background with
                         MemLimitBytes = Some 1
+                        ScanHook = Some(fun _ -> releaseCompaction.Wait 30000 |> ignore)
                     }
                     dir
             )
@@ -510,6 +513,8 @@ let ``DatabaseHost: background compaction の install 後も書き込み文が�
             let committedNumbers =
                 fileNumbers host.Committed.Store.Engine.PublishedState.Version
 
+            releaseCompaction.Set()
+
             waitFor "compaction が install されません" (fun () ->
                 let removed =
                     Set.difference committedNumbers (fileNumbers coordinator.Current.Version)
@@ -523,6 +528,7 @@ let ``DatabaseHost: background compaction の install 後も書き込み文が�
             let _, result = ok (execSql session "UPDATE t SET v = 'x'")
             Assert.Equal(4, result.RowsAffected)
         finally
+            releaseCompaction.Set()
             session.Close() |> ignore)
 
 [<Fact>]

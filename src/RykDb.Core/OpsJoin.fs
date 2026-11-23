@@ -557,6 +557,79 @@ module internal OpsJoin =
                             ret (spool, next')
             | Error e -> err e
 
+    /// 開始状態の側を 1行先読みして次へ進む。
+    let private advanceMergeSide (next: MergeSide -> Op) (side: MergeSide) =
+        Op.compute (fun () ->
+            match ensureMergeSide side with
+            | DbErr e -> OpStep.OpError e
+            | DbOk advanced -> Op.next (next advanced))
+
+    /// 左側を 1行進める（LEFT JOIN なら現在行を NULL 拡張して出す）。
+    let private advanceMergeLeft
+        (isLeft: bool)
+        (padded: SqlValue array -> SqlValue array)
+        (loop: MergeSide -> MergeSide -> Op)
+        (lside: MergeSide)
+        (rside: MergeSide)
+        (lrow: SqlValue array)
+        =
+        Op.compute (fun () ->
+            match pullMergeSide lside with
+            | DbErr e -> OpStep.OpError e
+            | DbOk lnext ->
+                if isLeft then
+                    OpStep.OpRow(padded lrow, loop lnext rside)
+                else
+                    Op.next (loop lnext rside))
+
+    /// 右側を 1行進める。
+    let private advanceMergeRight (loop: MergeSide -> MergeSide -> Op) (lside: MergeSide) (rside: MergeSide) =
+        Op.compute (fun () ->
+            match pullMergeSide rside with
+            | DbErr e -> OpStep.OpError e
+            | DbOk rnext -> Op.next (loop lside rnext))
+
+    /// キーが等しい行のグループを両側から取り出して交叉結合へ渡す。
+    let private emitMergeGroup
+        (budget: MemoryBudget)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (emitGroup: Spill.RowSpool -> Spill.RowSpool -> MergeSide -> MergeSide -> Op)
+        (lside: MergeSide)
+        (rside: MergeSide)
+        =
+        match takeMergeGroup budget leftKeys lside with
+        | Error e -> Op.compute (fun () -> OpStep.OpError e)
+        | Ok(lgroup, lnext) ->
+            match takeMergeGroup budget rightKeys rside with
+            | Error e -> Op.compute (fun () -> OpStep.OpError e)
+            | Ok(rgroup, rnext) -> emitGroup lgroup rgroup lnext rnext
+
+    /// 両側に現在行があるときの 1ステップ（NULL キー・大小・等値を振り分ける）。
+    let private stepMerge
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (padded: SqlValue array -> SqlValue array)
+        (emitGroup: Spill.RowSpool -> Spill.RowSpool -> MergeSide -> MergeSide -> Op)
+        (loop: MergeSide -> MergeSide -> Op)
+        (lside: MergeSide)
+        (rside: MergeSide)
+        (lrow: SqlValue array)
+        (rrow: SqlValue array)
+        =
+        if hasNullKey lrow leftKeys then
+            advanceMergeLeft isLeft padded loop lside rside lrow
+        elif hasNullKey rrow rightKeys then
+            advanceMergeRight loop lside rside
+        else
+            match compareKeyVectors 0 leftKeys lrow rightKeys rrow with
+            | DbErr e -> Op.compute (fun () -> OpStep.OpError e)
+            | DbOk c when c < 0 -> advanceMergeLeft isLeft padded loop lside rside lrow
+            | DbOk c when c > 0 -> advanceMergeRight loop lside rside
+            | DbOk _ -> emitMergeGroup budget leftKeys rightKeys emitGroup lside rside
+
     /// マージ結合。両入力は結合キーで昇順に並んでいる必要がある
     /// （`Analyzer.chooseJoinAlgorithm` が走査の並び順を確認して選ぶ）。
     /// 右側を materialize せず、両側を 1行ずつ流す。
@@ -588,16 +661,8 @@ module internal OpsJoin =
 
         let rec loop lside rside =
             match lside, rside with
-            | MergeStart _, _ ->
-                Op.compute (fun () ->
-                    match ensureMergeSide lside with
-                    | DbErr e -> OpStep.OpError e
-                    | DbOk lnext -> Op.next (loop lnext rside))
-            | _, MergeStart _ ->
-                Op.compute (fun () ->
-                    match ensureMergeSide rside with
-                    | DbErr e -> OpStep.OpError e
-                    | DbOk rnext -> Op.next (loop lside rnext))
+            | MergeStart _, _ -> advanceMergeSide (fun lnext -> loop lnext rside) lside
+            | _, MergeStart _ -> advanceMergeSide (fun rnext -> loop lside rnext) rside
             | MergeDone, _ -> drain rside
             | _, MergeDone ->
                 if not isLeft then
@@ -611,44 +676,7 @@ module internal OpsJoin =
                             | DbOk lnext -> OpStep.OpRow(padded lrow, loop lnext MergeDone))
                     | _ -> Op.Empty
             | MergeAt(lrow, _), MergeAt(rrow, _) ->
-                if hasNullKey lrow leftKeys then
-                    Op.compute (fun () ->
-                        match pullMergeSide lside with
-                        | DbErr e -> OpStep.OpError e
-                        | DbOk lnext ->
-                            if isLeft then
-                                OpStep.OpRow(padded lrow, loop lnext rside)
-                            else
-                                Op.next (loop lnext rside))
-                elif hasNullKey rrow rightKeys then
-                    Op.compute (fun () ->
-                        match pullMergeSide rside with
-                        | DbErr e -> OpStep.OpError e
-                        | DbOk rnext -> Op.next (loop lside rnext))
-                else
-                    match compareKeyVectors 0 leftKeys lrow rightKeys rrow with
-                    | DbErr e -> Op.compute (fun () -> OpStep.OpError e)
-                    | DbOk c when c < 0 ->
-                        Op.compute (fun () ->
-                            match pullMergeSide lside with
-                            | DbErr e -> OpStep.OpError e
-                            | DbOk lnext ->
-                                if isLeft then
-                                    OpStep.OpRow(padded lrow, loop lnext rside)
-                                else
-                                    Op.next (loop lnext rside))
-                    | DbOk c when c > 0 ->
-                        Op.compute (fun () ->
-                            match pullMergeSide rside with
-                            | DbErr e -> OpStep.OpError e
-                            | DbOk rnext -> Op.next (loop lside rnext))
-                    | DbOk _ ->
-                        match takeMergeGroup budget leftKeys lside with
-                        | Error e -> Op.compute (fun () -> OpStep.OpError e)
-                        | Ok(lgroup, lnext) ->
-                            match takeMergeGroup budget rightKeys rside with
-                            | Error e -> Op.compute (fun () -> OpStep.OpError e)
-                            | Ok(rgroup, rnext) -> emitGroup lgroup rgroup lnext rnext
+                stepMerge isLeft budget leftKeys rightKeys padded emitGroup loop lside rside lrow rrow
 
         and emitGroup lspool rspool lnext rnext =
             match Spill.reopenKeep budget.Scope lspool with

@@ -208,44 +208,63 @@ module internal Optimizer =
         | PutWrapper of Logical * Logical
         | PutJoin of Logical * Logical * Logical
 
+    /// NeedNode 作業項目を処理する（子ノードを積むか、スキーマを確定する）。
+    let private processNeedNode
+        (ctx: ExecContext)
+        (inSchema: Schema)
+        (memo: OutputSchemaMemo)
+        (node: Logical)
+        (rest: OutputJob list)
+        =
+        match memo.TryFind node with
+        | Some _ -> rest
+        | None ->
+            match node with
+            | Logical.Scan _
+            | Logical.Values _
+            | Logical.Aggregate _
+            | Logical.Derived _
+            | Logical.UnionAll _ ->
+                memo.Add(node, baseSchemaOf ctx inSchema node)
+                rest
+            | Logical.Filter(_, child)
+            | Logical.Sort(_, child)
+            | Logical.Limit(_, _, child)
+            | Logical.Distinct child
+            | Logical.Having(_, _, _, child)
+            | Logical.Project(_, child) -> NeedNode child :: PutWrapper(node, child) :: rest
+            | Logical.Join(_, _, _, left, right) ->
+                NeedNode left :: NeedNode right :: PutJoin(node, left, right) :: rest
+
+    /// 作業項目 1つを処理し、残りの作業リストを返す。
+    let private processOutputJob
+        (ctx: ExecContext)
+        (inSchema: Schema)
+        (memo: OutputSchemaMemo)
+        (rest: OutputJob list)
+        =
+        function
+        | NeedNode node -> processNeedNode ctx inSchema memo node rest
+        | PutWrapper(parent, child) ->
+            match memo.TryFind child with
+            | Some schema -> memo.Add(parent, schema)
+            | None -> ()
+
+            rest
+        | PutJoin(parent, left, right) ->
+            match memo.TryFind left, memo.TryFind right with
+            | Some leftSchema, Some rightSchema -> memo.Add(parent, Schema.concat leftSchema rightSchema)
+            | _ -> ()
+
+            rest
+
     /// 部分木の全ノードの出力スキーマを後順で求め、メモに入れる。
     /// 明示スタックなので木の形に依存せずスタックは一定。
     let private fillOutputSchemas (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (root: Logical) =
-        let rec loop =
-            function
+        let rec loop jobs =
+            match jobs with
             | [] -> ()
-            | NeedNode node :: rest ->
-                match memo.TryFind node with
-                | Some _ -> loop rest
-                | None ->
-                    match node with
-                    | Logical.Scan _
-                    | Logical.Values _
-                    | Logical.Aggregate _
-                    | Logical.Derived _
-                    | Logical.UnionAll _ ->
-                        memo.Add(node, baseSchemaOf ctx inSchema node)
-                        loop rest
-                    | Logical.Filter(_, child)
-                    | Logical.Sort(_, child)
-                    | Logical.Limit(_, _, child)
-                    | Logical.Distinct child
-                    | Logical.Having(_, _, _, child)
-                    | Logical.Project(_, child) -> loop (NeedNode child :: PutWrapper(node, child) :: rest)
-                    | Logical.Join(_, _, _, left, right) ->
-                        loop (NeedNode left :: NeedNode right :: PutJoin(node, left, right) :: rest)
-            | PutWrapper(parent, child) :: rest ->
-                match memo.TryFind child with
-                | Some schema -> memo.Add(parent, schema)
-                | None -> ()
-
-                loop rest
-            | PutJoin(parent, left, right) :: rest ->
-                match memo.TryFind left, memo.TryFind right with
-                | Some leftSchema, Some rightSchema -> memo.Add(parent, Schema.concat leftSchema rightSchema)
-                | _ -> ()
-
-                loop rest
+            | job :: rest -> loop (processOutputJob ctx inSchema memo rest job)
 
         loop [ NeedNode root ]
 
@@ -380,6 +399,87 @@ module internal Optimizer =
         match stripWrappers tree with
         | Logical.Aggregate(groupBy, aggs, _) -> Some(groupBy, aggs)
         | _ -> None
+
+    /// 入れ子ループ結合を実行する。
+    let private execNestedLoopJoin (ctx: ExecContext) (frame: JoinFrame) (left: Op) (right: Op) =
+        match frame.Kind with
+        | JoinKind.Inner -> OpsJoin.innerJoin ctx.Budget frame.LeftSchema left frame.RightSchema right frame.On
+        | JoinKind.Left -> OpsJoin.leftJoin ctx.Budget frame.LeftSchema left frame.RightSchema right frame.On
+
+    /// ハッシュ結合を実行する（build 側と INNER/LEFT の組み合わせを振り分ける）。
+    let private execHashJoin (ctx: ExecContext) (frame: JoinFrame) (left: Op) (right: Op) =
+        match frame.Keys with
+        | None -> err (DbError.internalError "ハッシュ結合に結合キーがありません")
+        | Some keys ->
+            match frame.Kind with
+            | JoinKind.Inner ->
+                match frame.BuildSide with
+                | HashBuildLeft ->
+                    OpsJoin.innerJoinHashBuildLeft
+                        ctx.Budget
+                        frame.LeftSchema
+                        left
+                        keys.LeftIndices
+                        frame.RightSchema
+                        right
+                        keys.RightIndices
+                        keys.Residual
+                | HashBuildRight ->
+                    OpsJoin.innerJoinHash
+                        ctx.Budget
+                        frame.LeftSchema
+                        left
+                        keys.LeftIndices
+                        frame.RightSchema
+                        right
+                        keys.RightIndices
+                        keys.Residual
+            | JoinKind.Left ->
+                OpsJoin.leftJoinHash
+                    ctx.Budget
+                    frame.LeftSchema
+                    left
+                    keys.LeftIndices
+                    frame.RightSchema
+                    right
+                    keys.RightIndices
+                    keys.Residual
+
+    /// マージ結合を実行する。
+    let private execMergeJoin (ctx: ExecContext) (frame: JoinFrame) (left: Op) (right: Op) =
+        match frame.Keys with
+        | None -> err (DbError.internalError "マージ結合に結合キーがありません")
+        | Some keys ->
+            match frame.Kind with
+            | JoinKind.Inner ->
+                OpsJoin.innerJoinMerge
+                    ctx.Budget
+                    frame.LeftSchema
+                    left
+                    keys.LeftIndices
+                    frame.RightSchema
+                    right
+                    keys.RightIndices
+                    keys.Residual
+            | JoinKind.Left ->
+                OpsJoin.leftJoinMerge
+                    ctx.Budget
+                    frame.LeftSchema
+                    left
+                    keys.LeftIndices
+                    frame.RightSchema
+                    right
+                    keys.RightIndices
+                    keys.Residual
+
+    /// 結合アルゴリズムを選んで実行する。
+    let private execJoin (ctx: ExecContext) (frame: JoinFrame) (left: Op) (right: Op) =
+        match frame.Algorithm with
+        | JoinAlgorithm.NestedLoop -> execNestedLoopJoin ctx frame left right
+        | JoinAlgorithm.HashJoin -> execHashJoin ctx frame left right
+        | JoinAlgorithm.IndexNestedLoop _ ->
+            DbError.internalError "index nested loop は JoinIndexLeftFrame で実行します" |> err
+        | JoinAlgorithm.MergeJoin -> execMergeJoin ctx frame left right
 
     /// 論理木を 1ノードずつ処理する。
     /// 継続は ExecFrame list に積むので、ラッパの深さに依存せずスタックは一定。
@@ -549,77 +649,6 @@ module internal Optimizer =
                     }
                 | _ -> err (DbError.internalError "index nested loop ではありません")
 
-        let execJoin frame left right =
-            match frame.Algorithm with
-            | JoinAlgorithm.NestedLoop ->
-                match frame.Kind with
-                | JoinKind.Inner -> OpsJoin.innerJoin ctx.Budget frame.LeftSchema left frame.RightSchema right frame.On
-                | JoinKind.Left -> OpsJoin.leftJoin ctx.Budget frame.LeftSchema left frame.RightSchema right frame.On
-            | JoinAlgorithm.HashJoin ->
-                match frame.Keys with
-                | None -> err (DbError.internalError "ハッシュ結合に結合キーがありません")
-                | Some keys ->
-                    match frame.Kind with
-                    | JoinKind.Inner ->
-                        match frame.BuildSide with
-                        | HashBuildLeft ->
-                            OpsJoin.innerJoinHashBuildLeft
-                                ctx.Budget
-                                frame.LeftSchema
-                                left
-                                keys.LeftIndices
-                                frame.RightSchema
-                                right
-                                keys.RightIndices
-                                keys.Residual
-                        | HashBuildRight ->
-                            OpsJoin.innerJoinHash
-                                ctx.Budget
-                                frame.LeftSchema
-                                left
-                                keys.LeftIndices
-                                frame.RightSchema
-                                right
-                                keys.RightIndices
-                                keys.Residual
-                    | JoinKind.Left ->
-                        OpsJoin.leftJoinHash
-                            ctx.Budget
-                            frame.LeftSchema
-                            left
-                            keys.LeftIndices
-                            frame.RightSchema
-                            right
-                            keys.RightIndices
-                            keys.Residual
-            | JoinAlgorithm.IndexNestedLoop _ ->
-                DbError.internalError "index nested loop は JoinIndexLeftFrame で実行します" |> err
-            | JoinAlgorithm.MergeJoin ->
-                match frame.Keys with
-                | None -> err (DbError.internalError "マージ結合に結合キーがありません")
-                | Some keys ->
-                    match frame.Kind with
-                    | JoinKind.Inner ->
-                        OpsJoin.innerJoinMerge
-                            ctx.Budget
-                            frame.LeftSchema
-                            left
-                            keys.LeftIndices
-                            frame.RightSchema
-                            right
-                            keys.RightIndices
-                            keys.Residual
-                    | JoinKind.Left ->
-                        OpsJoin.leftJoinMerge
-                            ctx.Budget
-                            frame.LeftSchema
-                            left
-                            keys.LeftIndices
-                            frame.RightSchema
-                            right
-                            keys.RightIndices
-                            keys.Residual
-
         match step with
         | EvalNode(node, inSchema, hint) ->
             match node with
@@ -718,7 +747,7 @@ module internal Optimizer =
                 | JoinRightFrame frame ->
                     run ctx memo (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
                 | JoinApplyFrame(frame, leftOp) ->
-                    match execJoin frame leftOp op with
+                    match execJoin ctx frame leftOp op with
                     | Ok joined -> run ctx memo rest (ApplyOp(countOutput ctx frame.Node joined))
                     | Error e -> err e
                 | UnionFrame(outer, doneOps, []) ->

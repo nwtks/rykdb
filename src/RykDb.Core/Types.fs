@@ -548,6 +548,32 @@ module internal SqlValue =
     [<Literal>]
     let private Int64MaxAsFloat = 9223372036854775808.0
 
+    /// TEXT を DATE として解釈する（失敗は None）。
+    let private tryParseDate (s: string) =
+        match
+            System.DateOnly.TryParseExact(
+                s,
+                "yyyy-MM-dd",
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None
+            )
+        with
+        | true, d -> Some d
+        | _ -> None
+
+    /// TEXT を TIMESTAMP として解釈する（失敗は None）。
+    let private tryParseTimestamp (s: string) =
+        match
+            System.DateTimeOffset.TryParse(
+                s,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal
+                ||| System.Globalization.DateTimeStyles.AdjustToUniversal
+            )
+        with
+        | true, t -> Some t
+        | _ -> None
+
     /// 暗黙変換。
     /// SQL の通常の型強制の規則を表す。
     /// 変換できない場合は型エラーを返す。
@@ -614,16 +640,9 @@ module internal SqlValue =
             | SqlValue.Date _ as v -> ret v
             | SqlValue.Timestamp t -> System.DateOnly.FromDateTime t.UtcDateTime |> SqlValue.Date |> ret
             | SqlValue.Text s ->
-                match
-                    System.DateOnly.TryParseExact(
-                        s,
-                        "yyyy-MM-dd",
-                        System.Globalization.CultureInfo.InvariantCulture,
-                        System.Globalization.DateTimeStyles.None
-                    )
-                with
-                | true, d -> d |> SqlValue.Date |> ret
-                | _ -> fail ()
+                match tryParseDate s with
+                | Some d -> d |> SqlValue.Date |> ret
+                | None -> fail ()
             | _ -> fail ()
 
         let asTimestamp =
@@ -634,16 +653,9 @@ module internal SqlValue =
                 |> SqlValue.Timestamp
                 |> ret
             | SqlValue.Text s ->
-                match
-                    System.DateTimeOffset.TryParse(
-                        s,
-                        System.Globalization.CultureInfo.InvariantCulture,
-                        System.Globalization.DateTimeStyles.AssumeUniversal
-                        ||| System.Globalization.DateTimeStyles.AdjustToUniversal
-                    )
-                with
-                | true, t -> t |> SqlValue.Timestamp |> ret
-                | _ -> fail ()
+                match tryParseTimestamp s with
+                | Some t -> t |> SqlValue.Timestamp |> ret
+                | None -> fail ()
             | _ -> fail ()
 
         if isNull v then
@@ -675,58 +687,63 @@ module internal SqlValue =
                     | _ -> fail ()
                 | _ -> fail ()
 
-    /// CAST 用の明示変換。
-    /// 暗黙変換 (`coerce`) より広く、TEXT から数値・BOOLEAN への変換も行う。
-    let cast (target: DataType) (v: SqlValue) =
+    /// TEXT から数値・BOOLEAN への明示変換（CAST のみ。暗黙変換では行わない）。
+    let private castText (target: DataType) (v: SqlValue) (s: string) =
         let fail () =
             sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
             |> DbError.typeError
             |> err
 
+        match target with
+        | DataType.Integer ->
+            match
+                System.Int64.TryParse(
+                    s,
+                    System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture
+                )
+            with
+            | true, i -> ret (SqlValue.Int i)
+            | _ -> fail ()
+        | DataType.Real ->
+            match
+                System.Double.TryParse(
+                    s,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture
+                )
+            with
+            | true, f -> ret (vReal f)
+            | _ -> fail ()
+        | DataType.Decimal ->
+            match
+                System.Decimal.TryParse(
+                    s,
+                    System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture
+                )
+            with
+            | true, d -> ret (SqlValue.Decimal d)
+            | _ -> fail ()
+        | DataType.Boolean ->
+            match s.Trim().ToUpperInvariant() with
+            | "TRUE"
+            | "T"
+            | "1" -> ret TrueValue
+            | "FALSE"
+            | "F"
+            | "0" -> ret FalseValue
+            | _ -> fail ()
+        | _ -> coerce target v
+
+    /// CAST 用の明示変換。
+    /// 暗黙変換 (`coerce`) より広く、TEXT から数値・BOOLEAN への変換も行う。
+    let cast (target: DataType) (v: SqlValue) =
         if isNull v then
             ret SqlValue.Null
         else
-            match target, v with
-            | DataType.Null, _ -> ret SqlValue.Null
-            | DataType.Integer, SqlValue.Text s ->
-                match
-                    System.Int64.TryParse(
-                        s,
-                        System.Globalization.NumberStyles.Integer,
-                        System.Globalization.CultureInfo.InvariantCulture
-                    )
-                with
-                | true, i -> ret (SqlValue.Int i)
-                | _ -> fail ()
-            | DataType.Real, SqlValue.Text s ->
-                match
-                    System.Double.TryParse(
-                        s,
-                        System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture
-                    )
-                with
-                | true, f -> ret (vReal f)
-                | _ -> fail ()
-            | DataType.Decimal, SqlValue.Text s ->
-                match
-                    System.Decimal.TryParse(
-                        s,
-                        System.Globalization.NumberStyles.Number,
-                        System.Globalization.CultureInfo.InvariantCulture
-                    )
-                with
-                | true, d -> ret (SqlValue.Decimal d)
-                | _ -> fail ()
-            | DataType.Boolean, SqlValue.Text s ->
-                match s.Trim().ToUpperInvariant() with
-                | "TRUE"
-                | "T"
-                | "1" -> ret TrueValue
-                | "FALSE"
-                | "F"
-                | "0" -> ret FalseValue
-                | _ -> fail ()
+            match v with
+            | SqlValue.Text s -> castText target v s
             | _ -> coerce target v
 
 /// 復号済みの行。

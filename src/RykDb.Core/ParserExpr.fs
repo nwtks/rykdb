@@ -354,41 +354,56 @@ module internal ParserExpr =
         /// NOT の後ろが IN / BETWEEN / LIKE でない
         | BadNot
 
+    /// 記号トークンを中置演算子として解釈する。
+    let private symbolInfix =
+        function
+        | "=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Eq)
+        | "<>" -> Some(CompareBp, InfixKind.Compare BinaryOp.Ne)
+        | "!=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Ne)
+        | "<=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Le)
+        | ">=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Ge)
+        | "<" -> Some(CompareBp, InfixKind.Compare BinaryOp.Lt)
+        | ">" -> Some(CompareBp, InfixKind.Compare BinaryOp.Gt)
+        | "+" -> Some(AddBp, InfixKind.Binary BinaryOp.Add)
+        | "-" -> Some(AddBp, InfixKind.Binary BinaryOp.Sub)
+        | "||" -> Some(AddBp, InfixKind.Binary BinaryOp.Concat)
+        | "*" -> Some(MulBp, InfixKind.Binary BinaryOp.Mul)
+        | "/" -> Some(MulBp, InfixKind.Binary BinaryOp.Div)
+        | "%" -> Some(MulBp, InfixKind.Binary BinaryOp.Mod)
+        | _ -> None
+
+    /// NOT の後ろの字句を見て、否定の述語の種類を決める。
+    let private notInfix (st: PState) =
+        let next =
+            if st.Pos + 1 < st.Tokens.Length then
+                st.Tokens.[st.Pos + 1].Token
+            else
+                Token.Eos
+
+        match next with
+        | Token.Keyword "IN" -> Some(CompareBp, InfixKind.InPredicate true)
+        | Token.Keyword "BETWEEN" -> Some(CompareBp, InfixKind.BetweenPredicate true)
+        | Token.Keyword "LIKE" -> Some(CompareBp, InfixKind.LikePredicate true)
+        | _ -> Some(CompareBp, InfixKind.BadNot)
+
+    /// キーワードトークンを中置演算子として解釈する。
+    let private keywordInfix (st: PState) =
+        function
+        | "OR" -> Some(OrBp, InfixKind.Binary BinaryOp.Or)
+        | "AND" -> Some(AndBp, InfixKind.Binary BinaryOp.And)
+        | "IS" -> Some(CompareBp, InfixKind.IsPredicate)
+        | "IN" -> Some(CompareBp, InfixKind.InPredicate false)
+        | "BETWEEN" -> Some(CompareBp, InfixKind.BetweenPredicate false)
+        | "LIKE" -> Some(CompareBp, InfixKind.LikePredicate false)
+        | "NOT" -> notInfix st
+        | _ -> None
+
     /// 現在位置が中置演算子なら (左の結合強度, 種類) を返す。
     /// NOT は後ろの字句を見て否定の述語かを決める。
     let private infixAt (st: PState) =
         match peek st with
-        | Token.Keyword "OR" -> Some(OrBp, InfixKind.Binary BinaryOp.Or)
-        | Token.Keyword "AND" -> Some(AndBp, InfixKind.Binary BinaryOp.And)
-        | Token.Symbol "=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Eq)
-        | Token.Symbol "<>" -> Some(CompareBp, InfixKind.Compare BinaryOp.Ne)
-        | Token.Symbol "!=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Ne)
-        | Token.Symbol "<=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Le)
-        | Token.Symbol ">=" -> Some(CompareBp, InfixKind.Compare BinaryOp.Ge)
-        | Token.Symbol "<" -> Some(CompareBp, InfixKind.Compare BinaryOp.Lt)
-        | Token.Symbol ">" -> Some(CompareBp, InfixKind.Compare BinaryOp.Gt)
-        | Token.Symbol "+" -> Some(AddBp, InfixKind.Binary BinaryOp.Add)
-        | Token.Symbol "-" -> Some(AddBp, InfixKind.Binary BinaryOp.Sub)
-        | Token.Symbol "||" -> Some(AddBp, InfixKind.Binary BinaryOp.Concat)
-        | Token.Symbol "*" -> Some(MulBp, InfixKind.Binary BinaryOp.Mul)
-        | Token.Symbol "/" -> Some(MulBp, InfixKind.Binary BinaryOp.Div)
-        | Token.Symbol "%" -> Some(MulBp, InfixKind.Binary BinaryOp.Mod)
-        | Token.Keyword "IS" -> Some(CompareBp, InfixKind.IsPredicate)
-        | Token.Keyword "IN" -> Some(CompareBp, InfixKind.InPredicate false)
-        | Token.Keyword "BETWEEN" -> Some(CompareBp, InfixKind.BetweenPredicate false)
-        | Token.Keyword "LIKE" -> Some(CompareBp, InfixKind.LikePredicate false)
-        | Token.Keyword "NOT" ->
-            let next =
-                if st.Pos + 1 < st.Tokens.Length then
-                    st.Tokens.[st.Pos + 1].Token
-                else
-                    Token.Eos
-
-            match next with
-            | Token.Keyword "IN" -> Some(CompareBp, InfixKind.InPredicate true)
-            | Token.Keyword "BETWEEN" -> Some(CompareBp, InfixKind.BetweenPredicate true)
-            | Token.Keyword "LIKE" -> Some(CompareBp, InfixKind.LikePredicate true)
-            | _ -> Some(CompareBp, InfixKind.BadNot)
+        | Token.Keyword word -> keywordInfix st word
+        | Token.Symbol symbol -> symbolInfix symbol
         | _ -> None
 
     /// 式を 1つ読み、継続へ渡す。

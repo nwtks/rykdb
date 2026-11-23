@@ -25,6 +25,8 @@ src/RykDb.Core/OpsJoin.fs|joinRows/scan|scan|call
 src/RykDb.Core/OpsJoin.fs|joinRows|joinRows|call
 src/RykDb.Core/OpsJoin.fs|loop/advance|advance|call
 src/RykDb.Core/OpsJoin.fs|loop/advance|loop|call
+src/RykDb.Core/OpsJoin.fs|loop/emitGroup/nextLeft/nextRight|emitGroup|bare
+src/RykDb.Core/OpsJoin.fs|loop/emitGroup/nextLeft/nextRight|loop|bare
 src/RykDb.Core/OpsJoin.fs|loop/emitGroup/nextLeft/nextRight|loop|call
 src/RykDb.Core/OpsJoin.fs|loop/emitGroup/nextLeft/nextRight|nextLeft|call
 src/RykDb.Core/OpsJoin.fs|loop/emitGroup/nextLeft/nextRight|nextRight|call
