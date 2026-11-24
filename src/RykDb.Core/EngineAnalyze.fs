@@ -54,18 +54,68 @@ module internal EngineAnalyze =
         else
             (nulls * totalRows + sampleSize / 2L) / sampleSize
 
+    /// 統計収集で共有する可変のアキュムレータ一式。
+    /// 1 回の ANALYZE の間だけ使う（モジュールスコープには置かない）。
+    type private StatsAccumulators =
+        {
+            /// 列ごとの値（SQL リテラル表記）と出現数。
+            ColumnSets: System.Collections.Generic.Dictionary<string, int64> array
+            /// 列位置ごとの NULL 数。
+            NullCounts: System.Collections.Generic.Dictionary<int, int64>
+            /// 列位置ごとの数値の最小・最大。
+            MinMax: System.Collections.Generic.Dictionary<int, struct (float * float)>
+            /// ヒストグラム用の reservoir 標本。
+            NumericSamples: System.Collections.Generic.Dictionary<int, float list>
+            /// 標本に数えた数値の件数。
+            NumericSeen: System.Collections.Generic.Dictionary<int, int64>
+            /// reservoir の乱数状態。
+            NumericRng: System.Collections.Generic.Dictionary<int, int64>
+            /// 索引・索引列の位置・prefix ごとのキー集合。
+            Indexes: (IndexDefinition * int array * System.Collections.Generic.HashSet<string> array) list
+        }
+
+    /// テーブルの列と索引からアキュムレータを作る。
+    let private createStatsAccumulators (schema: TableSchema) (state: ExecState) =
+        let schemaColumns = schema.Columns |> Array.ofList
+
+        let indexes =
+            Catalog.indexesOf schema.Name state.Catalog
+            |> List.choose (fun index ->
+                let positions =
+                    index.Columns
+                    |> List.map (fun name ->
+                        schemaColumns |> Array.tryFindIndex (fun col -> SqlName.equal col.Name name))
+
+                if positions |> List.exists Option.isNone then
+                    None
+                else
+                    Some(
+                        index,
+                        positions |> List.choose id |> Array.ofList,
+                        Array.init index.Columns.Length (fun _ -> System.Collections.Generic.HashSet<string>())
+                    ))
+
+        {
+            ColumnSets =
+                Array.init schemaColumns.Length (fun _ -> System.Collections.Generic.Dictionary<string, int64>())
+            NullCounts = System.Collections.Generic.Dictionary<int, int64>()
+            MinMax = System.Collections.Generic.Dictionary<int, struct (float * float)>()
+            NumericSamples = System.Collections.Generic.Dictionary<int, float list>()
+            NumericSeen = System.Collections.Generic.Dictionary<int, int64>()
+            NumericRng = System.Collections.Generic.Dictionary<int, int64>()
+            Indexes = indexes
+        }
+
     /// 1行を統計の辞書へ加算する。
-    let private accumulateRow
-        (columnSets: System.Collections.Generic.Dictionary<string, int64> array)
-        (nullCounts: System.Collections.Generic.Dictionary<int, int64>)
-        (minMax: System.Collections.Generic.Dictionary<int, struct (float * float)>)
-        (numericSamples: System.Collections.Generic.Dictionary<int, float list>)
-        (numericSeen: System.Collections.Generic.Dictionary<int, int64>)
-        (numericRng: System.Collections.Generic.Dictionary<int, int64>)
-        (indexes: (IndexDefinition * int array * System.Collections.Generic.HashSet<string> array) list)
-        (histogramSamples: int)
-        (row: SqlValue array)
-        =
+    let private accumulateRow (acc: StatsAccumulators) (histogramSamples: int) (row: SqlValue array) =
+        let columnSets = acc.ColumnSets
+        let nullCounts = acc.NullCounts
+        let minMax = acc.MinMax
+        let numericSamples = acc.NumericSamples
+        let numericSeen = acc.NumericSeen
+        let numericRng = acc.NumericRng
+        let indexes = acc.Indexes
+
         row
         |> Array.iteri (fun i value ->
             if i < columnSets.Length then
@@ -210,6 +260,85 @@ module internal EngineAnalyze =
                         else
                             sampleScan cancel progress tableName n count samples sampleCount rng rest
 
+    /// サンプルの有無に応じて走査を回し、(全体行数, 標本数, 行バイト合計) を返す。
+    let private collectScanTotals
+        (tableName: string)
+        (cancel: System.Threading.CancellationToken)
+        (progress: (string * int64 -> unit) option)
+        (sample: int option)
+        (accumulate: SqlValue array -> unit)
+        (scan: SstScan)
+        =
+        match sample |> Option.map (min 100_000) with
+        | None ->
+            result {
+                let! count, bytes = consumeScan cancel progress tableName accumulate 0.0 0L scan
+                return count, count, bytes
+            }
+        | Some n ->
+            result {
+                let! count, samples, sampleCount =
+                    sampleScan cancel progress tableName n 0L [] 0 1L scan
+
+                samples |> List.iter accumulate
+                let bytes = samples |> List.sumBy (ValueCodec.managedRowBytes >> float)
+                return count, sampleCount, bytes
+            }
+
+    /// 列ごとの統計を組み立てる。
+    let private buildColumnStats
+        (schemaColumns: ColumnDefinition array)
+        (acc: StatsAccumulators)
+        (totalRows: int64)
+        (sampleSize: int64)
+        (histogramBuckets: int)
+        =
+        let mcvLimit = 32
+
+        schemaColumns
+        |> Array.indexed
+        |> Array.map (fun (i, col) ->
+            let nulls =
+                match acc.NullCounts.TryGetValue i with
+                | true, n -> n
+                | _ -> 0L
+
+            let minValue, maxValue =
+                match acc.MinMax.TryGetValue i with
+                | true, struct (lo, hi) -> Some lo, Some hi
+                | _ -> None, None
+
+            let histogram =
+                match acc.NumericSamples.TryGetValue i with
+                | true, samples -> equiDepthHistogram histogramBuckets samples
+                | _ -> []
+
+            {
+                Name = col.Name
+                NDV = int64 acc.ColumnSets.[i].Count
+                Nulls = scaleNulls totalRows sampleSize nulls
+                Min = minValue
+                Max = maxValue
+                Histogram = histogram
+                Mcv = frequentValues mcvLimit totalRows sampleSize acc.ColumnSets.[i]
+            })
+        |> List.ofArray
+
+    /// 索引ごとの prefix NDV を組み立てる。
+    let private buildIndexStats
+        (indexes: (IndexDefinition * int array * System.Collections.Generic.HashSet<string> array) list)
+        =
+        indexes
+        |> List.map (fun (index, _, sets) ->
+            let indexStats: IndexStats =
+                {
+                    Name = index.IndexName
+                    Columns = index.Columns
+                    PrefixNDV = sets |> Array.map (fun set -> int64 set.Count) |> List.ofArray
+                }
+
+            indexStats)
+
     /// テーブルの行数、列 NDV・NULL 数・数値範囲、索引 prefix NDV を収集する。
     /// `sample` が Some n なら reservoir sampling で n 行だけを標本にする。
     let private collectStats
@@ -223,66 +352,15 @@ module internal EngineAnalyze =
 
         result {
             let! schema = Catalog.toSchema defn
-            let schemaColumns = schema.Columns |> Array.ofList
-
-            let columnSets =
-                Array.init schemaColumns.Length (fun _ -> System.Collections.Generic.Dictionary<string, int64>())
-
-            let nullCounts = System.Collections.Generic.Dictionary<int, int64>()
-            let minMax = System.Collections.Generic.Dictionary<int, struct (float * float)>()
-            let numericSamples = System.Collections.Generic.Dictionary<int, float list>()
-            let numericSeen = System.Collections.Generic.Dictionary<int, int64>()
-            let numericRng = System.Collections.Generic.Dictionary<int, int64>()
-
+            let acc = createStatsAccumulators schema state
             let histogramSamples = 1024
             let histogramBuckets = 32
 
-            let indexes =
-                Catalog.indexesOf schema.Name state.Catalog
-                |> List.choose (fun index ->
-                    let positions =
-                        index.Columns
-                        |> List.map (fun name ->
-                            schemaColumns |> Array.tryFindIndex (fun col -> SqlName.equal col.Name name))
-
-                    if positions |> List.exists Option.isNone then
-                        None
-                    else
-                        Some(
-                            index,
-                            positions |> List.choose id |> Array.ofList,
-                            Array.init index.Columns.Length (fun _ -> System.Collections.Generic.HashSet<string>())
-                        ))
-
             let! scan = RowStore.scan (Keyspace.table schema.Name) [||] 0 state.Store
-
-            let accumulate =
-                accumulateRow
-                    columnSets
-                    nullCounts
-                    minMax
-                    numericSamples
-                    numericSeen
-                    numericRng
-                    indexes
-                    histogramSamples
+            let accumulate = accumulateRow acc histogramSamples
 
             let! totalRows, sampleSize, rowBytesTotal =
-                match sample |> Option.map (min 100_000) with
-                | None ->
-                    result {
-                        let! count, bytes = consumeScan cancel progress defn.Name accumulate 0.0 0L scan
-                        return count, count, bytes
-                    }
-                | Some n ->
-                    result {
-                        let! count, samples, sampleCount =
-                            sampleScan cancel progress defn.Name n 0L [] 0 1L scan
-
-                        samples |> List.iter accumulate
-                        let bytes = samples |> List.sumBy (ValueCodec.managedRowBytes >> float)
-                        return count, sampleCount, bytes
-                    }
+                collectScanTotals defn.Name cancel progress sample accumulate scan
 
             let rowBytes =
                 if sampleSize <= 0L then
@@ -290,52 +368,10 @@ module internal EngineAnalyze =
                 else
                     rowBytesTotal / float sampleSize
 
-            let mcvLimit = 32
-
             let columns =
-                schemaColumns
-                |> Array.indexed
-                |> Array.map (fun (i, col) ->
-                    let nulls =
-                        match nullCounts.TryGetValue i with
-                        | true, n -> n
-                        | _ -> 0L
+                buildColumnStats (schema.Columns |> Array.ofList) acc totalRows sampleSize histogramBuckets
 
-                    let minValue, maxValue =
-                        match minMax.TryGetValue i with
-                        | true, struct (lo, hi) -> Some lo, Some hi
-                        | _ -> None, None
-
-                    let histogram =
-                        match numericSamples.TryGetValue i with
-                        | true, samples -> equiDepthHistogram histogramBuckets samples
-                        | _ -> []
-
-                    let column =
-                        {
-                            Name = col.Name
-                            NDV = int64 columnSets.[i].Count
-                            Nulls = scaleNulls totalRows sampleSize nulls
-                            Min = minValue
-                            Max = maxValue
-                            Histogram = histogram
-                            Mcv = frequentValues mcvLimit totalRows sampleSize columnSets.[i]
-                        }
-
-                    column)
-                |> List.ofArray
-
-            let indexes =
-                indexes
-                |> List.map (fun (index, _, sets) ->
-                    let indexStats: IndexStats =
-                        {
-                            Name = index.IndexName
-                            Columns = index.Columns
-                            PrefixNDV = sets |> Array.map (fun set -> int64 set.Count) |> List.ofArray
-                        }
-
-                    indexStats)
+            let indexes = buildIndexStats acc.Indexes
 
             progress |> Option.iter (fun report -> report (defn.Name, totalRows))
 

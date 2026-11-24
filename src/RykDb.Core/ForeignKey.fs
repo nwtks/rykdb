@@ -68,13 +68,8 @@ module internal ForeignKey =
     let private primaryKeyNames (schema: TableSchema) =
         TableSchema.primaryKeyColumns schema |> List.ofArray
 
-    /// 1つの外部キー定義を検証して保存形へ解決する。
-    let private resolveOne
-        (catalog: Catalog)
-        (schema: TableSchema)
-        (c: CreateTable)
-        (columns: string list, r: ForeignKeyRef)
-        =
+    /// 子の外部キー列の指定（空・重複）を検証する。
+    let private checkForeignKeyColumns (columns: string list) =
         result {
             do!
                 if List.isEmpty columns then
@@ -84,66 +79,91 @@ module internal ForeignKey =
 
             match SqlName.duplicate columns with
             | Some name -> return! err (DbError.name (sprintf "FOREIGN KEY の列 %s が重複しています" name))
-            | None -> ()
+            | None -> return ()
+        }
+
+    /// 参照先テーブルのスキーマを解決する（自テーブルならそのまま）。
+    let private resolveParentSchema (catalog: Catalog) (schema: TableSchema) (r: ForeignKeyRef) =
+        if Catalog.eqName r.ParentTable schema.Name then
+            ret schema
+        else
+            match Catalog.findTable r.ParentTable catalog with
+            | Some defn -> Catalog.toSchema defn
+            | None -> err (DbError.name (sprintf "参照先テーブル %s が存在しません" r.ParentTable))
+
+    /// 参照先の列名を解決する（省略時は親の主キー。指定時も主キーと同順を要求）。
+    let private resolveParentKey (parent: TableSchema) (r: ForeignKeyRef) =
+        let parentKey = primaryKeyNames parent
+
+        match r.ParentColumns with
+        | None -> ret parentKey
+        | Some names when sameNames names parentKey -> ret parentKey
+        | Some names ->
+            err (
+                DbError.constraintViolation (
+                    sprintf
+                        "参照先の列（%s）はテーブル %s の主キー（%s）と同順で指定してください"
+                        (System.String.Join(", ", names))
+                        parent.Name
+                        (System.String.Join(", ", parentKey))
+                )
+            )
+
+    /// 子の列数と参照先の主キー列数の一致を検証する。
+    let private checkForeignKeyArity (columns: string list) (resolvedKey: string list) =
+        if columns.Length = resolvedKey.Length then
+            ret ()
+        else
+            err (
+                DbError.constraintViolation (
+                    sprintf "FOREIGN KEY の列数(%d)と参照先の主キー列数(%d)が一致しません" columns.Length resolvedKey.Length
+                )
+            )
+
+    /// 子と親の列型の一致を検証する。
+    let private checkForeignKeyTypes
+        (parentName: string)
+        (childColumns: ColumnDefinition list)
+        (parentColumns: ColumnDefinition list)
+        =
+        List.zip childColumns parentColumns
+        |> List.map (fun (childCol, parentCol) ->
+            if childCol.DataType = parentCol.DataType then
+                ret ()
+            else
+                err (
+                    DbError.typeError (
+                        sprintf
+                            "外部キーの列 %s の型 %s が参照先 %s.%s の型 %s と一致しません"
+                            childCol.Name
+                            (DataType.toSqlName childCol.DataType)
+                            parentName
+                            parentCol.Name
+                            (DataType.toSqlName parentCol.DataType)
+                    )
+                ))
+        |> all
+        |> Result.map ignore
+
+    /// 1つの外部キー定義を検証して保存形へ解決する。
+    let private resolveOne
+        (catalog: Catalog)
+        (schema: TableSchema)
+        (c: CreateTable)
+        (columns: string list, r: ForeignKeyRef)
+        =
+        result {
+            do! checkForeignKeyColumns columns
 
             let! childColumns = columnsOf c.Columns columns
+            let! parent = resolveParentSchema catalog schema r
+            let! resolvedKey = resolveParentKey parent r
 
-            let! parent =
-                if Catalog.eqName r.ParentTable schema.Name then
-                    ret schema
-                else
-                    match Catalog.findTable r.ParentTable catalog with
-                    | Some defn -> Catalog.toSchema defn
-                    | None -> err (DbError.name (sprintf "参照先テーブル %s が存在しません" r.ParentTable))
-
-            let parentKey = primaryKeyNames parent
-
-            let! resolvedKey =
-                match r.ParentColumns with
-                | None -> ret parentKey
-                | Some names when sameNames names parentKey -> ret parentKey
-                | Some names ->
-                    err (
-                        DbError.constraintViolation (
-                            sprintf
-                                "参照先の列（%s）はテーブル %s の主キー（%s）と同順で指定してください"
-                                (System.String.Join(", ", names))
-                                parent.Name
-                                (System.String.Join(", ", parentKey))
-                        )
-                    )
-
-            do!
-                if columns.Length = resolvedKey.Length then
-                    ret ()
-                else
-                    err (
-                        DbError.constraintViolation (
-                            sprintf "FOREIGN KEY の列数(%d)と参照先の主キー列数(%d)が一致しません" columns.Length resolvedKey.Length
-                        )
-                    )
+            do! checkForeignKeyArity columns resolvedKey
 
             let! parentColumns = columnsOf parent.Columns resolvedKey
 
-            do!
-                List.zip childColumns parentColumns
-                |> List.map (fun (childCol, parentCol) ->
-                    if childCol.DataType = parentCol.DataType then
-                        ret ()
-                    else
-                        err (
-                            DbError.typeError (
-                                sprintf
-                                    "外部キーの列 %s の型 %s が参照先 %s.%s の型 %s と一致しません"
-                                    childCol.Name
-                                    (DataType.toSqlName childCol.DataType)
-                                    parent.Name
-                                    parentCol.Name
-                                    (DataType.toSqlName parentCol.DataType)
-                            )
-                        ))
-                |> all
-                |> Result.map ignore
+            do! checkForeignKeyTypes parent.Name childColumns parentColumns
 
             return
                 {

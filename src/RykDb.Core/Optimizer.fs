@@ -338,6 +338,67 @@ module internal Optimizer =
             Tree = child
         }
 
+    /// JOIN の左右へ必要列を分割し、子の作業項目を作る。
+    let private scanNeedsJoinJobs
+        (memo: OutputSchemaMemo)
+        (item: ScanNeedsJob)
+        (on: Expr)
+        (left: Logical)
+        (right: Logical)
+        =
+        let leftSchema = outputOfMemo item.Context item.Input memo left
+        let rightSchema = outputOfMemo item.Context item.Input memo right
+        let joined = Schema.concat leftSchema rightSchema
+        let withOn = Set.union item.Needed (scanRefsOf joined on)
+        let leftWidth = leftSchema.Columns.Length
+        let leftNeeded = withOn |> Set.filter (fun i -> i < leftWidth)
+
+        let rightNeeded =
+            withOn
+            |> Set.filter (fun i -> i >= leftWidth)
+            |> Set.map (fun i -> i - leftWidth)
+
+        let leftJob =
+            { item with
+                Input = leftSchema
+                Needed = leftNeeded
+                Tree = left
+            }
+
+        let rightJob =
+            { item with
+                Input = rightSchema
+                Needed = rightNeeded
+                Tree = right
+            }
+
+        [ leftJob; rightJob ]
+
+    /// 派生テーブルの内側の作業項目を作る。
+    let private scanNeedsDerivedJob (memo: OutputSchemaMemo) (item: ScanNeedsJob) (plan: PlannedQuery) =
+        let innerOutput = outputOfMemo plan.Context plan.Input memo plan.Tree
+
+        let innerNeeded =
+            item.Needed |> Set.filter (fun i -> i < innerOutput.Columns.Length)
+
+        {
+            Context = plan.Context
+            Input = plan.Input
+            Needed = innerNeeded
+            Tree = plan.Tree
+        }
+
+    /// UNION ALL の各枝の作業項目を作る（各枝は全列を必要とする）。
+    let private scanNeedsUnionJobs (memo: OutputSchemaMemo) (plans: PlannedQuery list) =
+        plans
+        |> List.map (fun plan ->
+            {
+                Context = plan.Context
+                Input = plan.Input
+                Needed = scanAllColumns (outputOfMemo plan.Context plan.Input memo plan.Tree)
+                Tree = plan.Tree
+            })
+
     /// 作業項目 1つを処理し、確定した Scan のマスクと残りの作業リストを返す。
     let private processScanNeedsJob
         (memo: OutputSchemaMemo)
@@ -391,59 +452,9 @@ module internal Optimizer =
             let childSchema = outputOfMemo item.Context item.Input memo child
             masks, scanNeedsChild item (scanAllColumns childSchema) child :: rest
         | Logical.Limit(_, _, child) -> masks, scanNeedsChild item item.Needed child :: rest
-        | Logical.Join(_, _, on, left, right) ->
-            let leftSchema = outputOfMemo item.Context item.Input memo left
-            let rightSchema = outputOfMemo item.Context item.Input memo right
-            let joined = Schema.concat leftSchema rightSchema
-            let withOn = Set.union item.Needed (scanRefsOf joined on)
-            let leftWidth = leftSchema.Columns.Length
-            let leftNeeded = withOn |> Set.filter (fun i -> i < leftWidth)
-
-            let rightNeeded =
-                withOn
-                |> Set.filter (fun i -> i >= leftWidth)
-                |> Set.map (fun i -> i - leftWidth)
-
-            let leftJob =
-                { item with
-                    Input = leftSchema
-                    Needed = leftNeeded
-                    Tree = left
-                }
-
-            let rightJob =
-                { item with
-                    Input = rightSchema
-                    Needed = rightNeeded
-                    Tree = right
-                }
-
-            masks, leftJob :: rightJob :: rest
-        | Logical.Derived plan ->
-            let innerOutput = outputOfMemo plan.Context plan.Input memo plan.Tree
-
-            let innerNeeded =
-                item.Needed |> Set.filter (fun i -> i < innerOutput.Columns.Length)
-
-            masks,
-            {
-                Context = plan.Context
-                Input = plan.Input
-                Needed = innerNeeded
-                Tree = plan.Tree
-            }
-            :: rest
-        | Logical.UnionAll plans ->
-            masks,
-            (plans
-             |> List.map (fun plan ->
-                 {
-                     Context = plan.Context
-                     Input = plan.Input
-                     Needed = scanAllColumns (outputOfMemo plan.Context plan.Input memo plan.Tree)
-                     Tree = plan.Tree
-                 }))
-            @ rest
+        | Logical.Join(_, _, on, left, right) -> masks, scanNeedsJoinJobs memo item on left right @ rest
+        | Logical.Derived plan -> masks, scanNeedsDerivedJob memo item plan :: rest
+        | Logical.UnionAll plans -> masks, scanNeedsUnionJobs memo plans @ rest
         | Logical.Values _ -> masks, rest
 
     /// 必要列を後方伝播する作業を末尾再帰で処理する。
@@ -1011,23 +1022,111 @@ module internal Optimizer =
     let private explainRowBytesOfSchema (schema: Schema) =
         Analyzer.rowBytesOfTypes (schema.Columns |> Seq.map _.DataType)
 
+    /// 索引走査で主キー fetch が必要なときの表示（` + Fetch`）を返す。
+    let private explainFetchSuffix (item: ExplainItem) (name: string) (method: ScanMethod) =
+        match method with
+        | ScanMethod.IndexLookup(indexName, _)
+        | ScanMethod.IndexRangeScan(indexName, _, _) ->
+            match item.Context.ScanNeeds.TryGetValue(box item.Tree) with
+            | true, mask ->
+                match ExecContext.indexAccessMasks item.Context name indexName mask with
+                | Ok(_, fetchMask) when fetchMask |> Array.exists id -> " + Fetch"
+                | _ -> ""
+            | _ -> ""
+        | _ -> ""
+
+    /// ハッシュ結合の表示（build 側とスピル見積りを添える）。
+    let private explainHashJoinText
+        (statsOf: string -> TableStats option)
+        (ctx: ExecContext)
+        (kind: JoinKind)
+        (left: Logical)
+        (right: Logical)
+        (leftSchema: Schema)
+        (rightSchema: Schema)
+        =
+        let buildSide = hashBuildSide statsOf JoinAlgorithm.HashJoin kind left right
+
+        match buildSide with
+        | HashBuildLeft -> "HashJoin(left)"
+        | HashBuildRight ->
+            let leftRows = Analyzer.estimateRowsWith statsOf left
+            let rightRows = Analyzer.estimateRowsWith statsOf right
+            let buildRows = min leftRows rightRows
+
+            let buildRowBytes =
+                if leftRows < rightRows then
+                    explainRowBytesOfSchema leftSchema
+                else
+                    explainRowBytesOfSchema rightSchema
+
+            let spilled =
+                Analyzer.spilledBuildRows
+                    buildRows
+                    buildRowBytes
+                    (if ctx.Budget.Work >= 0L then
+                         float ctx.Budget.Work
+                     else
+                         -1.0)
+
+            if spilled > 0.0 then
+                sprintf "HashJoin(spill=%.0fKB)" (spilled * buildRowBytes / 1024.0)
+            else
+                "HashJoin"
+
+    /// JOIN ノードの表示と子項目を作る。
+    let private explainJoinNode
+        (memo: OutputSchemaMemo)
+        (item: ExplainItem)
+        (kind: JoinKind)
+        (name: string)
+        (on: Expr)
+        (left: Logical)
+        (right: Logical)
+        =
+        let leftSchema = outputOfMemo item.Context item.Schema memo left
+
+        let rightSchema, rightTable =
+            match stripWrappers right with
+            | Logical.Derived plan -> plan.Output, None
+            | Logical.Join _ -> outputOfMemo item.Context item.Schema memo right, None
+            | _ ->
+                let table = defaultSchema item.Context name
+                Schema.ofTable name None table, Some table
+
+        let statsOf = statsOfContext item.Context
+
+        let algorithm, _, _ =
+            Analyzer.chooseJoinAlgorithmWith
+                statsOf
+                (tableOf item.Context)
+                leftSchema
+                rightSchema
+                rightTable
+                left
+                right
+                on
+
+        let algorithmTextValue =
+            match algorithm with
+            | JoinAlgorithm.HashJoin -> explainHashJoinText statsOf item.Context kind left right leftSchema rightSchema
+            | _ -> explainAlgorithmText algorithm
+
+        let text =
+            sprintf
+                "Join(%s, %s, right=%s, on=%s)"
+                (explainJoinKindText kind)
+                algorithmTextValue
+                name
+                (Expr.toDisplayString on)
+
+        text, [ explainChildOf item left leftSchema; explainChildOf item right rightSchema ]
+
     /// 1ノードを EXPLAIN の行と子項目へ変換する。
     let private explainDescribe (memo: OutputSchemaMemo) (item: ExplainItem) =
         match item.Tree with
         | Logical.Scan(name, method) ->
-            let fetchSuffix =
-                match method with
-                | ScanMethod.IndexLookup(indexName, _)
-                | ScanMethod.IndexRangeScan(indexName, _, _) ->
-                    match item.Context.ScanNeeds.TryGetValue(box item.Tree) with
-                    | true, mask ->
-                        match ExecContext.indexAccessMasks item.Context name indexName mask with
-                        | Ok(_, fetchMask) when fetchMask |> Array.exists id -> " + Fetch"
-                        | _ -> ""
-                    | _ -> ""
-                | _ -> ""
-
-            sprintf "Scan(%s)%s" (explainScanText name method) fetchSuffix, []
+            sprintf "Scan(%s)%s" (explainScanText name method) (explainFetchSuffix item name method), []
         | Logical.Values values ->
             if Array.isEmpty values then
                 "Values", []
@@ -1038,71 +1137,7 @@ module internal Optimizer =
         | Logical.Project(items, child) ->
             let text = items |> List.map explainItemText |> String.concat ", "
             sprintf "Project(%s)" text, [ explainChildOf item child item.Schema ]
-        | Logical.Join(kind, name, on, left, right) ->
-            let leftSchema = outputOfMemo item.Context item.Schema memo left
-
-            let rightSchema, rightTable =
-                match stripWrappers right with
-                | Logical.Derived plan -> plan.Output, None
-                | Logical.Join _ -> outputOfMemo item.Context item.Schema memo right, None
-                | _ ->
-                    let table = defaultSchema item.Context name
-                    Schema.ofTable name None table, Some table
-
-            let statsOf = statsOfContext item.Context
-
-            let algorithm, _, _ =
-                Analyzer.chooseJoinAlgorithmWith
-                    statsOf
-                    (tableOf item.Context)
-                    leftSchema
-                    rightSchema
-                    rightTable
-                    left
-                    right
-                    on
-
-            let algorithmTextValue =
-                let buildSide = hashBuildSide statsOf algorithm kind left right
-
-                match algorithm, buildSide with
-                | JoinAlgorithm.HashJoin, HashBuildLeft -> "HashJoin(left)"
-                | JoinAlgorithm.HashJoin, HashBuildRight ->
-                    let leftRows = Analyzer.estimateRowsWith statsOf left
-                    let rightRows = Analyzer.estimateRowsWith statsOf right
-                    let buildRows = min leftRows rightRows
-
-                    let buildRowBytes =
-                        if leftRows < rightRows then
-                            explainRowBytesOfSchema leftSchema
-                        else
-                            explainRowBytesOfSchema rightSchema
-
-                    let spilled =
-                        Analyzer.spilledBuildRows
-                            buildRows
-                            buildRowBytes
-                            (if item.Context.Budget.Work >= 0L then
-                                 float item.Context.Budget.Work
-                             else
-                                 -1.0)
-
-                    if spilled > 0.0 then
-                        sprintf "HashJoin(spill=%.0fKB)" (spilled * buildRowBytes / 1024.0)
-                    else
-                        "HashJoin"
-
-                | _ -> explainAlgorithmText algorithm
-
-            let text =
-                sprintf
-                    "Join(%s, %s, right=%s, on=%s)"
-                    (explainJoinKindText kind)
-                    algorithmTextValue
-                    name
-                    (Expr.toDisplayString on)
-
-            text, [ explainChildOf item left leftSchema; explainChildOf item right rightSchema ]
+        | Logical.Join(kind, name, on, left, right) -> explainJoinNode memo item kind name on left right
         | Logical.Aggregate(groupBy, aggs, child) ->
             let text =
                 sprintf

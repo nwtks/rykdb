@@ -103,58 +103,62 @@ module internal OpsAggregate =
                         SeenRuns = path :: acc.SeenRuns
                     }
 
+    /// SUM / AVG の 1値加算。
+    /// REAL は非有限、INTEGER / DECIMAL は桁あふれを検査する。
+    let private aggAddSum (acc: Acc) (bump: Acc) (newSeen: Set<SqlValue>) (v: SqlValue) =
+        match v with
+        | SqlValue.Real f ->
+            let sum = acc.SumReal + float acc.SumDecimal + f
+
+            if
+                not (System.Double.IsFinite sum)
+                && System.Double.IsFinite acc.SumReal
+                && System.Double.IsFinite f
+            then
+                DbErr(DbError.constraintViolation "SUM の結果が REAL の範囲を超えました")
+            else
+                DbOk
+                    { bump with
+                        SawReal = true
+                        SumReal = sum
+                        SumDecimal = 0M
+                        Seen = newSeen
+                    }
+        | SqlValue.Int _
+        | SqlValue.Decimal _ ->
+            match SqlValue.asNumeric v with
+            | Some d ->
+                if acc.SawReal then
+                    let sum = acc.SumReal + float d
+
+                    if not (System.Double.IsFinite sum) && System.Double.IsFinite acc.SumReal then
+                        DbErr(DbError.constraintViolation "SUM の結果が REAL の範囲を超えました")
+                    else
+                        DbOk
+                            { bump with
+                                SumReal = sum
+                                Seen = newSeen
+                            }
+                else
+                    aggAddDecimal acc.SumDecimal d
+                    |> DbResult.map (fun sum ->
+                        { bump with
+                            SumDecimal = sum
+                            Seen = newSeen
+                        })
+            | None -> DbErr(DbError.internalError "数値の変換に失敗しました（内部不整合）")
+        | _ ->
+            DbErr(
+                sprintf "%s は数値だけを受け付けますが %s です" acc.Kind.Name (SqlLiteral.toSqlLiteral v)
+                |> DbError.typeError
+            )
+
     /// 1つの値をアキュムレータへ畳み込む。
     let private aggAddValue (acc: Acc) (bump: Acc) (v: SqlValue) (newSeen: Set<SqlValue>) =
         match acc.Kind with
         | AggFunc.Count -> DbOk { bump with Seen = newSeen }
         | AggFunc.Sum
-        | AggFunc.Avg ->
-            match v with
-            | SqlValue.Real f ->
-                let sum = acc.SumReal + float acc.SumDecimal + f
-
-                if
-                    not (System.Double.IsFinite sum)
-                    && System.Double.IsFinite acc.SumReal
-                    && System.Double.IsFinite f
-                then
-                    DbErr(DbError.constraintViolation "SUM の結果が REAL の範囲を超えました")
-                else
-                    DbOk
-                        { bump with
-                            SawReal = true
-                            SumReal = sum
-                            SumDecimal = 0M
-                            Seen = newSeen
-                        }
-            | SqlValue.Int _
-            | SqlValue.Decimal _ ->
-                match SqlValue.asNumeric v with
-                | Some d ->
-                    if acc.SawReal then
-                        let sum = acc.SumReal + float d
-
-                        if not (System.Double.IsFinite sum) && System.Double.IsFinite acc.SumReal then
-                            DbErr(DbError.constraintViolation "SUM の結果が REAL の範囲を超えました")
-                        else
-                            DbOk
-                                { bump with
-                                    SumReal = sum
-                                    Seen = newSeen
-                                }
-                    else
-                        aggAddDecimal acc.SumDecimal d
-                        |> DbResult.map (fun sum ->
-                            { bump with
-                                SumDecimal = sum
-                                Seen = newSeen
-                            })
-                | None -> DbErr(DbError.internalError "数値の変換に失敗しました（内部不整合）")
-            | _ ->
-                DbErr(
-                    sprintf "%s は数値だけを受け付けますが %s です" acc.Kind.Name (SqlLiteral.toSqlLiteral v)
-                    |> DbError.typeError
-                )
+        | AggFunc.Avg -> aggAddSum acc bump newSeen v
         | AggFunc.Min ->
             let updated = { bump with Seen = newSeen }
 

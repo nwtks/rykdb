@@ -516,7 +516,8 @@ module internal Catalog =
             return items, c2
         }
 
-    let private decodeStats (table: string) (bytes: byte array) =
+    /// 統計の先頭部分（行数・列 NDV・索引名）を復号する。
+    let private decodeStatsBase (table: string) (bytes: byte array) =
         result {
             let! rowCount, cur1 = Cursor.create bytes |> Reader.readInt64LE
             let! colCount, cur2 = Reader.readVarint cur1
@@ -559,7 +560,7 @@ module internal Catalog =
 
                     index)
 
-            let baseStats =
+            let baseStats: TableStats =
                 {
                     Table = table
                     RowCount = rowCount
@@ -570,9 +571,17 @@ module internal Catalog =
                     RowBytes = 0.0
                 }
 
-            if Cursor.atEnd afterIndexes then
-                return baseStats
-            else
+            return baseStats, afterIndexes
+        }
+
+    /// 統計の末尾に付く拡張フィールドを復号し、基本統計へ畳み込む。
+    let private decodeStatsExtras (baseStats: TableStats) (afterIndexes: Cursor) =
+        if Cursor.atEnd afterIndexes then
+            ret baseStats
+        else
+            result {
+                let columns = baseStats.Columns
+                let indexes = baseStats.Indexes
                 let! tag, cur4 = Reader.readByte afterIndexes
 
                 if tag <> 1uy && tag <> 2uy && tag <> 3uy && tag <> 4uy && tag <> 5uy then
@@ -643,6 +652,12 @@ module internal Catalog =
                                 Changes = changes
                                 RowBytes = rowBytes
                             }
+            }
+
+    let private decodeStats (table: string) (bytes: byte array) =
+        result {
+            let! baseStats, afterIndexes = decodeStatsBase table bytes
+            return! decodeStatsExtras baseStats afterIndexes
         }
 
     /// カタログのテーブル定義キー（`table:<name>`）。

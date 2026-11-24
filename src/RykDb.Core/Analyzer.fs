@@ -604,86 +604,132 @@ module internal Analyzer =
         | BinaryOp.Le -> BinaryOp.Ge
         | other -> other
 
+    /// 等値述語の選択性（列どうし → 列とリテラル → 既定値の順）。
+    let private equalityPredicateSelectivity
+        (statsOf: string -> TableStats option)
+        (defaultSelectivity: float)
+        (a: Expr)
+        (b: Expr)
+        =
+        match columnWithStatsOf statsOf a, columnWithStatsOf statsOf b with
+        | Some(sa, ca), Some(sb, cb) when ca.NDV > 0L && cb.NDV > 0L ->
+            (1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV)
+        | _ ->
+            match literalOf b with
+            | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity a literal
+            | None ->
+                match literalOf a with
+                | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity b literal
+                | None -> defaultSelectivity
+
+    /// 範囲比較の選択性（リテラル側を左辺へ寄せる）。
+    let private rangeComparisonSelectivity
+        (statsOf: string -> TableStats option)
+        (rangeSelectivity: float)
+        (defaultSelectivity: float)
+        (op: BinaryOp)
+        (a: Expr)
+        (b: Expr)
+        =
+        match literalOf b with
+        | Some literal -> rangeToLiteralWithStats statsOf rangeSelectivity a literal op
+        | None ->
+            match literalOf a with
+            | Some literal -> rangeToLiteralWithStats statsOf rangeSelectivity b literal (flipComparison op)
+            | None -> defaultSelectivity
+
+    /// BETWEEN の選択性（ヒストグラム優先、無ければ min/max の線形補間）。
+    let private betweenSelectivity
+        (statsOf: string -> TableStats option)
+        (rangeSelectivity: float)
+        (x: Expr)
+        (low: Expr)
+        (high: Expr)
+        (neg: bool)
+        =
+        let selectivity =
+            match columnWithStatsOf statsOf x, numericLiteral low, numericLiteral high with
+            | Some(_, column), Some lo, Some hi ->
+                match histogramCdf column.Histogram hi, histogramCdf column.Histogram lo with
+                | Some highCdf, Some lowCdf -> max 0.0 (min 1.0 (highCdf - lowCdf))
+                | _ ->
+                    match column.Min, column.Max with
+                    | Some minValue, Some maxValue when maxValue > minValue ->
+                        max 0.0 (min 1.0 ((hi - lo) / (maxValue - minValue)))
+                    | _ -> rangeSelectivity
+            | _ -> rangeSelectivity
+
+        selectivityWithNegation neg selectivity
+
+    /// IN リストの選択性（先頭要素の等値選択性 × 要素数）。
+    let private inListSelectivity
+        (statsOf: string -> TableStats option)
+        (defaultSelectivity: float)
+        (x: Expr)
+        (values: Expr list)
+        (neg: bool)
+        =
+        let perValue =
+            values
+            |> List.tryHead
+            |> Option.map (fun v ->
+                literalOf v
+                |> Option.map (eqToLiteralWithStats statsOf defaultSelectivity x)
+                |> Option.defaultValue defaultSelectivity)
+            |> Option.defaultValue defaultSelectivity
+
+        selectivityWithNegation neg (min 1.0 (float (List.length values) * perValue))
+
+    /// LIKE の選択性（前方一致 / 部分一致 / その他の既定値）。
+    let private likeSelectivity
+        (statsOf: string -> TableStats option)
+        (defaultSelectivity: float)
+        (x: Expr)
+        (pattern: Expr)
+        (neg: bool)
+        =
+        let selectivity =
+            let baseSelectivity =
+                match literalOf pattern with
+                | Some(SqlValue.Text text) when text.EndsWith("%", System.StringComparison.Ordinal) ->
+                    if text.Length <= 1 then 1.0 else 0.1
+                | Some(SqlValue.Text _) -> 0.2
+                | _ -> defaultSelectivity
+
+            match columnWithStatsOf statsOf x with
+            | Some(stats, column) -> baseSelectivity * (1.0 - nullRate stats column)
+            | None -> baseSelectivity
+
+        selectivityWithNegation neg selectivity
+
+    /// IS [NOT] NULL の選択性（NULL 率）。
+    let private isNullSelectivity
+        (statsOf: string -> TableStats option)
+        (defaultSelectivity: float)
+        (x: Expr)
+        (neg: bool)
+        =
+        let selectivity =
+            match columnWithStatsOf statsOf x with
+            | Some(stats, column) -> nullRate stats column
+            | None -> defaultSelectivity
+
+        selectivityWithNegation neg selectivity
+
     /// 1本の述語の選択性（統計が無ければ既定値）。
     let private filterConjunctSelectivity (statsOf: string -> TableStats option) (conjunct: Expr) =
         let defaultSelectivity = 0.1
         let rangeSelectivity = 1.0 / 3.0
 
         match conjunct with
-        | Expr.Binary(BinaryOp.Eq, a, b) ->
-            match columnWithStatsOf statsOf a, columnWithStatsOf statsOf b with
-            | Some(sa, ca), Some(sb, cb) when ca.NDV > 0L && cb.NDV > 0L ->
-                (1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV)
-            | _ ->
-                match literalOf b with
-                | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity a literal
-                | None ->
-                    match literalOf a with
-                    | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity b literal
-                    | None -> defaultSelectivity
-        | Expr.Binary(BinaryOp.Ne, a, b) ->
-            let equality =
-                match literalOf b with
-                | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity a literal
-                | None ->
-                    match literalOf a with
-                    | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity b literal
-                    | None -> defaultSelectivity
-
-            max 0.0 (1.0 - equality)
+        | Expr.Binary(BinaryOp.Eq, a, b) -> equalityPredicateSelectivity statsOf defaultSelectivity a b
+        | Expr.Binary(BinaryOp.Ne, a, b) -> max 0.0 (1.0 - equalityPredicateSelectivity statsOf defaultSelectivity a b)
         | Expr.Binary(BinaryOp.Gt | BinaryOp.Ge | BinaryOp.Lt | BinaryOp.Le as op, a, b) ->
-            match literalOf b with
-            | Some literal -> rangeToLiteralWithStats statsOf rangeSelectivity a literal op
-            | None ->
-                match literalOf a with
-                | Some literal -> rangeToLiteralWithStats statsOf rangeSelectivity b literal (flipComparison op)
-                | None -> defaultSelectivity
-        | Expr.Between(x, low, high, neg) ->
-            let selectivity =
-                match columnWithStatsOf statsOf x, numericLiteral low, numericLiteral high with
-                | Some(_, column), Some lo, Some hi ->
-                    match histogramCdf column.Histogram hi, histogramCdf column.Histogram lo with
-                    | Some highCdf, Some lowCdf -> max 0.0 (min 1.0 (highCdf - lowCdf))
-                    | _ ->
-                        match column.Min, column.Max with
-                        | Some minValue, Some maxValue when maxValue > minValue ->
-                            max 0.0 (min 1.0 ((hi - lo) / (maxValue - minValue)))
-                        | _ -> rangeSelectivity
-                | _ -> rangeSelectivity
-
-            selectivityWithNegation neg selectivity
-        | Expr.InList(x, values, neg) ->
-            let perValue =
-                values
-                |> List.tryHead
-                |> Option.map (fun v ->
-                    literalOf v
-                    |> Option.map (eqToLiteralWithStats statsOf defaultSelectivity x)
-                    |> Option.defaultValue defaultSelectivity)
-                |> Option.defaultValue defaultSelectivity
-
-            selectivityWithNegation neg (min 1.0 (float (List.length values) * perValue))
-        | Expr.Like(x, pattern, neg, _) ->
-            let selectivity =
-                let baseSelectivity =
-                    match literalOf pattern with
-                    | Some(SqlValue.Text text) when text.EndsWith("%", System.StringComparison.Ordinal) ->
-                        if text.Length <= 1 then 1.0 else 0.1
-                    | Some(SqlValue.Text _) -> 0.2
-                    | _ -> defaultSelectivity
-
-                match columnWithStatsOf statsOf x with
-                | Some(stats, column) -> baseSelectivity * (1.0 - nullRate stats column)
-                | None -> baseSelectivity
-
-            selectivityWithNegation neg selectivity
-        | Expr.IsNull(x, neg) ->
-            let selectivity =
-                match columnWithStatsOf statsOf x with
-                | Some(stats, column) -> nullRate stats column
-                | None -> defaultSelectivity
-
-            selectivityWithNegation neg selectivity
+            rangeComparisonSelectivity statsOf rangeSelectivity defaultSelectivity op a b
+        | Expr.Between(x, low, high, neg) -> betweenSelectivity statsOf rangeSelectivity x low high neg
+        | Expr.InList(x, values, neg) -> inListSelectivity statsOf defaultSelectivity x values neg
+        | Expr.Like(x, pattern, neg, _) -> likeSelectivity statsOf defaultSelectivity x pattern neg
+        | Expr.IsNull(x, neg) -> isNullSelectivity statsOf defaultSelectivity x neg
         | _ -> defaultSelectivity
 
     let private filterSelectivity (statsOf: string -> TableStats option) =

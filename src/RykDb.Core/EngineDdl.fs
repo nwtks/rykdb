@@ -457,6 +457,222 @@ module internal EngineDdl =
                  (txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn selfName))
         |> ret
 
+    /// ADD COLUMN の制約を検証する。
+    let private validateAddedColumn (schema: TableSchema) (col: ColumnDefinition) =
+        result {
+            do!
+                if (TableSchema.indexOf schema col.Name).IsSome then
+                    err (DbError.name (sprintf "列 %s は既に存在します" col.Name))
+                else
+                    ret ()
+
+            do!
+                if col.Constraint.PrimaryKey then
+                    err (DbError.constraintViolation "ALTER TABLE ... ADD COLUMN で PRIMARY KEY は指定できません")
+                else
+                    ret ()
+
+            do!
+                if col.Constraint.References.IsSome then
+                    err (DbError.constraintViolation "ALTER TABLE ... ADD COLUMN で REFERENCES は指定できません（テーブルを作り直してください）")
+                else
+                    ret ()
+
+            do!
+                if col.Constraint.Unique then
+                    err (
+                        DbError.constraintViolation
+                            "ALTER TABLE ... ADD COLUMN で UNIQUE は指定できません（CREATE UNIQUE INDEX を使ってください）"
+                    )
+                else
+                    ret ()
+
+            do!
+                if col.Constraint.NotNull && col.Constraint.Default.IsNone then
+                    err (DbError.constraintViolation (sprintf "NOT NULL 列 %s を追加するには DEFAULT が必要です" col.Name))
+                else
+                    ret ()
+        }
+
+    /// 列を追加し、既存行へ既定値を付ける。
+    let private alterAddColumn
+        (state: ExecState)
+        (defn: TableDefinition)
+        (schema: TableSchema)
+        (withIndexes: TableSchema)
+        (col: ColumnDefinition)
+        =
+        result {
+            do! validateAddedColumn schema col
+
+            let! pad = addedColumnValue col
+            let oldWidth = schema.Columns.Length
+            let newWidth = oldWidth + 1
+
+            let nextDefn =
+                { defn with
+                    Columns = defn.Columns @ [ col ]
+                }
+
+            let transform = addColumnTransform schema oldWidth newWidth pad
+            let build = addColumnBuild state defn.Name withIndexes nextDefn transform
+
+            return! commitRewrite state (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)) build
+        }
+
+    /// DROP COLUMN の制約を検証する。
+    let private validateDropColumn
+        (state: ExecState)
+        (defn: TableDefinition)
+        (schema: TableSchema)
+        (withIndexes: TableSchema)
+        (pos: int)
+        (name: string)
+        =
+        result {
+            do!
+                if schema.PrimaryKey |> List.contains pos then
+                    err (DbError.constraintViolation (sprintf "主キー列 %s は削除できません（主キーは LSM のキーに使われています）" name))
+                else
+                    ret ()
+
+            do!
+                if
+                    defn.ForeignKeys
+                    |> List.exists (fun fk -> fk.Columns |> List.exists (fun c -> SqlName.equal c name))
+                then
+                    err (DbError.constraintViolation (sprintf "列 %s は外部キーで使われているため削除できません" name))
+                else
+                    ret ()
+
+            do!
+                if
+                    state.Catalog.Tables
+                    |> List.exists (fun t ->
+                        t.ForeignKeys
+                        |> List.exists (fun fk ->
+                            Catalog.eqName fk.ParentTable defn.Name
+                            && fk.ParentColumns |> List.exists (fun c -> SqlName.equal c name)))
+                then
+                    err (DbError.constraintViolation (sprintf "列 %s は外部キーの参照先になっているため削除できません" name))
+                else
+                    ret ()
+
+            do!
+                match
+                    withIndexes.Indexes
+                    |> List.tryFind (fun idx -> idx.Columns |> List.exists (fun c -> SqlName.equal c name))
+                with
+                | Some idx when Catalog.isReservedIndexName idx.Name ->
+                    err (DbError.constraintViolation (sprintf "列 %s は UNIQUE 制約で使われているため削除できません" name))
+                | Some idx -> err (DbError.constraintViolation (sprintf "列 %s は索引 %s で使われているため削除できません" name idx.Name))
+                | None -> ret ()
+        }
+
+    /// 列を削除し、既存行から値を取り除く。
+    let private alterDropColumn
+        (state: ExecState)
+        (defn: TableDefinition)
+        (schema: TableSchema)
+        (withIndexes: TableSchema)
+        (name: string)
+        =
+        result {
+            let! pos = TableSchema.requireIndexOf schema name
+            do! validateDropColumn state defn schema withIndexes pos name
+
+            let oldWidth = schema.Columns.Length
+            let newWidth = oldWidth - 1
+
+            let newColumns =
+                schema.Columns
+                |> List.indexed
+                |> List.choose (fun (i, c) -> if i = pos then None else Some c)
+
+            let nextDefn = { defn with Columns = newColumns }
+            let transform = dropColumnTransform schema oldWidth newWidth pos
+
+            let build =
+                dropColumnBuild state defn.Name withIndexes newColumns nextDefn transform
+
+            return! commitRewrite state (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)) build
+        }
+
+    /// 列名の変更を、その列を参照する子テーブルの外部キーへ伝播させる。
+    let private renameReferencingTables (catalog: Catalog) (tableName: string) (rename: string -> string) =
+        catalog.Tables
+        |> List.filter (fun t -> not (Catalog.eqName t.Name tableName))
+        |> List.choose (fun t ->
+            let renamed =
+                t.ForeignKeys
+                |> List.map (fun fk ->
+                    if Catalog.eqName fk.ParentTable tableName then
+                        { fk with
+                            ParentColumns = fk.ParentColumns |> List.map rename
+                        }
+                    else
+                        fk)
+
+            if renamed = t.ForeignKeys then
+                None
+            else
+                Some { t with ForeignKeys = renamed })
+
+    /// 列名を変更し、主キー・外部キー・索引定義を追随させる。
+    let private alterRenameColumn
+        (state: ExecState)
+        (defn: TableDefinition)
+        (schema: TableSchema)
+        (oldName: string)
+        (newName: string)
+        =
+        result {
+            let! pos = TableSchema.requireIndexOf schema oldName
+
+            do!
+                if
+                    schema.Columns
+                    |> List.indexed
+                    |> List.exists (fun (i, c) -> i <> pos && SqlName.equal c.Name newName)
+                then
+                    err (DbError.name (sprintf "列 %s は既に存在します" newName))
+                else
+                    ret ()
+
+            let rename = renameColumn oldName newName
+            let renameLocal = renameForeignKeyLocal defn.Name rename
+            let referencing = renameReferencingTables state.Catalog defn.Name rename
+
+            let nextDefn =
+                { defn with
+                    Columns =
+                        schema.Columns
+                        |> List.mapi (fun i c -> if i = pos then { c with Name = newName } else c)
+                    PrimaryKeyColumns = defn.PrimaryKeyColumns |> List.map rename
+                    ForeignKeys = defn.ForeignKeys |> List.map renameLocal
+                }
+
+            let nextIndexes =
+                Catalog.indexesOf defn.Name state.Catalog
+                |> List.map (fun idx ->
+                    { idx with
+                        Columns = idx.Columns |> List.map rename
+                    })
+
+            let nextCatalog =
+                referencing
+                |> List.fold
+                    (fun cat t -> Catalog.addTable t cat)
+                    (nextIndexes
+                     |> List.fold
+                         (fun cat i -> Catalog.addIndex i cat)
+                         (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)))
+
+            let build = renameColumnBuild defn.Name nextDefn nextIndexes referencing
+
+            return! commitRewrite state nextCatalog build
+        }
+
     /// `ALTER TABLE`。
     /// <remarks>
     /// 行の書き換え（列の追加・削除）とカタログ更新を **1つの transaction** で commit する。
@@ -477,187 +693,10 @@ module internal EngineDdl =
                     }
 
                 match a.Action with
-                | AlterTableAction.AddColumn col ->
-                    do!
-                        if (TableSchema.indexOf schema col.Name).IsSome then
-                            err (DbError.name (sprintf "列 %s は既に存在します" col.Name))
-                        else
-                            ret ()
-
-                    do!
-                        if col.Constraint.PrimaryKey then
-                            err (DbError.constraintViolation "ALTER TABLE ... ADD COLUMN で PRIMARY KEY は指定できません")
-                        else
-                            ret ()
-
-                    do!
-                        if col.Constraint.References.IsSome then
-                            err (
-                                DbError.constraintViolation
-                                    "ALTER TABLE ... ADD COLUMN で REFERENCES は指定できません（テーブルを作り直してください）"
-                            )
-                        else
-                            ret ()
-
-                    do!
-                        if col.Constraint.Unique then
-                            err (
-                                DbError.constraintViolation
-                                    "ALTER TABLE ... ADD COLUMN で UNIQUE は指定できません（CREATE UNIQUE INDEX を使ってください）"
-                            )
-                        else
-                            ret ()
-
-                    do!
-                        if col.Constraint.NotNull && col.Constraint.Default.IsNone then
-                            err (DbError.constraintViolation (sprintf "NOT NULL 列 %s を追加するには DEFAULT が必要です" col.Name))
-                        else
-                            ret ()
-
-                    let! pad = addedColumnValue col
-                    let oldWidth = schema.Columns.Length
-                    let newWidth = oldWidth + 1
-
-                    let nextDefn =
-                        { defn with
-                            Columns = defn.Columns @ [ col ]
-                        }
-
-                    let transform = addColumnTransform schema oldWidth newWidth pad
-
-                    let build = addColumnBuild state defn.Name withIndexes nextDefn transform
-
-                    return!
-                        commitRewrite
-                            state
-                            (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog))
-                            build
-                | AlterTableAction.DropColumn name ->
-                    let! pos = TableSchema.requireIndexOf schema name
-
-                    do!
-                        if schema.PrimaryKey |> List.contains pos then
-                            err (DbError.constraintViolation (sprintf "主キー列 %s は削除できません（主キーは LSM のキーに使われています）" name))
-                        else
-                            ret ()
-
-                    do!
-                        if
-                            defn.ForeignKeys
-                            |> List.exists (fun fk -> fk.Columns |> List.exists (fun c -> SqlName.equal c name))
-                        then
-                            err (DbError.constraintViolation (sprintf "列 %s は外部キーで使われているため削除できません" name))
-                        else
-                            ret ()
-
-                    do!
-                        if
-                            state.Catalog.Tables
-                            |> List.exists (fun t ->
-                                t.ForeignKeys
-                                |> List.exists (fun fk ->
-                                    Catalog.eqName fk.ParentTable defn.Name
-                                    && fk.ParentColumns |> List.exists (fun c -> SqlName.equal c name)))
-                        then
-                            err (DbError.constraintViolation (sprintf "列 %s は外部キーの参照先になっているため削除できません" name))
-                        else
-                            ret ()
-
-                    do!
-                        match
-                            withIndexes.Indexes
-                            |> List.tryFind (fun idx -> idx.Columns |> List.exists (fun c -> SqlName.equal c name))
-                        with
-                        | Some idx when Catalog.isReservedIndexName idx.Name ->
-                            err (DbError.constraintViolation (sprintf "列 %s は UNIQUE 制約で使われているため削除できません" name))
-                        | Some idx ->
-                            err (DbError.constraintViolation (sprintf "列 %s は索引 %s で使われているため削除できません" name idx.Name))
-                        | None -> ret ()
-
-                    let oldWidth = schema.Columns.Length
-                    let newWidth = oldWidth - 1
-
-                    let newColumns =
-                        schema.Columns
-                        |> List.mapi (fun i c -> i, c)
-                        |> List.choose (fun (i, c) -> if i = pos then None else Some c)
-
-                    let nextDefn = { defn with Columns = newColumns }
-
-                    let transform = dropColumnTransform schema oldWidth newWidth pos
-
-                    let build =
-                        dropColumnBuild state defn.Name withIndexes newColumns nextDefn transform
-
-                    return!
-                        commitRewrite
-                            state
-                            (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog))
-                            build
+                | AlterTableAction.AddColumn col -> return! alterAddColumn state defn schema withIndexes col
+                | AlterTableAction.DropColumn name -> return! alterDropColumn state defn schema withIndexes name
                 | AlterTableAction.RenameColumn(oldName, newName) ->
-                    let! pos = TableSchema.requireIndexOf schema oldName
-
-                    do!
-                        if
-                            schema.Columns
-                            |> List.indexed
-                            |> List.exists (fun (i, c) -> i <> pos && SqlName.equal c.Name newName)
-                        then
-                            err (DbError.name (sprintf "列 %s は既に存在します" newName))
-                        else
-                            ret ()
-
-                    let rename = renameColumn oldName newName
-
-                    let renameLocal = renameForeignKeyLocal defn.Name rename
-
-                    let referencing =
-                        state.Catalog.Tables
-                        |> List.filter (fun t -> not (Catalog.eqName t.Name defn.Name))
-                        |> List.choose (fun t ->
-                            let renamed =
-                                t.ForeignKeys
-                                |> List.map (fun fk ->
-                                    if Catalog.eqName fk.ParentTable defn.Name then
-                                        { fk with
-                                            ParentColumns = fk.ParentColumns |> List.map rename
-                                        }
-                                    else
-                                        fk)
-
-                            if renamed = t.ForeignKeys then
-                                None
-                            else
-                                Some { t with ForeignKeys = renamed })
-
-                    let nextDefn =
-                        { defn with
-                            Columns =
-                                schema.Columns
-                                |> List.mapi (fun i c -> if i = pos then { c with Name = newName } else c)
-                            PrimaryKeyColumns = defn.PrimaryKeyColumns |> List.map rename
-                            ForeignKeys = defn.ForeignKeys |> List.map renameLocal
-                        }
-
-                    let nextIndexes =
-                        Catalog.indexesOf defn.Name state.Catalog
-                        |> List.map (fun idx ->
-                            { idx with
-                                Columns = idx.Columns |> List.map rename
-                            })
-
-                    let nextCatalog =
-                        referencing
-                        |> List.fold
-                            (fun cat t -> Catalog.addTable t cat)
-                            (nextIndexes
-                             |> List.fold
-                                 (fun cat i -> Catalog.addIndex i cat)
-                                 (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)))
-
-                    let build = renameColumnBuild defn.Name nextDefn nextIndexes referencing
-
-                    return! commitRewrite state nextCatalog build
+                    return! alterRenameColumn state defn schema oldName newName
             }
 
     let alterTable (a: AlterTable) (state: ExecState) =

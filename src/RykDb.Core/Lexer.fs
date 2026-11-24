@@ -267,6 +267,145 @@ module internal Lexer =
 
             ret (value, advance input closeState)
 
+    /// X'..' のバイナリリテラルを読む。
+    let private scanBlobLiteral (input: string) (n: int) (startPos: Position) (s: LexState) =
+        let contentStart = s.Index + 2
+        let closeIdx = findQuoteEnd input n contentStart
+
+        if closeIdx < 0 then
+            err (DbError.syntax "unclosed binary literal" startPos)
+        else
+            let digitCount = closeIdx - contentStart
+
+            if digitCount % 2 <> 0 then
+                err (DbError.syntax "binary literal has odd length" startPos)
+            else
+                let values =
+                    Array.init (digitCount / 2) (fun k ->
+                        hexDigitValue input.[contentStart + 2 * k] <<< 4
+                        ||| hexDigitValue input.[contentStart + 2 * k + 1])
+
+                if Array.exists (fun v -> v < 0) values then
+                    let hex = input.Substring(contentStart, digitCount)
+                    let msg = sprintf "binary literal contains non-hex character: %s" hex
+                    err (DbError.syntax msg startPos)
+                else
+                    ret (Token.BlobLit(Array.map byte values), advanceBy (digitCount + 3) s)
+
+    /// 識別子またはキーワードを読む。
+    let private scanWord (input: string) (n: int) (s: LexState) =
+        let endIdx = scanIdentEnd input n (s.Index + 1)
+        let word = input.Substring(s.Index, endIdx - s.Index)
+        let s' = advanceBy (endIdx - s.Index) s
+
+        if isAscii word 0 then
+            match Keywords.TryGetValue word with
+            | true, kw -> ret (Token.Keyword kw, s')
+            | _ -> ret (Token.Ident word, s')
+        else
+            match KeywordsUpper.TryGetValue(word.ToUpperInvariant()) with
+            | true, kw -> ret (Token.Keyword kw, s')
+            | _ -> ret (Token.Ident word, s')
+
+    /// 数値リテラルを読む（整数 / 実数 / 指数表記）。
+    let private scanNumber (input: string) (n: int) (startPos: Position) (s: LexState) =
+        let afterInt = scanDigits input n s
+        let hasFraction = afterInt.Index < n && input.[afterInt.Index] = '.'
+
+        let afterFraction =
+            if hasFraction then
+                advance input afterInt |> scanDigits input n
+            else
+                afterInt
+
+        let hasExponent =
+            afterFraction.Index < n
+            && (input.[afterFraction.Index] = 'e' || input.[afterFraction.Index] = 'E')
+
+        let afterExponent =
+            if hasExponent then
+                let afterE = advance input afterFraction
+
+                let afterSign =
+                    if afterE.Index < n && (input.[afterE.Index] = '+' || input.[afterE.Index] = '-') then
+                        advance input afterE
+                    else
+                        afterE
+
+                scanDigits input n afterSign
+            else
+                afterFraction
+
+        let followedByIdent =
+            afterExponent.Index < n && isIdentStart input.[afterExponent.Index]
+
+        if followedByIdent then
+            let text = input.Substring(s.Index, afterExponent.Index - s.Index + 1)
+            err (DbError.syntax (sprintf "numeric literal is followed by an identifier: %s" text) startPos)
+        else
+            let text = input.Substring(s.Index, afterExponent.Index - s.Index)
+
+            if hasFraction || hasExponent then
+                match
+                    System.Double.TryParse(
+                        text,
+                        System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture
+                    )
+                with
+                | true, v -> ret (Token.RealLit v, afterExponent)
+                | _ -> err (DbError.syntax (sprintf "failed to parse real: %s" text) startPos)
+            else
+                match
+                    System.Int64.TryParse(
+                        text,
+                        System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture
+                    )
+                with
+                | true, v -> ret (Token.IntLit v, afterExponent)
+                | _ -> err (DbError.syntax (sprintf "failed to parse integer: %s" text) startPos)
+
+    /// 区切り付きのリテラル（'...' / "..."）を読む。
+    let private scanDelimitedToken
+        (input: string)
+        (n: int)
+        (delim: char)
+        (unclosedMessage: string)
+        (toToken: string -> Token)
+        (startPos: Position)
+        (s: LexState)
+        =
+        collectDelimited input n delim unclosedMessage startPos s
+        |> Result.map (fun (v, s') -> toToken v, s')
+
+    /// 記号・パラメータを読む。
+    let private scanSymbol (input: string) (n: int) (startPos: Position) (paramIndex: int) (s: LexState) =
+        let next = if s.Index + 1 < n then input.[s.Index + 1] else '\000'
+        let c = input.[s.Index]
+
+        match c with
+        | '<' when next = '>' -> ret (Token.Symbol "<>", advanceBy 2 s)
+        | '<' when next = '=' -> ret (Token.Symbol "<=", advanceBy 2 s)
+        | '<' -> ret (Token.Symbol "<", advanceBy 1 s)
+        | '>' when next = '=' -> ret (Token.Symbol ">=", advanceBy 2 s)
+        | '>' -> ret (Token.Symbol ">", advanceBy 1 s)
+        | '=' -> ret (Token.Symbol "=", advanceBy 1 s)
+        | '!' when next = '=' -> ret (Token.Symbol "!=", advanceBy 2 s)
+        | '|' when next = '|' -> ret (Token.Symbol "||", advanceBy 2 s)
+        | '+' -> ret (Token.Symbol "+", advanceBy 1 s)
+        | '-' -> ret (Token.Symbol "-", advanceBy 1 s)
+        | '*' -> ret (Token.Symbol "*", advanceBy 1 s)
+        | '/' -> ret (Token.Symbol "/", advanceBy 1 s)
+        | '%' -> ret (Token.Symbol "%", advanceBy 1 s)
+        | '?' -> ret (Token.Param paramIndex, advanceBy 1 s)
+        | ';' -> ret (Token.Symbol ";", advanceBy 1 s)
+        | ',' -> ret (Token.Symbol ",", advanceBy 1 s)
+        | '.' -> ret (Token.Symbol ".", advanceBy 1 s)
+        | '(' -> ret (Token.Symbol "(", advanceBy 1 s)
+        | ')' -> ret (Token.Symbol ")", advanceBy 1 s)
+        | c -> err (DbError.syntax (sprintf "unexpected character '%c'" c) startPos)
+
     /// 1トークンを読む。
     /// 読み後は次の位置を返す。
     /// `paramIndex` は `?` に割り当てる位置パラメータ番号。
@@ -274,131 +413,20 @@ module internal Lexer =
         let c = input.[s.Index]
 
         if (c = 'x' || c = 'X') && s.Index + 1 < n && input.[s.Index + 1] = '\'' then
-            let contentStart = s.Index + 2
-            let closeIdx = findQuoteEnd input n contentStart
-
-            if closeIdx < 0 then
-                err (DbError.syntax "unclosed binary literal" startPos)
-            else
-                let digitCount = closeIdx - contentStart
-
-                if digitCount % 2 <> 0 then
-                    err (DbError.syntax "binary literal has odd length" startPos)
-                else
-                    let values =
-                        Array.init (digitCount / 2) (fun k ->
-                            hexDigitValue input.[contentStart + 2 * k] <<< 4
-                            ||| hexDigitValue input.[contentStart + 2 * k + 1])
-
-                    if Array.exists (fun v -> v < 0) values then
-                        let hex = input.Substring(contentStart, digitCount)
-                        let msg = sprintf "binary literal contains non-hex character: %s" hex
-                        err (DbError.syntax msg startPos)
-                    else
-                        ret (Token.BlobLit(Array.map byte values), advanceBy (digitCount + 3) s)
+            scanBlobLiteral input n startPos s
         elif isIdentStart c then
-            let endIdx = scanIdentEnd input n (s.Index + 1)
-            let word = input.Substring(s.Index, endIdx - s.Index)
-            let s' = advanceBy (endIdx - s.Index) s
-
-            if isAscii word 0 then
-                match Keywords.TryGetValue word with
-                | true, kw -> ret (Token.Keyword kw, s')
-                | _ -> ret (Token.Ident word, s')
-            else
-                match KeywordsUpper.TryGetValue(word.ToUpperInvariant()) with
-                | true, kw -> ret (Token.Keyword kw, s')
-                | _ -> ret (Token.Ident word, s')
+            scanWord input n s
         elif
             System.Char.IsDigit c
             || c = '.' && s.Index + 1 < n && System.Char.IsDigit input.[s.Index + 1]
         then
-            let afterInt = scanDigits input n s
-            let hasFraction = afterInt.Index < n && input.[afterInt.Index] = '.'
-
-            let afterFraction =
-                if hasFraction then
-                    advance input afterInt |> scanDigits input n
-                else
-                    afterInt
-
-            let hasExponent =
-                afterFraction.Index < n
-                && (input.[afterFraction.Index] = 'e' || input.[afterFraction.Index] = 'E')
-
-            let afterExponent =
-                if hasExponent then
-                    let afterE = advance input afterFraction
-
-                    let afterSign =
-                        if afterE.Index < n && (input.[afterE.Index] = '+' || input.[afterE.Index] = '-') then
-                            advance input afterE
-                        else
-                            afterE
-
-                    scanDigits input n afterSign
-                else
-                    afterFraction
-
-            let followedByIdent =
-                afterExponent.Index < n && isIdentStart input.[afterExponent.Index]
-
-            if followedByIdent then
-                let text = input.Substring(s.Index, afterExponent.Index - s.Index + 1)
-                err (DbError.syntax (sprintf "numeric literal is followed by an identifier: %s" text) startPos)
-            else
-                let text = input.Substring(s.Index, afterExponent.Index - s.Index)
-
-                if hasFraction || hasExponent then
-                    match
-                        System.Double.TryParse(
-                            text,
-                            System.Globalization.NumberStyles.Float,
-                            System.Globalization.CultureInfo.InvariantCulture
-                        )
-                    with
-                    | true, v -> ret (Token.RealLit v, afterExponent)
-                    | _ -> err (DbError.syntax (sprintf "failed to parse real: %s" text) startPos)
-                else
-                    match
-                        System.Int64.TryParse(
-                            text,
-                            System.Globalization.NumberStyles.Integer,
-                            System.Globalization.CultureInfo.InvariantCulture
-                        )
-                    with
-                    | true, v -> ret (Token.IntLit v, afterExponent)
-                    | _ -> err (DbError.syntax (sprintf "failed to parse integer: %s" text) startPos)
+            scanNumber input n startPos s
         elif c = '\'' then
-            collectDelimited input n '\'' "unclosed string" startPos s
-            |> Result.map (fun (v, s') -> Token.StringLit v, s')
+            scanDelimitedToken input n '\'' "unclosed string" Token.StringLit startPos s
         elif c = '"' then
-            collectDelimited input n '"' "unclosed quoted identifier" startPos s
-            |> Result.map (fun (v, s') -> Token.QuotedIdent v, s')
+            scanDelimitedToken input n '"' "unclosed quoted identifier" Token.QuotedIdent startPos s
         else
-            let next = if s.Index + 1 < n then input.[s.Index + 1] else '\000'
-
-            match c with
-            | '<' when next = '>' -> ret (Token.Symbol "<>", advanceBy 2 s)
-            | '<' when next = '=' -> ret (Token.Symbol "<=", advanceBy 2 s)
-            | '<' -> ret (Token.Symbol "<", advanceBy 1 s)
-            | '>' when next = '=' -> ret (Token.Symbol ">=", advanceBy 2 s)
-            | '>' -> ret (Token.Symbol ">", advanceBy 1 s)
-            | '=' -> ret (Token.Symbol "=", advanceBy 1 s)
-            | '!' when next = '=' -> ret (Token.Symbol "!=", advanceBy 2 s)
-            | '|' when next = '|' -> ret (Token.Symbol "||", advanceBy 2 s)
-            | '+' -> ret (Token.Symbol "+", advanceBy 1 s)
-            | '-' -> ret (Token.Symbol "-", advanceBy 1 s)
-            | '*' -> ret (Token.Symbol "*", advanceBy 1 s)
-            | '/' -> ret (Token.Symbol "/", advanceBy 1 s)
-            | '%' -> ret (Token.Symbol "%", advanceBy 1 s)
-            | '?' -> ret (Token.Param paramIndex, advanceBy 1 s)
-            | ';' -> ret (Token.Symbol ";", advanceBy 1 s)
-            | ',' -> ret (Token.Symbol ",", advanceBy 1 s)
-            | '.' -> ret (Token.Symbol ".", advanceBy 1 s)
-            | '(' -> ret (Token.Symbol "(", advanceBy 1 s)
-            | ')' -> ret (Token.Symbol ")", advanceBy 1 s)
-            | _ -> err (DbError.syntax (sprintf "unexpected character '%c'" c) startPos)
+            scanSymbol input n startPos paramIndex s
 
     [<TailCall>]
     let rec private collectTokens (input: string) (n: int) (acc: TokenItem list) (nextParam: int) (s: LexState) =

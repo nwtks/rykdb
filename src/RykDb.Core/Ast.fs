@@ -704,167 +704,113 @@ module internal Expr =
     /// 表示項目を StringBuilder へ書き出す。
     let private displayPut (sb: System.Text.StringBuilder) (s: string) = sb.Append s |> ignore
 
-    /// 文字列の表示項目を作る。
-    let private displayText (s: string) = Text s
+    /// 式 1つ分の表示手順を、後続の手順の前に展開する。
+    let private exprSteps (e: Expr) (next: PrintStep list) : PrintStep list =
+        match e with
+        | Expr.Literal l -> Text(SqlLiteral.toSqlLiteral l.ToSqlValue) :: next
+        | Expr.Column c -> Text c.Display :: next
+        | Expr.Name n -> Text n :: next
+        | Expr.Star -> Text "*" :: next
+        | Expr.QualifiedStar q -> Text q :: Text ".*" :: next
+        | Expr.Unary(op, x) -> Text "(" :: Text op.Display :: Text " " :: Sub(x, [ Text ")" ]) :: next
+        | Expr.Binary(op, a, b) ->
+            Text "("
+            :: Sub(a, [ Text " "; Text op.Display; Text " " ])
+            :: Sub(b, [ Text ")" ])
+            :: next
+        | Expr.IsNull(x, neg) ->
+            Text "("
+            :: Sub(x, [ Text(if neg then " IS NOT NULL)" else " IS NULL)") ])
+            :: next
+        | Expr.IsTruth(x, expected, neg) ->
+            let label =
+                match expected with
+                | TruthValue.True -> "TRUE"
+                | TruthValue.False -> "FALSE"
+                | TruthValue.Unknown -> "UNKNOWN"
 
-    /// 式と後続項目の表示項目を作る。
-    let private displaySub (x: Expr) (closer: PrintStep list) = Sub(x, closer)
+            let op = if neg then " IS NOT " else " IS "
+
+            Text "(" :: Sub(x, [ Text(op + label + ")") ]) :: next
+        | Expr.Between(x, a, b, neg) ->
+            Text "("
+            :: Sub(x, [ Text(if neg then " NOT BETWEEN " else " BETWEEN ") ])
+            :: Sub(a, [ Text " AND " ])
+            :: Sub(b, [ Text ")" ])
+            :: next
+        | Expr.InList(x, xs, neg) ->
+            let opener = Text(if neg then " NOT IN (" else " IN (")
+
+            match xs with
+            | [] -> Text "(" :: Sub(x, [ opener; Text "))" ]) :: next
+            | _ ->
+                let n = List.length xs
+
+                let items =
+                    xs |> List.mapi (fun i y -> Sub(y, [ Text(if i = n - 1 then "))" else ", ") ]))
+
+                Text "(" :: Sub(x, [ opener ]) :: (items @ next)
+        | Expr.Like(x, p, neg, esc) ->
+            let closer =
+                match esc with
+                | None -> [ Text ")" ]
+                | Some escExpr -> [ Text " ESCAPE "; Sub(escExpr, [ Text ")" ]) ]
+
+            Text "("
+            :: Sub(x, [ Text(if neg then " NOT LIKE " else " LIKE ") ])
+            :: Sub(p, closer)
+            :: next
+        | Expr.Case(branches, elseE) ->
+            let branchSteps =
+                branches
+                |> List.collect (fun (w, t) -> [ Text "WHEN "; Sub(w, [ Text " THEN " ]); Sub(t, [ Text " " ]) ])
+
+            let elseSteps =
+                match elseE with
+                | Some v -> [ Text "ELSE "; Sub(v, [ Text " " ]) ]
+                | None -> []
+
+            Text "(CASE " :: (branchSteps @ elseSteps @ [ Text "END)" ] @ next)
+        | Expr.FuncCall(n, args) ->
+            let n' = List.length args
+
+            let items =
+                args
+                |> List.mapi (fun i y -> Sub(y, [ Text(if i = n' - 1 then ")" else ", ") ]))
+
+            Text n :: Text "(" :: (items @ next)
+        | Expr.Cast(x, dt) -> Text "CAST(" :: Sub(x, [ Text(" AS " + DataType.toSqlName dt + ")") ]) :: next
+        | Expr.Default -> Text "DEFAULT" :: next
+        | Expr.AggCall(f, distinct, x) ->
+            Text f.Name
+            :: Text "("
+            :: ((if distinct then [ Text "DISTINCT " ] else []) @ (Sub(x, [ Text ")" ]) :: next))
+        | Expr.Value v -> Text(SqlLiteral.toSqlLiteral v) :: next
+        | Expr.Subquery _ -> Text "(subquery)" :: next
+        | Expr.Exists _ -> Text "EXISTS (subquery)" :: next
+        | Expr.CorrelatedSubquery _ -> Text "(subquery)" :: next
+        | Expr.InSubquery(x, _, neg) ->
+            Text "("
+            :: Sub(x, [ Text(if neg then " NOT IN (subquery))" else " IN (subquery))") ])
+            :: next
+        | Expr.InSet(x, _, neg) ->
+            Text "("
+            :: Sub(x, [ Text(if neg then " NOT IN (subquery))" else " IN (subquery))") ])
+            :: next
 
     /// 表示項目を末尾再帰で書き出す（式と後続項目を 1本のスタックで処理）。
     [<TailCall>]
-    let rec private writeSteps
-        (put: string -> unit)
-        (text: string -> PrintStep)
-        (sub: Expr -> PrintStep list -> PrintStep)
-        =
+    let rec private writeSteps (put: string -> unit) =
         function
         | [] -> ()
         | Text s :: rest ->
             put s
-            writeSteps put text sub rest
-        | Sub(e, closer) :: rest ->
-            let next = closer @ rest
-
-            match e with
-            | Expr.Literal l ->
-                put (SqlLiteral.toSqlLiteral l.ToSqlValue)
-                writeSteps put text sub next
-            | Expr.Column c ->
-                put c.Display
-                writeSteps put text sub next
-            | Expr.Name n ->
-                put n
-                writeSteps put text sub next
-            | Expr.Star ->
-                put "*"
-                writeSteps put text sub next
-            | Expr.QualifiedStar q ->
-                put q
-                put ".*"
-                writeSteps put text sub next
-            | Expr.Unary(op, x) ->
-                put "("
-                put op.Display
-                put " "
-                sub x [ text ")" ] :: next |> writeSteps put text sub
-            | Expr.Binary(op, a, b) ->
-                put "("
-
-                sub a [ text " "; text op.Display; text " " ] :: sub b [ text ")" ] :: next
-                |> writeSteps put text sub
-            | Expr.IsNull(x, neg) ->
-                put "("
-
-                sub x [ text (if neg then " IS NOT NULL)" else " IS NULL)") ] :: next
-                |> writeSteps put text sub
-            | Expr.IsTruth(x, expected, neg) ->
-                put "("
-
-                let label =
-                    match expected with
-                    | TruthValue.True -> "TRUE"
-                    | TruthValue.False -> "FALSE"
-                    | TruthValue.Unknown -> "UNKNOWN"
-
-                let op = if neg then " IS NOT " else " IS "
-                sub x [ text (op + label + ")") ] :: next |> writeSteps put text sub
-            | Expr.Between(x, a, b, neg) ->
-                put "("
-
-                sub x [ text (if neg then " NOT BETWEEN " else " BETWEEN ") ]
-                :: sub a [ text " AND " ]
-                :: sub b [ text ")" ]
-                :: next
-                |> writeSteps put text sub
-            | Expr.InList(x, xs, neg) ->
-                put "("
-                let opener = text (if neg then " NOT IN (" else " IN (")
-
-                match xs with
-                | [] -> sub x [ opener; text "))" ] :: next |> writeSteps put text sub
-                | _ ->
-                    let n = List.length xs
-
-                    let items =
-                        xs |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then "))" else ", ") ])
-
-                    sub x [ opener ] :: (items @ next) |> writeSteps put text sub
-            | Expr.Like(x, p, neg, esc) ->
-                put "("
-
-                let closer =
-                    match esc with
-                    | None -> [ text ")" ]
-                    | Some escExpr -> [ text " ESCAPE "; sub escExpr [ text ")" ] ]
-
-                sub x [ text (if neg then " NOT LIKE " else " LIKE ") ] :: sub p closer :: next
-                |> writeSteps put text sub
-            | Expr.Case(branches, elseE) ->
-                put "(CASE "
-
-                let branchSteps =
-                    branches
-                    |> List.collect (fun (w, t) -> [ text "WHEN "; sub w [ text " THEN " ]; sub t [ text " " ] ])
-
-                let elseSteps =
-                    match elseE with
-                    | Some v -> [ text "ELSE "; sub v [ text " " ] ]
-                    | None -> []
-
-                (branchSteps @ elseSteps @ [ text "END)" ]) @ next |> writeSteps put text sub
-            | Expr.FuncCall(n, args) ->
-                put n
-                put "("
-                let n' = List.length args
-
-                let items =
-                    args |> List.mapi (fun i y -> sub y [ text (if i = n' - 1 then ")" else ", ") ])
-
-                items @ next |> writeSteps put text sub
-            | Expr.Cast(x, dt) ->
-                put "CAST("
-
-                sub x [ text (" AS " + DataType.toSqlName dt + ")") ] :: next
-                |> writeSteps put text sub
-            | Expr.Default ->
-                put "DEFAULT"
-                writeSteps put text sub next
-            | Expr.AggCall(f, distinct, x) ->
-                put f.Name
-                put "("
-
-                if distinct then
-                    put "DISTINCT "
-
-                sub x [ text ")" ] :: next |> writeSteps put text sub
-            | Expr.Value v ->
-                put (SqlLiteral.toSqlLiteral v)
-                writeSteps put text sub next
-            | Expr.Subquery _ ->
-                put "(subquery)"
-                writeSteps put text sub next
-            | Expr.Exists _ ->
-                put "EXISTS (subquery)"
-                writeSteps put text sub next
-            | Expr.CorrelatedSubquery _ ->
-                put "(subquery)"
-                writeSteps put text sub next
-            | Expr.InSubquery(x, _, neg) ->
-                put "("
-
-                sub x [ text (if neg then " NOT IN (subquery))" else " IN (subquery))") ]
-                :: next
-                |> writeSteps put text sub
-            | Expr.InSet(x, _, neg) ->
-                put "("
-
-                sub x [ text (if neg then " NOT IN (subquery))" else " IN (subquery))") ]
-                :: next
-                |> writeSteps put text sub
+            writeSteps put rest
+        | Sub(e, closer) :: rest -> writeSteps put (exprSteps e (closer @ rest))
 
     /// 式をテキストへ戻す（EXPLAIN やエラーメッセージ用）。
     /// 「式」と「その式を出したあとに吐く文字列」を 1本のスタックで表現し、末尾再帰で処理する。
     let toDisplayString (e: Expr) =
         let sb = System.Text.StringBuilder()
-        writeSteps (displayPut sb) displayText displaySub [ displaySub e [] ]
+        writeSteps (displayPut sb) [ Sub(e, []) ]
         sb.ToString()

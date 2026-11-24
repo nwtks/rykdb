@@ -371,6 +371,74 @@ module internal Engine =
         | Some lo, Some hi -> sprintf "%s=[%g,%g]" c.Name lo hi
         | _ -> ""
 
+    /// ANALYZE の結果（見出しと 1テーブル 1行）を作る。
+    let private analyzeResultRows (stats: TableStats list) =
+        let columns =
+            [|
+                "table"
+                "rows"
+                "columns"
+                "ndv"
+                "nulls"
+                "ranges"
+                "indexes"
+                "histograms"
+                "mcv"
+                "row_bytes"
+                "analyzed_at"
+            |]
+
+        let rows =
+            stats
+            |> List.map (fun (s: TableStats) ->
+                [|
+                    SqlValue.Text s.Table
+                    SqlValue.Int s.RowCount
+                    SqlValue.Int(int64 s.Columns.Length)
+                    SqlValue.Text(
+                        s.Columns
+                        |> List.map (fun c -> sprintf "%s=%d" c.Name c.NDV)
+                        |> String.concat ","
+                    )
+                    SqlValue.Text(
+                        s.Columns
+                        |> List.map (fun c -> sprintf "%s=%d" c.Name c.Nulls)
+                        |> String.concat ","
+                    )
+                    SqlValue.Text(
+                        s.Columns
+                        |> List.map columnRangeText
+                        |> List.filter ((<>) "")
+                        |> String.concat ","
+                    )
+                    SqlValue.Text(
+                        s.Indexes
+                        |> List.map (fun i -> sprintf "%s=%A" i.Name i.PrefixNDV)
+                        |> String.concat ","
+                    )
+                    SqlValue.Text(
+                        s.Columns
+                        |> List.filter (fun c -> not (List.isEmpty c.Histogram))
+                        |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Histogram))
+                        |> String.concat ","
+                    )
+                    SqlValue.Text(
+                        s.Columns
+                        |> List.filter (fun c -> not (List.isEmpty c.Mcv))
+                        |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Mcv))
+                        |> String.concat ","
+                    )
+                    SqlValue.Int(int64 (System.Math.Round s.RowBytes))
+                    SqlValue.Text(
+                        match s.AnalyzedAt with
+                        | Some t -> t.UtcDateTime.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
+                        | None -> ""
+                    )
+                |])
+            |> Array.ofList
+
+        StatementResult.OfRows(0, columns, rows)
+
     let private runStatement (limits: ResultLimits) (state: ExecState) (txn: Transaction) =
         function
         | Statement.Select stmt -> runSelect limits state txn stmt
@@ -387,74 +455,7 @@ module internal Engine =
         | Statement.Analyze(name, sample) ->
             runDdlWithState state (fun st ->
                 EngineAnalyze.analyze (name, sample) limits.Cancel limits.Progress st
-                >>= fun (next, stats) ->
-                    let columns =
-                        [|
-                            "table"
-                            "rows"
-                            "columns"
-                            "ndv"
-                            "nulls"
-                            "ranges"
-                            "indexes"
-                            "histograms"
-                            "mcv"
-                            "row_bytes"
-                            "analyzed_at"
-                        |]
-
-                    let rows =
-                        stats
-                        |> List.map (fun (s: TableStats) ->
-                            [|
-                                SqlValue.Text s.Table
-                                SqlValue.Int s.RowCount
-                                SqlValue.Int(int64 s.Columns.Length)
-                                SqlValue.Text(
-                                    s.Columns
-                                    |> List.map (fun c -> sprintf "%s=%d" c.Name c.NDV)
-                                    |> String.concat ","
-                                )
-                                SqlValue.Text(
-                                    s.Columns
-                                    |> List.map (fun c -> sprintf "%s=%d" c.Name c.Nulls)
-                                    |> String.concat ","
-                                )
-                                SqlValue.Text(
-                                    s.Columns
-                                    |> List.map columnRangeText
-                                    |> List.filter ((<>) "")
-                                    |> String.concat ","
-                                )
-                                SqlValue.Text(
-                                    s.Indexes
-                                    |> List.map (fun i -> sprintf "%s=%A" i.Name i.PrefixNDV)
-                                    |> String.concat ","
-                                )
-                                SqlValue.Text(
-                                    s.Columns
-                                    |> List.filter (fun c -> not (List.isEmpty c.Histogram))
-                                    |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Histogram))
-                                    |> String.concat ","
-                                )
-                                SqlValue.Text(
-                                    s.Columns
-                                    |> List.filter (fun c -> not (List.isEmpty c.Mcv))
-                                    |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Mcv))
-                                    |> String.concat ","
-                                )
-                                SqlValue.Int(int64 (System.Math.Round s.RowBytes))
-                                SqlValue.Text(
-                                    match s.AnalyzedAt with
-                                    | Some t ->
-                                        t.UtcDateTime.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
-                                    | None -> ""
-                                )
-                            |])
-                        |> Array.ofList
-
-                    StatementResult.OfRows(0, columns, rows)
-                    |> Result.map (fun result -> next, result))
+                >>= fun (next, stats) -> analyzeResultRows stats |> Result.map (fun result -> next, result))
         | Statement.Begin
         | Statement.Commit
         | Statement.Rollback -> ret state |> noRows

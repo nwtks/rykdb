@@ -537,6 +537,38 @@ module internal Sstable =
             | None -> SstEntry.decodeValueAt slice valueLen
             | Some mask -> SstEntry.decodeMaskedValueAt mask slice valueLen
 
+    /// ブロック内の 1エントリのヘッダを読み、接頭辞長・キー末尾長・キー開始位置・値長を返す。
+    let private readLookupHeader
+        (data: byte array)
+        (payloadLen: int)
+        (prev: byte array)
+        (pos: int)
+        : Result<struct (int * int * int * int), DbError> =
+        let struct (ok1, shared, p1) = readVarintAt data payloadLen pos
+        let struct (ok2, tailLen, p2) = readVarintAt data payloadLen p1
+        let struct (ok3, valueLen, p3) = readVarintAt data payloadLen p2
+
+        if not (ok1 && ok2 && ok3) then
+            err (DbError.corruption "Sstable: ブロックの varint が不正です")
+        elif shared > uint64 prev.Length then
+            err (DbError.corruption "Sstable: 接頭辞長が直前のキーを超えています")
+        elif
+            tailLen > uint64 System.Int32.MaxValue
+            || int tailLen > System.Int32.MaxValue - int shared
+        then
+            err (DbError.corruption "Sstable: キー長が不正です")
+        elif int tailLen > payloadLen - p3 then
+            err (DbError.corruption "Sstable: キーがブロックの終端を超えています")
+        else
+            let sharedLength = int shared
+            let tailLength = int tailLen
+            let valuePos = p3 + tailLength
+
+            if valueLen > uint64 System.Int32.MaxValue || int valueLen > payloadLen - valuePos then
+                err (DbError.corruption "Sstable: 値がブロックの終端を超えています")
+            else
+                ret (struct (sharedLength, tailLength, p3, int valueLen))
+
     /// ブロック内を先頭から走査してキーを探す。
     [<TailCall>]
     let rec private scanLookupBlock
@@ -555,67 +587,40 @@ module internal Sstable =
             else
                 ret None
         else
-            let struct (ok1, shared, p1) = readVarintAt data payloadLen pos
-            let struct (ok2, tailLen, p2) = readVarintAt data payloadLen p1
-            let struct (ok3, valueLen, p3) = readVarintAt data payloadLen p2
+            match readLookupHeader data payloadLen prev pos with
+            | Error e -> err e
+            | Ok(struct (sharedLength, tailLength, keyStart, valueLength)) ->
+                let valuePos = keyStart + tailLength
+                let entryKey = Array.zeroCreate<byte>(sharedLength + tailLength)
+                Array.blit prev 0 entryKey 0 sharedLength
+                Array.blit data keyStart entryKey sharedLength tailLength
+                let ordering = Bytes.compare entryKey key
 
-            if not (ok1 && ok2 && ok3) then
-                err (DbError.corruption "Sstable: ブロックの varint が不正です")
-            elif shared > uint64 prev.Length then
-                err (DbError.corruption "Sstable: 接頭辞長が直前のキーを超えています")
-            elif
-                tailLen > uint64 System.Int32.MaxValue
-                || int tailLen > System.Int32.MaxValue - int shared
-            then
-                err (DbError.corruption "Sstable: キー長が不正です")
-            elif int tailLen > payloadLen - p3 then
-                err (DbError.corruption "Sstable: キーがブロックの終端を超えています")
-            else
-                let sharedLength = int shared
-                let tailLength = int tailLen
-                let valuePos = p3 + tailLength
-
-                if valueLen > uint64 System.Int32.MaxValue || int valueLen > payloadLen - valuePos then
-                    err (DbError.corruption "Sstable: 値がブロックの終端を超えています")
+                if ordering < 0 then
+                    scanLookupBlock maskOpt key visible indexEntry data payloadLen entryKey (valuePos + valueLength)
+                elif ordering > 0 then
+                    ret None
                 else
-                    let entryKey = Array.zeroCreate<byte>(sharedLength + tailLength)
-                    Array.blit prev 0 entryKey 0 sharedLength
-                    Array.blit data p3 entryKey sharedLength tailLength
-                    let ordering = Bytes.compare entryKey key
+                    match decodeLookupValue maskOpt data valuePos valueLength with
+                    | Ok(seqNo, value, _) ->
+                        let isVisible =
+                            match visible with
+                            | Some s -> seqNo <= s
+                            | None -> true
 
-                    if ordering < 0 then
-                        scanLookupBlock
-                            maskOpt
-                            key
-                            visible
-                            indexEntry
-                            data
-                            payloadLen
-                            entryKey
-                            (valuePos + int valueLen)
-                    elif ordering > 0 then
-                        ret None
-                    else
-                        match decodeLookupValue maskOpt data valuePos (int valueLen) with
-                        | Ok(seqNo, value, _) ->
-                            let isVisible =
-                                match visible with
-                                | Some s -> seqNo <= s
-                                | None -> true
-
-                            if isVisible then
-                                ret (Some(SstEntry.make entryKey seqNo value))
-                            else
-                                scanLookupBlock
-                                    maskOpt
-                                    key
-                                    visible
-                                    indexEntry
-                                    data
-                                    payloadLen
-                                    entryKey
-                                    (valuePos + int valueLen)
-                        | Error e -> err e
+                        if isVisible then
+                            ret (Some(SstEntry.make entryKey seqNo value))
+                        else
+                            scanLookupBlock
+                                maskOpt
+                                key
+                                visible
+                                indexEntry
+                                data
+                                payloadLen
+                                entryKey
+                                (valuePos + valueLength)
+                    | Error e -> err e
 
     /// 1ブロックを検索する（チェックサムを検証してから走査）。
     let private lookupIndexEntry
