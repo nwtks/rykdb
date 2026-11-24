@@ -1,11 +1,6 @@
 namespace RykDb.Core
 
 /// 読み取り位置を値で持つカーソル。
-/// <remarks>
-/// レコードはこのシグネチャで隠す。
-/// 構築は `create` / `createSlice`、前進は `advance` に限る。
-/// フィールドの読み取りは `data` / `pos` / `endPos` を使う。
-/// </remarks>
 type internal Cursor
 
 module internal Cursor =

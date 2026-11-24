@@ -68,7 +68,7 @@ module internal SstScan =
     val toArray: SstScan -> Result<SstEntry array, DbError>
     val filter: (SstEntry -> bool) -> SstScan -> SstScan
 
-/// 開いたソースの k-way merge（ケースは非公開）。
+/// 開いたソースの k-way merge。
 type internal SstMerge
 
 module internal SstMerge =

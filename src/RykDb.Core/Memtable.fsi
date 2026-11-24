@@ -25,10 +25,6 @@ module internal Entry =
     val decodeBatch: byte array -> Result<TxnId * Entry array, DbError>
 
 /// memtable（永続 Treap）。
-/// <remarks>
-/// ケースはこのシグネチャで隠す。
-/// 構築は `Memtable.Empty` / `insert` / `apply` に限る。
-/// </remarks>
 type internal Memtable
 
 module internal Memtable =

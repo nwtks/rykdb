@@ -5,8 +5,6 @@
 //   chooseScanMethod    : WHERE の等値・範囲から ScanMethod を選ぶ
 //   chooseJoinAlgorithm : ON と昇格した WHERE から JoinAlgorithm を選ぶ
 //   estimateRows        : 統計（無ければ既定値）から行数を推定する（結合順と INL の判断で共有）
-//
-// 論理代数の組み立ては PlanBuilder、Op への変換は Optimizer。
 // ===========================================================================
 
 namespace RykDb.Core

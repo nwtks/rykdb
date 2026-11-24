@@ -1,11 +1,6 @@
 namespace RykDb.Core
 
 /// 書き出し: Writer（不変のチャンク列）。
-/// <remarks>
-/// `Chunks` は逆順（先頭が最後に書いたチャンク）で保持する。
-/// ケースとレコードはこのシグネチャで隠すので、
-/// 構築は `Empty` と各 write 関数に限られる。
-/// </remarks>
 type internal Writer
 
 module internal Writer =

@@ -487,6 +487,22 @@ let peopleSchema: TableSchema =
             ]
     }
 
+/// 索引なしの people スキーマ（DML 経路のテスト用）。
+/// `peopleSchema` は索引付きで NOT NULL 検証が付くため、索引を触らない
+/// ExecContext / DmlOps のテストではこちらを使う。
+let plainPeopleSchema: TableSchema =
+    {
+        Name = "people"
+        Columns =
+            [
+                col "id" DataType.Integer
+                col "name" DataType.Text
+                col "age" DataType.Integer
+            ]
+        PrimaryKey = [ 0 ]
+        Indexes = []
+    }
+
 let ordersSchema: TableSchema =
     {
         Name = "orders"
@@ -755,3 +771,176 @@ let buildSstable (bloomFalsePositiveRate: float) (entries: SstEntry array) =
     match protect build with
     | Ok result -> result
     | Error e -> Error e
+
+/// OpsJoin のテスト用フィクスチャ（OpsJoinTests / OpsJoinHashTests / OpsJoinMergeTests で共有）。
+module OpsJoinFixtures =
+    /// このモジュールのテストは上限なし（スピルしない）経路を検証する。
+    /// スピル経路は専用のバジェットで別途テストする。
+    module UnlimitedOpsJoin =
+        let innerJoin = OpsJoin.innerJoin MemoryBudget.Unlimited
+        let leftJoin = OpsJoin.leftJoin MemoryBudget.Unlimited
+        let innerJoinHash = OpsJoinHash.innerJoinHash MemoryBudget.Unlimited
+
+        let innerJoinHashBuildLeft =
+            OpsJoinHash.innerJoinHashBuildLeft MemoryBudget.Unlimited
+
+        let leftJoinHash = OpsJoinHash.leftJoinHash MemoryBudget.Unlimited
+        let innerJoinMerge = OpsJoinMerge.innerJoinMerge MemoryBudget.Unlimited
+        let leftJoinMerge = OpsJoinMerge.leftJoinMerge MemoryBudget.Unlimited
+        let innerJoinIndexed = OpsJoin.innerJoinIndexed
+        let leftJoinIndexed = OpsJoin.leftJoinIndexed
+
+    let leftSchema = outSchema [ outCol "lid" (Some "l") (Some DataType.Integer) ]
+
+    let rightSchema = outSchema [ outCol "rid" (Some "r") (Some DataType.Integer) ]
+
+    let lcol = Expr.Column { Qualifier = Some "l"; Name = "lid" }
+    let rcol = Expr.Column { Qualifier = Some "r"; Name = "rid" }
+
+    /// 行の並びを順序非依存の文字列にする（結合アルゴリズムが変わっても比較できる）。
+    let rowsText (rows: SqlValue array array) =
+        rows
+        |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
+        |> Array.sort
+        |> String.concat "|"
+
+    /// 重複キーを含む左右の入力（左 40行 / 右 24行）。
+    let dupLeft () =
+        Op.ofArray [| for i in 0..39 -> [| SqlValue.Int(int64 (i % 5)) |] |]
+
+    let dupRight () =
+        Op.ofArray [| for i in 0..23 -> [| SqlValue.Int(int64 (i % 8)) |] |]
+
+    let onEq = Expr.Binary(BinaryOp.Eq, lcol, rcol)
+
+    /// 複合キー (a, b) と、結果の同一性を確かめるための値 v を持つスキーマ。
+    let diffLeftSchema =
+        outSchema
+            [
+                outCol "a" (Some "l") (Some DataType.Integer)
+                outCol "b" (Some "l") (Some DataType.Integer)
+                outCol "v" (Some "l") (Some DataType.Integer)
+            ]
+
+    let diffRightSchema =
+        outSchema
+            [
+                outCol "a" (Some "r") (Some DataType.Integer)
+                outCol "b" (Some "r") (Some DataType.Integer)
+                outCol "v" (Some "r") (Some DataType.Integer)
+            ]
+
+    let diffColumn side name =
+        Expr.Column { Qualifier = Some side; Name = name }
+
+    let diffKeyEq =
+        Expr.Binary(
+            BinaryOp.And,
+            Expr.Binary(BinaryOp.Eq, diffColumn "l" "a", diffColumn "r" "a"),
+            Expr.Binary(BinaryOp.Eq, diffColumn "l" "b", diffColumn "r" "b")
+        )
+
+    let diffResidual = Expr.Binary(BinaryOp.Lt, diffColumn "l" "v", diffColumn "r" "v")
+
+    /// NULL を最小としてキー列を比較する（マージ結合用の整列）。
+    let compareDiffKeys (a: SqlValue array) (b: SqlValue array) =
+        let rec go i =
+            if i >= 2 then
+                0
+            else
+                match a.[i], b.[i] with
+                | SqlValue.Null, SqlValue.Null -> go (i + 1)
+                | SqlValue.Null, _ -> -1
+                | _, SqlValue.Null -> 1
+                | x, y ->
+                    match SqlValue.compareValuesV x y with
+                    | DbOk 0 -> go (i + 1)
+                    | DbOk c -> c
+                    | DbErr _ -> 0
+
+        go 0
+
+    /// 重複キー・NULL キー・複合キーを含むランダムな行。
+    let diffRows (seed: int) (count: int) =
+        let rnd = System.Random(seed)
+
+        Array.init count (fun i ->
+            let key modulus =
+                if rnd.Next(0, 8) = 0 then
+                    SqlValue.Null
+                else
+                    SqlValue.Int(int64 (rnd.Next(0, modulus)))
+
+            [| key 5; key 4; SqlValue.Int(int64 i) |])
+
+    /// 右テーブルの索引探索を模した lookup（キーは `compareValuesV` で比較する）。
+    let diffLookup (rows: SqlValue array array) (keys: int array) (key: SqlValue array) : Result<Op, DbError> =
+        let sameKey (row: SqlValue array) =
+            let rec go i =
+                if i >= keys.Length then
+                    true
+                else
+                    match SqlValue.compareValuesV row.[keys.[i]] key.[i] with
+                    | DbOk 0 -> go (i + 1)
+                    | _ -> false
+
+            go 0
+
+        rows |> Array.filter sameKey |> Op.ofArray |> ret
+
+    let assertSameRows (label: string) (expected: SqlValue array array) (actual: SqlValue array array) =
+        if rowsText expected <> rowsText actual then
+            Assert.Fail(sprintf "%s: 結果が一致しません\n期待: %s\n実際: %s" label (rowsText expected) (rowsText actual))
+
+/// Ops のテスト用フィクスチャ（OpsTests / OpsSortTests / OpsDistinctTests / OpsAggregateTests で共有）。
+module OpsFixtures =
+    /// このモジュールのテストは上限なし（スピルしない）経路を検証する。
+    /// スピル経路は専用のバジェットで別途テストする。
+    module UnlimitedOps =
+        let filter = Ops.filter
+
+        let sortBy schema keys src =
+            OpsSort.sortBy MemoryBudget.Unlimited schema [] [] keys src
+
+        let distinct = OpsDistinct.distinct MemoryBudget.Unlimited
+        let aggregate = OpsAggregate.aggregate MemoryBudget.Unlimited
+        let havingFilter = OpsAggregate.havingFilter
+
+    /// 行の配列を Op にする（入れ子の配列推論を避けるため明示的に作る）。
+    let opOfRows (rows: SqlValue array list) = Op.ofArray (List.toArray rows)
+
+    /// 1 行を作る。
+    let row (values: SqlValue list) = List.toArray values
+
+    /// SqlValue から値を取り出す（テスト用）。
+    let asDec (v: SqlValue) =
+        match v with
+        | SqlValue.Decimal d -> d
+        | SqlValue.Int i -> decimal i
+        | other -> failwithf "DECIMAL ではありません: %A" other
+
+    let asReal (v: SqlValue) =
+        match v with
+        | SqlValue.Real f -> f
+        | other -> failwithf "REAL ではありません: %A" other
+
+    let col (name: string) =
+        Expr.Column { Qualifier = None; Name = name }
+
+    /// 行の並びを表示用の文字列にする（スピル有無の比較用）。
+    let rowsText (rows: SqlValue array array) =
+        rows
+        |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
+        |> String.concat "|"
+
+    /// 退避に使った一時ファイルが残っていないことを確かめる（サイズ付きの詳細表示）。
+    let assertNoLeftoversDetailed (dir: string) =
+        let files = System.IO.Directory.GetFiles dir
+
+        if files.Length > 0 then
+            let detail =
+                files
+                |> Array.map (fun p -> sprintf "%s(%d)" (System.IO.Path.GetFileName p) (System.IO.FileInfo(p).Length))
+                |> String.concat " "
+
+            Assert.Fail(sprintf "一時ファイルが残っています: %s" detail)

@@ -971,8 +971,10 @@ module internal PlanBuilder =
                 |> all
 
             let! qs = Binder.qualifyMany schema (selectExprs @ orderExprs)
-            let selectAggs = Ops.aggCalls (qs |> List.take (List.length selectExprs))
-            let orderAggs = orderExprs |> List.map (fun e -> Ops.aggCalls [ e ]) |> List.concat
+            let selectAggs = OpsShared.aggCalls (qs |> List.take (List.length selectExprs))
+
+            let orderAggs =
+                orderExprs |> List.map (fun e -> OpsShared.aggCalls [ e ]) |> List.concat
 
             let! having, havingAggs =
                 match stmt.Having with
@@ -983,7 +985,7 @@ module internal PlanBuilder =
                         let! hs = Binder.qualifyMany schema [ h' ]
 
                         match hs with
-                        | [ hv ] -> return Some hv, Ops.aggCalls [ hv ]
+                        | [ hv ] -> return Some hv, OpsShared.aggCalls [ hv ]
                         | _ -> return! err (DbError.internalError "HAVING の修飾に失敗")
                     }
 

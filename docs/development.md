@@ -173,6 +173,7 @@ class 内の `let` は FS1182 が担当するため対象外（`--warnon:1182` �
 
 - `DatabaseTests.fs` はソースファイルに対応せず、`Session` / `SessionPool` 経由の DB 全体の通し経路を検証する。
 - `ProcessLock.fs` は専用ファイルを持たず、`RowStoreTests` / `DatabaseTests` で間接的に検証する。
+- `EngineAnalyze.fs` / `EngineDdl.fs` は専用ファイルを持たず、`DatabaseTests` / `SqlReferenceTests` の E2E で検証する。
 - `CommitDurability:` と `SerializationTests` の「順序保持:」は横断的な性質を検証する。
 - `CliTests` は CLI 全体を検証する。
 - SQL の構文と意味論は [`sql-reference.md`](sql-reference.md) に対応する `SqlReferenceTests.fs` に書く。

@@ -500,7 +500,7 @@ module internal Optimizer =
             | JoinKind.Inner ->
                 match frame.BuildSide with
                 | HashBuildLeft ->
-                    OpsJoin.innerJoinHashBuildLeft
+                    OpsJoinHash.innerJoinHashBuildLeft
                         ctx.Budget
                         frame.LeftSchema
                         left
@@ -510,7 +510,7 @@ module internal Optimizer =
                         keys.RightIndices
                         keys.Residual
                 | HashBuildRight ->
-                    OpsJoin.innerJoinHash
+                    OpsJoinHash.innerJoinHash
                         ctx.Budget
                         frame.LeftSchema
                         left
@@ -520,7 +520,7 @@ module internal Optimizer =
                         keys.RightIndices
                         keys.Residual
             | JoinKind.Left ->
-                OpsJoin.leftJoinHash
+                OpsJoinHash.leftJoinHash
                     ctx.Budget
                     frame.LeftSchema
                     left
@@ -537,7 +537,7 @@ module internal Optimizer =
         | Some keys ->
             match frame.Kind with
             | JoinKind.Inner ->
-                OpsJoin.innerJoinMerge
+                OpsJoinMerge.innerJoinMerge
                     ctx.Budget
                     frame.LeftSchema
                     left
@@ -547,7 +547,7 @@ module internal Optimizer =
                     keys.RightIndices
                     keys.Residual
             | JoinKind.Left ->
-                OpsJoin.leftJoinMerge
+                OpsJoinMerge.leftJoinMerge
                     ctx.Budget
                     frame.LeftSchema
                     left
@@ -847,16 +847,16 @@ module internal Optimizer =
                     | Ok filtered -> run ctx memo rest (ApplyOp filtered)
                     | Error e -> err e
                 | AggregateFrame(groupBy, aggs, inSchema) ->
-                    match Ops.aggregate ctx.Budget inSchema groupBy aggs op with
+                    match OpsAggregate.aggregate ctx.Budget inSchema groupBy aggs op with
                     | Ok aggregated -> run ctx memo rest (ApplyOp aggregated)
                     | Error e -> err e
                 | HavingFrame(h, aggs, groupBy) ->
-                    match Ops.havingFilter groupBy aggs h with
+                    match OpsAggregate.havingFilter groupBy aggs h with
                     | Error e -> err e
                     | Ok p -> run ctx memo rest (ApplyOp(Op.filter p op))
-                | DistinctFrame -> run ctx memo rest (ApplyOp(Ops.distinct ctx.Budget op))
+                | DistinctFrame -> run ctx memo rest (ApplyOp(OpsDistinct.distinct ctx.Budget op))
                 | SortFrame(keys, childSchema, groupBy, aggs) ->
-                    match Ops.sortBy ctx.Budget childSchema groupBy aggs keys op with
+                    match OpsSort.sortBy ctx.Budget childSchema groupBy aggs keys op with
                     | Ok sorted -> run ctx memo rest (ApplyOp sorted)
                     | Error e -> err e
                 | LimitFrame(offset, limit) ->

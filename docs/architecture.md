@@ -170,22 +170,23 @@ flowchart TB
 
 ### 主要モジュール
 
-| モジュール                                                            | 役割                                   |
-| --------------------------------------------------------------------- | -------------------------------------- |
-| `Errors`、`Types`                                                     | `DbError`、`SqlValue`、型、3値論理     |
-| `Writer`、`Cursor`、`Serialization`                                   | 不変書き込み、カーソル、順序保持符号化 |
-| `Memtable`、`Wal`                                                     | 永続Treapと論理ログ                    |
-| `SstScan`、`Sstable`、`SstableFormat`                                 | 部分読み、ブロック走査、SSTable形式    |
-| `VersionSet`、`Manifest`、`Compaction`                                | レベル構成、版履歴、圧縮               |
-| `StorageEngine`                                                       | LSMツリーの公開層                      |
-| `Ast`、`Lexer`、`Parser`                                              | SQL構文木、字句解析、構文解析          |
-| `Transactions`、`ProcessLock`                                         | MVCC、プロセス間排他                   |
-| `RowStore`、`TableSchema`、`Catalog`                                  | 行、スキーマ、論理keyspace             |
-| `Eval`、`Scalar`                                                      | 式評価とスカラー関数                   |
-| `Op`、`Ops`、`OpsJoin`、`ExtSort`、`Spill`                            | pull演算子、結合、ソート、退避         |
-| `Binder`、`Analyzer`、`JoinOrder`、`PlanBuilder`、`Optimizer`、`Plan` | 名前解決、結合順、論理代数、物理計画   |
-| `Dml`、`ForeignKey`、`ExecContext`                                    | DMLと参照整合性                        |
-| `Engine`、`DatabaseHost`、`Session`                                   | 文実行、共有状態、接続API              |
+| モジュール                                                                | 役割                                   |
+| ------------------------------------------------------------------------- | -------------------------------------- |
+| `Errors`、`Types`                                                         | `DbError`、`SqlValue`、型、3値論理     |
+| `Writer`、`Cursor`、`Serialization`、`KeyCodec`                           | 不変書き込み、カーソル、順序保持符号化 |
+| `Memtable`、`Wal`                                                         | 永続Treapと論理ログ                    |
+| `SstScan`、`Sstable`、`SstableFormat`                                     | 部分読み、ブロック走査、SSTable形式    |
+| `VersionSet`、`Manifest`、`Compaction`                                    | レベル構成、版履歴、圧縮               |
+| `StorageEngine`                                                           | LSMツリーの公開層                      |
+| `Ast`、`Lexer`、`Parser`                                                  | SQL構文木、字句解析、構文解析          |
+| `Transactions`、`ProcessLock`                                             | MVCC、プロセス間排他                   |
+| `RowStore`、`TableSchema`、`Catalog`、`Schema`                            | 行、スキーマ、論理keyspace             |
+| `Eval`、`Scalar`                                                          | 式評価とスカラー関数                   |
+| `Op`、`Ops`、`OpsSort`、`OpsDistinct`、`OpsAggregate`、`ExtSort`、`Spill` | pull演算子、ソート、集約、退避         |
+| `OpsJoin`、`OpsJoinHash`、`OpsJoinMerge`、`OpsJoinShared`                 | 結合                                   |
+| `Binder`、`Analyzer`、`JoinOrder`、`PlanBuilder`、`Optimizer`、`Plan`     | 名前解決、結合順、論理代数、物理計画   |
+| `Dml`、`ForeignKey`、`ExecContext`、`DmlOps`                              | DMLと参照整合性                        |
+| `Engine`、`DatabaseHost`、`Session`                                       | 文実行、共有状態、接続API              |
 
 ### F#コンパイル順
 
@@ -193,14 +194,17 @@ F#はファイルをプロジェクトの列挙順に評価する。
 依存が下位から上位へ進むよう、`.fsproj`の`Compile`項目でコンパイル順を明示する。
 
 ```text
-Errors -> Types -> Writer -> Cursor -> Serialization -> Memtable -> Wal
+Errors -> Types -> Writer -> Cursor -> Serialization -> KeyCodec -> Memtable -> Wal
     -> BloomFilter -> SstScan -> SstableFormat -> Sstable -> VersionSet
     -> Compaction -> StorageEngine -> Ast -> Lexer -> ParserExpr -> Parser
     -> Transactions -> ProcessLock -> VersionCoordinator -> RowStore
-    -> TableSchema -> Catalog -> Scalar -> Eval -> Op -> Spill -> ExtSort
-    -> OpsJoin -> Ops -> Dml -> ForeignKey -> ExecContext -> Binder
+    -> TableSchema -> Catalog -> Schema -> Scalar -> Eval -> Op -> Spill -> ExtSort
+    -> OpsJoinShared -> OpsJoinMerge -> OpsJoinHash -> OpsJoin
+    -> OpsShared -> OpsSort -> OpsDistinct -> OpsAggregate -> Ops
+    -> Dml -> ForeignKey -> ExecContext -> DmlOps -> Binder
     -> Analyzer -> JoinOrder -> PlanBuilder -> Optimizer -> ValueSet -> Plan
-    -> DropCleanup -> Engine -> DatabaseHost -> Session
+    -> DropCleanup -> EngineState -> EngineAnalyze -> EngineDdl -> Engine
+    -> DatabaseHost -> Session
 ```
 
 ---

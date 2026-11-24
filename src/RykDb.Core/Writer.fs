@@ -8,7 +8,6 @@ namespace RykDb.Core
 /// **`Chunks` は逆順**（先頭が最後に書いたチャンク）で保持する。
 /// `add` が先頭へ積み、`toArray` が出力配列の末尾から埋めるので `List.rev` が不要になる。
 /// 外でレコードを組むと順序が反転して**静かに**壊れるので、
-/// 構築はこのファイルの `Empty` / `add` にだけ閉じる（`Writer.fsi` でケースを隠す）。
 /// </remarks>
 type internal WriterChunk =
     | Bytes of byte array
