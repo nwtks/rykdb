@@ -44,6 +44,7 @@ type DbError =
 
 [<RequireQualifiedAccess>]
 module DbError =
+    /// 位置も詳細も持たないエラーを作る。
     let create (kind: ErrorKind) (message: string) =
         {
             Kind = kind
@@ -62,20 +63,33 @@ module DbError =
             Detail = None
         }
 
+    /// 名前解決の失敗。
     let inline name (message: string) = create ErrorKind.NameError message
+
+    /// 型の不一致・不正な変換。
     let inline typeError (message: string) = create ErrorKind.TypeError message
 
+    /// 制約違反。
     let inline constraintViolation (message: string) =
         create ErrorKind.ConstraintViolation message
 
+    /// 対象が存在しない。
     let inline notFound (message: string) = create ErrorKind.NotFound message
+
+    /// 同名の対象が既に存在する。
     let inline alreadyExists (message: string) = create ErrorKind.AlreadyExists message
+
+    /// メモリ・件数などの上限超過。
     let inline capacity (message: string) = create ErrorKind.CapacityError message
 
+    /// ファイル内容の破損。
     let inline corruption (message: string) =
         create ErrorKind.CorruptionError message
 
+    /// write-write 競合などの同時実行衝突。
     let inline conflict (message: string) = create ErrorKind.ConflictError message
+
+    /// 内部不整合（バグの兆候）。
     let inline internalError (message: string) = create ErrorKind.InternalError message
 
     /// .NET の I/O 例外を DbError に包む。
@@ -94,14 +108,12 @@ module DbError =
         | None, Some d -> sprintf "%s [%s]" e.Message d
         | None, None -> e.Message
 
-/// 成功値の割当を避けるための内部専用 Result。
+/// 成功値の確保を避ける内部専用 Result。
 /// <remarks>
-/// FSharp.Core の `Result` は参照 DU なので、成功パスでも `Ok` を 1個確保する。
-/// 行ごと・値ごとに評価するホットパスではこの struct 版を使い、
-/// 公開 API の境界（`Session` / `Op.toArrayLimited`）で `Result` に戻す。
-/// ケースは struct DU のためフィールド名を付ける（FS3585）。
-/// `Unchecked.defaultof` で作らないこと（tag 0 = `DbOk` の既定値になる）。
-/// コレクションの要素にしないこと（セルが大きくなり、コピーも増える）。
+/// 参照 DU の `Result` は成功パスでも `Ok` を確保するため、行ごとのホットパスではこちらを使い、
+/// 公開境界（`Session` / `Op.toArrayLimited`）で `Result` に戻す。
+/// struct DU なのでケースにフィールド名が必要（FS3585）。
+/// `Unchecked.defaultof` で作らず、コレクションの要素にもしない（既定値が `DbOk`、セルも大きくなる）。
 /// </remarks>
 [<Struct>]
 type internal DbResult<'T> =
@@ -122,6 +134,7 @@ module internal DbResult =
         | Ok v -> DbOk v
         | Error e -> DbErr e
 
+    /// 成功値だけを変換する。
     let inline map (f: 'T -> 'U) (r: DbResult<'T>) =
         match r with
         | DbOk v -> DbOk(f v)
@@ -166,22 +179,24 @@ module internal ResultOps =
         | Ok v -> f v
         | Error e -> Error e
 
+    /// 成功値を `Result` に包む。
     let inline ret (x: 'a) = Ok x
 
+    /// エラーを `Result` に包む。
     let inline err (e: DbError) = Error e
 
-    /// 共有の成功値。
-    /// `Result` は参照 DU なので `Ok()` / `Ok true` / `Ok false` を書くとそのたびに確保する。
-    /// 行ごと・値ごとに返す箇所ではこの定数を使う。
+    /// 共有の `Ok()`。
+    /// 参照 DU の `Result` は成功値でも確保するため、行ごとに返す箇所ではこの定数を使う。
     let OkUnit: Result<unit, DbError> = Ok()
+
+    /// 共有の `Ok true`。
     let OkTrue: Result<bool, DbError> = Ok true
+
+    /// 共有の `Ok false`。
     let OkFalse: Result<bool, DbError> = Ok false
 
-    /// Result の列を左から畳み込み、全て Ok なら値のリストを返す。
-    /// 最初の Error で打ち切り、残りの項目は列挙しない（`foldOk` と同じ規則）。
-    /// 複数の Error があっても返るのは最初の 1つ。
+    /// Result の列を先頭から畳み、最初の Error で打ち切って値のリストを返す。
     /// `seq` は 1回だけ列挙するので、1回限りの列挙子でも渡せる。
-    /// Result 列を先頭から畳み、最初の Error で打ち切って値を集める。
     [<TailCall>]
     let rec private gather (e: System.Collections.Generic.IEnumerator<Result<'a, DbError>>) (acc: 'a list) =
         if not (e.MoveNext()) then
@@ -191,14 +206,14 @@ module internal ResultOps =
             | Error e -> Error e
             | Ok v -> gather e (v :: acc)
 
+    /// Result の列を値のリストにする。
+    /// 最初の Error で打ち切る。
     let all (rs: Result<'a, DbError> seq) =
         use e = rs.GetEnumerator()
         gather e []
 
-    /// 状態を受け取り Result を返す step で列を左から畳み込む Result 版 fold。
-    /// 最初の Error で打ち切り、残りの項目は評価しない。
-    /// 空の列は Ok state を返す。
-    /// 副作用は step に任せる。
+    /// 状態付きの畳み込み。最初の Error で打ち切る。
+    /// 空の列は `Ok state` を返す。
     let foldOk (step: 's -> 'a -> Result<'s, DbError>) (state: 's) =
         Seq.fold
             (fun acc item ->

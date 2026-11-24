@@ -1,11 +1,9 @@
 namespace RykDb.Core
 
 /// SSTable の Bloom filter。
-/// SSTable がメモリ上に載る前に「その SSTable にキーが存在し得るか」を O(1) で判定し、
-/// 存在しないキーではファイル I/O そのものを省く。
-/// false positive（無いのにあると返す）は許されるが、false negative（あるのに無いと返す）は許されない。
-/// 構築してから読み取り専用。
-/// 不変なので複数の読み取りスレッドで共有できる。
+/// 「その SSTable にキーが存在し得るか」を O(1) で判定し、存在しなければファイル I/O を省く。
+/// false positive は許すが false negative は許さない。
+/// 構築後は不変で、複数の読み取りで共有できる。
 [<Struct>]
 type internal BloomFilter =
     {
@@ -20,15 +18,14 @@ type internal BloomFilter =
     }
 
 module internal BloomFilter =
+    /// 自然対数 2（ビット数・ハッシュ数の式で使う）。
     let private ln2 = log 2.0
 
     /// double hashing の起点とステップ。
-    /// ハッシュ上位 32bit（h1）を起点、下位 32bit を 1..2^32-1 に正規化した値をステップ幅にする。
-    /// ステップは奇数にしないと偏る。
+    /// 起点はハッシュ上位 32bit、ステップは下位 32bit を 1..2^32-1 に正規化した奇数。
     /// <remarks>
-    /// 「% n してから偶数を +1」（読む側）と「偶数を +1 してから % n」（築く側）は本来別物だが、
-    /// bitCount が必ず 8の倍数（= 偶数、bitsFor が 8単位に丸める）なので同値になる。
-    /// 2つに分けておくと片方が書き換わった瞬間に false negative が出るので、ここでは 1つに畳んでいる。
+    /// 読み取り側と構築側で `% n` と偶数 +1 の順序が違っても、ビット数が必ず 8 の倍数（= 偶数）なので同値になる。
+    /// 2つに分けると片方の変更で false negative が出るため 1つに畳んでいる。
     /// </remarks>
     let private firstAndStep (bitCount: int) (hash: uint64) =
         let n = uint64 bitCount
@@ -109,7 +106,7 @@ module internal BloomFilter =
     /// 逐次追加できる Bloom filter ビルダ。
     /// `ofKeys` と同じパラメータで作り、`Add` でキーを足して `Build` で確定する。
     /// 件数が期待値を大きく超えると誤検出率が悪化するが、
-    /// false negative は出ないので**正しさには影響しない**（遅くなるだけ）。
+    /// false negative は出ないので正しさには影響しない（遅くなるだけ）。
     [<Sealed>]
     type BloomBuilder(expectedCount: int, falsePositiveRate: float) =
         let template = ofKeys expectedCount falsePositiveRate Seq.empty
@@ -138,6 +135,7 @@ module internal BloomFilter =
     [<Literal>]
     let private Version = 2uy
 
+    /// filter をバイト列にする。
     let serialize (filter: BloomFilter) =
         Writer.build
             [
@@ -148,6 +146,8 @@ module internal BloomFilter =
                 Writer.writeBytes filter.Bits
             ]
 
+    /// バイト列から filter を復元する。
+    /// 壊れた入力は `CorruptionError`。
     let deserialize (data: byte array) =
         result {
             let c = Cursor.create data

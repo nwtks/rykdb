@@ -4,9 +4,11 @@ namespace RykDb.Core
 /// カタログ削除前にこれを書き、後始末が完了したら消す。
 /// 起動時にカタログに存在しない keyspace だけを掃除する。
 module internal DropCleanup =
+    /// ジャーナルのファイル名。
     [<Literal>]
     let private FileName = ".drop-cleanup"
 
+    /// ジャーナルのパス。
     let private path (root: string) = System.IO.Path.Combine(root, FileName)
 
     /// 未完了の後始末対象 keyspace を読む。
@@ -78,6 +80,7 @@ module internal DropCleanup =
 
 /// 中断した DROP の keyspace 後始末を open 時に再開する。
 module internal DropCleanupRecovery =
+    /// カタログに存在しない keyspace だけを対象にする。
     let private shouldClean (catalog: Catalog) (space: string) =
         if space.StartsWith("t:", System.StringComparison.Ordinal) then
             Catalog.findTable (space.Substring 2) catalog |> Option.isNone
@@ -96,6 +99,7 @@ module internal DropCleanupRecovery =
             | Ok next -> clear next tail
             | Error e -> err e
 
+    /// 未完了の後始末を再開する（起動時に呼ぶ）。
     let recover (store: RowStore) (catalog: Catalog) (mgr: TransactionManager) =
         DropCleanup.pending store.Root
         >>= (List.filter (shouldClean catalog) >> clear (store, mgr))

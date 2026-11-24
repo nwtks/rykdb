@@ -178,6 +178,7 @@ module internal OpsJoinHash =
 
             ret table
 
+    /// ハッシュ表からキーの行を引く。
     let private lookupHash
         (table: System.Collections.Generic.Dictionary<byte array, SqlValue array array>)
         (key: byte array)

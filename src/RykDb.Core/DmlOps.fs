@@ -252,6 +252,8 @@ module internal DmlOps =
         else
             insertGather schema evalConstant idxs values [] values idxs
 
+    /// INSERT（VALUES）。
+    /// 列リスト省略時は表の列順。
     let insert (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (rows: Expr list list) =
         let evalConstant = Eval.eval Schema.Empty [||]
 
@@ -314,6 +316,8 @@ module internal DmlOps =
                 | Error e -> err e
             | Error e -> err e
 
+    /// INSERT ... SELECT。
+    /// 選択結果の Op を行ごとに変換して挿入する。
     let insertSelect (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (source: Op) =
         result {
             let! idxs = insertTargets schema columns

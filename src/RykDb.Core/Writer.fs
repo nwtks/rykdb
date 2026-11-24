@@ -1,13 +1,11 @@
 namespace RykDb.Core
 
 /// 書き出し: Writer
-/// 可変バッファではなく「不変のチャンク列」で表現する。
-/// 追加操作は新しい Writer を返すので、途中で失敗しても中途半端な状態は残らない。
-/// 最後に一度だけ配列へ平坦化する。
+/// 不変のチャンク列で書き出し手順を保持し、最後に一度だけバイト列へ平坦化する。
 /// <remarks>
-/// **`Chunks` は逆順**（先頭が最後に書いたチャンク）で保持する。
-/// `add` が先頭へ積み、`toArray` が出力配列の末尾から埋めるので `List.rev` が不要になる。
-/// 外でレコードを組むと順序が反転して**静かに**壊れるので、
+/// `Chunks` は逆順（先頭が最後に書いたチャンク）。
+/// `add` が先頭へ積み、`toArray` が末尾から埋める。
+/// 外でレコードを組むと順序が反転して静かに壊れるため、構築はこのモジュールの関数に限る。
 /// </remarks>
 type internal WriterChunk =
     | Bytes of byte array
@@ -21,10 +19,13 @@ type internal WriterChunk =
 type internal Writer = { Chunks: WriterChunk list }
 
 module internal Writer =
+    /// 空の Writer。
     let Empty = { Chunks = [] }
 
+    /// チャンクを先頭へ積む。
     let private add (chunk: WriterChunk) (w: Writer) = { Chunks = chunk :: w.Chunks }
 
+    /// 1バイト追加する。
     let writeByte (b: byte) (w: Writer) = add (Byte b) w
 
     /// バイト列を追加する。
@@ -32,6 +33,7 @@ module internal Writer =
     let writeBytes (bs: byte array) (w: Writer) =
         if bs.Length = 0 then w else add (Bytes bs) w
 
+    /// BOOL を 1バイト（1 / 0）で追加する。
     let bool (v: bool) = add (Byte(if v then 1uy else 0uy))
 
     /// 符号なし LEB128（順序保持ではない）。
@@ -56,6 +58,7 @@ module internal Writer =
     let str (s: string) =
         lengthPrefixed (System.Text.Encoding.UTF8.GetBytes s)
 
+    /// varint を `out.[pos]` から書き込み、次の空き位置を返す。
     [<TailCall>]
     let rec writeVarintTo (out: byte array) (pos: int) (v: uint64) =
         if v >= 0x80UL then
@@ -73,8 +76,10 @@ module internal Writer =
         else
             varintLengthLoop (bytes + 1) (value >>> 7)
 
+    /// varint のバイト数。
     let varintLength (v: uint64) = varintLengthLoop 0 v
 
+    /// チャンクのバイト長。
     let private chunkLength =
         function
         | Bytes bs -> bs.Length
@@ -88,6 +93,7 @@ module internal Writer =
     /// 平坦化後のバイト長。
     let private length (w: Writer) = w.Chunks |> List.sumBy chunkLength
 
+    /// チャンク 1つを `out.[pos]` へ書き込む。
     let private writeChunk (out: byte array) (pos: int) =
         function
         | Bytes bs -> Array.blit bs 0 out pos bs.Length

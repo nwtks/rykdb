@@ -11,8 +11,10 @@ namespace RykDb.Core
 /// 1つの DB が共有する実行時状態。
 /// `StorageEngine` の不変コピー間で参照を共有し、DB の寿命と一緒に回収する。
 type internal StorageRuntime() =
+    /// flush / compaction / close を直列化する gate。
     let gate = new System.Threading.SemaphoreSlim(1, 1)
 
+    /// 直近の flush 失敗（成功したら None）。
     let lastFlushError =
         System.Collections.Concurrent.ConcurrentDictionary<string, DbError option>()
 
@@ -57,8 +59,7 @@ type internal StorageEngine =
     }
 
 module internal StorageEngine =
-    // writeBatch / maybeFlush / close は、同じ DB の WAL / memtable 競合を防ぐため直列化する。
-    // Gate は DB の Runtime が所有する。
+    /// writeBatch / maybeFlush / close を DB 単位で直列化する（同じ WAL / memtable の競合防止）。
     let private withRuntimeGate (engine: StorageEngine) (f: unit -> 'T) =
         engine.Runtime.Gate.Wait()
 
@@ -83,6 +84,7 @@ module internal StorageEngine =
         | Some info -> ret info
         | None -> Sstable.openPartial (FileMetaData.path dir f.FileNumber)
 
+    /// ファイルの読み取り用メタデータを引く。
     let private readInfoIn (f: FileMetaData) (engine: StorageEngine) = readInfoOf engine.Dir f
 
     /// 行の列挙子から遅延走査を作る（終端で列挙子を閉じる）。
@@ -373,6 +375,7 @@ module internal StorageEngine =
                 return applyBatch entries engine wal txnId
             })
 
+    /// バッチを WAL へ追記して fsync まで行う。
     let writeBatch = writeBatchCore true
 
     /// WAL への追記だけ行い、fsync は Session のグループコミットに任せる。

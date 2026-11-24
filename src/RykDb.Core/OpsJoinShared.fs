@@ -26,6 +26,7 @@ module internal OpsJoinShared =
     let hasNullKey (row: SqlValue array) =
         Array.exists (fun i -> SqlValue.isNull row.[i])
 
+    /// residual の ON 表現をリストにする。
     let residualExprs =
         function
         | None -> []

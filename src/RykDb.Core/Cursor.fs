@@ -1,9 +1,7 @@
 namespace RykDb.Core
 
-/// 読み取り: Cursor
-/// 読み取り位置を値が持つ。
-/// 更新は新しい Cursor を返すので mutable は要らない。
-/// すべての読み取りは Result を返し、例外を送らない。
+/// 読み取り位置を持つ不変のカーソル。
+/// 前進は新しい Cursor を返し、読み取りは例外ではなく `Result` を返す。
 /// <remarks>
 /// レコードは `Cursor.fsi` で隠す。
 /// 構築は `create` / `createSlice`、前進は `advance` に限る。
@@ -12,6 +10,7 @@ type internal Cursor =
     { Data: byte array; Pos: int; End: int }
 
 module internal Cursor =
+    /// 配列全体を読むカーソル。
     let create (data: byte array) =
         {
             Data = data
@@ -19,14 +18,12 @@ module internal Cursor =
             End = data.Length
         }
 
-    /// 配列の一部だけを読み取るカーソル。
+    /// 配列の一部を読むカーソル。
+    /// 範囲は構築時に検証する（範囲外は `CorruptionError`）。
     /// <remarks>
-    /// **範囲を検証してから作る**。
-    /// 検証せずに作ると `Pos` / `End` が `Data.Length` を超え、
-    /// `Reader.readByte` が `IndexOutOfRangeException` を投げる
-    /// （壊れた SSTable を `CorruptionError` ではなく未処理例外で拒否してしまう）。
-    /// 範囲外は `CorruptionError`。
-    /// 判定は `data.Length - length` で行うので、`length` が巨大でもオーバーフローしない。
+    /// 検証せずに作ると `Pos` / `End` が配列外になり、`Reader.readByte` が
+    /// `IndexOutOfRangeException` を投げて壊れた SSTable が未処理例外になる。
+    /// 判定は `data.Length - length` で行うため、`length` が巨大でもオーバーフローしない。
     /// </remarks>
     let createSlice (data: byte array) (offset: int) (length: int) =
         if offset < 0 || length < 0 || offset > data.Length - length then
@@ -42,13 +39,14 @@ module internal Cursor =
                 }
 
     /// 読み取り位置を進める。
-    /// <remarks>
     /// 範囲の検証は呼び出し側（`Pos < End` の確認）が行う。
-    /// **Cursor のレコード更新はこの関数の中だけに置く**。
-    /// </remarks>
+    /// Cursor のレコード更新はこの関数の中だけに置く。
     let advance (n: int) (c: Cursor) = { c with Pos = c.Pos + n }
 
+    /// 残りのバイト数。
     let remaining (c: Cursor) = c.End - c.Pos
+
+    /// 読み取り終端に達しているか。
     let atEnd (c: Cursor) = c.Pos >= c.End
 
     /// 読み取り対象の配列。
@@ -61,10 +59,7 @@ module internal Cursor =
     let endPos (c: Cursor) = c.End
 
     /// 先頭から `length` バイトを切り出し、切り出したカーソルと残りのカーソルを返す。
-    /// <remarks>
-    /// 値の本体と後続を分ける用途で使う。
     /// 範囲外は `CorruptionError`（`createSlice` と同じ判定）。
-    /// </remarks>
     let splitAt (length: int) (c: Cursor) =
         if length < 0 || length > remaining c then
             sprintf "Cursor: %d バイトを切り出せません（残り %d バイト）" length (remaining c)

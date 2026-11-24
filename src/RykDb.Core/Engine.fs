@@ -5,6 +5,7 @@
 namespace RykDb.Core
 
 module internal Engine =
+    /// テーブルの schema を実行文脈へ登録する。
     let private addTable (state: ExecState) (ctx: ExecContext) (t: TableDefinition) =
         Catalog.toSchema t
         >>= fun schema ->
@@ -15,6 +16,7 @@ module internal Engine =
 
             ret (ExecContext.withSchema t.Name withIndexes ctx)
 
+    /// 確定カタログの全テーブルを登録した実行文脈を作る。
     let private contextOf (budget: MemoryBudget) (state: ExecState) (txn: Transaction) =
         let baseCtx =
             ExecContext.create state.Store (Snapshot.toVisible txn.Snapshot)
@@ -30,6 +32,7 @@ module internal Engine =
 
         state.Catalog.Tables |> foldOk (addTable state) ctx
 
+    /// SELECT を実行して結果を materialize する。
     let private runSelect (limits: ResultLimits) (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
         contextOf limits.Budget state txn
         >>= fun ctx ->
@@ -155,6 +158,7 @@ module internal Engine =
                 ctx.Scope.DisposeAll()
                 err e
 
+    /// SELECT の計画だけを組み立てる（既定の結合順戦略）。
     let prepareSelect (state: ExecState) (stmt: SelectStatement) =
         prepareSelectWith JoinOrderStrategy.Dp state stmt
 
@@ -206,6 +210,7 @@ module internal Engine =
 
             state.Store.Runtime.WithShared(fun () -> openSelectRun budget state startState txn registration stmt)
 
+    /// WHERE の式を対象 schema で解決する。
     let private resolveWhere (target: Schema) (ctx: ExecContext) =
         function
         | None -> ret None
@@ -282,6 +287,7 @@ module internal Engine =
             indexCandidateScan ctx schema.Name mask indexName (fun scanMask ->
                 ExecContext.byIndexRangeMasked ctx schema.Name indexName lower upper 0 scanMask)
 
+    /// INSERT を実行する。
     let private runInsert (stmt: InsertStatement) (ctx: ExecContext) =
         result {
             let! schema = ExecContext.schemaOf stmt.Table.Name ctx
@@ -304,6 +310,7 @@ module internal Engine =
                     }
         }
 
+    /// UPDATE を実行する。
     let private runUpdate (stmt: UpdateStatement) (ctx: ExecContext) =
         result {
             let! schema = ExecContext.schemaOf stmt.Table.Name ctx
@@ -318,6 +325,7 @@ module internal Engine =
             return! DmlOps.updateWith (dmlCandidateScan ctx schema whereE) ctx schema assignments whereE
         }
 
+    /// DELETE を実行する。
     let private runDelete (stmt: DeleteStatement) (ctx: ExecContext) =
         result {
             let! schema = ExecContext.schemaOf stmt.Table.Name ctx
@@ -326,6 +334,7 @@ module internal Engine =
             return! DmlOps.deleteWith (dmlCandidateScan ctx schema whereE) ctx schema whereE
         }
 
+    /// DML の共通部分: 文脈を作り、変更を pending transaction に畳んで影響行数を返す。
     let private runDml
         (limits: ResultLimits)
         (state: ExecState)
@@ -350,6 +359,7 @@ module internal Engine =
             finally
                 ctx.Scope.DisposeAll()
 
+    /// DDL を実行し、(状態, 結果) を返す。
     let private runDdlWithState (state: ExecState) (run: ExecState -> Result<ExecState * StatementResult, DbError>) =
         if state.Active.IsSome then
             err (
@@ -360,9 +370,11 @@ module internal Engine =
         else
             run state
 
+    /// DDL を実行する（結果は空）。
     let private runDdl (state: ExecState) (run: ExecState -> Result<ExecState, DbError>) =
         runDdlWithState state (run >> Result.map (fun next -> next, StatementResult.Empty))
 
+    /// 状態だけを返す DDL 結果にする。
     let private noRows = Result.map (fun s -> s, StatementResult.Empty)
 
     /// 列の数値範囲を表示用文字列にする。
@@ -439,6 +451,7 @@ module internal Engine =
 
         StatementResult.OfRows(0, columns, rows)
 
+    /// 1文を transaction 付きで実行する。
     let private runStatement (limits: ResultLimits) (state: ExecState) (txn: Transaction) =
         function
         | Statement.Select stmt -> runSelect limits state txn stmt
@@ -492,6 +505,8 @@ module internal Engine =
         state.Store.Runtime.Unregister registration
         r
 
+    /// 1文を実行する。
+    /// transaction 中ならその中で、そうでなければ暗黙 transaction で実行する。
     let executeStatementWithLimits (limits: ResultLimits) (state: ExecState) (stmt: Statement) =
         match state.Active with
         | Some activeTxn ->
@@ -524,6 +539,7 @@ module internal Engine =
             (if isDdl then run () else state.Store.Runtime.WithShared run)
             |> unregisterAfter state registration
 
+    /// 接続の transaction を commit し、接続ローカルを確定状態へ進める。
     let executeCommit (state: ExecState) =
         match state.Active with
         | None -> ret state
@@ -535,6 +551,7 @@ module internal Engine =
                 state.ActiveRegistration |> Option.iter state.Store.Runtime.Unregister
                 ExecState.ofCommitted committed)
 
+    /// 接続の transaction を abort し、接続ローカルを確定状態へ戻す。
     let executeRollback (state: ExecState) =
         match state.Active with
         | None -> state

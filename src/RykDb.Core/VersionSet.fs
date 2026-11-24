@@ -164,6 +164,7 @@ type internal Version =
     }
 
 module internal Version =
+    /// 空の Version（全レベル空、次のファイル番号 1）。
     let Empty =
         {
             Files = Array.create Levels.Count [||]
@@ -251,6 +252,7 @@ type internal VersionEdit =
     }
 
 module internal VersionEdit =
+    /// ファイル追加だけの編集を作る。
     let addFile f =
         {
             AddedFiles = [ f ]
@@ -281,6 +283,7 @@ module internal VersionEdit =
     let private encodeDeleted (f: FileMetaData) =
         Writer.build [ Writer.varint (uint64 f.FileNumber); Writer.varint (uint64 f.Level) ]
 
+    /// VersionEdit をバイト列にする。
     let encode (edit: VersionEdit) =
         let steps =
             (edit.AddedFiles
@@ -380,6 +383,7 @@ module internal VersionEdit =
                     readEditFiles c' added (f :: deleted)
             | Error e -> err e
 
+    /// バイト列から VersionEdit を復元する（要素 1件のリスト）。
     let decode (data: byte array) =
         result {
             let! body, _ = Cursor.create data |> Reader.readLengthPrefixed
@@ -411,18 +415,23 @@ module internal Manifest =
     [<Literal>]
     let ManifestPrefix = "MANIFEST-"
 
+    /// MANIFEST のファイル名。
     let private fileName (manifestNumber: int64<manifestNo>) =
         sprintf "%s%06d" ManifestPrefix manifestNumber
 
+    /// MANIFEST のパス。
     let private manifestPath (dir: string) (manifestNumber: int64<manifestNo>) =
         System.IO.Path.Combine(dir, fileName manifestNumber)
 
+    /// 現在の MANIFEST 番号を指すファイル名。
     [<Literal>]
     let CurrentFileName = "CURRENT"
 
+    /// CURRENT のパス。
     let private currentPath (dir: string) =
         System.IO.Path.Combine(dir, CurrentFileName)
 
+    /// CURRENT を一時ファイル経由で原子的に置き換える。
     let private writeCurrent (dir: string) (manifestNumber: int64<manifestNo>) =
         protect (fun () ->
             let tmp = currentPath dir + ".tmp"
@@ -449,6 +458,7 @@ module internal Manifest =
 
         System.Convert.ToBase64String frame + "\n"
 
+    /// base64 の 1行から VersionEdit を復元する（チェックサム検証付き）。
     let private decodeRecord (line: string) =
         try
             let frame = System.Convert.FromBase64String line
@@ -842,6 +852,7 @@ type internal PublishedState =
     }
 
 module internal PublishedState =
+    /// 初期状態（Generation 0、GC 境界 0 = 全版を残す）。
     let initial (version: Version) (manifestNumber: int64<manifestNo>) =
         {
             Version = version

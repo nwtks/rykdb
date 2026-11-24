@@ -61,13 +61,13 @@ module internal SstableFormat =
     [<Literal>]
     let private EntriesPerBlock = 128
 
+    /// SSTable ファイルのマジック文字列。
     [<Literal>]
     let internal Magic = "RykDbSST"
 
-    /// 書き出すファイルのバージョン。
-    /// v6 はブロック末尾・メタデータ（meta / Bloom / index）・Footer を CRC32C で検証する。
-    /// 全体チェックサムは持たない（部分読みでは読まなかったブロックは検証されない）。
-    /// v6 未満は読めない。
+    /// 書き出すファイルのバージョン（6）。
+    /// ブロック末尾とメタデータ（meta / Bloom / index）・Footer を CRC32C で検証する。
+    /// 全体チェックサムは持たず、部分読みでは読まなかったブロックは検証されない。
     [<Literal>]
     let internal Version = 6
 
@@ -101,6 +101,7 @@ module internal SstableFormat =
     // ファイル内の最大 SeqNo を保存する
     //（GC は版ごとの SeqNo と active snapshot で判定する）。
 
+    /// Footer を 84 バイトに符号化する（末尾に自身のチェックサムを含む）。
     let private encodeFooter
         (maxSeqNo: uint64)
         (indexOff: int)
@@ -146,10 +147,12 @@ module internal SstableFormat =
             MetadataChecksum: uint32
         }
 
-    /// Footer の値が int に収まるかを判定する。
+    /// int に収まる非負の int64 か。
     let private fitsInt (v: int64) =
         v >= 0L && v <= int64 System.Int32.MaxValue
 
+    /// Footer の先頭から各フィールドを読む
+    /// （magic / version の検証は呼び出し側）。
     let internal readFooterFields (footerBytes: byte array) =
         result {
             let c = Cursor.create footerBytes

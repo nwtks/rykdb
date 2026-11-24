@@ -44,6 +44,7 @@ type internal ExecContext =
     }
 
 module internal ExecContext =
+    /// ストアと可視 SeqNo から実行文脈を作る。
     let create (store: RowStore) (visible: uint64 option) =
         {
             Store = store

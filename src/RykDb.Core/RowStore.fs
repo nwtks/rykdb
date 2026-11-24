@@ -13,9 +13,11 @@ namespace RykDb.Core
 
 /// 書き込みの単位。(keyspace, key) -> 値（None は削除）。
 module internal Keyspace =
+    /// カタログ（テーブル・索引の定義）を置く keyspace。
     [<Literal>]
     let CatalogKeyspace = "__catalog__"
 
+    /// テーブル名・索引名の上限（UTF-8 バイト）。
     let private MaxNameBytes = 128
 
     /// テーブルの主キー用 keyspace 名。
@@ -57,6 +59,7 @@ type internal RowStoreOptions =
     }
 
 module internal RowStoreOptions =
+    /// 既定の設定（同期 compaction、メモリ上限なし）。
     let Default =
         {
             BackgroundCompaction = false
@@ -66,6 +69,7 @@ module internal RowStoreOptions =
             ManifestApplyHook = None
         }
 
+    /// 背景 compaction を有効にした設定。
     let Background =
         { Default with
             BackgroundCompaction = true
@@ -88,6 +92,7 @@ type internal RowStore =
     }
 
 module internal RowStore =
+    /// keyspace 全消去の 1チャンク行数。
     [<Literal>]
     let private ClearChunkEntries = 8192
 

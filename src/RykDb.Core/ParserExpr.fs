@@ -47,8 +47,10 @@ module internal ParserExpr =
     let private dataTypeOfName (name: string) =
         TypeTable |> List.tryFind (fun (n, _) -> n = name) |> Option.map snd
 
+    /// 現在位置のトークン。
     let peek (st: PState) = st.Tokens.[st.Pos].Token
 
+    /// 現在位置のソース位置。
     let private peekPos (st: PState) = st.Tokens.[st.Pos].Pos
 
     /// 1トークン消費した次の状態を返す。
@@ -92,11 +94,13 @@ module internal ParserExpr =
         | Token.QuotedIdent s -> ValueSome s
         | _ -> ValueNone
 
+    /// 現在位置が指定の記号か。
     let isSymbol (s: string) (st: PState) =
         match peek st with
         | Token.Symbol x -> x = s
         | _ -> false
 
+    /// 現在位置が指定のキーワードか。
     let isKeyword (k: string) (st: PState) =
         match peek st with
         | Token.Keyword x -> x = k
@@ -157,20 +161,22 @@ module internal ParserExpr =
             fail (unsupportedAliasMessage (s.ToUpperInvariant())) st
         | _ -> ret ()
 
-    /// 記号pletsを消費して次の状態を返す。
-    /// 消費できなくてもエラーにしない。
+    /// 指定の記号を消費する（無ければ何もしない）。
     let private eatSymbol (s: string) (st: PState) =
         if isSymbol s st then advance st else st
 
+    /// 指定のキーワードを消費する（無ければ何もしない）。
     let private eatKeyword (k: string) (st: PState) =
         if isKeyword k st then advance st else st
 
+    /// 指定の記号を消費する（無ければ SyntaxError）。
     let expectSymbol (s: string) (st: PState) =
         if isSymbol s st then
             ret ((), advance st)
         else
             fail (sprintf "'%s' が必要ですが見つかりませんでした" s) st
 
+    /// 指定のキーワードを消費する（無ければ SyntaxError）。
     let expectKeyword (k: string) (st: PState) =
         if isKeyword k st then
             ret ((), advance st)
@@ -222,6 +228,7 @@ module internal ParserExpr =
     let parseParenIdentList (st: PState) =
         expectSymbol "(" st >>= fun (_, st) -> parseParenIdentListLoop [] st
 
+    /// 型名を DataType として読む（未知の型は SyntaxError）。
     let parseDataType (st: PState) =
         match peek st with
         | Token.Ident s ->
@@ -310,15 +317,19 @@ module internal ParserExpr =
     // 深さ上限は設けない。
     // -----------------------------------------------------------------------
 
+    /// OR の結合強度。
     [<Literal>]
     let private OrBp = 10
 
+    /// AND の結合強度。
     [<Literal>]
     let private AndBp = 20
 
+    /// NOT（前置）の結合強度。
     [<Literal>]
     let private NotPrefixBp = 30
 
+    /// 比較・述語の結合強度（非結合）。
     [<Literal>]
     let private CompareBp = 40
 
@@ -328,12 +339,15 @@ module internal ParserExpr =
     [<Literal>]
     let private PredicateRightBp = 50
 
+    /// 加減の結合強度。
     [<Literal>]
     let private AddBp = 50
 
+    /// 乗除の結合強度。
     [<Literal>]
     let private MulBp = 60
 
+    /// 単項 +/- の結合強度。
     [<Literal>]
     let private UnaryBp = 70
 
@@ -536,6 +550,7 @@ module internal ParserExpr =
             parseExprBpC UnaryBp (advance st) (fun (operand, st) -> k (Expr.Unary(UnaryOp.Pos, operand), st))
         | _ -> parsePrimaryC st k
 
+    /// 原子式（リテラル・列・関数・括弧・サブクエリ）を読む。
     and [<TailCall>] private parsePrimaryC (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
         match peek st with
         | LiteralExpr e -> k (e, advance st)
@@ -568,6 +583,7 @@ module internal ParserExpr =
                     | Error e -> err e
                     | Ok(_, st) -> k (Expr.Case(branches, None), st))
 
+    /// CASE の WHEN 節を読む。
     and [<TailCall>] private parseCaseBranchesC
         (acc: (Expr * Expr) list)
         (st: PState)
@@ -672,6 +688,7 @@ module internal ParserExpr =
                     | Some agg, [ arg ] -> k (Expr.AggCall(agg, distinct, arg), st)
                     | _ -> k (Expr.FuncCall(upper, argList), st))
 
+    /// 式の並びを読むループ。
     and private parseExprListLoop (acc: Expr list) (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =
         parseExprC st (fun (e, st) ->
             if isSymbol "," st then
@@ -772,6 +789,7 @@ module internal ParserExpr =
         else
             k (List.rev acc, st)
 
+    /// SELECT 項目の並びを読むループ。
     and private parseSelectItemsLoop
         (acc: SelectItem list)
         (st: PState)
@@ -864,6 +882,7 @@ module internal ParserExpr =
                             st
                         )))))
 
+    /// JOIN 句の並びを読むループ。
     and [<TailCall>] private parseJoinsLoop
         (acc: JoinClause list)
         (st: PState)
@@ -908,12 +927,14 @@ module internal ParserExpr =
     and [<TailCall>] private parseJoinsC (st: PState) (k: JoinClause list * PState -> Result<'r, DbError>) =
         parseJoinsLoop [] st k
 
+    /// WHERE 句を読む。
     and [<TailCall>] private parseWhereC (st: PState) (k: Expr option * PState -> Result<'r, DbError>) =
         if isKeyword "WHERE" st then
             parseExprC (advance st) (fun (e, st) -> k (Some e, st))
         else
             k (None, st)
 
+    /// GROUP BY 句を読む。
     and [<TailCall>] private parseGroupByC (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =
         if isKeyword "GROUP" st then
             match advance st |> expectKeyword "BY" with
@@ -922,6 +943,7 @@ module internal ParserExpr =
         else
             k ([], st)
 
+    /// GROUP BY の式の並びを読むループ。
     and private parseGroupByItemsLoop (acc: Expr list) (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =
         parseExprC st (fun (e, st) ->
             if isSymbol "," st then
@@ -929,15 +951,18 @@ module internal ParserExpr =
             else
                 k (List.rev (e :: acc), st))
 
+    /// GROUP BY の式の並びを読む。
     and [<TailCall>] private parseGroupByItemsC (st: PState) (k: Expr list * PState -> Result<'r, DbError>) =
         parseGroupByItemsLoop [] st k
 
+    /// HAVING 句を読む。
     and [<TailCall>] private parseHavingC (st: PState) (k: Expr option * PState -> Result<'r, DbError>) =
         if isKeyword "HAVING" st then
             parseExprC (advance st) (fun (e, st) -> k (Some e, st))
         else
             k (None, st)
 
+    /// ORDER BY 句を読む。
     and [<TailCall>] private parseOrderByC (st: PState) (k: SortKey list * PState -> Result<'r, DbError>) =
         if isKeyword "ORDER" st then
             match advance st |> expectKeyword "BY" with
@@ -946,6 +971,7 @@ module internal ParserExpr =
         else
             k ([], st)
 
+    /// ORDER BY のキーの並びを読むループ。
     and private parseOrderByItemsLoop
         (acc: SortKey list)
         (st: PState)
@@ -967,9 +993,11 @@ module internal ParserExpr =
             else
                 k (List.rev (key :: acc), st))
 
+    /// ORDER BY のキーの並びを読む。
     and [<TailCall>] private parseOrderByItemsC (st: PState) (k: SortKey list * PState -> Result<'r, DbError>) =
         parseOrderByItemsLoop [] st k
 
+    /// LIMIT / OFFSET 句を読む。
     and private parseLimitOffsetC (st: PState) (k: (Expr option * Expr option) * PState -> Result<'r, DbError>) =
         if isKeyword "LIMIT" st then
             parseExprC (advance st) (fun (limit, st) ->
@@ -986,10 +1014,13 @@ module internal ParserExpr =
     /// DML・文の列挙など、呼び出しの入れ子が入力サイズに比例しない箇所で使う。
     let parseExprValue (st: PState) = parseExprC st ret
 
+    /// WHERE 句を値として読む。
     let parseWhereValue (st: PState) = parseWhereC st ret
 
+    /// SELECT 文を値として読む。
     let parseSelectStatementValue (st: PState) = parseSelectStatementC st ret
 
+    /// SELECT 文（末尾の ; は任意）を Statement として読む。
     let parseSelect (st: PState) =
         result {
             let! sel, st = parseSelectStatementValue st

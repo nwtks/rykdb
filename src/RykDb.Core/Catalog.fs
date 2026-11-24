@@ -96,6 +96,7 @@ type internal Catalog =
     }
 
 module internal Catalog =
+    /// 空のカタログ。
     let Empty =
         {
             Tables = []
@@ -249,6 +250,7 @@ module internal Catalog =
     // 外部キーを追加する前のテーブル定義は末尾に何も無いので、そこで読むのを止める。
     //
 
+    /// テーブル定義をカタログのバイト列にする。
     let private encodeTable (t: TableDefinition) =
         let w0 = Writer.varint (uint64 t.Columns.Length) Writer.Empty
 
@@ -287,6 +289,7 @@ module internal Catalog =
             w4
         |> Writer.toArray
 
+    /// 外部キー定義を読む。
     let private readForeignKey (c: Cursor) =
         result {
             let! colCount, c1 = Reader.readVarint c
@@ -339,6 +342,7 @@ module internal Catalog =
                 c4
         }
 
+    /// バイト列からテーブル定義を復元する。
     let private decodeTable (name: string) (bytes: byte array) =
         result {
             let! colCount, cur1 = Cursor.create bytes |> Reader.readVarint
@@ -362,6 +366,7 @@ module internal Catalog =
                 }
         }
 
+    /// 索引定義をカタログのバイト列にする。
     let private encodeIndex (i: IndexDefinition) =
         let w2 =
             Writer.Empty
@@ -371,6 +376,7 @@ module internal Catalog =
 
         i.Columns |> List.fold (fun w c -> Writer.str c w) w2 |> Writer.toArray
 
+    /// バイト列から索引定義を復元する。
     let private decodeIndex (name: string) (bytes: byte array) =
         result {
             let! table, cur1 = Cursor.create bytes |> Reader.readStr
@@ -387,14 +393,17 @@ module internal Catalog =
                 }
         }
 
+    /// 統計用の float を書く。
     let private writeFloat (v: float) =
         Writer.int64LE (System.BitConverter.DoubleToInt64Bits v)
 
+    /// 省略可能な float を書く。
     let private writeFloatOption (v: float option) (w: Writer) =
         match v with
         | None -> Writer.bool false w
         | Some x -> Writer.bool true w |> writeFloat x
 
+    /// テーブル統計をバイト列にする。
     let private encodeStats (s: TableStats) =
         let w0 =
             Writer.Empty
@@ -453,6 +462,7 @@ module internal Catalog =
             w5
         |> Writer.toArray
 
+    /// 列統計を読む。
     let private readColumnStat (c: Cursor) =
         result {
             let! name, c1 = Reader.readStr c
@@ -460,6 +470,7 @@ module internal Catalog =
             return (name, ndv), c2
         }
 
+    /// 索引統計を読む。
     let private readIndexStat (c: Cursor) =
         result {
             let! name, c1 = Reader.readStr c
@@ -468,6 +479,7 @@ module internal Catalog =
             return (name, columns), c3
         }
 
+    /// 省略可能な float を読む。
     let private readFloatOption (c: Cursor) =
         result {
             let! has, c1 = Reader.readBool c
@@ -479,6 +491,7 @@ module internal Catalog =
                 return Some(System.BitConverter.Int64BitsToDouble bits), c2
         }
 
+    /// 列統計の末尾拡張（MCV・ヒストグラムなど）を読む。
     let private readColumnExtras (c: Cursor) =
         result {
             let! nulls, c1 = Reader.readInt64LE c
@@ -490,6 +503,7 @@ module internal Catalog =
             return (nulls, minValue, maxValue, histogram), c5
         }
 
+    /// 索引統計の末尾拡張を読む。
     let private readIndexExtras (c: Cursor) =
         result {
             let! count, c1 = Reader.readVarint c
@@ -654,6 +668,7 @@ module internal Catalog =
                             }
             }
 
+    /// バイト列からテーブル統計を復元する。
     let private decodeStats (table: string) (bytes: byte array) =
         result {
             let! baseStats, afterIndexes = decodeStatsBase table bytes
@@ -672,20 +687,26 @@ module internal Catalog =
     let private statsKey (name: string) =
         System.Text.Encoding.UTF8.GetBytes("stats:" + name)
 
+    /// カタログ値を BLOB 1列の行にする。
     let private toValue (bytes: byte array) = [| SqlValue.Blob bytes |]
 
+    /// テーブル定義の書き込みエントリを作る。
     let private tableBatch (t: TableDefinition) (seq: uint64) =
         Keyspace.CatalogKeyspace, [| Entry.put (tableKey t.Name) seq (toValue (encodeTable t)) |]
 
+    /// 索引定義の書き込みエントリを作る。
     let private indexBatch (i: IndexDefinition) (seq: uint64) =
         Keyspace.CatalogKeyspace, [| Entry.put (indexKey i.IndexName) seq (toValue (encodeIndex i)) |]
 
+    /// 統計の書き込みエントリを作る。
     let private statsBatch (s: TableStats) (seq: uint64) =
         Keyspace.CatalogKeyspace, [| Entry.put (statsKey s.Table) seq (toValue (encodeStats s)) |]
 
+    /// カタログ値の削除エントリを作る。
     let private deleteBatch (key: byte array) (seq: uint64) =
         Keyspace.CatalogKeyspace, [| Entry.delete key seq |]
 
+    /// 連番を振りながら定義列を書き込みエントリへ変換する。
     [<TailCall>]
     let rec private numberList (mk: 'a -> uint64 -> 'b) (rest: 'a list) (seq: uint64) (acc: 'b list) =
         match rest with

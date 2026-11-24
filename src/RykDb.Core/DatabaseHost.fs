@@ -25,30 +25,38 @@ type private SyncState =
 /// 複数の commit の WAL 位置をまとめ、リーダーが 1回だけ fsync する。
 /// 先に登録された位置を後から登録された位置が包含する場合、後者だけを同期すればよい。
 type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
+    /// 状態を保護するロック。
     let gate = obj ()
+
+    /// グループコミットの進行状態。
     let mutable state = SyncState.Idle(None, None)
 
+    /// 到達済みの位置が pos を包含するか。
     let covers (pos: WalState) =
         function
         | Some(current: WalState) -> (current.FileNumber, current.Size) >= (pos.FileNumber, pos.Size)
         | None -> false
 
+    /// 2つの WAL 位置のうち後ろを返す。
     let later (a: WalState) (b: WalState) =
         if (a.FileNumber, a.Size) >= (b.FileNumber, b.Size) then
             a
         else
             b
 
+    /// 登録済みの最大位置と pos の後ろを返す。
     let laterPending (pos: WalState) =
         function
         | Some current -> later current pos
         | None -> pos
 
+    /// 到達済みの位置と target の後ろを返す。
     let laterSynced (target: WalState) =
         function
         | Some current -> later current target
         | None -> target
 
+    /// pos が fsync 済みになるまで待つ（先頭の待機者がリーダーとして同期する）。
     [<TailCall>]
     let rec awaitLoop (pos: WalState) =
         let step =
@@ -195,23 +203,26 @@ module internal DatabaseHostHelpers =
                 ret (next, (nextLocal, StatementResult.Empty)))
 
 type internal DatabaseHost(root: string, state: Committed, ?commitDurability: CommitDurability) =
-    // ライフサイクル（確定状態と Close 状態）を保護する短いロック。
+    /// ライフサイクル（確定状態と Close 状態）を保護する短いロック。
     let stateGate = obj ()
-    // 書き込み・transaction 操作・Close を直列化するロック。
+
+    /// 書き込み・transaction 操作・Close を直列化するロック。
     let writeGate = obj ()
-    // 放棄された接続の transaction の TxnId。
-    // finalizer が積み、`writeGate` の内側で回収する（finalizer はロックを取らない）。
+
+    /// 放棄された接続の transaction の TxnId（finalizer が積む）。
     let abandoned = System.Collections.Concurrent.ConcurrentQueue<TxnId>()
 
+    /// WAL のグループコミット。
     let durability =
         match commitDurability with
         | Some d -> d
         | None -> CommitDurability(fun pos -> Wal.sync root pos)
 
-    // 確定状態は transaction を持たない（型で保証される）。
-    // WAL の fsync はホストのグループコミットへ委ねる（DeferDurability）。
+    /// ホストのライフサイクル（Running / Closed）。
+    /// 確定状態は transaction を持たない（型で保証される）。
     let mutable lifecycle = HostLifecycle.Running { state with DeferDurability = true }
 
+    /// 現在のライフサイクルを読む。
     let snapshot () = lock stateGate (fun () -> lifecycle)
 
     /// 確定状態と接続ローカルの transaction から実行状態を作る。
@@ -230,15 +241,14 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
             | HostLifecycle.Running _ -> lifecycle <- HostLifecycle.Running state
             | HostLifecycle.Closed _ -> ())
 
+    /// Close 後の操作のエラー。
     let closedError () = DbError.internalError "データベースは閉じられています"
 
     /// 放棄された接続の transaction を manager から外す（`writeGate` の内側で呼ぶ）。
     /// <remarks>
-    /// 接続が Close されずに GC されると、その transaction は二度と commit できない。
-    /// `Active` に残すと `activeSnapshot` が下がり、`LastCommitted` が以後の commit の
-    /// キーを保持し続ける（メモリリーク）。
-    /// finalizer はキューに積むだけなので、finalizer スレッドが gate で止まることはない。
-    /// `abortId` は冪等で、既に commit / abort 済みの TxnId は無視される。
+    /// 接続が Close されずに GC されるとその transaction は二度と commit できない。
+    /// `Active` に残すと `activeSnapshot` が下がらず、`LastCommitted` がキーを保持し続ける。
+    /// finalizer はキューに積むだけなので gate で止まらない。`abortId` は冪等。
     /// </remarks>
     let reclaimAbandoned (current: Committed) =
         match DatabaseHostHelpers.drainAbandoned abandoned false current.Manager with
@@ -249,14 +259,12 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
         | _, false -> current
 
     /// writeGate の内側で実行し、WAL を進めたときだけ fsync を gate の外で待つ。
-    /// `run` は「実行後の確定状態」と値も返す（読み取りだけなら入力をそのまま返す）。
     /// <remarks>
-    /// 戻り値は (run の値, 永続化エラー)。
-    /// 永続化エラーが Some のとき、run の変更は**適用済み**だが fsync に失敗している
-    /// （以後の操作は `CommitDurability` の失敗状態ですべてエラーになる）。
-    /// run が成功した結果を捨てて Error だけ返すと、呼び出し側の接続状態が host と分断する
+    /// 戻り値は (run の値, 永続化エラー)。Some なら run の変更は適用済みで fsync だけが失敗している
+    /// （以後の操作は `CommitDurability` の失敗状態でエラーになる）。
+    /// run の結果を捨てて Error だけ返すと、接続状態が host と分断する
     /// （COMMIT 済みなのに「transaction 中」のまま残る）。
-    /// BEGIN / ROLLBACK・失敗した文は WAL を進めないので fsync を待たない。
+    /// BEGIN / ROLLBACK と失敗した文は WAL を進めないので待たない。
     /// </remarks>
     let serialized (run: Committed -> Result<Committed * 'a, DbError>) =
         let outcome, position =

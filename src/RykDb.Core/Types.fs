@@ -1,11 +1,8 @@
 namespace RykDb.Core
 
 /// 意味の違う数値を取り違えないための単位。
-/// 素の `int64` / `uint64` 同士は取り違えてもコンパイルが通る。
-/// そこで**同型で紛れやすい組の片側だけ**に単位を付ける:
-/// - `manifestNo` — MANIFEST 番号（`FileNumber` / `NextFileNumber` は素の `int64` のまま）
-/// - `txnId` — transaction 番号（`NextSeqNo` は素の `uint64` のまま）
-/// 片側だけでも対が区別できる（`int64<manifestNo>` と `int64` は代入できない）。
+/// 紛れやすい同型の組の片側だけに付ける
+/// （`manifestNo` は MANIFEST 番号、`txnId` は transaction 番号）。
 [<Measure>]
 type manifestNo
 
@@ -98,10 +95,10 @@ module internal Bytes =
         ||| (readLE32At data offset 2 <<< 16)
         ||| (readLE32At data offset 3 <<< 24)
 
-/// エントリの並び順（キー昇順・同一キーは SeqNo 降順）の**唯一の定義**。
-/// memtable の `Entry` と SSTable の `SstEntry` は必ずこれを経由する
-/// （2実装になると片方だけ壊れる。`SerializationTests` の `順序保持:` が検査する）。
+/// エントリの並び順（キー昇順・同一キーは SeqNo 降順）の唯一の定義。
+/// memtable の `Entry` と SSTable の `SstEntry` は必ずこれを経由する。
 module internal KeyOrder =
+    /// キー昇順、同一キーなら SeqNo 降順で比較する。
     let compare (keyA: byte array) (seqA: uint64) (keyB: byte array) (seqB: uint64) =
         match Bytes.compare keyA keyB with
         | 0 -> compare seqB seqA
@@ -111,6 +108,7 @@ module internal KeyOrder =
 /// テーブル名・列名・索引名・別名は大文字小文字を区別しない。
 /// スキーマ・カタログ・実行層で同じ規則を使うため、ここに 1つだけ置く。
 module internal SqlName =
+    /// 識別子を大文字小文字を無視して比較する。
     let equal (a: string) (b: string) =
         System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
 
@@ -224,10 +222,11 @@ module internal DataType =
         | DataType.Uuid -> "UUID"
 
 module internal SqlValue =
-    /// 共有済みの Bool 値。
-    /// 比較・IS NULL・3値論理の結果は true / false の 2種類しかないので、
-    /// 行ごとの評価で新しい DU を作らない。
+    /// 共有の `true`。
+    /// 行ごとの評価で新しい DU を確保しない。
     let TrueValue = SqlValue.Bool true
+
+    /// 共有の `false`。
     let FalseValue = SqlValue.Bool false
 
     /// bool を共有済みの SqlValue.Bool へ変換する。
@@ -255,15 +254,14 @@ module internal SqlValue =
         | Ok t -> DataType.toSqlName t
         | Error _ -> "<unloaded>"
 
+    /// NULL かどうか。
     let isNull =
         function
         | SqlValue.Null -> true
         | _ -> false
 
-    /// 行を結果として返すときに DB 内部の配列と切り離す。
-    /// `StatementResult.Rows` や `RowReader` はこれを経由する。
-    /// 配列をそのまま返すと、呼び出し側の書き換えが memtable / SSTable の内容を壊す。
-    /// Blob の byte[] も複製する。
+    /// 行を結果として返すときに内部の配列と切り離す（Blob も複製する）。
+    /// 結果の境界（`StatementResult` / `RowReader`）は必ずここを通る。
     let copyRow =
         Array.map (function
             | SqlValue.Blob b -> SqlValue.Blob(Array.copy b)
@@ -318,9 +316,7 @@ module internal SqlValue =
         && System.Math.Abs f <= DecimalMaxAsFloat
 
     /// 数値として取り出す。
-    /// 非数値なら None。
-    /// NaN と ±Infinity、および decimal の範囲外の REAL は None を返す
-    /// （System.Decimal の変換は例外を送出するため）。
+    /// 非数値、NaN、±Infinity、decimal の範囲外は None。
     let asNumeric =
         function
         | SqlValue.Int i -> Some(decimal i)
@@ -329,6 +325,8 @@ module internal SqlValue =
         | SqlValue.Decimal d -> Some d
         | _ -> None
 
+    /// TEXT として取り出す。
+    /// それ以外は None。
     let asText =
         function
         | SqlValue.Text s -> Some s
@@ -340,6 +338,8 @@ module internal SqlValue =
     [<Literal>]
     let private CanonicalNaNBits = 0x7FF8000000000000L
 
+    /// キー符号化に使う正の quiet NaN。
+    /// .NET の `Double.NaN` は符号ビットが立つため、そのままキーにすると順序が崩れる。
     let canonicalNaN = System.BitConverter.Int64BitsToDouble CanonicalNaNBits
 
     /// 浮動小数点数を単一のビットパターンに正規化する。
@@ -351,6 +351,7 @@ module internal SqlValue =
         elif f = 0.0 then 0.0
         else f
 
+    /// 浮動小数点数を正規化して `SqlValue.Real` にする。
     let vReal = normalizeFloat >> SqlValue.Real
 
     /// 10進値を整数で表せるなら INTEGER に寄せる。
@@ -367,13 +368,11 @@ module internal SqlValue =
             SqlValue.Decimal stripped
 
     /// 等値キー用の正規化。
-    /// DISTINCT / GROUP BY の同一性は符号化バイト列の一致で判定するため、
-    /// `compareValuesV` が等値とみなす表現差を 1つの表現へ寄せる:
+    /// `compareValuesV` が等値とみなす表現差を 1つに寄せる:
     /// - 整数値の DECIMAL は INTEGER に寄せる（`1.0` / `1.00` / `1` を同じキーに）
-    /// - REAL は 10進と厳密に往復できる値だけ寄せる（丸めが絡む値は REAL のまま残す。
-    ///   REAL と DECIMAL の等値は丸めで推移的でなくなり得るため、安全側に倒す）
-    /// - 深夜 0時 UTC の TIMESTAMP は DATE に寄せる（両者は等値）
-    /// 集計値の計算には使わない（元の値の型を保つ）。
+    /// - REAL は 10進と厳密に往復できる値だけ寄せる（丸めが絡む値は REAL のまま）
+    /// - 深夜 0時 UTC の TIMESTAMP は DATE に寄せる
+    /// 集計値の計算には使わない（元の型を保つ）。
     let keyNormalize =
         function
         | SqlValue.Decimal d -> canonicalDecimal d
@@ -422,19 +421,19 @@ module internal SqlValue =
                 let c = compare px py
                 if c <> 0 then c else compareTextLoop x y nextX nextY
 
-    /// TEXT を UTF-8 の符号化順（Unicode コードポイント順）で比較する。
-    /// .NET の StringComparer.Ordinal は UTF-16 コード単位順であり、
-    /// 補助文字（サロゲートペア）と U+E000..U+FFFF の間で UTF-8 の順序と逆転する。
-    /// キーの符号化は UTF-8 バイト列なので、SQL の比較も同じ順序に合わせる。
-    /// 不正なサロゲートは Encoding.UTF8 と同じく U+FFFD として扱う。
+    /// TEXT を UTF-8 符号化順（Unicode コードポイント順）で比較する。
+    /// .NET の序数比較は UTF-16 コード単位順で、補助文字と U+E000..U+FFFF の間で UTF-8 と逆転する。
+    /// 不正なサロゲートは U+FFFD として扱う。
     let private compareText (x: string) (y: string) = compareTextLoop x y 0 0
 
+    /// 値から decimal を取り出す（非数値は 0）。
     let private decimalOfValue =
         function
         | SqlValue.Int i -> decimal i
         | SqlValue.Decimal d -> d
         | _ -> 0M
 
+    /// 値から float を取り出す（非数値は 0）。
     let private floatOfValue =
         function
         | SqlValue.Int i -> float i
@@ -442,11 +441,14 @@ module internal SqlValue =
         | SqlValue.Real f -> f
         | _ -> 0.0
 
+    /// NaN を含まない float の比較。
     let private compareFloat (x: float) (y: float) =
         if x < y then -1
         elif x > y then 1
         else 0
 
+    /// REAL と他の数値を比較する。
+    /// decimal で疳密に表せる範囲は decimal、極小値と範囲外は float で比較する。
     let private compareRealValue (f: float) (other: SqlValue) =
         if System.Double.IsNaN f || System.Double.IsInfinity f then
             DbErr(DbError.typeError "NaN や ±Infinity は数値比較できません")
@@ -455,8 +457,10 @@ module internal SqlValue =
         else
             DbOk(compareFloat f (floatOfValue other))
 
+    /// 比較結果の符号を反転する。
     let private negateInt (c: int) = -c
 
+    /// 数値 3型（INTEGER / REAL / DECIMAL）の比較。REAL を含むときの規則をここに集約する。
     let private compareNumericValue (a: SqlValue) (b: SqlValue) =
         match a, b with
         | SqlValue.Real fa, SqlValue.Real fb ->
@@ -473,11 +477,8 @@ module internal SqlValue =
         | _ -> DbOk(System.Decimal.Compare(decimalOfValue a, decimalOfValue b))
 
     /// 値どうしの比較（内部ホットパス用）。
-    /// 成功値を struct で返すので、行ごとの比較で `Ok` を確保しない。
-    /// ローカル関数は毎回クロージャを確保するため、ヘルパーはモジュール直下に置く。
-    /// NULL は比較不能として `DbError.typeError` を返す。
-    /// NaN は NaN と等しく、Real 同士では他のすべての値より大きいものとして扱う
-    /// （Int / Decimal との比較は型エラー）。
+    /// NULL は `TypeError`、NaN は NaN と等しく他の値より大きい。
+    /// REAL と INTEGER / DECIMAL の比較も行う。
     let compareValuesV (a: SqlValue) (b: SqlValue) =
         match a, b with
         | SqlValue.Unloaded, _
@@ -556,9 +557,11 @@ module internal SqlValue =
         | SqlValue.Uuid g -> g.ToString("D", System.Globalization.CultureInfo.InvariantCulture)
         | SqlValue.Unloaded -> "<unloaded>"
 
+    /// int64 の下限を float で表した値（境界判定用）。
     [<Literal>]
     let private Int64MinAsFloat = -9223372036854775808.0
 
+    /// int64 の上限の 1つ上を float で表した値（境界判定用）。
     [<Literal>]
     let private Int64MaxAsFloat = 9223372036854775808.0
 
@@ -770,12 +773,11 @@ module internal SqlValue =
             | _ -> coerce target v
 
 /// 復号済みの行。
-/// 列マスクのプレースホルダ（`SqlValue.Unloaded`）を含まないことが構築時に保証される。
+/// `SqlValue.Unloaded` を含まないことが構築時に保証される。
 /// <remarks>
 /// ケースは非公開で、構築は `LoadedRow.create` だけ。
-/// 結果の境界（`StatementResult` / `RowReader`）はこの型を経由するので、
-/// 復号していない行が公開 API へ漏れる経路は型で塞がれている。
-/// `toArray` の配列は内部で複製済みのものを共有する（書き換えないこと）。
+/// 結果の境界はこの型を経由するので、復号していない行が公開 API へ漏れる経路は型で塞がれている。
+/// `toArray` の配列は内部で共有する（書き換えないこと）。
 /// </remarks>
 [<Struct>]
 type LoadedRow =

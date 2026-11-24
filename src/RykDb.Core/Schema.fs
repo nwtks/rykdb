@@ -39,6 +39,7 @@ type internal Schema =
     }
 
 module internal Schema =
+    /// 列のないスキーマ。
     let Empty = { Columns = [||]; Tables = [] }
 
     /// 横連結（JOIN 用）。
@@ -172,6 +173,7 @@ type internal SelectProjection =
     }
 
 module internal SelectProjection =
+    /// 射影項目を展開した列参照の式にする。
     let private expressionsOf (schema: Schema) =
         List.collect (fun item ->
             match Schema.expandStar item.Expression schema with

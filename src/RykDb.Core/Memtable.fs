@@ -14,6 +14,7 @@ type internal Entry =
     member this.IsDelete = this.Value.IsNone
 
 module internal Entry =
+    /// 値を持つエントリを作る。
     let put (key: byte array) (seqNo: uint64) (value: SqlValue array) =
         {
             Key = key
@@ -21,6 +22,7 @@ module internal Entry =
             Value = Some value
         }
 
+    /// 削除 tombstone のエントリを作る。
     let delete (key: byte array) (seqNo: uint64) =
         {
             Key = key
@@ -30,9 +32,8 @@ module internal Entry =
 
     /// memtable が 1エントリを保持するのに要するヒープ上の概算サイズ。
     /// <remarks>
-    /// Treap ノード（48）+ Entry（40）+ `option Some`（24）+ キー配列（24 + 長さ）
-    /// + 行配列と値（`ValueCodec.managedRowBytes`）。
-    /// 64bit の .NET を前提にした概算で、`SstEntry.approximateBytes`（ファイルサイズ）とは別物。
+    /// Treap ノード + Entry + キー配列 + 行配列と値の合計（64bit .NET 前提の概算）。
+    /// ファイルサイズの見積り（`SstEntry.approximateBytes`）とは別物。
     /// </remarks>
     let managedBytes (e: Entry) =
         let rowBytes =
@@ -40,7 +41,7 @@ module internal Entry =
             | Some values -> ValueCodec.managedRowBytes values
             | None -> 0
 
-        112 + 24 + e.Key.Length + rowBytes
+        48 + 40 + 24 + 24 + e.Key.Length + rowBytes
 
     /// エントリ列に含まれる SeqNo の最大値（空なら 0）。
     let maxSeqNo (entries: Entry seq) =
@@ -51,14 +52,15 @@ module internal Entry =
     let compareKeys (a: Entry) (b: Entry) =
         KeyOrder.compare a.Key a.SeqNo b.Key b.SeqNo
 
+    /// Treap の優先度。
+    /// キーと SeqNo から決定的に導く。
     let priority (e: Entry) =
         let h = Hashing.hashBytes e.Key
         Hashing.mix (h ^^^ e.SeqNo * 0x9E3779B97F4A7C15UL) |> Hashing.mix
 
     /// 所有権を移す: キーと行を複製する。
     /// <remarks>
-    /// Treap の探索と `KeyOrder.compare` は配列の**中身**に依存するので、
-    /// 挿入後に呼び出し側が書き換えると木が壊れる。
+    /// 木の探索は配列の中身に依存するので、挿入後に呼び出し側が書き換えると壊れる。
     /// 保持する側（memtable / transaction バッファ）がこれを呼ぶ。
     /// </remarks>
     let takeOwnership (given: Entry) =
@@ -67,6 +69,7 @@ module internal Entry =
             Value = given.Value |> Option.map SqlValue.copyRow
         }
 
+    /// 1エントリを長さ付きで符号化する。
     let private encodeEntry (e: Entry) =
         let header =
             Writer.build [ Writer.varint e.SeqNo; Writer.bool e.IsDelete; Writer.lengthPrefixed e.Key ]
@@ -81,6 +84,8 @@ module internal Entry =
 
         body |> Result.map (fun b -> Writer.build [ Writer.lengthPrefixed b ])
 
+    /// 1エントリを復号する
+    /// （フレームのチェックサムは呼び出し側で検証済み）。
     let private decodeEntry (data: byte array) =
         result {
             let c = Cursor.create data
@@ -102,6 +107,7 @@ module internal Entry =
                 }
         }
 
+    /// transaction のエントリ列を WAL 用のバイト列にする。
     let encodeBatch (txnId: TxnId) (entries: Entry array) =
         entries
         |> foldOk
@@ -119,6 +125,7 @@ module internal Entry =
             return e, c1
         }
 
+    /// WAL のバイト列から transaction 番号とエントリ列を復元する。
     let decodeBatch (data: byte array) =
         result {
             let c = Cursor.create data
@@ -155,6 +162,7 @@ type internal Memtable =
     }
 
 module internal Memtable =
+    /// 空の memtable。
     let Empty =
         {
             Root = None
@@ -237,10 +245,7 @@ module internal Memtable =
         descend e p [] root
 
     /// 1エントリを挿入する。
-    /// <remarks>
-    /// 保持する側なので `Entry.takeOwnership` でキーと行を複製する
-    /// （呼び出し側が後から配列を書き換えても木が壊れないようにする）。
-    /// </remarks>
+    /// キーと行は複製して保持する（`Entry.takeOwnership`）。
     let insert (given: Entry) (mem: Memtable) =
         let e = Entry.takeOwnership given
 
@@ -271,14 +276,11 @@ module internal Memtable =
             else
                 ceiling key bound best r.Right
 
-    /// キーの最新バージョン（SeqNo が最大のもの）を返す。
-    /// 同一キーの版は SeqNo 降順に並ぶので、最初に拾ったものが最新。
-    /// ポイントルックアップ（MVCC の可視性つき）。
+    /// 可視な最新版を返す（ポイントルックアップ）。
     /// <remarks>
-    /// 木ではキーを昇順、同じキーの版を SeqNo 降順に並べる。
-    /// `visible` 以下の SeqNo を持つ版のうち、同じキーで最も新しい版を返す。
-    /// 木の順序に合わせて `(キー, visible)` 以上で最小のノードを探し、
-    /// 見つかったノードのキーが一致すれば、その版が可視な最新版である（探索は対数時間）。
+    /// 木はキー昇順・同一キーは SeqNo 降順。
+    /// `(キー, visible)` 以上で最小のノードを探し、見つかったノードのキーが一致すれば、
+    /// それが可視な最新版である（対数時間）。
     /// </remarks>
     let getVisible (key: byte array) (visible: uint64 option) (mem: Memtable) =
         let bound =
@@ -293,9 +295,9 @@ module internal Memtable =
     /// 範囲走査の作業リスト。
     /// 探索中のノードと、「このエントリを結果に積む」という操作を交互に並べる。
     type private Work =
-        /// 探索するノード。
-        /// None は「ここより先には対象がない」を意味する。
+        /// 探索するノード。None は「ここより先には対象がない」を意味する。
         | Visit of TNode option
+        /// 結果に積むエントリ。
         | Emit of Entry
 
     /// 作業リストを 1段進め、次のエントリと残りの作業を返す。
@@ -313,8 +315,7 @@ module internal Memtable =
                 rangeScanStep startKey limit struct (Visit r.Left :: Emit r.Entry :: Visit r.Right :: rest, count)
 
     /// startKey 以降をキー昇順（同一キーは SeqNo 降順）で遅延生成する。
-    /// 状態は「作業リスト + 出した件数」だけで、結果を溜めない
-    /// （余分なメモリは作業リスト＝木の高さ分・期待 O(log n)）。
+    /// 状態は作業リスト（木の高さ分）と件数だけで、結果を溜めない。
     /// limit が 0 以下のときは上限なし。
     let rangeScan (startKey: byte array) (limit: int) (mem: Memtable) =
         Seq.unfold (rangeScanStep startKey limit) struct ([ Visit mem.Root ], 0)

@@ -612,6 +612,7 @@ module internal Spill =
             else
                 spoolLoop budget stamp (row :: buf) (bufCount + 1) (bufBytes + size) written serial paths nxt
 
+    /// Op をスプールへ書き出す（読み直しで何度でも列挙できる）。
     let spool (budget: MemoryBudget) (src: Op) =
         let stamp = System.Guid.NewGuid().ToString "N"
         spoolLoop budget stamp [] 0 0L 0 0 [] src

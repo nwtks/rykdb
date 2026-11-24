@@ -59,9 +59,11 @@ module private VersionCoordinatorHelpers =
     [<Literal>]
     let Idle = 0
 
+    /// worker が処理中の activity ビット。
     [<Literal>]
     let Busy = 1
 
+    /// 処理待ちがある activity ビット。
     [<Literal>]
     let Pending = 2
 
@@ -587,14 +589,19 @@ type internal VersionCoordinator
         scanHook: (FileMetaData -> unit) option,
         manifestApply: (int64<manifestNo> -> Version -> VersionEdit -> ManifestApplyResult) option
     ) =
+    /// 公開状態を入れるセルのキー。
     let stateKey = "current"
+
+    /// worker 状態を入れるセルのキー。
     let workerKey = "worker"
 
+    /// 公開状態（1セル）。
     let stateCell =
         System.Collections.Concurrent.ConcurrentDictionary<string, PublishedState>()
 
     do stateCell.[stateKey] <- initial
 
+    /// ファイル番号ごとの参照状態。
     let fileRefs =
         System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>()
 
@@ -609,10 +616,16 @@ type internal VersionCoordinator
 
     do workerCell.[workerKey] <- WorkerState.NotStarted
 
+    /// MANIFEST 反映・採番・install を直列化する gate。
     let installGate = new System.Threading.SemaphoreSlim(1, 1)
+
+    /// worker を停止するための token。
     let cancel = new System.Threading.CancellationTokenSource()
+
+    /// worker を起こすシグナル。
     let signal = new System.Threading.SemaphoreSlim(0, System.Int32.MaxValue)
 
+    /// install 経路へ渡す共通文脈。
     let installCtx: InstallContext =
         {
             Dir = dir
@@ -624,6 +637,7 @@ type internal VersionCoordinator
             FileRefs = fileRefs
         }
 
+    /// compaction サイクルへ渡す共通文脈。
     let cycleCtx: CycleContext =
         {
             Dir = dir

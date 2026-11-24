@@ -111,6 +111,7 @@ module internal Optimizer =
                 Indexes = []
             }
 
+    /// テーブル名から schema を引く。
     let private tableOf (ctx: ExecContext) (name: string) =
         match ExecContext.schemaOf name ctx with
         | Ok s -> Some s
@@ -136,6 +137,7 @@ module internal Optimizer =
             DataType = None
         }
 
+    /// 集約の出力スキーマを作る。
     let private aggregateSchema (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
         let groupColumns = groupBy |> List.map (Expr.toDisplayString >> aggregateColumn)
 
@@ -186,6 +188,7 @@ module internal Optimizer =
             | _ ->
                 outputSchema ctx inSchema (Schema.concat acc (Schema.ofTable name None (defaultSchema ctx name))) rest
 
+    /// 論理木の出力スキーマを求める。
     let private outputOf (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
         outputSchema ctx inSchema Schema.Empty [ SchemaOf tree ]
 
@@ -484,6 +487,7 @@ module internal Optimizer =
 
         System.Collections.Immutable.ImmutableDictionary.CreateRange<obj, bool array>(HashIdentity.Reference, entries)
 
+    /// 集約ノードの GROUP BY 式を拾う。
     let private groupByOf (tree: Logical) =
         match stripWrappers tree with
         | Logical.Aggregate(groupBy, _, _) -> groupBy

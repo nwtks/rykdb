@@ -126,6 +126,7 @@ module internal Compaction =
         | Sequence of int64
         | Allocator of (unit -> int64)
 
+    /// ファイル番号を採番して供給状態を進める。
     let private takeFileNumber (supply: FileNumberSupply) =
         match supply with
         | Sequence current -> current, Sequence(current + 1L)

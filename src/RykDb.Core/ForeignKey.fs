@@ -202,6 +202,7 @@ module internal ForeignKey =
         else
             ret values
 
+    /// 参照先テーブルの schema を引く。
     let private parentSchemaOf (catalog: Catalog) (table: string) =
         match Catalog.findTable table catalog with
         | Some defn -> Catalog.toSchema defn
@@ -335,11 +336,13 @@ module internal ForeignKey =
     /// Op は one-shot なので途中で捨てた走査は Scope の DisposeAll で閉じる。
     let private anyRow (matches: SqlValue array -> DbResult<bool>) (op: Op) = anyRowLoop matches op
 
+    /// 2つの値が SQL の等値か。
     let private sameValue (a: SqlValue) (b: SqlValue) =
         match SqlValue.compareValuesV a b with
         | DbOk 0 -> true
         | _ -> false
 
+    /// 指定位置の値が一致する行か。
     let private rowMatches (positions: int list) (values: SqlValue array) (row: SqlValue array) =
         positions
         |> List.mapi (fun i p -> sameValue row.[p] values.[i])

@@ -33,6 +33,7 @@ type internal SstEntry =
         | None -> this.Value.IsNone
 
 module internal SstEntry =
+    /// 復号済みの値を持つエントリを作る。
     let make (key: byte array) (seqNo: uint64) (value: SqlValue array option) =
         {
             Key = key
@@ -102,8 +103,10 @@ module internal SstEntry =
             else
                 ValueSome struct (acc, next)
 
+    /// varint の SeqNo を読む。
     let private readSeqNo = readSeqNoLoop 0 0UL
 
+    /// エントリのヘッダ（SeqNo と削除タグ）を読む。
     let private decodeHeader (c: Cursor) =
         match readSeqNo c with
         | ValueNone -> err (DbError.corruption "Sstable: SeqNo の varint が不正です")
@@ -114,6 +117,7 @@ module internal SstEntry =
                 let tag = (Cursor.data c).[Cursor.pos c]
                 ret (seqNo, tag, Cursor.advance 1 c)
 
+    /// 削除タグと値本体を復号する。
     let private decodePayload (seqNo: uint64) (tag: byte) (c: Cursor) =
         result {
             let! values, _ = ValueCodec.readValues c
@@ -229,6 +233,7 @@ module internal SstEntry =
 /// 消費者が早期終了しても `DisposeAll` で最新の continuation を閉じられるようにする。
 /// 同じキーには最新の走査だけを保持する（古い continuation は同じファイルハンドルを共有する）。
 type internal ScanScope() =
+    /// 登録中の走査（キー → 最新の continuation）。
     let active =
         System.Collections.Concurrent.ConcurrentDictionary<obj, System.IDisposable>()
 
@@ -398,6 +403,7 @@ module internal SstScan =
             else
                 nextWithFilters allFilters scope scan
 
+    /// 次のエントリを返す（フィルタなしの通常入口）。
     let next = nextWithFilters [] None
 
     /// 明示的に資源を解放する（終端・エラー後の呼び出しも安全）。
@@ -499,17 +505,20 @@ module internal SstMerge =
     /// 空のマージ（すぐ終端）。
     let Empty = SstMerge MergeEmpty
 
+    /// 左偏木の rank（右スパインの長さ）。
     let private rank =
         function
         | MergeEmpty -> 0
         | MergeNode(r, _, _, _) -> r
 
+    /// rank の小さい側を右に置いてノードを作る。
     let private node (head: MergeHead) (left: MergeNode) (right: MergeNode) =
         if rank left >= rank right then
             MergeNode(rank right + 1, head, left, right)
         else
             MergeNode(rank left + 1, head, right, left)
 
+    /// エントリ順（同一ならソース順）でヘッドを比較する。
     let private compareHead (a: MergeHead) (b: MergeHead) =
         match SstEntry.compare a.Entry b.Entry with
         | 0 -> compare a.Source b.Source
@@ -524,11 +533,12 @@ module internal SstMerge =
         | MergeNode(_, ha, _, _), MergeNode(_, hb, _, _) when compareHead ha hb > 0 -> descendMerge picked b a
         | MergeNode(_, ha, left, right), _ -> descendMerge ((ha, left) :: picked) right b
 
+    /// 2つの左偏ヒープを合成する。
     let private mergeHeaps (first: MergeNode) (second: MergeNode) =
         let picked, rest = descendMerge [] first second
         List.fold (fun acc (head, left) -> node head left acc) rest picked
 
-    /// 右スパインを組み直す。
+    /// 右スパインを積んだ経路からヒープを組み直す。
     let private rebuildHeap = List.fold (fun acc (h, left) -> node h left acc)
 
     /// 1つのヘッドを挿入しながら右スパインを辿る。
@@ -557,14 +567,14 @@ module internal SstMerge =
 
         SstMerge(push head heap)
 
-    /// 1つのスキャンを先頭 1件読んでマージへ登録する。
+    /// 走査の先頭 1件をマージのソースとして登録する。
     let private ofScanEntry (source: int) (scan: SstScan) =
         match SstScan.next scan with
         | Ok None -> ret Empty
         | Ok(Some(entry, rest)) -> ret (insert source entry rest Empty)
         | Error e -> err e
 
-    /// 2つのヒープを合成する。
+    /// 2つのマージヒープを統合する。
     let private unionHeaps (SstMerge a) (SstMerge b) = SstMerge(mergeHeaps a b)
 
     /// スキャンを順に追加する本体。

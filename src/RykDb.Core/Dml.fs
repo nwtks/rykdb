@@ -47,6 +47,7 @@ module internal Dml =
     /// （行全体の複製を避ける。読み取りはキーから復号する）。
     let private EmptyIndexValue: SqlValue array = Array.empty
 
+    /// UNIQUE 索引の予約キーを transaction に積む。
     let private reserveUniqueValues (txn: Transaction) (schema: TableSchema) (index: IndexSchema) =
         function
         | None -> ret txn
@@ -180,12 +181,14 @@ module internal Dml =
 
             int (min (int64 System.Int32.MaxValue) (int64 limit + int64 deletions))
 
+    /// 主キーのキーが範囲内か。
     let private inKeyRange (lowerBytes: byte array) (upperBytes: byte array option) (key: byte array) =
         Bytes.compare key lowerBytes >= 0
         && match upperBytes with
            | None -> true
            | Some hb -> Bytes.compare key hb <= 0
 
+    /// 索引キーが範囲内か。
     let private inIndexRange (lowerBytes: byte array) (upperBytes: byte array option) (key: byte array) =
         inKeyRange lowerBytes upperBytes key
         || match upperBytes with

@@ -5,6 +5,7 @@
 namespace RykDb.Core
 
 module internal EngineDdl =
+    /// CREATE TABLE 本体（排他は呼び出し側で取る）。
     let private createTableCore (c: CreateTable) (state: ExecState) =
         let existing = Catalog.findTable c.Name state.Catalog
 
@@ -53,6 +54,8 @@ module internal EngineDdl =
                 return! ExecState.saved catalog2 cleaned
             }
 
+    /// CREATE TABLE。
+    /// カタログ更新と後始末を排他で行う。
     let createTable (c: CreateTable) (state: ExecState) =
         createTableCore c |> ExecState.exclusiveDdl state
 
@@ -110,6 +113,8 @@ module internal EngineDdl =
                 | Error _ -> return next
             }
 
+    /// DROP TABLE
+    /// （後始末をジャーナルに書いてからカタログを削除する）。
     let dropTable (name: string) (ifExists: bool) (state: ExecState) =
         dropTableCore name ifExists |> ExecState.exclusiveDdl state
 
@@ -180,6 +185,7 @@ module internal EngineDdl =
                     return filled
             }
 
+    /// CREATE INDEX 本体（排他は呼び出し側で取る）。
     let private createIndexCore (ci: CreateIndex) (state: ExecState) =
         match Catalog.findTable ci.Table state.Catalog with
         | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
@@ -236,6 +242,8 @@ module internal EngineDdl =
                 return! ExecState.saved next filled
             }
 
+    /// CREATE INDEX
+    /// （索引 keyspace を空にしてから backfill する）。
     let createIndex (ci: CreateIndex) (state: ExecState) =
         match Catalog.findIndex ci.Name state.Catalog with
         | Some _ when ci.IfNotExists -> ret state
@@ -273,6 +281,7 @@ module internal EngineDdl =
                 | Error _ -> return next
             }
 
+    /// DROP INDEX。
     let dropIndex (name: string) (ifExists: bool) (state: ExecState) =
         dropIndexCore name ifExists |> ExecState.exclusiveDdl state
 
@@ -699,5 +708,7 @@ module internal EngineDdl =
                     return! alterRenameColumn state defn schema oldName newName
             }
 
+    /// ALTER TABLE（ADD / DROP / RENAME COLUMN）。
+    /// カタログと行を 1 transaction で更新する。
     let alterTable (a: AlterTable) (state: ExecState) =
         alterTableCore a |> ExecState.exclusiveDdl state

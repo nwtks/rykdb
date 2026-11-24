@@ -55,6 +55,7 @@ module internal Parser =
             | Error e -> err e
         | Error e -> err e
 
+    /// INSERT 文を読む。
     let private parseInsert (st: PState) =
         result {
             let! _, st = expectKeyword "INSERT" st
@@ -125,6 +126,7 @@ module internal Parser =
             | Error e -> err e
         | Error e -> err e
 
+    /// UPDATE 文を読む。
     let private parseUpdate (st: PState) =
         result {
             let! _, st = expectKeyword "UPDATE" st
@@ -143,6 +145,7 @@ module internal Parser =
                 st
         }
 
+    /// DELETE 文を読む。
     let private parseDelete (st: PState) =
         result {
             let! _, st = expectKeyword "DELETE" st
@@ -259,6 +262,7 @@ module internal Parser =
         else
             ret (c, st)
 
+    /// 列定義（型・制約・既定値）を読む。
     let private parseColumnDefinition (st: PState) =
         result {
             let! name, st = parseIdent st
@@ -360,6 +364,7 @@ module internal Parser =
                 |> Result.map (fun (_, st) -> List.rev cols, List.rev constrs, st)
         | Error e -> err e
 
+    /// CREATE TABLE 文を読む。
     let private parseCreateTable (st: PState) =
         result {
             let! _, st = expectKeyword "CREATE" st
@@ -381,6 +386,7 @@ module internal Parser =
                 st
         }
 
+    /// CREATE INDEX 文を読む。
     let private parseCreateIndex (st: PState) =
         result {
             let! _, st = expectKeyword "CREATE" st
@@ -406,6 +412,7 @@ module internal Parser =
                 st
         }
 
+    /// DROP TABLE 文を読む。
     let private parseDropTable (st: PState) =
         result {
             let! _, st = expectKeyword "DROP" st
@@ -417,6 +424,7 @@ module internal Parser =
             return Statement.DropTable(name, ifEx), st
         }
 
+    /// DROP INDEX 文を読む。
     let private parseDropIndex (st: PState) =
         result {
             let! _, st = expectKeyword "DROP" st
@@ -535,6 +543,7 @@ module internal Parser =
         else
             ret (None, st)
 
+    /// ANALYZE 文を読む。
     let private parseAnalyze (st: PState) =
         let st =
             match peek st with
@@ -564,6 +573,7 @@ module internal Parser =
                 |> Result.map (fun (_, st) -> Statement.Analyze(None, None), st)
             | _ -> fail "ANALYZE にはテーブル名が必要です" st
 
+    /// 1文を読む（文の種類で分岐する）。
     let private parseOne (st: PState) =
         let nextToken =
             if st.Pos + 1 < st.Tokens.Length then
@@ -683,6 +693,7 @@ module internal Parser =
                     parseAllStatements (statement :: acc) next
             | Error e -> err e
 
+    /// トークン列を文の列にする。
     let private parseTokens (parameters: SqlValue array) (tokens: TokenItem array) =
         let expected = parameterCount tokens
 

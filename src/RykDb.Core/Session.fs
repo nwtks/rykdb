@@ -81,6 +81,7 @@ type private RowReaderState =
 /// 1つのインスタンスを複数スレッドから同時に使ってはならない。
 /// </remarks>
 type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
+    /// リーダーの状態（Reading / Exhausted / Closed）。
     let mutable state = Reading op
 
     /// リソースを解放して次の状態にする。
@@ -376,14 +377,20 @@ module internal SessionHelpers =
 /// （read-your-writes とスナップショットの一貫性を保つため）。
 /// </remarks>
 type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bool) =
-    // local / readers を保護する短いロック。
-    // 読み取りは入口と出口でしか取らないので、実行中の書き込みに待たされない。
+    /// 接続ローカル（`local` / `readers`）を保護する短いロック。
+    /// 読み取りは入口と出口でしか取らないので、実行中の書き込みに待たされない。
     let stateGate = obj ()
-    // 書き込み・transaction 操作・Close を接続内で直列化するロック。
+
+    /// 書き込み・transaction 操作・Close を接続内で直列化するロック。
     let writeGate = obj ()
+
+    /// 接続だけが持つ状態（Open / Closed、実行中の transaction）。
     let mutable local = LocalSession.Open TxnState.none
+
+    /// 実行中の読み取り数（Close は 0 になるまで待つ）。
     let mutable readers = 0
 
+    /// `SessionOptions` を実行用の上限へ変換したもの。
     let limits =
         {
             MaxRows =
@@ -407,18 +414,21 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             Progress = options.OnAnalyzeProgress
         }
 
+    /// 1文ごとの結果上限（行・バイト）。
     let initialBudget =
         {
             RowsLeft = limits.MaxRows
             BytesLeft = limits.MaxBytes
         }
 
+    /// Close 済みか。
     let isClosed () =
         lock stateGate (fun () ->
             match local with
             | LocalSession.Closed -> true
             | LocalSession.Open _ -> false)
 
+    /// 接続が transaction 中か。
     let inTransaction () =
         lock stateGate (fun () ->
             match local with
@@ -729,7 +739,10 @@ type private PoolLifecycle =
 /// `Close` は DB 全体を閉じる（全接続の終了後に呼ぶ）。
 /// </remarks>
 type SessionPool internal (host: DatabaseHost, options: SessionOptions) =
+    /// `lifecycle` を保護するロック。
     let gate = obj ()
+
+    /// プールのライフサイクル。
     let mutable lifecycle = PoolLifecycle.Open
 
     /// DB を開く（既定の上限）。

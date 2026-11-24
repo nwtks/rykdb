@@ -171,6 +171,8 @@ module internal Analyzer =
         | Logical.Values _ -> Some []
         | _ -> None
 
+    /// 走査が出力する列順（昇順）。
+    /// 順序を保証できなければ None。
     let scanOrder (tableOf: string -> TableSchema option) = scanOrderGo tableOf
 
     /// 列名を未使用の結合キー位置へ順に対応付ける。
@@ -732,6 +734,7 @@ module internal Analyzer =
         | Expr.IsNull(x, neg) -> isNullSelectivity statsOf defaultSelectivity x neg
         | _ -> defaultSelectivity
 
+    /// WHERE の連言から選択性を推定する。
     let private filterSelectivity (statsOf: string -> TableStats option) =
         Predicate.splitConjuncts
         >> List.map (filterConjunctSelectivity statsOf)
@@ -844,6 +847,7 @@ module internal Analyzer =
                 estimateRowsGo statsOf (joined :: tail) rest
             | _ -> estimateRowsGo statsOf (System.Double.PositiveInfinity :: values) rest
 
+    /// 統計から論理木の出力行数を見積る。
     let estimateRowsWith (statsOf: string -> TableStats option) (tree: Logical) =
         estimateRowsGo statsOf [] [ Visit tree ]
 
@@ -1102,6 +1106,7 @@ module internal Analyzer =
                 | Some aligned -> JoinAlgorithm.MergeJoin, Some aligned, None
                 | None -> JoinAlgorithm.HashJoin, Some keys, None
 
+    /// テーブル名から列定義を引く関数を作る。
     let private colOf (tn: string) =
         function
         | Expr.Column { Qualifier = Some q; Name = n } when q.ToLowerInvariant() = tn -> Some n
@@ -1183,6 +1188,7 @@ module internal Analyzer =
                 | _ -> accumulateRangeBounds tn colName lower upper tail
             | _ -> accumulateRangeBounds tn colName lower upper tail
 
+    /// 範囲比較から索引走査の境界を作る。
     let private rangeBounds (tn: string) (colName: string) =
         List.collect Predicate.splitConjuncts
         >> accumulateRangeBounds tn colName None None

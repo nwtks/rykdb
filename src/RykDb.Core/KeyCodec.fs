@@ -29,6 +29,7 @@ module internal Hashing =
         else
             crcStep (n - 1) (c >>> 1)
 
+    /// CRC32C の基本テーブル。
     let private crcTable0 = Array.init 256 (fun i -> crcStep 8 (uint32 i))
 
     /// slicing-by-8 用の次のテーブルを計算する。
@@ -49,6 +50,7 @@ module internal Hashing =
     [<Literal>]
     let private CrcInitial = 0xFFFFFFFFu
 
+    /// 最終 XOR 値（CRC32C の標準パラメータ）。
     [<Literal>]
     let private CrcFinalXor = 0xFFFFFFFFu
 
@@ -160,6 +162,7 @@ module internal ValueCodec =
     /// 型タグを書き込む。
     let private writeTagged (w: Writer) (tag: byte) = w |> Writer.writeByte (byte tag)
 
+    /// 1値を行ペイロードへ書く（`Unloaded` は拒否）。
     let private writeValue (w: Writer) =
         function
         | SqlValue.Null -> ret (writeTagged w 0uy)
@@ -189,6 +192,7 @@ module internal ValueCodec =
         | SqlValue.Uuid g -> ret (writeTagged w 9uy |> Writer.writeBytes (g.ToByteArray()))
         | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
+    /// 型タグを読んで 1値を復号する（高速経路に乗らない型）。
     let private readValueSlow (c: Cursor) =
         result {
             let! tag, c = Reader.readByte c
@@ -258,24 +262,24 @@ module internal ValueCodec =
         let withCount = w |> Writer.varint (uint64 arr.Length)
         foldOk writeValue withCount arr
 
-    /// 一時ファイル（スピル）用: `SqlValue.Unloaded` を含む行も書き出す。
-    /// <remarks>
-    /// 列マスクで「不要」とされた列は `Unloaded` のまま行に残る。
-    /// 退避した行を読み戻したときに列位置がずれないよう、タグ 10 のプレースホルダとして往復させる。
-    /// 永続化（WAL / SSTable）には使わないこと
-    /// （`writeValues` は `Unloaded` を拒否する）。
-    /// </remarks>
-    /// 一時ファイル用の 1値を書き出す（Unloaded はプレースホルダとして残す）。
+    /// 1値を書き出す（`Unloaded` はタグ 10 のプレースホルダにする）。
     let private writeSparse (w: Writer) =
         function
         | SqlValue.Unloaded -> ret (w |> Writer.writeByte 10uy)
         | v -> writeValue w v
 
+    /// 一時ファイル（スピル）用: `SqlValue.Unloaded` を含む行も書き出す。
+    /// <remarks>
+    /// 列マスクで不要とされた列は `Unloaded` のまま行に残る。
+    /// 読み戻したときに列位置がずれないよう、タグ 10 のプレースホルダとして往復させる。
+    /// 永続化（WAL / SSTable）には使わない。
+    /// </remarks>
     let writeValuesSparse (values: SqlValue seq) (w: Writer) =
         let arr = Seq.toArray values
         let withCount = w |> Writer.varint (uint64 arr.Length)
         foldOk writeSparse withCount arr
 
+    /// int64 をリトルエンディアンで書く。
     let private writeInt64LETo (out: byte array) (pos: int) (v: int64) =
         let u = uint64 v
 
@@ -338,6 +342,7 @@ module internal ValueCodec =
         let pos = Writer.writeVarintTo out pos (uint64 values.Length)
         foldOk (writeValueTo out) pos values
 
+    /// タグ 2（INTEGER）の固定長を高速に読む。
     let private readInt (c: Cursor) =
         let d = Cursor.data c
         let start = Cursor.pos c
@@ -359,6 +364,7 @@ module internal ValueCodec =
         else
             ValueNone
 
+    /// INT の高速経路を試し、だめなら `readValueSlow` で読む。
     let private readValue (c: Cursor) =
         match readInt c with
         | ValueSome struct (v, c) -> ret (v, c)
@@ -381,6 +387,7 @@ module internal ValueCodec =
                     fillReadValues values count (i + 1) c'
                 | Error e -> err e
 
+    /// 値の並びを復号する（`writeValues` の逆）。
     let readValues (c: Cursor) =
         result {
             let! n, c = Reader.readVarint c
@@ -485,10 +492,8 @@ module internal ValueCodec =
         Writer.varintLength (uint64 values.Length)
         + Array.sumBy encodedValueLength values
 
-    /// 1値の符号化後のおよそのバイト数（SSTable のファイルサイズ見積り）。
-    /// 実際のファイルサイズとは厳密には一致しない。
-    /// **メモリ上限の判定には使わない**
-    /// （参照型の `SqlValue`・string・配列ヘッダを含まないため）。
+    /// 1値の符号化後のおよそのバイト数（ファイルサイズ見積り）。
+    /// メモリ上限の判定には使わない（参照型・string・配列ヘッダを含まない）。
     /// メモリの見積りは `managedBytes` / `managedRowBytes` を使う。
     let approximateBytes (v: SqlValue) =
         match fixedEncodedBytes v with

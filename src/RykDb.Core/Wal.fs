@@ -1,14 +1,8 @@
 // ===========================================================================
 // WAL（Write-Ahead Log）— 論理ログ。
-// ページイメージではなく更新内容を記録する。
-//   Begin(txnId) / Batch(txnId, entries) / Commit(txnId) / Abort(txnId)
-// を並べ、open 時に先頭から走査して memtable へ再生する。
-//
-//   1レコード: [payloadLength:u32LE][checksum:u32LE(CRC32C)][payload]
-//
-// 長さが合わないレコードは書きかけ（torn write）として打ち切り、
-// チェックサム不一致は CorruptionError にする。
-// 壊れたレコードの後ろは読まずに打ち切る。
+// Begin / Batch / Commit / Abort を記録し、open 時に再生する。
+// 1レコード: [payloadLength:u32LE][checksum:u32LE(CRC32C)][payload]
+// 長さが合わない末尾は書きかけとして打ち切り、チェックサム不一致は CorruptionError にする。
 // ===========================================================================
 
 namespace RykDb.Core
@@ -42,22 +36,27 @@ module internal Wal =
     [<Literal>]
     let WalExtension = ".wal"
 
+    /// Begin のタグ。
     [<Literal>]
     let private TagBegin = 0uy
 
+    /// Batch のタグ。
     [<Literal>]
     let private TagBatch = 1uy
 
+    /// Commit のタグ。
     [<Literal>]
     let private TagCommit = 2uy
 
+    /// Abort のタグ。
     [<Literal>]
     let private TagAbort = 3uy
 
-    /// タグと txnId だけから成るレコードを符号化する。
+    /// タグと txnId だけのレコードを符号化する。
     let private txnRecord (tag: byte) (txnId: TxnId) =
         Writer.build [ Writer.writeByte tag; Writer.uint64BE (uint64 txnId) ]
 
+    /// レコードをバイト列にする。
     let private encodePayload (r: WalRecord) =
         match r with
         | WalRecord.Begin txnId -> ret (txnRecord TagBegin txnId)
@@ -67,6 +66,7 @@ module internal Wal =
             Entry.encodeBatch txnId entries
             |> Result.map (fun bytes -> Writer.build [ Writer.writeByte TagBatch; Writer.writeBytes bytes ])
 
+    /// バイト列からレコードを復元する。
     let private decodePayload (payload: byte array) =
         result {
             let c = Cursor.create payload
@@ -89,20 +89,15 @@ module internal Wal =
             | _ -> return! err (sprintf "Wal: 不明なレコード種別 %d" (int tag) |> DbError.corruption)
         }
 
-    /// ファイル番号から WAL ファイル名を作る。
+    /// ファイル番号から WAL のファイル名を作る。
     let private walFileName (fileNumber: int64) =
         sprintf "%06d%s" fileNumber WalExtension
 
+    /// WAL ファイルのパス。
     let path (dir: string) (fileNumber: int64) =
         System.IO.Path.Combine(dir, walFileName fileNumber)
 
-    /// レコード列を追記する。
-    /// 1レコード（= 1フレーム）ずつ書き出すので、全フレームを 1本の配列に連結しない
-    /// （大きな transaction でピークが約 2倍にならない）。
-    /// Begin / Batch / Commit がフレーム単位で完結しているので、
-    /// プロセスが途中で落ちてもコミット済みトランザクションが中途半端にならない
-    /// （未 commit の Batch は再生時に捨てられ、書きかけのフレームは CRC で検出される）。
-    /// フレームヘッダ（長さ + CRC32C）を符号化する。
+    /// フレームのヘッダ（長さ + CRC32C）を符号化する。
     let private headerOf (payload: byte array) =
         Writer.build
             [
@@ -124,6 +119,8 @@ module internal Wal =
                 writeAll fs (written + header.Length + payload.Length) rest
             | Error e -> err e
 
+    /// 追記本体。
+    /// フレーム単位で書き、書きかけの末尾は切り捨ててから追記する。
     let private appendCore (sync: bool) (dir: string) (records: WalRecord list) (state: WalState) =
         match records with
         | [] -> ret state

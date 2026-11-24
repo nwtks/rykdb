@@ -45,6 +45,7 @@ module internal Transaction =
     [<Literal>]
     let DefaultLimitBytes = 256L * 1024L * 1024L
 
+    /// UNIQUE 予約キーの keyspace 接頭辞。
     [<Literal>]
     let private ReservationKeyspacePrefix = "@unique:"
 
@@ -293,6 +294,7 @@ module internal TransactionManager =
                 | _ -> Map.add k commitSeq acc)
             physical
 
+    /// 初期状態の manager を作る。
     let create () =
         {
             NextSeqNo = 1UL
@@ -464,6 +466,7 @@ module internal TransactionManager =
 
 /// 同じ DB を指す root 表記の揺れ（相対・絶対・末尾の /）を吸収する。
 module internal RootKey =
+    /// root の表記揺れ（相対・絶対・末尾の /）を吸収する。
     let normalize (root: string) =
         if System.String.IsNullOrEmpty root then
             ""
@@ -611,9 +614,11 @@ type internal SnapshotRegistry() =
 /// DB ごとの RootRuntime と active snapshot 登録。
 /// `RowStore` が所有し、Session 間で共有する。
 type internal RootRuntime() =
+    /// DDL（排他）と文の実行（共有）を分けるロック。
     let gate =
         new System.Threading.ReaderWriterLockSlim(System.Threading.LockRecursionPolicy.SupportsRecursion)
 
+    /// 進行中 transaction の snapshot 登録。
     let snapshots = SnapshotRegistry()
 
     /// 書き込み系（文の実行と commit）の共有ロック。

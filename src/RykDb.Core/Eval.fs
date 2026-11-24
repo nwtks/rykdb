@@ -90,6 +90,7 @@ module internal Eval =
         resolve.Like escape pattern
         |> Result.map (fun compiled -> Scalar.matchLikeTokens compiled.Tokens (System.MemoryExtensions.AsSpan text))
 
+    /// 桁あふれのエラー。
     let private overflowError () =
         DbErr(DbError.constraintViolation "数値演算の結果が表現可能な範囲を超えました")
 
@@ -145,6 +146,7 @@ module internal Eval =
             else
                 DbOk(SqlValue.Int(a % b))
 
+    /// DECIMAL の四則演算（桁あふれを検査する）。
     let private decimalArith (a: decimal) (b: decimal) (op: ArithOp) =
         let maxD = System.Decimal.MaxValue
         let minD = System.Decimal.MinValue
@@ -174,6 +176,7 @@ module internal Eval =
         | Div -> DbOk(SqlValue.Decimal(a / b))
         | Mod -> DbOk(SqlValue.Decimal(a % b))
 
+    /// REAL の四則演算（非有限の結果を拒否する）。
     let private realArith (a: float) (b: float) (op: ArithOp) =
         let r =
             match op with
@@ -192,12 +195,14 @@ module internal Eval =
         else
             DbOk(SqlValue.vReal r)
 
+    /// INTEGER / DECIMAL を decimal にする。
     let private decimalOf (v: SqlValue) =
         match v with
         | SqlValue.Int i -> decimal i
         | SqlValue.Decimal d -> d
         | _ -> 0M
 
+    /// 数値を float にする。
     let private floatOf (v: SqlValue) =
         match v with
         | SqlValue.Int i -> float i
@@ -205,6 +210,7 @@ module internal Eval =
         | SqlValue.Real f -> f
         | _ -> 0.0
 
+    /// ゼロか（除算・剰余の前に見る）。
     let private isZero (v: SqlValue) =
         match v with
         | SqlValue.Int 0L
@@ -212,6 +218,7 @@ module internal Eval =
         | SqlValue.Real 0.0 -> true
         | _ -> false
 
+    /// 数値 3型を共通の型へ持ち上げてから演算する。
     let private liftNumeric (op: ArithOp) (a: SqlValue) (b: SqlValue) =
         match a, b with
         | SqlValue.Int x, SqlValue.Int y -> intArith x y op
@@ -221,6 +228,8 @@ module internal Eval =
           (SqlValue.Int _ | SqlValue.Decimal _ | SqlValue.Real _) -> realArith (floatOf a) (floatOf b) op
         | _ -> DbOk SqlValue.Null
 
+    /// 四則演算の入口。
+    /// 数値以外は NULL を返す。
     let private arith (op: ArithOp) (a: SqlValue) (b: SqlValue) =
         if SqlValue.isNull a || SqlValue.isNull b then
             DbOk SqlValue.Null
@@ -240,6 +249,7 @@ module internal Eval =
     let private comparisonTruth (b: bool) =
         if b then TruthValue.True else TruthValue.False
 
+    /// 比較結果の符号に演算子を適用する。
     let private applyComparison (op: CompareOp) (c: int) =
         match op with
         | CompareOp.Eq -> comparisonTruth (c = 0)

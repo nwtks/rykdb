@@ -47,6 +47,7 @@ module internal OpsJoin =
             | DbOk false -> joinLoopAdvance onExhausted onError lrow rightRows resolve on matched (j + 1)
             | DbErr e -> Op.next (onError e matched)
 
+    /// 入れ子ループの本体（一致ごとに emit する）。
     let private joinLoop
         (onExhausted: bool -> Op)
         (onError: DbError -> bool -> Op)
@@ -72,6 +73,7 @@ module internal OpsJoin =
                 ))
             cur
 
+    /// INNER 結合（左右とも配列）。
     let private innerJoinArrays
         (leftSchema: Schema)
         (left: Op)
@@ -122,6 +124,7 @@ module internal OpsJoin =
         else
             Op.emit (padWithNulls lrow width) (leftJoinRows resolve rightRows on width lnext)
 
+    /// LEFT 結合（左右とも配列）。
     let private leftJoinArrays
         (leftSchema: Schema)
         (left: Op)
@@ -180,6 +183,7 @@ module internal OpsJoin =
                     OpStep.OpRow(Array.append lrow rrow, spilledScan budget spool resolve on lrow lnext rest)
                 | DbOk false -> Op.next (spilledScan budget spool resolve on lrow lnext rest))
 
+    /// INNER 結合（右をスプールから読む）。
     let private innerJoinSpilled
         (budget: MemoryBudget)
         (spool: Spill.RowSpool)

@@ -52,6 +52,8 @@ type internal AggFunc =
         | Max -> "MAX"
 
 module internal AggFunc =
+    /// 関数名（大文字小文字無視）から `AggFunc` を得る。
+    /// 未知なら None。
     let tryParse (name: string) =
         match name.ToUpperInvariant() with
         | "COUNT" -> Some AggFunc.Count

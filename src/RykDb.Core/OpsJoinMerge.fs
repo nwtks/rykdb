@@ -72,6 +72,7 @@ module internal OpsJoinMerge =
                 | DbOk c -> c
                 | DbErr _ -> 0
 
+    /// 結合キー列だけで 2行を比較する。
     let private compareKeyRows (keys: int array) (a: SqlValue array) (b: SqlValue array) = compareKeyRowsAt keys a b 0
 
     /// マージ結合フォールバック用に、パーティションの run をキー順に外部ソートする。

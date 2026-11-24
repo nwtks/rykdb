@@ -418,6 +418,7 @@ module internal EngineAnalyze =
             return next, stats
         }
 
+    /// ANALYZE: 統計を取り直してカタログへ保存する（排他 DDL）。
     let analyze
         (table: string option, sample: int option)
         (cancel: System.Threading.CancellationToken)

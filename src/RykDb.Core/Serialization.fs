@@ -5,14 +5,17 @@ namespace RykDb.Core
 #nowarn "760"
 
 module internal Reader =
+    /// 破損として読取り失敗を返す。
     let private eof msg = err (DbError.corruption msg)
 
+    /// 1バイト読む（末尾超過は `CorruptionError`）。
     let readByte (c: Cursor) =
         if Cursor.atEnd c then
             eof "Reader: 読み取り位置が末尾を超えました"
         else
             ret ((Cursor.data c).[Cursor.pos c], Cursor.advance 1 c)
 
+    /// `count` バイトを新しい配列へ読む。
     let readBytes (count: int) (c: Cursor) =
         let d = Cursor.data c
         let p = Cursor.pos c
@@ -23,6 +26,7 @@ module internal Reader =
         else
             ret (Array.sub d p count, Cursor.advance count c)
 
+    /// BOOL を 1バイトから読む（0 以外は true）。
     let readBool = readByte >> Result.map (fun (b, c) -> b <> 0uy, c)
 
     /// 呼び出し側の配列へ読み取る（読み取り用の配列を確保しない）。
@@ -75,6 +79,7 @@ module internal Reader =
     /// 符号なし LEB128 を読む。
     let private readVarintV = decodeVarintV 0 0UL
 
+    /// 符号なし LEB128 を読む。
     let readVarint (c: Cursor) =
         match readVarintV c with
         | ValueSome struct (v, c) -> ret (v, c)
@@ -138,6 +143,7 @@ module internal Reader =
 
             ret (v, Cursor.advance 8 c)
 
+    /// 長さ付きバイト列を読む（`Writer.lengthPrefixed` の逆）。
     let readLengthPrefixed (c: Cursor) =
         readVarint c
         >>= fun (n, c) ->
@@ -217,6 +223,7 @@ module internal OrderPreserving =
         else
             bits ||| System.Int64.MinValue
 
+    /// int64 を順序保持で書く（ビッグエンディアン）。
     let private writeOrderedInt64 (v: int64) (w: Writer) = w |> Writer.uint64BE (mapInt64 v)
 
     /// decimal の有効桁数の上限。
@@ -259,6 +266,7 @@ module internal OrderPreserving =
 
         buffer, start, trimUnscaledDigits buffer start total, total
 
+    /// DECIMAL を符号・指数・桁の補数で書く（順序保持）。
     let private writeOrderedDecimal (v: decimal) (w: Writer) =
         let bits = System.Decimal.GetBits v
         let flags = uint32 bits.[3]
@@ -287,6 +295,7 @@ module internal OrderPreserving =
         |> writeOrderedInt64 exponentValue
         |> Writer.writeBytes digitBytes
 
+    /// GUID を 16 バイトの生バイト列にする。
     let private guidToOrderedBytes (g: System.Guid) =
         let s = g.ToString("N", System.Globalization.CultureInfo.InvariantCulture)
 
@@ -362,7 +371,7 @@ module internal OrderPreserving =
     /// int64 の順序写像を戻す。
     let private unmapInt64 (u: uint64) = int64 (u - 0x8000000000000000UL)
 
-    /// double の順序写像を戻す。
+    /// double の順序写像を戻す（NaN は正規化前のビット列のまま戻る）。
     let private unmapDouble (u: uint64) =
         let bits =
             if u >= 0x8000000000000000UL then
@@ -411,7 +420,7 @@ module internal OrderPreserving =
             fillEscapedPayload d out terminator start 0
             ret (out, Cursor.advance (terminator + 1 - start) c)
 
-    /// DECIMAL の 1桁を復元する。
+    /// 補数で書かれた 1桁を 0..9 に戻す。
     let private decimalDigit (negative: bool) (digits: byte array) (i: int) =
         let d = if negative then 9 - int digits.[i] else int digits.[i]
         if d < 0 || d > 9 then ValueNone else ValueSome d

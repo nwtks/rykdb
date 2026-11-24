@@ -32,6 +32,7 @@ module internal Plan =
             | Ok _ -> Some i
             | Error _ -> outerScopeIndexGo r rest (i + 1)
 
+    /// 外側スコープの列参照を解決する。
     let private outerScopeIndex (inner: Schema) (scopes: OuterScope list) (r: ColumnRef) =
         if Schema.resolve r inner |> Result.isOk || shadowedByInner inner r then
             None
@@ -94,6 +95,7 @@ module internal Plan =
                 let children = kids |> List.map (fun k -> scopeSchema, k)
                 outerRefsCollect addExpr (List.fold (addExpr scopeSchema) acc exprs) (children @ rest)
 
+    /// 相関サブクエリが参照する外側の列を集める。
     let private outerRefs (inner: Schema) (scopes: OuterScope list) (tree: Logical) =
         outerRefsCollect (outerRefsAddExpr scopes) [] [ (inner, tree) ] |> List.distinct
 
@@ -119,6 +121,7 @@ module internal Plan =
         else
             substituteOuterGo r scopes scopes
 
+    /// 外側の列参照を値に置き換える。
     let private substituteOuter (inner: Schema) (scopes: OuterScope list) =
         Expr.rewrite (fun x ->
             match x with

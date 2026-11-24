@@ -66,6 +66,7 @@ type internal ResultLimits =
     }
 
 module internal ResultLimits =
+    /// 上限なしの `ResultLimits`。
     let Unlimited =
         {
             MaxRows = System.Int64.MaxValue
@@ -132,6 +133,7 @@ module internal TxnState =
             Lease = None
         }
 
+    /// transaction 中か。
     let inTransaction (state: TxnState) = state.Active.IsSome
 
 /// 1回の文実行の入力（確定状態 + 接続ローカルの transaction + 実行中の登録）。
@@ -218,6 +220,7 @@ module internal ExecState =
                 StatsDeltas = state.StatsDeltas |> Map.filter (fun k _ -> not (Set.contains k cleared))
             }
 
+    /// transaction を manager で確定し、確定状態を返す。
     let commitTransaction (txn: Transaction) (state: ExecState) =
         result {
             let txn, catalog = applyStatsDeltas txn state
@@ -275,8 +278,11 @@ module internal ExecState =
             | Some _ -> err (DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください")
             | None -> run state)
 
+    /// DDL を排他の下で実行する
+    /// （実行中の transaction があれば待たずに ConflictError）。
     let exclusiveDdl (state: ExecState) (run: ExecState -> Result<ExecState, DbError>) = exclusiveDdlWith state run
 
+    /// backfill を commit する 1チャンクの行数。
     let private BackfillChunkRows = 8192
 
     /// 1チャンク分を transaction にして commit する。
@@ -377,4 +383,5 @@ module internal ExecState =
             | Error e -> err e
         | Error e -> err e
 
+    /// keyspace をチャンク単位で全消去する（DDL 用）。
     let clearSpaceChunksResult (space: string) (state: ExecState) = clearSpaceChunksLoop space state [||]

@@ -113,12 +113,14 @@ module internal Lexer =
             System.ReadOnlySpan<System.Collections.Generic.KeyValuePair<string, string>> pairs
         )
 
+    /// 予約語の表（大文字小文字を区別しない）。
     let private Keywords = makeKeywordMap System.StringComparer.OrdinalIgnoreCase
 
     /// 非 ASCII を含む識別子は ToUpperInvariant してから引く
     /// （ſ のような文字の大文字化で予約語に一致する挙動を保つ）。
     let private KeywordsUpper = makeKeywordMap System.StringComparer.Ordinal
 
+    /// 現在位置の文字を 1つ読み進める。
     let private advance (input: string) (s: LexState) =
         if s.Index < input.Length && input.[s.Index] = '\n' then
             {
@@ -151,6 +153,7 @@ module internal Lexer =
         else
             s
 
+    /// 入れ子を許すブロックコメントを読み飛ばす。
     [<TailCall>]
     let rec private skipBlockComment (input: string) (n: int) (depth: int) (s: LexState) =
         if depth <= 0 then
@@ -164,6 +167,7 @@ module internal Lexer =
         else
             skipBlockComment input n depth (advance input s)
 
+    /// 空白とコメントを読み飛ばす。
     [<TailCall>]
     let rec private skipTriviaLoop (input: string) (n: int) (s: LexState) =
         if s.Index >= n then
@@ -184,13 +188,17 @@ module internal Lexer =
             else
                 ret s
 
+    /// 末尾まで空白とコメントを読み飛ばす。
     let private skipTrivia (input: string) = skipTriviaLoop input input.Length
 
+    /// 識別子の先頭文字か。
     let private isIdentStart (c: char) = System.Char.IsLetter c || c = '_'
 
+    /// 識別子の 2文字目以降か。
     let private isIdentPart (c: char) =
         System.Char.IsLetterOrDigit c || c = '_'
 
+    /// 16進 1桁を数値にする（不正なら -1）。
     let private hexDigitValue (c: char) =
         if c >= '0' && c <= '9' then int c - int '0'
         elif c >= 'a' && c <= 'f' then int c - int 'a' + 10
@@ -234,6 +242,7 @@ module internal Lexer =
         else
             scanDelimitedLoop input n delim (advance input s) sawDouble
 
+    /// 引用符で囲まれた文字列・識別子を 1つ読む。
     let private scanDelimited (input: string) (n: int) (delim: char) (start: LexState) =
         scanDelimitedLoop input n delim (advance input start) false
 
@@ -428,6 +437,7 @@ module internal Lexer =
         else
             scanSymbol input n startPos paramIndex s
 
+    /// 入力全体をトークン列にする。
     [<TailCall>]
     let rec private collectTokens (input: string) (n: int) (acc: TokenItem list) (nextParam: int) (s: LexState) =
         match skipTrivia input s with

@@ -83,13 +83,13 @@ module internal ValueKey =
     let private values (v: SqlValue) =
         v :: (numericEquivalents v @ temporalEquivalents v)
 
-    /// 全候補の符号化（Bloom に登録するキー）。
+    /// Bloom に登録する候補キーの符号化列。
     let encode =
         values
         >> List.map (fun x -> ValueCodec.writeValues [| x |] Writer.Empty |> Result.map Writer.toArray)
         >> all
 
-    /// Bloom 照会用のハッシュ。
+    /// 候補キーのハッシュ列（重複なし）。
     let hashes =
         encode
         >> Result.map (
@@ -99,7 +99,7 @@ module internal ValueKey =
 
 /// IndexedValues / ValueSet のブロック読みと二分探索の共通処理。
 module private ValueSetSearch =
-    /// 退避ブロックの行を配列へ読み込む本体。
+    /// 退避ブロックの行を配列へ読み込む。
     [<TailCall>]
     let rec readBlockFill (block: ValueBlock) (src: Source) (rows: SqlValue array) (i: int) =
         if i >= block.Count then
@@ -160,12 +160,22 @@ module private ValueSetSearch =
 /// </remarks>
 [<Sealed>]
 type internal IndexedValues(path: string, blocks: ValueBlock array, bloom: BloomFilter) =
+    /// 直近ブロックのキャッシュを保護するロック。
     let gate = obj ()
+
+    /// 読み取り用ストリーム（初回アクセスで開く）。
     let mutable reader: System.IO.Stream option = None
+
+    /// 直近に読んだブロックの番号。
     let mutable cachedIndex = -1
+
+    /// 直近に読んだブロックの行。
     let mutable cachedRows: SqlValue array = [||]
+
+    /// 破棄済みか。
     let mutable disposed = false
 
+    /// ストリームを閉じる。
     let closeReader () =
         match reader with
         | Some s ->
@@ -173,6 +183,7 @@ type internal IndexedValues(path: string, blocks: ValueBlock array, bloom: Bloom
             reader <- None
         | None -> ()
 
+    /// ストリームを開く（既に開いていれば再利用する）。
     let openReader () =
         match reader with
         | Some s -> s
