@@ -28,35 +28,36 @@ module internal Scalar =
         else
             struct (int c, 1)
 
+    /// ESCAPE の解釈ループ（末尾再帰）。
+    [<TailCall>]
+    let rec private compileTokensLoop (escape: int option) (pattern: string) (i: int) (acc: LikeToken list) =
+        if i >= pattern.Length then
+            ret
+                {
+                    Tokens = List.rev acc |> List.toArray
+                }
+        else
+            let struct (cp, w) = codePointAt (System.MemoryExtensions.AsSpan pattern) i
+
+            match escape with
+            | Some e when cp = e ->
+                if i + w >= pattern.Length then
+                    err (DbError.typeError "LIKE の ESCAPE の後に文字がありません")
+                else
+                    let struct (nextCp, nextW) =
+                        codePointAt (System.MemoryExtensions.AsSpan pattern) (i + w)
+
+                    compileTokensLoop escape pattern (i + w + nextW) (LiteralCodePoint nextCp :: acc)
+            | _ ->
+                match pattern.[i] with
+                | '%' -> compileTokensLoop escape pattern (i + 1) (AnyMany :: acc)
+                | '_' -> compileTokensLoop escape pattern (i + 1) (AnyOne :: acc)
+                | _ -> compileTokensLoop escape pattern (i + w) (LiteralCodePoint cp :: acc)
+
     /// ESCAPE を解釈してパターンをトークン列にする。
     /// ESCAPE の後に文字が無ければ TypeError。
     /// ESCAPE 文字とエスケープした文字は 1 コードポイントとして扱う。
-    let compileTokens (escape: int option) (pattern: string) =
-        let rec loop i acc =
-            if i >= pattern.Length then
-                ret
-                    {
-                        Tokens = List.rev acc |> List.toArray
-                    }
-            else
-                let struct (cp, w) = codePointAt (System.MemoryExtensions.AsSpan pattern) i
-
-                match escape with
-                | Some e when cp = e ->
-                    if i + w >= pattern.Length then
-                        err (DbError.typeError "LIKE の ESCAPE の後に文字がありません")
-                    else
-                        let struct (nextCp, nextW) =
-                            codePointAt (System.MemoryExtensions.AsSpan pattern) (i + w)
-
-                        loop (i + w + nextW) (LiteralCodePoint nextCp :: acc)
-                | _ ->
-                    match pattern.[i] with
-                    | '%' -> loop (i + 1) (AnyMany :: acc)
-                    | '_' -> loop (i + 1) (AnyOne :: acc)
-                    | _ -> loop (i + w) (LiteralCodePoint cp :: acc)
-
-        loop 0 []
+    let compileTokens (escape: int option) (pattern: string) = compileTokensLoop escape pattern 0 []
 
     /// ESCAPE なしを表すコードポイント。
     [<Literal>]
@@ -132,43 +133,53 @@ module internal Scalar =
         else
             err (DbError.typeError "LIKE の ESCAPE は 1 文字で指定してください")
 
+    /// 文字列のコードポイント数を先頭から数える再帰ループ。
+    [<TailCall>]
+    let rec private charLengthLoop (s: string) (i: int) (n: int) =
+        if i >= s.Length then
+            n
+        elif
+            System.Char.IsHighSurrogate s.[i]
+            && i + 1 < s.Length
+            && System.Char.IsLowSurrogate s.[i + 1]
+        then
+            charLengthLoop s (i + 2) (n + 1)
+        else
+            charLengthLoop s (i + 1) (n + 1)
+
     /// Unicode のコードポイント数を数える。
     /// `string.Length` は UTF-16 の code unit 数なので、
     /// サロゲートペア（BMP 外の文字）を 1文字として数える。
-    let private charLength (s: string) =
-        let rec loop i n =
-            if i >= s.Length then
-                n
-            elif
-                System.Char.IsHighSurrogate s.[i]
-                && i + 1 < s.Length
-                && System.Char.IsLowSurrogate s.[i + 1]
-            then
-                loop (i + 2) (n + 1)
-            else
-                loop (i + 1) (n + 1)
+    let private charLength (s: string) = charLengthLoop s 0 0
 
-        loop 0 0
+    /// 引数個数を検証する。
+    let private arity (upper: string) (args: SqlValue array) (n: int) =
+        if args.Length = n then
+            OkUnit
+        else
+            err (sprintf "%s 関数は %d個の引数が必要ですが、%d個渡されました" upper n args.Length |> DbError.name)
+
+    /// 引数を文字列として扱う（NULL 以外は表示形式に変換する）。
+    let private asStr (v: SqlValue) =
+        match SqlValue.asText v with
+        | Some t -> t
+        | None -> SqlValue.toDisplayString v
+
+    /// 最初の NULL でない引数を探す。
+    [<TailCall>]
+    let rec private find (args: SqlValue array) (i: int) =
+        if i >= args.Length then ret SqlValue.Null
+        elif SqlValue.isNull args.[i] then find args (i + 1)
+        else ret args.[i]
 
     /// スカラー関数。
     /// 未知の関数はエラー。
     let applyFunc (name: string) (args: SqlValue array) =
         let upper = name.ToUpperInvariant()
 
-        let arity (n: int) =
-            if args.Length = n then
-                OkUnit
-            else
-                err (sprintf "%s 関数は %d個の引数が必要ですが、%d個渡されました" upper n args.Length |> DbError.name)
-
-        let asStr (v: SqlValue) =
-            match SqlValue.asText v with
-            | Some t -> t
-            | None -> SqlValue.toDisplayString v
-
         match upper with
         | "UPPER" ->
-            arity 1
+            arity upper args 1
             >>= fun () ->
                 if SqlValue.isNull args.[0] then
                     ret SqlValue.Null
@@ -176,7 +187,7 @@ module internal Scalar =
                     let t = asStr args.[0]
                     ret (SqlValue.Text(t.ToUpperInvariant()))
         | "LOWER" ->
-            arity 1
+            arity upper args 1
             >>= fun () ->
                 if SqlValue.isNull args.[0] then
                     ret SqlValue.Null
@@ -184,7 +195,7 @@ module internal Scalar =
                     let t = asStr args.[0]
                     ret (SqlValue.Text(t.ToLowerInvariant()))
         | "LENGTH" ->
-            arity 1
+            arity upper args 1
             >>= fun () ->
                 if SqlValue.isNull args.[0] then
                     ret SqlValue.Null
@@ -192,7 +203,7 @@ module internal Scalar =
                     let t = asStr args.[0]
                     ret (SqlValue.Int(int64 (charLength t)))
         | "ABS" ->
-            arity 1
+            arity upper args 1
             >>= fun () ->
                 if SqlValue.isNull args.[0] then
                     ret SqlValue.Null
@@ -208,15 +219,9 @@ module internal Scalar =
                             sprintf "ABS は数値を受け付けますが %s です" (SqlLiteral.toSqlLiteral other)
                             |> DbError.typeError
                         )
-        | "COALESCE" ->
-            let rec find (i: int) =
-                if i >= args.Length then ret SqlValue.Null
-                elif SqlValue.isNull args.[i] then find (i + 1)
-                else ret args.[i]
-
-            find 0
+        | "COALESCE" -> find args 0
         | "TRIM" ->
-            arity 1
+            arity upper args 1
             >>= fun () ->
                 if SqlValue.isNull args.[0] then
                     ret SqlValue.Null
@@ -224,7 +229,7 @@ module internal Scalar =
                     let t = (asStr args.[0]).Trim()
                     ret (SqlValue.Text t)
         | "ROUND" ->
-            arity 1
+            arity upper args 1
             >>= fun () ->
                 match args.[0] with
                 | SqlValue.Int i -> ret (SqlValue.Int i)

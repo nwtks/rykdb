@@ -20,35 +20,71 @@ type Reply =
     | Failure of string
     | Halt
 
+/// エスケープを 1文字ずつ元へ戻して sb へ積む（末尾再帰）。
+[<TailCall>]
+let rec private unescapeLineLoop (sb: System.Text.StringBuilder) (s: string) (i: int) =
+    if i >= s.Length then
+        sb.ToString()
+    else
+        match s.[i] with
+        | '\\' when i + 1 < s.Length ->
+            match s.[i + 1] with
+            | 'n' ->
+                sb.Append '\n' |> ignore
+                unescapeLineLoop sb s (i + 2)
+            | 'r' ->
+                sb.Append '\r' |> ignore
+                unescapeLineLoop sb s (i + 2)
+            | '\\' ->
+                sb.Append '\\' |> ignore
+                unescapeLineLoop sb s (i + 2)
+            | _ ->
+                sb.Append '\\' |> ignore
+                unescapeLineLoop sb s (i + 1)
+        | c ->
+            sb.Append c |> ignore
+            unescapeLineLoop sb s (i + 1)
+
 /// サーバがプロトコルに載せるために付けたエスケープ
 /// （`\\` / `\n` / `\r`）を 1パスで元へ戻す。
 let private unescapeLine (s: string) =
     let sb = System.Text.StringBuilder s.Length
+    unescapeLineLoop sb s 0
 
-    let rec loop i =
-        if i >= s.Length then
-            sb.ToString()
-        else
-            match s.[i] with
-            | '\\' when i + 1 < s.Length ->
-                match s.[i + 1] with
-                | 'n' ->
-                    sb.Append '\n' |> ignore
-                    loop (i + 2)
-                | 'r' ->
-                    sb.Append '\r' |> ignore
-                    loop (i + 2)
-                | '\\' ->
-                    sb.Append '\\' |> ignore
-                    loop (i + 2)
-                | _ ->
-                    sb.Append '\\' |> ignore
-                    loop (i + 1)
-            | c ->
-                sb.Append c |> ignore
-                loop (i + 1)
+/// STREAM 応答の行を onRow へ渡しながら END まで読む（末尾再帰）。
+[<TailCall>]
+let rec private readStreamRows
+    (tryReadLine: unit -> string option)
+    (columns: string list)
+    (onRow: string -> unit)
+    (count: int)
+    =
+    match tryReadLine () with
+    | None -> Failure "サーバ応答が途中で切断されました"
+    | Some line when line = EndTag -> Streamed(columns, count)
+    | Some line when line.StartsWith(ErrTag, System.StringComparison.Ordinal) ->
+        Failure(line.Substring(ErrTag.Length).Trim())
+    | Some line ->
+        onRow (unescapeLine line)
+        readStreamRows tryReadLine columns onRow (count + 1)
 
-    loop 0
+/// 通常 OK にフォールバックした場合の行を onRow へ渡しながら読む（末尾再帰）。
+[<TailCall>]
+let rec private readFallbackRows
+    (tryReadLine: unit -> string option)
+    (columns: string list)
+    (onRow: string -> unit)
+    (count: int)
+    (remaining: int)
+    =
+    if remaining = 0 then
+        Streamed(columns, count)
+    else
+        match tryReadLine () with
+        | None -> Failure "サーバ応答が途中で切断されました"
+        | Some line ->
+            onRow (unescapeLine line)
+            readFallbackRows tryReadLine columns onRow count (remaining - 1)
 
 /// TCP 経由の SQL クライアント。
 type RykDbClient(host: string, port: int) =
@@ -97,6 +133,7 @@ type RykDbClient(host: string, port: int) =
         | true, count when count >= 0 -> Some(columns, count)
         | _ -> None
 
+    [<TailCall>]
     let rec readRows (columns: string list) (remaining: int) (acc: string list) =
         if remaining = 0 then
             Rows(columns, List.rev acc)
@@ -105,6 +142,7 @@ type RykDbClient(host: string, port: int) =
             | None -> Failure "サーバ応答が途中で切断されました"
             | Some row -> readRows columns (remaining - 1) (unescapeLine row :: acc)
 
+    [<TailCall>]
     let rec readStream (columns: string list) (acc: string list) =
         match tryReadLine () with
         | None -> Failure "サーバ応答が途中で切断されました"
@@ -133,7 +171,7 @@ type RykDbClient(host: string, port: int) =
     /// 単一 SELECT を `.stream` で要求し、行ごとに `onRow` へ渡す。
     /// サーバが通常の OK にフォールバックした場合も、その行を `onRow` に渡す。
     /// 行の蓄積はしないため、大きな結果でもクライアント側のメモリは行数に比例しない。
-    member _.SendStream(sql: string, onRow: string -> unit) : Reply =
+    member _.SendStream(sql: string, onRow: string -> unit) =
         let request =
             if sql = ".stream" || sql.StartsWith(".stream ", System.StringComparison.Ordinal) then
                 sql
@@ -149,34 +187,12 @@ type RykDbClient(host: string, port: int) =
         | Some h when h.StartsWith ErrTag -> Failure(h.Substring(ErrTag.Length).Trim())
         | Some h when h = StreamTag || h.StartsWith(StreamTag + "\t", System.StringComparison.Ordinal) ->
             let columns = columnsOfHeader h
-
-            let rec loop count =
-                match tryReadLine () with
-                | None -> Failure "サーバ応答が途中で切断されました"
-                | Some line when line = EndTag -> Streamed(columns, count)
-                | Some line when line.StartsWith(ErrTag, System.StringComparison.Ordinal) ->
-                    Failure(line.Substring(ErrTag.Length).Trim())
-                | Some line ->
-                    onRow (unescapeLine line)
-                    loop (count + 1)
-
-            loop 0
+            readStreamRows tryReadLine columns onRow 0
         | Some h when h.StartsWith(OkTag + " ", System.StringComparison.Ordinal) ->
             match parseOkHeader h with
             | None -> Failure(sprintf "不正なサーバ応答ヘッダー: %s" h)
             | Some([], affected) -> Affected affected
-            | Some(columns, count) ->
-                let rec readRemaining remaining =
-                    if remaining = 0 then
-                        Streamed(columns, count)
-                    else
-                        match tryReadLine () with
-                        | None -> Failure "サーバ応答が途中で切断されました"
-                        | Some line ->
-                            onRow (unescapeLine line)
-                            readRemaining (remaining - 1)
-
-                readRemaining count
+            | Some(columns, count) -> readFallbackRows tryReadLine columns onRow count count
         | Some h -> Failure(sprintf "不正なサーバ応答: %s" h)
 
     member this.Close() =

@@ -68,6 +68,91 @@ module internal ForeignKey =
     let private primaryKeyNames (schema: TableSchema) =
         TableSchema.primaryKeyColumns schema |> List.ofArray
 
+    /// 1つの外部キー定義を検証して保存形へ解決する。
+    let private resolveOne
+        (catalog: Catalog)
+        (schema: TableSchema)
+        (c: CreateTable)
+        (columns: string list, r: ForeignKeyRef)
+        =
+        result {
+            do!
+                if List.isEmpty columns then
+                    err (DbError.constraintViolation "FOREIGN KEY の列が空です")
+                else
+                    ret ()
+
+            match SqlName.duplicate columns with
+            | Some name -> return! err (DbError.name (sprintf "FOREIGN KEY の列 %s が重複しています" name))
+            | None -> ()
+
+            let! childColumns = columnsOf c.Columns columns
+
+            let! parent =
+                if Catalog.eqName r.ParentTable schema.Name then
+                    ret schema
+                else
+                    match Catalog.findTable r.ParentTable catalog with
+                    | Some defn -> Catalog.toSchema defn
+                    | None -> err (DbError.name (sprintf "参照先テーブル %s が存在しません" r.ParentTable))
+
+            let parentKey = primaryKeyNames parent
+
+            let! resolvedKey =
+                match r.ParentColumns with
+                | None -> ret parentKey
+                | Some names when sameNames names parentKey -> ret parentKey
+                | Some names ->
+                    err (
+                        DbError.constraintViolation (
+                            sprintf
+                                "参照先の列（%s）はテーブル %s の主キー（%s）と同順で指定してください"
+                                (System.String.Join(", ", names))
+                                parent.Name
+                                (System.String.Join(", ", parentKey))
+                        )
+                    )
+
+            do!
+                if columns.Length = resolvedKey.Length then
+                    ret ()
+                else
+                    err (
+                        DbError.constraintViolation (
+                            sprintf "FOREIGN KEY の列数(%d)と参照先の主キー列数(%d)が一致しません" columns.Length resolvedKey.Length
+                        )
+                    )
+
+            let! parentColumns = columnsOf parent.Columns resolvedKey
+
+            do!
+                List.zip childColumns parentColumns
+                |> List.map (fun (childCol, parentCol) ->
+                    if childCol.DataType = parentCol.DataType then
+                        ret ()
+                    else
+                        err (
+                            DbError.typeError (
+                                sprintf
+                                    "外部キーの列 %s の型 %s が参照先 %s.%s の型 %s と一致しません"
+                                    childCol.Name
+                                    (DataType.toSqlName childCol.DataType)
+                                    parent.Name
+                                    parentCol.Name
+                                    (DataType.toSqlName parentCol.DataType)
+                            )
+                        ))
+                |> all
+                |> Result.map ignore
+
+            return
+                {
+                    Columns = columns
+                    ParentTable = r.ParentTable
+                    ParentColumns = resolvedKey
+                }
+        }
+
     /// `CREATE TABLE` の外部キーを検証し、カタログへ保存する形にする。
     /// 参照先の列は省略時には親の主キーへ解決し、指定時も主キーと同順であることを要求する。
     let resolveCreatedTable (catalog: Catalog) (schema: TableSchema) (c: CreateTable) =
@@ -80,86 +165,7 @@ module internal ForeignKey =
                    | TableConstraint.ForeignKey(columns, r) -> Some(columns, r)
                    | _ -> None))
 
-        let resolveOne (columns: string list, r: ForeignKeyRef) =
-            result {
-                do!
-                    if List.isEmpty columns then
-                        err (DbError.constraintViolation "FOREIGN KEY の列が空です")
-                    else
-                        ret ()
-
-                match SqlName.duplicate columns with
-                | Some name -> return! err (DbError.name (sprintf "FOREIGN KEY の列 %s が重複しています" name))
-                | None -> ()
-
-                let! childColumns = columnsOf c.Columns columns
-
-                let! parent =
-                    if Catalog.eqName r.ParentTable schema.Name then
-                        ret schema
-                    else
-                        match Catalog.findTable r.ParentTable catalog with
-                        | Some defn -> Catalog.toSchema defn
-                        | None -> err (DbError.name (sprintf "参照先テーブル %s が存在しません" r.ParentTable))
-
-                let parentKey = primaryKeyNames parent
-
-                let! resolvedKey =
-                    match r.ParentColumns with
-                    | None -> ret parentKey
-                    | Some names when sameNames names parentKey -> ret parentKey
-                    | Some names ->
-                        err (
-                            DbError.constraintViolation (
-                                sprintf
-                                    "参照先の列（%s）はテーブル %s の主キー（%s）と同順で指定してください"
-                                    (System.String.Join(", ", names))
-                                    parent.Name
-                                    (System.String.Join(", ", parentKey))
-                            )
-                        )
-
-                do!
-                    if columns.Length = resolvedKey.Length then
-                        ret ()
-                    else
-                        err (
-                            DbError.constraintViolation (
-                                sprintf "FOREIGN KEY の列数(%d)と参照先の主キー列数(%d)が一致しません" columns.Length resolvedKey.Length
-                            )
-                        )
-
-                let! parentColumns = columnsOf parent.Columns resolvedKey
-
-                do!
-                    List.zip childColumns parentColumns
-                    |> List.map (fun (childCol, parentCol) ->
-                        if childCol.DataType = parentCol.DataType then
-                            ret ()
-                        else
-                            err (
-                                DbError.typeError (
-                                    sprintf
-                                        "外部キーの列 %s の型 %s が参照先 %s.%s の型 %s と一致しません"
-                                        childCol.Name
-                                        (DataType.toSqlName childCol.DataType)
-                                        parent.Name
-                                        parentCol.Name
-                                        (DataType.toSqlName parentCol.DataType)
-                                )
-                            ))
-                    |> all
-                    |> Result.map ignore
-
-                return
-                    {
-                        Columns = columns
-                        ParentTable = r.ParentTable
-                        ParentColumns = resolvedKey
-                    }
-            }
-
-        references |> List.map resolveOne |> all
+        references |> List.map (resolveOne catalog schema c) |> all
 
     /// 列位置のリストから行の値を取り出す。
     /// 列マスクで復号されていない列があれば InternalError（呼び出し側の mask 漏れ）。
@@ -293,20 +299,21 @@ module internal ForeignKey =
             })
         |> all
 
+    /// `anyRow` の走査ループ。
+    [<TailCall>]
+    let rec private anyRowLoop (matches: SqlValue array -> DbResult<bool>) (current: Op) =
+        match Op.next current with
+        | OpStep.OpError e -> Error e
+        | OpStep.OpDone -> Ok false
+        | OpStep.OpRow(row, next) ->
+            match matches row with
+            | DbErr e -> Error e
+            | DbOk true -> Ok true
+            | DbOk false -> anyRowLoop matches next
+
     /// Op の行を先頭から調べ、`matches` が真になった時点で打ち切る。
     /// Op は one-shot なので途中で捨てた走査は Scope の DisposeAll で閉じる。
-    let private anyRow (matches: SqlValue array -> DbResult<bool>) (op: Op) =
-        let rec loop current =
-            match Op.next current with
-            | OpStep.OpError e -> Error e
-            | OpStep.OpDone -> Ok false
-            | OpStep.OpRow(row, next) ->
-                match matches row with
-                | DbErr e -> Error e
-                | DbOk true -> Ok true
-                | DbOk false -> loop next
-
-        loop op
+    let private anyRow (matches: SqlValue array -> DbResult<bool>) (op: Op) = anyRowLoop matches op
 
     let private sameValue (a: SqlValue) (b: SqlValue) =
         match SqlValue.compareValuesV a b with

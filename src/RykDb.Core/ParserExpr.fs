@@ -48,13 +48,13 @@ module internal ParserExpr =
     let private dataTypeOfName (name: string) =
         TypeTable |> List.tryFind (fun (n, _) -> n = name) |> Option.map snd
 
-    let internal peek (st: PState) = st.Tokens.[st.Pos].Token
+    let peek (st: PState) = st.Tokens.[st.Pos].Token
 
     let private peekPos (st: PState) = st.Tokens.[st.Pos].Pos
 
     /// 1トークン消費した次の状態を返す。
     /// 末尾なら動かない。
-    let internal advance (st: PState) =
+    let advance (st: PState) =
         if st.Pos < st.Tokens.Length - 1 then
             { st with Pos = st.Pos + 1 }
         else
@@ -62,7 +62,7 @@ module internal ParserExpr =
 
     /// 現在位置を添えた構文エラーを返す。
     /// 送出はしない。
-    let internal fail (msg: string) (st: PState) = err (DbError.syntax msg (peekPos st))
+    let fail (msg: string) (st: PState) = err (DbError.syntax msg (peekPos st))
 
     /// 単純リテラルなら式を返す。
     /// `parsePrimaryC` と `Parser.parseInsert` の VALUES 高速経路が共有する
@@ -70,7 +70,7 @@ module internal ParserExpr =
     /// 部分アクティブパターンは既定で `Some` を確保するため、
     /// `[<return: Struct>]` + `voption` でホットパスを割当ゼロに保つ。
     [<return: Struct>]
-    let internal (|LiteralExpr|_|) (tok: Token) : Expr voption =
+    let (|LiteralExpr|_|) (tok: Token) =
         match tok with
         | Token.IntLit v -> ValueSome(Expr.Literal(Literal.Int v))
         | Token.RealLit v -> ValueSome(Expr.Literal(Literal.Real v))
@@ -87,18 +87,18 @@ module internal ParserExpr =
     /// （`QuotedIdent` は予約語チェックを通さない仕様なので、`Ident` と混ぜると
     /// `"UNION"` を別名にできなくなる）。
     [<return: Struct>]
-    let internal (|NameToken|_|) (tok: Token) : string voption =
+    let (|NameToken|_|) (tok: Token) =
         match tok with
         | Token.Ident s
         | Token.QuotedIdent s -> ValueSome s
         | _ -> ValueNone
 
-    let internal isSymbol (s: string) (st: PState) =
+    let isSymbol (s: string) (st: PState) =
         match peek st with
         | Token.Symbol x -> x = s
         | _ -> false
 
-    let internal isKeyword (k: string) (st: PState) =
+    let isKeyword (k: string) (st: PState) =
         match peek st with
         | Token.Keyword x -> x = k
         | _ -> false
@@ -108,7 +108,7 @@ module internal ParserExpr =
     /// （`UNION` 単独・`INTERSECT` / `EXCEPT` は明示エラー）。
     /// これらは予約語ではないため、テーブル別名として飲み込むと
     /// 後続の SELECT が別の文として実行されてしまう。
-    let internal SetOperationWords = Set.ofList [ "UNION"; "INTERSECT"; "EXCEPT" ]
+    let SetOperationWords = Set.ofList [ "UNION"; "INTERSECT"; "EXCEPT" ]
 
     /// 未対応の JOIN 系の語。
     /// テーブル別名として飲み込むと、RIGHT JOIN などが INNER JOIN として静かに実行される。
@@ -120,13 +120,13 @@ module internal ParserExpr =
     let private ReservedAliasWords = Set.union SetOperationWords UnsupportedJoinWords
 
     /// 現在位置が指定した識別子（大文字小文字を無視）か。
-    let internal isIdentName (name: string) (st: PState) =
+    let isIdentName (name: string) (st: PState) =
         match peek st with
         | Token.Ident s -> s.ToUpperInvariant() = name
         | _ -> false
 
     /// 指定した識別子があれば消費する（無くてもエラーにしない）。
-    let internal eatIdentName (name: string) (st: PState) =
+    let eatIdentName (name: string) (st: PState) =
         if isIdentName name st then advance st else st
 
     /// 未対応語をテーブル別名として飲み込まないためのメッセージ。
@@ -166,68 +166,70 @@ module internal ParserExpr =
     let private eatKeyword (k: string) (st: PState) =
         if isKeyword k st then advance st else st
 
-    let internal expectSymbol (s: string) (st: PState) =
+    let expectSymbol (s: string) (st: PState) =
         if isSymbol s st then
             ret ((), advance st)
         else
             fail (sprintf "'%s' が必要ですが見つかりませんでした" s) st
 
-    let internal expectKeyword (k: string) (st: PState) =
+    let expectKeyword (k: string) (st: PState) =
         if isKeyword k st then
             ret ((), advance st)
         else
             fail (sprintf "%s が必要ですが見つかりませんでした" k) st
 
     /// 末尾の ';' は任意なので、失敗扱いにしない。
-    let internal eatOptionalSemicolon (st: PState) = ret ((), eatSymbol ";" st)
+    let eatOptionalSemicolon (st: PState) = ret ((), eatSymbol ";" st)
 
     /// 識別子を読む。
     /// 型名（INTEGER など）は予約語ではなく Ident として字句解析されるので、ここでそのまま通る。
-    let internal parseIdent (st: PState) =
+    let parseIdent (st: PState) =
         match peek st with
         | NameToken s -> ret (s, advance st)
         | _ -> fail "識別子が必要ですが見つかりませんでした" st
 
     /// 括弧の対応を取って読み飛ばす（CAST の型引数用）。
-    let private skipParens (st: PState) =
-        let rec loop depth st =
-            if depth = 0 then
-                ret st
-            elif st.Pos >= st.Tokens.Length - 1 then
-                fail "型引数の ')' がありません" st
-            else
-                match peek st with
-                | Token.Symbol "(" -> loop (depth + 1) (advance st)
-                | Token.Symbol ")" -> loop (depth - 1) (advance st)
-                | _ -> loop depth (advance st)
+    [<TailCall>]
+    let rec private skipParensLoop (depth: int) (st: PState) =
+        if depth = 0 then
+            ret st
+        elif st.Pos >= st.Tokens.Length - 1 then
+            fail "型引数の ')' がありません" st
+        else
+            match peek st with
+            | Token.Symbol "(" -> skipParensLoop (depth + 1) (advance st)
+            | Token.Symbol ")" -> skipParensLoop (depth - 1) (advance st)
+            | _ -> skipParensLoop depth (advance st)
 
-        if isSymbol "(" st then loop 1 (advance st) else ret st
+    /// 括弧の対応を取って読み飛ばす（CAST の型引数用）。
+    let private skipParens (st: PState) =
+        if isSymbol "(" st then
+            skipParensLoop 1 (advance st)
+        else
+            ret st
+
+    /// 括弧で囲まれた識別子リストを読む（走査ループ）。
+    [<TailCall>]
+    let rec private parseParenIdentListLoop (acc: string list) (st: PState) =
+        match parseIdent st with
+        | Error e -> err e
+        | Ok(c, st) ->
+            if isSymbol "," st then
+                advance st |> parseParenIdentListLoop (c :: acc)
+            else
+                expectSymbol ")" st |> Result.map (fun (_, st) -> List.rev (c :: acc), st)
 
     /// 括弧で囲まれた識別子リストを読む。
-    let internal parseParenIdentList (st: PState) =
-        let rec loop acc st =
-            match parseIdent st with
-            | Error e -> err e
-            | Ok(c, st) ->
-                if isSymbol "," st then
-                    advance st |> loop (c :: acc)
-                else
-                    expectSymbol ")" st |> Result.map (fun (_, st) -> List.rev (c :: acc), st)
+    let parseParenIdentList (st: PState) =
+        expectSymbol "(" st >>= fun (_, st) -> parseParenIdentListLoop [] st
 
-        expectSymbol "(" st >>= fun (_, st) -> loop [] st
-
-    let internal parseDataType (st: PState) =
+    let parseDataType (st: PState) =
         match peek st with
         | Token.Ident s ->
             match dataTypeOfName (s.ToUpperInvariant()) with
             | Some dt -> ret (dt, advance st)
             | None -> fail (sprintf "未知の型 '%s'" s) st
         | _ -> fail "型名が必要です" st
-
-    // -----------------------------------------------------------------------
-    // 別名・対象テーブル・選択項目の補助関数。
-    // 式の本体は Pratt（precedence climbing）で読む（下の節）。
-    // -----------------------------------------------------------------------
 
     /// 列の別名を読む。
     /// 未対応の SQL 語（UNION / RIGHT など）は裸の別名として飲み込まない
@@ -263,7 +265,7 @@ module internal ParserExpr =
     /// INSERT / UPDATE / DELETE の対象テーブル。
     /// 別名は受理しない（列解決に使われず、`WHERE x.id` だけが NameError になる
     /// 中途半端な状態を避けるため、パース時点で明示エラーにする）。
-    let internal parseTableRef (st: PState) =
+    let parseTableRef (st: PState) =
         match peek st with
         | Token.Symbol "(" -> fail "INSERT / UPDATE / DELETE の対象テーブルにサブクエリは使えません" st
         | _ ->
@@ -405,6 +407,17 @@ module internal ParserExpr =
         | Token.Keyword word -> keywordInfix st word
         | Token.Symbol symbol -> symbolInfix symbol
         | _ -> None
+
+    /// JOIN の種類（INNER / LEFT [OUTER]）を読む。
+    /// 語を消費した後の状態と種類を返す。
+    /// どちらの語も無ければ None。
+    let private parseJoinKind (st: PState) =
+        if isKeyword "INNER" st then
+            Some(JoinKind.Inner, advance st)
+        elif isKeyword "LEFT" st then
+            Some(JoinKind.Left, advance st |> eatIdentName "OUTER")
+        else
+            None
 
     /// 式を 1つ読み、継続へ渡す。
     /// 継続は「残りの解析」を表す関数で、必ず末尾位置で呼ぶ。
@@ -852,7 +865,7 @@ module internal ParserExpr =
                             st
                         )))))
 
-    and private parseJoinsLoop
+    and [<TailCall>] private parseJoinsLoop
         (acc: JoinClause list)
         (st: PState)
         (k: JoinClause list * PState -> Result<'r, DbError>)
@@ -895,17 +908,6 @@ module internal ParserExpr =
     /// （`FROM t LEFT WHERE ...` が LEFT JOIN なしとして静かに通っていた）。
     and [<TailCall>] private parseJoinsC (st: PState) (k: JoinClause list * PState -> Result<'r, DbError>) =
         parseJoinsLoop [] st k
-
-    /// JOIN の種類（INNER / LEFT [OUTER]）を読む。
-    /// 語を消費した後の状態と種類を返す。
-    /// どちらの語も無ければ None。
-    and [<TailCall>] private parseJoinKind (st: PState) =
-        if isKeyword "INNER" st then
-            Some(JoinKind.Inner, advance st)
-        elif isKeyword "LEFT" st then
-            Some(JoinKind.Left, advance st |> eatIdentName "OUTER")
-        else
-            None
 
     and [<TailCall>] private parseWhereC (st: PState) (k: Expr option * PState -> Result<'r, DbError>) =
         if isKeyword "WHERE" st then
@@ -983,13 +985,13 @@ module internal ParserExpr =
 
     /// CPS の構文規則を、値をそのまま返す形で呼ぶ入口。
     /// DML・文の列挙など、呼び出しの入れ子が入力サイズに比例しない箇所で使う。
-    let internal parseExprValue (st: PState) = parseExprC st ret
+    let parseExprValue (st: PState) = parseExprC st ret
 
-    let internal parseWhereValue (st: PState) = parseWhereC st ret
+    let parseWhereValue (st: PState) = parseWhereC st ret
 
-    let internal parseSelectStatementValue (st: PState) = parseSelectStatementC st ret
+    let parseSelectStatementValue (st: PState) = parseSelectStatementC st ret
 
-    let internal parseSelect (st: PState) =
+    let parseSelect (st: PState) =
         result {
             let! sel, st = parseSelectStatementValue st
             let! _, st = eatOptionalSemicolon st

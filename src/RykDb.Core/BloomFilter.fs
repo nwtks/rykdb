@@ -38,68 +38,73 @@ module internal BloomFilter =
         h1, step
 
     /// i 番目のハッシュ位置。
-    let private positionAt (bitCount: int) (h1: uint64) (step: uint64) i =
+    let private positionAt (bitCount: int) (h1: uint64) (step: uint64) (i: int32) =
         int ((h1 + uint64 i * step) % uint64 bitCount)
+
+    /// 期待要素数と誤検出率から必要なビット数を求める（8ビット単位に丸める）。
+    let private bitsFor (expectedCount: int) (falsePositiveRate: float) =
+        if expectedCount <= 0 then
+            8
+        else
+            let m = -float expectedCount * log falsePositiveRate / (ln2 * ln2)
+            let words = min (ceil (m / 8.0)) (float (System.Int32.MaxValue / 8))
+            max 8 (int words * 8)
+
+    /// ビット数と期待要素数からハッシュ関数数を求める。
+    let private hashesFor (expectedCount: int) (bitCount: int) =
+        if expectedCount <= 0 then
+            1
+        else
+            max 1 (int (ceil (float bitCount / float expectedCount) * ln2))
+
+    /// 1ハッシュ分のビットを立て、追加したハッシュ数を返す。
+    let private addHash (bitCount: int) (hashCount: int) (bits: byte array) (count: int) (hash: uint64) =
+        let h1, step = firstAndStep bitCount hash
+
+        for i in 0 .. hashCount - 1 do
+            let pos = positionAt bitCount h1 step i
+            bits.[pos / 8] <- bits.[pos / 8] ||| (1uy <<< pos % 8)
+
+        count + hashCount
+
+    /// ハッシュ列から filter を構築する。
+    let private ofHashes (expectedCount: int) (falsePositiveRate: float) (hashes: uint64 seq) =
+        let bitCount = bitsFor expectedCount falsePositiveRate
+        let hashCount = hashesFor expectedCount bitCount
+        let bits = Array.zeroCreate<byte>(bitCount / 8)
+
+        let count = hashes |> Seq.fold (addHash bitCount hashCount bits) 0
+
+        {
+            Bits = bits
+            BitCount = bitCount
+            HashCount = hashCount
+            Count = count
+        }
 
     /// キー列から filter を構築する（ハッシュはキーから導出）。
     let private ofKeys (expectedCount: int) (falsePositiveRate: float) =
-        let bitsFor expectedCount falsePositiveRate =
-            if expectedCount <= 0 then
-                8
-            else
-                let m = -float expectedCount * log falsePositiveRate / (ln2 * ln2)
-                let words = min (ceil (m / 8.0)) (float (System.Int32.MaxValue / 8))
-                max 8 (int words * 8)
-
-        let hashesFor expectedCount bitCount =
-            if expectedCount <= 0 then
-                1
-            else
-                max 1 (int (ceil (float bitCount / float expectedCount) * ln2))
-
-        let ofHashes expectedCount falsePositiveRate hashes =
-            let bitCount = bitsFor expectedCount falsePositiveRate
-            let hashCount = hashesFor expectedCount bitCount
-            let bits = Array.zeroCreate<byte>(bitCount / 8)
-
-            let addHash count hash =
-                let h1, step = firstAndStep bitCount hash
-
-                for i in 0 .. hashCount - 1 do
-                    let pos = positionAt bitCount h1 step i
-                    bits.[pos / 8] <- bits.[pos / 8] ||| (1uy <<< pos % 8)
-
-                count + hashCount
-
-            let count = hashes |> Seq.fold addHash 0
-
-            {
-                Bits = bits
-                BitCount = bitCount
-                HashCount = hashCount
-                Count = count
-            }
-
         Seq.map (Hashing.hashBytes >> Hashing.mix)
         >> ofHashes expectedCount falsePositiveRate
+
+    /// 全ハッシュ位置のビットが立っているかを順に検査する。
+    [<TailCall>]
+    let rec private check (filter: BloomFilter) (h1: uint64) (step: uint64) (i: int) =
+        if i >= filter.HashCount then
+            true
+        else
+            let pos = positionAt filter.BitCount h1 step i
+
+            if filter.Bits.[pos / 8] &&& (1uy <<< pos % 8) <> 0uy then
+                check filter h1 step (i + 1)
+            else
+                false
 
     /// キーが含まれ得るなら true（false positive を許す）。
     /// 位置の配列を作らない（ポイント検索ごとの割り当てを避ける）。
     let mightContain (filter: BloomFilter) (keyHash: uint64) =
         let h1, step = firstAndStep filter.BitCount keyHash
-
-        let rec check i =
-            if i >= filter.HashCount then
-                true
-            else
-                let pos = positionAt filter.BitCount h1 step i
-
-                if filter.Bits.[pos / 8] &&& (1uy <<< pos % 8) <> 0uy then
-                    check (i + 1)
-                else
-                    false
-
-        check 0
+        check filter h1 step 0
 
     /// 逐次追加できる Bloom filter ビルダ。
     /// `ofKeys` と同じパラメータで作り、`Add` でキーを足して `Build` で確定する。

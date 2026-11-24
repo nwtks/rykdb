@@ -97,6 +97,62 @@ module internal ValueKey =
             >> List.distinct
         )
 
+/// IndexedValues / ValueSet のブロック読みと二分探索の共通処理。
+module private ValueSetSearch =
+    /// 退避ブロックの行を配列へ読み込む本体。
+    [<TailCall>]
+    let rec readBlockFill (block: ValueBlock) (src: Source) (rows: SqlValue array) (i: int) =
+        if i >= block.Count then
+            Ok rows
+        else
+            match Spill.readRow src with
+            | Error e -> Error e
+            | Ok None -> Error(DbError.corruption "ValueSet: 退避したブロックが途中で終わりました")
+            | Ok(Some row) ->
+                rows.[i] <- row.[0]
+                readBlockFill block src rows (i + 1)
+
+    /// ソート済み配列を二分探索する本体。
+    [<TailCall>]
+    let rec private searchRowsLoop (rows: SqlValue array) (v: SqlValue) (lo: int) (hi: int) =
+        if lo > hi then
+            Ok false
+        else
+            let mid = (lo + hi) / 2
+
+            match SqlValue.compareValuesV rows.[mid] v with
+            | DbErr e -> Error e
+            | DbOk 0 -> Ok true
+            | DbOk c ->
+                if c < 0 then
+                    searchRowsLoop rows v (mid + 1) hi
+                else
+                    searchRowsLoop rows v lo (mid - 1)
+
+    /// 退避ブロックの行を二分探索する。
+    let searchIndexedRows (rows: SqlValue array) (v: SqlValue) =
+        searchRowsLoop rows v 0 (rows.Length - 1)
+
+    /// メモリ上のソート済み配列を二分探索する。
+    let searchArrayRows (rows: SqlValue array) (v: SqlValue) =
+        searchRowsLoop rows v 0 (rows.Length - 1)
+
+    /// v を含み得る最後のブロックを二分探索する。
+    [<TailCall>]
+    let rec findBlockIndex (blocks: ValueBlock array) (v: SqlValue) (lo: int) (hi: int) (best: int option) =
+        if lo > hi then
+            Ok best
+        else
+            let mid = (lo + hi) / 2
+
+            match SqlValue.compareValuesV blocks.[mid].First v with
+            | DbErr e -> Error e
+            | DbOk c ->
+                if c <= 0 then
+                    findBlockIndex blocks v (mid + 1) hi (Some mid)
+                else
+                    findBlockIndex blocks v lo (mid - 1) best
+
 /// ソート済みファイルに置いた値集合。
 /// <remarks>
 /// 読み取り用のストリームと直近 1ブロックをキャッシュする。
@@ -144,37 +200,12 @@ type internal IndexedValues(path: string, blocks: ValueBlock array, bloom: Bloom
             let src = new Source(s)
             let rows = Array.zeroCreate<SqlValue> block.Count
 
-            let rec fill i =
-                if i >= block.Count then
-                    Ok rows
-                else
-                    match Spill.readRow src with
-                    | Error e -> Error e
-                    | Ok None -> Error(DbError.corruption "ValueSet: 退避したブロックが途中で終わりました")
-                    | Ok(Some row) ->
-                        rows.[i] <- row.[0]
-                        fill (i + 1)
-
-            match fill 0 with
+            match ValueSetSearch.readBlockFill block src rows 0 with
             | Error e -> Error e
             | Ok _ ->
                 cachedIndex <- index
                 cachedRows <- rows
                 Ok rows
-
-    let searchRows (rows: SqlValue array) (v: SqlValue) =
-        let rec go lo hi =
-            if lo > hi then
-                Ok false
-            else
-                let mid = (lo + hi) / 2
-
-                match SqlValue.compareValuesV rows.[mid] v with
-                | DbErr e -> Error e
-                | DbOk 0 -> Ok true
-                | DbOk c -> if c < 0 then go (mid + 1) hi else go lo (mid - 1)
-
-        go 0 (rows.Length - 1)
 
     /// 空か（NULL だけの集合は空だが、`ValueSet` 側が `HasNull` で区別する）。
     member _.IsEmpty = blocks.Length = 0
@@ -189,27 +220,13 @@ type internal IndexedValues(path: string, blocks: ValueBlock array, bloom: Bloom
                     Ok false
                 else
                     // `v` を含み得るブロックは「先頭値が v 以下である最後のブロック」だけ。
-                    let rec findBlock lo hi best =
-                        if lo > hi then
-                            Ok best
-                        else
-                            let mid = (lo + hi) / 2
-
-                            match SqlValue.compareValuesV blocks.[mid].First v with
-                            | DbErr e -> Error e
-                            | DbOk c ->
-                                if c <= 0 then
-                                    findBlock (mid + 1) hi (Some mid)
-                                else
-                                    findBlock lo (mid - 1) best
-
-                    match findBlock 0 (blocks.Length - 1) None with
+                    match ValueSetSearch.findBlockIndex blocks v 0 (blocks.Length - 1) None with
                     | Error e -> Error e
                     | Ok None -> Ok false
                     | Ok(Some index) ->
                         match readBlock index with
                         | Error e -> Error e
-                        | Ok rows -> searchRows rows v)
+                        | Ok rows -> ValueSetSearch.searchIndexedRows rows v)
 
     interface System.IDisposable with
         member _.Dispose() =
@@ -233,21 +250,6 @@ type internal ValueSetStorage =
 /// </remarks>
 [<Sealed>]
 type internal ValueSet internal (storage: ValueSetStorage, hasNull: bool) =
-    /// ソート済み配列の二分探索（SQL の等値）。
-    let searchArray (rows: SqlValue array) (v: SqlValue) =
-        let rec go lo hi =
-            if lo > hi then
-                Ok false
-            else
-                let mid = (lo + hi) / 2
-
-                match SqlValue.compareValuesV rows.[mid] v with
-                | DbErr e -> Error e
-                | DbOk 0 -> Ok true
-                | DbOk c -> if c < 0 then go (mid + 1) hi else go lo (mid - 1)
-
-        go 0 (rows.Length - 1)
-
     /// 値を含むか（SQL の 3値論理）。
     /// 空集合は FALSE、要素に NULL があって見つからない場合は UNKNOWN。
     member _.Contains(v: SqlValue) =
@@ -263,7 +265,7 @@ type internal ValueSet internal (storage: ValueSetStorage, hasNull: bool) =
         else
             let found =
                 match storage with
-                | ValueSetStorage.InMemory rows -> searchArray rows v
+                | ValueSetStorage.InMemory rows -> ValueSetSearch.searchArrayRows rows v
                 | ValueSetStorage.OnDisk store -> store.Contains v
 
             match found with
@@ -308,6 +310,16 @@ module internal ValueSet =
                 | DbErr e -> DbErr e
                 | DbOk _ -> DbOk representative
 
+    /// 代表値との比較可能性を検査する本体。
+    [<TailCall>]
+    let rec private validateComparable (values: SqlValue array) (rep: SqlValue) (i: int) =
+        if i >= values.Length then
+            Ok()
+        else
+            match SqlValue.compareValuesV rep values.[i] with
+            | DbErr e -> Error e
+            | DbOk _ -> validateComparable values rep (i + 1)
+
     /// メモリ上の集合をソート済み配列にする。
     let private sortedArray (set: System.Collections.Generic.HashSet<SqlValue>) =
         let values = set |> Seq.toArray
@@ -317,15 +329,7 @@ module internal ValueSet =
         | _ ->
             let rep = values.[0]
 
-            let rec validate i =
-                if i >= values.Length then
-                    Ok()
-                else
-                    match SqlValue.compareValuesV rep values.[i] with
-                    | DbErr e -> Error e
-                    | DbOk _ -> validate (i + 1)
-
-            match validate 1 with
+            match validateComparable values rep 1 with
             | Error e -> Error e
             | Ok() -> Ok(values |> Array.sortWith (fun a b -> compareValues [| a |] [| b |]))
 
@@ -333,6 +337,72 @@ module internal ValueSet =
     let private frameLength (v: SqlValue) =
         let payload = ValueCodec.encodedValuesLength [| v |]
         int64 (Writer.varintLength (uint64 payload)) + int64 payload
+
+    /// 1ブロックの行を sink へ書き出す本体。
+    [<TailCall>]
+    let rec private writeIndexedRows (sink: Sink) (rows: SqlValue array) (i: int) (pos: int64) =
+        if i >= rows.Length then
+            Ok pos
+        else
+            match Spill.writeRow [| rows.[i] |] sink with
+            | Error e -> Error e
+            | Ok() -> writeIndexedRows sink rows (i + 1) (pos + frameLength rows.[i])
+
+    /// 1ブロックを書き出し、ブロック一覧と次のオフセットを返す。
+    let private writeIndexedBlock (sink: Sink) blocks (rows: SqlValue array) (offset: int64) =
+        match writeIndexedRows sink rows 0 offset with
+        | Error e -> Error e
+        | Ok pos ->
+            Ok(
+                {
+                    First = rows.[0]
+                    Offset = offset
+                    Count = rows.Length
+                }
+                :: blocks,
+                pos
+            )
+
+    /// Bloom に 1値を追加する（符号化できない値は無視）。
+    let private addIndexedBloom (bloom: BloomFilter.BloomBuilder) (v: SqlValue) =
+        match ValueKey.encode v with
+        | Ok keys -> keys |> List.iter bloom.Add
+        | Error _ -> ()
+
+    /// ソート済みの行を索引付きファイルへ書き出すループ本体。
+    [<TailCall>]
+    let rec private writeIndexedLoop
+        (sink: Sink)
+        (bloom: BloomFilter.BloomBuilder)
+        (hasNull: bool)
+        (blocks: ValueBlock list)
+        (buf: SqlValue array)
+        (n: int)
+        (offset: int64)
+        (cur: Op)
+        =
+        match Op.next cur with
+        | OpStep.OpError e -> Error e
+        | OpStep.OpDone ->
+            if n = 0 then
+                Ok(List.rev blocks, hasNull)
+            else
+                writeIndexedBlock sink blocks (Array.sub buf 0 n) offset
+                |> Result.map (fun (blocks', _) -> blocks', hasNull)
+        | OpStep.OpRow(row, nxt) ->
+            if SqlValue.isNull row.[0] then
+                writeIndexedLoop sink bloom true blocks buf n offset nxt
+            else
+                addIndexedBloom bloom row.[0]
+                buf.[n] <- row.[0]
+
+                if n + 1 >= BlockRows then
+                    match writeIndexedBlock sink blocks buf offset with
+                    | Error e -> Error e
+                    | Ok(blocks', offset') ->
+                        writeIndexedLoop sink bloom hasNull blocks' (Array.zeroCreate BlockRows) 0 offset' nxt
+                else
+                    writeIndexedLoop sink bloom hasNull blocks buf (n + 1) offset nxt
 
     /// ソート済みの行を索引付きファイルへ書き出す。
     /// NULL は書き出さず、`HasNull` だけを立てる（比較不能な値を二分探索に混ぜない）。
@@ -343,63 +413,11 @@ module internal ValueSet =
         match Spill.openSink path with
         | Error e -> err e
         | Ok sink ->
-            let abandon (e: DbError) =
+            match writeIndexedLoop sink bloom initialHasNull [] (Array.zeroCreate BlockRows) 0 0L sorted with
+            | Error e ->
                 Spill.closeSink sink
                 Spill.unlink path
                 err e
-
-            let writeBlock blocks (rows: SqlValue array) offset =
-                let rec writeRows i pos =
-                    if i >= rows.Length then
-                        Ok pos
-                    else
-                        match Spill.writeRow [| rows.[i] |] sink with
-                        | Error e -> Error e
-                        | Ok() -> writeRows (i + 1) (pos + frameLength rows.[i])
-
-                match writeRows 0 offset with
-                | Error e -> Error e
-                | Ok pos ->
-                    Ok(
-                        {
-                            First = rows.[0]
-                            Offset = offset
-                            Count = rows.Length
-                        }
-                        :: blocks,
-                        pos
-                    )
-
-            let addBloom v =
-                match ValueKey.encode v with
-                | Ok keys -> keys |> List.iter bloom.Add
-                | Error _ -> ()
-
-            let rec go hasNull blocks buf n offset cur =
-                match Op.next cur with
-                | OpStep.OpError e -> Error e
-                | OpStep.OpDone ->
-                    if n = 0 then
-                        Ok(List.rev blocks, hasNull)
-                    else
-                        writeBlock blocks (Array.sub buf 0 n) offset
-                        |> Result.map (fun (blocks', _) -> blocks', hasNull)
-                | OpStep.OpRow(row, nxt) ->
-                    if SqlValue.isNull row.[0] then
-                        go true blocks buf n offset nxt
-                    else
-                        addBloom row.[0]
-                        buf.[n] <- row.[0]
-
-                        if n + 1 >= BlockRows then
-                            match writeBlock blocks buf offset with
-                            | Error e -> Error e
-                            | Ok(blocks', offset') -> go hasNull blocks' (Array.zeroCreate BlockRows) 0 offset' nxt
-                        else
-                            go hasNull blocks buf (n + 1) offset nxt
-
-            match go initialHasNull [] (Array.zeroCreate BlockRows) 0 0L sorted with
-            | Error e -> abandon e
             | Ok(blocks, hasNull) ->
                 Spill.closeSink sink
                 let store = new IndexedValues(path, Array.ofList blocks, bloom.Build())
@@ -427,33 +445,40 @@ module internal ValueSet =
             >>= ExtSort.sortRows budget None checkComparable compareValues
             >>= writeIndexed budget total hasNull
 
+    /// 入力を走査して値集合を溜める本体。
+    [<TailCall>]
+    let rec private scanValues
+        (budget: MemoryBudget)
+        (set: System.Collections.Generic.HashSet<SqlValue>)
+        (used: int64)
+        (hasNull: bool)
+        (cur: Op)
+        =
+        match Op.next cur with
+        | OpStep.OpError e -> Error e
+        | OpStep.OpDone ->
+            sortedArray set
+            |> Result.map (fun rows -> new ValueSet(ValueSetStorage.InMemory rows, hasNull))
+        | OpStep.OpRow(row, nxt) ->
+            let v = row.[0]
+
+            if SqlValue.isNull v then
+                scanValues budget set used true nxt
+            else
+                let key = SqlValue.keyNormalize v
+
+                if set.Add key then
+                    let size = int64 (ValueCodec.managedBytes key) + 48L
+
+                    if MemoryBudget.exceeded (budget.Work, used + size) then
+                        spillToDisk budget set hasNull nxt
+                    else
+                        scanValues budget set (used + size) hasNull nxt
+                else
+                    scanValues budget set used hasNull nxt
+
     /// `src`（1列の行）から値集合を作る。
     /// 作業メモリを超えたら一時ファイルへ退避する。
     let build (budget: MemoryBudget) (src: Op) =
         let set = System.Collections.Generic.HashSet<SqlValue>()
-
-        let rec scan used hasNull cur =
-            match Op.next cur with
-            | OpStep.OpError e -> Error e
-            | OpStep.OpDone ->
-                sortedArray set
-                |> Result.map (fun rows -> new ValueSet(ValueSetStorage.InMemory rows, hasNull))
-            | OpStep.OpRow(row, nxt) ->
-                let v = row.[0]
-
-                if SqlValue.isNull v then
-                    scan used true nxt
-                else
-                    let key = SqlValue.keyNormalize v
-
-                    if set.Add key then
-                        let size = int64 (ValueCodec.managedBytes key) + 48L
-
-                        if MemoryBudget.exceeded (budget.Work, used + size) then
-                            spillToDisk budget set hasNull nxt
-                        else
-                            scan (used + size) hasNull nxt
-                    else
-                        scan used hasNull nxt
-
-        scan 0L false src
+        scanValues budget set 0L false src

@@ -46,12 +46,43 @@ module internal FileMetaData =
             ReadInfo = None
         }
 
+    /// SSTable のファイル名（6桁の番号と拡張子）。
+    let private fileName (fileNumber: int64) =
+        sprintf "%06d%s" fileNumber SstExtension
+
     /// SSTable のフルパス。
     let path (dir: string) (fileNumber: int64) =
-        let fileName fileNumber =
-            sprintf "%06d%s" fileNumber SstExtension
-
         System.IO.Path.Combine(dir, fileName fileNumber)
+
+    /// 書き出し結果から SSTable のメタデータを組み立てる。
+    let private ofChunk (dir: string) (fileNumber: int64) (level: int) (info: SstWriteInfo) =
+        {
+            FileNumber = fileNumber
+            Level = level
+            Smallest = info.FirstKey
+            Largest = info.LastKey
+            EntryCount = info.EntryCount
+            Size = info.Size
+            MaxSeqNo = info.MaxSeqNo
+            ReadInfo =
+                Some
+                    {
+                        Path = path dir fileNumber
+                        Index = info.Index
+                        MinKey = info.FirstKey
+                        MaxKey = info.LastKey
+                        Bloom = info.Bloom
+                        EntryCount = info.EntryCount
+                        MaxSeqNo = info.MaxSeqNo
+                    }
+        }
+
+    /// 失敗時に部分ファイルを削除する。
+    let private deletePartial (target: string) =
+        protect (fun () ->
+            if System.IO.File.Exists target then
+                System.IO.File.Delete target)
+        |> ignore
 
     /// エントリ列を SSTable としてファイルへストリーム書きし、メタデータを返す。
     /// ブロックと Bloom filter は 1個ずつ組み立てて書くので、ファイル全体分のメモリを持たない。
@@ -67,35 +98,7 @@ module internal FileMetaData =
         (expectedEntries: int)
         (entries: seq<SstEntry>)
         =
-        let ofChunk info =
-            {
-                FileNumber = fileNumber
-                Level = level
-                Smallest = info.FirstKey
-                Largest = info.LastKey
-                EntryCount = info.EntryCount
-                Size = info.Size
-                MaxSeqNo = info.MaxSeqNo
-                ReadInfo =
-                    Some
-                        {
-                            Path = path dir fileNumber
-                            Index = info.Index
-                            MinKey = info.FirstKey
-                            MaxKey = info.LastKey
-                            Bloom = info.Bloom
-                            EntryCount = info.EntryCount
-                            MaxSeqNo = info.MaxSeqNo
-                        }
-            }
-
         let target = path dir fileNumber
-
-        let deletePartial () =
-            protect (fun () ->
-                if System.IO.File.Exists target then
-                    System.IO.File.Delete target)
-            |> ignore
 
         let written =
             protect (fun () ->
@@ -117,26 +120,27 @@ module internal FileMetaData =
 
         match written with
         | Error e ->
-            deletePartial ()
+            deletePartial target
             err e
         | Ok info when info.EntryCount = 0L ->
-            deletePartial ()
+            deletePartial target
             err (DbError.internalError "Sstable: 空のエントリ列は書き出せません")
-        | Ok info -> ret (ofChunk info)
+        | Ok info -> ret (ofChunk dir fileNumber level info)
 
     /// このファイルが [key] を持ち得るか（Bloom より粗い判定）。
     let mightContain (key: byte array) (f: FileMetaData) =
         Bytes.compare f.Smallest key <= 0 && Bytes.compare key f.Largest <= 0
 
+    /// ファイルを 1つ削除する（存在しなければ何もしない）。
+    let private deleteFile (dir: string) (fileNumber: int64) =
+        protect (fun () ->
+            let p = path dir fileNumber
+
+            if System.IO.File.Exists p then
+                System.IO.File.Delete p)
+
     /// ファイルを実際に削除する。
     let deleteObsolete (dir: string) (files: FileMetaData list) =
-        let deleteFile dir fileNumber =
-            protect (fun () ->
-                let p = path dir fileNumber
-
-                if System.IO.File.Exists p then
-                    System.IO.File.Delete p)
-
         files |> foldOk (fun () f -> deleteFile dir f.FileNumber) ()
 
 /// LSM のレベル設定。
@@ -193,21 +197,23 @@ module internal Version =
 
         { v with Files = newFiles }
 
+    /// キー以上の Smallest を持つ最初の位置を二分探索する。
+    [<TailCall>]
+    let rec private search (key: byte array) (files: FileMetaData array) (lo: int) (hi: int) =
+        if lo >= hi then
+            lo
+        else
+            let mid = lo + (hi - lo) / 2
+
+            if Bytes.compare files.[mid].Smallest key <= 0 then
+                search key files (mid + 1) hi
+            else
+                search key files lo mid
+
     /// レベル内で key を含み得るファイルを 1つ返す。
     /// L1 以降は Smallest 昇順・非重複なので二分探索できる。
     let private findLevelFile (key: byte array) (files: FileMetaData array) =
-        let rec search lo hi =
-            if lo >= hi then
-                lo
-            else
-                let mid = lo + (hi - lo) / 2
-
-                if Bytes.compare files.[mid].Smallest key <= 0 then
-                    search (mid + 1) hi
-                else
-                    search lo mid
-
-        let index = search 0 files.Length
+        let index = search key files 0 files.Length
 
         if index > 0 && FileMetaData.mightContain key files.[index - 1] then
             Some files.[index - 1]
@@ -258,22 +264,24 @@ module internal VersionEdit =
         edit.AddedFiles
         |> List.fold (fun current file -> Version.addFile file current) afterDelete
 
+    /// VersionEdit の追加ファイルを符号化する。
+    let private encodeFile (f: FileMetaData) =
+        Writer.build
+            [
+                Writer.varint (uint64 f.FileNumber)
+                Writer.varint (uint64 f.Level)
+                Writer.varint (uint64 f.EntryCount)
+                Writer.varint (uint64 f.Size)
+                Writer.varint f.MaxSeqNo
+                Writer.lengthPrefixed f.Smallest
+                Writer.lengthPrefixed f.Largest
+            ]
+
+    /// VersionEdit の削除ファイルを符号化する。
+    let private encodeDeleted (f: FileMetaData) =
+        Writer.build [ Writer.varint (uint64 f.FileNumber); Writer.varint (uint64 f.Level) ]
+
     let encode (edit: VersionEdit) =
-        let encodeFile f =
-            Writer.build
-                [
-                    Writer.varint (uint64 f.FileNumber)
-                    Writer.varint (uint64 f.Level)
-                    Writer.varint (uint64 f.EntryCount)
-                    Writer.varint (uint64 f.Size)
-                    Writer.varint f.MaxSeqNo
-                    Writer.lengthPrefixed f.Smallest
-                    Writer.lengthPrefixed f.Largest
-                ]
-
-        let encodeDeleted f =
-            Writer.build [ Writer.varint (uint64 f.FileNumber); Writer.varint (uint64 f.Level) ]
-
         let steps =
             (edit.AddedFiles
              |> List.collect (fun f -> [ Writer.varint 1UL; Writer.writeBytes (encodeFile f) ]))
@@ -282,92 +290,100 @@ module internal VersionEdit =
 
         Writer.build [ Writer.build steps |> Writer.lengthPrefixed ]
 
-    let decode (data: byte array) =
-        let readInt64 label c =
-            Reader.readVarint c
-            >>= fun (v, c) ->
-                if v > uint64 System.Int64.MaxValue then
-                    err (sprintf "VersionEdit: %s が大きすぎます" label |> DbError.corruption)
-                else
-                    ret (int64 v, c)
-
-        let readFileNumber c = readInt64 "ファイル番号" c
-
-        let readLevel c =
-            Reader.readVarint c
-            >>= fun (v, c) ->
-                if v > uint64 Levels.Max then
-                    err (sprintf "VersionEdit: レベル %d が範囲外です" v |> DbError.corruption)
-                else
-                    ret (int v, c)
-
-        let decodeFile c =
-            result {
-                let! num, c = readFileNumber c
-                let! lvl, c = readLevel c
-                let! cnt, c = readInt64 "エントリ数" c
-                let! size, c = readInt64 "ファイルサイズ" c
-                let! maxSeq, c = Reader.readVarint c
-                let! smallest, c = Reader.readLengthPrefixed c
-                let! largest, c = Reader.readLengthPrefixed c
-
-                return
-                    c,
-                    {
-                        FileNumber = num
-                        Level = lvl
-                        Smallest = smallest
-                        Largest = largest
-                        EntryCount = cnt
-                        Size = size
-                        MaxSeqNo = maxSeq
-                        ReadInfo = None
-                    }
-            }
-
-        let decodeDeleted c =
-            result {
-                let! num, c = readFileNumber c
-                let! lvl, c = readLevel c
-
-                return
-                    c,
-                    { FileMetaData.Zero with
-                        FileNumber = num
-                        Level = lvl
-                    }
-            }
-
-        let step c =
-            result {
-                let! tag, c = Reader.readVarint c
-
-                let! c, file =
-                    if tag = 1UL then
-                        decodeFile c
-                    elif tag = 2UL then
-                        decodeDeleted c
-                    else
-                        err (sprintf "VersionEdit: 不明なタグ %d" tag |> DbError.corruption)
-
-                return c, file, tag = 1UL
-            }
-
-        let rec readFiles c added deleted =
-            if Cursor.atEnd c then
-                ret (List.rev added, List.rev deleted)
+    /// VersionEdit の符号化された int64 を読む（上限超過は CorruptionError）。
+    let private readEditInt64 (label: string) (c: Cursor) =
+        Reader.readVarint c
+        >>= fun (v, c) ->
+            if v > uint64 System.Int64.MaxValue then
+                err (sprintf "VersionEdit: %s が大きすぎます" label |> DbError.corruption)
             else
-                match step c with
-                | Ok(c', f, isAdded) ->
-                    if isAdded then
-                        readFiles c' (f :: added) deleted
-                    else
-                        readFiles c' added (f :: deleted)
-                | Error e -> err e
+                ret (int64 v, c)
 
+    /// VersionEdit のファイル番号を読む。
+    let private readEditFileNumber (c: Cursor) = readEditInt64 "ファイル番号" c
+
+    /// VersionEdit のレベルを読む（範囲外は CorruptionError）。
+    let private readEditLevel (c: Cursor) =
+        Reader.readVarint c
+        >>= fun (v, c) ->
+            if v > uint64 Levels.Max then
+                err (sprintf "VersionEdit: レベル %d が範囲外です" v |> DbError.corruption)
+            else
+                ret (int v, c)
+
+    /// VersionEdit の追加ファイル 1件を読む。
+    let private decodeEditFile (c: Cursor) =
+        result {
+            let! num, c = readEditFileNumber c
+            let! lvl, c = readEditLevel c
+            let! cnt, c = readEditInt64 "エントリ数" c
+            let! size, c = readEditInt64 "ファイルサイズ" c
+            let! maxSeq, c = Reader.readVarint c
+            let! smallest, c = Reader.readLengthPrefixed c
+            let! largest, c = Reader.readLengthPrefixed c
+
+            return
+                c,
+                {
+                    FileNumber = num
+                    Level = lvl
+                    Smallest = smallest
+                    Largest = largest
+                    EntryCount = cnt
+                    Size = size
+                    MaxSeqNo = maxSeq
+                    ReadInfo = None
+                }
+        }
+
+    /// VersionEdit の削除ファイル 1件を読む。
+    let private decodeEditDeleted (c: Cursor) =
+        result {
+            let! num, c = readEditFileNumber c
+            let! lvl, c = readEditLevel c
+
+            return
+                c,
+                { FileMetaData.Zero with
+                    FileNumber = num
+                    Level = lvl
+                }
+        }
+
+    /// VersionEdit のレコード 1件を読む（追加なら isAdded=true）。
+    let private decodeEditStep (c: Cursor) =
+        result {
+            let! tag, c = Reader.readVarint c
+
+            let! c, file =
+                if tag = 1UL then
+                    decodeEditFile c
+                elif tag = 2UL then
+                    decodeEditDeleted c
+                else
+                    err (sprintf "VersionEdit: 不明なタグ %d" tag |> DbError.corruption)
+
+            return c, file, tag = 1UL
+        }
+
+    /// VersionEdit の全レコードを読む。
+    [<TailCall>]
+    let rec private readEditFiles (c: Cursor) (added: FileMetaData list) (deleted: FileMetaData list) =
+        if Cursor.atEnd c then
+            ret (List.rev added, List.rev deleted)
+        else
+            match decodeEditStep c with
+            | Ok(c', f, isAdded) ->
+                if isAdded then
+                    readEditFiles c' (f :: added) deleted
+                else
+                    readEditFiles c' added (f :: deleted)
+            | Error e -> err e
+
+    let decode (data: byte array) =
         result {
             let! body, _ = Cursor.create data |> Reader.readLengthPrefixed
-            let! added, deleted = readFiles (Cursor.create body) [] []
+            let! added, deleted = readEditFiles (Cursor.create body) [] []
 
             return
                 [
@@ -499,6 +515,70 @@ module internal Manifest =
         | AppendRejected of DbError
         | AppendUncertain of DbError
 
+    /// 末尾の改行まで遡って、完全な行の終端位置を返す。
+    [<TailCall>]
+    let rec private lastNewline (fs: System.IO.FileStream) (pos: int64) =
+        if pos <= 0L then
+            0L
+        else
+            fs.Position <- pos - 1L
+
+            if fs.ReadByte() = int '\n' then
+                pos
+            else
+                lastNewline fs (pos - 1L)
+
+    /// 追記前の長さと内容から、レコードが実際に書き込まれたかを判定する。
+    let private recordWasWritten (path: string) (data: byte array) (expectedLine: string) (oldLength: int64) =
+        match
+            protect (fun () ->
+                System.IO.FileInfo(path).Length = oldLength + int64 data.Length
+                && System.IO.File.ReadAllLines path |> Array.tryLast = Some expectedLine)
+        with
+        | Ok written -> written
+        | Error _ -> false
+
+    /// ファイルを追記前の長さまで切り詰める。
+    let private rollback (path: string) (oldLength: int64) =
+        protect (fun () ->
+            use fs =
+                new System.IO.FileStream(
+                    path,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.ReadWrite,
+                    System.IO.FileShare.Read
+                )
+
+            fs.SetLength oldLength
+            fs.Flush true)
+
+    /// 追記前の有効な長さを求め、必要なら途中の行を切り詰める。
+    let private readOldLength (path: string) =
+        use fs =
+            new System.IO.FileStream(
+                path,
+                System.IO.FileMode.Open,
+                System.IO.FileAccess.ReadWrite,
+                System.IO.FileShare.Read
+            )
+
+        let oldLength =
+            if fs.Length = 0L then
+                0L
+            else
+                fs.Position <- fs.Length - 1L
+
+                if fs.ReadByte() = int '\n' then
+                    fs.Length
+                else
+                    lastNewline fs (fs.Length - 1L)
+
+        if fs.Length <> oldLength then
+            fs.SetLength oldLength
+            fs.Flush true
+
+        oldLength
+
     /// MANIFEST に 1レコード追記する。
     /// <remarks>
     /// 末尾が改行で終わっていなければ、前回の書き込みが途中で失敗したとみなして
@@ -512,70 +592,11 @@ module internal Manifest =
         let data = System.Text.Encoding.UTF8.GetBytes text
         let expectedLine = text.TrimEnd '\n'
 
-        let rec lastNewline (fs: System.IO.FileStream) pos =
-            if pos <= 0L then
-                0L
-            else
-                fs.Position <- pos - 1L
-
-                if fs.ReadByte() = int '\n' then
-                    pos
-                else
-                    lastNewline fs (pos - 1L)
-
-        let recordWasWritten oldLength =
-            match
-                protect (fun () ->
-                    System.IO.FileInfo(path).Length = oldLength + int64 data.Length
-                    && System.IO.File.ReadAllLines path |> Array.tryLast = Some expectedLine)
-            with
-            | Ok written -> written
-            | Error _ -> false
-
-        let rollback oldLength =
-            protect (fun () ->
-                use fs =
-                    new System.IO.FileStream(
-                        path,
-                        System.IO.FileMode.Open,
-                        System.IO.FileAccess.ReadWrite,
-                        System.IO.FileShare.Read
-                    )
-
-                fs.SetLength oldLength
-                fs.Flush true)
-
-        let readOldLength () =
-            use fs =
-                new System.IO.FileStream(
-                    path,
-                    System.IO.FileMode.Open,
-                    System.IO.FileAccess.ReadWrite,
-                    System.IO.FileShare.Read
-                )
-
-            let oldLength =
-                if fs.Length = 0L then
-                    0L
-                else
-                    fs.Position <- fs.Length - 1L
-
-                    if fs.ReadByte() = int '\n' then
-                        fs.Length
-                    else
-                        lastNewline fs (fs.Length - 1L)
-
-            if fs.Length <> oldLength then
-                fs.SetLength oldLength
-                fs.Flush true
-
-            oldLength
-
         let oldLength =
             protect (fun () -> System.IO.File.Exists path)
             >>= fun exists ->
                 if exists then
-                    protect readOldLength
+                    protect (fun () -> readOldLength path)
                 else
                     sprintf "MANIFEST が見つかりません: %s" (fileName manifestNumber)
                     |> DbError.corruption
@@ -599,9 +620,9 @@ module internal Manifest =
                     fs.Flush true)
             with
             | Ok() -> Ok(oldLength + int64 data.Length)
-            | Error _ when recordWasWritten oldLength -> Ok(oldLength + int64 data.Length)
+            | Error _ when recordWasWritten path data expectedLine oldLength -> Ok(oldLength + int64 data.Length)
             | Error e ->
-                match rollback oldLength with
+                match rollback path oldLength with
                 | Ok() -> Error(AppendRejected e)
                 | Error _ -> Error(AppendUncertain e)
 
@@ -611,69 +632,76 @@ module internal Manifest =
             if not (System.IO.Directory.Exists dir) then
                 System.IO.Directory.CreateDirectory dir |> ignore)
 
+    /// CURRENT が指す manifest 番号を読む。
+    let private readCurrent (dir: string) =
+        protect (fun () ->
+            if not (System.IO.File.Exists(currentPath dir)) then
+                None
+            else
+                let text = System.IO.File.ReadAllText(currentPath dir).Trim()
+
+                if text = "" then
+                    None
+                elif text.StartsWith ManifestPrefix && text.EndsWith ".manifest" then
+                    text.Substring(9, text.Length - 9 - ".manifest".Length)
+                    |> System.Int64.Parse
+                    |> LanguagePrimitives.Int64WithMeasure<manifestNo>
+                    |> Some
+                elif text.StartsWith ManifestPrefix then
+                    text.Substring 9
+                    |> System.Int64.Parse
+                    |> LanguagePrimitives.Int64WithMeasure<manifestNo>
+                    |> Some
+                else
+                    raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
+
+    /// manifest の行を順にデコードし、末尾の途中行を検出する。
+    [<TailCall>]
+    let rec private decodeLines (acc: VersionEdit list) (lines: string list) =
+        match lines with
+        | [] -> ret (List.rev acc, false)
+        | line :: rest ->
+            if line.Trim() = "" then
+                decodeLines acc rest
+            else
+                match decodeRecord line with
+                | Ok edits -> decodeLines (List.rev edits @ acc) rest
+                | Error _ when rest |> List.forall (fun l -> l.Trim() = "") -> ret (List.rev acc, true)
+                | Error e -> err e
+
+    /// manifest ファイルの行を読む。
+    let private read (dir: string) (manifestNumber: int64<manifestNo>) =
+        let path = manifestPath dir manifestNumber
+
+        if System.IO.File.Exists path then
+            ret (System.IO.File.ReadAllLines path |> Array.toList)
+        else
+            sprintf "有効な manifest が見つかりません: %s" (fileName manifestNumber)
+            |> DbError.corruption
+            |> err
+
+    /// manifest を保護して読み、デコード結果と末尾の状態を返す。
+    let private readAll (dir: string) (manifestNumber: int64<manifestNo>) =
+        match protect (fun () -> read dir manifestNumber) with
+        | Ok(Error e) -> err e
+        | Ok(Ok lines) ->
+            let hasContent = lines |> List.exists (fun line -> line.Trim() <> "")
+
+            decodeLines [] lines
+            |> Result.map (fun (edits, truncated) -> edits, truncated, hasContent)
+        | Error e -> err e
+
+    /// デコードした編集を Version へ順に適用する。
+    let private applyAll (edits: VersionEdit list) (initial: Version) =
+        List.fold VersionEdit.apply initial edits
+
+    /// SSTable ファイルが残っているか。
+    let private hasSstFiles (dir: string) =
+        protect (fun () -> System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension).Length > 0)
+
     /// データベースを開く（新規なら作成する）。
     /// 返り値は (Version, 有効な manifest 番号)。
     let openOrCreate (dir: string) =
-        let readCurrent dir =
-            protect (fun () ->
-                if not (System.IO.File.Exists(currentPath dir)) then
-                    None
-                else
-                    let text = System.IO.File.ReadAllText(currentPath dir).Trim()
-
-                    if text = "" then
-                        None
-                    elif text.StartsWith ManifestPrefix && text.EndsWith ".manifest" then
-                        text.Substring(9, text.Length - 9 - ".manifest".Length)
-                        |> System.Int64.Parse
-                        |> LanguagePrimitives.Int64WithMeasure<manifestNo>
-                        |> Some
-                    elif text.StartsWith ManifestPrefix then
-                        text.Substring 9
-                        |> System.Int64.Parse
-                        |> LanguagePrimitives.Int64WithMeasure<manifestNo>
-                        |> Some
-                    else
-                        raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
-
-        let rec decodeLines acc (lines: string list) =
-            match lines with
-            | [] -> ret (List.rev acc, false)
-            | line :: rest ->
-                if line.Trim() = "" then
-                    decodeLines acc rest
-                else
-                    match decodeRecord line with
-                    | Ok edits -> decodeLines (List.rev edits @ acc) rest
-                    | Error _ when rest |> List.forall (fun l -> l.Trim() = "") -> ret (List.rev acc, true)
-                    | Error e -> err e
-
-        let read dir manifestNumber =
-            let path = manifestPath dir manifestNumber
-
-            if System.IO.File.Exists path then
-                ret (System.IO.File.ReadAllLines path |> Array.toList)
-            else
-                sprintf "有効な manifest が見つかりません: %s" (fileName manifestNumber)
-                |> DbError.corruption
-                |> err
-
-        let readAll dir manifestNumber =
-            match protect (fun () -> read dir manifestNumber) with
-            | Ok(Error e) -> err e
-            | Ok(Ok lines) ->
-                let hasContent = lines |> List.exists (fun line -> line.Trim() <> "")
-
-                decodeLines [] lines
-                |> Result.map (fun (edits, truncated) -> edits, truncated, hasContent)
-            | Error e -> err e
-
-        let applyAll edits initial =
-            List.fold VersionEdit.apply initial edits
-
-        let hasSstFiles dir =
-            protect (fun () -> System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension).Length > 0)
-
         result {
             let! _ = ensureDirectory dir
             let! hasSsts = hasSstFiles dir

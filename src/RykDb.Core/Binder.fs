@@ -1,6 +1,36 @@
 namespace RykDb.Core
 
 module internal Binder =
+    /// 修飾子なしの列名が一意に決まる修飾子を返す。
+    let private uniqueQualifierOf (schema: Schema) (name: string) =
+        let lower = name.ToLowerInvariant()
+
+        let hits =
+            schema.Columns
+            |> Array.toList
+            |> List.filter (fun (oc: OutputColumn) -> oc.Name.ToLowerInvariant() = lower)
+            |> List.choose (fun (oc: OutputColumn) -> oc.Qualifier)
+
+        match hits with
+        | [ q ] -> Some q
+        | _ -> None
+
+    /// 葉の列参照へ一意な修飾子を付ける。
+    let private qualifyRewriteLeaf (schema: Schema) (e: Expr) =
+        match e with
+        | Expr.Column c ->
+            match c.Qualifier with
+            | Some _ -> e
+            | None ->
+                match uniqueQualifierOf schema c.Name with
+                | Some q -> Expr.Column { Qualifier = Some q; Name = c.Name }
+                | None -> e
+        | Expr.Name name ->
+            match uniqueQualifierOf schema name with
+            | Some q -> Expr.Column { Qualifier = Some q; Name = name }
+            | None -> e
+        | _ -> e
+
     /// 修飾子無しの列名を「修飾名」にする。
     /// <remarks>
     /// 修飾子なしで一意に決まる場合にだけ修飾名を付ける。
@@ -9,35 +39,7 @@ module internal Binder =
     /// `Expr.plugChildren` で組み直す（`Expr.rewrite` の評価機）。
     /// </remarks>
     let qualify (schema: Schema) (e: Expr) =
-        let uniqueQualifier (name: string) =
-            let lower = name.ToLowerInvariant()
-
-            let hits =
-                schema.Columns
-                |> Array.toList
-                |> List.filter (fun (oc: OutputColumn) -> oc.Name.ToLowerInvariant() = lower)
-                |> List.choose (fun (oc: OutputColumn) -> oc.Qualifier)
-
-            match hits with
-            | [ q ] -> Some q
-            | _ -> None
-
-        let rewriteLeaf x =
-            match x with
-            | Expr.Column c ->
-                match c.Qualifier with
-                | Some _ -> x
-                | None ->
-                    match uniqueQualifier c.Name with
-                    | Some q -> Expr.Column { Qualifier = Some q; Name = c.Name }
-                    | None -> x
-            | Expr.Name name ->
-                match uniqueQualifier name with
-                | Some q -> Expr.Column { Qualifier = Some q; Name = name }
-                | None -> x
-            | _ -> x
-
-        match Expr.rewrite rewriteLeaf e with
+        match Expr.rewrite (qualifyRewriteLeaf schema) e with
         | Error err -> Error err
         | Ok qualified -> Eval.checkComparableTypes schema qualified |> Result.map (fun () -> qualified)
 
@@ -48,6 +50,40 @@ module internal Binder =
 /// SELECT 項目の別名。
 /// 別名を ORDER BY / GROUP BY / HAVING で参照できるようにするために使う。
 module internal Alias =
+    /// 式中の裸の名前を小文字で列挙する。
+    let private aliasNamesOf =
+        Expr.fold
+            (fun acc node ->
+                match node with
+                | Expr.Name n -> n.ToLowerInvariant() :: acc
+                | _ -> acc)
+            []
+
+    /// 別名の依存辺をたどり、開始別名へ循環するか調べる。
+    [<TailCall>]
+    let rec private aliasSearchCycle (edges: Map<'a, 'a list>) (start: 'a) (visited: Set<'a>) =
+        function
+        | [] -> false
+        | n :: rest ->
+            if n = start then
+                true
+            elif Set.contains n visited then
+                aliasSearchCycle edges start visited rest
+            else
+                let next =
+                    match Map.tryFind n edges with
+                    | Some l -> l
+                    | None -> []
+
+                aliasSearchCycle edges start (Set.add n visited) (next @ rest)
+
+    /// 別名が自分自身へ循環するか。
+    let private aliasReachesSelf (edges: Map<'a, 'a list>) (start: 'a) =
+        match Map.tryFind start edges with
+        | Some l -> l
+        | None -> []
+        |> aliasSearchCycle edges start Set.empty
+
     /// 別名（小文字）→ 式 の表。別名が重複したときは後の項目を優先する。
     let ofItems =
         List.fold
@@ -60,61 +96,30 @@ module internal Alias =
     /// 自分自身に循環参照する別名を除く。
     /// （差し替えで無限ループにしないため）
     let dropCyclic (aliases: Map<string, Expr>) =
-        let namesOf =
-            Expr.fold
-                (fun acc node ->
-                    match node with
-                    | Expr.Name n -> n.ToLowerInvariant() :: acc
-                    | _ -> acc)
-                []
-
         let edges =
             aliases
-            |> Map.map (fun _ v -> namesOf v |> List.filter (fun n -> Map.containsKey n aliases))
+            |> Map.map (fun _ v -> aliasNamesOf v |> List.filter (fun n -> Map.containsKey n aliases))
 
-        let rec searchCycle start visited =
-            function
-            | [] -> false
-            | n :: rest ->
-                if n = start then
-                    true
-                elif Set.contains n visited then
-                    searchCycle start visited rest
-                else
-                    let next =
-                        match Map.tryFind n edges with
-                        | Some l -> l
-                        | None -> []
+        aliases |> Map.filter (fun k _ -> not (aliasReachesSelf edges k))
 
-                    searchCycle start (Set.add n visited) (next @ rest)
-
-        let reachesSelf start =
-            match Map.tryFind start edges with
-            | Some l -> l
-            | None -> []
-            |> searchCycle start Set.empty
-
-        aliases |> Map.filter (fun k _ -> not (reachesSelf k))
+    /// 別名を式へ差し替える葉の書き換え。
+    let private substituteRewriteLeaf (schema: Schema) (aliases: Map<string, Expr>) (e: Expr) =
+        match e with
+        | Expr.Name name ->
+            match Map.tryFind (name.ToLowerInvariant()) aliases with
+            | Some replacement ->
+                match Schema.resolve { Qualifier = None; Name = name } schema with
+                | Ok _ -> e
+                | Error _ -> replacement
+            | None -> e
+        | _ -> e
 
     /// 別名を式に差し替える。
     /// 入力のスキーマに同名の列があれば列を優先する（曖昧を避ける）。
     /// 差し替えた式の中の名前も差し替え対象になる（別名の連鎖を解決する）。
     /// （`Expr.rewrite` はplugChildren の失敗を返すので Result になる）
     let substitute (schema: Schema) (aliases: Map<string, Expr>) =
-        let aliases = dropCyclic aliases
-
-        let rewriteLeaf x =
-            match x with
-            | Expr.Name name ->
-                match Map.tryFind (name.ToLowerInvariant()) aliases with
-                | Some replacement ->
-                    match Schema.resolve { Qualifier = None; Name = name } schema with
-                    | Ok _ -> x
-                    | Error _ -> replacement
-                | None -> x
-            | _ -> x
-
-        Expr.rewrite rewriteLeaf
+        Expr.rewrite (substituteRewriteLeaf schema (dropCyclic aliases))
 
     /// 集計を含む別名は差し替えない表（GROUP BY 用）。
     /// 集計をグループキーにすると意味が壊れるため。

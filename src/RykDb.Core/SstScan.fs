@@ -35,7 +35,7 @@ type internal SstEntry =
         | None -> this.Value.IsNone
 
 module internal SstEntry =
-    let make key seqNo value =
+    let make (key: byte array) (seqNo: uint64) (value: SqlValue array option) =
         {
             Key = key
             SeqNo = seqNo
@@ -44,7 +44,7 @@ module internal SstEntry =
         }
 
     /// 復号せずに値スライスを保持するエントリ（compaction 用）。
-    let makeRaw key seqNo raw =
+    let makeRaw (key: byte array) (seqNo: uint64) (raw: RawSstValue) =
         {
             Key = key
             SeqNo = seqNo
@@ -89,21 +89,22 @@ module internal SstEntry =
                 out.[pos] <- 1uy
                 ValueCodec.writeValuesTo out (pos + 1) values
 
-    let private readSeqNo =
-        let rec loop shift acc c =
-            if shift > 63 || Cursor.pos c >= Cursor.endPos c then
-                ValueNone
+    /// SeqNo の varint をデコードする本体。
+    [<TailCall>]
+    let rec private readSeqNoLoop (shift: int) (acc: uint64) (c: Cursor) =
+        if shift > 63 || Cursor.pos c >= Cursor.endPos c then
+            ValueNone
+        else
+            let b = (Cursor.data c).[Cursor.pos c]
+            let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
+            let next = Cursor.advance 1 c
+
+            if b &&& 0x80uy <> 0uy then
+                readSeqNoLoop (shift + 7) acc next
             else
-                let b = (Cursor.data c).[Cursor.pos c]
-                let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
-                let next = Cursor.advance 1 c
+                ValueSome struct (acc, next)
 
-                if b &&& 0x80uy <> 0uy then
-                    loop (shift + 7) acc next
-                else
-                    ValueSome struct (acc, next)
-
-        loop 0 0UL
+    let private readSeqNo = readSeqNoLoop 0 0UL
 
     let private decodeHeader (c: Cursor) =
         match readSeqNo c with
@@ -404,6 +405,25 @@ module internal SstScan =
     /// 明示的に資源を解放する（終端・エラー後の呼び出しも安全）。
     let dispose (scan: SstScan) = (scan :> System.IDisposable).Dispose()
 
+    /// 結び付けた資源を 1回だけ解放する。
+    let private releaseResource (holder: ScanScope) (key: obj) = holder.Release key
+
+    /// 走査の続きに同じ後始末を付ける。
+    let rec private wrapWithResource (release: unit -> unit) (current: SstScan) =
+        ofStepWithClose
+            (fun () ->
+                match next current with
+                | Ok None ->
+                    release ()
+                    ret None
+                | Ok(Some(e, rest)) -> ret (Some(e, wrapWithResource release rest))
+                | Error e ->
+                    release ()
+                    err e)
+            (fun () ->
+                dispose current
+                release ())
+
     /// 走査に追加の資源（Version pin の lease など）を結び付ける。
     /// 資源は Dispose・自然終端・エラーのいずれでも 1回だけ解放する
     /// （冪等な `ScanScope.Release` に任せる）。
@@ -412,24 +432,7 @@ module internal SstScan =
         let holder = ScanScope()
         let key = obj ()
         holder.Register(key, resource)
-        let release () = holder.Release key
-
-        let rec wrap current =
-            ofStepWithClose
-                (fun () ->
-                    match next current with
-                    | Ok None ->
-                        release ()
-                        ret None
-                    | Ok(Some(e, rest)) -> ret (Some(e, wrap rest))
-                    | Error e ->
-                        release ()
-                        err e)
-                (fun () ->
-                    dispose current
-                    release ())
-
-        wrap scan
+        wrapWithResource (fun () -> releaseResource holder key) scan
 
     /// 走査を使い、成功・失敗・例外のいずれでも Dispose する。
     /// 開いた走査を全件読み切る用途で使う。
@@ -452,15 +455,16 @@ module internal SstScan =
     let emit (rest: unit -> SstScan) (e: SstEntry) =
         ofStep (fun () -> Some(e, rest ()) |> ret)
 
-    /// 残りを配列に畳む（壊れたブロックに当たったらその場で Error）。
-    let toArray (scan: SstScan) =
-        let rec drain acc cur =
-            match next cur with
-            | Ok None -> List.rev acc |> Array.ofList |> ret
-            | Ok(Some(e, nxt)) -> drain (e :: acc) nxt
-            | Error e -> err e
+    /// 残りを配列へ畳む本体（壊れたブロックに当たったらその場で Error）。
+    [<TailCall>]
+    let rec private drainToArray (acc: SstEntry list) (cur: SstScan) =
+        match next cur with
+        | Ok None -> List.rev acc |> Array.ofList |> ret
+        | Ok(Some(e, nxt)) -> drainToArray (e :: acc) nxt
+        | Error e -> err e
 
-        withScan scan (drain [])
+    /// 残りを配列に畳む（壊れたブロックに当たったらその場で Error）。
+    let toArray (scan: SstScan) = withScan scan (drainToArray [])
 
     /// 条件を満たすエントリだけを返す走査。
     /// 条件を満たさない間は次のエントリを読み進める（ブロック単位のまま）。
@@ -502,7 +506,7 @@ module internal SstMerge =
         | MergeEmpty -> 0
         | MergeNode(r, _, _, _) -> r
 
-    let private node head left right =
+    let private node (head: MergeHead) (left: MergeNode) (right: MergeNode) =
         if rank left >= rank right then
             MergeNode(rank right + 1, head, left, right)
         else
@@ -513,32 +517,36 @@ module internal SstMerge =
         | 0 -> compare a.Source b.Source
         | order -> order
 
-    let private mergeHeaps (first: MergeNode) (second: MergeNode) =
-        let rec descend picked a b =
-            match a, b with
-            | MergeEmpty, heap
-            | heap, MergeEmpty -> picked, heap
-            | MergeNode(_, ha, _, _), MergeNode(_, hb, _, _) when compareHead ha hb > 0 -> descend picked b a
-            | MergeNode(_, ha, left, right), _ -> descend ((ha, left) :: picked) right b
+    /// 右スパインを picked へ移しながら 2つのヒープを合成する。
+    [<TailCall>]
+    let rec private descendMerge (picked: (MergeHead * MergeNode) list) (a: MergeNode) (b: MergeNode) =
+        match a, b with
+        | MergeEmpty, heap
+        | heap, MergeEmpty -> picked, heap
+        | MergeNode(_, ha, _, _), MergeNode(_, hb, _, _) when compareHead ha hb > 0 -> descendMerge picked b a
+        | MergeNode(_, ha, left, right), _ -> descendMerge ((ha, left) :: picked) right b
 
-        let picked, rest = descend [] first second
+    let private mergeHeaps (first: MergeNode) (second: MergeNode) =
+        let picked, rest = descendMerge [] first second
         List.fold (fun acc (head, left) -> node head left acc) rest picked
+
+    /// 右スパインを組み直す。
+    let private rebuildHeap = List.fold (fun acc (h, left) -> node h left acc)
+
+    /// 1つのヘッドを挿入しながら右スパインを辿る。
+    [<TailCall>]
+    let rec private descendPush (head: MergeHead) (picked: (MergeHead * MergeNode) list) =
+        function
+        | MergeEmpty -> rebuildHeap (MergeNode(1, head, MergeEmpty, MergeEmpty)) picked
+        | MergeNode(_, h, left, right) as current ->
+            if compareHead head h > 0 then
+                descendPush head ((h, left) :: picked) right
+            else
+                rebuildHeap (node head MergeEmpty current) picked
 
     /// 単一のヘッドをヒープへ追加する。
     /// singleton を作って汎用 merge に通すより、右スパインの更新1回で済む。
-    let private push (head: MergeHead) =
-        let rebuild = List.fold (fun acc (h, left) -> node h left acc)
-
-        let rec descend picked =
-            function
-            | MergeEmpty -> rebuild (MergeNode(1, head, MergeEmpty, MergeEmpty)) picked
-            | MergeNode(_, h, left, right) as current ->
-                if compareHead head h > 0 then
-                    descend ((h, left) :: picked) right
-                else
-                    rebuild (node head MergeEmpty current) picked
-
-        descend []
+    let private push (head: MergeHead) = descendPush head []
 
     /// 先頭を 1件読んだソースを登録する。
     let insert (source: int) (entry: SstEntry) (scan: SstScan) (SstMerge heap) =
@@ -551,37 +559,41 @@ module internal SstMerge =
 
         SstMerge(push head heap)
 
-    /// 複数のスキャンをまとめて登録する。
-    let ofScans (scans: SstScan array) =
-        let ofScan source scan =
-            match SstScan.next scan with
-            | Ok None -> ret Empty
-            | Ok(Some(entry, rest)) -> ret (insert source entry rest Empty)
+    /// 1つのスキャンを先頭 1件読んでマージへ登録する。
+    let private ofScanEntry (source: int) (scan: SstScan) =
+        match SstScan.next scan with
+        | Ok None -> ret Empty
+        | Ok(Some(entry, rest)) -> ret (insert source entry rest Empty)
+        | Error e -> err e
+
+    /// 2つのヒープを合成する。
+    let private unionHeaps (SstMerge a) (SstMerge b) = SstMerge(mergeHeaps a b)
+
+    /// スキャンを順に追加する本体。
+    [<TailCall>]
+    let rec private addScans (scans: SstScan array) (i: int) (merge: SstMerge) =
+        if i >= scans.Length then
+            ret merge
+        else
+            match ofScanEntry i scans.[i] with
+            | Ok more -> addScans scans (i + 1) (unionHeaps merge more)
             | Error e -> err e
 
-        let union (SstMerge a) (SstMerge b) = SstMerge(mergeHeaps a b)
+    /// 複数のスキャンをまとめて登録する。
+    let ofScans (scans: SstScan array) = addScans scans 0 Empty
 
-        let rec add i merge =
-            if i >= scans.Length then
-                ret merge
-            else
-                match ofScan i scans.[i] with
-                | Ok more -> add (i + 1) (union merge more)
-                | Error e -> err e
-
-        add 0 Empty
+    /// ヒープのノードをスタックで辿って閉じる。
+    [<TailCall>]
+    let rec private disposeMergeNodes =
+        function
+        | [] -> ()
+        | MergeEmpty :: rest -> disposeMergeNodes rest
+        | MergeNode(_, head, left, right) :: rest ->
+            SstScan.dispose head.Scan
+            disposeMergeNodes (left :: right :: rest)
 
     /// ヒープが持つソースをすべて閉じる。
-    let dispose (SstMerge heap) =
-        let rec disposeNode =
-            function
-            | [] -> ()
-            | MergeEmpty :: rest -> disposeNode rest
-            | MergeNode(_, head, left, right) :: rest ->
-                SstScan.dispose head.Scan
-                disposeNode (left :: right :: rest)
-
-        disposeNode [ heap ]
+    let dispose (SstMerge heap) = disposeMergeNodes [ heap ]
 
     /// 先頭のエントリ（取り出さない）。
     /// 空なら None。

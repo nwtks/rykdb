@@ -45,7 +45,7 @@ module internal Dml =
     /// 索引エントリの値。
     /// 索引列 + 主キーはキーに埋め込んであるので、値は空にする
     /// （行全体の複製を避ける。読み取りはキーから復号する）。
-    let private emptyIndexValue: SqlValue array = Array.empty
+    let private EmptyIndexValue: SqlValue array = Array.empty
 
     let private reserveUniqueValues (txn: Transaction) (schema: TableSchema) (index: IndexSchema) =
         function
@@ -58,6 +58,10 @@ module internal Dml =
                 else
                     KeyBuilder.ofValues keyValues
                     |> Result.map (fun key -> Transaction.reserveUnique index.Name key txn)
+
+    /// 索引エントリのキーを作る（差分反映用の薄いラッパー）。
+    let private indexKeyFor (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
+        RowKey.indexKey schema index row
 
     /// 旧行と新行の差分を索引へ反映する。
     /// 同じ索引キーなら上書きだけ行い、キーが変わった場合だけ旧キーを削除する。
@@ -78,31 +82,73 @@ module internal Dml =
                         ret current
 
                 let space = indexSpace index
-                let keyFor row = RowKey.indexKey schema index row
 
                 match oldRow, newRow with
                 | None, None -> reserved
                 | None, Some row ->
                     reserved
                     >>= fun txn ->
-                        keyFor row
-                        |> Result.map (fun key -> Transaction.put space key emptyIndexValue txn)
+                        indexKeyFor schema index row
+                        |> Result.map (fun key -> Transaction.put space key EmptyIndexValue txn)
                 | Some row, None ->
                     reserved
-                    >>= fun txn -> keyFor row |> Result.map (fun key -> Transaction.remove space key txn)
+                    >>= fun txn ->
+                        indexKeyFor schema index row
+                        |> Result.map (fun key -> Transaction.remove space key txn)
                 | Some oldValue, Some newValue ->
                     reserved
                     >>= fun txn ->
-                        keyFor oldValue
+                        indexKeyFor schema index oldValue
                         >>= fun oldKey ->
-                            keyFor newValue
+                            indexKeyFor schema index newValue
                             |> Result.map (fun newKey ->
                                 if Bytes.compare oldKey newKey = 0 then
                                     txn
                                 else
                                     let removed = Transaction.remove space oldKey txn
-                                    Transaction.put space newKey emptyIndexValue removed))
+                                    Transaction.put space newKey EmptyIndexValue removed))
             txn
+
+    /// 残りの txn スロットを順に出力する遅延 Op。
+    let rec private overlayEmitRemaining (slotArr: (byte array * SqlValue array option) array) (i: int) =
+        if i >= slotArr.Length then
+            Op.Empty
+        else
+            Op.compute (fun () ->
+                match slotArr.[i] with
+                | _, Some v -> OpStep.OpRow(v, overlayEmitRemaining slotArr (i + 1))
+                | _, None -> Op.next (overlayEmitRemaining slotArr (i + 1)))
+
+    /// store 行と txn スロットをキー順にマージする遅延 Op。
+    let rec private overlayMerge
+        (keyOf: SqlValue array -> DbResult<byte array>)
+        (slotArr: (byte array * SqlValue array option) array)
+        (cur: Op)
+        (i: int)
+        =
+        if i >= slotArr.Length then
+            cur
+        else
+            Op.compute (fun () ->
+                match Op.next cur with
+                | OpStep.OpError e -> OpStep.OpError e
+                | OpStep.OpDone -> Op.next (overlayEmitRemaining slotArr i)
+                | OpStep.OpRow(row, nxt) ->
+                    let sk, sv = slotArr.[i]
+
+                    match keyOf row with
+                    | DbErr e -> OpStep.OpError e
+                    | DbOk rk ->
+                        match Bytes.compare rk sk with
+                        | c when c < 0 -> OpStep.OpRow(row, overlayMerge keyOf slotArr nxt i)
+                        | 0 ->
+                            match sv with
+                            | Some v -> OpStep.OpRow(v, overlayMerge keyOf slotArr nxt (i + 1))
+                            | None -> Op.next (overlayMerge keyOf slotArr nxt (i + 1))
+                        | _ ->
+                            match sv with
+                            | Some v -> OpStep.OpRow(v, Op.emit row (overlayMerge keyOf slotArr nxt (i + 1)))
+                            | None -> OpStep.OpRow(row, overlayMerge keyOf slotArr nxt (i + 1)))
 
     /// store の行に txn の書き込みを重ねる（ストリーミング）。
     /// <remarks>
@@ -121,41 +167,7 @@ module internal Dml =
             let slotArr =
                 slots |> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b) |> List.toArray
 
-            let rec emitRemaining i =
-                if i >= slotArr.Length then
-                    Op.Empty
-                else
-                    Op.compute (fun () ->
-                        match slotArr.[i] with
-                        | _, Some v -> OpStep.OpRow(v, emitRemaining (i + 1))
-                        | _, None -> Op.next (emitRemaining (i + 1)))
-
-            let rec merge cur i =
-                if i >= slotArr.Length then
-                    cur
-                else
-                    Op.compute (fun () ->
-                        match Op.next cur with
-                        | OpStep.OpError e -> OpStep.OpError e
-                        | OpStep.OpDone -> Op.next (emitRemaining i)
-                        | OpStep.OpRow(row, nxt) ->
-                            let sk, sv = slotArr.[i]
-
-                            match keyOf row with
-                            | DbErr e -> OpStep.OpError e
-                            | DbOk rk ->
-                                match Bytes.compare rk sk with
-                                | c when c < 0 -> OpStep.OpRow(row, merge nxt i)
-                                | 0 ->
-                                    match sv with
-                                    | Some v -> OpStep.OpRow(v, merge nxt (i + 1))
-                                    | None -> Op.next (merge nxt (i + 1))
-                                | _ ->
-                                    match sv with
-                                    | Some v -> OpStep.OpRow(v, Op.emit row (merge nxt (i + 1)))
-                                    | None -> OpStep.OpRow(row, merge nxt (i + 1)))
-
-            merge rows 0
+            overlayMerge keyOf slotArr rows 0
 
     /// store の読み取り上限（txn の削除分を足す）。
     /// 削除スロットは overlay で出力から落ちるので、その分だけ余分に読む。
@@ -228,6 +240,41 @@ module internal Dml =
 
             scanMask, fetchMask)
 
+    /// 走査行の幅を検証して列配列にする。
+    let private rowOfFixedWidth (width: int) (row: SqlValue array) =
+        if row.Length = width then
+            Ok row
+        elif row.Length = 0 then
+            Ok(Array.create width SqlValue.Unloaded)
+        else
+            err (DbError.internalError (sprintf "行の幅が列数と一致しません（%d 列、%d 値）" width row.Length))
+
+    /// 走査から 1行ずつ Op を組み立てる（emit 側）。
+    [<TailCall>]
+    let rec private opOfScanEmit (width: int) (take: SstEntry -> bool) (scan: SstScan) =
+        Op.compute (fun () -> opOfScanPull width take scan)
+
+    /// 走査の 1ステップを進め、不要な行はスキップする（pull 側）。
+    and private opOfScanPull (width: int) (take: SstEntry -> bool) (current: SstScan) =
+        match SstScan.next current with
+        | Error e ->
+            SstScan.dispose current
+            OpStep.OpError e
+        | Ok None -> OpStep.OpDone
+        | Ok(Some(e, rest)) ->
+            if not (take e) then
+                SstScan.dispose rest
+                OpStep.OpDone
+            else
+                match e.Value with
+                | Some row ->
+                    match rowOfFixedWidth width row with
+                    | Ok values -> OpStep.OpRow(values, opOfScanEmit width take rest)
+                    | Error e ->
+                        SstScan.dispose rest
+                        OpStep.OpError e
+                | None -> opOfScanPull width take rest
+
     /// `SstScan` を `Op` に変換する。
     /// `take` が false になった時点で走査を打ち切る（キー昇順なので範囲の上限に使える）。
     /// <remarks>
@@ -235,40 +282,7 @@ module internal Dml =
     /// 回帰: `StorageEngine: 走査とポイント検索は tombstone を返さない`）。
     /// 防御として `Value = None` は読み飛ばし、想定外の行幅は `InternalError` にする。
     /// </remarks>
-    let private opOfScan (width: int) (take: SstEntry -> bool) (scan: SstScan) =
-        let rowOf (row: SqlValue array) =
-            if row.Length = width then
-                Ok row
-            elif row.Length = 0 then
-                Ok(Array.create width SqlValue.Unloaded)
-            else
-                err (DbError.internalError (sprintf "行の幅が列数と一致しません（%d 列、%d 値）" width row.Length))
-
-        let rec emit scan =
-            Op.compute (fun () ->
-                let rec pull current =
-                    match SstScan.next current with
-                    | Error e ->
-                        SstScan.dispose current
-                        OpStep.OpError e
-                    | Ok None -> OpStep.OpDone
-                    | Ok(Some(e, rest)) ->
-                        if not (take e) then
-                            SstScan.dispose rest
-                            OpStep.OpDone
-                        else
-                            match e.Value with
-                            | Some row ->
-                                match rowOf row with
-                                | Ok values -> OpStep.OpRow(values, emit rest)
-                                | Error e ->
-                                    SstScan.dispose rest
-                                    OpStep.OpError e
-                            | None -> pull rest
-
-                pull scan)
-
-        emit scan
+    let private opOfScan (width: int) (take: SstEntry -> bool) (scan: SstScan) = opOfScanEmit width take scan
 
     /// 索引キーから表幅の行を組み立てる関数を作る。
     /// `positions` は「索引列 + 主キー列」の表内位置。
@@ -288,6 +302,114 @@ module internal Dml =
                 Array.iteri (fun i p -> row.[p] <- values.[i]) positions'
                 ret row
 
+    /// 索引スロットだけを残り出力する。
+    [<TailCall>]
+    let rec private indexScanEmitSlots
+        (rowOf: byte array -> Result<SqlValue array, DbError>)
+        (slotArr: (byte array * SqlValue array option) array)
+        (slotCount: int)
+        (i: int)
+        =
+        if i >= slotCount then
+            Op.Empty
+        else
+            Op.compute (fun () -> indexScanAdvanceSlots rowOf slotArr slotCount i)
+
+    /// 索引スロットの 1ステップを進める。
+    and private indexScanAdvanceSlots
+        (rowOf: byte array -> Result<SqlValue array, DbError>)
+        (slotArr: (byte array * SqlValue array option) array)
+        (slotCount: int)
+        (j: int)
+        =
+        if j >= slotCount then
+            OpStep.OpDone
+        else
+            let key, value = slotArr.[j]
+
+            match value with
+            | None -> indexScanAdvanceSlots rowOf slotArr slotCount (j + 1)
+            | Some _ ->
+                match rowOf key with
+                | Error e -> OpStep.OpError e
+                | Ok row -> OpStep.OpRow(row, indexScanEmitSlots rowOf slotArr slotCount (j + 1))
+
+    /// 索引スキャンを 1行ずつ引く。
+    [<TailCall>]
+    let rec private indexScanPull
+        (rowOf: byte array -> Result<SqlValue array, DbError>)
+        (inRange: byte array -> bool)
+        (slotArr: (byte array * SqlValue array option) array)
+        (slotCount: int)
+        (scan: SstScan)
+        (i: int)
+        =
+        Op.compute (fun () -> indexScanAdvanceScan rowOf inRange slotArr slotCount scan i)
+
+    /// 索引スキャンの 1ステップを進め、スロットとマージする。
+    and private indexScanAdvanceScan
+        (rowOf: byte array -> Result<SqlValue array, DbError>)
+        (inRange: byte array -> bool)
+        (slotArr: (byte array * SqlValue array option) array)
+        (slotCount: int)
+        (scan: SstScan)
+        (j: int)
+        =
+        if j >= slotCount then
+            match SstScan.next scan with
+            | Error e ->
+                SstScan.dispose scan
+                OpStep.OpError e
+            | Ok None -> OpStep.OpDone
+            | Ok(Some(e, rest)) ->
+                if not (inRange e.Key) then
+                    SstScan.dispose rest
+                    OpStep.OpDone
+                elif e.Value.IsNone then
+                    indexScanAdvanceScan rowOf inRange slotArr slotCount rest j
+                else
+                    match rowOf e.Key with
+                    | Error e -> OpStep.OpError e
+                    | Ok row -> OpStep.OpRow(row, indexScanPull rowOf inRange slotArr slotCount rest j)
+        else
+            match SstScan.next scan with
+            | Error e ->
+                SstScan.dispose scan
+                OpStep.OpError e
+            | Ok None -> Op.next (indexScanEmitSlots rowOf slotArr slotCount j)
+            | Ok(Some(e, rest)) ->
+                if not (inRange e.Key) then
+                    SstScan.dispose rest
+                    Op.next (indexScanEmitSlots rowOf slotArr slotCount j)
+                else
+                    let sk, sv = slotArr.[j]
+
+                    match Bytes.compare e.Key sk with
+                    | c when c < 0 ->
+                        if e.Value.IsNone then
+                            indexScanAdvanceScan rowOf inRange slotArr slotCount rest j
+                        else
+                            match rowOf e.Key with
+                            | Error e -> OpStep.OpError e
+                            | Ok row -> OpStep.OpRow(row, indexScanPull rowOf inRange slotArr slotCount rest j)
+                    | 0 ->
+                        match sv with
+                        | None -> indexScanAdvanceScan rowOf inRange slotArr slotCount rest (j + 1)
+                        | Some _ ->
+                            match rowOf sk with
+                            | Error e -> OpStep.OpError e
+                            | Ok row -> OpStep.OpRow(row, indexScanPull rowOf inRange slotArr slotCount rest (j + 1))
+                    | _ ->
+                        let replay =
+                            SstScan.ofStepWithClose (fun () -> ret (Some(e, rest))) (fun () -> SstScan.dispose rest)
+
+                        match sv with
+                        | None -> indexScanAdvanceScan rowOf inRange slotArr slotCount replay (j + 1)
+                        | Some _ ->
+                            match rowOf sk with
+                            | Error e -> OpStep.OpError e
+                            | Ok row -> OpStep.OpRow(row, indexScanPull rowOf inRange slotArr slotCount replay (j + 1))
+
     /// 索引スキャン。
     /// store の走査と transaction のスロットを**キーで**マージする。
     /// <remarks>
@@ -305,85 +427,7 @@ module internal Dml =
             slots |> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b) |> List.toArray
 
         let slotCount = slotArr.Length
-
-        let rec emitSlots i =
-            if i >= slotCount then
-                Op.Empty
-            else
-                Op.compute (fun () -> advance i)
-
-        and advance j =
-            if j >= slotCount then
-                OpStep.OpDone
-            else
-                let key, value = slotArr.[j]
-
-                match value with
-                | None -> advance (j + 1)
-                | Some _ ->
-                    match rowOf key with
-                    | Error e -> OpStep.OpError e
-                    | Ok row -> OpStep.OpRow(row, emitSlots (j + 1))
-
-        let rec pull scan i = Op.compute (fun () -> advance scan i)
-
-        and advance scan j =
-            if j >= slotCount then
-                match SstScan.next scan with
-                | Error e ->
-                    SstScan.dispose scan
-                    OpStep.OpError e
-                | Ok None -> OpStep.OpDone
-                | Ok(Some(e, rest)) ->
-                    if not (inRange e.Key) then
-                        SstScan.dispose rest
-                        OpStep.OpDone
-                    elif e.Value.IsNone then
-                        advance rest j
-                    else
-                        match rowOf e.Key with
-                        | Error e -> OpStep.OpError e
-                        | Ok row -> OpStep.OpRow(row, pull rest j)
-            else
-                match SstScan.next scan with
-                | Error e ->
-                    SstScan.dispose scan
-                    OpStep.OpError e
-                | Ok None -> Op.next (emitSlots j)
-                | Ok(Some(e, rest)) ->
-                    if not (inRange e.Key) then
-                        SstScan.dispose rest
-                        Op.next (emitSlots j)
-                    else
-                        let sk, sv = slotArr.[j]
-
-                        match Bytes.compare e.Key sk with
-                        | c when c < 0 ->
-                            if e.Value.IsNone then
-                                advance rest j
-                            else
-                                match rowOf e.Key with
-                                | Error e -> OpStep.OpError e
-                                | Ok row -> OpStep.OpRow(row, pull rest j)
-                        | 0 ->
-                            match sv with
-                            | None -> advance rest (j + 1)
-                            | Some _ ->
-                                match rowOf sk with
-                                | Error e -> OpStep.OpError e
-                                | Ok row -> OpStep.OpRow(row, pull rest (j + 1))
-                        | _ ->
-                            let replay =
-                                SstScan.ofStepWithClose (fun () -> ret (Some(e, rest))) (fun () -> SstScan.dispose rest)
-
-                            match sv with
-                            | None -> advance replay (j + 1)
-                            | Some _ ->
-                                match rowOf sk with
-                                | Error e -> OpStep.OpError e
-                                | Ok row -> OpStep.OpRow(row, pull replay (j + 1))
-
-        pull scan 0
+        indexScanPull rowOf inRange slotArr slotCount scan 0
 
     /// 符号化済みの主キーで既存行を列マスク付きで取り出す。
     let getByPrimaryKeyBytesWithTxnMask
@@ -424,7 +468,7 @@ module internal Dml =
         |> Result.map (opOfScan schema.Columns.Length (fun _ -> true))
 
     /// 主キーで prefix 走査する（キー昇順、スコープなし・全列）。
-    let scanByPrimaryKey store schema limit visible =
+    let scanByPrimaryKey (store: RowStore) (schema: TableSchema) (limit: int) (visible: uint64 option) =
         scanByPrimaryKeyScopedMask None store schema limit visible (Array.create schema.Columns.Length true)
 
     /// 主キーで prefix 走査する（txn の書き込みを含む）。
@@ -439,7 +483,7 @@ module internal Dml =
         (mask: bool array)
         =
         let slots = Transaction.slotsOf (tableSpace schema) txn
-        // overlay は主キーを読むので、書き込みがあるときは主キー列を足す。
+
         let mask =
             if List.isEmpty slots then
                 mask
@@ -451,16 +495,23 @@ module internal Dml =
             let overlaid = overlayRows (RowKey.primaryV schema) slots rows
             if limit > 0 then Op.take limit overlaid else overlaid)
 
-    /// 主キーで prefix 走査する（txn の書き込みを含む・bool 互換）。
-    let scanByPrimaryKeyWithTxnValues store schema limit visible scope txn needsValues =
-        scanByPrimaryKeyWithTxnMask
-            store
-            schema
-            limit
-            visible
-            scope
-            txn
-            (Array.create schema.Columns.Length needsValues)
+    /// 主キー範囲をストアから走査し、上限チェックと LIMIT を掛ける。
+    let private scanPrimaryKeyRange
+        (store: RowStore)
+        (schema: TableSchema)
+        (visible: uint64 option)
+        (scope: ScanScope option)
+        (mask: bool array)
+        (lowerBytes: byte array)
+        (upperBytes: byte array option)
+        (limit: int)
+        =
+        RowStore.scanAtRawMasked (tableSpace schema) lowerBytes limit visible scope mask store
+        |> Result.map (fun scan ->
+            let rows =
+                opOfScan schema.Columns.Length (fun e -> inKeyRange lowerBytes upperBytes e.Key) scan
+
+            if limit > 0 then Op.take limit rows else rows)
 
     /// 主キーの範囲走査（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`。
@@ -489,15 +540,9 @@ module internal Dml =
                 else
                     widenMask mask schema.PrimaryKey
 
-            let scanPrimaryKeyRange lowerBytes upperBytes limit =
-                RowStore.scanAtRawMasked (tableSpace schema) lowerBytes limit visible scope mask store
-                |> Result.map (fun scan ->
-                    let rows =
-                        opOfScan schema.Columns.Length (fun e -> inKeyRange lowerBytes upperBytes e.Key) scan
+            let! rows =
+                scanPrimaryKeyRange store schema visible scope mask startBytes endBytes (storeLimitFor limit slots)
 
-                    if limit > 0 then Op.take limit rows else rows)
-
-            let! rows = scanPrimaryKeyRange startBytes endBytes (storeLimitFor limit slots)
             let merged = overlayRows (RowKey.primaryV schema) slots rows
 
             if limit > 0 then
@@ -591,17 +636,18 @@ module internal Dml =
             return! Transaction.checkLimit changed
         }
 
+    /// 主キー列が更新前後で同じか検査する。
+    let private ensureSamePrimaryKey (schema: TableSchema) (oldRow: SqlValue array) (newRow: SqlValue array) =
+        if Array.forall2 (=) (TableSchema.primaryKeyOf schema oldRow) (TableSchema.primaryKeyOf schema newRow) then
+            OkUnit
+        else
+            sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
+            |> DbError.constraintViolation
+            |> err
+
     /// 走査済みの行をそのまま使って更新する（主キー検索をやり直さない）。
     /// 主キーは変更できない（DELETE + INSERT を使う）。
     let updateRow (txn: Transaction) (schema: TableSchema) (oldRow: SqlValue array) (newRow: SqlValue array) =
-        let ensureSamePrimaryKey schema oldRow newRow =
-            if Array.forall2 (=) (TableSchema.primaryKeyOf schema oldRow) (TableSchema.primaryKeyOf schema newRow) then
-                OkUnit
-            else
-                sprintf "テーブル %s の主キー列は更新できません（DELETE + INSERT を使ってください）" schema.Name
-                |> DbError.constraintViolation
-                |> err
-
         result {
             do! TableSchema.validateRow schema newRow
             do! ensureSamePrimaryKey schema oldRow newRow

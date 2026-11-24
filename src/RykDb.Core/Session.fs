@@ -86,7 +86,7 @@ type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
     /// リソースを解放して次の状態にする。
     /// `Reading` 以外（既に解放済み）なら何もしないので、
     /// `release` は 1回しか呼ばれない。
-    let releaseTo next =
+    let releaseTo (next: RowReaderState) =
         match state with
         | Reading _ ->
             state <- next
@@ -132,7 +132,7 @@ type RowReader internal (columns: string array, op: Op, release: unit -> unit) =
             releaseTo Closed
             System.GC.SuppressFinalize this
 
-type private ResultBudget = { RowsLeft: int64; BytesLeft: int64 }
+type internal ResultBudget = { RowsLeft: int64; BytesLeft: int64 }
 
 /// `Execute` の前後で transaction の状態がどう変わったか。
 /// <remarks>
@@ -158,6 +158,213 @@ type private SessionTransactionChange =
 type private LocalSession =
     | Open of TxnState
     | Closed
+
+/// Session のロジックを接続状態から切り出したヘルパー。
+module internal SessionHelpers =
+
+    /// 上限から実行用の制限を作る（残予算を反映する）。
+    let limitsOfBudget (limits: ResultLimits) (budget: ResultBudget) =
+        {
+            MaxRows = max 0L budget.RowsLeft
+            MaxBytes = max 0L budget.BytesLeft
+            Budget = limits.Budget
+            Cancel = limits.Cancel
+            Progress = limits.Progress
+        }
+
+    /// 実行結果の行数とバイト数を予算から差し引く。
+    let consumeBudget (result: StatementResult) (budget: ResultBudget) =
+        if Array.isEmpty result.Columns then
+            budget
+        else
+            let rows = int64 result.Rows.Length
+            let bytes = result.Rows |> Array.sumBy (ValueCodec.managedRowBytes >> int64)
+
+            {
+                RowsLeft = max 0L (budget.RowsLeft - rows)
+                BytesLeft = max 0L (budget.BytesLeft - bytes)
+            }
+
+    /// 閉じたセッションに対するエラーを作る。
+    let closedError () =
+        DbError.internalError "Session は閉じられています"
+
+    /// バッチの結果を 1つの結果へまとめる。
+    let summarize (results: StatementResult list) =
+        let selects = results |> List.filter (fun r -> not (Array.isEmpty r.Columns))
+
+        match selects with
+        | [ s ] -> s
+        | _ -> StatementResult.Affected(results |> List.sumBy _.RowsAffected)
+
+    /// 読み取り経路の文を順に実行する。
+    [<TailCall>]
+    let rec runReadLoop
+        (limits: ResultLimits)
+        (readState: Committed)
+        (budget: ResultBudget)
+        (acc: StatementResult list)
+        =
+        function
+        | [] -> ret (List.rev acc)
+        | stmt :: tail ->
+            match
+                Engine.executeStatementWithLimits (limitsOfBudget limits budget) (ExecState.ofCommitted readState) stmt
+            with
+            | Ok(_, result) -> runReadLoop limits readState (consumeBudget result budget) (result :: acc) tail
+            | Error e -> err e
+
+    /// 排他経路で文を 1つずつ実行する（末尾再帰）。
+    [<TailCall>]
+    let rec runExclusiveLoop
+        (host: DatabaseHost)
+        (limits: ResultLimits)
+        (setState: TxnState -> unit)
+        (budget: ResultBudget)
+        (acc: StatementResult list)
+        (state: TxnState)
+        (statements: Statement list)
+        =
+        match statements with
+        | [] -> ret (List.rev acc)
+        | stmt :: tail ->
+            let outcome =
+                match stmt with
+                | Statement.Begin -> host.Begin state |> Result.map (fun next -> next, StatementResult.Empty)
+                | Statement.Commit ->
+                    host.Commit state
+                    >>= fun (outcome, result) ->
+                        match outcome with
+                        | CommitOutcome.Committed next -> ret (next, result)
+                        | CommitOutcome.CommittedUnsynced(next, e)
+                        | CommitOutcome.RolledBack(next, e) ->
+                            setState next
+                            err e
+                | Statement.Rollback -> host.Rollback state
+                | _ -> host.ExecuteNonTransaction state (limitsOfBudget limits budget) stmt
+
+            match outcome with
+            | Ok(next, result) ->
+                setState next
+                runExclusiveLoop host limits setState (consumeBudget result budget) (result :: acc) next tail
+            | Error e -> err e
+
+    /// SELECT / EXPLAIN だけのバッチか。
+    let isReadOnlyBatch =
+        List.forall (function
+            | Statement.Select _
+            | Statement.Explain _ -> true
+            | Statement.ExplainAnalyze _ -> true
+            | _ -> false)
+
+    /// パラメータ配列を先頭から検査する。
+    [<TailCall>]
+    let rec validateParametersLoop (parameters: SqlValue array) (i: int) =
+        if i >= parameters.Length then
+            ret ()
+        else
+            match parameters.[i] with
+            | SqlValue.Unloaded -> err (DbError.typeError "パラメータに SqlValue.Unloaded は指定できません")
+            | SqlValue.Text s when isNull s -> err (DbError.typeError "パラメータの TEXT に null は指定できません")
+            | SqlValue.Blob b when isNull b -> err (DbError.typeError "パラメータの BLOB に null 配列は指定できません")
+            | _ -> validateParametersLoop parameters (i + 1)
+
+    /// ゲートを跨ぐ例外を InternalError に変換して実行する。
+    let executeStatementsCore
+        (isReadOnlyBatch: Statement list -> bool)
+        (runRead: Statement list -> Result<'a, DbError>)
+        (runExclusive: Statement list -> Result<'a, DbError>)
+        (statements: Statement list)
+        =
+        try
+            if isReadOnlyBatch statements then
+                runRead statements
+            else
+                runExclusive statements
+        with ex ->
+            err (DbError.internalError ex.Message)
+
+    /// 解析済みの文を実行する（ゲート＝closed / durability を確認した後）。
+    let executeCore
+        (isClosed: unit -> bool)
+        (host: DatabaseHost)
+        (validateParameters: SqlValue array -> Result<unit, DbError>)
+        (runStatements: Statement list -> Result<'a, DbError>)
+        (sql: string)
+        (parameters: SqlValue array)
+        =
+        if isClosed () then
+            err (closedError ())
+        else
+            match host.DurabilityFailure with
+            | Some e -> err e
+            | None ->
+                validateParameters parameters
+                >>= fun () ->
+                    let parameters = SqlValue.copyRow parameters
+
+                    Parser.parseStatementsWith parameters sql
+                    >>= fun statements -> runStatements statements
+
+    /// RowReader のリソースを解放する。
+    let private readerRelease
+        (exitRead: System.IDisposable -> unit)
+        (stream: SelectStream)
+        (lease: System.IDisposable)
+        =
+        try
+            stream.Cleanup()
+        finally
+            exitRead lease
+
+    /// `TryOpenReader` の実装。
+    let tryOpenReaderCore
+        (isClosed: unit -> bool)
+        (host: DatabaseHost)
+        (validateParameters: SqlValue array -> Result<unit, DbError>)
+        (tryEnterRead: unit -> Result<(Committed * System.IDisposable) option, DbError>)
+        (exitRead: System.IDisposable -> unit)
+        (limits: ResultLimits)
+        (sql: string)
+        (parameters: SqlValue array)
+        =
+        if isClosed () then
+            err (closedError ())
+        else
+            match host.DurabilityFailure with
+            | Some e -> err e
+            | None ->
+                validateParameters parameters
+                >>= fun () ->
+                    let parameters = SqlValue.copyRow parameters
+
+                    match Parser.parseStatementsWith parameters sql with
+                    | Ok [ Statement.Select stmt ] ->
+                        match tryEnterRead () with
+                        | Ok None -> ret None
+                        | Ok(Some(readState, lease)) ->
+                            let opened =
+                                protect (fun () ->
+                                    Engine.openSelect limits.Budget (ExecState.ofCommitted readState) stmt)
+                                >>= id
+
+                            match opened with
+                            | Error e ->
+                                exitRead lease
+                                err e
+                            | Ok stream ->
+                                ret (
+                                    Some(
+                                        new RowReader(
+                                            stream.Columns,
+                                            stream.Op,
+                                            fun () -> readerRelease exitRead stream lease
+                                        )
+                                    )
+                                )
+                        | Error e -> err e
+                    | Ok _ -> ret None
+                    | Error e -> err e
 
 /// データベースへのセッション（1接続）。
 /// <remarks>
@@ -206,30 +413,6 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             BytesLeft = limits.MaxBytes
         }
 
-    let limitsOfBudget (budget: ResultBudget) =
-        {
-            MaxRows = max 0L budget.RowsLeft
-            MaxBytes = max 0L budget.BytesLeft
-            Budget = limits.Budget
-            Cancel = limits.Cancel
-            Progress = limits.Progress
-        }
-
-    let consumeBudget (result: StatementResult) (budget: ResultBudget) =
-        if Array.isEmpty result.Columns then
-            budget
-        else
-            let rows = int64 result.Rows.Length
-            let bytes = result.Rows |> Array.sumBy (ValueCodec.managedRowBytes >> int64)
-
-            {
-                RowsLeft = max 0L (budget.RowsLeft - rows)
-                BytesLeft = max 0L (budget.BytesLeft - bytes)
-            }
-
-    let closedError () =
-        DbError.internalError "Session は閉じられています"
-
     let isClosed () =
         lock stateGate (fun () ->
             match local with
@@ -242,50 +425,24 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             | LocalSession.Closed -> false
             | LocalSession.Open state -> TxnState.inTransaction state)
 
-    let summarize (results: StatementResult list) =
-        let selects = results |> List.filter (fun r -> not (Array.isEmpty r.Columns))
-
-        match selects with
-        | [ s ] -> s
-        | _ -> StatementResult.Affected(results |> List.sumBy _.RowsAffected)
-
     /// 排他経路。
     /// 文を 1つずつ host の writeGate の下で実行し、成功するたびに接続ローカルの状態を更新する。
     /// WAL の fsync 待ちは host が writeGate の外で行う。
     let runExclusive (statements: Statement list) =
         lock writeGate (fun () ->
             match lock stateGate (fun () -> local) with
-            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Closed -> err (SessionHelpers.closedError ())
             | LocalSession.Open start ->
                 let wasInTransaction = TxnState.inTransaction start
 
-                let rec run budget acc state =
-                    function
-                    | [] -> ret (List.rev acc)
-                    | stmt :: tail ->
-                        let outcome =
-                            match stmt with
-                            | Statement.Begin ->
-                                host.Begin state |> Result.map (fun next -> next, StatementResult.Empty)
-                            | Statement.Commit ->
-                                host.Commit state
-                                >>= fun (outcome, result) ->
-                                    match outcome with
-                                    | CommitOutcome.Committed next -> ret (next, result)
-                                    | CommitOutcome.CommittedUnsynced(next, e)
-                                    | CommitOutcome.RolledBack(next, e) ->
-                                        lock stateGate (fun () -> local <- LocalSession.Open next)
-                                        err e
-                            | Statement.Rollback -> host.Rollback state
-                            | _ -> host.ExecuteNonTransaction state (limitsOfBudget budget) stmt
-
-                        match outcome with
-                        | Ok(next, result) ->
-                            lock stateGate (fun () -> local <- LocalSession.Open next)
-                            run (consumeBudget result budget) (result :: acc) next tail
-                        | Error e -> err e
-
-                run initialBudget [] start statements
+                SessionHelpers.runExclusiveLoop
+                    host
+                    limits
+                    (fun next -> lock stateGate (fun () -> local <- LocalSession.Open next))
+                    initialBudget
+                    []
+                    start
+                    statements
                 >>= fun results ->
                     let nowInTransaction = inTransaction ()
 
@@ -295,7 +452,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
                         | true, false -> SessionTransactionChange.Ended
                         | _ -> SessionTransactionChange.NoChange
 
-                    ret (summarize results, change))
+                    ret (SessionHelpers.summarize results, change))
 
     /// 読み取りの入口。
     /// closed ならエラー、transaction 中なら None（排他経路へ）。
@@ -304,7 +461,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     let tryEnterRead () =
         lock stateGate (fun () ->
             match local with
-            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Closed -> err (SessionHelpers.closedError ())
             | LocalSession.Open state when TxnState.inTransaction state -> ret None
             | LocalSession.Open _ ->
                 host.AcquireReadSnapshot()
@@ -330,51 +487,20 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
         | Ok None -> runExclusive statements
         | Ok(Some(readState, lease)) ->
             try
-                let rec run budget acc =
-                    function
-                    | [] -> ret (List.rev acc)
-                    | stmt :: tail ->
-                        match
-                            Engine.executeStatementWithLimits
-                                (limitsOfBudget budget)
-                                (ExecState.ofCommitted readState)
-                                stmt
-                        with
-                        | Ok(_, result) -> run (consumeBudget result budget) (result :: acc) tail
-                        | Error e -> err e
-
-                run initialBudget [] statements
-                >>= fun results -> ret (summarize results, SessionTransactionChange.NoChange)
+                SessionHelpers.runReadLoop limits readState initialBudget [] statements
+                >>= fun results -> ret (SessionHelpers.summarize results, SessionTransactionChange.NoChange)
             finally
                 exitRead lease
         | Error e -> err e
-
-    /// SELECT / EXPLAIN だけのバッチか。
-    let isReadOnlyBatch =
-        List.forall (function
-            | Statement.Select _
-            | Statement.Explain _ -> true
-            | Statement.ExplainAnalyze _ -> true
-            | _ -> false)
 
     /// パラメータに `SqlValue.Unloaded`（内部専用の未復号マーカー）が含まれていないか検査する。
     /// 呼び出し側が誤って内部値を持ち込むと、行のマスク漏れと同じ事故になるため拒否する。
     /// `Blob` の配列は呼び出し側と共有しない（`SqlValue.copyRow` で複製する）。
     let validateParameters (parameters: SqlValue array) =
-        let rec loop i =
-            if i >= parameters.Length then
-                ret ()
-            else
-                match parameters.[i] with
-                | SqlValue.Unloaded -> err (DbError.typeError "パラメータに SqlValue.Unloaded は指定できません")
-                | SqlValue.Text s when isNull s -> err (DbError.typeError "パラメータの TEXT に null は指定できません")
-                | SqlValue.Blob b when isNull b -> err (DbError.typeError "パラメータの BLOB に null 配列は指定できません")
-                | _ -> loop (i + 1)
-
         if isNull parameters then
             err (DbError.typeError "parameters に null は指定できません")
         else
-            loop 0
+            SessionHelpers.validateParametersLoop parameters 0
 
     /// 解析済みの文を実行する（ゲート＝closed / durability を確認した後）。
     /// <remarks>
@@ -383,66 +509,15 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// `Session` の境界で `InternalError` に変換し、例外を送らない契約にする。
     /// </remarks>
     let executeStatementsCore (statements: Statement list) =
-        try
-            if isReadOnlyBatch statements then
-                runRead statements
-            else
-                runExclusive statements
-        with ex ->
-            err (DbError.internalError ex.Message)
+        SessionHelpers.executeStatementsCore SessionHelpers.isReadOnlyBatch runRead runExclusive statements
 
     /// 単一文または複数文を実行し、transaction の遷移も返す。
     let executeCore (sql: string) (parameters: SqlValue array) =
-        if isClosed () then
-            err (closedError ())
-        else
-            match host.DurabilityFailure with
-            | Some e -> err e
-            | None ->
-                validateParameters parameters
-                >>= fun () ->
-                    let parameters = SqlValue.copyRow parameters
-
-                    Parser.parseStatementsWith parameters sql
-                    >>= fun statements -> executeStatementsCore statements
+        SessionHelpers.executeCore isClosed host validateParameters executeStatementsCore sql parameters
 
     /// `TryOpenReader` の実装。
     let tryOpenReaderCore (sql: string) (parameters: SqlValue array) =
-        if isClosed () then
-            err (closedError ())
-        else
-            match host.DurabilityFailure with
-            | Some e -> err e
-            | None ->
-                validateParameters parameters
-                >>= fun () ->
-                    let parameters = SqlValue.copyRow parameters
-
-                    match Parser.parseStatementsWith parameters sql with
-                    | Ok [ Statement.Select stmt ] ->
-                        match tryEnterRead () with
-                        | Ok None -> ret None
-                        | Ok(Some(readState, lease)) ->
-                            let opened =
-                                protect (fun () ->
-                                    Engine.openSelect limits.Budget (ExecState.ofCommitted readState) stmt)
-                                >>= id
-
-                            match opened with
-                            | Error e ->
-                                exitRead lease
-                                err e
-                            | Ok stream ->
-                                let release () =
-                                    try
-                                        stream.Cleanup()
-                                    finally
-                                        exitRead lease
-
-                                ret (Some(new RowReader(stream.Columns, stream.Op, release)))
-                        | Error e -> err e
-                    | Ok _ -> ret None
-                    | Error e -> err e
+        SessionHelpers.tryOpenReaderCore isClosed host validateParameters tryEnterRead exitRead limits sql parameters
 
     /// DB を開く（background compaction 有効、既定の上限）。
     static member OpenWith(root: string) =
@@ -491,7 +566,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     member _.TableNames() =
         lock stateGate (fun () ->
             match local with
-            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Closed -> err (SessionHelpers.closedError ())
             | LocalSession.Open _ -> ret (host.Committed.Catalog.Tables |> List.map _.Name))
 
     /// 単一の SELECT を materialize せずにストリーミング用に開く。
@@ -537,7 +612,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     /// 解析済みの 1文を実行する（テスト・ベンチ用。`Execute` と同じゲートを通る）。
     member internal _.ExecuteStatement(stmt: Statement) =
         if isClosed () then
-            err (closedError ())
+            err (SessionHelpers.closedError ())
         else
             match host.DurabilityFailure with
             | Some e -> err e
@@ -557,7 +632,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     member _.Begin() =
         lock writeGate (fun () ->
             match lock stateGate (fun () -> local) with
-            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Closed -> err (SessionHelpers.closedError ())
             | LocalSession.Open state ->
                 host.Begin state
                 |> Result.map (fun next ->
@@ -573,7 +648,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     member _.Commit() =
         lock writeGate (fun () ->
             match lock stateGate (fun () -> local) with
-            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Closed -> err (SessionHelpers.closedError ())
             | LocalSession.Open state ->
                 host.Commit state
                 >>= fun (outcome, _) ->
@@ -593,7 +668,7 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     member _.Rollback() =
         lock writeGate (fun () ->
             match lock stateGate (fun () -> local) with
-            | LocalSession.Closed -> err (closedError ())
+            | LocalSession.Closed -> err (SessionHelpers.closedError ())
             | LocalSession.Open state ->
                 host.Rollback state
                 |> Result.map (fun (next, _) -> lock stateGate (fun () -> local <- LocalSession.Open next)))

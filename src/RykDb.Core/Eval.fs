@@ -236,17 +236,18 @@ module internal Eval =
     /// 演算子は文字列タグではなく `CompareOp` で受け、6 演算子を漏れなく分岐する
     /// （未知の演算子を黙って Unknown へ寄せる既定分岐は持たない）。
     /// </remarks>
-    let private applyComparison (op: CompareOp) (c: int) =
-        let tf b =
-            if b then TruthValue.True else TruthValue.False
+    /// 比較結果を 3値論理へ変換する。
+    let private comparisonTruth (b: bool) =
+        if b then TruthValue.True else TruthValue.False
 
+    let private applyComparison (op: CompareOp) (c: int) =
         match op with
-        | CompareOp.Eq -> tf (c = 0)
-        | CompareOp.Ne -> tf (c <> 0)
-        | CompareOp.Lt -> tf (c < 0)
-        | CompareOp.Le -> tf (c <= 0)
-        | CompareOp.Gt -> tf (c > 0)
-        | CompareOp.Ge -> tf (c >= 0)
+        | CompareOp.Eq -> comparisonTruth (c = 0)
+        | CompareOp.Ne -> comparisonTruth (c <> 0)
+        | CompareOp.Lt -> comparisonTruth (c < 0)
+        | CompareOp.Le -> comparisonTruth (c <= 0)
+        | CompareOp.Gt -> comparisonTruth (c > 0)
+        | CompareOp.Ge -> comparisonTruth (c >= 0)
 
     /// 比較を 3値論理に変換する。
     let private compare (op: CompareOp) (a: SqlValue) (b: SqlValue) =
@@ -270,8 +271,8 @@ module internal Eval =
     /// BOOL はそのまま、NULL は UNKNOWN。
     /// BOOLEAN 以外は UNKNOWN だが、`WHERE` の互換のため INTEGER だけは
     /// 0 = FALSE / 非 0 = TRUE とする（AND / OR / NOT / CASE / IS TRUE / IS UNKNOWN も同じ規則）。
-    let private truthOfValue (v: SqlValue) =
-        match v with
+    let private truthOfValue =
+        function
         | SqlValue.Bool b -> if b then TruthValue.True else TruthValue.False
         | SqlValue.Int i -> if i <> 0L then TruthValue.True else TruthValue.False
         | _ -> TruthValue.Unknown
@@ -297,8 +298,8 @@ module internal Eval =
             | Joined(l, r) -> if i < l.Length then DbOk l.[i] else DbOk r.[i - l.Length]
 
     /// 3値の判定結果を SqlValue へ戻す（UNKNOWN は NULL）。
-    let private ofTruth (t: TruthValue) =
-        match t with
+    let private ofTruth =
+        function
         | TruthValue.True -> SqlValue.TrueValue
         | TruthValue.False -> SqlValue.FalseValue
         | TruthValue.Unknown -> SqlValue.Null
@@ -366,8 +367,8 @@ module internal Eval =
     /// `resolve` は計画時に作った評価準備（`Eval.prepare`）で、
     /// 列解決と LIKE のコンパイルを済ませてある。
     [<TailCall>]
-    let rec private step (resolve: Prepared) (row: RowView) (kont: Kont list) (st: Step) =
-        match st with
+    let rec private step (resolve: Prepared) (row: RowView) (kont: Kont list) =
+        function
         | Descend e ->
             match e with
             | Expr.Literal l -> step resolve row kont (Arrive l.ToSqlValue)
@@ -596,6 +597,64 @@ module internal Eval =
                     | Ok res -> step resolve row rest (Arrive res)
                 | a :: more -> step resolve row (KFuncArg(n, acc, more) :: rest) (Descend a)
 
+    /// 列参照を 1つ解決して準備済み辞書へ加える。
+    let private prepareAddColumn
+        (schema: Schema)
+        (
+            acc:
+                System.Collections.Immutable.ImmutableDictionary<struct (string option * string), Result<int, DbError>> *
+                DbError option
+        )
+        (asName: bool)
+        (c: ColumnRef)
+        =
+        let dict, firstError = acc
+        let key = struct (c.Qualifier, c.Name)
+
+        if dict.ContainsKey key then
+            acc
+        else
+            let resolved =
+                match Schema.resolve c schema with
+                | Error _ when asName -> Error(DbError.name (sprintf "'%s' は列でも関数でもありません" c.Name))
+                | other -> other
+
+            match resolved, firstError with
+            | Error e, None -> dict.Add(key, resolved), Some e
+            | _ -> dict.Add(key, resolved), firstError
+
+    /// リテラル LIKE パターンを 1つコンパイルして辞書へ加える。
+    let private prepareAddLike
+        (acc:
+            System.Collections.Immutable.ImmutableDictionary<struct (int * string), Result<Scalar.LikePattern, DbError>>)
+        (escape: Expr option)
+        (pattern: Expr)
+        =
+        match pattern with
+        | Expr.Literal(Literal.String p) ->
+            let code =
+                match escape with
+                | None -> Some Scalar.NoEscape
+                | Some(Expr.Literal(Literal.String s)) ->
+                    match Scalar.escapeCodePoint s with
+                    | Ok cp -> Some cp
+                    | Error _ -> None
+                | Some _ -> None
+
+            match code with
+            | Some code ->
+                let key = struct (code, p)
+
+                if acc.ContainsKey key then
+                    acc
+                else
+                    let compiled =
+                        Scalar.compileTokens (if code = Scalar.NoEscape then None else Some code) p
+
+                    acc.Add(key, compiled)
+            | None -> acc
+        | _ -> acc
+
     /// 演算子が評価する式から、列解決とリテラル LIKE のコンパイルを 1回で済ませる。
     /// 可変のキャッシュではなく、返した値は評価中に変化しない。
     /// 列パターン（`a LIKE b`）は計画時に決まらないので、ここではコンパイルしない。
@@ -604,41 +663,14 @@ module internal Eval =
             : System.Collections.Immutable.ImmutableDictionary<struct (string option * string), Result<int, DbError>> =
             System.Collections.Immutable.ImmutableDictionary.Create()
 
-        let addColumn
-            (
-                acc:
-                    System.Collections.Immutable.ImmutableDictionary<
-                        struct (string option * string),
-                        Result<int, DbError>
-                     > *
-                    DbError option
-            )
-            asName
-            (c: ColumnRef)
-            =
-            let dict, firstError = acc
-            let key = struct (c.Qualifier, c.Name)
-
-            if dict.ContainsKey key then
-                acc
-            else
-                let resolved =
-                    match Schema.resolve c schema with
-                    | Error _ when asName -> Error(DbError.name (sprintf "'%s' は列でも関数でもありません" c.Name))
-                    | other -> other
-
-                match resolved, firstError with
-                | Error e, None -> dict.Add(key, resolved), Some e
-                | _ -> dict.Add(key, resolved), firstError
-
         let columns, firstError =
             ((emptyColumns, None), exprs)
             ||> List.fold (fun acc e ->
                 Expr.fold
                     (fun acc node ->
                         match node with
-                        | Expr.Column c -> addColumn acc false c
-                        | Expr.Name n -> addColumn acc true { Qualifier = None; Name = n }
+                        | Expr.Column c -> prepareAddColumn schema acc false c
+                        | Expr.Name n -> prepareAddColumn schema acc true { Qualifier = None; Name = n }
                         | _ -> acc)
                     acc
                     e)
@@ -650,48 +682,14 @@ module internal Eval =
                > =
             System.Collections.Immutable.ImmutableDictionary.Create()
 
-        let addLike
-            (acc:
-                System.Collections.Immutable.ImmutableDictionary<
-                    struct (int * string),
-                    Result<Scalar.LikePattern, DbError>
-                 >)
-            (escape: Expr option)
-            (pattern: Expr)
-            =
-            match pattern with
-            | Expr.Literal(Literal.String p) ->
-                let code =
-                    match escape with
-                    | None -> Some Scalar.NoEscape
-                    | Some(Expr.Literal(Literal.String s)) ->
-                        match Scalar.escapeCodePoint s with
-                        | Ok cp -> Some cp
-                        | Error _ -> None
-                    | Some _ -> None
-
-                match code with
-                | Some code ->
-                    let key = struct (code, p)
-
-                    if acc.ContainsKey key then
-                        acc
-                    else
-                        let compiled =
-                            Scalar.compileTokens (if code = Scalar.NoEscape then None else Some code) p
-
-                        acc.Add(key, compiled)
-                | None -> acc
-            | _ -> acc
-
         let likes =
             (emptyLikes, exprs)
             ||> List.fold (fun acc e ->
                 Expr.fold
                     (fun acc node ->
                         match node with
-                        | Expr.Like(_, p, _, esc) -> addLike acc esc p
-                        | Expr.Binary(BinaryOp.Like, _, p) -> addLike acc None p
+                        | Expr.Like(_, p, _, esc) -> prepareAddLike acc esc p
+                        | Expr.Binary(BinaryOp.Like, _, p) -> prepareAddLike acc None p
                         | _ -> acc)
                     acc
                     e)
@@ -710,59 +708,64 @@ module internal Eval =
         | Some e -> err e
         | None -> ret ()
 
+    /// 列参照の宣言型を解決する（修飾子なしも試す）。
+    let private comparableColumnType (schema: Schema) (c: ColumnRef) =
+        match Schema.resolve c schema with
+        | Ok i -> schema.Columns.[i].DataType
+        | Error _ ->
+            match Schema.resolve { Qualifier = None; Name = c.Name } schema with
+            | Ok i -> schema.Columns.[i].DataType
+            | Error _ -> None
+
+    /// 型が静的に決まる式だけ型を返す。
+    let private comparableSimpleType (schema: Schema) =
+        function
+        | Expr.Column c -> comparableColumnType schema c
+        | Expr.Name n -> comparableColumnType schema { Qualifier = None; Name = n }
+        | Expr.Literal l -> SqlValue.dataType l.ToSqlValue |> Result.toOption
+        | Expr.Value v -> SqlValue.dataType v |> Result.toOption
+        | Expr.Cast(_, dt) -> Some dt
+        | _ -> None
+
+    /// 2つの式が比較可能か検査する。
+    let private comparableCheck (schema: Schema) (a: Expr) (b: Expr) =
+        match comparableSimpleType schema a, comparableSimpleType schema b with
+        | Some ta, Some tb when not (SqlValue.typesComparable ta tb) ->
+            sprintf "型 '%s' と '%s' は比較できません" (DataType.toSqlName ta) (DataType.toSqlName tb)
+            |> DbError.typeError
+            |> err
+        | _ -> ret ()
+
+    /// 比較を含むノード 1つを検査する。
+    let private comparableNodeCheck (schema: Schema) =
+        function
+        | Expr.Binary(BinaryOp.Eq, a, b)
+        | Expr.Binary(BinaryOp.Ne, a, b)
+        | Expr.Binary(BinaryOp.Lt, a, b)
+        | Expr.Binary(BinaryOp.Le, a, b)
+        | Expr.Binary(BinaryOp.Gt, a, b)
+        | Expr.Binary(BinaryOp.Ge, a, b) -> comparableCheck schema a b
+        | Expr.Between(x, lo, hi, _) -> comparableCheck schema x lo >>= fun () -> comparableCheck schema x hi
+        | Expr.InList(x, items, _) -> items |> foldOk (fun () item -> comparableCheck schema x item) ()
+        | _ -> ret ()
+
+    /// 明示スタックで全ノードを検査する。
+    [<TailCall>]
+    let rec private checkComparableLoop (schema: Schema) =
+        function
+        | [] -> ret ()
+        | node :: rest ->
+            match comparableNodeCheck schema node with
+            | Error e -> err e
+            | Ok() -> checkComparableLoop schema (List.append (Expr.children node) rest)
+
     /// 比較の型を静的に検査する。
     /// 列参照・リテラル・値・CAST から型が決まる比較だけを見て、
     /// `compareValuesV` が型エラーにする組み合わせ（例: INTEGER と TEXT）を
     /// 行の有無に関係なく TypeError にする。
     /// 演算・関数・集約の結果は型を決めないので、実行時の判定に委ねる。
     /// 走査は明示スタックなので、式の深さに依存せずスタックを食わない。
-    let checkComparableTypes (schema: Schema) (e: Expr) =
-        let columnType c =
-            match Schema.resolve c schema with
-            | Ok i -> schema.Columns.[i].DataType
-            | Error _ ->
-                match Schema.resolve { Qualifier = None; Name = c.Name } schema with
-                | Ok i -> schema.Columns.[i].DataType
-                | Error _ -> None
-
-        let simpleType =
-            function
-            | Expr.Column c -> columnType c
-            | Expr.Name n -> columnType { Qualifier = None; Name = n }
-            | Expr.Literal l -> SqlValue.dataType l.ToSqlValue |> Result.toOption
-            | Expr.Value v -> SqlValue.dataType v |> Result.toOption
-            | Expr.Cast(_, dt) -> Some dt
-            | _ -> None
-
-        let compareCheck a b =
-            match simpleType a, simpleType b with
-            | Some ta, Some tb when not (SqlValue.typesComparable ta tb) ->
-                sprintf "型 '%s' と '%s' は比較できません" (DataType.toSqlName ta) (DataType.toSqlName tb)
-                |> DbError.typeError
-                |> err
-            | _ -> ret ()
-
-        let nodeCheck =
-            function
-            | Expr.Binary(BinaryOp.Eq, a, b)
-            | Expr.Binary(BinaryOp.Ne, a, b)
-            | Expr.Binary(BinaryOp.Lt, a, b)
-            | Expr.Binary(BinaryOp.Le, a, b)
-            | Expr.Binary(BinaryOp.Gt, a, b)
-            | Expr.Binary(BinaryOp.Ge, a, b) -> compareCheck a b
-            | Expr.Between(x, lo, hi, _) -> compareCheck x lo >>= fun () -> compareCheck x hi
-            | Expr.InList(x, items, _) -> items |> foldOk (fun () item -> compareCheck x item) ()
-            | _ -> ret ()
-
-        let rec loop =
-            function
-            | [] -> ret ()
-            | node :: rest ->
-                match nodeCheck node with
-                | Error e -> err e
-                | Ok() -> loop (List.append (Expr.children node) rest)
-
-        loop [ e ]
+    let checkComparableTypes (schema: Schema) (e: Expr) = checkComparableLoop schema [ e ]
 
     /// 計画時に作った評価準備で式を評価する（内部ホットパス用）。
     /// 集約呼び出しはここでエラーになる。
@@ -780,7 +783,7 @@ module internal Eval =
 
     /// 評価結果を WHERE の真偽へ変換する（UNKNOWN は偽）。
     /// 真偽の解釈は `truthOfValue` に一本化する。
-    let private asMatchV (r: DbResult<SqlValue>) : DbResult<bool> =
+    let private asMatchV (r: DbResult<SqlValue>) =
         match r with
         | DbErr e -> DbErr e
         | DbOk v -> DbOk(truthOfValue v = TruthValue.True)

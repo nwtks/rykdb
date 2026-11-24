@@ -190,17 +190,19 @@ module internal Catalog =
             |> List.filter (fun fk -> eqName fk.ParentTable table)
             |> List.map (fun fk -> t, fk))
 
+    /// 主キー列名を列位置へ変換する。
+    [<TailCall>]
+    let rec private primaryKeyIndices (t: TableDefinition) (names: string list) (acc: int list) =
+        match names with
+        | [] -> ret (List.rev acc)
+        | name :: rest ->
+            match t.Columns |> List.tryFindIndex (fun c -> eqName c.Name name) with
+            | Some i -> primaryKeyIndices t rest (i :: acc)
+            | None -> err (sprintf "テーブル %s に主キー列 %s がありません" t.Name name |> DbError.name)
+
     /// 永続化形を TableSchema に戻す。
     let toSchema (t: TableDefinition) =
-        let rec findIndices names acc =
-            match names with
-            | [] -> ret (List.rev acc)
-            | name :: rest ->
-                match t.Columns |> List.tryFindIndex (fun c -> eqName c.Name name) with
-                | Some i -> findIndices rest (i :: acc)
-                | None -> err (sprintf "テーブル %s に主キー列 %s がありません" t.Name name |> DbError.name)
-
-        findIndices t.PrimaryKeyColumns []
+        primaryKeyIndices t t.PrimaryKeyColumns []
         |> Result.map (fun idx ->
             {
                 Name = t.Name
@@ -302,44 +304,45 @@ module internal Catalog =
                 c5
         }
 
+    /// カタログの列定義 1件を復号する。
+    let private decodeColumn (c: Cursor) =
+        result {
+            let! name, c1 = Reader.readStr c
+            let! tag, c2 = Reader.readByte c1
+            let! flags, c3 = Reader.readByte c2
+            let! defaultText, c4 = Reader.readStr c3
+            let! dt = DataType.fromTag tag
+
+            let! defaultExpr =
+                if defaultText = "" then
+                    ret None
+                else
+                    match Parser.parseExpression defaultText with
+                    | Ok e -> ret (Some e)
+                    | Error e -> err (sprintf "DEFAULT 式を復元できません: %s" e.Message |> DbError.corruption)
+
+            return
+                {
+                    Name = name
+                    DataType = dt
+                    // 型引数は宣言のみで実行時の意味を持たないため保存しない。
+                    TypeArguments = []
+                    Constraint =
+                        {
+                            NotNull = flags &&& 1uy <> 0uy
+                            PrimaryKey = flags &&& 2uy <> 0uy
+                            Unique = flags &&& 4uy <> 0uy
+                            Default = defaultExpr
+                            References = None
+                        }
+                },
+                c4
+        }
+
     let private decodeTable (name: string) (bytes: byte array) =
-        let readColumn c =
-            result {
-                let! name, c1 = Reader.readStr c
-                let! tag, c2 = Reader.readByte c1
-                let! flags, c3 = Reader.readByte c2
-                let! defaultText, c4 = Reader.readStr c3
-                let! dt = DataType.fromTag tag
-
-                let! defaultExpr =
-                    if defaultText = "" then
-                        ret None
-                    else
-                        match Parser.parseExpression defaultText with
-                        | Ok e -> ret (Some e)
-                        | Error e -> err (sprintf "DEFAULT 式を復元できません: %s" e.Message |> DbError.corruption)
-
-                return
-                    {
-                        Name = name
-                        DataType = dt
-                        // 型引数は宣言のみで実行時の意味を持たないため保存しない。
-                        TypeArguments = []
-                        Constraint =
-                            {
-                                NotNull = flags &&& 1uy <> 0uy
-                                PrimaryKey = flags &&& 2uy <> 0uy
-                                Unique = flags &&& 4uy <> 0uy
-                                Default = defaultExpr
-                                References = None
-                            }
-                    },
-                    c4
-            }
-
         result {
             let! colCount, cur1 = Cursor.create bytes |> Reader.readVarint
-            let! cols, cur2 = Reader.readItems readColumn colCount cur1
+            let! cols, cur2 = Reader.readItems decodeColumn colCount cur1
             let! pkCount, cur3 = Reader.readVarint cur2
             let! pks, cur4 = Reader.readItems Reader.readStr pkCount cur3
 
@@ -668,6 +671,7 @@ module internal Catalog =
     let private deleteBatch (key: byte array) (seq: uint64) =
         Keyspace.CatalogKeyspace, [| Entry.delete key seq |]
 
+    [<TailCall>]
     let rec private numberList (mk: 'a -> uint64 -> 'b) (rest: 'a list) (seq: uint64) (acc: 'b list) =
         match rest with
         | [] -> List.rev acc, seq
@@ -689,6 +693,28 @@ module internal Catalog =
     let putStatsInTxn (s: TableStats) (txn: Transaction) =
         Transaction.put Keyspace.CatalogKeyspace (statsKey s.Table) (toValue (encodeStats s)) txn
 
+    /// 2つのバイト列が等しいか。
+    let private bytesEqual (a: byte array) (b: byte array) =
+        a.Length = b.Length && Array.forall2 (=) a b
+
+    /// 保存形が前回から変わったテーブルか。
+    let private changedTable (previous: Catalog) (t: TableDefinition) =
+        match previous.Tables |> List.tryFind (fun p -> eqName p.Name t.Name) with
+        | Some p -> not (bytesEqual (encodeTable p) (encodeTable t))
+        | None -> true
+
+    /// 保存形が前回から変わった索引か。
+    let private changedIndex (previous: Catalog) (i: IndexDefinition) =
+        match previous.Indexes |> List.tryFind (fun p -> eqName p.IndexName i.IndexName) with
+        | Some p -> not (bytesEqual (encodeIndex p) (encodeIndex i))
+        | None -> true
+
+    /// 保存形が前回から変わった統計か。
+    let private changedStats (previous: Catalog) (s: TableStats) =
+        match previous.Stats |> List.tryFind (fun p -> eqName p.Table s.Table) with
+        | Some p -> not (bytesEqual (encodeStats p) (encodeStats s))
+        | None -> true
+
     /// カタログを保存する（消えた定義は tombstone で落とす）。
     /// previous は保存前のカタログ（store にあった内容）。
     /// 書き込みは「前回から変わった定義」と「消えた定義」の差分だけにする。
@@ -697,24 +723,6 @@ module internal Catalog =
     /// 書き込みは 1バッチにまとめる
     /// （tombstone も同じバッチに含めるので WAL の fsync は 1回で済む）。
     let save (store: RowStore) (previous: Catalog) (catalog: Catalog) =
-        let bytesEqual (a: byte array) (b: byte array) =
-            a.Length = b.Length && Array.forall2 (=) a b
-
-        let changedTable (t: TableDefinition) =
-            match previous.Tables |> List.tryFind (fun p -> eqName p.Name t.Name) with
-            | Some p -> not (bytesEqual (encodeTable p) (encodeTable t))
-            | None -> true
-
-        let changedIndex (i: IndexDefinition) =
-            match previous.Indexes |> List.tryFind (fun p -> eqName p.IndexName i.IndexName) with
-            | Some p -> not (bytesEqual (encodeIndex p) (encodeIndex i))
-            | None -> true
-
-        let changedStats (s: TableStats) =
-            match previous.Stats |> List.tryFind (fun p -> eqName p.Table s.Table) with
-            | Some p -> not (bytesEqual (encodeStats p) (encodeStats s))
-            | None -> true
-
         let staleKeys =
             let wanted =
                 (catalog.Tables |> List.map (fun t -> tableKey t.Name))
@@ -734,13 +742,13 @@ module internal Catalog =
             let seq0 = e.NextSeqNo
 
             let tableBatches, seq1 =
-                numberList tableBatch (catalog.Tables |> List.filter changedTable) seq0 []
+                numberList tableBatch (catalog.Tables |> List.filter (changedTable previous)) seq0 []
 
             let indexBatches, seq2 =
-                numberList indexBatch (catalog.Indexes |> List.filter changedIndex) seq1 []
+                numberList indexBatch (catalog.Indexes |> List.filter (changedIndex previous)) seq1 []
 
             let statsBatches, seq3 =
-                numberList statsBatch (catalog.Stats |> List.filter changedStats) seq2 []
+                numberList statsBatch (catalog.Stats |> List.filter (changedStats previous)) seq2 []
 
             let deleteBatches, _ = numberList deleteBatch staleKeys seq3 []
 
@@ -750,65 +758,70 @@ module internal Catalog =
             return updated
         }
 
+    /// カタログ値から Blob / Text のバイト列を取り出す。
+    let private catalogValueOf =
+        function
+        | [| SqlValue.Blob b |] -> Some b
+        | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
+        | _ -> None
+
+    /// キーが指定の接頭辞を持てば残りの名前を返す。
+    let private tryKeyPrefix (key: byte array) (prefix: string) =
+        let p = System.Text.Encoding.UTF8.GetBytes prefix
+
+        if key.Length < p.Length then
+            None
+        elif Array.forall2 (=) key.[0 .. p.Length - 1] p then
+            Some(System.Text.Encoding.UTF8.GetString(key, p.Length, key.Length - p.Length))
+        else
+            None
+
+    /// カタログキーの種別（0=テーブル, 1=索引, 2=統計）と名前を返す。
+    let private keyKindOf (key: byte array) =
+        match tryKeyPrefix key "table:" with
+        | Some name -> Some(0, name)
+        | None ->
+            match tryKeyPrefix key "index:" with
+            | Some name -> Some(1, name)
+            | None ->
+                match tryKeyPrefix key "stats:" with
+                | Some name -> Some(2, name)
+                | None -> None
+
+    /// 読み出したカタログ行を末尾再帰で畳み込む。
+    [<TailCall>]
+    let rec private decodeCatalogRows (rows: (byte array * SqlValue array option) array) (i: int) (c: Catalog) =
+        if i >= rows.Length then
+            ret c
+        else
+            let key, value = rows.[i]
+
+            match value with
+            | None -> decodeCatalogRows rows (i + 1) c
+            | Some v ->
+                match catalogValueOf v with
+                | None -> decodeCatalogRows rows (i + 1) c
+                | Some bytes ->
+                    match keyKindOf key with
+                    | Some(0, name) ->
+                        match decodeTable name bytes with
+                        | Ok t -> addTable t c |> decodeCatalogRows rows (i + 1)
+                        | Error e -> err e
+                    | Some(1, name) ->
+                        match decodeIndex name bytes with
+                        | Ok idx -> addIndex idx c |> decodeCatalogRows rows (i + 1)
+                        | Error e -> err e
+                    | Some(2, name) ->
+                        match decodeStats name bytes with
+                        | Ok s -> addStats s c |> decodeCatalogRows rows (i + 1)
+                        | Error e -> err e
+                    | _ -> decodeCatalogRows rows (i + 1) c
+
     /// カタログを読み込む。キーが無ければ空を返す。
     let load (store: RowStore) =
-        let ofValue =
-            function
-            | [| SqlValue.Blob b |] -> Some b
-            | [| SqlValue.Text t |] -> Some(System.Text.Encoding.UTF8.GetBytes t)
-            | _ -> None
-
-        let tryPrefix (key: byte array) (prefix: string) =
-            let p = System.Text.Encoding.UTF8.GetBytes prefix
-
-            if key.Length < p.Length then
-                None
-            elif Array.forall2 (=) key.[0 .. p.Length - 1] p then
-                Some(System.Text.Encoding.UTF8.GetString(key, p.Length, key.Length - p.Length))
-            else
-                None
-
-        let keyKindOf key =
-            match tryPrefix key "table:" with
-            | Some name -> Some(0, name)
-            | None ->
-                match tryPrefix key "index:" with
-                | Some name -> Some(1, name)
-                | None ->
-                    match tryPrefix key "stats:" with
-                    | Some name -> Some(2, name)
-                    | None -> None
-
-        let rec decodeRows (rows: (byte array * SqlValue array option) array) i c =
-            if i >= rows.Length then
-                ret c
-            else
-                let key, value = rows.[i]
-
-                match value with
-                | None -> decodeRows rows (i + 1) c
-                | Some v ->
-                    match ofValue v with
-                    | None -> decodeRows rows (i + 1) c
-                    | Some bytes ->
-                        match keyKindOf key with
-                        | Some(0, name) ->
-                            match decodeTable name bytes with
-                            | Ok t -> addTable t c |> decodeRows rows (i + 1)
-                            | Error e -> err e
-                        | Some(1, name) ->
-                            match decodeIndex name bytes with
-                            | Ok idx -> addIndex idx c |> decodeRows rows (i + 1)
-                            | Error e -> err e
-                        | Some(2, name) ->
-                            match decodeStats name bytes with
-                            | Ok s -> addStats s c |> decodeRows rows (i + 1)
-                            | Error e -> err e
-                        | _ -> decodeRows rows (i + 1) c
-
         RowStore.scan Keyspace.CatalogKeyspace [||] 0 store
         >>= fun rows -> SstScan.toArray rows
-        >>= fun rows -> decodeRows (rows |> Array.map (fun e -> e.Key, e.Value)) 0 Empty
+        >>= fun rows -> decodeCatalogRows (rows |> Array.map (fun e -> e.Key, e.Value)) 0 Empty
 
 /// 出力の 1列。
 type internal OutputColumn =
@@ -919,28 +932,31 @@ module internal Schema =
 
         { Columns = cols; Tables = [ name ] }
 
+    /// 出力列が列参照に一致するか。
+    let private columnMatchesRef (r: ColumnRef) (c: OutputColumn) =
+        match r.Qualifier with
+        | Some q ->
+            SqlName.equal c.Display r.Display
+            || match c.Qualifier with
+               | Some cq -> SqlName.equal cq q && SqlName.equal c.Name r.Name
+               | None -> false
+        | None -> SqlName.equal c.Name r.Name
+
+    /// 一致する列位置を昇順に集める。
+    [<TailCall>]
+    let rec private resolveCollect (r: ColumnRef) (schema: Schema) (i: int) (acc: int list) =
+        if i >= schema.Columns.Length then
+            List.rev acc
+        elif columnMatchesRef r schema.Columns.[i] then
+            resolveCollect r schema (i + 1) (i :: acc)
+        else
+            resolveCollect r schema (i + 1) acc
+
     /// 列参照を解決する。見つからなければエラー、曖昧ならエラー。
     /// 大文字小文字を区別しない（`SqlName.equal` と同じ規則）。
     /// 行ごとに呼ばれるので、文字列の小文字化や一時配列を作らない。
     let resolve (r: ColumnRef) (schema: Schema) =
-        let isMatch (c: OutputColumn) =
-            match r.Qualifier with
-            | Some q ->
-                SqlName.equal c.Display r.Display
-                || match c.Qualifier with
-                   | Some cq -> SqlName.equal cq q && SqlName.equal c.Name r.Name
-                   | None -> false
-            | None -> SqlName.equal c.Name r.Name
-
-        let rec collect i acc =
-            if i >= schema.Columns.Length then
-                List.rev acc
-            elif isMatch schema.Columns.[i] then
-                collect (i + 1) (i :: acc)
-            else
-                collect (i + 1) acc
-
-        let hits = collect 0 []
+        let hits = resolveCollect r schema 0 []
 
         match hits with
         | [ i ] -> ret i
@@ -988,6 +1004,23 @@ module internal SelectProjection =
                         })
             | None -> [ item.Expression ])
 
+    /// 式が直接参照する出力列を返す。
+    let private referencedColumn (schema: Schema) (e: Expr) =
+        match Schema.tryAsColumnRef e with
+        | Some c ->
+            match Schema.resolve c schema with
+            | Ok i -> Some schema.Columns.[i]
+            | Error _ -> None
+        | None -> None
+
+    /// 射影後の列 1つを作る（型は直接参照からだけ引き継ぐ）。
+    let private projectedColumn (schema: Schema) (name: string) (e: Expr) =
+        {
+            Name = name
+            Qualifier = None
+            DataType = referencedColumn schema e |> Option.bind (fun c -> c.DataType)
+        }
+
     /// 射影後の列（名前・修飾子・型）を作る。
     /// `SELECT *` は入力の列名をそのまま、`t.*` は修飾つきの表示名にする（元の挙動）。
     /// `SELECT id` は式を表示し、別名があればそれを使う。
@@ -999,21 +1032,6 @@ module internal SelectProjection =
     /// `SELECT id, v AS x FROM t` や `SELECT *` のような形では型を残す。
     /// </remarks>
     let private projectedColumns (useDisplayName: bool) (schema: Schema) =
-        let referenced e =
-            match Schema.tryAsColumnRef e with
-            | Some c ->
-                match Schema.resolve c schema with
-                | Ok i -> Some schema.Columns.[i]
-                | Error _ -> None
-            | None -> None
-
-        let column name e =
-            {
-                Name = name
-                Qualifier = None
-                DataType = referenced e |> Option.bind (fun c -> c.DataType)
-            }
-
         function
         | [] -> schema.Columns
         | items ->
@@ -1030,9 +1048,14 @@ module internal SelectProjection =
                         })
                 | None ->
                     match item.Alias with
-                    | Some a -> [ column a item.Expression ]
+                    | Some a -> [ projectedColumn schema a item.Expression ]
                     | None ->
-                        match if useDisplayName then None else referenced item.Expression with
+                        match
+                            if useDisplayName then
+                                None
+                            else
+                                referencedColumn schema item.Expression
+                        with
                         | Some c ->
                             [
                                 {
@@ -1041,7 +1064,10 @@ module internal SelectProjection =
                                     DataType = c.DataType
                                 }
                             ]
-                        | None -> [ column (Expr.toDisplayString item.Expression) item.Expression ])
+                        | None ->
+                            [
+                                projectedColumn schema (Expr.toDisplayString item.Expression) item.Expression
+                            ])
             |> List.toArray
 
     /// 射影を組み立てる。

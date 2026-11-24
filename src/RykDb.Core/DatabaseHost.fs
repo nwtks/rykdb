@@ -49,6 +49,7 @@ type internal CommitDurability(sync: WalState -> Result<unit, DbError>) =
         | Some current -> later current target
         | None -> target
 
+    [<TailCall>]
     let rec awaitLoop (pos: WalState) =
         let step =
             lock gate (fun () ->
@@ -151,6 +152,48 @@ type internal CommitOutcome =
 /// - ストアを開くのも閉じるのもこの型（`OpenWithBackground` / `Close`）。
 /// - 閉じるのは所有者だけ（`SessionPool.Close` / 単独の `Session.Close`）。
 /// </remarks>
+module internal DatabaseHostHelpers =
+    /// 放棄された transaction を manager から外すループ。
+    let rec drainAbandoned
+        (abandoned: System.Collections.Concurrent.ConcurrentQueue<TxnId>)
+        (changed: bool)
+        (manager: TransactionManager)
+        =
+        match abandoned.TryDequeue() with
+        | true, txnId -> drainAbandoned abandoned true (TransactionManager.abortId txnId manager)
+        | _ -> manager, changed
+
+    /// BEGIN の本体（接続ローカルの状態を作る）。
+    let beginRun
+        (root: string)
+        (abandoned: System.Collections.Concurrent.ConcurrentQueue<TxnId>)
+        (publish: Committed -> unit)
+        (current: Committed)
+        =
+        current.Store.Runtime.WithShared(fun () ->
+            let mgr, txn = TransactionManager.beginTxn current.Manager
+            let registration = current.Store.Runtime.Register(root, txn.Snapshot.SeqNo)
+
+            match Catalog.load current.Store with
+            | Error e ->
+                current.Store.Runtime.Unregister registration
+                err e
+            | Ok fresh ->
+                let lease = RegistrationLease(registration, (fun () -> abandoned.Enqueue txn.TxnId))
+
+                let next = { current with Manager = mgr }
+                publish next
+
+                let nextLocal: TxnState =
+                    {
+                        CatalogAtBegin = fresh
+                        Active = Some txn
+                        Pending = None
+                        Lease = Some lease
+                    }
+
+                ret (next, (nextLocal, StatementResult.Empty)))
+
 type internal DatabaseHost(root: string, state: Committed, ?commitDurability: CommitDurability) =
     // ライフサイクル（確定状態と Close 状態）を保護する短いロック。
     let stateGate = obj ()
@@ -198,12 +241,7 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
     /// `abortId` は冪等で、既に commit / abort 済みの TxnId は無視される。
     /// </remarks>
     let reclaimAbandoned (current: Committed) =
-        let rec drain changed manager =
-            match abandoned.TryDequeue() with
-            | true, txnId -> drain true (TransactionManager.abortId txnId manager)
-            | _ -> manager, changed
-
-        match drain false current.Manager with
+        match DatabaseHostHelpers.drainAbandoned abandoned false current.Manager with
         | manager, true ->
             let next = { current with Manager = manager }
             publish next
@@ -347,32 +385,8 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
         if TxnState.inTransaction local then
             ret local
         else
-            let run (current: Committed) =
-                current.Store.Runtime.WithShared(fun () ->
-                    let mgr, txn = TransactionManager.beginTxn current.Manager
-                    let registration = current.Store.Runtime.Register(root, txn.Snapshot.SeqNo)
-
-                    match Catalog.load current.Store with
-                    | Error e ->
-                        current.Store.Runtime.Unregister registration
-                        err e
-                    | Ok fresh ->
-                        let lease = RegistrationLease(registration, (fun () -> abandoned.Enqueue txn.TxnId))
-
-                        let next = { current with Manager = mgr }
-                        publish next
-
-                        let nextLocal: TxnState =
-                            {
-                                CatalogAtBegin = fresh
-                                Active = Some txn
-                                Pending = None
-                                Lease = Some lease
-                            }
-
-                        ret (next, (nextLocal, StatementResult.Empty)))
-
-            serialized run |> Result.map (fun ((nextLocal, _), _) -> nextLocal)
+            serialized (DatabaseHostHelpers.beginRun root abandoned publish)
+            |> Result.map (fun ((nextLocal, _), _) -> nextLocal)
 
     /// COMMIT。接続の transaction を共有の Manager で確定する。
     /// <remarks>

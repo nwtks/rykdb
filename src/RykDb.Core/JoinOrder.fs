@@ -67,7 +67,7 @@ module internal JoinOrder =
         }
 
     /// 右テーブルを索引で引ける結合辺のうち、最も選択性の高い索引を選ぶ。
-    /// 結合キー全体が 1 つの索引の prefix に収まる場合だけ INL にする
+    /// 結合キー全体が 1つの索引の prefix に収まる場合だけ INL にする
     /// （実行時の `coversAll` / prefix NDV 最小の索引選択と同じ条件）。
     let private bestIndexFor (item: JoinOrderItem) (applicable: JoinOrderEdge list) =
         let keyColumns =
@@ -111,7 +111,7 @@ module internal JoinOrder =
         |> List.filter (fun e -> Set.contains name e.Refs && not (Set.isEmpty (Set.intersect e.Refs joined)))
 
     /// テーブルを 1つ追加した後の中間行数。
-    /// 選択性が分からない辺は 0.1 を使う。0 行の入力は 0 のまま返す。
+    /// 選択性が分からない辺は 0.1 を使う。0行の入力は 0 のまま返す。
     let private nextRows (edges: JoinOrderEdge list) (joined: Set<string>) (joinedRows: float) (item: JoinOrderItem) =
         let applicable = applicableEdges edges joined item.Name
 
@@ -124,6 +124,36 @@ module internal JoinOrder =
 
             if product <= 0.0 then 0.0 else max 1.0 product
 
+    /// 貪欲法で結合順を選ぶ再帰ループ。
+    [<TailCall>]
+    let rec private greedyGo
+        (dependencies: Map<string, Set<string>>)
+        (edges: JoinOrderEdge list)
+        (joinedRows: float)
+        (joined: Set<string>)
+        (remaining: JoinOrderItem list)
+        (acc: string list)
+        =
+        match remaining with
+        | [] -> List.rev acc
+        | _ ->
+            let ready =
+                remaining |> List.filter (fun item -> eligible dependencies joined item.Name)
+
+            let pool = if List.isEmpty ready then remaining else ready
+
+            let item =
+                pool
+                |> List.minBy (fun item -> nextRows edges joined joinedRows item, item.Position)
+
+            greedyGo
+                dependencies
+                edges
+                (nextRows edges joined joinedRows item)
+                (Set.add item.Name joined)
+                (remaining |> List.filter (fun x -> x.Name <> item.Name))
+                (item.Name :: acc)
+
     /// 現行の貪欲法。先頭テーブルと LEFT の境界は呼び出し側が固定する。
     /// A/B・診断用に内部へ公開する。
     let greedy
@@ -133,54 +163,43 @@ module internal JoinOrder =
         (items: JoinOrderItem list)
         (dependencies: Map<string, Set<string>>)
         =
-        let rec go joinedRows joined remaining acc =
-            match remaining with
-            | [] -> List.rev acc
-            | _ ->
-                let ready =
-                    remaining |> List.filter (fun item -> eligible dependencies joined item.Name)
+        greedyGo dependencies edges initialRows initialJoined items []
 
-                let pool = if List.isEmpty ready then remaining else ready
+    /// 右の自然順と結合辺を照合して出力順を組み立てる。
+    [<TailCall>]
+    let rec private mergeKeyOrderLoop
+        (left: string list)
+        (right: string list)
+        (item: JoinOrderItem)
+        (applicable: JoinOrderEdge list)
+        (i: int)
+        (acc: string list)
+        =
+        if i >= List.length right then
+            Some(List.rev acc)
+        else
+            let rightColumn = right.[i]
 
-                let item =
-                    pool
-                    |> List.minBy (fun item -> nextRows edges joined joinedRows item, item.Position)
-
-                go
-                    (nextRows edges joined joinedRows item)
-                    (Set.add item.Name joined)
-                    (remaining |> List.filter (fun x -> x.Name <> item.Name))
-                    (item.Name :: acc)
-
-        go initialRows initialJoined items []
+            match
+                applicable
+                |> List.tryFind (fun e -> e.KeyColumns |> Map.tryFind item.Name = Some rightColumn)
+            with
+            | None -> if i > 0 then Some(List.rev acc) else None
+            | Some edge ->
+                if
+                    i < List.length left
+                    && edge.KeyColumns
+                       |> Map.exists (fun name column -> name <> item.Name && SqlName.equal column left.[i])
+                then
+                    mergeKeyOrderLoop left right item applicable (i + 1) (left.[i] :: acc)
+                else
+                    None
 
     /// 両側の自然順が結合キーで揃っているときの、結合後の出力順。
     /// 右の走査順の先頭から、結合辺がある限り一致した列名を返す。
     let private mergeKeyOrder (ordered: string list option) (item: JoinOrderItem) (applicable: JoinOrderEdge list) =
         match ordered, item.NaturalOrder with
-        | Some left, Some right ->
-            let rec loop i acc =
-                if i >= List.length right then
-                    Some(List.rev acc)
-                else
-                    let rightColumn = right.[i]
-
-                    match
-                        applicable
-                        |> List.tryFind (fun e -> e.KeyColumns |> Map.tryFind item.Name = Some rightColumn)
-                    with
-                    | None -> if i > 0 then Some(List.rev acc) else None
-                    | Some edge ->
-                        if
-                            i < List.length left
-                            && edge.KeyColumns
-                               |> Map.exists (fun name column -> name <> item.Name && SqlName.equal column left.[i])
-                        then
-                            loop (i + 1) (left.[i] :: acc)
-                        else
-                            None
-
-            loop 0 []
+        | Some left, Some right -> mergeKeyOrderLoop left right item applicable 0 []
         | _ -> None
 
     /// 1テーブル追加時の (コスト, 結合後の出力順) の候補。
@@ -237,15 +256,16 @@ module internal JoinOrder =
 
             [ (hashDelta, None) ] @ Option.toList mergeVariant @ Option.toList inlVariant
 
+    /// 状態の順序を FROM 内の位置列へ変換する。
+    let private positions (items: JoinOrderItem array) (state: PlanState) =
+        state.Order |> List.map (fun i -> items.[i].Position)
+
     /// 同じ出力順の状態として候補を採用するか。
     /// コストが同じなら FROM の位置順（辞書式）で決める。
     let private isBetter (items: JoinOrderItem array) (candidate: PlanState) (current: PlanState option) =
-        let positions state =
-            state.Order |> List.map (fun i -> items.[i].Position)
-
         match current with
         | None -> true
-        | Some old -> (candidate.Cost, positions candidate) < (old.Cost, positions old)
+        | Some old -> (candidate.Cost, positions items candidate) < (old.Cost, positions items old)
 
     /// 出力順の同一性（列名の大文字小文字は区別しない）。
     let private sameOrder (a: string list option) (b: string list option) =
@@ -278,6 +298,16 @@ module internal JoinOrder =
         |> List.sortBy (fun s -> s.Cost)
         |> List.truncate maxOrders
 
+    /// mask に含まれるテーブル名と初期集合の和集合を返す。
+    let private joinedOf (itemArray: JoinOrderItem array) (initialJoined: Set<string>) (mask: int) =
+        let names =
+            itemArray
+            |> Array.indexed
+            |> Array.choose (fun (i, item) -> if mask &&& (1 <<< i) <> 0 then Some item.Name else None)
+            |> Array.toList
+
+        Set.union initialJoined (Set.ofList names)
+
     /// 初期状態から部分集合ごとの状態リストを埋める（左深 DP の本体）。
     let private dpCore
         (itemArray: JoinOrderItem array)
@@ -291,22 +321,13 @@ module internal JoinOrder =
         let fullMask = (1 <<< itemArray.Length) - 1
         let maxOrdersPerMask = 8
 
-        let joinedOf mask =
-            let names =
-                itemArray
-                |> Array.indexed
-                |> Array.choose (fun (i, item) -> if mask &&& (1 <<< i) <> 0 then Some item.Name else None)
-                |> Array.toList
-
-            Set.union initialJoined (Set.ofList names)
-
         seq { 0..fullMask }
         |> Seq.fold
             (fun states mask ->
                 match states |> Map.tryFind mask with
                 | None -> states
                 | Some stateList ->
-                    let joined = joinedOf mask
+                    let joined = joinedOf itemArray initialJoined mask
 
                     stateList
                     |> List.fold
@@ -373,6 +394,76 @@ module internal JoinOrder =
         >> Array.choose (fun (i, item) -> if mask &&& (1 <<< i) <> 0 then Some item.Name else None)
         >> Set.ofArray
 
+    /// 全開始点から mask の最良状態を選ぶ。
+    let private bestOf (perFirst: (int * Map<int, PlanState list>) array) (mask: int) =
+        perFirst
+        |> Array.choose (fun (_, states) -> bestState mask states |> Option.map (fun s -> s.Cost, s))
+        |> Array.sortBy fst
+        |> Array.tryHead
+
+    /// mask 内のテーブルが依存をすべて満たしているか。
+    let private dependencyClosed (itemArray: JoinOrderItem array) (dependencies: Map<string, Set<string>>) (mask: int) =
+        let names = namesOf mask itemArray
+
+        itemArray
+        |> Array.indexed
+        |> Array.forall (fun (i, item) ->
+            if mask &&& (1 <<< i) <> 0 then
+                match dependencies |> Map.tryFind item.Name with
+                | None -> true
+                | Some refs -> Set.isSubset refs names
+            else
+                true)
+
+    /// 左右の部分木を結合したときの追加コストと行数を返す。
+    let private splitCost
+        (edges: JoinOrderEdge list)
+        (workMemBytes: float)
+        (leftNames: Set<string>)
+        (rightNames: Set<string>)
+        (lRows: float)
+        (lRowBytes: float)
+        (rRows: float)
+        (rRowBytes: float)
+        =
+        let crossing =
+            edges
+            |> List.filter (fun e ->
+                not (Set.isEmpty (Set.intersect e.Refs leftNames))
+                && not (Set.isEmpty (Set.intersect e.Refs rightNames))
+                && Set.isSubset e.Refs (Set.union leftNames rightNames))
+
+        if List.isEmpty crossing then
+            None
+        else
+            let selectivity =
+                crossing
+                |> List.fold (fun acc e -> acc * (e.Selectivity |> Option.defaultValue 0.1)) 1.0
+
+            let newRows =
+                if lRows * rRows * selectivity <= 0.0 then
+                    0.0
+                else
+                    max 1.0 (lRows * rRows * selectivity)
+
+            if crossing |> List.forall (fun e -> Map.isEmpty e.KeyColumns) then
+                Some(lRows * rRows + newRows, newRows)
+            else
+                let buildRows = min lRows rRows
+                let buildRowBytes = if lRows < rRows then lRowBytes else rRowBytes
+                let spilled = Analyzer.spilledBuildRows buildRows buildRowBytes workMemBytes
+
+                let spillPenalty =
+                    if spilled <= 0.0 then
+                        0.0
+                    else
+                        spilled * 2.0 + float Spill.Partitions * 8.0
+
+                let hashDelta =
+                    buildRows + max lRows rRows + newRows + 0.1 * buildRows + spillPenalty
+
+                Some(hashDelta, newRows)
+
     /// bushy 計画（1段の分割。両側は左深）。
     /// 適用できないときは None。
     let bushyPlan
@@ -413,79 +504,32 @@ module internal JoinOrder =
 
                     f, dpCore itemArray edges dependencies workMemBytes (Set.singleton item.Name) (1 <<< f) initial)
 
-            let bestOf mask =
-                perFirst
-                |> Array.choose (fun (_, states) -> bestState mask states |> Option.map (fun s -> s.Cost, s))
-                |> Array.sortBy fst
-                |> Array.tryHead
-
-            let dependencyClosed mask =
-                let names = namesOf mask itemArray
-
-                itemArray
-                |> Array.indexed
-                |> Array.forall (fun (i, item) ->
-                    if mask &&& (1 <<< i) <> 0 then
-                        match dependencies |> Map.tryFind item.Name with
-                        | None -> true
-                        | Some refs -> Set.isSubset refs names
-                    else
-                        true)
-
-            let splitCost leftNames rightNames lRows lRowBytes rRows rRowBytes =
-                let crossing =
-                    edges
-                    |> List.filter (fun e ->
-                        not (Set.isEmpty (Set.intersect e.Refs leftNames))
-                        && not (Set.isEmpty (Set.intersect e.Refs rightNames))
-                        && Set.isSubset e.Refs (Set.union leftNames rightNames))
-
-                if List.isEmpty crossing then
-                    None
-                else
-                    let selectivity =
-                        crossing
-                        |> List.fold (fun acc e -> acc * (e.Selectivity |> Option.defaultValue 0.1)) 1.0
-
-                    let newRows =
-                        if lRows * rRows * selectivity <= 0.0 then
-                            0.0
-                        else
-                            max 1.0 (lRows * rRows * selectivity)
-
-                    if crossing |> List.forall (fun e -> Map.isEmpty e.KeyColumns) then
-                        Some(lRows * rRows + newRows, newRows)
-                    else
-                        let buildRows = min lRows rRows
-                        let buildRowBytes = if lRows < rRows then lRowBytes else rRowBytes
-                        let spilled = Analyzer.spilledBuildRows buildRows buildRowBytes workMemBytes
-
-                        let spillPenalty =
-                            if spilled <= 0.0 then
-                                0.0
-                            else
-                                spilled * 2.0 + float Spill.Partitions * 8.0
-
-                        let hashDelta =
-                            buildRows + max lRows rRows + newRows + 0.1 * buildRows + spillPenalty
-
-                        Some(hashDelta, newRows)
-
             let splits =
                 seq { 1 .. full - 1 }
                 |> Seq.filter (fun l -> l < full ^^^ l)
                 |> Seq.choose (fun l ->
                     let r = full ^^^ l
 
-                    if not (dependencyClosed l) || not (dependencyClosed r) then
+                    if
+                        not (dependencyClosed itemArray dependencies l)
+                        || not (dependencyClosed itemArray dependencies r)
+                    then
                         None
                     else
-                        match bestOf l, bestOf r with
+                        match bestOf perFirst l, bestOf perFirst r with
                         | Some(lCost, lState), Some(rCost, rState) ->
                             let leftNames = namesOf l itemArray
                             let rightNames = namesOf r itemArray
 
-                            splitCost leftNames rightNames lState.Rows lState.RowBytes rState.Rows rState.RowBytes
+                            splitCost
+                                edges
+                                workMemBytes
+                                leftNames
+                                rightNames
+                                lState.Rows
+                                lState.RowBytes
+                                rState.Rows
+                                rState.RowBytes
                             |> Option.map (fun (joinDelta, _) -> lCost + rCost + joinDelta, lState, rState)
                         | _ -> None)
                 |> Seq.sortBy (fun (cost, _, _) -> cost)
@@ -493,12 +537,14 @@ module internal JoinOrder =
 
             match splits with
             | Some(splitCostValue, lState, rState) ->
-                match bestOf full with
+                match bestOf perFirst full with
                 | Some(leftDeepCost, leftDeepState) when leftDeepCost <= splitCostValue ->
                     Some(treeOfOrder itemArray leftDeepState.Order)
                 | _ ->
                     Some(JoinOrderTree.Branch(treeOfOrder itemArray lState.Order, treeOfOrder itemArray rState.Order))
-            | None -> bestOf full |> Option.map (fun (_, state) -> treeOfOrder itemArray state.Order)
+            | None ->
+                bestOf perFirst full
+                |> Option.map (fun (_, state) -> treeOfOrder itemArray state.Order)
 
     /// Selinger DP（左深・先頭固定）。
     /// 適用できないときは None（呼び出し側が貪欲へフォールバックする）。

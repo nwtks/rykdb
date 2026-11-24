@@ -93,6 +93,51 @@ let private sendRows (writer: System.IO.StreamWriter) (columns: string array) (r
     with _ ->
         false
 
+/// 1行を書き出して flush する。送信成否を返し、失敗時は接続を閉じる。
+let private sendLine (writer: System.IO.StreamWriter) (line: string) =
+    try
+        writer.WriteLine line
+        writer.Flush()
+        true
+    with _ ->
+        false
+
+/// StatementResult を OK 応答として送る（列があれば行ごとに書き出す）。
+let private sendStatementResult (writer: System.IO.StreamWriter) (result: StatementResult) =
+    if Array.isEmpty result.Columns then
+        sprintf "%s %d" OkTag result.RowsAffected |> sendLine writer
+    else
+        sendRows writer result.Columns result.Rows
+
+/// STREAM のデータ行を END まで送る（末尾再帰）。
+[<TailCall>]
+let rec private streamRows (writer: System.IO.StreamWriter) (rowReader: RowReader) =
+    match rowReader.TryRead() with
+    | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> sendLine writer
+    | Ok None -> sendLine writer EndTag
+    | Ok(Some row) ->
+        if sendLine writer (rowLine (LoadedRow.toArray row)) then
+            streamRows writer rowReader
+        else
+            false
+
+/// `.stream` 要求を処理し、SELECT を materialize せず STREAM で返す。
+let private sendStream (writer: System.IO.StreamWriter) (session: Session) (sql: string) =
+    match session.TryOpenReader sql with
+    | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> sendLine writer
+    | Ok None ->
+        match session.Execute sql with
+        | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> sendLine writer
+        | Ok result -> sendStatementResult writer result
+    | Ok(Some rowReader) ->
+        use _ = rowReader
+        let header = sprintf "%s%s" StreamTag (columnsSuffix rowReader.Columns)
+
+        if not (sendLine writer header) then
+            false
+        else
+            streamRows writer rowReader
+
 let private handleClientSession (onLog: string -> unit) (session: Session) (client: System.Net.Sockets.TcpClient) =
     use stream = client.GetStream()
 
@@ -103,46 +148,6 @@ let private handleClientSession (onLog: string -> unit) (session: Session) (clie
         new System.IO.StreamWriter(stream, System.Text.Encoding.UTF8, 1024, true)
 
     writer.AutoFlush <- true
-
-    let send (line: string) =
-        try
-            writer.WriteLine line
-            writer.Flush()
-            true
-        with _ ->
-            false
-
-    let sendResult (result: StatementResult) =
-        if Array.isEmpty result.Columns then
-            sprintf "%s %d" OkTag result.RowsAffected |> send
-        else
-            sendRows writer result.Columns result.Rows
-
-    let sendStream sql =
-        match session.TryOpenReader sql with
-        | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
-        | Ok None ->
-            match session.Execute sql with
-            | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
-            | Ok result -> sendResult result
-        | Ok(Some rowReader) ->
-            use _ = rowReader
-            let header = sprintf "%s%s" StreamTag (columnsSuffix rowReader.Columns)
-
-            if not (send header) then
-                false
-            else
-                let rec loop () =
-                    match rowReader.TryRead() with
-                    | Error e -> sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
-                    | Ok None -> send EndTag
-                    | Ok(Some row) ->
-                        if send (rowLine (LoadedRow.toArray row)) then
-                            loop ()
-                        else
-                            false
-
-                loop ()
 
     let mutable running = true
 
@@ -155,30 +160,30 @@ let private handleClientSession (onLog: string -> unit) (session: Session) (clie
             let sql = line.Trim()
 
             if sql.Length = 0 then
-                running <- sprintf "%s 0" OkTag |> send
+                running <- sprintf "%s 0" OkTag |> sendLine writer
             else
                 match sql with
                 | ".exit"
                 | ".quit" ->
-                    send HaltTag |> ignore
+                    sendLine writer HaltTag |> ignore
                     running <- false
-                | ".ping" -> running <- sprintf "%s 0\tpong" OkTag |> send
+                | ".ping" -> running <- sprintf "%s 0\tpong" OkTag |> sendLine writer
                 | ".tables" ->
                     match session.TableNames() with
-                    | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
+                    | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> sendLine writer
                     | Ok names ->
                         if List.isEmpty names then
-                            running <- send (sprintf "%s 0" OkTag)
+                            running <- sendLine writer (sprintf "%s 0" OkTag)
                         else
                             let rows = names |> List.map (fun n -> [| SqlValue.Text n |]) |> List.toArray
                             running <- sendRows writer [| "tables" |] rows
-                | ".stream" -> running <- sprintf "%s .stream には SQL が必要です" ErrTag |> send
+                | ".stream" -> running <- sprintf "%s .stream には SQL が必要です" ErrTag |> sendLine writer
                 | _ when sql.StartsWith(".stream ", System.StringComparison.Ordinal) ->
-                    running <- sendStream (sql.Substring(".stream ".Length).Trim())
+                    running <- sendStream writer session (sql.Substring(".stream ".Length).Trim())
                 | _ ->
                     match session.Execute sql with
-                    | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> send
-                    | Ok result -> running <- sendResult result
+                    | Error e -> running <- sprintf "%s %s" ErrTag (DbError.toDisplayString e) |> sendLine writer
+                    | Ok result -> running <- sendStatementResult writer result
 
     if session.InTransaction then
         match session.Rollback() with
@@ -202,6 +207,31 @@ let private handleClient (onLog: string -> unit) (pool: SessionPool) (client: Sy
             | Ok() -> ()
             | Error e -> sprintf "接続の後始末に失敗しました: %s" (DbError.toDisplayString e) |> onLog
 
+/// 1接続の処理と後始末を行い、接続台帳から登録を解除する。
+let private handleConnection
+    (onLog: string -> unit)
+    (pool: SessionPool)
+    (clients: System.Collections.Concurrent.ConcurrentDictionary<int, System.Net.Sockets.TcpClient>)
+    (handlers: System.Collections.Concurrent.ConcurrentDictionary<int, System.Threading.Tasks.Task>)
+    (clientId: int)
+    (client: System.Net.Sockets.TcpClient)
+    =
+    try
+        handleClient (fun m -> sprintf "[%d] %s" clientId m |> onLog) pool client
+    with ex ->
+        sprintf "[%d] 例外: %s" clientId ex.Message |> onLog
+
+    try
+        if client.Client.Connected then
+            client.Client.Shutdown System.Net.Sockets.SocketShutdown.Send
+    with _ ->
+        ()
+
+    client.Close()
+    clients.TryRemove clientId |> ignore
+    handlers.TryRemove clientId |> ignore
+    sprintf "[%d] 切断されました" clientId |> onLog
+
 let serve
     (pool: SessionPool)
     (listener: System.Net.Sockets.TcpListener)
@@ -221,23 +251,6 @@ let serve
     let handlers =
         System.Collections.Concurrent.ConcurrentDictionary<int, System.Threading.Tasks.Task>()
 
-    let handleConnection clientId client =
-        try
-            handleClient (fun m -> sprintf "[%d] %s" clientId m |> onLog) pool client
-        with ex ->
-            sprintf "[%d] 例外: %s" clientId ex.Message |> onLog
-
-        try
-            if client.Client.Connected then
-                client.Client.Shutdown System.Net.Sockets.SocketShutdown.Send
-        with _ ->
-            ()
-
-        client.Close()
-        clients.TryRemove clientId |> ignore
-        handlers.TryRemove clientId |> ignore
-        sprintf "[%d] 切断されました" clientId |> onLog
-
     let mutable clientId = 0
     let idGate = obj ()
 
@@ -253,7 +266,9 @@ let serve
 
             clients.[cid] <- client
             sprintf "[%d] 接続されました" cid |> onLog
-            handlers.[cid] <- System.Threading.Tasks.Task.Run(fun () -> handleConnection cid client)
+
+            handlers.[cid] <-
+                System.Threading.Tasks.Task.Run(fun () -> handleConnection onLog pool clients handlers cid client)
         with
         | :? System.ObjectDisposedException -> ()
         | :? System.InvalidOperationException when stop.IsCancellationRequested -> ()

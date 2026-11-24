@@ -111,14 +111,15 @@ module internal Entry =
              |> Writer.varint (uint64 entries.Length))
         |> Result.map Writer.toArray
 
-    let decodeBatch (data: byte array) =
-        let readOne c =
-            result {
-                let! bs, c1 = Reader.readLengthPrefixed c
-                let! e = decodeEntry bs
-                return e, c1
-            }
+    /// 長さ付きの 1エントリを読んで、エントリと後続カーソルを返す。
+    let private readOne (c: Cursor) =
+        result {
+            let! bs, c1 = Reader.readLengthPrefixed c
+            let! e = decodeEntry bs
+            return e, c1
+        }
 
+    let decodeBatch (data: byte array) =
         result {
             let c = Cursor.create data
             let! rawTxnId, c = Reader.readUint64BE c
@@ -161,76 +162,86 @@ module internal Memtable =
             ApproxBytes = 0
         }
 
+    /// 探索スタックを巻き戻し、左右の部分木を組み直す。
+    [<TailCall>]
+    let rec private unwind (left: TNode option) (right: TNode option) (stack: TNode list) (target: Entry) =
+        match stack with
+        | [] -> left, right
+        | r :: rest ->
+            if Entry.compareKeys r.Entry target < 0 then
+                unwind (Some { r with Right = left }) right rest target
+            else
+                unwind left (Some { r with Left = right }) rest target
+
+    /// 挿入位置へ向かって下降し、経路をスタックに積む。
+    [<TailCall>]
+    let rec private down (node: TNode option) (stack: TNode list) (target: Entry) =
+        match node with
+        | None -> unwind None None stack target
+        | Some r ->
+            if Entry.compareKeys r.Entry target < 0 then
+                down r.Right (r :: stack) target
+            else
+                down r.Left (r :: stack) target
+
+    /// 根から挿入位置までの経路を分ける。
+    let private split (root: TNode option) (target: Entry) = down root [] target
+
+    /// スタックを積み直して部分木を再構築する。
+    [<TailCall>]
+    let rec private rebuild (stack: (TNode * bool) list) (node: TNode option) =
+        match stack with
+        | [] -> node
+        | (r, wentLeft) :: rest ->
+            let rebuilt =
+                if wentLeft then
+                    Some { r with Left = node }
+                else
+                    Some { r with Right = node }
+
+            rebuild rest rebuilt
+
+    /// 優先度に従って挿入位置を探し、ノードを組み込む。
+    [<TailCall>]
+    let rec private descend (e: Entry) (p: uint64) (stack: (TNode * bool) list) =
+        function
+        | None ->
+            Some
+                {
+                    Entry = e
+                    Priority = p
+                    Left = None
+                    Right = None
+                }
+            |> rebuild stack
+        | Some r ->
+            if p > r.Priority then
+                let left, right = split (Some r) e
+
+                Some
+                    {
+                        Entry = e
+                        Priority = p
+                        Left = left
+                        Right = right
+                    }
+                |> rebuild stack
+            else if Entry.compareKeys e r.Entry < 0 then
+                descend e p ((r, true) :: stack) r.Left
+            else
+                descend e p ((r, false) :: stack) r.Right
+
+    /// 新しいノードを根から挿入する。
+    let private insertNode (e: Entry) (root: TNode option) =
+        let p = Entry.priority e
+        descend e p [] root
+
     /// 1エントリを挿入する。
     /// <remarks>
     /// 保持する側なので `Entry.takeOwnership` でキーと行を複製する
     /// （呼び出し側が後から配列を書き換えても木が壊れないようにする）。
     /// </remarks>
     let insert (given: Entry) (mem: Memtable) =
-        let rec unwind left right stack target =
-            match stack with
-            | [] -> left, right
-            | r :: rest ->
-                if Entry.compareKeys r.Entry target < 0 then
-                    unwind (Some { r with Right = left }) right rest target
-                else
-                    unwind left (Some { r with Left = right }) rest target
-
-        let rec down node stack target =
-            match node with
-            | None -> unwind None None stack target
-            | Some r ->
-                if Entry.compareKeys r.Entry target < 0 then
-                    down r.Right (r :: stack) target
-                else
-                    down r.Left (r :: stack) target
-
-        let split root target = down root [] target
-
-        let rec rebuild stack node =
-            match stack with
-            | [] -> node
-            | (r, wentLeft) :: rest ->
-                let rebuilt =
-                    if wentLeft then
-                        Some { r with Left = node }
-                    else
-                        Some { r with Right = node }
-
-                rebuild rest rebuilt
-
-        let rec descend e p stack =
-            function
-            | None ->
-                Some
-                    {
-                        Entry = e
-                        Priority = p
-                        Left = None
-                        Right = None
-                    }
-                |> rebuild stack
-            | Some r ->
-                if p > r.Priority then
-                    let left, right = split (Some r) e
-
-                    Some
-                        {
-                            Entry = e
-                            Priority = p
-                            Left = left
-                            Right = right
-                        }
-                    |> rebuild stack
-                else if Entry.compareKeys e r.Entry < 0 then
-                    descend e p ((r, true) :: stack) r.Left
-                else
-                    descend e p ((r, false) :: stack) r.Right
-
-        let insertNode e root =
-            let p = Entry.priority e
-            descend e p [] root
-
         let e = Entry.takeOwnership given
 
         {
@@ -243,6 +254,23 @@ module internal Memtable =
     let apply (entries: Entry seq) (mem: Memtable) =
         Seq.fold (fun mem e -> insert e mem) mem entries
 
+    /// キーと SeqNo の上限から、可視な最小ノードを探す。
+    [<TailCall>]
+    let rec private ceiling (key: byte array) (bound: uint64) (best: TNode option) =
+        function
+        | None -> best
+        | Some r ->
+            let c = Bytes.compare r.Entry.Key key
+
+            if c > 0 then
+                ceiling key bound (Some r) r.Left
+            elif c < 0 then
+                ceiling key bound best r.Right
+            else if r.Entry.SeqNo <= bound then
+                ceiling key bound (Some r) r.Left
+            else
+                ceiling key bound best r.Right
+
     /// キーの最新バージョン（SeqNo が最大のもの）を返す。
     /// 同一キーの版は SeqNo 降順に並ぶので、最初に拾ったものが最新。
     /// ポイントルックアップ（MVCC の可視性つき）。
@@ -253,27 +281,12 @@ module internal Memtable =
     /// 見つかったノードのキーが一致すれば、その版が可視な最新版である（探索は対数時間）。
     /// </remarks>
     let getVisible (key: byte array) (visible: uint64 option) (mem: Memtable) =
-        let rec ceiling bound best =
-            function
-            | None -> best
-            | Some r ->
-                let c = Bytes.compare r.Entry.Key key
-
-                if c > 0 then
-                    ceiling bound (Some r) r.Left
-                elif c < 0 then
-                    ceiling bound best r.Right
-                else if r.Entry.SeqNo <= bound then
-                    ceiling bound (Some r) r.Left
-                else
-                    ceiling bound best r.Right
-
         let bound =
             match visible with
             | Some v -> v
             | None -> System.UInt64.MaxValue
 
-        match ceiling bound None mem.Root with
+        match ceiling key bound None mem.Root with
         | Some r when Bytes.compare r.Entry.Key key = 0 -> Some r.Entry
         | _ -> None
 
@@ -285,24 +298,26 @@ module internal Memtable =
         | Visit of TNode option
         | Emit of Entry
 
+    /// 作業リストを 1段進め、次のエントリと残りの作業を返す。
+    [<TailCall>]
+    let rec private rangeScanStep (startKey: byte array) (limit: int) struct (work: Work list, count: int) =
+        match work with
+        | [] -> None
+        | _ when limit > 0 && count >= limit -> None
+        | Emit e :: rest -> Some(e, struct (rest, count + 1))
+        | Visit None :: rest -> rangeScanStep startKey limit struct (rest, count)
+        | Visit(Some r) :: rest ->
+            if Bytes.compare r.Entry.Key startKey < 0 then
+                rangeScanStep startKey limit struct (Visit r.Right :: rest, count)
+            else
+                rangeScanStep startKey limit struct (Visit r.Left :: Emit r.Entry :: Visit r.Right :: rest, count)
+
     /// startKey 以降をキー昇順（同一キーは SeqNo 降順）で遅延生成する。
     /// 状態は「作業リスト + 出した件数」だけで、結果を溜めない
     /// （余分なメモリは作業リスト＝木の高さ分・期待 O(log n)）。
     /// limit が 0 以下のときは上限なし。
     let rangeScan (startKey: byte array) (limit: int) (mem: Memtable) =
-        let rec step struct (work, count) =
-            match work with
-            | [] -> None
-            | _ when limit > 0 && count >= limit -> None
-            | Emit e :: rest -> Some(e, struct (rest, count + 1))
-            | Visit None :: rest -> step struct (rest, count)
-            | Visit(Some r) :: rest ->
-                if Bytes.compare r.Entry.Key startKey < 0 then
-                    step struct (Visit r.Right :: rest, count)
-                else
-                    step struct (Visit r.Left :: Emit r.Entry :: Visit r.Right :: rest, count)
-
-        Seq.unfold step struct ([ Visit mem.Root ], 0)
+        Seq.unfold (rangeScanStep startKey limit) struct ([ Visit mem.Root ], 0)
 
     /// エントリを 1つも持たないか。
     let isEmpty (mem: Memtable) = mem.Count = 0

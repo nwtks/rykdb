@@ -305,46 +305,50 @@ module internal ExecState =
                 }
         }
 
-    /// 走査から `size` 件までを取り出す。
-    let private takeScanChunk =
-        let rec loop acc n scan =
-            if n <= 0 then
-                ret (List.rev acc, scan)
-            else
-                match SstScan.next scan with
-                | Ok None -> ret (List.rev acc, SstScan.Empty)
-                | Ok(Some(e, rest)) -> loop (e :: acc) (n - 1) rest
-                | Error e ->
-                    SstScan.dispose scan
-                    err e
+    /// 走査から最大 n 件を取り出す（エラー時は走査を解放する）。
+    [<TailCall>]
+    let rec private takeScanChunkLoop (acc: SstEntry list) (n: int) (scan: SstScan) =
+        if n <= 0 then
+            ret (List.rev acc, scan)
+        else
+            match SstScan.next scan with
+            | Ok None -> ret (List.rev acc, SstScan.Empty)
+            | Ok(Some(e, rest)) -> takeScanChunkLoop (e :: acc) (n - 1) rest
+            | Error e ->
+                SstScan.dispose scan
+                err e
 
-        loop []
+    /// 走査から `size` 件までを取り出す。
+    let private takeScanChunk = takeScanChunkLoop []
+
+    /// Op から最大 n 行を取り出す。
+    [<TailCall>]
+    let rec private takeOpChunkLoop (acc: SqlValue array list) (n: int) (op: Op) =
+        if n <= 0 then
+            ret (List.rev acc, op)
+        else
+            match Op.next op with
+            | OpStep.OpError e -> err e
+            | OpStep.OpDone -> ret (List.rev acc, Op.Empty)
+            | OpStep.OpRow(row, rest) -> takeOpChunkLoop (row :: acc) (n - 1) rest
 
     /// Op から `size` 行までを取り出す。
-    let private takeOpChunk =
-        let rec loop acc n op =
-            if n <= 0 then
-                ret (List.rev acc, op)
-            else
-                match Op.next op with
-                | OpStep.OpError e -> err e
-                | OpStep.OpDone -> ret (List.rev acc, Op.Empty)
-                | OpStep.OpRow(row, rest) -> loop (row :: acc) (n - 1) rest
+    let private takeOpChunk = takeOpChunkLoop []
 
-        loop []
+    /// Op をチャンク単位で消費する（全件を実体化しない）。
+    [<TailCall>]
+    let rec private applyOpChunksLoop apply (op: Op) (st: ExecState) =
+        match takeOpChunk BackfillChunkRows op with
+        | Ok([], _) -> ret st
+        | Ok(chunk, rest) ->
+            match commitChunk apply chunk st with
+            | Ok st' -> applyOpChunksLoop apply rest st'
+            | Error e -> err e
+        | Error e -> err e
 
     /// Op をチャンク単位で消費する（全件を実体化しない）。
     let private applyOpChunks (apply: Transaction -> SqlValue array -> Result<Transaction, DbError>) =
-        let rec loop op st =
-            match takeOpChunk BackfillChunkRows op with
-            | Ok([], _) -> ret st
-            | Ok(chunk, rest) ->
-                match commitChunk apply chunk st with
-                | Ok st' -> loop rest st'
-                | Error e -> err e
-            | Error e -> err e
-
-        loop
+        applyOpChunksLoop apply
 
     /// keyspace の全エントリをチャンク単位で tombstone 消去する。
     /// <remarks>
@@ -354,31 +358,28 @@ module internal ExecState =
     /// 起動時の後始末は `RowStore.clearKeyspaceChunks` を使う
     /// （その時点には `ExecState` が無い）。
     /// </remarks>
-    let private clearSpaceChunksResult (space: string) (state: ExecState) =
-        let rec loop (st: ExecState) startKey =
-            match RowStore.scanKeys space startKey 0 st.Store with
-            | Ok scan ->
-                match takeScanChunk BackfillChunkRows scan with
-                | Ok(chunk, rest) ->
-                    SstScan.dispose rest
+    [<TailCall>]
+    let rec private clearSpaceChunksLoop (space: string) (st: ExecState) (startKey: byte array) =
+        match RowStore.scanKeys space startKey 0 st.Store with
+        | Ok scan ->
+            match takeScanChunk BackfillChunkRows scan with
+            | Ok(chunk, rest) ->
+                SstScan.dispose rest
 
-                    match List.tryLast chunk with
-                    | None -> ret st
-                    | Some lastEntry ->
-                        let lastKey = lastEntry.Key
+                match List.tryLast chunk with
+                | None -> ret st
+                | Some lastEntry ->
+                    let lastKey = lastEntry.Key
 
-                        match
-                            commitChunk
-                                (fun txn key -> ret (Transaction.remove space key txn))
-                                (chunk |> List.map _.Key)
-                                st
-                        with
-                        | Ok st' -> loop st' lastKey
-                        | Error e -> err e
-                | Error e -> err e
+                    match
+                        commitChunk (fun txn key -> ret (Transaction.remove space key txn)) (chunk |> List.map _.Key) st
+                    with
+                    | Ok st' -> clearSpaceChunksLoop space st' lastKey
+                    | Error e -> err e
             | Error e -> err e
+        | Error e -> err e
 
-        loop state [||]
+    let private clearSpaceChunksResult (space: string) (state: ExecState) = clearSpaceChunksLoop space state [||]
 
     /// 標本から等頻度ヒストグラムの境界を選ぶ（`buckets + 1` 個）。
     /// 値の分布が偏っていても、境界が同じ割合の行を区切るので CDF の推定がぶれにくい。
@@ -397,6 +398,194 @@ module internal ExecState =
                     for k in 0..buckets -> values.[int (System.Math.Round(float k * float last / float buckets))]
                 ]
 
+    /// 線形合同法の次の乱数（reservoir sampling 用）。
+    let private nextRandom (state: int64) =
+        state * 6364136223846793005L + 1442695040888963407L
+
+    /// 標本の件数を全体の件数へスケールする。
+    let private scaleCount (sampleSize: int64) (totalRows: int64) (n: int64) =
+        if sampleSize <= 0L then
+            n
+        else
+            (n * totalRows + sampleSize / 2L) / sampleSize
+
+    /// 2回以上現れた値を多い順に最大 mcvLimit 個返す（件数は標本→全体へスケール）。
+    let private frequentValues
+        (mcvLimit: int)
+        (totalRows: int64)
+        (sampleSize: int64)
+        (counts: System.Collections.Generic.Dictionary<string, int64>)
+        =
+        counts
+        |> Seq.filter (fun kv -> kv.Value >= 2L)
+        |> Seq.map (fun kv -> kv.Key, scaleCount sampleSize totalRows kv.Value)
+        |> Seq.sortByDescending (fun (value, rows) -> rows, value)
+        |> Seq.truncate mcvLimit
+        |> List.ofSeq
+
+    /// 標本の NULL 件数を全体の件数へスケールする（標本が空なら 0）。
+    let private scaleNulls (totalRows: int64) (sampleSize: int64) (nulls: int64) =
+        if sampleSize <= 0L then
+            0L
+        else
+            (nulls * totalRows + sampleSize / 2L) / sampleSize
+
+    /// 1行を統計の辞書へ加算する。
+    let private accumulateRow
+        (columnSets: System.Collections.Generic.Dictionary<string, int64> array)
+        (nullCounts: System.Collections.Generic.Dictionary<int, int64>)
+        (minMax: System.Collections.Generic.Dictionary<int, struct (float * float)>)
+        (numericSamples: System.Collections.Generic.Dictionary<int, float list>)
+        (numericSeen: System.Collections.Generic.Dictionary<int, int64>)
+        (numericRng: System.Collections.Generic.Dictionary<int, int64>)
+        (indexes: (IndexDefinition * int array * System.Collections.Generic.HashSet<string> array) list)
+        (histogramSamples: int)
+        (row: SqlValue array)
+        =
+        row
+        |> Array.iteri (fun i value ->
+            if i < columnSets.Length then
+                if SqlValue.isNull value then
+                    let current =
+                        match nullCounts.TryGetValue i with
+                        | true, n -> n
+                        | _ -> 0L
+
+                    nullCounts.[i] <- current + 1L
+                else
+                    let key = SqlLiteral.toSqlLiteral value
+
+                    match columnSets.[i].TryGetValue key with
+                    | true, n -> columnSets.[i].[key] <- n + 1L
+                    | _ -> columnSets.[i].[key] <- 1L
+
+                    match SqlValue.asNumeric value with
+                    | Some d ->
+                        let v = float d
+
+                        match minMax.TryGetValue i with
+                        | true, struct (lo, hi) -> minMax.[i] <- struct (min lo v, max hi v)
+                        | _ -> minMax.[i] <- struct (v, v)
+
+                        let seen =
+                            match numericSeen.TryGetValue i with
+                            | true, n -> n + 1L
+                            | _ -> 1L
+
+                        numericSeen.[i] <- seen
+
+                        let samples =
+                            match numericSamples.TryGetValue i with
+                            | true, xs -> xs
+                            | _ -> []
+
+                        if List.length samples < histogramSamples then
+                            numericSamples.[i] <- v :: samples
+                        else
+                            let rng =
+                                match numericRng.TryGetValue i with
+                                | true, s -> s
+                                | _ -> 1L
+
+                            let rng = nextRandom rng
+                            numericRng.[i] <- rng
+                            let j = int ((rng >>> 1) % seen)
+
+                            if j < histogramSamples then
+                                numericSamples.[i] <-
+                                    samples |> List.mapi (fun k current -> if k = j then v else current)
+                    | None -> ())
+
+        for _, positions, sets in indexes do
+            positions
+            |> Array.fold
+                (fun (key, k) pos ->
+                    if pos < row.Length then
+                        let part = SqlLiteral.toSqlLiteral row.[pos]
+                        let key = key + string part.Length + ":" + part
+                        sets.[k].Add key |> ignore
+
+                    key, k + 1)
+                ("", 0)
+            |> ignore
+
+    /// 走査を全件消費して統計を加算する（末尾再帰）。
+    [<TailCall>]
+    let rec private consumeScan
+        (cancel: System.Threading.CancellationToken)
+        (progress: (string * int64 -> unit) option)
+        (tableName: string)
+        (accumulate: SqlValue array -> unit)
+        (totalBytes: float)
+        (count: int64)
+        (scan: SstScan)
+        =
+        if count % 8192L = 0L && cancel.IsCancellationRequested then
+            SstScan.dispose scan
+            err (DbError.capacity "ANALYZE はキャンセルされました")
+        else
+            if count % 8192L = 0L then
+                progress |> Option.iter (fun report -> report (tableName, count))
+
+            match SstScan.next scan with
+            | Error e ->
+                SstScan.dispose scan
+                err e
+            | Ok None -> ret (count, totalBytes)
+            | Ok(Some(entry, rest)) ->
+                entry.Value |> Option.iter accumulate
+
+                let totalBytes =
+                    match entry.Value with
+                    | Some row -> totalBytes + float (ValueCodec.managedRowBytes row)
+                    | None -> totalBytes
+
+                consumeScan cancel progress tableName accumulate totalBytes (count + 1L) rest
+
+    /// reservoir sampling で標本を集める（末尾再帰）。
+    [<TailCall>]
+    let rec private sampleScan
+        (cancel: System.Threading.CancellationToken)
+        (progress: (string * int64 -> unit) option)
+        (tableName: string)
+        (n: int)
+        (count: int64)
+        (samples: SqlValue array list)
+        (sampleCount: int)
+        (rng: int64)
+        (scan: SstScan)
+        =
+        if count % 8192L = 0L && cancel.IsCancellationRequested then
+            SstScan.dispose scan
+            err (DbError.capacity "ANALYZE はキャンセルされました")
+        else
+            if count % 8192L = 0L then
+                progress |> Option.iter (fun report -> report (tableName, count))
+
+            match SstScan.next scan with
+            | Error e ->
+                SstScan.dispose scan
+                err e
+            | Ok None -> ret (count, samples, sampleCount)
+            | Ok(Some(entry, rest)) ->
+                match entry.Value with
+                | None -> sampleScan cancel progress tableName n count samples sampleCount rng rest
+                | Some row ->
+                    let rng = nextRandom rng
+                    let count = count + 1L
+
+                    if sampleCount < n then
+                        sampleScan cancel progress tableName n count (row :: samples) (sampleCount + 1) rng rest
+                    else
+                        let j = int ((rng >>> 1) % count)
+
+                        if j < n then
+                            let samples = samples |> List.mapi (fun i current -> if i = j then row else current)
+
+                            sampleScan cancel progress tableName n count samples sampleCount rng rest
+                        else
+                            sampleScan cancel progress tableName n count samples sampleCount rng rest
+
     /// テーブルの行数、列 NDV・NULL 数・数値範囲、索引 prefix NDV を収集する。
     /// `sample` が Some n なら reservoir sampling で n 行だけを標本にする。
     let private collectStats
@@ -406,84 +595,7 @@ module internal ExecState =
         (cancel: System.Threading.CancellationToken)
         (progress: (string * int64 -> unit) option)
         =
-        let nextRandom state =
-            state * 6364136223846793005L + 1442695040888963407L
-
         progress |> Option.iter (fun report -> report (defn.Name, 0L))
-
-        let rec consume accumulate totalBytes count scan =
-            if count % 8192L = 0L && cancel.IsCancellationRequested then
-                SstScan.dispose scan
-                err (DbError.capacity "ANALYZE はキャンセルされました")
-            else
-                if count % 8192L = 0L then
-                    progress |> Option.iter (fun report -> report (defn.Name, count))
-
-                match SstScan.next scan with
-                | Error e ->
-                    SstScan.dispose scan
-                    err e
-                | Ok None -> ret (count, totalBytes)
-                | Ok(Some(entry, rest)) ->
-                    entry.Value |> Option.iter accumulate
-
-                    let totalBytes =
-                        match entry.Value with
-                        | Some row -> totalBytes + float (ValueCodec.managedRowBytes row)
-                        | None -> totalBytes
-
-                    consume accumulate totalBytes (count + 1L) rest
-
-        let rec loop n count samples sampleCount rng scan =
-            if count % 8192L = 0L && cancel.IsCancellationRequested then
-                SstScan.dispose scan
-                err (DbError.capacity "ANALYZE はキャンセルされました")
-            else
-                if count % 8192L = 0L then
-                    progress |> Option.iter (fun report -> report (defn.Name, count))
-
-                match SstScan.next scan with
-                | Error e ->
-                    SstScan.dispose scan
-                    err e
-                | Ok None -> ret (count, samples, sampleCount)
-                | Ok(Some(entry, rest)) ->
-                    match entry.Value with
-                    | None -> loop n count samples sampleCount rng rest
-                    | Some row ->
-                        let rng = nextRandom rng
-                        let count = count + 1L
-
-                        if sampleCount < n then
-                            loop n count (row :: samples) (sampleCount + 1) rng rest
-                        else
-                            let j = int ((rng >>> 1) % count)
-
-                            if j < n then
-                                let samples = samples |> List.mapi (fun i current -> if i = j then row else current)
-
-                                loop n count samples sampleCount rng rest
-                            else
-                                loop n count samples sampleCount rng rest
-
-        let frequentValues
-            mcvLimit
-            totalRows
-            sampleSize
-            (counts: System.Collections.Generic.Dictionary<string, int64>)
-            =
-            let scale n =
-                if sampleSize <= 0L then
-                    n
-                else
-                    (n * totalRows + sampleSize / 2L) / sampleSize
-
-            counts
-            |> Seq.filter (fun kv -> kv.Value >= 2L)
-            |> Seq.map (fun kv -> kv.Key, scale kv.Value)
-            |> Seq.sortByDescending (fun (value, rows) -> rows, value)
-            |> Seq.truncate mcvLimit
-            |> List.ofSeq
 
         result {
             let! schema = Catalog.toSchema defn
@@ -520,84 +632,29 @@ module internal ExecState =
 
             let! scan = RowStore.scan (Keyspace.table schema.Name) [||] 0 state.Store
 
-            let accumulate row =
-                row
-                |> Array.iteri (fun i value ->
-                    if i < columnSets.Length then
-                        if SqlValue.isNull value then
-                            let current =
-                                match nullCounts.TryGetValue i with
-                                | true, n -> n
-                                | _ -> 0L
-
-                            nullCounts.[i] <- current + 1L
-                        else
-                            let key = SqlLiteral.toSqlLiteral value
-
-                            match columnSets.[i].TryGetValue key with
-                            | true, n -> columnSets.[i].[key] <- n + 1L
-                            | _ -> columnSets.[i].[key] <- 1L
-
-                            match SqlValue.asNumeric value with
-                            | Some d ->
-                                let v = float d
-
-                                match minMax.TryGetValue i with
-                                | true, struct (lo, hi) -> minMax.[i] <- struct (min lo v, max hi v)
-                                | _ -> minMax.[i] <- struct (v, v)
-
-                                let seen =
-                                    match numericSeen.TryGetValue i with
-                                    | true, n -> n + 1L
-                                    | _ -> 1L
-
-                                numericSeen.[i] <- seen
-
-                                let samples =
-                                    match numericSamples.TryGetValue i with
-                                    | true, xs -> xs
-                                    | _ -> []
-
-                                if List.length samples < histogramSamples then
-                                    numericSamples.[i] <- v :: samples
-                                else
-                                    let rng =
-                                        match numericRng.TryGetValue i with
-                                        | true, s -> s
-                                        | _ -> 1L
-
-                                    let rng = nextRandom rng
-                                    numericRng.[i] <- rng
-                                    let j = int ((rng >>> 1) % seen)
-
-                                    if j < histogramSamples then
-                                        numericSamples.[i] <-
-                                            samples |> List.mapi (fun k current -> if k = j then v else current)
-                            | None -> ())
-
-                for _, positions, sets in indexes do
-                    positions
-                    |> Array.fold
-                        (fun (key, k) pos ->
-                            if pos < row.Length then
-                                let part = SqlLiteral.toSqlLiteral row.[pos]
-                                let key = key + string part.Length + ":" + part
-                                sets.[k].Add key |> ignore
-
-                            key, k + 1)
-                        ("", 0)
-                    |> ignore
+            let accumulate =
+                accumulateRow
+                    columnSets
+                    nullCounts
+                    minMax
+                    numericSamples
+                    numericSeen
+                    numericRng
+                    indexes
+                    histogramSamples
 
             let! totalRows, sampleSize, rowBytesTotal =
                 match sample |> Option.map (min 100_000) with
                 | None ->
                     result {
-                        let! count, bytes = consume accumulate 0.0 0L scan
+                        let! count, bytes = consumeScan cancel progress defn.Name accumulate 0.0 0L scan
                         return count, count, bytes
                     }
                 | Some n ->
                     result {
-                        let! count, samples, sampleCount = loop n 0L [] 0 1L scan
+                        let! count, samples, sampleCount =
+                            sampleScan cancel progress defn.Name n 0L [] 0 1L scan
+
                         samples |> List.iter accumulate
                         let bytes = samples |> List.sumBy (ValueCodec.managedRowBytes >> float)
                         return count, sampleCount, bytes
@@ -608,12 +665,6 @@ module internal ExecState =
                     0.0
                 else
                     rowBytesTotal / float sampleSize
-
-            let scaleNulls nulls =
-                if sampleSize <= 0L then
-                    0L
-                else
-                    (nulls * totalRows + sampleSize / 2L) / sampleSize
 
             let mcvLimit = 32
 
@@ -640,7 +691,7 @@ module internal ExecState =
                         {
                             Name = col.Name
                             NDV = int64 columnSets.[i].Count
-                            Nulls = scaleNulls nulls
+                            Nulls = scaleNulls totalRows sampleSize nulls
                             Min = minValue
                             Max = maxValue
                             Histogram = histogram
@@ -820,69 +871,74 @@ module internal ExecState =
     let dropTable (name: string) (ifExists: bool) (state: ExecState) =
         dropTableCore name ifExists |> exclusiveDdl state
 
-    let private createIndexCore (ci: CreateIndex) (state: ExecState) =
-        let rec checkEntries (idx: IndexSchema) previous scan =
-            match SstScan.next scan with
-            | Ok None -> ret ()
-            | Ok(Some(e, rest)) ->
-                match OrderPreserving.readValues idx.Columns.Length (Cursor.create e.Key) with
-                | Ok(values, _) ->
-                    if values |> Array.exists SqlValue.isNull then
-                        checkEntries idx previous rest
-                    else
-                        match KeyBuilder.ofValues values with
-                        | Ok prefix ->
-                            match previous with
-                            | Some before when Bytes.compare before prefix = 0 ->
-                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                            | _ -> checkEntries idx (Some prefix) rest
-                        | Error e -> err e
-                | Error e -> err e
+    /// 索引キーの重複を走査して検査する。
+    [<TailCall>]
+    let rec private checkUniqueEntries (idx: IndexSchema) (previous: byte array option) (scan: SstScan) =
+        match SstScan.next scan with
+        | Ok None -> ret ()
+        | Ok(Some(e, rest)) ->
+            match OrderPreserving.readValues idx.Columns.Length (Cursor.create e.Key) with
+            | Ok(values, _) ->
+                if values |> Array.exists SqlValue.isNull then
+                    checkUniqueEntries idx previous rest
+                else
+                    match KeyBuilder.ofValues values with
+                    | Ok prefix ->
+                        match previous with
+                        | Some before when Bytes.compare before prefix = 0 ->
+                            err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                        | _ -> checkUniqueEntries idx (Some prefix) rest
+                    | Error e -> err e
             | Error e -> err e
+        | Error e -> err e
 
-        let checkUniqueIndex (idx: IndexSchema) store =
-            RowStore.scanKeys (Keyspace.index idx.Name) [||] 0 store
-            >>= fun scan -> SstScan.withScan scan (fun scan -> checkEntries idx None scan)
+    /// 索引 keyspace の UNIQUE 制約を検査する。
+    let private checkUniqueIndex (idx: IndexSchema) (store: RowStore) =
+        RowStore.scanKeys (Keyspace.index idx.Name) [||] 0 store
+        >>= fun scan -> SstScan.withScan scan (fun scan -> checkUniqueEntries idx None scan)
 
-        let clearSpaceChunks state space =
-            match clearSpaceChunksResult space state with
-            | Ok next -> next
-            | Error _ -> state
+    /// 後始末の失敗を無視して keyspace を空にする。
+    let private clearSpaceIgnoringError (state: ExecState) (space: string) =
+        match clearSpaceChunksResult space state with
+        | Ok next -> next
+        | Error _ -> state
 
-        let backfillIndex tableName idx (state: ExecState) =
-            match Catalog.findTable tableName state.Catalog with
-            | None -> ret state
-            | Some defn ->
-                result {
-                    let! schema = Catalog.toSchema defn
+    /// 索引 keyspace に全行の索引エントリを書き込む。
+    let private backfillIndex (tableName: string) (idx: IndexSchema) (state: ExecState) =
+        match Catalog.findTable tableName state.Catalog with
+        | None -> ret state
+        | Some defn ->
+            result {
+                let! schema = Catalog.toSchema defn
 
-                    let withIndex =
-                        { schema with
-                            Indexes = idx :: schema.Indexes
-                        }
+                let withIndex =
+                    { schema with
+                        Indexes = idx :: schema.Indexes
+                    }
 
-                    let space = Keyspace.index idx.Name
-                    let! cleared = clearSpaceChunksResult space state
-                    let! rows = Dml.scanByPrimaryKey cleared.Store withIndex 0 None
+                let space = Keyspace.index idx.Name
+                let! cleared = clearSpaceChunksResult space state
+                let! rows = Dml.scanByPrimaryKey cleared.Store withIndex 0 None
 
-                    let! filled =
-                        applyOpChunks
-                            (fun txn row ->
-                                RowKey.indexKey withIndex idx row
-                                |> Result.map (fun key -> Transaction.put space key Array.empty txn))
-                            rows
-                            cleared
+                let! filled =
+                    applyOpChunks
+                        (fun txn row ->
+                            RowKey.indexKey withIndex idx row
+                            |> Result.map (fun key -> Transaction.put space key Array.empty txn))
+                        rows
+                        cleared
 
-                    if idx.Unique then
-                        match checkUniqueIndex idx filled.Store with
-                        | Ok() -> return filled
-                        | Error e ->
-                            clearSpaceChunks filled space |> ignore
-                            return! err e
-                    else
-                        return filled
-                }
+                if idx.Unique then
+                    match checkUniqueIndex idx filled.Store with
+                    | Ok() -> return filled
+                    | Error e ->
+                        clearSpaceIgnoringError filled space |> ignore
+                        return! err e
+                else
+                    return filled
+            }
 
+    let private createIndexCore (ci: CreateIndex) (state: ExecState) =
         match Catalog.findTable ci.Table state.Catalog with
         | None -> err (sprintf "テーブル %s が存在しません" ci.Table |> DbError.notFound)
         | Some tableDef ->
@@ -993,6 +1049,29 @@ module internal ExecState =
         |> DbError.corruption
         |> err
 
+    /// keyspace の走査を畳み込んで transaction に積む。
+    [<TailCall>]
+    let rec private rewriteSpaceLoop
+        (space: string)
+        (transform: SqlValue array -> Result<SqlValue array option, DbError>)
+        (txn: Transaction)
+        (scan: SstScan)
+        =
+        match SstScan.next scan with
+        | Ok None -> ret txn
+        | Ok(Some(e, rest)) ->
+            match e.Value with
+            | None -> rewriteSpaceLoop space transform txn rest
+            | Some row ->
+                match transform row with
+                | Ok None -> rewriteSpaceLoop space transform txn rest
+                | Ok(Some next) ->
+                    match Transaction.put space e.Key next txn |> Transaction.checkLimit with
+                    | Ok txn2 -> rewriteSpaceLoop space transform txn2 rest
+                    | Error e -> err e
+                | Error e -> err e
+        | Error e -> err e
+
     /// keyspace の全行を変換して transaction に積む。
     /// `transform` が None を返した行は書き換えない（対象外・変換済み）。
     let private rewriteSpace
@@ -1001,24 +1080,140 @@ module internal ExecState =
         (txn: Transaction)
         (store: RowStore)
         =
-        let rec loop txn scan =
-            match SstScan.next scan with
-            | Ok None -> ret txn
-            | Ok(Some(e, rest)) ->
-                match e.Value with
-                | None -> loop txn rest
-                | Some row ->
-                    match transform row with
-                    | Ok None -> loop txn rest
-                    | Ok(Some next) ->
-                        match Transaction.put space e.Key next txn |> Transaction.checkLimit with
-                        | Ok txn2 -> loop txn2 rest
-                        | Error e -> err e
-                    | Error e -> err e
-            | Error e -> err e
-
         RowStore.scan space [||] 0 store
-        >>= fun scan -> SstScan.withScan scan (fun scan -> loop txn scan)
+        >>= fun scan -> SstScan.withScan scan (fun scan -> rewriteSpaceLoop space transform txn scan)
+
+    /// テーブル keyspace の行変換器を作る。
+    let private rewriteTableOf (schema: TableSchema) =
+        rewriteSpace (Keyspace.table schema.Name)
+
+    /// 行の書き換えとカタログ更新を 1 transaction で commit する。
+    let private commitRewrite
+        (state: ExecState)
+        (catalog: Catalog)
+        (build: Transaction -> Result<Transaction, DbError>)
+        =
+        let mgr, txn = TransactionManager.beginTxn state.Manager
+
+        result {
+            let! txn2 = build txn
+
+            let! store, mgr2 =
+                RowStore.commitToStoreWith
+                    state.DeferDurability
+                    state.Root
+                    state.ActiveRegistration
+                    mgr
+                    txn2
+                    state.Store
+
+            return
+                { state with
+                    Committed =
+                        { state.Committed with
+                            Store = store
+                            Manager = mgr2
+                            Catalog = catalog
+                        }
+                }
+        }
+
+    /// 列追加時に既存行へ既定値を付ける。
+    let private addColumnTransform
+        (schema: TableSchema)
+        (oldWidth: int)
+        (newWidth: int)
+        (pad: SqlValue)
+        (row: SqlValue array)
+        =
+        if row.Length = newWidth then
+            ret None
+        elif row.Length = oldWidth then
+            ret (Some(Array.append row [| pad |]))
+        else
+            widthError schema row oldWidth
+
+    /// 列追加の行書き換え transaction を組み立てる。
+    let private addColumnBuild
+        (state: ExecState)
+        (tableName: string)
+        (withIndexes: TableSchema)
+        (nextDefn: TableDefinition)
+        (transform: SqlValue array -> Result<SqlValue array option, DbError>)
+        (txn: Transaction)
+        =
+        let nextSchema =
+            { withIndexes with
+                Columns = nextDefn.Columns
+            }
+
+        rewriteTableOf nextSchema transform txn state.Store
+        |> Result.map (fun txn -> txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn tableName)
+
+    /// 列削除時に既存行から 1列を除く。
+    let private dropColumnTransform
+        (schema: TableSchema)
+        (oldWidth: int)
+        (newWidth: int)
+        (pos: int)
+        (row: SqlValue array)
+        =
+        if row.Length = newWidth then
+            ret None
+        elif row.Length = oldWidth then
+            ret (Some(Array.init newWidth (fun i -> row.[if i < pos then i else i + 1])))
+        else
+            widthError schema row oldWidth
+
+    /// 列削除の行書き換え transaction を組み立てる。
+    let private dropColumnBuild
+        (state: ExecState)
+        (tableName: string)
+        (withIndexes: TableSchema)
+        (newColumns: ColumnDefinition list)
+        (nextDefn: TableDefinition)
+        (transform: SqlValue array -> Result<SqlValue array option, DbError>)
+        (txn: Transaction)
+        =
+        let nextSchema =
+            { withIndexes with
+                Columns = newColumns
+            }
+
+        rewriteTableOf nextSchema transform txn state.Store
+        |> Result.map (fun txn -> txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn tableName)
+
+    /// 列名の変更を 1列へ適用する。
+    let private renameColumn (oldName: string) (newName: string) (column: string) =
+        if SqlName.equal column oldName then newName else column
+
+    /// 外部キー定義の列名を変更する（参照先が自テーブルの場合だけ親側も変える）。
+    let private renameForeignKeyLocal (selfName: string) (rename: string -> string) (fk: ForeignKeyDefinition) =
+        { fk with
+            Columns = fk.Columns |> List.map rename
+            ParentColumns =
+                if Catalog.eqName fk.ParentTable selfName then
+                    fk.ParentColumns |> List.map rename
+                else
+                    fk.ParentColumns
+        }
+
+    /// 列名変更の transaction を組み立てる。
+    let private renameColumnBuild
+        (selfName: string)
+        (nextDefn: TableDefinition)
+        (nextIndexes: IndexDefinition list)
+        (referencing: TableDefinition list)
+        (txn: Transaction)
+        =
+        referencing
+        |> List.fold
+            (fun t childDefn -> Catalog.putTableInTxn childDefn t)
+            (nextIndexes
+             |> List.fold
+                 (fun t idx -> Catalog.putIndexInTxn idx t)
+                 (txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn selfName))
+        |> ret
 
     /// `ALTER TABLE`。
     /// <remarks>
@@ -1028,35 +1223,6 @@ module internal ExecState =
     /// 主キーは LSM のキーなので、主キー列の追加・削除は許可しない。
     /// </remarks>
     let private alterTableCore (a: AlterTable) (state: ExecState) =
-        let rewriteTable (schema: TableSchema) =
-            rewriteSpace (Keyspace.table schema.Name)
-
-        let commitRewrite catalog build =
-            let mgr, txn = TransactionManager.beginTxn state.Manager
-
-            result {
-                let! txn2 = build txn
-
-                let! store, mgr2 =
-                    RowStore.commitToStoreWith
-                        state.DeferDurability
-                        state.Root
-                        state.ActiveRegistration
-                        mgr
-                        txn2
-                        state.Store
-
-                return
-                    { state with
-                        Committed =
-                            { state.Committed with
-                                Store = store
-                                Manager = mgr2
-                                Catalog = catalog
-                            }
-                    }
-            }
-
         match Catalog.findTable a.Table state.Catalog with
         | None -> err (sprintf "テーブル %s が存在しません" a.Table |> DbError.notFound)
         | Some defn ->
@@ -1115,26 +1281,15 @@ module internal ExecState =
                             Columns = defn.Columns @ [ col ]
                         }
 
-                    let transform (row: SqlValue array) =
-                        if row.Length = newWidth then
-                            ret None
-                        elif row.Length = oldWidth then
-                            ret (Some(Array.append row [| pad |]))
-                        else
-                            widthError schema row oldWidth
+                    let transform = addColumnTransform schema oldWidth newWidth pad
 
-                    let build txn =
-                        let nextSchema =
-                            { withIndexes with
-                                Columns = nextDefn.Columns
-                            }
-
-                        rewriteTable nextSchema transform txn state.Store
-                        |> Result.map (fun txn ->
-                            txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn defn.Name)
+                    let build = addColumnBuild state defn.Name withIndexes nextDefn transform
 
                     return!
-                        commitRewrite (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)) build
+                        commitRewrite
+                            state
+                            (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog))
+                            build
                 | AlterTableAction.DropColumn name ->
                     let! pos = TableSchema.requireIndexOf schema name
 
@@ -1187,26 +1342,16 @@ module internal ExecState =
 
                     let nextDefn = { defn with Columns = newColumns }
 
-                    let transform (row: SqlValue array) =
-                        if row.Length = newWidth then
-                            ret None
-                        elif row.Length = oldWidth then
-                            ret (Some(Array.init newWidth (fun i -> row.[if i < pos then i else i + 1])))
-                        else
-                            widthError schema row oldWidth
+                    let transform = dropColumnTransform schema oldWidth newWidth pos
 
-                    let build txn =
-                        let nextSchema =
-                            { withIndexes with
-                                Columns = newColumns
-                            }
-
-                        rewriteTable nextSchema transform txn state.Store
-                        |> Result.map (fun txn ->
-                            txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn defn.Name)
+                    let build =
+                        dropColumnBuild state defn.Name withIndexes newColumns nextDefn transform
 
                     return!
-                        commitRewrite (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)) build
+                        commitRewrite
+                            state
+                            (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog))
+                            build
                 | AlterTableAction.RenameColumn(oldName, newName) ->
                     let! pos = TableSchema.requireIndexOf schema oldName
 
@@ -1220,18 +1365,9 @@ module internal ExecState =
                         else
                             ret ()
 
-                    let rename column =
-                        if SqlName.equal column oldName then newName else column
+                    let rename = renameColumn oldName newName
 
-                    let renameLocal (fk: ForeignKeyDefinition) =
-                        { fk with
-                            Columns = fk.Columns |> List.map rename
-                            ParentColumns =
-                                if Catalog.eqName fk.ParentTable defn.Name then
-                                    fk.ParentColumns |> List.map rename
-                                else
-                                    fk.ParentColumns
-                        }
+                    let renameLocal = renameForeignKeyLocal defn.Name rename
 
                     let referencing =
                         state.Catalog.Tables
@@ -1277,17 +1413,9 @@ module internal ExecState =
                                  (fun cat i -> Catalog.addIndex i cat)
                                  (Catalog.addTable nextDefn (Catalog.removeStats defn.Name state.Catalog)))
 
-                    let build txn =
-                        referencing
-                        |> List.fold
-                            (fun t childDefn -> Catalog.putTableInTxn childDefn t)
-                            (nextIndexes
-                             |> List.fold
-                                 (fun t idx -> Catalog.putIndexInTxn idx t)
-                                 (txn |> Catalog.putTableInTxn nextDefn |> Catalog.removeStatsInTxn defn.Name))
-                        |> ret
+                    let build = renameColumnBuild defn.Name nextDefn nextIndexes referencing
 
-                    return! commitRewrite nextCatalog build
+                    return! commitRewrite state nextCatalog build
             }
 
     let alterTable (a: AlterTable) (state: ExecState) = alterTableCore a |> exclusiveDdl state
@@ -1370,6 +1498,12 @@ module internal Engine =
             finally
                 ctx.Scope.DisposeAll()
 
+    /// 実測行数表からノードの行数を引く。
+    let private actualCountOf (counts: System.Collections.Generic.Dictionary<obj, int64>) (tree: Logical) =
+        match counts.TryGetValue(box tree) with
+        | true, n -> Some n
+        | false, _ -> None
+
     /// EXPLAIN ANALYZE: クエリを実行し、走査と結合の実測行数を推定に添える。
     /// 結果は materialize するが返さない（末尾に件数と経過時間の 1行を足す）。
     let private runExplainAnalyze (limits: ResultLimits) (state: ExecState) (txn: Transaction) (stmt: SelectStatement) =
@@ -1392,12 +1526,8 @@ module internal Engine =
                     match executed with
                     | Error e -> Error e
                     | Ok rows ->
-                        let actualOf (tree: Logical) =
-                            match counts.TryGetValue(box tree) with
-                            | true, n -> Some n
-                            | false, _ -> None
-
-                        let lines = Optimizer.explainWithCounts actualOf plan.Context plan.Tree plan.Input
+                        let lines =
+                            Optimizer.explainWithCounts (actualCountOf counts) plan.Context plan.Tree plan.Input
 
                         let stale =
                             staleStatsLine state |> Option.map List.singleton |> Option.defaultValue []
@@ -1444,6 +1574,37 @@ module internal Engine =
     let prepareSelect (state: ExecState) (stmt: SelectStatement) =
         prepareSelectWith JoinOrderStrategy.Dp state stmt
 
+    /// ストリーミング SELECT を共有ロックの内側で開く。
+    let private openSelectRun
+        (budget: MemoryBudget)
+        (state: ExecState)
+        (startState: ExecState)
+        (txn: Transaction)
+        (registration: ActiveRegistration)
+        (stmt: SelectStatement)
+        =
+        match contextOf budget startState txn with
+        | Error e ->
+            state.Store.Runtime.Unregister registration
+            err e
+        | Ok ctx ->
+            match Plan.runSelect ctx stmt with
+            | Error e ->
+                ctx.Scope.DisposeAll()
+                state.Store.Runtime.Unregister registration
+                err e
+            | Ok(columns, op) ->
+                ret
+                    {
+                        Columns = columns
+                        Op = op
+                        Scope = ctx.Scope
+                        Cleanup =
+                            fun () ->
+                                ctx.Scope.DisposeAll()
+                                state.Store.Runtime.Unregister registration
+                    }
+
     /// SELECT を materialize せずにストリーミング用の Op として開く。
     /// 呼び出し側は返された `Cleanup` を必ず呼び、snapshot 登録と走査を解放する。
     let openSelect (budget: MemoryBudget) (state: ExecState) (stmt: SelectStatement) =
@@ -1459,53 +1620,36 @@ module internal Engine =
                     Registration = Some registration
                 }
 
-            let run () =
-                match contextOf budget startState txn with
-                | Error e ->
-                    state.Store.Runtime.Unregister registration
-                    err e
-                | Ok ctx ->
-                    match Plan.runSelect ctx stmt with
-                    | Error e ->
-                        ctx.Scope.DisposeAll()
-                        state.Store.Runtime.Unregister registration
-                        err e
-                    | Ok(columns, op) ->
-                        ret
-                            {
-                                Columns = columns
-                                Op = op
-                                Scope = ctx.Scope
-                                Cleanup =
-                                    fun () ->
-                                        ctx.Scope.DisposeAll()
-                                        state.Store.Runtime.Unregister registration
-                            }
-
-            state.Store.Runtime.WithShared run
+            state.Store.Runtime.WithShared(fun () -> openSelectRun budget state startState txn registration stmt)
 
     let private resolveWhere (target: Schema) (ctx: ExecContext) =
         function
         | None -> ret None
         | Some e -> Plan.resolveDmlExprWith target ctx e |> Result.map Some
 
+    /// 索引走査を開き、足りない列を主キーから取り補う。
+    let private indexCandidateScan
+        (ctx: ExecContext)
+        (schemaName: string)
+        (mask: bool array)
+        (indexName: string)
+        (build: bool array -> Result<Op, DbError>)
+        =
+        result {
+            let! scanMask, fetchMask = ExecContext.indexAccessMasks ctx schemaName indexName mask
+
+            let! op = build scanMask
+
+            if fetchMask |> Array.exists id then
+                return! ExecContext.fetchMissing ctx schemaName fetchMask op
+            else
+                return op
+        }
+
     /// UPDATE / DELETE の候補行を、WHERE から選んだ走査方法で開く。
     /// WHERE は呼び出し側が行ごとに再評価するので、走査は候補の十分条件にだけ使う
     /// （範囲の閉区間など、走査が広めに返しても結果は変わらない）。
     let private dmlCandidateScan (ctx: ExecContext) (schema: TableSchema) (where: Expr option) (mask: bool array) =
-        let indexScan indexName build =
-            result {
-                let! scanMask, fetchMask =
-                    ExecContext.indexAccessMasks ctx schema.Name indexName mask
-
-                let! op = build scanMask
-
-                if fetchMask |> Array.exists id then
-                    return! ExecContext.fetchMissing ctx schema.Name fetchMask op
-                else
-                    return op
-            }
-
         let method =
             match where with
             | None -> ScanMethod.SeqScan
@@ -1548,9 +1692,10 @@ module internal Engine =
                 ctx.Txn
                 mask
         | ScanMethod.IndexLookup(indexName, values) ->
-            indexScan indexName (fun scanMask -> ExecContext.byIndexMasked ctx schema.Name indexName values 0 scanMask)
+            indexCandidateScan ctx schema.Name mask indexName (fun scanMask ->
+                ExecContext.byIndexMasked ctx schema.Name indexName values 0 scanMask)
         | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
-            indexScan indexName (fun scanMask ->
+            indexCandidateScan ctx schema.Name mask indexName (fun scanMask ->
                 ExecContext.byIndexRangeMasked ctx schema.Name indexName lower upper 0 scanMask)
 
     let private runInsert (stmt: InsertStatement) (ctx: ExecContext) =
@@ -1636,6 +1781,12 @@ module internal Engine =
 
     let private noRows = Result.map (fun s -> s, StatementResult.Empty)
 
+    /// 列の数値範囲を表示用文字列にする。
+    let private columnRangeText (c: ColumnStats) =
+        match c.Min, c.Max with
+        | Some lo, Some hi -> sprintf "%s=[%g,%g]" c.Name lo hi
+        | _ -> ""
+
     let private runStatement (limits: ResultLimits) (state: ExecState) (txn: Transaction) =
         function
         | Statement.Select stmt -> runSelect limits state txn stmt
@@ -1668,11 +1819,6 @@ module internal Engine =
                             "analyzed_at"
                         |]
 
-                    let rangeText (c: ColumnStats) =
-                        match c.Min, c.Max with
-                        | Some lo, Some hi -> sprintf "%s=[%g,%g]" c.Name lo hi
-                        | _ -> ""
-
                     let rows =
                         stats
                         |> List.map (fun (s: TableStats) ->
@@ -1691,7 +1837,10 @@ module internal Engine =
                                     |> String.concat ","
                                 )
                                 SqlValue.Text(
-                                    s.Columns |> List.map rangeText |> List.filter ((<>) "") |> String.concat ","
+                                    s.Columns
+                                    |> List.map columnRangeText
+                                    |> List.filter ((<>) "")
+                                    |> String.concat ","
                                 )
                                 SqlValue.Text(
                                     s.Indexes
@@ -1726,6 +1875,38 @@ module internal Engine =
         | Statement.Commit
         | Statement.Rollback -> ret state |> noRows
 
+    /// 1文を実行し、読み取り専用なら状態を戻し、それ以外は commit する。
+    let private executeStatementRun
+        (limits: ResultLimits)
+        (state: ExecState)
+        (txn: Transaction)
+        (stmt: Statement)
+        (mgr: TransactionManager)
+        (registration: ActiveRegistration)
+        (isReadOnly: bool)
+        =
+        result {
+            let startState =
+                { state with
+                    Committed = { state.Committed with Manager = mgr }
+                    Registration = Some registration
+                }
+
+            let! midState, result = runStatement limits startState txn stmt
+
+            if isReadOnly then
+                return state, result
+            else
+                let toCommit = midState.Pending |> Option.defaultValue txn
+                let! committed = ExecState.commitTransaction toCommit midState
+                return ExecState.ofCommitted committed, result
+        }
+
+    /// 文の終了時に snapshot 登録を外す。
+    let private unregisterAfter (state: ExecState) (registration: ActiveRegistration) (r: 'a) =
+        state.Store.Runtime.Unregister registration
+        r
+
     let executeStatementWithLimits (limits: ResultLimits) (state: ExecState) (stmt: Statement) =
         match state.Active with
         | Some activeTxn ->
@@ -1742,28 +1923,6 @@ module internal Engine =
                 | Statement.ExplainAnalyze _ -> true
                 | _ -> false
 
-            let run () =
-                result {
-                    let startState =
-                        { state with
-                            Committed = { state.Committed with Manager = mgr }
-                            Registration = Some registration
-                        }
-
-                    let! midState, result = runStatement limits startState txn stmt
-
-                    if isReadOnly then
-                        return state, result
-                    else
-                        let toCommit = midState.Pending |> Option.defaultValue txn
-                        let! committed = ExecState.commitTransaction toCommit midState
-                        return ExecState.ofCommitted committed, result
-                }
-
-            let finish r =
-                state.Store.Runtime.Unregister registration
-                r
-
             let isDdl =
                 match stmt with
                 | Statement.CreateTable _
@@ -1774,7 +1933,11 @@ module internal Engine =
                 | Statement.Analyze _ -> true
                 | _ -> false
 
-            (if isDdl then run () else state.Store.Runtime.WithShared run) |> finish
+            let run =
+                fun () -> executeStatementRun limits state txn stmt mgr registration isReadOnly
+
+            (if isDdl then run () else state.Store.Runtime.WithShared run)
+            |> unregisterAfter state registration
 
     let executeCommit (state: ExecState) =
         match state.Active with

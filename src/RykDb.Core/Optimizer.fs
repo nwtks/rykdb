@@ -128,21 +128,22 @@ module internal Optimizer =
         | Logical.Project(_, child) -> stripWrappers child
         | other -> other
 
-    let private aggregateSchema (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
-        let column name =
-            {
-                Name = name
-                Qualifier = None
-                DataType = None
-            }
+    /// 集約結果の出力列を作る。
+    let private aggregateColumn name =
+        {
+            Name = name
+            Qualifier = None
+            DataType = None
+        }
 
-        let groupColumns = groupBy |> List.map (Expr.toDisplayString >> column)
+    let private aggregateSchema (groupBy: Expr list) (aggs: (AggFunc * bool * bool * Expr) list) =
+        let groupColumns = groupBy |> List.map (Expr.toDisplayString >> aggregateColumn)
 
         let aggColumns =
             aggs
             |> List.map (fun (f, star, _, arg) ->
                 let suffix = if star then "*" else Expr.toDisplayString arg
-                column (sprintf "%s(%s)" f.Name suffix))
+                aggregateColumn (sprintf "%s(%s)" f.Name suffix))
 
         { Schema.Empty with
             Columns = Array.append (List.toArray groupColumns) (List.toArray aggColumns)
@@ -253,15 +254,17 @@ module internal Optimizer =
 
             rest
 
+    /// 出力スキーマの作業項目を末尾再帰で処理する。
+    [<TailCall>]
+    let rec private fillOutputSchemasLoop (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) =
+        function
+        | [] -> ()
+        | job :: rest -> fillOutputSchemasLoop ctx inSchema memo (processOutputJob ctx inSchema memo rest job)
+
     /// 部分木の全ノードの出力スキーマを後順で求め、メモに入れる。
     /// 明示スタックなので木の形に依存せずスタックは一定。
     let private fillOutputSchemas (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (root: Logical) =
-        let rec loop jobs =
-            match jobs with
-            | [] -> ()
-            | job :: rest -> loop (processOutputJob ctx inSchema memo rest job)
-
-        loop [ NeedNode root ]
+        fillOutputSchemasLoop ctx inSchema memo [ NeedNode root ]
 
     /// 出力スキーマをメモから引く（未計算なら部分木を 1パスで計算してから引く）。
     let private outputOfMemo (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (tree: Logical) =
@@ -274,111 +277,198 @@ module internal Optimizer =
             | Some schema -> schema
             | None -> outputOf ctx inSchema tree
 
+    /// スキーマの全列位置を返す。
+    let private scanAllColumns (schema: Schema) =
+        if schema.Columns.Length = 0 then
+            Set.empty
+        else
+            Set.ofSeq [ 0 .. schema.Columns.Length - 1 ]
+
+    /// 列参照を位置へ解決する（修飾子なしも試す）。
+    let private scanResolveRef (schema: Schema) (r: ColumnRef) =
+        match Schema.resolve r schema with
+        | Ok i -> Some i
+        | Error _ ->
+            match Schema.resolve { Qualifier = None; Name = r.Name } schema with
+            | Ok i -> Some i
+            | Error _ -> None
+
+    /// 式が参照する列位置の集合を返す。
+    let private scanRefsOf (schema: Schema) (e: Expr) =
+        if Expr.hasAnySubquery e then
+            scanAllColumns schema
+        else
+            let refs =
+                Expr.fold
+                    (fun acc x ->
+                        match x with
+                        | Expr.Column c -> c :: acc
+                        | Expr.Name n -> { Qualifier = None; Name = n } :: acc
+                        | _ -> acc)
+                    []
+                    e
+
+            let resolved = refs |> List.map (scanResolveRef schema)
+
+            if List.exists Option.isNone resolved then
+                scanAllColumns schema
+            else
+                resolved |> List.choose id |> Set.ofList
+
+    /// 複数の式が参照する列位置を合わせる。
+    let private scanRefsOfAll (schema: Schema) (exprs: Expr list) =
+        exprs |> List.fold (fun acc e -> Set.union acc (scanRefsOf schema e)) Set.empty
+
+    /// 必要列の後方伝播の作業項目。
+    /// ノードと、そのノードを実行するときの文脈・入力スキーマ・必要な列位置を持つ。
+    type private ScanNeedsJob =
+        {
+            Context: ExecContext
+            Input: Schema
+            Needed: Set<int>
+            Tree: Logical
+        }
+
+    /// 子ノードの作業項目を作る（文脈と入力スキーマを引き継ぐ）。
+    let private scanNeedsChild (item: ScanNeedsJob) (needed: Set<int>) (child: Logical) =
+        {
+            Context = item.Context
+            Input = item.Input
+            Needed = needed
+            Tree = child
+        }
+
+    /// 作業項目 1つを処理し、確定した Scan のマスクと残りの作業リストを返す。
+    let private processScanNeedsJob
+        (memo: OutputSchemaMemo)
+        (masks: (obj * bool array) list)
+        (item: ScanNeedsJob)
+        (rest: ScanNeedsJob list)
+        =
+        match item.Tree with
+        | Logical.Scan _ as node ->
+            let mask =
+                Array.init item.Input.Columns.Length (fun i -> Set.contains i item.Needed)
+
+            (box node, mask) :: masks, rest
+        | Logical.Filter(p, child) ->
+            let childSchema = outputOfMemo item.Context item.Input memo child
+
+            masks,
+            scanNeedsChild item (Set.union item.Needed (scanRefsOf childSchema p)) child
+            :: rest
+        | Logical.Project(items, child) ->
+            let childSchema = outputOfMemo item.Context item.Input memo child
+            let projection = SelectProjection.create childSchema items
+
+            masks,
+            scanNeedsChild item (scanRefsOfAll childSchema projection.Expressions) child
+            :: rest
+        | Logical.Sort(keys, child) ->
+            let childSchema = outputOfMemo item.Context item.Input memo child
+            let keyExprs = keys |> List.map _.Expression
+
+            masks,
+            scanNeedsChild item (Set.union item.Needed (scanRefsOfAll childSchema keyExprs)) child
+            :: rest
+        | Logical.Aggregate(groupBy, aggs, child) ->
+            let childSchema = outputOfMemo item.Context item.Input memo child
+
+            let exprs =
+                groupBy
+                @ (aggs
+                   |> List.filter (fun (_, star, _, _) -> not star)
+                   |> List.map (fun (_, _, _, arg) -> arg))
+
+            masks, scanNeedsChild item (scanRefsOfAll childSchema exprs) child :: rest
+        | Logical.Having(h, aggs, groupBy, child) ->
+            let aggSchema = aggregateSchema groupBy aggs
+
+            masks,
+            scanNeedsChild item (Set.union item.Needed (scanRefsOf aggSchema h)) child
+            :: rest
+        | Logical.Distinct child ->
+            let childSchema = outputOfMemo item.Context item.Input memo child
+            masks, scanNeedsChild item (scanAllColumns childSchema) child :: rest
+        | Logical.Limit(_, _, child) -> masks, scanNeedsChild item item.Needed child :: rest
+        | Logical.Join(_, _, on, left, right) ->
+            let leftSchema = outputOfMemo item.Context item.Input memo left
+            let rightSchema = outputOfMemo item.Context item.Input memo right
+            let joined = Schema.concat leftSchema rightSchema
+            let withOn = Set.union item.Needed (scanRefsOf joined on)
+            let leftWidth = leftSchema.Columns.Length
+            let leftNeeded = withOn |> Set.filter (fun i -> i < leftWidth)
+
+            let rightNeeded =
+                withOn
+                |> Set.filter (fun i -> i >= leftWidth)
+                |> Set.map (fun i -> i - leftWidth)
+
+            let leftJob =
+                { item with
+                    Input = leftSchema
+                    Needed = leftNeeded
+                    Tree = left
+                }
+
+            let rightJob =
+                { item with
+                    Input = rightSchema
+                    Needed = rightNeeded
+                    Tree = right
+                }
+
+            masks, leftJob :: rightJob :: rest
+        | Logical.Derived plan ->
+            let innerOutput = outputOfMemo plan.Context plan.Input memo plan.Tree
+
+            let innerNeeded =
+                item.Needed |> Set.filter (fun i -> i < innerOutput.Columns.Length)
+
+            masks,
+            {
+                Context = plan.Context
+                Input = plan.Input
+                Needed = innerNeeded
+                Tree = plan.Tree
+            }
+            :: rest
+        | Logical.UnionAll plans ->
+            masks,
+            (plans
+             |> List.map (fun plan ->
+                 {
+                     Context = plan.Context
+                     Input = plan.Input
+                     Needed = scanAllColumns (outputOfMemo plan.Context plan.Input memo plan.Tree)
+                     Tree = plan.Tree
+                 }))
+            @ rest
+        | Logical.Values _ -> masks, rest
+
+    /// 必要列を後方伝播する作業を末尾再帰で処理する。
+    /// 明示スタックなので木の形に依存せずスタックは一定。
+    [<TailCall>]
+    let rec private scanNeedsLoop (memo: OutputSchemaMemo) (masks: (obj * bool array) list) =
+        function
+        | [] -> masks
+        | item :: rest ->
+            let masks, next = processScanNeedsJob memo masks item rest
+            scanNeedsLoop memo masks next
+
     /// 出力列の必要集合を後方伝播し、各 Scan の列マスクを求める。
     /// `Logical` は参照等価の `obj` キーで覚える（構造比較はできない）。
     let private scanNeedsMasks (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (tree: Logical) =
-        let allColumns schema =
-            if schema.Columns.Length = 0 then
-                Set.empty
-            else
-                Set.ofSeq [ 0 .. schema.Columns.Length - 1 ]
-
-        let resolveRef schema r =
-            match Schema.resolve r schema with
-            | Ok i -> Some i
-            | Error _ ->
-                match Schema.resolve { Qualifier = None; Name = r.Name } schema with
-                | Ok i -> Some i
-                | Error _ -> None
-
-        let refsOf schema e =
-            if Expr.hasAnySubquery e then
-                allColumns schema
-            else
-                let refs =
-                    Expr.fold
-                        (fun acc x ->
-                            match x with
-                            | Expr.Column c -> c :: acc
-                            | Expr.Name n -> { Qualifier = None; Name = n } :: acc
-                            | _ -> acc)
-                        []
-                        e
-
-                let resolved = refs |> List.map (resolveRef schema)
-
-                if List.exists Option.isNone resolved then
-                    allColumns schema
-                else
-                    resolved |> List.choose id |> Set.ofList
-
-        let refsOfAll schema exprs =
-            exprs |> List.fold (fun acc e -> Set.union acc (refsOf schema e)) Set.empty
-
-        let rec go nodeCtx nodeInput needed =
-            function
-            | Logical.Scan _ as node ->
-                [
-                    (box node, Array.init nodeInput.Columns.Length (fun i -> Set.contains i needed))
-                ]
-            | Logical.Filter(p, child) ->
-                let childSchema = outputOfMemo nodeCtx nodeInput memo child
-                go nodeCtx nodeInput (Set.union needed (refsOf childSchema p)) child
-            | Logical.Project(items, child) ->
-                let childSchema = outputOfMemo nodeCtx nodeInput memo child
-                let projection = SelectProjection.create childSchema items
-                go nodeCtx nodeInput (refsOfAll childSchema projection.Expressions) child
-            | Logical.Sort(keys, child) ->
-                let childSchema = outputOfMemo nodeCtx nodeInput memo child
-                let keyExprs = keys |> List.map _.Expression
-                go nodeCtx nodeInput (Set.union needed (refsOfAll childSchema keyExprs)) child
-            | Logical.Aggregate(groupBy, aggs, child) ->
-                let childSchema = outputOfMemo nodeCtx nodeInput memo child
-
-                let exprs =
-                    groupBy
-                    @ (aggs
-                       |> List.filter (fun (_, star, _, _) -> not star)
-                       |> List.map (fun (_, _, _, arg) -> arg))
-
-                go nodeCtx nodeInput (refsOfAll childSchema exprs) child
-            | Logical.Having(h, aggs, groupBy, child) ->
-                let aggSchema = aggregateSchema groupBy aggs
-                go nodeCtx nodeInput (Set.union needed (refsOf aggSchema h)) child
-            | Logical.Distinct child ->
-                let childSchema = outputOfMemo nodeCtx nodeInput memo child
-                go nodeCtx nodeInput (allColumns childSchema) child
-            | Logical.Limit(_, _, child) -> go nodeCtx nodeInput needed child
-            | Logical.Join(_, _, on, left, right) ->
-                let leftSchema = outputOfMemo nodeCtx nodeInput memo left
-                let rightSchema = outputOfMemo nodeCtx nodeInput memo right
-                let joined = Schema.concat leftSchema rightSchema
-                let withOn = Set.union needed (refsOf joined on)
-                let leftWidth = leftSchema.Columns.Length
-                let leftNeeded = withOn |> Set.filter (fun i -> i < leftWidth)
-
-                let rightNeeded =
-                    withOn
-                    |> Set.filter (fun i -> i >= leftWidth)
-                    |> Set.map (fun i -> i - leftWidth)
-
-                go nodeCtx leftSchema leftNeeded left @ go nodeCtx rightSchema rightNeeded right
-            | Logical.Derived plan ->
-                let innerOutput = outputOfMemo plan.Context plan.Input memo plan.Tree
-                let innerNeeded = needed |> Set.filter (fun i -> i < innerOutput.Columns.Length)
-                go plan.Context plan.Input innerNeeded plan.Tree
-            | Logical.UnionAll plans ->
-                plans
-                |> List.collect (fun plan ->
-                    go
-                        plan.Context
-                        plan.Input
-                        (allColumns (outputOfMemo plan.Context plan.Input memo plan.Tree))
-                        plan.Tree)
-            | Logical.Values _ -> []
+        let root =
+            {
+                Context = ctx
+                Input = inSchema
+                Needed = scanAllColumns (outputOfMemo ctx inSchema memo tree)
+                Tree = tree
+            }
 
         let entries =
-            go ctx inSchema (allColumns (outputOfMemo ctx inSchema memo tree)) tree
+            scanNeedsLoop memo [] [ root ]
             |> List.map (fun (key, mask) -> System.Collections.Generic.KeyValuePair<obj, bool array>(key, mask))
 
         System.Collections.Immutable.ImmutableDictionary.CreateRange<obj, bool array>(HashIdentity.Reference, entries)
@@ -476,179 +566,221 @@ module internal Optimizer =
             DbError.internalError "index nested loop は JoinIndexLeftFrame で実行します" |> err
         | JoinAlgorithm.MergeJoin -> execMergeJoin ctx frame left right
 
+    /// 文脈からテーブル統計を引く。
+    let private statsOfContext (ctx: ExecContext) (name: string) = ExecContext.statsOf name ctx
+
+    /// 索引走査と必要なら非被覆列の fetch を結ぶ。
+    let private execIndexScan
+        (ctx: ExecContext)
+        (name: string)
+        (indexName: string)
+        (mask: bool array)
+        (build: bool array -> Result<Op, DbError>)
+        =
+        result {
+            let! scanMask, fetchMask = ExecContext.indexAccessMasks ctx name indexName mask
+            let! op = build scanMask
+
+            if fetchMask |> Array.exists id then
+                return! ExecContext.fetchMissing ctx name fetchMask op
+            else
+                return op
+        }
+
+    /// 走査ノードを Op に変換する（件数ヒントと列マスクを適用）。
+    let private execScan (node: 'a) (ctx: ExecContext) (name: string) (method: ScanMethod) =
+        let mask =
+            match ctx.ScanNeeds.TryGetValue(box node) with
+            | true, mask -> mask
+            | _ -> Array.create (defaultSchema ctx name).Columns.Length true
+
+        function
+        | Some 0 -> ret Op.Empty
+        | hint ->
+            let limit = defaultArg hint 0
+
+            match method with
+            | ScanMethod.SeqScan -> ExecContext.tableMasked ctx name limit mask
+            | ScanMethod.PkLookup values -> ExecContext.byPrimaryKeyMasked ctx name values mask
+            | ScanMethod.IndexLookup(indexName, values) ->
+                execIndexScan ctx name indexName mask (fun scanMask ->
+                    ExecContext.byIndexMasked ctx name indexName values limit scanMask)
+            | ScanMethod.RangeScan(_, startKey, endKey) ->
+                ExecContext.rangeScanMasked ctx name startKey endKey limit mask
+            | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
+                execIndexScan ctx name indexName mask (fun scanMask ->
+                    ExecContext.byIndexRangeMasked ctx name indexName lower upper limit scanMask)
+
+    /// オフセットと件数を Int32 の範囲へクランプして足す。
+    let private addClamp (a: int) (b: int) =
+        if a > System.Int32.MaxValue - b then
+            System.Int32.MaxValue
+        else
+            a + b
+
+    /// 子へ渡す件数ヒントを求める。
+    let private childLimitHint (offset: int) (count: int) (hint: int option) =
+        if count = 0 then
+            Some 0
+        else
+            match count with
+            | c when c >= 0 ->
+                let inner = addClamp offset c
+
+                Some(
+                    match hint with
+                    | Some h -> min h inner
+                    | None -> inner
+                )
+            | _ -> hint |> Option.map (fun h -> addClamp offset h)
+
+    /// 索引で右行を引き、必要なら非被覆列を fetch する。
+    let private lookupIndexRows
+        (ctx: ExecContext)
+        (frame: JoinFrame)
+        (indexName: string)
+        (scanMask: bool array)
+        (fetchMask: bool array)
+        (keyValues: SqlValue array)
+        =
+        result {
+            let! op =
+                ExecContext.byIndexMasked ctx frame.RightName indexName keyValues 0 scanMask
+
+            if fetchMask |> Array.exists id then
+                return! ExecContext.fetchMissing ctx frame.RightName fetchMask op
+            else
+                return op
+        }
+
+    /// Filter を剥がして右部分木の Scan を探す。
+    [<TailCall>]
+    let rec private rightScanOf =
+        function
+        | Logical.Scan _ as scan -> Some scan
+        | Logical.Filter(_, child) -> rightScanOf child
+        | _ -> None
+
+    /// 索引検索の結果を左行と結合する。
+    let private joinWithLookup
+        (frame: JoinFrame)
+        (left: Op)
+        (keys: JoinKeys)
+        (lookupRows: SqlValue array -> Result<Op, DbError>)
+        =
+        match frame.Kind with
+        | JoinKind.Inner ->
+            OpsJoin.innerJoinIndexed
+                frame.LeftSchema
+                left
+                frame.LeftKeyIndices
+                frame.RightSchema
+                keys.Residual
+                lookupRows
+        | JoinKind.Left ->
+            OpsJoin.leftJoinIndexed
+                frame.LeftSchema
+                left
+                frame.LeftKeyIndices
+                frame.RightSchema
+                keys.Residual
+                lookupRows
+
+    /// インデックス入れ子ループを実行する。
+    let private execIndexJoin (ctx: ExecContext) (frame: JoinFrame) (left: Op) =
+        match frame.Keys with
+        | None -> err (DbError.internalError "index nested loop に結合キーがありません")
+        | Some keys ->
+            let baseMask =
+                match rightScanOf frame.Right with
+                | Some scan ->
+                    match ctx.ScanNeeds.TryGetValue(box scan) with
+                    | true, mask -> mask
+                    | _ -> Array.create frame.RightSchema.Columns.Length true
+                | None -> Array.create frame.RightSchema.Columns.Length true
+
+            let residualColumns =
+                match keys.Residual with
+                | None -> Set.empty
+                | Some p ->
+                    Expr.columnRefs p
+                    |> List.choose (fun c ->
+                        match Schema.resolve c frame.RightSchema with
+                        | Ok i -> Some i
+                        | Error _ -> None)
+                    |> Set.ofList
+
+            let rightMask =
+                Array.init frame.RightSchema.Columns.Length (fun i ->
+                    i < baseMask.Length && baseMask.[i] || Set.contains i residualColumns)
+
+            match frame.Algorithm with
+            | JoinAlgorithm.IndexNestedLoop JoinLookup.PrimaryKey ->
+                joinWithLookup frame left keys (fun keyValues ->
+                    ExecContext.byPrimaryKeyMasked ctx frame.RightName keyValues rightMask)
+            | JoinAlgorithm.IndexNestedLoop(JoinLookup.Index indexName) ->
+                result {
+                    let! scanMask, fetchMask =
+                        ExecContext.indexAccessMasks ctx frame.RightName indexName rightMask
+
+                    return! joinWithLookup frame left keys (lookupIndexRows ctx frame indexName scanMask fetchMask)
+                }
+            | _ -> err (DbError.internalError "index nested loop ではありません")
+
+    /// 結合ノードの実行フレームを組み立てる。
+    let private buildJoinFrame
+        (ctx: ExecContext)
+        (memo: OutputSchemaMemo)
+        (inSchema: Schema)
+        (node: Logical)
+        (kind: JoinKind)
+        (name: string)
+        (on: Expr)
+        (left: Logical)
+        (right: Logical)
+        =
+        let leftSchema = outputOfMemo ctx inSchema memo left
+
+        let rightSchema, rightTable =
+            match stripWrappers right with
+            | Logical.Derived plan -> plan.Output, None
+            | Logical.Join _ -> outputOfMemo ctx inSchema memo right, None
+            | _ ->
+                let table = defaultSchema ctx name
+                Schema.ofTable name None table, Some table
+
+        let statsOf = statsOfContext ctx
+
+        let algorithm, keys, leftKeyIndices =
+            Analyzer.chooseJoinAlgorithmWith statsOf (tableOf ctx) leftSchema rightSchema rightTable left right on
+
+        let frame =
+            {
+                Node = node
+                Kind = kind
+                Right = right
+                On = on
+                LeftSchema = leftSchema
+                RightSchema = rightSchema
+                RightName = name
+                Algorithm = algorithm
+                Keys = keys
+                LeftKeyIndices = defaultArg leftKeyIndices [||]
+                BuildSide = hashBuildSide statsOf algorithm kind left right
+            }
+
+        frame, leftSchema
+
     /// 論理木を 1ノードずつ処理する。
     /// 継続は ExecFrame list に積むので、ラッパの深さに依存せずスタックは一定。
     [<TailCall>]
-    let rec private run (ctx: ExecContext) (memo: OutputSchemaMemo) (frames: ExecFrame list) (step: ExecStep) =
-        let buildJoinFrame inSchema node kind name on left right =
-            let leftSchema = outputOfMemo ctx inSchema memo left
-
-            let rightSchema, rightTable =
-                match stripWrappers right with
-                | Logical.Derived plan -> plan.Output, None
-                | Logical.Join _ -> outputOfMemo ctx inSchema memo right, None
-                | _ ->
-                    let table = defaultSchema ctx name
-                    Schema.ofTable name None table, Some table
-
-            let statsOf name = ExecContext.statsOf name ctx
-
-            let algorithm, keys, leftKeyIndices =
-                Analyzer.chooseJoinAlgorithmWith statsOf (tableOf ctx) leftSchema rightSchema rightTable left right on
-
-            let frame: JoinFrame =
-                {
-                    Node = node
-                    Kind = kind
-                    Right = right
-                    On = on
-                    LeftSchema = leftSchema
-                    RightSchema = rightSchema
-                    RightName = name
-                    Algorithm = algorithm
-                    Keys = keys
-                    LeftKeyIndices = defaultArg leftKeyIndices [||]
-                    BuildSide = hashBuildSide statsOf algorithm kind left right
-                }
-
-            frame, leftSchema
-
-        let execIndexScan ctx name indexName mask build =
-            result {
-                let! scanMask, fetchMask = ExecContext.indexAccessMasks ctx name indexName mask
-                let! op = build scanMask
-
-                if fetchMask |> Array.exists id then
-                    return! ExecContext.fetchMissing ctx name fetchMask op
-                else
-                    return op
-            }
-
-        let execScan node ctx name method =
-            let mask =
-                match ctx.ScanNeeds.TryGetValue(box node) with
-                | true, mask -> mask
-                | _ -> Array.create (defaultSchema ctx name).Columns.Length true
-
-            function
-            | Some 0 -> ret Op.Empty
-            | hint ->
-                let limit = defaultArg hint 0
-
-                match method with
-                | ScanMethod.SeqScan -> ExecContext.tableMasked ctx name limit mask
-                | ScanMethod.PkLookup values -> ExecContext.byPrimaryKeyMasked ctx name values mask
-                | ScanMethod.IndexLookup(indexName, values) ->
-                    execIndexScan ctx name indexName mask (fun scanMask ->
-                        ExecContext.byIndexMasked ctx name indexName values limit scanMask)
-                | ScanMethod.RangeScan(_, startKey, endKey) ->
-                    ExecContext.rangeScanMasked ctx name startKey endKey limit mask
-                | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
-                    execIndexScan ctx name indexName mask (fun scanMask ->
-                        ExecContext.byIndexRangeMasked ctx name indexName lower upper limit scanMask)
-
-        let addClamp a b =
-            if a > System.Int32.MaxValue - b then
-                System.Int32.MaxValue
-            else
-                a + b
-
-        let childLimitHint offset count hint =
-            if count = 0 then
-                Some 0
-            else
-                match count with
-                | c when c >= 0 ->
-                    let inner = addClamp offset c
-
-                    Some(
-                        match hint with
-                        | Some h -> min h inner
-                        | None -> inner
-                    )
-                | _ -> hint |> Option.map (fun h -> addClamp offset h)
-
-        let lookup frame indexName scanMask fetchMask keyValues =
-            result {
-                let! op =
-                    ExecContext.byIndexMasked ctx frame.RightName indexName keyValues 0 scanMask
-
-                if fetchMask |> Array.exists id then
-                    return! ExecContext.fetchMissing ctx frame.RightName fetchMask op
-                else
-                    return op
-            }
-
-        let rec rightScanOf =
-            function
-            | Logical.Scan _ as scan -> Some scan
-            | Logical.Filter(_, child) -> rightScanOf child
-            | _ -> None
-
-        let joinWith frame left keys lookupRows =
-            match frame.Kind with
-            | JoinKind.Inner ->
-                OpsJoin.innerJoinIndexed
-                    frame.LeftSchema
-                    left
-                    frame.LeftKeyIndices
-                    frame.RightSchema
-                    keys.Residual
-                    lookupRows
-            | JoinKind.Left ->
-                OpsJoin.leftJoinIndexed
-                    frame.LeftSchema
-                    left
-                    frame.LeftKeyIndices
-                    frame.RightSchema
-                    keys.Residual
-                    lookupRows
-
-        let execIndexJoin frame left =
-            match frame.Keys with
-            | None -> err (DbError.internalError "index nested loop に結合キーがありません")
-            | Some keys ->
-                let baseMask =
-                    match rightScanOf frame.Right with
-                    | Some scan ->
-                        match ctx.ScanNeeds.TryGetValue(box scan) with
-                        | true, mask -> mask
-                        | _ -> Array.create frame.RightSchema.Columns.Length true
-                    | None -> Array.create frame.RightSchema.Columns.Length true
-
-                let residualColumns =
-                    match keys.Residual with
-                    | None -> Set.empty
-                    | Some p ->
-                        Expr.columnRefs p
-                        |> List.choose (fun c ->
-                            match Schema.resolve c frame.RightSchema with
-                            | Ok i -> Some i
-                            | Error _ -> None)
-                        |> Set.ofList
-
-                let rightMask =
-                    Array.init frame.RightSchema.Columns.Length (fun i ->
-                        i < baseMask.Length && baseMask.[i] || Set.contains i residualColumns)
-
-                match frame.Algorithm with
-                | JoinAlgorithm.IndexNestedLoop JoinLookup.PrimaryKey ->
-                    joinWith frame left keys (fun keyValues ->
-                        ExecContext.byPrimaryKeyMasked ctx frame.RightName keyValues rightMask)
-                | JoinAlgorithm.IndexNestedLoop(JoinLookup.Index indexName) ->
-                    result {
-                        let! scanMask, fetchMask =
-                            ExecContext.indexAccessMasks ctx frame.RightName indexName rightMask
-
-                        return! joinWith frame left keys (lookup frame indexName scanMask fetchMask)
-                    }
-                | _ -> err (DbError.internalError "index nested loop ではありません")
-
-        match step with
+    let rec private run (ctx: ExecContext) (memo: OutputSchemaMemo) (frames: ExecFrame list) =
+        function
         | EvalNode(node, inSchema, hint) ->
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
-                let frame, leftSchema = buildJoinFrame inSchema node kind name on lTree rTree
+                let frame, leftSchema =
+                    buildJoinFrame ctx memo inSchema node kind name on lTree rTree
 
                 match frame.Algorithm with
                 | JoinAlgorithm.IndexNestedLoop _ ->
@@ -736,7 +868,7 @@ module internal Optimizer =
                     | Ok projected -> run ctx memo rest (ApplyOp projected)
                     | Error e -> err e
                 | JoinIndexLeftFrame frame ->
-                    match execIndexJoin frame op with
+                    match execIndexJoin ctx frame op with
                     | Ok joined -> run ctx memo rest (ApplyOp(countOutput ctx frame.Node joined))
                     | Error e -> err e
                 | JoinRightFrame frame ->
@@ -803,6 +935,243 @@ module internal Optimizer =
             Context: ExecContext
         }
 
+    /// EXPLAIN の作業項目を作る。
+    let private explainChildItem (indent: int) (tree: Logical) (schema: Schema) (context: ExecContext) =
+        {
+            Indent = indent
+            Tree = tree
+            Schema = schema
+            Context = context
+        }
+
+    /// 子ノードの作業項目を作る。
+    let private explainChildOf (item: ExplainItem) (tree: Logical) (schema: Schema) =
+        explainChildItem (item.Indent + 1) tree schema item.Context
+
+    /// 値を SQL リテラル表記へ変換する。
+    let private explainValueText = SqlLiteral.toSqlLiteral
+
+    /// 値配列をカンマ区切り文字列へ変換する。
+    let private explainValuesText = Array.map explainValueText >> String.concat ", "
+
+    /// SELECT 項目の表示文字列を作る。
+    let private explainItemText (item: SelectItem) =
+        let expression = Expr.toDisplayString item.Expression
+
+        match item.Alias with
+        | Some alias -> sprintf "%s AS %s" expression alias
+        | None -> expression
+
+    /// 範囲走査のキー表示を作る。
+    let private explainRangeText (lower: SqlValue array) (upper: SqlValue array option) =
+        let upper = upper |> Option.map explainValuesText |> Option.defaultValue "*"
+        sprintf "%s..%s" (explainValuesText lower) upper
+
+    /// 走査方法の表示を作る。
+    let private explainScanText (name: string) =
+        function
+        | ScanMethod.SeqScan -> sprintf "%s, SeqScan" name
+        | ScanMethod.PkLookup values -> sprintf "%s, PkLookup(%s)" name (explainValuesText values)
+        | ScanMethod.IndexLookup(index, values) ->
+            sprintf "%s, IndexLookup(%s, %s)" name index (explainValuesText values)
+        | ScanMethod.RangeScan(_, lower, upper) -> sprintf "%s, RangeScan(%s)" name (explainRangeText lower upper)
+        | ScanMethod.IndexRangeScan(index, lower, upper) ->
+            sprintf "%s, IndexRangeScan(%s, %s)" name index (explainRangeText lower upper)
+
+    /// 結合アルゴリズムの表示を作る。
+    let private explainAlgorithmText =
+        function
+        | JoinAlgorithm.NestedLoop -> "NestedLoop"
+        | JoinAlgorithm.HashJoin -> "HashJoin"
+        | JoinAlgorithm.MergeJoin -> "MergeJoin"
+        | JoinAlgorithm.IndexNestedLoop JoinLookup.PrimaryKey -> "IndexNestedLoop(pk)"
+        | JoinAlgorithm.IndexNestedLoop(JoinLookup.Index index) -> sprintf "IndexNestedLoop(%s)" index
+
+    /// JOIN 種別の表示を作る。
+    let private explainJoinKindText =
+        function
+        | JoinKind.Inner -> "INNER"
+        | JoinKind.Left -> "LEFT"
+
+    /// 集約呼び出しの表示を作る。
+    let private explainAggText (f: AggFunc, star: bool, distinct: bool, arg: Expr) =
+        let body = if star then "*" else Expr.toDisplayString arg
+        sprintf "%s(%s%s)" f.Name (if distinct then "DISTINCT " else "") body
+
+    /// 並び替えキーの表示を作る。
+    let private explainSortText (k: SortKey) =
+        let direction =
+            match k.Direction with
+            | SortDirection.Ascending -> "ASC"
+            | SortDirection.Descending -> "DESC"
+
+        sprintf "%s %s" (Expr.toDisplayString k.Expression) direction
+
+    /// スキーマの管理メモリ概算を返す。
+    let private explainRowBytesOfSchema (schema: Schema) =
+        Analyzer.rowBytesOfTypes (schema.Columns |> Seq.map _.DataType)
+
+    /// 1ノードを EXPLAIN の行と子項目へ変換する。
+    let private explainDescribe (memo: OutputSchemaMemo) (item: ExplainItem) =
+        match item.Tree with
+        | Logical.Scan(name, method) ->
+            let fetchSuffix =
+                match method with
+                | ScanMethod.IndexLookup(indexName, _)
+                | ScanMethod.IndexRangeScan(indexName, _, _) ->
+                    match item.Context.ScanNeeds.TryGetValue(box item.Tree) with
+                    | true, mask ->
+                        match ExecContext.indexAccessMasks item.Context name indexName mask with
+                        | Ok(_, fetchMask) when fetchMask |> Array.exists id -> " + Fetch"
+                        | _ -> ""
+                    | _ -> ""
+                | _ -> ""
+
+            sprintf "Scan(%s)%s" (explainScanText name method) fetchSuffix, []
+        | Logical.Values values ->
+            if Array.isEmpty values then
+                "Values", []
+            else
+                sprintf "Values(%s)" (explainValuesText values), []
+        | Logical.Filter(predicate, child) ->
+            sprintf "Filter(%s)" (Expr.toDisplayString predicate), [ explainChildOf item child item.Schema ]
+        | Logical.Project(items, child) ->
+            let text = items |> List.map explainItemText |> String.concat ", "
+            sprintf "Project(%s)" text, [ explainChildOf item child item.Schema ]
+        | Logical.Join(kind, name, on, left, right) ->
+            let leftSchema = outputOfMemo item.Context item.Schema memo left
+
+            let rightSchema, rightTable =
+                match stripWrappers right with
+                | Logical.Derived plan -> plan.Output, None
+                | Logical.Join _ -> outputOfMemo item.Context item.Schema memo right, None
+                | _ ->
+                    let table = defaultSchema item.Context name
+                    Schema.ofTable name None table, Some table
+
+            let statsOf = statsOfContext item.Context
+
+            let algorithm, _, _ =
+                Analyzer.chooseJoinAlgorithmWith
+                    statsOf
+                    (tableOf item.Context)
+                    leftSchema
+                    rightSchema
+                    rightTable
+                    left
+                    right
+                    on
+
+            let algorithmTextValue =
+                let buildSide = hashBuildSide statsOf algorithm kind left right
+
+                match algorithm, buildSide with
+                | JoinAlgorithm.HashJoin, HashBuildLeft -> "HashJoin(left)"
+                | JoinAlgorithm.HashJoin, HashBuildRight ->
+                    let leftRows = Analyzer.estimateRowsWith statsOf left
+                    let rightRows = Analyzer.estimateRowsWith statsOf right
+                    let buildRows = min leftRows rightRows
+
+                    let buildRowBytes =
+                        if leftRows < rightRows then
+                            explainRowBytesOfSchema leftSchema
+                        else
+                            explainRowBytesOfSchema rightSchema
+
+                    let spilled =
+                        Analyzer.spilledBuildRows
+                            buildRows
+                            buildRowBytes
+                            (if item.Context.Budget.Work >= 0L then
+                                 float item.Context.Budget.Work
+                             else
+                                 -1.0)
+
+                    if spilled > 0.0 then
+                        sprintf "HashJoin(spill=%.0fKB)" (spilled * buildRowBytes / 1024.0)
+                    else
+                        "HashJoin"
+
+                | _ -> explainAlgorithmText algorithm
+
+            let text =
+                sprintf
+                    "Join(%s, %s, right=%s, on=%s)"
+                    (explainJoinKindText kind)
+                    algorithmTextValue
+                    name
+                    (Expr.toDisplayString on)
+
+            text, [ explainChildOf item left leftSchema; explainChildOf item right rightSchema ]
+        | Logical.Aggregate(groupBy, aggs, child) ->
+            let text =
+                sprintf
+                    "Aggregate(group by [%s], aggregates [%s])"
+                    (groupBy |> List.map Expr.toDisplayString |> String.concat ", ")
+                    (aggs |> List.map explainAggText |> String.concat ", ")
+
+            text, [ explainChildOf item child item.Schema ]
+        | Logical.Having(predicate, _, _, child) ->
+            sprintf "Having(%s)" (Expr.toDisplayString predicate), [ explainChildOf item child item.Schema ]
+        | Logical.Distinct child -> "Distinct", [ explainChildOf item child item.Schema ]
+        | Logical.Sort(keys, child) ->
+            let text = keys |> List.map explainSortText |> String.concat ", "
+            sprintf "Sort(%s)" text, [ explainChildOf item child item.Schema ]
+        | Logical.Limit(offset, limit, child) ->
+            let text =
+                if limit >= 0 then
+                    sprintf "Limit(offset=%d, count=%d)" offset limit
+                else
+                    sprintf "Limit(offset=%d)" offset
+
+            text, [ explainChildOf item child item.Schema ]
+        | Logical.Derived plan -> "Derived", [ explainChildItem (item.Indent + 1) plan.Tree plan.Input plan.Context ]
+        | Logical.UnionAll plans ->
+            "UnionAll",
+            plans
+            |> List.map (fun plan -> explainChildItem (item.Indent + 1) plan.Tree plan.Input plan.Context)
+
+    /// EXPLAIN の行を末尾再帰で組み立てる。
+    [<TailCall>]
+    let rec private explainEmit (actual: Logical -> int64 option) (memo: OutputSchemaMemo) (acc: string list) =
+        function
+        | [] -> List.rev acc
+        | item :: rest ->
+            let text, children = explainDescribe memo item
+
+            let rowSuffix =
+                if List.isEmpty item.Context.Catalog.Stats then
+                    ""
+                else
+                    let statsOf = statsOfContext item.Context
+                    let rows = Analyzer.estimateRowsWith statsOf item.Tree
+
+                    let rowsText =
+                        if System.Double.IsFinite rows then
+                            sprintf " rows=%.0f" rows
+                        elif System.Double.IsPositiveInfinity rows then
+                            " rows=inf"
+                        else
+                            ""
+
+                    let selectivityText =
+                        match item.Tree with
+                        | Logical.Join(_, _, on, _, _) ->
+                            match Analyzer.joinSelectivity statsOf on with
+                            | Some selectivity -> sprintf " sel=%.4g" selectivity
+                            | None -> ""
+                        | _ -> ""
+
+                    rowsText + selectivityText
+
+            let actualSuffix =
+                actual item.Tree
+                |> Option.map (fun rows -> sprintf " actual=%d" rows)
+                |> Option.defaultValue ""
+
+            let line = String.replicate item.Indent "  " + text + rowSuffix + actualSuffix
+            explainEmit actual memo (line :: acc) (children @ rest)
+
     /// 論理木を EXPLAIN 用の行にする（実行しない）。
     /// `exec` と同じ規則で走査方法・結合アルゴリズムを選び、木を深さ優先で並べる。
     /// `actual` が Some を返したノードには実測行数（`EXPLAIN ANALYZE`）を添える。
@@ -814,237 +1183,7 @@ module internal Optimizer =
                 ScanNeeds = scanNeedsMasks ctx schema memo tree
             }
 
-        let childItem indent tree schema context =
-            {
-                Indent = indent
-                Tree = tree
-                Schema = schema
-                Context = context
-            }
-
-        let childOf item tree schema =
-            childItem (item.Indent + 1) tree schema item.Context
-
-        let valueText = SqlLiteral.toSqlLiteral
-
-        let valuesText = Array.map valueText >> String.concat ", "
-
-        let itemText item =
-            let expression = Expr.toDisplayString item.Expression
-
-            match item.Alias with
-            | Some alias -> sprintf "%s AS %s" expression alias
-            | None -> expression
-
-        let rangeText lower upper =
-            let upper = upper |> Option.map valuesText |> Option.defaultValue "*"
-            sprintf "%s..%s" (valuesText lower) upper
-
-        let scanText name =
-            function
-            | ScanMethod.SeqScan -> sprintf "%s, SeqScan" name
-            | ScanMethod.PkLookup values -> sprintf "%s, PkLookup(%s)" name (valuesText values)
-            | ScanMethod.IndexLookup(index, values) -> sprintf "%s, IndexLookup(%s, %s)" name index (valuesText values)
-            | ScanMethod.RangeScan(_, lower, upper) -> sprintf "%s, RangeScan(%s)" name (rangeText lower upper)
-            | ScanMethod.IndexRangeScan(index, lower, upper) ->
-                sprintf "%s, IndexRangeScan(%s, %s)" name index (rangeText lower upper)
-
-        let algorithmText =
-            function
-            | JoinAlgorithm.NestedLoop -> "NestedLoop"
-            | JoinAlgorithm.HashJoin -> "HashJoin"
-            | JoinAlgorithm.MergeJoin -> "MergeJoin"
-            | JoinAlgorithm.IndexNestedLoop JoinLookup.PrimaryKey -> "IndexNestedLoop(pk)"
-            | JoinAlgorithm.IndexNestedLoop(JoinLookup.Index index) -> sprintf "IndexNestedLoop(%s)" index
-
-        let joinKindText =
-            function
-            | JoinKind.Inner -> "INNER"
-            | JoinKind.Left -> "LEFT"
-
-        let aggText (f: AggFunc, star, distinct, arg) =
-            let body = if star then "*" else Expr.toDisplayString arg
-            sprintf "%s(%s%s)" f.Name (if distinct then "DISTINCT " else "") body
-
-        let sortText k =
-            let direction =
-                match k.Direction with
-                | SortDirection.Ascending -> "ASC"
-                | SortDirection.Descending -> "DESC"
-
-            sprintf "%s %s" (Expr.toDisplayString k.Expression) direction
-
-        let rowBytesOfSchema schema =
-            Analyzer.rowBytesOfTypes (schema.Columns |> Seq.map _.DataType)
-
-        let describe item =
-            match item.Tree with
-            | Logical.Scan(name, method) ->
-                let fetchSuffix =
-                    match method with
-                    | ScanMethod.IndexLookup(indexName, _)
-                    | ScanMethod.IndexRangeScan(indexName, _, _) ->
-                        match item.Context.ScanNeeds.TryGetValue(box item.Tree) with
-                        | true, mask ->
-                            match ExecContext.indexAccessMasks item.Context name indexName mask with
-                            | Ok(_, fetchMask) when fetchMask |> Array.exists id -> " + Fetch"
-                            | _ -> ""
-                        | _ -> ""
-                    | _ -> ""
-
-                sprintf "Scan(%s)%s" (scanText name method) fetchSuffix, []
-            | Logical.Values values ->
-                if Array.isEmpty values then
-                    "Values", []
-                else
-                    sprintf "Values(%s)" (valuesText values), []
-            | Logical.Filter(predicate, child) ->
-                sprintf "Filter(%s)" (Expr.toDisplayString predicate), [ childOf item child item.Schema ]
-            | Logical.Project(items, child) ->
-                let text = items |> List.map itemText |> String.concat ", "
-                sprintf "Project(%s)" text, [ childOf item child item.Schema ]
-            | Logical.Join(kind, name, on, left, right) ->
-                let leftSchema = outputOfMemo item.Context item.Schema memo left
-
-                let rightSchema, rightTable =
-                    match stripWrappers right with
-                    | Logical.Derived plan -> plan.Output, None
-                    | Logical.Join _ -> outputOfMemo item.Context item.Schema memo right, None
-                    | _ ->
-                        let table = defaultSchema item.Context name
-                        Schema.ofTable name None table, Some table
-
-                let statsOf name = ExecContext.statsOf name item.Context
-
-                let algorithm, _, _ =
-                    Analyzer.chooseJoinAlgorithmWith
-                        statsOf
-                        (tableOf item.Context)
-                        leftSchema
-                        rightSchema
-                        rightTable
-                        left
-                        right
-                        on
-
-                let algorithmTextValue =
-                    let buildSide = hashBuildSide statsOf algorithm kind left right
-
-                    match algorithm, buildSide with
-                    | JoinAlgorithm.HashJoin, HashBuildLeft -> "HashJoin(left)"
-                    | JoinAlgorithm.HashJoin, HashBuildRight ->
-                        let leftRows = Analyzer.estimateRowsWith statsOf left
-                        let rightRows = Analyzer.estimateRowsWith statsOf right
-                        let buildRows = min leftRows rightRows
-
-                        let buildRowBytes =
-                            if leftRows < rightRows then
-                                rowBytesOfSchema leftSchema
-                            else
-                                rowBytesOfSchema rightSchema
-
-                        let spilled =
-                            Analyzer.spilledBuildRows
-                                buildRows
-                                buildRowBytes
-                                (if item.Context.Budget.Work >= 0L then
-                                     float item.Context.Budget.Work
-                                 else
-                                     -1.0)
-
-                        if spilled > 0.0 then
-                            sprintf "HashJoin(spill=%.0fKB)" (spilled * buildRowBytes / 1024.0)
-                        else
-                            "HashJoin"
-
-                    | _ -> algorithmText algorithm
-
-                let text =
-                    sprintf
-                        "Join(%s, %s, right=%s, on=%s)"
-                        (joinKindText kind)
-                        algorithmTextValue
-                        name
-                        (Expr.toDisplayString on)
-
-                text, [ childOf item left leftSchema; childOf item right rightSchema ]
-            | Logical.Aggregate(groupBy, aggs, child) ->
-                let text =
-                    sprintf
-                        "Aggregate(group by [%s], aggregates [%s])"
-                        (groupBy |> List.map Expr.toDisplayString |> String.concat ", ")
-                        (aggs |> List.map aggText |> String.concat ", ")
-
-                text, [ childOf item child item.Schema ]
-            | Logical.Having(predicate, _, _, child) ->
-                sprintf "Having(%s)" (Expr.toDisplayString predicate), [ childOf item child item.Schema ]
-            | Logical.Distinct child -> "Distinct", [ childOf item child item.Schema ]
-            | Logical.Sort(keys, child) ->
-                let text = keys |> List.map sortText |> String.concat ", "
-                sprintf "Sort(%s)" text, [ childOf item child item.Schema ]
-            | Logical.Limit(offset, limit, child) ->
-                let text =
-                    if limit >= 0 then
-                        sprintf "Limit(offset=%d, count=%d)" offset limit
-                    else
-                        sprintf "Limit(offset=%d)" offset
-
-                text, [ childOf item child item.Schema ]
-            | Logical.Derived plan -> "Derived", [ childItem (item.Indent + 1) plan.Tree plan.Input plan.Context ]
-            | Logical.UnionAll plans ->
-                "UnionAll",
-                plans
-                |> List.map (fun plan -> childItem (item.Indent + 1) plan.Tree plan.Input plan.Context)
-
-        let rec emit acc =
-            function
-            | [] -> List.rev acc
-            | item :: rest ->
-                let text, children = describe item
-
-                let rowSuffix =
-                    if List.isEmpty item.Context.Catalog.Stats then
-                        ""
-                    else
-                        let statsOf name = ExecContext.statsOf name item.Context
-                        let rows = Analyzer.estimateRowsWith statsOf item.Tree
-
-                        let rowsText =
-                            if System.Double.IsFinite rows then
-                                sprintf " rows=%.0f" rows
-                            elif System.Double.IsPositiveInfinity rows then
-                                " rows=inf"
-                            else
-                                ""
-
-                        let selectivityText =
-                            match item.Tree with
-                            | Logical.Join(_, _, on, _, _) ->
-                                match Analyzer.joinSelectivity statsOf on with
-                                | Some selectivity -> sprintf " sel=%.4g" selectivity
-                                | None -> ""
-                            | _ -> ""
-
-                        rowsText + selectivityText
-
-                let actualSuffix =
-                    actual item.Tree
-                    |> Option.map (fun rows -> sprintf " actual=%d" rows)
-                    |> Option.defaultValue ""
-
-                let line = String.replicate item.Indent "  " + text + rowSuffix + actualSuffix
-                emit (line :: acc) (children @ rest)
-
-        emit
-            []
-            [
-                {
-                    Indent = 0
-                    Tree = tree
-                    Schema = schema
-                    Context = ctx
-                }
-            ]
+        explainEmit actual memo [] [ explainChildItem 0 tree schema ctx ]
 
     /// 論理木を EXPLAIN 用の行にする（実行しない。実測行数は添えない）。
     let explain (ctx: ExecContext) (tree: Logical) (schema: Schema) =

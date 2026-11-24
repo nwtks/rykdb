@@ -182,33 +182,37 @@ module internal Transaction =
 
         Set.union physical txn.Reservations
 
+    /// キーと値の組へ SeqNo を割り当てて Entry にする。
+    [<TailCall>]
+    let rec private numberEntries (seqNo: uint64) (acc: Entry list) =
+        function
+        | [] -> List.rev acc
+        | (k, v) :: tail ->
+            let e =
+                match v with
+                | Some values -> Entry.put k seqNo values
+                | None -> Entry.delete k seqNo
+
+            numberEntries (seqNo + 1UL) (e :: acc) tail
+
+    /// keyspace ごとに連続した SeqNo を割り当てる。
+    [<TailCall>]
+    let rec private numberEntriesByKeyspace (seqNo: uint64) (acc: ('a * Entry array) list) =
+        function
+        | [] -> List.rev acc, seqNo
+        | (ks, entries) :: rest ->
+            let made = numberEntries seqNo [] entries |> Array.ofList
+            numberEntriesByKeyspace (seqNo + uint64 entries.Length) ((ks, made) :: acc) rest
+
     /// バッファを keyspace ごとに「SeqNo 昇順で採番済みの Entry 配列」に変換する。
     /// 採番は nextSeqNo から 1つずつ採番する。
     /// 決定的な順序にするため keyspace 名 → キーの昇順で採番する
     /// （同じ transaction は常に同じ SeqNo 割当になる）。
     let toEntries (nextSeqNo: uint64) (txn: Transaction) =
-        let rec step seqNo acc =
-            function
-            | [] -> List.rev acc
-            | (k, v) :: tail ->
-                let e =
-                    match v with
-                    | Some values -> Entry.put k seqNo values
-                    | None -> Entry.delete k seqNo
-
-                step (seqNo + 1UL) (e :: acc) tail
-
-        let rec perKeyspace seqNo acc =
-            function
-            | [] -> List.rev acc, seqNo
-            | (ks, entries) :: rest ->
-                let made = step seqNo [] entries |> Array.ofList
-                perKeyspace (seqNo + uint64 entries.Length) ((ks, made) :: acc) rest
-
         txn.Buffers
         |> Map.toList
         |> List.map (fun (ks, m) -> ks, m |> Map.toList)
-        |> perKeyspace nextSeqNo []
+        |> numberEntriesByKeyspace nextSeqNo []
 
 /// transaction manager の診断用スナップショット（テスト・診断用。挙動には影響しない）。
 /// <remarks>
@@ -247,6 +251,48 @@ type internal TransactionManager =
     }
 
 module internal TransactionManager =
+    /// snapshot より後に同じキーへ書かれた履歴を競合キーとして列挙する。
+    let private findWriteConflicts (txn: Transaction) (lastCommitted: Map<string, 'a>) (snapSeq: 'a) =
+        if Map.isEmpty lastCommitted then
+            []
+        else
+            Transaction.writeKeys txn
+            |> Set.toList
+            |> List.filter (fun k ->
+                match lastCommitted |> Map.tryFind k with
+                | Some seq -> seq > snapSeq
+                | None -> false)
+
+    /// 今回の commit のキーを履歴へ記録する（UNIQUE 予約を含む）。
+    let private updateLastCommittedWith
+        (txn: Transaction)
+        (lastCommitted: Map<string, uint64>)
+        (batches: (string * Entry array) list)
+        (commitSeq: uint64)
+        =
+        let physical =
+            batches
+            |> List.fold
+                (fun acc (ks, entries) ->
+                    entries
+                    |> Array.fold
+                        (fun acc e ->
+                            let k = Transaction.conflictKey ks e.Key
+
+                            match acc |> Map.tryFind k with
+                            | Some old when old >= e.SeqNo -> acc
+                            | _ -> Map.add k e.SeqNo acc)
+                        acc)
+                lastCommitted
+
+        txn.Reservations
+        |> Set.fold
+            (fun acc k ->
+                match acc |> Map.tryFind k with
+                | Some old when old >= commitSeq -> acc
+                | _ -> Map.add k commitSeq acc)
+            physical
+
     let create () =
         {
             NextSeqNo = 1UL
@@ -339,47 +385,12 @@ module internal TransactionManager =
     ///    履歴を残し続けると、書き込まれたすべてのキーがメモリに蓄積する。
     /// 返り値の Entry 配列を StorageEngine に渡すと、書き込みが DB に反映される。
     let commit (txn: Transaction) (manager: TransactionManager) =
-        let findConflicts txn lastCommitted snapSeq =
-            if Map.isEmpty lastCommitted then
-                []
-            else
-                Transaction.writeKeys txn
-                |> Set.toList
-                |> List.filter (fun k ->
-                    match lastCommitted |> Map.tryFind k with
-                    | Some seq -> seq > snapSeq
-                    | None -> false)
-
-        let updateLastCommitted lastCommitted (batches: (string * Entry array) list) commitSeq =
-            let physical =
-                batches
-                |> List.fold
-                    (fun acc (ks, entries) ->
-                        entries
-                        |> Array.fold
-                            (fun acc e ->
-                                let k = Transaction.conflictKey ks e.Key
-
-                                match acc |> Map.tryFind k with
-                                | Some old when old >= e.SeqNo -> acc
-                                | _ -> Map.add k e.SeqNo acc)
-                            acc)
-                    lastCommitted
-
-            txn.Reservations
-            |> Set.fold
-                (fun acc k ->
-                    match acc |> Map.tryFind k with
-                    | Some old when old >= commitSeq -> acc
-                    | _ -> Map.add k commitSeq acc)
-                physical
-
         if not (Map.containsKey txn.TxnId manager.Active) then
             err (sprintf "Transaction %d が存在しません" txn.TxnId |> DbError.internalError)
         elif Transaction.isOverLimit txn then
             err (Transaction.overLimitError txn)
         else
-            let conflicting = findConflicts txn manager.LastCommitted txn.Snapshot.SeqNo
+            let conflicting = findWriteConflicts txn manager.LastCommitted txn.Snapshot.SeqNo
 
             if not (List.isEmpty conflicting) then
                 let examples =
@@ -424,7 +435,7 @@ module internal TransactionManager =
                     if gcThreshold > commitSeq then
                         Map.empty
                     else
-                        updateLastCommitted manager.LastCommitted batches commitSeq
+                        updateLastCommittedWith txn manager.LastCommitted batches commitSeq
                         |> Map.filter (fun _ seq -> seq >= gcThreshold)
 
                 let updated =
@@ -494,6 +505,36 @@ type internal ActiveRegistration internal (root: string, unregister: ActiveRegis
     /// 登録を解除する（登録先のレジストリを保持している）。
     member this.Unregister() = unregister this
 
+/// 登録・リースの共通ヘルパー。
+module private RegistrationInternals =
+    /// Gate を取って操作を直列化する。
+    let withGate (gate: System.Threading.SemaphoreSlim) (f: unit -> 'T) =
+        gate.Wait()
+
+        try
+            f ()
+        finally
+            gate.Release() |> ignore
+
+    /// 正規化済み key の bucket を取る（呼び出しは Gate の内側）。
+    let snapshotBucket
+        (byRoot:
+            System.Collections.Concurrent.ConcurrentDictionary<
+                string,
+                System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>
+             >)
+        (key: string)
+        =
+        byRoot.GetOrAdd(key, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>())
+
+    /// リースのトークンを外し、最後の 1本なら登録も解除する。
+    let releaseLease (registration: ActiveRegistration) (token: obj) =
+        if registration.Detach token then
+            registration.Unregister()
+            true
+        else
+            false
+
 /// DB ごとの active transaction の snapshot を集約する。
 /// <remarks>
 /// GC の境界は「最古の active snapshot」なので、
@@ -521,31 +562,19 @@ type internal SnapshotRegistry() =
     /// </remarks>
     let gate = new System.Threading.SemaphoreSlim(1, 1)
 
-    let withGate (f: unit -> 'T) =
-        gate.Wait()
-
-        try
-            f ()
-        finally
-            gate.Release() |> ignore
-
-    /// 正規化済み key の bucket を取る（呼び出しは Gate の内側）。
-    let bucket (key: string) =
-        byRoot.GetOrAdd(key, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>())
-
     /// snapshot を登録し、解除に使う登録を返す。
     member this.Register(root: string, snapshot: uint64) =
         let key = RootKey.normalize root
 
-        withGate (fun () ->
+        RegistrationInternals.withGate gate (fun () ->
             let registration = ActiveRegistration(key, fun reg -> this.Unregister reg)
-            (bucket key).[registration] <- snapshot
+            (RegistrationInternals.snapshotBucket byRoot key).[registration] <- snapshot
             registration)
 
     /// 登録を解除する（commit 成功・rollback・Close・最後の接続の GC）。
     /// 解除し忘れても「版を余分に残す」側にしか倒れない（安全側）。
     member _.Unregister(registration: ActiveRegistration) =
-        withGate (fun () ->
+        RegistrationInternals.withGate gate (fun () ->
             match byRoot.TryGetValue registration.Root with
             | true, inner ->
                 inner.TryRemove registration |> ignore
@@ -559,7 +588,7 @@ type internal SnapshotRegistry() =
     member _.OldestExcept(root: string, registration: ActiveRegistration option) =
         let key = RootKey.normalize root
 
-        withGate (fun () ->
+        RegistrationInternals.withGate gate (fun () ->
             match byRoot.TryGetValue key with
             | true, inner ->
                 inner
@@ -635,23 +664,16 @@ type internal RegistrationLease(registration: ActiveRegistration, ?onAbandon: un
     /// このリースの生存トークン。
     let token = registration.Attach()
 
-    /// 登録を外す。戻り値は「これが最後のリースだった」かどうか。
-    let releaseCore () =
-        if registration.Detach token then
-            registration.Unregister()
-            true
-        else
-            false
-
     /// 登録そのもの（`ExecState.ActiveRegistration` へ渡す）。
     member _.Registration = registration
 
     /// このリースの登録を外す。
     /// 最後の 1本なら registry からも消える。二重呼び出しは無害。
-    member _.Release() = releaseCore () |> ignore
+    member _.Release() =
+        RegistrationInternals.releaseLease registration token |> ignore
 
     override _.Finalize() =
         protect (fun () ->
-            if releaseCore () then
+            if RegistrationInternals.releaseLease registration token then
                 onAbandon |> Option.iter (fun signal -> signal ()))
         |> ignore

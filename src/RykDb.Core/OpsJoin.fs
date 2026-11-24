@@ -48,8 +48,8 @@ module internal OpsJoin =
         Eval.checkPrepared (Eval.prepare (Schema.concat leftSchema rightSchema) exprs)
 
     /// residual（等値キー以外の ON 句）の列参照を検査する。
-    let private checkResidual (leftSchema: Schema) (rightSchema: Schema) (residual: Expr option) =
-        match residual with
+    let private checkResidual (leftSchema: Schema) (rightSchema: Schema) =
+        function
         | None -> Ok()
         | Some p -> checkExprs leftSchema rightSchema [ p ]
 
@@ -59,6 +59,49 @@ module internal OpsJoin =
     /// onError error matched は ON 句の評価が失敗したときの Op。
     /// matched は「この左行で既に一致を出したか」。
     /// INNER はどちらも matched を無視し、LEFT だけが NULL 拡張と継続を使い分ける。
+    /// 結合述語を左右の行へ評価する。
+    let private joinPred (resolve: Prepared) (on: Expr) (l: SqlValue array) (r: SqlValue array) =
+        Eval.matchesJoinedV resolve l r on
+
+    /// nested loop の 1ステップを遅延して作る。
+    [<TailCall>]
+    let rec private joinLoopGo
+        (onExhausted: bool -> Op)
+        (onError: DbError -> bool -> Op)
+        (lrow: SqlValue array)
+        (rightRows: SqlValue array array)
+        (resolve: Prepared)
+        (on: Expr)
+        (matched: bool)
+        (i: int)
+        =
+        Op.compute (fun () -> joinLoopAdvance onExhausted onError lrow rightRows resolve on matched i)
+
+    /// nested loop の内側を 1行進める。
+    and private joinLoopAdvance
+        (onExhausted: bool -> Op)
+        (onError: DbError -> bool -> Op)
+        (lrow: SqlValue array)
+        (rightRows: SqlValue array array)
+        (resolve: Prepared)
+        (on: Expr)
+        (matched: bool)
+        (j: int)
+        =
+        if j >= rightRows.Length then
+            Op.next (onExhausted matched)
+        else
+            let rrow = rightRows.[j]
+
+            match joinPred resolve on lrow rrow with
+            | DbOk true ->
+                OpStep.OpRow(
+                    Array.append lrow rrow,
+                    joinLoopGo onExhausted onError lrow rightRows resolve on true (j + 1)
+                )
+            | DbOk false -> joinLoopAdvance onExhausted onError lrow rightRows resolve on matched (j + 1)
+            | DbErr e -> Op.next (onError e matched)
+
     let private joinLoop
         (onExhausted: bool -> Op)
         (onError: DbError -> bool -> Op)
@@ -67,23 +110,22 @@ module internal OpsJoin =
         (resolve: Prepared)
         (on: Expr)
         =
-        let joinPred l r = Eval.matchesJoinedV resolve l r on
+        joinLoopGo onExhausted onError lrow rightRows resolve on false 0
 
-        let rec loop matched i =
-            Op.compute (fun () -> advance matched i)
-
-        and advance matched j =
-            if j >= rightRows.Length then
-                Op.next (onExhausted matched)
-            else
-                let rrow = rightRows.[j]
-
-                match joinPred lrow rrow with
-                | DbOk true -> OpStep.OpRow(Array.append lrow rrow, loop true (j + 1))
-                | DbOk false -> advance matched (j + 1)
-                | DbErr e -> Op.next (onError e matched)
-
-        loop false 0
+    /// INNER の内側ループ（左行を 1つずつ進める）。
+    let rec private innerJoinRows (resolve: Prepared) (rightRows: SqlValue array array) (on: Expr) (cur: Op) =
+        Op.pull
+            (fun lrow lnext ->
+                Op.next (
+                    joinLoop
+                        (fun _ -> innerJoinRows resolve rightRows on lnext)
+                        (fun e _ -> Op.compute (fun () -> OpStep.OpError e))
+                        lrow
+                        rightRows
+                        resolve
+                        on
+                ))
+            cur
 
     let private innerJoinArrays
         (leftSchema: Schema)
@@ -93,22 +135,47 @@ module internal OpsJoin =
         (on: Expr)
         =
         let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
+        innerJoinRows resolve rightRows on left
 
-        let rec joinRows cur =
-            Op.pull
-                (fun lrow lnext ->
-                    Op.next (
-                        joinLoop
-                            (fun _ -> joinRows lnext)
-                            (fun e _ -> Op.compute (fun () -> OpStep.OpError e))
-                            lrow
-                            rightRows
-                            resolve
-                            on
-                    ))
-                cur
+    /// ON 句評価失敗時の Op。
+    let private leftJoinOnError (e: DbError) _ = Op.compute (fun () -> OpStep.OpError e)
 
-        joinRows left
+    /// LEFT JOIN の内側ループ（左行を 1つずつ進める）。
+    [<TailCall>]
+    let rec private leftJoinRows
+        (resolve: Prepared)
+        (rightRows: SqlValue array array)
+        (on: Expr)
+        (width: int)
+        (cur: Op)
+        =
+        Op.pull
+            (fun lrow lnext ->
+                Op.next (
+                    joinLoop
+                        (leftJoinOnExhausted resolve rightRows on width lrow lnext)
+                        leftJoinOnError
+                        lrow
+                        rightRows
+                        resolve
+                        on
+                ))
+            cur
+
+    /// 右が尽きたときの NULL 拡張と継続を作る。
+    and private leftJoinOnExhausted
+        (resolve: Prepared)
+        (rightRows: SqlValue array array)
+        (on: Expr)
+        (width: int)
+        (lrow: SqlValue array)
+        (lnext: Op)
+        (matched: bool)
+        =
+        if matched then
+            leftJoinRows resolve rightRows on width lnext
+        else
+            Op.emit (padWithNulls lrow width) (leftJoinRows resolve rightRows on width lnext)
 
     let private leftJoinArrays
         (leftSchema: Schema)
@@ -118,21 +185,7 @@ module internal OpsJoin =
         (on: Expr)
         =
         let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
-
-        let rec joinRows width cur =
-            Op.pull
-                (fun lrow lnext ->
-                    let onExhausted matched =
-                        if matched then
-                            joinRows width lnext
-                        else
-                            Op.emit (padWithNulls lrow width) (joinRows width lnext)
-
-                    let onError e _ = Op.compute (fun () -> OpStep.OpError e)
-                    Op.next (joinLoop onExhausted onError lrow rightRows resolve on))
-                cur
-
-        joinRows rightSchema.Columns.Length left
+        leftJoinRows resolve rightRows on rightSchema.Columns.Length left
 
     /// 右側を退避したときの入れ子ループ。
     /// 左行ごとに run を先頭から読み直す（I/O は O(左行数 × 右行数) になるが、メモリは一定）。
@@ -140,6 +193,48 @@ module internal OpsJoin =
     /// `joinRows` / `scan` は `Op.compute` の継続内で呼ぶので、1行ごとに 1段だけ進み、
     /// スタックは積み上がらない。
     /// </remarks>
+    /// 退避右側の入れ子ループ（左行を進める）。
+    [<TailCall>]
+    let rec private spilledJoinRows
+        (budget: MemoryBudget)
+        (spool: Spill.RowSpool)
+        (resolve: Prepared)
+        (on: Expr)
+        (cur: Op)
+        =
+        Op.compute (fun () ->
+            match Op.next cur with
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpDone ->
+                Spill.forgetSpool budget.Scope spool
+                Spill.deleteSpool spool
+                OpStep.OpDone
+            | OpStep.OpRow(lrow, lnext) ->
+                match Spill.reopenKeep budget.Scope spool with
+                | Error e -> OpStep.OpError e
+                | Ok rows -> Op.next (spilledScan budget spool resolve on lrow lnext rows))
+
+    /// 退避右側の 1行を評価して次へ進める。
+    and private spilledScan
+        (budget: MemoryBudget)
+        (spool: Spill.RowSpool)
+        (resolve: Prepared)
+        (on: Expr)
+        (lrow: SqlValue array)
+        (lnext: Op)
+        (rows: Op)
+        =
+        Op.compute (fun () ->
+            match Op.next rows with
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpDone -> Op.next (spilledJoinRows budget spool resolve on lnext)
+            | OpStep.OpRow(rrow, rest) ->
+                match Eval.matchesJoinedV resolve lrow rrow on with
+                | DbErr e -> OpStep.OpError e
+                | DbOk true ->
+                    OpStep.OpRow(Array.append lrow rrow, spilledScan budget spool resolve on lrow lnext rest)
+                | DbOk false -> Op.next (spilledScan budget spool resolve on lrow lnext rest))
+
     let private innerJoinSpilled
         (budget: MemoryBudget)
         (spool: Spill.RowSpool)
@@ -149,32 +244,59 @@ module internal OpsJoin =
         (on: Expr)
         =
         let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
+        spilledJoinRows budget spool resolve on left
 
-        let rec joinRows cur =
-            Op.compute (fun () ->
-                match Op.next cur with
-                | OpStep.OpError e -> OpStep.OpError e
-                | OpStep.OpDone ->
-                    Spill.forgetSpool budget.Scope spool
-                    Spill.deleteSpool spool
-                    OpStep.OpDone
-                | OpStep.OpRow(lrow, lnext) ->
-                    match Spill.reopenKeep budget.Scope spool with
-                    | Error e -> OpStep.OpError e
-                    | Ok rows -> Op.next (scan lrow lnext rows))
+    /// 退避右側の LEFT JOIN（左行を進める）。
+    [<TailCall>]
+    let rec private leftSpilledJoinRows
+        (budget: MemoryBudget)
+        (spool: Spill.RowSpool)
+        (resolve: Prepared)
+        (on: Expr)
+        (width: int)
+        (cur: Op)
+        =
+        Op.compute (fun () ->
+            match Op.next cur with
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpDone ->
+                Spill.forgetSpool budget.Scope spool
+                Spill.deleteSpool spool
+                OpStep.OpDone
+            | OpStep.OpRow(lrow, lnext) ->
+                match Spill.reopenKeep budget.Scope spool with
+                | Error e -> OpStep.OpError e
+                | Ok rows -> Op.next (leftSpilledScan budget spool resolve on width lrow lnext rows false))
 
-        and scan lrow lnext rows =
-            Op.compute (fun () ->
-                match Op.next rows with
-                | OpStep.OpError e -> OpStep.OpError e
-                | OpStep.OpDone -> Op.next (joinRows lnext)
-                | OpStep.OpRow(rrow, rest) ->
-                    match Eval.matchesJoinedV resolve lrow rrow on with
-                    | DbErr e -> OpStep.OpError e
-                    | DbOk true -> OpStep.OpRow(Array.append lrow rrow, scan lrow lnext rest)
-                    | DbOk false -> Op.next (scan lrow lnext rest))
-
-        joinRows left
+    /// 退避右側の LEFT JOIN（右行を評価する）。
+    and private leftSpilledScan
+        (budget: MemoryBudget)
+        (spool: Spill.RowSpool)
+        (resolve: Prepared)
+        (on: Expr)
+        (width: int)
+        (lrow: SqlValue array)
+        (lnext: Op)
+        (rows: Op)
+        (matched: bool)
+        =
+        Op.compute (fun () ->
+            match Op.next rows with
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpDone ->
+                if matched then
+                    Op.next (leftSpilledJoinRows budget spool resolve on width lnext)
+                else
+                    OpStep.OpRow(padWithNulls lrow width, leftSpilledJoinRows budget spool resolve on width lnext)
+            | OpStep.OpRow(rrow, rest) ->
+                match Eval.matchesJoinedV resolve lrow rrow on with
+                | DbErr e -> OpStep.OpError e
+                | DbOk true ->
+                    OpStep.OpRow(
+                        Array.append lrow rrow,
+                        leftSpilledScan budget spool resolve on width lrow lnext rest true
+                    )
+                | DbOk false -> Op.next (leftSpilledScan budget spool resolve on width lrow lnext rest matched))
 
     /// 右側を退避したときの LEFT JOIN。
     let private leftJoinSpilled
@@ -187,36 +309,7 @@ module internal OpsJoin =
         =
         let width = rightSchema.Columns.Length
         let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
-
-        let rec joinRows cur =
-            Op.compute (fun () ->
-                match Op.next cur with
-                | OpStep.OpError e -> OpStep.OpError e
-                | OpStep.OpDone ->
-                    Spill.forgetSpool budget.Scope spool
-                    Spill.deleteSpool spool
-                    OpStep.OpDone
-                | OpStep.OpRow(lrow, lnext) ->
-                    match Spill.reopenKeep budget.Scope spool with
-                    | Error e -> OpStep.OpError e
-                    | Ok rows -> Op.next (scan lrow lnext rows false))
-
-        and scan lrow lnext rows matched =
-            Op.compute (fun () ->
-                match Op.next rows with
-                | OpStep.OpError e -> OpStep.OpError e
-                | OpStep.OpDone ->
-                    if matched then
-                        Op.next (joinRows lnext)
-                    else
-                        OpStep.OpRow(padWithNulls lrow width, joinRows lnext)
-                | OpStep.OpRow(rrow, rest) ->
-                    match Eval.matchesJoinedV resolve lrow rrow on with
-                    | DbErr e -> OpStep.OpError e
-                    | DbOk true -> OpStep.OpRow(Array.append lrow rrow, scan lrow lnext rest true)
-                    | DbOk false -> Op.next (scan lrow lnext rest matched))
-
-        joinRows left
+        leftSpilledJoinRows budget spool resolve on width left
 
     /// INNER JOIN（nested loop）。
     /// 右側は内側ループごとに先頭から引き直す。
@@ -242,6 +335,113 @@ module internal OpsJoin =
                 | Spill.RowSpool.Memory rightRows -> ret (leftJoinArrays leftSchema left rightSchema rightRows on)
                 | spool -> ret (leftJoinSpilled budget spool leftSchema left rightSchema on)
 
+    /// 左行を右幅まで NULL で埋める。
+    let private joinPadded (rightWidth: int) (lrow: SqlValue array) = padWithNulls lrow rightWidth
+
+    /// 結合キーで右側を引く走査（`joinProbe` の左行側）。
+    let rec private joinProbeLoop
+        (isLeft: bool)
+        (leftKeys: int array)
+        (rightWidth: int)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (keyFor: SqlValue array -> Result<'Key, DbError>)
+        (lookupRows: 'Key -> Result<Op, DbError>)
+        (cur: Op)
+        =
+        Op.pull
+            (fun lrow lnext ->
+                if hasNullKey lrow leftKeys then
+                    if isLeft then
+                        OpStep.OpRow(
+                            joinPadded rightWidth lrow,
+                            joinProbeLoop isLeft leftKeys rightWidth resolve residual keyFor lookupRows lnext
+                        )
+                    else
+                        Op.next (joinProbeLoop isLeft leftKeys rightWidth resolve residual keyFor lookupRows lnext)
+                else
+                    match keyFor lrow with
+                    | Error e -> OpStep.OpError e
+                    | Ok key ->
+                        match lookupRows key with
+                        | Error e -> OpStep.OpError e
+                        | Ok rows ->
+                            Op.next (
+                                joinProbeEmit
+                                    isLeft
+                                    leftKeys
+                                    rightWidth
+                                    resolve
+                                    residual
+                                    keyFor
+                                    lookupRows
+                                    lrow
+                                    lnext
+                                    rows
+                                    false
+                            ))
+            cur
+
+    /// 結合キーで引いた右行を評価する（`joinProbe` の右行側）。
+    and private joinProbeEmit
+        (isLeft: bool)
+        (leftKeys: int array)
+        (rightWidth: int)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (keyFor: SqlValue array -> Result<'Key, DbError>)
+        (lookupRows: 'Key -> Result<Op, DbError>)
+        (lrow: SqlValue array)
+        (lnext: Op)
+        (rows: Op)
+        (matched: bool)
+        =
+        Op.compute (fun () ->
+            match Op.next rows with
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpDone ->
+                if isLeft && not matched then
+                    OpStep.OpRow(
+                        joinPadded rightWidth lrow,
+                        joinProbeLoop isLeft leftKeys rightWidth resolve residual keyFor lookupRows lnext
+                    )
+                else
+                    Op.next (joinProbeLoop isLeft leftKeys rightWidth resolve residual keyFor lookupRows lnext)
+            | OpStep.OpRow(rrow, rest) ->
+                match residualMatches resolve lrow rrow residual with
+                | DbErr e -> OpStep.OpError e
+                | DbOk false ->
+                    Op.next (
+                        joinProbeEmit
+                            isLeft
+                            leftKeys
+                            rightWidth
+                            resolve
+                            residual
+                            keyFor
+                            lookupRows
+                            lrow
+                            lnext
+                            rest
+                            matched
+                    )
+                | DbOk true ->
+                    OpStep.OpRow(
+                        Array.append lrow rrow,
+                        joinProbeEmit
+                            isLeft
+                            leftKeys
+                            rightWidth
+                            resolve
+                            residual
+                            keyFor
+                            lookupRows
+                            lrow
+                            lnext
+                            rest
+                            true
+                    ))
+
     /// ハッシュ結合 / インデックス入れ子ループの共通ループ。
     /// `keyFor` は左行からルックアップ用のキーを作る
     /// （ハッシュ結合は符号化したバイト列、インデックス探索は索引列の値）。
@@ -260,44 +460,21 @@ module internal OpsJoin =
         (lookupRows: 'Key -> Result<Op, DbError>)
         =
         let rightWidth = rightSchema.Columns.Length
-        let padded lrow = padWithNulls lrow rightWidth
 
         let resolve =
             Eval.prepare (Schema.concat leftSchema rightSchema) (residualExprs residual)
 
-        let rec probe cur =
-            Op.pull
-                (fun lrow lnext ->
-                    if hasNullKey lrow leftKeys then
-                        if isLeft then
-                            OpStep.OpRow(padded lrow, probe lnext)
-                        else
-                            Op.next (probe lnext)
-                    else
-                        match keyFor lrow with
-                        | Error e -> OpStep.OpError e
-                        | Ok key ->
-                            match lookupRows key with
-                            | Error e -> OpStep.OpError e
-                            | Ok rows -> Op.next (emit lrow lnext rows false))
-                cur
+        joinProbeLoop isLeft leftKeys rightWidth resolve residual keyFor lookupRows left
 
-        and emit lrow lnext rows matched =
-            Op.compute (fun () ->
-                match Op.next rows with
-                | OpStep.OpError e -> OpStep.OpError e
-                | OpStep.OpDone ->
-                    if isLeft && not matched then
-                        OpStep.OpRow(padded lrow, probe lnext)
-                    else
-                        Op.next (probe lnext)
-                | OpStep.OpRow(rrow, rest) ->
-                    match residualMatches resolve lrow rrow residual with
-                    | DbErr e -> OpStep.OpError e
-                    | DbOk false -> Op.next (emit lrow lnext rest matched)
-                    | DbOk true -> OpStep.OpRow(Array.append lrow rrow, emit lrow lnext rest true))
-
-        probe left
+    /// ハッシュ表の 1バケットへ行を追加する。
+    let private hashAdd
+        (buckets: System.Collections.Generic.Dictionary<byte array, SqlValue array list>)
+        (key: byte array)
+        (rrow: SqlValue array)
+        =
+        match buckets.TryGetValue key with
+        | true, bucket -> buckets.[key] <- rrow :: bucket
+        | _ -> buckets.[key] <- [ rrow ]
 
     /// 右側のハッシュ表を作る（NULL キーは登録しない）。
     /// キーは順序保持符号化のバイト列（`encodeKey`）なので、
@@ -306,11 +483,6 @@ module internal OpsJoin =
     let private buildHashTable (rightRows: SqlValue array array) (rightKeys: int array) =
         let buckets =
             System.Collections.Generic.Dictionary<byte array, SqlValue array list> HashIdentity.Structural
-
-        let add key rrow =
-            match buckets.TryGetValue key with
-            | true, bucket -> buckets.[key] <- rrow :: bucket
-            | _ -> buckets.[key] <- [ rrow ]
 
         rightRows
         |> foldOk
@@ -321,7 +493,7 @@ module internal OpsJoin =
                     match encodeKey rrow rightKeys with
                     | Error e -> err e
                     | Ok key ->
-                        add key rrow
+                        hashAdd buckets key rrow
                         OkUnit)
             ()
         >>= fun () ->
@@ -341,6 +513,53 @@ module internal OpsJoin =
         | true, bucket -> ret (Op.ofArray bucket)
         | _ -> ret Op.Empty
 
+    /// 左 build 版ハッシュ結合の probe（右行を 1つずつ進める）。
+    let rec private buildLeftProbe
+        (right: Op)
+        (rightKeys: int array)
+        (table: System.Collections.Generic.Dictionary<byte array, SqlValue array array>)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (cur: Op)
+        =
+        Op.pull
+            (fun rrow rnext ->
+                if hasNullKey rrow rightKeys then
+                    Op.next (buildLeftProbe right rightKeys table resolve residual rnext)
+                else
+                    match encodeKey rrow rightKeys with
+                    | Error e -> OpStep.OpError e
+                    | Ok key ->
+                        match lookupHash table key with
+                        | Error e -> OpStep.OpError e
+                        | Ok rows -> Op.next (buildLeftEmit right rightKeys table resolve residual rrow rnext rows))
+            cur
+
+    /// 左 build 版ハッシュ結合の一致行を出す。
+    and private buildLeftEmit
+        (right: Op)
+        (rightKeys: int array)
+        (table: System.Collections.Generic.Dictionary<byte array, SqlValue array array>)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (rrow: SqlValue array)
+        (rnext: Op)
+        (rows: Op)
+        =
+        Op.compute (fun () ->
+            match Op.next rows with
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpDone -> Op.next (buildLeftProbe right rightKeys table resolve residual rnext)
+            | OpStep.OpRow(lrow, rest) ->
+                match residualMatches resolve lrow rrow residual with
+                | DbErr e -> OpStep.OpError e
+                | DbOk false -> Op.next (buildLeftEmit right rightKeys table resolve residual rrow rnext rest)
+                | DbOk true ->
+                    OpStep.OpRow(
+                        Array.append lrow rrow,
+                        buildLeftEmit right rightKeys table resolve residual rrow rnext rest
+                    ))
+
     /// 左をハッシュ表にした INNER ハッシュ結合の probe。
     /// 右行ごとに左の一致行を引き、`左行 ++ 右行` の順で返す（列順は通常の JOIN と同じ）。
     let private joinProbeBuildLeft
@@ -354,48 +573,22 @@ module internal OpsJoin =
         let resolve =
             Eval.prepare (Schema.concat leftSchema rightSchema) (residualExprs residual)
 
-        let rec probe cur =
-            Op.pull
-                (fun rrow rnext ->
-                    if hasNullKey rrow rightKeys then
-                        Op.next (probe rnext)
-                    else
-                        match encodeKey rrow rightKeys with
-                        | Error e -> OpStep.OpError e
-                        | Ok key ->
-                            match lookupHash table key with
-                            | Error e -> OpStep.OpError e
-                            | Ok rows -> Op.next (emit rrow rnext rows))
-                cur
+        buildLeftProbe right rightKeys table resolve residual right
 
-        and emit rrow rnext rows =
-            Op.compute (fun () ->
-                match Op.next rows with
-                | OpStep.OpError e -> OpStep.OpError e
-                | OpStep.OpDone -> Op.next (probe rnext)
-                | OpStep.OpRow(lrow, rest) ->
-                    match residualMatches resolve lrow rrow residual with
-                    | DbErr e -> OpStep.OpError e
-                    | DbOk false -> Op.next (emit rrow rnext rest)
-                    | DbOk true -> OpStep.OpRow(Array.append lrow rrow, emit rrow rnext rest))
-
-        probe right
+    /// 結合結果が尽きたら cleanup を呼ぶ再帰本体。
+    let rec private onExhaustedGo (cleanup: unit -> unit) (cur: Op) =
+        Op.compute (fun () ->
+            match Op.next cur with
+            | OpStep.OpDone ->
+                cleanup ()
+                OpStep.OpDone
+            | OpStep.OpError e ->
+                cleanup ()
+                OpStep.OpError e
+            | OpStep.OpRow(row, nxt) -> OpStep.OpRow(row, onExhaustedGo cleanup nxt))
 
     /// 結合結果が尽きたら `cleanup` を呼ぶ（退避したファイルを確実に消す）。
-    /// `go` は `Op.compute` の継続内の再帰で、1行ごとに 1段だけ進む。
-    let private onExhausted (cleanup: unit -> unit) =
-        let rec go cur =
-            Op.compute (fun () ->
-                match Op.next cur with
-                | OpStep.OpDone ->
-                    cleanup ()
-                    OpStep.OpDone
-                | OpStep.OpError e ->
-                    cleanup ()
-                    OpStep.OpError e
-                | OpStep.OpRow(row, nxt) -> OpStep.OpRow(row, go nxt))
-
-        go
+    let private onExhausted (cleanup: unit -> unit) = onExhaustedGo cleanup
 
     /// マージ結合の入力側の状態。
     /// `MergeStart` はまだ 1行も取り出していない入力、`MergeAt` は現在行と続き。
@@ -404,17 +597,18 @@ module internal OpsJoin =
         | MergeAt of SqlValue array * Op
         | MergeDone
 
+    /// Op から次の 1行を先読みする。
+    let private mergeSideFromOp (op: Op) =
+        match Op.next op with
+        | OpStep.OpError e -> DbErr e
+        | OpStep.OpDone -> DbOk MergeDone
+        | OpStep.OpRow(row, rest) -> DbOk(MergeAt(row, rest))
+
     /// 次の 1行を先読みした状態にする。
     let private pullMergeSide =
-        let fromOp op =
-            match Op.next op with
-            | OpStep.OpError e -> DbErr e
-            | OpStep.OpDone -> DbOk MergeDone
-            | OpStep.OpRow(row, rest) -> DbOk(MergeAt(row, rest))
-
         function
         | MergeStart op
-        | MergeAt(_, op) -> fromOp op
+        | MergeAt(_, op) -> mergeSideFromOp op
         | MergeDone -> DbOk MergeDone
 
     /// まだ 1行も取り出していなければ、先頭行を先読みする。
@@ -445,22 +639,23 @@ module internal OpsJoin =
     /// NULL は最小として並べる（NULL キーは結合しないので順序は任意）。
     /// 比較できない値（Unloaded・型不一致）は 0 を返して並びを保つ。
     /// エラー自体はマージ結合の `compareKeyVectors` が返す。
-    let private compareKeyRows (keys: int array) (a: SqlValue array) (b: SqlValue array) =
-        let rec compareAt i =
-            if i >= keys.Length then
-                0
-            else
-                match a.[keys.[i]], b.[keys.[i]] with
-                | SqlValue.Null, SqlValue.Null -> compareAt (i + 1)
-                | SqlValue.Null, _ -> -1
-                | _, SqlValue.Null -> 1
-                | x, y ->
-                    match SqlValue.compareValuesV x y with
-                    | DbOk 0 -> compareAt (i + 1)
-                    | DbOk c -> c
-                    | DbErr _ -> 0
+    /// 結合キーを位置から順に比較する本体。
+    [<TailCall>]
+    let rec private compareKeyRowsAt (keys: int array) (a: SqlValue array) (b: SqlValue array) (i: int) =
+        if i >= keys.Length then
+            0
+        else
+            match a.[keys.[i]], b.[keys.[i]] with
+            | SqlValue.Null, SqlValue.Null -> compareKeyRowsAt keys a b (i + 1)
+            | SqlValue.Null, _ -> -1
+            | _, SqlValue.Null -> 1
+            | x, y ->
+                match SqlValue.compareValuesV x y with
+                | DbOk 0 -> compareKeyRowsAt keys a b (i + 1)
+                | DbOk c -> c
+                | DbErr _ -> 0
 
-        compareAt 0
+    let private compareKeyRows (keys: int array) (a: SqlValue array) (b: SqlValue array) = compareKeyRowsAt keys a b 0
 
     /// マージ結合フォールバック用に、パーティションの run をキー順に外部ソートする。
     /// 退避に使うメモリは作業メモリを超えないようにする。
@@ -475,62 +670,82 @@ module internal OpsJoin =
 
         ExtSort.sortRows sortBudget () (fun () _ -> DbOk()) (compareKeyRows keys) src
 
+    /// 先頭行と同じ結合キーかどうかを比較する。
+    let private mergeSameKey (keys: int array) (first: SqlValue array) (row: SqlValue array) =
+        match compareKeyVectors 0 keys first keys row with
+        | DbErr e -> err e
+        | DbOk 0 -> ret true
+        | DbOk _ -> ret false
+
+    /// メモリ内に同じキーの行を集める。
+    [<TailCall>]
+    let rec private mergeFill
+        (budget: MemoryBudget)
+        (keys: int array)
+        (first: SqlValue array)
+        (buf: SqlValue array list)
+        (bufBytes: int64)
+        (current: MergeSide)
+        =
+        match pullMergeSide current with
+        | DbErr e -> err e
+        | DbOk MergeDone -> ret (List.rev buf, None, MergeDone)
+        | DbOk(MergeStart _) -> err (DbError.internalError "merge join: 入力状態が不正です")
+        | DbOk(MergeAt(row, _) as next) ->
+            match mergeSameKey keys first row with
+            | Ok false -> ret (List.rev buf, None, next)
+            | Ok true ->
+                let size = int64 (ValueCodec.managedRowBytes row) + 32L
+
+                if MemoryBudget.exceeded (budget.Work, bufBytes + size) then
+                    ret (List.rev buf, Some row, next)
+                else
+                    mergeFill budget keys first (row :: buf) (bufBytes + size) next
+            | Error e -> err e
+
+    /// 退避ファイルへ行をすべて書き出す。
+    [<TailCall>]
+    let rec private mergeWriteAll (sink: Sink) (rest: SqlValue array list) =
+        match rest with
+        | [] -> ret ()
+        | r :: tail ->
+            match Spill.writeRow r sink with
+            | Ok() -> mergeWriteAll sink tail
+            | x -> x
+
+    /// 残りの同じキー行を退避ファイルへ流す。
+    [<TailCall>]
+    let rec private mergeDrain
+        (keys: int array)
+        (sink: Sink)
+        (first: SqlValue array)
+        (count: int)
+        (current: MergeSide)
+        =
+        match pullMergeSide current with
+        | DbErr e -> err e
+        | DbOk MergeDone -> ret (count, MergeDone)
+        | DbOk(MergeStart _) -> err (DbError.internalError "merge join: 入力状態が不正です")
+        | DbOk(MergeAt(row, _) as next) ->
+            match mergeSameKey keys first row with
+            | Ok false -> ret (count, next)
+            | Ok true ->
+                match Spill.writeRow row sink with
+                | Ok() -> mergeDrain keys sink first (count + 1) next
+                | Error e -> err e
+            | Error e -> err e
+
     /// 等値キーの行をまとめて取り出す（入力はキー昇順）。
     /// 返り値は (グループの行, グループの次の行を含む状態)。
     /// グループも上限つきで退避する（`Spill.RowSpool`）。
-    let private takeMergeGroup (budget: MemoryBudget) (keys: int array) (side: MergeSide) =
-        let sameKey first row =
-            match compareKeyVectors 0 keys first keys row with
-            | DbErr e -> err e
-            | DbOk 0 -> ret true
-            | DbOk _ -> ret false
-
-        let rec fill first buf bufBytes current =
-            match pullMergeSide current with
-            | DbErr e -> err e
-            | DbOk MergeDone -> ret (List.rev buf, None, MergeDone)
-            | DbOk(MergeStart _) -> err (DbError.internalError "merge join: 入力状態が不正です")
-            | DbOk(MergeAt(row, _) as next) ->
-                match sameKey first row with
-                | Ok false -> ret (List.rev buf, None, next)
-                | Ok true ->
-                    let size = int64 (ValueCodec.managedRowBytes row) + 32L
-
-                    if MemoryBudget.exceeded (budget.Work, bufBytes + size) then
-                        ret (List.rev buf, Some row, next)
-                    else
-                        fill first (row :: buf) (bufBytes + size) next
-                | Error e -> err e
-
-        let rec writeAll sink rest =
-            match rest with
-            | [] -> ret ()
-            | r :: tail ->
-                match Spill.writeRow r sink with
-                | Ok() -> writeAll sink tail
-                | x -> x
-
-        let rec drain sink first count current =
-            match pullMergeSide current with
-            | DbErr e -> err e
-            | DbOk MergeDone -> ret (count, MergeDone)
-            | DbOk(MergeStart _) -> err (DbError.internalError "merge join: 入力状態が不正です")
-            | DbOk(MergeAt(row, _) as next) ->
-                match sameKey first row with
-                | Ok false -> ret (count, next)
-                | Ok true ->
-                    match Spill.writeRow row sink with
-                    | Ok() -> drain sink first (count + 1) next
-                    | Error e -> err e
-                | Error e -> err e
-
-        match side with
+    let private takeMergeGroup (budget: MemoryBudget) (keys: int array) =
+        function
         | MergeStart _
-        | MergeDone -> ret (Spill.RowSpool.Memory [||], side)
-        | MergeAt(first, _) ->
+        | MergeDone as side -> ret (Spill.RowSpool.Memory [||], side)
+        | MergeAt(first, _) as side ->
             let firstBytes = int64 (ValueCodec.managedRowBytes first) + 32L
 
-            match fill first [ first ] firstBytes side with
+            match mergeFill budget keys first [ first ] firstBytes side with
             | Ok(rows, None, next) -> ret (Spill.RowSpool.Memory(List.toArray rows), next)
             | Ok(rows, Some pending, next) ->
                 let path = Spill.runPath budget.Directory (System.Guid.NewGuid().ToString "N") 0
@@ -539,13 +754,13 @@ module internal OpsJoin =
                 >>= fun sink ->
                     let buffered = rows @ [ pending ]
 
-                    match writeAll sink buffered with
+                    match mergeWriteAll sink buffered with
                     | Error e ->
                         Spill.closeSink sink
                         Spill.unlink path
                         err e
                     | Ok() ->
-                        match drain sink first buffered.Length next with
+                        match mergeDrain keys sink first buffered.Length next with
                         | Error e ->
                             Spill.closeSink sink
                             Spill.unlink path
@@ -630,6 +845,252 @@ module internal OpsJoin =
             | DbOk c when c > 0 -> advanceMergeRight loop lside rside
             | DbOk _ -> emitMergeGroup budget leftKeys rightKeys emitGroup lside rside
 
+    /// マージ結合で左行を右幅まで NULL で埋める。
+    let private mergePadded (rightWidth: int) (lrow: SqlValue array) = padWithNulls lrow rightWidth
+
+    /// マージ結合で残った入力を捨てる Op。
+    let private mergeDrainOp =
+        function
+        | MergeStart op
+        | MergeAt(_, op) -> Op.filter (fun _ -> DbOk false) op
+        | MergeDone -> Op.Empty
+
+    /// マージ結合のメインループ。
+    let rec private mergeJoinLoop
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (rightWidth: int)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (lside: MergeSide)
+        (rside: MergeSide)
+        =
+        match lside, rside with
+        | MergeStart _, _ ->
+            advanceMergeSide
+                (fun lnext -> mergeJoinLoop isLeft budget leftKeys rightKeys rightWidth resolve residual lnext rside)
+                lside
+        | _, MergeStart _ ->
+            advanceMergeSide
+                (fun rnext -> mergeJoinLoop isLeft budget leftKeys rightKeys rightWidth resolve residual lside rnext)
+                rside
+        | MergeDone, _ -> mergeDrainOp rside
+        | _, MergeDone ->
+            if not isLeft then
+                mergeDrainOp lside
+            else
+                match lside with
+                | MergeAt(lrow, _) ->
+                    Op.compute (fun () ->
+                        match pullMergeSide lside with
+                        | DbErr e -> OpStep.OpError e
+                        | DbOk lnext ->
+                            OpStep.OpRow(
+                                mergePadded rightWidth lrow,
+                                mergeJoinLoop
+                                    isLeft
+                                    budget
+                                    leftKeys
+                                    rightKeys
+                                    rightWidth
+                                    resolve
+                                    residual
+                                    lnext
+                                    MergeDone
+                            ))
+                | _ -> Op.Empty
+        | MergeAt(lrow, _), MergeAt(rrow, _) ->
+            stepMerge
+                isLeft
+                budget
+                leftKeys
+                rightKeys
+                (mergePadded rightWidth)
+                (mergeJoinEmitGroup isLeft budget leftKeys rightKeys rightWidth resolve residual)
+                (mergeJoinLoop isLeft budget leftKeys rightKeys rightWidth resolve residual)
+                lside
+                rside
+                lrow
+                rrow
+
+    /// マージ結合で一致したグループを出力する。
+    and private mergeJoinEmitGroup
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (rightWidth: int)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (lspool: Spill.RowSpool)
+        (rspool: Spill.RowSpool)
+        (lnext: MergeSide)
+        (rnext: MergeSide)
+        =
+        match Spill.reopenKeep budget.Scope lspool with
+        | Error e -> Op.compute (fun () -> OpStep.OpError e)
+        | Ok lrows ->
+            mergeJoinNextLeft
+                isLeft
+                budget
+                leftKeys
+                rightKeys
+                rightWidth
+                resolve
+                residual
+                lspool
+                rspool
+                lnext
+                rnext
+                lrows
+
+    /// 一致グループの左行を順に出力する。
+    and private mergeJoinNextLeft
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (rightWidth: int)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (lspool: Spill.RowSpool)
+        (rspool: Spill.RowSpool)
+        (lnext: MergeSide)
+        (rnext: MergeSide)
+        (lrows: Op)
+        =
+        Op.compute (fun () ->
+            match Op.next lrows with
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpDone ->
+                Spill.forgetSpool budget.Scope lspool
+                Spill.deleteSpool lspool
+                Spill.forgetSpool budget.Scope rspool
+                Spill.deleteSpool rspool
+                Op.next (mergeJoinLoop isLeft budget leftKeys rightKeys rightWidth resolve residual lnext rnext)
+            | OpStep.OpRow(lrow, lrest) ->
+                match Spill.reopenKeep budget.Scope rspool with
+                | Error e -> OpStep.OpError e
+                | Ok rrows ->
+                    Op.next (
+                        mergeJoinNextRight
+                            isLeft
+                            budget
+                            leftKeys
+                            rightKeys
+                            rightWidth
+                            resolve
+                            residual
+                            lspool
+                            rspool
+                            lnext
+                            rnext
+                            lrow
+                            lrest
+                            rrows
+                            false
+                    ))
+
+    /// 一致グループの右行を評価する。
+    and private mergeJoinNextRight
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (rightWidth: int)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (lspool: Spill.RowSpool)
+        (rspool: Spill.RowSpool)
+        (lnext: MergeSide)
+        (rnext: MergeSide)
+        (lrow: SqlValue array)
+        (lrest: Op)
+        (rrows: Op)
+        (matched: bool)
+        =
+        Op.compute (fun () ->
+            match Op.next rrows with
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpDone ->
+                if isLeft && not matched then
+                    OpStep.OpRow(
+                        mergePadded rightWidth lrow,
+                        mergeJoinNextLeft
+                            isLeft
+                            budget
+                            leftKeys
+                            rightKeys
+                            rightWidth
+                            resolve
+                            residual
+                            lspool
+                            rspool
+                            lnext
+                            rnext
+                            lrest
+                    )
+                else
+                    Op.next (
+                        mergeJoinNextLeft
+                            isLeft
+                            budget
+                            leftKeys
+                            rightKeys
+                            rightWidth
+                            resolve
+                            residual
+                            lspool
+                            rspool
+                            lnext
+                            rnext
+                            lrest
+                    )
+            | OpStep.OpRow(rrow, rrest) ->
+                match residualMatches resolve lrow rrow residual with
+                | DbErr e -> OpStep.OpError e
+                | DbOk false ->
+                    Op.next (
+                        mergeJoinNextRight
+                            isLeft
+                            budget
+                            leftKeys
+                            rightKeys
+                            rightWidth
+                            resolve
+                            residual
+                            lspool
+                            rspool
+                            lnext
+                            rnext
+                            lrow
+                            lrest
+                            rrest
+                            matched
+                    )
+                | DbOk true ->
+                    OpStep.OpRow(
+                        Array.append lrow rrow,
+                        mergeJoinNextRight
+                            isLeft
+                            budget
+                            leftKeys
+                            rightKeys
+                            rightWidth
+                            resolve
+                            residual
+                            lspool
+                            rspool
+                            lnext
+                            rnext
+                            lrow
+                            lrest
+                            rrest
+                            true
+                    ))
+
     /// マージ結合。両入力は結合キーで昇順に並んでいる必要がある
     /// （`Analyzer.chooseJoinAlgorithm` が走査の並び順を確認して選ぶ）。
     /// 右側を materialize せず、両側を 1行ずつ流す。
@@ -648,73 +1109,206 @@ module internal OpsJoin =
         (residual: Expr option)
         =
         let rightWidth = rightSchema.Columns.Length
-        let padded lrow = padWithNulls lrow rightWidth
 
         let resolve =
             Eval.prepare (Schema.concat leftSchema rightSchema) (residualExprs residual)
 
-        let drain =
-            function
-            | MergeStart op
-            | MergeAt(_, op) -> Op.filter (fun _ -> DbOk false) op
-            | MergeDone -> Op.Empty
+        mergeJoinLoop isLeft budget leftKeys rightKeys rightWidth resolve residual (MergeStart left) (MergeStart right)
 
-        let rec loop lside rside =
-            match lside, rside with
-            | MergeStart _, _ -> advanceMergeSide (fun lnext -> loop lnext rside) lside
-            | _, MergeStart _ -> advanceMergeSide (fun rnext -> loop lside rnext) rside
-            | MergeDone, _ -> drain rside
-            | _, MergeDone ->
-                if not isLeft then
-                    drain lside
-                else
-                    match lside with
-                    | MergeAt(lrow, _) ->
-                        Op.compute (fun () ->
-                            match pullMergeSide lside with
-                            | DbErr e -> OpStep.OpError e
-                            | DbOk lnext -> OpStep.OpRow(padded lrow, loop lnext MergeDone))
-                    | _ -> Op.Empty
-            | MergeAt(lrow, _), MergeAt(rrow, _) ->
-                stepMerge isLeft budget leftKeys rightKeys padded emitGroup loop lside rside lrow rrow
+    /// パーティション分割用に結合キーを順序保持符号化する。
+    let private hashKeyBytes (keys: int array) (row: SqlValue array) = encodeKey row keys
 
-        and emitGroup lspool rspool lnext rnext =
-            match Spill.reopenKeep budget.Scope lspool with
-            | Error e -> Op.compute (fun () -> OpStep.OpError e)
-            | Ok lrows -> nextLeft lspool rspool lnext rnext lrows
+    /// 退避した spool をスコープへ登録して台帳に積む。
+    let private hashRegister
+        (budget: MemoryBudget)
+        (spools: System.Collections.Generic.List<Spill.RowSpool>)
+        (spool: Spill.RowSpool)
+        =
+        Spill.registerSpool budget.Scope spool
+        spools.Add spool
+        spool
 
-        and nextLeft lspool rspool lnext rnext lrows =
-            Op.compute (fun () ->
-                match Op.next lrows with
-                | OpStep.OpError e -> OpStep.OpError e
-                | OpStep.OpDone ->
-                    Spill.forgetSpool budget.Scope lspool
-                    Spill.deleteSpool lspool
+    /// 再分割の深さ上限。
+    [<Literal>]
+    let private MaxPartitionDepth = 4
+
+    /// 再分割の総数の上限（1回で両側 16本ずつ作る）。
+    [<Literal>]
+    let private MaxPartitionSplits = 128
+
+    /// 片側をパーティションへ分割し、spool として登録する。
+    let private hashPartitionSide
+        (budget: MemoryBudget)
+        (stamp: string)
+        (spools: System.Collections.Generic.List<Spill.RowSpool>)
+        (serial: int)
+        (keys: int array)
+        (src: Op)
+        =
+        Spill.openPartitions budget.Directory stamp serial Spill.Partitions
+        >>= fun writer ->
+            match Spill.fillPartitions writer (hashKeyBytes keys) (fun _ row -> row) 0L src with
+            | Error e ->
+                writer.Abandon()
+                err e
+            | Ok _ ->
+                writer.Close()
+
+                writer.Paths
+                |> Array.map (fun p -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0)))
+                |> ret
+
+    /// 1つの spool を salt 付きで再分割する。
+    let private hashRepartitionOne
+        (budget: MemoryBudget)
+        (stamp: string)
+        (spools: System.Collections.Generic.List<Spill.RowSpool>)
+        (salt: uint64)
+        (side: string)
+        (keys: int array)
+        =
+        function
+        | Spill.RowSpool.Memory rows -> ret [| Spill.RowSpool.Memory rows |]
+        | Spill.RowSpool.Disk([ path ], _) ->
+            let callStamp = System.Guid.NewGuid().ToString "N"
+
+            Spill.repartitionRun
+                budget.Directory
+                (sprintf "%s-%s-%s" stamp side callStamp)
+                0
+                Spill.Partitions
+                salt
+                (hashKeyBytes keys)
+                path
+            |> Result.map (
+                List.map (fun p -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0)))
+                >> Array.ofList
+            )
+        | Spill.RowSpool.Disk _ -> err (DbError.internalError "hash join: パーティションが複数の run です")
+
+    /// パーティションを明示スタックで 1つずつ処理する（末尾再帰）。
+    [<TailCall>]
+    let rec private hashJoinWork
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (leftSchema: Schema)
+        (leftKeys: int array)
+        (rightSchema: Schema)
+        (rightKeys: int array)
+        (residual: Expr option)
+        (spools: System.Collections.Generic.List<Spill.RowSpool>)
+        (stamp: string)
+        (splits: int)
+        (acc: Op list)
+        (work: (int * uint64 * Spill.RowSpool * Spill.RowSpool) list)
+        =
+        match work with
+        | [] -> ret (List.foldBack Op.append (List.rev acc) Op.Empty)
+        | (depth, salt, lspool, rspool) :: rest ->
+            match Spill.reopenKeep budget.Scope rspool >>= Spill.spool budget with
+            | Ok(Spill.RowSpool.Memory rightRows) ->
+                match buildHashTable rightRows rightKeys with
+                | Ok table ->
                     Spill.forgetSpool budget.Scope rspool
                     Spill.deleteSpool rspool
-                    Op.next (loop lnext rnext)
-                | OpStep.OpRow(lrow, lrest) ->
-                    match Spill.reopenKeep budget.Scope rspool with
-                    | Error e -> OpStep.OpError e
-                    | Ok rrows -> Op.next (nextRight lspool rspool lnext rnext lrow lrest rrows false))
 
-        and nextRight lspool rspool lnext rnext lrow lrest rrows matched =
-            Op.compute (fun () ->
-                match Op.next rrows with
-                | OpStep.OpError e -> OpStep.OpError e
-                | OpStep.OpDone ->
-                    if isLeft && not matched then
-                        OpStep.OpRow(padded lrow, nextLeft lspool rspool lnext rnext lrest)
-                    else
-                        Op.next (nextLeft lspool rspool lnext rnext lrest)
-                | OpStep.OpRow(rrow, rrest) ->
-                    match residualMatches resolve lrow rrow residual with
-                    | DbErr e -> OpStep.OpError e
-                    | DbOk false -> Op.next (nextRight lspool rspool lnext rnext lrow lrest rrest matched)
-                    | DbOk true ->
-                        OpStep.OpRow(Array.append lrow rrow, nextRight lspool rspool lnext rnext lrow lrest rrest true))
+                    match Spill.reopen budget.Scope lspool with
+                    | Ok l ->
+                        let op =
+                            joinProbe
+                                isLeft
+                                leftSchema
+                                l
+                                leftKeys
+                                rightSchema
+                                residual
+                                (fun row -> encodeKey row leftKeys)
+                                (lookupHash table)
 
-        loop (MergeStart left) (MergeStart right)
+                        hashJoinWork
+                            isLeft
+                            budget
+                            leftSchema
+                            leftKeys
+                            rightSchema
+                            rightKeys
+                            residual
+                            spools
+                            stamp
+                            splits
+                            (op :: acc)
+                            rest
+                    | Error e -> err e
+                | Error e -> err e
+            | Ok rightSpool when depth < MaxPartitionDepth && splits < MaxPartitionSplits ->
+                Spill.forgetSpool budget.Scope rightSpool
+                Spill.deleteSpool rightSpool
+
+                match hashRepartitionOne budget stamp spools salt "l" leftKeys lspool with
+                | Ok lparts ->
+                    match hashRepartitionOne budget stamp spools salt "r" rightKeys rspool with
+                    | Ok rparts ->
+                        let next =
+                            Array.map2 (fun l r -> depth + 1, salt + 1UL, l, r) lparts rparts
+                            |> Array.toList
+
+                        hashJoinWork
+                            isLeft
+                            budget
+                            leftSchema
+                            leftKeys
+                            rightSchema
+                            rightKeys
+                            residual
+                            spools
+                            stamp
+                            (splits + 1)
+                            acc
+                            (next @ rest)
+                    | Error e -> err e
+                | Error e -> err e
+            | Ok rightSpool ->
+                Spill.forgetSpool budget.Scope rightSpool
+                Spill.deleteSpool rightSpool
+
+                match Spill.reopen budget.Scope lspool with
+                | Ok l ->
+                    match sortByJoinKey budget leftKeys l with
+                    | Ok sortedLeft ->
+                        match Spill.reopen budget.Scope rspool with
+                        | Ok r ->
+                            match sortByJoinKey budget rightKeys r with
+                            | Ok sortedRight ->
+                                let op =
+                                    mergeJoinWith
+                                        isLeft
+                                        budget
+                                        leftSchema
+                                        sortedLeft
+                                        leftKeys
+                                        rightSchema
+                                        sortedRight
+                                        rightKeys
+                                        residual
+
+                                hashJoinWork
+                                    isLeft
+                                    budget
+                                    leftSchema
+                                    leftKeys
+                                    rightSchema
+                                    rightKeys
+                                    residual
+                                    spools
+                                    stamp
+                                    splits
+                                    (op :: acc)
+                                    rest
+                            | Error e -> err e
+                        | Error e -> err e
+                    | Error e -> err e
+                | Error e -> err e
+            | Error e -> err e
 
     /// ハッシュ結合の外部版。
     /// 両側を結合キーで `Spill.Partitions` 本に分割し、
@@ -739,131 +1333,14 @@ module internal OpsJoin =
         =
         let stamp = System.Guid.NewGuid().ToString "N"
         let spools = System.Collections.Generic.List<Spill.RowSpool>()
-        let maxDepth = 4
 
-        /// 再分割の総数の上限。
-        /// 1回で両側 16本ずつ作るので、これ × 32 本が一時ファイル数の上限になる
-        /// （上限に達したら整列マージフォールバックへ回す）。
-        let maxSplits = 128
-
-        let keyBytes keys row = encodeKey row keys
-
-        let register spool =
-            Spill.registerSpool budget.Scope spool
-            spools.Add spool
-            spool
-
-        let partitionSide serial keys src =
-            Spill.openPartitions budget.Directory stamp serial Spill.Partitions
-            >>= fun writer ->
-                match Spill.fillPartitions writer (keyBytes keys) (fun _ row -> row) 0L src with
-                | Error e ->
-                    writer.Abandon()
-                    err e
-                | Ok _ ->
-                    writer.Close()
-
-                    writer.Paths
-                    |> Array.map (fun p -> register (Spill.RowSpool.Disk([ p ], 0)))
-                    |> ret
-
-        let repartitionOne salt side keys =
-            function
-            | Spill.RowSpool.Memory rows -> ret [| Spill.RowSpool.Memory rows |]
-            | Spill.RowSpool.Disk([ path ], _) ->
-                let callStamp = System.Guid.NewGuid().ToString "N"
-
-                Spill.repartitionRun
-                    budget.Directory
-                    (sprintf "%s-%s-%s" stamp side callStamp)
-                    0
-                    Spill.Partitions
-                    salt
-                    (keyBytes keys)
-                    path
-                |> Result.map (List.map (fun p -> register (Spill.RowSpool.Disk([ p ], 0))) >> Array.ofList)
-            | Spill.RowSpool.Disk _ -> err (DbError.internalError "hash join: パーティションが複数の run です")
-
-        let rec joinWork splits acc =
-            function
-            | [] -> ret (List.foldBack Op.append (List.rev acc) Op.Empty)
-            | (depth, salt, lspool, rspool) :: rest ->
-                match Spill.reopenKeep budget.Scope rspool >>= Spill.spool budget with
-                | Ok(Spill.RowSpool.Memory rightRows) ->
-                    match buildHashTable rightRows rightKeys with
-                    | Ok table ->
-                        Spill.forgetSpool budget.Scope rspool
-                        Spill.deleteSpool rspool
-
-                        match Spill.reopen budget.Scope lspool with
-                        | Ok l ->
-                            let op =
-                                joinProbe
-                                    isLeft
-                                    leftSchema
-                                    l
-                                    leftKeys
-                                    rightSchema
-                                    residual
-                                    (fun row -> encodeKey row leftKeys)
-                                    (lookupHash table)
-
-                            joinWork splits (op :: acc) rest
-                        | Error e -> err e
-                    | Error e -> err e
-                | Ok rightSpool when depth < maxDepth && splits < maxSplits ->
-                    Spill.forgetSpool budget.Scope rightSpool
-                    Spill.deleteSpool rightSpool
-
-                    match repartitionOne salt "l" leftKeys lspool with
-                    | Ok lparts ->
-                        match repartitionOne salt "r" rightKeys rspool with
-                        | Ok rparts ->
-                            let next =
-                                Array.map2 (fun l r -> depth + 1, salt + 1UL, l, r) lparts rparts
-                                |> Array.toList
-
-                            joinWork (splits + 1) acc (next @ rest)
-                        | Error e -> err e
-                    | Error e -> err e
-                | Ok rightSpool ->
-                    Spill.forgetSpool budget.Scope rightSpool
-                    Spill.deleteSpool rightSpool
-
-                    match Spill.reopen budget.Scope lspool with
-                    | Ok l ->
-                        match sortByJoinKey budget leftKeys l with
-                        | Ok sortedLeft ->
-                            match Spill.reopen budget.Scope rspool with
-                            | Ok r ->
-                                match sortByJoinKey budget rightKeys r with
-                                | Ok sortedRight ->
-                                    let op =
-                                        mergeJoinWith
-                                            isLeft
-                                            budget
-                                            leftSchema
-                                            sortedLeft
-                                            leftKeys
-                                            rightSchema
-                                            sortedRight
-                                            rightKeys
-                                            residual
-
-                                    joinWork splits (op :: acc) rest
-                                | Error e -> err e
-                            | Error e -> err e
-                        | Error e -> err e
-                    | Error e -> err e
-                | Error e -> err e
-
-        partitionSide 0 leftKeys left
+        hashPartitionSide budget stamp spools 0 leftKeys left
         >>= fun lparts ->
-            partitionSide Spill.Partitions rightKeys right
+            hashPartitionSide budget stamp spools Spill.Partitions rightKeys right
             >>= fun rparts ->
                 let work = Array.map2 (fun l r -> 0, 1UL, l, r) lparts rparts |> Array.toList
 
-                joinWork 0 [] work
+                hashJoinWork isLeft budget leftSchema leftKeys rightSchema rightKeys residual spools stamp 0 [] work
                 |> Result.map (
                     onExhausted (fun () ->
                         for sp in spools do
@@ -1017,7 +1494,14 @@ module internal OpsJoin =
 
     /// INNER JOIN（インデックス入れ子ループ）。
     /// 索引検索の結果は materialize せず 1行ずつ流す。
-    let innerJoinIndexed leftSchema left leftKeys rightSchema residual lookupRows =
+    let innerJoinIndexed
+        (leftSchema: Schema)
+        (left: Op)
+        (leftKeys: int array)
+        (rightSchema: Schema)
+        (residual: Expr option)
+        (lookupRows: SqlValue array -> Result<Op, DbError>)
+        =
         match checkResidual leftSchema rightSchema residual with
         | Error e -> err e
         | Ok() ->
@@ -1034,7 +1518,14 @@ module internal OpsJoin =
             )
 
     /// LEFT JOIN（インデックス入れ子ループ）。
-    let leftJoinIndexed leftSchema left leftKeys rightSchema residual lookupRows =
+    let leftJoinIndexed
+        (leftSchema: Schema)
+        (left: Op)
+        (leftKeys: int array)
+        (rightSchema: Schema)
+        (residual: Expr option)
+        (lookupRows: SqlValue array -> Result<Op, DbError>)
+        =
         match checkResidual leftSchema rightSchema residual with
         | Error e -> err e
         | Ok() ->

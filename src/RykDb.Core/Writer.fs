@@ -57,6 +57,7 @@ module internal Writer =
     let str (s: string) =
         lengthPrefixed (System.Text.Encoding.UTF8.GetBytes s)
 
+    [<TailCall>]
     let rec writeVarintTo (out: byte array) (pos: int) (v: uint64) =
         if v >= 0x80UL then
             out.[pos] <- byte (v &&& 0x7FUL ||| 0x80UL)
@@ -65,14 +66,15 @@ module internal Writer =
             out.[pos] <- byte v
             pos + 1
 
-    let varintLength (v: uint64) =
-        let rec loop bytes value =
-            if value < 0x80UL then
-                bytes + 1
-            else
-                loop (bytes + 1) (value >>> 7)
+    /// varint が占めるバイト数を上位桁から数える。
+    [<TailCall>]
+    let rec private varintLengthLoop (bytes: int) (value: uint64) =
+        if value < 0x80UL then
+            bytes + 1
+        else
+            varintLengthLoop (bytes + 1) (value >>> 7)
 
-        loop 0 v
+    let varintLength (v: uint64) = varintLengthLoop 0 v
 
     let private chunkLength =
         function
@@ -103,6 +105,16 @@ module internal Writer =
                 out.[pos + i] <- byte (v >>> 8 * i &&& 0xFFu)
         | Varint v -> writeVarintTo out pos v |> ignore
 
+    /// 逆順のチャンク列を出力配列の末尾から埋めていく。
+    [<TailCall>]
+    let rec private fillChunks (out: byte array) (pos: int) (chunks: WriterChunk list) =
+        match chunks with
+        | [] -> out
+        | chunk :: rest ->
+            let next = pos - chunkLength chunk
+            writeChunk out next chunk
+            fillChunks out next rest
+
     /// 全チャンクを 1本のバイト列に平坦化する。
     /// チャンク列は逆順（先頭が最後の書き込み）なので、
     /// 出力配列の末尾から埋めて `List.rev` を不要にする。
@@ -110,15 +122,7 @@ module internal Writer =
         let total = length w
         let out = Array.zeroCreate<byte> total
 
-        let rec fill pos chunks =
-            match chunks with
-            | [] -> out
-            | chunk :: rest ->
-                let next = pos - chunkLength chunk
-                writeChunk out next chunk
-                fill next rest
-
-        fill total w.Chunks
+        fillChunks out total w.Chunks
 
     /// 書き出し手順を左から順に適用して 1本のバイト列にする。
     /// 要素は Writer.varint x のような部分適用で書ける。

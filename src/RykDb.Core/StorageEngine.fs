@@ -85,31 +85,108 @@ module internal StorageEngine =
 
     let private readInfoIn (f: FileMetaData) (engine: StorageEngine) = readInfoOf engine.Dir f
 
+    /// 行の列挙子から遅延走査を作る（終端で列挙子を閉じる）。
+    [<TailCall>]
+    let rec private pullFromEnumerator (e: System.Collections.Generic.IEnumerator<SstEntry>) () =
+        if e.MoveNext() then
+            SstScan.emit (pullFromEnumerator e) e.Current
+        else
+            (e :> System.IDisposable).Dispose() |> ignore
+            SstScan.Empty
+
+    /// 行列を SstScan に変換する。
+    let private seqToScan (rows: SstEntry seq) =
+        let e = rows.GetEnumerator()
+        pullFromEnumerator e ()
+
+    /// ファイルの走査開始キーを、要求キーとの大きい方に取る。
+    let private sourceBound (startKey: byte array) (f: FileMetaData) =
+        if Bytes.compare f.Smallest startKey > 0 then
+            f.Smallest
+        else
+            startKey
+
+    /// 未オープンのファイルを開き、先頭 1件をマージへ登録する。
+    let private openPending
+        (engine: StorageEngine)
+        (maskOpt: bool array option)
+        (startKey: byte array)
+        (index: int)
+        (f: FileMetaData)
+        (merge: SstMerge)
+        =
+        readInfoIn f engine
+        >>= fun info ->
+            match maskOpt with
+            | None -> Sstable.rangeScanPartial startKey 0 info
+            | Some mask when mask.Length = 0 -> Sstable.rangeScanPartialSkipped startKey 0 info
+            | Some mask -> Sstable.rangeScanPartialMasked mask startKey 0 info
+            |> ret
+            >>= fun scan ->
+                match SstScan.next scan with
+                | Ok None -> ret merge
+                | Ok(Some(e, nxt)) -> ret (SstMerge.insert index e nxt merge)
+                | Error e -> err e
+
+    /// 現在の最上位より小さいキー範囲のファイルを先に開く。
+    [<TailCall>]
+    let rec private prepareScan
+        (engine: StorageEngine)
+        (maskOpt: bool array option)
+        (startKey: byte array)
+        (pending: (int * byte array * FileMetaData) list)
+        (merge: SstMerge)
+        =
+        match pending with
+        | [] -> ret (merge, [])
+        | (index, bound, f) :: rest ->
+            match SstMerge.top merge with
+            | Some top when Bytes.compare bound top.Key > 0 -> ret (merge, pending)
+            | _ ->
+                match openPending engine maskOpt startKey index f merge with
+                | Ok merge' -> prepareScan engine maskOpt startKey rest merge'
+                | Error e -> err e
+
+    /// snapshot に対して可視かどうかを判定する。
+    let private isVisibleEntry (visible: uint64 option) (e: SstEntry) =
+        match visible with
+        | Some s -> e.SeqNo <= s
+        | None -> true
+
     /// バックグラウンド compaction 用の走査。
     /// ファイルの先頭から全件を遅延して読む。
     /// compaction はキー・SeqNo・削除タグしか見ないので、値は復号せずスライスのまま渡す。
     let openScan (dir: string) (f: FileMetaData) =
         readInfoOf dir f >>= fun info -> ret (Sstable.rangeScanPartialRaw [||] 0 info)
 
+    /// 列マスク付きポイントルックアップのファイル走査本体。
+    [<TailCall>]
+    let rec private probeAtMasked
+        (visible: uint64 option)
+        (key: byte array)
+        (mask: bool array)
+        (engine: StorageEngine)
+        =
+        function
+        | [] -> ret None
+        | f :: rest ->
+            match readInfoIn f engine with
+            | Ok info ->
+                match Sstable.lookupMasked mask key visible info with
+                | Ok(Some e) -> ret (Some e)
+                | Ok None -> probeAtMasked visible key mask engine rest
+                | Error e -> err e
+            | Error e -> err e
+
     /// 列マスク付きのポイントルックアップ。
     let getAtMasked (visible: uint64 option) (key: byte array) (mask: bool array) (engine: StorageEngine) =
-        let rec probe files =
-            match files with
-            | [] -> ret None
-            | f :: rest ->
-                match readInfoIn f engine with
-                | Ok info ->
-                    match Sstable.lookupMasked mask key visible info with
-                    | Ok(Some e) -> ret (Some e)
-                    | Ok None -> probe rest
-                    | Error e -> err e
-                | Error e -> err e
-
         match Memtable.getVisible key visible engine.Mem with
         | Some e ->
             let value = e.Value |> Option.map (SqlValue.maskRow mask)
             ret (Some(SstEntry.make e.Key e.SeqNo value))
-        | None -> Version.filesForPointLookup key engine.Version |> probe
+        | None ->
+            Version.filesForPointLookup key engine.Version
+            |> probeAtMasked visible key mask engine
 
     /// 遅延走査の状態。
     /// `next` を呼ぶたびに、未オープンのファイルを必要な分だけ開き、
@@ -125,6 +202,62 @@ module internal StorageEngine =
             /// 出力済みの件数（limit 用。tombstone は数えない）
             Count: int
         }
+
+    /// 走査が持つマージのソースを閉じる。
+    let private closeScanState (state: ScanState) = SstMerge.dispose state.Merge
+
+    /// マージから可視・最新・非 tombstone の 1件を取り出す。
+    let rec private stepScanState
+        (limit: int)
+        (visible: uint64 option)
+        (engine: StorageEngine)
+        (maskOpt: bool array option)
+        (startKey: byte array)
+        (state: ScanState)
+        =
+        if limit > 0 && state.Count >= limit then
+            ret None
+        else
+            match prepareScan engine maskOpt startKey state.Pending state.Merge with
+            | Ok(ready, remaining) ->
+                match SstMerge.next ready with
+                | Ok None -> ret None
+                | Ok(Some(e, merge')) ->
+                    let sameKey =
+                        match state.EmittedKey with
+                        | Some k -> Bytes.compare k e.Key = 0
+                        | None -> false
+
+                    if sameKey || not (isVisibleEntry visible e) then
+                        { state with
+                            Pending = remaining
+                            Merge = merge'
+                        }
+                        |> stepScanState limit visible engine maskOpt startKey
+                    else
+                        let appended = e.Value.IsSome
+
+                        let advanced =
+                            { state with
+                                Pending = remaining
+                                Merge = merge'
+                                EmittedKey = Some e.Key
+                                Count = if appended then state.Count + 1 else state.Count
+                            }
+
+                        if appended then
+                            Some(
+                                e,
+                                SstScan.ofState
+                                    advanced
+                                    (stepScanState limit visible engine maskOpt startKey)
+                                    closeScanState
+                            )
+                            |> ret
+                        else
+                            stepScanState limit visible engine maskOpt startKey advanced
+                | Error e -> err e
+            | Error e -> err e
 
     /// 範囲ルックアップ。
     /// キー昇順の pull（`SstScan`）を返す。
@@ -143,94 +276,6 @@ module internal StorageEngine =
         (maskOpt: bool array option)
         (engine: StorageEngine)
         =
-        let seqToScan (rows: SstEntry seq) =
-            let e = rows.GetEnumerator()
-
-            let rec pull () =
-                if e.MoveNext() then
-                    SstScan.emit pull e.Current
-                else
-                    (e :> System.IDisposable).Dispose() |> ignore
-                    SstScan.Empty
-
-            pull ()
-
-        let sourceBound startKey f =
-            if Bytes.compare f.Smallest startKey > 0 then
-                f.Smallest
-            else
-                startKey
-
-        let openPending index f merge =
-            readInfoIn f engine
-            >>= fun info ->
-                match maskOpt with
-                | None -> Sstable.rangeScanPartial startKey 0 info
-                | Some mask when mask.Length = 0 -> Sstable.rangeScanPartialSkipped startKey 0 info
-                | Some mask -> Sstable.rangeScanPartialMasked mask startKey 0 info
-                |> ret
-                >>= fun scan ->
-                    match SstScan.next scan with
-                    | Ok None -> ret merge
-                    | Ok(Some(e, nxt)) -> ret (SstMerge.insert index e nxt merge)
-                    | Error e -> err e
-
-        let rec prepare pending merge =
-            match pending with
-            | [] -> ret (merge, [])
-            | (index, bound, f) :: rest ->
-                match SstMerge.top merge with
-                | Some top when Bytes.compare bound top.Key > 0 -> ret (merge, pending)
-                | _ ->
-                    match openPending index f merge with
-                    | Ok merge' -> prepare rest merge'
-                    | Error e -> err e
-
-        let isVisible e =
-            match visible with
-            | Some s -> e.SeqNo <= s
-            | None -> true
-
-        let closeState state = SstMerge.dispose state.Merge
-
-        let rec stepObj state =
-            if limit > 0 && state.Count >= limit then
-                ret None
-            else
-                match prepare state.Pending state.Merge with
-                | Ok(ready, remaining) ->
-                    match SstMerge.next ready with
-                    | Ok None -> ret None
-                    | Ok(Some(e, merge')) ->
-                        let sameKey =
-                            match state.EmittedKey with
-                            | Some k -> Bytes.compare k e.Key = 0
-                            | None -> false
-
-                        if sameKey || not (isVisible e) then
-                            { state with
-                                Pending = remaining
-                                Merge = merge'
-                            }
-                            |> stepObj
-                        else
-                            let appended = e.Value.IsSome
-
-                            let advanced =
-                                { state with
-                                    Pending = remaining
-                                    Merge = merge'
-                                    EmittedKey = Some e.Key
-                                    Count = if appended then state.Count + 1 else state.Count
-                                }
-
-                            if appended then
-                                Some(e, SstScan.ofState advanced stepObj closeState) |> ret
-                            else
-                                stepObj advanced
-                    | Error e -> err e
-                | Error e -> err e
-
         let pendingFiles =
             Version.allFiles engine.Version
             |> List.filter (fun f -> Bytes.compare f.Largest startKey >= 0)
@@ -257,8 +302,8 @@ module internal StorageEngine =
                     EmittedKey = None
                     Count = 0
                 }
-                stepObj
-                closeState
+                (stepScanState limit visible engine maskOpt startKey)
+                closeScanState
             |> ret
         | Ok(Some(e, nxt)) ->
             SstScan.ofState
@@ -268,33 +313,46 @@ module internal StorageEngine =
                     EmittedKey = None
                     Count = 0
                 }
-                stepObj
-                closeState
+                (stepScanState limit visible engine maskOpt startKey)
+                closeScanState
             |> ret
         | Error e -> err e
 
     /// 範囲ルックアップ（`needsValues = true` なら値を復号し、false なら空の行を返す）。
-    let scanAtValues visible limit startKey needsValues engine =
+    let scanAtValues
+        (visible: uint64 option)
+        (limit: int)
+        (startKey: byte array)
+        (needsValues: bool)
+        (engine: StorageEngine)
+        =
         scanAtWith visible limit startKey (if needsValues then None else Some [||]) engine
 
     /// 範囲ルックアップ（列マスクに従って必要な列だけ復号する）。
-    let scanAtMasked visible limit startKey (mask: bool array) engine =
+    let scanAtMasked
+        (visible: uint64 option)
+        (limit: int)
+        (startKey: byte array)
+        (mask: bool array)
+        (engine: StorageEngine)
+        =
         scanAtWith visible limit startKey (Some mask) engine
+
+    /// WAL と memtable の反映結果を新しい engine にまとめる。
+    let private applyBatch (entries: Entry array) (engine: StorageEngine) (wal: WalState) (txnId: uint64<txnId>) =
+        let mem = Memtable.apply entries engine.Mem
+        let nextTxnId = txnId + 1UL<txnId>
+
+        { engine with
+            Wal = wal
+            Mem = mem
+            NextTxnId = nextTxnId
+        }
 
     /// 書き込みバッチ。
     /// まず WAL（Begin/Batch/Commit を 1回の書き込みで）へ、
     /// それから memtable へ反映する。
     let private writeBatchCore (sync: bool) (entries: Entry array) (engine: StorageEngine) =
-        let apply wal txnId =
-            let mem = Memtable.apply entries engine.Mem
-            let nextTxnId = txnId + 1UL<txnId>
-
-            { engine with
-                Wal = wal
-                Mem = mem
-                NextTxnId = nextTxnId
-            }
-
         withRuntimeGate engine (fun () ->
             result {
                 let txnId = engine.NextTxnId
@@ -312,13 +370,54 @@ module internal StorageEngine =
                     else
                         Wal.appendDeferred engine.Dir records engine.Wal
 
-                return apply wal txnId
+                return applyBatch entries engine wal txnId
             })
 
     let writeBatch = writeBatchCore true
 
     /// WAL への追記だけ行い、fsync は Session のグループコミットに任せる。
     let writeBatchDeferred = writeBatchCore false
+
+    /// WAL を同期して古い WAL を削除し、次の WAL へ切り替える。
+    let private rotateWal (engine: StorageEngine) (next: WalState) =
+        result {
+            do! Wal.sync engine.Dir engine.Wal
+            let! stale = Wal.walFiles engine.Dir
+            let! _ = Wal.create engine.Dir next.FileNumber
+
+            protect (fun () ->
+                stale
+                |> List.filter (fun path -> path <> Wal.path engine.Dir next.FileNumber)
+                |> List.iter System.IO.File.Delete)
+            |> ignore
+
+            return { engine with Wal = next }
+        }
+
+    /// MANIFEST 反映後の Version を受け取り、WAL を切り替えて flush 後の engine を作る。
+    let private finishFlush (engine: StorageEngine) (version: Version) (manifestNumber: int64<manifestNo>) =
+        result {
+            let! rotated = Wal.rotate engine.Wal |> rotateWal engine
+
+            return
+                { rotated with
+                    Version =
+                        { version with
+                            NextFileNumber = version.NextFileNumber + 1L
+                        }
+                    ManifestNumber = manifestNumber
+                    Mem = Memtable.Empty
+                }
+        }
+
+    /// ファイル番号の下限を進めた engine を返す。
+    let private bumpNextFileNumber (engine: StorageEngine) (fileNumber: int64) =
+        { engine with
+            Version =
+                { engine.Version with
+                    NextFileNumber = max engine.Version.NextFileNumber (fileNumber + 1L)
+                }
+        }
 
     /// memtable を L0 の SSTable にして書き出す。
     /// memtable が空なら何もしない（WAL も切り替えない）。
@@ -328,44 +427,6 @@ module internal StorageEngine =
     /// MANIFEST が参照する SSTable を上書きしないため。
     /// </remarks>
     let private flushCore (engine: StorageEngine) =
-        let rotateWal engine (next: WalState) =
-            result {
-                do! Wal.sync engine.Dir engine.Wal
-                let! stale = Wal.walFiles engine.Dir
-                let! _ = Wal.create engine.Dir next.FileNumber
-
-                protect (fun () ->
-                    stale
-                    |> List.filter (fun path -> path <> Wal.path engine.Dir next.FileNumber)
-                    |> List.iter System.IO.File.Delete)
-                |> ignore
-
-                return { engine with Wal = next }
-            }
-
-        let finishFlush engine version manifestNumber =
-            result {
-                let! rotated = Wal.rotate engine.Wal |> rotateWal engine
-
-                return
-                    { rotated with
-                        Version =
-                            { version with
-                                NextFileNumber = version.NextFileNumber + 1L
-                            }
-                        ManifestNumber = manifestNumber
-                        Mem = Memtable.Empty
-                    }
-            }
-
-        let bumpNextFileNumber (engine: StorageEngine) fileNumber =
-            { engine with
-                Version =
-                    { engine.Version with
-                        NextFileNumber = max engine.Version.NextFileNumber (fileNumber + 1L)
-                    }
-            }
-
         if Memtable.isEmpty engine.Mem then
             Ok engine
         else
@@ -444,6 +505,32 @@ module internal StorageEngine =
             else
                 ret (engine, false))
 
+    /// compaction 用にファイルの部分読みスキャンを開く。
+    let private scanOfFile (engine: StorageEngine) (f: FileMetaData) =
+        readInfoIn f engine
+        >>= fun info -> ret (Sstable.rangeScanPartialRaw [||] 0 info)
+
+    /// 追加されたファイルの最大番号の次を返す。
+    let private nextFileNumberAfter (version: Version) (result: CompactionResult) =
+        match result.Added with
+        | [] -> version.NextFileNumber
+        | files -> max version.NextFileNumber ((files |> List.map _.FileNumber |> List.max) + 1L)
+
+    /// compaction 結果を反映した engine を組み立てる。
+    let private buildCompacted
+        (engine: StorageEngine)
+        (version: Version)
+        (manifestNumber: int64<manifestNo>)
+        (result: CompactionResult)
+        =
+        { engine with
+            Version =
+                { version with
+                    NextFileNumber = nextFileNumberAfter version result
+                }
+            ManifestNumber = manifestNumber
+        }
+
     /// 1 回の Leveled compaction を行う。
     /// 手順:
     ///   1. 対象レベルExceeded しているファイルを選ぶ
@@ -454,24 +541,6 @@ module internal StorageEngine =
     /// クラッシュ時に「MANIFEST は新しいがファイルは古い」= データ損失になる。
     /// 入力はファイル全体を読まず、ブロック単位で読む（部分読みリーダー）。
     let private compactOnce (engine: StorageEngine) =
-        let scanOf f =
-            readInfoIn f engine
-            >>= fun info -> ret (Sstable.rangeScanPartialRaw [||] 0 info)
-
-        let nextFileNumberAfter version result =
-            match result.Added with
-            | [] -> version.NextFileNumber
-            | files -> max version.NextFileNumber ((files |> List.map _.FileNumber |> List.max) + 1L)
-
-        let buildCompacted version manifestNumber result =
-            { engine with
-                Version =
-                    { version with
-                        NextFileNumber = nextFileNumberAfter version result
-                    }
-                ManifestNumber = manifestNumber
-            }
-
         match
             Compaction.compact
                 engine.Dir
@@ -479,7 +548,7 @@ module internal StorageEngine =
                 engine.Compaction
                 engine.ActiveSnapshot
                 engine.Version.NextFileNumber
-                scanOf
+                (scanOfFile engine)
         with
         | Error e -> Error(engine, e)
         | Ok(compactionResult, _) ->
@@ -505,7 +574,7 @@ module internal StorageEngine =
                         }
                 with
                 | ManifestApplyResult.Applied(version, manifestNumber) ->
-                    let compacted = buildCompacted version manifestNumber compactionResult
+                    let compacted = buildCompacted engine version manifestNumber compactionResult
 
                     match FileMetaData.deleteObsolete engine.Dir compactionResult.Removed with
                     | Ok() -> Ok compacted
@@ -532,154 +601,178 @@ module internal StorageEngine =
             else
                 ret (engine, None))
 
+    /// MANIFEST が参照する SSTable がすべて存在するか確認する。
+    let private ensureFilesPresent (dir: string) (version: Version) =
+        let missing =
+            Version.allFiles version
+            |> List.filter (fun f -> not (System.IO.File.Exists(FileMetaData.path dir f.FileNumber)))
+
+        if List.isEmpty missing then
+            ret ()
+        else
+            let names =
+                missing
+                |> List.map (fun f -> FileMetaData.path dir f.FileNumber)
+                |> String.concat ", "
+
+            DbError.corruption (sprintf "MANIFEST が参照する SSTable が見つかりません: %s" names) |> err
+
+    /// パスから数値のファイル番号を取り出す。
+    let private parseNumber (path: string) =
+        match System.Int64.TryParse(System.IO.Path.GetFileNameWithoutExtension path) with
+        | true, v -> Some v
+        | _ -> None
+
+    /// ディレクトリ内の SSTable 番号を列挙する。
+    let private sstNumbersOnDisk (dir: string) =
+        protect (fun () ->
+            System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
+            |> Array.choose parseNumber)
+
+    /// 孤立ファイルを検疫ディレクトリへ移す。
+    let private moveToQuarantine (dir: string) (quarantine: string) (n: int64) =
+        let source = FileMetaData.path dir n
+        let name = System.IO.Path.GetFileName source
+        let target = System.IO.Path.Combine(quarantine, name)
+
+        let target =
+            if System.IO.File.Exists target then
+                target + "." + string System.DateTime.UtcNow.Ticks
+            else
+                target
+
+        System.IO.File.Move(source, target, true)
+
+    /// 参照されていない SSTable を検疫へ移す。
+    let private quarantineOrphans (dir: string) (version: Version) =
+        result {
+            let referenced = Version.allFiles version |> List.map _.FileNumber |> Set.ofList
+            let! numbers = sstNumbersOnDisk dir
+            let orphans = numbers |> Array.filter (fun n -> not (Set.contains n referenced))
+
+            do!
+                protect (fun () ->
+                    if not (Array.isEmpty orphans) then
+                        let quarantine = System.IO.Path.Combine(dir, ".orphans")
+                        System.IO.Directory.CreateDirectory quarantine |> ignore
+                        Array.iter (moveToQuarantine dir quarantine) orphans)
+
+            return ()
+        }
+
+    /// WAL ファイル番号のうち最大のものを返す。
+    let private latestWalNumber =
+        Wal.walFiles
+        >> Result.map (fun files -> files |> List.choose parseNumber |> List.sort |> List.tryLast)
+
+    /// WAL を開く（無ければ作る）。
+    let private openOrCreateWal (dir: string) (version: Version) =
+        result {
+            let! latest = latestWalNumber dir
+
+            let walNumber =
+                match latest with
+                | Some n -> n
+                | None -> version.NextFileNumber
+
+            let! exists = protect (fun () -> System.IO.File.Exists(Wal.path dir walNumber))
+
+            if exists then
+                return!
+                    protect (fun () -> System.IO.FileInfo(Wal.path dir walNumber).Length)
+                    |> Result.map (fun size -> { FileNumber = walNumber; Size = size })
+            else
+                return! Wal.create dir walNumber
+        }
+
+    /// ディスク上の最大 SeqNo を返す。
+    let private maxSeqNoOnDisk =
+        Version.allFiles >> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
+
+    /// ディスク上の最大ファイル番号を返す。
+    let private maxFileNumberOnDisk (dir: string) =
+        result {
+            let! ssts = sstNumbersOnDisk dir
+            let! wals = Wal.walFiles dir
+            let walNumbers = wals |> List.choose parseNumber |> List.toArray
+            return Array.append ssts walNumbers |> Array.fold (fun acc n -> max acc n) 0L
+        }
+
+    /// 空の engine を組み立てる。
+    let private emptyEngine (dir: string) =
+        {
+            Dir = dir
+            ManifestNumber = 1L<manifestNo>
+            Version = Version.Empty
+            Mem = Memtable.Empty
+            Wal = { FileNumber = 1L; Size = 0L }
+            NextSeqNo = 1UL
+            NextTxnId = 1UL<txnId>
+            MemLimitBytes = DefaultMemLimitBytes
+            Compaction = CompactionOptions.Defaults
+            ActiveSnapshot = 0UL
+            Runtime = StorageRuntime()
+        }
+
+    /// SSTable の ReadInfo を 1つ埋める。
+    let private hydrateFile (dir: string) (f: FileMetaData) =
+        match f.ReadInfo with
+        | Some _ -> ret f
+        | None ->
+            Sstable.openPartial (FileMetaData.path dir f.FileNumber)
+            |> Result.map (fun info -> { f with ReadInfo = Some info })
+
+    /// 1レベルの ReadInfo を埋める。
+    let private hydrateLevel (dir: string) (files: FileMetaData array) =
+        files |> Array.map (hydrateFile dir) |> all |> Result.map List.toArray
+
+    /// Version の全レベルの ReadInfo を埋める。
+    let private hydrateVersion (dir: string) (version: Version) =
+        version.Files
+        |> Array.map (hydrateLevel dir)
+        |> all
+        |> Result.map (fun levels ->
+            { version with
+                Files = List.toArray levels
+            })
+
+    /// 復旧済みの状態から起動時のエンジンを作る。
+    let private buildRecovered
+        (dir: string)
+        (version: Version)
+        (manifestNumber: int64<manifestNo>)
+        (walState: WalState)
+        (mem: Memtable)
+        (walMax: uint64)
+        (diskMax: uint64)
+        (diskMaxFile: int64)
+        (walMaxTxn: uint64<txnId>)
+        =
+        let nextSeqNo = max walMax diskMax + 1UL
+        let nextTxnId = walMaxTxn + 1UL<txnId>
+
+        let bumped =
+            { version with
+                NextFileNumber = max version.NextFileNumber (diskMaxFile + 1L)
+            }
+
+        { emptyEngine dir with
+            ManifestNumber = manifestNumber
+            Version = bumped
+            Wal = walState
+            NextSeqNo = nextSeqNo
+            NextTxnId = nextTxnId
+            Mem = mem
+        }
+
     /// データベースを開く（新規なら作る）。
     /// [memLimitBytes] を指定すると memtable の上限を差し替える。
     let openDatabaseWith (memLimitBytes: int option) (dir: string) =
-        let ensureFilesPresent dir version =
-            let missing =
-                Version.allFiles version
-                |> List.filter (fun f -> not (System.IO.File.Exists(FileMetaData.path dir f.FileNumber)))
-
-            if List.isEmpty missing then
-                ret ()
-            else
-                let names =
-                    missing
-                    |> List.map (fun f -> FileMetaData.path dir f.FileNumber)
-                    |> String.concat ", "
-
-                DbError.corruption (sprintf "MANIFEST が参照する SSTable が見つかりません: %s" names) |> err
-
-        let parseNumber (path: string) =
-            match System.Int64.TryParse(System.IO.Path.GetFileNameWithoutExtension path) with
-            | true, v -> Some v
-            | _ -> None
-
-        let sstNumbersOnDisk dir =
-            protect (fun () ->
-                System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
-                |> Array.choose parseNumber)
-
-        let move quarantine n =
-            let source = FileMetaData.path dir n
-            let name = System.IO.Path.GetFileName source
-            let target = System.IO.Path.Combine(quarantine, name)
-
-            let target =
-                if System.IO.File.Exists target then
-                    target + "." + string System.DateTime.UtcNow.Ticks
-                else
-                    target
-
-            System.IO.File.Move(source, target, true)
-
-        let quarantineOrphans dir version =
-            result {
-                let referenced = Version.allFiles version |> List.map _.FileNumber |> Set.ofList
-                let! numbers = sstNumbersOnDisk dir
-                let orphans = numbers |> Array.filter (fun n -> not (Set.contains n referenced))
-
-                do!
-                    protect (fun () ->
-                        if not (Array.isEmpty orphans) then
-                            let quarantine = System.IO.Path.Combine(dir, ".orphans")
-                            System.IO.Directory.CreateDirectory quarantine |> ignore
-                            Array.iter (move quarantine) orphans)
-
-                return ()
-            }
-
-        let latestWalNumber =
-            Wal.walFiles
-            >> Result.map (fun files -> files |> List.choose parseNumber |> List.sort |> List.tryLast)
-
-        let openOrCreateWal dir version =
-            result {
-                let! latest = latestWalNumber dir
-
-                let walNumber =
-                    match latest with
-                    | Some n -> n
-                    | None -> version.NextFileNumber
-
-                let! exists = protect (fun () -> System.IO.File.Exists(Wal.path dir walNumber))
-
-                if exists then
-                    return!
-                        protect (fun () -> System.IO.FileInfo(Wal.path dir walNumber).Length)
-                        |> Result.map (fun size -> { FileNumber = walNumber; Size = size })
-                else
-                    return! Wal.create dir walNumber
-            }
-
-        let maxSeqNoOnDisk =
-            Version.allFiles >> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
-
-        let maxFileNumberOnDisk dir =
-            result {
-                let! ssts = sstNumbersOnDisk dir
-                let! wals = Wal.walFiles dir
-                let walNumbers = wals |> List.choose parseNumber |> List.toArray
-                return Array.append ssts walNumbers |> Array.fold (fun acc n -> max acc n) 0L
-            }
-
-        let emptyEngine dir =
-            {
-                Dir = dir
-                ManifestNumber = 1L<manifestNo>
-                Version = Version.Empty
-                Mem = Memtable.Empty
-                Wal = { FileNumber = 1L; Size = 0L }
-                NextSeqNo = 1UL
-                NextTxnId = 1UL<txnId>
-                MemLimitBytes = DefaultMemLimitBytes
-                Compaction = CompactionOptions.Defaults
-                ActiveSnapshot = 0UL
-                Runtime = StorageRuntime()
-            }
-
-        let buildRecovered version manifestNumber walState mem walMax diskMax diskMaxFile walMaxTxn =
-            let nextSeqNo = max walMax diskMax + 1UL
-            let nextTxnId = walMaxTxn + 1UL<txnId>
-
-            let bumped =
-                { version with
-                    NextFileNumber = max version.NextFileNumber (diskMaxFile + 1L)
-                }
-
-            { emptyEngine dir with
-                ManifestNumber = manifestNumber
-                Version = bumped
-                Wal = walState
-                NextSeqNo = nextSeqNo
-                NextTxnId = nextTxnId
-                Mem = mem
-            }
-
-        let hydrateVersion version =
-            let hydrate f =
-                match f.ReadInfo with
-                | Some _ -> ret f
-                | None ->
-                    Sstable.openPartial (FileMetaData.path dir f.FileNumber)
-                    |> Result.map (fun info -> { f with ReadInfo = Some info })
-
-            let hydrateLevel (files: FileMetaData array) =
-                files |> Array.map hydrate |> all |> Result.map List.toArray
-
-            version.Files
-            |> Array.map hydrateLevel
-            |> all
-            |> Result.map (fun levels ->
-                { version with
-                    Files = List.toArray levels
-                })
-
         result {
             let! version, manifestNumber = Manifest.openOrCreate dir
             do! ensureFilesPresent dir version
             do! quarantineOrphans dir version
-            let! version' = hydrateVersion version
+            let! version' = hydrateVersion dir version
             let! walState = openOrCreateWal dir version'
 
             let! replayed =
@@ -695,7 +788,7 @@ module internal StorageEngine =
             let! diskMaxFile = maxFileNumberOnDisk dir
 
             let engine =
-                buildRecovered version' manifestNumber alignedWal mem walMax diskMax diskMaxFile walMaxTxn
+                buildRecovered dir version' manifestNumber alignedWal mem walMax diskMax diskMaxFile walMaxTxn
 
             return
                 match memLimitBytes with
@@ -788,34 +881,34 @@ type internal DiskStorageEngine(engine: StorageEngine) =
         member _.WalState = Some engine.Wal
         member _.LastFlushError = engine.Runtime.LastFlushError
 
-        member _.GetAtMasked visible key mask =
+        member _.GetAtMasked (visible: uint64 option) (key: byte array) (mask: bool array) =
             StorageEngine.getAtMasked visible key mask engine
 
-        member _.ScanAtValues visible startKey limit needsValues =
+        member _.ScanAtValues (visible: uint64 option) (startKey: byte array) (limit: int) (needsValues: bool) =
             StorageEngine.scanAtValues visible limit startKey needsValues engine
 
-        member _.ScanAtMasked visible startKey limit mask =
+        member _.ScanAtMasked (visible: uint64 option) (startKey: byte array) (limit: int) (mask: bool array) =
             StorageEngine.scanAtMasked visible limit startKey mask engine
 
-        member _.WriteBatch entries =
+        member _.WriteBatch(entries: Entry array) =
             StorageEngine.writeBatch entries engine
             |> Result.map (fun next -> DiskStorageEngine next :> IStorageEngine)
 
-        member _.WriteBatchDeferred entries =
+        member _.WriteBatchDeferred(entries: Entry array) =
             StorageEngine.writeBatchDeferred entries engine
             |> Result.map (fun next -> DiskStorageEngine next :> IStorageEngine)
 
-        member _.WithNextSeqNo nextSeqNo =
+        member _.WithNextSeqNo(nextSeqNo: uint64) =
             DiskStorageEngine { engine with NextSeqNo = nextSeqNo } :> IStorageEngine
 
-        member _.WithActiveSnapshot snapshot =
+        member _.WithActiveSnapshot(snapshot: uint64) =
             DiskStorageEngine
                 { engine with
                     ActiveSnapshot = snapshot
                 }
             :> IStorageEngine
 
-        member _.WithHostState state =
+        member _.WithHostState(state: PublishedState) =
             DiskStorageEngine
                 { engine with
                     Version = state.Version
@@ -824,7 +917,7 @@ type internal DiskStorageEngine(engine: StorageEngine) =
                 }
             :> IStorageEngine
 
-        member _.FlushIfNeeded allocateFileNumber =
+        member _.FlushIfNeeded(allocateFileNumber: unit -> int64) =
             StorageEngine.flushIfNeededWith allocateFileNumber engine
             |> Result.map (fun (next, flushed) -> DiskStorageEngine next :> IStorageEngine, flushed)
 

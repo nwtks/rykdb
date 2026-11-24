@@ -86,21 +86,22 @@ let private execOne (session: Session) (sql: string) =
             printError e
             true
 
-let private runRepl (session: Session) =
-    let splitForRun merged =
-        let pieces = piecesOf merged
+/// 入力行を実行可能な文と未完了の保持文に分ける（末尾が `;` なら全て実行対象）。
+let private splitForRun (merged: string) =
+    let pieces = piecesOf merged
 
-        if Array.isEmpty pieces then
-            [||], [||]
+    if Array.isEmpty pieces then
+        [||], [||]
+    else
+        let complete = merged.EndsWith(";", System.StringComparison.Ordinal)
+        let last = pieces.Length - 1
+
+        if complete then
+            pieces, [||]
         else
-            let complete = merged.EndsWith(";", System.StringComparison.Ordinal)
-            let last = pieces.Length - 1
+            pieces.[0 .. last - 1], pieces.[last..last]
 
-            if complete then
-                pieces, [||]
-            else
-                pieces.[0 .. last - 1], pieces.[last..last]
-
+let private runRepl (session: Session) =
     let mutable running = true
     let mutable buffer = ""
 

@@ -104,6 +104,30 @@ module internal RowStore =
         let next = store.Engine.NextSeqNo
         if next = 0UL then 0UL else next - 1UL
 
+    /// 書き込み後の状態を flush して公開する（GC 境界を明示的に受け取る）。
+    let private flushAndPublish (activeSnapshot: uint64) (bumped: IStorageEngine) (host: VersionCoordinator) =
+        host.WithInstallGate(fun () ->
+            let state = host.Current
+            let hinted = bumped.WithHostState state
+
+            hinted.FlushIfNeeded host.AllocateFileNumber
+            |> Result.map (fun (flushed, didFlush) ->
+                let flushedState = flushed.PublishedState
+
+                host.Publish(fun current ->
+                    { current with
+                        Version = flushedState.Version
+                        ManifestNumber = flushedState.ManifestNumber
+                        ActiveSnapshot =
+                            if activeSnapshot = 0UL then
+                                current.ActiveSnapshot
+                            else
+                                activeSnapshot
+                    })
+                |> ignore
+
+                flushed, didFlush))
+
     /// Entry を論理 keyspace の接頭辞付きで書き込む。
     /// 複数 keyspace の書き込みも同じ WAL バッチに入るため、途中で分断されない。
     let writeBatchesWithSnapshotWith
@@ -112,29 +136,6 @@ module internal RowStore =
         (batches: (string * Entry array) list)
         (store: RowStore)
         =
-        let flushAndPublish (bumped: IStorageEngine) (host: VersionCoordinator) =
-            host.WithInstallGate(fun () ->
-                let state = host.Current
-                let hinted = bumped.WithHostState state
-
-                hinted.FlushIfNeeded host.AllocateFileNumber
-                |> Result.map (fun (flushed, didFlush) ->
-                    let flushedState = flushed.PublishedState
-
-                    host.Publish(fun current ->
-                        { current with
-                            Version = flushedState.Version
-                            ManifestNumber = flushedState.ManifestNumber
-                            ActiveSnapshot =
-                                if activeSnapshot = 0UL then
-                                    current.ActiveSnapshot
-                                else
-                                    activeSnapshot
-                        })
-                    |> ignore
-
-                    flushed, didFlush))
-
         let physicalEntries =
             batches
             |> List.collect (fun (keyspace, entries) ->
@@ -168,7 +169,7 @@ module internal RowStore =
                     | Ok(flushed, _) -> ret { store with Engine = flushed }
                     | Error _ -> ret { store with Engine = bumped }
                 | Some host ->
-                    match flushAndPublish bumped host with
+                    match flushAndPublish activeSnapshot bumped host with
                     | Ok(flushed, didFlush) ->
                         if didFlush || host.LastCompactionError.IsSome then
                             host.Signal()
@@ -240,27 +241,29 @@ module internal RowStore =
         finally
             lease |> Option.iter (fun lease -> lease.Dispose())
 
+    /// 接頭辞の境界で走査を止め、キーから接頭辞を外す 1ステップ。
+    let rec private scanWithinPrefixLoop (prefix: byte array) (current: SstScan) =
+        match SstScan.next current with
+        | Ok None -> ret None
+        | Ok(Some(e, rest)) ->
+            if not (KeyBuilder.startsWithPrefix e.Key prefix) then
+                SstScan.dispose rest
+                ret None
+            else
+                let key = Array.sub e.Key prefix.Length (e.Key.Length - prefix.Length)
+
+                Some(
+                    { e with Key = key },
+                    SstScan.ofStepWithClose (fun () -> scanWithinPrefixLoop prefix rest) (fun () ->
+                        SstScan.dispose rest)
+                )
+                |> ret
+        | Error e -> err e
+
     /// 接頭辞の境界で走査を止め、返すキーから接頭辞を外す。
     /// 途中で捨てられても下流の走査（SSTable のファイルハンドル）を閉じられるようにする。
     let private scanWithinPrefix (prefix: byte array) (scan: SstScan) =
-        let rec loop current =
-            match SstScan.next current with
-            | Ok None -> ret None
-            | Ok(Some(e, rest)) ->
-                if not (KeyBuilder.startsWithPrefix e.Key prefix) then
-                    SstScan.dispose rest
-                    ret None
-                else
-                    let key = Array.sub e.Key prefix.Length (e.Key.Length - prefix.Length)
-
-                    Some(
-                        { e with Key = key },
-                        SstScan.ofStepWithClose (fun () -> loop rest) (fun () -> SstScan.dispose rest)
-                    )
-                    |> ret
-            | Error e -> err e
-
-        SstScan.ofStepWithClose (fun () -> loop scan) (fun () -> SstScan.dispose scan)
+        SstScan.ofStepWithClose (fun () -> scanWithinPrefixLoop prefix scan) (fun () -> SstScan.dispose scan)
 
     /// 走査が使う Version を、走査の Dispose まで pin する。
     /// Session の read lease より長く走査を保持しても compaction にファイルを消されない。
@@ -336,6 +339,50 @@ module internal RowStore =
         scanAtRawMasked keyspace startKey limit None None [||] store
         |> Result.map (SstScan.filter (fun e -> e.Value.IsSome))
 
+    /// 走査から最大 n 個のキーを集める（末尾再帰）。
+    [<TailCall>]
+    let rec private takeKeys (n: int) (acc: byte array list) (scan: SstScan) =
+        if n <= 0 then
+            ret (List.rev acc, scan)
+        else
+            match SstScan.next scan with
+            | Ok None -> ret (List.rev acc, SstScan.Empty)
+            | Ok(Some(e, rest)) -> takeKeys (n - 1) (e.Key :: acc) rest
+            | Error e ->
+                SstScan.dispose scan
+                err e
+
+    /// 1チャンクずつ tombstone を書き、次のキーから走査し直す（末尾再帰）。
+    [<TailCall>]
+    let rec private clearKeyspaceLoop
+        (space: string)
+        (currentStore: RowStore, currentMgr: TransactionManager)
+        (startKey: byte array)
+        =
+        match scanKeys space startKey 0 currentStore with
+        | Ok stale ->
+            match takeKeys ClearChunkEntries [] stale with
+            | Ok(chunk, rest) ->
+                SstScan.dispose rest
+
+                match List.tryLast chunk with
+                | None -> ret (currentStore, currentMgr)
+                | Some lastKey ->
+                    let mgr0, txn =
+                        TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) currentMgr
+
+                    match foldOk (fun t key -> ret (Transaction.remove space key t)) txn chunk with
+                    | Ok txn2 ->
+                        match TransactionManager.commit txn2 mgr0 with
+                        | Ok(mgr1, _, batches) ->
+                            match writeBatches batches currentStore with
+                            | Ok store1 -> clearKeyspaceLoop space (store1, mgr1) lastKey
+                            | Error e -> err e
+                        | Error e -> err e
+                    | Error e -> err e
+            | Error e -> err e
+        | Error e -> err e
+
     /// keyspace の全エントリをチャンク単位で tombstone 消去する。
     /// <remarks>
     /// 同じ keyspace を走査しながら書くため、1チャンク書くたびに新しい store で
@@ -346,43 +393,7 @@ module internal RowStore =
     /// 両者は持つ状態（store+mgr / ExecState）が違うため、意図的に分けている。
     /// </remarks>
     let clearKeyspaceChunks (mgr: TransactionManager) (space: string) (store: RowStore) =
-        let rec takeKeys n acc scan =
-            if n <= 0 then
-                ret (List.rev acc, scan)
-            else
-                match SstScan.next scan with
-                | Ok None -> ret (List.rev acc, SstScan.Empty)
-                | Ok(Some(e, rest)) -> takeKeys (n - 1) (e.Key :: acc) rest
-                | Error e ->
-                    SstScan.dispose scan
-                    err e
-
-        let rec loop (currentStore, currentMgr) startKey =
-            match scanKeys space startKey 0 currentStore with
-            | Ok stale ->
-                match takeKeys ClearChunkEntries [] stale with
-                | Ok(chunk, rest) ->
-                    SstScan.dispose rest
-
-                    match List.tryLast chunk with
-                    | None -> ret (currentStore, currentMgr)
-                    | Some lastKey ->
-                        let mgr0, txn =
-                            TransactionManager.beginTxnWithLimit (System.Int64.MaxValue |> Some) currentMgr
-
-                        match foldOk (fun t key -> ret (Transaction.remove space key t)) txn chunk with
-                        | Ok txn2 ->
-                            match TransactionManager.commit txn2 mgr0 with
-                            | Ok(mgr1, _, batches) ->
-                                match writeBatches batches currentStore with
-                                | Ok store1 -> loop (store1, mgr1) lastKey
-                                | Error e -> err e
-                            | Error e -> err e
-                        | Error e -> err e
-                | Error e -> err e
-            | Error e -> err e
-
-        loop (store, mgr) [||]
+        clearKeyspaceLoop space (store, mgr) [||]
 
     /// format マーカーより前に作られた DB か（データファイルがあるか）。
     let private hasDataFiles (root: string) =
@@ -437,6 +448,12 @@ module internal RowStore =
                     |> err
         }
 
+    /// オープン失敗時に確保済みの engine とロックを解放する。
+    let private abandonOpen (engine: StorageEngine) (lease: ProcessLockLease) (e: DbError) =
+        protect (fun () -> StorageEngine.close engine |> ignore) |> ignore
+        lease.ForceRelease()
+        err e
+
     /// DB を開く（新規ならルート直下に 1本の LSM を作る）。
     /// 同じ root が既にこのプロセスで開かれていれば `IoError`。
     let private openStoreCore (takeOver: bool) (options: RowStoreOptions) (root: string) =
@@ -463,11 +480,6 @@ module internal RowStore =
                 match options.Compaction with
                 | Some compaction -> { engine with Compaction = compaction }
                 | None -> engine
-
-            let abandon e =
-                protect (fun () -> StorageEngine.close engine |> ignore) |> ignore
-                lease.ForceRelease()
-                err e
 
             let! built =
                 match
@@ -497,7 +509,7 @@ module internal RowStore =
                         runtime, host)
                 with
                 | Ok built -> ret built
-                | Error e -> abandon e
+                | Error e -> abandonOpen engine lease e
 
             let runtime, host = built
 

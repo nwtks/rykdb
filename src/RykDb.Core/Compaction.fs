@@ -83,29 +83,38 @@ module internal Compaction =
             OutputLevel: int
         }
 
+    /// 古い版を残すか捨てるかを判定しながら走査する。
+    [<TailCall>]
+    let rec private gcKeepOlder
+        (activeSnapshot: uint64)
+        (newest: SstEntry)
+        (kept: SstEntry list)
+        (dropped: int)
+        (keptVisible: bool)
+        (rest: SstEntry list)
+        =
+        match rest with
+        | [] -> List.rev kept, dropped
+        | item :: tail ->
+            if activeSnapshot = 0UL || item.SeqNo > activeSnapshot then
+                gcKeepOlder activeSnapshot newest (item :: kept) dropped keptVisible tail
+            elif newest.SeqNo > activeSnapshot && not keptVisible then
+                gcKeepOlder activeSnapshot newest (item :: kept) dropped true tail
+            else
+                gcKeepOlder activeSnapshot newest kept (dropped + 1) keptVisible tail
+
     /// 同一キーの版グループを GC する（純粋関数）。
     /// `older` は `newest` より古い版（SeqNo 降順）。
     /// 戻り値は (残す版, 捨てた版数, 捨てた tombstone 数)。
     /// `activeSnapshot = 0` は「制限なし」を表す。
     let internal gcGroup (activeSnapshot: uint64) (dropTombstones: bool) (older: SstEntry list) (newest: SstEntry) =
-        let rec keepOlder kept dropped keptVisible rest =
-            match rest with
-            | [] -> List.rev kept, dropped
-            | item :: tail ->
-                if activeSnapshot = 0UL || item.SeqNo > activeSnapshot then
-                    keepOlder (item :: kept) dropped keptVisible tail
-                elif newest.SeqNo > activeSnapshot && not keptVisible then
-                    keepOlder (item :: kept) dropped true tail
-                else
-                    keepOlder kept (dropped + 1) keptVisible tail
-
         match older with
         | [] ->
             let keepNewest = not (newest.IsDelete && dropTombstones)
             (if keepNewest then [ newest ] else []), 0, (if keepNewest then 0 else 1)
         | _ when activeSnapshot = 0UL -> newest :: older, 0, 0
         | _ ->
-            let keptOlder, dropped = keepOlder [] 0 false older
+            let keptOlder, dropped = gcKeepOlder activeSnapshot newest [] 0 false older
             let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty keptOlder)
             let kept = if keepNewest then newest :: keptOlder else keptOlder
             kept, dropped, (if keepNewest then 0 else 1)
@@ -117,7 +126,7 @@ module internal Compaction =
         | Sequence of int64
         | Allocator of (unit -> int64)
 
-    let private takeFileNumber supply =
+    let private takeFileNumber (supply: FileNumberSupply) =
         match supply with
         | Sequence current -> current, Sequence(current + 1L)
         | Allocator allocate -> allocate (), supply
@@ -130,6 +139,340 @@ module internal Compaction =
         | NextGroupDone
         | NextGroupStopped
         | NextGroup of SstEntry list * int * int * SstMerge
+
+    /// ファイルのキー範囲を現在の境界へ広げる。
+    let private widen (mn: byte array, mx: byte array) (f: FileMetaData) =
+        let mn' = if Bytes.compare f.Smallest mn <= 0 then f.Smallest else mn
+        let mx' = if Bytes.compare f.Largest mx >= 0 then f.Largest else mx
+        mn', mx'
+
+    /// ファイル列のキー範囲を求める（空なら CorruptionError）。
+    let private boundsOf (files: FileMetaData array) =
+        match Array.tryHead files with
+        | None -> err (DbError.corruption "compaction の入力ファイルが空です（MANIFEST のキー範囲が不正）")
+        | Some first -> ret (files |> Array.fold widen (first.Smallest, first.Largest))
+
+    /// ファイルがキー範囲と重なるか。
+    let private inRange (minKey: byte array) (maxKey: byte array) (f: FileMetaData) =
+        Bytes.compare f.Largest minKey >= 0 && Bytes.compare f.Smallest maxKey <= 0
+
+    /// 境界が動かなくなるまで入力ファイルを広げる。
+    [<TailCall>]
+    let rec private expand
+        (current: FileMetaData array)
+        (next: FileMetaData array)
+        (minBound: byte array)
+        (maxBound: byte array)
+        =
+        let inputs = current |> Array.filter (inRange minBound maxBound)
+        let nextFiles = next |> Array.filter (inRange minBound maxBound)
+        let found = Array.append inputs nextFiles
+
+        match boundsOf found with
+        | Ok(minKey', maxKey') ->
+            if Bytes.compare minKey' minBound = 0 && Bytes.compare maxKey' maxBound = 0 then
+                ret (inputs |> Array.toList, nextFiles |> Array.toList)
+            else
+                expand current next minKey' maxKey'
+        | Error e -> err e
+
+    /// 指定レベルの compaction 入力を選ぶ。
+    let private selectInputs (version: Version) (level: int) (maxFiles: int) =
+        let current = Version.filesAt level version
+        let seed = current |> Array.toList |> List.truncate maxFiles
+
+        match seed with
+        | [] -> ret ([], [])
+        | _ ->
+            let nextLevel = level + 1
+
+            let next =
+                if nextLevel > Levels.Max then
+                    [||]
+                else
+                    Version.filesAt nextLevel version
+
+            Array.ofList seed
+            |> boundsOf
+            >>= fun (minBound, maxBound) -> expand current next minBound maxBound
+
+    /// 開いた走査からマージを組み立てる（失敗時は全走査を閉じる）。
+    let private openMerge (scans: SstScan array) =
+        match SstMerge.ofScans scans with
+        | Ok merge -> ret merge
+        | Error e ->
+            scans |> Array.iter SstScan.dispose
+            err e
+
+    /// compaction の結果レコードを組み立てる。
+    let private finish
+        (plan: CompactionPlan)
+        (allInputs: FileMetaData list)
+        (added: FileMetaData list)
+        (droppedVersions: int)
+        (droppedTombstones: int)
+        =
+        {
+            Added = List.rev added
+            Removed = allInputs
+            DroppedVersions = droppedVersions
+            DroppedTombstones = droppedTombstones
+        },
+        { FileMetaData.Zero with
+            Level = plan.OutputLevel
+        }
+
+    /// 何も追加・削除しなかったときの結果。
+    let private EmptyCompactResult =
+        {
+            Added = []
+            Removed = []
+            DroppedVersions = 0
+            DroppedTombstones = 0
+        },
+        { FileMetaData.Zero with
+            FileNumber = -1L
+        }
+
+    /// 作成済みの出力ファイルを削除する。
+    let private deleteCompactOutputs (dir: string) (files: FileMetaData list) =
+        FileMetaData.deleteObsolete dir files |> ignore
+
+    /// 指定レベルのファイル数・サイズが compaction の閾値を超えたか。
+    let private levelExceeded (options: CompactionOptions) (v: Version) (level: int) =
+        if level = 0 then
+            let count = v.Files.[0].Length
+            count > 0 && count >= options.L0CompactionTrigger
+        else
+            v.Files.[level] |> Array.sumBy _.Size > options.MaxLevelBytes.[level]
+
+    /// 閾値を超えた最初のレベルを探す。
+    [<TailCall>]
+    let rec private findCompactionLevel (options: CompactionOptions) (v: Version) (level: int) =
+        if level > Levels.Max then None
+        elif levelExceeded options v level then Some level
+        else findCompactionLevel options v (level + 1)
+
+    /// 次に compaction するレベルを選ぶ。
+    let private pickCompaction (options: CompactionOptions) (v: Version) =
+        match findCompactionLevel options v 0 with
+        | None -> None
+        | Some level ->
+            Some
+                {
+                    Level = level
+                    OutputLevel = min (level + 1) Levels.Max
+                }
+
+    /// 入力ファイルを走査として開く（停止要求時は閉じて None）。
+    [<TailCall>]
+    let rec private openInputs
+        (shouldStop: unit -> bool)
+        (openScan: FileMetaData -> Result<SstScan, DbError>)
+        (files: FileMetaData list)
+        (scans: SstScan list)
+        =
+        if shouldStop () then
+            scans |> List.iter SstScan.dispose
+            ret None
+        else
+            match files with
+            | [] -> ret (Some(List.rev scans |> List.toArray))
+            | f :: rest ->
+                match openScan f with
+                | Error e ->
+                    scans |> List.iter SstScan.dispose
+                    err e
+                | Ok scan -> openInputs shouldStop openScan rest (scan :: scans)
+
+    /// 同じキーの版を集める（停止要求時は中断）。
+    [<TailCall>]
+    let rec private gatherGroup (shouldStop: unit -> bool) (newest: SstEntry) (m: SstMerge) (acc: SstEntry list) =
+        if shouldStop () then
+            ret GatherStopped
+        else
+            match SstMerge.top m with
+            | Some e when Bytes.compare e.Key newest.Key = 0 ->
+                if shouldStop () then
+                    ret GatherStopped
+                else
+                    match SstMerge.next m with
+                    | Ok None -> ret (Gathered(m, List.rev acc))
+                    | Ok(Some(nxt, rest)) -> gatherGroup shouldStop newest rest (nxt :: acc)
+                    | Error e -> err e
+            | _ -> ret (Gathered(m, List.rev acc))
+
+    /// GC を適用した次のグループを取り出す。
+    let private nextGroup (shouldStop: unit -> bool) (activeSnapshot: uint64) (dropTombstones: bool) (merge: SstMerge) =
+        if shouldStop () then
+            ret NextGroupStopped
+        else
+            match SstMerge.next merge with
+            | Ok None -> ret NextGroupDone
+            | Ok(Some(newest, afterNewest)) ->
+                match gatherGroup shouldStop newest afterNewest [] with
+                | Ok GatherStopped -> ret NextGroupStopped
+                | Ok(Gathered(rest, older)) ->
+                    let kept, dropped, tombstones = gcGroup activeSnapshot dropTombstones older newest
+                    ret (NextGroup(kept, dropped, tombstones, rest))
+                | Error e -> err e
+            | Error e -> err e
+
+    /// 溜めたチャンクを 1ファイルとして書き出す。
+    let private flushChunk
+        (dir: string)
+        (options: CompactionOptions)
+        (plan: CompactionPlan)
+        (chunk: SstEntry list)
+        (fileNumber: int64)
+        =
+        match chunk with
+        | [] -> ret None
+        | _ ->
+            FileMetaData.writeSstable
+                dir
+                fileNumber
+                plan.OutputLevel
+                options.BloomFalsePositiveRate
+                (List.length chunk)
+                (List.rev chunk)
+            |> Result.map Some
+
+    /// グループを出力ファイルへ書き出す（末尾再帰）。
+    [<TailCall>]
+    let rec private pump
+        (dir: string)
+        (options: CompactionOptions)
+        (shouldStop: unit -> bool)
+        (activeSnapshot: uint64)
+        (supply: FileNumberSupply)
+        (plan: CompactionPlan)
+        (allInputs: FileMetaData list)
+        (dropTombstones: bool)
+        (merge: SstMerge)
+        (chunk: SstEntry list)
+        (chunkBytes: int64)
+        (added: FileMetaData list)
+        (droppedVersions: int)
+        (droppedTombstones: int)
+        =
+        if shouldStop () then
+            deleteCompactOutputs dir added
+            ret EmptyCompactResult
+        else
+            match nextGroup shouldStop activeSnapshot dropTombstones merge with
+            | Error e ->
+                deleteCompactOutputs dir added
+                err e
+            | Ok NextGroupStopped ->
+                deleteCompactOutputs dir added
+                ret EmptyCompactResult
+            | Ok NextGroupDone ->
+                let fileNumber, _ = takeFileNumber supply
+
+                match flushChunk dir options plan chunk fileNumber with
+                | Error e ->
+                    deleteCompactOutputs dir added
+                    err e
+                | Ok last ->
+                    let added =
+                        match last with
+                        | Some meta -> meta :: added
+                        | None -> added
+
+                    ret (finish plan allInputs added droppedVersions droppedTombstones)
+            | Ok(NextGroup(kept, dropped, tombstones, rest)) ->
+                let keptBytes = kept |> List.sumBy (fun e -> int64 (SstEntry.approximateBytes e))
+                let chunk' = List.fold (fun acc item -> item :: acc) chunk kept
+
+                if
+                    not (List.isEmpty chunk)
+                    && chunkBytes + keptBytes > options.OutputFileTargetBytes
+                then
+                    let fileNumber, supply = takeFileNumber supply
+
+                    match flushChunk dir options plan chunk fileNumber with
+                    | Error e ->
+                        deleteCompactOutputs dir added
+                        err e
+                    | Ok meta ->
+                        let added' =
+                            match meta with
+                            | Some m -> m :: added
+                            | None -> added
+
+                        pump
+                            dir
+                            options
+                            shouldStop
+                            activeSnapshot
+                            supply
+                            plan
+                            allInputs
+                            dropTombstones
+                            rest
+                            (List.rev kept)
+                            keptBytes
+                            added'
+                            (droppedVersions + dropped)
+                            (droppedTombstones + tombstones)
+                else
+                    pump
+                        dir
+                        options
+                        shouldStop
+                        activeSnapshot
+                        supply
+                        plan
+                        allInputs
+                        dropTombstones
+                        rest
+                        chunk'
+                        (chunkBytes + keptBytes)
+                        added
+                        (droppedVersions + dropped)
+                        (droppedTombstones + tombstones)
+
+    /// 出力を書き切って merge を解放する。
+    let private runPump
+        (dir: string)
+        (options: CompactionOptions)
+        (shouldStop: unit -> bool)
+        (activeSnapshot: uint64)
+        (supply: FileNumberSupply)
+        (plan: CompactionPlan)
+        (allInputs: FileMetaData list)
+        (merge: SstMerge)
+        =
+        let dropTombstones = plan.OutputLevel >= options.DropTombstonesBelowLevel
+
+        try
+            pump dir options shouldStop activeSnapshot supply plan allInputs dropTombstones merge [] 0L [] 0 0
+        finally
+            SstMerge.dispose merge
+
+    /// 選択したレベルの compaction を実行する。
+    let private compactPlan
+        (dir: string)
+        (options: CompactionOptions)
+        (shouldStop: unit -> bool)
+        (activeSnapshot: uint64)
+        (openScan: FileMetaData -> Result<SstScan, DbError>)
+        (supply: FileNumberSupply)
+        (version: Version)
+        (plan: CompactionPlan)
+        =
+        result {
+            let! inputs, nextFiles = selectInputs version plan.Level options.MaxInputFiles
+            let allInputs = inputs @ nextFiles
+            let! opened = openInputs shouldStop openScan allInputs []
+
+            match opened with
+            | None -> return EmptyCompactResult
+            | Some scans ->
+                let! merge = openMerge scans
+                return! runPump dir options shouldStop activeSnapshot supply plan allInputs merge
+        }
 
     /// 1回の Leveled compaction を行う（ストリーミング）。
     /// <remarks>
@@ -148,267 +491,9 @@ module internal Compaction =
         (supply: FileNumberSupply)
         (shouldStop: unit -> bool)
         =
-        let emptyResult =
-            {
-                Added = []
-                Removed = []
-                DroppedVersions = 0
-                DroppedTombstones = 0
-            },
-            { FileMetaData.Zero with
-                FileNumber = -1L
-            }
-
-        let deleteOutputs (files: FileMetaData list) =
-            FileMetaData.deleteObsolete dir files |> ignore
-
-        let exceeded v level =
-            if level = 0 then
-                let count = v.Files.[0].Length
-                count > 0 && count >= options.L0CompactionTrigger
-            else
-                v.Files.[level] |> Array.sumBy _.Size > options.MaxLevelBytes.[level]
-
-        let rec find v level =
-            if level > Levels.Max then None
-            elif exceeded v level then Some level
-            else find v (level + 1)
-
-        let pickCompaction v =
-            match find v 0 with
-            | None -> None
-            | Some level ->
-                Some
-                    {
-                        Level = level
-                        OutputLevel = min (level + 1) Levels.Max
-                    }
-
-        let widen (mn, mx) f =
-            let mn' = if Bytes.compare f.Smallest mn <= 0 then f.Smallest else mn
-            let mx' = if Bytes.compare f.Largest mx >= 0 then f.Largest else mx
-            mn', mx'
-
-        let boundsOf files =
-            match Array.tryHead files with
-            | None -> err (DbError.corruption "compaction の入力ファイルが空です（MANIFEST のキー範囲が不正）")
-            | Some first -> ret (files |> Array.fold widen (first.Smallest, first.Largest))
-
-        let inRange minKey maxKey f =
-            Bytes.compare f.Largest minKey >= 0 && Bytes.compare f.Smallest maxKey <= 0
-
-        let rec expand current next minBound maxBound =
-            let inputs = current |> Array.filter (inRange minBound maxBound)
-            let nextFiles = next |> Array.filter (inRange minBound maxBound)
-            let found = Array.append inputs nextFiles
-
-            match boundsOf found with
-            | Ok(minKey', maxKey') ->
-                if Bytes.compare minKey' minBound = 0 && Bytes.compare maxKey' maxBound = 0 then
-                    ret (inputs |> Array.toList, nextFiles |> Array.toList)
-                else
-                    expand current next minKey' maxKey'
-            | Error e -> err e
-
-        let selectInputs version level maxFiles =
-            let current = Version.filesAt level version
-            let seed = current |> Array.toList |> List.truncate maxFiles
-
-            match seed with
-            | [] -> ret ([], [])
-            | _ ->
-                let nextLevel = level + 1
-
-                let next =
-                    if nextLevel > Levels.Max then
-                        [||]
-                    else
-                        Version.filesAt nextLevel version
-
-                Array.ofList seed
-                |> boundsOf
-                >>= fun (minBound, maxBound) -> expand current next minBound maxBound
-
-        let rec openAll files scans =
-            if shouldStop () then
-                scans |> List.iter SstScan.dispose
-                ret None
-            else
-                match files with
-                | [] -> ret (Some(List.rev scans |> List.toArray))
-                | f :: rest ->
-                    match openScan f with
-                    | Error e ->
-                        scans |> List.iter SstScan.dispose
-                        err e
-                    | Ok scan -> openAll rest (scan :: scans)
-
-        let openMerge scans =
-            match SstMerge.ofScans scans with
-            | Ok merge -> ret merge
-            | Error e ->
-                scans |> Array.iter SstScan.dispose
-                err e
-
-        let rec gather newest m acc =
-            if shouldStop () then
-                ret GatherStopped
-            else
-                match SstMerge.top m with
-                | Some e when Bytes.compare e.Key newest.Key = 0 ->
-                    if shouldStop () then
-                        ret GatherStopped
-                    else
-                        match SstMerge.next m with
-                        | Ok None -> ret (Gathered(m, List.rev acc))
-                        | Ok(Some(nxt, rest)) -> gather newest rest (nxt :: acc)
-                        | Error e -> err e
-                | _ -> ret (Gathered(m, List.rev acc))
-
-        let nextGroup dropTombstones merge =
-            if shouldStop () then
-                ret NextGroupStopped
-            else
-                match SstMerge.next merge with
-                | Ok None -> ret NextGroupDone
-                | Ok(Some(newest, afterNewest)) ->
-                    match gather newest afterNewest [] with
-                    | Ok GatherStopped -> ret NextGroupStopped
-                    | Ok(Gathered(rest, older)) ->
-                        let kept, dropped, tombstones = gcGroup activeSnapshot dropTombstones older newest
-                        ret (NextGroup(kept, dropped, tombstones, rest))
-                    | Error e -> err e
-                | Error e -> err e
-
-        let flushChunk plan chunk fileNumber =
-            match chunk with
-            | [] -> ret None
-            | _ ->
-                FileMetaData.writeSstable
-                    dir
-                    fileNumber
-                    plan.OutputLevel
-                    options.BloomFalsePositiveRate
-                    (List.length chunk)
-                    (List.rev chunk)
-                |> Result.map Some
-
-        let finish plan allInputs added droppedVersions droppedTombstones =
-            {
-                Added = List.rev added
-                Removed = allInputs
-                DroppedVersions = droppedVersions
-                DroppedTombstones = droppedTombstones
-            },
-            { FileMetaData.Zero with
-                Level = plan.OutputLevel
-            }
-
-        let rec pump
-            supply
-            plan
-            allInputs
-            dropTombstones
-            merge
-            chunk
-            chunkBytes
-            added
-            droppedVersions
-            droppedTombstones
-            =
-            if shouldStop () then
-                deleteOutputs added
-                ret emptyResult
-            else
-                match nextGroup dropTombstones merge with
-                | Error e ->
-                    deleteOutputs added
-                    err e
-                | Ok NextGroupStopped ->
-                    deleteOutputs added
-                    ret emptyResult
-                | Ok NextGroupDone ->
-                    let fileNumber, _ = takeFileNumber supply
-
-                    match flushChunk plan chunk fileNumber with
-                    | Error e ->
-                        deleteOutputs added
-                        err e
-                    | Ok last ->
-                        let added =
-                            match last with
-                            | Some meta -> meta :: added
-                            | None -> added
-
-                        ret (finish plan allInputs added droppedVersions droppedTombstones)
-                | Ok(NextGroup(kept, dropped, tombstones, rest)) ->
-                    let keptBytes = kept |> List.sumBy (fun e -> int64 (SstEntry.approximateBytes e))
-                    let chunk' = List.fold (fun acc item -> item :: acc) chunk kept
-
-                    if
-                        not (List.isEmpty chunk)
-                        && chunkBytes + keptBytes > options.OutputFileTargetBytes
-                    then
-                        let fileNumber, supply = takeFileNumber supply
-
-                        match flushChunk plan chunk fileNumber with
-                        | Error e ->
-                            deleteOutputs added
-                            err e
-                        | Ok meta ->
-                            let added' =
-                                match meta with
-                                | Some m -> m :: added
-                                | None -> added
-
-                            pump
-                                supply
-                                plan
-                                allInputs
-                                dropTombstones
-                                rest
-                                (List.rev kept)
-                                keptBytes
-                                added'
-                                (droppedVersions + dropped)
-                                (droppedTombstones + tombstones)
-                    else
-                        pump
-                            supply
-                            plan
-                            allInputs
-                            dropTombstones
-                            rest
-                            chunk'
-                            (chunkBytes + keptBytes)
-                            added
-                            (droppedVersions + dropped)
-                            (droppedTombstones + tombstones)
-
-        let runPump plan allInputs merge =
-            let dropTombstones = plan.OutputLevel >= options.DropTombstonesBelowLevel
-
-            try
-                pump supply plan allInputs dropTombstones merge [] 0L [] 0 0
-            finally
-                SstMerge.dispose merge
-
-        let compactPlan plan =
-            result {
-                let! inputs, nextFiles = selectInputs version plan.Level options.MaxInputFiles
-                let allInputs = inputs @ nextFiles
-                let! opened = openAll allInputs []
-
-                match opened with
-                | None -> return emptyResult
-                | Some scans ->
-                    let! merge = openMerge scans
-                    return! runPump plan allInputs merge
-            }
-
-        match pickCompaction version with
-        | Some plan -> compactPlan plan
-        | None -> ret emptyResult
+        match pickCompaction options version with
+        | Some plan -> compactPlan dir options shouldStop activeSnapshot openScan supply version plan
+        | None -> ret EmptyCompactResult
 
     /// バックグラウンド compaction。
     /// ファイル番号は [allocateFileNumber] から取得する。

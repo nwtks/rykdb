@@ -201,48 +201,70 @@ module internal ExecContext =
             | Some idx -> return! Dml.indexAccessMasks schema idx mask
         }
 
+    /// 索引 fetch で 1行の主キーを組み立てて本体を引く。
+    let private fetchOneRow
+        (ctx: ExecContext)
+        (fetchMask: bool array)
+        (schema: TableSchema)
+        (pkPositions: int array)
+        (row: SqlValue array)
+        =
+        let pk = pkPositions |> Array.map (fun i -> row.[i])
+
+        if
+            pk
+            |> Array.exists (function
+                | SqlValue.Unloaded -> true
+                | _ -> false)
+        then
+            err (DbError.internalError "索引 fetch: 主キーが復号されていません")
+        else
+            KeyBuilder.ofValues pk
+            >>= fun keyBytes ->
+                Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema keyBytes ctx.Visible ctx.Txn fetchMask
+                |> Result.map (
+                    Option.map (fun fetched ->
+                        Array.init schema.Columns.Length (fun i ->
+                            if i < fetchMask.Length && fetchMask.[i] then
+                                fetched.[i]
+                            else
+                                row.[i]))
+                )
+
+    /// 索引 fetch の後続 Op を遅延して作る。
+    [<TailCall>]
+    let rec private fetchGo
+        (ctx: ExecContext)
+        (fetchMask: bool array)
+        (schema: TableSchema)
+        (pkPositions: int array)
+        (op: Op)
+        =
+        Op.compute (fun () -> fetchAdvance ctx fetchMask schema pkPositions op)
+
+    /// 索引 fetch の 1ステップを進める。
+    and private fetchAdvance
+        (ctx: ExecContext)
+        (fetchMask: bool array)
+        (schema: TableSchema)
+        (pkPositions: int array)
+        (current: Op)
+        =
+        match Op.next current with
+        | OpStep.OpRow(row, next) ->
+            match fetchOneRow ctx fetchMask schema pkPositions row with
+            | Error e -> OpStep.OpError e
+            | Ok None -> fetchAdvance ctx fetchMask schema pkPositions next
+            | Ok(Some merged) -> OpStep.OpRow(merged, fetchGo ctx fetchMask schema pkPositions next)
+        | x -> x
+
     /// 索引スキャンで被覆できなかった列を、同じスナップショットの主キー lookup で埋める。
     /// 表行が見つからない索引エントリ（防御）は行ごと捨てる。
     let fetchMissing (ctx: ExecContext) (table: string) (fetchMask: bool array) (op: Op) =
-        let fetchOne schema pkPositions (row: SqlValue array) =
-            let pk = pkPositions |> Array.map (fun i -> row.[i])
-
-            if
-                pk
-                |> Array.exists (function
-                    | SqlValue.Unloaded -> true
-                    | _ -> false)
-            then
-                err (DbError.internalError "索引 fetch: 主キーが復号されていません")
-            else
-                KeyBuilder.ofValues pk
-                >>= fun keyBytes ->
-                    Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema keyBytes ctx.Visible ctx.Txn fetchMask
-                    |> Result.map (
-                        Option.map (fun fetched ->
-                            Array.init schema.Columns.Length (fun i ->
-                                if i < fetchMask.Length && fetchMask.[i] then
-                                    fetched.[i]
-                                else
-                                    row.[i]))
-                    )
-
-        let rec go schema pkPositions op =
-            Op.compute (fun () -> advance schema pkPositions op)
-
-        and advance schema pkPositions current =
-            match Op.next current with
-            | OpStep.OpRow(row, next) ->
-                match fetchOne schema pkPositions row with
-                | Error e -> OpStep.OpError e
-                | Ok None -> advance schema pkPositions next
-                | Ok(Some merged) -> OpStep.OpRow(merged, go schema pkPositions next)
-            | x -> x
-
         result {
             let! schema = schemaOf table ctx
             let pkPositions = Array.ofList schema.PrimaryKey
-            return go schema pkPositions op
+            return fetchGo ctx fetchMask schema pkPositions op
         }
 
     /// 主キーで 1行を列マスク付きで引く。
@@ -271,6 +293,28 @@ module internal DmlOps =
         | Some w -> Eval.matchesWithV resolve row w
         | None -> DbOk true
 
+    /// 値式を列位置へ対応付ける再帰本体（アキュムレータを明示する）。
+    [<TailCall>]
+    let rec private gatherWithLoop
+        (evalOne: Expr -> DbResult<SqlValue>)
+        (schema: TableSchema)
+        (acc: (int * SqlValue) list)
+        (vs: Expr list)
+        (ixs: int list)
+        =
+        match vs, ixs with
+        | [], [] -> DbOk acc
+        | v :: rest, i :: restIdx ->
+            match evalOne v with
+            | DbErr e -> DbErr e
+            | DbOk value ->
+                let colDef = schema.Columns.[i]
+
+                match SqlValue.coerce colDef.DataType value with
+                | Error e -> DbErr e
+                | Ok coerced -> gatherWithLoop evalOne schema ((i, coerced) :: acc) rest restIdx
+        | _ -> DbOk acc
+
     /// 値式を列位置に対応付け、型強制して (位置, 値) のリストにする。
     /// UPDATE の現在行を使った評価を受け取る
     /// （INSERT は `evalValues` → `assembleRow` の別経路）。
@@ -280,21 +324,7 @@ module internal DmlOps =
         (values: Expr list)
         (idxs: int list)
         =
-        let rec gather acc vs ixs =
-            match vs, ixs with
-            | [], [] -> DbOk acc
-            | v :: rest, i :: restIdx ->
-                match evalOne v with
-                | DbErr e -> DbErr e
-                | DbOk value ->
-                    let colDef = schema.Columns.[i]
-
-                    match SqlValue.coerce colDef.DataType value with
-                    | Error e -> DbErr e
-                    | Ok coerced -> gather ((i, coerced) :: acc) rest restIdx
-            | _ -> DbOk acc
-
-        gather [] values idxs
+        gatherWithLoop evalOne schema [] values idxs
 
     /// gather で埋まった `(列位置, 値)` の対を、列順の行へ戻す。
     /// 埋まっていない位置は fallback に委ねる
@@ -341,26 +371,86 @@ module internal DmlOps =
         |> all
         |> Result.map List.toArray
 
+    /// INSERT の列数と値の数の不一致を表すエラーを作る。
+    let private insertWidthMismatchOf (expected: int) (provided: int) =
+        sprintf "INSERT の列数(%d)と値の数(%d)が合いません" expected provided
+        |> DbError.create ErrorKind.SyntaxError
+
+    /// 列位置・値配列から INSERT の列数不一致エラーを作る。
+    let private insertWidthMismatch (idxs: int list) (values: SqlValue array) =
+        insertWidthMismatchOf (List.length idxs) values.Length
+
+    /// 提供値を列の型へ強制して (位置, 値) の対を集める。
+    [<TailCall>]
+    let rec private assembleGather
+        (schema: TableSchema)
+        (idxs: int list)
+        (values: SqlValue array)
+        (acc: (int * SqlValue) list)
+        (vs: SqlValue list)
+        (ixs: int list)
+        =
+        match vs, ixs with
+        | [], [] -> ret acc
+        | v :: rest, i :: restIdx ->
+            match SqlValue.coerce schema.Columns.[i].DataType v with
+            | Ok coerced -> assembleGather schema idxs values ((i, coerced) :: acc) rest restIdx
+            | Error e -> err e
+        | _ -> err (insertWidthMismatch idxs values)
+
     /// 提供された値（`idxs` の順）を列の型へ強制し、省略列を `defaults` で埋めて列順の行にする。
     let private assembleRow (schema: TableSchema) (idxs: int list) (defaults: SqlValue array) (values: SqlValue array) =
-        let widthMismatch () =
-            sprintf "INSERT の列数(%d)と値の数(%d)が合いません" (List.length idxs) values.Length
-            |> DbError.create ErrorKind.SyntaxError
-
-        let rec gather acc vs ixs =
-            match vs, ixs with
-            | [], [] -> ret acc
-            | v :: rest, i :: restIdx ->
-                match SqlValue.coerce schema.Columns.[i].DataType v with
-                | Ok coerced -> gather ((i, coerced) :: acc) rest restIdx
-                | Error e -> err e
-            | _ -> err (widthMismatch ())
-
         if values.Length <> List.length idxs then
-            err (widthMismatch ())
+            err (insertWidthMismatch idxs values)
         else
-            gather [] (List.ofArray values) idxs
+            assembleGather schema idxs values [] (List.ofArray values) idxs
             |> Result.map (fun filled -> scatter schema.Columns.Length filled (fun i -> defaults.[i]))
+
+    /// UNIQUE 索引の重複を検査する本体。
+    [<TailCall>]
+    let rec private checkUniqueIndexes
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (txn: Transaction)
+        (row: SqlValue array)
+        (pkMask: bool array)
+        (pk: SqlValue array)
+        (pkBytes: byte array)
+        =
+        function
+        | [] -> ret pkBytes
+        | idx :: rest ->
+            match RowKey.indexValues schema idx row |> Result.map List.toArray with
+            | Ok values when values |> Array.exists SqlValue.isNull ->
+                checkUniqueIndexes ctx schema txn row pkMask pk pkBytes rest
+            | Ok values ->
+                match
+                    Dml.scanByIndexPrefixWithTxnMask
+                        ctx.Store
+                        schema
+                        idx
+                        values
+                        1
+                        ctx.Visible
+                        (Some ctx.Scope)
+                        txn
+                        pkMask
+                with
+                | Ok scan ->
+                    match Op.toArray scan with
+                    | Ok rows ->
+                        if
+                            rows
+                            |> Array.exists (fun r ->
+                                let existingPk = TableSchema.primaryKeyOf schema r
+                                not (Array.forall2 (=) existingPk pk))
+                        then
+                            err (sprintf "UNIQUE 制約に違反: %s" idx.Name |> DbError.constraintViolation)
+                        else
+                            checkUniqueIndexes ctx schema txn row pkMask pk pkBytes rest
+                    | Error e -> err e
+                | Error e -> err e
+            | Error e -> err e
 
     /// 主キーと UNIQUE 索引の重複を検査し、確定した主キーのバイト列を返す。
     let private checkUnique (ctx: ExecContext) (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
@@ -369,48 +459,14 @@ module internal DmlOps =
         let pkMask =
             Array.init schema.Columns.Length (fun i -> List.contains i schema.PrimaryKey)
 
-        let rec check pk pkBytes =
-            function
-            | [] -> ret pkBytes
-            | idx :: rest ->
-                match RowKey.indexValues schema idx row |> Result.map List.toArray with
-                | Ok values when values |> Array.exists SqlValue.isNull -> check pk pkBytes rest
-                | Ok values ->
-                    match
-                        Dml.scanByIndexPrefixWithTxnMask
-                            ctx.Store
-                            schema
-                            idx
-                            values
-                            1
-                            ctx.Visible
-                            (Some ctx.Scope)
-                            txn
-                            pkMask
-                    with
-                    | Ok scan ->
-                        match Op.toArray scan with
-                        | Ok rows ->
-                            if
-                                rows
-                                |> Array.exists (fun r ->
-                                    let existingPk = TableSchema.primaryKeyOf schema r
-                                    not (Array.forall2 (=) existingPk pk))
-                            then
-                                err (sprintf "UNIQUE 制約に違反: %s" idx.Name |> DbError.constraintViolation)
-                            else
-                                check pk pkBytes rest
-                        | Error e -> err e
-                    | Error e -> err e
-                | Error e -> err e
-
         let pk = TableSchema.primaryKeyOf schema row
 
         KeyBuilder.ofValues pk
         >>= fun pkBytes ->
             match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes ctx.Visible txn existsMask with
             | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
-            | Ok None -> check pk pkBytes (schema.Indexes |> List.filter _.Unique)
+            | Ok None ->
+                checkUniqueIndexes ctx schema txn row pkMask pk pkBytes (schema.Indexes |> List.filter _.Unique)
             | Error e -> err e
 
     /// 1行を制約検査して transaction へ積む。
@@ -438,32 +494,44 @@ module internal DmlOps =
     /// columns が None ならテーブル定義の順に並べる。
     /// DEFAULT / NULL の充足と型強制はここで行う。
     /// TableSchema.validateRow が NOT NULL と列数を最終確認する（型は`SqlValue.coerce`で強制済み）。
+    /// INSERT の値式を 1つずつ評価して列順の配列へ集める再帰本体。
+    [<TailCall>]
+    let rec private insertGather
+        (schema: TableSchema)
+        (evalConstant: Expr -> Result<SqlValue, DbError>)
+        (idxs: int list)
+        (values: Expr list)
+        (acc: SqlValue list)
+        (vs: Expr list)
+        (ixs: int list)
+        =
+        match vs, ixs with
+        | [], [] -> ret (List.rev acc |> List.toArray)
+        | v :: rest, i :: restIdx ->
+            let evaluated =
+                match v with
+                | Expr.Default -> evalDefaultValue schema i
+                | _ -> evalConstant v
+
+            match evaluated with
+            | Ok value -> insertGather schema evalConstant idxs values (value :: acc) rest restIdx
+            | Error e -> err e
+        | _ -> err (insertWidthMismatchOf (List.length idxs) (List.length values))
+
+    /// INSERT の値式を評価して列順の配列にする。
+    let private insertEvalValues
+        (schema: TableSchema)
+        (evalConstant: Expr -> Result<SqlValue, DbError>)
+        (idxs: int list)
+        (values: Expr list)
+        =
+        if List.length values <> List.length idxs then
+            err (insertWidthMismatchOf (List.length idxs) (List.length values))
+        else
+            insertGather schema evalConstant idxs values [] values idxs
+
     let insert (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (rows: Expr list list) =
         let evalConstant = Eval.eval Schema.Empty [||]
-
-        let widthMismatch expected provided =
-            sprintf "INSERT の列数(%d)と値の数(%d)が合いません" expected provided
-            |> DbError.create ErrorKind.SyntaxError
-
-        let evalValues idxs values =
-            let rec gather acc vs ixs =
-                match vs, ixs with
-                | [], [] -> ret (List.rev acc |> List.toArray)
-                | v :: rest, i :: restIdx ->
-                    let evaluated =
-                        match v with
-                        | Expr.Default -> evalDefaultValue schema i
-                        | _ -> evalConstant v
-
-                    match evaluated with
-                    | Ok value -> gather (value :: acc) rest restIdx
-                    | Error e -> err e
-                | _ -> err (widthMismatch (List.length idxs) (List.length values))
-
-            if List.length values <> List.length idxs then
-                err (widthMismatch (List.length idxs) (List.length values))
-            else
-                gather [] values idxs
 
         result {
             let! idxs = insertTargets schema columns
@@ -487,7 +555,7 @@ module internal DmlOps =
                     |> foldOk
                         (fun (txnAcc, count) values ->
                             result {
-                                let! provided = evalValues idxs values
+                                let! provided = insertEvalValues schema evalConstant idxs values
                                 let! row = assembleRow schema idxs defaults provided
                                 let! txnAcc2 = insertRow ctx schema checks txnAcc row
                                 return txnAcc2, count + 1
@@ -501,24 +569,209 @@ module internal DmlOps =
     /// ここでは列の対応付け・型強制・制約検査だけを行う。
     /// 選択結果の `Op` は計画時点の snapshot と transaction を握っているため、
     /// 挿入した行を読み返して増え続けることはない（`INSERT INTO t SELECT * FROM t` も止まる）。
-    let insertSelect (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (source: Op) =
-        let rec go idxs defaults checks txn count cur =
-            match Op.next cur with
-            | OpStep.OpError e -> err e
-            | OpStep.OpDone -> ret (txn, count)
-            | OpStep.OpRow(row, nxt) ->
-                match assembleRow schema idxs defaults row with
-                | Ok values ->
-                    match insertRow ctx schema checks txn values with
-                    | Ok next -> go idxs defaults checks next (count + 1) nxt
-                    | Error e -> err e
+    /// INSERT ... SELECT の選択結果を 1行ずつ挿入する再帰本体。
+    [<TailCall>]
+    let rec private insertSelectGo
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (idxs: int list)
+        (defaults: SqlValue array)
+        (checks: ChildCheck list)
+        (txn: Transaction)
+        (count: int)
+        (cur: Op)
+        =
+        match Op.next cur with
+        | OpStep.OpError e -> err e
+        | OpStep.OpDone -> ret (txn, count)
+        | OpStep.OpRow(row, nxt) ->
+            match assembleRow schema idxs defaults row with
+            | Ok values ->
+                match insertRow ctx schema checks txn values with
+                | Ok next -> insertSelectGo ctx schema idxs defaults checks next (count + 1) nxt
                 | Error e -> err e
+            | Error e -> err e
 
+    let insertSelect (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (source: Op) =
         result {
             let! idxs = insertTargets schema columns
             let! defaults = defaultValuesOf schema (Set.ofList idxs)
             let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
-            return! go idxs defaults checks ctx.Txn 0 source
+            return! insertSelectGo ctx schema idxs defaults checks ctx.Txn 0 source
+        }
+
+    /// UPDATE の代入式を現在行で評価して新しい行を作る。
+    let private updateAssign
+        (resolve: Prepared)
+        (schema: TableSchema)
+        (assignExprs: Expr list)
+        (targets: int list)
+        (row: SqlValue array)
+        =
+        gatherWith (Eval.evalWithV resolve row) schema assignExprs targets
+        |> DbResult.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
+
+    /// 行のバイト数を見積もる。
+    let private rowByteCount (row: SqlValue array) = int64 (ValueCodec.managedRowBytes row)
+
+    /// 更新後の UNIQUE 索引に他行が残っていないか検査する。
+    let private checkExistingUpdated
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (updatedPks: Set<SqlValue array>)
+        (txn: Transaction)
+        (pkMask: bool array)
+        (idx: IndexSchema)
+        (values: SqlValue array)
+        =
+        result {
+            let! scan =
+                Dml.scanByIndexPrefixWithTxnMask ctx.Store schema idx values 0 ctx.Visible (Some ctx.Scope) txn pkMask
+
+            let! rows = Op.toArray scan
+
+            if
+                rows
+                |> Array.exists (fun row -> not (Set.contains (TableSchema.primaryKeyOf schema row) updatedPks))
+            then
+                return! err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+            else
+                return ()
+        }
+
+    /// 位置列から索引キーのバイト列を作る（NULL は対象外）。
+    let private encodeKeyValues positions (row: SqlValue array) =
+        let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
+
+        if values |> Array.exists SqlValue.isNull then
+            Ok None
+        else
+            KeyBuilder.ofValues values |> Result.map Some
+
+    /// 1つの UNIQUE 索引について更新前後のキーを検査する。
+    let private checkIndexUpdates
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (txn: Transaction)
+        (updatedPks: Set<SqlValue array>)
+        (targetPositions: Set<int>)
+        (pkMask: bool array)
+        (updates: (SqlValue array * SqlValue array) list)
+        (idx: IndexSchema)
+        =
+        result {
+            let! positions = idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
+
+            if not (positions |> List.exists (fun p -> Set.contains p targetPositions)) then
+                return ()
+            else
+                let! _, changed =
+                    updates
+                    |> foldOk
+                        (fun (seen, changed) (oldRow, newRow) ->
+                            result {
+                                let! newKey = encodeKeyValues positions newRow
+
+                                match newKey with
+                                | None -> return seen, changed
+                                | Some key ->
+                                    if Set.contains key seen then
+                                        return! err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
+                                    else
+                                        let! oldKey = encodeKeyValues positions oldRow
+                                        let changed = if oldKey = newKey then changed else newRow :: changed
+                                        return Set.add key seen, changed
+                            })
+                        (Set.empty, [])
+
+                return!
+                    changed
+                    |> List.fold
+                        (fun acc newRow ->
+                            acc
+                            >>= fun () ->
+                                let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
+                                checkExistingUpdated ctx schema updatedPks txn pkMask idx values)
+                        (ret ())
+        }
+
+    /// 更新される全 UNIQUE 索引をまとめて検査する。
+    let private validateUniqueUpdates
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (txn: Transaction)
+        (targets: int list)
+        (updates: (SqlValue array * SqlValue array) list)
+        =
+        let updatedPks =
+            updates
+            |> List.map (fun (_, newRow) -> TableSchema.primaryKeyOf schema newRow)
+            |> Set.ofList
+
+        let targetPositions = Set.ofList targets
+
+        let pkMask =
+            Array.init schema.Columns.Length (fun i -> List.contains i schema.PrimaryKey)
+
+        schema.Indexes
+        |> List.filter _.Unique
+        |> foldOk (fun () idx -> checkIndexUpdates ctx schema txn updatedPks targetPositions pkMask updates idx) ()
+
+    /// UPDATE の対象行を走査して収集する（末尾再帰）。
+    [<TailCall>]
+    let rec private updateRowsGo
+        (resolve: Prepared)
+        (where: Expr option)
+        (schema: TableSchema)
+        (assignExprs: Expr list)
+        (limitBytes: int64)
+        (targets: int list)
+        (acc: (SqlValue array * SqlValue array) list)
+        (bytes: int64)
+        (cur: Op)
+        =
+        match Op.next cur with
+        | OpStep.OpError e -> err e
+        | OpStep.OpDone -> ret (List.rev acc)
+        | OpStep.OpRow(row, next) ->
+            match matchesWhere resolve row where with
+            | DbErr e -> err e
+            | DbOk false -> updateRowsGo resolve where schema assignExprs limitBytes targets acc bytes next
+            | DbOk true ->
+                match updateAssign resolve schema assignExprs targets row with
+                | DbErr e -> err e
+                | DbOk newRow ->
+                    let bytes = bytes + rowByteCount row + rowByteCount newRow + 24L
+
+                    if bytes > limitBytes then
+                        sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" limitBytes
+                        |> DbError.capacity
+                        |> err
+                    else
+                        updateRowsGo
+                            resolve
+                            where
+                            schema
+                            assignExprs
+                            limitBytes
+                            targets
+                            ((row, newRow) :: acc)
+                            bytes
+                            next
+
+    /// UPDATE の対象行を開いて収集する。
+    let private collectUpdates
+        (scan: bool array -> Result<Op, DbError>)
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (resolve: Prepared)
+        (assignExprs: Expr list)
+        (where: Expr option)
+        (targets: int list)
+        =
+        result {
+            let! scan = scan (Array.create schema.Columns.Length true)
+            return! updateRowsGo resolve where schema assignExprs ctx.Txn.LimitBytes targets [] 0L scan
         }
 
     /// UPDATE。
@@ -539,125 +792,6 @@ module internal DmlOps =
         let assignExprs = List.map snd assignments
         let resolve = Eval.prepare targetSchema (assignExprs @ Option.toList where)
 
-        let assign targets row =
-            gatherWith (Eval.evalWithV resolve row) schema assignExprs targets
-            |> DbResult.map (fun filled -> scatter row.Length filled (fun i -> row.[i]))
-
-        let rowBytes row = int64 (ValueCodec.managedRowBytes row)
-
-        let rec go targets acc bytes cur =
-            match Op.next cur with
-            | OpStep.OpError e -> err e
-            | OpStep.OpDone -> ret (List.rev acc)
-            | OpStep.OpRow(row, next) ->
-                match matchesWhere resolve row where with
-                | DbErr e -> err e
-                | DbOk false -> go targets acc bytes next
-                | DbOk true ->
-                    match assign targets row with
-                    | DbErr e -> err e
-                    | DbOk newRow ->
-                        let bytes = bytes + rowBytes row + rowBytes newRow + 24L
-
-                        if bytes > ctx.Txn.LimitBytes then
-                            sprintf "UPDATE の対象行が transaction の上限（%d バイト）を超えました" ctx.Txn.LimitBytes
-                            |> DbError.capacity
-                            |> err
-                        else
-                            go targets ((row, newRow) :: acc) bytes next
-
-        let collectUpdates targets =
-            result {
-                let! scan = scan (Array.create schema.Columns.Length true)
-                return! go targets [] 0L scan
-            }
-
-        let checkExisting updatedPks txn pkMask idx values =
-            result {
-                let! scan =
-                    Dml.scanByIndexPrefixWithTxnMask
-                        ctx.Store
-                        schema
-                        idx
-                        values
-                        0
-                        ctx.Visible
-                        (Some ctx.Scope)
-                        txn
-                        pkMask
-
-                let! rows = Op.toArray scan
-
-                if
-                    rows
-                    |> Array.exists (fun row -> not (Set.contains (TableSchema.primaryKeyOf schema row) updatedPks))
-                then
-                    return! err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                else
-                    return ()
-            }
-
-        let encodeValues positions (row: SqlValue array) =
-            let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
-
-            if values |> Array.exists SqlValue.isNull then
-                Ok None
-            else
-                KeyBuilder.ofValues values |> Result.map Some
-
-        let checkIndex txn updatedPks targetPositions pkMask updates (idx: IndexSchema) =
-            result {
-                let! positions = idx.Columns |> List.map (TableSchema.requireIndexOf schema) |> all
-
-                if not (positions |> List.exists (fun p -> Set.contains p targetPositions)) then
-                    return ()
-                else
-                    let! _, changed =
-                        updates
-                        |> foldOk
-                            (fun (seen, changed) (oldRow, newRow) ->
-                                result {
-                                    let! newKey = encodeValues positions newRow
-
-                                    match newKey with
-                                    | None -> return seen, changed
-                                    | Some key ->
-                                        if Set.contains key seen then
-                                            return!
-                                                err (DbError.constraintViolation (sprintf "UNIQUE 制約に違反: %s" idx.Name))
-                                        else
-                                            let! oldKey = encodeValues positions oldRow
-                                            let changed = if oldKey = newKey then changed else newRow :: changed
-                                            return Set.add key seen, changed
-                                })
-                            (Set.empty, [])
-
-                    return!
-                        changed
-                        |> List.fold
-                            (fun acc newRow ->
-                                acc
-                                >>= fun () ->
-                                    let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
-                                    checkExisting updatedPks txn pkMask idx values)
-                            (ret ())
-            }
-
-        let validateUniqueUpdates txn targets updates =
-            let updatedPks =
-                updates
-                |> List.map (fun (_, newRow) -> TableSchema.primaryKeyOf schema newRow)
-                |> Set.ofList
-
-            let targetPositions = Set.ofList targets
-
-            let pkMask =
-                Array.init schema.Columns.Length (fun i -> List.contains i schema.PrimaryKey)
-
-            schema.Indexes
-            |> List.filter _.Unique
-            |> foldOk (fun () idx -> checkIndex txn updatedPks targetPositions pkMask updates idx) ()
-
         match assignments |> List.map fst |> SqlName.duplicate with
         | Some name -> err (DbError.name (sprintf "UPDATE の列 %s が重複しています" name))
         | None ->
@@ -673,8 +807,8 @@ module internal DmlOps =
                         |> foldOk (fun () e -> Eval.checkComparableTypes targetSchema e) ()
 
                     let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
-                    let! updates = collectUpdates targets
-                    do! validateUniqueUpdates ctx.Txn targets updates
+                    let! updates = collectUpdates scan ctx schema resolve assignExprs where targets
+                    do! validateUniqueUpdates ctx schema ctx.Txn targets updates
 
                     let! txn2 =
                         updates
@@ -689,6 +823,101 @@ module internal DmlOps =
                     return txn2, List.length updates
                 }
 
+    /// DELETE で読み直す必要のある列だけを残す列マスクを作る。
+    let private deleteMaskFor
+        (targetSchema: Schema)
+        (schema: TableSchema)
+        (where: Expr option)
+        (checks: ParentDeleteCheck list)
+        =
+        let width = schema.Columns.Length
+        let allColumns = Array.create width true
+        let mask = Array.create width false
+
+        for i in schema.PrimaryKey do
+            if i >= 0 && i < width then
+                mask.[i] <- true
+
+        for idx in schema.Indexes do
+            for name in idx.Columns do
+                match TableSchema.indexOf schema name with
+                | Some i when i >= 0 && i < width -> mask.[i] <- true
+                | _ -> ()
+
+        for check in checks do
+            for i in check.ParentPositions do
+                if i >= 0 && i < width then
+                    mask.[i] <- true
+
+        match where with
+        | None -> mask
+        | Some w when Expr.hasAnySubquery w -> allColumns
+        | Some w ->
+            let refs =
+                Expr.fold
+                    (fun acc x ->
+                        match x with
+                        | Expr.Column c -> c :: acc
+                        | Expr.Name n -> { Qualifier = None; Name = n } :: acc
+                        | _ -> acc)
+                    []
+                    w
+
+            let resolved =
+                refs
+                |> List.map (fun r ->
+                    match Schema.resolve r targetSchema with
+                    | Ok i -> Some i
+                    | Error _ ->
+                        match Schema.resolve { Qualifier = None; Name = r.Name } targetSchema with
+                        | Ok i -> Some i
+                        | Error _ -> None)
+
+            if List.exists Option.isNone resolved then
+                allColumns
+            else
+                for i in resolved |> List.choose id do
+                    if i >= 0 && i < width then
+                        mask.[i] <- true
+
+                mask
+
+    /// DELETE の候補行を畳み込む再帰本体。
+    [<TailCall>]
+    let rec private deleteGo
+        (scan: 'a)
+        (mask: 'b)
+        (matched: SqlValue array -> DbResult<bool>)
+        (onRow: 'c -> 'd -> SqlValue array -> Result<('c * 'd), DbError>)
+        (t: 'c)
+        (c: 'd)
+        (cur: Op)
+        =
+        match Op.next cur with
+        | OpStep.OpError e -> err e
+        | OpStep.OpDone -> ret (t, c)
+        | OpStep.OpRow(row, nxt) ->
+            match matched row with
+            | DbErr e -> err e
+            | DbOk false -> deleteGo scan mask matched onRow t c nxt
+            | DbOk true ->
+                match onRow t c row with
+                | Ok(tc, c') -> deleteGo scan mask matched onRow tc c' nxt
+                | Error e -> err e
+
+    /// DELETE の候補行を開いて畳み込む。
+    let private foldDeleteRows
+        (scan: 'a -> Result<Op, DbError>)
+        (ctx: ExecContext)
+        (mask: 'a)
+        (matched: SqlValue array -> DbResult<bool>)
+        (onRow: Transaction -> int -> SqlValue array -> Result<(Transaction * int), DbError>)
+        =
+        result {
+            let! scan = scan mask
+            return! deleteGo scan mask matched onRow ctx.Txn 0 scan
+        }
+
     /// DELETE。
     /// WHERE に合う行を主キー + 全索引に tombstone で消す。
     /// `scan` は候補行を開く関数（列マスクを受ける）。
@@ -701,78 +930,6 @@ module internal DmlOps =
         let targetSchema = targetSchemaOf schema
         let resolve = Eval.prepare targetSchema (Option.toList where)
 
-        let deleteMask checks =
-            let width = schema.Columns.Length
-            let allColumns = Array.create width true
-            let mask = Array.create width false
-
-            for i in schema.PrimaryKey do
-                if i >= 0 && i < width then
-                    mask.[i] <- true
-
-            for idx in schema.Indexes do
-                for name in idx.Columns do
-                    match TableSchema.indexOf schema name with
-                    | Some i when i >= 0 && i < width -> mask.[i] <- true
-                    | _ -> ()
-
-            for check in checks do
-                for i in check.ParentPositions do
-                    if i >= 0 && i < width then
-                        mask.[i] <- true
-
-            match where with
-            | None -> mask
-            | Some w when Expr.hasAnySubquery w -> allColumns
-            | Some w ->
-                let refs =
-                    Expr.fold
-                        (fun acc x ->
-                            match x with
-                            | Expr.Column c -> c :: acc
-                            | Expr.Name n -> { Qualifier = None; Name = n } :: acc
-                            | _ -> acc)
-                        []
-                        w
-
-                let resolved =
-                    refs
-                    |> List.map (fun r ->
-                        match Schema.resolve r targetSchema with
-                        | Ok i -> Some i
-                        | Error _ ->
-                            match Schema.resolve { Qualifier = None; Name = r.Name } targetSchema with
-                            | Ok i -> Some i
-                            | Error _ -> None)
-
-                if List.exists Option.isNone resolved then
-                    allColumns
-                else
-                    for i in resolved |> List.choose id do
-                        if i >= 0 && i < width then
-                            mask.[i] <- true
-
-                    mask
-
-        let foldRows ctx mask matched onRow =
-            let rec go t c cur =
-                match Op.next cur with
-                | OpStep.OpError e -> err e
-                | OpStep.OpDone -> ret (t, c)
-                | OpStep.OpRow(row, nxt) ->
-                    match matched row with
-                    | DbErr e -> err e
-                    | DbOk false -> go t c nxt
-                    | DbOk true ->
-                        match onRow t c row with
-                        | Ok(tc, c') -> go tc c' nxt
-                        | Error e -> err e
-
-            result {
-                let! scan = scan mask
-                return! go ctx.Txn 0 scan
-            }
-
         result {
             do! Eval.checkPrepared resolve
 
@@ -782,10 +939,10 @@ module internal DmlOps =
                 |> foldOk (fun () e -> Eval.checkComparableTypes targetSchema e) ()
 
             let! checks = ForeignKey.prepareParentDeleteChecks ctx.Catalog schema
-            let mask = deleteMask checks
+            let mask = deleteMaskFor targetSchema schema where checks
 
             return!
-                foldRows ctx mask (fun row -> matchesWhere resolve row where) (fun t count row ->
+                foldDeleteRows scan ctx mask (fun row -> matchesWhere resolve row where) (fun t count row ->
                     ForeignKey.checkParentDelete ctx.Store ctx.Visible ctx.Scope t schema checks row
                     >>= fun () -> Dml.deleteRow t schema row |> Result.map (fun t2 -> t2, count + 1))
         }

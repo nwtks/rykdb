@@ -148,52 +148,57 @@ module internal Analyzer =
     /// LSM の走査はキーのバイト順 = 主キー / 索引列の SQL 順なので、
     /// 主キー走査・索引走査はこの並びを返す。`Filter` / `Limit` は順序を変えない。
     /// </remarks>
-    let scanOrder (tableOf: string -> TableSchema option) =
-        let primaryKeyOrder t =
-            match TableSchema.primaryKeyColumns t |> Array.toList with
-            | [] -> None
-            | keys -> Some keys
+    /// 主キー列の並びを返す（主キーが無ければ None）。
+    let private primaryKeyOrder (t: TableSchema) =
+        match TableSchema.primaryKeyColumns t |> Array.toList with
+        | [] -> None
+        | keys -> Some keys
 
-        let rec go =
-            function
-            | Logical.Scan(name, ScanMethod.SeqScan)
-            | Logical.Scan(name, ScanMethod.RangeScan _) -> tableOf name |> Option.bind primaryKeyOrder
-            | Logical.Scan(name, ScanMethod.IndexLookup(indexName, _))
-            | Logical.Scan(name, ScanMethod.IndexRangeScan(indexName, _, _)) ->
-                tableOf name
-                |> Option.bind (fun (t: TableSchema) ->
-                    t.Indexes
-                    |> List.tryFind (fun (i: IndexSchema) -> Catalog.eqName i.Name indexName)
-                    |> Option.map (fun i -> i.Columns))
-            | Logical.Scan(_, ScanMethod.PkLookup _) -> Some []
-            | Logical.Filter(_, child)
-            | Logical.Limit(_, _, child) -> go child
-            | Logical.Values _ -> Some []
-            | _ -> None
+    /// 走査順が保証される列名を木から辿る。
+    [<TailCall>]
+    let rec private scanOrderGo (tableOf: string -> TableSchema option) =
+        function
+        | Logical.Scan(name, ScanMethod.SeqScan)
+        | Logical.Scan(name, ScanMethod.RangeScan _) -> tableOf name |> Option.bind primaryKeyOrder
+        | Logical.Scan(name, ScanMethod.IndexLookup(indexName, _))
+        | Logical.Scan(name, ScanMethod.IndexRangeScan(indexName, _, _)) ->
+            tableOf name
+            |> Option.bind (fun (t: TableSchema) ->
+                t.Indexes
+                |> List.tryFind (fun (i: IndexSchema) -> Catalog.eqName i.Name indexName)
+                |> Option.map (fun i -> i.Columns))
+        | Logical.Scan(_, ScanMethod.PkLookup _) -> Some []
+        | Logical.Filter(_, child)
+        | Logical.Limit(_, _, child) -> scanOrderGo tableOf child
+        | Logical.Values _ -> Some []
+        | _ -> None
 
-        go
+    let scanOrder (tableOf: string -> TableSchema option) = scanOrderGo tableOf
+
+    /// 列名を未使用の結合キー位置へ順に対応付ける。
+    [<TailCall>]
+    let rec private alignJoinKeysPick (schema: Schema) (indices: int array) (used: int list) (acc: int list) =
+        function
+        | [] -> Some(List.rev acc)
+        | n :: rest ->
+            let hit =
+                indices
+                |> Array.indexed
+                |> Array.tryFind (fun (_, i) -> not (List.contains i used) && SqlName.equal schema.Columns.[i].Name n)
+
+            match hit with
+            | Some(_, i) -> alignJoinKeysPick schema indices (i :: used) (i :: acc) rest
+            | None -> None
+
+    /// 対応付いた列位置を配列へ整える。
+    let private alignJoinKeysReorder (schema: Schema) (indices: int array) =
+        alignJoinKeysPick schema indices [] [] >> Option.map List.toArray
 
     /// 結合キーを走査順に並べ替える。
     /// 走査順の先頭 `indices.Length` 列がちょうど結合キーであれば、
     /// その順のキー位置と列名を返す。
     /// （キーでない列がキーの間に挟まると、その走査はキー順にならないので None）
     let private alignJoinKeys (schema: Schema) (indices: int array) =
-        let rec pick used acc =
-            function
-            | [] -> Some(List.rev acc)
-            | n :: rest ->
-                let hit =
-                    indices
-                    |> Array.indexed
-                    |> Array.tryFind (fun (_, i) ->
-                        not (List.contains i used) && SqlName.equal schema.Columns.[i].Name n)
-
-                match hit with
-                | Some(_, i) -> pick (i :: used) (i :: acc) rest
-                | None -> None
-
-        let reorder = pick [] [] >> Option.map List.toArray
-
         function
         | None -> None
         | Some [] -> Some(indices, [])
@@ -202,21 +207,24 @@ module internal Analyzer =
                 None
             else
                 let prefix = List.truncate indices.Length names
-                reorder prefix |> Option.map (fun reordered -> reordered, prefix)
+
+                alignJoinKeysReorder schema indices prefix
+                |> Option.map (fun reordered -> reordered, prefix)
+
+    /// Filter を剥がしながら Scan と述語を探す。
+    [<TailCall>]
+    let rec private unwrapScanPreds (preds: Expr list) =
+        function
+        | Logical.Scan(name, method) -> Some(name, method, preds)
+        | Logical.Filter(p, child) -> unwrapScanPreds (p :: preds) child
+        | _ -> None
 
     /// 右部分木の `Scan`（`Filter` を重ねてもよい）から、
     /// 走査名・走査方法・residual の述語を返す。
     /// インデックス入れ子ループは右部分木を実行しないため、
     /// `Filter` の述語は residual として結合時に評価する
     /// （捨てると WHERE の pushdown が消えて結果が変わる）。
-    let private scanOfRight =
-        let rec unwrap preds =
-            function
-            | Logical.Scan(name, method) -> Some(name, method, preds)
-            | Logical.Filter(p, child) -> unwrap (p :: preds) child
-            | _ -> None
-
-        unwrap []
+    let private scanOfRight = unwrapScanPreds []
 
     /// 右部分木を索引で引ける形か（`Scan` か `Filter` の連なり）。
     /// インデックス入れ子ループは右部分木を実行しないため、
@@ -224,21 +232,23 @@ module internal Analyzer =
     /// 結合順のコスト見積りが実行時と同じ条件で INL を選ぶために使う。
     let canScanJoinRight = scanOfRight >> Option.isSome
 
+    /// 走査名で修飾した列参照を作る。
+    let private absorbedColumn (rightName: string) (name: string) =
+        Expr.Column
+            {
+                Qualifier = Some rightName
+                Name = name
+            }
+
+    /// 吸収済み等値の述語を再構成する。
+    let private absorbedEquality (rightName: string) (name: string) (value: SqlValue) =
+        Expr.Binary(BinaryOp.Eq, absorbedColumn rightName name, Expr.Value value)
+
     /// 走査方法が吸収した等値述語を `Expr` に再構成する。
     /// `Analyzer.impliedByScan` は `PkLookup` / `IndexLookup` が保証する等値を
     /// `Filter` から除くため、INL では residual に戻さないと結果が変わる。
     /// 索引が見つからない・値の数が合わないなど再構成できないときは None を返し、INL にしない。
     let private absorbedPredicates (rightTable: TableSchema) (rightName: string) =
-        let column name =
-            Expr.Column
-                {
-                    Qualifier = Some rightName
-                    Name = name
-                }
-
-        let equality name value =
-            Expr.Binary(BinaryOp.Eq, column name, Expr.Value value)
-
         function
         | ScanMethod.PkLookup values ->
             let pkNames =
@@ -246,7 +256,7 @@ module internal Analyzer =
                 |> List.choose (fun i -> rightTable.Columns |> List.tryItem i |> Option.map _.Name)
 
             if pkNames.Length = values.Length then
-                Some(List.map2 equality pkNames (List.ofArray values))
+                Some(List.map2 (absorbedEquality rightName) pkNames (List.ofArray values))
             else
                 None
         | ScanMethod.IndexLookup(indexName, values) ->
@@ -254,7 +264,12 @@ module internal Analyzer =
             |> List.tryFind (fun i -> Catalog.eqName i.Name indexName)
             |> Option.bind (fun idx ->
                 if values.Length <= idx.Columns.Length then
-                    Some(List.map2 equality (List.truncate values.Length idx.Columns) (List.ofArray values))
+                    Some(
+                        List.map2
+                            (absorbedEquality rightName)
+                            (List.truncate values.Length idx.Columns)
+                            (List.ofArray values)
+                    )
                 else
                     None)
         | _ -> Some []
@@ -360,82 +375,93 @@ module internal Analyzer =
         else
             buildRows * (1.0 - workMemBytes / buildBytes)
 
+    /// 同じ名前の集合か（大文字小文字を区別しない）。
+    let private sameNameSet (a: string list) (b: string list) =
+        List.length a = List.length b
+        && a |> List.forall (fun x -> b |> List.exists (SqlName.equal x))
+
+    /// 修飾名からテーブル統計と列統計を引く。
+    let private joinStatsFor (statsOf: string -> TableStats option) (table: string) (name: string) =
+        statsOf table
+        |> Option.bind (fun stats ->
+            stats.Columns
+            |> List.tryFind (fun c -> SqlName.equal c.Name name)
+            |> Option.map (fun c -> stats, c))
+
+    /// 索引の先頭 prefix に対する NDV を引く。
+    let private joinPrefixNdv (statsOf: string -> TableStats option) (table: string) (names: string list) =
+        statsOf table
+        |> Option.bind (fun stats ->
+            stats.Indexes
+            |> List.tryPick (fun index ->
+                let prefix = List.truncate names.Length index.Columns
+
+                if List.length prefix = names.Length && sameNameSet prefix names then
+                    index.PrefixNDV |> List.tryItem (names.Length - 1)
+                else
+                    None))
+
+    /// 同じテーブル対の複合等値 1グループの選択性。
+    let private joinGroupSelectivity
+        (statsOf: string -> TableStats option)
+        (leftTable, rightTable)
+        (items: (string * string) list)
+        =
+        let leftNames = items |> List.map fst
+        let rightNames = items |> List.map snd
+
+        let nullFactor =
+            let factors =
+                (leftNames
+                 |> List.choose (fun name ->
+                     joinStatsFor statsOf leftTable name
+                     |> Option.map (fun (stats, column) -> 1.0 - nullRate stats column)))
+                @ (rightNames
+                   |> List.choose (fun name ->
+                       joinStatsFor statsOf rightTable name
+                       |> Option.map (fun (stats, column) -> 1.0 - nullRate stats column)))
+
+            if List.length factors = List.length leftNames + List.length rightNames then
+                Some(factors |> List.fold (*) 1.0)
+            else
+                None
+
+        let indexNdv =
+            [
+                joinPrefixNdv statsOf leftTable leftNames
+                joinPrefixNdv statsOf rightTable rightNames
+            ]
+            |> List.choose id
+            |> List.sortDescending
+            |> List.tryHead
+
+        match nullFactor, indexNdv with
+        | Some nullFactor, Some ndv when ndv > 0L -> Some(nullFactor / float ndv)
+        | _ ->
+            let perColumn =
+                List.zip leftNames rightNames
+                |> List.map (fun (leftName, rightName) ->
+                    match joinStatsFor statsOf leftTable leftName, joinStatsFor statsOf rightTable rightName with
+                    | Some(sa, ca), Some(sb, cb) when ca.NDV > 0L && cb.NDV > 0L ->
+                        Some((1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV))
+                    | _ -> None)
+
+            if perColumn |> List.forall Option.isSome then
+                Some(perColumn |> List.choose id |> List.fold (*) 1.0)
+            else
+                let known = perColumn |> List.choose id
+                let unknown = perColumn |> List.filter Option.isNone |> List.length
+
+                if List.isEmpty known then
+                    None
+                else
+                    Some((known |> List.fold (*) 1.0) * 0.1 ** float unknown)
+
     /// 等値結合の選択性。
     /// 統計が欠けている等値は既定の 0.1 で穴埋めする。
     /// 同じテーブル対の複合等値は、索引 prefix NDV があればそれを使う。
     /// `Some` は「その結合でどれだけ行が減るか」、`None` は統計なし。
     let joinSelectivity (statsOf: string -> TableStats option) (on: Expr) =
-        let sameSet a b =
-            List.length a = List.length b
-            && a |> List.forall (fun x -> b |> List.exists (SqlName.equal x))
-
-        let statsFor table name =
-            statsOf table
-            |> Option.bind (fun stats ->
-                stats.Columns
-                |> List.tryFind (fun c -> SqlName.equal c.Name name)
-                |> Option.map (fun c -> stats, c))
-
-        let prefixNdv table (names: string list) =
-            statsOf table
-            |> Option.bind (fun stats ->
-                stats.Indexes
-                |> List.tryPick (fun index ->
-                    let prefix = List.truncate names.Length index.Columns
-
-                    if List.length prefix = names.Length && sameSet prefix names then
-                        index.PrefixNDV |> List.tryItem (names.Length - 1)
-                    else
-                        None))
-
-        let groupSelectivity (leftTable, rightTable) items =
-            let leftNames = items |> List.map fst
-            let rightNames = items |> List.map snd
-
-            let nullFactor =
-                let factors =
-                    (leftNames
-                     |> List.choose (fun name ->
-                         statsFor leftTable name
-                         |> Option.map (fun (stats, column) -> 1.0 - nullRate stats column)))
-                    @ (rightNames
-                       |> List.choose (fun name ->
-                           statsFor rightTable name
-                           |> Option.map (fun (stats, column) -> 1.0 - nullRate stats column)))
-
-                if List.length factors = List.length leftNames + List.length rightNames then
-                    Some(factors |> List.fold (*) 1.0)
-                else
-                    None
-
-            let indexNdv =
-                [ prefixNdv leftTable leftNames; prefixNdv rightTable rightNames ]
-                |> List.choose id
-                |> List.sortDescending
-                |> List.tryHead
-
-            match nullFactor, indexNdv with
-            | Some nullFactor, Some ndv when ndv > 0L -> Some(nullFactor / float ndv)
-            | _ ->
-                let perColumn =
-                    List.zip leftNames rightNames
-                    |> List.map (fun (leftName, rightName) ->
-                        match statsFor leftTable leftName, statsFor rightTable rightName with
-                        | Some(sa, ca), Some(sb, cb) when ca.NDV > 0L && cb.NDV > 0L ->
-                            Some((1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV))
-                        | _ -> None)
-
-                if perColumn |> List.forall Option.isSome then
-                    Some(perColumn |> List.choose id |> List.fold (*) 1.0)
-                else
-                    let known = perColumn |> List.choose id
-                    let unknown = perColumn |> List.filter Option.isNone |> List.length
-
-                    if List.isEmpty known then
-                        None
-                    else
-                        Some((known |> List.fold (*) 1.0) * 0.1 ** float unknown)
-
         let groups =
             Predicate.splitConjuncts on
             |> List.choose (fun conjunct ->
@@ -463,7 +489,8 @@ module internal Analyzer =
             None
         else
             let estimated =
-                groups |> List.map (fun (pair, items) -> groupSelectivity pair items)
+                groups
+                |> List.map (fun (pair, items) -> joinGroupSelectivity statsOf pair items)
 
             if estimated |> List.forall Option.isNone then
                 None
@@ -497,76 +524,92 @@ module internal Analyzer =
     let private numericLiteral =
         literalOf >> Option.bind (SqlValue.asNumeric >> Option.map float)
 
+    /// 否定述語の選択性を反転する。
+    let private selectivityWithNegation (neg: bool) (value: float) =
+        if neg then max 0.0 (1.0 - value) else value
+
+    /// 列とリテラルの等値選択性（MCV を優先する）。
+    let private eqToLiteralWithStats
+        (statsOf: string -> TableStats option)
+        (defaultSelectivity: float)
+        (columnExpr: Expr)
+        (literal: SqlValue)
+        =
+        match columnWithStatsOf statsOf columnExpr with
+        | Some(stats, column) when column.NDV > 0L ->
+            if SqlValue.isNull literal then
+                nullRate stats column
+            elif stats.RowCount <= 0L then
+                defaultSelectivity
+            else
+                let total = float stats.RowCount
+                let key = SqlLiteral.toSqlLiteral literal
+
+                match column.Mcv |> List.tryFind (fun (value, _) -> value = key) with
+                | Some(_, rows) -> min 1.0 (float rows / total)
+                | None ->
+                    let nulls = float column.Nulls / total
+                    let mcvShare = column.Mcv |> List.sumBy (snd >> float) |> fun rows -> rows / total
+                    let rest = max 0.0 (min 1.0 (1.0 - nulls - mcvShare))
+                    rest / float (max 1L (column.NDV - int64 column.Mcv.Length))
+        | _ -> defaultSelectivity
+
+    /// ヒストグラムの累積分布を返す（未収集なら None）。
+    let private histogramCdf (histogram: 'a list) (v: 'a) =
+        if List.isEmpty histogram then
+            None
+        else
+            let below = histogram |> List.filter (fun x -> x <= v) |> List.length
+            Some(float below / float histogram.Length)
+
+    /// 列とリテラルの範囲選択性。
+    let private rangeToLiteralWithStats
+        (statsOf: string -> TableStats option)
+        (rangeSelectivity: float)
+        (columnExpr: Expr)
+        (literal: SqlValue)
+        (op: BinaryOp)
+        =
+        match columnWithStatsOf statsOf columnExpr, SqlValue.asNumeric literal with
+        | Some(_, column), Some n ->
+            let v = float n
+
+            match histogramCdf column.Histogram v with
+            | Some cdf ->
+                match op with
+                | BinaryOp.Gt
+                | BinaryOp.Ge -> 1.0 - cdf
+                | BinaryOp.Lt
+                | BinaryOp.Le -> cdf
+                | _ -> rangeSelectivity
+            | None ->
+                match column.Min, column.Max with
+                | Some lo, Some hi when hi > lo ->
+                    let selectivity =
+                        match op with
+                        | BinaryOp.Gt
+                        | BinaryOp.Ge -> (hi - v) / (hi - lo)
+                        | BinaryOp.Lt
+                        | BinaryOp.Le -> (v - lo) / (hi - lo)
+                        | _ -> rangeSelectivity
+
+                    max 0.0 (min 1.0 selectivity)
+                | _ -> rangeSelectivity
+        | _ -> rangeSelectivity
+
+    /// 比較演算子を左右反転する。
+    let private flipComparison =
+        function
+        | BinaryOp.Gt -> BinaryOp.Lt
+        | BinaryOp.Ge -> BinaryOp.Le
+        | BinaryOp.Lt -> BinaryOp.Gt
+        | BinaryOp.Le -> BinaryOp.Ge
+        | other -> other
+
     /// 1本の述語の選択性（統計が無ければ既定値）。
     let private filterConjunctSelectivity (statsOf: string -> TableStats option) (conjunct: Expr) =
         let defaultSelectivity = 0.1
         let rangeSelectivity = 1.0 / 3.0
-
-        let withNegation neg value =
-            if neg then max 0.0 (1.0 - value) else value
-
-        let eqToLiteral columnExpr literal =
-            match columnWithStatsOf statsOf columnExpr with
-            | Some(stats, column) when column.NDV > 0L ->
-                if SqlValue.isNull literal then
-                    nullRate stats column
-                elif stats.RowCount <= 0L then
-                    defaultSelectivity
-                else
-                    let total = float stats.RowCount
-                    let key = SqlLiteral.toSqlLiteral literal
-
-                    match column.Mcv |> List.tryFind (fun (value, _) -> value = key) with
-                    | Some(_, rows) -> min 1.0 (float rows / total)
-                    | None ->
-                        let nulls = float column.Nulls / total
-                        let mcvShare = column.Mcv |> List.sumBy (snd >> float) |> fun rows -> rows / total
-                        let rest = max 0.0 (min 1.0 (1.0 - nulls - mcvShare))
-                        rest / float (max 1L (column.NDV - int64 column.Mcv.Length))
-            | _ -> defaultSelectivity
-
-        let histogramCdf histogram v =
-            if List.isEmpty histogram then
-                None
-            else
-                let below = histogram |> List.filter (fun x -> x <= v) |> List.length
-                Some(float below / float histogram.Length)
-
-        let rangeToLiteral columnExpr literal op =
-            match columnWithStatsOf statsOf columnExpr, SqlValue.asNumeric literal with
-            | Some(_, column), Some n ->
-                let v = float n
-
-                match histogramCdf column.Histogram v with
-                | Some cdf ->
-                    match op with
-                    | BinaryOp.Gt
-                    | BinaryOp.Ge -> 1.0 - cdf
-                    | BinaryOp.Lt
-                    | BinaryOp.Le -> cdf
-                    | _ -> rangeSelectivity
-                | None ->
-                    match column.Min, column.Max with
-                    | Some lo, Some hi when hi > lo ->
-                        let selectivity =
-                            match op with
-                            | BinaryOp.Gt
-                            | BinaryOp.Ge -> (hi - v) / (hi - lo)
-                            | BinaryOp.Lt
-                            | BinaryOp.Le -> (v - lo) / (hi - lo)
-                            | _ -> rangeSelectivity
-
-                        max 0.0 (min 1.0 selectivity)
-                    | _ -> rangeSelectivity
-            | _ -> rangeSelectivity
-
-        let flip =
-            function
-            | BinaryOp.Gt -> BinaryOp.Lt
-            | BinaryOp.Ge -> BinaryOp.Le
-            | BinaryOp.Lt -> BinaryOp.Gt
-            | BinaryOp.Le -> BinaryOp.Ge
-            | other -> other
 
         match conjunct with
         | Expr.Binary(BinaryOp.Eq, a, b) ->
@@ -575,27 +618,27 @@ module internal Analyzer =
                 (1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV)
             | _ ->
                 match literalOf b with
-                | Some literal -> eqToLiteral a literal
+                | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity a literal
                 | None ->
                     match literalOf a with
-                    | Some literal -> eqToLiteral b literal
+                    | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity b literal
                     | None -> defaultSelectivity
         | Expr.Binary(BinaryOp.Ne, a, b) ->
             let equality =
                 match literalOf b with
-                | Some literal -> eqToLiteral a literal
+                | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity a literal
                 | None ->
                     match literalOf a with
-                    | Some literal -> eqToLiteral b literal
+                    | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity b literal
                     | None -> defaultSelectivity
 
             max 0.0 (1.0 - equality)
         | Expr.Binary(BinaryOp.Gt | BinaryOp.Ge | BinaryOp.Lt | BinaryOp.Le as op, a, b) ->
             match literalOf b with
-            | Some literal -> rangeToLiteral a literal op
+            | Some literal -> rangeToLiteralWithStats statsOf rangeSelectivity a literal op
             | None ->
                 match literalOf a with
-                | Some literal -> rangeToLiteral b literal (flip op)
+                | Some literal -> rangeToLiteralWithStats statsOf rangeSelectivity b literal (flipComparison op)
                 | None -> defaultSelectivity
         | Expr.Between(x, low, high, neg) ->
             let selectivity =
@@ -610,18 +653,18 @@ module internal Analyzer =
                         | _ -> rangeSelectivity
                 | _ -> rangeSelectivity
 
-            withNegation neg selectivity
+            selectivityWithNegation neg selectivity
         | Expr.InList(x, values, neg) ->
             let perValue =
                 values
                 |> List.tryHead
                 |> Option.map (fun v ->
                     literalOf v
-                    |> Option.map (eqToLiteral x)
+                    |> Option.map (eqToLiteralWithStats statsOf defaultSelectivity x)
                     |> Option.defaultValue defaultSelectivity)
                 |> Option.defaultValue defaultSelectivity
 
-            withNegation neg (min 1.0 (float (List.length values) * perValue))
+            selectivityWithNegation neg (min 1.0 (float (List.length values) * perValue))
         | Expr.Like(x, pattern, neg, _) ->
             let selectivity =
                 let baseSelectivity =
@@ -635,14 +678,14 @@ module internal Analyzer =
                 | Some(stats, column) -> baseSelectivity * (1.0 - nullRate stats column)
                 | None -> baseSelectivity
 
-            withNegation neg selectivity
+            selectivityWithNegation neg selectivity
         | Expr.IsNull(x, neg) ->
             let selectivity =
                 match columnWithStatsOf statsOf x with
                 | Some(stats, column) -> nullRate stats column
                 | None -> defaultSelectivity
 
-            withNegation neg selectivity
+            selectivityWithNegation neg selectivity
         | _ -> defaultSelectivity
 
     let private filterSelectivity (statsOf: string -> TableStats option) =
@@ -659,97 +702,324 @@ module internal Analyzer =
     /// 統計があるときは走査の基数を実測行数にし、等値結合を `1 / max(NDV_l, NDV_r)` で見積もる。
     /// 統計が無い結合は従来どおり左右の小さい方（外側の行数は内側で絞られる）。
     /// </remarks>
+    /// 選択性を行数へ適用する（下限 1行）。
+    let private scaledRows (rows: float) (selectivity: float) =
+        if rows <= 0.0 then 0.0 else max 1.0 (rows * selectivity)
+
+    /// 索引の prefix NDV から選択性を求める。
+    let private estimateIndexSelectivity (stats: TableStats) (indexName: string) (count: int) =
+        stats.Indexes
+        |> List.tryFind (fun index -> Catalog.eqName index.Name indexName)
+        |> Option.bind (fun index ->
+            if count <= 0 || count > index.Columns.Length then
+                None
+            else
+                match index.PrefixNDV |> List.tryItem (count - 1) with
+                | Some ndv when ndv > 0L -> Some(1.0 / float ndv)
+                | _ ->
+                    let prefix = List.truncate count index.Columns
+                    let selectivities = prefix |> List.map (ndvOfName stats)
+
+                    if selectivities |> List.exists Option.isNone then
+                        None
+                    else
+                        selectivities
+                        |> List.choose id
+                        |> List.fold (fun acc n -> if n > 0L then acc * (1.0 / float n) else acc) 1.0
+                        |> Some)
+
+    /// 走査ノードの基本行数を求める。
+    let private estimateBaseRows (statsOf: string -> TableStats option) =
+        function
+        | Logical.Scan(name, method) ->
+            match statsOf name with
+            | Some stats ->
+                let rows = float stats.RowCount
+
+                match method with
+                | ScanMethod.PkLookup _ -> 1.0
+                | ScanMethod.IndexLookup(indexName, values) ->
+                    match estimateIndexSelectivity stats indexName values.Length with
+                    | Some selectivity -> scaledRows rows selectivity
+                    | None -> if rows <= 0.0 then 0.0 else max 1.0 (rows / 10.0)
+                | ScanMethod.RangeScan _
+                | ScanMethod.IndexRangeScan _ -> if rows <= 0.0 then 0.0 else max 1.0 (rows / 3.0)
+                | ScanMethod.SeqScan -> rows
+            | None ->
+                match method with
+                | ScanMethod.PkLookup _ -> 1.0
+                | ScanMethod.IndexLookup _ -> 2.0
+                | ScanMethod.RangeScan _
+                | ScanMethod.IndexRangeScan _ -> 100.0
+                | ScanMethod.SeqScan -> 1000.0
+        | Logical.Values _ -> 1.0
+        | _ -> System.Double.PositiveInfinity
+
+    /// 見積りの作業項目を末尾再帰で畳み込む。
+    [<TailCall>]
+    let rec private estimateRowsGo (statsOf: string -> TableStats option) (values: float list) =
+        function
+        | [] ->
+            match values with
+            | v :: _ -> v
+            | [] -> System.Double.PositiveInfinity
+        | Visit node :: rest ->
+            match node with
+            | Logical.Filter(predicate, child) ->
+                estimateRowsGo statsOf values (Visit child :: ApplyFilter predicate :: rest)
+            | Logical.Limit(_, n, _) when n >= 0 -> estimateRowsGo statsOf (float n :: values) rest
+            | Logical.Limit(_, _, child)
+            | Logical.Project(_, child)
+            | Logical.Sort(_, child)
+            | Logical.Distinct child
+            | Logical.Having(_, _, _, child) -> estimateRowsGo statsOf values (Visit child :: rest)
+            | Logical.Aggregate(groupBy, _, _) when List.isEmpty groupBy -> estimateRowsGo statsOf (1.0 :: values) rest
+            | Logical.Aggregate(_, _, child) -> estimateRowsGo statsOf values (Visit child :: rest)
+            | Logical.Join(_, _, on, left, right) ->
+                estimateRowsGo
+                    statsOf
+                    values
+                    (Visit left :: Visit right :: ApplyJoin(joinSelectivity statsOf on) :: rest)
+            | leaf -> estimateRowsGo statsOf (estimateBaseRows statsOf leaf :: values) rest
+        | ApplyFilter predicate :: rest ->
+            match values with
+            | v :: tail ->
+                let selectivity = filterSelectivity statsOf predicate
+                let filtered = if v <= 0.0 then 0.0 else max 1.0 (v * selectivity)
+                estimateRowsGo statsOf (filtered :: tail) rest
+            | [] -> estimateRowsGo statsOf (1.0 :: values) rest
+        | ApplyJoin selectivity :: rest ->
+            match values with
+            | r :: l :: tail ->
+                let joined =
+                    match selectivity with
+                    | Some sel when System.Double.IsFinite l && System.Double.IsFinite r ->
+                        if l <= 0.0 || r <= 0.0 then 0.0 else max 1.0 (l * r * sel)
+                    | _ -> min l r
+
+                estimateRowsGo statsOf (joined :: tail) rest
+            | _ -> estimateRowsGo statsOf (System.Double.PositiveInfinity :: values) rest
+
     let estimateRowsWith (statsOf: string -> TableStats option) (tree: Logical) =
-        let scaled rows selectivity =
-            if rows <= 0.0 then 0.0 else max 1.0 (rows * selectivity)
+        estimateRowsGo statsOf [] [ Visit tree ]
 
-        let indexSelectivity (stats: TableStats) indexName count =
-            stats.Indexes
-            |> List.tryFind (fun index -> Catalog.eqName index.Name indexName)
-            |> Option.bind (fun index ->
-                if count <= 0 || count > index.Columns.Length then
-                    None
+    /// 列参照がスキーマ列に一致するか。
+    let private joinRefMatches (r: ColumnRef) (c: OutputColumn) =
+        match r.Qualifier with
+        | Some q ->
+            SqlName.equal c.Name r.Name
+            && match c.Qualifier with
+               | Some cq -> SqlName.equal cq q
+               | None -> false
+        | None -> SqlName.equal c.Name r.Name
+
+    /// 列参照が一意に指す列位置を返す。
+    let private joinColumnIndex (schema: Schema) (expr: Expr) =
+        match Schema.tryAsColumnRef expr with
+        | None -> None
+        | Some r ->
+            let hits =
+                schema.Columns
+                |> Array.indexed
+                |> Array.filter (fun (_, c) -> joinRefMatches r c)
+
+            match hits with
+            | [| i, _ |] -> Some i
+            | _ -> None
+
+    /// 左右の同型な列参照を結合キー位置の対にする。
+    let private joinTryPair (leftSchema: Schema) (rightSchema: Schema) (l: Expr, r: Expr) =
+        match joinColumnIndex leftSchema l, joinColumnIndex rightSchema r with
+        | Some li, Some ri ->
+            match leftSchema.Columns.[li].DataType, rightSchema.Columns.[ri].DataType with
+            | Some lt, Some rt when lt = rt -> Some(li, ri)
+            | _ -> None
+        | _ -> None
+
+    /// ON から同型の等値キーと残差を抽出する。
+    let private joinKeyPairs (leftSchema: Schema) (rightSchema: Schema) (on: Expr) =
+        let keyPairs, residual =
+            on
+            |> Predicate.splitConjuncts
+            |> List.fold
+                (fun (keys, residual) conjunct ->
+                    match conjunct with
+                    | Expr.Binary(BinaryOp.Eq, a, b) ->
+                        let pair =
+                            match joinTryPair leftSchema rightSchema (a, b) with
+                            | Some p -> Some p
+                            | None -> joinTryPair leftSchema rightSchema (b, a)
+
+                        match pair with
+                        | Some(li, ri) -> (li, ri) :: keys, residual
+                        | None -> keys, conjunct :: residual
+                    | _ -> keys, conjunct :: residual)
+                ([], [])
+
+        if List.isEmpty keyPairs then
+            None
+        else
+            let ordered = List.rev keyPairs
+
+            Some
+                {
+                    LeftIndices = ordered |> List.map fst |> Array.ofList
+                    RightIndices = ordered |> List.map snd |> Array.ofList
+                    Residual = Predicate.joinConjuncts (List.rev residual)
+                }
+
+    /// キー列名の集合が列集合とちょうど一致するか。
+    let private joinCoversAll (keyNames: string array) (cols: string list) =
+        List.length cols = keyNames.Length
+        && cols
+           |> List.forall (fun c -> keyNames |> Array.exists (fun k -> Catalog.eqName c k))
+        && keyNames
+           |> Array.forall (fun k -> cols |> List.exists (fun c -> Catalog.eqName c k))
+
+    /// 右キー列名から対応する左キー位置を引く。
+    let private joinFindLeft (rightSchema: Schema) (keys: JoinKeys) (colName: string) =
+        keys.RightIndices
+        |> Array.tryFindIndex (fun ri -> Catalog.eqName rightSchema.Columns.[ri].Name colName)
+        |> Option.map (fun keyPos -> keys.LeftIndices.[keyPos])
+
+    /// 右キー列集合を左キー位置の配列へ変換する。
+    let private joinLeftIndices (rightSchema: Schema) (keys: JoinKeys) (cols: string list) =
+        let lefts = cols |> List.map (joinFindLeft rightSchema keys)
+
+        if lefts |> List.forall Option.isSome then
+            Some(lefts |> List.choose id |> Array.ofList)
+        else
+            None
+
+    /// 右テーブルの索引 prefix NDV を引く（無ければ最大値）。
+    let private joinIndexPrefixNdv
+        (statsOf: string -> TableStats option)
+        (rightName: string)
+        (keyNames: string array)
+        (indexName: string)
+        =
+        statsOf rightName
+        |> Option.bind (fun stats -> stats.Indexes |> List.tryFind (fun i -> Catalog.eqName i.Name indexName))
+        |> Option.bind (fun index -> index.PrefixNDV |> List.tryItem (keyNames.Length - 1))
+        |> Option.defaultValue System.Int64.MaxValue
+
+    /// 右テーブルを引く方法（主キー優先・索引は prefix NDV 最小）を選ぶ。
+    let private joinRightLookup
+        (statsOf: string -> TableStats option)
+        (rightName: string)
+        (rightSchema: Schema)
+        (rightTable: TableSchema)
+        (keys: JoinKeys)
+        =
+        let keyNames =
+            keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
+
+        let pkNames =
+            rightTable.PrimaryKey |> List.map (fun i -> rightTable.Columns.[i].Name)
+
+        if List.isEmpty pkNames || not (joinCoversAll keyNames pkNames) then
+            None
+        else
+            joinLeftIndices rightSchema keys pkNames
+            |> Option.map (fun lefts -> JoinLookup.PrimaryKey, lefts)
+        |> Option.orElseWith (fun () ->
+            rightTable.Indexes
+            |> List.choose (fun idx ->
+                let prefix = List.truncate keyNames.Length idx.Columns
+
+                if joinCoversAll keyNames prefix then
+                    Some(joinIndexPrefixNdv statsOf rightName keyNames idx.Name, JoinLookup.Index idx.Name, prefix)
                 else
-                    match index.PrefixNDV |> List.tryItem (count - 1) with
-                    | Some ndv when ndv > 0L -> Some(1.0 / float ndv)
-                    | _ ->
-                        let prefix = List.truncate count index.Columns
-                        let selectivities = prefix |> List.map (ndvOfName stats)
+                    None)
+            |> List.sortBy (fun (ndv, _, _) -> ndv)
+            |> List.tryPick (fun (_, lookup, cols) ->
+                joinLeftIndices rightSchema keys cols |> Option.map (fun lefts -> lookup, lefts)))
 
-                        if selectivities |> List.exists Option.isNone then
-                            None
-                        else
-                            selectivities
-                            |> List.choose id
-                            |> List.fold (fun acc n -> if n > 0L then acc * (1.0 / float n) else acc) 1.0
-                            |> Some)
+    /// 他方のキー順に並んだ列名から、自側のキー位置を引く。
+    [<TailCall>]
+    let rec private joinOrderGo (otherKeyNames: string array) (ownIndices: int array) (acc: int list) =
+        function
+        | [] -> Some(List.rev acc |> List.toArray)
+        | n :: rest ->
+            match otherKeyNames |> Array.tryFindIndex (fun m -> SqlName.equal m n) with
+            | Some i -> joinOrderGo otherKeyNames ownIndices (ownIndices.[i] :: acc) rest
+            | None -> None
 
-        let baseRows =
-            function
-            | Logical.Scan(name, method) ->
-                match statsOf name with
-                | Some stats ->
-                    let rows = float stats.RowCount
+    /// 走査順の列名を自側のキー位置へ並べ替える。
+    let private joinOrderBy (targetNames: string list) (otherKeyNames: string array) (ownIndices: int array) =
+        joinOrderGo otherKeyNames ownIndices [] targetNames
 
-                    match method with
-                    | ScanMethod.PkLookup _ -> 1.0
-                    | ScanMethod.IndexLookup(indexName, values) ->
-                        match indexSelectivity stats indexName values.Length with
-                        | Some selectivity -> scaled rows selectivity
-                        | None -> if rows <= 0.0 then 0.0 else max 1.0 (rows / 10.0)
-                    | ScanMethod.RangeScan _
-                    | ScanMethod.IndexRangeScan _ -> if rows <= 0.0 then 0.0 else max 1.0 (rows / 3.0)
-                    | ScanMethod.SeqScan -> rows
-                | None ->
-                    match method with
-                    | ScanMethod.PkLookup _ -> 1.0
-                    | ScanMethod.IndexLookup _ -> 2.0
-                    | ScanMethod.RangeScan _
-                    | ScanMethod.IndexRangeScan _ -> 100.0
-                    | ScanMethod.SeqScan -> 1000.0
-            | Logical.Values _ -> 1.0
-            | _ -> System.Double.PositiveInfinity
+    /// 左右のキー名が同じ対応で並んでいるか。
+    let private joinPairsAligned
+        (leftKeyNames: string array)
+        (rightKeyNames: string array)
+        (leftNames: string list)
+        (rightNames: string list)
+        =
+        if
+            List.length leftNames <> List.length rightNames
+            || List.length leftNames <> leftKeyNames.Length
+        then
+            false
+        else
+            leftNames
+            |> List.mapi (fun j leftName ->
+                match leftKeyNames |> Array.tryFindIndex (fun n -> SqlName.equal n leftName) with
+                | Some i -> SqlName.equal rightKeyNames.[i] rightNames.[j]
+                | None -> false)
+            |> List.forall id
 
-        let rec go values =
-            function
-            | [] ->
-                match values with
-                | v :: _ -> v
-                | [] -> System.Double.PositiveInfinity
-            | Visit node :: rest ->
-                match node with
-                | Logical.Filter(predicate, child) -> go values (Visit child :: ApplyFilter predicate :: rest)
-                | Logical.Limit(_, n, _) when n >= 0 -> go (float n :: values) rest
-                | Logical.Limit(_, _, child)
-                | Logical.Project(_, child)
-                | Logical.Sort(_, child)
-                | Logical.Distinct child
-                | Logical.Having(_, _, _, child) -> go values (Visit child :: rest)
-                | Logical.Aggregate(groupBy, _, _) when List.isEmpty groupBy -> go (1.0 :: values) rest
-                | Logical.Aggregate(_, _, child) -> go values (Visit child :: rest)
-                | Logical.Join(_, _, on, left, right) ->
-                    go values (Visit left :: Visit right :: ApplyJoin(joinSelectivity statsOf on) :: rest)
-                | leaf -> go (baseRows leaf :: values) rest
-            | ApplyFilter predicate :: rest ->
-                match values with
-                | v :: tail ->
-                    let selectivity = filterSelectivity statsOf predicate
-                    let filtered = if v <= 0.0 then 0.0 else max 1.0 (v * selectivity)
-                    go (filtered :: tail) rest
-                | [] -> go (1.0 :: values) rest
-            | ApplyJoin selectivity :: rest ->
-                match values with
-                | r :: l :: tail ->
-                    let joined =
-                        match selectivity with
-                        | Some sel when System.Double.IsFinite l && System.Double.IsFinite r ->
-                            if l <= 0.0 || r <= 0.0 then 0.0 else max 1.0 (l * r * sel)
-                        | _ -> min l r
+    /// 両入力がキー順ならマージ結合用のキーへ整える。
+    let private joinMergeKeys
+        (tableOf: string -> TableSchema option)
+        (leftTree: Logical)
+        (rightTree: Logical)
+        (leftSchema: Schema)
+        (rightSchema: Schema)
+        (keys: JoinKeys)
+        =
+        let leftOrder = scanOrder tableOf leftTree
+        let rightOrder = scanOrder tableOf rightTree
 
-                    go (joined :: tail) rest
-                | _ -> go (System.Double.PositiveInfinity :: values) rest
+        match
+            alignJoinKeys leftSchema keys.LeftIndices leftOrder, alignJoinKeys rightSchema keys.RightIndices rightOrder
+        with
+        | Some(leftKeys, leftNames), Some(rightKeys, rightNames) ->
+            let leftKeyNames =
+                keys.LeftIndices |> Array.map (fun i -> leftSchema.Columns.[i].Name)
 
-        go [] [ Visit tree ]
+            let rightKeyNames =
+                keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
+
+            match leftNames, rightNames with
+            | [], [] ->
+                Some
+                    { keys with
+                        LeftIndices = leftKeys
+                        RightIndices = rightKeys
+                    }
+            | _, [] ->
+                joinOrderBy leftNames leftKeyNames keys.RightIndices
+                |> Option.map (fun rk ->
+                    { keys with
+                        LeftIndices = leftKeys
+                        RightIndices = rk
+                    })
+            | [], _ ->
+                joinOrderBy rightNames rightKeyNames keys.LeftIndices
+                |> Option.map (fun lk ->
+                    { keys with
+                        LeftIndices = lk
+                        RightIndices = rightKeys
+                    })
+            | _ when joinPairsAligned leftKeyNames rightKeyNames leftNames rightNames ->
+                Some
+                    { keys with
+                        LeftIndices = leftKeys
+                        RightIndices = rightKeys
+                    }
+            | _ -> None
+        | _ -> None
 
     /// 結合アルゴリズムを選ぶ。
     /// - 等値キーなし: 入れ子ループ
@@ -767,187 +1037,7 @@ module internal Analyzer =
         (rightTree: Logical)
         (on: Expr)
         =
-        let isMatch (r: ColumnRef) c =
-            match r.Qualifier with
-            | Some q ->
-                SqlName.equal c.Name r.Name
-                && match c.Qualifier with
-                   | Some cq -> SqlName.equal cq q
-                   | None -> false
-            | None -> SqlName.equal c.Name r.Name
-
-        let columnIndexIn schema expr =
-            match Schema.tryAsColumnRef expr with
-            | None -> None
-            | Some r ->
-                let hits =
-                    schema.Columns |> Array.indexed |> Array.filter (fun (_, c) -> isMatch r c)
-
-                match hits with
-                | [| i, _ |] -> Some i
-                | _ -> None
-
-        let tryPair (l, r) =
-            match columnIndexIn leftSchema l, columnIndexIn rightSchema r with
-            | Some li, Some ri ->
-                match leftSchema.Columns.[li].DataType, rightSchema.Columns.[ri].DataType with
-                | Some lt, Some rt when lt = rt -> Some(li, ri)
-                | _ -> None
-            | _ -> None
-
-        let joinKeys on =
-            let keyPairs, residual =
-                on
-                |> Predicate.splitConjuncts
-                |> List.fold
-                    (fun (keys, residual) conjunct ->
-                        match conjunct with
-                        | Expr.Binary(BinaryOp.Eq, a, b) ->
-                            let pair =
-                                match tryPair (a, b) with
-                                | Some p -> Some p
-                                | None -> tryPair (b, a)
-
-                            match pair with
-                            | Some(li, ri) -> (li, ri) :: keys, residual
-                            | None -> keys, conjunct :: residual
-                        | _ -> keys, conjunct :: residual)
-                    ([], [])
-
-            if List.isEmpty keyPairs then
-                None
-            else
-                let ordered = List.rev keyPairs
-
-                Some
-                    {
-                        LeftIndices = ordered |> List.map fst |> Array.ofList
-                        RightIndices = ordered |> List.map snd |> Array.ofList
-                        Residual = Predicate.joinConjuncts (List.rev residual)
-                    }
-
-        let coversAll (keyNames: string array) cols =
-            List.length cols = keyNames.Length
-            && cols
-               |> List.forall (fun c -> keyNames |> Array.exists (fun k -> Catalog.eqName c k))
-            && keyNames
-               |> Array.forall (fun k -> cols |> List.exists (fun c -> Catalog.eqName c k))
-
-        let leftIndicesOf keys cols =
-            let findLeft colName =
-                keys.RightIndices
-                |> Array.tryFindIndex (fun ri -> Catalog.eqName rightSchema.Columns.[ri].Name colName)
-                |> Option.map (fun keyPos -> keys.LeftIndices.[keyPos])
-
-            let lefts = cols |> List.map findLeft
-
-            if lefts |> List.forall Option.isSome then
-                Some(lefts |> List.choose id |> Array.ofList)
-            else
-                None
-
-        let indexPrefixNdv rightName (keyNames: string array) indexName =
-            statsOf rightName
-            |> Option.bind (fun stats -> stats.Indexes |> List.tryFind (fun i -> Catalog.eqName i.Name indexName))
-            |> Option.bind (fun index -> index.PrefixNDV |> List.tryItem (keyNames.Length - 1))
-            |> Option.defaultValue System.Int64.MaxValue
-
-        let rightLookupForJoin rightName rightSchema rightTable keys =
-            let keyNames =
-                keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
-
-            let pkNames =
-                rightTable.PrimaryKey |> List.map (fun i -> rightTable.Columns.[i].Name)
-
-            if List.isEmpty pkNames || not (coversAll keyNames pkNames) then
-                None
-            else
-                leftIndicesOf keys pkNames
-                |> Option.map (fun lefts -> JoinLookup.PrimaryKey, lefts)
-            |> Option.orElseWith (fun () ->
-                rightTable.Indexes
-                |> List.choose (fun idx ->
-                    let prefix = List.truncate keyNames.Length idx.Columns
-
-                    if coversAll keyNames prefix then
-                        Some(indexPrefixNdv rightName keyNames idx.Name, JoinLookup.Index idx.Name, prefix)
-                    else
-                        None)
-                |> List.sortBy (fun (ndv, _, _) -> ndv)
-                |> List.tryPick (fun (_, lookup, cols) ->
-                    leftIndicesOf keys cols |> Option.map (fun lefts -> lookup, lefts)))
-
-        let orderBy targetNames otherKeyNames (ownIndices: int array) =
-            let rec go acc =
-                function
-                | [] -> Some(List.rev acc |> List.toArray)
-                | n :: rest ->
-                    match otherKeyNames |> Array.tryFindIndex (fun m -> SqlName.equal m n) with
-                    | Some i -> go (ownIndices.[i] :: acc) rest
-                    | None -> None
-
-            go [] targetNames
-
-        let pairsAligned (leftKeyNames: string array) (rightKeyNames: string array) leftNames rightNames =
-            if
-                List.length leftNames <> List.length rightNames
-                || List.length leftNames <> leftKeyNames.Length
-            then
-                false
-            else
-                leftNames
-                |> List.mapi (fun j leftName ->
-                    match leftKeyNames |> Array.tryFindIndex (fun n -> SqlName.equal n leftName) with
-                    | Some i -> SqlName.equal rightKeyNames.[i] rightNames.[j]
-                    | None -> false)
-                |> List.forall id
-
-        let mergeJoinKeys keys =
-            let leftOrder = scanOrder tableOf leftTree
-            let rightOrder = scanOrder tableOf rightTree
-
-            match
-                alignJoinKeys leftSchema keys.LeftIndices leftOrder,
-                alignJoinKeys rightSchema keys.RightIndices rightOrder
-            with
-            | Some(leftKeys, leftNames), Some(rightKeys, rightNames) ->
-                let leftKeyNames =
-                    keys.LeftIndices |> Array.map (fun i -> leftSchema.Columns.[i].Name)
-
-                let rightKeyNames =
-                    keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
-
-                match leftNames, rightNames with
-                | [], [] ->
-                    Some
-                        { keys with
-                            LeftIndices = leftKeys
-                            RightIndices = rightKeys
-                        }
-                | _, [] ->
-                    orderBy leftNames leftKeyNames keys.RightIndices
-                    |> Option.map (fun rk ->
-                        { keys with
-                            LeftIndices = leftKeys
-                            RightIndices = rk
-                        })
-                | [], _ ->
-                    orderBy rightNames rightKeyNames keys.LeftIndices
-                    |> Option.map (fun lk ->
-                        { keys with
-                            LeftIndices = lk
-                            RightIndices = rightKeys
-                        })
-                | _ when pairsAligned leftKeyNames rightKeyNames leftNames rightNames ->
-                    Some
-                        { keys with
-                            LeftIndices = leftKeys
-                            RightIndices = rightKeys
-                        }
-                | _ -> None
-            | _ -> None
-
-        match joinKeys on with
+        match joinKeyPairs leftSchema rightSchema on with
         | None -> JoinAlgorithm.NestedLoop, None, None
         | Some keys ->
             let lookup =
@@ -955,7 +1045,7 @@ module internal Analyzer =
                 | Some(rightName, method, rightPreds), Some table ->
                     absorbedPredicates table rightName method
                     |> Option.bind (fun absorbed ->
-                        rightLookupForJoin rightName rightSchema table keys
+                        joinRightLookup statsOf rightName rightSchema table keys
                         |> Option.map (fun (target, leftIndices) -> target, leftIndices, rightPreds @ absorbed))
                 | _ -> None
 
@@ -964,7 +1054,7 @@ module internal Analyzer =
                 let residual = Option.toList keys.Residual @ rightPreds |> Predicate.joinConjuncts
                 JoinAlgorithm.IndexNestedLoop target, Some { keys with Residual = residual }, Some leftIndices
             | _ ->
-                match mergeJoinKeys keys with
+                match joinMergeKeys tableOf leftTree rightTree leftSchema rightSchema keys with
                 | Some aligned -> JoinAlgorithm.MergeJoin, Some aligned, None
                 | None -> JoinAlgorithm.HashJoin, Some keys, None
 
@@ -973,169 +1063,196 @@ module internal Analyzer =
         | Expr.Column { Qualifier = Some q; Name = n } when q.ToLowerInvariant() = tn -> Some n
         | _ -> None
 
-    let private rangeBounds (tn: string) (colName: string) =
-        let literalFor a b =
-            match colOf tn a, literalOf b with
-            | Some n, Some v when Catalog.eqName n colName -> Some v
-            | _ -> None
+    /// 指定列への等値リテラルを取り出す。
+    let private rangeLiteralFor (tn: string) (colName: string) (a: Expr) (b: Expr) =
+        match colOf tn a, literalOf b with
+        | Some n, Some v when Catalog.eqName n colName -> Some v
+        | _ -> None
 
-        let pick found current =
-            match found with
-            | Some v -> Some v
-            | None -> current
+    /// 既に見つかった値を優先する。
+    let private pickFirst (found: 'a option) (current: 'a option) =
+        match found with
+        | Some v -> Some v
+        | None -> current
 
-        let rec accumulateBounds tn colName lower upper =
-            function
-            | [] -> lower, upper
-            | e :: tail ->
-                match e with
-                | Expr.Binary((BinaryOp.Gt | BinaryOp.Ge), a, b) ->
-                    accumulateBounds tn colName (pick (literalFor a b) lower) (pick (literalFor b a) upper) tail
-                | Expr.Binary((BinaryOp.Lt | BinaryOp.Le), a, b) ->
-                    accumulateBounds tn colName (pick (literalFor b a) lower) (pick (literalFor a b) upper) tail
-                | Expr.Between(x, lo, hi, false) ->
-                    match colOf tn x with
-                    | Some n when Catalog.eqName n colName ->
-                        match literalOf lo, literalOf hi with
-                        | Some lv, Some hv -> accumulateBounds tn colName (Some lv) (Some hv) tail
-                        | _ -> accumulateBounds tn colName lower upper tail
-                    | _ -> accumulateBounds tn colName lower upper tail
-                | Expr.Like(x, p, false, None) ->
-                    match colOf tn x, literalOf p with
-                    | Some n, Some(SqlValue.Text pattern) when Catalog.eqName n colName ->
-                        if
-                            pattern.EndsWith "%"
-                            && not (pattern.Contains "_")
-                            && pattern.IndexOf "%" = pattern.Length - 1
-                        then
-                            let prefix = pattern.Substring(0, pattern.Length - 1)
-                            let lower' = Some(SqlValue.Text prefix)
+    /// 連言を走査して列の上下界を畳み込む。
+    [<TailCall>]
+    let rec private accumulateRangeBounds
+        (tn: string)
+        (colName: string)
+        (lower: SqlValue option)
+        (upper: SqlValue option)
+        =
+        function
+        | [] -> lower, upper
+        | e :: tail ->
+            match e with
+            | Expr.Binary((BinaryOp.Gt | BinaryOp.Ge), a, b) ->
+                accumulateRangeBounds
+                    tn
+                    colName
+                    (pickFirst (rangeLiteralFor tn colName a b) lower)
+                    (pickFirst (rangeLiteralFor tn colName b a) upper)
+                    tail
+            | Expr.Binary((BinaryOp.Lt | BinaryOp.Le), a, b) ->
+                accumulateRangeBounds
+                    tn
+                    colName
+                    (pickFirst (rangeLiteralFor tn colName b a) lower)
+                    (pickFirst (rangeLiteralFor tn colName a b) upper)
+                    tail
+            | Expr.Between(x, lo, hi, false) ->
+                match colOf tn x with
+                | Some n when Catalog.eqName n colName ->
+                    match literalOf lo, literalOf hi with
+                    | Some lv, Some hv -> accumulateRangeBounds tn colName (Some lv) (Some hv) tail
+                    | _ -> accumulateRangeBounds tn colName lower upper tail
+                | _ -> accumulateRangeBounds tn colName lower upper tail
+            | Expr.Like(x, p, false, None) ->
+                match colOf tn x, literalOf p with
+                | Some n, Some(SqlValue.Text pattern) when Catalog.eqName n colName ->
+                    if
+                        pattern.EndsWith "%"
+                        && not (pattern.Contains "_")
+                        && pattern.IndexOf "%" = pattern.Length - 1
+                    then
+                        let prefix = pattern.Substring(0, pattern.Length - 1)
+                        let lower' = Some(SqlValue.Text prefix)
 
-                            let upper' =
-                                if prefix = "" then
-                                    None
+                        let upper' =
+                            if prefix = "" then
+                                None
+                            else
+                                let lastChar = prefix.[prefix.Length - 1]
+
+                                if int lastChar < 0xFFFF then
+                                    let newPrefix =
+                                        prefix.Substring(0, prefix.Length - 1) + string (char (int lastChar + 1))
+
+                                    Some(SqlValue.Text newPrefix)
                                 else
-                                    let lastChar = prefix.[prefix.Length - 1]
+                                    None
 
-                                    if int lastChar < 0xFFFF then
-                                        let newPrefix =
-                                            prefix.Substring(0, prefix.Length - 1) + string (char (int lastChar + 1))
+                        accumulateRangeBounds tn colName lower' upper' tail
+                    else
+                        accumulateRangeBounds tn colName lower upper tail
+                | _ -> accumulateRangeBounds tn colName lower upper tail
+            | _ -> accumulateRangeBounds tn colName lower upper tail
 
-                                        Some(SqlValue.Text newPrefix)
-                                    else
-                                        None
+    let private rangeBounds (tn: string) (colName: string) =
+        List.collect Predicate.splitConjuncts
+        >> accumulateRangeBounds tn colName None None
 
-                            accumulateBounds tn colName lower' upper' tail
-                        else
-                            accumulateBounds tn colName lower upper tail
-                    | _ -> accumulateBounds tn colName lower upper tail
-                | _ -> accumulateBounds tn colName lower upper tail
-
-        List.collect Predicate.splitConjuncts >> accumulateBounds tn colName None None
-
-    /// WHERE から等価条件を探して走査方法を決める。
-    /// 複合主キーは全列の等値条件が揃ったときだけ PkLookup にし、
-    /// 複合索引は先頭から連続する等値列の範囲で IndexLookup にする。
-    let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
-        let equalitiesOf tn =
-            List.collect Predicate.splitConjuncts
-            >> List.choose (function
-                | Expr.Binary(BinaryOp.Eq, a, b) ->
-                    match colOf tn a, literalOf b with
+    /// WHERE から指定テーブルの等値条件を列挙する。
+    let private scanEqualitiesOf (tn: string) =
+        List.collect Predicate.splitConjuncts
+        >> List.choose (function
+            | Expr.Binary(BinaryOp.Eq, a, b) ->
+                match colOf tn a, literalOf b with
+                | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
+                | _ ->
+                    match colOf tn b, literalOf a with
                     | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
-                    | _ ->
-                        match colOf tn b, literalOf a with
-                        | Some n, Some v when not (SqlValue.isNull v) -> Some(n, v)
-                        | _ -> None
-                | _ -> None)
+                    | _ -> None
+            | _ -> None)
 
-        let typeMatches (schema: TableSchema) colName value =
-            match SqlValue.dataType value with
-            | Ok t ->
-                schema.Columns
-                |> List.exists (fun c -> Catalog.eqName c.Name colName && c.DataType = t)
-            | Error _ -> false
+    /// リテラルの型が列の宣言型と合うか。
+    let private scanTypeMatches (schema: TableSchema) (colName: string) (value: SqlValue) =
+        match SqlValue.dataType value with
+        | Ok t ->
+            schema.Columns
+            |> List.exists (fun c -> Catalog.eqName c.Name colName && c.DataType = t)
+        | Error _ -> false
 
-        let findValue (tn: string) colName =
-            equalitiesOf (tn.ToLowerInvariant()) predicates
-            |> List.tryPick (fun (n, v) ->
-                if Catalog.eqName n colName && typeMatches b.Schema n v then
-                    Some v
-                else
-                    None)
+    /// 指定列へ束縛できる等値リテラルを探す。
+    let private scanFindValue (b: TableBinding) (predicates: Expr list) (tn: string) (colName: string) =
+        scanEqualitiesOf (tn.ToLowerInvariant()) predicates
+        |> List.tryPick (fun (n, v) ->
+            if Catalog.eqName n colName && scanTypeMatches b.Schema n v then
+                Some v
+            else
+                None)
 
-        let tryIndexRange (tn: string) =
-            Catalog.indexesOf b.RealName catalog
-            |> List.tryPick (fun i ->
-                match i.Columns with
-                | [] -> None
-                | cols ->
-                    let rangeColIdx =
-                        cols
-                        |> List.tryFindIndex (fun c ->
-                            let lo, _ = rangeBounds (tn.ToLowerInvariant()) c predicates
-
-                            match lo with
-                            | Some lv when typeMatches b.Schema c lv -> true
-                            | _ -> false)
-
-                    match rangeColIdx with
-                    | Some idx ->
-                        let rangeCol = cols.[idx]
-                        let lo, hi = rangeBounds (tn.ToLowerInvariant()) rangeCol predicates
+    /// 範囲条件を持つ先頭索引列から IndexRangeScan を組み立てる。
+    let private scanTryIndexRange (b: TableBinding) (catalog: Catalog) (predicates: Expr list) (tn: string) =
+        Catalog.indexesOf b.RealName catalog
+        |> List.tryPick (fun i ->
+            match i.Columns with
+            | [] -> None
+            | cols ->
+                let rangeColIdx =
+                    cols
+                    |> List.tryFindIndex (fun c ->
+                        let lo, _ = rangeBounds (tn.ToLowerInvariant()) c predicates
 
                         match lo with
-                        | Some lv when typeMatches b.Schema rangeCol lv ->
-                            let upper = hi |> Option.filter (fun v -> typeMatches b.Schema rangeCol v)
-                            let prefixCols = cols |> List.take idx
-                            let prefixVals = prefixCols |> List.map (fun c -> findValue tn c)
+                        | Some lv when scanTypeMatches b.Schema c lv -> true
+                        | _ -> false)
 
-                            if prefixVals |> List.forall Option.isSome then
-                                let lowerKey = (prefixVals |> List.choose id) @ [ lv ] |> Array.ofList
+                match rangeColIdx with
+                | Some idx ->
+                    let rangeCol = cols.[idx]
+                    let lo, hi = rangeBounds (tn.ToLowerInvariant()) rangeCol predicates
 
-                                let upperKey =
-                                    upper
-                                    |> Option.map (fun uv -> (prefixVals |> List.choose id) @ [ uv ] |> Array.ofList)
+                    match lo with
+                    | Some lv when scanTypeMatches b.Schema rangeCol lv ->
+                        let upper = hi |> Option.filter (fun v -> scanTypeMatches b.Schema rangeCol v)
+                        let prefixCols = cols |> List.take idx
+                        let prefixVals = prefixCols |> List.map (fun c -> scanFindValue b predicates tn c)
 
-                                Some(ScanMethod.IndexRangeScan(i.IndexName, lowerKey, upperKey))
-                            else
-                                None
-                        | _ -> None
-                    | None -> None)
+                        if prefixVals |> List.forall Option.isSome then
+                            let lowerKey = (prefixVals |> List.choose id) @ [ lv ] |> Array.ofList
 
-        let equalityPrefix tn (i: IndexDefinition) =
-            i.Columns
-            |> List.map (findValue tn)
-            |> List.takeWhile Option.isSome
-            |> List.choose id
+                            let upperKey =
+                                upper
+                                |> Option.map (fun uv -> (prefixVals |> List.choose id) @ [ uv ] |> Array.ofList)
 
-        let tryIndexEquality tn =
-            Catalog.indexesOf b.RealName catalog
-            |> List.choose (fun i ->
-                let values = equalityPrefix tn i
-                if List.isEmpty values then None else Some(i, values))
-            |> List.sortByDescending (fun (_, values) -> List.length values)
-            |> List.tryHead
+                            Some(ScanMethod.IndexRangeScan(i.IndexName, lowerKey, upperKey))
+                        else
+                            None
+                    | _ -> None
+                | None -> None)
 
-        let tryIndexMethod tn =
-            match tryIndexEquality tn, tryIndexRange tn with
-            | Some(i, values), Some range ->
-                let rangeLen =
-                    match range with
-                    | ScanMethod.IndexRangeScan(_, lower, _) -> lower.Length
-                    | _ -> 0
+    /// 索引の先頭から連続する等値列の値を取る。
+    let private scanEqualityPrefix (b: TableBinding) (predicates: Expr list) (tn: string) (i: IndexDefinition) =
+        i.Columns
+        |> List.map (scanFindValue b predicates tn)
+        |> List.takeWhile Option.isSome
+        |> List.choose id
 
-                if List.length values >= rangeLen then
-                    Some(ScanMethod.IndexLookup(i.IndexName, Array.ofList values))
-                else
-                    Some range
-            | Some(i, values), None -> Some(ScanMethod.IndexLookup(i.IndexName, Array.ofList values))
-            | None, Some range -> Some range
-            | None, None -> None
+    /// 最長の等値プレフィックスを持つ索引を選ぶ。
+    let private scanTryIndexEquality (b: TableBinding) (catalog: Catalog) (predicates: Expr list) (tn: string) =
+        Catalog.indexesOf b.RealName catalog
+        |> List.choose (fun i ->
+            let values = scanEqualityPrefix b predicates tn i
+            if List.isEmpty values then None else Some(i, values))
+        |> List.sortByDescending (fun (_, values) -> List.length values)
+        |> List.tryHead
 
+    /// 等値と範囲のうち、より多くの列を絞れる方を選ぶ。
+    let private scanTryIndexMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) (tn: string) =
+        match scanTryIndexEquality b catalog predicates tn, scanTryIndexRange b catalog predicates tn with
+        | Some(i, values), Some range ->
+            let rangeLen =
+                match range with
+                | ScanMethod.IndexRangeScan(_, lower, _) -> lower.Length
+                | _ -> 0
+
+            if List.length values >= rangeLen then
+                Some(ScanMethod.IndexLookup(i.IndexName, Array.ofList values))
+            else
+                Some range
+        | Some(i, values), None -> Some(ScanMethod.IndexLookup(i.IndexName, Array.ofList values))
+        | None, Some range -> Some range
+        | None, None -> None
+
+    /// WHERE から等価条件を探して走査方法を決める。
+    /// 複合主キーは全列の等値条件が揃ったときだけ PkLookup にし,
+    /// 複合索引は先頭から連続する等値列の範囲で IndexLookup にする。
+    let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
         let tn = refName b
         let pkNames = b.Schema.PrimaryKey |> List.map (fun i -> b.Schema.Columns.[i].Name)
-        let pkValues = pkNames |> List.map (findValue tn)
+        let pkValues = pkNames |> List.map (scanFindValue b predicates tn)
 
         if not pkNames.IsEmpty && pkValues |> List.forall Option.isSome then
             ret (ScanMethod.PkLookup(pkValues |> List.choose id |> Array.ofList))
@@ -1144,37 +1261,38 @@ module internal Analyzer =
             let lower, upper = rangeBounds (tn.ToLowerInvariant()) pkCol predicates
 
             match lower with
-            | Some lv when typeMatches b.Schema pkCol lv ->
+            | Some lv when scanTypeMatches b.Schema pkCol lv ->
                 let startKey = [| lv |]
 
                 let endKey =
                     upper
-                    |> Option.filter (fun v -> typeMatches b.Schema pkCol v)
+                    |> Option.filter (fun v -> scanTypeMatches b.Schema pkCol v)
                     |> Option.map (fun v -> [| v |])
 
                 ret (ScanMethod.RangeScan(tn, startKey, endKey))
             | _ ->
-                match tryIndexMethod tn with
+                match scanTryIndexMethod b catalog predicates tn with
                 | Some m -> ret m
                 | None -> ret ScanMethod.SeqScan
         else
-            match tryIndexMethod tn with
+            match scanTryIndexMethod b catalog predicates tn with
             | Some m -> ret m
             | None -> ret ScanMethod.SeqScan
+
+    /// 走査キーの位置に等値リテラルが入っているか。
+    let private scanMatches (names: string list) (values: SqlValue array) (name: string) (value: SqlValue) =
+        names
+        |> List.tryFindIndex (fun n -> Catalog.eqName n name)
+        |> Option.exists (fun pos ->
+            pos < values.Length
+            && match SqlValue.compareValuesV values.[pos] value with
+               | DbOk 0 -> true
+               | _ -> false)
 
     /// 走査方法が同じ等値条件を保証するか。
     /// `PkLookup` / `IndexLookup` が吸収済みの `col = 定数` を Filter から落とすために使う
     /// （残しても結果は変わらないが、行ごとに二重評価になる）。
     let impliedByScan (catalog: Catalog) (b: TableBinding) (method: ScanMethod) (predicate: Expr) =
-        let matches names (values: SqlValue array) name value =
-            names
-            |> List.tryFindIndex (fun n -> Catalog.eqName n name)
-            |> Option.exists (fun pos ->
-                pos < values.Length
-                && match SqlValue.compareValuesV values.[pos] value with
-                   | DbOk 0 -> true
-                   | _ -> false)
-
         let tn = (refName b).ToLowerInvariant()
 
         match predicate with
@@ -1189,8 +1307,8 @@ module internal Analyzer =
         |> Option.exists (fun (name, value) ->
             match method with
             | ScanMethod.PkLookup values ->
-                matches (b.Schema.PrimaryKey |> List.map (fun i -> b.Schema.Columns.[i].Name)) values name value
+                scanMatches (b.Schema.PrimaryKey |> List.map (fun i -> b.Schema.Columns.[i].Name)) values name value
             | ScanMethod.IndexLookup(indexName, values) ->
                 Catalog.findIndex indexName catalog
-                |> Option.exists (fun idx -> matches idx.Columns values name value)
+                |> Option.exists (fun idx -> scanMatches idx.Columns values name value)
             | _ -> false)

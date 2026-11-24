@@ -10,48 +10,53 @@ open ParserExpr
 /// SQL 文を AST に変換するパーサ（文は再帰下降、式は `ParserExpr` の Pratt / CPS）。
 /// 失敗はすべて Result<'T, DbError> として返し、例外は送らない。
 module internal Parser =
-    let private parseInsert (st: PState) =
-        let simpleLiteral st =
-            let nextEnds =
-                st.Pos + 1 < st.Tokens.Length
-                && match st.Tokens.[st.Pos + 1].Token with
-                   | Token.Symbol ","
-                   | Token.Symbol ")" -> true
-                   | _ -> false
+    /// INSERT の値が単純リテラルで、直後に区切りがあるかを調べる。
+    let private simpleInsertLiteral (st: PState) =
+        let nextEnds =
+            st.Pos + 1 < st.Tokens.Length
+            && match st.Tokens.[st.Pos + 1].Token with
+               | Token.Symbol ","
+               | Token.Symbol ")" -> true
+               | _ -> false
 
-            if not nextEnds then
-                None
+        if not nextEnds then
+            None
+        else
+            match peek st with
+            | LiteralExpr e -> Some(e, advance st)
+            | _ -> None
+
+    /// INSERT の 1行分の値を読む。
+    [<TailCall>]
+    let rec private insertOne (acc: Expr list) (st: PState) =
+        let parsed =
+            match simpleInsertLiteral st with
+            | Some e -> ret e
+            | None -> parseExprValue st
+
+        match parsed with
+        | Ok(e, st) ->
+            if isSymbol "," st then
+                advance st |> insertOne (e :: acc)
             else
-                match peek st with
-                | LiteralExpr e -> Some(e, advance st)
-                | _ -> None
+                expectSymbol ")" st |> Result.map (fun (_, st) -> List.rev (e :: acc), st)
+        | Error e -> err e
 
-        let rec one acc st =
-            let parsed =
-                match simpleLiteral st with
-                | Some e -> ret e
-                | None -> parseExprValue st
-
-            match parsed with
-            | Ok(e, st) ->
+    /// INSERT の VALUES 行を読む。
+    [<TailCall>]
+    let rec private insertRows (acc: Expr list list) (st: PState) =
+        match expectSymbol "(" st with
+        | Ok(_, st) ->
+            match insertOne [] st with
+            | Ok(r, st) ->
                 if isSymbol "," st then
-                    advance st |> one (e :: acc)
+                    advance st |> insertRows (r :: acc)
                 else
-                    expectSymbol ")" st |> Result.map (fun (_, st) -> List.rev (e :: acc), st)
+                    ret (List.rev (r :: acc), st)
             | Error e -> err e
+        | Error e -> err e
 
-        let rec rows acc st =
-            match expectSymbol "(" st with
-            | Ok(_, st) ->
-                match one [] st with
-                | Ok(r, st) ->
-                    if isSymbol "," st then
-                        advance st |> rows (r :: acc)
-                    else
-                        ret (List.rev (r :: acc), st)
-                | Error e -> err e
-            | Error e -> err e
-
+    let private parseInsert (st: PState) =
         result {
             let! _, st = expectKeyword "INSERT" st
             let! _, st = expectKeyword "INTO" st
@@ -92,7 +97,7 @@ module internal Parser =
                     st
             else
                 let! _, st = expectKeyword "VALUES" st
-                let! rs, st = rows [] st
+                let! rs, st = insertRows [] st
                 let! _, st = eatOptionalSemicolon st
 
                 return
@@ -104,27 +109,29 @@ module internal Parser =
                     st
         }
 
-    let private parseUpdate (st: PState) =
-        let rec assigns acc st =
-            match parseIdent st with
-            | Ok(col, st) ->
-                match expectSymbol "=" st with
-                | Ok(_, st) ->
-                    match parseExprValue st with
-                    | Ok(e, st) ->
-                        if isSymbol "," st then
-                            advance st |> assigns ((col, e) :: acc)
-                        else
-                            ret (List.rev ((col, e) :: acc), st)
-                    | Error e -> err e
+    /// UPDATE の SET 代入リストを読む。
+    [<TailCall>]
+    let rec private updateAssigns (acc: (string * Expr) list) (st: PState) =
+        match parseIdent st with
+        | Ok(col, st) ->
+            match expectSymbol "=" st with
+            | Ok(_, st) ->
+                match parseExprValue st with
+                | Ok(e, st) ->
+                    if isSymbol "," st then
+                        advance st |> updateAssigns ((col, e) :: acc)
+                    else
+                        ret (List.rev ((col, e) :: acc), st)
                 | Error e -> err e
             | Error e -> err e
+        | Error e -> err e
 
+    let private parseUpdate (st: PState) =
         result {
             let! _, st = expectKeyword "UPDATE" st
             let! tbl, st = parseTableRef st
             let! _, st = expectKeyword "SET" st
-            let! asg, st = assigns [] st
+            let! asg, st = updateAssigns [] st
             let! whereE, st = parseWhereValue st
             let! _, st = eatOptionalSemicolon st
 
@@ -154,31 +161,33 @@ module internal Parser =
             return { Table = tbl; Where = whereE }, st
         }
 
+    /// 型引数のカンマ区切り要素を読む。
+    [<TailCall>]
+    let rec private typeArgumentsLoop (acc: (int * bool) list) (st: PState) =
+        match parseExprValue st with
+        | Ok(e, st) ->
+            let v =
+                match e with
+                | Expr.Literal(Literal.Int n) -> int n, true
+                | _ -> 0, false
+
+            if isSymbol "," st then
+                advance st |> typeArgumentsLoop (v :: acc)
+            else
+                expectSymbol ")" st
+                |> Result.map (fun (_, st) ->
+                    v :: acc
+                    |> List.rev
+                    |> List.choose (fun (n, ok) -> if ok then Some("n", n) else None),
+                    st)
+        | Error e -> err e
+
     /// DECIMAL(10, 2) のような型引数を読む。
     let private parseTypeArguments (st: PState) =
-        let rec loop acc st =
-            match parseExprValue st with
-            | Ok(e, st) ->
-                let v =
-                    match e with
-                    | Expr.Literal(Literal.Int n) -> int n, true
-                    | _ -> 0, false
-
-                if isSymbol "," st then
-                    advance st |> loop (v :: acc)
-                else
-                    expectSymbol ")" st
-                    |> Result.map (fun (_, st) ->
-                        v :: acc
-                        |> List.rev
-                        |> List.choose (fun (n, ok) -> if ok then Some("n", n) else None),
-                        st)
-            | Error e -> err e
-
         if not (isSymbol "(" st) then
             ret ([], st)
         else
-            advance st |> loop []
+            advance st |> typeArgumentsLoop []
 
     /// `REFERENCES 親 [(列 [, …])]` を読む。
     /// 参照アクション（ON DELETE / ON UPDATE）・MATCH・DEFERRABLE は未対応として明示エラーにする
@@ -221,36 +230,35 @@ module internal Parser =
            | Token.Keyword "KEY" -> true
            | _ -> false
 
-    let private parseColumnConstraint (acc: ColumnConstraint) (st: PState) =
-        let rec loop c st =
-            if isKeyword "NOT" st then
-                match advance st |> expectKeyword "NULL" with
-                | Ok(_, st) -> loop { c with NotNull = true } st
-                | Error e -> err e
-            elif isKeyword "PRIMARY" st then
-                match advance st |> expectKeyword "KEY" with
-                | Ok(_, st) ->
-                    loop
-                        { c with
-                            PrimaryKey = true
-                            NotNull = true
-                        }
-                        st
-                | Error e -> err e
-            elif isKeyword "UNIQUE" st then
-                advance st |> loop { c with Unique = true }
-            elif isKeyword "DEFAULT" st then
-                match advance st |> parseExprValue with
-                | Ok(e, st) -> loop { c with Default = Some e } st
-                | Error e -> err e
-            elif isIdentName "REFERENCES" st then
-                match advance st |> parseReferences with
-                | Ok(r, st) -> loop { c with References = Some r } st
-                | Error e -> err e
-            else
-                ret (c, st)
-
-        loop acc st
+    /// 列制約を 1つずつ畳み込む。
+    [<TailCall>]
+    let rec private columnConstraintLoop (c: ColumnConstraint) (st: PState) =
+        if isKeyword "NOT" st then
+            match advance st |> expectKeyword "NULL" with
+            | Ok(_, st) -> columnConstraintLoop { c with NotNull = true } st
+            | Error e -> err e
+        elif isKeyword "PRIMARY" st then
+            match advance st |> expectKeyword "KEY" with
+            | Ok(_, st) ->
+                columnConstraintLoop
+                    { c with
+                        PrimaryKey = true
+                        NotNull = true
+                    }
+                    st
+            | Error e -> err e
+        elif isKeyword "UNIQUE" st then
+            advance st |> columnConstraintLoop { c with Unique = true }
+        elif isKeyword "DEFAULT" st then
+            match advance st |> parseExprValue with
+            | Ok(e, st) -> columnConstraintLoop { c with Default = Some e } st
+            | Error e -> err e
+        elif isIdentName "REFERENCES" st then
+            match advance st |> parseReferences with
+            | Ok(r, st) -> columnConstraintLoop { c with References = Some r } st
+            | Error e -> err e
+        else
+            ret (c, st)
 
     let private parseColumnDefinition (st: PState) =
         result {
@@ -272,7 +280,7 @@ module internal Parser =
                     parseDataType st
 
             let! args, st = parseTypeArguments st
-            let! columnConstraint, st = parseColumnConstraint ColumnConstraint.Empty st
+            let! columnConstraint, st = columnConstraintLoop ColumnConstraint.Empty st
 
             return
                 {
@@ -309,49 +317,51 @@ module internal Parser =
         else
             ret (hasIf, st)
 
-    let private parseCreateTable (st: PState) =
-        let rec body cols constrs st =
-            let next =
-                if isKeyword "PRIMARY" st then
-                    match expectKeyword "PRIMARY" st with
+    /// CREATE TABLE の列・テーブル制約を 1つずつ読む。
+    [<TailCall>]
+    let rec private createTableBody (cols: ColumnDefinition list) (constrs: TableConstraint list) (st: PState) =
+        let next =
+            if isKeyword "PRIMARY" st then
+                match expectKeyword "PRIMARY" st with
+                | Ok(_, st) ->
+                    match expectKeyword "KEY" st with
                     | Ok(_, st) ->
-                        match expectKeyword "KEY" st with
-                        | Ok(_, st) ->
-                            parseParenIdentList st
-                            |> Result.map (fun (pkCols, st) ->
-                                cols, TableConstraint.PrimaryKeyColumns pkCols :: constrs, st)
-                        | Error e -> err e
+                        parseParenIdentList st
+                        |> Result.map (fun (pkCols, st) ->
+                            cols, TableConstraint.PrimaryKeyColumns pkCols :: constrs, st)
                     | Error e -> err e
-                elif isKeyword "UNIQUE" st then
-                    advance st
-                    |> parseParenIdentList
-                    |> Result.map (fun (uqCols, st) -> cols, TableConstraint.UniqueColumns uqCols :: constrs, st)
-                elif isIdentName "CONSTRAINT" st then
-                    fail "名前付き制約（CONSTRAINT）は未対応です" st
-                elif isForeignKeyStart st then
-                    let st1 = advance st
+                | Error e -> err e
+            elif isKeyword "UNIQUE" st then
+                advance st
+                |> parseParenIdentList
+                |> Result.map (fun (uqCols, st) -> cols, TableConstraint.UniqueColumns uqCols :: constrs, st)
+            elif isIdentName "CONSTRAINT" st then
+                fail "名前付き制約（CONSTRAINT）は未対応です" st
+            elif isForeignKeyStart st then
+                let st1 = advance st
 
-                    match advance st1 |> parseParenIdentList with
-                    | Error e -> err e
-                    | Ok(fkCols, st2) ->
-                        if not (isIdentName "REFERENCES" st2) then
-                            fail "FOREIGN KEY の後ろには REFERENCES が必要です" st2
-                        else
-                            advance st2
-                            |> parseReferences
-                            |> Result.map (fun (r, st3) -> cols, TableConstraint.ForeignKey(fkCols, r) :: constrs, st3)
-                else
-                    parseColumnDefinition st |> Result.map (fun (c, st) -> c :: cols, constrs, st)
+                match advance st1 |> parseParenIdentList with
+                | Error e -> err e
+                | Ok(fkCols, st2) ->
+                    if not (isIdentName "REFERENCES" st2) then
+                        fail "FOREIGN KEY の後ろには REFERENCES が必要です" st2
+                    else
+                        advance st2
+                        |> parseReferences
+                        |> Result.map (fun (r, st3) -> cols, TableConstraint.ForeignKey(fkCols, r) :: constrs, st3)
+            else
+                parseColumnDefinition st |> Result.map (fun (c, st) -> c :: cols, constrs, st)
 
-            match next with
-            | Ok(cols, constrs, st) ->
-                if isSymbol "," st then
-                    advance st |> body cols constrs
-                else
-                    expectSymbol ")" st
-                    |> Result.map (fun (_, st) -> List.rev cols, List.rev constrs, st)
-            | Error e -> err e
+        match next with
+        | Ok(cols, constrs, st) ->
+            if isSymbol "," st then
+                advance st |> createTableBody cols constrs
+            else
+                expectSymbol ")" st
+                |> Result.map (fun (_, st) -> List.rev cols, List.rev constrs, st)
+        | Error e -> err e
 
+    let private parseCreateTable (st: PState) =
         result {
             let! _, st = expectKeyword "CREATE" st
             let! _, st = expectKeyword "TABLE" st
@@ -359,7 +369,7 @@ module internal Parser =
             let! ifNotExists, st = ifFlag "CREATE TABLE" true hasIf hasNot st
             let! name, st = parseIdent st
             let! _, st = expectSymbol "(" st
-            let! cols, constrs, st = body [] [] st
+            let! cols, constrs, st = createTableBody [] [] st
             let! _, st = eatOptionalSemicolon st
 
             return
@@ -419,6 +429,73 @@ module internal Parser =
             return Statement.DropIndex(name, ifEx), st
         }
 
+    /// ALTER の COLUMN キーワードを読み飛ばす。
+    let private optionalColumnKeyword (st: PState) =
+        if isIdentName "COLUMN" st then advance st else st
+
+    /// ALTER TABLE の操作を読む。
+    let private alterTableAction (name: string) (st: PState) =
+        if isIdentName "ADD" st then
+            let st = advance st |> optionalColumnKeyword
+
+            result {
+                let! col, st = parseColumnDefinition st
+                let! _, st = eatOptionalSemicolon st
+
+                return
+                    Statement.AlterTable
+                        {
+                            Table = name
+                            Action = AlterTableAction.AddColumn col
+                        },
+                    st
+            }
+        elif isKeyword "DROP" st then
+            let st = advance st |> optionalColumnKeyword
+
+            result {
+                let! column, st = parseIdent st
+                let! _, st = eatOptionalSemicolon st
+
+                return
+                    Statement.AlterTable
+                        {
+                            Table = name
+                            Action = AlterTableAction.DropColumn column
+                        },
+                    st
+            }
+        elif isIdentName "RENAME" st then
+            let st = advance st
+
+            if isIdentName "TO" st then
+                fail "ALTER TABLE ... RENAME TO（テーブル名の変更）は未対応です" st
+            else
+                let st = if isIdentName "COLUMN" st then advance st else st
+
+                result {
+                    let! oldName, st = parseIdent st
+
+                    do!
+                        if isIdentName "TO" st then
+                            ret ()
+                        else
+                            fail "RENAME COLUMN の後ろには TO が必要です" st
+
+                    let! newName, st = parseIdent (advance st)
+                    let! _, st = eatOptionalSemicolon st
+
+                    return
+                        Statement.AlterTable
+                            {
+                                Table = name
+                                Action = AlterTableAction.RenameColumn(oldName, newName)
+                            },
+                        st
+                }
+        else
+            fail "ALTER TABLE では ADD COLUMN / DROP COLUMN / RENAME COLUMN を指定してください" st
+
     /// `ALTER TABLE`。
     /// <remarks>
     /// `ALTER` / `ADD` / `COLUMN` / `RENAME` / `TO` は予約語にしない
@@ -426,75 +503,10 @@ module internal Parser =
     /// 未対応の操作（型変更・テーブル名の変更など）は黙って無視せず SyntaxError にする。
     /// </remarks>
     let private parseAlterTable (st: PState) =
-        let alterAction name st =
-            let withOptionalColumn st =
-                if isIdentName "COLUMN" st then advance st else st
-
-            if isIdentName "ADD" st then
-                let st = advance st |> withOptionalColumn
-
-                result {
-                    let! col, st = parseColumnDefinition st
-                    let! _, st = eatOptionalSemicolon st
-
-                    return
-                        Statement.AlterTable
-                            {
-                                Table = name
-                                Action = AlterTableAction.AddColumn col
-                            },
-                        st
-                }
-            elif isKeyword "DROP" st then
-                let st = advance st |> withOptionalColumn
-
-                result {
-                    let! column, st = parseIdent st
-                    let! _, st = eatOptionalSemicolon st
-
-                    return
-                        Statement.AlterTable
-                            {
-                                Table = name
-                                Action = AlterTableAction.DropColumn column
-                            },
-                        st
-                }
-            elif isIdentName "RENAME" st then
-                let st = advance st
-
-                if isIdentName "TO" st then
-                    fail "ALTER TABLE ... RENAME TO（テーブル名の変更）は未対応です" st
-                else
-                    let st = if isIdentName "COLUMN" st then advance st else st
-
-                    result {
-                        let! oldName, st = parseIdent st
-
-                        do!
-                            if isIdentName "TO" st then
-                                ret ()
-                            else
-                                fail "RENAME COLUMN の後ろには TO が必要です" st
-
-                        let! newName, st = parseIdent (advance st)
-                        let! _, st = eatOptionalSemicolon st
-
-                        return
-                            Statement.AlterTable
-                                {
-                                    Table = name
-                                    Action = AlterTableAction.RenameColumn(oldName, newName)
-                                },
-                            st
-                    }
-            else
-                fail "ALTER TABLE では ADD COLUMN / DROP COLUMN / RENAME COLUMN を指定してください" st
-
         result {
             let! _, st = expectKeyword "TABLE" st
             let! name, st = parseIdent st
-            return! alterAction name st
+            return! alterTableAction name st
         }
 
     /// 現在位置が `SAMPLE` で、直後が数値（`SAMPLE n` の n）か。
@@ -655,6 +667,23 @@ module internal Parser =
         >> Option.defaultValue { Offset = 0; Line = 1; Column = 1 }
 
     /// トークン列を 1文以上へ分解し、`?` を `parameters` の順に値へ置き換える。
+    /// トークン列を文へ分解し、区切りを検査する。
+    [<TailCall>]
+    let rec private parseAllStatements (acc: Statement list) (st: PState) =
+        if st.Pos >= st.Tokens.Length - 1 then
+            ret (List.rev acc)
+        else
+            match parseOne st with
+            | Ok(statement, next) ->
+                let separated =
+                    next.Pos > st.Pos && st.Tokens.[next.Pos - 1].Token = Token.Symbol ";"
+
+                if next.Pos < st.Tokens.Length - 1 && not separated then
+                    fail "文の区切りには ; が必要です（複数文は ; で区切ってください）" next
+                else
+                    parseAllStatements (statement :: acc) next
+            | Error e -> err e
+
     let private parseTokens (parameters: SqlValue array) (tokens: TokenItem array) =
         let expected = parameterCount tokens
 
@@ -666,22 +695,7 @@ module internal Parser =
             }
             |> err
         else
-            let rec parseAll acc st =
-                if st.Pos >= st.Tokens.Length - 1 then
-                    ret (List.rev acc)
-                else
-                    match parseOne st with
-                    | Ok(statement, next) ->
-                        let separated =
-                            next.Pos > st.Pos && st.Tokens.[next.Pos - 1].Token = Token.Symbol ";"
-
-                        if next.Pos < st.Tokens.Length - 1 && not separated then
-                            fail "文の区切りには ; が必要です（複数文は ; で区切ってください）" next
-                        else
-                            parseAll (statement :: acc) next
-                    | Error e -> err e
-
-            parseAll
+            parseAllStatements
                 []
                 {
                     Tokens = tokens

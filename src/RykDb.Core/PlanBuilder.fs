@@ -5,19 +5,20 @@
 namespace RykDb.Core
 
 module internal PlanBuilder =
+    /// 木が主キー順の単一走査かを調べる（Filter は透過的にたどる）。
+    [<TailCall>]
+    let rec private scanOfPrimaryKeyOrder (tree: Logical) =
+        match tree with
+        | Logical.Filter(_, child) -> scanOfPrimaryKeyOrder child
+        | Logical.Scan(_, ScanMethod.SeqScan) -> true
+        | Logical.Scan(_, ScanMethod.PkLookup _) -> true
+        | Logical.Scan(_, ScanMethod.RangeScan _) -> true
+        | _ -> false
+
     /// 走査が主キー順（キー昇順）に結果を返すか。
     /// `SeqScan` / 主キー等値 / 主キー範囲は主キー順に返る。
     /// 索引経由の走査は索引順なので対象外（`WHERE` の索引選択で順序が変わる）。
-    let private scansInPrimaryKeyOrder (tree: Logical) =
-        let rec scanOf tree =
-            match tree with
-            | Logical.Filter(_, child) -> scanOf child
-            | Logical.Scan(_, ScanMethod.SeqScan) -> true
-            | Logical.Scan(_, ScanMethod.PkLookup _) -> true
-            | Logical.Scan(_, ScanMethod.RangeScan _) -> true
-            | _ -> false
-
-        scanOf tree
+    let private scansInPrimaryKeyOrder (tree: Logical) = scanOfPrimaryKeyOrder tree
 
     /// ORDER BY を省略できるか。
     /// <remarks>
@@ -103,17 +104,18 @@ module internal PlanBuilder =
             | _ -> Map.empty
         | _ -> Map.empty
 
+    /// 索引名に対応する PrefixNDV を取り出す（統計が無ければ空）。
+    let private indexStatsOf (stats: TableStats option) (name: string) =
+        stats
+        |> Option.bind (fun s -> s.Indexes |> List.tryFind (fun (i: IndexStats) -> Catalog.eqName i.Name name))
+        |> Option.map _.PrefixNDV
+        |> Option.defaultValue []
+
     /// 結合順の候補を作る。
     let private joinItem (statsOf: string -> TableStats option) (position: int) (scan: Logical) (rows: float) =
         function
         | Base tb as binding ->
             let stats = statsOf (bindingName binding)
-
-            let indexStats name =
-                stats
-                |> Option.bind (fun s -> s.Indexes |> List.tryFind (fun (i: IndexStats) -> Catalog.eqName i.Name name))
-                |> Option.map _.PrefixNDV
-                |> Option.defaultValue []
 
             {
                 Name = (bindingName binding).ToLowerInvariant()
@@ -138,7 +140,7 @@ module internal PlanBuilder =
                            {
                                IndexName = index.Name
                                IndexColumns = index.Columns
-                               PrefixNDV = indexStats index.Name
+                               PrefixNDV = indexStatsOf stats index.Name
                                Unique = index.Unique
                            }))
                 RowBytes =
@@ -163,7 +165,7 @@ module internal PlanBuilder =
             }
 
     /// LIMIT / OFFSET の定数式を評価する（0 以上の int）。
-    let private evalCount what =
+    let private evalCount (what: string) =
         function
         | Expr.Literal(Literal.Int i) when i >= 0L && i <= int64 System.Int32.MaxValue -> ret (int i)
         | e when Expr.hasCorrelated e -> sprintf "%s に相関サブクエリは使えません" what |> DbError.create ErrorKind.SyntaxError |> err
@@ -200,20 +202,26 @@ module internal PlanBuilder =
             UsedWhere: Set<int>
         }
 
+    /// 述語が左右の部分木の両方を参照するか。
+    let private crossesNames
+        (both: Set<string>)
+        (leftNames: Set<string>)
+        (rightNames: Set<string>)
+        (refs: Set<string>)
+        =
+        Set.isSubset refs both
+        && not (Set.isEmpty (Set.intersect refs leftNames))
+        && not (Set.isEmpty (Set.intersect refs rightNames))
+
     /// 左右の部分木を結合し、両方を参照する述語を ON に取り込む。
     let private joinBushy (env: BushyEnv) (left: BushyNode) (right: BushyNode) (rightName: string) =
         let both = Set.union left.Names right.Names
-
-        let crosses refs =
-            Set.isSubset refs both
-            && not (Set.isEmpty (Set.intersect refs left.Names))
-            && not (Set.isEmpty (Set.intersect refs right.Names))
 
         let ons, usedOn =
             env.OnPredicates
             |> Array.fold
                 (fun (take, used) (k, refs, e) ->
-                    if not (Set.contains k used) && crosses refs then
+                    if not (Set.contains k used) && crossesNames both left.Names right.Names refs then
                         e :: take, Set.add k used
                     else
                         take, used)
@@ -224,7 +232,7 @@ module internal PlanBuilder =
             |> Array.indexed
             |> Array.fold
                 (fun (take, used) (k, (refs, p)) ->
-                    if not (Set.contains k used) && crosses refs then
+                    if not (Set.contains k used) && crossesNames both left.Names right.Names refs then
                         p :: take, Set.add k used
                     else
                         take, used)
@@ -409,18 +417,19 @@ module internal PlanBuilder =
 
             Logical.Join(kind, bindingName right, onAll, acc, scans.[rightIndex]), Schema.concat accSchema rightSchema)
 
+    /// 式が列参照なら修飾子を返す。
+    let private qualifierOfColumn (e: Expr) =
+        match Schema.tryAsColumnRef e with
+        | Some(r: ColumnRef) -> r.Qualifier
+        | None -> None
+
     /// 等値述語を（参照テーブル集合, 述語, テーブル名 -> 結合キー列）に分解する。
     let private equiLinks (schema: Schema) =
-        let qualifierOf x =
-            match Schema.tryAsColumnRef x with
-            | Some(r: ColumnRef) -> r.Qualifier
-            | None -> None
-
         Predicate.splitConjuncts
         >> List.choose (fun conjunct ->
             match conjunct with
             | Expr.Binary(BinaryOp.Eq, a, b) ->
-                match qualifierOf a, qualifierOf b with
+                match qualifierOfColumn a, qualifierOfColumn b with
                 | Some qa, Some qb when not (Catalog.eqName qa qb) ->
                     let columns =
                         if Analyzer.isJoinKeyEquality schema conjunct then
@@ -477,9 +486,8 @@ module internal PlanBuilder =
         (joined: Set<string>)
         (used: Set<int>)
         (usedOns: Set<int>)
-        (order: string list)
         =
-        match order with
+        function
         | [] ->
             let leftovers =
                 env.OnPredicates
@@ -520,7 +528,12 @@ module internal PlanBuilder =
 
     /// 述語の依存が満たされた結合を繰り返し取り込む（LEFT JOIN 越しの前倒し用）。
     [<TailCall>]
-    let rec private growAccepted nameOf ready accepted pending =
+    let rec private growAccepted
+        (nameOf: 'a -> 'b)
+        (ready: Set<'b>)
+        (accepted: ('a * 'c) list)
+        (pending: (('a * 'c) * Set<'b>) list)
+        =
         let fits, waiting =
             pending
             |> List.partition (fun ((i, _), refs) ->
@@ -533,6 +546,9 @@ module internal PlanBuilder =
             let ready' = fits |> List.fold (fun s ((i, _), _) -> Set.add (nameOf i) s) ready
             growAccepted nameOf ready' (accepted @ (fits |> List.map fst)) waiting
 
+    /// 束縛の参照名（小文字）。
+    let private nameOfBinding (bindings: SourceBinding list) (i: int) = lowerName bindings.[i]
+
     /// LEFT JOIN より前の INNER JOIN に、後続の INNER JOIN の ON から移せる述語を前倒しする。
     let private hoistAcrossLeft (bindings: SourceBinding list) (steps: (int * JoinClause) list) =
         let leading = steps |> List.takeWhile (fun (_, j) -> j.Kind = JoinKind.Inner)
@@ -541,15 +557,19 @@ module internal PlanBuilder =
         if List.isEmpty rest || List.isEmpty bindings then
             steps
         else
-            let nameOf i = lowerName bindings.[i]
-
             let accepted =
                 rest
                 |> List.choose (fun (i, j) ->
                     match referencedTables j.On with
                     | Some refs when j.Kind = JoinKind.Inner -> Some((i, j), refs)
                     | _ -> None)
-                |> growAccepted nameOf (Set.ofList (nameOf 0 :: (leading |> List.map (fun (i, _) -> nameOf i)))) []
+                |> growAccepted
+                    (nameOfBinding bindings)
+                    (Set.ofList (
+                        nameOfBinding bindings 0
+                        :: (leading |> List.map (fun (i, _) -> nameOfBinding bindings i))
+                    ))
+                    []
 
             if List.isEmpty accepted then
                 steps
@@ -1282,6 +1302,10 @@ module internal PlanBuilder =
            |> Array.choose (fun (k, (_, p)) -> if Set.contains k usedJoinPredicates then None else Some p)
            |> Array.toList)
 
+    /// 束縛名から統計を引く（ctx と bindings を明示的に受け取る）。
+    let private statsLookupFor (ctx: ExecContext) (bindings: SourceBinding list) (name: string) =
+        statsLookup ctx name bindings
+
     /// SELECT 文を論理代数に変換する。
     /// `derived` は計画済みの派生テーブル（別名の小文字 -> 計画）。
     let buildLogicalWith (ctx: ExecContext) (stmt: SelectStatement) (derived: Map<string, PlannedQuery>) =
@@ -1301,7 +1325,7 @@ module internal PlanBuilder =
 
                 let bindingNames = bindings |> List.map lowerName |> Set.ofList
                 let classified = classifyPredicates bindingNames predicates
-                let statsOf name = statsLookup ctx name bindings
+                let statsOf = statsLookupFor ctx bindings
                 let leftRightTables = leftRightTableNames bindings stmt
                 let leftRightPreds = leftRightPredicates classified leftRightTables bindings
                 let joinPredicates' = List.toArray classified.JoinPredicates
@@ -1341,31 +1365,32 @@ module internal PlanBuilder =
                 return! applyLimit stmt deduped
         }
 
+    /// ORDER BY の序数を出力スキーマの列名へ解決する。
+    let private sortKeyOfOutput (output: Schema) (k: SortKey) =
+        match k.Expression with
+        | Expr.Literal(Literal.Int n) ->
+            if n < 1L || n > int64 output.Columns.Length then
+                sprintf "ORDER BY の列番号 %d は範囲外です" n
+                |> DbError.create ErrorKind.SyntaxError
+                |> err
+            else
+                ret
+                    { k with
+                        Expression =
+                            Expr.Column
+                                {
+                                    Qualifier = None
+                                    Name = output.Columns.[int n - 1].Name
+                                }
+                    }
+        | e -> ret { k with Expression = e }
+
     /// 集合演算（`UNION ALL`）全体に掛かる ORDER BY / LIMIT / OFFSET を論理木へ適用する。
     /// ORDER BY は先頭の SELECT の出力列（列名・別名・序数）で解決する。
     /// 枝単位の ORDER BY / LIMIT は持てない（構文上も全体に掛かる）。
     let applySetOperationTail (output: Schema) (stmt: SelectStatement) (tree: Logical) =
-        let keyOf (k: SortKey) =
-            match k.Expression with
-            | Expr.Literal(Literal.Int n) ->
-                if n < 1L || n > int64 output.Columns.Length then
-                    sprintf "ORDER BY の列番号 %d は範囲外です" n
-                    |> DbError.create ErrorKind.SyntaxError
-                    |> err
-                else
-                    ret
-                        { k with
-                            Expression =
-                                Expr.Column
-                                    {
-                                        Qualifier = None
-                                        Name = output.Columns.[int n - 1].Name
-                                    }
-                        }
-            | e -> ret { k with Expression = e }
-
         result {
-            let! keys = stmt.OrderBy |> List.map keyOf |> all
+            let! keys = stmt.OrderBy |> List.map (sortKeyOfOutput output) |> all
             let sorted = if List.isEmpty keys then tree else Logical.Sort(keys, tree)
 
             let! limit =

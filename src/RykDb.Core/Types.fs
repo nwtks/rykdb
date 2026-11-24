@@ -37,27 +37,29 @@ type SqlValue =
 
 [<RequireQualifiedAccess>]
 module SqlLiteral =
+    /// 実数を SQL リテラル向けの文字列にする（特殊値は名前で表す）。
+    let private formatReal (f: double) =
+        if System.Double.IsNaN f then
+            "NaN"
+        elif System.Double.IsPositiveInfinity f then
+            "Infinity"
+        elif System.Double.IsNegativeInfinity f then
+            "-Infinity"
+        else
+            f.ToString("R", System.Globalization.CultureInfo.InvariantCulture)
+
+    /// バイト列を X'..' 形式のリテラルにする。
+    let private formatBlob (b: byte[]) =
+        let sb = System.Text.StringBuilder "X'"
+
+        for x in b do
+            sb.Append(x.ToString("X2", System.Globalization.CultureInfo.InvariantCulture))
+            |> ignore
+
+        sb.Append('\'').ToString()
+
     /// SQL リテラルとしての表示。
     let toSqlLiteral =
-        let formatReal (f: double) =
-            if System.Double.IsNaN f then
-                "NaN"
-            elif System.Double.IsPositiveInfinity f then
-                "Infinity"
-            elif System.Double.IsNegativeInfinity f then
-                "-Infinity"
-            else
-                f.ToString("R", System.Globalization.CultureInfo.InvariantCulture)
-
-        let formatBlob (b: byte[]) =
-            let sb = System.Text.StringBuilder "X'"
-
-            for x in b do
-                sb.Append(x.ToString("X2", System.Globalization.CultureInfo.InvariantCulture))
-                |> ignore
-
-            sb.Append('\'').ToString()
-
         function
         | SqlValue.Null -> "NULL"
         | SqlValue.Bool b -> if b then "TRUE" else "FALSE"
@@ -74,21 +76,27 @@ module SqlLiteral =
 
 /// バイト列のユーティリティ。
 module internal Bytes =
+    /// 2配列を先頭から比較する（共通長を超えたら長さで決める）。
+    [<TailCall>]
+    let rec private compareAt (a: byte array) (b: byte array) (n: int) (i: int) =
+        if i >= n then compare a.Length b.Length
+        elif a.[i] = b.[i] then compareAt a b n (i + 1)
+        else compare (int a.[i]) (int b.[i])
+
     /// 昇順比較（前方が短いほうが小さい）。
     let compare (a: byte array) (b: byte array) =
         let n = min a.Length b.Length
+        compareAt a b n 0
 
-        let rec compareAt i =
-            if i >= n then compare a.Length b.Length
-            elif a.[i] = b.[i] then compareAt (i + 1)
-            else compare (int a.[i]) (int b.[i])
-
-        compareAt 0
+    /// 指定オフセットの 1バイトを符号なしで読む。
+    let private readLE32At (data: byte array) (offset: int) (i: int) = uint32 data.[offset + i]
 
     /// 生のバイト列の固定オフセットから、リトルエンディアン 32bit を読む。
     let readLE32 (data: byte array) (offset: int) =
-        let at i = uint32 data.[offset + i]
-        at 0 ||| (at 1 <<< 8) ||| (at 2 <<< 16) ||| (at 3 <<< 24)
+        readLE32At data offset 0
+        ||| (readLE32At data offset 1 <<< 8)
+        ||| (readLE32At data offset 2 <<< 16)
+        ||| (readLE32At data offset 3 <<< 24)
 
 /// エントリの並び順（キー昇順・同一キーは SeqNo 降順）の**唯一の定義**。
 /// memtable の `Entry` と SSTable の `SstEntry` は必ずこれを経由する
@@ -106,19 +114,20 @@ module internal SqlName =
     let equal (a: string) (b: string) =
         System.String.Equals(a, b, System.StringComparison.OrdinalIgnoreCase)
 
+    /// 済みの名前を積みながら重複を探す再帰本体。
+    [<TailCall>]
+    let rec private duplicateLoop (seen: string list) (rest: string list) =
+        match rest with
+        | [] -> None
+        | name :: tail ->
+            if seen |> List.exists (fun s -> equal s name) then
+                Some name
+            else
+                duplicateLoop (name :: seen) tail
+
     /// 大文字小文字を無視して重複する名前を探す。
     /// 重複があれば最初に見つかった名前を返す。
-    let duplicate (names: string list) =
-        let rec loop (seen: string list) (rest: string list) =
-            match rest with
-            | [] -> None
-            | name :: tail ->
-                if seen |> List.exists (fun s -> equal s name) then
-                    Some name
-                else
-                    loop (name :: seen) tail
-
-        loop [] names
+    let duplicate (names: string list) = duplicateLoop [] names
 
 /// SQL の 3値論理。
 /// 比較結果は TRUE / FALSE だけでなく UNKNOWN を持つ。
@@ -222,7 +231,7 @@ module internal SqlValue =
     let FalseValue = SqlValue.Bool false
 
     /// bool を共有済みの SqlValue.Bool へ変換する。
-    let inline ofBool b = if b then TrueValue else FalseValue
+    let inline ofBool (b: bool) = if b then TrueValue else FalseValue
 
     /// 値の型。`Unloaded`（列マスクのプレースホルダ）は型を持たないためエラー。
     let dataType =
@@ -275,18 +284,20 @@ module internal SqlValue =
                         v)
                 row
 
+    /// 復号していない列の最初の位置を探す。
+    [<TailCall>]
+    let rec private firstUnloaded (row: SqlValue array) (i: int) =
+        if i >= row.Length then
+            None
+        else
+            match row.[i] with
+            | SqlValue.Unloaded -> Some i
+            | _ -> firstUnloaded row (i + 1)
+
     /// 列マスクのプレースホルダが結果に漏れていないか検査する。
     /// 結果の境界では `LoadedRow.create` がこれを呼ぶ（直接呼ぶのはそこだけ）。
     let ensureLoaded (row: SqlValue array) =
-        let rec firstUnloaded i =
-            if i >= row.Length then
-                None
-            else
-                match row.[i] with
-                | SqlValue.Unloaded -> Some i
-                | _ -> firstUnloaded (i + 1)
-
-        match firstUnloaded 0 with
+        match firstUnloaded row 0 with
         | None -> ret row
         | Some i -> err (DbError.internalError (sprintf "復号していない列がクエリ結果に含まれています（列位置: %d）" i))
 
@@ -342,6 +353,19 @@ module internal SqlValue =
 
     let vReal = normalizeFloat >> SqlValue.Real
 
+    /// 10進値を整数で表せるなら INTEGER に寄せる。
+    let private canonicalDecimal (d: decimal) =
+        let stripped = if d = 0M then 0M else d / 1.0000000000000000000000000000M
+
+        if
+            stripped = System.Decimal.Truncate stripped
+            && stripped >= decimal System.Int64.MinValue
+            && stripped <= decimal System.Int64.MaxValue
+        then
+            SqlValue.Int(int64 stripped)
+        else
+            SqlValue.Decimal stripped
+
     /// 等値キー用の正規化。
     /// DISTINCT / GROUP BY の同一性は符号化バイト列の一致で判定するため、
     /// `compareValuesV` が等値とみなす表現差を 1つの表現へ寄せる:
@@ -351,18 +375,6 @@ module internal SqlValue =
     /// - 深夜 0時 UTC の TIMESTAMP は DATE に寄せる（両者は等値）
     /// 集計値の計算には使わない（元の値の型を保つ）。
     let keyNormalize =
-        let canonicalDecimal d =
-            let stripped = if d = 0M then 0M else d / 1.0000000000000000000000000000M
-
-            if
-                stripped = System.Decimal.Truncate stripped
-                && stripped >= decimal System.Int64.MinValue
-                && stripped <= decimal System.Int64.MaxValue
-            then
-                SqlValue.Int(int64 stripped)
-            else
-                SqlValue.Decimal stripped
-
         function
         | SqlValue.Decimal d -> canonicalDecimal d
         | SqlValue.Real f as v when
@@ -376,44 +388,46 @@ module internal SqlValue =
             SqlValue.Date(System.DateOnly.FromDateTime t.UtcDateTime)
         | other -> other
 
+    /// 位置 i のコードポイントと次の位置を返す（不正サロゲートは U+FFFD）。
+    let private codePointAt (s: string) (i: int) =
+        let c = s.[i]
+
+        if
+            System.Char.IsHighSurrogate c
+            && i + 1 < s.Length
+            && System.Char.IsLowSurrogate s.[i + 1]
+        then
+            System.Char.ConvertToUtf32(c, s.[i + 1]), i + 2
+        elif System.Char.IsSurrogate c then
+            0xFFFD, i + 1
+        else
+            int c, i + 1
+
+    /// 2文字列をコードポイント順で比較する再帰本体。
+    [<TailCall>]
+    let rec private compareTextLoop (x: string) (y: string) (i: int) (j: int) =
+        if i >= x.Length then
+            if j >= y.Length then 0 else -1
+        elif j >= y.Length then
+            1
+        else
+            let cx = x.[i]
+            let cy = y.[j]
+
+            if cx = cy && not (System.Char.IsSurrogate cx) then
+                compareTextLoop x y (i + 1) (j + 1)
+            else
+                let px, nextX = codePointAt x i
+                let py, nextY = codePointAt y j
+                let c = compare px py
+                if c <> 0 then c else compareTextLoop x y nextX nextY
+
     /// TEXT を UTF-8 の符号化順（Unicode コードポイント順）で比較する。
     /// .NET の StringComparer.Ordinal は UTF-16 コード単位順であり、
     /// 補助文字（サロゲートペア）と U+E000..U+FFFF の間で UTF-8 の順序と逆転する。
     /// キーの符号化は UTF-8 バイト列なので、SQL の比較も同じ順序に合わせる。
     /// 不正なサロゲートは Encoding.UTF8 と同じく U+FFFD として扱う。
-    let private compareText (x: string) (y: string) =
-        let codePointAt (s: string) i =
-            let c = s.[i]
-
-            if
-                System.Char.IsHighSurrogate c
-                && i + 1 < s.Length
-                && System.Char.IsLowSurrogate s.[i + 1]
-            then
-                System.Char.ConvertToUtf32(c, s.[i + 1]), i + 2
-            elif System.Char.IsSurrogate c then
-                0xFFFD, i + 1
-            else
-                int c, i + 1
-
-        let rec loop i j =
-            if i >= x.Length then
-                if j >= y.Length then 0 else -1
-            elif j >= y.Length then
-                1
-            else
-                let cx = x.[i]
-                let cy = y.[j]
-
-                if cx = cy && not (System.Char.IsSurrogate cx) then
-                    loop (i + 1) (j + 1)
-                else
-                    let px, nextX = codePointAt x i
-                    let py, nextY = codePointAt y j
-                    let c = compare px py
-                    if c <> 0 then c else loop nextX nextY
-
-        loop 0 0
+    let private compareText (x: string) (y: string) = compareTextLoop x y 0 0
 
     let private decimalOfValue =
         function
@@ -574,99 +588,107 @@ module internal SqlValue =
         | true, t -> Some t
         | _ -> None
 
+    /// 暗黙変換の失敗を型エラーにする。
+    let private coerceFail (target: DataType) (v: SqlValue) =
+        sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
+        |> DbError.typeError
+        |> err
+
+    /// REAL が decimal で表せる範囲かを返す。
+    let private isDecimalRepresentable =
+        function
+        | SqlValue.Real f -> fitsDecimal f
+        | _ -> true
+
+    /// BOOLEAN への暗黙変換。
+    let private asBoolean (target: DataType) (v: SqlValue) =
+        function
+        | SqlValue.Bool _ as b -> ret b
+        | SqlValue.Int i when i = 0L -> ret FalseValue
+        | SqlValue.Int i when i = 1L -> ret TrueValue
+        | SqlValue.Real f when f = 0.0 -> ret FalseValue
+        | SqlValue.Real f when f = 1.0 -> ret TrueValue
+        | _ -> coerceFail target v
+
+    /// INTEGER への暗黙変換。
+    let private asInteger (target: DataType) (v: SqlValue) =
+        function
+        | SqlValue.Int _ as n -> ret n
+        | SqlValue.Bool b -> (if b then 1L else 0L) |> SqlValue.Int |> ret
+        | SqlValue.Real f when
+            not (System.Double.IsNaN f || System.Double.IsInfinity f)
+            && System.Math.Truncate f = f
+            && f >= Int64MinAsFloat
+            && f < Int64MaxAsFloat
+            ->
+            int64 f |> SqlValue.Int |> ret
+        | SqlValue.Decimal d when
+            System.Decimal.Truncate d = d
+            && d >= decimal System.Int64.MinValue
+            && d <= decimal System.Int64.MaxValue
+            ->
+            int64 d |> SqlValue.Int |> ret
+        | _ -> coerceFail target v
+
+    /// REAL への暗黙変換。
+    let private asReal (target: DataType) (v: SqlValue) =
+        function
+        | SqlValue.Real f -> ret (vReal f)
+        | SqlValue.Int i -> float i |> vReal |> ret
+        | SqlValue.Bool b -> (if b then 1.0 else 0.0) |> vReal |> ret
+        | SqlValue.Decimal d -> float d |> vReal |> ret
+        | _ -> coerceFail target v
+
+    /// DECIMAL への暗黙変換（変換対象とエラー表示用の元の値を分けて受け取る）。
+    let private asDecimal (target: DataType) (original: SqlValue) (v: SqlValue) =
+        if not (isDecimalRepresentable v) then
+            coerceFail target original
+        else
+            match v with
+            | SqlValue.Decimal _ -> ret v
+            | SqlValue.Int i -> decimal i |> SqlValue.Decimal |> ret
+            | SqlValue.Real f -> decimal f |> SqlValue.Decimal |> ret
+            | SqlValue.Bool b -> (if b then 1.0M else 0.0M) |> SqlValue.Decimal |> ret
+            | _ -> coerceFail target original
+
+    /// DATE への暗黙変換。
+    let private asDate (target: DataType) (v: SqlValue) =
+        function
+        | SqlValue.Date _ as d -> ret d
+        | SqlValue.Timestamp t -> System.DateOnly.FromDateTime t.UtcDateTime |> SqlValue.Date |> ret
+        | SqlValue.Text s ->
+            match tryParseDate s with
+            | Some d -> d |> SqlValue.Date |> ret
+            | None -> coerceFail target v
+        | _ -> coerceFail target v
+
+    /// TIMESTAMP への暗黙変換。
+    let private asTimestamp (target: DataType) (v: SqlValue) =
+        function
+        | SqlValue.Timestamp _ as t -> ret t
+        | SqlValue.Date d ->
+            System.DateTimeOffset(d.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
+            |> SqlValue.Timestamp
+            |> ret
+        | SqlValue.Text s ->
+            match tryParseTimestamp s with
+            | Some t -> t |> SqlValue.Timestamp |> ret
+            | None -> coerceFail target v
+        | _ -> coerceFail target v
+
     /// 暗黙変換。
     /// SQL の通常の型強制の規則を表す。
     /// 変換できない場合は型エラーを返す。
     let coerce (target: DataType) (v: SqlValue) =
-        let fail () =
-            sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
-            |> DbError.typeError
-            |> err
-
-        let isDecimalRepresentable =
-            function
-            | SqlValue.Real f -> fitsDecimal f
-            | _ -> true
-
-        let asBoolean =
-            function
-            | SqlValue.Bool _ as v -> ret v
-            | SqlValue.Int i when i = 0L -> ret FalseValue
-            | SqlValue.Int i when i = 1L -> ret TrueValue
-            | SqlValue.Real f when f = 0.0 -> ret FalseValue
-            | SqlValue.Real f when f = 1.0 -> ret TrueValue
-            | _ -> fail ()
-
-        let asInteger =
-            function
-            | SqlValue.Int _ as v -> ret v
-            | SqlValue.Bool b -> (if b then 1L else 0L) |> SqlValue.Int |> ret
-            | SqlValue.Real f when
-                not (System.Double.IsNaN f || System.Double.IsInfinity f)
-                && System.Math.Truncate f = f
-                && f >= Int64MinAsFloat
-                && f < Int64MaxAsFloat
-                ->
-                int64 f |> SqlValue.Int |> ret
-            | SqlValue.Decimal d when
-                System.Decimal.Truncate d = d
-                && d >= decimal System.Int64.MinValue
-                && d <= decimal System.Int64.MaxValue
-                ->
-                int64 d |> SqlValue.Int |> ret
-            | _ -> fail ()
-
-        let asReal =
-            function
-            | SqlValue.Real f -> ret (vReal f)
-            | SqlValue.Int i -> float i |> vReal |> ret
-            | SqlValue.Bool b -> (if b then 1.0 else 0.0) |> vReal |> ret
-            | SqlValue.Decimal d -> float d |> vReal |> ret
-            | _ -> fail ()
-
-        let asDecimal v =
-            if not (isDecimalRepresentable v) then
-                fail ()
-            else
-                match v with
-                | SqlValue.Decimal _ -> ret v
-                | SqlValue.Int i -> decimal i |> SqlValue.Decimal |> ret
-                | SqlValue.Real f -> decimal f |> SqlValue.Decimal |> ret
-                | SqlValue.Bool b -> (if b then 1.0M else 0.0M) |> SqlValue.Decimal |> ret
-                | _ -> fail ()
-
-        let asDate =
-            function
-            | SqlValue.Date _ as v -> ret v
-            | SqlValue.Timestamp t -> System.DateOnly.FromDateTime t.UtcDateTime |> SqlValue.Date |> ret
-            | SqlValue.Text s ->
-                match tryParseDate s with
-                | Some d -> d |> SqlValue.Date |> ret
-                | None -> fail ()
-            | _ -> fail ()
-
-        let asTimestamp =
-            function
-            | SqlValue.Timestamp _ as v -> ret v
-            | SqlValue.Date d ->
-                System.DateTimeOffset(d.ToDateTime System.TimeOnly.MinValue, System.TimeSpan.Zero)
-                |> SqlValue.Timestamp
-                |> ret
-            | SqlValue.Text s ->
-                match tryParseTimestamp s with
-                | Some t -> t |> SqlValue.Timestamp |> ret
-                | None -> fail ()
-            | _ -> fail ()
-
         if isNull v then
             ret SqlValue.Null
         else
             match target with
             | DataType.Null -> ret SqlValue.Null
-            | DataType.Boolean -> asBoolean v
-            | DataType.Integer -> asInteger v
-            | DataType.Real -> asReal v
-            | DataType.Decimal -> asDecimal v
+            | DataType.Boolean -> asBoolean target v v
+            | DataType.Integer -> asInteger target v v
+            | DataType.Real -> asReal target v v
+            | DataType.Decimal -> asDecimal target v v
             | DataType.Text ->
                 match v with
                 | SqlValue.Text _ -> ret v
@@ -675,25 +697,26 @@ module internal SqlValue =
                 match v with
                 | SqlValue.Blob _ -> ret v
                 | SqlValue.Text s -> System.Text.Encoding.UTF8.GetBytes s |> SqlValue.Blob |> ret
-                | _ -> fail ()
-            | DataType.Date -> asDate v
-            | DataType.Timestamp -> asTimestamp v
+                | _ -> coerceFail target v
+            | DataType.Date -> asDate target v v
+            | DataType.Timestamp -> asTimestamp target v v
             | DataType.Uuid ->
                 match v with
                 | SqlValue.Uuid _ -> ret v
                 | SqlValue.Text s ->
                     match System.Guid.TryParse s with
                     | true, g -> g |> SqlValue.Uuid |> ret
-                    | _ -> fail ()
-                | _ -> fail ()
+                    | _ -> coerceFail target v
+                | _ -> coerceFail target v
+
+    /// CAST の変換失敗を型エラーにする。
+    let private castTextFail (target: DataType) (v: SqlValue) =
+        sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
+        |> DbError.typeError
+        |> err
 
     /// TEXT から数値・BOOLEAN への明示変換（CAST のみ。暗黙変換では行わない）。
     let private castText (target: DataType) (v: SqlValue) (s: string) =
-        let fail () =
-            sprintf "'%s' は '%s' に変換できません" (SqlLiteral.toSqlLiteral v) (DataType.toSqlName target)
-            |> DbError.typeError
-            |> err
-
         match target with
         | DataType.Integer ->
             match
@@ -704,7 +727,7 @@ module internal SqlValue =
                 )
             with
             | true, i -> ret (SqlValue.Int i)
-            | _ -> fail ()
+            | _ -> castTextFail target v
         | DataType.Real ->
             match
                 System.Double.TryParse(
@@ -714,7 +737,7 @@ module internal SqlValue =
                 )
             with
             | true, f -> ret (vReal f)
-            | _ -> fail ()
+            | _ -> castTextFail target v
         | DataType.Decimal ->
             match
                 System.Decimal.TryParse(
@@ -724,7 +747,7 @@ module internal SqlValue =
                 )
             with
             | true, d -> ret (SqlValue.Decimal d)
-            | _ -> fail ()
+            | _ -> castTextFail target v
         | DataType.Boolean ->
             match s.Trim().ToUpperInvariant() with
             | "TRUE"
@@ -733,7 +756,7 @@ module internal SqlValue =
             | "FALSE"
             | "F"
             | "0" -> ret FalseValue
-            | _ -> fail ()
+            | _ -> castTextFail target v
         | _ -> coerce target v
 
     /// CAST 用の明示変換。

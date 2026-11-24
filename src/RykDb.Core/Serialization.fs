@@ -57,22 +57,23 @@ module internal Reader =
         else
             ret (Cursor.advance count c)
 
-    /// 符号なし LEB128 を読む。
-    let private readVarintV =
-        let rec decode shift acc c =
-            if shift > 63 || Cursor.pos c >= Cursor.endPos c then
-                ValueNone
+    /// varint をデコードする本体。
+    [<TailCall>]
+    let rec private decodeVarintV (shift: int) (acc: uint64) (c: Cursor) =
+        if shift > 63 || Cursor.pos c >= Cursor.endPos c then
+            ValueNone
+        else
+            let b = (Cursor.data c).[Cursor.pos c]
+            let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
+            let next = Cursor.advance 1 c
+
+            if b &&& 0x80uy <> 0uy then
+                decodeVarintV (shift + 7) acc next
             else
-                let b = (Cursor.data c).[Cursor.pos c]
-                let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
-                let next = Cursor.advance 1 c
+                ValueSome struct (acc, next)
 
-                if b &&& 0x80uy <> 0uy then
-                    decode (shift + 7) acc next
-                else
-                    ValueSome struct (acc, next)
-
-        decode 0 0UL
+    /// 符号なし LEB128 を読む。
+    let private readVarintV = decodeVarintV 0 0UL
 
     let readVarint (c: Cursor) =
         match readVarintV c with
@@ -150,18 +151,25 @@ module internal Reader =
         readLengthPrefixed c
         |> Result.map (fun (bs, c) -> System.Text.Encoding.UTF8.GetString bs, c)
 
+    /// 残り件数だけ読み出してリストへ積む本体。
+    [<TailCall>]
+    let rec private readItemsLoop
+        (readOne: Cursor -> Result<'a * Cursor, DbError>)
+        (rest: uint64)
+        (acc: 'a list)
+        (c: Cursor)
+        =
+        if rest = 0UL then
+            ret (List.rev acc, c)
+        else
+            match readOne c with
+            | Ok(v, c') -> readItemsLoop readOne (rest - 1UL) (v :: acc) c'
+            | Error e -> err e
+
     /// count 件を 1件ずつ読み出してリストにする。
     /// 「1件読む」処理は readOne に切り出し、ループはここ 1箇所にまとめる。
     let readItems (readOne: Cursor -> Result<'a * Cursor, DbError>) (count: uint64) (c: Cursor) =
-        let rec readRemaining rest acc c =
-            if rest = 0UL then
-                ret (List.rev acc, c)
-            else
-                match readOne c with
-                | Ok(v, c') -> readRemaining (rest - 1UL) (v :: acc) c'
-                | Error e -> err e
-
-        readRemaining count [] c
+        readItemsLoop readOne count [] c
 
 /// 順序保持符号化 (order-preserving encoding)
 /// SSTable のマージはキーのバイト列比較で行うので、「バイト列の大小関係 = SQL の比較結果」でなければならない。
@@ -223,30 +231,33 @@ module internal OrderPreserving =
         let lo64 = uint64 (uint32 (mid64 % 10UL)) <<< 32 ||| uint64 lo
         hi / 10u, uint32 (mid64 / 10UL), uint32 (lo64 / 10UL), uint32 (lo64 % 10UL)
 
+    /// 96bit 非スケール値の桁を buffer の後ろから詰める。
+    [<TailCall>]
+    let rec private fillUnscaledDigits (buffer: byte array) (hi: uint32) (mid: uint32) (lo: uint32) (pos: int) =
+        if hi = 0u && mid = 0u && lo = 0u then
+            pos
+        else
+            let hi', mid', lo', digit = div10 hi mid lo
+            buffer.[pos] <- byte digit
+            fillUnscaledDigits buffer hi' mid' lo' (pos - 1)
+
+    /// 末尾の 0 を落として桁数を縮める。
+    [<TailCall>]
+    let rec private trimUnscaledDigits (buffer: byte array) (start: int) (count: int) =
+        if count > 1 && buffer.[start + count - 1] = 0uy then
+            trimUnscaledDigits buffer start (count - 1)
+        else
+            count
+
     /// 96bit 非スケール値の 10進桁を `Buffer.[Start]` から `Count` 個返す。
     /// 末尾の 0 は落として `Count` を縮め、落とす前の桁数を第4要素で返す。
     /// 指数は「元の桁数 - スケール」なので、落とした 0 は指数に影響しない。
     let private unscaledDigits (hi: uint32) (mid: uint32) (lo: uint32) =
         let buffer = Array.zeroCreate<byte> DecimalMaxDigits
-
-        let rec fill hi mid lo pos =
-            if hi = 0u && mid = 0u && lo = 0u then
-                pos
-            else
-                let hi', mid', lo', digit = div10 hi mid lo
-                buffer.[pos] <- byte digit
-                fill hi' mid' lo' (pos - 1)
-
-        let start = fill hi mid lo (DecimalMaxDigits - 1) + 1
+        let start = fillUnscaledDigits buffer hi mid lo (DecimalMaxDigits - 1) + 1
         let total = DecimalMaxDigits - start
 
-        let rec trim count =
-            if count > 1 && buffer.[start + count - 1] = 0uy then
-                trim (count - 1)
-            else
-                count
-
-        buffer, start, trim total, total
+        buffer, start, trimUnscaledDigits buffer start total, total
 
     let private writeOrderedDecimal (v: decimal) (w: Writer) =
         let bits = System.Decimal.GetBits v
@@ -284,39 +295,59 @@ module internal OrderPreserving =
                 yield System.Convert.ToByte(s.Substring(i * 2, 2), 16)
         |]
 
+    /// 0x00 を escape してペイロードと終端を書き込む。
+    let private writeEscapedPayload (bs: byte array) (w: Writer) =
+        let escaped =
+            bs
+            |> Array.collect (fun b -> if b = 0uy then [| Terminator; EscapeMarker |] else [| b |])
+
+        w |> Writer.writeBytes escaped |> Writer.writeByte Terminator
+
+    /// 型タグを書き込む。
+    let private writeTaggedValue (w: Writer) (tag: Tag) = w |> Writer.writeByte (byte tag)
+
+    /// フィールド終端を書き込む。
+    let private writeTerminator = Writer.writeByte Terminator
+
     /// 値をキーへ追加する（型タグ + escape 済みペイロード + 終端）。
     /// `SqlValue.Unloaded`（列マスクのプレースホルダ）は符号化できないため `InternalError` を返す。
     let writeValue (v: SqlValue) (w: Writer) =
-        let writeEscapedPayload bs w =
-            let escaped =
-                bs
-                |> Array.collect (fun b -> if b = 0uy then [| Terminator; EscapeMarker |] else [| b |])
-
-            w |> Writer.writeBytes escaped |> Writer.writeByte Terminator
-
-        let tagged tag = w |> Writer.writeByte (byte tag)
-        let terminate = Writer.writeByte Terminator
-
         match v with
-        | SqlValue.Null -> ret (tagged Tag.Null |> terminate)
-        | SqlValue.Bool b -> ret (tagged Tag.Bool |> Writer.writeByte (if b then 1uy else 0uy) |> terminate)
-        | SqlValue.Int i -> ret (tagged Tag.Int |> writeOrderedInt64 i |> terminate)
+        | SqlValue.Null -> ret (writeTaggedValue w Tag.Null |> writeTerminator)
+        | SqlValue.Bool b ->
+            ret (
+                writeTaggedValue w Tag.Bool
+                |> Writer.writeByte (if b then 1uy else 0uy)
+                |> writeTerminator
+            )
+        | SqlValue.Int i -> ret (writeTaggedValue w Tag.Int |> writeOrderedInt64 i |> writeTerminator)
         | SqlValue.Real f ->
             let bits =
-                tagged Tag.Real
+                writeTaggedValue w Tag.Real
                 |> Writer.uint64BE (uint64 (mapDouble (SqlValue.normalizeFloat f)))
 
-            ret (bits |> terminate)
-        | SqlValue.Decimal d -> ret (tagged Tag.Decimal |> writeOrderedDecimal d |> terminate)
+            ret (bits |> writeTerminator)
+        | SqlValue.Decimal d -> ret (writeTaggedValue w Tag.Decimal |> writeOrderedDecimal d |> writeTerminator)
         | SqlValue.Date d ->
             let days =
                 d.ToDateTime(System.TimeOnly.MinValue).Ticks / System.TimeSpan.TicksPerDay
 
-            ret (tagged Tag.Date |> writeOrderedInt64 days |> terminate)
-        | SqlValue.Timestamp t -> ret (tagged Tag.Timestamp |> writeOrderedInt64 t.UtcTicks |> terminate)
-        | SqlValue.Text s -> ret (writeEscapedPayload (System.Text.Encoding.UTF8.GetBytes s) (tagged Tag.Text))
-        | SqlValue.Blob bs -> ret (writeEscapedPayload bs (tagged Tag.Blob))
-        | SqlValue.Uuid g -> ret (tagged Tag.Uuid |> Writer.writeBytes (guidToOrderedBytes g) |> terminate)
+            ret (writeTaggedValue w Tag.Date |> writeOrderedInt64 days |> writeTerminator)
+        | SqlValue.Timestamp t ->
+            ret (
+                writeTaggedValue w Tag.Timestamp
+                |> writeOrderedInt64 t.UtcTicks
+                |> writeTerminator
+            )
+        | SqlValue.Text s ->
+            ret (writeEscapedPayload (System.Text.Encoding.UTF8.GetBytes s) (writeTaggedValue w Tag.Text))
+        | SqlValue.Blob bs -> ret (writeEscapedPayload bs (writeTaggedValue w Tag.Blob))
+        | SqlValue.Uuid g ->
+            ret (
+                writeTaggedValue w Tag.Uuid
+                |> Writer.writeBytes (guidToOrderedBytes g)
+                |> writeTerminator
+            )
         | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
     /// 固定長フィールドの終端（0x00）を検証する。
@@ -341,6 +372,31 @@ module internal OrderPreserving =
 
         System.BitConverter.Int64BitsToDouble bits
 
+    /// 終端を探す（0x00 0xFF は escape として飛ばす）。
+    [<TailCall>]
+    let rec private scanEscapedPayload (d: byte array) (finish: int) (i: int) (length: int) =
+        if i >= finish then
+            ValueNone
+        elif d.[i] = 0uy then
+            if i + 1 < finish && d.[i + 1] = 0xFFuy then
+                scanEscapedPayload d finish (i + 2) (length + 1)
+            else
+                ValueSome struct (i, length)
+        else
+            scanEscapedPayload d finish (i + 1) (length + 1)
+
+    /// escape を戻して出力配列へ詰める。
+    [<TailCall>]
+    let rec private fillEscapedPayload (d: byte array) (out: byte array) (terminator: int) (i: int) (j: int) =
+        if i >= terminator then
+            ()
+        elif d.[i] = 0uy then
+            out.[j] <- 0uy
+            fillEscapedPayload d out terminator (i + 2) (j + 1)
+        else
+            out.[j] <- d.[i]
+            fillEscapedPayload d out terminator (i + 1) (j + 1)
+
     /// escape されたペイロードを読む（0x00 0xFF を 0x00 に戻す）。
     /// 0xFF 以外が続く 0x00 を終端として扱う。
     let private readEscapedPayload (c: Cursor) =
@@ -348,68 +404,62 @@ module internal OrderPreserving =
         let start = Cursor.pos c
         let finish = Cursor.endPos c
 
-        let rec scan i length =
-            if i >= finish then
-                ValueNone
-            elif d.[i] = 0uy then
-                if i + 1 < finish && d.[i + 1] = 0xFFuy then
-                    scan (i + 2) (length + 1)
-                else
-                    ValueSome struct (i, length)
-            else
-                scan (i + 1) (length + 1)
-
-        let rec fill (out: byte array) terminator i j =
-            if i >= terminator then
-                ()
-            elif d.[i] = 0uy then
-                out.[j] <- 0uy
-                fill out terminator (i + 2) (j + 1)
-            else
-                out.[j] <- d.[i]
-                fill out terminator (i + 1) (j + 1)
-
-        match scan start 0 with
+        match scanEscapedPayload d finish start 0 with
         | ValueNone -> err (DbError.corruption "OrderPreserving: 文字列の終端がありません")
         | ValueSome struct (terminator, length) ->
             let out = Array.zeroCreate<byte> length
-            fill out terminator start 0
+            fillEscapedPayload d out terminator start 0
             ret (out, Cursor.advance (terminator + 1 - start) c)
+
+    /// DECIMAL の 1桁を復元する。
+    let private decimalDigit (negative: bool) (digits: byte array) (i: int) =
+        let d = if negative then 9 - int digits.[i] else int digits.[i]
+        if d < 0 || d > 9 then ValueNone else ValueSome d
+
+    /// 29桁すべてが 0..9 の範囲か検査する。
+    [<TailCall>]
+    let rec private decimalDigitsValid (negative: bool) (digits: byte array) (i: int) =
+        if i >= DecimalMaxDigits then
+            ValueSome()
+        else
+            match decimalDigit negative digits i with
+            | ValueSome _ -> decimalDigitsValid negative digits (i + 1)
+            | ValueNone -> ValueNone
+
+    /// 最後の非ゼロ桁の位置を返す。
+    [<TailCall>]
+    let rec private lastNonZeroDigit (negative: bool) (digits: byte array) (i: int) =
+        if i < 0 then
+            -1
+        else
+            match decimalDigit negative digits i with
+            | ValueSome d when d <> 0 -> i
+            | _ -> lastNonZeroDigit negative digits (i - 1)
+
+    /// 桁列を 96bit の非スケール値へ畳む。
+    [<TailCall>]
+    let rec private accumulateDigits
+        (negative: bool)
+        (digits: byte array)
+        (total: int)
+        (i: int)
+        (hi: uint64)
+        (mid: uint64)
+        (lo: uint64)
+        =
+        if i >= total then
+            struct (hi, mid, lo)
+        else
+            match decimalDigit negative digits i with
+            | ValueNone -> struct (hi, mid, lo)
+            | ValueSome d ->
+                let lo' = lo * 10UL + uint64 d
+                let mid' = mid * 10UL + (lo' >>> 32)
+                let hi' = hi * 10UL + (mid' >>> 32)
+                accumulateDigits negative digits total (i + 1) hi' (mid' &&& 0xFFFFFFFFUL) (lo' &&& 0xFFFFFFFFUL)
 
     /// DECIMAL を復号する（符号・指数・29 桁の補数）。
     let private readOrderedDecimal (c: Cursor) =
-        let digit negative (digits: byte array) i =
-            let d = if negative then 9 - int digits.[i] else int digits.[i]
-            if d < 0 || d > 9 then ValueNone else ValueSome d
-
-        let rec digitsValid negative digits i =
-            if i >= DecimalMaxDigits then
-                ValueSome()
-            else
-                match digit negative digits i with
-                | ValueSome _ -> digitsValid negative digits (i + 1)
-                | ValueNone -> ValueNone
-
-        let rec lastNonZero negative digits i =
-            if i < 0 then
-                -1
-            else
-                match digit negative digits i with
-                | ValueSome d when d <> 0 -> i
-                | _ -> lastNonZero negative digits (i - 1)
-
-        let rec accumulate negative digits total i hi mid lo =
-            if i >= total then
-                struct (hi, mid, lo)
-            else
-                match digit negative digits i with
-                | ValueNone -> struct (hi, mid, lo)
-                | ValueSome d ->
-                    let lo' = lo * 10UL + uint64 d
-                    let mid' = mid * 10UL + (lo' >>> 32)
-                    let hi' = hi * 10UL + (mid' >>> 32)
-                    accumulate negative digits total (i + 1) hi' (mid' &&& 0xFFFFFFFFUL) (lo' &&& 0xFFFFFFFFUL)
-
         Reader.readByte c
         >>= fun (sign, c1) ->
             Reader.readUint64BE c1
@@ -423,10 +473,10 @@ module internal OrderPreserving =
                         else
                             let negative = sign = 0uy
 
-                            match digitsValid negative digits 0 with
+                            match decimalDigitsValid negative digits 0 with
                             | ValueNone -> err (DbError.corruption "OrderPreserving: DECIMAL の桁が不正です")
                             | ValueSome() ->
-                                let total = lastNonZero negative digits (DecimalMaxDigits - 1) + 1
+                                let total = lastNonZeroDigit negative digits (DecimalMaxDigits - 1) + 1
 
                                 if total = 0 then
                                     ret (System.Decimal.Zero, c4)
@@ -442,7 +492,8 @@ module internal OrderPreserving =
                                         if scale < 0L || scale > 28L then
                                             err (DbError.corruption "OrderPreserving: DECIMAL のスケールが不正です")
                                         else
-                                            let struct (hi, mid, lo) = accumulate negative digits total 0 0UL 0UL 0UL
+                                            let struct (hi, mid, lo) =
+                                                accumulateDigits negative digits total 0 0UL 0UL 0UL
 
                                             if hi > 0xFFFFFFFFUL then
                                                 err (DbError.corruption "OrderPreserving: DECIMAL の桁数が大きすぎます")
@@ -556,28 +607,31 @@ module internal Hashing =
     // （FNV-1a は分布用途の hashBytes にのみ残す）。
     // slicing-by-8 で 1回に 8バイト進める。
 
-    let private crcTable0 =
-        let rec step n c =
-            if n = 0 then
-                c
-            elif c &&& 1u <> 0u then
-                step (n - 1) ((c >>> 1) ^^^ 0x82F63B78u)
-            else
-                step (n - 1) (c >>> 1)
+    /// CRC32C の 1ステップ（生成多項式の反射表現）。
+    [<TailCall>]
+    let rec private crcStep (n: int) (c: uint32) =
+        if n = 0 then
+            c
+        elif c &&& 1u <> 0u then
+            crcStep (n - 1) ((c >>> 1) ^^^ 0x82F63B78u)
+        else
+            crcStep (n - 1) (c >>> 1)
 
-        Array.init 256 (fun i -> step 8 (uint32 i))
+    let private crcTable0 = Array.init 256 (fun i -> crcStep 8 (uint32 i))
+
+    /// slicing-by-8 用の次のテーブルを計算する。
+    let private crcTableNext (prev: uint32 array) =
+        Array.init 256 (fun i -> (prev.[i] >>> 8) ^^^ crcTable0.[int (prev.[i] &&& 0xFFu)])
+
+    /// slicing-by-8 用のテーブルを組み立てる。
+    [<TailCall>]
+    let rec private crcTablesBuild (n: int) (acc: uint32 array list) =
+        match acc with
+        | prev :: _ when n > 0 -> crcTablesBuild (n - 1) (crcTableNext prev :: acc)
+        | _ -> acc |> List.rev |> Array.ofList
 
     /// slicing-by-8 用の 8テーブル。`Tables.[k].[i]` は k バイト後ろの寄与。
-    let private crcTables =
-        let next (prev: uint32 array) =
-            Array.init 256 (fun i -> (prev.[i] >>> 8) ^^^ crcTable0.[int (prev.[i] &&& 0xFFu)])
-
-        let rec build n acc =
-            match acc with
-            | prev :: _ when n > 0 -> build (n - 1) (next prev :: acc)
-            | _ -> acc |> List.rev |> Array.ofList
-
-        build 7 [ crcTable0 ]
+    let private crcTables = crcTablesBuild 7 [ crcTable0 ]
 
     /// 初期値と最終反転（CRC32C の標準パラメータ）。
     [<Literal>]
@@ -586,32 +640,32 @@ module internal Hashing =
     [<Literal>]
     let private CrcFinalXor = 0xFFFFFFFFu
 
+    /// CRC を範囲の終端まで進める本体。
+    [<TailCall>]
+    let rec private crcUpdateLoop (finish: int) (data: byte array) (i: int) (crc: uint32) =
+        if i + 8 <= finish then
+            let v =
+                System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(System.ReadOnlySpan<byte>(data, i, 8))
+                ^^^ uint64 crc
+
+            crcTables.[7].[int (v &&& 0xFFUL)]
+            ^^^ crcTables.[6].[int (v >>> 8 &&& 0xFFUL)]
+            ^^^ crcTables.[5].[int (v >>> 16 &&& 0xFFUL)]
+            ^^^ crcTables.[4].[int (v >>> 24 &&& 0xFFUL)]
+            ^^^ crcTables.[3].[int (v >>> 32 &&& 0xFFUL)]
+            ^^^ crcTables.[2].[int (v >>> 40 &&& 0xFFUL)]
+            ^^^ crcTables.[1].[int (v >>> 48 &&& 0xFFUL)]
+            ^^^ crcTables.[0].[int (v >>> 56 &&& 0xFFUL)]
+            |> crcUpdateLoop finish data (i + 8)
+        elif i < finish then
+            crcUpdateLoop finish data (i + 1) (crcTables.[0].[int (crc ^^^ uint32 data.[i] &&& 0xFFu)] ^^^ (crc >>> 8))
+        else
+            crc
+
     /// 範囲 [offset, offset + length) を 1つの連続入力として CRC を進める。
     /// チャンクをまたぐ場合は前のチャンクの戻り値をそのまま渡す。
     let private crcUpdate (crc: uint32) (data: byte array) (offset: int) (length: int) =
-        let finish = offset + length
-
-        let rec loop i crc =
-            if i + 8 <= finish then
-                let v =
-                    System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(System.ReadOnlySpan<byte>(data, i, 8))
-                    ^^^ uint64 crc
-
-                crcTables.[7].[int (v &&& 0xFFUL)]
-                ^^^ crcTables.[6].[int (v >>> 8 &&& 0xFFUL)]
-                ^^^ crcTables.[5].[int (v >>> 16 &&& 0xFFUL)]
-                ^^^ crcTables.[4].[int (v >>> 24 &&& 0xFFUL)]
-                ^^^ crcTables.[3].[int (v >>> 32 &&& 0xFFUL)]
-                ^^^ crcTables.[2].[int (v >>> 40 &&& 0xFFUL)]
-                ^^^ crcTables.[1].[int (v >>> 48 &&& 0xFFUL)]
-                ^^^ crcTables.[0].[int (v >>> 56 &&& 0xFFUL)]
-                |> loop (i + 8)
-            elif i < finish then
-                loop (i + 1) (crcTables.[0].[int (crc ^^^ uint32 data.[i] &&& 0xFFu)] ^^^ (crc >>> 8))
-            else
-                crc
-
-        loop offset crc
+        crcUpdateLoop (offset + length) data offset crc
 
     /// バイト列の 32bit チェックサム（CRC32C / Castagnoli）。
     let checksum (data: byte array) =
@@ -622,16 +676,18 @@ module internal Hashing =
     let checksumRange (data: byte array) (offset: int) (length: int) =
         CrcFinalXor ^^^ crcUpdate CrcInitial data offset length
 
+    /// チャンク列を順に畳む本体。
+    [<TailCall>]
+    let rec private checksumChunksLoop (chunks: byte array array) (i: int) (crc: uint32) =
+        if i >= chunks.Length then
+            crc
+        else
+            checksumChunksLoop chunks (i + 1) (crcUpdate crc chunks.[i] 0 chunks.[i].Length)
+
     /// 複数のチャンクを連結したものの 32bit チェックサム（CRC32C）。
     /// SSTable のメタデータ（meta / Bloom / index）をコピーせずに検証する。
     let checksumChunks (chunks: byte array array) =
-        let rec loop i crc =
-            if i >= chunks.Length then
-                crc
-            else
-                loop (i + 1) (crcUpdate crc chunks.[i] 0 chunks.[i].Length)
-
-        CrcFinalXor ^^^ loop 0 CrcInitial
+        CrcFinalXor ^^^ checksumChunksLoop chunks 0 CrcInitial
 
     /// ハッシュ値を攪拌する（splitmix64 相当）。
     /// FNV-1a は下位ビットに偏りがちで、Bloom filter のビット分布が悪くなるため。
@@ -664,14 +720,22 @@ module internal KeyBuilder =
         appendCols Writer.Empty indexCols
         >>= fun withIndex -> appendCols withIndex primaryCols |> Result.map Writer.toArray
 
+    /// プレフィックス一致を先頭から辿る。
+    [<TailCall>]
+    let rec private matchPrefix (key: byte array) (prefix: byte array) (i: int) =
+        if i >= prefix.Length then
+            true
+        elif key.[i] = prefix.[i] then
+            matchPrefix key prefix (i + 1)
+        else
+            false
+
     /// バイト列 key が prefix で始まるか。
     let startsWithPrefix (key: byte array) (prefix: byte array) =
-        let rec matchPrefix i =
-            if i >= prefix.Length then true
-            elif key.[i] = prefix.[i] then matchPrefix (i + 1)
-            else false
-
-        if key.Length < prefix.Length then false else matchPrefix 0
+        if key.Length < prefix.Length then
+            false
+        else
+            matchPrefix key prefix 0
 
 /// 行ペイロード用のコンパクト符号化。
 /// キーと異なり、行値には順序保持が不要なので varint で詰めて小さくする。
@@ -681,16 +745,17 @@ module internal ValueCodec =
     /// DISTINCT などの符号化でも同じビット列にして重複と見なす。
     let private normalizeDecimal (d: decimal) = if d = 0M then 0M else d
 
-    let private writeValue (w: Writer) =
-        let tagged tag = w |> Writer.writeByte (byte tag)
+    /// 型タグを書き込む。
+    let private writeTagged (w: Writer) (tag: byte) = w |> Writer.writeByte (byte tag)
 
+    let private writeValue (w: Writer) =
         function
-        | SqlValue.Null -> ret (tagged 0uy)
-        | SqlValue.Bool b -> ret (tagged 1uy |> Writer.bool b)
-        | SqlValue.Int i -> ret (tagged 2uy |> Writer.int64LE i)
+        | SqlValue.Null -> ret (writeTagged w 0uy)
+        | SqlValue.Bool b -> ret (writeTagged w 1uy |> Writer.bool b)
+        | SqlValue.Int i -> ret (writeTagged w 2uy |> Writer.int64LE i)
         | SqlValue.Real f ->
             let bits =
-                tagged 3uy
+                writeTagged w 3uy
                 |> Writer.int64LE (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits)
 
             ret bits
@@ -698,14 +763,18 @@ module internal ValueCodec =
             let unfolded =
                 normalizeDecimal d
                 |> System.Decimal.GetBits
-                |> Array.fold (fun w b -> w |> Writer.int64LE (int64 b)) (tagged 4uy)
+                |> Array.fold (fun w b -> w |> Writer.int64LE (int64 b)) (writeTagged w 4uy)
 
             ret unfolded
-        | SqlValue.Text s -> ret (tagged 5uy |> Writer.str s)
-        | SqlValue.Blob bs -> ret (tagged 6uy |> Writer.lengthPrefixed bs)
-        | SqlValue.Date d -> ret (tagged 7uy |> Writer.int64LE (d.ToDateTime(System.TimeOnly.MinValue).Ticks))
-        | SqlValue.Timestamp t -> ret (tagged 8uy |> Writer.int64LE t.UtcTicks)
-        | SqlValue.Uuid g -> ret (tagged 9uy |> Writer.writeBytes (g.ToByteArray()))
+        | SqlValue.Text s -> ret (writeTagged w 5uy |> Writer.str s)
+        | SqlValue.Blob bs -> ret (writeTagged w 6uy |> Writer.lengthPrefixed bs)
+        | SqlValue.Date d ->
+            ret (
+                writeTagged w 7uy
+                |> Writer.int64LE (d.ToDateTime(System.TimeOnly.MinValue).Ticks)
+            )
+        | SqlValue.Timestamp t -> ret (writeTagged w 8uy |> Writer.int64LE t.UtcTicks)
+        | SqlValue.Uuid g -> ret (writeTagged w 9uy |> Writer.writeBytes (g.ToByteArray()))
         | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
     let private readValueSlow (c: Cursor) =
@@ -784,16 +853,16 @@ module internal ValueCodec =
     /// 永続化（WAL / SSTable）には使わないこと
     /// （`writeValues` は `Unloaded` を拒否する）。
     /// </remarks>
+    /// 一時ファイル用の 1値を書き出す（Unloaded はプレースホルダとして残す）。
+    let private writeSparse (w: Writer) =
+        function
+        | SqlValue.Unloaded -> ret (w |> Writer.writeByte 10uy)
+        | v -> writeValue w v
+
     let writeValuesSparse (values: SqlValue seq) (w: Writer) =
         let arr = Seq.toArray values
         let withCount = w |> Writer.varint (uint64 arr.Length)
-
-        let write w =
-            function
-            | SqlValue.Unloaded -> ret (w |> Writer.writeByte 10uy)
-            | v -> writeValue w v
-
-        foldOk write withCount arr
+        foldOk writeSparse withCount arr
 
     let private writeInt64LETo (out: byte array) (pos: int) (v: int64) =
         let u = uint64 v
@@ -883,6 +952,23 @@ module internal ValueCodec =
         | ValueSome struct (v, c) -> ret (v, c)
         | ValueNone -> readValueSlow c
 
+    /// 配列へ値を読み込む本体。
+    [<TailCall>]
+    let rec private fillReadValues (values: SqlValue array) (count: int) (i: int) (c: Cursor) =
+        if i >= count then
+            ret (values, c)
+        else
+            match readInt c with
+            | ValueSome struct (v, c') ->
+                values.[i] <- v
+                fillReadValues values count (i + 1) c'
+            | ValueNone ->
+                match readValue c with
+                | Ok(v, c') ->
+                    values.[i] <- v
+                    fillReadValues values count (i + 1) c'
+                | Error e -> err e
+
     let readValues (c: Cursor) =
         result {
             let! n, c = Reader.readVarint c
@@ -892,23 +978,7 @@ module internal ValueCodec =
             else
                 let count = int n
                 let values = Array.zeroCreate<SqlValue> count
-
-                let rec fill i c =
-                    if i >= count then
-                        ret (values, c)
-                    else
-                        match readInt c with
-                        | ValueSome struct (v, c') ->
-                            values.[i] <- v
-                            fill (i + 1) c'
-                        | ValueNone ->
-                            match readValue c with
-                            | Ok(v, c') ->
-                                values.[i] <- v
-                                fill (i + 1) c'
-                            | Error e -> err e
-
-                return! fill 0 c
+                return! fillReadValues values count 0 c
         }
 
     /// 長さ付きの値を読み飛ばす（マスク復号用）。
@@ -937,6 +1007,27 @@ module internal ValueCodec =
             | 9uy -> ret (Cursor.advance 16 c)
             | _ -> err (sprintf "ValueCodec: 不明な型タグ %d" (int tag) |> DbError.corruption)
 
+    /// マスク付きで配列へ値を読み込む本体（false の列は読み飛ばす）。
+    [<TailCall>]
+    let rec private fillReadValuesMasked (mask: bool array) (values: SqlValue array) (count: int) (i: int) (c: Cursor) =
+        if i >= count then
+            ret (values, c)
+        else if i < mask.Length && not mask.[i] then
+            match skipValue c with
+            | Ok c' -> fillReadValuesMasked mask values count (i + 1) c'
+            | Error e -> err e
+        else
+            match readInt c with
+            | ValueSome struct (v, c') ->
+                values.[i] <- v
+                fillReadValuesMasked mask values count (i + 1) c'
+            | ValueNone ->
+                match readValue c with
+                | Ok(v, c') ->
+                    values.[i] <- v
+                    fillReadValuesMasked mask values count (i + 1) c'
+                | Error e -> err e
+
     /// 列マスクに従って値の並びを復号する。
     /// `mask.[i] = false` の列は `SqlValue.Unloaded` を置き、読み飛ばす。
     let readValuesMasked (mask: bool array) (c: Cursor) =
@@ -948,27 +1039,7 @@ module internal ValueCodec =
             else
                 let count = int n
                 let values = Array.create count SqlValue.Unloaded
-
-                let rec fill i c =
-                    if i >= count then
-                        ret (values, c)
-                    else if i < mask.Length && not mask.[i] then
-                        match skipValue c with
-                        | Ok c' -> fill (i + 1) c'
-                        | Error e -> err e
-                    else
-                        match readInt c with
-                        | ValueSome struct (v, c') ->
-                            values.[i] <- v
-                            fill (i + 1) c'
-                        | ValueNone ->
-                            match readValue c with
-                            | Ok(v, c') ->
-                                values.[i] <- v
-                                fill (i + 1) c'
-                            | Error e -> err e
-
-                return! fill 0 c
+                return! fillReadValuesMasked mask values count 0 c
         }
 
     /// 固定長の値の符号化サイズ（型タグ込み）。

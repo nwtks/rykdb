@@ -44,7 +44,7 @@ type DbError =
 
 [<RequireQualifiedAccess>]
 module DbError =
-    let create kind message =
+    let create (kind: ErrorKind) (message: string) =
         {
             Kind = kind
             Message = message
@@ -54,7 +54,7 @@ module DbError =
 
     /// 構文エラー。
     /// 字句・構文解析器が持つ位置（行・列）を伴う。
-    let syntax message (position: Position) =
+    let syntax (message: string) (position: Position) =
         {
             Kind = ErrorKind.SyntaxError
             Message = message
@@ -62,21 +62,21 @@ module DbError =
             Detail = None
         }
 
-    let inline name message = create ErrorKind.NameError message
-    let inline typeError message = create ErrorKind.TypeError message
+    let inline name (message: string) = create ErrorKind.NameError message
+    let inline typeError (message: string) = create ErrorKind.TypeError message
 
-    let inline constraintViolation message =
+    let inline constraintViolation (message: string) =
         create ErrorKind.ConstraintViolation message
 
-    let inline notFound message = create ErrorKind.NotFound message
-    let inline alreadyExists message = create ErrorKind.AlreadyExists message
-    let inline capacity message = create ErrorKind.CapacityError message
+    let inline notFound (message: string) = create ErrorKind.NotFound message
+    let inline alreadyExists (message: string) = create ErrorKind.AlreadyExists message
+    let inline capacity (message: string) = create ErrorKind.CapacityError message
 
-    let inline corruption message =
+    let inline corruption (message: string) =
         create ErrorKind.CorruptionError message
 
-    let inline conflict message = create ErrorKind.ConflictError message
-    let inline internalError message = create ErrorKind.InternalError message
+    let inline conflict (message: string) = create ErrorKind.ConflictError message
+    let inline internalError (message: string) = create ErrorKind.InternalError message
 
     /// .NET の I/O 例外を DbError に包む。
     let io (e: exn) =
@@ -181,15 +181,17 @@ module internal ResultOps =
     /// 最初の Error で打ち切り、残りの項目は列挙しない（`foldOk` と同じ規則）。
     /// 複数の Error があっても返るのは最初の 1つ。
     /// `seq` は 1回だけ列挙するので、1回限りの列挙子でも渡せる。
-    let all (rs: Result<'a, DbError> seq) =
-        let rec gather (e: System.Collections.Generic.IEnumerator<Result<'a, DbError>>) (acc: 'a list) =
-            if not (e.MoveNext()) then
-                ret (List.rev acc)
-            else
-                match e.Current with
-                | Error e -> Error e
-                | Ok v -> gather e (v :: acc)
+    /// Result 列を先頭から畳み、最初の Error で打ち切って値を集める。
+    [<TailCall>]
+    let rec private gather (e: System.Collections.Generic.IEnumerator<Result<'a, DbError>>) (acc: 'a list) =
+        if not (e.MoveNext()) then
+            ret (List.rev acc)
+        else
+            match e.Current with
+            | Error e -> Error e
+            | Ok v -> gather e (v :: acc)
 
+    let all (rs: Result<'a, DbError> seq) =
         use e = rs.GetEnumerator()
         gather e []
 

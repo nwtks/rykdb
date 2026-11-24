@@ -86,15 +86,17 @@ module internal DropCleanupRecovery =
         else
             false
 
-    let recover (store: RowStore) (catalog: Catalog) (mgr: TransactionManager) =
-        let rec clear (currentStore, currentMgr) spaces =
-            match spaces with
-            | [] -> ret (currentStore, currentMgr)
-            | space :: tail ->
-                match RowStore.clearKeyspaceChunks currentMgr space currentStore with
-                | Ok next -> clear next tail
-                | Error e -> err e
+    /// ジャーナルに残った keyspace を順に掃除し、更新後の store と manager を返す。
+    [<TailCall>]
+    let rec private clear (currentStore: RowStore, currentMgr: TransactionManager) (spaces: string list) =
+        match spaces with
+        | [] -> ret (currentStore, currentMgr)
+        | space :: tail ->
+            match RowStore.clearKeyspaceChunks currentMgr space currentStore with
+            | Ok next -> clear next tail
+            | Error e -> err e
 
+    let recover (store: RowStore) (catalog: Catalog) (mgr: TransactionManager) =
         DropCleanup.pending store.Root
         >>= (List.filter (shouldClean catalog) >> clear (store, mgr))
         >>= fun ready ->

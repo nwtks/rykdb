@@ -60,16 +60,16 @@ module internal Op =
     /// 返す値は `OpStep`（成功値は構造体なので `Ok` を確保しない）。
     let compute (f: unit -> OpStep) = Op.Compute f
 
+    /// 配列の残りを順に返す（`ofArray` の走査）。
+    let rec private rowsFrom (rows: SqlValue array array) (i: int) =
+        if i >= rows.Length then
+            Empty
+        else
+            compute (fun () -> OpStep.OpRow(rows.[i], rowsFrom rows (i + 1)))
+
     /// 配列を順に返す演算子。
     /// 次の行は呼び出すたびに計算する。
-    let ofArray (rows: SqlValue array array) =
-        let rec rowsFrom i =
-            if i >= rows.Length then
-                Empty
-            else
-                compute (fun () -> OpStep.OpRow(rows.[i], rowsFrom (i + 1)))
-
-        rowsFrom 0
+    let ofArray (rows: SqlValue array array) = rowsFrom rows 0
 
     /// 1行取り出す。
     let next =
@@ -98,19 +98,19 @@ module internal Op =
             | DbErr e -> OpStep.OpError e
             | DbOk r -> OpStep.OpRow(r, map f nxt))
 
+    /// 述語に合う行まで読み飛ばす（`filter` の走査）。
+    let rec private filterSeekMatch (p: SqlValue array -> DbResult<bool>) (cur: Op) =
+        pull
+            (fun row nxt ->
+                match p row with
+                | DbOk true -> OpStep.OpRow(row, filterSeekMatch p nxt)
+                | DbOk false -> next (filterSeekMatch p nxt)
+                | DbErr e -> OpStep.OpError e)
+            cur
+
     /// 述語で弾く。
     /// 偽の行は読み飛ばして次へ進む。
-    let filter (p: SqlValue array -> DbResult<bool>) =
-        let rec seekMatch cur =
-            pull
-                (fun row nxt ->
-                    match p row with
-                    | DbOk true -> OpStep.OpRow(row, seekMatch nxt)
-                    | DbOk false -> next (seekMatch nxt)
-                    | DbErr e -> OpStep.OpError e)
-                cur
-
-        seekMatch
+    let filter (p: SqlValue array -> DbResult<bool>) = filterSeekMatch p
 
     /// 先頭 n 行だけ。
     /// n <= 0 は 0 行（`LIMIT 0` は 0 行）。
@@ -122,14 +122,11 @@ module internal Op =
             pull (fun row nxt -> OpStep.OpRow(row, take (n - 1) nxt)) src
 
     /// 先頭 n行を読み飛ばす。
-    let skip =
-        let rec drop left cur =
-            if left <= 0 then
-                cur
-            else
-                pull (fun _ nxt -> next (drop (left - 1) nxt)) cur
-
-        drop
+    let rec skip (left: int) (cur: Op) =
+        if left <= 0 then
+            cur
+        else
+            pull (fun _ nxt -> next (skip (left - 1) nxt)) cur
 
     /// 2つの演算子を順に連結する（左をすべて出してから右）。
     /// 右は左が尽きるまで評価しない（`compute` の遅延を保つ）。
@@ -140,37 +137,46 @@ module internal Op =
             | OpStep.OpError e -> OpStep.OpError e
             | OpStep.OpRow(row, nxt) -> OpStep.OpRow(row, append nxt second))
 
+    /// 上限超過のエラーを作る。
+    let private resultTooLarge (maxRows: int64) (maxBytes: int64) =
+        sprintf
+            "SELECT 結果が上限を超えました（上限: %s 行 / %s バイト）。LIMIT を付けるか、SessionOptions で上限を変更するか、Session.TryOpenReader で 1行ずつ読んでください"
+            (if maxRows >= 0L then sprintf "%d" maxRows else "無制限")
+            (if maxBytes >= 0L then sprintf "%d" maxBytes else "無制限")
+        |> DbError.capacity
+        |> err
+
+    /// 上限つき materialize の走査本体（末尾再帰）。
+    [<TailCall>]
+    let rec private drainRows
+        (rowLimit: bool)
+        (byteLimit: bool)
+        (maxRows: int64)
+        (maxBytes: int64)
+        (acc: SqlValue array list)
+        (count: int64)
+        (bytes: int64)
+        (cur: Op)
+        =
+        match next cur with
+        | OpStep.OpError e -> err e
+        | OpStep.OpDone -> ret (List.rev acc |> List.toArray)
+        | OpStep.OpRow(row, nxt) ->
+            if rowLimit && count >= maxRows then
+                resultTooLarge maxRows maxBytes
+            else
+                let rowBytes = int64 (ValueCodec.managedRowBytes row)
+
+                if byteLimit && rowBytes > maxBytes - bytes then
+                    resultTooLarge maxRows maxBytes
+                else
+                    drainRows rowLimit byteLimit maxRows maxBytes (row :: acc) (count + 1L) (bytes + rowBytes) nxt
+
     /// 全行を上限つきで配列に materialize する。
     /// 上限を超えたら `CapacityError` を返し、部分結果は返さない。
     /// 上限が負なら無制限（`SessionOptions` の `-1`、または `ResultLimits.Unlimited`）。
     let toArrayLimited (maxRows: int64) (maxBytes: int64) (op: Op) =
-        let rowLimit = maxRows >= 0L
-        let byteLimit = maxBytes >= 0L
-
-        let tooLarge () =
-            sprintf
-                "SELECT 結果が上限を超えました（上限: %s 行 / %s バイト）。LIMIT を付けるか、SessionOptions で上限を変更するか、Session.TryOpenReader で 1行ずつ読んでください"
-                (if rowLimit then sprintf "%d" maxRows else "無制限")
-                (if byteLimit then sprintf "%d" maxBytes else "無制限")
-            |> DbError.capacity
-            |> err
-
-        let rec drain acc count bytes cur =
-            match next cur with
-            | OpStep.OpError e -> err e
-            | OpStep.OpDone -> ret (List.rev acc |> List.toArray)
-            | OpStep.OpRow(row, nxt) ->
-                if rowLimit && count >= maxRows then
-                    tooLarge ()
-                else
-                    let rowBytes = int64 (ValueCodec.managedRowBytes row)
-
-                    if byteLimit && rowBytes > maxBytes - bytes then
-                        tooLarge ()
-                    else
-                        drain (row :: acc) (count + 1L) (bytes + rowBytes) nxt
-
-        drain [] 0L 0L op
+        drainRows (maxRows >= 0L) (maxBytes >= 0L) maxRows maxBytes [] 0L 0L op
 
     /// 全行を配列に materialize する（無制限）。
     let toArray = toArrayLimited System.Int64.MaxValue System.Int64.MaxValue

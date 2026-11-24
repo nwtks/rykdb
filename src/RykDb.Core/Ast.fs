@@ -408,32 +408,38 @@ and [<RequireQualifiedAccess; NoComparison; NoEquality>] internal Statement =
     | Rollback
 
 module internal Expr =
+    /// 子のリストを左から順に step へ渡して組み直す。
+    [<TailCall>]
+    let rec private mapChildrenListLoop (step: 's -> Expr -> 's * Expr) (acc: Expr list) (state: 's) =
+        function
+        | [] -> state, List.rev acc
+        | x :: rest ->
+            let state, x' = step state x
+            mapChildrenListLoop step (x' :: acc) state rest
+
+    /// 子のリストを空のアキュムレータから畳み込む。
+    let private mapChildrenList (step: 's -> Expr -> 's * Expr) (state: 's) (items: Expr list) =
+        mapChildrenListLoop step [] state items
+
+    /// (WHEN, THEN) の対を左から順に step へ渡して組み直す。
+    [<TailCall>]
+    let rec private mapChildrenPairsLoop (step: 's -> Expr -> 's * Expr) (acc: (Expr * Expr) list) (state: 's) =
+        function
+        | [] -> state, List.rev acc
+        | (w, t) :: rest ->
+            let state, w' = step state w
+            let state, t' = step state t
+            mapChildrenPairsLoop step ((w', t') :: acc) state rest
+
+    /// 対のリストを空のアキュムレータから畳み込む。
+    let private mapChildrenPairs (step: 's -> Expr -> 's * Expr) (state: 's) (items: (Expr * Expr) list) =
+        mapChildrenPairsLoop step [] state items
+
     /// 子を左から右へ 1つずつ `step` に渡し、組み直した子で親を作る。
     /// 状態を引き回すので、子の列挙（`children`）と子の差し替え（`plugChildren`）の
     /// **両方をこの 1箇所から導出**できる。
     /// ノードを追加したときに直すのはこの match だけ。
     let private mapChildrenState (step: 's -> Expr -> 's * Expr) (state: 's) =
-        let mapList =
-            let rec loop acc state =
-                function
-                | [] -> state, List.rev acc
-                | x :: rest ->
-                    let state, x' = step state x
-                    loop (x' :: acc) state rest
-
-            loop []
-
-        let mapPairs =
-            let rec loop acc state =
-                function
-                | [] -> state, List.rev acc
-                | (w, t) :: rest ->
-                    let state, w' = step state w
-                    let state, t' = step state t
-                    loop ((w', t') :: acc) state rest
-
-            loop []
-
         function
         | Expr.Literal _
         | Expr.Column _
@@ -465,7 +471,7 @@ module internal Expr =
             state, Expr.Between(x', lo', hi', neg)
         | Expr.InList(x, xs, neg) ->
             let state, x' = step state x
-            let state, xs' = mapList state xs
+            let state, xs' = mapChildrenList step state xs
             state, Expr.InList(x', xs', neg)
         | Expr.InSubquery(x, sel, neg) ->
             let state, x' = step state x
@@ -483,7 +489,7 @@ module internal Expr =
                 let state, esc' = step state esc
                 state, Expr.Like(x', p', neg, Some esc')
         | Expr.Case(branches, elseE) ->
-            let state, branches' = mapPairs state branches
+            let state, branches' = mapChildrenPairs step state branches
 
             match elseE with
             | None -> state, Expr.Case(branches', None)
@@ -491,7 +497,7 @@ module internal Expr =
                 let state, else' = step state elseExpr
                 state, Expr.Case(branches', Some else')
         | Expr.FuncCall(n, args) ->
-            let state, args' = mapList state args
+            let state, args' = mapChildrenList step state args
             state, Expr.FuncCall(n, args')
         | Expr.Cast(x, dt) ->
             let state, x' = step state x
@@ -505,6 +511,12 @@ module internal Expr =
     let internal children (e: Expr) =
         mapChildrenState (fun acc x -> x :: acc, x) [] e |> fst |> List.rev
 
+    /// 残りの子を順に差し替える `mapChildrenState` の step。
+    let private plugChildrenStep (remaining: 'a list, complete: bool) (original: 'a) =
+        match remaining with
+        | kid :: tail -> (tail, complete), kid
+        | [] -> ([], false), original
+
     /// `children` の逆変換。子の列を親ノードへ戻して式を組み直す。
     /// 自分では再帰しない（再帰は `rewriteWithC` / `rewrite` が行う）。
     /// <remarks>
@@ -512,12 +524,7 @@ module internal Expr =
     /// （arity がずれるとここが最初に落ちる。`AstTests` が全ノード種で検査する）。
     /// </remarks>
     let internal plugChildren (kids: Expr list) (e: Expr) =
-        let step (remaining, complete) original =
-            match remaining with
-            | kid :: tail -> (tail, complete), kid
-            | [] -> ([], false), original
-
-        let (leftover, complete), parent = mapChildrenState step (kids, true) e
+        let (leftover, complete), parent = mapChildrenState plugChildrenStep (kids, true) e
 
         if complete && List.isEmpty leftover then
             ret parent
@@ -549,6 +556,37 @@ module internal Expr =
         | Visit of Expr
         | Arrive of Expr
 
+    /// 書き換え機のループ（`rewriteWithC` の本体）。
+    let rec private rewriteLoop
+        (rewriteLeaf: Expr -> (Expr -> Result<'r, DbError>) -> Result<'r, DbError>)
+        (k: Expr -> Result<'r, DbError>)
+        (frames: RewriteFrame list)
+        (step: RewriteStep)
+        =
+        match step with
+        | Visit x ->
+            rewriteLeaf x (fun x2 ->
+                match children x2 with
+                | [] -> rewriteLoop rewriteLeaf k frames (Arrive x2)
+                | c :: rest -> rewriteLoop rewriteLeaf k ({ Parent = x2; Done = []; Rest = rest } :: frames) (Visit c))
+        | Arrive v ->
+            match frames with
+            | [] -> k v
+            | frame :: more ->
+                match frame.Rest with
+                | c :: rest ->
+                    let next =
+                        { frame with
+                            Done = v :: frame.Done
+                            Rest = rest
+                        }
+
+                    rewriteLoop rewriteLeaf k (next :: more) (Visit c)
+                | [] ->
+                    match plugChildren (v :: frame.Done |> List.rev) frame.Parent with
+                    | Ok parent -> rewriteLoop rewriteLeaf k more (Arrive parent)
+                    | Error e -> err e
+
     /// 葉の書き換え関数で式を組み直す（CPS 版）。
     /// <remarks>
     /// `rewriteLeaf` は「書き換えた式を受け取る継続」を取る。
@@ -560,33 +598,8 @@ module internal Expr =
         (rewriteLeaf: Expr -> (Expr -> Result<'r, DbError>) -> Result<'r, DbError>)
         (k: Expr -> Result<'r, DbError>)
         (root: Expr)
-        : Result<'r, DbError> =
-        let rec loop (frames: RewriteFrame list) =
-            function
-            | Visit x ->
-                rewriteLeaf x (fun x2 ->
-                    match children x2 with
-                    | [] -> loop frames (Arrive x2)
-                    | c :: rest -> loop ({ Parent = x2; Done = []; Rest = rest } :: frames) (Visit c))
-            | Arrive v ->
-                match frames with
-                | [] -> k v
-                | frame :: more ->
-                    match frame.Rest with
-                    | c :: rest ->
-                        let next =
-                            { frame with
-                                Done = v :: frame.Done
-                                Rest = rest
-                            }
-
-                        loop (next :: more) (Visit c)
-                    | [] ->
-                        match plugChildren (v :: frame.Done |> List.rev) frame.Parent with
-                        | Ok parent -> loop more (Arrive parent)
-                        | Error e -> err e
-
-        loop [] (Visit root)
+        =
+        rewriteLoop rewriteLeaf k [] (Visit root)
 
     /// 葉の書き換え関数で式を組み直す（末尾再帰。式の深さに依存せずスタックは一定）。
     /// 葉の書き換えが失敗する版（束縛・集約の読み替えなど）。
@@ -596,22 +609,25 @@ module internal Expr =
     /// 葉の書き換え関数で式を組み直す。
     let rewrite (rewriteLeaf: Expr -> Expr) = rewriteWith (rewriteLeaf >> ret)
 
+    /// リストを逆順にしてアキュムレータへ積む。
+    [<TailCall>]
+    let rec private foldRevInto (acc: 'a list) =
+        function
+        | [] -> acc
+        | x :: rest -> foldRevInto (x :: acc) rest
+
+    /// 明示スタックで式を pre-order にたどり、状態を畳み込む。
+    [<TailCall>]
+    let rec private foldExprStack (f: 's -> Expr -> 's) (acc: 's) =
+        function
+        | [] -> acc
+        | e :: rest ->
+            let acc2 = f acc e
+            children e |> List.rev |> foldRevInto rest |> foldExprStack f acc2
+
     /// 式木を明示スタックで pre-order にたどり、各ノードについて状態を畳み込む。
     /// 走査順は「根 → 子を左から右へ」。
-    let fold (f: 's -> Expr -> 's) (state: 's) (root: Expr) =
-        let rec revInto acc =
-            function
-            | [] -> acc
-            | x :: rest -> revInto (x :: acc) rest
-
-        let rec foldStack acc =
-            function
-            | [] -> acc
-            | e :: rest ->
-                let acc2 = f acc e
-                children e |> List.rev |> revInto rest |> foldStack acc2
-
-        foldStack state [ root ]
+    let fold (f: 's -> Expr -> 's) (state: 's) (root: Expr) = foldExprStack f state [ root ]
 
     /// 式中のすべての列参照を列挙する。
     /// 束縛と空き列判定に使う。
@@ -685,159 +701,170 @@ module internal Expr =
         /// 式と、その後に出力する項目
         | Sub of Expr * PrintStep list
 
-    /// 式をテキストへ戻す（EXPLAIN やエラーメッセージ用）。
-    /// 「式」と「その式を出したあとに吐く文字列」を 1本のスタックで表現し、末尾再帰で処理する。
-    /// writeSteps x のあとに put ")" と書くと再帰呼び出しが末尾位置にならず、
-    /// 深い式（1万段超）でスタックを食うため。
-    let toDisplayString (e: Expr) =
-        let sb = System.Text.StringBuilder()
-        let put (s: string) = sb.Append s |> ignore
-        let text s = Text s
-        let sub x closer = Sub(x, closer)
+    /// 表示項目を StringBuilder へ書き出す。
+    let private displayPut (sb: System.Text.StringBuilder) (s: string) = sb.Append s |> ignore
 
-        let rec writeSteps =
-            function
-            | [] -> ()
-            | Text s :: rest ->
-                put s
-                writeSteps rest
-            | Sub(e, closer) :: rest ->
-                let next = closer @ rest
+    /// 文字列の表示項目を作る。
+    let private displayText (s: string) = Text s
 
-                match e with
-                | Expr.Literal l ->
-                    put (SqlLiteral.toSqlLiteral l.ToSqlValue)
-                    writeSteps next
-                | Expr.Column c ->
-                    put c.Display
-                    writeSteps next
-                | Expr.Name n ->
-                    put n
-                    writeSteps next
-                | Expr.Star ->
-                    put "*"
-                    writeSteps next
-                | Expr.QualifiedStar q ->
-                    put q
-                    put ".*"
-                    writeSteps next
-                | Expr.Unary(op, x) ->
-                    put "("
-                    put op.Display
-                    put " "
-                    sub x [ text ")" ] :: next |> writeSteps
-                | Expr.Binary(op, a, b) ->
-                    put "("
+    /// 式と後続項目の表示項目を作る。
+    let private displaySub (x: Expr) (closer: PrintStep list) = Sub(x, closer)
 
-                    sub a [ text " "; text op.Display; text " " ] :: sub b [ text ")" ] :: next
-                    |> writeSteps
-                | Expr.IsNull(x, neg) ->
-                    put "("
+    /// 表示項目を末尾再帰で書き出す（式と後続項目を 1本のスタックで処理）。
+    [<TailCall>]
+    let rec private writeSteps
+        (put: string -> unit)
+        (text: string -> PrintStep)
+        (sub: Expr -> PrintStep list -> PrintStep)
+        =
+        function
+        | [] -> ()
+        | Text s :: rest ->
+            put s
+            writeSteps put text sub rest
+        | Sub(e, closer) :: rest ->
+            let next = closer @ rest
 
-                    sub x [ text (if neg then " IS NOT NULL)" else " IS NULL)") ] :: next
-                    |> writeSteps
-                | Expr.IsTruth(x, expected, neg) ->
-                    put "("
+            match e with
+            | Expr.Literal l ->
+                put (SqlLiteral.toSqlLiteral l.ToSqlValue)
+                writeSteps put text sub next
+            | Expr.Column c ->
+                put c.Display
+                writeSteps put text sub next
+            | Expr.Name n ->
+                put n
+                writeSteps put text sub next
+            | Expr.Star ->
+                put "*"
+                writeSteps put text sub next
+            | Expr.QualifiedStar q ->
+                put q
+                put ".*"
+                writeSteps put text sub next
+            | Expr.Unary(op, x) ->
+                put "("
+                put op.Display
+                put " "
+                sub x [ text ")" ] :: next |> writeSteps put text sub
+            | Expr.Binary(op, a, b) ->
+                put "("
 
-                    let label =
-                        match expected with
-                        | TruthValue.True -> "TRUE"
-                        | TruthValue.False -> "FALSE"
-                        | TruthValue.Unknown -> "UNKNOWN"
+                sub a [ text " "; text op.Display; text " " ] :: sub b [ text ")" ] :: next
+                |> writeSteps put text sub
+            | Expr.IsNull(x, neg) ->
+                put "("
 
-                    let op = if neg then " IS NOT " else " IS "
-                    sub x [ text (op + label + ")") ] :: next |> writeSteps
-                | Expr.Between(x, a, b, neg) ->
-                    put "("
+                sub x [ text (if neg then " IS NOT NULL)" else " IS NULL)") ] :: next
+                |> writeSteps put text sub
+            | Expr.IsTruth(x, expected, neg) ->
+                put "("
 
-                    sub x [ text (if neg then " NOT BETWEEN " else " BETWEEN ") ]
-                    :: sub a [ text " AND " ]
-                    :: sub b [ text ")" ]
-                    :: next
-                    |> writeSteps
-                | Expr.InList(x, xs, neg) ->
-                    put "("
-                    let opener = text (if neg then " NOT IN (" else " IN (")
+                let label =
+                    match expected with
+                    | TruthValue.True -> "TRUE"
+                    | TruthValue.False -> "FALSE"
+                    | TruthValue.Unknown -> "UNKNOWN"
 
-                    match xs with
-                    | [] -> sub x [ opener; text "))" ] :: next |> writeSteps
-                    | _ ->
-                        let n = List.length xs
+                let op = if neg then " IS NOT " else " IS "
+                sub x [ text (op + label + ")") ] :: next |> writeSteps put text sub
+            | Expr.Between(x, a, b, neg) ->
+                put "("
 
-                        let items =
-                            xs |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then "))" else ", ") ])
+                sub x [ text (if neg then " NOT BETWEEN " else " BETWEEN ") ]
+                :: sub a [ text " AND " ]
+                :: sub b [ text ")" ]
+                :: next
+                |> writeSteps put text sub
+            | Expr.InList(x, xs, neg) ->
+                put "("
+                let opener = text (if neg then " NOT IN (" else " IN (")
 
-                        sub x [ opener ] :: (items @ next) |> writeSteps
-                | Expr.Like(x, p, neg, esc) ->
-                    put "("
-
-                    let closer =
-                        match esc with
-                        | None -> [ text ")" ]
-                        | Some escExpr -> [ text " ESCAPE "; sub escExpr [ text ")" ] ]
-
-                    sub x [ text (if neg then " NOT LIKE " else " LIKE ") ] :: sub p closer :: next
-                    |> writeSteps
-                | Expr.Case(branches, elseE) ->
-                    put "(CASE "
-
-                    let branchSteps =
-                        branches
-                        |> List.collect (fun (w, t) -> [ text "WHEN "; sub w [ text " THEN " ]; sub t [ text " " ] ])
-
-                    let elseSteps =
-                        match elseE with
-                        | Some v -> [ text "ELSE "; sub v [ text " " ] ]
-                        | None -> []
-
-                    (branchSteps @ elseSteps @ [ text "END)" ]) @ next |> writeSteps
-                | Expr.FuncCall(n, args) ->
-                    put n
-                    put "("
-                    let n' = List.length args
+                match xs with
+                | [] -> sub x [ opener; text "))" ] :: next |> writeSteps put text sub
+                | _ ->
+                    let n = List.length xs
 
                     let items =
-                        args |> List.mapi (fun i y -> sub y [ text (if i = n' - 1 then ")" else ", ") ])
+                        xs |> List.mapi (fun i y -> sub y [ text (if i = n - 1 then "))" else ", ") ])
 
-                    items @ next |> writeSteps
-                | Expr.Cast(x, dt) ->
-                    put "CAST("
-                    sub x [ text (" AS " + DataType.toSqlName dt + ")") ] :: next |> writeSteps
-                | Expr.Default ->
-                    put "DEFAULT"
-                    writeSteps next
-                | Expr.AggCall(f, distinct, x) ->
-                    put f.Name
-                    put "("
+                    sub x [ opener ] :: (items @ next) |> writeSteps put text sub
+            | Expr.Like(x, p, neg, esc) ->
+                put "("
 
-                    if distinct then
-                        put "DISTINCT "
+                let closer =
+                    match esc with
+                    | None -> [ text ")" ]
+                    | Some escExpr -> [ text " ESCAPE "; sub escExpr [ text ")" ] ]
 
-                    sub x [ text ")" ] :: next |> writeSteps
-                | Expr.Value v ->
-                    put (SqlLiteral.toSqlLiteral v)
-                    writeSteps next
-                | Expr.Subquery _ ->
-                    put "(subquery)"
-                    writeSteps next
-                | Expr.Exists _ ->
-                    put "EXISTS (subquery)"
-                    writeSteps next
-                | Expr.CorrelatedSubquery _ ->
-                    put "(subquery)"
-                    writeSteps next
-                | Expr.InSubquery(x, _, neg) ->
-                    put "("
+                sub x [ text (if neg then " NOT LIKE " else " LIKE ") ] :: sub p closer :: next
+                |> writeSteps put text sub
+            | Expr.Case(branches, elseE) ->
+                put "(CASE "
 
-                    sub x [ text (if neg then " NOT IN (subquery))" else " IN (subquery))") ]
-                    :: next
-                    |> writeSteps
-                | Expr.InSet(x, _, neg) ->
-                    put "("
+                let branchSteps =
+                    branches
+                    |> List.collect (fun (w, t) -> [ text "WHEN "; sub w [ text " THEN " ]; sub t [ text " " ] ])
 
-                    sub x [ text (if neg then " NOT IN (subquery))" else " IN (subquery))") ]
-                    :: next
-                    |> writeSteps
+                let elseSteps =
+                    match elseE with
+                    | Some v -> [ text "ELSE "; sub v [ text " " ] ]
+                    | None -> []
 
-        writeSteps [ Sub(e, []) ]
+                (branchSteps @ elseSteps @ [ text "END)" ]) @ next |> writeSteps put text sub
+            | Expr.FuncCall(n, args) ->
+                put n
+                put "("
+                let n' = List.length args
+
+                let items =
+                    args |> List.mapi (fun i y -> sub y [ text (if i = n' - 1 then ")" else ", ") ])
+
+                items @ next |> writeSteps put text sub
+            | Expr.Cast(x, dt) ->
+                put "CAST("
+
+                sub x [ text (" AS " + DataType.toSqlName dt + ")") ] :: next
+                |> writeSteps put text sub
+            | Expr.Default ->
+                put "DEFAULT"
+                writeSteps put text sub next
+            | Expr.AggCall(f, distinct, x) ->
+                put f.Name
+                put "("
+
+                if distinct then
+                    put "DISTINCT "
+
+                sub x [ text ")" ] :: next |> writeSteps put text sub
+            | Expr.Value v ->
+                put (SqlLiteral.toSqlLiteral v)
+                writeSteps put text sub next
+            | Expr.Subquery _ ->
+                put "(subquery)"
+                writeSteps put text sub next
+            | Expr.Exists _ ->
+                put "EXISTS (subquery)"
+                writeSteps put text sub next
+            | Expr.CorrelatedSubquery _ ->
+                put "(subquery)"
+                writeSteps put text sub next
+            | Expr.InSubquery(x, _, neg) ->
+                put "("
+
+                sub x [ text (if neg then " NOT IN (subquery))" else " IN (subquery))") ]
+                :: next
+                |> writeSteps put text sub
+            | Expr.InSet(x, _, neg) ->
+                put "("
+
+                sub x [ text (if neg then " NOT IN (subquery))" else " IN (subquery))") ]
+                :: next
+                |> writeSteps put text sub
+
+    /// 式をテキストへ戻す（EXPLAIN やエラーメッセージ用）。
+    /// 「式」と「その式を出したあとに吐く文字列」を 1本のスタックで表現し、末尾再帰で処理する。
+    let toDisplayString (e: Expr) =
+        let sb = System.Text.StringBuilder()
+        writeSteps (displayPut sb) displayText displaySub [ displaySub e [] ]
         sb.ToString()

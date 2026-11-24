@@ -213,3 +213,16 @@ let ``Optimizer.explain: 結合アルゴリズムも表示する`` () =
             ],
             Optimizer.explain ctx tree Schema.Empty
         ))
+
+[<Fact>]
+let ``末尾再帰: 50000段の論理木でも列マスクを求められる`` () =
+    withStore "ex-deep-needs" (fun store ->
+        let ctx = ctxOf store
+        let p = Expr.Literal(Literal.Bool true)
+
+        let tree =
+            List.fold (fun child _ -> Logical.Filter(p, child)) (Logical.Values [| SqlValue.Int 1L |]) [ 1..50000 ]
+
+        // scanNeedsMasks が明示スタックで深い木をたどること。
+        // 行の取り出しは Op の深さに比例するため行わず、演算子の組み立てまでを確かめる。
+        ok (Optimizer.exec ctx tree Schema.Empty) |> ignore)
