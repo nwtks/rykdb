@@ -11,19 +11,19 @@ module internal Writer =
     /// バイト列（並びは保たれる）。
     val writeBytes: byte array -> Writer -> Writer
     /// 真偽値（1バイト）。
-    val bool: bool -> (Writer -> Writer)
+    val bool: bool -> Writer -> Writer
     /// 符号なし LEB128。
-    val varint: uint64 -> (Writer -> Writer)
+    val varint: uint64 -> Writer -> Writer
     /// リトルエンディアン 8バイト。
-    val int64LE: int64 -> (Writer -> Writer)
+    val int64LE: int64 -> Writer -> Writer
     /// リトルエンディアン 4バイト。
-    val uint32LE: uint32 -> (Writer -> Writer)
+    val uint32LE: uint32 -> Writer -> Writer
     /// ビッグエンディアン 8バイト。
-    val uint64BE: uint64 -> (Writer -> Writer)
+    val uint64BE: uint64 -> Writer -> Writer
     /// 長さ付きバイト列（varint 長 + 実体）。
-    val lengthPrefixed: byte array -> (Writer -> Writer)
+    val lengthPrefixed: byte array -> Writer -> Writer
     /// UTF-8 文字列を長さ付きで追加する。
-    val str: string -> (Writer -> Writer)
+    val str: string -> Writer -> Writer
     /// varint を出力配列へ書き、次の位置を返す。
     val writeVarintTo: byte array -> int -> uint64 -> int
     /// 符号なし LEB128 のバイト数。

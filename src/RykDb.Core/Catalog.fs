@@ -588,84 +588,101 @@ module internal Catalog =
             return baseStats, afterIndexes
         }
 
+    /// 統計の拡張タグとして既知か。
+    let private isKnownStatsTag tag = tag >= 1uy && tag <= 5uy
+
+    /// 統計の末尾フィールド（解析時刻・変更数・行幅・MCV）を読み取る。
+    let private readStatsTail (tag: byte) (columnCount: int) (cur: Cursor) =
+        result {
+            let! analyzedAt, cur =
+                if tag < 2uy then
+                    ret (None, cur)
+                else
+                    Reader.readInt64LE cur
+                    |> Result.map (fun (ticks, c) ->
+                        (if ticks > 0L then
+                             Some(System.DateTimeOffset(ticks, System.TimeSpan.Zero))
+                         else
+                             None),
+                        c)
+
+            let! changes, cur = if tag < 3uy then ret (0L, cur) else Reader.readInt64LE cur
+
+            let! rowBytes, cur =
+                if tag < 4uy then
+                    ret (0.0, cur)
+                else
+                    Reader.readInt64LE cur
+                    |> Result.map (fun (bits, c) -> System.BitConverter.Int64BitsToDouble bits, c)
+
+            let! mcvs, cur =
+                if tag < 5uy then
+                    ret (List.init columnCount (fun _ -> []), cur)
+                else
+                    Reader.readItems readMcv (uint64 columnCount) cur
+
+            return (analyzedAt, changes, rowBytes, mcvs), cur
+        }
+
+    /// 読み取った拡張フィールドを基本統計へ畳み込む。
+    let private applyStatsExtras
+        (baseStats: TableStats)
+        (columnExtras: (int64 * float option * float option * float list) list)
+        (indexExtras: int64 list list)
+        (analyzedAt: System.DateTimeOffset option)
+        (changes: int64)
+        (rowBytes: float)
+        (mcvs: (string * int64) list list)
+        =
+        let columns =
+            List.map3
+                (fun c (nulls, minValue, maxValue, histogram) mcv ->
+                    { c with
+                        Nulls = nulls
+                        Min = minValue
+                        Max = maxValue
+                        Histogram = histogram
+                        Mcv = mcv
+                    })
+                baseStats.Columns
+                columnExtras
+                mcvs
+
+        let indexes =
+            List.map2 (fun i prefix -> { i with PrefixNDV = prefix }) baseStats.Indexes indexExtras
+
+        { baseStats with
+            Columns = columns
+            Indexes = indexes
+            AnalyzedAt = analyzedAt
+            Changes = changes
+            RowBytes = rowBytes
+        }
+
     /// 統計の末尾に付く拡張フィールドを復号し、基本統計へ畳み込む。
     let private decodeStatsExtras (baseStats: TableStats) (afterIndexes: Cursor) =
         if Cursor.atEnd afterIndexes then
             ret baseStats
         else
             result {
-                let columns = baseStats.Columns
-                let indexes = baseStats.Indexes
-                let! tag, cur4 = Reader.readByte afterIndexes
+                let! tag, cur = Reader.readByte afterIndexes
 
-                if tag <> 1uy && tag <> 2uy && tag <> 3uy && tag <> 4uy && tag <> 5uy then
+                if not (isKnownStatsTag tag) then
                     return! err (sprintf "統計の形式が不明です: %d" tag |> DbError.corruption)
                 else
-                    let! columnExtras, cur5 =
-                        Reader.readItems readColumnExtras (uint64 columns.Length) cur4
+                    let! columnExtras, cur =
+                        Reader.readItems readColumnExtras (uint64 baseStats.Columns.Length) cur
 
-                    let! indexExtras, cur6 =
-                        Reader.readItems readIndexExtras (uint64 indexes.Length) cur5
+                    let! indexExtras, cur =
+                        Reader.readItems readIndexExtras (uint64 baseStats.Indexes.Length) cur
 
-                    let! analyzedAt, cur7 =
-                        if tag < 2uy then
-                            ret (None, cur6)
-                        else
-                            Reader.readInt64LE cur6
-                            |> Result.map (fun (ticks, cur) ->
-                                (if ticks > 0L then
-                                     Some(System.DateTimeOffset(ticks, System.TimeSpan.Zero))
-                                 else
-                                     None),
-                                cur)
+                    let! (analyzedAt, changes, rowBytes, mcvs), cur =
+                        readStatsTail tag baseStats.Columns.Length cur
 
-                    let! changes, cur7 =
-                        if tag < 3uy then
-                            ret (0L, cur7)
-                        else
-                            Reader.readInt64LE cur7
-
-                    let! rowBytes, cur7 =
-                        if tag < 4uy then
-                            ret (0.0, cur7)
-                        else
-                            Reader.readInt64LE cur7
-                            |> Result.map (fun (bits, cur) -> System.BitConverter.Int64BitsToDouble bits, cur)
-
-                    let! mcvs, cur7 =
-                        if tag < 5uy then
-                            ret (List.init columns.Length (fun _ -> []), cur7)
-                        else
-                            Reader.readItems readMcv (uint64 columns.Length) cur7
-
-                    if not (Cursor.atEnd cur7) then
+                    if not (Cursor.atEnd cur) then
                         return! err (DbError.corruption "統計の末尾に余分なデータがあります")
                     else
-                        let columns =
-                            List.map3
-                                (fun c (nulls, minValue, maxValue, histogram) mcv ->
-                                    { c with
-                                        Nulls = nulls
-                                        Min = minValue
-                                        Max = maxValue
-                                        Histogram = histogram
-                                        Mcv = mcv
-                                    })
-                                columns
-                                columnExtras
-                                mcvs
-
-                        let indexes =
-                            List.map2 (fun i prefix -> { i with PrefixNDV = prefix }) indexes indexExtras
-
-                        return
-                            { baseStats with
-                                Columns = columns
-                                Indexes = indexes
-                                AnalyzedAt = analyzedAt
-                                Changes = changes
-                                RowBytes = rowBytes
-                            }
+                        return applyStatsExtras baseStats columnExtras indexExtras analyzedAt changes rowBytes mcvs
             }
 
     /// バイト列からテーブル統計を復元する。

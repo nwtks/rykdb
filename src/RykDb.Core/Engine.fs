@@ -383,73 +383,86 @@ module internal Engine =
         | Some lo, Some hi -> sprintf "%s=[%g,%g]" c.Name lo hi
         | _ -> ""
 
+    /// ANALYZE の結果の見出し。
+    let private analyzeColumns =
+        [|
+            "table"
+            "rows"
+            "columns"
+            "ndv"
+            "nulls"
+            "ranges"
+            "indexes"
+            "histograms"
+            "mcv"
+            "row_bytes"
+            "analyzed_at"
+        |]
+
+    /// 列ごとの NDV を `名前=値` の並びにする。
+    let private columnNdvText (s: TableStats) =
+        s.Columns
+        |> List.map (fun c -> sprintf "%s=%d" c.Name c.NDV)
+        |> String.concat ","
+
+    /// 列ごとの NULL 数を `名前=値` の並びにする。
+    let private columnNullsText (s: TableStats) =
+        s.Columns
+        |> List.map (fun c -> sprintf "%s=%d" c.Name c.Nulls)
+        |> String.concat ","
+
+    /// 列の数値範囲を並べる。
+    let private columnRangesText (s: TableStats) =
+        s.Columns
+        |> List.map columnRangeText
+        |> List.filter ((<>) "")
+        |> String.concat ","
+
+    /// 索引ごとの prefix NDV を並べる。
+    let private indexPrefixText (s: TableStats) =
+        s.Indexes
+        |> List.map (fun i -> sprintf "%s=%A" i.Name i.PrefixNDV)
+        |> String.concat ","
+
+    /// ヒストグラムを持つ列の件数を並べる。
+    let private histogramText (s: TableStats) =
+        s.Columns
+        |> List.filter (fun c -> not (List.isEmpty c.Histogram))
+        |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Histogram))
+        |> String.concat ","
+
+    /// MCV を持つ列の件数を並べる。
+    let private mcvText (s: TableStats) =
+        s.Columns
+        |> List.filter (fun c -> not (List.isEmpty c.Mcv))
+        |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Mcv))
+        |> String.concat ","
+
+    /// 解析時刻を ISO 8601 で表す。
+    let private analyzedAtText (s: TableStats) =
+        match s.AnalyzedAt with
+        | Some t -> t.UtcDateTime.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
+        | None -> ""
+
+    /// ANALYZE の結果 1行。
+    let private analyzeRow (s: TableStats) =
+        [|
+            SqlValue.Text s.Table
+            SqlValue.Int s.RowCount
+            SqlValue.Int(int64 s.Columns.Length)
+            SqlValue.Text(columnNdvText s)
+            SqlValue.Text(columnNullsText s)
+            SqlValue.Text(columnRangesText s)
+            SqlValue.Text(indexPrefixText s)
+            SqlValue.Text(histogramText s)
+            SqlValue.Text(mcvText s)
+            SqlValue.Int(int64 (System.Math.Round s.RowBytes))
+            SqlValue.Text(analyzedAtText s)
+        |]
+
     /// ANALYZE の結果（見出しと 1テーブル 1行）を作る。
     let private analyzeResultRows (stats: TableStats list) =
-        let columns =
-            [|
-                "table"
-                "rows"
-                "columns"
-                "ndv"
-                "nulls"
-                "ranges"
-                "indexes"
-                "histograms"
-                "mcv"
-                "row_bytes"
-                "analyzed_at"
-            |]
-
-        let rows =
-            stats
-            |> List.map (fun (s: TableStats) ->
-                [|
-                    SqlValue.Text s.Table
-                    SqlValue.Int s.RowCount
-                    SqlValue.Int(int64 s.Columns.Length)
-                    SqlValue.Text(
-                        s.Columns
-                        |> List.map (fun c -> sprintf "%s=%d" c.Name c.NDV)
-                        |> String.concat ","
-                    )
-                    SqlValue.Text(
-                        s.Columns
-                        |> List.map (fun c -> sprintf "%s=%d" c.Name c.Nulls)
-                        |> String.concat ","
-                    )
-                    SqlValue.Text(
-                        s.Columns
-                        |> List.map columnRangeText
-                        |> List.filter ((<>) "")
-                        |> String.concat ","
-                    )
-                    SqlValue.Text(
-                        s.Indexes
-                        |> List.map (fun i -> sprintf "%s=%A" i.Name i.PrefixNDV)
-                        |> String.concat ","
-                    )
-                    SqlValue.Text(
-                        s.Columns
-                        |> List.filter (fun c -> not (List.isEmpty c.Histogram))
-                        |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Histogram))
-                        |> String.concat ","
-                    )
-                    SqlValue.Text(
-                        s.Columns
-                        |> List.filter (fun c -> not (List.isEmpty c.Mcv))
-                        |> List.map (fun c -> sprintf "%s:%d" c.Name (List.length c.Mcv))
-                        |> String.concat ","
-                    )
-                    SqlValue.Int(int64 (System.Math.Round s.RowBytes))
-                    SqlValue.Text(
-                        match s.AnalyzedAt with
-                        | Some t -> t.UtcDateTime.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
-                        | None -> ""
-                    )
-                |])
-            |> Array.ofList
-
-        StatementResult.OfRows(0, columns, rows)
+        StatementResult.OfRows(0, analyzeColumns, stats |> List.map analyzeRow |> Array.ofList)
 
     /// 1文を transaction 付きで実行する。
     let private runStatement (limits: ResultLimits) (state: ExecState) (txn: Transaction) =

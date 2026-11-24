@@ -27,11 +27,15 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
 let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array -> unit) =
     let path = FileMetaData.path dir fileNumber
     let data = System.IO.File.ReadAllBytes path
-    let footerStart = data.Length - Sstable.FooterSize
+    let footerStart = data.Length - SstableFormat.FooterSize
 
     let readI64 offset =
         [ 0..7 ]
-        |> List.fold (fun acc i -> acc ||| (int64 data.[data.Length - Sstable.FooterSize + offset + i] <<< (i * 8))) 0L
+        |> List.fold
+            (fun acc i ->
+                acc
+                ||| (int64 data.[data.Length - SstableFormat.FooterSize + offset + i] <<< (i * 8)))
+            0L
 
     let writeU32 offset (value: uint32) =
         for i in 0..3 do
@@ -48,9 +52,9 @@ let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array ->
     writeU32 76 metadataChecksum
 
     let footerChecksum =
-        Hashing.checksum (Array.sub data footerStart (Sstable.FooterSize - 4))
+        Hashing.checksum (Array.sub data footerStart (SstableFormat.FooterSize - 4))
 
-    writeU32 (Sstable.FooterSize - 4) footerChecksum
+    writeU32 (SstableFormat.FooterSize - 4) footerChecksum
 
     System.IO.File.WriteAllBytes(path, data)
 
@@ -68,7 +72,7 @@ let private twoFilesWithBrokenSecond (dir: string) =
     let f2 =
         mkSst dir 11L 0 [ Entry.put (intKey 3) 3UL (intRow 3); Entry.put (intKey 4) 4UL (intRow 4) ]
 
-    patchSstable dir 11L (fun data -> data.[data.Length - Sstable.FooterSize] <- 0x00uy)
+    patchSstable dir 11L (fun data -> data.[data.Length - SstableFormat.FooterSize] <- 0x00uy)
 
     let f2 = { f2 with ReadInfo = None }
     f1, f2
@@ -78,7 +82,7 @@ let ``StorageEngine.openDatabase: 書き込み後に壊れたファイルは再�
     withDir "se-hydrate-corrupt" (fun dir ->
         let _f = mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1) ]
         // `ReadInfo` は書き込み時点の内容なので、後から壊しても open 中の hydrate で初めて検出する。
-        patchSstable dir 10L (fun data -> data.[data.Length - Sstable.FooterSize] <- 0x00uy)
+        patchSstable dir 10L (fun data -> data.[data.Length - SstableFormat.FooterSize] <- 0x00uy)
         expectErrorKind ErrorKind.CorruptionError "再オープンで Footer の破損を検出する" (StorageEngine.openDatabaseWith None dir))
 
 [<Fact>]

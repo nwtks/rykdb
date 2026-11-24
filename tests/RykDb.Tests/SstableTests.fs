@@ -18,13 +18,13 @@ let private writeTempSst (data: byte array) =
 
 /// Footer 末尾の 4バイト（先頭 FooterSize-4 バイトのチェックサム）を付け直す。
 let private fixFooterChecksum (bytes: byte array) =
-    let footerStart = bytes.Length - Sstable.FooterSize
+    let footerStart = bytes.Length - SstableFormat.FooterSize
 
     let checksum =
-        Hashing.checksum (Array.sub bytes footerStart (Sstable.FooterSize - 4))
+        Hashing.checksum (Array.sub bytes footerStart (SstableFormat.FooterSize - 4))
 
     for i in 0..3 do
-        bytes.[footerStart + Sstable.FooterSize - 4 + i] <- byte (checksum >>> (8 * i) &&& 0xFFu)
+        bytes.[footerStart + SstableFormat.FooterSize - 4 + i] <- byte (checksum >>> (8 * i) &&& 0xFFu)
 
 /// Footer の int64 フィールドを読む。
 let private readI64At (bytes: byte array) (off: int) =
@@ -55,7 +55,7 @@ let private readVarintAtBytes (bytes: byte array) (pos: int) =
 
 /// 索引を書き換えたときに呼ぶ: metadataChecksum と Footer のチェックサムを付け直す。
 let private refreshMetadataChecksums (bytes: byte array) =
-    let footerStart = bytes.Length - Sstable.FooterSize
+    let footerStart = bytes.Length - SstableFormat.FooterSize
     let indexOff = int (readI64At bytes (footerStart + 20))
     let indexLen = int (readI64At bytes (footerStart + 28))
     let metaOff = int (readI64At bytes (footerStart + 52))
@@ -338,7 +338,7 @@ let ``Sstable.openPartial: チェックサム不一致は読み出し時に Corr
 let ``Sstable.openPartial: マジック不一致は CorruptionError`` () =
     let data = ok (buildSstable 0.01 (sstEntries 500))
     let badMagic = Array.copy data
-    let footerStart = badMagic.Length - Sstable.FooterSize
+    let footerStart = badMagic.Length - SstableFormat.FooterSize
     badMagic.[footerStart] <- badMagic.[footerStart] ^^^ 0xFFuy
     fixFooterChecksum badMagic
     expectErrorKind ErrorKind.CorruptionError "マジック不一致はエラーになるはず" (Sstable.openPartial (writeTempSst badMagic))
@@ -347,14 +347,14 @@ let ``Sstable.openPartial: マジック不一致は CorruptionError`` () =
 let ``Sstable.openPartial: 未対応バージョンは CorruptionError`` () =
     let data = ok (buildSstable 0.01 (sstEntries 3))
     let bad = Array.copy data
-    bad.[bad.Length - Sstable.FooterSize + 8] <- 7uy
+    bad.[bad.Length - SstableFormat.FooterSize + 8] <- 7uy
     fixFooterChecksum bad
     expectErrorKind ErrorKind.CorruptionError "未対応バージョンはエラーになるはず" (Sstable.openPartial (writeTempSst bad))
 
 [<Fact>]
 let ``Sstable.openPartial: Footer の範囲が不正なら CorruptionError`` () =
     let baseBytes = ok (buildSstable 0.01 (sstEntries 3))
-    let footerStart = baseBytes.Length - Sstable.FooterSize
+    let footerStart = baseBytes.Length - SstableFormat.FooterSize
 
     let writeI64 (bytes: byte array) (off: int) (v: int64) =
         for i in 0..7 do
@@ -416,7 +416,7 @@ let ``Sstable.openPartial: Footer のチェックサム不一致は CorruptionEr
 
         // Footer の indexOff を壊す（Footer チェックサムは直さない）。
         let bad = Array.copy data
-        let footerStart = bad.Length - Sstable.FooterSize
+        let footerStart = bad.Length - SstableFormat.FooterSize
         bad.[footerStart + 20] <- bad.[footerStart + 20] ^^^ 0xFFuy
         System.IO.File.WriteAllBytes(path, bad)
         expectErrorKind ErrorKind.CorruptionError "部分読みでも Footer の破損を検出する" (Sstable.openPartial path)
@@ -427,7 +427,7 @@ let ``Sstable.openPartial: Bloom メタデータの破損は checksum で検出`
     withDir "sst-partial-meta-checksum" (fun dir ->
         let data = ok (buildSstable 0.01 (sstEntries 100))
         let path = System.IO.Path.Combine(dir, "1.sst")
-        let footerStart = data.Length - Sstable.FooterSize
+        let footerStart = data.Length - SstableFormat.FooterSize
 
         let bloomOffset =
             [ 0..7 ]
@@ -463,7 +463,7 @@ let ``Sstable.openPartial: 索引の範囲がファイル外なら CorruptionErr
     withDir "sst-partial-index-range" (fun dir ->
         let path = System.IO.Path.Combine(dir, "1.sst")
         let bytes = Array.copy (ok (buildSstable 0.01 (sstEntries 300)))
-        let footerStart = bytes.Length - Sstable.FooterSize
+        let footerStart = bytes.Length - SstableFormat.FooterSize
         let indexOff = int (readI64At bytes (footerStart + 20))
 
         // 先頭エントリ（長さ付き LastKey + Offset + Length）を飛ばし、2 個目の Offset を範囲外へ書き換える。
@@ -483,7 +483,7 @@ let ``Sstable.openPartial: 索引の LastKey が昇順でなければ Corruption
     withDir "sst-partial-index-order" (fun dir ->
         let path = System.IO.Path.Combine(dir, "1.sst")
         let bytes = Array.copy (ok (buildSstable 0.01 (sstEntries 300)))
-        let footerStart = bytes.Length - Sstable.FooterSize
+        let footerStart = bytes.Length - SstableFormat.FooterSize
         let indexOff = int (readI64At bytes (footerStart + 20))
 
         // 先頭エントリの LastKey の先頭バイト（型タグ 0x20）を 0x7F にして、

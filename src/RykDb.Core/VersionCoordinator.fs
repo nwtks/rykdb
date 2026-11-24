@@ -453,6 +453,80 @@ module private VersionCoordinatorHelpers =
             releaseVersion versionPins fileRefs dir state.Version
             acquireCallLoop stateCell stateKey versionPins fileRefs dir
 
+    /// 現在の最古 snapshot（登録が無ければ ActiveSnapshot）。
+    let private oldestSnapshotAt (ctx: InstallContext) (current: PublishedState) =
+        match ctx.OldestSnapshot() with
+        | Some snapshot -> min current.ActiveSnapshot snapshot
+        | None -> current.ActiveSnapshot
+
+    /// 入力が現存し、最古 snapshot が開始時より古くならないか。
+    let private canInstall
+        (currentNumbers: Set<int64>)
+        (baseState: PublishedState)
+        (result: CompactionResult)
+        (oldestNow: uint64)
+        =
+        result.Removed
+        |> List.forall (fun f -> Set.contains f.FileNumber currentNumbers)
+        && oldestNow >= baseState.ActiveSnapshot
+
+    /// GC 境界を下げて公開する（入力の消失・snapshot の前進でインストールできないとき）。
+    let private publishSkippedInstall (ctx: InstallContext) (result: CompactionResult) (oldestNow: uint64) =
+        FileMetaData.deleteObsolete ctx.Dir result.Added |> ignore
+
+        publish ctx.StateCell ctx.StateKey (fun state ->
+            { state with
+                ActiveSnapshot = oldestNow
+                LastCompactionError = None
+            })
+        |> ignore
+
+    /// インストール失敗を記録する（出力は残す。MANIFEST を読めないときは孤児として扱う）。
+    let private publishInstallFailure (ctx: InstallContext) (error: DbError) =
+        publish ctx.StateCell ctx.StateKey (fun state ->
+            { state with
+                LastCompactionError = Some error
+            })
+        |> ignore
+
+    /// 出力を削除し、インストール失敗を記録する。
+    let private publishInstallError (ctx: InstallContext) (result: CompactionResult) (error: DbError) =
+        FileMetaData.deleteObsolete ctx.Dir result.Added |> ignore
+        publishInstallFailure ctx error
+
+    /// MANIFEST に反映済みの Version を公開し、削除済みファイルを retire する。
+    let private publishInstalled
+        (ctx: InstallContext)
+        (result: CompactionResult)
+        (version: Version)
+        (manifestNumber: int64<manifestNo>)
+        =
+        publish ctx.StateCell ctx.StateKey (fun state ->
+            { state with
+                Version = version
+                ManifestNumber = manifestNumber
+                LastCompactionError = None
+            })
+        |> ignore
+
+        result.Removed |> List.iter (fun f -> retireFile ctx.FileRefs f.FileNumber)
+
+    /// MANIFEST 追記の結果が Unknown のとき、読み直して適用済みかを確かめる。
+    let private resolveUnknownInstall
+        (ctx: InstallContext)
+        (current: PublishedState)
+        (edit: VersionEdit)
+        (result: CompactionResult)
+        (error: DbError)
+        =
+        let expected = VersionEdit.apply current.Version edit
+
+        match Manifest.openOrCreate ctx.Dir with
+        | Ok(version, manifestNumber) when sameFileSet version expected ->
+            publishInstalled ctx result version manifestNumber
+        | Ok _ -> publishInstallError ctx result error
+        | Error _ -> publishInstallFailure ctx error
+
     /// compaction 結果を MANIFEST へ反映する。
     let install (ctx: InstallContext) (baseState: PublishedState, result: CompactionResult) =
         withGate ctx.InstallGate (fun () ->
@@ -461,24 +535,10 @@ module private VersionCoordinatorHelpers =
             let currentNumbers =
                 Version.allFiles current.Version |> List.map _.FileNumber |> Set.ofList
 
-            let inputsPresent =
-                result.Removed
-                |> List.forall (fun f -> Set.contains f.FileNumber currentNumbers)
+            let oldestNow = oldestSnapshotAt ctx current
 
-            let oldestNow =
-                match ctx.OldestSnapshot() with
-                | Some snapshot -> min current.ActiveSnapshot snapshot
-                | None -> current.ActiveSnapshot
-
-            if not inputsPresent || oldestNow < baseState.ActiveSnapshot then
-                FileMetaData.deleteObsolete ctx.Dir result.Added |> ignore
-
-                publish ctx.StateCell ctx.StateKey (fun state ->
-                    { state with
-                        ActiveSnapshot = oldestNow
-                        LastCompactionError = None
-                    })
-                |> ignore
+            if not (canInstall currentNumbers baseState result oldestNow) then
+                publishSkippedInstall ctx result oldestNow
             else
                 let edit =
                     {
@@ -487,52 +547,10 @@ module private VersionCoordinatorHelpers =
                     }
 
                 match applyManifestOf ctx.Dir ctx.ManifestApply current.ManifestNumber current.Version edit with
-                | ManifestApplyResult.NotApplied e ->
-                    FileMetaData.deleteObsolete ctx.Dir result.Added |> ignore
-
-                    publish ctx.StateCell ctx.StateKey (fun state ->
-                        { state with
-                            LastCompactionError = Some e
-                        })
-                    |> ignore
-                | ManifestApplyResult.Unknown e ->
-                    let expected = VersionEdit.apply current.Version edit
-
-                    match Manifest.openOrCreate ctx.Dir with
-                    | Ok(version, manifestNumber) when sameFileSet version expected ->
-                        publish ctx.StateCell ctx.StateKey (fun state ->
-                            { state with
-                                Version = version
-                                ManifestNumber = manifestNumber
-                                LastCompactionError = None
-                            })
-                        |> ignore
-
-                        result.Removed |> List.iter (fun f -> retireFile ctx.FileRefs f.FileNumber)
-                    | Ok _ ->
-                        FileMetaData.deleteObsolete ctx.Dir result.Added |> ignore
-
-                        publish ctx.StateCell ctx.StateKey (fun state ->
-                            { state with
-                                LastCompactionError = Some e
-                            })
-                        |> ignore
-                    | Error _ ->
-                        publish ctx.StateCell ctx.StateKey (fun state ->
-                            { state with
-                                LastCompactionError = Some e
-                            })
-                        |> ignore
+                | ManifestApplyResult.NotApplied e -> publishInstallError ctx result e
+                | ManifestApplyResult.Unknown e -> resolveUnknownInstall ctx current edit result e
                 | ManifestApplyResult.Applied(version, manifestNumber) ->
-                    publish ctx.StateCell ctx.StateKey (fun state ->
-                        { state with
-                            Version = version
-                            ManifestNumber = manifestNumber
-                            LastCompactionError = None
-                        })
-                    |> ignore
-
-                    result.Removed |> List.iter (fun f -> retireFile ctx.FileRefs f.FileNumber))
+                    publishInstalled ctx result version manifestNumber)
 
         sweepFiles ctx.FileRefs ctx.Dir
 

@@ -573,6 +573,90 @@ module internal Parser =
                 |> Result.map (fun (_, st) -> Statement.Analyze(None, None), st)
             | _ -> fail "ANALYZE にはテーブル名が必要です" st
 
+    /// EXPLAIN [ANALYZE] SELECT ...
+    let private parseExplain (st: PState) =
+        let st = advance st
+
+        let st, analyze =
+            if isIdentName "ANALYZE" st then
+                advance st, true
+            else
+                st, false
+
+        match peek st with
+        | Token.Keyword "SELECT" ->
+            result {
+                let! sel, st = parseSelectStatementValue st
+                let! _, st = eatOptionalSemicolon st
+
+                return
+                    (if analyze then
+                         Statement.ExplainAnalyze sel
+                     else
+                         Statement.Explain sel),
+                    st
+            }
+        | _ -> fail "EXPLAIN は SELECT 文だけに対応しています" st
+
+    /// BEGIN [TRANSACTION]
+    let private parseBegin (st: PState) =
+        advance st
+        |> eatIdentName "TRANSACTION"
+        |> eatOptionalSemicolon
+        |> Result.map (fun (_, st) -> Statement.Begin, st)
+
+    /// START TRANSACTION
+    let private parseStartTransaction (st: PState) =
+        let st = advance st
+
+        if isIdentName "TRANSACTION" st then
+            st
+            |> advance
+            |> eatOptionalSemicolon
+            |> Result.map (fun (_, st) -> Statement.Begin, st)
+        else
+            fail "START TRANSACTION が必要です" st
+
+    /// CREATE TABLE / CREATE [UNIQUE] INDEX
+    let private parseCreate (nextToken: Token) (st: PState) =
+        if nextToken = Token.Keyword "TABLE" then
+            parseCreateTable st |> Result.map (fun (x, st) -> Statement.CreateTable x, st)
+        elif nextToken = Token.Keyword "UNIQUE" || nextToken = Token.Keyword "INDEX" then
+            parseCreateIndex st |> Result.map (fun (x, st) -> Statement.CreateIndex x, st)
+        else
+            fail "CREATE TABLE または CREATE INDEX を指定してください" st
+
+    /// DROP TABLE / DROP INDEX
+    let private parseDrop (nextToken: Token) (st: PState) =
+        if nextToken = Token.Keyword "TABLE" then
+            parseDropTable st
+        elif nextToken = Token.Keyword "INDEX" then
+            parseDropIndex st
+        else
+            fail "DROP TABLE または DROP INDEX を指定してください" st
+
+    /// COMMIT [WORK|TRANSACTION]
+    let private parseCommit (st: PState) =
+        advance st
+        |> eatIdentName "WORK"
+        |> eatIdentName "TRANSACTION"
+        |> eatOptionalSemicolon
+        |> Result.map (fun (_, st) -> Statement.Commit, st)
+
+    /// END
+    let private parseEnd (st: PState) =
+        advance st
+        |> eatOptionalSemicolon
+        |> Result.map (fun (_, st) -> Statement.Commit, st)
+
+    /// ROLLBACK [WORK|TRANSACTION]
+    let private parseRollback (st: PState) =
+        advance st
+        |> eatIdentName "WORK"
+        |> eatIdentName "TRANSACTION"
+        |> eatOptionalSemicolon
+        |> Result.map (fun (_, st) -> Statement.Rollback, st)
+
     /// 1文を読む（文の種類で分岐する）。
     let private parseOne (st: PState) =
         let nextToken =
@@ -586,76 +670,16 @@ module internal Parser =
         | Token.Keyword "INSERT" -> parseInsert st |> Result.map (fun (x, st) -> Statement.Insert x, st)
         | Token.Keyword "UPDATE" -> parseUpdate st |> Result.map (fun (x, st) -> Statement.Update x, st)
         | Token.Keyword "DELETE" -> parseDelete st |> Result.map (fun (x, st) -> Statement.Delete x, st)
-        | Token.Keyword "CREATE" ->
-            if nextToken = Token.Keyword "TABLE" then
-                parseCreateTable st |> Result.map (fun (x, st) -> Statement.CreateTable x, st)
-            elif nextToken = Token.Keyword "UNIQUE" || nextToken = Token.Keyword "INDEX" then
-                parseCreateIndex st |> Result.map (fun (x, st) -> Statement.CreateIndex x, st)
-            else
-                fail "CREATE TABLE または CREATE INDEX を指定してください" st
-        | Token.Keyword "DROP" ->
-            if nextToken = Token.Keyword "TABLE" then
-                parseDropTable st
-            elif nextToken = Token.Keyword "INDEX" then
-                parseDropIndex st
-            else
-                fail "DROP TABLE または DROP INDEX を指定してください" st
-        | Token.Keyword "BEGIN" ->
-            advance st
-            |> eatIdentName "TRANSACTION"
-            |> eatOptionalSemicolon
-            |> Result.map (fun (_, st) -> Statement.Begin, st)
-        | Token.Ident name when name.ToUpperInvariant() = "EXPLAIN" ->
-            let st = advance st
-
-            let st, analyze =
-                if isIdentName "ANALYZE" st then
-                    advance st, true
-                else
-                    st, false
-
-            match peek st with
-            | Token.Keyword "SELECT" ->
-                result {
-                    let! sel, st = parseSelectStatementValue st
-                    let! _, st = eatOptionalSemicolon st
-
-                    return
-                        (if analyze then
-                             Statement.ExplainAnalyze sel
-                         else
-                             Statement.Explain sel),
-                        st
-                }
-            | _ -> fail "EXPLAIN は SELECT 文だけに対応しています" st
+        | Token.Keyword "CREATE" -> parseCreate nextToken st
+        | Token.Keyword "DROP" -> parseDrop nextToken st
+        | Token.Keyword "BEGIN" -> parseBegin st
+        | Token.Ident name when name.ToUpperInvariant() = "EXPLAIN" -> parseExplain st
         | Token.Ident name when name.ToUpperInvariant() = "ALTER" -> advance st |> parseAlterTable
         | Token.Ident name when name.ToUpperInvariant() = "ANALYZE" -> advance st |> parseAnalyze
-        | Token.Ident name when name.ToUpperInvariant() = "START" ->
-            let st = advance st
-
-            if isIdentName "TRANSACTION" st then
-                st
-                |> advance
-                |> eatOptionalSemicolon
-                |> Result.map (fun (_, st) -> Statement.Begin, st)
-            else
-                fail "START TRANSACTION が必要です" st
-        | Token.Keyword "COMMIT" ->
-            advance st
-            |> eatIdentName "WORK"
-            |> eatIdentName "TRANSACTION"
-            |> eatOptionalSemicolon
-            |> Result.map (fun (_, st) -> Statement.Commit, st)
-        | Token.Keyword "END" ->
-            advance st
-            |> eatOptionalSemicolon
-            |> Result.map (fun (_, st) -> Statement.Commit, st)
-        | Token.Keyword "ROLLBACK" ->
-            advance st
-            |> eatIdentName "WORK"
-            |> eatIdentName "TRANSACTION"
-            |> eatOptionalSemicolon
-            |> Result.map (fun (_, st) -> Statement.Rollback, st)
+        | Token.Ident name when name.ToUpperInvariant() = "START" -> parseStartTransaction st
+        | Token.Keyword "COMMIT" -> parseCommit st
+        | Token.Keyword "END" -> parseEnd st
+        | Token.Keyword "ROLLBACK" -> parseRollback st
         | Token.Ident name when Set.contains (name.ToUpperInvariant()) SetOperationWords ->
             fail "集合演算は UNION ALL のみ対応しています" st
         | _ -> fail "文の開始として解釈できません" st

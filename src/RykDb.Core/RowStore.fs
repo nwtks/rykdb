@@ -459,6 +459,37 @@ module internal RowStore =
         lease.ForceRelease()
         err e
 
+    /// background compaction 用の coordinator を作る（無効なら None）。
+    let private createCoordinator
+        (root: string)
+        (engine: StorageEngine)
+        (options: RowStoreOptions)
+        (runtime: RootRuntime)
+        =
+        if not options.BackgroundCompaction then
+            None
+        else
+            new VersionCoordinator(
+                root,
+                PublishedState.initial engine.Version engine.ManifestNumber,
+                engine.Compaction,
+                (fun () -> runtime.OldestExcept(root, None)),
+                (fun f -> StorageEngine.openScan root f),
+                options.ScanHook,
+                options.ManifestApplyHook
+                |> Option.map (fun hook ->
+                    fun manifestNumber version edit ->
+                        match hook edit with
+                        | Some result -> result
+                        | None -> Manifest.logAndApplyWithOutcome root manifestNumber version edit)
+            )
+            |> Some
+
+    /// ストアの実行時状態（runtime と background coordinator）を作る。
+    let private createRuntime (root: string) (engine: StorageEngine) (options: RowStoreOptions) =
+        let runtime = RootRuntime()
+        runtime, createCoordinator root engine options runtime
+
     /// DB を開く（新規ならルート直下に 1本の LSM を作る）。
     /// 同じ root が既にこのプロセスで開かれていれば `IoError`。
     let private openStoreCore (takeOver: bool) (options: RowStoreOptions) (root: string) =
@@ -487,32 +518,7 @@ module internal RowStore =
                 | None -> engine
 
             let! built =
-                match
-                    protect (fun () ->
-                        let runtime = RootRuntime()
-
-                        let host =
-                            if options.BackgroundCompaction then
-                                new VersionCoordinator(
-                                    root,
-                                    PublishedState.initial engine.Version engine.ManifestNumber,
-                                    engine.Compaction,
-                                    (fun () -> runtime.OldestExcept(root, None)),
-                                    (fun f -> StorageEngine.openScan root f),
-                                    options.ScanHook,
-                                    options.ManifestApplyHook
-                                    |> Option.map (fun hook ->
-                                        fun manifestNumber version edit ->
-                                            match hook edit with
-                                            | Some result -> result
-                                            | None -> Manifest.logAndApplyWithOutcome root manifestNumber version edit)
-                                )
-                                |> Some
-                            else
-                                None
-
-                        runtime, host)
-                with
+                match protect (fun () -> createRuntime root engine options) with
                 | Ok built -> ret built
                 | Error e -> abandonOpen engine lease e
 

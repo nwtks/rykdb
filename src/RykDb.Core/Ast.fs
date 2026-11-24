@@ -116,8 +116,8 @@ type internal BinaryOp =
 
 /// 比較演算子。
 /// <remarks>
-/// `BinaryOp` の比較 6 種だけを型として抜き出したもので、
-/// 評価器（`Eval`）が 3 値論理へ変換するときの演算子表に使う。
+/// `BinaryOp` の比較 6種だけを型として抜き出したもので、
+/// 評価器（`Eval`）が 3値論理へ変換するときの演算子表に使う。
 /// 文字列タグ（"eq" / "lt" など）で渡すと誤ったタグでも型検査が通るため、
 /// 演算子の分岐は必ずこの型で受け取る。
 /// </remarks>
@@ -346,13 +346,6 @@ and internal SelectStatement =
         Limit: Expr option
         Offset: Expr option
         /// `UNION ALL` で連結する後続の SELECT（空なら通常の SELECT）。
-        /// <remarks>
-        /// 空でないとき、この文は「先頭の SELECT（このレコード自身）と
-        /// `SetOperations` の枝を順に `UNION ALL` する」複合文になる。
-        /// その場合の `OrderBy` / `Limit` / `Offset` は**全体**へ掛かり、
-        /// 枝側の `OrderBy` / `Limit` / `Offset` は常に空になる。
-        /// 列名は先頭の SELECT のものが使われる。
-        /// </remarks>
         SetOperations: SetOperation list
     }
 
@@ -438,8 +431,7 @@ module internal Expr =
         mapChildrenPairsLoop step [] state items
 
     /// 子を左から右へ 1つずつ `step` に渡し、組み直した子で親を作る。
-    /// 状態を引き回すので、子の列挙（`children`）と子の差し替え（`plugChildren`）の
-    /// **両方をこの 1箇所から導出**できる。
+    /// 状態を引き回すので、子の列挙（`children`）と子の差し替え（`plugChildren`）の両方をこの 1箇所から導出できる。
     /// ノードを追加したときに直すのはこの match だけ。
     let private mapChildrenState (step: 's -> Expr -> 's * Expr) (state: 's) =
         function
@@ -558,14 +550,13 @@ module internal Expr =
         | Visit of Expr
         | Arrive of Expr
 
-    /// 書き換え機のループ（`rewriteWithC` の本体）。
+    /// 書き換え機のループ。
     let rec private rewriteLoop
         (rewriteLeaf: Expr -> (Expr -> Result<'r, DbError>) -> Result<'r, DbError>)
         (k: Expr -> Result<'r, DbError>)
         (frames: RewriteFrame list)
-        (step: RewriteStep)
         =
-        match step with
+        function
         | Visit x ->
             rewriteLeaf x (fun x2 ->
                 match children x2 with
@@ -633,7 +624,7 @@ module internal Expr =
 
     /// 式中のすべての列参照を列挙する。
     /// 束縛と空き列判定に使う。
-    /// 末尾再帰の明示スタック走査（`Expr.columnRefs` の既存の挙動を維持）。
+    /// 末尾再帰の明示スタック走査。
     let columnRefs =
         fold
             (fun acc e ->
@@ -695,8 +686,8 @@ module internal Expr =
             false
 
     /// Expr.toDisplayString が使う出力項目。
-    /// Sub の closer を先に与えておくことで、式の出力が終わってから
-    /// 閉じ括弧などを出力する順序を、末尾再帰のまま表現できる。
+    /// Sub の closer を先に与えておくことで、式の出力が終わってから閉じ括弧などを出力する順序を、
+    /// 末尾再帰のまま表現できる。
     type private PrintStep =
         /// そのまま出力する文字列
         | Text of string
@@ -705,6 +696,58 @@ module internal Expr =
 
     /// 表示項目を StringBuilder へ書き出す。
     let private displayPut (sb: System.Text.StringBuilder) (s: string) = sb.Append s |> ignore
+
+    /// `IS [NOT] TRUE / FALSE / UNKNOWN` の表示手順。
+    let private isTruthSteps (x: Expr) (expected: TruthValue) (neg: bool) (next: PrintStep list) =
+        let label =
+            match expected with
+            | TruthValue.True -> "TRUE"
+            | TruthValue.False -> "FALSE"
+            | TruthValue.Unknown -> "UNKNOWN"
+
+        let op = if neg then " IS NOT " else " IS "
+
+        Text "(" :: Sub(x, [ Text(op + label + ")") ]) :: next
+
+    /// 式の並びを `, ` で区切り、最後の項目に閉じ括弧を付ける。
+    let private separatedItems (closer: string) (items: Expr list) =
+        let n = List.length items
+
+        items
+        |> List.mapi (fun i y -> Sub(y, [ Text(if i = n - 1 then closer else ", ") ]))
+
+    /// `IN (値, ...)` / `NOT IN (値, ...)` の表示手順。
+    let private inListSteps (x: Expr) (xs: Expr list) (neg: bool) (next: PrintStep list) =
+        let opener = Text(if neg then " NOT IN (" else " IN (")
+
+        match xs with
+        | [] -> Text "(" :: Sub(x, [ opener; Text "))" ]) :: next
+        | _ -> Text "(" :: Sub(x, [ opener ]) :: (separatedItems "))" xs @ next)
+
+    /// `LIKE` の表示手順。
+    let private likeSteps (x: Expr) (p: Expr) (neg: bool) (esc: Expr option) (next: PrintStep list) =
+        let closer =
+            match esc with
+            | None -> [ Text ")" ]
+            | Some escExpr -> [ Text " ESCAPE "; Sub(escExpr, [ Text ")" ]) ]
+
+        Text "("
+        :: Sub(x, [ Text(if neg then " NOT LIKE " else " LIKE ") ])
+        :: Sub(p, closer)
+        :: next
+
+    /// `CASE` の表示手順。
+    let private caseSteps (branches: (Expr * Expr) list) (elseE: Expr option) (next: PrintStep list) =
+        let branchSteps =
+            branches
+            |> List.collect (fun (w, t) -> [ Text "WHEN "; Sub(w, [ Text " THEN " ]); Sub(t, [ Text " " ]) ])
+
+        let elseSteps =
+            match elseE with
+            | Some v -> [ Text "ELSE "; Sub(v, [ Text " " ]) ]
+            | None -> []
+
+        Text "(CASE " :: (branchSteps @ elseSteps @ [ Text "END)" ] @ next)
 
     /// 式 1つ分の表示手順を、後続の手順の前に展開する。
     let private exprSteps (e: Expr) (next: PrintStep list) : PrintStep list =
@@ -724,63 +767,17 @@ module internal Expr =
             Text "("
             :: Sub(x, [ Text(if neg then " IS NOT NULL)" else " IS NULL)") ])
             :: next
-        | Expr.IsTruth(x, expected, neg) ->
-            let label =
-                match expected with
-                | TruthValue.True -> "TRUE"
-                | TruthValue.False -> "FALSE"
-                | TruthValue.Unknown -> "UNKNOWN"
-
-            let op = if neg then " IS NOT " else " IS "
-
-            Text "(" :: Sub(x, [ Text(op + label + ")") ]) :: next
+        | Expr.IsTruth(x, expected, neg) -> isTruthSteps x expected neg next
         | Expr.Between(x, a, b, neg) ->
             Text "("
             :: Sub(x, [ Text(if neg then " NOT BETWEEN " else " BETWEEN ") ])
             :: Sub(a, [ Text " AND " ])
             :: Sub(b, [ Text ")" ])
             :: next
-        | Expr.InList(x, xs, neg) ->
-            let opener = Text(if neg then " NOT IN (" else " IN (")
-
-            match xs with
-            | [] -> Text "(" :: Sub(x, [ opener; Text "))" ]) :: next
-            | _ ->
-                let n = List.length xs
-
-                let items =
-                    xs |> List.mapi (fun i y -> Sub(y, [ Text(if i = n - 1 then "))" else ", ") ]))
-
-                Text "(" :: Sub(x, [ opener ]) :: (items @ next)
-        | Expr.Like(x, p, neg, esc) ->
-            let closer =
-                match esc with
-                | None -> [ Text ")" ]
-                | Some escExpr -> [ Text " ESCAPE "; Sub(escExpr, [ Text ")" ]) ]
-
-            Text "("
-            :: Sub(x, [ Text(if neg then " NOT LIKE " else " LIKE ") ])
-            :: Sub(p, closer)
-            :: next
-        | Expr.Case(branches, elseE) ->
-            let branchSteps =
-                branches
-                |> List.collect (fun (w, t) -> [ Text "WHEN "; Sub(w, [ Text " THEN " ]); Sub(t, [ Text " " ]) ])
-
-            let elseSteps =
-                match elseE with
-                | Some v -> [ Text "ELSE "; Sub(v, [ Text " " ]) ]
-                | None -> []
-
-            Text "(CASE " :: (branchSteps @ elseSteps @ [ Text "END)" ] @ next)
-        | Expr.FuncCall(n, args) ->
-            let n' = List.length args
-
-            let items =
-                args
-                |> List.mapi (fun i y -> Sub(y, [ Text(if i = n' - 1 then ")" else ", ") ]))
-
-            Text n :: Text "(" :: (items @ next)
+        | Expr.InList(x, xs, neg) -> inListSteps x xs neg next
+        | Expr.Like(x, p, neg, esc) -> likeSteps x p neg esc next
+        | Expr.Case(branches, elseE) -> caseSteps branches elseE next
+        | Expr.FuncCall(n, args) -> Text n :: Text "(" :: (separatedItems ")" args @ next)
         | Expr.Cast(x, dt) -> Text "CAST(" :: Sub(x, [ Text(" AS " + DataType.toSqlName dt + ")") ]) :: next
         | Expr.Default -> Text "DEFAULT" :: next
         | Expr.AggCall(f, distinct, x) ->

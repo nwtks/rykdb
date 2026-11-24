@@ -34,29 +34,29 @@ module internal Writer =
         if bs.Length = 0 then w else add (Bytes bs) w
 
     /// BOOL を 1バイト（1 / 0）で追加する。
-    let bool (v: bool) = add (Byte(if v then 1uy else 0uy))
+    let bool (v: bool) (w: Writer) = add (Byte(if v then 1uy else 0uy)) w
 
     /// 符号なし LEB128（順序保持ではない）。
-    let varint (v: uint64) = add (Varint v)
+    let varint (v: uint64) (w: Writer) = add (Varint v) w
 
     /// リトルエンディアン 8バイト。
-    let int64LE (v: int64) = add (UInt64LE(uint64 v))
+    let int64LE (v: int64) (w: Writer) = add (UInt64LE(uint64 v)) w
 
     /// リトルエンディアン 4バイト（符号なし）。
     /// WAL のフレームヘッダや SSTable の Footer など固定長フィールド用。
-    let uint32LE (v: uint32) = add (UInt32LE v)
+    let uint32LE (v: uint32) (w: Writer) = add (UInt32LE v) w
 
     /// ビッグエンディアン 8バイト（符号なし）。
     /// 順序保持符号化で使う。
-    let uint64BE (v: uint64) = add (UInt64BE v)
+    let uint64BE (v: uint64) (w: Writer) = add (UInt64BE v) w
 
     /// 長さ付きバイト列（varint 長 + 実体）。
-    let lengthPrefixed (bs: byte array) =
-        varint (uint64 bs.Length) >> writeBytes bs
+    let lengthPrefixed (bs: byte array) (w: Writer) =
+        varint (uint64 bs.Length) w |> writeBytes bs
 
     /// UTF-8 文字列を長さ付きで追加する。
-    let str (s: string) =
-        lengthPrefixed (System.Text.Encoding.UTF8.GetBytes s)
+    let str (s: string) (w: Writer) =
+        lengthPrefixed (System.Text.Encoding.UTF8.GetBytes s) w
 
     /// varint を `out.[pos]` から書き込み、次の空き位置を返す。
     [<TailCall>]

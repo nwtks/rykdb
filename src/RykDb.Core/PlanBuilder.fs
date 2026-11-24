@@ -823,7 +823,85 @@ module internal PlanBuilder =
         else
             None
 
-    /// INNER JOIN 区間 1 つ分の計画を組み立てる。
+    /// INNER JOIN 区間の結合順を決める材料（区間全体で 1回だけ計算する）。
+    type private SegmentPlan =
+        {
+            Edges: JoinOrderEdge list
+            OnPredicates: (int * Set<string> * Expr) list
+            UnmovableOns: (int * Expr) list
+            Dependencies: (string * Set<string>) option list
+            WorkMemBytes: float
+        }
+
+    /// 区間の述語・依存関係・作業メモリをまとめる。
+    let private segmentPlanOf (accSchema: Schema) (inner: (int * JoinClause) list) (input: SegmentInput) =
+        let schema =
+            inner
+            |> List.fold (fun s (i, _) -> Schema.concat s (bindingSchema input.Bindings.[i])) accSchema
+
+        let qualifiedOns = qualifyOns schema inner
+
+        {
+            Edges =
+                segmentEdges
+                    schema
+                    (concatSchemas input.Bindings)
+                    qualifiedOns
+                    input.JoinPredicates
+                    input.EdgeSelectivity
+            OnPredicates = movableOns qualifiedOns
+            UnmovableOns = unmovableOnsOf qualifiedOns
+            Dependencies = joinDependencies input.Bindings qualifiedOns
+            WorkMemBytes =
+                if input.Ctx.Budget.Work >= 0L then
+                    float input.Ctx.Budget.Work
+                else
+                    -1.0
+        }
+
+    /// `applyJoinOrder` に渡す入力を作る。
+    let private orderInput (plan: SegmentPlan) (input: SegmentInput) (byName: Map<string, int>) =
+        {
+            Bindings = input.Bindings
+            Scans = input.Scans
+            JoinPredicates = input.JoinPredicates
+            OnPredicates = plan.OnPredicates
+            UnmovableOns = plan.UnmovableOns
+            ByName = byName
+        }
+
+    /// 先頭テーブルを緩めた順で区間を積む。
+    let private applyRelaxedOrder
+        (plan: SegmentPlan)
+        (input: SegmentInput)
+        (firstIndex: int)
+        (order: string list)
+        (byName: Map<string, int>)
+        (used: Set<int>)
+        =
+        applyJoinOrder
+            (orderInput plan input byName)
+            input.Scans.[firstIndex]
+            (bindingSchema input.Bindings.[firstIndex])
+            (Set.singleton (lowerName input.Bindings.[firstIndex]))
+            used
+            Set.empty
+            (List.tail order)
+
+    /// FROM 順（貪欲）で区間を積む。
+    let private applyNormalOrder
+        (plan: SegmentPlan)
+        (input: SegmentInput)
+        (acc: Logical)
+        (accSchema: Schema)
+        (joined: Set<string>)
+        (used: Set<int>)
+        (normalByName: Map<string, int>)
+        (normalOrder: string list)
+        =
+        applyJoinOrder (orderInput plan input normalByName) acc accSchema joined used Set.empty normalOrder
+
+    /// INNER JOIN 区間 1つ分の計画を組み立てる。
     /// 戻り値は (木, スキーマ, 取り込んだ WHERE 述語の番号集合)。
     let private planInnerSegment
         (acc: Logical)
@@ -834,78 +912,34 @@ module internal PlanBuilder =
         (allowFirstRelax: bool)
         (input: SegmentInput)
         =
-        let segmentSchema =
-            inner
-            |> List.fold (fun schema (i, _) -> Schema.concat schema (bindingSchema input.Bindings.[i])) accSchema
-
-        let qualifiedOns = qualifyOns segmentSchema inner
-
-        let edges =
-            segmentEdges
-                segmentSchema
-                (concatSchemas input.Bindings)
-                qualifiedOns
-                input.JoinPredicates
-                input.EdgeSelectivity
-
-        let onPredicates = movableOns qualifiedOns
-        let unmovableOns = unmovableOnsOf qualifiedOns
-        let dependencies = joinDependencies input.Bindings qualifiedOns
-
-        let workMemBytes =
-            if input.Ctx.Budget.Work >= 0L then
-                float input.Ctx.Budget.Work
-            else
-                -1.0
+        let plan = segmentPlanOf accSchema inner input
 
         let normalOrder =
-            normalOrderOf inner acc accSchema joined dependencies edges workMemBytes input
+            normalOrderOf inner acc accSchema joined plan.Dependencies plan.Edges plan.WorkMemBytes input
 
         let normalByName =
             inner |> List.map (fun (i, _) -> lowerName input.Bindings.[i], i) |> Map.ofList
 
         let relaxedOrder =
-            relaxedOrderOf inner dependencies edges workMemBytes allowFirstRelax input
+            relaxedOrderOf inner plan.Dependencies plan.Edges plan.WorkMemBytes allowFirstRelax input
 
         let bushyApplied =
-            bushyResultOf inner joined unmovableOns dependencies edges onPredicates workMemBytes input
+            bushyResultOf
+                inner
+                joined
+                plan.UnmovableOns
+                plan.Dependencies
+                plan.Edges
+                plan.OnPredicates
+                plan.WorkMemBytes
+                input
 
         match bushyApplied with
         | Some result -> result
         | None ->
             match relaxedOrder with
-            | Some(firstIndex, order, byName) ->
-                applyJoinOrder
-                    {
-                        Bindings = input.Bindings
-                        Scans = input.Scans
-                        JoinPredicates = input.JoinPredicates
-                        OnPredicates = onPredicates
-                        UnmovableOns = unmovableOns
-                        ByName = byName
-                    }
-                    input.Scans.[firstIndex]
-                    (bindingSchema input.Bindings.[firstIndex])
-                    (Set.singleton (lowerName input.Bindings.[firstIndex]))
-                    used
-                    Set.empty
-                    (List.tail order)
-            | None ->
-                applyJoinOrder
-                    {
-                        Bindings = input.Bindings
-                        Scans = input.Scans
-                        JoinPredicates = input.JoinPredicates
-                        OnPredicates = onPredicates
-                        UnmovableOns = unmovableOns
-                        ByName = normalByName
-                    }
-                    acc
-                    accSchema
-                    joined
-                    used
-                    Set.empty
-                    normalOrder
+            | Some(firstIndex, order, byName) -> applyRelaxedOrder plan input firstIndex order byName used
+            | None -> applyNormalOrder plan input acc accSchema joined used normalByName normalOrder
 
     /// FROM と JOIN を左から順に積む（末尾再帰）。
     /// LEFT JOIN は 1 つずつ、INNER JOIN は区間ごとに結合順を解析して積む。

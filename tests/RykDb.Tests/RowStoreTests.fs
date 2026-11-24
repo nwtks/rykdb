@@ -386,7 +386,7 @@ let ``RowStore.openStore: 開く途中で失敗してもロックを解放する
         let sst = System.IO.Directory.GetFiles(dir, "*.sst") |> Array.exactlyOne
         let original = System.IO.File.ReadAllBytes sst
         let broken = Array.copy original
-        let magicOffset = broken.Length - Sstable.FooterSize
+        let magicOffset = broken.Length - SstableFormat.FooterSize
         broken.[magicOffset] <- broken.[magicOffset] ^^^ 0xFFuy
         System.IO.File.WriteAllBytes(sst, broken)
         expectErrorKind ErrorKind.CorruptionError "壊れた SSTable を開けてしまった" (RowStore.openStore dir)

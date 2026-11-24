@@ -56,6 +56,32 @@ type internal SstWriteInfo =
         Bloom: BloomFilter option
     }
 
+/// footer を decode した情報。
+type internal SstFooterInfo =
+    {
+        Version: int
+        MaxSeqNo: uint64
+        IndexOff: int
+        IndexLen: int
+        BloomOff: int
+        BloomLen: int
+        MetaOff: int
+        MetaLen: int
+        EntryCount: int
+        MetadataChecksum: uint32
+    }
+
+/// フッター手前に書き出すメタ・Bloom・索引の符号化結果。
+type private SstableTailParts =
+    {
+        DataSize: int
+        MetaBytes: byte array
+        BloomFilter: BloomFilter option
+        BloomBytes: byte array
+        Index: SstIndexEntry array
+        IndexBytes: byte array
+    }
+
 module internal SstableFormat =
     /// 1ブロックあたりのエントリ数。
     [<Literal>]
@@ -131,21 +157,6 @@ module internal SstableFormat =
 
         let footerChecksum = Hashing.checksum body
         Writer.build [ Writer.writeBytes body; Writer.uint32LE footerChecksum ]
-
-    /// footer を decode した情報。
-    type internal FooterInfo =
-        {
-            Version: int
-            MaxSeqNo: uint64
-            IndexOff: int
-            IndexLen: int
-            BloomOff: int
-            BloomLen: int
-            MetaOff: int
-            MetaLen: int
-            EntryCount: int
-            MetadataChecksum: uint32
-        }
 
     /// int に収まる非負の int64 か。
     let private fitsInt (v: int64) =
@@ -301,6 +312,92 @@ module internal SstableFormat =
         >> Array.toList
         >> Writer.build
 
+    /// 残っているブロックを書き出し、(データ長, 索引) を返す。
+    let private flushPendingBlock
+        (stream: System.IO.Stream)
+        (block: SstEntry list)
+        (offset: int)
+        (indexEntries: SstIndexEntry list)
+        =
+        if List.isEmpty block then
+            ret (offset, indexEntries)
+        else
+            writeBlock stream (block |> List.rev |> List.toArray) offset indexEntries
+
+    /// メタ（先頭・末尾キー）を符号化する。
+    let private metaBytesOf (firstKey: byte array option) (lastKey: byte array option) =
+        match firstKey, lastKey with
+        | Some first, Some last -> Writer.build [ Writer.lengthPrefixed first; Writer.lengthPrefixed last ]
+        | _ -> [||]
+
+    /// Bloom filter とその符号化結果を返す（0 件なら None と空配列）。
+    let private bloomBytesOf (bloom: BloomFilter.BloomBuilder) (count: int64) =
+        if count = 0L then
+            None, [||]
+        else
+            let filter = bloom.Build()
+            Some filter, BloomFilter.serialize filter
+
+    /// フッター手前に書き出すメタ・Bloom・索引をまとめる。
+    let private buildTail
+        (bloom: BloomFilter.BloomBuilder)
+        (count: int64)
+        (firstKey: byte array option)
+        (lastKey: byte array option)
+        (dataSize: int)
+        (indexEntries: SstIndexEntry list)
+        =
+        let metaBytes = metaBytesOf firstKey lastKey
+        let bloomFilter, bloomBytes = bloomBytesOf bloom count
+        let bloomOff = int64 dataSize + int64 metaBytes.Length
+        let indexOff = bloomOff + int64 bloomBytes.Length
+        let index = List.rev indexEntries |> List.toArray
+        let indexBytes = indexBytesOf index
+
+        if indexOff + int64 indexBytes.Length > int64 System.Int32.MaxValue then
+            err (DbError.internalError "Sstable: ファイルが大きすぎます")
+        else
+            ret
+                {
+                    DataSize = dataSize
+                    MetaBytes = metaBytes
+                    BloomFilter = bloomFilter
+                    BloomBytes = bloomBytes
+                    Index = index
+                    IndexBytes = indexBytes
+                }
+
+    /// メタ・Bloom・索引・フッターを書き出し、ファイルサイズを返す。
+    let private writeTail (stream: System.IO.Stream) (maxSeqNo: uint64) (count: int64) (tail: SstableTailParts) =
+        let metaBytes = tail.MetaBytes
+        let bloomBytes = tail.BloomBytes
+        let indexBytes = tail.IndexBytes
+        let bloomOff = int64 tail.DataSize + int64 metaBytes.Length
+        let indexOff = bloomOff + int64 bloomBytes.Length
+
+        let metadataChecksum =
+            Hashing.checksumChunks [| metaBytes; bloomBytes; indexBytes |]
+
+        stream.Write(metaBytes, 0, metaBytes.Length)
+        stream.Write(bloomBytes, 0, bloomBytes.Length)
+        stream.Write(indexBytes, 0, indexBytes.Length)
+
+        let footer =
+            encodeFooter
+                maxSeqNo
+                (int indexOff)
+                indexBytes.Length
+                (int bloomOff)
+                bloomBytes.Length
+                tail.DataSize
+                metaBytes.Length
+                (int count)
+                metadataChecksum
+
+        stream.Write(footer, 0, footer.Length)
+
+        ret (indexOff + int64 indexBytes.Length + int64 footer.Length)
+
     /// ブロック列・Bloom・索引・フッターを書き出し、結果を返す。
     let private finishWrite
         (stream: System.IO.Stream)
@@ -313,60 +410,21 @@ module internal SstableFormat =
         (offset: int)
         (indexEntries: SstIndexEntry list)
         =
-        (if List.isEmpty block then
-             ret (offset, indexEntries)
-         else
-             writeBlock stream (block |> List.rev |> List.toArray) offset indexEntries)
+        flushPendingBlock stream block offset indexEntries
         >>= fun (dataSize, indexEntries) ->
-            let metaBytes =
-                match firstKey, lastKey with
-                | Some first, Some last -> Writer.build [ Writer.lengthPrefixed first; Writer.lengthPrefixed last ]
-                | _ -> [||]
-
-            let bloomOff = int64 dataSize + int64 metaBytes.Length
-            let bloomFilter = if count = 0L then None else Some(bloom.Build())
-
-            let bloomBytes =
-                bloomFilter |> Option.map BloomFilter.serialize |> Option.defaultValue [||]
-
-            let indexOff = bloomOff + int64 bloomBytes.Length
-            let index = List.rev indexEntries |> List.toArray
-            let indexBytes = indexBytesOf index
-
-            if indexOff + int64 indexBytes.Length > int64 System.Int32.MaxValue then
-                err (DbError.internalError "Sstable: ファイルが大きすぎます")
-            else
-                let metadataChecksum =
-                    Hashing.checksumChunks [| metaBytes; bloomBytes; indexBytes |]
-
-                stream.Write(metaBytes, 0, metaBytes.Length)
-                stream.Write(bloomBytes, 0, bloomBytes.Length)
-                stream.Write(indexBytes, 0, indexBytes.Length)
-
-                let footer =
-                    encodeFooter
-                        maxSeqNo
-                        (int indexOff)
-                        indexBytes.Length
-                        (int bloomOff)
-                        bloomBytes.Length
-                        dataSize
-                        metaBytes.Length
-                        (int count)
-                        metadataChecksum
-
-                stream.Write(footer, 0, footer.Length)
-
-                ret
+            buildTail bloom count firstKey lastKey dataSize indexEntries
+            >>= fun tail ->
+                writeTail stream maxSeqNo count tail
+                |> Result.map (fun size ->
                     {
-                        Size = indexOff + int64 indexBytes.Length + int64 footer.Length
+                        Size = size
                         FirstKey = defaultArg firstKey [||]
                         LastKey = defaultArg lastKey [||]
                         EntryCount = count
                         MaxSeqNo = maxSeqNo
-                        Index = index
-                        Bloom = bloomFilter
-                    }
+                        Index = tail.Index
+                        Bloom = tail.BloomFilter
+                    })
 
     /// エントリをブロック単位で書き出す（末尾再帰）。
     [<TailCall>]

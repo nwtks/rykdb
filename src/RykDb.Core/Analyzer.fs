@@ -143,8 +143,8 @@ module internal Analyzer =
     /// 並び順が保証されない木は None。
     /// <remarks>
     /// マージ結合は「両入力が結合キーで昇順」の場合にだけ使える。
-    /// LSM の走査はキーのバイト順 = 主キー / 索引列の SQL 順なので、
-    /// 主キー走査・索引走査はこの並びを返す。`Filter` / `Limit` は順序を変えない。
+    /// LSM の走査はキーのバイト順 = 主キー / 索引列の SQL 順なので、主キー走査・索引走査はこの並びを返す。
+    /// `Filter` / `Limit` は順序を変えない。
     /// </remarks>
     /// 主キー列の並びを返す（主キーが無ければ None）。
     let private primaryKeyOrder (t: TableSchema) =
@@ -195,8 +195,7 @@ module internal Analyzer =
         alignJoinKeysPick schema indices [] [] >> Option.map List.toArray
 
     /// 結合キーを走査順に並べ替える。
-    /// 走査順の先頭 `indices.Length` 列がちょうど結合キーであれば、
-    /// その順のキー位置と列名を返す。
+    /// 走査順の先頭 `indices.Length` 列がちょうど結合キーであれば、その順のキー位置と列名を返す。
     /// （キーでない列がキーの間に挟まると、その走査はキー順にならないので None）
     let private alignJoinKeys (schema: Schema) (indices: int array) =
         function
@@ -219,16 +218,13 @@ module internal Analyzer =
         | Logical.Filter(p, child) -> unwrapScanPreds (p :: preds) child
         | _ -> None
 
-    /// 右部分木の `Scan`（`Filter` を重ねてもよい）から、
-    /// 走査名・走査方法・residual の述語を返す。
-    /// インデックス入れ子ループは右部分木を実行しないため、
-    /// `Filter` の述語は residual として結合時に評価する
+    /// 右部分木の `Scan`（`Filter` を重ねてもよい）から、走査名・走査方法・residual の述語を返す。
+    /// インデックス入れ子ループは右部分木を実行しないため、`Filter` の述語は residual として結合時に評価する
     /// （捨てると WHERE の pushdown が消えて結果が変わる）。
     let private scanOfRight = unwrapScanPreds []
 
     /// 右部分木を索引で引ける形か（`Scan` か `Filter` の連なり）。
-    /// インデックス入れ子ループは右部分木を実行しないため、
-    /// `Filter` は residual に回して評価する。
+    /// インデックス入れ子ループは右部分木を実行しないため、`Filter` は residual に回して評価する。
     /// 結合順のコスト見積りが実行時と同じ条件で INL を選ぶために使う。
     let canScanJoinRight = scanOfRight >> Option.isSome
 
@@ -245,8 +241,8 @@ module internal Analyzer =
         Expr.Binary(BinaryOp.Eq, absorbedColumn rightName name, Expr.Value value)
 
     /// 走査方法が吸収した等値述語を `Expr` に再構成する。
-    /// `Analyzer.impliedByScan` は `PkLookup` / `IndexLookup` が保証する等値を
-    /// `Filter` から除くため、INL では residual に戻さないと結果が変わる。
+    /// `Analyzer.impliedByScan` は `PkLookup` / `IndexLookup` が保証する等値を`Filter` から除くため、
+    /// INL では residual に戻さないと結果が変わる。
     /// 索引が見つからない・値の数が合わないなど再構成できないときは None を返し、INL にしない。
     let private absorbedPredicates (rightTable: TableSchema) (rightName: string) =
         function
@@ -606,7 +602,7 @@ module internal Analyzer =
         | BinaryOp.Le -> BinaryOp.Ge
         | other -> other
 
-    /// 等値述語の選択性（列どうし → 列とリテラル → 既定値の順）。
+    /// 等値述語の選択性（列同士 → 列とリテラル → 既定値の順）。
     let private equalityPredicateSelectivity
         (statsOf: string -> TableStats option)
         (defaultSelectivity: float)
@@ -741,6 +737,7 @@ module internal Analyzer =
         >> List.fold (*) 1.0
 
     /// 行数の見積り。
+    /// 選択性を行数へ適用する（下限 1行）。
     /// 統計が無ければ従来の定数だけを使う。
     /// 結合順の決定（`PlanBuilder`）とインデックス入れ子ループの判断（`chooseJoinAlgorithm`）で同じ値を使う。
     /// 上限なし・未知は `infinity`。
@@ -749,7 +746,6 @@ module internal Analyzer =
     /// 統計があるときは走査の基数を実測行数にし、等値結合を `1 / max(NDV_l, NDV_r)` で見積もる。
     /// 統計が無い結合は従来どおり左右の小さい方（外側の行数は内側で絞られる）。
     /// </remarks>
-    /// 選択性を行数へ適用する（下限 1行）。
     let private scaledRows (rows: float) (selectivity: float) =
         if rows <= 0.0 then 0.0 else max 1.0 (rows * selectivity)
 
@@ -1297,7 +1293,7 @@ module internal Analyzer =
         | None, None -> None
 
     /// WHERE から等価条件を探して走査方法を決める。
-    /// 複合主キーは全列の等値条件が揃ったときだけ PkLookup にし,
+    /// 複合主キーは全列の等値条件が揃ったときだけ PkLookup にして、
     /// 複合索引は先頭から連続する等値列の範囲で IndexLookup にする。
     let chooseScanMethod (b: TableBinding) (catalog: Catalog) (predicates: Expr list) =
         let tn = refName b

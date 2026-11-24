@@ -5,9 +5,6 @@
 namespace RykDb.Core
 
 module internal Sstable =
-    /// Footer の固定長（形式は `SstableFormat`）。
-    let internal FooterSize = SstableFormat.FooterSize
-
     /// カーソルを末尾まで読み、配列へ詰める本体。
     [<TailCall>]
     let rec private readItemsLoop
@@ -146,7 +143,7 @@ module internal Sstable =
                 None
 
     /// Footer の内容を検証する。
-    let private validateFooter (info: SstableFormat.FooterInfo) (magic: string) (footerStart: int64) =
+    let private validateFooter (info: SstFooterInfo) (magic: string) (footerStart: int64) =
         if magic <> SstableFormat.Magic then
             err (DbError.corruption "Sstable: マジックが違います")
         elif
@@ -171,7 +168,7 @@ module internal Sstable =
 
     /// 部分読みのメタデータを読んで SstReadInfo を作る。
     let private readPartialInfo (path: string) (stream: System.IO.FileStream) =
-        match readFooter stream FooterSize with
+        match readFooter stream SstableFormat.FooterSize with
         | None -> err (DbError.corruption "Sstable: Footer がありません")
         | Some(footerStart, footerBytes) ->
             parseFooterBytes footerBytes footerStart

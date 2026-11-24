@@ -71,11 +71,66 @@ module internal OpsSort =
                 keyValues.[i] <- v
                 sortFillKeys resolve row keyValues (i + 1) tail
 
+    /// ORDER BY の式が列参照なのに解決できないときのエラーを返す。
+    let private unresolvedSortColumn (schema: Schema) (keys: RykDb.Core.SortKey list) =
+        keys
+        |> List.tryPick (fun k ->
+            match Schema.tryAsColumnRef k.Expression with
+            | None -> None
+            | Some c ->
+                let bare = { Qualifier = None; Name = c.Name }
+
+                match Schema.resolve c schema with
+                | Ok _ -> None
+                | Error _ ->
+                    match Schema.resolve bare schema with
+                    | Ok _ -> None
+                    | Error e -> Some e)
+
+    /// 列位置へ解決済みのキーでソートする。
+    let private sortByColumns (budget: MemoryBudget) (plan: (int * SortDirection) list) (src: Op) =
+        ExtSort.sortRows budget Map.empty (sortCheckNulls plan) (sortCompareKeys plan) src
+
+    /// キー式を評価して行末へ足してからソートする。
+    let private sortByExpressions
+        (budget: MemoryBudget)
+        (schema: Schema)
+        (groupBy: Expr list)
+        (aggs: (AggFunc * bool * bool * Expr) list)
+        (keys: RykDb.Core.SortKey list)
+        (src: Op)
+        =
+        let exprs = keys |> List.map _.Expression
+
+        let prepared =
+            if List.isEmpty groupBy && List.isEmpty aggs then
+                let resolve = Eval.prepare schema exprs
+
+                match Eval.checkPrepared resolve with
+                | Error e -> err e
+                | Ok() -> ret (resolve, exprs)
+            else
+                prepareAggExprs groupBy aggs exprs
+
+        match prepared with
+        | Error e -> err e
+        | Ok(resolveKeys, slotExprs) ->
+            let width = schema.Columns.Length
+            let plan = keys |> List.mapi (fun i k -> width + i, k.Direction)
+
+            let projected =
+                Op.map
+                    (fun row ->
+                        let keyValues = Array.zeroCreate<SqlValue> slotExprs.Length
+                        sortFillKeys resolveKeys row keyValues 0 slotExprs)
+                    src
+
+            ExtSort.sortRows budget Map.empty (sortCheckNulls plan) (sortCompareKeys plan) projected
+            |> Result.map (Op.map (fun row -> DbOk(Array.sub row 0 width)))
+
     /// ソート。
-    /// ORDER BY のキーを列位置へ解決できるならそのまま使い、
-    /// 式が含まれる場合はキーを評価して行末へ足してからソートする。
-    /// 集約後の行（`groupBy` / `aggs` が非空）では、キー式を
-    /// グループ値・集約値のスロット参照へ計画時に置き換えてから評価する
+    /// ORDER BY のキーを列位置へ解決できるならそのまま使い、式が含まれる場合はキーを評価して行末へ足してからソートする。
+    /// 集約後の行（`groupBy` / `aggs` が非空）では、キー式をグループ値・集約値のスロット参照へ計画時に置き換えてから評価する
     /// （`ORDER BY COUNT(*)` / `ORDER BY age + 1` / 別名・序数経由の同じ形）。
     /// `*` / `t.*` はORDER BY には書けない。
     let sortBy
@@ -88,22 +143,7 @@ module internal OpsSort =
         =
         let resolve = Eval.prepare schema (keys |> List.map _.Expression)
 
-        let unresolved =
-            keys
-            |> List.tryPick (fun k ->
-                match Schema.tryAsColumnRef k.Expression with
-                | None -> None
-                | Some c ->
-                    let bare = { Qualifier = None; Name = c.Name }
-
-                    match Schema.resolve c schema with
-                    | Ok _ -> None
-                    | Error _ ->
-                        match Schema.resolve bare schema with
-                        | Ok _ -> None
-                        | Error e -> Some e)
-
-        match unresolved with
+        match unresolvedSortColumn schema keys with
         | Some e -> err e
         | None ->
             if List.isEmpty keys then
@@ -112,36 +152,6 @@ module internal OpsSort =
                 let columns = keys |> List.map (sortResolveColumn resolve)
 
                 if List.forall Option.isSome columns then
-                    let plan = columns |> List.choose id
-
-                    result {
-                        return! ExtSort.sortRows budget Map.empty (sortCheckNulls plan) (sortCompareKeys plan) src
-                    }
+                    sortByColumns budget (columns |> List.choose id) src
                 else
-                    let exprs = keys |> List.map _.Expression
-
-                    let prepared =
-                        if List.isEmpty groupBy && List.isEmpty aggs then
-                            let resolve = Eval.prepare schema exprs
-
-                            match Eval.checkPrepared resolve with
-                            | Error e -> err e
-                            | Ok() -> ret (resolve, exprs)
-                        else
-                            prepareAggExprs groupBy aggs exprs
-
-                    match prepared with
-                    | Error e -> err e
-                    | Ok(resolveKeys, slotExprs) ->
-                        let width = schema.Columns.Length
-                        let plan = keys |> List.mapi (fun i k -> width + i, k.Direction)
-
-                        let projected =
-                            Op.map
-                                (fun row ->
-                                    let keyValues = Array.zeroCreate<SqlValue> slotExprs.Length
-                                    sortFillKeys resolveKeys row keyValues 0 slotExprs)
-                                src
-
-                        ExtSort.sortRows budget Map.empty (sortCheckNulls plan) (sortCompareKeys plan) projected
-                        |> Result.map (Op.map (fun row -> DbOk(Array.sub row 0 width)))
+                    sortByExpressions budget schema groupBy aggs keys src

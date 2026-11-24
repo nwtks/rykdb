@@ -106,82 +106,99 @@ module internal EngineAnalyze =
             Indexes = indexes
         }
 
+    /// 文字列キーの出現数を 1 増やす（なければ 1）。
+    let private bumpCount (counts: System.Collections.Generic.Dictionary<string, int64>) (key: string) =
+        match counts.TryGetValue key with
+        | true, n -> counts.[key] <- n + 1L
+        | _ -> counts.[key] <- 1L
+
+    /// 列位置ごとの件数を 1 増やす（なければ 1）。
+    let private bumpPosition (counts: System.Collections.Generic.Dictionary<int, int64>) (position: int) =
+        match counts.TryGetValue position with
+        | true, n -> counts.[position] <- n + 1L
+        | _ -> counts.[position] <- 1L
+
+    /// 数値列の最小・最大を更新する。
+    let private updateMinMax
+        (minMax: System.Collections.Generic.Dictionary<int, struct (float * float)>)
+        (position: int)
+        (v: float)
+        =
+        match minMax.TryGetValue position with
+        | true, struct (lo, hi) -> minMax.[position] <- struct (min lo v, max hi v)
+        | _ -> minMax.[position] <- struct (v, v)
+
+    /// reservoir 標本へ 1 件加える（`seen` は加算後の件数）。
+    let private addSample
+        (samples: System.Collections.Generic.Dictionary<int, float list>)
+        (rng: System.Collections.Generic.Dictionary<int, int64>)
+        (limit: int)
+        (position: int)
+        (seen: int64)
+        (v: float)
+        =
+        let current =
+            match samples.TryGetValue position with
+            | true, xs -> xs
+            | _ -> []
+
+        if List.length current < limit then
+            samples.[position] <- v :: current
+        else
+            let state =
+                match rng.TryGetValue position with
+                | true, s -> s
+                | _ -> 1L
+
+            let state = nextRandom state
+            rng.[position] <- state
+            let j = int ((state >>> 1) % seen)
+
+            if j < limit then
+                samples.[position] <- current |> List.mapi (fun k existing -> if k = j then v else existing)
+
+    /// 列値 1つ分（NULL 以外）の統計を加算する。
+    let private accumulateValue (acc: StatsAccumulators) (histogramSamples: int) (position: int) (value: SqlValue) =
+        bumpCount acc.ColumnSets.[position] (SqlLiteral.toSqlLiteral value)
+
+        match SqlValue.asNumeric value with
+        | Some d ->
+            let v = float d
+            updateMinMax acc.MinMax position v
+            bumpPosition acc.NumericSeen position
+            addSample acc.NumericSamples acc.NumericRng histogramSamples position acc.NumericSeen.[position] v
+        | None -> ()
+
+    /// 索引 1本分のキー集合へ行の値を加える。
+    let private accumulateIndexKeys
+        (positions: int array)
+        (sets: System.Collections.Generic.HashSet<string> array)
+        (row: SqlValue array)
+        =
+        positions
+        |> Array.fold
+            (fun (key, k) pos ->
+                if pos < row.Length then
+                    let part = SqlLiteral.toSqlLiteral row.[pos]
+                    let key = key + string part.Length + ":" + part
+                    sets.[k].Add key |> ignore
+
+                key, k + 1)
+            ("", 0)
+        |> ignore
+
     /// 1行を統計の辞書へ加算する。
     let private accumulateRow (acc: StatsAccumulators) (histogramSamples: int) (row: SqlValue array) =
-        let columnSets = acc.ColumnSets
-        let nullCounts = acc.NullCounts
-        let minMax = acc.MinMax
-        let numericSamples = acc.NumericSamples
-        let numericSeen = acc.NumericSeen
-        let numericRng = acc.NumericRng
-        let indexes = acc.Indexes
-
         row
         |> Array.iteri (fun i value ->
-            if i < columnSets.Length then
+            if i < acc.ColumnSets.Length then
                 if SqlValue.isNull value then
-                    let current =
-                        match nullCounts.TryGetValue i with
-                        | true, n -> n
-                        | _ -> 0L
-
-                    nullCounts.[i] <- current + 1L
+                    bumpPosition acc.NullCounts i
                 else
-                    let key = SqlLiteral.toSqlLiteral value
+                    accumulateValue acc histogramSamples i value)
 
-                    match columnSets.[i].TryGetValue key with
-                    | true, n -> columnSets.[i].[key] <- n + 1L
-                    | _ -> columnSets.[i].[key] <- 1L
-
-                    match SqlValue.asNumeric value with
-                    | Some d ->
-                        let v = float d
-
-                        match minMax.TryGetValue i with
-                        | true, struct (lo, hi) -> minMax.[i] <- struct (min lo v, max hi v)
-                        | _ -> minMax.[i] <- struct (v, v)
-
-                        let seen =
-                            match numericSeen.TryGetValue i with
-                            | true, n -> n + 1L
-                            | _ -> 1L
-
-                        numericSeen.[i] <- seen
-
-                        let samples =
-                            match numericSamples.TryGetValue i with
-                            | true, xs -> xs
-                            | _ -> []
-
-                        if List.length samples < histogramSamples then
-                            numericSamples.[i] <- v :: samples
-                        else
-                            let rng =
-                                match numericRng.TryGetValue i with
-                                | true, s -> s
-                                | _ -> 1L
-
-                            let rng = nextRandom rng
-                            numericRng.[i] <- rng
-                            let j = int ((rng >>> 1) % seen)
-
-                            if j < histogramSamples then
-                                numericSamples.[i] <-
-                                    samples |> List.mapi (fun k current -> if k = j then v else current)
-                    | None -> ())
-
-        for _, positions, sets in indexes do
-            positions
-            |> Array.fold
-                (fun (key, k) pos ->
-                    if pos < row.Length then
-                        let part = SqlLiteral.toSqlLiteral row.[pos]
-                        let key = key + string part.Length + ":" + part
-                        sets.[k].Add key |> ignore
-
-                    key, k + 1)
-                ("", 0)
-            |> ignore
+        for _, positions, sets in acc.Indexes do
+            accumulateIndexKeys positions sets row
 
     /// 走査を全件消費して統計を加算する（末尾再帰）。
     [<TailCall>]

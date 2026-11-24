@@ -464,6 +464,96 @@ module internal JoinOrder =
 
                 Some(hashDelta, newRows)
 
+    /// bushy 計画を使える条件を満たすか（件数・有限コスト・依存の閉包）。
+    let private canUseBushy (itemArray: JoinOrderItem array) (dependencies: Map<string, Set<string>>) =
+        let count = itemArray.Length
+        let full = (1 <<< count) - 1
+
+        count >= 3
+        && count <= 6
+        && not (itemArray |> Array.exists (fun item -> not (System.Double.IsFinite item.Rows)))
+        && not (
+            dependencies
+            |> Map.exists (fun _ refs -> refs |> Set.exists (fun r -> not (Set.contains r (namesOf full itemArray))))
+        )
+
+    /// 先頭テーブル候補ごとに左深 DP を回す（部分集合の最良計画を引くため）。
+    let private leftDeepByFirst
+        (itemArray: JoinOrderItem array)
+        (edges: JoinOrderEdge list)
+        (dependencies: Map<string, Set<string>>)
+        (workMemBytes: float)
+        =
+        itemArray
+        |> Array.mapi (fun f item ->
+            let initial =
+                {
+                    Cost = 0.0
+                    Rows = item.Rows
+                    RowBytes = item.RowBytes
+                    Ordered = item.NaturalOrder
+                    ScanInput = Option.isSome item.NaturalOrder
+                    Order = [ f ]
+                }
+
+            f, dpCore itemArray edges dependencies workMemBytes (Set.singleton item.Name) (1 <<< f) initial)
+
+    /// 全 2分割のうち最良の分割を返す。
+    let private bestBushySplit
+        (itemArray: JoinOrderItem array)
+        (edges: JoinOrderEdge list)
+        (dependencies: Map<string, Set<string>>)
+        (workMemBytes: float)
+        (perFirst: (int * Map<int, PlanState list>) array)
+        (full: int)
+        =
+        seq { 1 .. full - 1 }
+        |> Seq.filter (fun l -> l < full ^^^ l)
+        |> Seq.choose (fun l ->
+            let r = full ^^^ l
+
+            if
+                not (dependencyClosed itemArray dependencies l)
+                || not (dependencyClosed itemArray dependencies r)
+            then
+                None
+            else
+                match bestOf perFirst l, bestOf perFirst r with
+                | Some(lCost, lState), Some(rCost, rState) ->
+                    let leftNames = namesOf l itemArray
+                    let rightNames = namesOf r itemArray
+
+                    splitCost
+                        edges
+                        workMemBytes
+                        leftNames
+                        rightNames
+                        lState.Rows
+                        lState.RowBytes
+                        rState.Rows
+                        rState.RowBytes
+                    |> Option.map (fun (joinDelta, _) -> lCost + rCost + joinDelta, lState, rState)
+                | _ -> None)
+        |> Seq.sortBy (fun (cost, _, _) -> cost)
+        |> Seq.tryHead
+
+    /// 分割と左深のうち安い方の木を選ぶ。
+    let private chooseBushyTree
+        (itemArray: JoinOrderItem array)
+        (perFirst: (int * Map<int, PlanState list>) array)
+        (full: int)
+        (split: (float * PlanState * PlanState) option)
+        =
+        match split with
+        | Some(splitCostValue, lState, rState) ->
+            match bestOf perFirst full with
+            | Some(leftDeepCost, leftDeepState) when leftDeepCost <= splitCostValue ->
+                Some(treeOfOrder itemArray leftDeepState.Order)
+            | _ -> Some(JoinOrderTree.Branch(treeOfOrder itemArray lState.Order, treeOfOrder itemArray rState.Order))
+        | None ->
+            bestOf perFirst full
+            |> Option.map (fun (_, state) -> treeOfOrder itemArray state.Order)
+
     /// bushy 計画（1段の分割。両側は左深）。
     /// 適用できないときは None。
     let bushyPlan
@@ -472,79 +562,15 @@ module internal JoinOrder =
         (items: JoinOrderItem list)
         (dependencies: Map<string, Set<string>>)
         =
-        let maxBushyItems = 6
         let itemArray = Array.ofList items
-        let count = itemArray.Length
-        let full = (1 <<< count) - 1
+        let full = (1 <<< itemArray.Length) - 1
 
-        let unknownDependency =
-            dependencies
-            |> Map.exists (fun _ refs -> refs |> Set.exists (fun r -> not (Set.contains r (namesOf full itemArray))))
-
-        if count < 3 || count > maxBushyItems then
-            None
-        elif itemArray |> Array.exists (fun item -> not (System.Double.IsFinite item.Rows)) then
-            None
-        elif unknownDependency then
+        if not (canUseBushy itemArray dependencies) then
             None
         else
-            // 先頭テーブル候補ごとに左深 DP を回す（部分集合の最良計画を引くため）。
-            let perFirst =
-                itemArray
-                |> Array.mapi (fun f item ->
-                    let initial =
-                        {
-                            Cost = 0.0
-                            Rows = item.Rows
-                            RowBytes = item.RowBytes
-                            Ordered = item.NaturalOrder
-                            ScanInput = Option.isSome item.NaturalOrder
-                            Order = [ f ]
-                        }
-
-                    f, dpCore itemArray edges dependencies workMemBytes (Set.singleton item.Name) (1 <<< f) initial)
-
-            let splits =
-                seq { 1 .. full - 1 }
-                |> Seq.filter (fun l -> l < full ^^^ l)
-                |> Seq.choose (fun l ->
-                    let r = full ^^^ l
-
-                    if
-                        not (dependencyClosed itemArray dependencies l)
-                        || not (dependencyClosed itemArray dependencies r)
-                    then
-                        None
-                    else
-                        match bestOf perFirst l, bestOf perFirst r with
-                        | Some(lCost, lState), Some(rCost, rState) ->
-                            let leftNames = namesOf l itemArray
-                            let rightNames = namesOf r itemArray
-
-                            splitCost
-                                edges
-                                workMemBytes
-                                leftNames
-                                rightNames
-                                lState.Rows
-                                lState.RowBytes
-                                rState.Rows
-                                rState.RowBytes
-                            |> Option.map (fun (joinDelta, _) -> lCost + rCost + joinDelta, lState, rState)
-                        | _ -> None)
-                |> Seq.sortBy (fun (cost, _, _) -> cost)
-                |> Seq.tryHead
-
-            match splits with
-            | Some(splitCostValue, lState, rState) ->
-                match bestOf perFirst full with
-                | Some(leftDeepCost, leftDeepState) when leftDeepCost <= splitCostValue ->
-                    Some(treeOfOrder itemArray leftDeepState.Order)
-                | _ ->
-                    Some(JoinOrderTree.Branch(treeOfOrder itemArray lState.Order, treeOfOrder itemArray rState.Order))
-            | None ->
-                bestOf perFirst full
-                |> Option.map (fun (_, state) -> treeOfOrder itemArray state.Order)
+            let perFirst = leftDeepByFirst itemArray edges dependencies workMemBytes
+            let split = bestBushySplit itemArray edges dependencies workMemBytes perFirst full
+            chooseBushyTree itemArray perFirst full split
 
     /// Selinger DP（左深・先頭固定）。
     /// 適用できないときは None（呼び出し側が貪欲へフォールバックする）。
