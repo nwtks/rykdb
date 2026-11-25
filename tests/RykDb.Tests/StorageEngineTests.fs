@@ -650,7 +650,7 @@ let ``StorageEngine.maybeFlush: MANIFEST ローテーション後の WAL 失敗�
             | Error e -> failwithf "想定外のエラー: %A" e
 
         // 古い番号を保持すると次の flush が CURRENT の指さない MANIFEST へ追記してしまう。
-        Assert.Equal<int64<manifestNo>>(2L<manifestNo>, engine.ManifestNumber)
+        Assert.Equal<ManifestNumber>(2L<manifestNo>, engine.ManifestNumber)
 
         System.IO.Directory.Delete nextWal
 

@@ -198,19 +198,19 @@ module internal ResultOps =
     /// Result の列を先頭から畳み、最初の Error で打ち切って値のリストを返す。
     /// `seq` は 1回だけ列挙するので、1回限りの列挙子でも渡せる。
     [<TailCall>]
-    let rec private gather (e: System.Collections.Generic.IEnumerator<Result<'a, DbError>>) (acc: 'a list) =
+    let rec private gather (acc: 'a list) (e: System.Collections.Generic.IEnumerator<Result<'a, DbError>>) =
         if not (e.MoveNext()) then
             ret (List.rev acc)
         else
             match e.Current with
             | Error e -> Error e
-            | Ok v -> gather e (v :: acc)
+            | Ok v -> gather (v :: acc) e
 
     /// Result の列を値のリストにする。
     /// 最初の Error で打ち切る。
     let all (rs: Result<'a, DbError> seq) =
         use e = rs.GetEnumerator()
-        gather e []
+        gather [] e
 
     /// 状態付きの畳み込み。最初の Error で打ち切る。
     /// 空の列は `Ok state` を返す。

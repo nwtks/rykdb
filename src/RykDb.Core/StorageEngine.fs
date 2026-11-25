@@ -35,7 +35,7 @@ type internal StorageEngine =
         Dir: string
         /// 有効な manifest 番号
         /// （単位 `manifestNo`。SSTable のファイル番号とは取り違えない）。
-        ManifestNumber: int64<manifestNo>
+        ManifestNumber: ManifestNumber
         /// 現在の LSM 形状
         Version: Version
         /// 書き込み先 memtable
@@ -398,7 +398,7 @@ module internal StorageEngine =
         }
 
     /// MANIFEST 反映後の Version を受け取り、WAL を切り替えて flush 後の engine を作る。
-    let private finishFlush (engine: StorageEngine) (version: Version) (manifestNumber: int64<manifestNo>) =
+    let private finishFlush (engine: StorageEngine) (version: Version) (manifestNumber: ManifestNumber) =
         result {
             let! rotated = Wal.rotate engine.Wal |> rotateWal engine
 
@@ -523,7 +523,7 @@ module internal StorageEngine =
     let private buildCompacted
         (engine: StorageEngine)
         (version: Version)
-        (manifestNumber: int64<manifestNo>)
+        (manifestNumber: ManifestNumber)
         (result: CompactionResult)
         =
         { engine with
@@ -743,7 +743,7 @@ module internal StorageEngine =
     let private buildRecovered
         (dir: string)
         (version: Version)
-        (manifestNumber: int64<manifestNo>)
+        (manifestNumber: ManifestNumber)
         (walState: WalState)
         (mem: Memtable)
         (walMax: uint64)
@@ -786,7 +786,7 @@ module internal StorageEngine =
                     (Memtable.Empty, 0UL)
 
             let (mem, walMax), walMaxTxn, goodWalSize = replayed
-            let! alignedWal = Wal.truncateTo dir walState goodWalSize
+            let! alignedWal = Wal.truncateTo dir goodWalSize walState
             let diskMax = maxSeqNoOnDisk version'
             let! diskMaxFile = maxFileNumberOnDisk dir
 

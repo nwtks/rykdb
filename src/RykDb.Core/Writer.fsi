@@ -31,4 +31,4 @@ module internal Writer =
     /// 全チャンクを 1本のバイト列に平坦化する。
     val toArray: Writer -> byte array
     /// 書き出し手順を左から順に適用して 1本のバイト列にする。
-    val build: ((Writer -> Writer) list -> byte array)
+    val build: (Writer -> Writer) list -> byte array

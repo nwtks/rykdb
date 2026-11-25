@@ -36,7 +36,7 @@ type private InstallContext =
         StateCell: System.Collections.Concurrent.ConcurrentDictionary<string, PublishedState>
         StateKey: string
         OldestSnapshot: unit -> uint64 option
-        ManifestApply: (int64<manifestNo> -> Version -> VersionEdit -> ManifestApplyResult) option
+        ManifestApply: (ManifestNumber -> Version -> VersionEdit -> ManifestApplyResult) option
         FileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>
     }
 
@@ -68,13 +68,13 @@ module private VersionCoordinatorHelpers =
     let Pending = 2
 
     /// MANIFEST 反映の既定実装。
-    let defaultApplyManifest (dir: string) (manifestNumber: int64<manifestNo>) (version: Version) (edit: VersionEdit) =
+    let defaultApplyManifest (dir: string) (manifestNumber: ManifestNumber) (version: Version) (edit: VersionEdit) =
         Manifest.logAndApplyWithOutcome dir manifestNumber version edit
 
     /// MANIFEST 反映関数を解決する。
     let applyManifestOf
         (dir: string)
-        (manifestApply: (int64<manifestNo> -> Version -> VersionEdit -> ManifestApplyResult) option)
+        (manifestApply: (ManifestNumber -> Version -> VersionEdit -> ManifestApplyResult) option)
         =
         defaultArg manifestApply (defaultApplyManifest dir)
 
@@ -499,7 +499,7 @@ module private VersionCoordinatorHelpers =
         (ctx: InstallContext)
         (result: CompactionResult)
         (version: Version)
-        (manifestNumber: int64<manifestNo>)
+        (manifestNumber: ManifestNumber)
         =
         publish ctx.StateCell ctx.StateKey (fun state ->
             { state with
@@ -605,7 +605,7 @@ type internal VersionCoordinator
         oldestSnapshot: unit -> uint64 option,
         scanOf: FileMetaData -> Result<SstScan, DbError>,
         scanHook: (FileMetaData -> unit) option,
-        manifestApply: (int64<manifestNo> -> Version -> VersionEdit -> ManifestApplyResult) option
+        manifestApply: (ManifestNumber -> Version -> VersionEdit -> ManifestApplyResult) option
     ) =
     /// 公開状態を入れるセルのキー。
     let stateKey = "current"

@@ -48,7 +48,6 @@ module internal Entry =
         entries |> Seq.fold (fun acc e -> max acc e.SeqNo) 0UL
 
     /// キーの昇順、同一キーは SeqNo の降順（新しい版が先）。
-    /// 定義は `KeyOrder.compare` に 1つだけ置く。
     let compareKeys (a: Entry) (b: Entry) =
         KeyOrder.compare a.Key a.SeqNo b.Key b.SeqNo
 
@@ -245,7 +244,7 @@ module internal Memtable =
         descend e p [] root
 
     /// 1エントリを挿入する。
-    /// キーと行は複製して保持する（`Entry.takeOwnership`）。
+    /// キーと行は複製して保持する。
     let insert (given: Entry) (mem: Memtable) =
         let e = Entry.takeOwnership given
 

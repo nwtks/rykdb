@@ -231,24 +231,16 @@ module internal Wal =
 
     /// フレームを順に読み、step で状態を畳み込む（停止位置も返す）。
     [<TailCall>]
-    let rec private foldFramesLoop
-        (fs: System.IO.FileStream)
-        (step: 's -> WalRecord -> Result<'s, DbError>)
-        (state: 's)
-        =
+    let rec private foldFrames (fs: System.IO.FileStream) (step: 's -> WalRecord -> Result<'s, DbError>) (state: 's) =
         let positionBefore = fs.Position
 
         match readFrameFrom fs with
         | Ok None -> ret (state, positionBefore)
         | Ok(Some record) ->
             match step state record with
-            | Ok next -> foldFramesLoop fs step next
+            | Ok next -> foldFrames fs step next
             | Error e -> err e
         | Error e -> err e
-
-    /// フレーム列を先頭から畳み込む。
-    let private foldFrames (fs: System.IO.FileStream) (step: 's -> WalRecord -> Result<'s, DbError>) (initial: 's) =
-        foldFramesLoop fs step initial
 
     /// 1レコードを pending 表へ反映し、(pending, 最大 txnId, 状態) を返す。
     let private applyRecord
@@ -303,7 +295,7 @@ module internal Wal =
     /// 最後の完全なフレームの終端までファイルを切り詰め、WalState の Size を合わせる。
     /// 不完全な末尾を残したまま追記すると、次回の再生がそこで止まり、
     /// 後続の commit が見えなくなるため、open 時に必ず呼ぶ。
-    let truncateTo (dir: string) (state: WalState) (goodSize: int64) =
+    let truncateTo (dir: string) (goodSize: int64) (state: WalState) =
         if goodSize < 0L then
             err (DbError.internalError "Wal: ファイルサイズが範囲外です")
         else

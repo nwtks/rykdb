@@ -126,9 +126,9 @@ module internal Writer =
     let toArray (w: Writer) =
         let total = length w
         let out = Array.zeroCreate<byte> total
-
         fillChunks out total w.Chunks
 
     /// 書き出し手順を左から順に適用して 1本のバイト列にする。
     /// 要素は Writer.varint x のような部分適用で書ける。
-    let build = List.fold (fun w f -> f w) Empty >> toArray
+    let build funs =
+        funs |> List.fold (fun w f -> f w) Empty |> toArray

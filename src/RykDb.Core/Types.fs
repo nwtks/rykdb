@@ -6,6 +6,8 @@ namespace RykDb.Core
 [<Measure>]
 type manifestNo
 
+type internal ManifestNumber = int64<manifestNo>
+
 [<Measure>]
 type txnId
 
@@ -75,15 +77,15 @@ module SqlLiteral =
 module internal Bytes =
     /// 2配列を先頭から比較する（共通長を超えたら長さで決める）。
     [<TailCall>]
-    let rec private compareAt (a: byte array) (b: byte array) (n: int) (i: int) =
+    let rec private compareAt (i: int) (n: int) (a: byte array) (b: byte array) =
         if i >= n then compare a.Length b.Length
-        elif a.[i] = b.[i] then compareAt a b n (i + 1)
+        elif a.[i] = b.[i] then compareAt (i + 1) n a b
         else compare (int a.[i]) (int b.[i])
 
     /// 昇順比較（前方が短いほうが小さい）。
     let compare (a: byte array) (b: byte array) =
         let n = min a.Length b.Length
-        compareAt a b n 0
+        compareAt 0 n a b
 
     /// 指定オフセットの 1バイトを符号なしで読む。
     let private readLE32At (data: byte array) (offset: int) (i: int) = uint32 data.[offset + i]
@@ -114,8 +116,8 @@ module internal SqlName =
 
     /// 済みの名前を積みながら重複を探す再帰本体。
     [<TailCall>]
-    let rec private duplicateLoop (seen: string list) (rest: string list) =
-        match rest with
+    let rec private duplicateLoop (seen: string list) =
+        function
         | [] -> None
         | name :: tail ->
             if seen |> List.exists (fun s -> equal s name) then
@@ -125,7 +127,7 @@ module internal SqlName =
 
     /// 大文字小文字を無視して重複する名前を探す。
     /// 重複があれば最初に見つかった名前を返す。
-    let duplicate (names: string list) = duplicateLoop [] names
+    let duplicate = duplicateLoop []
 
 /// SQL の 3値論理。
 /// 比較結果は TRUE / FALSE だけでなく UNKNOWN を持つ。
@@ -284,18 +286,18 @@ module internal SqlValue =
 
     /// 復号していない列の最初の位置を探す。
     [<TailCall>]
-    let rec private firstUnloaded (row: SqlValue array) (i: int) =
+    let rec private firstUnloaded (i: int) (row: SqlValue array) =
         if i >= row.Length then
             None
         else
             match row.[i] with
             | SqlValue.Unloaded -> Some i
-            | _ -> firstUnloaded row (i + 1)
+            | _ -> firstUnloaded (i + 1) row
 
     /// 列マスクのプレースホルダが結果に漏れていないか検査する。
     /// 結果の境界では `LoadedRow.create` がこれを呼ぶ（直接呼ぶのはそこだけ）。
     let ensureLoaded (row: SqlValue array) =
-        match firstUnloaded row 0 with
+        match firstUnloaded 0 row with
         | None -> ret row
         | Some i -> err (DbError.internalError (sprintf "復号していない列がクエリ結果に含まれています（列位置: %d）" i))
 
@@ -340,7 +342,7 @@ module internal SqlValue =
 
     /// キー符号化に使う正の quiet NaN。
     /// .NET の `Double.NaN` は符号ビットが立つため、そのままキーにすると順序が崩れる。
-    let canonicalNaN = System.BitConverter.Int64BitsToDouble CanonicalNaNBits
+    let private canonicalNaN = System.BitConverter.Int64BitsToDouble CanonicalNaNBits
 
     /// 浮動小数点数を単一のビットパターンに正規化する。
     /// - NaN は単一のビットパターンに揃える（キー符号化の順序を一意にする）。
@@ -404,7 +406,7 @@ module internal SqlValue =
 
     /// 2文字列をコードポイント順で比較する再帰本体。
     [<TailCall>]
-    let rec private compareTextLoop (x: string) (y: string) (i: int) (j: int) =
+    let rec private compareTextLoop (i: int) (j: int) (x: string) (y: string) =
         if i >= x.Length then
             if j >= y.Length then 0 else -1
         elif j >= y.Length then
@@ -414,17 +416,17 @@ module internal SqlValue =
             let cy = y.[j]
 
             if cx = cy && not (System.Char.IsSurrogate cx) then
-                compareTextLoop x y (i + 1) (j + 1)
+                compareTextLoop (i + 1) (j + 1) x y
             else
                 let px, nextX = codePointAt x i
                 let py, nextY = codePointAt y j
                 let c = compare px py
-                if c <> 0 then c else compareTextLoop x y nextX nextY
+                if c <> 0 then c else compareTextLoop nextX nextY x y
 
     /// TEXT を UTF-8 符号化順（Unicode コードポイント順）で比較する。
     /// .NET の序数比較は UTF-16 コード単位順で、補助文字と U+E000..U+FFFF の間で UTF-8 と逆転する。
     /// 不正なサロゲートは U+FFFD として扱う。
-    let private compareText (x: string) (y: string) = compareTextLoop x y 0 0
+    let private compareText = compareTextLoop 0 0
 
     /// 値から decimal を取り出す（非数値は 0）。
     let private decimalOfValue =
@@ -799,8 +801,7 @@ type LoadedRow =
 module LoadedRow =
     /// 復号済みであることを検査して行を作る。
     /// `SqlValue.Unloaded` が混ざっていれば `InternalError`。
-    let internal create (row: SqlValue array) =
-        SqlValue.ensureLoaded row |> Result.map LoadedRow
+    let internal create = SqlValue.ensureLoaded >> Result.map LoadedRow
 
     /// 内部配列を取り出す（コピーしない）。
     let toArray (LoadedRow row) = row

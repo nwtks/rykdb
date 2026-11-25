@@ -406,7 +406,7 @@ module internal VersionEdit =
 /// </remarks>
 [<RequireQualifiedAccess>]
 type internal ManifestApplyResult =
-    | Applied of version: Version * manifestNumber: int64<manifestNo>
+    | Applied of version: Version * manifestNumber: ManifestNumber
     | NotApplied of error: DbError
     | Unknown of error: DbError
 
@@ -416,11 +416,11 @@ module internal Manifest =
     let ManifestPrefix = "MANIFEST-"
 
     /// MANIFEST のファイル名。
-    let private fileName (manifestNumber: int64<manifestNo>) =
+    let private fileName (manifestNumber: ManifestNumber) =
         sprintf "%s%06d" ManifestPrefix manifestNumber
 
     /// MANIFEST のパス。
-    let private manifestPath (dir: string) (manifestNumber: int64<manifestNo>) =
+    let private manifestPath (dir: string) (manifestNumber: ManifestNumber) =
         System.IO.Path.Combine(dir, fileName manifestNumber)
 
     /// 現在の MANIFEST 番号を指すファイル名。
@@ -432,7 +432,7 @@ module internal Manifest =
         System.IO.Path.Combine(dir, CurrentFileName)
 
     /// CURRENT を一時ファイル経由で原子的に置き換える。
-    let private writeCurrent (dir: string) (manifestNumber: int64<manifestNo>) =
+    let private writeCurrent (dir: string) (manifestNumber: ManifestNumber) =
         protect (fun () ->
             let tmp = currentPath dir + ".tmp"
             System.IO.File.WriteAllText(tmp, fileName manifestNumber + "\n")
@@ -488,7 +488,7 @@ module internal Manifest =
             None
 
     /// 既存の最大番号より 1つ大きい manifest 番号を返す。
-    let private nextManifestNumber (dir: string) (current: int64<manifestNo>) =
+    let private nextManifestNumber (dir: string) (current: ManifestNumber) =
         protect (fun () ->
             System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")
             |> Array.choose parseManifestNumber
@@ -496,7 +496,7 @@ module internal Manifest =
             |> fun highest -> highest + 1L<manifestNo>)
 
     /// Version 全体を新しい manifest に書き出す（スナップショット）。
-    let private writeSnapshot (dir: string) (manifestNumber: int64<manifestNo>) (version: Version) =
+    let private writeSnapshot (dir: string) (manifestNumber: ManifestNumber) (version: Version) =
         protect (fun () ->
             let edit =
                 {
@@ -596,7 +596,7 @@ module internal Manifest =
     /// 書き込み中に失敗した場合は、追記前の長さまで戻す。
     /// それにも失敗した場合だけ `AppendUncertain` を返す。
     /// </remarks>
-    let private append (dir: string) (manifestNumber: int64<manifestNo>) (edit: VersionEdit) =
+    let private append (dir: string) (manifestNumber: ManifestNumber) (edit: VersionEdit) =
         let path = manifestPath dir manifestNumber
         let text = encodeRecord (VersionEdit.encode edit)
         let data = System.Text.Encoding.UTF8.GetBytes text
@@ -680,7 +680,7 @@ module internal Manifest =
                 | Error e -> err e
 
     /// manifest ファイルの行を読む。
-    let private read (dir: string) (manifestNumber: int64<manifestNo>) =
+    let private read (dir: string) (manifestNumber: ManifestNumber) =
         let path = manifestPath dir manifestNumber
 
         if System.IO.File.Exists path then
@@ -691,7 +691,7 @@ module internal Manifest =
             |> err
 
     /// manifest を保護して読み、デコード結果と末尾の状態を返す。
-    let private readAll (dir: string) (manifestNumber: int64<manifestNo>) =
+    let private readAll (dir: string) (manifestNumber: ManifestNumber) =
         match protect (fun () -> read dir manifestNumber) with
         | Ok(Error e) -> err e
         | Ok(Ok lines) ->
@@ -765,12 +765,7 @@ module internal Manifest =
     /// この関数は `version.NextFileNumber`（SSTable のファイル番号・素の `int64`）も扱うので、
     /// 2つの番号を取り違えるとコンパイルが通らない。
     /// </remarks>
-    let logAndApplyWithOutcome
-        (dir: string)
-        (manifestNumber: int64<manifestNo>)
-        (version: Version)
-        (edit: VersionEdit)
-        =
+    let logAndApplyWithOutcome (dir: string) (manifestNumber: ManifestNumber) (version: Version) (edit: VersionEdit) =
         let next = VersionEdit.apply version edit
         let seed = version.NextFileNumber
 
@@ -829,7 +824,7 @@ module internal Manifest =
     /// 戻り値の `Ok` は「MANIFEST に反映済み」、`Error` は「反映されていないか不明」を表す。
     /// 不明と未反映を区別する必要がある呼び出し側は `logAndApplyWithOutcome` を使う。
     /// </remarks>
-    let logAndApply (dir: string) (manifestNumber: int64<manifestNo>) (version: Version) (edit: VersionEdit) =
+    let logAndApply (dir: string) (manifestNumber: ManifestNumber) (version: Version) (edit: VersionEdit) =
         match logAndApplyWithOutcome dir manifestNumber version edit with
         | ManifestApplyResult.Applied(version, manifestNumber) -> Ok(version, manifestNumber)
         | ManifestApplyResult.NotApplied e
@@ -842,7 +837,7 @@ type internal PublishedState =
         Version: Version
         /// 有効な manifest 番号
         /// （SSTable のファイル番号とは単位が違う）。
-        ManifestNumber: int64<manifestNo>
+        ManifestNumber: ManifestNumber
         /// commit 時に更新される GC 境界。0 は「全版を残す」。
         ActiveSnapshot: uint64
         /// 直近の compaction の失敗（成功したら None）。
@@ -853,7 +848,7 @@ type internal PublishedState =
 
 module internal PublishedState =
     /// 初期状態（Generation 0、GC 境界 0 = 全版を残す）。
-    let initial (version: Version) (manifestNumber: int64<manifestNo>) =
+    let initial (version: Version) (manifestNumber: ManifestNumber) =
         {
             Version = version
             ManifestNumber = manifestNumber

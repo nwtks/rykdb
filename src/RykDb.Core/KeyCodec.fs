@@ -56,7 +56,7 @@ module internal Hashing =
 
     /// CRC を範囲の終端まで進める本体。
     [<TailCall>]
-    let rec private crcUpdateLoop (finish: int) (data: byte array) (i: int) (crc: uint32) =
+    let rec private crcUpdateLoop (i: int) (finish: int) (data: byte array) (crc: uint32) =
         if i + 8 <= finish then
             let v =
                 System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(System.ReadOnlySpan<byte>(data, i, 8))
@@ -70,38 +70,38 @@ module internal Hashing =
             ^^^ crcTables.[2].[int (v >>> 40 &&& 0xFFUL)]
             ^^^ crcTables.[1].[int (v >>> 48 &&& 0xFFUL)]
             ^^^ crcTables.[0].[int (v >>> 56 &&& 0xFFUL)]
-            |> crcUpdateLoop finish data (i + 8)
+            |> crcUpdateLoop (i + 8) finish data
         elif i < finish then
-            crcUpdateLoop finish data (i + 1) (crcTables.[0].[int (crc ^^^ uint32 data.[i] &&& 0xFFu)] ^^^ (crc >>> 8))
+            crcUpdateLoop (i + 1) finish data (crcTables.[0].[int (crc ^^^ uint32 data.[i] &&& 0xFFu)] ^^^ (crc >>> 8))
         else
             crc
 
     /// 範囲 [offset, offset + length) を 1つの連続入力として CRC を進める。
     /// チャンクをまたぐ場合は前のチャンクの戻り値をそのまま渡す。
-    let private crcUpdate (crc: uint32) (data: byte array) (offset: int) (length: int) =
-        crcUpdateLoop (offset + length) data offset crc
+    let private crcUpdate (offset: int) (length: int) = crcUpdateLoop offset (offset + length)
 
     /// バイト列の 32bit チェックサム（CRC32C / Castagnoli）。
     let checksum (data: byte array) =
-        CrcFinalXor ^^^ crcUpdate CrcInitial data 0 data.Length
+        CrcFinalXor ^^^ crcUpdate 0 data.Length data CrcInitial
 
     /// 範囲指定の 32bit チェックサム（CRC32C）。
     /// SSTable のブロック末尾チェックサムを、コピーを作らずに計算する。
     let checksumRange (data: byte array) (offset: int) (length: int) =
-        CrcFinalXor ^^^ crcUpdate CrcInitial data offset length
+        CrcFinalXor ^^^ crcUpdate offset length data CrcInitial
 
     /// チャンク列を順に畳む本体。
     [<TailCall>]
-    let rec private checksumChunksLoop (chunks: byte array array) (i: int) (crc: uint32) =
+    let rec private checksumChunksLoop (i: int) (chunks: byte array array) (crc: uint32) =
         if i >= chunks.Length then
             crc
         else
-            checksumChunksLoop chunks (i + 1) (crcUpdate crc chunks.[i] 0 chunks.[i].Length)
+            crcUpdate 0 chunks.[i].Length chunks.[i] crc
+            |> checksumChunksLoop (i + 1) chunks
 
     /// 複数のチャンクを連結したものの 32bit チェックサム（CRC32C）。
     /// SSTable のメタデータ（meta / Bloom / index）をコピーせずに検証する。
     let checksumChunks (chunks: byte array array) =
-        CrcFinalXor ^^^ checksumChunksLoop chunks 0 CrcInitial
+        CrcFinalXor ^^^ checksumChunksLoop 0 chunks CrcInitial
 
     /// ハッシュ値を攪拌する（splitmix64 相当）。
     /// FNV-1a は下位ビットに偏りがちで、Bloom filter のビット分布が悪くなるため。
@@ -121,8 +121,8 @@ module internal KeyBuilder =
         |> Result.map Writer.toArray
 
     /// 省略可能な値の並びを符号化する（`None` はそのまま `None`）。
-    let ofOptionalValues (values: SqlValue array option) =
-        match values with
+    let ofOptionalValues =
+        function
         | Some vs -> ofValues vs |> Result.map Some
         | None -> ret None
 
@@ -136,11 +136,11 @@ module internal KeyBuilder =
 
     /// プレフィックス一致を先頭から辿る。
     [<TailCall>]
-    let rec private matchPrefix (key: byte array) (prefix: byte array) (i: int) =
+    let rec private matchPrefix (i: int) (key: byte array) (prefix: byte array) =
         if i >= prefix.Length then
             true
         elif key.[i] = prefix.[i] then
-            matchPrefix key prefix (i + 1)
+            matchPrefix (i + 1) key prefix
         else
             false
 
@@ -149,7 +149,7 @@ module internal KeyBuilder =
         if key.Length < prefix.Length then
             false
         else
-            matchPrefix key prefix 0
+            matchPrefix 0 key prefix
 
 /// 行ペイロード用のコンパクト符号化。
 /// キーと異なり、行値には順序保持が不要なので varint で詰めて小さくする。
@@ -159,37 +159,68 @@ module internal ValueCodec =
     /// DISTINCT などの符号化でも同じビット列にして重複と見なす。
     let private normalizeDecimal (d: decimal) = if d = 0M then 0M else d
 
+    // 行ペイロードの型タグ。
+    // Unloaded はスピル専用のプレースホルダ。
+
+    [<Literal>]
+    let private TagNull = 0uy
+
+    [<Literal>]
+    let private TagBool = 1uy
+
+    [<Literal>]
+    let private TagInt = 2uy
+
+    [<Literal>]
+    let private TagReal = 3uy
+
+    [<Literal>]
+    let private TagDecimal = 4uy
+
+    [<Literal>]
+    let private TagText = 5uy
+
+    [<Literal>]
+    let private TagBlob = 6uy
+
+    [<Literal>]
+    let private TagDate = 7uy
+
+    [<Literal>]
+    let private TagTimestamp = 8uy
+
+    [<Literal>]
+    let private TagUuid = 9uy
+
+    [<Literal>]
+    let private TagUnloaded = 10uy
+
     /// 型タグを書き込む。
-    let private writeTagged (w: Writer) (tag: byte) = w |> Writer.writeByte (byte tag)
+    let private writeTagged (tag: byte) (w: Writer) = w |> Writer.writeByte (byte tag)
 
     /// 1値を行ペイロードへ書く（`Unloaded` は拒否）。
     let private writeValue (w: Writer) =
         function
-        | SqlValue.Null -> ret (writeTagged w 0uy)
-        | SqlValue.Bool b -> ret (writeTagged w 1uy |> Writer.bool b)
-        | SqlValue.Int i -> ret (writeTagged w 2uy |> Writer.int64LE i)
+        | SqlValue.Null -> writeTagged TagNull w |> ret
+        | SqlValue.Bool b -> writeTagged TagBool w |> Writer.bool b |> ret
+        | SqlValue.Int i -> writeTagged TagInt w |> Writer.int64LE i |> ret
         | SqlValue.Real f ->
-            let bits =
-                writeTagged w 3uy
-                |> Writer.int64LE (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits)
-
-            ret bits
+            writeTagged TagReal w
+            |> Writer.int64LE (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits)
+            |> ret
         | SqlValue.Decimal d ->
-            let unfolded =
-                normalizeDecimal d
-                |> System.Decimal.GetBits
-                |> Array.fold (fun w b -> w |> Writer.int64LE (int64 b)) (writeTagged w 4uy)
-
-            ret unfolded
-        | SqlValue.Text s -> ret (writeTagged w 5uy |> Writer.str s)
-        | SqlValue.Blob bs -> ret (writeTagged w 6uy |> Writer.lengthPrefixed bs)
+            normalizeDecimal d
+            |> System.Decimal.GetBits
+            |> Array.fold (fun w b -> w |> Writer.int64LE (int64 b)) (writeTagged TagDecimal w)
+            |> ret
+        | SqlValue.Text s -> writeTagged TagText w |> Writer.str s |> ret
+        | SqlValue.Blob bs -> writeTagged TagBlob w |> Writer.lengthPrefixed bs |> ret
         | SqlValue.Date d ->
-            ret (
-                writeTagged w 7uy
-                |> Writer.int64LE (d.ToDateTime(System.TimeOnly.MinValue).Ticks)
-            )
-        | SqlValue.Timestamp t -> ret (writeTagged w 8uy |> Writer.int64LE t.UtcTicks)
-        | SqlValue.Uuid g -> ret (writeTagged w 9uy |> Writer.writeBytes (g.ToByteArray()))
+            writeTagged TagDate w
+            |> Writer.int64LE (d.ToDateTime(System.TimeOnly.MinValue).Ticks)
+            |> ret
+        | SqlValue.Timestamp t -> writeTagged TagTimestamp w |> Writer.int64LE t.UtcTicks |> ret
+        | SqlValue.Uuid g -> writeTagged TagUuid w |> Writer.writeBytes (g.ToByteArray()) |> ret
         | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
     /// 型タグを読んで 1値を復号する（高速経路に乗らない型）。
@@ -198,17 +229,17 @@ module internal ValueCodec =
             let! tag, c = Reader.readByte c
 
             match tag with
-            | 0uy -> return SqlValue.Null, c
-            | 1uy ->
+            | TagNull -> return SqlValue.Null, c
+            | TagBool ->
                 let! v, c = Reader.readBool c
                 return SqlValue.ofBool v, c
-            | 2uy ->
+            | TagInt ->
                 let! v, c = Reader.readInt64LE c
                 return SqlValue.Int v, c
-            | 3uy ->
+            | TagReal ->
                 let! bits, c = Reader.readInt64LE c
                 return System.BitConverter.Int64BitsToDouble bits |> SqlValue.vReal, c
-            | 4uy ->
+            | TagDecimal ->
                 let! bs, c = Reader.readBytes 32 c
 
                 let bits =
@@ -224,13 +255,13 @@ module internal ValueCodec =
                     return! err (DbError.corruption "ValueCodec: DECIMAL のビット列が不正です")
 
                 return System.Decimal bits |> SqlValue.Decimal, c
-            | 5uy ->
+            | TagText ->
                 let! bs, c = Reader.readLengthPrefixed c
                 return System.Text.Encoding.UTF8.GetString bs |> SqlValue.Text, c
-            | 6uy ->
+            | TagBlob ->
                 let! bs, c = Reader.readLengthPrefixed c
                 return SqlValue.Blob bs, c
-            | 7uy ->
+            | TagDate ->
                 let! ticks, c = Reader.readInt64LE c
                 let days = ticks / System.TimeSpan.TicksPerDay
 
@@ -241,17 +272,17 @@ module internal ValueCodec =
                     return! err (DbError.corruption "ValueCodec: DATE の範囲が不正です")
 
                 return SqlValue.Date(System.DateOnly.FromDayNumber(int days)), c
-            | 8uy ->
+            | TagTimestamp ->
                 let! ticks, c = Reader.readInt64LE c
 
                 if ticks < 0L || ticks > System.DateTimeOffset.MaxValue.Ticks then
                     return! err (DbError.corruption "ValueCodec: TIMESTAMP の範囲が不正です")
 
                 return System.DateTimeOffset(ticks, System.TimeSpan.Zero) |> SqlValue.Timestamp, c
-            | 9uy ->
+            | TagUuid ->
                 let! bs, c = Reader.readBytes 16 c
                 return System.Guid bs |> SqlValue.Uuid, c
-            | 10uy -> return SqlValue.Unloaded, c
+            | TagUnloaded -> return SqlValue.Unloaded, c
             | _ -> return! err (sprintf "ValueCodec: 不明な型タグ %d" (int tag) |> DbError.corruption)
         }
 
@@ -265,7 +296,7 @@ module internal ValueCodec =
     /// 1値を書き出す（`Unloaded` はタグ 10 のプレースホルダにする）。
     let private writeSparse (w: Writer) =
         function
-        | SqlValue.Unloaded -> ret (w |> Writer.writeByte 10uy)
+        | SqlValue.Unloaded -> ret (w |> Writer.writeByte TagUnloaded)
         | v -> writeValue w v
 
     /// 一時ファイル（スピル）用: `SqlValue.Unloaded` を含む行も書き出す。
@@ -293,20 +324,24 @@ module internal ValueCodec =
     let private writeValueTo (out: byte array) (pos: int) =
         function
         | SqlValue.Null ->
-            out.[pos] <- 0uy
+            out.[pos] <- TagNull
             ret (pos + 1)
         | SqlValue.Bool b ->
-            out.[pos] <- 1uy
+            out.[pos] <- TagBool
             out.[pos + 1] <- if b then 1uy else 0uy
             ret (pos + 2)
         | SqlValue.Int i ->
-            out.[pos] <- 2uy
+            out.[pos] <- TagInt
             ret (writeInt64LETo out (pos + 1) i)
         | SqlValue.Real f ->
-            out.[pos] <- 3uy
-            ret (writeInt64LETo out (pos + 1) (SqlValue.normalizeFloat f |> System.BitConverter.DoubleToInt64Bits))
+            out.[pos] <- TagReal
+
+            SqlValue.normalizeFloat f
+            |> System.BitConverter.DoubleToInt64Bits
+            |> writeInt64LETo out (pos + 1)
+            |> ret
         | SqlValue.Decimal d ->
-            out.[pos] <- 4uy
+            out.[pos] <- TagDecimal
 
             normalizeDecimal d
             |> System.Decimal.GetBits
@@ -314,24 +349,27 @@ module internal ValueCodec =
             |> ret
         | SqlValue.Text s ->
             let bytes = System.Text.Encoding.UTF8.GetBytes s
-            out.[pos] <- 5uy
+            out.[pos] <- TagText
             let p = Writer.writeVarintTo out (pos + 1) (uint64 bytes.Length)
             Array.blit bytes 0 out p bytes.Length
             ret (p + bytes.Length)
         | SqlValue.Blob bs ->
-            out.[pos] <- 6uy
+            out.[pos] <- TagBlob
             let p = Writer.writeVarintTo out (pos + 1) (uint64 bs.Length)
             Array.blit bs 0 out p bs.Length
             ret (p + bs.Length)
         | SqlValue.Date d ->
-            out.[pos] <- 7uy
-            ret (writeInt64LETo out (pos + 1) (d.ToDateTime(System.TimeOnly.MinValue).Ticks))
+            out.[pos] <- TagDate
+
+            d.ToDateTime(System.TimeOnly.MinValue).Ticks
+            |> writeInt64LETo out (pos + 1)
+            |> ret
         | SqlValue.Timestamp t ->
-            out.[pos] <- 8uy
+            out.[pos] <- TagTimestamp
             ret (writeInt64LETo out (pos + 1) t.UtcTicks)
         | SqlValue.Uuid g ->
+            out.[pos] <- TagUuid
             let bytes = g.ToByteArray()
-            out.[pos] <- 9uy
             Array.blit bytes 0 out (pos + 1) 16
             ret (pos + 17)
         | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
@@ -347,7 +385,7 @@ module internal ValueCodec =
         let d = Cursor.data c
         let start = Cursor.pos c
 
-        if Cursor.remaining c >= 9 && d.[start] = 2uy then
+        if Cursor.remaining c >= 9 && d.[start] = TagInt then
             let p = start + 1
 
             let v =
@@ -414,16 +452,16 @@ module internal ValueCodec =
         Reader.readByte c
         >>= fun (tag, c) ->
             match tag with
-            | 0uy -> ret c
-            | 1uy -> ret (Cursor.advance 1 c)
-            | 2uy
-            | 3uy
-            | 7uy
-            | 8uy -> ret (Cursor.advance 8 c)
-            | 4uy -> ret (Cursor.advance 32 c)
-            | 5uy
-            | 6uy -> skipLengthPrefixed c
-            | 9uy -> ret (Cursor.advance 16 c)
+            | TagNull -> ret c
+            | TagBool -> ret (Cursor.advance 1 c)
+            | TagInt
+            | TagReal
+            | TagDate
+            | TagTimestamp -> ret (Cursor.advance 8 c)
+            | TagDecimal -> ret (Cursor.advance 32 c)
+            | TagText
+            | TagBlob -> skipLengthPrefixed c
+            | TagUuid -> ret (Cursor.advance 16 c)
             | _ -> err (sprintf "ValueCodec: 不明な型タグ %d" (int tag) |> DbError.corruption)
 
     /// マスク付きで配列へ値を読み込む本体（false の列は読み飛ばす）。
@@ -463,7 +501,7 @@ module internal ValueCodec =
 
     /// 固定長の値の符号化サイズ（型タグ込み）。
     /// TEXT / BLOB は長さ依存なので `None`。
-    let fixedEncodedBytes =
+    let private fixedEncodedBytes =
         function
         | SqlValue.Null -> Some 1
         | SqlValue.Bool _ -> Some 2

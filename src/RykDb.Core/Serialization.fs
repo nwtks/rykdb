@@ -49,18 +49,6 @@ module internal Reader =
             Array.blit d p dest destOffset count
             ret (Cursor.advance count c)
 
-    /// 読み飛ばす（配列を確保しない）。
-    /// 値を使わないブロック走査で、不要なエントリの値コピーを避けるために使う。
-    let skipBytes (count: int) (c: Cursor) =
-        let d = Cursor.data c
-        let p = Cursor.pos c
-        let e = Cursor.endPos c
-
-        if count < 0 || p < 0 || e < p || e > d.Length || count > e - p then
-            eof (sprintf "Reader: %d バイトを読み飛ばせません（残り %d）" count (Cursor.remaining c))
-        else
-            ret (Cursor.advance count c)
-
     /// varint をデコードする本体。
     [<TailCall>]
     let rec private decodeVarintV (shift: int) (acc: uint64) (c: Cursor) =
@@ -160,22 +148,22 @@ module internal Reader =
     /// 残り件数だけ読み出してリストへ積む本体。
     [<TailCall>]
     let rec private readItemsLoop
+        (acc: 'a list)
         (readOne: Cursor -> Result<'a * Cursor, DbError>)
         (rest: uint64)
-        (acc: 'a list)
         (c: Cursor)
         =
         if rest = 0UL then
             ret (List.rev acc, c)
         else
             match readOne c with
-            | Ok(v, c') -> readItemsLoop readOne (rest - 1UL) (v :: acc) c'
+            | Ok(v, c') -> readItemsLoop (v :: acc) readOne (rest - 1UL) c'
             | Error e -> err e
 
     /// count 件を 1件ずつ読み出してリストにする。
     /// 「1件読む」処理は readOne に切り出し、ループはここ 1箇所にまとめる。
     let readItems (readOne: Cursor -> Result<'a * Cursor, DbError>) (count: uint64) (c: Cursor) =
-        readItemsLoop readOne count [] c
+        readItemsLoop [] readOne count c
 
 /// 順序保持符号化 (order-preserving encoding)
 /// SSTable のマージはキーのバイト列比較で行うので、「バイト列の大小関係 = SQL の比較結果」でなければならない。
@@ -186,7 +174,7 @@ module internal Reader =
 module internal OrderPreserving =
     /// 型タグ。
     /// 順序は SQL の照合順に従う。
-    type Tag =
+    type private Tag =
         | Null = 0x00uy
         | Bool = 0x10uy
         | Int = 0x20uy
@@ -263,7 +251,6 @@ module internal OrderPreserving =
         let buffer = Array.zeroCreate<byte> DecimalMaxDigits
         let start = fillUnscaledDigits buffer hi mid lo (DecimalMaxDigits - 1) + 1
         let total = DecimalMaxDigits - start
-
         buffer, start, trimUnscaledDigits buffer start total, total
 
     /// DECIMAL を符号・指数・桁の補数で書く（順序保持）。
@@ -313,7 +300,7 @@ module internal OrderPreserving =
         w |> Writer.writeBytes escaped |> Writer.writeByte Terminator
 
     /// 型タグを書き込む。
-    let private writeTaggedValue (w: Writer) (tag: Tag) = w |> Writer.writeByte (byte tag)
+    let private writeTaggedValue (tag: Tag) = Writer.writeByte (byte tag)
 
     /// フィールド終端を書き込む。
     let private writeTerminator = Writer.writeByte Terminator
@@ -322,41 +309,41 @@ module internal OrderPreserving =
     /// `SqlValue.Unloaded`（列マスクのプレースホルダ）は符号化できないため `InternalError` を返す。
     let writeValue (v: SqlValue) (w: Writer) =
         match v with
-        | SqlValue.Null -> ret (writeTaggedValue w Tag.Null |> writeTerminator)
+        | SqlValue.Null -> writeTaggedValue Tag.Null w |> writeTerminator |> ret
         | SqlValue.Bool b ->
-            ret (
-                writeTaggedValue w Tag.Bool
-                |> Writer.writeByte (if b then 1uy else 0uy)
-                |> writeTerminator
-            )
-        | SqlValue.Int i -> ret (writeTaggedValue w Tag.Int |> writeOrderedInt64 i |> writeTerminator)
+            writeTaggedValue Tag.Bool w
+            |> Writer.writeByte (if b then 1uy else 0uy)
+            |> writeTerminator
+            |> ret
+        | SqlValue.Int i -> writeTaggedValue Tag.Int w |> writeOrderedInt64 i |> writeTerminator |> ret
         | SqlValue.Real f ->
-            let bits =
-                writeTaggedValue w Tag.Real
-                |> Writer.uint64BE (uint64 (mapDouble (SqlValue.normalizeFloat f)))
-
-            ret (bits |> writeTerminator)
-        | SqlValue.Decimal d -> ret (writeTaggedValue w Tag.Decimal |> writeOrderedDecimal d |> writeTerminator)
+            let bits = uint64 (mapDouble (SqlValue.normalizeFloat f))
+            writeTaggedValue Tag.Real w |> Writer.uint64BE bits |> writeTerminator |> ret
+        | SqlValue.Decimal d ->
+            writeTaggedValue Tag.Decimal w
+            |> writeOrderedDecimal d
+            |> writeTerminator
+            |> ret
         | SqlValue.Date d ->
             let days =
                 d.ToDateTime(System.TimeOnly.MinValue).Ticks / System.TimeSpan.TicksPerDay
 
-            ret (writeTaggedValue w Tag.Date |> writeOrderedInt64 days |> writeTerminator)
+            writeTaggedValue Tag.Date w |> writeOrderedInt64 days |> writeTerminator |> ret
         | SqlValue.Timestamp t ->
-            ret (
-                writeTaggedValue w Tag.Timestamp
-                |> writeOrderedInt64 t.UtcTicks
-                |> writeTerminator
-            )
+            writeTaggedValue Tag.Timestamp w
+            |> writeOrderedInt64 t.UtcTicks
+            |> writeTerminator
+            |> ret
         | SqlValue.Text s ->
-            ret (writeEscapedPayload (System.Text.Encoding.UTF8.GetBytes s) (writeTaggedValue w Tag.Text))
-        | SqlValue.Blob bs -> ret (writeEscapedPayload bs (writeTaggedValue w Tag.Blob))
+            writeTaggedValue Tag.Text w
+            |> writeEscapedPayload (System.Text.Encoding.UTF8.GetBytes s)
+            |> ret
+        | SqlValue.Blob bs -> writeTaggedValue Tag.Blob w |> writeEscapedPayload bs |> ret
         | SqlValue.Uuid g ->
-            ret (
-                writeTaggedValue w Tag.Uuid
-                |> Writer.writeBytes (guidToOrderedBytes g)
-                |> writeTerminator
-            )
+            writeTaggedValue Tag.Uuid w
+            |> Writer.writeBytes (guidToOrderedBytes g)
+            |> writeTerminator
+            |> ret
         | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
     /// 固定長フィールドの終端（0x00）を検証する。
@@ -515,23 +502,28 @@ module internal OrderPreserving =
 
                                                 ret (System.Decimal bits, c4)
 
+    /// 生のタグバイトを `Tag` として解釈する。
+    /// 未定義の値もそのまま通し、`readValue` のワイルドカードで破損として扱う。
+    let private toTag (b: byte) =
+        LanguagePrimitives.EnumOfValue<byte, Tag> b
+
     /// キーの 1値を復号する。
     let private readValue (c: Cursor) =
         Reader.readByte c
         >>= fun (tag, c1) ->
-            match tag with
-            | 0x00uy -> expectTerminator c1 >>= fun c2 -> ret (SqlValue.Null, c2)
-            | 0x10uy ->
+            match toTag tag with
+            | Tag.Null -> expectTerminator c1 |> Result.map (fun c2 -> SqlValue.Null, c2)
+            | Tag.Bool ->
                 Reader.readByte c1
-                >>= fun (b, c2) -> expectTerminator c2 >>= fun c3 -> ret (SqlValue.ofBool (b <> 0uy), c3)
-            | 0x20uy ->
+                >>= fun (b, c2) -> expectTerminator c2 |> Result.map (fun c3 -> SqlValue.ofBool (b <> 0uy), c3)
+            | Tag.Int ->
                 Reader.readUint64BE c1
-                >>= fun (u, c2) -> expectTerminator c2 >>= fun c3 -> ret (SqlValue.Int(unmapInt64 u), c3)
-            | 0x21uy ->
+                >>= fun (u, c2) -> expectTerminator c2 |> Result.map (fun c3 -> SqlValue.Int(unmapInt64 u), c3)
+            | Tag.Real ->
                 Reader.readUint64BE c1
-                >>= fun (u, c2) -> expectTerminator c2 >>= fun c3 -> ret (SqlValue.Real(unmapDouble u), c3)
-            | 0x22uy -> readOrderedDecimal c1 |> Result.map (fun (d, c2) -> SqlValue.Decimal d, c2)
-            | 0x30uy ->
+                >>= fun (u, c2) -> expectTerminator c2 |> Result.map (fun c3 -> SqlValue.Real(unmapDouble u), c3)
+            | Tag.Decimal -> readOrderedDecimal c1 |> Result.map (fun (d, c2) -> SqlValue.Decimal d, c2)
+            | Tag.Date ->
                 Reader.readUint64BE c1
                 >>= fun (u, c2) ->
                     expectTerminator c2
@@ -545,7 +537,7 @@ module internal OrderPreserving =
                             err (DbError.corruption "OrderPreserving: DATE の範囲が不正です")
                         else
                             ret (SqlValue.Date(System.DateOnly.FromDayNumber(int days)), c3)
-            | 0x40uy ->
+            | Tag.Timestamp ->
                 Reader.readUint64BE c1
                 >>= fun (u, c2) ->
                     expectTerminator c2
@@ -556,11 +548,11 @@ module internal OrderPreserving =
                             err (DbError.corruption "OrderPreserving: TIMESTAMP の範囲が不正です")
                         else
                             ret (SqlValue.Timestamp(System.DateTimeOffset(ticks, System.TimeSpan.Zero)), c3)
-            | 0x50uy ->
+            | Tag.Text ->
                 readEscapedPayload c1
                 |> Result.map (fun (bs, c2) -> SqlValue.Text(System.Text.Encoding.UTF8.GetString bs), c2)
-            | 0x60uy -> readEscapedPayload c1 |> Result.map (fun (bs, c2) -> SqlValue.Blob bs, c2)
-            | 0x70uy ->
+            | Tag.Blob -> readEscapedPayload c1 |> Result.map (fun (bs, c2) -> SqlValue.Blob bs, c2)
+            | Tag.Uuid ->
                 Reader.readBytes 16 c1
                 >>= fun (bs, c2) ->
                     expectTerminator c2
@@ -572,7 +564,7 @@ module internal OrderPreserving =
     /// 値を count 件復号する。
     /// `mask` が Some のとき、false の位置は値を作らず `SqlValue.Unloaded` を置く。
     [<TailCall>]
-    let rec private readValuesLoop (mask: bool array option) (count: int) (i: int) (acc: SqlValue list) (c: Cursor) =
+    let rec private readValuesLoop (i: int) (acc: SqlValue list) (mask: bool array option) (count: int) (c: Cursor) =
         if i >= count then
             ret (List.rev acc |> Array.ofList, c)
         else
@@ -584,7 +576,7 @@ module internal OrderPreserving =
             match readValue c with
             | Ok(v, c') ->
                 let value = if materialize then v else SqlValue.Unloaded
-                readValuesLoop mask count (i + 1) (value :: acc) c'
+                readValuesLoop (i + 1) (value :: acc) mask count c'
             | Error e -> err e
 
     /// 値を count 件復号する（末尾の余りは消費しない）。
@@ -592,11 +584,11 @@ module internal OrderPreserving =
         if count < 0 then
             err (DbError.corruption "OrderPreserving: 復号する値の個数が負です")
         else
-            readValuesLoop None count 0 [] c
+            readValuesLoop 0 [] None count c
 
     /// マスク付きで値を count 件復号する。
     let readValuesMasked (mask: bool array) (count: int) (c: Cursor) =
         if count < 0 then
             err (DbError.corruption "OrderPreserving: 復号する値の個数が負です")
         else
-            readValuesLoop (Some mask) count 0 [] c
+            readValuesLoop 0 [] (Some mask) count c

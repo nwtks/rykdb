@@ -54,36 +54,6 @@ module internal BloomFilter =
         else
             max 1 (int (ceil (float bitCount / float expectedCount) * ln2))
 
-    /// 1ハッシュ分のビットを立て、追加したハッシュ数を返す。
-    let private addHash (bitCount: int) (hashCount: int) (bits: byte array) (count: int) (hash: uint64) =
-        let h1, step = firstAndStep bitCount hash
-
-        for i in 0 .. hashCount - 1 do
-            let pos = positionAt bitCount h1 step i
-            bits.[pos / 8] <- bits.[pos / 8] ||| (1uy <<< pos % 8)
-
-        count + hashCount
-
-    /// ハッシュ列から filter を構築する。
-    let private ofHashes (expectedCount: int) (falsePositiveRate: float) (hashes: uint64 seq) =
-        let bitCount = bitsFor expectedCount falsePositiveRate
-        let hashCount = hashesFor expectedCount bitCount
-        let bits = Array.zeroCreate<byte>(bitCount / 8)
-
-        let count = hashes |> Seq.fold (addHash bitCount hashCount bits) 0
-
-        {
-            Bits = bits
-            BitCount = bitCount
-            HashCount = hashCount
-            Count = count
-        }
-
-    /// キー列から filter を構築する（ハッシュはキーから導出）。
-    let private ofKeys (expectedCount: int) (falsePositiveRate: float) =
-        Seq.map (Hashing.hashBytes >> Hashing.mix)
-        >> ofHashes expectedCount falsePositiveRate
-
     /// 全ハッシュ位置のビットが立っているかを順に検査する。
     [<TailCall>]
     let rec private check (filter: BloomFilter) (h1: uint64) (step: uint64) (i: int) =
@@ -104,30 +74,33 @@ module internal BloomFilter =
         check filter h1 step 0
 
     /// 逐次追加できる Bloom filter ビルダ。
-    /// `ofKeys` と同じパラメータで作り、`Add` でキーを足して `Build` で確定する。
+    /// 期待要素数と誤検出率からビット数・ハッシュ数を決め、`Add` でキーを足して `Build` で確定する。
     /// 件数が期待値を大きく超えると誤検出率が悪化するが、
     /// false negative は出ないので正しさには影響しない（遅くなるだけ）。
     [<Sealed>]
     type BloomBuilder(expectedCount: int, falsePositiveRate: float) =
-        let template = ofKeys expectedCount falsePositiveRate Seq.empty
-        let bits = Array.copy template.Bits
+        let bitCount = bitsFor expectedCount falsePositiveRate
+        let hashCount = hashesFor expectedCount bitCount
+        let bits = Array.zeroCreate<byte>(bitCount / 8)
         let mutable hashes = 0
 
-        /// キーを 1つ追加する（ハッシュは `ofKeys` と同じ導出）。
+        /// キーを 1つ追加する（`mightContain` に渡すハッシュと同じ導出）。
         member _.Add(key: byte array) =
             let hash = key |> Hashing.hashBytes |> Hashing.mix
-            let h1, step = firstAndStep template.BitCount hash
+            let h1, step = firstAndStep bitCount hash
 
-            for i in 0 .. template.HashCount - 1 do
-                let pos = positionAt template.BitCount h1 step i
+            for i in 0 .. hashCount - 1 do
+                let pos = positionAt bitCount h1 step i
                 bits.[pos / 8] <- bits.[pos / 8] ||| (1uy <<< pos % 8)
 
-            hashes <- hashes + template.HashCount
+            hashes <- hashes + hashCount
 
         /// 確定した filter。
         member _.Build() =
-            { template with
+            {
                 Bits = bits
+                BitCount = bitCount
+                HashCount = hashCount
                 Count = hashes
             }
 
