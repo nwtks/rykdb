@@ -71,7 +71,7 @@ src/RykDb.Core/RowStore.fs|scanWithinPrefixLoop|scanWithinPrefixLoop|call
 src/RykDb.Core/Spill.fs|reopenOpenNext/reopenStream|reopenOpenNext|call
 src/RykDb.Core/Spill.fs|reopenOpenNext/reopenStream|reopenStream|call
 src/RykDb.Core/SstScan.fs|wrapWithResource|wrapWithResource|call
-src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|loadBlock|call
-src/RykDb.Core/Sstable.fs|scanEntries/loadBlock|scanEntries|call
+src/RykDb.Core/SstableReader.fs|loadBlock/scanEntries|loadBlock|call
+src/RykDb.Core/SstableReader.fs|loadBlock/scanEntries|scanEntries|call
 src/RykDb.Core/StorageEngine.fs|pullFromEnumerator|pullFromEnumerator|call
 src/RykDb.Core/StorageEngine.fs|stepScanState|stepScanState|call
