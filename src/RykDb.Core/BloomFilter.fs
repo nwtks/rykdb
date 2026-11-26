@@ -34,10 +34,6 @@ module internal BloomFilter =
         let step = if raw % 2UL = 0UL then (raw + 1UL) % n else raw % n
         h1, step
 
-    /// i 番目のハッシュ位置。
-    let private positionAt (bitCount: int) (h1: uint64) (step: uint64) (i: int32) =
-        int ((h1 + uint64 i * step) % uint64 bitCount)
-
     /// 期待要素数と誤検出率から必要なビット数を求める（8ビット単位に丸める）。
     let private bitsFor (expectedCount: int) (falsePositiveRate: float) =
         if expectedCount <= 0 then
@@ -54,16 +50,20 @@ module internal BloomFilter =
         else
             max 1 (int (ceil (float bitCount / float expectedCount) * ln2))
 
+    /// i 番目のハッシュ位置。
+    let private positionAt (bitCount: int) (h1: uint64) (step: uint64) (i: int32) =
+        int ((h1 + uint64 i * step) % uint64 bitCount)
+
     /// 全ハッシュ位置のビットが立っているかを順に検査する。
     [<TailCall>]
-    let rec private check (filter: BloomFilter) (h1: uint64) (step: uint64) (i: int) =
+    let rec private check (h1: uint64) (step: uint64) (i: int) (filter: BloomFilter) =
         if i >= filter.HashCount then
             true
         else
             let pos = positionAt filter.BitCount h1 step i
 
             if filter.Bits.[pos / 8] &&& (1uy <<< pos % 8) <> 0uy then
-                check filter h1 step (i + 1)
+                check h1 step (i + 1) filter
             else
                 false
 
@@ -71,7 +71,7 @@ module internal BloomFilter =
     /// 位置の配列を作らない（ポイント検索ごとの割り当てを避ける）。
     let mightContain (filter: BloomFilter) (keyHash: uint64) =
         let h1, step = firstAndStep filter.BitCount keyHash
-        check filter h1 step 0
+        check h1 step 0 filter
 
     /// 逐次追加できる Bloom filter ビルダ。
     /// 期待要素数と誤検出率からビット数・ハッシュ数を決め、`Add` でキーを足して `Build` で確定する。

@@ -6,7 +6,7 @@ type internal Entry =
         /// 論理 keyspace の接頭辞を含む物理キー
         Key: byte array
         /// 書き込みの論理時計。大きいほど新しい
-        SeqNo: uint64
+        SeqNo: SeqNo
         /// Some が値、None が削除 tombstone
         Value: SqlValue array option
     }
@@ -15,7 +15,7 @@ type internal Entry =
 
 module internal Entry =
     /// 値を持つエントリを作る。
-    let put (key: byte array) (seqNo: uint64) (value: SqlValue array) =
+    let put (key: byte array) (seqNo: SeqNo) (value: SqlValue array) =
         {
             Key = key
             SeqNo = seqNo
@@ -23,7 +23,7 @@ module internal Entry =
         }
 
     /// 削除 tombstone のエントリを作る。
-    let delete (key: byte array) (seqNo: uint64) =
+    let delete (key: byte array) (seqNo: SeqNo) =
         {
             Key = key
             SeqNo = seqNo
@@ -44,7 +44,7 @@ module internal Entry =
         48 + 40 + 24 + 24 + e.Key.Length + rowBytes
 
     /// エントリ列に含まれる SeqNo の最大値（空なら 0）。
-    let maxSeqNo (entries: Entry seq) =
+    let maxSeqNo (entries: Entry seq) : SeqNo =
         entries |> Seq.fold (fun acc e -> max acc e.SeqNo) 0UL
 
     /// キーの昇順、同一キーは SeqNo の降順（新しい版が先）。

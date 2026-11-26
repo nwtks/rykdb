@@ -3,7 +3,7 @@ namespace RykDb.Core
 /// 1つの SSTable のメタデータ。
 type internal FileMetaData =
     {
-        FileNumber: int64
+        FileNumber: FileNumber
         Level: int
         /// このファイルが持つ最小キー
         Smallest: byte array
@@ -15,7 +15,7 @@ type internal FileMetaData =
         /// このファイルに含まれる SeqNo の最大値。
         /// 起動時の NextSeqNo 復元に使う
         /// （GC は `Compaction.gcGroup` が activeSnapshot と版ごとの SeqNo で判定する）。
-        MaxSeqNo: uint64
+        MaxSeqNo: SeqNo
         /// 読み取り用のメタデータ（footer / index / Bloom / meta の解析結果）。
         /// <remarks>
         /// MANIFEST には保存しない（ファイル内容から導出できる）。
@@ -47,15 +47,15 @@ module internal FileMetaData =
         }
 
     /// SSTable のファイル名（6桁の番号と拡張子）。
-    let private fileName (fileNumber: int64) =
+    let private fileName (fileNumber: FileNumber) =
         sprintf "%06d%s" fileNumber SstExtension
 
     /// SSTable のフルパス。
-    let path (dir: string) (fileNumber: int64) =
+    let path (dir: string) (fileNumber: FileNumber) =
         System.IO.Path.Combine(dir, fileName fileNumber)
 
     /// 書き出し結果から SSTable のメタデータを組み立てる。
-    let private ofChunk (dir: string) (fileNumber: int64) (level: int) (info: SstWriteInfo) =
+    let private ofChunk (dir: string) (fileNumber: FileNumber) (level: int) (info: SstWriteInfo) =
         {
             FileNumber = fileNumber
             Level = level
@@ -92,7 +92,7 @@ module internal FileMetaData =
     /// 失敗時（キー順違反・書き込み失敗・空の入力）は部分ファイルを消してからエラーを返す。
     let writeSstable
         (dir: string)
-        (fileNumber: int64)
+        (fileNumber: FileNumber)
         (level: int)
         (bloomFalsePositiveRate: float)
         (expectedEntries: int)
@@ -112,7 +112,7 @@ module internal FileMetaData =
                         System.IO.FileOptions.SequentialScan
                     )
 
-                SstableFormat.writeTo fs bloomFalsePositiveRate expectedEntries entries
+                SstableWriter.writeTo fs bloomFalsePositiveRate expectedEntries entries
                 >>= fun info ->
                     fs.Flush true
                     ret info)
@@ -132,7 +132,7 @@ module internal FileMetaData =
         Bytes.compare f.Smallest key <= 0 && Bytes.compare key f.Largest <= 0
 
     /// ファイルを 1つ削除する（存在しなければ何もしない）。
-    let private deleteFile (dir: string) (fileNumber: int64) =
+    let private deleteFile (dir: string) (fileNumber: FileNumber) =
         protect (fun () ->
             let p = path dir fileNumber
 
@@ -160,7 +160,7 @@ type internal Version =
     {
         /// [level] が、そのレベルのファイル（キーの昇順に並べる）
         Files: FileMetaData array array
-        NextFileNumber: int64
+        NextFileNumber: FileNumber
     }
 
 module internal Version =
@@ -303,7 +303,7 @@ module internal VersionEdit =
                 ret (int64 v, c)
 
     /// VersionEdit のファイル番号を読む。
-    let private readEditFileNumber (c: Cursor) = readEditInt64 "ファイル番号" c
+    let private readEditFileNumber (c: Cursor) : Result<FileNumber * Cursor, DbError> = readEditInt64 "ファイル番号" c
 
     /// VersionEdit のレベルを読む（範囲外は CorruptionError）。
     let private readEditLevel (c: Cursor) =
@@ -762,7 +762,7 @@ module internal Manifest =
     /// ローテーションが必要な場合は、追記ではなく新しい MANIFEST へ Version 全体を書いて CURRENT を切り替える。
     /// CURRENT の切り替えに失敗した場合は旧 MANIFEST がそのまま残る。
     /// `manifestNumber` は単位 `manifestNo` を持つ。
-    /// この関数は `version.NextFileNumber`（SSTable のファイル番号・素の `int64`）も扱うので、
+    /// この関数は `version.NextFileNumber`（`FileNumber`）も扱うので、
     /// 2つの番号を取り違えるとコンパイルが通らない。
     /// </remarks>
     let logAndApplyWithOutcome (dir: string) (manifestNumber: ManifestNumber) (version: Version) (edit: VersionEdit) =

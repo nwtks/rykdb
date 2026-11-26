@@ -16,7 +16,7 @@ namespace RykDb.Core
 
 /// 読み取りの可視性境界。
 /// これより大きい SeqNo の書き込みは見えない。
-type internal Snapshot = { SeqNo: uint64 }
+type internal Snapshot = { SeqNo: SeqNo }
 
 module internal Snapshot =
     /// この snapshot から見える SeqNo か（Option で「制限なし」を表す）。
@@ -185,7 +185,7 @@ module internal Transaction =
 
     /// キーと値の組へ SeqNo を割り当てて Entry にする。
     [<TailCall>]
-    let rec private numberEntries (seqNo: uint64) (acc: Entry list) =
+    let rec private numberEntries (seqNo: SeqNo) (acc: Entry list) =
         function
         | [] -> List.rev acc
         | (k, v) :: tail ->
@@ -198,7 +198,7 @@ module internal Transaction =
 
     /// keyspace ごとに連続した SeqNo を割り当てる。
     [<TailCall>]
-    let rec private numberEntriesByKeyspace (seqNo: uint64) (acc: ('a * Entry array) list) =
+    let rec private numberEntriesByKeyspace (seqNo: SeqNo) (acc: ('a * Entry array) list) =
         function
         | [] -> List.rev acc, seqNo
         | (ks, entries) :: rest ->
@@ -209,7 +209,7 @@ module internal Transaction =
     /// 採番は nextSeqNo から 1つずつ採番する。
     /// 決定的な順序にするため keyspace 名 → キーの昇順で採番する
     /// （同じ transaction は常に同じ SeqNo 割当になる）。
-    let toEntries (nextSeqNo: uint64) (txn: Transaction) =
+    let toEntries (nextSeqNo: SeqNo) (txn: Transaction) =
         txn.Buffers
         |> Map.toList
         |> List.map (fun (ks, m) -> ks, m |> Map.toList)
@@ -223,8 +223,8 @@ module internal Transaction =
 /// </remarks>
 type internal TransactionStatus =
     {
-        NextSeqNo: uint64
-        LastCommitSeqNo: uint64
+        NextSeqNo: SeqNo
+        LastCommitSeqNo: SeqNo
         ActiveCount: int
         OldestActiveSnapshot: uint64
         LastCommittedKeys: int
@@ -234,19 +234,19 @@ type internal TransactionStatus =
 type internal TransactionManager =
     {
         /// 次に採番する SeqNo
-        NextSeqNo: uint64
+        NextSeqNo: SeqNo
         /// 次に採番する TxnId
         NextTxnId: TxnId
         /// commit 済み transaction が最後に書いた (keyspace:キー) -> SeqNo。
         /// 競合判定では、active transaction の snapshot より後に書かれた版だけを参照する。
         /// そのため、最古の active snapshot より前の履歴は commit ごとに削除できる。
         /// active transaction がなければ履歴は不要なので、commit 直後に空になる。
-        LastCommitted: Map<string, uint64>
+        LastCommitted: Map<string, SeqNo>
         /// アクティブな transaction（TxnId -> 開始時の状態）。
         /// 書き込みは `Transaction` 側の不変更新で行い、ここには開始時の値を置く。
         Active: Map<TxnId, Transaction>
         /// 最後に commit された SeqNo（=「DB の現在時刻」）
-        LastCommitSeqNo: uint64
+        LastCommitSeqNo: SeqNo
         /// 1 transaction のバッファ上限（バイト）。
         MaxTransactionBytes: int64
     }
@@ -267,9 +267,9 @@ module internal TransactionManager =
     /// 今回の commit のキーを履歴へ記録する（UNIQUE 予約を含む）。
     let private updateLastCommittedWith
         (txn: Transaction)
-        (lastCommitted: Map<string, uint64>)
+        (lastCommitted: Map<string, SeqNo>)
         (batches: (string * Entry array) list)
-        (commitSeq: uint64)
+        (commitSeq: SeqNo)
         =
         let physical =
             batches
@@ -311,7 +311,7 @@ module internal TransactionManager =
     /// 次の採番がそれを巻き戻さないようにする
     /// （巻き戻すと同じキーに同じ SeqNo の版ができ、可視性と GC が曖昧になる）。
     /// </remarks>
-    let synchronize (lastSeq: uint64) (manager: TransactionManager) =
+    let synchronize (lastSeq: SeqNo) (manager: TransactionManager) =
         let next =
             if lastSeq = System.UInt64.MaxValue then
                 lastSeq

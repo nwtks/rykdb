@@ -1075,7 +1075,7 @@ entry =
 ブロックは128エントリを目安に分割する。
 チェックサムはCRC32Cで、slicing-by-8を使う。
 
-書き出し（`SstableFormat.writeTo`）は入力の`seq`を1回だけ列挙し、
+書き出し（`SstableWriter.writeTo`）は入力の`seq`を1回だけ列挙し、
 ブロックとBloom filterを同時に構築する（キー列を溜めない）。
 Bloom filterのビット数は`expectedEntries`の見積りから決める。
 実件数がこれを超えてもfalse negativeは出ない（誤検出率が上がるだけ）。

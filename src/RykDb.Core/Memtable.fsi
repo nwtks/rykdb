@@ -6,7 +6,7 @@ type internal Entry =
         /// 論理 keyspace の接頭辞を含む物理キー
         Key: byte array
         /// 書き込みの論理時計。大きいほど新しい
-        SeqNo: uint64
+        SeqNo: SeqNo
         /// Some が値、None が削除 tombstone
         Value: SqlValue array option
     }
@@ -14,10 +14,10 @@ type internal Entry =
     member IsDelete: bool
 
 module internal Entry =
-    val put: byte array -> uint64 -> SqlValue array -> Entry
-    val delete: byte array -> uint64 -> Entry
+    val put: byte array -> SeqNo -> SqlValue array -> Entry
+    val delete: byte array -> SeqNo -> Entry
     val managedBytes: Entry -> int
-    val maxSeqNo: seq<Entry> -> uint64
+    val maxSeqNo: seq<Entry> -> SeqNo
     val compareKeys: Entry -> Entry -> int
     val priority: Entry -> uint64
     val takeOwnership: Entry -> Entry

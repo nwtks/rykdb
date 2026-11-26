@@ -27,6 +27,43 @@ type internal StorageRuntime() =
         with get () = lastFlushError.["current"]
         and set (value: DbError option) = lastFlushError.["current"] <- value
 
+/// RowStore が使う StorageEngine の操作面。
+/// テストではメモリ実装に差し替えられる。
+type internal IStorageEngine =
+    abstract NextSeqNo: SeqNo
+    abstract ActiveSnapshot: uint64
+    /// MANIFEST に反映済みの状態（background compaction が共有する）。
+    abstract PublishedState: PublishedState
+    /// 現在の WAL 位置。メモリエンジンは None。
+    abstract WalState: WalState option
+    /// 直近の flush 失敗（成功したら None）。
+    abstract LastFlushError: DbError option
+
+    /// 列マスクに従って必要な列だけ復号して 1行を引く。
+    abstract GetAtMasked:
+        visible: uint64 option -> key: byte array -> mask: bool array -> Result<SstEntry option, DbError>
+
+    /// 行の値が必要ないときは `needsValues = false`（値を作らず空の行を返す）。
+    abstract ScanAtValues:
+        visible: uint64 option -> startKey: byte array -> limit: int -> needsValues: bool -> Result<SstScan, DbError>
+
+    /// 列マスクに従って必要な列だけ復号する。
+    abstract ScanAtMasked:
+        visible: uint64 option -> startKey: byte array -> limit: int -> mask: bool array -> Result<SstScan, DbError>
+
+    abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
+    /// WAL 追記のみ行い、fsync は呼び出し側に任せる。
+    abstract WriteBatchDeferred: entries: Entry array -> Result<IStorageEngine, DbError>
+    abstract WithNextSeqNo: nextSeqNo: SeqNo -> IStorageEngine
+    abstract WithActiveSnapshot: snapshot: uint64 -> IStorageEngine
+    /// coordinator が公開した Version / MANIFEST 番号 / GC 境界で差し替える。
+    abstract WithHostState: state: PublishedState -> IStorageEngine
+    /// 上限超過時は flush だけを行う（compaction はしない）。
+    /// 戻り値の bool は「実際に flush したか」。
+    abstract FlushIfNeeded: allocateFileNumber: (unit -> FileNumber) -> Result<IStorageEngine * bool, DbError>
+    abstract MaybeFlush: unit -> Result<IStorageEngine * DbError option, DbError>
+    abstract Close: unit -> Result<unit, DbError>
+
 /// StorageEngine の不変状態。
 /// すべての操作は新しい状態を返す。
 type internal StorageEngine =
@@ -43,7 +80,7 @@ type internal StorageEngine =
         /// 現在の WAL
         Wal: WalState
         /// 次に採番する seqNo
-        NextSeqNo: uint64
+        NextSeqNo: SeqNo
         /// 次に採番する txnId
         NextTxnId: TxnId
         /// memtable のメモリ上限（超えたら flush する）
@@ -82,7 +119,7 @@ module internal StorageEngine =
     let private readInfoOf (dir: string) (f: FileMetaData) =
         match f.ReadInfo with
         | Some info -> ret info
-        | None -> Sstable.openPartial (FileMetaData.path dir f.FileNumber)
+        | None -> SstableReader.openPartial (FileMetaData.path dir f.FileNumber)
 
     /// ファイルの読み取り用メタデータを引く。
     let private readInfoIn (f: FileMetaData) (engine: StorageEngine) = readInfoOf engine.Dir f
@@ -120,9 +157,9 @@ module internal StorageEngine =
         readInfoIn f engine
         >>= fun info ->
             match maskOpt with
-            | None -> Sstable.rangeScanPartial startKey 0 info
-            | Some mask when mask.Length = 0 -> Sstable.rangeScanPartialSkipped startKey 0 info
-            | Some mask -> Sstable.rangeScanPartialMasked mask startKey 0 info
+            | None -> SstableReader.rangeScanPartial startKey 0 info
+            | Some mask when mask.Length = 0 -> SstableReader.rangeScanPartialSkipped startKey 0 info
+            | Some mask -> SstableReader.rangeScanPartialMasked mask startKey 0 info
             |> ret
             >>= fun scan ->
                 match SstScan.next scan with
@@ -159,14 +196,15 @@ module internal StorageEngine =
     /// ファイルの先頭から全件を遅延して読む。
     /// compaction はキー・SeqNo・削除タグしか見ないので、値は復号せずスライスのまま渡す。
     let openScan (dir: string) (f: FileMetaData) =
-        readInfoOf dir f >>= fun info -> ret (Sstable.rangeScanPartialRaw [||] 0 info)
+        readInfoOf dir f
+        >>= fun info -> ret (SstableReader.rangeScanPartialRaw [||] 0 info)
 
     /// 列マスク付きポイントルックアップのファイル走査本体。
     [<TailCall>]
     let rec private probeAtMasked
-        (visible: uint64 option)
         (key: byte array)
         (mask: bool array)
+        (visible: uint64 option)
         (engine: StorageEngine)
         =
         function
@@ -174,21 +212,21 @@ module internal StorageEngine =
         | f :: rest ->
             match readInfoIn f engine with
             | Ok info ->
-                match Sstable.lookupMasked mask key visible info with
+                match SstableReader.lookupMasked key mask visible info with
                 | Ok(Some e) -> ret (Some e)
-                | Ok None -> probeAtMasked visible key mask engine rest
+                | Ok None -> probeAtMasked key mask visible engine rest
                 | Error e -> err e
             | Error e -> err e
 
     /// 列マスク付きのポイントルックアップ。
-    let getAtMasked (visible: uint64 option) (key: byte array) (mask: bool array) (engine: StorageEngine) =
+    let getAtMasked (key: byte array) (mask: bool array) (visible: uint64 option) (engine: StorageEngine) =
         match Memtable.getVisible key visible engine.Mem with
         | Some e ->
             let value = e.Value |> Option.map (SqlValue.maskRow mask)
             ret (Some(SstEntry.make e.Key e.SeqNo value))
         | None ->
             Version.filesForPointLookup key engine.Version
-            |> probeAtMasked visible key mask engine
+            |> probeAtMasked key mask visible engine
 
     /// 遅延走査の状態。
     /// `next` を呼ぶたびに、未オープンのファイルを必要な分だけ開き、
@@ -341,7 +379,7 @@ module internal StorageEngine =
         scanAtWith visible limit startKey (Some mask) engine
 
     /// WAL と memtable の反映結果を新しい engine にまとめる。
-    let private applyBatch (entries: Entry array) (engine: StorageEngine) (wal: WalState) (txnId: uint64<txnId>) =
+    let private applyBatch (entries: Entry array) (engine: StorageEngine) (wal: WalState) (txnId: TxnId) =
         let mem = Memtable.apply entries engine.Mem
         let nextTxnId = txnId + 1UL<txnId>
 
@@ -414,7 +452,7 @@ module internal StorageEngine =
         }
 
     /// ファイル番号の下限を進めた engine を返す。
-    let private bumpNextFileNumber (engine: StorageEngine) (fileNumber: int64) =
+    let private bumpNextFileNumber (engine: StorageEngine) (fileNumber: FileNumber) =
         { engine with
             Version =
                 { engine.Version with
@@ -485,7 +523,7 @@ module internal StorageEngine =
     /// 呼び出し側の `RowStore` は失敗前の memtable を保持して次の write で再試行する。
     /// background compaction の有効時は RowStore がこちらを呼び、MANIFEST 反映後に worker を起こす。
     /// 戻り値の bool は「実際に flush したか」。
-    let flushIfNeededWith (allocateFileNumber: unit -> int64) (engine: StorageEngine) =
+    let flushIfNeededWith (allocateFileNumber: unit -> FileNumber) (engine: StorageEngine) =
         withRuntimeGate engine (fun () ->
             if
                 not (Memtable.isEmpty engine.Mem)
@@ -511,7 +549,7 @@ module internal StorageEngine =
     /// compaction 用にファイルの部分読みスキャンを開く。
     let private scanOfFile (engine: StorageEngine) (f: FileMetaData) =
         readInfoIn f engine
-        >>= fun info -> ret (Sstable.rangeScanPartialRaw [||] 0 info)
+        >>= fun info -> ret (SstableReader.rangeScanPartialRaw [||] 0 info)
 
     /// 追加されたファイルの最大番号の次を返す。
     let private nextFileNumberAfter (version: Version) (result: CompactionResult) =
@@ -621,7 +659,7 @@ module internal StorageEngine =
             DbError.corruption (sprintf "MANIFEST が参照する SSTable が見つかりません: %s" names) |> err
 
     /// パスから数値のファイル番号を取り出す。
-    let private parseNumber (path: string) =
+    let private parseNumber (path: string) : FileNumber option =
         match System.Int64.TryParse(System.IO.Path.GetFileNameWithoutExtension path) with
         | true, v -> Some v
         | _ -> None
@@ -633,7 +671,7 @@ module internal StorageEngine =
             |> Array.choose parseNumber)
 
     /// 孤立ファイルを検疫ディレクトリへ移す。
-    let private moveToQuarantine (dir: string) (quarantine: string) (n: int64) =
+    let private moveToQuarantine (dir: string) (quarantine: string) (n: FileNumber) =
         let source = FileMetaData.path dir n
         let name = System.IO.Path.GetFileName source
         let target = System.IO.Path.Combine(quarantine, name)
@@ -689,7 +727,7 @@ module internal StorageEngine =
         }
 
     /// ディスク上の最大 SeqNo を返す。
-    let private maxSeqNoOnDisk =
+    let private maxSeqNoOnDisk: Version -> SeqNo =
         Version.allFiles >> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
 
     /// ディスク上の最大ファイル番号を返す。
@@ -722,7 +760,7 @@ module internal StorageEngine =
         match f.ReadInfo with
         | Some _ -> ret f
         | None ->
-            Sstable.openPartial (FileMetaData.path dir f.FileNumber)
+            SstableReader.openPartial (FileMetaData.path dir f.FileNumber)
             |> Result.map (fun info -> { f with ReadInfo = Some info })
 
     /// 1レベルの ReadInfo を埋める。
@@ -746,10 +784,10 @@ module internal StorageEngine =
         (manifestNumber: ManifestNumber)
         (walState: WalState)
         (mem: Memtable)
-        (walMax: uint64)
-        (diskMax: uint64)
-        (diskMaxFile: int64)
-        (walMaxTxn: uint64<txnId>)
+        (walMax: SeqNo)
+        (diskMax: SeqNo)
+        (diskMaxFile: FileNumber)
+        (walMaxTxn: TxnId)
         =
         let nextSeqNo = max walMax diskMax + 1UL
         let nextTxnId = walMaxTxn + 1UL<txnId>
@@ -829,43 +867,6 @@ module internal StorageEngine =
                         return ()
                 })
 
-/// RowStore が使う StorageEngine の操作面。
-/// テストではメモリ実装に差し替えられる。
-type internal IStorageEngine =
-    abstract NextSeqNo: uint64
-    abstract ActiveSnapshot: uint64
-    /// MANIFEST に反映済みの状態（background compaction が共有する）。
-    abstract PublishedState: PublishedState
-    /// 現在の WAL 位置。メモリエンジンは None。
-    abstract WalState: WalState option
-    /// 直近の flush 失敗（成功したら None）。
-    abstract LastFlushError: DbError option
-
-    /// 列マスクに従って必要な列だけ復号して 1行を引く。
-    abstract GetAtMasked:
-        visible: uint64 option -> key: byte array -> mask: bool array -> Result<SstEntry option, DbError>
-
-    /// 行の値が必要ないときは `needsValues = false`（値を作らず空の行を返す）。
-    abstract ScanAtValues:
-        visible: uint64 option -> startKey: byte array -> limit: int -> needsValues: bool -> Result<SstScan, DbError>
-
-    /// 列マスクに従って必要な列だけ復号する。
-    abstract ScanAtMasked:
-        visible: uint64 option -> startKey: byte array -> limit: int -> mask: bool array -> Result<SstScan, DbError>
-
-    abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
-    /// WAL 追記のみ行い、fsync は呼び出し側に任せる。
-    abstract WriteBatchDeferred: entries: Entry array -> Result<IStorageEngine, DbError>
-    abstract WithNextSeqNo: nextSeqNo: uint64 -> IStorageEngine
-    abstract WithActiveSnapshot: snapshot: uint64 -> IStorageEngine
-    /// coordinator が公開した Version / MANIFEST 番号 / GC 境界で差し替える。
-    abstract WithHostState: state: PublishedState -> IStorageEngine
-    /// 上限超過時は flush だけを行う（compaction はしない）。
-    /// 戻り値の bool は「実際に flush したか」。
-    abstract FlushIfNeeded: allocateFileNumber: (unit -> int64) -> Result<IStorageEngine * bool, DbError>
-    abstract MaybeFlush: unit -> Result<IStorageEngine * DbError option, DbError>
-    abstract Close: unit -> Result<unit, DbError>
-
 /// 実ディスクの StorageEngine を IStorageEngine として公開する。
 type internal DiskStorageEngine(engine: StorageEngine) =
     interface IStorageEngine with
@@ -885,7 +886,7 @@ type internal DiskStorageEngine(engine: StorageEngine) =
         member _.LastFlushError = engine.Runtime.LastFlushError
 
         member _.GetAtMasked (visible: uint64 option) (key: byte array) (mask: bool array) =
-            StorageEngine.getAtMasked visible key mask engine
+            StorageEngine.getAtMasked key mask visible engine
 
         member _.ScanAtValues (visible: uint64 option) (startKey: byte array) (limit: int) (needsValues: bool) =
             StorageEngine.scanAtValues visible limit startKey needsValues engine
@@ -901,7 +902,7 @@ type internal DiskStorageEngine(engine: StorageEngine) =
             StorageEngine.writeBatchDeferred entries engine
             |> Result.map (fun next -> DiskStorageEngine next :> IStorageEngine)
 
-        member _.WithNextSeqNo(nextSeqNo: uint64) =
+        member _.WithNextSeqNo(nextSeqNo: SeqNo) =
             DiskStorageEngine { engine with NextSeqNo = nextSeqNo } :> IStorageEngine
 
         member _.WithActiveSnapshot(snapshot: uint64) =
@@ -920,7 +921,7 @@ type internal DiskStorageEngine(engine: StorageEngine) =
                 }
             :> IStorageEngine
 
-        member _.FlushIfNeeded(allocateFileNumber: unit -> int64) =
+        member _.FlushIfNeeded(allocateFileNumber: unit -> FileNumber) =
             StorageEngine.flushIfNeededWith allocateFileNumber engine
             |> Result.map (fun (next, flushed) -> DiskStorageEngine next :> IStorageEngine, flushed)
 

@@ -37,7 +37,7 @@ type private InstallContext =
         StateKey: string
         OldestSnapshot: unit -> uint64 option
         ManifestApply: (ManifestNumber -> Version -> VersionEdit -> ManifestApplyResult) option
-        FileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>
+        FileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>
     }
 
 /// compaction 1サイクルに必要な共有状態。
@@ -50,7 +50,7 @@ type private CycleContext =
         ScanOf: FileMetaData -> Result<SstScan, DbError>
         ScanHook: (FileMetaData -> unit) option
         Cancel: System.Threading.CancellationTokenSource
-        FileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>
+        FileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>
     }
 
 /// VersionCoordinator の共通処理。
@@ -79,7 +79,7 @@ module private VersionCoordinatorHelpers =
         defaultArg manifestApply (defaultApplyManifest dir)
 
     /// ファイルを削除する（失敗したら false）。
-    let tryDeleteFile (dir: string) (fileNumber: int64) =
+    let tryDeleteFile (dir: string) (fileNumber: FileNumber) =
         match
             protect (fun () ->
                 let path = FileMetaData.path dir fileNumber
@@ -162,8 +162,8 @@ module private VersionCoordinatorHelpers =
     /// ファイルの pin 数を増やすループ本体。
     [<TailCall>]
     let rec pinFile
-        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>)
-        (fileNumber: int64)
+        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
+        (fileNumber: FileNumber)
         =
         match fileRefs.TryGetValue fileNumber with
         | true, state ->
@@ -177,7 +177,7 @@ module private VersionCoordinatorHelpers =
     [<TailCall>]
     let rec pinVersion
         (versionPins: System.Collections.Concurrent.ConcurrentDictionary<Version, int>)
-        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>)
+        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
         (version: Version)
         =
         match versionPins.TryGetValue version with
@@ -193,9 +193,9 @@ module private VersionCoordinatorHelpers =
     /// ファイルの参照を減らすループ本体。
     [<TailCall>]
     let rec releaseFile
-        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>)
+        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
         (dir: string)
-        (fileNumber: int64)
+        (fileNumber: FileNumber)
         =
         match fileRefs.TryGetValue fileNumber with
         | true, state ->
@@ -223,8 +223,8 @@ module private VersionCoordinatorHelpers =
     /// ファイルを retired にするループ本体。
     [<TailCall>]
     let rec retireFile
-        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>)
-        (fileNumber: int64)
+        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
+        (fileNumber: FileNumber)
         =
         match fileRefs.TryGetValue fileNumber with
         | true, state ->
@@ -237,7 +237,10 @@ module private VersionCoordinatorHelpers =
                 retireFile fileRefs fileNumber
 
     /// retired かつ参照 0 のファイルを削除する（失敗したら次回に再試行）。
-    let sweepFiles (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>) (dir: string) =
+    let sweepFiles
+        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
+        (dir: string)
+        =
         fileRefs.ToArray()
         |> Array.iter (fun pair ->
             if pair.Value.Retired && pair.Value.Pins = 0 then
@@ -249,7 +252,7 @@ module private VersionCoordinatorHelpers =
     [<TailCall>]
     let rec releaseVersion
         (versionPins: System.Collections.Concurrent.ConcurrentDictionary<Version, int>)
-        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>)
+        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
         (dir: string)
         (version: Version)
         =
@@ -441,7 +444,7 @@ module private VersionCoordinatorHelpers =
         (stateCell: System.Collections.Concurrent.ConcurrentDictionary<string, PublishedState>)
         (stateKey: string)
         (versionPins: System.Collections.Concurrent.ConcurrentDictionary<Version, int>)
-        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>)
+        (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
         (dir: string)
         =
         let state = stateCell.[stateKey]
@@ -461,7 +464,7 @@ module private VersionCoordinatorHelpers =
 
     /// 入力が現存し、最古 snapshot が開始時より古くならないか。
     let private canInstall
-        (currentNumbers: Set<int64>)
+        (currentNumbers: Set<FileNumber>)
         (baseState: PublishedState)
         (result: CompactionResult)
         (oldestNow: uint64)
@@ -621,7 +624,7 @@ type internal VersionCoordinator
 
     /// ファイル番号ごとの参照状態。
     let fileRefs =
-        System.Collections.Concurrent.ConcurrentDictionary<int64, FileRefState>()
+        System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>()
 
     /// Version 単位の参照数。最初の lease でファイルを pin し、最後の lease で release する。
     /// 参照等価で数える（構造が同じ別の Version を取り違えない）。

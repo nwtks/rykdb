@@ -142,7 +142,7 @@ module internal EngineDdl =
     /// 索引 keyspace の UNIQUE 制約を検査する。
     let private checkUniqueIndex (idx: IndexSchema) (store: RowStore) =
         RowStore.scanKeys (Keyspace.index idx.Name) [||] 0 store
-        >>= fun scan -> SstScan.withScan scan (fun scan -> checkUniqueEntries idx None scan)
+        >>= SstScan.withScan (checkUniqueEntries idx None)
 
     /// 後始末の失敗を無視して keyspace を空にする。
     let private clearSpaceIgnoringError (state: ExecState) (space: string) =
@@ -332,7 +332,7 @@ module internal EngineDdl =
         (store: RowStore)
         =
         RowStore.scan space [||] 0 store
-        >>= fun scan -> SstScan.withScan scan (fun scan -> rewriteSpaceLoop space transform txn scan)
+        >>= SstScan.withScan (rewriteSpaceLoop space transform txn)
 
     /// テーブル keyspace の行変換器を作る。
     let private rewriteTableOf (schema: TableSchema) =

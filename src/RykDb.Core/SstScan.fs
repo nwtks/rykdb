@@ -1,6 +1,5 @@
 // ===========================================================================
 // SstEntry / SstScan / SstMerge — SSTable の 1エントリと遅延走査・k-way merge。
-//
 // 走査は one-shot（同じ値の next を 2回呼ばない）。
 // ===========================================================================
 
@@ -20,7 +19,7 @@ type internal RawSstValue =
 type internal SstEntry =
     {
         Key: byte array
-        SeqNo: uint64
+        SeqNo: SeqNo
         /// None が削除 tombstone（復号済みの値）
         Value: SqlValue array option
         /// 符号化されたままの値（compaction 用。`Value` とどちらか一方だけが有効）
@@ -34,7 +33,7 @@ type internal SstEntry =
 
 module internal SstEntry =
     /// 復号済みの値を持つエントリを作る。
-    let make (key: byte array) (seqNo: uint64) (value: SqlValue array option) =
+    let make (key: byte array) (seqNo: SeqNo) (value: SqlValue array option) =
         {
             Key = key
             SeqNo = seqNo
@@ -43,7 +42,7 @@ module internal SstEntry =
         }
 
     /// 復号せずに値スライスを保持するエントリ（compaction 用）。
-    let makeRaw (key: byte array) (seqNo: uint64) (raw: RawSstValue) =
+    let makeRaw (key: byte array) (seqNo: SeqNo) (raw: RawSstValue) =
         {
             Key = key
             SeqNo = seqNo
@@ -118,7 +117,7 @@ module internal SstEntry =
                 ret (seqNo, tag, Cursor.advance 1 c)
 
     /// 削除タグと値本体を復号する。
-    let private decodePayload (seqNo: uint64) (tag: byte) (c: Cursor) =
+    let private decodePayload (seqNo: SeqNo) (tag: byte) (c: Cursor) =
         result {
             let! values, _ = ValueCodec.readValues c
 
@@ -140,7 +139,7 @@ module internal SstEntry =
     /// 値部分をカーソルから直接復元する。
     /// `length` バイトを消費した次のカーソルも返す。
     /// 値の一時配列を作らずにブロックを読み進められる。
-    let decodeValueAt (c: Cursor) (length: int) =
+    let decodeValueAt (length: int) (c: Cursor) =
         Cursor.splitAt length c
         >>= fun (value, rest) ->
             decodeHeader value
@@ -150,7 +149,7 @@ module internal SstEntry =
     /// 値を復号せず、削除タグだけ見て空の行を返す。
     /// 列が 1つも不要なクエリ（COUNT(*) など）用。
     /// `length` バイトを消費した次のカーソルも返す。
-    let decodeSkippedValueAt (c: Cursor) (length: int) =
+    let decodeSkippedValueAt (length: int) (c: Cursor) =
         Cursor.splitAt length c
         >>= fun (value, rest) ->
             match decodeHeader value with
@@ -161,7 +160,7 @@ module internal SstEntry =
 
     /// 列マスクに従って値を復号する。
     /// `mask` が false の列は `SqlValue.Unloaded` を置き、値本体を読み飛ばす。
-    let decodeMaskedValueAt (mask: bool array) (c: Cursor) (length: int) =
+    let decodeMaskedValueAt (mask: bool array) (length: int) (c: Cursor) =
         Cursor.splitAt length c
         >>= fun (value, rest) ->
             match decodeHeader value with
@@ -177,7 +176,7 @@ module internal SstEntry =
 
     /// 符号化された値の位置を返す（復号しない）。
     /// `length` バイトを消費した次のカーソルも返す。
-    let decodeRawValueAt (c: Cursor) (length: int) =
+    let decodeRawValueAt (length: int) (c: Cursor) =
         Cursor.splitAt length c
         >>= fun (value, rest) ->
             decodeHeader value
@@ -185,7 +184,6 @@ module internal SstEntry =
                 if tag <> 0uy && tag <> 1uy then
                     err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
                 else
-                    // タグから値の終端までが raw スライス（書き出しはタグ込み）。
                     let rawStart = Cursor.pos payload - 1
 
                     ret (
@@ -212,7 +210,7 @@ module internal SstEntry =
                     ret None
                 elif tag = 1uy then
                     Cursor.createSlice raw.Buffer (raw.Offset + 1) (raw.Length - 1)
-                    >>= fun c -> ValueCodec.readValues c |> Result.map (fun (values, _) -> Some values)
+                    >>= (ValueCodec.readValues >> Result.map (fst >> Some))
                 else
                     err (sprintf "Sstable: 不明な値タグ %d" (int tag) |> DbError.corruption)
 
@@ -327,7 +325,7 @@ module internal SstScan =
     let ofFilter (predicate: SstEntry -> bool) (scan: SstScan) = FilterScan(scan, predicate)
 
     /// スコープ登録された走査を作る。
-    let ofScoped (scan: SstScan) (scope: ScanScope) (key: obj) = ScopedScan(scan, scope, key)
+    let ofScoped (key: obj) (scope: ScanScope) (scan: SstScan) = ScopedScan(scan, scope, key)
 
     /// 終端（これ以上要素は無い）。
     let Empty = ofStep (fun () -> ret None)
@@ -339,12 +337,12 @@ module internal SstScan =
         | None -> ()
 
     /// 残りの走査を台帳の最新版へ差し替える。
-    let private finishScoped (scope: (ScanScope * obj) option) (e: SstEntry) (scan: SstScan) =
+    let private finishScoped (e: SstEntry) (scope: (ScanScope * obj) option) (scan: SstScan) =
         match scope with
         | None -> ret (Some(e, scan))
         | Some(scope, key) ->
             scope.Register(key, scan :> System.IDisposable)
-            ret (Some(e, ofScoped scan scope key))
+            ret (Some(e, ofScoped key scope scan))
 
     /// 次の 1件。
     /// None は終端。
@@ -381,36 +379,36 @@ module internal SstScan =
             ret None
         | Ok(Some(e, rest)) ->
             match filters with
-            | [] -> finishScoped scope e rest
-            | _ -> applyFilters filters filters scope e rest
+            | [] -> finishScoped e scope rest
+            | _ -> applyFilters filters filters e scope rest
 
     /// 継続として積んだ述語を先頭から試す。
     /// 満たさなければ下流 scan の続きへ末尾再帰する。
     and [<TailCall>] private applyFilters
         (allFilters: (SstEntry -> bool) list)
         (remaining: (SstEntry -> bool) list)
-        (scope: (ScanScope * obj) option)
         (e: SstEntry)
+        (scope: (ScanScope * obj) option)
         (scan: SstScan)
         =
         match remaining with
         | [] ->
             List.fold (fun scan predicate -> ofFilter predicate scan) scan allFilters
-            |> finishScoped scope e
+            |> finishScoped e scope
         | predicate :: tail ->
             if predicate e then
-                applyFilters allFilters tail scope e scan
+                applyFilters allFilters tail e scope scan
             else
                 nextWithFilters allFilters scope scan
 
     /// 次のエントリを返す（フィルタなしの通常入口）。
-    let next = nextWithFilters [] None
+    let next (scan: SstScan) = nextWithFilters [] None scan
 
     /// 明示的に資源を解放する（終端・エラー後の呼び出しも安全）。
     let dispose (scan: SstScan) = (scan :> System.IDisposable).Dispose()
 
     /// 結び付けた資源を 1回だけ解放する。
-    let private releaseResource (holder: ScanScope) (key: obj) = holder.Release key
+    let private releaseResource (holder: ScanScope) = holder.Release
 
     /// 走査の続きに同じ後始末を付ける。
     let rec private wrapWithResource (release: unit -> unit) (current: SstScan) =
@@ -440,7 +438,7 @@ module internal SstScan =
 
     /// 走査を使い、成功・失敗・例外のいずれでも Dispose する。
     /// 開いた走査を全件読み切る用途で使う。
-    let withScan (scan: SstScan) (f: SstScan -> Result<'a, DbError>) =
+    let withScan (f: SstScan -> Result<'a, DbError>) (scan: SstScan) =
         try
             f scan
         finally
@@ -451,7 +449,7 @@ module internal SstScan =
     let scoped (scope: ScanScope) (scan: SstScan) =
         let key = obj ()
         scope.Register(key, scan :> System.IDisposable)
-        ofScoped scan scope key
+        ofScoped key scope scan
 
     /// 1件を返す走査。
     /// 続き（rest）は次を要求されるまで組み立てない
@@ -468,7 +466,7 @@ module internal SstScan =
         | Error e -> err e
 
     /// 残りを配列に畳む（壊れたブロックに当たったらその場で Error）。
-    let toArray (scan: SstScan) = withScan scan (drainToArray [])
+    let toArray (scan: SstScan) = withScan (drainToArray []) scan
 
     /// 条件を満たすエントリだけを返す走査。
     /// 条件を満たさない間は次のエントリを読み進める（ブロック単位のまま）。
@@ -505,19 +503,6 @@ module internal SstMerge =
     /// 空のマージ（すぐ終端）。
     let Empty = SstMerge MergeEmpty
 
-    /// 左偏木の rank（右スパインの長さ）。
-    let private rank =
-        function
-        | MergeEmpty -> 0
-        | MergeNode(r, _, _, _) -> r
-
-    /// rank の小さい側を右に置いてノードを作る。
-    let private node (head: MergeHead) (left: MergeNode) (right: MergeNode) =
-        if rank left >= rank right then
-            MergeNode(rank right + 1, head, left, right)
-        else
-            MergeNode(rank left + 1, head, right, left)
-
     /// エントリ順（同一ならソース順）でヘッドを比較する。
     let private compareHead (a: MergeHead) (b: MergeHead) =
         match SstEntry.compare a.Entry b.Entry with
@@ -532,6 +517,19 @@ module internal SstMerge =
         | heap, MergeEmpty -> picked, heap
         | MergeNode(_, ha, _, _), MergeNode(_, hb, _, _) when compareHead ha hb > 0 -> descendMerge picked b a
         | MergeNode(_, ha, left, right), _ -> descendMerge ((ha, left) :: picked) right b
+
+    /// 左偏木の rank（右スパインの長さ）。
+    let private rank =
+        function
+        | MergeEmpty -> 0
+        | MergeNode(r, _, _, _) -> r
+
+    /// rank の小さい側を右に置いてノードを作る。
+    let private node (head: MergeHead) (left: MergeNode) (right: MergeNode) =
+        if rank left >= rank right then
+            MergeNode(rank right + 1, head, left, right)
+        else
+            MergeNode(rank left + 1, head, right, left)
 
     /// 2つの左偏ヒープを合成する。
     let private mergeHeaps (first: MergeNode) (second: MergeNode) =

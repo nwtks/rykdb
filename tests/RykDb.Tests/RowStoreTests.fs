@@ -192,8 +192,8 @@ let ``RowStore: compaction 失敗後も flush 結果を保持し、再起動で 
         let reopened = ok (StorageEngine.openDatabaseWith None dir)
         let key5 = Keyspace.prefixedKey "t" (intKey 5)
         let key6 = Keyspace.prefixedKey "t" (intKey 6)
-        Assert.True((ok (StorageEngine.getAtMasked None key5 [||] reopened)).IsSome)
-        Assert.True((ok (StorageEngine.getAtMasked None key6 [||] reopened)).IsSome))
+        Assert.True((ok (StorageEngine.getAtMasked key5 [||] None reopened)).IsSome)
+        Assert.True((ok (StorageEngine.getAtMasked key6 [||] None reopened)).IsSome))
 
 [<Fact>]
 let ``RowStore: compaction 失敗で中断した走査は入力 SSTable のハンドルを残さない`` () =
@@ -386,7 +386,7 @@ let ``RowStore.openStore: 開く途中で失敗してもロックを解放する
         let sst = System.IO.Directory.GetFiles(dir, "*.sst") |> Array.exactlyOne
         let original = System.IO.File.ReadAllBytes sst
         let broken = Array.copy original
-        let magicOffset = broken.Length - SstableFormat.FooterSize
+        let magicOffset = broken.Length - SstableFooter.FooterSize
         broken.[magicOffset] <- broken.[magicOffset] ^^^ 0xFFuy
         System.IO.File.WriteAllBytes(sst, broken)
         expectErrorKind ErrorKind.CorruptionError "壊れた SSTable を開けてしまった" (RowStore.openStore dir)

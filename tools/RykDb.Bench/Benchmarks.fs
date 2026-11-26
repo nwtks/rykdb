@@ -495,9 +495,9 @@ type CompactionBenchmarks() =
     let mutable added: FileMetaData list = []
 
     member private _.OpenScan(f: FileMetaData) =
-        match Sstable.openPartial (FileMetaData.path dir f.FileNumber) with
+        match SstableReader.openPartial (FileMetaData.path dir f.FileNumber) with
         | Error e -> Error e
-        | Ok partial -> Ok(Sstable.rangeScanPartialRaw [||] 0 partial)
+        | Ok partial -> Ok(SstableReader.rangeScanPartialRaw [||] 0 partial)
 
     [<GlobalSetup>]
     member _.Setup() =

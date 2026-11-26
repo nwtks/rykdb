@@ -708,24 +708,24 @@ module internal Catalog =
     let private toValue (bytes: byte array) = [| SqlValue.Blob bytes |]
 
     /// テーブル定義の書き込みエントリを作る。
-    let private tableBatch (t: TableDefinition) (seq: uint64) =
+    let private tableBatch (t: TableDefinition) (seq: SeqNo) =
         Keyspace.CatalogKeyspace, [| Entry.put (tableKey t.Name) seq (toValue (encodeTable t)) |]
 
     /// 索引定義の書き込みエントリを作る。
-    let private indexBatch (i: IndexDefinition) (seq: uint64) =
+    let private indexBatch (i: IndexDefinition) (seq: SeqNo) =
         Keyspace.CatalogKeyspace, [| Entry.put (indexKey i.IndexName) seq (toValue (encodeIndex i)) |]
 
     /// 統計の書き込みエントリを作る。
-    let private statsBatch (s: TableStats) (seq: uint64) =
+    let private statsBatch (s: TableStats) (seq: SeqNo) =
         Keyspace.CatalogKeyspace, [| Entry.put (statsKey s.Table) seq (toValue (encodeStats s)) |]
 
     /// カタログ値の削除エントリを作る。
-    let private deleteBatch (key: byte array) (seq: uint64) =
+    let private deleteBatch (key: byte array) (seq: SeqNo) =
         Keyspace.CatalogKeyspace, [| Entry.delete key seq |]
 
     /// 連番を振りながら定義列を書き込みエントリへ変換する。
     [<TailCall>]
-    let rec private numberList (mk: 'a -> uint64 -> 'b) (rest: 'a list) (seq: uint64) (acc: 'b list) =
+    let rec private numberList (mk: 'a -> SeqNo -> 'b) (rest: 'a list) (seq: SeqNo) (acc: 'b list) =
         match rest with
         | [] -> List.rev acc, seq
         | x :: tail -> numberList mk tail (seq + 1UL) (mk x seq :: acc)

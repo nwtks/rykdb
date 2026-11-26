@@ -18,49 +18,11 @@ type internal SstIndexEntry =
         Length: int
     }
 
-/// SSTable の部分読み取りに必要なメタデータ（不変）。
-/// <remarks>
-/// footer / index / Bloom / meta を 1回解析した結果で、ファイル内容だけで決まる純粋な値。
-/// `FileMetaData.ReadInfo` に載せ、読み取りのたびに開き直さない。
-/// DB・プロセスの寿命にわたるキャッシュではない（不変の Version に付随する）。
-/// </remarks>
-type internal SstReadInfo =
-    {
-        Path: string
-        Index: SstIndexEntry array
-        MinKey: byte array
-        MaxKey: byte array
-        Bloom: BloomFilter option
-        EntryCount: int64
-        MaxSeqNo: uint64
-    }
-
-/// `SstableFormat.writeTo` の結果。
-/// 入力が `seq` なので、書き出しに成功してから先頭・末尾のキーを数え直せない。
-/// `FileMetaData.writeSstable` がこれを `FileMetaData` に載せる。
-/// `Index` / `Bloom` は書き出しと同時に得られるので、
-/// 読み取り用の `SstReadInfo` を再解析なしで組み立てられる。
-type internal SstWriteInfo =
-    {
-        /// 書き込んだバイト数
-        Size: int64
-        /// 先頭エントリのキー（0 件なら空配列）
-        FirstKey: byte array
-        /// 末尾エントリのキー（0 件なら空配列）
-        LastKey: byte array
-        EntryCount: int64
-        MaxSeqNo: uint64
-        /// 索引（ブロック位置）。
-        Index: SstIndexEntry array
-        /// 書き出した Bloom filter（0 件なら None）。
-        Bloom: BloomFilter option
-    }
-
 /// footer を decode した情報。
 type internal SstFooterInfo =
     {
         Version: int
-        MaxSeqNo: uint64
+        MaxSeqNo: SeqNo
         IndexOff: int
         IndexLen: int
         BloomOff: int
@@ -71,39 +33,24 @@ type internal SstFooterInfo =
         MetadataChecksum: uint32
     }
 
-/// フッター手前に書き出すメタ・Bloom・索引の符号化結果。
-type private SstableTailParts =
-    {
-        DataSize: int
-        MetaBytes: byte array
-        BloomFilter: BloomFilter option
-        BloomBytes: byte array
-        Index: SstIndexEntry array
-        IndexBytes: byte array
-    }
-
-module internal SstableFormat =
-    /// 1ブロックあたりのエントリ数。
-    [<Literal>]
-    let private EntriesPerBlock = 128
-
+module internal SstableFooter =
     /// SSTable ファイルのマジック文字列。
     [<Literal>]
-    let internal Magic = "RykDbSST"
+    let Magic = "RykDbSST"
 
     /// 書き出すファイルのバージョン（6）。
     /// ブロック末尾とメタデータ（meta / Bloom / index）・Footer を CRC32C で検証する。
     /// 全体チェックサムは持たず、部分読みでは読まなかったブロックは検証されない。
     [<Literal>]
-    let internal Version = 6
+    let private Version = 6
 
     /// 読み取れる下限バージョン。
     [<Literal>]
-    let internal MinReadableVersion = 6
+    let private MinReadableVersion = 6
 
     /// 最新 Footer の固定長（本体 80 + Footer チェックサム 4）。
     [<Literal>]
-    let internal FooterSize = 84
+    let FooterSize = 84
 
     /// Footer で footerChecksum がカバーするバイト数（metadataChecksum フィールド込み）。
     [<Literal>]
@@ -119,17 +66,16 @@ module internal SstableFormat =
     //
     // 全体 checksum は持たない。
     // データブロックはそれぞれ末尾のチェックサムで守られ、
-    // meta / Bloom / index は metadataChecksum、
-    // Footer は footerChecksum で守られる。
+    // meta / Bloom / index は metadataChecksum、Footer は footerChecksum で守られる。
     // 部分読みでは読まなかったブロックを検証できないが、全体 checksum があっても同じだった。
     //
     // maxSeqNo は起動時の NextSeqNo 復元のために必要。
     // ファイル内の最大 SeqNo を保存する
     //（GC は版ごとの SeqNo と active snapshot で判定する）。
 
-    /// Footer を 84 バイトに符号化する（末尾に自身のチェックサムを含む）。
-    let private encodeFooter
-        (maxSeqNo: uint64)
+    /// Footer を符号化する（末尾に自身のチェックサムを含む）。
+    let encodeFooter
+        (maxSeqNo: SeqNo)
         (indexOff: int)
         (indexLen: int)
         (bloomOff: int)
@@ -164,7 +110,7 @@ module internal SstableFormat =
 
     /// Footer の先頭から各フィールドを読む
     /// （magic / version の検証は呼び出し側）。
-    let internal readFooterFields (footerBytes: byte array) =
+    let private readFooterFields (footerBytes: byte array) =
         result {
             let c = Cursor.create footerBytes
             let! magicBytes, c = Reader.readBytes Magic.Length c
@@ -209,17 +155,64 @@ module internal SstableFormat =
                     }
         }
 
+    /// Footer の内容を検証する。
+    let private validateFooter (magic: string) (footerStart: int64) (footer: SstFooterInfo) =
+        if magic <> Magic then
+            err (DbError.corruption "Sstable: マジックが違います")
+        elif footer.Version < MinReadableVersion || footer.Version > Version then
+            err (sprintf "Sstable: 未対応のバージョン %d" footer.Version |> DbError.corruption)
+        elif
+            footerStart < 0L
+            || int64 footer.MetaOff + int64 footer.MetaLen <> int64 footer.BloomOff
+            || int64 footer.BloomOff + int64 footer.BloomLen <> int64 footer.IndexOff
+            || int64 footer.IndexOff + int64 footer.IndexLen <> footerStart
+        then
+            err (DbError.corruption "Sstable: Footer の範囲が不正です")
+        else
+            ret footer
+
+    /// Footer バイト列を解析して検証する。
+    let parseFooterBytes (footerStart: int64) (footerBytes: byte array) =
+        readFooterFields footerBytes
+        >>= fun (magic, footer) -> validateFooter magic footerStart footer
+
+/// `SstableWriter.writeTo` の結果。
+/// 入力が `seq` なので、書き出しに成功してから先頭・末尾のキーを数え直せない。
+/// `FileMetaData.writeSstable` がこれを `FileMetaData` に載せる。
+/// `Index` / `Bloom` は書き出しと同時に得られるので、
+/// 読み取り用の `SstReadInfo` を再解析なしで組み立てられる。
+type internal SstWriteInfo =
+    {
+        /// 書き込んだバイト数
+        Size: int64
+        /// 先頭エントリのキー（0 件なら空配列）
+        FirstKey: byte array
+        /// 末尾エントリのキー（0 件なら空配列）
+        LastKey: byte array
+        EntryCount: int64
+        MaxSeqNo: SeqNo
+        /// 索引（ブロック位置）。
+        Index: SstIndexEntry array
+        /// 書き出した Bloom filter（0 件なら None）。
+        Bloom: BloomFilter option
+    }
+
+module internal SstableWriter =
+    /// 1ブロックあたりのエントリ数。
+    [<Literal>]
+    let private EntriesPerBlock = 128
+
     /// 共通接頭辞の長さを先頭から数える。
     [<TailCall>]
-    let rec private sharedLength (prev: byte array) (key: byte array) (n: int) (i: int) =
+    let rec private sharedLength (prev: byte array) (key: byte array) (i: int) (n: int) =
         if i >= n then n
-        elif prev.[i] = key.[i] then sharedLength prev key n (i + 1)
+        elif prev.[i] = key.[i] then sharedLength prev key (i + 1) n
         else i
 
     /// 2つのキーの共通接頭辞の長さを返す。
     let private sharedPrefix (prev: byte array) (key: byte array) =
         let n = min prev.Length key.Length
-        sharedLength prev key n 0
+        sharedLength prev key 0 n
 
     /// 1エントリの符号化後の長さを返す。
     let private entryLength (prevKey: byte array) (e: SstEntry) =
@@ -234,7 +227,7 @@ module internal SstableFormat =
         + valueLength
 
     /// 1エントリをバッファの pos から書き込み、次の位置を返す。
-    let private writeEntry (out: byte array) pos (prevKey: byte array) (e: SstEntry) =
+    let private writeEntry (out: byte array) (pos: int) (prevKey: byte array) (e: SstEntry) =
         let shared = sharedPrefix prevKey e.Key
         let tailLength = e.Key.Length - shared
         let valueLength = SstEntry.encodedValueLength e
@@ -246,28 +239,28 @@ module internal SstableFormat =
 
     /// ブロック本体のバイト長を数える。
     [<TailCall>]
-    let rec private bodyLength (items: SstEntry array) (i: int) (prev: byte array) (total: int) =
-        if i >= items.Length then
+    let rec private blockLength (prev: byte array) (i: int) (total: int) (entries: SstEntry array) =
+        if i >= entries.Length then
             total
         else
-            bodyLength items (i + 1) items.[i].Key (total + entryLength prev items.[i])
+            blockLength entries.[i].Key (i + 1) (total + entryLength prev entries.[i]) entries
 
     /// エントリをブロックへ順に書き込む。
     [<TailCall>]
-    let rec private writeEntries (items: SstEntry array) (block: byte array) (i: int) (prev: byte array) (pos: int) =
-        if i >= items.Length then
+    let rec private writeEntries (block: byte array) (prev: byte array) (i: int) (pos: int) (entries: SstEntry array) =
+        if i >= entries.Length then
             ret pos
         else
-            match writeEntry block pos prev items.[i] with
-            | Ok next -> writeEntries items block (i + 1) items.[i].Key next
+            match writeEntry block pos prev entries.[i] with
+            | Ok next -> writeEntries block entries.[i].Key (i + 1) next entries
             | Error e -> err e
 
     /// エントリ列からチェックサム付きのブロックを組み立てる。
-    let private buildBlock (items: SstEntry array) =
-        let length = bodyLength items 0 [||] 0
+    let private buildBlock (entries: SstEntry array) =
+        let length = blockLength [||] 0 0 entries
         let block = Array.zeroCreate<byte>(length + 4)
 
-        writeEntries items block 0 [||] 0
+        writeEntries block [||] 0 0 entries
         |> Result.map (fun _ ->
             let sum = Hashing.checksumRange block 0 length
             block.[length] <- byte (sum &&& 0xFFu)
@@ -279,11 +272,11 @@ module internal SstableFormat =
     /// ブロックをストリームへ書き出し、索引要素を返す。
     let private writeBlock
         (stream: System.IO.Stream)
-        (items: SstEntry array)
         (offset: int)
         (indexEntries: SstIndexEntry list)
+        (entries: SstEntry array)
         =
-        buildBlock items
+        buildBlock entries
         >>= fun data ->
             let nextOffset = int64 offset + int64 data.Length
 
@@ -294,7 +287,7 @@ module internal SstableFormat =
 
                 let entry =
                     {
-                        LastKey = items.[items.Length - 1].Key
+                        LastKey = entries.[entries.Length - 1].Key
                         Offset = offset
                         Length = data.Length
                     }
@@ -315,14 +308,14 @@ module internal SstableFormat =
     /// 残っているブロックを書き出し、(データ長, 索引) を返す。
     let private flushPendingBlock
         (stream: System.IO.Stream)
-        (block: SstEntry list)
         (offset: int)
         (indexEntries: SstIndexEntry list)
+        (entries: SstEntry list)
         =
-        if List.isEmpty block then
+        if List.isEmpty entries then
             ret (offset, indexEntries)
         else
-            writeBlock stream (block |> List.rev |> List.toArray) offset indexEntries
+            entries |> List.rev |> List.toArray |> writeBlock stream offset indexEntries
 
     /// メタ（先頭・末尾キー）を符号化する。
     let private metaBytesOf (firstKey: byte array option) (lastKey: byte array option) =
@@ -337,6 +330,17 @@ module internal SstableFormat =
         else
             let filter = bloom.Build()
             Some filter, BloomFilter.serialize filter
+
+    /// フッター手前に書き出すメタ・Bloom・索引の符号化結果。
+    type private SstableTailParts =
+        {
+            DataSize: int
+            MetaBytes: byte array
+            BloomFilter: BloomFilter option
+            BloomBytes: byte array
+            Index: SstIndexEntry array
+            IndexBytes: byte array
+        }
 
     /// フッター手前に書き出すメタ・Bloom・索引をまとめる。
     let private buildTail
@@ -368,7 +372,7 @@ module internal SstableFormat =
                 }
 
     /// メタ・Bloom・索引・フッターを書き出し、ファイルサイズを返す。
-    let private writeTail (stream: System.IO.Stream) (maxSeqNo: uint64) (count: int64) (tail: SstableTailParts) =
+    let private writeTail (stream: System.IO.Stream) (maxSeqNo: SeqNo) (count: int64) (tail: SstableTailParts) =
         let metaBytes = tail.MetaBytes
         let bloomBytes = tail.BloomBytes
         let indexBytes = tail.IndexBytes
@@ -383,7 +387,7 @@ module internal SstableFormat =
         stream.Write(indexBytes, 0, indexBytes.Length)
 
         let footer =
-            encodeFooter
+            SstableFooter.encodeFooter
                 maxSeqNo
                 (int indexOff)
                 indexBytes.Length
@@ -395,7 +399,6 @@ module internal SstableFormat =
                 metadataChecksum
 
         stream.Write(footer, 0, footer.Length)
-
         ret (indexOff + int64 indexBytes.Length + int64 footer.Length)
 
     /// ブロック列・Bloom・索引・フッターを書き出し、結果を返す。
@@ -404,13 +407,13 @@ module internal SstableFormat =
         (bloom: BloomFilter.BloomBuilder)
         (firstKey: byte array option)
         (lastKey: byte array option)
-        (maxSeqNo: uint64)
+        (maxSeqNo: SeqNo)
         (count: int64)
-        (block: SstEntry list)
         (offset: int)
         (indexEntries: SstIndexEntry list)
+        (entries: SstEntry list)
         =
-        flushPendingBlock stream block offset indexEntries
+        flushPendingBlock stream offset indexEntries entries
         >>= fun (dataSize, indexEntries) ->
             buildTail bloom count firstKey lastKey dataSize indexEntries
             >>= fun tail ->
@@ -434,18 +437,18 @@ module internal SstableFormat =
         (e: System.Collections.Generic.IEnumerator<SstEntry>)
         (firstKey: byte array option)
         (lastKey: byte array option)
-        (maxSeqNo: uint64)
+        (maxSeqNo: SeqNo)
         (count: int64)
-        (block: SstEntry list)
         (blockCount: int)
         (offset: int)
         (indexEntries: SstIndexEntry list)
         (prev: SstEntry option)
+        (entries: SstEntry list)
         =
         if blockCount >= EntriesPerBlock then
-            match writeBlock stream (block |> List.rev |> List.toArray) offset indexEntries with
+            match entries |> List.rev |> List.toArray |> writeBlock stream offset indexEntries with
             | Ok(nextOffset, indexEntries') ->
-                writeLoop stream bloom e firstKey lastKey maxSeqNo count [] 0 nextOffset indexEntries' prev
+                writeLoop stream bloom e firstKey lastKey maxSeqNo count 0 nextOffset indexEntries' prev []
             | Error e -> err e
         elif e.MoveNext() then
             let item = e.Current
@@ -464,17 +467,17 @@ module internal SstableFormat =
                     (Some item.Key)
                     (max maxSeqNo item.SeqNo)
                     (count + 1L)
-                    (item :: block)
                     (blockCount + 1)
                     offset
                     indexEntries
                     (Some item)
+                    (item :: entries)
         else
-            finishWrite stream bloom firstKey lastKey maxSeqNo count block offset indexEntries
+            finishWrite stream bloom firstKey lastKey maxSeqNo count offset indexEntries entries
 
     /// エントリ列を SSTable v6 として stream に書き出し、書き込んだ結果を返す。
     /// <remarks>
-    /// 入力は `seq` で **1回だけ列挙する**（memtable の flush が全件を配列にしないため）。
+    /// 入力は `seq` で 1回だけ列挙する（memtable の flush が全件を配列にしないため）。
     /// キー順であることの検証は書き込みと同時に行う（失敗時は呼び出し側が部分ファイルを消す）。
     /// ブロックと Bloom filter は書き出しと同時に構築するので、ファイル全体分のメモリを持たない。
     /// `expectedEntries` は Bloom filter のビット数を決める見積り。
@@ -485,8 +488,8 @@ module internal SstableFormat =
         (stream: System.IO.Stream)
         (bloomFalsePositiveRate: float)
         (expectedEntries: int)
-        (entries: seq<SstEntry>)
+        (entries: SstEntry seq)
         =
         let bloom = BloomFilter.BloomBuilder(max 1 expectedEntries, bloomFalsePositiveRate)
         use e = entries.GetEnumerator()
-        writeLoop stream bloom e None None 0UL 0L [] 0 0 [] None
+        writeLoop stream bloom e None None 0UL 0L 0 0 [] None []

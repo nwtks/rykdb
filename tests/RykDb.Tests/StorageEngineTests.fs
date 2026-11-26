@@ -24,22 +24,22 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
 /// SSTable の本文を書き換え、メタデータ・Footer のチェックサムを合わせ直す。
 /// 「開けるが中身が壊れたファイル」を作る
 /// （FooterSize = 84、metadata checksum は +76、Footer checksum は +80）。
-let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array -> unit) =
+let private patchSstable (dir: string) (fileNumber: FileNumber) (patch: byte array -> unit) =
     let path = FileMetaData.path dir fileNumber
     let data = System.IO.File.ReadAllBytes path
-    let footerStart = data.Length - SstableFormat.FooterSize
+    let footerStart = data.Length - SstableFooter.FooterSize
 
     let readI64 offset =
         [ 0..7 ]
         |> List.fold
             (fun acc i ->
                 acc
-                ||| (int64 data.[data.Length - SstableFormat.FooterSize + offset + i] <<< (i * 8)))
+                ||| (int64 data.[data.Length - SstableFooter.FooterSize + offset + i] <<< i * 8))
             0L
 
     let writeU32 offset (value: uint32) =
         for i in 0..3 do
-            data.[footerStart + offset + i] <- byte (value >>> (i * 8) &&& 0xFFu)
+            data.[footerStart + offset + i] <- byte (value >>> i * 8 &&& 0xFFu)
 
     patch data
     let metadataOffset = int (readI64 52)
@@ -52,9 +52,9 @@ let private patchSstable (dir: string) (fileNumber: int64) (patch: byte array ->
     writeU32 76 metadataChecksum
 
     let footerChecksum =
-        Hashing.checksum (Array.sub data footerStart (SstableFormat.FooterSize - 4))
+        Hashing.checksum (Array.sub data footerStart (SstableFooter.FooterSize - 4))
 
-    writeU32 (SstableFormat.FooterSize - 4) footerChecksum
+    writeU32 (SstableFooter.FooterSize - 4) footerChecksum
 
     System.IO.File.WriteAllBytes(path, data)
 
@@ -72,7 +72,7 @@ let private twoFilesWithBrokenSecond (dir: string) =
     let f2 =
         mkSst dir 11L 0 [ Entry.put (intKey 3) 3UL (intRow 3); Entry.put (intKey 4) 4UL (intRow 4) ]
 
-    patchSstable dir 11L (fun data -> data.[data.Length - SstableFormat.FooterSize] <- 0x00uy)
+    patchSstable dir 11L (fun data -> data.[data.Length - SstableFooter.FooterSize] <- 0x00uy)
 
     let f2 = { f2 with ReadInfo = None }
     f1, f2
@@ -82,7 +82,7 @@ let ``StorageEngine.openDatabase: 書き込み後に壊れたファイルは再�
     withDir "se-hydrate-corrupt" (fun dir ->
         let _f = mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1) ]
         // `ReadInfo` は書き込み時点の内容なので、後から壊しても open 中の hydrate で初めて検出する。
-        patchSstable dir 10L (fun data -> data.[data.Length - SstableFormat.FooterSize] <- 0x00uy)
+        patchSstable dir 10L (fun data -> data.[data.Length - SstableFooter.FooterSize] <- 0x00uy)
         expectErrorKind ErrorKind.CorruptionError "再オープンで Footer の破損を検出する" (StorageEngine.openDatabaseWith None dir))
 
 [<Fact>]
@@ -98,7 +98,7 @@ let ``StorageEngine.getAtMasked: 古い snapshot は SSTable 内の見える版�
                 }
 
             // snapshot 4 には最新版 seq5 は見えず、1つ古い seq3 が見える
-            match ok (StorageEngine.getAtMasked (Some 4UL) (intKey 1) [| true |] engine) with
+            match ok (StorageEngine.getAtMasked (intKey 1) [| true |] (Some 4UL) engine) with
             | Some e -> Assert.Equal<uint64>(3UL, e.SeqNo)
             | None -> Assert.Fail "seq3 が見えるはず"))
 
@@ -129,7 +129,7 @@ let ``StorageEngine: 走査は tombstone を返さず、ポイント検索は削
                 ok scan |> SstScan.toArray |> ok |> Array.toList |> List.map (fun e -> e.Key)
 
             let expectTombstone key (engine: StorageEngine) =
-                match ok (StorageEngine.getAtMasked None key [| true |] engine) with
+                match ok (StorageEngine.getAtMasked key [| true |] None engine) with
                 | Some e -> Assert.True(e.Value.IsNone, sprintf "tombstone ではなく値が返りました: %A" e.Key)
                 | None -> Assert.Fail "エンジンは tombstone を Value = None で返すはず"
 
@@ -177,7 +177,7 @@ let ``StorageEngine.getAtMasked: 壊れたブロックは CorruptionError`` () =
                 mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1); Entry.put (intKey 2) 2UL (intRow 2) ]
 
             // ブロック末尾のチェックサムを壊す（Footer のチェックサムは合わせ直す）
-            let block = (ok (Sstable.openPartial (FileMetaData.path dir 10L))).Index.[0]
+            let block = (ok (SstableReader.openPartial (FileMetaData.path dir 10L))).Index.[0]
 
             patchSstable dir 10L (fun data ->
                 let at = block.Offset + block.Length - 4
@@ -194,7 +194,7 @@ let ``StorageEngine.getAtMasked: 壊れたブロックは CorruptionError`` () =
             expectErrorKind
                 ErrorKind.CorruptionError
                 "壊れたブロックは CorruptionError"
-                (StorageEngine.getAtMasked None (intKey 1) [||] engine)))
+                (StorageEngine.getAtMasked (intKey 1) [||] None engine)))
 
 [<Fact>]
 let ``StorageEngine.scanAtValues: 多数のファイルをキー昇順にマージする`` () =
@@ -375,7 +375,7 @@ let ``StorageEngine.getAtMasked / scanAtMasked: 必要なブロックだけを�
 
             // 2番目のブロックの内部を壊す（ブロックのチェックサムも合わなくなる）。
             let path = FileMetaData.path dir 10L
-            let reader = ok (Sstable.openPartial path)
+            let reader = ok (SstableReader.openPartial path)
             let block = reader.Index.[1]
             let data = System.IO.File.ReadAllBytes path
             data.[block.Offset + 2] <- data.[block.Offset + 2] ^^^ 0xFFuy
@@ -388,12 +388,12 @@ let ``StorageEngine.getAtMasked / scanAtMasked: 必要なブロックだけを�
                 }
 
             // ブロック 0 のキーは読める
-            Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] engine)).IsSome)
+            Assert.True((ok (StorageEngine.getAtMasked (intKey 1) [||] None engine)).IsSome)
             // ブロック 1 のキーは壊れている
             expectErrorKind
                 ErrorKind.CorruptionError
                 "必要なブロックの破損は検出する"
-                (StorageEngine.getAtMasked None (intKey 200) [||] engine)
+                (StorageEngine.getAtMasked (intKey 200) [||] None engine)
             // limit 5 はブロック 0 だけで足りる
             let five =
                 ok (StorageEngine.scanAtMasked None 5 [||] [||] engine) |> SstScan.toArray |> ok
@@ -547,17 +547,17 @@ let ``StorageEngine.openDatabaseWith: NextTxnId は WAL の最大 txnId + 1 か�
         let engine =
             ok (StorageEngine.writeBatch [| Entry.put (intKey 1) 1UL (intRow 1) |] engine)
 
-        Assert.Equal<uint64<txnId>>(2UL<txnId>, engine.NextTxnId)
+        Assert.Equal<TxnId>(2UL<txnId>, engine.NextTxnId)
 
         // WAL を再生して採番を巻き戻さない
         let reopened = ok (StorageEngine.openDatabaseWith None dir)
-        Assert.Equal<uint64<txnId>>(2UL<txnId>, reopened.NextTxnId)
+        Assert.Equal<TxnId>(2UL<txnId>, reopened.NextTxnId)
 
         let reopened =
             ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] reopened)
 
-        Assert.Equal<uint64<txnId>>(3UL<txnId>, reopened.NextTxnId)
-        Assert.Equal<uint64<txnId>>(3UL<txnId>, (ok (StorageEngine.openDatabaseWith None dir)).NextTxnId))
+        Assert.Equal<TxnId>(3UL<txnId>, reopened.NextTxnId)
+        Assert.Equal<TxnId>(3UL<txnId>, (ok (StorageEngine.openDatabaseWith None dir)).NextTxnId))
 
 [<Fact>]
 let ``StorageEngine.openDatabaseWith: WAL の不完全な末尾を切り詰めて次の commit を失わない`` () =
@@ -583,14 +583,14 @@ let ``StorageEngine.openDatabaseWith: WAL の不完全な末尾を切り詰め�
             fs.Flush true
 
         let reopened = ok (StorageEngine.openDatabaseWith None dir)
-        Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] reopened)).IsSome)
+        Assert.True((ok (StorageEngine.getAtMasked (intKey 1) [||] None reopened)).IsSome)
 
         let _ =
             ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] reopened)
 
         let reopened = ok (StorageEngine.openDatabaseWith None dir)
-        Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] reopened)).IsSome)
-        Assert.True((ok (StorageEngine.getAtMasked None (intKey 2) [||] reopened)).IsSome))
+        Assert.True((ok (StorageEngine.getAtMasked (intKey 1) [||] None reopened)).IsSome)
+        Assert.True((ok (StorageEngine.getAtMasked (intKey 2) [||] None reopened)).IsSome))
 
 [<Fact>]
 let ``StorageEngine.maybeFlush: WAL 作成に失敗しても旧 WAL を残し、次の flush で回復する`` () =
@@ -608,7 +608,7 @@ let ``StorageEngine.maybeFlush: WAL 作成に失敗しても旧 WAL を残し、
         System.IO.Directory.CreateDirectory(nextWal) |> ignore
 
         let engine, error = ok (StorageEngine.maybeFlush engine)
-        Assert.True(error.IsSome)
+        Assert.True error.IsSome
         Assert.True engine.Runtime.LastFlushError.IsSome
         // 旧 WAL は削除されず、engine の位置も変わらない。
         Assert.True(System.IO.File.Exists oldWal)
@@ -623,8 +623,8 @@ let ``StorageEngine.maybeFlush: WAL 作成に失敗しても旧 WAL を残し、
         let engine, error = ok (StorageEngine.maybeFlush engine)
         Assert.True(error.IsNone)
         Assert.True engine.Runtime.LastFlushError.IsNone
-        Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] engine)).IsSome)
-        Assert.True((ok (StorageEngine.getAtMasked None (intKey 2) [||] engine)).IsSome))
+        Assert.True((ok (StorageEngine.getAtMasked (intKey 1) [||] None engine)).IsSome)
+        Assert.True((ok (StorageEngine.getAtMasked (intKey 2) [||] None engine)).IsSome))
 
 [<Fact>]
 let ``StorageEngine.maybeFlush: MANIFEST ローテーション後の WAL 失敗でも番号を進めて次の flush を失わない`` () =
@@ -658,13 +658,13 @@ let ``StorageEngine.maybeFlush: MANIFEST ローテーション後の WAL 失敗�
             ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] engine)
 
         let engine, error = ok (StorageEngine.maybeFlush engine)
-        Assert.True(error.IsNone)
+        Assert.True error.IsNone
         ok (StorageEngine.close engine)
 
         // 再オープンで両方の commit が見える（2 行目を失わない）。
         let reopened = ok (StorageEngine.openDatabaseWith None dir)
-        Assert.True((ok (StorageEngine.getAtMasked None (intKey 1) [||] reopened)).IsSome)
-        Assert.True((ok (StorageEngine.getAtMasked None (intKey 2) [||] reopened)).IsSome))
+        Assert.True((ok (StorageEngine.getAtMasked (intKey 1) [||] None reopened)).IsSome)
+        Assert.True((ok (StorageEngine.getAtMasked (intKey 2) [||] None reopened)).IsSome))
 
 [<Fact>]
 let ``StorageEngine.openDatabaseWith: 孤児の SSTable は削除せず退避する`` () =

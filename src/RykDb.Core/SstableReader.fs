@@ -4,15 +4,32 @@
 
 namespace RykDb.Core
 
-module internal Sstable =
-    /// カーソルを末尾まで読み、配列へ詰める本体。
+/// SSTable の部分読み取りに必要なメタデータ（不変）。
+/// <remarks>
+/// footer / index / Bloom / meta を 1回解析した結果で、ファイル内容だけで決まる純粋な値。
+/// `FileMetaData.ReadInfo` に載せ、読み取りのたびに開き直さない。
+/// DB・プロセスの寿命にわたるキャッシュではない（不変の Version に付随する）。
+/// </remarks>
+type internal SstReadInfo =
+    {
+        Path: string
+        Index: SstIndexEntry array
+        MinKey: byte array
+        MaxKey: byte array
+        Bloom: BloomFilter option
+        EntryCount: int64
+        MaxSeqNo: SeqNo
+    }
+
+module internal SstableReader =
+    /// カーソルを末尾まで読み、配列へ詰める。
     [<TailCall>]
-    let rec private readItemsLoop
+    let rec private readItem
         (step: Cursor -> 'State -> Result<Cursor * 'Item * 'State, DbError>)
         (c: Cursor)
         (state: 'State)
-        (items: 'Item array)
         (count: int)
+        (items: 'Item array)
         =
         if Cursor.atEnd c then
             if count = items.Length then
@@ -31,7 +48,7 @@ module internal Sstable =
                         grown
 
                 items.[count] <- item
-                readItemsLoop step c' state' items (count + 1)
+                readItem step c' state' (count + 1) items
             | Error e -> err e
 
     /// Cursor から終端まで 1件ずつ読み出して配列にまとめる。
@@ -43,7 +60,7 @@ module internal Sstable =
         (c: Cursor)
         (state: 'State)
         =
-        readItemsLoop step c state (Array.zeroCreate<'Item> 128) 0
+        readItem step c state 0 (Array.zeroCreate<'Item> 128)
 
     /// メタデータから最小・最大キーを取り出す（壊れていたら空に倒す）。
     let private readMinMaxKey (metaBytes: byte array) =
@@ -93,9 +110,9 @@ module internal Sstable =
         else
             readItems (fun c _ -> decodeIndexEntry c) (Cursor.create bytes) ()
 
-    /// 索引エントリの範囲と順序を検証する本体。
+    /// 索引エントリの範囲と順序を検証する。
     [<TailCall>]
-    let rec private validateIndexLoop (footerStart: int64) (prev: SstIndexEntry option) =
+    let rec private validateIndex (footerStart: int64) (prev: SstIndexEntry option) =
         function
         | [] -> ret ()
         | entry :: rest ->
@@ -111,12 +128,12 @@ module internal Sstable =
                     elif Bytes.compare prevEntry.LastKey entry.LastKey > 0 then
                         err (DbError.corruption "Sstable: 索引の LastKey が昇順ではありません")
                     else
-                        validateIndexLoop footerStart (Some entry) rest
-                | None -> validateIndexLoop footerStart (Some entry) rest
+                        validateIndex footerStart (Some entry) rest
+                | None -> validateIndex footerStart (Some entry) rest
 
     /// 索引エントリの範囲と順序を検証する。
     let private validateIndexEntries (footerStart: int64) (entries: SstIndexEntry array) =
-        validateIndexLoop footerStart None (Array.toList entries)
+        validateIndex footerStart None (Array.toList entries)
 
     /// ストリームの指定範囲をバイト列として読む。
     let private readRegion (stream: System.IO.FileStream) (offset: int64) (length: int) =
@@ -137,41 +154,17 @@ module internal Sstable =
         else
             let bytes = readRegion stream start size
 
-            if System.Text.Encoding.ASCII.GetString(bytes, 0, SstableFormat.Magic.Length) = SstableFormat.Magic then
+            if System.Text.Encoding.ASCII.GetString(bytes, 0, SstableFooter.Magic.Length) = SstableFooter.Magic then
                 Some(start, bytes)
             else
                 None
 
-    /// Footer の内容を検証する。
-    let private validateFooter (info: SstFooterInfo) (magic: string) (footerStart: int64) =
-        if magic <> SstableFormat.Magic then
-            err (DbError.corruption "Sstable: マジックが違います")
-        elif
-            info.Version < SstableFormat.MinReadableVersion
-            || info.Version > SstableFormat.Version
-        then
-            err (sprintf "Sstable: 未対応のバージョン %d" info.Version |> DbError.corruption)
-        elif
-            footerStart < 0L
-            || int64 info.MetaOff + int64 info.MetaLen <> int64 info.BloomOff
-            || int64 info.BloomOff + int64 info.BloomLen <> int64 info.IndexOff
-            || int64 info.IndexOff + int64 info.IndexLen <> footerStart
-        then
-            err (DbError.corruption "Sstable: Footer の範囲が不正です")
-        else
-            ret info
-
-    /// Footer バイト列を解析して検証する。
-    let private parseFooterBytes (footerBytes: byte array) (footerStart: int64) =
-        SstableFormat.readFooterFields footerBytes
-        >>= fun (magic, info) -> validateFooter info magic footerStart
-
     /// 部分読みのメタデータを読んで SstReadInfo を作る。
-    let private readPartialInfo (path: string) (stream: System.IO.FileStream) =
-        match readFooter stream SstableFormat.FooterSize with
+    let private readPartialInfo (stream: System.IO.FileStream) (path: string) =
+        match readFooter stream SstableFooter.FooterSize with
         | None -> err (DbError.corruption "Sstable: Footer がありません")
         | Some(footerStart, footerBytes) ->
-            parseFooterBytes footerBytes footerStart
+            SstableFooter.parseFooterBytes footerStart footerBytes
             >>= fun footer ->
                 let metaBytes = readRegion stream (int64 footer.MetaOff) footer.MetaLen
                 let bloomBytes = readRegion stream (int64 footer.BloomOff) footer.BloomLen
@@ -207,8 +200,21 @@ module internal Sstable =
     let openPartial (path: string) =
         protect (fun () ->
             use stream = System.IO.File.OpenRead path
-            readPartialInfo path stream)
+            readPartialInfo stream path)
         >>= id
+
+    /// 索引上で startKey 以上になる最初のブロックを二分探索する。
+    [<TailCall>]
+    let rec private searchBlock (startKey: byte array) (lo: int) (hi: int) (partial: SstReadInfo) =
+        if lo >= hi then
+            lo
+        else
+            let mid = lo + (hi - lo) / 2
+
+            if Bytes.compare partial.Index.[mid].LastKey startKey < 0 then
+                searchBlock startKey (mid + 1) hi partial
+            else
+                searchBlock startKey lo mid partial
 
     /// ブロック内の値をどう扱うか。
     /// Decode は通常のクエリ、Raw は compaction、Skip は列が不要なクエリ。
@@ -227,7 +233,6 @@ module internal Sstable =
                 return! err (DbError.corruption "Sstable: 接頭辞長が直前のキーを超えています")
 
             let! nonShared, c = Reader.readVarint c
-            let! valueLen, c = Reader.readVarint c
 
             if nonShared > uint64 System.Int32.MaxValue then
                 return! err (DbError.corruption "Sstable: キー長が不正です")
@@ -237,28 +242,31 @@ module internal Sstable =
 
                 if tailLength > System.Int32.MaxValue - sharedLength then
                     return! err (DbError.corruption "Sstable: キー長が不正です")
-                elif valueLen > uint64 System.Int32.MaxValue then
-                    return! err (DbError.corruption "Sstable: 値長が不正です")
                 else
-                    let key = Array.zeroCreate<byte>(sharedLength + tailLength)
-                    Array.blit prev 0 key 0 sharedLength
+                    let! valueLen, c = Reader.readVarint c
 
-                    return!
-                        Reader.copyBytesInto key sharedLength tailLength c
-                        >>= fun c ->
-                            match mode with
-                            | DecodeValues ->
-                                SstEntry.decodeValueAt c (int valueLen)
-                                >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
-                            | RawValues ->
-                                SstEntry.decodeRawValueAt c (int valueLen)
-                                >>= fun (seqNo, raw, c) -> ret (c, SstEntry.makeRaw key seqNo raw, key)
-                            | SkipValues ->
-                                SstEntry.decodeSkippedValueAt c (int valueLen)
-                                >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
-                            | MaskValues mask ->
-                                SstEntry.decodeMaskedValueAt mask c (int valueLen)
-                                >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
+                    if valueLen > uint64 System.Int32.MaxValue then
+                        return! err (DbError.corruption "Sstable: 値長が不正です")
+                    else
+                        let key = Array.zeroCreate<byte>(sharedLength + tailLength)
+                        Array.blit prev 0 key 0 sharedLength
+
+                        return!
+                            Reader.copyBytesInto key sharedLength tailLength c
+                            >>= fun c ->
+                                match mode with
+                                | DecodeValues ->
+                                    SstEntry.decodeValueAt (int valueLen) c
+                                    >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
+                                | RawValues ->
+                                    SstEntry.decodeRawValueAt (int valueLen) c
+                                    >>= fun (seqNo, raw, c) -> ret (c, SstEntry.makeRaw key seqNo raw, key)
+                                | SkipValues ->
+                                    SstEntry.decodeSkippedValueAt (int valueLen) c
+                                    >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
+                                | MaskValues mask ->
+                                    SstEntry.decodeMaskedValueAt mask (int valueLen) c
+                                    >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
         }
 
     /// バッファ内の範囲にある 1ブロックをエントリ列へ復元する。
@@ -277,43 +285,8 @@ module internal Sstable =
                 Cursor.createSlice data payloadStart payloadLen
                 >>= fun payload -> readItems (decodeBlockEntry mode) payload [||]
 
-    /// 索引上で startKey 以上になる最初のブロックを二分探索する。
-    [<TailCall>]
-    let rec private searchBlock (partial: SstReadInfo) (startKey: byte array) (lo: int) (hi: int) =
-        if lo >= hi then
-            lo
-        else
-            let mid = lo + (hi - lo) / 2
-
-            if Bytes.compare partial.Index.[mid].LastKey startKey < 0 then
-                searchBlock partial startKey (mid + 1) hi
-            else
-                searchBlock partial startKey lo mid
-
-    /// 開いたファイルストリームを閉じる。
-    let private closeScanStream (stream: Lazy<System.IO.FileStream>) =
-        if stream.IsValueCreated then
-            stream.Value.Dispose()
-
-    /// 最大 batchBlocks 個分の生バイトをまとめて読む。
-    let private readRawBatch (partial: SstReadInfo) (stream: Lazy<System.IO.FileStream>) (batchBlocks: int) (i: int) =
-        let batchEnd = min (i + batchBlocks) partial.Index.Length
-        let startOffset = partial.Index.[i].Offset
-        let endEntry = partial.Index.[batchEnd - 1]
-        let total = int64 endEntry.Offset + int64 endEntry.Length - int64 startOffset
-
-        if total < 0L || total > int64 System.Int32.MaxValue then
-            err (DbError.corruption "Sstable: 索引範囲が不正です")
-        else
-            protect (fun () ->
-                let s = stream.Value
-                s.Seek(int64 startOffset, System.IO.SeekOrigin.Begin) |> ignore
-                let buffer = Array.zeroCreate<byte>(int total)
-                s.ReadExactly(buffer, 0, int total)
-                buffer, startOffset, batchEnd)
-
     /// 生バイトから 1ブロックを解析する。
-    let private parseRawBlock (mode: ValueMode) (partial: SstReadInfo) (raw: byte array) (startOffset: int) (i: int) =
+    let private parseRawBlock (mode: ValueMode) (raw: byte array) (startOffset: int) (i: int) (partial: SstReadInfo) =
         let ie = partial.Index.[i]
         let relativeOffset = ie.Offset - startOffset
 
@@ -330,49 +303,124 @@ module internal Sstable =
                 else
                     ret entries
 
-    /// ステップ走査に後始末を付ける。
-    let private stepScanWithClose (close: unit -> unit) (step: unit -> Result<(SstEntry * SstScan) option, DbError>) =
-        SstScan.ofStepWithClose step close
+    /// 最大 batchBlocks 個分の生バイトをまとめて読む。
+    let private readRawBatch (stream: Lazy<System.IO.FileStream>) (batchBlocks: int) (i: int) (partial: SstReadInfo) =
+        let batchEnd = min (i + batchBlocks) partial.Index.Length
+        let startOffset = partial.Index.[i].Offset
+        let endEntry = partial.Index.[batchEnd - 1]
+        let total = int64 endEntry.Offset + int64 endEntry.Length - int64 startOffset
 
-    /// 読み込み済みブロックの残りエントリを走査する。
-    let rec private scanEntries
+        if total < 0L || total > int64 System.Int32.MaxValue then
+            err (DbError.corruption "Sstable: 索引範囲が不正です")
+        else
+            protect (fun () ->
+                let s = stream.Value
+                s.Seek(int64 startOffset, System.IO.SeekOrigin.Begin) |> ignore
+                let buffer = Array.zeroCreate<byte>(int total)
+                s.ReadExactly(buffer, 0, int total)
+                buffer, startOffset, batchEnd)
+
+    /// 開いたファイルストリームを閉じる。
+    let private closeScanStream (stream: Lazy<System.IO.FileStream>) =
+        if stream.IsValueCreated then
+            stream.Value.Dispose()
+
+    /// 次のブロック（バッチ）を読み込む。
+    let rec private loadBlock
+        (stream: Lazy<System.IO.FileStream>)
         (mode: ValueMode)
         (startKey: byte array)
         (limit: int)
-        (partial: SstReadInfo)
-        (stream: Lazy<System.IO.FileStream>)
         (batchBlocks: int)
         (raw: byte array)
         (startOffset: int)
         (batchEnd: int)
-        (pos: int)
         (count: int)
         (i: int)
+        (partial: SstReadInfo)
+        =
+        if i >= partial.Index.Length || limit > 0 && count >= limit then
+            closeScanStream stream
+            SstScan.Empty
+        elif i < batchEnd then
+            SstScan.ofStepWithClose
+                (fun () ->
+                    match parseRawBlock mode raw startOffset i partial with
+                    | Error e ->
+                        closeScanStream stream
+                        err e
+                    | Ok entries ->
+                        SstScan.next (
+                            scanEntries
+                                stream
+                                mode
+                                startKey
+                                limit
+                                batchBlocks
+                                raw
+                                startOffset
+                                batchEnd
+                                count
+                                (i + 1)
+                                partial
+                                0
+                                entries
+                        ))
+                (fun () -> closeScanStream stream)
+        else
+            SstScan.ofStepWithClose
+                (fun () ->
+                    match readRawBatch stream batchBlocks i partial with
+                    | Error e ->
+                        closeScanStream stream
+                        err e
+                    | Ok(raw, startOffset, batchEnd) ->
+                        SstScan.next (
+                            loadBlock stream mode startKey limit batchBlocks raw startOffset batchEnd count i partial
+                        ))
+                (fun () -> closeScanStream stream)
+
+    /// 読み込み済みブロックの残りエントリを走査する。
+    and private scanEntries
+        (stream: Lazy<System.IO.FileStream>)
+        (mode: ValueMode)
+        (startKey: byte array)
+        (limit: int)
+        (batchBlocks: int)
+        (raw: byte array)
+        (startOffset: int)
+        (batchEnd: int)
+        (count: int)
+        (i: int)
+        (partial: SstReadInfo)
+        (pos: int)
         (entries: SstEntry array)
         =
         if pos >= entries.Length then
-            loadBlock mode startKey limit partial stream batchBlocks raw startOffset batchEnd count i
+            loadBlock stream mode startKey limit batchBlocks raw startOffset batchEnd count i partial
         elif limit > 0 && count >= limit then
             closeScanStream stream
             SstScan.Empty
         elif Bytes.compare entries.[pos].Key startKey < 0 then
-            stepScanWithClose (fun () -> closeScanStream stream) (fun () ->
-                SstScan.next (
-                    scanEntries
-                        mode
-                        startKey
-                        limit
-                        partial
-                        stream
-                        batchBlocks
-                        raw
-                        startOffset
-                        batchEnd
-                        (pos + 1)
-                        count
-                        i
-                        entries
-                ))
+            SstScan.ofStepWithClose
+                (fun () ->
+                    SstScan.next (
+                        scanEntries
+                            stream
+                            mode
+                            startKey
+                            limit
+                            batchBlocks
+                            raw
+                            startOffset
+                            batchEnd
+                            count
+                            i
+                            partial
+                            (pos + 1)
+                            entries
+                    ))
+                (fun () -> closeScanStream stream)
         else
             SstScan.ofArray
                 entries
@@ -381,60 +429,10 @@ module internal Sstable =
                 limit
                 (fun nextCount ->
                     SstScan.next (
-                        loadBlock mode startKey limit partial stream batchBlocks raw startOffset batchEnd nextCount i
+                        loadBlock stream mode startKey limit batchBlocks raw startOffset batchEnd nextCount i partial
                     ))
                 (fun () -> closeScanStream stream)
 
-    /// 次のブロック（バッチ）を読み込む。
-    and private loadBlock
-        (mode: ValueMode)
-        (startKey: byte array)
-        (limit: int)
-        (partial: SstReadInfo)
-        (stream: Lazy<System.IO.FileStream>)
-        (batchBlocks: int)
-        (raw: byte array)
-        (startOffset: int)
-        (batchEnd: int)
-        (count: int)
-        (i: int)
-        =
-        if i >= partial.Index.Length || limit > 0 && count >= limit then
-            closeScanStream stream
-            SstScan.Empty
-        elif i < batchEnd then
-            stepScanWithClose (fun () -> closeScanStream stream) (fun () ->
-                match parseRawBlock mode partial raw startOffset i with
-                | Error e ->
-                    closeScanStream stream
-                    err e
-                | Ok entries ->
-                    SstScan.next (
-                        scanEntries
-                            mode
-                            startKey
-                            limit
-                            partial
-                            stream
-                            batchBlocks
-                            raw
-                            startOffset
-                            batchEnd
-                            0
-                            count
-                            (i + 1)
-                            entries
-                    ))
-        else
-            stepScanWithClose (fun () -> closeScanStream stream) (fun () ->
-                match readRawBatch partial stream batchBlocks i with
-                | Error e ->
-                    closeScanStream stream
-                    err e
-                | Ok(raw, startOffset, batchEnd) ->
-                    SstScan.next (
-                        loadBlock mode startKey limit partial stream batchBlocks raw startOffset batchEnd count i
-                    ))
 
     /// 部分読みした reader から startKey 以降を遅延生成する。
     /// ブロックは最大 8個まとめて 1回の open で読み、解析は必要になったときだけ行う。
@@ -453,21 +451,34 @@ module internal Sstable =
                 ))
 
         let batchBlocks = 8
-        let startBlock = searchBlock partial startKey 0 partial.Index.Length
+        let startBlock = searchBlock startKey 0 partial.Index.Length partial
 
         if startBlock >= partial.Index.Length then
             closeScanStream stream
             SstScan.Empty
         else
-            stepScanWithClose (fun () -> closeScanStream stream) (fun () ->
-                match readRawBatch partial stream batchBlocks startBlock with
-                | Error e ->
-                    closeScanStream stream
-                    err e
-                | Ok(raw, startOffset, batchEnd) ->
-                    SstScan.next (
-                        loadBlock mode startKey limit partial stream batchBlocks raw startOffset batchEnd 0 startBlock
-                    ))
+            SstScan.ofStepWithClose
+                (fun () ->
+                    match readRawBatch stream batchBlocks startBlock partial with
+                    | Error e ->
+                        closeScanStream stream
+                        err e
+                    | Ok(raw, startOffset, batchEnd) ->
+                        SstScan.next (
+                            loadBlock
+                                stream
+                                mode
+                                startKey
+                                limit
+                                batchBlocks
+                                raw
+                                startOffset
+                                batchEnd
+                                0
+                                startBlock
+                                partial
+                        ))
+                (fun () -> closeScanStream stream)
 
     /// 値を復号せずに走査する（compaction 用）。
     let rangeScanPartialRaw = rangeScanPartialWith RawValues
@@ -489,19 +500,19 @@ module internal Sstable =
 
     /// 索引上でキー以上になる最初のエントリを二分探索する。
     [<TailCall>]
-    let rec private searchIndex (partial: SstReadInfo) (key: byte array) (lo: int) (hi: int) =
+    let rec private searchIndex (key: byte array) (lo: int) (hi: int) (partial: SstReadInfo) =
         if lo >= hi then
             lo
         else
             let mid = lo + (hi - lo) / 2
 
             if Bytes.compare partial.Index.[mid].LastKey key < 0 then
-                searchIndex partial key (mid + 1) hi
+                searchIndex key (mid + 1) hi partial
             else
-                searchIndex partial key lo mid
+                searchIndex key lo mid partial
 
     /// 索引エントリが指すブロックを読む。
-    let private readIndexBlock (partial: SstReadInfo) (indexEntry: SstIndexEntry) =
+    let private readIndexBlock (indexEntry: SstIndexEntry) (partial: SstReadInfo) =
         protect (fun () ->
             use stream = System.IO.File.OpenRead partial.Path
             stream.Seek(int64 indexEntry.Offset, System.IO.SeekOrigin.Begin) |> ignore
@@ -509,9 +520,9 @@ module internal Sstable =
             stream.ReadExactly(buffer, 0, buffer.Length)
             buffer)
 
-    /// ブロック内の varint を読む本体。
+    /// ブロック内の varint を読む。
     [<TailCall>]
-    let rec private readVarintGo (data: byte array) (payloadLen: int) (shift: int) (acc: uint64) (i: int) =
+    let rec private readVarintGo (shift: int) (acc: uint64) (data: byte array) (payloadLen: int) (i: int) =
         if i >= payloadLen || shift >= 64 then
             struct (false, 0UL, i)
         else
@@ -521,18 +532,10 @@ module internal Sstable =
             if b &&& 0x80uy = 0uy then
                 struct (true, acc, i + 1)
             else
-                readVarintGo data payloadLen (shift + 7) acc (i + 1)
+                readVarintGo (shift + 7) acc data payloadLen (i + 1)
 
     /// 指定位置の varint を読む。
-    let private readVarintAt (data: byte array) (payloadLen: int) (pos: int) = readVarintGo data payloadLen 0 0UL pos
-
-    /// 値部分を復号する（列マスクを適用する場合がある）。
-    let private decodeLookupValue (maskOpt: bool array option) (data: byte array) (valuePos: int) (valueLen: int) =
-        Cursor.createSlice data valuePos valueLen
-        >>= fun slice ->
-            match maskOpt with
-            | None -> SstEntry.decodeValueAt slice valueLen
-            | Some mask -> SstEntry.decodeMaskedValueAt mask slice valueLen
+    let private readVarintAt = readVarintGo 0 0UL
 
     /// ブロック内の 1エントリのヘッダを読み、接頭辞長・キー末尾長・キー開始位置・値長を返す。
     let private readLookupHeader
@@ -564,13 +567,18 @@ module internal Sstable =
             if valueLen > uint64 System.Int32.MaxValue || int valueLen > payloadLen - valuePos then
                 err (DbError.corruption "Sstable: 値がブロックの終端を超えています")
             else
-                ret (struct (sharedLength, tailLength, p3, int valueLen))
+                ret struct (sharedLength, tailLength, p3, int valueLen)
+
+    /// 値部分を復号する（列マスクを適用する場合がある）。
+    let private decodeLookupValue (data: byte array) (mask: bool array) (valuePos: int) (valueLen: int) =
+        Cursor.createSlice data valuePos valueLen
+        >>= SstEntry.decodeMaskedValueAt mask valueLen
 
     /// ブロック内を先頭から走査してキーを探す。
     [<TailCall>]
     let rec private scanLookupBlock
-        (maskOpt: bool array option)
         (key: byte array)
+        (mask: bool array)
         (visible: uint64 option)
         (indexEntry: SstIndexEntry)
         (data: byte array)
@@ -594,11 +602,11 @@ module internal Sstable =
                 let ordering = Bytes.compare entryKey key
 
                 if ordering < 0 then
-                    scanLookupBlock maskOpt key visible indexEntry data payloadLen entryKey (valuePos + valueLength)
+                    scanLookupBlock key mask visible indexEntry data payloadLen entryKey (valuePos + valueLength)
                 elif ordering > 0 then
                     ret None
                 else
-                    match decodeLookupValue maskOpt data valuePos valueLength with
+                    match decodeLookupValue data mask valuePos valueLength with
                     | Ok(seqNo, value, _) ->
                         let isVisible =
                             match visible with
@@ -609,8 +617,8 @@ module internal Sstable =
                             ret (Some(SstEntry.make entryKey seqNo value))
                         else
                             scanLookupBlock
-                                maskOpt
                                 key
+                                mask
                                 visible
                                 indexEntry
                                 data
@@ -621,13 +629,13 @@ module internal Sstable =
 
     /// 1ブロックを検索する（チェックサムを検証してから走査）。
     let private lookupIndexEntry
-        (maskOpt: bool array option)
         (key: byte array)
+        (mask: bool array)
         (visible: uint64 option)
-        (partial: SstReadInfo)
         (indexEntry: SstIndexEntry)
+        (partial: SstReadInfo)
         =
-        readIndexBlock partial indexEntry
+        readIndexBlock indexEntry partial
         >>= fun data ->
             let n = data.Length
             let payloadLen = n - 4
@@ -637,27 +645,27 @@ module internal Sstable =
             elif Hashing.checksumRange data 0 payloadLen <> Bytes.readLE32 data payloadLen then
                 err (DbError.corruption "Sstable: ブロックのチェックサム不一致")
             else
-                scanLookupBlock maskOpt key visible indexEntry data payloadLen [||] 0
+                scanLookupBlock key mask visible indexEntry data payloadLen [||] 0
 
     /// 索引を先頭から辿って最初の可視版を探す。
     [<TailCall>]
     let rec private findIndexEntry
-        (maskOpt: bool array option)
         (key: byte array)
+        (mask: bool array)
         (visible: uint64 option)
-        (partial: SstReadInfo)
         (i: int)
+        (partial: SstReadInfo)
         =
         if i >= partial.Index.Length then
             ret None
         else
             let indexEntry = partial.Index.[i]
 
-            match lookupIndexEntry maskOpt key visible partial indexEntry with
+            match lookupIndexEntry key mask visible indexEntry partial with
             | Ok(Some e) -> ret (Some e)
             | Ok None ->
                 if Bytes.compare indexEntry.LastKey key = 0 then
-                    findIndexEntry maskOpt key visible partial (i + 1)
+                    findIndexEntry key mask visible (i + 1) partial
                 else
                     ret None
             | Error e -> err e
@@ -665,17 +673,12 @@ module internal Sstable =
     /// 部分読みで 1キーを検索する。
     /// 同一キーの複数版は SeqNo 降順で並ぶので、最初の可視版を返す。
     /// 可視版がブロック末尾まで無い場合は、次のブロックに古い版が続く可能性があるため読み進める。
-    let private lookupWith
-        (maskOpt: bool array option)
-        (key: byte array)
-        (visible: uint64 option)
-        (partial: SstReadInfo)
-        =
+    let private lookupWith (key: byte array) (mask: bool array) (visible: uint64 option) (partial: SstReadInfo) =
         if not (mayContainPartial key partial) then
             ret None
         else
-            findIndexEntry maskOpt key visible partial (searchIndex partial key 0 partial.Index.Length)
+            findIndexEntry key mask visible (searchIndex key 0 partial.Index.Length partial) partial
 
     /// 列マスクに従って必要な列だけ復号して 1キーを検索する。
-    let lookupMasked (mask: bool array) (key: byte array) (visible: uint64 option) (partial: SstReadInfo) =
-        lookupWith (Some mask) key visible partial
+    let lookupMasked (key: byte array) (mask: bool array) (visible: uint64 option) (partial: SstReadInfo) =
+        lookupWith key mask visible partial

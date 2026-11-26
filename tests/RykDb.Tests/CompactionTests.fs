@@ -19,13 +19,13 @@ let private mkSst (dir: string) (num: int64) (level: int) (entries: Entry list) 
 
 /// 書いた SSTable を開く（検証用。値は復号する）。
 let private openBack (dir: string) (f: FileMetaData) =
-    Sstable.openPartial (FileMetaData.path dir f.FileNumber)
-    >>= fun partial -> ret (Sstable.rangeScanPartial [||] 0 partial)
+    SstableReader.openPartial (FileMetaData.path dir f.FileNumber)
+    >>= fun partial -> ret (SstableReader.rangeScanPartial [||] 0 partial)
 
 /// compaction の入力用。値は復号せずスライスのまま渡す。
 let private openBackRaw (dir: string) (f: FileMetaData) =
-    Sstable.openPartial (FileMetaData.path dir f.FileNumber)
-    >>= fun partial -> ret (Sstable.rangeScanPartialRaw [||] 0 partial)
+    SstableReader.openPartial (FileMetaData.path dir f.FileNumber)
+    >>= fun partial -> ret (SstableReader.rangeScanPartialRaw [||] 0 partial)
 
 /// 書いた SSTable を読み戻す（検証用）。
 let private readBack (dir: string) (f: FileMetaData) = openBack dir f >>= SstScan.toArray

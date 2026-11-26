@@ -33,7 +33,7 @@ let private forceL1Compaction =
 let private waitIdle (host: VersionCoordinator) =
     Assert.True(SpinWait.SpinUntil((fun () -> host.IsIdle), 10000), "worker が idle になりません")
 
-let private writeWithSeq (store: RowStore) (seqNo: uint64) (i: int) =
+let private writeWithSeq (store: RowStore) (seqNo: SeqNo) (i: int) =
     ok (RowStore.writeBatches [ ("t", [| Entry.put (intKey i) seqNo (intRow i) |]) ] store)
 
 let private writeOne (store: RowStore) (i: int) = writeWithSeq store (uint64 i) i

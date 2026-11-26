@@ -123,8 +123,8 @@ module internal Compaction =
     /// 同期 compaction は決まった開始番号から純粋に進め、
     /// バックグラウンド compaction はホストが持つ allocator から取得する。
     type private FileNumberSupply =
-        | Sequence of int64
-        | Allocator of (unit -> int64)
+        | Sequence of FileNumber
+        | Allocator of (unit -> FileNumber)
 
     /// ファイル番号を採番して供給状態を進める。
     let private takeFileNumber (supply: FileNumberSupply) =
@@ -325,7 +325,7 @@ module internal Compaction =
         (options: CompactionOptions)
         (plan: CompactionPlan)
         (chunk: SstEntry list)
-        (fileNumber: int64)
+        (fileNumber: FileNumber)
         =
         match chunk with
         | [] -> ret None
@@ -506,7 +506,7 @@ module internal Compaction =
         (options: CompactionOptions)
         (activeSnapshot: uint64)
         (openScan: FileMetaData -> Result<SstScan, DbError>)
-        (allocateFileNumber: unit -> int64)
+        (allocateFileNumber: unit -> FileNumber)
         (shouldStop: unit -> bool)
         =
         runCompact dir version options activeSnapshot openScan (Allocator allocateFileNumber) shouldStop
@@ -518,7 +518,7 @@ module internal Compaction =
         (version: Version)
         (options: CompactionOptions)
         (activeSnapshot: uint64)
-        (nextFileNumber: int64)
+        (nextFileNumber: FileNumber)
         (openScan: FileMetaData -> Result<SstScan, DbError>)
         =
         runCompact dir version options activeSnapshot openScan (Sequence nextFileNumber) (fun () -> false)

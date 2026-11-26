@@ -26,7 +26,7 @@ type internal WalRecord =
 type internal WalState =
     {
         /// 現在の WAL ファイル番号
-        FileNumber: int64
+        FileNumber: FileNumber
         /// 現在の WAL ファイルに書き込んだバイト数
         Size: int64
     }
@@ -90,11 +90,11 @@ module internal Wal =
         }
 
     /// ファイル番号から WAL のファイル名を作る。
-    let private walFileName (fileNumber: int64) =
+    let private walFileName (fileNumber: FileNumber) =
         sprintf "%06d%s" fileNumber WalExtension
 
     /// WAL ファイルのパス。
-    let path (dir: string) (fileNumber: int64) =
+    let path (dir: string) (fileNumber: FileNumber) =
         System.IO.Path.Combine(dir, walFileName fileNumber)
 
     /// フレームのヘッダ（長さ + CRC32C）を符号化する。
@@ -270,7 +270,7 @@ module internal Wal =
     /// 戻り値は `(再生後の状態, WAL に現れた最大 txnId, 最後の完全なフレームの終端位置)`。
     /// 最大 txnId は open 時に NextTxnId を復元し、既存ファイル内での採番の再利用を防ぐために返す。
     /// 終端位置は open 時に不完全な末尾を切り詰めるために返す。
-    let foldCommitted (dir: string) (fileNumber: int64) (step: 's -> Entry -> 's) (initial: 's) =
+    let foldCommitted (dir: string) (fileNumber: FileNumber) (step: 's -> Entry -> 's) (initial: 's) =
         let p = path dir fileNumber
 
         protect (fun () ->
@@ -329,7 +329,7 @@ module internal Wal =
                 [])
 
     /// WAL ファイルを作る。
-    let create (dir: string) (fileNumber: int64) =
+    let create (dir: string) (fileNumber: FileNumber) =
         protect (fun () ->
             System.IO.File.WriteAllBytes(path dir fileNumber, [||])
             { FileNumber = fileNumber; Size = 0L })

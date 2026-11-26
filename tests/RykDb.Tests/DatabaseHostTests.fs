@@ -9,7 +9,7 @@ open Xunit
 open RykDb.Core
 open RykDb.TestHelpers
 
-let private pos (fileNumber: int64) (size: int) : WalState =
+let private pos (fileNumber: FileNumber) (size: int) : WalState =
     { FileNumber = fileNumber; Size = size }
 
 /// 条件が満たされるまで待つ（満たされなければテストを失敗させる）。

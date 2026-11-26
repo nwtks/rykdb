@@ -21,7 +21,7 @@
     <Compile Include="BloomFilterTests.fs" />
     <Compile Include="SstScanTests.fs" />
     <Compile Include="SstableFormatTests.fs" />
-    <Compile Include="SstableTests.fs" />
+    <Compile Include="SstableReaderTests.fs" />
     <Compile Include="VersionSetTests.fs" />
     <Compile Include="CompactionTests.fs" />
     <Compile Include="StorageEngineTests.fs" />

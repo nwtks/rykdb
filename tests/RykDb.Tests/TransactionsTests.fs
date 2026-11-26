@@ -11,7 +11,7 @@ open RykDb.TestHelpers
 let private rowKey (i: int) =
     KeyBuilder.ofValues [ SqlValue.Int(int64 i) ] |> ok
 
-let private isVisible (snap: Snapshot) (seqNo: uint64) = seqNo <= snap.SeqNo
+let private isVisible (snap: Snapshot) (seqNo: SeqNo) = seqNo <= snap.SeqNo
 
 let private currentSeqNo (mgr: TransactionManager) = mgr.LastCommitSeqNo
 
@@ -84,7 +84,7 @@ let private errorOf (r: Result<'a, DbError>) =
 let ``Transaction.create: 空の transaction`` () =
     let snap = { Snapshot.SeqNo = 0UL }
     let txn = Transaction.create 1UL<txnId> snap
-    Assert.Equal<uint64<txnId>>(1UL<txnId>, txn.TxnId)
+    Assert.Equal<TxnId>(1UL<txnId>, txn.TxnId)
     Assert.Equal(0UL, txn.Snapshot.SeqNo)
     Assert.True(Map.isEmpty txn.Buffers)
 

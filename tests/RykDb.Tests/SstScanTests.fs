@@ -137,10 +137,10 @@ let ``SstScan.withScan: 成功・失敗のどちらでも Dispose する`` () =
     let make () =
         SstScan.ofState () (fun (_: unit) -> ret None) (fun (_: unit) -> closed.Value <- closed.Value + 1)
 
-    let okResult = SstScan.withScan (make ()) (fun _ -> ret 42)
+    let okResult = make () |> SstScan.withScan (fun _ -> ret 42)
     Assert.Equal<int>(42, ok okResult)
 
-    let errResult = SstScan.withScan (make ()) (fun _ -> err (DbError.notFound "x"))
+    let errResult = make () |> SstScan.withScan (fun _ -> err (DbError.notFound "x"))
     expectErrorKind ErrorKind.NotFound "withScan はエラーを伝播するはず" errResult
     Assert.Equal<int>(2, closed.Value)
 

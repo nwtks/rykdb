@@ -15,6 +15,15 @@ type txnId
 /// 単位 `txnId` を持つ。
 type internal TxnId = uint64<txnId>
 
+/// SSTable / WAL のファイル番号。
+/// `ManifestNumber` とは意味が違うが、単位を持たない `int64` のまま名前を付ける。
+type internal FileNumber = int64
+
+/// 書き込みの論理時計。
+/// commit 時に transaction manager が採番する。
+/// `TxnId` とは違うが、単位を持たない `uint64` のまま名前を付ける。
+type internal SeqNo = uint64
+
 /// 実行時の値。
 /// NULL は他のすべての型と区別できる特別なケースとして持つ。
 [<RequireQualifiedAccess>]
@@ -101,7 +110,7 @@ module internal Bytes =
 /// memtable の `Entry` と SSTable の `SstEntry` は必ずこれを経由する。
 module internal KeyOrder =
     /// キー昇順、同一キーなら SeqNo 降順で比較する。
-    let compare (keyA: byte array) (seqA: uint64) (keyB: byte array) (seqB: uint64) =
+    let compare (keyA: byte array) (seqA: SeqNo) (keyB: byte array) (seqB: SeqNo) =
         match Bytes.compare keyA keyB with
         | 0 -> compare seqB seqA
         | c -> c
