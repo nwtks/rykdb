@@ -60,8 +60,7 @@ module internal Transaction =
             LimitBytes = DefaultLimitBytes
         }
 
-    /// transaction のバッファ 1スロット（Map ノード・キー配列・行・値を含む）の
-    /// ヒープ上の概算サイズ。
+    /// transaction のバッファ 1スロット（Map ノード・キー配列・行・値を含む）のヒープ上の概算サイズ。
     /// `Entry.managedBytes` は Treap ノードの分も数えるので使わない（バッファは Map）。
     let private slotBytes (keyspace: string) (key: byte array) (slot: SqlValue array option) =
         let rowBytes =
@@ -71,12 +70,10 @@ module internal Transaction =
 
         int64 keyspace.Length + 48L + 24L + int64 key.Length + int64 rowBytes
 
-    /// <remarks>
-    /// **所有権を移す**:
+    /// 所有権を移す。
     /// キーは Map の順序の根拠、行は read-your-writes が返す値なので、
     /// 呼び出し側が後から配列を書き換えるとバッファが壊れる。
     /// そこでここで複製する。
-    /// </remarks>
     let private setSlot
         (keyspace: string)
         (givenKey: byte array)
@@ -252,48 +249,6 @@ type internal TransactionManager =
     }
 
 module internal TransactionManager =
-    /// snapshot より後に同じキーへ書かれた履歴を競合キーとして列挙する。
-    let private findWriteConflicts (txn: Transaction) (lastCommitted: Map<string, 'a>) (snapSeq: 'a) =
-        if Map.isEmpty lastCommitted then
-            []
-        else
-            Transaction.writeKeys txn
-            |> Set.toList
-            |> List.filter (fun k ->
-                match lastCommitted |> Map.tryFind k with
-                | Some seq -> seq > snapSeq
-                | None -> false)
-
-    /// 今回の commit のキーを履歴へ記録する（UNIQUE 予約を含む）。
-    let private updateLastCommittedWith
-        (txn: Transaction)
-        (lastCommitted: Map<string, SeqNo>)
-        (batches: (string * Entry array) list)
-        (commitSeq: SeqNo)
-        =
-        let physical =
-            batches
-            |> List.fold
-                (fun acc (ks, entries) ->
-                    entries
-                    |> Array.fold
-                        (fun acc e ->
-                            let k = Transaction.conflictKey ks e.Key
-
-                            match acc |> Map.tryFind k with
-                            | Some old when old >= e.SeqNo -> acc
-                            | _ -> Map.add k e.SeqNo acc)
-                        acc)
-                lastCommitted
-
-        txn.Reservations
-        |> Set.fold
-            (fun acc k ->
-                match acc |> Map.tryFind k with
-                | Some old when old >= commitSeq -> acc
-                | _ -> Map.add k commitSeq acc)
-            physical
-
     /// 初期状態の manager を作る。
     let create () =
         {
@@ -378,6 +333,48 @@ module internal TransactionManager =
             LastCommittedKeys = manager.LastCommitted.Count
         }
 
+    /// snapshot より後に同じキーへ書かれた履歴を競合キーとして列挙する。
+    let private findWriteConflicts (lastCommitted: Map<string, 'a>) (snapSeq: 'a) (txn: Transaction) =
+        if Map.isEmpty lastCommitted then
+            []
+        else
+            Transaction.writeKeys txn
+            |> Set.toList
+            |> List.filter (fun k ->
+                match lastCommitted |> Map.tryFind k with
+                | Some seq -> seq > snapSeq
+                | None -> false)
+
+    /// 今回の commit のキーを履歴へ記録する（UNIQUE 予約を含む）。
+    let private updateLastCommittedWith
+        (lastCommitted: Map<string, SeqNo>)
+        (commitSeq: SeqNo)
+        (batches: (string * Entry array) list)
+        (txn: Transaction)
+        =
+        let physical =
+            batches
+            |> List.fold
+                (fun acc (ks, entries) ->
+                    entries
+                    |> Array.fold
+                        (fun acc e ->
+                            let k = Transaction.conflictKey ks e.Key
+
+                            match acc |> Map.tryFind k with
+                            | Some old when old >= e.SeqNo -> acc
+                            | _ -> Map.add k e.SeqNo acc)
+                        acc)
+                lastCommitted
+
+        txn.Reservations
+        |> Set.fold
+            (fun acc k ->
+                match acc |> Map.tryFind k with
+                | Some old when old >= commitSeq -> acc
+                | _ -> Map.add k commitSeq acc)
+            physical
+
     /// commit する。
     /// 1. transaction 開始時の snapshot より後に、同じキーへの commit があれば競合とする。
     /// 2. 競合がなければ SeqNo を割り当て、今回の書き込みを `LastCommitted` に記録する。
@@ -392,7 +389,7 @@ module internal TransactionManager =
         elif Transaction.isOverLimit txn then
             err (Transaction.overLimitError txn)
         else
-            let conflicting = findWriteConflicts txn manager.LastCommitted txn.Snapshot.SeqNo
+            let conflicting = findWriteConflicts manager.LastCommitted txn.Snapshot.SeqNo txn
 
             if not (List.isEmpty conflicting) then
                 let examples =
@@ -437,7 +434,7 @@ module internal TransactionManager =
                     if gcThreshold > commitSeq then
                         Map.empty
                     else
-                        updateLastCommittedWith txn manager.LastCommitted batches commitSeq
+                        updateLastCommittedWith manager.LastCommitted commitSeq batches txn
                         |> Map.filter (fun _ seq -> seq >= gcThreshold)
 
                 let updated =
@@ -480,11 +477,9 @@ module internal RootKey =
 /// 1つの登録に対して、それを参照するリース（`RegistrationLease`）が複数存在しうる。
 /// リースが1つでも残っていれば transaction は利用中なので、その snapshot の登録を維持する。
 /// リースごとに生存トークンを付け、最後のトークンが GC で回収されたときに登録を解除する。
-/// 登録を解除しないと、使われていない snapshot が残り、
-/// 同じ root の DDL が `ConflictError` で拒否され続ける。
+/// 登録を解除しないと、使われていない snapshot が残り、同じ root の DDL が `ConflictError` で拒否され続ける。
 /// トークンは `obj()` の参照等価。
-/// Core は `mutable` / `ref` を 0件に保つ規約なので、
-/// 連番カウンタではなく参照等価のオブジェクトを鍵にする。
+/// Core は `mutable` / `ref` を 0件に保つ規約なので、連番カウンタではなく参照等価のオブジェクトを鍵にする。
 /// </remarks>
 type internal ActiveRegistration internal (root: string, unregister: ActiveRegistration -> unit) =
     /// 生存しているリースのトークン。
@@ -508,36 +503,6 @@ type internal ActiveRegistration internal (root: string, unregister: ActiveRegis
     /// 登録を解除する（登録先のレジストリを保持している）。
     member this.Unregister() = unregister this
 
-/// 登録・リースの共通ヘルパー。
-module private RegistrationInternals =
-    /// Gate を取って操作を直列化する。
-    let withGate (gate: System.Threading.SemaphoreSlim) (f: unit -> 'T) =
-        gate.Wait()
-
-        try
-            f ()
-        finally
-            gate.Release() |> ignore
-
-    /// 正規化済み key の bucket を取る（呼び出しは Gate の内側）。
-    let snapshotBucket
-        (byRoot:
-            System.Collections.Concurrent.ConcurrentDictionary<
-                string,
-                System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>
-             >)
-        (key: string)
-        =
-        byRoot.GetOrAdd(key, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>())
-
-    /// リースのトークンを外し、最後の 1本なら登録も解除する。
-    let releaseLease (registration: ActiveRegistration) (token: obj) =
-        if registration.Detach token then
-            registration.Unregister()
-            true
-        else
-            false
-
 /// DB ごとの active transaction の snapshot を集約する。
 /// <remarks>
 /// GC の境界は「最古の active snapshot」なので、
@@ -547,7 +512,7 @@ module private RegistrationInternals =
 /// 複数プロセスからの同時アクセスは非対応なので、DB ごとの表で十分。
 /// 永続化もしない（再オープン後の transaction は存在しない）。
 /// </remarks>
-type internal SnapshotRegistry() =
+type private SnapshotRegistry() =
     /// 正規化した root -> (登録 -> snapshot)。
     let byRoot =
         System.Collections.Concurrent.ConcurrentDictionary<
@@ -565,19 +530,32 @@ type internal SnapshotRegistry() =
     /// </remarks>
     let gate = new System.Threading.SemaphoreSlim(1, 1)
 
-    /// snapshot を登録し、解除に使う登録を返す。
+    let withGate (f: unit -> 'T) =
+        gate.Wait()
+
+        try
+            f ()
+        finally
+            gate.Release() |> ignore
+
+    /// 正規化済み key の bucket を取る（呼び出しは Gate の内側）。
+    let snapshotBucket (key: string) =
+        byRoot.GetOrAdd(key, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>())
+
+    /// snapshot を登録し、解除に使う登
+    /// 録を返す。
     member this.Register(root: string, snapshot: uint64) =
         let key = RootKey.normalize root
 
-        RegistrationInternals.withGate gate (fun () ->
+        withGate (fun () ->
             let registration = ActiveRegistration(key, fun reg -> this.Unregister reg)
-            (RegistrationInternals.snapshotBucket byRoot key).[registration] <- snapshot
+            (snapshotBucket key).[registration] <- snapshot
             registration)
 
     /// 登録を解除する（commit 成功・rollback・Close・最後の接続の GC）。
     /// 解除し忘れても「版を余分に残す」側にしか倒れない（安全側）。
     member _.Unregister(registration: ActiveRegistration) =
-        RegistrationInternals.withGate gate (fun () ->
+        withGate (fun () ->
             match byRoot.TryGetValue registration.Root with
             | true, inner ->
                 inner.TryRemove registration |> ignore
@@ -591,7 +569,7 @@ type internal SnapshotRegistry() =
     member _.OldestExcept(root: string, registration: ActiveRegistration option) =
         let key = RootKey.normalize root
 
-        RegistrationInternals.withGate gate (fun () ->
+        withGate (fun () ->
             match byRoot.TryGetValue key with
             | true, inner ->
                 inner
@@ -611,6 +589,42 @@ type internal SnapshotRegistry() =
                     None
             | _ -> None)
 
+/// 進行中 transaction の登録の生存に結び付いたリース。
+/// <remarks>
+/// `TxnState.Lease` が持ち、接続（`Session`）が Close されずに捨てられても、
+/// GC された時点で（その登録のリースが最後の 1本なら）登録を外す。
+/// finalizer が走るのは「その接続がもう使えない」状態なので、
+/// まだ commit できる transaction を誤って解放することはない。
+/// 明示的に終わらせた場合は登録が先に外れているので何もしない（解除は冪等）。
+/// 未解放のまま GC された場合は、二度と commit できない transaction が
+/// `TransactionManager.Active` に残るため、`onAbandon` で通知する。
+/// 通知側（`DatabaseHost`）はロックを取らずにキューへ積み、次の書き込みで回収する。
+/// </remarks>
+type internal RegistrationLease(registration: ActiveRegistration, ?onAbandon: unit -> unit) =
+    /// このリースの生存トークン。
+    let token = registration.Attach()
+
+    /// リースのトークンを外し、最後の 1本なら登録も解除する。
+    let releaseLease () =
+        if registration.Detach token then
+            registration.Unregister()
+            true
+        else
+            false
+
+    /// 登録そのもの（`ExecState.ActiveRegistration` へ渡す）。
+    member _.Registration = registration
+
+    /// このリースの登録を外す。
+    /// 最後の 1本なら registry からも消える。二重呼び出しは無害。
+    member _.Release() = releaseLease () |> ignore
+
+    override _.Finalize() =
+        protect (fun () ->
+            if releaseLease () then
+                onAbandon |> Option.iter (fun signal -> signal ()))
+        |> ignore
+
 /// DB ごとの RootRuntime と active snapshot 登録。
 /// `RowStore` が所有し、Session 間で共有する。
 type internal RootRuntime() =
@@ -622,7 +636,8 @@ type internal RootRuntime() =
     let snapshots = SnapshotRegistry()
 
     /// 書き込み系（文の実行と commit）の共有ロック。
-    /// 既にこのスレッドがロックを持っていれば何もしない（DDL の内部 commit・入れ子の commit）。
+    /// 既にこのスレッドがロックを持っていれば何もしない
+    /// （DDL の内部 commit・入れ子の commit）。
     member _.WithShared(f: unit -> 'r) =
         if gate.IsReadLockHeld || gate.IsWriteLockHeld then
             f ()
@@ -653,32 +668,3 @@ type internal RootRuntime() =
 
     member _.OldestExcept(root: string, registration: ActiveRegistration option) =
         snapshots.OldestExcept(root, registration)
-
-/// 進行中 transaction の登録の生存に結び付いたリース。
-/// <remarks>
-/// `TxnState.Lease` が持ち、接続（`Session`）が Close されずに捨てられても、
-/// GC された時点で（その登録のリースが最後の 1本なら）登録を外す。
-/// finalizer が走るのは「その接続がもう使えない」状態なので、
-/// まだ commit できる transaction を誤って解放することはない。
-/// 明示的に終わらせた場合は登録が先に外れているので何もしない（解除は冪等）。
-/// 未解放のまま GC された場合は、二度と commit できない transaction が
-/// `TransactionManager.Active` に残るため、`onAbandon` で通知する。
-/// 通知側（`DatabaseHost`）はロックを取らずにキューへ積み、次の書き込みで回収する。
-/// </remarks>
-type internal RegistrationLease(registration: ActiveRegistration, ?onAbandon: unit -> unit) =
-    /// このリースの生存トークン。
-    let token = registration.Attach()
-
-    /// 登録そのもの（`ExecState.ActiveRegistration` へ渡す）。
-    member _.Registration = registration
-
-    /// このリースの登録を外す。
-    /// 最後の 1本なら registry からも消える。二重呼び出しは無害。
-    member _.Release() =
-        RegistrationInternals.releaseLease registration token |> ignore
-
-    override _.Finalize() =
-        protect (fun () ->
-            if RegistrationInternals.releaseLease registration token then
-                onAbandon |> Option.iter (fun signal -> signal ()))
-        |> ignore
