@@ -66,7 +66,7 @@ let ``background compaction: flush 後に L0 が background で compaction さ�
             Assert.True((Version.filesAt 1 state.Version).Length > 0)
 
             let refreshed = refresh current
-            Assert.True((ok (RowStore.getAtMasked "t" (intKey 1) None [||] refreshed)).IsSome)
+            Assert.True((ok (RowStore.getAtMasked "t" (intKey 1) [||] None refreshed)).IsSome)
         finally
             RowStore.close store |> ignore)
 
@@ -273,7 +273,7 @@ let ``RowStore.scanAtRawMasked: 正常終了で ScanScope の登録が外れる`
 
             let snapStore, lease = RowStore.acquireSnapshot current
             let scope = ScanScope()
-            let scan = ok (RowStore.scanAtRawMasked "t" [||] 0 None (Some scope) [||] snapStore)
+            let scan = ok (RowStore.scanAtRawMasked "t" [||] 0 [||] None (Some scope) snapStore)
             let rows = ok (SstScan.toArray scan)
             Assert.NotEmpty rows
             Assert.Equal(0, scope.ActiveCount)
@@ -333,7 +333,7 @@ let ``background compaction: MANIFEST の結果が不明でも再読で未反映
         let refreshed = refresh reopened
 
         for i in 1..4 do
-            Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] refreshed)).IsSome)
+            Assert.True((ok (RowStore.getAtMasked "t" (intKey i) [||] None refreshed)).IsSome)
 
         let orphans = System.IO.Path.Combine(dir, ".orphans")
 
@@ -397,7 +397,7 @@ let ``background compaction: install 後に再オープンしても行が残る`
             let refreshed = refresh reopened
 
             for i in 1..4 do
-                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] refreshed)).IsSome)
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) [||] None refreshed)).IsSome)
 
             ok (RowStore.close reopened) |> ignore
         finally
@@ -435,7 +435,7 @@ let ``background compaction: close は進行中の compaction を停止して再
                 ()
 
             let reopened = ok (RowStore.openStore dir)
-            Assert.True((ok (RowStore.getAtMasked "t" (intKey 1) None [||] reopened)).IsSome)
+            Assert.True((ok (RowStore.getAtMasked "t" (intKey 1) [||] None reopened)).IsSome)
             ok (RowStore.close reopened) |> ignore
         finally
             release.Set()
@@ -518,7 +518,7 @@ let ``background compaction: 開始後に古い snapshot が現れたら境界�
             let refreshed = refresh current
 
             for i in 1..4 do
-                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] refreshed)).IsSome)
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) [||] None refreshed)).IsSome)
 
             store.Runtime.Unregister registration
         finally
@@ -549,7 +549,7 @@ let ``background compaction: Close しなくても install 済みの行は再オ
             let reopened = ok (RowStore.openStoreTakingOver dir)
 
             for i in 1..10 do
-                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] reopened)).IsSome)
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) [||] None reopened)).IsSome)
 
             ok (RowStore.close reopened) |> ignore
         finally
@@ -585,7 +585,7 @@ let ``background compaction: flush と install が競合してもファイル番
             let refreshed = refresh current
 
             for i in 1..60 do
-                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) None [||] refreshed)).IsSome)
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) [||] None refreshed)).IsSome)
         finally
             RowStore.close store |> ignore)
 
@@ -663,7 +663,7 @@ let ``background compaction: 書き込み・読み取り・snapshot pin を並�
 
                             let key = rnd.Next(1, writes + 1)
 
-                            match RowStore.getAtMasked "t" (intKey key) None [| true |] view |> ok with
+                            match RowStore.getAtMasked "t" (intKey key) [| true |] None view |> ok with
                             // まだ書かれていないキーは None でよい（書き込みと競合する）
                             | Some row -> Assert.Equal<SqlValue>(SqlValue.Int(int64 key), row.[0])
                             | None -> ()
@@ -728,7 +728,7 @@ let ``background compaction: 書き込み・読み取り・snapshot pin を並�
             let refreshed = refresh current
 
             for i in 1..writes do
-                match RowStore.getAtMasked "t" (intKey i) None [| true |] refreshed |> ok with
+                match RowStore.getAtMasked "t" (intKey i) [| true |] None refreshed |> ok with
                 | Some row -> Assert.Equal<SqlValue>(SqlValue.Int(int64 i), row.[0])
                 | None -> Assert.Fail(sprintf "キー %d が読めません" i)
         finally
@@ -798,7 +798,7 @@ let ``background compaction: ランダムな操作列でも Version と refcount
                 if written > 0 then
                     let key = rnd.Next(1, written + 1)
 
-                    match RowStore.getAtMasked "t" (intKey key) None [| true |] view |> ok with
+                    match RowStore.getAtMasked "t" (intKey key) [| true |] None view |> ok with
                     | Some row -> Assert.Equal<SqlValue>(SqlValue.Int(int64 key), row.[0])
                     | None -> Assert.False(requireHit, sprintf "キー %d が pin 済みの state から読めません" key)
 
@@ -852,7 +852,7 @@ let ``background compaction: ランダムな操作列でも Version と refcount
             let refreshed = refresh current
 
             for i in 1..written do
-                match RowStore.getAtMasked "t" (intKey i) None [| true |] refreshed |> ok with
+                match RowStore.getAtMasked "t" (intKey i) [| true |] None refreshed |> ok with
                 | Some row -> Assert.Equal<SqlValue>(SqlValue.Int(int64 i), row.[0])
                 | None -> Assert.Fail(sprintf "キー %d が読めません" i)
         finally

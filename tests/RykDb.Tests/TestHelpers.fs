@@ -208,14 +208,14 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
         member _.WalState = None
         member _.LastFlushError = None
 
-        member _.GetAtMasked visible key mask =
+        member _.GetAtMasked key mask visible =
             Memtable.getVisible key visible state.Mem
             |> Option.map (fun e ->
                 let value = e.Value |> Option.map (SqlValue.maskRow mask)
                 SstEntry.make e.Key e.SeqNo value)
             |> ret
 
-        member _.ScanAtValues visible startKey limit needsValues =
+        member _.ScanAtValues startKey limit visible needsValues =
             let entries =
                 Memtable.rangeScan startKey 0 state.Mem
                 |> Seq.filter (fun e ->
@@ -228,7 +228,7 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
                         if needsValues || e.Value.IsNone then
                             e.Value
                         else
-                            Some(Array.empty<SqlValue>)
+                            Some Array.empty<SqlValue>
 
                     SstEntry.make e.Key e.SeqNo value)
                 |> Seq.filter (fun e -> e.Value.IsSome)
@@ -237,7 +237,7 @@ type private MemoryStorageEngine(state: MemoryEngineState) =
             |> scanOfEntries
             |> ret
 
-        member _.ScanAtMasked visible startKey limit mask =
+        member _.ScanAtMasked startKey limit mask visible =
             let entries =
                 Memtable.rangeScan startKey 0 state.Mem
                 |> Seq.filter (fun e ->

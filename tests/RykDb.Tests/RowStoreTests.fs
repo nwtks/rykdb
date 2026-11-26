@@ -429,8 +429,8 @@ let ``RowStore: 複数 keyspace の書き込みは 1 回の WAL バッチで回�
 
         // close せずに開き直す（WAL だけが残ったクラッシュ状態）。
         let reopened = ok (RowStore.openStoreTakingOver dir)
-        Assert.Equal(Some(intRow 1), ok (RowStore.getAtMasked "t:a" (intKey 1) None [| true |] reopened))
-        Assert.Equal(Some(intRow 2), ok (RowStore.getAtMasked "t:b" (intKey 2) None [| true |] reopened))
+        Assert.Equal(Some(intRow 1), ok (RowStore.getAtMasked "t:a" (intKey 1) [| true |] None reopened))
+        Assert.Equal(Some(intRow 2), ok (RowStore.getAtMasked "t:b" (intKey 2) [| true |] None reopened))
 
         ok (RowStore.close reopened)
         ok (RowStore.close store))

@@ -259,11 +259,11 @@ module internal Engine =
 
         match method with
         | ScanMethod.SeqScan ->
-            Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn mask
+            Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 mask ctx.Visible (Some ctx.Scope) ctx.Txn
         | ScanMethod.PkLookup values ->
             result {
                 let! row =
-                    Dml.getByPrimaryKeyWithTxnMask ctx.Store schema values ctx.Visible ctx.Txn mask
+                    Dml.getByPrimaryKeyWithTxnMask ctx.Store schema values mask ctx.Visible ctx.Txn
 
                 match row with
                 | Some r -> return Op.ofRow r
@@ -276,10 +276,10 @@ module internal Engine =
                 startKey
                 endKey
                 0
+                mask
                 ctx.Visible
                 (Some ctx.Scope)
                 ctx.Txn
-                mask
         | ScanMethod.IndexLookup(indexName, values) ->
             indexCandidateScan ctx schema.Name mask indexName (fun scanMask ->
                 ExecContext.byIndexMasked ctx schema.Name indexName values 0 scanMask)

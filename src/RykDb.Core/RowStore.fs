@@ -231,7 +231,7 @@ module internal RowStore =
             })
 
     /// keyspace から列マスク付きで読む（SeqNo 制限つき）。
-    let getAtMasked (keyspace: string) (key: byte array) (visible: uint64 option) (mask: bool array) (store: RowStore) =
+    let getAtMasked (keyspace: string) (key: byte array) (mask: bool array) (visible: uint64 option) (store: RowStore) =
         let lease =
             match store.Host with
             | Some host -> Some(host.AcquireVersion store.Engine.PublishedState.Version)
@@ -240,7 +240,7 @@ module internal RowStore =
         try
             result {
                 let! e = ensure store
-                let! sst = e.GetAtMasked visible (Keyspace.prefixedKey keyspace key) mask
+                let! sst = e.GetAtMasked (Keyspace.prefixedKey keyspace key) mask visible
                 return Option.bind _.Value sst
             }
         finally
@@ -301,7 +301,7 @@ module internal RowStore =
             let! e = ensure store
 
             let! scan =
-                e.ScanAtValues visible (Keyspace.prefixedKey keyspace startKey) limit needsValues
+                e.ScanAtValues (Keyspace.prefixedKey keyspace startKey) limit visible needsValues
 
             return scanWithinPrefix prefix scan
         }
@@ -312,9 +312,9 @@ module internal RowStore =
         (keyspace: string)
         (startKey: byte array)
         (limit: int)
+        (mask: bool array)
         (visible: uint64 option)
         (scope: ScanScope option)
-        (mask: bool array)
         (store: RowStore)
         =
         let prefix = Keyspace.prefix keyspace
@@ -323,7 +323,7 @@ module internal RowStore =
             let! e = ensure store
 
             let! scan =
-                e.ScanAtMasked visible (Keyspace.prefixedKey keyspace startKey) limit mask
+                e.ScanAtMasked (Keyspace.prefixedKey keyspace startKey) limit mask visible
 
             return scanWithinPrefix prefix scan
         }
@@ -341,7 +341,7 @@ module internal RowStore =
     /// keyspace をキーだけ走査する（値は復号しない）。
     /// 削除・後始末など、キーしか使わない処理向け。
     let scanKeys (keyspace: string) (startKey: byte array) (limit: int) (store: RowStore) =
-        scanAtRawMasked keyspace startKey limit None None [||] store
+        scanAtRawMasked keyspace startKey limit [||] None None store
         |> Result.map (SstScan.filter (fun e -> e.Value.IsSome))
 
     /// 走査から最大 n 個のキーを集める（末尾再帰）。

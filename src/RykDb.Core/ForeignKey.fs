@@ -254,7 +254,7 @@ module internal ForeignKey =
                     let! key = KeyBuilder.ofValues values
 
                     let! found =
-                        Dml.getByPrimaryKeyBytesWithTxnMask store check.Parent key visible txn check.ProbeMask
+                        Dml.getByPrimaryKeyBytesWithTxnMask store check.Parent key check.ProbeMask visible txn
 
                     if found.IsSome then
                         return ()
@@ -367,10 +367,10 @@ module internal ForeignKey =
                         idx
                         values
                         1
+                        check.ProbeMask
                         visible
                         (Some scope)
                         txn
-                        check.ProbeMask
 
                 return! anyRow (fun _ -> DbOk true) op
             | None ->
@@ -382,15 +382,15 @@ module internal ForeignKey =
                             values
                             (Some values)
                             1
+                            check.ProbeMask
                             visible
                             (Some scope)
                             txn
-                            check.ProbeMask
 
                     return! anyRow (fun _ -> DbOk true) op
                 else
                     let! op =
-                        Dml.scanByPrimaryKeyWithTxnMask store check.Child 0 visible (Some scope) txn check.ScanMask
+                        Dml.scanByPrimaryKeyWithTxnMask store check.Child 0 check.ScanMask visible (Some scope) txn
 
                     return! anyRow (fun row -> DbOk(rowMatches check.ChildPositions values row)) op
         }

@@ -153,10 +153,10 @@ module internal DmlOps =
                         idx
                         values
                         1
+                        pkMask
                         ctx.Visible
                         (Some ctx.Scope)
                         txn
-                        pkMask
                 with
                 | Ok scan ->
                     match Op.toArray scan with
@@ -185,7 +185,7 @@ module internal DmlOps =
 
         KeyBuilder.ofValues pk
         >>= fun pkBytes ->
-            match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes ctx.Visible txn existsMask with
+            match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes existsMask ctx.Visible txn with
             | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
             | Ok None ->
                 checkUniqueIndexes ctx schema txn row pkMask pk pkBytes (schema.Indexes |> List.filter _.Unique)
@@ -352,7 +352,7 @@ module internal DmlOps =
         =
         result {
             let! scan =
-                Dml.scanByIndexPrefixWithTxnMask ctx.Store schema idx values 0 ctx.Visible (Some ctx.Scope) txn pkMask
+                Dml.scanByIndexPrefixWithTxnMask ctx.Store schema idx values 0 pkMask ctx.Visible (Some ctx.Scope) txn
 
             let! rows = Op.toArray scan
 

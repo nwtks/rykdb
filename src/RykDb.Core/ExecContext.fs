@@ -105,7 +105,7 @@ module internal ExecContext =
     let tableMasked (ctx: ExecContext) (table: string) (limit: int) (mask: bool array) =
         result {
             let! schema = schemaOf table ctx
-            return! Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema limit ctx.Visible (Some ctx.Scope) ctx.Txn mask
+            return! Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema limit mask ctx.Visible (Some ctx.Scope) ctx.Txn
         }
 
     /// 主キーの範囲走査（列マスク付き）。
@@ -127,10 +127,10 @@ module internal ExecContext =
                     startKey
                     endKey
                     limit
+                    mask
                     ctx.Visible
                     (Some ctx.Scope)
                     ctx.Txn
-                    mask
         }
 
     /// 索引で一致する全行を引く（列マスク付き）。
@@ -155,10 +155,10 @@ module internal ExecContext =
                         idx
                         keyValues
                         limit
+                        mask
                         ctx.Visible
                         (Some ctx.Scope)
                         ctx.Txn
-                        mask
         }
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く（列マスク付き）。
@@ -185,10 +185,10 @@ module internal ExecContext =
                         lower
                         upper
                         limit
+                        mask
                         ctx.Visible
                         (Some ctx.Scope)
                         ctx.Txn
-                        mask
         }
 
     /// 索引スキャン用の mask を計算する。
@@ -222,7 +222,7 @@ module internal ExecContext =
         else
             KeyBuilder.ofValues pk
             >>= fun keyBytes ->
-                Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema keyBytes ctx.Visible ctx.Txn fetchMask
+                Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema keyBytes fetchMask ctx.Visible ctx.Txn
                 |> Result.map (
                     Option.map (fun fetched ->
                         Array.init schema.Columns.Length (fun i ->
@@ -274,7 +274,7 @@ module internal ExecContext =
             let! schema = schemaOf table ctx
 
             let! row =
-                Dml.getByPrimaryKeyWithTxnMask ctx.Store schema key ctx.Visible ctx.Txn mask
+                Dml.getByPrimaryKeyWithTxnMask ctx.Store schema key mask ctx.Visible ctx.Txn
 
             match row with
             | None -> return Op.Empty

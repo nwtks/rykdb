@@ -49,7 +49,7 @@ let private col (name: string) =
 
 let private update (ctx: ExecContext) (schema: TableSchema) (assignments: (string * Expr) list) (where: Expr option) =
     DmlOps.updateWith
-        (fun mask -> Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn mask)
+        (fun mask -> Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 mask ctx.Visible (Some ctx.Scope) ctx.Txn)
         ctx
         schema
         assignments
@@ -57,7 +57,7 @@ let private update (ctx: ExecContext) (schema: TableSchema) (assignments: (strin
 
 let private delete (ctx: ExecContext) (schema: TableSchema) (where: Expr option) =
     DmlOps.deleteWith
-        (fun mask -> Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 ctx.Visible (Some ctx.Scope) ctx.Txn mask)
+        (fun mask -> Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 mask ctx.Visible (Some ctx.Scope) ctx.Txn)
         ctx
         schema
         where

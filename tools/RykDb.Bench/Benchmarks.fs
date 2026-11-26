@@ -812,8 +812,8 @@ type StorageBenchmarks() =
         let opened = RowStore.writeBatches [ ("t", entries ()) ] opened |> Check.ok
         RowStore.close opened |> Check.ok
         store <- RowStore.openStoreWithOptions RowStoreOptions.Background root |> Check.ok
-        let byStore = RowStore.getAtMasked "t" key None mask store |> Check.ok
-        let byEngine = store.Engine.GetAtMasked None physicalKey mask |> Check.ok
+        let byStore = RowStore.getAtMasked "t" key mask None store |> Check.ok
+        let byEngine = store.Engine.GetAtMasked physicalKey mask None |> Check.ok
 
         if byStore.IsNone || byEngine.IsNone then
             failwithf "StorageBenchmarks のポイント検索が 1行を返しません（store=%A engine=%A）" byStore byEngine
@@ -831,9 +831,9 @@ type StorageBenchmarks() =
     /// 公開経路（`RowStore`）。Version lease の取得と解放を含む。
     [<Benchmark>]
     member _.RowStorePointLookup() =
-        (RowStore.getAtMasked "t" key None mask store |> Check.ok).IsSome
+        (RowStore.getAtMasked "t" key mask None store |> Check.ok).IsSome
 
     /// エンジン直（`IStorageEngine.GetAtMasked`）。Version lease を含まない。
     [<Benchmark>]
     member _.EnginePointLookup() =
-        (store.Engine.GetAtMasked None physicalKey mask |> Check.ok).IsSome
+        (store.Engine.GetAtMasked physicalKey mask None |> Check.ok).IsSome

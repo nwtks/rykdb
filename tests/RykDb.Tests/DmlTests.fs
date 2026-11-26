@@ -162,10 +162,10 @@ let ``Dml.scanByPrimaryKeyRange: 上限を超える行と範囲外の書き込�
                 [| SqlValue.Int 2L |]
                 (Some [| SqlValue.Int 4L |])
                 0
+                (allTrue usersWithEmailIndex)
                 None
                 None
                 txn1
-                (allTrue usersWithEmailIndex)
             |> ok
             |> Op.toArray
             |> ok
@@ -220,10 +220,10 @@ let ``Dml.scanByIndexPrefix: 索引キーから索引列と主キーを復元す
                 emailIndex
                 [| SqlValue.Text "b@example.com" |]
                 0
+                (allTrue usersWithEmailIndex)
                 None
                 None
                 emptyTxn
-                (allTrue usersWithEmailIndex)
             |> ok
             |> Op.toArray
             |> ok
@@ -248,10 +248,10 @@ let ``Dml.scanByIndexPrefix: マスクした列は Unloaded になる`` () =
                 emailIndex
                 [| SqlValue.Text "a@example.com" |]
                 0
+                [| false; true; false |]
                 None
                 None
                 emptyTxn
-                [| false; true; false |]
             |> ok
             |> Op.toArray
             |> ok
@@ -275,10 +275,10 @@ let ``Dml.scanByIndexPrefix: transaction の索引書き込みもキーで overl
                 emailIndex
                 [| SqlValue.Text "a@example.com" |]
                 0
+                (allTrue usersWithEmailIndex)
                 None
                 None
                 txn
-                (allTrue usersWithEmailIndex)
             |> ok
             |> Op.toArray
             |> ok
@@ -306,10 +306,10 @@ let ``Dml.scanByIndexPrefix: store のキーより前の書き込みを先に返
                 ageIndex
                 [| SqlValue.Int 15L |]
                 0
+                (allTrue usersWithAgeIndex)
                 None
                 None
                 txn1
-                (allTrue usersWithAgeIndex)
             |> ok
             |> Op.toArray
             |> ok
@@ -344,10 +344,10 @@ let ``Dml.scanByIndexRange: transaction の索引書き込みを store のキー
                 [| SqlValue.Int 10L |]
                 (Some [| SqlValue.Int 30L |])
                 0
+                (allTrue usersWithAgeIndex)
                 None
                 None
                 txn1
-                (allTrue usersWithAgeIndex)
             |> ok
             |> Op.toArray
             |> ok
@@ -388,10 +388,10 @@ let ``Dml.scanByIndexRange: 削除した行の索引エントリを残さずに 
                 [| SqlValue.Int 10L |]
                 (Some [| SqlValue.Int 30L |])
                 0
+                (allTrue usersWithAgeIndex)
                 None
                 None
                 txn2
-                (allTrue usersWithAgeIndex)
             |> ok
             |> Op.toArray
             |> ok

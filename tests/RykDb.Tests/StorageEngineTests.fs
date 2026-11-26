@@ -133,11 +133,11 @@ let ``StorageEngine: 走査は tombstone を返さず、ポイント検索は削
                 | Some e -> Assert.True(e.Value.IsNone, sprintf "tombstone ではなく値が返りました: %A" e.Key)
                 | None -> Assert.Fail "エンジンは tombstone を Value = None で返すはず"
 
-            Assert.Equal<byte array list>([ intKey 1 ], keysOf (StorageEngine.scanAtValues None 0 [||] true engine))
+            Assert.Equal<byte array list>([ intKey 1 ], keysOf (StorageEngine.scanAtValues [||] 0 None true engine))
 
             Assert.Equal<byte array list>(
                 [ intKey 1 ],
-                keysOf (StorageEngine.scanAtMasked None 0 [||] [| true |] engine)
+                keysOf (StorageEngine.scanAtMasked [||] 0 [| true |] None engine)
             )
 
             expectTombstone (intKey 2) engine
@@ -163,7 +163,7 @@ let ``StorageEngine: 走査は tombstone を返さず、ポイント検索は削
 
             Assert.Equal<byte array list>(
                 [ intKey 1; intKey 4 ],
-                keysOf (StorageEngine.scanAtValues None 0 [||] true engine)
+                keysOf (StorageEngine.scanAtValues [||] 0 None true engine)
             )
 
             expectTombstone (intKey 3) engine
@@ -219,7 +219,7 @@ let ``StorageEngine.scanAtValues: 多数のファイルをキー昇順にマー�
                 }
 
             let got =
-                ok (StorageEngine.scanAtValues None 0 [||] true engine) |> SstScan.toArray |> ok
+                ok (StorageEngine.scanAtValues [||] 0 None true engine) |> SstScan.toArray |> ok
 
             let expected = [ 2..2..64 ] @ [ 102..2..164 ]
             Assert.Equal(expected.Length, got.Length)
@@ -243,7 +243,7 @@ let ``StorageEngine.scanAtMasked: memtable が空でも SSTable だけを走査�
                 }
 
             let got =
-                ok (StorageEngine.scanAtMasked None 0 [||] [| true |] engine)
+                ok (StorageEngine.scanAtMasked [||] 0 [| true |] None engine)
                 |> SstScan.toArray
                 |> ok
 
@@ -268,20 +268,20 @@ let ``StorageEngine.scanAtMasked: 先頭 1 件だけなら全件を実体化し�
 
             // SstReadInfo の読み込みを先に済ませる（計測から index/Bloom の解析を除く）。
             let all =
-                ok (StorageEngine.scanAtMasked None 0 [||] [||] engine) |> SstScan.toArray |> ok
+                ok (StorageEngine.scanAtMasked [||] 0 [||] None engine) |> SstScan.toArray |> ok
 
             Assert.Equal<int>(2000, all.Length)
 
             let before = System.GC.GetAllocatedBytesForCurrentThread()
 
             let first =
-                ok (StorageEngine.scanAtMasked None 1 [||] [||] engine) |> SstScan.toArray |> ok
+                ok (StorageEngine.scanAtMasked [||] 1 [||] None engine) |> SstScan.toArray |> ok
 
             let firstBytes = System.GC.GetAllocatedBytesForCurrentThread() - before
             let fullBefore = System.GC.GetAllocatedBytesForCurrentThread()
 
             let full =
-                ok (StorageEngine.scanAtMasked None 0 [||] [||] engine) |> SstScan.toArray |> ok
+                ok (StorageEngine.scanAtMasked [||] 0 [||] None engine) |> SstScan.toArray |> ok
 
             let fullBytes = System.GC.GetAllocatedBytesForCurrentThread() - fullBefore
             Assert.Equal<int>(1, first.Length)
@@ -305,7 +305,7 @@ let ``StorageEngine.scanAtMasked: limit 1 は後続の壊れたファイルを�
 
             // 先頭 1行はファイル 10 だけで足りる。ファイル 11 の下限はキー 3 なので開かない。
             let scanned =
-                ok (StorageEngine.scanAtMasked None 1 (intKey 1) [| true |] engine)
+                ok (StorageEngine.scanAtMasked (intKey 1) 1 [| true |] None engine)
                 |> SstScan.toArray
                 |> ok
 
@@ -316,7 +316,7 @@ let ``StorageEngine.scanAtMasked: limit 1 は後続の壊れたファイルを�
             expectErrorKind
                 ErrorKind.CorruptionError
                 "必要なファイルの破損は検出する"
-                (ok (StorageEngine.scanAtMasked None 10 (intKey 1) [| true |] engine)
+                (ok (StorageEngine.scanAtMasked (intKey 1) 10 [| true |] None engine)
                  |> SstScan.toArray)))
 
 [<Fact>]
@@ -335,7 +335,7 @@ let ``StorageEngine.scanAtMasked: 制限なしの走査も読んだ時点で破�
             expectErrorKind
                 ErrorKind.CorruptionError
                 "制限なしの走査は壊れたファイルを検出する"
-                (ok (StorageEngine.scanAtMasked None 0 [||] [||] engine) |> SstScan.toArray)))
+                (ok (StorageEngine.scanAtMasked [||] 0 [||] None engine) |> SstScan.toArray)))
 
 [<Fact>]
 let ``StorageEngine.scanAtMasked: 欠落ファイルは必要になった時点で検出する`` () =
@@ -351,7 +351,7 @@ let ``StorageEngine.scanAtMasked: 欠落ファイルは必要になった時点�
 
             // limit 1 はファイル 11 を必要としないので、欠落していても先頭 1 行は返せる。
             let scanned =
-                ok (StorageEngine.scanAtMasked None 1 (intKey 1) [||] engine)
+                ok (StorageEngine.scanAtMasked (intKey 1) 1 [||] None engine)
                 |> SstScan.toArray
                 |> ok
 
@@ -360,7 +360,7 @@ let ``StorageEngine.scanAtMasked: 欠落ファイルは必要になった時点�
             expectErrorKind
                 ErrorKind.IoError
                 "欠落ファイルは必要になれば検出する"
-                (ok (StorageEngine.scanAtMasked None 10 (intKey 1) [||] engine)
+                (ok (StorageEngine.scanAtMasked (intKey 1) 10 [||] None engine)
                  |> SstScan.toArray)))
 
 [<Fact>]
@@ -396,14 +396,14 @@ let ``StorageEngine.getAtMasked / scanAtMasked: 必要なブロックだけを�
                 (StorageEngine.getAtMasked (intKey 200) [||] None engine)
             // limit 5 はブロック 0 だけで足りる
             let five =
-                ok (StorageEngine.scanAtMasked None 5 [||] [||] engine) |> SstScan.toArray |> ok
+                ok (StorageEngine.scanAtMasked [||] 5 [||] None engine) |> SstScan.toArray |> ok
 
             Assert.Equal<int>(5, five.Length)
             // 全件走査は壊れたブロックのチェックサムで検出する
             expectErrorKind
                 ErrorKind.CorruptionError
                 "全件走査は壊れたブロックを検出する"
-                (ok (StorageEngine.scanAtMasked None 0 [||] [||] engine) |> SstScan.toArray)))
+                (ok (StorageEngine.scanAtMasked [||] 0 [||] None engine) |> SstScan.toArray)))
 
 [<Fact>]
 let ``StorageEngine.maybeFlush: flush 後に compaction が不要なら compactOnce は noop で返す`` () =
@@ -495,7 +495,7 @@ let ``DiskStorageEngine.MaybeFlush: wrapper 経由でも上限超過を flush �
         let disk = ok (disk.WriteBatch [| Entry.put (intKey 1) 1UL (intRow 1) |])
         let disk, _ = ok (disk.MaybeFlush())
         Assert.NotEmpty(System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension))
-        Assert.True((ok (disk.GetAtMasked None (intKey 1) [||])).IsSome))
+        Assert.True((ok (disk.GetAtMasked (intKey 1) [||] None)).IsSome))
 
 [<Fact>]
 let ``StorageEngine.openDatabaseWith: MANIFEST が参照する SSTable が無ければ CorruptionError`` () =

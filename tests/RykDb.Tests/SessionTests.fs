@@ -60,17 +60,17 @@ type private GatedEngine(gates: EngineGates, inner: IStorageEngine) =
         member _.PublishedState = inner.PublishedState
         member _.WalState = inner.WalState
         member _.LastFlushError = inner.LastFlushError
-        member _.GetAtMasked visible key mask = inner.GetAtMasked visible key mask
+        member _.GetAtMasked key mask visible = inner.GetAtMasked key mask visible
 
-        member _.ScanAtValues visible startKey limit needsValues =
+        member _.ScanAtValues startKey limit visible needsValues =
             gates.ScanEntered.Set()
             gates.WaitScan()
-            inner.ScanAtValues visible startKey limit needsValues
+            inner.ScanAtValues startKey limit visible needsValues
 
-        member _.ScanAtMasked visible startKey limit mask =
+        member _.ScanAtMasked startKey limit mask visible =
             gates.ScanEntered.Set()
             gates.WaitScan()
-            inner.ScanAtMasked visible startKey limit mask
+            inner.ScanAtMasked startKey limit mask visible
 
         member _.WriteBatch entries =
             gates.WriteEntered.Set()

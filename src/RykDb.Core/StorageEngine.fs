@@ -41,15 +41,15 @@ type internal IStorageEngine =
 
     /// 列マスクに従って必要な列だけ復号して 1行を引く。
     abstract GetAtMasked:
-        visible: uint64 option -> key: byte array -> mask: bool array -> Result<SstEntry option, DbError>
+        key: byte array -> mask: bool array -> visible: uint64 option -> Result<SstEntry option, DbError>
 
     /// 行の値が必要ないときは `needsValues = false`（値を作らず空の行を返す）。
     abstract ScanAtValues:
-        visible: uint64 option -> startKey: byte array -> limit: int -> needsValues: bool -> Result<SstScan, DbError>
+        startKey: byte array -> limit: int -> visible: uint64 option -> needsValues: bool -> Result<SstScan, DbError>
 
     /// 列マスクに従って必要な列だけ復号する。
     abstract ScanAtMasked:
-        visible: uint64 option -> startKey: byte array -> limit: int -> mask: bool array -> Result<SstScan, DbError>
+        startKey: byte array -> limit: int -> mask: bool array -> visible: uint64 option -> Result<SstScan, DbError>
 
     abstract WriteBatch: entries: Entry array -> Result<IStorageEngine, DbError>
     /// WAL 追記のみ行い、fsync は呼び出し側に任せる。
@@ -121,83 +121,15 @@ module internal StorageEngine =
         | Some info -> ret info
         | None -> SstableReader.openPartial (FileMetaData.path dir f.FileNumber)
 
-    /// ファイルの読み取り用メタデータを引く。
-    let private readInfoIn (f: FileMetaData) (engine: StorageEngine) = readInfoOf engine.Dir f
-
-    /// 行の列挙子から遅延走査を作る（終端で列挙子を閉じる）。
-    [<TailCall>]
-    let rec private pullFromEnumerator (e: System.Collections.Generic.IEnumerator<SstEntry>) () =
-        if e.MoveNext() then
-            SstScan.emit (pullFromEnumerator e) e.Current
-        else
-            (e :> System.IDisposable).Dispose() |> ignore
-            SstScan.Empty
-
-    /// 行列を SstScan に変換する。
-    let private seqToScan (rows: SstEntry seq) =
-        let e = rows.GetEnumerator()
-        pullFromEnumerator e ()
-
-    /// ファイルの走査開始キーを、要求キーとの大きい方に取る。
-    let private sourceBound (startKey: byte array) (f: FileMetaData) =
-        if Bytes.compare f.Smallest startKey > 0 then
-            f.Smallest
-        else
-            startKey
-
-    /// 未オープンのファイルを開き、先頭 1件をマージへ登録する。
-    let private openPending
-        (engine: StorageEngine)
-        (maskOpt: bool array option)
-        (startKey: byte array)
-        (index: int)
-        (f: FileMetaData)
-        (merge: SstMerge)
-        =
-        readInfoIn f engine
-        >>= fun info ->
-            match maskOpt with
-            | None -> SstableReader.rangeScanPartial startKey 0 info
-            | Some mask when mask.Length = 0 -> SstableReader.rangeScanPartialSkipped startKey 0 info
-            | Some mask -> SstableReader.rangeScanPartialMasked mask startKey 0 info
-            |> ret
-            >>= fun scan ->
-                match SstScan.next scan with
-                | Ok None -> ret merge
-                | Ok(Some(e, nxt)) -> ret (SstMerge.insert index e nxt merge)
-                | Error e -> err e
-
-    /// 現在の最上位より小さいキー範囲のファイルを先に開く。
-    [<TailCall>]
-    let rec private prepareScan
-        (engine: StorageEngine)
-        (maskOpt: bool array option)
-        (startKey: byte array)
-        (pending: (int * byte array * FileMetaData) list)
-        (merge: SstMerge)
-        =
-        match pending with
-        | [] -> ret (merge, [])
-        | (index, bound, f) :: rest ->
-            match SstMerge.top merge with
-            | Some top when Bytes.compare bound top.Key > 0 -> ret (merge, pending)
-            | _ ->
-                match openPending engine maskOpt startKey index f merge with
-                | Ok merge' -> prepareScan engine maskOpt startKey rest merge'
-                | Error e -> err e
-
-    /// snapshot に対して可視かどうかを判定する。
-    let private isVisibleEntry (visible: uint64 option) (e: SstEntry) =
-        match visible with
-        | Some s -> e.SeqNo <= s
-        | None -> true
-
     /// バックグラウンド compaction 用の走査。
     /// ファイルの先頭から全件を遅延して読む。
     /// compaction はキー・SeqNo・削除タグしか見ないので、値は復号せずスライスのまま渡す。
     let openScan (dir: string) (f: FileMetaData) =
         readInfoOf dir f
         >>= fun info -> ret (SstableReader.rangeScanPartialRaw [||] 0 info)
+
+    /// ファイルの読み取り用メタデータを引く。
+    let private readInfoIn (f: FileMetaData) (engine: StorageEngine) = readInfoOf engine.Dir f
 
     /// 列マスク付きポイントルックアップのファイル走査本体。
     [<TailCall>]
@@ -228,6 +160,72 @@ module internal StorageEngine =
             Version.filesForPointLookup key engine.Version
             |> probeAtMasked key mask visible engine
 
+    /// ファイルの走査開始キーを、要求キーとの大きい方に取る。
+    let private sourceBound (startKey: byte array) (f: FileMetaData) =
+        if Bytes.compare f.Smallest startKey > 0 then
+            f.Smallest
+        else
+            startKey
+
+    /// 行の列挙子から遅延走査を作る（終端で列挙子を閉じる）。
+    [<TailCall>]
+    let rec private pullFromEnumerator (e: System.Collections.Generic.IEnumerator<SstEntry>) =
+        if e.MoveNext() then
+            SstScan.emit (fun () -> pullFromEnumerator e) e.Current
+        else
+            (e :> System.IDisposable).Dispose() |> ignore
+            SstScan.Empty
+
+    /// 行列を SstScan に変換する。
+    let private seqToScan (rows: SstEntry seq) =
+        rows.GetEnumerator() |> pullFromEnumerator
+
+    /// 未オープンのファイルを開き、先頭 1件をマージへ登録する。
+    let private openPending
+        (startKey: byte array)
+        (maskOpt: bool array option)
+        (engine: StorageEngine)
+        (index: int)
+        (f: FileMetaData)
+        (merge: SstMerge)
+        =
+        readInfoIn f engine
+        >>= fun info ->
+            match maskOpt with
+            | None -> SstableReader.rangeScanPartial startKey 0 info
+            | Some mask when mask.Length = 0 -> SstableReader.rangeScanPartialSkipped startKey 0 info
+            | Some mask -> SstableReader.rangeScanPartialMasked mask startKey 0 info
+            |> ret
+            >>= fun scan ->
+                match SstScan.next scan with
+                | Ok None -> ret merge
+                | Ok(Some(e, nxt)) -> ret (SstMerge.insert index e nxt merge)
+                | Error e -> err e
+
+    /// 現在の最上位より小さいキー範囲のファイルを先に開く。
+    [<TailCall>]
+    let rec private prepareScan
+        (startKey: byte array)
+        (maskOpt: bool array option)
+        (engine: StorageEngine)
+        (merge: SstMerge)
+        =
+        function
+        | [] -> ret (merge, [])
+        | (index, bound, f) :: rest as pending ->
+            match SstMerge.top merge with
+            | Some top when Bytes.compare bound top.Key > 0 -> ret (merge, pending)
+            | _ ->
+                match openPending startKey maskOpt engine index f merge with
+                | Ok merge' -> prepareScan startKey maskOpt engine merge' rest
+                | Error e -> err e
+
+    /// snapshot に対して可視かどうかを判定する。
+    let private isVisibleEntry (visible: uint64 option) (e: SstEntry) =
+        match visible with
+        | Some s -> e.SeqNo <= s
+        | None -> true
+
     /// 遅延走査の状態。
     /// `next` を呼ぶたびに、未オープンのファイルを必要な分だけ開き、
     /// マージから可視・最新・非 tombstone の 1件を取り出す。
@@ -248,17 +246,17 @@ module internal StorageEngine =
 
     /// マージから可視・最新・非 tombstone の 1件を取り出す。
     let rec private stepScanState
+        (startKey: byte array)
         (limit: int)
+        (maskOpt: bool array option)
         (visible: uint64 option)
         (engine: StorageEngine)
-        (maskOpt: bool array option)
-        (startKey: byte array)
         (state: ScanState)
         =
         if limit > 0 && state.Count >= limit then
             ret None
         else
-            match prepareScan engine maskOpt startKey state.Pending state.Merge with
+            match prepareScan startKey maskOpt engine state.Merge state.Pending with
             | Ok(ready, remaining) ->
                 match SstMerge.next ready with
                 | Ok None -> ret None
@@ -273,7 +271,7 @@ module internal StorageEngine =
                             Pending = remaining
                             Merge = merge'
                         }
-                        |> stepScanState limit visible engine maskOpt startKey
+                        |> stepScanState startKey limit maskOpt visible engine
                     else
                         let appended = e.Value.IsSome
 
@@ -290,12 +288,12 @@ module internal StorageEngine =
                                 e,
                                 SstScan.ofState
                                     advanced
-                                    (stepScanState limit visible engine maskOpt startKey)
+                                    (stepScanState startKey limit maskOpt visible engine)
                                     closeScanState
                             )
                             |> ret
                         else
-                            stepScanState limit visible engine maskOpt startKey advanced
+                            stepScanState startKey limit maskOpt visible engine advanced
                 | Error e -> err e
             | Error e -> err e
 
@@ -310,10 +308,10 @@ module internal StorageEngine =
     /// （行ごとにソース列から作り直すと O(行数 × ファイル数 log ファイル数) になる）。
     /// マージとヒープは `SstMerge`（SstScan.fs）に集約する。
     let private scanAtWith
-        (visible: uint64 option)
-        (limit: int)
         (startKey: byte array)
+        (limit: int)
         (maskOpt: bool array option)
+        (visible: uint64 option)
         (engine: StorageEngine)
         =
         let pendingFiles =
@@ -342,7 +340,7 @@ module internal StorageEngine =
                     EmittedKey = None
                     Count = 0
                 }
-                (stepScanState limit visible engine maskOpt startKey)
+                (stepScanState startKey limit maskOpt visible engine)
                 closeScanState
             |> ret
         | Ok(Some(e, nxt)) ->
@@ -353,33 +351,20 @@ module internal StorageEngine =
                     EmittedKey = None
                     Count = 0
                 }
-                (stepScanState limit visible engine maskOpt startKey)
+                (stepScanState startKey limit maskOpt visible engine)
                 closeScanState
             |> ret
         | Error e -> err e
 
     /// 範囲ルックアップ（`needsValues = true` なら値を復号し、false なら空の行を返す）。
-    let scanAtValues
-        (visible: uint64 option)
-        (limit: int)
-        (startKey: byte array)
-        (needsValues: bool)
-        (engine: StorageEngine)
-        =
-        scanAtWith visible limit startKey (if needsValues then None else Some [||]) engine
+    let scanAtValues (startKey: byte array) (limit: int) (visible: uint64 option) (needsValues: bool) =
+        scanAtWith startKey limit (if needsValues then None else Some [||]) visible
 
     /// 範囲ルックアップ（列マスクに従って必要な列だけ復号する）。
-    let scanAtMasked
-        (visible: uint64 option)
-        (limit: int)
-        (startKey: byte array)
-        (mask: bool array)
-        (engine: StorageEngine)
-        =
-        scanAtWith visible limit startKey (Some mask) engine
+    let scanAtMasked (startKey: byte array) (limit: int) (mask: bool array) = scanAtWith startKey limit (Some mask)
 
     /// WAL と memtable の反映結果を新しい engine にまとめる。
-    let private applyBatch (entries: Entry array) (engine: StorageEngine) (wal: WalState) (txnId: TxnId) =
+    let private applyBatch (wal: WalState) (txnId: TxnId) (entries: Entry array) (engine: StorageEngine) =
         let mem = Memtable.apply entries engine.Mem
         let nextTxnId = txnId + 1UL<txnId>
 
@@ -410,7 +395,7 @@ module internal StorageEngine =
                     else
                         Wal.appendDeferred engine.Dir records engine.Wal
 
-                return applyBatch entries engine wal txnId
+                return applyBatch wal txnId entries engine
             })
 
     /// バッチを WAL へ追記して fsync まで行う。
@@ -419,8 +404,17 @@ module internal StorageEngine =
     /// WAL への追記だけ行い、fsync は Session のグループコミットに任せる。
     let writeBatchDeferred = writeBatchCore false
 
+    /// ファイル番号の下限を進めた engine を返す。
+    let private bumpNextFileNumber (fileNumber: FileNumber) (engine: StorageEngine) =
+        { engine with
+            Version =
+                { engine.Version with
+                    NextFileNumber = max engine.Version.NextFileNumber (fileNumber + 1L)
+                }
+        }
+
     /// WAL を同期して古い WAL を削除し、次の WAL へ切り替える。
-    let private rotateWal (engine: StorageEngine) (next: WalState) =
+    let private rotateWal (next: WalState) (engine: StorageEngine) =
         result {
             do! Wal.sync engine.Dir engine.Wal
             let! stale = Wal.walFiles engine.Dir
@@ -436,9 +430,9 @@ module internal StorageEngine =
         }
 
     /// MANIFEST 反映後の Version を受け取り、WAL を切り替えて flush 後の engine を作る。
-    let private finishFlush (engine: StorageEngine) (version: Version) (manifestNumber: ManifestNumber) =
+    let private finishFlush (version: Version) (manifestNumber: ManifestNumber) (engine: StorageEngine) =
         result {
-            let! rotated = Wal.rotate engine.Wal |> rotateWal engine
+            let! rotated = rotateWal (Wal.rotate engine.Wal) engine
 
             return
                 { rotated with
@@ -448,15 +442,6 @@ module internal StorageEngine =
                         }
                     ManifestNumber = manifestNumber
                     Mem = Memtable.Empty
-                }
-        }
-
-    /// ファイル番号の下限を進めた engine を返す。
-    let private bumpNextFileNumber (engine: StorageEngine) (fileNumber: FileNumber) =
-        { engine with
-            Version =
-                { engine.Version with
-                    NextFileNumber = max engine.Version.NextFileNumber (fileNumber + 1L)
                 }
         }
 
@@ -472,7 +457,7 @@ module internal StorageEngine =
             Ok engine
         else
             let fileNumber = engine.Version.NextFileNumber
-            let bumped = bumpNextFileNumber engine fileNumber
+            let bumped = bumpNextFileNumber fileNumber engine
 
             match
                 Memtable.rangeScan [||] 0 engine.Mem
@@ -486,7 +471,7 @@ module internal StorageEngine =
                     |> Manifest.logAndApplyWithOutcome engine.Dir engine.ManifestNumber engine.Version
                 with
                 | ManifestApplyResult.Applied(version, manifestNumber) ->
-                    match finishFlush engine version manifestNumber with
+                    match finishFlush version manifestNumber engine with
                     | Ok flushed -> Ok flushed
                     | Error e ->
                         let applied =
@@ -559,10 +544,10 @@ module internal StorageEngine =
 
     /// compaction 結果を反映した engine を組み立てる。
     let private buildCompacted
-        (engine: StorageEngine)
         (version: Version)
         (manifestNumber: ManifestNumber)
         (result: CompactionResult)
+        (engine: StorageEngine)
         =
         { engine with
             Version =
@@ -615,7 +600,7 @@ module internal StorageEngine =
                         }
                 with
                 | ManifestApplyResult.Applied(version, manifestNumber) ->
-                    let compacted = buildCompacted engine version manifestNumber compactionResult
+                    let compacted = buildCompacted version manifestNumber compactionResult engine
 
                     match FileMetaData.deleteObsolete engine.Dir compactionResult.Removed with
                     | Ok() -> Ok compacted
@@ -659,7 +644,7 @@ module internal StorageEngine =
             DbError.corruption (sprintf "MANIFEST が参照する SSTable が見つかりません: %s" names) |> err
 
     /// パスから数値のファイル番号を取り出す。
-    let private parseNumber (path: string) : FileNumber option =
+    let private parseNumber (path: string) =
         match System.Int64.TryParse(System.IO.Path.GetFileNameWithoutExtension path) with
         | true, v -> Some v
         | _ -> None
@@ -696,63 +681,9 @@ module internal StorageEngine =
                     if not (Array.isEmpty orphans) then
                         let quarantine = System.IO.Path.Combine(dir, ".orphans")
                         System.IO.Directory.CreateDirectory quarantine |> ignore
-                        Array.iter (moveToQuarantine dir quarantine) orphans)
+                        orphans |> Array.iter (moveToQuarantine dir quarantine))
 
             return ()
-        }
-
-    /// WAL ファイル番号のうち最大のものを返す。
-    let private latestWalNumber =
-        Wal.walFiles
-        >> Result.map (fun files -> files |> List.choose parseNumber |> List.sort |> List.tryLast)
-
-    /// WAL を開く（無ければ作る）。
-    let private openOrCreateWal (dir: string) (version: Version) =
-        result {
-            let! latest = latestWalNumber dir
-
-            let walNumber =
-                match latest with
-                | Some n -> n
-                | None -> version.NextFileNumber
-
-            let! exists = protect (fun () -> System.IO.File.Exists(Wal.path dir walNumber))
-
-            if exists then
-                return!
-                    protect (fun () -> System.IO.FileInfo(Wal.path dir walNumber).Length)
-                    |> Result.map (fun size -> { FileNumber = walNumber; Size = size })
-            else
-                return! Wal.create dir walNumber
-        }
-
-    /// ディスク上の最大 SeqNo を返す。
-    let private maxSeqNoOnDisk: Version -> SeqNo =
-        Version.allFiles >> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
-
-    /// ディスク上の最大ファイル番号を返す。
-    let private maxFileNumberOnDisk (dir: string) =
-        result {
-            let! ssts = sstNumbersOnDisk dir
-            let! wals = Wal.walFiles dir
-            let walNumbers = wals |> List.choose parseNumber |> List.toArray
-            return Array.append ssts walNumbers |> Array.fold (fun acc n -> max acc n) 0L
-        }
-
-    /// 空の engine を組み立てる。
-    let private emptyEngine (dir: string) =
-        {
-            Dir = dir
-            ManifestNumber = 1L<manifestNo>
-            Version = Version.Empty
-            Mem = Memtable.Empty
-            Wal = { FileNumber = 1L; Size = 0L }
-            NextSeqNo = 1UL
-            NextTxnId = 1UL<txnId>
-            MemLimitBytes = DefaultMemLimitBytes
-            Compaction = CompactionOptions.Defaults
-            ActiveSnapshot = 0UL
-            Runtime = StorageRuntime()
         }
 
     /// SSTable の ReadInfo を 1つ埋める。
@@ -776,6 +707,65 @@ module internal StorageEngine =
             { version with
                 Files = List.toArray levels
             })
+
+    /// WAL ファイル番号のうち最大のものを返す。
+    let private latestWalNumber =
+        Wal.walFiles
+        >> Result.map (List.choose parseNumber >> List.sort >> List.tryLast)
+
+    /// WAL を開く（無ければ作る）。
+    let private openOrCreateWal (dir: string) (version: Version) =
+        result {
+            let! latest = latestWalNumber dir
+
+            let walNumber =
+                match latest with
+                | Some n -> n
+                | None -> version.NextFileNumber
+
+            let! exists = protect (fun () -> System.IO.File.Exists(Wal.path dir walNumber))
+
+            if exists then
+                return!
+                    protect (fun () -> System.IO.FileInfo(Wal.path dir walNumber).Length)
+                    |> Result.map (fun size -> { FileNumber = walNumber; Size = size })
+            else
+                return! Wal.create dir walNumber
+        }
+
+    /// ディスク上の最大 SeqNo を返す。
+    let private maxSeqNoOnDisk =
+        Version.allFiles >> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
+
+    /// ディスク上の最大ファイル番号を返す。
+    let private maxFileNumberOnDisk (dir: string) =
+        result {
+            let! ssts = sstNumbersOnDisk dir
+            let! wals = Wal.walFiles dir
+
+            return
+                wals
+                |> List.choose parseNumber
+                |> List.toArray
+                |> Array.append ssts
+                |> Array.fold max 0L
+        }
+
+    /// 空の engine を組み立てる。
+    let private emptyEngine (dir: string) =
+        {
+            Dir = dir
+            ManifestNumber = 1L<manifestNo>
+            Version = Version.Empty
+            Mem = Memtable.Empty
+            Wal = { FileNumber = 1L; Size = 0L }
+            NextSeqNo = 1UL
+            NextTxnId = 1UL<txnId>
+            MemLimitBytes = DefaultMemLimitBytes
+            Compaction = CompactionOptions.Defaults
+            ActiveSnapshot = 0UL
+            Runtime = StorageRuntime()
+        }
 
     /// 復旧済みの状態から起動時のエンジンを作る。
     let private buildRecovered
@@ -885,14 +875,14 @@ type internal DiskStorageEngine(engine: StorageEngine) =
         member _.WalState = Some engine.Wal
         member _.LastFlushError = engine.Runtime.LastFlushError
 
-        member _.GetAtMasked (visible: uint64 option) (key: byte array) (mask: bool array) =
+        member _.GetAtMasked (key: byte array) (mask: bool array) (visible: uint64 option) =
             StorageEngine.getAtMasked key mask visible engine
 
-        member _.ScanAtValues (visible: uint64 option) (startKey: byte array) (limit: int) (needsValues: bool) =
-            StorageEngine.scanAtValues visible limit startKey needsValues engine
+        member _.ScanAtValues (startKey: byte array) (limit: int) (visible: uint64 option) (needsValues: bool) =
+            StorageEngine.scanAtValues startKey limit visible needsValues engine
 
-        member _.ScanAtMasked (visible: uint64 option) (startKey: byte array) (limit: int) (mask: bool array) =
-            StorageEngine.scanAtMasked visible limit startKey mask engine
+        member _.ScanAtMasked (startKey: byte array) (limit: int) (mask: bool array) (visible: uint64 option) =
+            StorageEngine.scanAtMasked startKey limit mask visible engine
 
         member _.WriteBatch(entries: Entry array) =
             StorageEngine.writeBatch entries engine
