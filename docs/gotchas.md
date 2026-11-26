@@ -291,7 +291,9 @@ SSTableのファイル選択でLargestを確認するだけでなく、読み出
 ### 4.4 ファイル番号は巻き戻さない
 
 新規/再オープン時はディスク上の最大番号より大きい`NextFileNumber`を設定する。
-MANIFESTに反映した後に出力ファイルを削除し、削除の前にMANIFESTへ反映する。
+MANIFESTへ反映する前に出力ファイルを削除しない。
+出力の名前が電源断で失われたときに前のVersionへ戻れるよう、
+入力の削除は起動時の検証後（`Manifest.collectGarbage`）に回す。
 番号の巻き戻しは既存SSTableの上書きとデータ損失につながる。
 
 ### 4.5 全レベルをポイント検索対象にする
@@ -317,7 +319,10 @@ commit済みprefixだけを再生し、不完全な末尾は捨てる。
 open時は`Wal.foldCommitted`が返す最後の完全なフレーム位置までファイルを切り詰める。
 追記は`FileMode.Append`ではなく`WalState.Size`へ`SetLength`/`Seek`してから行い、
 不完全な末尾を残したまま次のcommitを書かない。
-flush後のrotateは新しいWALを作成してから旧WALを削除する。
+WAL v2はファイルヘッダーとフレームヘッダーにCRCを持ち、
+長さフィールドの破損をtorn writeと誤認しない。
+flush後のrotateは新しいWALを作成するだけで旧WALを削除しない。
+旧WALは名前消失時の復旧元として残し、起動時に最新3本を残して回収する。
 作成失敗時に旧WALを残す。
 flush失敗は`StorageRuntime.LastFlushError`に残し、次のwriteで再試行する。
 
@@ -329,10 +334,11 @@ flush失敗は`StorageRuntime.LastFlushError`に残し、次のwriteで再試行
 ### 4.10 MANIFEST破損は空のVersionとして扱わない
 
 途中のレコード破損は`CorruptionError`。末尾の書きかけだけを許容する。
-末尾の書きかけを検出したら、復元できたVersionを新しいMANIFESTへ移して`CURRENT`を切り替える。
+末尾の書きかけを検出したら、復元できたVersionを新しいMANIFESTへ移して`CURRENT.A`/`CURRENT.B`を更新する。
 ローテーションは追記の前に判定し、追記失敗時は追記前の長さへ切り詰める。
 `CURRENT`やMANIFESTがないのにSSTableが残っている場合もエラー。
 孤児は削除せず`.orphans/`へ退避する。
+CURRENTスロットの片方が壊れても、もう一方で開ける。
 
 ### 4.11 SSTable検証は構造比較ではなくファイルの順序規則で行う
 
@@ -376,13 +382,16 @@ WAL commit成功後に`Error`を返さない。
 
 ### 4.17 MANIFESTが参照するSSTableの欠落はCorruptionError
 
-`ensureFilesPresent`は、MANIFESTが参照するSSTableが実在しなければ`CorruptionError`にする。
+`Manifest.openOrCreateWith`は編集履歴を遡り、参照SSTableがすべて存在する最後のVersionを選ぶ。
+復旧できない場合だけ`ensureFilesPresent`が`CorruptionError`にする。
 欠落をVersionから黙って除くと、バックアップの誤りや削除事故を正常な空DBとして扱ってしまうため。
-`.orphans/`へ退避するのはMANIFESTが参照しないファイルだけにする。
+`.orphans/`へ退避するのは、どのMANIFESTからも参照されないファイルだけにする。
+古いMANIFESTが参照するcompaction入力は、ロールバックのために残す。
 
 ### 4.18 ローテーション後の失敗でもMANIFEST番号を進める
 
-`logAndApplyWithOutcome`のローテーションは`CURRENT`を切り替え、旧MANIFESTを削除してから`Applied`を返す。
+`logAndApplyWithOutcome`のローテーションは`CURRENT.A`/`CURRENT.B`の古い方を新しいMANIFESTへ更新してから`Applied`を返す。
+旧MANIFESTはすぐには削除しない（保持世代を超えた分だけ起動時に回収する）。
 その後のWAL切り替えが失敗したときに旧MANIFEST番号を返すと、次のflushが`CURRENT`の指さない番号へ追記し、
 再オープンでそのSSTableがVersionから消える（データ損失）。
 `Applied`の後で続きが失敗したら、**新しい番号と反映済みVersionを持ったengine**を返す。
@@ -1025,11 +1034,14 @@ JOINのONは、並べ替え用の解析で`Binder.qualify`が失敗しても述�
 - [ ] ポイント検索にrangeScanを使っていないか
 - [ ] SSTable走査のstartKeyとファイル枝刈りを両方適用しているか
 - [ ] ファイル番号を巻き戻していないか
-- [ ] MANIFEST反映をファイル削除より先にしているか
+- [ ] 出力のMANIFEST反映と検証が終わるまで、入力・旧WAL・旧MANIFESTを削除していないか
+- [ ] `CURRENT.A`/`CURRENT.B`の片方が壊れても他方で開けるか
 - [ ] MANIFESTローテーション後の失敗経路でも新しい番号を返しているか
 - [ ] 走査に結び付けた資源を、続きの破棄でも解放しているか
 - [ ] SSTableのキー順とFooterを正しく検証しているか
 - [ ] WALはフレーム単位で書き、commit済みprefixだけ再生するか
+- [ ] WAL v2のファイルヘッダーとフレームヘッダーのCRCを検証しているか
+- [ ] 起動時に残っているWALをすべて再生し、SSTableに含まれるSeqNo以下を適用していないか
 - [ ] 複数keyspaceを1回のWAL/batchへまとめているか
 - [ ] 古いsnapshotとtombstoneをGCで消していないか
 - [ ] 再オープン時にSeqNoを復元しているか

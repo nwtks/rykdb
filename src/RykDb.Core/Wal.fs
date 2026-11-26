@@ -1,7 +1,8 @@
 // ===========================================================================
 // WAL（Write-Ahead Log）— 論理ログ。
 // Begin / Batch / Commit / Abort を記録し、open 時に再生する。
-// 1レコード: [payloadLength:u32LE][checksum:u32LE(CRC32C)][payload]
+// ファイル先頭: [magic:8][version:u32LE][headerCRC:u32LE]
+// 1フレーム    : [payloadLength:u32LE][payloadCRC:u32LE][headerCRC:u32LE][payload]
 // 長さが合わない末尾は書きかけとして打ち切り、チェックサム不一致は CorruptionError にする。
 // ===========================================================================
 
@@ -52,6 +53,25 @@ module internal Wal =
     [<Literal>]
     let private TagAbort = 3uy
 
+    /// WAL のファイルヘッダーの magic。
+    [<Literal>]
+    let private Magic = "RYKWAL02"
+
+    /// ファイルヘッダーの長さ（magic 8 + version 4 + header CRC 4）。
+    [<Literal>]
+    let private HeaderLength = 16
+
+    /// フレームヘッダーの長さ（length 4 + payload CRC 4 + header CRC 4）。
+    [<Literal>]
+    let private FrameHeaderLength = 12
+
+    /// WAL のファイル形式バージョン。
+    [<Literal>]
+    let private FormatVersion = 2u
+
+    /// magic のバイト列。
+    let private magicBytes = System.Text.Encoding.ASCII.GetBytes Magic
+
     /// タグと txnId だけのレコードを符号化する。
     let private txnRecord (tag: byte) (txnId: TxnId) =
         Writer.build [ Writer.writeByte tag; Writer.uint64BE (uint64 txnId) ]
@@ -97,13 +117,63 @@ module internal Wal =
     let path (dir: string) (fileNumber: FileNumber) =
         System.IO.Path.Combine(dir, walFileName fileNumber)
 
-    /// フレームのヘッダ（長さ + CRC32C）を符号化する。
-    let private headerOf (payload: byte array) =
-        Writer.build
-            [
-                uint32 payload.Length |> Writer.uint32LE
-                Hashing.checksum payload |> Writer.uint32LE
-            ]
+    /// ファイルヘッダー（magic + version + header CRC）を符号化する。
+    let private header () =
+        let prefix =
+            Writer.build [ Writer.writeBytes magicBytes; Writer.uint32LE FormatVersion ]
+
+        Writer.build [ Writer.writeBytes prefix; Writer.uint32LE (Hashing.checksum prefix) ]
+
+    [<TailCall>]
+    let rec private readHeader (fs: System.IO.FileStream) (header: byte array) (offset: int) =
+        if offset >= header.Length then
+            offset
+        else
+            let read = fs.Read(header, offset, header.Length - offset)
+
+            if read <= 0 then
+                offset
+            else
+                readHeader fs header (offset + read)
+
+    /// ファイル先頭のヘッダーを検証する。
+    /// 戻り値は「ヘッダーが完全か」。空・途中までは書きかけとして false を返す。
+    /// magic が一致しないファイル（旧 v1 を含む）は CorruptionError にする。
+    let private detectFormat (fs: System.IO.FileStream) =
+        let original = fs.Position
+        let header = Array.zeroCreate<byte> HeaderLength
+        fs.Position <- 0L
+        let headerBytes = readHeader fs header 0
+        fs.Position <- original
+
+        if headerBytes < magicBytes.Length then
+            ret false
+        else
+            let prefix = Array.sub header 0 magicBytes.Length
+
+            if prefix <> magicBytes then
+                err (DbError.corruption "Wal: 不明な形式です（v1 の WAL は読み取れません）")
+            elif headerBytes < HeaderLength then
+                ret false
+            else
+                let version = Bytes.readLE32 header 8
+                let checksum = Bytes.readLE32 header 12
+
+                if version <> FormatVersion || Hashing.checksumRange header 0 12 <> checksum then
+                    err (DbError.corruption "Wal: ファイルヘッダーのチェックサム不一致")
+                else
+                    ret true
+
+    /// フレームヘッダ（長さ + payload CRC + ヘッダ CRC）を符号化する。
+    let private frameHeader (payload: byte array) =
+        let frame =
+            Writer.build
+                [
+                    uint32 payload.Length |> Writer.uint32LE
+                    Hashing.checksum payload |> Writer.uint32LE
+                ]
+
+        Writer.build [ Writer.writeBytes frame; Writer.uint32LE (Hashing.checksum frame) ]
 
     /// レコードを 1フレームずつ書き出し、書き込んだバイト数を返す。
     [<TailCall>]
@@ -113,7 +183,7 @@ module internal Wal =
         | record :: rest ->
             match encodePayload record with
             | Ok payload ->
-                let header = headerOf payload
+                let header = frameHeader payload
                 fs.Write(header, 0, header.Length)
                 fs.Write(payload, 0, payload.Length)
                 writeAll fs (written + header.Length + payload.Length) rest
@@ -130,7 +200,7 @@ module internal Wal =
                     new System.IO.FileStream(
                         path dir state.FileNumber,
                         System.IO.FileMode.OpenOrCreate,
-                        System.IO.FileAccess.Write,
+                        System.IO.FileAccess.ReadWrite,
                         System.IO.FileShare.ReadWrite
                     )
 
@@ -143,15 +213,35 @@ module internal Wal =
                         fs.SetLength expected
                         fs.Flush true
 
-                    fs.Seek(expected, System.IO.SeekOrigin.Begin) |> ignore
+                    let headerBytes =
+                        if expected = 0L then
+                            let header = header ()
+                            fs.Seek(0L, System.IO.SeekOrigin.Begin) |> ignore
+                            fs.Write(header, 0, header.Length)
+                            Ok header.Length
+                        else
+                            detectFormat fs
+                            |> Result.bind (fun complete ->
+                                if complete then
+                                    Ok 0
+                                else
+                                    err (DbError.corruption "Wal: ファイルヘッダーが不完全です"))
 
-                    writeAll fs 0 records
-                    |> Result.map (fun written ->
-                        fs.Flush sync
+                    match headerBytes with
+                    | Error e -> err e
+                    | Ok headerBytes ->
+                        let startPosition = if expected = 0L then int64 headerBytes else expected
+                        fs.Seek(startPosition, System.IO.SeekOrigin.Begin) |> ignore
 
-                        { state with
-                            Size = state.Size + int64 written
-                        }))
+                        match writeAll fs 0 records with
+                        | Error e -> err e
+                        | Ok written ->
+                            fs.Flush sync
+
+                            ret
+                                { state with
+                                    Size = state.Size + int64 headerBytes + int64 written
+                                })
             >>= id
 
     /// レコード列を追記して fsync まで行う。
@@ -204,30 +294,35 @@ module internal Wal =
 
     /// 現在位置から 1フレーム読み、レコードを返す（不完全なら None）。
     let private readFrameFrom (fs: System.IO.FileStream) =
-        let header = Array.zeroCreate<byte> 8
+        let header = Array.zeroCreate<byte> FrameHeaderLength
         let headerBytes = readAtMost fs header
 
         if headerBytes < header.Length then
             ret None
         else
             let length = uint64 (Bytes.readLE32 header 0)
-            let checksum = Bytes.readLE32 header 4
-            let remaining = fs.Length - fs.Position
+            let payloadChecksum = Bytes.readLE32 header 4
+            let headerChecksum = Bytes.readLE32 header 8
 
-            if length > uint64 remaining then
-                ret None
-            elif length > uint64 System.Int32.MaxValue then
-                err (DbError.corruption "Wal: フレーム長が不正です")
+            if Hashing.checksumRange header 0 8 <> headerChecksum then
+                err (DbError.corruption "Wal: フレームヘッダーのチェックサム不一致")
             else
-                let payload = Array.zeroCreate<byte>(int length)
-                let payloadBytes = readAtMost fs payload
+                let remaining = fs.Length - fs.Position
 
-                if payloadBytes < payload.Length then
+                if length > uint64 remaining then
                     ret None
-                elif Hashing.checksum payload <> checksum then
-                    err (DbError.corruption "Wal: チェックサム不一致")
+                elif length > uint64 System.Int32.MaxValue then
+                    err (DbError.corruption "Wal: フレーム長が不正です")
                 else
-                    decodePayload payload |> Result.map Some
+                    let payload = Array.zeroCreate<byte>(int length)
+                    let payloadBytes = readAtMost fs payload
+
+                    if payloadBytes < payload.Length then
+                        ret None
+                    elif Hashing.checksum payload <> payloadChecksum then
+                        err (DbError.corruption "Wal: チェックサム不一致")
+                    else
+                        decodePayload payload |> Result.map Some
 
     /// フレームを順に読み、step で状態を畳み込む（停止位置も返す）。
     [<TailCall>]
@@ -285,11 +380,17 @@ module internal Wal =
                         System.IO.FileShare.Read
                     )
 
-                foldFrames
-                    fs
-                    (fun state record -> ret (applyRecord step state record))
-                    (Map.empty, 0UL<txnId>, initial)
-                |> Result.map (fun ((_, maxTxnId, state), goodSize) -> state, maxTxnId, goodSize))
+                match detectFormat fs with
+                | Error e -> err e
+                | Ok false -> ret (initial, 0UL<txnId>, 0L)
+                | Ok true ->
+                    fs.Position <- int64 HeaderLength
+
+                    foldFrames
+                        fs
+                        (fun state record -> ret (applyRecord step state record))
+                        (Map.empty, 0UL<txnId>, initial)
+                    |> Result.map (fun ((_, maxTxnId, state), goodSize) -> state, maxTxnId, goodSize))
         >>= id
 
     /// 最後の完全なフレームの終端までファイルを切り詰め、WalState の Size を合わせる。
@@ -328,11 +429,25 @@ module internal Wal =
             else
                 [])
 
-    /// WAL ファイルを作る。
+    /// WAL ファイルを作る（v2 のファイルヘッダーを書いて fsync する）。
     let create (dir: string) (fileNumber: FileNumber) =
         protect (fun () ->
-            System.IO.File.WriteAllBytes(path dir fileNumber, [||])
-            { FileNumber = fileNumber; Size = 0L })
+            use fs =
+                new System.IO.FileStream(
+                    path dir fileNumber,
+                    System.IO.FileMode.Create,
+                    System.IO.FileAccess.Write,
+                    System.IO.FileShare.None
+                )
+
+            let header = header ()
+            fs.Write(header, 0, header.Length)
+            fs.Flush true
+
+            {
+                FileNumber = fileNumber
+                Size = int64 header.Length
+            })
 
     /// 新しい WAL ファイル番号に切り替える（flush 後に呼ぶ）。
     let rotate (state: WalState) =

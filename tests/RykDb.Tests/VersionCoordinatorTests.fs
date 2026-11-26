@@ -109,6 +109,7 @@ let ``background compaction: 読み取り中のファイルは削除されず、
                 { RowStoreOptions.Background with
                     MemLimitBytes = Some 1
                     Compaction = Some forceL1Compaction
+                    DeferDeletes = false
                 }
 
         let mutable current = store
@@ -156,6 +157,7 @@ let ``background compaction: 途中で捨てた走査の Version pin も解放�
                 { RowStoreOptions.Background with
                     MemLimitBytes = Some 1
                     Compaction = Some forceL1Compaction
+                    DeferDeletes = false
                 }
 
         let mutable current = store

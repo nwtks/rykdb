@@ -402,6 +402,10 @@ type internal ManifestApplyResult =
     | Unknown of error: DbError
 
 module internal Manifest =
+    /// manifest がこれを超えたら、現在の Version 全体を新しい manifest へ書き直す。
+    [<Literal>]
+    let private MaxManifestBytes = 4L * 1024L * 1024L
+
     /// manifest ファイル名の接頭辞。
     [<Literal>]
     let private ManifestPrefix = "MANIFEST-"
@@ -414,13 +418,17 @@ module internal Manifest =
     let private manifestPath (dir: string) (manifestNumber: ManifestNumber) =
         System.IO.Path.Combine(dir, fileName manifestNumber)
 
-    /// 現在の MANIFEST 番号を指すファイル名。
+    /// CURRENT の A スロット。
     [<Literal>]
-    let private CurrentFileName = "CURRENT"
+    let private CurrentSlotA = "CURRENT.A"
 
-    /// CURRENT のパス。
-    let private currentPath (dir: string) =
-        System.IO.Path.Combine(dir, CurrentFileName)
+    /// CURRENT の B スロット。
+    [<Literal>]
+    let private CurrentSlotB = "CURRENT.B"
+
+    /// SSTable ファイルが残っているか。
+    let private hasSstFiles (dir: string) =
+        protect (fun () -> System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension).Length > 0)
 
     /// manifest のファイル名から番号を取り出す。
     let private parseManifestNumber (path: string) =
@@ -433,40 +441,84 @@ module internal Manifest =
         else
             None
 
-    /// 既存の最大番号より 1つ大きい manifest 番号を返す。
-    let private nextManifestNumber (dir: string) (current: ManifestNumber) =
+    /// CURRENT スロットを読み、内容が正しければ manifest 番号を返す。
+    /// 壊れたスロットは無視する（もう一方のスロットで復旧する）。
+    let private readCurrentSlot (dir: string) (slot: string) =
         protect (fun () ->
-            System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")
-            |> Array.choose parseManifestNumber
-            |> Array.fold max current
-            |> (+) 1L<manifestNo>)
+            let p = System.IO.Path.Combine(dir, slot)
 
-    /// SSTable ファイルが残っているか。
-    let private hasSstFiles (dir: string) =
-        protect (fun () -> System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension).Length > 0)
-
-    /// CURRENT が指す manifest 番号を読む。
-    let private readCurrentManifestNumber (dir: string) =
-        protect (fun () ->
-            if not (System.IO.File.Exists(currentPath dir)) then
+            if not (System.IO.File.Exists p) then
                 None
             else
-                let text = System.IO.File.ReadAllText(currentPath dir).Trim()
+                let text = System.IO.File.ReadAllText(p).Trim()
+                let parts = text.Split([| ' ' |], System.StringSplitOptions.RemoveEmptyEntries)
 
-                if text = "" then
+                if parts.Length <> 2 then
                     None
-                elif text.StartsWith ManifestPrefix && text.EndsWith ".manifest" then
-                    text.Substring(ManifestPrefix.Length, text.Length - ManifestPrefix.Length - ".manifest".Length)
-                    |> System.Int64.Parse
-                    |> LanguagePrimitives.Int64WithMeasure<manifestNo>
-                    |> Some
-                elif text.StartsWith ManifestPrefix then
-                    text.Substring ManifestPrefix.Length
-                    |> System.Int64.Parse
-                    |> LanguagePrimitives.Int64WithMeasure<manifestNo>
-                    |> Some
                 else
-                    raise (System.IO.InvalidDataException(sprintf "CURRENT の内容が不正: %s" text)))
+                    match
+                        System.Int64.TryParse(
+                            parts.[1],
+                            System.Globalization.NumberStyles.HexNumber,
+                            System.Globalization.CultureInfo.InvariantCulture
+                        )
+                    with
+                    | false, _ -> None
+                    | true, checksum ->
+                        let name = parts.[0]
+
+                        if Hashing.checksum (System.Text.Encoding.UTF8.GetBytes name) <> uint32 checksum then
+                            None
+                        else
+                            parseManifestNumber name)
+        |> Result.defaultValue None
+
+    /// CURRENT の候補（A/B スロット）を新しい順に返す。
+    /// MANIFEST ファイルは、これらが両方失われたときの最終手段としてだけ使う。
+    let private readCurrentCandidates (dir: string) =
+        [ CurrentSlotA; CurrentSlotB ]
+        |> List.choose (fun slot -> readCurrentSlot dir slot |> Option.map (fun mn -> mn, slot))
+        |> List.distinctBy fst
+        |> List.sortByDescending fst
+
+    /// ディスク上の MANIFEST を新しい順に返す（CURRENT が失われたときの最終手段）。
+    let private readManifestCandidates (dir: string) =
+        match protect (fun () -> System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")) with
+        | Ok files ->
+            files
+            |> Array.toList
+            |> List.choose parseManifestNumber
+            |> List.distinct
+            |> List.sortDescending
+            |> List.map (fun manifestNumber -> manifestNumber, "MANIFEST")
+        | Error _ -> []
+
+    /// CURRENT スロットの内容を符号化する（manifest 名 + CRC）。
+    let private encodeCurrentSlot (manifestNumber: ManifestNumber) =
+        let name = fileName manifestNumber
+        let checksum = Hashing.checksum (System.Text.Encoding.UTF8.GetBytes name)
+        sprintf "%s %08X\n" name checksum
+
+    /// CURRENT スロットを書いて fsync する。
+    let private writeCurrentSlot (dir: string) (slot: string) (manifestNumber: ManifestNumber) =
+        protect (fun () ->
+            let data = System.Text.Encoding.UTF8.GetBytes(encodeCurrentSlot manifestNumber)
+
+            use fs =
+                new System.IO.FileStream(
+                    System.IO.Path.Combine(dir, slot),
+                    System.IO.FileMode.Create,
+                    System.IO.FileAccess.Write,
+                    System.IO.FileShare.None
+                )
+
+            fs.Write(data, 0, data.Length)
+            fs.Flush true)
+
+    /// 初期化で両方のスロットを同じ manifest 番号にする。
+    let private writeCurrentSlotsBoth (dir: string) (manifestNumber: ManifestNumber) =
+        writeCurrentSlot dir CurrentSlotA manifestNumber
+        >>= fun () -> writeCurrentSlot dir CurrentSlotB manifestNumber
 
     /// manifest ファイルの行を読む。
     let private read (dir: string) (manifestNumber: ManifestNumber) =
@@ -522,8 +574,46 @@ module internal Manifest =
         | Ok(Error e)
         | Error e -> err e
 
-    /// デコードした編集を Version へ順に適用する。
-    let private applyAll = List.fold VersionEdit.apply Version.Empty
+    [<TailCall>]
+    let rec private applyHistoryLoop (current: Version) (acc: Version list) =
+        function
+        | [] -> List.rev (current :: acc)
+        | edit :: rest -> applyHistoryLoop (VersionEdit.apply current edit) (current :: acc) rest
+
+    /// 編集を先頭から適用し、各編集後の Version を履歴として返す。
+    /// 参照 SSTable が欠けた最後の編集を巻き戻すために使う。
+    let private applyHistory (edits: VersionEdit list) = applyHistoryLoop Version.Empty [] edits
+
+    [<TailCall>]
+    let rec private lastValidVersionLoop (isValid: Version -> bool) (index: int) (best: (int * Version) option) =
+        function
+        | [] -> best
+        | version :: rest ->
+            let best = if isValid version then Some(index, version) else best
+            lastValidVersionLoop isValid (index + 1) best rest
+
+    /// 履歴のうち、条件を満たす最後の Version とその位置を返す。
+    let private lastValidVersion (isValid: Version -> bool) (history: Version list) =
+        lastValidVersionLoop isValid 0 None history
+
+    let private acceptable
+        (isValid: Version -> bool)
+        (hasSsts: bool)
+        (hasContent: bool)
+        (hasFileEdits: bool)
+        (version: Version)
+        =
+        isValid version
+        && (not (List.isEmpty (Version.allFiles version)) || not hasFileEdits)
+        && (not (List.isEmpty (Version.allFiles version)) || not hasContent || not hasSsts)
+
+    /// 既存の最大番号より 1つ大きい manifest 番号を返す。
+    let private nextManifestNumber (dir: string) (current: ManifestNumber) =
+        protect (fun () ->
+            System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")
+            |> Array.choose parseManifestNumber
+            |> Array.fold max current
+            |> (+) 1L<manifestNo>)
 
     /// MANIFEST の 1レコード。
     /// [checksum:u32LE][VersionEdit 本体] のフレームを base64 にして 1行にする。
@@ -558,23 +648,36 @@ module internal Manifest =
             fs.Write(data, 0, data.Length)
             fs.Flush true)
 
-    /// CURRENT を一時ファイル経由で原子的に置き換える。
-    let private writeCurrent (dir: string) (manifestNumber: ManifestNumber) =
-        protect (fun () ->
-            let tmp = currentPath dir + ".tmp"
-            System.IO.File.WriteAllText(tmp, fileName manifestNumber + "\n")
+    [<TailCall>]
+    let rec private tryCandidates (dir: string) (isValid: Version -> bool) (hasSsts: bool) (lastError: DbError option) =
+        function
+        | [] ->
+            lastError
+            |> Option.defaultValue (DbError.corruption "有効な MANIFEST が見つかりません")
+            |> err
+        | (manifestNumber, _) :: rest ->
+            match readAll dir manifestNumber with
+            | Error e -> tryCandidates dir isValid hasSsts (Some e) rest
+            | Ok(edits, truncated, hasContent) ->
+                let history = applyHistory edits
 
-            use fs =
-                new System.IO.FileStream(
-                    tmp,
-                    System.IO.FileMode.Open,
-                    System.IO.FileAccess.Write,
-                    System.IO.FileShare.None
-                )
+                let hasFileEdits =
+                    edits
+                    |> List.exists (fun edit ->
+                        not (List.isEmpty edit.AddedFiles) || not (List.isEmpty edit.DeletedFiles))
 
-            fs.Flush true
-            fs.Close()
-            System.IO.File.Move(tmp, currentPath dir, true))
+                match lastValidVersion (acceptable isValid hasSsts hasContent hasFileEdits) history with
+                | None -> tryCandidates dir isValid hasSsts lastError rest
+                | Some(index, version) ->
+                    if not truncated && index = history.Length - 1 then
+                        ret (version, manifestNumber)
+                    else
+                        result {
+                            let! nextNumber = nextManifestNumber dir manifestNumber
+                            let! _ = writeSnapshot dir nextNumber version
+                            let! _ = writeCurrentSlotsBoth dir nextNumber
+                            return version, nextNumber
+                        }
 
     /// ディレクトリを作る（既にあれば何もしない）。
     let ensureDirectory (dir: string) =
@@ -582,49 +685,159 @@ module internal Manifest =
             if not (System.IO.Directory.Exists dir) then
                 System.IO.Directory.CreateDirectory dir |> ignore)
 
-    /// データベースを開く（新規なら作成する）。
-    /// 返り値は (Version, 有効な manifest 番号)。
-    let openOrCreate (dir: string) =
+    /// データベースを開く本体。
+    /// [isValid] は「参照する SSTable がすべて存在するか」の判定。
+    /// MANIFEST の編集履歴を先頭から適用し、条件を満たす最後の Version を選ぶ。
+    /// 現在の Version が壊れていれば、その Version を新しい MANIFEST にスナップショットして復旧する。
+    let private openOrCreateCore (dir: string) (isValid: Version -> bool) =
         result {
             let! _ = ensureDirectory dir
             let! hasSsts = hasSstFiles dir
-            let! current = readCurrentManifestNumber dir
+            let candidates = readCurrentCandidates dir
+            let fallback = readManifestCandidates dir
 
-            match current with
-            | Some manifestNumber ->
-                let! decoded = readAll dir manifestNumber
-                let edits, truncated, hasContent = decoded
-                let version = applyAll edits
+            match candidates with
+            | [] ->
+                if List.isEmpty fallback then
+                    if hasSsts then
+                        return! err (DbError.corruption "CURRENT が無いのに SSTable が残っています（データ損失の恐れ）")
+                    else
+                        let manifestNumber = 1L<manifestNo>
 
-                if List.isEmpty (Version.allFiles version) && hasContent && hasSsts then
-                    return! err (DbError.corruption "manifest が壊れており、SSTable の管理情報を復元できません（SSTable は変更していません）")
-                elif truncated then
-                    let! nextNumber = nextManifestNumber dir manifestNumber
-                    let! _ = writeSnapshot dir nextNumber version
-                    let! _ = writeCurrent dir nextNumber
+                        do!
+                            protect (fun () ->
+                                use fs =
+                                    new System.IO.FileStream(
+                                        manifestPath dir manifestNumber,
+                                        System.IO.FileMode.Create,
+                                        System.IO.FileAccess.Write,
+                                        System.IO.FileShare.Read
+                                    )
 
-                    protect (fun () ->
-                        let old = manifestPath dir manifestNumber
+                                fs.Flush true)
 
-                        if System.IO.File.Exists old then
-                            System.IO.File.Delete old)
-                    |> ignore
-
-                    return version, nextNumber
+                        do! writeCurrentSlotsBoth dir manifestNumber
+                        return Version.Empty, manifestNumber
                 else
-                    return version, manifestNumber
-            | None ->
-                if hasSsts then
-                    return! err (DbError.corruption "CURRENT が無いのに SSTable が残っています（データ損失の恐れ）")
-                else
-                    let manifestNumber = 1L<manifestNo>
-
-                    let! _ =
-                        protect (fun () -> System.IO.File.WriteAllText(manifestPath dir manifestNumber, ""))
-
-                    let! _ = writeCurrent dir manifestNumber
-                    return Version.Empty, manifestNumber
+                    return! tryCandidates dir isValid hasSsts None fallback
+            | _ ->
+                match tryCandidates dir isValid hasSsts None candidates with
+                | Ok found -> return found
+                | Error e when not (List.isEmpty fallback) ->
+                    return! tryCandidates dir isValid hasSsts (Some e) fallback
+                | Error e -> return! err e
         }
+
+    /// データベースを開く（新規なら作成する）。
+    /// 返り値は (Version, 有効な manifest 番号)。
+    let openOrCreate (dir: string) = openOrCreateCore dir (fun _ -> true)
+
+    /// 参照する SSTable の存在を検証して開く（クラッシュ復旧用）。
+    let openOrCreateWith (dir: string) (isValid: Version -> bool) = openOrCreateCore dir isValid
+
+    /// デコードした編集を Version へ順に適用する。
+    let private applyAll = List.fold VersionEdit.apply Version.Empty
+
+    /// 残っている MANIFEST が参照するファイル番号の和集合。
+    /// まだ削除していない compaction 入力を孤児として退避しないために使う。
+    let referencedFileNumbers (dir: string) =
+        let manifests =
+            match protect (fun () -> System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")) with
+            | Ok files -> files |> Array.toList |> List.choose parseManifestNumber
+            | Error _ -> []
+
+        manifests
+        |> List.fold
+            (fun acc manifestNumber ->
+                match readAll dir manifestNumber with
+                | Ok(edits, _, _) ->
+                    let version = applyAll edits
+
+                    Version.allFiles version
+                    |> List.fold (fun set f -> Set.add f.FileNumber set) acc
+                | Error _ -> acc)
+            Set.empty
+
+    [<TailCall>]
+    let rec private decodeAll (dir: string) (acc: (ManifestNumber * Set<FileNumber>) list) =
+        function
+        | [] -> Some(List.rev acc)
+        | manifestNumber :: rest ->
+            match readAll dir manifestNumber with
+            | Error _ -> None
+            | Ok(edits, _, _) ->
+                let version = applyAll edits
+                let files = Version.allFiles version |> List.map _.FileNumber |> Set.ofList
+                decodeAll dir ((manifestNumber, files) :: acc) rest
+
+    let private filesOf (predicate: 'a * Set<'b> -> bool) =
+        List.filter predicate
+        >> List.fold (fun acc (_, files) -> Set.union acc files) Set.empty
+
+    /// 古い MANIFEST と、その MANIFEST だけが参照している SSTable を削除する。
+    /// [activeManifestNumber] は必ず保持する。
+    /// どの MANIFEST か読めないときは、ファイルを消さずに何もしない。
+    /// どの MANIFEST からも参照されない SSTable（真の孤児）は削除せず、
+    /// 呼び出し側の検疫（`.orphans/`）に任せる。
+    let collectGarbage (dir: string) (activeManifestNumber: ManifestNumber) (keepCount: int) =
+        let sorted =
+            match protect (fun () -> System.IO.Directory.GetFiles(dir, ManifestPrefix + "*")) with
+            | Ok files -> files |> Array.toList |> List.choose parseManifestNumber
+            | Error _ -> []
+            |> List.sortDescending
+
+        match decodeAll dir [] sorted with
+        | None -> ()
+        | Some entries ->
+            let keptSet =
+                sorted
+                |> List.indexed
+                |> List.filter (fun (index, manifestNumber) ->
+                    index < keepCount || manifestNumber = activeManifestNumber)
+                |> List.map snd
+                |> Set.ofList
+
+            let keptFiles =
+                filesOf (fun (manifestNumber, _) -> Set.contains manifestNumber keptSet) entries
+
+            let droppedFiles =
+                filesOf (fun (manifestNumber, _) -> not (Set.contains manifestNumber keptSet)) entries
+
+            entries
+            |> List.map fst
+            |> List.filter (fun manifestNumber -> not (Set.contains manifestNumber keptSet))
+            |> List.iter (fun manifestNumber ->
+                protect (fun () ->
+                    let path = manifestPath dir manifestNumber
+
+                    if System.IO.File.Exists path then
+                        System.IO.File.Delete path)
+                |> ignore)
+
+            Set.difference droppedFiles keptFiles
+            |> Set.iter (fun fileNumber ->
+                protect (fun () ->
+                    let path = FileMetaData.path dir fileNumber
+
+                    if System.IO.File.Exists path then
+                        System.IO.File.Delete path)
+                |> ignore)
+
+    /// CURRENT の A/B スロットを更新する。
+    /// 現在の有効なスロットのうち古い方（同値なら A）を上書きする。
+    /// rename を使わないので、CURRENT の耐久性が rename に依存しない。
+    let private writeCurrentSlots (dir: string) (manifestNumber: ManifestNumber) =
+        let a = readCurrentSlot dir CurrentSlotA
+        let b = readCurrentSlot dir CurrentSlotB
+
+        let target =
+            match a, b with
+            | Some x, Some y -> if x <= y then CurrentSlotA else CurrentSlotB
+            | Some _, None -> CurrentSlotB
+            | None, Some _ -> CurrentSlotA
+            | None, None -> CurrentSlotA
+
+        writeCurrentSlot dir target manifestNumber
 
     /// 末尾の改行まで遡って、完全な行の終端位置を返す。
     [<TailCall>]
@@ -745,10 +958,6 @@ module internal Manifest =
                 | Ok() -> Error(AppendRejected e)
                 | Error _ -> Error(AppendUncertain e)
 
-    /// manifest がこれを超えたら、現在の Version 全体を新しい manifest へ書き直す。
-    [<Literal>]
-    let private MaxManifestBytes = 4L * 1024L * 1024L
-
     /// .VersionEdit を反映し、結果を「反映済み / 未反映 / 不明」で返す。
     /// <remarks>
     /// ローテーションが必要な場合は、追記ではなく新しい MANIFEST へ Version 全体を書いて CURRENT を切り替える。
@@ -790,15 +999,9 @@ module internal Manifest =
                 match writeSnapshot dir nextNumber bumped with
                 | Error e -> ManifestApplyResult.NotApplied e
                 | Ok() ->
-                    match writeCurrent dir nextNumber with
+                    match writeCurrentSlots dir nextNumber with
                     | Error e -> ManifestApplyResult.NotApplied e
-                    | Ok() ->
-                        protect (fun () ->
-                            if System.IO.File.Exists path then
-                                System.IO.File.Delete path)
-                        |> ignore
-
-                        ManifestApplyResult.Applied(bumped, nextNumber)
+                    | Ok() -> ManifestApplyResult.Applied(bumped, nextNumber)
         | Ok _ ->
             match append dir manifestNumber edit with
             | Ok _ -> ManifestApplyResult.Applied(bumped, manifestNumber)

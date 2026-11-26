@@ -1146,20 +1146,30 @@ L1以降は最小キーの二分探索で候補を絞る。
 
 ### 8.4 MANIFEST
 
-MANIFESTには、`CURRENT`と世代ごとの`MANIFEST-xxxxx`がある。
+MANIFESTには、`CURRENT`の二世代スロットと世代ごとの`MANIFEST-xxxxx`がある。
 
 ```text
-CURRENT           有効なMANIFEST番号
+CURRENT.A         有効なMANIFEST名 + CRC
+CURRENT.B         有効なMANIFEST名 + CRC
 MANIFEST-000001   VersionEditの履歴
 ```
+
+`CURRENT.A`と`CURRENT.B`のうち、CRCが正しく新しいMANIFESTを指す方を有効とする。
+一方が壊れていても、もう一方から復旧できる。
 
 MANIFESTレコードはCRC32Cと`VersionEdit`本体をBase64化した1行で構成する。
 途中の壊れたレコードは`CorruptionError`になる。
 末尾の不完全な行だけはクラッシュ時の追記とみなし、読み飛ばす。
 
 MANIFESTが4MiBを超える場合は、現在のVersion全体を新しいMANIFESTへスナップショットする。
-成功してから`CURRENT.tmp`をfsyncし、`File.Move`で置換する。
+成功してから、現在有効でない方の`CURRENT`スロットへ新しいMANIFEST名とCRCを書いてfsyncする。
+renameを使わないため、CURRENTの耐久性がrenameに依存しない。
 ディレクトリのfsyncは行わない。
+
+古いMANIFESTはすぐには削除しない。
+起動時に最新4世代を残し、それより古いMANIFESTと、
+そのMANIFESTだけが参照しているSSTableを回収する（`Manifest.collectGarbage`）。
+どのMANIFESTからも参照されないSSTableは削除せず`.orphans/`へ退避する。
 
 通常追記では、末尾が改行で終わっていない場合は最後の完全な行まで切り詰めてから追記する。
 
@@ -1183,12 +1193,15 @@ Commit(txnId)
 Abort(txnId)
 ```
 
-1レコードは`payloadLength`、CRC32C、payloadで構成する。
+WAL v2のファイルは、先頭に16バイトのヘッダー（magic・version・header CRC）を持つ。
+各フレームは`payloadLength`、payload CRC、ヘッダーCRC、payloadで構成する。
 
-- ヘッダーやpayloadが末尾で不完全ならtorn writeとして切り詰める。
-- 長さフィールドはCRCの対象外なので、中間フレームの長さ破損が実ファイル長を超えた場合は
-  torn writeと区別できず切り詰めになる（LevelDBと同じトレードオフ）。
-- 完全なフレームのチェックサム不一致、未知タグ、破損payloadは`CorruptionError`になる。
+- ファイルヘッダーが途中で切れている → 書きかけのWALとして扱い、フレームを読まない。
+- ファイルヘッダーのCRC不一致 → `CorruptionError`。
+- フレームヘッダーが途中で切れている → torn writeとして切り詰める。
+- フレームヘッダーのCRC不一致 → `CorruptionError`（長さ破損をtorn writeと誤認しない）。
+- payloadが途中で切れている → torn writeとして切り詰める。
+- payloadのCRC不一致、未知タグ、破損payload → `CorruptionError`。
 
 追記はフレームごとに行う。
 メモリ上で全フレームを結合しないことで、大きなtransactionのピークメモリを抑える。
@@ -1200,9 +1213,11 @@ Abort(txnId)
 commitのfsyncはグループ化する。
 待機中のcommitは最大WAL位置まで登録し、先頭の待機者が1回だけ`Flush(true)`する。
 
-flush後のWAL rotateは、新しいWALを作成してから旧WALを削除する。
-旧WALの列挙は作成より先に行う（作成後の列挙失敗で空の新WALだけが残り、
-再openがそれを最新として選んで旧WALの未flush分を失うのを防ぐ）。
+flush後のWAL rotateは、新しいWALを作成するだけで旧WALを削除しない。
+旧WALは、新しいWALやSSTableの名前が失われたときの復旧元として残す。
+起動時は残っているWALをすべてファイル番号順に再生し、
+復旧済みVersionのSSTableに含まれるSeqNo以下のエントリは適用しない。
+最新3本を残し、SSTableに反映済みの古いWALを起動時に回収する。
 新しいWALの作成に失敗しても旧WALとengineの位置が残るため、次のwriteで回復できる。
 flushの失敗は`StorageRuntime.LastFlushError`に残す。
 
@@ -1217,7 +1232,12 @@ compactionは次の手順で行う。
 5. 同一キーの版をSeqNo降順でまとめる。
 6. snapshotが必要な版だけ残して古い版を回収する。
 7. 約4MiBを目標にキーの切れ目で出力ファイルを分割する。
-8. MANIFESTへ出力を記録し、入力ファイルを削除する。
+8. MANIFESTへ出力を記録する。
+   入力ファイルはすぐには削除せず、次の起動時の検証後に回収する。
+
+入力の削除を遅らせるのは、出力のファイル名が電源断で失われたときに、
+前のVersionへロールバックして入力から復旧するためである。
+古いMANIFESTが入力を参照している間は、`.orphans/`へも退避しない。
 
 L0はキー域が重なるが、L1以降は1ファイル=1キー域である。
 出力は入力外のキー域と重ならないため、最下位レベルでのtombstone回収が安全になる。
@@ -1282,7 +1302,7 @@ Closeは次の順で行う。
 1. compaction workerを停止してjoinする。
 2. 最新の`PublishedState`をengineへ反映する。
 3. memtableをflushする。
-4. WALをfsyncして削除する。
+4. WALをfsyncする（削除は次の起動時の復旧検証後に回す）。
 5. ProcessLockを解放する。
 
 停止確認は出力ファイル境界に加えて、同一キーグループを畳む途中の`gather`でも行う。
@@ -1502,7 +1522,8 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 #### 12.2.4 耐久性
 
 - WALフレーム、SSTableブロック、MANIFESTレコードはチェックサムで保護する。
-- CURRENTと一時ファイルは原子的な置換を使う。
+- CURRENTは`CURRENT.A`/`CURRENT.B`の二世代で管理し、renameの耐久性に依存しない。
+- クラッシュ整合性の保証レベル・復旧手順・検証方法は[`crash-consistency.md`](crash-consistency.md)を参照する。
 - ディレクトリfsyncは標準機能だけでは実行できないため、
   新規ファイル作成やrotateの削除は電源故障で欠ける可能性がある。
 - プロセスのクラッシュ後は再作成・再生成で吸収できる。

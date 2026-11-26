@@ -25,6 +25,7 @@
     <Compile Include="VersionSetTests.fs" />
     <Compile Include="CompactionTests.fs" />
     <Compile Include="StorageEngineTests.fs" />
+    <Compile Include="CrashConsistencyTests.fs" />
     <Compile Include="AstTests.fs" />
     <Compile Include="LexerTests.fs" />
     <Compile Include="ParserExprTests.fs" />

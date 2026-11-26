@@ -56,6 +56,8 @@ type internal RowStoreOptions =
         ScanHook: (FileMetaData -> unit) option
         /// テスト用: MANIFEST への反映結果を差し替える（`None` なら実装どおり）。
         ManifestApplyHook: (VersionEdit -> ManifestApplyResult option) option
+        /// compaction の入力をすぐ削除せず、起動時の検証後に回すか。
+        DeferDeletes: bool
     }
 
 module internal RowStoreOptions =
@@ -67,6 +69,7 @@ module internal RowStoreOptions =
             Compaction = None
             ScanHook = None
             ManifestApplyHook = None
+            DeferDeletes = true
         }
 
     /// 背景 compaction を有効にした設定。
@@ -473,6 +476,7 @@ module internal RowStore =
                 root,
                 PublishedState.initial engine.Version engine.ManifestNumber,
                 engine.Compaction,
+                options.DeferDeletes,
                 (fun () -> runtime.OldestExcept(root, None)),
                 (fun f -> StorageEngine.openScan root f),
                 options.ScanHook,
@@ -513,6 +517,11 @@ module internal RowStore =
                     err e
 
             let engine =
+                let engine =
+                    { engine with
+                        DeferDeletes = options.DeferDeletes
+                    }
+
                 match options.Compaction with
                 | Some compaction -> { engine with Compaction = compaction }
                 | None -> engine

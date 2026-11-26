@@ -435,6 +435,7 @@ let ``StorageEngine.maybeFlush: 4 本目の L0 で compactOnce が L0→L1 compa
                 { engine with
                     Version = version
                     MemLimitBytes = 1
+                    DeferDeletes = false
                 }
 
             let engine =

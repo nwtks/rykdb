@@ -85,6 +85,8 @@ type internal StorageEngine =
         NextTxnId: TxnId
         /// memtable のメモリ上限（超えたら flush する）
         MemLimitBytes: int
+        /// compaction の入力をすぐ削除せず、起動時の検証後に回すか
+        DeferDeletes: bool
         /// コンパクションの設定
         Compaction: CompactionOptions
         /// 最古の active snapshot の SeqNo。
@@ -96,6 +98,23 @@ type internal StorageEngine =
     }
 
 module internal StorageEngine =
+    /// SSTable に書く Bloom filter の誤検出率。
+    [<Literal>]
+    let private BloomFalsePositiveRate = 0.01
+
+    /// 既定の memtable 上限（64 MiB）。
+    [<Literal>]
+    let private DefaultMemLimitBytes = 64 * 1024 * 1024
+
+    /// 起動時に残す WAL の本数。
+    [<Literal>]
+    let private WalRetention = 3
+
+    /// 起動時に残す MANIFEST の世代数。
+    /// これより古い MANIFEST と、それだけが参照する SSTable は削除する。
+    [<Literal>]
+    let private ManifestRetention = 4
+
     /// writeBatch / maybeFlush / close を DB 単位で直列化する（同じ WAL / memtable の競合防止）。
     let private withRuntimeGate (engine: StorageEngine) (f: unit -> 'T) =
         engine.Runtime.Gate.Wait()
@@ -104,14 +123,6 @@ module internal StorageEngine =
             f ()
         finally
             engine.Runtime.Gate.Release() |> ignore
-
-    /// SSTable に書く Bloom filter の誤検出率。
-    [<Literal>]
-    let private BloomFalsePositiveRate = 0.01
-
-    /// 既定の memtable 上限（64 MiB）。
-    [<Literal>]
-    let private DefaultMemLimitBytes = 64 * 1024 * 1024
 
     /// 読み取り用メタデータを返す。
     /// flush / compaction が作ったファイルは `ReadInfo` を持っている。
@@ -413,20 +424,13 @@ module internal StorageEngine =
                 }
         }
 
-    /// WAL を同期して古い WAL を削除し、次の WAL へ切り替える。
+    /// WAL を同期して次の WAL へ切り替える。
+    /// 旧 WAL は削除しない（新しい WAL や SSTable の名前が失われたときの復旧元として残す）。
     let private rotateWal (next: WalState) (engine: StorageEngine) =
         result {
             do! Wal.sync engine.Dir engine.Wal
-            let! stale = Wal.walFiles engine.Dir
-            let! _ = Wal.create engine.Dir next.FileNumber
-
-            protect (fun () ->
-                stale
-                |> List.filter (fun path -> path <> Wal.path engine.Dir next.FileNumber)
-                |> List.iter System.IO.File.Delete)
-            |> ignore
-
-            return { engine with Wal = next }
+            let! created = Wal.create engine.Dir next.FileNumber
+            return { engine with Wal = created }
         }
 
     /// MANIFEST 反映後の Version を受け取り、WAL を切り替えて flush 後の engine を作る。
@@ -602,9 +606,12 @@ module internal StorageEngine =
                 | ManifestApplyResult.Applied(version, manifestNumber) ->
                     let compacted = buildCompacted version manifestNumber compactionResult engine
 
-                    match FileMetaData.deleteObsolete engine.Dir compactionResult.Removed with
-                    | Ok() -> Ok compacted
-                    | Error e -> Error(compacted, e)
+                    if engine.DeferDeletes then
+                        Ok compacted
+                    else
+                        match FileMetaData.deleteObsolete engine.Dir compactionResult.Removed with
+                        | Ok() -> Ok compacted
+                        | Error e -> Error(compacted, e)
                 | ManifestApplyResult.NotApplied e ->
                     FileMetaData.deleteObsolete engine.Dir compactionResult.Added |> ignore
                     Error(fallbackEngine, e)
@@ -626,6 +633,11 @@ module internal StorageEngine =
                     | Error(bumped, e) -> ret (bumped, Some e)
             else
                 ret (engine, None))
+
+    /// Version が参照する SSTable がすべて存在するか。
+    let private filesPresent (dir: string) (version: Version) =
+        Version.allFiles version
+        |> List.forall (fun f -> System.IO.File.Exists(FileMetaData.path dir f.FileNumber))
 
     /// MANIFEST が参照する SSTable がすべて存在するか確認する。
     let private ensureFilesPresent (dir: string) (version: Version) =
@@ -670,9 +682,14 @@ module internal StorageEngine =
         System.IO.File.Move(source, target, true)
 
     /// 参照されていない SSTable を検疫へ移す。
+    /// 古い MANIFEST が参照しているファイルは、ロールバックのために残す。
     let private quarantineOrphans (dir: string) (version: Version) =
         result {
-            let referenced = Version.allFiles version |> List.map _.FileNumber |> Set.ofList
+            let referenced =
+                Set.union
+                    (Version.allFiles version |> List.map _.FileNumber |> Set.ofList)
+                    (Manifest.referencedFileNumbers dir)
+
             let! numbers = sstNumbersOnDisk dir
             let orphans = numbers |> Array.filter (fun n -> not (Set.contains n referenced))
 
@@ -708,34 +725,14 @@ module internal StorageEngine =
                 Files = List.toArray levels
             })
 
-    /// WAL ファイル番号のうち最大のものを返す。
-    let private latestWalNumber =
-        Wal.walFiles
-        >> Result.map (List.choose parseNumber >> List.sort >> List.tryLast)
-
-    /// WAL を開く（無ければ作る）。
-    let private openOrCreateWal (dir: string) (version: Version) =
-        result {
-            let! latest = latestWalNumber dir
-
-            let walNumber =
-                match latest with
-                | Some n -> n
-                | None -> version.NextFileNumber
-
-            let! exists = protect (fun () -> System.IO.File.Exists(Wal.path dir walNumber))
-
-            if exists then
-                return!
-                    protect (fun () -> System.IO.FileInfo(Wal.path dir walNumber).Length)
-                    |> Result.map (fun size -> { FileNumber = walNumber; Size = size })
-            else
-                return! Wal.create dir walNumber
+    /// 1本の WAL を再生した結果。
+    type private WalReplay =
+        {
+            FileNumber: FileNumber
+            /// その WAL に現れた最大 SeqNo
+            MaxSeq: SeqNo
+            GoodSize: int64
         }
-
-    /// ディスク上の最大 SeqNo を返す。
-    let private maxSeqNoOnDisk =
-        Version.allFiles >> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
 
     /// ディスク上の最大ファイル番号を返す。
     let private maxFileNumberOnDisk (dir: string) =
@@ -751,6 +748,86 @@ module internal StorageEngine =
                 |> Array.fold max 0L
         }
 
+    /// ディスク上の WAL 番号（昇順）。
+    let private walNumbersOnDisk =
+        Wal.walFiles >> Result.map (List.choose parseNumber >> List.sort)
+
+    /// ディスク上の最大 SeqNo を返す。
+    let private maxSeqNoOnDisk =
+        Version.allFiles >> List.fold (fun acc f -> max acc f.MaxSeqNo) 0UL
+
+    /// すべての WAL をファイル番号順に再生し、各 WAL の最後の完全なフレームまで切り詰める。
+    /// 古い WAL は、新しい WAL や SSTable の名前が失われたときの復旧元として残す。
+    /// [diskMax] 以下の SeqNo は復旧済み Version の SSTable に含まれているので適用しない
+    /// （再適用すると memtable が膨らみ、LIMIT が不要な SSTable を開く原因になる）。
+    [<TailCall>]
+    let rec private replayWals
+        (dir: string)
+        (diskMax: SeqNo)
+        (mem: Memtable)
+        (maxSeq: SeqNo)
+        (maxTxn: TxnId)
+        (replays: WalReplay list)
+        =
+        function
+        | [] -> ret (mem, maxSeq, maxTxn, List.rev replays)
+        | number :: rest ->
+            match
+                Wal.foldCommitted
+                    dir
+                    number
+                    (fun (current, seqNo, fileSeq) entry ->
+                        let current =
+                            if entry.SeqNo > diskMax then
+                                Memtable.insert entry current
+                            else
+                                current
+
+                        current, max seqNo entry.SeqNo, max fileSeq entry.SeqNo)
+                    (mem, maxSeq, 0UL)
+            with
+            | Error e -> err e
+            | Ok((mem', maxSeq', fileMaxSeq), fileMaxTxn, goodSize) ->
+                match Wal.truncateTo dir goodSize { FileNumber = number; Size = goodSize } with
+                | Error e -> err e
+                | Ok _ ->
+                    replayWals
+                        dir
+                        diskMax
+                        mem'
+                        maxSeq'
+                        (max maxTxn fileMaxTxn)
+                        ({
+                            FileNumber = number
+                            MaxSeq = fileMaxSeq
+                            GoodSize = goodSize
+                         }
+                         :: replays)
+                        rest
+
+    /// 復旧に不要になった古い WAL を回収する。
+    /// 最新の WalRetention 本と、SSTable に反映されていない WAL は残す。
+    let private collectObsoleteWals (dir: string) (diskMax: SeqNo) (replays: WalReplay list) =
+        let sorted = replays |> List.sortBy _.FileNumber
+
+        let retained =
+            sorted
+            |> List.rev
+            |> List.truncate WalRetention
+            |> List.rev
+            |> List.map _.FileNumber
+            |> Set.ofList
+
+        sorted
+        |> List.filter (fun replay -> not (Set.contains replay.FileNumber retained) && replay.MaxSeq <= diskMax)
+        |> List.iter (fun replay ->
+            protect (fun () ->
+                let path = Wal.path dir replay.FileNumber
+
+                if System.IO.File.Exists path then
+                    System.IO.File.Delete path)
+            |> ignore)
+
     /// 空の engine を組み立てる。
     let private emptyEngine (dir: string) =
         {
@@ -762,6 +839,7 @@ module internal StorageEngine =
             NextSeqNo = 1UL
             NextTxnId = 1UL<txnId>
             MemLimitBytes = DefaultMemLimitBytes
+            DeferDeletes = true
             Compaction = CompactionOptions.Defaults
             ActiveSnapshot = 0UL
             Runtime = StorageRuntime()
@@ -798,28 +876,36 @@ module internal StorageEngine =
 
     /// データベースを開く（新規なら作る）。
     /// [memLimitBytes] を指定すると memtable の上限を差し替える。
+    /// 参照 SSTable が欠けた Version は、MANIFEST の履歴を遡って復旧する。
+    /// 残っている WAL はすべて再生する（古い WAL の再適用は SeqNo で解決する）。
     let openDatabaseWith (memLimitBytes: int option) (dir: string) =
         result {
-            let! version, manifestNumber = Manifest.openOrCreate dir
+            let! version, manifestNumber = Manifest.openOrCreateWith dir (filesPresent dir)
             do! ensureFilesPresent dir version
+            Manifest.collectGarbage dir manifestNumber ManifestRetention
             do! quarantineOrphans dir version
             let! version' = hydrateVersion dir version
-            let! walState = openOrCreateWal dir version'
-
-            let! replayed =
-                Wal.foldCommitted
-                    dir
-                    walState.FileNumber
-                    (fun (mem, maxSeq) entry -> Memtable.insert entry mem, max maxSeq entry.SeqNo)
-                    (Memtable.Empty, 0UL)
-
-            let (mem, walMax), walMaxTxn, goodWalSize = replayed
-            let! alignedWal = Wal.truncateTo dir goodWalSize walState
-            let diskMax = maxSeqNoOnDisk version'
             let! diskMaxFile = maxFileNumberOnDisk dir
+            let! walNumbers = walNumbersOnDisk dir
+            let diskMax = maxSeqNoOnDisk version'
+
+            let! mem, walMax, walMaxTxn, replays =
+                replayWals dir diskMax Memtable.Empty 0UL 0UL<txnId> [] walNumbers
+
+            collectObsoleteWals dir diskMax replays
+
+            let! walState =
+                match List.tryLast replays with
+                | Some replay ->
+                    ret
+                        {
+                            FileNumber = replay.FileNumber
+                            Size = replay.GoodSize
+                        }
+                | None -> Wal.create dir (max version'.NextFileNumber (diskMaxFile + 1L))
 
             let engine =
-                buildRecovered dir version' manifestNumber alignedWal mem walMax diskMax diskMaxFile walMaxTxn
+                buildRecovered dir version' manifestNumber walState mem walMax diskMax diskMaxFile walMaxTxn
 
             return
                 match memLimitBytes with
@@ -827,11 +913,13 @@ module internal StorageEngine =
                 | None -> engine
         }
 
-    /// データベースを閉じる（memtable を flush してから WAL を消す）。
+    /// データベースを閉じる（memtable を flush して WAL を fsync する）。
     /// <remarks>
+    /// WAL は削除しない。削除は次の起動時の復旧検証後に回す
+    /// （SSTable や MANIFEST の名前が失われたときの復旧元として残す）。
     /// ハンドルは不変なので、古いハンドルでも `Close` を呼べる。
     /// 古いハンドルの WAL は新しいハンドルが既に書き進めているため、
-    /// WAL の実サイズがハンドルの記録と一致しないときは flush も WAL 削除もしない
+    /// WAL の実サイズがハンドルの記録と一致しないときは flush もしない
     /// （古い memtable を flush すると新しいハンドルの書き込みを消してしまう）。
     /// </remarks>
     let close (engine: StorageEngine) =
@@ -847,14 +935,7 @@ module internal StorageEngine =
                 result {
                     match flush engine with
                     | Error(_, e) -> return! err e
-                    | Ok flushed ->
-                        do! Wal.sync flushed.Dir flushed.Wal
-                        let! stale = Wal.walFiles flushed.Dir
-
-                        stale
-                        |> List.iter (fun p -> protect (fun () -> System.IO.File.Delete p) |> ignore)
-
-                        return ()
+                    | Ok flushed -> do! Wal.sync flushed.Dir flushed.Wal
                 })
 
 /// 実ディスクの StorageEngine を IStorageEngine として公開する。

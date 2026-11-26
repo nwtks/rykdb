@@ -509,7 +509,6 @@ let ``DatabaseHost: background compaction の install 後も書き込み文が�
                 Version.allFiles version |> List.map _.FileNumber |> Set.ofList
 
             // 最後の commit 時点の Version と、compaction が install した Version の差を待つ。
-            // 旧ファイルがディスクから消えるまで待つのは、修正前のコードで確実に失敗させるため。
             let committedNumbers =
                 fileNumbers host.Committed.Store.Engine.PublishedState.Version
 
@@ -519,9 +518,16 @@ let ``DatabaseHost: background compaction の install 後も書き込み文が�
                 let removed =
                     Set.difference committedNumbers (fileNumbers coordinator.Current.Version)
 
-                not (Set.isEmpty removed)
-                && removed
-                   |> Set.forall (fun n -> not (System.IO.File.Exists(FileMetaData.path dir n))))
+                not (Set.isEmpty removed))
+
+            // 旧ファイルは遅延削除のため残っている（クラッシュ時のロールバックに使う）。
+            // それでも確定状態の store が古い Version を指したままだと UPDATE が失敗するので、
+            // 書き込み文が最新 Version へ載せ替えられていることを検査する。
+            let removed =
+                Set.difference committedNumbers (fileNumbers coordinator.Current.Version)
+
+            removed
+            |> Set.iter (fun n -> Assert.True(System.IO.File.Exists(FileMetaData.path dir n)))
 
             // 修正前は確定状態の store が最後の commit 時点の Version を指したまま
             // compaction が旧ファイルを削除していたため、UPDATE の走査が IoError になった。

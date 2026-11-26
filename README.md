@@ -155,6 +155,7 @@ Bloom filter の誤検出率（1%）と LSM のレベル容量比（10倍）は�
 | ファイル                                              | 内容                                                      |
 | ----------------------------------------------------- | --------------------------------------------------------- |
 | [`architecture.md`](docs/architecture.md)             | 内部設計（レイヤ構成・実行モデル・LSM・MVCC・既知の制約） |
+| [`crash-consistency.md`](docs/crash-consistency.md)   | クラッシュ整合性の保証レベル・復旧手順・検証方法          |
 | [`coding-conventions.md`](docs/coding-conventions.md) | コーディング規約（例外・不変・末尾再帰）                  |
 | [`development.md`](docs/development.md)               | ビルド・テスト・品質ゲート                                |
 | [`invariants.md`](docs/invariants.md)                 | 型で守れない不変条件の一覧と担保方法                      |

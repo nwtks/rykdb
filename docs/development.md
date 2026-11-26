@@ -172,6 +172,8 @@ class 内の `let` は FS1182 が担当するため対象外（`--warnon:1182` �
 例外的なテスト構成は次のとおり。
 
 - `DatabaseTests.fs` はソースファイルに対応せず、`Session` / `SessionPool` 経由の DB 全体の通し経路を検証する。
+- `CrashConsistencyTests.fs` はソースファイルに対応せず、CURRENT スロット・WAL 名・SSTable 名の
+  消失からの復旧（[`crash-consistency.md`](crash-consistency.md) の C1/C2）を検証する。
 - `ProcessLock.fs` は専用ファイルを持たず、`RowStoreTests` / `DatabaseTests` で間接的に検証する。
 - `EngineAnalyze.fs` / `EngineDdl.fs` は専用ファイルを持たず、`DatabaseTests` / `SqlReferenceTests` の E2E で検証する。
 - `CommitDurability:` と `SerializationTests` の「順序保持:」は横断的な性質を検証する。
@@ -194,6 +196,10 @@ dotnet test --filter "FullyQualifiedName~RykDb.ServerTests"
 - `DatabaseTests`
   - MVCC、WAL、プロセスロック、索引の backfill と後始末、永続性、末尾再帰を検証する。
   - Parser、Analyzer、Plan、PlanBuilder、ExecContext、Catalog の連携も検証する。
+- `CrashConsistencyTests`
+  - CURRENT の A/B スロット、WAL / SSTable のファイル名消失、compaction 出力の消失、
+    WAL v2 のフレームヘッダー破損を検証する。
+  - 復旧を 2 回繰り返しても同じ manifest を指すこと（冪等性）を検証する。
 
 ### テストの書き方
 

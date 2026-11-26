@@ -22,6 +22,13 @@ let private applyEdit (dir: string) (manifestNumber: ManifestNumber) (version: V
         Assert.Fail(DbError.toDisplayString e)
         version
 
+/// CURRENT.A / CURRENT.B スロットを書く（テスト用）。
+let private writeCurrentSlot (dir: string) (slot: string) (manifestNumber: ManifestNumber) =
+    let name = sprintf "MANIFEST-%06d" manifestNumber
+    let checksum = Hashing.checksum (System.Text.Encoding.UTF8.GetBytes name)
+
+    System.IO.File.WriteAllText(System.IO.Path.Combine(dir, slot), sprintf "%s %08X\n" name checksum)
+
 [<Fact>]
 let ``FileMetaData.Zero: 空メタデータ`` () =
     Assert.Equal(0L, FileMetaData.Zero.FileNumber)
@@ -552,32 +559,10 @@ let ``Manifest: 空行は読み飛ばす`` () =
         Assert.Equal<int array>([| 1; 0; 0; 0; 0; 0; 0 |], levelCounts reopened))
 
 [<Fact>]
-let ``Manifest: 空の CURRENT は新規作成として扱う`` () =
-    withDir "manifest-empty-current" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "\n")
-
-        let version, manifestNumber = ok (Manifest.openOrCreate dir)
-        Assert.Equal<ManifestNumber>(1L<manifestNo>, manifestNumber)
-        Assert.Empty(Version.allFiles version))
-
-[<Fact>]
-let ``Manifest: CURRENT の .manifest 付き表記は番号として読む`` () =
-    withDir "manifest-suffix" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "MANIFEST-000007.manifest\n")
-        // 指している MANIFEST は空でよい
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "MANIFEST-000007"), "")
-
-        let version, manifestNumber = ok (Manifest.openOrCreate dir)
-        Assert.Equal<ManifestNumber>(7L<manifestNo>, manifestNumber)
-        Assert.Empty(Version.allFiles version))
-
-[<Fact>]
 let ``Manifest: CURRENT が指す MANIFEST が無ければ CorruptionError`` () =
     withDir "manifest-missing" (fun dir ->
         ok (Manifest.ensureDirectory dir)
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "MANIFEST-000007\n")
+        writeCurrentSlot dir "CURRENT.A" 7L<manifestNo>
 
         // 空の Version で開くと SSTable が孤児になるので、開かずにエラーにする
         expectErrorKind ErrorKind.CorruptionError "manifest の欠落はエラーになる" (Manifest.openOrCreate dir))
@@ -594,19 +579,12 @@ let ``Manifest: CURRENT が無いのに SSTable があれば CorruptionError`` (
 let ``Manifest: 中身があるのに Version が空なら CorruptionError`` () =
     withDir "manifest-empty-version" (fun dir ->
         ok (Manifest.ensureDirectory dir)
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "MANIFEST-000001\n")
+        writeCurrentSlot dir "CURRENT.A" 1L<manifestNo>
         // "AAAA" は 4バイトで、チェックサムフレームとしても VersionEdit としても不正
         System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "MANIFEST-000001"), "AAAA\n")
         System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "000002.sst"), [| 1uy |])
 
         expectErrorKind ErrorKind.CorruptionError "SSTable があるのに空の Version はエラー" (Manifest.openOrCreate dir))
-
-[<Fact>]
-let ``Manifest: CURRENT が不正なら CorruptionError`` () =
-    withDir "manifest-corrupt" (fun dir ->
-        ok (Manifest.ensureDirectory dir)
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "CURRENT"), "not-a-manifest")
-        expectErrorKind ErrorKind.CorruptionError "壊れた CURRENT はエラーになるはず" (Manifest.openOrCreate dir))
 
 [<Fact>]
 let ``Manifest: NextFileNumber は追加したファイル番号より必ず大きくなる`` () =

@@ -38,6 +38,8 @@ type private InstallContext =
         OldestSnapshot: unit -> uint64 option
         ManifestApply: (ManifestNumber -> Version -> VersionEdit -> ManifestApplyResult) option
         FileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>
+        /// compaction の入力をすぐ削除せず、起動時の検証後に回すか
+        DeferDeletes: bool
     }
 
 /// compaction 1サイクルに必要な共有状態。
@@ -79,16 +81,20 @@ module private VersionCoordinatorHelpers =
         defaultArg manifestApply (defaultApplyManifest dir)
 
     /// ファイルを削除する（失敗したら false）。
-    let tryDeleteFile (dir: string) (fileNumber: FileNumber) =
-        match
-            protect (fun () ->
-                let path = FileMetaData.path dir fileNumber
+    /// [deferDeletes] が true のときは削除せず、起動時の GC に回す。
+    let tryDeleteFile (deferDeletes: bool) (dir: string) (fileNumber: FileNumber) =
+        if deferDeletes then
+            true
+        else
+            match
+                protect (fun () ->
+                    let path = FileMetaData.path dir fileNumber
 
-                if System.IO.File.Exists path then
-                    System.IO.File.Delete path)
-        with
-        | Ok() -> true
-        | Error _ -> false
+                    if System.IO.File.Exists path then
+                        System.IO.File.Delete path)
+            with
+            | Ok() -> true
+            | Error _ -> false
 
     /// 二重 Dispose で参照数を 2回減らさないための 1回限りの解放。
     let disposableOnce (release: unit -> unit) =
@@ -193,6 +199,7 @@ module private VersionCoordinatorHelpers =
     /// ファイルの参照を減らすループ本体。
     [<TailCall>]
     let rec releaseFile
+        (deferDeletes: bool)
         (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
         (dir: string)
         (fileNumber: FileNumber)
@@ -202,12 +209,12 @@ module private VersionCoordinatorHelpers =
             if state.Pins <= 0 then
                 false
             elif not (fileRefs.TryUpdate(fileNumber, { state with Pins = state.Pins - 1 }, state)) then
-                releaseFile fileRefs dir fileNumber
+                releaseFile deferDeletes fileRefs dir fileNumber
             elif state.Pins > 1 then
                 false
             elif state.Retired then
                 if fileRefs.TryRemove(System.Collections.Generic.KeyValuePair(fileNumber, { state with Pins = 0 })) then
-                    if not (tryDeleteFile dir fileNumber) then
+                    if not (tryDeleteFile deferDeletes dir fileNumber) then
                         fileRefs.TryAdd(fileNumber, { Pins = 0; Retired = true }) |> ignore
 
                     true
@@ -237,7 +244,9 @@ module private VersionCoordinatorHelpers =
                 retireFile fileRefs fileNumber
 
     /// retired かつ参照 0 のファイルを削除する（失敗したら次回に再試行）。
+    /// [deferDeletes] が true のときは追跡だけ外し、ファイルは起動時の GC に残す。
     let sweepFiles
+        (deferDeletes: bool)
         (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
         (dir: string)
         =
@@ -245,12 +254,13 @@ module private VersionCoordinatorHelpers =
         |> Array.iter (fun pair ->
             if pair.Value.Retired && pair.Value.Pins = 0 then
                 if fileRefs.TryRemove(System.Collections.Generic.KeyValuePair(pair.Key, pair.Value)) then
-                    if not (tryDeleteFile dir pair.Key) then
+                    if not (tryDeleteFile deferDeletes dir pair.Key) then
                         fileRefs.TryAdd(pair.Key, { Pins = 0; Retired = true }) |> ignore)
 
     /// Version の参照を減らすループ本体。
     [<TailCall>]
     let rec releaseVersion
+        (deferDeletes: bool)
         (versionPins: System.Collections.Concurrent.ConcurrentDictionary<Version, int>)
         (fileRefs: System.Collections.Concurrent.ConcurrentDictionary<FileNumber, FileRefState>)
         (dir: string)
@@ -259,15 +269,15 @@ module private VersionCoordinatorHelpers =
         match versionPins.TryGetValue version with
         | true, count when count > 1 ->
             if not (versionPins.TryUpdate(version, count - 1, count)) then
-                releaseVersion versionPins fileRefs dir version
+                releaseVersion deferDeletes versionPins fileRefs dir version
         | true, 1 ->
             if versionPins.TryRemove(System.Collections.Generic.KeyValuePair(version, 1)) then
                 Version.allFiles version
-                |> List.iter (fun f -> releaseFile fileRefs dir f.FileNumber |> ignore)
+                |> List.iter (fun f -> releaseFile deferDeletes fileRefs dir f.FileNumber |> ignore)
 
-                sweepFiles fileRefs dir
+                sweepFiles deferDeletes fileRefs dir
             else
-                releaseVersion versionPins fileRefs dir version
+                releaseVersion deferDeletes versionPins fileRefs dir version
         | _ -> ()
 
     /// ファイルを走査する（hook を呼んでから scanOf を実行）。
@@ -441,6 +451,7 @@ module private VersionCoordinatorHelpers =
     /// 現在 Version を pin した lease を取得するループ本体。
     [<TailCall>]
     let rec acquireCallLoop
+        (deferDeletes: bool)
         (stateCell: System.Collections.Concurrent.ConcurrentDictionary<string, PublishedState>)
         (stateKey: string)
         (versionPins: System.Collections.Concurrent.ConcurrentDictionary<Version, int>)
@@ -451,10 +462,10 @@ module private VersionCoordinatorHelpers =
         pinVersion versionPins fileRefs state.Version
 
         if obj.ReferenceEquals(stateCell.[stateKey], state) then
-            state, disposableOnce (fun () -> releaseVersion versionPins fileRefs dir state.Version)
+            state, disposableOnce (fun () -> releaseVersion deferDeletes versionPins fileRefs dir state.Version)
         else
-            releaseVersion versionPins fileRefs dir state.Version
-            acquireCallLoop stateCell stateKey versionPins fileRefs dir
+            releaseVersion deferDeletes versionPins fileRefs dir state.Version
+            acquireCallLoop deferDeletes stateCell stateKey versionPins fileRefs dir
 
     /// 現在の最古 snapshot（登録が無ければ ActiveSnapshot）。
     let private oldestSnapshotAt (ctx: InstallContext) (current: PublishedState) =
@@ -555,7 +566,7 @@ module private VersionCoordinatorHelpers =
                 | ManifestApplyResult.Applied(version, manifestNumber) ->
                     publishInstalled ctx result version manifestNumber)
 
-        sweepFiles ctx.FileRefs ctx.Dir
+        sweepFiles ctx.DeferDeletes ctx.FileRefs ctx.Dir
 
     /// compaction を最大 `remaining` 回まわす。
     [<TailCall>]
@@ -582,7 +593,7 @@ module private VersionCoordinatorHelpers =
                     })
                 |> ignore
 
-                sweepFiles ctx.FileRefs ctx.Dir
+                sweepFiles installCtx.DeferDeletes ctx.FileRefs ctx.Dir
             | Ok(result, _) ->
                 if List.isEmpty result.Added && List.isEmpty result.Removed then
                     publish ctx.StateCell ctx.StateKey (fun state ->
@@ -591,7 +602,7 @@ module private VersionCoordinatorHelpers =
                         })
                     |> ignore
 
-                    sweepFiles ctx.FileRefs ctx.Dir
+                    sweepFiles installCtx.DeferDeletes ctx.FileRefs ctx.Dir
                 else
                     install installCtx (baseState, result)
 
@@ -605,6 +616,7 @@ type internal VersionCoordinator
         dir: string,
         initial: PublishedState,
         options: CompactionOptions,
+        deferDeletes: bool,
         oldestSnapshot: unit -> uint64 option,
         scanOf: FileMetaData -> Result<SstScan, DbError>,
         scanHook: (FileMetaData -> unit) option,
@@ -656,6 +668,7 @@ type internal VersionCoordinator
             OldestSnapshot = oldestSnapshot
             ManifestApply = manifestApply
             FileRefs = fileRefs
+            DeferDeletes = deferDeletes
         }
 
     /// compaction サイクルへ渡す共通文脈。
@@ -696,7 +709,7 @@ type internal VersionCoordinator
     /// （SELECT が flush を待たない）。
     /// </remarks>
     member _.AcquireCall() =
-        VersionCoordinatorHelpers.acquireCallLoop stateCell stateKey versionPins fileRefs dir
+        VersionCoordinatorHelpers.acquireCallLoop deferDeletes stateCell stateKey versionPins fileRefs dir
 
     /// 指定した Version を pin する lease を返す。
     /// 走査が呼び出し元の read lease より長生きする場合に使う。
@@ -706,7 +719,7 @@ type internal VersionCoordinator
         VersionCoordinatorHelpers.pinVersion versionPins fileRefs version
 
         VersionCoordinatorHelpers.disposableOnce (fun () ->
-            VersionCoordinatorHelpers.releaseVersion versionPins fileRefs dir version)
+            VersionCoordinatorHelpers.releaseVersion deferDeletes versionPins fileRefs dir version)
 
     member _.Signal() =
         VersionCoordinatorHelpers.signalWork
@@ -745,7 +758,7 @@ type internal VersionCoordinator
             with _ ->
                 ())
 
-        VersionCoordinatorHelpers.sweepFiles fileRefs dir
+        VersionCoordinatorHelpers.sweepFiles deferDeletes fileRefs dir
 
     member internal _.IsIdle =
         match workerCell.[workerKey] with

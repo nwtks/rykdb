@@ -138,6 +138,45 @@ let ``Wal.walFiles: 存在しないディレクトリの walFiles は空`` () =
     Assert.Empty(ok (Wal.walFiles missing))
 
 [<Fact>]
+let ``Wal.append: 不完全なヘッダーを切り詰めた後に新しいヘッダーから書ける`` () =
+    withDir "wal-header-retry" (fun dir ->
+        let state = freshWal dir
+        let path = Wal.path dir 1L
+
+        // ファイルヘッダーの先頭 8 バイトだけを残す（書きかけのヘッダー）。
+        let bytes = System.IO.File.ReadAllBytes path
+        System.IO.File.WriteAllBytes(path, bytes.[0..7])
+
+        let replayed, _, goodSize =
+            ok (Wal.foldCommitted dir 1L (fun acc entry -> entry :: acc) [])
+
+        Assert.Empty replayed
+        Assert.Equal(0L, goodSize)
+
+        let truncated = ok (Wal.truncateTo dir goodSize { state with Size = goodSize })
+        let txn = 1UL<txnId>
+
+        let appended =
+            ok (
+                Wal.append
+                    dir
+                    [
+                        WalRecord.Begin txn
+                        WalRecord.Batch(txn, [| Entry.put (intKey 1) 1UL (intRow 1) |])
+                        WalRecord.Commit txn
+                    ]
+                    truncated
+            )
+
+        Assert.True(appended.Size > int64 goodSize)
+
+        let replayed, maxTxnId, _ =
+            ok (Wal.foldCommitted dir 1L (fun acc entry -> entry :: acc) [])
+
+        Assert.Equal<uint64 list>([ 1UL ], replayed |> List.rev |> List.map _.SeqNo)
+        Assert.Equal(txn, maxTxnId))
+
+[<Fact>]
 let ``Wal: deferred append の位置を fsync でき、削除済みファイルは同期済み扱い`` () =
     withDir "wal-deferred-sync" (fun dir ->
         let state = ok (Wal.create dir 1L)
