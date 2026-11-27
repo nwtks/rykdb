@@ -643,6 +643,15 @@ JOINを並べ替えても`SELECT *`の列順はFROM順を保つ。
 各ノードの出力スキーマは`OutputSchemaMemo`で1回の実行につき1パスだけ求める
 （左深い結合木でもスキーマ計算が O(n²) にならない）。
 
+プラン中に変わらない実行情報は`ExecContext`へ持たせ、同じプランを繰り返し実行するときに再利用する。
+
+- `ScanNeeds`（各`Logical.Scan`の列マスク）と`JoinPlans`（各`Logical.Join`のアルゴリズム・結合キー・build 側）を
+  `Optimizer.prepareContext`が計画時に 1回だけ求める。
+- `Optimizer.exec`は空なら求める（通常の 1回実行の経路）。
+  `Engine.prepareSelect`は計画時に埋めるので、`Optimizer.exec`を繰り返しても再計算しない。
+- `JoinPlans`は`Logical`ノードの参照をキーにした`obj`辞書として持つ
+  （`JoinFrame`は`Optimizer`の内部型で、`ExecContext`より後にコンパイルされるため）。
+
 `LIMIT`は`Op.skip(OFFSET)`の後に`Op.take(LIMIT)`を適用する。
 最終的な行の配列化は`Engine.runSelect`が行う。
 

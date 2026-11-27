@@ -153,7 +153,11 @@ module internal Engine =
         |> Result.map (ExecContext.withJoinOrder strategy)
         >>= fun ctx ->
             match Plan.explainSelect ctx stmt with
-            | Ok plan -> ret plan
+            | Ok plan ->
+                ret
+                    { plan with
+                        Context = Optimizer.prepareContext plan.Context plan.Input plan.Tree
+                    }
             | Error e ->
                 ctx.Scope.DisposeAll()
                 err e

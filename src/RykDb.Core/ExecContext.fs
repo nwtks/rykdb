@@ -32,6 +32,10 @@ type internal ExecContext =
         /// `Logical` はこのファイルより後に定義されるため、参照等価の `obj` キーで持つ。
         /// `Optimizer.exec` がクエリ開始時に構築する（クエリ中は不変）。
         ScanNeeds: System.Collections.Immutable.ImmutableDictionary<obj, bool array>
+        /// 結合ノード（`Logical.Join`）の実行プラン（`Optimizer.JoinFrame`）。
+        /// 型をこのファイルより前には置けないので `obj` で包む。
+        /// `Optimizer.prepareContext` が計画時に埋め、`buildJoinFrame` が再利用する。
+        JoinPlans: System.Collections.Immutable.ImmutableDictionary<obj, obj>
         /// 演算子が使ってよいメモリ作業領域とスピル先。
         /// クエリ開始時に 1回だけ決まる。
         Budget: MemoryBudget
@@ -54,6 +58,7 @@ module internal ExecContext =
             Txn = Transaction.create 0UL<txnId> { SeqNo = 0UL }
             Scope = ScanScope()
             ScanNeeds = System.Collections.Immutable.ImmutableDictionary.Create<obj, bool array> HashIdentity.Reference
+            JoinPlans = System.Collections.Immutable.ImmutableDictionary.Create<obj, obj> HashIdentity.Reference
             Budget = MemoryBudget.Default
             JoinOrder = JoinOrderStrategy.Dp
             RowCounts = None

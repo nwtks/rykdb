@@ -125,6 +125,61 @@ let ``Optimizer.exec: Filter の下のラッパーを透過する`` () =
             Assert.Empty rows)
 
 [<Fact>]
+let ``Optimizer.prepareContext: 列マスクを 1回だけ求め、exec は再利用する`` () =
+    withSession "prepare-mask" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
+        let db2 = exec db1 "CREATE INDEX ix_a ON t (a)"
+        let db3 = exec db2 "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')"
+
+        let stmt = parseSelectOk "SELECT b FROM t WHERE a > 0"
+
+        match db3.PrepareSelect stmt with
+        | Error e -> Assert.Fail $"計画できません: {DbError.toDisplayString e}"
+        | Ok plan ->
+            // 計画時に列マスクが埋まっている。
+            Assert.False(plan.Context.ScanNeeds.IsEmpty)
+
+            // 同じ文脈で 2回実行しても結果が同じ（マスクを使い回しても壊れない）。
+            let textOf (rows: SqlValue array array) =
+                rows
+                |> Array.map (fun r -> r |> Array.map SqlLiteral.toSqlLiteral |> String.concat ",")
+                |> String.concat "|"
+
+            let first = ok (Op.toArray (ok (Optimizer.exec plan.Context plan.Tree plan.Input)))
+            let second = ok (Op.toArray (ok (Optimizer.exec plan.Context plan.Tree plan.Input)))
+            Assert.Equal<string>(textOf first, textOf second)
+            Assert.Equal<int>(2, first.Length)
+            plan.Context.Scope.DisposeAll())
+
+[<Fact>]
+let ``Optimizer.prepareContext: 結合プランも計画時に決めて再利用する`` () =
+    withSession "prepare-join" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db3 = exec db2 "INSERT INTO a VALUES (1, 1), (2, 2)"
+        let db4 = exec db3 "INSERT INTO b VALUES (1, 1), (2, 2)"
+
+        let stmt =
+            parseSelectOk "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id"
+
+        match db4.PrepareSelect stmt with
+        | Error e -> Assert.Fail $"計画できません: {DbError.toDisplayString e}"
+        | Ok plan ->
+            Assert.False(plan.Context.ScanNeeds.IsEmpty)
+            Assert.False(plan.Context.JoinPlans.IsEmpty)
+
+            let textOf (rows: SqlValue array array) =
+                rows
+                |> Array.map (fun r -> r |> Array.map SqlLiteral.toSqlLiteral |> String.concat ",")
+                |> String.concat "|"
+
+            let first = ok (Op.toArray (ok (Optimizer.exec plan.Context plan.Tree plan.Input)))
+            let second = ok (Op.toArray (ok (Optimizer.exec plan.Context plan.Tree plan.Input)))
+            Assert.Equal<string>(textOf first, textOf second)
+            Assert.Equal<int>(2, first.Length)
+            plan.Context.Scope.DisposeAll())
+
+[<Fact>]
 let ``Optimizer.exec: Join の左右でエラーになった木は Error を返す`` () =
     withStore "ex-joinerr" (fun store ->
         let ctx = ctxOf store

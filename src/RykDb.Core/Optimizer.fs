@@ -775,37 +775,40 @@ module internal Optimizer =
         (left: Logical)
         (right: Logical)
         =
-        let leftSchema = outputOfMemo ctx inSchema memo left
+        match ctx.JoinPlans.TryGetValue(box node) with
+        | true, (:? JoinFrame as cached) -> cached, cached.LeftSchema
+        | _ ->
+            let leftSchema = outputOfMemo ctx inSchema memo left
 
-        let rightSchema, rightTable =
-            match stripWrappers right with
-            | Logical.Derived plan -> plan.Output, None
-            | Logical.Join _ -> outputOfMemo ctx inSchema memo right, None
-            | _ ->
-                let table = defaultSchema ctx name
-                Schema.ofTable name None table, Some table
+            let rightSchema, rightTable =
+                match stripWrappers right with
+                | Logical.Derived plan -> plan.Output, None
+                | Logical.Join _ -> outputOfMemo ctx inSchema memo right, None
+                | _ ->
+                    let table = defaultSchema ctx name
+                    Schema.ofTable name None table, Some table
 
-        let statsOf = statsOfContext ctx
+            let statsOf = statsOfContext ctx
 
-        let algorithm, keys, leftKeyIndices =
-            Analyzer.chooseJoinAlgorithmWith statsOf (tableOf ctx) leftSchema rightSchema rightTable left right on
+            let algorithm, keys, leftKeyIndices =
+                Analyzer.chooseJoinAlgorithmWith statsOf (tableOf ctx) leftSchema rightSchema rightTable left right on
 
-        let frame =
-            {
-                Node = node
-                Kind = kind
-                Right = right
-                On = on
-                LeftSchema = leftSchema
-                RightSchema = rightSchema
-                RightName = name
-                Algorithm = algorithm
-                Keys = keys
-                LeftKeyIndices = defaultArg leftKeyIndices [||]
-                BuildSide = hashBuildSide statsOf algorithm kind left right
-            }
+            let frame =
+                {
+                    Node = node
+                    Kind = kind
+                    Right = right
+                    On = on
+                    LeftSchema = leftSchema
+                    RightSchema = rightSchema
+                    RightName = name
+                    Algorithm = algorithm
+                    Keys = keys
+                    LeftKeyIndices = defaultArg leftKeyIndices [||]
+                    BuildSide = hashBuildSide statsOf algorithm kind left right
+                }
 
-        frame, leftSchema
+            frame, leftSchema
 
     /// 論理木を 1ノードずつ処理する。
     /// 継続は ExecFrame list に積むので、ラッパの深さに依存せずスタックは一定。
@@ -960,6 +963,7 @@ module internal Optimizer =
                         (EvalNode(plan.Tree, plan.Input, None, None))
 
     /// 論理代数を Op に変換する。
+    /// 結合ノードを後順で集める作業項目。
     /// <remarks>
     /// 下へ渡すスキーマは常に「入力スキーマ」schema のまま。
     /// outputOf child schema は「child の出力スキーマ」であって、
@@ -970,14 +974,78 @@ module internal Optimizer =
     /// `GROUP BY` も別の列でグループ化してしまう。
     /// childSchema は「そのノードが結果を読む側」だけが使う。
     /// </remarks>
-    let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
-        let memo = OutputSchemaMemo()
+    type private JoinPlanJob =
+        | VisitNode of Logical * Schema
+        | PutJoinPlan of Logical * Schema
 
-        let ctx =
+    /// 結合ノード 1つ分の実行プランを求めて辞書へ積む。
+    let private processJoinPlanJob
+        (baseCtx: ExecContext)
+        (memo: OutputSchemaMemo)
+        (acc: (obj * obj) list)
+        (frames: JoinPlanJob list)
+        =
+        function
+        | VisitNode(Logical.Join(_, _, _, left, right) as node, inSchema) ->
+            let leftSchema = outputOfMemo baseCtx inSchema memo left
+            let rightSchema = outputOfMemo baseCtx inSchema memo right
+
+            acc,
+            VisitNode(left, leftSchema)
+            :: VisitNode(right, rightSchema)
+            :: PutJoinPlan(node, inSchema)
+            :: frames
+        | VisitNode((Logical.Filter(_, child) | Logical.Sort(_, child) | Logical.Limit(_, _, child) | Logical.Distinct child | Logical.Having(_,
+                                                                                                                                              _,
+                                                                                                                                              _,
+                                                                                                                                              child) | Logical.Project(_,
+                                                                                                                                                                       child) | Logical.Aggregate(_,
+                                                                                                                                                                                                  _,
+                                                                                                                                                                                                  child)),
+                    inSchema) -> acc, VisitNode(child, inSchema) :: frames
+        | VisitNode(_, _) -> acc, frames
+        | PutJoinPlan(Logical.Join(kind, name, on, left, right) as node, inSchema) ->
+            let frame, _ = buildJoinFrame baseCtx memo inSchema node kind name on left right
+            (box node, box frame) :: acc, frames
+        | PutJoinPlan(_, _) -> acc, frames
+
+    [<TailCall>]
+    let rec private collectJoinPlan (ctx: ExecContext) (memo: OutputSchemaMemo) (acc: (obj * obj) list) =
+        function
+        | [] ->
+            acc
+            |> List.map (fun (k, v) -> System.Collections.Generic.KeyValuePair<obj, obj>(k, v))
+            |> fun entries ->
+                System.Collections.Immutable.ImmutableDictionary.CreateRange<obj, obj>(HashIdentity.Reference, entries)
+        | job :: rest ->
+            let acc, next = processJoinPlanJob ctx memo acc rest job
+            collectJoinPlan ctx memo acc next
+
+    /// 結合ノードの実行プランを 1パスで求める。
+    let private collectJoinPlans (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (tree: Logical) =
+        collectJoinPlan ctx memo [] [ VisitNode(tree, inSchema) ]
+
+    /// 実行に必要なプラン情報（列マスクと結合プラン）を文脈へ埋める。
+    /// 既に埋まっていれば再計算しない（計画時の 1回分を再利用する）。
+    let prepareContext (ctx: ExecContext) (inSchema: Schema) (tree: Logical) =
+        if not ctx.ScanNeeds.IsEmpty && not ctx.JoinPlans.IsEmpty then
+            ctx
+        else
+            let memo = OutputSchemaMemo()
+
+            let baseCtx =
+                { ctx with
+                    JoinPlans = System.Collections.Immutable.ImmutableDictionary.Create()
+                }
+
             { ctx with
-                ScanNeeds = scanNeedsMasks ctx schema memo tree
+                ScanNeeds = scanNeedsMasks ctx inSchema memo tree
+                JoinPlans = collectJoinPlans baseCtx inSchema memo tree
             }
 
+    let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
+        let memo = OutputSchemaMemo()
+        let ctx = prepareContext ctx schema tree
         run ctx memo [] (EvalNode(tree, schema, None, None))
 
     /// 実行しながら、走査と結合の出力行数を `counts` に数える。
