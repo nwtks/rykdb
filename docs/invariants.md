@@ -718,6 +718,10 @@ UNIQUE索引の物理キーは「索引値＋主キー」のため、
 - commitした予約をcommit SeqNoで `LastCommitted`へ登録する。
 - 物理エントリがなくても予約だけのcommitでSeqNoを進める。
 - NULLを含むUNIQUE値は予約しない。
+- INSERT文の検査は`DmlOps.UniqueGuard`へ文開始時のスロットを 1回だけ畳み、
+  文内で確定したキーは不変`Map`の`Added`へ積む。
+  行ごとに`Transaction.slotsOf`を呼ばない。
+  `Added`はcommit用の`Reservations`とは別で、文内の可視性だけを担う。
 - UNIQUE reservationは物理キーではないため、CREATE UNIQUE INDEXのbackfillは不要である。
 - DDLは排他の `RootRuntime`で実行し、active transactionを拒否する。
 

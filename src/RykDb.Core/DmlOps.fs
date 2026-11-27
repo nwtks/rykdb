@@ -5,6 +5,29 @@
 namespace RykDb.Core
 
 module internal DmlOps =
+    /// 文単位の UNIQUE 検査ガード。
+    /// `BaseSlots` は文開始時の txn スロット（行ごとの `Transaction.slotsOf` を避ける）。
+    /// `Added` は文内で挿入した UNIQUE キー → PK（後続行との重複を O(log n) で見つける）。
+    /// 不変 `Map` なので、文の再帰へ引き回しても可変状態は増えない。
+    type private UniqueGuard =
+        {
+            BaseSlots: Map<string, (byte array * SqlValue array option) list>
+            Added: Map<string, Map<byte array, SqlValue array>>
+        }
+
+    /// 文の開始時にガードを作る
+    /// （UNIQUE 索引ごとのスロットはここで 1回だけ変換する）。
+    let private uniqueGuardOf (ctx: ExecContext) (accesses: Dml.IndexAccess list) =
+        let unique = accesses |> List.filter _.Index.Unique
+
+        {
+            BaseSlots =
+                unique
+                |> List.map (fun a -> a.Index.Name, Transaction.slotsOf (Keyspace.index a.Index.Name) ctx.Txn)
+                |> Map.ofList
+            Added = unique |> List.map (fun a -> a.Index.Name, Map.empty) |> Map.ofList
+        }
+
     /// WHERE を評価するときの対象スキーマ（UPDATE / DELETE で共通）。
     let private targetSchemaOf (schema: TableSchema) = Schema.ofTable schema.Name None schema
 
@@ -18,9 +41,9 @@ module internal DmlOps =
     /// 値式を列位置へ対応付ける再帰本体（アキュムレータを明示する）。
     [<TailCall>]
     let rec private gatherWithLoop
+        (acc: (int * SqlValue) list)
         (evalOne: Expr -> DbResult<SqlValue>)
         (schema: TableSchema)
-        (acc: (int * SqlValue) list)
         (vs: Expr list)
         (ixs: int list)
         =
@@ -34,19 +57,13 @@ module internal DmlOps =
 
                 match SqlValue.coerce colDef.DataType value with
                 | Error e -> DbErr e
-                | Ok coerced -> gatherWithLoop evalOne schema ((i, coerced) :: acc) rest restIdx
+                | Ok coerced -> gatherWithLoop ((i, coerced) :: acc) evalOne schema rest restIdx
         | _ -> DbOk acc
 
     /// 値式を列位置に対応付け、型強制して (位置, 値) のリストにする。
     /// UPDATE の現在行を使った評価を受け取る
     /// （INSERT は `evalValues` → `assembleRow` の別経路）。
-    let private gatherWith
-        (evalOne: Expr -> DbResult<SqlValue>)
-        (schema: TableSchema)
-        (values: Expr list)
-        (idxs: int list)
-        =
-        gatherWithLoop evalOne schema [] values idxs
+    let private gatherWith = gatherWithLoop []
 
     /// gather で埋まった `(列位置, 値)` の対を、列順の行へ戻す。
     /// 埋まっていない位置は fallback に委ねる
@@ -129,57 +146,71 @@ module internal DmlOps =
             |> Result.map (fun filled -> scatter schema.Columns.Length filled (fun i -> defaults.[i]))
 
     /// UNIQUE 索引の重複を検査する本体。
+    /// `added` は文内で確定したキー → PK（不変 Map をアキュムレータとして引き回す）。
     [<TailCall>]
     let rec private checkUniqueIndexes
         (ctx: ExecContext)
         (schema: TableSchema)
-        (txn: Transaction)
         (row: SqlValue array)
         (pkMask: bool array)
         (pk: SqlValue array)
         (pkBytes: byte array)
+        (guard: UniqueGuard)
+        (added: Map<string, Map<byte array, SqlValue array>>)
         =
         function
-        | [] -> ret pkBytes
+        | [] -> ret (pkBytes, added)
         | access: Dml.IndexAccess :: rest ->
             let idx = access.Index
             let values = access.Columns |> List.map (fun i -> row.[i]) |> List.toArray
 
             if values |> Array.exists SqlValue.isNull then
-                checkUniqueIndexes ctx schema txn row pkMask pk pkBytes rest
+                checkUniqueIndexes ctx schema row pkMask pk pkBytes guard added rest
             else
-                match
-                    Dml.scanByIndexPrefixWithTxnMask
-                        ctx.Store
-                        schema
-                        idx
-                        values
-                        1
-                        pkMask
-                        ctx.Visible
-                        (Some ctx.Scope)
-                        txn
-                with
-                | Ok scan ->
-                    match Op.next scan with
-                    | OpStep.OpError e -> err e
-                    | OpStep.OpDone -> checkUniqueIndexes ctx schema txn row pkMask pk pkBytes rest
-                    | OpStep.OpRow(existing, _) ->
-                        let existingPk = TableSchema.primaryKeyOf schema existing
-
-                        if Array.forall2 (=) existingPk pk then
-                            checkUniqueIndexes ctx schema txn row pkMask pk pkBytes rest
-                        else
-                            err (sprintf "UNIQUE 制約に違反: %s" idx.Name |> DbError.constraintViolation)
+                match KeyBuilder.ofValues values with
                 | Error e -> err e
+                | Ok key ->
+                    let remember () =
+                        added |> Map.add idx.Name (Map.add key pk added.[idx.Name])
 
-    /// 主キーと UNIQUE 索引の重複を検査し、確定した主キーのバイト列を返す。
+                    match Map.tryFind key added.[idx.Name] with
+                    | Some existingPk when not (Array.forall2 (=) existingPk pk) ->
+                        err (sprintf "UNIQUE 制約に違反: %s" idx.Name |> DbError.constraintViolation)
+                    | Some _ -> checkUniqueIndexes ctx schema row pkMask pk pkBytes guard added rest
+                    | None ->
+                        match
+                            Dml.scanByIndexPrefixWithSlots
+                                ctx.Store
+                                schema
+                                idx
+                                values
+                                1
+                                pkMask
+                                ctx.Visible
+                                (Some ctx.Scope)
+                                guard.BaseSlots.[idx.Name]
+                        with
+                        | Ok scan ->
+                            match Op.next scan with
+                            | OpStep.OpError e -> err e
+                            | OpStep.OpDone ->
+                                checkUniqueIndexes ctx schema row pkMask pk pkBytes guard (remember ()) rest
+                            | OpStep.OpRow(existing, _) ->
+                                let existingPk = TableSchema.primaryKeyOf schema existing
+
+                                if Array.forall2 (=) existingPk pk then
+                                    checkUniqueIndexes ctx schema row pkMask pk pkBytes guard (remember ()) rest
+                                else
+                                    err (sprintf "UNIQUE 制約に違反: %s" idx.Name |> DbError.constraintViolation)
+                        | Error e -> err e
+
+    /// 主キーと UNIQUE 索引の重複を検査し、確定した主キーのバイト列と更新済みガードを返す。
     let private checkUnique
         (ctx: ExecContext)
         (schema: TableSchema)
-        (txn: Transaction)
         (accesses: Dml.IndexAccess list)
         (row: SqlValue array)
+        (guard: UniqueGuard)
         =
         let existsMask = Array.create schema.Columns.Length false
 
@@ -190,18 +221,20 @@ module internal DmlOps =
 
         KeyBuilder.ofValues pk
         >>= fun pkBytes ->
-            match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes existsMask ctx.Visible txn with
+            match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes existsMask ctx.Visible ctx.Txn with
             | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
             | Ok None ->
                 checkUniqueIndexes
                     ctx
                     schema
-                    txn
                     row
                     pkMask
                     pk
                     pkBytes
+                    guard
+                    guard.Added
                     (accesses |> List.filter (fun a -> a.Index.Unique))
+                |> Result.map (fun (pkBytes, added) -> pkBytes, { guard with Added = added })
             | Error e -> err e
 
     /// 1行を制約検査して transaction へ積む。
@@ -217,14 +250,15 @@ module internal DmlOps =
         (accesses: Dml.IndexAccess list)
         (checks: ChildCheck list)
         (txn: Transaction)
+        (guard: UniqueGuard)
         (row: SqlValue array)
         =
-        checkUnique ctx schema txn accesses row
-        >>= fun pkBytes ->
+        checkUnique ctx schema accesses row guard
+        >>= fun (pkBytes, guard') ->
             Dml.insertWithKeyPrepared pkBytes txn schema accesses row
             >>= fun next ->
                 ForeignKey.checkChildRow ctx.Store ctx.Visible next schema checks row
-                |> Result.map (fun () -> next)
+                |> Result.map (fun () -> next, guard')
 
     /// INSERT。
     /// columns が None ならテーブル定義の順に並べる。
@@ -275,6 +309,7 @@ module internal DmlOps =
             let! idxs = insertTargets schema columns
             let! accesses = Dml.prepareIndexAccess schema
             let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
+            let guard = uniqueGuardOf ctx accesses
 
             match columns, rows with
             | None, [ [] ] ->
@@ -284,7 +319,7 @@ module internal DmlOps =
                     |> all
                     |> Result.map List.toArray
 
-                let! txn = insertRow ctx schema accesses checks ctx.Txn row
+                let! txn, _ = insertRow ctx schema accesses checks ctx.Txn guard row
                 return txn, 1
             | _ ->
                 let! defaults = defaultValuesOf schema (Set.ofList idxs)
@@ -292,14 +327,15 @@ module internal DmlOps =
                 return!
                     rows
                     |> foldOk
-                        (fun (txnAcc, count) values ->
+                        (fun (txnAcc, guardAcc, count) values ->
                             result {
                                 let! provided = insertEvalValues schema evalConstant idxs values
                                 let! row = assembleRow schema idxs defaults provided
-                                let! txnAcc2 = insertRow ctx schema accesses checks txnAcc row
-                                return txnAcc2, count + 1
+                                let! txnAcc2, guardAcc2 = insertRow ctx schema accesses checks txnAcc guardAcc row
+                                return txnAcc2, guardAcc2, count + 1
                             })
-                        (ctx.Txn, 0)
+                        (ctx.Txn, guard, 0)
+                    |> Result.map (fun (txn, _, count) -> txn, count)
         }
 
     /// INSERT ... SELECT。
@@ -318,6 +354,7 @@ module internal DmlOps =
         (accesses: Dml.IndexAccess list)
         (checks: ChildCheck list)
         (txn: Transaction)
+        (guard: UniqueGuard)
         (count: int)
         (cur: Op)
         =
@@ -327,8 +364,9 @@ module internal DmlOps =
         | OpStep.OpRow(row, nxt) ->
             match assembleRow schema idxs defaults row with
             | Ok values ->
-                match insertRow ctx schema accesses checks txn values with
-                | Ok next -> insertSelectGo ctx schema idxs defaults accesses checks next (count + 1) nxt
+                match insertRow ctx schema accesses checks txn guard values with
+                | Ok(next, guard') ->
+                    insertSelectGo ctx schema idxs defaults accesses checks next guard' (count + 1) nxt
                 | Error e -> err e
             | Error e -> err e
 
@@ -352,7 +390,8 @@ module internal DmlOps =
                 let! defaults = defaultValuesOf schema (Set.ofList idxs)
                 let! accesses = Dml.prepareIndexAccess schema
                 let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
-                return! insertSelectGo ctx schema idxs defaults accesses checks ctx.Txn 0 source
+                let guard = uniqueGuardOf ctx accesses
+                return! insertSelectGo ctx schema idxs defaults accesses checks ctx.Txn guard 0 source
         }
 
     /// UPDATE の代入式を現在行で評価して新しい行を作る。
@@ -402,7 +441,7 @@ module internal DmlOps =
         }
 
     /// 位置列から索引キーのバイト列を作る（NULL は対象外）。
-    let private encodeKeyValues positions (row: SqlValue array) =
+    let private encodeKeyValues (positions: int list) (row: SqlValue array) =
         let values = positions |> List.map (fun i -> row.[i]) |> List.toArray
 
         if values |> Array.exists SqlValue.isNull then

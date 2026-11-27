@@ -312,6 +312,17 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 - ✅ `Op.toArrayLimited -1 budget.Work` で直接読み込み、`CapacityError` を「収まらない」として扱う。
 - ❌ `Spill.spool` の戻り値で判定する（収まる場合も収まらない場合も run を作る）。
 
+### 3.26 UNIQUE 検査で行ごとに txn スロットを並べ替えない
+
+`Dml.scanByIndexPrefixWithTxnMask` が行ごとに `Transaction.slotsOf` を呼ぶと、
+`Map.toList` と `Bytes.compare` による再ソートが行数分走り、一括 INSERT が O(n² log n) になる。
+
+- ✅ 文の開始時に `DmlOps.UniqueGuard` を作り、`BaseSlots` を 1回だけ変換する。
+- ✅ 文内で確定したキーは不変 `Map` の `Added` へ積み、後続行はそこを先に見る。
+- ✅ ストア走査は `Dml.scanByIndexPrefixWithSlots` に `BaseSlots` を渡す。
+- ❌ `Reservations` を文内可視性に流用する（commit 競合専用で NULL を予約しないため意味が違う）。
+- 回帰: `SqlReference: 明示 transaction の INSERT は前の文の UNIQUE 値も見る`。
+
 ---
 
 ## 4. LSM・WAL・MANIFEST

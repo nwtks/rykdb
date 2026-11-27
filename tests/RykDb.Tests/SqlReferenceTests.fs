@@ -776,6 +776,29 @@ let ``SqlReference: UPDATE で UNIQUE 値を 3行で回転できる`` () =
         Assert.Equal<int64 list>([ 20L; 30L; 10L ], rows.Rows |> Array.toList |> List.map (fun r -> asInt r.[0])))
 
 [<Fact>]
+let ``SqlReference: 明示 transaction の INSERT は前の文の UNIQUE 値も見る`` () =
+    // 文単位ガードの BaseSlots（文開始時の txn スロット）経由で衝突を検出する。
+    withSession "unique-prior-statement" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
+        let db2 = exec db1 "BEGIN"
+        let db3 = exec db2 "INSERT INTO t VALUES (1, 'a')"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "前の文で挿入した UNIQUE 値との衝突"
+            (execSql db3 "INSERT INTO t VALUES (2, 'a')")
+
+        // 同じ文なら PK が違っても重複を検出する（Added 経由）。
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "同一文内の UNIQUE 重複"
+            (execSql db3 "INSERT INTO t VALUES (3, 'b'), (4, 'b')")
+
+        let db4 = exec db3 "ROLLBACK"
+        let _, rows = ok (execSql db4 "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(0L, asInt rows.Rows.[0].[0]))
+
+[<Fact>]
 let ``SqlReference: UNIQUE 列を代入しても値が変わらなければ通る`` () =
     withSession "unique-update-same" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"

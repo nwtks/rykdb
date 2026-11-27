@@ -686,6 +686,11 @@ INSERT/UPDATE/DELETEは行を`Transaction`のバッファへ積み、commit時�
   検査は**行を書いた後**の状態で行うので、自分自身を参照する行を挿入できる
   （同一文の後続行はまだ見えない）。
 - 親の削除検査は`ForeignKey.prepareParentDeleteChecks`で準備する。
+- INSERTのUNIQUE検査は文の開始時に`DmlOps.UniqueGuard`を 1つ作る。
+  `BaseSlots`は文開始時の索引スロットを 1回だけ`Transaction.slotsOf`で変換したもので、
+  行ごとの`Map.toList`＋再ソート（`O(txn log txn)`）を避ける。
+  `Added`は文内で確定した「UNIQUEキー→主キー」の不変`Map`で、後続行との重複を`O(log n)`で見つける。
+  ストア側のprefix走査は`Dml.scanByIndexPrefixWithSlots`に`BaseSlots`を渡す。
 - UPDATEのUNIQUE検査は「値が変わった行の新しい値」だけを索引prefixで引く。
   代入対象に索引列が無い索引は検査しない。
   同一文で同じ値になる行は、値が変わらない行も含めた集合で検出する。

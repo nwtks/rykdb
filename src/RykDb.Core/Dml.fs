@@ -591,6 +591,38 @@ module internal Dml =
                 return merged
         }
 
+    /// 索引の値に一致する全行を引く（txn のスロットを明示渡し）。
+    /// `slots` は文の開始時に 1回だけ作った `Transaction.slotsOf` の結果を受け取る。
+    /// 文内で追加した行は呼び出し側のガードが別途見る（DmlOps の UniqueGuard）。
+    let scanByIndexPrefixWithSlots
+        (store: RowStore)
+        (schema: TableSchema)
+        (index: IndexSchema)
+        (values: SqlValue array)
+        (limit: int)
+        (mask: bool array)
+        (visible: uint64 option)
+        (scope: ScanScope option)
+        (slots: (byte array * SqlValue array option) list)
+        =
+        result {
+            let! prefix = KeyBuilder.ofValues values
+            let! positions = indexAndPrimaryIndices schema index
+
+            let slots =
+                slots |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
+
+            let rowOf = indexRowDecoder schema positions mask
+
+            let! scan =
+                RowStore.scanAtRawMasked (indexSpace index) prefix (storeLimitFor limit slots) [||] visible scope store
+
+            let rows =
+                opOfIndexScan rowOf (fun key -> KeyBuilder.startsWithPrefix key prefix) slots scan
+
+            if limit > 0 then return Op.take limit rows else return rows
+        }
+
     /// 索引の値に一致する全行を引く（txn の書き込みを含む）。
     /// 索引値は空で、行は「索引列 + 主キー」のキーから復号する。
     /// 返り値は遅延の `Op`。
@@ -605,24 +637,16 @@ module internal Dml =
         (scope: ScanScope option)
         (txn: Transaction)
         =
-        result {
-            let! prefix = KeyBuilder.ofValues values
-            let! positions = indexAndPrimaryIndices schema index
-
-            let slots =
-                Transaction.slotsOf (indexSpace index) txn
-                |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
-
-            let rowOf = indexRowDecoder schema positions mask
-
-            let! scan =
-                RowStore.scanAtRawMasked (indexSpace index) prefix (storeLimitFor limit slots) [||] visible scope store
-
-            let rows =
-                opOfIndexScan rowOf (fun key -> KeyBuilder.startsWithPrefix key prefix) slots scan
-
-            if limit > 0 then return Op.take limit rows else return rows
-        }
+        scanByIndexPrefixWithSlots
+            store
+            schema
+            index
+            values
+            limit
+            mask
+            visible
+            scope
+            (Transaction.slotsOf (indexSpace index) txn)
 
     /// 索引の値が範囲 [lower, upper] に入る行を引く（txn の書き込みを含む）。
     /// 返り値は遅延の `Op`。
