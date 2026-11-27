@@ -822,6 +822,11 @@ JOINのONは並べ替え用の解析で修飾に失敗しても述語を落と�
 長さを接頭辞に含めることで、`t:a`と`t:ab`のような前方一致する名前を混同しない。
 走査は接頭辞境界で停止し、論理キーだけを呼び出し元へ返す。
 
+索引キーの構築では、列名から位置への解決を文単位で1回だけ行う
+（`Dml.prepareIndexAccess`）。
+`INSERT` / `UPDATE` / `DELETE` はこの準備済み `IndexAccess` を共有し、
+行ごとの `TableSchema.requireIndexOf` を避ける。
+
 ### 6.2 行の削除
 
 削除は物理キーへtombstoneを付ける。
@@ -852,6 +857,11 @@ compactionはtombstoneを最下位レベルで回収する。
 自身の主キーを参照する行を挿入でき、同一文の先行行は参照できるが、
 後続行はまだ書かれていないので参照できない。
 子スキーマ、列位置、maskは文単位で1回だけ準備する（`ForeignKey.prepareChildChecks`）。
+
+親の`DELETE`が複数行に渡るときは、削除対象の親キーを集合にして子を1回だけ走査する
+（`ForeignKey.checkParentDeletes`）。
+単行は索引プレフィックス + `LIMIT 1` の従来経路を使う。
+UNIQUE の更新後検査も、一致行を全件配列化せず先頭の更新対象外行で打ち切る。
 
 ---
 

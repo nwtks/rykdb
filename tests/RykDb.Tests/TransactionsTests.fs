@@ -155,6 +155,20 @@ let ``Transaction.conflictKey: keyspace と key を連結`` () =
     Assert.True(k.StartsWith "t:people:")
 
 [<Fact>]
+let ``Transaction.slotsOf: キーは Bytes.compare の昇順で返る`` () =
+    let txn0 = Transaction.create 1UL<txnId> { Snapshot.SeqNo = 0UL }
+
+    // Map の構造比較は byte[] を長さ優先で並べるため、辞書順では後ろに来る
+    // 短いキーが先に来る。ストア走査と同じ順序で返さないと索引マージが壊れる。
+    let keys = [ [| 2uy |]; [| 1uy; 0uy |]; [| 1uy |]; [| 1uy; 255uy |] ]
+
+    let txn = keys |> List.fold (fun t k -> Transaction.put "t:x" k [||] t) txn0
+    let actual = Transaction.slotsOf "t:x" txn |> List.map fst
+    let expected = keys |> List.sortWith Bytes.compare
+    Assert.Equal<int>(expected.Length, actual.Length)
+    Assert.True(List.forall2 (fun a b -> Bytes.compare a b = 0) expected actual)
+
+[<Fact>]
 let ``Transaction.reserveUnique: 同じ索引値の予約は 1 件にまとまる`` () =
     let txn0 = Transaction.create 1UL<txnId> { Snapshot.SeqNo = 0UL }
     let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |] |> ok

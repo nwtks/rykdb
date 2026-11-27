@@ -127,8 +127,13 @@ SSTable のマージ、範囲走査、GC、memtable の Treap が同じ順序を
 
 - `KeyOrder.compare` が唯一の比較処理である。
 - memtable の `Entry.compareKeys` と SSTable の `SstEntry.compare` は `KeyOrder.compare` を呼ぶ。
+- `Transaction.slotsOf` は `Bytes.compare` の昇順で返す。
+  Map の構造比較（byte[] の長さ優先）をそのまま露出すると、
+  索引スキャンのマージが store 側と食い違い `LIMIT` の結果が誤る。
 
 プロパティテストで反対称性、推移性、memtable と SSTable の並び一致を検査する。
+回帰: `Transaction.slotsOf: キーは Bytes.compare の昇順で返る` /
+`SqlReference: txn 内の索引スキャンはキー順にマージされ LIMIT でも正しい行を返す`。
 
 ### INV-04: 異なる意味の番号は型で区別する
 

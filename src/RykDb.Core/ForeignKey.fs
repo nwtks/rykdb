@@ -114,11 +114,9 @@ module internal ForeignKey =
         if columns.Length = resolvedKey.Length then
             ret ()
         else
-            err (
-                DbError.constraintViolation (
-                    sprintf "FOREIGN KEY の列数(%d)と参照先の主キー列数(%d)が一致しません" columns.Length resolvedKey.Length
-                )
-            )
+            sprintf "FOREIGN KEY の列数(%d)と参照先の主キー列数(%d)が一致しません" columns.Length resolvedKey.Length
+            |> DbError.constraintViolation
+            |> err
 
     /// 子と親の列型の一致を検証する。
     let private checkForeignKeyTypes
@@ -131,17 +129,15 @@ module internal ForeignKey =
             if childCol.DataType = parentCol.DataType then
                 ret ()
             else
-                err (
-                    DbError.typeError (
-                        sprintf
-                            "外部キーの列 %s の型 %s が参照先 %s.%s の型 %s と一致しません"
-                            childCol.Name
-                            (DataType.toSqlName childCol.DataType)
-                            parentName
-                            parentCol.Name
-                            (DataType.toSqlName parentCol.DataType)
-                    )
-                ))
+                sprintf
+                    "外部キーの列 %s の型 %s が参照先 %s.%s の型 %s と一致しません"
+                    childCol.Name
+                    (DataType.toSqlName childCol.DataType)
+                    parentName
+                    parentCol.Name
+                    (DataType.toSqlName parentCol.DataType)
+                |> DbError.typeError
+                |> err)
         |> all
         |> Result.map ignore
 
@@ -154,15 +150,11 @@ module internal ForeignKey =
         =
         result {
             do! checkForeignKeyColumns columns
-
             let! childColumns = columnsOf c.Columns columns
             let! parent = resolveParentSchema catalog schema r
             let! resolvedKey = resolveParentKey parent r
-
             do! checkForeignKeyArity columns resolvedKey
-
             let! parentColumns = columnsOf parent.Columns resolvedKey
-
             do! checkForeignKeyTypes parent.Name childColumns parentColumns
 
             return
@@ -176,16 +168,15 @@ module internal ForeignKey =
     /// `CREATE TABLE` の外部キーを検証し、カタログへ保存する形にする。
     /// 参照先の列は省略時には親の主キーへ解決し、指定時も主キーと同順であることを要求する。
     let resolveCreatedTable (catalog: Catalog) (schema: TableSchema) (c: CreateTable) =
-        let references =
-            (c.Columns
-             |> List.choose (fun col -> col.Constraint.References |> Option.map (fun r -> [ col.Name ], r)))
-            @ (c.Constraints
-               |> List.choose (fun tc ->
-                   match tc with
-                   | TableConstraint.ForeignKey(columns, r) -> Some(columns, r)
-                   | _ -> None))
-
-        references |> List.map (resolveOne catalog schema c) |> all
+        (c.Columns
+         |> List.choose (fun col -> col.Constraint.References |> Option.map (fun r -> [ col.Name ], r)))
+        @ (c.Constraints
+           |> List.choose (fun tc ->
+               match tc with
+               | TableConstraint.ForeignKey(columns, r) -> Some(columns, r)
+               | _ -> None))
+        |> List.map (resolveOne catalog schema c)
+        |> all
 
     /// 列位置のリストから行の値を取り出す。
     /// 列マスクで復号されていない列があれば InternalError（呼び出し側の mask 漏れ）。
@@ -320,9 +311,10 @@ module internal ForeignKey =
             })
         |> all
 
-    /// `anyRow` の走査ループ。
+    /// Op の行を先頭から調べ、`matches` が真になった時点で打ち切る。
+    /// Op は one-shot なので途中で捨てた走査は Scope の DisposeAll で閉じる。
     [<TailCall>]
-    let rec private anyRowLoop (matches: SqlValue array -> DbResult<bool>) (current: Op) =
+    let rec private anyRow (matches: SqlValue array -> DbResult<bool>) (current: Op) =
         match Op.next current with
         | OpStep.OpError e -> Error e
         | OpStep.OpDone -> Ok false
@@ -330,11 +322,7 @@ module internal ForeignKey =
             match matches row with
             | DbErr e -> Error e
             | DbOk true -> Ok true
-            | DbOk false -> anyRowLoop matches next
-
-    /// Op の行を先頭から調べ、`matches` が真になった時点で打ち切る。
-    /// Op は one-shot なので途中で捨てた走査は Scope の DisposeAll で閉じる。
-    let private anyRow (matches: SqlValue array -> DbResult<bool>) (op: Op) = anyRowLoop matches op
+            | DbOk false -> anyRow matches next
 
     /// 2つの値が SQL の等値か。
     let private sameValue (a: SqlValue) (b: SqlValue) =
@@ -398,7 +386,7 @@ module internal ForeignKey =
     /// 親行を削除してよいか（RESTRICT）。
     /// 参照している子行があれば `ConstraintViolation`。
     /// `checks` は `prepareParentDeleteChecks` の結果（文単位で 1回だけ用意する）。
-    let checkParentDelete
+    let private checkParentDelete
         (store: RowStore)
         (visible: uint64 option)
         (scope: ScanScope)
@@ -431,3 +419,81 @@ module internal ForeignKey =
             })
         |> all
         |> Result.map ignore
+
+    /// 複数行の親 DELETE をまとめて検査する。
+    /// 子に索引が無い場合、行ごとの全走査を 1回にまとめるため、
+    /// 削除対象の親キーを集合にして子を 1回だけ走査する。
+    /// 単行は既存の `checkParentDelete`（索引プレフィックス + LIMIT 1）を使う。
+    let checkParentDeletes
+        (store: RowStore)
+        (visible: uint64 option)
+        (scope: ScanScope)
+        (txn: Transaction)
+        (schema: TableSchema)
+        (checks: ParentDeleteCheck list)
+        =
+        function
+        | [ row ] -> checkParentDelete store visible scope txn schema checks row
+        | rows ->
+            checks
+            |> List.map (fun check ->
+                result {
+                    let! keys =
+                        rows
+                        |> List.map (valuesAt check.ParentPositions)
+                        |> all
+                        |> Result.map (List.filter (fun values -> values |> Array.exists SqlValue.isNull |> not))
+                        |> Result.bind (List.map KeyBuilder.ofValues >> all)
+                        |> Result.map Set.ofList
+
+                    if Set.isEmpty keys then
+                        return ()
+                    else
+                        let! op =
+                            match check.Index with
+                            | Some idx ->
+                                Dml.scanByIndexPrefixWithTxnMask
+                                    store
+                                    check.Child
+                                    idx
+                                    [||]
+                                    0
+                                    check.ScanMask
+                                    visible
+                                    (Some scope)
+                                    txn
+                            | None ->
+                                Dml.scanByPrimaryKeyWithTxnMask
+                                    store
+                                    check.Child
+                                    0
+                                    check.ScanMask
+                                    visible
+                                    (Some scope)
+                                    txn
+
+                        let! found =
+                            anyRow
+                                (fun row ->
+                                    match valuesAt check.ChildPositions row with
+                                    | Error e -> DbErr e
+                                    | Ok values ->
+                                        match KeyBuilder.ofValues values with
+                                        | Error e -> DbErr e
+                                        | Ok key -> DbOk(Set.contains key keys))
+                                op
+
+                        if found then
+                            return!
+                                sprintf
+                                    "外部キー制約に違反: テーブル %s の行が %s(%s) を参照しています"
+                                    check.Child.Name
+                                    schema.Name
+                                    (System.String.Join(", ", check.ParentColumns))
+                                |> DbError.constraintViolation
+                                |> err
+                        else
+                            return ()
+                })
+            |> all
+            |> Result.map ignore

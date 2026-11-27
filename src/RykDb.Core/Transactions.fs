@@ -127,11 +127,12 @@ module internal Transaction =
     let tryFind (keyspace: string) (key: byte array) (txn: Transaction) =
         txn.Buffers |> Map.tryFind keyspace |> Option.bind (Map.tryFind key)
 
-    /// txn が keyspace に書いた全スロット。
+    /// txn が keyspace に書いた全スロット（LSM のキー昇順）。
+    /// Map の構造比較は byte[] を長さ優先で並べるため、ストア走査と同じ `Bytes.compare` で並べ直す。
     let slotsOf (keyspace: string) (txn: Transaction) =
         txn.Buffers
         |> Map.tryFind keyspace
-        |> Option.map Map.toList
+        |> Option.map (Map.toList >> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b))
         |> Option.defaultValue []
 
     /// 「(keyspace, キー)」を競合検出用の文字列 1本に畳む。

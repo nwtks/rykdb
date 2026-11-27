@@ -58,9 +58,25 @@ let private usersWithEmailIndex =
 let private rowOf (id: int) (email: string) (age: int) =
     [| SqlValue.Int(int64 id); SqlValue.Text email; SqlValue.Int(int64 age) |]
 
+/// 1行を transaction に積む（まだ DB には入らない）。
+let private insertWithKey (key: byte array) (txn: Transaction) (schema: TableSchema) (row: SqlValue array) =
+    Dml.prepareIndexAccess schema
+    |> Result.bind (fun accesses -> Dml.insertWithKeyPrepared key txn schema accesses row)
+
 /// 主キーを計算して 1行を transaction に積む。
 let private insertRow (schema: TableSchema) (txn: Transaction) (row: SqlValue array) =
-    Dml.insertWithKey (RowKey.primary schema row |> ok) txn schema row
+    insertWithKey (RowKey.primary schema row |> ok) txn schema row
+
+/// 走査済みの行をそのまま使って更新する（主キー検索をやり直さない）。
+/// 主キーは変更できない（DELETE + INSERT を使う）。
+let private updateRow (txn: Transaction) (schema: TableSchema) (oldRow: SqlValue array) (newRow: SqlValue array) =
+    Dml.prepareIndexAccess schema
+    |> Result.bind (fun accesses -> Dml.updateRowPrepared txn schema accesses oldRow newRow)
+
+/// 走査済みの行をそのまま使って削除する（主キー検索をやり直さない）。
+let private deleteRow (txn: Transaction) (schema: TableSchema) (oldRow: SqlValue array) =
+    Dml.prepareIndexAccess schema
+    |> Result.bind (fun accesses -> Dml.deleteRowPrepared txn schema accesses oldRow)
 
 /// transaction のバッファを DB に流し込む。
 let private commitInto (store: RowStore) (nextSeq: uint64) (txn: Transaction) =
@@ -151,7 +167,7 @@ let ``Dml.scanByPrimaryKeyRange: 上限を超える行と範囲外の書き込�
 
         // 範囲の外（5 の削除、0 / 6 の追加）も同じ transaction に積む。
         let _, txn1 = TransactionManager.beginTxn mgr
-        let txn1 = Dml.deleteRow txn1 usersWithEmailIndex (rowOf 5 "u5@example.com" 5) |> ok
+        let txn1 = deleteRow txn1 usersWithEmailIndex (rowOf 5 "u5@example.com" 5) |> ok
         let txn1 = insertRow usersWithEmailIndex txn1 (rowOf 0 "u0@example.com" 0) |> ok
         let txn1 = insertRow usersWithEmailIndex txn1 (rowOf 6 "u6@example.com" 6) |> ok
 
@@ -374,7 +390,7 @@ let ``Dml.scanByIndexRange: 削除した行の索引エントリを残さずに 
         commitInto store 1UL txn0
 
         let _, txn1 = TransactionManager.beginTxn mgr
-        let txn1 = Dml.deleteRow txn1 usersWithAgeIndex (rowOf 2 "u2@example.com" 20) |> ok
+        let txn1 = deleteRow txn1 usersWithAgeIndex (rowOf 2 "u2@example.com" 20) |> ok
         commitInto store 7UL txn1
 
         let _, txn2 = TransactionManager.beginTxn mgr
@@ -413,15 +429,13 @@ let ``Dml.updateRow: 索引列が変わらない更新では索引エントリ�
 
         // email（索引列）はそのまま、age だけ変える。
         let sameKey =
-            Dml.updateRow updateTxn usersWithEmailIndex row (rowOf 1 "a@example.com" 11)
-            |> ok
+            updateRow updateTxn usersWithEmailIndex row (rowOf 1 "a@example.com" 11) |> ok
 
         Assert.Empty(Transaction.slotsOf (Keyspace.index "users_email") sameKey)
 
         // email（索引列）を変えれば索引エントリが書かれる。
         let newKey =
-            Dml.updateRow updateTxn usersWithEmailIndex row (rowOf 1 "b@example.com" 10)
-            |> ok
+            updateRow updateTxn usersWithEmailIndex row (rowOf 1 "b@example.com" 10) |> ok
 
         Assert.Equal(2, (Transaction.slotsOf (Keyspace.index "users_email") newKey).Length))
 

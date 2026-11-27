@@ -196,6 +196,29 @@ let ``SqlReference: 複合索引の全列等値で行を引ける`` () =
         Assert.Equal<int>(2, prefix.Rows.Length))
 
 [<Fact>]
+let ``SqlReference: txn 内の索引スキャンはキー順にマージされ LIMIT でも正しい行を返す`` () =
+    withSession "index-txn-merge-order" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id TEXT PRIMARY KEY, g INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES ('aaaaaaaaa', 1), ('aaab', 1)"
+        let db3 = exec db2 "CREATE INDEX ix_g ON t (g)"
+        let db4 = exec db3 "BEGIN"
+        let db5 = exec db4 "INSERT INTO t VALUES ('b', 1), ('aaaaaaaaaaaa', 1)"
+
+        // 索引キーは辞書順で aaaaaaaaa < aaaaaaaaaaaa < aaab < b。
+        // txn スロットを Map 順（長さ優先）のままマージすると LIMIT 2 が誤る。
+        let _, r = ok (execSql db5 "SELECT id FROM t WHERE g = 1 LIMIT 2")
+
+        let ids =
+            r.Rows
+            |> Array.map (fun row ->
+                match row.[0] with
+                | SqlValue.Text s -> s
+                | _ -> failwithf "TEXT ではありません: %A" row.[0])
+
+        Assert.Equal<string[]>([| "aaaaaaaaa"; "aaaaaaaaaaaa" |], ids)
+        exec db5 "ROLLBACK" |> ignore)
+
+[<Fact>]
 let ``SqlReference: DECIMAL(10, 2) は再オープン後も使える`` () =
     withDir "typeargs-reopen" (fun dir ->
         let db0 = openDb dir

@@ -63,6 +63,11 @@ let private commitInto (store: RowStore) (nextSeq: uint64) (txn: Transaction) =
     let batches = Transaction.toEntries nextSeq txn |> fst
     RowStore.writeBatches batches store |> ok
 
+/// 1行を transaction に積む（まだ DB には入らない）。
+let private insertWithKey (key: byte array) (txn: Transaction) (schema: TableSchema) (row: SqlValue array) =
+    Dml.prepareIndexAccess schema
+    |> Result.bind (fun accesses -> Dml.insertWithKeyPrepared key txn schema accesses row)
+
 /// Close の呼び出しを記録するだけの engine（RowStore.close のテスト用）。
 type private CloseTrackingEngine(name: string, fail: bool, closed: ResizeArray<string>) =
     interface IStorageEngine with
@@ -255,7 +260,7 @@ let ``RowStore: keyspace は 1 本の LSM の接頭辞で分離される`` () =
         let row = rowOf 1 "a@x.com" 1
 
         let txn =
-            Dml.insertWithKey (RowKey.primary usersWithEmailIndex row |> ok) txn usersWithEmailIndex row
+            insertWithKey (RowKey.primary usersWithEmailIndex row |> ok) txn usersWithEmailIndex row
             |> ok
 
         let store = commitInto store 1UL txn
@@ -287,7 +292,7 @@ let ``RowStore.scanKeys: 値を復号せずキーだけ返す`` () =
         let row = rowOf 1 "a@x.com" 1
 
         let txn =
-            Dml.insertWithKey (RowKey.primary usersWithEmailIndex row |> ok) txn usersWithEmailIndex row
+            insertWithKey (RowKey.primary usersWithEmailIndex row |> ok) txn usersWithEmailIndex row
             |> ok
 
         let store = commitInto store 1UL txn
@@ -377,7 +382,7 @@ let ``RowStore.openStore: 開く途中で失敗してもロックを解放する
         let _, txn = TransactionManager.beginTxn mgr
 
         let txn =
-            Dml.insertWithKey (intKey 1) txn usersSchema (rowOf 1 "a@example.com" 10) |> ok
+            insertWithKey (intKey 1) txn usersSchema (rowOf 1 "a@example.com" 10) |> ok
 
         let store = commitInto store 1UL txn
         ok (RowStore.close store)

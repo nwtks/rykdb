@@ -47,49 +47,78 @@ module internal Dml =
     /// （行全体の複製を避ける。読み取りはキーから復号する）。
     let private EmptyIndexValue: SqlValue array = Array.empty
 
+    /// 索引キー構築の事前準備（文単位で 1回だけ列名→位置を解決する）。
+    type IndexAccess =
+        {
+            Index: IndexSchema
+            Columns: int list
+            Primary: int list
+        }
+
+    /// スキーマから索引アクセスを準備する。
+    /// 壊れたカタログの列名はここで `NameError` にする（行ごとの検査はしない）。
+    let prepareIndexAccess (schema: TableSchema) =
+        schema.Indexes
+        |> List.map (fun index ->
+            index.Columns
+            |> List.map (TableSchema.requireIndexOf schema)
+            |> all
+            |> Result.map (fun columns ->
+                {
+                    Index = index
+                    Columns = columns
+                    Primary = schema.PrimaryKey
+                }))
+        |> all
+
     /// UNIQUE 索引値の予約を増減する（NULL は予約しない）。
-    let private changeUniqueReservation
+    let private changeUniqueReservationAt
         (change: string -> byte array -> Transaction -> Transaction)
         (txn: Transaction)
-        (schema: TableSchema)
-        (index: IndexSchema)
+        (access: IndexAccess)
         =
         function
         | None -> ret txn
-        | Some values ->
-            RowKey.indexValues schema index values
-            >>= fun keyValues ->
-                if keyValues |> List.exists SqlValue.isNull then
-                    ret txn
-                else
-                    KeyBuilder.ofValues keyValues
-                    |> Result.map (fun key -> change index.Name key txn)
+        | Some(values: SqlValue array) ->
+            let keyValues = access.Columns |> List.map (fun i -> values.[i])
+
+            if keyValues |> List.exists SqlValue.isNull then
+                ret txn
+            else
+                KeyBuilder.ofValues keyValues
+                |> Result.map (fun key -> change access.Index.Name key txn)
 
     /// UNIQUE 索引値を予約する。
-    let private reserveUniqueValues = changeUniqueReservation Transaction.reserveUnique
+    let private reserveUniqueValuesAt =
+        changeUniqueReservationAt Transaction.reserveUnique
 
     /// txn 内で消えた UNIQUE 値の予約を解放する（最終状態に残らない値は競合しない）。
-    let private releaseUniqueValues = changeUniqueReservation Transaction.releaseUnique
+    let private releaseUniqueValuesAt =
+        changeUniqueReservationAt Transaction.releaseUnique
 
-    /// 索引エントリのキーを作る（差分反映用の薄いラッパー）。
-    let private indexKeyFor (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
-        RowKey.indexKey schema index row
+    /// 準備済み位置から索引キーを作る（行ごとの列名解決を避ける）。
+    let private indexKeyAt (access: IndexAccess) (row: SqlValue array) =
+        let values = access.Columns |> List.map (fun i -> row.[i])
+        let primary = access.Primary |> List.map (fun i -> row.[i])
+        KeyBuilder.ofIndexAndPrimary values primary
 
     /// 旧行と新行の差分を索引へ反映する。
     /// 同じ索引キーなら上書きだけ行い、キーが変わった場合だけ旧キーを削除する。
     let private applyIndexChange
         (txn: Transaction)
-        (schema: TableSchema)
+        (accesses: IndexAccess list)
         (oldRow: SqlValue array option)
         (newRow: SqlValue array option)
         =
-        schema.Indexes
+        accesses
         |> foldOk
-            (fun current index ->
+            (fun current access ->
+                let index = access.Index
+
                 let reserved =
                     if index.Unique then
-                        releaseUniqueValues current schema index oldRow
-                        >>= fun afterOld -> reserveUniqueValues afterOld schema index newRow
+                        releaseUniqueValuesAt current access oldRow
+                        >>= fun afterOld -> reserveUniqueValuesAt afterOld access newRow
                     else
                         ret current
 
@@ -100,19 +129,19 @@ module internal Dml =
                 | None, Some row ->
                     reserved
                     >>= fun txn ->
-                        indexKeyFor schema index row
+                        indexKeyAt access row
                         |> Result.map (fun key -> Transaction.put space key EmptyIndexValue txn)
                 | Some row, None ->
                     reserved
                     >>= fun txn ->
-                        indexKeyFor schema index row
+                        indexKeyAt access row
                         |> Result.map (fun key -> Transaction.remove space key txn)
                 | Some oldValue, Some newValue ->
                     reserved
                     >>= fun txn ->
-                        indexKeyFor schema index oldValue
+                        indexKeyAt access oldValue
                         >>= fun oldKey ->
-                            indexKeyFor schema index newValue
+                            indexKeyAt access newValue
                             |> Result.map (fun newKey ->
                                 if Bytes.compare oldKey newKey = 0 then
                                     txn
@@ -164,7 +193,8 @@ module internal Dml =
 
     /// store の行に txn の書き込みを重ねる（ストリーミング）。
     /// <remarks>
-    /// store の行も txn のバッファも**キー昇順**なので、両者を突き合わせながら 1行ずつ合成できる。
+    /// store の行も `Transaction.slotsOf` も**同じ LSM キー昇順**なので、
+    /// 両者を突き合わせながら 1行ずつ合成できる。
     /// store 側は 1行だけ、slot 側は txn のバッファぶんだけしか持たない。
     /// slot は 1回ずつしか消費されない（store 行と突き合わせたとき、あるいは store が尽きたとき）。
     /// </remarks>
@@ -176,9 +206,7 @@ module internal Dml =
         if List.isEmpty slots then
             rows
         else
-            let slotArr =
-                slots |> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b) |> List.toArray
-
+            let slotArr = slots |> List.toArray
             overlayMerge keyOf slotArr rows 0
 
     /// store の読み取り上限（txn の削除分を足す）。
@@ -637,14 +665,18 @@ module internal Dml =
             if limit > 0 then return Op.take limit rows else return rows
         }
 
-    /// 1行を transaction に積む（まだ DB には入らない）。
-    /// 索引のエントリも同じ transaction に入れるので、commit 原子性が保たれる。
-    /// `DmlOps.insert` が制約検査で作ったキーをそのまま使い、二重の検索・符号化を避ける。
-    let insertWithKey (key: byte array) (txn: Transaction) (schema: TableSchema) (row: SqlValue array) =
+    /// 準備済み索引アクセスで 1行を transaction に積む（ホットパス用）。
+    let insertWithKeyPrepared
+        (key: byte array)
+        (txn: Transaction)
+        (schema: TableSchema)
+        (accesses: IndexAccess list)
+        (row: SqlValue array)
+        =
         result {
             do! TableSchema.validateRow schema row
             let next = Transaction.put (tableSpace schema) key row txn
-            let! changed = applyIndexChange next schema None (Some row)
+            let! changed = applyIndexChange next accesses None (Some row)
             return! Transaction.checkLimit changed
         }
 
@@ -657,23 +689,33 @@ module internal Dml =
             |> DbError.constraintViolation
             |> err
 
-    /// 走査済みの行をそのまま使って更新する（主キー検索をやり直さない）。
-    /// 主キーは変更できない（DELETE + INSERT を使う）。
-    let updateRow (txn: Transaction) (schema: TableSchema) (oldRow: SqlValue array) (newRow: SqlValue array) =
+    /// 準備済み索引アクセスで走査済みの行を更新する（ホットパス用）。
+    let updateRowPrepared
+        (txn: Transaction)
+        (schema: TableSchema)
+        (accesses: IndexAccess list)
+        (oldRow: SqlValue array)
+        (newRow: SqlValue array)
+        =
         result {
             do! TableSchema.validateRow schema newRow
             do! ensureSamePrimaryKey schema oldRow newRow
             let! key = RowKey.primary schema newRow
             let afterMain = Transaction.put (tableSpace schema) key newRow txn
-            let! changed = applyIndexChange afterMain schema (Some oldRow) (Some newRow)
+            let! changed = applyIndexChange afterMain accesses (Some oldRow) (Some newRow)
             return! Transaction.checkLimit changed
         }
 
-    /// 走査済みの行をそのまま使って削除する（主キー検索をやり直さない）。
-    let deleteRow (txn: Transaction) (schema: TableSchema) (oldRow: SqlValue array) =
+    /// 準備済み索引アクセスで走査済みの行を削除する（ホットパス用）。
+    let deleteRowPrepared
+        (txn: Transaction)
+        (schema: TableSchema)
+        (accesses: IndexAccess list)
+        (oldRow: SqlValue array)
+        =
         result {
             let! key = RowKey.primary schema oldRow
             let next = Transaction.remove (tableSpace schema) key txn
-            let! changed = applyIndexChange next schema (Some oldRow) None
+            let! changed = applyIndexChange next accesses (Some oldRow) None
             return! Transaction.checkLimit changed
         }

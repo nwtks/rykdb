@@ -264,6 +264,25 @@ let ``ForeignKey.checkParentDelete: 子の主キーが外部キーのときも�
         expectErrorKind ErrorKind.ConstraintViolation "主キー経由の参照を検出できません" (execSql db4 "DELETE FROM p WHERE id = 1"))
 
 [<Fact>]
+let ``ForeignKey.checkParentDeletes: 複数行の親 DELETE は子の参照を 1 回の走査で検出する`` () =
+    withParentChild "fk-delete-batch" (fun db0 ->
+        let db1 = exec db0 "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+        let db2 = exec db1 "INSERT INTO c VALUES (10, 2)"
+        // 3 行が候補になるのでバッチ経路を通る。子の参照がある以上 1 行も消えない。
+        expectErrorKind ErrorKind.ConstraintViolation "バッチ検査が参照を見逃しました" (execSql db2 "DELETE FROM p WHERE id > 0")
+        Assert.Equal<int64>(3L, countOf db2 "p"))
+
+[<Fact>]
+let ``ForeignKey.checkParentDeletes: 参照が無ければ複数行の親を削除できる`` () =
+    withParentChild "fk-delete-batch-ok" (fun db0 ->
+        let db1 = exec db0 "CREATE INDEX c_pid ON c (pid)"
+        let db2 = exec db1 "INSERT INTO p VALUES (1, 'a'), (2, 'b')"
+        let db3 = exec db2 "INSERT INTO c VALUES (10, 1)"
+        let db4 = exec db3 "DELETE FROM c WHERE id = 10"
+        let db5 = exec db4 "DELETE FROM p WHERE id > 0"
+        Assert.Equal<int64>(0L, countOf db5 "p"))
+
+[<Fact>]
 let ``ForeignKey: 参照されているテーブルは DROP できない`` () =
     withParentChild "fk-drop" (fun db0 ->
         expectErrorKind ErrorKind.ConstraintViolation "参照されている親を DROP できました" (execSql db0 "DROP TABLE p")
