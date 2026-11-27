@@ -318,12 +318,24 @@ module internal DmlOps =
 
     /// INSERT ... SELECT。
     /// 選択結果の Op を行ごとに変換して挿入する。
-    let insertSelect (ctx: ExecContext) (schema: TableSchema) (columns: string list option) (source: Op) =
+    /// 選択結果の列数は、行を 1 つも消費する前に検査する
+    /// （0 行のときに列数不一致が黙って成功しないようにするため）。
+    let insertSelect
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (columns: string list option)
+        (sourceWidth: int)
+        (source: Op)
+        =
         result {
             let! idxs = insertTargets schema columns
-            let! defaults = defaultValuesOf schema (Set.ofList idxs)
-            let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
-            return! insertSelectGo ctx schema idxs defaults checks ctx.Txn 0 source
+
+            if sourceWidth <> List.length idxs then
+                return! err (insertWidthMismatchOf (List.length idxs) sourceWidth)
+            else
+                let! defaults = defaultValuesOf schema (Set.ofList idxs)
+                let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
+                return! insertSelectGo ctx schema idxs defaults checks ctx.Txn 0 source
         }
 
     /// UPDATE の代入式を現在行で評価して新しい行を作る。

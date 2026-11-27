@@ -603,6 +603,8 @@ SQL の等値は型・DECIMAL のスケール・DATE/TIMESTAMP を跨ぐため�
 グループ局所に判定するとグループ数分だけメモリが伸びる。
 
 - `seenBytes` がバケットの `Seen` のバイト概算を返し、`bucketBytes` と行のたびの増分計上で `used` に合算する。
+- パーティションへ退避した後の畳み込み（`Spill.foldEntries`）でも、既存グループの `stateBytes` の増分を毎行計上する。
+  新規グループだけを見ると、グループ数分だけ上限を超え得る。
 - 上限を超えたら、その行以降をパーティションへ退避する。
 - 極小の `WorkMem` では 1 run あたり最低 64 値（最大 2KiB の超過）までまとめる。
 
@@ -682,6 +684,8 @@ memtableやtransactionなど保持する側は、渡されたキーと行を複�
   - `reopenKeep`: 閉じるだけ
 - `repartitionRun`は元のrunを削除する。
 - 開いたrunとspoolは `MemoryBudget.Scope`（`ExecContext.Scope`）へ登録する。
+- `ValueSet` の OnDisk 索引（`IndexedValues`）も Dispose で `ScanScope.Forget` する
+  （相関 IN で外側行ごとに作ってもメモリが残らない）。
 - `LIMIT`や `RowReader.Dispose`の早期終了では `DisposeAll()`が閉じて削除する。
 - 通常終了では `ScanScope.Forget`で登録を外してから明示的に削除する。
 - 途中で残ったrunは次の外部ソート時に `Spill.sweepStale`が24時間超だけ回収する。
@@ -827,6 +831,8 @@ fsync が失敗しても commit は**適用済み**である
 - 行ごとに式を書き換えない（`Expr.rewrite` のコストを行数に比例させない）。
 - 置換後に残った列参照はスロット専用のスキーマで解決できず、行を 1つも評価する前に
   `NameError` になる（0行の入力で静かに通らない）。
+- 対応付けは表示文字列ではなく、識別子を大小無視に畳み、リテラルに型タグを付けた正規化キーで行う
+  （`1` と `1e0` の表示衝突を避ける）。
 - `ORDER BY COUNT(*)`・集約の別名・序数・`GROUP BY`式（`ORDER BY age + 1`）も同じ置換を通る。
 - 回帰: `sortBy: 集約後の行を集約呼び出し・GROUP BY 式で並べ替えられる` /
   `SqlReference: ORDER BY は集約式・集約の別名・序数・GROUP BY 式で並べ替えられる`。

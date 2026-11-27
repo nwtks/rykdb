@@ -302,11 +302,14 @@ module internal OpsJoinHash =
                 writer.Abandon()
                 err e
             | Ok _ ->
-                writer.Close()
-
-                writer.Paths
-                |> Array.map (fun p -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0)))
-                |> ret
+                match writer.Close() with
+                | Error e ->
+                    writer.Abandon()
+                    err e
+                | Ok() ->
+                    writer.Paths
+                    |> Array.map (fun p -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0)))
+                    |> ret
 
     /// 1つの spool を salt 付きで再分割する。
     let private hashRepartitionOne
@@ -432,9 +435,11 @@ module internal OpsJoinHash =
             | Error e -> err e
         | Error e -> err e
 
-    /// パーティションを明示スタックで 1つずつ処理する（末尾再帰）。
-    [<TailCall>]
-    let rec private hashJoinWork
+    /// パーティションを 1つずつ遅延処理する。
+    /// 先頭の 1 行を返す前に全パーティションのハッシュ表を作らない
+    /// （LIMIT や早期終了で残りを構築しない）。
+    /// 再帰は `Op.compute` の継続内で 1パーティションずつ進む（スタックは積まれない）。
+    let rec private hashJoinWorkOp
         (isLeft: bool)
         (budget: MemoryBudget)
         (leftSchema: Schema)
@@ -445,74 +450,81 @@ module internal OpsJoinHash =
         (spools: System.Collections.Generic.List<Spill.RowSpool>)
         (stamp: string)
         (splits: int)
-        (acc: Op list)
         (work: (int * uint64 * Spill.RowSpool * Spill.RowSpool) list)
         =
-        match work with
-        | [] -> ret (List.foldBack Op.append (List.rev acc) Op.Empty)
-        | (depth, salt, lspool, rspool) :: rest ->
-            let canSplit = depth < MaxPartitionDepth && splits < MaxPartitionSplits
+        Op.compute (fun () ->
+            match work with
+            | [] -> OpStep.OpDone
+            | (depth, salt, lspool, rspool) :: rest ->
+                let canSplit = depth < MaxPartitionDepth && splits < MaxPartitionSplits
 
-            match
-                hashJoinStep
-                    isLeft
-                    budget
-                    leftSchema
-                    leftKeys
-                    rightSchema
-                    rightKeys
-                    residual
-                    spools
-                    stamp
-                    depth
-                    salt
-                    canSplit
-                    lspool
-                    rspool
-            with
-            | Error e -> err e
-            | Ok(HashJoinEmit op) ->
-                hashJoinWork
-                    isLeft
-                    budget
-                    leftSchema
-                    leftKeys
-                    rightSchema
-                    rightKeys
-                    residual
-                    spools
-                    stamp
-                    splits
-                    (op :: acc)
-                    rest
-            | Ok(HashJoinSplit next) ->
-                hashJoinWork
-                    isLeft
-                    budget
-                    leftSchema
-                    leftKeys
-                    rightSchema
-                    rightKeys
-                    residual
-                    spools
-                    stamp
-                    (splits + 1)
-                    acc
-                    (next @ rest)
-            | Ok(HashJoinMergeFallback op) ->
-                hashJoinWork
-                    isLeft
-                    budget
-                    leftSchema
-                    leftKeys
-                    rightSchema
-                    rightKeys
-                    residual
-                    spools
-                    stamp
-                    splits
-                    (op :: acc)
-                    rest
+                match
+                    hashJoinStep
+                        isLeft
+                        budget
+                        leftSchema
+                        leftKeys
+                        rightSchema
+                        rightKeys
+                        residual
+                        spools
+                        stamp
+                        depth
+                        salt
+                        canSplit
+                        lspool
+                        rspool
+                with
+                | Error e -> OpStep.OpError e
+                | Ok(HashJoinEmit op) ->
+                    Op.next (
+                        Op.append
+                            op
+                            (hashJoinWorkOp
+                                isLeft
+                                budget
+                                leftSchema
+                                leftKeys
+                                rightSchema
+                                rightKeys
+                                residual
+                                spools
+                                stamp
+                                splits
+                                rest)
+                    )
+                | Ok(HashJoinSplit next) ->
+                    Op.next (
+                        hashJoinWorkOp
+                            isLeft
+                            budget
+                            leftSchema
+                            leftKeys
+                            rightSchema
+                            rightKeys
+                            residual
+                            spools
+                            stamp
+                            (splits + 1)
+                            (next @ rest)
+                    )
+                | Ok(HashJoinMergeFallback op) ->
+                    Op.next (
+                        Op.append
+                            op
+                            (hashJoinWorkOp
+                                isLeft
+                                budget
+                                leftSchema
+                                leftKeys
+                                rightSchema
+                                rightKeys
+                                residual
+                                spools
+                                stamp
+                                splits
+                                rest)
+                    ))
 
     /// ハッシュ結合の外部版。
     /// 両側を結合キーで `Spill.Partitions` 本に分割し、
@@ -544,9 +556,9 @@ module internal OpsJoinHash =
             >>= fun rparts ->
                 let work = Array.map2 (fun l r -> 0, 1UL, l, r) lparts rparts |> Array.toList
 
-                hashJoinWork isLeft budget leftSchema leftKeys rightSchema rightKeys residual spools stamp 0 [] work
-                |> Result.map (
-                    onExhausted (fun () ->
+                ret (
+                    hashJoinWorkOp isLeft budget leftSchema leftKeys rightSchema rightKeys residual spools stamp 0 work
+                    |> onExhausted (fun () ->
                         for sp in spools do
                             Spill.forgetSpool budget.Scope sp
                             Spill.deleteSpool sp)

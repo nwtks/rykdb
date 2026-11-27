@@ -14,6 +14,21 @@ let private rowsOf (values: int list) =
 let private intsOf (rows: SqlValue array array) =
     rows |> Array.map (fun r -> asInt r.[0])
 
+/// 最終フラッシュで失敗するストリーム（ディスクフル等の再現）。
+type private FailingFlushStream() =
+    inherit System.IO.MemoryStream()
+
+    override _.Flush() =
+        raise (System.IO.IOException "flush failed")
+
+[<Fact>]
+let ``Spill.closeSinkResult: 最終フラッシュの失敗を IoError で返す`` () =
+    let sink = new Sink(new FailingFlushStream())
+
+    match Spill.closeSinkResult sink with
+    | Ok() -> Assert.Fail("最終フラッシュの失敗を握り潰しています")
+    | Error e -> Assert.Equal(ErrorKind.IoError, e.Kind)
+
 [<Fact>]
 let ``Spill.partitionOfKey: 同じキーは同じパーティション、salt を変えると分け方が変わる`` () =
     let key = [| 1uy; 2uy; 3uy |]

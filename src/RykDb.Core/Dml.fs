@@ -426,9 +426,7 @@ module internal Dml =
         (slots: (byte array * SqlValue array option) list)
         (scan: SstScan)
         =
-        let slotArr =
-            slots |> List.sortWith (fun (a, _) (b, _) -> Bytes.compare a b) |> List.toArray
-
+        let slotArr = slots |> List.toArray
         let slotCount = slotArr.Length
         indexScanPull rowOf inRange slotArr slotCount scan 0
 

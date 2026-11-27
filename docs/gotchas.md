@@ -270,6 +270,29 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 `JoinOrder.selinger: マージ結合は左が走査のときだけ候補にする` /
 `SqlReference: 型が違う等値は結合キーにせず入れ子ループになる`。
 
+### 3.22 集約スロットの対応付けに表示文字列を使わない
+
+`Expr.toDisplayString` は識別子の大小文字を保ち、リテラルの表示が衝突する
+（`1` と `1e0` はどちらも `1`）。
+これをスロットの `Map` キーにすると、`SELECT A, COUNT(*) FROM t GROUP BY a` が `NameError` になり、
+`MIN(1)` と `MIN(1e0)` が後勝ちで同じスロットを指して `MIN(1) / 2` が 0.5 になる。
+
+- ✅ 識別子を `ToUpperInvariant` で畳み、リテラルに型タグを付けた正規化キー（`OpsShared.exprKey`）。
+- ❌ `Map.ofList` に表示文字列を入れる（重複キーは後勝ちで静かに消える）。
+- 回帰: `SqlReference: 集約後の参照は識別子の大小文字を区別しない` /
+  `SqlReference: 表示が同じでも型が違う集約を混同しない`。
+
+### 3.23 0行でも計画時の検査を省かない
+
+行が 1つも流れないと、行評価のときにだけ行う検査は走らない。
+`INSERT INTO d (a) SELECT a, b FROM 空` の列数不一致や、
+`WHERE s LIKE 'a#' ESCAPE '#'` の ESCAPE エラーが 0行の成功になっていた。
+
+- ✅ `Plan.runSelect` の選択列数を `insertSelect` へ渡し、行を消費する前に検査する。
+- ✅ LIKE の定数パターンのコンパイル・ESCAPE 検証エラーを `Prepared.FirstError` に載せる。
+- 回帰: `SqlReference: INSERT ... SELECT の列数不一致は選択が 0 行でもエラー` /
+  `SqlReference: 不正な LIKE のパターンは 0 行でもエラー`。
+
 ---
 
 ## 4. LSM・WAL・MANIFEST
@@ -640,6 +663,25 @@ REAL の丸めが絡む値は REAL のまま残す
 入力自体が非有限なら従来どおり伝播する。
 回帰: `SqlReference: REAL の演算が無限大になる場合はエラー`。
 
+### 6.17 ORDER BY の比較不能を 0 として捨てない
+
+`compareValuesForSortV` が TypeError にする組合せ（INTEGER と ±Infinity など）を
+比較関数が 0 として扱うと、ソート順が静かに崩れる。
+代表値 1個だけの型検査では、有限 REAL の代表値が `INTEGER vs Infinity` を隠す。
+
+- ✅ 比較可能性の型クラス（Int / 有限 REAL / 非有限 REAL / DECIMAL / DATE / TIMESTAMP ...）ごとに
+  代表値を持ち、新しいクラスが現れたら既存の全クラスと比較する（`OpsSort.sortClass`）。
+- ❌「最初の非 NULL 値との比較」だけで済ませる（比較可能性は推移的でない）。
+- 回帰: `SqlReference: ORDER BY は非有限 REAL と他型の混在を検出する`。
+
+### 6.18 COALESCE は遅延評価する
+
+引数を全部評価してから最初の非 NULL を選ぶと、`COALESCE(1, 1/0)` が 0除算で落ちる。
+COALESCE は CASE と等価で、非 NULL が見つかった後の引数は評価しない。
+
+- ✅ `Eval` の `KCoalesce` 継続で、NULL のときだけ次の引数へ進む。
+- 回帰: `SqlReference: COALESCE は非 NULL が見つかった後の引数を評価しない`。
+
 ---
 
 ## 7. メモリ・退避・列読み込み
@@ -722,6 +764,33 @@ SELECT定数、`COUNT(*)`、DELETE、INDEX lookupは参照列だけ復号する�
 そのためグループ数分だけ上限を超え得た。`Seen` の増分を全体の `used` に計上し、超えたら残りを退避する。
 また WorkMem が 32B 未満だと 1値ごとに run を作るため、1 run あたり最低 64値をまとめる（超過は最大 2KiB）。
 回帰: `集約: DISTINCT の値が上限を超えても全集約関数が同じ結果`。
+
+### 7.14 スピル run の close/flush 失敗を握り潰さない
+
+`BufferedStream.Dispose` の最終フラッシュが失敗しても成功扱いにすると、
+切り詰められた run が EOF として読まれ、結果が静かに欠ける。
+
+- ✅ 成功経路は `Spill.closeSinkResult` / `PartitionWriter.Close`（Result）を使う。
+- ✅ 後始末専用の `Sink.Dispose` / `closeSink` だけが失敗を握る。
+- 回帰: `Spill.closeSinkResult: 最終フラッシュの失敗を IoError で返す`。
+
+### 7.15 DISTINCT 集約の退避は元の値で再集計する
+
+`Seen` に `keyNormalize` した値だけを入れると、退避後の MIN/MAX/SUM/AVG が
+`DECIMAL 1.0` → `INTEGER 1`、整数 REAL → INTEGER のように型・スケールを変える。
+
+- ✅ `Seen` は「正規化キー → 最初に現れた元の値」の Map。重複判定はキー、run には元の値を書く。
+- ✅ finalize は run を 1本のストリームとして順に読み、全 run を同時に open しない。
+- 回帰: `集約: DISTINCT の値が上限を超えても全集約関数が同じ結果`。
+
+### 7.16 外部 GROUP BY / DISTINCT の出力を全 materialize しない
+
+`groupPartitions` が全パーティションの出力をリストに積むと、グループ数に比例したメモリを使い、
+スピルの意味がなくなる。
+
+- ✅ `foldPartitionOp` がパーティションを 1本ずつ畳み、その出力行を `Op` として順に返す。
+- ✅ `ValueSet` の OnDisk 索引は Dispose で `ScanScope.Forget` する。
+- 回帰: `ValueSet: Dispose は ScanScope の登録を外す`。
 
 ---
 
@@ -1099,6 +1168,10 @@ JOINのONは、並べ替え用の解析で`Binder.qualify`が失敗しても述�
 - [ ] `IF EXISTS` / `IF NOT EXISTS` の綴りを文種ごとに検査しているか
 - [ ] `DISTINCT` / `GROUP BY` の退避キーが SQL の等値（`KeyBuilder` + `keyNormalize`）に揃っているか
 - [ ] 集約後の `SELECT` / `HAVING` / `ORDER BY` がすべてスロット置換を通っているか
+- [ ] 集約スロットのキーは正規化（大小無視・型タグ）で、表示文字列を使っていないか
+- [ ] 0行でも計画時の検査（INSERT SELECT の列数・LIKE の定数パターン）が走るか
+- [ ] ORDER BY の比較不能を 0 として捨てていないか
+- [ ] スピル run の成功経路で close/flush の Result を確認しているか
 - [ ] `UPDATE` / `DELETE` の候補走査は `WHERE` の十分条件だけで、行の可否は再評価で決めているか
 - [ ] COUNT 以外の集約に `*` を許していないか
 - [ ] REAL の演算・SUM が有限の入力から非有限を作らないか

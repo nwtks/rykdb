@@ -386,6 +386,7 @@ name LIKE 'a!%' ESCAPE '!'
 `!%`の `!`をエスケープとして解釈し、末尾の `%`をリテラルとして扱う。
 
 - パターン末尾にエスケープ文字だけが残る場合は `TypeError`になる。
+  定数パターンの `ESCAPE` 検証とコンパイルは計画時に行うため、対象が0行でもエラーになる。
 - `ILIKE`や既定の `\`エスケープはない。
 - `NULL`に対する `LIKE`の結果は `NULL`になる。
 
@@ -426,6 +427,8 @@ ORDER BY dept_id;
   `MIN(*)` / `SUM(*)` / `COUNT(t.*)` は `SyntaxError` になる。
 - 集約と `GROUP BY`を使うクエリでは `SELECT *`を使えない。
 - 集約も `GROUP BY`もない `HAVING`は構文エラーになる。
+- 集約後の `SELECT` / `HAVING` / `ORDER BY` の参照は、識別子の大小文字を区別しない。
+  リテラルは型で区別する（`1` と `1e0` は別の式）。
 
 ### 6.6 スカラー関数
 
@@ -444,6 +447,7 @@ ORDER BY dept_id;
 
 `CAST`は型引数を無視して変換する。
 `TEXT`から数値・真偽値への変換もできる。
+`COALESCE`は最初の非 `NULL`が見つかった時点で残りの引数を評価しない（`CASE`と等価）。
 
 ```sql
 CAST('42' AS INTEGER)
@@ -639,6 +643,7 @@ LEFT JOIN depts d ON p.dept_id = d.id;
 - `NULLS FIRST`、`NULLS LAST`は未対応。
 - 同値行の順序は保証しない。
 - 列参照、式、序数（1始まり）を指定できる。
+- 比較できない型（`INTEGER`と`TEXT`、非有限`REAL`と他型など）が同じキーに混ざると`TypeError`になる。
 - 集約クエリ（`GROUP BY` / 集約関数）の`ORDER BY`では、`GROUP BY`の式と集約呼び出しを参照できる。
   集約の別名・序数（集約の選択項目を指すもの）も同じ規則で解決する。
 
@@ -879,6 +884,7 @@ INSERT INTO people (name, id) VALUES ('carol', 3);
 ### INSERT ... SELECT
 
 選択結果の列数は挿入先の列数または列リストの列数と一致させる。
+列数の検査は選択結果が0行でも行う。
 選択は文の開始時点のsnapshotを読む。
 
 ```sql

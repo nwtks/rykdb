@@ -305,8 +305,8 @@ module internal Engine =
                     }
                 | InsertSource.Select sel ->
                     result {
-                        let! _, op = Plan.runSelect ctx sel
-                        return! DmlOps.insertSelect ctx schema stmt.Columns op
+                        let! sourceColumns, op = Plan.runSelect ctx sel
+                        return! DmlOps.insertSelect ctx schema stmt.Columns sourceColumns.Length op
                     }
         }
 

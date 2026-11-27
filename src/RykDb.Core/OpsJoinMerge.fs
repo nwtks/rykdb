@@ -184,10 +184,14 @@ module internal OpsJoinMerge =
                             Spill.unlink path
                             err e
                         | Ok(count, next') ->
-                            Spill.closeSink sink
-                            let spool = Spill.RowSpool.Disk([ path ], count)
-                            Spill.registerSpool budget.Scope spool
-                            ret (spool, next')
+                            match Spill.closeSinkResult sink with
+                            | Error e ->
+                                Spill.unlink path
+                                err e
+                            | Ok() ->
+                                let spool = Spill.RowSpool.Disk([ path ], count)
+                                Spill.registerSpool budget.Scope spool
+                                ret (spool, next')
             | Error e -> err e
 
     /// 開始状態の側を 1行先読みして次へ進む。

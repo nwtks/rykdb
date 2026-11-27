@@ -142,6 +142,24 @@ let ``ValueSet: 退避した集合は ScanScope の早期終了でもファイ�
         dispose set)
 
 [<Fact>]
+let ``ValueSet: Dispose は ScanScope の登録を外す`` () =
+    // 相関 IN のように外側行ごとに集合を作る用途で、索引と Bloom の参照が
+    // クエリ終了まで残らないことを確認する。
+    withDir "valueset-scope-forget" (fun dir ->
+        let scope = ScanScope()
+
+        let budget =
+            { budgetIn dir 1L with
+                Scope = Some scope
+            }
+
+        let set = build budget [ for i in 0..199 -> SqlValue.Text(sprintf "v%03d" i) ]
+        Assert.Equal<int>(1, scope.ActiveCount)
+
+        dispose set
+        Assert.Equal<int>(0, scope.ActiveCount))
+
+[<Fact>]
 let ``ValueSet: 比較できない型が混ざると TypeError`` () =
     let mixed = [ SqlValue.Int 1L; SqlValue.Text "x" ]
     expectErrorKind ErrorKind.TypeError "比較できない型の集合が OK になっています" (ValueSet.build MemoryBudget.Unlimited (opOf mixed))

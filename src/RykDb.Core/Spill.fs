@@ -149,11 +149,45 @@ module internal Spill =
 
             new Sink(new System.IO.BufferedStream(fs, 65536) :> System.IO.Stream))
 
-    /// 書き込み口を閉じる（失敗は握る）。
+    /// 書き込み口を閉じる（後始末用。失敗は握る）。
     let closeSink (sink: Sink) = (sink :> System.IDisposable).Dispose()
 
-    /// 複数の書き込み口を閉じる。
-    let closeSinks = List.iter closeSink
+    /// 書き込み口を閉じ、最終フラッシュの失敗も Result で返す。
+    /// 成功経路では必ずこちらを使う（ディスクフル等で run が切り詰められたまま
+    /// 成功扱いになるのを防ぐ）。
+    let closeSinkResult (sink: Sink) =
+        let flushError = protect (fun () -> sink.Stream.Flush())
+        let disposeError = protect (fun () -> (sink :> System.IDisposable).Dispose())
+
+        match flushError with
+        | Error e -> err e
+        | Ok() ->
+            match disposeError with
+            | Error e -> err e
+            | Ok() -> ret ()
+
+    /// 複数の書き込み口を閉じる（後始末用。失敗は握る）。
+    let private closeSinks = List.iter closeSink
+
+    /// 複数の書き込み口を閉じ、最初の失敗を返す（成功経路用）。
+    [<TailCall>]
+    let rec private closeSinksResultLoop (i: int) (firstError: DbError option) (sinks: Sink array) =
+        if i >= sinks.Length then
+            match firstError with
+            | Some e -> err e
+            | None -> ret ()
+        else
+            match closeSinkResult sinks.[i] with
+            | Ok() -> closeSinksResultLoop (i + 1) firstError sinks
+            | Error e ->
+                let next =
+                    match firstError with
+                    | Some _ -> firstError
+                    | None -> Some e
+
+                closeSinksResultLoop (i + 1) next sinks
+
+    let private closeSinksResult = closeSinksResultLoop 0 None
 
     /// 1行をフレーム（varint 長 + 符号化）にする。
     let private frameRow (row: SqlValue array) =
@@ -189,8 +223,11 @@ module internal Spill =
                 unlink path
                 err e
             | Ok() ->
-                closeSink sink
-                ret path
+                match closeSinkResult sink with
+                | Ok() -> ret path
+                | Error e ->
+                    unlink path
+                    err e
 
     /// run ファイル 1本を作る（受け皿の行を整列して書き出す）。
     let writeRun
@@ -345,8 +382,8 @@ module internal Spill =
             else
                 writeRow row sinks.[index]
 
-        /// すべて閉じる。
-        member _.Close() = sinks |> Array.iter closeSink
+        /// すべて閉じる（成功経路用。失敗は Result で返す）。
+        member _.Close() = closeSinksResult sinks
 
         /// すべて閉じてファイルを消す。
         member _.Abandon() =
@@ -470,9 +507,14 @@ module internal Spill =
                 unlink path
                 err e
             | Ok() ->
-                writer.Close()
-                unlink path
-                ret (writer.Paths |> Array.toList)
+                match writer.Close() with
+                | Ok() ->
+                    unlink path
+                    ret (writer.Paths |> Array.toList)
+                | Error e ->
+                    unlink path
+                    writer.Paths |> Array.iter unlink
+                    err e
 
     /// 何度でも先頭から読める行の並び。
     /// 上限内ならメモリ、超過したら run ファイルへ退避する。
@@ -518,6 +560,24 @@ module internal Spill =
     let forgetSpool (scope: ScanScope option) (spool: RowSpool) =
         match scope with
         | Some s -> s.Forget(box spool)
+        | None -> ()
+
+    /// 1本の run を ScanScope に登録する（早期終了・エラー時に削除する）。
+    let registerRun (scope: ScanScope option) (path: string) =
+        match scope with
+        | Some s ->
+            let cleanup =
+                { new System.IDisposable with
+                    member _.Dispose() = unlink path
+                }
+
+            s.Register(box path, cleanup)
+        | None -> ()
+
+    /// run の登録を外す（削除は読み取り側が行う）。
+    let forgetRun (scope: ScanScope option) (path: string) =
+        match scope with
+        | Some s -> s.Forget(box path)
         | None -> ()
 
     /// 退避した run を順に開く。
@@ -650,8 +710,9 @@ module internal Spill =
             | Ok key ->
                 let isNew = not (dict.ContainsKey key)
                 let current = if isNew then seed () else dict.[key]
+                let before = stateBytes current
 
-                if isNew && MemoryBudget.exceeded (budget.Work, used + stateBytes current) then
+                if isNew && MemoryBudget.exceeded (budget.Work, used + before) then
                     closeSource st.Src
                     ret None
                 else
@@ -661,15 +722,21 @@ module internal Spill =
                         err e
                     | Ok next ->
                         dict.[key] <- next
-                        let used = if isNew then used + stateBytes next else used
+                        let grown = max 0L (stateBytes next - before)
+                        let used = used + grown
 
-                        match readRow st.Src with
-                        | Error e ->
+                        if MemoryBudget.exceeded (budget.Work, used) then
                             closeSource st.Src
-                            err e
-                        | Ok None -> foldEntriesLoop budget keyOf seed add stateBytes dict used { st with Head = None }
-                        | Ok(Some head) ->
-                            foldEntriesLoop budget keyOf seed add stateBytes dict used { st with Head = Some head }
+                            ret None
+                        else
+                            match readRow st.Src with
+                            | Error e ->
+                                closeSource st.Src
+                                err e
+                            | Ok None ->
+                                foldEntriesLoop budget keyOf seed add stateBytes dict used { st with Head = None }
+                            | Ok(Some head) ->
+                                foldEntriesLoop budget keyOf seed add stateBytes dict used { st with Head = Some head }
 
     /// パーティション 1本をキーごとに畳む。
     /// 状態の合計が上限を超えたら `None` を返す（呼び出し側が分割し直す）。
@@ -707,58 +774,66 @@ module internal Spill =
             Emit: 'A -> Result<SqlValue array option, DbError>
         }
 
-    /// `groupPartitions` の畳み込みループ（再分割もここで行う）。
-    [<TailCall>]
-    let rec private foldPartitionLoop (ctx: FoldPartitionContext<'A>) (acc: SqlValue array list list) =
-        function
-        | [] -> ret (List.rev acc |> List.concat)
-        | (depth, entries, path) :: rest ->
-            let effective =
-                if depth >= MaxGroupDepth then
-                    { ctx.Budget with Work = -1L }
-                else
-                    ctx.Budget
+    /// `groupPartitions` の畳み込み（パーティションを 1本ずつ遅延処理する）。
+    /// 全グループをメモリに集めず、畳んだパーティションの出力行を順に返す。
+    /// 再分割もここで行う。再帰は `Op.compute` の継続内で 1パーティションずつ進む
+    /// （スタックは積まれない）。
+    let rec private foldPartitionOp
+        (ctx: FoldPartitionContext<'A>)
+        (work: (int * (byte array * 'A) list * string) list)
+        =
+        Op.compute (fun () ->
+            match work with
+            | [] -> OpStep.OpDone
+            | (depth, entries, path) :: rest ->
+                let effective =
+                    if depth >= MaxGroupDepth then
+                        { ctx.Budget with Work = -1L }
+                    else
+                        ctx.Budget
 
-            match foldEntries effective ctx.KeyOf ctx.Seed ctx.Add ctx.StateBytes entries path with
-            | Error e ->
-                unlink path
-                abandonPaths rest
-                err e
-            | Ok(Some folded) ->
-                unlink path
-
-                match folded |> List.map (fun (_, state) -> ctx.Emit state) |> all with
+                match foldEntries effective ctx.KeyOf ctx.Seed ctx.Add ctx.StateBytes entries path with
                 | Error e ->
+                    unlink path
                     abandonPaths rest
-                    err e
-                | Ok emitted -> foldPartitionLoop ctx (List.choose id emitted :: acc) rest
-            | Ok None ->
-                let salt = saltAt depth
+                    OpStep.OpError e
+                | Ok(Some folded) ->
+                    unlink path
 
-                match
-                    repartitionRun
-                        ctx.Budget.Directory
-                        (sprintf "%s-d%d" ctx.Stamp (depth + 1))
-                        0
-                        Partitions
-                        salt
-                        ctx.KeyOf
-                        path
-                with
-                | Error e ->
-                    abandonPaths rest
-                    err e
-                | Ok subs ->
-                    let byPartition =
-                        entries |> List.groupBy (fun (k, _) -> partitionOfKey salt k) |> Map.ofList
+                    match folded |> List.map (fun (_, state) -> ctx.Emit state) |> all with
+                    | Error e ->
+                        abandonPaths rest
+                        OpStep.OpError e
+                    | Ok emitted ->
+                        let rows = emitted |> List.choose id |> List.toArray
+                        Op.next (Op.append (Op.ofArray rows) (foldPartitionOp ctx rest))
+                | Ok None ->
+                    let salt = saltAt depth
 
-                    let children =
-                        subs
-                        |> List.mapi (fun i sub ->
-                            let carried = byPartition |> Map.tryFind i |> Option.defaultValue []
-                            depth + 1, carried, sub)
+                    match
+                        repartitionRun
+                            ctx.Budget.Directory
+                            (sprintf "%s-d%d" ctx.Stamp (depth + 1))
+                            0
+                            Partitions
+                            salt
+                            ctx.KeyOf
+                            path
+                    with
+                    | Error e ->
+                        abandonPaths rest
+                        OpStep.OpError e
+                    | Ok subs ->
+                        let byPartition =
+                            entries |> List.groupBy (fun (k, _) -> partitionOfKey salt k) |> Map.ofList
 
-                    foldPartitionLoop ctx acc (children @ rest)
+                        let children =
+                            subs
+                            |> List.mapi (fun i sub ->
+                                let carried = byPartition |> Map.tryFind i |> Option.defaultValue []
+                                depth + 1, carried, sub)
+
+                        Op.next (foldPartitionOp ctx (children @ rest)))
 
     /// 退避した行をキーごとに畳み、結果行の Op を作る。
     /// <remarks>
@@ -780,7 +855,7 @@ module internal Spill =
         (seeds: (byte array * 'A) list)
         (paths: string list)
         =
-        let ctx: FoldPartitionContext<'A> =
+        let ctx =
             {
                 Budget = budget
                 Stamp = stamp
@@ -791,12 +866,13 @@ module internal Spill =
                 Emit = emit
             }
 
-        paths
-        |> List.mapi (fun i path ->
-            let carried = seeds |> List.filter (fun (k, _) -> partitionOfKey 0UL k = i)
-            0, carried, path)
-        |> foldPartitionLoop ctx []
-        |> Result.map (List.toArray >> Op.ofArray)
+        let work =
+            paths
+            |> List.mapi (fun i path ->
+                let carried = seeds |> List.filter (fun (k, _) -> partitionOfKey 0UL k = i)
+                0, carried, path)
+
+        ret (foldPartitionOp ctx work)
 
     /// 行に連番を振ってパーティションへ書き出す本体。
     [<TailCall>]

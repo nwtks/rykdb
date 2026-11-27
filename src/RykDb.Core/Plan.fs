@@ -507,7 +507,7 @@ module internal Plan =
     /// 外側スコープ付きで SELECT を計画する（CPS）。実行はしない。
     /// `UNION ALL` の複合文は `planCompoundCWith` へ、
     /// 通常の SELECT は `planSimpleCWith` へ振り分ける。
-    and [<TailCall>] private planCoreCWith
+    and private planCoreCWith
         (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
         (outer: OuterScope list)
         (k: PlannedQuery -> Result<'r, DbError>)
@@ -524,7 +524,7 @@ module internal Plan =
     /// 列数は全枝で一致が必要（列名は先頭の SELECT に従う）。
     /// `ORDER BY` / `LIMIT` / `OFFSET` は連結後の結果全体へ掛ける
     /// （列名・別名・序数は先頭の SELECT の出力列で解決する）。
-    and [<TailCall>] private planCompoundCWith
+    and private planCompoundCWith
         (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
         (outer: OuterScope list)
         (k: PlannedQuery -> Result<'r, DbError>)
@@ -540,7 +540,7 @@ module internal Plan =
             (finishCompound runner outer k ctx stmt)
 
     /// 複合 SELECT の枝を検証して連結し、末尾の ORDER BY などを解決する。
-    and [<TailCall>] private finishCompound
+    and private finishCompound
         (runner: OuterScope list -> ExecContext -> SelectStatement -> Result<Schema * Op, DbError>)
         (outer: OuterScope list)
         (k: PlannedQuery -> Result<'r, DbError>)

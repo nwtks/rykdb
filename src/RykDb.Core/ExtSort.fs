@@ -150,8 +150,11 @@ module internal ExtSort =
                     Spill.forget [ path ]
                     err e
                 | Ok() ->
-                    Spill.closeSink sink
-                    ret path
+                    match Spill.closeSinkResult sink with
+                    | Ok() -> ret path
+                    | Error e ->
+                        Spill.forget [ path ]
+                        err e
 
     /// 開いた run から 1行取り出し、残りの状態を返す。
     let private pull

@@ -159,7 +159,7 @@ module private ValueSetSearch =
 /// 1つのクエリの評価スレッドから順に呼ばれる前提（`RowReader` と同じ）。
 /// </remarks>
 [<Sealed>]
-type internal IndexedValues(path: string, blocks: ValueBlock array, bloom: BloomFilter) =
+type internal IndexedValues(path: string, blocks: ValueBlock array, bloom: BloomFilter, scope: ScanScope option) =
     /// 直近ブロックのキャッシュを保護するロック。
     let gate = obj ()
 
@@ -240,12 +240,16 @@ type internal IndexedValues(path: string, blocks: ValueBlock array, bloom: Bloom
                         | Ok rows -> ValueSetSearch.searchIndexedRows rows v)
 
     interface System.IDisposable with
-        member _.Dispose() =
+        member this.Dispose() =
             lock gate (fun () ->
                 if not disposed then
                     disposed <- true
                     closeReader ()
-                    Spill.unlink path)
+                    Spill.unlink path
+
+                    match scope with
+                    | Some s -> s.Forget(box this)
+                    | None -> ())
 
 [<RequireQualifiedAccess; NoEquality; NoComparison>]
 type internal ValueSetStorage =
@@ -430,14 +434,19 @@ module internal ValueSet =
                 Spill.unlink path
                 err e
             | Ok(blocks, hasNull) ->
-                Spill.closeSink sink
-                let store = new IndexedValues(path, Array.ofList blocks, bloom.Build())
+                match Spill.closeSinkResult sink with
+                | Error e ->
+                    Spill.unlink path
+                    err e
+                | Ok() ->
+                    let store =
+                        new IndexedValues(path, Array.ofList blocks, bloom.Build(), budget.Scope)
 
-                match budget.Scope with
-                | Some scope -> scope.Register(box store, store)
-                | None -> ()
+                    match budget.Scope with
+                    | Some scope -> scope.Register(box store, store)
+                    | None -> ()
 
-                Ok(new ValueSet(ValueSetStorage.OnDisk store, hasNull))
+                    Ok(new ValueSet(ValueSetStorage.OnDisk store, hasNull))
 
     /// 上限を超えたので、ここまでの集合と残りの入力を一時ファイルへ退避する。
     let private spillToDisk
@@ -452,9 +461,17 @@ module internal ValueSet =
         >>= fun spool ->
             let total = set.Count + Spill.spoolCount spool
 
-            Spill.reopen budget.Scope spool
-            >>= ExtSort.sortRows budget None checkComparable compareValues
-            >>= writeIndexed budget total hasNull
+            match
+                Spill.reopen budget.Scope spool
+                >>= ExtSort.sortRows budget None checkComparable compareValues
+            with
+            | Error e ->
+                Spill.deleteSpool spool
+                Spill.forgetSpool budget.Scope spool
+                err e
+            | Ok sorted ->
+                Spill.forgetSpool budget.Scope spool
+                writeIndexed budget total hasNull sorted
 
     /// 入力を走査して値集合を溜める本体。
     [<TailCall>]

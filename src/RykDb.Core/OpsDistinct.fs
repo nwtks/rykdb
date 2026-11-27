@@ -87,21 +87,22 @@ module internal OpsDistinct =
             match written with
             | Error e -> distinctAbandon writer e
             | Ok _ ->
-                writer.Close()
-
-                Spill.groupPartitions
-                    budget
-                    stamp
-                    distinctKeyOfFrame
-                    distinctSeed
-                    distinctAddOne
-                    distinctStateBytes
-                    distinctEmitOne
-                    []
-                    (writer.Paths |> Array.toList)
-                >>= fun rows ->
-                    ExtSort.sortRows budget () (fun () _ -> DbOk()) compareDistinctSeq rows
-                    |> Result.map (Op.map (fun f -> DbOk(Array.sub f 1 (f.Length - 1))))
+                match writer.Close() with
+                | Error e -> distinctAbandon writer e
+                | Ok() ->
+                    Spill.groupPartitions
+                        budget
+                        stamp
+                        distinctKeyOfFrame
+                        distinctSeed
+                        distinctAddOne
+                        distinctStateBytes
+                        distinctEmitOne
+                        []
+                        (writer.Paths |> Array.toList)
+                    >>= fun rows ->
+                        ExtSort.sortRows budget () (fun () _ -> DbOk()) compareDistinctSeq rows
+                        |> Result.map (Op.map (fun f -> DbOk(Array.sub f 1 (f.Length - 1))))
 
     /// DISTINCT のストリーミング本体（使用バイト数と連番を明示する）。
     let rec private distinctProbe

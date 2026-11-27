@@ -89,6 +89,20 @@ let ``末尾再帰: 50000段の式を havingFilter してもスタックを食�
     Assert.True(okV ((ok (UnlimitedOps.havingFilter groupBy aggs deep)) r))
 
 [<Fact>]
+let ``末尾再帰: 50000段の集約引式でも正規化キーを作れる`` () =
+    let depth = 50_000
+
+    // 集約キー（OpsShared.exprKey）は式の深さに比例してスタックを積まないこと。
+    // GROUP BY を空にすると木全体の照合が入らず、集約引式のキーだけを 1回作る。
+    let deep =
+        List.init depth (fun _ -> Expr.Literal(Literal.Bool true))
+        |> List.fold (fun acc e -> Expr.Binary(BinaryOp.And, acc, e)) (Expr.Literal(Literal.Bool true))
+
+    let aggs = [ (AggFunc.Count, false, false, deep) ]
+    let r = [| SqlValue.Int 1L |]
+    Assert.True(okV ((ok (UnlimitedOps.havingFilter [] aggs (Expr.Literal(Literal.Bool true)))) r))
+
+[<Fact>]
 let ``集約: 入力行を抱えずにグループごとに集める`` () =
     // 10 万行を 3 グループに振り、行を全部保持しない実装でも結果が同じであること。
     let rec make (i: int) : Op =

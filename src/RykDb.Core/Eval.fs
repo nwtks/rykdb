@@ -361,6 +361,8 @@ module internal Eval =
         | KCaseWhen of (Expr * Expr) * (Expr * Expr) list * Expr option
         /// 関数の引数 1個を評価中（関数名, 確定済みの逆順, 残りの引数）。
         | KFuncArg of string * SqlValue list * Expr list
+        /// COALESCE の残りの引数（NULL のときだけ次を評価する）。
+        | KCoalesce of Expr list
 
     /// 評価機の状態。
     /// 式を 1つ降りるか（Descend）、値が上がってきたか（Arrive）。
@@ -424,12 +426,17 @@ module internal Eval =
                     | Some rest -> step resolve row kont (Descend rest)
                     | None -> step resolve row kont (Arrive SqlValue.Null)
             | Expr.FuncCall(n, args) ->
-                match args with
-                | a :: tail -> step resolve row (KFuncArg(n, [], tail) :: kont) (Descend a)
-                | [] ->
-                    match Scalar.applyFunc n [||] with
-                    | Error er -> DbErr er
-                    | Ok v -> step resolve row kont (Arrive v)
+                if SqlName.equal n "COALESCE" then
+                    match args with
+                    | a :: tail -> step resolve row (KCoalesce tail :: kont) (Descend a)
+                    | [] -> step resolve row kont (Arrive SqlValue.Null)
+                else
+                    match args with
+                    | a :: tail -> step resolve row (KFuncArg(n, [], tail) :: kont) (Descend a)
+                    | [] ->
+                        match Scalar.applyFunc n [||] with
+                        | Error er -> DbErr er
+                        | Ok v -> step resolve row kont (Arrive v)
             | Expr.Cast(x, dt) -> step resolve row (KCast dt :: kont) (Descend x)
             | Expr.Default -> DbErr(DbError.create ErrorKind.SyntaxError "DEFAULT は INSERT の VALUES でのみ使えます")
             | Expr.AggCall(f, _, _) -> DbErr(sprintf "%s は集約なのでここでは評価できません" f.Name |> DbError.name)
@@ -597,6 +604,13 @@ module internal Eval =
                         match elseE with
                         | Some rest2 -> step resolve row rest (Descend rest2)
                         | None -> step resolve row rest (Arrive SqlValue.Null)
+            | KCoalesce remaining :: rest ->
+                if not (SqlValue.isNull v) then
+                    step resolve row rest (Arrive v)
+                else
+                    match remaining with
+                    | a :: tail -> step resolve row (KCoalesce tail :: rest) (Descend a)
+                    | [] -> step resolve row rest (Arrive SqlValue.Null)
             | KFuncArg(n, doneRev, tail) :: rest ->
                 let acc = v :: doneRev
 
@@ -633,37 +647,66 @@ module internal Eval =
             | Error e, None -> dict.Add(key, resolved), Some e
             | _ -> dict.Add(key, resolved), firstError
 
+    let private remember (e: DbError) (firstError: DbError option) =
+        match firstError with
+        | Some _ -> firstError
+        | None -> Some e
+
     /// リテラル LIKE パターンを 1つコンパイルして辞書へ加える。
+    /// ESCAPE の検証エラーやパターンのコンパイルエラーは、行が 1つも流れなくても
+    /// 検出できるよう `FirstError` にも載せる。
     let private prepareAddLike
-        (acc:
-            System.Collections.Immutable.ImmutableDictionary<struct (int * string), Result<Scalar.LikePattern, DbError>>)
+        (
+            acc:
+                System.Collections.Immutable.ImmutableDictionary<
+                    struct (int * string),
+                    Result<Scalar.LikePattern, DbError>
+                 > *
+                DbError option
+        )
         (escape: Expr option)
         (pattern: Expr)
         =
-        match pattern with
-        | Expr.Literal(Literal.String p) ->
-            let code =
+        let dict, firstError = acc
+
+        let patternText =
+            match pattern with
+            | Expr.Literal(Literal.String p) -> Some p
+            | Expr.Value(SqlValue.Text p) -> Some p
+            | _ -> None
+
+        match patternText with
+        | None -> acc
+        | Some p ->
+            let code, escapeError =
                 match escape with
-                | None -> Some Scalar.NoEscape
-                | Some(Expr.Literal(Literal.String s)) ->
+                | None -> Some Scalar.NoEscape, None
+                | Some(Expr.Literal(Literal.String s))
+                | Some(Expr.Value(SqlValue.Text s)) ->
                     match Scalar.escapeCodePoint s with
-                    | Ok cp -> Some cp
-                    | Error _ -> None
-                | Some _ -> None
+                    | Ok cp -> Some cp, None
+                    | Error e -> None, Some e
+                | Some _ -> None, None
+
+            let firstError' =
+                match escapeError with
+                | Some e -> remember e firstError
+                | None -> firstError
 
             match code with
+            | None -> dict, firstError'
             | Some code ->
                 let key = struct (code, p)
 
-                if acc.ContainsKey key then
-                    acc
+                if dict.ContainsKey key then
+                    dict, firstError'
                 else
                     let compiled =
                         Scalar.compileTokens (if code = Scalar.NoEscape then None else Some code) p
 
-                    acc.Add(key, compiled)
-            | None -> acc
-        | _ -> acc
+                    match compiled with
+                    | Error e -> dict.Add(key, compiled), remember e firstError
+                    | Ok _ -> dict.Add(key, compiled), firstError'
 
     /// 演算子が評価する式から、列解決とリテラル LIKE のコンパイルを 1回で済ませる。
     /// 可変のキャッシュではなく、返した値は評価中に変化しない。
@@ -692,8 +735,8 @@ module internal Eval =
                > =
             System.Collections.Immutable.ImmutableDictionary.Create()
 
-        let likes =
-            (emptyLikes, exprs)
+        let likes, likeError =
+            ((emptyLikes, None), exprs)
             ||> List.fold (fun acc e ->
                 Expr.fold
                     (fun acc node ->
@@ -708,7 +751,7 @@ module internal Eval =
             Source = schema
             Resolved = columns
             Patterns = likes
-            FirstError = firstError
+            FirstError = firstError |> Option.orElse likeError
         }
 
     /// 解決できなかった列参照があれば、その最初のエラーを返す。

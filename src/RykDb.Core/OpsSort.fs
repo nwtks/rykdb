@@ -23,27 +23,76 @@ module internal OpsSort =
                     | SortDirection.Ascending -> c
                     | SortDirection.Descending -> -c
 
+    /// 比較可能性のクラス。
+    /// 同じクラス内は `compareValuesV` で比較できる。
+    /// 単一の代表値だけで検査すると、有限 REAL の代表値が `INTEGER vs ±Infinity` を
+    /// 見逃してしまうため、型ごとに代表値を持つ。
+    /// 比較可能性は推移的でない（Int と有限 REAL は比較でき、有限 REAL と非有限 REAL も
+    /// 比較できるが、Int と非有限 REAL は比較できない）ので、互換クラスではなく型で分ける。
+    let private sortClass =
+        function
+        | SqlValue.Int _ -> 1
+        | SqlValue.Real f -> if System.Double.IsFinite f then 2 else 3
+        | SqlValue.Decimal _ -> 4
+        | SqlValue.Date _ -> 5
+        | SqlValue.Timestamp _ -> 6
+        | SqlValue.Bool _ -> 7
+        | SqlValue.Text _ -> 8
+        | SqlValue.Blob _ -> 9
+        | SqlValue.Uuid _ -> 10
+        | SqlValue.Unloaded -> 11
+        | SqlValue.Null -> 0
+
+    /// キー列のクラス別代表値へ 1つ値を足す。
+    /// 同じクラスなら代表値と 1 回だけ比べ、新しいクラスなら既存の全クラスと比べる。
+    [<TailCall>]
+    let rec private checkSortRepsAgainst (v: SqlValue) (reps: (int * SqlValue) list) =
+        function
+        | [] -> DbOk reps
+        | (_, representative) :: tail ->
+            match SqlValue.compareValuesV representative v with
+            | DbErr e -> DbErr e
+            | DbOk _ -> checkSortRepsAgainst v reps tail
+
+    /// キー列の代表値表へ 1つ値を足す。
+    let private checkSortRep (cls: int) (v: SqlValue) (reps: (int * SqlValue) list) =
+        match reps |> List.tryFind (fun (c, _) -> c = cls) with
+        | Some(_, representative) ->
+            match SqlValue.compareValuesV representative v with
+            | DbErr e -> DbErr e
+            | DbOk _ -> DbOk reps
+        | None ->
+            match checkSortRepsAgainst v reps reps with
+            | DbErr e -> DbErr e
+            | DbOk _ -> DbOk((cls, v) :: reps)
+
     /// 外部ソートの代表値検査を回す本体。
     [<TailCall>]
-    let rec private sortCheckLoop (plan: (int * SortDirection) list) (row: SqlValue array) (acc: Map<int, SqlValue>) =
+    let rec private sortCheckLoop (row: SqlValue array) (acc: Map<int, (int * SqlValue) list>) =
         function
         | [] -> DbOk acc
         | (i, _) :: tail ->
             let v = row.[i]
 
             if SqlValue.isNull v then
-                sortCheckLoop plan row acc tail
+                sortCheckLoop row acc tail
             else
+                let cls = sortClass v
+
                 match Map.tryFind i acc with
-                | None -> sortCheckLoop plan row (Map.add i v acc) tail
-                | Some representative ->
-                    match SqlValue.compareValuesV representative v with
+                | None -> sortCheckLoop row (Map.add i [ (cls, v) ] acc) tail
+                | Some reps ->
+                    match checkSortRep cls v reps with
                     | DbErr e -> DbErr e
-                    | DbOk _ -> sortCheckLoop plan row acc tail
+                    | DbOk reps' -> sortCheckLoop row (Map.add i reps' acc) tail
 
     /// キー列の代表値を集めて比較不能な値を検出する。
-    let private sortCheckNulls (plan: (int * SortDirection) list) (reps: Map<int, SqlValue>) (row: SqlValue array) =
-        sortCheckLoop plan row reps plan
+    let private sortCheckNulls
+        (plan: (int * SortDirection) list)
+        (reps: Map<int, (int * SqlValue) list>)
+        (row: SqlValue array)
+        =
+        sortCheckLoop row reps plan
 
     /// ORDER BY 式を列位置へ解決する。
     let private sortResolveColumn (resolve: Prepared) (k: SortKey) =

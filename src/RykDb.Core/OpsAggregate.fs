@@ -29,7 +29,9 @@ module internal OpsAggregate =
             SumReal: double
             Min: SqlValue option
             Max: SqlValue option
-            Seen: Set<SqlValue>
+            /// DISTINCT の重複判定キー（`keyNormalize`）→ 最初に現れた元の値。
+            /// 退避時は元の値を書く（型・スケールを保って再集計する）。
+            Seen: Map<SqlValue, SqlValue>
             SeenRuns: string list
         }
 
@@ -85,8 +87,8 @@ module internal OpsAggregate =
 
         let rows =
             acc.Seen
-            |> Set.toList
-            |> List.map (fun v ->
+            |> Map.toList
+            |> List.map (fun (_, v) ->
                 ValueCodec.writeValues [| v |] Writer.Empty
                 |> Result.map (fun w -> [| SqlValue.Blob(Writer.toArray w) |]))
             |> all
@@ -97,15 +99,17 @@ module internal OpsAggregate =
             match Spill.writeChunk budget.Directory stamp 0 (List.toArray rows) with
             | Error e -> DbErr e
             | Ok path ->
+                Spill.registerRun budget.Scope path
+
                 DbOk
                     { acc with
-                        Seen = Set.empty
+                        Seen = Map.empty
                         SeenRuns = path :: acc.SeenRuns
                     }
 
     /// SUM / AVG の 1値加算。
     /// REAL は非有限、INTEGER / DECIMAL は桁あふれを検査する。
-    let private aggAddSum (acc: Acc) (bump: Acc) (newSeen: Set<SqlValue>) (v: SqlValue) =
+    let private aggAddSum (acc: Acc) (bump: Acc) (newSeen: Map<SqlValue, SqlValue>) (v: SqlValue) =
         match v with
         | SqlValue.Real f ->
             let sum = acc.SumReal + float acc.SumDecimal + f
@@ -154,7 +158,7 @@ module internal OpsAggregate =
             )
 
     /// 1つの値をアキュムレータへ畳み込む。
-    let private aggAddValue (acc: Acc) (bump: Acc) (v: SqlValue) (newSeen: Set<SqlValue>) =
+    let private aggAddValue (acc: Acc) (bump: Acc) (v: SqlValue) (newSeen: Map<SqlValue, SqlValue>) =
         match acc.Kind with
         | AggFunc.Count -> DbOk { bump with Seen = newSeen }
         | AggFunc.Sum
@@ -188,13 +192,13 @@ module internal OpsAggregate =
 
     /// 集約 1項目のアキュムレータ更新（DISTINCT 判定と退避を含む）。
     let private aggAddAcc (budget: MemoryBudget) (acc: Acc) (value: SqlValue option) (isStar: bool) (distinct: bool) =
-        let seenValue =
+        let seenKey =
             match value with
             | Some v when not (SqlValue.isNull v) -> Some(SqlValue.keyNormalize v)
             | _ -> None
 
         let alreadySeen =
-            distinct && seenValue |> Option.exists (fun v -> Set.contains v acc.Seen)
+            distinct && seenKey |> Option.exists (fun k -> Map.containsKey k acc.Seen)
 
         if alreadySeen then
             DbOk acc
@@ -209,9 +213,9 @@ module internal OpsAggregate =
 
             let newSeen =
                 if distinct then
-                    match seenValue with
-                    | Some v -> Set.add v acc.Seen
-                    | None -> acc.Seen
+                    match seenKey, value with
+                    | Some k, Some original when not (SqlValue.isNull original) -> Map.add k original acc.Seen
+                    | _ -> acc.Seen
                 else
                     acc.Seen
 
@@ -222,7 +226,7 @@ module internal OpsAggregate =
                     else
                         max 64L (budget.Work / 32L)
 
-                if distinct && int64 (Set.count newSeen) > seenLimit then
+                if distinct && int64 (Map.count newSeen) > seenLimit then
                     aggSpillSeen budget { acc with Seen = newSeen }
                 else
                     DbOk { acc with Seen = newSeen }
@@ -292,7 +296,7 @@ module internal OpsAggregate =
             SumReal = 0.0
             Min = None
             Max = None
-            Seen = Set.empty
+            Seen = Map.empty
             SeenRuns = []
         }
 
@@ -320,7 +324,7 @@ module internal OpsAggregate =
                     let v = values.[0]
                     let bump = { a with Count = a.Count + 1L }
 
-                    match aggAddValue a bump v Set.empty with
+                    match aggAddValue a bump v Map.empty with
                     | DbErr e -> DbErr e
                     | DbOk next -> aggFoldDistinct next (Some bytes) nxt
             | SqlValue.Blob _ -> aggFoldDistinct a previous nxt
@@ -332,7 +336,7 @@ module internal OpsAggregate =
             DbOk acc
         else
             let flushed =
-                if Set.isEmpty acc.Seen then
+                if Map.isEmpty acc.Seen then
                     DbOk acc
                 else
                     aggSpillSeen budget acc
@@ -342,23 +346,20 @@ module internal OpsAggregate =
             | DbOk acc ->
                 let paths = acc.SeenRuns
 
-                let runOps =
-                    paths
-                    |> List.map (fun p -> Spill.reopen budget.Scope (Spill.RowSpool.Disk([ p ], 0)))
-                    |> all
-
-                match runOps with
+                match Spill.reopen budget.Scope (Spill.RowSpool.Disk(paths, 0)) with
                 | Error e ->
                     Spill.forget paths
+                    paths |> List.iter (Spill.forgetRun budget.Scope)
                     DbErr e
-                | Ok ops ->
-                    let src = List.foldBack Op.append ops Op.Empty
-
+                | Ok src ->
                     match ExtSort.sortRows budget () (fun () _ -> DbOk()) aggCompareBlob src with
                     | Error e ->
                         Spill.forget paths
+                        paths |> List.iter (Spill.forgetRun budget.Scope)
                         DbErr e
                     | Ok sorted ->
+                        paths |> List.iter (Spill.forgetRun budget.Scope)
+
                         aggFoldDistinct (aggEmptyAcc acc.Kind) None sorted
                         |> DbResult.map (fun final -> { final with SeenRuns = [] })
 
@@ -491,30 +492,31 @@ module internal OpsAggregate =
             match written with
             | Error e -> aggAbandon writer e
             | Ok _ ->
-                writer.Close()
+                match writer.Close() with
+                | Error e -> aggAbandon writer e
+                | Ok() ->
+                    let seeds =
+                        ctx.Buckets
+                        |> Seq.choose (fun kv ->
+                            match KeyBuilder.ofValues kv.Key with
+                            | Ok encoded ->
+                                Some(encoded, struct (ctx.OutputKeys.[kv.Key], kv.Value, ctx.FirstSeen.[kv.Key]))
+                            | Error _ -> None)
+                        |> List.ofSeq
 
-                let seeds =
-                    ctx.Buckets
-                    |> Seq.choose (fun kv ->
-                        match KeyBuilder.ofValues kv.Key with
-                        | Ok encoded ->
-                            Some(encoded, struct (ctx.OutputKeys.[kv.Key], kv.Value, ctx.FirstSeen.[kv.Key]))
-                        | Error _ -> None)
-                    |> List.ofSeq
-
-                Spill.groupPartitions
-                    ctx.Budget
-                    stamp
-                    (aggKeyOfFrame ctx.Resolve ctx.GroupBy ctx.NormalizeKey)
-                    (fun () -> aggSeed ctx.Aggs)
-                    (aggAddFrame ctx.Resolve ctx.GroupBy ctx.Aggs ctx.Budget)
-                    (aggStateBytes ctx.SeenBytes)
-                    (aggEmitGroup ctx.Budget)
-                    seeds
-                    (writer.Paths |> Array.toList)
-                >>= fun rows ->
-                    ExtSort.sortRows ctx.Budget () (fun () _ -> DbOk()) aggCompareFirst rows
-                    |> Result.map (Op.map (fun f -> DbOk(Array.sub f 1 (f.Length - 1))))
+                    Spill.groupPartitions
+                        ctx.Budget
+                        stamp
+                        (aggKeyOfFrame ctx.Resolve ctx.GroupBy ctx.NormalizeKey)
+                        (fun () -> aggSeed ctx.Aggs)
+                        (aggAddFrame ctx.Resolve ctx.GroupBy ctx.Aggs ctx.Budget)
+                        (aggStateBytes ctx.SeenBytes)
+                        (aggEmitGroup ctx.Budget)
+                        seeds
+                        (writer.Paths |> Array.toList)
+                    >>= fun rows ->
+                        ExtSort.sortRows ctx.Budget () (fun () _ -> DbOk()) aggCompareFirst rows
+                        |> Result.map (Op.map (fun f -> DbOk(Array.sub f 1 (f.Length - 1))))
 
     /// 入力行をグループ表へ畳み込む（末尾再帰）。上限超過時は退避する。
     [<TailCall>]
@@ -592,7 +594,7 @@ module internal OpsAggregate =
             Eval.prepare schema (groupBy @ (aggs |> List.map (fun (_, _, _, e) -> e)))
 
         let normalizeKey = Array.map SqlValue.keyNormalize
-        let seenBytes = List.sumBy (fun a -> int64 (Set.count a.Seen) * 32L)
+        let seenBytes = List.sumBy (fun a -> int64 (Map.count a.Seen) * 32L)
 
         let buckets =
             System.Collections.Generic.Dictionary<SqlValue array, Acc list>(

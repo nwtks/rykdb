@@ -992,6 +992,30 @@ let ``SqlReference: INSERT ... SELECT の制約違反は文全体を取り消す
         Assert.Equal<int64>(1L, countOf db2))
 
 [<Fact>]
+let ``SqlReference: INSERT ... SELECT の列数不一致は選択が 0 行でもエラー`` () =
+    // 行が 1 つも流れないと列数検査が走らず、不正な DML が 0 行の成功になる穴を塞ぐ。
+    withSession "insert-select-empty" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE src (a INTEGER PRIMARY KEY, b INTEGER)"
+        let db2 = exec db1 "CREATE TABLE dst (a INTEGER PRIMARY KEY)"
+
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "0 行の INSERT ... SELECT の列数不一致"
+            (execSql db2 "INSERT INTO dst (a) SELECT a, b FROM src")
+
+        // 列数が合っていれば 0 行で成功する。
+        let _, empty = ok (execSql db2 "INSERT INTO dst (a) SELECT a FROM src")
+        Assert.Equal<int>(0, empty.RowsAffected)
+
+        // 1 行でも流れれば従来どおり不一致を検出する。
+        let db3 = exec db2 "INSERT INTO src VALUES (1, 10)"
+
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "1 行の INSERT ... SELECT の列数不一致"
+            (execSql db3 "INSERT INTO dst (a) SELECT a, b FROM src"))
+
+[<Fact>]
 let ``SqlReference: UPDATE は WHERE に合う行だけを変える`` () =
     withSession "dml3" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
@@ -1313,6 +1337,51 @@ let ``SqlReference: GROUP BY の式を SELECT / HAVING でも使える`` () =
 
         Assert.Equal<int>(1, having.Rows.Length)
         Assert.Equal<int64>(2L, asInt having.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: 集約後の参照は識別子の大小文字を区別しない`` () =
+    // 識別子は大小文字を区別しない（§5）。集約後のスロット対応も同じ規則にする。
+    withSession "agg-case" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2)"
+
+        let _, res = ok (execSql db2 "SELECT A, COUNT(*) FROM t GROUP BY a ORDER BY A")
+        Assert.Equal<int>(2, res.Rows.Length)
+        Assert.Equal<int64>(1L, asInt res.Rows.[0].[0])
+        Assert.Equal<int64>(2L, asInt res.Rows.[0].[1])
+        Assert.Equal<int64>(2L, asInt res.Rows.[1].[0])
+        Assert.Equal<int64>(1L, asInt res.Rows.[1].[1])
+
+        // HAVING と ORDER BY も同じ規則で解決する。
+        let _, having = ok (execSql db2 "SELECT a FROM t GROUP BY A HAVING A > 1")
+        Assert.Equal<int>(1, having.Rows.Length)
+        Assert.Equal<int64>(2L, asInt having.Rows.[0].[0])
+
+        let _, ordered =
+            ok (execSql db2 "SELECT a, COUNT(*) FROM t GROUP BY A ORDER BY COUNT(*) DESC, a")
+
+        Assert.Equal<int64>(1L, asInt ordered.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: 表示が同じでも型が違う集約を混同しない`` () =
+    // `1` と `1e0` は表示が同じだが型が違う。スロット対応を表示文字列で行うと
+    // 後勝ちで取り違え、`MIN(1) / 2` が REAL の 0.5 になる（INTEGER の 0 が正しい）。
+    withSession "agg-key-type" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1)"
+
+        let _, res = ok (execSql db2 "SELECT MIN(1) / 2, MIN(1e0) FROM t")
+
+        match res.Rows.[0].[0], res.Rows.[0].[1] with
+        | SqlValue.Int 0L, SqlValue.Real 1.0 -> ()
+        | other -> failActual "INTEGER 0 と REAL 1.0" other
+
+        // 順序を入れ替えても取り違えない。
+        let _, rev = ok (execSql db2 "SELECT MIN(1e0), MIN(1) / 2 FROM t")
+
+        match rev.Rows.[0].[0], rev.Rows.[0].[1] with
+        | SqlValue.Real 1.0, SqlValue.Int 0L -> ()
+        | other -> failActual "REAL 1.0 と INTEGER 0" other)
 
 [<Fact>]
 let ``SqlReference: HAVING でグループを絞る`` () =
@@ -2401,6 +2470,44 @@ let ``SqlReference: LIKE ESCAPE と CAST`` () =
         Assert.Equal<string>("42", asText casted.Rows.[0].[1]))
 
 [<Fact>]
+let ``SqlReference: 不正な LIKE のパターンは 0 行でもエラー`` () =
+    // 定数パターンのコンパイルエラーは、行を 1 つも評価しなくても計画時に検出する。
+    withSession "like-pattern-empty" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
+        expectErrorKind ErrorKind.TypeError "末尾 ESCAPE" (execSql db1 "SELECT * FROM t WHERE s LIKE 'a#' ESCAPE '#'")
+
+        expectErrorKind
+            ErrorKind.TypeError
+            "2 文字の ESCAPE"
+            (execSql db1 "SELECT * FROM t WHERE s LIKE 'a#b' ESCAPE '##'")
+
+        // 正しいパターンは 0 行で成功する。
+        let _, empty = ok (execSql db1 "SELECT * FROM t WHERE s LIKE 'a#%' ESCAPE '#'")
+        Assert.Equal<int>(0, empty.Rows.Length))
+
+[<Fact>]
+let ``SqlReference: COALESCE は非 NULL が見つかった後の引数を評価しない`` () =
+    // SQL 標準の COALESCE は CASE と等価。到達しない引数のエラーで落ちない。
+    withSession "coalesce-lazy" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1)"
+
+        let _, first = ok (execSql db2 "SELECT COALESCE(1, 1 / 0) FROM t")
+        Assert.Equal<int64>(1L, asInt first.Rows.[0].[0])
+
+        let _, second = ok (execSql db2 "SELECT COALESCE(NULL, 2, 1 / 0) FROM t")
+        Assert.Equal<int64>(2L, asInt second.Rows.[0].[0])
+
+        let _, allNull = ok (execSql db2 "SELECT COALESCE(NULL, NULL) FROM t")
+        Assert.Equal<SqlValue>(SqlValue.Null, allNull.Rows.[0].[0])
+
+        // NULL のときは次の引数を評価するので、0 除算はエラーになる。
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "COALESCE の到達する引数のエラー"
+            (execSql db2 "SELECT COALESCE(NULL, 1 / 0) FROM t"))
+
+[<Fact>]
 let ``SqlReference: LENGTH はサロゲートペアを 1文字として数える`` () =
     withSession "p1-length-surrogate" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
@@ -2675,6 +2782,27 @@ let ``SqlReference: 集約があるのに GROUP BY に無い列を選ぶとエ�
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
         let db2 = exec db1 "INSERT INTO t VALUES (1), (2)"
         expectErrorKind ErrorKind.NameError "ORDER BY COUNT(*)" (execSql db2 "SELECT id FROM t ORDER BY COUNT(*)"))
+
+[<Fact>]
+let ``SqlReference: ORDER BY は非有限 REAL と他型の混在を検出する`` () =
+    // 代表値が有限 REAL だと INTEGER vs ±Infinity の比較不能を見逃し、
+    // 比較エラーを 0 として扱って誤った順序を返していた。
+    withSession "order-by-mixed-inf" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1)"
+
+        expectErrorKind
+            ErrorKind.TypeError
+            "混在型の ORDER BY"
+            (execSql db2 "SELECT 1.5 AS x UNION ALL SELECT 1 UNION ALL SELECT 1e999 ORDER BY x")
+
+        // 有限の数値同士は従来どおり並べ替えられる。
+        let _, finite =
+            ok (execSql db2 "SELECT 1.5 AS x UNION ALL SELECT 1 UNION ALL SELECT 0.5 ORDER BY x")
+
+        Assert.Equal<SqlValue>(SqlValue.Real 0.5, finite.Rows.[0].[0])
+        Assert.Equal<SqlValue>(SqlValue.Int 1L, finite.Rows.[1].[0])
+        Assert.Equal<SqlValue>(SqlValue.Real 1.5, finite.Rows.[2].[0]))
 
 [<Fact>]
 let ``SqlReference: ORDER BY の序数は範囲外だとエラー`` () =
