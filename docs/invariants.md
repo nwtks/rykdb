@@ -693,7 +693,8 @@ memtableやtransactionなど保持する側は、渡されたキーと行を複�
   （相関 IN で外側行ごとに作ってもメモリが残らない）。
 - `LIMIT`や `RowReader.Dispose`の早期終了では `DisposeAll()`が閉じて削除する。
 - 通常終了では `ScanScope.Forget`で登録を外してから明示的に削除する。
-- 途中で残ったrunは次の外部ソート時に `Spill.sweepStale`が24時間超だけ回収する。
+- 途中で残ったrunは、DB を開くときに `Spill.sweepStale` が 24時間超だけ回収する
+  （クエリごとにディレクトリを列挙しない）。
 
 回帰テストは上限超過、再open、破損run、不在ディレクトリ、早期終了、DISTINCT、集約、結合アルゴリズムでの残留を検査する。
 

@@ -495,28 +495,26 @@ module internal OpsAggregate =
                 match writer.Close() with
                 | Error e -> aggAbandon writer e
                 | Ok() ->
-                    let seeds =
-                        ctx.Buckets
-                        |> Seq.choose (fun kv ->
-                            match KeyBuilder.ofValues kv.Key with
-                            | Ok encoded ->
-                                Some(encoded, struct (ctx.OutputKeys.[kv.Key], kv.Value, ctx.FirstSeen.[kv.Key]))
-                            | Error _ -> None)
-                        |> List.ofSeq
-
-                    Spill.groupPartitions
-                        ctx.Budget
-                        stamp
-                        (aggKeyOfFrame ctx.Resolve ctx.GroupBy ctx.NormalizeKey)
-                        (fun () -> aggSeed ctx.Aggs)
-                        (aggAddFrame ctx.Resolve ctx.GroupBy ctx.Aggs ctx.Budget)
-                        (aggStateBytes ctx.SeenBytes)
-                        (aggEmitGroup ctx.Budget)
-                        seeds
-                        (writer.Paths |> Array.toList)
-                    >>= fun rows ->
-                        ExtSort.sortRows ctx.Budget () (fun () _ -> DbOk()) aggCompareFirst rows
-                        |> Result.map (Op.map (fun f -> DbOk(Array.sub f 1 (f.Length - 1))))
+                    ctx.Buckets
+                    |> Seq.map (fun kv ->
+                        KeyBuilder.ofValues kv.Key
+                        |> Result.map (fun encoded ->
+                            encoded, struct (ctx.OutputKeys.[kv.Key], kv.Value, ctx.FirstSeen.[kv.Key])))
+                    |> all
+                    >>= fun seeds ->
+                        Spill.groupPartitions
+                            ctx.Budget
+                            stamp
+                            (aggKeyOfFrame ctx.Resolve ctx.GroupBy ctx.NormalizeKey)
+                            (fun () -> aggSeed ctx.Aggs)
+                            (aggAddFrame ctx.Resolve ctx.GroupBy ctx.Aggs ctx.Budget)
+                            (aggStateBytes ctx.SeenBytes)
+                            (aggEmitGroup ctx.Budget)
+                            seeds
+                            (writer.Paths |> Array.toList)
+                        >>= fun rows ->
+                            ExtSort.sortRows ctx.Budget () (fun () _ -> DbOk()) aggCompareFirst rows
+                            |> Result.map (Op.map (fun f -> DbOk(Array.sub f 1 (f.Length - 1))))
 
     /// 入力行をグループ表へ畳み込む（末尾再帰）。上限超過時は退避する。
     [<TailCall>]

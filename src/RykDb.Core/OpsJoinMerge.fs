@@ -351,22 +351,204 @@ module internal OpsJoinMerge =
         (lnext: MergeSide)
         (rnext: MergeSide)
         =
-        match Spill.reopenKeep budget.Scope lspool with
-        | Error e -> Op.compute (fun () -> OpStep.OpError e)
-        | Ok lrows ->
-            mergeJoinNextLeft
-                isLeft
-                budget
-                leftKeys
-                rightKeys
-                rightWidth
-                resolve
-                residual
-                lspool
-                rspool
-                lnext
-                rnext
-                lrows
+        match lspool, rspool with
+        | Spill.RowSpool.Memory leftRows, Spill.RowSpool.Disk _ ->
+            match Spill.reopenKeep budget.Scope rspool with
+            | Error e -> Op.compute (fun () -> OpStep.OpError e)
+            | Ok rrows ->
+                let matched = if isLeft then Array.create leftRows.Length false else [||]
+
+                mergeJoinRightOuter
+                    isLeft
+                    budget
+                    leftKeys
+                    rightKeys
+                    rightWidth
+                    resolve
+                    residual
+                    leftRows
+                    matched
+                    lnext
+                    rnext
+                    lspool
+                    rspool
+                    rrows
+        | _ ->
+            match Spill.reopenKeep budget.Scope lspool with
+            | Error e -> Op.compute (fun () -> OpStep.OpError e)
+            | Ok lrows ->
+                mergeJoinNextLeft
+                    isLeft
+                    budget
+                    leftKeys
+                    rightKeys
+                    rightWidth
+                    resolve
+                    residual
+                    lspool
+                    rspool
+                    lnext
+                    rnext
+                    lrows
+
+    /// メモリ上の左グループを内側にして、退避した右グループを外側に流す。
+    /// `LEFT` では一致しなかった左行を最後に NULL 拡張する。
+    and private mergeJoinRightOuter
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (rightWidth: int)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (leftRows: SqlValue array array)
+        (matched: bool array)
+        (lnext: MergeSide)
+        (rnext: MergeSide)
+        (lspool: Spill.RowSpool)
+        (rspool: Spill.RowSpool)
+        (rrows: Op)
+        =
+        Op.compute (fun () ->
+            match Op.next rrows with
+            | OpStep.OpError e -> OpStep.OpError e
+            | OpStep.OpDone ->
+                Spill.forgetSpool budget.Scope lspool
+                Spill.deleteSpool lspool
+                Spill.forgetSpool budget.Scope rspool
+                Spill.deleteSpool rspool
+
+                if isLeft then
+                    Op.next (
+                        mergeJoinUnmatchedLeft
+                            isLeft
+                            budget
+                            leftKeys
+                            rightKeys
+                            rightWidth
+                            resolve
+                            residual
+                            leftRows
+                            matched
+                            0
+                            lnext
+                            rnext
+                    )
+                else
+                    Op.next (mergeJoinLoop isLeft budget leftKeys rightKeys rightWidth resolve residual lnext rnext)
+            | OpStep.OpRow(rrow, rrest) ->
+                Op.next (
+                    mergeJoinRightRow
+                        isLeft
+                        rightWidth
+                        resolve
+                        residual
+                        leftRows
+                        matched
+                        0
+                        rrow
+                        (mergeJoinRightOuter
+                            isLeft
+                            budget
+                            leftKeys
+                            rightKeys
+                            rightWidth
+                            resolve
+                            residual
+                            leftRows
+                            matched
+                            lnext
+                            rnext
+                            lspool
+                            rspool
+                            rrest)
+                ))
+
+    /// 1 右行とメモリ上の全左行を突き合わせる。
+    and private mergeJoinRightRow
+        (isLeft: bool)
+        (rightWidth: int)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (leftRows: SqlValue array array)
+        (matched: bool array)
+        (rowIndex: int)
+        (rrow: SqlValue array)
+        (rest: Op)
+        =
+        if rowIndex >= leftRows.Length then
+            rest
+        else
+            Op.compute (fun () ->
+                let lrow = leftRows.[rowIndex]
+
+                match residualMatches resolve lrow rrow residual with
+                | DbErr e -> OpStep.OpError e
+                | DbOk false ->
+                    Op.next (
+                        mergeJoinRightRow isLeft rightWidth resolve residual leftRows matched (rowIndex + 1) rrow rest
+                    )
+                | DbOk true ->
+                    if isLeft then
+                        matched.[rowIndex] <- true
+
+                    OpStep.OpRow(
+                        Array.append lrow rrow,
+                        mergeJoinRightRow isLeft rightWidth resolve residual leftRows matched (rowIndex + 1) rrow rest
+                    ))
+
+    /// 右グループを流し終えたあと、`LEFT` で一致しなかった左行を NULL 拡張して出す。
+    and private mergeJoinUnmatchedLeft
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (leftKeys: int array)
+        (rightKeys: int array)
+        (rightWidth: int)
+        (resolve: Prepared)
+        (residual: Expr option)
+        (leftRows: SqlValue array array)
+        (matched: bool array)
+        (rowIndex: int)
+        (lnext: MergeSide)
+        (rnext: MergeSide)
+        =
+        if rowIndex >= leftRows.Length then
+            mergeJoinLoop isLeft budget leftKeys rightKeys rightWidth resolve residual lnext rnext
+        else
+            Op.compute (fun () ->
+                if matched.[rowIndex] then
+                    Op.next (
+                        mergeJoinUnmatchedLeft
+                            isLeft
+                            budget
+                            leftKeys
+                            rightKeys
+                            rightWidth
+                            resolve
+                            residual
+                            leftRows
+                            matched
+                            (rowIndex + 1)
+                            lnext
+                            rnext
+                    )
+                else
+                    OpStep.OpRow(
+                        mergePadded rightWidth leftRows.[rowIndex],
+                        mergeJoinUnmatchedLeft
+                            isLeft
+                            budget
+                            leftKeys
+                            rightKeys
+                            rightWidth
+                            resolve
+                            residual
+                            leftRows
+                            matched
+                            (rowIndex + 1)
+                            lnext
+                            rnext
+                    ))
 
     /// 一致グループの左行を順に出力する。
     and private mergeJoinNextLeft

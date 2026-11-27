@@ -106,6 +106,7 @@ module internal Spill =
 
     /// 24時間を超えて残った run を回収する（途中打ち切りで放置された分）。
     /// 実行中の run は24時間を超えない前提で、年齢で見分ける。
+    /// 呼び出しは DB を開くときの 1 回だけ（クエリごとに列挙しない）。
     let sweepStale (dir: string option) =
         protect (fun () ->
             let dir = directory dir
@@ -190,11 +191,13 @@ module internal Spill =
     let private closeSinksResult = closeSinksResultLoop 0 None
 
     /// 1行をフレーム（varint 長 + 符号化）にする。
+    /// 長さを先に求めて 1 回の `Writer` に書く
+    /// （符号化した本文をもう一度コピーしない）。
     let private frameRow (row: SqlValue array) =
-        ValueCodec.writeValuesSparse row Writer.Empty
-        |> Result.map (fun writer ->
-            let payload = Writer.toArray writer
-            Writer.build [ Writer.varint (uint64 payload.Length); Writer.writeBytes payload ])
+        let payloadLength = ValueCodec.encodedValuesLength row
+
+        ValueCodec.writeValuesSparse row (Writer.varint (uint64 payloadLength) Writer.Empty)
+        |> Result.map Writer.toArray
 
     /// 1行を run へ書き出す。
     let writeRow (row: SqlValue array) (sink: Sink) =

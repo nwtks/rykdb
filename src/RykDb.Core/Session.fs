@@ -537,6 +537,8 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     static member OpenWith(root: string, options: SessionOptions) =
         SessionOptions.Validate options
         >>= fun () ->
+            Spill.sweepStale options.SpillDirectory
+
             DatabaseHost.OpenWithBackground root
             |> Result.map (fun host -> new Session(host, options, true))
 
@@ -544,6 +546,8 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
     static member internal OpenWithSync(root: string, options: SessionOptions) =
         SessionOptions.Validate options
         >>= fun () ->
+            Spill.sweepStale options.SpillDirectory
+
             DatabaseHost.OpenWith root
             |> Result.map (fun host -> new Session(host, options, true))
 

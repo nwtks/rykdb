@@ -365,75 +365,72 @@ module internal OpsJoinHash =
         (canSplit: bool)
         (lspool: Spill.RowSpool)
         (rspool: Spill.RowSpool)
-        : Result<HashJoinStep, DbError> =
-        match Spill.reopenKeep budget.Scope rspool >>= Spill.spool budget with
-        | Ok(Spill.RowSpool.Memory rightRows) ->
-            match buildHashTable rightRows rightKeys with
-            | Ok table ->
-                Spill.forgetSpool budget.Scope rspool
-                Spill.deleteSpool rspool
+        =
+        match Spill.reopenKeep budget.Scope rspool with
+        | Error e -> err e
+        | Ok rrows ->
+            match Op.toArrayLimited -1L budget.Work rrows with
+            | Ok rightRows ->
+                match buildHashTable rightRows rightKeys with
+                | Ok table ->
+                    Spill.forgetSpool budget.Scope rspool
+                    Spill.deleteSpool rspool
 
+                    match Spill.reopen budget.Scope lspool with
+                    | Ok l ->
+                        let op =
+                            joinProbe
+                                isLeft
+                                leftSchema
+                                l
+                                leftKeys
+                                rightSchema
+                                residual
+                                (fun row -> encodeKey row leftKeys)
+                                (lookupHash table)
+
+                        ret (HashJoinEmit op)
+                    | Error e -> err e
+                | Error e -> err e
+            | Error e when e.Kind = ErrorKind.CapacityError && canSplit ->
+                match hashRepartitionOne budget stamp spools salt "l" leftKeys lspool with
+                | Ok lparts ->
+                    match hashRepartitionOne budget stamp spools salt "r" rightKeys rspool with
+                    | Ok rparts ->
+                        let next =
+                            Array.map2 (fun l r -> depth + 1, salt + 1UL, l, r) lparts rparts
+                            |> Array.toList
+
+                        ret (HashJoinSplit next)
+                    | Error e -> err e
+                | Error e -> err e
+            | Error e when e.Kind = ErrorKind.CapacityError ->
                 match Spill.reopen budget.Scope lspool with
                 | Ok l ->
-                    let op =
-                        joinProbe
-                            isLeft
-                            leftSchema
-                            l
-                            leftKeys
-                            rightSchema
-                            residual
-                            (fun row -> encodeKey row leftKeys)
-                            (lookupHash table)
+                    match sortByJoinKey budget leftKeys l with
+                    | Ok sortedLeft ->
+                        match Spill.reopen budget.Scope rspool with
+                        | Ok r ->
+                            match sortByJoinKey budget rightKeys r with
+                            | Ok sortedRight ->
+                                let op =
+                                    mergeJoinWith
+                                        isLeft
+                                        budget
+                                        leftSchema
+                                        sortedLeft
+                                        leftKeys
+                                        rightSchema
+                                        sortedRight
+                                        rightKeys
+                                        residual
 
-                    ret (HashJoinEmit op)
-                | Error e -> err e
-            | Error e -> err e
-        | Ok rightSpool when canSplit ->
-            Spill.forgetSpool budget.Scope rightSpool
-            Spill.deleteSpool rightSpool
-
-            match hashRepartitionOne budget stamp spools salt "l" leftKeys lspool with
-            | Ok lparts ->
-                match hashRepartitionOne budget stamp spools salt "r" rightKeys rspool with
-                | Ok rparts ->
-                    let next =
-                        Array.map2 (fun l r -> depth + 1, salt + 1UL, l, r) lparts rparts
-                        |> Array.toList
-
-                    ret (HashJoinSplit next)
-                | Error e -> err e
-            | Error e -> err e
-        | Ok rightSpool ->
-            Spill.forgetSpool budget.Scope rightSpool
-            Spill.deleteSpool rightSpool
-
-            match Spill.reopen budget.Scope lspool with
-            | Ok l ->
-                match sortByJoinKey budget leftKeys l with
-                | Ok sortedLeft ->
-                    match Spill.reopen budget.Scope rspool with
-                    | Ok r ->
-                        match sortByJoinKey budget rightKeys r with
-                        | Ok sortedRight ->
-                            let op =
-                                mergeJoinWith
-                                    isLeft
-                                    budget
-                                    leftSchema
-                                    sortedLeft
-                                    leftKeys
-                                    rightSchema
-                                    sortedRight
-                                    rightKeys
-                                    residual
-
-                            ret (HashJoinMergeFallback op)
+                                ret (HashJoinMergeFallback op)
+                            | Error e -> err e
                         | Error e -> err e
                     | Error e -> err e
                 | Error e -> err e
             | Error e -> err e
-        | Error e -> err e
 
     /// パーティションを 1つずつ遅延処理する。
     /// 先頭の 1 行を返す前に全パーティションのハッシュ表を作らない

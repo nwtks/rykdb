@@ -293,6 +293,25 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 - 回帰: `SqlReference: INSERT ... SELECT の列数不一致は選択が 0 行でもエラー` /
   `SqlReference: 不正な LIKE のパターンは 0 行でもエラー`。
 
+### 3.24 結合グループの退避は「メモリ側を内側」にする
+
+マージ結合は結合キーのグループを `Spill.RowSpool` で保持する。
+左行ごとに右グループの run を先頭から読み直すと、
+左がメモリに収まっていても O(左行数 × 右行数) の I/O になる
+（右が退避したときが本命）。
+
+- ✅ 左がメモリ・右が退避なら、右を外側に 1回だけ流し、左を内側にする（`mergeJoinRightOuter`）。
+- ✅ `LEFT` では左行ごとの一致フラグ（`bool array`）を持ち、一致しなかった左行を最後に NULL 拡張する。
+- 回帰: `結合: マージ結合は左がメモリ・右が退避でも結果が同じ`。
+
+### 3.25 ハッシュ結合の収容判定に spool を使わない
+
+「右パーティションが作業メモリに収まるか」を知るために spool すると、
+収まらない場合に作った run を捨てて再分割するため、右全体の読み書きが余分に発生する。
+
+- ✅ `Op.toArrayLimited -1 budget.Work` で直接読み込み、`CapacityError` を「収まらない」として扱う。
+- ❌ `Spill.spool` の戻り値で判定する（収まる場合も収まらない場合も run を作る）。
+
 ---
 
 ## 4. LSM・WAL・MANIFEST
@@ -803,6 +822,23 @@ SELECT定数、`COUNT(*)`、DELETE、INDEX lookupは参照列だけ復号する�
 - ✅ `foldPartitionOp` がパーティションを 1本ずつ畳み、その出力行を `Op` として順に返す。
 - ✅ `ValueSet` の OnDisk 索引は Dispose で `ScanScope.Forget` する。
 - 回帰: `ValueSet: Dispose は ScanScope の登録を外す`。
+
+### 7.17 k-way merge は run の配列と添字更新で回す
+
+run のリストを `splitAt` と `@` で行ごとに組み直すと、1行出力するたびに O(fan-in) のリストセルを確保する。
+
+- ✅ 開いた run を配列で持ち、選んだ添字の先頭行だけを差し替える
+  （`ExtSort.scanArray` / `writeMerged` / `pull`）。
+- ✅ 尽きた run は `Head = None` にして閉じ、最後に残りを閉じる（`Dispose` は冪等）。
+- 回帰: `ExtSort` / `OpsSort` / `OpsDistinct` / `OpsAggregate` のスピル系テスト。
+
+### 7.18 sweepStale はクエリごとに呼ばない
+
+`Optimizer.exec` の冒頭で `Spill.sweepStale` を呼ぶと、スピルしない小さなクエリでも
+一時ディレクトリの列挙（`Directory.GetFiles` + ファイルごとの `FileInfo`）が固定費になる。
+
+- ✅ `Session.OpenWith` / `OpenWithSync` で 1回だけ回収する（24時間超の run だけ削除）。
+- ❌ クエリの実行ごとに列挙する。
 
 ---
 

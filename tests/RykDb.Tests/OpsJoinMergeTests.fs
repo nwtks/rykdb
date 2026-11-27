@@ -256,6 +256,69 @@ let ``結合: マージの LEFT JOIN もグループを退避すると NULL 拡�
         assertNoLeftovers dir)
 
 [<Fact>]
+let ``結合: マージ結合は左がメモリ・右が退避でも結果が同じ`` () =
+    // 左がメモリに収まり右だけが退避するとき、右を行ごとに読み直さず 1回だけ流す。
+    withDir "join-merge-right-spill" (fun dir ->
+        let left =
+            Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 1L |]; [| SqlValue.Int 9L |] |]
+
+        let rightRows = [| for _ in 1..200 -> [| SqlValue.Int 1L |] |]
+
+        let budget =
+            { MemoryBudget.Unlimited with
+                Work = 1024L
+                Sort = 1024L
+                Directory = Some dir
+            }
+
+        let inner =
+            ok (
+                Op.toArray (
+                    ok (
+                        OpsJoinMerge.innerJoinMerge
+                            budget
+                            leftSchema
+                            left
+                            [| 0 |]
+                            rightSchema
+                            (Op.ofArray rightRows)
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        // キー 1 の左 2行 × 右 200行。キー 9 は一致しない。
+        Assert.Equal<int>(400, inner.Length)
+        Assert.True(inner |> Array.forall (fun r -> asInt r.[0] = 1L))
+
+        // LEFT は一致しなかったキー 9 の左行を NULL 拡張する。
+        let leftOnly =
+            ok (
+                Op.toArray (
+                    ok (
+                        OpsJoinMerge.leftJoinMerge
+                            budget
+                            leftSchema
+                            left
+                            [| 0 |]
+                            rightSchema
+                            (Op.ofArray rightRows)
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        Assert.Equal<int>(401, leftOnly.Length)
+
+        let padded =
+            leftOnly |> Array.filter (fun r -> asInt r.[0] = 9L && SqlValue.isNull r.[1])
+
+        Assert.Equal<int>(1, padded.Length)
+        assertNoLeftovers dir)
+
+[<Fact>]
 let ``結合: マージ結合のグループ退避は作成直後に ScanScope へ登録する`` () =
     withDir "join-merge-group-scope" (fun dir ->
         let scope = ScanScope()

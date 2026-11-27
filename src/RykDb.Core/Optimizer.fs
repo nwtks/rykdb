@@ -919,7 +919,6 @@ module internal Optimizer =
     /// childSchema は「そのノードが結果を読む側」だけが使う。
     /// </remarks>
     let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
-        Spill.sweepStale ctx.Budget.Directory
         let memo = OutputSchemaMemo()
 
         let ctx =

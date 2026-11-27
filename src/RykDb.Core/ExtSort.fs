@@ -28,111 +28,94 @@ module internal ExtSort =
     [<Literal>]
     let private MaxFanIn = 32
 
+    let private openRun (budget: MemoryBudget) (path: string) = Spill.openTracked budget.Scope path
+
+    let private closeRun (budget: MemoryBudget) (st: RunState) = Spill.closeTracked budget.Scope true st
+
+    /// 開いている run をすべて閉じる。
+    let private closeAll (budget: MemoryBudget) = Array.iter (closeRun budget)
+
     /// run ファイルをすべて開く（失敗時は開いた分を閉じて忘れる）。
     [<TailCall>]
-    let rec private openAll
-        (openRun: string -> Result<'a, DbError>)
-        (closeAll: 'a list -> unit)
-        (acc: 'a list)
-        (rest: string list)
-        =
-        match rest with
-        | [] -> ret (List.rev acc)
-        | p :: tail ->
-            match openRun p with
+    let rec private openAll (budget: MemoryBudget) (acc: RunState list) =
+        function
+        | [] -> ret (List.rev acc |> List.toArray)
+        | p :: tail as rest ->
+            match openRun budget p with
             | Error e ->
-                closeAll acc
+                acc |> List.iter (closeRun budget)
                 Spill.forget rest
                 err e
-            | Ok state -> openAll openRun closeAll (state :: acc) tail
+            | Ok state -> openAll budget (state :: acc) tail
 
     /// 先頭行が最小の run の添字を選ぶ。
+    /// run の状態は配列で持ち、選んだ添字の先頭行だけを差し替える
+    /// （リストの分割と連結を行ごとに作り直さない）。
     [<TailCall>]
     let rec private scan
         (compareRows: SqlValue array -> SqlValue array -> int)
+        (states: RunState array)
         (i: int)
         (bestIdx: int)
         (best: SqlValue array option)
         =
-        function
-        | [] -> bestIdx
-        | s :: tail ->
-            match s.Head with
-            | None -> scan compareRows (i + 1) bestIdx best tail
+        if i >= states.Length then
+            bestIdx
+        else
+            match states.[i].Head with
+            | None -> scan compareRows states (i + 1) bestIdx best
             | Some h ->
                 match best with
-                | Some b when compareRows h b >= 0 -> scan compareRows (i + 1) bestIdx best tail
-                | _ -> scan compareRows (i + 1) i (Some h) tail
-
-    /// 先頭 n 個を取り出して残りを返す。
-    [<TailCall>]
-    let rec private splitAt (n: int) (acc: 'a list) (states: 'a list) =
-        if n <= 0 then
-            List.rev acc, states
-        else
-            match states with
-            | [] -> List.rev acc, []
-            | h :: tail -> splitAt (n - 1) (h :: acc) tail
+                | Some b when compareRows h b >= 0 -> scan compareRows states (i + 1) bestIdx best
+                | _ -> scan compareRows states (i + 1) i (Some h)
 
     /// 最小の run から sink へ行を書き出し、全 run が空になるまで続ける。
     [<TailCall>]
     let rec private writeMerged
-        (closeAll: RunState list -> unit)
-        (closeRun: RunState -> unit)
+        (budget: MemoryBudget)
         (compareRows: SqlValue array -> SqlValue array -> int)
         (sink: Sink)
-        (states: RunState list)
+        (states: RunState array)
         =
-        let idx = scan compareRows 0 -1 None states
+        let idx = scan compareRows states 0 -1 None
 
         if idx < 0 then
-            closeAll states
+            closeAll budget states
             ret ()
         else
-            let before, chosenAndAfter = splitAt idx [] states
+            let chosen = states.[idx]
 
-            match chosenAndAfter with
-            | [] ->
-                closeAll states
+            match chosen.Head with
+            | None ->
+                closeAll budget states
                 ret ()
-            | chosen :: after ->
-                match chosen.Head with
-                | None ->
-                    closeRun chosen
-                    writeMerged closeAll closeRun compareRows sink (before @ after)
-                | Some row ->
-                    match Spill.writeRow row sink with
+            | Some row ->
+                match Spill.writeRow row sink with
+                | Error e ->
+                    closeAll budget states
+                    err e
+                | Ok() ->
+                    match Spill.readRow chosen.Src with
                     | Error e ->
-                        closeAll (before @ chosenAndAfter)
+                        closeAll budget states
                         err e
-                    | Ok() ->
-                        match Spill.readRow chosen.Src with
-                        | Error e ->
-                            closeAll (before @ chosenAndAfter)
-                            err e
-                        | Ok None ->
-                            closeRun chosen
-                            writeMerged closeAll closeRun compareRows sink (before @ after)
-                        | Ok(Some nxt) ->
-                            writeMerged
-                                closeAll
-                                closeRun
-                                compareRows
-                                sink
-                                (before @ { chosen with Head = Some nxt } :: after)
+                    | Ok None ->
+                        closeRun budget chosen
+                        states.[idx] <- { chosen with Head = None }
+                        writeMerged budget compareRows sink states
+                    | Ok(Some nxt) ->
+                        states.[idx] <- { chosen with Head = Some nxt }
+                        writeMerged budget compareRows sink states
 
     /// 複数の run を 1本にマージして新しい run を作る。
     let private mergeToRun
-        (openRun: string -> Result<RunState, DbError>)
-        (closeAll: RunState list -> unit)
-        (closeRun: RunState -> unit)
         (budget: MemoryBudget)
         (compareRows: SqlValue array -> SqlValue array -> int)
         (stamp: string)
         (serial: int)
         (paths: string list)
         =
-        match openAll openRun closeAll [] paths with
+        match openAll budget [] paths with
         | Error e ->
             Spill.forget paths
             err e
@@ -141,10 +124,10 @@ module internal ExtSort =
 
             match Spill.openSink path with
             | Error e ->
-                closeAll states
+                closeAll budget states
                 err e
             | Ok sink ->
-                match writeMerged closeAll closeRun compareRows sink states with
+                match writeMerged budget compareRows sink states with
                 | Error e ->
                     Spill.closeSink sink
                     Spill.forget [ path ]
@@ -158,58 +141,52 @@ module internal ExtSort =
 
     /// 開いた run から 1行取り出し、残りの状態を返す。
     let private pull
-        (closeAll: RunState list -> unit)
-        (closeRun: RunState -> unit)
+        (budget: MemoryBudget)
         (compareRows: SqlValue array -> SqlValue array -> int)
-        (states: RunState list)
+        (states: RunState array)
         =
-        let idx = scan compareRows 0 -1 None states
+        let idx = scan compareRows states 0 -1 None
 
         if idx < 0 then
-            closeAll states
+            closeAll budget states
             ret None
         else
-            let before, chosenAndAfter = splitAt idx [] states
+            let chosen = states.[idx]
 
-            match chosenAndAfter with
-            | [] -> ret None
-            | chosen :: after ->
-                match chosen.Head with
-                | None -> ret None
-                | Some row ->
-                    match Spill.readRow chosen.Src with
-                    | Error e ->
-                        closeAll (before @ chosenAndAfter)
-                        err e
-                    | Ok None ->
-                        closeRun chosen
-                        ret (Some(row, before @ after))
-                    | Ok(Some nxt) ->
-                        let advanced = { chosen with Head = Some nxt }
-                        ret (Some(row, before @ advanced :: after))
+            match chosen.Head with
+            | None -> ret None
+            | Some row ->
+                match Spill.readRow chosen.Src with
+                | Error e ->
+                    closeAll budget states
+                    err e
+                | Ok None ->
+                    closeRun budget chosen
+                    states.[idx] <- { chosen with Head = None }
+                    ret (Some(row, states))
+                | Ok(Some nxt) ->
+                    states.[idx] <- { chosen with Head = Some nxt }
+                    ret (Some(row, states))
 
     /// マージ済みの run から行を順に返す Op を組み立てる。
     let rec private mergeRuns
-        (closeAll: RunState list -> unit)
-        (closeRun: RunState -> unit)
+        (budget: MemoryBudget)
         (compareRows: SqlValue array -> SqlValue array -> int)
-        (states: RunState list)
+        (states: RunState array)
         =
         Op.compute (fun () ->
-            match pull closeAll closeRun compareRows states with
+            match pull budget compareRows states with
             | Error e -> OpStep.OpError e
             | Ok None -> OpStep.OpDone
-            | Ok(Some(row, rest)) -> OpStep.OpRow(row, mergeRuns closeAll closeRun compareRows rest))
+            | Ok(Some(row, rest)) -> OpStep.OpRow(row, mergeRuns budget compareRows rest))
 
     /// 受け皿をメモリ上で整列する。
     let private inMemory (compareRows: SqlValue array -> SqlValue array -> int) (buf: SqlValue array list) =
         buf |> List.toArray |> Array.sortWith compareRows |> Op.ofArray
 
     /// fan-in を超えた run を段階的にマージする。
+    [<TailCall>]
     let rec private reduceRuns
-        (openRun: string -> Result<RunState, DbError>)
-        (closeAll: RunState list -> unit)
-        (closeRun: RunState -> unit)
         (budget: MemoryBudget)
         (compareRows: SqlValue array -> SqlValue array -> int)
         (stamp: string)
@@ -220,24 +197,10 @@ module internal ExtSort =
         if List.length paths <= MaxFanIn then
             ret paths
         else
-            combine
-                openRun
-                closeAll
-                closeRun
-                budget
-                compareRows
-                stamp
-                nextSerial
-                known
-                0
-                []
-                (List.chunkBySize MaxFanIn paths)
+            combine budget compareRows stamp nextSerial known 0 [] (List.chunkBySize MaxFanIn paths)
 
     /// `reduceRuns` の 1段分（相互再帰）。
-    and private combine
-        (openRun: string -> Result<RunState, DbError>)
-        (closeAll: RunState list -> unit)
-        (closeRun: RunState -> unit)
+    and [<TailCall>] private combine
         (budget: MemoryBudget)
         (compareRows: SqlValue array -> SqlValue array -> int)
         (stamp: string)
@@ -245,38 +208,22 @@ module internal ExtSort =
         (known: string list)
         (count: int)
         (outputs: string list)
-        (groups: string list list)
         =
-        match groups with
+        function
         | [] ->
             let outputs = List.rev outputs
-            reduceRuns openRun closeAll closeRun budget compareRows stamp (nextSerial + count) (known @ outputs) outputs
+            reduceRuns budget compareRows stamp (nextSerial + count) (known @ outputs) outputs
         | group :: rest ->
-            match mergeToRun openRun closeAll closeRun budget compareRows stamp (nextSerial + count) group with
+            match mergeToRun budget compareRows stamp (nextSerial + count) group with
             | Error e ->
                 Spill.forget (List.concat rest)
                 Spill.forget known
                 Spill.forget outputs
                 err e
-            | Ok path ->
-                combine
-                    openRun
-                    closeAll
-                    closeRun
-                    budget
-                    compareRows
-                    stamp
-                    nextSerial
-                    known
-                    (count + 1)
-                    (path :: outputs)
-                    rest
+            | Ok path -> combine budget compareRows stamp nextSerial known (count + 1) (path :: outputs) rest
 
     /// 入力の読み終わりに run を確定してマージする。
     let private finish
-        (openRun: string -> Result<RunState, DbError>)
-        (closeAll: RunState list -> unit)
-        (closeRun: RunState -> unit)
         (budget: MemoryBudget)
         (compareRows: SqlValue array -> SqlValue array -> int)
         (stamp: string)
@@ -299,23 +246,20 @@ module internal ExtSort =
                 Spill.forget paths
                 err e
             | Ok runPaths ->
-                match reduceRuns openRun closeAll closeRun budget compareRows stamp (written + 1) runPaths runPaths with
+                match reduceRuns budget compareRows stamp (written + 1) runPaths runPaths with
                 | Error e ->
                     Spill.forget runPaths
                     err e
                 | Ok reduced ->
-                    match openAll openRun closeAll [] reduced with
+                    match openAll budget [] reduced with
                     | Error e ->
                         Spill.forget reduced
                         err e
-                    | Ok states -> ret (mergeRuns closeAll closeRun compareRows states)
+                    | Ok states -> ret (mergeRuns budget compareRows states)
 
     /// 入力を 1行ずつ受け、バジェット超過時に run を書き出す（末尾再帰）。
     [<TailCall>]
     let rec private ingest
-        (openRun: string -> Result<RunState, DbError>)
-        (closeAll: RunState list -> unit)
-        (closeRun: RunState -> unit)
         (budget: MemoryBudget)
         (check: 'S -> SqlValue array -> DbResult<'S>)
         (compareRows: SqlValue array -> SqlValue array -> int)
@@ -331,7 +275,7 @@ module internal ExtSort =
         | OpStep.OpError e ->
             Spill.forget paths
             err e
-        | OpStep.OpDone -> finish openRun closeAll closeRun budget compareRows stamp buf written paths
+        | OpStep.OpDone -> finish budget compareRows stamp buf written paths
         | OpStep.OpRow(row, tail) ->
             match check state row with
             | DbErr e ->
@@ -348,35 +292,9 @@ module internal ExtSort =
                         Spill.forget paths
                         err e
                     | Ok p ->
-                        ingest
-                            openRun
-                            closeAll
-                            closeRun
-                            budget
-                            check
-                            compareRows
-                            stamp
-                            []
-                            0L
-                            (written + 1)
-                            (p :: paths)
-                            state'
-                            (Op.emit row tail)
+                        ingest budget check compareRows stamp [] 0L (written + 1) (p :: paths) state' (Op.emit row tail)
                 else
-                    ingest
-                        openRun
-                        closeAll
-                        closeRun
-                        budget
-                        check
-                        compareRows
-                        stamp
-                        (row :: buf)
-                        (bufBytes + size)
-                        written
-                        paths
-                        state'
-                        tail
+                    ingest budget check compareRows stamp (row :: buf) (bufBytes + size) written paths state' tail
 
     /// 入力を整列して返す。
     /// `budget.Sort` が負ならスピルせずメモリだけで整列する。
@@ -387,8 +305,5 @@ module internal ExtSort =
         (compareRows: SqlValue array -> SqlValue array -> int)
         (src: Op)
         =
-        let openRun = Spill.openTracked budget.Scope
-        let closeRun = Spill.closeTracked budget.Scope true
-        let closeAll = Spill.closeAllTracked budget.Scope
         let stamp = System.Guid.NewGuid().ToString "N"
-        ingest openRun closeAll closeRun budget check compareRows stamp [] 0L 0 [] init src
+        ingest budget check compareRows stamp [] 0L 0 [] init src
