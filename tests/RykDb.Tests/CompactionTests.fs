@@ -532,6 +532,23 @@ let ``Compaction.compact: 入力の読み込みに失敗したらそのエラー
         expectErrorKind ErrorKind.CorruptionError "読み込みエラーはそのまま伝播する" r)
 
 [<Fact>]
+let ``Compaction.compact: L0 が閾値超えでも L1 が大きく超過していれば L1 を選ぶ`` () =
+    withDir "comp-level-fairness" (fun dir ->
+        let l0 = [ for i in 1..4 -> mkSst dir (int64 i) 0 [ entryOf i ] ]
+        let l1 = [ mkSst dir 11L 1 [ entryOf 100 ] ]
+        let version = (l0 @ l1) |> List.fold (fun v f -> Version.addFile f v) Version.Empty
+
+        let options =
+            { pickFirstLevel with
+                L0CompactionTrigger = 4
+            }
+
+        let result, _ = compactAll dir version 0UL options
+        let removed = result.Removed |> List.map _.FileNumber |> Set.ofList
+        Assert.True(Set.contains 11L removed, sprintf "L1 が選ばれませんでした: %A" removed)
+        Assert.False(Set.contains 1L removed, sprintf "L0 が選ばれてしまいました: %A" removed))
+
+[<Fact>]
 let ``Compaction.compact: Smallest > Largest の入力は CorruptionError になる`` () =
     withDir "comp-broken-range" (fun dir ->
         // MANIFEST の破損で Largest < Smallest のファイルだけの Version。

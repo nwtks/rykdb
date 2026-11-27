@@ -348,6 +348,79 @@ let ``background compaction: MANIFEST の結果が不明でも再読で未反映
         Assert.Equal(0, orphanCount)
         ok (RowStore.close reopened) |> ignore)
 
+[<Fact>]
+let ``background compaction: MANIFEST 反映済みの Unknown でも ReadInfo を失わない`` () =
+    withDir "bg-manifest-unknown-applied" (fun dir ->
+        // MANIFEST には実際に反映するが、結果は Unknown を返す。
+        let hook (edit: VersionEdit) =
+            match Manifest.openOrCreate dir with
+            | Ok(version, manifestNumber) -> Manifest.logAndApplyWithOutcome dir manifestNumber version edit |> ignore
+            | Error _ -> ()
+
+            Some(ManifestApplyResult.Unknown(DbError.create ErrorKind.IoError "injected-after-apply"))
+
+        let store =
+            openBackgroundWith
+                dir
+                { RowStoreOptions.Background with
+                    MemLimitBytes = Some 1
+                    Compaction = Some forceL1Compaction
+                    ManifestApplyHook = Some hook
+                }
+
+        let mutable current = store
+
+        try
+            for i in 1..4 do
+                current <- writeOne current i
+
+            let host = expectSome "store.Host" store.Host
+            waitIdle host
+
+            let files = Version.allFiles host.Current.Version
+
+            Assert.True(
+                not (List.isEmpty files) && files |> List.forall (fun f -> f.ReadInfo.IsSome),
+                sprintf "ReadInfo を失ったファイル: %A" (files |> List.map (fun f -> f.FileNumber, f.ReadInfo.IsSome))
+            )
+
+            let refreshed = refresh current
+
+            for i in 1..4 do
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) [||] None refreshed)).IsSome)
+        finally
+            RowStore.close current |> ignore)
+
+[<Fact>]
+let ``background compaction: 古い store からの point lookup も削除済みファイルを踏まない`` () =
+    withDir "bg-stale-store-lookup" (fun dir ->
+        let store =
+            openBackgroundWith
+                dir
+                { RowStoreOptions.Background with
+                    MemLimitBytes = Some 1
+                    Compaction = Some forceL1Compaction
+                    DeferDeletes = false
+                }
+
+        let mutable current = store
+
+        try
+            for i in 1..4 do
+                current <- writeOne current i
+
+            let host = expectSome "store.Host" store.Host
+            waitIdle host
+
+            // current は最後の commit 時点の store で、compaction 後の Version を知らない。
+            // 古い Version を pin すると削除済みの入力 SSTable を開いてしまう。
+            for i in 1..4 do
+                Assert.True(
+                    (ok (RowStore.getAtMasked "t" (intKey i) [| true |] None current)).IsSome,
+                    sprintf "key %d が読み取れませんでした" i
+                )
+        finally
+            RowStore.close current |> ignore)
 
 [<Fact>]
 let ``background compaction: 走査は read lease より長く Version を pin する`` () =

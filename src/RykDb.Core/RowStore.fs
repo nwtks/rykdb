@@ -233,12 +233,28 @@ module internal RowStore =
                 return next, manager
             })
 
+    /// 呼び出し単位のスナップショットを取る。
+    /// 返した IDisposable を dispose するまで、この Version のファイルは削除されない。
+    /// 読み取り経路も書き込み経路と同じく、background install 後の古い Version を
+    /// pin しないように、ここから現行 Version へ rebind して使う。
+    let acquireSnapshot (store: RowStore) =
+        match store.Host with
+        | None ->
+            store,
+            { new System.IDisposable with
+                member _.Dispose() = ()
+            }
+        | Some host ->
+            let state, lease = host.AcquireCall()
+
+            { store with
+                Engine = store.Engine.WithHostState state
+            },
+            lease
+
     /// keyspace から列マスク付きで読む（SeqNo 制限つき）。
     let getAtMasked (keyspace: string) (key: byte array) (mask: bool array) (visible: uint64 option) (store: RowStore) =
-        let lease =
-            match store.Host with
-            | Some host -> Some(host.AcquireVersion store.Engine.PublishedState.Version)
-            | None -> None
+        let store, lease = acquireSnapshot store
 
         try
             result {
@@ -247,7 +263,7 @@ module internal RowStore =
                 return Option.bind _.Value sst
             }
         finally
-            lease |> Option.iter (fun lease -> lease.Dispose())
+            lease.Dispose()
 
     /// 接頭辞の境界で走査を止め、キーから接頭辞を外す 1ステップ。
     let rec private scanWithinPrefixLoop (prefix: byte array) (current: SstScan) =
@@ -273,19 +289,14 @@ module internal RowStore =
     let private scanWithinPrefix (prefix: byte array) (scan: SstScan) =
         SstScan.ofStepWithClose (fun () -> scanWithinPrefixLoop prefix scan) (fun () -> SstScan.dispose scan)
 
-    /// 走査が使う Version を、走査の Dispose まで pin する。
+    /// acquireSnapshot の lease を、走査の Dispose まで保持する。
     /// Session の read lease より長く走査を保持しても compaction にファイルを消されない。
-    let private withVersionPin (store: RowStore) (scan: Result<SstScan, DbError>) =
-        match store.Host with
-        | None -> scan
-        | Some host ->
-            let lease = host.AcquireVersion store.Engine.PublishedState.Version
-
-            match scan with
-            | Ok scan -> Ok(SstScan.withResource lease scan)
-            | Error e ->
-                lease.Dispose()
-                Error e
+    let private withVersionPin (lease: System.IDisposable) =
+        function
+        | Ok scan -> Ok(SstScan.withResource lease scan)
+        | Error e ->
+            lease.Dispose()
+            Error e
 
     /// keyspace を prefix で走査する（最新エントリ。値の filter はしない）。
     /// 返すキーは接頭辞を外した論理キー。
@@ -299,6 +310,7 @@ module internal RowStore =
         (store: RowStore)
         =
         let prefix = Keyspace.prefix keyspace
+        let store, lease = acquireSnapshot store
 
         result {
             let! e = ensure store
@@ -308,7 +320,7 @@ module internal RowStore =
 
             return scanWithinPrefix prefix scan
         }
-        |> withVersionPin store
+        |> withVersionPin lease
 
     /// keyspace を列マスク付きで走査する（必要な列だけ復号する）。
     let scanAtRawMasked
@@ -321,6 +333,7 @@ module internal RowStore =
         (store: RowStore)
         =
         let prefix = Keyspace.prefix keyspace
+        let store, lease = acquireSnapshot store
 
         result {
             let! e = ensure store
@@ -330,7 +343,7 @@ module internal RowStore =
 
             return scanWithinPrefix prefix scan
         }
-        |> withVersionPin store
+        |> withVersionPin lease
         |> fun scan ->
             match scope with
             | Some scope -> scan |> Result.map (SstScan.scoped scope)
@@ -571,23 +584,6 @@ module internal RowStore =
         |> Result.map (fun store ->
             startBackground store
             store)
-
-    /// 呼び出し単位のスナップショットを取る。
-    /// 返した IDisposable を dispose するまで、この Version のファイルは削除されない。
-    let acquireSnapshot (store: RowStore) =
-        match store.Host with
-        | None ->
-            store,
-            { new System.IDisposable with
-                member _.Dispose() = ()
-            }
-        | Some host ->
-            let state, lease = host.AcquireCall()
-
-            { store with
-                Engine = store.Engine.WithHostState state
-            },
-            lease
 
     /// LSM を close し、プロセス間ロックを外す。
     /// ロックの解除は二重 Close でも無害（トークンは一度しか外れない）。

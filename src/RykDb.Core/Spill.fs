@@ -254,6 +254,8 @@ module internal Spill =
                     err (DbError.corruption "Spill: run ファイルが途中で終わりました")
                 else
                     readRunVarint s (shift + 7) (acc ||| (uint64 (lead &&& 0x7Fuy) <<< shift)) (byte next)
+        elif shift = 63 && (lead &&& 0x7Fuy) > 1uy then
+            err (DbError.corruption "Spill: varint が長すぎます")
         else
             ret (acc ||| (uint64 (lead &&& 0x7Fuy) <<< shift))
 

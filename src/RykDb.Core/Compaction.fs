@@ -73,20 +73,44 @@ type internal CompactionResult =
     }
 
 module internal Compaction =
-    /// 指定レベルのファイル数・サイズが compaction の閾値を超えたか。
-    let private levelExceeded (options: CompactionOptions) (v: Version) (level: int) =
+    /// レベルごとの超過度（1 未満なら未超過）。
+    /// L0 はファイル数、L1 以降はバイト数で測る。単位が違うので比で比較する。
+    let private excessRatio (options: CompactionOptions) (v: Version) (level: int) =
         if level = 0 then
+            let trigger = options.L0CompactionTrigger
             let count = v.Files.[0].Length
-            count > 0 && count >= options.L0CompactionTrigger
-        else
-            v.Files.[level] |> Array.sumBy _.Size > options.MaxLevelBytes.[level]
 
-    /// 閾値を超えた最初のレベルを探す。
-    [<TailCall>]
-    let rec private findCompactionLevel (options: CompactionOptions) (v: Version) (level: int) =
-        if level > Levels.Max then None
-        elif levelExceeded options v level then Some level
-        else findCompactionLevel options v (level + 1)
+            if trigger <= 0 then
+                if count = 0 then 0.0 else System.Double.PositiveInfinity
+            else
+                float count / float trigger
+        else
+            let limit = options.MaxLevelBytes.[level]
+
+            if limit <= 0L then
+                if Array.isEmpty v.Files.[level] then
+                    0.0
+                else
+                    System.Double.PositiveInfinity
+            else
+                float (v.Files.[level] |> Array.sumBy _.Size) / float limit
+
+    /// 最も超過しているレベルを選ぶ（同点なら小さいレベルを優先）。
+    /// 最小レベル固定だと L0 が常に閾値超えのとき L1 以降が飢餓する。
+    let private findCompactionLevel (options: CompactionOptions) (v: Version) =
+        [ 0 .. Levels.Max ]
+        |> List.fold
+            (fun best level ->
+                let ratio = excessRatio options v level
+
+                if ratio < 1.0 then
+                    best
+                else
+                    match best with
+                    | Some(_, prevRatio) when prevRatio >= ratio -> best
+                    | _ -> Some(level, ratio))
+            None
+        |> Option.map fst
 
     /// コンパクションの候補。
     type private CompactionPlan =
@@ -99,7 +123,7 @@ module internal Compaction =
 
     /// 次に compaction するレベルを選ぶ。
     let private pickCompaction (options: CompactionOptions) (v: Version) =
-        match findCompactionLevel options v 0 with
+        match findCompactionLevel options v with
         | None -> None
         | Some level ->
             Some

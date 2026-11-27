@@ -94,13 +94,18 @@ module internal SstEntry =
             ValueNone
         else
             let b = (Cursor.data c).[Cursor.pos c]
-            let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
-            let next = Cursor.advance 1 c
+            let payload = b &&& 0x7Fuy
 
-            if b &&& 0x80uy <> 0uy then
-                readSeqNoLoop (shift + 7) acc next
+            if shift = 63 && payload > 1uy then
+                ValueNone
             else
-                ValueSome struct (acc, next)
+                let acc = acc ||| (uint64 payload <<< shift)
+                let next = Cursor.advance 1 c
+
+                if b &&& 0x80uy <> 0uy then
+                    readSeqNoLoop (shift + 7) acc next
+                else
+                    ValueSome struct (acc, next)
 
     /// varint の SeqNo を読む。
     let private readSeqNo = readSeqNoLoop 0 0UL
@@ -281,8 +286,9 @@ type internal SstScan =
     /// 呼び出し側の状態を共有ステップ関数で進める走査。
     /// 行ごとにクロージャを作らず、状態だけを差し替える。
     | StateScan of obj * (obj -> Result<(SstEntry * SstScan) option, DbError>) * (obj -> unit)
-    /// 下流 scan と述語を保持する filter。早期終了時に下流を Dispose できる。
-    | FilterScan of SstScan * (SstEntry -> bool)
+    /// 下流 scan と述語リストを保持する filter。
+    /// 述語を 1つの継続にまとめ、通過行ごとに FilterScan を積み直さない。
+    | FilterScan of SstScan * (SstEntry -> bool) list
     /// ScanScope に登録された走査。next のたびに最新の continuation を登録し直す。
     | ScopedScan of SstScan * ScanScope * obj
 
@@ -322,7 +328,7 @@ module internal SstScan =
         StateScan(box state, (fun o -> step (unbox<'s> o)), (fun o -> close (unbox<'s> o)))
 
     /// filter 走査を作る。
-    let ofFilter (predicate: SstEntry -> bool) (scan: SstScan) = FilterScan(scan, predicate)
+    let ofFilter (predicate: SstEntry -> bool) (scan: SstScan) = FilterScan(scan, [ predicate ])
 
     /// スコープ登録された走査を作る。
     let ofScoped (key: obj) (scope: ScanScope) (scan: SstScan) = ScopedScan(scan, scope, key)
@@ -350,7 +356,10 @@ module internal SstScan =
     [<TailCall>]
     let rec private nextWithFilters (filters: (SstEntry -> bool) list) (scope: (ScanScope * obj) option) =
         function
-        | FilterScan(inner, predicate) -> nextWithFilters (predicate :: filters) scope inner
+        | FilterScan(inner, predicates) ->
+            match filters with
+            | [] -> nextWithFilters predicates scope inner
+            | _ -> nextWithFilters (predicates @ filters) scope inner
         | SstScan(step, _) -> continueWith filters scope (step ())
         | ArrayScan(entries, pos, count, limit, loadNext, close) ->
             if limit > 0 && count >= limit then
@@ -380,26 +389,11 @@ module internal SstScan =
         | Ok(Some(e, rest)) ->
             match filters with
             | [] -> finishScoped e scope rest
-            | _ -> applyFilters filters filters e scope rest
-
-    /// 継続として積んだ述語を先頭から試す。
-    /// 満たさなければ下流 scan の続きへ末尾再帰する。
-    and [<TailCall>] private applyFilters
-        (allFilters: (SstEntry -> bool) list)
-        (remaining: (SstEntry -> bool) list)
-        (e: SstEntry)
-        (scope: (ScanScope * obj) option)
-        (scan: SstScan)
-        =
-        match remaining with
-        | [] ->
-            List.fold (fun scan predicate -> ofFilter predicate scan) scan allFilters
-            |> finishScoped e scope
-        | predicate :: tail ->
-            if predicate e then
-                applyFilters allFilters tail e scope scan
-            else
-                nextWithFilters allFilters scope scan
+            | _ ->
+                if filters |> List.forall (fun predicate -> predicate e) then
+                    finishScoped e scope (FilterScan(rest, filters))
+                else
+                    nextWithFilters filters scope rest
 
     /// 次のエントリを返す（フィルタなしの通常入口）。
     let next (scan: SstScan) = nextWithFilters [] None scan

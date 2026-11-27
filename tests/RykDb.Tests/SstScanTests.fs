@@ -131,6 +131,31 @@ let ``SstScan.filter: 入れ子のフィルタは両方適用される`` () =
     Assert.Equal<SstEntry array>(expected, got)
 
 [<Fact>]
+let ``SstScan.filter: 入れ子フィルタの継続は行ごとに 1個だけ確保する`` () =
+    let entries = sstEntries 200
+
+    let make () =
+        scanOfEntries entries
+        |> SstScan.filter (fun e -> e.SeqNo >= 5UL)
+        |> SstScan.filter (fun e -> e.SeqNo < 195UL)
+
+    ok (SstScan.toArray (make ())) |> ignore
+    ok (SstScan.toArray (scanOfEntries entries)) |> ignore
+
+    let before = System.GC.GetAllocatedBytesForCurrentThread()
+    let got = ok (SstScan.toArray (make ()))
+    let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before
+    let beforePlain = System.GC.GetAllocatedBytesForCurrentThread()
+    ok (SstScan.toArray (scanOfEntries entries)) |> ignore
+    let plain = System.GC.GetAllocatedBytesForCurrentThread() - beforePlain
+    Assert.Equal(190, got.Length)
+    // 述語 2個を毎行で積み直す旧実装より明らかに少ないことを固定する。
+    Assert.True(
+        allocated - plain < 190L * 96L,
+        sprintf "filter の追加割当が多すぎます: %d バイト（filter なし %d）" (allocated - plain) plain
+    )
+
+[<Fact>]
 let ``SstScan.withScan: 成功・失敗のどちらでも Dispose する`` () =
     let closed = ref 0
 

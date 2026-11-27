@@ -39,7 +39,13 @@ module internal BloomFilter =
         if expectedCount <= 0 then
             8
         else
-            let m = -float expectedCount * log falsePositiveRate / (ln2 * ln2)
+            let rate =
+                if System.Double.IsNaN falsePositiveRate then
+                    0.01
+                else
+                    min 0.99 (max 1e-9 falsePositiveRate)
+
+            let m = -float expectedCount * log rate / (ln2 * ln2)
             let words = min (ceil (m / 8.0)) (float (System.Int32.MaxValue / 8))
             max 8 (int words * 8)
 
@@ -93,7 +99,7 @@ module internal BloomFilter =
                 let pos = positionAt bitCount h1 step i
                 bits.[pos / 8] <- bits.[pos / 8] ||| (1uy <<< pos % 8)
 
-            hashes <- hashes + hashCount
+            hashes <- hashes + 1
 
         /// 確定した filter。
         member _.Build() =

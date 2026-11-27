@@ -65,13 +65,13 @@ module internal SstableWriter =
         Array.blit e.Key shared out pos tailLength
         SstEntry.writeValueTo out (pos + tailLength) e
 
-    /// ブロック本体のバイト長を数える。
+    /// ブロック本体のバイト長を数える（int64 で蓄積してから上限を検査）。
     [<TailCall>]
-    let rec private blockLength (prev: byte array) (i: int) (total: int) (entries: SstEntry array) =
+    let rec private blockLength (prev: byte array) (i: int) (total: int64) (entries: SstEntry array) =
         if i >= entries.Length then
             total
         else
-            blockLength entries.[i].Key (i + 1) (total + entryLength prev entries.[i]) entries
+            blockLength entries.[i].Key (i + 1) (total + int64 (entryLength prev entries.[i])) entries
 
     /// エントリをブロックへ順に書き込む。
     [<TailCall>]
@@ -85,17 +85,22 @@ module internal SstableWriter =
 
     /// エントリ列からチェックサム付きのブロックを組み立てる。
     let private buildBlock (entries: SstEntry array) =
-        let length = blockLength [||] 0 0 entries
-        let block = Array.zeroCreate<byte>(length + 4)
+        let total = blockLength [||] 0 0L entries
 
-        writeEntries block [||] 0 0 entries
-        |> Result.map (fun _ ->
-            let sum = Hashing.checksumRange block 0 length
-            block.[length] <- byte (sum &&& 0xFFu)
-            block.[length + 1] <- byte (sum >>> 8 &&& 0xFFu)
-            block.[length + 2] <- byte (sum >>> 16 &&& 0xFFu)
-            block.[length + 3] <- byte (sum >>> 24 &&& 0xFFu)
-            block)
+        if total > int64 System.Int32.MaxValue - 4L then
+            err (DbError.internalError "Sstable: ブロックが大きすぎます")
+        else
+            let length = int total
+            let block = Array.zeroCreate<byte>(length + 4)
+
+            writeEntries block [||] 0 0 entries
+            |> Result.map (fun _ ->
+                let sum = Hashing.checksumRange block 0 length
+                block.[length] <- byte (sum &&& 0xFFu)
+                block.[length + 1] <- byte (sum >>> 8 &&& 0xFFu)
+                block.[length + 2] <- byte (sum >>> 16 &&& 0xFFu)
+                block.[length + 3] <- byte (sum >>> 24 &&& 0xFFu)
+                block)
 
     /// ブロックをストリームへ書き出し、索引要素を返す。
     let private writeBlock

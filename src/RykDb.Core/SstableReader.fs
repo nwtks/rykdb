@@ -527,12 +527,17 @@ module internal SstableReader =
             struct (false, 0UL, i)
         else
             let b = data.[i]
-            let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
+            let payload = b &&& 0x7Fuy
 
-            if b &&& 0x80uy = 0uy then
-                struct (true, acc, i + 1)
+            if shift = 63 && payload > 1uy then
+                struct (false, 0UL, i)
             else
-                readVarintGo (shift + 7) acc data payloadLen (i + 1)
+                let acc = acc ||| (uint64 payload <<< shift)
+
+                if b &&& 0x80uy = 0uy then
+                    struct (true, acc, i + 1)
+                else
+                    readVarintGo (shift + 7) acc data payloadLen (i + 1)
 
     /// 指定位置の varint を読む。
     let private readVarintAt = readVarintGo 0 0UL

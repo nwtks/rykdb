@@ -45,6 +45,17 @@ let ``BloomFilter.ofKeys: ビット数は必ず 8 の倍数でビット配列と
             Assert.Equal<int>(filter.HashCount, restored.HashCount)
 
 [<Fact>]
+let ``BloomFilter: Count は追加した要素数で、誤検出率が壊れていても確保量は有限`` () =
+    let keys = Array.init 100 intKey
+    let filter = ofKeys 100 0.01 keys
+    Assert.Equal(100, filter.Count)
+
+    for rate in [ 0.0; 1.0; 2.0; System.Double.NaN ] do
+        let f = ofKeys 100 rate keys
+        Assert.True(f.BitCount > 0 && f.BitCount % 8 = 0, sprintf "rate=%A のビット数が不正: %d" rate f.BitCount)
+        Assert.True(f.BitCount <= 256 * 1024 * 1024, sprintf "rate=%A で過大な確保: %d" rate f.BitCount)
+
+[<Fact>]
 let ``BloomFilter: ビット配列は 1ビット = 1ビットで保持する`` () =
     let keys = Array.init 1_000 intKey
     let filter = ofKeys keys.Length 0.01 keys

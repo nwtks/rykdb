@@ -56,13 +56,18 @@ module internal Reader =
             ValueNone
         else
             let b = (Cursor.data c).[Cursor.pos c]
-            let acc = acc ||| (uint64 (b &&& 0x7Fuy) <<< shift)
-            let next = Cursor.advance 1 c
+            let payload = b &&& 0x7Fuy
 
-            if b &&& 0x80uy <> 0uy then
-                decodeVarintV (shift + 7) acc next
+            if shift = 63 && payload > 1uy then
+                ValueNone
             else
-                ValueSome struct (acc, next)
+                let acc = acc ||| (uint64 payload <<< shift)
+                let next = Cursor.advance 1 c
+
+                if b &&& 0x80uy <> 0uy then
+                    decodeVarintV (shift + 7) acc next
+                else
+                    ValueSome struct (acc, next)
 
     /// 符号なし LEB128 を読む。
     let private readVarintV = decodeVarintV 0 0UL
@@ -282,21 +287,39 @@ module internal OrderPreserving =
         |> writeOrderedInt64 exponentValue
         |> Writer.writeBytes digitBytes
 
-    /// GUID を 16 バイトの生バイト列にする。
+    let private nibble (c: char) =
+        if c >= '0' && c <= '9' then
+            int c - int '0'
+        else
+            int c - int 'a' + 10
+
+    /// GUID を 16バイトの生バイト列にする（Substring を 16回作らない）。
     let private guidToOrderedBytes (g: System.Guid) =
         let s = g.ToString("N", System.Globalization.CultureInfo.InvariantCulture)
 
         [|
             for i in 0..15 do
-                yield System.Convert.ToByte(s.Substring(i * 2, 2), 16)
+                yield byte (nibble s.[i * 2] <<< 4 ||| nibble s.[i * 2 + 1])
         |]
+
+    /// escape 後のバイト列を 1本のバッファへ埋める。
+    [<TailCall>]
+    let rec private fillEscapedForWrite (src: byte array) (dst: byte array) (i: int) (pos: int) =
+        if i >= src.Length then
+            ()
+        elif src.[i] = 0uy then
+            dst.[pos] <- Terminator
+            dst.[pos + 1] <- EscapeMarker
+            fillEscapedForWrite src dst (i + 1) (pos + 2)
+        else
+            dst.[pos] <- src.[i]
+            fillEscapedForWrite src dst (i + 1) (pos + 1)
 
     /// 0x00 を escape してペイロードと終端を書き込む。
     let private writeEscapedPayload (bs: byte array) (w: Writer) =
-        let escaped =
-            bs
-            |> Array.collect (fun b -> if b = 0uy then [| Terminator; EscapeMarker |] else [| b |])
-
+        let escapedLength = bs |> Array.fold (fun n b -> if b = 0uy then n + 2 else n + 1) 0
+        let escaped = Array.zeroCreate<byte> escapedLength
+        fillEscapedForWrite bs escaped 0 0
         w |> Writer.writeBytes escaped |> Writer.writeByte Terminator
 
     /// 型タグを書き込む。
@@ -472,9 +495,9 @@ module internal OrderPreserving =
                             match decimalDigitsValid negative digits 0 with
                             | ValueNone -> err (DbError.corruption "OrderPreserving: DECIMAL の桁が不正です")
                             | ValueSome() ->
-                                let total = lastNonZeroDigit negative digits (DecimalMaxDigits - 1) + 1
+                                let count = lastNonZeroDigit negative digits (DecimalMaxDigits - 1) + 1
 
-                                if total = 0 then
+                                if count = 0 then
                                     ret (System.Decimal.Zero, c4)
                                 else
                                     let rawExponent = unmapInt64 exponentBits
@@ -483,11 +506,15 @@ module internal OrderPreserving =
                                         err (DbError.corruption "OrderPreserving: DECIMAL の指数が不正です")
                                     else
                                         let exponent = if negative then -rawExponent else rawExponent
-                                        let scale = int64 total - exponent
+                                        let scale = int64 count - exponent
+                                        let pad = if scale < 0L then -scale else 0L
 
-                                        if scale < 0L || scale > 28L then
+                                        if pad > int64 (DecimalMaxDigits - count) || scale > 28L then
                                             err (DbError.corruption "OrderPreserving: DECIMAL のスケールが不正です")
                                         else
+                                            let total = count + int pad
+                                            let effectiveScale = max 0L scale
+
                                             let struct (hi, mid, lo) =
                                                 accumulateDigits negative digits total 0 0UL 0UL 0UL
 
@@ -495,7 +522,8 @@ module internal OrderPreserving =
                                                 err (DbError.corruption "OrderPreserving: DECIMAL の桁数が大きすぎます")
                                             else
                                                 let flags =
-                                                    uint32 (int scale) <<< 16 ||| if negative then 0x80000000u else 0u
+                                                    uint32 (int effectiveScale) <<< 16
+                                                    ||| if negative then 0x80000000u else 0u
 
                                                 let bits =
                                                     [| int (uint32 lo); int (uint32 mid); int (uint32 hi); int flags |]

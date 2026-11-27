@@ -150,6 +150,17 @@ let ``Reader: 10 バイトを超える varint は CorruptionError`` () =
         (Reader.readVarint (Cursor.create (Array.create 10 0x80uy)))
 
 [<Fact>]
+let ``Reader: varint の 10バイト目に上位ビットがあると CorruptionError`` () =
+    // 9バイト目まで継続ビット、10バイト目の payload が 1 超だと uint64 に収まらない。
+    let bytes = Array.append (Array.create 9 0x80uy) [| 0x7Fuy |]
+    expectErrorKind ErrorKind.CorruptionError "10バイト目の上位ビットはエラー" (Reader.readVarint (Cursor.create bytes))
+
+[<Fact>]
+let ``Reader: varint の 10バイト目が 1 なら UInt64.MaxValue を読む`` () =
+    let bytes = Array.append (Array.create 9 0xFFuy) [| 0x01uy |]
+    Assert.Equal<uint64>(System.UInt64.MaxValue, ok (Reader.readVarint (Cursor.create bytes)) |> fst)
+
+[<Fact>]
 let ``Reader: Int32.MaxValue を超える長さ指定は CorruptionError`` () =
     let bytes = Writer.build [ Writer.varint (uint64 System.Int32.MaxValue + 1UL) ]
     expectErrorKind ErrorKind.CorruptionError "長すぎる長さ指定はエラー" (Reader.readLengthPrefixed (Cursor.create bytes))

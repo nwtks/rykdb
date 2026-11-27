@@ -485,13 +485,27 @@ module private VersionCoordinatorHelpers =
         && oldestNow >= baseState.ActiveSnapshot
 
     /// GC 境界を下げて公開する（入力の消失・snapshot の前進でインストールできないとき）。
-    let private publishSkippedInstall (ctx: InstallContext) (result: CompactionResult) (oldestNow: uint64) =
+    /// スキップ理由を消すと診断も再試行要求も失われるので、競合エラーとして残す。
+    let private publishSkippedInstall
+        (ctx: InstallContext)
+        (baseState: PublishedState)
+        (result: CompactionResult)
+        (oldestNow: uint64)
+        =
         FileMetaData.deleteObsolete ctx.Dir result.Added |> ignore
+
+        let reason =
+            sprintf
+                "compaction の install をスキップしました（最古 snapshot=%d, 開始時=%d, 入力=%d）"
+                oldestNow
+                baseState.ActiveSnapshot
+                (List.length result.Removed)
+            |> DbError.conflict
 
         publish ctx.StateCell ctx.StateKey (fun state ->
             { state with
                 ActiveSnapshot = oldestNow
-                LastCompactionError = None
+                LastCompactionError = Some reason
             })
         |> ignore
 
@@ -537,7 +551,7 @@ module private VersionCoordinatorHelpers =
 
         match Manifest.openOrCreate ctx.Dir with
         | Ok(version, manifestNumber) when sameFileSet version expected ->
-            publishInstalled ctx result version manifestNumber
+            publishInstalled ctx result expected manifestNumber
         | Ok _ -> publishInstallError ctx result error
         | Error _ -> publishInstallFailure ctx error
 
@@ -552,7 +566,7 @@ module private VersionCoordinatorHelpers =
             let oldestNow = oldestSnapshotAt ctx current
 
             if not (canInstall currentNumbers baseState result oldestNow) then
-                publishSkippedInstall ctx result oldestNow
+                publishSkippedInstall ctx baseState result oldestNow
             else
                 let edit =
                     {
