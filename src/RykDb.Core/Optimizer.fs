@@ -96,7 +96,8 @@ module internal Optimizer =
     /// 木を 1つ降りるか、Op が上がってきたか。
     type private ExecStep =
         /// 第 3要素はストレージへ降ろせる件数ヒント（Some 0 は「0行」）。
-        | EvalNode of Logical * Schema * int option
+        /// 第 4要素は索引 fetch の前に評価する述語（被覆列だけを参照）。
+        | EvalNode of Logical * Schema * int option * Expr option
         | ApplyOp of Op
 
     /// テーブルスキーマの既定値（未登録なら空）。
@@ -584,17 +585,37 @@ module internal Optimizer =
     /// 文脈からテーブル統計を引く。
     let private statsOfContext (ctx: ExecContext) (name: string) = ExecContext.statsOf name ctx
 
+    /// 索引スキャンで追加の主キー lookup なしに読める列位置。
+    /// `Dml.indexAccessMasks` と同じ「索引列 + 主キー」の規則を使う。
+    let private coveredColumns (ctx: ExecContext) (name: string) (indexName: string) =
+        match ExecContext.schemaOf name ctx with
+        | Error _ -> Set.empty
+        | Ok schema ->
+            match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
+            | None -> Set.empty
+            | Some idx ->
+                (idx.Columns |> List.choose (TableSchema.indexOf schema)) @ schema.PrimaryKey
+                |> Set.ofList
+
     /// 索引走査と必要なら非被覆列の fetch を結ぶ。
+    /// `preFilter` は被覆列（索引列 + 主キー）だけで評価できる述語で、
+    /// 主キー lookup の前に適用して捨てられる行を減らす。
     let private execIndexScan
         (ctx: ExecContext)
         (name: string)
         (indexName: string)
         (mask: bool array)
+        (preFilter: Expr option)
         (build: bool array -> Result<Op, DbError>)
         =
         result {
             let! scanMask, fetchMask = ExecContext.indexAccessMasks ctx name indexName mask
             let! op = build scanMask
+
+            let! op =
+                match preFilter with
+                | None -> ret op
+                | Some p -> Ops.filter (Schema.ofTable name None (defaultSchema ctx name)) p op
 
             if fetchMask |> Array.exists id then
                 return! ExecContext.fetchMissing ctx name fetchMask op
@@ -603,7 +624,7 @@ module internal Optimizer =
         }
 
     /// 走査ノードを Op に変換する（件数ヒントと列マスクを適用）。
-    let private execScan (node: 'a) (ctx: ExecContext) (name: string) (method: ScanMethod) =
+    let private execScan (node: 'a) (ctx: ExecContext) (name: string) (method: ScanMethod) (preFilter: Expr option) =
         let mask =
             match ctx.ScanNeeds.TryGetValue(box node) with
             | true, mask -> mask
@@ -618,12 +639,12 @@ module internal Optimizer =
             | ScanMethod.SeqScan -> ExecContext.tableMasked ctx name limit mask
             | ScanMethod.PkLookup values -> ExecContext.byPrimaryKeyMasked ctx name values mask
             | ScanMethod.IndexLookup(indexName, values) ->
-                execIndexScan ctx name indexName mask (fun scanMask ->
+                execIndexScan ctx name indexName mask preFilter (fun scanMask ->
                     ExecContext.byIndexMasked ctx name indexName values limit scanMask)
             | ScanMethod.RangeScan(_, startKey, endKey) ->
                 ExecContext.rangeScanMasked ctx name startKey endKey limit mask
             | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
-                execIndexScan ctx name indexName mask (fun scanMask ->
+                execIndexScan ctx name indexName mask preFilter (fun scanMask ->
                     ExecContext.byIndexRangeMasked ctx name indexName lower upper limit scanMask)
 
     /// オフセットと件数を Int32 の範囲へクランプして足す。
@@ -791,7 +812,7 @@ module internal Optimizer =
     [<TailCall>]
     let rec private run (ctx: ExecContext) (memo: OutputSchemaMemo) (frames: ExecFrame list) =
         function
-        | EvalNode(node, inSchema, hint) ->
+        | EvalNode(node, inSchema, hint, preFilter) ->
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
                 let frame, leftSchema =
@@ -799,8 +820,8 @@ module internal Optimizer =
 
                 match frame.Algorithm with
                 | JoinAlgorithm.IndexNestedLoop _ ->
-                    run ctx memo (JoinIndexLeftFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
-                | _ -> run ctx memo (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None))
+                    run ctx memo (JoinIndexLeftFrame frame :: frames) (EvalNode(lTree, leftSchema, None, None))
+                | _ -> run ctx memo (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None, None))
             | Logical.Values values -> run ctx memo frames (ApplyOp(Op.ofRow values))
             | Logical.Derived plan ->
                 let innerCtx =
@@ -808,7 +829,7 @@ module internal Optimizer =
                         ScanNeeds = ctx.ScanNeeds
                     }
 
-                run innerCtx memo (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None))
+                run innerCtx memo (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None, None))
             | Logical.UnionAll [] -> run ctx memo frames (ApplyOp Op.Empty)
             | Logical.UnionAll(plan :: rest) ->
                 let innerCtx =
@@ -816,20 +837,43 @@ module internal Optimizer =
                         ScanNeeds = ctx.ScanNeeds
                     }
 
-                run innerCtx memo (UnionFrame(ctx, [], rest) :: frames) (EvalNode(plan.Tree, plan.Input, None))
+                run innerCtx memo (UnionFrame(ctx, [], rest) :: frames) (EvalNode(plan.Tree, plan.Input, None, None))
             | Logical.Scan(name, method) ->
-                match execScan node ctx name method hint with
+                match execScan node ctx name method preFilter hint with
                 | Ok op -> run ctx memo frames (ApplyOp(countOutput ctx node op))
                 | Error e -> err e
             | Logical.Filter(p, child) ->
                 let childSchema = outputOfMemo ctx inSchema memo child
-                run ctx memo (FilterFrame(p, childSchema) :: frames) (EvalNode(child, inSchema, None))
+
+                let preConjuncts, remaining =
+                    match child with
+                    | Logical.Scan(name, ScanMethod.IndexLookup(indexName, _))
+                    | Logical.Scan(name, ScanMethod.IndexRangeScan(indexName, _, _)) ->
+                        let covered = coveredColumns ctx name indexName
+
+                        Predicate.splitConjuncts p
+                        |> List.partition (fun conjunct ->
+                            scanRefsOf childSchema conjunct |> Set.forall (fun i -> Set.contains i covered))
+                    | _ -> [], Predicate.splitConjuncts p
+
+                let preFilter = Predicate.joinConjuncts preConjuncts
+                let remainingExpr = Predicate.joinConjuncts remaining
+
+                match remainingExpr with
+                | Some rest ->
+                    run ctx memo (FilterFrame(rest, childSchema) :: frames) (EvalNode(child, inSchema, None, preFilter))
+                | None -> run ctx memo frames (EvalNode(child, inSchema, None, preFilter))
             | Logical.Aggregate(groupBy, aggs, child) ->
                 let childSchema = outputOfMemo ctx inSchema memo child
-                run ctx memo (AggregateFrame(groupBy, aggs, childSchema) :: frames) (EvalNode(child, inSchema, None))
+
+                run
+                    ctx
+                    memo
+                    (AggregateFrame(groupBy, aggs, childSchema) :: frames)
+                    (EvalNode(child, inSchema, None, None))
             | Logical.Having(h, aggs, groupBy, child) ->
-                run ctx memo (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema, None))
-            | Logical.Distinct child -> run ctx memo (DistinctFrame :: frames) (EvalNode(child, inSchema, None))
+                run ctx memo (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema, None, None))
+            | Logical.Distinct child -> run ctx memo (DistinctFrame :: frames) (EvalNode(child, inSchema, None, None))
             | Logical.Sort(keys, child) ->
                 let childSchema = outputOfMemo ctx inSchema memo child
 
@@ -838,10 +882,14 @@ module internal Optimizer =
                     | Some(groupBy, aggs) -> groupBy, aggs
                     | None -> [], []
 
-                run ctx memo (SortFrame(keys, childSchema, groupBy, aggs) :: frames) (EvalNode(child, inSchema, None))
+                run
+                    ctx
+                    memo
+                    (SortFrame(keys, childSchema, groupBy, aggs) :: frames)
+                    (EvalNode(child, inSchema, None, None))
             | Logical.Limit(offset, limit, child) ->
                 let childHint = childLimitHint offset limit hint
-                run ctx memo (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema, childHint))
+                run ctx memo (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema, childHint, None))
             | Logical.Project(items, child) ->
                 let childSchema = outputOfMemo ctx inSchema memo child
                 let groupBy = groupByOf child
@@ -850,7 +898,7 @@ module internal Optimizer =
                     ctx
                     memo
                     (ProjectFrame(items, inSchema, childSchema, groupBy) :: frames)
-                    (EvalNode(child, inSchema, hint))
+                    (EvalNode(child, inSchema, hint, None))
         | ApplyOp op ->
             match frames with
             | [] -> ret op
@@ -887,7 +935,11 @@ module internal Optimizer =
                     | Ok joined -> run ctx memo rest (ApplyOp(countOutput ctx frame.Node joined))
                     | Error e -> err e
                 | JoinRightFrame frame ->
-                    run ctx memo (JoinApplyFrame(frame, op) :: rest) (EvalNode(frame.Right, frame.RightSchema, None))
+                    run
+                        ctx
+                        memo
+                        (JoinApplyFrame(frame, op) :: rest)
+                        (EvalNode(frame.Right, frame.RightSchema, None, None))
                 | JoinApplyFrame(frame, leftOp) ->
                     match execJoin ctx frame leftOp op with
                     | Ok joined -> run ctx memo rest (ApplyOp(countOutput ctx frame.Node joined))
@@ -905,7 +957,7 @@ module internal Optimizer =
                         innerCtx
                         memo
                         (UnionFrame(outer, op :: doneOps, plans) :: rest)
-                        (EvalNode(plan.Tree, plan.Input, None))
+                        (EvalNode(plan.Tree, plan.Input, None, None))
 
     /// 論理代数を Op に変換する。
     /// <remarks>
@@ -926,7 +978,7 @@ module internal Optimizer =
                 ScanNeeds = scanNeedsMasks ctx schema memo tree
             }
 
-        run ctx memo [] (EvalNode(tree, schema, None))
+        run ctx memo [] (EvalNode(tree, schema, None, None))
 
     /// 実行しながら、走査と結合の出力行数を `counts` に数える。
     /// `EXPLAIN ANALYZE` 用で、通常の `exec` は計測しない。

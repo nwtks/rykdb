@@ -1541,6 +1541,10 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
   `ALTER TABLE` は対象テーブルの統計を削除する。
 - MVCCの古い版はactive snapshotがある間はcompactionで回収されない。
 - 非被覆索引はヒット行ごとに主キーlookupを行う。
+  `Logical.Filter` の conjunct のうち、索引列 + 主キーだけを参照するものは
+  `Optimizer.execIndexScan` が fetch の前に適用し、捨てられる行の主キー lookup を避ける。
+  DML の候補走査（`Engine.indexCandidateScan`）も同じ規則を使う。
+  WHERE 全体は呼び出し側で再評価する（INV-48）。
 - ORDER BYのSort省略は主キー全列の単一テーブル昇順だけを対象とする。
 
 #### 12.2.2 読み取りと破損検出

@@ -769,6 +769,13 @@ SQLのNULLではない。比較・ソート・DISTINCT・符号化・型問い�
 SELECT定数、`COUNT(*)`、DELETE、INDEX lookupは参照列だけ復号する。
 全列を復号しない。
 非被覆索引は主キーで本体をfetchし、`fetch`を全行へ適用する。
+ただし、被覆列（索引列 + 主キー）だけを参照する conjunct は fetch の前に評価できる。
+
+- ✅ `Optimizer.execIndexScan` / `Engine.indexCandidateScan` の `preFilter` が
+  `Predicate.splitConjuncts` で分割した被覆列の述語を先に適用する。
+- ✅ `child` が直接 `Logical.Scan` のときだけ分割する（`stripWrappers` で Project を剥がすと列位置がずれる）。
+- ✅ preFilter に移した conjunct も元の WHERE に残し、呼び出し側で再評価する（INV-48）。
+- 回帰: `SqlReference: 被覆列の残り述語は fetch の前後に同じ結果を返す`。
 
 範囲走査の上限は`opOfScan`の打ち切りで担保する。
 返した行を読み直して主キーを再符号化するfilterを足さない（主キーの復号も強制される）。

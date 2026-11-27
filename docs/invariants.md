@@ -463,6 +463,9 @@ CASEのELSE有無、LIKEのESCAPE有無、サブクエリを含む型を検査�
 - transactionの索引書き込みも生キーでmergeする。
 - `Dml.indexAccessMasks`がscan maskとfetch maskを返す。
 - 被覆外の列は `ExecContext.fetchMissing`が主キー lookupで補う。
+- 被覆列（索引列 + 主キー）だけを参照する conjunct は fetch の前に評価してよい
+  （`Optimizer.execIndexScan` / `Engine.indexCandidateScan` の `preFilter`）。
+  WHERE 全体は呼び出し側で再評価し、preFilter に移した conjunct も元の式に残す。
 - UNIQUE backfillは `RowStore.scanKeys`でキーだけを走査し、重複を検査する。
 - `ALTER TABLE`はテーブル本体の行だけを書き換える。
 

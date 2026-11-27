@@ -216,18 +216,52 @@ module internal Engine =
         | None -> ret None
         | Some e -> Plan.resolveDmlExprWith target ctx e |> Result.map Some
 
+    /// 索引走査で被覆列だけを参照する conjunct を求める。
+    /// 修飾済み WHERE を分割し、索引列 + 主キーだけを見る述語を fetch の前に回す。
+    let private coveredPreFilter (schema: TableSchema) (indexName: string) (where: Expr) =
+        match schema.Indexes |> List.tryFind (fun i -> i.Name = indexName) with
+        | None -> None
+        | Some idx ->
+            let covered =
+                (idx.Columns |> List.choose (TableSchema.indexOf schema)) @ schema.PrimaryKey
+                |> Set.ofList
+
+            let target = Schema.ofTable schema.Name None schema
+
+            Predicate.splitConjuncts where
+            |> List.filter (fun conjunct ->
+                conjunct
+                |> Expr.fold
+                    (fun acc node ->
+                        match node with
+                        | Expr.Column c ->
+                            match Schema.resolve c target with
+                            | Ok i -> Set.add i acc
+                            | Error _ -> acc
+                        | _ -> acc)
+                    Set.empty
+                |> Set.forall (fun i -> Set.contains i covered))
+            |> Predicate.joinConjuncts
+
     /// 索引走査を開き、足りない列を主キーから取り補う。
     let private indexCandidateScan
         (ctx: ExecContext)
         (schemaName: string)
         (mask: bool array)
         (indexName: string)
+        (preFilter: Expr option)
         (build: bool array -> Result<Op, DbError>)
         =
         result {
+            let! table = ExecContext.schemaOf schemaName ctx
             let! scanMask, fetchMask = ExecContext.indexAccessMasks ctx schemaName indexName mask
 
             let! op = build scanMask
+
+            let! op =
+                match preFilter with
+                | None -> ret op
+                | Some p -> Ops.filter (Schema.ofTable schemaName None table) p op
 
             if fetchMask |> Array.exists id then
                 return! ExecContext.fetchMissing ctx schemaName fetchMask op
@@ -239,9 +273,9 @@ module internal Engine =
     /// WHERE は呼び出し側が行ごとに再評価するので、走査は候補の十分条件にだけ使う
     /// （範囲の閉区間など、走査が広めに返しても結果は変わらない）。
     let private dmlCandidateScan (ctx: ExecContext) (schema: TableSchema) (where: Expr option) (mask: bool array) =
-        let method =
+        let method, qualifiedWhere =
             match where with
-            | None -> ScanMethod.SeqScan
+            | None -> ScanMethod.SeqScan, None
             | Some w ->
                 let binding: TableBinding =
                     {
@@ -251,11 +285,14 @@ module internal Engine =
                     }
 
                 match Binder.qualify (Schema.ofTable schema.Name None schema) w with
-                | Error _ -> ScanMethod.SeqScan
+                | Error _ -> ScanMethod.SeqScan, None
                 | Ok qualified ->
                     match Analyzer.chooseScanMethod binding ctx.Catalog [ qualified ] with
-                    | Ok method -> method
-                    | Error _ -> ScanMethod.SeqScan
+                    | Ok method -> method, Some qualified
+                    | Error _ -> ScanMethod.SeqScan, None
+
+        let preFilterOf indexName =
+            qualifiedWhere |> Option.bind (coveredPreFilter schema indexName)
 
         match method with
         | ScanMethod.SeqScan ->
@@ -281,10 +318,10 @@ module internal Engine =
                 (Some ctx.Scope)
                 ctx.Txn
         | ScanMethod.IndexLookup(indexName, values) ->
-            indexCandidateScan ctx schema.Name mask indexName (fun scanMask ->
+            indexCandidateScan ctx schema.Name mask indexName (preFilterOf indexName) (fun scanMask ->
                 ExecContext.byIndexMasked ctx schema.Name indexName values 0 scanMask)
         | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
-            indexCandidateScan ctx schema.Name mask indexName (fun scanMask ->
+            indexCandidateScan ctx schema.Name mask indexName (preFilterOf indexName) (fun scanMask ->
                 ExecContext.byIndexRangeMasked ctx schema.Name indexName lower upper 0 scanMask)
 
     /// INSERT を実行する。

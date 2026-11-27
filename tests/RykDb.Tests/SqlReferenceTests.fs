@@ -2378,6 +2378,32 @@ let ``SqlReference: 索引の等価検索は一致する行をすべて返す`` 
         Assert.Equal<int64>(3L, asInt res.Rows.[1].[0]))
 
 [<Fact>]
+let ``SqlReference: 被覆列の残り述語は fetch の前後に同じ結果を返す`` () =
+    // 複合索引 (a, b) の a=1 と b>10 は被覆列、c は被覆外。
+    // 被覆列だけを見る conjunct を主キー fetch の前に評価しても結果は変わらない。
+    withSession "prefilter-covered" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT)"
+
+        let db2 = exec db1 "CREATE INDEX ix_ab ON t (a, b)"
+
+        let db3 =
+            exec db2 "INSERT INTO t VALUES (1,1,5,'x'),(2,1,15,'x'),(3,1,20,'y'),(4,2,15,'x')"
+
+        let _, rows = ok (execSql db3 "SELECT c FROM t WHERE a = 1 AND b > 10 AND c = 'x'")
+        Assert.Equal<string array>([| "x" |], rows.Rows |> Array.map (fun r -> asText r.[0]))
+
+        // DML の候補走査でも同じ述語を評価する（WHERE は再評価される）。
+        let db4, upd =
+            ok (execSql db3 "UPDATE t SET c = 'z' WHERE a = 1 AND b > 10 AND c = 'x'")
+
+        Assert.Equal<int>(1, upd.RowsAffected)
+
+        let _, after = ok (execSql db4 "SELECT id, c FROM t ORDER BY id")
+        Assert.Equal<int64 list>([ 1L; 2L; 3L; 4L ], after.Rows |> Array.toList |> List.map (fun r -> asInt r.[0]))
+        Assert.Equal<string array>([| "x"; "z"; "y"; "x" |], after.Rows |> Array.map (fun r -> asText r.[1])))
+
+[<Fact>]
 let ``SqlReference: 索引列を更新すると索引も追従する`` () =
     withSession "reg-index-upd" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)"
