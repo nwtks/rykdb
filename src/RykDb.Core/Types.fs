@@ -541,6 +541,53 @@ module internal SqlValue =
         | DataType.Timestamp, (DataType.Timestamp | DataType.Date) -> true
         | _ -> false
 
+    /// 比較可能性のクラス。
+    /// 同じクラス内は `compareValuesV` で比較できる。
+    /// 比較可能性は推移的でない（Int と有限 REAL は比較でき、有限 REAL と非有限 REAL も
+    /// 比較できるが、Int と非有限 REAL は比較できない）ので、互換クラスではなく型で分ける。
+    /// 単一の代表値だけだと有限 REAL の代表値が `INTEGER vs ±Infinity` を見逃すため、
+    /// 外部ソート・値集合・マージ結合の事前検査でクラスごとに代表値を持つ。
+    let private comparabilityClass =
+        function
+        | SqlValue.Null -> 0
+        | SqlValue.Int _ -> 1
+        | SqlValue.Real f -> if System.Double.IsFinite f then 2 else 3
+        | SqlValue.Decimal _ -> 4
+        | SqlValue.Date _ -> 5
+        | SqlValue.Timestamp _ -> 6
+        | SqlValue.Bool _ -> 7
+        | SqlValue.Text _ -> 8
+        | SqlValue.Blob _ -> 9
+        | SqlValue.Uuid _ -> 10
+        | SqlValue.Unloaded -> 11
+
+    /// クラス別代表値へ 1値を足す（新しいクラスなら既存の全クラスと比較する）。
+    [<TailCall>]
+    let rec private checkRepsAgainst (v: SqlValue) (reps: (int * SqlValue) list) =
+        function
+        | [] -> DbOk reps
+        | (_, representative) :: tail ->
+            match compareValuesV representative v with
+            | DbErr e -> DbErr e
+            | DbOk _ -> checkRepsAgainst v reps tail
+
+    /// 比較可能性の代表値表へ 1値を足す。比較不能なら最初のエラーを返す。
+    let checkComparabilityRep (reps: (int * SqlValue) list) (v: SqlValue) =
+        if isNull v then
+            DbOk reps
+        else
+            let cls = comparabilityClass v
+
+            match reps |> List.tryFind (fun (c, _) -> c = cls) with
+            | Some(_, representative) ->
+                match compareValuesV representative v with
+                | DbErr e -> DbErr e
+                | DbOk _ -> DbOk reps
+            | None ->
+                match checkRepsAgainst v reps reps with
+                | DbErr e -> DbErr e
+                | DbOk _ -> DbOk((cls, v) :: reps)
+
     /// ORDER BY 用の全順序比較（内部ホットパス用）。
     /// NULL は他のすべての値より小さいものとして扱う（ASC の先頭、DESC の末尾）。
     /// SQL の 3値論理では NULL は比較不能だが、ソートには全順序が必要なのでここだけ規則を分ける。

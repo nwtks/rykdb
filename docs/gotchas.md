@@ -726,8 +726,9 @@ REAL の丸めが絡む値は REAL のまま残す
 比較関数が 0 として扱うと、ソート順が静かに崩れる。
 代表値 1個だけの型検査では、有限 REAL の代表値が `INTEGER vs Infinity` を隠す。
 
-- ✅ 比較可能性の型クラス（Int / 有限 REAL / 非有限 REAL / DECIMAL / DATE / TIMESTAMP ...）ごとに
-  代表値を持ち、新しいクラスが現れたら既存の全クラスと比較する（`OpsSort.sortClass`）。
+- ✅ 比較可能性の型クラス（Int / 有限 REAL / 非有限 REAL / DECIMAL / DATE / TIMESTAMP ...）ごとに代表値を持ち、
+  新しいクラスが現れたら既存の全クラスと比較する
+  （`SqlValue.comparabilityClass` / `checkComparabilityRep` を ORDER BY・値集合・マージ結合で共有）。
 - ❌「最初の非 NULL 値との比較」だけで済ませる（比較可能性は推移的でない）。
 - 回帰: `SqlReference: ORDER BY は非有限 REAL と他型の混在を検出する`。
 
@@ -1206,6 +1207,8 @@ JOINのONは、並べ替え用の解析で`Binder.qualify`が失敗しても述�
 - [ ] DROPと再作成時に残骸を掃除しているか
 - [ ] `IN`と`LIKE`が3値論理・進捗を守るか
 - [ ] TEXT・REAL・NULLの比較規則を揃えているか
+- [ ] 比較可能性の型クラス検査を ORDER BY・値集合・マージ結合で共有しているか
+- [ ] DML の WHERE 型検査は `Binder.qualify` の 1回だけか（`DmlOps` で再検査していないか）
 - [ ] ハッシュ結合のキーを`compareValuesV`と同じ等値（順序保持符号化）にしているか
 - [ ] INNERハッシュ結合で小さい側をbuildし、LEFTは右をbuildしているか
 - [ ] パーティションしたrunをキー順と仮定していないか

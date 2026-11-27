@@ -273,31 +273,13 @@ module internal Engine =
                 return op
         }
 
-    /// UPDATE / DELETE の候補行を、WHERE から選んだ走査方法で開く。
-    /// WHERE は呼び出し側が行ごとに再評価するので、走査は候補の十分条件にだけ使う
-    /// （範囲の閉区間など、走査が広めに返しても結果は変わらない）。
-    let private dmlCandidateScan (ctx: ExecContext) (schema: TableSchema) (where: Expr option) (mask: bool array) =
-        let method, qualifiedWhere =
-            match where with
-            | None -> ScanMethod.SeqScan, None
-            | Some w ->
-                let binding: TableBinding =
-                    {
-                        Ref = { Name = schema.Name; Alias = None }
-                        RealName = schema.Name
-                        Schema = schema
-                    }
-
-                match Binder.qualify (Schema.ofTable schema.Name None schema) w with
-                | Error _ -> ScanMethod.SeqScan, None
-                | Ok qualified ->
-                    match Analyzer.chooseScanMethod binding ctx.Catalog [ qualified ] with
-                    | Ok method -> method, Some qualified
-                    | Error _ -> ScanMethod.SeqScan, None
-
-        let preFilterOf indexName =
-            qualifiedWhere |> Option.bind (coveredPreFilter schema indexName)
-
+    let private dmlCandidateScanMasked
+        (ctx: ExecContext)
+        (schema: TableSchema)
+        (method: ScanMethod)
+        (preFilterOf: string -> Expr option)
+        (mask: bool array)
+        =
         match method with
         | ScanMethod.SeqScan ->
             Dml.scanByPrimaryKeyWithTxnMask ctx.Store schema 0 mask ctx.Visible (Some ctx.Scope) ctx.Txn
@@ -327,6 +309,33 @@ module internal Engine =
         | ScanMethod.IndexRangeScan(indexName, lower, upper) ->
             indexCandidateScan ctx schema.Name mask indexName (preFilterOf indexName) (fun scanMask ->
                 ExecContext.byIndexRangeMasked ctx schema.Name indexName lower upper 0 scanMask)
+
+    /// UPDATE / DELETE の候補行を、WHERE から選んだ走査方法で開く。
+    /// WHERE は呼び出し側が行ごとに再評価するので、走査は候補の十分条件にだけ使う
+    /// （範囲の閉区間など、走査が広めに返しても結果は変わらない）。
+    let private dmlCandidateScan (ctx: ExecContext) (schema: TableSchema) (where: Expr option) =
+        let method, qualifiedWhere =
+            match where with
+            | None -> ScanMethod.SeqScan, None
+            | Some w ->
+                let binding: TableBinding =
+                    {
+                        Ref = { Name = schema.Name; Alias = None }
+                        RealName = schema.Name
+                        Schema = schema
+                    }
+
+                match Binder.qualify (Schema.ofTable schema.Name None schema) w with
+                | Error _ -> ScanMethod.SeqScan, None
+                | Ok qualified ->
+                    match Analyzer.chooseScanMethod binding ctx.Catalog [ qualified ] with
+                    | Ok method -> method, Some qualified
+                    | Error _ -> ScanMethod.SeqScan, None
+
+        let preFilterOf indexName =
+            qualifiedWhere |> Option.bind (coveredPreFilter schema indexName)
+
+        dmlCandidateScanMasked ctx schema method preFilterOf, qualifiedWhere
 
     /// INSERT を実行する。
     let private runInsert (stmt: InsertStatement) (ctx: ExecContext) =
@@ -363,7 +372,8 @@ module internal Engine =
                 |> all
 
             let! whereE = resolveWhere target ctx stmt.Where
-            return! DmlOps.updateWith (dmlCandidateScan ctx schema whereE) ctx schema assignments whereE
+            let scan, qualifiedWhere = dmlCandidateScan ctx schema whereE
+            return! DmlOps.updateWith scan ctx schema assignments whereE qualifiedWhere
         }
 
     /// DELETE を実行する。
@@ -372,7 +382,8 @@ module internal Engine =
             let! schema = ExecContext.schemaOf stmt.Table.Name ctx
             let target = Schema.ofTable schema.Name None schema
             let! whereE = resolveWhere target ctx stmt.Where
-            return! DmlOps.deleteWith (dmlCandidateScan ctx schema whereE) ctx schema whereE
+            let scan, qualifiedWhere = dmlCandidateScan ctx schema whereE
+            return! DmlOps.deleteWith scan ctx schema whereE qualifiedWhere
         }
 
     /// DML の共通部分: 文脈を作り、変更を pending transaction に畳んで影響行数を返す。

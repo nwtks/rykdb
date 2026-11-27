@@ -54,6 +54,7 @@ let private update (ctx: ExecContext) (schema: TableSchema) (assignments: (strin
         schema
         assignments
         where
+        None
 
 let private delete (ctx: ExecContext) (schema: TableSchema) (where: Expr option) =
     DmlOps.deleteWith
@@ -61,6 +62,7 @@ let private delete (ctx: ExecContext) (schema: TableSchema) (where: Expr option)
         ctx
         schema
         where
+        None
 
 [<Fact>]
 let ``DmlOps.insert: INSERT は行を追加する`` () =

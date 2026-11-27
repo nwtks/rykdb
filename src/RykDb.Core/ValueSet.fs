@@ -311,29 +311,10 @@ module internal ValueSet =
         | DbErr _ -> 0
 
     /// 比較不能な型が混ざっていないかを早い段階で検査する。
-    /// 代表値（最初の非 NULL 値）と比べれば、型の組み合わせはすべて検出できる。
-    let private checkComparable (representative: SqlValue option) (row: SqlValue array) =
-        let v = row.[0]
-
-        if SqlValue.isNull v then
-            DbOk representative
-        else
-            match representative with
-            | None -> DbOk(Some v)
-            | Some rep ->
-                match SqlValue.compareValuesV rep v with
-                | DbErr e -> DbErr e
-                | DbOk _ -> DbOk representative
-
-    /// 代表値との比較可能性を検査する本体。
-    [<TailCall>]
-    let rec private validateComparable (values: SqlValue array) (rep: SqlValue) (i: int) =
-        if i >= values.Length then
-            Ok()
-        else
-            match SqlValue.compareValuesV rep values.[i] with
-            | DbErr e -> Error e
-            | DbOk _ -> validateComparable values rep (i + 1)
+    /// 代表値 1つでは推移的でない組合せ（Int vs ±Infinity）を見逃すため、
+    /// 型クラスごとの代表値で全組合せを検査する。
+    let private checkComparable (reps: (int * SqlValue) list) (row: SqlValue array) =
+        SqlValue.checkComparabilityRep reps row.[0]
 
     /// メモリ上の集合をソート済み配列にする。
     let private sortedArray (set: System.Collections.Generic.HashSet<SqlValue>) =
@@ -342,11 +323,21 @@ module internal ValueSet =
         match values with
         | [||] -> Ok values
         | _ ->
-            let rep = values.[0]
+            let comparability =
+                values
+                |> Array.fold
+                    (fun acc v ->
+                        match acc with
+                        | Error e -> Error e
+                        | Ok reps ->
+                            match SqlValue.checkComparabilityRep reps v with
+                            | DbErr e -> Error e
+                            | DbOk reps' -> Ok reps')
+                    (Ok [])
 
-            match validateComparable values rep 1 with
+            match comparability with
             | Error e -> Error e
-            | Ok() -> Ok(values |> Array.sortWith (fun a b -> compareValues [| a |] [| b |]))
+            | Ok _ -> Ok(values |> Array.sortWith (fun a b -> compareValues [| a |] [| b |]))
 
     /// 1値のフレーム長（varint 長 + 符号化）。
     let private frameLength (v: SqlValue) =
@@ -463,7 +454,7 @@ module internal ValueSet =
 
             match
                 Spill.reopen budget.Scope spool
-                >>= ExtSort.sortRows budget None checkComparable compareValues
+                >>= ExtSort.sortRows budget [] checkComparable compareValues
             with
             | Error e ->
                 Spill.deleteSpool spool

@@ -58,25 +58,39 @@ module internal OpsJoinMerge =
     /// エラー自体はマージ結合の `compareKeyVectors` が返す。
     /// 結合キーを位置から順に比較する本体。
     [<TailCall>]
-    let rec private compareKeyRowsAt (keys: int array) (a: SqlValue array) (b: SqlValue array) (i: int) =
+    let rec private compareKeyRowsAt (i: int) (keys: int array) (a: SqlValue array) (b: SqlValue array) =
         if i >= keys.Length then
             0
         else
             match a.[keys.[i]], b.[keys.[i]] with
-            | SqlValue.Null, SqlValue.Null -> compareKeyRowsAt keys a b (i + 1)
+            | SqlValue.Null, SqlValue.Null -> compareKeyRowsAt (i + 1) keys a b
             | SqlValue.Null, _ -> -1
             | _, SqlValue.Null -> 1
             | x, y ->
                 match SqlValue.compareValuesV x y with
-                | DbOk 0 -> compareKeyRowsAt keys a b (i + 1)
+                | DbOk 0 -> compareKeyRowsAt (i + 1) keys a b
                 | DbOk c -> c
                 | DbErr _ -> 0
 
     /// 結合キー列だけで 2行を比較する。
-    let private compareKeyRows (keys: int array) (a: SqlValue array) (b: SqlValue array) = compareKeyRowsAt keys a b 0
+    let private compareKeyRows = compareKeyRowsAt 0
+
+    let private checkJoinKey (keys: int array) (reps: (int * SqlValue) list) (row: SqlValue array) =
+        keys
+        |> Array.fold
+            (fun acc i ->
+                match acc with
+                | Error e -> Error e
+                | Ok rs ->
+                    match SqlValue.checkComparabilityRep rs row.[i] with
+                    | DbErr e -> Error e
+                    | DbOk rs' -> Ok rs')
+            (Ok reps)
+        |> DbResult.ofResult
 
     /// マージ結合フォールバック用に、パーティションの run をキー順に外部ソートする。
     /// 退避に使うメモリは作業メモリを超えないようにする。
+    /// 比較可能性は型クラスごとの代表値で事前検査し、比較関数の `DbErr` が出ないようにする。
     let sortByJoinKey (budget: MemoryBudget) (keys: int array) (src: Op) =
         let sortBudget =
             { budget with
@@ -86,7 +100,7 @@ module internal OpsJoinMerge =
                     else min budget.Sort budget.Work
             }
 
-        ExtSort.sortRows sortBudget () (fun () _ -> DbOk()) (compareKeyRows keys) src
+        ExtSort.sortRows sortBudget [] (checkJoinKey keys) (compareKeyRows keys) src
 
     /// 先頭行と同じ結合キーかどうかを比較する。
     let private mergeSameKey (keys: int array) (first: SqlValue array) (row: SqlValue array) =

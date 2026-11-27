@@ -591,6 +591,7 @@ module internal DmlOps =
         (schema: TableSchema)
         (assignments: (string * Expr) list)
         (where: Expr option)
+        (qualifiedWhere: Expr option)
         =
         let targetSchema = targetSchemaOf schema
         let assignExprs = List.map snd assignments
@@ -607,8 +608,11 @@ module internal DmlOps =
                     do! Eval.checkPrepared resolve
 
                     do!
-                        assignExprs @ Option.toList where
-                        |> foldOk (fun () e -> Eval.checkComparableTypes targetSchema e) ()
+                        match qualifiedWhere with
+                        | Some _ -> ret ()
+                        | None ->
+                            assignExprs @ Option.toList where
+                            |> foldOk (fun () e -> Eval.checkComparableTypes targetSchema e) ()
 
                     let! accesses = Dml.prepareIndexAccess schema
                     let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
@@ -719,6 +723,7 @@ module internal DmlOps =
         (ctx: ExecContext)
         (schema: TableSchema)
         (where: Expr option)
+        (qualifiedWhere: Expr option)
         =
         let targetSchema = targetSchemaOf schema
         let resolve = Eval.prepare targetSchema (Option.toList where)
@@ -726,10 +731,13 @@ module internal DmlOps =
         result {
             do! Eval.checkPrepared resolve
 
-            do!
-                where
-                |> Option.toList
-                |> foldOk (fun () e -> Eval.checkComparableTypes targetSchema e) ()
+            match qualifiedWhere with
+            | Some _ -> ()
+            | None ->
+                do!
+                    where
+                    |> Option.toList
+                    |> foldOk (fun () e -> Eval.checkComparableTypes targetSchema e) ()
 
             let! accesses = Dml.prepareIndexAccess schema
             let! checks = ForeignKey.prepareParentDeleteChecks ctx.Catalog schema
