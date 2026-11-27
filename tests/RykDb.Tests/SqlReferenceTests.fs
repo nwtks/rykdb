@@ -2904,6 +2904,40 @@ let ``SqlReference: 主キーの重複 INSERT はエラー（upsert しない）
         Assert.Equal<string>("a", asText rows.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: 同じ INSERT 文内の主キー重複はエラー`` () =
+    // 文の途中で同じ主キーを書いても、後の行で上書きしない。
+    withSession "pk-duplicate-same-stmt" (fun db0 ->
+        let db1 =
+            exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE, v INTEGER)"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "同一文内の主キー重複"
+            (execSql db1 "INSERT INTO t VALUES (1,'a',10),(1,'b',20)")
+
+        let _, count = ok (execSql db1 "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(0L, asInt count.Rows.[0].[0])
+
+        // 失敗した文の索引エントリも残らない。
+        let _, byIndex = ok (execSql db1 "SELECT id, u, v FROM t WHERE u = 'a'")
+        Assert.Empty byIndex.Rows)
+
+[<Fact>]
+let ``SqlReference: INSERT ... SELECT の生成行が主キー重複ならエラー`` () =
+    withSession "pk-duplicate-select" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "CREATE TABLE s (x INTEGER PRIMARY KEY)"
+        let db3 = exec db2 "INSERT INTO s VALUES (10), (20)"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "INSERT ... SELECT の生成行の主キー重複"
+            (execSql db3 "INSERT INTO t (id, v) SELECT 1, x FROM s")
+
+        let _, count = ok (execSql db3 "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(0L, asInt count.Rows.[0].[0]))
+
+[<Fact>]
 let ``SqlReference: UPDATE は主キー列を変えられない`` () =
     // §9: 主キー列を SET するとエラーになり、何も更新されない。
     withSession "pk-update" (fun db0 ->

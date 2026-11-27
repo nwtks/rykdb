@@ -88,6 +88,59 @@ let ``DmlOps.insert: INSERT は行を追加する`` () =
         Assert.Equal("alice", asText rows.[0].[1]))
 
 [<Fact>]
+let ``DmlOps.insert: 同じ INSERT 文で主キーが重複したらエラー`` () =
+    withStore "ins-pk-dup" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+
+        let duplicate =
+            [
+                [
+                    Expr.Literal(Literal.Int 1L)
+                    Expr.Literal(Literal.String "alice")
+                    Expr.Literal(Literal.Int 20L)
+                ]
+                [
+                    Expr.Literal(Literal.Int 1L)
+                    Expr.Literal(Literal.String "bob")
+                    Expr.Literal(Literal.Int 30L)
+                ]
+            ]
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "同じ文の主キー重複が OK になっています"
+            (DmlOps.insert (ctxOf store txn) plainPeopleSchema None duplicate)
+
+        let rows =
+            ok (Dml.scanByPrimaryKey store plainPeopleSchema 0 None) |> Op.toArray |> ok
+
+        Assert.Empty rows)
+
+[<Fact>]
+let ``DmlOps.insertSelect: 選択結果の主キーが重複したらエラー`` () =
+    withStore "ins-select-pk-dup" (fun store ->
+        let mgr = TransactionManager.create ()
+        let _, txn = TransactionManager.beginTxn mgr
+
+        let source =
+            Op.ofArray
+                [|
+                    [| SqlValue.Int 1L; SqlValue.Text "alice"; SqlValue.Int 20L |]
+                    [| SqlValue.Int 1L; SqlValue.Text "bob"; SqlValue.Int 30L |]
+                |]
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "INSERT ... SELECT の主キー重複が OK になっています"
+            (DmlOps.insertSelect (ctxOf store txn) plainPeopleSchema None 3 source)
+
+        let rows =
+            ok (Dml.scanByPrimaryKey store plainPeopleSchema 0 None) |> Op.toArray |> ok
+
+        Assert.Empty rows)
+
+[<Fact>]
 let ``DmlOps.insert: INSERT は列順を明示できる`` () =
     withStore "inscols" (fun store ->
         let mgr = TransactionManager.create ()

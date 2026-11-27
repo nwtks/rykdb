@@ -205,9 +205,12 @@ module internal DmlOps =
                         | Error e -> err e
 
     /// 主キーと UNIQUE 索引の重複を検査し、確定した主キーのバイト列と更新済みガードを返す。
+    /// 主キーは同じ文の先行行も含む累積の transaction で検査する
+    /// （`UniqueGuard` は UNIQUE 索引だけを追跡し、主キーは見ない）。
     let private checkUnique
         (ctx: ExecContext)
         (schema: TableSchema)
+        (txn: Transaction)
         (accesses: Dml.IndexAccess list)
         (row: SqlValue array)
         (guard: UniqueGuard)
@@ -221,7 +224,7 @@ module internal DmlOps =
 
         KeyBuilder.ofValues pk
         >>= fun pkBytes ->
-            match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes existsMask ctx.Visible ctx.Txn with
+            match Dml.getByPrimaryKeyBytesWithTxnMask ctx.Store schema pkBytes existsMask ctx.Visible txn with
             | Ok(Some _) -> err (sprintf "PRIMARY KEY 制約に違反: %s" schema.Name |> DbError.constraintViolation)
             | Ok None ->
                 checkUniqueIndexes
@@ -253,7 +256,7 @@ module internal DmlOps =
         (guard: UniqueGuard)
         (row: SqlValue array)
         =
-        checkUnique ctx schema accesses row guard
+        checkUnique ctx schema txn accesses row guard
         >>= fun (pkBytes, guard') ->
             Dml.insertWithKeyPrepared pkBytes txn schema accesses row
             >>= fun next ->

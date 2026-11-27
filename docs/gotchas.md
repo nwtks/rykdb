@@ -320,8 +320,12 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 - ✅ 文の開始時に `DmlOps.UniqueGuard` を作り、`BaseSlots` を 1回だけ変換する。
 - ✅ 文内で確定したキーは不変 `Map` の `Added` へ積み、後続行はそこを先に見る。
 - ✅ ストア走査は `Dml.scanByIndexPrefixWithSlots` に `BaseSlots` を渡す。
+- ✅ 主キーの重複は `UniqueGuard` ではなく、同じ文の先行行を含む累積 `Transaction` で検査する
+  （`checkUnique` が `txn` を受け取る。ガードは UNIQUE 索引だけを追跡する）。
 - ❌ `Reservations` を文内可視性に流用する（commit 競合専用で NULL を予約しないため意味が違う）。
-- 回帰: `SqlReference: 明示 transaction の INSERT は前の文の UNIQUE 値も見る`。
+- 回帰: `SqlReference: 明示 transaction の INSERT は前の文の UNIQUE 値も見る` /
+  `SqlReference: 同じ INSERT 文内の主キー重複はエラー` /
+  `SqlReference: INSERT ... SELECT の生成行が主キー重複ならエラー`。
 
 ---
 
