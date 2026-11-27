@@ -311,6 +311,93 @@ module internal OpsJoinHash =
                     |> Array.map (fun p -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0)))
                     |> ret
 
+    [<TailCall>]
+    let rec private hashPartitionLeftGather
+        (budget: MemoryBudget)
+        (stamp: string)
+        (spools: System.Collections.Generic.List<Spill.RowSpool>)
+        (keys: int array)
+        (buckets: SqlValue array list array)
+        (used: int64)
+        (cur: Op)
+        =
+        match Op.next cur with
+        | OpStep.OpError e -> err e
+        | OpStep.OpDone ->
+            buckets
+            |> Array.map (fun rows -> Spill.RowSpool.Memory(List.rev rows |> List.toArray))
+            |> ret
+        | OpStep.OpRow(row, nxt) ->
+            match hashKeyBytes keys row with
+            | Error e -> err e
+            | Ok key ->
+                let size = int64 (ValueCodec.managedRowBytes row) + 32L
+
+                if MemoryBudget.exceeded (budget.Work, used + size) then
+                    Spill.openPartitions budget.Directory stamp 0 Spill.Partitions
+                    >>= fun writer ->
+                        let written =
+                            buckets
+                            |> Array.mapi (fun i rows ->
+                                rows
+                                |> List.rev
+                                |> List.fold (fun acc r -> acc >>= fun () -> writer.Write(i, r)) (ret ()))
+                            |> Array.fold (fun acc step -> acc >>= fun () -> step) (ret ())
+
+                        match written with
+                        | Error e ->
+                            writer.Abandon()
+                            err e
+                        | Ok() ->
+                            match
+                                Spill.fillPartitions writer (hashKeyBytes keys) (fun _ row -> row) 0L (Op.emit row nxt)
+                            with
+                            | Error e ->
+                                writer.Abandon()
+                                err e
+                            | Ok _ ->
+                                match writer.Close() with
+                                | Error e ->
+                                    writer.Abandon()
+                                    err e
+                                | Ok() ->
+                                    writer.Paths
+                                    |> Array.map (fun p -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0)))
+                                    |> ret
+                else
+                    let p = Spill.partitionOfKey 0UL key
+                    buckets.[p] <- row :: buckets.[p]
+                    hashPartitionLeftGather budget stamp spools keys buckets (used + size) nxt
+
+    /// 左側をパーティションへ分割する。
+    /// まずメモリ上の16バケットへ溜め、作業メモリに収まれば run を作らずに返す。
+    /// 超えた時点で溜めた行を `PartitionWriter` へ書き出し、残りを既存経路で分割する
+    /// （`Op` は one-shot なので、事前判定のために読み切ってからやり直すことはできない）。
+    let private hashPartitionLeft
+        (budget: MemoryBudget)
+        (stamp: string)
+        (spools: System.Collections.Generic.List<Spill.RowSpool>)
+        (keys: int array)
+        (src: Op)
+        =
+        let buckets = Array.init Spill.Partitions (fun _ -> [])
+        hashPartitionLeftGather budget stamp spools keys buckets 0L src
+
+    [<TailCall>]
+    let rec private splitMemory (salt: uint64) (keys: int array) (buckets: SqlValue array list array) =
+        function
+        | [] ->
+            buckets
+            |> Array.map (fun rs -> Spill.RowSpool.Memory(List.rev rs |> List.toArray))
+            |> ret
+        | row :: rest ->
+            match hashKeyBytes keys row with
+            | Error e -> err e
+            | Ok key ->
+                let p = Spill.partitionOfKey salt key
+                buckets.[p] <- row :: buckets.[p]
+                splitMemory salt keys buckets rest
+
     /// 1つの spool を salt 付きで再分割する。
     let private hashRepartitionOne
         (budget: MemoryBudget)
@@ -321,7 +408,9 @@ module internal OpsJoinHash =
         (keys: int array)
         =
         function
-        | Spill.RowSpool.Memory rows -> ret [| Spill.RowSpool.Memory rows |]
+        | Spill.RowSpool.Memory rows ->
+            let buckets = Array.init Spill.Partitions (fun _ -> [])
+            splitMemory salt keys buckets (rows |> Array.toList)
         | Spill.RowSpool.Disk([ path ], _) ->
             let callStamp = System.Guid.NewGuid().ToString "N"
 
@@ -547,7 +636,7 @@ module internal OpsJoinHash =
         let stamp = System.Guid.NewGuid().ToString "N"
         let spools = System.Collections.Generic.List<Spill.RowSpool>()
 
-        hashPartitionSide budget stamp spools 0 leftKeys left
+        hashPartitionLeft budget stamp spools leftKeys left
         >>= fun lparts ->
             hashPartitionSide budget stamp spools Spill.Partitions rightKeys right
             >>= fun rparts ->

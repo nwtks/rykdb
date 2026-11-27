@@ -312,6 +312,17 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 - ✅ `Op.toArrayLimited -1 budget.Work` で直接読み込み、`CapacityError` を「収まらない」として扱う。
 - ❌ `Spill.spool` の戻り値で判定する（収まる場合も収まらない場合も run を作る）。
 
+### 3.25b 左が小さくても 16本の run を書かない
+
+右が退避すると、左が数行でも `hashPartitionSide` で16本の run を書いていた。
+
+- ✅ `hashPartitionLeft` がメモリ上の16バケットへ溜め、収まれば `RowSpool.Memory` で返す。
+- ✅ 溢れた行を書き出すときは、上限超過のきっかけになった行も `Op.emit row nxt` で渡す
+  （`nxt` から始めると1行失われる）。
+- ✅ 再分割では `hashRepartitionOne` の Memory 分岐も同じ salt で16本へ分ける
+  （片側だけ1本だと `hashJoinStep` の `Array.map2` が長さ不一致で落ちる）。
+- 回帰: `結合: 左が小さく右が退避しても左は run に書かない`。
+
 ### 3.26 UNIQUE 検査で行ごとに txn スロットを並べ替えない
 
 `Dml.scanByIndexPrefixWithTxnMask` が行ごとに `Transaction.slotsOf` を呼ぶと、

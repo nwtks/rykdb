@@ -360,6 +360,48 @@ let ``結合: ハッシュの LEFT JOIN も退避すると結果が同じ`` () =
         assertNoLeftovers dir)
 
 [<Fact>]
+let ``結合: 左が小さく右が退避しても左は run に書かない`` () =
+    // 左が作業メモリに収まるなら、16本のパーティション run を作らずメモリで分割する。
+    withDir "join-hash-left-memory" (fun dir ->
+        let left =
+            Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 1L |]; [| SqlValue.Int 9L |] |]
+
+        let rightRows = [| for _ in 1..200 -> [| SqlValue.Int 1L |] |]
+
+        let budget =
+            { MemoryBudget.Unlimited with
+                Work = 1024L
+                Sort = 1024L
+                Directory = Some dir
+            }
+
+        let rows =
+            ok (
+                Op.toArray (
+                    ok (
+                        OpsJoinHash.leftJoinHash
+                            budget
+                            leftSchema
+                            left
+                            [| 0 |]
+                            rightSchema
+                            (Op.ofArray rightRows)
+                            [| 0 |]
+                            None
+                    )
+                )
+            )
+
+        // キー 1 の左 2行 × 右 200行 + 一致しない左行 1行。
+        Assert.Equal<int>(401, rows.Length)
+
+        let padded =
+            rows |> Array.filter (fun r -> asInt r.[0] = 9L && SqlValue.isNull r.[1])
+
+        Assert.Equal<int>(1, padded.Length)
+        assertNoLeftovers dir)
+
+[<Fact>]
 let ``結合: ハッシュ結合のパーティションは早期終了でも残らない`` () =
     withDir "join-hash-partition-scope" (fun dir ->
         let scope = ScanScope()
