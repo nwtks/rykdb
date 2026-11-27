@@ -22,6 +22,7 @@
     <Compile Include="SstScan.fsi" />
     <Compile Include="SstScan.fs" />
     <Compile Include="SstableFormat.fs" />
+    <Compile Include="SstableWriter.fs" />
     <Compile Include="SstableReader.fs" />
     <Compile Include="VersionSet.fs" />
     <Compile Include="Compaction.fs" />

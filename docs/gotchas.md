@@ -474,6 +474,18 @@ active transactionがない場合は`LastCommitSeqNo + 1`を境界にする。
 transactionに`@unique:<index>:<encoded value>`の論理予約キーを持たせ、commit時の競合検査へ含める。
 予約キーはWAL/SSTableへ書かない。
 
+予約は参照カウントで管理し、txn内で値が消えたら`Transaction.releaseUnique`で解放する。
+`Dml.applyIndexChange`は旧値を解放してから新値を予約するため、
+INSERT後にUPDATE / DELETEした値はcommitの競合検査から外れる。
+最終状態に残る値だけを予約することで、重複の無い2つのtransactionが誤って競合するのを防ぐ。
+
+❌ 予約を追加するだけで解放しない: INSERT (1,'x') → UPDATE email='y' の txn と
+INSERT (2,'x') の txn が、最終状態に重複が無いのに競合する。
+✅ 旧値を解放してから新値を予約する。
+
+回帰: `SessionPool: txn 内で消した UNIQUE 値は競合しない` /
+`TransactionManager.commit: 解放した UNIQUE 予約は競合しない`。
+
 ### 5.8 明示transactionは接続ごとに保持する
 
 接続ごとの状態はBEGIN時点のCatalog・Active・Pending・leaseだけを保持し、
@@ -1114,7 +1126,7 @@ JOINのONは、並べ替え用の解析で`Binder.qualify`が失敗しても述�
 - [ ] 複数keyspaceを1回のWAL/batchへまとめているか
 - [ ] 古いsnapshotとtombstoneをGCで消していないか
 - [ ] 再オープン時にSeqNoを復元しているか
-- [ ] UNIQUEの論理予約を競合検査へ含めているか
+- [ ] UNIQUEの論理予約を競合検査へ含め、txn内で消えた値を解放しているか
 
 ### 11.4 索引・JOIN・SQL意味論
 

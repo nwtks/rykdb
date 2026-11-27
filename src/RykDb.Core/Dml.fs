@@ -47,8 +47,13 @@ module internal Dml =
     /// （行全体の複製を避ける。読み取りはキーから復号する）。
     let private EmptyIndexValue: SqlValue array = Array.empty
 
-    /// UNIQUE 索引の予約キーを transaction に積む。
-    let private reserveUniqueValues (txn: Transaction) (schema: TableSchema) (index: IndexSchema) =
+    /// UNIQUE 索引値の予約を増減する（NULL は予約しない）。
+    let private changeUniqueReservation
+        (change: string -> byte array -> Transaction -> Transaction)
+        (txn: Transaction)
+        (schema: TableSchema)
+        (index: IndexSchema)
+        =
         function
         | None -> ret txn
         | Some values ->
@@ -58,7 +63,13 @@ module internal Dml =
                     ret txn
                 else
                     KeyBuilder.ofValues keyValues
-                    |> Result.map (fun key -> Transaction.reserveUnique index.Name key txn)
+                    |> Result.map (fun key -> change index.Name key txn)
+
+    /// UNIQUE 索引値を予約する。
+    let private reserveUniqueValues = changeUniqueReservation Transaction.reserveUnique
+
+    /// txn 内で消えた UNIQUE 値の予約を解放する（最終状態に残らない値は競合しない）。
+    let private releaseUniqueValues = changeUniqueReservation Transaction.releaseUnique
 
     /// 索引エントリのキーを作る（差分反映用の薄いラッパー）。
     let private indexKeyFor (schema: TableSchema) (index: IndexSchema) (row: SqlValue array) =
@@ -77,7 +88,7 @@ module internal Dml =
             (fun current index ->
                 let reserved =
                     if index.Unique then
-                        reserveUniqueValues current schema index oldRow
+                        releaseUniqueValues current schema index oldRow
                         >>= fun afterOld -> reserveUniqueValues afterOld schema index newRow
                     else
                         ret current

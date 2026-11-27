@@ -1,8 +1,8 @@
 // ===========================================================================
-// SstableFormat.fs のテスト（書き出し）
+// SstableWriter.fs のテスト（書き出し）
 // ===========================================================================
 
-module RykDb.SstableFormatTests
+module RykDb.SstableWriterTests
 
 open Xunit
 open RykDb.Core

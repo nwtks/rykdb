@@ -1233,6 +1233,8 @@ Closeだけは読み取り完了を待つ。
 - transaction内で同じ行を読み直すと、後続のcommitは見えない。
 - snapshot取得後に別transactionが先に同じキーをcommitした場合、
   自分のcommitは `ConflictError`になる。
+- UNIQUEの予約はtransaction内の最終状態だけを対象にする。
+  値を挿入後に別の値へ更新・削除した場合、その値は競合検査から外れる。
 - 競合または書き込みバッファの上限超過で COMMIT が失敗した transaction は自動的に rollback され、
   接続は自動コミット状態へ戻る。
   同じ snapshot では再試行しても永久に競合し、上限は減らないため、transaction 全体を最初からやり直す。

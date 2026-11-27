@@ -121,20 +121,25 @@ flowchart TB
 | -------------------- | ------------------------------------------------------------------------- |
 | ストレージ           | LSM-Tree、leveled compaction、論理keyspace接頭辞                          |
 | memtable             | 永続Treap。優先度は決定的ハッシュ                                         |
-| SSTable              | ブロック、接頭辞共有、Bloom filter、Footer v6、部分読み                   |
-| 一貫性               | CRC32C、SSTableとMANIFEST、WALフレームのチェックサム                      |
-| 障害回復             | 論理WAL、MANIFEST、CURRENT                                                |
-| 耐久性               | WAL追記とグループコミットによるfsync                                      |
+| SSTable              | ブロック、接頭辞共有、Bloom filter、Footer、部分読み                      |
+| 一貫性               | CRC32C。SSTableブロック・Footer、MANIFEST・CURRENT、WALフレーム           |
+| 障害回復             | 論理WAL、MANIFEST、二世代CURRENT(A/B)                                     |
+| 耐久性               | WAL追記とグループコミットfsync。複数keyspaceを1バッチで原子コミット       |
 | ガベージコレクション | エントリ単位のSeqNo判定。tombstoneは最下位レベルで回収                    |
 | 並行制御             | Sessionで読み取りを並行化、書き込みを直列化、MVCCとfirst-committer-wins   |
+| 排他                 | DDLはRootRuntime、DBは`.rykdb.format`のFileShare.None（プロセス間）       |
 | compaction           | バックグラウンドworker。MANIFEST追記は排他ゲート、ファイル番号はCASで予約 |
 | 符号化               | 型タグ、escape付きタプル、varint、順序保持エンコーディング                |
-| 索引                 | 複合キーと主キーのprefix走査                                              |
-| 最適化               | Filter pushdown、結合選択、主キー順ORDER BYのSort省略、LIMITヒント        |
-| 実行                 | 不変`Op`によるpull型演算子                                                |
+| ハッシュ             | FNV-1a 64bitとsplitmix64（Bloom filter・Treapの優先度）                   |
+| 索引                 | 複合キーと主キーのprefix走査。索引値は空、非被覆列は主キーlookup          |
+| 最適化               | Filter pushdown、Selinger DP・bushy、統計、Sort省略、LIMITヒント          |
+| 実行                 | 不変`Op`によるpull型演算子。列マスクで不要列を復号しない                  |
 | 結合                 | インデックス入れ子ループ、マージ、ハッシュ、入れ子ループ                  |
-| ソート               | 外部マージソート                                                          |
+| ソート               | 外部マージソート。runへの退避とfan-in 32のmulti-pass k-way merge          |
+| 外部処理             | JOIN・DISTINCT・GROUP BY・INをSpillとValueSetへ退避                       |
 | 式評価               | 3値論理、計画時の準備値、CPS、手書きLIKE照合                              |
+| 構文解析             | 手書きLexerと再帰下降Parser。式はPratt、SELECTはCPS                       |
+| エラー処理           | `Result`／`DbResult`と`protect`。失敗を値として扱う                       |
 
 ### 依存の向き
 
@@ -170,23 +175,23 @@ flowchart TB
 
 ### 主要モジュール
 
-| モジュール                                                                | 役割                                   |
-| ------------------------------------------------------------------------- | -------------------------------------- |
-| `Errors`、`Types`                                                         | `DbError`、`SqlValue`、型、3値論理     |
-| `Writer`、`Cursor`、`Serialization`、`KeyCodec`                           | 不変書き込み、カーソル、順序保持符号化 |
-| `Memtable`、`Wal`                                                         | 永続Treapと論理ログ                    |
-| `SstScan`、`Sstable`、`SstableFormat`                                     | 部分読み、ブロック走査、SSTable形式    |
-| `VersionSet`、`Manifest`、`Compaction`                                    | レベル構成、版履歴、圧縮               |
-| `StorageEngine`                                                           | LSMツリーの公開層                      |
-| `Ast`、`Lexer`、`Parser`                                                  | SQL構文木、字句解析、構文解析          |
-| `Transactions`、`ProcessLock`                                             | MVCC、プロセス間排他                   |
-| `RowStore`、`TableSchema`、`Catalog`、`Schema`                            | 行、スキーマ、論理keyspace             |
-| `Eval`、`Scalar`                                                          | 式評価とスカラー関数                   |
-| `Op`、`Ops`、`OpsSort`、`OpsDistinct`、`OpsAggregate`、`ExtSort`、`Spill` | pull演算子、ソート、集約、退避         |
-| `OpsJoin`、`OpsJoinHash`、`OpsJoinMerge`、`OpsJoinShared`                 | 結合                                   |
-| `Binder`、`Analyzer`、`JoinOrder`、`PlanBuilder`、`Optimizer`、`Plan`     | 名前解決、結合順、論理代数、物理計画   |
-| `Dml`、`ForeignKey`、`ExecContext`、`DmlOps`                              | DMLと参照整合性                        |
-| `Engine`、`DatabaseHost`、`Session`                                       | 文実行、共有状態、接続API              |
+| モジュール                                                                | 役割                                          |
+| ------------------------------------------------------------------------- | --------------------------------------------- |
+| `Errors`、`Types`                                                         | `DbError`、`SqlValue`、型、3値論理            |
+| `Writer`、`Cursor`、`Serialization`、`KeyCodec`                           | 不変書き込み、カーソル、順序保持符号化        |
+| `Memtable`、`Wal`                                                         | 永続Treapと論理ログ                           |
+| `SstScan`、`SstableFormat`、`SstableWriter`、`SstableReader`              | SSTable形式、書き出し、部分読み、ブロック走査 |
+| `VersionSet`、`Compaction`                                                | レベル構成、版履歴、圧縮                      |
+| `StorageEngine`                                                           | LSMツリーの公開層                             |
+| `Ast`、`Lexer`、`Parser`                                                  | SQL構文木、字句解析、構文解析                 |
+| `Transactions`、`ProcessLock`                                             | MVCC、プロセス間排他                          |
+| `RowStore`、`TableSchema`、`Catalog`、`Schema`                            | 行、スキーマ、論理keyspace                    |
+| `Eval`、`Scalar`                                                          | 式評価とスカラー関数                          |
+| `Op`、`Ops`、`OpsSort`、`OpsDistinct`、`OpsAggregate`、`ExtSort`、`Spill` | pull演算子、ソート、集約、退避                |
+| `OpsJoin`、`OpsJoinHash`、`OpsJoinMerge`、`OpsJoinShared`                 | 結合                                          |
+| `Binder`、`Analyzer`、`JoinOrder`、`PlanBuilder`、`Optimizer`、`Plan`     | 名前解決、結合順、論理代数、物理計画          |
+| `Dml`、`ForeignKey`、`ExecContext`、`DmlOps`                              | DMLと参照整合性                               |
+| `Engine`、`DatabaseHost`、`Session`                                       | 文実行、共有状態、接続API                     |
 
 ### F#コンパイル順
 
@@ -195,7 +200,7 @@ F#はファイルをプロジェクトの列挙順に評価する。
 
 ```text
 Errors -> Types -> Writer -> Cursor -> Serialization -> KeyCodec -> Memtable -> Wal
-    -> BloomFilter -> SstScan -> SstableFormat -> Sstable -> VersionSet
+    -> BloomFilter -> SstScan -> SstableFormat -> SstableWriter -> SstableReader -> VersionSet
     -> Compaction -> StorageEngine -> Ast -> Lexer -> ParserExpr -> Parser
     -> Transactions -> ProcessLock -> VersionCoordinator -> RowStore
     -> TableSchema -> Catalog -> Schema -> Scalar -> Eval -> Op -> Spill -> ExtSort
@@ -890,6 +895,9 @@ snapshotは「SeqNoがS以下の版だけを可視とする」不変な状態で
 UNIQUE索引は論理予約キー`@unique:<索引名>:<base64(索引値)>`を使う。
 
 予約キーは物理エントリを書かず、commit時に`LastCommitted`へ登録する。
+予約は参照カウントで管理し、txn内で値が消えたら解放する。
+commitの競合検査には最終状態に残る予約だけを使うため、
+INSERT後に別の値へ更新・削除した値は競合しない。
 `NULL`を含むUNIQUE値は予約しない。
 
 競合時の`ConflictError`は、競合したキーの件数と先頭3件の内訳を示す。
@@ -1405,7 +1413,8 @@ Close後のExecute、BEGIN、COMMIT、ROLLBACKはエラーになる。
 ├── .rykdb.format
 ├── .drop-cleanup
 ├── MANIFEST-000001
-├── CURRENT
+├── CURRENT.A
+├── CURRENT.B
 ├── 000002.wal
 ├── 000003.sst
 ├── 000004.sst
@@ -1417,7 +1426,7 @@ Close後のExecute、BEGIN、COMMIT、ROLLBACKはエラーになる。
 | `.rykdb.format`  | レイアウト版とプロセス間ロック |
 | `.drop-cleanup`  | 未完了DROPの後始末対象         |
 | `MANIFEST-xxxxx` | VersionSetの変更履歴           |
-| `CURRENT`        | 有効なMANIFEST番号             |
+| `CURRENT.A`      | 有効なMANIFEST名とCRC（2世代） |
 | `xxxxx.wal`      | 論理ログ                       |
 | `xxxxx.sst`      | データファイル                 |
 | `.orphans/`      | MANIFEST非参照ファイルの退避先 |

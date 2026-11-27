@@ -54,7 +54,7 @@
 | INV-18 | 式ノードの children と arity が一致する                                               | `Expr.mapChildrenState`、`AstTests.allNodeKinds`                                                        |
 | INV-19 | 保持する側はキーと行を複製して所有する                                                | `Entry.takeOwnership`、`Transaction.setSlot`                                                            |
 | INV-20 | `Writer.Chunks` は逆順に保持する                                                      | `Writer.fsi`、順序プロパティテスト                                                                      |
-| INV-21 | UNIQUE の論理予約を commitまで保持する                                                | `Transaction.reserveUnique`、`TransactionManager.commit`                                                |
+| INV-21 | UNIQUE の論理予約は最終状態に残る値だけを commit まで保持する                         | `Transaction.reserveUnique` / `releaseUnique`、`Dml.applyIndexChange`                                   |
 | INV-22 | mutable 状態を許可された層とスロットに限定する                                        | 状態 DU、クエリ局所 mutable                                                                             |
 | INV-23 | 公開行は `LoadedRow` のみで構成する                                                   | `LoadedRow.create`、`StatementResult`、`RowReader`                                                      |
 | INV-24 | 公開 Version とファイル refcount を一貫させる                                         | `VersionCoordinator`、pin/sweep                                                                         |
@@ -702,9 +702,12 @@ UNIQUE索引の物理キーは「索引値＋主キー」のため、
 主キーが違えば同じUNIQUE値でも物理キーは衝突しない。
 そこで、同じUNIQUE値を論理予約キーとして transaction中に保持し、commit時に競合を検出する。
 
-- `Transaction.reserveUnique`が `@unique:<索引名>:<base64(索引値)>`を `Reservations : Set<string>`へ追加する。
-- 同じ値の予約は1件にまとめる。
-- `Transaction.writeKeys`が物理書き込みキーと予約の和集合を返す。
+- `Transaction.reserveUnique`が `@unique:<索引名>:<base64(索引値)>`を
+  `Reservations : Map<string,int>`の参照カウントへ追加する。
+- `Transaction.releaseUnique`が参照カウントを減らし、0になったキーを削除する。
+- `Dml.applyIndexChange`が旧値を解放してから新値を予約する（文の順序に依存しない）。
+- 同じ値の予約はキー1件にまとめ、カウントだけが増減する。
+- `Transaction.writeKeys`が物理書き込みキーと**カウントが残る予約**の和集合を返す。
 - `TransactionManager.commit`が `writeKeys`で競合を判定する。
 - commitした予約をcommit SeqNoで `LastCommitted`へ登録する。
 - 物理エントリがなくても予約だけのcommitでSeqNoを進める。
@@ -712,8 +715,8 @@ UNIQUE索引の物理キーは「索引値＋主キー」のため、
 - UNIQUE reservationは物理キーではないため、CREATE UNIQUE INDEXのbackfillは不要である。
 - DDLは排他の `RootRuntime`で実行し、active transactionを拒否する。
 
-回帰テストは予約の重複排除、論理予約の競合、activeなしでの予約破棄、Session間のINSERT/UPDATE、
-NULL、rollbackを検査する。
+回帰テストは予約の重複排除と参照カウント、解放した予約の非競合、論理予約の競合、
+activeなしでの予約破棄、Session間のINSERT/UPDATE、NULL、rollbackを検査する。
 
 ### INV-23: 結果行は LoadedRow
 

@@ -164,6 +164,50 @@ let ``Transaction.reserveUnique: 同じ索引値の予約は 1 件にまとま�
     Assert.Equal(txn1.ApproxBytes, txn2.ApproxBytes)
 
 [<Fact>]
+let ``Transaction.reserveUnique: 同じ値の再予約は参照カウントだけ増える`` () =
+    let txn0 = Transaction.create 1UL<txnId> { Snapshot.SeqNo = 0UL }
+    let key = KeyBuilder.ofValues [| SqlValue.Text "x@example.com" |] |> ok
+    let txn1 = Transaction.reserveUnique "idx_email" key txn0
+    let txn2 = Transaction.reserveUnique "idx_email" key txn1
+    Assert.Equal(1, txn2.Reservations.Count)
+    Assert.Equal(txn1.ApproxBytes, txn2.ApproxBytes)
+
+    let txn3 = Transaction.releaseUnique "idx_email" key txn2
+    Assert.Equal(1, txn3.Reservations.Count)
+    Assert.Equal(txn1.ApproxBytes, txn3.ApproxBytes)
+
+    let txn4 = Transaction.releaseUnique "idx_email" key txn3
+    Assert.Equal(0, txn4.Reservations.Count)
+    Assert.Equal(txn0.ApproxBytes, txn4.ApproxBytes)
+
+[<Fact>]
+let ``Transaction.releaseUnique: 存在しない予約は無視する`` () =
+    let txn = Transaction.create 1UL<txnId> { Snapshot.SeqNo = 0UL }
+    let key = KeyBuilder.ofValues [| SqlValue.Text "missing" |] |> ok
+    let released = Transaction.releaseUnique "idx_email" key txn
+    Assert.Equal(0, released.Reservations.Count)
+    Assert.Equal(txn.ApproxBytes, released.ApproxBytes)
+
+[<Fact>]
+let ``TransactionManager.commit: 解放した UNIQUE 予約は競合しない`` () =
+    let mgr0 = TransactionManager.create ()
+    let mgr1, txnA = TransactionManager.beginTxn mgr0
+    let mgr2, txnB = TransactionManager.beginTxn mgr1
+    let keyX = KeyBuilder.ofValues [| SqlValue.Text "x" |] |> ok
+    let keyY = KeyBuilder.ofValues [| SqlValue.Text "y" |] |> ok
+
+    let txnA =
+        txnA
+        |> Transaction.reserveUnique "idx" keyX
+        |> Transaction.releaseUnique "idx" keyX
+        |> Transaction.reserveUnique "idx" keyY
+
+    let txnB = Transaction.reserveUnique "idx" keyX txnB
+    let mgr3, _, _ = ok (TransactionManager.commit txnB mgr2)
+    let mgr4, _, _ = ok (TransactionManager.commit txnA mgr3)
+    Assert.Equal(0, mgr4.LastCommitted.Count)
+
+[<Fact>]
 let ``Transaction.writeKeys: 書き込みキーを返す`` () =
     let snap = { Snapshot.SeqNo = 0UL }
     let txn0 = Transaction.create 1UL<txnId> snap

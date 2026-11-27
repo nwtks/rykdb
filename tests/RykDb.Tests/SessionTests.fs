@@ -956,6 +956,30 @@ let ``SessionPool: 接続間で UNIQUE の同時 UPDATE を検出する`` () =
             b.Close() |> ignore)
 
 [<Fact>]
+let ``SessionPool: txn 内で消した UNIQUE 値は競合しない`` () =
+    withPool "pool-unique-released" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            |> ignore
+
+            ok (a.Begin()) |> ignore
+            ok (b.Begin()) |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1, 'x')") |> ignore
+            ok (a.Execute "UPDATE t SET email = 'y' WHERE id = 1") |> ignore
+            ok (b.Execute "INSERT INTO t VALUES (2, 'x')") |> ignore
+            ok (b.Commit()) |> ignore
+            ok (a.Commit()) |> ignore
+            Assert.Equal(2L, scalar a "SELECT COUNT(*) FROM t")
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t WHERE email = 'x'")
+            Assert.Equal(1L, scalar a "SELECT COUNT(*) FROM t WHERE email = 'y'")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
 let ``SessionPool: UNIQUE の NULL は接続間でも重複できる`` () =
     withPool "pool-unique-null" (fun pool ->
         let a = ok (pool.CreateSession())

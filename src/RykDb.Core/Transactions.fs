@@ -34,8 +34,10 @@ type internal Transaction =
         Buffers: Map<string, Map<byte array, SqlValue array option>>
         /// バッファの概算バイト数。
         ApproxBytes: int64
-        /// UNIQUE 索引値の論理予約キー。物理エントリは書かない。
-        Reservations: Set<string>
+        /// UNIQUE 索引値の論理予約キー → 参照カウント。
+        /// 物理エントリは書かない。
+        /// txn 内で値が消えたら解放し、最終状態に残る値だけを commit の競合検査へ入れる。
+        Reservations: Map<string, int>
         /// この transaction が保持できるバッファの上限。
         LimitBytes: int64
     }
@@ -56,7 +58,7 @@ module internal Transaction =
             Snapshot = snap
             Buffers = Map.empty
             ApproxBytes = 0L
-            Reservations = Set.empty
+            Reservations = Map.empty
             LimitBytes = DefaultLimitBytes
         }
 
@@ -158,16 +160,34 @@ module internal Transaction =
     let private uniqueReservationKey (indexName: string) (key: byte array) =
         conflictKey (ReservationKeyspacePrefix + indexName) key
 
-    /// UNIQUE 索引値の予約を記録する。
+    /// UNIQUE 予約 1件のヒープ上の概算サイズ。
+    let private reservationBytes (reservation: string) = int64 reservation.Length * 2L + 48L
+
+    /// UNIQUE 索引値の予約を記録する（同じ値は参照カウントでまとめる）。
     let reserveUnique (indexName: string) (key: byte array) (txn: Transaction) =
         let reservation = uniqueReservationKey indexName key
+        let count = txn.Reservations |> Map.tryFind reservation |> Option.defaultValue 0
 
-        if Set.contains reservation txn.Reservations then
-            txn
-        else
+        { txn with
+            Reservations = Map.add reservation (count + 1) txn.Reservations
+            ApproxBytes = txn.ApproxBytes + if count = 0 then reservationBytes reservation else 0L
+        }
+
+    /// UNIQUE 索引値の予約を 1件解放する。
+    /// 存在しない予約は無視する（コミット済み行の旧値を解放する場合など）。
+    let releaseUnique (indexName: string) (key: byte array) (txn: Transaction) =
+        let reservation = uniqueReservationKey indexName key
+
+        match txn.Reservations |> Map.tryFind reservation with
+        | None -> txn
+        | Some 1 ->
             { txn with
-                Reservations = Set.add reservation txn.Reservations
-                ApproxBytes = txn.ApproxBytes + int64 reservation.Length * 2L + 48L
+                Reservations = Map.remove reservation txn.Reservations
+                ApproxBytes = txn.ApproxBytes - reservationBytes reservation
+            }
+        | Some count ->
+            { txn with
+                Reservations = Map.add reservation (count - 1) txn.Reservations
             }
 
     /// 競合検出用に「(keyspace, キー)」を文字列 1本に畳んだ集合。
@@ -178,7 +198,7 @@ module internal Transaction =
             |> Seq.collect (fun (ks, m) -> m |> Map.keys |> Seq.map (conflictKey ks))
             |> Set.ofSeq
 
-        Set.union physical txn.Reservations
+        Set.union physical (txn.Reservations |> Map.keys |> Set.ofSeq)
 
     /// キーと値の組へ SeqNo を割り当てて Entry にする。
     [<TailCall>]
@@ -368,8 +388,8 @@ module internal TransactionManager =
                 lastCommitted
 
         txn.Reservations
-        |> Set.fold
-            (fun acc k ->
+        |> Map.fold
+            (fun acc k _ ->
                 match acc |> Map.tryFind k with
                 | Some old when old >= commitSeq -> acc
                 | _ -> Map.add k commitSeq acc)
@@ -412,7 +432,7 @@ module internal TransactionManager =
                 let batches, allocatedNext = Transaction.toEntries manager.NextSeqNo txn
 
                 let commitSeq =
-                    if Set.isEmpty txn.Reservations then
+                    if Map.isEmpty txn.Reservations then
                         allocatedNext - 1UL
                     else
                         max (allocatedNext - 1UL) (manager.LastCommitSeqNo + 1UL)
