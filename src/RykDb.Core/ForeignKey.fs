@@ -383,8 +383,39 @@ module internal ForeignKey =
                     return! anyRow (fun row -> DbOk(rowMatches check.ChildPositions values row)) op
         }
 
-    /// 親行を削除してよいか（RESTRICT）。
+    /// 親 1行を 1つの外部キー定義で検査する（RESTRICT）。
     /// 参照している子行があれば `ConstraintViolation`。
+    let private checkParentDeleteOne
+        (store: RowStore)
+        (visible: uint64 option)
+        (scope: ScanScope)
+        (txn: Transaction)
+        (schema: TableSchema)
+        (check: ParentDeleteCheck)
+        (row: SqlValue array)
+        =
+        result {
+            let! values = valuesAt check.ParentPositions row
+
+            if values |> Array.exists SqlValue.isNull then
+                return ()
+            else
+                let! exists = childRowExists store check values visible scope txn
+
+                if exists then
+                    return!
+                        sprintf
+                            "外部キー制約に違反: テーブル %s の行が %s(%s) を参照しています"
+                            check.Child.Name
+                            schema.Name
+                            (System.String.Join(", ", check.ParentColumns))
+                        |> DbError.constraintViolation
+                        |> err
+                else
+                    return ()
+        }
+
+    /// 親行を削除してよいか（RESTRICT）。
     /// `checks` は `prepareParentDeleteChecks` の結果（文単位で 1回だけ用意する）。
     let private checkParentDelete
         (store: RowStore)
@@ -396,34 +427,23 @@ module internal ForeignKey =
         (row: SqlValue array)
         =
         checks
-        |> List.map (fun check ->
-            result {
-                let! values = valuesAt check.ParentPositions row
-
-                if values |> Array.exists SqlValue.isNull then
-                    return ()
-                else
-                    let! exists = childRowExists store check values visible scope txn
-
-                    if exists then
-                        return!
-                            sprintf
-                                "外部キー制約に違反: テーブル %s の行が %s(%s) を参照しています"
-                                check.Child.Name
-                                schema.Name
-                                (System.String.Join(", ", check.ParentColumns))
-                            |> DbError.constraintViolation
-                            |> err
-                    else
-                        return ()
-            })
+        |> List.map (fun check -> checkParentDeleteOne store visible scope txn schema check row)
         |> all
         |> Result.map ignore
 
+    /// 親 DELETE を子索引の prefix lookup で検査する上限行数。
+    /// これを超えたら子の全走査1回へ切り替える
+    /// （索引が使えても lookup の本数が子の行数に近づくと負けるため）。
+    [<Literal>]
+    let private MaxParentLookups = 16
+
     /// 複数行の親 DELETE をまとめて検査する。
-    /// 子に索引が無い場合、行ごとの全走査を 1回にまとめるため、
-    /// 削除対象の親キーを集合にして子を 1回だけ走査する。
-    /// 単行は既存の `checkParentDelete`（索引プレフィックス + LIMIT 1）を使う。
+    /// <remarks>
+    /// 子を索引（または主キー）で引ける場合、行数が `MaxParentLookups` 以下なら
+    /// 1行ずつ lookup（prefix + LIMIT 1）する方が子全体を読むより安い。
+    /// 索引を持たない子や行数が多い場合は、削除対象の親キーを集合にして
+    /// 子を 1回だけ走査する。
+    /// </remarks>
     let checkParentDeletes
         (store: RowStore)
         (visible: uint64 option)
@@ -437,63 +457,72 @@ module internal ForeignKey =
         | rows ->
             checks
             |> List.map (fun check ->
-                result {
-                    let! keys =
-                        rows
-                        |> List.map (valuesAt check.ParentPositions)
-                        |> all
-                        |> Result.map (List.filter (fun values -> values |> Array.exists SqlValue.isNull |> not))
-                        |> Result.bind (List.map KeyBuilder.ofValues >> all)
-                        |> Result.map Set.ofList
+                if
+                    (check.Index.IsSome || check.PrimaryKeyMatches)
+                    && rows.Length <= MaxParentLookups
+                then
+                    rows
+                    |> List.map (fun row -> checkParentDeleteOne store visible scope txn schema check row)
+                    |> all
+                    |> Result.map ignore
+                else
+                    result {
+                        let! keys =
+                            rows
+                            |> List.map (valuesAt check.ParentPositions)
+                            |> all
+                            |> Result.map (List.filter (fun values -> values |> Array.exists SqlValue.isNull |> not))
+                            |> Result.bind (List.map KeyBuilder.ofValues >> all)
+                            |> Result.map Set.ofList
 
-                    if Set.isEmpty keys then
-                        return ()
-                    else
-                        let! op =
-                            match check.Index with
-                            | Some idx ->
-                                Dml.scanByIndexPrefixWithTxnMask
-                                    store
-                                    check.Child
-                                    idx
-                                    [||]
-                                    0
-                                    check.ScanMask
-                                    visible
-                                    (Some scope)
-                                    txn
-                            | None ->
-                                Dml.scanByPrimaryKeyWithTxnMask
-                                    store
-                                    check.Child
-                                    0
-                                    check.ScanMask
-                                    visible
-                                    (Some scope)
-                                    txn
-
-                        let! found =
-                            anyRow
-                                (fun row ->
-                                    match valuesAt check.ChildPositions row with
-                                    | Error e -> DbErr e
-                                    | Ok values ->
-                                        match KeyBuilder.ofValues values with
-                                        | Error e -> DbErr e
-                                        | Ok key -> DbOk(Set.contains key keys))
-                                op
-
-                        if found then
-                            return!
-                                sprintf
-                                    "外部キー制約に違反: テーブル %s の行が %s(%s) を参照しています"
-                                    check.Child.Name
-                                    schema.Name
-                                    (System.String.Join(", ", check.ParentColumns))
-                                |> DbError.constraintViolation
-                                |> err
-                        else
+                        if Set.isEmpty keys then
                             return ()
-                })
+                        else
+                            let! op =
+                                match check.Index with
+                                | Some idx ->
+                                    Dml.scanByIndexPrefixWithTxnMask
+                                        store
+                                        check.Child
+                                        idx
+                                        [||]
+                                        0
+                                        check.ScanMask
+                                        visible
+                                        (Some scope)
+                                        txn
+                                | None ->
+                                    Dml.scanByPrimaryKeyWithTxnMask
+                                        store
+                                        check.Child
+                                        0
+                                        check.ScanMask
+                                        visible
+                                        (Some scope)
+                                        txn
+
+                            let! found =
+                                anyRow
+                                    (fun row ->
+                                        match valuesAt check.ChildPositions row with
+                                        | Error e -> DbErr e
+                                        | Ok values ->
+                                            match KeyBuilder.ofValues values with
+                                            | Error e -> DbErr e
+                                            | Ok key -> DbOk(Set.contains key keys))
+                                    op
+
+                            if found then
+                                return!
+                                    sprintf
+                                        "外部キー制約に違反: テーブル %s の行が %s(%s) を参照しています"
+                                        check.Child.Name
+                                        schema.Name
+                                        (System.String.Join(", ", check.ParentColumns))
+                                    |> DbError.constraintViolation
+                                    |> err
+                            else
+                                return ()
+                    })
             |> all
             |> Result.map ignore

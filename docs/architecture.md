@@ -927,9 +927,10 @@ compactionはtombstoneを最下位レベルで回収する。
 後続行はまだ書かれていないので参照できない。
 子スキーマ、列位置、maskは文単位で1回だけ準備する（`ForeignKey.prepareChildChecks`）。
 
-親の`DELETE`が複数行に渡るときは、削除対象の親キーを集合にして子を1回だけ走査する
+親の`DELETE`が複数行に渡るときは、子を索引（または主キー）で引ける場合に限り
+親が 16行（`ForeignKey.MaxParentLookups`）以下なら 1行ずつ索引プレフィックス + `LIMIT 1` で検査する
 （`ForeignKey.checkParentDeletes`）。
-単行は索引プレフィックス + `LIMIT 1` の従来経路を使う。
+索引を持たない子や 16行超は、削除対象の親キーを集合にして子を1回だけ走査する。
 UNIQUE の更新後検査も、一致行を全件配列化せず先頭の更新対象外行で打ち切る。
 
 ---

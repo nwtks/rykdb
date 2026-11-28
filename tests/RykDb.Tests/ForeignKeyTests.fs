@@ -283,6 +283,62 @@ let ``ForeignKey.checkParentDeletes: 参照が無ければ複数行の親を削�
         Assert.Equal<int64>(0L, countOf db5 "p"))
 
 [<Fact>]
+let ``ForeignKey.checkParentDeletes: 行数が多くても索引付きの子の参照を検出する`` () =
+    withParentChild "fk-delete-batch-many" (fun db0 ->
+        let db1 = exec db0 "CREATE INDEX c_pid ON c (pid)"
+
+        let parentValues =
+            [ 1..20 ] |> List.map (fun i -> sprintf "(%d)" i) |> String.concat ", "
+
+        let db2 = exec db1 ("INSERT INTO p (id) VALUES " + parentValues)
+        let db3 = exec db2 "INSERT INTO c VALUES (10, 20)"
+
+        // 20行は MaxParentLookups を超えるので子の全走査 1回で検査する。
+        expectErrorKind ErrorKind.ConstraintViolation "バッチ検査が参照を見逃しました" (execSql db3 "DELETE FROM p WHERE id > 0")
+
+        Assert.Equal<int64>(20L, countOf db3 "p"))
+
+[<Fact>]
+let ``ForeignKey.checkParentDeletes: 少行の親 DELETE は子を全走査しない`` () =
+    // 子を索引で引ける場合、親が MaxParentLookups（16）以下なら 1行ずつ prefix lookup する。
+    // 全走査 1回へ戻すと、子の行数に比例して確保量が増える。
+    let allocateDelete (childRows: int) =
+        let mutable allocated = 0L
+
+        withSession (sprintf "fk-delete-lookup-%d" childRows) (fun db0 ->
+            let db1 = exec db0 "CREATE TABLE p (id INTEGER PRIMARY KEY)"
+
+            let db2 =
+                exec db1 "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id))"
+
+            let db3 = exec db2 "CREATE INDEX c_pid ON c (pid)"
+            let db4 = exec db3 "INSERT INTO p VALUES (1),(2),(3),(4),(5),(6),(7),(8)"
+
+            // 子は残す親 (5..8) だけを参照する（削除する 1..4 は参照しない）。
+            let childValues =
+                [ 1..childRows ]
+                |> List.map (fun i -> sprintf "(%d, %d)" (1000 + i) (5 + i % 4))
+                |> String.concat ", "
+
+            let db5 = exec db4 ("INSERT INTO c VALUES " + childValues)
+            let before = System.GC.GetAllocatedBytesForCurrentThread()
+            let db6, result = ok (execSql db5 "DELETE FROM p WHERE id <= 4")
+            allocated <- System.GC.GetAllocatedBytesForCurrentThread() - before
+            Assert.Equal<int>(4, result.RowsAffected)
+            Assert.Equal<int64>(4L, countOf db6 "p"))
+
+        allocated
+
+    let small = allocateDelete 20
+    let large = allocateDelete 2000
+
+    // 実測: lookup 経路は 20行 88KB / 2000行 96KB、全走査へ戻すと 2000行で 5.6MB。
+    Assert.True(
+        large - small < 300_000L,
+        sprintf "子 2000行で確保量が増えています（20行: %d バイト / 2000行: %d バイト）。子を全走査していませんか" small large
+    )
+
+[<Fact>]
 let ``ForeignKey: 参照されているテーブルは DROP できない`` () =
     withParentChild "fk-drop" (fun db0 ->
         expectErrorKind ErrorKind.ConstraintViolation "参照されている親を DROP できました" (execSql db0 "DROP TABLE p")

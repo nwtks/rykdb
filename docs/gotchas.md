@@ -340,6 +340,17 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
   `SqlReference: 同じ INSERT 文内の主キー重複はエラー` /
   `SqlReference: INSERT ... SELECT の生成行が主キー重複ならエラー`。
 
+### 3.27 親 DELETE の FK 検査を常に子の全走査にしない
+
+複数行の親 DELETE を常に「親キーの集合 + 子の全走査 1回」で検査すると、
+索引付きの子でも 2行の削除で子の索引全体を読む。
+
+- ✅ 子を索引（または主キー）で引けるなら、親が `ForeignKey.MaxParentLookups`（16）以下は
+  行ごとの prefix lookup + `LIMIT 1`。
+- ✅ 索引を持たない子と 16行超は従来どおり全走査 1回（行ごとの全走査を繰り返さない）。
+- 回帰: `ForeignKey.checkParentDeletes: 少行の親 DELETE は子を全走査しない`
+  （子 20行と 2000行の確保量差で経路を検査）。
+
 ---
 
 ## 4. LSM・WAL・MANIFEST

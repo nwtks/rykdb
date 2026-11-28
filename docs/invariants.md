@@ -788,6 +788,8 @@ DMLは即時RESTRICTを適用する。
 - `ForeignKey.checkParentDelete`をDELETEが呼ぶ。
   子スキーマ、列位置、maskの準備は`ForeignKey.prepareParentDeleteChecks`が文単位で1回だけ行う。
 - 子テーブルの探索は、外部キー列から始まる索引、子主キー、全走査の順で行う。
+- 複数行の親 DELETE は、索引（または主キー）で引ける子なら 16行以下は行ごとの lookup、
+  それ以外は親キーの集合 + 子の全走査 1回で検査する（結果は同じ）。
 - DROP TABLEは参照先を持つテーブルを拒否する。
 - DROP COLUMNは外部キーに使われる子・親の列を拒否する。
 - RENAME COLUMNは外部キー定義の列名を追随させる。
