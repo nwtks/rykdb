@@ -74,6 +74,9 @@ type QueryBenchmarks() =
     let constantCountSql = "SELECT COUNT(*) FROM t WHERE 1 = 1"
     let joinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id"
     let mergeJoinSql = "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id"
+    // 左を主キー 1行に絞るので右を主キーで引く（IndexNestedLoop(pk)）。
+    let indexNestedLoopSql =
+        "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id WHERE a.id = 10000"
 
     // 直積を含む疎な 4テーブル結合（結合順の DP で中間行数が変わる形）。
     let join4SparseSql =
@@ -341,6 +344,11 @@ type QueryBenchmarks() =
     /// 2テーブルの等値結合（主キー順の走査なのでマージ結合になる）。
     [<Benchmark>]
     member this.MergeJoin2Tables() = this.Exec mergeJoinSql
+
+    /// 左が主キー 1行の等値結合（右を主キーで引くインデックス入れ子ループ）。
+    /// 4つの結合アルゴリズムを同じデータで比べるための計測。
+    [<Benchmark>]
+    member this.IndexNestedLoop2Tables() = this.Exec indexNestedLoopSql
 
     /// 等値キー + residual の結合（左右の行を連結せずに ON を評価する経路）。
     [<Benchmark>]

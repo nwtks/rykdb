@@ -819,6 +819,7 @@ plan
 ```
 
 - 実測行数は `Scan` と `Join` だけに付く（他のノードは推定 `rows=` のみ）。
+- `IndexNestedLoop` は右部分木を実行しないため、右の `Scan` に `actual=` は付かない。
 - `LIMIT` などで途中終了した場合は、実際に取り出された行数になる。
 - 結果は materialize するが返さず、件数だけを `Execution` 行に出す。
   `SessionOptions` の結果上限は通常の `SELECT` と同じように効く。

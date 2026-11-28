@@ -306,8 +306,9 @@ dotnet run -c Release --project tools/RykDb.Bench -- --class query --quick --fil
   計画や実行の変更はこの3シナリオで確認する。
   `PointLookup` は計画が支配的なため、ストレージの変化が埋もれる。
 - `Insert100Rows`、`Insert10kRows`: INSERT のスループットを測定する。
-- `Join3Tables`、`MergeJoin2Tables`、`JoinWithResidual`、`NestedLoopNoMatch`:
+- `Join3Tables`、`MergeJoin2Tables`、`IndexNestedLoop2Tables`、`JoinWithResidual`、`NestedLoopNoMatch`:
   結合を測定する。
+  4つのアルゴリズム（Hash / Merge / INL / NL）を同じデータで比べられる。
 - `Join4TablesSparse`、`Join4TablesDense`:
   4テーブル結合の結合順を測定する。
   前者は直積を含む疎なグラフ、後者は全テーブルが結合述語で繋がる密なグラフ。

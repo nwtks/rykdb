@@ -4409,6 +4409,99 @@ let ``SqlReference: EXPLAIN ANALYZE は走査と結合の実測行数を返す``
         Assert.DoesNotContain("Execution:", plainText))
 
 [<Fact>]
+let ``SqlReference: EXPLAIN ANALYZE は4つの結合アルゴリズムで実測行数を返す`` () =
+    withSession "explain-analyze-algorithms" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db3 = exec db2 "INSERT INTO a VALUES (1,10),(2,20),(3,30)"
+        let db4 = exec db3 "INSERT INTO b VALUES (1,10),(2,25),(3,30)"
+
+        let linesOf db sql =
+            let _, plan = ok (execSql db ("EXPLAIN ANALYZE " + sql))
+
+            plan.Rows |> Array.map (fun row -> asText row.[0])
+
+        let joinLineOf (lines: string array) =
+            lines |> Array.find (fun line -> line.Contains "Join(INNER")
+
+        let check algorithm actual sql =
+            let lines = linesOf db4 sql
+            let joinLine = joinLineOf lines
+
+            Assert.Contains(sprintf "Join(INNER, %s," algorithm, joinLine)
+            Assert.EndsWith(sprintf "actual=%d" actual, joinLine)
+            Assert.StartsWith(sprintf "Execution: rows=%d " actual, lines.[lines.Length - 1])
+            lines
+
+        // 主キー同士の等値は両側が主キー順に走査できるのでマージ結合。
+        let mergeLines =
+            check "MergeJoin" 3 "SELECT a.id, b.id FROM a JOIN b ON a.id = b.id"
+
+        let mergeText = String.concat "\n" mergeLines
+        Assert.Contains("Scan(a, SeqScan) actual=3", mergeText)
+        Assert.Contains("Scan(b, SeqScan) actual=3", mergeText)
+
+        // 非主キーの等値はハッシュ結合（一致は 2行）。
+        let hashLines = check "HashJoin" 2 "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k"
+        Assert.Contains("Scan(a, SeqScan) actual=3", String.concat "\n" hashLines)
+
+        // 非等値の ON は入れ子ループ（a.k < b.k の一致は 4行）。
+        check "NestedLoop" 4 "SELECT a.id, b.id FROM a JOIN b ON a.k < b.k" |> ignore
+
+        // 左が 1行なら右を索引で引く。右部分木は実行しないので actual= が付かない。
+        let inlLines =
+            check "IndexNestedLoop(pk)" 1 "SELECT a.id, b.id FROM a JOIN b ON a.id = b.id WHERE a.id = 1"
+
+        let inlText = String.concat "\n" inlLines
+        Assert.Contains("Scan(a, PkLookup(1)) actual=1", inlText)
+        Assert.DoesNotContain("Scan(b, SeqScan) actual=", inlText))
+
+[<Fact>]
+let ``SqlReference: EXPLAIN の推定行数は EXPLAIN ANALYZE の実測と近い`` () =
+    // コスト較正の根拠: 統計ありの推定が実測から大きく外れないことを固定する。
+    withSession "explain-estimate-vs-actual" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db3 = exec db2 "INSERT INTO a VALUES (1,10),(2,20),(3,30)"
+        let db4 = exec db3 "INSERT INTO b VALUES (1,10),(2,25),(3,30)"
+        let db5 = exec db4 "ANALYZE"
+
+        let joinLineOf db prefix sql =
+            let _, plan = ok (execSql db (prefix + sql))
+
+            plan.Rows
+            |> Array.map (fun row -> asText row.[0])
+            |> Array.find (fun line -> line.Contains "Join(INNER")
+
+        let compare estimated actual sql =
+            let e = joinLineOf db5 "EXPLAIN " sql
+            let a = joinLineOf db5 "EXPLAIN ANALYZE " sql
+
+            Assert.Contains(estimated, e)
+            Assert.Contains(actual, a)
+            e, a
+
+        // 等値（NDV=3, 3行ずつ）: 推定 3行、実測 2行。
+        let hashEstimate, hashActual =
+            compare "rows=3" "actual=2" "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k"
+
+        Assert.Contains("HashJoin", hashEstimate)
+        Assert.Contains("HashJoin", hashActual)
+
+        // 非等値: 推定 3行、実測 4行（既定の選択性でも 2倍以内）。
+        let nlEstimate, nlActual =
+            compare "rows=3" "actual=4" "SELECT a.id, b.id FROM a JOIN b ON a.k < b.k"
+
+        Assert.Contains("NestedLoop", nlEstimate)
+        Assert.Contains("NestedLoop", nlActual)
+
+        // 主キー 1行の INL: 推定も実測も 1行。
+        let inlSql = "SELECT a.id, b.id FROM a JOIN b ON a.id = b.id WHERE a.id = 1"
+        let inlEstimate, inlActual = compare "rows=1" "actual=1" inlSql
+        Assert.Contains("IndexNestedLoop(pk)", inlEstimate)
+        Assert.Contains("IndexNestedLoop(pk)", inlActual))
+
+[<Fact>]
 let ``SqlReference: EXPLAIN は ANALYZE 以降の更新行数を示す`` () =
     // 統計は DML で自動更新しないので、推定が古いことを EXPLAIN で示す。
     // 数えるのはコミットした行数だけ（ROLLBACK した分は数えない）。

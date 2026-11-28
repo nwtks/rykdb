@@ -606,6 +606,16 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
   `Logical.Join` の右は結合の部分木も許容し、`Optimizer` は `outputOf` で
   部分木の出力スキーマを作業リストで求め、INL を無効化して実行する（bushy の土台）。
 
+コストの単位は時間ではなく行訪問数である。
+ハッシュは build 1.0・probe 1.0・出力行数に build 側の 0.1倍を加え、
+マージは両入力の走査と出力行数の和、INL は左行数 × probe 単価（一意 0.5 / 非一意 0.8）と出力行数で見積もる。
+係数は実測で較正する前提のヒューリスティックで、`EXPLAIN ANALYZE` の `actual=` が検証手段になる。
+回帰テスト `SqlReference: EXPLAIN の推定行数は EXPLAIN ANALYZE の実測と近い` が
+統計ありの推定と実測が 2倍以内に収まることを固定する。
+ベンチ（`--class query`）では左を主キー 1行に絞った INL が 37ms 程度で、
+同じデータのマージ結合が 293ms 程度（Dry・参考値）となり、小さい左での INL 優先は妥当だった。
+一方 DP と貪欲の実行差は Sparse / Dense で方向が一定せず、係数変更の根拠は得られなかったため据え置く。
+
 診断・A/B用に `ExecContext.JoinOrder`（`Dp` / `Greedy` / `Bushy`）で戦略を切り替えられる。
 `Session.PrepareSelectWith(JoinOrderStrategy.Greedy, stmt)` は貪欲計画を、
 `Bushy` は1段の分割計画を返し、結果はDPと同じになる（回帰テストで固定）。
