@@ -478,7 +478,10 @@ module internal ParserExpr =
         (k: Expr * PState -> Result<'r, DbError>)
         =
         match peek st with
-        | Token.Symbol "." -> fail "'.' の後ろには列名か '*' が必要です（修飾子は識別子にだけ付けられます）" st
+        | Token.Symbol "." ->
+            match left with
+            | Expr.Column { Qualifier = Some _ } -> fail "3部名（a.b.c）は未対応です（テーブル別名または列の別名を使ってください）" st
+            | _ -> fail "'.' の後ろには列名か '*' が必要です（修飾子は識別子にだけ付けられます）" st
         | _ ->
             match infixAt st with
             | Some(lbp, kind) when lbp >= minBp ->
@@ -589,22 +592,26 @@ module internal ParserExpr =
         | _ -> fail "式が必要ですが見つかりませんでした" st
 
     /// CASE 式。
+    /// 単純 CASE（`CASE 式 WHEN 値 THEN ...`）は未対応なので、式が来た時点で明示エラーにする。
     and private parseCaseC (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
         match expectKeyword "CASE" st with
         | Error e -> err e
         | Ok(_, st) ->
-            parseCaseBranchesC [] st (fun (branches, st) ->
-                if List.isEmpty branches then
-                    fail "CASE には WHEN 句が必要です" st
-                elif isKeyword "ELSE" st then
-                    parseExprC (advance st) (fun (elseE, st) ->
+            if isKeyword "WHEN" st || isKeyword "ELSE" st || isKeyword "END" st then
+                parseCaseBranchesC [] st (fun (branches, st) ->
+                    if List.isEmpty branches then
+                        fail "CASE には WHEN 句が必要です" st
+                    elif isKeyword "ELSE" st then
+                        parseExprC (advance st) (fun (elseE, st) ->
+                            match expectKeyword "END" st with
+                            | Error e -> err e
+                            | Ok(_, st) -> k (Expr.Case(branches, Some elseE), st))
+                    else
                         match expectKeyword "END" st with
                         | Error e -> err e
-                        | Ok(_, st) -> k (Expr.Case(branches, Some elseE), st))
-                else
-                    match expectKeyword "END" st with
-                    | Error e -> err e
-                    | Ok(_, st) -> k (Expr.Case(branches, None), st))
+                        | Ok(_, st) -> k (Expr.Case(branches, None), st))
+            else
+                fail "単純 CASE（CASE 式 WHEN ...）は未対応です（CASE WHEN 条件 THEN ... を使ってください）" st
 
     /// CASE の WHEN 節を読む。
     and [<TailCall>] private parseCaseBranchesC
@@ -647,6 +654,11 @@ module internal ParserExpr =
 
     /// 識別子の後ろ（列参照 / t.* / 関数呼び出し / CAST）。
     and [<TailCall>] private parseNamedPrimaryC (name: string) (st: PState) (k: Expr * PState -> Result<'r, DbError>) =
+        let quoted =
+            match peek st with
+            | Token.QuotedIdent _ -> true
+            | _ -> false
+
         let st = advance st
 
         if isSymbol "." st then
@@ -659,7 +671,7 @@ module internal ParserExpr =
                 | Error e -> err e
                 | Ok(c, st) -> k (Expr.Column { Qualifier = Some name; Name = c }, st)
         elif isSymbol "(" st then
-            if name.ToUpperInvariant() = "CAST" then
+            if not quoted && name.ToUpperInvariant() = "CAST" then
                 parseCastExprC st k
             else
                 parseCallBodyC name st k
@@ -709,6 +721,7 @@ module internal ParserExpr =
                     | Some _, Expr.QualifiedStar _ :: _ ->
                         fail (sprintf "%s に t.* は使えません（* を使えるのは COUNT(*) だけです）" upper) st
                     | Some agg, [ arg ] -> k (Expr.AggCall(agg, distinct, arg), st)
+                    | Some _, args -> fail (sprintf "%s の引数は 1個です（%d個渡されました）" upper args.Length) st
                     | _ -> k (Expr.FuncCall(upper, argList), st))
 
     /// 式の並びを読むループ。
@@ -772,16 +785,20 @@ module internal ParserExpr =
         | Ok(_, st) ->
             let distinct = isKeyword "DISTINCT" st
             let st = if distinct then advance st else st
-            let st = if isIdentName "ALL" st then advance st else st
 
-            parseSelectItemsC st (fun (items, st) ->
-                if isKeyword "FROM" st then
-                    parseSourceC (advance st) (fun (fromRef, st) ->
-                        parseSelectCoreTailC distinct items (Some fromRef) st k)
-                elif isKeyword "JOIN" st || isKeyword "INNER" st || isKeyword "LEFT" st then
-                    fail "JOIN には FROM が必要です" st
-                else
-                    parseSelectCoreTailC distinct items None st k)
+            if distinct && isIdentName "ALL" st then
+                fail "SELECT に DISTINCT と ALL は同時に書けません" st
+            else
+                let st = if isIdentName "ALL" st then advance st else st
+
+                parseSelectItemsC st (fun (items, st) ->
+                    if isKeyword "FROM" st then
+                        parseSourceC (advance st) (fun (fromRef, st) ->
+                            parseSelectCoreTailC distinct items (Some fromRef) st k)
+                    elif isKeyword "JOIN" st || isKeyword "INNER" st || isKeyword "LEFT" st then
+                        fail "JOIN には FROM が必要です" st
+                    else
+                        parseSelectCoreTailC distinct items None st k)
 
     /// `UNION ALL` の枝（0個以上）を読む。
     /// `UNION`（ALL なし）と `INTERSECT` / `EXCEPT` は未対応なので明示エラーにする。

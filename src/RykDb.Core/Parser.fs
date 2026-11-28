@@ -252,9 +252,12 @@ module internal Parser =
         elif isKeyword "UNIQUE" st then
             advance st |> columnConstraintLoop { c with Unique = true }
         elif isKeyword "DEFAULT" st then
-            match parseExprValue { advance st with InDefault = true } with
-            | Ok(e, st) -> columnConstraintLoop { c with Default = Some e } { st with InDefault = false }
-            | Error e -> err e
+            if c.Default.IsSome then
+                fail "DEFAULT は 1回だけ指定できます" st
+            else
+                match parseExprValue { advance st with InDefault = true } with
+                | Ok(e, st) -> columnConstraintLoop { c with Default = Some e } { st with InDefault = false }
+                | Error e -> err e
         elif isIdentName "REFERENCES" st then
             match advance st |> parseReferences with
             | Ok(r, st) -> columnConstraintLoop { c with References = Some r } st
@@ -766,5 +769,9 @@ module internal Parser =
             if st.Pos >= st.Tokens.Length - 1 then
                 return e
             else
-                return! err (DbError.create ErrorKind.SyntaxError "式の後に余分なトークンがあります")
+                return!
+                    { DbError.create ErrorKind.SyntaxError "式の後に余分なトークンがあります" with
+                        Position = Some st.Tokens.[st.Pos].Pos
+                    }
+                    |> err
         }

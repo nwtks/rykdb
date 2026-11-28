@@ -3779,6 +3779,25 @@ let ``SqlReference: 深いサブクエリの入れ子も実行できる`` () =
         Assert.Equal<int64>(10L, asInt rows.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: 引用した "cast" は CAST 構文として扱わない`` () =
+    // 引用識別子（`"cast"(...)`）は通常の関数呼び出しになる（関数 `CAST` は存在しない）。
+    withSession "quoted-cast" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)"
+        let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1,'2')")
+        expectMessage "未知のスカラー関数 'CAST' です" "SELECT \"cast\"(a) FROM t" db2
+
+        // 通常の CAST は動く。
+        let _, cast = ok (execSql db2 "SELECT CAST(a AS INTEGER) FROM t")
+        Assert.Equal<int64>(2L, asInt cast.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: ORDER BY の * は句に依存しないメッセージで拒否する`` () =
+    withSession "order-by-star" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1)")
+        expectMessage "'*' はここでは使えません" "SELECT id FROM t ORDER BY *" db2)
+
+[<Fact>]
 let ``SqlReference: 派生テーブル（FROM / JOIN）`` () =
     withSession "derived" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"

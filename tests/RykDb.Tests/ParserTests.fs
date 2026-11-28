@@ -504,6 +504,19 @@ let ``Parser: 文法エラーの諸形`` () =
         "DEFAULT の式が無い"
         (parseStatement "CREATE TABLE t (id INTEGER PRIMARY KEY, v DEFAULT)")
 
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "DEFAULT の重複"
+        (parseStatement "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 1 DEFAULT 2)")
+
+[<Fact>]
+let ``Parser.parseExpression: 余分なトークンのエラーに位置が付く`` () =
+    match Parser.parseExpression "1 2" with
+    | Ok _ -> Assert.Fail("エラーにならないはず")
+    | Error e ->
+        Assert.Equal<ErrorKind>(ErrorKind.SyntaxError, e.Kind)
+        Assert.True(e.Position.IsSome, sprintf "位置がありません: %A" e)
+
     expectErrorKind ErrorKind.SyntaxError "テーブル主キーの ( が無い" (parseStatement "CREATE TABLE t (a INTEGER, PRIMARY KEY a)")
     expectErrorKind ErrorKind.SyntaxError "テーブル主キーの KEY が無い" (parseStatement "CREATE TABLE t (a INTEGER, PRIMARY (a))")
     expectErrorKind ErrorKind.SyntaxError "主キー列の後に要素が無い" (parseStatement "CREATE TABLE t (a INTEGER, PRIMARY KEY (a,))")

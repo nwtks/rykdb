@@ -49,7 +49,8 @@ sort_key   ::= expr [ ASC | DESC ]
 explain    ::= EXPLAIN [ANALYZE] SELECT ...
 
 insert     ::= INSERT INTO ident [ "(" column_list ")" ]
-               ( VALUES row { "," row } | SELECT ... | DEFAULT VALUES )
+               ( VALUES row { "," row } | SELECT ... )
+             | INSERT INTO ident DEFAULT VALUES
 
 update     ::= UPDATE ident SET assignment { "," assignment } [ WHERE expr ]
 delete     ::= DELETE FROM ident [ WHERE expr ]
@@ -119,10 +120,14 @@ BEGIN   COMMIT  ROLLBACK PRIMARY KEY     UNIQUE  DEFAULT CASE    WHEN
 THEN    ELSE    END      EXISTS  IF      TRUE    FALSE
 ```
 
-予約語を別名として使う場合は原則として `AS`を付ける。
+予約語（`ORDER` など）を別名にするには、二重引用符の引用識別子を使う。
+`AS` を付けても予約語は識別子にならない（`SELECT 1 AS order` は `SyntaxError`）。
+予約語でない語は `AS` を付ければ別名にできる。
+`RIGHT` / `UNION` などは FROM / JOIN の表別名の位置で特別扱いされるため、`AS` が必要。
 
 ```sql
 SELECT 1 AS right FROM t AS union;
+SELECT 1 AS "order" FROM t;
 ```
 
 ### 記号と数値
@@ -506,6 +511,10 @@ FROM table_ref [ [AS] alias ]
 `ALL`は既定と同じで、重複を残す（`DISTINCT`の逆）。
 `ALL`は予約語ではないが、`SELECT`直後の `ALL`はこの綴りとして消費される
 （`ALL`という列名は `"ALL"`で参照する）。
+`DISTINCT` と `ALL` は同時に書けない（`SELECT DISTINCT ALL` は `SyntaxError`）。
+
+`GROUP BY`の整数リテラルは序数ではなく定数式になる（`GROUP BY 1`は全行を1グループにする）。
+序数を使えるのは`ORDER BY`だけ。
 
 `JOIN`は次の形式を受け付ける。
 
@@ -546,6 +555,8 @@ FROM → JOIN → WHERE → GROUP BY → 集約 → HAVING → ORDER BY
 
 `ORDER BY`、`GROUP BY`、`HAVING`では `SELECT`項目の別名を参照できる。
 入力に同名の列がある場合は列が優先される。
+入力で曖昧な名前（複数のテーブルに同名の列）は列として解決できないため、別名が優先される。
+`SELECT` の別名が重複した場合（`SELECT a AS x, b AS x`）はエラーにせず、後ろの項目の別名を優先する。
 
 ### 7.4 索引と走査
 
@@ -652,6 +663,9 @@ LEFT JOIN depts d ON p.dept_id = d.id;
 - `NULLS FIRST`、`NULLS LAST`は未対応。
 - 同値行の順序は保証しない。
 - 列参照、式、序数（1始まり）を指定できる。
+  序数として扱うのは **1以上の整数リテラル**だけ（`ORDER BY 2`）。
+  `ORDER BY 0` は範囲外エラー、`ORDER BY -1` / `ORDER BY 1.0` は序数ではなく定数式
+  （全行同値なので並び替えは起きない）。
 - 列参照の修飾子は実際のテーブル名・別名に一致する必要がある。
   存在しない修飾付きの列（`ORDER BY u.v` で `u` はあるが `u.v` が無い）を、
   裸の名前（別テーブルの `v`）に落として解決しない。
@@ -674,6 +688,7 @@ SELECT age / 10, COUNT(*) FROM people GROUP BY age / 10 ORDER BY age / 10;
 
 - 値は0以上の定数式である必要がある。
 - リテラル、パラメータ、定数式を受け付ける。
+  整数として評価される必要があり、`LIMIT 1.0` のような REAL / DECIMAL はエラーになる。
 - 負数、列参照、範囲外の値はエラーになる。
 - `OFFSET`単独、`LIMIT`単独を指定できる。
 - `OFFSET`を先に、次に `LIMIT`を適用する。
@@ -1007,7 +1022,9 @@ CREATE TABLE people (
 `CAST('NaN' AS REAL)` のような式で書けば保存できる。
 
 列名の重複、テーブルレベル制約の存在しない列、重複列はエラーになる。
-型を省略した列は `TEXT`になる。
+型を省略できるのは制約だけを書いた列（`name NOT NULL`）で、その場合は `TEXT` になる。
+型も制約もない列（`CREATE TABLE t (v)`）は型名が必要でエラーになる。
+同じ列に `DEFAULT` を 2回書くと `SyntaxError`。
 
 `IF NOT EXISTS`は`IF NOT EXISTS`の綴りだけを受理する。
 `IF EXISTS`は`SyntaxError`になる（`CREATE`と`DROP`の取り違えを防ぐ）。
@@ -1334,6 +1351,13 @@ autocommitの文（DML / DDL）も同じ理由で「適用済みだがエラー�
 | REAL の結果が無限大        | `数値演算の結果が表現可能な範囲を超えました` / `SUM の結果が REAL の範囲を超えました`             |
 | LATERAL                    | `LATERAL は未対応です（LATERAL JOIN は使えません。別名にする場合は AS を付けてください）`         |
 | カンマ結合                 | `カンマ結合は未対応です（JOIN ... ON を使ってください）`                                          |
+| 単純 CASE                  | `単純 CASE（CASE 式 WHEN ...）は未対応です（CASE WHEN 条件 THEN ... を使ってください）`           |
+| 集約の引数が 2 個以上      | `SUM の引数は 1 個です（2 個渡されました）`                                                       |
+| 引用した `"cast"`          | `未知のスカラー関数 'CAST' です`（引用識別子は CAST 構文にならない）                              |
+| 3 部名（`a.b.c`）          | `3 部名（a.b.c）は未対応です（テーブル別名または列の別名を使ってください）`                       |
+| ORDER BY の `*`            | `'*' はここでは使えません`                                                                        |
+| `DEFAULT` の重複           | `DEFAULT は 1 回だけ指定できます`                                                                 |
+| `DISTINCT ALL`             | `SELECT に DISTINCT と ALL は同時に書けません`                                                    |
 
 未対応の後置句は専用エラーにならず、文の区切りエラーとして報告される場合がある。
 `TEXT`値の変換エラーは、値を引用符付きで表示するため引用符が二重になる。
@@ -1348,7 +1372,10 @@ autocommitの文（DML / DDL）も同じ理由で「適用済みだがエラー�
 - 相関派生テーブル（LATERAL）
 - `UNION`、`INTERSECT`、`EXCEPT`
 - CTE、再帰クエリ
-- ウィンドウ関数
+- ウィンドウ関数、`FILTER`句
+- 単純 CASE（`CASE 式 WHEN 値 THEN ...`。`CASE WHEN 条件 THEN ...` を使う）
+- `CHECK`、`COLLATE`、`GENERATED`、`TABLESAMPLE`
+- `IS DISTINCT FROM`
 - `RIGHT JOIN`、`FULL JOIN`、`CROSS JOIN`
 - 自然結合、`JOIN ... USING`、カンマ結合
 - `ON CONFLICT`、upsert
@@ -1396,6 +1423,9 @@ autocommitの文（DML / DDL）も同じ理由で「適用済みだがエラー�
 - `NaN`と整数・decimalの比較、無限大とdecimalへの変換はエラーになる。
 - 有限の `REAL` から `NaN` / `±Infinity` を作る演算（`1e308 * 10` など）と、
   `SUM` / `AVG` の途中結果が `REAL` の範囲を超える場合は `ConstraintViolation` になる。
+- `1e999` のような REAL リテラルは `±Infinity` として受理する。
+  `DEFAULT` には使えない（非有限の REAL は保存できない）。
+  `1e-9999` のようなアンダーフローは `0.0` になる。
 - `-0.0`と `+0.0`は同じ値として扱う。主キーとUNIQUE索引も同じキーになる。
 
 ## 14. 例

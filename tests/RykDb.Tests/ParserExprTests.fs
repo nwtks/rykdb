@@ -267,6 +267,23 @@ let ``Parser: SELECT 各種`` () =
     Assert.Equal(1, selAll.Items.Length)
 
 [<Fact>]
+let ``Parser: 構文の診断（DISTINCT ALL・単純 CASE・集約の引数・3 部名）`` () =
+    let expectMessage (fragment: string) (sql: string) =
+        match parseStatement sql with
+        | Ok _ -> Assert.Fail(sprintf "エラーにならないはず: %s" sql)
+        | Error e -> Assert.Contains(fragment, DbError.toDisplayString e)
+
+    // 重複の扱いが矛盾するので拒否する。
+    expectMessage "DISTINCT と ALL は同時に書けません" "SELECT DISTINCT ALL a FROM t"
+    // 単純 CASE は未対応。WHEN を書いているのに「WHEN が必要」という誤った案内にしない。
+    expectMessage "単純 CASE" "SELECT CASE a WHEN 1 THEN 'x' END FROM t"
+    // 集約に 2 個以上渡したら、未知のスカラー関数ではなく引数個数のエラーにする。
+    expectMessage "SUM の引数は 1 個です" "SELECT SUM(a, b) FROM t"
+    expectMessage "COUNT の引数は 1 個です" "SELECT COUNT(DISTINCT a, b) FROM t"
+    // 3 部名は修飾を 1 段だけにする。
+    expectMessage "3 部名" "SELECT x.y.z FROM t AS x"
+
+[<Fact>]
 let ``Parser: サブクエリ（スカラー / IN / EXISTS）`` () =
     parseOneOk "SELECT (SELECT MAX(v) FROM t) FROM t" |> ignore
     parseOneOk "SELECT id FROM t WHERE id IN (SELECT id FROM t)" |> ignore

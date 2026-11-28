@@ -422,7 +422,7 @@ module internal Eval =
                     match valueAt row i e with
                     | DbErr er -> DbErr er
                     | DbOk v -> step resolve row kont (Arrive v)
-            | Expr.Star -> DbErr(DbError.create ErrorKind.SyntaxError "WHERE 句に '*' は置けません")
+            | Expr.Star -> DbErr(DbError.create ErrorKind.SyntaxError "'*' はここでは使えません")
             | Expr.QualifiedStar q -> DbErr(sprintf "'%s.*' はここでは使えません" q |> DbError.name)
             | Expr.Unary(op, x) -> step resolve row (KUnary op :: kont) (Descend x)
             | Expr.Binary(op, a, b) -> step resolve row (KBinaryL(op, b) :: kont) (Descend a)
