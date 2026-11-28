@@ -1077,6 +1077,12 @@ DDLの可否は`TransactionExists`で明示transactionの登録だけを見て�
 DDLはその完了を待ってから実行する（拒否しない）。
 GC境界は従来どおり種別を問わずすべての登録の最小snapshotを使う。
 
+SELECTのみのバッチは`DatabaseHost.AcquireReadSnapshot`がバッチのsnapshotも
+`Statement`種別で登録し、`Session.exitRead`まで維持する。
+文ごとの登録はその文の実行中しか無いため、文と文の間にcommit + compactionが入ると
+バッチ開始時の版がGCされ得る。
+バッチの登録も`Statement`種別なので、`RowReader`と同じくDDLはその完了を待つだけで拒否しない。
+
 排他中は新しい文とBEGINがブロックする。
 DDL完了後に始まるtransactionは必ず新しいカタログを見る。
 

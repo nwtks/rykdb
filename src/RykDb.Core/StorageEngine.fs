@@ -488,7 +488,9 @@ module internal StorageEngine =
                             }
 
                         Error(applied, e)
-                | ManifestApplyResult.NotApplied e
+                | ManifestApplyResult.NotApplied e ->
+                    FileMetaData.deleteObsolete engine.Dir [ meta ] |> ignore
+                    Error(bumped, e)
                 | ManifestApplyResult.Unknown e -> Error(bumped, e)
 
     /// flush を実行し、失敗を DB の診断欄へ残す。

@@ -119,6 +119,80 @@ let private withGatedSession (_tag: string) (f: Session -> EngineGates -> unit) 
         gates.ResumeWrites()
         session.Close() |> ignore
 
+/// 例外を投げるかどうかのフラグ（書き込みで差し替わる engine を跨いで共有する）。
+type private ThrowingGate() =
+    member val Armed = false with get, set
+
+/// 有効化すると読み取りで例外を投げるエンジン（例外経路の登録解除用）。
+type private ThrowingEngine(gate: ThrowingGate, inner: IStorageEngine) =
+    interface IStorageEngine with
+        member _.NextSeqNo = inner.NextSeqNo
+        member _.ActiveSnapshot = inner.ActiveSnapshot
+        member _.PublishedState = inner.PublishedState
+        member _.WalState = inner.WalState
+        member _.LastFlushError = inner.LastFlushError
+
+        member _.GetAtMasked key mask visible =
+            if gate.Armed then
+                failwith "test: engine read failure"
+
+            inner.GetAtMasked key mask visible
+
+        member _.ScanAtValues startKey limit visible needsValues =
+            if gate.Armed then
+                failwith "test: engine read failure"
+
+            inner.ScanAtValues startKey limit visible needsValues
+
+        member _.ScanAtMasked startKey limit mask visible =
+            if gate.Armed then
+                failwith "test: engine read failure"
+
+            inner.ScanAtMasked startKey limit mask visible
+
+        member _.WriteBatch entries =
+            inner.WriteBatch entries
+            |> Result.map (fun next -> ThrowingEngine(gate, next) :> IStorageEngine)
+
+        member _.WriteBatchDeferred entries =
+            inner.WriteBatchDeferred entries
+            |> Result.map (fun next -> ThrowingEngine(gate, next) :> IStorageEngine)
+
+        member _.WithNextSeqNo next =
+            ThrowingEngine(gate, inner.WithNextSeqNo next) :> IStorageEngine
+
+        member _.WithActiveSnapshot snapshot =
+            ThrowingEngine(gate, inner.WithActiveSnapshot snapshot) :> IStorageEngine
+
+        member _.WithHostState state =
+            ThrowingEngine(gate, inner.WithHostState state) :> IStorageEngine
+
+        member _.FlushIfNeeded allocate =
+            inner.FlushIfNeeded allocate
+            |> Result.map (fun (next, flushed) -> ThrowingEngine(gate, next) :> IStorageEngine, flushed)
+
+        member _.MaybeFlush() =
+            inner.MaybeFlush()
+            |> Result.map (fun (next, error) -> ThrowingEngine(gate, next) :> IStorageEngine, error)
+
+        member _.Close() = inner.Close()
+
+/// 例外を投げられるエンジンの上に host / session を組み立てる。
+let private withThrowingSession (_tag: string) (f: DatabaseHost -> Session -> ThrowingGate -> unit) =
+    let gate = ThrowingGate()
+    let root = "mem:" + System.Guid.NewGuid().ToString "N"
+
+    let store =
+        openStoreWith "" (ThrowingEngine(gate, memoryEngine ()) :> IStorageEngine)
+
+    let host = ok (DatabaseHost.OpenWithStore(root, store))
+    let session = Session.Create(host, SessionOptions.Default, true)
+
+    try
+        f host session gate
+    finally
+        session.Close() |> ignore
+
 /// ブロックして待つ処理は専用スレッドで動かす。
 /// スレッドプールが他のテストで飽和していても開始が遅れない。
 let private startDedicated (f: unit -> 'T) =
@@ -452,6 +526,27 @@ let ``Session: 並行読み取りは commit 済みの一貫した snapshot を�
 
         let finalCount = ok (session.Execute "SELECT COUNT(*) FROM t")
         Assert.Equal<int64>(int64 (batchSize * batches), asInt finalCount.Rows.[0].[0]))
+
+[<Fact>]
+let ``Session: 文の実行が例外で終わっても snapshot 登録は外れる`` () =
+    // 例外は Session の境界で InternalError になるが、登録解除は Engine の try/finally が担う。
+    // 残ると GC 境界が固定され、その root の版が捨てられなくなる。
+    withThrowingSession "session-throw-unregister" (fun host session gate ->
+        let runtime = host.Committed.Store.Runtime
+        let root = host.Committed.Root
+
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (session.Execute "INSERT INTO t VALUES (1), (2)") |> ignore
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
+
+        gate.Armed <- true
+        expectErrorKind ErrorKind.InternalError "例外は InternalError になる" (session.Execute "SELECT * FROM t")
+
+        gate.Armed <- false
+        Assert.True((runtime.OldestExcept(root, None)).IsNone)
+
+        // 登録が残っていると以降の DDL も詰まる（ここでは通ることまで見る）。
+        ok (session.Execute "CREATE INDEX ix ON t (id)") |> ignore)
 
 [<Fact>]
 let ``Session: 空 SQL は 0 行の結果を返す`` () =

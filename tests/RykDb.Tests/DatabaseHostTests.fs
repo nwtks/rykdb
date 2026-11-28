@@ -384,6 +384,26 @@ let ``DatabaseHost: active transaction は snapshot registry に登録され、c
         Assert.True((runtime.OldestExcept(root, None)).IsNone))
 
 [<Fact>]
+let ``DatabaseHost: AcquireReadSnapshot はバッチの snapshot を GC 境界に固定する`` () =
+    // 文ごとの登録は文の実行中しか無いため、文と文の間の境界はバッチの lease が担う。
+    withDbHost "reg-read-batch" (fun host session ->
+        let runtime = host.Committed.Store.Runtime
+        let root = host.Committed.Root
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+
+        let readState, readLease = ok (host.AcquireReadSnapshot())
+
+        try
+            let batchSnapshot = readState.Manager.LastCommitSeqNo
+            Assert.Equal<Option<uint64>>(Some batchSnapshot, runtime.OldestExcept(root, None))
+            // 読み取りは DDL を拒否しない（種別は Statement）。
+            Assert.False(runtime.TransactionExists(root, None))
+        finally
+            readLease.Dispose()
+
+        Assert.True((runtime.OldestExcept(root, None)).IsNone))
+
+[<Fact>]
 let ``DatabaseHost: DDL の可否は文を跨ぐ明示 transaction の登録だけで決まる`` () =
     withDbHost "reg-ddl-kind" (fun host _session ->
         let runtime = host.Committed.Store.Runtime

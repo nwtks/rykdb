@@ -90,6 +90,10 @@
 | INV-54 | 索引の等値検索は `[prefix, prefix ++ 0xFF)` で切り、NUL 継続値を除外する              | `KeyBuilder.equalityPrefixUpper` / `inEqualityPrefix`、`Dml.scanByIndexPrefixWithSlots`、KeyCodecTests、SqlReferenceTests |
 | INV-55 | 相関サブクエリへ渡す外側行はクエリ入力（FROM 順）へ詰め替える                         | `Optimizer.rowRemap` / `adaptCorrelated`、`Plan.substituteOuterGo`、SqlReferenceTests                                     |
 | INV-56 | IN サブクエリ式のキーは構文で決まり、集合インスタンスに依存しない                     | `Ast.SubqueryKey`、`Membership.Id`、`OpsShared.exprKey`、SqlReferenceTests                                                |
+| INV-57 | 集約呼び出しは集約を置ける位置でのみ評価し、0 行でも計画時に拒否する                  | `Eval.Prepared.FirstError`、`Eval.checkPrepared`、SqlReferenceTests                                                       |
+| INV-58 | 既定式はカタログへ保存後に再パースできる形だけを許す                                  | `EngineDdl.validateDefaultPersistable`、`Catalog.encodeStats` 系の直列化、SqlReferenceTests                               |
+| INV-59 | 派生テーブルは参照名（別名があれば別名）で引き当てる                                  | `Plan.registerSources`、`PlanBuilder.bindSource`、SqlReferenceTests                                                       |
+| INV-60 | SELECT のみのバッチは開始時の snapshot を登録して GC 境界に固定する                   | `DatabaseHost.AcquireReadSnapshot`、`Session.exitRead`、DatabaseHostTests                                                 |
 
 ---
 
@@ -1041,6 +1045,19 @@ WAL / MANIFEST / compaction 入力から最善努力で復旧する。
   `defaultArg r.Alias r.Name` で引く。
 - 別名なしの実表と派生の別名が同じ場合は、参照名の重複として先に `NameError` になる。
 - 回帰: `SqlReference: 派生テーブルの別名は実表名と衝突しない`。
+
+### INV-60: SELECT のみのバッチは開始時の snapshot を登録する
+
+読み取り専用バッチは開始時の committed 状態を固定して実行するが、
+文ごとの snapshot 登録はその文の実行中しか無い。
+文と文の間に commit + compaction が入ると GC 境界が前進し、
+後の文が開始 snapshot の版を見落とす。
+
+- `DatabaseHost.AcquireReadSnapshot` が `ActiveRegistrationKind.Statement` で登録し、
+  Version pin と同じ lease で `Session.exitRead` まで維持する。
+- 種別は`Statement`なのでDDLは拒否しない（共有ロックで文の完了を待つだけ）。
+- 例外で抜ける経路はSessionの`finally`がleaseを返す。
+- 回帰: `DatabaseHost: AcquireReadSnapshot はバッチの snapshot を GC 境界に固定する`。
 
 ---
 

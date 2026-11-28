@@ -376,17 +376,40 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
 
     /// 読み取り用の committed state と Version 全ファイルの pin を 1回で返す
     /// （返した lease を Dispose するまで GC から守る）。
+    /// <remarks>
+    /// バッチの snapshot も Statement 種別で登録する。
+    /// 文ごとの登録（`Engine`）はその文の実行中しか無いため、
+    /// 文と文の間に commit + compaction が入ると、
+    /// バッチ開始時に固定した snapshot の版が GC され得る。
+    /// 登録は Version の pin と同じ lease で解放する。
+    /// </remarks>
     member _.AcquireReadSnapshot() =
         match snapshot () with
         | HostLifecycle.Closed _ -> err (closedError ())
         | HostLifecycle.Running state ->
-            let store, lease = RowStore.acquireSnapshot state.Store
+            let store, versionLease = RowStore.acquireSnapshot state.Store
 
             let readState =
                 if obj.ReferenceEquals(store, state.Store) then
                     state
                 else
                     { state with Store = store }
+
+            let registration =
+                readState.Store.Runtime.Register(
+                    root,
+                    readState.Manager.LastCommitSeqNo,
+                    ActiveRegistrationKind.Statement
+                )
+
+            let registrationLease = RegistrationLease registration
+
+            let lease =
+                { new System.IDisposable with
+                    member _.Dispose() =
+                        registrationLease.Release()
+                        versionLease.Dispose()
+                }
 
             ret (readState, lease)
 

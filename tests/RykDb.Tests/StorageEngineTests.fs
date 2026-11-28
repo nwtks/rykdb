@@ -668,6 +668,34 @@ let ``StorageEngine.maybeFlush: MANIFEST ローテーション後の WAL 失敗�
         Assert.True((ok (StorageEngine.getAtMasked (intKey 2) [||] None reopened)).IsSome))
 
 [<Fact>]
+let ``StorageEngine.maybeFlush: MANIFEST へ追記できないときは flush の出力を残さない`` () =
+    withDir "flush-manifest-missing" (fun dir ->
+        let engine = ok (StorageEngine.openDatabaseWith (Some 1) dir)
+
+        let engine =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 1) 1UL (intRow 1) |] engine)
+
+        let engine, error = ok (StorageEngine.maybeFlush engine)
+        Assert.True error.IsNone
+        let sstsBefore = System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
+        Assert.Equal(1, sstsBefore.Length)
+
+        // MANIFEST を消すと追記は NotApplied になり flush は失敗する。
+        for manifest in System.IO.Directory.GetFiles(dir, "MANIFEST-*") do
+            System.IO.File.Delete manifest
+
+        let engine =
+            ok (StorageEngine.writeBatch [| Entry.put (intKey 2) 2UL (intRow 2) |] engine)
+
+        let engine, error = ok (StorageEngine.maybeFlush engine)
+        Assert.True error.IsSome
+        Assert.True engine.Runtime.LastFlushError.IsSome
+        // 参照されない出力は残さない（残すと失敗のたびに孤児が増える）。
+        Assert.Equal(sstsBefore.Length, System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension).Length)
+        // memtable は残っているので、障害を取り除けば次の flush で再試行できる。
+        Assert.False(Memtable.isEmpty engine.Mem))
+
+[<Fact>]
 let ``StorageEngine.openDatabaseWith: 孤児の SSTable は削除せず退避する`` () =
     withDir "re5" (fun dir ->
         withEngine dir (fun _ -> ())

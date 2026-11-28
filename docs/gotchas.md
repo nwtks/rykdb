@@ -913,6 +913,14 @@ closed状態を先に確定し、`readers`が0になるまで待ってからroll
 committed stateを取得してから別にpinすると、pinとGCの間に必要な版が消える。
 `AcquireReadSnapshot`でstateと全ファイルのleaseを一度に取得する。
 
+同じ理由で、バッチの snapshot は取得した瞬間に registry へ登録し、lease で解放する。
+文ごとの登録はその文の実行中しか無いため、文と文の間に commit + compaction が入ると
+バッチ開始時の版が GC され、後の文が古い行を見落とす。
+
+- ✅ `DatabaseHost.AcquireReadSnapshot` が `ActiveRegistrationKind.Statement` で登録し、
+  `Session.exitRead` が Version pin と一緒に解放する。
+- 回帰: `DatabaseHost: AcquireReadSnapshot はバッチの snapshot を GC 境界に固定する`。
+
 ### 8.5 TCP切断は接続ごとのtransactionだけrollbackする
 
 切断検知とrollbackは非同期になるため、テストでは完了を待つ。
@@ -970,7 +978,13 @@ closeはworker join後にWALとロックを解放する。
 想定外の例外が `readers` や lease の解放を跨ぐと、`Session.Close` が永久に待つ。
 `executeStatementsCore` が例外を `InternalError` へ変換し、
 `TryOpenReader` は lease を `finally` で返す。
-通常経路では例外は起きないため、既存の Session 並行・Close テストが退行の検出を担う。
+
+snapshot 登録の解除も `try/finally` で行う。
+例外で抜けたときに登録が残ると GC 境界が固定され、以後の版が捨てられなくなる。
+
+- ✅ `Engine.executeStatementWithLimits` / `Engine.openSelect` は登録を `try` の内側で行い、
+  `finally` で解除する。
+- 回帰: `Session: 文の実行が例外で終わっても snapshot 登録は外れる`。
 
 ---
 
