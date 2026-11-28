@@ -398,6 +398,8 @@ DMLの式は`Plan.resolveDmlExprWith`で同じ方法を使う。
 
 FROM/JOINのサブクエリは派生テーブルとして計画する。
 各枝は独立した入力スキーマと`ExecContext`で実行する。
+派生テーブルの引き当ては参照名（別名があれば別名）で行い、実表名とは独立させる。
+実表名で引くと、実表に別名を付けても同じ名前の派生の計画を使う。
 
 `UNION ALL`は枝ごとにSELECTを計画し、`Logical.UnionAll`として連結する。
 列数は全枝で一致させる。
@@ -425,6 +427,9 @@ JOINを使う場合はFROMが必要である。
 集約はSELECT項目、ORDER BY、HAVINGから検出する。
 GROUP BYがあるか集約呼び出しがある場合に`Aggregate`を作り、HAVINGがあればその上に`Having`を置く。
 ORDER BYは列参照、式、1始まりの序数を受け付ける。
+ORDER BYの列参照は実際の修飾子で解決する（存在しない修飾付きの列を裸の名前に落とさない）。
+集約を評価できない位置（`WHERE`・`JOIN ... ON`・`GROUP BY`・`UPDATE`の`SET`）に `AggCall`が現れたら、
+`Eval.prepare`が行を評価する前に`NameError`にする。
 
 単一テーブルで集約・DISTINCT・JOINがなく、走査が主キー順（`SeqScan` / `PkLookup` / `RangeScan`）で、
 ORDER BYの先頭が主キー全列の定義順・昇順と一致する場合は`Sort`を省略する。
@@ -782,6 +787,8 @@ run の k-way merge は開いた run を配列で持ち、選んだ run の先�
 深夜0時UTCのTIMESTAMP）を揃えてから符号化する。
 REALの丸めが絡む値はREALのまま残す（等値が推移的でなくなるのを避ける）。
 GROUP BYの出力値は先頭出現の元の値を使い、型とスケールを保つ。
+DISTINCT集約の退避runは「正規化キー」と「元の値」の2列を書き、
+再集計はキーで重複排除してから元の値を集計する（退避後もメモリと同じ等値になる）。
 
 比較述語の型も計画時に検査する。
 列の宣言型・リテラル・`Expr.Value`・`CAST`から型が決まる比較だけを見て、
@@ -1063,6 +1070,13 @@ DDLはDBごとの`RootRuntime`で排他する。
 
 排他中は新しい文とBEGINがブロックする。
 DDL完了後に始まるtransactionは必ず新しいカタログを見る。
+
+列の`DEFAULT`はカタログへ`Expr.toDisplayString`の文字列で保存し、
+再オープン時に`Parser.parseExpression`で復元する。
+表示が式として読み戻せない既定値（非有限`REAL`のリテラル）は
+`CREATE TABLE` / `ALTER TABLE ... ADD COLUMN`の時点で拒否する。
+`CAST('NaN' AS REAL)`のような式は表示も式なので保存できる。
+既定式の評価は従来どおり行を埋めるとき（INSERT / ALTER）に行う。
 
 ### 7.9 プロセス間排他
 

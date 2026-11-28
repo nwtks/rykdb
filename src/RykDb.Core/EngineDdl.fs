@@ -5,6 +5,32 @@
 namespace RykDb.Core
 
 module internal EngineDdl =
+    /// 既定値の式に、カタログへ保存できない非有限の REAL が含まれるか。
+    /// 既定式は表示文字列で保存するため、`Infinity` / `NaN` へ表示される値は
+    /// 再オープン後に式として読み戻せない（`CAST('NaN' AS REAL)` のような式は保存できる）。
+    let private hasNonFiniteRealDefault (col: ColumnDefinition) =
+        match col.Constraint.Default with
+        | None -> false
+        | Some d ->
+            Expr.fold
+                (fun found node ->
+                    found
+                    || match node with
+                       | Expr.Literal(Literal.Real f) -> not (System.Double.IsFinite f)
+                       | Expr.Value(SqlValue.Real f) -> not (System.Double.IsFinite f)
+                       | _ -> false)
+                false
+                d
+
+    /// 既定値が永続化できることを確かめる。
+    let private validateDefaultPersistable (col: ColumnDefinition) =
+        if hasNonFiniteRealDefault col then
+            sprintf "列 %s の DEFAULT に非有限の REAL は指定できません" col.Name
+            |> DbError.constraintViolation
+            |> err
+        else
+            ret ()
+
     /// CREATE TABLE 本体（排他は呼び出し側で取る）。
     let private createTableCore (c: CreateTable) (state: ExecState) =
         let existing = Catalog.findTable c.Name state.Catalog
@@ -15,6 +41,7 @@ module internal EngineDdl =
         | None, _ ->
             result {
                 do! Keyspace.validateName "テーブル" c.Name
+                do! c.Columns |> List.map validateDefaultPersistable |> all |> Result.map ignore
                 let! schema = TableSchema.ofCreateTable c
                 let! foreignKeys = ForeignKey.resolveCreatedTable state.Catalog schema c
 
@@ -469,6 +496,8 @@ module internal EngineDdl =
     /// ADD COLUMN の制約を検証する。
     let private validateAddedColumn (schema: TableSchema) (col: ColumnDefinition) =
         result {
+            do! validateDefaultPersistable col
+
             do!
                 if (TableSchema.indexOf schema col.Name).IsSome then
                     err (DbError.name (sprintf "列 %s は既に存在します" col.Name))

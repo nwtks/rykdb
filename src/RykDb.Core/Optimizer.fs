@@ -482,11 +482,19 @@ module internal Optimizer =
                 Tree = tree
             }
 
-        let entries =
-            scanNeedsLoop memo [] [ root ]
-            |> List.map (fun (key, mask) -> System.Collections.Generic.KeyValuePair<obj, bool array>(key, mask))
+        let entries = scanNeedsLoop memo [] [ root ]
 
-        System.Collections.Immutable.ImmutableDictionary.CreateRange<obj, bool array>(HashIdentity.Reference, entries)
+        let pairs =
+            (System.Collections.Generic.Dictionary<obj, bool array> HashIdentity.Reference, entries)
+            ||> List.fold (fun dict (key, mask) ->
+                match dict.TryGetValue key with
+                | true, existing -> dict.[key] <- Array.map2 (||) existing mask
+                | false, _ -> dict.[key] <- mask
+
+                dict)
+            |> Seq.map (fun kv -> System.Collections.Generic.KeyValuePair<obj, bool array>(kv.Key, kv.Value))
+
+        System.Collections.Immutable.ImmutableDictionary.CreateRange<obj, bool array>(HashIdentity.Reference, pairs)
 
     /// 集約ノードの GROUP BY 式を拾う。
     let private groupByOf (tree: Logical) =

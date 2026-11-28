@@ -38,6 +38,23 @@ let private plannedRows (text: string) =
 let private openDb (root: string) =
     ok (Session.OpenWithSync(root, SessionOptions.Default))
 
+/// 作業メモリを絞ったメモリ DB でテストする（DISTINCT 集約の退避経路）。
+let private withTightMemory (_tag: string) (f: Session -> unit) =
+    let root = "mem:" + System.Guid.NewGuid().ToString "N"
+    let store = openStoreWith "" (memoryEngine ())
+
+    let options =
+        { SessionOptions.Default with
+            WorkMemBytes = 2048L
+        }
+
+    let session = ok (Session.OpenWithStore(root, options, store))
+
+    try
+        f session
+    finally
+        ok (session.Close()) |> ignore
+
 /// テスト用のテーブルを用意する。
 let private seeded (tag: string) (f: Session -> unit) =
     withSession tag (fun db0 ->
@@ -178,6 +195,74 @@ let ``SqlReference: DEFAULT は列型へ暗黙変換される`` () =
             exec db2 "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 'oops')"
 
         expectErrorKind ErrorKind.TypeError "INTEGER 列の変換できない DEFAULT" (execSql db3 "INSERT INTO u (id) VALUES (1)"))
+
+[<Fact>]
+let ``SqlReference: DEFAULT は制約の順序に依存しない`` () =
+    // `DEFAULT 0 NOT NULL` の NOT を否定の述語として読み、構文エラーになっていた。
+    withSession "default-order" (fun db0 ->
+        let db1 =
+            exec
+                db0
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER DEFAULT 0 NOT NULL, y TEXT NOT NULL DEFAULT 'n')"
+
+        let db2, _ = ok (execSql db1 "INSERT INTO t (id) VALUES (1)")
+        let _, rows = ok (execSql db2 "SELECT x, y FROM t")
+        Assert.Equal<int64>(0L, asInt rows.Rows.[0].[0])
+        Assert.Equal<string>("n", asText rows.Rows.[0].[1])
+
+        // ALTER ... ADD の既定値でも同じ順序を受理する
+        let db3 = exec db2 "ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 5 NOT NULL"
+        let _, altered = ok (execSql db3 "SELECT z FROM t WHERE id = 1")
+        Assert.Equal<int64>(5L, asInt altered.Rows.[0].[0]))
+
+[<Fact>]
+let ``SqlReference: DEFAULT に非有限の REAL は指定できない`` () =
+    // 既定式はカタログへ表示文字列で保存するため、`Infinity` / `NaN` へ表示される
+    // リテラルは再オープン後に読み戻せない。
+    withSession "default-nonfinite" (fun db0 ->
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "DEFAULT 1e999"
+            (execSql db0 "CREATE TABLE d (id INTEGER PRIMARY KEY, x REAL DEFAULT 1e999)")
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "DEFAULT -1e999"
+            (execSql db0 "CREATE TABLE d (id INTEGER PRIMARY KEY, x REAL DEFAULT -1e999)")
+
+        let db1 = exec db0 "CREATE TABLE d (id INTEGER PRIMARY KEY, x REAL DEFAULT 1e10)"
+
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "ALTER の DEFAULT 1e999"
+            (execSql db1 "ALTER TABLE d ADD COLUMN y REAL DEFAULT 1e999"))
+
+[<Fact>]
+let ``SqlReference: 非有限 REAL でも式で書いた DEFAULT は再オープン後も使える`` () =
+    withDir "default-nonfinite-e2e" (fun dir ->
+        let db0 = openDb dir
+
+        let db1 =
+            exec db0 "CREATE TABLE d (id INTEGER PRIMARY KEY, x REAL DEFAULT CAST('NaN' AS REAL))"
+
+        let db2 = exec db1 "INSERT INTO d (id) VALUES (1)"
+        let _, first = ok (execSql db2 "SELECT x FROM d WHERE id = 1")
+
+        match first.Rows.[0].[0] with
+        | SqlValue.Real f -> Assert.True(System.Double.IsNaN f)
+        | other -> failwithf "REAL ではありません: %A" other
+
+        ok (db2.Close())
+
+        let db3 = openDb dir
+        let db4 = exec db3 "INSERT INTO d (id) VALUES (2)"
+        let _, second = ok (execSql db4 "SELECT x FROM d WHERE id = 2")
+
+        match second.Rows.[0].[0] with
+        | SqlValue.Real f -> Assert.True(System.Double.IsNaN f)
+        | other -> failwithf "REAL ではありません: %A" other
+
+        ok (db4.Close()))
 
 [<Fact>]
 let ``SqlReference: 複合索引の全列等値で行を引ける`` () =
@@ -1914,6 +1999,30 @@ let ``SqlReference: DISTINCT は DECIMAL のスケール違いを同じ値とみ
         Assert.Equal<int64>(2L, asInt counted.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: DISTINCT 集約は退避しても型の違う同じ値を 1つに数える`` () =
+    // 退避 run に元の値だけを書いていたため、Int 1 と DECIMAL 1.0 を別の値として数えていた。
+    withTightMemory "distinct-spill-types" (fun db ->
+        let db1 = exec db "CREATE TABLE t (i INTEGER PRIMARY KEY, v INTEGER)"
+
+        let values =
+            [ 1..100 ] |> List.map (fun i -> sprintf "(%d, %d)" i i) |> String.concat ","
+
+        let db2, _ = ok (execSql db1 (sprintf "INSERT INTO t VALUES %s, (101, 1)" values))
+
+        let _, rows =
+            ok (
+                execSql
+                    db2
+                    "SELECT COUNT(DISTINCT CASE WHEN i = 101 THEN CAST(1 AS DECIMAL) ELSE v END) AS c, SUM(DISTINCT CASE WHEN i = 101 THEN CAST(1 AS DECIMAL) ELSE v END) AS s FROM t"
+            )
+
+        Assert.Equal<int64>(100L, asInt rows.Rows.[0].[0])
+
+        match rows.Rows.[0].[1] with
+        | SqlValue.Decimal d -> Assert.Equal<decimal>(5050M, d)
+        | other -> failwithf "DECIMAL ではありません: %A" other)
+
+[<Fact>]
 let ``SqlReference: REAL の演算が無限大になる場合はエラー`` () =
     // 黙って Infinity を返すと、比較段階で初めて型エラーになる。
     withSession "real-overflow" (fun db0 ->
@@ -2934,6 +3043,44 @@ let ``SqlReference: ORDER BY の集約は SELECT に無くても並べ替えに�
         Assert.Equal<int64 array>([| 1L; 3L; 2L |], withSelect.Rows |> Array.map (fun r -> asInt r.[0])))
 
 [<Fact>]
+let ``SqlReference: ORDER BY の修飾列が無い場合は別の列で並べない`` () =
+    withSession "order-by-qualified" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "CREATE TABLE u (x INTEGER PRIMARY KEY)"
+        let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (1, 50), (2, 100)")
+        let db4, _ = ok (execSql db3 "INSERT INTO u VALUES (1)")
+
+        // u はあるが u.v は無い。裸の v（t.v）で並べない。
+        expectErrorKind
+            ErrorKind.NameError
+            "存在しない修飾列"
+            (execSql db4 "SELECT t.v FROM t JOIN u ON u.x = 1 ORDER BY u.v DESC")
+
+        // 別名を付けたテーブルを実名で修飾しても解決しない（§5）。
+        expectErrorKind ErrorKind.NameError "別名を実名で修飾" (execSql db4 "SELECT v FROM t AS x ORDER BY t.v DESC")
+
+        // 正しい修飾はそのまま使える。
+        let _, rows =
+            ok (execSql db4 "SELECT t.v FROM t JOIN u ON u.x = 1 ORDER BY t.v DESC")
+
+        Assert.Equal<int64 array>([| 100L; 50L |], rows.Rows |> Array.map (fun r -> asInt r.[0])))
+
+[<Fact>]
+let ``SqlReference: WHERE の集約は 0 行でも計画時にエラー`` () =
+    withSession "aggregate-in-where" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        // 空のテーブルでも黙って 0 行を返さない。
+        expectErrorKind ErrorKind.NameError "空表の WHERE 集約" (execSql db1 "SELECT * FROM t WHERE COUNT(*) > 0")
+
+        let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (1)")
+        expectErrorKind ErrorKind.NameError "非空表の WHERE 集約" (execSql db2 "SELECT * FROM t WHERE COUNT(*) > 0")
+
+        expectErrorKind
+            ErrorKind.NameError
+            "JOIN の ON の集約"
+            (execSql db2 "SELECT * FROM t AS a JOIN t AS b ON COUNT(*) > 0"))
+
+[<Fact>]
 let ``SqlReference: GROUP BY の IN サブクエリは集合ごとに別のキーになる`` () =
     // 式のキーが「左辺 + 否定」だけだと、内容の違う IN サブクエリが同じグループ列に
     // まとまり、SELECT の値が取り違えられていた。
@@ -3740,6 +3887,34 @@ let ``SqlReference: 派生テーブル（FROM / JOIN）`` () =
 
         // 自己参照（相関は未対応なので内側から外側の別名は見えない）
         expectErrorKind ErrorKind.NameError "派生テーブルの自己参照" (execSql db4 "SELECT * FROM (SELECT * FROM x) x"))
+
+[<Fact>]
+let ``SqlReference: 派生テーブルの別名は実表名と衝突しない`` () =
+    // 派生の引き当てを実表名で行っていたため、実表に別名を付けても派生の別名と衝突し、
+    // 同じ走査ノードが 2 回現れて InternalError になっていた。
+    withSession "derived-alias-real" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE foo (id INTEGER PRIMARY KEY, w INTEGER)"
+        let db2, _ = ok (execSql db1 "INSERT INTO foo VALUES (1, 100), (2, 200)")
+
+        // 派生の別名 foo と、実表 foo（別名 f）を同時に使える。
+        let _, rows =
+            ok (
+                execSql
+                    db2
+                    "SELECT foo.id, f.w FROM (SELECT id FROM foo WHERE id = 1) AS foo JOIN foo AS f ON f.id = foo.id"
+            )
+
+        Assert.Equal<int>(1, rows.Rows.Length)
+        Assert.Equal<int64>(1L, asInt rows.Rows.[0].[0])
+        Assert.Equal<int64>(100L, asInt rows.Rows.[0].[1])
+
+        // 存在しない列は InternalError ではなく NameError になる。
+        expectErrorKind
+            ErrorKind.NameError
+            "派生別名と実表名の衝突"
+            (execSql
+                db2
+                "SELECT d.id, f.w FROM (SELECT id FROM foo WHERE id = 1) AS foo JOIN foo AS f ON f.id = foo.id"))
 
 [<Fact>]
 let ``SqlReference: EXPLAIN は実行せずに計画を返す`` () =

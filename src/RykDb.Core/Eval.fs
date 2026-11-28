@@ -724,6 +724,9 @@ module internal Eval =
                         match node with
                         | Expr.Column c -> prepareAddColumn schema acc false c
                         | Expr.Name n -> prepareAddColumn schema acc true { Qualifier = None; Name = n }
+                        | Expr.AggCall(f, _, _) ->
+                            let err = sprintf "%s は集約なのでここでは評価できません" f.Name |> DbError.name
+                            fst acc, remember err (snd acc)
                         | _ -> acc)
                     acc
                     e)

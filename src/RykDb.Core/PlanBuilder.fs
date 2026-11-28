@@ -323,8 +323,10 @@ module internal PlanBuilder =
         | Some p -> ret (Logical.Filter(p, node))
 
     /// FROM / JOIN の 1テーブルを束縛する（派生テーブルは計画済みの計画を使う）。
+    /// 派生の引き当ては参照名（別名があれば別名）で行う
+    /// （実表名で引くと、別名付きの実表が他の派生の別名と衝突する）。
     let private bindSource (ctx: ExecContext) (derived: Map<string, PlannedQuery>) (r: TableRef) =
-        match derived |> Map.tryFind (r.Name.ToLowerInvariant()) with
+        match derived |> Map.tryFind ((defaultArg r.Alias r.Name).ToLowerInvariant()) with
         | Some plan -> ret (DerivedSource(r, plan))
         | None -> Analyzer.bindTable ctx r |> Result.map Base
 

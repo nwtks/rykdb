@@ -13,6 +13,9 @@ type internal PState =
         Tokens: TokenItem array
         Pos: int
         Parameters: SqlValue array
+        /// 列定義の `DEFAULT` 式を読んでいる途中か。
+        /// `NOT NULL` などの制約の開始で式を終えるために使う（`NOT IN` などは述語のまま）。
+        InDefault: bool
     }
 
 /// 式と SELECT のパーサ（文は `Parser`）。
@@ -401,6 +404,20 @@ module internal ParserExpr =
         | Token.Keyword "LIKE" -> Some(CompareBp, InfixKind.LikePredicate true)
         | _ -> Some(CompareBp, InfixKind.BadNot)
 
+    /// `NOT` の後ろが否定の述語（IN / BETWEEN / LIKE）か。
+    let private notStartsPredicate (st: PState) =
+        let next =
+            if st.Pos + 1 < st.Tokens.Length then
+                st.Tokens.[st.Pos + 1].Token
+            else
+                Token.Eos
+
+        match next with
+        | Token.Keyword "IN"
+        | Token.Keyword "BETWEEN"
+        | Token.Keyword "LIKE" -> true
+        | _ -> false
+
     /// キーワードトークンを中置演算子として解釈する。
     let private keywordInfix (st: PState) =
         function
@@ -410,7 +427,11 @@ module internal ParserExpr =
         | "IN" -> Some(CompareBp, InfixKind.InPredicate false)
         | "BETWEEN" -> Some(CompareBp, InfixKind.BetweenPredicate false)
         | "LIKE" -> Some(CompareBp, InfixKind.LikePredicate false)
-        | "NOT" -> notInfix st
+        | "NOT" ->
+            if st.InDefault && not (notStartsPredicate st) then
+                None
+            else
+                notInfix st
         | _ -> None
 
     /// 現在位置が中置演算子なら (左の結合強度, 種類) を返す。

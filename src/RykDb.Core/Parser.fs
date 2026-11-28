@@ -252,8 +252,8 @@ module internal Parser =
         elif isKeyword "UNIQUE" st then
             advance st |> columnConstraintLoop { c with Unique = true }
         elif isKeyword "DEFAULT" st then
-            match advance st |> parseExprValue with
-            | Ok(e, st) -> columnConstraintLoop { c with Default = Some e } st
+            match parseExprValue { advance st with InDefault = true } with
+            | Ok(e, st) -> columnConstraintLoop { c with Default = Some e } { st with InDefault = false }
             | Error e -> err e
         elif isIdentName "REFERENCES" st then
             match advance st |> parseReferences with
@@ -735,6 +735,7 @@ module internal Parser =
                     Tokens = tokens
                     Pos = 0
                     Parameters = parameters
+                    InDefault = false
                 }
 
     /// SQL テキストを 1文以上へ分解して AST にする。
@@ -757,6 +758,7 @@ module internal Parser =
                     Tokens = Array.ofList tokens
                     Pos = 0
                     Parameters = [||]
+                    InDefault = false
                 }
 
             let! e, st = parseExprValue st

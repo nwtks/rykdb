@@ -30,7 +30,8 @@ module internal OpsAggregate =
             Min: SqlValue option
             Max: SqlValue option
             /// DISTINCT の重複判定キー（`keyNormalize`）→ 最初に現れた元の値。
-            /// 退避時は元の値を書く（型・スケールを保って再集計する）。
+            /// 退避時は「キー」と「元の値」を別の列で書く
+            /// （再集計はキーで重複排除し、集計値には型・スケールを保った元の値を使う）。
             Seen: Map<SqlValue, SqlValue>
             SeenRuns: string list
         }
@@ -81,31 +82,35 @@ module internal OpsAggregate =
         else
             DbOk(a + b)
 
+    let private aggSpillEncode (v: SqlValue) =
+        ValueCodec.writeValues [| v |] Writer.Empty
+        |> Result.map (fun w -> SqlValue.Blob(Writer.toArray w))
+
     /// DISTINCT の見た値を退避ファイルへ流す。
+    /// 1行は「正規化キー」「元の値」の 2列。
+    /// キーで重複を判定するので、型・スケールの違う同じ値（`1` と `1.0`）も 1つに畳める。
     let private aggSpillSeen (budget: MemoryBudget) (acc: Acc) =
         let stamp = System.Guid.NewGuid().ToString "N"
 
-        let rows =
-            acc.Seen
-            |> Map.toList
-            |> List.map (fun (_, v) ->
-                ValueCodec.writeValues [| v |] Writer.Empty
-                |> Result.map (fun w -> [| SqlValue.Blob(Writer.toArray w) |]))
-            |> all
-
-        match rows with
-        | Error e -> DbErr e
-        | Ok rows ->
-            match Spill.writeChunk budget.Directory stamp 0 (List.toArray rows) with
+        acc.Seen
+        |> Map.toList
+        |> List.map (fun (k, v) ->
+            aggSpillEncode k
+            |> Result.bind (fun key -> aggSpillEncode v |> Result.map (fun value -> [| key; value |])))
+        |> all
+        |> function
             | Error e -> DbErr e
-            | Ok path ->
-                Spill.registerRun budget.Scope path
+            | Ok rows ->
+                match Spill.writeChunk budget.Directory stamp 0 (List.toArray rows) with
+                | Error e -> DbErr e
+                | Ok path ->
+                    Spill.registerRun budget.Scope path
 
-                DbOk
-                    { acc with
-                        Seen = Map.empty
-                        SeenRuns = path :: acc.SeenRuns
-                    }
+                    DbOk
+                        { acc with
+                            Seen = Map.empty
+                            SeenRuns = path :: acc.SeenRuns
+                        }
 
     /// SUM / AVG の 1値加算。
     /// REAL は非有限、INTEGER / DECIMAL は桁あふれを検査する。
@@ -303,22 +308,24 @@ module internal OpsAggregate =
     /// 空のバケットを作る。
     let private aggNewBucket = List.map (fun (f, _, _, _) -> aggEmptyAcc f)
 
-    /// 退避行の先頭バイト列を比較する。
+    /// 退避行のキー列（先頭）を比較する。
     let private aggCompareBlob (a: SqlValue array) (b: SqlValue array) =
         match a.[0], b.[0] with
         | SqlValue.Blob x, SqlValue.Blob y -> Bytes.compare x y
         | _ -> 0
 
     /// DISTINCT 集約の退避行を 1つのアキュムレータへ畳み込む再帰本体。
+    /// 同じ正規化キーの行は最初の 1行だけを使う
+    /// （複数の run に同じキーが現れても 1回だけ数える）。
     [<TailCall>]
     let rec private aggFoldDistinct (a: Acc) (previous: byte array option) (op: Op) =
         match Op.next op with
         | OpStep.OpError e -> DbErr e
         | OpStep.OpDone -> DbOk a
         | OpStep.OpRow(row, nxt) ->
-            match row.[0] with
-            | SqlValue.Blob bytes when previous <> Some bytes ->
-                match ValueCodec.readValues (Cursor.create bytes) with
+            match row.[0], row.[1] with
+            | SqlValue.Blob key, SqlValue.Blob value when previous <> Some key ->
+                match ValueCodec.readValues (Cursor.create value) with
                 | Error e -> DbErr e
                 | Ok(values, _) ->
                     let v = values.[0]
@@ -326,8 +333,8 @@ module internal OpsAggregate =
 
                     match aggAddValue a bump v Map.empty with
                     | DbErr e -> DbErr e
-                    | DbOk next -> aggFoldDistinct next (Some bytes) nxt
-            | SqlValue.Blob _ -> aggFoldDistinct a previous nxt
+                    | DbOk next -> aggFoldDistinct next (Some key) nxt
+            | SqlValue.Blob _, SqlValue.Blob _ -> aggFoldDistinct a previous nxt
             | _ -> DbErr(DbError.internalError "DISTINCT 集約の退避行が不正です")
 
     /// 退避済み DISTINCT 値をマージして確定させる。

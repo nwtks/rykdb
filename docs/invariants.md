@@ -593,9 +593,12 @@ SQL の等値は型・DECIMAL のスケール・DATE/TIMESTAMP を跨ぐため�
 - キーは `KeyBuilder.ofValues`（順序保持符号化）を使う。
 - `Ops.distinct` の重複キー、`Ops.aggregate` の退避グループキー、`OpsJoin.encodeKey` が対象。
 - `ValueCodec` はストレージの値符号化であり、DECIMAL のスケールを保存するためキーに使わない。
+- DISTINCT 集約の退避 run は「正規化キー」と「元の値」の 2列を書き、再集計はキーで重複排除する
+  （元の値だけで比較すると、退避後にだけ Int 1 と DECIMAL 1.0 を別の値として数える）。
 
 回帰テストは `SqlReference: DISTINCT は DECIMAL のスケール違いを同じ値とみなす` と
-`集約: 退避しても DECIMAL のスケール違いを同じグループにする` を検査する。
+`集約: 退避しても DECIMAL のスケール違いを同じグループにする` と
+`SqlReference: DISTINCT 集約は退避しても型の違う同じ値を 1つに数える` を検査する。
 
 ### INV-40: 有限の REAL から非有限値を作らない
 
@@ -996,6 +999,44 @@ WAL / MANIFEST / compaction 入力から最善努力で復旧する。
 - 相関`IN`の集合は外側行ごとに作るので、識別子は使わない。
 - 回帰: `SqlReference: GROUP BY の IN サブクエリは集合ごとに別のキーになる` /
   `SqlReference: GROUP BY の相関サブクエリ`（SyntaxError）。
+
+### INV-57: 集約呼び出しは集約を置ける位置でのみ評価する
+
+集約を評価できるのは集約ノードの上（SELECT 項目・HAVING・ORDER BY）だけ。
+`WHERE` / `JOIN ... ON` / `GROUP BY` / `UPDATE` の `SET` に書かれた `AggCall` は計画時に拒否する。
+行が 1行も無くてもエラーにする（評価時まで遅らせると、空のテーブルで黙って 0行を返す）。
+
+- `Eval.prepare` が `FirstError` に `AggCall` のエラーを載せ、
+  `checkPrepared` が行を 1つも評価する前に返す。
+- 集約後の式は計画時にスロット参照へ置き換わるので、残った `AggCall` だけが対象。
+- メッセージと種別は実行時と同じ（`COUNT は集約なのでここでは評価できません` / `NameError`）。
+- 回帰: `SqlReference: WHERE の集約は 0行でも計画時にエラー`。
+
+### INV-58: 既定式は保存後に再パースできる形にする
+
+`ColumnDefinition.Default` はカタログへ `Expr.toDisplayString` の文字列で保存し、
+再オープン時に `Parser.parseExpression` で復元する。
+表示が式として読み戻せない値は、永続化した時点で壊れる。
+
+- 非有限 `REAL` のリテラルは `Infinity` / `NaN` と表示され、式として復元できない。
+  `CREATE TABLE` / `ALTER TABLE ... ADD COLUMN` の `DEFAULT` では拒否する
+  （`EngineDdl.validateDefaultPersistable`）。
+- `CAST('NaN' AS REAL)` のような式は表示も式なので保存できる。
+- 既定式の評価は従来どおり INSERT / ALTER の行埋めのとき（CREATE では評価しない）。
+- 回帰: `SqlReference: DEFAULT に非有限の REAL は指定できない` /
+  `SqlReference: 非有限 REAL でも式で書いた DEFAULT は再オープン後も使える`。
+
+### INV-59: 派生テーブルは参照名で引き当てる
+
+派生テーブルの別名は参照名であり、実表名とは独立する。
+実表名で派生の計画を引くと、`FROM (…) AS foo JOIN foo AS f` で
+`foo AS f` まで派生の計画に置き換わり、存在しない列を読んだり
+同じ走査ノードが 2 回現れたりする。
+
+- `Plan.registerSources` と `PlanBuilder.bindSource` は
+  `defaultArg r.Alias r.Name` で引く。
+- 別名なしの実表と派生の別名が同じ場合は、参照名の重複として先に `NameError` になる。
+- 回帰: `SqlReference: 派生テーブルの別名は実表名と衝突しない`。
 
 ---
 

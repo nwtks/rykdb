@@ -53,18 +53,15 @@ module internal OpsSort =
         sortCheckLoop row reps plan
 
     /// ORDER BY 式を列位置へ解決する。
+    /// 修飾子の付いた参照を裸の名前に落とさない
+    /// （`ORDER BY u.v` で u はあるが u.v が無いときに、別テーブルの v で並べない）。
     let private sortResolveColumn (resolve: Prepared) (k: SortKey) =
         match Schema.tryAsColumnRef k.Expression with
         | None -> None
         | Some c ->
-            let bare = { Qualifier = None; Name = c.Name }
-
             match resolve.Resolve c with
             | Ok i -> Some(i, k.Direction)
-            | Error _ ->
-                match resolve.Resolve bare with
-                | Ok i -> Some(i, k.Direction)
-                | Error _ -> None
+            | Error _ -> None
 
     /// 評価したキー値を一時配列へ詰める再帰本体。
     [<TailCall>]
@@ -85,14 +82,9 @@ module internal OpsSort =
             match Schema.tryAsColumnRef k.Expression with
             | None -> None
             | Some c ->
-                let bare = { Qualifier = None; Name = c.Name }
-
                 match Schema.resolve c schema with
                 | Ok _ -> None
-                | Error _ ->
-                    match Schema.resolve bare schema with
-                    | Ok _ -> None
-                    | Error e -> Some e)
+                | Error e -> Some e)
 
     /// 列位置へ解決済みのキーでソートする。
     let private sortByColumns (budget: MemoryBudget) (plan: (int * SortDirection) list) (src: Op) =

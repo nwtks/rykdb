@@ -329,10 +329,12 @@ module internal Plan =
 
     /// 文の入力（FROM / JOIN）を実テーブルとして登録する。
     /// 派生テーブルはスキーマだけを連結する（カタログにも ctx.Schemas にも登録しない）。
+    /// 派生の引き当ては**参照名**（別名があれば別名）で行う。
+    /// 実表名で引くと、実表に別名を付けても他の派生の別名と衝突して別の計画を使う。
     let private registerSources (ctx: ExecContext) (derived: Map<string, PlannedQuery>) =
         foldOk
             (fun (c, acc) (r: TableRef) ->
-                match derived |> Map.tryFind (r.Name.ToLowerInvariant()) with
+                match derived |> Map.tryFind ((defaultArg r.Alias r.Name).ToLowerInvariant()) with
                 | Some plan -> ret (c, Schema.concat acc plan.Output)
                 | None ->
                     result {
