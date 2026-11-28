@@ -720,6 +720,9 @@ INSERT/UPDATE/DELETEは行を`Transaction`のバッファへ積み、commit時�
   代入対象に索引列が無い索引は検査しない。
   同一文で同じ値になる行は、値が変わらない行も含めた集合で検出する。
   全索引を1回走査する方式は、統計が無く小さい更新で大きい索引を読む退行を避けられないため採らない。
+  検査に使う文開始時のスロットは、代入対象の列を含むUNIQUE索引についてだけ1回変換し、
+  変更行ごとの`Transaction.slotsOf`（`Map.toList`＋再ソート）を呼ばない。
+  索引列を代入しないUPDATEではスロットを作らない。
 - UPDATEとDELETEは対象行を溜め込むメモリをtransactionの上限（`Transaction.LimitBytes`）へ計上する。
   DELETEはFKの親検査を1回にまとめるため候補を全件揃えてから消すので、収集の段階で上限を検査する。
   超過時は対象を書き込む前に`CapacityError`を返す。

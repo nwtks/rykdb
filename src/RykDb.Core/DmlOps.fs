@@ -15,16 +15,21 @@ module internal DmlOps =
             Added: Map<string, Map<byte array, SqlValue array>>
         }
 
+    /// UNIQUE 索引ごとの文開始時スロット（索引名 -> txn スロット）。
+    /// 行ごとに `Transaction.slotsOf`（`Map.toList` と `Bytes.compare` の再ソート）を
+    /// 呼ばないよう、文の開始時に 1回だけ変換して使い回す。
+    let private baseSlotsOf (ctx: ExecContext) (indexes: IndexSchema list) =
+        indexes
+        |> List.map (fun idx -> idx.Name, Transaction.slotsOf (Keyspace.index idx.Name) ctx.Txn)
+        |> Map.ofList
+
     /// 文の開始時にガードを作る
     /// （UNIQUE 索引ごとのスロットはここで 1回だけ変換する）。
     let private uniqueGuardOf (ctx: ExecContext) (accesses: Dml.IndexAccess list) =
         let unique = accesses |> List.filter _.Index.Unique
 
         {
-            BaseSlots =
-                unique
-                |> List.map (fun a -> a.Index.Name, Transaction.slotsOf (Keyspace.index a.Index.Name) ctx.Txn)
-                |> Map.ofList
+            BaseSlots = baseSlotsOf ctx (unique |> List.map _.Index)
             Added = unique |> List.map (fun a -> a.Index.Name, Map.empty) |> Map.ofList
         }
 
@@ -424,18 +429,19 @@ module internal DmlOps =
                 Ok true
 
     /// 更新後の UNIQUE 索引に他行が残っていないか検査する。
+    /// `slots` は文開始時に 1回だけ変換した transaction のスロット。
     let private checkExistingUpdated
         (ctx: ExecContext)
         (schema: TableSchema)
         (updatedPks: Set<SqlValue array>)
-        (txn: Transaction)
+        (slots: (byte array * SqlValue array option) list)
         (pkMask: bool array)
         (idx: IndexSchema)
         (values: SqlValue array)
         =
         result {
             let! scan =
-                Dml.scanByIndexPrefixWithTxnMask ctx.Store schema idx values 0 pkMask ctx.Visible (Some ctx.Scope) txn
+                Dml.scanByIndexPrefixWithSlots ctx.Store schema idx values 0 pkMask ctx.Visible (Some ctx.Scope) slots
 
             match existsOutsidePks schema updatedPks scan with
             | Error e -> return! err e
@@ -453,10 +459,11 @@ module internal DmlOps =
             KeyBuilder.ofValues values |> Result.map Some
 
     /// 1つの UNIQUE 索引について更新前後のキーを検査する。
+    /// `baseSlots` は文開始時の transaction スロット（索引名 -> スロット）。
     let private checkIndexUpdates
         (ctx: ExecContext)
         (schema: TableSchema)
-        (txn: Transaction)
+        (baseSlots: Map<string, (byte array * SqlValue array option) list>)
         (updatedPks: Set<SqlValue array>)
         (targetPositions: Set<int>)
         (pkMask: bool array)
@@ -488,22 +495,26 @@ module internal DmlOps =
                             })
                         (Set.empty, [])
 
-                return!
-                    changed
-                    |> List.fold
-                        (fun acc newRow ->
-                            acc
-                            >>= fun () ->
-                                let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
-                                checkExistingUpdated ctx schema updatedPks txn pkMask idx values)
-                        (ret ())
+                match Map.tryFind idx.Name baseSlots with
+                | None -> return! err (DbError.internalError (sprintf "UNIQUE 索引 %s の文開始スロットがありません" idx.Name))
+                | Some slots ->
+                    return!
+                        changed
+                        |> List.fold
+                            (fun acc newRow ->
+                                acc
+                                >>= fun () ->
+                                    let values = positions |> List.map (fun i -> newRow.[i]) |> List.toArray
+                                    checkExistingUpdated ctx schema updatedPks slots pkMask idx values)
+                            (ret ())
         }
 
     /// 更新される全 UNIQUE 索引をまとめて検査する。
+    /// `baseSlots` は更新対象の列を含む UNIQUE 索引の文開始スロット。
     let private validateUniqueUpdates
         (ctx: ExecContext)
         (schema: TableSchema)
-        (txn: Transaction)
+        (baseSlots: Map<string, (byte array * SqlValue array option) list>)
         (targets: int list)
         (updates: (SqlValue array * SqlValue array) list)
         =
@@ -519,7 +530,9 @@ module internal DmlOps =
 
         schema.Indexes
         |> List.filter _.Unique
-        |> foldOk (fun () idx -> checkIndexUpdates ctx schema txn updatedPks targetPositions pkMask updates idx) ()
+        |> foldOk
+            (fun () idx -> checkIndexUpdates ctx schema baseSlots updatedPks targetPositions pkMask updates idx)
+            ()
 
     /// UPDATE の対象行を走査して収集する（末尾再帰）。
     [<TailCall>]
@@ -604,6 +617,19 @@ module internal DmlOps =
             |> List.map (fun (name, _) -> TableSchema.requireIndexOf schema name)
             |> all
             >>= fun targets ->
+                let targetSet = Set.ofList targets
+
+                let uniqueSlots =
+                    schema.Indexes
+                    |> List.filter (fun idx ->
+                        idx.Unique
+                        && idx.Columns
+                           |> List.exists (fun name ->
+                               match TableSchema.indexOf schema name with
+                               | Some i -> Set.contains i targetSet
+                               | None -> false))
+                    |> baseSlotsOf ctx
+
                 result {
                     do! Eval.checkPrepared resolve
 
@@ -617,7 +643,7 @@ module internal DmlOps =
                     let! accesses = Dml.prepareIndexAccess schema
                     let! checks = ForeignKey.prepareChildChecks ctx.Catalog schema
                     let! updates = collectUpdates scan ctx schema resolve assignExprs where targets
-                    do! validateUniqueUpdates ctx schema ctx.Txn targets updates
+                    do! validateUniqueUpdates ctx schema uniqueSlots targets updates
 
                     let! txn2 =
                         updates

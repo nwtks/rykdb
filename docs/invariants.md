@@ -743,6 +743,8 @@ UNIQUE索引の物理キーは「索引値＋主キー」のため、
   文内で確定したキーは不変`Map`の`Added`へ積む。
   行ごとに`Transaction.slotsOf`を呼ばない。
   `Added`はcommit用の`Reservations`とは別で、文内の可視性だけを担う。
+- UPDATE文のUNIQUE検査も、代入対象の列を含む索引の文開始スロットを1回だけ変換して使い回す
+  （変更行ごとに`Transaction.slotsOf`を呼ばない）。
 - UNIQUE reservationは物理キーではないため、CREATE UNIQUE INDEXのbackfillは不要である。
 - DDLは排他の `RootRuntime` で実行し、文を跨ぐ明示 transaction の登録があれば拒否する
   （読み取り・暗黙 transaction の登録は種別が違い、排他ロックで完了を待つ）。

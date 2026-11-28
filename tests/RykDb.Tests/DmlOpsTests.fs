@@ -299,6 +299,65 @@ let ``DmlOps.update: UPDATE は WHERE に合う行だけを変える`` () =
         Assert.Equal<int64>(31L, asInt rows.[1].[2]))
 
 [<Fact>]
+let ``DmlOps.update: UNIQUE 検査は文開始時のスロットを 1回だけ変換する`` () =
+    // 行ごとに `Transaction.slotsOf`（Map.toList + Bytes.compare の再ソート）を
+    // 呼ぶ実装へ戻すと、索引列を更新する行数ぶんだけ txn スロットのソートが走る。
+    let schema =
+        { plainPeopleSchema with
+            Indexes =
+                [
+                    {
+                        Name = "ux_people_name"
+                        Columns = [ "name" ]
+                        Unique = true
+                    }
+                ]
+        }
+
+    withStore "upd-unique-slots" (fun store ->
+        let mgr = TransactionManager.create ()
+        let mgr, txn = TransactionManager.beginTxn mgr
+
+        let rows =
+            [ 1..40 ]
+            |> List.map (fun i ->
+                [
+                    Expr.Literal(Literal.Int(int64 i))
+                    Expr.Literal(Literal.String(sprintf "name%03d" i))
+                    Expr.Literal(Literal.Int(int64 i))
+                ])
+
+        let txn, _ = ok (DmlOps.insert (ctxOf store txn) schema None rows)
+        let mgr = commitInto store mgr txn
+        // transaction に大量の索引スロットを持たせる。
+        let _, txn2 = TransactionManager.beginTxn mgr
+
+        let txn2 =
+            [ 1..2000 ]
+            |> List.fold
+                (fun t i ->
+                    let key = ok (KeyBuilder.ofValues [ SqlValue.Text(sprintf "filler%04d" i) ])
+                    Transaction.put (Keyspace.index "ux_people_name") key [||] t)
+                txn2
+
+        let before = System.GC.GetAllocatedBytesForCurrentThread()
+
+        let _, n =
+            ok (
+                update
+                    (ctxOf store txn2)
+                    schema
+                    [
+                        ("name", Expr.Binary(BinaryOp.Concat, col "name", Expr.Literal(Literal.String "x")))
+                    ]
+                    None
+            )
+
+        let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before
+        Assert.Equal<int>(40, n)
+        Assert.True(allocated < 6_000_000L, sprintf "UNIQUE 検査の確保量が多すぎます（%d バイト）。行ごとに txn スロットを再ソートしていませんか" allocated))
+
+[<Fact>]
 let ``DmlOps.update: UPDATE 対象が transaction 上限を超えると CapacityError`` () =
     withStore "upd-limit" (fun store ->
         let mgr = seedPeople store (TransactionManager.create ())
