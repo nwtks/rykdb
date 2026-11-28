@@ -752,6 +752,10 @@ INSERT/UPDATE/DELETEは行を`Transaction`のバッファへ積み、commit時�
   （LIMITで残りを構築しない）。
   収容判定は `Op.toArrayLimited` で直接読み、収まらないときだけ再分割する
   （判定のために spool して捨てない）。
+  退避済みパーティションは書き出し時に記録した管理メモリ概算（`Spill.spoolBytes`）から、
+  読み切る前に再分割を決める（スキュー時の読み 2回を避ける）。
+  ハッシュ表は `ResizeArray` のバケットを 1段で構築し、probe 時にコピーしない
+  （`Op.ofResizeArray`）。
   左側はまずメモリ上の16バケットへ溜め、作業メモリに収まれば run を作らない
   （`hashPartitionLeft`）。
   溢れた時点で溜めた行を書き出して既存のディスク分割へ合流する。

@@ -15,6 +15,7 @@ src/RykDb.Core/ExtSort.fs|mergeRuns|mergeRuns|call
 src/RykDb.Core/Op.fs|append|append|call
 src/RykDb.Core/Op.fs|filterSeekMatch|filterSeekMatch|call
 src/RykDb.Core/Op.fs|map|map|call
+src/RykDb.Core/Op.fs|rowsFromResize|rowsFromResize|call
 src/RykDb.Core/Op.fs|rowsFrom|rowsFrom|call
 src/RykDb.Core/Op.fs|skip|skip|call
 src/RykDb.Core/Op.fs|take|take|call

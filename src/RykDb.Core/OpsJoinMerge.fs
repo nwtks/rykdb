@@ -203,7 +203,7 @@ module internal OpsJoinMerge =
                                 Spill.unlink path
                                 err e
                             | Ok() ->
-                                let spool = Spill.RowSpool.Disk([ path ], count)
+                                let spool = Spill.RowSpool.Disk([ path ], count, -1L)
                                 Spill.registerSpool budget.Scope spool
                                 ret (spool, next')
             | Error e -> err e

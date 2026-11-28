@@ -844,11 +844,16 @@ DP は実行されないアルゴリズムのコストで順序を決めてし�
 - マージ結合の候補は左が走査のときだけ（`PlanState.ScanInput`）。
   実行時は左部分木の `scanOrder` を使うため、結合を重ねた左では選ばれない。
 - 等値キーが 1本も無い辺だけなら入れ子ループとして見積もる。
+- INL の索引選択は `Analyzer.joinLookupFor`、マージのキー対応は
+  `Analyzer.mergeKeyOrderFor` を計画側・実行側の両方が呼ぶ（判定の二重実装を置かない）。
 - スピル量は `Analyzer.spilledBuildRows` を結合順のコストと `EXPLAIN` の
   `HashJoin(spill=…KB)` で共有する（表示とコストを食い違わせない）。
 - 回帰: `JoinOrder.selinger: 等値キーの無い辺は入れ子ループのコストで見積もる` /
   `JoinOrder.selinger: 右が走査でなければ INL のコストにしない` /
   `JoinOrder.selinger: マージ結合は左が走査のときだけ候補にする` /
+  `JoinOrder.selinger: 主キーと索引の両方があるとき主キーの INL コストを使う` /
+  `Analyzer.joinLookupFor: 主キーが被覆すれば prefix NDV の小さい索引より優先する` /
+  `Analyzer.mergeKeyOrderFor: 走査順の先頭が結合キーでなければマージしない` /
   `SqlReference: 型が違う等値は結合キーにせず入れ子ループになる`。
 
 ### INV-51: 実測行数の計測は `EXPLAIN ANALYZE` だけが有効にする

@@ -20,6 +20,8 @@ module internal Op =
     val compute: (unit -> OpStep) -> Op
     /// 配列を順に返す演算子。
     val ofArray: SqlValue array array -> Op
+    /// ResizeArray をコピーせず順に返す演算子。
+    val ofResizeArray: ResizeArray<SqlValue array> -> Op
     /// 1行取り出す。
     val next: Op -> OpStep
     /// ソースの次の 1行を引き出して継続に渡す。

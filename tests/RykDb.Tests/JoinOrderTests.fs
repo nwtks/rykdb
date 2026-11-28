@@ -266,3 +266,18 @@ let ``JoinOrder.selinger: 作業メモリを超えるとスピル分のコスト
     let spilled = Analyzer.spilledBuildRows 1000.0 32.0 1024.0
     let expected = unlimited.Cost + spilled * 2.0 + float Spill.Partitions * 8.0
     Assert.Equal(expected, (plan 1024.0).Cost, 3)
+
+[<Fact>]
+let ``JoinOrder.selinger: 主キーと索引の両方があるとき主キーの INL コストを使う`` () =
+    // 実行側は主キーを優先する。計画側も同じ判定を使わないと
+    // 「DP は索引のコストで選ぶが実行は主キー」という静かな不一致が起きる。
+    let edges = [ keyedEdge (Some 0.1) (Map.ofList [ "a", "k"; "b", "k" ]) ]
+    let indexes = [ index "__pk" [ "k" ] [] true; index "ix_k" [ "k" ] [ 1L ] false ]
+    let item = itemWith "b" 1000.0 2 indexes None
+
+    let plan =
+        expectSome "DP の計画" (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 edges [ item ] Map.empty)
+
+    // 主キー（一意）の probe 単価 0.5: 10 * 0.5 + 1000 = 1005。
+    // 索引（非一意）なら 10 * 0.8 + 1000 = 1008 になる。
+    Assert.Equal(1005.0, plan.Cost, 3)

@@ -95,7 +95,7 @@ let ``Spill.reopen: 手で作った run を読める`` () =
 
             Spill.closeSink sink
 
-        let spool = Spill.RowSpool.Disk([ path ], 3)
+        let spool = Spill.RowSpool.Disk([ path ], 3, -1L)
         Assert.True(Spill.isSpilled spool)
 
         let rows = ok (Op.toArray (ok (Spill.reopen None spool)))
@@ -228,4 +228,16 @@ let ``Spill.reopen: ScanScope の早期終了でファイルを消す`` () =
 
         // Engine の DisposeAll 相当: 開いた run を閉じて消す。
         scope.DisposeAll()
+        assertNoLeftovers dir)
+
+[<Fact>]
+let ``Spill.spool: 退避時に書き出しバイト数を記録する`` () =
+    // ハッシュ結合の再分割前判定はこの値で「読み切らずに再分割する」を決める。
+    withDir "spill-bytes" (fun dir ->
+        let spool =
+            ok (Spill.spool (tightBudget dir 1L) (Op.ofArray (rowsOf [ 1..200 ] |> Array.ofList)))
+
+        Assert.True(Spill.isSpilled spool)
+        Assert.True(Spill.spoolBytes spool > 0L)
+        Spill.deleteSpool spool
         assertNoLeftovers dir)

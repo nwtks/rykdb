@@ -71,6 +71,17 @@ module internal Op =
     /// 次の行は呼び出すたびに計算する。
     let ofArray (rows: SqlValue array array) = rowsFrom rows 0
 
+    /// ResizeArray の残りを順に返す（`ofArray` の走査）。
+    let rec private rowsFromResize (rows: ResizeArray<SqlValue array>) (i: int) =
+        if i >= rows.Count then
+            Empty
+        else
+            compute (fun () -> OpStep.OpRow(rows.[i], rowsFromResize rows (i + 1)))
+
+    /// ResizeArray をコピーせず順に返す演算子。
+    /// ハッシュ表のバケットのように、構築後に変更されない可変コレクションに使う。
+    let ofResizeArray (rows: ResizeArray<SqlValue array>) = rowsFromResize rows 0
+
     /// 1行取り出す。
     let next =
         function

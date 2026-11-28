@@ -194,22 +194,6 @@ module internal Analyzer =
     let private alignJoinKeysReorder (schema: Schema) (indices: int array) =
         alignJoinKeysPick schema indices [] [] >> Option.map List.toArray
 
-    /// 結合キーを走査順に並べ替える。
-    /// 走査順の先頭 `indices.Length` 列がちょうど結合キーであれば、その順のキー位置と列名を返す。
-    /// （キーでない列がキーの間に挟まると、その走査はキー順にならないので None）
-    let private alignJoinKeys (schema: Schema) (indices: int array) =
-        function
-        | None -> None
-        | Some [] -> Some(indices, [])
-        | Some names ->
-            if indices.Length > List.length names then
-                None
-            else
-                let prefix = List.truncate indices.Length names
-
-                alignJoinKeysReorder schema indices prefix
-                |> Option.map (fun reordered -> reordered, prefix)
-
     /// Filter を剥がしながら Scan と述語を探す。
     [<TailCall>]
     let rec private unwrapScanPreds (preds: Expr list) =
@@ -927,13 +911,45 @@ module internal Analyzer =
                     Residual = Predicate.joinConjuncts (List.rev residual)
                 }
 
-    /// キー列名の集合が列集合とちょうど一致するか。
-    let private joinCoversAll (keyNames: string array) (cols: string list) =
-        List.length cols = keyNames.Length
+    /// 右を引く方法の候補（計画と実行で共通の形）。
+    type internal JoinLookupCandidate =
+        {
+            Lookup: JoinLookup
+            Columns: string list
+            PrefixNDV: int64 list
+        }
+
+    let private joinLookupCovers (keyNames: string list) (cols: string list) =
+        List.length cols = List.length keyNames
         && cols
-           |> List.forall (fun c -> keyNames |> Array.exists (fun k -> Catalog.eqName c k))
+           |> List.forall (fun c -> keyNames |> List.exists (fun k -> Catalog.eqName c k))
         && keyNames
-           |> Array.forall (fun k -> cols |> List.exists (fun c -> Catalog.eqName c k))
+           |> List.forall (fun k -> cols |> List.exists (fun c -> Catalog.eqName c k))
+
+    let private joinLookupNdvOf (keyNames: string list) (c: JoinLookupCandidate) =
+        c.PrefixNDV
+        |> List.tryItem (List.length keyNames - 1)
+        |> Option.defaultValue System.Int64.MaxValue
+
+    /// 右を引く方法を選ぶ（主キー優先・索引は prefix NDV 最小）。
+    /// 計画側の `JoinOrder.bestIndexFor` と実行側の `chooseJoinAlgorithmWith` が同じ判定を使う。
+    let joinLookupFor (candidates: JoinLookupCandidate list) (keyNames: string list) =
+        match
+            candidates
+            |> List.tryFind (fun c -> c.Lookup = JoinLookup.PrimaryKey && joinLookupCovers keyNames c.Columns)
+        with
+        | Some pk -> Some(pk.Lookup, pk.Columns)
+        | None ->
+            candidates
+            |> List.choose (fun c ->
+                let prefix = List.truncate (List.length keyNames) c.Columns
+
+                if joinLookupCovers keyNames prefix then
+                    Some(joinLookupNdvOf keyNames c, c.Lookup, prefix)
+                else
+                    None)
+            |> List.sortBy (fun (ndv, _, _) -> ndv)
+            |> List.tryPick (fun (_, lookup, cols) -> Some(lookup, cols))
 
     /// 右キー列名から対応する左キー位置を引く。
     let private joinFindLeft (rightSchema: Schema) (keys: JoinKeys) (colName: string) =
@@ -950,18 +966,6 @@ module internal Analyzer =
         else
             None
 
-    /// 右テーブルの索引 prefix NDV を引く（無ければ最大値）。
-    let private joinIndexPrefixNdv
-        (statsOf: string -> TableStats option)
-        (rightName: string)
-        (keyNames: string array)
-        (indexName: string)
-        =
-        statsOf rightName
-        |> Option.bind (fun stats -> stats.Indexes |> List.tryFind (fun i -> Catalog.eqName i.Name indexName))
-        |> Option.bind (fun index -> index.PrefixNDV |> List.tryItem (keyNames.Length - 1))
-        |> Option.defaultValue System.Int64.MaxValue
-
     /// 右テーブルを引く方法（主キー優先・索引は prefix NDV 最小）を選ぶ。
     let private joinRightLookup
         (statsOf: string -> TableStats option)
@@ -971,62 +975,123 @@ module internal Analyzer =
         (keys: JoinKeys)
         =
         let keyNames =
-            keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
+            keys.RightIndices
+            |> Array.map (fun i -> rightSchema.Columns.[i].Name)
+            |> Array.toList
 
         let pkNames =
             rightTable.PrimaryKey |> List.map (fun i -> rightTable.Columns.[i].Name)
 
-        if List.isEmpty pkNames || not (joinCoversAll keyNames pkNames) then
-            None
-        else
-            joinLeftIndices rightSchema keys pkNames
-            |> Option.map (fun lefts -> JoinLookup.PrimaryKey, lefts)
-        |> Option.orElseWith (fun () ->
-            rightTable.Indexes
-            |> List.choose (fun idx ->
-                let prefix = List.truncate keyNames.Length idx.Columns
+        let candidates =
+            (if List.isEmpty pkNames then
+                 []
+             else
+                 [
+                     {
+                         Lookup = JoinLookup.PrimaryKey
+                         Columns = pkNames
+                         PrefixNDV = []
+                     }
+                 ])
+            @ (rightTable.Indexes
+               |> List.map (fun idx ->
+                   {
+                       Lookup = JoinLookup.Index idx.Name
+                       Columns = idx.Columns
+                       PrefixNDV =
+                           statsOf rightName
+                           |> Option.bind (fun stats ->
+                               stats.Indexes |> List.tryFind (fun i -> Catalog.eqName i.Name idx.Name))
+                           |> Option.map (fun i -> i.PrefixNDV)
+                           |> Option.defaultValue []
+                   }))
 
-                if joinCoversAll keyNames prefix then
-                    Some(joinIndexPrefixNdv statsOf rightName keyNames idx.Name, JoinLookup.Index idx.Name, prefix)
-                else
-                    None)
-            |> List.sortBy (fun (ndv, _, _) -> ndv)
-            |> List.tryPick (fun (_, lookup, cols) ->
-                joinLeftIndices rightSchema keys cols |> Option.map (fun lefts -> lookup, lefts)))
+        joinLookupFor candidates keyNames
+        |> Option.bind (fun (lookup, cols) ->
+            joinLeftIndices rightSchema keys cols |> Option.map (fun lefts -> lookup, lefts))
 
-    /// 他方のキー順に並んだ列名から、自側のキー位置を引く。
-    [<TailCall>]
-    let rec private joinOrderGo (otherKeyNames: string array) (ownIndices: int array) (acc: int list) =
-        function
-        | [] -> Some(List.rev acc |> List.toArray)
-        | n :: rest ->
-            match otherKeyNames |> Array.tryFindIndex (fun m -> SqlName.equal m n) with
-            | Some i -> joinOrderGo otherKeyNames ownIndices (ownIndices.[i] :: acc) rest
-            | None -> None
+    /// マージ結合のキー対応（両側の走査順の列名）。
+    type internal MergeKeyOrder =
+        {
+            LeftKeys: string list
+            RightKeys: string list
+        }
 
-    /// 走査順の列名を自側のキー位置へ並べ替える。
-    let private joinOrderBy (targetNames: string list) (otherKeyNames: string array) (ownIndices: int array) =
-        joinOrderGo otherKeyNames ownIndices [] targetNames
-
-    /// 左右のキー名が同じ対応で並んでいるか。
-    let private joinPairsAligned
-        (leftKeyNames: string array)
-        (rightKeyNames: string array)
-        (leftNames: string list)
-        (rightNames: string list)
+    /// 走査順と等値キー対からマージ結合のキー対応を求める。
+    /// 計画側の `JoinOrder.mergeKeyOrder` と実行側の `chooseJoinAlgorithmWith` が同じ判定を使う。
+    /// 片側が単一行走査（順序なし）なら、もう片側のキー順に合わせる。
+    let mergeKeyOrderFor
+        (leftOrder: string list option)
+        (rightOrder: string list option)
+        (keyPairs: (string * string) list)
         =
-        if
-            List.length leftNames <> List.length rightNames
-            || List.length leftNames <> leftKeyNames.Length
-        then
-            false
-        else
-            leftNames
-            |> List.mapi (fun j leftName ->
-                match leftKeyNames |> Array.tryFindIndex (fun n -> SqlName.equal n leftName) with
-                | Some i -> SqlName.equal rightKeyNames.[i] rightNames.[j]
-                | None -> false)
-            |> List.forall id
+        let n = List.length keyPairs
+
+        let pairForLeft l =
+            keyPairs |> List.tryFind (fun (kl, _) -> Catalog.eqName kl l)
+
+        let pairForRight r =
+            keyPairs |> List.tryFind (fun (_, kr) -> Catalog.eqName kr r)
+
+        match leftOrder, rightOrder with
+        | None, _
+        | _, None -> None
+        | Some [], Some [] ->
+            Some
+                {
+                    LeftKeys = keyPairs |> List.map fst
+                    RightKeys = keyPairs |> List.map snd
+                }
+        | Some [], Some rightNames ->
+            if List.length rightNames < n then
+                None
+            else
+                let prefix = List.truncate n rightNames
+                let pairs = prefix |> List.choose pairForRight
+
+                if List.length pairs = n then
+                    Some
+                        {
+                            LeftKeys = pairs |> List.map fst
+                            RightKeys = prefix
+                        }
+                else
+                    None
+        | Some leftNames, Some [] ->
+            if List.length leftNames < n then
+                None
+            else
+                let prefix = List.truncate n leftNames
+                let pairs = prefix |> List.choose pairForLeft
+
+                if List.length pairs = n then
+                    Some
+                        {
+                            LeftKeys = prefix
+                            RightKeys = pairs |> List.map snd
+                        }
+                else
+                    None
+        | Some leftNames, Some rightNames ->
+            if List.length leftNames < n || List.length rightNames < n then
+                None
+            else
+                let lp = List.truncate n leftNames
+                let rp = List.truncate n rightNames
+
+                let aligned =
+                    List.forall2
+                        (fun l r ->
+                            match pairForLeft l with
+                            | Some(_, kr) -> Catalog.eqName kr r
+                            | None -> false)
+                        lp
+                        rp
+
+                if aligned then
+                    Some { LeftKeys = lp; RightKeys = rp }
+                else
+                    None
 
     /// 両入力がキー順ならマージ結合用のキーへ整える。
     let private joinMergeKeys
@@ -1037,48 +1102,24 @@ module internal Analyzer =
         (rightSchema: Schema)
         (keys: JoinKeys)
         =
-        let leftOrder = scanOrder tableOf leftTree
-        let rightOrder = scanOrder tableOf rightTree
+        let keyPairs =
+            keys.LeftIndices
+            |> Array.mapi (fun i li -> leftSchema.Columns.[li].Name, rightSchema.Columns.[keys.RightIndices.[i]].Name)
+            |> Array.toList
 
-        match
-            alignJoinKeys leftSchema keys.LeftIndices leftOrder, alignJoinKeys rightSchema keys.RightIndices rightOrder
-        with
-        | Some(leftKeys, leftNames), Some(rightKeys, rightNames) ->
-            let leftKeyNames =
-                keys.LeftIndices |> Array.map (fun i -> leftSchema.Columns.[i].Name)
-
-            let rightKeyNames =
-                keys.RightIndices |> Array.map (fun i -> rightSchema.Columns.[i].Name)
-
-            match leftNames, rightNames with
-            | [], [] ->
+        mergeKeyOrderFor (scanOrder tableOf leftTree) (scanOrder tableOf rightTree) keyPairs
+        |> Option.bind (fun aligned ->
+            match
+                alignJoinKeysReorder leftSchema keys.LeftIndices aligned.LeftKeys,
+                alignJoinKeysReorder rightSchema keys.RightIndices aligned.RightKeys
+            with
+            | Some l, Some r ->
                 Some
                     { keys with
-                        LeftIndices = leftKeys
-                        RightIndices = rightKeys
+                        LeftIndices = l
+                        RightIndices = r
                     }
-            | _, [] ->
-                joinOrderBy leftNames leftKeyNames keys.RightIndices
-                |> Option.map (fun rk ->
-                    { keys with
-                        LeftIndices = leftKeys
-                        RightIndices = rk
-                    })
-            | [], _ ->
-                joinOrderBy rightNames rightKeyNames keys.LeftIndices
-                |> Option.map (fun lk ->
-                    { keys with
-                        LeftIndices = lk
-                        RightIndices = rightKeys
-                    })
-            | _ when joinPairsAligned leftKeyNames rightKeyNames leftNames rightNames ->
-                Some
-                    { keys with
-                        LeftIndices = leftKeys
-                        RightIndices = rightKeys
-                    }
-            | _ -> None
-        | _ -> None
+            | _ -> None)
 
     /// 結合アルゴリズムを選ぶ。
     /// - 等値キーなし: 入れ子ループ

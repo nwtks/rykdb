@@ -67,8 +67,6 @@ module internal JoinOrder =
         }
 
     /// 右テーブルを索引で引ける結合辺のうち、最も選択性の高い索引を選ぶ。
-    /// 結合キー全体が 1つの索引の prefix に収まる場合だけ INL にする
-    /// （実行時の `coversAll` / prefix NDV 最小の索引選択と同じ条件）。
     let private bestIndexFor (item: JoinOrderItem) (applicable: JoinOrderEdge list) =
         let keyColumns =
             applicable |> List.choose (fun edge -> edge.KeyColumns |> Map.tryFind item.Name)
@@ -76,28 +74,29 @@ module internal JoinOrder =
         if List.isEmpty keyColumns then
             None
         else
-            item.Indexes
-            |> List.choose (fun index ->
-                let prefix = List.truncate keyColumns.Length index.IndexColumns
+            let candidates =
+                item.Indexes
+                |> List.map (fun index ->
+                    let candidate: Analyzer.JoinLookupCandidate =
+                        {
+                            Lookup =
+                                if index.IndexName = "__pk" then
+                                    JoinLookup.PrimaryKey
+                                else
+                                    JoinLookup.Index index.IndexName
+                            Columns = index.IndexColumns
+                            PrefixNDV = index.PrefixNDV
+                        }
 
-                if
-                    List.length prefix = keyColumns.Length
-                    && prefix
-                       |> List.forall (fun c -> keyColumns |> List.exists (fun key -> SqlName.equal c key))
-                    && keyColumns
-                       |> List.forall (fun key -> prefix |> List.exists (fun c -> SqlName.equal c key))
-                then
-                    let ndv =
-                        index.PrefixNDV
-                        |> List.tryItem (keyColumns.Length - 1)
-                        |> Option.defaultValue System.Int64.MaxValue
+                    candidate)
 
-                    Some(ndv, index)
-                else
-                    None)
-            |> List.sortBy fst
-            |> List.tryHead
-            |> Option.map snd
+            Analyzer.joinLookupFor candidates keyColumns
+            |> Option.bind (fun (lookup, _) ->
+                item.Indexes
+                |> List.tryFind (fun index ->
+                    match lookup with
+                    | JoinLookup.PrimaryKey -> index.IndexName = "__pk"
+                    | JoinLookup.Index n -> Catalog.eqName index.IndexName n))
 
     /// まだ結合していないテーブルのうち、ON の参照先が揃っているか。
     let private eligible (dependencies: Map<string, Set<string>>) (joined: Set<string>) (name: string) =
@@ -165,46 +164,22 @@ module internal JoinOrder =
         =
         greedyGo dependencies edges initialRows initialJoined items []
 
-    /// 右の自然順と結合辺を照合して出力順を組み立てる。
-    [<TailCall>]
-    let rec private mergeKeyOrderLoop
-        (left: string list)
-        (right: string list)
-        (item: JoinOrderItem)
-        (applicable: JoinOrderEdge list)
-        (i: int)
-        (acc: string list)
-        =
-        if i >= List.length right then
-            Some(List.rev acc)
-        else
-            let rightColumn = right.[i]
-
-            match
-                applicable
-                |> List.tryFind (fun e -> e.KeyColumns |> Map.tryFind item.Name = Some rightColumn)
-            with
-            | None -> if i > 0 then Some(List.rev acc) else None
-            | Some edge ->
-                if
-                    i < List.length left
-                    && edge.KeyColumns
-                       |> Map.exists (fun name column -> name <> item.Name && SqlName.equal column left.[i])
-                then
-                    mergeKeyOrderLoop left right item applicable (i + 1) (left.[i] :: acc)
-                else
-                    None
-
     /// 両側の自然順が結合キーで揃っているときの、結合後の出力順。
-    /// 右の走査順の先頭から、結合辺がある限り一致した列名を返す。
     let private mergeKeyOrder (ordered: string list option) (item: JoinOrderItem) (applicable: JoinOrderEdge list) =
-        match ordered, item.NaturalOrder with
-        | Some left, Some right -> mergeKeyOrderLoop left right item applicable 0 []
-        | _ -> None
+        let keyPairs =
+            applicable
+            |> List.choose (fun e ->
+                e.KeyColumns
+                |> Map.tryFind item.Name
+                |> Option.bind (fun rightCol ->
+                    e.KeyColumns
+                    |> Map.tryPick (fun name col -> if name <> item.Name then Some(col, rightCol) else None)))
+
+        Analyzer.mergeKeyOrderFor ordered item.NaturalOrder keyPairs
+        |> Option.map (fun aligned -> aligned.LeftKeys)
 
     /// 1テーブル追加時の (コスト, 結合後の出力順) の候補。
     /// ハッシュ・INL・マージはそれぞれ出力順が違うので、すべて候補にする。
-    /// 実行時の `Analyzer.chooseJoinAlgorithmWith` と同じ条件で選ぶ。
     let private transitionVariants
         (rows: float)
         (rowBytes: float)

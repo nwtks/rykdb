@@ -1020,3 +1020,89 @@ let ``Analyzer.spilledBuildRows: 収まらなければはみ出した割合だ�
     Assert.Equal(0.0, Analyzer.spilledBuildRows 100.0 10.0 -1.0, 3)
     Assert.Equal(0.0, Analyzer.spilledBuildRows 10.0 10.0 1000.0, 3)
     Assert.Equal(50.0, Analyzer.spilledBuildRows 100.0 10.0 500.0, 3)
+
+[<Fact>]
+let ``Analyzer.joinLookupFor: 主キーが被覆すれば prefix NDV の小さい索引より優先する`` () =
+    // 実行側 (chooseJoinAlgorithmWith) と計画側 (JoinOrder.bestIndexFor) が同じ判定を使う。
+    let pk: Analyzer.JoinLookupCandidate =
+        {
+            Lookup = JoinLookup.PrimaryKey
+            Columns = [ "k" ]
+            PrefixNDV = []
+        }
+
+    let ix: Analyzer.JoinLookupCandidate =
+        {
+            Lookup = JoinLookup.Index "ix_k"
+            Columns = [ "k" ]
+            PrefixNDV = [ 1L ]
+        }
+
+    match Analyzer.joinLookupFor [ pk; ix ] [ "k" ] with
+    | Some(JoinLookup.PrimaryKey, [ "k" ]) -> ()
+    | other -> failActual "主キー" other
+
+[<Fact>]
+let ``Analyzer.joinLookupFor: 結合キーを被覆しない索引は候補にしない`` () =
+    let ix: Analyzer.JoinLookupCandidate =
+        {
+            Lookup = JoinLookup.Index "ix_ab"
+            Columns = [ "a"; "b" ]
+            PrefixNDV = [ 10L; 5L ]
+        }
+
+    Assert.True((Analyzer.joinLookupFor [ ix ] [ "b" ]).IsNone)
+
+[<Fact>]
+let ``Analyzer.joinLookupFor: prefix NDV が小さい索引を選ぶ`` () =
+    let large: Analyzer.JoinLookupCandidate =
+        {
+            Lookup = JoinLookup.Index "ix_large"
+            Columns = [ "k" ]
+            PrefixNDV = [ 100L ]
+        }
+
+    let small: Analyzer.JoinLookupCandidate =
+        {
+            Lookup = JoinLookup.Index "ix_small"
+            Columns = [ "k" ]
+            PrefixNDV = [ 2L ]
+        }
+
+    match Analyzer.joinLookupFor [ large; small ] [ "k" ] with
+    | Some(JoinLookup.Index "ix_small", _) -> ()
+    | other -> failActual "ix_small" other
+
+[<Fact>]
+let ``Analyzer.mergeKeyOrderFor: 走査順の先頭が結合キーなら対応を返す`` () =
+    let aligned =
+        Analyzer.mergeKeyOrderFor (Some [ "k"; "x" ]) (Some [ "k"; "y" ]) [ "k", "k" ]
+
+    let expected: Analyzer.MergeKeyOrder =
+        {
+            LeftKeys = [ "k" ]
+            RightKeys = [ "k" ]
+        }
+
+    Assert.Equal<Analyzer.MergeKeyOrder option>(Some expected, aligned)
+
+[<Fact>]
+let ``Analyzer.mergeKeyOrderFor: 走査順の先頭が結合キーでなければマージしない`` () =
+    // キーでない列が先頭にあると、その走査はキー順にならない。
+    Assert.True((Analyzer.mergeKeyOrderFor (Some [ "x"; "k" ]) (Some [ "k"; "y" ]) [ "k", "k" ]).IsNone)
+
+[<Fact>]
+let ``Analyzer.mergeKeyOrderFor: 片側が単一行走査ならもう片側のキー順に合わせる`` () =
+    let aligned = Analyzer.mergeKeyOrderFor (Some []) (Some [ "j"; "x" ]) [ "k", "j" ]
+
+    let expected: Analyzer.MergeKeyOrder =
+        {
+            LeftKeys = [ "k" ]
+            RightKeys = [ "j" ]
+        }
+
+    Assert.Equal<Analyzer.MergeKeyOrder option>(Some expected, aligned)
+
+[<Fact>]
+let ``Analyzer.mergeKeyOrderFor: 走査順が不明ならマージしない`` () =
+    Assert.True((Analyzer.mergeKeyOrderFor None (Some [ "k" ]) [ "k", "k" ]).IsNone)

@@ -423,3 +423,31 @@ let ``結合: ハッシュ結合のパーティションは早期終了でも残
         // Engine の早期終了（LIMIT / エラー）相当。
         scope.DisposeAll()
         assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: ハッシュ表のバケットは右入力の順序を保つ`` () =
+    // 1段構築でもバケット内の順序が変わらないことを固定する。
+    let rightSchema2 =
+        outSchema
+            [
+                outCol "a" (Some "r") (Some DataType.Integer)
+                outCol "b" (Some "r") (Some DataType.Integer)
+            ]
+
+    let left = Op.ofArray [| [| SqlValue.Int 1L |] |]
+
+    let right =
+        Op.ofArray
+            [|
+                [| SqlValue.Int 1L; SqlValue.Int 10L |]
+                [| SqlValue.Int 1L; SqlValue.Int 20L |]
+                [| SqlValue.Int 1L; SqlValue.Int 30L |]
+            |]
+
+    let rows =
+        ok (Op.toArray (ok (UnlimitedOpsJoin.innerJoinHash leftSchema left [| 0 |] rightSchema2 right [| 0 |] None)))
+
+    Assert.Equal<int>(3, rows.Length)
+    Assert.Equal<int64>(10L, asInt rows.[0].[2])
+    Assert.Equal<int64>(20L, asInt rows.[1].[2])
+    Assert.Equal<int64>(30L, asInt rows.[2].[2])

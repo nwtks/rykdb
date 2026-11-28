@@ -370,7 +370,7 @@ module internal OpsAggregate =
             | DbOk acc ->
                 let paths = acc.SeenRuns
 
-                match Spill.reopen budget.Scope (Spill.RowSpool.Disk(paths, 0)) with
+                match Spill.reopen budget.Scope (Spill.RowSpool.Disk(paths, 0, -1L)) with
                 | Error e ->
                     Spill.forget paths
                     paths |> List.iter (Spill.forgetRun budget.Scope)

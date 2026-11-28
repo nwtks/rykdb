@@ -381,8 +381,13 @@ module internal Spill =
     /// 書き込み口は構築時にすべて開く（本数は固定なので fd は有界）。
     [<Sealed>]
     type internal PartitionWriter internal (sinks: Sink array, paths: string array) =
+        let bytes = Array.zeroCreate<int64> sinks.Length
+
         /// パーティションのパスの並び。
         member _.Paths = paths
+
+        /// 各パーティションへ書き出した行の管理メモリ概算バイト数。
+        member _.BytesWritten = bytes
 
         /// 指定したパーティションへ 1行追記する。
         member _.Write(index: int, row: SqlValue array) =
@@ -390,6 +395,7 @@ module internal Spill =
                 DbError.internalError "Spill: パーティション番号が範囲外です" |> err
             else
                 writeRow row sinks.[index]
+                |> Result.map (fun () -> bytes.[index] <- bytes.[index] + int64 (ValueCodec.managedRowBytes row) + 32L)
 
         /// すべて閉じる（成功経路用。失敗は Result で返す）。
         member _.Close() = closeSinksResult sinks
@@ -519,7 +525,12 @@ module internal Spill =
                 match writer.Close() with
                 | Ok() ->
                     unlink path
-                    ret (writer.Paths |> Array.toList)
+
+                    ret (
+                        writer.Paths
+                        |> Array.mapi (fun i p -> p, writer.BytesWritten.[i])
+                        |> Array.toList
+                    )
                 | Error e ->
                     unlink path
                     writer.Paths |> Array.iter unlink
@@ -532,13 +543,20 @@ module internal Spill =
         /// メモリに収まっている行。
         | Memory of SqlValue array array
         /// run ファイルへ退避した行（パスの並びは入力順）。
-        | Disk of paths: string list * count: int
+        /// `bytes` は書き出し時の管理メモリ概算。会計しない経路は -1（不明）。
+        | Disk of paths: string list * count: int * bytes: int64
 
     /// 行数。
     let spoolCount =
         function
         | RowSpool.Memory rows -> rows.Length
-        | RowSpool.Disk(_, count) -> count
+        | RowSpool.Disk(_, count, _) -> count
+
+    /// 退避時の管理メモリ概算バイト数（メモリ spool は 0、不明な run は -1）。
+    let spoolBytes =
+        function
+        | RowSpool.Memory _ -> 0L
+        | RowSpool.Disk(_, _, bytes) -> bytes
 
     /// ディスクへ退避したか。
     let isSpilled =
@@ -550,13 +568,13 @@ module internal Spill =
     let deleteSpool =
         function
         | RowSpool.Memory _ -> ()
-        | RowSpool.Disk(paths, _) -> forget paths
+        | RowSpool.Disk(paths, _, _) -> forget paths
 
     /// 退避した spool を ScanScope に登録する。
     /// 早期終了でファイルを消すための後始末を一緒に登録する。
     let registerSpool (scope: ScanScope option) (spool: RowSpool) =
         match scope, spool with
-        | Some s, RowSpool.Disk(paths, _) ->
+        | Some s, RowSpool.Disk(paths, _, _) ->
             let cleanup =
                 { new System.IDisposable with
                     member _.Dispose() = forget paths
@@ -624,7 +642,7 @@ module internal Spill =
     let private reopenWith (deleteRun: bool) (scope: ScanScope option) =
         function
         | RowSpool.Memory rows -> ret (Op.ofArray rows)
-        | RowSpool.Disk(paths, _) -> ret (reopenOpenNext scope deleteRun paths)
+        | RowSpool.Disk(paths, _, _) -> ret (reopenOpenNext scope deleteRun paths)
 
     /// 退避した行を先頭から読む Op を作る。
     /// `scope` を渡すと、途中で捨てられても開いたファイルを閉じられる。
@@ -646,6 +664,7 @@ module internal Spill =
         (bufCount: int)
         (bufBytes: int64)
         (written: int)
+        (writtenBytes: int64)
         (serial: int)
         (paths: string list)
         (cur: Op)
@@ -658,13 +677,13 @@ module internal Spill =
             (if List.isEmpty paths then
                  ret (RowSpool.Memory(List.rev buf |> List.toArray))
              elif List.isEmpty buf then
-                 ret (RowSpool.Disk(List.rev paths, written))
+                 ret (RowSpool.Disk(List.rev paths, written, writtenBytes))
              else
                  match writeChunk budget.Directory stamp serial (List.rev buf |> List.toArray) with
                  | Error e ->
                      forget paths
                      err e
-                 | Ok last -> ret (RowSpool.Disk(List.rev (last :: paths), written + bufCount)))
+                 | Ok last -> ret (RowSpool.Disk(List.rev (last :: paths), written + bufCount, writtenBytes + bufBytes)))
             |> Result.map (fun spool ->
                 registerSpool budget.Scope spool
                 spool)
@@ -677,14 +696,34 @@ module internal Spill =
                     forget paths
                     err e
                 | Ok p ->
-                    spoolLoop budget stamp [] 0 0L (written + bufCount) (serial + 1) (p :: paths) (Op.emit row nxt)
+                    spoolLoop
+                        budget
+                        stamp
+                        []
+                        0
+                        0L
+                        (written + bufCount)
+                        (writtenBytes + bufBytes)
+                        (serial + 1)
+                        (p :: paths)
+                        (Op.emit row nxt)
             else
-                spoolLoop budget stamp (row :: buf) (bufCount + 1) (bufBytes + size) written serial paths nxt
+                spoolLoop
+                    budget
+                    stamp
+                    (row :: buf)
+                    (bufCount + 1)
+                    (bufBytes + size)
+                    written
+                    writtenBytes
+                    serial
+                    paths
+                    nxt
 
     /// Op をスプールへ書き出す（読み直しで何度でも列挙できる）。
     let spool (budget: MemoryBudget) (src: Op) =
         let stamp = System.Guid.NewGuid().ToString "N"
-        spoolLoop budget stamp [] 0 0L 0 0 [] src
+        spoolLoop budget stamp [] 0 0L 0 0L 0 [] src
 
     /// パーティションを分割し直す深さの上限。
     /// ここに達したら上限を無視して畳む（メモリは best effort。失敗はさせない）。
@@ -838,7 +877,7 @@ module internal Spill =
 
                         let children =
                             subs
-                            |> List.mapi (fun i sub ->
+                            |> List.mapi (fun i (sub, _) ->
                                 let carried = byPartition |> Map.tryFind i |> Option.defaultValue []
                                 depth + 1, carried, sub)
 

@@ -8,6 +8,9 @@ open OpsJoinShared
 open OpsJoinMerge
 
 module internal OpsJoinHash =
+    /// ハッシュ表（キー → 一致行）。1段構築のため ResizeArray をそのまま保持する。
+    type private HashTable = System.Collections.Generic.Dictionary<byte array, ResizeArray<SqlValue array>>
+
     /// 左行を右幅まで NULL で埋める。
     let private joinPadded (rightWidth: int) (lrow: SqlValue array) = padWithNulls lrow rightWidth
 
@@ -140,22 +143,21 @@ module internal OpsJoinHash =
         joinProbeLoop isLeft leftKeys rightWidth resolve residual keyFor lookupRows left
 
     /// ハッシュ表の 1バケットへ行を追加する。
-    let private hashAdd
-        (buckets: System.Collections.Generic.Dictionary<byte array, SqlValue array list>)
-        (key: byte array)
-        (rrow: SqlValue array)
-        =
-        match buckets.TryGetValue key with
-        | true, bucket -> buckets.[key] <- rrow :: bucket
-        | _ -> buckets.[key] <- [ rrow ]
+    let private hashAdd (table: HashTable) (key: byte array) (rrow: SqlValue array) =
+        match table.TryGetValue key with
+        | true, bucket -> bucket.Add rrow
+        | _ ->
+            let bucket = ResizeArray<SqlValue array>()
+            bucket.Add rrow
+            table.[key] <- bucket
 
     /// 右側のハッシュ表を作る（NULL キーは登録しない）。
     /// キーは順序保持符号化のバイト列（`encodeKey`）なので、
     /// `SqlValue` の構造的等価と SQL の比較が食い違う値（NaN など）も正しく一致する。
     /// バケットは右入力の順序を保つ（マージ結合と同じ出力順にするため）。
     let private buildHashTable (rightRows: SqlValue array array) (rightKeys: int array) =
-        let buckets =
-            System.Collections.Generic.Dictionary<byte array, SqlValue array list> HashIdentity.Structural
+        let table =
+            System.Collections.Generic.Dictionary<byte array, ResizeArray<SqlValue array>> HashIdentity.Structural
 
         rightRows
         |> foldOk
@@ -166,32 +168,22 @@ module internal OpsJoinHash =
                     match encodeKey rrow rightKeys with
                     | Error e -> err e
                     | Ok key ->
-                        hashAdd buckets key rrow
+                        hashAdd table key rrow
                         OkUnit)
             ()
-        >>= fun () ->
-            let table =
-                System.Collections.Generic.Dictionary<byte array, SqlValue array array> HashIdentity.Structural
-
-            for kv in buckets do
-                table.[kv.Key] <- kv.Value |> List.rev |> List.toArray
-
-            ret table
+        |> Result.map (fun () -> table)
 
     /// ハッシュ表からキーの行を引く。
-    let private lookupHash
-        (table: System.Collections.Generic.Dictionary<byte array, SqlValue array array>)
-        (key: byte array)
-        =
+    let private lookupHash (table: HashTable) (key: byte array) =
         match table.TryGetValue key with
-        | true, bucket -> ret (Op.ofArray bucket)
+        | true, bucket -> ret (Op.ofResizeArray bucket)
         | _ -> ret Op.Empty
 
     /// 左 build 版ハッシュ結合の probe（右行を 1つずつ進める）。
     let rec private buildLeftProbe
         (right: Op)
         (rightKeys: int array)
-        (table: System.Collections.Generic.Dictionary<byte array, SqlValue array array>)
+        (table: HashTable)
         (resolve: Prepared)
         (residual: Expr option)
         (cur: Op)
@@ -213,7 +205,7 @@ module internal OpsJoinHash =
     and private buildLeftEmit
         (right: Op)
         (rightKeys: int array)
-        (table: System.Collections.Generic.Dictionary<byte array, SqlValue array array>)
+        (table: HashTable)
         (resolve: Prepared)
         (residual: Expr option)
         (rrow: SqlValue array)
@@ -242,7 +234,7 @@ module internal OpsJoinHash =
         (right: Op)
         (rightKeys: int array)
         (residual: Expr option)
-        (table: System.Collections.Generic.Dictionary<byte array, SqlValue array array>)
+        (table: HashTable)
         =
         let resolve =
             Eval.prepare (Schema.concat leftSchema rightSchema) (residualExprs residual)
@@ -308,7 +300,8 @@ module internal OpsJoinHash =
                     err e
                 | Ok() ->
                     writer.Paths
-                    |> Array.map (fun p -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0)))
+                    |> Array.mapi (fun i p ->
+                        hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0, writer.BytesWritten.[i])))
                     |> ret
 
     [<TailCall>]
@@ -362,7 +355,11 @@ module internal OpsJoinHash =
                                     err e
                                 | Ok() ->
                                     writer.Paths
-                                    |> Array.map (fun p -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0)))
+                                    |> Array.mapi (fun i p ->
+                                        hashRegister
+                                            budget
+                                            spools
+                                            (Spill.RowSpool.Disk([ p ], 0, writer.BytesWritten.[i])))
                                     |> ret
                 else
                     let p = Spill.partitionOfKey 0UL key
@@ -411,7 +408,7 @@ module internal OpsJoinHash =
         | Spill.RowSpool.Memory rows ->
             let buckets = Array.init Spill.Partitions (fun _ -> [])
             splitMemory salt keys buckets (rows |> Array.toList)
-        | Spill.RowSpool.Disk([ path ], _) ->
+        | Spill.RowSpool.Disk([ path ], _, _) ->
             let callStamp = System.Guid.NewGuid().ToString "N"
 
             Spill.repartitionRun
@@ -423,7 +420,7 @@ module internal OpsJoinHash =
                 (hashKeyBytes keys)
                 path
             |> Result.map (
-                List.map (fun p -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0)))
+                List.map (fun (p, bytes) -> hashRegister budget spools (Spill.RowSpool.Disk([ p ], 0, bytes)))
                 >> Array.ofList
             )
         | Spill.RowSpool.Disk _ -> err (DbError.internalError "hash join: パーティションが複数の run です")
@@ -436,6 +433,20 @@ module internal OpsJoinHash =
         | HashJoinSplit of (int * uint64 * Spill.RowSpool * Spill.RowSpool) list
         /// 深さ上限に達したのでマージ結合へフォールバックした。
         | HashJoinMergeFallback of Op
+
+    /// 左右のパーティションを salt を変えて再分割する。
+    let private hashSplitBoth budget stamp spools salt depth leftKeys rightKeys lspool rspool =
+        match hashRepartitionOne budget stamp spools salt "l" leftKeys lspool with
+        | Ok lparts ->
+            match hashRepartitionOne budget stamp spools salt "r" rightKeys rspool with
+            | Ok rparts ->
+                let next =
+                    Array.map2 (fun l r -> depth + 1, salt + 1UL, l, r) lparts rparts
+                    |> Array.toList
+
+                ret (HashJoinSplit next)
+            | Error e -> err e
+        | Error e -> err e
 
     /// パーティション 1組を処理する。
     /// メモリに載ればハッシュ表を作って probe し、超過なら再分割、深さ上限ならマージ結合へ落とす。
@@ -455,71 +466,64 @@ module internal OpsJoinHash =
         (lspool: Spill.RowSpool)
         (rspool: Spill.RowSpool)
         =
-        match Spill.reopenKeep budget.Scope rspool with
-        | Error e -> err e
-        | Ok rrows ->
-            match Op.toArrayLimited -1L budget.Work rrows with
-            | Ok rightRows ->
-                match buildHashTable rightRows rightKeys with
-                | Ok table ->
-                    Spill.forgetSpool budget.Scope rspool
-                    Spill.deleteSpool rspool
+        if canSplit && MemoryBudget.exceeded (budget.Work, Spill.spoolBytes rspool) then
+            hashSplitBoth budget stamp spools salt depth leftKeys rightKeys lspool rspool
+        else
+            match Spill.reopenKeep budget.Scope rspool with
+            | Error e -> err e
+            | Ok rrows ->
+                match Op.toArrayLimited -1L budget.Work rrows with
+                | Ok rightRows ->
+                    match buildHashTable rightRows rightKeys with
+                    | Ok table ->
+                        Spill.forgetSpool budget.Scope rspool
+                        Spill.deleteSpool rspool
 
+                        match Spill.reopen budget.Scope lspool with
+                        | Ok l ->
+                            let op =
+                                joinProbe
+                                    isLeft
+                                    leftSchema
+                                    l
+                                    leftKeys
+                                    rightSchema
+                                    residual
+                                    (fun row -> encodeKey row leftKeys)
+                                    (lookupHash table)
+
+                            ret (HashJoinEmit op)
+                        | Error e -> err e
+                    | Error e -> err e
+                | Error e when e.Kind = ErrorKind.CapacityError && canSplit ->
+                    hashSplitBoth budget stamp spools salt depth leftKeys rightKeys lspool rspool
+                | Error e when e.Kind = ErrorKind.CapacityError ->
                     match Spill.reopen budget.Scope lspool with
                     | Ok l ->
-                        let op =
-                            joinProbe
-                                isLeft
-                                leftSchema
-                                l
-                                leftKeys
-                                rightSchema
-                                residual
-                                (fun row -> encodeKey row leftKeys)
-                                (lookupHash table)
+                        match sortByJoinKey budget leftKeys l with
+                        | Ok sortedLeft ->
+                            match Spill.reopen budget.Scope rspool with
+                            | Ok r ->
+                                match sortByJoinKey budget rightKeys r with
+                                | Ok sortedRight ->
+                                    let op =
+                                        mergeJoinWith
+                                            isLeft
+                                            budget
+                                            leftSchema
+                                            sortedLeft
+                                            leftKeys
+                                            rightSchema
+                                            sortedRight
+                                            rightKeys
+                                            residual
 
-                        ret (HashJoinEmit op)
-                    | Error e -> err e
-                | Error e -> err e
-            | Error e when e.Kind = ErrorKind.CapacityError && canSplit ->
-                match hashRepartitionOne budget stamp spools salt "l" leftKeys lspool with
-                | Ok lparts ->
-                    match hashRepartitionOne budget stamp spools salt "r" rightKeys rspool with
-                    | Ok rparts ->
-                        let next =
-                            Array.map2 (fun l r -> depth + 1, salt + 1UL, l, r) lparts rparts
-                            |> Array.toList
-
-                        ret (HashJoinSplit next)
-                    | Error e -> err e
-                | Error e -> err e
-            | Error e when e.Kind = ErrorKind.CapacityError ->
-                match Spill.reopen budget.Scope lspool with
-                | Ok l ->
-                    match sortByJoinKey budget leftKeys l with
-                    | Ok sortedLeft ->
-                        match Spill.reopen budget.Scope rspool with
-                        | Ok r ->
-                            match sortByJoinKey budget rightKeys r with
-                            | Ok sortedRight ->
-                                let op =
-                                    mergeJoinWith
-                                        isLeft
-                                        budget
-                                        leftSchema
-                                        sortedLeft
-                                        leftKeys
-                                        rightSchema
-                                        sortedRight
-                                        rightKeys
-                                        residual
-
-                                ret (HashJoinMergeFallback op)
+                                    ret (HashJoinMergeFallback op)
+                                | Error e -> err e
                             | Error e -> err e
                         | Error e -> err e
                     | Error e -> err e
                 | Error e -> err e
-            | Error e -> err e
 
     /// パーティションを 1つずつ遅延処理する。
     /// 先頭の 1 行を返す前に全パーティションのハッシュ表を作らない
