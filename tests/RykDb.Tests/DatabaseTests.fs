@@ -545,7 +545,7 @@ let ``Session: 中断した DROP の後始末を open 時に再開する`` () =
         let store = ok (RowStore.openStore dir)
         let previous = ok (Catalog.load store)
         let next = Catalog.removeTable "t" previous
-        let store = ok (Catalog.save store previous next)
+        let store = ok (Catalog.saveWith false store previous next)
         ok (DropCleanup.write store.Root [ Keyspace.table "t"; Keyspace.index "ix_a" ])
         ok (RowStore.close store)
 

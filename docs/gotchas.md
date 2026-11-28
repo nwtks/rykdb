@@ -665,9 +665,14 @@ fsync が失敗しても**commit は適用済み**（WAL に記録済みで、�
 - 暗黙 commit（autocommit の DML / DDL）も「適用済みだが Error」になり得る。
   接続ローカルは transaction を持たないので分断は無い。
   以後の操作は`CommitDurability`の失敗状態ですべてエラーになる。
+- ✅ fsync 失敗後も SQL の `ROLLBACK` だけは受け付ける（`SessionHelpers.isClosingStatement`）。
+  transaction を閉じられないと切断するまで回収できない。
+  ROLLBACK は WAL を書かない。
+  それ以外の文（BEGIN / SELECT / DML / DDL）は従来どおり同じエラーで失敗する。
 - 回帰: `DatabaseHost: fsync 失敗の COMMIT は適用済みを CommittedUnsynced で返す` /
   `DatabaseHost: fsync 失敗後も BEGIN と ROLLBACK は成功する` /
-  `Session: fsync 失敗の COMMIT は transaction を閉じてからエラーを返す`。
+  `Session: fsync 失敗の COMMIT は transaction を閉じてからエラーを返す` /
+  `Session: fsync 失敗後でも SQL の ROLLBACK は transaction を閉じる`。
 
 ---
 
@@ -1035,6 +1040,12 @@ fsync失敗を待機者だけに返さず、失敗位置とエラーを共有す
 `WalState`を`CommitDurability.Register`した後にgate外で`Await`する。
 登録漏れはcommitごとのfsyncを再発させる。
 
+DDLの書き込み（`Catalog.saveWith`・backfill・DROP後の消去）は deferred にし、
+fsyncはグループコミットの1回に任せる。
+`Catalog.save`をホスト経由で使うと、同じWAL位置を2回fsyncすることになる。
+回帰: `DatabaseHost: DDL の書き込みは deferred だけを使う` /
+`Catalog.saveWith: deferDurability なら deferred 書き込みだけを使う`。
+
 ### 8.12 commit中のファイルをworkerが削除しない
 
 Session単位のread leaseでSSTableをpinする。
@@ -1390,6 +1401,8 @@ JOINのONは、並べ替え用の解析で`Binder.qualify`が失敗しても述�
 - [ ] 接続ごとのtransactionだけrollbackしているか
 - [ ] STREAMはENDまで読み切っているか
 - [ ] fsync失敗を全Sessionへ伝播しているか
+- [ ] fsync 失敗後も SQL の `ROLLBACK` だけは受け付けているか
+- [ ] DDL の書き込みも deferred にして fsync をグループコミットの 1回にまとめているか
 - [ ] 退避した値集合のBloomキーがSQL等値の全表現（数値の型・スケール、DATE/TIMESTAMP）を網羅しているか
 - [ ] DISTINCT集約のfinalizeが最後の`Seen`もrunに含めているか
 - [ ] 集約の `Seen` 使用量を全体の作業メモリへ計上しているか

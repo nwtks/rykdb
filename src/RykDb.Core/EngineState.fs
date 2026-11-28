@@ -258,10 +258,13 @@ module internal ExecState =
     /// カタログのエントリは Transaction を介さず `Catalog.save` が engine の `NextSeqNo` から採番する。
     /// そのままでは Manager の採番がカタログより前を指し、データとカタログで SeqNo が重複する。
     /// 保存後に Manager を engine の高水位まで進め、snapshot もそれに追随させる。
+    /// 書き込みは state の `DeferDurability` に従う
+    /// （ホスト経由なら fsync はグループコミットの 1回にまとまる）。
     /// </remarks>
     let saved (next: Catalog) (state: ExecState) =
         result {
-            let! store = Catalog.save state.Committed.Store state.Committed.Catalog next
+            let! store =
+                Catalog.saveWith state.DeferDurability state.Committed.Store state.Committed.Catalog next
 
             return
                 { state with

@@ -310,6 +310,58 @@ let openStoreWith (root: string) (engine: IStorageEngine) =
         Runtime = RootRuntime()
     }
 
+/// 書き込み API の使い分け（sync / deferred）を記録する engine
+/// （DDL の fsync 二重化の検査用。各リクエストは1要素で記録する）。
+type WriteRecordingEngine(writes: ResizeArray<string>, inner: IStorageEngine) =
+    interface IStorageEngine with
+        member _.NextSeqNo = inner.NextSeqNo
+        member _.ActiveSnapshot = inner.ActiveSnapshot
+        member _.PublishedState = inner.PublishedState
+        member _.WalState = inner.WalState
+        member _.LastFlushError = inner.LastFlushError
+        member _.GetAtMasked key mask visible = inner.GetAtMasked key mask visible
+
+        member _.ScanAtValues startKey limit visible needsValues =
+            inner.ScanAtValues startKey limit visible needsValues
+
+        member _.ScanAtMasked startKey limit mask visible =
+            inner.ScanAtMasked startKey limit mask visible
+
+        member _.WriteBatch entries =
+            writes.Add "sync"
+
+            inner.WriteBatch entries
+            |> Result.map (fun next -> WriteRecordingEngine(writes, next) :> IStorageEngine)
+
+        member _.WriteBatchDeferred entries =
+            writes.Add "deferred"
+
+            inner.WriteBatchDeferred entries
+            |> Result.map (fun next -> WriteRecordingEngine(writes, next) :> IStorageEngine)
+
+        member _.WithNextSeqNo nextSeqNo =
+            WriteRecordingEngine(writes, inner.WithNextSeqNo nextSeqNo) :> IStorageEngine
+
+        member _.WithActiveSnapshot snapshot =
+            WriteRecordingEngine(writes, inner.WithActiveSnapshot snapshot) :> IStorageEngine
+
+        member _.WithHostState state =
+            WriteRecordingEngine(writes, inner.WithHostState state) :> IStorageEngine
+
+        member _.FlushIfNeeded allocate =
+            inner.FlushIfNeeded allocate
+            |> Result.map (fun (next, flushed) -> WriteRecordingEngine(writes, next) :> IStorageEngine, flushed)
+
+        member _.MaybeFlush() =
+            inner.MaybeFlush()
+            |> Result.map (fun (next, error) -> WriteRecordingEngine(writes, next) :> IStorageEngine, error)
+
+        member _.Close() = inner.Close()
+
+/// 書き込み履歴つきのメモリ engine を作る。
+let recordingEngine (writes: ResizeArray<string>) =
+    WriteRecordingEngine(writes, memoryEngine ()) :> IStorageEngine
+
 /// メモリ上の RowStore を渡す（ディスク I/O なし）。
 let withStore (_tag: string) (f: RowStore -> unit) = f (openStoreWith "" (memoryEngine ()))
 

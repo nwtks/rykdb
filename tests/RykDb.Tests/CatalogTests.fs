@@ -26,11 +26,11 @@ let ``Catalog.removeTable: 削除した定義は再読込時に消える`` () =
         let people = Catalog.toDefinition peopleSchema
         let orders = Catalog.toDefinition ordersSchema
         let c1 = Catalog.Empty |> Catalog.addTable people |> Catalog.addTable orders
-        let store = ok (Catalog.save store Catalog.Empty c1)
+        let store = ok (Catalog.saveWith false store Catalog.Empty c1)
 
         // people を消して保存し直す（消えた定義は tombstone で落ちる）
         let c2 = Catalog.removeTable "people" c1
-        let store = ok (Catalog.save store c1 c2)
+        let store = ok (Catalog.saveWith false store c1 c2)
         let loaded = ok (Catalog.load store)
         Assert.Single loaded.Tables |> ignore
         Assert.Equal<string>("orders", loaded.Tables.[0].Name)
@@ -48,12 +48,33 @@ let ``Catalog.addIndex: 索引だけを追加して読み込める`` () =
             }
 
         let c = Catalog.addIndex ix Catalog.Empty
-        let store = ok (Catalog.save store Catalog.Empty c)
+        let store = ok (Catalog.saveWith false store Catalog.Empty c)
         let loaded = ok (Catalog.load store)
         Assert.Empty loaded.Tables
         Assert.Single loaded.Indexes |> ignore
         Assert.Equal<string list>([ "a"; "b" ], loaded.Indexes.[0].Columns)
         Assert.True(loaded.Indexes.[0].Unique))
+
+[<Fact>]
+let ``Catalog.saveWith: deferDurability なら deferred 書き込みだけを使う`` () =
+    let defn = Catalog.toDefinition peopleSchema
+    let c = Catalog.addTable defn Catalog.Empty
+    let writes = ResizeArray<string>()
+
+    let deferredStore =
+        ok (Catalog.saveWith true (openStoreWith "" (recordingEngine writes)) Catalog.Empty c)
+
+    Assert.Equal<string list>([ "deferred" ], List.ofSeq writes)
+    // deferred でもカタログは読める（fsync はホストのグループコミットが行う）。
+    Assert.Single((ok (Catalog.load deferredStore)).Tables) |> ignore
+
+    // 既定の save は従来どおり fsync まで行う。
+    let writes2 = ResizeArray<string>()
+
+    ok (Catalog.saveWith false (openStoreWith "" (recordingEngine writes2)) Catalog.Empty c)
+    |> ignore
+
+    Assert.Equal<string list>([ "sync" ], List.ofSeq writes2)
 
 [<Fact>]
 let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
@@ -74,7 +95,7 @@ let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
             }
 
         let c = Catalog.addStats stats Catalog.Empty
-        let store = ok (Catalog.save store Catalog.Empty c)
+        let store = ok (Catalog.saveWith false store Catalog.Empty c)
         let loaded = ok (Catalog.load store)
         let s = expectSome "people の統計" (Catalog.findStats "PEOPLE" loaded)
         Assert.Equal<int64>(3L, s.RowCount)
@@ -87,7 +108,7 @@ let ``Catalog.save / load: 統計を往復し、removeTable で消える`` () =
         Assert.Equal<string list>([ "name" ], s.Indexes.[0].Columns)
         Assert.Equal<int64 list>([ 2L ], s.Indexes.[0].PrefixNDV)
         Assert.Equal<(string * int64) list>([ ("'alice'", 2L) ], nameColumn.Mcv)
-        Assert.True(s.AnalyzedAt.IsNone)
+        Assert.True s.AnalyzedAt.IsNone
         Assert.Equal<int64>(4L, s.Changes)
         Assert.Equal(40.0, s.RowBytes, 3)
 
@@ -155,7 +176,7 @@ let ``Catalog.save / load: 保存したカタログを読み込める`` () =
         let people = Catalog.toDefinition peopleSchema
         let ix = indexDefinition "people" peopleSchema.Indexes.[0]
         let c = Catalog.addTable people Catalog.Empty |> fun c -> Catalog.addIndex ix c
-        let store = ok (Catalog.save store Catalog.Empty c)
+        let store = ok (Catalog.saveWith false store Catalog.Empty c)
         let loaded = ok (Catalog.load store)
         Assert.Single loaded.Tables |> ignore
         Assert.Single loaded.Indexes |> ignore
@@ -188,7 +209,7 @@ let ``Catalog.save / load: DEFAULT 式は保存・再読込しても復元され
             }
 
         let store =
-            ok (Catalog.save store Catalog.Empty (Catalog.addTable defn Catalog.Empty))
+            ok (Catalog.saveWith false store Catalog.Empty (Catalog.addTable defn Catalog.Empty))
 
         let loaded = ok (Catalog.load store)
 
@@ -210,13 +231,13 @@ let ``Catalog.save: 消えた定義は差分から tombstone で落ちる`` () =
 
         // テーブルを保存する
         let c1 = Catalog.addTable people Catalog.Empty
-        let store = ok (Catalog.save store Catalog.Empty c1)
+        let store = ok (Catalog.saveWith false store Catalog.Empty c1)
         let loaded = ok (Catalog.load store)
         Assert.Single loaded.Tables |> ignore
 
         // 消えた定義は「保存前と保存後の差分」から tombstone にして落とす
         // （カタログ keyspace を全走査しない）。
-        let store = ok (Catalog.save store c1 Catalog.Empty)
+        let store = ok (Catalog.saveWith false store c1 Catalog.Empty)
         let loaded = ok (Catalog.load store)
         Assert.Empty loaded.Tables)
 
@@ -236,12 +257,12 @@ let ``Catalog.save: 変わっていない定義は書き直さない`` () =
             |> Array.tryPick (fun e -> if e.Key = key then Some e.SeqNo else None)
 
         let c1 = Catalog.Empty |> Catalog.addTable people
-        let store = ok (Catalog.save store Catalog.Empty c1)
+        let store = ok (Catalog.saveWith false store Catalog.Empty c1)
         let peopleSeq = expectSome "people の定義がありません" (seqOf "people" store)
 
         // 別のテーブルを足しても、変わっていない people は書き直さない（SeqNo が進まない）。
         let c2 = Catalog.addTable orders c1
-        let store = ok (Catalog.save store c1 c2)
+        let store = ok (Catalog.saveWith false store c1 c2)
         Assert.Equal<uint64>(peopleSeq, expectSome "people の定義がありません" (seqOf "people" store))
         Assert.True((seqOf "orders" store).IsSome)
 
@@ -254,7 +275,7 @@ let ``Catalog.save: 変わっていない定義は書き直さない`` () =
             }
 
         let c3 = Catalog.addTable renamed c2
-        let store = ok (Catalog.save store c2 c3)
+        let store = ok (Catalog.saveWith false store c2 c3)
         Assert.NotEqual<uint64>(peopleSeq, expectSome "people の定義がありません" (seqOf "people" store)))
 
 [<Fact>]
@@ -266,7 +287,7 @@ let ``Catalog.load: 未知のキーや不正な値は読み飛ばす`` () =
         let people = Catalog.toDefinition peopleSchema
 
         let store =
-            ok (Catalog.save store Catalog.Empty (Catalog.addTable people Catalog.Empty))
+            ok (Catalog.saveWith false store Catalog.Empty (Catalog.addTable people Catalog.Empty))
 
         let raw =
             ok (RowStore.scan Keyspace.CatalogKeyspace [||] 0 store)

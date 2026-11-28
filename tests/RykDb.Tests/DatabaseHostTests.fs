@@ -232,10 +232,10 @@ let ``DatabaseHost: fsync 失敗の COMMIT は適用済みを CommittedUnsynced 
             | other -> Assert.Fail(sprintf "CommittedUnsynced が返るはず: %A" other)
 
             // commit は適用済み: manager から transaction は消え、読み取りに見える。
-            Assert.True(host.Committed.Manager.Active.IsEmpty)
+            Assert.True host.Committed.Manager.Active.IsEmpty
             let _, found = ok (execute TxnState.none "SELECT id FROM t WHERE v = 10")
             Assert.Equal<int>(1, found.Rows.Length)
-            Assert.True(host.DurabilityFailure.IsSome)
+            Assert.True host.DurabilityFailure.IsSome
         finally
             host.Close() |> ignore)
 
@@ -261,14 +261,14 @@ let ``DatabaseHost: fsync 失敗後も BEGIN と ROLLBACK は成功する`` () =
             failSync <- true
             // 暗黙 commit は適用済みだが、永続化に失敗するので Error。
             expectError "fsync 失敗後の書き込み" (execute "INSERT INTO t VALUES (1, 10)")
-            Assert.True(host.DurabilityFailure.IsSome)
+            Assert.True host.DurabilityFailure.IsSome
 
             // BEGIN / ROLLBACK は WAL を書かないので成功する
             // （修正前は fsync 待ちで失敗し、manager に ghost transaction が残った）。
             let local = ok (host.Begin TxnState.none)
             Assert.True(TxnState.inTransaction local)
             ok (host.Rollback local) |> ignore
-            Assert.True(host.Committed.Manager.Active.IsEmpty)
+            Assert.True host.Committed.Manager.Active.IsEmpty
         finally
             host.Close() |> ignore)
 
@@ -300,10 +300,72 @@ let ``Session: fsync 失敗の COMMIT は transaction を閉じてからエラ�
             | Ok() -> Assert.Fail "fsync 失敗なのに COMMIT が成功した"
 
             // 修正前: 接続ローカルが更新されず「transaction 中」のまま host と分断した。
-            Assert.False(session.InTransaction)
-            Assert.True(host.DurabilityFailure.IsSome)
+            Assert.False session.InTransaction
+            Assert.True host.DurabilityFailure.IsSome
         finally
             session.Close() |> ignore)
+
+[<Fact>]
+let ``Session: fsync 失敗後でも SQL の ROLLBACK は transaction を閉じる`` () =
+    withDir "session-rollback-after-fsync-fail" (fun root ->
+        let mutable failSync = false
+
+        let durable =
+            CommitDurability(fun _ ->
+                if failSync then
+                    err (DbError.io (System.IO.IOException "fsync failed"))
+                else
+                    ret ())
+
+        let host = ok (DatabaseHost.OpenWith(root, commitDurability = durable))
+        let session = Session.Create(host, SessionOptions.Default, true)
+
+        let execute local sql =
+            host.ExecuteNonTransaction local ResultLimits.Unlimited (parseOneOk sql)
+
+        try
+            ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            |> ignore
+
+            ok (session.Begin()) |> ignore
+            ok (session.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+
+            // 別の書き込みで fsync を失敗させ、host を「永続化失敗」の状態にする。
+            failSync <- true
+            expectError "fsync 失敗後の書き込み" (execute TxnState.none "INSERT INTO t VALUES (2, 20)")
+            Assert.True host.DurabilityFailure.IsSome
+
+            // 修正前: SQL の ROLLBACK も durability ゲートで拒否され、transaction を閉じられなかった。
+            ok (session.Execute "ROLLBACK") |> ignore
+            Assert.False session.InTransaction
+            Assert.True host.Committed.Manager.Active.IsEmpty
+
+            // ROLLBACK 以外は従来どおり同じエラーで失敗する。
+            expectError "fsync 失敗後の BEGIN" (session.Execute "BEGIN")
+            expectError "fsync 失敗後の SELECT" (session.Execute "SELECT 1")
+        finally
+            session.Close() |> ignore)
+
+[<Fact>]
+let ``DatabaseHost: DDL の書き込みは deferred だけを使う`` () =
+    let writes = ResizeArray<string>()
+    let durable = CommitDurability(fun _ -> ret ())
+    let root = "mem:" + System.Guid.NewGuid().ToString "N"
+    let store = openStoreWith "" (recordingEngine writes)
+    let host = ok (DatabaseHost.OpenWithStore(root, store, commitDurability = durable))
+    let session = Session.Create(host, SessionOptions.Default, true)
+
+    try
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        |> ignore
+
+        // 修正前: Catalog.save が WriteBatch（fsync）で書き、host が同じ WAL 位置をもう一度 fsync した。
+        Assert.Equal<string list>([ "deferred" ], List.ofSeq writes)
+
+        ok (session.Execute "INSERT INTO t VALUES (1, 10)") |> ignore
+        Assert.Equal<string list>([ "deferred"; "deferred" ], List.ofSeq writes)
+    finally
+        session.Close() |> ignore
 
 [<Fact>]
 let ``DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollback する`` () =
@@ -345,7 +407,7 @@ let ``DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollb
         | Ok(CommitOutcome.CommittedUnsynced _, _) -> Assert.Fail "上限超過なのに commit できた"
         | Error e -> Assert.Fail(sprintf "COMMIT が Error を返した: %A" e.Kind)
 
-        Assert.True(host.Committed.Manager.Active.IsEmpty)
+        Assert.True host.Committed.Manager.Active.IsEmpty
     finally
         RowStore.close store |> ignore
 
@@ -458,7 +520,7 @@ let ``DatabaseHost: 放棄された transaction は次の書き込みで manager
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
         |> ignore
 
-        Assert.True(host.Committed.Manager.Active.IsEmpty)
+        Assert.True host.Committed.Manager.Active.IsEmpty
         Assert.Equal<int>(0, host.Committed.Manager.LastCommitted.Count)
 
         // 回収済みなので通常の書き込み・読み取りが続く。
@@ -493,10 +555,8 @@ let ``DatabaseHost: DDL のカタログ保存後も Manager の採番は保存�
     withDbHost "ddl-seq" (fun host session ->
         // テーブル + 暗黙 UNIQUE 索引でカタログに 2エントリ書く。
         let session = exec session "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)"
-
         let committed = host.Committed
         let lastSeq = RowStore.lastSeqNo committed.Store
-
         // カタログは Transaction を介さず採番するが、Manager は保存済み SeqNo に追随する
         // （追随しないと次の commit がカタログと同じ SeqNo を再利用する）。
         Assert.True(lastSeq > 0UL)
@@ -507,7 +567,6 @@ let ``DatabaseHost: DDL のカタログ保存後も Manager の採番は保存�
         let session = exec session "INSERT INTO t VALUES (1, 'a')"
         let committed = host.Committed
         let lastSeq2 = RowStore.lastSeqNo committed.Store
-
         Assert.True(lastSeq2 > lastSeq)
         Assert.Equal<uint64>(lastSeq2, committed.Manager.LastCommitSeqNo)
         Assert.Equal<uint64>(lastSeq2 + 1UL, committed.Manager.NextSeqNo)
@@ -516,7 +575,6 @@ let ``DatabaseHost: DDL のカタログ保存後も Manager の採番は保存�
         let _ = exec session "CREATE TABLE u (id INTEGER PRIMARY KEY)"
         let committed = host.Committed
         let lastSeq3 = RowStore.lastSeqNo committed.Store
-
         Assert.Equal<uint64>(lastSeq3, committed.Manager.LastCommitSeqNo)
         Assert.Equal<uint64>(lastSeq3 + 1UL, committed.Manager.NextSeqNo))
 

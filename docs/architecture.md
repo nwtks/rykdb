@@ -1028,6 +1028,11 @@ WALは`Begin / Batch / Commit`を1回の追記呼び出しで記録し、最後�
 （フレームは個別に書く）。
 したがって、テーブルだけがコミットされ索引だけが残らないという中間状態を作らない。
 
+DDL（カタログ保存・backfill・DROP後の消去）も deferred 書き込みにし、
+`DatabaseHost.serialized` のグループコミットが WAL 位置ごとに1回だけ fsync する。
+カタログ保存が独自に fsync すると同じ位置をもう一度 fsync することになるため、
+`Catalog.saveWith` の `deferDurability` はホスト経由では true にする。
+
 WAL追記が成功した時点でCOMMIT成立とする。
 その後のmemtable flushが失敗しても、WALから再生できるため`Error`にはせず、
 memtableを保持して次回再試行する。
@@ -1041,7 +1046,8 @@ WAL追記が成功してもfsyncが失敗した場合、commitは**適用済み*
 `Commit`は`CommitOutcome.CommittedUnsynced`へ変換する。
 `Session`は接続をtransaction外へ進めてからエラーを返す
 （適用済みを捨ててErrorだけ返すと、接続ローカルが「transaction中」のままhostと分断する）。
-fsyncの失敗は`CommitDurability`が記憶し、以後のすべての操作が同じエラーで失敗する。
+fsyncの失敗は`CommitDurability`が記憶し、以後のすべての操作が同じエラーで失敗する
+（SQL の `ROLLBACK` だけは transaction を閉じるために受け付ける）。
 BEGIN / ROLLBACK・失敗した文はWALを進めないためfsyncを待たない。
 
 ### 7.6 Sessionのtransactionモデル

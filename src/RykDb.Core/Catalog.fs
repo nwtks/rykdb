@@ -775,9 +775,10 @@ module internal Catalog =
     /// 書き込みは「前回から変わった定義」と「消えた定義」の差分だけにする。
     /// 定義の比較は保存形（エンコード後）のバイト列で行う
     /// （`Expr` は構造比較できないため、カタログのレコードどうしは比べられない）。
-    /// 書き込みは 1バッチにまとめる
-    /// （tombstone も同じバッチに含めるので WAL の fsync は 1回で済む）。
-    let save (store: RowStore) (previous: Catalog) (catalog: Catalog) =
+    /// 書き込みは 1バッチにまとめる。
+    /// `deferDurability` が true なら WAL への追記だけを行い、fsync は呼び出し側に任せる
+    /// （`DatabaseHost` のグループコミットが WAL 位置ごとに 1回だけ fsync する）。
+    let saveWith (deferDurability: bool) (store: RowStore) (previous: Catalog) (catalog: Catalog) =
         let staleKeys =
             let wanted =
                 (catalog.Tables |> List.map (fun t -> tableKey t.Name))
@@ -808,7 +809,11 @@ module internal Catalog =
             let deleteBatches, _ = numberList deleteBatch staleKeys seq3 []
 
             let! updated =
-                RowStore.writeBatches (tableBatches @ indexBatches @ statsBatches @ deleteBatches) store
+                RowStore.writeBatchesWithSnapshotWith
+                    deferDurability
+                    0UL
+                    (tableBatches @ indexBatches @ statsBatches @ deleteBatches)
+                    store
 
             return updated
         }

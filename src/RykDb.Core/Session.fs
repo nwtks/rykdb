@@ -285,7 +285,20 @@ module internal SessionHelpers =
         with ex ->
             err (DbError.internalError ex.Message)
 
+    /// fsync 失敗後でも受け付ける文（transaction を閉じる ROLLBACK だけ）。
+    /// ROLLBACK は WAL を書かないので、失敗状態でも安全に通せる。
+    let isClosingStatement =
+        function
+        | Statement.Rollback -> true
+        | _ -> false
+
     /// 解析済みの文を実行する（ゲート＝closed / durability を確認した後）。
+    /// <remarks>
+    /// fsync 失敗後も **transaction を閉じる ROLLBACK だけ**は受け付ける。
+    /// 残したままだと接続が transaction を閉じられず、切断するまで回収できない。
+    /// ROLLBACK は WAL を書かないので安全に通せる。
+    /// それ以外の文は従来どおり同じエラーで失敗する。
+    /// </remarks>
     let executeCore
         (isClosed: unit -> bool)
         (host: DatabaseHost)
@@ -297,15 +310,15 @@ module internal SessionHelpers =
         if isClosed () then
             err (closedError ())
         else
-            match host.DurabilityFailure with
-            | Some e -> err e
-            | None ->
-                validateParameters parameters
-                >>= fun () ->
-                    let parameters = SqlValue.copyRow parameters
+            validateParameters parameters
+            >>= fun () ->
+                let parameters = SqlValue.copyRow parameters
 
-                    Parser.parseStatementsWith parameters sql
-                    >>= fun statements -> runStatements statements
+                Parser.parseStatementsWith parameters sql
+                >>= fun statements ->
+                    match host.DurabilityFailure with
+                    | Some e when not (List.forall isClosingStatement statements) -> err e
+                    | _ -> runStatements statements
 
     /// RowReader のリソースを解放する。
     let private readerRelease
@@ -629,8 +642,8 @@ type Session internal (host: DatabaseHost, options: SessionOptions, ownsHost: bo
             err (SessionHelpers.closedError ())
         else
             match host.DurabilityFailure with
-            | Some e -> err e
-            | None -> executeStatementsCore [ stmt ] |> Result.map fst
+            | Some e when not (SessionHelpers.isClosingStatement stmt) -> err e
+            | _ -> executeStatementsCore [ stmt ] |> Result.map fst
 
     /// SELECT の計画だけを組み立てる（テスト・ベンチ用）。
     /// <remarks>
