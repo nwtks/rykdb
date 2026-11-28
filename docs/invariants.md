@@ -94,6 +94,9 @@
 | INV-58 | 既定式はカタログへ保存後に再パースできる形だけを許す                                  | `EngineDdl.validateDefaultPersistable`、`Catalog.encodeStats` 系の直列化、SqlReferenceTests                               |
 | INV-59 | 派生テーブルは参照名（別名があれば別名）で引き当てる                                  | `Plan.registerSources`、`PlanBuilder.bindSource`、SqlReferenceTests                                                       |
 | INV-60 | SELECT のみのバッチは開始時の snapshot を登録して GC 境界に固定する                   | `DatabaseHost.AcquireReadSnapshot`、`Session.exitRead`、DatabaseHostTests                                                 |
+| INV-61 | 同じ列どうしの等値の選択性は NULL 率だけを掛ける                                      | `Analyzer.equalityPredicateSelectivity`、SqlReferenceTests                                                                |
+| INV-62 | Bushy の区間木には区間内のテーブルだけを参照する述語を載せる                          | `PlanBuilder.bushyResultOf`、SqlReferenceTests                                                                            |
+| INV-63 | 列パターン LIKE のキャッシュは演算子スクラッチで上限付き                              | `Eval.Prepared.LikeCache`、EvalTests                                                                                      |
 
 ---
 
@@ -627,7 +630,9 @@ SQL の等値は型・DECIMAL のスケール・DATE/TIMESTAMP を跨ぐため�
 - パーティションへ退避した後の畳み込み（`Spill.foldEntries`）でも、既存グループの `stateBytes` の増分を毎行計上する。
   新規グループだけを見ると、グループ数分だけ上限を超え得る。
 - 上限を超えたら、その行以降をパーティションへ退避する。
-- 極小の `WorkMem` では 1 run あたり最低 64 値（最大 2KiB の超過）までまとめる。
+- 極小の `WorkMem` では 1 run あたり最低 64値（最大 2KiB の超過）までまとめる。
+- `Seen` の件数は `Acc.SeenCount` が持ち、行ごとの上限判定とバイト見積りで
+  `Map.count`（木全体の走査）を呼ばない。`Map.count` は 20k ユニーク値で O(n²) になっていた。
 
 回帰テストは `集約: DISTINCT の値が上限を超えても全集約関数が同じ結果` と
 `集約: 最後のスピル以降に溜まった DISTINCT 値も結果に含める` を検査する。
@@ -1058,6 +1063,38 @@ WAL / MANIFEST / compaction 入力から最善努力で復旧する。
 - 種別は`Statement`なのでDDLは拒否しない（共有ロックで文の完了を待つだけ）。
 - 例外で抜ける経路はSessionの`finally`がleaseを返す。
 - 回帰: `DatabaseHost: AcquireReadSnapshot はバッチの snapshot を GC 境界に固定する`。
+
+### INV-61: 同じ列どうしの等値の選択性は NULL 率だけを掛ける
+
+`WHERE t.a = t.a` は NULL でない行すべてで真になる。
+独立な 2列として `1/max(NDV)` を掛けると、行数を NDV 分の 1 に過小評価する。
+
+- `Analyzer.equalityPredicateSelectivity` が同じ列（修飾子と名前が大小無視で一致）を検出し、
+  `1 - NULL率` を返す。
+- 別の列どうし（`t.a = t.b`）は従来どおり独立な列として `1/max(NDV)`。
+- 統計が無いときは 1.0（行を減らさない）。
+- 回帰: `SqlReference: 同じ列どうしの等値は行を減らさない見積りになる`。
+
+### INV-62: Bushy の区間木には区間内の述語だけを載せる
+
+bushy は先頭 INNER 区間（3〜6表）の木を組み、使わなかった述語を区間木の上に `Filter` として残す。
+区間外のテーブルを参照する述語をそこに載せると、区間木のスキーマで列を解決できず `NameError` になる。
+
+- `PlanBuilder.bushyResultOf` は leftover の ON / WHERE 述語を
+  「参照表がすべて区間内」のものだけ区間木へ載せる。
+- 区間外の述語は未使用のまま返し、`leftoverPredicates` が結合木全体の上で評価する。
+- 回帰: `SqlReference: bushy 計画でも区間外を参照する WHERE が使える`
+  （bushy が選ばれたことを木の形で確認してから、LEFT の後ろの表を参照する WHERE を実行）。
+
+### INV-63: 列パターン LIKE のキャッシュは演算子スクラッチで上限付き
+
+列パターン（`a LIKE b`）は計画時にコンパイルできない。
+評価中に見たパターンを覚えないと、同じパターンを毎行コンパイルする。
+
+- `Eval.Prepared.LikeCache` が演算子 1つ分の `Dictionary` でコンパイル結果を保持する。
+- 上限 1024件を超えたら追加しない（高カーディナリティのパターンでメモリを食わない）。
+- `Prepared` は演算子の寿命だけであり、DB / プロセス寿命のキャッシュにはしない。
+- 回帰: `Eval.prepare: 列パターンの LIKE は同じパターンをコンパイルし直さない`。
 
 ---
 

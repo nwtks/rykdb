@@ -33,6 +33,9 @@ module internal OpsAggregate =
             /// 退避時は「キー」と「元の値」を別の列で書く
             /// （再集計はキーで重複排除し、集計値には型・スケールを保った元の値を使う）。
             Seen: Map<SqlValue, SqlValue>
+            /// `Seen` の件数。`Map.count` は木全体の走査（O(n)）なので、
+            /// 行ごとの上限判定のために件数を別に持つ。
+            SeenCount: int
             SeenRuns: string list
         }
 
@@ -109,6 +112,7 @@ module internal OpsAggregate =
                     DbOk
                         { acc with
                             Seen = Map.empty
+                            SeenCount = 0
                             SeenRuns = path :: acc.SeenRuns
                         }
 
@@ -216,13 +220,16 @@ module internal OpsAggregate =
                     | Some v when not (SqlValue.isNull v) -> Some v
                     | _ -> None
 
-            let newSeen =
+            let newSeen, newSeenCount =
                 if distinct then
                     match seenKey, value with
-                    | Some k, Some original when not (SqlValue.isNull original) -> Map.add k original acc.Seen
-                    | _ -> acc.Seen
+                    | Some k, Some original when not (SqlValue.isNull original) ->
+                        let added = not (Map.containsKey k acc.Seen)
+
+                        Map.add k original acc.Seen, (if added then acc.SeenCount + 1 else acc.SeenCount)
+                    | _ -> acc.Seen, acc.SeenCount
                 else
-                    acc.Seen
+                    acc.Seen, acc.SeenCount
 
             let withSeen =
                 let seenLimit =
@@ -231,10 +238,19 @@ module internal OpsAggregate =
                     else
                         max 64L (budget.Work / 32L)
 
-                if distinct && int64 (Map.count newSeen) > seenLimit then
-                    aggSpillSeen budget { acc with Seen = newSeen }
+                if distinct && int64 newSeenCount > seenLimit then
+                    aggSpillSeen
+                        budget
+                        { acc with
+                            Seen = newSeen
+                            SeenCount = newSeenCount
+                        }
                 else
-                    DbOk { acc with Seen = newSeen }
+                    DbOk
+                        { acc with
+                            Seen = newSeen
+                            SeenCount = newSeenCount
+                        }
 
             match withSeen with
             | DbErr e -> DbErr e
@@ -302,6 +318,7 @@ module internal OpsAggregate =
             Min = None
             Max = None
             Seen = Map.empty
+            SeenCount = 0
             SeenRuns = []
         }
 
@@ -599,7 +616,7 @@ module internal OpsAggregate =
             Eval.prepare schema (groupBy @ (aggs |> List.map (fun (_, _, _, e) -> e)))
 
         let normalizeKey = Array.map SqlValue.keyNormalize
-        let seenBytes = List.sumBy (fun a -> int64 (Map.count a.Seen) * 32L)
+        let seenBytes = List.sumBy (fun a -> int64 a.SeenCount * 32L)
 
         let buckets =
             System.Collections.Generic.Dictionary<SqlValue array, Acc list>(

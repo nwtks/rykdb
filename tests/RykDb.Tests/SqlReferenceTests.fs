@@ -4214,6 +4214,84 @@ let ``SqlReference: 結合順は中間行数の見積りで決まる`` () =
         Assert.True(indexOf "right=c" > indexOf "right=b", String.concat "\n" lines))
 
 [<Fact>]
+let ``SqlReference: 同じ列どうしの等値は行を減らさない見積りになる`` () =
+    // `t.a = t.a` を独立な 2 列として 1/NDV で見積もると、行数が 1/10 になる。
+    // NULL でない行すべてで真なので、NULL 率だけを掛ける。
+    withSession "stats-same-column" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)"
+
+        let values =
+            [ 1..10 ] |> List.map (fun i -> sprintf "(%d,%d)" i i) |> String.concat ","
+
+        let db2 = exec db1 (sprintf "INSERT INTO t VALUES %s" values)
+        let db3 = exec db2 "ANALYZE t"
+        let _, plan = ok (execSql db3 "EXPLAIN SELECT id FROM t WHERE a = a")
+        let text = plan.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+
+        let filterRows =
+            text.Split '\n'
+            |> Array.find (fun line -> line.Contains "Filter")
+            |> plannedRows
+
+        Assert.Equal(10.0, filterRows, 1))
+
+[<Fact>]
+let ``SqlReference: bushy 計画でも区間外を参照する WHERE が使える`` () =
+    // 最初の INNER 区間（a,b,c,d）の外にある e（LEFT の右）と f（LEFT の後の INNER）を
+    // 参照する WHERE は区間木の上に置かず、未使用のまま外側の Filter で評価する。
+    withSession "join-order-bushy-leftover" (fun db ->
+        let db = exec db "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE e (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "CREATE TABLE f (id INTEGER PRIMARY KEY, k INTEGER)"
+        let db = exec db "INSERT INTO a VALUES (1,10),(2,20)"
+        let db = exec db "INSERT INTO b VALUES (1,10),(2,20)"
+        let db = exec db "INSERT INTO c VALUES (1,10),(2,20)"
+        let db = exec db "INSERT INTO d VALUES (1,10),(2,20)"
+        let db = exec db "INSERT INTO e VALUES (1,10)"
+        let db = exec db "INSERT INTO f VALUES (1,10)"
+
+        let stmt =
+            match
+                parseOneOk
+                    "SELECT a.k FROM a JOIN b ON b.k = a.k JOIN c ON c.k = b.k JOIN d ON d.k = c.k LEFT JOIN e ON e.k = d.k JOIN f ON f.k = e.k WHERE a.k = f.k"
+            with
+            | Statement.Select s -> s
+            | other -> failwithf "SELECT ではありません: %A" other
+
+        let plan = ok (db.PrepareSelectWith(JoinOrderStrategy.Bushy, stmt))
+
+        // テストの前提: bushy（右が部分木の結合）が実際に選ばれている。
+        let rec hasBushyJoin =
+            function
+            | Logical.Join(_, _, _, _, Logical.Join _) -> true
+            | Logical.Join(_, _, _, left, right) -> hasBushyJoin left || hasBushyJoin right
+            | Logical.Filter(_, child)
+            | Logical.Sort(_, child)
+            | Logical.Limit(_, _, child)
+            | Logical.Distinct child
+            | Logical.Project(_, child)
+            | Logical.Aggregate(_, _, child)
+            | Logical.Having(_, _, _, child) -> hasBushyJoin child
+            | _ -> false
+
+        Assert.True(hasBushyJoin plan.Tree, sprintf "%A" plan.Tree)
+
+        try
+            let op = ok (Optimizer.exec plan.Context plan.Tree plan.Input)
+
+            let rows =
+                (op |> Op.toArray |> ok)
+                |> Array.map (Array.map SqlLiteral.toSqlLiteral >> String.concat ",")
+                |> Array.sort
+
+            Assert.Equal<string array>([| "10" |], rows)
+        finally
+            plan.Context.Scope.DisposeAll())
+
+[<Fact>]
 let ``SqlReference: ヒストグラムは偏った分布でも範囲の行数を見積もる`` () =
     // 99行が 0、1行が 1000。min/max の線形補間なら v < 500 は 50行になるが、
     // 等頻度ヒストグラムなら 97行前後になる。

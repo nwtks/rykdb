@@ -72,6 +72,40 @@ let ``Eval.eval: LIKE の % と _`` () =
     Assert.False(test "a%_" "a")
 
 [<Fact>]
+let ``Eval.prepare: 列パターンの LIKE は同じパターンをコンパイルし直さない`` () =
+    // 列パターン（`a LIKE b`）は行ごとにパターンが変わるので計画時にはコンパイルできない。
+    // 評価中に見たパターンは演算子 1つ分のスクラッチに覚え、同じパターンを繰り返し使う。
+    let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
+
+    let prepared =
+        Eval.prepare
+            schema
+            [
+                Expr.Like(
+                    Expr.Column { Qualifier = None; Name = "s" },
+                    Expr.Column { Qualifier = None; Name = "s" },
+                    false,
+                    None
+                )
+            ]
+
+    let first = prepared.Like Scalar.NoEscape "a%b"
+    let second = prepared.Like Scalar.NoEscape "a%b"
+
+    // `Result` は値型なので、コンパイル結果のトークン配列の同一性で見る。
+    match first, second with
+    | Ok a, Ok b -> Assert.True(System.Object.ReferenceEquals(a.Tokens, b.Tokens))
+    | _ -> failwith "LIKE のコンパイルに失敗しました"
+
+    // 別のパターンは別のコンパイル結果。
+    match prepared.Like Scalar.NoEscape "a%c" with
+    | Ok other ->
+        match first with
+        | Ok a -> Assert.False(System.Object.ReferenceEquals(a.Tokens, other.Tokens))
+        | _ -> failwith "LIKE のコンパイルに失敗しました"
+    | _ -> failwith "LIKE のコンパイルに失敗しました"
+
+[<Fact>]
 let ``Eval.eval: スカラー関数`` () =
     let schema = outSchema [ outCol "s" None (Some DataType.Text) ]
 

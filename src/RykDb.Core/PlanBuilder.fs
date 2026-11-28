@@ -804,16 +804,24 @@ module internal PlanBuilder =
                 match foldBushy env tree Set.empty Set.empty ret with
                 | Error e -> Some(Error e)
                 | Ok node ->
+                    let segmentNames = allByName |> Map.toList |> List.map fst |> Set.ofList
+
                     let leftoverOn =
                         onPredicatesArr
                         |> Array.indexed
-                        |> Array.choose (fun (k, (_, _, e)) -> if Set.contains k node.UsedOn then None else Some e)
+                        |> Array.choose (fun (k, (_, refs, e)) ->
+                            if Set.contains k node.UsedOn then None
+                            elif Set.isSubset refs segmentNames then Some e
+                            else None)
                         |> Array.toList
 
                     let leftoverWhere =
                         input.JoinPredicates
                         |> Array.indexed
-                        |> Array.choose (fun (k, (_, p)) -> if Set.contains k node.UsedWhere then None else Some p)
+                        |> Array.choose (fun (k, (refs, p)) ->
+                            if Set.contains k node.UsedWhere then None
+                            elif Set.isSubset refs segmentNames then Some p
+                            else None)
                         |> Array.toList
 
                     let finalTree =

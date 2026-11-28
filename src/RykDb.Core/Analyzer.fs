@@ -609,16 +609,31 @@ module internal Analyzer =
         (a: Expr)
         (b: Expr)
         =
-        match columnWithStatsOf statsOf a, columnWithStatsOf statsOf b with
-        | Some(sa, ca), Some(sb, cb) when ca.NDV > 0L && cb.NDV > 0L ->
-            (1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV)
-        | _ ->
-            match literalOf b with
-            | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity a literal
-            | None ->
-                match literalOf a with
-                | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity b literal
-                | None -> defaultSelectivity
+        let sameColumn =
+            match Schema.tryAsColumnRef a, Schema.tryAsColumnRef b with
+            | Some ca, Some cb ->
+                SqlName.equal ca.Name cb.Name
+                && match ca.Qualifier, cb.Qualifier with
+                   | Some qa, Some qb -> SqlName.equal qa qb
+                   | None, None -> true
+                   | _ -> false
+            | _ -> false
+
+        if sameColumn then
+            match columnWithStatsOf statsOf a with
+            | Some(stats, column) -> 1.0 - nullRate stats column
+            | None -> 1.0
+        else
+            match columnWithStatsOf statsOf a, columnWithStatsOf statsOf b with
+            | Some(sa, ca), Some(sb, cb) when ca.NDV > 0L && cb.NDV > 0L ->
+                (1.0 - nullRate sa ca) * (1.0 - nullRate sb cb) / float (max ca.NDV cb.NDV)
+            | _ ->
+                match literalOf b with
+                | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity a literal
+                | None ->
+                    match literalOf a with
+                    | Some literal -> eqToLiteralWithStats statsOf defaultSelectivity b literal
+                    | None -> defaultSelectivity
 
     /// 範囲比較の選択性（リテラル側を左辺へ寄せる）。
     let private rangeComparisonSelectivity

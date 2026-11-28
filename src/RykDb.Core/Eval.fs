@@ -1,12 +1,14 @@
 namespace RykDb.Core
 
-/// 1オペレータ分の評価準備（不変）。
+/// 1オペレータ分の評価準備。
 /// <remarks>
 /// 演算子が評価する式から、列参照の解決とリテラル LIKE パターンのコンパイルを
-/// **計画時に 1回だけ**行って保持する。行ごとの `Schema.resolve` と LIKE の
-/// 再コンパイルを繰り返さないための前計算であり、評価中に変わる状態は無い。
+/// **計画時に 1回だけ**行って保持する。
+/// 行ごとの `Schema.resolve` と LIKE の再コンパイルを繰り返さないための前計算である。
 /// `Schema` が変わるところ（JOIN の出力、集約後など）では新しい `Prepared` を作る。
-/// 列パターン（`a LIKE b`）だけは評価のたびにコンパイルする（`Like` のフォールバック）。
+/// 列パターン（`a LIKE b`）は計画時に決まらないので、評価中に見たパターンを
+/// 演算子 1つ分のスクラッチ（`LikeCache`、上限付き）に覚えて再利用する。
+/// このキャッシュは `Prepared` の外へ出さず、DB / プロセス寿命のものではない。
 /// </remarks>
 [<NoEquality; NoComparison>]
 type internal Prepared =
@@ -20,6 +22,9 @@ type internal Prepared =
                     struct (int * string),
                     Result<Scalar.LikePattern, DbError>
                  >
+            /// 列パターン LIKE のコンパイル結果（演算子ごとのスクラッチ）。
+            /// 上限を超えたら追加しない（高カーディナリティのパターンでメモリを食わない）。
+            LikeCache: System.Collections.Generic.Dictionary<struct (int * string), Result<Scalar.LikePattern, DbError>>
             /// 計画時に解決できなかった列参照の最初のエラー。
             /// 評価は行ごとなので、入力が 0 行だとこのエラーが表に出ない。
             /// 演算子は `Eval.checkPrepared` で構築時に検査する。
@@ -45,14 +50,23 @@ type internal Prepared =
 
     /// コンパイル済み LIKE パターンを返す。
     /// `escape` はコードポイント（`Scalar.NoEscape` = ESCAPE なし）。
-    /// リテラル以外のパターンはここでコンパイルする。
+    /// リテラル以外のパターンはここでコンパイルし、演算子ごとのスクラッチに覚える。
     member this.Like (escape: int) (pattern: string) =
         let key = struct (escape, pattern)
 
         if this.Patterns.ContainsKey key then
             this.Patterns.[key]
         else
-            Scalar.compileTokens (if escape = Scalar.NoEscape then None else Some escape) pattern
+            match this.LikeCache.TryGetValue key with
+            | true, compiled -> compiled
+            | false, _ ->
+                let compiled =
+                    Scalar.compileTokens (if escape = Scalar.NoEscape then None else Some escape) pattern
+
+                if this.LikeCache.Count < 1024 then
+                    this.LikeCache.[key] <- compiled
+
+                compiled
 
 /// 評価対象の行。
 /// JOIN の ON 句では左右の行を連結せずに参照する（構造体なのでヒープ割当なし）。
@@ -754,6 +768,8 @@ module internal Eval =
             Source = schema
             Resolved = columns
             Patterns = likes
+            LikeCache =
+                System.Collections.Generic.Dictionary<struct (int * string), Result<Scalar.LikePattern, DbError>>()
             FirstError = firstError |> Option.orElse likeError
         }
 
