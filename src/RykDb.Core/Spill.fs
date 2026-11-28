@@ -295,10 +295,14 @@ module internal Spill =
                 ret None
             else
                 match readVarintFrom s (byte first) with
-                | Ok len when len > uint64 System.Int32.MaxValue -> err (DbError.corruption "Spill: 行の長さが異常です")
+                | Ok len when
+                    len > uint64 System.Int32.MaxValue
+                    || (s.CanSeek && len > uint64 (max 0L (s.Length - s.Position)))
+                    ->
+                    err (DbError.corruption "Spill: 行の長さが異常です")
                 | Ok len ->
                     readExactly s (int len)
-                    >>= (Cursor.create >> ValueCodec.readValues)
+                    >>= (Cursor.create >> ValueCodec.readValuesSparse)
                     >>= fun (values, _) -> ret (Some values)
                 | Error e -> err e)
         >>= id

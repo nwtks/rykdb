@@ -479,6 +479,30 @@ WAL commit成功後に`Error`を返さない。
 さらに`Manifest.append`は対象ファイルが無いとき、`OpenOrCreate`で空ファイルを作り直さず`NotApplied`にする。
 回帰テスト: `StorageEngine.maybeFlush: MANIFEST ローテーション後の WAL 失敗でも番号を進めて次の flush を失わない`。
 
+### 4.20 読み直した MANIFEST の番号へ追随する
+
+`Manifest.openOrCreate`は末尾の書きかけを見つけると新しい MANIFEST へスナップショットし、
+CURRENT を切り替える。Unknown install の判定でこの番号を捨てると、
+以後の flush / compaction が CURRENT の指さない MANIFEST へ追記し、
+再オープン時の Version にその出力が載らない。
+
+- ✅ `resolveUnknownInstall`は読み直した`manifestNumber`を常に公開する。
+- ✅ 復旧後の MANIFEST が compaction 出力を参照していれば削除しない。
+- 回帰: `background compaction: 再読で CURRENT が切り替わったら ManifestNumber も追随する`。
+
+### 4.21 細工された SSTable は必ず CorruptionError にする
+
+層状 CRC が正しい（= 作成側の規約違反）ファイルでも、構造の不整合は検出する。
+
+- ✅ ブロック内のキーは直前キー以上（`Bytes.compare prev key > 0`は CorruptionError。
+  同一キーの複数版は許す）。
+- ✅ ブロックの先頭キーは前ブロックの`LastKey`以上。ポイント検索の走査も同じ検査をする。
+- ✅ Footerの`MaxSeqNo`は非負、`EntryCount = 0`と索引が空は同値。
+- ✅ Meta は空（空テーブル）以外の解析失敗を CorruptionError にする（空キーへ黙って倒さない）。
+- 回帰: `SstableReader.rangeScanPartial: ブロック内のキーが昇順でなければ CorruptionError` /
+  `SstableReader.openPartial: Footer の MaxSeqNo が負なら CorruptionError` /
+  `SstableReader.openPartial: エントリ数と索引の有無が食い違えば CorruptionError`。
+
 ### 4.19 走査に結び付けた資源は継続にも後始末を付ける
 
 `SstScan`の遅延走査は、`next`が返す**続き（continuation）を捨てる**のが実際の破棄経路になる。
@@ -892,6 +916,19 @@ run のリストを `splitAt` と `@` で行ごとに組み直すと、1行出�
   （`ExtSort.scanArray` / `writeMerged` / `pull`）。
 - ✅ 尽きた run は `Head = None` にして閉じ、最後に残りを閉じる（`Dispose` は冪等）。
 - 回帰: `ExtSort` / `OpsSort` / `OpsDistinct` / `OpsAggregate` のスピル系テスト。
+
+### 7.19 退避 run の行長は確保前に残量と比べる
+
+`Spill.readRow`が長さ varint だけで`Array.zeroCreate`すると、
+数バイトの壊れた run で 2GiB を確保し得る。
+
+- ✅ 長さが`Int32.MaxValue`か、seekable ならファイル残量を超えていたら CorruptionError。
+- ✅ マスク復号の読み飛ばし（`ValueCodec.skipValue`）も`Cursor.splitAt`で境界を検査する。
+- ✅ `ValueCodec.readValues`はタグ 10（`Unloaded`）を拒否し、スピル専用の
+  `readValuesSparse`だけが許す。
+- 回帰: `Spill.readRow: 残量を超える行長は確保せず CorruptionError` /
+  `ValueCodec.readValuesMasked: 切り詰められた固定長値は CorruptionError` /
+  `ValueCodec.readValues: スピル専用の Unloaded は CorruptionError`。
 
 ### 7.18 sweepStale はクエリごとに呼ばない
 

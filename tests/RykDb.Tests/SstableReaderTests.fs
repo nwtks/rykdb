@@ -466,6 +466,74 @@ let ``SstableReader.openPartial: 壊れたブロックは読み出し時に Corr
             (SstableReader.rangeScanPartial [||] 0 partial |> SstScan.toArray))
 
 [<Fact>]
+let ``SstableReader.rangeScanPartial: ブロック内のキーが昇順でなければ CorruptionError`` () =
+    withDir "sst-block-order" (fun dir ->
+        // TEXT "b" の次に INTEGER 1（バイト順は INTEGER が先）を置いたブロック。
+        // 接頭辞共有は 0 にして、並びだけを壊す。
+        let textKey = ok (KeyBuilder.ofValues [ SqlValue.Text "b" ])
+        let intK = intKey 1
+        let tombstone = [| 1uy; 0uy; 0uy |]
+
+        let entry (key: byte array) =
+            Array.concat [ [| 0uy; byte key.Length; byte tombstone.Length |]; key; tombstone ]
+
+        let content = Array.append (entry textKey) (entry intK)
+        let crc = Hashing.checksum content
+
+        let block =
+            Array.append content [| for i in 0..3 -> byte (crc >>> (8 * i) &&& 0xFFu) |]
+
+        let path = System.IO.Path.Combine(dir, "unordered.sst")
+        System.IO.File.WriteAllBytes(path, block)
+
+        let info =
+            {
+                Path = path
+                Index =
+                    [|
+                        {
+                            LastKey = intK
+                            Offset = 0
+                            Length = block.Length
+                        }
+                    |]
+                MinKey = textKey
+                MaxKey = intK
+                Bloom = None
+                EntryCount = 2L
+                MaxSeqNo = 1UL
+            }
+
+        expectErrorKind
+            ErrorKind.CorruptionError
+            "降順のブロックは CorruptionError"
+            (SstScan.toArray (SstableReader.rangeScanPartial [||] 0 info)))
+
+[<Fact>]
+let ``SstableReader.openPartial: Footer の MaxSeqNo が負なら CorruptionError`` () =
+    withDir "sst-footer-negative-seq" (fun dir ->
+        let data = ok (buildSstable 0.01 (sstEntries 10))
+        let footerStart = data.Length - SstableFooter.FooterSize
+        writeI64At data (footerStart + 12) -1L
+        fixFooterChecksum data
+
+        let path = System.IO.Path.Combine(dir, "negative.sst")
+        System.IO.File.WriteAllBytes(path, data)
+        expectErrorKind ErrorKind.CorruptionError "負の MaxSeqNo は CorruptionError" (SstableReader.openPartial path))
+
+[<Fact>]
+let ``SstableReader.openPartial: エントリ数と索引の有無が食い違えば CorruptionError`` () =
+    withDir "sst-footer-entry-count" (fun dir ->
+        let data = ok (buildSstable 0.01 (sstEntries 10))
+        let footerStart = data.Length - SstableFooter.FooterSize
+        writeI64At data (footerStart + 68) 0L
+        fixFooterChecksum data
+
+        let path = System.IO.Path.Combine(dir, "entry-count.sst")
+        System.IO.File.WriteAllBytes(path, data)
+        expectErrorKind ErrorKind.CorruptionError "エントリ数 0 で索引があるのは CorruptionError" (SstableReader.openPartial path))
+
+[<Fact>]
 let ``SstableReader.openPartial: 索引の範囲がファイル外なら CorruptionError`` () =
     withDir "sst-partial-index-range" (fun dir ->
         let path = System.IO.Path.Combine(dir, "1.sst")

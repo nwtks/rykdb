@@ -349,6 +349,56 @@ let ``background compaction: MANIFEST の結果が不明でも再読で未反映
         ok (RowStore.close reopened) |> ignore)
 
 [<Fact>]
+let ``background compaction: 再読で CURRENT が切り替わったら ManifestNumber も追随する`` () =
+    withDir "bg-manifest-unknown-rollback" (fun dir ->
+        // Unknown を返す前に MANIFEST の末尾を書きかけにする。
+        // 再読は末尾を切り捨てて新しい MANIFEST へスナップショットし、CURRENT を切り替える。
+        let mutable torn = false
+
+        let hook (_: VersionEdit) =
+            if not torn then
+                torn <- true
+
+                match System.IO.Directory.GetFiles(dir, "MANIFEST-*") with
+                | [||] -> ()
+                | manifests -> System.IO.File.AppendAllText(Array.sort manifests |> Array.last, "!!!")
+
+            Some(ManifestApplyResult.Unknown(DbError.create ErrorKind.IoError "injected-torn"))
+
+        let store =
+            openBackgroundWith
+                dir
+                { RowStoreOptions.Background with
+                    MemLimitBytes = Some 1
+                    Compaction = Some forceL1Compaction
+                    ManifestApplyHook = Some hook
+                }
+
+        let mutable current = store
+
+        try
+            for i in 1..4 do
+                current <- writeOne current i
+
+            let host = expectSome "store.Host" store.Host
+            waitIdle host
+
+            let expected =
+                match Manifest.openOrCreate dir with
+                | Ok(_, manifestNumber) -> manifestNumber
+                | Error e -> failwithf "MANIFEST を開けません: %s" (DbError.toDisplayString e)
+
+            // 古い番号のままだと、以後の flush が CURRENT の指さない MANIFEST へ追記する。
+            Assert.Equal<ManifestNumber>(expected, host.Current.ManifestNumber)
+
+            let refreshed = refresh current
+
+            for i in 1..4 do
+                Assert.True((ok (RowStore.getAtMasked "t" (intKey i) [||] None refreshed)).IsSome)
+        finally
+            RowStore.close current |> ignore)
+
+[<Fact>]
 let ``background compaction: MANIFEST 反映済みの Unknown でも ReadInfo を失わない`` () =
     withDir "bg-manifest-unknown-applied" (fun dir ->
         // MANIFEST には実際に反映するが、結果は Unknown を返す。

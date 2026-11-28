@@ -41,6 +41,26 @@ let ``Spill.partitionOfKey: 同じキーは同じパーティション、salt �
     Assert.True(indices.Length > 1, "salt を変えてもパーティションが変わっていません")
 
 [<Fact>]
+let ``Spill.readRow: 残量を超える行長は確保せず CorruptionError`` () =
+    withDir "spill-row-length" (fun dir ->
+        // 長さ 1,000,000 の varint の直後でファイルが終わっている run。
+        let openBogus (name: string) =
+            let path = Spill.runPath (Some dir) name 0
+            System.IO.File.WriteAllBytes(path, [| 0xC0uy; 0x84uy; 0x3Duy |])
+            new Source(System.IO.File.OpenRead path :> System.IO.Stream)
+
+        // JIT を温めてから確保量を測る。
+        use warmup = openBogus "bogus-warmup"
+        expectErrorKind ErrorKind.CorruptionError "残量超過の行長" (Spill.readRow warmup)
+
+        use source = openBogus "bogus"
+        let before = System.GC.GetAllocatedBytesForCurrentThread()
+        let read = Spill.readRow source
+        let allocated = System.GC.GetAllocatedBytesForCurrentThread() - before
+        expectErrorKind ErrorKind.CorruptionError "残量超過の行長" read
+        Assert.True(allocated < 100_000L, sprintf "行長の確保が大きすぎます: %d バイト" allocated))
+
+[<Fact>]
 let ``Spill.foldRun: 終端でファイルを消す`` () =
     withDir "spill-fold" (fun dir ->
         let path = Spill.runPath (Some dir) "fold" 0

@@ -102,6 +102,33 @@ let ``KeyBuilder.inEqualityPrefix: NUL 継続値を等値から除外する`` ()
     Assert.False(KeyBuilder.inEqualityPrefix textPrefix textUpper textLonger)
 
 [<Fact>]
+let ``ValueCodec.readValues: スピル専用の Unloaded は CorruptionError`` () =
+    let w = ok (ValueCodec.writeValuesSparse [| SqlValue.Unloaded |] Writer.Empty)
+    let bytes = Writer.toArray w
+    expectErrorKind ErrorKind.CorruptionError "永続データに Unloaded が現れている" (ValueCodec.readValues (Cursor.create bytes))
+
+    match ValueCodec.readValuesSparse (Cursor.create bytes) with
+    | Ok(values, _) ->
+        match values.[0] with
+        | SqlValue.Unloaded -> ()
+        | other -> failActual "Unloaded ではない" other
+    | Error e -> Assert.Fail(sprintf "sparse 復号が失敗しました: %s" (DbError.toDisplayString e))
+
+[<Fact>]
+let ``ValueCodec.readValuesMasked: 切り詰められた固定長値は CorruptionError`` () =
+    let w =
+        ok (ValueCodec.writeValues [| SqlValue.Int 1L; SqlValue.Decimal 2M |] Writer.Empty)
+
+    let bytes = Writer.toArray w
+    // 最後の DECIMAL（33バイト）を途中で切る。読まない列でも境界を確かめる。
+    let truncated = Array.sub bytes 0 (bytes.Length - 10)
+
+    expectErrorKind
+        ErrorKind.CorruptionError
+        "切り詰められた値を読み飛ばしている"
+        (ValueCodec.readValuesMasked [| false; false |] (Cursor.create truncated))
+
+[<Fact>]
 let ``ValueCodec: 全型の往復`` () =
     let values = Array.init 3000 (fun _ -> randomValue ())
     let w = ValueCodec.writeValues values Writer.Empty |> ok

@@ -238,7 +238,8 @@ module internal ValueCodec =
         | SqlValue.Unloaded -> err (DbError.internalError "SqlValue.Unloaded は符号化できません")
 
     /// 型タグを読んで 1値を復号する（高速経路に乗らない型）。
-    let private readValueSlow (c: Cursor) =
+    /// `allowUnloaded` はスピルの退避行だけが true（永続化された行には現れない）。
+    let private readValueSlow (allowUnloaded: bool) (c: Cursor) =
         result {
             let! tag, c = Reader.readByte c
 
@@ -296,7 +297,7 @@ module internal ValueCodec =
             | TagUuid ->
                 let! bs, c = Reader.readBytes 16 c
                 return System.Guid bs |> SqlValue.Uuid, c
-            | TagUnloaded -> return SqlValue.Unloaded, c
+            | TagUnloaded when allowUnloaded -> return SqlValue.Unloaded, c
             | _ -> return! err (sprintf "ValueCodec: 不明な型タグ %d" (int tag) |> DbError.corruption)
         }
 
@@ -417,30 +418,30 @@ module internal ValueCodec =
             ValueNone
 
     /// INT の高速経路を試し、だめなら `readValueSlow` で読む。
-    let private readValue (c: Cursor) =
+    let private readValue (allowUnloaded: bool) (c: Cursor) =
         match readInt c with
         | ValueSome struct (v, c) -> ret (v, c)
-        | ValueNone -> readValueSlow c
+        | ValueNone -> readValueSlow allowUnloaded c
 
     /// 配列へ値を読み込む本体。
     [<TailCall>]
-    let rec private fillReadValues (values: SqlValue array) (count: int) (i: int) (c: Cursor) =
+    let rec private fillReadValues (allowUnloaded: bool) (values: SqlValue array) (count: int) (i: int) (c: Cursor) =
         if i >= count then
             ret (values, c)
         else
             match readInt c with
             | ValueSome struct (v, c') ->
                 values.[i] <- v
-                fillReadValues values count (i + 1) c'
+                fillReadValues allowUnloaded values count (i + 1) c'
             | ValueNone ->
-                match readValue c with
+                match readValue allowUnloaded c with
                 | Ok(v, c') ->
                     values.[i] <- v
-                    fillReadValues values count (i + 1) c'
+                    fillReadValues allowUnloaded values count (i + 1) c'
                 | Error e -> err e
 
-    /// 値の並びを復号する（`writeValues` の逆）。
-    let readValues (c: Cursor) =
+    /// 値の並びを復号する本体。
+    let private readValuesWith (allowUnloaded: bool) (c: Cursor) =
         result {
             let! n, c = Reader.readVarint c
 
@@ -449,8 +450,15 @@ module internal ValueCodec =
             else
                 let count = int n
                 let values = Array.zeroCreate<SqlValue> count
-                return! fillReadValues values count 0 c
+                return! fillReadValues allowUnloaded values count 0 c
         }
+
+    /// 値の並びを復号する（`writeValues` の逆）。
+    /// `Unloaded` は永続化された行には現れない（スピル専用）。
+    let readValues (c: Cursor) = readValuesWith false c
+
+    /// 値の並びを復号する（スピルの `writeValuesSparse` の逆。`Unloaded` を許す）。
+    let readValuesSparse (c: Cursor) = readValuesWith true c
 
     /// 長さ付きの値を読み飛ばす（マスク復号用）。
     let private skipLengthPrefixed (c: Cursor) =
@@ -461,21 +469,27 @@ module internal ValueCodec =
             else
                 ret (Cursor.advance (int n) c)
 
+    /// 固定長の値を読み飛ばす（残りが足りなければ CorruptionError）。
+    let private skipFixed (n: int) (c: Cursor) =
+        Cursor.splitAt n c >>= fun (_, rest) -> ret rest
+
     /// 1値を読み飛ばす（マスク復号用）。
+    /// 長さを先に確かめずに `Cursor.advance` すると、切り詰められたブロックを
+    /// 黙って読み飛ばしてしまう。
     let private skipValue (c: Cursor) =
         Reader.readByte c
         >>= fun (tag, c) ->
             match tag with
             | TagNull -> ret c
-            | TagBool -> ret (Cursor.advance 1 c)
+            | TagBool -> skipFixed 1 c
             | TagInt
             | TagReal
             | TagDate
-            | TagTimestamp -> ret (Cursor.advance 8 c)
-            | TagDecimal -> ret (Cursor.advance 32 c)
+            | TagTimestamp -> skipFixed 8 c
+            | TagDecimal -> skipFixed 32 c
             | TagText
             | TagBlob -> skipLengthPrefixed c
-            | TagUuid -> ret (Cursor.advance 16 c)
+            | TagUuid -> skipFixed 16 c
             | _ -> err (sprintf "ValueCodec: 不明な型タグ %d" (int tag) |> DbError.corruption)
 
     /// マスク付きで配列へ値を読み込む本体（false の列は読み飛ばす）。
@@ -493,7 +507,7 @@ module internal ValueCodec =
                 values.[i] <- v
                 fillReadValuesMasked mask values count (i + 1) c'
             | ValueNone ->
-                match readValue c with
+                match readValue false c with
                 | Ok(v, c') ->
                     values.[i] <- v
                     fillReadValuesMasked mask values count (i + 1) c'

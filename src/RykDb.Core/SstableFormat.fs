@@ -128,6 +128,8 @@ module internal SstableFooter =
 
             if Hashing.checksumRange footerBytes 0 FooterChecksumLength <> footerChecksum then
                 return! err (DbError.corruption "Sstable: Footer のチェックサム不一致")
+            else if maxSeqNo < 0L then
+                return! err (DbError.corruption "Sstable: Footer の MaxSeqNo が負です")
             else if
                 not (fitsInt indexOff)
                 || not (fitsInt indexLen)

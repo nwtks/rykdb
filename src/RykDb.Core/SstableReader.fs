@@ -62,14 +62,16 @@ module internal SstableReader =
         =
         readItem step c state 0 (Array.zeroCreate<'Item> 128)
 
-    /// メタデータから最小・最大キーを取り出す（壊れていたら空に倒す）。
+    /// メタデータから最小・最大キーを取り出す。
+    /// 空のテーブルはメタデータが無い（空キー）。
+    /// 中身があるのに壊れていれば CorruptionError（空キーへ黙って倒さない）。
     let private readMinMaxKey (metaBytes: byte array) =
-        match Cursor.create metaBytes |> Reader.readLengthPrefixed with
-        | Ok(mn, c) ->
-            match Reader.readLengthPrefixed c with
-            | Ok(mx, _) -> mn, mx
-            | Error _ -> [||], [||]
-        | Error _ -> [||], [||]
+        if metaBytes.Length = 0 then
+            ret ([||], [||])
+        else
+            Cursor.create metaBytes
+            |> Reader.readLengthPrefixed
+            >>= fun (mn, c) -> Reader.readLengthPrefixed c |> Result.map (fun (mx, _) -> mn, mx)
 
     /// Bloom filter のバイト列を復元する。
     let private readBloomBytes (bytes: byte array) =
@@ -169,9 +171,9 @@ module internal SstableReader =
                 let metaBytes = readRegion stream (int64 footer.MetaOff) footer.MetaLen
                 let bloomBytes = readRegion stream (int64 footer.BloomOff) footer.BloomLen
                 let indexBytes = readRegion stream (int64 footer.IndexOff) footer.IndexLen
-                let minKey, maxKey = readMinMaxKey metaBytes
 
                 result {
+                    let! minKey, maxKey = readMinMaxKey metaBytes
                     let! bloom = readBloomBytes bloomBytes
                     let! indexEntries = parseIndexBytes indexBytes
 
@@ -180,6 +182,8 @@ module internal SstableReader =
                         <> footer.MetadataChecksum
                     then
                         return! err (DbError.corruption "Sstable: 部分読みメタデータのチェックサム不一致")
+                    else if (footer.EntryCount = 0) <> (indexEntries.Length = 0) then
+                        return! err (DbError.corruption "Sstable: エントリ数と索引の有無が一致しません")
                     else
                         do! validateIndexEntries footerStart indexEntries
 
@@ -254,19 +258,22 @@ module internal SstableReader =
                         return!
                             Reader.copyBytesInto key sharedLength tailLength c
                             >>= fun c ->
-                                match mode with
-                                | DecodeValues ->
-                                    SstEntry.decodeValueAt (int valueLen) c
-                                    >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
-                                | RawValues ->
-                                    SstEntry.decodeRawValueAt (int valueLen) c
-                                    >>= fun (seqNo, raw, c) -> ret (c, SstEntry.makeRaw key seqNo raw, key)
-                                | SkipValues ->
-                                    SstEntry.decodeSkippedValueAt (int valueLen) c
-                                    >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
-                                | MaskValues mask ->
-                                    SstEntry.decodeMaskedValueAt mask (int valueLen) c
-                                    >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
+                                if Bytes.compare prev key > 0 then
+                                    err (DbError.corruption "Sstable: ブロック内のキーが昇順ではありません")
+                                else
+                                    match mode with
+                                    | DecodeValues ->
+                                        SstEntry.decodeValueAt (int valueLen) c
+                                        >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
+                                    | RawValues ->
+                                        SstEntry.decodeRawValueAt (int valueLen) c
+                                        >>= fun (seqNo, raw, c) -> ret (c, SstEntry.makeRaw key seqNo raw, key)
+                                    | SkipValues ->
+                                        SstEntry.decodeSkippedValueAt (int valueLen) c
+                                        >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
+                                    | MaskValues mask ->
+                                        SstEntry.decodeMaskedValueAt mask (int valueLen) c
+                                        >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
         }
 
     /// バッファ内の範囲にある 1ブロックをエントリ列へ復元する。
@@ -300,6 +307,8 @@ module internal SstableReader =
                     || Bytes.compare entries.[entries.Length - 1].Key ie.LastKey <> 0
                 then
                     err (DbError.corruption "Sstable: 索引の LastKey とブロックが一致しません")
+                elif i > 0 && Bytes.compare partial.Index.[i - 1].LastKey entries.[0].Key > 0 then
+                    err (DbError.corruption "Sstable: 前のブロックの LastKey より小さいキーで始まっています")
                 else
                     ret entries
 
@@ -604,33 +613,37 @@ module internal SstableReader =
                 let entryKey = Array.zeroCreate<byte>(sharedLength + tailLength)
                 Array.blit prev 0 entryKey 0 sharedLength
                 Array.blit data keyStart entryKey sharedLength tailLength
-                let ordering = Bytes.compare entryKey key
 
-                if ordering < 0 then
-                    scanLookupBlock key mask visible indexEntry data payloadLen entryKey (valuePos + valueLength)
-                elif ordering > 0 then
-                    ret None
+                if Bytes.compare prev entryKey > 0 then
+                    err (DbError.corruption "Sstable: ブロック内のキーが昇順ではありません")
                 else
-                    match decodeLookupValue data mask valuePos valueLength with
-                    | Ok(seqNo, value, _) ->
-                        let isVisible =
-                            match visible with
-                            | Some s -> seqNo <= s
-                            | None -> true
+                    let ordering = Bytes.compare entryKey key
 
-                        if isVisible then
-                            ret (Some(SstEntry.make entryKey seqNo value))
-                        else
-                            scanLookupBlock
-                                key
-                                mask
-                                visible
-                                indexEntry
-                                data
-                                payloadLen
-                                entryKey
-                                (valuePos + valueLength)
-                    | Error e -> err e
+                    if ordering < 0 then
+                        scanLookupBlock key mask visible indexEntry data payloadLen entryKey (valuePos + valueLength)
+                    elif ordering > 0 then
+                        ret None
+                    else
+                        match decodeLookupValue data mask valuePos valueLength with
+                        | Ok(seqNo, value, _) ->
+                            let isVisible =
+                                match visible with
+                                | Some s -> seqNo <= s
+                                | None -> true
+
+                            if isVisible then
+                                ret (Some(SstEntry.make entryKey seqNo value))
+                            else
+                                scanLookupBlock
+                                    key
+                                    mask
+                                    visible
+                                    indexEntry
+                                    data
+                                    payloadLen
+                                    entryKey
+                                    (valuePos + valueLength)
+                        | Error e -> err e
 
     /// 1ブロックを検索する（チェックサムを検証してから走査）。
     let private lookupIndexEntry

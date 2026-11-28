@@ -1216,8 +1216,11 @@ Bloom filterのビット数は`expectedEntries`の見積りから決める。
 `Sstable.openPartial`はFooter、Meta、Bloom filter、Indexだけを読み込む。
 データブロックは必要になったときだけ開く。
 IndexはmetadataChecksumで守られるが、チェックサムごと作り直されたファイルに備え、
-open時に「各ブロックの範囲がfooterStart以内・重なりなし・`LastKey`が昇順」を検証し、
-違反は`CorruptionError`にする
+open時に「各ブロックの範囲がfooterStart以内・重なりなし・`LastKey`が昇順」と
+「`MaxSeqNo`非負・`EntryCount`と索引の有無の一致」を検証し、違反は`CorruptionError`にする。
+ブロックを読むときは「ブロック内のキーが昇順・先頭キーが前ブロックの`LastKey`以上」も検査する
+（同一キーの複数版は許す）。
+ポイント検索の走査も同じ順序検査をする
 （壊れた索引が二分探索・範囲読みの前提を壊し、静かな誤答やブロック長の巨大割当になるのを防ぐ）。
 
 - ポイント検索は通常1ブロックだけ読む。

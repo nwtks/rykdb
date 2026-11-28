@@ -540,6 +540,12 @@ module private VersionCoordinatorHelpers =
         result.Removed |> List.iter (fun f -> retireFile ctx.FileRefs f.FileNumber)
 
     /// MANIFEST 追記の結果が Unknown のとき、読み直して適用済みかを確かめる。
+    /// <remarks>
+    /// 読み直しは CURRENT を別の MANIFEST へ切り替えることがある
+    /// （追記の巻き戻しで新しい世代を書いた場合）。
+    /// その番号を捨てると、以後の flush / compaction が CURRENT の指さない MANIFEST へ追記し、
+    /// 再オープン時にその出力が Version から消える。
+    /// </remarks>
     let private resolveUnknownInstall
         (ctx: InstallContext)
         (current: PublishedState)
@@ -552,7 +558,22 @@ module private VersionCoordinatorHelpers =
         match Manifest.openOrCreate ctx.Dir with
         | Ok(version, manifestNumber) when sameFileSet version expected ->
             publishInstalled ctx result expected manifestNumber
-        | Ok _ -> publishInstallError ctx result error
+        | Ok(version, manifestNumber) ->
+            let referenced = Version.allFiles version |> List.map _.FileNumber |> Set.ofList
+
+            if
+                result.Added
+                |> List.exists (fun f -> Set.contains f.FileNumber referenced)
+                |> not
+            then
+                FileMetaData.deleteObsolete ctx.Dir result.Added |> ignore
+
+            publish ctx.StateCell ctx.StateKey (fun state ->
+                { state with
+                    ManifestNumber = manifestNumber
+                    LastCompactionError = Some error
+                })
+            |> ignore
         | Error _ -> publishInstallFailure ctx error
 
     /// compaction 結果を MANIFEST へ反映する。
