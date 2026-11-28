@@ -293,6 +293,41 @@ let ``StorageEngine.scanAtMasked: 先頭 1 件だけなら全件を実体化し�
             )))
 
 [<Fact>]
+let ``StorageEngine.scanAtMasked: limit の終端で走査のファイルを閉じる`` () =
+    withDir "se-limit-close" (fun dir ->
+        withEngine dir (fun engine ->
+            let f =
+                mkSst dir 10L 0 [ Entry.put (intKey 1) 1UL (intRow 1); Entry.put (intKey 2) 2UL (intRow 2) ]
+
+            let engine =
+                { engine with
+                    Version = Version.Empty |> Version.addFile f
+                }
+
+            let scan = ok (StorageEngine.scanAtMasked [||] 1 [| true |] None engine)
+
+            let rest =
+                match SstScan.next scan with
+                | Ok(Some(_, rest)) -> rest
+                | _ -> failwith "1 行目が取れませんでした"
+
+            // limit の終端。ScanScope を持たない呼び出しでもここで閉じる。
+            match SstScan.next rest with
+            | Ok None -> ()
+            | _ -> Assert.Fail "limit 1 の終端が None ではありませんでした"
+
+            // SSTable の FileStream が残っていないことを、FileShare.None で開き直して確かめる。
+            use _ =
+                new System.IO.FileStream(
+                    FileMetaData.path dir 10L,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.Read,
+                    System.IO.FileShare.None
+                )
+
+            ()))
+
+[<Fact>]
 let ``StorageEngine.scanAtMasked: limit 1 は後続の壊れたファイルを開かない`` () =
     withDir "se-lazy-open" (fun dir ->
         withEngine dir (fun engine ->

@@ -45,6 +45,8 @@
 - `SstScan.fsi` で union case を隠す。
 - `SstScan.withScan` は走査の終了時と失敗時に必ず `Dispose` を呼ぶ。
 - `ofStepWithClose` はファイルハンドルを保持する walk に使う。
+- `StorageEngine`のlimit終端と、`Dml`の索引キー復号エラーは、
+  `ScanScope`が無くてもその場で下流の走査を閉じる。
 
 回帰テストでは、成功、失敗、フィルタ、配列化、
 compaction 中断の各経路で一度だけ消費されることとハンドルが残らないことを検査する。

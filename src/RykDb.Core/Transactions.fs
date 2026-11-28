@@ -428,6 +428,24 @@ module internal TransactionManager =
                 | _ -> Map.add k commitSeq acc)
             physical
 
+    /// バッファに積まれたエントリ数。
+    let private bufferedEntryCount (txn: Transaction) =
+        txn.Buffers |> Map.fold (fun acc _ entries -> acc + uint64 entries.Count) 0UL
+
+    /// commit で割り当てる SeqNo が `UInt64` の上限を超えるか。
+    /// 予約だけの commit も 1つ SeqNo を使う。
+    let private seqNoOverflow (manager: TransactionManager) (txn: Transaction) =
+        let entries = bufferedEntryCount txn
+
+        let needed =
+            if Map.isEmpty txn.Reservations then
+                entries
+            else
+                max entries 1UL
+
+        manager.LastCommitSeqNo = System.UInt64.MaxValue
+        || needed > System.UInt64.MaxValue - manager.NextSeqNo
+
     /// commit する。
     /// 1. transaction 開始時の snapshot より後に、同じキーへの commit があれば競合とする。
     /// 2. 競合がなければ SeqNo を割り当て、今回の書き込みを `LastCommitted` に記録する。
@@ -441,6 +459,8 @@ module internal TransactionManager =
             err (sprintf "Transaction %d が存在しません" txn.TxnId |> DbError.internalError)
         elif Transaction.isOverLimit txn then
             err (Transaction.overLimitError txn)
+        elif seqNoOverflow manager txn then
+            err (DbError.capacity "SeqNo が上限（UInt64.MaxValue）に達したため、これ以上 commit できません")
         else
             let conflicting = findWriteConflicts manager.LastCommitted txn.Snapshot.SeqNo txn
 

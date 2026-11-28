@@ -122,6 +122,47 @@ let ``TransactionManager.commit: バッファ上限を超えると commit でき
     expectErrorKind ErrorKind.CapacityError "上限を超えた transaction を commit できてしまう" (TransactionManager.commit txn mgr)
 
 [<Fact>]
+let ``TransactionManager.commit: SeqNo の上限に達すると CapacityError`` () =
+    // バッチの採番が UInt64 を巻き戻さないこと。
+    let mgr =
+        { TransactionManager.create () with
+            NextSeqNo = System.UInt64.MaxValue - 1UL
+            LastCommitSeqNo = System.UInt64.MaxValue - 2UL
+        }
+
+    let mgr, txn = TransactionManager.beginTxn mgr
+
+    let txn =
+        txn
+        |> Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |]
+        |> Transaction.put "t:x" [| 2uy |] [| SqlValue.Int 2L |]
+        |> Transaction.put "t:x" [| 3uy |] [| SqlValue.Int 3L |]
+
+    expectErrorKind ErrorKind.CapacityError "SeqNo の上限を超えて commit できてしまう" (TransactionManager.commit txn mgr)
+
+    // 収まるバッチは最後の SeqNo まで使い、次の commit が上限で止まる。
+    let mgr =
+        { TransactionManager.create () with
+            NextSeqNo = System.UInt64.MaxValue - 2UL
+            LastCommitSeqNo = System.UInt64.MaxValue - 3UL
+        }
+
+    let mgr, txn = TransactionManager.beginTxn mgr
+
+    let txn =
+        txn
+        |> Transaction.put "t:x" [| 1uy |] [| SqlValue.Int 1L |]
+        |> Transaction.put "t:x" [| 2uy |] [| SqlValue.Int 2L |]
+
+    let mgr, commitSeq, _ = ok (TransactionManager.commit txn mgr)
+    Assert.Equal<uint64>(System.UInt64.MaxValue - 1UL, commitSeq)
+    Assert.Equal<uint64>(System.UInt64.MaxValue, mgr.NextSeqNo)
+
+    let mgr, txn = TransactionManager.beginTxn mgr
+    let txn = Transaction.put "t:x" [| 3uy |] [| SqlValue.Int 3L |] txn
+    expectErrorKind ErrorKind.CapacityError "NextSeqNo が上限のときに commit できてしまう" (TransactionManager.commit txn mgr)
+
+[<Fact>]
 let ``Transaction: put したキー・行配列を後から書き換えてもバッファは保たれる`` () =
     let key = rowKey 1
     let row = [| SqlValue.Int 1L |]

@@ -411,7 +411,9 @@ module internal Dml =
                     indexScanAdvanceScan rowOf inRange slotArr slotCount rest j
                 else
                     match rowOf e.Key with
-                    | Error e -> OpStep.OpError e
+                    | Error e ->
+                        SstScan.dispose rest
+                        OpStep.OpError e
                     | Ok row -> OpStep.OpRow(row, indexScanPull rowOf inRange slotArr slotCount rest j)
         else
             match SstScan.next scan with
@@ -432,14 +434,18 @@ module internal Dml =
                             indexScanAdvanceScan rowOf inRange slotArr slotCount rest j
                         else
                             match rowOf e.Key with
-                            | Error e -> OpStep.OpError e
+                            | Error e ->
+                                SstScan.dispose rest
+                                OpStep.OpError e
                             | Ok row -> OpStep.OpRow(row, indexScanPull rowOf inRange slotArr slotCount rest j)
                     | 0 ->
                         match sv with
                         | None -> indexScanAdvanceScan rowOf inRange slotArr slotCount rest (j + 1)
                         | Some _ ->
                             match rowOf sk with
-                            | Error e -> OpStep.OpError e
+                            | Error e ->
+                                SstScan.dispose rest
+                                OpStep.OpError e
                             | Ok row -> OpStep.OpRow(row, indexScanPull rowOf inRange slotArr slotCount rest (j + 1))
                     | _ ->
                         let replay =
@@ -449,7 +455,9 @@ module internal Dml =
                         | None -> indexScanAdvanceScan rowOf inRange slotArr slotCount replay (j + 1)
                         | Some _ ->
                             match rowOf sk with
-                            | Error e -> OpStep.OpError e
+                            | Error e ->
+                                SstScan.dispose replay
+                                OpStep.OpError e
                             | Ok row -> OpStep.OpRow(row, indexScanPull rowOf inRange slotArr slotCount replay (j + 1))
 
     /// 索引スキャン。

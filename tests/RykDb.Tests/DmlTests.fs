@@ -485,3 +485,77 @@ let ``Dml.insertWithKey: 列数が違う行は弾かれる`` () =
         ErrorKind.ConstraintViolation
         "列数不一致を検出できなかった"
         (insertRow usersWithEmailIndex txn [| SqlValue.Int 1L |])
+
+[<Fact>]
+let ``Dml.scanByIndexPrefix: 索引キーの復号に失敗しても走査を閉じる`` () =
+    // scope を持たない走査（ScanScope 任せにできない）で復号エラーになっても、
+    // 開いた SSTable の FileStream を残さない。
+    withDir "dml-index-decode-close" (fun dir ->
+        let engine = ok (StorageEngine.openDatabaseWith None dir)
+
+        let index =
+            usersWithEmailIndex.Indexes |> List.find (fun i -> i.Name = "users_email")
+
+        // i:users_email に「email='a', id=9」の有効な索引キーを 1件持つ SSTable。
+        let validKey =
+            ok (KeyBuilder.ofIndexAndPrimary [ SqlValue.Text "a" ] [ SqlValue.Int 9L ])
+
+        let physicalKey = Keyspace.prefixedKey (Keyspace.index "users_email") validKey
+
+        // 同じ索引値の 2件目。マージは先頭を 1件先読みするので、
+        // 1件だけだと最初の next でファイルが閉じてしまい漏れを検出できない。
+        let secondKey =
+            ok (KeyBuilder.ofIndexAndPrimary [ SqlValue.Text "a" ] [ SqlValue.Int 10L ])
+
+        let secondPhysical = Keyspace.prefixedKey (Keyspace.index "users_email") secondKey
+
+        let entries =
+            [|
+                SstEntry.make physicalKey 1UL (Some [||])
+                SstEntry.make secondPhysical 2UL (Some [||])
+            |]
+
+        let f = ok (FileMetaData.writeSstable dir 10L 0 0.01 2 entries)
+
+        let engine =
+            { engine with
+                Version = Version.Empty |> Version.addFile f
+            }
+
+        let store = openStoreWith dir (DiskStorageEngine engine :> IStorageEngine)
+
+        // prefix だけの不正なスロット（行の復号で CorruptionError）を先頭に置く。
+        let _, txn = TransactionManager.beginTxn (TransactionManager.create ())
+        let prefix = ok (KeyBuilder.ofValues [ SqlValue.Text "a" ])
+
+        let slots =
+            Transaction.put (Keyspace.index "users_email") prefix [||] txn
+            |> Transaction.slotsOf (Keyspace.index "users_email")
+
+        let scan =
+            ok (
+                Dml.scanByIndexPrefixWithSlots
+                    store
+                    usersWithEmailIndex
+                    index
+                    [| SqlValue.Text "a" |]
+                    0
+                    [| true; true; true |]
+                    None
+                    None
+                    slots
+            )
+
+        match Op.next scan with
+        | OpStep.OpError _ -> ()
+        | _ -> Assert.Fail "索引キーの復号エラーになりませんでした"
+
+        use _ =
+            new System.IO.FileStream(
+                FileMetaData.path dir 10L,
+                System.IO.FileMode.Open,
+                System.IO.FileAccess.Read,
+                System.IO.FileShare.None
+            )
+
+        ())

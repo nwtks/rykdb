@@ -353,6 +353,19 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 - 回帰: `ForeignKey.checkParentDeletes: 少行の親 DELETE は子を全走査しない`
   （子 20行と 2000行の確保量差で経路を検査）。
 
+### 3.28 走査を途中で捨てたら自分で閉じる
+
+`ScanScope` に任せられるのは、scope を渡した呼び出しだけである。
+limit の終端や索引キーの復号エラーで走査を打ち切る場合、
+その場で下流を閉じないと SSTable の FileStream が最終化まで残る。
+
+- ✅ `StorageEngine` の limit 終端は `closeScanState` でマージのソースを閉じる
+  （`SstScan.dispose` は冪等なので、後から `ScanScope` が捨てても安全）。
+- ✅ `Dml.indexScanAdvanceScan` の復号エラーは、その時点の継続（`rest` / `replay`）を
+  `SstScan.dispose` してから `OpError` を返す。
+- 回帰: `StorageEngine.scanAtMasked: limit の終端で走査のファイルを閉じる` /
+  `Dml.scanByIndexPrefix: 索引キーの復号に失敗しても走査を閉じる`。
+
 ---
 
 ## 4. LSM・WAL・MANIFEST
@@ -624,6 +637,16 @@ write-write競合や書き込みバッファの上限超過は、再COMMITして
 - 回帰: `SessionPool: 競合した COMMIT は transaction を自動的に rollback する` /
   `SessionPool: SQL の COMMIT 競合でも transaction が閉じる` /
   `DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollback する`。
+
+### 5.13b SeqNo が上限に近い commit は採番前に止める
+
+`TransactionManager.commit`の採番は`NextSeqNo`からバッチ件数分進める。
+`UInt64`の上限を跨ぐと`commitSeq + 1UL`が0へ巻き戻り、可視性とGCが壊れる。
+
+- ✅ バッチ件数（予約だけのcommitは1）が`UInt64.MaxValue - NextSeqNo`を超えるなら
+  `CapacityError`（書き込みは適用しない）。
+- ✅ `LastCommitSeqNo = UInt64.MaxValue`からのcommitも拒否する。
+- 回帰: `TransactionManager.commit: SeqNo の上限に達すると CapacityError`。
 
 ### 5.13 fsync 失敗の COMMIT は適用済み。結果を捨てない
 

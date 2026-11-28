@@ -265,6 +265,10 @@ module internal StorageEngine =
         (state: ScanState)
         =
         if limit > 0 && state.Count >= limit then
+            // limit の終端はマージの途中で打ち切るので、ソースの走査を自分で閉じる
+            // （ScanScope を持たない呼び出しでも FileStream / lease を残さない）。
+            // `SstScan.dispose` は冪等なので、後から ScanScope が捨てても安全。
+            closeScanState state
             ret None
         else
             match prepareScan startKey maskOpt engine state.Merge state.Pending with

@@ -1252,6 +1252,8 @@ SSTable全体のチェックサムは持たない。
 
 `limit > 0`の走査は可視かつ非tombstoneのエントリをlimit件返した時点で終了する。
 後続ファイルの破損は到達しない限り検出しない。
+limitの終端はマージの途中で打ち切るため、`StorageEngine`がその場でソースの走査を閉じる
+（`ScanScope`を持たない呼び出しでもFileStreamを残さない）。
 
 走査はtombstoneを返さない。
 ポイント検索は最新版が削除なら `Value = None`を返し、

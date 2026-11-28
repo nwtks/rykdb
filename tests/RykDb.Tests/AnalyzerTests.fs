@@ -1076,7 +1076,7 @@ let ``Analyzer.joinLookupFor: prefix NDV が小さい索引を選ぶ`` () =
 [<Fact>]
 let ``Analyzer.mergeKeyOrderFor: 走査順の先頭が結合キーなら対応を返す`` () =
     let aligned =
-        Analyzer.mergeKeyOrderFor (Some [ "k"; "x" ]) (Some [ "k"; "y" ]) [ "k", "k" ]
+        Analyzer.mergeKeyOrderFor (Some [ "k"; "x" ]) (Some [ "k"; "y" ]) [ ("k", "k") ]
 
     let expected: Analyzer.MergeKeyOrder =
         {
@@ -1089,11 +1089,11 @@ let ``Analyzer.mergeKeyOrderFor: 走査順の先頭が結合キーなら対応�
 [<Fact>]
 let ``Analyzer.mergeKeyOrderFor: 走査順の先頭が結合キーでなければマージしない`` () =
     // キーでない列が先頭にあると、その走査はキー順にならない。
-    Assert.True((Analyzer.mergeKeyOrderFor (Some [ "x"; "k" ]) (Some [ "k"; "y" ]) [ "k", "k" ]).IsNone)
+    Assert.True((Analyzer.mergeKeyOrderFor (Some [ "x"; "k" ]) (Some [ "k"; "y" ]) [ ("k", "k") ]).IsNone)
 
 [<Fact>]
 let ``Analyzer.mergeKeyOrderFor: 片側が単一行走査ならもう片側のキー順に合わせる`` () =
-    let aligned = Analyzer.mergeKeyOrderFor (Some []) (Some [ "j"; "x" ]) [ "k", "j" ]
+    let aligned = Analyzer.mergeKeyOrderFor (Some []) (Some [ "j"; "x" ]) [ ("k", "j") ]
 
     let expected: Analyzer.MergeKeyOrder =
         {
@@ -1105,4 +1105,4 @@ let ``Analyzer.mergeKeyOrderFor: 片側が単一行走査ならもう片側の�
 
 [<Fact>]
 let ``Analyzer.mergeKeyOrderFor: 走査順が不明ならマージしない`` () =
-    Assert.True((Analyzer.mergeKeyOrderFor None (Some [ "k" ]) [ "k", "k" ]).IsNone)
+    Assert.True((Analyzer.mergeKeyOrderFor None (Some [ "k" ]) [ ("k", "k") ]).IsNone)
