@@ -473,7 +473,7 @@ let ``RowStore.commitToStore: 別ハンドルの active snapshot を GC 境界�
         let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
 
         // 同じ DB を開いた別ハンドルが snapshot 5 で読み始めている状態。
-        let other = store.Runtime.Register(dir, 5UL)
+        let other = store.Runtime.Register(dir, 5UL, ActiveRegistrationKind.Statement)
         let committed, _ = ok (RowStore.commitToStoreWith false dir None mgr txn store)
         let engine = ok (RowStore.ensure committed)
         // 自ハンドルだけなら 12（LastCommitSeqNo 11 + 1）だが、別ハンドルの 5 が下限になる。
@@ -497,7 +497,8 @@ let ``RowStore.commitToStore: 自分の登録は GC 境界から除外する`` (
         let txn = Transaction.put "t:a" (intKey 1) (intRow 1) txn
 
         // 自分（これから commit する transaction）の登録は除外し、他の登録だけを見る。
-        let own = store.Runtime.Register(dir, txn.Snapshot.SeqNo)
+        let own =
+            store.Runtime.Register(dir, txn.Snapshot.SeqNo, ActiveRegistrationKind.Transaction)
 
         let committed, _ =
             ok (RowStore.commitToStoreWith false dir (Some own) mgr txn store)

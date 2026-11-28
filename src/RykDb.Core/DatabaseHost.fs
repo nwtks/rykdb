@@ -180,7 +180,9 @@ module internal DatabaseHostHelpers =
         =
         current.Store.Runtime.WithShared(fun () ->
             let mgr, txn = TransactionManager.beginTxn current.Manager
-            let registration = current.Store.Runtime.Register(root, txn.Snapshot.SeqNo)
+
+            let registration =
+                current.Store.Runtime.Register(root, txn.Snapshot.SeqNo, ActiveRegistrationKind.Transaction)
 
             match Catalog.load current.Store with
             | Error e ->

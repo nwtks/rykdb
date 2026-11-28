@@ -1090,6 +1090,36 @@ let ``SessionPool: transaction 中の DDL は他接続で ConflictError`` () =
             b.Close() |> ignore)
 
 [<Fact>]
+let ``SessionPool: RowReader を開いている間も他接続の DDL は成功する`` () =
+    withPool "pool-ddl-reader" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1)") |> ignore
+
+            match ok (a.TryOpenReader "SELECT id FROM t") with
+            | None -> Assert.Fail "単一 SELECT が RowReader になりませんでした"
+            | Some reader ->
+                use reader = reader
+                // 読み取り中の snapshot 登録は文の種別なので DDL を拒否しない
+                // （種別を分ける前は ConflictError になった）。
+                ok (b.Execute "CREATE TABLE u (id INTEGER PRIMARY KEY)") |> ignore
+                ok (b.Execute "INSERT INTO u VALUES (10)") |> ignore
+
+                // 読み取りは開いた時点の snapshot を保つ。
+                let rows = drainReader reader
+                Assert.Equal<int>(1, rows.Length)
+                Assert.Equal<int64>(1L, asInt rows.[0].[0])
+
+            // 読み取りを閉じた後も DDL は通常どおり。
+            ok (b.Execute "CREATE INDEX ix_u ON u (id)") |> ignore
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
 let ``SessionPool: DDL の結果は他接続の次の文から見える`` () =
     withPool "pool-ddl-visible" (fun pool ->
         let a = ok (pool.CreateSession())

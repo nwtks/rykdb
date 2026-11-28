@@ -204,7 +204,9 @@ module internal Engine =
             err (DbError.internalError "transaction 中の SELECT は RowReader で開けません")
         else
             let mgr, txn = TransactionManager.beginTxn state.Manager
-            let registration = state.Store.Runtime.Register(state.Root, txn.Snapshot.SeqNo)
+
+            let registration =
+                state.Store.Runtime.Register(state.Root, txn.Snapshot.SeqNo, ActiveRegistrationKind.Statement)
 
             let startState =
                 { state with
@@ -212,7 +214,11 @@ module internal Engine =
                     Registration = Some registration
                 }
 
-            state.Store.Runtime.WithShared(fun () -> openSelectRun budget state startState txn registration stmt)
+            try
+                state.Store.Runtime.WithShared(fun () -> openSelectRun budget state startState txn registration stmt)
+            with _ ->
+                state.Store.Runtime.Unregister registration
+                reraise ()
 
     /// WHERE の式を対象 schema で解決する。
     let private resolveWhere (target: Schema) (ctx: ExecContext) =
@@ -565,13 +571,10 @@ module internal Engine =
                 return ExecState.ofCommitted committed, result
         }
 
-    /// 文の終了時に snapshot 登録を外す。
-    let private unregisterAfter (state: ExecState) (registration: ActiveRegistration) (r: 'a) =
-        state.Store.Runtime.Unregister registration
-        r
-
     /// 1文を実行する。
     /// transaction 中ならその中で、そうでなければ暗黙 transaction で実行する。
+    /// 暗黙 transaction の snapshot 登録は文の実行中だけ存在する
+    /// （登録はロックの内側で作り、成功・失敗・例外のいずれでも外す）。
     let executeStatementWithLimits (limits: ResultLimits) (state: ExecState) (stmt: Statement) =
         match state.Active with
         | Some activeTxn ->
@@ -579,7 +582,6 @@ module internal Engine =
             runStatement limits state running stmt
         | None ->
             let mgr, txn = TransactionManager.beginTxn state.Manager
-            let registration = state.Store.Runtime.Register(state.Root, txn.Snapshot.SeqNo)
 
             let isReadOnly =
                 match stmt with
@@ -598,11 +600,16 @@ module internal Engine =
                 | Statement.Analyze _ -> true
                 | _ -> false
 
-            let run =
-                fun () -> executeStatementRun limits state txn stmt mgr registration isReadOnly
+            let run () =
+                let registration =
+                    state.Store.Runtime.Register(state.Root, txn.Snapshot.SeqNo, ActiveRegistrationKind.Statement)
 
-            (if isDdl then run () else state.Store.Runtime.WithShared run)
-            |> unregisterAfter state registration
+                try
+                    executeStatementRun limits state txn stmt mgr registration isReadOnly
+                finally
+                    state.Store.Runtime.Unregister registration
+
+            if isDdl then run () else state.Store.Runtime.WithShared run
 
     /// 接続の transaction を commit し、接続ローカルを確定状態へ進める。
     let executeCommit (state: ExecState) =

@@ -384,6 +384,26 @@ let ``DatabaseHost: active transaction は snapshot registry に登録され、c
         Assert.True((runtime.OldestExcept(root, None)).IsNone))
 
 [<Fact>]
+let ``DatabaseHost: DDL の可否は文を跨ぐ明示 transaction の登録だけで決まる`` () =
+    withDbHost "reg-ddl-kind" (fun host _session ->
+        let runtime = host.Committed.Store.Runtime
+        let root = host.Committed.Root
+        Assert.False(runtime.TransactionExists(root, None))
+
+        // 文の実行中だけの登録（読み取り・暗黙 transaction）は GC 境界には効くが、DDL は拒否しない。
+        let statement = runtime.Register(root, 0UL, ActiveRegistrationKind.Statement)
+        Assert.True((runtime.OldestExcept(root, None)).IsSome)
+        Assert.False(runtime.TransactionExists(root, None))
+        runtime.Unregister statement
+
+        // 明示 transaction の登録は DDL を拒否する（自分の登録は除外できる）。
+        let txn = runtime.Register(root, 0UL, ActiveRegistrationKind.Transaction)
+        Assert.True(runtime.TransactionExists(root, None))
+        Assert.False(runtime.TransactionExists(root, Some txn))
+        runtime.Unregister txn
+        Assert.False(runtime.TransactionExists(root, None)))
+
+[<Fact>]
 let ``DatabaseHost: commit せずに捨てた transaction も GC されれば登録が外れる`` () =
     withDbHost "reg-abandon" (fun host session ->
         ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")

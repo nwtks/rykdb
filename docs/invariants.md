@@ -333,6 +333,9 @@ Bits.Length = BitCount / 8
 - `Session.writeGate` は接続内の操作を直列化する。
 - `DatabaseHost.writeGate` は書き込み、BEGIN、COMMIT、ROLLBACK、DDL、Close を直列化する。
 - SELECT のみのバッチは `writeGate` を取らず、`AcquireReadSnapshot` で並行する。
+- snapshot 登録は種別（`Transaction` / `Statement`）を持ち、
+  DDL の可否は `TransactionExists`（明示 transaction だけ）で判定する。
+  読み取り・暗黙 transaction は共有ロックで待つ。
 
 回帰テストは読み取り中の書き込み、書き込み中の読み取り、Close 待ち、並行 snapshot、同一 Session の並行使用、
 BEGIN が書き込みを待ち SELECT を待たないことを検査する。
@@ -732,7 +735,8 @@ UNIQUE索引の物理キーは「索引値＋主キー」のため、
   行ごとに`Transaction.slotsOf`を呼ばない。
   `Added`はcommit用の`Reservations`とは別で、文内の可視性だけを担う。
 - UNIQUE reservationは物理キーではないため、CREATE UNIQUE INDEXのbackfillは不要である。
-- DDLは排他の `RootRuntime`で実行し、active transactionを拒否する。
+- DDLは排他の `RootRuntime` で実行し、文を跨ぐ明示 transaction の登録があれば拒否する
+  （読み取り・暗黙 transaction の登録は種別が違い、排他ロックで完了を待つ）。
 
 回帰テストは予約の重複排除と参照カウント、解放した予約の非競合、論理予約の競合、
 activeなしでの予約破棄、Session間のINSERT/UPDATE、NULL、rollbackを検査する。

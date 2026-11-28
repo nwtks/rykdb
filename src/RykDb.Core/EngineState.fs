@@ -267,19 +267,24 @@ module internal ExecState =
     /// DDL を排他の内側で実行する。
     /// <remarks>
     /// - 書き込み中の文があれば、それが終わるまで待つ（`RootRuntime` の共有ロック）。
-    /// - 実行中の transaction があれば **待たずに ConflictError** にする。
+    /// - 文を跨いで残っている明示 transaction（BEGIN のまま）があれば **待たずに ConflictError** にする。
     ///   古いスキーマで計算した索引エントリを commit されると、索引に載らない行ができるため。
     ///   待つと、commit されないまま残った transaction で永久に止まるので失敗側に倒す。
+    /// - 文の実行中だけの登録（読み取り・暗黙 transaction）は拒否しない。
+    ///   共有ロックを保持しているので、この排他ロックが完了を待てる
+    ///   （判定は登録の種別。GC 境界は種別を問わない `OldestExcept`）。
     /// - 新しい transaction の開始と文の実行は排他の間ブロックされる（実行後は新しいカタログを見る）。
     /// </remarks>
     let exclusiveDdlWith (state: ExecState) (run: ExecState -> Result<'a, DbError>) =
         state.Store.Runtime.WithExclusive(fun () ->
-            match state.Store.Runtime.OldestExcept(state.Root, state.ActiveRegistration) with
-            | Some _ -> err (DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください")
-            | None -> run state)
+            if state.Store.Runtime.TransactionExists(state.Root, state.ActiveRegistration) then
+                DbError.conflict "実行中の transaction があります。COMMIT または ROLLBACK してから DDL を実行してください"
+                |> err
+            else
+                run state)
 
     /// DDL を排他の下で実行する
-    /// （実行中の transaction があれば待たずに ConflictError）。
+    /// （文を跨ぐ明示 transaction があれば待たずに ConflictError）。
     let exclusiveDdl (state: ExecState) (run: ExecState -> Result<ExecState, DbError>) = exclusiveDdlWith state run
 
     /// backfill を commit する 1チャンクの行数。

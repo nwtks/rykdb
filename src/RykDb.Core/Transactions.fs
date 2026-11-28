@@ -493,6 +493,20 @@ module internal RootKey =
             | Ok full -> System.IO.Path.TrimEndingDirectorySeparator full
             | Error _ -> root
 
+/// snapshot 登録の種別。
+/// <remarks>
+/// GC の境界（`OldestExcept`）にはすべての登録を使う。
+/// 一方、DDL の実行可否は文を跨いで残る明示 transaction だけで判定する（`TransactionExists`）。
+/// 文の実行中の登録は `RootRuntime` の共有ロックを保持しているので、
+/// DDL の排他（書き込みロック）はその完了を待てる。
+/// </remarks>
+[<RequireQualifiedAccess>]
+type internal ActiveRegistrationKind =
+    /// BEGIN から COMMIT / ROLLBACK まで続く明示 transaction。
+    | Transaction
+    /// 文の実行中（読み取り・暗黙 transaction）だけ存在する登録。
+    | Statement
+
 /// 進行中 transaction の snapshot 登録 1件。
 /// <remarks>
 /// 1つの登録に対して、それを参照するリース（`RegistrationLease`）が複数存在しうる。
@@ -502,12 +516,16 @@ module internal RootKey =
 /// トークンは `obj()` の参照等価。
 /// Core は `mutable` / `ref` を 0件に保つ規約なので、連番カウンタではなく参照等価のオブジェクトを鍵にする。
 /// </remarks>
-type internal ActiveRegistration internal (root: string, unregister: ActiveRegistration -> unit) =
+type internal ActiveRegistration
+    internal (root: string, kind: ActiveRegistrationKind, unregister: ActiveRegistration -> unit) =
     /// 生存しているリースのトークン。
     let handles = System.Collections.Concurrent.ConcurrentDictionary<obj, byte>()
 
     /// 正規化済みの root。
     member _.Root = root
+
+    /// 登録の種別（DDL の可否判定に使う）。
+    member _.Kind = kind
 
     /// リースの生存を登録し、解除に使うトークンを返す。
     member _.Attach() =
@@ -563,13 +581,12 @@ type private SnapshotRegistry() =
     let snapshotBucket (key: string) =
         byRoot.GetOrAdd(key, fun _ -> System.Collections.Concurrent.ConcurrentDictionary<ActiveRegistration, uint64>())
 
-    /// snapshot を登録し、解除に使う登
-    /// 録を返す。
-    member this.Register(root: string, snapshot: uint64) =
+    /// snapshot を登録し、解除に使う登録を返す。
+    member this.Register(root: string, snapshot: uint64, kind: ActiveRegistrationKind) =
         let key = RootKey.normalize root
 
         withGate (fun () ->
-            let registration = ActiveRegistration(key, fun reg -> this.Unregister reg)
+            let registration = ActiveRegistration(key, kind, fun reg -> this.Unregister reg)
             (snapshotBucket key).[registration] <- snapshot
             registration)
 
@@ -609,6 +626,29 @@ type private SnapshotRegistry() =
                             | None -> Some pair.Value)
                     None
             | _ -> None)
+
+    /// その root に明示 transaction の登録が残っているか（DDL の可否判定）。
+    /// registration に自分の登録を渡すと除外できる。
+    /// <remarks>
+    /// GC 境界の `OldestExcept` と違い、文の実行中だけの登録（読み取り・暗黙 transaction）は数えない。
+    /// それらは `RootRuntime` の共有ロックを保持しているので、DDL の排他が完了を待てる。
+    /// 文を跨いで残る明示 transaction だけは待つと止まるため、拒否する対象にする。
+    /// </remarks>
+    member _.TransactionExists(root: string, registration: ActiveRegistration option) =
+        let key = RootKey.normalize root
+
+        withGate (fun () ->
+            match byRoot.TryGetValue key with
+            | true, inner ->
+                inner
+                |> Seq.exists (fun pair ->
+                    let isSelf =
+                        match registration with
+                        | Some reg -> System.Object.ReferenceEquals(reg, pair.Key)
+                        | None -> false
+
+                    not isSelf && pair.Key.Kind = ActiveRegistrationKind.Transaction)
+            | _ -> false)
 
 /// 進行中 transaction の登録の生存に結び付いたリース。
 /// <remarks>
@@ -683,9 +723,14 @@ type internal RootRuntime() =
             finally
                 gate.ExitWriteLock()
 
-    member _.Register(root: string, snapshot: uint64) = snapshots.Register(root, snapshot)
+    member _.Register(root: string, snapshot: uint64, kind: ActiveRegistrationKind) =
+        snapshots.Register(root, snapshot, kind)
 
     member _.Unregister(registration: ActiveRegistration) = snapshots.Unregister registration
 
     member _.OldestExcept(root: string, registration: ActiveRegistration option) =
         snapshots.OldestExcept(root, registration)
+
+    /// 文を跨ぐ明示 transaction の登録が残っているか（DDL の可否判定）。
+    member _.TransactionExists(root: string, registration: ActiveRegistration option) =
+        snapshots.TransactionExists(root, registration)

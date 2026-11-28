@@ -1066,10 +1066,16 @@ backfill中に通常の書き込みが入ると、索引の追加漏れや削除
 DDLはDBごとの`RootRuntime`で排他する。
 
 1. 排他ゲートを取得する。
-2. 実行中transactionがある場合はDDLを拒否する。
+2. 文を跨いで残っている明示transaction（BEGINのまま）があればDDLを拒否する。
 3. 古い索引エントリのtombstoneを作る。
 4. 8192行ずつbackfillをコミットする。
 5. カタログへ索引定義を保存する。
+
+snapshotの登録は種別（明示transaction / 文の実行中）を持つ。
+DDLの可否は`TransactionExists`で明示transactionの登録だけを見て決める。
+読み取り中の`RowReader`や暗黙transactionの登録は共有ロックを保持しているので、
+DDLはその完了を待ってから実行する（拒否しない）。
+GC境界は従来どおり種別を問わずすべての登録の最小snapshotを使う。
 
 排他中は新しい文とBEGINがブロックする。
 DDL完了後に始まるtransactionは必ず新しいカタログを見る。
@@ -1617,7 +1623,8 @@ dotnet run --project src/RykDb.Server -- -p 7090 ./mydata
 - `SAVEPOINT`、分離レベル指定、読み取り専用transactionは未対応である。
 - 複数スレッドで1つのSessionと1つのtransactionを共有しない。
 - DDL中は通常の文とBEGINをブロックする。
-- 実行中のtransactionがある場合、DDLは`ConflictError`になる。
+- 文を跨ぐ明示transaction（BEGINのまま）がある場合、DDLは`ConflictError`になる。
+  読み取り中の`RowReader`や暗黙transactionは待つだけで拒否しない。
 - Closeされずに捨てられた接続のtransactionは、GC後の次の書き込み時に回収する（§7.10）。
 - マルチプロセスでの同時更新はサポートしない。
 - transactionとleaseはプロセス内だけに保持する。
