@@ -135,53 +135,133 @@ module internal OpsJoin =
         let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
         leftJoinRows resolve rightRows on rightSchema.Columns.Length left
 
-    /// 右側を退避したときの入れ子ループ。
-    /// 左行ごとに run を先頭から読み直す（I/O は O(左行数 × 右行数) になるが、メモリは一定）。
+    /// 退避 NL の左ブロックの最大行数。
+    /// 右をブロックごとに 1回だけ流すためのブロック（行数固定でメモリを抑える）。
+    [<Literal>]
+    let private SpilledBlockRows = 64
+
+    /// 退避右側の入れ子ループ（ブロック単位）。
+    /// 左をブロックに溜め、右はブロックごとに 1回だけ先頭から読む。
+    /// I/O は O((左行数 / ブロック行数) × 右行数) に減る（旧実装は左行ごとに再読込）。
+    /// 出力順は右行優先（1右行に対してブロック内の左を回す）で、
+    /// `ORDER BY` が無い限り SQL は行順を保証しない。
     /// <remarks>
-    /// `joinRows` / `scan` は `Op.compute` の継続内で呼ぶので、1行ごとに 1段だけ進み、
-    /// スタックは積み上がらない。
+    /// 各ステップは `Op.compute` の継続内で 1段だけ進み、スタックは積み上がらない。
+    /// `matched` はブロック局所のスクラッチで、演算子の外へ出さない。
     /// </remarks>
-    /// 退避右側の入れ子ループ（左行を進める）。
-    [<TailCall>]
-    let rec private spilledJoinRows
+    let rec private spilledBlockLoad
+        (isLeft: bool)
         (budget: MemoryBudget)
         (spool: Spill.RowSpool)
         (resolve: Prepared)
         (on: Expr)
+        (width: int)
+        (acc: ResizeArray<SqlValue array>)
         (cur: Op)
         =
-        Op.compute (fun () ->
-            match Op.next cur with
-            | OpStep.OpError e -> OpStep.OpError e
-            | OpStep.OpDone ->
-                Spill.forgetSpool budget.Scope spool
-                Spill.deleteSpool spool
-                OpStep.OpDone
-            | OpStep.OpRow(lrow, lnext) ->
-                match Spill.reopenKeep budget.Scope spool with
-                | Error e -> OpStep.OpError e
-                | Ok rows -> Op.next (spilledScan budget spool resolve on lrow lnext rows))
+        if acc.Count >= SpilledBlockRows then
+            spilledBlockStart isLeft budget spool resolve on width (acc.ToArray()) cur
+        else
+            Op.compute (fun () ->
+                match Op.next cur with
+                | OpStep.OpError e -> OpStep.OpError e
+                | OpStep.OpDone ->
+                    if acc.Count = 0 then
+                        Spill.forgetSpool budget.Scope spool
+                        Spill.deleteSpool spool
+                        OpStep.OpDone
+                    else
+                        Op.next (spilledBlockStart isLeft budget spool resolve on width (acc.ToArray()) cur)
+                | OpStep.OpRow(lrow, nxt) ->
+                    acc.Add lrow
+                    Op.next (spilledBlockLoad isLeft budget spool resolve on width acc nxt))
 
-    /// 退避右側の 1行を評価して次へ進める。
-    and private spilledScan
+    and private spilledBlockStart
+        (isLeft: bool)
         (budget: MemoryBudget)
         (spool: Spill.RowSpool)
         (resolve: Prepared)
         (on: Expr)
-        (lrow: SqlValue array)
+        (width: int)
+        (leftRows: SqlValue array array)
         (lnext: Op)
+        =
+        match Spill.reopenKeep budget.Scope spool with
+        | Error e -> Op.compute (fun () -> OpStep.OpError e)
+        | Ok rows ->
+            let matched = Array.create leftRows.Length false
+
+            Op.compute (fun () ->
+                Op.next (spilledBlockNext isLeft budget spool resolve on width leftRows lnext matched rows))
+
+    and private spilledBlockNext
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (spool: Spill.RowSpool)
+        (resolve: Prepared)
+        (on: Expr)
+        (width: int)
+        (leftRows: SqlValue array array)
+        (lnext: Op)
+        (matched: bool array)
         (rows: Op)
         =
         Op.compute (fun () ->
             match Op.next rows with
             | OpStep.OpError e -> OpStep.OpError e
-            | OpStep.OpDone -> Op.next (spilledJoinRows budget spool resolve on lnext)
+            | OpStep.OpDone ->
+                Op.next (spilledBlockFinish isLeft budget spool resolve on width leftRows lnext matched 0)
             | OpStep.OpRow(rrow, rest) ->
-                match Eval.matchesJoinedV resolve lrow rrow on with
-                | DbErr e -> OpStep.OpError e
-                | DbOk true ->
-                    OpStep.OpRow(Array.append lrow rrow, spilledScan budget spool resolve on lrow lnext rest)
-                | DbOk false -> Op.next (spilledScan budget spool resolve on lrow lnext rest))
+                Op.next (spilledBlockCompare isLeft budget spool resolve on width leftRows lnext matched rest rrow 0))
+
+    and private spilledBlockCompare
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (spool: Spill.RowSpool)
+        (resolve: Prepared)
+        (on: Expr)
+        (width: int)
+        (leftRows: SqlValue array array)
+        (lnext: Op)
+        (matched: bool array)
+        (rows: Op)
+        (rrow: SqlValue array)
+        (i: int)
+        =
+        if i >= leftRows.Length then
+            spilledBlockNext isLeft budget spool resolve on width leftRows lnext matched rows
+        else
+            match Eval.matchesJoinedV resolve leftRows.[i] rrow on with
+            | DbErr e -> Op.compute (fun () -> OpStep.OpError e)
+            | DbOk false ->
+                spilledBlockCompare isLeft budget spool resolve on width leftRows lnext matched rows rrow (i + 1)
+            | DbOk true ->
+                matched.[i] <- true
+
+                Op.emit
+                    (Array.append leftRows.[i] rrow)
+                    (spilledBlockCompare isLeft budget spool resolve on width leftRows lnext matched rows rrow (i + 1))
+
+    and private spilledBlockFinish
+        (isLeft: bool)
+        (budget: MemoryBudget)
+        (spool: Spill.RowSpool)
+        (resolve: Prepared)
+        (on: Expr)
+        (width: int)
+        (leftRows: SqlValue array array)
+        (lnext: Op)
+        (matched: bool array)
+        (i: int)
+        =
+        if i >= leftRows.Length then
+            spilledBlockLoad isLeft budget spool resolve on width (ResizeArray<SqlValue array>()) lnext
+        elif isLeft && not matched.[i] then
+            Op.emit
+                (padWithNulls leftRows.[i] width)
+                (spilledBlockFinish isLeft budget spool resolve on width leftRows lnext matched (i + 1))
+        else
+            spilledBlockFinish isLeft budget spool resolve on width leftRows lnext matched (i + 1)
 
     /// INNER 結合（右をスプールから読む）。
     let private innerJoinSpilled
@@ -193,59 +273,7 @@ module internal OpsJoin =
         (on: Expr)
         =
         let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
-        spilledJoinRows budget spool resolve on left
-
-    /// 退避右側の LEFT JOIN（左行を進める）。
-    [<TailCall>]
-    let rec private leftSpilledJoinRows
-        (budget: MemoryBudget)
-        (spool: Spill.RowSpool)
-        (resolve: Prepared)
-        (on: Expr)
-        (width: int)
-        (cur: Op)
-        =
-        Op.compute (fun () ->
-            match Op.next cur with
-            | OpStep.OpError e -> OpStep.OpError e
-            | OpStep.OpDone ->
-                Spill.forgetSpool budget.Scope spool
-                Spill.deleteSpool spool
-                OpStep.OpDone
-            | OpStep.OpRow(lrow, lnext) ->
-                match Spill.reopenKeep budget.Scope spool with
-                | Error e -> OpStep.OpError e
-                | Ok rows -> Op.next (leftSpilledScan budget spool resolve on width lrow lnext rows false))
-
-    /// 退避右側の LEFT JOIN（右行を評価する）。
-    and private leftSpilledScan
-        (budget: MemoryBudget)
-        (spool: Spill.RowSpool)
-        (resolve: Prepared)
-        (on: Expr)
-        (width: int)
-        (lrow: SqlValue array)
-        (lnext: Op)
-        (rows: Op)
-        (matched: bool)
-        =
-        Op.compute (fun () ->
-            match Op.next rows with
-            | OpStep.OpError e -> OpStep.OpError e
-            | OpStep.OpDone ->
-                if matched then
-                    Op.next (leftSpilledJoinRows budget spool resolve on width lnext)
-                else
-                    OpStep.OpRow(padWithNulls lrow width, leftSpilledJoinRows budget spool resolve on width lnext)
-            | OpStep.OpRow(rrow, rest) ->
-                match Eval.matchesJoinedV resolve lrow rrow on with
-                | DbErr e -> OpStep.OpError e
-                | DbOk true ->
-                    OpStep.OpRow(
-                        Array.append lrow rrow,
-                        leftSpilledScan budget spool resolve on width lrow lnext rest true
-                    )
-                | DbOk false -> Op.next (leftSpilledScan budget spool resolve on width lrow lnext rest matched))
+        spilledBlockLoad false budget spool resolve on 0 (ResizeArray<SqlValue array>()) left
 
     /// 右側を退避したときの LEFT JOIN。
     let private leftJoinSpilled
@@ -258,7 +286,7 @@ module internal OpsJoin =
         =
         let width = rightSchema.Columns.Length
         let resolve = Eval.prepare (Schema.concat leftSchema rightSchema) [ on ]
-        leftSpilledJoinRows budget spool resolve on width left
+        spilledBlockLoad true budget spool resolve on width (ResizeArray<SqlValue array>()) left
 
     /// INNER JOIN（nested loop）。
     /// 右側は内側ループごとに先頭から引き直す。

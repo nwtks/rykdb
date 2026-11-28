@@ -26,10 +26,11 @@ src/RykDb.Core/OpsJoin.fs|joinLoopGo/joinLoopAdvance|joinLoopAdvance|call
 src/RykDb.Core/OpsJoin.fs|joinLoopGo/joinLoopAdvance|joinLoopGo|call
 src/RykDb.Core/OpsJoin.fs|leftJoinRows/leftJoinOnExhausted|leftJoinOnExhausted|call
 src/RykDb.Core/OpsJoin.fs|leftJoinRows/leftJoinOnExhausted|leftJoinRows|call
-src/RykDb.Core/OpsJoin.fs|leftSpilledJoinRows/leftSpilledScan|leftSpilledJoinRows|call
-src/RykDb.Core/OpsJoin.fs|leftSpilledJoinRows/leftSpilledScan|leftSpilledScan|call
-src/RykDb.Core/OpsJoin.fs|spilledJoinRows/spilledScan|spilledJoinRows|call
-src/RykDb.Core/OpsJoin.fs|spilledJoinRows/spilledScan|spilledScan|call
+src/RykDb.Core/OpsJoin.fs|spilledBlockLoad/spilledBlockStart/spilledBlockNext/spilledBlockCompare/spilledBlockFinish|spilledBlockCompare|call
+src/RykDb.Core/OpsJoin.fs|spilledBlockLoad/spilledBlockStart/spilledBlockNext/spilledBlockCompare/spilledBlockFinish|spilledBlockFinish|call
+src/RykDb.Core/OpsJoin.fs|spilledBlockLoad/spilledBlockStart/spilledBlockNext/spilledBlockCompare/spilledBlockFinish|spilledBlockLoad|call
+src/RykDb.Core/OpsJoin.fs|spilledBlockLoad/spilledBlockStart/spilledBlockNext/spilledBlockCompare/spilledBlockFinish|spilledBlockNext|call
+src/RykDb.Core/OpsJoin.fs|spilledBlockLoad/spilledBlockStart/spilledBlockNext/spilledBlockCompare/spilledBlockFinish|spilledBlockStart|call
 src/RykDb.Core/OpsJoinHash.fs|buildLeftProbe/buildLeftEmit|buildLeftEmit|call
 src/RykDb.Core/OpsJoinHash.fs|buildLeftProbe/buildLeftEmit|buildLeftProbe|call
 src/RykDb.Core/OpsJoinHash.fs|hashJoinWorkOp|hashJoinWorkOp|call

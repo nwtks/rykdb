@@ -352,6 +352,54 @@ let ``結合: 入れ子ループの LEFT JOIN も右を退避すると NULL 拡�
         assertNoLeftovers dir)
 
 [<Fact>]
+let ``結合: 退避入れ子ループは右行優先でブロックを流す`` () =
+    // ブロック化は 1右行に対してブロック内の左を回すため、出力順は右行優先になる。
+    // 旧実装（左行ごとに右を読み直す）なら (1,1),(2,2) なので、順序でブロック化を固定する。
+    // SQL の ORDER BY が無いときの行順は仕様ではないが、演算子のストリーム順は回帰で見る。
+    withDir "join-nested-block-order" (fun dir ->
+        let left = Op.ofArray [| [| SqlValue.Int 1L |]; [| SqlValue.Int 2L |] |]
+        let right = Op.ofArray [| [| SqlValue.Int 2L |]; [| SqlValue.Int 1L |] |]
+
+        let rows =
+            ok (Op.toArray (ok (OpsJoin.innerJoin (tightBudget dir 1L) leftSchema left rightSchema right onEq)))
+
+        let text =
+            rows
+            |> Array.map (fun r -> r |> Array.map SqlLiteral.toSqlLiteral |> String.concat ",")
+            |> String.concat "|"
+
+        Assert.Equal("2,2|1,1", text)
+        assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: 退避入れ子ループは複数ブロックでも全行を返す`` () =
+    // 左 130行はブロック境界（64行）をまたぐ。右は 1回だけ流すので一致は 130行。
+    withDir "join-nested-blocks" (fun dir ->
+        let left = Op.ofArray [| for i in 0..129 -> [| SqlValue.Int(int64 (i % 10)) |] |]
+        let right = Op.ofArray [| for i in 0..9 -> [| SqlValue.Int(int64 i) |] |]
+
+        let rows =
+            ok (Op.toArray (ok (OpsJoin.innerJoin (tightBudget dir 1L) leftSchema left rightSchema right onEq)))
+
+        Assert.Equal<int>(130, rows.Length)
+        assertNoLeftovers dir)
+
+[<Fact>]
+let ``結合: 退避入れ子ループの LEFT JOIN はブロックごとに未一致行をNULL拡張する`` () =
+    withDir "join-nested-blocks-left" (fun dir ->
+        let left = Op.ofArray [| for i in 0..129 -> [| SqlValue.Int(int64 (i % 10)) |] |]
+        let right = Op.ofArray [| [| SqlValue.Int 0L |] |]
+
+        let rows =
+            ok (Op.toArray (ok (OpsJoin.leftJoin (tightBudget dir 1L) leftSchema left rightSchema right onEq)))
+
+        Assert.Equal<int>(130, rows.Length)
+        // 値 0 の 13行だけが一致し、残り 117行は右が NULL。
+        Assert.Equal<int>(13, rows |> Array.filter (fun r -> not (SqlValue.isNull r.[1])) |> Array.length)
+        Assert.Equal<int>(117, rows |> Array.filter (fun r -> SqlValue.isNull r.[1]) |> Array.length)
+        assertNoLeftovers dir)
+
+[<Fact>]
 let ``結合: ON と residual の未知の列は空の入力でも構築時に Error`` () =
     // 入力が 0 行でも ON 句は一度も評価されない。
     // 列解決は演算子の構築時に検査し、行数に依存せず NameError にする。
