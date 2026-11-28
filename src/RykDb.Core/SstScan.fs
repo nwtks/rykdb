@@ -165,13 +165,14 @@ module internal SstEntry =
 
     /// 列マスクに従って値を復号する。
     /// `mask` が false の列は `SqlValue.Unloaded` を置き、値本体を読み飛ばす。
-    let decodeMaskedValueAt (mask: bool array) (length: int) (c: Cursor) =
+    /// `keepsNothing` は「どの列も必要ない」の事前計算（行ごとに forall しない）。
+    let decodeMaskedValueAt (mask: bool array) (keepsNothing: bool) (length: int) (c: Cursor) =
         Cursor.splitAt length c
         >>= fun (value, rest) ->
             match decodeHeader value with
             | Ok(seqNo, 0uy, _) -> ret (seqNo, None, rest)
             | Ok(seqNo, 1uy, payload) ->
-                if mask.Length = 0 || Array.forall (fun needed -> not needed) mask then
+                if keepsNothing then
                     ret (seqNo, Some(Array.create mask.Length SqlValue.Unloaded), rest)
                 else
                     ValueCodec.readValuesMasked mask payload
@@ -350,6 +351,13 @@ module internal SstScan =
             scope.Register(key, scan :> System.IDisposable)
             ret (Some(e, ofScoped key scope scan))
 
+    /// 述語をすべて満たすか（行ごとのクロージャを作らない）。
+    [<TailCall>]
+    let rec private allPass (predicates: (SstEntry -> bool) list) (e: SstEntry) =
+        match predicates with
+        | [] -> true
+        | predicate :: rest -> if predicate e then allPass rest e else false
+
     /// 次の 1件。
     /// None は終端。
     /// フィルタの継続は述語リストとして持ち、すべての再帰呼び出しを末尾に置く。
@@ -390,7 +398,7 @@ module internal SstScan =
             match filters with
             | [] -> finishScoped e scope rest
             | _ ->
-                if filters |> List.forall (fun predicate -> predicate e) then
+                if allPass filters e then
                     finishScoped e scope (FilterScan(rest, filters))
                 else
                     nextWithFilters filters scope rest

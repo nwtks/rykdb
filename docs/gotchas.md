@@ -975,6 +975,24 @@ run のリストを `splitAt` と `@` で行ごとに組み直すと、1行出�
   `ValueCodec.readValuesMasked: 切り詰められた固定長値は CorruptionError` /
   `ValueCodec.readValues: スピル専用の Unloaded は CorruptionError`。
 
+### 7.20 同一キーの版グループは「残す版だけ」保持する
+
+同一キーの全版を list に集めてから GC すると、
+ホットキーの版数に比例して compaction のメモリが増える。
+
+- ✅ `gcStep`（struct タプルの状態）を `SstMerge` の走査に適用し、残す版だけを `kept` に積む。
+  舍てる版は件数だけを数える。
+- ✅ `gcGroup`（純粋関数）も同じ `gcStep` を使う（プロパティテストの検証対象と実経路が一致する）。
+- 回帰: `Compaction.gcGroup: 任意の snapshot で可視行が変わらない` /
+  `Compaction.compact: ホットキーの多数の版は snapshot 以降の全版と境界の 1版を残す`。
+
+### 7.21 列マスクの判定とフィルタは行ごとに評価しない
+
+- ✅ 「どの列も要らない」マスクは走査の構築時に 1回だけ判定し、`MaskValues` がフラグを持つ。
+- ✅ `SstScan.filter` の述語評価は `allPass`（モジュールスコープの末尾再帰）で行い、
+  行ごとのクロージャを作らない。
+- 回帰: `SstScan.filter: 入れ子フィルタの継続は行ごとに 1個だけ確保する`（追加割当の上限）。
+
 ### 7.18 sweepStale はクエリごとに呼ばない
 
 `Optimizer.exec` の冒頭で `Spill.sweepStale` を呼ぶと、スピルしない小さなクエリでも

@@ -99,6 +99,59 @@ let ``Compaction.gcGroup: 任意の snapshot で可視行が変わらない`` ()
             Assert.Equal<string>(showValue (visibleValue entries snapshot), showValue (visibleValue kept snapshot))
 
 [<Fact>]
+let ``Compaction.compact: ホットキーの多数の版は snapshot 以降の全版と境界の 1版を残す`` () =
+    withDir "compact-hot-key" (fun dir ->
+        // 1つのキーに 600版。ファイルを跨がせてマージ経路も通す。
+        let versions = [ 1..600 ]
+        let half = 300
+
+        let file1 =
+            mkSst
+                dir
+                1L
+                0
+                (versions
+                 |> List.take half
+                 |> List.rev
+                 |> List.map (fun i -> Entry.put (intKey 1) (uint64 i) (intRow i)))
+
+        let file2 =
+            mkSst
+                dir
+                2L
+                0
+                (versions
+                 |> List.skip half
+                 |> List.rev
+                 |> List.map (fun i -> Entry.put (intKey 1) (uint64 i) (intRow i)))
+
+        let version = Version.Empty |> Version.addFile file1 |> Version.addFile file2
+        let version = { version with NextFileNumber = 10L }
+
+        let result, _ =
+            compactAll
+                dir
+                version
+                500UL
+                { pickFirstLevel with
+                    L0CompactionTrigger = 1
+                }
+
+        Assert.Single(result.Added) |> ignore
+        let entries = ok (readBack dir (List.exactlyOne result.Added))
+        // snapshot より新しい版（501〜600）と、snapshot が見る最新版（500）を残し、
+        // それより古い版（1〜499）だけを落とす（版グループのストリーミング経路）。
+        let expected = [ for i in 600..-1..500 -> uint64 i ]
+        Assert.Equal<uint64 list>(expected, entries |> Array.toList |> List.map _.SeqNo)
+        Assert.Equal<int>(499, result.DroppedVersions)
+        Assert.Equal(0, result.DroppedTombstones)
+        // 可視行は変わらない（どの snapshot でも同じ版が見える）。
+        let keptEntries = Array.toList entries
+        Assert.Equal("600", showValue (visibleValue keptEntries 600UL))
+        Assert.Equal("550", showValue (visibleValue keptEntries 550UL))
+        Assert.Equal("500", showValue (visibleValue keptEntries 500UL)))
+
+[<Fact>]
 let ``Compaction.compact: 同名キーは最新版と最古 snapshot が見る版を残す`` () =
     withDir "comp-gc" (fun dir ->
         let f =

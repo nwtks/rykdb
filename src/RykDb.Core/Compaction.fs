@@ -148,48 +148,50 @@ module internal Compaction =
     let private deleteCompactOutputs (dir: string) (files: FileMetaData list) =
         FileMetaData.deleteObsolete dir files |> ignore
 
-    /// 古い版を残すか捨てるかを判定しながら走査する。
-    [<TailCall>]
-    let rec private keepOlder
+    /// 古い版 1つを GC の判定に沿って取り込む。
+    /// 状態は (残す版の逆順, 捨てた数, SeqNo <= snapshot の版を残したか)。
+    /// `newest` が snapshot より新しいときだけ、境界の 1版を残す。
+    let private gcStep
         (activeSnapshot: uint64)
         (newest: SstEntry)
-        (kept: SstEntry list)
-        (dropped: int)
-        (keptVisible: bool)
+        struct (kept: SstEntry list, dropped: int, keptVisible: bool)
+        (item: SstEntry)
         =
-        function
-        | [] -> List.rev kept, dropped
-        | item :: tail ->
-            if activeSnapshot = 0UL || item.SeqNo > activeSnapshot then
-                keepOlder activeSnapshot newest (item :: kept) dropped keptVisible tail
-            elif newest.SeqNo > activeSnapshot && not keptVisible then
-                keepOlder activeSnapshot newest (item :: kept) dropped true tail
-            else
-                keepOlder activeSnapshot newest kept (dropped + 1) keptVisible tail
+        if activeSnapshot = 0UL || item.SeqNo > activeSnapshot then
+            struct (item :: kept, dropped, keptVisible)
+        elif newest.SeqNo > activeSnapshot && not keptVisible then
+            struct (item :: kept, dropped, true)
+        else
+            struct (kept, dropped + 1, keptVisible)
 
     /// 同一キーの版グループを GC する（純粋関数）。
     /// `older` は `newest` より古い版（SeqNo 降順）。
     /// 戻り値は (残す版, 捨てた版数, 捨てた tombstone 数)。
     /// `activeSnapshot = 0` は「制限なし」を表す。
     let internal gcGroup (activeSnapshot: uint64) (dropTombstones: bool) (older: SstEntry list) (newest: SstEntry) =
-        match older with
-        | [] ->
-            let keepNewest = not (newest.IsDelete && dropTombstones)
-            (if keepNewest then [ newest ] else []), 0, (if keepNewest then 0 else 1)
-        | _ when activeSnapshot = 0UL -> newest :: older, 0, 0
-        | _ ->
-            let keptOlder, dropped = keepOlder activeSnapshot newest [] 0 false older
-            let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty keptOlder)
-            let kept = if keepNewest then newest :: keptOlder else keptOlder
-            kept, dropped, (if keepNewest then 0 else 1)
+        let struct (keptRev, dropped, _) =
+            older |> List.fold (gcStep activeSnapshot newest) struct ([], 0, false)
+
+        let keptOlder = List.rev keptRev
+        let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty keptOlder)
+        let kept = if keepNewest then newest :: keptOlder else keptOlder
+        kept, dropped, (if keepNewest then 0 else 1)
 
     type private GatherResult =
         | GatherStopped
-        | Gathered of SstMerge * SstEntry list
+        | Gathered of SstMerge * SstEntry list * int
 
-    /// 同じキーの版を集める（停止要求時は中断）。
+    /// 同じキーの版を集めながら GC する（停止要求時は中断）。
+    /// 保持するのは残す版だけで、捨てる版は数だけを数える
+    /// （ホットキーで版が多くてもメモリが版数に比例しない）。
     [<TailCall>]
-    let rec private gatherGroup (shouldStop: unit -> bool) (newest: SstEntry) (m: SstMerge) (acc: SstEntry list) =
+    let rec private gatherGroup
+        (shouldStop: unit -> bool)
+        (activeSnapshot: uint64)
+        (newest: SstEntry)
+        (m: SstMerge)
+        (state: struct (SstEntry list * int * bool))
+        =
         if shouldStop () then
             ret GatherStopped
         else
@@ -199,10 +201,15 @@ module internal Compaction =
                     ret GatherStopped
                 else
                     match SstMerge.next m with
-                    | Ok None -> ret (Gathered(m, List.rev acc))
-                    | Ok(Some(nxt, rest)) -> gatherGroup shouldStop newest rest (nxt :: acc)
+                    | Ok None ->
+                        let struct (kept, dropped, _) = state
+                        ret (Gathered(m, List.rev kept, dropped))
+                    | Ok(Some(nxt, rest)) ->
+                        gatherGroup shouldStop activeSnapshot newest rest (gcStep activeSnapshot newest state nxt)
                     | Error e -> err e
-            | _ -> ret (Gathered(m, List.rev acc))
+            | _ ->
+                let struct (kept, dropped, _) = state
+                ret (Gathered(m, List.rev kept, dropped))
 
     type private NextGroup =
         | NextGroupDone
@@ -217,11 +224,12 @@ module internal Compaction =
             match SstMerge.next merge with
             | Ok None -> ret NextGroupDone
             | Ok(Some(newest, afterNewest)) ->
-                match gatherGroup shouldStop newest afterNewest [] with
+                match gatherGroup shouldStop activeSnapshot newest afterNewest struct ([], 0, false) with
                 | Ok GatherStopped -> ret NextGroupStopped
-                | Ok(Gathered(rest, older)) ->
-                    let kept, dropped, tombstones = gcGroup activeSnapshot dropTombstones older newest
-                    ret (NextGroup(kept, dropped, tombstones, rest))
+                | Ok(Gathered(rest, keptOlder, dropped)) ->
+                    let keepNewest = not (newest.IsDelete && dropTombstones && List.isEmpty keptOlder)
+                    let kept = if keepNewest then newest :: keptOlder else keptOlder
+                    ret (NextGroup(kept, dropped, (if keepNewest then 0 else 1), rest))
                 | Error e -> err e
             | Error e -> err e
 

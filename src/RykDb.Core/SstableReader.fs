@@ -222,11 +222,12 @@ module internal SstableReader =
 
     /// ブロック内の値をどう扱うか。
     /// Decode は通常のクエリ、Raw は compaction、Skip は列が不要なクエリ。
+    /// `MaskValues` はマスクと「どの列も要らない」の事前計算を持つ。
     type private ValueMode =
         | DecodeValues
         | RawValues
         | SkipValues
-        | MaskValues of bool array
+        | MaskValues of bool array * bool
 
     /// ブロック内の 1エントリを復号する（値の扱いは mode で決める）。
     let private decodeBlockEntry (mode: ValueMode) (c: Cursor) (prev: byte array) =
@@ -271,8 +272,8 @@ module internal SstableReader =
                                     | SkipValues ->
                                         SstEntry.decodeSkippedValueAt (int valueLen) c
                                         >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
-                                    | MaskValues mask ->
-                                        SstEntry.decodeMaskedValueAt mask (int valueLen) c
+                                    | MaskValues(mask, keepsNothing) ->
+                                        SstEntry.decodeMaskedValueAt mask keepsNothing (int valueLen) c
                                         >>= fun (seqNo, value, c) -> ret (c, SstEntry.make key seqNo value, key)
         }
 
@@ -496,7 +497,10 @@ module internal SstableReader =
     let rangeScanPartialSkipped = rangeScanPartialWith SkipValues
 
     /// 列マスクに従って必要な列だけ復号する。
-    let rangeScanPartialMasked (mask: bool array) = rangeScanPartialWith (MaskValues mask)
+    /// 「どの列も要らない」は走査の構築時に 1回だけ判定する。
+    let rangeScanPartialMasked (mask: bool array) =
+        let keepsNothing = mask.Length = 0 || Array.forall not mask
+        rangeScanPartialWith (MaskValues(mask, keepsNothing))
 
     /// 値を復号しながら走査する（通常のクエリ・検証用）。
     let rangeScanPartial = rangeScanPartialWith DecodeValues
@@ -584,15 +588,22 @@ module internal SstableReader =
                 ret struct (sharedLength, tailLength, p3, int valueLen)
 
     /// 値部分を復号する（列マスクを適用する場合がある）。
-    let private decodeLookupValue (data: byte array) (mask: bool array) (valuePos: int) (valueLen: int) =
+    let private decodeLookupValue
+        (data: byte array)
+        (mask: bool array)
+        (keepsNothing: bool)
+        (valuePos: int)
+        (valueLen: int)
+        =
         Cursor.createSlice data valuePos valueLen
-        >>= SstEntry.decodeMaskedValueAt mask valueLen
+        >>= SstEntry.decodeMaskedValueAt mask keepsNothing valueLen
 
     /// ブロック内を先頭から走査してキーを探す。
     [<TailCall>]
     let rec private scanLookupBlock
         (key: byte array)
         (mask: bool array)
+        (keepsNothing: bool)
         (visible: uint64 option)
         (indexEntry: SstIndexEntry)
         (data: byte array)
@@ -620,11 +631,20 @@ module internal SstableReader =
                     let ordering = Bytes.compare entryKey key
 
                     if ordering < 0 then
-                        scanLookupBlock key mask visible indexEntry data payloadLen entryKey (valuePos + valueLength)
+                        scanLookupBlock
+                            key
+                            mask
+                            keepsNothing
+                            visible
+                            indexEntry
+                            data
+                            payloadLen
+                            entryKey
+                            (valuePos + valueLength)
                     elif ordering > 0 then
                         ret None
                     else
-                        match decodeLookupValue data mask valuePos valueLength with
+                        match decodeLookupValue data mask keepsNothing valuePos valueLength with
                         | Ok(seqNo, value, _) ->
                             let isVisible =
                                 match visible with
@@ -637,6 +657,7 @@ module internal SstableReader =
                                 scanLookupBlock
                                     key
                                     mask
+                                    keepsNothing
                                     visible
                                     indexEntry
                                     data
@@ -663,7 +684,8 @@ module internal SstableReader =
             elif Hashing.checksumRange data 0 payloadLen <> Bytes.readLE32 data payloadLen then
                 err (DbError.corruption "Sstable: ブロックのチェックサム不一致")
             else
-                scanLookupBlock key mask visible indexEntry data payloadLen [||] 0
+                let keepsNothing = mask.Length = 0 || Array.forall not mask
+                scanLookupBlock key mask keepsNothing visible indexEntry data payloadLen [||] 0
 
     /// 索引を先頭から辿って最初の可視版を探す。
     [<TailCall>]

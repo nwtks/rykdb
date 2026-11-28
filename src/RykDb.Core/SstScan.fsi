@@ -23,7 +23,10 @@ module internal SstEntry =
     val decodeValue: byte array -> Result<SeqNo * SqlValue array option, DbError>
     val decodeValueAt: int -> Cursor -> Result<SeqNo * SqlValue array option * Cursor, DbError>
     val decodeSkippedValueAt: int -> Cursor -> Result<SeqNo * SqlValue array option * Cursor, DbError>
-    val decodeMaskedValueAt: bool array -> int -> Cursor -> Result<SeqNo * SqlValue array option * Cursor, DbError>
+
+    val decodeMaskedValueAt:
+        bool array -> bool -> int -> Cursor -> Result<SeqNo * SqlValue array option * Cursor, DbError>
+
     val decodeRawValueAt: int -> Cursor -> Result<SeqNo * RawSstValue * Cursor, DbError>
     val decoded: SstEntry -> Result<SqlValue array option, DbError>
     val approximateBytes: SstEntry -> int
