@@ -119,10 +119,10 @@ module internal OpsShared =
             Text("A" + f.Name + (if distinct then "D" else "N") + "(")
             :: Sub(arg, [ Text ")" ])
             :: next
+        | Expr.InSet(x, set, neg) -> Text("P" + flag neg + identKey set.Id + "(") :: Sub(x, [ Text ")" ]) :: next
         | Expr.Subquery _
         | Expr.Exists _
         | Expr.InSubquery _
-        | Expr.InSet _
         | Expr.CorrelatedSubquery _ as e -> Text("Z" + sprintf "%A" e) :: next
 
     /// 手順を末尾再帰で連結する（式の深さに依存せずスタックは一定）。

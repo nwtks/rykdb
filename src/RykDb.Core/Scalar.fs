@@ -96,7 +96,13 @@ module internal Scalar =
         if ti >= n then
             skipTrailingStars tokens pi >= m
         elif pi >= m then
-            star = m - 1
+            if star = m - 1 then
+                true
+            elif star >= 0 && starTi < n then
+                let next = advanceCodePoint text starTi
+                goLike tokens text next (star + 1) star next
+            else
+                false
         else
             match tokens.[pi] with
             | AnyMany -> goLike tokens text ti (pi + 1) pi ti

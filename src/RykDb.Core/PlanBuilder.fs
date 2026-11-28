@@ -1006,9 +1006,7 @@ module internal PlanBuilder =
 
             let! qs = Binder.qualifyMany schema (selectExprs @ orderExprs)
             let selectAggs = OpsShared.aggCalls (qs |> List.take (List.length selectExprs))
-
-            let orderAggs =
-                orderExprs |> List.map (fun e -> OpsShared.aggCalls [ e ]) |> List.concat
+            let orderAggs = qs |> List.skip (List.length selectExprs) |> OpsShared.aggCalls
 
             let! having, havingAggs =
                 match stmt.Having with
@@ -1058,6 +1056,7 @@ module internal PlanBuilder =
         let correlatedInOutput =
             parts.SelectExprs |> List.exists Expr.hasCorrelated
             || parts.OrderExprs |> List.exists Expr.hasCorrelated
+            || parts.GroupBy |> List.exists Expr.hasCorrelated
             || match parts.Having with
                | Some h -> Expr.hasCorrelated h
                | None -> false

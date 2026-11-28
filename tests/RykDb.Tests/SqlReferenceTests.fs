@@ -2911,6 +2911,111 @@ let ``SqlReference: ORDER BY は集約式・集約の別名・序数・GROUP BY 
             (execSql db2 "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY id"))
 
 [<Fact>]
+let ``SqlReference: ORDER BY の集約は SELECT に無くても並べ替えに効く`` () =
+    // SELECT に無い ORDER BY の集約を未修飾の式で集めると、集約後のスロットに一致せず
+    // NULL へ置換され、並べ替えが無効になっていた（§7.6）。
+    withSession "order-by-agg-unselected" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER)"
+        let db2, _ = ok (execSql db1 "INSERT INTO t VALUES (2, 1), (1, 100), (3, 100)")
+
+        let _, sum = ok (execSql db2 "SELECT a FROM t GROUP BY a ORDER BY SUM(b) DESC, a")
+        // SUM(b) は 1:100 / 2:1 / 3:100。同点は a で並べる。
+        Assert.Equal<int64 array>([| 1L; 3L; 2L |], sum.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        let _, count =
+            ok (execSql db2 "SELECT a FROM t GROUP BY a ORDER BY COUNT(b) DESC, a")
+
+        Assert.Equal<int64 array>([| 1L; 2L; 3L |], count.Rows |> Array.map (fun r -> asInt r.[0]))
+
+        // SELECT に同じ集約がある場合も同じ結果
+        let _, withSelect =
+            ok (execSql db2 "SELECT a, SUM(b) FROM t GROUP BY a ORDER BY SUM(b) DESC, a")
+
+        Assert.Equal<int64 array>([| 1L; 3L; 2L |], withSelect.Rows |> Array.map (fun r -> asInt r.[0])))
+
+[<Fact>]
+let ``SqlReference: GROUP BY の IN サブクエリは集合ごとに別のキーになる`` () =
+    // 式のキーが「左辺 + 否定」だけだと、内容の違う IN サブクエリが同じグループ列に
+    // まとまり、SELECT の値が取り違えられていた。
+    withSession "group-by-in-set" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (x INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1), (2), (3)"
+        let db3 = exec db2 "CREATE TABLE s1 (v INTEGER PRIMARY KEY)"
+        let db4 = exec db3 "CREATE TABLE s2 (v INTEGER PRIMARY KEY)"
+        let db5, _ = ok (execSql db4 "INSERT INTO s1 VALUES (1)")
+        let db6, _ = ok (execSql db5 "INSERT INTO s2 VALUES (2)")
+
+        let asBool v =
+            match v with
+            | SqlValue.Bool b -> b
+            | _ -> failwithf "BOOLEAN ではありません: %A" v
+
+        let _, rows =
+            ok (
+                execSql
+                    db6
+                    "SELECT x IN (SELECT v FROM s1), x IN (SELECT v FROM s2), COUNT(*) FROM t GROUP BY x IN (SELECT v FROM s1), x IN (SELECT v FROM s2)"
+            )
+
+        Assert.Equal<int>(3, rows.Rows.Length)
+
+        let got =
+            rows.Rows
+            |> Array.map (fun r -> asBool r.[0], asBool r.[1], asInt r.[2])
+            |> Array.sort
+
+        Assert.Equal<(bool * bool * int64) array>([| (false, false, 1L); (false, true, 1L); (true, false, 1L) |], got)
+
+        // SELECT と GROUP BY に同じ構文で書いたサブクエリは同じスロットに一致する。
+        let _, same =
+            ok (execSql db6 "SELECT x IN (SELECT v FROM s1) AS in1, COUNT(*) FROM t GROUP BY x IN (SELECT v FROM s1)")
+
+        Assert.Equal<(bool * int64) array>(
+            [| (false, 2L); (true, 1L) |],
+            same.Rows |> Array.map (fun r -> asBool r.[0], asInt r.[1]) |> Array.sort
+        ))
+
+[<Fact>]
+let ``SqlReference: 相関サブクエリは結合順を並べ替えても外側行を取り違えない`` () =
+    // LEFT JOIN の後に書いた INNER は前に繰り上げられる（§7.5）。
+    // 評価行は FROM 順ではなく実行順になるため、外側行を FROM 順へ詰め替えないと
+    // 外側参照が別の列を読む。
+    withSession "correlated-hoist" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)"
+        let db2 = exec db1 "CREATE TABLE b (id INTEGER PRIMARY KEY, z INTEGER)"
+        let db3 = exec db2 "CREATE TABLE c (id INTEGER PRIMARY KEY, a_id INTEGER)"
+        let db4 = exec db3 "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db5, _ = ok (execSql db4 "INSERT INTO a VALUES (1, 10)")
+        let db6, _ = ok (execSql db5 "INSERT INTO b VALUES (1, 99)")
+        let db7, _ = ok (execSql db6 "INSERT INTO c VALUES (1, 10)")
+        let db8, _ = ok (execSql db7 "INSERT INTO d VALUES (1, 10)")
+
+        // b.z = 99 なので d.v = 10 の行は一致しない（0 行が正しい）。
+        let _, exists =
+            ok (
+                execSql
+                    db8
+                    "SELECT a.id FROM a LEFT JOIN b ON b.id = a.id JOIN c ON c.a_id = a.x WHERE EXISTS (SELECT 1 FROM d WHERE d.v = b.z)"
+            )
+
+        Assert.Equal<int>(0, exists.Rows.Length)
+
+        // スカラー相関も同じ外側行を読む。
+        let _, scalar =
+            ok (
+                execSql
+                    db8
+                    "SELECT a.id, (SELECT MAX(d.v) FROM d WHERE d.v = b.z) AS mx FROM a LEFT JOIN b ON b.id = a.id JOIN c ON c.a_id = a.x"
+            )
+
+        Assert.Equal<int>(1, scalar.Rows.Length)
+        Assert.Equal<int64>(1L, asInt scalar.Rows.[0].[0])
+
+        match scalar.Rows.[0].[1] with
+        | SqlValue.Null -> ()
+        | other -> failwithf "NULL ではありません: %A" other)
+
+[<Fact>]
 let ``SqlReference: 集約があるのに GROUP BY に無い列を選ぶとエラー`` () =
     // 上のテストの逆（集約式の ORDER BY 自体は使えるようになった）。
     withSession "order-by-agg2" (fun db0 ->
@@ -3407,6 +3512,12 @@ let ``SqlReference: 相関サブクエリの未対応形`` () =
             ErrorKind.SyntaxError
             "集約クエリの SELECT の相関サブクエリ"
             (execSql db2 "SELECT (SELECT MAX(x.v) FROM t AS x WHERE x.v = o.v) FROM t AS o GROUP BY o.id")
+
+        // GROUP BY も外側の行を持たない
+        expectErrorKind
+            ErrorKind.SyntaxError
+            "GROUP BY の相関サブクエリ"
+            (execSql db2 "SELECT o.id FROM t AS o GROUP BY (SELECT x.v FROM t AS x WHERE x.id = o.id)")
 
         // 相関スカラーが外側行ごとに 2 行以上を返す
         expectErrorKind

@@ -248,3 +248,22 @@ let ``末尾再帰: 集計呼び出しを含む深い AST も走査できる`` (
 
     Assert.True(Expr.isAggregate deep)
     Assert.Empty(Expr.columnRefs deep)
+
+[<Fact>]
+let ``末尾再帰: 深い派生テーブルの入れ子でも構文キーを作れる`` () =
+    let depth = 10_000
+
+    // `FROM (SELECT ...) AS d` の入れ子を depth 段作る。
+    // 構文キーは各段で `FROM:D:d(...)` を 1つ追加する。
+    let deep =
+        List.init depth (fun _ -> ())
+        |> List.fold
+            (fun acc _ ->
+                { acc with
+                    From = Some(TableSource.Derived(acc, "d"))
+                })
+            emptySelect
+
+    let key = SubqueryKey.ofStatement deep
+    Assert.StartsWith("ITEMS:*@|FROM:D:d(", key)
+    Assert.EndsWith("|OFFSET:-|SETOPS:", key)

@@ -717,7 +717,11 @@ SELECT id FROM t WHERE EXISTS (
 - `UPDATE`の `SET`
 - `UPDATE`と `DELETE`の `WHERE`
 
-`GROUP BY`または集約関数を使うクエリの `SELECT`・`HAVING`・`ORDER BY`、`LIMIT`・`OFFSET`、派生テーブルでは相関サブクエリを使えない。
+`GROUP BY`または集約関数を使うクエリの `SELECT`・`HAVING`・`ORDER BY`、`LIMIT`・`OFFSET`、
+派生テーブルでは相関サブクエリを使えない。
+`GROUP BY` の式そのものにも相関サブクエリは使えない（`SyntaxError`）。
+非相関の `IN (SELECT ...)` は `GROUP BY` の式にも書ける。
+`SELECT`・`HAVING`・`ORDER BY` と `GROUP BY` に同じ構文で書いたサブクエリは同じグループキーになる。
 
 サブクエリの入れ子には深さ制限を設けない。
 

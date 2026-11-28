@@ -60,6 +60,16 @@ let ``Eval.eval: LIKE の % と _`` () =
     Assert.True(test "%" "anything")
     // `%` の後に何もない（0 文字一致）も許す
     Assert.True(test "abc%" "abc")
+    // パターンを使い切ってもテキストが残るとき、以前の `%` の位置を進めて再照合する
+    // （末尾がリテラルでも `%` が残りを飲み込める）。
+    Assert.True(test "%_" "ab")
+    Assert.True(test "a%_" "abc")
+    Assert.True(test "%a" "baa")
+    Assert.True(test "%ab" "xabab")
+    Assert.True(test "a%b" "axxb")
+    // 進めても一致しないものは FALSE のまま
+    Assert.False(test "%ab" "xabz")
+    Assert.False(test "a%_" "a")
 
 [<Fact>]
 let ``Eval.eval: スカラー関数`` () =

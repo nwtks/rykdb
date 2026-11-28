@@ -159,6 +159,10 @@ type internal CorrelatedSubquery =
 /// 評価器は集合の実装を知らずに `Contains` だけを使う。
 type internal Membership =
     {
+        /// 集合の識別子。
+        /// 式のキー（GROUP BY・集約スロットの照合）で集合の同一性を表す。
+        /// 内容の異なる 2つの IN サブクエリが同じキーにならないよう、計画時に 1つずつ振る。
+        Id: string
         /// 値を含むか（SQL の 3値論理。NULL を含む集合では UNKNOWN があり得る）。
         Contains: SqlValue -> DbResult<TruthValue>
         /// 集合のリソースを解放する（メモリなら何もしない）。多重呼び出しは安全。
@@ -812,4 +816,114 @@ module internal Expr =
     let toDisplayString (e: Expr) =
         let sb = System.Text.StringBuilder()
         writeSteps (displayPut sb) [ Sub(e, []) ]
+        sb.ToString()
+
+/// サブクエリ式（`IN (SELECT ...)`）の同一性キー。
+/// `InSet` の `Membership` は出現ごとに別インスタンスなので、そのままでは
+/// `SELECT` と `GROUP BY` に同じ構文で書いたサブクエリが同じ集約スロットに一致しない。
+/// 構文が同じサブクエリが同じキーになるよう、パース結果から文字列を作る。
+/// 入れ子のサブクエリを含む文は式の表示では区別できないため、呼び出しごとに一意な印を付ける
+/// （照合では一致せず `NameError` になり、静かな誤答にしない）。
+module internal SubqueryKey =
+    /// 文の構文キーが使う出力項目。
+    /// `Stmt` として入れ子の文を積むことで、文の出力順（前 → 入れ子 → 後続）を
+    /// 手順のリストとして表し、末尾再帰で書き出す（`Expr.PrintStep` と同じ形）。
+    type private KeyStep =
+        /// そのまま出力する文字列
+        | Text of string
+        /// 入れ子の文（派生テーブルと `UNION ALL` の枝）
+        | Stmt of SelectStatement
+
+    /// 手順の並びを区切り文字で連結する。
+    let private separatedSteps (separator: string) =
+        function
+        | [] -> []
+        | first :: rest -> first @ (rest |> List.collect (fun part -> Text separator :: part))
+
+    let private sourceSteps =
+        function
+        | TableSource.Named r ->
+            [
+                Text(
+                    "T:"
+                    + r.Name.ToLowerInvariant()
+                    + ":"
+                    + (defaultArg r.Alias "").ToLowerInvariant()
+                )
+            ]
+        | TableSource.Derived(inner, alias) -> [ Text("D:" + alias.ToLowerInvariant() + "("); Stmt inner; Text ")" ]
+
+    /// 文 1つ分の出力手順を、後続の手順の前に展開する。
+    /// 入れ子の文は `Stmt` として積み、この関数では再帰しない。
+    let private statementSteps (stmt: SelectStatement) (next: KeyStep list) =
+        let expr = Expr.toDisplayString
+
+        let items =
+            stmt.Items
+            |> List.map (fun i -> expr i.Expression + "@" + (defaultArg i.Alias "").ToLowerInvariant())
+            |> String.concat ","
+
+        let fromSteps =
+            Text "FROM:"
+            :: match stmt.From with
+               | None -> [ Text "-" ]
+               | Some s -> sourceSteps s
+
+        let joinSteps =
+            Text "JOINS:"
+            :: (stmt.Joins
+                |> List.map (fun j ->
+                    Text(sprintf "%A" j.Kind + ",") :: sourceSteps j.Table
+                    @ [ Text("," + expr j.On) ])
+                |> separatedSteps ";")
+
+        let whereKey = stmt.Where |> Option.map expr |> Option.defaultValue "-"
+        let having = stmt.Having |> Option.map expr |> Option.defaultValue "-"
+
+        let order =
+            stmt.OrderBy
+            |> List.map (fun k -> expr k.Expression + "," + sprintf "%A" k.Direction)
+            |> String.concat ";"
+
+        let limit = stmt.Limit |> Option.map expr |> Option.defaultValue "-"
+        let offset = stmt.Offset |> Option.map expr |> Option.defaultValue "-"
+
+        let setOpSteps =
+            Text "SETOPS:"
+            :: (stmt.SetOperations
+                |> List.map (fun op -> [ Text(sprintf "%A" op.Kind + ":"); Stmt op.Statement ])
+                |> separatedSteps ";")
+
+        [
+            if stmt.Distinct then
+                yield [ Text "DISTINCT" ]
+
+            yield [ Text("ITEMS:" + items) ]
+            yield fromSteps
+            yield joinSteps
+            yield [ Text("WHERE:" + whereKey) ]
+            yield [ Text("GROUP:" + (stmt.GroupBy |> List.map expr |> String.concat ",")) ]
+            yield [ Text("HAVING:" + having) ]
+            yield [ Text("ORDER:" + order) ]
+            yield [ Text("LIMIT:" + limit) ]
+            yield [ Text("OFFSET:" + offset) ]
+            yield setOpSteps
+        ]
+        |> separatedSteps "|"
+        |> fun steps -> steps @ next
+
+    /// 出力手順を末尾再帰で書き出す（文と後続の手順を 1本のスタックで処理）。
+    [<TailCall>]
+    let rec private writeKey (put: string -> unit) =
+        function
+        | [] -> ()
+        | Text s :: rest ->
+            put s
+            writeKey put rest
+        | Stmt s :: rest -> writeKey put (statementSteps s rest)
+
+    /// サブクエリの構文キー。
+    let ofStatement (stmt: SelectStatement) =
+        let sb = System.Text.StringBuilder()
+        writeKey (fun s -> sb.Append s |> ignore) [ Stmt stmt ]
         sb.ToString()

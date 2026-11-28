@@ -110,7 +110,10 @@ module internal Plan =
             match Schema.resolve r s.Schema with
             | Ok i ->
                 match s.Row with
-                | Some row when i >= 0 && i < row.Length -> Some(Expr.Value row.[i])
+                | Some row when i >= 0 && i < row.Length ->
+                    match row.[i] with
+                    | SqlValue.Unloaded -> None
+                    | v -> Some(Expr.Value v)
                 | _ -> None
             | Error _ -> substituteOuterGo r scopes rest
 
@@ -417,6 +420,7 @@ module internal Plan =
             >>= fun set ->
                 let membership =
                     {
+                        Id = System.Guid.NewGuid().ToString "N"
                         Contains = set.Contains
                         Release = fun () -> (set :> System.IDisposable).Dispose()
                     }
@@ -848,6 +852,7 @@ module internal Plan =
                                 >>= fun set ->
                                     let membership =
                                         {
+                                            Id = SubqueryKey.ofStatement sel
                                             Contains = set.Contains
                                             Release = fun () -> (set :> System.IDisposable).Dispose()
                                         }

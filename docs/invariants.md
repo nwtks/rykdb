@@ -88,6 +88,8 @@
 | INV-52 | 統計の鮮度は COMMIT した DML だけで進み、ROLLBACK で戻る                              | `ExecState.StatsDeltas`、`ExecState.commitTransaction`、CatalogTests、SqlReferenceTests                                   |
 | INV-53 | クラッシュ復旧は COMMIT 済み prefix を保持し、壊れた CURRENT / 出力をロールバックする | `CURRENT.A`/`CURRENT.B`、`Manifest.openOrCreateWith`、`StorageEngine.replayWals`、CrashConsistencyTests                   |
 | INV-54 | 索引の等値検索は `[prefix, prefix ++ 0xFF)` で切り、NUL 継続値を除外する              | `KeyBuilder.equalityPrefixUpper` / `inEqualityPrefix`、`Dml.scanByIndexPrefixWithSlots`、KeyCodecTests、SqlReferenceTests |
+| INV-55 | 相関サブクエリへ渡す外側行はクエリ入力（FROM 順）へ詰め替える                         | `Optimizer.rowRemap` / `adaptCorrelated`、`Plan.substituteOuterGo`、SqlReferenceTests                                     |
+| INV-56 | IN サブクエリ式のキーは構文で決まり、集合インスタンスに依存しない                     | `Ast.SubqueryKey`、`Membership.Id`、`OpsShared.exprKey`、SqlReferenceTests                                                |
 
 ---
 
@@ -962,6 +964,38 @@ WAL / MANIFEST / compaction 入力から最善努力で復旧する。
   `SqlReference: BLOB 索引の等値検索は NUL 継続値を返さない` /
   `SqlReference: BLOB の UNIQUE は NUL 継続値を重複と見なさない` /
   `SqlReference: 外部キーの子行検索は NUL 継続値を一致と見なさない`。
+
+### INV-55: 相関サブクエリへ渡す外側行はクエリ入力（FROM 順）へ詰め替える
+
+相関サブクエリの外側参照は、計画時にクエリの入力スキーマ（FROM 順）の列位置へ解決される。
+一方、実行時の行は結合順を並べ替えた物理順になる。
+そのまま渡すと外側参照が別の列を読む。
+
+- `Optimizer.rowRemap`が評価スキーマの列を FROM 順の位置へ写す表を作り、
+  `adaptCorrelated`が相関サブクエリを含む式の`Run`へ詰め替えを挟む。
+- 対象は Filter・Sort・Project・JOIN ON（と residual）。
+  相関サブクエリを含まない式には何もしない（行ごとの割当を増やさない）。
+- 評価行に存在しない列は`SqlValue.Unloaded`で埋め、`Plan.substituteOuterGo`が
+  外側参照として解決しない（後続 JOIN のテーブルを参照した場合は`NameError`）。
+- 回帰: `SqlReference: 相関サブクエリは結合順を並べ替えても外側行を取り違えない` /
+  `SqlReference: 相関サブクエリ`（既存の WHERE・ON・SELECT・ORDER BY 経路） /
+  `SqlReference: 相関サブクエリの未対応形`（後続 JOIN の参照は NameError）。
+
+### INV-56: IN サブクエリ式のキーは構文で決まる
+
+`InSet`の`Membership`は `Contains` / `Release` の関数を持つので、
+表示や等値では同じ構文のサブクエリを一致させられない。
+出現ごとに別インスタンスでもある。
+
+- `Ast.SubqueryKey.ofStatement`がパース結果から構文キーを作り、`Membership.Id`に入れる。
+- `OpsShared.exprKey`は`InSet`を「左辺 + 否定 + 構文キー」で表す。
+  これで`SELECT`と`GROUP BY`に同じ構文で書いたサブクエリが同じ集約スロットに一致し、
+  内容の違うサブクエリは別のキーになる。
+- 入れ子のサブクエリを含む文は式の表示で区別できないため、構文キーを作らず一意な印を付ける
+  （一致せず`NameError`になり、静かな誤答にしない）。
+- 相関`IN`の集合は外側行ごとに作るので、識別子は使わない。
+- 回帰: `SqlReference: GROUP BY の IN サブクエリは集合ごとに別のキーになる` /
+  `SqlReference: GROUP BY の相関サブクエリ`（SyntaxError）。
 
 ---
 

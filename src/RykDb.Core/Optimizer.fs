@@ -82,15 +82,15 @@ module internal Optimizer =
         /// 射影。第2・3要素は `*` の展開用（論理 = FROM 順）と評価用（実際の行レイアウト）のスキーマ。
         | ProjectFrame of SelectItem list * Schema * Schema * Expr list
         /// 派生テーブルの内側を評価し終えた。外側の実行文脈へ戻す。
-        | DerivedFrame of ExecContext
+        | DerivedFrame of ExecContext * Schema
         /// 左部分木を評価し終えた Join。次に右部分木を評価する。
         | JoinRightFrame of JoinFrame
         /// 左部分木を評価し終えた Index Nested Loop。右部分木は評価しない。
         | JoinIndexLeftFrame of JoinFrame
         /// 右部分木も評価し終えた Join。左 Op を保持している。
         | JoinApplyFrame of JoinFrame * Op
-        /// UNION ALL の枝を評価中（外側の文脈・完了した枝の Op（逆順）・残りの枝）。
-        | UnionFrame of ExecContext * Op list * PlannedQuery list
+        /// UNION ALL の枝を評価中（外側の文脈・外側の入力スキーマ・完了した枝の Op（逆順）・残りの枝）。
+        | UnionFrame of ExecContext * Schema * Op list * PlannedQuery list
 
     /// 評価機の状態。
     /// 木を 1つ降りるか、Op が上がってきたか。
@@ -501,6 +501,68 @@ module internal Optimizer =
         | Logical.Aggregate(groupBy, aggs, _) -> Some(groupBy, aggs)
         | _ -> None
 
+    /// 評価行を論理スキーマ（FROM 順）の行へ写す関数。
+    /// 評価スキーマの列がすべて論理スキーマに属するときだけ作る
+    /// （集約後など行の形が違うスキーマでは `None`）。
+    /// 評価行に無い論理列は `SqlValue.Unloaded` で埋め、外側参照として解決させない
+    /// （結合途中の行から後続テーブルを参照した場合は評価時の NameError になる）。
+    let private rowRemap (logical: Schema) (evaluated: Schema) =
+        let positions =
+            evaluated.Columns
+            |> Array.map (fun c ->
+                match
+                    Schema.resolve
+                        {
+                            Qualifier = c.Qualifier
+                            Name = c.Name
+                        }
+                        logical
+                with
+                | Ok i -> i
+                | Error _ -> -1)
+
+        if positions |> Array.exists (fun i -> i < 0) then
+            None
+        else
+            let source = Array.create logical.Columns.Length -1
+            positions |> Array.iteri (fun fromIdx toIdx -> source.[toIdx] <- fromIdx)
+
+            if source |> Array.mapi (fun i p -> i = p) |> Array.forall id then
+                None
+            else
+                Some(fun (row: SqlValue array) ->
+                    Array.init source.Length (fun i ->
+                        let j = source.[i]
+
+                        if j >= 0 && j < row.Length then
+                            row.[j]
+                        else
+                            SqlValue.Unloaded))
+
+    /// 式に含まれる相関サブクエリへ、評価行を論理スキーマ（FROM 順）へ写す処理を挟む。
+    /// 結合順を並べ替えても、相関サブクエリの外側参照が正しい列を読むようにする。
+    /// 相関サブクエリを含まない式には何もしない（行ごとの割当を増やさない）。
+    let private adaptCorrelated (logical: Schema) (evaluated: Schema) (e: Expr) =
+        if not (Expr.hasCorrelated e) then
+            e
+        else
+            match rowRemap logical evaluated with
+            | None -> e
+            | Some remap ->
+                Expr.rewrite
+                    (fun x ->
+                        match x with
+                        | Expr.CorrelatedSubquery c ->
+                            Expr.CorrelatedSubquery
+                                { c with
+                                    Run = fun row -> c.Run(remap row)
+                                }
+                        | _ -> x)
+                    e
+                |> function
+                    | Ok rewritten -> rewritten
+                    | Error _ -> e
+
     /// 入れ子ループ結合を実行する。
     let private execNestedLoopJoin (ctx: ExecContext) (frame: JoinFrame) (left: Op) (right: Op) =
         match frame.Kind with
@@ -764,8 +826,11 @@ module internal Optimizer =
             | _ -> err (DbError.internalError "index nested loop ではありません")
 
     /// 結合ノードの実行フレームを組み立てる。
+    /// `root` は実行するクエリの入力スキーマ（FROM 順）で、
+    /// ON の相関サブクエリが外側行を読むときの並び。
     let private buildJoinFrame
         (ctx: ExecContext)
+        (root: Schema)
         (memo: OutputSchemaMemo)
         (inSchema: Schema)
         (node: Logical)
@@ -793,6 +858,16 @@ module internal Optimizer =
             let algorithm, keys, leftKeyIndices =
                 Analyzer.chooseJoinAlgorithmWith statsOf (tableOf ctx) leftSchema rightSchema rightTable left right on
 
+            let evalSchema = Schema.concat leftSchema rightSchema
+            let on = adaptCorrelated root evalSchema on
+
+            let keys =
+                keys
+                |> Option.map (fun k ->
+                    { k with
+                        Residual = k.Residual |> Option.map (adaptCorrelated root evalSchema)
+                    })
+
             let frame =
                 {
                     Node = node
@@ -811,39 +886,51 @@ module internal Optimizer =
             frame, leftSchema
 
     /// 論理木を 1ノードずつ処理する。
+    /// `root` は実行するクエリの入力スキーマ（FROM 順）で、
+    /// 相関サブクエリの外側行を詰め替えるときに使う。
     /// 継続は ExecFrame list に積むので、ラッパの深さに依存せずスタックは一定。
     [<TailCall>]
-    let rec private run (ctx: ExecContext) (memo: OutputSchemaMemo) (frames: ExecFrame list) =
+    let rec private run (ctx: ExecContext) (root: Schema) (memo: OutputSchemaMemo) (frames: ExecFrame list) =
         function
         | EvalNode(node, inSchema, hint, preFilter) ->
             match node with
             | Logical.Join(kind, name, on, lTree, rTree) ->
                 let frame, leftSchema =
-                    buildJoinFrame ctx memo inSchema node kind name on lTree rTree
+                    buildJoinFrame ctx root memo inSchema node kind name on lTree rTree
 
                 match frame.Algorithm with
                 | JoinAlgorithm.IndexNestedLoop _ ->
-                    run ctx memo (JoinIndexLeftFrame frame :: frames) (EvalNode(lTree, leftSchema, None, None))
-                | _ -> run ctx memo (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None, None))
-            | Logical.Values values -> run ctx memo frames (ApplyOp(Op.ofRow values))
+                    run ctx root memo (JoinIndexLeftFrame frame :: frames) (EvalNode(lTree, leftSchema, None, None))
+                | _ -> run ctx root memo (JoinRightFrame frame :: frames) (EvalNode(lTree, leftSchema, None, None))
+            | Logical.Values values -> run ctx root memo frames (ApplyOp(Op.ofRow values))
             | Logical.Derived plan ->
                 let innerCtx =
                     { plan.Context with
                         ScanNeeds = ctx.ScanNeeds
                     }
 
-                run innerCtx memo (DerivedFrame ctx :: frames) (EvalNode(plan.Tree, plan.Input, None, None))
-            | Logical.UnionAll [] -> run ctx memo frames (ApplyOp Op.Empty)
+                run
+                    innerCtx
+                    plan.Input
+                    memo
+                    (DerivedFrame(ctx, root) :: frames)
+                    (EvalNode(plan.Tree, plan.Input, None, None))
+            | Logical.UnionAll [] -> run ctx root memo frames (ApplyOp Op.Empty)
             | Logical.UnionAll(plan :: rest) ->
                 let innerCtx =
                     { plan.Context with
                         ScanNeeds = ctx.ScanNeeds
                     }
 
-                run innerCtx memo (UnionFrame(ctx, [], rest) :: frames) (EvalNode(plan.Tree, plan.Input, None, None))
+                run
+                    innerCtx
+                    plan.Input
+                    memo
+                    (UnionFrame(ctx, root, [], rest) :: frames)
+                    (EvalNode(plan.Tree, plan.Input, None, None))
             | Logical.Scan(name, method) ->
                 match execScan node ctx name method preFilter hint with
-                | Ok op -> run ctx memo frames (ApplyOp(countOutput ctx node op))
+                | Ok op -> run ctx root memo frames (ApplyOp(countOutput ctx node op))
                 | Error e -> err e
             | Logical.Filter(p, child) ->
                 let childSchema = outputOfMemo ctx inSchema memo child
@@ -864,19 +951,28 @@ module internal Optimizer =
 
                 match remainingExpr with
                 | Some rest ->
-                    run ctx memo (FilterFrame(rest, childSchema) :: frames) (EvalNode(child, inSchema, None, preFilter))
-                | None -> run ctx memo frames (EvalNode(child, inSchema, None, preFilter))
+                    let rest = adaptCorrelated root childSchema rest
+
+                    run
+                        ctx
+                        root
+                        memo
+                        (FilterFrame(rest, childSchema) :: frames)
+                        (EvalNode(child, inSchema, None, preFilter))
+                | None -> run ctx root memo frames (EvalNode(child, inSchema, None, preFilter))
             | Logical.Aggregate(groupBy, aggs, child) ->
                 let childSchema = outputOfMemo ctx inSchema memo child
 
                 run
                     ctx
+                    root
                     memo
                     (AggregateFrame(groupBy, aggs, childSchema) :: frames)
                     (EvalNode(child, inSchema, None, None))
             | Logical.Having(h, aggs, groupBy, child) ->
-                run ctx memo (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema, None, None))
-            | Logical.Distinct child -> run ctx memo (DistinctFrame :: frames) (EvalNode(child, inSchema, None, None))
+                run ctx root memo (HavingFrame(h, aggs, groupBy) :: frames) (EvalNode(child, inSchema, None, None))
+            | Logical.Distinct child ->
+                run ctx root memo (DistinctFrame :: frames) (EvalNode(child, inSchema, None, None))
             | Logical.Sort(keys, child) ->
                 let childSchema = outputOfMemo ctx inSchema memo child
 
@@ -885,20 +981,37 @@ module internal Optimizer =
                     | Some(groupBy, aggs) -> groupBy, aggs
                     | None -> [], []
 
+                let keys =
+                    keys
+                    |> List.map (fun k ->
+                        { k with
+                            Expression = adaptCorrelated root childSchema k.Expression
+                        })
+
                 run
                     ctx
+                    root
                     memo
                     (SortFrame(keys, childSchema, groupBy, aggs) :: frames)
                     (EvalNode(child, inSchema, None, None))
             | Logical.Limit(offset, limit, child) ->
                 let childHint = childLimitHint offset limit hint
-                run ctx memo (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema, childHint, None))
+
+                run ctx root memo (LimitFrame(offset, limit) :: frames) (EvalNode(child, inSchema, childHint, None))
             | Logical.Project(items, child) ->
                 let childSchema = outputOfMemo ctx inSchema memo child
                 let groupBy = groupByOf child
 
+                let items =
+                    items
+                    |> List.map (fun i ->
+                        { i with
+                            Expression = adaptCorrelated root childSchema i.Expression
+                        })
+
                 run
                     ctx
+                    root
                     memo
                     (ProjectFrame(items, inSchema, childSchema, groupBy) :: frames)
                     (EvalNode(child, inSchema, hint, None))
@@ -907,50 +1020,51 @@ module internal Optimizer =
             | [] -> ret op
             | frame :: rest ->
                 match frame with
-                | DerivedFrame outer -> run outer memo rest (ApplyOp op)
+                | DerivedFrame(outerCtx, outerRoot) -> run outerCtx outerRoot memo rest (ApplyOp op)
                 | FilterFrame(p, childSchema) ->
                     match Ops.filter childSchema p op with
-                    | Ok filtered -> run ctx memo rest (ApplyOp filtered)
+                    | Ok filtered -> run ctx root memo rest (ApplyOp filtered)
                     | Error e -> err e
                 | AggregateFrame(groupBy, aggs, inSchema) ->
                     match OpsAggregate.aggregate ctx.Budget inSchema groupBy aggs op with
-                    | Ok aggregated -> run ctx memo rest (ApplyOp aggregated)
+                    | Ok aggregated -> run ctx root memo rest (ApplyOp aggregated)
                     | Error e -> err e
                 | HavingFrame(h, aggs, groupBy) ->
                     match OpsAggregate.havingFilter groupBy aggs h with
                     | Error e -> err e
-                    | Ok p -> run ctx memo rest (ApplyOp(Op.filter p op))
-                | DistinctFrame -> run ctx memo rest (ApplyOp(OpsDistinct.distinct ctx.Budget op))
+                    | Ok p -> run ctx root memo rest (ApplyOp(Op.filter p op))
+                | DistinctFrame -> run ctx root memo rest (ApplyOp(OpsDistinct.distinct ctx.Budget op))
                 | SortFrame(keys, childSchema, groupBy, aggs) ->
                     match OpsSort.sortBy ctx.Budget childSchema groupBy aggs keys op with
-                    | Ok sorted -> run ctx memo rest (ApplyOp sorted)
+                    | Ok sorted -> run ctx root memo rest (ApplyOp sorted)
                     | Error e -> err e
                 | LimitFrame(offset, limit) ->
                     let skipped = if offset > 0 then Op.skip offset op else op
                     let limited = if limit >= 0 then Op.take limit skipped else skipped
-                    run ctx memo rest (ApplyOp limited)
+                    run ctx root memo rest (ApplyOp limited)
                 | ProjectFrame(items, expandSchema, evalSchema, groupBy) ->
                     match Ops.project expandSchema evalSchema groupBy items op with
-                    | Ok projected -> run ctx memo rest (ApplyOp projected)
+                    | Ok projected -> run ctx root memo rest (ApplyOp projected)
                     | Error e -> err e
                 | JoinIndexLeftFrame frame ->
                     match execIndexJoin ctx frame op with
-                    | Ok joined -> run ctx memo rest (ApplyOp(countOutput ctx frame.Node joined))
+                    | Ok joined -> run ctx root memo rest (ApplyOp(countOutput ctx frame.Node joined))
                     | Error e -> err e
                 | JoinRightFrame frame ->
                     run
                         ctx
+                        root
                         memo
                         (JoinApplyFrame(frame, op) :: rest)
                         (EvalNode(frame.Right, frame.RightSchema, None, None))
                 | JoinApplyFrame(frame, leftOp) ->
                     match execJoin ctx frame leftOp op with
-                    | Ok joined -> run ctx memo rest (ApplyOp(countOutput ctx frame.Node joined))
+                    | Ok joined -> run ctx root memo rest (ApplyOp(countOutput ctx frame.Node joined))
                     | Error e -> err e
-                | UnionFrame(outer, doneOps, []) ->
+                | UnionFrame(outerCtx, outerRoot, doneOps, []) ->
                     let combined = List.foldBack Op.append (List.rev (op :: doneOps)) Op.Empty
-                    run outer memo rest (ApplyOp combined)
-                | UnionFrame(outer, doneOps, plan :: plans) ->
+                    run outerCtx outerRoot memo rest (ApplyOp combined)
+                | UnionFrame(outer, outerRoot, doneOps, plan :: plans) ->
                     let innerCtx =
                         { plan.Context with
                             ScanNeeds = outer.ScanNeeds
@@ -958,8 +1072,9 @@ module internal Optimizer =
 
                     run
                         innerCtx
+                        plan.Input
                         memo
-                        (UnionFrame(outer, op :: doneOps, plans) :: rest)
+                        (UnionFrame(outer, outerRoot, op :: doneOps, plans) :: rest)
                         (EvalNode(plan.Tree, plan.Input, None, None))
 
     /// 論理代数を Op に変換する。
@@ -979,8 +1094,10 @@ module internal Optimizer =
         | PutJoinPlan of Logical * Schema
 
     /// 結合ノード 1つ分の実行プランを求めて辞書へ積む。
+    /// `root` は実行するクエリの入力スキーマ（FROM 順）。
     let private processJoinPlanJob
         (baseCtx: ExecContext)
+        (root: Schema)
         (memo: OutputSchemaMemo)
         (acc: (obj * obj) list)
         (frames: JoinPlanJob list)
@@ -1005,12 +1122,14 @@ module internal Optimizer =
                     inSchema) -> acc, VisitNode(child, inSchema) :: frames
         | VisitNode(_, _) -> acc, frames
         | PutJoinPlan(Logical.Join(kind, name, on, left, right) as node, inSchema) ->
-            let frame, _ = buildJoinFrame baseCtx memo inSchema node kind name on left right
+            let frame, _ =
+                buildJoinFrame baseCtx root memo inSchema node kind name on left right
+
             (box node, box frame) :: acc, frames
         | PutJoinPlan(_, _) -> acc, frames
 
     [<TailCall>]
-    let rec private collectJoinPlan (ctx: ExecContext) (memo: OutputSchemaMemo) (acc: (obj * obj) list) =
+    let rec private collectJoinPlan (ctx: ExecContext) (root: Schema) (memo: OutputSchemaMemo) (acc: (obj * obj) list) =
         function
         | [] ->
             acc
@@ -1018,12 +1137,12 @@ module internal Optimizer =
             |> fun entries ->
                 System.Collections.Immutable.ImmutableDictionary.CreateRange<obj, obj>(HashIdentity.Reference, entries)
         | job :: rest ->
-            let acc, next = processJoinPlanJob ctx memo acc rest job
-            collectJoinPlan ctx memo acc next
+            let acc, next = processJoinPlanJob ctx root memo acc rest job
+            collectJoinPlan ctx root memo acc next
 
     /// 結合ノードの実行プランを 1パスで求める。
     let private collectJoinPlans (ctx: ExecContext) (inSchema: Schema) (memo: OutputSchemaMemo) (tree: Logical) =
-        collectJoinPlan ctx memo [] [ VisitNode(tree, inSchema) ]
+        collectJoinPlan ctx inSchema memo [] [ VisitNode(tree, inSchema) ]
 
     /// 実行に必要なプラン情報（列マスクと結合プラン）を文脈へ埋める。
     /// 既に埋まっていれば再計算しない（計画時の 1回分を再利用する）。
@@ -1046,7 +1165,7 @@ module internal Optimizer =
     let exec (ctx: ExecContext) (tree: Logical) (schema: Schema) =
         let memo = OutputSchemaMemo()
         let ctx = prepareContext ctx schema tree
-        run ctx memo [] (EvalNode(tree, schema, None, None))
+        run ctx schema memo [] (EvalNode(tree, schema, None, None))
 
     /// 実行しながら、走査と結合の出力行数を `counts` に数える。
     /// `EXPLAIN ANALYZE` 用で、通常の `exec` は計測しない。
