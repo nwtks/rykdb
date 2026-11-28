@@ -1197,7 +1197,9 @@ transaction が無い状態の `ROLLBACK` は何もしない（成功する）�
 `COMMIT` は `InternalError` になる。
 
 1 transactionの書き込みバッファ上限は256MiBである。
-超過時は `CapacityError`になる。
+`UPDATE` / `DELETE` は対象行を溜め込む作業メモリも同じ上限へ計上する。
+`DELETE` は外部キーの親検査をまとめるため候補を全件揃えてから消すので、収集の段階で上限を検査する。
+超過時は `CapacityError`になる（行は書き換えない）。
 
 ### 11.2 暗黙のtransaction
 

@@ -692,26 +692,43 @@ module internal DmlOps =
                 mask
 
     /// DELETE の候補行を集める再帰本体。
+    /// 候補を溜め込むメモリを transaction の上限へ計上する
+    /// （FK の親検査は候補を揃えてから 1回で行うため、収集段階で上限を検査する）。
     [<TailCall>]
-    let rec private collectDeleteRow (matched: SqlValue array -> DbResult<bool>) (acc: SqlValue array list) (cur: Op) =
+    let rec private collectDeleteRow
+        (matched: SqlValue array -> DbResult<bool>)
+        (limitBytes: int64)
+        (acc: SqlValue array list)
+        (bytes: int64)
+        (cur: Op)
+        =
         match Op.next cur with
         | OpStep.OpError e -> err e
         | OpStep.OpDone -> ret (List.rev acc)
         | OpStep.OpRow(row, next) ->
             match matched row with
             | DbErr e -> err e
-            | DbOk false -> collectDeleteRow matched acc next
-            | DbOk true -> collectDeleteRow matched (row :: acc) next
+            | DbOk false -> collectDeleteRow matched limitBytes acc bytes next
+            | DbOk true ->
+                let bytes = bytes + rowByteCount row + 24L
+
+                if bytes > limitBytes then
+                    sprintf "DELETE の対象行が transaction の上限（%d バイト）を超えました" limitBytes
+                    |> DbError.capacity
+                    |> err
+                else
+                    collectDeleteRow matched limitBytes (row :: acc) bytes next
 
     /// DELETE の候補行を開いて集める。
     let private collectDeleteRows
         (scan: bool array -> Result<Op, DbError>)
+        (limitBytes: int64)
         (mask: bool array)
         (matched: SqlValue array -> DbResult<bool>)
         =
         result {
             let! scan = scan mask
-            return! collectDeleteRow matched [] scan
+            return! collectDeleteRow matched limitBytes [] 0L scan
         }
 
     /// DELETE。
@@ -742,7 +759,10 @@ module internal DmlOps =
             let! accesses = Dml.prepareIndexAccess schema
             let! checks = ForeignKey.prepareParentDeleteChecks ctx.Catalog schema
             let mask = deleteMaskFor targetSchema schema where checks
-            let! rows = collectDeleteRows scan mask (fun row -> matchesWhere resolve row where)
+
+            let! rows =
+                collectDeleteRows scan ctx.Txn.LimitBytes mask (fun row -> matchesWhere resolve row where)
+
             do! ForeignKey.checkParentDeletes ctx.Store ctx.Visible ctx.Scope ctx.Txn schema checks rows
 
             let! txn2 =

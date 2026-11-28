@@ -335,3 +335,20 @@ let ``DmlOps.delete: DELETE は WHERE に合う行を消す`` () =
 
         Assert.Equal<int>(1, rows.Length)
         Assert.Equal("bob", asText rows.[0].[1]))
+
+[<Fact>]
+let ``DmlOps.delete: DELETE 対象が transaction 上限を超えると CapacityError`` () =
+    withStore "del-limit" (fun store ->
+        let mgr = seedPeople store (TransactionManager.create ())
+
+        let txn =
+            { Transaction.create 1UL<txnId> { SeqNo = mgr.LastCommitSeqNo } with
+                LimitBytes = 1L
+            }
+
+        // 候補の収集段階で上限を検査する（tombstone を積むまで待たない）。
+        match delete (ctxOf store txn) plainPeopleSchema None with
+        | Error e ->
+            Assert.Equal(ErrorKind.CapacityError, e.Kind)
+            Assert.Contains("DELETE の対象行", e.Message)
+        | Ok _ -> Assert.Fail("DELETE の上限超過が OK になっています"))
