@@ -654,6 +654,64 @@ module internal Spill =
     /// 使い終わったら `deleteSpool` で消す。
     let reopenKeep (scope: ScanScope option) (spool: RowSpool) = reopenWith false scope spool
 
+    /// 1行の管理メモリ概算（`spoolLoop` と同じ会計）。
+    let private spoolRowBytes (row: SqlValue array) =
+        int64 (ValueCodec.managedRowBytes row) + 32L
+
+    /// run を上限まで読み込む本体。
+    /// 上限超過でも source を閉じ、run は消さない。
+    [<TailCall>]
+    let rec private loadRunLimited (limit: int64) (acc: SqlValue array list) (used: int64) (st: RunState) =
+        match st.Head with
+        | None ->
+            closeSource st.Src
+            ret (Some(acc, used))
+        | Some row ->
+            let size = spoolRowBytes row
+
+            if MemoryBudget.exceeded (limit, used + size) then
+                closeSource st.Src
+                ret None
+            else
+                match readRow st.Src with
+                | Error e ->
+                    closeSource st.Src
+                    err e
+                | Ok None ->
+                    closeSource st.Src
+                    ret (Some(row :: acc, used + size))
+                | Ok(Some head) -> loadRunLimited limit (row :: acc) (used + size) { st with Head = Some head }
+
+    /// 複数の run を上限まで読み込む本体（まだ開いていない run は触らない）。
+    [<TailCall>]
+    let rec private loadPathsLimited (limit: int64) (acc: SqlValue array list) (used: int64) =
+        function
+        | [] -> ret (Some(List.rev acc |> List.toArray))
+        | path :: rest ->
+            match openRun path with
+            | Error e -> err e
+            | Ok st ->
+                match loadRunLimited limit acc used st with
+                | Error e -> err e
+                | Ok None -> ret None
+                | Ok(Some(acc', used')) -> loadPathsLimited limit acc' used' rest
+
+    /// スプールの全行を上限までメモリへ読み込む。
+    /// 上限超過なら `None`。
+    /// 読み取り元は必ず閉じ、run は消さない（呼び出し側が再分割または通常終了の後始末で消す）。
+    /// `reopenKeep` を `Op.toArrayLimited` で途中打ち切りにすると開いたままの source が残り、
+    /// Windows では後続の `unlink` が共有違反で失敗するため、上限判定はこの同期経路で行う。
+    let loadSpoolLimited (limit: int64) =
+        function
+        | RowSpool.Memory rows ->
+            let used = rows |> Array.sumBy spoolRowBytes
+
+            if MemoryBudget.exceeded (limit, used) then
+                ret None
+            else
+                ret (Some rows)
+        | RowSpool.Disk(paths, _, _) -> loadPathsLimited limit [] 0L paths
+
     /// `src` の全行を上限までメモリに溜め、超えたら run へ退避する。
     /// 入力を 1回だけ消費する（JOIN の右側・同一キーのグループなどに使う）。
     [<TailCall>]

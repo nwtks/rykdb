@@ -974,6 +974,14 @@ run のリストを `splitAt` と `@` で行ごとに組み直すと、1行出�
 - ✅ 尽きた run は `Head = None` にして閉じ、最後に残りを閉じる（`Dispose` は冪等）。
 - 回帰: `ExtSort` / `OpsSort` / `OpsDistinct` / `OpsAggregate` のスピル系テスト。
 
+### 7.18 sweepStale はクエリごとに呼ばない
+
+`Optimizer.exec` の冒頭で `Spill.sweepStale` を呼ぶと、スピルしない小さなクエリでも
+一時ディレクトリの列挙（`Directory.GetFiles` + ファイルごとの `FileInfo`）が固定費になる。
+
+- ✅ `Session.OpenWith` / `OpenWithSync` で 1回だけ回収する（24時間超の run だけ削除）。
+- ❌ クエリの実行ごとに列挙する。
+
 ### 7.19 退避 run の行長は確保前に残量と比べる
 
 `Spill.readRow`が長さ varint だけで`Array.zeroCreate`すると、
@@ -1005,13 +1013,17 @@ run のリストを `splitAt` と `@` で行ごとに組み直すと、1行出�
   行ごとのクロージャを作らない。
 - 回帰: `SstScan.filter: 入れ子フィルタの継続は行ごとに 1個だけ確保する`（追加割当の上限）。
 
-### 7.18 sweepStale はクエリごとに呼ばない
+### 7.22 上限判定で開いた run を途中で捨てない
 
-`Optimizer.exec` の冒頭で `Spill.sweepStale` を呼ぶと、スピルしない小さなクエリでも
-一時ディレクトリの列挙（`Directory.GetFiles` + ファイルごとの `FileInfo`）が固定費になる。
+`reopenKeep` で開いた run を `Op.toArrayLimited` の容量エラーで打ち切ると、
+`Op` の継続が捨てられ、開いた `Source` が `ScanScope` に残る。
+Linux では開いたまま削除できるため見えないが、Windows では `unlink` が共有違反で失敗し、
+再分割後の run が一時ディレクトリに残る。
 
-- ✅ `Session.OpenWith` / `OpenWithSync` で 1回だけ回収する（24時間超の run だけ削除）。
-- ❌ クエリの実行ごとに列挙する。
+- ✅ 上限判定は `Spill.loadSpoolLimited` で同期読みし、超過しても `closeSource` する。
+- ✅ `Spill.spool` を `reopen` で1回だけ読む経路では `forgetSpool` で元の登録を外す。
+- 回帰: `結合: 深度上限のフォールバックでも未整列のキーを取りこぼさない`
+  （`ScanScope.ActiveCount = 0` と残留ファイルなしを検査）。
 
 ---
 

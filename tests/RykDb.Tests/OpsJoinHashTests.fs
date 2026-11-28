@@ -241,6 +241,13 @@ let ``結合: 深度上限のフォールバックでも未整列のキーを取
     // 深さ上限でマージ結合へ落ちるときに整列していないと一致を取りこぼすため、
     // 「深さ上限までずっと同じパーティションに残る 2 キー」を総当たりで用意する。
     withDir "join-depth-fallback" (fun dir ->
+        let scope = ScanScope()
+
+        let budget =
+            { tightBudget dir 1L with
+                Scope = Some scope
+            }
+
         // 実装と同じ符号化（順序保持）でパーティション番号を求める。
         let keyBytes (i: int) =
             KeyBuilder.ofValues [| SqlValue.Int(int64 i) |] |> ok
@@ -276,21 +283,12 @@ let ``結合: 深度上限のフォールバックでも未整列のキーを取
         let inner =
             ok (
                 Op.toArray (
-                    ok (
-                        OpsJoinHash.innerJoinHash
-                            (tightBudget dir 1L)
-                            leftSchema
-                            left
-                            [| 0 |]
-                            rightSchema
-                            right
-                            [| 0 |]
-                            None
-                    )
+                    ok (OpsJoinHash.innerJoinHash budget leftSchema left [| 0 |] rightSchema right [| 0 |] None)
                 )
             )
 
         Assert.Equal<int>(4, inner.Length)
+        Assert.Equal<int>(0, scope.ActiveCount)
 
         // LEFT も同じ経路。一致する 2 行 + NULL 拡張 1 行。
         let left2 =
@@ -302,22 +300,13 @@ let ``結合: 深度上限のフォールバックでも未整列のキーを取
         let leftRows =
             ok (
                 Op.toArray (
-                    ok (
-                        OpsJoinHash.leftJoinHash
-                            (tightBudget dir 1L)
-                            leftSchema
-                            left2
-                            [| 0 |]
-                            rightSchema
-                            right2
-                            [| 0 |]
-                            None
-                    )
+                    ok (OpsJoinHash.leftJoinHash budget leftSchema left2 [| 0 |] rightSchema right2 [| 0 |] None)
                 )
             )
 
         Assert.Equal<int>(3, leftRows.Length)
         Assert.True((leftRows |> Array.filter (fun r -> SqlValue.isNull r.[1])).Length = 1)
+        Assert.Equal<int>(0, scope.ActiveCount)
         assertNoLeftovers dir)
 
 [<Fact>]

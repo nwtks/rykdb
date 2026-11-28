@@ -648,6 +648,8 @@ memtableやtransactionなど保持する側は、渡されたキーと行を複�
   - `reopen`: 閉じて削除
   - `reopenKeep`: 閉じるだけ
 - `repartitionRun`は元のrunを削除する。
+- 上限判定のために開いたrunも超過時に `closeSource` し、開いたまま捨てない
+  （Windowsでは開いたファイルを `unlink` できない）。
 - 開いたrunとspoolは `MemoryBudget.Scope`（`ExecContext.Scope`）へ登録する。
 - `ValueSet` の OnDisk 索引（`IndexedValues`）も Dispose で `ScanScope.Forget` する
   （相関 IN で外側行ごとに作ってもメモリが残らない）。
