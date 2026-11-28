@@ -731,6 +731,25 @@ let ``StorageEngine.maybeFlush: MANIFEST へ追記できないときは flush �
         Assert.False(Memtable.isEmpty engine.Mem))
 
 [<Fact>]
+let ``StorageEngine.openDatabaseWith: 検疫済みの孤児は保持期間を過ぎたら削除する`` () =
+    withDir "orphan-sweep" (fun dir ->
+        withEngine dir (fun _ -> ())
+
+        let quarantine = System.IO.Path.Combine(dir, ".orphans")
+        System.IO.Directory.CreateDirectory quarantine |> ignore
+        let oldPath = System.IO.Path.Combine(quarantine, "999998.sst")
+        let newPath = System.IO.Path.Combine(quarantine, "999999.sst")
+        System.IO.File.WriteAllBytes(oldPath, [| 1uy |])
+        System.IO.File.WriteAllBytes(newPath, [| 1uy |])
+        System.IO.File.SetLastWriteTimeUtc(oldPath, System.DateTime.UtcNow.AddDays -30.0)
+        System.IO.File.SetLastWriteTimeUtc(newPath, System.DateTime.UtcNow.AddDays -1.0)
+
+        withEngine dir (fun _ ->
+            // 保持期間を過ぎた孤児だけを回収する（最近の孤児は調査用に残す）。
+            Assert.False(System.IO.File.Exists oldPath)
+            Assert.True(System.IO.File.Exists newPath)))
+
+[<Fact>]
 let ``StorageEngine.openDatabaseWith: 孤児の SSTable は削除せず退避する`` () =
     withDir "re5" (fun dir ->
         withEngine dir (fun _ -> ())

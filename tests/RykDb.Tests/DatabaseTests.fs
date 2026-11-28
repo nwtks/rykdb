@@ -27,6 +27,55 @@ let private seedLibrary (db: Session) =
     |> fun d -> exec d "CREATE INDEX idx_people_name ON people (name)"
     |> fun d -> exec d "CREATE INDEX idx_orders_pid ON orders (person_id)"
 
+/// 任意のタイミングで書き込みだけ失敗させるエンジン（カタログ保存の失敗注入用）。
+type private FailingWriteEngine(armed: bool ref, inner: IStorageEngine) =
+    interface IStorageEngine with
+        member _.NextSeqNo = inner.NextSeqNo
+        member _.ActiveSnapshot = inner.ActiveSnapshot
+        member _.PublishedState = inner.PublishedState
+        member _.WalState = inner.WalState
+        member _.LastFlushError = inner.LastFlushError
+        member _.GetAtMasked key mask visible = inner.GetAtMasked key mask visible
+
+        member _.ScanAtValues startKey limit visible needsValues =
+            inner.ScanAtValues startKey limit visible needsValues
+
+        member _.ScanAtMasked startKey limit mask visible =
+            inner.ScanAtMasked startKey limit mask visible
+
+        member _.WriteBatch entries =
+            if armed.Value then
+                err (DbError.create ErrorKind.IoError "injected write failure")
+            else
+                inner.WriteBatch entries
+                |> Result.map (fun next -> FailingWriteEngine(armed, next) :> IStorageEngine)
+
+        member _.WriteBatchDeferred entries =
+            if armed.Value then
+                err (DbError.create ErrorKind.IoError "injected write failure")
+            else
+                inner.WriteBatchDeferred entries
+                |> Result.map (fun next -> FailingWriteEngine(armed, next) :> IStorageEngine)
+
+        member _.WithNextSeqNo next =
+            FailingWriteEngine(armed, inner.WithNextSeqNo next) :> IStorageEngine
+
+        member _.WithActiveSnapshot snapshot =
+            FailingWriteEngine(armed, inner.WithActiveSnapshot snapshot) :> IStorageEngine
+
+        member _.WithHostState state =
+            FailingWriteEngine(armed, inner.WithHostState state) :> IStorageEngine
+
+        member _.FlushIfNeeded allocate =
+            inner.FlushIfNeeded allocate
+            |> Result.map (fun (next, flushed) -> FailingWriteEngine(armed, next) :> IStorageEngine, flushed)
+
+        member _.MaybeFlush() =
+            inner.MaybeFlush()
+            |> Result.map (fun (next, error) -> FailingWriteEngine(armed, next) :> IStorageEngine, error)
+
+        member _.Close() = inner.Close()
+
 /// 既に開いているハンドルを「クラッシュで失った」ことにして開き直す。
 /// 未 commit の transaction / WAL 再生の検証に使う。
 let private openWithTakingOver (root: string) =
@@ -566,6 +615,40 @@ let ``Session: 中断した DROP の後始末を open 時に再開する`` () =
         Assert.Empty indexRows
         Assert.Empty(ok (DropCleanup.pending store.Root))
         ok (RowStore.close store))
+
+[<Fact>]
+let ``Session: カタログ保存に失敗した DROP は後始末ジャーナルを残す`` () =
+    withDir "drop-cleanup-save-fail" (fun dir ->
+        let armed = ref false
+        let store = ok (RowStore.openStore dir)
+
+        let wrapped =
+            { store with
+                Engine = FailingWriteEngine(armed, store.Engine)
+            }
+
+        let session = ok (Session.OpenWithStore(dir, SessionOptions.Default, wrapped))
+
+        try
+            ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+            armed.Value <- true
+            expectErrorKind ErrorKind.IoError "カタログ保存の失敗" (session.Execute "DROP TABLE t")
+            // WAL の commit だけ成立している場合、再起動後のカタログは削除済みで
+            // keyspace の後始末が必要になる。ここでジャーナルを消してはいけない。
+            Assert.NotEmpty(ok (DropCleanup.pending dir))
+        finally
+            armed.Value <- false
+            session.Close() |> ignore)
+
+[<Fact>]
+let ``Session: 壊れた DROP ジャーナルでも open は続く`` () =
+    withDir "drop-cleanup-corrupt" (fun dir ->
+        // 復号できない行があっても、後始末対象を特定できないだけなので open は止めない。
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, ".drop-cleanup"), "!!!\n")
+
+        let session = ok (Session.OpenWithSync(dir, SessionOptions.Default))
+        ok (session.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY)") |> ignore
+        ok (session.Close()) |> ignore)
 
 [<Fact>]
 let ``Session: DROP INDEX 後の同名再作成で旧索引エントリが復活しない`` () =

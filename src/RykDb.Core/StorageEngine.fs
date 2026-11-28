@@ -673,7 +673,12 @@ module internal StorageEngine =
             System.IO.Directory.GetFiles(dir, "*" + FileMetaData.SstExtension)
             |> Array.choose parseNumber)
 
+    /// 孤児を検疫に保持する期間（日）。過ぎたら open 時に削除する。
+    [<Literal>]
+    let private OrphanRetentionDays = 7
+
     /// 孤立ファイルを検疫ディレクトリへ移す。
+    /// 保持期間は「孤児になった時点」から数えるため、移動時に mtime を更新する。
     let private moveToQuarantine (dir: string) (quarantine: string) (n: FileNumber) =
         let source = FileMetaData.path dir n
         let name = System.IO.Path.GetFileName source
@@ -686,6 +691,7 @@ module internal StorageEngine =
                 target
 
         System.IO.File.Move(source, target, true)
+        System.IO.File.SetLastWriteTimeUtc(target, System.DateTime.UtcNow)
 
     /// 参照されていない SSTable を検疫へ移す。
     /// 古い MANIFEST が参照しているファイルは、ロールバックのために残す。
@@ -708,6 +714,20 @@ module internal StorageEngine =
 
             return ()
         }
+
+    /// 検疫済みの孤児を保持期間後に削除する（失敗は無視する best effort）。
+    let private sweepOrphans (dir: string) =
+        protect (fun () ->
+            let quarantine = System.IO.Path.Combine(dir, ".orphans")
+
+            if System.IO.Directory.Exists quarantine then
+                let limit = System.DateTime.UtcNow.AddDays(float -OrphanRetentionDays)
+
+                System.IO.Directory.GetFiles(quarantine, "*" + FileMetaData.SstExtension)
+                |> Array.iter (fun path ->
+                    if System.IO.File.GetLastWriteTimeUtc path < limit then
+                        System.IO.File.Delete path))
+        |> ignore
 
     /// SSTable の ReadInfo を 1つ埋める。
     let private hydrateFile (dir: string) (f: FileMetaData) =
@@ -890,6 +910,7 @@ module internal StorageEngine =
             do! ensureFilesPresent dir version
             Manifest.collectGarbage dir manifestNumber ManifestRetention
             do! quarantineOrphans dir version
+            sweepOrphans dir
             let! version' = hydrateVersion dir version
             let! diskMaxFile = maxFileNumberOnDisk dir
             let! walNumbers = walNumbersOnDisk dir

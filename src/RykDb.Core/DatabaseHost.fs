@@ -321,33 +321,33 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
                     NextSeqNo = lastSeq + 1UL
                 }
 
-            match seeded |> DropCleanupRecovery.recover store catalog with
-            | Error e ->
-                RowStore.close store |> ignore
-                err e
-            | Ok(store, mgr) ->
-                let lastSeq = RowStore.lastSeqNo store
+            let store, mgr =
+                match seeded |> DropCleanupRecovery.recover store catalog with
+                | Ok ready -> ready
+                | Error _ -> store, seeded
 
-                let manager =
-                    { mgr with
-                        LastCommitSeqNo = lastSeq
-                        NextSeqNo = lastSeq + 1UL
-                    }
+            let lastSeq = RowStore.lastSeqNo store
 
-                RowStore.startBackground store
+            let manager =
+                { mgr with
+                    LastCommitSeqNo = lastSeq
+                    NextSeqNo = lastSeq + 1UL
+                }
 
-                new DatabaseHost(
-                    root,
-                    {
-                        Root = root
-                        Store = store
-                        Catalog = catalog
-                        Manager = manager
-                        DeferDurability = true
-                    },
-                    ?commitDurability = commitDurability
-                )
-                |> ret
+            RowStore.startBackground store
+
+            new DatabaseHost(
+                root,
+                {
+                    Root = root
+                    Store = store
+                    Catalog = catalog
+                    Manager = manager
+                    DeferDurability = true
+                },
+                ?commitDurability = commitDurability
+            )
+            |> ret
 
     /// background compaction を有効にして開く（公開 API の `Session` が使う）。
     /// 同じ root はプロセス内で 1つしか開けない。

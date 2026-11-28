@@ -89,20 +89,32 @@ module internal DropCleanupRecovery =
         else
             false
 
-    /// ジャーナルに残った keyspace を順に掃除し、更新後の store と manager を返す。
+    /// ジャーナルに残った keyspace を順に掃除し、途中までの状態と未完了件数を返す。
+    /// 失敗しても、そこまでに書いた tombstone を含む状態を返す（SeqNo を巻き戻さない）。
     [<TailCall>]
-    let rec private clear (currentStore: RowStore, currentMgr: TransactionManager) (spaces: string list) =
-        match spaces with
-        | [] -> ret (currentStore, currentMgr)
-        | space :: tail ->
-            match RowStore.clearKeyspaceChunks currentMgr space currentStore with
+    let rec private clear (current: RowStore * TransactionManager) =
+        function
+        | [] -> ret (current, 0)
+        | space :: tail as remaining ->
+            match RowStore.clearKeyspaceChunks (snd current) space (fst current) with
             | Ok next -> clear next tail
-            | Error e -> err e
+            | Error _ -> ret (current, List.length remaining)
 
     /// 未完了の後始末を再開する（起動時に呼ぶ）。
+    /// <remarks>
+    /// 後始末の失敗で open を止めない。
+    /// 対象は既にカタログから消えた keyspace で、読めなくても他のデータは使える。
+    /// 失敗したらジャーナルを残し、次の open で再試行する。
+    /// ジャーナル自体を読めないときだけ Error を返す（呼び出し側は無視してよい）。
+    /// </remarks>
     let recover (store: RowStore) (catalog: Catalog) (mgr: TransactionManager) =
         DropCleanup.pending store.Root
-        >>= (List.filter (shouldClean catalog) >> clear (store, mgr))
-        >>= fun ready ->
-            DropCleanup.clear store.Root |> ignore
-            ret ready
+        >>= fun spaces ->
+            let targets = spaces |> List.filter (shouldClean catalog)
+
+            clear (store, mgr) targets
+            >>= fun (ready, remaining) ->
+                if remaining = 0 then
+                    DropCleanup.clear store.Root |> ignore
+
+                ret ready

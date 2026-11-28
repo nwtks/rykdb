@@ -125,13 +125,7 @@ module internal EngineDdl =
                     :: (withIndexes.Indexes |> List.map (fun index -> Keyspace.index index.Name))
 
                 let! () = DropCleanup.add state.Store.Root spaces
-
-                let! next =
-                    match ExecState.saved (Catalog.removeTable name state.Catalog) state with
-                    | Ok next -> ret next
-                    | Error e ->
-                        DropCleanup.clear state.Store.Root |> ignore
-                        err e
+                let! next = ExecState.saved (Catalog.removeTable name state.Catalog) state
 
                 match spaces |> foldOk (fun st sp -> ExecState.clearSpaceChunksResult sp st) next with
                 | Ok cleaned ->
@@ -293,13 +287,7 @@ module internal EngineDdl =
             result {
                 let space = Keyspace.index defn.IndexName
                 let! () = DropCleanup.add state.Store.Root [ space ]
-
-                let! next =
-                    match ExecState.saved (Catalog.removeIndex name state.Catalog) state with
-                    | Ok next -> ret next
-                    | Error e ->
-                        DropCleanup.clear state.Store.Root |> ignore
-                        err e
+                let! next = ExecState.saved (Catalog.removeIndex name state.Catalog) state
 
                 match ExecState.clearSpaceChunksResult space next with
                 | Ok cleaned ->

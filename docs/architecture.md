@@ -1316,6 +1316,7 @@ renameを使わないため、CURRENTの耐久性がrenameに依存しない。
 起動時に最新4世代を残し、それより古いMANIFESTと、
 そのMANIFESTだけが参照しているSSTableを回収する（`Manifest.collectGarbage`）。
 どのMANIFESTからも参照されないSSTableは削除せず`.orphans/`へ退避する。
+退避時にmtimeを退避時刻へ更新し、7日を過ぎたものは起動時に回収する（`sweepOrphans`）。
 
 通常追記では、末尾が改行で終わっていない場合は最後の完全な行まで切り詰めてから追記する。
 
@@ -1547,15 +1548,20 @@ Close後のExecute、BEGIN、COMMIT、ROLLBACKはエラーになる。
 └── .orphans/
 ```
 
-| ファイル         | 役割                           |
-| ---------------- | ------------------------------ |
-| `.rykdb.format`  | レイアウト版とプロセス間ロック |
-| `.drop-cleanup`  | 未完了DROPの後始末対象         |
-| `MANIFEST-xxxxx` | VersionSetの変更履歴           |
-| `CURRENT.A`      | 有効なMANIFEST名とCRC（2世代） |
-| `xxxxx.wal`      | 論理ログ                       |
-| `xxxxx.sst`      | データファイル                 |
-| `.orphans/`      | MANIFEST非参照ファイルの退避先 |
+| ファイル         | 役割                                      |
+| ---------------- | ----------------------------------------- |
+| `.rykdb.format`  | レイアウト版とプロセス間ロック            |
+| `.drop-cleanup`  | 未完了DROPの後始末対象（完了時だけ消す）  |
+| `MANIFEST-xxxxx` | VersionSetの変更履歴                      |
+| `CURRENT.A`      | 有効なMANIFEST名とCRC（2世代）            |
+| `xxxxx.wal`      | 論理ログ                                  |
+| `xxxxx.sst`      | データファイル                            |
+| `.orphans/`      | MANIFEST非参照ファイルの退避先（7日保持） |
+
+`.drop-cleanup`は後始末が完了したときだけ消す。
+カタログ保存が失敗しても消さない（WALのcommitだけが成立した場合、再起動後のカタログは削除済み）。
+復旧時の後始末に失敗してもopenは止めず、ジャーナルを残して次のopenで再試行する
+（壊れたジャーナルを読めない場合も同じ）。
 
 ---
 
