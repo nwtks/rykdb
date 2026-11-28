@@ -743,8 +743,10 @@ module internal Catalog =
         Transaction.remove Keyspace.CatalogKeyspace (statsKey table) txn
 
     /// テーブルの統計を transaction に積む（DML のコミットと同時に鮮度を進める）。
+    /// 統計は助言情報なので競合検査の対象外にする
+    /// （同じ表の別行を更新する 2つの transaction が偽の競合にならないようにする）。
     let putStatsInTxn (s: TableStats) (txn: Transaction) =
-        Transaction.put Keyspace.CatalogKeyspace (statsKey s.Table) (toValue (encodeStats s)) txn
+        Transaction.putAdvisory Keyspace.CatalogKeyspace (statsKey s.Table) (toValue (encodeStats s)) txn
 
     /// 2つのバイト列が等しいか。
     let private bytesEqual (a: byte array) (b: byte array) =

@@ -38,6 +38,10 @@ type internal Transaction =
         /// 物理エントリは書かない。
         /// txn 内で値が消えたら解放し、最終状態に残る値だけを commit の競合検査へ入れる。
         Reservations: Map<string, int>
+        /// 競合検査をしない「助言」の書き込みキー（統計の鮮度など）。
+        /// 物理エントリは commit で書くが、write-write 競合の判定と `LastCommitted` には入れない
+        /// （commit は `writeGate` で直列なので、統計は最新カタログから畳み込めば正しい）。
+        AdvisoryKeys: Set<string>
         /// この transaction が保持できるバッファの上限。
         LimitBytes: int64
     }
@@ -59,6 +63,7 @@ module internal Transaction =
             Buffers = Map.empty
             ApproxBytes = 0L
             Reservations = Map.empty
+            AdvisoryKeys = Set.empty
             LimitBytes = DefaultLimitBytes
         }
 
@@ -71,6 +76,9 @@ module internal Transaction =
             | None -> 0
 
         int64 keyspace.Length + 48L + 24L + int64 key.Length + int64 rowBytes
+
+    /// 文字列をキーに持つ Map / Set の 1件あたりのヒープ概算サイズ。
+    let private stringKeyBytes (key: string) = int64 key.Length * 2L + 48L
 
     /// 所有権を移す。
     /// キーは Map の順序の根拠、行は read-your-writes が返す値なので、
@@ -140,6 +148,21 @@ module internal Transaction =
     let conflictKey (keyspace: string) (key: byte array) =
         keyspace + ":" + System.Convert.ToBase64String key
 
+    /// 競合検査をしない値を書き込む（統計の鮮度などの助言情報）。
+    /// 物理エントリは commit で書くが、`writeKeys` と `LastCommitted` には入れない。
+    /// 同じキーを何度書いても `AdvisoryKeys` は 1件分だけを計上する。
+    let putAdvisory (keyspace: string) (key: byte array) (value: SqlValue array) (txn: Transaction) =
+        let updated = put keyspace key value txn
+        let advisoryKey = conflictKey keyspace key
+
+        if Set.contains advisoryKey txn.AdvisoryKeys then
+            updated
+        else
+            { updated with
+                AdvisoryKeys = Set.add advisoryKey updated.AdvisoryKeys
+                ApproxBytes = updated.ApproxBytes + stringKeyBytes advisoryKey
+            }
+
     /// 競合メッセージ用に `conflictKey` を人が読める形へ縮める。
     /// <remarks>
     /// `conflictKey` は `keyspace + ":" + base64` で、base64 は `:` を含まないため、
@@ -162,7 +185,7 @@ module internal Transaction =
         conflictKey (ReservationKeyspacePrefix + indexName) key
 
     /// UNIQUE 予約 1件のヒープ上の概算サイズ。
-    let private reservationBytes (reservation: string) = int64 reservation.Length * 2L + 48L
+    let private reservationBytes (reservation: string) = stringKeyBytes reservation
 
     /// UNIQUE 索引値の予約を記録する（同じ値は参照カウントでまとめる）。
     let reserveUnique (indexName: string) (key: byte array) (txn: Transaction) =
@@ -192,11 +215,16 @@ module internal Transaction =
             }
 
     /// 競合検出用に「(keyspace, キー)」を文字列 1本に畳んだ集合。
+    /// 助言の書き込み（`AdvisoryKeys`）は競合しても正しさに影響しないので含めない。
     let writeKeys (txn: Transaction) =
         let physical =
             txn.Buffers
             |> Map.toList
-            |> Seq.collect (fun (ks, m) -> m |> Map.keys |> Seq.map (conflictKey ks))
+            |> Seq.collect (fun (ks, m) ->
+                m
+                |> Map.keys
+                |> Seq.map (conflictKey ks)
+                |> Seq.filter (fun k -> not (Set.contains k txn.AdvisoryKeys)))
             |> Set.ofSeq
 
         Set.union physical (txn.Reservations |> Map.keys |> Set.ofSeq)
@@ -367,6 +395,7 @@ module internal TransactionManager =
                 | None -> false)
 
     /// 今回の commit のキーを履歴へ記録する（UNIQUE 予約を含む）。
+    /// 助言の書き込み（`AdvisoryKeys`）は履歴に残さない（競合判定に使わないため）。
     let private updateLastCommittedWith
         (lastCommitted: Map<string, SeqNo>)
         (commitSeq: SeqNo)
@@ -382,9 +411,12 @@ module internal TransactionManager =
                         (fun acc e ->
                             let k = Transaction.conflictKey ks e.Key
 
-                            match acc |> Map.tryFind k with
-                            | Some old when old >= e.SeqNo -> acc
-                            | _ -> Map.add k e.SeqNo acc)
+                            if Set.contains k txn.AdvisoryKeys then
+                                acc
+                            else
+                                match acc |> Map.tryFind k with
+                                | Some old when old >= e.SeqNo -> acc
+                                | _ -> Map.add k e.SeqNo acc)
                         acc)
                 lastCommitted
 

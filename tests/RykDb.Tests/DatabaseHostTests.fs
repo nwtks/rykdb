@@ -335,6 +335,7 @@ let ``DatabaseHost: 上限を超えた transaction の COMMIT も自動で rollb
                 Active = Some txn
                 Pending = None
                 Lease = None
+                StatsDeltas = Map.empty
             }
 
         // 上限は減らないので、何度 COMMIT しても成功しない。競合と同じく abort する。

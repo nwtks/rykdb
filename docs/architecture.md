@@ -547,10 +547,14 @@ LEFTは左行を保存する必要があるため常に右をbuildする。
 統計はDMLで自動更新しない（手動 `ANALYZE` のみ）。
 代わりに、COMMIT した DML が触った行数を `TableStats.Changes` に積む。
 
-- 実行中の行数は `ExecState.StatsDeltas`（接続ローカル）に持ち、
+- 実行中の行数は `TxnState.StatsDeltas`（接続ローカル）に持ち、
+  明示 transaction でも COMMIT まで文を跨いで残る。
   `ExecState.commitTransaction` が同じ transaction に `Catalog.putStatsInTxn` で畳み込む。
   ROLLBACK した分は捨てる
   （統計の書き込みもロールバックされる）。
+- 統計の書き込みは `Transaction.putAdvisory` を使い、write-write 競合と `LastCommitted` の対象外にする
+  （同じ表の別行を更新する 2 つの transaction が偽の競合にならないようにする）。
+  commit は書き込みロックで直列なので、統計は最新カタログへ畳み込めば正しい。
 - `ANALYZE` は `Changes = 0` で統計を作り直し、未反映の行数も捨てる。
 - `EXPLAIN` は 0 より大きいテーブルを `Stats stale: t(+12)` として示す。
 - 保存形は tag 4（従来の末尾に `Changes` と平均行幅を追加）。

@@ -236,6 +236,31 @@ let ``Transaction: read-only な transaction は keys が空`` () =
     Assert.Empty(Transaction.writeKeys txn)
 
 [<Fact>]
+let ``Transaction.putAdvisory: 競合キーにも LastCommitted にも入らない`` () =
+    let mgr0 = TransactionManager.create ()
+    // reader が居る間は LastCommitted が掃除されないので、履歴に残るかを見られる。
+    let mgr1, reader = TransactionManager.beginTxn mgr0
+    let mgr2, txnA = TransactionManager.beginTxn mgr1
+    let mgr3, txnB = TransactionManager.beginTxn mgr2
+    let key = [| 1uy |]
+    let txnA = Transaction.putAdvisory "c:stats:t" key [| SqlValue.Int 1L |] txnA
+    let txnB = Transaction.putAdvisory "c:stats:t" key [| SqlValue.Int 2L |] txnB
+
+    // 助言の書き込みは競合キーに含まれない（物理エントリは commit で書く）。
+    Assert.Empty(Transaction.writeKeys txnA)
+    let batches, _ = Transaction.toEntries 1UL txnA
+    Assert.Equal(1, batches |> List.sumBy (fun (_, entries) -> entries.Length))
+
+    // 同じ統計キーを書いても 2 つの transaction は両方 commit でき、
+    // 統計キーは LastCommitted に残らない。
+    let mgr4, _, _ = ok (TransactionManager.commit txnA mgr3)
+    Assert.Equal(0, mgr4.LastCommitted.Count)
+    let mgr5, _, _ = ok (TransactionManager.commit txnB mgr4)
+    Assert.Equal(0, mgr5.LastCommitted.Count)
+    let mgr6 = TransactionManager.abort reader mgr5
+    Assert.Equal(0, mgr6.LastCommitted.Count)
+
+[<Fact>]
 let ``TransactionManager.activeSnapshot: 最古の active snapshot を返す`` () =
     let mgr = TransactionManager.create ()
     // active が無ければ「次の SeqNo」

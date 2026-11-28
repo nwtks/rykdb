@@ -121,6 +121,10 @@ type internal TxnState =
         /// 接続（`Session`）が Close されずに GC された場合も、
         /// 最後のリースが回収された時点で登録が外れる（`RegistrationLease`）。
         Lease: RegistrationLease option
+        /// COMMIT 前の DML が触った行数（小文字のテーブル名 -> 行数）。
+        /// 接続ローカルに置くので、明示 transaction でも文を跨いで残る。
+        /// COMMIT で統計の `Changes` に畳み込み、ROLLBACK で捨てる。
+        StatsDeltas: Map<string, int64>
     }
 
 module internal TxnState =
@@ -131,6 +135,7 @@ module internal TxnState =
             Active = None
             Pending = None
             Lease = None
+            StatsDeltas = Map.empty
         }
 
     /// transaction 中か。
@@ -149,9 +154,6 @@ type internal ExecState =
         Txn: TxnState
         /// 実行中の文の ActiveSnapshot 登録（暗黙 transaction・DDL の排他判定用）。
         Registration: ActiveRegistration option
-        /// COMMIT 前の DML が触った行数（小文字のテーブル名 -> 行数）。
-        /// COMMIT で統計の `Changes` に畳み込み、ROLLBACK で捨てる。
-        StatsDeltas: Map<string, int64>
     }
 
     member this.Root = this.Committed.Root
@@ -170,6 +172,9 @@ type internal ExecState =
     member this.Pending = this.Txn.Pending
     member this.ActiveRegistration = this.Registration
 
+    /// COMMIT 前の DML が触った行数（接続ローカルの `TxnState` が持つ）。
+    member this.StatsDeltas = this.Txn.StatsDeltas
+
 module internal ExecState =
     /// 確定状態だけから実行状態を作る（transaction なし）。
     let ofCommitted (state: Committed) =
@@ -177,7 +182,6 @@ module internal ExecState =
             Committed = state
             Txn = TxnState.none
             Registration = None
-            StatsDeltas = Map.empty
         }
 
     /// 統計の更新行数を transaction に積む（COMMIT と同じ atomically に反映する）。
@@ -197,27 +201,33 @@ module internal ExecState =
                     Catalog.putStatsInTxn next txn, Catalog.addStats next catalog)
             (txn, state.Committed.Catalog)
 
-    /// DML が触った行数を積む（COMMIT まで持つ）。
+    /// DML が触った行数を積む（COMMIT まで接続ローカルに持つ）。
     let addStatsDelta (table: string) (rows: int) (state: ExecState) =
         if rows <= 0 || Option.isNone (Catalog.findStats table state.Catalog) then
             state
         else
             let key = table.ToLowerInvariant()
-            let delta = state.StatsDeltas |> Map.tryFind key |> Option.defaultValue 0L
+            let delta = state.Txn.StatsDeltas |> Map.tryFind key |> Option.defaultValue 0L
 
             { state with
-                StatsDeltas = Map.add key (delta + int64 rows) state.StatsDeltas
+                Txn =
+                    { state.Txn with
+                        StatsDeltas = Map.add key (delta + int64 rows) state.Txn.StatsDeltas
+                    }
             }
 
     /// 統計を取り直したテーブルの未反映の行数を捨てる。
     let clearStatsDeltas (tables: string list) (state: ExecState) =
-        if List.isEmpty tables || Map.isEmpty state.StatsDeltas then
+        if List.isEmpty tables || Map.isEmpty state.Txn.StatsDeltas then
             state
         else
             let cleared = tables |> List.map (fun t -> t.ToLowerInvariant()) |> Set.ofList
 
             { state with
-                StatsDeltas = state.StatsDeltas |> Map.filter (fun k _ -> not (Set.contains k cleared))
+                Txn =
+                    { state.Txn with
+                        StatsDeltas = state.Txn.StatsDeltas |> Map.filter (fun k _ -> not (Set.contains k cleared))
+                    }
             }
 
     /// transaction を manager で確定し、確定状態を返す。

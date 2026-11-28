@@ -85,7 +85,7 @@
 | INV-49 | LEFT を跨ぐ INNER は ON の参照が閉じるときだけ繰り上げる                              | `PlanBuilder.hoistAcrossLeft`、PlanBuilderTests、SqlReferenceTests                                                        |
 | INV-50 | 結合順の見積りと実行時のアルゴリズム選択は同じ条件を使う                              | `JoinOrder.transitionVariants`、`Analyzer.chooseJoinAlgorithmWith`、JoinOrderTests、SqlReferenceTests                     |
 | INV-51 | 実測行数の計測は `EXPLAIN ANALYZE` だけが有効にする                                   | `ExecContext.RowCounts`、`Optimizer.countOutput`、SqlReferenceTests                                                       |
-| INV-52 | 統計の鮮度は COMMIT した DML だけで進み、ROLLBACK で戻る                              | `ExecState.StatsDeltas`、`ExecState.commitTransaction`、CatalogTests、SqlReferenceTests                                   |
+| INV-52 | 統計の鮮度は COMMIT した DML だけで進み、ROLLBACK で戻る                              | `TxnState.StatsDeltas`、`Transaction.putAdvisory`、`ExecState.commitTransaction`、CatalogTests、SqlReferenceTests         |
 | INV-53 | クラッシュ復旧は COMMIT 済み prefix を保持し、壊れた CURRENT / 出力をロールバックする | `CURRENT.A`/`CURRENT.B`、`Manifest.openOrCreateWith`、`StorageEngine.replayWals`、CrashConsistencyTests                   |
 | INV-54 | 索引の等値検索は `[prefix, prefix ++ 0xFF)` で切り、NUL 継続値を除外する              | `KeyBuilder.equalityPrefixUpper` / `inEqualityPrefix`、`Dml.scanByIndexPrefixWithSlots`、KeyCodecTests、SqlReferenceTests |
 | INV-55 | 相関サブクエリへ渡す外側行はクエリ入力（FROM 順）へ詰め替える                         | `Optimizer.rowRemap` / `adaptCorrelated`、`Plan.substituteOuterGo`、SqlReferenceTests                                     |
@@ -936,10 +936,13 @@ DP は実行されないアルゴリズムのコストで順序を決めてし�
 `TableStats.Changes` は「この統計を取った後に変わった行数」で、
 `EXPLAIN` が `Stats stale:` を出す根拠になる。
 
-- 実行中の行数は `ExecState.StatsDeltas`（接続ローカル）に置き、確定状態には載せない。
+- 実行中の行数は `TxnState.StatsDeltas`（接続ローカル）に置き、確定状態には載せない。
+  明示 transaction では COMMIT まで文を跨いで残り、ROLLBACK で捨てる。
 - `ExecState.commitTransaction` が同じ transaction に `Catalog.putStatsInTxn` で畳み込むので、
   COMMIT と統計の更新は原子的に決まる。
   ROLLBACK すれば統計は変わらない。
+- 統計の書き込みは `Transaction.putAdvisory` で積み、write-write 競合と `LastCommitted` から外す
+  （助言情報のため。commit は直列なので最新カタログから畳み込めば正しい）。
 - 統計の無いテーブルは数えない（鮮度を示す相手が無い）。
 - `ANALYZE` は `Changes = 0` で作り直し、未反映の行数も捨てる。
 - 保存形は tag 5（tag 3 に平均行幅、tag 4 に頻出値を追加）。

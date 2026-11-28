@@ -4393,6 +4393,31 @@ let ``SqlReference: EXPLAIN は ANALYZE 以降の更新行数を示す`` () =
         Assert.DoesNotContain("Stats stale", planOf db9 "SELECT * FROM t"))
 
 [<Fact>]
+let ``SqlReference: 明示 transaction の DML も COMMIT した分だけ統計の鮮度に積まれる`` () =
+    withSession "stats-stale-txn" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1,10),(2,20)"
+        let db3 = exec db2 "ANALYZE t"
+
+        let planOf db sql =
+            let _, res = ok (execSql db ("EXPLAIN " + sql))
+            res.Rows |> Array.map (fun row -> asText row.[0]) |> String.concat "\n"
+
+        // BEGIN してから INSERT しても、COMMIT すれば鮮度に積まれる。
+        let db4 = exec db3 "BEGIN"
+        let db5 = exec db4 "INSERT INTO t VALUES (3,30)"
+        let db6 = exec db5 "COMMIT"
+        Assert.Contains("Stats stale: t(+1)", planOf db6 "SELECT * FROM t")
+
+        // ROLLBACK した分は数えない。
+        let db7 = exec db6 "BEGIN"
+        let db8 = exec db7 "DELETE FROM t"
+        let db9 = exec db8 "ROLLBACK"
+        Assert.Contains("Stats stale: t(+1)", planOf db9 "SELECT * FROM t")
+        let _, remaining = ok (execSql db9 "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(3L, asInt remaining.Rows.[0].[0]))
+
+[<Fact>]
 let ``SqlReference: 並べ替えても LEFT JOIN の NULL 拡張は変わらない`` () =
     withSession "join-order-left" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE l (id INTEGER PRIMARY KEY, v INTEGER)"

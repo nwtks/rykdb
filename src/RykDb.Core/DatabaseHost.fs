@@ -200,6 +200,7 @@ module internal DatabaseHostHelpers =
                         Active = Some txn
                         Pending = None
                         Lease = Some lease
+                        StatsDeltas = Map.empty
                     }
 
                 ret (next, (nextLocal, StatementResult.Empty)))
@@ -233,7 +234,6 @@ type internal DatabaseHost(root: string, state: Committed, ?commitDurability: Co
             Committed = committed
             Txn = local
             Registration = local.Lease |> Option.map _.Registration
-            StatsDeltas = Map.empty
         }
 
     /// Close 後は何もしない（呼び出しはすべて writeGate の内側で Closed を確認済み）。

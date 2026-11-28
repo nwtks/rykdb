@@ -1138,6 +1138,32 @@ let ``SessionPool: 長い transaction 中でも他接続は commit できる`` (
             b.Close() |> ignore)
 
 [<Fact>]
+let ``SessionPool: 同じ表の別行を更新する 2 つの transaction は両方 commit できる`` () =
+    withPool "pool-stats-advisory" (fun pool ->
+        let a = ok (pool.CreateSession())
+        let b = ok (pool.CreateSession())
+
+        try
+            ok (a.Execute "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)") |> ignore
+            ok (a.Execute "INSERT INTO t VALUES (1, 10), (2, 20)") |> ignore
+            // 統計があると COMMIT 時に統計の鮮度も transaction に積まれる。
+            // 統計を競合検査から外していないと、同じ表の別行を更新する 2 つが偽の競合になる。
+            ok (a.Execute "ANALYZE t") |> ignore
+
+            ok (a.Begin()) |> ignore
+            ok (a.Execute "UPDATE t SET v = 11 WHERE id = 1") |> ignore
+            ok (b.Begin()) |> ignore
+            ok (b.Execute "UPDATE t SET v = 22 WHERE id = 2") |> ignore
+            ok (a.Commit()) |> ignore
+            ok (b.Commit()) |> ignore
+
+            Assert.Equal(11L, scalar a "SELECT v FROM t WHERE id = 1")
+            Assert.Equal(22L, scalar a "SELECT v FROM t WHERE id = 2")
+        finally
+            a.Close() |> ignore
+            b.Close() |> ignore)
+
+[<Fact>]
 let ``SessionPool: 接続を閉じるとその transaction だけ rollback される`` () =
     withDir "pool-close-rollback" (fun dir ->
         let pool = ok (SessionPool.OpenWith dir)
