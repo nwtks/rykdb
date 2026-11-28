@@ -608,18 +608,18 @@ module internal Dml =
         result {
             let! prefix = KeyBuilder.ofValues values
             let! positions = indexAndPrimaryIndices schema index
+            let upper = KeyBuilder.equalityPrefixUpper prefix
 
-            let slots =
-                slots |> List.filter (fun (key, _) -> KeyBuilder.startsWithPrefix key prefix)
+            let inPrefix key =
+                KeyBuilder.inEqualityPrefix prefix upper key
 
-            let rowOf = indexRowDecoder schema positions mask
+            let slots = slots |> List.filter (fun (key, _) -> inPrefix key)
 
             let! scan =
                 RowStore.scanAtRawMasked (indexSpace index) prefix (storeLimitFor limit slots) [||] visible scope store
 
-            let rows =
-                opOfIndexScan rowOf (fun key -> KeyBuilder.startsWithPrefix key prefix) slots scan
-
+            let rowOf = indexRowDecoder schema positions mask
+            let rows = opOfIndexScan rowOf inPrefix slots scan
             if limit > 0 then return Op.take limit rows else return rows
         }
 

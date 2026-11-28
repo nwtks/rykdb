@@ -75,6 +75,33 @@ let ``KeyBuilder.startsWithPrefix: 前缀一致`` () =
     Assert.True(KeyBuilder.startsWithPrefix key [||])
 
 [<Fact>]
+let ``KeyBuilder.inEqualityPrefix: NUL 継続値を等値から除外する`` () =
+    // TEXT/BLOB の NUL は 0x00 0xFF にエスケープされるため、
+    // 短い値の符号化は「NUL を含むより長い値」の接頭辞になる。
+    let shortValue = SqlValue.Blob [| 0x61uy |]
+    let longValue = SqlValue.Blob [| 0x61uy; 0x00uy; 0x62uy |]
+    let prefix = KeyBuilder.ofValues [ shortValue ] |> ok
+    let upper = KeyBuilder.equalityPrefixUpper prefix
+    let exact = KeyBuilder.ofIndexAndPrimary [ shortValue ] [ SqlValue.Int 7L ] |> ok
+    let longer = KeyBuilder.ofIndexAndPrimary [ longValue ] [ SqlValue.Int 7L ] |> ok
+    // 生の接頭辞一致はより長い値にも当たる（startsWithPrefix の契約）。
+    Assert.True(KeyBuilder.startsWithPrefix longer prefix)
+    // 等値用の範囲は主キーが続く exact だけを通す。
+    Assert.True(KeyBuilder.inEqualityPrefix prefix upper exact)
+    Assert.True(KeyBuilder.inEqualityPrefix prefix upper prefix)
+    Assert.False(KeyBuilder.inEqualityPrefix prefix upper longer)
+
+    let textPrefix = KeyBuilder.ofValues [ SqlValue.Text "a" ] |> ok
+    let textUpper = KeyBuilder.equalityPrefixUpper textPrefix
+
+    let textLonger =
+        KeyBuilder.ofIndexAndPrimary [ SqlValue.Text("a" + string (char 0) + "b") ] [ SqlValue.Int 1L ]
+        |> ok
+
+    Assert.True(KeyBuilder.startsWithPrefix textLonger textPrefix)
+    Assert.False(KeyBuilder.inEqualityPrefix textPrefix textUpper textLonger)
+
+[<Fact>]
 let ``ValueCodec: 全型の往復`` () =
     let values = Array.init 3000 (fun _ -> randomValue ())
     let w = ValueCodec.writeValues values Writer.Empty |> ok

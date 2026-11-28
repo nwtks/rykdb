@@ -151,6 +151,20 @@ module internal KeyBuilder =
         else
             matchPrefix 0 key prefix
 
+    /// 索引の等値検索で使う接頭辞範囲 `[prefix, prefix ++ 0xFF)` の上限。
+    /// <remarks>
+    /// TEXT/BLOB は埋め込みの 0x00 を 0x00 0xFF へエスケープするので、
+    /// `encode(v)` は `encode(v ++ NUL ++ rest)` のバイト接頭辞になる。
+    /// 索引キーは `prefix` の後ろに主キーの型タグ（すべて 0xFF 未満）が続くため、
+    /// 次のバイトが 0xFF のキーだけを等値検索から除外すればよい。
+    /// </remarks>
+    let equalityPrefixUpper (prefix: byte array) = Array.append prefix [| 0xFFuy |]
+
+    /// キーが等値接頭辞の範囲 `[prefix, upper)` に入るか。
+    /// `upper` は `equalityPrefixUpper prefix` で作る。
+    let inEqualityPrefix (prefix: byte array) (upper: byte array) (key: byte array) =
+        Bytes.compare key prefix >= 0 && Bytes.compare key upper < 0
+
 /// 行ペイロード用のコンパクト符号化。
 /// キーと異なり、行値には順序保持が不要なので varint で詰めて小さくする。
 module internal ValueCodec =

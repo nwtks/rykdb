@@ -740,6 +740,20 @@ COALESCE は CASE と等価で、非 NULL が見つかった後の引数は評�
 - ✅ `Eval` の `KCoalesce` 継続で、NULL のときだけ次の引数へ進む。
 - 回帰: `SqlReference: COALESCE は非 NULL が見つかった後の引数を評価しない`。
 
+### 6.19 索引の等値検索は接頭辞の上限で切る
+
+TEXT/BLOB は埋め込みの `0x00` を `0x00 0xFF` へエスケープするため、
+短い値の符号化は「その値 + NUL + 続き」の符号化のバイト接頭辞になる。
+生の `startsWithPrefix` だけで索引の等値を判定すると、別の値の行を拾う。
+
+- ❌ `KeyBuilder.startsWithPrefix key prefix` だけで索引の等値スキャンを絞る。
+- ✅ `[prefix, prefix ++ 0xFF)` の範囲で切る（`KeyBuilder.equalityPrefixUpper` / `inEqualityPrefix`）。
+  索引キーは prefix の後ろに主キーの型タグ（すべて 0xFF 未満）が続くので、0xFF が続くキーは別の値になる。
+- 回帰: `KeyBuilder.inEqualityPrefix: NUL 継続値を等値から除外する` /
+  `SqlReference: BLOB 索引の等値検索は NUL 継続値を返さない` /
+  `SqlReference: BLOB の UNIQUE は NUL 継続値を重複と見なさない` /
+  `SqlReference: 外部キーの子行検索は NUL 継続値を一致と見なさない`。
+
 ---
 
 ## 7. メモリ・退避・列読み込み

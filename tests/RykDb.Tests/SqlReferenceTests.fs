@@ -799,6 +799,69 @@ let ``SqlReference: 明示 transaction の INSERT は前の文の UNIQUE 値も�
         Assert.Equal<int64>(0L, asInt rows.Rows.[0].[0]))
 
 [<Fact>]
+let ``SqlReference: BLOB 索引の等値検索は NUL 継続値を返さない`` () =
+    // TEXT/BLOB の NUL は 0x00 0xFF にエスケープされるため、生の接頭辞一致だけでは
+    // 「短い値」の索引検索が「短い値 + NUL + 続き」の行まで拾ってしまう。
+    withSession "index-blob-nul" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB, note TEXT)"
+        let db2 = exec db1 "CREATE INDEX iv ON t (v)"
+        let db3 = exec db2 "INSERT INTO t VALUES (1, X'61', 'one'), (2, X'610062', 'two')"
+
+        // 被覆索引（id + v）と非被覆索引（note の fetch あり）の両方。
+        let _, covered = ok (execSql db3 "SELECT id FROM t WHERE v = X'61' ORDER BY id")
+        Assert.Equal<int64 list>([ 1L ], covered.Rows |> Array.toList |> List.map (fun r -> asInt r.[0]))
+
+        let _, fetched = ok (execSql db3 "SELECT note FROM t WHERE v = X'61'")
+        Assert.Equal<int>(1, fetched.Rows.Length)
+        Assert.Equal<string>("one", asText fetched.Rows.[0].[0])
+
+        let _, count = ok (execSql db3 "SELECT COUNT(*) FROM t WHERE v = X'61'")
+        Assert.Equal<int64>(1L, asInt count.Rows.[0].[0])
+
+        // より長い値の完全一致は引き続き引ける。
+        let _, longer = ok (execSql db3 "SELECT id FROM t WHERE v = X'610062'")
+        Assert.Equal<int64 list>([ 2L ], longer.Rows |> Array.toList |> List.map (fun r -> asInt r.[0])))
+
+[<Fact>]
+let ``SqlReference: BLOB の UNIQUE は NUL 継続値を重複と見なさない`` () =
+    withSession "unique-blob-nul" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB UNIQUE)"
+        let db2 = exec db1 "INSERT INTO t VALUES (1, X'610062')"
+        let db3 = exec db2 "INSERT INTO t VALUES (2, X'61')"
+
+        let _, count = ok (execSql db3 "SELECT COUNT(*) FROM t")
+        Assert.Equal<int64>(2L, asInt count.Rows.[0].[0])
+
+        // 同じ値の重複は引き続き拒否する。
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "同じ BLOB 値の UNIQUE 重複"
+            (execSql db3 "INSERT INTO t VALUES (3, X'61')"))
+
+[<Fact>]
+let ``SqlReference: 外部キーの子行検索は NUL 継続値を一致と見なさない`` () =
+    withSession "fk-blob-nul" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE p (id BLOB PRIMARY KEY)"
+
+        let db2 =
+            exec db1 "CREATE TABLE c (id INTEGER PRIMARY KEY, pid BLOB REFERENCES p(id))"
+
+        let db3 = exec db2 "CREATE INDEX ci ON c (pid)"
+        let db4 = exec db3 "INSERT INTO p VALUES (X'61'), (X'610062')"
+        let db5 = exec db4 "INSERT INTO c VALUES (1, X'610062')"
+
+        // 子が参照しているのは X'610062' だけなので、X'61' は削除できる。
+        let db6 = exec db5 "DELETE FROM p WHERE id = X'61'"
+        let _, count = ok (execSql db6 "SELECT COUNT(*) FROM p")
+        Assert.Equal<int64>(1L, asInt count.Rows.[0].[0])
+
+        // 実際に参照されている親は削除できない。
+        expectErrorKind
+            ErrorKind.ConstraintViolation
+            "子行がある親の DELETE"
+            (execSql db6 "DELETE FROM p WHERE id = X'610062'"))
+
+[<Fact>]
 let ``SqlReference: UNIQUE 列を代入しても値が変わらなければ通る`` () =
     withSession "unique-update-same" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"
