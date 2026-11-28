@@ -98,12 +98,6 @@ module internal JoinOrder =
                     | JoinLookup.PrimaryKey -> index.IndexName = "__pk"
                     | JoinLookup.Index n -> Catalog.eqName index.IndexName n))
 
-    /// まだ結合していないテーブルのうち、ON の参照先が揃っているか。
-    let private eligible (dependencies: Map<string, Set<string>>) (joined: Set<string>) (name: string) =
-        match dependencies |> Map.tryFind name with
-        | None -> true
-        | Some refs -> Set.isSubset refs (Set.add name joined)
-
     /// 追加するテーブルに接する結合述語（既に結合済みの側だけ数える）。
     let private applicableEdges (edges: JoinOrderEdge list) (joined: Set<string>) (name: string) =
         edges
@@ -125,44 +119,24 @@ module internal JoinOrder =
 
     /// 貪欲法で結合順を選ぶ再帰ループ。
     [<TailCall>]
-    let rec private greedyGo
-        (dependencies: Map<string, Set<string>>)
-        (edges: JoinOrderEdge list)
-        (joinedRows: float)
-        (joined: Set<string>)
-        (remaining: JoinOrderItem list)
-        (acc: string list)
-        =
-        match remaining with
+    let rec private greedyGo (acc: string list) (joinedRows: float) (joined: Set<string>) (edges: JoinOrderEdge list) =
+        function
         | [] -> List.rev acc
-        | _ ->
-            let ready =
-                remaining |> List.filter (fun item -> eligible dependencies joined item.Name)
-
-            let pool = if List.isEmpty ready then remaining else ready
-
+        | remaining ->
             let item =
-                pool
+                remaining
                 |> List.minBy (fun item -> nextRows edges joined joinedRows item, item.Position)
 
             greedyGo
-                dependencies
-                edges
+                (item.Name :: acc)
                 (nextRows edges joined joinedRows item)
                 (Set.add item.Name joined)
+                edges
                 (remaining |> List.filter (fun x -> x.Name <> item.Name))
-                (item.Name :: acc)
 
     /// 現行の貪欲法。先頭テーブルと LEFT の境界は呼び出し側が固定する。
     /// A/B・診断用に内部へ公開する。
-    let greedy
-        (initialRows: float)
-        (initialJoined: Set<string>)
-        (edges: JoinOrderEdge list)
-        (items: JoinOrderItem list)
-        (dependencies: Map<string, Set<string>>)
-        =
-        greedyGo dependencies edges initialRows initialJoined items []
+    let greedy = greedyGo []
 
     /// 両側の自然順が結合キーで揃っているときの、結合後の出力順。
     let private mergeKeyOrder (ordered: string list option) (item: JoinOrderItem) (applicable: JoinOrderEdge list) =
@@ -287,7 +261,6 @@ module internal JoinOrder =
     let private dpCore
         (itemArray: JoinOrderItem array)
         (edges: JoinOrderEdge list)
-        (dependencies: Map<string, Set<string>>)
         (workMemBytes: float)
         (initialJoined: Set<string>)
         (startMask: int)
@@ -313,7 +286,7 @@ module internal JoinOrder =
                                 (fun states (i, item) ->
                                     let bit = 1 <<< i
 
-                                    if mask &&& bit <> 0 || not (eligible dependencies joined item.Name) then
+                                    if mask &&& bit <> 0 then
                                         states
                                     else
                                         let newMask = mask ||| bit
@@ -376,20 +349,6 @@ module internal JoinOrder =
         |> Array.sortBy fst
         |> Array.tryHead
 
-    /// mask 内のテーブルが依存をすべて満たしているか。
-    let private dependencyClosed (itemArray: JoinOrderItem array) (dependencies: Map<string, Set<string>>) (mask: int) =
-        let names = namesOf mask itemArray
-
-        itemArray
-        |> Array.indexed
-        |> Array.forall (fun (i, item) ->
-            if mask &&& (1 <<< i) <> 0 then
-                match dependencies |> Map.tryFind item.Name with
-                | None -> true
-                | Some refs -> Set.isSubset refs names
-            else
-                true)
-
     /// 左右の部分木を結合したときの追加コストと行数を返す。
     let private splitCost
         (edges: JoinOrderEdge list)
@@ -439,26 +398,16 @@ module internal JoinOrder =
 
                 Some(hashDelta, newRows)
 
-    /// bushy 計画を使える条件を満たすか（件数・有限コスト・依存の閉包）。
-    let private canUseBushy (itemArray: JoinOrderItem array) (dependencies: Map<string, Set<string>>) =
+    /// bushy 計画を使える条件を満たすか（件数・有限コスト）。
+    let private canUseBushy (itemArray: JoinOrderItem array) =
         let count = itemArray.Length
-        let full = (1 <<< count) - 1
 
         count >= 3
         && count <= 6
         && not (itemArray |> Array.exists (fun item -> not (System.Double.IsFinite item.Rows)))
-        && not (
-            dependencies
-            |> Map.exists (fun _ refs -> refs |> Set.exists (fun r -> not (Set.contains r (namesOf full itemArray))))
-        )
 
     /// 先頭テーブル候補ごとに左深 DP を回す（部分集合の最良計画を引くため）。
-    let private leftDeepByFirst
-        (itemArray: JoinOrderItem array)
-        (edges: JoinOrderEdge list)
-        (dependencies: Map<string, Set<string>>)
-        (workMemBytes: float)
-        =
+    let private leftDeepByFirst (itemArray: JoinOrderItem array) (edges: JoinOrderEdge list) (workMemBytes: float) =
         itemArray
         |> Array.mapi (fun f item ->
             let initial =
@@ -471,13 +420,12 @@ module internal JoinOrder =
                     Order = [ f ]
                 }
 
-            f, dpCore itemArray edges dependencies workMemBytes (Set.singleton item.Name) (1 <<< f) initial)
+            f, dpCore itemArray edges workMemBytes (Set.singleton item.Name) (1 <<< f) initial)
 
     /// 全 2分割のうち最良の分割を返す。
     let private bestBushySplit
         (itemArray: JoinOrderItem array)
         (edges: JoinOrderEdge list)
-        (dependencies: Map<string, Set<string>>)
         (workMemBytes: float)
         (perFirst: (int * Map<int, PlanState list>) array)
         (full: int)
@@ -487,28 +435,22 @@ module internal JoinOrder =
         |> Seq.choose (fun l ->
             let r = full ^^^ l
 
-            if
-                not (dependencyClosed itemArray dependencies l)
-                || not (dependencyClosed itemArray dependencies r)
-            then
-                None
-            else
-                match bestOf perFirst l, bestOf perFirst r with
-                | Some(lCost, lState), Some(rCost, rState) ->
-                    let leftNames = namesOf l itemArray
-                    let rightNames = namesOf r itemArray
+            match bestOf perFirst l, bestOf perFirst r with
+            | Some(lCost, lState), Some(rCost, rState) ->
+                let leftNames = namesOf l itemArray
+                let rightNames = namesOf r itemArray
 
-                    splitCost
-                        edges
-                        workMemBytes
-                        leftNames
-                        rightNames
-                        lState.Rows
-                        lState.RowBytes
-                        rState.Rows
-                        rState.RowBytes
-                    |> Option.map (fun (joinDelta, _) -> lCost + rCost + joinDelta, lState, rState)
-                | _ -> None)
+                splitCost
+                    edges
+                    workMemBytes
+                    leftNames
+                    rightNames
+                    lState.Rows
+                    lState.RowBytes
+                    rState.Rows
+                    rState.RowBytes
+                |> Option.map (fun (joinDelta, _) -> lCost + rCost + joinDelta, lState, rState)
+            | _ -> None)
         |> Seq.sortBy (fun (cost, _, _) -> cost)
         |> Seq.tryHead
 
@@ -531,20 +473,15 @@ module internal JoinOrder =
 
     /// bushy 計画（1段の分割。両側は左深）。
     /// 適用できないときは None。
-    let bushyPlan
-        (workMemBytes: float)
-        (edges: JoinOrderEdge list)
-        (items: JoinOrderItem list)
-        (dependencies: Map<string, Set<string>>)
-        =
+    let bushyPlan (workMemBytes: float) (edges: JoinOrderEdge list) (items: JoinOrderItem list) =
         let itemArray = Array.ofList items
         let full = (1 <<< itemArray.Length) - 1
 
-        if not (canUseBushy itemArray dependencies) then
+        if not (canUseBushy itemArray) then
             None
         else
-            let perFirst = leftDeepByFirst itemArray edges dependencies workMemBytes
-            let split = bestBushySplit itemArray edges dependencies workMemBytes perFirst full
+            let perFirst = leftDeepByFirst itemArray edges workMemBytes
+            let split = bestBushySplit itemArray edges workMemBytes perFirst full
             chooseBushyTree itemArray perFirst full split
 
     /// Selinger DP（左深・先頭固定）。
@@ -557,26 +494,16 @@ module internal JoinOrder =
         (workMemBytes: float)
         (edges: JoinOrderEdge list)
         (items: JoinOrderItem list)
-        (dependencies: Map<string, Set<string>>)
         =
         let maxItems = 12
         let itemArray = Array.ofList items
         let count = itemArray.Length
-        let itemNames = itemArray |> Array.map _.Name |> Set.ofArray
-
-        let unknownDependency =
-            dependencies
-            |> Map.exists (fun _ refs ->
-                refs
-                |> Set.exists (fun r -> not (Set.contains r initialJoined) && not (Set.contains r itemNames)))
 
         if count > maxItems then
             None
         elif not (System.Double.IsFinite initialRows) then
             None
         elif itemArray |> Array.exists (fun item -> not (System.Double.IsFinite item.Rows)) then
-            None
-        elif unknownDependency then
             None
         else
             let fullMask = (1 <<< count) - 1
@@ -591,7 +518,7 @@ module internal JoinOrder =
                     Order = []
                 }
 
-            dpCore itemArray edges dependencies workMemBytes initialJoined 0 initial
+            dpCore itemArray edges workMemBytes initialJoined 0 initial
             |> Map.tryFind fullMask
             |> Option.map (fun stateList ->
                 let best = stateList |> List.minBy (fun s -> s.Cost)
@@ -610,8 +537,7 @@ module internal JoinOrder =
         (workMemBytes: float)
         (edges: JoinOrderEdge list)
         (items: JoinOrderItem list)
-        (dependencies: Map<string, Set<string>>)
         =
-        selingerPlan initialRows initialRowBytes initialJoined initialOrder workMemBytes edges items dependencies
+        selingerPlan initialRows initialRowBytes initialJoined initialOrder workMemBytes edges items
         |> Option.map _.Order
-        |> Option.defaultWith (fun () -> greedy initialRows initialJoined edges items dependencies)
+        |> Option.defaultWith (fun () -> greedy initialRows initialJoined edges items)

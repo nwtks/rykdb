@@ -517,7 +517,9 @@ LEFT OUTER JOIN table ON expr
 ```
 
 `ON`は省略できない。
-`RIGHT`、`FULL`、`CROSS`、`NATURAL`、`USING`、カンマ結合は未対応。
+`RIGHT`、`FULL`、`CROSS`、`NATURAL`、`USING`、`LATERAL`、カンマ結合は未対応で、
+いずれも明示的な`SyntaxError`になる
+（`AS`を付ければ同じ語を別名として使える）。
 
 ### 7.2 評価順
 
@@ -1330,6 +1332,8 @@ autocommitの文（DML / DDL）も同じ理由で「適用済みだがエラー�
 | COUNT 以外の集約の `*`     | `MIN に * は使えません（* を使えるのは COUNT(*) だけです）`                                       |
 | SAMPLE に整数以外          | `SAMPLE には正の整数が必要です`                                                                   |
 | REAL の結果が無限大        | `数値演算の結果が表現可能な範囲を超えました` / `SUM の結果が REAL の範囲を超えました`             |
+| LATERAL                    | `LATERAL は未対応です（LATERAL JOIN は使えません。別名にする場合は AS を付けてください）`         |
+| カンマ結合                 | `カンマ結合は未対応です（JOIN ... ON を使ってください）`                                          |
 
 未対応の後置句は専用エラーにならず、文の区切りエラーとして報告される場合がある。
 `TEXT`値の変換エラーは、値を引用符付きで表示するため引用符が二重になる。

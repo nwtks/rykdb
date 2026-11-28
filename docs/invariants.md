@@ -594,6 +594,11 @@ SQL の等値は型・DECIMAL のスケール・DATE/TIMESTAMP を跨ぐため�
 - どの結合にも昇格できなかった ON 述語は、結合の上に `Logical.Filter` として残す
   （INNER では ON = WHERE）。
   `usedOns` は結合句の番号で管理し、位置と取り違えない。
+- 参照先が判明しない ON が 1本でもあれば `PlanBuilder.canReorderOns` が偽を返し、
+  その INNER 区間は FROM 順に固定する
+  （ON を昇格できないため並べ替えても意味が変わる）。
+  ON は昇格時に参照先が閉じるので、依存待ちの集合は常に空になる。
+  `JoinOrder` は依存引数を持たず、貪欲法・DP・bushy とも全候補を素直に探索する。
 
 回帰テストは `SqlReference: 型の違う列の等値結合は TypeError`・
 `PlanBuilder.buildLogicalWith: WHERE の結合述語は INNER の ON へ昇格する` を検査する。

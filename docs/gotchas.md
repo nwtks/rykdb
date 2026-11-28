@@ -190,8 +190,11 @@ INL は右部分木を実行しないので、吸収済みの等値を `Expr` �
 
 ### 3.13 未対応のSQL語を別名へ吸収しない
 
-`UNION`・`INTERSECT`・`EXCEPT`・`RIGHT`・`FULL`・`CROSS`・`NATURAL`・`OUTER`を裸の別名として読まない。
+`UNION`・`INTERSECT`・`EXCEPT`・`RIGHT`・`FULL`・`CROSS`・`NATURAL`・`OUTER`・`LATERAL`を裸の別名として読まない。
 未対応の構文は明示エラーにする。集合演算は文の区切り規則へ通す。
+`LATERAL`は`parseSourceC`の入口でも拾う（`JOIN LATERAL (...)`は`parseIdent`が先に語を消費するため）。
+カンマ結合は`parseJoinsLoop`の入口で`,`を検出して専用エラーにする
+（何もしないと文の区切りエラーに化ける）。
 
 ### 3.14 結合アルゴリズムは走査順を検証する
 

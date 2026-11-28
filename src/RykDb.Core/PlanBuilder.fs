@@ -648,28 +648,25 @@ module internal PlanBuilder =
             | Some e when (referencedTables e).IsNone -> Some(i, e)
             | _ -> None)
 
-    /// 各結合の依存（そのテーブル自身を参照する ON があることを示す）。
-    let private joinDependencies (bindings: SourceBinding list) =
-        List.map (fun (i, _, q) ->
-            q
-            |> Option.bind (fun e ->
-                match referencedTables e with
-                | Some _ -> Some(lowerName bindings.[i], Set.empty)
-                | None -> None))
+    /// ON の参照先が全て判明しているか（未修飾列・相関・曖昧列が無いか）。
+    /// 判明していれば ON を昇格できるので結合順を並べ替えても意味が変わらない。
+    /// 判明しなければ ON は結合の上の Filter に残るため FROM 順に固定する。
+    let private canReorderOns =
+        List.forall (fun (_, _, q) -> q |> Option.forall (referencedTables >> Option.isSome))
 
-    /// 既定の結合順。依存が全て判明しているときは JoinOrder 戦略に従い、
-    /// それ以外は FROM 順。
+    /// 既定の結合順。
+    /// ON を昇格できるときは JoinOrder 戦略に従い、それ以外は FROM 順。
     let private normalOrderOf
         (inner: (int * JoinClause) list)
         (acc: Logical)
         (accSchema: Schema)
         (joined: Set<string>)
-        (dependencies: (string * Set<string>) option list)
+        (canReorder: bool)
         (edges: JoinOrderEdge list)
         (workMemBytes: float)
         (input: SegmentInput)
         =
-        if dependencies |> List.forall Option.isSome then
+        if canReorder then
             let initialOrder =
                 match input.Bindings with
                 | first :: _ ->
@@ -685,14 +682,12 @@ module internal PlanBuilder =
                 |> List.map (fun (i, _) ->
                     joinItem input.StatsOf i input.Scans.[i] input.Estimates.[i] input.Bindings.[i])
 
-            let deps = dependencies |> List.choose id |> Map.ofList
-
             match input.Ctx.JoinOrder with
             | JoinOrderStrategy.Dp ->
-                JoinOrder.choose (input.Estimate acc) initialRowBytes joined initialOrder workMemBytes edges items deps
-            | JoinOrderStrategy.Greedy -> JoinOrder.greedy (input.Estimate acc) joined edges items deps
+                JoinOrder.choose (input.Estimate acc) initialRowBytes joined initialOrder workMemBytes edges items
+            | JoinOrderStrategy.Greedy -> JoinOrder.greedy (input.Estimate acc) joined edges items
             | JoinOrderStrategy.Bushy ->
-                JoinOrder.choose (input.Estimate acc) initialRowBytes joined initialOrder workMemBytes edges items deps
+                JoinOrder.choose (input.Estimate acc) initialRowBytes joined initialOrder workMemBytes edges items
         else
             inner |> List.map (fun (i, _) -> lowerName input.Bindings.[i])
 
@@ -700,17 +695,13 @@ module internal PlanBuilder =
     /// 返すのは (先頭の FROM 位置, 順序, 名前 -> FROM 位置)。
     let private relaxedOrderOf
         (inner: (int * JoinClause) list)
-        (dependencies: (string * Set<string>) option list)
+        (canReorder: bool)
         (edges: JoinOrderEdge list)
         (workMemBytes: float)
         (allowFirstRelax: bool)
         (input: SegmentInput)
         =
-        if
-            allowFirstRelax
-            && input.Ctx.JoinOrder = JoinOrderStrategy.Dp
-            && dependencies |> List.forall Option.isSome
-        then
+        if allowFirstRelax && input.Ctx.JoinOrder = JoinOrderStrategy.Dp && canReorder then
             let allTables = 0 :: (inner |> List.map fst)
 
             let allByName =
@@ -720,28 +711,20 @@ module internal PlanBuilder =
                 allTables
                 |> List.map (fun i -> joinItem input.StatsOf i input.Scans.[i] input.Estimates.[i] input.Bindings.[i])
 
-            let deps = dependencies |> List.choose id |> Map.ofList
-
             let candidates =
                 allItems
                 |> List.choose (fun firstItem ->
-                    let firstDeps = deps |> Map.tryFind firstItem.Name |> Option.defaultValue Set.empty
+                    let rest = allItems |> List.filter (fun item -> item.Name <> firstItem.Name)
 
-                    if not (Set.isSubset firstDeps (Set.singleton firstItem.Name)) then
-                        None
-                    else
-                        let rest = allItems |> List.filter (fun item -> item.Name <> firstItem.Name)
-
-                        JoinOrder.selingerPlan
-                            firstItem.Rows
-                            firstItem.RowBytes
-                            (Set.singleton firstItem.Name)
-                            firstItem.NaturalOrder
-                            workMemBytes
-                            edges
-                            rest
-                            deps
-                        |> Option.map (fun plan -> plan.Cost, firstItem.Name :: plan.Order))
+                    JoinOrder.selingerPlan
+                        firstItem.Rows
+                        firstItem.RowBytes
+                        (Set.singleton firstItem.Name)
+                        firstItem.NaturalOrder
+                        workMemBytes
+                        edges
+                        rest
+                    |> Option.map (fun plan -> plan.Cost, firstItem.Name :: plan.Order))
 
             match candidates with
             | [] -> None
@@ -761,7 +744,7 @@ module internal PlanBuilder =
         (inner: (int * JoinClause) list)
         (joined: Set<string>)
         (unmovableOns: (int * Expr) list)
-        (dependencies: (string * Set<string>) option list)
+        (canReorder: bool)
         (edges: JoinOrderEdge list)
         (onPredicates: (int * Set<string> * Expr) list)
         (workMemBytes: float)
@@ -772,7 +755,7 @@ module internal PlanBuilder =
             && joined = Set.singleton (lowerName input.Bindings.[0])
             && not (List.isEmpty inner)
             && List.isEmpty unmovableOns
-            && dependencies |> List.forall Option.isSome
+            && canReorder
         then
             let allTables = 0 :: (inner |> List.map fst)
 
@@ -783,11 +766,7 @@ module internal PlanBuilder =
                 allTables
                 |> List.map (fun i -> joinItem input.StatsOf i input.Scans.[i] input.Estimates.[i] input.Bindings.[i])
 
-            let deps =
-                (lowerName input.Bindings.[0], Set.empty) :: (dependencies |> List.choose id)
-                |> Map.ofList
-
-            match JoinOrder.bushyPlan workMemBytes edges allItems deps with
+            match JoinOrder.bushyPlan workMemBytes edges allItems with
             | None -> None
             | Some tree ->
                 let onPredicatesArr = onPredicates |> Array.ofList
@@ -839,7 +818,7 @@ module internal PlanBuilder =
             Edges: JoinOrderEdge list
             OnPredicates: (int * Set<string> * Expr) list
             UnmovableOns: (int * Expr) list
-            Dependencies: (string * Set<string>) option list
+            CanReorder: bool
             WorkMemBytes: float
         }
 
@@ -861,7 +840,7 @@ module internal PlanBuilder =
                     input.EdgeSelectivity
             OnPredicates = movableOns qualifiedOns
             UnmovableOns = unmovableOnsOf qualifiedOns
-            Dependencies = joinDependencies input.Bindings qualifiedOns
+            CanReorder = canReorderOns qualifiedOns
             WorkMemBytes =
                 if input.Ctx.Budget.Work >= 0L then
                     float input.Ctx.Budget.Work
@@ -925,20 +904,20 @@ module internal PlanBuilder =
         let plan = segmentPlanOf accSchema inner input
 
         let normalOrder =
-            normalOrderOf inner acc accSchema joined plan.Dependencies plan.Edges plan.WorkMemBytes input
+            normalOrderOf inner acc accSchema joined plan.CanReorder plan.Edges plan.WorkMemBytes input
 
         let normalByName =
             inner |> List.map (fun (i, _) -> lowerName input.Bindings.[i], i) |> Map.ofList
 
         let relaxedOrder =
-            relaxedOrderOf inner plan.Dependencies plan.Edges plan.WorkMemBytes allowFirstRelax input
+            relaxedOrderOf inner plan.CanReorder plan.Edges plan.WorkMemBytes allowFirstRelax input
 
         let bushyApplied =
             bushyResultOf
                 inner
                 joined
                 plan.UnmovableOns
-                plan.Dependencies
+                plan.CanReorder
                 plan.Edges
                 plan.OnPredicates
                 plan.WorkMemBytes

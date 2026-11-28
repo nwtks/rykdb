@@ -637,6 +637,15 @@ let ``Parser: 未対応の JOIN は明示エラー`` () =
     expectErrorKind ErrorKind.SyntaxError "NATURAL JOIN" (parseStatement "SELECT * FROM t NATURAL JOIN u")
     expectErrorKind ErrorKind.SyntaxError "USING" (parseStatement "SELECT * FROM t JOIN u USING (id)")
 
+    expectErrorKind
+        ErrorKind.SyntaxError
+        "LATERAL JOIN"
+        (parseStatement "SELECT * FROM t JOIN LATERAL (SELECT 1) AS x ON 1 = 1")
+
+    expectErrorKind ErrorKind.SyntaxError "FROM の LATERAL" (parseStatement "SELECT * FROM LATERAL (SELECT 1) AS x")
+    expectErrorKind ErrorKind.SyntaxError "カンマ結合" (parseStatement "SELECT * FROM t, u")
+    expectErrorKind ErrorKind.SyntaxError "JOIN の後のカンマ" (parseStatement "SELECT * FROM t JOIN u ON 1 = 1, v")
+
 [<Fact>]
 let ``Parser: JOIN の種類だけで JOIN が無い入力はエラー`` () =
     // JOIN の種類を読んだら、続く JOIN 本体まで要求する。
@@ -657,9 +666,11 @@ let ``Parser: 未対応語でも列名と明示 AS の別名には使える`` ()
     parseOneOk "SELECT a AS union FROM t" |> ignore
     parseOneOk "SELECT a FROM t AS union" |> ignore
     parseOneOk "CREATE TABLE x (right INTEGER PRIMARY KEY)" |> ignore
+    parseOneOk "SELECT a FROM t AS lateral" |> ignore
 
     // 裸のテーブル別名には使えない（AS を付ける）
     expectErrorKind ErrorKind.SyntaxError "裸の RIGHT 別名" (parseStatement "SELECT a FROM t right")
+    expectErrorKind ErrorKind.SyntaxError "裸の LATERAL 別名" (parseStatement "SELECT a FROM t lateral")
     // 裸の列別名にも使えない（集合演算を飲み込まないため）
     expectErrorKind ErrorKind.SyntaxError "裸の RIGHT 列別名" (parseStatement "SELECT a right FROM t")
 

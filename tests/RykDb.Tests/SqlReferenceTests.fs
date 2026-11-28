@@ -4074,6 +4074,8 @@ let ``SqlReference: よく見るエラーメッセージは sql-reference §13 �
         let db2 = exec db1 "INSERT INTO t (id, n, num, active) VALUES (1, 'a', 10, TRUE)"
 
         expectMessage "JOIN には FROM が必要です" "SELECT 1 JOIN t ON 1 = 1" db2
+        expectMessage "LATERAL は未対応です" "SELECT * FROM t JOIN LATERAL (SELECT 1) AS x ON 1 = 1" db2
+        expectMessage "カンマ結合は未対応です" "SELECT * FROM t, u" db2
         expectMessage "FROM のない SELECT では * を使えません" "SELECT *" db2
         expectMessage "式が必要ですが見つかりませんでした" "SELECT id FROM t WHERE id > 1 AND;" db2
         expectMessage "unclosed string" "SELECT 'abc;" db2

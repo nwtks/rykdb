@@ -119,7 +119,7 @@ module internal ParserExpr =
     /// 未対応の JOIN 系の語。
     /// テーブル別名として飲み込むと、RIGHT JOIN などが INNER JOIN として静かに実行される。
     let private UnsupportedJoinWords =
-        Set.ofList [ "RIGHT"; "FULL"; "CROSS"; "NATURAL"; "OUTER" ]
+        Set.ofList [ "RIGHT"; "FULL"; "CROSS"; "NATURAL"; "OUTER"; "LATERAL" ]
 
     /// 裸の別名として飲み込んではいけない語。
     /// 集合演算の語はここでは消費せず、後続の構文規則（集合演算・文の境界）に判定を委ねる。
@@ -146,6 +146,7 @@ module internal ParserExpr =
         | "CROSS"
         | "NATURAL"
         | "OUTER" -> sprintf "%s は未対応です（INNER JOIN / LEFT JOIN のみ対応。別名にする場合は AS を付けてください）" word
+        | "LATERAL" -> sprintf "%s は未対応です（LATERAL JOIN は使えません。別名にする場合は AS を付けてください）" word
         | _ -> sprintf "%s は未対応です" word
 
     /// 集合演算が ORDER BY / LIMIT の後ろに続いている場合は、専用のエラーにする。
@@ -156,10 +157,11 @@ module internal ParserExpr =
             fail "UNION / INTERSECT / EXCEPT は ORDER BY / LIMIT より前に書いてください" st
         | _ -> ret ()
 
-    /// JOIN の位置に未対応語が来たら、別名や別の JOIN として解釈せず明示エラーにする。
+    /// JOIN の位置に未対応構文が来たら、別名や別の JOIN として解釈せず明示エラーにする。
     /// テーブルに `AS` で別名を付けた場合（`FROM t AS x RIGHT JOIN u`）もここで拾う。
     let private rejectUnsupportedClause (st: PState) =
         match peek st with
+        | Token.Symbol "," -> fail "カンマ結合は未対応です（JOIN ... ON を使ってください）" st
         | Token.Ident s when Set.contains (s.ToUpperInvariant()) UnsupportedJoinWords ->
             fail (unsupportedAliasMessage (s.ToUpperInvariant())) st
         | _ -> ret ()
@@ -850,6 +852,7 @@ module internal ParserExpr =
     /// 派生テーブルには別名を必須にしている（列修飾と JOIN のスキーマ特定に使うため）。
     and private parseSourceC (st: PState) (k: TableSource * PState -> Result<'r, DbError>) =
         match peek st with
+        | Token.Ident s when s.ToUpperInvariant() = "LATERAL" -> fail (unsupportedAliasMessage "LATERAL") st
         | Token.Symbol "(" ->
             let afterParen = advance st
 

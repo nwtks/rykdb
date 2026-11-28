@@ -69,19 +69,19 @@ let private isBushyShape tree =
 let ``JoinOrder.bushyPlan: 3テーブル以上で分割を検討する`` () =
     let items = [ item "a" 1000.0 0; item "b" 1000.0 1; item "c" 1000.0 2 ]
     let edges = [ edgeWith (Some 0.5) "a" "b"; edgeWith (Some 0.01) "b" "c" ]
-    let plan = JoinOrder.bushyPlan -1.0 edges items Map.empty
+    let plan = JoinOrder.bushyPlan -1.0 edges items
     let tree = expectSome "bushy 計画" plan
     Assert.Equal<Set<string>>(Set.ofList [ "a"; "b"; "c" ], leavesOf tree)
 
 [<Fact>]
 let ``JoinOrder.bushyPlan: 2テーブル以下では使わない`` () =
     let items = [ item "a" 10.0 0; item "b" 10.0 1 ]
-    Assert.True((JoinOrder.bushyPlan -1.0 [ edge "a" "b" ] items Map.empty).IsNone)
+    Assert.True((JoinOrder.bushyPlan -1.0 [ edge "a" "b" ] items).IsNone)
 
 [<Fact>]
 let ``JoinOrder.bushyPlan: 7テーブル以上では使わない`` () =
     let items = [ for i in 0..6 -> item (sprintf "t%d" i) 10.0 i ]
-    Assert.True((JoinOrder.bushyPlan -1.0 [] items Map.empty).IsNone)
+    Assert.True((JoinOrder.bushyPlan -1.0 [] items).IsNone)
 
 [<Fact>]
 let ``JoinOrder.bushyPlan: 分割の方が安ければ右が部分木になる`` () =
@@ -90,7 +90,7 @@ let ``JoinOrder.bushyPlan: 分割の方が安ければ右が部分木になる``
         [ item "a" 1_000_000.0 0; item "b" 1_000_000.0 1; item "c" 1_000_000.0 2 ]
 
     let edges = [ edgeWith (Some 0.0001) "b" "c"; edgeWith (Some 1.0) "a" "b" ]
-    let tree = expectSome "bushy 計画" (JoinOrder.bushyPlan -1.0 edges items Map.empty)
+    let tree = expectSome "bushy 計画" (JoinOrder.bushyPlan -1.0 edges items)
     Assert.True(isBushyShape tree, sprintf "%A" tree)
 
 /// 順序だけを返す DP。
@@ -102,9 +102,8 @@ let private selinger
     (workMemBytes: float)
     (edges: JoinOrderEdge list)
     (items: JoinOrderItem list)
-    (dependencies: Map<string, Set<string>>)
     =
-    JoinOrder.selingerPlan initialRows initialRowBytes initialJoined initialOrder workMemBytes edges items dependencies
+    JoinOrder.selingerPlan initialRows initialRowBytes initialJoined initialOrder workMemBytes edges items
     |> Option.map _.Order
 
 [<Fact>]
@@ -112,8 +111,7 @@ let ``JoinOrder.choose: DP が使えるときは DP の順を返す`` () =
     let items = [ item "b" 1000.0 1; item "c" 100.0 2; item "d" 100.0 3 ]
     let edges = [ keyedEdge (Some 0.1) (Map.ofList [ "a", "k"; "b", "k" ]) ]
 
-    let order =
-        JoinOrder.choose 1.0 1.0 (Set.singleton "a") None -1.0 edges items Map.empty
+    let order = JoinOrder.choose 1.0 1.0 (Set.singleton "a") None -1.0 edges items
 
     Assert.Equal<string list>([ "c"; "d"; "b" ], order)
 
@@ -125,15 +123,13 @@ let ``JoinOrder.selinger: 小さい左と索引がある辺は INL のコスト�
         itemWith "b" 1_000_000.0 2 [ index "ix_k" [ "k" ] [ 100L ] false ] None
 
     let withIndex =
-        expectSome
-            "DP の計画"
-            (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 edges [ itemWithIndex ] Map.empty)
+        expectSome "DP の計画" (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 edges [ itemWithIndex ])
 
     // 索引が無ければハッシュ結合（build + probe）のコストになる。
     let withoutIndex =
         expectSome
             "DP の計画"
-            (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 edges [ item "b" 1_000_000.0 2 ] Map.empty)
+            (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 edges [ item "b" 1_000_000.0 2 ])
 
     Assert.True(withIndex.Cost < withoutIndex.Cost, sprintf "INL %g < ハッシュ %g" withIndex.Cost withoutIndex.Cost)
 
@@ -145,9 +141,7 @@ let ``JoinOrder.selinger: 等値キーの無い辺は入れ子ループのコス
     let residualEdges = [ edge "a" "b"; edge "a" "c" ]
 
     let nested =
-        expectSome
-            "DP の計画"
-            (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 residualEdges items Map.empty)
+        expectSome "DP の計画" (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 residualEdges items)
 
     let keyedEdges =
         [
@@ -156,7 +150,7 @@ let ``JoinOrder.selinger: 等値キーの無い辺は入れ子ループのコス
         ]
 
     let hashed =
-        expectSome "DP の計画" (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 keyedEdges items Map.empty)
+        expectSome "DP の計画" (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 keyedEdges items)
 
     // 10*100 + 100 + (100*100 + 1000) = 12,100 が入れ子ループの見積り。
     Assert.Equal(12100.0, nested.Cost, 3)
@@ -171,14 +165,10 @@ let ``JoinOrder.selinger: 右が走査でなければ INL のコストにしな�
     let notLookupable = { lookupable with Lookupable = false }
 
     let withLookup =
-        expectSome
-            "DP の計画"
-            (JoinOrder.selingerPlan 1.0 32.0 (Set.singleton "a") None -1.0 edges [ lookupable ] Map.empty)
+        expectSome "DP の計画" (JoinOrder.selingerPlan 1.0 32.0 (Set.singleton "a") None -1.0 edges [ lookupable ])
 
     let withoutLookup =
-        expectSome
-            "DP の計画"
-            (JoinOrder.selingerPlan 1.0 32.0 (Set.singleton "a") None -1.0 edges [ notLookupable ] Map.empty)
+        expectSome "DP の計画" (JoinOrder.selingerPlan 1.0 32.0 (Set.singleton "a") None -1.0 edges [ notLookupable ])
 
     // 右を実行しない INL は 1*0.5 + 100 = 100.5、ハッシュは 1 + 1000 + 100 + 0.1 = 1101.1。
     Assert.Equal(100.5, withLookup.Cost, 3)
@@ -201,9 +191,7 @@ let ``JoinOrder.selinger: マージ結合は左が走査のときだけ候補に
         ]
 
     let plan =
-        expectSome
-            "DP の計画"
-            (JoinOrder.selingerPlan 1.0 32.0 (Set.singleton "a") (Some [ "k" ]) 100.0 edges items Map.empty)
+        expectSome "DP の計画" (JoinOrder.selingerPlan 1.0 32.0 (Set.singleton "a") (Some [ "k" ]) 100.0 edges items)
 
     // 先頭は a のつもりなので、b と c の順だけを見る（マージ連鎖は前提にしない）。
     Assert.Equal<string list>([ "b"; "c" ], plan.Order)
@@ -212,33 +200,15 @@ let ``JoinOrder.selinger: マージ結合は左が走査のときだけ候補に
 let ``JoinOrder.selinger: 同点は FROM の位置順にする`` () =
     let items = [ item "b" 10.0 1; item "c" 10.0 2 ]
     let edges = [ edge "a" "b"; edge "a" "c" ]
-    let order = selinger 100.0 1.0 (Set.singleton "a") None -1.0 edges items Map.empty
+    let order = selinger 100.0 1.0 (Set.singleton "a") None -1.0 edges items
     Assert.Equal<string list option>(Some [ "b"; "c" ], order)
-
-[<Fact>]
-let ``JoinOrder.selinger: ON の参照先が揃うまで待つ`` () =
-    let items = [ item "b" 100.0 1; item "c" 100.0 2 ]
-    let edges = [ edge "a" "b"; edge "a" "c" ]
-
-    let dependencies =
-        Map.ofList [ "b", Set.ofList [ "a"; "b"; "c" ]; "c", Set.ofList [ "a"; "c" ] ]
-
-    let order = selinger 1.0 1.0 (Set.singleton "a") None -1.0 edges items dependencies
-    Assert.Equal<string list option>(Some [ "c"; "b" ], order)
-
-[<Fact>]
-let ``JoinOrder.selinger: 未知の依存先があれば DP を使わない`` () =
-    let items = [ item "b" 10.0 1 ]
-    let dependencies = Map.ofList [ ("b", Set.ofList [ "a"; "x" ]) ]
-    let order = selinger 1.0 1.0 (Set.singleton "a") None -1.0 [] items dependencies
-    Assert.True order.IsNone
 
 [<Fact>]
 let ``JoinOrder.selinger: 推定が無限なら DP を使わない`` () =
     let items = [ item "b" 10.0 1; item "c" 10.0 2 ]
 
     let order =
-        selinger System.Double.PositiveInfinity 1.0 (Set.singleton "a") None -1.0 [] items Map.empty
+        selinger System.Double.PositiveInfinity 1.0 (Set.singleton "a") None -1.0 [] items
 
     Assert.True order.IsNone
 
@@ -247,8 +217,7 @@ let ``JoinOrder.selinger: 上限を超えるテーブル数では DP を使わ�
     let items = [ for i in 1..13 -> item (sprintf "t%d" i) 10.0 i ]
     let items = item "a" 1.0 0 :: items
 
-    let order =
-        selinger 1.0 1.0 (Set.singleton "a") None -1.0 [] (List.tail items) Map.empty
+    let order = selinger 1.0 1.0 (Set.singleton "a") None -1.0 [] (List.tail items)
 
     Assert.True order.IsNone
 
@@ -260,7 +229,7 @@ let ``JoinOrder.selinger: 作業メモリを超えるとスピル分のコスト
     let edges = [ keyedEdge None (Map.ofList [ "a", "k"; "b", "k" ]) ]
 
     let plan workMem =
-        expectSome "DP の計画" (JoinOrder.selingerPlan 1000.0 32.0 (Set.singleton "a") None workMem edges items Map.empty)
+        expectSome "DP の計画" (JoinOrder.selingerPlan 1000.0 32.0 (Set.singleton "a") None workMem edges items)
 
     let unlimited = plan -1.0
     let spilled = Analyzer.spilledBuildRows 1000.0 32.0 1024.0
@@ -276,7 +245,7 @@ let ``JoinOrder.selinger: 主キーと索引の両方があるとき主キーの
     let item = itemWith "b" 1000.0 2 indexes None
 
     let plan =
-        expectSome "DP の計画" (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 edges [ item ] Map.empty)
+        expectSome "DP の計画" (JoinOrder.selingerPlan 10.0 32.0 (Set.singleton "a") None -1.0 edges [ item ])
 
     // 主キー（一意）の probe 単価 0.5: 10 * 0.5 + 1000 = 1005。
     // 索引（非一意）なら 10 * 0.8 + 1000 = 1008 になる。
