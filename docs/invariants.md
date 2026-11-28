@@ -1053,6 +1053,19 @@ bushy は先頭 INNER 区間（3〜6表）の木を組み、使わなかった�
   `SstableReader.openPartial: Footer の MaxSeqNo が負なら CorruptionError` /
   `SstableReader.openPartial: エントリ数と索引の有無が食い違えば CorruptionError`。
 
+### INV-65: 相関サブクエリの外側参照は枝（UNION ALL）ごとの入力スキーマで判定する
+
+相関サブクエリが `UNION ALL` の枝を持つとき、枝ごとに入力スキーマが違う。
+全枝の入力を連結したスキーマで「内側で解決できるか」を判定すると、
+枝 2 に外側と同じ名前の表（別名）があるだけで枝 1 の外側参照を内側と誤判定し、
+実行時に `NameError` になる。
+
+- `Plan.branchSchemasOf` が複合計画の枝（コア → `UNION ALL` の順）の `Input` を取り出す。
+  `Sort` / `Limit` のラッパは剥がして `Logical.UnionAll` を探す。
+- `Plan.substituteStatement` は枝ごとのスキーマで置換し、
+  枝の数が文と合わないときは全体の入力（保守的）で埋める。
+- 回帰: `SqlReference: UNION ALL の枝を持つ相関サブクエリは枝ごとに外側参照を判定する`。
+
 ---
 
 ## 既知の未対応

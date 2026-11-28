@@ -143,13 +143,18 @@ module internal Plan =
             Current: SetOperation
             /// まだ処理していない枝。
             Rest: SetOperation list
+            /// `Rest` の各枝に対応する入力スキーマ（足りなければ `Fallback`）。
+            RestSchemas: Schema list
+            /// 枝のスキーマが分からないときの保守的な入力（その枝の入力）。
+            Fallback: Schema
             /// 置換済みの枝（逆順）。
             Done: SetOperation list
         }
 
-    /// 置換の作業状態（これから降りる文 / 組み上がった文）。
+    /// 置換の作業状態。
+    /// `Visit` は文とその入力スキーマ、および後続の枝（`UNION ALL`）の入力スキーマ。
     type private SubstituteStep =
-        | Visit of SelectStatement
+        | Visit of SelectStatement * Schema * Schema list
         | Completed of SelectStatement
 
     /// 省略可能な式へ置換を適用する。
@@ -204,26 +209,33 @@ module internal Plan =
     /// 集合演算の枝を明示スタックで降りて置換する。
     [<TailCall>]
     let rec private substituteStatementLoop
-        (substituteFields: SelectStatement -> Result<SelectStatement, DbError>)
+        (substituteFields: Schema -> SelectStatement -> Result<SelectStatement, DbError>)
         (frames: SubstituteFrame list)
         =
         function
-        | Visit s ->
-            match substituteFields s with
+        | Visit(s, inner, branchSchemas) ->
+            match substituteFields inner s with
             | Ok baseStmt ->
                 match s.SetOperations with
                 | [] -> substituteStatementLoop substituteFields frames (Completed baseStmt)
                 | first :: rest ->
+                    let firstSchema, restSchemas =
+                        match branchSchemas with
+                        | schema :: tail -> schema, tail
+                        | [] -> inner, []
+
                     substituteStatementLoop
                         substituteFields
                         ({
                             Base = baseStmt
                             Current = first
                             Rest = rest
+                            RestSchemas = restSchemas
+                            Fallback = inner
                             Done = []
                          }
                          :: frames)
-                        (Visit first.Statement)
+                        (Visit(first.Statement, firstSchema, []))
             | Error e -> err e
         | Completed doneStmt ->
             match frames with
@@ -245,25 +257,60 @@ module internal Plan =
                                 SetOperations = List.rev done'
                             })
                 | next :: rest ->
+                    let nextSchema, restSchemas =
+                        match frame.RestSchemas with
+                        | schema :: tail -> schema, tail
+                        | [] -> frame.Fallback, []
+
                     substituteStatementLoop
                         substituteFields
                         ({ frame with
                             Current = next
                             Rest = rest
+                            RestSchemas = restSchemas
                             Done = done'
                          }
                          :: outerFrames)
-                        (Visit next.Statement)
+                        (Visit(next.Statement, nextSchema, []))
+
+    let private substituteFields (scopes: OuterScope list) (inner: Schema) (s: SelectStatement) =
+        let sub = substituteOuter inner scopes
+        substituteStatementFields sub (substituteOpt sub) s
 
     /// 文の各式に外側参照の置換を適用する。
     /// 入れ子のサブクエリ（`Subquery` / `Exists`）の内部には入らない
     /// （そのスコープは実行時に別途解決する）。
-    /// 集合演算の枝は自前の入力スキーマを持つが、外側参照の判定は
-    /// 呼び出し側が渡した `inner`（枝の入力をすべて含む保守的なスキーマ）で行う。
+    /// 集合演算の枝は自前の入力スキーマを持つので、`branchSchemas`
+    /// （コア → `UNION ALL` の順）の枝ごとのスキーマで外側参照を判定する。
+    /// 枝 2 に外側と同じ名前の表があるだけで、枝 1 の外側参照を内側と誤判定しない。
     /// 枝は明示スタックで降りて戻りながら組み直す（自己再帰は全経路で末尾）。
-    let private substituteStatement (inner: Schema) (scopes: OuterScope list) (stmt: SelectStatement) =
-        let sub = substituteOuter inner scopes
-        substituteStatementLoop (substituteStatementFields sub (substituteOpt sub)) [] (Visit stmt)
+    let private substituteStatement (branchSchemas: Schema list) (scopes: OuterScope list) (stmt: SelectStatement) =
+        let coreSchema, setOpSchemas =
+            match branchSchemas with
+            | schema :: rest -> schema, rest
+            | [] -> Schema.Empty, []
+
+        substituteStatementLoop (substituteFields scopes) [] (Visit(stmt, coreSchema, setOpSchemas))
+
+    [<TailCall>]
+    let rec private branchesOf =
+        function
+        | Logical.UnionAll plans -> plans
+        | Logical.Sort(_, child) -> branchesOf child
+        | Logical.Limit(_, _, child) -> branchesOf child
+        | _ -> []
+
+    /// 相関サブクエリの枝ごとの入力スキーマ（コア → `UNION ALL` の順）。
+    /// 複合文の枝は入力スキーマが違う。全体を連結したスキーマで外側参照を判定すると、
+    /// 枝 2 に同名の表があるだけで枝 1 の外側参照を内側と誤判定する。
+    /// 枝の数が文と合わないときは全体の入力（保守的）で埋める。
+    let private branchSchemasOf (plan: PlannedQuery) (stmt: SelectStatement) =
+        let branches = branchesOf plan.Tree
+
+        List.init (1 + stmt.SetOperations.Length) (fun i ->
+            List.tryItem i branches
+            |> Option.map (fun (p: PlannedQuery) -> p.Input)
+            |> Option.defaultValue plan.Input)
 
     /// 現在のクエリの行を先頭に差し込んだスコープ列。
     let private withCurrentRow (row: SqlValue array) =
@@ -370,7 +417,7 @@ module internal Plan =
         =
         let withRow = withCurrentRow row scopes
 
-        substituteStatement plan.Input withRow sel
+        substituteStatement (branchSchemasOf plan sel) withRow sel
         >>= runner withRow ctx
         >>= fun (_, op) ->
             match Op.next op with
@@ -393,7 +440,7 @@ module internal Plan =
         =
         let withRow = withCurrentRow row scopes
 
-        substituteStatement plan.Input withRow sel
+        substituteStatement (branchSchemasOf plan sel) withRow sel
         >>= runner withRow ctx
         >>= fun (_, op) ->
             match Op.next op with
@@ -415,7 +462,7 @@ module internal Plan =
         =
         let withRow = withCurrentRow row scopes
 
-        substituteStatement plan.Input withRow sel
+        substituteStatement (branchSchemasOf plan sel) withRow sel
         >>= runner withRow ctx
         >>= fun (_, op) ->
             ValueSet.build ctx.Budget op

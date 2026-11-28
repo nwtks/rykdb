@@ -3643,6 +3643,32 @@ let ``SqlReference: 相関サブクエリ`` () =
         Assert.Equal<int64 array>([| 2L; 3L |], remaining.Rows |> Array.map (fun r -> asInt r.[0])))
 
 [<Fact>]
+let ``SqlReference: UNION ALL の枝を持つ相関サブクエリは枝ごとに外側参照を判定する`` () =
+    // 枝 2 に外側と同じ名前の別名（o）があると、全枝の入力を連結したスキーマでは
+    // 枝 1 の o.id を「内側」と誤判定し、実行時に NameError になっていた。
+    withSession "correlated-union-branches" (fun db0 ->
+        let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY)"
+        let db2 = exec db1 "CREATE TABLE u (id INTEGER PRIMARY KEY)"
+        let db3, _ = ok (execSql db2 "INSERT INTO t VALUES (1),(2)")
+        let db4, _ = ok (execSql db3 "INSERT INTO u VALUES (1),(2)")
+
+        let ids sql =
+            let _, rows = ok (execSql db4 sql)
+            rows.Rows |> Array.map (fun row -> asInt row.[0])
+
+        let inRows =
+            ids
+                "SELECT o.id FROM t AS o WHERE o.id IN (SELECT x.id FROM u AS x WHERE x.id = o.id UNION ALL SELECT o.id FROM u AS o WHERE o.id = 2) ORDER BY o.id"
+
+        Assert.Equal<int64 array>([| 1L; 2L |], inRows)
+
+        let existsRows =
+            ids
+                "SELECT o.id FROM t AS o WHERE EXISTS (SELECT 1 FROM u AS x WHERE x.id = o.id UNION ALL SELECT 1 FROM u AS o WHERE o.id = 100) ORDER BY o.id"
+
+        Assert.Equal<int64 array>([| 1L; 2L |], existsRows))
+
+[<Fact>]
 let ``SqlReference: 相関サブクエリの未対応形`` () =
     withSession "correlated-errors" (fun db0 ->
         let db1 = exec db0 "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"
